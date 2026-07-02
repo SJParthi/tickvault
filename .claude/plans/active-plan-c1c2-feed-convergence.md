@@ -90,7 +90,7 @@ line is the original DRAFT and is superseded where it conflicts):
   - Files: `crates/storage/src/tick_row_builder.rs` (new), `crates/storage/src/tick_persistence.rs`, `crates/storage/src/groww_persistence.rs`, `crates/storage/src/lib.rs`, `crates/storage/tests/feed_tick_writer_convergence_guard.rs` (new), `crates/storage/tests/dhat_tick_row_builder.rs` (new)
   - Tests: `volume_carrier_dhan_u32_widens_and_groww_i64_passes_through`, `ltp_carrier_dhan_f32_widens_exactly`, `groww_row_omits_dhan_only_columns_null_not_zero`, `groww_row_has_no_received_at_token`, `dhan_row_contains_every_column`, `dhan_tick_row_is_byte_identical_golden`, `exactly_one_ticks_row_builder_function_exists`, `dhat_build_tick_row_for_feed_zero_alloc`, `shared_builder_unchecked_ilp_names_pass_validation`
 
-- [ ] **Item C1 (ORIGINAL DRAFT) — Sub-PR #1: unify the raw-tick WRITER (feed-parameterized)**
+- [x] ~~**Item C1 (ORIGINAL DRAFT) — Sub-PR #1: unify the raw-tick WRITER (feed-parameterized)**~~ ~~superseded by shipped C1 (tick_row_builder.rs)~~ — reconciled 2026-07-02
   - Files: `crates/storage/src/tick_persistence.rs`, `crates/storage/src/groww_persistence.rs`, `crates/storage/src/lib.rs`, `crates/app/src/groww_bridge.rs` (call-site swap), `crates/storage/tests/feed_tick_writer_convergence_guard.rs` (new)
   - Tests: `test_generic_tick_writer_dhan_full_columns`, `test_generic_tick_writer_groww_subset_columns_null_not_zero`, `test_generic_tick_writer_dedup_key_unchanged`, `test_generic_tick_writer_dhan_uses_f32_to_f64_clean`, `test_generic_tick_writer_groww_native_f64`, `test_one_raw_tick_writer_path_guard`, DHAT `dhat_generic_tick_writer_zero_alloc`
 

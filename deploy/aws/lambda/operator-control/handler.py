@@ -2,8 +2,10 @@
 
 Open the Function URL in a browser and you get a device-locked mission-control
 page with tabs: Overview (box status + control), Data (live metrics + a QuestDB
-query box), GitHub (open PRs + CI status + merge + trigger deploy), Logs (live
-error/app tail), and AWS (CloudWatch alarms + month-to-date cost).
+query box), DB (READ-ONLY database console: tables list + columns + query grid
++ CSV download — writes blocked server-side), GitHub (open PRs + CI status +
+merge + trigger deploy), Logs (live error/app tail), and AWS (CloudWatch alarms
++ month-to-date cost).
 
 ONE URL, two layers:
   * `GET  /` → serves the portal HTML. PUBLIC shell with ZERO secrets — it just
@@ -117,7 +119,29 @@ _SQL_BANNED = (
     "vacuum",
     "grant",
     "revoke",
+    # QuestDB-specific mutators (DB-console hardening 2026-07-02). Before this,
+    # a ';'-chained second statement starting with an UNLISTED keyword — e.g.
+    # "select 1; backup table ticks" — passed the gate (first-word check only
+    # saw "select"; "backup" was not in the banned list). The gate now ALSO
+    # rejects any ';' (single-statement rule), but these stay banned anywhere
+    # as belt-and-braces.
+    "backup",
+    "checkpoint",
+    "snapshot",
+    "cancel",
+    "set",
+    "refresh",
+    "detach",
+    "attach",
+    "dedup",
+    "squash",
+    "resume",
+    "suspend",
 )
+
+# Server-side row cap for the read-only SQL console (both the Data-tab query
+# box and the DB tab share the same `sql` action).
+_SQL_MAX_ROWS = 1000
 
 
 def _is_market_hours(now_utc: datetime.datetime) -> bool:
@@ -148,22 +172,64 @@ def _authorized(headers: dict) -> bool:
 
 
 def _is_safe_sql(query: str) -> bool:
-    """Read-only gate. The query must start with an allowed keyword and contain
-    no mutating keyword (whole-word). Pure function — fully unit-tested."""
+    """Read-only gate (hardened 2026-07-02). Rules, all fail-closed:
+    1. SINGLE STATEMENT: one trailing ';' is stripped; ANY remaining ';'
+       rejects (closes the "select 1; <unlisted mutator>" chaining gap).
+    2. NO SQL COMMENTS ('--' or '/*'): keeps the banned-word scan honest —
+       comments could otherwise hide/split keywords.
+    3. First WORD must be an allowed read-only keyword (not just a prefix,
+       so "explainx ..." / "selector ..." are rejected).
+    4. No mutating keyword (whole-word) anywhere — incl. QuestDB mutators
+       (BACKUP/CHECKPOINT/SNAPSHOT/...). False-positive rejects on string
+       literals are accepted (fail-closed).
+    Pure function — fully unit-tested."""
     q = (query or "").strip().lower()
     if not q:
         return False
     import re  # noqa: PLC0415
 
-    # First WORD must be an allowed read-only keyword (not just a prefix, so
-    # "explainx ..." / "selector ..." are rejected).
+    # Rule 1 — single statement: strip ONE trailing ';', reject any other.
+    if q.endswith(";"):
+        q = q[:-1].rstrip()
+    if not q or ";" in q:
+        return False
+    # Rule 2 — no comments.
+    if "--" in q or "/*" in q:
+        return False
+    # Rule 3 — allowed first word.
     first = re.split(r"[^a-z]+", q, maxsplit=1)[0]
     if first not in _SQL_ALLOWED_PREFIXES:
         return False
+    # Rule 4 — banned keywords anywhere.
     for kw in _SQL_BANNED:
         if re.search(r"\b" + kw + r"\b", q):
             return False
     return True
+
+
+def _cap_sql_rows(query: str, cap: int = _SQL_MAX_ROWS) -> str:
+    """Enforce a server-side row cap on an already-validated read-only query.
+    A trailing `LIMIT n` above the cap is clamped to the cap; a SELECT/WITH
+    query with no trailing LIMIT gets `LIMIT <cap>` appended. SHOW/EXPLAIN
+    are left untouched (tiny output; appending LIMIT to SHOW is a syntax
+    error). QuestDB's range/negative forms (`LIMIT lo,hi` / `LIMIT -n`) are
+    left as-is — the `/exp?limit=` param + `head` on the box remain the
+    belt-and-braces output bound in every case. Pure function — unit-tested."""
+    import re  # noqa: PLC0415
+
+    q = (query or "").strip()
+    if q.endswith(";"):
+        q = q[:-1].rstrip()
+    m = re.search(r"(?i)\blimit\s+(-?\d+)(\s*,\s*-?\d+)?\s*$", q)
+    if m:
+        lo, hi = m.group(1), m.group(2)
+        if hi is None and not lo.startswith("-") and int(lo) > cap:
+            return q[: m.start()] + f"LIMIT {cap}"
+        return q
+    first = re.split(r"[^a-z]+", q.lower(), maxsplit=1)[0]
+    if first in ("select", "with"):
+        return f"{q} LIMIT {cap}"
+    return q
 
 
 def _ssm_shell(commands: list[str]) -> str:
@@ -1117,13 +1183,18 @@ def lambda_handler(event, _context):
                 {"ok": True, "action": "view", "instance_state": state, "market_hours": _is_market_hours(datetime.datetime.utcnow()), **snap},
             )
         if action == "sql":
+            # READ-ONLY console query (Data tab box + DB tab). Writes are
+            # blocked server-side by _is_safe_sql (single statement, no
+            # comments, banned mutators); _cap_sql_rows clamps/appends LIMIT;
+            # the /exp `limit=` param + `head` bound the output regardless.
             q = str(payload.get("query", "")).strip()
             if not _is_safe_sql(q):
-                return _resp(400, {"error": "only read-only SELECT/SHOW/EXPLAIN/WITH queries are allowed"})
+                return _resp(400, {"error": "only read-only single-statement SELECT/SHOW/EXPLAIN/WITH queries are allowed (no ';' chaining, no comments)"})
+            q = _cap_sql_rows(q)
             import urllib.parse  # noqa: PLC0415
 
             enc = urllib.parse.quote(q)
-            out = _ssm_shell_sync(["set +e", f"curl -fsS 'http://127.0.0.1:9000/exp?query={enc}&limit=200' 2>/dev/null | head -200 || echo 'query failed'"])
+            out = _ssm_shell_sync(["set +e", f"curl -fsS 'http://127.0.0.1:9000/exp?query={enc}&limit={_SQL_MAX_ROWS}' 2>/dev/null | head -{_SQL_MAX_ROWS + 1} || echo 'query failed'"])
             return _resp(200, {"ok": True, "action": "sql", "csv": out})
         if action == "logs":
             out = _ssm_shell_sync(
@@ -1344,6 +1415,7 @@ def _console_html() -> str:
     <div class="tabs">
       <div class="tab active" data-t="overview" onclick="tab('overview')">📊 Overview</div>
       <div class="tab" data-t="data" onclick="tab('data')">📈 Data</div>
+      <div class="tab" data-t="db" onclick="tab('db')">🗄️ DB</div>
       <div class="tab" data-t="github" onclick="tab('github')">🔀 GitHub</div>
       <div class="tab" data-t="logs" onclick="tab('logs')">📜 Logs</div>
       <div class="tab" data-t="aws" onclick="tab('aws')">☁️ AWS</div>
@@ -1409,7 +1481,33 @@ def _console_html() -> str:
         <textarea id="sql" placeholder="SELECT ts, security_id, count() FROM ticks WHERE ts IN today() GROUP BY ts, security_id ORDER BY 3 DESC LIMIT 20"></textarea>
         <div class="row" style="margin-top:10px"><button class="b-blu" onclick="runSql()">▶ Run query</button></div>
         <div id="sqlout" style="margin-top:12px;overflow:auto"></div>
-        <div class="muted" style="margin-top:8px">Only SELECT / SHOW / EXPLAIN / WITH are allowed. Capped at 200 rows.</div>
+        <div class="muted" style="margin-top:8px">Only SELECT / SHOW / EXPLAIN / WITH are allowed. Capped at 1000 rows. Full console in the DB tab.</div>
+      </div>
+    </section>
+
+    <!-- DB (read-only database console) -->
+    <section data-tab="db" hidden>
+      <div class="card">
+        <div class="lbl">database console &nbsp;<span class="badge unknown">READ-ONLY — writes are blocked server-side</span></div>
+        <div style="display:flex;gap:16px;flex-wrap:wrap">
+          <div style="flex:1 1 200px;min-width:180px">
+            <div class="lbl">tables</div>
+            <div class="row" style="margin-bottom:8px"><button class="b-ghost mini" onclick="loadDbTables()">🔄 Reload tables</button></div>
+            <div id="dbtables" style="max-height:420px;overflow:auto"><span class="muted">not loaded yet</span></div>
+          </div>
+          <div style="flex:2 1 380px;min-width:280px">
+            <div class="lbl">query</div>
+            <textarea id="dbsql" spellcheck="false">SELECT * FROM ticks ORDER BY ts DESC LIMIT 50</textarea>
+            <div class="row" style="margin-top:10px">
+              <button class="b-blu" onclick="runDbSql()">▶ Run</button>
+              <button class="b-ghost" onclick="dbDownloadCsv()">⬇ Download CSV</button></div>
+            <div class="muted" id="dbcount" style="margin-top:8px"></div>
+            <div id="dbout" style="margin-top:10px;overflow:auto;max-height:480px"></div>
+            <div class="muted" style="margin-top:8px">Only single-statement SELECT / SHOW / EXPLAIN / WITH — mutations, ';' chaining and comments are rejected by the server. Row cap 1000 (a bigger LIMIT is clamped). Click a table on the left for its columns + first 100 rows.</div>
+          </div>
+        </div>
+        <div class="lbl" style="margin-top:16px">columns <span class="muted" id="dbcolname"></span></div>
+        <div id="dbcols" style="overflow:auto;max-height:320px"><span class="muted">click a table</span></div>
       </div>
     </section>
 
@@ -1482,6 +1580,7 @@ function tab(name){ curTab=name; document.querySelectorAll('.tab').forEach(t=>t.
   document.querySelectorAll('section[data-tab]').forEach(s=>s.hidden=s.dataset.tab!==name);
   if(name==='github' && !$('prs').dataset.loaded) loadGithub();
   if(name==='data' && !$('cvshields').dataset.loaded) loadCrossVerify();
+  if(name==='db' && !$('dbtables').dataset.loaded) loadDbTables();
   if(name==='aws' && !$('alarms').dataset.loaded) loadAws();
   if(name==='latency' && !$('latnet').dataset.loaded) loadLatency();
   if(name==='logs' && $('logErr').textContent==='—') loadLogs(); }
@@ -1590,17 +1689,52 @@ async function feedToggle(feed,enabled){
     $('feedsmsg').textContent='⚠ '+m; toast('⚠ '+String(m).slice(0,120)); }
   setTimeout(loadFeeds,1200); }
 
-async function runSql(){ const q=$('sql').value.trim(); if(!q){ toast('Type a query'); return; } $('sqlout').innerHTML='<span class="muted">running…</span>';
-  const j=await call('sql',{query:q}); if(!j){ $('sqlout').innerHTML=''; return; }
-  const lines=(j.csv||'').split(/\r?\n/).filter(x=>x.length); if(!lines.length){ $('sqlout').innerHTML='<span class="muted">no rows</span>'; return; }
-  const rows=lines.map(l=>l.split(',').map(c=>c.replace(/^"|"$/g,'')));
-  // QuestDB renders our IST-stored timestamps as "...T15:28:00.000000Z" — the
-  // value is already IST (project storage convention); strip the noisy
-  // microseconds + Z and the T so it reads "2026-06-01 15:28:00 IST".
-  const tcell=c=>{ const m=/^(\d{4}-\d{2}-\d{2})T(\d{2}:\d{2}:\d{2})(?:\.\d+)?Z?$/.exec(c); return m? m[1]+' '+m[2]+' IST' : c; };
+// Shared CSV → grid renderer (Data tab query box + DB tab reuse it).
+function parseCsv(csv){ const lines=(csv||'').split(/\r?\n/).filter(x=>x.length);
+  return lines.map(l=>l.split(',').map(c=>c.replace(/^"|"$/g,''))); }
+// QuestDB renders our IST-stored timestamps as "...T15:28:00.000000Z" — the
+// value is already IST (project storage convention); strip the noisy
+// microseconds + Z and the T so it reads "2026-06-01 15:28:00 IST".
+function tcell(c){ const m=/^(\d{4}-\d{2}-\d{2})T(\d{2}:\d{2}:\d{2})(?:\.\d+)?Z?$/.exec(c); return m? m[1]+' '+m[2]+' IST' : c; }
+// Renders rows (header + data, all esc()-wrapped) into el; returns data-row count.
+function renderGrid(el,rows){ if(!rows.length){ el.innerHTML='<span class="muted">no rows</span>'; return 0; }
   let h='<table><tr>'+rows[0].map(c=>'<th>'+esc(c)+'</th>').join('')+'</tr>';
   for(let i=1;i<rows.length;i++) h+='<tr>'+rows[i].map(c=>'<td>'+esc(tcell(c))+'</td>').join('')+'</tr>';
-  $('sqlout').innerHTML=h+'</table>'; }
+  el.innerHTML=h+'</table>'; return rows.length-1; }
+
+async function runSql(){ const q=$('sql').value.trim(); if(!q){ toast('Type a query'); return; } $('sqlout').innerHTML='<span class="muted">running…</span>';
+  const j=await call('sql',{query:q}); if(!j){ $('sqlout').innerHTML=''; return; }
+  renderGrid($('sqlout'),parseCsv(j.csv)); }
+
+// ---- DB tab (read-only database console) ----
+// Writes are blocked SERVER-SIDE by the hardened _is_safe_sql gate (single
+// statement, no comments, banned mutators) + the 1000-row cap — the UI is a
+// convenience, never the security boundary.
+let dbTables=[], dbCsv='';
+async function loadDbTables(){ $('dbtables').dataset.loaded='1'; $('dbtables').innerHTML='<span class="muted">loading…</span>';
+  const j=await call('sql',{query:'SELECT table_name FROM tables() ORDER BY table_name'});
+  if(!j){ $('dbtables').innerHTML='<span class="warn">load failed</span>'; return; }
+  dbTables=parseCsv(j.csv).slice(1).map(r=>r[0]).filter(Boolean);
+  if(!dbTables.length){ $('dbtables').innerHTML='<span class="warn">no tables returned — is the box running?</span>'; return; }
+  // Click handlers pass an INDEX into the just-fetched list — the table name
+  // used in follow-up queries always comes from QuestDB's own tables() output,
+  // never from user-typed input (no injection surface).
+  $('dbtables').innerHTML=dbTables.map((t,i)=>'<div style="padding:6px 0;border-bottom:1px solid var(--line)"><a href="#" style="color:var(--cyan);text-decoration:none;font-size:13px" onclick="dbPick('+i+');return false">'+esc(t)+'</a></div>').join(''); }
+async function dbPick(i){ const t=dbTables[i]; if(t==null) return;
+  $('dbcolname').textContent='— '+t; $('dbcols').innerHTML='<span class="muted">loading…</span>';
+  const j=await call('sql',{query:"SELECT * FROM table_columns('"+t.replace(/'/g,"''")+"')"});
+  if(j) renderGrid($('dbcols'),parseCsv(j.csv)); else $('dbcols').innerHTML='<span class="warn">columns load failed</span>';
+  $('dbsql').value='SELECT * FROM "'+t.replace(/"/g,'')+'" LIMIT 100';
+  runDbSql(); }
+async function runDbSql(){ const q=$('dbsql').value.trim(); if(!q){ toast('Type a query'); return; }
+  $('dbout').innerHTML='<span class="muted">running…</span>'; $('dbcount').textContent=''; dbCsv='';
+  const j=await call('sql',{query:q}); if(!j){ $('dbout').innerHTML=''; return; }
+  dbCsv=j.csv||''; const n=renderGrid($('dbout'),parseCsv(dbCsv));
+  $('dbcount').textContent=n+' row'+(n===1?'':'s')+(n>=1000?' — server cap 1000 reached':''); }
+function dbDownloadCsv(){ if(!dbCsv){ toast('Run a query first'); return; }
+  const a=document.createElement('a'); a.href=URL.createObjectURL(new Blob([dbCsv],{type:'text/csv'}));
+  a.download='tickvault-query-'+new Date().toISOString().slice(0,19).replace(/[:T]/g,'-')+'.csv';
+  document.body.appendChild(a); a.click(); a.remove(); URL.revokeObjectURL(a.href); }
 
 function ciBadge(s){ const k=['success','pending','failure'].includes(s)?s:'unknown'; return '<span class="badge '+k+'">'+s+'</span>'; }
 async function loadGithub(){ $('prs').dataset.loaded='1'; $('prs').innerHTML='<span class="muted">loading…</span>'; const j=await call('gh_prs'); if(!j){ $('prs').innerHTML=''; return; }
