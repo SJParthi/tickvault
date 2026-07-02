@@ -11,7 +11,8 @@
 #
 # What this script does on first boot (runs once via cloud-init):
 #   1. Set timezone to Asia/Kolkata (operator convenience; app uses UTC internally)
-#   2. Install Docker via `dnf install docker docker-compose-plugin`
+#   2. Install Docker (`dnf install docker`) + the Compose v2 plugin
+#      (`docker-compose-plugin`, with a Docker-CE-repo fallback + verify)
 #   3. Enable Docker daemon at boot
 #   4. Create /opt/tickvault/{config,data/spill,logs,bin}
 #   5. Clone the repo (shallow, main branch)
@@ -37,10 +38,38 @@ echo "    target: AL2023 arm64 (Graviton), env=$${ENVIRONMENT}, region=$${REGION
 dnf update -y
 timedatectl set-timezone Asia/Kolkata
 
-# ---- Step 2: Docker via dnf (AL2023 ships docker in the default repo) ----
-dnf install -y docker docker-compose-plugin git jq
+# ---- Step 2: Docker + Compose v2 plugin (AL2023 ships docker in the default repo) ----
+# docker MUST install; the Compose v2 CLI plugin (`docker compose`) is REQUIRED
+# by BOTH the app boot (crates/app/src/infra.rs runs `docker compose -f … up -d
+# --force-recreate`, retried every 10s) AND the systemd self-heal
+# (scripts/ensure-questdb.sh). Without a working `docker compose` the app
+# crash-loops on BOOT-02 (QuestDB never starts) and the boot logs show the
+# `docker compose up -d failed (exit status: 125): unknown shorthand flag: 'f'`
+# cascade — the docker CLI does not recognise the `compose` subcommand, so `-f`
+# reaches the top-level parser.
+#
+# Install docker FIRST on its own line so a plugin-package hiccup can never abort
+# first-boot under `set -euo pipefail`. Then install the plugin from the AL2023
+# default repo; if that repo does not carry `docker-compose-plugin` (varies by
+# AL2023 minor version), add Docker's official CE repo (which manages the plugin
+# version — no hard-coded version to drift) and install from there.
+dnf install -y docker git jq
+if ! dnf install -y docker-compose-plugin; then
+    echo "user-data: docker-compose-plugin not in default repo — adding Docker CE repo and retrying"
+    curl -fsSL https://download.docker.com/linux/centos/docker-ce.repo \
+        -o /etc/yum.repos.d/docker-ce.repo || true
+    dnf install -y docker-compose-plugin \
+        || echo "user-data: WARNING — docker-compose-plugin install failed; 'docker compose' will be unavailable"
+fi
 systemctl enable --now docker
 usermod -aG docker ec2-user
+
+# Fail-loud VERIFY: surface a missing/broken Compose v2 plugin in the user-data
+# log immediately, instead of the box discovering it hours later as a BOOT-02
+# crash-loop. Non-fatal (`|| echo`) so a transient hiccup does not abort first
+# boot — ensure-questdb.sh's docker-run fallback still recovers QuestDB.
+docker compose version \
+    || echo "user-data: WARNING — 'docker compose' unavailable after install; check Step 2"
 
 # ---- Step 3: CloudWatch agent config (agent itself is pre-installed) ----
 # Inject the metrics + log config. The agent comes pre-installed but the

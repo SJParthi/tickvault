@@ -23,6 +23,18 @@
 #     "no drift, nothing to apply" and the run exits green (no false-OK).
 #     10:20 UTC is safely past the guard's 10:15 UTC edge — the guard itself
 #     is unchanged and passes naturally.
+#   - schedule 10:50 + 11:35 UTC Mon–Fri → SCHEDULER-DROP retries (2026-07-02
+#     incident): GitHub's cron scheduler DROPPED the single 10:20 UTC slot
+#     today (repo-wide ~09:40–10:30 UTC drop window; dropped slots never
+#     queue — they are silently skipped), so a market-hours-blocked apply
+#     stayed stranded a further day. Two staggered retries give three
+#     independent daily chances. Each firing is idempotent: apply runs ONLY
+#     when `terraform plan -detailed-exitcode` returns 2; exit 0 → the
+#     no-drift job logs "no drift, nothing to apply" and the run is green.
+#     Terraform runs on GitHub runners against AWS APIs, so the 16:30 IST EC2
+#     auto-stop is irrelevant to these slots. HONEST ENVELOPE: cron redundancy
+#     REDUCES but cannot ELIMINATE GitHub scheduler risk — the scheduler is an
+#     external system and can drop any or all slots.
 #
 # Auth precedence (try in order):
 #   1. OIDC role via secrets.AWS_TERRAFORM_ROLE_ARN (preferred, set after first run)
@@ -47,7 +59,11 @@ on:
   schedule:
     # 10:20 UTC = 15:50 IST Mon–Fri — post-close retry for market-hours-blocked
     # applies (just past the guard's 09:00-15:45 IST / 03:30-10:15 UTC band).
+    # 10:50 UTC = 16:20 IST + 11:35 UTC = 17:05 IST — scheduler-drop retries
+    # (2026-07-02 — see header; plan-gated apply makes extras free no-ops).
     - cron: '20 10 * * 1-5'
+    - cron: '50 10 * * 1-5'
+    - cron: '35 11 * * 1-5'
   workflow_dispatch:
     inputs:
       confirm_market_hours:
