@@ -501,7 +501,13 @@ async fn main() -> Result<()> {
         TradingCalendar::from_config(&config.trading)
             .context("failed to build Groww trading calendar")?,
     );
-    tokio::spawn(tickvault_app::groww_bridge::run_groww_bridge(
+    // SUPERVISED (2026-07-02 adversarial-sweep fix): the bridge — the ONLY
+    // consumer of the sidecar NDJSON — used to be a bare tokio::spawn, so a
+    // panic silently stopped all Groww persistence while the stall watchdog
+    // killed the WRONG process (the healthy Python sidecar). The supervisor
+    // respawns it (FEED-SUPERVISOR-01 + tv_feed_supervisor_respawn_total,
+    // WS-GAP-05 pattern); the NDJSON re-tail is DEDUP-idempotent.
+    let _groww_bridge_supervisor = tickvault_app::groww_bridge::spawn_supervised_groww_bridge(
         config.questdb.clone(),
         std::path::PathBuf::from(tickvault_app::groww_bridge::GROWW_TICK_FILE_DEFAULT),
         std::path::PathBuf::from(tickvault_app::groww_bridge::GROWW_STATUS_FILE_DEFAULT),
@@ -515,7 +521,7 @@ async fn main() -> Result<()> {
         // boundary task's trading-day gate — built from the SAME `config.trading`
         // the Dhan IST-midnight force-seal calendar uses.
         groww_trading_calendar,
-    ));
+    );
     // Deferred Telegram slot for the Groww sidecar supervisor: the supervisor is
     // spawned here (before the notifier is built), so it gets a shared slot that
     // is filled with the live `NotificationService` once it exists (below). On a

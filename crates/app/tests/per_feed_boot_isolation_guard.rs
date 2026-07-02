@@ -97,7 +97,10 @@ fn groww_lanes_spawn_dormant_and_self_idle_on_the_enable_flag() {
     // so the stall-watchdog can never die silently — that wrapper internally calls
     // `run_groww_sidecar_supervisor`, so the lane still exists for the live toggle.
     for spawn in [
-        "run_groww_bridge",
+        // The bridge is spawned via its respawning wrapper since 2026-07-02
+        // (FEED-SUPERVISOR-01 sweep fix) — a bare run_groww_bridge spawn was
+        // the silent-death hole.
+        "spawn_supervised_groww_bridge",
         "spawn_supervised_groww_sidecar_supervisor",
         "run_groww_activation_watcher",
     ] {
@@ -115,8 +118,8 @@ fn groww_lanes_spawn_dormant_and_self_idle_on_the_enable_flag() {
     //       per-feed dispatcher early-return, so they run regardless of which feed
     //       is enabled (a Groww-only run AND a Dhan-only run both spawn them).
     let bridge_pos = main
-        .find("run_groww_bridge")
-        .expect("main.rs must spawn run_groww_bridge");
+        .find("spawn_supervised_groww_bridge")
+        .expect("main.rs must spawn the supervised groww bridge");
     let lane_comment = main
         .find("Groww second feed: dormant-until-enabled")
         .expect("main.rs must carry the dormant-lane spawn comment");
