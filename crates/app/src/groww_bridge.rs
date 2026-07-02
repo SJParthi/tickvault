@@ -898,6 +898,36 @@ fn spawn_groww_ist_midnight_force_seal(
     info!("Groww bridge — IST-midnight force-seal task spawned (parity with Dhan)");
 }
 
+/// ws_event_audit edge latches shared between the supervisor wrapper and the
+/// (respawnable) bridge task, so a bridge panic never resets the forensic
+/// Connected/Disconnected/Reconnected chain (2026-07-02 adversarial finding M3).
+#[derive(Debug, Default)]
+pub struct GrowwAuditLatches {
+    /// A Connected/Reconnected row has been emitted for the current streaming
+    /// episode (rising-edge gate).
+    pub audited_connected: std::sync::atomic::AtomicBool,
+    /// A Disconnected row was emitted since the last connect — the next rising
+    /// edge classifies as Reconnected, not a second Connected.
+    pub prior_disconnect: std::sync::atomic::AtomicBool,
+}
+
+/// Pure: the next consecutive-respawn count given how long the previous bridge
+/// incarnation ran. A HEALTHY long run (>= `HEALTHY_RUN_RESET_SECS`) resets the
+/// curve to 1 so one panic per day never converges to the permanent 60s
+/// ceiling (2026-07-02 adversarial finding M2); rapid deaths keep climbing.
+#[must_use]
+pub fn next_respawn_count(prev_count: u32, ran_secs: u64) -> u32 {
+    if ran_secs >= HEALTHY_RUN_RESET_SECS {
+        1
+    } else {
+        prev_count.saturating_add(1)
+    }
+}
+
+/// A bridge incarnation that survived this long ran healthy — reset the
+/// respawn-backoff curve (5 minutes ≫ the 60s backoff ceiling).
+pub const HEALTHY_RUN_RESET_SECS: u64 = 300;
+
 /// Backoff (seconds) before the Nth consecutive bridge respawn: 5s doubling to
 /// a 60s cap. Pure — mirrors the sidecar supervisor's restart curve so a
 /// persistently-panicking bridge never tight-loops, yet a one-off panic
@@ -947,8 +977,13 @@ pub fn spawn_supervised_groww_bridge(
             Arc::clone(&feed_runtime),
             trading_calendar,
         );
+        // Process-lifetime ws_event_audit edge latches (finding M3): survive a
+        // bridge respawn so the forensic chain stays Connected → Disconnected →
+        // Reconnected, never Connected → Connected.
+        let audit_latches = Arc::new(GrowwAuditLatches::default());
         let mut consecutive_respawns: u32 = 0;
         loop {
+            let started = std::time::Instant::now();
             let handle = tokio::spawn(run_groww_bridge(
                 qdb.clone(),
                 tick_file_path.clone(),
@@ -957,14 +992,47 @@ pub fn spawn_supervised_groww_bridge(
                 Arc::clone(&feed_health),
                 ws_audit_tx.clone(),
                 aggregator.clone(),
+                Arc::clone(&audit_latches),
             ));
             let reason = match handle.await {
                 Err(err) if err.is_panic() => "panic",
-                Err(_) => "cancelled",
+                // A non-panic JoinError = the inner task was CANCELLED — the
+                // runtime is shutting down (finding M2). Do NOT respawn onto a
+                // dying runtime and do NOT page a spurious FEED-SUPERVISOR-01;
+                // exit the supervisor cleanly (mirrors the sidecar wrapper).
+                Err(_) => {
+                    info!(
+                        "groww bridge supervisor: inner task cancelled (runtime \
+                         shutdown) — supervisor exiting cleanly"
+                    );
+                    return;
+                }
                 Ok(()) => "clean_exit",
             };
-            consecutive_respawns = consecutive_respawns.saturating_add(1);
+            // If the previous incarnation ran healthy for a while, reset the
+            // backoff curve — one panic per day must never converge to the
+            // permanent 60s ceiling (finding M2).
+            consecutive_respawns =
+                next_respawn_count(consecutive_respawns, started.elapsed().as_secs());
             let backoff = bridge_respawn_backoff(consecutive_respawns);
+            // Forensic falling edge (finding M3): a panic unwound the bridge
+            // before it could emit its Disconnected row — emit it HERE so the
+            // audit chain never reads Connected → Connected. The respawned
+            // bridge's first streaming rising edge then classifies Reconnected.
+            if audit_latches
+                .audited_connected
+                .swap(false, std::sync::atomic::Ordering::Relaxed)
+            {
+                emit_groww_ws_audit(
+                    ws_audit_tx.as_ref(),
+                    WsEventKind::Disconnected,
+                    "bridge_died",
+                    "groww bridge task died — respawning",
+                );
+                audit_latches
+                    .prior_disconnect
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+            }
             error!(
                 code =
                     tickvault_common::error_code::ErrorCode::FeedSupervisor01Respawned.code_str(),
@@ -1025,6 +1093,10 @@ pub async fn run_groww_bridge(
     // wrapper — a respawned bridge reuses it (bars survive a panic) and the
     // IST-midnight force-seal (spawned once by the wrapper) keeps sealing it.
     aggregator: MultiTfAggregator,
+    // Process-lifetime ws_event_audit edge latches (created once by the
+    // supervisor wrapper) — survive a bridge respawn so the forensic
+    // Connected/Disconnected/Reconnected chain stays consistent (finding M3).
+    audit_latches: Arc<GrowwAuditLatches>,
 ) {
     info!(
         path = %tick_file_path.display(),
@@ -1065,8 +1137,11 @@ pub async fn run_groww_bridge(
     // per streaming rising edge (never per loop turn). `prior_disconnect` is set when
     // a Disconnected/DisconnectedOffHours row was emitted on a disable falling edge,
     // so the NEXT rising edge is classified Reconnected (not a second Connected).
-    let mut audited_connected = false;
-    let mut prior_disconnect = false;
+    // SHARED with the supervisor wrapper (2026-07-02 adversarial finding M3): the
+    // latches live in `audit_latches` (created once per process) so a bridge PANIC
+    // does not reset them — the wrapper emits the missing Disconnected row on death
+    // and the respawned bridge's first rising edge classifies as RECONNECTED, so the
+    // forensic chain never reads Connected→Connected with no disconnect between.
 
     loop {
         // Wake on EITHER a filesystem event (zero-latency) OR the fallback timer.
@@ -1109,7 +1184,10 @@ pub async fn run_groww_bridge(
             // DisconnectedOffHours Low, else Disconnected). Gated on
             // `audited_connected` so a disable while already-disconnected (or
             // never-connected) does not spam a row each idle turn.
-            if audited_connected {
+            if audit_latches
+                .audited_connected
+                .load(std::sync::atomic::Ordering::Relaxed)
+            {
                 let kind = if tickvault_common::market_hours::is_within_market_hours_ist() {
                     WsEventKind::Disconnected
                 } else {
@@ -1121,9 +1199,13 @@ pub async fn run_groww_bridge(
                     "feed_disabled",
                     "groww disabled",
                 );
-                prior_disconnect = true;
+                audit_latches
+                    .prior_disconnect
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
             }
-            audited_connected = false;
+            audit_latches
+                .audited_connected
+                .store(false, std::sync::atomic::Ordering::Relaxed);
             connect_logged = false;
             streaming_observed = false;
             continue;
@@ -1178,15 +1260,26 @@ pub async fn run_groww_bridge(
         // last (re)arm, emit ONE row — Reconnected if a Disconnected was emitted
         // since the last connect, else Connected. Gated on `audited_connected` so
         // it fires once per rising edge, never per loop turn (audit-findings Rule 4).
-        if streaming_observed && !audited_connected {
-            let (kind, source) = if prior_disconnect {
+        if streaming_observed
+            && !audit_latches
+                .audited_connected
+                .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            let (kind, source) = if audit_latches
+                .prior_disconnect
+                .load(std::sync::atomic::Ordering::Relaxed)
+            {
                 (WsEventKind::Reconnected, "groww_resumed")
             } else {
                 (WsEventKind::Connected, "groww_sidecar")
             };
             emit_groww_ws_audit(ws_audit_tx.as_ref(), kind, source, "groww streaming");
-            audited_connected = true;
-            prior_disconnect = false;
+            audit_latches
+                .audited_connected
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            audit_latches
+                .prior_disconnect
+                .store(false, std::sync::atomic::Ordering::Relaxed);
         }
     }
 }
@@ -1820,9 +1913,10 @@ mod tests {
         let disable_idx = src
             .find("if !feed_runtime.is_enabled(Feed::Groww) {")
             .expect("disable branch present");
-        // Window widened (PR-10) to span the inserted ws_event_audit falling-edge
-        // emit block — the latch re-arm now lives just below it.
-        let after = &src[disable_idx..disable_idx + 1600];
+        // Window widened (PR-10, then 2026-07-02 M3 atomic-latch expansion) to
+        // span the ws_event_audit falling-edge emit block — the latch re-arm
+        // lives just below it.
+        let after = &src[disable_idx..disable_idx + 2600];
         assert!(
             after.contains(&clear)
                 && after.contains("connect_logged = false")
@@ -2094,6 +2188,22 @@ mod tests {
         );
         // Defensive: a 0th call (before any respawn) still yields the base.
         assert_eq!(bridge_respawn_backoff(0).as_secs(), 5);
+    }
+
+    #[test]
+    fn test_next_respawn_count_resets_after_healthy_run() {
+        // Finding M2: a bridge that ran healthy >= HEALTHY_RUN_RESET_SECS resets
+        // the curve (one panic/day never converges to the 60s ceiling); rapid
+        // deaths keep climbing.
+        assert_eq!(next_respawn_count(0, 0), 1);
+        assert_eq!(next_respawn_count(3, 10), 4, "rapid death keeps climbing");
+        assert_eq!(
+            next_respawn_count(7, HEALTHY_RUN_RESET_SECS),
+            1,
+            "healthy run resets"
+        );
+        assert_eq!(next_respawn_count(u32::MAX, 0), u32::MAX, "no overflow");
+        assert_eq!(HEALTHY_RUN_RESET_SECS, 300);
     }
 
     #[test]

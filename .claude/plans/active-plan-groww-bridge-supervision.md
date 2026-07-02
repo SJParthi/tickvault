@@ -104,6 +104,25 @@ persist-coupled liveness.
   - Files: .claude/rules/project/feed-stall-watchdog-error-codes.md
   - Tests: (doc)
 
+## Post-implementation adversarial review (3-agent, 2026-07-02) — all findings fixed in-PR
+
+- [x] H1: stale-token alert marker routed to AuthRejected (classify arm + test)
+  - Files: crates/app/src/groww_sidecar_supervisor.rs
+  - Tests: test_classify_access_token_stale_marker_is_auth_rejected
+- [x] M2: cancel-aware supervisor exit + healthy-run backoff reset
+  - Files: crates/app/src/groww_bridge.rs
+  - Tests: test_next_respawn_count_resets_after_healthy_run
+- [x] M3: process-lifetime GrowwAuditLatches + death-edge Disconnected emit
+  - Files: crates/app/src/groww_bridge.rs, crates/app/tests/groww_live_pipeline_e2e.rs
+  - Tests: test_runtime_disable_clears_connected_and_rearms_latches
+- [x] M4: sidecar forces a fresh SSM token read every 5th non-auth failure
+  - Files: scripts/groww-sidecar/groww_sidecar.py
+  - Tests: test_sidecar_reads_token_never_mints
+- [x] M5: orphaned-sidecar reap before each launch (pkill by script path)
+  - Files: crates/app/src/groww_sidecar_supervisor.rs
+  - Tests: test_supervisor_injects_token_param_env_and_no_credentials
+- Hot-path + security agents: CLEAN (0 findings); hostile L6/L7 accepted with documented reasoning.
+
 ## Scenarios
 
 | # | Scenario | Expected |

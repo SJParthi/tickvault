@@ -254,6 +254,7 @@ async fn groww_ticks_and_candles_land_tagged_feed_groww() {
         Arc::clone(&feed_health),
         None,
         test_aggregator(),
+        std::sync::Arc::new(tickvault_app::groww_bridge::GrowwAuditLatches::default()),
     ));
 
     // --- Assert the 5 ticks landed in `ticks` tagged feed='groww' ---
@@ -411,6 +412,7 @@ async fn malformed_ndjson_line_is_skipped_and_valid_lines_land() {
         Arc::clone(&feed_health),
         None,
         test_aggregator(),
+        std::sync::Arc::new(tickvault_app::groww_bridge::GrowwAuditLatches::default()),
     ));
 
     let ticks_sql =
@@ -479,6 +481,7 @@ async fn replay_same_ndjson_is_idempotent_no_duplicate_rows() {
             Arc::clone(&feed_health),
             None,
             test_aggregator(),
+            std::sync::Arc::new(tickvault_app::groww_bridge::GrowwAuditLatches::default()),
         ));
         let _ = wait_until_count(&ticks_sql, 3, Duration::from_secs(15)).await;
         bridge.abort();

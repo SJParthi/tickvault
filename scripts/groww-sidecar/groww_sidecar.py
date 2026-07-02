@@ -550,6 +550,10 @@ def should_force_reconnect(
 # Floor for retry pacing when the failure is auth-class (stale/unusable token):
 # ~60s rides the daily 06:00->06:05 IST mint gap without hammering anything.
 AUTH_RETRY_FLOOR_SECS = 60
+# Safety net: every Nth consecutive NON-auth-shaped failure also drops the
+# cached token (forces a fresh SSM read next cycle) — so a daily reset that
+# surfaces as a bare socket close can never loop a stale token forever.
+TOKEN_REREAD_EVERY_N_FAILURES = 5
 # After this many seconds of CONTINUOUS auth-class failure, print ONE
 # edge-triggered `GROWW LIVE FEED REJECTED:` alert line (the Rust supervisor
 # routes it to feed-health + Telegram) — then keep retrying, NEVER mint.
@@ -1453,6 +1457,13 @@ def main() -> None:
                 access_token = None
                 if auth_stale_since is None:
                     auth_stale_since = time.time()
+            elif consecutive_failures % TOKEN_REREAD_EVERY_N_FAILURES == 0:
+                # Safety net (2026-07-02 adversarial finding M4): the 06:00 IST
+                # daily reset can surface as a BARE socket close (not auth-shaped),
+                # which would otherwise retry the cached stale token forever. Every
+                # Nth consecutive failure, drop the cache so the next cycle re-reads
+                # SSM — one cheap GetParameter, no Groww call, never a mint.
+                access_token = None
             delay = _backoff_secs(consecutive_failures, rate_limited, retry_after)
             if auth_class:
                 # Ride the 06:00->06:05 daily mint gap at a calm >=60s pace —
