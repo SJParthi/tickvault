@@ -593,6 +593,28 @@ mod tests {
     }
 
     #[test]
+    fn test_count_trading_days_saturates_at_date_range_ceiling() {
+        // Doc contract: "Never panics. Date-arithmetic failures (year-9999
+        // class overflow) saturate at 0." Scanning up to NaiveDate::MAX must
+        // hit the succ_opt() -> None guard inside the loop and stop cleanly.
+        let config = make_test_config();
+        let cal = TradingCalendar::from_config(&config).unwrap();
+        let from = NaiveDate::MAX.pred_opt().unwrap();
+        let count = cal.count_trading_days(from, NaiveDate::MAX);
+        assert!(count <= 1, "at most NaiveDate::MAX itself is countable");
+    }
+
+    #[test]
+    fn test_secs_until_next_market_open_none_beyond_date_range() {
+        // A wall-clock so far in the future that the IST day index exceeds
+        // NaiveDate's representable range must return None, never panic.
+        let config = make_test_config();
+        let cal = TradingCalendar::from_config(&config).unwrap();
+        let far_future = 100_000_000_i64 * 86_400; // ~year 275760 CE
+        assert!(cal.secs_until_next_market_open(far_future).is_none());
+    }
+
+    #[test]
     fn test_count_trading_days_expiry_day_from_t_minus_2() {
         // Today = Tue, Thu = expiry.
         // count_trading_days(Tue, Thu) = 2 (Wed + Thu).
