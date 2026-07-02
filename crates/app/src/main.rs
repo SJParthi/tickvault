@@ -3203,13 +3203,23 @@ fn create_websocket_pool(
         tickvault_common::config::SubscriptionScope::Indices4Only => {
             tickvault_core::websocket::activity_watchdog::WATCHDOG_THRESHOLD_IDX_I_SECS
         }
-        // Sub-PR #1 of 2026-05-27 — `DailyUniverse` variant introduced;
-        // production code-path activation lands in Sub-PRs #2-#13. Same
-        // IDX_I watchdog threshold applies until #8 tunes it for the
-        // 250-SID mixed universe (indices + NSE_EQ underlyings).
-        // See `.claude/rules/project/daily-universe-scope-expansion-2026-05-27.md`.
+        // Audit GAP-1 fix (<PENDING OPERATOR APPROVAL 2026-07-02>): the
+        // DailyUniverse clamp previously reused the 3s IDX_I threshold
+        // (the Sub-PR #1 2026-05-27 comment here explicitly deferred
+        // re-tuning to "#8", which never happened). Dhan's server pings
+        // every 10s and the read loop counts pings as activity
+        // (connection.rs STAGE-C.3), so the 3s clamp force-reconnected
+        // HEALTHY, still-pinging sockets during any >=3s data lull
+        // inside the market-hours gate (thin pre-open 09:00–09:15
+        // especially). 15s = one full Dhan ping interval + 50% margin:
+        // can never fire on a healthy socket, still detects a truly
+        // silent one 3.3x faster than the 50s config default. The
+        // Indices4Only arm above keeps its historical 3s value
+        // untouched. See `WATCHDOG_THRESHOLD_DAILY_UNIVERSE_SECS` docs +
+        // `.claude/rules/project/live-market-feed-subscription.md`
+        // (2026-07-02 section).
         tickvault_common::config::SubscriptionScope::DailyUniverse => {
-            tickvault_core::websocket::activity_watchdog::WATCHDOG_THRESHOLD_IDX_I_SECS
+            tickvault_core::websocket::activity_watchdog::WATCHDOG_THRESHOLD_DAILY_UNIVERSE_SECS
         }
     };
     if effective_watchdog_threshold != configured_watchdog_threshold {

@@ -4,6 +4,42 @@
 > **Scope:** Any file touching main WebSocket connection pool, subscription planning, or instrument distribution.
 > **Ground truth:** `docs/dhan-ref/03-live-market-feed-websocket.md`, `docs/dhan-ref/08-annexure-enums.md`
 
+## 2026-07-02 Update — DailyUniverse activity-watchdog floor 3s → 15s (audit GAP-1, PENDING OPERATOR APPROVAL)
+
+> **Status: `<PENDING OPERATOR APPROVAL 2026-07-02>`** — prepared on branch
+> `claude/watchdog-threshold-15s`; NOT pushed/merged until the operator
+> approves (this changes a value operator-locked 2026-05-13).
+
+**The gap (verified):** `crates/app/src/main.rs` clamped the main-feed
+`activity_watchdog_threshold_secs` to `WATCHDOG_THRESHOLD_IDX_I_SECS = 3`
+for the `DailyUniverse` scope (carried over from the Indices4Only
+dense-feed assumption; the code comment itself deferred re-tuning).
+Dhan's server pings only every 10s (`live-market-feed.md` rule 16) and
+the read loop counts pings as activity — so during any ≥3s data lull
+inside the market-hours gate (thin pre-open 09:00–09:15 especially) the
+watchdog force-reconnected a HEALTHY, still-pinging socket. This
+violated the watchdog module's own P2.1 intent (never fire on a socket
+the server itself still treats as alive) and contradicted the 50s config
+default (40s Dhan server timeout + 10s margin).
+
+**The fix:** new constant
+`WATCHDOG_THRESHOLD_DAILY_UNIVERSE_SECS = 15`
+(`crates/core/src/websocket/activity_watchdog.rs`) used by the
+DailyUniverse clamp arm. Rationale: 15s = one full Dhan ping interval +
+50% margin — a healthy socket ALWAYS shows a counted frame within 10s,
+so 15s can never fire on a healthy socket, while still detecting a truly
+silent socket 3.3x faster than the 50s default. The Indices4Only arm
+keeps its historical 3s value untouched.
+
+**Ratchet:** `activity_watchdog.rs::tests::daily_universe_threshold_is_15_above_dhan_ping_cadence`
+pins 15, `> 10` (ping cadence), `< 50` (legacy), and ≥3 poll windows.
+
+**On operator approval:** replace every
+`<PENDING OPERATOR APPROVAL 2026-07-02>` marker (this file,
+`activity_watchdog.rs`, `main.rs`, `connection.rs`) with the dated
+operator quote, flip the plan
+`.claude/plans/active-plan-watchdog-threshold.md` to APPROVED, then push.
+
 ## 2026-05-26 Update — pre-market buffer + Dhan historical REMOVED
 
 Per operator directive 2026-05-26, the `preopen_price_buffer` module

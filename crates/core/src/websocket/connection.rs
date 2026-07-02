@@ -1646,10 +1646,16 @@ impl WebSocketConnection {
             // STAGE-C.3: Bump the activity counter on EVERY Some(Ok(_)) frame
             // — binary, ping, pong, text. The watchdog only cares that the
             // socket is producing something, not what. A steady stream of
-            // Dhan pings (every 10s) is enough to keep the counter advancing
-            // during data-quiet periods so the watchdog never fires a false
-            // positive. One relaxed atomic increment is O(1) and allocation
-            // free — safe on the hot path.
+            // Dhan pings (every 10s) keeps the counter advancing during
+            // data-quiet periods, so the watchdog never fires a false
+            // positive PROVIDED the effective threshold sits above the
+            // 10s ping cadence. Audit GAP-1 (<PENDING OPERATOR APPROVAL
+            // 2026-07-02>): the DailyUniverse scope clamp is
+            // WATCHDOG_THRESHOLD_DAILY_UNIVERSE_SECS = 15 (> 10s), so
+            // this guarantee holds; the historical Indices4Only 3s clamp
+            // pre-dates it and is retained unchanged. One relaxed atomic
+            // increment is O(1) and allocation free — safe on the hot
+            // path.
             //
             // ZL-P0-1: also update the heartbeat gauge with the current
             // wall-clock epoch seconds. Grafana rule fires if

@@ -76,6 +76,29 @@ pub const WATCHDOG_THRESHOLD_LIVE_AND_DEPTH_SECS: u64 = 50;
 /// Phase 0 main-feed pool (single conn carrying all 4 IDX_I SIDs).
 pub const WATCHDOG_THRESHOLD_IDX_I_SECS: u64 = 3;
 
+/// Scope-level threshold for the `DailyUniverse` main-feed connection
+/// (audit GAP-1 fix, <PENDING OPERATOR APPROVAL 2026-07-02>).
+///
+/// Dhan's server pings every 10s (`live-market-feed.md` rule 16) and the
+/// read loop bumps the activity counter on EVERY `Some(Ok(_))` frame —
+/// binary, ping, pong, text (`connection.rs` STAGE-C.3). Therefore a
+/// HEALTHY socket ALWAYS shows counter movement within 10s, even during
+/// a total data lull. 15s = one full ping interval + 50% margin — it can
+/// never fire on a healthy, still-pinging socket, while still detecting
+/// a truly silent socket 3.3x faster than the 50s legacy default.
+///
+/// History: the DailyUniverse clamp in `crates/app/src/main.rs`
+/// previously reused `WATCHDOG_THRESHOLD_IDX_I_SECS = 3` (operator-locked
+/// 2026-05-13 under the old dense-feed assumption; the Sub-PR #1
+/// 2026-05-27 comment explicitly deferred re-tuning). During any >=3s
+/// data lull inside the market-hours gate (thin pre-open 09:00–09:15
+/// especially) that clamp force-reconnected a healthy socket — violating
+/// this module's own P2.1 intent (never fire on a socket the server
+/// itself still considers alive and is actively pinging).
+/// `WATCHDOG_THRESHOLD_IDX_I_SECS` is retained untouched for the
+/// historical Indices4Only arm.
+pub const WATCHDOG_THRESHOLD_DAILY_UNIVERSE_SECS: u64 = 15;
+
 /// Per-segment threshold for NSE_EQ cash equities (Phase 0 LEAN MVP):
 /// each F&O underlying stock produces 0.5-2 ticks/sec; with 218 SIDs
 /// the aggregate is 109-436 ticks/sec. 10s without ANY NSE_EQ frame =
@@ -494,6 +517,26 @@ mod tests {
         assert_eq!(WATCHDOG_THRESHOLD_IDX_I_SECS, 3);
         assert_eq!(WATCHDOG_THRESHOLD_NSE_EQ_SECS, 10);
         assert_eq!(WATCHDOG_THRESHOLD_VIX_SECS, 30);
+    }
+
+    #[test]
+    fn daily_universe_threshold_is_15_above_dhan_ping_cadence() {
+        // Audit GAP-1 (<PENDING OPERATOR APPROVAL 2026-07-02>): Dhan's
+        // server pings every 10s and the read loop counts pings as
+        // activity (connection.rs STAGE-C.3), so any threshold > 10s
+        // can NEVER fire on a healthy socket. 15 = 10s ping interval
+        // + 50% margin; still 3.3x faster than the 50s legacy default
+        // at detecting a truly silent socket. The 3s IDX_I value is
+        // retained for the historical Indices4Only arm only.
+        assert_eq!(WATCHDOG_THRESHOLD_DAILY_UNIVERSE_SECS, 15);
+        // Strictly above the 10s Dhan ping cadence — the healthy-socket
+        // no-false-positive bound.
+        assert!(WATCHDOG_THRESHOLD_DAILY_UNIVERSE_SECS > 10);
+        // Strictly below the legacy 50s — still a faster silent-socket
+        // detector than the config default.
+        assert!(WATCHDOG_THRESHOLD_DAILY_UNIVERSE_SECS < WATCHDOG_THRESHOLD_LIVE_AND_DEPTH_SECS);
+        // The 5s poll cadence still gives >= 3 sample windows.
+        assert!(WATCHDOG_POLL_INTERVAL_SECS * 3 <= WATCHDOG_THRESHOLD_DAILY_UNIVERSE_SECS);
     }
 
     #[test]
