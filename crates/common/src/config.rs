@@ -2617,11 +2617,14 @@ mod tests {
 
     #[test]
     fn test_sandbox_guard_blocks_live_before_july() {
+        // Date-robust (2026-07-02 coverage-gate fix): the previous version only
+        // called validate() with Live INSIDE `if today < earliest`, so from
+        // 2026-07-01 the entire D1 live-mode guard block silently fell out of
+        // coverage (the `common` floor regression on main). Now validate() runs
+        // through the guard UNCONDITIONALLY and the correct branch is asserted
+        // for whichever era "today" is in — the guard stays covered forever.
         let mut config = make_valid_config();
         config.strategy.mode = TradingMode::Live;
-        // The guard uses the current system date. Since we're before July 2026,
-        // this should fail. If running after July 2026, the guard is no longer
-        // active and this test should be updated.
         let today = (chrono::Utc::now()
             + chrono::TimeDelta::seconds(crate::constants::IST_UTC_OFFSET_SECONDS_I64))
         .date_naive();
@@ -2631,15 +2634,19 @@ mod tests {
             crate::constants::LIVE_TRADING_EARLIEST_DAY,
         )
         .unwrap();
+        let result = config.validate();
         if today < earliest {
-            let err = config.validate().unwrap_err();
+            let err = result.unwrap_err();
             assert!(
                 err.to_string().contains("SANDBOX GUARD"),
                 "should mention SANDBOX GUARD: {}",
                 err
             );
+        } else {
+            // On/after the earliest date the D1 date gate passes and validation
+            // proceeds through the URL checks.
+            result.expect("live mode on/after LIVE_TRADING_EARLIEST_DATE must validate");
         }
-        // If today >= earliest, live mode is permitted — test passes trivially.
     }
 
     #[test]
