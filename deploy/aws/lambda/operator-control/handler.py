@@ -88,7 +88,7 @@ def _github_token() -> str:
 
 
 # Destructive box actions blocked during market hours unless force=true.
-_DESTRUCTIVE = {"stop", "reboot", "restart-app", "stop-app", "wipe-questdb", "docker-reset", "docker-nuke-bare"}
+_DESTRUCTIVE = {"stop", "reboot", "restart-app", "stop-app", "wipe-questdb", "wipe-groww", "docker-reset", "docker-nuke-bare"}
 
 _MKT_OPEN_SECS = 9 * 3600 + 15 * 60
 _MKT_CLOSE_SECS = 15 * 3600 + 30 * 60
@@ -801,6 +801,163 @@ def _parse_feed_toggle(stdout: str) -> dict:
     return {"app_status": status, "app_response": body, "error": ""}
 
 
+# --------------------------------------------------------------- groww-only wipe
+# Surgical per-feed wipe (operator demand 2026-07-02: delete every groww row
+# WITHOUT touching dhan data or the SEBI audit tables). QuestDB cannot DELETE
+# rows and groww+dhan share partitions, so removal = a per-table REWRITE:
+#   CREATE <t>_gwipe with the EXACT canonical DDL (mirrored from
+#   crates/storage/src/tick_persistence.rs::TICKS_CREATE_DDL — 19 cols,
+#   TIMESTAMP(ts) PARTITION BY HOUR WAL, DEDUP UPSERT KEYS(ts, security_id,
+#   segment, capture_seq, feed) — and crates/storage/src/shadow_persistence.rs
+#   — 15 cols, timestamp(ts) PARTITION BY DAY, DEDUP UPSERT KEYS(ts,
+#   security_id, segment, feed))
+#   → INSERT the kept rows (feed != 'groww' OR feed IS NULL — NULL-feed rows
+#     are legacy dhan rows and MUST be kept; explicit column lists make the
+#     copy immune to live column-ORDER drift from historical ALTER ADDs)
+#   → VERIFY count(new) == count(old) - count(groww) BEFORE any DROP (WAL
+#     apply is async — poll up to 120s)
+#   → only then DROP old + RENAME new into place.
+# Mid-rewrite failure safety: the ORIGINAL table is NEVER dropped until the
+# copy verified; any failure aborts THAT table (original untouched, temp
+# dropped) and the run ends GROWW-WIPE-PARTIAL — never a fake OK.
+# SCOPE LOCK: market-data tables ONLY (ticks + dynamically-discovered
+# candles_*). The SEBI never-delete tables (instrument lifecycle + every
+# *_audit + index constituency + prev-day OHLCV) are NOT in the target filter.
+# Dhan replay sources (data/ws_wal, spill, dlq, instrument-cache) are NOT
+# removed — only the groww capture dir (capture file + status + bridge
+# flushed-offset snapshot), the proven resurrection vector, BEFORE restart.
+_GROWW_WIPE_PY = """
+import json, time, urllib.request, urllib.parse
+
+BASE = 'http://127.0.0.1:9000/exec?query='
+
+def q(sql, timeout=60):
+    with urllib.request.urlopen(BASE + urllib.parse.quote(sql), timeout=timeout) as r:
+        return json.load(r)
+
+def one(sql):
+    ds = q(sql).get('dataset') or []
+    if not ds or not ds[0] or ds[0][0] is None:
+        return 0
+    return int(ds[0][0])
+
+TICKS_COLS = ['feed','segment','security_id','ltp','open','high','low','close','volume','oi','avg_price','last_trade_qty','total_buy_qty','total_sell_qty','exchange_timestamp','received_at','payload_hash','capture_seq','ts']
+TICKS_TYPES = {'feed':'SYMBOL','segment':'SYMBOL','security_id':'LONG','ltp':'DOUBLE','open':'DOUBLE','high':'DOUBLE','low':'DOUBLE','close':'DOUBLE','volume':'LONG','oi':'LONG','avg_price':'DOUBLE','last_trade_qty':'LONG','total_buy_qty':'LONG','total_sell_qty':'LONG','exchange_timestamp':'LONG','received_at':'TIMESTAMP','payload_hash':'LONG','capture_seq':'LONG','ts':'TIMESTAMP'}
+CANDLE_COLS = ['feed','segment','security_id','ts','open','high','low','close','volume','oi','tick_count','close_pct_from_prev_day','open_pct','change_pct','open_gap_pct']
+CANDLE_TYPES = {'feed':'SYMBOL','segment':'SYMBOL','security_id':'LONG','ts':'TIMESTAMP','open':'DOUBLE','high':'DOUBLE','low':'DOUBLE','close':'DOUBLE','volume':'LONG','oi':'LONG','tick_count':'LONG','close_pct_from_prev_day':'DOUBLE','open_pct':'DOUBLE','change_pct':'DOUBLE','open_gap_pct':'DOUBLE'}
+
+def ddl(new, cols, types, tail):
+    body = ', '.join('%s %s' % (c, types[c]) for c in cols)
+    return 'CREATE TABLE %s (%s) %s' % (new, body, tail)
+
+def rewrite(table, cols, types, tail, dedup_key):
+    new = table + '_gwipe'
+    try:
+        live = [r[0] for r in (q("SELECT * FROM table_columns('%s')" % table).get('dataset') or [])]
+        if sorted(live) != sorted(cols):
+            print('GWIPE-SKIP %s: live schema differs from canonical (live=%s) - original untouched' % (table, ','.join(sorted(live))))
+            return False
+        total = one('SELECT count() FROM %s' % table)
+        groww = one("SELECT count() FROM %s WHERE feed = 'groww'" % table)
+        keep = total - groww
+        if groww == 0:
+            print('GWIPE-CLEAN %s: rows=%d groww=0 (nothing to remove)' % (table, total))
+            return True
+        q('DROP TABLE IF EXISTS %s' % new)
+        q(ddl(new, cols, types, tail))
+        if dedup_key:
+            q('ALTER TABLE %s DEDUP ENABLE UPSERT KEYS(%s)' % (new, dedup_key))
+        collist = ', '.join(cols)
+        q("INSERT INTO %s (%s) SELECT %s FROM %s WHERE feed != 'groww' OR feed IS NULL" % (new, collist, collist, table), timeout=1800)
+        got = -1
+        deadline = time.time() + 120
+        while time.time() < deadline:
+            got = one('SELECT count() FROM %s' % new)
+            if got == keep:
+                break
+            time.sleep(2)
+        if got != keep:
+            print('GWIPE-ABORT %s: copy verify failed (new=%d expected=%d) - ORIGINAL UNTOUCHED, temp dropped' % (table, got, keep))
+            q('DROP TABLE IF EXISTS %s' % new)
+            return False
+    except Exception as exc:
+        print('GWIPE-ABORT %s: %r - ORIGINAL UNTOUCHED' % (table, exc))
+        try:
+            q('DROP TABLE IF EXISTS %s' % new)
+        except Exception:
+            pass
+        return False
+    try:
+        q('DROP TABLE %s' % table)
+        q('RENAME TABLE %s TO %s' % (new, table))
+    except Exception as exc:
+        print('GWIPE-CRITICAL %s: swap failed midway (%r) - dhan rows are SAFE in %s; run manually: RENAME TABLE %s TO %s' % (table, exc, new, new, table))
+        return False
+    print('GWIPE-OK %s: before=%d groww_removed=%d after=%d' % (table, total, groww, keep))
+    return True
+
+names = [r[0] for r in (q('SELECT table_name FROM tables()').get('dataset') or []) if isinstance(r, list) and r]
+targets = (['ticks'] if 'ticks' in names else [])
+targets += sorted(t for t in names if t.startswith('candles_') and not t.endswith('_gwipe'))
+print('GWIPE-TARGETS %d %s' % (len(targets), targets))
+all_ok = bool(targets)
+for t in targets:
+    if t == 'ticks':
+        okr = rewrite(t, TICKS_COLS, TICKS_TYPES, 'TIMESTAMP(ts) PARTITION BY HOUR WAL', 'ts, security_id, segment, capture_seq, feed')
+    else:
+        okr = rewrite(t, CANDLE_COLS, CANDLE_TYPES, 'timestamp(ts) PARTITION BY DAY DEDUP UPSERT KEYS(ts, security_id, segment, feed)', None)
+    all_ok = all_ok and okr
+print('GWIPE-TABLES-%s' % ('OK' if all_ok else 'PARTIAL'))
+"""
+
+
+def _wipe_groww_commands() -> list[str]:
+    """Build the SSM command list for the groww-only surgical wipe. Pure —
+    unit-tested by content assertions without touching boto3. See the block
+    comment above `_GROWW_WIPE_PY` for the full design + safety contract."""
+    data_dir = "/opt/tickvault/data"
+    return [
+        "set +e",
+        # 1. stop the app + the groww sidecar FIRST: releases QuestDB writers,
+        #    stops the capture-file appender + the bridge so nothing re-appends
+        #    or re-tails groww rows mid-wipe.
+        "systemctl stop tickvault || true",
+        "pkill -f groww_sidecar.py 2>/dev/null || true",
+        # Best-effort safety net: if SSM kills this script mid-run (execution
+        # timeout on an enormous table / manual cancel), restart the app on
+        # the way out so the box is never left silently dead. SIGKILL cannot
+        # be trapped — that residual case is documented for the operator.
+        "trap 'systemctl start tickvault >/dev/null 2>&1 || true' EXIT TERM INT",
+        # 2. remove ONLY the groww capture/replay dir (capture file, status,
+        #    bridge flushed-offset snapshot) — the proven resurrection vector.
+        #    Dhan replay sources (ws_wal/spill/dlq/instrument-cache) KEPT.
+        f"rm -rf {data_dir}/groww 2>/dev/null || true",
+        "echo 'OK: groww capture/status/offset files removed (data/groww) - dhan replay sources untouched'",
+        # 3. surgical per-table rewrite (ticks + every candles_*), verified
+        #    copy-before-drop. Full transcript kept at /tmp/tv-gwipe.log.
+        "python3 - <<'PYGROWW' 2>&1 | tee /tmp/tv-gwipe.log" + _GROWW_WIPE_PY + "PYGROWW",
+        # 4. verify groww counts are 0 BEFORE restarting the app (no live
+        #    writes racing the count).
+        (
+            "sleep 2; "
+            "Q='http://127.0.0.1:9000/exec?query='; "
+            "TG=$(curl -fsS \"${Q}SELECT%20count()%20FROM%20ticks%20WHERE%20feed%20%3D%20%27groww%27\" 2>/dev/null | grep -o '\\[\\[[0-9]*' | grep -o '[0-9]*'); "
+            "CG=$(curl -fsS \"${Q}SELECT%20count()%20FROM%20candles_1m%20WHERE%20feed%20%3D%20%27groww%27\" 2>/dev/null | grep -o '\\[\\[[0-9]*' | grep -o '[0-9]*'); "
+            "echo \"GROWW-WIPE-RESULT ticks_groww=${TG:-?} candles_1m_groww=${CG:-?}\""
+        ),
+        # 5. restart the app — feeds config unchanged (a disabled groww feed
+        #    stays disabled; an enabled one resumes LIVE-only from now).
+        "systemctl start tickvault || true",
+        # 6. honest verdict: COMPLETE only when every table rewrite reported
+        #    OK AND both groww counts read 0. Anything else = PARTIAL.
+        (
+            "if grep -q 'GWIPE-TABLES-OK' /tmp/tv-gwipe.log && [ \"${TG:-1}\" = 0 ] && [ \"${CG:-1}\" = 0 ]; "
+            "then echo GROWW-WIPE-COMPLETE; "
+            "else echo 'GROWW-WIPE-PARTIAL: some tables were not rewritten or groww rows remain (originals kept safe) - inspect the GWIPE lines above'; fi"
+        ),
+    ]
+
+
 # ---------------------------------------------------------------- GitHub helper
 def _gh(method: str, path: str, body: dict | None = None) -> tuple[int, object]:
     """Minimal GitHub REST call using urllib (no deps). Returns (status, json)."""
@@ -1025,6 +1182,35 @@ def lambda_handler(event, _context):
                 ),
             ]
             cid = _ssm_shell(cmds)
+            return _resp(200, {"ok": True, "action": action, "command_id": cid})
+        if action == "wipe-groww":
+            # DESTRUCTIVE but feed-SCOPED: surgically removes every groww row
+            # from the market-data tables (per-table rewrite — QuestDB cannot
+            # DELETE rows) + the groww capture/offset files, leaving dhan data
+            # byte-identical and the SEBI never-delete tables untouched. In
+            # _DESTRUCTIVE (market-hours-blocked 09:15-15:30 IST unless force).
+            # Three server-side guards, in order:
+            #   1. confirm token — the caller must send {"confirm": "GROWW"}
+            #      (typed by the operator in the UI prompt; a scripted call
+            #      without the token can never fire this accidentally).
+            #   2. box must be RUNNING — the rewrite needs QuestDB + the SSM
+            #      agent live; dispatching to a stopped box would silently
+            #      no-op and mislead the operator.
+            #   3. the command list itself never drops an original table until
+            #      the copied row count verified (see _GROWW_WIPE_PY).
+            if str(payload.get("confirm", "")).strip() != "GROWW":
+                return _resp(
+                    409,
+                    {"error": 'wipe-groww deletes every groww tick+candle — re-send with {"confirm": "GROWW"}', "action": action},
+                )
+            inst = _client("ec2").describe_instances(InstanceIds=[INSTANCE_ID])["Reservations"][0]["Instances"][0]
+            state = inst["State"]["Name"]
+            if state != "running":
+                return _resp(
+                    409,
+                    {"error": f"box is {state} — the groww wipe needs the box RUNNING (start it first)", "action": action},
+                )
+            cid = _ssm_shell(_wipe_groww_commands())
             return _resp(200, {"ok": True, "action": action, "command_id": cid})
         if action == "docker-reset":
             # MOST DESTRUCTIVE: full Docker teardown + fresh rebuild (operator
@@ -1461,6 +1647,8 @@ def _console_html() -> str:
         <label class="switch" style="margin-top:8px"><input type="checkbox" id="force"> force (override market-hours guard)</label>
         <div class="row" style="margin-top:18px"><button class="b-stop" onclick="wipeData()">🗑️ Wipe ALL data → fresh start</button></div>
         <div class="muted" style="margin-top:6px">Deletes every tick &amp; candle in ALL timeframe tables for BOTH feeds (Dhan + Groww + any future feed) AND their capture/replay files (Groww capture file, Dhan WAL, spill, dlq) so NOTHING resurrects after restart — audit tables kept. Run when the box is RUNNING; next session = fresh data. Asks you to type WIPE.</div>
+        <div class="row" style="margin-top:18px"><button class="b-amb" onclick="wipeGroww()">🧹 Wipe GROWW data only</button></div>
+        <div class="muted" style="margin-top:6px">Surgical per-feed wipe: deletes every <b>groww</b> tick &amp; candle from every timeframe table (per-table rewrite — the DB can't delete rows in place) AND the groww capture file + offsets so nothing resurrects. <b>Dhan data untouched. Audit tables kept (SEBI).</b> Box must be RUNNING. Asks you to type GROWW.</div>
         <div class="row" style="margin-top:18px"><button class="b-stop" onclick="dockerReset()">💥 Full Docker reset → wipe EVERYTHING</button></div>
         <div class="muted" style="margin-top:6px">⚠️ NUCLEAR: deletes Docker containers + volumes + images and rebuilds from scratch. Wipes <b>ALL</b> data INCLUDING the SEBI-retention audit tables. Box must be RUNNING. Asks you to type NUKE.</div>
         <div class="row" style="margin-top:18px"><button class="b-stop" onclick="bareNuke()">☢️ Bare Nuke → delete ALL &amp; leave EMPTY</button></div>
@@ -1829,6 +2017,13 @@ async function wipeData(){
   const j=await call('wipe-questdb',{force:true});
   if(j&&j.ok){ toast('✅ wipe started — fresh data from next session'); setTimeout(loadOverview,4000); }
   else { toast((j&&j.error)||'wipe failed — is the box running?'); } }
+async function wipeGroww(){
+  if(prompt('🧹 GROWW-ONLY WIPE. Deletes EVERY groww tick + candle (per-table rewrite) and the groww capture/offset files so nothing resurrects. Dhan data is UNTOUCHED; audit tables kept (SEBI). The box must be RUNNING. Type GROWW to confirm:')!=='GROWW'){ toast('cancelled'); return; }
+  toast('🧹 groww-only wipe dispatched → rewriting tables in background…');
+  const j=await call('wipe-groww',{force:$('force').checked,confirm:'GROWW'});
+  if(!(j&&j.ok)){ toast((j&&j.error)||'groww wipe failed — is the box running?'); return; }
+  if(!j.command_id){ toast('⚠️ dispatched but no command id — re-check the groww tick count in ~2 min'); return; }
+  pollNuke(j.command_id,0); }
 async function dockerReset(){
   if(prompt('⚠️ NUCLEAR RESET. This DELETES Docker containers + volumes + images and rebuilds from scratch — wiping ALL data INCLUDING the SEBI-retention audit tables. The box must be RUNNING. Type NUKE to confirm:')!=='NUKE'){ toast('cancelled'); return; }
   if(!confirm('Last check: every table is destroyed, including audit history. Continue?')){ toast('cancelled'); return; }
@@ -1849,10 +2044,12 @@ async function bareNuke(){
 // dispatched. The teardown runs for a minute or two; we show the truthful
 // result: complete, FAILED/PARTIAL (something still in-use), or still-running.
 async function pollNuke(cid,n){
-  if(n>40){ toast('⏳ nuke still running after 3+ min — re-check the box manually'); setTimeout(loadOverview,4000); return; }
+  if(n>40){ toast('⏳ still running after 3+ min — re-check the box manually'); setTimeout(loadOverview,4000); return; }
   const s=await call('command-status',{command_id:cid}); const st=(s&&s.status)||'', out=(s&&s.stdout_tail)||'';
   if(st==='Success'||st==='Failed'||st==='Cancelled'||st==='TimedOut'){
-    if(out.indexOf('DOCKER-RESET-FAILED')>=0){ toast('🔴 NUKE FAILED — QuestDB volume still in use, data NOT wiped. Check the box.'); }
+    if(out.indexOf('GROWW-WIPE-COMPLETE')>=0){ toast('✅ GROWW wipe complete — 0 groww rows left, dhan data intact; app restarting'); }
+    else if(out.indexOf('GROWW-WIPE-PARTIAL')>=0){ toast('🟠 GROWW wipe PARTIAL — some tables not rewritten (originals kept SAFE, nothing lost). Check the Logs tab / box output.'); }
+    else if(out.indexOf('DOCKER-RESET-FAILED')>=0){ toast('🔴 NUKE FAILED — QuestDB volume still in use, data NOT wiped. Check the box.'); }
     else if(out.indexOf('bare-nuke-complete')>=0){ toast('☢️ BARE NUKE complete — 0 containers, 0 images, 0 volumes. Box is empty + DEAD (redeploy to restart).'); }
     else if(out.indexOf('bare-nuke-PARTIAL')>=0){ toast('🟠 bare nuke PARTIAL — something is still in-use. '+(out.match(/BARE-NUKE-RESULT[^\n]*/)||[''])[0]); }
     else if(out.indexOf('docker-reset-dispatched')>=0){ toast('✅ nuke complete — empty DB; app restarting'); }
