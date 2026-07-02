@@ -335,6 +335,118 @@ class SafeSql(unittest.TestCase):
         self.assertFalse(handler._is_safe_sql("vacuum"))
 
 
+class SafeSqlHardened(unittest.TestCase):
+    """DB-console hardening (2026-07-02): single-statement, no comments,
+    QuestDB mutators banned anywhere, server-side row cap."""
+
+    def test_chained_unlisted_mutator_rejected(self) -> None:
+        # THE pre-hardening gap: 'backup' was not in the banned list and the
+        # first-word check only saw "select", so a ';'-chained second
+        # statement slipped through. Now BOTH the single-statement rule and
+        # the extended banned list reject it.
+        self.assertFalse(handler._is_safe_sql("select 1; backup table ticks"))
+
+    def test_multi_statement_rejected_single_trailing_semicolon_ok(self) -> None:
+        self.assertFalse(handler._is_safe_sql("select 1; select 2"))
+        self.assertFalse(handler._is_safe_sql("select 1;;"))
+        self.assertFalse(handler._is_safe_sql(";"))
+        self.assertTrue(handler._is_safe_sql("select 1;"))  # ONE trailing ';' stripped
+
+    def test_sql_comments_rejected(self) -> None:
+        self.assertFalse(handler._is_safe_sql("-- comment\nselect 1"))
+        self.assertFalse(handler._is_safe_sql("select 1 -- tail comment"))
+        self.assertFalse(handler._is_safe_sql("select /* hidden */ 1"))
+
+    def test_with_insert_still_rejected(self) -> None:
+        self.assertFalse(handler._is_safe_sql("WITH x AS (SELECT 1) INSERT INTO t SELECT * FROM x"))
+
+    def test_questdb_mutator_keywords_rejected_anywhere(self) -> None:
+        for kw in (
+            "backup", "checkpoint", "snapshot", "cancel", "set", "refresh",
+            "detach", "attach", "dedup", "squash", "resume", "suspend",
+        ):
+            self.assertFalse(handler._is_safe_sql(f"select {kw} from ticks"), kw)
+            self.assertFalse(handler._is_safe_sql(f"{kw} table ticks"), kw)
+
+    def test_plain_reads_still_pass(self) -> None:
+        self.assertTrue(handler._is_safe_sql("SELECT * FROM ticks LIMIT 10"))
+        self.assertTrue(handler._is_safe_sql("SHOW TABLES"))
+        self.assertTrue(handler._is_safe_sql("SELECT table_name FROM tables() ORDER BY table_name"))
+        self.assertTrue(handler._is_safe_sql("SELECT * FROM table_columns('ticks')"))
+        # word-boundary sanity: 'offset' must not trip the 'set' ban.
+        self.assertTrue(handler._is_safe_sql("select * from ticks limit 10 offset"))
+
+
+class SqlRowCap(unittest.TestCase):
+    def test_oversized_user_limit_is_clamped_to_1000(self) -> None:
+        self.assertEqual(
+            handler._cap_sql_rows("select * from ticks limit 99999"),
+            "select * from ticks LIMIT 1000",
+        )
+
+    def test_missing_limit_is_appended_for_select(self) -> None:
+        self.assertEqual(
+            handler._cap_sql_rows("select * from ticks"),
+            "select * from ticks LIMIT 1000",
+        )
+
+    def test_small_user_limit_is_kept(self) -> None:
+        self.assertEqual(
+            handler._cap_sql_rows("select * from ticks limit 50"),
+            "select * from ticks limit 50",
+        )
+
+    def test_show_is_left_untouched(self) -> None:
+        # Appending LIMIT to SHOW would be a syntax error; output is tiny.
+        self.assertEqual(handler._cap_sql_rows("SHOW TABLES"), "SHOW TABLES")
+
+    def test_trailing_semicolon_is_stripped_before_append(self) -> None:
+        self.assertEqual(handler._cap_sql_rows("select 1;"), "select 1 LIMIT 1000")
+
+    def test_sql_max_rows_constant_is_1000(self) -> None:
+        self.assertEqual(handler._SQL_MAX_ROWS, 1000)
+
+
+class DbConsoleTab(unittest.TestCase):
+    def test_html_has_db_tab_between_data_and_github(self) -> None:
+        html = handler._console_html()
+        for t in ("overview", "data", "db", "github", "logs", "aws", "latency"):
+            self.assertIn('data-t="' + t + '"', html)
+        self.assertLess(html.index('data-t="data"'), html.index('data-t="db"'))
+        self.assertLess(html.index('data-t="db"'), html.index('data-t="github"'))
+
+    def test_db_tab_shows_read_only_badge(self) -> None:
+        html = handler._console_html()
+        self.assertIn("READ-ONLY — writes are blocked server-side", html)
+
+    def test_db_tab_has_all_controls(self) -> None:
+        html = handler._console_html()
+        for needle in (
+            "loadDbTables()", "runDbSql()", "dbDownloadCsv()", "dbPick(",
+            'id="dbtables"', 'id="dbsql"', 'id="dbout"', 'id="dbcount"', 'id="dbcols"',
+        ):
+            self.assertIn(needle, html, needle)
+
+    def test_db_tab_autoloads_tables_on_open(self) -> None:
+        # tab('db') must trigger loadDbTables() without an extra click.
+        html = handler._console_html()
+        self.assertIn("name==='db' && !$('dbtables').dataset.loaded) loadDbTables()", html)
+
+    def test_table_pick_is_index_based_no_injection(self) -> None:
+        # The clicked table name comes from dbTables[i] — QuestDB's own
+        # tables() output — never from user-typed input.
+        html = handler._console_html()
+        self.assertIn("dbTables[i]", html)
+        self.assertIn("table_columns(", html)
+        self.assertIn("LIMIT 100", html)
+
+    def test_grid_rows_render_through_esc(self) -> None:
+        # Every cell of the shared grid renderer must pass through esc().
+        html = handler._console_html()
+        self.assertIn("'<th>'+esc(c)+'</th>'", html)
+        self.assertIn("'<td>'+esc(tcell(c))+'</td>'", html)
+
+
 class PostRequiresAuth(unittest.TestCase):
     def setUp(self) -> None:
         self._orig = handler._control_secret
@@ -822,6 +934,146 @@ class FeedsCardHtml(unittest.TestCase):
         html = handler._console_html()
         self.assertIn("esc(j.feeds_error", html)
         self.assertIn("j.app_response.error", html)
+
+
+class _FakeEc2:
+    """Minimal describe_instances stub for the box-must-be-running gate."""
+
+    def __init__(self, state: str) -> None:
+        self._state = state
+
+    def describe_instances(self, InstanceIds):  # noqa: N803 — boto3 casing
+        return {"Reservations": [{"Instances": [{"State": {"Name": self._state}}]}]}
+
+
+class WipeGrowwGate(unittest.TestCase):
+    def setUp(self) -> None:
+        self._orig_secret = handler._control_secret
+        handler._control_secret = lambda: "s3cret-token"  # type: ignore[assignment]
+
+    def tearDown(self) -> None:
+        handler._control_secret = self._orig_secret  # type: ignore[assignment]
+
+    def _wipe_groww(self, force: bool = True, confirm: str = "GROWW"):
+        return handler.lambda_handler(
+            {
+                "requestContext": {"http": {"method": "POST"}},
+                "headers": {"authorization": "Bearer s3cret-token"},
+                "body": json.dumps({"action": "wipe-groww", "force": force, "confirm": confirm}),
+            },
+            None,
+        )
+
+    def test_wipe_groww_is_in_destructive_set(self) -> None:
+        # Membership = market-hours-blocked during 09:15-15:30 IST Mon-Fri.
+        self.assertIn("wipe-groww", handler._DESTRUCTIVE)
+
+    def test_wipe_groww_without_confirm_token_is_blocked(self) -> None:
+        # The server-side confirm token is the anti-bypass guard: even a
+        # forced, authenticated call without {"confirm": "GROWW"} is 409 and
+        # never reaches boto3/SSM.
+        for bad in ("", "WIPE", "groww", "NUKE"):
+            resp = self._wipe_groww(force=True, confirm=bad)
+            self.assertEqual(resp["statusCode"], 409, repr(bad))
+            self.assertIn("GROWW", json.loads(resp["body"])["error"])
+
+    def test_wipe_groww_requires_running_box(self) -> None:
+        # Dispatching the rewrite to a stopped box would silently no-op —
+        # the gate must 409 with the real state and never call SSM.
+        orig_client = handler._client
+        orig_shell = handler._ssm_shell
+        handler._client = lambda name, region="": _FakeEc2("stopped")  # type: ignore[assignment]
+        handler._ssm_shell = lambda cmds: self.fail("SSM must not be called for a stopped box")  # type: ignore[assignment]
+        try:
+            resp = self._wipe_groww(force=True)
+        finally:
+            handler._client = orig_client  # type: ignore[assignment]
+            handler._ssm_shell = orig_shell  # type: ignore[assignment]
+        self.assertEqual(resp["statusCode"], 409)
+        self.assertIn("stopped", json.loads(resp["body"])["error"])
+
+    def test_wipe_groww_forced_is_surgical_and_scoped(self) -> None:
+        # The dispatched command list must be groww-SCOPED and SURGICAL:
+        # exact-DDL per-table rewrite, dhan replay sources untouched, SEBI
+        # tables never named, honest completion markers.
+        captured: dict = {}
+        orig_client = handler._client
+        orig_shell = handler._ssm_shell
+        handler._client = lambda name, region="": _FakeEc2("running")  # type: ignore[assignment]
+        handler._ssm_shell = lambda cmds: (captured.__setitem__("cmds", cmds) or "cmd-groww")  # type: ignore[assignment]
+        try:
+            resp = self._wipe_groww(force=True)
+        finally:
+            handler._client = orig_client  # type: ignore[assignment]
+            handler._ssm_shell = orig_shell  # type: ignore[assignment]
+        self.assertEqual(resp["statusCode"], 200)
+        self.assertEqual(json.loads(resp["body"])["command_id"], "cmd-groww")
+        joined = "\n".join(captured["cmds"])
+        # app + groww sidecar stopped first; app restarted after.
+        self.assertIn("systemctl stop tickvault", joined)
+        self.assertIn("pkill -f groww_sidecar.py", joined)
+        self.assertIn("systemctl start tickvault", joined)
+        # ONLY the groww capture dir removed (capture file + status + bridge
+        # offset snapshot) — the resurrection vector, removed BEFORE restart.
+        self.assertIn("rm -rf /opt/tickvault/data/groww", joined)
+        # Dhan replay sources + caches MUST survive a groww-only wipe.
+        for keep in ("/ws_wal", "/spill", "/dlq", "instrument-cache"):
+            self.assertNotIn(keep, joined, f"groww-only wipe must NOT touch {keep}")
+        # Surgical rewrite, never TRUNCATE (that would kill dhan rows too).
+        self.assertNotIn("TRUNCATE", joined)
+        # Dynamic candles_* discovery — nothing hardcoded to rot.
+        self.assertIn("SELECT table_name FROM tables()", joined)
+        self.assertIn("t.startswith('candles_')", joined)
+        # Exact canonical DDL anchors (mirrored from tick_persistence.rs +
+        # shadow_persistence.rs) incl. the real DEDUP keys.
+        self.assertIn("TIMESTAMP(ts) PARTITION BY HOUR WAL", joined)
+        self.assertIn("DEDUP ENABLE UPSERT KEYS(%s)", joined)
+        self.assertIn("'ts, security_id, segment, capture_seq, feed'", joined)
+        self.assertIn("timestamp(ts) PARTITION BY DAY DEDUP UPSERT KEYS(ts, security_id, segment, feed)", joined)
+        # Keep-filter preserves NULL-feed legacy dhan rows.
+        self.assertIn("feed != 'groww' OR feed IS NULL", joined)
+        # Verified copy-before-drop + honest completion markers.
+        self.assertIn("GWIPE-ABORT", joined)
+        self.assertIn("ORIGINAL UNTOUCHED", joined)
+        self.assertIn("GROWW-WIPE-COMPLETE", joined)
+        self.assertIn("GROWW-WIPE-PARTIAL", joined)
+        # SEBI scope lock: the never-delete tables are never named.
+        for sebi in ("_audit", "instrument_lifecycle", "index_constituency", "prev_day_ohlcv", "ws_event"):
+            self.assertNotIn(sebi, joined, f"groww wipe must never name {sebi}")
+
+    def test_wipe_groww_never_drops_original_before_verify(self) -> None:
+        # Ordering ratchet inside the embedded rewrite: INSERT copy → count
+        # verify (with the abort path) → only then DROP the original table.
+        py = handler._GROWW_WIPE_PY
+        i_insert = py.index("INSERT INTO %s (%s) SELECT")
+        i_verify = py.index("copy verify failed")
+        i_drop = py.index("q('DROP TABLE %s' % table)")
+        self.assertLess(i_insert, i_verify)
+        self.assertLess(i_verify, i_drop)
+        # The abort path drops the TEMP table, never the original.
+        self.assertIn("DROP TABLE IF EXISTS %s' % new", py)
+        # The worst-case swap failure names the safe copy + the manual fix.
+        self.assertIn("GWIPE-CRITICAL", py)
+        self.assertIn("RENAME TABLE %s TO %s", py)
+
+
+class HtmlWipeGrowwButton(unittest.TestCase):
+    def test_html_has_wipe_groww_button(self) -> None:
+        html = handler._console_html()
+        self.assertIn("wipeGroww()", html)
+        self.assertIn("Wipe GROWW data only", html)
+        # Confirm prompt: the operator must type GROWW.
+        self.assertIn("Type GROWW to confirm", html)
+        # The explanatory line must spell out the scope honestly.
+        self.assertIn("Dhan data untouched", html)
+        self.assertIn("SEBI", html)
+
+    def test_wipe_groww_sends_confirm_token_and_polls_real_outcome(self) -> None:
+        html = handler._console_html()
+        self.assertIn("confirm:'GROWW'", html)
+        # Truthful async outcome via the shared command-status poller.
+        self.assertIn("GROWW-WIPE-COMPLETE", html)
+        self.assertIn("GROWW-WIPE-PARTIAL", html)
 
 
 if __name__ == "__main__":

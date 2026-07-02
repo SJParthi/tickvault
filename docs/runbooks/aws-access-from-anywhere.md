@@ -49,7 +49,35 @@ alarms, and the live alarm-status strip are all there.
 ## 2. QuestDB web console (browse/query your market data)
 
 QuestDB's console runs on the box at `127.0.0.1:9000` (localhost-only = secure).
-Tunnel it to your laptop:
+
+**One command (recommended):**
+
+```bash
+make questdb-prod        # or: bash scripts/questdb-tunnel.sh [--port N] [--no-open]
+```
+
+This resolves the running `tv-prod-app` instance dynamically (no hardcoded
+instance id), preflights the AWS CLI / credentials / session-manager-plugin
+with actionable errors, opens the SSM tunnel, waits until the local port is
+live, auto-opens the browser, and holds the tunnel until you press `Ctrl-C`.
+If local port 9000 is busy (e.g. local QuestDB running), it falls back to
+19000 and tells you. If the box is stopped, it says so and exits (or pass
+`--wait-for-box 30` to poll until it comes up).
+
+**Auto-open every trading morning (macOS, one-time install):**
+
+```bash
+make questdb-autoopen-install     # launchd agent: weekdays 08:35 IST,
+                                  # waits up to 30 min for the box
+                                  # (it auto-starts 08:30 IST Mon-Fri)
+make questdb-autoopen-uninstall   # remove it
+```
+
+Logs land in `~/Library/Logs/tickvault-questdb-tunnel.log`. The agent needs
+`aws` credentials + `session-manager-plugin` available on the Mac (same
+preflights as the manual run — failures are logged there, not silent).
+
+**Manual equivalent** (what the script does under the hood):
 
 ```bash
 aws ssm start-session \

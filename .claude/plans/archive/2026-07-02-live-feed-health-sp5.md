@@ -1,7 +1,8 @@
 # Implementation Plan: Live-Feed Health SP5 — wire Dhan per-tick freshness
 
-**Status:** APPROVED
+**Status:** VERIFIED
 **Date:** 2026-06-22
+**Reconciled:** 2026-07-02 — audit verified all 4 items shipped on origin/main; checkboxes were stale.
 **Approved by:** Parthiban (standing approval — "go ahead dude as per the plan", serial SP sequence)
 
 ## Per-Item Guarantee Matrix
@@ -150,16 +151,16 @@ keeps every existing test green (they use `market_open: true`) and adds
 
 ## Plan Items
 
-- [ ] **C1/H1 fix:** reorder `classify()` so market-open gate precedes the connected check — pre-market disconnected Dhan is `Ok "idle"`, not a false `Down`
+- [x] **C1/H1 fix:** reorder `classify()` so market-open gate precedes the connected check — pre-market disconnected Dhan is `Ok "idle"`, not a false `Down` — DONE on main: `test_disconnected_outside_market_hours_is_not_down` in `crates/common/src/feed_health.rs`
   - Files: crates/common/src/feed_health.rs
   - Tests: test_disconnected_outside_market_hours_is_not_down
-- [ ] Add `feed_health: Option<Arc<FeedHealthRegistry>>` param to `run_tick_processor`; record Dhan tick at the heartbeat block with IST offset
+- [x] Add `feed_health: Option<Arc<FeedHealthRegistry>>` param to `run_tick_processor`; record Dhan tick at the heartbeat block with IST offset — DONE on main: `feed_health` param at `crates/core/src/pipeline/tick_processor.rs:746`
   - Files: crates/core/src/pipeline/tick_processor.rs
   - Tests: test_run_tick_processor_records_dhan_feed_health, test_dhan_feed_health_uses_ist_clock
-- [ ] Add `feed_health: Option<Arc<FeedHealthRegistry>>` param to `spawn_pool_watchdog_task`; `set_connected(Dhan, active>0)` at the counter site
+- [x] Add `feed_health: Option<Arc<FeedHealthRegistry>>` param to `spawn_pool_watchdog_task`; `set_connected(Dhan, active>0)` at the counter site — DONE on main: `set_connected(Feed::Dhan, …)` at `crates/app/src/main.rs:3957`
   - Files: crates/app/src/main.rs
   - Tests: pool_watchdog_sets_dhan_connected (source-scan wiring guard)
-- [ ] Thread `Some(feed_health)` into both tick_processor + both watchdog call sites
+- [x] Thread `Some(feed_health)` into both tick_processor + both watchdog call sites — DONE on main: pinned by `crates/app/tests/sp5_dhan_feed_health_wiring_guard.rs`
   - Files: crates/app/src/main.rs
   - Tests: run_tick_processor_passes_feed_health (source-scan wiring guard)
 
