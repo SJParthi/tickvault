@@ -139,14 +139,25 @@ fn boot_completed_emit_sites_are_gated_on_live_feed() {
 #[test]
 fn test_metric_is_in_cloudwatch_scrape_filter() {
     let tftpl = read_repo("deploy/aws/terraform/user-data.sh.tftpl");
-    // The CW-agent emf_processor lists the metric twice (label_matcher +
-    // metric_selectors). Without this, the metric is emitted by the app but
-    // NEVER shipped to CloudWatch -> the alarm could never observe it.
-    let occurrences = tftpl.matches(BOOT_COMPLETED_METRIC).count();
+    // 2026-07-02 root-cause fix (B1): the metric-name regex now lives ONLY in
+    // `metric_selectors`. The old shape duplicated it into `label_matcher`
+    // with `source_labels: ["__name__"]` — but `__name__` is not a series
+    // label at the emf_processor stage, so the declaration matched ZERO
+    // metrics and Tickvault/Prod sat empty ~40 days. The correct shape:
+    // `source_labels: ["host"]` matched against its literal value, and the
+    // metric name filtered by `metric_selectors` alone. Full-shape pins live
+    // in crates/common/tests/cloudwatch_app_alarms_wiring.rs.
     assert!(
-        occurrences >= 2,
-        "`{BOOT_COMPLETED_METRIC}` must appear in BOTH the label_matcher and metric_selectors \
-         of the CloudWatch-agent metric_declaration filter (found {occurrences})."
+        tftpl.matches(BOOT_COMPLETED_METRIC).count() >= 1,
+        "`{BOOT_COMPLETED_METRIC}` must appear in the metric_selectors of the \
+         CloudWatch-agent metric_declaration filter — without it the metric is \
+         emitted by the app but NEVER shipped to CloudWatch."
+    );
+    assert!(
+        tftpl.contains("\"source_labels\": [\"host\"]"),
+        "the CW-agent metric_declaration must use source_labels [\"host\"] — a label \
+         that actually exists on the scraped series (the [\"__name__\"] shape is the \
+         40-day-empty-namespace root cause; see B1 analysis 2026-07-02)."
     );
 }
 
