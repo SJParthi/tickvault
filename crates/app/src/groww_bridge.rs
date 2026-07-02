@@ -338,6 +338,13 @@ const MIN_PLAUSIBLE_TS_IST_NANOS: i64 = 1_577_836_800_000_000_000;
 /// Rejects `i64::MAX` / mangled far-future stamps.
 const MAX_PLAUSIBLE_TS_IST_NANOS: i64 = 4_102_444_800_000_000_000;
 
+/// PR-4 (2026-07-02): max tolerated FUTURE skew between a tick's exchange
+/// timestamp and our receipt clock. Generous for legitimate exchange-vs-box
+/// skew (~15x observed), fatal for day-level poison: a tick stamped
+/// "tomorrow" (sidecar bug / SDK clock glitch) would land in a future candle
+/// bucket and confuse the IST-midnight force-seal.
+const GROWW_FUTURE_TS_TOLERANCE_NANOS: i64 = 60 * 1_000_000_000;
+
 /// Upper bound for a plausible cumulative day volume (1 trillion shares).
 /// ~1000× the busiest real NSE day-volume — rejects an absurd-but-finite `i64`
 /// (e.g. a mangled field) before it can reach the shared `ticks` table, while
@@ -362,6 +369,10 @@ enum GrowwTickReject {
     ImplausibleVolume,
     /// `security_id` is zero or negative.
     NonPositiveSecurityId,
+    /// `ts_ist_nanos` is ahead of OUR receipt clock beyond
+    /// `GROWW_FUTURE_TS_TOLERANCE_NANOS` (PR-4 2026-07-02) — a "tomorrow"
+    /// stamp would poison a future candle bucket.
+    FutureTimestamp,
     /// `ts_ist_nanos` is outside the plausible `[2020, 2100)` IST window.
     TimestampOutOfRange,
 }
@@ -369,7 +380,10 @@ enum GrowwTickReject {
 /// Validates a parsed Groww tick before persist. Pure, O(1) (a handful of
 /// finite/compare checks), no allocation. Mirrors the Dhan `is_valid_ltp`
 /// upper/lower bounds so it can never reject a genuine price.
-fn validate_groww_tick(parsed: &ParsedGrowwTick) -> Result<(), GrowwTickReject> {
+fn validate_groww_tick(
+    parsed: &ParsedGrowwTick,
+    receipt_ist_nanos: i64,
+) -> Result<(), GrowwTickReject> {
     let ltp = parsed.tick.ltp;
     if !ltp.is_finite() {
         return Err(GrowwTickReject::NonFinitePrice);
@@ -393,6 +407,16 @@ fn validate_groww_tick(parsed: &ParsedGrowwTick) -> Result<(), GrowwTickReject> 
         .contains(&parsed.tick.ts_ist_nanos)
     {
         return Err(GrowwTickReject::TimestampOutOfRange);
+    }
+    // PR-4 relative clamp: reject a tick stamped ahead of OUR receipt clock
+    // beyond the skew tolerance. Applies only when the clock read succeeded
+    // (receipt > 0) — a broken clock fails OPEN to the static bounds above,
+    // never mass-rejecting a healthy feed.
+    if receipt_ist_nanos > 0
+        && parsed.tick.ts_ist_nanos
+            > receipt_ist_nanos.saturating_add(GROWW_FUTURE_TS_TOLERANCE_NANOS)
+    {
+        return Err(GrowwTickReject::FutureTimestamp);
     }
     Ok(())
 }
@@ -746,6 +770,9 @@ impl GrowwBridgeState {
         // Drain only COMPLETE newline-terminated lines; a trailing partial line
         // (incl. a partial UTF-8 char from the chunk boundary) stays buffered.
         let prefix = drain_complete_prefix(&mut self.residual);
+        // PR-4: one clock read per WAKE (not per line — O(1) preserved) for
+        // the relative future-timestamp clamp in validate_groww_tick.
+        let wake_receipt_ist_nanos = receipt_ist_nanos();
         for line_bytes in prefix.split(|&b| b == b'\n') {
             if line_bytes.is_empty() {
                 continue;
@@ -773,7 +800,7 @@ impl GrowwBridgeState {
             // ticks/candles_1m tables (which Dhan also reads + the 15:31
             // cross-verify compares). Reject + log + skip before persist AND
             // before the aggregator fold, so one bad tick can't poison a candle.
-            if let Err(reason) = validate_groww_tick(&parsed) {
+            if let Err(reason) = validate_groww_tick(&parsed, wake_receipt_ist_nanos) {
                 error!(
                     ?reason,
                     security_id = parsed.tick.security_id,
@@ -1520,7 +1547,7 @@ mod tests {
 
     #[test]
     fn test_validate_groww_tick_accepts_valid() {
-        assert_eq!(validate_groww_tick(&valid_parsed()), Ok(()));
+        assert_eq!(validate_groww_tick(&valid_parsed(), 0), Ok(()));
     }
 
     #[test]
@@ -1528,12 +1555,12 @@ mod tests {
         let mut p = valid_parsed();
         p.tick.ltp = f64::NAN;
         assert_eq!(
-            validate_groww_tick(&p),
+            validate_groww_tick(&p, 0),
             Err(GrowwTickReject::NonFinitePrice)
         );
         p.tick.ltp = f64::INFINITY;
         assert_eq!(
-            validate_groww_tick(&p),
+            validate_groww_tick(&p, 0),
             Err(GrowwTickReject::NonFinitePrice)
         );
     }
@@ -1543,12 +1570,12 @@ mod tests {
         let mut p = valid_parsed();
         p.tick.ltp = 0.0;
         assert_eq!(
-            validate_groww_tick(&p),
+            validate_groww_tick(&p, 0),
             Err(GrowwTickReject::NonPositivePrice)
         );
         p.tick.ltp = -1.5;
         assert_eq!(
-            validate_groww_tick(&p),
+            validate_groww_tick(&p, 0),
             Err(GrowwTickReject::NonPositivePrice)
         );
     }
@@ -1558,7 +1585,7 @@ mod tests {
         let mut p = valid_parsed();
         p.tick.ltp = f64::from(tickvault_common::constants::MAX_PLAUSIBLE_LTP) + 1.0;
         assert_eq!(
-            validate_groww_tick(&p),
+            validate_groww_tick(&p, 0),
             Err(GrowwTickReject::ImplausiblePrice)
         );
     }
@@ -1568,7 +1595,7 @@ mod tests {
         let mut p = valid_parsed();
         p.tick.cum_volume = -1;
         assert_eq!(
-            validate_groww_tick(&p),
+            validate_groww_tick(&p, 0),
             Err(GrowwTickReject::NegativeVolume)
         );
     }
@@ -1578,12 +1605,12 @@ mod tests {
         let mut p = valid_parsed();
         p.tick.cum_volume = MAX_PLAUSIBLE_VOLUME + 1;
         assert_eq!(
-            validate_groww_tick(&p),
+            validate_groww_tick(&p, 0),
             Err(GrowwTickReject::ImplausibleVolume)
         );
         // Boundary is inclusive-valid.
         p.tick.cum_volume = MAX_PLAUSIBLE_VOLUME;
-        assert_eq!(validate_groww_tick(&p), Ok(()));
+        assert_eq!(validate_groww_tick(&p, 0), Ok(()));
     }
 
     #[test]
@@ -1620,12 +1647,12 @@ mod tests {
         let mut p = valid_parsed();
         p.tick.security_id = 0;
         assert_eq!(
-            validate_groww_tick(&p),
+            validate_groww_tick(&p, 0),
             Err(GrowwTickReject::NonPositiveSecurityId)
         );
         p.tick.security_id = -7;
         assert_eq!(
-            validate_groww_tick(&p),
+            validate_groww_tick(&p, 0),
             Err(GrowwTickReject::NonPositiveSecurityId)
         );
     }
@@ -1635,24 +1662,24 @@ mod tests {
         let mut p = valid_parsed();
         p.tick.ts_ist_nanos = 0;
         assert_eq!(
-            validate_groww_tick(&p),
+            validate_groww_tick(&p, 0),
             Err(GrowwTickReject::TimestampOutOfRange)
         );
         p.tick.ts_ist_nanos = -1;
         assert_eq!(
-            validate_groww_tick(&p),
+            validate_groww_tick(&p, 0),
             Err(GrowwTickReject::TimestampOutOfRange)
         );
         p.tick.ts_ist_nanos = i64::MAX;
         assert_eq!(
-            validate_groww_tick(&p),
+            validate_groww_tick(&p, 0),
             Err(GrowwTickReject::TimestampOutOfRange)
         );
         // Boundaries are inclusive-valid.
         p.tick.ts_ist_nanos = MIN_PLAUSIBLE_TS_IST_NANOS;
-        assert_eq!(validate_groww_tick(&p), Ok(()));
+        assert_eq!(validate_groww_tick(&p, 0), Ok(()));
         p.tick.ts_ist_nanos = MAX_PLAUSIBLE_TS_IST_NANOS;
-        assert_eq!(validate_groww_tick(&p), Ok(()));
+        assert_eq!(validate_groww_tick(&p, 0), Ok(()));
     }
 
     #[test]
@@ -2366,6 +2393,36 @@ mod tests {
         );
         // Defensive: a 0th call (before any respawn) still yields the base.
         assert_eq!(bridge_respawn_backoff(0).as_secs(), 5);
+    }
+
+    #[test]
+    fn test_validate_rejects_future_timestamp() {
+        // PR-4: a tick stamped ahead of the receipt clock beyond the 60s skew
+        // tolerance is rejected; at/below tolerance passes; a broken clock
+        // (receipt=0) fails OPEN to the static bounds (never mass-rejects).
+        let mut p = valid_parsed();
+        let now = p.tick.ts_ist_nanos; // pretend receipt == the tick's stamp
+        assert_eq!(validate_groww_tick(&p, now), Ok(()), "same-instant passes");
+        p.tick.ts_ist_nanos = now + 59 * 1_000_000_000;
+        assert_eq!(
+            validate_groww_tick(&p, now),
+            Ok(()),
+            "within tolerance passes"
+        );
+        p.tick.ts_ist_nanos = now + 61 * 1_000_000_000;
+        assert_eq!(
+            validate_groww_tick(&p, now),
+            Err(GrowwTickReject::FutureTimestamp),
+            "beyond tolerance rejected"
+        );
+        // 24h future (the candle-poison case) definitely rejected.
+        p.tick.ts_ist_nanos = now + 24 * 3600 * 1_000_000_000;
+        assert_eq!(
+            validate_groww_tick(&p, now),
+            Err(GrowwTickReject::FutureTimestamp)
+        );
+        // Broken clock: fail-open (static bounds only).
+        assert_eq!(validate_groww_tick(&p, 0), Ok(()), "receipt=0 fails open");
     }
 
     #[test]
