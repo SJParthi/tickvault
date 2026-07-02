@@ -1,7 +1,8 @@
 # Implementation Plan: Live-Feed Health SP5.1 — wire Dhan drops (close the false-OK)
 
-**Status:** APPROVED
+**Status:** VERIFIED
 **Date:** 2026-06-22
+**Reconciled:** 2026-07-02 — audit verified all 3 items shipped on origin/main; checkboxes were stale.
 **Approved by:** Parthiban (standing approval — "resolve issues and merge, then go ahead"; no-false-OK is mandatory)
 
 ## Per-Item Guarantee Matrix
@@ -89,15 +90,15 @@ adds the per-feed health signal alongside them, not instead of them.
 
 ## Plan Items
 
-- [ ] `WsFrameSpill`: add `feed_health` field + `with_feed_health` setter; `record_drops(Feed::Dhan, 1)` in both drop arms for `WsType::LiveFeed`
+- [x] `WsFrameSpill`: add `feed_health` field + `with_feed_health` setter; `record_drops(Feed::Dhan, 1)` in both drop arms for `WsType::LiveFeed` — DONE on main: `with_feed_health` in `crates/storage/src/ws_frame_spill.rs`
   - Files: crates/storage/src/ws_frame_spill.rs
   - Tests: test_live_feed_drop_records_dhan_feed_health, test_order_update_drop_does_not_record_dhan
-- [ ] Wire `Some(feed_health)` into `WsFrameSpill` at boot
+- [x] Wire `Some(feed_health)` into `WsFrameSpill` at boot — DONE on main: wired in `crates/app/src/main.rs`
   - Files: crates/app/src/main.rs
   - Tests: (covered by the flipped wiring guard)
-- [ ] Flip the SP5.1 pending guard → drops-now-wired; update module doc
+- [x] Flip the SP5.1 pending guard → drops-now-wired; update module doc — DONE on main: `test_sp5_1_drops_dimension_wired_in_spill` in `crates/app/tests/sp5_dhan_feed_health_wiring_guard.rs`
   - Files: crates/app/tests/sp5_dhan_feed_health_wiring_guard.rs
-  - Tests: test_sp5_1_drops_dimension_wired
+  - Tests: test_sp5_1_drops_dimension_wired_in_spill
 
 ## Scenarios
 

@@ -1,6 +1,6 @@
 # Implementation Plan: Groww honest streaming/connected flag + decoded-but-dropped visibility
 
-**Status:** APPROVED
+**Status:** VERIFIED (reconciled 2026-07-02 — audit verified all items shipped on origin/main)
 **Date:** 2026-06-29
 **Approved by:** operator standing directive 2026-06-29 ("fix the fake-connected
 signal — only show streaming on a REAL decoded tick, make the silent drop visible,
@@ -146,16 +146,16 @@ untouched), no DEDUP-key change, no data migration to undo.
   but 0 ticks" has an immediate, plain-English cause.
 
 ## Plan Items
-- [ ] feed_health.rs — `decoded_emitted`/`decoded_dropped` + `set_decode_counts` + snapshot surfacing
+- [x] feed_health.rs — `decoded_emitted`/`decoded_dropped` + `set_decode_counts` + snapshot surfacing — DONE on main: `set_decode_counts` in `crates/common/src/feed_health.rs`
   - Files: crates/common/src/feed_health.rs
   - Tests: test_registry_set_decode_counts_round_trip
-- [ ] sidecar — count drops/emits; move `streaming` to first-emit; add emitted/dropped to status JSON
+- [x] sidecar — count drops/emits; move `streaming` to first-emit; add emitted/dropped to status JSON — DONE on main: `EMITTED_TOTAL`/`DROPPED_TOTAL` at `scripts/groww-sidecar/groww_sidecar.py:400-433`
   - Files: scripts/groww-sidecar/groww_sidecar.py
   - Tests: Rust source-scan guard (no pytest harness present — skipped, noted)
-- [ ] bridge — parse emitted/dropped, call set_decode_counts; connected stays streaming-gated
+- [x] bridge — parse emitted/dropped, call set_decode_counts; connected stays streaming-gated — DONE on main: `set_decode_counts` call wired in `crates/app/src/groww_bridge.rs`
   - Files: crates/app/src/groww_bridge.rs
   - Tests: test_parse_groww_status_line_decode_counts, test_parse_groww_status_line_decode_counts_default, source-scan
-- [ ] API + page — FeedHealthRow.decoded_emitted/decoded_dropped + page `decoded · dropped` line
+- [x] API + page — FeedHealthRow.decoded_emitted/decoded_dropped + page `decoded · dropped` line — DONE on main: `decoded_emitted`/`decoded_dropped` surfaced on `GET /api/feeds/health` (`crates/api/src/handlers/feeds.rs`)
   - Files: crates/api/src/handlers/feeds.rs, crates/api/src/handlers/feeds_page.rs
   - Tests: test_get_feeds_health_reflects_decode_counts, page string-scan
 
