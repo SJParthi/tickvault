@@ -10,12 +10,15 @@ One importable dashboard that shows **everything from your phone or laptop** —
 
 | Section | Panels | Source |
 |---|---|---|
-| **Health at a glance** | overall score, market feed, order feed, QuestDB-down, clock skew, token life, silent instruments, ticks dropped, orders rejected | CloudWatch `Tickvault/Prod` (13 real metrics) |
+| **Health at a glance** | overall score, market feed, order feed, QuestDB-down, clock skew, token life, silent instruments, ticks dropped, orders rejected | CloudWatch `Tickvault/Prod` (19 real metrics) |
 | **Trends** | candles sealed (rising), health score + WS failures over time | CloudWatch |
 | **Live ticks** | total ticks, ticks-per-minute, latest 50 ticks | QuestDB (read-only) |
 
 Every panel points at a **real metric the app already publishes** (verified against
-`deploy/aws/cloudwatch-agent.json` EMF declaration) — nothing invented.
+the DEPLOYED EMF declaration in `deploy/aws/terraform/user-data.sh.tftpl` — the single
+source of truth that `amazon-cloudwatch-agent-ctl -a fetch-config` actually loads on the
+box. `deploy/aws/cloudwatch-agent.json` is a byte-for-byte reference copy of that same
+declaration, kept in sync by the `cloudwatch_app_alarms_wiring.rs` drift-guard) — nothing invented.
 
 ## Import (one-time, ~1 min)
 
