@@ -1,6 +1,6 @@
 # Operator portal Lambda — action backend for the single-page operator portal
 # (Overview / Data / GitHub / Logs / AWS / Latency tabs).
-# Re-trigger marker: bump to fire terraform-apply (re-zips handler.py). (2026-06-10b — PR #1097 cross-verify card: portal gains the 15:31 post-market cross-verify PASS/BLIND/DEGRADED card fed by /api/debug/cross-verify/latest; the #1097 handler.py change never re-zipped because terraform-apply only watches deploy/aws/terraform/** — same gap #1096 closed for #1091)
+# Re-trigger marker: bump to fire terraform-apply (re-zips handler.py). (2026-07-02 — portal feed toggles: Overview gains a FEEDS card (feeds-view/feed-toggle actions SSM-curling the app's /api/feeds + /api/feeds/health + POST /api/feeds/{feed} on 127.0.0.1:3001 — SG keeps 3001 closed), per-feed today tick counts, and the dedup check corrected 4 → 5 upsert-key columns (ts, security_id, segment, capture_seq, feed). handler.py-only changes need this bump because terraform-apply only watches deploy/aws/terraform/**)
 #
 # WHY: the operator wants ONE place (console URL + Telegram) to view AND control
 # the box, without the AWS console or GitHub UI. Grafana = view; this = control.
