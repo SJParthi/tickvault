@@ -768,6 +768,58 @@ jobs:
             fi
           fi
           if [ "$CRASHED" -eq 1 ]; then
+            # ── EXTERNAL-STOP DISAMBIGUATION (2026-07-02 fix, runs #415/#416) ─
+            # Today an EXTERNAL SSM wipe session ran `systemctl stop tickvault`
+            # while this verify window was polling — the binary was healthy,
+            # but this step declared a CRASH, rolled back, auto-stopped the
+            # service and paged "deploy FAILED". Before taking the crash path:
+            #   1. Re-check after ~10s — a transient blip (or an external
+            #      stop-then-start) may already have recovered.
+            #   2. Ask systemd WHY the unit is down. A clean EXTERNAL stop
+            #      shows Result=success with ActiveState != failed, and the
+            #      journal carries a "Stopping tickvault" line WITHOUT a crash
+            #      signature (panic / oom / non-zero exit status). That is NOT
+            #      a crash — fail with a DISTINCT message and skip the
+            #      rollback + auto-stop (the real-crash path below is
+            #      unchanged and still rolls back + auto-stops).
+            echo "possible crash detected — re-checking after 10s before declaring"
+            sleep 10
+            OUT="$(probe)"; STATE=$(parse_state "$OUT")
+            if [ "$STATE" = "active" ]; then
+              echo "service is ACTIVE again on re-check — transient, not a crash; deploy verified"
+              CRASHED=0; VERIFIED=1
+            else
+              EXT_CMD=$(aws ssm send-command \
+                --region "$REGION" --instance-ids "$IID" \
+                --document-name "AWS-RunShellScript" \
+                --comment "tickvault external-stop check sha=${{ github.sha }}" \
+                --parameters 'commands=["systemctl show tickvault -p ActiveState,SubState,Result 2>/dev/null || true","echo ===JOURNAL-LAST-20===","journalctl -u tickvault -n 20 --no-pager 2>&1 || true"]' \
+                --query 'Command.CommandId' --output text 2>/dev/null || echo "")
+              EXT_OUT=""
+              if [ -n "$EXT_CMD" ] && [ "$EXT_CMD" != "None" ]; then
+                sleep 6
+                EXT_OUT=$(aws ssm get-command-invocation \
+                  --region "$REGION" --command-id "$EXT_CMD" --instance-id "$IID" \
+                  --query 'StandardOutputContent' --output text 2>/dev/null || echo "")
+              fi
+              echo "----- EXTERNAL-STOP CHECK (systemd state + journal tail) -----"
+              echo "$EXT_OUT"
+              echo "--------------------------------------------------------------"
+              if echo "$EXT_OUT" | grep -q 'Result=success' \
+                 && ! echo "$EXT_OUT" | grep -q 'ActiveState=failed' \
+                 && echo "$EXT_OUT" | grep -qi 'Stopping tickvault' \
+                 && ! echo "$EXT_OUT" | grep -Eqi 'panic|out of memory|oom-kill|status=[1-9]'; then
+                # Cleanly STOPPED by someone else (Result=success, no failed
+                # state, no crash signature). Skip the rollback (the new binary
+                # is fine) and gate the auto-stop step off via GITHUB_ENV.
+                echo "EXTERNAL_STOP_DETECTED=yes" >> "$GITHUB_ENV"
+                echo "::error::EXTERNAL-STOP-DETECTED (not a crash): another session stopped the service during verify — re-run the deploy. Evidence: systemd Result=success + clean Stopping-tickvault journal line with no panic/oom/exit-code signature. Rollback and auto-stop are SKIPPED (the deployed binary is healthy)."
+                exit 1
+              fi
+              echo "external-stop check did not match a clean stop — treating as a genuine crash"
+            fi
+          fi
+          if [ "$CRASHED" -eq 1 ]; then
             # ── Z+ L1 DETECT (2026-06-05 fix, deploy run #176) ───────────────
             # The app started but DIED inside this 60s verify window — the most
             # common real failure (a delayed boot-step panic between T+5s and
@@ -835,7 +887,12 @@ jobs:
       - name: Auto-stop tickvault service on deploy failure (kills Telegram spam)
         # Not on an intentional off-hours skip: the box is already stopped, so
         # this would only emit InvalidInstanceId noise.
-        if: failure() && env.DEPLOY_SKIP_REASON == ''
+        # Not on EXTERNAL-STOP-DETECTED (2026-07-02, runs #415/#416): the
+        # binary is healthy and another session already stopped the service
+        # deliberately — auto-stopping again would fight that session and
+        # mask its intent. The verify step failed with a DISTINCT
+        # "EXTERNAL-STOP-DETECTED (not a crash)" message instead.
+        if: failure() && env.DEPLOY_SKIP_REASON == '' && env.EXTERNAL_STOP_DETECTED != 'yes'
         # When the deploy fails AFTER the binary is in place, systemd's
         # Restart=always keeps relaunching it every few seconds. If each
         # boot reaches the auth step (it does after PR #921/#922), each
@@ -862,12 +919,19 @@ jobs:
         # step). For earlier failures it silently no-ops via `|| true`.
         run: |
           set +e
+          # QUOTING FIX (2026-07-02, run #415 rc=127): the on-box echo message
+          # previously contained an unquoted `;` — SSM runs each commands[]
+          # element as a shell line, so the `;` TERMINATED the echo and the
+          # shell then tried to execute the rest of the sentence (`unit kept
+          # ENABLED ...`) as a command → `unit: command not found` → the whole
+          # auto-stop invocation exited rc=127 even though the systemctl stop
+          # itself succeeded. The message is now split into two `;`-free echos.
           aws ssm send-command \
             --region ${{ vars.AWS_REGION || 'ap-south-1' }} \
             --instance-ids ${{ secrets.EC2_INSTANCE_ID }} \
             --document-name "AWS-RunShellScript" \
             --comment "tickvault auto-stop on deploy failure sha=${{ github.sha }}" \
-            --parameters 'commands=["systemctl stop tickvault || true","echo AUTO-STOPPED-UNIT-STAYS-ENABLED: stopped to break the Restart=always spam loop for this boot; unit kept ENABLED so it auto-starts at the next boot and aws-autopilot self-heals it."]' \
+            --parameters 'commands=["systemctl stop tickvault || true","echo AUTO-STOPPED-UNIT-STAYS-ENABLED: stopped to break the Restart=always spam loop for this boot","echo unit kept ENABLED so it auto-starts at the next boot and aws-autopilot self-heals it"]' \
             --query Command.CommandId --output text || echo "(could not dispatch auto-stop — AWS creds likely not configured at this stage)"
 
       - name: Notify Telegram on failure
@@ -879,7 +943,14 @@ jobs:
         run: |
           SHORT_SHA="${GITHUB_SHA:0:7}"
           IST_TIME="$(TZ='Asia/Kolkata' date +'%I:%M %p IST')"
-          MSG="🆘 Deploy FAILED at ${IST_TIME} (version ${SHORT_SHA}). The app was auto-stopped to avoid repeated alerts; it stays set to auto-start at the next boot/deploy. Check the run: ${{ github.run_id }}"
+          if [ "${EXTERNAL_STOP_DETECTED:-}" = "yes" ]; then
+            # 2026-07-02 (runs #415/#416): NOT a crash — another session
+            # stopped the service during verify. The binary is healthy, no
+            # rollback and no auto-stop happened; the operator just re-runs.
+            MSG="⚠️ Deploy could not be verified at ${IST_TIME} (version ${SHORT_SHA}) — another session STOPPED the app during the check (this is NOT a crash; the new code is healthy). What you need to do RIGHT NOW: re-run the deploy once the other session finishes. Run: ${{ github.run_id }}"
+          else
+            MSG="🆘 Deploy FAILED at ${IST_TIME} (version ${SHORT_SHA}). The app was auto-stopped to avoid repeated alerts; it stays set to auto-start at the next boot/deploy. Check the run: ${{ github.run_id }}"
+          fi
           # If the app started then crashed inside the 60s verify window, the
           # Monitor step captured WHY into CRASH_DIAG — forward it so the
           # operator sees the actual reason on the phone, not just "FAILED".
