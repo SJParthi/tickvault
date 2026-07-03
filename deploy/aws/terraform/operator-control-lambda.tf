@@ -99,6 +99,15 @@ data "aws_iam_policy_document" "operator_control_permissions" {
     resources = ["arn:aws:ssm:${var.aws_region}:*:parameter/tickvault/${var.environment}/operator/github-token"]
   }
 
+  # B9 deploy provenance: read the deployed-binary git SHA (written by
+  # deploy-aws.yml after a verified swap) for the portal footer.
+  statement {
+    sid       = "ReadBinaryGitSha"
+    effect    = "Allow"
+    actions   = ["ssm:GetParameter"]
+    resources = ["arn:aws:ssm:${var.aws_region}:*:parameter/tickvault/${var.environment}/deploy/binary-git-sha"]
+  }
+
   # AWS tab: read-only CloudWatch alarm states + month-to-date cost. No
   # resource-level scoping is available for these read APIs (AWS requires "*").
   statement {
@@ -165,6 +174,11 @@ resource "aws_lambda_function" "operator_control" {
       OPERATOR_GITHUB_TOKEN_PARAM   = "/tickvault/${var.environment}/operator/github-token"
       GH_REPO                       = var.operator_github_repo
       GH_DEPLOY_WORKFLOW            = "deploy-aws.yml"
+      # B9 deploy provenance (portal footer: binary · portal · main).
+      # PORTAL_GIT_SHA = the repo tree the Lambda zip was applied from
+      # (CI sets TF_VAR_portal_git_sha; default "unknown" for local applies).
+      PORTAL_GIT_SHA   = var.portal_git_sha
+      BINARY_SHA_PARAM = "/tickvault/${var.environment}/deploy/binary-git-sha"
     }
   }
 }

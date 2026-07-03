@@ -1796,5 +1796,46 @@ class TickConservationShield(unittest.TestCase):
         self.assertIn("tc.envelope", html)
 
 
+class DeployProvenance(unittest.TestCase):
+    """B9 deploy provenance — pure formatter + fail-soft GET contract."""
+
+    def test_provenance_line_short_shas(self) -> None:
+        line = handler._provenance_line(
+            "abc1234def567890abc1234def567890abc12345",
+            "def5678900000000000000000000000000000000",
+            "xyz1234",  # already short — must not blow up
+        )
+        self.assertEqual(line, "binary abc1234 · portal def5678 · main xyz1234")
+
+    def test_provenance_line_unknown_values(self) -> None:
+        # "unknown" is exactly 7 chars — renders verbatim, never raises.
+        line = handler._provenance_line("unknown", "unknown", "unknown")
+        self.assertEqual(line, "binary unknown · portal unknown · main unknown")
+
+    def test_portal_sha_defaults_to_unknown(self) -> None:
+        old = os.environ.pop("PORTAL_GIT_SHA", None)
+        try:
+            self.assertEqual(handler._portal_sha(), "unknown")
+            os.environ["PORTAL_GIT_SHA"] = "1234567890abcdef1234567890abcdef12345678"
+            self.assertEqual(
+                handler._portal_sha(), "1234567890abcdef1234567890abcdef12345678"
+            )
+        finally:
+            if old is None:
+                os.environ.pop("PORTAL_GIT_SHA", None)
+            else:
+                os.environ["PORTAL_GIT_SHA"] = old
+
+    def test_get_html_carries_provenance_footer(self) -> None:
+        # No AWS creds / no GitHub in the test env — every lookup must
+        # fail-soft to "unknown" and the page must still render (the
+        # provenance footer can NEVER break the GET).
+        resp = handler._html_resp()
+        self.assertEqual(resp["statusCode"], 200)
+        self.assertIn("· portal", resp["body"])
+        self.assertIn("· main", resp["body"])
+        self.assertIn("<footer", resp["body"])
+
+
 if __name__ == "__main__":
     unittest.main()
