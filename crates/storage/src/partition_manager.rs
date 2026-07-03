@@ -90,6 +90,10 @@ pub(crate) const DAY_PARTITIONED_TABLES: &[&str] = &[
     // both feeds write here, `feed` is in the DEDUP key. Same SEBI-audit class +
     // DAY partitioning as the two siloed tables it merges.
     "feed_parity_1m_audit",
+    // GROWW-SCALE-01..04 (2026-07-03, auto-scale ladder PR-2): one row per
+    // ladder rung transition — same SEBI-audit class + DAY partitioning as
+    // ws_event_audit; `feed` is in the DEDUP key.
+    "groww_scale_audit",
 ];
 
 /// Tables EXEMPT from retention sweeping — NEVER detached or dropped.
