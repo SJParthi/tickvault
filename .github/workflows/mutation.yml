@@ -67,8 +67,27 @@ jobs:
       - name: Determine changed crates
         id: changed
         run: |
-          # Get list of changed .rs files in critical crates
-          CHANGED=$(gh pr diff ${{ github.event.pull_request.number }} --name-only 2>/dev/null || git diff --name-only origin/${{ github.base_ref }}...HEAD)
+          set -euo pipefail
+          # Get list of changed .rs files in critical crates, event-aware.
+          # github.base_ref is only set on pull_request events — the old
+          # unconditional fallback `git diff origin/${base_ref}...HEAD`
+          # expanded to `origin/...HEAD` on push/schedule and exited 128
+          # on every push-triggered run.
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            CHANGED=$(gh pr diff ${{ github.event.pull_request.number }} --name-only 2>/dev/null || git diff --name-only "origin/${{ github.base_ref }}...HEAD")
+          elif [ "${{ github.event_name }}" = "push" ]; then
+            before="${{ github.event.before }}"
+            if [ -z "$before" ] || [ "$before" = "0000000000000000000000000000000000000000" ] || ! git cat-file -e "$before" 2>/dev/null; then
+              # Force-push / new branch: fall back to the last commit.
+              CHANGED=$(git diff --name-only HEAD~1 HEAD 2>/dev/null || git ls-files)
+            else
+              CHANGED=$(git diff --name-only "$before" HEAD)
+            fi
+          else
+            # schedule / workflow_dispatch: no diff range — full weekly
+            # sweep over ALL critical crates.
+            CHANGED=$(printf 'crates/core/\ncrates/trading/\ncrates/common/\n')
+          fi
           PACKAGES=""
           if echo "$CHANGED" | grep -q '^crates/core/'; then
             PACKAGES="$PACKAGES --package tickvault-core"
