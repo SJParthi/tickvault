@@ -715,6 +715,41 @@ pub enum ErrorCode {
     /// operator inspects the fd/resolver pressure — cross-check
     /// RESOURCE-01).
     HttpClient01BuildFailed,
+    /// GROWW-SCALE-01 (§34 auto-scale, 2026-07-03) — the Groww auto-scale
+    /// ladder ROLLED BACK a failed rung advance: the newly added connections
+    /// were killed (verified older connections untouched), the last
+    /// KNOWN-healthy connection count was restored, and an exponential hold
+    /// (`min(10m × 2^k, 4h)`) was armed before the next attempt. This IS the
+    /// operator-demanded auto-correction ("if there is any failure how that
+    /// can be auto corrected") — Severity::High so the operator sees every
+    /// rollback; auto-triage-safe (the correction already applied).
+    GrowwScale01RollbackFired,
+    /// GROWW-SCALE-02 (§34 auto-scale, 2026-07-03) — ALL active Groww
+    /// connections failed within a 60s window: classified as an ACCOUNT-LEVEL
+    /// throttle (provider rejecting us), NOT a single-rung failure. The
+    /// ladder applied a 5-minute global cooldown, HALVED the connection count
+    /// (`N → max(ceil(N/2), 1)`), and resumed PROBING with staggered
+    /// reconnects. Severity::High, auto-triage-safe (self-applied); a
+    /// REPEATING halve down to 1 conn is the honest "Groww refuses
+    /// multi-connection" signal per §34.3.
+    GrowwScale02GlobalHalve,
+    /// GROWW-SCALE-03 (§34 auto-scale, 2026-07-03) — the fail-closed shard
+    /// invariant was violated: two shards claimed the same
+    /// `(exchange, segment, security_id)` OR the shard union did not cover
+    /// the watch-set. The ladder step HALTs; the younger conflicting
+    /// connection is killed. Should be unreachable (the `cut_shards` ratchet
+    /// tests pin disjointness + coverage) — a firing means a real cutter/
+    /// ladder bug. Severity::Critical (never auto-triaged). The `ticks`
+    /// DEDUP key still prevents duplicate rows — this is a contract breach
+    /// signal, not data loss.
+    GrowwScale03ShardOverlap,
+    /// GROWW-SCALE-04 (§34 auto-scale, 2026-07-03) — a `groww_scale_audit`
+    /// rung-transition row could not be persisted (ILP down / QuestDB
+    /// unreachable / disk full). Best-effort forensic side-record (mirror of
+    /// AUDIT-WS-01): ladder decisions continue on in-memory state; a restart
+    /// during the outage rehydrates from the last PERSISTED (always
+    /// previously-verified) rung. Severity::Medium, auto-triage-safe.
+    GrowwScale04AuditWriteFailed,
 }
 
 impl ErrorCode {
@@ -875,6 +910,11 @@ impl ErrorCode {
             Self::FeedSupervisor01Respawned => "FEED-SUPERVISOR-01",
             // C2 (2026-07-03): panic-free reqwest client construction
             Self::HttpClient01BuildFailed => "HTTP-CLIENT-01",
+            // §34 (2026-07-03): Groww multi-connection auto-scale ladder
+            Self::GrowwScale01RollbackFired => "GROWW-SCALE-01",
+            Self::GrowwScale02GlobalHalve => "GROWW-SCALE-02",
+            Self::GrowwScale03ShardOverlap => "GROWW-SCALE-03",
+            Self::GrowwScale04AuditWriteFailed => "GROWW-SCALE-04",
         }
     }
 
@@ -916,7 +956,10 @@ impl ErrorCode {
             // WS-SPILL-02 — durable frame dropped (writer dead at append instant)
             | Self::WsSpill02FrameDropped
             // PROC-01 — OOM kill detected (host out of memory)
-            | Self::Proc01OomKillDetected => Severity::Critical,
+            | Self::Proc01OomKillDetected
+            // GROWW-SCALE-03 — shard disjointness/coverage contract violated
+            // (a cutter/ladder bug; ladder step HALTs fail-closed)
+            | Self::GrowwScale03ShardOverlap => Severity::Critical,
             // Info: positive-ping / lifecycle confirmations
             Self::Selftest01Passed
             | Self::Slo01Healthy
@@ -992,7 +1035,14 @@ impl ErrorCode {
             // HTTP-CLIENT-01 (C2 2026-07-03) — a failed client build means the
             // host is under TLS/resolver/fd pressure; the site already
             // degraded gracefully, but the operator must see it (High).
-            | Self::HttpClient01BuildFailed => Severity::High,
+            | Self::HttpClient01BuildFailed
+            // GROWW-SCALE-01/02 (§34 2026-07-03) — the auto-scale ladder
+            // rolled back a failed rung / halved on fleet-wide failure. The
+            // auto-correction already applied; the operator must see every
+            // rollback (a repeat at the same rung = the discovered
+            // server-side cap).
+            | Self::GrowwScale01RollbackFired
+            | Self::GrowwScale02GlobalHalve => Severity::High,
             // Medium: data pipeline correctness
             // PR #6b (2026-05-19): I-P0-01/02/04/05 retired with their modules.
             Self::InstrumentP1CrossSegmentCollision
@@ -1040,7 +1090,10 @@ impl ErrorCode {
             | Self::DhanLane04TeardownTimeout
             // GROWW-MASTER-01 (PR-A 2026-06-28): best-effort cold-path master
             // write failed; feed + ticks unaffected, next boot re-runs. Medium.
-            | Self::GrowwMaster01PersistFailed => Severity::Medium,
+            | Self::GrowwMaster01PersistFailed
+            // GROWW-SCALE-04 (§34 2026-07-03): best-effort groww_scale_audit
+            // row write failed; ladder continues on in-memory state. Medium.
+            | Self::GrowwScale04AuditWriteFailed => Severity::Medium,
             // Low: trading-day / Dhan other
             // PR #6a (2026-05-19): I-P1-01 (DailyScheduler) + I-P1-02 (DeltaFieldCoverage) retired
             Self::InstrumentP2TradingDayGuard
@@ -1233,6 +1286,13 @@ impl ErrorCode {
             Self::HttpClient01BuildFailed => {
                 ".claude/rules/project/http-client-error-codes.md"
             }
+            // §34 (2026-07-03): Groww multi-connection auto-scale ladder
+            Self::GrowwScale01RollbackFired
+            | Self::GrowwScale02GlobalHalve
+            | Self::GrowwScale03ShardOverlap
+            | Self::GrowwScale04AuditWriteFailed => {
+                ".claude/rules/project/groww-scale-error-codes.md"
+            }
         }
     }
 
@@ -1393,6 +1453,11 @@ impl ErrorCode {
             Self::FeedSupervisor01Respawned,
             // C2 (2026-07-03): panic-free reqwest client construction
             Self::HttpClient01BuildFailed,
+            // §34 (2026-07-03): Groww multi-connection auto-scale ladder
+            Self::GrowwScale01RollbackFired,
+            Self::GrowwScale02GlobalHalve,
+            Self::GrowwScale03ShardOverlap,
+            Self::GrowwScale04AuditWriteFailed,
         ]
     }
 }
@@ -1685,7 +1750,12 @@ mod tests {
         // 2026-07-03 (C2 panic-free reqwest client): bumped 118 -> 119 for
         // HTTP-CLIENT-01 (ClientBuilder::build failed — typed degrade
         // replaces the Client::new() panic fallback at 8 storage sites).
-        assert_eq!(ErrorCode::all().len(), 119);
+        // 2026-07-03 (§34 Groww multi-connection auto-scale): bumped 119 -> 123
+        // for GROWW-SCALE-01 (ladder rollback fired) + GROWW-SCALE-02
+        // (fleet-wide failure → global cooldown + halve) + GROWW-SCALE-03
+        // (shard disjointness/coverage contract violated) + GROWW-SCALE-04
+        // (groww_scale_audit row write failed, best-effort).
+        assert_eq!(ErrorCode::all().len(), 123);
     }
 
     #[test]
@@ -1813,6 +1883,8 @@ mod tests {
                 || s.starts_with("DHAN-LANE-")
                 // PR-A 2026-06-28: Groww shared-master persist
                 || s.starts_with("GROWW-MASTER-")
+                // §34 (2026-07-03): Groww multi-connection auto-scale ladder
+                || s.starts_with("GROWW-SCALE-")
                 // 2026-06-30: feed-agnostic sidecar stall-watchdog + respawn
                 || s.starts_with("FEED-STALL-")
                 || s.starts_with("FEED-SUPERVISOR-")

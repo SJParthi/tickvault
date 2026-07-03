@@ -47,9 +47,14 @@ pub mod dhan_activation;
 pub mod groww_activation;
 /// Groww second-feed bridge — consumer side (operator lock §32). Default-OFF.
 pub mod groww_bridge;
+/// Groww auto-scale ladder FSM + gates + restart rehydration (§34, PR-2 of
+/// `.claude/plans/active-plan-groww-autoscale.md`). Default-OFF behind
+/// `[feeds.groww.scale] enabled`.
+pub mod groww_scale_ladder;
 /// Groww Python-sidecar auto-launcher + supervisor (operator lock §32 +
 /// "no manual commands" 2026-06-19). Default-OFF.
 pub mod groww_sidecar_supervisor;
+pub mod scale_test_preflight;
 /// Shared per-seal routing for BOTH feeds (Dhan + Groww) — the single
 /// `route_seal` body the two `on_seal` call sites invoke (C2, behavior-preserving).
 pub mod seal_routing;

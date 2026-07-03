@@ -1934,3 +1934,82 @@ rules:
       cross-check RESOURCE-01 and WS reconnect churn). Escalate with a 300s
       cooldown so a sustained-pressure window pages once per 5 minutes, not
       once per probe tick.
+
+  # GROWW-SCALE-01 = the auto-scale ladder rolled a failed rung back to the
+  # last KNOWN-healthy connection count (newest conns killed, exponential hold
+  # before retry). The rollback IS the auto-correction — it already fired — but
+  # a rung that keeps failing means the box or the provider refuses that scale
+  # (CPU / capture lag / auth rejects at rung N), which is exactly the live
+  # capacity answer the operator is running the scale test to learn. Escalate
+  # with a cooldown: one page per rollback episode, not per retry.
+  - name: groww-scale-01-rollback-fired-escalate
+    match:
+      code: GROWW-SCALE-01
+    action: escalate
+    runbook_path: .claude/rules/project/groww-scale-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 300
+    justification: >-
+      GROWW-SCALE-01 = the ladder auto-rolled a failed rung back to the last
+      healthy N and armed an exponential hold. Self-corrected, but the operator
+      must see WHICH rung failed and WHY (gate snapshot in the audit row) —
+      that measured ceiling is the scale test's deliverable. 300s cooldown so
+      the expo-hold retry loop pages once per episode.
+
+  # GROWW-SCALE-02 = ALL Groww connections failed inside the 60s window —
+  # classified as an ACCOUNT-level throttle/reject (provider-side), not a
+  # single-rung failure. The ladder already applied the global cooldown and
+  # HALVED the connection count. Escalate: a provider throttle needs the
+  # operator to check the Groww account / token / entitlement before the
+  # ladder re-probes.
+  - name: groww-scale-02-global-halve-escalate
+    match:
+      code: GROWW-SCALE-02
+    action: escalate
+    runbook_path: .claude/rules/project/groww-scale-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 300
+    justification: >-
+      GROWW-SCALE-02 = fleet-wide simultaneous failure (account-level throttle
+      signature). The ladder already cooled down 5 min + halved N; the operator
+      must verify the Groww account/token/entitlement because repeated global
+      halves mean the provider is rejecting the whole fleet, which no local
+      auto-fix can cure.
+
+  # GROWW-SCALE-03 = the shard cutter emitted overlapping / non-covering
+  # shards or the runtime detected the same (exchange, segment, security_id)
+  # in two connections' shards. This is a CUTTER BUG class (Critical): a
+  # double-subscribe burns the per-account subscription budget and a coverage
+  # gap silently drops instruments. The ladder step HALTs fail-closed.
+  # Critical is never auto-triaged — escalate.
+  - name: groww-scale-03-shard-overlap-escalate
+    match:
+      code: GROWW-SCALE-03
+    action: escalate
+    runbook_path: .claude/rules/project/groww-scale-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 0
+    justification: >-
+      GROWW-SCALE-03 = shard disjointness/coverage invariant broke at runtime —
+      a cutter bug (the PR-1 ratchets make this near-unreachable). The ladder
+      HALTed fail-closed; no auto-fix applies because the correct action is a
+      code fix, never a resubscribe. Critical severity is never auto-triage-safe.
+
+  # GROWW-SCALE-04 = a groww_scale_audit forensic row failed to persist via
+  # QuestDB ILP. Best-effort mirror of AUDIT-WS-01: ladder decisions continue
+  # on in-memory state; only the queryable forensic row for that transition is
+  # missing until QuestDB recovers (the counter records it). Silence — a
+  # sustained failure surfaces as the same QuestDB-ILP-degraded condition as
+  # BOOT-01/02, which have their own escalation.
+  - name: groww-scale-04-audit-write-failed-silence
+    match:
+      code: GROWW-SCALE-04
+    action: silence
+    runbook_path: .claude/rules/project/groww-scale-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 0
+    justification: >-
+      GROWW-SCALE-04 = best-effort audit-row write failed (QuestDB ILP). The
+      ladder is unaffected and the write is idempotent on retry (DEDUP UPSERT).
+      Silence: the tv_groww_scale_audit_write_errors_total counter records it;
+      persistence-layer degradation already escalates via BOOT-01/02.

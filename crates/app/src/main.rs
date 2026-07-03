@@ -33,8 +33,9 @@
 // Modules are declared in lib.rs for coverage instrumentation.
 use tickvault_app::boot_helpers::{
     CONFIG_BASE_PATH, CONFIG_LOCAL_PATH, FAST_BOOT_WINDOW_END, FAST_BOOT_WINDOW_START, IstTimer,
-    check_clock_drift, compute_market_close_sleep, create_error_log_writer, effective_ws_stagger,
-    format_bind_addr, should_emit_post_market_alert, spawn_heartbeat_watchdog,
+    check_clock_drift, compute_close_seal_sleep, compute_market_close_sleep,
+    create_error_log_writer, effective_ws_stagger, format_bind_addr, should_emit_post_market_alert,
+    spawn_heartbeat_watchdog,
 };
 use tickvault_app::{infra, observability, subsystem_memory, trading_pipeline};
 
@@ -507,21 +508,64 @@ async fn main() -> Result<()> {
     // killed the WRONG process (the healthy Python sidecar). The supervisor
     // respawns it (FEED-SUPERVISOR-01 + tv_feed_supervisor_respawn_total,
     // WS-GAP-05 pattern); the NDJSON re-tail is DEDUP-idempotent.
-    let _groww_bridge_supervisor = tickvault_app::groww_bridge::spawn_supervised_groww_bridge(
-        config.questdb.clone(),
-        std::path::PathBuf::from(tickvault_app::groww_bridge::GROWW_TICK_FILE_DEFAULT),
-        std::path::PathBuf::from(tickvault_app::groww_bridge::GROWW_STATUS_FILE_DEFAULT),
-        std::sync::Arc::clone(&feed_runtime),
-        std::sync::Arc::clone(&feed_health),
-        // ws_event_audit forensic sender (2026-06-29): one `feed='groww'` row per
-        // Groww connect/disconnect/reconnect, drained by the SAME consumer Dhan +
-        // order-update use. Closes the audit gap (Groww connected but wrote no row).
-        Some(spawn_ws_event_audit_consumer(config.questdb.clone())),
-        // Trading calendar (2026-06-29): drives the Groww IST-midnight force-seal
-        // boundary task's trading-day gate — built from the SAME `config.trading`
-        // the Dhan IST-midnight force-seal calendar uses.
-        groww_trading_calendar,
-    );
+    // §34 auto-scale (PR-2): default OFF → the single-conn spawns below are
+    // byte-identical to the pre-scale boot. When `[feeds.groww.scale]`
+    // enabled=true, the shard-bridge fleet + per-conn sidecar fleet + ladder
+    // replace the single bridge + single sidecar (same aggregator engine,
+    // same ring→spill→DLQ chain, ONE shared capture-seq across shards).
+    let groww_scale_cfg = config.feeds.groww.scale.clone();
+    let groww_shards_root =
+        std::path::PathBuf::from(tickvault_app::groww_bridge::GROWW_SHARDS_DIR_DEFAULT);
+    // §34 PR-3 (addendum A): the Mac scale-test PREFLIGHT gates the fleet.
+    // On ANY failed check the boot falls back to the SINGLE-CONNECTION Groww
+    // path — capture continues; only the multi-conn experiment is refused.
+    let groww_scale_enabled = groww_scale_cfg.enabled
+        && {
+            let report = tickvault_app::scale_test_preflight::run_scale_preflight(
+                &groww_shards_root,
+                &config.questdb,
+            );
+            let ok = report.all_ok();
+            if !ok {
+                error!(
+                    "[feeds] groww scale PREFLIGHT FAILED — falling back to the                  single-connection Groww path (capture continues; fix the                  failed checks above and restart to run the scale test)"
+                );
+            }
+            ok
+        };
+    // Watch-entries slot: the activation watcher publishes the daily
+    // subscribe set here so the ladder can cut shards (scale mode only).
+    let groww_scale_entries: std::sync::Arc<
+        arc_swap::ArcSwapOption<Vec<tickvault_core::feed::groww::instruments::WatchEntry>>,
+    > = std::sync::Arc::new(arc_swap::ArcSwapOption::empty());
+    if groww_scale_enabled {
+        let _groww_shard_bridges =
+            tickvault_app::groww_bridge::spawn_supervised_groww_shard_bridges(
+                config.questdb.clone(),
+                groww_shards_root.clone(),
+                groww_scale_cfg.target_connections,
+                std::sync::Arc::clone(&feed_runtime),
+                std::sync::Arc::clone(&feed_health),
+                Some(spawn_ws_event_audit_consumer(config.questdb.clone())),
+                groww_trading_calendar,
+            );
+    } else {
+        let _groww_bridge_supervisor = tickvault_app::groww_bridge::spawn_supervised_groww_bridge(
+            config.questdb.clone(),
+            std::path::PathBuf::from(tickvault_app::groww_bridge::GROWW_TICK_FILE_DEFAULT),
+            std::path::PathBuf::from(tickvault_app::groww_bridge::GROWW_STATUS_FILE_DEFAULT),
+            std::sync::Arc::clone(&feed_runtime),
+            std::sync::Arc::clone(&feed_health),
+            // ws_event_audit forensic sender (2026-06-29): one `feed='groww'` row per
+            // Groww connect/disconnect/reconnect, drained by the SAME consumer Dhan +
+            // order-update use. Closes the audit gap (Groww connected but wrote no row).
+            Some(spawn_ws_event_audit_consumer(config.questdb.clone())),
+            // Trading calendar (2026-06-29): drives the Groww IST-midnight force-seal
+            // boundary task's trading-day gate — built from the SAME `config.trading`
+            // the Dhan IST-midnight force-seal calendar uses.
+            groww_trading_calendar,
+        );
+    }
     // Deferred Telegram slot for the Groww sidecar supervisor: the supervisor is
     // spawned here (before the notifier is built), so it gets a shared slot that
     // is filled with the live `NotificationService` once it exists (below). On a
@@ -534,12 +578,36 @@ async fn main() -> Result<()> {
     // FEED-SUPERVISOR-01: spawn the feed-agnostic sidecar supervisor under a
     // respawning wrapper so the stall-watchdog (FEED-STALL-01) can never die
     // silently — a panic/return respawns it (WS-GAP-05 / DISK-WATCHER-01 pattern).
-    tickvault_app::groww_sidecar_supervisor::spawn_supervised_groww_sidecar_supervisor(
-        std::sync::Arc::clone(&feed_runtime),
-        tickvault_app::groww_sidecar_supervisor::GrowwSidecarOptions::default(),
-        std::sync::Arc::clone(&feed_health),
-        std::sync::Arc::clone(&groww_sidecar_notifier_slot),
-    );
+    if groww_scale_enabled {
+        // §34: the ladder publishes desired_conns; the fleet reconciles the
+        // per-conn Python children to it (spawn missing / kill newest).
+        let scale_runtime = tickvault_app::groww_scale_ladder::GrowwScaleRuntime::default();
+        let _groww_fleet = tickvault_app::groww_sidecar_supervisor::spawn_groww_scale_fleet(
+            std::sync::Arc::clone(&feed_runtime),
+            tickvault_app::groww_sidecar_supervisor::GrowwSidecarOptions::default(),
+            groww_shards_root.clone(),
+            std::sync::Arc::clone(&scale_runtime.desired_conns),
+            std::sync::Arc::clone(&scale_runtime.wake),
+            std::sync::Arc::clone(&feed_health),
+            std::sync::Arc::clone(&groww_sidecar_notifier_slot),
+        );
+        tokio::spawn(tickvault_app::groww_scale_ladder::run_groww_scale_ladder(
+            groww_scale_cfg.clone(),
+            config.questdb.clone(),
+            std::sync::Arc::clone(&feed_runtime),
+            std::sync::Arc::clone(&feed_health),
+            scale_runtime,
+            std::sync::Arc::clone(&groww_scale_entries),
+            groww_shards_root.clone(),
+        ));
+    } else {
+        tickvault_app::groww_sidecar_supervisor::spawn_supervised_groww_sidecar_supervisor(
+            std::sync::Arc::clone(&feed_runtime),
+            tickvault_app::groww_sidecar_supervisor::GrowwSidecarOptions::default(),
+            std::sync::Arc::clone(&feed_health),
+            std::sync::Arc::clone(&groww_sidecar_notifier_slot),
+        );
+    }
     tokio::spawn(
         tickvault_app::groww_activation::run_groww_activation_watcher(
             std::sync::Arc::clone(&feed_runtime),
@@ -551,6 +619,10 @@ async fn main() -> Result<()> {
             // slot the sidecar supervisor uses — carries the Groww
             // instruments-load Info ping once the watch-set resolves.
             std::sync::Arc::clone(&groww_sidecar_notifier_slot),
+            // §34: in scale mode the watcher publishes the daily subscribe
+            // set here so the ladder can cut shards. `None` (scale OFF) is
+            // byte-identical to the pre-scale watcher behavior.
+            groww_scale_enabled.then(|| std::sync::Arc::clone(&groww_scale_entries)),
         ),
     );
     // ── Dhan dormant activation watcher (PR-2, feed-toggle-full-lifecycle) ──
@@ -4727,9 +4799,11 @@ fn spawn_engine_b_aggregator(
     // the per-tick path uses (`global_seal_sender()`).
     let agg_for_boundary = std::sync::Arc::clone(&aggregator);
     let prev_day_cache_for_boundary = std::sync::Arc::clone(&prev_day_cache);
-    // Cloned BEFORE Task 3 moves `trading_calendar` — Task 4 (the watermark
-    // catch-up seal below) shares the same calendar gate.
+    // Cloned BEFORE Task 3 moves `trading_calendar` — Task 3b (close-time
+    // force-seal) and Task 4 (the watermark catch-up seal below) share the
+    // same calendar gate.
     let calendar_for_catchup = std::sync::Arc::clone(&trading_calendar);
+    let calendar_for_close_seal = std::sync::Arc::clone(&trading_calendar);
     tokio::spawn(async move {
         loop {
             // Sleep until the next IST midnight (bounded helper, ≤ 24h).
@@ -4800,6 +4874,95 @@ fn spawn_engine_b_aggregator(
         }
     });
     tracing::info!("candle-engine #T1b — IST-midnight force-seal task spawned");
+
+    // --- Task 3b: 15:30:05 IST close-time force-seal (2026-07-03) ---
+    // The LAST session minute (the 15:29 M1 bar — and every TF's final
+    // bucket) never sealed intraday: a bucket seals only on the SAME
+    // instrument's next tick, and the session gate discards ≥15:30:00
+    // ticks BEFORE they can roll the bucket, so the final buckets waited
+    // for the IST-midnight force-seal — which the 16:30 IST instance
+    // auto-stop destroys (RAM state lost). This task closes that gap:
+    // at 15:30:05 IST on trading days it force-seals every NON-always-on
+    // instrument via `force_seal_all_session_scoped` (GIFT Nifty's ~21h
+    // session must NOT be truncated at NSE close — only the midnight
+    // task seals always-on cells) and routes each seal through the SAME
+    // `route_seal` Dhan policy as Task 3.
+    //
+    // Ordering vs the 15:30:00.8 market-close pipeline stop: DELIBERATELY
+    // a parallel timer, NOT a close-sequence hook — the close sequence
+    // (`run_until_shutdown`) only aborts WS/tick-processor/trading
+    // handles; the aggregator Arc, `global_seal_sender()` and the
+    // seal-writer loop stay alive until final app shutdown, so this task
+    // runs safely after the stop AND covers both boot paths (fast boot +
+    // start_dhan_lane both call `spawn_engine_b_aggregator`).
+    //
+    // Idempotent vs the midnight seal: `force_seal` on emptied slots
+    // returns None (0 double-flushes) and any duplicate row is absorbed
+    // by the candle tables' DEDUP UPSERT KEYS. Never fires mid-session:
+    // the trigger instant is fixed strictly after the [09:15, 15:30)
+    // session-gate window closes. Same bare-spawn supervision level as
+    // the sibling Task 3 midnight force-seal.
+    let agg_for_close_seal = std::sync::Arc::clone(&aggregator);
+    let prev_day_cache_for_close_seal = std::sync::Arc::clone(&prev_day_cache);
+    tokio::spawn(async move {
+        loop {
+            // Sleep until the next 15:30:05 IST (bounded helper, ≤ 24h;
+            // returns tomorrow's trigger when at/past today's, never 0).
+            tokio::time::sleep(compute_close_seal_sleep()).await;
+
+            // Only force-seal on trading days — a weekend/holiday 15:30:05
+            // has no open buckets worth flushing.
+            if !calendar_for_close_seal.is_trading_day_today() {
+                tracing::info!("close-time force-seal: skipping (non-trading day)");
+                continue;
+            }
+
+            let Some(sender) = global_seal_sender() else {
+                tracing::warn!("close-time force-seal: seal sender not installed — skipping");
+                continue;
+            };
+
+            let mut sealed: u64 = 0;
+            let mut dropped: u64 = 0;
+            agg_for_close_seal.force_seal_all_session_scoped(
+                |security_id, segment_code, tf, state| {
+                    match tickvault_app::seal_routing::route_seal(
+                        tickvault_app::seal_routing::SealRouteParams {
+                            feed: tickvault_common::feed::Feed::Dhan,
+                            drop_d1: true,
+                            prev_day_cache: Some(prev_day_cache_for_close_seal.as_ref()),
+                            heartbeat: None,
+                            feed_health_on_m1: None,
+                        },
+                        security_id,
+                        segment_code,
+                        tf,
+                        state,
+                        sender,
+                    ) {
+                        tickvault_app::seal_routing::SealOutcome::Sent => {
+                            sealed = sealed.saturating_add(1);
+                        }
+                        tickvault_app::seal_routing::SealOutcome::DroppedFull => {
+                            dropped = dropped.saturating_add(1);
+                        }
+                        // D1 is dropped at the write boundary — not counted
+                        // as a mpsc-full drop (same policy as Task 3).
+                        tickvault_app::seal_routing::SealOutcome::DroppedD1 => {}
+                    }
+                },
+            );
+            // NOTE: no `reset_watermark()` here — the watermark reset is the
+            // IST-midnight task's cross-day duty; post-close ticks must keep
+            // advancing it for the BOUNDARY-01 catch-up driver.
+            tracing::info!(
+                sealed,
+                dropped,
+                "close-time force-seal complete — final session buckets flushed"
+            );
+        }
+    });
+    tracing::info!("candle-engine #T1b — 15:30:05 IST close-time force-seal task spawned");
 
     // --- Task 4: watermark-aware per-minute catch-up seal (BOUNDARY-01) ---
     // Bounds candle seal lag WITHOUT mass-discarding backlogged ticks. A
