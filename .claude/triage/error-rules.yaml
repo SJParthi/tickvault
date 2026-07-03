@@ -1051,6 +1051,25 @@ rules:
       runbook (PHASE2-01, BOOT-01, AUTH-GAP-03, etc.). Never auto-fix
       the composite — root cause is upstream.
 
+  - name: slo-03-publisher-respawn-escalate
+    match:
+      code: SLO-03
+    action: escalate
+    runbook_path: .claude/rules/project/wave-3-d-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 300
+    justification: >-
+      SLO-03 means the supervisor respawned the SLO evaluator/publisher
+      (the 10s tv_realtime_guarantee_score scheduler) after it died
+      (panic/cancel/clean-exit). A single respawn self-heals — the metric
+      stream resumes within ~15s. But a sustained respawn rate
+      (tv_slo_publisher_respawn_total) means a real bug in the loop, and a
+      dying publisher blinds the guarantee-critical alarm on missing data
+      (the 2026-07-03 10:35 IST incident). Mirrors DISK-WATCHER-01 /
+      WS-SPILL-01. Escalate (Telegram + draft Issue) so the operator can
+      correlate the panic backtrace, with a 5-min cooldown to avoid
+      spamming on the benign one-off respawn at shutdown.
+
   # -----------------------------------------------------------------------
   # Phase 7 (2026-04-28) — Depth-20 dynamic top-150 selector
   # -----------------------------------------------------------------------

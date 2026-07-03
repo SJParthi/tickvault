@@ -170,6 +170,12 @@ _SQL_BANNED = (
 # box and the DB tab share the same `sql` action).
 _SQL_MAX_ROWS = 1000
 
+# B4 QuestDB console: TTL of the one-click link token minted by the
+# `qdb_console_url` action. The console front Lambda verifies it (same
+# control secret, HMAC over "qdblink|<exp>") and swaps it for a 12h session
+# cookie — so the link in a browser history / Telegram scroll dies in 90s.
+_QDB_LINK_TTL_SECS = 90
+
 
 def _is_market_hours(now_utc: datetime.datetime) -> bool:
     """True during NSE market hours (Mon-Fri 09:15-15:30 IST)."""
@@ -257,6 +263,17 @@ def _cap_sql_rows(query: str, cap: int = _SQL_MAX_ROWS) -> str:
     if first in ("select", "with"):
         return f"{q} LIMIT {cap}"
     return q
+
+
+def _mint_qdb_link_token(secret: str, now_epoch: int, ttl: int = _QDB_LINK_TTL_SECS) -> str:
+    """One-click console link token: <exp>.<hexhmac(secret, "qdblink|<exp>")>.
+    Verified constant-time by the questdb-console-front Lambda against the
+    SAME SSM control secret — no second key to manage. Pure function."""
+    import hashlib  # noqa: PLC0415
+
+    exp = now_epoch + ttl
+    sig = hmac.new(secret.encode(), f"qdblink|{exp}".encode(), hashlib.sha256).hexdigest()
+    return f"{exp}.{sig}"
 
 
 def _ssm_shell(commands: list[str]) -> str:
@@ -1324,12 +1341,125 @@ def _wipe_groww_commands() -> list[str]:
     ]
 
 
+# --------------------------------------------------------- deploy provenance
+# B9 deploy provenance: the GET page footer shows `binary <7> · portal <7> ·
+# main <7>` so drift between the deployed binary, this Lambda's code tree,
+# and main HEAD is visible at a glance. HARD RULE: the GET must NEVER fail
+# or hang because of provenance — every lookup is individually fail-soft to
+# "unknown", the GitHub call is bounded to 3s and cached 60s module-globally.
+
+_BINARY_SHA_PARAM = os.environ.get("BINARY_SHA_PARAM", "/tickvault/prod/deploy/binary-git-sha")
+_PROVENANCE_GH_REPO = os.environ.get("GH_REPO", "SJParthi/tickvault")
+_PROVENANCE_GH_TOKEN_PARAM = os.environ.get("OPERATOR_GITHUB_TOKEN_PARAM", "")
+
+_MAIN_SHA_TTL_SECS = 60.0
+# 2026-07-03 hardening (adversarial-review LOW): on sustained GitHub failure
+# the cached main-HEAD value must not be served forever — past this hard
+# max-age a failed refresh degrades to "unknown" instead of a stale sha.
+_MAIN_SHA_MAX_AGE_SECS = 600.0
+_main_sha_cache: dict = {"value": "", "ts": 0.0}
+
+
+def _binary_sha() -> str:
+    """Git SHA of the last successfully deployed binary — SSM param written
+    by deploy-aws.yml after a verified swap. Fail-soft to "unknown"."""
+    try:
+        return _cached_param(_BINARY_SHA_PARAM).strip() or "unknown"
+    except Exception:  # noqa: BLE001 — provenance must never break the page
+        return "unknown"
+
+
+def _portal_sha() -> str:
+    """Git SHA of the repo tree this Lambda zip was applied from — injected
+    by terraform (var.portal_git_sha, set by CI TF_VAR_portal_git_sha)."""
+    return os.environ.get("PORTAL_GIT_SHA", "").strip() or "unknown"
+
+
+def _main_sha() -> str:
+    """HEAD sha of main via the GitHub API (existing operator token), with a
+    60s module-global cache so the page adds at most one 3s-bounded GitHub
+    round-trip per minute. Fail-soft to the cached value while it is younger
+    than the 600s hard max-age, else "unknown" (never an unboundedly stale
+    sha)."""
+    now = time.monotonic()
+    if _main_sha_cache["value"] and (now - _main_sha_cache["ts"]) <= _MAIN_SHA_TTL_SECS:
+        return _main_sha_cache["value"]
+    try:
+        import urllib.request  # noqa: PLC0415 — lazy, matches file style
+
+        req = urllib.request.Request(
+            f"https://api.github.com/repos/{_PROVENANCE_GH_REPO}/commits/main",
+            method="GET",
+        )
+        token = _cached_param(_PROVENANCE_GH_TOKEN_PARAM)
+        if token:
+            req.add_header("authorization", "Bearer " + token)
+        req.add_header("accept", "application/vnd.github+json")
+        req.add_header("user-agent", "tickvault-operator-portal")
+        with urllib.request.urlopen(req, timeout=3) as r:  # noqa: S310 — fixed host
+            sha = str(json.loads(r.read().decode() or "{}").get("sha") or "").strip()
+        if sha:
+            _main_sha_cache["value"] = sha
+            _main_sha_cache["ts"] = now
+            return sha
+    except Exception:  # noqa: BLE001 — provenance must never break the page
+        pass
+    # Refresh failed: serve the cached value only while it is younger than
+    # the 600s hard max-age; a sustained GitHub outage degrades to "unknown"
+    # instead of an unboundedly stale sha (2026-07-03 adversarial-review LOW).
+    if _main_sha_cache["value"] and (now - _main_sha_cache["ts"]) <= _MAIN_SHA_MAX_AGE_SECS:
+        return _main_sha_cache["value"]
+    return "unknown"
+
+
+def _safe_provenance_sha(sha: object) -> str:
+    """Hex-validate one provenance sha (mirrors the Rust
+    is_full_lower_hex_sha guard, widened to 7-40 for short values): anything
+    that is not 7-40 lowercase-hex becomes "unknown", so a poisoned SSM
+    param / GitHub response can never smuggle markup into the footer
+    (2026-07-03 adversarial-review MEDIUM fix)."""
+    import re  # noqa: PLC0415
+
+    if isinstance(sha, str) and re.fullmatch(r"[0-9a-f]{7,40}", sha):
+        return sha
+    return "unknown"
+
+
+def _provenance_line(binary_sha: str, portal_sha: str, main_sha: str) -> str:
+    """Pure formatter (unit-tested): short-7 provenance triple. Every input
+    is hex-validated via _safe_provenance_sha before use."""
+    b = _safe_provenance_sha(binary_sha)
+    p = _safe_provenance_sha(portal_sha)
+    m = _safe_provenance_sha(main_sha)
+    return f"binary {b[:7]} · portal {p[:7]} · main {m[:7]}"
+
+
+def _provenance_footer_html() -> str:
+    # Defense in depth: the line is already hex-validated per sha, and the
+    # assembled string is ALSO html-escaped before splicing into the page.
+    import html as _html  # noqa: PLC0415
+
+    line = _html.escape(_provenance_line(_binary_sha(), _portal_sha(), _main_sha()))
+    return (
+        '<footer style="margin-top:26px;text-align:center;font-size:11px;'
+        'color:var(--mut);opacity:.75">' + line + "</footer>"
+    )
+
+
 # --------------------------------------------------------------------- response
 def _resp(status: int, body: dict) -> dict:
     return {"statusCode": status, "headers": {"content-type": "application/json"}, "body": json.dumps(body)}
 
 
 def _html_resp() -> dict:
+    # B9 deploy provenance: inject the footer just before </body> so the
+    # giant static console template stays untouched. Fail-soft: if the
+    # footer render itself blows up, serve the page WITHOUT it.
+    html = _console_html()
+    try:
+        html = html.replace("</body>", _provenance_footer_html() + "\n</body>", 1)
+    except Exception:  # noqa: BLE001 — provenance must never break the page
+        pass
     return {
         "statusCode": 200,
         "headers": {
@@ -1337,7 +1467,7 @@ def _html_resp() -> dict:
             "cache-control": "no-store",
             "referrer-policy": "no-referrer",
         },
-        "body": _console_html(),
+        "body": html,
     }
 
 
@@ -1760,6 +1890,17 @@ def lambda_handler(event, _context):
             enc = urllib.parse.quote(q)
             out = _ssm_shell_sync(["set +e", f"curl -fsS 'http://127.0.0.1:9000/exp?query={enc}&limit={_SQL_MAX_ROWS}' 2>/dev/null | head -{_SQL_MAX_ROWS + 1} || echo 'query failed'"])
             return _resp(200, {"ok": True, "action": "sql", "csv": out})
+        if action == "qdb_console_url":
+            # READ-ONLY: mint a one-click 90s HMAC link to the B4 QuestDB
+            # console (questdb-console-front Lambda). Same control secret
+            # signs the token; the console verifies it constant-time and
+            # swaps it for a 12h session cookie. Env QDB_CONSOLE_URL is
+            # injected by Terraform only when var.enable_questdb_console.
+            base = os.environ.get("QDB_CONSOLE_URL", "").rstrip("/")
+            if not base:
+                return _resp(400, {"error": "console not enabled", "action": action})
+            tok = _mint_qdb_link_token(_control_secret(), int(time.time()))
+            return _resp(200, {"ok": True, "action": action, "url": f"{base}/open?tok={tok}"})
         if action == "logs":
             out = _ssm_shell_sync(
                 [
@@ -2054,6 +2195,7 @@ def _console_html() -> str:
       </div>
       <div class="card">
         <div class="lbl">database console &nbsp;<span class="badge unknown">READ-ONLY — writes are blocked server-side</span></div>
+        <div class="row" style="margin-bottom:10px"><button class="b-blu" onclick="openQdbConsole()">🗄 Open QuestDB Console</button></div>
         <div style="display:flex;gap:16px;flex-wrap:wrap">
           <div style="flex:1 1 200px;min-width:180px">
             <div class="lbl">tables</div>
@@ -2309,6 +2451,10 @@ async function runDbSql(){ const q=$('dbsql').value.trim(); if(!q){ toast('Type 
   const j=await call('sql',{query:q}); if(!j){ $('dbout').innerHTML=''; return; }
   dbCsv=j.csv||''; const n=renderGrid($('dbout'),parseCsv(dbCsv));
   $('dbcount').textContent=n+' row'+(n===1?'':'s')+(n>=1000?' — server cap 1000 reached':''); }
+async function openQdbConsole(){ const w=window.open('','_blank'); // open SYNC in the click (popup-safe) BEFORE the await
+  const j=await call('qdb_console_url');
+  if(j&&j.url){ if(w) w.location=j.url; else window.open(j.url,'_blank'); }
+  else { if(w) w.close(); } } // call() already toasts the {error}/non-ok case
 function dbDownloadCsv(){ if(!dbCsv){ toast('Run a query first'); return; }
   const a=document.createElement('a'); a.href=URL.createObjectURL(new Blob([dbCsv],{type:'text/csv'}));
   a.download='tickvault-query-'+new Date().toISOString().slice(0,19).replace(/[:T]/g,'-')+'.csv';

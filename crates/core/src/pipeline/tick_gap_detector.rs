@@ -50,8 +50,28 @@ const _: fn() = || {
 #[derive(Debug, Default)]
 pub struct TickGapDetector {
     /// Last-seen wall-clock instant per `(security_id, segment)` — the
-    /// composite key satisfies I-P1-11.
+    /// composite key satisfies I-P1-11. Populated by `record_tick` (real
+    /// parsed ticks) AND by `seed_subscribed` (NT-15 boot seeds, so a
+    /// never-ticking SID is scan-visible) — per-SID entries are therefore
+    /// NOT proof of a real tick; the real-tick liveness signal is the
+    /// separate `last_real_tick_offset_plus_one_secs` atomic below.
     last_seen: PapayaHashMap<TickGapKey, Instant>,
+    /// Anchor instant for the lock-free freshest-REAL-tick atomic below.
+    /// Set ONCE to the FIRST recorded tick's instant (`OnceLock`), so every
+    /// later tick is representable as a non-negative seconds offset from it
+    /// (including instants backdated relative to detector creation, which
+    /// tests use).
+    freshest_anchor: std::sync::OnceLock<Instant>,
+    /// Seconds-since-anchor of the most recent REAL tick, PLUS ONE
+    /// (`0` = no real tick recorded since boot / daily reset). Written ONLY
+    /// by `record_tick` — NEVER by `seed_subscribed` — so the market-open
+    /// self-test's `recent_tick` input cannot be contaminated by NT-15 boot
+    /// seeds (a lane restart < 60s before the 09:16:30 IST self-test would
+    /// otherwise false-PASS with zero real ticks — Rule 11 false-OK).
+    /// `fetch_max` keeps it monotonic (an out-of-order older instant never
+    /// regresses the freshest). ≤ 1s quantization (`as_secs` truncation) —
+    /// honest for the 60s self-test threshold.
+    last_real_tick_offset_plus_one_secs: std::sync::atomic::AtomicU64,
     /// Per-instrument silence threshold in seconds. Configurable via
     /// `config/base.toml` `tick_gap_threshold_seconds`.
     threshold_secs: u64,
@@ -72,6 +92,8 @@ impl TickGapDetector {
     pub fn new(threshold_secs: u64) -> Self {
         Self {
             last_seen: PapayaHashMap::new(),
+            freshest_anchor: std::sync::OnceLock::new(),
+            last_real_tick_offset_plus_one_secs: std::sync::atomic::AtomicU64::new(0),
             threshold_secs,
             last_reset_trading_date_ist: std::sync::atomic::AtomicI64::new(0),
         }
@@ -87,6 +109,18 @@ impl TickGapDetector {
         // bounded by the universe size (~25K entries) and never grows
         // beyond that during a single trading day.
         pin.insert((security_id, segment), now);
+        // B3 round-2 (2026-07-03): freshest-REAL-tick stamp — a single
+        // relaxed atomic RMW per tick (O(1), zero alloc), mirroring the
+        // per-tick map write above. The anchor is initialised exactly once
+        // (first real tick); afterwards `get_or_init` is a plain atomic
+        // load. `seed_subscribed` deliberately does NOT touch this.
+        let anchor = *self.freshest_anchor.get_or_init(|| now);
+        let offset_plus_one = now
+            .saturating_duration_since(anchor)
+            .as_secs()
+            .saturating_add(1);
+        self.last_real_tick_offset_plus_one_secs
+            .fetch_max(offset_plus_one, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// NT-15 (audit 2026-07-01): seed a subscribed instrument's `last_seen`
@@ -108,6 +142,11 @@ impl TickGapDetector {
     /// instant would falsely age a healthy instrument; seeding with a newer
     /// instant would mask a real stall). Called once per subscribed SID at
     /// boot — cold path.
+    ///
+    /// B3 round-2 (2026-07-03): seeding deliberately does NOT touch the
+    /// freshest-REAL-tick atomic — `freshest_tick_age_secs` must reflect
+    /// genuine ticks only, so boot seeds can never make the market-open
+    /// self-test's `recent_tick` check false-PASS.
     pub fn seed_subscribed(&self, security_id: u64, segment: ExchangeSegment, at: Instant) {
         let pin = self.last_seen.pin();
         // Insert-if-absent: `get_or_insert_with` never overwrites an
@@ -116,23 +155,41 @@ impl TickGapDetector {
         let _ = pin.get_or_insert_with((security_id, segment), || at);
     }
 
-    /// Age (seconds) of the MOST-RECENT real tick across ALL instruments,
-    /// or `None` if no tick has ever been recorded (map empty).
+    /// Age (seconds) of the MOST-RECENT **real** tick across ALL
+    /// instruments, or `None` if no real tick has been recorded since
+    /// boot / daily reset.
     ///
-    /// This is the "are real market ticks actually flowing?" signal —
-    /// the map is populated ONLY from genuine parsed tick frames
-    /// (`record_tick`), never from WebSocket keep-alive pings. It exists
-    /// so operator-facing health messages can report real-tick freshness
-    /// instead of raw frame freshness (which counts pings and can read
-    /// "0s ago / healthy" while zero real ticks are captured — the
-    /// 2026-06-02 false-OK). Cold path: called once per heartbeat, NOT on
-    /// the hot loop.
+    /// This is the "are real market ticks actually flowing?" signal — the
+    /// backing atomic is written ONLY from genuine parsed tick frames
+    /// (`record_tick`), never from WebSocket keep-alive pings and never
+    /// from NT-15 `seed_subscribed` boot seeds (B3 round-2, 2026-07-03:
+    /// seeds land in the `last_seen` map, which this method no longer
+    /// reads, so a lane (re)start seconds before the 09:16:30 IST
+    /// market-open self-test cannot false-PASS `recent_tick` with zero
+    /// real ticks — Rule 11 false-OK). It exists so operator-facing
+    /// health messages report real-tick freshness instead of raw frame
+    /// freshness (which counts pings — the 2026-06-02 false-OK), and it
+    /// feeds the self-test's `recent_tick` sub-check: FEED-level
+    /// liveness — seconds since ANY subscribed SID last ticked.
+    ///
+    /// O(1): a single relaxed atomic load (was an O(N) map min-scan).
+    /// ≤ 1s quantization (seconds resolution) — honest for the 60s
+    /// self-test threshold. Cleared by `reset_daily` alongside the map.
     #[must_use]
     pub fn freshest_tick_age_secs(&self, now: Instant) -> Option<u64> {
-        let pin = self.last_seen.pin();
-        pin.iter()
-            .map(|(_, last)| now.saturating_duration_since(*last).as_secs())
-            .min()
+        let stored = self
+            .last_real_tick_offset_plus_one_secs
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if stored == 0 {
+            return None;
+        }
+        // `stored > 0` implies `record_tick` initialised the anchor; the
+        // defensive `?` covers the theoretical relaxed-load window where the
+        // counter is visible before the OnceLock init completes (momentary,
+        // self-heals on the next call — never panics).
+        let anchor = self.freshest_anchor.get()?;
+        let now_offset = now.saturating_duration_since(*anchor).as_secs();
+        Some(now_offset.saturating_sub(stored - 1))
     }
 
     /// Returns the list of `(security_id, segment, gap_secs)` for every
@@ -250,6 +307,14 @@ impl TickGapDetector {
         // O(n) where n = universe size. Only runs once per day.
         // O(1) EXEMPT: cold-path daily housekeeping.
         pin.clear();
+        // B3 round-2: the freshest-REAL-tick atomic resets with the map so
+        // post-close silence does not carry a stale "fresh" claim into the
+        // next session — `freshest_tick_age_secs` reads `None` (fail-safe
+        // for the self-test) until the first real tick of the new day. The
+        // `freshest_anchor` OnceLock is deliberately NOT reset (offsets
+        // keep growing monotonically from the process-lifetime anchor).
+        self.last_real_tick_offset_plus_one_secs
+            .store(0, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Wave-2-D adversarial review (MEDIUM) — idempotent per-day
@@ -601,6 +666,96 @@ mod tests {
             now - std::time::Duration::from_secs(2),
         );
         assert_eq!(d.freshest_tick_age_secs(now), Some(2));
+    }
+
+    #[test]
+    fn test_freshest_tick_age_secs_single_sid_returns_its_age() {
+        // One tracked SID => the min IS that SID's age.
+        let d = TickGapDetector::new(30);
+        let now = Instant::now();
+        d.record_tick(
+            13,
+            ExchangeSegment::IdxI,
+            now - std::time::Duration::from_secs(7),
+        );
+        assert_eq!(d.freshest_tick_age_secs(now), Some(7));
+    }
+
+    #[test]
+    fn test_freshest_tick_age_secs_saturates_to_zero_when_now_before_last_seen() {
+        // Clock edge: a tick recorded "in the future" relative to `now`
+        // (scheduler reordering) must saturate to age 0, never underflow.
+        let d = TickGapDetector::new(30);
+        let now = Instant::now();
+        d.record_tick(
+            13,
+            ExchangeSegment::IdxI,
+            now + std::time::Duration::from_secs(5),
+        );
+        assert_eq!(d.freshest_tick_age_secs(now), Some(0));
+    }
+
+    #[test]
+    fn test_freshest_tick_age_secs_ignores_boot_seeds() {
+        // B3 round-2 (review MEDIUM-2): NT-15 boot seeds populate the SAME
+        // map scan_gaps reads, but they are NOT real ticks — a lane restart
+        // seconds before the 09:16:30 IST self-test must not false-PASS
+        // `recent_tick` on seed entries alone.
+        let d = TickGapDetector::new(30);
+        let now = Instant::now();
+        d.seed_subscribed(13, ExchangeSegment::IdxI, now);
+        d.seed_subscribed(25, ExchangeSegment::IdxI, now);
+        assert_eq!(
+            d.freshest_tick_age_secs(now),
+            None,
+            "seeds alone must NOT produce a freshest-real-tick age"
+        );
+        // A genuine tick DOES arm the signal.
+        d.record_tick(13, ExchangeSegment::IdxI, now);
+        assert_eq!(d.freshest_tick_age_secs(now), Some(0));
+    }
+
+    #[test]
+    fn test_freshest_tick_age_secs_seed_after_real_tick_does_not_refresh_it() {
+        // A seed arriving AFTER a real tick (re-subscribe path) must not
+        // make the feed look fresher than the last REAL tick.
+        let d = TickGapDetector::new(30);
+        let now = Instant::now();
+        d.record_tick(13, ExchangeSegment::IdxI, now - Duration::from_secs(45));
+        d.seed_subscribed(999, ExchangeSegment::NseEquity, now);
+        assert_eq!(
+            d.freshest_tick_age_secs(now),
+            Some(45),
+            "a later seed must not refresh the real-tick age"
+        );
+    }
+
+    #[test]
+    fn test_freshest_tick_age_secs_out_of_order_older_tick_does_not_regress() {
+        // `fetch_max` semantics: a tick carrying an OLDER instant (scheduler
+        // reordering across threads) must never regress the freshest age.
+        let d = TickGapDetector::new(30);
+        let now = Instant::now();
+        d.record_tick(13, ExchangeSegment::IdxI, now - Duration::from_secs(2));
+        d.record_tick(25, ExchangeSegment::IdxI, now - Duration::from_secs(10));
+        assert_eq!(d.freshest_tick_age_secs(now), Some(2));
+    }
+
+    #[test]
+    fn test_freshest_tick_age_secs_cleared_by_reset_daily() {
+        // The 15:35 IST daily reset clears the real-tick signal alongside
+        // the map, so overnight the self-test input fails safe (None →
+        // u64::MAX at the caller) instead of carrying yesterday's claim.
+        let d = TickGapDetector::new(30);
+        let now = Instant::now();
+        d.record_tick(13, ExchangeSegment::IdxI, now);
+        assert_eq!(d.freshest_tick_age_secs(now), Some(0));
+        d.reset_daily();
+        assert_eq!(d.freshest_tick_age_secs(now), None);
+        // A fresh post-reset tick re-arms it (anchor survives the reset).
+        let later = now + Duration::from_secs(5);
+        d.record_tick(13, ExchangeSegment::IdxI, later);
+        assert_eq!(d.freshest_tick_age_secs(later), Some(0));
     }
 
     #[test]
