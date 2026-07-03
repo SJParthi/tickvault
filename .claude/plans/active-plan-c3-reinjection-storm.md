@@ -43,6 +43,26 @@ Fix (this plan):
 2. Both call sites replaced with helper calls; `..._reinjection_clean =
    outcome.clean`, so a fully delivered replay finally lets
    `confirm_replayed()` archive the WAL — breaking the storm loop.
+2b. **Consumer-first ordering (C3 adversarial-review CRITICAL fix):** at
+   BOTH call sites the reinject block was moved so the tick-processor
+   consumer task is spawned (receiver handed off, task running) BEFORE
+   `reinject_wal_frames(...).await`, while the reinject await still
+   completes BEFORE the WS connections spawn:
+   `[channel create] → [spawn consumer] → [await reinject] → [spawn
+   connections]`. Without a live consumer, any replay >
+   `FRAME_CHANNEL_CAPACITY` filled the channel with nobody draining →
+   30s timeout → abort NOT-clean → WAL never archived — i.e. the
+   backpressure fix alone only helped the ≤capacity case that was never
+   broken. FIFO is preserved (single sequential sender loop; live frames
+   only start after connections spawn). Ratchet:
+   `ratchet_tick_processor_spawns_before_reinject_await`.
+2c. **Boot-latency honesty:** an inline 1M+-frame drain before
+   `notify_systemd_ready` takes wall-clock proportional to the consumer
+   drain rate — bounded per-send by the 30s stall timeout, unbounded in
+   total by design (zero-drop trade-off); systemd tolerates it
+   (`TimeoutStartSec=infinity`, PR #1275). Progress `info!` every
+   `WAL_REINJECT_PROGRESS_LOG_CHUNKS = 16` chunks (~131K frames) so
+   operators see movement during a long boot.
 3. New typed `ErrorCode::WsReinject01Aborted` (`"WS-REINJECT-01"`,
    `Severity::High`, auto-triage-safe, runbook
    `.claude/rules/project/ws-reinject-error-codes.md`) + `all()` catalogue
@@ -52,8 +72,11 @@ Fix (this plan):
 5. Metrics: keep `tv_ws_frame_wal_reinjected_total` (call sites, per
    injected) and `tv_ws_frame_wal_reinjected_dropped_total` (helper, on
    `aborted_remaining` — semantic continuity); new
-   `tv_ws_wal_reinject_aborted_total{reason}` (abort path) and
-   `tv_ws_wal_reinject_chunks_total` (per delivered chunk).
+   `tv_ws_frame_wal_reinject_aborted_total{reason}` (abort path) and
+   `tv_ws_frame_wal_reinject_chunks_total` (per delivered chunk).
+   (Renamed from the short-lived `tv_ws_wal_reinject_*` spellings for
+   `tv_ws_frame_wal_*` family consistency — LOW review finding; the old
+   names never shipped to prod.)
 
 Crates touched: `crates/app` (`crates/app/src/main.rs`,
 `crates/app/src/wal_reinject.rs`, `crates/app/src/lib.rs`), `crates/common`
@@ -64,7 +87,18 @@ Crates touched: `crates/app` (`crates/app/src/main.rs`,
 - Empty replay Vec → helper returns `clean = true`, `injected = 0`; call
   sites are already gated on `!ws_wal_replay_live_feed.is_empty()`.
 - Replay >> channel capacity (1M+ frames vs 131,072 slots) → backpressure
-  + consumer drain deliver everything; proven by the 1M-frame unit test.
+  + consumer drain deliver everything. Honest proof split: the 1M-frame
+  unit test proves the HELPER; production is proven by the consumer-first
+  reorder + the `ratchet_tick_processor_spawns_before_reinject_await`
+  source-scan ratchet (the earlier wording over-claimed that the unit
+  test alone proved production — it did not, because production originally
+  spawned the consumer AFTER the reinject await).
+- NO consumer running at reinject time (the pre-reorder production shape)
+  → exactly `capacity` frames absorbed, then per-send timeout → abort
+  NOT-clean; pinned by `test_no_consumer_times_out_and_aborts`.
+- Consumer spawned slightly AFTER the reinject future starts (spawn race)
+  → the generous per-send timeout rides out the gap; run completes clean;
+  pinned by `test_consumer_spawned_after_call_still_drains`.
 - Frames exactly == / ±1 of `chunk_size` → chunk-boundary tests pin no
   off-by-one (yield fires exactly on the boundary, remainder delivered).
 - `chunk_size == 0` → clamped to 1 (no divide-by-zero-analogue, no
@@ -85,7 +119,7 @@ Crates touched: `crates/app` (`crates/app/src/main.rs`,
 ## Failure Modes
 
 - **Consumer dead (`channel_closed`)** → WS-REINJECT-01 `error!` (typed,
-  Telegram via the 5-sink chain) + `tv_ws_wal_reinject_aborted_total{reason="channel_closed"}`
+  Telegram via the 5-sink chain) + `tv_ws_frame_wal_reinject_aborted_total{reason="channel_closed"}`
   + `tv_ws_frame_wal_reinjected_dropped_total` += aborted_remaining; WAL
   stays staged in `replaying/`; next boot re-replays. Cross-check WS-GAP-07.
 - **Consumer wedged (`send_timeout`)** → same abort chain with
@@ -113,12 +147,23 @@ All in `crates/app/src/wal_reinject.rs::tests` (run: `cargo test -p tickvault-ap
   injected < total, injected + aborted_remaining == total, no panic.
 - `test_wedged_consumer_times_out_and_aborts` — cap-4 channel, 50ms test
   timeout: injected == 4, aborted_remaining == 6, clean == false.
+- `test_no_consumer_times_out_and_aborts` — 200 frames > cap-64 channel,
+  receiver alive but never polled (the pre-reorder production bug shape):
+  clean == false, injected == 64 (capacity exactly), aborted_remaining > 0.
+- `test_consumer_spawned_after_call_still_drains` — 5,000 frames > cap-64,
+  draining consumer spawned ~50ms AFTER the reinject future starts:
+  clean == true, injected == 5,000, aborted_remaining == 0.
+- `ratchet_tick_processor_spawns_before_reinject_await` — source-scan
+  ordering ratchet: per boot path, `run_tick_processor(` precedes
+  `reinject_wal_frames(` in main.rs.
 - `test_reinject_wal_frames_empty_vec_is_clean_noop` — injected == 0, clean == true.
 - `test_chunk_boundary_exactness` — frames == chunk_size and ±1 all clean.
 - `test_zero_chunk_size_is_clamped` — no panic, all delivered.
 - `test_live_frames_interleave_with_large_replay` — 500K replay + live
   producer every 5ms into the same channel; all frames of both classes
-  arrive; first live frame arrives in the first half (no starvation).
+  arrive; first live frame arrives within a deterministic index bound of
+  3×chunk + channel capacity = 7,168 of 500,010 consumed items
+  (strengthened from the near-vacuous `< total/2` per review).
 - `ratchet_main_rs_uses_bounded_reinject_helper` — source-scan ratchet
   (both call sites use the helper; raw try_send loop banned;
   `WsReinject01Aborted` exists in crates/common).
@@ -149,10 +194,11 @@ semantics are untouched, so a rollback boots cleanly against any existing
 - Counters: `tv_ws_frame_wal_reinjected_total{ws_type="live_feed"}`
   (delivered), `tv_ws_frame_wal_reinjected_dropped_total{ws_type="live_feed"}`
   (aborted remainder — semantic continuity with the pre-fix counter),
-  `tv_ws_wal_reinject_aborted_total{reason}` (new, per abort),
-  `tv_ws_wal_reinject_chunks_total` (new, per delivered 8,192-frame chunk —
-  progress signal during a large replay). All static labels, zero
-  per-frame allocation.
+  `tv_ws_frame_wal_reinject_aborted_total{reason}` (new, per abort),
+  `tv_ws_frame_wal_reinject_chunks_total` (new, per delivered 8,192-frame
+  chunk — progress signal during a large replay; every 16th chunk also
+  emits the `WAL re-injection progress` `info!` line). All static labels,
+  zero per-frame allocation.
 - `info!` success line ("all replayed frames delivered with backpressure")
   and `warn!` skip-confirm line at each call site; the pre-existing
   confirm/no-confirm warn blocks are unchanged.
@@ -175,6 +221,15 @@ semantics are untouched, so a rollback boots cleanly against any existing
 - [x] Item 4 — Plan file + verification runs (fmt, clippy, scoped tests, workspace check)
   - Files: .claude/plans/active-plan-c3-reinjection-storm.md
   - Tests: cargo test -p tickvault-common, cargo test -p tickvault-app, error_code_rule_file_crossref, error_code_tag_guard
+- [x] Item 5 — Consumer-first reorder at BOTH call sites (C3 review CRITICAL): spawn `run_tick_processor` BEFORE the reinject await, reinject await BEFORE WS connections spawn
+  - Files: crates/app/src/main.rs
+  - Tests: ratchet_tick_processor_spawns_before_reinject_await, test_no_consumer_times_out_and_aborts, test_consumer_spawned_after_call_still_drains
+- [x] Item 6 — Boot-latency honesty: progress logging every 16 chunks + honest envelope in runbook (HIGH review finding)
+  - Files: crates/common/src/constants.rs, crates/app/src/wal_reinject.rs, .claude/rules/project/ws-reinject-error-codes.md
+  - Tests: test_million_frames_all_delivered_zero_drops (exercises the progress path at 1M frames)
+- [x] Item 7 — Metric family rename `tv_ws_wal_reinject_*` → `tv_ws_frame_wal_reinject_*` + strengthened interleave liveness bound (LOW + MEDIUM review findings)
+  - Files: crates/app/src/wal_reinject.rs, .claude/rules/project/ws-reinject-error-codes.md, .claude/plans/active-plan-c3-reinjection-storm.md
+  - Tests: test_live_frames_interleave_with_large_replay
 
 ## Scenarios
 
@@ -186,6 +241,8 @@ semantics are untouched, so a rollback boots cleanly against any existing
 | 4 | Live frames arrive during a huge replay | Interleaved, not starved (per-chunk yield + mpsc waiter fairness) |
 | 5 | Empty WAL | No-op (pre-existing gate), clean path |
 | 6 | Future edit reverts to try_send | Build fails via the source-scan ratchet |
+| 7 | Future edit moves the consumer spawn back AFTER the reinject await | Build fails via `ratchet_tick_processor_spawns_before_reinject_await` |
+| 8 | Boot with a huge WAL — operator watching logs | `WAL re-injection progress` info line every ~131K frames; readiness delayed linearly (systemd `TimeoutStartSec=infinity` tolerates) |
 
 ## Guarantee Matrices (from `.claude/rules/project/per-wave-guarantee-matrix.md`)
 
