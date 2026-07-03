@@ -18,8 +18,12 @@
 
 resource "aws_sqs_queue" "eventbridge_dlq" {
   name = "tv-${var.environment}-eventbridge-dlq"
-  # 14-day retention so a Friday-evening failure is still inspectable Monday.
-  message_retention_seconds = 1209600
+  # 3-day retention (B5, 2026-07-03): a bounded drain-after-inspect window.
+  # Covers a Friday-evening failure through Monday inspection, then the queue
+  # self-drains — the alarm below is edge-triggered on NEW arrivals
+  # (NumberOfMessagesSent), so retention no longer controls how long a page
+  # latches; it only bounds how long a dead-lettered payload stays inspectable.
+  message_retention_seconds = 259200
   sqs_managed_sse_enabled   = true
 
   tags = {
@@ -54,20 +58,30 @@ resource "aws_sqs_queue_policy" "eventbridge_dlq" {
   })
 }
 
-# Auto-page when ANY message lands in the DLQ — i.e. the EventBridge retry
+# Auto-page when a NEW message lands in the DLQ — i.e. the EventBridge retry
 # ladder was exhausted and a start/stop genuinely failed. This is the
 # "no human input" backstop: a persistent failure now pages instead of being
 # discovered by the operator at 09:05.
+#
+# SEMANTICS FIX (B5, 2026-07-03): the previous metric
+# (ApproximateNumberOfMessagesVisible, Maximum > 0) LATCHED the alarm in
+# ALARM state for the entire SQS retention window while a stale, already-
+# inspected message sat in the queue — days of a permanently-red alarm with
+# no new failure. NumberOfMessagesSent (Sum > 0 per 5-min period) fires the
+# period a NEW message dead-letters, then self-clears; the queue self-drains
+# after the bounded 3-day inspect window above. The resource + alarm names
+# keep the historical "depth" wording deliberately — renaming would
+# delete/recreate the alarm for zero benefit.
 resource "aws_cloudwatch_metric_alarm" "eventbridge_dlq_depth" {
   alarm_name          = "tv-${var.environment}-eventbridge-dlq-depth"
   comparison_operator = "GreaterThanThreshold"
   evaluation_periods  = 1
-  metric_name         = "ApproximateNumberOfMessagesVisible"
+  metric_name         = "NumberOfMessagesSent"
   namespace           = "AWS/SQS"
-  period              = 60
-  statistic           = "Maximum"
+  period              = 300
+  statistic           = "Sum"
   threshold           = 0
-  alarm_description   = "An EC2 start/stop EventBridge invocation exhausted its retries and dead-lettered — the daily 08:30/16:30 IST schedule failed. Inspect the DLQ message + CloudTrail StartInstances. See aws-startinstances-failed.md."
+  alarm_description   = "A NEW EC2 start/stop EventBridge invocation exhausted its retries and dead-lettered — the daily 08:30/16:30 IST schedule failed. Pages on new dead-letter arrival (edge-trigger, self-clears next period); the queue self-drains after the bounded 3-day inspect window. Inspect the DLQ message + CloudTrail StartInstances. See aws-startinstances-failed.md."
   treat_missing_data  = "notBreaching"
 
   dimensions = {

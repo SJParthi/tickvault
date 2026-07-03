@@ -1796,5 +1796,183 @@ class TickConservationShield(unittest.TestCase):
         self.assertIn("tc.envelope", html)
 
 
+class QdbConsoleUrlAction(unittest.TestCase):
+    """B4: the `qdb_console_url` action mints a 90s one-click HMAC link to the
+    QuestDB console front Lambda (env QDB_CONSOLE_URL, TF-injected)."""
+
+    SECRET = "s3cret-token"
+
+    def setUp(self) -> None:
+        self._orig = handler._control_secret
+        handler._control_secret = lambda: self.SECRET  # type: ignore[assignment]
+        self._env = os.environ.pop("QDB_CONSOLE_URL", None)
+
+    def tearDown(self) -> None:
+        handler._control_secret = self._orig  # type: ignore[assignment]
+        if self._env is not None:
+            os.environ["QDB_CONSOLE_URL"] = self._env
+        else:
+            os.environ.pop("QDB_CONSOLE_URL", None)
+
+    def _dispatch(self) -> dict:
+        ev = {
+            "requestContext": {"http": {"method": "POST"}},
+            "headers": {"authorization": f"Bearer {self.SECRET}"},
+            "body": json.dumps({"action": "qdb_console_url"}),
+        }
+        return handler.lambda_handler(ev, None)
+
+    def test_qdb_console_url_disabled_returns_error(self) -> None:
+        # Console not deployed (env empty) → honest error, no fake URL.
+        resp = self._dispatch()
+        self.assertEqual(resp["statusCode"], 400)
+        self.assertIn("console not enabled", json.loads(resp["body"])["error"])
+
+    def test_qdb_console_url_enabled_returns_signed_link(self) -> None:
+        import hashlib
+        import hmac as hmac_mod
+        import time as time_mod
+
+        os.environ["QDB_CONSOLE_URL"] = "https://console.example.test/"
+        before = int(time_mod.time())
+        resp = self._dispatch()
+        after = int(time_mod.time())
+        self.assertEqual(resp["statusCode"], 200)
+        url = json.loads(resp["body"])["url"]
+        # trailing slash on the env base must not produce '//open'
+        self.assertTrue(url.startswith("https://console.example.test/open?tok="), url)
+        tok = url.split("tok=", 1)[1]
+        exp_s, _, sig = tok.partition(".")
+        exp = int(exp_s)
+        # ~90s TTL (token shape + expiry ratchet)
+        self.assertGreaterEqual(exp, before + handler._QDB_LINK_TTL_SECS)
+        self.assertLessEqual(exp, after + handler._QDB_LINK_TTL_SECS)
+        expected = hmac_mod.new(
+            self.SECRET.encode(), f"qdblink|{exp}".encode(), hashlib.sha256
+        ).hexdigest()
+        self.assertEqual(sig, expected)
+
+    def test_mint_helper_ttl_constant_is_90(self) -> None:
+        self.assertEqual(handler._QDB_LINK_TTL_SECS, 90)
+
+    def test_html_has_qdb_console_button(self) -> None:
+        html = handler._console_html()
+        self.assertIn("Open QuestDB Console", html)
+        self.assertIn("qdb_console_url", html)
+        self.assertIn("openQdbConsole", html)
+
+    def test_qdb_console_open_is_popup_safe(self) -> None:
+        # FIX 4: the window must be opened SYNCHRONOUSLY in the click, before
+        # the await, then navigated — so the browser popup blocker allows it.
+        html = handler._console_html()
+        self.assertIn("window.open('','_blank')", html)
+        self.assertIn("w.location=j.url", html)
+        self.assertIn("w.close()", html)
+
+
+class DeployProvenance(unittest.TestCase):
+    """B9 deploy provenance — pure formatter + fail-soft GET contract."""
+
+    def test_provenance_line_short_shas(self) -> None:
+        line = handler._provenance_line(
+            "abc1234def567890abc1234def567890abc12345",
+            "def5678900000000000000000000000000000000",
+            "fed4321",  # already short hex — must not blow up
+        )
+        self.assertEqual(line, "binary abc1234 · portal def5678 · main fed4321")
+
+    def test_provenance_line_unknown_values(self) -> None:
+        # "unknown" is not hex — the validator maps it (and any other
+        # non-hex value) to the literal "unknown"; never raises.
+        line = handler._provenance_line("unknown", "unknown", "unknown")
+        self.assertEqual(line, "binary unknown · portal unknown · main unknown")
+
+    def test_provenance_line_rejects_markup_as_unknown(self) -> None:
+        # 2026-07-03 hardening: a poisoned SSM param / GitHub response
+        # carrying markup must render as "unknown", never as markup.
+        line = handler._provenance_line(
+            "<script>alert(1)</script>",
+            '"><img src=x onerror=alert(1)>',
+            "abc1234def567890abc1234def567890abc12345",
+        )
+        self.assertEqual(line, "binary unknown · portal unknown · main abc1234")
+
+    def test_safe_provenance_sha_validation(self) -> None:
+        ok = "abc1234def567890abc1234def567890abc12345"
+        self.assertEqual(handler._safe_provenance_sha(ok), ok)
+        self.assertEqual(handler._safe_provenance_sha("abc1234"), "abc1234")
+        for bad in (
+            "<script",
+            "ABC1234",  # uppercase — validator is lowercase-only
+            "abc123",  # 6 chars — below the 7-char floor
+            "a" * 41,  # above the 40-char ceiling
+            "",
+            None,
+            1234567,
+        ):
+            self.assertEqual(handler._safe_provenance_sha(bad), "unknown")
+
+    def test_provenance_footer_html_escapes_line(self) -> None:
+        # Defense in depth: even if the formatter ever regressed, the footer
+        # html-escapes the assembled line. Prove the escape path by checking
+        # the footer for known-safe content and absence of raw markup chars
+        # beyond the footer element itself.
+        footer = handler._provenance_footer_html()
+        self.assertIn("<footer", footer)
+        self.assertIn("· portal", footer)
+        # Every sha in this env is "unknown" (no AWS/GitHub) — no angle
+        # brackets may appear inside the rendered line.
+        inner = footer.split(">", 1)[1].rsplit("</footer>", 1)[0]
+        self.assertNotIn("<", inner)
+        self.assertNotIn(">", inner)
+
+    def test_portal_sha_defaults_to_unknown(self) -> None:
+        old = os.environ.pop("PORTAL_GIT_SHA", None)
+        try:
+            self.assertEqual(handler._portal_sha(), "unknown")
+            os.environ["PORTAL_GIT_SHA"] = "1234567890abcdef1234567890abcdef12345678"
+            self.assertEqual(
+                handler._portal_sha(), "1234567890abcdef1234567890abcdef12345678"
+            )
+        finally:
+            if old is None:
+                os.environ.pop("PORTAL_GIT_SHA", None)
+            else:
+                os.environ["PORTAL_GIT_SHA"] = old
+
+    def test_main_sha_hard_max_age_degrades_to_unknown(self) -> None:
+        # 2026-07-03 hardening: on sustained GitHub failure the cached main
+        # sha is served only up to the 600s hard max-age; beyond that a
+        # failed refresh returns "unknown" instead of the stale value.
+        import time as _time
+        from unittest import mock
+
+        saved = dict(handler._main_sha_cache)
+        sha = "abc1234def567890abc1234def567890abc12345"
+        try:
+            with mock.patch("urllib.request.urlopen", side_effect=OSError("gh down")):
+                now = _time.monotonic()
+                # Past the 60s fresh TTL but inside the 600s max-age: the
+                # stale-but-bounded cached value is still served.
+                handler._main_sha_cache.update({"value": sha, "ts": now - 120.0})
+                self.assertEqual(handler._main_sha(), sha)
+                # Older than 600s: degrade to "unknown".
+                handler._main_sha_cache.update({"value": sha, "ts": now - 601.0})
+                self.assertEqual(handler._main_sha(), "unknown")
+        finally:
+            handler._main_sha_cache.clear()
+            handler._main_sha_cache.update(saved)
+
+    def test_get_html_carries_provenance_footer(self) -> None:
+        # No AWS creds / no GitHub in the test env — every lookup must
+        # fail-soft to "unknown" and the page must still render (the
+        # provenance footer can NEVER break the GET).
+        resp = handler._html_resp()
+        self.assertEqual(resp["statusCode"], 200)
+        self.assertIn("· portal", resp["body"])
+        self.assertIn("· main", resp["body"])
+        self.assertIn("<footer", resp["body"])
+
+
 if __name__ == "__main__":
     unittest.main()
