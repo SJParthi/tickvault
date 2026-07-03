@@ -54,11 +54,14 @@
     - `MktType`: `"NL"`=Normal Market, `"AU"`/`"A1"`/`"A2"`=Auction Market
     - `Series`: Exchange series (e.g., `"EQ"`)
     - `GoodTillDaysDate`: Order validity date for Forever Orders
-    - `RefLtp`: LTP at time of order update (float, camelCase — NOT PascalCase)
-    - `TickSize`: Tick size of instrument (float, camelCase — NOT PascalCase)
+    - `RefLtp`: LTP at time of order update (float, PascalCase like the other fields)
+    - `TickSize`: Tick size of instrument (float, PascalCase like the other fields)
     - `AlgoId`: Exchange ID for special order types (string)
     - `Multiplier`: Multiplier for commodity/currency (int)
-    - Note: `RefLtp` and `TickSize` use camelCase, not PascalCase like other fields.
+    - Note (corrected 2026-07-02 vs official docs page): `RefLtp` and `TickSize` are
+      PascalCase on the official Live Order Update page, same as every other Data field.
+      (An earlier note here claimed camelCase — wrong; our parser ignores both fields,
+      so zero code impact.)
 
 ## What This Prevents
 
