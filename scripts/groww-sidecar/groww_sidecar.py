@@ -84,6 +84,16 @@ logging.getLogger("growwapi").setLevel(logging.DEBUG)
 # the real reason text (e.g. the actual "Authorization Violation"/subject the
 # socket was rejected on) — without this it vanishes and we see the empty line.
 logging.getLogger("nats").setLevel(logging.DEBUG)
+# SECURITY (2026-07-03 High finding): the root logger is DEBUG (needed for the
+# SDK/NATS decode diagnostics above), but botocore at DEBUG prints the SigV4
+# CanonicalRequest — INCLUDING the full `x-amz-security-token` (the instance
+# role's session token) — to stderr, which the Rust supervisor forwards to
+# CloudWatch. The sidecar's redaction filter scrubs GROWW secrets, not
+# botocore's own DEBUG output. Clamp every AWS/HTTP client logger to WARNING
+# so no AWS credential material can reach the log stream. Applied BEFORE the
+# deferred `import boto3` (loggers are configured by name, import-order-safe).
+for _noisy_logger in ("botocore", "boto3", "urllib3", "s3transfer"):
+    logging.getLogger(_noisy_logger).setLevel(logging.WARNING)
 
 try:
     from growwapi import GrowwAPI, GrowwFeed
@@ -437,6 +447,39 @@ def nats_reject_poller(feed, secrets) -> None:
 # ("streaming but 0 ticks") is visible instead of invisible.
 EMITTED_TOTAL = 0
 DROPPED_TOTAL = 0
+# Change-dedup (2026-07-03 live incident): DEDUPED_TOTAL = decoded snapshot
+# entries SKIPPED because they were byte-identical re-dumps of the last emitted
+# (tsInMillis, price) for that instrument. The SDK's get_ltp()/get_index_value()
+# return the WHOLE snapshot tree on EVERY NATS callback, so without this the
+# sidecar re-emitted ALL ~25 subscribed indices per callback (~525 rows/sec of
+# frozen duplicates = 530K junk rows 09:00–09:17 IST, one fsync each). A skip is
+# neither an emit nor a drop — deliberately, so the decoded counter
+# (EMITTED+DROPPED) that drives the stall self-heal goes quiet on a frozen
+# snapshot flood and `should_force_reconnect` fires as designed.
+DEDUPED_TOTAL = 0
+# last-emitted cache: (kind, exchange, segment, token) -> (ts_millis, price).
+# Naturally bounded by the subscribed universe (Groww hard cap 1000 instruments;
+# ~768 + 25 today). The `kind` discriminant ("ltp" vs "idx") keeps a BSE index
+# token "1" distinct from a hypothetical BSE stock token "1".
+_LAST_EMITTED = {}
+# Per-reason drop breakdown (2026-07-03 forensics: dropped=276,077 with no
+# breakdown left the "stocks 100% dropped on a key-map miss?" hypothesis
+# unconfirmable from logs). reason -> count; carried in the status file. A
+# capped number of SAMPLE lines per reason (market-data identifiers only —
+# never a credential) names the exact keys involved.
+DROP_REASONS = {}
+_DROP_SAMPLES_LOGGED = {}
+DROP_SAMPLE_LIMIT_PER_REASON = 5
+# Max exchange timestamp (tsInMillis) seen across ALL decoded records this
+# process lifetime + the monotonic instant it last ADVANCED. This is the stall
+# detector's liveness signal (2026-07-03 feed-death forensics): the 09:07:55
+# frozen snapshot kept EMITTED_TOTAL climbing for 31 minutes, so a decode-count
+# detector saw a "live" feed while Groww delivered nothing fresh. Updated for
+# every decoded record (emitted, deduped, OR dropped — a fresh-but-mismapped
+# record is still proof the SOCKET is alive; force-reconnect cannot fix a
+# mapping bug and must not storm on one).
+MAX_TS_MILLIS_SEEN = 0
+_LAST_TS_ADVANCE_MONOTONIC = 0.0
 # Throttle for the periodic status re-write that carries the live emitted/dropped
 # counts: first emit always writes (it flips the bridge's connected=true), then at
 # most once per second so a fast tick stream cannot thrash the atomic-rename write.
@@ -1039,6 +1082,11 @@ def write_status(event: str, stocks: int, indices: int) -> None:
         # DROPPED so the bridge can surface "streaming but 0 ticks" with a cause.
         "emitted": int(EMITTED_TOTAL),
         "dropped": int(DROPPED_TOTAL),
+        # Change-dedup skips + per-reason drop breakdown (2026-07-03). The Rust
+        # status reader ignores unknown fields (serde default semantics), so
+        # these are additive-safe.
+        "deduped": int(DEDUPED_TOTAL),
+        "dropped_reasons": dict(DROP_REASONS),
         "ts_ist_nanos": now_ist_nanos(),
     }
     try:
@@ -1058,16 +1106,101 @@ def write_status(event: str, stocks: int, indices: int) -> None:
         )
 
 
-def note_drop() -> None:
+def dedup_should_emit(cache: dict, key: tuple, ts_millis: int, price: float) -> bool:
+    """PURE change-dedup decision (2026-07-03): emit only when (ts_millis, price)
+    differs from the last-emitted pair for `key`; update the cache on emit.
+
+    The key MUST include the instrument identity incl. a kind discriminant; the
+    VALUE pair must include ts_millis so a genuine new print with an identical
+    price but an advancing timestamp is NEVER swallowed (adversarial guard).
+    Same-ts price corrections (two prints in one millisecond slot) also emit
+    because the price differs. Only an EXACT (ts, price) re-dump of the
+    already-captured snapshot entry is skipped. O(1) dict lookup; the cache is
+    bounded by the subscribed universe. Unit-tested in test_dedup.py and under
+    `--selftest` (_selftest_dedup)."""
+    pair = (ts_millis, price)
+    if cache.get(key) == pair:
+        return False
+    cache[key] = pair
+    return True
+
+
+def note_dedup() -> None:
+    """Count one decoded-but-UNCHANGED snapshot entry skipped by change-dedup.
+
+    Not a drop (nothing was lost — the identical (ts, price) was already
+    captured + fsynced) and not an emit (nothing new flowed). Carried in the
+    status file as `deduped` so the flood magnitude stays observable."""
+    global DEDUPED_TOTAL
+    DEDUPED_TOTAL += 1
+
+
+def ts_watermark_advanced(prev_max_ms: int, ts_millis) -> bool:
+    """PURE liveness decision (2026-07-03 feed-death fix): does `ts_millis`
+    STRICTLY advance the max exchange timestamp seen? Non-numeric / missing
+    timestamps never advance. Mirrors the Rust bridge's `liveness_ts_advanced`
+    so both stall layers key on the same signal: fresh-timestamped delivery,
+    not decode volume. Unit-tested in test_dedup.py."""
+    try:
+        return int(ts_millis) > prev_max_ms
+    except (ValueError, TypeError):
+        return False
+
+
+def _note_ts_advance(tick) -> None:
+    """Advance the module ts watermark from a decoded record's tsInMillis.
+
+    Called for EVERY decoded record dict in both emit paths — before the
+    dedup/drop decisions — so the stall detector sees the truth: a frozen
+    snapshot re-dump (ts never advances) reads as STALLED even while duplicate
+    decodes flood in, and a fresh-but-dropped record still reads as alive
+    (the socket delivers; a mapping bug must not trigger a reconnect storm)."""
+    global MAX_TS_MILLIS_SEEN, _LAST_TS_ADVANCE_MONOTONIC
+    if not isinstance(tick, dict):
+        return
+    ts = tick.get("tsInMillis", 0)
+    if ts_watermark_advanced(MAX_TS_MILLIS_SEEN, ts):
+        MAX_TS_MILLIS_SEEN = int(ts)
+        _LAST_TS_ADVANCE_MONOTONIC = time.monotonic()
+
+
+def note_drop(
+    reason: str = "unspecified",
+    exchange: str = "",
+    segment: str = "",
+    token: str = "",
+    detail: str = "",
+) -> None:
     """Count one DECODED-but-DROPPED record (sid_map miss / missing field).
 
     Previously these were a SILENT `continue`. Counting them lets the Rust bridge
     surface "streaming but 0 ticks" with a visible cause (operator 2026-06-29).
     Does NOT re-write the status file (drops without emits do not flip connected;
     the count is carried on the next periodic emit re-write).
+
+    2026-07-03: per-reason breakdown + capped sample lines. The live incident's
+    dropped=276,077 (starting exactly at the first get_ltp() callback, ~320/sec
+    ≈ the 743-stock rate) could not be attributed from logs because the counter
+    had no breakdown. Reasons: `no_price_field` (leaf missing ltp/value),
+    `sid_map_miss` (index token unresolvable — stocks fall back to the numeric
+    token), `coerce_error` (ts/price coercion raised), `unmapped_segment`
+    (a whole (exchange, segment) subtree with no SEGMENT_MAP entry — previously
+    a fully SILENT skip). Sample lines carry market-data identifiers only —
+    never a credential.
     """
     global DROPPED_TOTAL
     DROPPED_TOTAL += 1
+    DROP_REASONS[reason] = DROP_REASONS.get(reason, 0) + 1
+    sampled = _DROP_SAMPLES_LOGGED.get(reason, 0)
+    if sampled < DROP_SAMPLE_LIMIT_PER_REASON:
+        _DROP_SAMPLES_LOGGED[reason] = sampled + 1
+        print(
+            f"groww sidecar: DROP[{reason}] sample "
+            f"{sampled + 1}/{DROP_SAMPLE_LIMIT_PER_REASON}: "
+            f"exchange={exchange} segment={segment} token={token} {detail}",
+            file=sys.stderr,
+            flush=True,
+        )
 
 
 def note_emit() -> None:
@@ -1182,11 +1315,30 @@ def emit_ltp_records(out, ltp_tree: dict, sid_map: dict) -> None:
         for segment, tokens in segs.items():
             canonical = SEGMENT_MAP.get((str(exchange), str(segment)))
             if canonical is None or not isinstance(tokens, dict):
+                # 2026-07-03: previously a FULLY SILENT subtree skip — a
+                # Groww-side segment-string change would vanish the entire
+                # stock feed with zero signal. Count + sample it.
+                if canonical is None:
+                    note_drop(
+                        "unmapped_segment",
+                        str(exchange),
+                        str(segment),
+                        detail=f"subtree_entries={len(tokens) if isinstance(tokens, dict) else 0}",
+                    )
                 continue
             for token, tick in tokens.items():
+                # Advance the stall detector's ts watermark for EVERY decoded
+                # record — before dedup/drop — so liveness = fresh timestamps.
+                _note_ts_advance(tick)
                 # A decoded record with no `ltp` field — DROP (honest-feed count).
                 if not isinstance(tick, dict) or "ltp" not in tick:
-                    note_drop()
+                    note_drop(
+                        "no_price_field",
+                        str(exchange),
+                        str(segment),
+                        str(token),
+                        detail=f"leaf_keys={sorted(map(str, tick.keys())) if isinstance(tick, dict) else type(tick).__name__}",
+                    )
                     continue
                 token = str(token)
                 security_id = sid_map.get((str(exchange), str(segment), token))
@@ -1194,14 +1346,31 @@ def emit_ltp_records(out, ltp_tree: dict, sid_map: dict) -> None:
                     security_id = int(token) if token.isdigit() else 0
                 # sid_map miss + non-numeric token → no resolvable id — DROP.
                 if security_id <= 0:
-                    note_drop()
+                    note_drop("sid_map_miss", str(exchange), str(segment), token)
                     continue
                 try:
                     ts_millis = int(tick.get("tsInMillis", 0))
-                    _write_record(out, security_id, canonical, ts_millis, tick["ltp"])
+                    price = float(tick["ltp"])
+                    # Change-dedup (2026-07-03): skip an EXACT (ts, price)
+                    # re-dump of this stock's already-emitted snapshot entry.
+                    if not dedup_should_emit(
+                        _LAST_EMITTED,
+                        ("ltp", str(exchange), str(segment), token),
+                        ts_millis,
+                        price,
+                    ):
+                        note_dedup()
+                        continue
+                    _write_record(out, security_id, canonical, ts_millis, price)
                     note_emit()
-                except (KeyError, ValueError, TypeError):
-                    note_drop()
+                except (KeyError, ValueError, TypeError) as exc:
+                    note_drop(
+                        "coerce_error",
+                        str(exchange),
+                        str(segment),
+                        token,
+                        detail=f"exc={type(exc).__name__}",
+                    )
                     continue
 
 
@@ -1237,23 +1406,51 @@ def emit_index_records(out, index_tree: dict, sid_map: dict) -> None:
             if not isinstance(tokens, dict):
                 continue
             for token, tick in tokens.items():
+                # Advance the stall detector's ts watermark for EVERY decoded
+                # record — before dedup/drop — so liveness = fresh timestamps.
+                _note_ts_advance(tick)
                 # A decoded index record with no `value` field — DROP (count it).
                 if not isinstance(tick, dict) or "value" not in tick:
-                    note_drop()
+                    note_drop(
+                        "no_price_field",
+                        str(exchange),
+                        str(segment),
+                        str(token),
+                        detail=f"leaf_keys={sorted(map(str, tick.keys())) if isinstance(tick, dict) else type(tick).__name__}",
+                    )
                     continue
                 security_id = sid_map.get((str(exchange), str(segment), str(token)))
                 # sid_map miss (index token may be a NAME — no fallback) — DROP.
                 if security_id is None or security_id <= 0:
-                    note_drop()
+                    note_drop("sid_map_miss", str(exchange), str(segment), str(token))
                     continue
                 try:
                     ts_millis = int(tick.get("tsInMillis", 0))
+                    price = float(tick["value"])
+                    # Change-dedup (2026-07-03 live incident): the index tree is
+                    # re-dumped WHOLE on every NATS callback — ~25 indices ×
+                    # ~21 msgs/sec of frozen (ts, value) pairs = 530K junk rows
+                    # in 17 min. Skip the unchanged re-dumps.
+                    if not dedup_should_emit(
+                        _LAST_EMITTED,
+                        ("idx", str(exchange), str(segment), str(token)),
+                        ts_millis,
+                        price,
+                    ):
+                        note_dedup()
+                        continue
                     _write_record(
-                        out, security_id, CANONICAL_INDEX_SEGMENT, ts_millis, tick["value"]
+                        out, security_id, CANONICAL_INDEX_SEGMENT, ts_millis, price
                     )
                     note_emit()
-                except (KeyError, ValueError, TypeError):
-                    note_drop()
+                except (KeyError, ValueError, TypeError) as exc:
+                    note_drop(
+                        "coerce_error",
+                        str(exchange),
+                        str(segment),
+                        str(token),
+                        detail=f"exc={type(exc).__name__}",
+                    )
                     continue
 
 
@@ -1305,25 +1502,38 @@ def _stall_recovery_loop(feed_cell) -> None:
 
     `feed_cell` is the shared 1-element cell holding the CURRENT GrowwFeed (the
     reconnect loop updates it each cycle) so a force-close always targets the live
-    socket, never the stale first-cycle one."""
-    last_decoded = EMITTED_TOTAL + DROPPED_TOTAL
+    socket, never the stale first-cycle one.
+
+    LIVENESS SIGNAL (revised 2026-07-03 feed-death forensics): the loop keys on
+    the ADVANCE of the max exchange timestamp seen (`MAX_TS_MILLIS_SEEN`), NOT
+    on the decoded count. On 2026-07-03 the Groww snapshot froze at 09:07:55.770
+    IST but kept re-broadcasting stale payloads for 31 minutes — the decoded
+    count climbed past 1.16M "alive" records while zero fresh data arrived, so
+    neither stall layer fired until the server itself closed the socket at
+    09:38:53. A frozen-timestamp re-dump now reads as STALLED and force-closes
+    within the deadline; the same pure `should_force_reconnect` decision applies
+    (the watermark is the progress counter: 0 = cold/never-streamed → never
+    close-loop; unchanged past the deadline in market hours → force-close)."""
+    last_watermark = MAX_TS_MILLIS_SEEN
     last_change_monotonic = time.monotonic()
     while True:
         time.sleep(STALL_POLL_SECS)
-        decoded = EMITTED_TOTAL + DROPPED_TOTAL
-        if decoded != last_decoded:
-            last_decoded = decoded
+        watermark = MAX_TS_MILLIS_SEEN
+        if watermark != last_watermark:
+            last_watermark = watermark
             last_change_monotonic = time.monotonic()
             continue
         secs_since_change = time.monotonic() - last_change_monotonic
         market_open = _is_within_market_hours_ist(time.time())
         if should_force_reconnect(
-            decoded, last_decoded, secs_since_change, market_open, STALL_DEADLINE_SECS
+            watermark, last_watermark, secs_since_change, market_open, STALL_DEADLINE_SECS
         ):
             print(
-                f"groww sidecar: FEED STALLED — {STALL_DEADLINE_SECS}s with NO new record "
-                f"across the universe during market hours (emitted={EMITTED_TOTAL}, "
-                f"dropped={DROPPED_TOTAL}); force-closing the NATS socket to trigger "
+                f"groww sidecar: FEED STALLED — {STALL_DEADLINE_SECS}s with NO advancing "
+                f"exchange timestamp across the universe during market hours "
+                f"(max_ts_millis={MAX_TS_MILLIS_SEEN}, emitted={EMITTED_TOTAL}, "
+                f"deduped={DEDUPED_TOTAL}, dropped={DROPPED_TOTAL}); a frozen snapshot "
+                "re-dump counts as stalled. Force-closing the NATS socket to trigger "
                 "reconnect + re-subscribe (self-heal).",
                 file=sys.stderr,
                 flush=True,
@@ -1727,6 +1937,44 @@ def _selftest_self_heal() -> None:
     print("groww sidecar self-heal self-test: PASS")
 
 
+def _selftest_dedup() -> None:
+    """Prove the change-dedup decision (2026-07-03 snapshot-flood fix). Guarded
+    behind `--selftest` so it NEVER runs in prod. Run:
+    `python3 groww_sidecar.py --selftest`. Full matrix in test_dedup.py."""
+    cache = {}
+    key = ("idx", "NSE", "CASH", "NIFTY")
+    # First sight always emits.
+    assert dedup_should_emit(cache, key, 1_783_069_200_183, 26965.05), \
+        "first print must emit"
+    # EXACT (ts, price) re-dump (the 530K-row flood shape) must be skipped.
+    assert not dedup_should_emit(cache, key, 1_783_069_200_183, 26965.05), \
+        "a frozen (ts, price) re-dump must be skipped"
+    # Advancing ts with the SAME price is a genuine new print — never swallowed.
+    assert dedup_should_emit(cache, key, 1_783_069_201_000, 26965.05), \
+        "advancing tsInMillis with an identical price must emit"
+    # Same ts, changed price (same-millisecond correction) must emit.
+    assert dedup_should_emit(cache, key, 1_783_069_201_000, 26966.00), \
+        "a changed price at the same tsInMillis must emit"
+    # Keys are independent per instrument + kind discriminant.
+    other = ("ltp", "NSE", "CASH", "2885")
+    assert dedup_should_emit(cache, other, 1_783_069_200_183, 26965.05), \
+        "a different instrument's first print must emit"
+    assert len(cache) == 2, "cache is bounded by distinct instrument keys"
+
+    # Stall-liveness watermark (pure): frozen ts never advances; fresh ts does;
+    # garbage ts never advances (and never raises).
+    assert ts_watermark_advanced(0, 1_783_069_200_183), "first ts must advance"
+    assert not ts_watermark_advanced(1_783_069_200_183, 1_783_069_200_183), \
+        "a frozen tsInMillis must NOT count as liveness"
+    assert not ts_watermark_advanced(1_783_069_200_183, 1_783_069_100_000), \
+        "an older (replayed) tsInMillis must NOT count as liveness"
+    assert ts_watermark_advanced(1_783_069_200_183, 1_783_069_201_000.0), \
+        "an advancing float tsInMillis must count as liveness"
+    assert not ts_watermark_advanced(0, None) and not ts_watermark_advanced(0, "x"), \
+        "unparseable tsInMillis must never advance (and never raise)"
+    print("groww sidecar dedup self-test: PASS")
+
+
 def _utc_epoch_for_ist(hour: int, minute: int) -> float:
     """Helper: a UTC epoch whose IST wall-clock is exactly `hour:minute` today.
     IST = UTC + 5:30, so UTC h:m = IST h:m − 5:30. Pure arithmetic for the test."""
@@ -1740,5 +1988,6 @@ if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "--selftest":
         _selftest_redaction()
         _selftest_self_heal()
+        _selftest_dedup()
     else:
         main()
