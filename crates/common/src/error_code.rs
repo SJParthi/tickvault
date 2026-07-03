@@ -244,6 +244,21 @@ pub enum ErrorCode {
     /// durable-loss signal — previously this arm returned silently.
     /// Severity::Critical.
     WsSpill02FrameDropped,
+    /// WS-REINJECT-01: the boot-time STAGE-C.2b WAL re-injection ABORTED —
+    /// a backpressured `send().await` into the pool frame channel either
+    /// returned `SendError` (tick-processor consumer dropped) or exceeded
+    /// the bounded per-send timeout (`WAL_REINJECT_SEND_TIMEOUT_SECS` —
+    /// consumer wedged). The injector STOPS, counts the remaining frames
+    /// as aborted, and the re-injection is NOT marked clean, so
+    /// `confirm_replayed()` is skipped and the staged WAL segments
+    /// re-replay next boot — no frame is silently lost (durable WAL
+    /// floor). Replaces the pre-2026-07-03 silent `try_send` drop storm
+    /// (dropped=1,127,801 at 10:35 IST — everything past
+    /// `FRAME_CHANNEL_CAPACITY` dropped, the WAL never confirmed, and the
+    /// replay re-grew every restart). Severity::High — the abort
+    /// self-heals via next boot's replay; a dead consumer usually means
+    /// the process is restarting anyway.
+    WsReinject01Aborted,
     /// TICK-FLUSH-01: the off-thread tick ILP flush worker died (panic or a
     /// fatal return) and the supervisor respawned it — mirrors WS-SPILL-01
     /// (WAL writer) and WS-GAP-05 (pool supervisor). Self-healing: the
@@ -761,6 +776,7 @@ impl ErrorCode {
             Self::DiskWatcher01Respawned => "DISK-WATCHER-01",
             Self::WsSpill01WriterRespawn => "WS-SPILL-01",
             Self::WsSpill02FrameDropped => "WS-SPILL-02",
+            Self::WsReinject01Aborted => "WS-REINJECT-01",
             Self::TickFlush01WorkerRespawn => "TICK-FLUSH-01",
             Self::Proc01OomKillDetected => "PROC-01",
             Self::AuthGap03TokenForceRenewedOnWake => "AUTH-GAP-03",
@@ -947,6 +963,10 @@ impl ErrorCode {
             | Self::WsGap07LiveChannelClosed
             // WS-SPILL-01 — WAL writer respawned (flapping writer = disk dying)
             | Self::WsSpill01WriterRespawn
+            // WS-REINJECT-01 — boot WAL re-injection aborted (consumer dead/
+            // wedged); frames stay staged in replaying/ — self-heals on the
+            // next boot's replay, but the operator must see a dead consumer
+            | Self::WsReinject01Aborted
             // TICK-FLUSH-01 — off-thread tick flush worker respawned (B6);
             // flapping = QuestDB ILP / host degrading
             | Self::TickFlush01WorkerRespawn
@@ -1079,6 +1099,8 @@ impl ErrorCode {
             Self::WsSpill01WriterRespawn | Self::WsSpill02FrameDropped => {
                 ".claude/rules/project/ws-frame-spill-error-codes.md"
             }
+            // C3 (2026-07-03): bounded chunked backpressure WAL re-injection
+            Self::WsReinject01Aborted => ".claude/rules/project/ws-reinject-error-codes.md",
             // B6 (2026-07-03): off-thread tick ILP flush worker
             Self::TickFlush01WorkerRespawn => {
                 ".claude/rules/project/tick-flush-worker-error-codes.md"
@@ -1297,6 +1319,7 @@ impl ErrorCode {
             Self::DiskWatcher01Respawned,
             Self::WsSpill01WriterRespawn,
             Self::WsSpill02FrameDropped,
+            Self::WsReinject01Aborted,
             Self::TickFlush01WorkerRespawn,
             Self::Proc01OomKillDetected,
             Self::AuthGap03TokenForceRenewedOnWake,
@@ -1656,10 +1679,13 @@ mod tests {
         // 10:35 IST mid-market; now supervised + respawned).
         // 2026-07-03 (B6 latency-histogram split): bumped 116 -> 117 for
         // TICK-FLUSH-01 (off-thread tick ILP flush worker respawned).
-        // 2026-07-03 (C2 panic-free reqwest client): bumped 117 -> 118 for
+        // 2026-07-03 (C3 re-injection storm fix): bumped 117 -> 118 for
+        // WS-REINJECT-01 (boot WAL re-injection aborted — chunked
+        // backpressure replaces the silent try_send drop storm).
+        // 2026-07-03 (C2 panic-free reqwest client): bumped 118 -> 119 for
         // HTTP-CLIENT-01 (ClientBuilder::build failed — typed degrade
         // replaces the Client::new() panic fallback at 8 storage sites).
-        assert_eq!(ErrorCode::all().len(), 118);
+        assert_eq!(ErrorCode::all().len(), 119);
     }
 
     #[test]
@@ -1683,6 +1709,35 @@ mod tests {
             .expect("workspace root");
         let shown = abs.display().to_string();
         assert!(abs.exists(), "PREVDAY-01 runbook missing on disk: {shown}");
+        // Listed in the catalogue.
+        assert!(ErrorCode::all().contains(&code));
+    }
+
+    #[test]
+    fn test_ws_reinject_01_aborted_contract() {
+        let code = ErrorCode::WsReinject01Aborted;
+        // Wire-format string + roundtrip via FromStr.
+        assert_eq!(code.code_str(), "WS-REINJECT-01");
+        assert_eq!("WS-REINJECT-01".parse::<ErrorCode>(), Ok(code));
+        // High (abort self-heals via next boot's WAL re-replay) and
+        // therefore auto-triage-safe.
+        assert_eq!(code.severity(), Severity::High);
+        assert!(code.is_auto_triage_safe());
+        // Runbook points at the dedicated rule file and exists on disk.
+        assert_eq!(
+            code.runbook_path(),
+            ".claude/rules/project/ws-reinject-error-codes.md"
+        );
+        let abs = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(std::path::Path::parent)
+            .map(|root| root.join(code.runbook_path()))
+            .expect("workspace root");
+        let shown = abs.display().to_string();
+        assert!(
+            abs.exists(),
+            "WS-REINJECT-01 runbook missing on disk: {shown}"
+        );
         // Listed in the catalogue.
         assert!(ErrorCode::all().contains(&code));
     }
@@ -1746,6 +1801,8 @@ mod tests {
                 || s.starts_with("DISK-WATCHER-")
                 // zero-tick-loss 2026-06-09: WAL frame-spill writer hardening
                 || s.starts_with("WS-SPILL-")
+                // C3 2026-07-03: bounded chunked-backpressure WAL re-injection
+                || s.starts_with("WS-REINJECT-")
                 // NTM Sub-PR #10a (§31): niftyindices constituent source degrade
                 || s.starts_with("NTM-CONSTITUENCY-")
                 // Operator 2026-06-10: daily end-to-end tick-conservation audit
