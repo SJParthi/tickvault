@@ -5481,11 +5481,29 @@ async fn start_dhan_lane(
     )
     .await
     {
-        tracing::error!(
-            error = ?e,
-            code = tickvault_common::error_code::ErrorCode::Boot02DeadlineExceeded.code_str(),
-            "BOOT-02 QuestDB never reached ready state — halting"
-        );
+        // C2 (2026-07-03): attribute the failure honestly. A ClientBuild
+        // error means OUR HTTP client could not be constructed (host
+        // fd/TLS/resolver pressure) — routing that to the BOOT-02
+        // Docker/QuestDB runbook misdirects triage. Control flow is
+        // identical in both arms (halt the lane start).
+        if matches!(
+            &e,
+            tickvault_storage::boot_probe::BootProbeError::ClientBuild(_)
+        ) {
+            tracing::error!(
+                error = ?e,
+                code =
+                    tickvault_common::error_code::ErrorCode::HttpClient01BuildFailed.code_str(),
+                "HTTP-CLIENT-01 HTTP client build failed — host fd/TLS/resolver problem, \
+                 not QuestDB — halting"
+            );
+        } else {
+            tracing::error!(
+                error = ?e,
+                code = tickvault_common::error_code::ErrorCode::Boot02DeadlineExceeded.code_str(),
+                "BOOT-02 QuestDB never reached ready state — halting"
+            );
+        }
         return Err(StartLaneError::BootAbortErr(anyhow::anyhow!(
             "BOOT-02 QuestDB readiness deadline exceeded: {e}"
         )));
