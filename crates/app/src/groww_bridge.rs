@@ -783,9 +783,27 @@ impl GrowwBridgeState {
                 .increment(1);
             return;
         };
+        let today_ist_day = ist_day_from_ist_nanos(receipt_ist_nanos());
         let current_len = match tokio::fs::metadata(tick_file_path).await {
             Ok(m) => m.len(),
             Err(_) => {
+                // B2 fix 2 (2026-07-03, hostile-review H-3 completion): the
+                // live capture file being ABSENT at bridge start (IST-midnight
+                // rotation happened; the sidecar first-writes today's file
+                // later — e.g. bridge boots 08:31, ticks start 09:00) must NOT
+                // skip a provable previous-day archive tail. Before this fix,
+                // the early return here silently orphaned those bytes until
+                // the archive's 2-day retention wiped them. Drain the archive
+                // through the SAME parse/validate/persist path, then proceed
+                // exactly as before: byte-0 tail once today's file appears.
+                self.drain_archive_tail_if_needed(
+                    tick_file_path,
+                    &snap,
+                    today_ist_day,
+                    feed_health,
+                )
+                .await;
+                self.offset = 0;
                 info!("groww bridge: capture file absent — snapshot ignored");
                 metrics::counter!("tv_groww_bridge_offset_resume_total", "outcome" => "no_file")
                     .increment(1);
@@ -793,7 +811,6 @@ impl GrowwBridgeState {
             }
         };
         let current_head = Self::read_file_head(tick_file_path).await;
-        let today_ist_day = ist_day_from_ist_nanos(receipt_ist_nanos());
         match resume_from_snapshot(&snap, current_len, &current_head, today_ist_day) {
             Some((offset, capture_seq)) => {
                 self.offset = offset;
@@ -808,50 +825,13 @@ impl GrowwBridgeState {
                     .increment(1);
             }
             None => {
-                // PR-5 H-3 (hostile F4): if the snapshot belongs to a PREVIOUS
-                // IST day, the sidecar rotated the live file at midnight and
-                // any bytes appended after our last flush were ARCHIVED unread
-                // (deleted after 2 days). Drain that archive's tail ONCE
-                // through the SAME parse/validate/persist path before the
-                // byte-0 re-tail of the fresh live file. Bounded + non-fatal:
-                // an absent/short archive falls straight through to byte-0.
-                let today_ist_day = ist_day_from_ist_nanos(receipt_ist_nanos());
-                let archive = archive_path_for_ist_day(tick_file_path, snap.ist_day);
-                let archive_len = tokio::fs::metadata(&archive).await.ok().map(|m| m.len());
-                if should_drain_archive(snap.ist_day, today_ist_day, archive_len, snap.offset) {
-                    let len = archive_len.unwrap_or(0);
-                    info!(
-                        archive = %archive.display(),
-                        from_offset = snap.offset,
-                        archive_len = len,
-                        "groww bridge: draining rotated archive tail (bytes flushed before \
-                         the downtime resume from the flushed offset; DEDUP-idempotent)"
-                    );
-                    metrics::counter!("tv_groww_bridge_archive_tail_drains_total").increment(1);
-                    self.offset = snap.offset;
-                    self.capture_seq.store(snap.capture_seq, Ordering::Relaxed);
-                    self.active_drain_ist_day = Some(snap.ist_day);
-                    let mut wakes: u32 = 0;
-                    while self.offset < len && wakes < GROWW_ARCHIVE_DRAIN_MAX_WAKES {
-                        let before = self.offset;
-                        self.drain_new_data(&archive, feed_health).await;
-                        wakes = wakes.saturating_add(1);
-                        if self.offset <= before {
-                            break; // no forward progress — read error / EOF
-                        }
-                    }
-                    if wakes >= GROWW_ARCHIVE_DRAIN_MAX_WAKES {
-                        warn!(
-                            archive = %archive.display(),
-                            drained_to = self.offset,
-                            archive_len = len,
-                            "groww bridge: archive tail drain hit the wake cap — proceeding \
-                             to the live file (remaining archive rows stay on disk)"
-                        );
-                    }
-                    self.active_drain_ist_day = None;
-                    self.residual.clear();
-                }
+                self.drain_archive_tail_if_needed(
+                    tick_file_path,
+                    &snap,
+                    today_ist_day,
+                    feed_health,
+                )
+                .await;
                 self.offset = 0;
                 info!(
                     snapshot_offset = snap.offset,
@@ -863,6 +843,68 @@ impl GrowwBridgeState {
                     .increment(1);
             }
         }
+    }
+
+    /// PR-5 H-3 (hostile F4) + B2 fix 2 (2026-07-03): if the snapshot belongs
+    /// to a PREVIOUS IST day, the sidecar rotated the live file at midnight and
+    /// any bytes appended after our last flush were ARCHIVED unread (deleted
+    /// after 2 days). Drain that archive's tail ONCE through the SAME
+    /// parse/validate/persist path before the byte-0 re-tail of the fresh live
+    /// file. Bounded + non-fatal: an absent/short archive is a no-op (the pure
+    /// gate is [`should_drain_archive`]). Extracted so BOTH resume arms reach
+    /// it — the identity-mismatch arm (live file exists but rotated) AND the
+    /// absent-live-file arm (rotation happened, today's file not yet created).
+    /// Leaves the state ready for a byte-0 live-file tail: the CALLER resets
+    /// `self.offset = 0` (this fn leaves it at the drained archive length);
+    /// `active_drain_ist_day` + `residual` are cleared here after the drain.
+    // TEST-EXEMPT: async file I/O wrapper around the pure should_drain_archive
+    // gate; executed end-to-end by test_retail_cross_day_snapshot_drains_archive_
+    // then_byte0_retail + test_retail_cross_day_archive_drains_even_without_
+    // today_live_file (+ the multi-wake chunking test).
+    async fn drain_archive_tail_if_needed(
+        &mut self,
+        tick_file_path: &Path,
+        snap: &GrowwOffsetSnapshot,
+        today_ist_day: i64,
+        feed_health: &tickvault_common::feed_health::FeedHealthRegistry,
+    ) {
+        let archive = archive_path_for_ist_day(tick_file_path, snap.ist_day);
+        let archive_len = tokio::fs::metadata(&archive).await.ok().map(|m| m.len());
+        if !should_drain_archive(snap.ist_day, today_ist_day, archive_len, snap.offset) {
+            return;
+        }
+        let len = archive_len.unwrap_or(0);
+        info!(
+            archive = %archive.display(),
+            from_offset = snap.offset,
+            archive_len = len,
+            "groww bridge: draining rotated archive tail (bytes flushed before \
+             the downtime resume from the flushed offset; DEDUP-idempotent)"
+        );
+        metrics::counter!("tv_groww_bridge_archive_tail_drains_total").increment(1);
+        self.offset = snap.offset;
+        self.capture_seq.store(snap.capture_seq, Ordering::Relaxed);
+        self.active_drain_ist_day = Some(snap.ist_day);
+        let mut wakes: u32 = 0;
+        while self.offset < len && wakes < GROWW_ARCHIVE_DRAIN_MAX_WAKES {
+            let before = self.offset;
+            self.drain_new_data(&archive, feed_health).await;
+            wakes = wakes.saturating_add(1);
+            if self.offset <= before {
+                break; // no forward progress — read error / EOF
+            }
+        }
+        if wakes >= GROWW_ARCHIVE_DRAIN_MAX_WAKES {
+            warn!(
+                archive = %archive.display(),
+                drained_to = self.offset,
+                archive_len = len,
+                "groww bridge: archive tail drain hit the wake cap — proceeding \
+                 to the live file (remaining archive rows stay on disk)"
+            );
+        }
+        self.active_drain_ist_day = None;
+        self.residual.clear();
     }
 
     /// PR-3 (2026-07-02): persist the FLUSHED-THROUGH offset snapshot —
@@ -895,8 +937,25 @@ impl GrowwBridgeState {
             // the next flush writes a consistent snapshot for the new file.
             return;
         }
+        // B2 fix 1 (2026-07-03, hostile-review VERIFIED): persist the offset of
+        // the last COMPLETE line, not the raw read cursor. `self.offset` counts
+        // every byte READ — including a torn trailing partial line whose bytes
+        // live only in the RAM `residual`. Persisting the raw offset meant a
+        // crash right after this write resumed PAST the torn line's start
+        // (restart begins with an empty residual), its tail then failed the
+        // parse ("skipping malformed tick line") and that line was permanently
+        // lost — a bounded 1-line loss window on crash-with-partial-residual.
+        // The adjusted offset re-reads exactly the torn bytes on resume and
+        // never re-reads a flushed line: `capture_seq` advances only on parsed
+        // COMPLETE lines, so the persisted capture_seq already corresponds to
+        // this boundary. `head` is file-START bytes (tail-independent) and
+        // `file_len` is diagnostic-only (unused by `resume_from_snapshot`) —
+        // neither needs adjusting. The F2 rotation guard above deliberately
+        // keeps comparing the RAW `self.offset` (the strictest shrink
+        // detection). saturating_sub is a defensive belt: residual bytes are
+        // always a suffix of the bytes counted in `offset`.
         let snap = GrowwOffsetSnapshot {
-            offset: self.offset,
+            offset: self.offset.saturating_sub(self.residual.len() as u64),
             capture_seq: self.capture_seq.load(Ordering::Relaxed),
             file_len,
             head,
@@ -3864,6 +3923,217 @@ mod tests {
         std::fs::write(&tick_file, retail_line(0)).expect("first line");
         assert!(state.drain_new_data(&tick_file, &reg).await);
         assert_eq!(state.live_writer.pending(), 1, "first line flows");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_retail_persisted_offset_excludes_torn_partial_line() {
+        // B2 fix 1 pinning test (hostile-review VERIFIED bug): the snapshot the
+        // REAL `maybe_persist_offset` writes must point at the last COMPLETE
+        // line boundary, NOT the raw read cursor — the raw cursor includes a
+        // torn trailing partial line whose bytes exist only in the RAM
+        // residual, so a crash right after the persist would resume PAST the
+        // torn line's start and its tail would be dropped as malformed
+        // (1 line permanently lost). Drives `maybe_persist_offset` DIRECTLY
+        // (the production snapshot writer), then simulates crash + restart +
+        // sidecar-completes-the-line, asserting ZERO lost and ZERO duplicated.
+        let reg = tickvault_common::feed_health::FeedHealthRegistry::new();
+        for attempt in 0..2 {
+            let dir = retail_tmp_dir("torn_persist");
+            let tick_file = dir.join("live-ticks.ndjson");
+            let complete: String = (0..3).map(retail_line).collect();
+            let line4 = retail_line(3);
+            let (part_a, part_b) = line4.split_at(line4.len() / 2);
+            std::fs::write(&tick_file, format!("{complete}{part_a}")).expect("seed torn file");
+            let today = retail_current_ist_day();
+
+            let mut state = retail_fresh_state();
+            assert!(state.drain_new_data(&tick_file, &reg).await);
+            assert_eq!(state.live_writer.pending(), 3, "3 complete lines parsed");
+            assert_eq!(
+                state.residual,
+                part_a.as_bytes(),
+                "torn bytes buffered in RAM"
+            );
+
+            // The instant production persists the snapshot (normally inside the
+            // flush-Ok arm — unreachable in CI without QuestDB, so drive the
+            // REAL writer directly at the same state).
+            state.maybe_persist_offset(&tick_file).await;
+            let raw = std::fs::read_to_string(offset_snapshot_path(&tick_file))
+                .expect("snapshot written");
+            let snap: GrowwOffsetSnapshot = serde_json::from_str(&raw).expect("snapshot parses");
+            assert_eq!(
+                snap.offset,
+                complete.len() as u64,
+                "persisted offset must be the last COMPLETE-line boundary — the \
+                 torn residual bytes must be EXCLUDED (the fix)"
+            );
+            assert_eq!(
+                snap.file_len,
+                (complete.len() + part_a.len()) as u64,
+                "file_len stays the diagnostic metadata length (unused by resume)"
+            );
+
+            // CRASH: state dropped (residual lost). The sidecar then completes
+            // the torn line. RESTART: fresh state resumes from the snapshot.
+            drop(state);
+            {
+                use std::io::Write;
+                let mut f = std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(&tick_file)
+                    .expect("open append");
+                f.write_all(part_b.as_bytes()).expect("complete the line");
+            }
+            let mut restarted = retail_fresh_state();
+            restarted.try_resume_from_snapshot(&tick_file, &reg).await;
+
+            if retail_current_ist_day() != today {
+                // IST midnight flipped mid-test (sub-second window) — the
+                // resume legitimately byte-0'd. Re-run once with the new day.
+                let _ = std::fs::remove_dir_all(&dir);
+                assert_eq!(attempt, 0, "IST day cannot flip twice in one test");
+                continue;
+            }
+
+            assert_eq!(
+                restarted.offset,
+                complete.len() as u64,
+                "resume adopts the complete-line boundary, never a mid-line offset"
+            );
+            assert!(restarted.drain_new_data(&tick_file, &reg).await);
+            assert_eq!(
+                restarted.live_writer.pending(),
+                1,
+                "the torn 4th line is recovered exactly ONCE — zero lost \
+                 (pre-fix: 0, dropped as malformed), zero duplicated (a flushed \
+                 line re-read would show >1)"
+            );
+            assert_eq!(
+                restarted.offset,
+                std::fs::metadata(&tick_file).expect("meta").len()
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+    }
+
+    #[tokio::test]
+    async fn test_retail_cross_day_archive_drains_even_without_today_live_file() {
+        // B2 fix 2 pinning test (H-3 completion): midnight rotation + the
+        // sidecar has NOT created today's live file yet when the bridge boots
+        // (rotation at 00:00, bridge boots 08:31, first tick 09:00). Before the
+        // fix, the `no_file` early-return skipped the archive branch and
+        // yesterday's unflushed tail was silently orphaned until the 2-day
+        // retention wiped it. Now: the archive tail drains EVEN WITHOUT the
+        // live file, then today's file flows from byte 0 when it appears.
+        // Flip-safe without a retry: however IST midnight moves, the snapshot
+        // day stays strictly in the past and the archive path is derived from
+        // the SNAPSHOT's day, so `should_drain_archive` stays true.
+        let reg = tickvault_common::feed_health::FeedHealthRegistry::new();
+        let dir = retail_tmp_dir("archive_no_live");
+        let tick_file = dir.join("live-ticks.ndjson"); // NOT created yet
+        let yesterday = retail_current_ist_day() - 1;
+
+        // Yesterday's rotated archive: 4 lines, the first flushed pre-crash.
+        let archive_lines: Vec<String> = (0..4).map(retail_line).collect();
+        let archive_all: String = archive_lines.concat();
+        let archive = archive_path_for_ist_day(&tick_file, yesterday);
+        std::fs::write(&archive, &archive_all).expect("seed archive");
+        let flushed = archive_lines[0].len();
+
+        let snap = GrowwOffsetSnapshot {
+            offset: flushed as u64,
+            capture_seq: 321,
+            file_len: archive_all.len() as u64,
+            head: retail_head(archive_all.as_bytes()),
+            ist_day: yesterday,
+        };
+        retail_write_snapshot(&tick_file, &snap);
+
+        let mut state = retail_fresh_state();
+        state.try_resume_from_snapshot(&tick_file, &reg).await;
+
+        assert_eq!(
+            state.live_writer.pending(),
+            3,
+            "archive tail drained EVEN THOUGH today's live file is absent — \
+             3 unflushed lines recovered (pre-fix: 0, silently orphaned)"
+        );
+        assert_eq!(
+            state.offset, 0,
+            "state left ready for the byte-0 tail of today's file"
+        );
+        assert!(state.residual.is_empty());
+        assert!(state.active_drain_ist_day.is_none());
+        assert!(
+            !state.drain_new_data(&tick_file, &reg).await,
+            "today's file still absent → safe no-op"
+        );
+
+        // The sidecar creates today's file later — lines flow from byte 0.
+        let live: String = (30..32).map(retail_line).collect();
+        std::fs::write(&tick_file, &live).expect("today's file appears");
+        assert!(state.drain_new_data(&tick_file, &reg).await);
+        assert_eq!(
+            state.live_writer.pending(),
+            5,
+            "3 archive-tail + 2 live lines — every line read exactly once"
+        );
+        assert_eq!(state.offset, live.len() as u64);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_retail_archive_drain_spans_multiple_bounded_wakes() {
+        // MEDIUM follow-up: the archive drain loop must make forward progress
+        // ACROSS bounded 4 MiB wakes (GROWW_BRIDGE_MAX_READ_BYTES) — an
+        // archive tail larger than one wake budget drains fully, with the
+        // chunk-boundary line split carried in the residual between wakes.
+        // Exact counts prove no line is lost or duplicated at the chunk seam.
+        // HONEST ENVELOPE: the wake CAP arm (4096 wakes = 16 GiB) and the
+        // no-forward-progress break (a mid-loop read fault) remain unexecuted
+        // — exercising them needs a 16 GiB fixture / mid-loop fault injection,
+        // documented as an open envelope note in the plan.
+        let reg = tickvault_common::feed_health::FeedHealthRegistry::new();
+        let dir = retail_tmp_dir("archive_multiwake");
+        let tick_file = dir.join("live-ticks.ndjson");
+        let yesterday = retail_current_ist_day() - 1;
+
+        // Build an archive whose UNFLUSHED tail exceeds one 4 MiB wake budget.
+        let mut archive_all = String::new();
+        let mut n_lines: u64 = 0;
+        while (archive_all.len() as u64) <= GROWW_BRIDGE_MAX_READ_BYTES + 64 * 1024 {
+            // i64 cast: n_lines stays ~33K, far inside i64.
+            archive_all.push_str(&retail_line(n_lines as i64));
+            n_lines += 1;
+        }
+        let archive = archive_path_for_ist_day(&tick_file, yesterday);
+        std::fs::write(&archive, &archive_all).expect("seed >4MiB archive");
+        // Today's live file exists (the classic H-3 shape) — empty.
+        std::fs::write(&tick_file, b"").expect("seed empty live file");
+
+        let snap = GrowwOffsetSnapshot {
+            offset: 0,
+            capture_seq: 1,
+            file_len: archive_all.len() as u64,
+            head: retail_head(archive_all.as_bytes()),
+            ist_day: yesterday,
+        };
+        retail_write_snapshot(&tick_file, &snap);
+
+        let mut state = retail_fresh_state();
+        state.try_resume_from_snapshot(&tick_file, &reg).await;
+
+        assert_eq!(
+            state.live_writer.pending() as u64,
+            n_lines,
+            "every archive line drained exactly once across ≥2 bounded wakes \
+             (the 4 MiB chunk seam must not lose or duplicate the split line)"
+        );
+        assert_eq!(state.offset, 0, "ready for the live byte-0 tail");
+        assert!(state.residual.is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
