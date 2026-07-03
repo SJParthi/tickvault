@@ -97,8 +97,16 @@ resource "aws_cloudwatch_metric_alarm" "market_hours_liveness_missing" {
 }
 
 # ---------------------------------------------------------------------------
-# Market-hours window gate Lambda — enables the alarm's actions during trading
-# hours and disables them otherwise. Pattern mirrors boot-heartbeat-alarm.tf.
+# Market-hours window gate Lambda — enables the gated alarms' actions during
+# trading hours and disables them otherwise. Pattern mirrors
+# boot-heartbeat-alarm.tf.
+#
+# 2026-07-03 (5 AM false-SOS fix): generalized from a single ALARM_NAME to a
+# comma-separated ALARM_NAMES list so the SAME window Lambda also gates the
+# two value-based off-hours false-pagers in app-alarms.tf:
+#   - tv-<env>-realtime-guarantee-critical (score legitimately 0 off-hours —
+#     VERIFIED SOS page at 05:40 IST 2026-07-03 on a healthy pre-market box)
+#   - tv-<env>-aggregator-no-seals (zero seals off-hours is by design)
 # ---------------------------------------------------------------------------
 data "archive_file" "tv_market_hours_liveness_gate_zip" {
   type        = "zip"
@@ -109,26 +117,29 @@ import os, boto3
 
 cw = boto3.client('cloudwatch')
 
-ALARM_NAME = os.environ['ALARM_NAME']
+ALARM_NAMES = [n.strip() for n in os.environ['ALARM_NAMES'].split(',') if n.strip()]
 
 # mode="open"  (09:20 IST) -> enable alarm actions for the market-hours window.
-# mode="close" (15:35 IST) -> disable them again so the nightly/weekend stop
-#                             (metric goes missing intentionally) never pages.
+# mode="close" (15:35 IST) -> disable them again so the intentional off-hours
+#                             state (metric missing on the nightly/weekend
+#                             stop, or legitimately-zero score/seals while the
+#                             box idles outside market hours) never pages.
 def handler(event, context):
     mode = (event or {}).get('mode', 'close')
     if mode == 'open':
-        cw.enable_alarm_actions(AlarmNames=[ALARM_NAME])
+        cw.enable_alarm_actions(AlarmNames=ALARM_NAMES)
         # Reset to OK on open so a stale ALARM from a prior window does not
         # immediately re-fire on the first enabled evaluation.
-        cw.set_alarm_state(
-            AlarmName=ALARM_NAME,
-            StateValue='OK',
-            StateReason='market-hours liveness window opened (09:20 IST)',
-        )
-        print(f"enabled actions for {ALARM_NAME}")
+        for name in ALARM_NAMES:
+            cw.set_alarm_state(
+                AlarmName=name,
+                StateValue='OK',
+                StateReason='market-hours window opened (09:20 IST)',
+            )
+        print(f"enabled actions for {ALARM_NAMES}")
         return {'mode': mode, 'enabled': True}
-    cw.disable_alarm_actions(AlarmNames=[ALARM_NAME])
-    print(f"disabled actions for {ALARM_NAME}")
+    cw.disable_alarm_actions(AlarmNames=ALARM_NAMES)
+    print(f"disabled actions for {ALARM_NAMES}")
     return {'mode': mode, 'enabled': False}
 PYEOF
     filename = "index.py"
@@ -181,7 +192,14 @@ resource "aws_lambda_function" "tv_market_hours_liveness_gate" {
   memory_size      = 128
   environment {
     variables = {
-      ALARM_NAME = aws_cloudwatch_metric_alarm.market_hours_liveness_missing.alarm_name
+      # All market-hours-gated alarms (comma-separated). 2026-07-03: the two
+      # app-alarms.tf value-based off-hours false-pagers joined the liveness
+      # alarm under the same 09:20-15:35 IST Mon-Fri window.
+      ALARM_NAMES = join(",", [
+        aws_cloudwatch_metric_alarm.market_hours_liveness_missing.alarm_name,
+        aws_cloudwatch_metric_alarm.realtime_guarantee_critical.alarm_name,
+        aws_cloudwatch_metric_alarm.aggregator_no_seals.alarm_name,
+      ])
     }
   }
 }
@@ -239,6 +257,6 @@ resource "aws_lambda_permission" "tv_market_hours_liveness_close" {
 }
 
 output "market_hours_liveness_alarm_name" {
-  description = "Market-hours liveness alarm (pages on a wedged/crash-looped/dead app in the 09:20-15:35 IST window). Signal: the tv_realtime_guarantee_score gauge MISSING (treat_missing_data=breaching) — emitted every 10s by the SLO loop in crates/app/src/main.rs, in the CW-agent filter (user-data.sh.tftpl). Closes the post-09:10 IST no-page gap the boot-heartbeat window leaves open."
+  description = "Market-hours liveness alarm (pages on a wedged/crash-looped/dead app in the 09:20-15:35 IST window). Signal: the tv_realtime_guarantee_score gauge MISSING (treat_missing_data=breaching) — emitted every 10s by the SLO loop in crates/app/src/main.rs, in the CW-agent filter (user-data.sh.tftpl). Closes the post-09:10 IST no-page gap the boot-heartbeat window leaves open. The same gate Lambda also window-gates realtime-guarantee-critical + aggregator-no-seals (2026-07-03 5 AM false-SOS fix)."
   value       = aws_cloudwatch_metric_alarm.market_hours_liveness_missing.alarm_name
 }
