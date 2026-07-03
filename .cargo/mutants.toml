@@ -1,0 +1,44 @@
+# cargo-mutants configuration — EQUIVALENT-mutant exclusions ONLY.
+#
+# B6 (2026-07-03): the unmasked mutation gate (run 28655302316) surfaced 47
+# MISSED mutants in tickvault-common. Every KILLABLE one got a killing test;
+# the entries below are the residue that is PROVABLY equivalent — the mutated
+# program's runtime behavior is byte-identical to the original, so no test can
+# ever distinguish them. Each entry carries its equivalence proof. Do NOT add
+# entries here to silence a mutant that a test could kill.
+#
+# NOTE: cargo-mutants matches these regexes against the full mutant name,
+# e.g. `crates/common/src/config.rs:901:5: replace f -> usize with 1`.
+# Function-scoped mutants carry an ` in <fn>` suffix, which the `$` anchors
+# below exploit to target ONLY function-less (const-initializer / const-block)
+# mutants.
+
+exclude_re = [
+    # candle_fold.rs OneMinFoldCell::consume — the `else if minute_start >
+    # self.minute_start_nanos` arm is only reachable when the preceding
+    # `if minute_start == self.minute_start_nanos` arm did NOT match, so on
+    # the reachable domain (minute_start != self.minute_start_nanos) `>` and
+    # `>=` are the same function. Equivalent by unreachable-equality.
+    'replace > with >= in OneMinFoldCell::consume',
+
+    # config.rs effective_main_feed_pool_size — the function body is exactly
+    # `PHASE_0_MAIN_FEED_CONNECTION_COUNT`, which is the constant 1 (AWS-
+    # lifecycle lock, PR #7b). "Replace return value with 1" is therefore a
+    # no-op mutant. CAVEAT: if that constant ever changes from 1, DELETE this
+    # entry (the mutant stops being equivalent).
+    'replace effective_main_feed_pool_size -> usize with 1',
+
+    # constants.rs compile-time-only `const _: () = { ... }` assertion block
+    # (INDIA VIX / DISPLAY_INDEX_ENTRIES consistency, ~line 992). The block
+    # evaluates to `()` at compile time and no runtime code path reads
+    # anything from it: any mutation inside it either FAILS THE BUILD (the
+    # assert fires -> cargo-mutants counts it unviable = caught) or is a
+    # runtime no-op (the `&&`->`||` splits that still match only the real
+    # INDIA VIX entry on current data). Nothing observable exists for a test
+    # to assert. The `$` anchor keeps this from touching any function-scoped
+    # `&&` mutant (those end with ` in <fn>`). CAVEAT: a future value-
+    # producing top-level `const X: bool = a && b;` in constants.rs would
+    # also be excluded by this line — prefer named `const fn`s for such
+    # logic so its mutants stay visible.
+    '^crates/common/src/constants\.rs:\d+:\d+: replace && with \|\|$',
+]
