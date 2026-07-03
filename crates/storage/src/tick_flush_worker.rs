@@ -346,6 +346,7 @@ pub(crate) fn spawn_flush_offload(ilp_conf_string: &str) -> anyhow::Result<Flush
 
 /// Test-only spawn with the HIGH-2 panic-injection hook attached.
 #[cfg(test)]
+// TEST-EXEMPT: cfg(test)-only helper — IS the test harness for test_job_panic_rescues_batch_and_recycles_pool_pair
 pub(crate) fn spawn_flush_offload_with_panic_hook(
     ilp_conf_string: &str,
     hook: FlushPanicHook,
