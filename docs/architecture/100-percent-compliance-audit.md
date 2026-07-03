@@ -14,7 +14,7 @@
 ```
    OPERATOR DEMAND                MECHANICAL PROOF
    ──────────                     ──────────────
-   "100% code coverage"      ──►  scripts/coverage-gate.sh fails build if any crate <100%
+   "100% code coverage"      ──►  scripts/coverage-gate.sh fails build if any crate drops below its ratcheted floor (app 63.3 … common 99.5; floors only move up, 100% is the target)
    "Zero tick loss"          ──►  chaos test zero_tick_loss_alert_guard.rs
    "WS never disconnect"     ──►  SubscribeRxGuard + pool watchdog ratchet tests
    "QuestDB never fail"      ──►  rescue→spill→DLQ 3-tier; chaos_questdb_docker_pause.rs
@@ -33,7 +33,7 @@ Every demand → mechanical proof → who fails the build.
 
 | # | Operator demand | Mechanical proof in indices-only architecture | Where it lives | Fails the build if... |
 |---|---|---|---|---|
-| 1 | 100% code coverage | `quality/crate-coverage-thresholds.toml` per-crate min 100%; `scripts/coverage-gate.sh` runs in CI | `.github/workflows/coverage.yml` | any crate < 100% line coverage |
+| 1 | 100% code coverage | `quality/crate-coverage-thresholds.toml` ratcheted per-crate floors (app 63.3 · core 90.2 · storage 91.2 · trading 96.9 · api 98.6 · common 99.5; floors only move up, 100% is the target); `scripts/coverage-gate.sh` runs post-merge | `.github/workflows/ci.yml` job `coverage-and-perf` | any crate drops below its ratcheted floor |
 | 2 | 100% audit coverage | Every typed `NotificationEvent` writes a row to a `<event>_audit` QuestDB table with DEDUP UPSERT KEYS | `crates/storage/src/*_audit_persistence.rs` (4 tables: order/auth/boot/selftest + 3 cross-verify + 3 option chain = 10 audit tables in the new arch) | a typed event ships without an audit row write |
 | 3 | 100% testing coverage | 22 test categories per `testing.md` (unit / integration / property / loom / dhat / fuzz / mutation / sanitizer / coverage / chaos / etc.); applied per touched crate | `.github/workflows/test.yml` + `.claude/rules/project/testing.md` | any of the 22 categories missing for a touched crate |
 | 4 | 100% code checks | 8 pre-commit + 12 pre-push + GitHub branch protection gates | `.claude/hooks/pre-commit-fast-gate.sh` + `pre-push-gate.sh` | banned-pattern / secret-scan / pub-fn-test / pub-fn-wiring / plan-verify / 9 invariants ANY one fires |

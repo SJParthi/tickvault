@@ -95,7 +95,7 @@ But we CAN mechanically guarantee:
 
 | Claim | Proof file | Test name / gate |
 |---|---|---|
-| 100% line coverage required per crate | `quality/crate-coverage-thresholds.toml` | `scripts/coverage-gate.sh` in CI |
+| Ratcheted per-crate LINE-coverage floors (app 63.3 · core 90.2 · storage 91.2 · trading 96.9 · api 98.6 · common 99.5 · default 63.0; floors only move up, 100% is the target — LINE coverage only, no branch gate) | `quality/crate-coverage-thresholds.toml` | `scripts/coverage-gate.sh`, post-merge only (not a PR blocker) |
 | Mutation score: zero survivors | `.github/workflows/mutation.yml` | lines 103-113 fail if any `SURVIVED` |
 | Fuzz targets run weekly, zero crashes | `.github/workflows/fuzz.yml` | nightly schedule |
 | `cargo fmt --check` clean | CI | pre-commit + PR gate |
@@ -165,7 +165,7 @@ no shell, no curl, no grep:
 | `cargo audit` | YES | every push |
 | `cargo deny` | YES | every push |
 | 30-check validate-automation | YES | every push |
-| Line + branch coverage 100% | YES | post-merge |
+| Ratcheted per-crate LINE-coverage floors (63.3–99.5, target 100%; no branch gate) | YES | post-merge only (not a PR blocker) |
 | Mutation zero-survivors | YES | weekly |
 | Fuzz 0 crashes | YES | weekly |
 
