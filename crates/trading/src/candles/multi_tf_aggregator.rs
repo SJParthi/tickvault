@@ -855,6 +855,60 @@ mod tests {
     }
 
     #[test]
+    fn test_session_gate_close_boundary_152959_accepted_153000_rejected() {
+        // Close boundary is EXCLUSIVE: 15:29:59 folds, 15:30:00 is rejected.
+        let agg = MultiTfAggregator::new();
+        agg.pre_populate(vec![(13, 0)]);
+        let last_in = mk_tick(13, 0, GATE_DAY_BASE + 55_799, 102.0, 10, 0);
+        agg.consume_tick(&last_in, 0, FeedStrategy::DHAN, None, |_, _| {});
+        let entry = agg.get(13, 0).expect("present");
+        let snap_before = entry.cell.snapshot(TfIndex::M1);
+        assert!(
+            !snap_before.is_uninitialised(),
+            "15:29:59 tick must fold into the final session minute"
+        );
+        let tick_count_before = snap_before.tick_count;
+        // 15:30:00 exactly — must NOT fold (exclusive close) and must not
+        // seal-and-reopen a post-close bucket.
+        let at_close = mk_tick(13, 0, GATE_DAY_BASE + 55_800, 999.0, 10, 0);
+        agg.consume_tick(&at_close, 0, FeedStrategy::DHAN, None, |_, _| {});
+        let snap_after = entry.cell.snapshot(TfIndex::M1);
+        assert_eq!(
+            snap_after.tick_count, tick_count_before,
+            "15:30:00 tick must be rejected (exclusive close boundary)"
+        );
+        assert_ne!(
+            snap_after.close, 999.0,
+            "the 15:30:00 tick's price must not leak into any candle"
+        );
+    }
+
+    #[test]
+    fn test_pre_market_tick_never_becomes_0915_open_groww() {
+        // Groww mirror of the purity test: a pre-market tick (09:10) with a
+        // different price, then the first regular tick at 09:15:01 — the
+        // M1 open MUST be the 09:15:01 price under LatePolicy::Discard too.
+        let agg = MultiTfAggregator::new();
+        agg.pre_populate(vec![(1_333, 1)]);
+        agg.seed_cumulative(1_333, 1, 100);
+        let pre_market = mk_tick(1_333, 1, GATE_DAY_BASE + 9 * 3600 + 10 * 60, 90.0, 0, 0);
+        agg.consume_tick(&pre_market, 1, FeedStrategy::GROWW, Some(100), |_, _| {});
+        let first_regular = mk_tick(1_333, 1, GATE_DAY_BASE + 33_301, 101.25, 0, 0);
+        agg.consume_tick(&first_regular, 1, FeedStrategy::GROWW, Some(120), |_, _| {});
+        let entry = agg.get(1_333, 1).expect("present");
+        let snap = entry.cell.snapshot(TfIndex::M1);
+        assert_eq!(
+            snap.open, 101.25,
+            "the Groww 09:15 candle open must be the first REGULAR-session \
+             tick's price, never the pre-market price"
+        );
+        assert_eq!(
+            snap.tick_count, 1,
+            "the Groww pre-market tick must not fold into the 09:15 bucket"
+        );
+    }
+
+    #[test]
     fn test_pre_market_tick_never_becomes_0915_open() {
         // A pre-market tick at 09:10 carrying a DIFFERENT price, followed by
         // the first regular-session tick at 09:15:01 — the 09:15 M1 candle's
