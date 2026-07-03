@@ -312,6 +312,32 @@ mod tests {
     }
 
     #[test]
+    fn test_consume_minute_comparison_boundary() {
+        // B6 mutation hardening (candle_fold.rs:162): pin the three-way
+        // routing on the floored-minute comparison. Equality folds in place
+        // (FIRST arm — which is why the else-if `>` vs `>=` mutant is
+        // EQUIVALENT: the else-if is only reached when the minutes differ;
+        // documented exclusion in .cargo/mutants.toml). Strictly-greater
+        // seals; strictly-less discards.
+        let mut cell = OneMinFoldCell::new(M1, 100.0, 10, 10);
+        // Equal minute (last nanosecond of the bucket) → fold, NOT seal.
+        assert_eq!(
+            cell.consume(M1 + NANOS_PER_MINUTE - 1, 101.0, 12, DISCARD),
+            FoldOutcome::Updated
+        );
+        // Exactly the first nanosecond of the next minute → seal.
+        let sealed =
+            as_sealed(cell.consume(M1 + NANOS_PER_MINUTE, 102.0, 15, DISCARD)).expect("seal");
+        assert_eq!(sealed.minute_start_ist_nanos, M1);
+        assert_eq!(sealed.close, 101.0);
+        // Strictly earlier minute → late path (discard policy).
+        assert_eq!(
+            cell.consume(M1 - 1, 99.0, 16, DISCARD),
+            FoldOutcome::Discarded
+        );
+    }
+
+    #[test]
     fn test_cell_is_copy_zero_alloc() {
         // Compile-time proof the cell is Copy (no heap on the hot path).
         fn assert_copy<T: Copy>() {}
