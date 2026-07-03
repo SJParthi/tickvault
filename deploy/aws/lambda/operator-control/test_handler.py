@@ -476,9 +476,15 @@ class WipeGate(unittest.TestCase):
     def setUp(self) -> None:
         self._orig = handler._control_secret
         handler._control_secret = lambda: "s3cret-token"  # type: ignore[assignment]
+        # Pin the clock OFF-hours: since the audit-fix-#2 hard lock, a forced
+        # data-destructive action is 409'd in-window regardless of force, so
+        # these dispatch tests must be deterministic at any wall-clock time.
+        self._orig_mkt = handler._is_market_hours
+        handler._is_market_hours = lambda _now: False  # type: ignore[assignment]
 
     def tearDown(self) -> None:
         handler._control_secret = self._orig  # type: ignore[assignment]
+        handler._is_market_hours = self._orig_mkt  # type: ignore[assignment]
 
     def _wipe(self, force: bool, confirm: str = "WIPE"):
         return handler.lambda_handler(
@@ -576,11 +582,11 @@ class WipeGate(unittest.TestCase):
             self.assertIn("/groww", block, f"{name} must remove the Groww capture dir")
             self.assertIn("live-ticks.ndjson", block, f"{name} must sweep future feeds' capture files")
 
-    def _docker_reset(self, force: bool, confirm: str = "NUKE-DOCKER", token: str = "s3cret-token"):
+    def _docker_reset(self, force: bool, confirm: str = "NUKE"):
         return handler.lambda_handler(
             {
                 "requestContext": {"http": {"method": "POST"}},
-                "headers": {"authorization": f"Bearer {token}"},
+                "headers": {"authorization": "Bearer s3cret-token"},
                 "body": json.dumps({"action": "docker-reset", "force": force, "confirm": confirm}),
             },
             None,
@@ -1043,9 +1049,13 @@ class WipeGrowwGate(unittest.TestCase):
     def setUp(self) -> None:
         self._orig_secret = handler._control_secret
         handler._control_secret = lambda: "s3cret-token"  # type: ignore[assignment]
+        # Off-hours pin — see WipeGate.setUp (audit-fix-#2 hard lock).
+        self._orig_mkt = handler._is_market_hours
+        handler._is_market_hours = lambda _now: False  # type: ignore[assignment]
 
     def tearDown(self) -> None:
         handler._control_secret = self._orig_secret  # type: ignore[assignment]
+        handler._is_market_hours = self._orig_mkt  # type: ignore[assignment]
 
     def _wipe_groww(self, force: bool = True, confirm: str = "GROWW"):
         return handler.lambda_handler(
@@ -1148,6 +1158,126 @@ class WipeGrowwGate(unittest.TestCase):
         # The worst-case swap failure names the safe copy + the manual fix.
         self.assertIn("GWIPE-CRITICAL", py)
         self.assertIn("RENAME TABLE %s TO %s", py)
+
+
+class DataDestructiveMarketHoursLock(unittest.TestCase):
+    """Audit fix #2 (operator incident 2026-07-02 15:05 IST): the four
+    data-destructive actions have NO force escape during market hours.
+    A mid-market forced wipe-ALL + docker-reset deleted ~4.5M rows and 77s
+    of live feed — upstream ticks in that window are unrecoverable."""
+
+    def setUp(self) -> None:
+        self._orig_secret = handler._control_secret
+        handler._control_secret = lambda: "s3cret-token"  # type: ignore[assignment]
+        # Pin the clock IN-window (market OPEN) — deterministic at any time.
+        self._orig_mkt = handler._is_market_hours
+        handler._is_market_hours = lambda _now: True  # type: ignore[assignment]
+        # Any AWS reach-through from a locked action is a test failure.
+        self._orig_shell = handler._ssm_shell
+        handler._ssm_shell = lambda cmds: self.fail("SSM must not be called for a market-hours-locked action")  # type: ignore[assignment]
+
+    def tearDown(self) -> None:
+        handler._control_secret = self._orig_secret  # type: ignore[assignment]
+        handler._is_market_hours = self._orig_mkt  # type: ignore[assignment]
+        handler._ssm_shell = self._orig_shell  # type: ignore[assignment]
+
+    def _act(self, action: str, extra: dict):
+        return handler.lambda_handler(
+            {
+                "requestContext": {"http": {"method": "POST"}},
+                "headers": {"authorization": "Bearer s3cret-token"},
+                "body": json.dumps({"action": action, **extra}),
+            },
+            None,
+        )
+
+    def test_all_data_destructive_actions_locked_in_window_even_with_force(self) -> None:
+        # force=true + the CORRECT confirm word — the exact call that wiped
+        # the box on 2026-07-02 — must be 409'd for every destructive action.
+        confirms = {
+            "wipe-questdb": "WIPE",
+            "wipe-groww": "GROWW",
+            "docker-reset": "NUKE",
+            "docker-nuke-bare": "ERASE",
+        }
+        self.assertEqual(set(confirms), handler._DATA_DESTRUCTIVE)
+        for action, word in confirms.items():
+            resp = self._act(action, {"force": True, "confirm": word})
+            self.assertEqual(resp["statusCode"], 409, action)
+            body = json.loads(resp["body"])
+            self.assertTrue(body.get("market_hours_locked"), action)
+            self.assertIn("locked during market hours", body["error"])
+            self.assertIn("never be re-fetched", body["error"])
+            self.assertIn("Run after 15:30", body["error"])
+
+    def test_lifecycle_actions_keep_force_override_in_window(self) -> None:
+        # Emergencies stay possible: stop/reboot/restart-app/stop-app with
+        # force=true must pass BOTH market-hours gates (they then reach the
+        # boto3/SSM layer, which we stub — reaching it proves not-blocked).
+        orig_client = handler._client
+        handler._client = lambda name, region="": _FakeLifecycleEc2()  # type: ignore[assignment]
+        handler._ssm_shell = lambda cmds: "cmd-lifecycle"  # type: ignore[assignment]
+        try:
+            for action in ("stop", "reboot", "restart-app", "stop-app"):
+                resp = self._act(action, {"force": True})
+                self.assertEqual(resp["statusCode"], 200, action)
+        finally:
+            handler._client = orig_client  # type: ignore[assignment]
+
+    def test_lifecycle_actions_without_force_still_soft_blocked_in_window(self) -> None:
+        # The pre-existing soft gate is unchanged: no force → 409 with the
+        # force hint (NOT the hard-lock body).
+        resp = self._act("stop", {"force": False})
+        self.assertEqual(resp["statusCode"], 409)
+        body = json.loads(resp["body"])
+        self.assertNotIn("market_hours_locked", body)
+        self.assertIn('"force": true', body["error"])
+
+    def test_data_destructive_is_strict_subset_of_destructive(self) -> None:
+        self.assertTrue(handler._DATA_DESTRUCTIVE < handler._DESTRUCTIVE)
+        for lifecycle in ("stop", "reboot", "restart-app", "stop-app"):
+            self.assertNotIn(lifecycle, handler._DATA_DESTRUCTIVE)
+
+    def test_out_of_window_forced_wipe_still_dispatches(self) -> None:
+        # After 15:30 IST the operator's forced+confirmed wipe works as before.
+        handler._is_market_hours = lambda _now: False  # type: ignore[assignment]
+        captured: dict = {}
+        handler._ssm_shell = lambda cmds: (captured.__setitem__("cmds", cmds) or "cmd-off-hours")  # type: ignore[assignment]
+        resp = self._act("wipe-questdb", {"force": True, "confirm": "WIPE"})
+        self.assertEqual(resp["statusCode"], 200)
+        self.assertEqual(json.loads(resp["body"])["command_id"], "cmd-off-hours")
+        self.assertIn("WIPE-COMPLETE", "\n".join(captured["cmds"]))
+
+    def test_boundary_minutes_pin_exact_semantics(self) -> None:
+        # Pinned lock window semantics: 09:15:00 ≤ t < 15:30:00 IST Mon-Fri.
+        # 2026-06-01 is a Monday; IST = UTC + 05:30.
+        cases = [
+            (datetime.datetime(2026, 6, 1, 3, 44, 59), False),  # 09:14:59 IST — open
+            (datetime.datetime(2026, 6, 1, 3, 45, 0), True),    # 09:15:00 IST — locked
+            (datetime.datetime(2026, 6, 1, 9, 59, 59), True),   # 15:29:59 IST — locked
+            (datetime.datetime(2026, 6, 1, 10, 0, 0), False),   # 15:30:00 IST — open
+        ]
+        for utc, locked in cases:
+            self.assertEqual(self._orig_mkt(utc), locked, utc.isoformat())
+
+    def test_danger_zone_shows_lock_label_when_market_open(self) -> None:
+        html = handler._console_html()
+        # The label exists, starts hidden, and names the lock honestly.
+        self.assertIn('id="dangerlock"', html)
+        self.assertIn("Locked until 3:30 PM IST", html)
+        self.assertIn("even with force", html)
+        # loadOverview un-hides it from the server's market_hours flag.
+        self.assertIn("dl.hidden=!j.market_hours", html)
+
+
+class _FakeLifecycleEc2:
+    """Stub accepting the lifecycle EC2 calls (stop/reboot)."""
+
+    def stop_instances(self, InstanceIds):  # noqa: N803 — boto3 casing
+        return {}
+
+    def reboot_instances(self, InstanceIds):  # noqa: N803 — boto3 casing
+        return {}
 
 
 class HtmlWipeGrowwButton(unittest.TestCase):

@@ -76,13 +76,25 @@ pub fn ws_wal_dir() -> std::path::PathBuf {
 }
 
 /// Decision for WHEN the conservation audit should fire. Mirrors
-/// `cross_verify_1m_boot::CrossVerifyStart`.
+/// `cross_verify_1m_boot::CrossVerifyStart` (whose own `SkipPastTrigger`
+/// is a SEPARATE design decision — cross-verify is untouched here).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConservationStart {
     /// Not a trading day and not forced → do not run.
     SkipNonTradingDay,
-    /// Past 15:40 IST on a normal (non-forced) boot → mid-evening boot, skip.
-    SkipPastTrigger,
+    /// Past 15:40 IST on a trading-day boot → run the day's audit ONCE,
+    /// immediately, as a catch-up (audit fix #2, 2026-07-03). Before this,
+    /// a boot between 15:40 and midnight IST SKIPPED the audit entirely —
+    /// so a post-incident evening boot (e.g. recovery after the 2026-07-02
+    /// mid-market wipe) recorded NO forensic WAL-vs-DB row for the day.
+    /// The catch-up row is honestly `partial` (a post-09:00 boot's counters
+    /// cannot vouch for the session), but the durable WAL frame count and
+    /// the QuestDB row count for the day ARE captured — exactly the
+    /// delivered-vs-stored forensic signal a wipe investigation needs.
+    /// Idempotency: one run per boot; the audit table's DEDUP UPSERT KEYS
+    /// `(ts, trading_date_ist, feed)` absorb exact re-writes, and a second
+    /// boot the same evening appends its own honest row.
+    RunCatchUp,
     /// Run immediately — operator forced an on-demand run.
     RunNow,
     /// Sleep this many seconds, then run at 15:40:00 IST.
@@ -108,7 +120,7 @@ pub fn decide_conservation_start(
         return ConservationStart::SkipNonTradingDay;
     }
     if now_secs_of_day_ist >= CONSERVATION_TRIGGER_SECS_OF_DAY_IST {
-        return ConservationStart::SkipPastTrigger;
+        return ConservationStart::RunCatchUp;
     }
     ConservationStart::SleepThenRun(u64::from(
         CONSERVATION_TRIGGER_SECS_OF_DAY_IST - now_secs_of_day_ist,
@@ -892,10 +904,12 @@ mod tests {
             decide_conservation_start(now, true, false),
             ConservationStart::SleepThenRun(60)
         );
-        // At/after the trigger → skip (mid-evening boot).
+        // At/after the trigger on a trading day → catch-up run (audit fix #2,
+        // 2026-07-03; was SkipPastTrigger — a late boot skipped the day's
+        // audit entirely, leaving no forensic row after an evening recovery).
         assert_eq!(
             decide_conservation_start(CONSERVATION_TRIGGER_SECS_OF_DAY_IST, true, false),
-            ConservationStart::SkipPastTrigger
+            ConservationStart::RunCatchUp
         );
         // Non-trading day → skip.
         assert_eq!(
@@ -914,6 +928,35 @@ mod tests {
         assert!(boot_covers_full_session(8 * 3600 + 35 * 60));
         assert!(!boot_covers_full_session(MARKET_OPEN_SECS_OF_DAY_IST));
         assert!(!boot_covers_full_session(11 * 3600));
+    }
+
+    #[test]
+    fn test_decide_conservation_start_late_boot_catches_up() {
+        // Audit fix #2 (2026-07-03): a trading-day boot ANYWHERE in
+        // [15:40:00, midnight) runs the day's audit once, immediately —
+        // previously skipped, so a post-incident evening boot recorded no
+        // forensic WAL-vs-DB row for the day.
+        for late in [
+            15 * 3600 + 40 * 60,      // 15:40:00 — exactly the trigger
+            16 * 3600 + 30 * 60,      // 16:30:00 — post-close recovery boot
+            23 * 3600 + 59 * 60 + 59, // 23:59:59 — last second of the day
+        ] {
+            assert_eq!(
+                decide_conservation_start(late, true, false),
+                ConservationStart::RunCatchUp,
+                "late boot at {late}s must catch up"
+            );
+        }
+        // One second before the trigger still sleeps (unchanged path).
+        assert_eq!(
+            decide_conservation_start(CONSERVATION_TRIGGER_SECS_OF_DAY_IST - 1, true, false),
+            ConservationStart::SleepThenRun(1)
+        );
+        // Non-trading day late boot still skips — never a weekend row.
+        assert_eq!(
+            decide_conservation_start(16 * 3600 + 30 * 60, false, false),
+            ConservationStart::SkipNonTradingDay
+        );
     }
 
     #[test]

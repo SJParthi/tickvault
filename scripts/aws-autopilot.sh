@@ -211,11 +211,17 @@ if [ "$STATE" = "running" ]; then
         # non-failed unit — it just clears any latched failed/limit state), THEN
         # `start`. This recovers BOTH a plain enabled-but-inactive unit AND a stuck
         # `failed` crash-loop with one path, without a human running reset-failed.
+        #
+        # HONEST WORDING (audit fix #2, 2026-07-03): autopilot only OBSERVES
+        # "unit inactive/failed" — it CANNOT tell a crash-loop from an external
+        # stop or an operator action (the 2026-07-02 mid-market wipe was
+        # misread as a crash by the deploy monitor). The heal message states
+        # the observation + what was done, never an assumed cause.
         echo "  app inactive ($APP), unit enabled — reset-failed + start via SSM"
         ssm_run "systemctl reset-failed tickvault 2>/dev/null; systemctl start tickvault 2>/dev/null; sleep 5" >/dev/null
         APP2=$(ssm_run "systemctl is-active tickvault 2>/dev/null || echo inactive" | tr -d '[:space:]')
         if [ "$APP2" = "active" ]; then
-          note_heal "restarted app (tickvault) — was $APP (reset-failed cleared any crash-loop limit, then start)"
+          note_heal "restarted app (tickvault) — unit was $APP (cause unknown to autopilot: could be a crash, an external stop, or an operator action); cleared any reset-failed state and started it"
         else
           note_issue "app (tickvault) not active after restart ($APP2) — check journalctl"
         fi
