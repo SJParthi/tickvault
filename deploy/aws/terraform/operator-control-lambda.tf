@@ -174,6 +174,10 @@ resource "aws_lambda_function" "operator_control" {
       OPERATOR_GITHUB_TOKEN_PARAM   = "/tickvault/${var.environment}/operator/github-token"
       GH_REPO                       = var.operator_github_repo
       GH_DEPLOY_WORKFLOW            = "deploy-aws.yml"
+      # B4: base URL of the QuestDB console front (questdb-console.tf). The
+      # portal's `qdb_console_url` action mints a 90s HMAC link off it; empty
+      # string (console disabled) → the action returns "console not enabled".
+      QDB_CONSOLE_URL = var.enable_questdb_console ? aws_apigatewayv2_stage.questdb_console[0].invoke_url : ""
       # B9 deploy provenance (portal footer: binary · portal · main).
       # PORTAL_GIT_SHA = the repo tree the Lambda zip was applied from
       # (CI sets TF_VAR_portal_git_sha; default "unknown" for local applies).
