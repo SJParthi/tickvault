@@ -29,8 +29,12 @@ fn test_<module>_<function>_<scenario>_<expected_outcome>()
 ```
 
 ## Coverage Thresholds
-- ALL crates: 95% minimum (no exceptions)
-- Enforced by: `quality/crate-coverage-thresholds.toml` + CI + `make coverage` (99% local)
+- Single source of truth: `quality/crate-coverage-thresholds.toml` — ratcheted
+  per-crate LINE-coverage floors (app 63.3 · core 90.2 · storage 91.2 ·
+  trading 96.9 · api 98.6 · common 99.5 · default 63.0). Floors only move up
+  (`coverage_threshold_lockdown.rs` ratchet); 100% remains the target.
+- Enforced post-merge by `scripts/coverage-gate.sh` (CI job `coverage-and-perf`);
+  `make coverage` runs the SAME per-crate gate locally.
 
 ## Required Test Types (22 Categories — Mechanical Enforcement, SCOPED)
 **Canonical definition:** `docs/standards/22-test-types.md` (single source of truth).
