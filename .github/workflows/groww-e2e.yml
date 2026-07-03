@@ -80,14 +80,19 @@ jobs:
             -p 127.0.0.1:9000:9000 -p 127.0.0.1:9009:9009 -p 127.0.0.1:8812:8812 \
             questdb/questdb:9.3.5
           echo "Waiting for QuestDB to be ready..."
+          # Readiness probe = the same SELECT 1 /exec probe the app's own
+          # wait_for_questdb_ready boot gate uses (BOOT-01/BOOT-02). QuestDB
+          # 9.3.5 serves NO /status on the :9000 HTTP server — that path 404s
+          # forever via StaticContentProcessor even when the DB is healthy
+          # (proven live in run 28649380025).
           for i in {1..90}; do
-            if curl -fsS http://127.0.0.1:9000/status >/dev/null 2>&1; then
+            if curl -fsS "http://127.0.0.1:9000/exec?query=SELECT%201" >/dev/null 2>&1; then
               echo "QuestDB ready on attempt $i"
               break
             fi
             sleep 2
           done
-          curl -fsS http://127.0.0.1:9000/status || {
+          curl -fsS "http://127.0.0.1:9000/exec?query=SELECT%201" || {
             echo "::error::QuestDB failed to come up after 180s"
             docker logs --tail=50 tv-questdb-ci || true
             exit 1
