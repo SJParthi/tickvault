@@ -533,6 +533,22 @@ class RelayPlumbing(WithSecret):
         self.assertIn("offline", json.loads(r["body"])["error"])
         self.assertIn("08:30", json.loads(r["body"])["error"])
 
+    def test_shell_get_authed_forwards_to_back_root(self) -> None:
+        # B4: the console SHELL (GET /) reaches the back with path "/" so the
+        # back can apply the identity + Connection:close framing fix.
+        r = handler.lambda_handler(_event("GET", "/", headers=_bearer()), None)
+        self.assertEqual(r["statusCode"], 200)
+        self.assertEqual(self.back_calls[0]["path"], "/")
+
+    def test_upstream_timeout_maps_to_504_not_503(self) -> None:
+        # B4 r2 diagnostic honesty: a reachable-but-slow box is a 504 gateway
+        # timeout, distinct from the 503 offline path (genuine refusal).
+        handler._invoke_back = lambda _p: {"err": "upstream_timeout"}  # type: ignore[assignment]
+        r = handler.lambda_handler(_event("GET", "/", headers=_bearer()), None)
+        self.assertEqual(r["statusCode"], 504)
+        self.assertIn("slow", json.loads(r["body"])["error"])
+        self.assertNotIn("offline", json.loads(r["body"])["error"])
+
     def test_body_cap_constant_within_6mib_envelope(self) -> None:
         # FIX 2: base64(cap) + JSON must stay under Lambda's 6 MiB response.
         self.assertLessEqual(handler.MAX_BODY_BYTES, 4_100_000)
