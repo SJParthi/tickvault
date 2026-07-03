@@ -415,15 +415,18 @@ Tests in `crates/*/tests/gap_enforcement.rs` verify:
 
 ## BENCHMARK BUDGETS
 
-| Benchmark | Budget |
-|-----------|--------|
-| tick_binary_parse | 10 ns |
-| tick_pipeline_routing | 100 ns |
-| papaya_lookup | 50 ns |
-| full_tick_processing | 10 μs |
-| oms_state_transition | 100 ns |
-| market_hour_validation | 50 ns |
-| config_toml_load | 10 ms |
+`quality/benchmark-budgets.toml` is the executable source of truth (24+ keys, enforced by `scripts/bench-gate.sh` via the post-merge + nightly `bench.yml` workflow). Headline subset — budget keys match real Criterion IDs mechanically (lowercased, `/`→`_`, substring match):
+
+| Budget key (benchmark-budgets.toml) | Real Criterion bench | Budget |
+|-------------------------------------|----------------------|--------|
+| dispatch_frame | `dispatch_frame/ticker`, `dispatch_frame/quote` | 10 ns |
+| pipeline | `pipeline/batch_100_mixed`, `pipeline/burst_100_ticker` | 100 ns/tick |
+| registry_get | `registry/get_hit`, `registry/get_miss` | 50 ns |
+| oms_state_transition | `oms/state_transition` | 100 ns |
+| is_trading_day | `calendar/is_trading_day` | 50 ns |
+| config_toml_load | `config/toml_load` | 10 ms |
+| composite_quote_tick_compute_only | `composite/quote_tick_compute_only` | 10 μs |
+| composite_quote_tick_full_chain | `composite/quote_tick_full_chain` | 10 μs |
 
 ## CONFIGURATION
 

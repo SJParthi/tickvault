@@ -1,0 +1,138 @@
+# =============================================================================
+# Benchmarks & Perf Gate — post-merge + nightly
+# =============================================================================
+# Closes the 2026-07-03 audit gap: quality/benchmark-budgets.toml +
+# scripts/bench-gate.sh existed but NO workflow ever ran `cargo bench` or the
+# gate — the 5% regression budget and the absolute ns budgets were
+# aspirational, not enforced. This workflow makes both real.
+#
+# HONESTY NOTE (absolute budgets on shared runners): the absolute ns budgets
+# in quality/benchmark-budgets.toml were calibrated on dev hardware. GitHub
+# shared runners are slower and noisier. If the first live runs show spurious
+# absolute-budget failures on runner hardware, the documented remediation is
+# a runner-class multiplier applied in bench-gate.sh — do NOT silently loosen
+# the budgets in benchmark-budgets.toml (they remain the dev-hardware truth).
+#
+# REGRESSION ARM (the 5% gate): Criterion only writes
+# target/criterion/<id>/change/estimates.json when a PRIOR baseline exists in
+# target/criterion BEFORE the bench run. The actions/cache restore step below
+# supplies that baseline from the previous green run on main, which is what
+# makes bench-gate.sh's `max_regression_pct = 5.0` arm actually fire. The
+# first-ever run has no baseline -> absolute budgets only (honest, expected).
+#
+# RATCHET SEMANTICS (exit-code-aware, post adversarial review 2026-07-03):
+# bench-gate.sh differentiates exit codes — 0 = clean, 1 = absolute-budget
+# breach ONLY, 2 = confident (>5%, CI-lower-bound) regression (2 wins when
+# both breach). The baseline cache is saved whenever the benches themselves
+# completed AND the gate did not report a regression (gate_rc != '2'):
+#   - rc=0 (clean) -> baseline advances (the normal green ratchet)
+#   - rc=1 (absolute-budget hardware misfit on slower runners) -> baseline
+#     STILL advances, so dev-calibrated absolute budgets can never starve the
+#     cache and deadlock the regression arm (it needs a prior baseline)
+#   - rc=2 (confident regression) -> baseline is NOT saved, so a regression
+#     can never self-ratify by becoming the next run's comparison base
+# The workflow step still fails on ANY nonzero rc — this only governs
+# whether the Criterion baseline ratchets forward.
+name: Benchmarks & Perf Gate
+
+on:
+  push:
+    branches: [main]
+  schedule:
+    # Nightly at 20:00 UTC — offset from full-test-nightly (19:30 UTC) so the
+    # two heavy workflows don't contend for runner capacity.
+    - cron: '0 20 * * *'
+  workflow_dispatch:
+
+# Baselines must not be corrupted by overlapping runs: serialize, never cancel
+# an in-flight run (a cancelled bench could save a partial criterion dir).
+concurrency:
+  group: bench-gate-main
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  bench-gate:
+    name: "Bench & Budget Gate"
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7.0.0
+
+      - name: Install Rust toolchain 1.95.0
+        uses: dtolnay/rust-toolchain@67ef31d5b988238dd797d409d6f9574278e20537 # SHA-pinned (was @stable, supply-chain hardening 2026-04-25)
+        with:
+          toolchain: '1.95.0'
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ci-bench
+          cache-on-failure: true
+
+      # Swatinem/rust-cache caches target/ — scrub any criterion state it
+      # resurrected (e.g. from a red run) so target/criterion comes ONLY from
+      # the green-baseline cache restored below, or is fresh.
+      - name: Scrub cached Criterion state
+        run: rm -rf target/criterion
+
+      # Restore the previous green run's Criterion baseline so this run's
+      # `cargo bench` writes <id>/change/estimates.json (Criterion compares
+      # against the restored `new/` dirs) and bench-gate.sh can enforce the
+      # 5% regression budget. restore-keys prefix-matches the most recent
+      # saved baseline; an exact key hit is impossible (run_id is unique),
+      # which is intentional — we always want "latest previous baseline".
+      - name: Restore Criterion baseline (previous main run)
+        uses: actions/cache/restore@v6
+        with:
+          path: target/criterion
+          key: criterion-baseline-${{ github.run_id }}
+          restore-keys: |
+            criterion-baseline-
+
+      - name: Run benchmarks (workspace)
+        id: bench
+        run: |
+          set -o pipefail
+          cargo bench --workspace 2>&1 | tee bench-output.log
+
+      - name: Run bench-gate (absolute budgets + 5% regression)
+        id: gate
+        run: |
+          set -o pipefail
+          rc=0
+          bash scripts/bench-gate.sh | tee gate-output.log || rc=$?
+          echo "gate_rc=$rc" >> "$GITHUB_OUTPUT"
+          {
+            echo '## Bench Gate Results'
+            echo '```'
+            cat gate-output.log
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit "$rc"
+
+      # Save the baseline whenever the benches completed and there was NO
+      # confident regression (gate_rc != '2'). An absolute-budget hardware
+      # misfit (rc=1) does NOT starve the cache — otherwise dev-calibrated
+      # budgets failing forever on slower runners would mean the baseline is
+      # never saved and the regression arm never activates (deadlock). A >5%
+      # regression (rc=2) can never self-ratify as the next baseline.
+      - name: Save Criterion baseline (benches ok, no regression)
+        if: always() && steps.bench.outcome == 'success' && steps.gate.outputs.gate_rc != '2'
+        uses: actions/cache/save@v6
+        with:
+          path: target/criterion
+          key: criterion-baseline-${{ github.run_id }}
+
+      - name: Upload bench + gate logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: bench-gate-logs
+          path: |
+            bench-output.log
+            gate-output.log
+          retention-days: 14
