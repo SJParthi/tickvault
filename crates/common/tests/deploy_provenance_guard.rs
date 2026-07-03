@@ -4,7 +4,7 @@
 //! `.claude/rules/project/deploy-provenance.md`:
 //!
 //! ```text
-//! GITHUB_SHA/git ─▶ build.rs ─▶ BUILD_GIT_SHA ─▶ /health + boot Telegram
+//! TICKVAULT_BUILD_GIT_SHA/git ─▶ build.rs ─▶ BUILD_GIT_SHA ─▶ /health + boot Telegram
 //! deploy-aws.yml ─▶ SSM binary-git-sha ─▶ portal footer + watchdog metric
 //!                                          ─▶ 24h binary-sha-stale alarm
 //! terraform ─▶ portal_git_sha var/output + binary_git_sha_ssm_param output
@@ -31,15 +31,24 @@ fn read(path: &Path) -> String {
     std::fs::read_to_string(path).unwrap_or_else(|e| panic!("read {} failed: {e}", path.display()))
 }
 
-/// 1+2 — the build script resolves GITHUB_SHA and embeds TICKVAULT_GIT_SHA,
-/// and build_info exposes it as BUILD_GIT_SHA.
+/// 1+2 — the build script resolves the dedicated TICKVAULT_BUILD_GIT_SHA
+/// env var (NEVER GitHub's own GITHUB_SHA — a rerun-if-env-changed on
+/// GITHUB_SHA kills the target cache in every CI workflow, 2026-07-03
+/// adversarial-review HIGH fix) and embeds TICKVAULT_GIT_SHA, and
+/// build_info exposes it as BUILD_GIT_SHA.
 #[test]
 fn build_script_embeds_git_sha() {
     let root = repo_root();
     let build_rs = read(&root.join("crates/common/build.rs"));
     assert!(
-        build_rs.contains("GITHUB_SHA"),
-        "build.rs must resolve the CI GITHUB_SHA env var"
+        build_rs.contains("TICKVAULT_BUILD_GIT_SHA"),
+        "build.rs must resolve the dedicated TICKVAULT_BUILD_GIT_SHA env var"
+    );
+    assert!(
+        !build_rs.contains("rerun-if-env-changed=GITHUB_SHA"),
+        "build.rs must NOT register rerun-if-env-changed on GITHUB_SHA — \
+         it changes every commit in EVERY workflow and invalidates the \
+         restored target cache (full workspace rebuild per commit)"
     );
     assert!(
         build_rs.contains("TICKVAULT_GIT_SHA"),
@@ -105,6 +114,16 @@ fn deploy_workflow_records_binary_sha_to_ssm() {
         workflow.contains("provenance param write failed"),
         "the SSM provenance write must be NON-FATAL with a visible warning"
     );
+    assert!(
+        workflow.contains("TICKVAULT_BUILD_GIT_SHA"),
+        "deploy-aws.yml build steps must set TICKVAULT_BUILD_GIT_SHA so the \
+         shipped + smoke binaries embed the exact deploy sha"
+    );
+    assert!(
+        workflow.contains("[0-9a-f]{40}"),
+        "the SSM provenance write must hex-validate GITHUB_SHA before \
+         recording it (refuse non-hex, still non-fatal)"
+    );
 
     let oidc = read(&root.join("deploy/aws/terraform/oidc.tf"));
     assert!(
@@ -125,6 +144,12 @@ fn portal_footer_renders_provenance_line() {
     assert!(
         handler.contains("_provenance_line"),
         "portal handler must keep the pure _provenance_line formatter"
+    );
+    assert!(
+        handler.contains("fullmatch"),
+        "portal handler must hex-validate provenance SHAs (re.fullmatch) \
+         before rendering — a poisoned SSM param / GitHub response must \
+         never smuggle markup into the footer"
     );
 
     let tf = read(&root.join("deploy/aws/terraform/operator-control-lambda.tf"));
