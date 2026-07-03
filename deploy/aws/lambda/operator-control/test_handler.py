@@ -534,21 +534,50 @@ class WipeGate(unittest.TestCase):
             self.assertIn("/groww", block, f"{name} must remove the Groww capture dir")
             self.assertIn("live-ticks.ndjson", block, f"{name} must sweep future feeds' capture files")
 
-    def _docker_reset(self, force: bool):
+    def _docker_reset(self, force: bool, confirm: str = "NUKE-DOCKER", token: str = "s3cret-token"):
         return handler.lambda_handler(
             {
                 "requestContext": {"http": {"method": "POST"}},
-                "headers": {"authorization": "Bearer s3cret-token"},
-                "body": json.dumps({"action": "docker-reset", "force": force}),
+                "headers": {"authorization": f"Bearer {token}"},
+                "body": json.dumps({"action": "docker-reset", "force": force, "confirm": confirm}),
             },
             None,
         )
 
-    def test_docker_reset_without_force_is_blocked(self) -> None:
-        # Force-required guard (409) OR the destructive market-hours guard (409)
-        # — must never reach SSM/boto3 without an explicit force.
-        resp = self._docker_reset(force=False)
+    def test_docker_reset_unauthorized_is_401(self) -> None:
+        # Bearer-auth gate fires BEFORE anything else — a wrong token never
+        # reaches the confirm/market-hours guards or boto3.
+        resp = self._docker_reset(force=True, token="wrong-token")
+        self.assertEqual(resp["statusCode"], 401)
+
+    def test_docker_reset_without_confirm_is_blocked(self) -> None:
+        # Full-docker-nuke typed-confirm guard (operator demand 2026-07-03,
+        # mirroring the #1325 wipe-groww pattern): even a forced, authenticated
+        # call without {"confirm": "NUKE-DOCKER"} is 409 and never reaches SSM.
+        orig = handler._ssm_shell
+        handler._ssm_shell = lambda cmds: self.fail("SSM must not be called without the typed confirm")  # type: ignore[assignment]
+        try:
+            for bad in ("", "NUKE", "nuke-docker", "DOCKER-NUKE", "WIPE"):
+                resp = self._docker_reset(force=True, confirm=bad)
+                self.assertEqual(resp["statusCode"], 409, repr(bad))
+                self.assertIn("NUKE-DOCKER", json.loads(resp["body"])["error"])
+        finally:
+            handler._ssm_shell = orig  # type: ignore[assignment]
+
+    def test_docker_reset_blocked_during_market_hours_without_force(self) -> None:
+        # 09:15-15:30 IST guard: with the correct confirm phrase but no force,
+        # the nuke is 409-blocked while the market is open.
+        orig_mh = handler._is_market_hours
+        orig_shell = handler._ssm_shell
+        handler._is_market_hours = lambda utc: True  # type: ignore[assignment]
+        handler._ssm_shell = lambda cmds: self.fail("SSM must not be called during market hours without force")  # type: ignore[assignment]
+        try:
+            resp = self._docker_reset(force=False)
+        finally:
+            handler._is_market_hours = orig_mh  # type: ignore[assignment]
+            handler._ssm_shell = orig_shell  # type: ignore[assignment]
         self.assertEqual(resp["statusCode"], 409)
+        self.assertIn("market hours", json.loads(resp["body"])["error"])
 
     def test_docker_reset_is_in_destructive_set(self) -> None:
         # Membership = market-hours-blocked during 09:15-15:30 IST.
@@ -577,6 +606,14 @@ class WipeGate(unittest.TestCase):
         self.assertIn("/opt/tickvault/data/instrument-cache", joined)
         self.assertIn("/opt/tickvault/data/spill", joined)
         self.assertIn("/opt/tickvault/data/dlq", joined)
+        # (d) the FULL-NUKE sequence: stop app → compose down -v (containers +
+        #     volumes = full QuestDB wipe) → prune → fresh rebuild + app restart
+        #     (fresh-start state) — operator demand 2026-07-03.
+        self.assertIn("systemctl stop tickvault", joined)
+        self.assertIn("docker compose down -v", joined)
+        self.assertIn("docker system prune -af --volumes", joined)
+        self.assertIn("ensure-questdb.sh", joined)
+        self.assertIn("systemctl restart tickvault", joined)
 
     def _docker_nuke_bare(self, force: bool):
         return handler.lambda_handler(
@@ -627,12 +664,19 @@ class HtmlWipeButton(unittest.TestCase):
         self.assertIn("Wipe ALL data", html)
 
     def test_html_has_docker_reset_button(self) -> None:
+        # Operator demand 2026-07-03 ("entire docker nuke") — the Full Docker
+        # Nuke must be a clearly-labeled red action inside the danger zone.
         html = handler._console_html()
         self.assertIn("dockerReset()", html)
-        self.assertIn("Full Docker reset", html)
-        # The nuke must spell out the SEBI-audit-data loss + require typing NUKE.
-        self.assertIn("NUKE", html)
+        self.assertIn("Full Docker nuke", html)
+        self.assertIn("fresh start", html)
+        # The nuke must spell out the SEBI-audit-data loss + require typing
+        # the server-verified confirm phrase NUKE-DOCKER.
+        self.assertIn("NUKE-DOCKER", html)
         self.assertIn("audit", html)
+        # The UI must SEND the typed confirm phrase server-side (no client-only
+        # prompt) and respect the force checkbox (market-hours guard).
+        self.assertIn("call('docker-reset',{force:$('force').checked,confirm:'NUKE-DOCKER'})", html)
 
     def test_html_has_bare_nuke_button(self) -> None:
         html = handler._console_html()
@@ -1160,7 +1204,7 @@ class RedesignThreeTabs(unittest.TestCase):
         # introduces no token-bypass path.
         self.assertIn("Type GROWW to confirm:')!=='GROWW'", html)
         self.assertIn("Type WIPE to confirm:')!=='WIPE'", html)
-        self.assertIn("Type NUKE to confirm:')!=='NUKE'", html)
+        self.assertIn("Type NUKE-DOCKER to confirm:')!=='NUKE-DOCKER'", html)
         self.assertIn("Type ERASE to confirm:')!=='ERASE'", html)
         # No selection → no dispatch.
         self.assertIn("Pick a danger-zone action first", html)
