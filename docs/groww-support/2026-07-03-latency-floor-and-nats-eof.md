@@ -14,6 +14,18 @@ BEFORE SENDING — operator-fill checklist (every intentional placeholder):
   4. <PENDING — paste verbatim CloudWatch line>  (Section B timeline +
      verbatim-log section) — fetch from CloudWatch group /tickvault/prod/app,
      window 2026-07-03 12:00–12:10 IST, filter patterns "groww" and "NATS".
+  5. <PENDING — exact offset from CloudWatch> / <PENDING — timestamp from
+     CloudWatch>  (Section B timeline timestamp cells) — fill each row's
+     exact second/sub-second from the pasted CloudWatch lines.
+  6. REDACT any token/JWT/credential material from pasted CloudWatch lines
+     before sending — the `last_error=<detail>` field carries raw exception
+     text.
+  7. `<N>` tokens in the verbatim log-format block and the Section B
+     timeline "format:" cells are FORMAT placeholders (part of the
+     sidecar's log-string templates), NOT operator-fill cells — the pasted
+     verbatim CloudWatch lines replace the whole format line.
+     (`<PENDING>` in SUMMARY-2026-07-03.md is a meta-reference to this
+     convention, also not a fill cell.)
   Find them all:  grep -n '<[A-Z_<]' docs/groww-support/2026-07-03-*.md
 =============================================================================
 -->
@@ -101,7 +113,13 @@ regardless of our internal share.
 **Best-case floor observed (global minimum across all ticks, all day):**
 `<PENDING — run SQL §1, paste>` ms, achieved by security_id
 `<PENDING — run SQL §1, paste>` at `<PENDING — run SQL §1, paste>` IST
-(Q3 lists the 5 lowest deltas with instrument + timestamp).
+(Q3 lists the 5 lowest deltas with instrument + timestamp). When pasting
+Q3 results, resolve each security_id to its Groww trading symbol +
+exchange_token per the README instrument-label convention — the `ticks`
+table carries no symbol column; use the resolve-helper query in the Q3
+comment of `docs/groww-support/sql/external-floor.sql`
+(`SELECT symbol_name, display_name FROM instrument_lifecycle WHERE
+security_id = <id> AND feed = 'groww' LIMIT 1;`).
 
 ### Why this pattern suggests a periodic snapshot pipeline
 
@@ -145,11 +163,12 @@ fabricate log content.
 | Timestamp (IST) | Event | Evidence source |
 |---|---|---|
 | `2026-07-03 12:02:43.<PENDING — paste verbatim CloudWatch line>` | last decoded tick before silence (server-side close begins) | tick capture record + `<PENDING — paste verbatim CloudWatch line>` |
-| `2026-07-03 12:02:4x` | nats-py stores swallowed error; no `-ERR` frame reached the application | format: `groww sidecar: NATS last_error -> <detail>` — `<PENDING — paste verbatim CloudWatch line>` |
-| `2026-07-03 12:02:4x` | SDK connection-closed callback fires (or is bypassed entirely) | format: `groww sidecar: NATS connection closed -> last_error=<detail>` — `<PENDING — paste verbatim CloudWatch line>` |
-| `2026-07-03 12:02:4x` | watchdog detects decoded-record stall during market hours; force-closes NATS socket | format: `groww sidecar: NATS disconnected -> last_error=<detail>` — `<PENDING — paste verbatim CloudWatch line>` |
-| `2026-07-03 12:02:4x` | reconnect ladder fires (50 ms base, ×2 per attempt, 5 s cap); re-auth via token read + re-subscribe | reconnect log — `<PENDING — paste verbatim CloudWatch line>` |
-| `2026-07-03 12:02:4x` | ticks flowing again on fresh socket | tick capture record — `<PENDING — paste verbatim CloudWatch line>` |
+| `12:02:43 + <PENDING — exact offset from CloudWatch>` | nats-py stores swallowed error; no `-ERR` frame reached the application | format: `groww sidecar: NATS last_error -> <detail>` — `<PENDING — paste verbatim CloudWatch line>` |
+| `12:02:43 + <PENDING — exact offset from CloudWatch>` | SDK connection-closed callback fires (or is bypassed entirely) | format: `groww sidecar: NATS connection closed -> last_error=<detail>` — `<PENDING — paste verbatim CloudWatch line>` |
+| `12:02:43 + <PENDING — exact offset from CloudWatch>` | watchdog detects decoded-record stall during market hours; force-closes NATS socket | format: `groww sidecar: FEED STALLED — <N>s with NO advancing exchange timestamp ...` (or the watermark-lag form `groww sidecar: FEED STALLED — watermark lag <N>ms behind wall-clock ...`) — `<PENDING — paste verbatim CloudWatch line>` |
+| `12:02:43 + <PENDING — exact offset from CloudWatch>` | nats-py disconnected callback fires after the force-close | format: `groww sidecar: NATS disconnected -> last_error=<detail>` — `<PENDING — paste verbatim CloudWatch line>` |
+| `12:02:43 + <PENDING — exact offset from CloudWatch>` | reconnect ladder fires (50 ms base, ×2 per attempt, 5 s cap); re-subscribes with the CACHED daily token (pure feed-side failures keep the token cached; SSM is NOT re-read on this path — only an AUTH-class failure drops the cache and re-reads SSM) | reconnect log — `<PENDING — paste verbatim CloudWatch line>` |
+| `<PENDING — timestamp from CloudWatch>` | ticks flowing again on fresh socket | tick capture record — `<PENDING — paste verbatim CloudWatch line>` |
 
 ### Mechanics (why this is painful client-side)
 
@@ -195,11 +214,20 @@ before sending — labeled as formats until then):
 ```
 groww sidecar: NATS error_cb -> <detail>
 groww sidecar: NATS connection closed -> last_error=<detail>
-groww sidecar: NATS disconnected -> last_error=<detail>
+groww sidecar: NATS disconnected -> last_error=<detail>          (nats-py disconnected callback — post-close timeline row, NOT the detection row)
 groww sidecar: NATS last_error -> <detail>
 groww sidecar: force-close of NATS socket failed (<type>)
+groww sidecar: FEED STALLED — <N>s with NO advancing exchange timestamp across the universe during market hours (...); a frozen snapshot re-dump counts as stalled. Force-closing the NATS socket to trigger reconnect + re-subscribe (self-heal).
+groww sidecar: FEED STALLED — watermark lag <N>ms behind wall-clock (> <N>ms for <N> consecutive checks) during market hours (...); micro-advancing timestamps that never catch up count as stalled. Force-closing the NATS socket to trigger reconnect + re-subscribe (self-heal).
+groww sidecar: SILENT FEED — subscribed <N> stocks + <N> indices but received NO live records in <N>s. (...)
 GROWW LIVE FEED REJECTED: <reason>
 ```
+
+The watchdog's own stall-detection lines are the `FEED STALLED` /
+`SILENT FEED` strings above (the two `FEED STALLED` forms and the
+`SILENT FEED` form are the detection signals); the
+`groww sidecar: NATS disconnected -> last_error=<detail>` line is the
+nats-py disconnected callback that fires AFTER the force-close.
 
 ```json
 <PENDING — paste verbatim CloudWatch line>
@@ -259,9 +287,13 @@ Groww Client ID: `<GROWW_CLIENT_ID — operator fill before sending>`
 - **Measurement basis:** the delta is `received_at − ts` in our tick
   store; both are IST wall-clock TIMESTAMPs, so the subtraction is
   same-basis. We deliberately do NOT subtract the raw
-  `exchange_timestamp` column (its units differ per feed). In QuestDB,
-  TIMESTAMP−TIMESTAMP arithmetic yields LONG **microseconds**; the SQL
-  divides by 1000 for ms.
+  `exchange_timestamp` column — it is SECOND-granular on both feeds
+  (Groww's mirrors Dhan's IST-epoch-seconds convention, ms truncated —
+  `crates/storage/src/groww_persistence.rs:268-270`); `ts` is the only
+  ms-true stamp. In QuestDB, TIMESTAMP−TIMESTAMP arithmetic yields LONG
+  **microseconds**; the SQL converts to ms via /1000.0 OUTSIDE any
+  aggregate (integer /1000 inside a percentile would truncate sub-ms
+  deltas to 0).
 - **capture_ns dependency:** `capture_ns` (per-callback capture stamp in
   the Python sidecar) is NOT yet merged anywhere in this repo (0 hits).
   Until it lands, `received_at` (stamped in the Rust bridge,
