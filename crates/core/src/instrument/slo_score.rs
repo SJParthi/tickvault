@@ -65,9 +65,17 @@ pub struct SloInputs {
     pub ws_health: f64,
     /// `1.0` if QuestDB connected (last health probe succeeded), else `0.0`.
     pub qdb_health: f64,
-    /// `1.0` if the worst per-instrument tick gap is `< 30s` (during
-    /// market hours), else `0.0`. Outside market hours the scheduler
-    /// pins this to `1.0` because tick silence post-close is by-design.
+    /// Fractional tick coverage of the subscribed universe (during
+    /// market hours): `1 − (silent SIDs / universe)`, clamped to `[0,1]`,
+    /// where a SID is silent when its last-tick gap is `≥ 30s`. INDIA VIX
+    /// (SID 21, quotes only around events) is excluded from the silent
+    /// numerator. A small illiquid silent tail degrades the dimension
+    /// proportionally (33/775 → 0.957, still Healthy) while a broad feed
+    /// stall drives it toward `0.0` — the 2026-07-03 #1342 fix for the
+    /// binary worst-gap definition that zeroed the score all session.
+    /// Computed by `compute_tick_freshness` in the scheduler. Outside
+    /// market hours the scheduler pins this to `1.0` because tick
+    /// silence post-close is by-design.
     pub tick_freshness: f64,
     /// `1.0` if seconds-until-token-expiry `> 4h`, else `0.0`.
     pub token_freshness: f64,

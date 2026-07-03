@@ -125,8 +125,13 @@ impl TickGapDetector {
     /// so operator-facing health messages can report real-tick freshness
     /// instead of raw frame freshness (which counts pings and can read
     /// "0s ago / healthy" while zero real ticks are captured — the
-    /// 2026-06-02 false-OK). Cold path: called once per heartbeat, NOT on
-    /// the hot loop.
+    /// 2026-06-02 false-OK). Also feeds the market-open self-test's
+    /// `recent_tick` sub-check (B3, 2026-07-03): FEED-level liveness —
+    /// seconds since ANY subscribed SID last ticked — so a handful of
+    /// always-silent illiquid SIDs cannot fail SELFTEST-02 the way the
+    /// old worst-per-SID gap did. Honest O(N) walk over ≤1200 tracked
+    /// SIDs, cold path only (per-heartbeat / once-per-day self-test),
+    /// NOT the tick hot loop.
     #[must_use]
     pub fn freshest_tick_age_secs(&self, now: Instant) -> Option<u64> {
         let pin = self.last_seen.pin();
@@ -601,6 +606,33 @@ mod tests {
             now - std::time::Duration::from_secs(2),
         );
         assert_eq!(d.freshest_tick_age_secs(now), Some(2));
+    }
+
+    #[test]
+    fn test_freshest_tick_age_secs_single_sid_returns_its_age() {
+        // One tracked SID => the min IS that SID's age.
+        let d = TickGapDetector::new(30);
+        let now = Instant::now();
+        d.record_tick(
+            13,
+            ExchangeSegment::IdxI,
+            now - std::time::Duration::from_secs(7),
+        );
+        assert_eq!(d.freshest_tick_age_secs(now), Some(7));
+    }
+
+    #[test]
+    fn test_freshest_tick_age_secs_saturates_to_zero_when_now_before_last_seen() {
+        // Clock edge: a tick recorded "in the future" relative to `now`
+        // (scheduler reordering) must saturate to age 0, never underflow.
+        let d = TickGapDetector::new(30);
+        let now = Instant::now();
+        d.record_tick(
+            13,
+            ExchangeSegment::IdxI,
+            now + std::time::Duration::from_secs(5),
+        );
+        assert_eq!(d.freshest_tick_age_secs(now), Some(0));
     }
 
     #[test]
