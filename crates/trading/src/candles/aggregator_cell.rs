@@ -551,6 +551,36 @@ impl AggregatorCell {
         // day's first bar opens at `tick.day_open`. Consume the flag so
         // every later bucket of the day opens at the LTP.
         if guard.is_uninitialised() {
+            // Failure-B guard (watermark catch-up seal, 2026-07-03): after
+            // `catch_up_seal` drained this slot INTRADAY, `last_sealed` still
+            // holds the just-sealed bucket (unlike `force_seal`, which clears
+            // it). A tick whose bucket is NOT strictly newer than that sealed
+            // bucket must NOT `from_first_tick`-reopen it — the re-opened
+            // bucket would lose the first half's open/high/low and re-baseline
+            // volume, then UPSERT a corrupted candle over the sealed one
+            // (research Failure B). Route it through the SAME late-arm
+            // semantics as the open-slot path instead:
+            // - Refold (Dhan): amend the sealed bucket iff same bucket
+            //   (Option B), else DiscardLate.
+            // - Discard (Groww): always DiscardLate.
+            // Boot and post-`force_seal` are unchanged: `last_sealed` is the
+            // empty sentinel there, so this block is skipped and the fresh
+            // open below runs exactly as before. Lock order stays
+            // slot-guard → last_sealed (guard is held here).
+            {
+                let mut last = self.last_sealed[tf.as_ordinal()].lock();
+                if !last.is_uninitialised() && bucket_start <= last.bucket_start_ist_secs {
+                    if matches!(strategy.late_policy, LatePolicy::Refold)
+                        && bucket_start == last.bucket_start_ist_secs
+                    {
+                        last.fold_late_hlc(tick);
+                        return ConsumeOutcome::AmendedLate {
+                            amended_state: *last,
+                        };
+                    }
+                    return ConsumeOutcome::DiscardLate;
+                }
+            }
             let use_day_open = self.armed_for_day_open[tf.as_ordinal()]
                 .swap(false, std::sync::atomic::Ordering::Relaxed);
             *guard = LiveCandleState::from_first_tick(
@@ -639,6 +669,62 @@ impl AggregatorCell {
             return None;
         }
         let sealed_state = std::mem::replace(&mut *guard, LiveCandleState::empty());
+        Some(sealed_state)
+    }
+
+    /// Watermark-aware INTRADAY catch-up seal (BOUNDARY-01, 2026-07-03).
+    ///
+    /// Seals the open bucket of `tf` ONLY when its (exclusive) bucket end is
+    /// at or before `cutoff_secs` — the caller's per-feed event-time
+    /// watermark minus the allowed-lateness margin
+    /// ([`crate::candles::CATCHUP_SEAL_LATENESS_MARGIN_SECS_DHAN`] /
+    /// [`crate::candles::CATCHUP_SEAL_LATENESS_MARGIN_SECS_GROWW`]). A bucket
+    /// ending past the cutoff is still potentially being filled by a
+    /// backlogged tick stream, so sealing it would either mass-discard the
+    /// backlog (Groww, `LatePolicy::Discard` — research Failure A) or corrupt
+    /// the candle on re-open (Failure B). Returns `None` in that case and for
+    /// an uninitialised slot.
+    ///
+    /// CONTRAST WITH [`Self::force_seal`] (the IST-midnight day boundary):
+    /// - `force_seal` RE-ARMS `armed_for_day_open` (next bucket = day's first
+    ///   bar); `catch_up_seal` does NOT — an intraday re-arm would make the
+    ///   next bucket open at `tick.day_open` mid-session (Failure B step 2).
+    /// - `force_seal` CLEARS `last_sealed` (§4b cross-day amend safety);
+    ///   `catch_up_seal` POPULATES it with the sealed state — exactly like an
+    ///   intraday boundary-crossing seal — so Dhan's Option B 1-bucket-late
+    ///   amend keeps working (research Failure C), and the
+    ///   uninitialised-slot Failure-B guard in [`Self::consume_tick`] can
+    ///   refuse to re-open the sealed bucket.
+    ///
+    /// Cold path (driven at a multi-second cadence, never per-tick). Lock
+    /// order: slot-guard → last_sealed (the pinned order shared with
+    /// `consume_tick` and `force_seal`).
+    pub fn catch_up_seal(&self, tf: TfIndex, cutoff_secs: u32) -> Option<LiveCandleState> {
+        let mut guard = self.slots[tf.as_ordinal()].lock();
+        if guard.is_uninitialised() {
+            return None;
+        }
+        // NEVER seal a bucket whose end is past the watermark cutoff — the
+        // no-mass-discard contract. Saturating add (F3, 2026-07-03 security
+        // review): a bucket_start near u32::MAX (reachable only via a
+        // poisoned watermark / garbage timestamp) must not overflow-panic
+        // (release profile pins `overflow-checks = true`); saturation pins
+        // the end at u32::MAX, which exceeds every real cutoff → the bucket
+        // simply never seals (fail-safe). Same bucket math as
+        // `TfIndex::bucket_end` minus the overflow — the plain-`+` variant
+        // keeps its semantics for all other callers.
+        if guard
+            .bucket_start_ist_secs
+            .saturating_add(tf.seconds_per_bucket())
+            > cutoff_secs
+        {
+            return None;
+        }
+        let sealed_state = std::mem::replace(&mut *guard, LiveCandleState::empty());
+        // Option B parity with the intraday boundary-crossing seal: the
+        // just-sealed bucket stays amendable (and re-open-proof via the
+        // consume_tick Failure-B guard). Lock order: slot → last_sealed.
+        *self.last_sealed[tf.as_ordinal()].lock() = sealed_state;
         Some(sealed_state)
     }
 }
@@ -1313,6 +1399,226 @@ mod tests {
         );
         let s = cell.snapshot(TfIndex::M1);
         assert_eq!(s.open, 105.0, "zero day_open falls back to LTP");
+    }
+
+    // -----------------------------------------------------------------------
+    // BOUNDARY-01 watermark catch-up seal (2026-07-03)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_catch_up_seal_respects_cutoff() {
+        let cell = AggregatorCell::empty();
+        // Uninitialised slot → None regardless of cutoff (even u32::MAX).
+        assert!(cell.catch_up_seal(TfIndex::M1, u32::MAX).is_none());
+
+        // Open an M1 bucket at b1 (aligned): bucket_end = b1 + 60.
+        let b1 = 1_779_355_500_u32; // 09:25:00 IST, M1-aligned
+        cell.consume_tick(
+            TfIndex::M1,
+            &mk_tick(b1 + 30, 100.0, 50, 0),
+            0,
+            FeedStrategy::DHAN,
+            None,
+        );
+        // cutoff BEFORE the bucket end → refuse to seal (the no-mass-discard
+        // contract: the backlog may still be filling this bucket).
+        assert!(cell.catch_up_seal(TfIndex::M1, b1 + 59).is_none());
+        assert!(
+            !cell.snapshot(TfIndex::M1).is_uninitialised(),
+            "refused catch-up must leave the bucket open"
+        );
+        // cutoff AT the bucket end → seal (bucket_end <= cutoff).
+        let sealed = cell
+            .catch_up_seal(TfIndex::M1, b1 + 60)
+            .expect("bucket_end <= cutoff must seal");
+        assert_eq!(sealed.bucket_start_ist_secs, b1);
+        assert_eq!(sealed.close, 100.0);
+        assert!(cell.snapshot(TfIndex::M1).is_uninitialised());
+    }
+
+    #[test]
+    fn test_catch_up_seal_bucket_end_saturates_at_u32_max() {
+        // F3 (2026-07-03 security review): a bucket_start near u32::MAX
+        // (reachable only via a poisoned watermark / garbage timestamp) must
+        // not overflow-panic in the bucket-end comparison — the release
+        // profile pins `overflow-checks = true`, so a plain `+` would abort
+        // the process. The saturating computation pins end = u32::MAX, which
+        // exceeds every real cutoff → the absurd bucket never seals
+        // (fail-safe). The slot is planted directly because `bucket_start`
+        // itself cannot construct a start this large without overflowing.
+        let cell = AggregatorCell::empty();
+        let start = u32::MAX - 30; // start + 60 (M1) would overflow u32
+        {
+            let mut guard = cell.slots[TfIndex::M1.as_ordinal()].lock();
+            *guard = LiveCandleState::from_first_tick(
+                &mk_tick(start, 100.0, 10, 0),
+                start,
+                0,
+                false,
+                10,
+            );
+        }
+        // No panic; saturated end (u32::MAX) > cutoff → never seals.
+        assert!(cell.catch_up_seal(TfIndex::M1, u32::MAX - 1).is_none());
+        assert!(
+            !cell.snapshot(TfIndex::M1).is_uninitialised(),
+            "refused catch-up must leave the bucket open"
+        );
+        // Degenerate ceiling: only cutoff == u32::MAX admits the saturated
+        // end (end <= cutoff) — pinning that this is saturation semantics,
+        // not a hard-disable. Unreachable in production: the driver clamps
+        // the cutoff to the IST wall clock.
+        assert!(cell.catch_up_seal(TfIndex::M1, u32::MAX).is_some());
+    }
+
+    #[test]
+    fn test_catch_up_seal_populates_last_sealed_and_keeps_day_open_unarmed() {
+        // Contrast with force_seal: an INTRADAY catch-up seal must (a) leave
+        // the sealed bucket amendable in last_sealed (Option B survives) and
+        // (b) NOT re-arm day-open (the next bucket opens at the LTP, never
+        // masquerading as the day's first bar — research Failure B step 2).
+        let cell = AggregatorCell::empty();
+        let b1 = 1_779_355_500_u32; // 09:25:00 IST, M1-aligned
+        // Day's first bucket consumes the armed flag (open = day_open 100).
+        cell.consume_tick(
+            TfIndex::M1,
+            &mk_tick_with_day_open(b1 + 30, 105.0, 100.0),
+            0,
+            FeedStrategy::DHAN,
+            None,
+        );
+        let sealed = cell
+            .catch_up_seal(TfIndex::M1, b1 + 60)
+            .expect("must seal past cutoff");
+        assert_eq!(sealed.open, 100.0);
+        // (a) last_sealed populated: a 1-bucket-late Dhan tick amends in place.
+        let late = mk_tick(b1 + 50, 110.0, 55, 0);
+        match cell.consume_tick(TfIndex::M1, &late, 0, FeedStrategy::DHAN, None) {
+            ConsumeOutcome::AmendedLate { amended_state } => {
+                assert_eq!(amended_state.bucket_start_ist_secs, b1);
+                assert_eq!(amended_state.high, 110.0);
+            }
+            other => panic!("expected AmendedLate after catch-up seal, got {other:?}"),
+        }
+        // (b) NOT re-armed: the next (newer) bucket opens at the LTP even
+        // though the tick still carries a non-zero day_open.
+        let newer = mk_tick_with_day_open(b1 + 70, 107.0, 100.0);
+        cell.consume_tick(TfIndex::M1, &newer, 0, FeedStrategy::DHAN, None);
+        assert_eq!(
+            cell.snapshot(TfIndex::M1).open,
+            107.0,
+            "post-catch-up intraday bucket must open at LTP, not day_open"
+        );
+    }
+
+    #[test]
+    fn test_post_catchup_late_tick_dhan_amends_in_place() {
+        // Option B survives a catch-up seal: the uninitialised-slot Failure-B
+        // guard routes a same-bucket late tick to the amend arm (Refold).
+        let cell = AggregatorCell::empty();
+        let b1 = 1_779_355_500_u32;
+        cell.consume_tick(
+            TfIndex::M1,
+            &mk_tick(b1 + 30, 100.0, 50, 0),
+            0,
+            FeedStrategy::DHAN,
+            None,
+        );
+        cell.catch_up_seal(TfIndex::M1, b1 + 60).expect("must seal");
+        // Slot is uninitialised now; a late tick whose LTT floors to the
+        // catch-up-sealed bucket AMENDS it (never re-opens it).
+        let late = mk_tick(b1 + 55, 111.0, 58, 0);
+        match cell.consume_tick(TfIndex::M1, &late, 0, FeedStrategy::DHAN, None) {
+            ConsumeOutcome::AmendedLate { amended_state } => {
+                assert_eq!(amended_state.bucket_start_ist_secs, b1);
+                assert_eq!(amended_state.high, 111.0);
+                assert_eq!(amended_state.close, 111.0); // LTT b1+55 >= close_ts b1+30
+            }
+            other => panic!("expected AmendedLate, got {other:?}"),
+        }
+        assert!(
+            cell.snapshot(TfIndex::M1).is_uninitialised(),
+            "amend must not re-open the slot"
+        );
+    }
+
+    #[test]
+    fn test_post_catchup_late_tick_groww_discards_not_reopens() {
+        // The Failure-B guard under LatePolicy::Discard: after a catch-up
+        // seal, a backlogged tick for the sealed (or any older) bucket is
+        // DiscardLate — NEVER a from_first_tick re-open that would corrupt
+        // the candle on UPSERT.
+        let cell = AggregatorCell::empty();
+        let b1 = 1_779_355_500_u32;
+        cell.consume_tick(
+            TfIndex::M1,
+            &mk_tick(b1 + 30, 100.0, 50, 0),
+            0,
+            FeedStrategy::GROWW,
+            None,
+        );
+        cell.catch_up_seal(TfIndex::M1, b1 + 60).expect("must seal");
+        // Same-bucket late tick → DiscardLate (Groww never amends).
+        let same_bucket_late = mk_tick(b1 + 55, 111.0, 58, 0);
+        assert_eq!(
+            cell.consume_tick(TfIndex::M1, &same_bucket_late, 0, FeedStrategy::GROWW, None),
+            ConsumeOutcome::DiscardLate
+        );
+        // Strictly-older-bucket late tick → DiscardLate too.
+        let older_bucket_late = mk_tick(b1 - 5, 99.0, 40, 0);
+        assert_eq!(
+            cell.consume_tick(
+                TfIndex::M1,
+                &older_bucket_late,
+                0,
+                FeedStrategy::GROWW,
+                None
+            ),
+            ConsumeOutcome::DiscardLate
+        );
+        assert!(
+            cell.snapshot(TfIndex::M1).is_uninitialised(),
+            "the sealed bucket must NEVER be re-opened by a late tick"
+        );
+    }
+
+    #[test]
+    fn test_force_seal_after_catchup_is_idempotent() {
+        // Midnight coexistence: after a catch-up seal drained the slot, the
+        // IST-midnight force_seal returns None (nothing to double-flush) but
+        // STILL performs its day-boundary duties — clear last_sealed (§4b
+        // cross-day amend safety) + re-arm day-open.
+        let cell = AggregatorCell::empty();
+        let b1 = 1_779_355_500_u32;
+        cell.consume_tick(
+            TfIndex::M1,
+            &mk_tick_with_day_open(b1 + 30, 105.0, 100.0),
+            0,
+            FeedStrategy::DHAN,
+            None,
+        );
+        cell.catch_up_seal(TfIndex::M1, b1 + 60).expect("must seal");
+        // Midnight: nothing left to seal.
+        assert!(cell.force_seal(TfIndex::M1).is_none());
+        // Duty 1: re-armed — the next day's first bucket opens at day_open
+        // (also proves the Failure-B guard yields to a cleared last_sealed:
+        // the day-2 tick opens fresh exactly as the pre-catch-up contract).
+        let day2 = mk_tick_with_day_open(b1 + 86_400, 210.0, 200.0);
+        cell.consume_tick(TfIndex::M1, &day2, 0, FeedStrategy::DHAN, None);
+        assert_eq!(
+            cell.snapshot(TfIndex::M1).open,
+            200.0,
+            "force_seal after catch-up must still re-arm day-open"
+        );
+        // Duty 2: last_sealed cleared — a stray late tick to the old
+        // (catch-up-sealed, then force-sealed-over) bucket can no longer
+        // amend cross-day; Dhan Refold falls through to discard (mirrors
+        // test_force_seal_clears_last_sealed_no_cross_day_amend).
+        let late = mk_tick(b1 + 50, 999.0, 55, 0);
+        assert_eq!(
+            cell.consume_tick(TfIndex::M1, &late, 0, FeedStrategy::DHAN, None),
+            ConsumeOutcome::DiscardLate
+        );
     }
 
     #[test]

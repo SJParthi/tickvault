@@ -55,7 +55,7 @@
 
 use std::collections::HashSet;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use papaya::HashMap;
 
@@ -63,6 +63,94 @@ use tickvault_common::tick_types::ParsedTick;
 
 use crate::candles::tf_index::{MARKET_CLOSE_SECS_OF_DAY_IST, MARKET_OPEN_SECS_OF_DAY_IST};
 use crate::candles::{AggregatorCell, ConsumeOutcome, FeedStrategy, LiveCandleState, TfIndex};
+
+/// Dhan allowed-lateness margin (seconds) subtracted from the Dhan feed's
+/// event-time watermark before the catch-up scan (BOUNDARY-01, 2026-07-03):
+/// `cutoff = min(watermark − margin, now_ist)`, and
+/// [`AggregatorCell::catch_up_seal`] seals ONLY buckets whose end ≤ cutoff.
+/// The 5 s margin absorbs sub-second out-of-order delivery around the
+/// boundary (the same lateness class Dhan's Option B amend exists for) so a
+/// bucket is never sealed while its final ticks are still plausibly in
+/// flight. Dhan's WS broadcast delivers in near-capture order, so 5 s is
+/// generous there.
+pub const CATCHUP_SEAL_LATENESS_MARGIN_SECS_DHAN: u32 = 5;
+
+/// Groww allowed-lateness margin (seconds) — DELIBERATELY wider than Dhan's
+/// (per-feed margins, F4 hostile finding 2026-07-03). Groww's NDJSON path has
+/// MEASURED per-subject delivery skew (sidecar snapshot freezes, byte-0
+/// re-tail replays, bounded 4 MiB chunk drains) that Dhan's in-process
+/// broadcast does not: two subjects' lines can legitimately interleave tens
+/// of seconds apart in capture order. Under `LatePolicy::Discard` a 5 s
+/// margin converts ">5 s skew = counted discard"; one full minute of allowed
+/// lateness converts that into "only >60 s skew discards", while still
+/// bounding the Groww seal lag to ~watermark + 65 s instead of unbounded
+/// (next tick / midnight only).
+pub const CATCHUP_SEAL_LATENESS_MARGIN_SECS_GROWW: u32 = 60;
+
+/// Future-skew guard (seconds) for the poisoned-watermark defense (F2,
+/// 2026-07-03 security review): a LEGITIMATE watermark can lead the IST wall
+/// clock only by the host clock skew, which BOOT-03 bounds at ≤ 2 s — so a
+/// watermark more than this many seconds AHEAD of `now_ist` is provably
+/// poisoned (a garbage future-dated tick advanced the `fetch_max`, which can
+/// never regress). [`compute_catchup_cutoff`] returns `None` in that case and
+/// the driver logs a coalesced BOUNDARY-01 `error!` with
+/// `reason = "watermark_future_skew"` — catch-up sealing stays disabled
+/// until the watermark self-heals at the IST-midnight
+/// [`MultiTfAggregator::reset_watermark`]. 10 s is generous vs the 2 s bound.
+pub const CATCHUP_WATERMARK_FUTURE_SKEW_GUARD_SECS: u32 = 10;
+
+/// Cadence (seconds) of the per-feed catch-up-seal driver tasks. Cold path:
+/// each wave is at most one `O(N × 21)` scan, and the drivers self-gate on
+/// "watermark advanced since the last scan" so an idle feed (overnight,
+/// holiday, dead socket) costs one atomic load per wave and never scans.
+pub const CATCHUP_SEAL_POLL_INTERVAL_SECS: u64 = 5;
+
+/// Pure per-scan gate for the catch-up drivers (F2, 2026-07-03 security
+/// review) — shared by BOTH the Dhan (`main.rs` Task 4) and Groww
+/// (`groww_bridge.rs::spawn_groww_catchup_seal`) driver tasks so the
+/// poisoned-watermark defense is unit-testable in one place.
+///
+/// Returns `None` (skip this wave, do NOT scan) when:
+/// - `watermark_secs == 0` — no tick consumed yet;
+/// - `watermark_secs == last_scanned_watermark` — self-gate: the watermark
+///   did not advance since the last scan (idle feed / overnight / holiday /
+///   dead socket — FEED-STALL-01 owns the dead-feed page);
+/// - `watermark_secs > now_ist_secs + future_skew_guard_secs` — **POISONED
+///   watermark**: a legit watermark can lead the wall clock only by host
+///   skew (≤ 2 s per BOOT-03), so a further-future watermark means a
+///   garbage-dated tick advanced the never-regressing `fetch_max`. The
+///   caller logs a coalesced `error!(code = "BOUNDARY-01",
+///   reason = "watermark_future_skew")`, increments
+///   `tv_boundary_catchup_skipped_total{feed, reason="future_skew"}`, and
+///   MUST NOT update `last_scanned_watermark` — so once the watermark
+///   self-heals (IST-midnight [`MultiTfAggregator::reset_watermark`], or a
+///   legit tick overtaking it in year-scale cases never), scanning resumes.
+///
+/// Otherwise returns `Some(min(watermark − margin, now_ist_secs))` — the
+/// wall-clock clamp is defense-in-depth: even with a mildly-poisoned
+/// watermark inside the guard band, a bucket can never seal before the wall
+/// clock passes its end.
+///
+/// Pure, O(1), no allocation. `margin_secs` is per-feed
+/// ([`CATCHUP_SEAL_LATENESS_MARGIN_SECS_DHAN`] /
+/// [`CATCHUP_SEAL_LATENESS_MARGIN_SECS_GROWW`]);
+/// `future_skew_guard_secs` is [`CATCHUP_WATERMARK_FUTURE_SKEW_GUARD_SECS`].
+#[must_use]
+pub fn compute_catchup_cutoff(
+    watermark_secs: u32,
+    last_scanned_watermark: u32,
+    now_ist_secs: u32,
+    margin_secs: u32,
+    future_skew_guard_secs: u32,
+) -> Option<u32> {
+    if watermark_secs == 0 || watermark_secs == last_scanned_watermark {
+        return None;
+    }
+    if watermark_secs > now_ist_secs.saturating_add(future_skew_guard_secs) {
+        return None;
+    }
+    Some(watermark_secs.saturating_sub(margin_secs).min(now_ist_secs))
+}
 
 /// Composite key per I-P1-11 — `(security_id, exchange_segment_code)`.
 /// `security_id` is `u64` (2026-06-29 widening) so Groww's native exchange_token
@@ -152,6 +240,18 @@ pub struct MultiTfAggregator {
     /// Nifty trades ~21 h/day). Empty by default → no exemptions →
     /// today's behavior. Set once at boot via `with_always_on`.
     always_on: Arc<HashSet<(u64, u8)>>,
+    /// Per-INSTANCE event-time watermark (BOUNDARY-01, 2026-07-03): the max
+    /// `tick.exchange_timestamp` (IST epoch seconds) EVER consumed by this
+    /// aggregator instance. Advanced by a single relaxed `fetch_max` at the
+    /// top of [`Self::consume_tick`] — BEFORE the out-of-session early
+    /// return, so post-close ticks still advance it (the final session
+    /// minute's catch-up seal depends on that). Duplicate-immune by
+    /// construction: a frozen-snapshot re-dump (same ts re-delivered) can
+    /// never advance a max. `Arc` (not a bare atomic) because the struct is
+    /// `Clone` — the catch-up driver task holds a clone and MUST observe the
+    /// same watermark the tick-consumer clone advances. Dhan and Groww run
+    /// SEPARATE instances, so their watermarks never cross-apply.
+    max_seen_exchange_ts_secs: Arc<AtomicU32>,
 }
 
 impl MultiTfAggregator {
@@ -169,7 +269,36 @@ impl MultiTfAggregator {
         Self {
             inner: Arc::new(HashMap::with_capacity(cap)),
             always_on: Arc::new(HashSet::new()),
+            max_seen_exchange_ts_secs: Arc::new(AtomicU32::new(0)),
         }
+    }
+
+    /// Current event-time watermark of this aggregator instance: the max
+    /// `exchange_timestamp` (IST epoch seconds) ever seen by
+    /// [`Self::consume_tick`], `0` before the first tick. The catch-up
+    /// drivers gate + compute the cutoff via [`compute_catchup_cutoff`]
+    /// with the per-feed margin ([`CATCHUP_SEAL_LATENESS_MARGIN_SECS_DHAN`] /
+    /// [`CATCHUP_SEAL_LATENESS_MARGIN_SECS_GROWW`]) and pass it to
+    /// [`Self::catch_up_seal_all`]. One relaxed atomic load.
+    #[must_use]
+    pub fn watermark_secs(&self) -> u32 {
+        self.max_seen_exchange_ts_secs.load(Ordering::Relaxed)
+    }
+
+    /// Resets the event-time watermark to `0` (F2 self-heal, 2026-07-03
+    /// security review). Called by BOTH IST-midnight force-seal tasks right
+    /// after `force_seal_all`, so:
+    /// - a POISONED watermark (a garbage future-dated tick advanced the
+    ///   never-regressing `fetch_max` past the
+    ///   [`CATCHUP_WATERMARK_FUTURE_SKEW_GUARD_SECS`] band, disabling
+    ///   catch-up) self-heals within one day, and
+    /// - each trading day's watermark restarts clean from the day's first
+    ///   real tick instead of carrying yesterday's high-water mark.
+    /// Cold path (once per day per feed instance); the drivers'
+    /// `watermark == 0` gate keeps the scan idle until the next tick
+    /// rebuilds it. One relaxed atomic store.
+    pub fn reset_watermark(&self) {
+        self.max_seen_exchange_ts_secs.store(0, Ordering::Relaxed);
     }
 
     /// Install the always-on (no market-hours filter) exemption set
@@ -305,6 +434,16 @@ impl MultiTfAggregator {
     where
         F: FnMut(TfIndex, LiveCandleState),
     {
+        // BOUNDARY-01 watermark (2026-07-03): advance this instance's
+        // event-time watermark BEFORE the out-of-session early return —
+        // post-close ticks must advance it so the final session minute
+        // (e.g. the 15:29 M1 bar) becomes catch-up-sealable once the feed's
+        // event time passes 15:30 + margin. One relaxed atomic RMW, zero
+        // allocation (DHAT-ratcheted); max never regresses on duplicate /
+        // stale timestamps.
+        self.max_seen_exchange_ts_secs
+            .fetch_max(tick.exchange_timestamp, Ordering::Relaxed);
+
         // Candle-window gate: only ticks inside the regular trading
         // session [09:15:00, 15:30:00) IST form candles. Pre-open
         // auction ticks (< 09:15) and post-close stale ticks (>= 15:30)
@@ -428,6 +567,46 @@ impl MultiTfAggregator {
                 }
             }
         }
+    }
+
+    /// Watermark-aware catch-up seal across every instrument × 21 TFs
+    /// (BOUNDARY-01, 2026-07-03). Mirrors [`Self::force_seal_all`]'s papaya
+    /// iteration but calls [`AggregatorCell::catch_up_seal`] per slot, so a
+    /// bucket is sealed ONLY when its end ≤ `cutoff_secs` (the caller's
+    /// [`Self::watermark_secs`] minus the per-feed lateness margin)
+    /// — never at/past the feed's event-time watermark (the no-mass-discard
+    /// contract; see the cell method for the Failure A/B/C rationale).
+    /// Unlike `force_seal_all` this does NOT re-arm day-open and does NOT
+    /// clear the amendable `last_sealed` — it is an INTRADAY flush, not the
+    /// day boundary; the two IST-midnight force-seal tasks keep their
+    /// cross-day duties unchanged.
+    ///
+    /// `on_seal(security_id, segment_code, tf, state)` — the same callback
+    /// shape as `force_seal_all`, because the app-side seal routing needs the
+    /// instrument identity. Returns the number of buckets sealed so the
+    /// driver can emit ONE coalesced BOUNDARY-01 log line per wave.
+    ///
+    /// `O(N × 21)` where N = number of instruments. Cold path — driven at
+    /// the [`CATCHUP_SEAL_POLL_INTERVAL_SECS`] cadence, never per tick; each
+    /// slot visit is the same per-slot `parking_lot::Mutex` the hot path
+    /// takes (papaya reads are lock-free), so contention is per-(instrument,
+    /// TF), never map-wide.
+    pub fn catch_up_seal_all<F>(&self, cutoff_secs: u32, mut on_seal: F) -> usize
+    where
+        F: FnMut(u64, u8, TfIndex, LiveCandleState),
+    {
+        let mut sealed_count: usize = 0;
+        let pin = self.inner.pin();
+        for (key, entry) in pin.iter() {
+            let (security_id, segment_code) = *key;
+            for tf in TfIndex::ALL {
+                if let Some(sealed) = entry.cell.catch_up_seal(tf, cutoff_secs) {
+                    sealed_count = sealed_count.saturating_add(1);
+                    on_seal(security_id, segment_code, tf, sealed);
+                }
+            }
+        }
+        sealed_count
     }
 }
 
@@ -834,5 +1013,344 @@ mod tests {
     fn test_consume_stats_is_copy_for_zero_alloc_callers() {
         fn assert_copy<T: Copy>() {}
         assert_copy::<ConsumeStats>();
+    }
+
+    // -----------------------------------------------------------------------
+    // BOUNDARY-01 watermark catch-up seal (2026-07-03)
+    // -----------------------------------------------------------------------
+
+    /// IST midnight (epoch-in-IST-seconds) of the 2026-05-21 test day the
+    /// existing tests anchor on (`1_779_354_900` = that day's 09:15:00).
+    const TEST_DAY_START: u32 = 1_779_321_600;
+
+    #[test]
+    fn test_watermark_secs_starts_zero_and_is_shared_across_clones() {
+        // The getter contract: 0 before any tick; a clone (the catch-up
+        // driver task holds one) observes the SAME watermark the
+        // tick-consumer clone advances (Arc-shared, per-instance).
+        let agg = MultiTfAggregator::new();
+        assert_eq!(agg.watermark_secs(), 0);
+        agg.pre_populate(vec![(13, 0)]);
+        let driver_clone = agg.clone();
+        let ts = TEST_DAY_START + 33_330; // 09:15:30 IST
+        agg.consume_tick(
+            &mk_tick(13, 0, ts, 100.0, 50, 0),
+            0,
+            FeedStrategy::DHAN,
+            None,
+            |_, _| {},
+        );
+        assert_eq!(driver_clone.watermark_secs(), ts);
+        // A separate INSTANCE has its own watermark (Dhan vs Groww never
+        // cross-apply).
+        let other_instance = MultiTfAggregator::new();
+        assert_eq!(other_instance.watermark_secs(), 0);
+    }
+
+    #[test]
+    fn test_watermark_advances_and_never_regresses() {
+        let agg = MultiTfAggregator::new();
+        agg.pre_populate(vec![(13, 0)]);
+        assert_eq!(agg.watermark_secs(), 0, "no tick yet → watermark 0");
+
+        let base = TEST_DAY_START + 33_300; // 09:15:00 IST
+        agg.consume_tick(
+            &mk_tick(13, 0, base + 30, 100.0, 50, 0),
+            0,
+            FeedStrategy::DHAN,
+            None,
+            |_, _| {},
+        );
+        assert_eq!(agg.watermark_secs(), base + 30);
+
+        // Advance.
+        agg.consume_tick(
+            &mk_tick(13, 0, base + 90, 101.0, 60, 0),
+            0,
+            FeedStrategy::DHAN,
+            None,
+            |_, _| {},
+        );
+        assert_eq!(agg.watermark_secs(), base + 90);
+
+        // A STALE tick (older ts) must never regress the watermark.
+        agg.consume_tick(
+            &mk_tick(13, 0, base + 10, 99.0, 61, 0),
+            0,
+            FeedStrategy::DHAN,
+            None,
+            |_, _| {},
+        );
+        assert_eq!(agg.watermark_secs(), base + 90, "stale ts must not regress");
+
+        // A DUPLICATE ts (frozen-snapshot re-dump class) must not move it.
+        agg.consume_tick(
+            &mk_tick(13, 0, base + 90, 101.0, 61, 0),
+            0,
+            FeedStrategy::GROWW,
+            Some(61),
+            |_, _| {},
+        );
+        assert_eq!(agg.watermark_secs(), base + 90, "duplicate ts is a no-op");
+
+        // Clones share the SAME watermark (the driver task holds a clone).
+        let cloned = agg.clone();
+        assert_eq!(cloned.watermark_secs(), base + 90);
+    }
+
+    #[test]
+    fn test_watermark_advances_on_out_of_session_tick() {
+        // A post-close tick (>= 15:30 IST) is gated out of the candle fold,
+        // but it MUST advance the watermark — the final session minute's
+        // catch-up seal depends on the feed's event time crossing 15:30.
+        let agg = MultiTfAggregator::new();
+        agg.pre_populate(vec![(13, 0)]);
+        let post_close = TEST_DAY_START + 55_807; // 15:30:07 IST
+        let stats = agg.consume_tick(
+            &mk_tick(13, 0, post_close, 100.0, 50, 0),
+            0,
+            FeedStrategy::DHAN,
+            None,
+            |_, _| {},
+        );
+        assert_eq!(stats.sealed_count, 0);
+        assert_eq!(
+            agg.watermark_secs(),
+            post_close,
+            "post-close tick must advance"
+        );
+        // The fold itself stayed gated — no bucket opened.
+        let entry = agg.get(13, 0).expect("present");
+        assert!(
+            entry.cell.snapshot(TfIndex::M1).is_uninitialised(),
+            "out-of-session tick must not open a candle"
+        );
+    }
+
+    #[test]
+    fn test_compute_catchup_cutoff_gates() {
+        // F2 (2026-07-03 security review): the shared pure per-scan gate.
+        let now = TEST_DAY_START + 40_000;
+        let margin = CATCHUP_SEAL_LATENESS_MARGIN_SECS_DHAN;
+        let guard = CATCHUP_WATERMARK_FUTURE_SKEW_GUARD_SECS;
+        // 1) No tick yet → None.
+        assert_eq!(compute_catchup_cutoff(0, 0, now, margin, guard), None);
+        // 2) Self-gate: watermark unchanged since the last scan → None.
+        let wm = now - 30;
+        assert_eq!(compute_catchup_cutoff(wm, wm, now, margin, guard), None);
+        // 3) POISONED: watermark further ahead of wall clock than the
+        //    future-skew guard → None (caller logs BOUNDARY-01
+        //    reason=watermark_future_skew and must NOT update last_scanned).
+        let poisoned = now + guard + 1;
+        assert_eq!(
+            compute_catchup_cutoff(poisoned, 0, now, margin, guard),
+            None
+        );
+        // Boundary: exactly now + guard is still allowed (legit host skew).
+        assert_eq!(
+            compute_catchup_cutoff(now + guard, 0, now, margin, guard),
+            Some(now) // wm − margin > now → clamped to wall clock
+        );
+        // 4) Normal: Some(min(wm − margin, now)) — here wm − margin < now.
+        assert_eq!(
+            compute_catchup_cutoff(wm, 0, now, margin, guard),
+            Some(wm - margin)
+        );
+        // Groww's wider margin flows through the same gate.
+        assert_eq!(
+            compute_catchup_cutoff(wm, 0, now, CATCHUP_SEAL_LATENESS_MARGIN_SECS_GROWW, guard),
+            Some(wm - CATCHUP_SEAL_LATENESS_MARGIN_SECS_GROWW)
+        );
+        // Tiny watermark (≤ margin) saturates to 0, never underflows.
+        assert_eq!(compute_catchup_cutoff(3, 0, now, margin, guard), Some(0));
+    }
+
+    #[test]
+    fn test_compute_catchup_cutoff_clamps_to_wall_clock() {
+        // F2 defense-in-depth: a watermark inside the skew-guard band but
+        // ahead of the wall clock must never let a bucket seal before the
+        // wall clock passes its end — cutoff is clamped to now_ist.
+        let now = TEST_DAY_START + 40_000;
+        let margin = 2; // margin < lead so wm − margin > now
+        let guard = CATCHUP_WATERMARK_FUTURE_SKEW_GUARD_SECS;
+        let wm = now + 5; // ≤ now + guard → allowed, but ahead of wall clock
+        assert_eq!(
+            compute_catchup_cutoff(wm, 0, now, margin, guard),
+            Some(now),
+            "cutoff must clamp to the wall clock, not wm − margin"
+        );
+        // With margin ≥ lead the min() is wm − margin (behind the clock).
+        assert_eq!(
+            compute_catchup_cutoff(wm, 0, now, CATCHUP_SEAL_LATENESS_MARGIN_SECS_GROWW, guard),
+            Some(wm - CATCHUP_SEAL_LATENESS_MARGIN_SECS_GROWW)
+        );
+    }
+
+    #[test]
+    fn test_reset_watermark_zeroes_and_next_tick_rebuilds() {
+        // F2 self-heal (2026-07-03): the IST-midnight tasks reset the
+        // watermark to 0 right after force_seal_all, so a poisoned watermark
+        // self-heals within one day and the next tick rebuilds it clean.
+        let agg = MultiTfAggregator::new();
+        agg.pre_populate(vec![(13, 0)]);
+        let ts = TEST_DAY_START + 33_310;
+        agg.consume_tick(
+            &mk_tick(13, 0, ts, 100.0, 10, 0),
+            0,
+            FeedStrategy::DHAN,
+            None,
+            |_, _| {},
+        );
+        assert_eq!(agg.watermark_secs(), ts);
+        agg.reset_watermark();
+        assert_eq!(agg.watermark_secs(), 0, "reset must zero the watermark");
+        // A clone (the driver task's handle) observes the same reset.
+        assert_eq!(agg.clone().watermark_secs(), 0);
+        // The next tick rebuilds the watermark from scratch.
+        let ts2 = ts + 60;
+        agg.consume_tick(
+            &mk_tick(13, 0, ts2, 101.0, 20, 0),
+            0,
+            FeedStrategy::DHAN,
+            None,
+            |_, _| {},
+        );
+        assert_eq!(agg.watermark_secs(), ts2, "next tick rebuilds cleanly");
+    }
+
+    #[test]
+    fn test_post_catchup_newer_tick_opens_next_bucket_with_volume_continuity() {
+        // Item 28 carry-over across a catch-up seal: the next bucket's
+        // bucket_start_cumulative must be the per-instrument last_cumulative
+        // baseline, so incremental volume is exact — identical to the
+        // next-tick boundary-crossing seal path.
+        let agg = MultiTfAggregator::new();
+        agg.pre_populate(vec![(13, 0)]);
+        let b1 = TEST_DAY_START + 33_300; // 09:15:00 IST (M1 bucket 1)
+        agg.consume_tick(
+            &mk_tick(13, 0, b1 + 10, 100.0, 100, 0),
+            0,
+            FeedStrategy::DHAN,
+            None,
+            |_, _| {},
+        );
+        // Catch up: only M1's bucket (end b1+60) is <= cutoff b1+60.
+        let sealed = agg.catch_up_seal_all(b1 + 60, |_, _, _, _| {});
+        assert_eq!(sealed, 1, "only the M1 bucket ends at/behind the cutoff");
+        // Next tick opens M1 bucket 2 with cumulative volume 150.
+        agg.consume_tick(
+            &mk_tick(13, 0, b1 + 70, 102.0, 150, 0),
+            0,
+            FeedStrategy::DHAN,
+            None,
+            |_, _| {},
+        );
+        let entry = agg.get(13, 0).expect("present");
+        let snap = entry.cell.snapshot(TfIndex::M1);
+        assert_eq!(snap.bucket_start_ist_secs, b1 + 60);
+        assert_eq!(
+            snap.bucket_start_cumulative, 100,
+            "baseline must carry the pre-seal cumulative"
+        );
+        assert_eq!(snap.volume, 50, "incremental volume = 150 - 100");
+        assert_eq!(
+            snap.open, 102.0,
+            "intraday open at LTP (no day-open re-arm)"
+        );
+    }
+
+    #[test]
+    fn test_catch_up_seal_all_never_seals_past_watermark() {
+        // THE no-mass-discard ratchet: a backlogged feed (watermark barely
+        // past the open buckets' starts) must produce ZERO catch-up seals —
+        // every bucket's end is past the cutoff, so the backlog can still
+        // fill them. This is the contract that prevents research Failure A.
+        let agg = MultiTfAggregator::new();
+        agg.pre_populate(vec![(13, 0), (25, 0)]);
+        let base = TEST_DAY_START + 33_300; // 09:15:00 IST
+        for sid in [13_u64, 25] {
+            agg.consume_tick(
+                &mk_tick(sid, 0, base + 30, 100.0, 50, 0),
+                0,
+                FeedStrategy::DHAN,
+                None,
+                |_, _| {},
+            );
+        }
+        assert_eq!(agg.watermark_secs(), base + 30);
+        let cutoff = agg
+            .watermark_secs()
+            .saturating_sub(CATCHUP_SEAL_LATENESS_MARGIN_SECS_DHAN);
+        let mut emitted: u32 = 0;
+        let sealed = agg.catch_up_seal_all(cutoff, |_, _, _, _| emitted += 1);
+        assert_eq!(sealed, 0, "no bucket ends at/behind watermark-margin");
+        assert_eq!(emitted, 0);
+        // Every open bucket survives untouched for the backlog to fill.
+        for sid in [13_u64, 25] {
+            let entry = agg.get(sid, 0).expect("present");
+            assert!(
+                !entry.cell.snapshot(TfIndex::M1).is_uninitialised(),
+                "backlogged bucket must stay open"
+            );
+        }
+    }
+
+    #[test]
+    fn test_boundary_catchup_final_session_minute_seals_when_watermark_passes_close() {
+        // The 2e gap: the 15:29 M1 bar can never be sealed by a next tick
+        // (>= 15:30 is out-of-session). Once a post-close tick advances the
+        // watermark past 15:30:00 + margin, the catch-up seal flushes it.
+        let agg = MultiTfAggregator::new();
+        agg.pre_populate(vec![(13, 0)]);
+        let last_minute_tick = TEST_DAY_START + 55_770; // 15:29:30 IST
+        agg.consume_tick(
+            &mk_tick(13, 0, last_minute_tick, 100.0, 50, 0),
+            0,
+            FeedStrategy::DHAN,
+            None,
+            |_, _| {},
+        );
+        // Before the watermark passes the close: the 15:29 bucket must wait.
+        let pre_cutoff = agg
+            .watermark_secs()
+            .saturating_sub(CATCHUP_SEAL_LATENESS_MARGIN_SECS_DHAN);
+        assert_eq!(agg.catch_up_seal_all(pre_cutoff, |_, _, _, _| {}), 0);
+
+        // A post-close tick advances the watermark to 15:30:07 (folding is
+        // gated, the watermark is not).
+        agg.consume_tick(
+            &mk_tick(13, 0, TEST_DAY_START + 55_807, 100.5, 51, 0),
+            0,
+            FeedStrategy::DHAN,
+            None,
+            |_, _| {},
+        );
+        let cutoff = agg
+            .watermark_secs()
+            .saturating_sub(CATCHUP_SEAL_LATENESS_MARGIN_SECS_DHAN);
+        assert!(cutoff >= TEST_DAY_START + 55_800, "cutoff passed 15:30:00");
+        let mut m1_sealed: Option<LiveCandleState> = None;
+        let sealed = agg.catch_up_seal_all(cutoff, |sid, seg, tf, state| {
+            assert_eq!((sid, seg), (13, 0));
+            if tf == TfIndex::M1 {
+                m1_sealed = Some(state);
+            }
+        });
+        assert!(sealed >= 1, "the final session minute must seal");
+        let m1 = m1_sealed.expect("15:29 M1 bar must be catch-up sealed");
+        assert_eq!(
+            m1.bucket_start_ist_secs,
+            TEST_DAY_START + 55_740,
+            "sealed bar is the 15:29:00 bucket (bucket-start ts, never wall-clock)"
+        );
+        assert_eq!(m1.close, 100.0);
+        // Wider TFs whose bucket ends past the cutoff stay open for the
+        // midnight force-seal (e.g. H1 — the 09:15-anchored grid's last H1
+        // bucket ends after 15:30).
+        let entry = agg.get(13, 0).expect("present");
+        assert!(
+            !entry.cell.snapshot(TfIndex::H1).is_uninitialised(),
+            "H1 must wait for the IST-midnight force-seal"
+        );
     }
 }
