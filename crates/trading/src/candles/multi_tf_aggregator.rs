@@ -569,6 +569,48 @@ impl MultiTfAggregator {
         }
     }
 
+    /// Session-scoped force-seal (close-time force-seal, 2026-07-03).
+    ///
+    /// Identical to [`Self::force_seal_all`] EXCEPT it SKIPS instruments in
+    /// the `always_on` exemption set (operator lock 2026-06-01 §30 — e.g.
+    /// GIFT Nifty's ~21h session). Used by the 15:30:05 IST close-time
+    /// force-seal task in `crates/app/src/main.rs` (Task 3b) so the final
+    /// NSE session buckets (the 15:29 M1 bar and every TF's last bucket)
+    /// seal + flush the same day instead of waiting for the IST-midnight
+    /// backstop — which the daily 16:30 IST instance auto-stop destroys.
+    ///
+    /// Why always-on instruments MUST be skipped here: their session
+    /// continues past the NSE 15:30 close, so force-sealing them at
+    /// 15:30:05 would truncate the open bucket; the later boundary re-seal
+    /// of the SAME bucket would then DEDUP-UPSERT a candle missing the
+    /// pre-seal ticks. Only the IST-midnight `force_seal_all` (the day
+    /// boundary) seals always-on cells.
+    ///
+    /// Idempotent vs the midnight seal: `force_seal` on an emptied slot
+    /// returns `None`, so the midnight pass double-flushes nothing; any
+    /// duplicate row is absorbed by the candle tables' DEDUP UPSERT KEYS.
+    ///
+    /// `O(N × 21)` where N = number of instruments (flagged O(N) honestly —
+    /// cold path, runs once per trading day, never per tick).
+    pub fn force_seal_all_session_scoped<F>(&self, mut on_seal: F)
+    where
+        F: FnMut(u64, u8, TfIndex, LiveCandleState),
+    {
+        let pin = self.inner.pin();
+        for (key, entry) in pin.iter() {
+            // O(1) EXEMPT: `always_on` is a HashSet — contains is O(1) hashing.
+            if self.always_on.contains(key) {
+                continue;
+            }
+            let (security_id, segment_code) = *key;
+            for tf in TfIndex::ALL {
+                if let Some(sealed) = entry.cell.force_seal(tf) {
+                    on_seal(security_id, segment_code, tf, sealed);
+                }
+            }
+        }
+    }
+
     /// Watermark-aware catch-up seal across every instrument × 21 TFs
     /// (BOUNDARY-01, 2026-07-03). Mirrors [`Self::force_seal_all`]'s papaya
     /// iteration but calls [`AggregatorCell::catch_up_seal`] per slot, so a
@@ -1194,6 +1236,76 @@ mod tests {
         let mut count: u32 = 0;
         agg.force_seal_all(|_, _, _, _| count += 1);
         assert_eq!(count, 0, "force_seal_all must skip uninitialised slots");
+    }
+
+    #[test]
+    fn test_force_seal_all_session_scoped_skips_always_on() {
+        // Close-time force-seal (2026-07-03): GIFT Nifty (always-on, ~21h
+        // session) must NOT be sealed at the 15:30:05 IST close-time seal —
+        // only regular NSE-session instruments are.
+        let mut set = HashSet::new();
+        set.insert((5024_u64, 0_u8));
+        let agg = MultiTfAggregator::with_capacity(8).with_always_on(Arc::new(set));
+        agg.pre_populate(vec![(5024, 0), (13, 0)]);
+        for sid in [5024_u64, 13] {
+            let t = mk_tick(sid, 0, 1_779_354_960, 100.0, 50, 0);
+            agg.consume_tick(&t, 0, FeedStrategy::DHAN, None, |_, _| {});
+        }
+        let mut emitted: Vec<(u64, u8, TfIndex)> = Vec::new();
+        agg.force_seal_all_session_scoped(|sid, seg, tf, _| emitted.push((sid, seg, tf)));
+        assert_eq!(
+            emitted.len(),
+            21,
+            "only the regular instrument's 21 TFs seal; got {}",
+            emitted.len()
+        );
+        assert!(
+            emitted.iter().all(|(sid, _, _)| *sid == 13),
+            "always-on sid 5024 must be skipped by the session-scoped seal"
+        );
+        // GIFT Nifty's open bucket survives; the regular instrument's is drained.
+        let gift = agg.get(5024, 0).expect("present");
+        assert!(
+            !gift.cell.snapshot(TfIndex::ALL[0]).is_uninitialised(),
+            "always-on open bucket must survive the close-time seal"
+        );
+        let nifty = agg.get(13, 0).expect("present");
+        assert!(nifty.cell.snapshot(TfIndex::ALL[0]).is_uninitialised());
+    }
+
+    #[test]
+    fn test_force_seal_all_session_scoped_seals_regular_instruments() {
+        // With an empty always_on set the session-scoped seal behaves
+        // exactly like force_seal_all: 2 instruments × 21 TFs = 42 bars.
+        let agg = MultiTfAggregator::new();
+        agg.pre_populate(vec![(13, 0), (25, 0)]);
+        for sid in [13_u64, 25] {
+            let t = mk_tick(sid, 0, 1_779_354_960, 100.0, 50, 0);
+            agg.consume_tick(&t, 0, FeedStrategy::DHAN, None, |_, _| {});
+        }
+        let mut count: u32 = 0;
+        agg.force_seal_all_session_scoped(|_, _, _, _| count += 1);
+        assert_eq!(count, 2 * 21);
+    }
+
+    #[test]
+    fn test_close_then_midnight_force_seal_is_idempotent() {
+        // The close-time seal (15:30:05) followed by the IST-midnight
+        // force_seal_all must NOT double-flush: force_seal on an emptied
+        // slot returns None, so the midnight pass emits 0 seals.
+        let agg = MultiTfAggregator::new();
+        agg.pre_populate(vec![(13, 0)]);
+        let t = mk_tick(13, 0, 1_779_354_960, 100.0, 50, 0);
+        agg.consume_tick(&t, 0, FeedStrategy::DHAN, None, |_, _| {});
+        let mut first: u32 = 0;
+        agg.force_seal_all_session_scoped(|_, _, _, _| first += 1);
+        assert_eq!(first, 21, "close-time seal drains the 21 open TF buckets");
+        let mut second: u32 = 0;
+        agg.force_seal_all(|_, _, _, _| second += 1);
+        assert_eq!(
+            second, 0,
+            "midnight force_seal_all after the close-time seal must emit 0 (idempotent)"
+        );
     }
 
     #[test]

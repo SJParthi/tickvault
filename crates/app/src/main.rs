@@ -33,8 +33,9 @@
 // Modules are declared in lib.rs for coverage instrumentation.
 use tickvault_app::boot_helpers::{
     CONFIG_BASE_PATH, CONFIG_LOCAL_PATH, FAST_BOOT_WINDOW_END, FAST_BOOT_WINDOW_START, IstTimer,
-    check_clock_drift, compute_market_close_sleep, create_error_log_writer, effective_ws_stagger,
-    format_bind_addr, should_emit_post_market_alert, spawn_heartbeat_watchdog,
+    check_clock_drift, compute_close_seal_sleep, compute_market_close_sleep,
+    create_error_log_writer, effective_ws_stagger, format_bind_addr, should_emit_post_market_alert,
+    spawn_heartbeat_watchdog,
 };
 use tickvault_app::{infra, observability, subsystem_memory, trading_pipeline};
 
@@ -4636,9 +4637,11 @@ fn spawn_engine_b_aggregator(
     // the per-tick path uses (`global_seal_sender()`).
     let agg_for_boundary = std::sync::Arc::clone(&aggregator);
     let prev_day_cache_for_boundary = std::sync::Arc::clone(&prev_day_cache);
-    // Cloned BEFORE Task 3 moves `trading_calendar` — Task 4 (the watermark
-    // catch-up seal below) shares the same calendar gate.
+    // Cloned BEFORE Task 3 moves `trading_calendar` — Task 3b (close-time
+    // force-seal) and Task 4 (the watermark catch-up seal below) share the
+    // same calendar gate.
     let calendar_for_catchup = std::sync::Arc::clone(&trading_calendar);
+    let calendar_for_close_seal = std::sync::Arc::clone(&trading_calendar);
     tokio::spawn(async move {
         loop {
             // Sleep until the next IST midnight (bounded helper, ≤ 24h).
@@ -4709,6 +4712,95 @@ fn spawn_engine_b_aggregator(
         }
     });
     tracing::info!("candle-engine #T1b — IST-midnight force-seal task spawned");
+
+    // --- Task 3b: 15:30:05 IST close-time force-seal (2026-07-03) ---
+    // The LAST session minute (the 15:29 M1 bar — and every TF's final
+    // bucket) never sealed intraday: a bucket seals only on the SAME
+    // instrument's next tick, and the session gate discards ≥15:30:00
+    // ticks BEFORE they can roll the bucket, so the final buckets waited
+    // for the IST-midnight force-seal — which the 16:30 IST instance
+    // auto-stop destroys (RAM state lost). This task closes that gap:
+    // at 15:30:05 IST on trading days it force-seals every NON-always-on
+    // instrument via `force_seal_all_session_scoped` (GIFT Nifty's ~21h
+    // session must NOT be truncated at NSE close — only the midnight
+    // task seals always-on cells) and routes each seal through the SAME
+    // `route_seal` Dhan policy as Task 3.
+    //
+    // Ordering vs the 15:30:00.8 market-close pipeline stop: DELIBERATELY
+    // a parallel timer, NOT a close-sequence hook — the close sequence
+    // (`run_until_shutdown`) only aborts WS/tick-processor/trading
+    // handles; the aggregator Arc, `global_seal_sender()` and the
+    // seal-writer loop stay alive until final app shutdown, so this task
+    // runs safely after the stop AND covers both boot paths (fast boot +
+    // start_dhan_lane both call `spawn_engine_b_aggregator`).
+    //
+    // Idempotent vs the midnight seal: `force_seal` on emptied slots
+    // returns None (0 double-flushes) and any duplicate row is absorbed
+    // by the candle tables' DEDUP UPSERT KEYS. Never fires mid-session:
+    // the trigger instant is fixed strictly after the [09:15, 15:30)
+    // session-gate window closes. Same bare-spawn supervision level as
+    // the sibling Task 3 midnight force-seal.
+    let agg_for_close_seal = std::sync::Arc::clone(&aggregator);
+    let prev_day_cache_for_close_seal = std::sync::Arc::clone(&prev_day_cache);
+    tokio::spawn(async move {
+        loop {
+            // Sleep until the next 15:30:05 IST (bounded helper, ≤ 24h;
+            // returns tomorrow's trigger when at/past today's, never 0).
+            tokio::time::sleep(compute_close_seal_sleep()).await;
+
+            // Only force-seal on trading days — a weekend/holiday 15:30:05
+            // has no open buckets worth flushing.
+            if !calendar_for_close_seal.is_trading_day_today() {
+                tracing::info!("close-time force-seal: skipping (non-trading day)");
+                continue;
+            }
+
+            let Some(sender) = global_seal_sender() else {
+                tracing::warn!("close-time force-seal: seal sender not installed — skipping");
+                continue;
+            };
+
+            let mut sealed: u64 = 0;
+            let mut dropped: u64 = 0;
+            agg_for_close_seal.force_seal_all_session_scoped(
+                |security_id, segment_code, tf, state| {
+                    match tickvault_app::seal_routing::route_seal(
+                        tickvault_app::seal_routing::SealRouteParams {
+                            feed: tickvault_common::feed::Feed::Dhan,
+                            drop_d1: true,
+                            prev_day_cache: Some(prev_day_cache_for_close_seal.as_ref()),
+                            heartbeat: None,
+                            feed_health_on_m1: None,
+                        },
+                        security_id,
+                        segment_code,
+                        tf,
+                        state,
+                        sender,
+                    ) {
+                        tickvault_app::seal_routing::SealOutcome::Sent => {
+                            sealed = sealed.saturating_add(1);
+                        }
+                        tickvault_app::seal_routing::SealOutcome::DroppedFull => {
+                            dropped = dropped.saturating_add(1);
+                        }
+                        // D1 is dropped at the write boundary — not counted
+                        // as a mpsc-full drop (same policy as Task 3).
+                        tickvault_app::seal_routing::SealOutcome::DroppedD1 => {}
+                    }
+                },
+            );
+            // NOTE: no `reset_watermark()` here — the watermark reset is the
+            // IST-midnight task's cross-day duty; post-close ticks must keep
+            // advancing it for the BOUNDARY-01 catch-up driver.
+            tracing::info!(
+                sealed,
+                dropped,
+                "close-time force-seal complete — final session buckets flushed"
+            );
+        }
+    });
+    tracing::info!("candle-engine #T1b — 15:30:05 IST close-time force-seal task spawned");
 
     // --- Task 4: watermark-aware per-minute catch-up seal (BOUNDARY-01) ---
     // Bounds candle seal lag WITHOUT mass-discarding backlogged ticks. A
