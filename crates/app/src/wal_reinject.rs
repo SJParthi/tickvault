@@ -246,8 +246,9 @@ mod tests {
     }
 
     /// (d) Empty vec: trivially clean, nothing injected, nothing aborted.
+    /// (Named after the pub fn for the pub-fn-test-guard ratchet.)
     #[tokio::test]
-    async fn test_empty_vec_is_clean_noop() {
+    async fn test_reinject_wal_frames_empty_vec_is_clean_noop() {
         let (tx, _rx) = mpsc::channel::<(u64, Bytes)>(8);
 
         let outcome = reinject_wal_frames(&tx, Vec::new(), 8, TEST_SEND_TIMEOUT).await;

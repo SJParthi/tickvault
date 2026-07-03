@@ -113,7 +113,7 @@ All in `crates/app/src/wal_reinject.rs::tests` (run: `cargo test -p tickvault-ap
   injected < total, injected + aborted_remaining == total, no panic.
 - `test_wedged_consumer_times_out_and_aborts` — cap-4 channel, 50ms test
   timeout: injected == 4, aborted_remaining == 6, clean == false.
-- `test_empty_vec_is_clean_noop` — injected == 0, clean == true.
+- `test_reinject_wal_frames_empty_vec_is_clean_noop` — injected == 0, clean == true.
 - `test_chunk_boundary_exactness` — frames == chunk_size and ±1 all clean.
 - `test_zero_chunk_size_is_clamped` — no panic, all delivered.
 - `test_live_frames_interleave_with_large_replay` — 500K replay + live
@@ -168,7 +168,7 @@ semantics are untouched, so a rollback boots cleanly against any existing
   - Tests: test_ws_reinject_01_aborted_contract, test_all_list_length_matches_catalogue_size, test_code_str_follows_expected_prefix_pattern, every_error_code_variant_appears_in_a_rule_file
 - [x] Item 2 — Bounded chunked-backpressure helper module + tests
   - Files: crates/app/src/wal_reinject.rs, crates/app/src/lib.rs
-  - Tests: test_million_frames_all_delivered_zero_drops, test_receiver_dropped_before_run_aborts_immediately, test_consumer_dropped_mid_replay_aborts_cleanly, test_wedged_consumer_times_out_and_aborts, test_empty_vec_is_clean_noop, test_chunk_boundary_exactness, test_zero_chunk_size_is_clamped, test_live_frames_interleave_with_large_replay
+  - Tests: test_million_frames_all_delivered_zero_drops, test_receiver_dropped_before_run_aborts_immediately, test_consumer_dropped_mid_replay_aborts_cleanly, test_wedged_consumer_times_out_and_aborts, test_reinject_wal_frames_empty_vec_is_clean_noop, test_chunk_boundary_exactness, test_zero_chunk_size_is_clamped, test_live_frames_interleave_with_large_replay
 - [x] Item 3 — Replace both STAGE-C.2b call sites (fast boot + start_dhan_lane mirror) with the helper
   - Files: crates/app/src/main.rs
   - Tests: ratchet_main_rs_uses_bounded_reinject_helper
