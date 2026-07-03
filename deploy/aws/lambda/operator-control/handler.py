@@ -6,7 +6,10 @@ messy, too many buttons"):
   * Overview — box status, ticks hero, ticks/sec sparkline, guarantees shields
     (greyed to a single "box stopped" banner when the instance is off), feed
     toggles, a thin AWS strip (spend / alarms / disk, click-to-expand), a
-    compact latency card, and ONE context-aware Start/Stop instance button.
+    per-feed latency comparison card (2026-07-03: one row per feed the app
+    reports — TCP/TLS probe + last-tick age + windowed ticks/sec + subscribed
+    counts, best value per column highlighted; box-wide cards labeled so), and
+    ONE context-aware Start/Stop instance button.
   * Data — candles per timeframe, the daily cross-verify result, and the
     READ-ONLY database console (tables + columns + query grid + CSV download —
     writes blocked server-side).
@@ -118,10 +121,12 @@ _IST_OFFSET_SECS = 19800  # +05:30
 
 _VIEW_TIMEOUT_SECS = 6.0
 _VIEW_POLL_SECS = 0.4
-# Latency probes run metrics-scrape-T0 + 3×curl-to-Dhan (--max-time 3) +
-# QuestDB + a 4s window floor + metrics-scrape-T1 ON the box (~14-17s
-# wall-clock), so the poll window must be longer than the view's.
-# Lambda timeout is 30s, so 26s leaves margin.
+# Latency probes run metrics-scrape-T0 + feeds-health-T0 + PARALLEL per-feed
+# TCP/TLS probes (2 samples × --max-time 2, all feeds concurrently) + QuestDB
+# + a 4s window floor + metrics-scrape-T1 + feeds-health-T1 ON the box.
+# Worst case ≈ 3+4+4+3+4+3+4 = 25s; typical ~7-9s. Lambda timeout is 30s,
+# so 26s leaves margin. Per-curl --max-time bounds every network leg — one
+# dead feed endpoint can never hang the whole measure (probes are parallel).
 _LATENCY_TIMEOUT_SECS = 26.0
 
 # Read-only SQL gate: the first keyword must be one of these.
@@ -526,40 +531,102 @@ def _classify_tick_conservation(rows: list, disconnects_raw: str, market_hours: 
 
 
 # ----------------------------------------------------------------- latency snap
-# Measures the REAL per-tick + per-process latency on the box:
-#  * network RTT to the Dhan feed edge (TCP connect + TLS handshake, 3 samples)
-#  * local QuestDB round-trip (SELECT 1)
-#  * the app's own histograms at :9091/metrics — sum/count gives average ns for
-#    tick parse+process (`tv_tick_processing_duration_ns`) and the full
-#    wire->parsed->routed journey (`tv_wire_to_done_duration_ns`), plus order
-#    placement (`tv_order_placement_duration_ns`).
-#  * wall-clock skew vs chrony's NTP source.
-_LATENCY_COMMANDS = [
-    "set +e",
-    # Windowed-percentile design (operator directive 2026-06-10): scrape the
-    # metrics endpoint TWICE — once BEFORE and once AFTER the ~10 s of Dhan +
-    # QuestDB network probes — and let the Lambda compute p50/p99 + avg from
-    # the histogram-bucket DELTAS between the two scrapes. The probe time IS
-    # the measurement window (no added sleep, no Lambda-timeout pressure).
-    # `_bucket` lines are included so percentiles are computable; sum/count
-    # lines feed both the windowed avg (delta) and the legacy lifetime avg.
-    'echo "T0=$(date +%s.%N)"',
-    'echo "METRICS_T0_BEGIN"',
-    "curl -fsS --max-time 3 http://127.0.0.1:9091/metrics 2>/dev/null | grep -E '^tv_(tick_processing|wire_to_done|order_placement|tick_flush)_duration_ns' || echo none",
-    'echo "METRICS_T0_END"',
-    'echo "DHAN_BEGIN"',
-    "for i in 1 2 3; do curl -o /dev/null -s -w '%{time_connect} %{time_appconnect}\\n' --max-time 3 https://api-feed.dhan.co/ 2>/dev/null || echo 'x x'; done",
-    'echo "DHAN_END"',
-    "echo \"QDB=$(curl -o /dev/null -s -w '%{time_total}' --max-time 3 'http://127.0.0.1:9000/exec?query=SELECT%201' 2>/dev/null)\"",
-    "echo \"SKEW=$(chronyc tracking 2>/dev/null | awk '/Last offset/{print $4}')\"",
-    # Floor the window at ~4 s so a fast-failing Dhan probe (network down →
-    # instant curl errors) still leaves a meaningful sample window.
-    "sleep 4",
-    'echo "T1=$(date +%s.%N)"',
-    'echo "METRICS_BEGIN"',
-    "curl -fsS --max-time 3 http://127.0.0.1:9091/metrics 2>/dev/null | grep -E '^tv_(tick_processing|wire_to_done|order_placement|tick_flush)_duration_ns' || echo none",
-    'echo "METRICS_END"',
-]
+# Measures the REAL per-feed + box-wide latency on the box (operator demand
+# 2026-07-03: dhan + groww run side by side — show "which is extremely faster
+# and more precise" PER FEED, auto-extending to any future feed):
+#  * PER FEED — network RTT to that feed's live edge (TCP connect + TLS
+#    handshake, parallel probes), plus the app's own per-feed reporting from
+#    GET /api/feeds/health (last-tick age, subscribed counts) curled TWICE so
+#    ticks/sec per feed = Δticks_total over the measured window. The feed
+#    LIST is the app's health response — never hardcoded here.
+#  * BOX-WIDE — local QuestDB round-trip (SELECT 1), wall-clock skew vs
+#    chrony, and the app's histograms at :9091/metrics (tick parse+process /
+#    wire->done / order placement). These carry NO feed label in the app
+#    (tick_processor.rs emits them unlabeled), so they are HONESTLY presented
+#    as box-wide — no fake per-feed processing splits.
+#
+# Feed → live-edge host map for the network probe ONLY. The table rows come
+# from the app's /api/feeds/health; a feed reported by the app but missing
+# here still gets its row — its network cells read "endpoint unknown" (never
+# fake numbers). Hosts are code-controlled constants (shell-safe by
+# construction; the app's response is never interpolated into commands).
+#   dhan:  wss://api-feed.dhan.co (main feed, 2-WS lock)
+#   groww: wss://socket-api.groww.in (NATS-over-WSS edge, docs/groww-ref/02)
+_FEED_LIVE_HOSTS = {
+    "dhan": "api-feed.dhan.co",
+    "groww": "socket-api.groww.in",
+}
+_FEED_PROBE_SAMPLES = 2
+_FEED_PROBE_MAX_SECS = 2
+
+
+def _latency_commands() -> list[str]:
+    """Build the on-box latency snapshot script (pure — static inputs only).
+
+    Windowed-percentile design (operator directive 2026-06-10): scrape the
+    metrics endpoint TWICE — once BEFORE and once AFTER the network probes —
+    and let the Lambda compute p50/p99 + avg from the histogram-bucket DELTAS
+    between the two scrapes. The same T0/T1 bracketing now also wraps TWO
+    /api/feeds/health scrapes so per-feed ticks/sec is a real windowed delta.
+
+    Per-feed TCP/TLS probes run as PARALLEL background jobs (`( … ) &` +
+    `wait`), each curl bounded by --max-time — a single dead feed endpoint
+    costs at most samples×max-time and never delays the other feeds. Probe
+    hosts come exclusively from the static _FEED_LIVE_HOSTS map above (feed
+    names are code-controlled lowercase tokens — safe in paths/markers)."""
+    metrics_curl = (
+        "curl -fsS --max-time 3 http://127.0.0.1:9091/metrics 2>/dev/null | "
+        "grep -E '^tv_(tick_processing|wire_to_done|order_placement|tick_flush)_duration_ns' "
+        "|| echo none"
+    )
+    health_curl = (
+        "curl -fsS --max-time 4 http://127.0.0.1:3001/api/feeds/health 2>/dev/null "
+        "|| echo TV_CURL_FAILED; echo"
+    )
+    cmds = [
+        "set +e",
+        'echo "T0=$(date +%s.%N)"',
+        'echo "METRICS_T0_BEGIN"',
+        metrics_curl,
+        'echo "METRICS_T0_END"',
+        'echo "FEEDS_T0_BEGIN"',
+        health_curl,
+        'echo "FEEDS_T0_END"',
+    ]
+    samples = " ".join(str(i + 1) for i in range(_FEED_PROBE_SAMPLES))
+    for feed, host in sorted(_FEED_LIVE_HOSTS.items()):
+        cmds.append(
+            f"(for i in {samples}; do "
+            f"curl -o /dev/null -s -w '%{{time_connect}} %{{time_appconnect}}\\n' "
+            f"--max-time {_FEED_PROBE_MAX_SECS} https://{host}/ 2>/dev/null || echo 'x x'; "
+            f"done > /tmp/tv-probe-{feed}.txt 2>/dev/null) &"
+        )
+    cmds.append("wait")
+    for feed in sorted(_FEED_LIVE_HOSTS):
+        cmds += [
+            f'echo "PROBE_{feed}_BEGIN"',
+            f"cat /tmp/tv-probe-{feed}.txt 2>/dev/null",
+            f'echo "PROBE_{feed}_END"',
+            f"rm -f /tmp/tv-probe-{feed}.txt",
+        ]
+    cmds += [
+        "echo \"QDB=$(curl -o /dev/null -s -w '%{time_total}' --max-time 3 'http://127.0.0.1:9000/exec?query=SELECT%201' 2>/dev/null)\"",
+        "echo \"SKEW=$(chronyc tracking 2>/dev/null | awk '/Last offset/{print $4}')\"",
+        # Floor the window at ~4 s so fast-failing probes (network down →
+        # instant curl errors) still leave a meaningful sample window.
+        "sleep 4",
+        'echo "T1=$(date +%s.%N)"',
+        'echo "METRICS_BEGIN"',
+        metrics_curl,
+        'echo "METRICS_END"',
+        'echo "FEEDS_T1_BEGIN"',
+        health_curl,
+        'echo "FEEDS_T1_END"',
+    ]
+    return cmds
+
+
+_LATENCY_COMMANDS = _latency_commands()
 
 
 def _avg_ns(sum_v: str, count_v: str) -> float | None:
@@ -661,6 +728,89 @@ def _percentile_from_bucket_deltas(deltas: dict | None, q: float) -> float | Non
     return prev_bound
 
 
+def _feed_comparison_winners(rows: list) -> dict:
+    """column -> feed name holding the STRICTLY best value (pure).
+
+    Lower is better for tcp_ms / tls_ms / last_tick_age_secs; higher is
+    better for ticks_per_sec / subscribed_total. A winner is only declared
+    when at least TWO feeds have a comparable value AND the best is strictly
+    unique — a tie, a single-feed measure, or unknown values yield NO winner
+    (an honest comparison needs something real to compare against)."""
+    lower_better = ("tcp_ms", "tls_ms", "last_tick_age_secs")
+    higher_better = ("ticks_per_sec", "subscribed_total")
+    winners: dict[str, str] = {}
+    for col in lower_better + higher_better:
+        vals: list[tuple[float, str]] = []
+        for r in rows:
+            try:
+                vals.append((float(r.get(col)), str(r.get("feed"))))
+            except (TypeError, ValueError):
+                continue
+        if len(vals) < 2:
+            continue
+        vals.sort(key=lambda x: x[0], reverse=col in higher_better)
+        if vals[0][0] == vals[1][0]:
+            continue  # tie — no single winner
+        winners[col] = vals[0][1]
+    return winners
+
+
+def _feed_latency_rows(health_t0: object, health_t1: object, probes: dict, window: str) -> list:
+    """Join the app's per-feed health rows with the on-box network probes
+    (pure). One output row per feed the APP reports (never hardcoded);
+    probe columns come from _FEED_LIVE_HOSTS-keyed samples — a feed with no
+    host mapping gets endpoint_known=False and blank probe cells. ticks/sec
+    is the Δticks_total between the two health scrapes over the window;
+    None when either scrape is missing or the counter reset (app restart)."""
+
+    def feed_map(payload: object) -> dict:
+        out: dict[str, dict] = {}
+        if isinstance(payload, dict) and isinstance(payload.get("feeds"), list):
+            for r in payload["feeds"]:
+                if isinstance(r, dict) and r.get("feed"):
+                    out[str(r["feed"])] = r
+        return out
+
+    def min_ms(values: list[float]) -> str:
+        vals = [v for v in values if v > 0]
+        return f"{min(vals) * 1000:.1f}" if vals else ""
+
+    t0_rows = feed_map(health_t0)
+    t1_rows = feed_map(health_t1)
+    # T1 is authoritative (post-window state); fall back to T0 when the
+    # second scrape failed so the operator still sees the rows.
+    base = t1_rows or t0_rows
+    rows: list = []
+    for name, r in base.items():
+        samples = probes.get(name, [])
+        tps = None
+        try:
+            w = float(window)
+            delta = float(t1_rows[name].get("ticks_total")) - float(
+                t0_rows[name].get("ticks_total")
+            )
+            if w > 0 and delta >= 0:
+                tps = round(delta / w, 1)
+        except (TypeError, ValueError, KeyError):
+            tps = None
+        rows.append(
+            {
+                "feed": name,
+                "endpoint": _FEED_LIVE_HOSTS.get(name),
+                "endpoint_known": name in _FEED_LIVE_HOSTS,
+                "tcp_ms": min_ms([s[0] for s in samples]),
+                "tls_ms": min_ms([s[1] for s in samples]),
+                "last_tick_age_secs": r.get("last_tick_age_secs"),
+                "ticks_total": r.get("ticks_total"),
+                "ticks_per_sec": tps,
+                "subscribed_total": r.get("subscribed_total"),
+                "verdict": r.get("verdict"),
+                "enabled": r.get("enabled"),
+            }
+        )
+    return rows
+
+
 def _parse_latency(stdout: str) -> dict:
     """Parse the labeled latency snapshot into a structured dict (pure).
 
@@ -668,32 +818,58 @@ def _parse_latency(stdout: str) -> dict:
     scrapes — METRICS_T0 (before the network probes) and METRICS (after).
     Lifetime averages come from the second scrape (back-compat); the
     p50/p99 + windowed averages come from the bucket DELTAS between them.
+
+    Per-feed design (2026-07-03): PROBE_<feed>_BEGIN/END blocks carry each
+    feed's TCP/TLS samples, and FEEDS_T0/FEEDS_T1 blocks carry the app's
+    /api/feeds/health JSON at both window edges — joined into one comparison
+    row per feed the app reports, plus a winners map for the green highlight.
     """
-    dhan_tcp: list[float] = []
-    dhan_tls: list[float] = []
+    probes: dict[str, list[tuple[float, float]]] = {}
     metrics: dict[str, str] = {}
     t0_lines: list[str] = []
     t1_lines: list[str] = []
+    feeds_t0_lines: list[str] = []
+    feeds_t1_lines: list[str] = []
     fields: dict[str, str] = {}
     mode = ""
+    probe_feed = ""
     for line in (stdout or "").splitlines():
-        if line in ("DHAN_BEGIN", "METRICS_BEGIN", "METRICS_T0_BEGIN"):
-            mode = "T0" if line == "METRICS_T0_BEGIN" else line.split("_")[0]
+        if line in ("METRICS_BEGIN", "METRICS_T0_BEGIN", "FEEDS_T0_BEGIN", "FEEDS_T1_BEGIN"):
+            mode = {
+                "METRICS_BEGIN": "METRICS",
+                "METRICS_T0_BEGIN": "T0",
+                "FEEDS_T0_BEGIN": "FEEDS_T0",
+                "FEEDS_T1_BEGIN": "FEEDS_T1",
+            }[line]
             continue
-        if line in ("DHAN_END", "METRICS_END", "METRICS_T0_END"):
+        if line in ("METRICS_END", "METRICS_T0_END", "FEEDS_T0_END", "FEEDS_T1_END"):
             mode = ""
             continue
-        if mode == "DHAN":
+        if line.startswith("PROBE_") and line.endswith("_BEGIN"):
+            probe_feed = line[len("PROBE_") : -len("_BEGIN")]
+            probes.setdefault(probe_feed, [])
+            mode = "PROBE"
+            continue
+        if line.startswith("PROBE_") and line.endswith("_END"):
+            mode = ""
+            probe_feed = ""
+            continue
+        if mode == "PROBE":
             parts = line.split()
             if len(parts) == 2:
                 try:
-                    dhan_tcp.append(float(parts[0]))
-                    dhan_tls.append(float(parts[1]))
+                    probes[probe_feed].append((float(parts[0]), float(parts[1])))
                 except ValueError:
-                    pass
+                    pass  # 'x x' sentinel — failed sample, honestly skipped
             continue
         if mode == "T0":
             t0_lines.append(line)
+            continue
+        if mode == "FEEDS_T0":
+            feeds_t0_lines.append(line)
+            continue
+        if mode == "FEEDS_T1":
+            feeds_t1_lines.append(line)
             continue
         if mode == "METRICS":
             # e.g. "tv_tick_processing_duration_ns_sum 1.23e6"
@@ -705,10 +881,6 @@ def _parse_latency(stdout: str) -> dict:
         if "=" in line:
             k, _, v = line.partition("=")
             fields[k.strip()] = v.strip()
-
-    def ms(values: list[float]) -> str:
-        vals = [v for v in values if v > 0]
-        return f"{min(vals) * 1000:.1f}" if vals else ""
 
     def sec_to_ms(s: str) -> str:
         try:
@@ -750,9 +922,26 @@ def _parse_latency(stdout: str) -> dict:
         except (TypeError, ValueError):
             return ""
 
+    def health_json(lines: list[str]) -> tuple[object, str]:
+        raw = "\n".join(lines).strip()
+        if not raw or "TV_CURL_FAILED" in raw:
+            return None, _FEED_API_UNREACHABLE
+        try:
+            return json.loads(raw), ""
+        except (json.JSONDecodeError, ValueError):
+            return None, "app API returned invalid JSON"
+
+    health_t0, err_t0 = health_json(feeds_t0_lines)
+    health_t1, err_t1 = health_json(feeds_t1_lines)
+    feed_rows = _feed_latency_rows(health_t0, health_t1, probes, window_secs())
+
     return {
-        "dhan_tcp_ms": ms(dhan_tcp),
-        "dhan_tls_ms": ms(dhan_tls),
+        # Per-feed comparison (operator demand 2026-07-03): one row per feed
+        # the APP reports, with the on-box probe joined in. Empty + error set
+        # when the app was unreachable on the box — never fabricated rows.
+        "feeds": feed_rows,
+        "feeds_error": "" if feed_rows else (err_t1 or err_t0 or ""),
+        "winners": _feed_comparison_winners(feed_rows),
         "questdb_ms": sec_to_ms(fields.get("QDB", "")),
         "clock_skew_ms": sec_to_ms(fields.get("SKEW", "")),
         "tick_process_avg_ns": avg("tv_tick_processing_duration_ns"),
@@ -1755,6 +1944,7 @@ def _console_html() -> str:
        font-size:11.5px; white-space:pre-wrap; max-height:300px; }
   table{ width:100%; border-collapse:collapse; font-size:12px; } th,td{ text-align:left; padding:6px 8px; border-bottom:1px solid var(--line); }
   th{ color:var(--mut); font-weight:600; }
+  td.win{ color:var(--grn); font-weight:800; } /* best-per-column in the per-feed latency table */
   .pr{ display:flex; align-items:center; gap:10px; padding:10px 0; border-bottom:1px solid var(--line); flex-wrap:wrap; }
   .pr .t{ flex:1 1 200px; } .pr .num{ color:var(--mut); font-weight:700; margin-right:6px; }
   .badge{ font-size:11px; font-weight:800; padding:3px 9px; border-radius:20px; }
@@ -1839,13 +2029,18 @@ def _console_html() -> str:
         <div class="muted" id="feedsmsg" style="margin-top:8px"></div>
         <div class="muted" style="margin-top:6px">Every feed the app reports appears here automatically (a future feed #3 needs zero portal changes). Turning a feed OFF asks for confirmation; disabling Dhan during live trading is refused by the app itself.</div>
       </div>
-      <div class="card"><div class="lbl">latency — measured live on the box</div>
+      <div class="card"><div class="lbl">latency — measured live on the box, per feed</div>
         <div class="row" style="margin-bottom:12px"><button class="b-blu" onclick="loadLatency()">⚡ Measure now</button></div>
+        <div id="latfeeds" style="overflow:auto"></div>
+        <div class="muted" id="latload" style="margin-top:8px"></div>
+        <div class="lbl" style="margin-top:14px">box-wide (shared by all feeds)</div>
         <div class="shields" id="latnet"></div>
         <div class="shields" id="latproc" style="margin-top:10px"></div>
         <div class="muted" id="lattick" style="margin-top:10px"></div>
-        <div class="muted" style="margin-top:6px">Takes ~15s (live probe on the box). Budgets: tick parse ≤10 ns · full tick process ≤10 µs · order ≤100 ns.
-          Dhan's exchange timestamp is 1-second granular, so the win is low, steady arrival — not microsecond co-location.</div>
+        <div class="muted" style="margin-top:6px">Takes ~15s (live probe on the box). Every feed the app reports gets a row —
+          best value per column is <span class="ok">green</span>; a feed without a known probe endpoint shows "endpoint unknown" (never fake numbers).
+          Tick processing / DB round-trip / clock skew are box-wide — the app does not split them per feed, so we don't pretend it does.
+          Budgets: tick parse ≤10 ns · full tick process ≤10 µs · order ≤100 ns.</div>
       </div>
     </section>
 
@@ -2169,14 +2364,39 @@ async function loadCrossVerify(){ $('cvshields').dataset.loaded='1'; $('cvshield
 function fmtNs(n){ if(n==null||n==='') return '—'; n=Number(n); if(n<1000) return n.toFixed(0)+' ns';
   if(n<1e6) return (n/1e3).toFixed(2)+' µs'; if(n<1e9) return (n/1e6).toFixed(2)+' ms'; return (n/1e9).toFixed(2)+' s'; }
 function fmtMs(s){ return (s===''||s==null)?'—':s+' ms'; }
+// Per-feed comparison table (operator demand 2026-07-03). Rendered by
+// ITERATING the server's j.feeds rows — which themselves come from the app's
+// own /api/feeds/health at measure time. NO feed name is hardcoded here, so a
+// future feed #3 gets its row (and honest "endpoint unknown" network cells if
+// the probe map doesn't know it) with zero portal changes. The best value per
+// column (server-computed j.winners — strict best, never on a tie or a
+// single-feed measure) is highlighted green.
 async function loadLatency(){ $('latnet').dataset.loaded='1'; $('latnet').innerHTML='<span class="muted">measuring…</span>'; $('latproc').innerHTML='';
-  const j=await call('latency'); if(!j){ $('latnet').innerHTML=''; return; }
-  const tcp=parseFloat(j.dhan_tcp_ms), skew=Math.abs(parseFloat(j.clock_skew_ms));
+  $('latfeeds').innerHTML='<span class="muted">measuring…</span>'; $('latload').textContent='';
+  const j=await call('latency'); if(!j){ $('latnet').innerHTML=''; $('latfeeds').innerHTML=''; return; }
+  const feeds=Array.isArray(j.feeds)?j.feeds:[]; const w=j.winners||{};
+  if(feeds.length){
+    const cols=[['tcp_ms','TCP connect'],['tls_ms','+ TLS'],['last_tick_age_secs','last tick age'],['ticks_per_sec','ticks/sec (window)'],['subscribed_total','subscribed']];
+    let h='<table><tr><th>feed</th>'+cols.map(c=>'<th>'+c[1]+'</th>').join('')+'</tr>';
+    feeds.forEach(f=>{
+      h+='<tr><td><b>'+esc(String(f.feed))+'</b></td>';
+      cols.forEach(c=>{ const k=c[0]; const v=f[k]; let txt;
+        if(k==='tcp_ms'||k==='tls_ms') txt=f.endpoint_known?fmtMs(v):'endpoint unknown';
+        else if(k==='last_tick_age_secs') txt=(v==null)?'—':v+' s ago';
+        else if(k==='ticks_per_sec') txt=(v==null)?'—':v+'/s';
+        else txt=(v==null)?'—':Number(v).toLocaleString();
+        h+='<td class="'+(w[k]===f.feed?'win':'')+'">'+esc(String(txt))+'</td>'; });
+      h+='</tr>'; });
+    $('latfeeds').innerHTML=h+'</table>';
+    $('latload').textContent='instrument load — '+feeds.map(f=>String(f.feed)+': '+
+      (f.subscribed_total!=null?Number(f.subscribed_total).toLocaleString()+' subscribed':'no count reported')).join(' · ');
+  } else {
+    $('latfeeds').innerHTML='<span class="warn">'+esc(j.feeds_error||'no per-feed data returned — is the app running?')+'</span>';
+  }
+  const skew=Math.abs(parseFloat(j.clock_skew_ms));
   $('latnet').innerHTML=
-    shield('Network to Dhan (TCP)', fmtMs(j.dhan_tcp_ms), !isNaN(tcp)&&tcp<15)+
-    shield('+ TLS handshake', fmtMs(j.dhan_tls_ms), true)+
-    shield('QuestDB round-trip', fmtMs(j.questdb_ms), true)+
-    shield('Clock skew', fmtMs(j.clock_skew_ms), isNaN(skew)||skew<50);
+    shield('QuestDB round-trip (box-wide)', fmtMs(j.questdb_ms), true)+
+    shield('Clock skew (box-wide)', fmtMs(j.clock_skew_ms), isNaN(skew)||skew<50);
   // Windowed precise latencies (live ticks during the ~10s probe window).
   // Falls back to lifetime averages when the window saw no ticks (market closed).
   const live = j.tick_p50_ns != null;
