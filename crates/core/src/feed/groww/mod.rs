@@ -17,5 +17,6 @@ pub mod nats;
 pub mod nkey;
 pub mod parity_1m;
 pub mod proto;
+pub mod shard_cutter;
 pub mod shared_master_writer;
 pub mod subjects;

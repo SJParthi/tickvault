@@ -424,6 +424,7 @@ mod tests {
             FeedsConfig {
                 dhan_enabled: true,
                 groww_enabled: true,
+                ..Default::default()
             },
             Arc::clone(&reg),
         );
@@ -460,6 +461,7 @@ mod tests {
         let state = test_state(FeedsConfig {
             dhan_enabled: true,
             groww_enabled: false,
+            ..Default::default()
         });
         let Json(resp) = get_feeds(State(state)).await;
         assert!(resp.dhan_enabled);
@@ -471,6 +473,7 @@ mod tests {
         let state = test_state(FeedsConfig {
             dhan_enabled: true,
             groww_enabled: false,
+            ..Default::default()
         });
         let res = set_feed(
             State(state.clone()),
@@ -488,6 +491,7 @@ mod tests {
         let state = test_state(FeedsConfig {
             dhan_enabled: true,
             groww_enabled: true,
+            ..Default::default()
         });
         let res = set_feed(
             State(state.clone()),
@@ -509,6 +513,7 @@ mod tests {
         let state = test_state(FeedsConfig {
             dhan_enabled: true,
             groww_enabled: false,
+            ..Default::default()
         });
         let Json(resp) = set_feed(
             State(state),
