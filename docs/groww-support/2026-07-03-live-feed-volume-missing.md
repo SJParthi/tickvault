@@ -25,7 +25,7 @@ BEFORE SENDING — operator-fill checklist (every intentional placeholder):
 
 # Live feed delivers zero volume / openInterest / OHLC on every tick — only `ltp` + `tsInMillis` populate — New request
 
-**To:** <GROWW_API_SUPPORT_EMAIL — operator fill before sending>
+**To:** support@groww.in
 **From:** subramaniaparthiban@gmail.com (the Groww-registered account)
 **Subject:** Live feed (growwapi SDK, subscribe_ltp) — volume / openInterest / OHLC are 0.0 on 444,657 consecutive market-hours ticks; only ltp + tsInMillis ever populate (2026-07-03 evidence)
 **Date:** 2026-07-03
