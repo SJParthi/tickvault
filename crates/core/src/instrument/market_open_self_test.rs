@@ -60,8 +60,12 @@ pub struct MarketOpenSelfTestInputs {
     /// True iff the tick-processing pipeline task is alive (heartbeat
     /// gauge `tv_pipeline_active == 1`).
     pub pipeline_active: bool,
-    /// Age in seconds of the most recent tick observed by the pipeline.
-    /// Stale tick (> 60s during market hours) signals silent socket.
+    /// FEED-level freshest-tick age: seconds since ANY subscribed SID
+    /// last ticked (the MIN age across the tracked universe, sourced from
+    /// `TickGapDetector::freshest_tick_age_secs` — B3, 2026-07-03). Stale
+    /// (> 60s during market hours) signals a silent socket; a single
+    /// illiquid SID being quiet does NOT trip this. The scheduler maps
+    /// "no tick ever observed" to `u64::MAX` so the check fails safe.
     pub last_tick_age_secs: u64,
     /// True iff the most recent QuestDB health probe succeeded.
     pub questdb_connected: bool,

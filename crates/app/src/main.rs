@@ -6851,8 +6851,11 @@ async fn start_dhan_lane(
                     // Sample live state. All eight sub-checks now have
                     // production sources: seven from `health_status`
                     // gauges + token manager, and `last_tick_age_secs`
-                    // from the global `TickGapDetector::scan_gaps_top_n`
-                    // (returns the worst-stale instrument's gap).
+                    // from the global
+                    // `TickGapDetector::freshest_tick_age_secs` —
+                    // FEED-level liveness (seconds since ANY subscribed
+                    // SID last ticked), mirroring the feed-stall
+                    // watchdog's feed-level last-tick design.
                     let main_active = st_health.websocket_connections() as usize;
                     let oms = st_health.order_update_connected();
                     let pipeline = st_health.pipeline_active();
@@ -6865,13 +6868,24 @@ async fn start_dhan_lane(
                     // the dead boot-time manager, which would show a misleading
                     // token-headroom on the exact path D2c targets.
                     let token_headroom_secs = gauge_token_headroom_secs(&st_feed_runtime);
-                    let worst_gap_secs =
+                    // B3 (2026-07-03): the `recent_tick` sub-check's
+                    // documented meaning ("last tick > 60s old — silent
+                    // socket likely", wave-3-c) is FEED-level liveness,
+                    // but the old wiring fed it the WORST per-SID gap
+                    // (`scan_gaps_top_n(now, 1)`) with no exclusions —
+                    // ~33 always-silent illiquid SIDs made SELFTEST-02
+                    // page Critical at 09:16:30 IST on pure illiquidity
+                    // (same false-alarm class as the fixed #1342 SLO
+                    // tick_freshness). Feed it the FRESHEST tick age
+                    // instead: seconds since ANY subscribed SID last
+                    // ticked. Fail-safe: `None` (detector missing, or
+                    // map empty = no tick and no boot seed ever seen)
+                    // maps to `u64::MAX` so an in-market self-test with
+                    // zero tick evidence FAILS instead of false-passing.
+                    let feed_freshest_age_secs =
                         tickvault_core::pipeline::tick_gap_detector::global_tick_gap_detector()
-                            .map(|d| {
-                                let (top, _total) = d.scan_gaps_top_n(std::time::Instant::now(), 1);
-                                top.first().map(|(_, _, gap)| *gap).unwrap_or(0)
-                            })
-                            .unwrap_or(0);
+                            .and_then(|d| d.freshest_tick_age_secs(std::time::Instant::now()))
+                            .unwrap_or(u64::MAX);
                     // §31 universe-completeness — read the live universe the
                     // boot stashed (same source as the post-market cross-check
                     // above). None (no universe at 09:16) → (0, 0) → both
@@ -6890,7 +6904,7 @@ async fn start_dhan_lane(
                         main_feed_active: main_active,
                         order_update_active: oms,
                         pipeline_active: pipeline,
-                        last_tick_age_secs: worst_gap_secs,
+                        last_tick_age_secs: feed_freshest_age_secs,
                         questdb_connected: questdb_ok,
                         token_expiry_headroom_secs: token_headroom_secs,
                         index_values_subscribed: index_values,
@@ -7233,6 +7247,19 @@ async fn start_dhan_lane(
                         // global OnceLock so a runtime stop→re-start reports the new
                         // manager's headroom, not the dead boot-time manager's.
                         let token_secs = gauge_token_headroom_secs(&slo_feed_runtime);
+                        // B3 (2026-07-03): this loop is the ONE production
+                        // writer of the shared health-state token block.
+                        // Before this wiring `token_remaining_secs` /
+                        // `token_valid` had ZERO production writers, so the
+                        // 09:14 IST READY Telegram, the 15:31:30 IST EOD
+                        // digest and `GET /health` all rendered a ghost
+                        // "Token headroom: 0.0h" / "invalid" forever.
+                        // `token_secs == 0` means no token / expired (per
+                        // `seconds_until_expiry`), so `> 0` is the honest
+                        // validity signal. Two lock-free atomic stores every
+                        // 10s on a cold-path task — not the tick hot path.
+                        slo_health.set_token_remaining_secs(token_secs);
+                        slo_health.set_token_valid(token_secs > 0);
                         let token_freshness = if token_secs > SLO_TOKEN_HEADROOM_THRESHOLD_SECS {
                             1.0
                         } else {
