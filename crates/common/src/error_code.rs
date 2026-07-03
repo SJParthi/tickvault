@@ -1627,9 +1627,12 @@ mod tests {
         // (OOM-kill monitor — cgroup-v2 memory.events oom_kill vs boot baseline).
         // 2026-07-01 (audit sweep): bumped 111 -> 115 for AUTH-GAP-04 (AUTH-P11)
         // + RESOURCE-01/02/03 (BP-08 fd / RSS / spill-free monitors).
-        // 2026-07-03 (B6 latency-histogram split): bumped 115 -> 116 for
+        // 2026-07-03 (SLO publisher supervisor): bumped 115 -> 116 for SLO-03
+        // (the 10s tv_realtime_guarantee_score publisher died silently at
+        // 10:35 IST mid-market; now supervised + respawned).
+        // 2026-07-03 (B6 latency-histogram split): bumped 116 -> 117 for
         // TICK-FLUSH-01 (off-thread tick ILP flush worker respawned).
-        assert_eq!(ErrorCode::all().len(), 116);
+        assert_eq!(ErrorCode::all().len(), 117);
     }
 
     #[test]
