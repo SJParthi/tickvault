@@ -46,15 +46,17 @@ link**. This mirrors the proven `docs/dhan-support/` workflow:
 - **Groww identity** — Groww client/account identifier. This repo does
   NOT store one; use `<GROWW_CLIENT_ID — operator fill before sending>`
   placeholders and fill before sending. NEVER reuse the Dhan Client ID
-  (`1106656882`) or Dhan UCC — those are Dhan credentials, not Groww
-  identity.
+  or UCC (see `docs/dhan-support/`) — those are Dhan credentials, not
+  Groww identity.
 - **Precise instrument labels** — the Groww trading symbol AND the Groww
   `exchange_token` AND our internal `security_id` for every instrument
   cited (e.g. `RELIANCE / NSE / exchange_token=2885 / security_id=2885`).
   Never generic ("some NSE stock").
 - **Microsecond IST timestamps** — `YYYY-MM-DD HH:MM:SS.ffffff` format.
 - **Verbatim log evidence** — fenced code blocks, raw lines, never
-  reformatted.
+  reformatted. REDACT any token/JWT/credential material from pasted
+  CloudWatch lines before sending — the `last_error=<detail>` field
+  carries raw exception text.
 - **What works vs what fails table** — same account, same minute; rules
   out account / token / host / network issues.
 - **Numbered specific questions** — never "please help".
@@ -75,7 +77,7 @@ groww sidecar: NATS connection closed -> last_error=<detail>
 groww sidecar: NATS disconnected -> last_error=<detail>
 groww sidecar: NATS last_error -> <detail>
 groww sidecar: force-close of NATS socket failed (<type>)
-GROWW LIVE FEED REJECTED: <reason>          (edge-triggered, 600s cadence)
+GROWW LIVE FEED REJECTED: <reason>          (edge-triggered; the token-stale form fires ONCE after 600s of continuous auth failure; a separate 60s heartbeat line uses `GROWW LIVE FEED STILL REJECTED:`)
 ```
 
 Known behaviours to reference: the server can close the socket WITHOUT
