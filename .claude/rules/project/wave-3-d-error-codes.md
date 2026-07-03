@@ -52,7 +52,7 @@ into a worse tier does.
 |---|---|---|
 | `WS_health` | `(active_main + depth_20 + depth_200 + order_update) / expected` | WebSocket pool partially or fully down |
 | `QDB_health` | `1` if QuestDB connected else `0` | persist failures cascading; rescue ring buffering |
-| `Tick_freshness` | `1` if last tick observed `< 30s` ago (during market hours) | silent socket; depth/main feed stalled |
+| `Tick_freshness` | fraction of subscribed SIDs with a tick in the last `30s` (`1 − silent/universe`, clamped; INDIA VIX excluded from the silent count; pinned `1` outside market hours — fractional coverage per the 2026-07-03 #1342 fix, computed by `compute_tick_freshness`) | silent socket; depth/main feed stalled |
 | `Token_freshness` | `1` if token expiry `> 4h` away | JWT will die mid-session unless force-renewed |
 | `Spill_health` | `1` if `rate(tv_spill_dropped_total[5m]) == 0` | rescue ring overflow → DLQ |
 | `Phase2_health` | `1` if today's Phase 2 outcome was `Complete` | stock F&O subscription empty for the day |
