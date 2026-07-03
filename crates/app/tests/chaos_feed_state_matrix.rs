@@ -159,6 +159,11 @@ fn durable_floor(feed: Feed) -> DurableFloor {
     }
 }
 
+/// The ONE place the sidecar NDJSON tick wire format exists in this file.
+fn write_ndjson_line(f: &mut std::fs::File, ts: i64) {
+    writeln!(f, "{{\"ts_ist_nanos\": {ts}}}").expect("ndjson write");
+}
+
 /// Write `n` synthetic NDJSON tick lines for `NDJSON_TARGET_DAY` and fsync.
 /// `advance_ts=false` models frozen (duplicate) exchange timestamps.
 /// Returns the STILL-OPEN producer handle so the caller controls the
@@ -173,7 +178,7 @@ fn write_ndjson_ticks(path: &Path, n: u64, advance_ts: bool) -> std::fs::File {
         } else {
             base
         };
-        writeln!(f, "{{\"ts_ist_nanos\": {ts}}}").expect("ndjson write");
+        write_ndjson_line(&mut f, ts);
     }
     f.sync_all().expect("ndjson fsync");
     f
@@ -900,7 +905,7 @@ fn chaos_perm7_process_down_mid_market_replay_recovers_partial_never_balanced() 
                         .expect("ndjson re-open append");
                     for i in 0..M {
                         let ts = base_ts + i64::try_from(i).expect("fits");
-                        writeln!(f, "{{\"ts_ist_nanos\": {ts}}}").expect("ndjson append");
+                        write_ndjson_line(&mut f, ts);
                     }
                     f.sync_all().expect("ndjson fsync");
                 }
