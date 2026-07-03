@@ -93,29 +93,36 @@ fn makefile_coverage_target_uses_the_real_per_crate_gate() {
 }
 
 /// The Groww QuestDB e2e CI lane must exist with both anti-false-OK guards:
-/// the no-SKIP grep and the PROVED-count assertion, run under TV_REQUIRE_QDB=1.
+/// the no-skip grep and the proof-count assertion, run under the
+/// require-QuestDB env switch. The pinned strings below are the ACTUAL run-step
+/// command lines — they appear ONLY inside the workflow's `run:` steps, never
+/// in its header comment, so deleting the real steps cannot pass this guard.
 #[test]
 fn groww_e2e_workflow_exists_with_no_skip_guard_and_proved_assertion() {
     let wf = read(".github/workflows/groww-e2e.yml");
     assert!(
-        wf.contains("groww_live_pipeline_e2e"),
+        wf.contains("--test groww_live_pipeline_e2e"),
         "groww-e2e.yml must run the groww_live_pipeline_e2e integration test \
-         (B7 Groww CI lane)"
+         via the actual `cargo test ... --test groww_live_pipeline_e2e` run \
+         step (B7 Groww CI lane)"
     );
     assert!(
-        wf.contains("TV_REQUIRE_QDB=1"),
-        "groww-e2e.yml must set TV_REQUIRE_QDB=1 so an unreachable QuestDB fails \
-         the lane instead of skipping (audit Rule 11: no false-OK signals)"
+        wf.contains("TV_REQUIRE_QDB=1 cargo test -p tickvault-app"),
+        "groww-e2e.yml must run the e2e as `TV_REQUIRE_QDB=1 cargo test -p \
+         tickvault-app ...` so an unreachable QuestDB fails the lane instead \
+         of skipping (audit Rule 11: no false-OK signals)"
     );
     assert!(
-        wf.contains("SKIP "),
-        "groww-e2e.yml must grep the log for 'SKIP ' lines and fail on any — \
-         a skipped e2e is a vacuous pass (audit Rule 11)"
+        wf.contains("grep -q \"^SKIP \""),
+        "groww-e2e.yml must carry the literal `grep -q \"^SKIP \"` guard line \
+         that fails the job on any skip line — a skipped e2e is a vacuous pass \
+         (audit Rule 11)"
     );
     assert!(
-        wf.contains("PROVED:"),
-        "groww-e2e.yml must assert on the count of 'PROVED:' lines (>=3) so a \
-         silently-deleted test cannot produce a vacuous green (audit Rule 11)"
+        wf.contains("grep -c \"PROVED:\""),
+        "groww-e2e.yml must carry the literal `grep -c \"PROVED:\"` count \
+         assertion (>=3) so a silently-deleted test cannot produce a vacuous \
+         green (audit Rule 11)"
     );
 }
 

@@ -40,9 +40,13 @@ Four workstreams, one branch:
    gains a `TV_REQUIRE_QDB` env switch — when set, an unreachable QuestDB
    PANICS instead of skipping, so a CI lane can never vacuously pass.
 4. **New CI lane** `.github/workflows/groww-e2e.yml` (dispatch + Sunday-night
-   cron + path-filtered push on main): compose-up `tv-questdb` only, readiness
-   wait, run the e2e with `TV_REQUIRE_QDB=1`, then anti-false-OK asserts
-   (no `SKIP ` line; ≥3 `PROVED:` lines), always-teardown + log artifact.
+   cron + path-filtered push on main): `docker run` of the SAME pinned
+   `questdb/questdb:9.3.5` image the compose file uses (docker run, not
+   compose, because the compose service pins `platform: linux/arm64` for prod
+   Graviton parity and exec-format-fails on amd64 ubuntu-latest runners),
+   readiness wait, run the e2e with `TV_REQUIRE_QDB=1`, then anti-false-OK
+   asserts (no `SKIP ` line; ≥3 `PROVED:` lines), always-teardown
+   (`docker rm -f`) + log artifact.
 
 A new source-scan ratchet `crates/storage/tests/coverage_claim_honesty_guard.rs`
 pins all of the above so the false claims cannot silently return
@@ -55,8 +59,11 @@ pins all of the above so the false claims cannot silently return
   TOML — the TOML is NOT changed by this plan.
 - Operator-charter verbatim quote sections are NEVER edited; only the
   mechanical-matrix cell text in §C / enforcement-chain rows is corrected.
-- The compose service key is `tv-questdb` (verified) — the lane brings up ONLY
-  that service so Loki/Alloy don't waste CI minutes.
+- The compose tv-questdb service pins `platform: linux/arm64` (prod Graviton
+  parity) which cannot execute on amd64 CI runners — the lane therefore
+  `docker run`s the same pinned image tag directly (native amd64 from the
+  multi-arch manifest; the compose file carries no sha256 digest), so
+  Loki/Alloy also don't waste CI minutes.
 - The e2e without `TV_REQUIRE_QDB` keeps today's SKIP-and-return behaviour so
   local `cargo test` on a machine without Docker stays green.
 - `set -o pipefail` in the workflow run step so a cargo failure is not masked
@@ -64,8 +71,8 @@ pins all of the above so the false claims cannot silently return
 
 ## Failure Modes
 
-- QuestDB fails to come up in CI → readiness loop fails the job after ~120s
-  with compose logs printed (fail-closed, no vacuous green).
+- QuestDB fails to come up in CI → readiness loop fails the job after ~180s
+  with container logs printed (fail-closed, no vacuous green).
 - QuestDB up but tests skip anyway (e.g. port mapping regression) →
   `TV_REQUIRE_QDB=1` panic + the `grep "^SKIP "` guard both fail the job.
 - Tests pass but print fewer than 3 `PROVED:` lines (a test deleted/renamed) →
