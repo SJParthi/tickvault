@@ -7,7 +7,7 @@ One URL you open on a phone or laptop to run the whole product. Three tabs
 |---|---|
 | 📊 **Overview** | Live status (instance/app/market), count-up tick counter, ticks/sec sparkline, **guarantee shields** incl. the audit-backed **Tick conservation** verdict (15:40 IST `tick_conservation_audit` + today's `ws_event_audit` disconnects — never green from a tick rate alone; greyed to one calm "box stopped" banner when the instance is off), feed toggles, a thin **AWS strip** (spend $ · alarms · disk %, tap to expand), a compact **latency** card ("Measure now"), and **ONE context-aware ▶ Start / ■ Stop instance button** |
 | 📈 **Data** | Animated candle bars per timeframe, the daily **cross-verify** result, and the **read-only database console** (tables + columns + query grid + CSV download; SELECT/SHOW/EXPLAIN/WITH only, capped 1000 rows) |
-| 🛠️ **Admin** | Restart app / Restart QuestDB / Stop app (+ force), a **collapsed danger zone** (severity picker: Wipe GROWW only → Wipe ALL data → Full Docker reset → Bare Nuke, each with its own typed confirm word), and "Lock / forget this device" |
+| 🛠️ **Admin** | Restart app / Restart QuestDB / Stop app (+ force), a **collapsed danger zone** (severity picker: Wipe GROWW only → Wipe ALL data → ☢ Full Docker nuke (wipes ALL data incl. QuestDB volumes + fresh start; type NUKE-DOCKER, server-verified) → Bare Nuke, each with its own typed confirm word), and "Lock / forget this device" |
 
 The former **GitHub** and **Logs** tabs were removed. The `logs` API action is
 kept (the tickvault-logs MCP server reads it); the `gh_*` actions were removed
@@ -54,4 +54,4 @@ cd deploy/aws/lambda/operator-control
 python3 -m unittest test_handler -v
 ```
 
-109 pure-function tests: method routing, constant-time bearer auth, market-hours guard, snapshot parsing, the read-only SQL gate, wipe/nuke guards + confirm tokens, the 3-tab structure (danger zone collapsed, severity-picker mapping, context-aware start/stop, stopped-box banner), and public-HTML-has-no-secret. The boto3 / SSM action paths are exercised by the live deploy smoke test.
+129 pure-function tests: method routing, constant-time bearer auth, market-hours guard, snapshot parsing, the read-only SQL gate, wipe/nuke guards + confirm tokens (incl. the Full Docker Nuke server-verified NUKE-DOCKER phrase), the 3-tab structure (danger zone collapsed, severity-picker mapping, context-aware start/stop, stopped-box banner), and public-HTML-has-no-secret. The boto3 / SSM action paths are exercised by the live deploy smoke test.
