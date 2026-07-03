@@ -1332,12 +1332,26 @@ def lambda_handler(event, _context):
             cid = _ssm_shell(_wipe_groww_commands())
             return _resp(200, {"ok": True, "action": action, "command_id": cid})
         if action == "docker-reset":
-            # MOST DESTRUCTIVE: full Docker teardown + fresh rebuild (operator
-            # Option B, 2026-06-04). Unlike wipe-questdb (TRUNCATE rows, keeps
+            # MOST DESTRUCTIVE: the FULL DOCKER NUKE — full Docker teardown +
+            # fresh rebuild (operator Option B, 2026-06-04; re-demanded verbatim
+            # 2026-07-03: "if I want to do the entire docker wipe off I mean
+            # entire docker nuke"). Unlike wipe-questdb (TRUNCATE rows, keeps
             # audit tables for SEBI), this DELETES the Docker volumes + images
             # entirely, so EVERY table — including the SEBI-retention audit
             # tables — is gone. The operator explicitly chose this; the UI
-            # double-confirms (type "NUKE") and spells out the audit-data loss.
+            # asks the operator to TYPE the confirm phrase and spells out the
+            # audit-data loss.
+            #
+            # Server-side guards (mirror the #1325 wipe-groww pattern):
+            #   1. typed confirm token — the caller must send
+            #      {"confirm": "NUKE-DOCKER"} (typed by the operator in the UI
+            #      prompt; a scripted call without the token can never fire
+            #      this accidentally — force alone is NOT enough).
+            #   2. market-hours guard — in _DESTRUCTIVE, so blocked
+            #      09:15-15:30 IST Mon-Fri unless {"force": true}.
+            #   3. audit trail — the dispatch is print-logged to the Lambda's
+            #      CloudWatch log group (who/when/command_id) and the full
+            #      command transcript lives in SSM command history.
             #
             # Sequence (each step fail-soft so one hiccup can't wedge the box):
             #   1. stop the app (systemd) so it releases the QuestDB connection
@@ -1363,13 +1377,13 @@ def lambda_handler(event, _context):
             #   6. `docker compose up -d` on the now-empty volume + restart app —
             #      it recreates `ticks` + candle + audit tables fresh via
             #      `ensure_*_table_dedup_keys` with the correct DEDUP keys.
-            if not force:
-                return _resp(409, {"error": 'docker-reset is the FULL nuke (deletes volumes + images + ALL data incl. SEBI audit tables) — re-send with {"force": true}', "action": action})
-            # PR-5 H-1: server-side token (mirror of the wipe-groww gate).
-            if str(payload.get("confirm", "")).strip() != "NUKE":
+            if str(payload.get("confirm", "")).strip() != "NUKE-DOCKER":
                 return _resp(
                     409,
-                    {"error": 'docker-reset destroys ALL data incl. SEBI audit tables — re-send with {"confirm": "NUKE"}', "action": action},
+                    {
+                        "error": 'docker-reset is the FULL DOCKER NUKE (deletes containers + volumes + images = ALL data incl. SEBI audit tables, then fresh start) — re-send with {"confirm": "NUKE-DOCKER"}',
+                        "action": action,
+                    },
                 )
             compose_dir = "/opt/tickvault/repo/deploy/docker"
             data_dir = "/opt/tickvault/data"
@@ -1423,6 +1437,9 @@ def lambda_handler(event, _context):
                 "echo docker-reset-dispatched",
             ]
             cid = _ssm_shell(cmds)
+            # Audit line → the Lambda's CloudWatch log group (same trail the
+            # other actions use); the full transcript is in SSM history.
+            print(f"operator-portal AUDIT: docker-reset (FULL DOCKER NUKE) dispatched command_id={cid} force={force}")  # noqa: T201
             return _resp(200, {"ok": True, "action": action, "command_id": cid})
 
         if action == "docker-nuke-bare":
@@ -1847,7 +1864,7 @@ def _console_html() -> str:
           <label class="danger-opt"><input type="radio" name="danger" value="wipe">
             <span><b>🗑️ Wipe ALL data → fresh start</b> — <span class="muted">deletes every tick &amp; candle in ALL timeframe tables for BOTH feeds (Dhan + Groww + any future feed) AND their capture/replay files (Groww capture file, Dhan WAL, spill, dlq) so NOTHING resurrects after restart — audit tables kept. Run when the box is RUNNING; next session = fresh data. Asks you to type WIPE.</span></span></label>
           <label class="danger-opt"><input type="radio" name="danger" value="nuke">
-            <span><b>💥 Full Docker reset → wipe EVERYTHING</b> — <span class="muted">⚠️ NUCLEAR: deletes Docker containers + volumes + images and rebuilds from scratch. Wipes <b>ALL</b> data INCLUDING the SEBI-retention audit tables. Box must be RUNNING. Asks you to type NUKE.</span></span></label>
+            <span><b style="color:#f66">☢ Full Docker nuke — wipes ALL data (QuestDB volumes) + fresh start</b> — <span class="muted">⚠️ NUCLEAR: stops the app, deletes Docker containers + volumes + images (full QuestDB wipe INCLUDING the SEBI-retention audit tables) + prune, then rebuilds QuestDB fresh + restarts the app. Box must be RUNNING. Asks you to type NUKE-DOCKER.</span></span></label>
           <label class="danger-opt"><input type="radio" name="danger" value="erase">
             <span><b>☢️ Bare Nuke → delete ALL &amp; leave EMPTY</b> — <span class="muted">☢️ Like Docker Desktop "delete all": removes <b>every</b> container + image + volume and does <b>NOT</b> rebuild — the box is left completely bare with <b>nothing running</b> (trading OFF until you redeploy). Asks you to type ERASE.</span></span></label>
           <div class="row" style="margin-top:12px"><button class="b-stop" onclick="dangerExecute()">☠ Execute selected action</button></div>
@@ -2146,7 +2163,7 @@ async function act(action,forceId){ if(!confirm('Run "'+action+'" on the trading
   const j=await call(action,{force}); if(j){ toast('✅ '+action+' sent'); setTimeout(loadOverview,1600); } }
 
 // Danger-zone severity picker → the UNCHANGED per-action functions. Each still
-// asks for its OWN typed confirm token (GROWW / WIPE / NUKE / ERASE) — the
+// asks for its OWN typed confirm token (GROWW / WIPE / NUKE-DOCKER / ERASE) — the
 // picker only chooses WHICH prompt fires; there is no token bypass path.
 function dangerExecute(){ const sel=document.querySelector('input[name="danger"]:checked');
   if(!sel){ toast('Pick a danger-zone action first'); return; }
@@ -2167,10 +2184,10 @@ async function wipeGroww(){
   if(!j.command_id){ toast('⚠️ dispatched but no command id — re-check the groww tick count in ~2 min'); return; }
   pollNuke(j.command_id,0); }
 async function dockerReset(){
-  if(prompt('⚠️ NUCLEAR RESET. This DELETES Docker containers + volumes + images and rebuilds from scratch — wiping ALL data INCLUDING the SEBI-retention audit tables. The box must be RUNNING. Type NUKE to confirm:')!=='NUKE'){ toast('cancelled'); return; }
+  if(prompt('☢ FULL DOCKER NUKE. Stops the app, DELETES Docker containers + volumes + images (full QuestDB wipe — ALL data INCLUDING the SEBI-retention audit tables) + prune, then rebuilds QuestDB fresh + restarts the app. The box must be RUNNING. Type NUKE-DOCKER to confirm:')!=='NUKE-DOCKER'){ toast('cancelled'); return; }
   if(!confirm('Last check: every table is destroyed, including audit history. Continue?')){ toast('cancelled'); return; }
-  toast('💥 nuke dispatched → wiping in background (~2-3 min)…');
-  const j=await call('docker-reset',{force:true,confirm:'NUKE'});
+  toast('☢ full docker nuke dispatched → wiping in background (~2-3 min)…');
+  const j=await call('docker-reset',{force:$('force').checked,confirm:'NUKE-DOCKER'});
   if(!(j&&j.ok)){ toast((j&&j.error)||'docker-reset failed — is the box running?'); return; }
   if(!j.command_id){ toast('⚠️ nuke dispatched but no command id — re-check the ticks count in ~3 min'); setTimeout(loadOverview,8000); return; }
   pollNuke(j.command_id,0); }
