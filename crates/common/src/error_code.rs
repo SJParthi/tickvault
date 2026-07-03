@@ -1679,9 +1679,9 @@ mod tests {
         // 10:35 IST mid-market; now supervised + respawned).
         // 2026-07-03 (B6 latency-histogram split): bumped 116 -> 117 for
         // TICK-FLUSH-01 (off-thread tick ILP flush worker respawned).
-        // 2026-07-03 (C3 re-injection storm fix): bumped 117 -> 118 for
-        // WS-REINJECT-01 (boot WAL re-injection aborted — chunked
-        // backpressure replaces the silent try_send drop storm).
+        // 2026-07-03 (C2 panic-free reqwest client): bumped 117 -> 118 for
+        // HTTP-CLIENT-01 (ClientBuilder::build failed — typed degrade
+        // replaces the Client::new() panic fallback at 8 storage sites).
         assert_eq!(ErrorCode::all().len(), 118);
     }
 

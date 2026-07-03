@@ -1887,26 +1887,26 @@ rules:
       one-off respawn at shutdown is benign; a sustained respawn rate is a real
       supervisor bug — escalate so the operator inspects the panic backtrace.
 
-  # WS-REINJECT-01 = the boot-time STAGE-C.2b WAL re-injection aborted — the
-  # frame-channel consumer (tick processor) was dead (channel closed) or
-  # wedged (per-send timeout). The undelivered remainder stays durably staged
-  # in the WAL replaying/ directory and re-replays next boot, so the abort
-  # self-heals across a restart — but a dead/wedged consumer at boot needs
-  # operator eyes (cross-check WS-GAP-07 / BOOT-01 / PROC-01).
-  - name: ws-reinject-01-aborted-escalate
+  # HTTP-CLIENT-01 = reqwest ClientBuilder::build() failed at a storage
+  # HTTP-client site (TLS backend / resolver init / fd exhaustion). The site
+  # already degraded gracefully (typed error — skipped one probe/DDL write,
+  # never a panic, never the process; C2 fix 2026-07-03 replacing the
+  # Client::new() panic fallback). Escalate so the operator inspects the
+  # underlying resource pressure (fd count, RESOURCE-01) per the runbook;
+  # 5-min cooldown since a pressured host can emit on every 5s/10s probe tick.
+  - name: http-client-01-build-failed-escalate
     match:
-      code: WS-REINJECT-01
+      code: HTTP-CLIENT-01
     action: escalate
-    runbook_path: .claude/rules/project/ws-reinject-error-codes.md
+    runbook_path: .claude/rules/project/http-client-error-codes.md
     confidence: 1.0
     cooldown_secs: 300
     justification: >-
-      WS-REINJECT-01 = the bounded chunked-backpressure WAL re-injection
-      (C3 fix for the 2026-07-03 dropped=1,127,801 storm) aborted because the
-      tick-processor consumer was dead or made zero progress for the per-send
-      timeout. No frame is silently lost — the remainder stays staged in
-      replaying/ for re-replay next boot and confirm_replayed() is skipped —
-      but the underlying consumer death/wedge (WS-GAP-07 / QuestDB /
-      host-pressure class) needs operator root-cause. Escalate (Telegram +
-      draft Issue) with a 5-min cooldown; the next boot's replay self-heals
-      the data path.
+      HTTP-CLIENT-01 = a reqwest client could not be built (TLS/resolver/fd
+      init failure). The degrade already happened — the single probe or
+      cold-path DDL write was skipped with error!+counter
+      (tv_http_client_build_failed_total{site}); no auto-fix applies because
+      the root cause is host resource pressure (check /proc/<pid>/fd,
+      cross-check RESOURCE-01 and WS reconnect churn). Escalate with a 300s
+      cooldown so a sustained-pressure window pages once per 5 minutes, not
+      once per probe tick.
