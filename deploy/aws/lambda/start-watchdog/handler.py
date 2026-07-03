@@ -1,6 +1,12 @@
 """Instance start watchdog Lambda — answers "who monitors the 08:30 start?".
 
-Two EventBridge schedules invoke this Lambda with a `mode` input:
+Also hosts the out-of-hours CURFEW guard (mode="curfew_check", hourly) —
+operator directive 2026-07-03: a manually-started box left running outside
+08:00-17:00 IST Mon-Fri with no keep-alive override is auto-stopped so a
+forgotten manual start can never burn budget overnight. Override: SSM param
+`/tickvault/prod/keep-alive-until` (ISO timestamp). Grace: 45 min from launch.
+
+EventBridge schedules invoke this Lambda with a `mode` input:
 
   * mode="ping"  @ 08:30 IST (03:00 UTC Mon-Fri) — fires WITH the daily_start
     EventBridge rule. Publishes a positive "start triggered" Telegram so the
@@ -65,6 +71,64 @@ STOP_TRIGGER_UTC_MINUTE = 0
 # minutes after the trigger means the scheduled start did NOT do it.
 LATE_START_GRACE_MINUTES = 5
 IST_OFFSET = timedelta(hours=5, minutes=30)
+
+# ---------------------------------------------------------------------------
+# Out-of-hours curfew guard (mode="curfew_check") — operator directive
+# 2026-07-03: "manually I started this instance right out of the expected
+# market hours right, by mistake if I don't stop manually means it should be
+# auto triggered right, because this already happened and the budget cost
+# became more — manual human error is not acceptable."
+#
+# This OVERRIDES the earlier "a box you start manually after 4:30 PM is never
+# auto-stopped" design: any box running OUTSIDE operating hours with no
+# explicit keep-alive override is stopped by the hourly curfew check.
+# ---------------------------------------------------------------------------
+# Operating hours: 08:00-17:00 IST, Mon-Fri. The curfew guard NEVER fires
+# inside this window — the normal 08:30 start / 16:30 stop schedule (plus the
+# 08:45 check + 16:45 stop_check) owns it. Outside it (nights + weekends) the
+# guard is active.
+OPERATING_OPEN_IST_MINUTES = 8 * 60  # 08:00 IST
+OPERATING_CLOSE_IST_MINUTES = 17 * 60  # 17:00 IST
+# Grace: never stop a box within this many minutes of its launch — gives the
+# operator time to work after a deliberate manual start before either setting
+# the keep-alive or finishing up.
+CURFEW_START_GRACE_MINUTES = 45
+# SSM parameter holding an ISO timestamp; while now < that timestamp the
+# curfew guard skips (operator's explicit "I want it running tonight" signal).
+# A naive timestamp is interpreted as IST. Missing/expired/garbage = no
+# override (budget protection wins).
+KEEP_ALIVE_PARAM = os.environ.get("KEEP_ALIVE_PARAM", "/tickvault/prod/keep-alive-until")
+
+
+def _is_within_operating_hours(now_utc: datetime) -> bool:
+    """True iff now is 08:00-17:00 IST on a Monday-Friday."""
+    ist = now_utc + IST_OFFSET
+    if ist.weekday() >= 5:  # Sat=5, Sun=6 — weekends are always curfew
+        return False
+    minutes = ist.hour * 60 + ist.minute
+    return OPERATING_OPEN_IST_MINUTES <= minutes < OPERATING_CLOSE_IST_MINUTES
+
+
+def _read_keep_alive_until(ssm_client: Any) -> datetime | None:
+    """Read the keep-alive-until SSM param. None = no (usable) override.
+
+    Never raises — an unreadable/garbage override must not crash the guard,
+    and fail-open here would silently disable budget protection, so any
+    failure is treated as 'no override' (the guard stays armed).
+    """
+    try:
+        resp = ssm_client.get_parameter(Name=KEEP_ALIVE_PARAM)
+        raw = (resp.get("Parameter", {}).get("Value") or "").strip()
+        if not raw:
+            return None
+        parsed = datetime.fromisoformat(raw)
+        if parsed.tzinfo is None:
+            # Operator wrote a naive local (IST) timestamp.
+            parsed = parsed.replace(tzinfo=timezone(IST_OFFSET))
+        return parsed
+    except Exception as exc:  # noqa: BLE001 — guard must never crash
+        logger.info("keep-alive param unavailable/unparseable (%s) — no override", exc)
+        return None
 
 
 def _now() -> datetime:
@@ -249,6 +313,83 @@ def lambda_handler(event: dict[str, Any], _context: Any = None) -> dict[str, Any
             self_stopped,
         )
         return {"mode": "stop_check", "state": state, "alerted": True, "self_stopped": self_stopped}
+
+    if mode == "curfew_check":
+        # Hourly, active OUTSIDE 08:00-17:00 IST Mon-Fri (and all weekend).
+        # Operator directive 2026-07-03: a manually-started box left running
+        # out of hours must be auto-stopped — "manual human error is not
+        # acceptable". Explicit keep-alive (SSM) or a fresh launch (<45 min)
+        # skips; the normal schedule owns the in-window hours untouched.
+        now = _now()
+        if _is_within_operating_hours(now):
+            logger.info("curfew_check — inside operating hours; guard inactive")
+            return {"mode": "curfew_check", "skipped": "operating_hours", "stopped": False}
+        ec2_client = boto3.client("ec2")
+        state, launch_time = _instance_info(ec2_client, EC2_INSTANCE_ID)
+        if state != "running":
+            logger.info("curfew_check OK — instance is '%s'; staying silent", state)
+            return {"mode": "curfew_check", "state": state, "stopped": False}
+        keep_alive_until = _read_keep_alive_until(boto3.client("ssm"))
+        if keep_alive_until is not None and now < keep_alive_until:
+            logger.info(
+                "curfew_check — keep-alive override active until %s; leaving the box alone",
+                keep_alive_until,
+            )
+            return {"mode": "curfew_check", "state": state, "stopped": False, "skipped": "keep_alive"}
+        if launch_time is not None and now - launch_time < timedelta(
+            minutes=CURFEW_START_GRACE_MINUTES
+        ):
+            logger.info(
+                "curfew_check — launched %s (<%d min ago): fresh manual start, grace window",
+                launch_time,
+                CURFEW_START_GRACE_MINUTES,
+            )
+            return {"mode": "curfew_check", "state": state, "stopped": False, "skipped": "grace"}
+        now_ist = (now + IST_OFFSET).strftime("%I:%M %p").lstrip("0")
+        if launch_time is None:
+            # Can't prove the box wasn't started seconds ago — page, don't
+            # stop. The next hourly check retries; a real forgotten box will
+            # be past any grace by then.
+            _publish(
+                sns_client,
+                "Curfew: box running out of hours — could not verify start time",
+                f"⚠️ At {now_ist} IST the box is running outside operating hours "
+                "with no keep-alive, but I could not read when it was started, "
+                "so I won't stop it this hour. The next hourly check will retry. "
+                "If you are NOT using it, press 'Stop instance' on the portal — "
+                "it bills every hour it runs.",
+            )
+            logger.error("curfew_check — running, launch_time unknown — paged, not stopped")
+            return {"mode": "curfew_check", "state": state, "stopped": False, "alerted": True}
+        self_stopped = _try_self_stop(ec2_client, EC2_INSTANCE_ID)
+        if self_stopped:
+            _publish(
+                sns_client,
+                "Curfew auto-stop — box stopped to protect budget",
+                f"💤 Curfew auto-stop: box was left running at {now_ist} IST "
+                "with no keep-alive — stopped to protect budget. "
+                "To run overnight set keep-alive. If you were using it right "
+                "now, press 'Start instance' on the portal and set the "
+                "keep-alive so I don't stop it again.",
+            )
+            logger.info("curfew_check — out-of-hours box stopped at %s IST", now_ist)
+        else:
+            _publish(
+                sns_client,
+                "Curfew auto-stop FAILED — manual stop NEEDED",
+                f"🆘 The box is running at {now_ist} IST outside operating hours "
+                "with no keep-alive, and my stop attempt FAILED. Press "
+                "'Stop instance' on the portal, or run "
+                f"`aws ec2 stop-instances --instance-ids {EC2_INSTANCE_ID} "
+                "--region ap-south-1`. It bills every hour it runs.",
+            )
+            logger.error("curfew_check — stop attempt FAILED — manual stop paged")
+        return {
+            "mode": "curfew_check",
+            "state": state,
+            "stopped": self_stopped,
+            "alerted": True,
+        }
 
     # mode == "check" (default): verify the box actually started — and fix it.
     ec2_client = boto3.client("ec2")
