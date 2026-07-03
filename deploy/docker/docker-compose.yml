@@ -105,9 +105,20 @@ services:
     # raised, QuestDB simply logs a perf warning (current=262144
     # recommended=1048576) and runs fine.
     ports:
-      # E5 security: bind web console to localhost only (no external access).
-      # PG + ILP remain on all interfaces for host app connectivity.
-      - "127.0.0.1:9000:9000"  # HTTP API + Web Console (localhost only)
+      # E5 security: bind web console to localhost only (no external access) —
+      # the DEV default. On the prod box, deploy-aws.yml persists
+      # TV_QDB_HTTP_BIND=0.0.0.0 into deploy/docker/.env (gitignored, survives
+      # the deploy's `git reset --hard`) so the B4 QuestDB console's VPC back
+      # Lambda can reach :9000 on the box PRIVATE IP. The 127.0.0.1-only bind
+      # made every B4 console request 503 "box offline" even with the box
+      # RUNNING (2026-07-03 incident): the SG-to-SG 9000 rule was correct but
+      # the host refused the connection. Prod network exposure is UNCHANGED:
+      # the box SG admits 9000 from the console Lambda's SG ONLY (main.tf
+      # dynamic ingress) — never public, even when bound 0.0.0.0. Compose v2
+      # loads .env from the compose file's project dir for EVERY caller
+      # (deploy-aws.yml, user-data boot, infra.rs --force-recreate,
+      # ensure-questdb.sh), so the prod bind persists across all restarts.
+      - "${TV_QDB_HTTP_BIND:-127.0.0.1}:9000:9000" # HTTP API + Web Console (dev default: localhost only)
       - "8812:8812"            # PostgreSQL wire protocol
       - "9009:9009"            # InfluxDB Line Protocol (high-speed ingestion)
       - "127.0.0.1:9003:9003" # Prometheus metrics (localhost only)

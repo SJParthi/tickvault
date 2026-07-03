@@ -140,8 +140,20 @@ QDB_PG_PASSWORD="$TV_QUESTDB_PG_PASSWORD"; export QDB_PG_PASSWORD  # secret-scan
 # `docker run -d` may pull the image on a cold box, so allow more headroom than
 # the per-call default (still bounded so a wedged daemon cannot hang forever).
 DOCKER_RUN_TIMEOUT_SECS="${DOCKER_RUN_TIMEOUT_SECS:-300}"
+# Honor TV_QDB_HTTP_BIND from the compose project's .env (B4 QuestDB console,
+# 2026-07-03): the compose paths above pick it up automatically (compose v2
+# loads .env from the compose file's dir), but this raw `docker run` fallback
+# must read it explicitly — otherwise a self-heal would silently regress
+# :9000 back to localhost-only and break the console's VPC back Lambda.
+# Dev default stays 127.0.0.1; prod .env sets 0.0.0.0 (box SG admits 9000
+# from the console Lambda's SG only — never public).
+QDB_HTTP_BIND="${TV_QDB_HTTP_BIND:-}"
+if [ -z "$QDB_HTTP_BIND" ] && [ -f "$(dirname "$COMPOSE_FILE")/.env" ]; then
+  QDB_HTTP_BIND="$(sed -n 's/^TV_QDB_HTTP_BIND=//p' "$(dirname "$COMPOSE_FILE")/.env" | tail -1)"
+fi
+QDB_HTTP_BIND="${QDB_HTTP_BIND:-127.0.0.1}"
 if DOCKER_CALL_TIMEOUT_SECS="$DOCKER_RUN_TIMEOUT_SECS" dtimeout run -d --name "$SVC" --hostname "$SVC" --restart unless-stopped \
-  -p 127.0.0.1:9000:9000 -p 8812:8812 -p 9009:9009 -p 127.0.0.1:9003:9003 \
+  -p "$QDB_HTTP_BIND:9000:9000" -p 8812:8812 -p 9009:9009 -p 127.0.0.1:9003:9003 \
   -v tv-questdb-data:/var/lib/questdb \
   --shm-size 512m --memory 2g \
   -e QDB_TELEMETRY_ENABLED=false \
