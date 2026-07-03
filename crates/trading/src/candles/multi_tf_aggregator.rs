@@ -934,6 +934,30 @@ mod tests {
     const TEST_DAY_START: u32 = 1_779_321_600;
 
     #[test]
+    fn test_watermark_secs_starts_zero_and_is_shared_across_clones() {
+        // The getter contract: 0 before any tick; a clone (the catch-up
+        // driver task holds one) observes the SAME watermark the
+        // tick-consumer clone advances (Arc-shared, per-instance).
+        let agg = MultiTfAggregator::new();
+        assert_eq!(agg.watermark_secs(), 0);
+        agg.pre_populate(vec![(13, 0)]);
+        let driver_clone = agg.clone();
+        let ts = TEST_DAY_START + 33_330; // 09:15:30 IST
+        agg.consume_tick(
+            &mk_tick(13, 0, ts, 100.0, 50, 0),
+            0,
+            FeedStrategy::DHAN,
+            None,
+            |_, _| {},
+        );
+        assert_eq!(driver_clone.watermark_secs(), ts);
+        // A separate INSTANCE has its own watermark (Dhan vs Groww never
+        // cross-apply).
+        let other_instance = MultiTfAggregator::new();
+        assert_eq!(other_instance.watermark_secs(), 0);
+    }
+
+    #[test]
     fn test_watermark_advances_and_never_regresses() {
         let agg = MultiTfAggregator::new();
         agg.pre_populate(vec![(13, 0)]);

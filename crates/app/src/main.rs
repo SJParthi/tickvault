@@ -4626,6 +4626,9 @@ fn spawn_engine_b_aggregator(
     // the per-tick path uses (`global_seal_sender()`).
     let agg_for_boundary = std::sync::Arc::clone(&aggregator);
     let prev_day_cache_for_boundary = std::sync::Arc::clone(&prev_day_cache);
+    // Cloned BEFORE Task 3 moves `trading_calendar` — Task 4 (the watermark
+    // catch-up seal below) shares the same calendar gate.
+    let calendar_for_catchup = std::sync::Arc::clone(&trading_calendar);
     tokio::spawn(async move {
         loop {
             // Sleep until the next IST midnight (bounded helper, ≤ 24h).
@@ -4688,6 +4691,99 @@ fn spawn_engine_b_aggregator(
         }
     });
     tracing::info!("candle-engine #T1b — IST-midnight force-seal task spawned");
+
+    // --- Task 4: watermark-aware per-minute catch-up seal (BOUNDARY-01) ---
+    // Bounds candle seal lag WITHOUT mass-discarding backlogged ticks. A
+    // bucket seals today only on the SAME instrument's next tick or at IST
+    // midnight — an instrument that stops ticking mid-session leaves its
+    // candle rows absent for hours, and the final session minute (the 15:29
+    // M1 bar) is structurally absent until midnight because the
+    // out-of-session gate blocks ≥15:30 ticks from folding. This task closes
+    // both gaps SAFELY: every CATCHUP_SEAL_POLL_INTERVAL_SECS it reads the
+    // Dhan aggregator instance's event-time watermark (max exchange_timestamp
+    // ever consumed — post-close ticks still advance it) and, ONLY when the
+    // watermark ADVANCED since the last scan, seals buckets whose end ≤
+    // watermark − CATCHUP_SEAL_LATENESS_MARGIN_SECS. Buckets past that cutoff
+    // are still potentially being filled by a backlogged stream and stay
+    // open — a naive wall-clock force-seal here would convert the backlog
+    // into DiscardLate drops and corrupt candles on re-open. A STALLED
+    // watermark (dead feed / broadcast starvation) gets NO catch-up seals —
+    // FEED-STALL-01 owns the dead-feed page; no "assume dead then force-seal
+    // anyway" escape hatch exists by design. Same bare-spawn supervision
+    // level as the sibling Task 3 midnight force-seal.
+    let agg_for_catchup = std::sync::Arc::clone(&aggregator);
+    let prev_day_cache_for_catchup = std::sync::Arc::clone(&prev_day_cache);
+    let heartbeat_for_catchup = heartbeat.clone();
+    tokio::spawn(async move {
+        use tickvault_trading::candles::{
+            CATCHUP_SEAL_LATENESS_MARGIN_SECS, CATCHUP_SEAL_POLL_INTERVAL_SECS,
+        };
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(
+            CATCHUP_SEAL_POLL_INTERVAL_SECS,
+        ));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut last_scanned_watermark: u32 = 0;
+        loop {
+            interval.tick().await;
+            // Self-gating: overnight / holiday / dead feed = static watermark
+            // = one atomic load per wave, no scan, no seals.
+            let watermark = agg_for_catchup.watermark_secs();
+            if watermark == 0 || watermark == last_scanned_watermark {
+                continue;
+            }
+            // Trading-day gate — mirrors the Task 3 midnight force-seal.
+            if !calendar_for_catchup.is_trading_day_today() {
+                continue;
+            }
+            let Some(sender) = global_seal_sender() else {
+                // Seal-writer not installed yet — retry next wave WITHOUT
+                // consuming the watermark advance (no seal is lost).
+                continue;
+            };
+            last_scanned_watermark = watermark;
+            let cutoff = watermark.saturating_sub(CATCHUP_SEAL_LATENESS_MARGIN_SECS);
+            let sealed = agg_for_catchup.catch_up_seal_all(
+                cutoff,
+                |security_id, segment_code, tf, state| {
+                    metrics::counter!("tv_boundary_catchup_total", "feed" => "dhan").increment(1);
+                    // EXACT same Dhan routing policy as the per-tick seal site
+                    // (spawn_engine_b_aggregator Task 1): drop D1
+                    // (`live-feed-purity.md` rule 10), pct-stamp from the
+                    // prev-day cache, drive the heartbeat + tv_aggregator_*
+                    // counters. A full-mpsc drop is already counted by
+                    // route_seal (`tv_seal_mpsc_dropped_total`).
+                    tickvault_app::seal_routing::route_seal(
+                        tickvault_app::seal_routing::SealRouteParams {
+                            feed: tickvault_common::feed::Feed::Dhan,
+                            drop_d1: true,
+                            prev_day_cache: Some(prev_day_cache_for_catchup.as_ref()),
+                            heartbeat: Some(&heartbeat_for_catchup),
+                            feed_health_on_m1: None,
+                        },
+                        security_id,
+                        segment_code,
+                        tf,
+                        state,
+                        sender,
+                    );
+                },
+            );
+            if sealed > 0 {
+                // ONE coalesced line per scan wave — never per-seal spam.
+                tracing::warn!(
+                    code =
+                        tickvault_common::error_code::ErrorCode::Boundary01CatchupSeal.code_str(),
+                    feed = "dhan",
+                    seals = sealed,
+                    cutoff_secs = cutoff,
+                    watermark_secs = watermark,
+                    "BOUNDARY-01: watermark catch-up sealed lagging candle bucket(s) — \
+                     late but correct; buckets past the watermark stay open for the backlog"
+                );
+            }
+        }
+    });
+    tracing::info!("candle-engine #T1b — watermark catch-up seal task spawned (BOUNDARY-01)");
 }
 
 // ---------------------------------------------------------------------------
