@@ -41,7 +41,7 @@
 
 ## Test Plan
 
-- `crates/app/src/boot_helpers.rs::tests` — `test_secs_until_close_seal_at_152959_is_6s`, `test_secs_until_close_seal_at_exact_trigger_wraps_to_next_day`, `test_secs_until_close_seal_just_after_trigger`, `test_secs_until_close_seal_at_midnight`, `test_close_seal_constant_is_153005_ist`.
+- `crates/app/src/boot_helpers.rs::tests` — `test_secs_until_close_seal_ist_at_152959_is_6s`, `test_secs_until_close_seal_ist_at_exact_trigger_wraps_to_next_day`, `test_secs_until_close_seal_ist_just_after_trigger`, `test_secs_until_close_seal_ist_at_midnight`, `test_close_seal_constant_is_153005_ist`.
 - `crates/app/src/boot_helpers.rs::tests::ratchet_main_rs_spawns_close_time_force_seal` — source-scan (include_str! main.rs) that the close-seal spawn exists: calls `compute_close_seal_sleep(`, `force_seal_all_session_scoped(`, and carries the `is_trading_day_today()` gate inside the close-seal task block.
 - `crates/trading/src/candles/multi_tf_aggregator.rs::tests` — `test_force_seal_all_session_scoped_skips_always_on`, `test_force_seal_all_session_scoped_seals_regular_instruments`, `test_close_then_midnight_force_seal_is_idempotent` (second pass emits 0).
 - Existing aggregator + app suites stay green: `cargo test -p tickvault-trading -p tickvault-app --lib`.
@@ -65,7 +65,7 @@ Single revert of the PR restores prior behaviour (15:29 bucket waits for the mid
   - Tests: test_force_seal_all_session_scoped_skips_always_on, test_force_seal_all_session_scoped_seals_regular_instruments, test_close_then_midnight_force_seal_is_idempotent
 - [x] Add close-seal trigger-time helper + constant to boot_helpers
   - Files: crates/app/src/boot_helpers.rs
-  - Tests: test_secs_until_close_seal_at_152959_is_6s, test_secs_until_close_seal_at_exact_trigger_wraps_to_next_day, test_secs_until_close_seal_just_after_trigger, test_secs_until_close_seal_at_midnight, test_close_seal_constant_is_153005_ist
+  - Tests: test_secs_until_close_seal_ist_at_152959_is_6s, test_secs_until_close_seal_ist_at_exact_trigger_wraps_to_next_day, test_secs_until_close_seal_ist_just_after_trigger, test_secs_until_close_seal_ist_at_midnight, test_close_seal_constant_is_153005_ist
 - [x] Spawn Task 3b close-time force-seal in `spawn_engine_b_aggregator`
   - Files: crates/app/src/main.rs
   - Tests: ratchet_main_rs_spawns_close_time_force_seal

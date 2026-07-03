@@ -244,9 +244,7 @@ pub fn secs_until_close_seal_ist(now_secs_of_day: u32) -> u64 {
 /// IST time and returns the sleep until the next 15:30:05 IST trigger.
 /// Used by the close-time force-seal task (Task 3b) in `main.rs`.
 #[must_use]
-// TEST-EXEMPT: thin wall-clock read; the trigger math is unit-tested via
-// secs_until_close_seal_ist and the spawn is pinned by
-// ratchet_main_rs_spawns_close_time_force_seal.
+// TEST-EXEMPT: thin wall-clock read — trigger math unit-tested via secs_until_close_seal_ist; spawn pinned by ratchet_main_rs_spawns_close_time_force_seal.
 pub fn compute_close_seal_sleep() -> std::time::Duration {
     let now_ist = chrono::Utc::now().with_timezone(&ist_offset());
     let now_secs = now_ist.time().num_seconds_from_midnight();
@@ -558,25 +556,25 @@ mod tests {
     }
 
     #[test]
-    fn test_secs_until_close_seal_at_152959_is_6s() {
+    fn test_secs_until_close_seal_ist_at_152959_is_6s() {
         // 15:29:59 IST = 55,799s → 6 seconds before the 15:30:05 trigger.
         assert_eq!(secs_until_close_seal_ist(55_799), 6);
     }
 
     #[test]
-    fn test_secs_until_close_seal_at_exact_trigger_wraps_to_next_day() {
+    fn test_secs_until_close_seal_ist_at_exact_trigger_wraps_to_next_day() {
         // AT 15:30:05 the trigger already fired — wrap to tomorrow (never 0,
         // so the task loop cannot busy-spin on the trigger instant).
         assert_eq!(secs_until_close_seal_ist(55_805), 86_400);
     }
 
     #[test]
-    fn test_secs_until_close_seal_just_after_trigger() {
+    fn test_secs_until_close_seal_ist_just_after_trigger() {
         assert_eq!(secs_until_close_seal_ist(55_806), 86_399);
     }
 
     #[test]
-    fn test_secs_until_close_seal_at_midnight() {
+    fn test_secs_until_close_seal_ist_at_midnight() {
         assert_eq!(secs_until_close_seal_ist(0), 55_805);
     }
 
