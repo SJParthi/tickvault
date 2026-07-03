@@ -55,10 +55,13 @@ SESSION_TTL_SECS = 12 * 3600
 LINK_TOKEN_TTL_SECS = 90
 MAX_SQL_LEN = 20_000
 
-# Lambda response payload hard limit is 6 MB; cap the relayed body below it
-# (base64 inflation ~4/3 → keep the raw body ≤ ~4.1 MB after encoding; the
-# back Lambda already caps its read at this many raw bytes).
-MAX_BODY_BYTES = 5_500_000
+# Lambda's synchronous invoke response envelope is 6 MiB. base64 inflates the
+# raw body ~4/3 and it is then wrapped in the back→front JSON — so the RAW
+# QuestDB body must stay ≤ ~4.1 MB for base64+JSON to fit under 6 MiB. A larger
+# cap (e.g. 5.5 MB → base64 7.33 MB) would make the back→front invoke FAIL on a
+# HEALTHY box and the front would wrongly report 503 "box offline". The back
+# Lambda caps its read at this same value; over-cap → 502, never 503.
+MAX_BODY_BYTES = 4_100_000
 
 # Lazy-init boto3 clients so the pure-function tests run without boto3
 # installed (mirrors operator-control/handler.py).
@@ -141,15 +144,44 @@ _SQL_BANNED = (
 
 _SQL_MAX_ROWS = 1000
 
+# Read-only introspection functions the pinned QuestDB 9.3.5 web console SPA
+# calls BARE against /exec (e.g. `tables()`, `columns('ticks')`,
+# `table_columns('ticks')`). The select/show/explain/with first-word allowlist
+# alone REJECTS bare `tables()`, so the console's table tree / browse breaks.
+# This makes _is_safe_sql an INTENTIONAL read-only SUPERSET of
+# operator-control's _is_safe_sql: operator-control wraps its OWN queries in
+# SELECT so it never needs bare introspection calls; THIS passthrough console
+# does. The full _SQL_BANNED mutator scan + single-statement + no-comment +
+# row-cap rules ALL still apply, so a function call still cannot smuggle a
+# mutator.  # noqa — the exact allowed-func set is to be LIVE-VERIFIED against
+# the deployed QuestDB 9.3.5 console post-deploy.
+_SQL_ALLOWED_FUNCS = (
+    "tables",
+    "columns",
+    "table_columns",
+    "materialized_views",
+    "wal_tables",
+    "table_partitions",
+    "functions",
+    "hydrate_table_metadata",
+    "memory_metrics",
+    "reader_pool",
+    "query_activity",
+    "flush_query_cache",
+)
+
 
 def _is_safe_sql(query: str) -> bool:
-    """Read-only gate (hardened 2026-07-02). Rules, all fail-closed:
+    """Read-only gate (hardened 2026-07-02; introspection superset 2026-07-03).
+    Rules, all fail-closed:
     1. SINGLE STATEMENT: one trailing ';' is stripped; ANY remaining ';'
        rejects (closes the "select 1; <unlisted mutator>" chaining gap).
     2. NO SQL COMMENTS ('--' or '/*'): keeps the banned-word scan honest —
        comments could otherwise hide/split keywords.
-    3. First WORD must be an allowed read-only keyword (not just a prefix,
-       so "explainx ..." / "selector ..." are rejected).
+    3. First TOKEN must be an allowed read-only keyword (select/show/explain/
+       with) OR a bare call to a read-only introspection function in
+       _SQL_ALLOWED_FUNCS (e.g. `tables()`), so the QuestDB console's own
+       introspection works. "explainx ..." / "selector ..." are still rejected.
     4. No mutating keyword (whole-word) anywhere — incl. QuestDB mutators
        (BACKUP/CHECKPOINT/SNAPSHOT/...). False-positive rejects on string
        literals are accepted (fail-closed).
@@ -167,11 +199,16 @@ def _is_safe_sql(query: str) -> bool:
     # Rule 2 — no comments.
     if "--" in q or "/*" in q:
         return False
-    # Rule 3 — allowed first word.
+    # Rule 3 — allowed first token: keyword OR read-only introspection func.
     first = re.split(r"[^a-z]+", q, maxsplit=1)[0]
-    if first not in _SQL_ALLOWED_PREFIXES:
+    allowed_first = first in _SQL_ALLOWED_PREFIXES
+    if not allowed_first:
+        m = re.match(r"\s*([a-z_]+)\s*\(", q)
+        if m and m.group(1) in _SQL_ALLOWED_FUNCS:
+            allowed_first = True
+    if not allowed_first:
         return False
-    # Rule 4 — banned keywords anywhere.
+    # Rule 4 — banned keywords anywhere (still applies to func calls).
     for kw in _SQL_BANNED:
         if re.search(r"\b" + kw + r"\b", q):
             return False
@@ -342,10 +379,35 @@ def _session_redirect(secret: str, now_epoch: int) -> dict:
 # else is dropped — deny-by-default).
 _PASSTHROUGH_PARAMS = ("limit", "count", "nm", "timings", "explain", "src", "version")
 
+# Query params forwarded on STATIC / /chk / console paths. The raw
+# rawQueryString is NEVER forwarded on these paths (a `?query=drop...` on a
+# static path must not reach QuestDB) — only this whitelist passes.
+_STATIC_ALLOWED_PARAMS = ("f", "j", "v", "version", "nm", "src")
+
 _STATIC_EXTS = (
     ".html", ".js", ".css", ".svg", ".png", ".woff2", ".ico", ".map", ".json",
     ".txt", ".webmanifest",
 )
+
+
+def _bad_path(raw_path: str) -> bool:
+    """Path-confusion / traversal reject, run BEFORE any classification.
+    True = reject outright. Checks the raw path AND its URL-decoded form for
+    traversal (`..`), collapsed separators (`//`), backslashes, encoded
+    separators (%2e / %2f / %5c, any case), and ASCII control chars — so
+    tricks like `/assets/../exec`, `%2e%2e%2fexec`, `/exec/../imp` can never
+    reach the classifier and be mis-read as static (or bypass the SQL gate)."""
+    raw = raw_path or ""
+    low = raw.lower()
+    if "%2e" in low or "%2f" in low or "%5c" in low:
+        return True
+    forms = [raw, urllib.parse.unquote(raw)]
+    for f in forms:
+        if ".." in f or "//" in f or "\\" in f:
+            return True
+        if any(ord(ch) < 0x20 for ch in f):
+            return True
+    return False
 
 
 def _classify_path(method: str, path: str) -> str:
@@ -409,6 +471,14 @@ def _build_sql_raw_query(path: str, params: dict) -> tuple[str, str] | dict:
     return capped, urllib.parse.urlencode(fwd)
 
 
+def _build_static_query(params: dict) -> str:
+    """Forward ONLY a whitelisted param set on static / /chk / console paths —
+    NEVER the raw rawQueryString (so a `?query=drop...` smuggled onto a static
+    path cannot reach QuestDB)."""
+    fwd = {k: str(params[k]) for k in _STATIC_ALLOWED_PARAMS if params.get(k) is not None}
+    return urllib.parse.urlencode(fwd)
+
+
 # ------------------------------------------------------------------ back relay
 
 
@@ -448,7 +518,7 @@ def _relay(method: str, path: str, raw_query: str, headers: dict) -> dict:
     )
     err = back.get("err")
     if err == "too_large":
-        return _json_resp(502, {"error": "response too large (>5.5MB) — narrow the query"})
+        return _json_resp(502, {"error": "response too large (>4.1MB) — narrow the query"})
     if err:
         return _json_resp(503, {"error": _OFFLINE_MSG})
     resp_headers = {"cache-control": "no-store"}
@@ -458,7 +528,7 @@ def _relay(method: str, path: str, raw_query: str, headers: dict) -> dict:
             resp_headers[k] = v
     body_b64 = back.get("body_b64", "") or ""
     if len(body_b64) > int(MAX_BODY_BYTES * 4 / 3) + 8:
-        return _json_resp(502, {"error": "response too large (>5.5MB) — narrow the query"})
+        return _json_resp(502, {"error": "response too large (>4.1MB) — narrow the query"})
     return {
         "statusCode": int(back.get("status", 200)),
         "headers": resp_headers,
@@ -505,6 +575,12 @@ def lambda_handler(event, _context):
     path = _path(event)
     params = event.get("queryStringParameters") or {}
     secret = _control_secret()
+
+    # ---- path-confusion / traversal reject FIRST (before /open, /login, auth,
+    # and any classification) — deny-by-default, leaks nothing.
+    if _bad_path(path):
+        _log(path, method, "denied_path", 403)
+        return _json_resp(403, {"error": "path not allowed on the read-only console"})
 
     # ---- unauthenticated endpoints: /open (link token) + /login (paste key)
     if method == "GET" and path == "/open":
@@ -555,8 +631,10 @@ def lambda_handler(event, _context):
         _log(path, method, "back_error" if resp["statusCode"] >= 502 else "ok", resp["statusCode"], capped_query)
         return resp
 
-    # static shell/assets/chk/settings(read) passthrough
-    raw_query = event.get("rawQueryString", "") or ""
+    # static shell/assets/chk/settings(read) passthrough — forward ONLY a
+    # whitelisted param set, NEVER the raw rawQueryString (so `?query=drop...`
+    # smuggled onto a static path cannot reach QuestDB).
+    raw_query = _build_static_query(params)
     resp = _relay(method, path, raw_query, event.get("headers") or {})
     _log(path, method, "back_error" if resp["statusCode"] >= 502 else "ok", resp["statusCode"])
     return resp
