@@ -36,9 +36,18 @@ pub const QUESTDB_TABLE_GROWW_SCALE_AUDIT: &str = "groww_scale_audit";
 /// timestamp partition column `trading_date_ist` is mandatory; `ts` keeps two
 /// rapid same-second transitions distinct; `from_conns`/`to_conns`/`outcome`
 /// make each lifecycle-chain row survive its siblings (a rollback row never
-/// overwrites the advance row that triggered it). No `security_id` — the
-/// ladder is fleet-level, not per-instrument, so I-P1-11 does not apply.
-pub const DEDUP_KEY_GROWW_SCALE_AUDIT: &str = "trading_date_ist, ts, from_conns, to_conns, outcome";
+/// overwrites the advance row that triggered it). `feed` is in-key per the
+/// operator override 2026-06-28 (feed-in-key EVERYWHERE, `data-integrity.md`)
+/// — the ladder is Groww-only today, so every row stamps
+/// [`GROWW_SCALE_AUDIT_FEED`], but the key stays future-proof for any other
+/// feed's scale ladder. No `security_id` — the ladder is fleet-level, not
+/// per-instrument, so I-P1-11 does not apply.
+pub const DEDUP_KEY_GROWW_SCALE_AUDIT: &str =
+    "trading_date_ist, ts, from_conns, to_conns, outcome, feed";
+
+/// The `feed` SYMBOL value every ladder row stamps — the auto-scale ladder is
+/// a Groww-only subsystem (§34 of `groww-second-feed-scope-2026-06-19.md`).
+pub const GROWW_SCALE_AUDIT_FEED: &str = "groww";
 
 /// Ladder-transition outcome labels (SYMBOL column, stable wire format —
 /// the rehydration reader in the app crate matches on these strings).
@@ -166,6 +175,54 @@ pub async fn ensure_groww_scale_audit_table(questdb_config: &QuestDbConfig) {
             );
         }
     }
+
+    // Feed-in-key self-heal (operator override 2026-06-28 — data-integrity.md
+    // "feed-in-key EVERYWHERE"). Additive + idempotent, IN THIS ORDER:
+    // ADD COLUMN → backfill NULL→'groww' → re-enable DEDUP with `feed` in the
+    // key. The CREATE above already ships the column+key on greenfield; these
+    // run for tables created before this change. The backfill MUST precede the
+    // DEDUP-ENABLE so a re-keyed table upserts over a legacy NULL-feed row
+    // instead of duplicating it. Never drops the table (SEBI retention).
+    let self_heal = [
+        format!(
+            "ALTER TABLE {QUESTDB_TABLE_GROWW_SCALE_AUDIT} ADD COLUMN IF NOT EXISTS feed SYMBOL;"
+        ),
+        format!(
+            "UPDATE {QUESTDB_TABLE_GROWW_SCALE_AUDIT} SET feed = '{GROWW_SCALE_AUDIT_FEED}' \
+             WHERE feed IS NULL;"
+        ),
+        format!(
+            "ALTER TABLE {QUESTDB_TABLE_GROWW_SCALE_AUDIT} DEDUP ENABLE \
+             UPSERT KEYS({DEDUP_KEY_GROWW_SCALE_AUDIT});"
+        ),
+    ];
+    for ddl in &self_heal {
+        match client
+            .get(&base_url)
+            .query(&[("query", ddl.as_str())])
+            .send()
+            .await
+        {
+            Ok(resp) if resp.status().is_success() => {}
+            Ok(resp) => {
+                let status = resp.status();
+                error!(
+                    %status,
+                    ddl = ddl.as_str(),
+                    table = QUESTDB_TABLE_GROWW_SCALE_AUDIT,
+                    "groww_scale_audit feed self-heal returned non-2xx"
+                );
+            }
+            Err(err) => {
+                error!(
+                    error = %err,
+                    ddl = ddl.as_str(),
+                    table = QUESTDB_TABLE_GROWW_SCALE_AUDIT,
+                    "groww_scale_audit feed self-heal request failed"
+                );
+            }
+        }
+    }
 }
 
 /// The full CREATE DDL (extracted for unit pinning).
@@ -180,7 +237,8 @@ pub fn groww_scale_audit_ddl() -> String {
             state SYMBOL, \
             outcome SYMBOL, \
             reason STRING, \
-            gate_snapshot STRING\
+            gate_snapshot STRING, \
+            feed SYMBOL\
         ) timestamp(ts) PARTITION BY DAY WAL \
         DEDUP UPSERT KEYS({DEDUP_KEY_GROWW_SCALE_AUDIT});"
     )
@@ -189,7 +247,7 @@ pub fn groww_scale_audit_ddl() -> String {
 /// Column list for the INSERT (kept adjacent to the DDL so drift is visible
 /// in one screenful).
 const INSERT_COLUMN_LIST: &str =
-    "ts, trading_date_ist, from_conns, to_conns, state, outcome, reason, gate_snapshot";
+    "ts, trading_date_ist, from_conns, to_conns, state, outcome, reason, gate_snapshot, feed";
 
 /// PURE: one `(...)` VALUES tuple for the row. `outcome` is a compile-time
 /// static label (provably SQL-safe); `state`/`reason`/`gate_snapshot` are
@@ -210,7 +268,8 @@ pub fn format_scale_row_values_tuple(row: &GrowwScaleAuditRow<'_>) -> String {
     let to_conns = row.to_conns;
     format!(
         "({ts_micros}, {trading_date_micros}, {from_conns}, {to_conns}, \
-          '{state}', '{outcome}', '{reason}', '{gate_snapshot}')"
+          '{state}', '{outcome}', '{reason}', '{gate_snapshot}', \
+          '{GROWW_SCALE_AUDIT_FEED}')"
     )
 }
 
@@ -312,6 +371,18 @@ mod tests {
         assert!(DEDUP_KEY_GROWW_SCALE_AUDIT.contains("outcome"));
         assert!(DEDUP_KEY_GROWW_SCALE_AUDIT.contains("from_conns"));
         assert!(DEDUP_KEY_GROWW_SCALE_AUDIT.contains("to_conns"));
+        // feed-in-key (operator override 2026-06-28, data-integrity.md).
+        assert!(DEDUP_KEY_GROWW_SCALE_AUDIT.contains("feed"));
+    }
+
+    #[test]
+    fn test_feed_constant_is_groww_and_stamped_in_tuple() {
+        assert_eq!(GROWW_SCALE_AUDIT_FEED, "groww");
+        let tuple = format_scale_row_values_tuple(&sample_row());
+        assert!(
+            tuple.ends_with("'groww')"),
+            "row tuple must stamp feed='groww' as the last value: {tuple}"
+        );
     }
 
     #[test]
@@ -348,6 +419,7 @@ mod tests {
             "outcome SYMBOL",
             "reason STRING",
             "gate_snapshot STRING",
+            "feed SYMBOL",
             "DEDUP UPSERT KEYS",
             "PARTITION BY DAY WAL",
         ] {
