@@ -53,6 +53,25 @@ resource "aws_iam_role_policy" "deploy_watchdog" {
         Resource = aws_sns_topic.tv_alerts.arn
       },
       {
+        # B9 deploy provenance: read the deployed-binary git SHA (written
+        # by deploy-aws.yml after a verified swap) to compare against main
+        # HEAD for the tv_binary_main_sha_mismatch metric.
+        Effect   = "Allow"
+        Action   = ["ssm:GetParameter"]
+        Resource = "arn:aws:ssm:${var.aws_region}:*:parameter/tickvault/${var.environment}/deploy/binary-git-sha"
+      },
+      {
+        # B9 deploy provenance: publish the mismatch metric. PutMetricData
+        # supports no resource-level scoping — constrain by namespace so
+        # this Lambda can only ever write Tickvault/Prod metrics.
+        Effect   = "Allow"
+        Action   = ["cloudwatch:PutMetricData"]
+        Resource = "*"
+        Condition = {
+          StringEquals = { "cloudwatch:namespace" = "Tickvault/Prod" }
+        }
+      },
+      {
         Effect = "Allow"
         Action = [
           "logs:CreateLogGroup",
@@ -95,6 +114,8 @@ resource "aws_lambda_function" "deploy_watchdog" {
       OPERATOR_GITHUB_TOKEN_PARAM = "/tickvault/${var.environment}/operator/github-token"
       ALERTS_TOPIC_ARN            = aws_sns_topic.tv_alerts.arn
       LOG_LEVEL                   = "INFO"
+      # B9 deploy provenance: deployed-binary sha param (deploy-aws.yml writes it).
+      BINARY_SHA_PARAM = "/tickvault/${var.environment}/deploy/binary-git-sha"
     }
   }
 
@@ -205,7 +226,48 @@ resource "aws_lambda_permission" "deploy_watchdog_instance_start" {
   source_arn    = aws_cloudwatch_event_rule.deploy_watchdog_instance_start.arn
 }
 
+# ---------------------------------------------------------------------------
+# B9 deploy provenance — binary-vs-main staleness alarm
+#
+# The watchdog publishes tv_binary_main_sha_mismatch (1.0 = the deployed
+# binary's SHA differs from main HEAD, 0.0 = in sync; SKIPPED when either
+# SHA is unknown) on every fire — ~2-3 samples/weekday (instance-start +
+# 08:50 + 15:51 IST crons).
+#
+# Alarm semantics: statistic Minimum over ONE 86400s (24h) period >= 1
+# means EVERY sample in the day reported mismatch — i.e. the box ran stale
+# code across the whole day's watchdog samples. At the ~2-3 samples/day
+# cadence this APPROXIMATES ">24h stale" (documented honestly — it is not
+# an exact wall-clock measurement). treat_missing_data = notBreaching:
+# box off / weekends / unknown-sha skips never page.
+# ---------------------------------------------------------------------------
+resource "aws_cloudwatch_metric_alarm" "binary_sha_stale" {
+  alarm_name          = "tv-${var.environment}-binary-sha-stale"
+  alarm_description   = "Running binary git SHA has differed from main HEAD for a full 24h window — deploy pipeline is stuck or bypassed; runbook: check deploy-aws.yml runs + SSM /tickvault/prod/deploy/binary-git-sha (see .claude/rules/project/deploy-provenance.md)"
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  evaluation_periods  = 1
+  metric_name         = "tv_binary_main_sha_mismatch"
+  namespace           = "Tickvault/Prod"
+  period              = 86400
+  statistic           = "Minimum"
+  threshold           = 1
+  dimensions          = { host = "tickvault-prod" }
+  treat_missing_data  = "notBreaching"
+  alarm_actions       = [aws_sns_topic.tv_alerts.arn]
+  ok_actions          = [aws_sns_topic.tv_alerts.arn]
+
+  tags = {
+    Project = "tickvault"
+    Layer   = "L2-VERIFY"
+  }
+}
+
 output "deploy_watchdog_function_name" {
   description = "Deploy-watchdog Lambda name (covers GitHub-cron auto-deploy misses)"
   value       = aws_lambda_function.deploy_watchdog.function_name
+}
+
+output "binary_sha_stale_alarm_name" {
+  description = "B9 deploy provenance: CloudWatch alarm firing when the deployed binary's git SHA lags main HEAD across a full 24h of watchdog samples"
+  value       = aws_cloudwatch_metric_alarm.binary_sha_stale.alarm_name
 }

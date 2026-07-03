@@ -72,6 +72,17 @@ GH_DISPATCH_WORKFLOW = os.environ.get("GH_DISPATCH_WORKFLOW", "deploy-aws-after-
 _GH_TOKEN_PARAM = os.environ.get("OPERATOR_GITHUB_TOKEN_PARAM", "")
 ALERTS_TOPIC_ARN = os.environ.get("ALERTS_TOPIC_ARN", "")
 
+# B9 deploy provenance: SSM param holding the git SHA of the last
+# successfully deployed binary (written by deploy-aws.yml post-swap), and
+# the CloudWatch metric the tv-<env>-binary-sha-stale alarm evaluates.
+# PutMetricData is called DIRECTLY (bypasses the Prometheus→EMF allowlist
+# in user-data.sh.tftpl by design — this metric originates in the Lambda,
+# not the app).
+_BINARY_SHA_PARAM = os.environ.get("BINARY_SHA_PARAM", "/tickvault/prod/deploy/binary-git-sha")
+_MISMATCH_METRIC_NAMESPACE = "Tickvault/Prod"
+_MISMATCH_METRIC_NAME = "tv_binary_main_sha_mismatch"
+_MISMATCH_METRIC_HOST = "tickvault-prod"
+
 # --------------------------------------------------------------------------- #
 # Pure decision logic (no IO — unit-tested in test_handler.py)
 # --------------------------------------------------------------------------- #
@@ -90,6 +101,32 @@ def is_stale(desired_sha: str | None, deployed_sha: str | None) -> bool:
     if not desired_sha or not deployed_sha:
         return False
     return desired_sha.strip() != deployed_sha.strip()
+
+
+def binary_mismatch_value(binary_sha: str | None, desired_sha: str | None) -> float | None:
+    """B9 deploy provenance — value for the tv_binary_main_sha_mismatch metric.
+
+    Returns:
+      * 1.0  — both shas are KNOWN and differ (running binary != main HEAD)
+      * 0.0  — both shas are KNOWN and equal (healthy)
+      * None — either sha is unknown/empty/"unknown" → SKIP publishing (no
+        false signal on uncertainty; the alarm treats missing data as
+        notBreaching, so a skipped sample never pages)
+
+    Comparison is normalized to the lowercase first-7 characters so a full
+    40-hex sha and a conventional short sha compare correctly.
+    """
+
+    def norm(sha: str | None) -> str:
+        s = (sha or "").strip().lower()
+        if not s or s == "unknown":
+            return ""
+        return s[:7]
+
+    b, d = norm(binary_sha), norm(desired_sha)
+    if not b or not d:
+        return None
+    return 0.0 if b == d else 1.0
 
 
 # --------------------------------------------------------------------------- #
@@ -183,6 +220,51 @@ def _dispatch_deploy() -> bool:
     return ok
 
 
+def _binary_sha() -> str | None:
+    """Deployed-binary git SHA from SSM (B9 deploy provenance). Read fresh
+    on every invocation (NOT via the token cache — the value changes on
+    every deploy and Lambda containers persist across invocations)."""
+    if not _BINARY_SHA_PARAM:
+        return None
+    try:
+        import boto3
+
+        ssm = boto3.client("ssm")
+        val = ssm.get_parameter(Name=_BINARY_SHA_PARAM)["Parameter"]["Value"]
+        return val.strip() or None
+    except Exception as exc:  # noqa: BLE001 — watchdog must never crash
+        logger.warning("could not read binary sha param %s: %s", _BINARY_SHA_PARAM, exc)
+        return None
+
+
+def _publish_binary_mismatch_metric(desired_sha: str | None) -> None:
+    """B9 deploy provenance: publish tv_binary_main_sha_mismatch so the
+    tv-<env>-binary-sha-stale alarm (Minimum >= 1 over 24h) can detect a
+    running binary that lags main HEAD for a full day. Wrapped so the
+    watchdog's core stale-deploy dispatch job NEVER breaks on metric IO."""
+    try:
+        value = binary_mismatch_value(_binary_sha(), desired_sha)
+        if value is None:
+            logger.info("binary/main mismatch metric skipped — a sha is unknown")
+            return
+        import boto3
+
+        boto3.client("cloudwatch").put_metric_data(
+            Namespace=_MISMATCH_METRIC_NAMESPACE,
+            MetricData=[
+                {
+                    "MetricName": _MISMATCH_METRIC_NAME,
+                    "Dimensions": [{"Name": "host", "Value": _MISMATCH_METRIC_HOST}],
+                    "Value": value,
+                    "Unit": "None",
+                }
+            ],
+        )
+        logger.info("published %s=%s", _MISMATCH_METRIC_NAME, value)
+    except Exception as exc:  # noqa: BLE001 — watchdog must never crash
+        logger.error("put_metric_data for %s failed: %s", _MISMATCH_METRIC_NAME, exc)
+
+
 def _publish(subject: str, message: str) -> None:
     if not ALERTS_TOPIC_ARN:
         logger.warning("ALERTS_TOPIC_ARN unset — cannot publish: %s", subject)
@@ -204,6 +286,9 @@ def lambda_handler(event: dict[str, Any], _context: Any = None) -> dict[str, Any
     """Entry point. Idempotent — safe to run on every 5-minutes-after schedule."""
     window = (event or {}).get("window", "unknown")
     desired = _desired_sha()
+    # B9 deploy provenance: sample binary-vs-main drift on every fire (the
+    # 24h alarm needs samples; a None value is silently skipped).
+    _publish_binary_mismatch_metric(desired)
     deployed = _deployed_sha()
     stale = is_stale(desired, deployed)
     logger.info(
