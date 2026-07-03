@@ -329,9 +329,12 @@ fn bench_composite(c: &mut Criterion) {
 }
 
 /// REAL writer against a local TCP drain: measures
-/// `append_tick_with_seq` including the amortized 1-in-1000 `force_flush()`
-/// TCP write (syscall + in_flight clear), exactly as it lands inside the
-/// live timed region. Self-skips when the sandbox forbids loopback sockets.
+/// `append_tick_with_seq` including the amortized 1-in-1000 batch handoff.
+/// B6 (2026-07-03): the batch flush is now handed to the off-thread
+/// tick-flush-worker (O(1) buffer swap) instead of a blocking inline TCP
+/// write, so this bench measures the offloaded hot path — the residual
+/// 1-in-1000 cost is the swap + channel send, not the flush I/O.
+/// Self-skips when the sandbox forbids loopback sockets.
 fn bench_writer_append_amortized_flush(c: &mut Criterion) {
     install_prometheus_recorder();
     let Ok(listener) = std::net::TcpListener::bind("127.0.0.1:0") else {
@@ -372,6 +375,133 @@ fn bench_writer_append_amortized_flush(c: &mut Criterion) {
     });
 }
 
+/// B6 (2026-07-03) — the 10µs-gated TRUE-COMPUTE bench: the full live-loop
+/// chain (parse → heartbeat → gap detector → canary → enricher → REAL
+/// `append_tick_with_seq` under the off-thread flush offload → broadcast →
+/// monotonicity guard → histogram records incl. the compute split). Flush
+/// I/O runs on the worker thread, NOT in the measured thread — this is the
+/// steady-state per-tick hot path the operator's p50 ≈ 30µs claim refers
+/// to. Budget: `composite_quote_tick_compute_only = 10000` ns in
+/// `quality/benchmark-budgets.toml`, enforced by `scripts/bench-gate.sh`.
+/// Self-skips when the sandbox forbids loopback sockets.
+fn bench_composite_compute_only(c: &mut Criterion) {
+    let handle = install_prometheus_recorder();
+    let Ok(listener) = std::net::TcpListener::bind("127.0.0.1:0") else {
+        return;
+    };
+    let Ok(addr) = listener.local_addr() else {
+        return;
+    };
+    // Multi-accept drain: the writer AND its off-thread flush worker each
+    // open one ILP TCP connection.
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut s) = stream else { return };
+            std::thread::spawn(move || {
+                let mut sink = [0_u8; 65_536];
+                while let Ok(n) = s.read(&mut sink) {
+                    if n == 0 {
+                        break;
+                    }
+                }
+            });
+        }
+    });
+    let cfg = QuestDbConfig {
+        host: "127.0.0.1".to_string(),
+        http_port: 0,
+        pg_port: 0,
+        ilp_port: addr.port(),
+    };
+    let Ok(mut writer) = TickPersistenceWriter::new(&cfg) else {
+        return;
+    };
+
+    let packet = build_quote_packet(13);
+    let m_frames = metrics::counter!("bench_co_frames_total");
+    let m_ticks = metrics::counter!("bench_co_ticks_total");
+    let m_persisted = metrics::counter!("bench_co_persisted_total");
+    let m_tick_duration = metrics::histogram!("bench_co_tick_duration_ns");
+    let m_tick_compute = metrics::histogram!("bench_co_tick_compute_ns");
+    let m_wire_to_done = metrics::histogram!("bench_co_wire_to_done_ns");
+    let heartbeat = AtomicI64::new(0);
+    let detector = TickGapDetector::new(30);
+    let enricher = TickEnricher::new();
+    let mut mono_guard = VolumeMonotonicityGuard::new();
+    let (sender, receiver) = tokio::sync::broadcast::channel::<ParsedTick>(262_144);
+    let _keep_alive = receiver;
+    let canary_sids: [u64; 3] = [13, 25, 51];
+    let mut seq: i64 = 1;
+
+    c.bench_function("composite/quote_tick_compute_only", |b| {
+        b.iter(|| {
+            let tick_start = std::time::Instant::now();
+            m_frames.increment(1);
+            let received_at_nanos = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+
+            let Ok(parsed) = dispatch_frame(black_box(&packet), received_at_nanos) else {
+                return;
+            };
+            let tickvault_core::parser::ParsedFrame::Tick(tick) = parsed else {
+                return;
+            };
+            m_ticks.increment(1);
+
+            heartbeat.store(
+                received_at_nanos.saturating_div(1_000_000_000),
+                Ordering::Relaxed,
+            );
+
+            if let Some(seg) = ExchangeSegment::from_byte(tick.exchange_segment_code) {
+                detector.record_tick(tick.security_id, seg, tick_start);
+            }
+
+            for sid in &canary_sids {
+                if *sid == tick.security_id {
+                    #[allow(clippy::cast_precision_loss)]
+                    // APPROVED: epoch seconds are exactly representable in f64
+                    {
+                        black_box(received_at_nanos.saturating_div(1_000_000_000) as f64);
+                    }
+                    break;
+                }
+            }
+
+            let secs_of_day = tick.exchange_timestamp % 86_400;
+            let enriched = enricher.enrich_tick(&tick, secs_of_day);
+            black_box(enriched.volume_delta);
+
+            // REAL writer under the B6 off-thread flush offload — at the
+            // 1-in-1000 batch boundary this is an O(1) buffer swap +
+            // bounded-channel send; the TCP flush happens on the worker.
+            seq = seq.wrapping_add(1);
+            let _ = black_box(writer.append_tick_with_seq(&tick, seq));
+            m_persisted.increment(1);
+
+            let _ = sender.send(tick);
+
+            let _ = mono_guard.observe(tick.security_id, tick.exchange_segment_code, tick.volume);
+
+            // Trailing records — mirrors the live loop's B6 split exactly.
+            let total_elapsed_ns =
+                u64::try_from(tick_start.elapsed().as_nanos()).unwrap_or(u64::MAX);
+            #[allow(clippy::cast_precision_loss)] // APPROVED: same cast as live loop
+            m_tick_duration.record(total_elapsed_ns as f64);
+            let stall_ns = writer.take_last_stall_ns();
+            #[allow(clippy::cast_precision_loss)] // APPROVED: same cast as live loop
+            m_tick_compute.record(total_elapsed_ns.saturating_sub(stall_ns) as f64);
+            let wire_elapsed = chrono::Utc::now()
+                .timestamp_nanos_opt()
+                .unwrap_or(0)
+                .saturating_sub(received_at_nanos);
+            #[allow(clippy::cast_precision_loss)] // APPROVED: same cast as live loop
+            m_wire_to_done.record(wire_elapsed.max(0) as f64);
+        });
+    });
+    // Drain the accumulated histogram samples (hostile-review HIGH #1).
+    drop(handle.render());
+}
+
 criterion_group!(
     benches,
     bench_clock_reads,
@@ -384,5 +514,6 @@ criterion_group!(
     bench_metrics_ops,
     bench_composite,
     bench_writer_append_amortized_flush,
+    bench_composite_compute_only,
 );
 criterion_main!(benches);
