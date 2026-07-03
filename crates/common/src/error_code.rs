@@ -244,6 +244,15 @@ pub enum ErrorCode {
     /// durable-loss signal — previously this arm returned silently.
     /// Severity::Critical.
     WsSpill02FrameDropped,
+    /// TICK-FLUSH-01: the off-thread tick ILP flush worker died (panic or a
+    /// fatal return) and the supervisor respawned it — mirrors WS-SPILL-01
+    /// (WAL writer) and WS-GAP-05 (pool supervisor). Self-healing: the
+    /// respawn re-enters the loop with the SAME channels, so queued flush
+    /// batches survive and the writer's `append` never sees `Disconnected`.
+    /// B6 (2026-07-03): this worker is what keeps the blocking questdb ILP
+    /// TCP flush OFF the tick-consumer thread. Severity::High (a flapping
+    /// flush worker means QuestDB ILP or the host is degrading).
+    TickFlush01WorkerRespawn,
     /// PROC-01: an OOM kill was detected — the cgroup-v2 `memory.events`
     /// `oom_kill` counter rose above the boot-time baseline. Some process in
     /// this cgroup (tickvault itself or a sidecar) was killed by the kernel
@@ -740,6 +749,7 @@ impl ErrorCode {
             Self::DiskWatcher01Respawned => "DISK-WATCHER-01",
             Self::WsSpill01WriterRespawn => "WS-SPILL-01",
             Self::WsSpill02FrameDropped => "WS-SPILL-02",
+            Self::TickFlush01WorkerRespawn => "TICK-FLUSH-01",
             Self::Proc01OomKillDetected => "PROC-01",
             Self::AuthGap03TokenForceRenewedOnWake => "AUTH-GAP-03",
             Self::AuthGap04TotpRotatedExternally => "AUTH-GAP-04",
@@ -923,6 +933,9 @@ impl ErrorCode {
             | Self::WsGap07LiveChannelClosed
             // WS-SPILL-01 — WAL writer respawned (flapping writer = disk dying)
             | Self::WsSpill01WriterRespawn
+            // TICK-FLUSH-01 — off-thread tick flush worker respawned (B6);
+            // flapping = QuestDB ILP / host degrading
+            | Self::TickFlush01WorkerRespawn
             // DHAN-LANE-01/02/03 — runtime Dhan-lane cold-start failures (D2b
             // 2026-06-26): a failed cold-start returns the FSM to Off + pages
             // the operator, never a half-running lane. High (operator must
@@ -1047,6 +1060,10 @@ impl ErrorCode {
             | Self::PrevClose04CacheEmptyAtBoot => ".claude/rules/project/wave-1-error-codes.md",
             Self::WsSpill01WriterRespawn | Self::WsSpill02FrameDropped => {
                 ".claude/rules/project/ws-frame-spill-error-codes.md"
+            }
+            // B6 (2026-07-03): off-thread tick ILP flush worker
+            Self::TickFlush01WorkerRespawn => {
+                ".claude/rules/project/tick-flush-worker-error-codes.md"
             }
             Self::WsGap04PostCloseSleep
             | Self::WsGap05PoolRespawn
@@ -1258,6 +1275,7 @@ impl ErrorCode {
             Self::DiskWatcher01Respawned,
             Self::WsSpill01WriterRespawn,
             Self::WsSpill02FrameDropped,
+            Self::TickFlush01WorkerRespawn,
             Self::Proc01OomKillDetected,
             Self::AuthGap03TokenForceRenewedOnWake,
             Self::AuthGap04TotpRotatedExternally,
@@ -1609,9 +1627,8 @@ mod tests {
         // (OOM-kill monitor — cgroup-v2 memory.events oom_kill vs boot baseline).
         // 2026-07-01 (audit sweep): bumped 111 -> 115 for AUTH-GAP-04 (AUTH-P11)
         // + RESOURCE-01/02/03 (BP-08 fd / RSS / spill-free monitors).
-        // 2026-07-03 (SLO publisher supervisor): bumped 115 -> 116 for SLO-03
-        // (the 10s tv_realtime_guarantee_score publisher died silently at
-        // 10:35 IST mid-market; now supervised + respawned).
+        // 2026-07-03 (B6 latency-histogram split): bumped 115 -> 116 for
+        // TICK-FLUSH-01 (off-thread tick ILP flush worker respawned).
         assert_eq!(ErrorCode::all().len(), 116);
     }
 
@@ -1674,6 +1691,8 @@ mod tests {
                 || s.starts_with("VOLUME-")
                 // DHAN-REST-400 (2026-06-10): scheduled REST-health canary.
                 || s.starts_with("REST-CANARY-")
+                // B6 (2026-07-03): off-thread tick ILP flush worker.
+                || s.starts_with("TICK-FLUSH-")
                 // PR #450 commit 8b (2026-05-03): prev_oi cache state.
                 || s.starts_with("PREVOI-")
                 // Wave 6 Sub-PR #1: multi-TF aggregator + boundary timer.
