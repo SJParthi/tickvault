@@ -1796,6 +1796,80 @@ class TickConservationShield(unittest.TestCase):
         self.assertIn("tc.envelope", html)
 
 
+class QdbConsoleUrlAction(unittest.TestCase):
+    """B4: the `qdb_console_url` action mints a 90s one-click HMAC link to the
+    QuestDB console front Lambda (env QDB_CONSOLE_URL, TF-injected)."""
+
+    SECRET = "s3cret-token"
+
+    def setUp(self) -> None:
+        self._orig = handler._control_secret
+        handler._control_secret = lambda: self.SECRET  # type: ignore[assignment]
+        self._env = os.environ.pop("QDB_CONSOLE_URL", None)
+
+    def tearDown(self) -> None:
+        handler._control_secret = self._orig  # type: ignore[assignment]
+        if self._env is not None:
+            os.environ["QDB_CONSOLE_URL"] = self._env
+        else:
+            os.environ.pop("QDB_CONSOLE_URL", None)
+
+    def _dispatch(self) -> dict:
+        ev = {
+            "requestContext": {"http": {"method": "POST"}},
+            "headers": {"authorization": f"Bearer {self.SECRET}"},
+            "body": json.dumps({"action": "qdb_console_url"}),
+        }
+        return handler.lambda_handler(ev, None)
+
+    def test_qdb_console_url_disabled_returns_error(self) -> None:
+        # Console not deployed (env empty) → honest error, no fake URL.
+        resp = self._dispatch()
+        self.assertEqual(resp["statusCode"], 400)
+        self.assertIn("console not enabled", json.loads(resp["body"])["error"])
+
+    def test_qdb_console_url_enabled_returns_signed_link(self) -> None:
+        import hashlib
+        import hmac as hmac_mod
+        import time as time_mod
+
+        os.environ["QDB_CONSOLE_URL"] = "https://console.example.test/"
+        before = int(time_mod.time())
+        resp = self._dispatch()
+        after = int(time_mod.time())
+        self.assertEqual(resp["statusCode"], 200)
+        url = json.loads(resp["body"])["url"]
+        # trailing slash on the env base must not produce '//open'
+        self.assertTrue(url.startswith("https://console.example.test/open?tok="), url)
+        tok = url.split("tok=", 1)[1]
+        exp_s, _, sig = tok.partition(".")
+        exp = int(exp_s)
+        # ~90s TTL (token shape + expiry ratchet)
+        self.assertGreaterEqual(exp, before + handler._QDB_LINK_TTL_SECS)
+        self.assertLessEqual(exp, after + handler._QDB_LINK_TTL_SECS)
+        expected = hmac_mod.new(
+            self.SECRET.encode(), f"qdblink|{exp}".encode(), hashlib.sha256
+        ).hexdigest()
+        self.assertEqual(sig, expected)
+
+    def test_mint_helper_ttl_constant_is_90(self) -> None:
+        self.assertEqual(handler._QDB_LINK_TTL_SECS, 90)
+
+    def test_html_has_qdb_console_button(self) -> None:
+        html = handler._console_html()
+        self.assertIn("Open QuestDB Console", html)
+        self.assertIn("qdb_console_url", html)
+        self.assertIn("openQdbConsole", html)
+
+    def test_qdb_console_open_is_popup_safe(self) -> None:
+        # FIX 4: the window must be opened SYNCHRONOUSLY in the click, before
+        # the await, then navigated — so the browser popup blocker allows it.
+        html = handler._console_html()
+        self.assertIn("window.open('','_blank')", html)
+        self.assertIn("w.location=j.url", html)
+        self.assertIn("w.close()", html)
+
+
 class DeployProvenance(unittest.TestCase):
     """B9 deploy provenance — pure formatter + fail-soft GET contract."""
 
