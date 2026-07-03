@@ -17,7 +17,22 @@
 > Saved verbatim 1:1 for reference. The SDK is **reference for the protocol + data
 > shapes only** — we do NOT depend on or vendor the Python package.
 
-## Files
+## Official doc pack (operator-uploaded 2026-07-03 — prefer these where they overlap)
+
+Captured verbatim from `https://groww.in/trade-api/docs/python-sdk` on
+2026-07-03 (SDK 1.5.0, scripted 100%-match verification per page). Index:
+[`00-INDEX.md`](./00-INDEX.md).
+
+| File | What it covers |
+|---|---|
+| `00-INDEX.md` | Index of the 26-page official capture + key facts (1000-subscription cap wording, rate limits, MCX contradiction) |
+| `01-introduction-auth-ratelimits.md` | Getting started, API key/auth, rate limits |
+| `07-feed-websocket-streaming.md` | **Official** `GrowwFeed` streaming docs: subscribe_ltp / subscribe_index_value / market depth / order + position updates; payload shapes |
+| `09-instruments-csv.md` | instrument.csv, exchange tokens, DataFrame helpers |
+| `12-sdk-exceptions.md` | SDK exception classes |
+| `13-annexures-enums.md` | All enums: exchange, segment, product, order type, validity, statuses |
+
+## Files (2026-06 capture + reverse-read wire notes)
 
 | File | What it covers |
 |---|---|
