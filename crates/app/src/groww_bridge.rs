@@ -3272,6 +3272,503 @@ mod tests {
         }
     }
 
+    // ── B2 (2026-07-03): re-tail/resume crash-recovery suite ──────────────
+    //
+    // The Groww lane has NO WAL — the NDJSON re-tail/resume IS its entire
+    // crash-recovery mechanism, so the mechanics below are EXECUTED (not just
+    // source-pinned): offset tracking + partial-line residual completion,
+    // shrink/rotation reset, mid-file snapshot resume, the rotated-archive
+    // tail drain, and every fail-closed byte-0 branch.
+    //
+    // ZERO QuestDB dependency (CI-runnable): the writer conf points at the
+    // reserved/refused loopback port 1 (the `groww_persistence::for_test()`
+    // fail-fast idiom), so `GrowwLiveTickWriter::new` degrades to local
+    // buffering and every in-drain flush fails fast after the bounded
+    // 50+100+200ms reconnect ladder. `pending()` therefore RETAINS the exact
+    // count of rows appended — the loss/duplicate-proof observable every
+    // assertion below counts (a lost line under-counts, a double-read
+    // over-counts).
+    //
+    // HONEST ENVELOPE (per operator-charter §F): the snapshot-PERSIST arm
+    // (`maybe_persist_offset` inside the flush-Ok arm) is NOT executed by
+    // these tests — CI has no QuestDB, so the flush never returns Ok. The
+    // resume tests exercise the READ side by hand-writing the snapshot JSON
+    // (the same `GrowwOffsetSnapshot` serde shape the persist arm writes;
+    // round-trip pinned by `test_offset_snapshot_roundtrip`, write-ordering
+    // pinned by `test_offset_persist_is_after_flush_ok`). The live persist
+    // path remains covered only by the QuestDB-gated e2e.
+
+    /// Fail-fast QuestDB conf: port 1 is reserved/refused on every platform,
+    /// so writer construction + every flush reconnect fails immediately
+    /// (never stalls CI) and appended rows stay retained in the local buffer.
+    fn retail_unreachable_qdb() -> QuestDbConfig {
+        QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: 1,
+            pg_port: 1,
+            ilp_port: 1,
+        }
+    }
+
+    /// A fresh bridge state around the fail-fast conf + its own aggregator.
+    fn retail_fresh_state() -> GrowwBridgeState {
+        GrowwBridgeState::with_aggregator(
+            &retail_unreachable_qdb(),
+            MultiTfAggregator::with_capacity(GROWW_AGGREGATOR_CAPACITY),
+        )
+    }
+
+    /// pid+nanos-unique temp dir (the chaos_tmp idiom) — removed by the caller.
+    fn retail_tmp_dir(tag: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!(
+            "tv_groww_retail_{tag}_{}_{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("mk retail tmp dir");
+        dir
+    }
+
+    /// Base exchange ts for generated lines: ~2026-05-29 IST — inside the
+    /// `[2020, 2100)` plausibility window and in the PAST relative to the
+    /// receipt clock, so `validate_groww_tick` accepts every generated line.
+    const RETAIL_BASE_TS_NANOS: i64 = 1_780_000_000_000_000_000;
+
+    /// One VALID newline-terminated NDJSON tick line per the sidecar contract.
+    fn retail_line(n: i64) -> String {
+        let ts = RETAIL_BASE_TS_NANOS + n * NANOS_PER_SECOND;
+        format!(
+            "{{\"security_id\":{},\"segment\":\"NSE_EQ\",\"ts_ist_nanos\":{ts},\"exchange_ts_millis\":{},\"ltp\":{}.5,\"cum_volume\":{}}}\n",
+            1_000 + n,
+            ts / 1_000_000,
+            100 + n,
+            1_000 + n
+        )
+    }
+
+    /// The identity head EXACTLY as `maybe_persist_offset` records it: the
+    /// first [`GROWW_OFFSET_HEAD_LEN`] bytes, lossy-decoded.
+    fn retail_head(bytes: &[u8]) -> String {
+        let n = bytes.len().min(GROWW_OFFSET_HEAD_LEN);
+        String::from_utf8_lossy(&bytes[..n]).into_owned()
+    }
+
+    /// Today's IST day index via the SAME clock production uses.
+    fn retail_current_ist_day() -> i64 {
+        ist_day_from_ist_nanos(receipt_ist_nanos())
+    }
+
+    /// Hand-write the offset snapshot at its production sibling path.
+    fn retail_write_snapshot(tick_file: &Path, snap: &GrowwOffsetSnapshot) {
+        let json = serde_json::to_string(snap).expect("serialize snapshot");
+        std::fs::write(offset_snapshot_path(tick_file), json).expect("write snapshot");
+    }
+
+    #[tokio::test]
+    async fn test_retail_drain_offset_tracks_complete_lines_and_carries_partial() {
+        // (a) N complete lines drain → offset == file length; a trailing
+        // PARTIAL line is carried in the residual and completed on the next
+        // drain — no line lost, no line duplicated (exact pending() counts).
+        let dir = retail_tmp_dir("offset_partial");
+        let tick_file = dir.join("live-ticks.ndjson");
+        let full: String = (0..3).map(retail_line).collect();
+        let line4 = retail_line(3);
+        let (part_a, part_b) = line4.split_at(line4.len() / 2);
+        std::fs::write(&tick_file, format!("{full}{part_a}")).expect("seed file");
+        let reg = tickvault_common::feed_health::FeedHealthRegistry::new();
+        let mut state = retail_fresh_state();
+
+        assert!(
+            state.drain_new_data(&tick_file, &reg).await,
+            "3 complete lines must parse"
+        );
+        let len1 = std::fs::metadata(&tick_file).expect("meta").len();
+        assert_eq!(
+            state.offset, len1,
+            "offset must equal the file length (the partial bytes were READ, just not parsed)"
+        );
+        assert_eq!(
+            state.live_writer.pending(),
+            3,
+            "exactly the 3 COMPLETE lines appended — the partial 4th must NOT be parsed early"
+        );
+        assert_eq!(
+            state.residual,
+            part_a.as_bytes(),
+            "the partial line must be carried in the residual, byte-exact"
+        );
+
+        // Next wake: the sidecar completes the split line.
+        {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&tick_file)
+                .expect("open append");
+            f.write_all(part_b.as_bytes()).expect("append rest");
+        }
+        assert!(
+            state.drain_new_data(&tick_file, &reg).await,
+            "the completed line must parse on the next drain"
+        );
+        assert_eq!(
+            state.offset,
+            std::fs::metadata(&tick_file).expect("meta").len(),
+            "offset advanced over the completed line"
+        );
+        assert_eq!(
+            state.live_writer.pending(),
+            4,
+            "the completed line appended exactly ONCE — no loss, no duplicate"
+        );
+        assert!(state.residual.is_empty(), "residual fully consumed");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_retail_drain_file_shrink_resets_offset_no_stall() {
+        // (b) rotation/truncate to a SHORTER file → offset resets to byte 0 and
+        // the fresh file drains; subsequent appends keep flowing (no permanent
+        // stall, which is what a stuck `offset > len` would produce).
+        let dir = retail_tmp_dir("shrink");
+        let tick_file = dir.join("live-ticks.ndjson");
+        let five: String = (0..5).map(retail_line).collect();
+        std::fs::write(&tick_file, &five).expect("seed 5 lines");
+        let reg = tickvault_common::feed_health::FeedHealthRegistry::new();
+        let mut state = retail_fresh_state();
+        assert!(state.drain_new_data(&tick_file, &reg).await);
+        assert_eq!(state.live_writer.pending(), 5);
+
+        // The sidecar rotates: the path now holds a SHORTER fresh file.
+        let two: String = (10..12).map(retail_line).collect();
+        assert!(
+            two.len() < five.len(),
+            "test setup: the rotated file must actually be shorter"
+        );
+        std::fs::write(&tick_file, &two).expect("rotate to shorter file");
+        assert!(
+            state.drain_new_data(&tick_file, &reg).await,
+            "the shrunk file must re-drain from byte 0 — never a stall"
+        );
+        assert_eq!(
+            state.offset,
+            two.len() as u64,
+            "offset reset to 0 then advanced over the whole fresh file"
+        );
+        assert_eq!(
+            state.live_writer.pending(),
+            7,
+            "5 pre-rotation + 2 fresh — the fresh file read exactly once"
+        );
+        assert!(
+            state.residual.is_empty(),
+            "stale residual cleared on shrink"
+        );
+
+        // The tail keeps flowing after the reset.
+        {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&tick_file)
+                .expect("open append");
+            f.write_all(retail_line(12).as_bytes()).expect("append");
+        }
+        assert!(state.drain_new_data(&tick_file, &reg).await);
+        assert_eq!(
+            state.live_writer.pending(),
+            8,
+            "post-shrink appends must keep flowing (no permanent stall)"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_retail_resume_mid_file_no_double_read() {
+        // (c) a hand-written same-day snapshot at a flushed line boundary →
+        // outcome "resumed": offset + capture_seq restored, and the next drain
+        // parses ONLY the unflushed tail — exact counts prove zero double-read.
+        let reg = tickvault_common::feed_health::FeedHealthRegistry::new();
+        for attempt in 0..2 {
+            let dir = retail_tmp_dir("resume_midfile");
+            let tick_file = dir.join("live-ticks.ndjson");
+            let lines: Vec<String> = (0..5).map(retail_line).collect();
+            let all: String = lines.concat();
+            std::fs::write(&tick_file, &all).expect("seed 5 lines");
+            // The first 3 lines were flushed-through before the "crash".
+            let flushed: usize = lines[..3].iter().map(String::len).sum();
+            let today = retail_current_ist_day();
+            let snap = GrowwOffsetSnapshot {
+                offset: flushed as u64,
+                capture_seq: 777_000,
+                file_len: all.len() as u64,
+                head: retail_head(all.as_bytes()),
+                ist_day: today,
+            };
+            retail_write_snapshot(&tick_file, &snap);
+
+            let mut state = retail_fresh_state();
+            state.try_resume_from_snapshot(&tick_file, &reg).await;
+
+            if retail_current_ist_day() != today {
+                // IST midnight flipped mid-test (sub-second window): the
+                // resume legitimately rejected the now-previous-day snapshot.
+                // Re-run once with the new day — bounded, deterministic.
+                let _ = std::fs::remove_dir_all(&dir);
+                assert_eq!(attempt, 0, "IST day cannot flip twice in one test");
+                continue;
+            }
+
+            assert_eq!(
+                state.offset, flushed as u64,
+                "outcome=resumed: read position restored MID-FILE (no full re-tail)"
+            );
+            assert_eq!(
+                state.capture_seq.load(Ordering::Relaxed),
+                777_000,
+                "capture_seq (the replay-stable dedup tiebreaker) restored from the snapshot"
+            );
+
+            assert!(state.drain_new_data(&tick_file, &reg).await);
+            assert_eq!(
+                state.live_writer.pending(),
+                2,
+                "ONLY the 2 unflushed tail lines parsed — zero duplicates (a byte-0 re-read would show 5)"
+            );
+            assert_eq!(state.offset, all.len() as u64);
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+    }
+
+    #[tokio::test]
+    async fn test_retail_cross_day_snapshot_drains_archive_then_byte0_retail() {
+        // (d) a PREVIOUS-day snapshot + the rotated archive on disk → the
+        // `should_drain_archive` branch EXECUTES: the archive tail beyond the
+        // flushed offset drains through the real parse/validate/append path,
+        // then today's live file re-tails from byte 0 — exact counts prove the
+        // flushed archive prefix is never re-read and no live line is lost.
+        let reg = tickvault_common::feed_health::FeedHealthRegistry::new();
+        for attempt in 0..2 {
+            let dir = retail_tmp_dir("archive_drain");
+            let tick_file = dir.join("live-ticks.ndjson");
+            let today = retail_current_ist_day();
+            let yesterday = today - 1;
+
+            // Yesterday's rotated archive: 5 lines, the first 2 flushed
+            // before the downtime — only the 3-line tail is un-persisted.
+            let archive_lines: Vec<String> = (0..5).map(retail_line).collect();
+            let archive_all: String = archive_lines.concat();
+            let archive = archive_path_for_ist_day(&tick_file, yesterday);
+            std::fs::write(&archive, &archive_all).expect("seed archive");
+            let flushed: usize = archive_lines[..2].iter().map(String::len).sum();
+
+            // Today's fresh live file MUST exist — an absent live file
+            // short-circuits the resume before the archive branch.
+            let live: String = (20..22).map(retail_line).collect();
+            std::fs::write(&tick_file, &live).expect("seed live file");
+
+            let snap = GrowwOffsetSnapshot {
+                offset: flushed as u64,
+                capture_seq: 555,
+                file_len: archive_all.len() as u64,
+                head: retail_head(archive_all.as_bytes()),
+                ist_day: yesterday,
+            };
+            retail_write_snapshot(&tick_file, &snap);
+
+            let mut state = retail_fresh_state();
+            state.try_resume_from_snapshot(&tick_file, &reg).await;
+
+            if retail_current_ist_day() != today {
+                // IST midnight flipped mid-test: `yesterday` is now 2 days
+                // back and the archive naming no longer lines up — re-run
+                // once with the new day. Bounded, deterministic.
+                let _ = std::fs::remove_dir_all(&dir);
+                assert_eq!(attempt, 0, "IST day cannot flip twice in one test");
+                continue;
+            }
+
+            assert_eq!(
+                state.live_writer.pending(),
+                3,
+                "archive tail drained FROM the flushed offset — 3 lines, never a re-read of the flushed prefix"
+            );
+            assert_eq!(
+                state.offset, 0,
+                "after the archive drain the live file re-tails from byte 0"
+            );
+            assert!(
+                state.residual.is_empty(),
+                "cross-file residual cleared before the live re-tail"
+            );
+            assert!(
+                state.active_drain_ist_day.is_none(),
+                "the archive-day snapshot stamp is cleared after the drain"
+            );
+
+            assert!(state.drain_new_data(&tick_file, &reg).await);
+            assert_eq!(
+                state.live_writer.pending(),
+                5,
+                "3 archive-tail + 2 live lines — every line read exactly once"
+            );
+            assert_eq!(state.offset, live.len() as u64);
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+    }
+
+    #[tokio::test]
+    async fn test_retail_corrupt_snapshot_fails_closed_to_byte0() {
+        // (e) unparseable snapshot JSON → fail-closed byte-0 full re-tail —
+        // never a partial/undefined resume, no garbage state adopted.
+        let dir = retail_tmp_dir("corrupt_snap");
+        let tick_file = dir.join("live-ticks.ndjson");
+        let all: String = (0..4).map(retail_line).collect();
+        std::fs::write(&tick_file, &all).expect("seed 4 lines");
+        std::fs::write(offset_snapshot_path(&tick_file), b"{ not a snapshot }")
+            .expect("write corrupt snapshot");
+        let reg = tickvault_common::feed_health::FeedHealthRegistry::new();
+        let mut state = retail_fresh_state();
+        state.try_resume_from_snapshot(&tick_file, &reg).await;
+        assert_eq!(state.offset, 0, "corrupt snapshot → byte-0 re-tail");
+        assert_eq!(
+            state.capture_seq.load(Ordering::Relaxed),
+            0,
+            "no partial state adopted from garbage"
+        );
+        assert!(state.drain_new_data(&tick_file, &reg).await);
+        assert_eq!(
+            state.live_writer.pending(),
+            4,
+            "full re-tail — every line recovered exactly once"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_retail_wrong_day_snapshot_without_archive_fails_closed_to_byte0() {
+        // (e) a previous-day snapshot whose archive is GONE (retention wiped /
+        // never rotated) → no archive drain, fail-closed byte-0 full re-tail.
+        // Flip-safe without a retry: however IST midnight moves, the snapshot
+        // day stays in the past and no archive exists at its derived path.
+        let dir = retail_tmp_dir("wrong_day_snap");
+        let tick_file = dir.join("live-ticks.ndjson");
+        let all: String = (0..3).map(retail_line).collect();
+        std::fs::write(&tick_file, &all).expect("seed 3 lines");
+        let snap = GrowwOffsetSnapshot {
+            offset: 10,
+            capture_seq: 99,
+            file_len: all.len() as u64,
+            head: retail_head(all.as_bytes()),
+            ist_day: retail_current_ist_day() - 1,
+        };
+        retail_write_snapshot(&tick_file, &snap);
+        let reg = tickvault_common::feed_health::FeedHealthRegistry::new();
+        let mut state = retail_fresh_state();
+        state.try_resume_from_snapshot(&tick_file, &reg).await;
+        assert_eq!(
+            state.offset, 0,
+            "cross-day snapshot with no archive → byte-0 re-tail (never a mid-file resume)"
+        );
+        assert!(state.drain_new_data(&tick_file, &reg).await);
+        assert_eq!(
+            state.live_writer.pending(),
+            3,
+            "full re-tail of today's file — nothing skipped, nothing doubled"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_retail_snapshot_offset_beyond_truncated_file_fails_closed_to_byte0() {
+        // Boundary: the snapshot's offset lies BEYOND the current file length
+        // (rotation/truncate shrank it below the flushed point) with a
+        // matching head → the resume must reject (offset > len) and byte-0
+        // re-tail. Flip-safe without a retry: a mid-test day flip only changes
+        // WHICH check rejects (day instead of length) — the byte-0 outcome and
+        // the exact-count assertions are identical.
+        let dir = retail_tmp_dir("over_offset");
+        let tick_file = dir.join("live-ticks.ndjson");
+        let all: String = (0..2).map(retail_line).collect();
+        std::fs::write(&tick_file, &all).expect("seed 2 lines");
+        let snap = GrowwOffsetSnapshot {
+            offset: all.len() as u64 + 10_000,
+            capture_seq: 42,
+            file_len: all.len() as u64 + 10_000,
+            head: retail_head(all.as_bytes()),
+            ist_day: retail_current_ist_day(),
+        };
+        retail_write_snapshot(&tick_file, &snap);
+        let reg = tickvault_common::feed_health::FeedHealthRegistry::new();
+        let mut state = retail_fresh_state();
+        state.try_resume_from_snapshot(&tick_file, &reg).await;
+        assert_eq!(
+            state.offset, 0,
+            "offset beyond the truncated length → fail-closed byte-0 (never a past-EOF seek)"
+        );
+        assert!(state.drain_new_data(&tick_file, &reg).await);
+        assert_eq!(
+            state.live_writer.pending(),
+            2,
+            "full re-tail — both surviving lines recovered exactly once"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_retail_snapshot_for_missing_file_is_ignored() {
+        // Boundary: a snapshot whose capture file no longer exists → the
+        // snapshot is ignored (offset stays 0) and draining the missing file
+        // is a safe no-op — no panic, no stall.
+        let dir = retail_tmp_dir("missing_file");
+        let tick_file = dir.join("live-ticks.ndjson"); // never created
+        let snap = GrowwOffsetSnapshot {
+            offset: 500,
+            capture_seq: 7,
+            file_len: 1_000,
+            head: "{\"security_id\":1000".to_string(),
+            ist_day: retail_current_ist_day(),
+        };
+        retail_write_snapshot(&tick_file, &snap);
+        let reg = tickvault_common::feed_health::FeedHealthRegistry::new();
+        let mut state = retail_fresh_state();
+        state.try_resume_from_snapshot(&tick_file, &reg).await;
+        assert_eq!(state.offset, 0, "absent capture file → snapshot ignored");
+        assert!(
+            !state.drain_new_data(&tick_file, &reg).await,
+            "draining the missing file is a safe no-op"
+        );
+        assert_eq!(state.live_writer.pending(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_retail_drain_empty_file_noop_then_first_line_flows() {
+        // Boundary: an EMPTY capture file (sidecar started, nothing appended)
+        // is a no-op drain; the very first appended line then flows normally.
+        let dir = retail_tmp_dir("empty_file");
+        let tick_file = dir.join("live-ticks.ndjson");
+        std::fs::write(&tick_file, b"").expect("seed empty file");
+        let reg = tickvault_common::feed_health::FeedHealthRegistry::new();
+        let mut state = retail_fresh_state();
+        assert!(
+            !state.drain_new_data(&tick_file, &reg).await,
+            "empty file → nothing parsed, no panic"
+        );
+        assert_eq!(state.offset, 0);
+        assert_eq!(state.live_writer.pending(), 0);
+
+        std::fs::write(&tick_file, retail_line(0)).expect("first line");
+        assert!(state.drain_new_data(&tick_file, &reg).await);
+        assert_eq!(state.live_writer.pending(), 1, "first line flows");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn test_liveness_gate_is_wired_into_drain() {
         // Ratchet (2026-07-03): the parse-time record_feed_liveness call must
