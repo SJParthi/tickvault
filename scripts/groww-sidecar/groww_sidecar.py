@@ -1324,6 +1324,169 @@ def note_emit() -> None:
         _last_status_rewrite_monotonic = now
 
 
+# ---------------------------------------------------------------------------
+# RAW-TICK-PROBE (2026-07-03, LOG-ONLY) — settle whether Groww's live feed
+# POPULATES the SDK-exposed `volume` field. The growwapi==1.5.0 SDK decodes the
+# full 16-field StocksLivePriceProto per instrument (volume, openInterest,
+# OHLC, avgPrice, …) even though Groww's docs list only tsInMillis+ltp — but
+# proto3 doubles have NO presence, so `volume: 0.0` appears whether the server
+# omits it or sends zero. Only inspecting REAL live tick dicts answers the
+# question. This probe:
+#   1. Prints the FIRST RAW_PROBE_SAMPLE_COUNT stock/FNO tick dicts (and the
+#      first RAW_PROBE_INDEX_SAMPLE_COUNT index dicts) verbatim as ONE
+#      `RAW-TICK-PROBE kind=… token=… fields=<compact json>` stderr line each,
+#      then ONE `RAW-TICK-PROBE-SUMMARY …` line scanning those samples.
+#   2. Keeps CHEAP process-lifetime running counters (two float compares + int
+#      increments per drained tick — O(1)) of how many drained stock/FNO ticks
+#      had volume != 0 / openInterest != 0, surfaced via a bounded
+#      `RAW-TICK-PROBE-HEARTBEAT` stderr line at most once per
+#      RAW_PROBE_HEARTBEAT_SECS — so even if the first 8 ticks are all zero we
+#      learn whether ANY tick all day carries volume.
+# It observes DRAINED snapshot entries inside the walker thread's emit paths —
+# NEVER the O(1) NATS callbacks (the 2026-07-03 lag-fix contract is untouched).
+# Emission/persistence are UNCHANGED: cum_volume stays 0 pending the verdict.
+# Market-data identifiers/values only — never a credential.
+# Default: sample once per process. GROWW_RAW_PROBE=always re-arms the sampler
+# on every reconnect cycle (running counters are NEVER reset).
+# CloudWatch: log group /tickvault/prod/app, filter "RAW-TICK-PROBE".
+# ---------------------------------------------------------------------------
+
+RAW_PROBE_SAMPLE_COUNT = 8
+RAW_PROBE_INDEX_SAMPLE_COUNT = 2
+RAW_PROBE_HEARTBEAT_SECS = 300.0
+# The OHLC keys scanned for the summary's nonzero_ohlc count.
+_RAW_PROBE_OHLC_KEYS = ("open", "high", "low", "close")
+
+
+def probe_field_nonzero(value) -> bool:
+    """Pure: True iff `value` coerces to a NON-ZERO float. Non-numeric /
+    missing values are honestly False (never raise) — proto3's no-presence
+    `0.0` and an absent key both read as \"not populated\". O(1)."""
+    try:
+        return float(value) != 0.0
+    except (TypeError, ValueError):
+        return False
+
+
+class RawTickProbe:
+    """Bounded raw-tick sampler + cheap running field-population counters.
+
+    Injectable `emit` (defaults to a flushed stderr print) so unit tests can
+    capture lines without patching stdio (test_dedup.py::RawTickProbeTests).
+    All state is plain ints/lists mutated from the single walker thread — no
+    locks needed (same threading model as the module counters above)."""
+
+    def __init__(
+        self,
+        mode: str = "",
+        ltp_limit: int = RAW_PROBE_SAMPLE_COUNT,
+        index_limit: int = RAW_PROBE_INDEX_SAMPLE_COUNT,
+        emit=None,
+    ) -> None:
+        self.always = (mode or "").strip().lower() == "always"
+        self._ltp_limit = ltp_limit
+        self._index_limit = index_limit
+        self._emit = emit or (
+            lambda line: print(line, file=sys.stderr, flush=True)
+        )
+        # Per-arming sampling state (reset by rearm_for_reconnect in `always`).
+        self._ltp_sampled = 0
+        self._index_sampled = 0
+        self._samples = []  # the sampled stock/FNO dicts, for the summary scan
+        self._summary_printed = False
+        # Process-lifetime running counters — NEVER reset, even on re-arm.
+        self.total_ltp_ticks = 0
+        self.nonzero_volume_ticks = 0
+        self.nonzero_oi_ticks = 0
+        self._last_heartbeat_monotonic = None
+
+    def observe(self, kind: str, token, tick) -> None:
+        """Observe ONE drained snapshot entry. O(1) fast path: once sampling
+        is exhausted this is an int compare + (for kind=\"ltp\") two float
+        compares + int increments. Called from the walker thread ONLY."""
+        if not isinstance(tick, dict):
+            return
+        if kind == "ltp":
+            self.total_ltp_ticks += 1
+            if probe_field_nonzero(tick.get("volume")):
+                self.nonzero_volume_ticks += 1
+            if probe_field_nonzero(tick.get("openInterest")):
+                self.nonzero_oi_ticks += 1
+            if self._ltp_sampled < self._ltp_limit:
+                self._ltp_sampled += 1
+                self._samples.append(dict(tick))
+                self._emit_sample("ltp", token, tick)
+                if self._ltp_sampled == self._ltp_limit and not self._summary_printed:
+                    self._print_summary()
+        elif kind == "index":
+            if self._index_sampled < self._index_limit:
+                self._index_sampled += 1
+                self._emit_sample("index", token, tick)
+
+    def _emit_sample(self, kind: str, token, tick: dict) -> None:
+        try:
+            fields = json.dumps(tick, sort_keys=True, separators=(",", ":"), default=str)
+        except (TypeError, ValueError):
+            fields = repr(tick)
+        self._emit(f"RAW-TICK-PROBE kind={kind} token={token} fields={fields}")
+
+    def _print_summary(self) -> None:
+        """ONE summary line scanning the sampled stock/FNO dicts."""
+        self._summary_printed = True
+        total = len(self._samples)
+        nz_vol = sum(1 for t in self._samples if probe_field_nonzero(t.get("volume")))
+        nz_oi = sum(
+            1 for t in self._samples if probe_field_nonzero(t.get("openInterest"))
+        )
+        nz_ohlc = sum(
+            1
+            for t in self._samples
+            if any(probe_field_nonzero(t.get(k)) for k in _RAW_PROBE_OHLC_KEYS)
+        )
+        self._emit(
+            f"RAW-TICK-PROBE-SUMMARY nonzero_volume_ticks={nz_vol}/{total} "
+            f"nonzero_oi={nz_oi}/{total} nonzero_ohlc={nz_ohlc}/{total}"
+        )
+
+    def rearm_for_reconnect(self) -> None:
+        """Re-arm the bounded sampler for a new reconnect cycle — ONLY under
+        GROWW_RAW_PROBE=always (default: once per process). The running
+        counters are process-lifetime truth and are NEVER reset."""
+        if not self.always:
+            return
+        self._ltp_sampled = 0
+        self._index_sampled = 0
+        self._samples = []
+        self._summary_printed = False
+
+    def maybe_heartbeat(self, now_monotonic: float) -> bool:
+        """Bounded periodic running-counter line (≤ 1 per
+        RAW_PROBE_HEARTBEAT_SECS; nothing before the first drained stock/FNO
+        tick). One float compare per call — safe to invoke every walker
+        iteration. Returns True iff a line was emitted (unit-testable)."""
+        if self.total_ltp_ticks == 0:
+            return False
+        if self._last_heartbeat_monotonic is None:
+            # Arm the cadence at the first observed tick; first line fires one
+            # full interval later (the samples already covered t=0).
+            self._last_heartbeat_monotonic = now_monotonic
+            return False
+        if now_monotonic - self._last_heartbeat_monotonic < RAW_PROBE_HEARTBEAT_SECS:
+            return False
+        self._last_heartbeat_monotonic = now_monotonic
+        self._emit(
+            "RAW-TICK-PROBE-HEARTBEAT "
+            f"nonzero_volume_ticks={self.nonzero_volume_ticks}/{self.total_ltp_ticks} "
+            f"nonzero_oi={self.nonzero_oi_ticks}/{self.total_ltp_ticks}"
+        )
+        return True
+
+
+# Module singleton wired into the walker-thread emit paths. Env read once at
+# import (the sidecar process is restarted by the Rust supervisor anyway).
+RAW_PROBE = RawTickProbe(mode=os.environ.get("GROWW_RAW_PROBE", ""))
+
+
 def latest_watch_file(watch_dir: str):
     """Return the path of the most recent groww-watch-*.json, or None."""
     matches = sorted(glob.glob(os.path.join(watch_dir, "groww-watch-*.json")))
@@ -1379,7 +1542,9 @@ def _write_record(out, security_id: int, segment: str, ts_millis: int, price) ->
         "ts_ist_nanos": ms_to_ist_nanos(ts_millis) if ts_millis else 0,
         "exchange_ts_millis": ts_millis,
         "ltp": float(price),
-        # Option A: Groww live feed carries no volume -> always 0.
+        # Option A: Groww docs list no volume; the SDK exposes a `volume`
+        # field — population under live probe (RAW-TICK-PROBE, 2026-07-03);
+        # emission unchanged pending verdict -> always 0.
         "cum_volume": 0,
     }
     out.write(json.dumps(rec) + "\n")
@@ -1429,6 +1594,10 @@ def emit_ltp_records(out, ltp_tree: dict, sid_map: dict) -> None:
                 # Advance the stall detector's ts watermark for EVERY decoded
                 # record — before dedup/drop — so liveness = fresh timestamps.
                 _note_ts_advance(tick)
+                # RAW-TICK-PROBE (log-only): observe the raw decoded dict —
+                # before drop/dedup — from the walker thread (never the O(1)
+                # NATS callbacks). Emission below is unchanged.
+                RAW_PROBE.observe("ltp", token, tick)
                 # A decoded record with no `ltp` field — DROP (honest-feed count).
                 if not isinstance(tick, dict) or "ltp" not in tick:
                     note_drop(
@@ -1508,6 +1677,8 @@ def emit_index_records(out, index_tree: dict, sid_map: dict) -> None:
                 # Advance the stall detector's ts watermark for EVERY decoded
                 # record — before dedup/drop — so liveness = fresh timestamps.
                 _note_ts_advance(tick)
+                # RAW-TICK-PROBE (log-only): first 2 raw index dicts, verbatim.
+                RAW_PROBE.observe("index", token, tick)
                 # A decoded index record with no `value` field — DROP (count it).
                 if not isinstance(tick, dict) or "value" not in tick:
                     note_drop(
@@ -1648,6 +1819,9 @@ def _snapshot_walker_loop(out, sid_map, feed_cell) -> None:
             if _INDEX_DIRTY.is_set():
                 _INDEX_DIRTY.clear()
                 emit_index_records(out, feed.get_index_value(), sid_map)
+            # RAW-TICK-PROBE heartbeat: one float compare per iteration; a
+            # bounded stderr line at most once per RAW_PROBE_HEARTBEAT_SECS.
+            RAW_PROBE.maybe_heartbeat(time.monotonic())
         except Exception as exc:  # noqa: BLE001 - the walker must never die
             _WALK_ERRORS_TOTAL += 1
             if _WALK_ERRORS_TOTAL <= 5 or _WALK_ERRORS_TOTAL % 100 == 0:
@@ -1967,6 +2141,10 @@ def main() -> None:
             # subscribe counts in feed-health. Counts only, never a credential. This
             # is the honest "attempted" signal; it does NOT flip `connected=true`.
             write_status("subscribed", len(stock_list), len(index_list))
+            # RAW-TICK-PROBE: under GROWW_RAW_PROBE=always, re-arm the bounded
+            # sampler each reconnect cycle (default: once per process; the
+            # running counters are never reset). No-op on the first cycle.
+            RAW_PROBE.rearm_for_reconnect()
             # A full cycle succeeded up to the blocking consume — reset backoff so
             # the next genuine disconnect retries quickly, not at the capped delay.
             consecutive_failures = 0
@@ -2257,6 +2435,53 @@ def _selftest_coalesce_and_watermark_lag() -> None:
     print("groww sidecar coalesce+watermark-lag self-test: PASS")
 
 
+def _selftest_raw_probe() -> None:
+    """Prove the RAW-TICK-PROBE sampler (2026-07-03, log-only). Guarded behind
+    `--selftest` so it NEVER runs in prod. Full matrix in test_dedup.py."""
+    lines = []
+    probe = RawTickProbe(mode="", emit=lines.append)
+    # Bounded at N: 20 drained stock ticks -> exactly N sample lines + 1 summary.
+    for i in range(20):
+        probe.observe(
+            "ltp",
+            str(2885 + i),
+            {"tsInMillis": 1_783_069_200_000 + i, "ltp": 100.0 + i,
+             "volume": 5000.0 if i % 2 == 0 else 0.0, "openInterest": 0.0,
+             "open": 99.0, "high": 101.0, "low": 98.0, "close": 0.0},
+        )
+    samples = [l for l in lines if l.startswith("RAW-TICK-PROBE kind=ltp")]
+    summaries = [l for l in lines if l.startswith("RAW-TICK-PROBE-SUMMARY")]
+    assert len(samples) == RAW_PROBE_SAMPLE_COUNT, "sampler must be bounded at N"
+    assert len(summaries) == 1, "exactly ONE summary after sampling completes"
+    assert f"nonzero_volume_ticks=4/{RAW_PROBE_SAMPLE_COUNT}" in summaries[0], \
+        "summary must count nonzero-volume samples (i=0,2,4,6 of the first 8)"
+    assert f"nonzero_oi=0/{RAW_PROBE_SAMPLE_COUNT}" in summaries[0], \
+        "summary must count nonzero-OI samples"
+    assert f"nonzero_ohlc={RAW_PROBE_SAMPLE_COUNT}/{RAW_PROBE_SAMPLE_COUNT}" in summaries[0], \
+        "any nonzero O/H/L/C marks the sample OHLC-populated"
+    # Running counters keep counting PAST the sample bound (all 20).
+    assert probe.total_ltp_ticks == 20 and probe.nonzero_volume_ticks == 10, \
+        "running counters must cover every drained tick, not just samples"
+    # Index sampling bounded at its own limit; never touches the ltp counters.
+    for i in range(5):
+        probe.observe("index", "NIFTY", {"tsInMillis": 1, "value": 26965.05})
+    idx = [l for l in lines if l.startswith("RAW-TICK-PROBE kind=index")]
+    assert len(idx) == RAW_PROBE_INDEX_SAMPLE_COUNT, "index sampler bounded"
+    assert probe.total_ltp_ticks == 20, "index dicts never count as ltp ticks"
+    # Default mode: rearm is a no-op. always mode: rearm resets sampling ONLY.
+    probe.rearm_for_reconnect()
+    probe.observe("ltp", "1", {"ltp": 1.0, "volume": 0.0})
+    assert len([l for l in lines if l.startswith("RAW-TICK-PROBE kind=ltp")]) \
+        == RAW_PROBE_SAMPLE_COUNT, "default mode samples once per process"
+    always = RawTickProbe(mode="always", ltp_limit=2, emit=lines.append)
+    assert always.always, "GROWW_RAW_PROBE=always must arm re-triggering"
+    # probe_field_nonzero: proto3 no-presence 0.0 / absent / garbage are False.
+    assert probe_field_nonzero(12.5) and probe_field_nonzero("3")
+    assert not probe_field_nonzero(0.0) and not probe_field_nonzero(None)
+    assert not probe_field_nonzero("x") and not probe_field_nonzero({})
+    print("groww sidecar raw-probe self-test: PASS")
+
+
 def _utc_epoch_for_ist(hour: int, minute: int) -> float:
     """Helper: a UTC epoch whose IST wall-clock is exactly `hour:minute` today.
     IST = UTC + 5:30, so UTC h:m = IST h:m − 5:30. Pure arithmetic for the test."""
@@ -2272,5 +2497,6 @@ if __name__ == "__main__":
         _selftest_self_heal()
         _selftest_dedup()
         _selftest_coalesce_and_watermark_lag()
+        _selftest_raw_probe()
     else:
         main()
