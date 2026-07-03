@@ -179,40 +179,186 @@ class Latency(unittest.TestCase):
         self.assertIsNone(handler._avg_ns("1000", "0"))
         self.assertIsNone(handler._avg_ns("", ""))
 
+    @staticmethod
+    def _health_json(rows: list) -> str:
+        import json as _json
+
+        return _json.dumps({"market_open": True, "feeds": rows})
+
     def test_parse_latency_full(self) -> None:
         stdout = (
-            "DHAN_BEGIN\n"
+            "T0=100.0\n"
+            "FEEDS_T0_BEGIN\n"
+            + self._health_json(
+                [
+                    {"feed": "dhan", "ticks_total": 1000, "subscribed_total": 776,
+                     "last_tick_age_secs": 1, "verdict": "ok", "enabled": True},
+                    {"feed": "groww", "ticks_total": 2000, "subscribed_total": 768,
+                     "last_tick_age_secs": 0, "verdict": "ok", "enabled": True},
+                ]
+            )
+            + "\n"
+            "FEEDS_T0_END\n"
+            "PROBE_dhan_BEGIN\n"
             "0.012 0.030\n"
             "0.009 0.025\n"
-            "0.011 0.028\n"
-            "DHAN_END\n"
+            "PROBE_dhan_END\n"
+            "PROBE_groww_BEGIN\n"
+            "0.007 0.020\n"
+            "x x\n"
+            "PROBE_groww_END\n"
             "QDB=0.0021\n"
             "SKEW=0.000123\n"
+            "T1=110.0\n"
             "METRICS_BEGIN\n"
             "tv_tick_processing_duration_ns_sum 50000\n"
             "tv_tick_processing_duration_ns_count 1000\n"
             "tv_wire_to_done_duration_ns_sum 8000000\n"
             "tv_wire_to_done_duration_ns_count 1000\n"
             "METRICS_END\n"
+            "FEEDS_T1_BEGIN\n"
+            + self._health_json(
+                [
+                    {"feed": "dhan", "ticks_total": 1050, "subscribed_total": 776,
+                     "last_tick_age_secs": 1, "verdict": "ok", "enabled": True},
+                    {"feed": "groww", "ticks_total": 2200, "subscribed_total": 768,
+                     "last_tick_age_secs": 0, "verdict": "ok", "enabled": True},
+                ]
+            )
+            + "\n"
+            "FEEDS_T1_END\n"
         )
         out = handler._parse_latency(stdout)
-        self.assertEqual(out["dhan_tcp_ms"], "9.0")  # min of the 3 samples
         self.assertEqual(out["questdb_ms"], "2.1")
         self.assertEqual(out["clock_skew_ms"], "0.1")
         self.assertEqual(out["tick_process_avg_ns"], 50.0)
         self.assertEqual(out["wire_to_done_avg_ns"], 8000.0)
         self.assertIsNone(out["order_place_avg_ns"])
         self.assertEqual(out["tick_count"], "1000")
+        # Per-feed rows: dynamic — driven by the app's health response.
+        rows = {r["feed"]: r for r in out["feeds"]}
+        self.assertEqual(set(rows), {"dhan", "groww"})
+        self.assertEqual(rows["dhan"]["tcp_ms"], "9.0")  # min of the samples
+        self.assertEqual(rows["dhan"]["tls_ms"], "25.0")
+        self.assertTrue(rows["dhan"]["endpoint_known"])
+        # groww's failed sample ('x x') is skipped, not fabricated.
+        self.assertEqual(rows["groww"]["tcp_ms"], "7.0")
+        # ticks/sec = Δticks_total / (T1-T0): dhan 50/10, groww 200/10.
+        self.assertEqual(rows["dhan"]["ticks_per_sec"], 5.0)
+        self.assertEqual(rows["groww"]["ticks_per_sec"], 20.0)
+        self.assertEqual(rows["dhan"]["subscribed_total"], 776)
+        self.assertEqual(out["feeds_error"], "")
+        # Winners: groww strictly faster + busier; subscribed goes to dhan.
+        self.assertEqual(out["winners"]["tcp_ms"], "groww")
+        self.assertEqual(out["winners"]["ticks_per_sec"], "groww")
+        self.assertEqual(out["winners"]["subscribed_total"], "dhan")
 
     def test_parse_latency_empty(self) -> None:
         out = handler._parse_latency("")
-        self.assertEqual(out["dhan_tcp_ms"], "")
+        self.assertEqual(out["feeds"], [])
+        self.assertTrue(out["feeds_error"])  # honest reason, never fake rows
+        self.assertEqual(out["winners"], {})
         self.assertIsNone(out["tick_process_avg_ns"])
         self.assertEqual(out["tick_count"], "")
         # Windowed fields degrade to None / 0 with no scrapes at all.
         self.assertIsNone(out["tick_p50_ns"])
         self.assertIsNone(out["tick_p99_ns"])
         self.assertEqual(out["tick_window_count"], 0)
+
+    def test_parse_latency_unknown_third_feed_row_appears(self) -> None:
+        # A future feed #3 the app reports but the probe map doesn't know:
+        # its row STILL appears (app-side metrics) with endpoint_known=False
+        # and blank probe cells — "endpoint unknown", never fake numbers.
+        stdout = (
+            "T0=100.0\n"
+            "FEEDS_T1_BEGIN\n"
+            + self._health_json(
+                [
+                    {"feed": "dhan", "ticks_total": 10, "subscribed_total": 776},
+                    {"feed": "groww", "ticks_total": 20, "subscribed_total": 768},
+                    {"feed": "zerodha", "ticks_total": 5, "subscribed_total": 100},
+                ]
+            )
+            + "\n"
+            "FEEDS_T1_END\n"
+        )
+        out = handler._parse_latency(stdout)
+        rows = {r["feed"]: r for r in out["feeds"]}
+        self.assertEqual(set(rows), {"dhan", "groww", "zerodha"})
+        self.assertFalse(rows["zerodha"]["endpoint_known"])
+        self.assertIsNone(rows["zerodha"]["endpoint"])
+        self.assertEqual(rows["zerodha"]["tcp_ms"], "")
+        self.assertEqual(rows["zerodha"]["tls_ms"], "")
+        # Known feeds keep their mapping even with no probe samples in stdout.
+        self.assertTrue(rows["dhan"]["endpoint_known"])
+        self.assertTrue(rows["groww"]["endpoint_known"])
+
+    def test_ticks_per_sec_counter_reset_is_none(self) -> None:
+        # App restarted mid-window → T1 ticks_total BELOW T0 → tps must be
+        # None (never a fabricated negative/huge rate).
+        rows = handler._feed_latency_rows(
+            {"feeds": [{"feed": "dhan", "ticks_total": 5000}]},
+            {"feeds": [{"feed": "dhan", "ticks_total": 10}]},
+            {},
+            "10.0",
+        )
+        self.assertIsNone(rows[0]["ticks_per_sec"])
+
+    def test_ticks_per_sec_missing_t0_is_none(self) -> None:
+        rows = handler._feed_latency_rows(
+            None,
+            {"feeds": [{"feed": "dhan", "ticks_total": 10}]},
+            {},
+            "10.0",
+        )
+        self.assertEqual(len(rows), 1)
+        self.assertIsNone(rows[0]["ticks_per_sec"])
+
+    def test_feed_comparison_winners_lower_and_higher_better(self) -> None:
+        rows = [
+            {"feed": "dhan", "tcp_ms": "9.0", "tls_ms": "30.0",
+             "last_tick_age_secs": 1, "ticks_per_sec": 5.0, "subscribed_total": 776},
+            {"feed": "groww", "tcp_ms": "7.0", "tls_ms": "20.0",
+             "last_tick_age_secs": 0, "ticks_per_sec": 20.0, "subscribed_total": 768},
+        ]
+        w = handler._feed_comparison_winners(rows)
+        self.assertEqual(w["tcp_ms"], "groww")  # lower is better
+        self.assertEqual(w["tls_ms"], "groww")
+        self.assertEqual(w["last_tick_age_secs"], "groww")
+        self.assertEqual(w["ticks_per_sec"], "groww")  # higher is better
+        self.assertEqual(w["subscribed_total"], "dhan")
+
+    def test_feed_comparison_winners_tie_and_single_feed_no_winner(self) -> None:
+        # Tie at the best value → no single winner claimed.
+        tied = [
+            {"feed": "dhan", "tcp_ms": "9.0"},
+            {"feed": "groww", "tcp_ms": "9.0"},
+        ]
+        self.assertNotIn("tcp_ms", handler._feed_comparison_winners(tied))
+        # Only one feed has a comparable value → nothing to compare → no winner.
+        single = [
+            {"feed": "dhan", "tcp_ms": "9.0"},
+            {"feed": "groww", "tcp_ms": ""},
+        ]
+        self.assertNotIn("tcp_ms", handler._feed_comparison_winners(single))
+        self.assertEqual(handler._feed_comparison_winners([]), {})
+
+    def test_latency_commands_probe_all_mapped_feeds_in_parallel(self) -> None:
+        cmds = handler._LATENCY_COMMANDS
+        joined = "\n".join(cmds)
+        for feed, host in handler._FEED_LIVE_HOSTS.items():
+            self.assertIn(f"PROBE_{feed}_BEGIN", joined)
+            self.assertIn(f"https://{host}/", joined)
+        # Parallel background probes + wait, each curl time-bounded — one
+        # dead feed endpoint can never hang the whole measure.
+        self.assertIn(") &", joined)
+        self.assertIn("wait", cmds)
+        for c in cmds:
+            if "https://" in c:
+                self.assertIn(f"--max-time {handler._FEED_PROBE_MAX_SECS}", c)
+        # The feed LIST is discovered from the app at measure time (twice —
+        # bracketing the window for the ticks/sec delta).
+        self.assertEqual(joined.count("/api/feeds/health"), 2)
 
     # ---- windowed percentile math (operator directive 2026-06-10) ----
 
@@ -231,9 +377,9 @@ class Latency(unittest.TestCase):
             "tv_tick_processing_duration_ns_sum 2000000\n"
             "tv_tick_processing_duration_ns_count 1000\n"
             "METRICS_T0_END\n"
-            "DHAN_BEGIN\n"
+            "PROBE_dhan_BEGIN\n"
             "0.012 0.030\n"
-            "DHAN_END\n"
+            "PROBE_dhan_END\n"
             "QDB=0.0021\n"
             "SKEW=0.000123\n"
             "T1=110.0\n"
@@ -1033,6 +1179,43 @@ class FeedsCardHtml(unittest.TestCase):
         html = handler._console_html()
         self.assertIn("esc(j.feeds_error", html)
         self.assertIn("j.app_response.error", html)
+
+
+class LatencyCardHtml(unittest.TestCase):
+    """Per-feed latency comparison card (operator demand 2026-07-03)."""
+
+    @staticmethod
+    def _load_latency_js() -> str:
+        html = handler._console_html()
+        return html.split("async function loadLatency()", 1)[1].split("async function act(", 1)[0]
+
+    def test_html_has_per_feed_table_and_instrument_load_line(self) -> None:
+        html = handler._console_html()
+        self.assertIn('id="latfeeds"', html)
+        self.assertIn('id="latload"', html)
+        self.assertIn("instrument load", html)
+        self.assertIn("endpoint unknown", html)
+        self.assertIn("td.win", html)  # green best-per-column highlight style
+
+    def test_latency_card_iterates_feed_list_no_hardcoded_names(self) -> None:
+        # Future-feeds ratchet: the table renders whatever j.feeds carries
+        # (the app's own /api/feeds/health list) and highlights via the
+        # server-computed winners map — NO feed name may be hardcoded in the
+        # portal JS, so a future feed #3 needs zero portal changes.
+        js = self._load_latency_js()
+        self.assertIn("j.feeds", js)
+        self.assertIn("j.winners", js)
+        self.assertNotIn("dhan", js.lower())
+        self.assertNotIn("groww", js.lower())
+
+    def test_box_wide_cards_labeled_honestly(self) -> None:
+        # Tick processing / QuestDB RTT / clock skew carry NO feed label in
+        # the app's metrics — the card must say "box-wide", never fake a
+        # per-feed processing split.
+        html = handler._console_html()
+        self.assertIn("box-wide (shared by all feeds)", html)
+        self.assertIn("QuestDB round-trip (box-wide)", html)
+        self.assertIn("Clock skew (box-wide)", html)
 
 
 class _FakeEc2:
