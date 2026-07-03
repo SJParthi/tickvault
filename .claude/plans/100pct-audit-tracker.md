@@ -26,8 +26,8 @@ falls under and what artifact proves the claim.
 
 | Dimension | Category | Target | Proof artifact |
 |---|---|---|---|
-| Line coverage (all crates) | P | 100% | `quality/crate-coverage-thresholds.toml` + `scripts/coverage-gate.sh` in CI (blocks merge if <100%) |
-| Branch coverage | P | 100% | Same file, same gate |
+| Line coverage (all crates) | P | Ratcheted per-crate floors (63.3–99.5; target 100%) | `quality/crate-coverage-thresholds.toml` + `scripts/coverage-gate.sh` — post-merge job `coverage-and-perf` (NOT a merge blocker) |
+| Branch coverage | P | NOT enforced (line coverage only) | No branch-coverage gate exists today; the TOML + gate enforce LINE coverage only |
 | Mutation coverage (critical crates) | P | 0 survivors | `.github/workflows/mutation.yml` fails PR on any `SURVIVED:` line |
 | Proptest randomised input coverage | P | 10,000+ cases per prop | `crates/core/tests/proptest_parser.rs` + `crates/core/tests/proptest_greeks_core.rs` + CI runs |
 | Loom concurrency coverage | P | All atomic types | `crates/trading/tests/loom_circuit_breaker.rs` |
