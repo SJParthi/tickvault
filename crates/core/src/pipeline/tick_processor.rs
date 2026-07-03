@@ -758,6 +758,12 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
     let m_market_status_updates = counter!("tv_market_status_updates_total");
     let m_disconnects = counter!("tv_disconnect_frames_total");
     let m_tick_duration = histogram!("tv_tick_processing_duration_ns");
+    // B6 (2026-07-03): true-compute histogram — the total span MINUS any
+    // persistence stall the writer accrued this iteration (blocking-send /
+    // inline-flush fallbacks, disconnected-branch recovery). Steady state
+    // (off-thread flush healthy): stall = 0 and compute ≈ total. The
+    // `_duration_ns` suffix auto-inherits the exporter's bucket config.
+    let m_tick_compute = histogram!("tv_tick_compute_duration_ns");
     let m_wire_to_done = histogram!("tv_wire_to_done_duration_ns");
     let m_pipeline_active = gauge!("tv_pipeline_active");
     let m_dedup_filtered = counter!("tv_dedup_filtered_total");
@@ -1749,7 +1755,18 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
             }
         }
 
-        m_tick_duration.record(tick_start.elapsed().as_nanos() as f64);
+        let total_elapsed_ns = u64::try_from(tick_start.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        m_tick_duration.record(total_elapsed_ns as f64);
+        // B6: compute-only = total minus the persistence stall this iteration
+        // (the writer measures its blocking-send / inline-flush fallbacks and
+        // disconnected-branch recovery as stall; the offloaded steady state
+        // accrues zero). Keeping the TOTAL histogram above unchanged preserves
+        // dashboard/alert back-compat; the 10µs bench budget gates the
+        // compute-only figure.
+        let stall_ns = tick_writer
+            .as_mut()
+            .map_or(0, TickPersistenceWriter::take_last_stall_ns);
+        m_tick_compute.record(total_elapsed_ns.saturating_sub(stall_ns) as f64);
         // Wire-to-done: from WebSocket receive (received_at_nanos) to pipeline completion.
         // Different from tick_duration which only measures processing time (tick_start).
         let wire_elapsed_ns = chrono::Utc::now()
@@ -1933,6 +1950,35 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
 #[allow(clippy::arithmetic_side_effects)] // APPROVED: test-only arithmetic (casts, indexing) is safe
 mod tests {
     use super::*;
+
+    /// B6 ratchet (2026-07-03): the tick loop MUST record the compute-only
+    /// histogram `tv_tick_compute_duration_ns` next to the total
+    /// `tv_tick_processing_duration_ns`, and MUST subtract the writer's
+    /// persistence stall (`take_last_stall_ns`) so flush I/O never re-folds
+    /// into the compute figure. Removing either silently reverts the B6
+    /// latency split.
+    #[test]
+    fn test_compute_histogram_recorded_and_subtracts_stall() {
+        let source = include_str!("tick_processor.rs");
+        assert!(
+            source.contains("histogram!(\"tv_tick_compute_duration_ns\")"),
+            "tick_processor must register the tv_tick_compute_duration_ns histogram"
+        );
+        assert!(
+            source.contains("take_last_stall_ns"),
+            "the compute record must subtract the writer's persistence stall \
+             (take_last_stall_ns)"
+        );
+        assert!(
+            source.contains("total_elapsed_ns.saturating_sub(stall_ns)"),
+            "compute = total − stall (saturating) — the exact B6 split"
+        );
+        // The TOTAL histogram must remain for dashboard/alert back-compat.
+        assert!(
+            source.contains("histogram!(\"tv_tick_processing_duration_ns\")"),
+            "the total-span histogram must stay (back-compat)"
+        );
+    }
 
     // --- Dedup-collision elimination: strict-monotonic received_at ---
     // (operator directive 2026-06-04) — prove two distinct ticks can never
