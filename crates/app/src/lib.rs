@@ -54,6 +54,7 @@ pub mod groww_scale_ladder;
 /// Groww Python-sidecar auto-launcher + supervisor (operator lock §32 +
 /// "no manual commands" 2026-06-19). Default-OFF.
 pub mod groww_sidecar_supervisor;
+pub mod scale_test_preflight;
 /// Shared per-seal routing for BOTH feeds (Dhan + Groww) — the single
 /// `route_seal` body the two `on_seal` call sites invoke (C2, behavior-preserving).
 pub mod seal_routing;

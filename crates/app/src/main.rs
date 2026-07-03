@@ -514,9 +514,25 @@ async fn main() -> Result<()> {
     // replace the single bridge + single sidecar (same aggregator engine,
     // same ring→spill→DLQ chain, ONE shared capture-seq across shards).
     let groww_scale_cfg = config.feeds.groww.scale.clone();
-    let groww_scale_enabled = groww_scale_cfg.enabled;
     let groww_shards_root =
         std::path::PathBuf::from(tickvault_app::groww_bridge::GROWW_SHARDS_DIR_DEFAULT);
+    // §34 PR-3 (addendum A): the Mac scale-test PREFLIGHT gates the fleet.
+    // On ANY failed check the boot falls back to the SINGLE-CONNECTION Groww
+    // path — capture continues; only the multi-conn experiment is refused.
+    let groww_scale_enabled = groww_scale_cfg.enabled
+        && {
+            let report = tickvault_app::scale_test_preflight::run_scale_preflight(
+                &groww_shards_root,
+                &config.questdb,
+            );
+            let ok = report.all_ok();
+            if !ok {
+                error!(
+                    "[feeds] groww scale PREFLIGHT FAILED — falling back to the                  single-connection Groww path (capture continues; fix the                  failed checks above and restart to run the scale test)"
+                );
+            }
+            ok
+        };
     // Watch-entries slot: the activation watcher publishes the daily
     // subscribe set here so the ladder can cut shards (scale mode only).
     let groww_scale_entries: std::sync::Arc<

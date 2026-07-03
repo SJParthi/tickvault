@@ -230,15 +230,24 @@ checks; portal rows render test.
 
 ### PR-3 — operator UX
 
-- [ ] Item 10: `make scale-test` target + Mac runbook
+- [x] Item 10: `make scale-test` target + Mac runbook
   - Files: Makefile, docs/runbooks/groww-scale-test.md
   - Tests: n/a — docs + make target (shell smoke)
-- [ ] Item 11: 2×600 cap-probe mode (`scale.probe_mode = true`) with per-conn-vs-per-account verdict
+- [x] Item 11: 2×600 cap-probe mode (`scale.probe_mode = true`) with per-conn-vs-per-account verdict
   - Files: crates/common/src/config.rs (probe_mode), crates/app/src/groww_scale_ladder.rs (probe short-circuit)
   - Tests: test_probe_mode_runs_two_conns_600, test_probe_verdict_classification
-- [ ] Item 12: portal feeds panel per-conn health rows (app-side)
+- [x] Item 12: portal feeds panel per-conn health rows (app-side)
   - Files: crates/api/src/feed_state.rs / handlers, crates/app wiring
   - Tests: test_feeds_health_includes_connections_array
+- [x] Addendum A (coordinator 2026-07-03): Mac preflight in app boot — shards-dir writable + disk headroom + QuestDB ILP/HTTP reachability + PROD-IS-UNTOUCHED banner; any FAIL falls back to the single-conn Groww path
+  - Files: crates/app/src/scale_test_preflight.rs, crates/app/src/main.rs, crates/app/src/lib.rs
+  - Tests: test_preflight_report_all_ok_classification, test_classify_disk_check_boundaries, test_is_local_host_classification, test_check_shards_dir_writable_pass_and_fail, test_check_tcp_reachable_against_live_listener_and_dead_port, test_run_scale_preflight_reports_four_checks
+- [x] Addendum B (coordinator 2026-07-03): IntelliJ run configuration
+  - Files: .run/Groww Scale Test.run.xml
+  - Tests: n/a — IDE config (mirrors the existing .run/*.xml shape)
+- [x] Addendum C (coordinator 2026-07-03): weekend SMOKE mode — market closed => machinery-validated run with tick gates honestly SKIPPED (auth + host gates stay real); outcomes labelled SMOKE; no effect while market open
+  - Files: crates/common/src/config.rs (weekend_smoke), crates/app/src/groww_scale_ladder.rs
+  - Tests: test_smoke_mode_gate_inputs_pass_tick_gates_keep_host_gates, test_groww_scale_probe_mode_and_weekend_smoke_parse_from_toml
 
 ## Scenarios
 

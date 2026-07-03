@@ -54,6 +54,11 @@ pub enum ScaleOutcome {
     GlobalHalved,
     /// The effective ceiling was reached and verified.
     HaltedAtCeiling,
+    /// §34 PR-3 (Item 11): the cap-probe run's per-conn-vs-per-account
+    /// verdict row — the `reason` column carries the verdict label
+    /// (`probe_multi_conn_ok` / `probe_per_account_limited` /
+    /// `probe_inconclusive` / `probe_smoke_machinery_validated`).
+    ProbeVerdict,
 }
 
 impl ScaleOutcome {
@@ -66,6 +71,7 @@ impl ScaleOutcome {
             Self::RolledBack => "rolled_back",
             Self::GlobalHalved => "global_halved",
             Self::HaltedAtCeiling => "halted_at_ceiling",
+            Self::ProbeVerdict => "probe_verdict",
         }
     }
 
@@ -315,6 +321,7 @@ mod tests {
         assert_eq!(ScaleOutcome::RolledBack.as_str(), "rolled_back");
         assert_eq!(ScaleOutcome::GlobalHalved.as_str(), "global_halved");
         assert_eq!(ScaleOutcome::HaltedAtCeiling.as_str(), "halted_at_ceiling");
+        assert_eq!(ScaleOutcome::ProbeVerdict.as_str(), "probe_verdict");
     }
 
     #[test]
@@ -322,6 +329,9 @@ mod tests {
         assert!(ScaleOutcome::VerifiedHealthy.is_verified_healthy());
         assert!(ScaleOutcome::HaltedAtCeiling.is_verified_healthy());
         assert!(!ScaleOutcome::AdvanceStarted.is_verified_healthy());
+        // A probe verdict is a REPORT, never a resume-here-healthy marker —
+        // rehydration must not resume a rung off a verdict row.
+        assert!(!ScaleOutcome::ProbeVerdict.is_verified_healthy());
         assert!(!ScaleOutcome::RolledBack.is_verified_healthy());
         assert!(!ScaleOutcome::GlobalHalved.is_verified_healthy());
     }
