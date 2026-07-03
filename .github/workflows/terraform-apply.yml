@@ -185,6 +185,23 @@ jobs:
       - name: terraform fmt -check
         run: terraform -chdir=${{ env.TF_DIR }} fmt -check -recursive
 
+      # AWS rejects non-ASCII in security-group RULE descriptions (issue #229 —
+      # an em-dash in main.tf's B4 ingress description hard-failed apply).
+      # Guard: scan ingress/egress blocks in all .tf files for non-ASCII
+      # description values. Variable/output/alarm descriptions are unaffected.
+      - name: ASCII-only SG rule descriptions
+        run: |
+          perl -ne '
+            $in = 1 if /^\s*(dynamic\s+")?(ingress|egress)"?\s*\{/;
+            if ($in) {
+              $d += () = /\{/g; $d -= () = /\}/g;
+              if (/^\s*description\s*=/ && /[^\x00-\x7F]/) { print "$ARGV:$.: non-ASCII in SG rule description: $_"; $bad = 1 }
+              if ($d <= 0) { $in = 0; $d = 0 }
+            }
+            close ARGV if eof;
+            END { exit($bad ? 1 : 0) }
+          ' ${{ env.TF_DIR }}/*.tf
+
       - name: terraform init (with S3 backend)
         run: |
           terraform -chdir=${{ env.TF_DIR }} init \
