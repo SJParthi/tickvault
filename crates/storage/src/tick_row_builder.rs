@@ -30,9 +30,11 @@
 //!
 //! For every `Option` column that is `None`, the builder **OMITS the column
 //! token entirely** so QuestDB stores NULL — it NEVER writes `0`. A Groww LTP
-//! feed supplies no OHLC / OI / avg_price / qty fields / payload_hash /
-//! received_at, so those stay NULL (not a misleading `0`). Pinned by the
-//! NULL-not-0 wire-byte tests.
+//! feed supplies no OHLC / OI / avg_price / qty fields / payload_hash, so
+//! those stay NULL (not a misleading `0`). Since 2026-07-03 (lag forensics
+//! fix #3) Groww DOES stamp `received_at` (the bridge's per-wake receipt
+//! clock, plausibility-gated — a broken clock still yields `None` → NULL).
+//! Pinned by the NULL-not-0 wire-byte tests.
 //!
 //! ## Pre-validated ILP names (latency, inherited from `build_tick_row_seq`)
 //!
