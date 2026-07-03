@@ -867,6 +867,25 @@ jobs:
           fi
           echo "DEPLOY VERIFIED: tickvault reached readiness (systemd active, or a healthy slow WAL-replay boot with no crash)"
 
+      - name: Record deployed binary git SHA to SSM (B9 deploy provenance)
+        # Runs ONLY after the swap is verified healthy (same gate as the
+        # success Telegram — an intentional off-hours skip writes nothing).
+        # Consumers: the operator-portal footer (binary <sha7>) and the
+        # deploy-watchdog binary-vs-main mismatch metric + 24h stale alarm.
+        # NON-FATAL by design: a provenance-recording failure must never
+        # fail (or roll back) a verified-healthy deploy — the next deploy
+        # retries the write. The IAM grant lives in deploy/aws/terraform/
+        # oidc.tf (ssm:PutParameter on exactly this parameter ARN).
+        if: success() && env.DEPLOY_SKIP_REASON == ''
+        run: |
+          aws ssm put-parameter \
+            --region ${{ vars.AWS_REGION || 'ap-south-1' }} \
+            --name "/tickvault/prod/deploy/binary-git-sha" \
+            --type String \
+            --overwrite \
+            --value "${GITHUB_SHA}" \
+          || echo "::warning::WARN: provenance param write failed — /tickvault/prod/deploy/binary-git-sha NOT updated (deploy itself is verified healthy; portal footer + stale-binary alarm will show the previous/unknown sha until the next deploy)"
+
       - name: Notify Telegram on success
         # ANTI-FALSE-OK: an intentional off-hours skip now exits the deploy job
         # GREEN (see the "Ensure instance running" step), so `success()` alone
