@@ -122,7 +122,7 @@ untouched crates in the same session.
 ## What This Does NOT Do
 
 - Does not skip any test in CI
-- Does not weaken coverage thresholds (still 100% per
+- Does not weaken coverage thresholds (still the ratcheted per-crate floors, target 100%, per
   `quality/crate-coverage-thresholds.toml`)
 - Does not allow merging without running the full battery somewhere
 - Does not apply to the changed crate's OWN tests (those always run)

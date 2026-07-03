@@ -87,6 +87,17 @@ fn test_calendar() -> Arc<TradingCalendar> {
     Arc::new(TradingCalendar::from_config(&trading).expect("valid test calendar")) // APPROVED: test-only
 }
 
+/// True when the CI lane demands a real QuestDB: with `TV_REQUIRE_QDB` set,
+/// an unreachable QuestDB PANICS instead of skipping, so the Groww e2e lane
+/// can never vacuously pass (audit-findings Rule 11: no false-OK signals).
+fn qdb_required() -> bool {
+    std::env::var("TV_REQUIRE_QDB").is_ok()
+}
+
+/// Panic message for the `TV_REQUIRE_QDB` hard-fail branch (shared by all 3 tests).
+const QDB_REQUIRED_PANIC: &str = "TV_REQUIRE_QDB=1 set but QuestDB not reachable on \
+     127.0.0.1:9000/9009 — the CI lane must never vacuously pass (audit Rule 11)";
+
 /// True when QuestDB's HTTP `/exec` answers 200 AND the ILP TCP port accepts a
 /// connection. Used to SKIP (not fail) when no DB is available.
 async fn questdb_available() -> bool {
@@ -202,6 +213,7 @@ async fn wait_until_count(sql: &str, want: i64, deadline: Duration) -> i64 {
 #[tokio::test]
 async fn groww_ticks_and_candles_land_tagged_feed_groww() {
     if !questdb_available().await {
+        assert!(!qdb_required(), "{QDB_REQUIRED_PANIC}");
         eprintln!(
             "SKIP groww_ticks_and_candles_land_tagged_feed_groww: QuestDB not reachable on \
              127.0.0.1:{QDB_HTTP_PORT}/{QDB_ILP_PORT} — run a local QuestDB to exercise this proof."
@@ -372,6 +384,7 @@ async fn ilp_send(line: &str) {
 #[tokio::test]
 async fn malformed_ndjson_line_is_skipped_and_valid_lines_land() {
     if !questdb_available().await {
+        assert!(!qdb_required(), "{QDB_REQUIRED_PANIC}");
         eprintln!("SKIP malformed_ndjson_line_is_skipped: QuestDB not reachable.");
         return;
     }
@@ -433,6 +446,7 @@ async fn malformed_ndjson_line_is_skipped_and_valid_lines_land() {
 #[tokio::test]
 async fn replay_same_ndjson_is_idempotent_no_duplicate_rows() {
     if !questdb_available().await {
+        assert!(!qdb_required(), "{QDB_REQUIRED_PANIC}");
         eprintln!("SKIP replay_same_ndjson_is_idempotent: QuestDB not reachable.");
         return;
     }
