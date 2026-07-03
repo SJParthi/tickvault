@@ -379,6 +379,19 @@ pub struct GrowwSidecarOptions {
     /// `GROWW_STATUS_FILE`. Carries ONLY counts + an event tag + a timestamp —
     /// never a credential.
     pub status_file: PathBuf,
+    /// §34 auto-scale (PR-2): the connection id this child owns. `None` =
+    /// the single-conn path (byte-identical to pre-scale behavior — no new
+    /// env vars, no argv, same pkill needle). `Some(n)` = fleet child `n`:
+    /// per-conn env (`GROWW_CONN_ID` / `GROWW_SHARD_SPEC` / `GROWW_WATCH_DIR`),
+    /// per-conn argv (`--conn-id n` — the pkill needle distinguisher so
+    /// relaunching conn n never reaps its siblings), per-conn paths.
+    pub conn_id: Option<usize>,
+    /// §34: the per-conn watch DIRECTORY (`GROWW_WATCH_DIR` env). `None` =
+    /// the sidecar's built-in default (`data/groww`).
+    pub watch_dir: Option<PathBuf>,
+    /// §34: human-readable shard identity for the child's log lines
+    /// (`GROWW_SHARD_SPEC` env). Counts + ranges only — never a credential.
+    pub shard_spec: Option<String>,
 }
 
 impl Default for GrowwSidecarOptions {
@@ -390,8 +403,60 @@ impl Default for GrowwSidecarOptions {
             requirements_path: PathBuf::from(GROWW_SIDECAR_REQUIREMENTS_DEFAULT),
             tick_file: PathBuf::from(crate::groww_bridge::GROWW_TICK_FILE_DEFAULT),
             status_file: PathBuf::from(crate::groww_bridge::GROWW_STATUS_FILE_DEFAULT),
+            conn_id: None,
+            watch_dir: None,
+            shard_spec: None,
         }
     }
+}
+
+/// §34 auto-scale (PR-2 Item 5): derives one fleet child's options from the
+/// base options + the shard's file layout. Pure — path/env math only. The
+/// venv, script, and requirements are SHARED (one provision, N children);
+/// tick/status/watch paths are per-conn (disjoint capture chains).
+#[must_use]
+pub fn shard_sidecar_options(
+    base: &GrowwSidecarOptions,
+    files: &crate::groww_bridge::GrowwShardFiles,
+    shard_spec: String,
+) -> GrowwSidecarOptions {
+    GrowwSidecarOptions {
+        system_python: base.system_python.clone(),
+        venv_dir: base.venv_dir.clone(),
+        script_path: base.script_path.clone(),
+        requirements_path: base.requirements_path.clone(),
+        tick_file: files.tick_file.clone(),
+        status_file: files.status_file.clone(),
+        conn_id: Some(files.conn_id),
+        watch_dir: Some(files.watch_dir.clone()),
+        shard_spec: Some(shard_spec),
+    }
+}
+
+/// §34: the pkill pattern that reaps ONLY this child's orphaned prior
+/// process. Single-conn = the script path (pre-scale behavior, unchanged).
+/// Fleet child n = `<script> --conn-id n$` — the `$` anchor plus the argv
+/// suffix means relaunching conn 3 can never match conn 30 or a sibling.
+#[must_use]
+pub fn orphan_reap_needle(script_path: &Path, conn_id: Option<usize>) -> String {
+    let script = script_path.to_string_lossy();
+    match conn_id {
+        None => script.into_owned(),
+        Some(n) => format!("{script} --conn-id {n}$"),
+    }
+}
+
+/// §34: the child argv for a given conn. Single-conn = script only
+/// (byte-identical to pre-scale). Fleet child = `script --conn-id n` so the
+/// cmdline is per-conn distinguishable (the reap needle above).
+#[must_use]
+pub fn sidecar_argv(script_path: &Path, conn_id: Option<usize>) -> Vec<String> {
+    let mut args = vec![script_path.to_string_lossy().into_owned()];
+    if let Some(n) = conn_id {
+        args.push("--conn-id".to_string());
+        args.push(n.to_string());
+    }
+    args
 }
 
 /// Exponential restart backoff, capped. Failure 0 → no wait (first launch is
@@ -1037,7 +1102,9 @@ pub async fn run_groww_sidecar_supervisor(
         // even carry the retired mint code. Best-effort pkill of any process
         // running our sidecar script before spawning the fresh one (single-app
         // host; matches the exact script path, nothing else).
-        let script_needle = opts.script_path.to_string_lossy().into_owned();
+        // §34: per-conn needle when this is a fleet child — relaunching conn n
+        // must never reap a healthy sibling (see `orphan_reap_needle`).
+        let script_needle = orphan_reap_needle(&opts.script_path, opts.conn_id);
         if let Ok(status) = Command::new("pkill")
             .args(["-f", &script_needle])
             .status()
@@ -1052,7 +1119,11 @@ pub async fn run_groww_sidecar_supervisor(
         }
 
         let venv_python = venv_python_path(&opts.venv_dir);
-        let (prog, args) = build_sidecar_run_command(&venv_python, &opts.script_path);
+        let (prog, _single_args) = build_sidecar_run_command(&venv_python, &opts.script_path);
+        // §34: fleet children carry `--conn-id n` argv (the reap-needle
+        // distinguisher). Single-conn path: `sidecar_argv(_, None)` == the
+        // legacy single-element argv — byte-identical behavior.
+        let args = sidecar_argv(&opts.script_path, opts.conn_id);
         let mut cmd = Command::new(&prog);
         cmd.args(&args)
             .env("GROWW_SSM_TOKEN_PARAM", &token_param_path)
@@ -1064,7 +1135,20 @@ pub async fn run_groww_sidecar_supervisor(
             .env(
                 "GROWW_STATUS_FILE",
                 opts.status_file.to_string_lossy().as_ref(),
-            )
+            );
+        // §34 auto-scale: fleet children get their conn identity + per-conn
+        // watch dir. Counts/paths only — never a credential. Single-conn path
+        // sets NONE of these (byte-identical env to pre-scale).
+        if let Some(conn_id) = opts.conn_id {
+            cmd.env("GROWW_CONN_ID", conn_id.to_string());
+        }
+        if let Some(watch_dir) = &opts.watch_dir {
+            cmd.env("GROWW_WATCH_DIR", watch_dir.to_string_lossy().as_ref());
+        }
+        if let Some(spec) = &opts.shard_spec {
+            cmd.env("GROWW_SHARD_SPEC", spec);
+        }
+        cmd
             // Capture the child's stdout + stderr so its diagnostic lines (the
             // SDK's bare `Error:`, the SILENT-FEED entitlement line, auth/permission
             // rejects, the redacted traceback) reach `tracing` → CloudWatch +
@@ -1227,6 +1311,140 @@ pub fn spawn_supervised_groww_sidecar_supervisor(
             sleep(Duration::from_secs(FEED_SUPERVISOR_RESPAWN_BACKOFF_SECS)).await;
         }
     })
+}
+
+/// §34 auto-scale (PR-2 Item 5): the fleet reconciler. Keeps exactly
+/// `desired_conns` per-conn sidecar supervision tasks alive — the ladder
+/// publishes `desired_conns` (an `Arc<AtomicUsize>`) and pokes `wake`;
+/// this loop spawns the missing children (lowest conn id first) and kills
+/// the NEWEST children on scale-down (aborting the task drops its `Child`,
+/// whose `kill_on_drop(true)` reaps the Python process). A finished child
+/// task (panic/return) is respawned with the FEED-SUPERVISOR-01 signal —
+/// a fleet child can never die silently.
+///
+/// Pure decision math (`fleet_reconcile_actions`) is unit-tested below;
+/// this loop is composition-only.
+// TEST-EXEMPT: spawn/abort/sleep reconciler loop; the pure reconcile decision (fleet_reconcile_actions) + the per-conn option/env/argv/needle primitives are unit-tested, and the child lifecycle is the already-tested run_groww_sidecar_supervisor.
+pub fn spawn_groww_scale_fleet(
+    feed_runtime: Arc<FeedRuntimeState>,
+    base_opts: GrowwSidecarOptions,
+    shards_root: PathBuf,
+    desired_conns: Arc<std::sync::atomic::AtomicUsize>,
+    wake: Arc<tokio::sync::Notify>,
+    feed_health: Arc<FeedHealthRegistry>,
+    notifier: Arc<arc_swap::ArcSwapOption<NotificationService>>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut children: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+        loop {
+            let want = desired_conns.load(std::sync::atomic::Ordering::Relaxed);
+            // Respawn any finished child in place (FEED-SUPERVISOR-01).
+            for (conn_id, handle) in children.iter_mut().enumerate() {
+                if handle.is_finished() {
+                    error!(
+                        code = ErrorCode::FeedSupervisor01Respawned.code_str(),
+                        feed = Feed::Groww.as_str(),
+                        conn_id,
+                        "[feeds] FEED-SUPERVISOR-01: fleet child supervision task died — respawning"
+                    );
+                    metrics::counter!(
+                        "tv_feed_supervisor_respawn_total",
+                        "feed" => Feed::Groww.as_str(),
+                        "component" => "scale_fleet_child",
+                    )
+                    .increment(1);
+                    *handle = spawn_fleet_child(
+                        &feed_runtime,
+                        &base_opts,
+                        &shards_root,
+                        conn_id,
+                        &feed_health,
+                        &notifier,
+                    );
+                }
+            }
+            match fleet_reconcile_actions(children.len(), want) {
+                FleetAction::SpawnUpTo(target) => {
+                    while children.len() < target {
+                        let conn_id = children.len();
+                        info!(conn_id, "[feeds] groww scale fleet: spawning connection");
+                        children.push(spawn_fleet_child(
+                            &feed_runtime,
+                            &base_opts,
+                            &shards_root,
+                            conn_id,
+                            &feed_health,
+                            &notifier,
+                        ));
+                    }
+                }
+                FleetAction::KillNewestTo(target) => {
+                    while children.len() > target {
+                        let conn_id = children.len() - 1;
+                        info!(
+                            conn_id,
+                            "[feeds] groww scale fleet: killing NEWEST connection (scale-down)"
+                        );
+                        if let Some(handle) = children.pop() {
+                            // Abort drops the supervise future → drops the
+                            // Child → kill_on_drop reaps the Python process.
+                            handle.abort();
+                        }
+                    }
+                }
+                FleetAction::Steady => {}
+            }
+            metrics::gauge!("tv_groww_conns_active").set(children.len() as f64);
+            tokio::select! {
+                () = wake.notified() => {}
+                () = sleep(SIDECAR_DISABLE_POLL) => {}
+            }
+        }
+    })
+}
+
+/// Spawn one fleet child's per-conn supervision loop.
+// TEST-EXEMPT: thin spawn wrapper over the tested run_groww_sidecar_supervisor + pure shard option derivation.
+fn spawn_fleet_child(
+    feed_runtime: &Arc<FeedRuntimeState>,
+    base_opts: &GrowwSidecarOptions,
+    shards_root: &Path,
+    conn_id: usize,
+    feed_health: &Arc<FeedHealthRegistry>,
+    notifier: &Arc<arc_swap::ArcSwapOption<NotificationService>>,
+) -> tokio::task::JoinHandle<()> {
+    let files = crate::groww_bridge::shard_files(shards_root, conn_id);
+    let opts = shard_sidecar_options(base_opts, &files, format!("c{conn_id:02}"));
+    tokio::spawn(run_groww_sidecar_supervisor(
+        Arc::clone(feed_runtime),
+        opts,
+        Arc::clone(feed_health),
+        Arc::clone(notifier),
+    ))
+}
+
+/// §34: pure fleet reconcile decision — spawn missing (lowest ids first),
+/// kill newest on scale-down, steady otherwise.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FleetAction {
+    /// Spawn children until the fleet reaches this size.
+    SpawnUpTo(usize),
+    /// Abort newest children until the fleet shrinks to this size.
+    KillNewestTo(usize),
+    /// Fleet already matches the desired size.
+    Steady,
+}
+
+/// Pure reconcile decision for the fleet loop.
+#[must_use]
+pub const fn fleet_reconcile_actions(current: usize, desired: usize) -> FleetAction {
+    if current < desired {
+        FleetAction::SpawnUpTo(desired)
+    } else if current > desired {
+        FleetAction::KillNewestTo(desired)
+    } else {
+        FleetAction::Steady
+    }
 }
 
 #[cfg(test)]
@@ -2018,5 +2236,92 @@ mod tests {
                 && src.contains("NotificationEvent::GrowwSidecarRejected"),
             "an alert-class line must mark feed_health rejected + fire the typed Telegram event"
         );
+    }
+
+    // ── §34 auto-scale (PR-2 Item 5) ──
+
+    /// Plan test: fleet children carry conn identity + shard spec through
+    /// options AND the child env injection exists in the launch source.
+    #[test]
+    fn test_shard_sidecar_options_env_carries_conn_id_and_spec() {
+        let base = GrowwSidecarOptions::default();
+        let files = crate::groww_bridge::shard_files(Path::new("data/groww/shards"), 3);
+        let opts = shard_sidecar_options(&base, &files, "c03".to_string());
+        assert_eq!(opts.conn_id, Some(3));
+        assert_eq!(opts.shard_spec.as_deref(), Some("c03"));
+        assert_eq!(opts.watch_dir, Some(files.watch_dir.clone()));
+        assert_eq!(opts.tick_file, files.tick_file);
+        assert_eq!(opts.status_file, files.status_file);
+        // Shared provision surface (one venv, N children).
+        assert_eq!(opts.venv_dir, base.venv_dir);
+        assert_eq!(opts.script_path, base.script_path);
+        // Source-scan: the launch site injects the 3 per-conn env vars
+        // (mirrors the GROWW_STATUS_FILE wiring ratchet above).
+        let src = include_str!("groww_sidecar_supervisor.rs");
+        for needle in [
+            "cmd.env(\"GROWW_CONN_ID\"",
+            "cmd.env(\"GROWW_WATCH_DIR\"",
+            "cmd.env(\"GROWW_SHARD_SPEC\"",
+        ] {
+            assert!(src.contains(needle), "launch site must inject {needle}");
+        }
+    }
+
+    /// Ratchet: scale disabled (the default `conn_id: None`) is byte-identical
+    /// to the pre-scale child contract — same argv, same reap needle, no
+    /// per-conn env values in the options.
+    #[test]
+    fn test_single_conn_path_unchanged_when_scale_disabled() {
+        let opts = GrowwSidecarOptions::default();
+        assert_eq!(opts.conn_id, None);
+        assert_eq!(opts.watch_dir, None);
+        assert_eq!(opts.shard_spec, None);
+        let script = Path::new("scripts/groww-sidecar/groww_sidecar.py");
+        // argv: exactly the script (what build_sidecar_run_command produced).
+        assert_eq!(
+            sidecar_argv(script, None),
+            vec![script.to_string_lossy().into_owned()]
+        );
+        // reap needle: exactly the script path (legacy behavior).
+        assert_eq!(
+            orphan_reap_needle(script, None),
+            script.to_string_lossy().into_owned()
+        );
+    }
+
+    /// §34: per-conn needle is anchored so conn 3 never matches conn 30.
+    #[test]
+    fn test_orphan_reap_needle_is_per_conn_anchored() {
+        let script = Path::new("scripts/groww-sidecar/groww_sidecar.py");
+        let n3 = orphan_reap_needle(script, Some(3));
+        assert!(n3.ends_with("--conn-id 3$"), "{n3}");
+        let n30 = orphan_reap_needle(script, Some(30));
+        assert!(n30.ends_with("--conn-id 30$"));
+        assert_ne!(n3, n30);
+        // The conn-3 anchored regex cannot match a conn-30 cmdline.
+        let conn30_cmdline = format!("{} --conn-id 30", script.to_string_lossy());
+        assert!(
+            !conn30_cmdline.ends_with("--conn-id 3"),
+            "anchor semantics: conn-30 cmdline must not end with the conn-3 suffix"
+        );
+    }
+
+    /// §34: fleet argv carries the conn id flag pair.
+    #[test]
+    fn test_sidecar_argv_fleet_child_has_conn_id_flag() {
+        let script = Path::new("scripts/groww-sidecar/groww_sidecar.py");
+        let argv = sidecar_argv(script, Some(7));
+        assert_eq!(argv.len(), 3);
+        assert_eq!(argv[1], "--conn-id");
+        assert_eq!(argv[2], "7");
+    }
+
+    /// §34: pure fleet reconcile decision covers all three arms.
+    #[test]
+    fn test_fleet_reconcile_actions() {
+        assert_eq!(fleet_reconcile_actions(0, 2), FleetAction::SpawnUpTo(2));
+        assert_eq!(fleet_reconcile_actions(5, 2), FleetAction::KillNewestTo(2));
+        assert_eq!(fleet_reconcile_actions(2, 2), FleetAction::Steady);
+        assert_eq!(fleet_reconcile_actions(0, 0), FleetAction::Steady);
     }
 }

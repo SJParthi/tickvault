@@ -212,19 +212,19 @@ checks; portal rows render test.
 
 ### PR-2 — supervisor + ladder + capture chain
 
-- [ ] Item 5: N-process sidecar supervision (per-conn child, conn_id + shard env; sidecar reads GROWW_SHARD_SPEC)
+- [x] Item 5: N-process sidecar supervision (per-conn child, conn_id + shard env; sidecar reads GROWW_SHARD_SPEC)
   - Files: crates/app/src/groww_sidecar_supervisor.rs, scripts/groww-sidecar/groww_sidecar.py
   - Tests: test_shard_child_env_carries_conn_id_and_spec, test_single_conn_path_unchanged_when_scale_disabled
-- [ ] Item 6: ladder FSM (PROBING/HOLDING/ADVANCING/ROLLING_BACK/HALTED_AT_CEILING) + gates + rollback + global halve
+- [x] Item 6: ladder FSM (PROBING/HOLDING/ADVANCING/ROLLING_BACK/HALTED_AT_CEILING) + gates + rollback + global halve
   - Files: crates/app/src/groww_scale_ladder.rs
   - Tests: ladder FSM unit tests (every transition + gate permutation), test_global_failure_halves_and_cooldowns, test_rollback_returns_to_last_healthy, test_advance_window_gate
-- [ ] Item 7: per-shard bridge tail-tasks + shared capture_seq atomic
+- [x] Item 7: per-shard bridge tail-tasks + shared capture_seq atomic
   - Files: crates/app/src/groww_bridge.rs
   - Tests: test_shared_capture_seq_monotonic_across_shards, supervisor respawn tests
-- [ ] Item 8: `groww_scale_audit` table (DEDUP keys per repo rules) + metrics + log-only Telegram profile
+- [x] Item 8: `groww_scale_audit` table (DEDUP keys per repo rules) + metrics + log-only Telegram profile
   - Files: crates/storage/src/groww_scale_audit_persistence.rs, crates/app/src/metrics_catalog.rs
   - Tests: DDL/DEDUP/outcome-enum tests per audit-table template
-- [ ] Item 9: cutter proptest + chaos test for mid-ladder deploy-restart resume
+- [x] Item 9: cutter proptest + chaos test for mid-ladder deploy-restart resume
   - Files: crates/core/tests/shard_cutter_property.rs, crates/app/src/groww_scale_ladder.rs (rehydrate tests)
   - Tests: proptest arbitrary watch-sets always disjoint+covering, test_restart_mid_ladder_resumes_last_healthy
 
