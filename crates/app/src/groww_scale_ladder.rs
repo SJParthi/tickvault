@@ -158,6 +158,126 @@ pub struct GateInputs {
 /// Max per-shard bridge behind-ness the advance gate tolerates (design §2).
 pub const GATE_MAX_BEHIND_BYTES: u64 = 4 * 1024 * 1024;
 
+// ---------------------------------------------------------------------------
+// §34 PR-3 — cap-probe mode (Item 11) + weekend SMOKE mode (addendum C)
+// ---------------------------------------------------------------------------
+
+/// Cap-probe connection count (plan scenario 10: "exactly 2 conns × 600").
+pub const PROBE_CONNS: usize = 2;
+
+/// Cap-probe per-connection instrument count. 600 × 2 = 1200 > the documented
+/// 1000 per-session cap — so a healthy 2×600 run PROVES the limit is
+/// per-CONNECTION, and a second-conn failure points at a per-ACCOUNT cap.
+pub const PROBE_INSTRUMENTS_PER_CONN: usize = 600;
+
+/// Probe-mode config override (pure): exactly [`PROBE_CONNS`] connections of
+/// [`PROBE_INSTRUMENTS_PER_CONN`] instruments each — the ladder is a single
+/// rung `[2]`, so the existing machinery climbs straight to 2 and HALTS AT
+/// CEILING there once verified healthy. Everything else (gates, holds,
+/// windows, smoke) is inherited from the operator config unchanged.
+#[must_use]
+pub fn probe_overrides(cfg: &GrowwScaleConfig) -> GrowwScaleConfig {
+    let mut probe = cfg.clone();
+    probe.target_connections = PROBE_CONNS;
+    probe.instruments_per_conn = PROBE_INSTRUMENTS_PER_CONN;
+    probe.ladder = vec![PROBE_CONNS];
+    probe
+}
+
+/// The cap-probe verdict (Item 11: per-conn-vs-per-account classification).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProbeVerdict {
+    /// Both probe connections captured ticks → 2×600 = 1200 instruments live
+    /// simultaneously → the documented 1000 cap is per-CONNECTION and
+    /// multi-connection scaling works on this account.
+    MultiConnOk,
+    /// Conn 0 captured but conn 1 did not → the account streams ONE
+    /// connection; the limit behaves per-ACCOUNT (or the 2nd conn was
+    /// rejected). Do not ladder up until Groww support clarifies.
+    PerAccountLimited,
+    /// Conn 0 itself never captured → infrastructure/auth problem, NOT a
+    /// limit signal. No conclusion about the cap can be drawn.
+    Inconclusive,
+    /// Weekend SMOKE run: the market was closed, so capture evidence cannot
+    /// exist by design. The fleet/ladder MACHINERY was exercised; the cap
+    /// question stays open until a market-hours probe run.
+    SmokeMachineryValidated,
+}
+
+impl ProbeVerdict {
+    /// Stable wire-format label (audit `reason` column + log field).
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::MultiConnOk => "probe_multi_conn_ok",
+            Self::PerAccountLimited => "probe_per_account_limited",
+            Self::Inconclusive => "probe_inconclusive",
+            Self::SmokeMachineryValidated => "probe_smoke_machinery_validated",
+        }
+    }
+
+    /// The one-line operator verdict printed at the end of a probe run.
+    #[must_use]
+    pub const fn operator_line(self) -> &'static str {
+        match self {
+            Self::MultiConnOk => {
+                "PROBE VERDICT: 2 connections x 600 instruments BOTH captured — the 1000-instrument cap is PER-CONNECTION; multi-connection scaling works on this account"
+            }
+            Self::PerAccountLimited => {
+                "PROBE VERDICT: only connection 0 captured — the limit behaves PER-ACCOUNT (2nd connection got nothing); do NOT ladder up until Groww clarifies"
+            }
+            Self::Inconclusive => {
+                "PROBE VERDICT: INCONCLUSIVE — connection 0 itself captured nothing (auth/infra problem, not a limit signal); fix the base feed first"
+            }
+            Self::SmokeMachineryValidated => {
+                "PROBE VERDICT (SMOKE): market closed — fleet + ladder machinery validated end-to-end; re-run during market hours for the real per-conn-vs-per-account answer"
+            }
+        }
+    }
+}
+
+/// Pure verdict classification from per-connection capture evidence (Item 11
+/// test contract: `test_probe_verdict_classification`).
+#[must_use]
+pub const fn classify_probe_verdict(
+    conn0_capturing: bool,
+    conn1_capturing: bool,
+    smoke: bool,
+) -> ProbeVerdict {
+    if smoke {
+        return ProbeVerdict::SmokeMachineryValidated;
+    }
+    match (conn0_capturing, conn1_capturing) {
+        (true, true) => ProbeVerdict::MultiConnOk,
+        (true, false) => ProbeVerdict::PerAccountLimited,
+        (false, _) => ProbeVerdict::Inconclusive,
+    }
+}
+
+/// Weekend SMOKE gate inputs (addendum C): the market is CLOSED, so the
+/// tick-dependent gates (streaming conns, capture lag, behind-bytes) are
+/// honestly SKIPPED — no live market means no ticks BY DESIGN, never a
+/// failure. The REAL signals that stay live: auth rejection (a credential
+/// reject is a genuine fault at any hour) and the host CPU/disk probes.
+#[must_use]
+pub const fn smoke_gate_inputs(
+    current: usize,
+    auth_rejected: bool,
+    cpu_pct: Option<f64>,
+    disk_free_pct: Option<f64>,
+) -> GateInputs {
+    GateInputs {
+        conns_ok: current,
+        conns_expected: current,
+        auth_rejects: if auth_rejected { 1 } else { 0 },
+        capture_lag_ms_max: 0,
+        cpu_pct,
+        disk_free_pct,
+        questdb_ok: true,
+        behind_bytes_max: 0,
+    }
+}
+
 /// Why a gate evaluation failed (stable wire-format labels — metric `reason`
 /// label + audit `reason` column + Telegram body all reuse these). `None` =
 /// every gate passed.
@@ -382,6 +502,22 @@ pub async fn run_groww_scale_ladder(
     };
     use tracing::{error, info, warn};
 
+    // §34 PR-3 (Item 11): cap-probe mode narrows the run to EXACTLY
+    // 2 conns × 600 instruments via a pure config override — the ordinary
+    // ladder machinery then does the climbing/verifying/halting.
+    let cfg = if cfg.probe_mode {
+        let probe = probe_overrides(&cfg);
+        info!(
+            conns = PROBE_CONNS,
+            per_conn = PROBE_INSTRUMENTS_PER_CONN,
+            "[feeds] groww scale ladder: CAP-PROBE mode — 2 x 600 verdict run"
+        );
+        probe
+    } else {
+        cfg
+    };
+    let mut probe_verdict_emitted = false;
+
     ensure_groww_scale_audit_table(&qdb).await;
 
     // ── Wait for the daily watch set (built by the activation watcher). ──
@@ -469,15 +605,28 @@ pub async fn run_groww_scale_ladder(
     );
 
     let mut host_probe_warned = false;
+    let mut smoke_warned = false;
     loop {
         tokio::time::sleep(std::time::Duration::from_secs(LADDER_EVAL_INTERVAL_SECS)).await;
         if !feed_runtime.is_enabled(Feed::Groww) {
             continue; // feed disabled — the fleet's own gate idles the children
         }
-        // Market-hours freeze: no probing credit accrues off-hours.
-        if !tickvault_common::market_hours::is_trading_session_now() {
+        // Market-hours freeze: no probing credit accrues off-hours — UNLESS
+        // weekend SMOKE mode is on (addendum C): then the machinery keeps
+        // running with tick gates honestly skipped + every outcome labelled
+        // SMOKE. Production (weekend_smoke=false) keeps the freeze.
+        let market_open = tickvault_common::market_hours::is_trading_session_now();
+        let smoke = cfg.weekend_smoke && !market_open;
+        if !market_open && !smoke {
             hold_started = None;
             continue;
+        }
+        if smoke && !smoke_warned {
+            smoke_warned = true;
+            warn!(
+                "[feeds] groww scale ladder: SMOKE mode — market closed; tick \
+                 gates SKIPPED (machinery validation only, NOT a live validation)"
+            );
         }
 
         // ── Sample telemetry → GateInputs (feed-level; per-conn = PR-3). ──
@@ -495,20 +644,25 @@ pub async fn run_groww_scale_ladder(
                  that gate is SKIPPED (honest envelope; Mac scale-test host has no /proc)"
             );
         }
-        let inputs = GateInputs {
-            conns_ok: if feed_streaming { current } else { 0 },
-            conns_expected: current,
-            auth_rejects: u64::from(auth_rejected),
-            capture_lag_ms_max: tick_age.map_or(0, |s| s.saturating_mul(1_000)),
-            cpu_pct,
-            disk_free_pct,
-            questdb_ok: true,    // BOOT-01/02 + doctor own QuestDB health signals
-            behind_bytes_max: 0, // per-shard behind-ness lands with PR-3 telemetry
+        let inputs = if smoke {
+            // Addendum C: tick-dependent gates skipped; auth + host stay real.
+            smoke_gate_inputs(current, auth_rejected, cpu_pct, disk_free_pct)
+        } else {
+            GateInputs {
+                conns_ok: if feed_streaming { current } else { 0 },
+                conns_expected: current,
+                auth_rejects: u64::from(auth_rejected),
+                capture_lag_ms_max: tick_age.map_or(0, |s| s.saturating_mul(1_000)),
+                cpu_pct,
+                disk_free_pct,
+                questdb_ok: true, // BOOT-01/02 + doctor own QuestDB health signals
+                behind_bytes_max: 0, // per-shard behind-ness: see snapshot rows
+            }
         };
         let gate_failure = gate_failure_reason(&inputs, &cfg);
 
         // ── Global-failure classification preempts the per-rung path. ──
-        if auth_rejected && !feed_streaming && state != LadderState::RollingBack {
+        if auth_rejected && !feed_streaming && !smoke && state != LadderState::RollingBack {
             state = next_ladder_state(state, LadderEvent::GlobalFailure);
             let halved = halve_conns(current);
             error!(
@@ -617,10 +771,11 @@ pub async fn run_groww_scale_ladder(
                         let held_long_enough = hold_started.is_some_and(|t| {
                             t.elapsed().as_secs() >= cfg.gate_hold_minutes.saturating_mul(60)
                         });
-                        let in_window = advance_window_allows(
-                            tickvault_common::market_hours::now_ist_secs_of_day(),
-                            &cfg.advance_window_ist,
-                        );
+                        let in_window = smoke
+                            || advance_window_allows(
+                                tickvault_common::market_hours::now_ist_secs_of_day(),
+                                &cfg.advance_window_ist,
+                            );
                         match (held_long_enough, next_rung(&cfg.ladder, current, ceiling)) {
                             (true, Some(next)) if in_window => {
                                 info!(
@@ -676,6 +831,110 @@ pub async fn run_groww_scale_ladder(
             },
         };
         publish_state(state, current, cfg.target_connections);
+
+        // ── §34 PR-3 (Item 12): publish the per-conn panel snapshot. ──
+        let snapshot = build_scale_snapshot(
+            state,
+            current,
+            cfg.target_connections,
+            cfg.probe_mode,
+            smoke,
+            ceiling,
+            &shards_root,
+            now_nanos,
+        );
+        feed_runtime.set_groww_scale_snapshot(std::sync::Arc::new(snapshot.clone()));
+
+        // ── §34 PR-3 (Item 11): emit the cap-probe verdict ONCE, when the ──
+        // probe run reaches a terminal signal: HALTED_AT_CEILING (both rungs
+        // verified) or a rollback at rung 2 (2nd conn failing).
+        if cfg.probe_mode
+            && !probe_verdict_emitted
+            && matches!(
+                state,
+                LadderState::HaltedAtCeiling | LadderState::RollingBack
+            )
+        {
+            probe_verdict_emitted = true;
+            let conn0 = snapshot
+                .connections
+                .first()
+                .is_some_and(|c| c.tick_file_bytes > 0);
+            let conn1 = snapshot
+                .connections
+                .get(1)
+                .is_some_and(|c| c.tick_file_bytes > 0);
+            let verdict = classify_probe_verdict(conn0, conn1, smoke);
+            info!(
+                verdict = verdict.as_str(),
+                conn0_capturing = conn0,
+                conn1_capturing = conn1,
+                "{}",
+                verdict.operator_line()
+            );
+            write_audit(
+                &qdb,
+                &today,
+                current,
+                current,
+                state,
+                ScaleOutcome::ProbeVerdict,
+                verdict.as_str(),
+                &inputs,
+            )
+            .await;
+        }
+    }
+}
+
+/// Assemble the `/feeds` panel snapshot from FILE-derived per-conn evidence
+/// (status file = connect+subscribe proof; tick file size + mtime age =
+/// capture liveness). Cold path — runs once per 30s eval tick over ≤ 100
+/// shard directories.
+// APPROVED: panel-row assembly — every arg is a distinct already-computed signal
+#[allow(clippy::too_many_arguments)]
+// TEST-EXEMPT: thin fs::metadata read per conn; the row/verdict consumers (classify_probe_verdict, the feeds handler test) and the shard_files path math are unit-tested.
+fn build_scale_snapshot(
+    state: LadderState,
+    desired: usize,
+    target: usize,
+    probe_mode: bool,
+    smoke: bool,
+    ceiling: usize,
+    shards_root: &std::path::Path,
+    now_ist_nanos: i64,
+) -> tickvault_api::feed_state::GrowwScaleSnapshot {
+    let mut connections = Vec::with_capacity(ceiling);
+    for conn_id in 0..ceiling {
+        let files = crate::groww_bridge::shard_files(shards_root, conn_id);
+        let subscribed_proof = files.status_file.exists();
+        let (tick_file_bytes, last_capture_age_secs) = match std::fs::metadata(&files.tick_file) {
+            Ok(meta) => {
+                let age = meta
+                    .modified()
+                    .ok()
+                    .and_then(|m| m.elapsed().ok())
+                    .map(|d| d.as_secs());
+                (meta.len(), age)
+            }
+            Err(_) => (0, None),
+        };
+        connections.push(tickvault_api::feed_state::GrowwScaleConnRow {
+            conn_id,
+            desired: conn_id < desired,
+            subscribed_proof,
+            tick_file_bytes,
+            last_capture_age_secs,
+        });
+    }
+    let _ = now_ist_nanos; // reserved: exchange-ts-based age lands with per-shard telemetry
+    tickvault_api::feed_state::GrowwScaleSnapshot {
+        ladder_state: state.as_str(),
+        desired_conns: desired,
+        target_conns: target,
+        probe_mode,
+        smoke,
+        connections,
     }
 }
 
@@ -1030,6 +1289,102 @@ mod tests {
         // Malformed window fails CLOSED.
         let bad = ["9:20".to_string(), "14:30".to_string()];
         assert!(!advance_window_allows(12 * 3600, &bad));
+    }
+
+    // ── §34 PR-3: cap-probe mode + weekend SMOKE mode ──
+
+    /// Item 11 contract: probe mode runs EXACTLY 2 connections × 600
+    /// instruments regardless of the operator's ladder/target/per-conn.
+    #[test]
+    fn test_probe_mode_runs_two_conns_600() {
+        // test coverage (pub-fn-test-guard line): probe_overrides
+        let mut base = cfg();
+        base.probe_mode = true;
+        base.target_connections = 10;
+        base.instruments_per_conn = 1000;
+        base.ladder = vec![1, 2, 5, 10];
+        let probe = probe_overrides(&base);
+        assert_eq!(probe.target_connections, 2);
+        assert_eq!(probe.instruments_per_conn, 600);
+        assert_eq!(probe.ladder, vec![2]);
+        // 2 × 600 = 1200 deliberately exceeds the documented 1000 cap — that
+        // asymmetry is what makes the verdict discriminating.
+        assert!(2 * probe.instruments_per_conn > 1000);
+        // Everything else inherits unchanged.
+        assert_eq!(probe.gate_hold_minutes, base.gate_hold_minutes);
+        assert_eq!(probe.advance_window_ist, base.advance_window_ist);
+        // The override still validates (probe envelope is legal).
+        assert!(probe.validate().is_ok());
+    }
+
+    /// Item 11 contract: verdict classification over per-conn evidence.
+    #[test]
+    fn test_probe_verdict_classification() {
+        assert_eq!(
+            classify_probe_verdict(true, true, false),
+            ProbeVerdict::MultiConnOk
+        );
+        assert_eq!(
+            classify_probe_verdict(true, false, false),
+            ProbeVerdict::PerAccountLimited
+        );
+        assert_eq!(
+            classify_probe_verdict(false, true, false),
+            ProbeVerdict::Inconclusive
+        );
+        assert_eq!(
+            classify_probe_verdict(false, false, false),
+            ProbeVerdict::Inconclusive
+        );
+        // SMOKE wins over any capture evidence: market closed ⇒ no capture
+        // conclusion is honest.
+        assert_eq!(
+            classify_probe_verdict(true, true, true),
+            ProbeVerdict::SmokeMachineryValidated
+        );
+        // Labels are stable wire format.
+        assert_eq!(ProbeVerdict::MultiConnOk.as_str(), "probe_multi_conn_ok");
+        assert_eq!(
+            ProbeVerdict::PerAccountLimited.as_str(),
+            "probe_per_account_limited"
+        );
+        assert_eq!(ProbeVerdict::Inconclusive.as_str(), "probe_inconclusive");
+        assert_eq!(
+            ProbeVerdict::SmokeMachineryValidated.as_str(),
+            "probe_smoke_machinery_validated"
+        );
+        // Every verdict carries a non-empty operator line.
+        for v in [
+            ProbeVerdict::MultiConnOk,
+            ProbeVerdict::PerAccountLimited,
+            ProbeVerdict::Inconclusive,
+            ProbeVerdict::SmokeMachineryValidated,
+        ] {
+            assert!(!v.operator_line().is_empty());
+        }
+    }
+
+    /// Addendum C contract: SMOKE inputs pass every tick-dependent gate while
+    /// the REAL signals (auth reject, host CPU/disk) still gate.
+    #[test]
+    fn test_smoke_mode_gate_inputs_pass_tick_gates_keep_host_gates() {
+        let c = cfg();
+        // Healthy smoke: no auth reject, healthy host → every gate passes
+        // even though zero ticks exist (market closed).
+        let ok = smoke_gate_inputs(2, false, Some(20.0), Some(60.0));
+        assert_eq!(gate_failure_reason(&ok, &c), None);
+        // Auth reject stays a REAL failure in smoke.
+        let auth = smoke_gate_inputs(2, true, Some(20.0), Some(60.0));
+        assert!(gate_failure_reason(&auth, &c).is_some());
+        // Host CPU gate stays REAL in smoke.
+        let hot = smoke_gate_inputs(2, false, Some(99.0), Some(60.0));
+        assert!(gate_failure_reason(&hot, &c).is_some());
+        // Host disk gate stays REAL in smoke.
+        let full = smoke_gate_inputs(2, false, Some(20.0), Some(1.0));
+        assert!(gate_failure_reason(&full, &c).is_some());
+        // Unavailable host probes are honestly skipped in smoke too (Mac).
+        let mac = smoke_gate_inputs(2, false, None, None);
+        assert_eq!(gate_failure_reason(&mac, &c), None);
     }
 
     #[test]

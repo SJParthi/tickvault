@@ -6,6 +6,7 @@
 # =============================================================================
 
 .PHONY: help run run-supervised stop build test check fmt clippy clean \
+        scale-test scale-probe scale-smoke scale-test-clean \
         docker-up docker-down docker-restart docker-status docker-logs questdb-init \
         health status open questdb questdb-prod questdb-autoopen-install questdb-autoopen-uninstall \
         jaeger prometheus traefik alloy loki \
@@ -51,6 +52,18 @@ run: ## Run app in dev mode (pretty logs, localhost config)
 	@echo "🚀 Starting $(APP_NAME)..."
 	@./scripts/ensure-ready.sh
 	@cargo run
+
+scale-test: ## Groww auto-scale ladder test (Mac; prod untouched) — §34
+	@bash scripts/groww-scale-test.sh ladder
+
+scale-probe: ## Groww 2x600 cap-probe: per-conn vs per-account verdict — §34 PR-3
+	@bash scripts/groww-scale-test.sh probe
+
+scale-smoke: ## Groww weekend SMOKE run (market closed; machinery validation)
+	@bash scripts/groww-scale-test.sh smoke
+
+scale-test-clean: ## Remove the scale-test overlay from config/local.toml
+	@bash scripts/groww-scale-test.sh clean
 
 stop: ## Stop running app (also wipes the on-disk JWT cache)
 	@echo "🛑 Stopping $(APP_NAME)..."
