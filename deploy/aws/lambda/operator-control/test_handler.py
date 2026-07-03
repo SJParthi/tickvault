@@ -443,6 +443,133 @@ class Latency(unittest.TestCase):
         }
         self.assertEqual(handler._percentile_from_bucket_deltas(deltas, 0.99), 100.0)
 
+    # ---- per-feed exchange→received lag percentile grid (2026-07-03) ----
+
+    def test_parse_pctl_row_converts_micros_to_ms(self) -> None:
+        feed, row = handler._parse_pctl_row(
+            "groww,48213,3,1500.0,42000.5,90000,250000,1817000"
+        )
+        self.assertEqual(feed, "groww")
+        self.assertEqual(row["rows"], 48213)
+        self.assertEqual(row["neg_clamped"], 3)
+        self.assertEqual(row["p50_ms"], 1.5)
+        self.assertEqual(row["p90_ms"], 42.0)
+        self.assertEqual(row["p95_ms"], 90.0)
+        self.assertEqual(row["p99_ms"], 250.0)
+        self.assertEqual(row["max_ms"], 1817.0)
+
+    def test_parse_pctl_row_zero_rows_and_nulls_degrade_to_none(self) -> None:
+        # Feed present in the window's DISTINCT but with no receive-stamped
+        # rows: count 0, aggregates null → None cells, never fake zeros.
+        feed, row = handler._parse_pctl_row("dhan,0,,,,,,")
+        self.assertEqual(feed, "dhan")
+        self.assertEqual(row["rows"], 0)
+        self.assertEqual(row["neg_clamped"], 0)
+        for col in handler._PCTL_COLS:
+            self.assertIsNone(row[col])
+        # Mixed null/NaN spellings are handled per cell.
+        _, row = handler._parse_pctl_row("dhan,100,0,null,NaN,,5000,9000")
+        self.assertIsNone(row["p50_ms"])
+        self.assertIsNone(row["p90_ms"])
+        self.assertIsNone(row["p95_ms"])
+        self.assertEqual(row["p99_ms"], 5.0)
+        self.assertEqual(row["max_ms"], 9.0)
+
+    def test_parse_pctl_row_rejects_malformed_and_bad_tokens(self) -> None:
+        # A failed on-box query leaves an empty tail → skipped, not fabricated.
+        self.assertEqual(handler._parse_pctl_row("dhan,"), (None, None))
+        self.assertEqual(handler._parse_pctl_row(""), (None, None))
+        # Feed token outside the [a-z0-9_-]{1,32} allowlist → rejected
+        # (defense in depth — mirrors the shell-side grep allowlist).
+        self.assertEqual(
+            handler._parse_pctl_row("Feed$;drop,1,0,1,1,1,1,1"), (None, None)
+        )
+        # Non-numeric row count → rejected.
+        self.assertEqual(
+            handler._parse_pctl_row("dhan,abc,0,1,1,1,1,1"), (None, None)
+        )
+
+    def test_percentile_winners_lower_is_better_strict(self) -> None:
+        pctl = {
+            "dhan": {"rows": 100, "neg_clamped": 0, "p50_ms": 500.0,
+                     "p90_ms": 800.0, "p95_ms": 900.0, "p99_ms": 990.0,
+                     "max_ms": 1200.0},
+            "groww": {"rows": 200, "neg_clamped": 0, "p50_ms": 60.0,
+                      "p90_ms": 110.0, "p95_ms": 900.0, "p99_ms": None,
+                      "max_ms": 300.0},
+        }
+        w = handler._percentile_winners(pctl)
+        self.assertEqual(w["p50_ms"], "groww")  # lower lag wins
+        self.assertEqual(w["p90_ms"], "groww")
+        self.assertNotIn("p95_ms", w)  # tie — no single winner
+        self.assertNotIn("p99_ms", w)  # only one comparable value
+        self.assertEqual(w["max_ms"], "groww")
+
+    def test_percentile_winners_zero_row_feed_excluded(self) -> None:
+        # A feed with 0 receive-stamped rows never wins (nothing measured),
+        # and a single remaining comparable feed yields no winner either.
+        pctl = {
+            "dhan": {"rows": 100, "neg_clamped": 0, "p50_ms": 500.0,
+                     "p90_ms": None, "p95_ms": None, "p99_ms": None,
+                     "max_ms": None},
+            "ghost": {"rows": 0, "neg_clamped": 0, "p50_ms": 1.0,
+                      "p90_ms": None, "p95_ms": None, "p99_ms": None,
+                      "max_ms": None},
+        }
+        self.assertEqual(handler._percentile_winners(pctl), {})
+        self.assertEqual(handler._percentile_winners({}), {})
+
+    def test_parse_latency_percentile_block(self) -> None:
+        stdout = (
+            "T0=100.0\n"
+            "PCTL_ROW=dhan,50000,0,500000,800000,900000,990000,1200000\n"
+            "PCTL_ROW=groww,48213,3,1500,42000,90000,250000,1817000\n"
+            "PCTL_ROW=badline\n"
+            "QDB=0.0021\n"
+            "T1=110.0\n"
+        )
+        out = handler._parse_latency(stdout)
+        self.assertEqual(set(out["percentiles"]), {"dhan", "groww"})
+        self.assertEqual(out["percentiles"]["groww"]["p50_ms"], 1.5)
+        self.assertEqual(out["percentiles"]["dhan"]["p50_ms"], 500.0)
+        self.assertEqual(out["percentile_winners"]["p50_ms"], "groww")
+        # dhan's max (1200ms) is lower than groww's (1817ms) — lower wins.
+        self.assertEqual(out["percentile_winners"]["max_ms"], "dhan")
+        self.assertEqual(out["percentile_window_mins"], handler._PCTL_WINDOW_MINS)
+        self.assertEqual(out["percentile_sample_cap"], handler._PCTL_SAMPLE_CAP)
+        # PCTL_ROW lines are intercepted BEFORE the generic K=V branch — the
+        # ordinary fields still parse and nothing leaks into them.
+        self.assertEqual(out["questdb_ms"], "2.1")
+        # No PCTL rows at all → empty dict + empty winners, honestly.
+        empty = handler._parse_latency("")
+        self.assertEqual(empty["percentiles"], {})
+        self.assertEqual(empty["percentile_winners"], {})
+
+    def test_latency_commands_percentile_block_bounded_and_sanitized(self) -> None:
+        joined = "\n".join(handler._LATENCY_COMMANDS)
+        # Verified QuestDB syntax: approx_percentile(value, q, precision).
+        self.assertIn("approx_percentile(lag_us, 0.5, 3)", joined)
+        self.assertIn("approx_percentile(lag_us, 0.99, 3)", joined)
+        # Bounded sample — never an unbounded scan.
+        self.assertIn(f"limit {handler._PCTL_SAMPLE_CAP}", joined)
+        self.assertIn("select distinct feed from ticks", joined)
+        # Only receive-stamped rows enter the lag math.
+        self.assertIn("received_at != null", joined)
+        # approx_percentile requires non-negative input → clamp, counted.
+        self.assertIn("case when received_at - ts < 0 then 0", joined)
+        # Feed tokens from the DB are allowlist-validated BEFORE they are
+        # interpolated into the per-feed SQL, and the loop is capped.
+        self.assertIn(handler._PCTL_FEED_TOKEN_RE, joined)
+        self.assertIn(f"head -{handler._PCTL_MAX_FEEDS}", joined)
+        # NO hardcoded feed name in the percentile SQL — shell var only.
+        self.assertIn("feed = '$f'", joined)
+        # Runs concurrently with the probes (launched before the shared
+        # wait), and its output is surfaced after that wait.
+        self.assertLess(joined.index("PCTL_FEEDS="), joined.index("\nwait\n"))
+        self.assertIn("cat /tmp/tv-pctl.out", joined)
+        # Every percentile curl is time-bounded.
+        self.assertIn(f"--max-time {handler._PCTL_QUERY_MAX_SECS}", joined)
+
 
 class ParseStorage(unittest.TestCase):
     def test_parses_df_du(self) -> None:

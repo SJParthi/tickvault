@@ -33,7 +33,11 @@ pub use aggregator_cell::{
     AggregatorCell, ConsumeOutcome, FeedStrategy, LatePolicy, LiveCandleState,
 };
 pub use heartbeat::{AggregatorHeartbeatCounters, AggregatorHeartbeatSnapshot};
-pub use multi_tf_aggregator::{ConsumeStats, InstrumentEntry, MultiTfAggregator};
+pub use multi_tf_aggregator::{
+    CATCHUP_SEAL_LATENESS_MARGIN_SECS_DHAN, CATCHUP_SEAL_LATENESS_MARGIN_SECS_GROWW,
+    CATCHUP_SEAL_POLL_INTERVAL_SECS, CATCHUP_WATERMARK_FUTURE_SKEW_GUARD_SECS, ConsumeStats,
+    InstrumentEntry, MultiTfAggregator, compute_catchup_cutoff,
+};
 pub use pct_stamping::{
     PrevDayRefs, compute_close_pct, compute_oi_pct, compute_volume_pct, stamp_seal_pct_fields,
 };
