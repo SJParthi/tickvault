@@ -1051,6 +1051,19 @@ impl GrowwBridgeState {
                     );
                 },
             );
+            if stats.late_count > 0 {
+                // AGGREGATOR-LATE-01 visibility (2026-07-03): Groww late
+                // discards were previously COMPLETELY silent — this path
+                // captured `stats` but never read `late_count` (no counter,
+                // no log), so a Discard-policy drop wave was invisible. Count
+                // them with the `feed=groww` label; the Dhan site keeps its
+                // label-less series (mirroring the `tv_seal_mpsc_dropped_total`
+                // per-feed labelling precedent in `seal_routing.rs`) so the
+                // existing tv-aggregator-late-tick-sustained alert series is
+                // not renamed or broken.
+                metrics::counter!("tv_aggregator_late_ticks_discarded_total", "feed" => "groww")
+                    .increment(u64::from(stats.late_count));
+            }
             if !stats.instrument_found {
                 self.aggregator.pre_populate(std::iter::once(key));
             }
@@ -1235,6 +1248,118 @@ fn spawn_groww_ist_midnight_force_seal(
         }
     });
     info!("Groww bridge — IST-midnight force-seal task spawned (parity with Dhan)");
+}
+
+/// Spawn the watermark-aware per-minute catch-up seal driver for the Groww
+/// aggregator (BOUNDARY-01, 2026-07-03).
+///
+/// Bounds candle seal lag WITHOUT mass-discarding backlogged ticks: every
+/// [`tickvault_trading::candles::CATCHUP_SEAL_POLL_INTERVAL_SECS`] it reads
+/// the Groww instance's event-time watermark (the max `exchange_timestamp`
+/// ever consumed — advanced only by real, newer ticks, so a frozen-snapshot
+/// re-dump never moves it) and, ONLY when the watermark ADVANCED since the
+/// last scan, seals buckets whose end ≤ watermark −
+/// [`tickvault_trading::candles::CATCHUP_SEAL_LATENESS_MARGIN_SECS`]. A
+/// backlogged bridge (ILP-backpressure pause, post-restart re-tail) has a
+/// trailing watermark, so its still-filling buckets are NEVER sealed ahead of
+/// the backlog — the exact mass-discard failure a naive wall-clock force-seal
+/// would cause under `LatePolicy::Discard`. A STALLED watermark (dead feed)
+/// gets NO catch-up seals — FEED-STALL-01 owns the dead-feed page; there is
+/// deliberately no "assume dead then force-seal anyway" escape hatch.
+///
+/// Routing is the SAME Groww policy as the IST-midnight force-seal closure
+/// above (feed=Groww, drop_d1=false, no prev-day pct-stamp, no Dhan
+/// heartbeat) through the SAME shared seal-writer chain, so a later amend or
+/// re-seal of the same bucket UPSERTs in place (DEDUP `ts, security_id,
+/// segment, feed`; `ts` = bucket start, never wall-clock). The midnight
+/// force-seal task keeps its cross-day duties (clear `last_sealed`, re-arm
+/// day-open) — post-catch-up it is idempotent (`force_seal` on an emptied
+/// slot returns `None`).
+// TEST-EXEMPT: cold-path tokio interval driver (same supervision level as the
+// sibling IST-midnight force-seal task). The load-bearing logic is unit-tested
+// in the trading crate (catch_up_seal / catch_up_seal_all / watermark tests);
+// the routing params are pinned by test_groww_force_seal_routes_with_feed_groww
+// (identical SealRouteParams).
+fn spawn_groww_catchup_seal(
+    aggregator: MultiTfAggregator,
+    feed_runtime: Arc<FeedRuntimeState>,
+    trading_calendar: Arc<tickvault_common::trading_calendar::TradingCalendar>,
+) {
+    use tickvault_trading::candles::{
+        CATCHUP_SEAL_LATENESS_MARGIN_SECS, CATCHUP_SEAL_POLL_INTERVAL_SECS,
+    };
+    tokio::spawn(async move {
+        let mut interval =
+            tokio::time::interval(Duration::from_secs(CATCHUP_SEAL_POLL_INTERVAL_SECS));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut last_scanned_watermark: u32 = 0;
+        loop {
+            interval.tick().await;
+            // Self-gating: scan ONLY when Groww's event-time watermark
+            // ADVANCED since the last scan. Overnight / holiday / disabled /
+            // dead-socket = static watermark = one atomic load per wave, no
+            // scan, no seals.
+            let watermark = aggregator.watermark_secs();
+            if watermark == 0 || watermark == last_scanned_watermark {
+                continue;
+            }
+            // Trading-day + runtime-enable gates, mirroring the IST-midnight
+            // task. The enable flag is read into a local so this gate does
+            // not collide with the `run_groww_bridge` disable-branch
+            // source-scan anchor (which `find`s the FIRST literal occurrence).
+            if !trading_calendar.is_trading_day_today() {
+                continue;
+            }
+            let groww_enabled_for_catchup = feed_runtime.is_enabled(Feed::Groww);
+            if !groww_enabled_for_catchup {
+                continue;
+            }
+            let Some(sender) = global_seal_sender() else {
+                // Seal-writer not installed yet — retry next wave WITHOUT
+                // consuming the watermark advance (no seal is lost).
+                continue;
+            };
+            last_scanned_watermark = watermark;
+            let cutoff = watermark.saturating_sub(CATCHUP_SEAL_LATENESS_MARGIN_SECS);
+            let sealed =
+                aggregator.catch_up_seal_all(cutoff, |security_id, segment_code, tf, state| {
+                    metrics::counter!("tv_boundary_catchup_total", "feed" => "groww").increment(1);
+                    // SAME Groww routing policy as the IST-midnight force-seal
+                    // closure: feed=Groww, drop_d1=false (Groww routes D1),
+                    // no prev-day pct-stamp, no Dhan heartbeat. A full-mpsc
+                    // drop is already counted by route_seal
+                    // (`tv_seal_mpsc_dropped_total{feed=groww}`).
+                    crate::seal_routing::route_seal(
+                        crate::seal_routing::SealRouteParams {
+                            feed: Feed::Groww,
+                            drop_d1: false,
+                            prev_day_cache: None,
+                            heartbeat: None,
+                            feed_health_on_m1: None,
+                        },
+                        security_id,
+                        segment_code,
+                        tf,
+                        state,
+                        sender,
+                    );
+                });
+            if sealed > 0 {
+                // ONE coalesced line per scan wave — never per-seal spam.
+                warn!(
+                    code =
+                        tickvault_common::error_code::ErrorCode::Boundary01CatchupSeal.code_str(),
+                    feed = "groww",
+                    seals = sealed,
+                    cutoff_secs = cutoff,
+                    watermark_secs = watermark,
+                    "BOUNDARY-01: watermark catch-up sealed lagging candle bucket(s) — \
+                     late but correct; buckets past the watermark stay open for the backlog"
+                );
+            }
+        }
+    });
+    info!("Groww bridge — watermark catch-up seal task spawned (BOUNDARY-01)");
 }
 
 /// Persisted bridge read-position (PR-3, 2026-07-02): written AFTER each
@@ -1430,6 +1555,16 @@ pub fn spawn_supervised_groww_bridge(
         // bridge task respawns.
         let aggregator = MultiTfAggregator::with_capacity(GROWW_AGGREGATOR_CAPACITY);
         spawn_groww_ist_midnight_force_seal(
+            aggregator.clone(),
+            Arc::clone(&feed_runtime),
+            Arc::clone(&trading_calendar),
+        );
+        // BOUNDARY-01 (2026-07-03): watermark-aware per-minute catch-up seal —
+        // spawned ONCE alongside the midnight force-seal (outside the respawn
+        // loop, same process-lifetime ownership) so bridge respawns never leak
+        // duplicate driver tasks. The clone shares the SAME papaya map + the
+        // SAME event-time watermark the bridge's consume path advances.
+        spawn_groww_catchup_seal(
             aggregator.clone(),
             Arc::clone(&feed_runtime),
             trading_calendar,
