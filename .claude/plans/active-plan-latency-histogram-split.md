@@ -199,7 +199,7 @@ no DEDUP-key change → no data migration on rollback.
 
 - [x] Item 3 — Off-thread flush worker + writer integration
   - Files: crates/storage/src/tick_flush_worker.rs, crates/storage/src/lib.rs, crates/storage/src/tick_persistence.rs
-  - Tests: test_offload_dispatch_resets_pending_and_stays_connected, test_worker_failure_routes_batch_to_ring_and_disconnects, test_take_last_stall_ns_drains_and_resets, test_append_hot_path_dispatches_offload_not_inline_flush, test_flush_worker_records_flush_duration_histogram, test_worker_fail_path_returns_batch_on_failed_channel, test_offload_pool_preallocates_spares
+  - Tests: test_offload_dispatch_resets_pending_and_stays_connected, test_worker_failure_routes_batch_to_ring_and_disconnects, test_take_last_stall_ns_drains_and_resets, test_append_hot_path_dispatches_offload_not_inline_flush, test_flush_worker_records_flush_duration_histogram, test_worker_fail_path_returns_batch_on_failed_channel, test_spawn_flush_offload_pool_preallocates_spares, test_try_dispatch_no_spare_returns_nospare_and_leaves_batch_intact, test_shutdown_and_join_drains_queued_jobs, test_worker_success_recycles_pair, test_failed_queue_cap_exceeds_max_outstanding_batches
 
 - [x] Item 4 — Histogram split in tick_processor
   - Files: crates/core/src/pipeline/tick_processor.rs
