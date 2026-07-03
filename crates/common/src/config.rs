@@ -1365,9 +1365,7 @@ impl ApplicationConfig {
         // This is a fail-fast guard at config validation time. If someone sets
         // mode = "live" before the date, the application refuses to start.
         if self.strategy.mode.is_live() {
-            let today = (chrono::Utc::now()
-                + chrono::TimeDelta::seconds(crate::constants::IST_UTC_OFFSET_SECONDS_I64))
-            .date_naive();
+            let today = ist_date_from_utc(chrono::Utc::now());
             let earliest = match chrono::NaiveDate::from_ymd_opt(
                 crate::constants::LIVE_TRADING_EARLIEST_YEAR,
                 crate::constants::LIVE_TRADING_EARLIEST_MONTH,
@@ -1376,7 +1374,7 @@ impl ApplicationConfig {
                 Some(d) => d,
                 None => bail!("LIVE_TRADING_EARLIEST_DATE constants are invalid"),
             };
-            if today < earliest {
+            if is_before_live_trading_earliest(today, earliest) {
                 // E1 (deferred): a `tv_sandbox_gate_blocks_total` counter
                 // would require pulling the `metrics` crate into common,
                 // which is currently framework-free. The bail!() already
@@ -1433,6 +1431,31 @@ impl ApplicationConfig {
 
         Ok(())
     }
+}
+
+/// IST calendar date for a UTC instant (UTC + 5:30, per
+/// `IST_UTC_OFFSET_SECONDS_I64`).
+///
+/// Extracted from `ApplicationConfig::validate` (B6 mutation hardening,
+/// 2026-07-03) so the offset arithmetic is deterministically testable — the
+/// inline `chrono::Utc::now() + ...` form made the `+` vs `-` mutant killable
+/// only within 5h30m of an IST midnight boundary (flaky by construction).
+fn ist_date_from_utc(now_utc: chrono::DateTime<chrono::Utc>) -> chrono::NaiveDate {
+    (now_utc + chrono::TimeDelta::seconds(crate::constants::IST_UTC_OFFSET_SECONDS_I64))
+        .date_naive()
+}
+
+/// True when live trading must be refused: strictly BEFORE the earliest
+/// permitted date. On the earliest date itself live mode is ALLOWED.
+///
+/// Extracted from `ApplicationConfig::validate` (B6 mutation hardening,
+/// 2026-07-03) so the `<` boundary is deterministically testable instead of
+/// depending on the wall-clock date at test time.
+fn is_before_live_trading_earliest(
+    today_ist: chrono::NaiveDate,
+    earliest: chrono::NaiveDate,
+) -> bool {
+    today_ist < earliest
 }
 
 // ---------------------------------------------------------------------------
@@ -1537,6 +1560,107 @@ mod tests {
         assert!(
             result.is_err(),
             "cutoff day must be blocked; only days AFTER are allowed"
+        );
+    }
+
+    #[test]
+    fn test_sandbox_live_with_dry_run_still_blocks() {
+        // B6 mutation kill (config.rs:435 `&&`→`||` + delete-`!`): Live mode
+        // MUST be blocked before the cutoff even when dry_run = true — the
+        // dry_run early-exit applies ONLY to non-live modes. A mutant that
+        // turns `!is_live && dry_run` into `!is_live || dry_run` (or drops
+        // the `!`) would let a live+dry_run config skip the sandbox gate.
+        let cfg = make_sandbox_config(TradingMode::Live, true, "2026-06-30");
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 4, 14).unwrap();
+        let result = cfg.check_sandbox_window(today);
+        assert!(
+            result.is_err(),
+            "Live + dry_run before cutoff must STILL be blocked"
+        );
+        assert!(result.unwrap_err().contains("SANDBOX-ONLY VIOLATION"));
+    }
+
+    #[test]
+    fn test_sandbox_non_live_with_dry_run_ok_before_cutoff() {
+        // Companion boundary: non-live + dry_run takes the first early-exit.
+        let cfg = make_sandbox_config(TradingMode::Paper, true, "2030-01-01");
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 4, 14).unwrap();
+        assert!(cfg.check_sandbox_window(today).is_ok());
+    }
+
+    // =======================================================================
+    // B6 mutation kills: serde default helpers (exact pinned values)
+    // =======================================================================
+
+    #[test]
+    fn test_default_activity_watchdog_threshold_secs_is_exactly_50() {
+        // Kills `default_activity_watchdog_threshold_secs -> 0/1` mutants.
+        // 50 mirrors WATCHDOG_THRESHOLD_LIVE_AND_DEPTH_SECS in the core crate
+        // (cross-crate equality ratcheted there — see the fn's doc comment).
+        assert_eq!(default_activity_watchdog_threshold_secs(), 50);
+    }
+
+    #[test]
+    fn test_default_retention_days_is_exactly_90() {
+        // Kills `default_retention_days -> 0/1` mutants. 90 days of hot
+        // partitions is the documented retention default.
+        assert_eq!(default_retention_days(), 90);
+        assert_eq!(PartitionRetentionConfig::default().retention_days, 90);
+    }
+
+    // =======================================================================
+    // B6 mutation kills: live-trading sandbox gate pure helpers
+    // =======================================================================
+
+    #[test]
+    fn test_ist_date_from_utc_crosses_midnight_forward() {
+        // 2026-01-01T20:00:00Z = 2026-01-02 01:30 IST → date must be Jan 2.
+        // Kills `+`→`-` (UTC−5:30 would give Jan 1 14:30 → Jan 1).
+        let utc = chrono::DateTime::parse_from_rfc3339("2026-01-01T20:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        assert_eq!(
+            ist_date_from_utc(utc),
+            chrono::NaiveDate::from_ymd_opt(2026, 1, 2).unwrap()
+        );
+    }
+
+    #[test]
+    fn test_ist_date_from_utc_early_utc_hours_stay_same_day() {
+        // 2026-01-01T05:00:00Z = 2026-01-01 10:30 IST → Jan 1. Under the
+        // `-` mutant this would be 2025-12-31 23:30 → Dec 31 (killed).
+        let utc = chrono::DateTime::parse_from_rfc3339("2026-01-01T05:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        assert_eq!(
+            ist_date_from_utc(utc),
+            chrono::NaiveDate::from_ymd_opt(2026, 1, 1).unwrap()
+        );
+    }
+
+    #[test]
+    fn test_is_before_live_trading_earliest_boundary() {
+        // Kills `<`→`<=` (earliest day itself must be ALLOWED), `<`→`==`
+        // (day before must block), and `<`→`>` (day after must not block).
+        let earliest = chrono::NaiveDate::from_ymd_opt(
+            crate::constants::LIVE_TRADING_EARLIEST_YEAR,
+            crate::constants::LIVE_TRADING_EARLIEST_MONTH,
+            crate::constants::LIVE_TRADING_EARLIEST_DAY,
+        )
+        .unwrap();
+        let day_before = earliest.pred_opt().unwrap();
+        let day_after = earliest.succ_opt().unwrap();
+        assert!(
+            is_before_live_trading_earliest(day_before, earliest),
+            "day before earliest must be blocked"
+        );
+        assert!(
+            !is_before_live_trading_earliest(earliest, earliest),
+            "the earliest date itself must be allowed (strict <, not <=)"
+        );
+        assert!(
+            !is_before_live_trading_earliest(day_after, earliest),
+            "days after earliest must be allowed"
         );
     }
 
