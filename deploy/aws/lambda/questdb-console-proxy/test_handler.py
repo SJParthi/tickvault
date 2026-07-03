@@ -208,6 +208,29 @@ class Relay(WithBase):
             self.assertTrue(req.full_url.startswith("http://10.42.1.99:9000/exp?"))
             self.assertEqual(up.call_args[1]["timeout"], handler._TIMEOUT_SECS)
 
+    def test_shell_get_forces_identity_and_connection_close(self) -> None:
+        # B4 r2: the shell (GET /) upstream request MUST carry
+        # `Accept-Encoding: identity` + `Connection: close` so QuestDB frames
+        # the body with a length AND EOFs the socket — the browser's own
+        # `Accept-Encoding: gzip` must NOT be forwarded (that unframed gzip
+        # shell is what hung read() until the 12s timeout → false 503).
+        resp = FakeResp([b"<!doctype html><html></html>"])
+        with mock.patch("urllib.request.urlopen", return_value=resp) as up:
+            r = handler.lambda_handler(
+                {
+                    "method": "GET",
+                    "path": "/",
+                    "headers": {"accept": "text/html", "accept-encoding": "gzip, br"},
+                },
+                None,
+            )
+            self.assertEqual(r["status"], 200)
+            req = up.call_args[0][0]
+            # urllib title-cases header keys via add_header().
+            self.assertEqual(req.get_header("Accept-encoding"), "identity")
+            self.assertEqual(req.get_header("Connection"), "close")
+            self.assertEqual(req.get_header("Accept"), "text/html")  # browser accept still relayed
+
     def test_size_cap_returns_too_large(self) -> None:
         chunk = b"x" * handler._READ_CHUNK
         n = handler.MAX_BODY_BYTES // len(chunk) + 2
@@ -216,17 +239,31 @@ class Relay(WithBase):
             r = handler.lambda_handler({"method": "GET", "path": "/index.html"}, None)
             self.assertEqual(r, {"err": "too_large"})
 
-    def test_urlerror_maps_to_box_unreachable(self) -> None:
+    def test_urlerror_refused_maps_to_box_unreachable(self) -> None:
+        # A genuine connection refusal / reset stays the offline-503 path.
         with mock.patch(
             "urllib.request.urlopen", side_effect=urllib.error.URLError("refused")
         ):
             r = handler.lambda_handler({"method": "GET", "path": "/"}, None)
             self.assertEqual(r, {"err": "box_unreachable"})
 
-    def test_socket_timeout_maps_to_box_unreachable(self) -> None:
+    def test_socket_timeout_maps_to_upstream_timeout(self) -> None:
+        # B4 r2 diagnostic honesty: a read/connect timeout is a REACHABLE-but-
+        # slow box, NOT a refused connection — distinct code so the front
+        # returns 504, never a false 503 "offline".
         with mock.patch("urllib.request.urlopen", side_effect=socket.timeout("slow")):
             r = handler.lambda_handler({"method": "GET", "path": "/"}, None)
-            self.assertEqual(r, {"err": "box_unreachable"})
+            self.assertEqual(r, {"err": "upstream_timeout"})
+
+    def test_urlerror_wrapping_timeout_maps_to_upstream_timeout(self) -> None:
+        # urllib may wrap a socket timeout in a URLError; still an upstream
+        # timeout, not box_unreachable.
+        with mock.patch(
+            "urllib.request.urlopen",
+            side_effect=urllib.error.URLError(socket.timeout("slow")),
+        ):
+            r = handler.lambda_handler({"method": "GET", "path": "/"}, None)
+            self.assertEqual(r, {"err": "upstream_timeout"})
 
     def test_http_error_is_relayed_not_swallowed(self) -> None:
         # QuestDB's own 400 (bad column etc.) must reach the console UI.

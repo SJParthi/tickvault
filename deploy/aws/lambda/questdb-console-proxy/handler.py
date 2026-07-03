@@ -26,12 +26,13 @@ from __future__ import annotations
 
 import base64
 import os
+import socket
 import urllib.error
 import urllib.parse
 import urllib.request
 
 # Deployed-bytes proof marker (proof-3 ratchet: test_build_marker_present).
-QDB_CONSOLE_BUILD = "b4-qdb-console-2026-07-03-r1"
+QDB_CONSOLE_BUILD = "b4-qdb-console-2026-07-03-r2"
 
 QDB_BASE = os.environ.get("QDB_BASE", "")  # e.g. http://<box_private_ip>:9000
 # Single-timeout tradeoff (FIX 8): urllib's `timeout` is the SOCKET-op timeout
@@ -240,10 +241,29 @@ def lambda_handler(event, _context):
 
     url = QDB_BASE.rstrip("/") + path + (f"?{raw_query}" if raw_query else "")
     req = urllib.request.Request(url, method=method)
-    for k in ("accept", "accept-encoding", "content-type"):
+    # Forward only `accept` + `content-type` from the browser. `accept-encoding`
+    # is deliberately NOT forwarded — see below.
+    for k in ("accept", "content-type"):
         v = in_headers.get(k)
         if v:
             req.add_header(k, str(v))
+    # B4 shell-load fix (2026-07-03, r2). The QuestDB web console SHELL (GET /)
+    # response carries NO length delimiter — no Content-Length, and most
+    # plausibly on-the-fly gzip triggered by the browser's forwarded
+    # `Accept-Encoding: gzip`. With no delimiter, urllib's HTTPResponse.read()
+    # blocks with no EOF until the _TIMEOUT_SECS socket timeout fires, and the
+    # blanket except then converts that read-timeout into a false 503 "offline"
+    # — even though /exec returns a Content-Length'd JSON body in ~4ms through
+    # the SAME box:9000 hop. Two framing-agnostic guards make read() EOF
+    # immediately regardless of gzip / Content-Length:
+    #   (1) `Connection: close` — QuestDB closes the socket AFTER the body, so
+    #       read() gets a clean EOF with no length delimiter (PRIMARY, zero
+    #       downside: one urlopen per Lambda invocation, no keep-alive to lose).
+    #   (2) `Accept-Encoding: identity` — do NOT forward the browser's
+    #       `gzip`; the shell comes back Content-Length'd (uncompressed). It is
+    #       larger on the wire but stays well under the MAX_BODY_BYTES relay cap.
+    req.add_header("Accept-Encoding", "identity")
+    req.add_header("Connection", "close")
 
     try:
         with urllib.request.urlopen(req, timeout=_TIMEOUT_SECS) as resp:  # noqa: S310 — QDB_BASE is TF-pinned to the box private IP
@@ -275,5 +295,18 @@ def lambda_handler(event, _context):
             "headers": out_headers,
             "body_b64": base64.b64encode(body).decode(),
         }
-    except Exception:  # noqa: BLE001 — URLError / socket timeout / box stopped
+    except (TimeoutError, socket.timeout):
+        # Diagnostic honesty (B4 r2): a connect/read timeout means the box was
+        # REACHABLE but slow (or the response never framed an EOF) — NOT a
+        # refused connection. Map it to a distinct `upstream_timeout` so the
+        # front returns 504 (gateway timeout), reserving the offline-503 for a
+        # genuine connection refusal. (socket.timeout is TimeoutError on 3.10+.)
+        return {"err": "upstream_timeout"}
+    except urllib.error.URLError as exc:
+        # A URLError WRAPPING a socket timeout is still an upstream timeout; a
+        # refused / DNS / reset connection is a genuine box_unreachable.
+        if isinstance(exc.reason, (TimeoutError, socket.timeout)):
+            return {"err": "upstream_timeout"}
+        return {"err": "box_unreachable"}
+    except Exception:  # noqa: BLE001 — any other error → box stopped / unreachable
         return {"err": "box_unreachable"}

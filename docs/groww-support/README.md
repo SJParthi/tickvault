@@ -102,5 +102,6 @@ YYYY-MM-DD-<short-topic>.md
 | File | Subject |
 |---|---|
 | `2026-07-03-latency-floor-and-nats-eof.md` | External snapshot-pipeline latency floor + NATS silent-EOF disconnects |
+| `2026-07-03-live-feed-volume-missing.md` | Live feed sends zero volume / openInterest / OHLC — only `ltp` + `tsInMillis` populate |
 | `SUMMARY-2026-07-03.md` | One-page at-a-glance summary of the above |
 | `sql/external-floor.sql` | Paste-ready QuestDB SQL producing the latency evidence tables |

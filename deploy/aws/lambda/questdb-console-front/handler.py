@@ -44,7 +44,7 @@ import time
 import urllib.parse
 
 # Deployed-bytes proof marker (proof-3 ratchet: test_build_marker_present).
-QDB_CONSOLE_BUILD = "b4-qdb-console-2026-07-03-r1"
+QDB_CONSOLE_BUILD = "b4-qdb-console-2026-07-03-r2"
 
 REGION = os.environ.get("AWS_REGION", "ap-south-1")
 BACK_FN_ARN = os.environ.get("BACK_FN_ARN", "")
@@ -519,6 +519,12 @@ def _relay(method: str, path: str, raw_query: str, headers: dict) -> dict:
     err = back.get("err")
     if err == "too_large":
         return _json_resp(502, {"error": "response too large (>4.1MB) — narrow the query"})
+    if err == "upstream_timeout":
+        # B4 r2 diagnostic honesty: the box was reachable but the request
+        # timed out (slow QuestDB or an unframed response) — a 504 gateway
+        # timeout, NOT the 503 "box offline" path (which is reserved for a
+        # genuine connection refusal / stopped box).
+        return _json_resp(504, {"error": "tickvault box is slow to respond — try again in a moment"})
     if err:
         return _json_resp(503, {"error": _OFFLINE_MSG})
     resp_headers = {"cache-control": "no-store"}
