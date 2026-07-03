@@ -85,7 +85,7 @@ state — survivors present) and AFTER (0 MISSED, equivalents excluded).
 
 ## Test Plan
 
-- New killing tests (14 total): `candle_fold.rs` (1), `config.rs` (7),
+- New killing tests (18 total): `candle_fold.rs` (1), `config.rs` (7),
   `constants.rs` (7), `disconnect_cause.rs` (3) — see Plan Items for names.
 - `cargo mutants -p tickvault-common -F <scoped>` BEFORE and AFTER; AFTER
   must show 0 MISSED (equivalents excluded via `.cargo/mutants.toml`).
@@ -148,7 +148,7 @@ Cross-reference: `.claude/rules/project/per-wave-guarantee-matrix.md` (15-row
 
 | Demand | This PR's proof |
 |---|---|
-| 100% testing coverage | 14 new killing tests; scoped mutation score for the target set = 100% (caught + excluded-equivalent) |
+| 100% testing coverage | 18 new killing tests; scoped mutation score for the target set = 100% (caught + excluded-equivalent) |
 | 100% code checks | fmt + clippy + banned-pattern + plan-verify + plan-gate + guarantee-check all green |
 | 100% functionalities covering | the two new private helpers are called by `validate()` and directly tested |
 | 100% extreme check | the mutation gate itself is the ratchet — these mutants fail the build if the tests regress |
