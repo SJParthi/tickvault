@@ -548,6 +548,10 @@ async fn main() -> Result<()> {
             config.questdb.clone(),
             groww_max_subscribe,
             config.network.request_timeout_ms,
+            // 2026-07-03 Telegram feed parity: same lazily-filled notifier
+            // slot the sidecar supervisor uses — carries the Groww
+            // instruments-load Info ping once the watch-set resolves.
+            std::sync::Arc::clone(&groww_sidecar_notifier_slot),
         ),
     );
     // ── Dhan dormant activation watcher (PR-2, feed-toggle-full-lifecycle) ──
@@ -1606,6 +1610,23 @@ async fn main() -> Result<()> {
             });
         }
 
+        // 2026-07-03 feed parity: record Dhan's subscribed counts into the
+        // shared per-feed health registry (one-shot, cold path) so the
+        // readiness + end-of-day Telegram feed lines — and the feed-control
+        // page — show a REAL Dhan instrument count instead of "unknown".
+        if let Some(ref plan) = subscription_plan {
+            let summary = &plan.summary;
+            let indices = summary
+                .major_index_values
+                .saturating_add(summary.display_indices);
+            let stocks = summary.total.saturating_sub(indices);
+            feed_health.set_subscribed(
+                tickvault_common::feed::Feed::Dhan,
+                stocks as u64,
+                indices as u64,
+            );
+        }
+
         // --- WebSocket pool create (channel only, NOT spawned yet) ---
         let (pool_receiver, ws_pool_ready) = match create_websocket_pool(
             &token_handle,
@@ -1906,6 +1927,8 @@ async fn main() -> Result<()> {
                 &pool_arc,
                 tickvault_core::notification::events::BootPathLabel::Fast,
                 boot_start,
+                &feed_runtime,
+                &feed_health,
             )
             .await;
             (handles, Some(pool_arc))
@@ -2359,6 +2382,8 @@ async fn main() -> Result<()> {
             std::sync::Arc::clone(&token_handle),
             client_id.clone(),
             &config,
+            std::sync::Arc::clone(&feed_runtime),
+            std::sync::Arc::clone(&feed_health),
         );
 
         // --- Await shutdown ---
@@ -3499,6 +3524,66 @@ const WS_BOOT_PER_CONN_DEADLINE_SECS: u64 = 30;
 /// freshness for state transitions without burning CPU.
 const WS_BOOT_POLL_INTERVAL_MS: u64 = 250;
 
+/// Current IST epoch nanos for feed last-tick-age math — the same basis the
+/// `FeedHealthRegistry` records ticks at (mirrors the `/api/feeds/health`
+/// handler's clock).
+fn now_ist_nanos_for_feed_status() -> i64 {
+    chrono::Utc::now()
+        .timestamp_nanos_opt()
+        .unwrap_or(0)
+        .saturating_add(tickvault_common::constants::IST_UTC_OFFSET_NANOS)
+}
+
+/// Builds one operator-facing status line per ENABLED market-data feed for
+/// the readiness + end-of-day Telegram messages (operator directive
+/// 2026-07-03: Groww — and any future feed — must appear alongside Dhan).
+///
+/// Source of truth = the SAME shared `FeedHealthRegistry` the feed-control
+/// page reads: subscribed counts + last-tick age per feed. Honest labeling:
+/// a feed with no recorded data yields `None` fields, which the renderer
+/// prints as "unknown" / "no tick seen yet" — never fabricated numbers.
+/// Dhan's last-tick age falls back to the global REAL-tick gap detector
+/// (Dhan-pipeline-only; real ticks, never keep-alive pings) because the Dhan
+/// hot path does not stamp the registry per tick. Cold path — called once
+/// per boot summary / once per daily digest.
+fn build_feed_status_lines(
+    feed_runtime: &tickvault_api::feed_state::FeedRuntimeState,
+    feed_health: &tickvault_common::feed_health::FeedHealthRegistry,
+) -> Vec<tickvault_core::notification::events::FeedStatusLine> {
+    use tickvault_common::feed::Feed;
+    let now = now_ist_nanos_for_feed_status();
+    let market_open = tickvault_common::market_hours::is_trading_session_now();
+    Feed::ALL
+        .iter()
+        .copied()
+        .filter(|feed| feed_runtime.is_enabled(*feed))
+        .map(|feed| {
+            let report = feed_health.snapshot(
+                feed,
+                true, // enabled — filtered above
+                feed_runtime.lane_running(feed),
+                market_open,
+                now,
+            );
+            let subscribed = report.input.subscribed_stocks + report.input.subscribed_indices;
+            let mut last_tick_age_secs = report.input.last_tick_age_secs;
+            if feed == Feed::Dhan && last_tick_age_secs.is_none() {
+                // The Dhan tick path stamps the global real-tick gap detector
+                // (not the per-feed registry) — reuse it so the Dhan line is
+                // as truthful as the "Real market ticks" line above it.
+                last_tick_age_secs =
+                    tickvault_core::pipeline::tick_gap_detector::global_tick_gap_detector()
+                        .and_then(|d| d.freshest_tick_age_secs(std::time::Instant::now()));
+            }
+            tickvault_core::notification::events::FeedStatusLine {
+                name: feed.display_name().to_string(),
+                instruments: (subscribed > 0).then_some(subscribed),
+                last_tick_age_secs,
+            }
+        })
+        .collect()
+}
+
 /// Polls `pool.health()` every 250ms for up to 30s per slot until each
 /// connection reaches `ConnectionState::Connected`, then emits a single
 /// aggregate `WebSocketPoolOnline` summary (or
@@ -3527,6 +3612,11 @@ async fn emit_websocket_connected_alerts(
     pool: &std::sync::Arc<WebSocketConnectionPool>,
     boot_path: tickvault_core::notification::events::BootPathLabel,
     boot_start: std::time::Instant,
+    // 2026-07-03 feed parity: the "ready to trade" message names EVERY
+    // enabled market-data feed (Dhan, Groww, future), built at emit time
+    // from the same per-feed health registry the feed-control page reads.
+    feed_runtime: &std::sync::Arc<tickvault_api::feed_state::FeedRuntimeState>,
+    feed_health: &std::sync::Arc<tickvault_common::feed_health::FeedHealthRegistry>,
 ) {
     let healths_initial = pool.health();
     let total = healths_initial.len();
@@ -3599,6 +3689,7 @@ async fn emit_websocket_connected_alerts(
             boot_path,
             boot_wall_clock_secs,
             last_real_tick_age_secs,
+            feeds: build_feed_status_lines(feed_runtime, feed_health),
         });
     } else if !tickvault_common::market_hours::is_within_market_hours_ist() {
         // 2026-05-09: off-hours boot — non-connected slots are
@@ -6147,6 +6238,24 @@ async fn start_dhan_lane(
         });
     }
 
+    // 2026-07-03 feed parity: record Dhan's subscribed counts into the shared
+    // per-feed health registry (one-shot, cold path) so the readiness +
+    // end-of-day Telegram feed lines — and the feed-control page — show a
+    // REAL Dhan instrument count instead of "unknown". Mirrors the fast-boot
+    // site above (boot symmetry).
+    if let Some(ref plan) = subscription_plan {
+        let summary = &plan.summary;
+        let indices = summary
+            .major_index_values
+            .saturating_add(summary.display_indices);
+        let stocks = summary.total.saturating_sub(indices);
+        feed_health.set_subscribed(
+            tickvault_common::feed::Feed::Dhan,
+            stocks as u64,
+            indices as u64,
+        );
+    }
+
     // Boot-timing proof Telegram (DailyUniverse scope only — sentinel-guarded
     // so Indices4Only emits nothing). Reads the wall-clock stashed by
     // `load_daily_universe_plan`; gives the operator REAL daily evidence the
@@ -6860,6 +6969,8 @@ async fn start_dhan_lane(
             &pool_arc,
             tickvault_core::notification::events::BootPathLabel::Slow,
             boot_start,
+            &feed_runtime,
+            &feed_health,
         )
         .await;
         (handles, Some(pool_arc))
@@ -7078,6 +7189,8 @@ async fn start_dhan_lane(
                 std::sync::Arc::clone(&token_handle),
                 ws_client_id.clone(),
                 config,
+                std::sync::Arc::clone(&feed_runtime),
+                std::sync::Arc::clone(&feed_health),
             );
 
             // Wave 3-C Item 12 (2026-04-28): market-open self-test at
@@ -9857,6 +9970,54 @@ mod tests {
     // All pure helper tests moved to boot_helpers.rs in the lib target.
     // Tests below verify main.rs-specific smoke behavior.
 
+    // ── build_feed_status_lines (Telegram feed parity, 2026-07-03) ──
+    // The readiness + end-of-day messages must list EVERY enabled feed
+    // (Dhan, Groww, future) with honest unknowns — never fabricated data.
+
+    #[test]
+    fn test_build_feed_status_lines_includes_enabled_feeds_only() {
+        use tickvault_common::feed::Feed;
+        let runtime = tickvault_api::feed_state::FeedRuntimeState::default();
+        runtime.set_enabled(Feed::Dhan, true);
+        runtime.set_enabled(Feed::Groww, false);
+        let health = tickvault_common::feed_health::FeedHealthRegistry::new();
+        health.set_subscribed(Feed::Dhan, 774, 2);
+        // Groww's slot is populated but the feed is DISABLED — it must not
+        // appear (a switched-off feed is intentional, not "unknown").
+        health.set_subscribed(Feed::Groww, 766, 2);
+        let lines = build_feed_status_lines(&runtime, &health);
+        assert_eq!(lines.len(), 1, "disabled feeds must not appear: {lines:?}");
+        assert_eq!(lines[0].name, "Dhan");
+        assert_eq!(lines[0].instruments, Some(776));
+    }
+
+    #[test]
+    fn test_build_feed_status_lines_honest_unknowns() {
+        use tickvault_common::feed::Feed;
+        let runtime = tickvault_api::feed_state::FeedRuntimeState::default();
+        runtime.set_enabled(Feed::Dhan, true);
+        runtime.set_enabled(Feed::Groww, true);
+        let health = tickvault_common::feed_health::FeedHealthRegistry::new();
+        // Groww enabled with a known subscribe count + a recorded tick.
+        health.set_subscribed(Feed::Groww, 766, 2);
+        health.record_tick(Feed::Groww, now_ist_nanos_for_feed_status());
+        let lines = build_feed_status_lines(&runtime, &health);
+        assert_eq!(lines.len(), 2, "both enabled feeds must appear: {lines:?}");
+        let dhan = lines.iter().find(|l| l.name == "Dhan").expect("Dhan line");
+        // Nothing recorded for Dhan in this test registry (and no global
+        // tick-gap detector in a unit test) → honest unknowns, never zeros.
+        assert_eq!(dhan.instruments, None, "unknown must stay None: {dhan:?}");
+        let groww = lines
+            .iter()
+            .find(|l| l.name == "Groww")
+            .expect("Groww line");
+        assert_eq!(groww.instruments, Some(768));
+        assert!(
+            groww.last_tick_age_secs.is_some_and(|age| age <= 1),
+            "freshly recorded tick must read ~0s: {groww:?}"
+        );
+    }
+
     // ── boot_completed_should_emit truth table ──
     // The alive signal (tv_boot_completed) must be published only when at least
     // one ENABLED feed is running — so a boot where every enabled feed died
@@ -11321,6 +11482,11 @@ fn spawn_post_market_tasks(
     token_handle: TokenHandle,
     client_id: String,
     config: &ApplicationConfig,
+    // 2026-07-03 feed parity: the end-of-day digest names EVERY enabled
+    // market-data feed, built at fire time (15:31:30 IST) from the same
+    // per-feed health registry the feed-control page reads.
+    feed_runtime: std::sync::Arc<tickvault_api::feed_state::FeedRuntimeState>,
+    feed_health: std::sync::Arc<tickvault_common::feed_health::FeedHealthRegistry>,
 ) {
     if POST_MARKET_TASKS_SPAWNED.swap(true, std::sync::atomic::Ordering::SeqCst) {
         info!(
@@ -11361,6 +11527,8 @@ fn spawn_post_market_tasks(
         let eod_notifier = notifier.clone();
         let eod_health = health_status.clone();
         let eod_calendar = std::sync::Arc::clone(&trading_calendar);
+        let eod_feed_runtime = std::sync::Arc::clone(&feed_runtime);
+        let eod_feed_health = std::sync::Arc::clone(&feed_health);
         let eod_main_feed_total = tickvault_common::config::effective_main_feed_pool_size(
             config.subscription.scope,
             config.dhan.max_websocket_connections,
@@ -11408,6 +11576,9 @@ fn spawn_post_market_tasks(
                 main_feed_active: main_active,
                 main_feed_total: eod_main_feed_total,
                 token_remaining_hours: token_hours,
+                // 2026-07-03 feed parity: one line per enabled feed
+                // (Dhan, Groww, future) built at digest fire time.
+                feeds: build_feed_status_lines(&eod_feed_runtime, &eod_feed_health),
             });
         });
     }

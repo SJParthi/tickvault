@@ -119,6 +119,11 @@ pub async fn run_groww_activation_watcher(
     questdb: QuestDbConfig,
     max_subscribe: Option<usize>,
     auth_timeout_ms: u64,
+    // 2026-07-03 Telegram feed parity: slot filled once the
+    // NotificationService boots (same slot the sidecar supervisor uses) —
+    // the watch-set-ready arm emits the Groww instruments-load Info ping
+    // through it. A not-yet-filled slot skips the Telegram, never blocks.
+    notifier_slot: Arc<arc_swap::ArcSwapOption<tickvault_core::notification::NotificationService>>,
 ) {
     // The SINGLE owned activation task for the current ON period. `Some` iff the
     // lane is activated. Holding the handle lets us `abort()` ALL in-flight Groww
@@ -168,6 +173,7 @@ pub async fn run_groww_activation_watcher(
                     questdb.clone(),
                     max_subscribe,
                     auth_timeout_ms,
+                    Arc::clone(&notifier_slot),
                 ));
                 active_task = Some(task);
             }
@@ -210,6 +216,7 @@ async fn activate_groww_lane(
     questdb: QuestDbConfig,
     max_subscribe: Option<usize>,
     auth_timeout_ms: u64,
+    notifier_slot: Arc<arc_swap::ArcSwapOption<tickvault_core::notification::NotificationService>>,
 ) {
     // Not live until the watch-list is built; clear any stale true from a prior
     // ON period so the feed page reports honestly during activation.
@@ -329,6 +336,24 @@ async fn activate_groww_lane(
                     unresolved = set.unresolved_stocks.len(),
                     "[feeds] Groww watch-list ready"
                 );
+                // 2026-07-03 Telegram feed parity (operator: "whatever we
+                // have provided for dhan the same should be provided for
+                // groww also — instruments load message"). Mirror of the
+                // Dhan `InstrumentBuildSuccess` ping: one Info Telegram when
+                // the Groww watch-set resolves. Slot not yet filled (boot
+                // ordering) → skipped; the info! line above still records
+                // the counts, and activation is never blocked.
+                if let Some(notifier) = notifier_slot.load_full() {
+                    notifier.notify(
+                        tickvault_core::notification::events::NotificationEvent::FeedInstrumentsLoaded {
+                            feed: Feed::Groww.display_name().to_string(),
+                            subscribed: set.entries.len(),
+                            indices: set.indices,
+                            stocks: set.resolved_stocks,
+                            skipped: set.unresolved_stocks.len(),
+                        },
+                    );
+                }
                 // PR-A: persist the Groww instrument set into the SHARED
                 // `instrument_lifecycle` (+ `index_constituency`) master tables
                 // tagged `feed='groww'`. Fire-and-forget + degrade-safe — a

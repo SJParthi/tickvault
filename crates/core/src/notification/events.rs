@@ -285,6 +285,12 @@ pub enum NotificationEvent {
         /// "last update Xs ago" counted Dhan keep-alive pings and could
         /// read healthy while no real ticks were captured.
         last_real_tick_age_secs: Option<u32>,
+        /// One status line per ENABLED market-data feed (Dhan, Groww, any
+        /// future feed) — operator directive 2026-07-03: the "ready to
+        /// trade" readiness message must name EVERY feed, not just the
+        /// Dhan connection pool. Built at emit time from the same
+        /// per-feed health registry the feed-control page reads.
+        feeds: Vec<FeedStatusLine>,
     },
 
     /// Aggregate pool-degraded summary — fires when only a subset of
@@ -409,6 +415,11 @@ pub enum NotificationEvent {
         /// means anything < 12h after market close needs a TOTP-driven
         /// refresh before the next opening bell.
         token_remaining_hours: u64,
+        /// One status line per ENABLED market-data feed at digest time
+        /// (operator directive 2026-07-03: the digest previously reported
+        /// only the Dhan connection count; Groww — running and subscribed —
+        /// was invisible).
+        feeds: Vec<FeedStatusLine>,
     },
 
     /// Post-market 1-minute cross-verify daily summary (operator directive
@@ -661,6 +672,26 @@ pub enum NotificationEvent {
         derivative_count: usize,
         /// Total F&O underlyings built.
         underlying_count: usize,
+    },
+
+    /// A market-data feed finished loading + resolving its instrument set
+    /// (operator directive 2026-07-03 — Telegram feed parity: "whatever we
+    /// have provided for dhan the same should be provided for groww also …
+    /// instruments load message"). Mirrors `InstrumentBuildSuccess` (the
+    /// Dhan universe-build ping) for every OTHER feed: fired once when a
+    /// feed's watch-set resolves at boot/activation. Severity::Info.
+    FeedInstrumentsLoaded {
+        /// Feed display name (e.g. "Groww").
+        feed: String,
+        /// Instruments actually subscribed by this feed today.
+        subscribed: usize,
+        /// Index instruments inside `subscribed`.
+        indices: usize,
+        /// Stock instruments inside `subscribed`.
+        stocks: usize,
+        /// Instruments that could not be matched/resolved today (skipped —
+        /// logged by name in the app log, counted here for the operator).
+        skipped: usize,
     },
 
     /// Instrument build failed — includes manual trigger URL for retry.
@@ -978,6 +1009,60 @@ fn format_ping_freshness(secs: Option<u32>) -> String {
     }
 }
 
+/// One operator-facing status line for a market-data feed (Dhan, Groww, any
+/// future feed) inside the readiness + end-of-day Telegram messages.
+///
+/// Honest by construction: `None` fields render as "unknown" / "no tick seen
+/// yet" — the renderer never invents numbers for a feed whose health signals
+/// are not wired (operator directive 2026-07-03 + audit Rule 11 mirror).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FeedStatusLine {
+    /// Feed display name (e.g. "Dhan", "Groww").
+    pub name: String,
+    /// Instruments this feed subscribed today; `None` = unknown.
+    pub instruments: Option<u64>,
+    /// Seconds since this feed's most recent tick; `None` = no tick seen yet.
+    pub last_tick_age_secs: Option<u64>,
+}
+
+/// Renders the per-feed status block shared by the readiness ("ready to
+/// trade") and end-of-day digest messages. One line per enabled feed:
+///
+/// ```text
+/// Market-data feeds:
+///   Dhan: 776 instruments — last tick 0s ago ✓
+///   Groww: 768 instruments — last tick 2s ago ✓
+/// ```
+///
+/// Freshness wording: ≤30s gets a ✓; 31–120s renders plain seconds; older
+/// ages render minutes with NO fault emoji (post-close silence is normal —
+/// the digest must not read as a false red). Unknown data says "unknown" /
+/// "no tick seen yet" — never a fabricated number. An empty list (no feed
+/// data available) renders "unknown" so the block can never silently vanish.
+fn format_feed_status_block(feeds: &[FeedStatusLine]) -> String {
+    if feeds.is_empty() {
+        return "Market-data feeds: unknown\n".to_string();
+    }
+    let mut out = String::from("Market-data feeds:\n");
+    for feed in feeds {
+        let instruments = match feed.instruments {
+            Some(n) => format!("{} instruments", format_with_commas(n as usize)),
+            None => "instruments unknown".to_string(),
+        };
+        let tick = match feed.last_tick_age_secs {
+            None => "no tick seen yet".to_string(),
+            Some(age @ 0..=30) => format!("last tick {age}s ago ✓"),
+            Some(age @ 31..=120) => format!("last tick {age}s ago"),
+            Some(age) => format!("last tick {}m ago", age / 60),
+        };
+        out.push_str(&format!(
+            "  {name}: {instruments} — {tick}\n",
+            name = feed.name
+        ));
+    }
+    out
+}
+
 /// Renders the WebSocket pool-online (HEALTHY) Telegram message in the
 /// Tier-2 human-readable format. Single message at boot — eye instantly
 /// catches the verdict, then per-feed breakdown for at-a-glance status.
@@ -988,6 +1073,7 @@ fn format_pool_online_message(
     boot_path: BootPathLabel,
     boot_wall_clock_secs: f64,
     last_real_tick_age_secs: Option<u32>,
+    feeds: &[FeedStatusLine],
 ) -> String {
     let total_subscribed: usize = per_connection.iter().map(|(s, _, _)| *s).sum();
     let total_capacity: usize = per_connection.iter().map(|(_, c, _)| *c).sum();
@@ -998,8 +1084,12 @@ fn format_pool_online_message(
     };
     let mut out = String::new();
     out.push_str("<b>✅ TickVault is live and ready to trade</b>\n\n");
+    // "Dhan:" prefix (2026-07-03 feed parity): this count is the Dhan
+    // connection pool ONLY — the per-feed block below covers every enabled
+    // market-data feed (Dhan, Groww, future), so the header must not claim
+    // to be the full feed count.
     out.push_str(&format!(
-        "📡 All {connected} of {total} market-data feeds connected\n"
+        "📡 Dhan: All {connected} of {total} connections up\n"
     ));
     out.push_str(&format!(
         "📊 Tracking {sub} instruments out of {cap} max ({pct:.0}% full)\n\n",
@@ -1020,7 +1110,7 @@ fn format_pool_online_message(
              connected but not delivering data.\n\n",
         ),
     }
-    out.push_str("Per feed:\n");
+    out.push_str("Dhan connections:\n");
     for (idx, (sub, cap, last)) in per_connection.iter().enumerate() {
         let display = idx.saturating_add(1);
         let pct = if *cap == 0 {
@@ -1035,10 +1125,15 @@ fn format_pool_online_message(
         };
         let ping = format_ping_freshness(*last);
         out.push_str(&format!(
-            "  Feed {display}: tracking {sub_fmt} instruments ({pct_label}) — last update {ping}\n",
+            "  Connection {display}: tracking {sub_fmt} instruments ({pct_label}) — last update {ping}\n",
             sub_fmt = format_with_commas(*sub),
         ));
     }
+    // 2026-07-03 feed parity: one line per ENABLED market-data feed —
+    // Groww (and any future feed) appears alongside Dhan, or the operator
+    // cannot know the second feed came up.
+    out.push('\n');
+    out.push_str(&format_feed_status_block(feeds));
     out.push_str("\n💚 Heartbeat healthy on all feeds (Dhan pings every 10s, auto-pong)\n");
     out.push_str(&format!(
         "⏱️ Boot took {boot_wall_clock_secs:.1} seconds — {path}\n",
@@ -1224,6 +1319,7 @@ impl NotificationEvent {
                 boot_path,
                 boot_wall_clock_secs,
                 last_real_tick_age_secs,
+                feeds,
             } => format_pool_online_message(
                 *connected,
                 *total,
@@ -1231,6 +1327,7 @@ impl NotificationEvent {
                 *boot_path,
                 *boot_wall_clock_secs,
                 *last_real_tick_age_secs,
+                feeds,
             ),
             Self::WebSocketPoolPartialAfterDeadline {
                 connected,
@@ -1314,6 +1411,7 @@ impl NotificationEvent {
                 main_feed_active,
                 main_feed_total,
                 token_remaining_hours,
+                feeds,
             } => {
                 // Operator-facing wording per operator-charter §G: no
                 // library names, no file paths, plain English action
@@ -1328,11 +1426,15 @@ impl NotificationEvent {
                 } else {
                     "Feed was disconnected at close — check overnight logs."
                 };
+                // 2026-07-03 feed parity: the digest names EVERY enabled
+                // market-data feed, not just the Dhan connection count.
+                let feed_block = format_feed_status_block(feeds);
                 format!(
                     "<b>End-of-day digest @ 15:31:30 IST</b>\n\
                      Trading date: {trading_date_ist}\n\
                      Main feed: {main_feed_active}/{main_feed_total}\n\
                      Token headroom: {token_remaining_hours}h\n\
+                     {feed_block}\
                      {close_status}{token_warning}"
                 )
             }
@@ -1560,6 +1662,29 @@ impl NotificationEvent {
             } => {
                 format!(
                     "<b>Instruments OK</b>\nSource: {source}\nDerivatives: {derivative_count}\nUnderlyings: {underlying_count}"
+                )
+            }
+            Self::FeedInstrumentsLoaded {
+                feed,
+                subscribed,
+                indices,
+                stocks,
+                skipped,
+            } => {
+                // Operator-charter §G wording: plain English, provider name
+                // only, real numbers, one glance = "the second feed loaded
+                // its instruments and subscribed them".
+                let skipped_line = if *skipped > 0 {
+                    format!("\nSkipped {skipped} that could not be matched today")
+                } else {
+                    "\nEvery instrument matched".to_string()
+                };
+                format!(
+                    "<b>✅ {feed_name} instruments loaded</b>\n\
+                     Subscribed {sub} instruments ({indices} indices + {stocks} stocks)\
+                     {skipped_line}",
+                    feed_name = html_escape(feed),
+                    sub = format_with_commas(*subscribed),
                 )
             }
             Self::InstrumentBuildFailed {
@@ -1952,6 +2077,7 @@ impl NotificationEvent {
             Self::ShutdownInitiated => "ShutdownInitiated",
             Self::ShutdownComplete => "ShutdownComplete",
             Self::InstrumentBuildSuccess { .. } => "InstrumentBuildSuccess",
+            Self::FeedInstrumentsLoaded { .. } => "FeedInstrumentsLoaded",
             Self::InstrumentBuildFailed { .. } => "InstrumentBuildFailed",
             Self::IpVerificationFailed { .. } => "IpVerificationFailed",
             Self::IpVerificationSuccess { .. } => "IpVerificationSuccess",
@@ -2116,6 +2242,10 @@ impl NotificationEvent {
             // 2026-05-09 complaint resolved.
             Self::AuthenticationSuccess => Severity::Low,
             Self::InstrumentBuildSuccess { .. } => Severity::Low,
+            // 2026-07-03 feed parity: once-per-activation positive ping that
+            // a non-Dhan feed loaded + subscribed its instruments. Info so
+            // it never pages — a purely positive signal, like the EOD digest.
+            Self::FeedInstrumentsLoaded { .. } => Severity::Info,
             Self::BootHealthCheck { .. } => Severity::Low,
             Self::OrphanPositionDetected { .. } => Severity::Critical,
             Self::OrphanPositionsClean => Severity::Info,
@@ -2156,6 +2286,10 @@ impl NotificationEvent {
             // batch 3); OrderUpdateConnected is the surviving WS ping.
             Self::AuthenticationSuccess
             | Self::InstrumentBuildSuccess { .. }
+            // 2026-07-03 feed parity: the Groww (any-feed) instruments-load
+            // ping is a boot-success milestone — ship instantly like the
+            // Dhan `InstrumentBuildSuccess` it mirrors, never coalesced.
+            | Self::FeedInstrumentsLoaded { .. }
             | Self::WebSocketPoolOnline { .. }
             | Self::WebSocketPoolDeferredOffHours { .. }
             // PR #5 (2026-05-19): Phase2Complete retired.
@@ -4205,6 +4339,7 @@ mod tests {
             main_feed_active: 1,
             main_feed_total: 1,
             token_remaining_hours: 20,
+            feeds: vec![],
         };
         assert_eq!(event.topic(), "EndOfDayDigest");
         assert_eq!(event.severity(), Severity::Info);
@@ -4218,6 +4353,7 @@ mod tests {
             main_feed_active: 1,
             main_feed_total: 1,
             token_remaining_hours: 20,
+            feeds: vec![],
         };
         let msg = event.to_message();
         assert!(msg.contains("End-of-day digest @ 15:31:30 IST"));
@@ -4237,6 +4373,7 @@ mod tests {
             main_feed_active: 1,
             main_feed_total: 1,
             token_remaining_hours: 8,
+            feeds: vec![],
         };
         let msg = event.to_message();
         assert!(msg.contains("Token headroom: 8h"));
@@ -4254,6 +4391,7 @@ mod tests {
             main_feed_active: 0,
             main_feed_total: 1,
             token_remaining_hours: 20,
+            feeds: vec![],
         };
         let msg = event.to_message();
         assert!(msg.contains("Main feed: 0/1"));
@@ -4271,6 +4409,7 @@ mod tests {
             main_feed_active: 1,
             main_feed_total: 1,
             token_remaining_hours: 12,
+            feeds: vec![],
         };
         assert!(!healthy.to_message().contains("refresh TOTP"));
         let warn = NotificationEvent::EndOfDayDigest {
@@ -4278,8 +4417,144 @@ mod tests {
             main_feed_active: 1,
             main_feed_total: 1,
             token_remaining_hours: 11,
+            feeds: vec![],
         };
         assert!(warn.to_message().contains("refresh TOTP"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Feed-agnostic Telegram parity (operator directive 2026-07-03):
+    // FeedStatusLine block + FeedInstrumentsLoaded
+    // -----------------------------------------------------------------------
+
+    fn feed_lines() -> Vec<FeedStatusLine> {
+        vec![
+            FeedStatusLine {
+                name: "Dhan".to_string(),
+                instruments: Some(776),
+                last_tick_age_secs: Some(0),
+            },
+            FeedStatusLine {
+                name: "Groww".to_string(),
+                instruments: Some(768),
+                last_tick_age_secs: Some(2),
+            },
+        ]
+    }
+
+    #[test]
+    fn test_feed_status_block_renders_known_values() {
+        let block = format_feed_status_block(&feed_lines());
+        assert!(block.contains("Market-data feeds:"), "got: {block}");
+        assert!(
+            block.contains("Dhan: 776 instruments — last tick 0s ago ✓"),
+            "got: {block}"
+        );
+        assert!(
+            block.contains("Groww: 768 instruments — last tick 2s ago ✓"),
+            "got: {block}"
+        );
+    }
+
+    #[test]
+    fn test_feed_status_block_renders_unknowns_honestly() {
+        // A feed with no wired health data must say "unknown" — never a
+        // fabricated number (audit Rule 11 mirror).
+        let block = format_feed_status_block(&[FeedStatusLine {
+            name: "Groww".to_string(),
+            instruments: None,
+            last_tick_age_secs: None,
+        }]);
+        assert!(
+            block.contains("Groww: instruments unknown — no tick seen yet"),
+            "got: {block}"
+        );
+        // Ages past 120s render as minutes with NO fault emoji (post-close
+        // silence is normal — the digest must not read as a false red).
+        let block = format_feed_status_block(&[FeedStatusLine {
+            name: "Dhan".to_string(),
+            instruments: Some(776),
+            last_tick_age_secs: Some(180),
+        }]);
+        assert!(block.contains("last tick 3m ago"), "got: {block}");
+        assert!(!block.contains('❌'), "no false red: {block}");
+        // Empty list must render an explicit "unknown", never vanish.
+        let empty = format_feed_status_block(&[]);
+        assert!(empty.contains("Market-data feeds: unknown"), "got: {empty}");
+    }
+
+    #[test]
+    fn test_pool_online_message_lists_every_enabled_feed() {
+        let ev = NotificationEvent::WebSocketPoolOnline {
+            connected: 1,
+            total: 1,
+            per_connection: vec![(776, 5_000, Some(0))],
+            boot_path: BootPathLabel::Slow,
+            boot_wall_clock_secs: 1.2,
+            last_real_tick_age_secs: Some(0),
+            feeds: feed_lines(),
+        };
+        let msg = ev.to_message();
+        assert!(msg.contains("Market-data feeds:"), "got: {msg}");
+        assert!(msg.contains("Dhan: 776 instruments"), "got: {msg}");
+        assert!(msg.contains("Groww: 768 instruments"), "got: {msg}");
+        // The header now honestly labels the connection count as Dhan's.
+        assert!(msg.contains("Dhan: All 1 of 1"), "got: {msg}");
+    }
+
+    #[test]
+    fn test_end_of_day_digest_lists_every_enabled_feed() {
+        let ev = NotificationEvent::EndOfDayDigest {
+            trading_date_ist: "2026-07-03".to_string(),
+            main_feed_active: 1,
+            main_feed_total: 1,
+            token_remaining_hours: 20,
+            feeds: feed_lines(),
+        };
+        let msg = ev.to_message();
+        assert!(msg.contains("Market-data feeds:"), "got: {msg}");
+        assert!(msg.contains("Dhan: 776 instruments"), "got: {msg}");
+        assert!(msg.contains("Groww: 768 instruments"), "got: {msg}");
+    }
+
+    #[test]
+    fn test_feed_instruments_loaded_message_and_severity() {
+        let ev = NotificationEvent::FeedInstrumentsLoaded {
+            feed: "Groww".to_string(),
+            subscribed: 768,
+            indices: 2,
+            stocks: 766,
+            skipped: 5,
+        };
+        assert_eq!(ev.topic(), "FeedInstrumentsLoaded");
+        assert_eq!(ev.severity(), Severity::Info);
+        // Boot-success milestone — must ship instantly like the Dhan
+        // instruments ping it mirrors, never coalesced 60s.
+        assert_eq!(ev.dispatch_policy(), DispatchPolicy::Immediate);
+        let msg = ev.to_message();
+        assert!(msg.contains("Groww instruments loaded"), "got: {msg}");
+        assert!(
+            msg.contains("Subscribed 768 instruments (2 indices + 766 stocks)"),
+            "got: {msg}"
+        );
+        assert!(
+            msg.contains("Skipped 5 that could not be matched today"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_feed_instruments_loaded_skipped_zero_wording() {
+        let ev = NotificationEvent::FeedInstrumentsLoaded {
+            feed: "Groww".to_string(),
+            subscribed: 770,
+            indices: 2,
+            stocks: 768,
+            skipped: 0,
+        };
+        let msg = ev.to_message();
+        assert!(msg.contains("Every instrument matched"), "got: {msg}");
+        assert!(!msg.contains("Skipped"), "got: {msg}");
     }
 
     // -----------------------------------------------------------------------
