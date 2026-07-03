@@ -125,3 +125,7 @@ pub mod lifecycle_reconcile_orchestrator;
 pub mod daily_universe_boot;
 pub mod subsystem_memory;
 pub mod trading_pipeline;
+/// C3 (2026-07-03): bounded, chunked, backpressured STAGE-C.2b WAL frame
+/// re-injection — replaces the raw try_send loop that dropped 1,127,801
+/// frames + kept the WAL unconfirmed (self-feeding re-replay storm).
+pub mod wal_reinject;
