@@ -38,9 +38,10 @@
 use std::time::Duration;
 
 use bytes::Bytes;
+use tickvault_common::constants::WAL_REINJECT_PROGRESS_LOG_CHUNKS;
 use tickvault_common::error_code::ErrorCode;
 use tokio::sync::mpsc::Sender;
-use tracing::error;
+use tracing::{error, info};
 
 /// Outcome of one [`reinject_wal_frames`] run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -68,10 +69,18 @@ pub struct ReinjectOutcome {
 ///
 /// On abort (channel closed OR per-send timeout) the helper emits
 /// `error!(code = "WS-REINJECT-01", …)`, increments
-/// `tv_ws_wal_reinject_aborted_total{reason}` +
+/// `tv_ws_frame_wal_reinject_aborted_total{reason}` +
 /// `tv_ws_frame_wal_reinjected_dropped_total{ws_type="live_feed"}`
 /// (semantic continuity with the pre-fix drop counter), and returns
 /// `clean == false` so the caller skips `confirm_replayed()`.
+///
+/// ORDERING INVARIANT (C3 review CRITICAL, 2026-07-03): production callers
+/// MUST spawn the frame-channel consumer (`run_tick_processor`) BEFORE
+/// awaiting this helper. Without a live consumer, any replay larger than
+/// `FRAME_CHANNEL_CAPACITY` fills the channel, the next send stalls for the
+/// full `send_timeout`, and the run aborts NOT-clean — the WAL never
+/// archives and the re-replay storm loop is NOT broken. Ratcheted by
+/// `tests::ratchet_tick_processor_spawns_before_reinject_await`.
 pub async fn reinject_wal_frames(
     sender: &Sender<(u64, Bytes)>,
     frames: Vec<(u64, Bytes)>,
@@ -82,6 +91,7 @@ pub async fn reinject_wal_frames(
     let chunk = chunk_size.max(1);
     let mut injected: u64 = 0;
     let mut since_yield: usize = 0;
+    let mut chunks_delivered: u64 = 0;
 
     for frame in frames {
         let abort_reason: &'static str =
@@ -91,7 +101,15 @@ pub async fn reinject_wal_frames(
                     since_yield += 1;
                     if since_yield >= chunk {
                         since_yield = 0;
-                        metrics::counter!("tv_ws_wal_reinject_chunks_total").increment(1);
+                        chunks_delivered += 1;
+                        metrics::counter!("tv_ws_frame_wal_reinject_chunks_total").increment(1);
+                        // Boot-latency honesty: a huge WAL drains inline
+                        // before systemd readiness, so surface periodic
+                        // progress (every ~131K frames at prod constants)
+                        // for an operator tailing logs during a long boot.
+                        if chunks_delivered.is_multiple_of(WAL_REINJECT_PROGRESS_LOG_CHUNKS) {
+                            info!(injected, total, "WAL re-injection progress");
+                        }
                         // Let the live WS read loop + tick processor run —
                         // a huge replay must not monopolize the runtime.
                         tokio::task::yield_now().await;
@@ -113,7 +131,7 @@ pub async fn reinject_wal_frames(
             "WS-REINJECT-01: WAL re-injection aborted — frame-channel consumer dead or \
              wedged; remaining frames stay staged in WAL replaying/ and re-replay next boot"
         );
-        metrics::counter!("tv_ws_wal_reinject_aborted_total", "reason" => abort_reason)
+        metrics::counter!("tv_ws_frame_wal_reinject_aborted_total", "reason" => abort_reason)
             .increment(1);
         // Semantic continuity: aborted frames are the bounded, WAL-preserved
         // successor of the pre-fix try_send drops (same operator dashboard).
@@ -245,6 +263,70 @@ mod tests {
         drop(rx); // keep the receiver alive across the run, then release
     }
 
+    /// (c2) C3 review CRITICAL, documented as a test: if NO consumer is
+    /// ever spawned (the receiver exists but nothing drains — the exact
+    /// shape of the pre-reorder production bug, where `run_tick_processor`
+    /// was spawned AFTER the reinject await), a replay LARGER than the
+    /// channel capacity fills exactly `capacity` slots, the next send
+    /// stalls for the full timeout, and the run aborts NOT-clean — so the
+    /// WAL never confirms and the storm loop is NOT broken. This is WHY
+    /// production MUST spawn the consumer BEFORE awaiting the helper
+    /// (ratcheted by `ratchet_tick_processor_spawns_before_reinject_await`).
+    #[tokio::test]
+    async fn test_no_consumer_times_out_and_aborts() {
+        const CAPACITY: usize = 64;
+        const TOTAL: u64 = 200; // > capacity, mirrors replay >> channel
+        let (tx, rx) = mpsc::channel::<(u64, Bytes)>(CAPACITY);
+
+        let outcome =
+            reinject_wal_frames(&tx, make_frames(TOTAL), 16, Duration::from_millis(50)).await;
+
+        assert!(!outcome.clean, "no consumer must abort NOT-clean");
+        assert_eq!(
+            outcome.injected, CAPACITY as u64,
+            "exactly the channel capacity is absorbed, then the stall aborts"
+        );
+        assert!(outcome.aborted_remaining > 0);
+        assert_eq!(outcome.injected + outcome.aborted_remaining, TOTAL);
+        drop(rx); // receiver stayed alive (never polled) across the run
+    }
+
+    /// (c3) Robustness to a slight spawn race: the reinject future starts
+    /// FIRST (frames > capacity), and the draining consumer is spawned
+    /// ~50ms AFTER. The generous per-send timeout rides out the gap, the
+    /// late consumer drains, and the run completes clean with zero aborts.
+    /// (Production still spawns consumer-first; this proves the helper
+    /// tolerates the inverse ordering briefly rather than aborting.)
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_consumer_spawned_after_call_still_drains() {
+        const CAPACITY: usize = 64;
+        const TOTAL: u64 = 5_000; // > capacity so the injector MUST stall
+        let (tx, mut rx) = mpsc::channel::<(u64, Bytes)>(CAPACITY);
+
+        let reinject = tokio::spawn(async move {
+            let outcome = reinject_wal_frames(&tx, make_frames(TOTAL), 16, TEST_SEND_TIMEOUT).await;
+            // tx drops here, closing the channel for the consumer below.
+            outcome
+        });
+
+        // Let the reinject future run (and park on a full channel) first.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let consumer = tokio::spawn(async move {
+            let mut received: u64 = 0;
+            while rx.recv().await.is_some() {
+                received += 1;
+            }
+            received
+        });
+
+        let outcome = reinject.await.expect("reinject task");
+        assert!(outcome.clean, "late-spawned consumer must still drain all");
+        assert_eq!(outcome.injected, TOTAL);
+        assert_eq!(outcome.aborted_remaining, 0);
+        assert_eq!(consumer.await.expect("consumer task"), TOTAL);
+    }
+
     /// (d) Empty vec: trivially clean, nothing injected, nothing aborted.
     /// (Named after the pub fn for the pub-fn-test-guard ratchet.)
     #[tokio::test]
@@ -318,7 +400,7 @@ mod tests {
         /// replay range so the consumer can classify arrivals.
         const LIVE_SEQ_BASE: u64 = u64::MAX - LIVE_TOTAL;
 
-        let (tx, mut rx) = mpsc::channel::<(u64, Bytes)>(4_096);
+        let (tx, mut rx) = mpsc::channel::<(u64, Bytes)>(CHANNEL_CAP as usize);
 
         // Consumer: drains everything, recording the arrival index of the
         // FIRST live frame plus per-class counts.
@@ -357,7 +439,7 @@ mod tests {
         let outcome = reinject_wal_frames(
             &tx,
             make_frames(REPLAY_TOTAL),
-            1_024, // frequent yields relative to the 4,096-slot channel
+            CHUNK as usize, // frequent yields relative to the 4,096-slot channel
             TEST_SEND_TIMEOUT,
         )
         .await;
@@ -373,10 +455,23 @@ mod tests {
         assert_eq!(replay_received, REPLAY_TOTAL, "no replay frame lost");
         assert_eq!(live_received, LIVE_TOTAL, "no live frame lost");
         let first = first_live_arrival.expect("at least one live frame arrived");
-        let total = REPLAY_TOTAL + LIVE_TOTAL;
+        // Deterministic, meaningful liveness bound (C3 review MEDIUM — the
+        // old `first < total/2` bound of 250,005 was near-vacuous): the live
+        // producer's first send is issued at replay start; mpsc waiter
+        // fairness is FIFO, so the live frame lands behind at most the
+        // frames already buffered (channel capacity 4,096) plus a few
+        // yield windows (chunk 1,024) of scheduling slack before the live
+        // task first runs. 3 chunks + capacity = 7,168 of 500,010 — a
+        // comfortable margin that still proves the live path is NOT
+        // starved behind hundreds of thousands of replay frames.
+        const CHANNEL_CAP: u64 = 4_096;
+        const CHUNK: u64 = 1_024;
+        let bound = 3 * CHUNK + CHANNEL_CAP;
         assert!(
-            first < total / 2,
-            "live path starved: first live frame arrived at index {first} of {total}"
+            first < bound,
+            "live path starved: first live frame arrived at index {first}, \
+             bound {bound} (replay still had {} frames remaining)",
+            REPLAY_TOTAL.saturating_sub(first)
         );
     }
 
@@ -406,5 +501,65 @@ mod tests {
             error_code_src.contains("WsReinject01Aborted"),
             "ErrorCode::WsReinject01Aborted must exist in crates/common"
         );
+    }
+
+    /// Ratchet/regression (C3 review CRITICAL): at BOTH STAGE-C.2b boot
+    /// paths (fast boot + the `start_dhan_lane` slow-boot mirror) the
+    /// frame-channel consumer spawn (`run_tick_processor(`) MUST precede
+    /// its `reinject_wal_frames(` await in main.rs source order. If the
+    /// consumer is spawned AFTER the reinject await, any replay larger
+    /// than FRAME_CHANNEL_CAPACITY (131,072) fills the channel with
+    /// nobody draining, the next send stalls for the full 30s
+    /// WAL_REINJECT_SEND_TIMEOUT, and the run aborts NOT-clean — the WAL
+    /// never archives and the re-replay storm loop is NOT broken (the
+    /// original fix only helped the ≤capacity case that was never
+    /// broken). Anchors: `run_tick_processor(` (call-with-paren — the
+    /// `use …::run_tick_processor;` import at the top of main.rs does
+    /// NOT match) and `reinject_wal_frames(`; both occur exactly once
+    /// per boot path, in boot-path order (fast first, slow second), so
+    /// pairwise position comparison pins the per-site ordering.
+    #[test]
+    fn ratchet_tick_processor_spawns_before_reinject_await() {
+        let main_src = include_str!("main.rs");
+
+        let spawn_positions: Vec<usize> = main_src
+            .match_indices("run_tick_processor(")
+            .map(|(pos, _)| pos)
+            .collect();
+        let reinject_positions: Vec<usize> = main_src
+            .match_indices("reinject_wal_frames(")
+            .map(|(pos, _)| pos)
+            .collect();
+
+        assert_eq!(
+            spawn_positions.len(),
+            2,
+            "expected exactly 2 run_tick_processor( call sites in main.rs \
+             (fast boot + slow boot); found {} — update this ratchet's \
+             pairing logic if a boot path was added/removed",
+            spawn_positions.len()
+        );
+        assert_eq!(
+            reinject_positions.len(),
+            2,
+            "expected exactly 2 reinject_wal_frames( call sites in main.rs \
+             (fast boot + slow boot); found {}",
+            reinject_positions.len()
+        );
+
+        for (i, (spawn, reinject)) in spawn_positions
+            .iter()
+            .zip(reinject_positions.iter())
+            .enumerate()
+        {
+            assert!(
+                spawn < reinject,
+                "boot path #{i}: run_tick_processor( at byte {spawn} must \
+                 precede reinject_wal_frames( at byte {reinject} — the \
+                 consumer MUST be spawned before the WAL re-injection \
+                 awaits, or a >capacity replay deadlocks into the 30s \
+                 timeout abort and the WAL storm loop returns (C3 CRITICAL)"
+            );
+        }
     }
 }

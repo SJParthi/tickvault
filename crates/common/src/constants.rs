@@ -2016,6 +2016,17 @@ pub const WAL_REINJECT_CHUNK_SIZE: usize = 8_192;
 /// archives a partially delivered replay (durable WAL floor preserved).
 pub const WAL_REINJECT_SEND_TIMEOUT_SECS: u64 = 30;
 
+/// Emit a WAL re-injection progress `info!` every this many delivered chunks.
+///
+/// 16 chunks × [`WAL_REINJECT_CHUNK_SIZE`] (8,192) = every ~131,072 frames —
+/// one progress line per channel-capacity's worth of replay. A pathologically
+/// large WAL (1M+ frames) drains inline before `notify_systemd_ready`, so an
+/// operator tailing logs during a long boot sees periodic
+/// `WAL re-injection progress` lines instead of a silent multi-second stall
+/// (boot wall-clock scales linearly with WAL backlog size by design —
+/// zero-drop trade-off; systemd tolerates it via `TimeoutStartSec=infinity`).
+pub const WAL_REINJECT_PROGRESS_LOG_CHUNKS: u64 = 16;
+
 /// Power-of-two exponent for the tick deduplication ring buffer.
 ///
 /// Size = 2^16 = 65,536 slots x 8 bytes = 512 KiB.

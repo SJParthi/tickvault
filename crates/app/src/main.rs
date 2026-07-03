@@ -1632,88 +1632,6 @@ async fn main() -> Result<()> {
             None => (None, None),
         };
 
-        // STAGE-C.2b: Re-inject replayed LiveFeed frames into the pool's
-        // frame sender. This happens BEFORE the pool spawns its
-        // connections, so the replayed frames land in the mpsc queue
-        // ahead of any fresh live frame. The tick processor — started
-        // below — drains them in FIFO order and QuestDB dedup keys
-        // (STORAGE-GAP-01) make the replay idempotent, so even if the
-        // same frames were partially persisted before the crash, no
-        // duplicate rows are written.
-        //
-        // If the pool build failed (ws_pool_ready is None) we log a
-        // warning but preserve the frames in the WAL archive.
-        //
-        // CRASH-SAFETY (zero-loss MEDIUM fix 2026-06-30): mirror of the
-        // slow-boot staged-then-confirm contract. The fast-boot confirm
-        // (just before notify_systemd_ready below) archives the staged
-        // segments ONLY if this re-injection was clean — i.e. a pool
-        // existed AND no frame was dropped. A dropped/no-pool case keeps
-        // the segments in replaying/ so they re-replay next boot.
-        let mut fast_ws_wal_replay_reinjection_clean = true;
-        if !ws_wal_replay_live_feed.is_empty() {
-            if let Some(ref pool) = ws_pool_ready {
-                let sender = pool.frame_sender_clone();
-                let capacity = sender.capacity();
-                let to_inject = std::mem::take(&mut ws_wal_replay_live_feed);
-                let count = to_inject.len();
-                info!(
-                    frames = count,
-                    channel_capacity = capacity,
-                    "STAGE-C.2b: re-injecting replayed LiveFeed frames into pool mpsc"
-                );
-                // C3 fix (2026-07-03): bounded chunked backpressure via
-                // `reinject_wal_frames` (send().await + per-chunk yield +
-                // bounded per-send timeout) replaces the raw try_send loop
-                // that silently dropped everything past
-                // FRAME_CHANNEL_CAPACITY (dropped=1,127,801 at 10:35 IST)
-                // and kept the WAL unconfirmed — the self-feeding re-replay
-                // storm. A clean run lets confirm_replayed() below archive
-                // the staged segments. Runbook: ws-reinject-error-codes.md.
-                let outcome = tickvault_app::wal_reinject::reinject_wal_frames(
-                    &sender,
-                    to_inject,
-                    tickvault_common::constants::WAL_REINJECT_CHUNK_SIZE,
-                    std::time::Duration::from_secs(
-                        tickvault_common::constants::WAL_REINJECT_SEND_TIMEOUT_SECS,
-                    ),
-                )
-                .await;
-                metrics::counter!(
-                    "tv_ws_frame_wal_reinjected_total",
-                    "ws_type" => "live_feed"
-                )
-                .increment(outcome.injected);
-                if outcome.clean {
-                    info!(
-                        injected = outcome.injected,
-                        "STAGE-C.2b: LiveFeed re-injection complete — all replayed frames \
-                         delivered with backpressure"
-                    );
-                } else {
-                    // WS-REINJECT-01 was already error!-paged (typed code +
-                    // abort counters) inside the helper; here we only record
-                    // the not-clean flag so confirm_replayed() below is
-                    // skipped and the staged segments re-replay next boot
-                    // (durable WAL floor — no silent loss).
-                    fast_ws_wal_replay_reinjection_clean = false;
-                    warn!(
-                        injected = outcome.injected,
-                        aborted_remaining = outcome.aborted_remaining,
-                        "STAGE-C.2b: LiveFeed re-injection aborted — staged WAL segments \
-                         remain in replaying/ for re-replay next boot"
-                    );
-                }
-            } else {
-                fast_ws_wal_replay_reinjection_clean = false;
-                warn!(
-                    frames = ws_wal_replay_live_feed.len(),
-                    "STAGE-C.2b: LiveFeed replay frames held but pool build failed — \
-                     frames remain in WAL archive, not re-injected"
-                );
-            }
-        }
-
         // S4-T1a/T1b: Shared shutdown notifier. The pool watchdog task
         // listens on this and stops when we signal graceful shutdown, so
         // the watchdog doesn't fire a spurious Halt during intentional
@@ -1849,6 +1767,96 @@ async fn main() -> Result<()> {
         // ticks were flowing.
         if processor_handle.is_some() {
             health_status.set_pipeline_active(true);
+        }
+
+        // STAGE-C.2b: Re-inject replayed LiveFeed frames into the pool's
+        // frame sender. Ordering (C3 review CRITICAL fix, 2026-07-03):
+        //   [channel create] → [tick processor spawned ABOVE, draining] →
+        //   [this reinject await] → [WS connections spawned BELOW].
+        // The consumer MUST already be running: a replay larger than
+        // FRAME_CHANNEL_CAPACITY (131,072) would otherwise fill the channel
+        // with nobody draining, stall into the 30s
+        // WAL_REINJECT_SEND_TIMEOUT, abort NOT-clean, and the WAL would
+        // never archive — the exact storm loop this fix exists to break.
+        // Because this await completes BEFORE the connections spawn, every
+        // replayed frame still enters the mpsc ahead of any fresh live
+        // frame (FIFO preserved — one sequential sender loop), and QuestDB
+        // dedup keys (STORAGE-GAP-01) make the replay idempotent, so even
+        // if the same frames were partially persisted before the crash, no
+        // duplicate rows are written. Ratchet:
+        // wal_reinject::tests::ratchet_tick_processor_spawns_before_reinject_await.
+        //
+        // If the pool build failed (ws_pool_ready is None) we log a
+        // warning but preserve the frames in the WAL archive.
+        //
+        // CRASH-SAFETY (zero-loss MEDIUM fix 2026-06-30): mirror of the
+        // slow-boot staged-then-confirm contract. The fast-boot confirm
+        // (just before notify_systemd_ready below) archives the staged
+        // segments ONLY if this re-injection was clean — i.e. a pool
+        // existed AND no frame was dropped. A dropped/no-pool case keeps
+        // the segments in replaying/ so they re-replay next boot.
+        let mut fast_ws_wal_replay_reinjection_clean = true;
+        if !ws_wal_replay_live_feed.is_empty() {
+            if let Some(ref pool) = ws_pool_ready {
+                let sender = pool.frame_sender_clone();
+                let capacity = sender.capacity();
+                let to_inject = std::mem::take(&mut ws_wal_replay_live_feed);
+                let count = to_inject.len();
+                info!(
+                    frames = count,
+                    channel_capacity = capacity,
+                    "STAGE-C.2b: re-injecting replayed LiveFeed frames into pool mpsc"
+                );
+                // C3 fix (2026-07-03): bounded chunked backpressure via
+                // `reinject_wal_frames` (send().await + per-chunk yield +
+                // bounded per-send timeout) replaces the raw try_send loop
+                // that silently dropped everything past
+                // FRAME_CHANNEL_CAPACITY (dropped=1,127,801 at 10:35 IST)
+                // and kept the WAL unconfirmed — the self-feeding re-replay
+                // storm. A clean run lets confirm_replayed() below archive
+                // the staged segments. Runbook: ws-reinject-error-codes.md.
+                let outcome = tickvault_app::wal_reinject::reinject_wal_frames(
+                    &sender,
+                    to_inject,
+                    tickvault_common::constants::WAL_REINJECT_CHUNK_SIZE,
+                    std::time::Duration::from_secs(
+                        tickvault_common::constants::WAL_REINJECT_SEND_TIMEOUT_SECS,
+                    ),
+                )
+                .await;
+                metrics::counter!(
+                    "tv_ws_frame_wal_reinjected_total",
+                    "ws_type" => "live_feed"
+                )
+                .increment(outcome.injected);
+                if outcome.clean {
+                    info!(
+                        injected = outcome.injected,
+                        "STAGE-C.2b: LiveFeed re-injection complete — all replayed frames \
+                         delivered with backpressure"
+                    );
+                } else {
+                    // WS-REINJECT-01 was already error!-paged (typed code +
+                    // abort counters) inside the helper; here we only record
+                    // the not-clean flag so confirm_replayed() below is
+                    // skipped and the staged segments re-replay next boot
+                    // (durable WAL floor — no silent loss).
+                    fast_ws_wal_replay_reinjection_clean = false;
+                    warn!(
+                        injected = outcome.injected,
+                        aborted_remaining = outcome.aborted_remaining,
+                        "STAGE-C.2b: LiveFeed re-injection aborted — staged WAL segments \
+                         remain in replaying/ for re-replay next boot"
+                    );
+                }
+            } else {
+                fast_ws_wal_replay_reinjection_clean = false;
+                warn!(
+                    frames = ws_wal_replay_live_feed.len(),
+                    "STAGE-C.2b: LiveFeed replay frames held but pool build failed — \
+                     frames remain in WAL archive, not re-injected"
+                );
+            }
         }
 
         // --- NOW spawn WebSocket connections (tick processor consuming) ---
@@ -5920,8 +5928,10 @@ async fn start_dhan_lane(
     // history preserves the SELF code if Dhan ever regresses.
 
     // Step 8a: Create WebSocket pool (channel + connections, NOT yet spawned).
-    // Step 9 starts tick processor BEFORE connections are spawned so frames
-    // are consumed immediately — prevents frame send timeouts during stagger.
+    // Step 9 starts tick processor BEFORE the STAGE-C.2b WAL re-injection
+    // awaits AND before connections are spawned (Step 8b), so frames are
+    // consumed immediately — prevents re-injection send timeouts on a
+    // >capacity replay and frame send timeouts during stagger.
     //
     // GUARD: Skip WebSocket connections on non-trading days (weekends/holidays).
     // Dhan's WebSocket server sends stale market data (last-traded prices from
@@ -5980,73 +5990,8 @@ async fn start_dhan_lane(
         (None, None)
     };
 
-    // STAGE-C.2b: Slow-boot mirror of the fast-boot re-injection path.
-    // Re-inject replayed LiveFeed frames into the pool's mpsc BEFORE the
-    // tick processor spawns, so recovered frames land ahead of any live
-    // frames and are persisted idempotently via QuestDB dedup keys.
-    //
-    // CRASH-SAFETY (zero-loss MEDIUM fix 2026-06-30): same staged-then-confirm
-    // contract as the fast-boot path — see its comment. Confirm only if BOTH
-    // the LiveFeed re-injection and the OrderUpdate drain below are clean.
-    let mut ws_wal_replay_reinjection_clean = true;
-    if !ws_wal_replay_live_feed.is_empty() {
-        if let Some(ref pool) = ws_pool_ready {
-            let sender = pool.frame_sender_clone();
-            let capacity = sender.capacity();
-            let to_inject = std::mem::take(&mut ws_wal_replay_live_feed);
-            let count = to_inject.len();
-            info!(
-                frames = count,
-                channel_capacity = capacity,
-                "STAGE-C.2b: re-injecting replayed LiveFeed frames into pool mpsc (slow boot)"
-            );
-            // C3 fix (2026-07-03): slow-boot mirror of the fast-boot bounded
-            // chunked-backpressure re-injection — see the fast-boot comment.
-            // Runbook: ws-reinject-error-codes.md.
-            let outcome = tickvault_app::wal_reinject::reinject_wal_frames(
-                &sender,
-                to_inject,
-                tickvault_common::constants::WAL_REINJECT_CHUNK_SIZE,
-                std::time::Duration::from_secs(
-                    tickvault_common::constants::WAL_REINJECT_SEND_TIMEOUT_SECS,
-                ),
-            )
-            .await;
-            metrics::counter!(
-                "tv_ws_frame_wal_reinjected_total",
-                "ws_type" => "live_feed"
-            )
-            .increment(outcome.injected);
-            if outcome.clean {
-                info!(
-                    injected = outcome.injected,
-                    "STAGE-C.2b: LiveFeed re-injection complete (slow boot) — all replayed \
-                     frames delivered with backpressure"
-                );
-            } else {
-                // WS-REINJECT-01 already error!-paged inside the helper;
-                // record the not-clean flag so the slow-boot confirm is
-                // skipped and the staged segments re-replay next boot.
-                ws_wal_replay_reinjection_clean = false;
-                warn!(
-                    injected = outcome.injected,
-                    aborted_remaining = outcome.aborted_remaining,
-                    "STAGE-C.2b: LiveFeed re-injection aborted (slow boot) — staged WAL \
-                     segments remain in replaying/ for re-replay next boot"
-                );
-            }
-        } else {
-            ws_wal_replay_reinjection_clean = false;
-            warn!(
-                frames = ws_wal_replay_live_feed.len(),
-                "STAGE-C.2b: LiveFeed replay frames held but no pool (slow boot) — \
-                 frames stay staged in WAL replaying/, not re-injected"
-            );
-        }
-    }
-
     // -----------------------------------------------------------------------
-    // Step 9: Spawn tick processor FIRST (before WS connections send frames)
+    // Step 9: Spawn tick processor FIRST (before WAL re-injection + WS spawn)
     // -----------------------------------------------------------------------
     // PR #2 (2026-05-18): `shared_movers` snapshot retired alongside
     // the deleted `top_movers` / `option_movers` modules.
@@ -6500,6 +6445,79 @@ async fn start_dhan_lane(
         info!("tick processor skipped — no frame source available");
         None
     };
+
+    // STAGE-C.2b: Slow-boot mirror of the fast-boot re-injection path.
+    // Ordering (C3 review CRITICAL fix, 2026-07-03):
+    //   [channel create, Step 8a] → [tick processor spawned ABOVE, Step 9,
+    //   draining] → [this reinject await] → [WS connections, Step 8b BELOW].
+    // The consumer MUST already be running — a replay larger than
+    // FRAME_CHANNEL_CAPACITY would otherwise fill the channel with nobody
+    // draining, stall into the 30s WAL_REINJECT_SEND_TIMEOUT, abort
+    // NOT-clean, and the WAL would never archive (the storm loop). Because
+    // this await completes BEFORE Step 8b spawns the connections, recovered
+    // frames still land ahead of any live frame (FIFO — one sequential
+    // sender loop) and are persisted idempotently via QuestDB dedup keys.
+    // Ratchet: wal_reinject::tests::ratchet_tick_processor_spawns_before_reinject_await.
+    //
+    // CRASH-SAFETY (zero-loss MEDIUM fix 2026-06-30): same staged-then-confirm
+    // contract as the fast-boot path — see its comment. Confirm only if BOTH
+    // the LiveFeed re-injection and the OrderUpdate drain below are clean.
+    let mut ws_wal_replay_reinjection_clean = true;
+    if !ws_wal_replay_live_feed.is_empty() {
+        if let Some(ref pool) = ws_pool_ready {
+            let sender = pool.frame_sender_clone();
+            let capacity = sender.capacity();
+            let to_inject = std::mem::take(&mut ws_wal_replay_live_feed);
+            let count = to_inject.len();
+            info!(
+                frames = count,
+                channel_capacity = capacity,
+                "STAGE-C.2b: re-injecting replayed LiveFeed frames into pool mpsc (slow boot)"
+            );
+            // C3 fix (2026-07-03): slow-boot mirror of the fast-boot bounded
+            // chunked-backpressure re-injection — see the fast-boot comment.
+            // Runbook: ws-reinject-error-codes.md.
+            let outcome = tickvault_app::wal_reinject::reinject_wal_frames(
+                &sender,
+                to_inject,
+                tickvault_common::constants::WAL_REINJECT_CHUNK_SIZE,
+                std::time::Duration::from_secs(
+                    tickvault_common::constants::WAL_REINJECT_SEND_TIMEOUT_SECS,
+                ),
+            )
+            .await;
+            metrics::counter!(
+                "tv_ws_frame_wal_reinjected_total",
+                "ws_type" => "live_feed"
+            )
+            .increment(outcome.injected);
+            if outcome.clean {
+                info!(
+                    injected = outcome.injected,
+                    "STAGE-C.2b: LiveFeed re-injection complete (slow boot) — all replayed \
+                     frames delivered with backpressure"
+                );
+            } else {
+                // WS-REINJECT-01 already error!-paged inside the helper;
+                // record the not-clean flag so the slow-boot confirm is
+                // skipped and the staged segments re-replay next boot.
+                ws_wal_replay_reinjection_clean = false;
+                warn!(
+                    injected = outcome.injected,
+                    aborted_remaining = outcome.aborted_remaining,
+                    "STAGE-C.2b: LiveFeed re-injection aborted (slow boot) — staged WAL \
+                     segments remain in replaying/ for re-replay next boot"
+                );
+            }
+        } else {
+            ws_wal_replay_reinjection_clean = false;
+            warn!(
+                frames = ws_wal_replay_live_feed.len(),
+                "STAGE-C.2b: LiveFeed replay frames held but no pool (slow boot) — \
+                 frames stay staged in WAL replaying/, not re-injected"
+            );
+        }
+    }
 
     // Step 8b: NOW spawn WebSocket connections (tick processor is already consuming).
     // S4-T1a/T1b: shared shutdown_notify for pool watchdog + graceful shutdown.
