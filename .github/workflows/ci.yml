@@ -243,7 +243,23 @@ jobs:
         with:
           toolchain: '1.95.0'
 
-      - name: Install cargo-audit + cargo-deny
+      # Prebuilt binaries via taiki-e/install-action (seconds) instead of
+      # `cargo install --locked` from source (observed 30-65+ min stalls on
+      # fresh runners during crates.io/network degradation, 2026-07-03).
+      # Pinned by full commit SHA (repo convention) + exact tool versions
+      # (both verified present in the v2.82.7 manifests; no ^/~ ranges).
+      - name: Install cargo-audit + cargo-deny (prebuilt, pinned)
+        id: install-audit-tools
+        continue-on-error: true
+        uses: taiki-e/install-action@16b05812d776ae1dfaabc8277e421fb6d2506419 # v2.82.7 SHA-pinned
+        with:
+          tool: cargo-audit@0.22.2,cargo-deny@0.19.9
+
+      # Fallback: if the prebuilt fetch ever fails (GitHub release asset
+      # outage, checksum mismatch), fall back to the original from-source
+      # install so the job never gets weaker — only faster on the happy path.
+      - name: Install cargo-audit + cargo-deny (from-source fallback)
+        if: steps.install-audit-tools.outcome == 'failure'
         run: |
           cargo install --locked cargo-audit
           cargo install --locked cargo-deny
