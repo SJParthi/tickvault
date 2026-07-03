@@ -20,9 +20,19 @@
 # makes bench-gate.sh's `max_regression_pct = 5.0` arm actually fire. The
 # first-ever run has no baseline -> absolute budgets only (honest, expected).
 #
-# RATCHET SEMANTICS: the baseline cache is SAVED only on a green gate
-# (`if: success()`). A run that fails the gate does NOT become the next
-# baseline — otherwise a regression would self-ratify on the following run.
+# RATCHET SEMANTICS (exit-code-aware, post adversarial review 2026-07-03):
+# bench-gate.sh differentiates exit codes — 0 = clean, 1 = absolute-budget
+# breach ONLY, 2 = confident (>5%, CI-lower-bound) regression (2 wins when
+# both breach). The baseline cache is saved whenever the benches themselves
+# completed AND the gate did not report a regression (gate_rc != '2'):
+#   - rc=0 (clean) -> baseline advances (the normal green ratchet)
+#   - rc=1 (absolute-budget hardware misfit on slower runners) -> baseline
+#     STILL advances, so dev-calibrated absolute budgets can never starve the
+#     cache and deadlock the regression arm (it needs a prior baseline)
+#   - rc=2 (confident regression) -> baseline is NOT saved, so a regression
+#     can never self-ratify by becoming the next run's comparison base
+# The workflow step still fails on ANY nonzero rc — this only governs
+# whether the Criterion baseline ratchets forward.
 name: Benchmarks & Perf Gate
 
 on:
@@ -63,6 +73,12 @@ jobs:
           shared-key: ci-bench
           cache-on-failure: true
 
+      # Swatinem/rust-cache caches target/ — scrub any criterion state it
+      # resurrected (e.g. from a red run) so target/criterion comes ONLY from
+      # the green-baseline cache restored below, or is fresh.
+      - name: Scrub cached Criterion state
+        run: rm -rf target/criterion
+
       # Restore the previous green run's Criterion baseline so this run's
       # `cargo bench` writes <id>/change/estimates.json (Criterion compares
       # against the restored `new/` dirs) and bench-gate.sh can enforce the
@@ -78,15 +94,18 @@ jobs:
             criterion-baseline-
 
       - name: Run benchmarks (workspace)
+        id: bench
         run: |
           set -o pipefail
           cargo bench --workspace 2>&1 | tee bench-output.log
 
       - name: Run bench-gate (absolute budgets + 5% regression)
+        id: gate
         run: |
           set -o pipefail
           rc=0
           bash scripts/bench-gate.sh | tee gate-output.log || rc=$?
+          echo "gate_rc=$rc" >> "$GITHUB_OUTPUT"
           {
             echo '## Bench Gate Results'
             echo '```'
@@ -95,10 +114,14 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
           exit "$rc"
 
-      # Save the baseline ONLY on a green gate — a regressed run must not
-      # become the next run's baseline (it would self-ratify the regression).
-      - name: Save Criterion baseline (green runs only)
-        if: success()
+      # Save the baseline whenever the benches completed and there was NO
+      # confident regression (gate_rc != '2'). An absolute-budget hardware
+      # misfit (rc=1) does NOT starve the cache — otherwise dev-calibrated
+      # budgets failing forever on slower runners would mean the baseline is
+      # never saved and the regression arm never activates (deadlock). A >5%
+      # regression (rc=2) can never self-ratify as the next baseline.
+      - name: Save Criterion baseline (benches ok, no regression)
+        if: always() && steps.bench.outcome == 'success' && steps.gate.outputs.gate_rc != '2'
         uses: actions/cache/save@v6
         with:
           path: target/criterion
