@@ -56,10 +56,27 @@ and it breaks Dhan's Option B 1-bucket-late amend (Failure C).
   identity (the D4 sketch's `(TfIndex, &LiveCandleState)` cannot route).
   Returns the seal count for the coalesced BOUNDARY-01 log line.
 - **D5 — per-feed driver tasks (cold path, self-gating).** Constants
-  `CATCHUP_SEAL_LATENESS_MARGIN_SECS = 5` and
+  `CATCHUP_SEAL_LATENESS_MARGIN_SECS_DHAN = 5`,
+  `CATCHUP_SEAL_LATENESS_MARGIN_SECS_GROWW = 60` (per-feed margins — F4
+  hardening 2026-07-03: Groww's NDJSON path has measured per-subject
+  delivery skew, so one full minute of allowed lateness converts ">5 s skew
+  = counted discard" into "only >60 s skew discards" while bounding Groww
+  seal lag to ~65 s), `CATCHUP_WATERMARK_FUTURE_SKEW_GUARD_SECS = 10` and
   `CATCHUP_SEAL_POLL_INTERVAL_SECS = 5` in
   `crates/trading/src/candles/multi_tf_aggregator.rs` (re-exported from
-  `candles::mod`). cutoff = `watermark.saturating_sub(margin)`. Dhan: Task 4
+  `candles::mod`). Each wave gates through the shared PURE
+  `compute_catchup_cutoff(watermark, last_scanned, now_ist, margin, guard)`
+  (F2 hardening): `None` on no-tick-yet / self-gate / POISONED watermark
+  (> now_ist + guard — a garbage future-dated tick advanced the
+  never-regressing fetch_max; the driver emits ONE edge-latched
+  `error!(code = "BOUNDARY-01", reason = "watermark_future_skew")` +
+  `tv_boundary_catchup_skipped_total{feed, reason="future_skew"}` per wave
+  and does NOT update last_scanned), else
+  `Some(min(watermark − margin, now_ist))` — the wall-clock clamp is
+  defense-in-depth so a bucket can never seal before the wall clock passes
+  its end. Self-heal: `MultiTfAggregator::reset_watermark()` runs in BOTH
+  IST-midnight force-seal tasks right after `force_seal_all`, so poisoning
+  self-heals within one day. Dhan: Task 4
   in `spawn_engine_b_aggregator` next to the midnight Task 3, same bare
   `tokio::spawn` supervision level as both midnight tasks; every 5 s reads
   `watermark_secs()`, skips when it has not advanced since the last scan
@@ -91,7 +108,8 @@ and it breaks Dhan's Option B 1-bucket-late amend (Failure C).
 
 **Why the watermark is safe under both late policies:** file order preserves
 capture order and `consume_tick` is single-writer per instrument, so every
-tick belonging to a bucket whose end is ≤ (max-seen event time − 5 s margin)
+tick belonging to a bucket whose end is ≤ (max-seen event time − the
+per-feed margin: 5 s Dhan / 60 s Groww)
 has provably already been consumed by the time the scan runs — sealing such a
 bucket can never orphan a backlogged tick. A bucket the backlog is still
 filling has `bucket_end > cutoff` and is left open. D1 (daily TF) never
@@ -194,7 +212,12 @@ and revert cleanly with the code.
 ## Observability
 
 - `tv_boundary_catchup_total{feed="dhan"|"groww"}` — one increment per
-  catch-up-sealed candle (static labels only).
+  ROUTED catch-up-sealed candle (static labels only; Dhan excludes D1,
+  which is dropped at the write boundary — F5 hardening 2026-07-03).
+- `tv_boundary_catchup_skipped_total{feed, reason="future_skew"}` — one
+  increment per wave skipped by the poisoned-watermark guard, plus ONE
+  edge-latched coalesced `error!(code = "BOUNDARY-01",
+  reason = "watermark_future_skew")` per poisoning episode (F2 hardening).
 - ONE coalesced `warn!(code = "BOUNDARY-01" …, feed, seals, cutoff_secs,
   watermark_secs)` per scan wave that sealed > 0 (Severity::Medium per
   `ErrorCode::Boundary01CatchupSeal`; runbook =
@@ -223,6 +246,22 @@ and revert cleanly with the code.
   - Tests: (app compile + existing source-scan ratchets; the load-bearing
     seal-routing closure params are pinned by the existing `route_seal`
     unit tests; the trading-crate primitives above carry the logic tests)
+- [x] Item 4 — Consolidated adversarial-review hardening (2026-07-03):
+  F1 Groww validator fail-closed on implausible receipt clock
+  (`GrowwTickReject::ImplausibleReceiptClock`); F2 poisoned-watermark
+  defense — pure `compute_catchup_cutoff` gate shared by both drivers
+  (self-gate + future-skew guard + wall-clock clamp), coalesced BOUNDARY-01
+  `error!` with `reason = "watermark_future_skew"` +
+  `tv_boundary_catchup_skipped_total{feed, reason="future_skew"}`, and
+  `reset_watermark()` self-heal in BOTH IST-midnight force-seal tasks;
+  F3 overflow-safe (saturating) bucket-end comparison in
+  `AggregatorCell::catch_up_seal`; F4 per-feed lateness margins
+  (`CATCHUP_SEAL_LATENESS_MARGIN_SECS_DHAN = 5`,
+  `CATCHUP_SEAL_LATENESS_MARGIN_SECS_GROWW = 60`); F5 Dhan catch-up counter
+  + coalesced `seals` count exclude D1 (dropped at the write boundary);
+  F6 honest-envelope addenda in the rule file + this plan.
+  - Files: crates/trading/src/candles/multi_tf_aggregator.rs, crates/trading/src/candles/aggregator_cell.rs, crates/trading/src/candles/mod.rs, crates/app/src/main.rs, crates/app/src/groww_bridge.rs, .claude/rules/project/wave-6-error-codes.md
+  - Tests: test_compute_catchup_cutoff_gates, test_compute_catchup_cutoff_clamps_to_wall_clock, test_reset_watermark_zeroes_and_next_tick_rebuilds, test_catch_up_seal_bucket_end_saturates_at_u32_max, test_validate_groww_tick_fail_closed_on_implausible_receipt_clock
 
 ## Per-Item Guarantee Matrix (15-row, per `per-wave-guarantee-matrix.md`)
 
@@ -259,15 +298,36 @@ and revert cleanly with the code.
 ## Honest 100% claim
 
 100% inside the tested envelope, with ratcheted regression coverage: (a) the
-catch-up seal fires ONLY for buckets whose end ≤ the feed's event-time
-watermark − 5 s (`CATCHUP_SEAL_LATENESS_MARGIN_SECS`, ratcheted by
-`test_catch_up_seal_all_never_seals_past_watermark`); a feed whose watermark
+catch-up seal fires ONLY for buckets whose end ≤ min(the feed's event-time
+watermark − the PER-FEED margin, the IST wall clock) —
+`CATCHUP_SEAL_LATENESS_MARGIN_SECS_DHAN = 5` /
+`CATCHUP_SEAL_LATENESS_MARGIN_SECS_GROWW = 60` (Groww's NDJSON path has
+measured per-subject delivery skew: 60 s converts ">5 s skew = counted
+discard" into "only >60 s skew discards" while bounding Groww seal lag to
+~65 s) — ratcheted by `test_catch_up_seal_all_never_seals_past_watermark` +
+`test_compute_catchup_cutoff_gates` +
+`test_compute_catchup_cutoff_clamps_to_wall_clock`; a feed whose watermark
 stalls (dead feed, ILP-backpressure pause) receives NO catch-up seals —
 FEED-STALL-01 owns the dead-feed page, and there is deliberately NO "assume
 dead then force-seal anyway" escape hatch; (b) if zero post-close ticks
 arrive after 15:29:59, the final session minute still waits for the
-IST-midnight force-seal (backstop unchanged); (c) the worst catch-up wave is
-≤ ~25K seals at the 1200-SID cap (1200 × 21 TFs), inside the 200K
-`SEAL_BUFFER_CAPACITY` seal-ring envelope drained at 1024/100 ms. Beyond the
-envelope, the seal-ring's spill → DLQ NDJSON catches every payload as
-recoverable text.
+IST-midnight force-seal (backstop unchanged) — and a day whose LAST tick
+lands inside [15:30:00, 15:30:00 + margin) likewise still waits for the
+midnight force-seal (the watermark never clears that bucket's end + margin);
+(c) the worst catch-up wave is ≤ ~25K seals at the 1200-SID cap (1200 × 21
+TFs), inside the 200K `SEAL_BUFFER_CAPACITY` seal-ring envelope drained at
+1024/100 ms — and the coalesced `warn!`'s `seals` count includes any
+mpsc-DroppedFull seals (those rows reach the ring→spill→DLQ absorption chain
+and are counted separately by `tv_seal_mpsc_dropped_total`); (d) a watermark
+more than `CATCHUP_WATERMARK_FUTURE_SKEW_GUARD_SECS = 10` s ahead of the IST
+wall clock is POISONED — catch-up sealing is disabled (ONE coalesced
+BOUNDARY-01 `error!` with `reason = "watermark_future_skew"` +
+`tv_boundary_catchup_skipped_total{feed, reason="future_skew"}`) until the
+IST-midnight `reset_watermark()` self-heals it, and the Groww validator now
+fails CLOSED on an implausible receipt clock so a broken host clock can no
+longer poison the watermark in the first place
+(`test_validate_groww_tick_fail_closed_on_implausible_receipt_clock`);
+(e) the Dhan driver's counter + `seals` count exclude D1 (dropped at the
+write boundary per `live-feed-purity.md` rule 10; Groww routes + counts D1).
+Beyond the envelope, the seal-ring's spill → DLQ NDJSON catches every
+payload as recoverable text.

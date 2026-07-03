@@ -177,9 +177,13 @@ sites; the cited source file does not exist). BOUNDARY-01 is now LIVE with
 different — safer — semantics:
 
 **Trigger (actual):** each per-feed catch-up driver task polls every
-`CATCHUP_SEAL_POLL_INTERVAL_SECS` (5 s) and, ONLY when that feed's
-**event-time watermark** advanced since the last scan, seals every bucket
-whose end ≤ `watermark − CATCHUP_SEAL_LATENESS_MARGIN_SECS` (5 s). The
+`CATCHUP_SEAL_POLL_INTERVAL_SECS` (5 s) and gates each wave through the
+shared pure `compute_catchup_cutoff` (2026-07-03 hardening): scan ONLY when
+that feed's **event-time watermark** advanced since the last scan AND is not
+poisoned (see the future-skew guard below), sealing every bucket whose end ≤
+`min(watermark − margin, now_ist)` where `margin` is **per-feed** —
+`CATCHUP_SEAL_LATENESS_MARGIN_SECS_DHAN` (5 s) /
+`CATCHUP_SEAL_LATENESS_MARGIN_SECS_GROWW` (60 s). The
 watermark is the max `tick.exchange_timestamp` ever consumed by that
 aggregator INSTANCE (`MultiTfAggregator::watermark_secs`, one relaxed
 `fetch_max` per tick advanced BEFORE the out-of-session gate so post-close
@@ -200,21 +204,77 @@ seal decision. A catch-up seal populates the cell's amendable `last_sealed`
 post-catch-up they are idempotent). Ratchet:
 `test_catch_up_seal_all_never_seals_past_watermark`.
 
+**Per-feed margins (F4 hostile finding, 2026-07-03):** Dhan's WS broadcast
+delivers in near-capture order — 5 s absorbs its boundary jitter. Groww's
+NDJSON path has MEASURED per-subject delivery skew (sidecar snapshot
+freezes, byte-0 re-tail replays, bounded 4 MiB chunk drains) AND runs
+`LatePolicy::Discard`: with a 5 s margin any >5 s cross-subject skew became
+a counted discard. The 60 s Groww margin means only >60 s skew discards,
+while still bounding the Groww seal lag to ~65 s (margin + poll cadence)
+instead of the pre-BOUNDARY-01 unbounded next-tick/midnight wait.
+
+**Poisoned-watermark defense (`reason = "watermark_future_skew"`, F2
+security finding 2026-07-03):** a legit watermark can lead the IST wall
+clock only by host skew (≤ 2 s per BOOT-03). If the watermark sits more than
+`CATCHUP_WATERMARK_FUTURE_SKEW_GUARD_SECS` (10 s) AHEAD of the wall clock, a
+garbage future-dated tick advanced the never-regressing `fetch_max` — the
+gate returns `None`; the driver emits ONE coalesced `error!(code =
+"BOUNDARY-01", reason = "watermark_future_skew", feed, watermark_secs,
+now_ist_secs)` per poisoning episode (edge-latched), increments
+`tv_boundary_catchup_skipped_total{feed, reason="future_skew"}` per skipped
+wave, and does NOT update its last-scanned watermark. Catch-up sealing stays
+disabled until the watermark self-heals at the IST-midnight
+`MultiTfAggregator::reset_watermark()` (called by BOTH midnight force-seal
+tasks right after `force_seal_all`). Companion fail-closed guard: the Groww
+validator now REJECTS every tick when its receipt-clock read is implausible
+(`GrowwTickReject::ImplausibleReceiptClock` — a broken host clock can no
+longer skip the ±60 s future-skew clamp and poison the watermark; BOOT-03
+class). The cutoff's wall-clock clamp (`min(…, now_ist)`) is
+defense-in-depth: a bucket can never seal before the wall clock passes its
+end. The cell-side bucket-end comparison uses a saturating add, so a
+bucket_start near `u32::MAX` (only reachable via poisoning) never
+overflow-panics — it simply never seals.
+
+**Triage (poisoned watermark):**
+1. `mcp__tickvault-logs__tail_errors` — the `watermark_future_skew` payload
+   carries `feed`, `watermark_secs`, `now_ist_secs`; the delta names how far
+   future the poison sits.
+2. Cross-check the feed's validator rejects (Groww:
+   `ImplausibleReceiptClock` / `FutureTimestamp` reject logs) and BOOT-03
+   (host clock skew) — either garbage upstream timestamps or a broken host
+   clock.
+3. No manual action is needed for the seal path: the IST-midnight watermark
+   reset self-heals it; per-tick sealing and the midnight force-seal are
+   unaffected in the meantime.
+
 **Honest envelope:** (a) a feed whose watermark STALLS (dead feed,
 ILP-backpressure pause) gets NO catch-up seals — FEED-STALL-01 owns the
 dead-feed page; there is deliberately NO "assume dead then force-seal
 anyway" escape hatch. (b) If zero post-close ticks arrive after 15:29:59,
 the final session minute still waits for the IST-midnight force-seal
-(backstop unchanged). (c) Worst catch-up wave ≤ ~25K seals at the 1200-SID
-cap (1200 × 21 TFs), inside the 200K `SEAL_BUFFER_CAPACITY` ring envelope.
-(d) D1 never catch-up seals intraday (its bucket ends next-day 09:15, past
-any same-day watermark) — the midnight force-seal keeps owning D1.
+(backstop unchanged) — and a day whose LAST tick lands inside
+[15:30:00, 15:30:00 + margin) also still waits for the midnight force-seal
+(the watermark never clears that bucket's end + margin). (c) Worst catch-up
+wave ≤ ~25K seals at the 1200-SID cap (1200 × 21 TFs), inside the 200K
+`SEAL_BUFFER_CAPACITY` ring envelope. (d) D1 never catch-up seals intraday
+(its bucket ends next-day 09:15, past any same-day watermark) — the
+midnight force-seal keeps owning D1; the Dhan driver additionally EXCLUDES
+D1 from its counter and coalesced `seals` count (Dhan drops D1 at the write
+boundary per `live-feed-purity.md` rule 10; Groww routes + counts D1).
+(e) The coalesced `warn!`'s `seals` count includes any mpsc-DroppedFull
+seals — those rows reach the ring→spill→DLQ absorption chain and are
+counted separately by `tv_seal_mpsc_dropped_total`. (f) A watermark >10 s
+ahead of the wall clock disables catch-up (coalesced BOUNDARY-01 error,
+reason=watermark_future_skew) until it self-heals at the IST-midnight
+watermark reset.
 
-**Counter:** `tv_boundary_catchup_total{feed="dhan"|"groww"}` — one
-increment per catch-up-sealed candle.
+**Counters:** `tv_boundary_catchup_total{feed="dhan"|"groww"}` — one
+increment per ROUTED catch-up-sealed candle (Dhan excludes D1);
+`tv_boundary_catchup_skipped_total{feed, reason="future_skew"}` — one
+increment per wave skipped by the poisoned-watermark guard.
 
 **Source (actual):**
-`crates/trading/src/candles/multi_tf_aggregator.rs::{watermark_secs, catch_up_seal_all, CATCHUP_SEAL_LATENESS_MARGIN_SECS, CATCHUP_SEAL_POLL_INTERVAL_SECS}`,
+`crates/trading/src/candles/multi_tf_aggregator.rs::{watermark_secs, reset_watermark, catch_up_seal_all, compute_catchup_cutoff, CATCHUP_SEAL_LATENESS_MARGIN_SECS_DHAN, CATCHUP_SEAL_LATENESS_MARGIN_SECS_GROWW, CATCHUP_WATERMARK_FUTURE_SKEW_GUARD_SECS, CATCHUP_SEAL_POLL_INTERVAL_SECS}`,
 `crates/trading/src/candles/aggregator_cell.rs::AggregatorCell::catch_up_seal`
 (+ the uninitialised-slot Failure-B guard in `consume_tick`). Drivers:
 `crates/app/src/main.rs` (`spawn_engine_b_aggregator` Task 4, Dhan) and
