@@ -1,6 +1,7 @@
 <!--
 =============================================================================
 GROWW SUPPORT DOSSIER — 2026-07-03 live feed sends zero volume / OI / OHLC
+SEND FROM subramaniaparthiban@gmail.com (the Groww-registered account)
 Share the GitHub link in the email — do NOT copy-paste plain text
 (Gmail's proportional font destroys the tables; GitHub renders them).
 
@@ -8,13 +9,13 @@ GMAIL BODY TO PASTE (one line + the link — nothing else):
 
     Hi Groww API team, we are seeing zero volume/openInterest/OHLC on every
     live-feed tick (only ltp + tsInMillis populate) — full evidence, verbatim
-    tick JSON, and 4 specific questions here:
+    tick JSON, and 5 specific questions here:
     https://github.com/SJParthi/tickvault/blob/main/docs/groww-support/2026-07-03-live-feed-volume-missing.md
     Thank you, Parthiban
 
 BEFORE SENDING — operator-fill checklist (every intentional placeholder):
-  1. <GROWW_API_SUPPORT_EMAIL — operator fill before sending>
-       — no Groww support email exists in this repo; do NOT guess one.
+  1. Recipient: FILLED — support@groww.in (confirmed from the groww.in/help
+       Contact-us panel, 2026-07-03 screenshot).
   2. <GROWW_CLIENT_ID — operator fill before sending>  (appears 2x)
        — Groww account identifier; NEVER substitute the Dhan Client ID / UCC
          (those are Dhan credentials — see docs/dhan-support/).
@@ -24,8 +25,8 @@ BEFORE SENDING — operator-fill checklist (every intentional placeholder):
 
 # Live feed delivers zero volume / openInterest / OHLC on every tick — only `ltp` + `tsInMillis` populate — New request
 
-**To:** <GROWW_API_SUPPORT_EMAIL — operator fill before sending>
-**From:** sjparthi93@gmail.com
+**To:** support@groww.in
+**From:** subramaniaparthiban@gmail.com (the Groww-registered account)
 **Subject:** Live feed (growwapi SDK, subscribe_ltp) — volume / openInterest / OHLC are 0.0 on 444,657 consecutive market-hours ticks; only ltp + tsInMillis ever populate (2026-07-03 evidence)
 **Date:** 2026-07-03
 
@@ -46,7 +47,7 @@ issue. All evidence below was captured live on 2026-07-03 (labelled
 |---|---|
 | Groww Client ID | `<GROWW_CLIENT_ID — operator fill before sending>` |
 | Name | Parthiban Subramanian |
-| Contact email | sjparthi93@gmail.com |
+| Contact email | subramaniaparthiban@gmail.com (Groww-registered account) |
 | SDK | official `growwapi` Python SDK, `GrowwFeed` |
 | Feed endpoint | `wss://socket-api.groww.in` (NATS-over-WebSocket + Protobuf) |
 | Subscription mode | `subscribe_ltp` |
@@ -132,25 +133,12 @@ cause of the zero fields.
    instrument on the live feed** (768 NSE_EQ/index instruments), given
    the constraint that we consume the live stream only (no per-instrument
    REST polling)?
-
----
-
-## Secondary observation — silent NATS socket closes (Verified; details in a separate dossier)
-
-On the same day (2026-07-03, around **12:02:43 IST**) we also observed
-the server closing the NATS-over-WebSocket socket with **no NATS ERR
-frame and no WebSocket close handshake** — the blocking SDK
-`feed.consume()` simply stops returning (bare EOF). Our side detects the
-stall and force-reconnects. Full timeline and verbatim logs are in a
-separate dossier we can share:
-`docs/groww-support/2026-07-03-latency-floor-and-nats-eof.md` in the
-same repository.
-
-5. **What are the expected disconnect/reconnect semantics of the live
-   feed?** Under what conditions does the server close the socket, is an
-   ERR frame or WS close handshake expected before the close, and what is
-   your recommended client reconnect + re-subscribe procedure after a
-   bare EOF?
+5. **If cumulative day volume / OI is not currently available on ANY
+   live-feed subscription mode, please treat this as a formal feature
+   request:** adding a per-instrument cumulative `volume` (and
+   `openInterest` for F&O) field to the live feed would make it fully
+   usable for volume-aware trading systems — is this on your roadmap,
+   and can it be prioritized?
 
 ---
 
@@ -163,4 +151,4 @@ questions 1–4 unblocks us immediately.
 
 Thank you,
 **Parthiban Subramanian**
-sjparthi93@gmail.com
+subramaniaparthiban@gmail.com

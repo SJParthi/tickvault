@@ -937,6 +937,95 @@ mod tests {
         );
     }
 
+    // -----------------------------------------------------------------------
+    // Session-open purity — exact boundary ratchets (operator directive
+    // 2026-07-03): [09:15:00 inclusive, 15:30:00 exclusive) IST. Pre-open
+    // data must never seed the 09:15 open candle.
+    // -----------------------------------------------------------------------
+
+    /// Day-aligned IST epoch base (divisible by 86_400).
+    const DAY_BASE: u32 = 1_779_235_200;
+
+    #[test]
+    fn test_0914_59_tick_never_seeds_0915_open() {
+        // A 09:14:59 pre-open tick (secs_of_day 33_299) must be skipped —
+        // and when the true 09:15:00 tick arrives, the 09:15 candle open
+        // must be the 09:15:00 LTP, NOT the pre-open price.
+        let agg = MultiTfAggregator::new();
+        agg.pre_populate(vec![(13, 0)]);
+
+        let preopen = mk_tick(13, 0, DAY_BASE + 33_299, 23_100.0, 0, 0);
+        agg.consume_tick(&preopen, 0, FeedStrategy::DHAN, None, |_, _| {});
+        let entry = agg.get(13, 0).expect("present");
+        assert!(
+            entry.cell.snapshot(TfIndex::M1).is_uninitialised(),
+            "09:14:59 tick must be skipped — no bucket state"
+        );
+
+        let open_tick = mk_tick(13, 0, DAY_BASE + 33_300, 23_146.45, 0, 0);
+        agg.consume_tick(&open_tick, 0, FeedStrategy::DHAN, None, |_, _| {});
+        let snap = entry.cell.snapshot(TfIndex::M1);
+        assert!(
+            !snap.is_uninitialised(),
+            "09:15:00 tick must open the bucket"
+        );
+        assert!(
+            (snap.open - 23_146.45).abs() < 1e-6,
+            "09:15 candle open must be the 09:15:00 LTP, not the 09:14:59 pre-open price"
+        );
+    }
+
+    #[test]
+    fn test_0915_00_first_tick_is_the_0915_open() {
+        // The FIRST tick at exactly 09:15:00 (secs_of_day 33_300) opens the
+        // 09:15 bucket with open == that LTP.
+        let agg = MultiTfAggregator::new();
+        agg.pre_populate(vec![(13, 0)]);
+        let tick = mk_tick(13, 0, DAY_BASE + 33_300, 100.25, 0, 0);
+        let stats = agg.consume_tick(&tick, 0, FeedStrategy::DHAN, None, |_, _| {});
+        assert!(stats.instrument_found);
+        let entry = agg.get(13, 0).expect("present");
+        let snap = entry.cell.snapshot(TfIndex::M1);
+        assert!(!snap.is_uninitialised());
+        assert!((snap.open - 100.25).abs() < 1e-6);
+        assert_eq!(
+            snap.bucket_start_ist_secs,
+            DAY_BASE + 33_300,
+            "09:15:00 tick must land in the 09:15-anchored first bucket"
+        );
+    }
+
+    #[test]
+    fn test_15_29_59_tick_is_consumed() {
+        // 15:29:59 (secs_of_day 55_799) is the last in-session second —
+        // it MUST form candle state.
+        let agg = MultiTfAggregator::new();
+        agg.pre_populate(vec![(13, 0)]);
+        let tick = mk_tick(13, 0, DAY_BASE + 55_799, 101.0, 0, 0);
+        agg.consume_tick(&tick, 0, FeedStrategy::DHAN, None, |_, _| {});
+        let entry = agg.get(13, 0).expect("present");
+        assert!(
+            !entry.cell.snapshot(TfIndex::M1).is_uninitialised(),
+            "15:29:59 tick must be consumed (session close is exclusive at 15:30:00)"
+        );
+    }
+
+    #[test]
+    fn test_15_30_00_tick_is_skipped() {
+        // 15:30:00 (secs_of_day 55_800) is EXCLUSIVE — no candle state.
+        // (The watermark still advances on out-of-session ticks — pinned
+        // separately by test_watermark_advances_on_out_of_session_tick.)
+        let agg = MultiTfAggregator::new();
+        agg.pre_populate(vec![(13, 0)]);
+        let tick = mk_tick(13, 0, DAY_BASE + 55_800, 101.0, 0, 0);
+        agg.consume_tick(&tick, 0, FeedStrategy::DHAN, None, |_, _| {});
+        let entry = agg.get(13, 0).expect("present");
+        assert!(
+            entry.cell.snapshot(TfIndex::M1).is_uninitialised(),
+            "15:30:00 tick must be skipped — the close boundary is exclusive"
+        );
+    }
+
     #[test]
     fn test_consume_tick_first_tick_updates_all_21_tfs_no_seal() {
         let agg = MultiTfAggregator::new();

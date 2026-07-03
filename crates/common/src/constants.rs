@@ -3580,4 +3580,62 @@ mod tests {
         assert!(has("NIFTY MIDCAP 50", "NIFTYMCAP50"));
         assert!(has("NIFTY TOTAL MARKET", "NIFTY TOTAL MKT"));
     }
+
+    // =======================================================================
+    // B6 mutation kills (2026-07-03) — exact computed values for every
+    // arithmetic const initializer the unmasked mutation gate found MISSED.
+    // Each assert pins the fully-evaluated number so ANY operator swap
+    // (`*`→`+`, `*`→`/`, `+`→`-`, `/`→`%`, ...) in the initializer fails.
+    // =======================================================================
+
+    #[test]
+    fn test_max_csv_body_bytes_is_exactly_50_mib() {
+        // 50 * 1024 * 1024 — kills the 4 arithmetic mutants at the initializer.
+        assert_eq!(MAX_CSV_BODY_BYTES, 52_428_800);
+    }
+
+    #[test]
+    fn test_tick_buffer_high_watermark_is_exactly_80_percent() {
+        // TICK_BUFFER_CAPACITY * 4 / 5 — kills `*`/`/` swaps at the initializer.
+        assert_eq!(TICK_BUFFER_CAPACITY, 100_000);
+        assert_eq!(TICK_BUFFER_HIGH_WATERMARK, 80_000);
+    }
+
+    #[test]
+    fn test_tick_spill_min_disk_space_is_exactly_100_mib() {
+        // 100 * 1024 * 1024 — kills the 4 arithmetic mutants at the initializer.
+        assert_eq!(TICK_SPILL_MIN_DISK_SPACE_BYTES, 104_857_600);
+    }
+
+    #[test]
+    fn test_spill_file_max_age_is_exactly_7_days() {
+        // 7 * 24 * 3600 — kills the 4 arithmetic mutants at the initializer.
+        assert_eq!(SPILL_FILE_MAX_AGE_SECS, 604_800);
+    }
+
+    #[test]
+    fn test_stock_contracts_per_expiry_is_exactly_43() {
+        // (1 + 10 + 10) * 2 + 1 = 43 — kills all 8 arithmetic mutants at the
+        // initializer (every operator swap yields a value ≠ 43).
+        assert_eq!(STOCK_ATM_STRIKES_ABOVE, 10);
+        assert_eq!(STOCK_ATM_STRIKES_BELOW, 10);
+        assert_eq!(STOCK_CONTRACTS_PER_EXPIRY, 43);
+    }
+
+    #[test]
+    fn test_token_sweep_interval_is_exactly_4_hours() {
+        // 4 * 3600 — kills the `*`→`+` / `*`→`/` mutants at the initializer.
+        assert_eq!(TOKEN_SWEEP_INTERVAL_SECS, 14_400);
+    }
+
+    #[test]
+    fn test_token_sweep_staleness_threshold_is_exactly_4_hours() {
+        // 4 * 3600 — kills the `*`→`+` / `*`→`/` mutants at the initializer,
+        // and pins the alignment with TOKEN_SWEEP_INTERVAL_SECS.
+        assert_eq!(TOKEN_SWEEP_STALENESS_THRESHOLD_SECS, 14_400);
+        assert_eq!(
+            TOKEN_SWEEP_STALENESS_THRESHOLD_SECS,
+            TOKEN_SWEEP_INTERVAL_SECS as i64
+        );
+    }
 }

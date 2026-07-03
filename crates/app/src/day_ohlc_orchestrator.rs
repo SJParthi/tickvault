@@ -12,21 +12,25 @@
 //!    `tracker.reset_daily_all()` to clear stale state so the next live
 //!    tick re-arms `day_open` to that day's first observed LTP.
 //!
-//! ## Why `day_open` is the first REGULAR-SESSION tick (never pre-market)
+//! ## Why `day_open` is the first live SESSION tick (not a pre-market value)
 //!
 //! Per operator directive 2026-05-26, all Dhan historical / pre-market
 //! buffer code was removed from the workspace. `day_open` for the 4 LOCKED
-//! IDX_I SIDs (NIFTY=13, BANKNIFTY=25, SENSEX=51, INDIA VIX=21) equals the
-//! first observed live WebSocket tick after the midnight reset **whose
-//! exchange timestamp falls inside the regular trading session
-//! `[09:15:00, 15:30:00)` IST** (operator rule 2026-07-03: pre-market data
-//! must NEVER become the day open). The tick broadcast starts carrying
-//! IDX_I ticks from 09:00 IST (the `TICK_PERSIST_START_SECS_OF_DAY_IST`
-//! pipeline window), so without this gate the pre-open snapshot tick would
-//! arm `day_open` — [`should_route_day_ohlc_tick`] drops those on the
-//! tick's EXCHANGE timestamp via
-//! [`g1_exchange_gate_accepts`](tickvault_common::constants::g1_exchange_gate_accepts).
+//! IDX_I SIDs (NIFTY=13, BANKNIFTY=25, SENSEX=51, INDIA VIX=21) now equals
+//! the first observed live WebSocket tick after the midnight reset.
+//!
+//! **Session-open purity (operator directive 2026-07-03):** the consumer is
+//! session-gated to `[09:15:00, 15:30:00)` IST via
+//! [`day_ohlc_session_accepts`], which reuses the canonical G1 exchange gate
+//! (`g1_exchange_gate_accepts`). Pre-open indicative ticks (Dhan streams
+//! from 09:00 IST) and post-close snapshot ticks can therefore NEVER arm
+//! `day_open` or advance high/low/close — the 09:15:00 tick IS the day open,
+//! matching the candle aggregator's session window exactly. Always-on SIDs
+//! (GIFT Nifty, operator lock 2026-06-01 §30) are EXEMPT from the window,
+//! mirroring the candle aggregator + tick processor — see
+//! [`day_ohlc_gate_allows`].
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -42,15 +46,73 @@ use tickvault_trading::in_mem::day_ohlc_tracker::{
     DayOhlcTracker, ist_seconds_of_day, secs_until_next_ist,
 };
 
+/// Nanoseconds per second — the seconds→nanos-of-day widening factor for
+/// [`g1_exchange_gate_accepts`] (which takes IST NANOS-of-day).
+const NANOS_PER_SECOND: i64 = 1_000_000_000;
+
+/// Session-open purity gate (operator directive 2026-07-03): returns `true`
+/// iff a tick's `exchange_timestamp` (IST epoch SECONDS, the Dhan LTT
+/// convention per `data-integrity.md` — Groww ticks never reach this
+/// consumer; they flow through the separate Groww bridge) falls inside the
+/// regular NSE session `[09:15:00, 15:30:00)` IST.
+///
+/// Delegates to the canonical `g1_exchange_gate_accepts`
+/// (`crates/common/src/constants.rs`) — the SAME half-open window the candle
+/// aggregator enforces — so the day-OHLC window can never drift from the
+/// candle-grid window. Pure, O(1), zero allocation: one modulo, one multiply,
+/// two integer compares.
+#[inline]
+#[must_use]
+pub fn day_ohlc_session_accepts(exchange_timestamp_ist_secs: u32) -> bool {
+    let secs_of_day = exchange_timestamp_ist_secs % SECONDS_PER_DAY;
+    g1_exchange_gate_accepts(i64::from(secs_of_day) * NANOS_PER_SECOND)
+}
+
+/// Full day-OHLC admission gate: session window + the always-on exemption
+/// (operator lock 2026-06-01 §30, GIFT Nifty — an NSE-IX INDEX with a ~21 h
+/// session). Returns `true` iff the tick may reach the tracker.
+///
+/// Always-on `(security_id, exchange_segment_code)` pairs are EXEMPT from the
+/// `[09:15, 15:30)` window, mirroring the candle aggregator
+/// (`multi_tf_aggregator.rs::consume_tick`) and the tick processor's
+/// `is_window_exempt`. The set is the SAME boot-computed source of truth both
+/// of those use — `DailyUniverse::always_on_segments` installed once via
+/// `tickvault_common::always_on::init_always_on_segments` and read at the
+/// spawn site via `tickvault_common::always_on::current()` — passed in
+/// EXPLICITLY (never read from the global here) so this stays unit-testable,
+/// exactly like the aggregator's `with_always_on`.
+///
+/// Honesty note: GIFT Nifty IS an IDX_I index (segment code 0 — see
+/// `always_on.rs` / `daily_universe.rs::always_on_segments`), so when it is in
+/// the subscribed universe its ticks DO pass this consumer's IDX_I filter
+/// today. Without this exemption its legitimate out-of-window ticks would be
+/// (a) skipped from day-OHLC and (b) continuously inflate
+/// `tv_day_ohlc_session_gate_skipped_total`, destroying that counter's
+/// diagnostic value.
+#[inline]
+#[must_use]
+pub fn day_ohlc_gate_allows(
+    always_on: &HashSet<(u64, u8)>,
+    security_id: u64,
+    exchange_segment_code: u8,
+    exchange_timestamp_ist_secs: u32,
+) -> bool {
+    // O(1) EXEMPT: HashSet `contains` is O(1) hashing, not an O(n) Vec scan.
+    always_on.contains(&(security_id, exchange_segment_code))
+        || day_ohlc_session_accepts(exchange_timestamp_ist_secs)
+}
+
 /// IST midnight = 00:00:00.
 pub const IST_MIDNIGHT_HOUR: u32 = 0;
 pub const IST_MIDNIGHT_MINUTE: u32 = 0;
 pub const IST_MIDNIGHT_SECOND: u32 = 0;
 
 /// Spawns the tick consumer task. Drains the tick broadcast and routes
-/// every IDX_I tick to `tracker.update_tick()`. The first tick for a SID
-/// auto-arms day_open/high/low/close to that LTP; subsequent ticks advance
-/// day_high/day_low/day_close. Non-IDX_I ticks are skipped O(1).
+/// every IN-SESSION IDX_I tick to `tracker.update_tick()`. The first
+/// in-session tick for a SID auto-arms day_open/high/low/close to that LTP;
+/// subsequent ticks advance day_high/day_low/day_close. Non-IDX_I ticks and
+/// out-of-session ticks (outside [09:15, 15:30) IST per
+/// [`day_ohlc_gate_allows`], always-on SIDs exempt per §30) are skipped O(1).
 ///
 /// On `broadcast::Lagged`, increments a counter and continues. Closed
 /// channel exits the task (process shutdown).
@@ -58,16 +120,30 @@ pub const IST_MIDNIGHT_SECOND: u32 = 0;
 pub fn spawn_day_ohlc_tick_consumer(
     tracker: Arc<DayOhlcTracker>,
     mut rx: broadcast::Receiver<ParsedTick>,
+    always_on: Arc<HashSet<(u64, u8)>>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         info!("day_ohlc tick consumer started");
         loop {
             match rx.recv().await {
                 Ok(tick) => {
-                    if !should_route_day_ohlc_tick(
+                    if tick.exchange_segment_code != idx_i_segment_code() {
+                        continue;
+                    }
+                    // Session-open purity (operator directive 2026-07-03):
+                    // only ticks inside [09:15:00, 15:30:00) IST reach the
+                    // tracker — a pre-open (09:00–09:14) indicative tick or a
+                    // post-close snapshot can never arm day_open or move
+                    // high/low/close. Always-on SIDs (GIFT Nifty §30) are
+                    // EXEMPT, matching the candle aggregator. O(1) skip, no
+                    // per-tick log.
+                    if !day_ohlc_gate_allows(
+                        &always_on,
+                        tick.security_id,
                         tick.exchange_segment_code,
                         tick.exchange_timestamp,
                     ) {
+                        metrics::counter!("tv_day_ohlc_session_gate_skipped_total").increment(1);
                         continue;
                     }
                     // Pure-function hot path: O(1) per tick, ≤50ns budget.
@@ -94,28 +170,6 @@ pub fn spawn_day_ohlc_tick_consumer(
 #[inline]
 const fn idx_i_segment_code() -> u8 {
     0
-}
-
-/// Pure routing gate for the day-OHLC tick consumer (operator rule
-/// 2026-07-03): route ONLY IDX_I ticks whose EXCHANGE timestamp (IST epoch
-/// seconds, per `data-integrity.md` — never receive time) falls inside the
-/// regular trading session `[09:15:00, 15:30:00)` IST. Pre-market /
-/// pre-open ticks (< 09:15:00) must never arm `day_open`; post-close stale
-/// ticks (>= 15:30:00) must never mutate day high/low/close. Delegates the
-/// window check to the canonical G1 exchange gate
-/// (`g1_exchange_gate_accepts`, half-open, boundary-exact). O(1), zero
-/// allocation, no panic path.
-#[inline]
-#[must_use]
-pub const fn should_route_day_ohlc_tick(
-    exchange_segment_code: u8,
-    exchange_timestamp_secs: u32,
-) -> bool {
-    if exchange_segment_code != idx_i_segment_code() {
-        return false;
-    }
-    let secs_of_day = (exchange_timestamp_secs % 86_400) as i64;
-    g1_exchange_gate_accepts(secs_of_day * 1_000_000_000)
 }
 
 /// Spawns the IST midnight reset task. At 00:00:00 IST every day, calls
@@ -245,6 +299,132 @@ mod tests {
         assert_eq!(IDX_I_SEGMENT_CODE_FOR_RATCHETS, 0);
     }
 
+    // -----------------------------------------------------------------------
+    // Session-open purity gate (operator directive 2026-07-03)
+    // -----------------------------------------------------------------------
+
+    /// Day-aligned IST epoch base (divisible by 86_400) used to build
+    /// multi-day epoch inputs — proves the `% SECONDS_PER_DAY` reduction.
+    const DAY_BASE_IST_EPOCH: u32 = 1_779_235_200;
+
+    #[test]
+    fn test_day_ohlc_session_gate_rejects_preopen_0907() {
+        // 09:07:00 IST = 32_820 secs-of-day — the original bug scenario:
+        // a pre-open indicative index tick must NOT reach the tracker.
+        assert!(!day_ohlc_session_accepts(DAY_BASE_IST_EPOCH + 32_820));
+    }
+
+    #[test]
+    fn test_day_ohlc_session_gate_rejects_0914_59() {
+        // 09:14:59 IST = 33_299 — last pre-open second is rejected.
+        assert!(!day_ohlc_session_accepts(DAY_BASE_IST_EPOCH + 33_299));
+    }
+
+    #[test]
+    fn test_day_ohlc_session_gate_accepts_0915_00_exact_open() {
+        // 09:15:00 IST = 33_300 — the session open is INCLUSIVE: this tick
+        // IS the day open.
+        assert!(day_ohlc_session_accepts(DAY_BASE_IST_EPOCH + 33_300));
+    }
+
+    #[test]
+    fn test_day_ohlc_session_gate_accepts_15_29_59() {
+        // 15:29:59 IST = 55_799 — last in-session second is accepted.
+        assert!(day_ohlc_session_accepts(DAY_BASE_IST_EPOCH + 55_799));
+    }
+
+    #[test]
+    fn test_day_ohlc_session_gate_rejects_15_30_00_exclusive_close() {
+        // 15:30:00 IST = 55_800 — the close is EXCLUSIVE, matching the
+        // candle aggregator gate and g1_exchange_gate_accepts.
+        assert!(!day_ohlc_session_accepts(DAY_BASE_IST_EPOCH + 55_800));
+    }
+
+    #[test]
+    fn test_day_ohlc_gate_allows_exempts_always_on_sid_at_2000_ist() {
+        // Operator lock 2026-06-01 §30: GIFT Nifty (an IDX_I index trading
+        // ~21 h/day on NSE-IX) must pass the gate OUTSIDE [09:15, 15:30),
+        // exactly like the candle aggregator's always_on exemption. A normal
+        // SID at the same 20:00 IST instant must still be rejected.
+        let mut always_on = std::collections::HashSet::new();
+        always_on.insert((5024_u64, 0_u8)); // GIFT Nifty (sid, IDX_I=0)
+
+        // 20:00:00 IST = 72_000 secs-of-day — far outside the regular session.
+        let ts_2000 = DAY_BASE_IST_EPOCH + 72_000;
+        assert!(
+            day_ohlc_gate_allows(&always_on, 5024, 0, ts_2000),
+            "always-on GIFT Nifty tick at 20:00 IST must be exempt from the session gate"
+        );
+        assert!(
+            !day_ohlc_gate_allows(&always_on, 13, 0, ts_2000),
+            "normal SID (NIFTY) at 20:00 IST must be rejected"
+        );
+        // In-session, both pass (the exemption never REJECTS anything).
+        let ts_open = DAY_BASE_IST_EPOCH + 33_300;
+        assert!(day_ohlc_gate_allows(&always_on, 5024, 0, ts_open));
+        assert!(day_ohlc_gate_allows(&always_on, 13, 0, ts_open));
+        // Same SID on a DIFFERENT segment is NOT exempt (composite key per
+        // I-P1-11 — matching the aggregator's (sid, segment) exempt_key).
+        assert!(!day_ohlc_gate_allows(&always_on, 5024, 2, ts_2000));
+    }
+
+    #[test]
+    fn test_day_ohlc_session_accepts_is_the_gate_when_always_on_empty() {
+        // With no exemptions installed (today's default when GIFT is absent),
+        // the gate is exactly the session window (`day_ohlc_session_accepts`).
+        let always_on = std::collections::HashSet::new();
+        assert!(!day_ohlc_gate_allows(
+            &always_on,
+            13,
+            0,
+            DAY_BASE_IST_EPOCH + 72_000
+        ));
+        assert!(day_ohlc_gate_allows(
+            &always_on,
+            13,
+            0,
+            DAY_BASE_IST_EPOCH + 33_300
+        ));
+    }
+
+    #[test]
+    fn test_preopen_tick_never_arms_day_open_then_0915_tick_is_the_open() {
+        // Integration-style: a real DayOhlcTracker fed through the SAME
+        // gated path the consumer uses. The 09:07 pre-open tick must leave
+        // the tracker untouched (no slot, hence disarmed); the 09:15:00
+        // tick must arm day_open to ITS LTP.
+        let tracker = DayOhlcTracker::new();
+        let sid: u64 = 13; // NIFTY
+
+        // Pre-open tick at 09:07 IST with a pre-market indicative price.
+        let preopen_ts = DAY_BASE_IST_EPOCH + 32_820;
+        let preopen_ltp = 23_100.0_f64;
+        if day_ohlc_session_accepts(preopen_ts) {
+            let _ = tracker.update_tick(sid, ExchangeSegment::IdxI, preopen_ltp);
+        }
+        assert!(
+            tracker
+                .snapshot(sid, ExchangeSegment::IdxI)
+                .is_none_or(|s| !s.is_armed()),
+            "a 09:07 pre-open tick must never arm day_open"
+        );
+
+        // First session tick at exactly 09:15:00 IST — this IS the open.
+        let open_ts = DAY_BASE_IST_EPOCH + 33_300;
+        let open_ltp = 23_146.45_f64;
+        if day_ohlc_session_accepts(open_ts) {
+            let _ = tracker.update_tick(sid, ExchangeSegment::IdxI, open_ltp);
+        }
+        let snap = tracker
+            .snapshot(sid, ExchangeSegment::IdxI)
+            .expect("09:15:00 tick must create the slot");
+        assert!(snap.is_armed(), "09:15:00 tick must arm the tracker");
+        assert!(
+            (snap.day_open - open_ltp).abs() < f64::EPSILON,
+            "day_open must be the 09:15:00 LTP, not the pre-open price"
+        );
+    }
+
     #[test]
     fn test_midnight_boundary_constants_pinned() {
         assert_eq!(IST_MIDNIGHT_HOUR, 0);
@@ -308,61 +488,5 @@ mod tests {
             "supervisor must keep running, not exit after spawning the reset task"
         );
         handle.abort();
-    }
-
-    // ------------------------------------------------------------------
-    // should_route_day_ohlc_tick — session-window ratchets (operator rule
-    // 2026-07-03: pre-market data must NEVER become day_open).
-    // ------------------------------------------------------------------
-
-    /// A day-aligned IST epoch base (multiple of 86_400) so seconds-of-day
-    /// arithmetic below is exact.
-    const DAY_BASE: u32 = 1_779_321_600;
-
-    #[test]
-    fn test_should_route_rejects_pre_open_and_pre_market() {
-        // 09:00:00 IST (pre-open session start — the broadcast carries these).
-        assert!(!should_route_day_ohlc_tick(0, DAY_BASE + 9 * 3600));
-        // 09:14:59 IST — one second before the regular session opens.
-        assert!(
-            !should_route_day_ohlc_tick(0, DAY_BASE + 33_299),
-            "09:14:59 pre-market tick must NOT arm day_open"
-        );
-        // 08:00:00 IST — any earlier tick.
-        assert!(!should_route_day_ohlc_tick(0, DAY_BASE + 8 * 3600));
-    }
-
-    #[test]
-    fn test_should_route_accepts_091500_and_in_session() {
-        // 09:15:00.000 exactly — the first regular-session second (inclusive).
-        assert!(
-            should_route_day_ohlc_tick(0, DAY_BASE + 33_300),
-            "09:15:00 exactly must be accepted (inclusive open boundary)"
-        );
-        // Mid-session 11:30:00 IST.
-        assert!(should_route_day_ohlc_tick(
-            0,
-            DAY_BASE + 11 * 3600 + 30 * 60
-        ));
-        // Last in-session second 15:29:59 IST.
-        assert!(should_route_day_ohlc_tick(0, DAY_BASE + 55_799));
-    }
-
-    #[test]
-    fn test_should_route_rejects_1530_and_later() {
-        // 15:30:00 exactly — exclusive close boundary.
-        assert!(
-            !should_route_day_ohlc_tick(0, DAY_BASE + 55_800),
-            "15:30:00 exactly must be rejected (exclusive close boundary)"
-        );
-        // 20:00:00 IST post-close stale tick.
-        assert!(!should_route_day_ohlc_tick(0, DAY_BASE + 72_000));
-    }
-
-    #[test]
-    fn test_should_route_rejects_non_idx_i_segment() {
-        // NSE_EQ (1) / NSE_FNO (2) in-session ticks are never day-OHLC routed.
-        assert!(!should_route_day_ohlc_tick(1, DAY_BASE + 33_300));
-        assert!(!should_route_day_ohlc_tick(2, DAY_BASE + 40_000));
     }
 }
