@@ -157,3 +157,9 @@ variable "operator_phone" {
     error_message = "operator_phone must be empty or E.164 format (e.g. +919876543210)."
   }
 }
+
+variable "portal_git_sha" {
+  description = "Git SHA of the repo tree terraform/lambda zips were applied from (B9 deploy provenance — set by CI via TF_VAR_portal_git_sha=github.sha; local applies default to \"unknown\"). Surfaces in the operator-portal footer as `portal <sha7>` and in the portal_git_sha output."
+  type        = string
+  default     = "unknown"
+}
