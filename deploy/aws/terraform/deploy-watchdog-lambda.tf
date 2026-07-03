@@ -115,6 +115,9 @@ resource "aws_lambda_function" "deploy_watchdog" {
       ALERTS_TOPIC_ARN            = aws_sns_topic.tv_alerts.arn
       LOG_LEVEL                   = "INFO"
       # B9 deploy provenance: deployed-binary sha param (deploy-aws.yml writes it).
+      # LOCKSTEP NOTE: deploy-aws.yml WRITES the param at the hardcoded
+      # /tickvault/prod/... path (prod is the only real env) — the two must
+      # stay in lockstep; a staging env would need the workflow parameterized.
       BINARY_SHA_PARAM = "/tickvault/${var.environment}/deploy/binary-git-sha"
     }
   }

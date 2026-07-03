@@ -177,6 +177,9 @@ resource "aws_lambda_function" "operator_control" {
       # B9 deploy provenance (portal footer: binary · portal · main).
       # PORTAL_GIT_SHA = the repo tree the Lambda zip was applied from
       # (CI sets TF_VAR_portal_git_sha; default "unknown" for local applies).
+      # LOCKSTEP NOTE: deploy-aws.yml WRITES this param at the hardcoded
+      # /tickvault/prod/... path (prod is the only real env) — the two must
+      # stay in lockstep; a staging env would need the workflow parameterized.
       PORTAL_GIT_SHA   = var.portal_git_sha
       BINARY_SHA_PARAM = "/tickvault/${var.environment}/deploy/binary-git-sha"
     }
