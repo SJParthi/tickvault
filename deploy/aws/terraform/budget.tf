@@ -45,13 +45,18 @@ resource "aws_budgets_budget" "tv_monthly" {
   time_unit         = "MONTHLY"
   time_period_start = "2026-05-01_00:00"
 
-  # 80% forecasted = early warning
+  # 80% forecasted = early warning. GAP 2 fix (2026-07-03): the audit found
+  # this was EMAIL-ONLY (and the live email subscription showed Deleted), so
+  # the operator's earliest budget signal never reached Telegram. Publishing
+  # to tv-prod-alerts routes it through the same SNS -> Telegram webhook as
+  # every other alert. Email stays as belt-and-suspenders.
   notification {
     comparison_operator        = "GREATER_THAN"
     threshold                  = 80
     threshold_type             = "PERCENTAGE"
     notification_type          = "FORECASTED"
     subscriber_email_addresses = [var.operator_email]
+    subscriber_sns_topic_arns  = [aws_sns_topic.tv_alerts.arn]
   }
 
   # 100% actual = hard crossing → BOTH email AND the kill-switch SNS
@@ -66,6 +71,84 @@ resource "aws_budgets_budget" "tv_monthly" {
     subscriber_email_addresses = [var.operator_email]
     subscriber_sns_topic_arns  = [aws_sns_topic.tv_budget_kill.arn]
   }
+}
+
+# ---------------------------------------------------------------------------
+# tv_alerts topic policy — AWS Budgets must be ALLOWED to publish (GAP 2).
+# ---------------------------------------------------------------------------
+# AWS Budgets validates it can publish to any subscriber_sns_topic_arns; the
+# tv_budget_kill topic already carries such a policy (budget-killswitch-
+# lambda.tf) — tv_alerts had only the implicit default. Attaching a custom
+# policy REPLACES the default, so the default owner statement + an explicit
+# CloudWatch-alarms statement are preserved alongside the budgets grant
+# (every CloudWatch alarm in this stack publishes to tv_alerts).
+data "aws_iam_policy_document" "tv_alerts_topic_policy" {
+  # Mirror of the AWS default topic policy (account-owner access) so nothing
+  # that worked under the implicit default breaks.
+  statement {
+    sid    = "DefaultOwnerAccess"
+    effect = "Allow"
+    actions = [
+      "SNS:GetTopicAttributes",
+      "SNS:SetTopicAttributes",
+      "SNS:AddPermission",
+      "SNS:RemovePermission",
+      "SNS:DeleteTopic",
+      "SNS:Subscribe",
+      "SNS:ListSubscriptionsByTopic",
+      "SNS:Publish",
+    ]
+    principals {
+      type        = "AWS"
+      identifiers = ["*"]
+    }
+    condition {
+      test     = "StringEquals"
+      variable = "AWS:SourceOwner"
+      values   = [data.aws_caller_identity.current.account_id]
+    }
+    resources = [aws_sns_topic.tv_alerts.arn]
+  }
+
+  # GAP 2: the 80% FORECASTED early-warning notification above publishes here.
+  statement {
+    sid     = "AllowBudgetsPublish"
+    effect  = "Allow"
+    actions = ["sns:Publish"]
+    principals {
+      type        = "Service"
+      identifiers = ["budgets.amazonaws.com"]
+    }
+    condition {
+      test     = "StringEquals"
+      variable = "aws:SourceAccount"
+      values   = [data.aws_caller_identity.current.account_id]
+    }
+    resources = [aws_sns_topic.tv_alerts.arn]
+  }
+
+  # Explicit CloudWatch-alarms grant — kept alongside the owner statement so
+  # alarm -> tv_alerts publishes are unambiguous under the custom policy.
+  statement {
+    sid     = "AllowCloudWatchAlarmsPublish"
+    effect  = "Allow"
+    actions = ["sns:Publish"]
+    principals {
+      type        = "Service"
+      identifiers = ["cloudwatch.amazonaws.com"]
+    }
+    condition {
+      test     = "StringEquals"
+      variable = "aws:SourceAccount"
+      values   = [data.aws_caller_identity.current.account_id]
+    }
+    resources = [aws_sns_topic.tv_alerts.arn]
+  }
+}
+
+resource "aws_sns_topic_policy" "tv_alerts" {
+  arn    = aws_sns_topic.tv_alerts.arn
+  policy = data.aws_iam_policy_document.tv_alerts_topic_policy.json
 }
 
 output "monthly_budget_name" {
