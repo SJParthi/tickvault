@@ -1233,17 +1233,40 @@ def lambda_handler(event, _context):
             # dynamic list matches ONLY ticks + candles_*.
             if not force:
                 return _resp(409, {"error": 'wipe is destructive — re-send with {"force": true}', "action": action})
+            # PR-5 H-1 (2026-07-02 security MEDIUM): server-side token — a
+            # scripted call with a stolen bearer can no longer fire this; the
+            # word the portal already makes the operator TYPE is now VERIFIED
+            # here (mirror of the wipe-groww gate).
+            if str(payload.get("confirm", "")).strip() != "WIPE":
+                return _resp(
+                    409,
+                    {"error": 'wipe-questdb deletes every tick and candle — re-send with {"confirm": "WIPE"}', "action": action},
+                )
             data_dir = "/opt/tickvault/data"
             cmds = [
                 "set +e",
                 # 1. stop the app: releases QuestDB writers + drops in-memory
                 #    bars + stops the Groww bridge/sidecar so nothing re-appends
-                #    the capture file mid-wipe.
+                #    the capture file mid-wipe. PR-5 H-2 (hostile F5): ALSO
+                #    disable the unit for the wipe window — a deploy watchdog /
+                #    autopilot / concurrent-deploy `systemctl start` mid-wipe
+                #    was the resurrection race (booting bridge re-tails the
+                #    capture file). Re-enabled just before the final start.
                 "systemctl stop tickvault || true",
+                "systemctl disable tickvault || true",
                 "pkill -f groww_sidecar.py 2>/dev/null || true",
-                # 2. discover + truncate EVERY market-data table dynamically
-                #    (ticks + all candles_* — 27 today, future ones included).
-                #    python3 is on the box (the Groww sidecar runtime).
+                # 2. PR-5 H-2 REORDER: remove EVERY feed's capture/replay
+                #    sources FIRST (was after TRUNCATE) — even a forced start
+                #    mid-window now finds NOTHING to replay: Dhan WAL, Groww
+                #    capture, spill, dlq, caches + a GENERIC sweep of any
+                #    future feed's capture file under data/*/ . Logs KEPT.
+                f"rm -rf {data_dir}/ws_wal {data_dir}/groww {data_dir}/spill {data_dir}/dlq {data_dir}/instrument-cache 2>/dev/null || true",
+                f"rm -f {data_dir}/*/live-ticks.ndjson {data_dir}/*/*-status.json 2>/dev/null || true",
+                "echo 'OK: feed capture/replay sources removed (ws_wal, groww, spill, dlq, instrument-cache)'",
+                # 3. discover + truncate EVERY market-data table dynamically
+                #    (ticks + all candles_* — 27 today, future ones included —
+                #    + prev_day_ohlcv, PR-5: a \"fresh start\" previously left
+                #    yesterday's reference rows). python3 is on the box.
                 (
                     "python3 - <<'PYWIPE'\n"
                     "import json, urllib.request, urllib.parse\n"
@@ -1251,7 +1274,7 @@ def lambda_handler(event, _context):
                     "q = urllib.parse.quote(\"SELECT table_name FROM tables()\")\n"
                     "rows = json.load(urllib.request.urlopen(base + q, timeout=15)).get('dataset', [])\n"
                     "names = [r[0] for r in rows if isinstance(r, list) and r]\n"
-                    "targets = [t for t in names if t == 'ticks' or t.startswith('candles_')]\n"
+                    "targets = [t for t in names if t == 'ticks' or t.startswith('candles_') or t == 'prev_day_ohlcv']\n"
                     "print('WIPE-TARGETS', len(targets), sorted(targets))\n"
                     "for t in targets:\n"
                     "    tq = urllib.parse.quote(f'TRUNCATE TABLE {t}')\n"
@@ -1262,14 +1285,8 @@ def lambda_handler(event, _context):
                     "        print('TRUNCATE-FAILED', t, exc)\n"
                     "PYWIPE"
                 ),
-                # 3. remove EVERY feed's capture/replay sources so nothing
-                #    resurrects: Dhan WAL, Groww capture, spill, dlq, caches —
-                #    plus a GENERIC sweep of any future feed's live-ticks
-                #    capture file under data/*/ . Logs are KEPT for forensics.
-                f"rm -rf {data_dir}/ws_wal {data_dir}/groww {data_dir}/spill {data_dir}/dlq {data_dir}/instrument-cache 2>/dev/null || true",
-                f"rm -f {data_dir}/*/live-ticks.ndjson {data_dir}/*/*-status.json 2>/dev/null || true",
-                "echo 'OK: feed capture/replay sources removed (ws_wal, groww, spill, dlq, instrument-cache)'",
-                # 4. restart the app — recreates schemas, resumes LIVE-only.
+                # 4. re-enable + restart the app — recreates schemas, LIVE-only.
+                "systemctl enable tickvault || true",
                 "systemctl start tickvault || true",
                 # 5. honest verification: both counts must be 0 (QuestDB may
                 #    need a moment; count right after truncate, before live
@@ -1348,6 +1365,12 @@ def lambda_handler(event, _context):
             #      `ensure_*_table_dedup_keys` with the correct DEDUP keys.
             if not force:
                 return _resp(409, {"error": 'docker-reset is the FULL nuke (deletes volumes + images + ALL data incl. SEBI audit tables) — re-send with {"force": true}', "action": action})
+            # PR-5 H-1: server-side token (mirror of the wipe-groww gate).
+            if str(payload.get("confirm", "")).strip() != "NUKE":
+                return _resp(
+                    409,
+                    {"error": 'docker-reset destroys ALL data incl. SEBI audit tables — re-send with {"confirm": "NUKE"}', "action": action},
+                )
             compose_dir = "/opt/tickvault/repo/deploy/docker"
             data_dir = "/opt/tickvault/data"
             cmds = [
@@ -1419,6 +1442,12 @@ def lambda_handler(event, _context):
                         'LEAVES THE BOX DEAD (no rebuild, no app). re-send with {"force": true}',
                         "action": action,
                     },
+                )
+            # PR-5 H-1: server-side token (mirror of the wipe-groww gate).
+            if str(payload.get("confirm", "")).strip() != "ERASE":
+                return _resp(
+                    409,
+                    {"error": 'docker-nuke-bare leaves the box BARE and DEAD — re-send with {"confirm": "ERASE"}', "action": action},
                 )
             data_dir = "/opt/tickvault/data"
             cmds = [
@@ -2127,7 +2156,7 @@ function dangerExecute(){ const sel=document.querySelector('input[name="danger"]
 async function wipeData(){
   if(prompt('This DELETES every tick and candle, then restarts empty. The box must be RUNNING. Type WIPE to confirm:')!=='WIPE'){ toast('cancelled'); return; }
   toast('wiping → fresh start…');
-  const j=await call('wipe-questdb',{force:true});
+  const j=await call('wipe-questdb',{force:true,confirm:'WIPE'});
   if(j&&j.ok){ toast('✅ wipe started — fresh data from next session'); setTimeout(loadOverview,4000); }
   else { toast((j&&j.error)||'wipe failed — is the box running?'); } }
 async function wipeGroww(){
@@ -2141,7 +2170,7 @@ async function dockerReset(){
   if(prompt('⚠️ NUCLEAR RESET. This DELETES Docker containers + volumes + images and rebuilds from scratch — wiping ALL data INCLUDING the SEBI-retention audit tables. The box must be RUNNING. Type NUKE to confirm:')!=='NUKE'){ toast('cancelled'); return; }
   if(!confirm('Last check: every table is destroyed, including audit history. Continue?')){ toast('cancelled'); return; }
   toast('💥 nuke dispatched → wiping in background (~2-3 min)…');
-  const j=await call('docker-reset',{force:true});
+  const j=await call('docker-reset',{force:true,confirm:'NUKE'});
   if(!(j&&j.ok)){ toast((j&&j.error)||'docker-reset failed — is the box running?'); return; }
   if(!j.command_id){ toast('⚠️ nuke dispatched but no command id — re-check the ticks count in ~3 min'); setTimeout(loadOverview,8000); return; }
   pollNuke(j.command_id,0); }
@@ -2149,7 +2178,7 @@ async function bareNuke(){
   if(prompt('☢️ BARE NUKE. Deletes EVERY Docker container + image + volume and LEAVES THE BOX COMPLETELY EMPTY — nothing rebuilt, nothing running, trading OFF until you redeploy (exactly like deleting all three in Docker Desktop). Type ERASE to confirm:')!=='ERASE'){ toast('cancelled'); return; }
   if(!confirm('Final check: the box is left BARE and DEAD (no QuestDB, no app). You will need to redeploy to bring it back. Continue?')){ toast('cancelled'); return; }
   toast('☢️ bare nuke dispatched → erasing everything…');
-  const j=await call('docker-nuke-bare',{force:true});
+  const j=await call('docker-nuke-bare',{force:true,confirm:'ERASE'});
   if(!(j&&j.ok)){ toast((j&&j.error)||'bare-nuke failed — is the box running?'); return; }
   if(!j.command_id){ toast('⚠️ dispatched but no command id — re-check the box in ~1 min'); return; }
   pollNuke(j.command_id,0); }
