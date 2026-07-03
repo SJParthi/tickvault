@@ -124,8 +124,27 @@ fn test_pool_online_fast_boot_path_and_ping_freshness_bands() {
         boot_path: BootPathLabel::Fast,
         boot_wall_clock_secs: 12.5,
         last_real_tick_age_secs: Some(3),
+        feeds: vec![
+            tickvault_core::notification::events::FeedStatusLine {
+                name: "Dhan".to_string(),
+                instruments: Some(776),
+                last_tick_age_secs: Some(1),
+            },
+            tickvault_core::notification::events::FeedStatusLine {
+                name: "Groww".to_string(),
+                instruments: None,
+                last_tick_age_secs: None,
+            },
+        ],
     });
     assert!(m.contains("Mid-market crash recovery"), "{m}");
+    // 2026-07-03 feed parity: every enabled feed appears by name, with
+    // honest "unknown" wording when no health data is wired yet.
+    assert!(m.contains("Dhan: 776 instruments"), "{m}");
+    assert!(
+        m.contains("Groww: instruments unknown — no tick seen yet"),
+        "{m}"
+    );
     assert!(
         m.contains('✓') && m.contains('⚠') && m.contains('❌') && m.contains('—'),
         "{m}"
