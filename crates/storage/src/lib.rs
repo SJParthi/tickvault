@@ -164,6 +164,9 @@ pub mod generic_candle_writer;
 pub mod shadow_candle_writer;
 pub mod shadow_persistence;
 pub mod shadow_seal_columns;
+// B6 (2026-07-03): off-thread tick ILP flush worker — keeps the blocking
+// questdb TCP flush off the tick-consumer thread (TICK-FLUSH-01).
+pub(crate) mod tick_flush_worker;
 pub mod tick_persistence;
 pub mod tick_row_builder;
 pub mod tick_spill_drain;
