@@ -68,6 +68,15 @@ resource "aws_iam_role_policy" "start_watchdog" {
         Resource = aws_sns_topic.tv_alerts.arn
       },
       {
+        # Curfew guard keep-alive override (2026-07-03 operator directive):
+        # the hourly curfew_check reads /tickvault/<env>/keep-alive-until to
+        # decide whether an out-of-hours running box is deliberate. Read-only,
+        # scoped to that single parameter.
+        Effect   = "Allow"
+        Action   = ["ssm:GetParameter"]
+        Resource = "arn:aws:ssm:${var.aws_region}:${data.aws_caller_identity.current.account_id}:parameter/tickvault/${var.environment}/keep-alive-until"
+      },
+      {
         Effect = "Allow"
         Action = [
           "logs:CreateLogGroup",
@@ -110,6 +119,9 @@ resource "aws_lambda_function" "start_watchdog" {
       # public IP via the existing ec2:DescribeInstances grant — no new IAM.
       DASHBOARD_PORT = "3001"
       LOG_LEVEL      = "INFO"
+      # Curfew keep-alive override param (ISO timestamp; operator/portal sets
+      # it to run the box out of hours without the curfew guard stopping it).
+      KEEP_ALIVE_PARAM = "/tickvault/${var.environment}/keep-alive-until"
     }
   }
 
@@ -199,6 +211,36 @@ resource "aws_lambda_permission" "start_watchdog_stop_check" {
   function_name = aws_lambda_function.start_watchdog.function_name
   principal     = "events.amazonaws.com"
   source_arn    = aws_cloudwatch_event_rule.start_watchdog_stop_check.arn
+}
+
+# Hourly out-of-hours CURFEW guard — operator directive 2026-07-03 ("manually
+# I started this instance right out of the expected market hours … by mistake
+# if I don't stop manually means it should be auto triggered … manual human
+# error is not acceptable"). Fires every hour; the HANDLER gates itself so it
+# NEVER acts inside 08:00-17:00 IST Mon-Fri (the normal 08:30/16:30 schedule +
+# 16:45 stop_check own that window, unchanged). Outside the window a running
+# box with no keep-alive override (SSM /tickvault/<env>/keep-alive-until) and
+# past the 45-min launch grace is stopped + Telegram-paged. Cost: 24
+# invokes/day — free tier.
+resource "aws_cloudwatch_event_rule" "start_watchdog_curfew_check" {
+  name                = "tv-${var.environment}-start-watchdog-curfew-check"
+  description         = "Hourly out-of-hours curfew: stop a forgotten manually-started box (keep-alive override honored)"
+  schedule_expression = "cron(5 * * * ? *)"
+}
+
+resource "aws_cloudwatch_event_target" "start_watchdog_curfew_check" {
+  rule      = aws_cloudwatch_event_rule.start_watchdog_curfew_check.name
+  target_id = "start-watchdog-curfew-check"
+  arn       = aws_lambda_function.start_watchdog.arn
+  input     = jsonencode({ mode = "curfew_check" })
+}
+
+resource "aws_lambda_permission" "start_watchdog_curfew_check" {
+  statement_id  = "AllowExecutionFromEventBridgeCurfewCheck"
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.start_watchdog.function_name
+  principal     = "events.amazonaws.com"
+  source_arn    = aws_cloudwatch_event_rule.start_watchdog_curfew_check.arn
 }
 
 output "start_watchdog_function_name" {
