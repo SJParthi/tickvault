@@ -134,7 +134,9 @@ class ReGate(WithBase):
             )
             up.assert_not_called()
 
-    def test_sql_gate_parity_with_operator_control(self) -> None:
+    def test_sql_gate_parity_with_operator_control_shared_subset(self) -> None:
+        # The back gate is a read-only SUPERSET of operator-control (adds bare
+        # introspection funcs); on the NON-func corpus they must agree.
         opctl = _load_opctl()
         self.assertEqual(handler._SQL_ALLOWED_PREFIXES, opctl._SQL_ALLOWED_PREFIXES)
         self.assertEqual(handler._SQL_BANNED, opctl._SQL_BANNED)
@@ -150,6 +152,39 @@ class ReGate(WithBase):
             "",
         ):
             self.assertEqual(handler._is_safe_sql(q), opctl._is_safe_sql(q), q)
+
+    def test_introspection_funcs_allowed_and_rechecked(self) -> None:
+        # FIX 3: the console's bare introspection funcs pass; unknown funcs +
+        # chaining + banned-word-after still reject at the VPC hop.
+        for fn in handler._SQL_ALLOWED_FUNCS:
+            self.assertTrue(handler._is_safe_sql(f"{fn}()"), fn)
+        self.assertTrue(handler._is_safe_sql("columns('ticks')"))
+        self.assertFalse(handler._is_safe_sql("evil_func()"))
+        self.assertFalse(handler._is_safe_sql("tables(); drop table ticks"))
+        self.assertFalse(handler._is_safe_sql("tables() delete"))
+        self.assertFalse(handler._is_safe_sql("insert into t values(1)"))
+
+    def test_introspection_func_relays_through_gate(self) -> None:
+        resp = FakeResp([b"[]"], headers={"content-type": "application/json"})
+        with mock.patch("urllib.request.urlopen", return_value=resp) as up:
+            r = handler.lambda_handler(
+                {"method": "GET", "path": "/exec", "rawQuery": "query=tables%28%29"}, None
+            )
+            self.assertEqual(r["status"], 200)
+            up.assert_called_once()
+
+    def test_bad_path_rejected_at_vpc_hop(self) -> None:
+        # FIX 1 zero-trust: even if the front is bypassed, traversal dies here.
+        with mock.patch("urllib.request.urlopen") as up:
+            for path in ("/assets/../exec", "/exec/../imp", "/%2e%2e%2fexec", "/a//b", "/x\\y"):
+                r = handler.lambda_handler(
+                    {"method": "GET", "path": path, "rawQuery": "query=drop+table+ticks"}, None
+                )
+                self.assertEqual(r, {"err": "bad_path"}, path)
+            up.assert_not_called()
+
+    def test_body_cap_constant_within_6mib_envelope(self) -> None:
+        self.assertLessEqual(handler.MAX_BODY_BYTES, 4_100_000)
 
 
 class Relay(WithBase):

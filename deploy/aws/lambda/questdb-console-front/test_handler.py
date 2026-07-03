@@ -191,6 +191,50 @@ class SqlGateParity(unittest.TestCase):
         self.assertFalse(handler._is_safe_sql("(select 1)"))
 
 
+class SqlIntrospectionSuperset(unittest.TestCase):
+    """FIX 3: bare read-only introspection function calls the QuestDB 9.3.5
+    console issues must PASS (a superset of operator-control's gate)."""
+
+    def test_each_allowed_func_passes_bare_and_with_args(self) -> None:
+        for fn in handler._SQL_ALLOWED_FUNCS:
+            self.assertTrue(handler._is_safe_sql(f"{fn}()"), fn)
+            self.assertTrue(handler._is_safe_sql(f"{fn.upper()}()"), fn)
+        self.assertTrue(handler._is_safe_sql("columns('ticks')"))
+        self.assertTrue(handler._is_safe_sql("table_columns('ticks')"))
+        self.assertTrue(handler._is_safe_sql("  tables()  "))
+
+    def test_unknown_func_still_rejected(self) -> None:
+        self.assertFalse(handler._is_safe_sql("evil_func()"))
+        self.assertFalse(handler._is_safe_sql("pg_sleep(10)"))
+
+    def test_func_chaining_rejected(self) -> None:
+        self.assertFalse(handler._is_safe_sql("tables(); drop table ticks"))
+        self.assertFalse(handler._is_safe_sql("tables() ; select 1"))
+
+    def test_func_with_banned_word_rejected(self) -> None:
+        # A banned mutator after an allowed func still trips the whole-word scan.
+        self.assertFalse(handler._is_safe_sql("tables() delete"))
+        self.assertFalse(handler._is_safe_sql("columns('t') drop"))
+
+    def test_insert_still_rejected(self) -> None:
+        self.assertFalse(handler._is_safe_sql("insert into t values(1)"))
+
+    def test_front_back_gate_byte_identical(self) -> None:
+        # FIX 3: front and back _is_safe_sql must agree on EVERYTHING.
+        import importlib.util as _u
+
+        p = Path(__file__).resolve().parent.parent / "questdb-console-proxy" / "handler.py"
+        spec = _u.spec_from_file_location("qdb_back_for_parity", p)
+        back = _u.module_from_spec(spec)
+        spec.loader.exec_module(back)
+        self.assertEqual(handler._SQL_ALLOWED_FUNCS, back._SQL_ALLOWED_FUNCS)
+        corpus = list(_SQL_CORPUS) + [f"{fn}()" for fn in handler._SQL_ALLOWED_FUNCS] + [
+            "columns('ticks')", "tables(); drop table ticks", "evil_func()", "tables() delete",
+        ]
+        for q in corpus:
+            self.assertEqual(handler._is_safe_sql(q), back._is_safe_sql(q), q)
+
+
 class Signing(unittest.TestCase):
     def test_mint_verify_roundtrip(self) -> None:
         now = int(time.time())
@@ -328,6 +372,51 @@ class PathMethodGate(WithSecret):
         self.assertEqual(r["statusCode"], 403)
         self.assertEqual(self.back_calls, [])  # never forwarded
 
+    def test_path_traversal_confusion_denied(self) -> None:
+        # FIX 1: none of these may reach the classifier / SQL gate / back.
+        for path, qs in (
+            ("/assets/../exec", {"query": "drop table ticks"}),
+            ("/exec/../imp", None),
+            ("/index.html/../exec", {"query": "select 1"}),
+            ("/assets//app.js", None),
+            ("/assets/\\..\\exec", None),
+        ):
+            r = handler.lambda_handler(_event("GET", path, qs, headers=_bearer()), None)
+            self.assertEqual(r["statusCode"], 403, path)
+            self.assertEqual(self.back_calls, [], path)
+
+    def test_encoded_traversal_denied(self) -> None:
+        # %2e%2e%2fexec, %2f, %5c encoded separators — rejected on the raw form.
+        for path in ("/%2e%2e%2fexec", "/assets/%2e%2e/exec", "/%2fexec", "/a%5c..%5cexec"):
+            r = handler.lambda_handler(
+                _event("GET", path, {"query": "drop table ticks"}, headers=_bearer()), None
+            )
+            self.assertEqual(r["statusCode"], 403, path)
+            self.assertEqual(self.back_calls, [], path)
+
+    def test_static_path_does_not_execute_sql(self) -> None:
+        # FIX 1: `?query=...` on a static path must NOT be forwarded to QuestDB.
+        r = handler.lambda_handler(
+            _event("GET", "/index.html", {"query": "drop table ticks", "v": "9"}, headers=_bearer()),
+            None,
+        )
+        self.assertEqual(r["statusCode"], 200)
+        self.assertEqual(self.back_calls[0]["path"], "/index.html")
+        fwd = urllib.parse.parse_qs(self.back_calls[0]["rawQuery"])
+        self.assertNotIn("query", fwd)  # never smuggled onto a static path
+        self.assertEqual(fwd.get("v"), ["9"])  # whitelisted param survives
+
+    def test_chk_forwards_only_whitelisted_params(self) -> None:
+        r = handler.lambda_handler(
+            _event("GET", "/chk", {"f": "json", "j": "ticks", "query": "drop table ticks"}, headers=_bearer()),
+            None,
+        )
+        self.assertEqual(r["statusCode"], 200)
+        fwd = urllib.parse.parse_qs(self.back_calls[0]["rawQuery"])
+        self.assertEqual(fwd["f"], ["json"])
+        self.assertEqual(fwd["j"], ["ticks"])
+        self.assertNotIn("query", fwd)
+
     def test_post_exec_405(self) -> None:
         r = handler.lambda_handler(
             _event("POST", "/exec", {"query": "select 1"}, headers=_bearer()), None
@@ -443,6 +532,21 @@ class RelayPlumbing(WithSecret):
         self.assertEqual(r["statusCode"], 503)
         self.assertIn("offline", json.loads(r["body"])["error"])
         self.assertIn("08:30", json.loads(r["body"])["error"])
+
+    def test_body_cap_constant_within_6mib_envelope(self) -> None:
+        # FIX 2: base64(cap) + JSON must stay under Lambda's 6 MiB response.
+        self.assertLessEqual(handler.MAX_BODY_BYTES, 4_100_000)
+
+    def test_over_cap_back_body_maps_to_502_not_503(self) -> None:
+        # A too_large from the back is a 502, never the 503 offline path.
+        handler._invoke_back = lambda _p: {"err": "too_large"}  # type: ignore[assignment]
+        r = handler.lambda_handler(_event("GET", "/", headers=_bearer()), None)
+        self.assertEqual(r["statusCode"], 502)
+        # And an over-sized base64 body_b64 from a (mis)reporting back → 502.
+        big = "A" * (int(handler.MAX_BODY_BYTES * 4 / 3) + 100)
+        handler._invoke_back = lambda _p: {"status": 200, "headers": {}, "body_b64": big}  # type: ignore[assignment]
+        r = handler.lambda_handler(_event("GET", "/", headers=_bearer()), None)
+        self.assertEqual(r["statusCode"], 502)
 
     def test_back_status_relayed(self) -> None:
         def fake_back(_payload: dict) -> dict:

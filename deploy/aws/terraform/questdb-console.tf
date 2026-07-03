@@ -35,12 +35,15 @@ resource "aws_security_group" "qdb_console_lambda" {
   description = "QuestDB console proxy Lambda (B4): egress-only; box SG admits 9000 from this SG"
   vpc_id      = aws_vpc.dlt.id
 
+  # Least-privilege egress: TCP 9000 to the box private IP ONLY (a known
+  # plan-time attribute; the relay dials a raw IP so it needs no DNS/other
+  # egress).
   egress {
-    description = "All outbound (QuestDB :9000 on the box private IP)"
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
-    cidr_blocks = ["0.0.0.0/0"]
+    description = "QuestDB :9000 on the box private IP only"
+    from_port   = 9000
+    to_port     = 9000
+    protocol    = "tcp"
+    cidr_blocks = ["${aws_instance.tv_app.private_ip}/32"]
   }
 
   tags = {
@@ -148,7 +151,7 @@ data "aws_iam_policy_document" "questdb_console_front_permissions" {
     sid       = "ReadControlSecret"
     effect    = "Allow"
     actions   = ["ssm:GetParameter"]
-    resources = ["arn:aws:ssm:${var.aws_region}:*:parameter/tickvault/${var.environment}/operator/control-secret"]
+    resources = ["arn:aws:ssm:${var.aws_region}:${data.aws_caller_identity.current.account_id}:parameter/tickvault/${var.environment}/operator/control-secret"]
   }
 
   statement {

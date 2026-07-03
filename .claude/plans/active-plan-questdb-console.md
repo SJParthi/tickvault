@@ -65,7 +65,27 @@ Portal integration: operator-control gains action `qdb_console_url` (mints the
   so the console UI renders it.
 - Non-GET/HEAD methods → 405 (blocks /imp uploads + settings writes by
   method); `/imp` and unknown paths → 403 even on GET.
-- Response >5.5 MB from QuestDB → honest 502 (Lambda payload limit is 6 MB).
+- Path-confusion / traversal (FIX 1): any request whose raw path OR its
+  URL-decoded form contains `..`, `//`, `\`, `%2e`/`%2f`/`%5c` (any case) or an
+  ASCII control char is rejected BEFORE classification (front→403
+  `denied_path`; back→`{"err":"bad_path"}`), so `/assets/../exec?query=drop…`,
+  `%2e%2e%2fexec`, `/exec/../imp` can never be mis-read as static or bypass the
+  SQL gate. Static/`/chk`/console paths forward ONLY a whitelisted param set
+  (`f`,`j`,`v`,`version`,`nm`,`src`) — never the raw query string — so
+  `?query=drop…` on a static path never reaches QuestDB.
+- QuestDB 9.3.5 console introspection (FIX 3): the console SPA issues bare
+  read-only functions (`tables()`, `columns('t')`, `table_columns('t')`, …)
+  directly to `/exec`; the gate allows the first token to be
+  select/show/explain/with OR a call to a fixed `_SQL_ALLOWED_FUNCS` read-only
+  introspection allowlist. The full mutator scan + single-statement +
+  no-comment + row-cap rules still apply, so `tables(); drop table ticks` and
+  `tables() delete` reject. INTENTIONAL read-only SUPERSET of operator-control;
+  exact func set to be live-verified against the deployed console.
+- 6 MiB Lambda invoke envelope (FIX 2): `MAX_BODY_BYTES = 4_100_000` in BOTH
+  handlers (base64 ≈ 5.47 MB + JSON stays under Lambda's 6 MiB sync-invoke
+  limit). A 5.5 MB cap would base64 to 7.33 MB → the back→front invoke would
+  FAIL on a HEALTHY box and the front would wrongly report 503; the 4.1 MB cap
+  maps genuinely oversized results to 502 (never 503).
 - SSM secret missing/unreadable → fail-closed deny-all (same as portal).
 - QDB_CONSOLE_URL env empty (console disabled) → portal action returns
   `{"error":"console not enabled"}`; button shows the error toast.
@@ -80,7 +100,8 @@ Portal integration: operator-control gains action `qdb_console_url` (mints the
 | Back Lambda ENI/VPC failure | front 502/503 honest JSON | `tv-<env>-questdb-console-front-errors` alarm → SNS |
 | Box stopped / 9000 down | back `{"err":"box_unreachable"}` → front 503 | structured log `outcome=back_error` |
 | SQL gate bypass attempt | 400 QuestDB-shaped error; logged `denied_sql` with 200-char sql_head (never secrets) | structured JSON log |
-| Oversized response | 502 `response too large` | structured log |
+| Path-confusion / traversal | front 403 `denied_path`; back independently `{"err":"bad_path"}` (zero-trust) | structured JSON log |
+| Oversized response (>4.1 MB raw) | back `too_large` → front 502 (never the 503 offline path) | structured log |
 | Terraform flag off | zero resources created (count-gated), portal button returns "console not enabled" | n/a |
 
 ## Test Plan
@@ -89,7 +110,12 @@ Python stdlib `unittest` (mirrors `deploy/aws/lambda/operator-control/test_handl
 run with `python3 -m unittest test_handler` in each Lambda dir:
 
 - `deploy/aws/lambda/questdb-console-front/test_handler.py` — SQL-gate parity
-  with operator-control (multi-statement, trailing `;`, comments, banned words
+  with operator-control on the non-func corpus + read-only introspection
+  superset (each allowed func passes; unknown func / func-chaining /
+  func-then-banned-word reject) + front==back byte-identical gate; path
+  traversal + encoded traversal + static-path-does-not-execute-SQL +
+  `/chk`-whitelist-only; body-cap constant ≤4.1 MB + over-cap→502-not-503;
+  (multi-statement, trailing `;`, comments, banned words
   any case/position, CTE smuggling, over-length, empty), auth (missing /
   expired / forged / garbage token+cookie, Bearer right/wrong, login POST
   right/wrong, `hmac.compare_digest` used — asserted via source inspection),

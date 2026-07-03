@@ -1861,6 +1861,14 @@ class QdbConsoleUrlAction(unittest.TestCase):
         self.assertIn("qdb_console_url", html)
         self.assertIn("openQdbConsole", html)
 
+    def test_qdb_console_open_is_popup_safe(self) -> None:
+        # FIX 4: the window must be opened SYNCHRONOUSLY in the click, before
+        # the await, then navigated — so the browser popup blocker allows it.
+        html = handler._console_html()
+        self.assertIn("window.open('','_blank')", html)
+        self.assertIn("w.location=j.url", html)
+        self.assertIn("w.close()", html)
+
 
 if __name__ == "__main__":
     unittest.main()

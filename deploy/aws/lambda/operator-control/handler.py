@@ -2338,8 +2338,10 @@ async function runDbSql(){ const q=$('dbsql').value.trim(); if(!q){ toast('Type 
   const j=await call('sql',{query:q}); if(!j){ $('dbout').innerHTML=''; return; }
   dbCsv=j.csv||''; const n=renderGrid($('dbout'),parseCsv(dbCsv));
   $('dbcount').textContent=n+' row'+(n===1?'':'s')+(n>=1000?' — server cap 1000 reached':''); }
-async function openQdbConsole(){ const j=await call('qdb_console_url'); if(!j||!j.url){ return; }
-  window.open(j.url,'_blank'); }
+async function openQdbConsole(){ const w=window.open('','_blank'); // open SYNC in the click (popup-safe) BEFORE the await
+  const j=await call('qdb_console_url');
+  if(j&&j.url){ if(w) w.location=j.url; else window.open(j.url,'_blank'); }
+  else { if(w) w.close(); } } // call() already toasts the {error}/non-ok case
 function dbDownloadCsv(){ if(!dbCsv){ toast('Run a query first'); return; }
   const a=document.createElement('a'); a.href=URL.createObjectURL(new Blob([dbCsv],{type:'text/csv'}));
   a.download='tickvault-query-'+new Date().toISOString().slice(0,19).replace(/[:T]/g,'-')+'.csv';
