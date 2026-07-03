@@ -1230,4 +1230,50 @@ mod tests {
              panic-loop."
         );
     }
+
+    /// SLO-03 (live incident 2026-07-03 10:35 IST): `main.rs` MUST spawn the
+    /// SLO evaluator/publisher through the SUPERVISED wrapper, never as a bare
+    /// `tokio::spawn`. The bare spawn died silently mid-market — last
+    /// `tv_realtime_guarantee_score` datapoint 10:35 IST, no `error!`, no
+    /// respawn — and the guarantee-critical alarm false-OK'd on missing data
+    /// (missing→NonBreaching). The SUPERVISED wrapper (mirrors
+    /// DISK-WATCHER-01 / PROC-01 / WS-GAP-05) logs `error!(code = "SLO-03")`,
+    /// increments `tv_slo_publisher_respawn_total{reason}`, and respawns with
+    /// bounded backoff so the guarantee-score stream can never vanish
+    /// silently again.
+    #[test]
+    fn test_slo_publisher_supervisor_is_wired_into_main() {
+        let main_rs = std::fs::read_to_string("../app/src/main.rs")
+            .or_else(|_| std::fs::read_to_string("crates/app/src/main.rs"))
+            .expect("main.rs must be readable");
+        assert!(
+            main_rs.contains("spawn_supervised_slo_publisher("),
+            "main.rs MUST spawn the SLO evaluator/publisher via \
+             `spawn_supervised_slo_publisher` (SLO-03). A bare tokio::spawn \
+             regresses the 2026-07-03 10:35 IST silent-death incident: the \
+             tv_realtime_guarantee_score stream stops with no error!, no \
+             counter, no respawn, and the guarantee-critical alarm false-OKs \
+             on missing data."
+        );
+        // The supervisor must be the ONLY spawn path for the publisher: the
+        // inner task fn must have exactly one non-doc call site (inside the
+        // supervisor loop), so nobody re-introduces a second, unsupervised
+        // spawn of the same loop.
+        let inner_call_sites = main_rs
+            .lines()
+            .filter(|l| {
+                let t = l.trim_start();
+                !t.starts_with("//")
+                    && !t.starts_with("///")
+                    && t.contains("spawn_slo_publisher_task(")
+            })
+            .count();
+        assert_eq!(
+            inner_call_sites,
+            2, // 1 definition (`fn spawn_slo_publisher_task(`) + 1 supervisor call site
+            "spawn_slo_publisher_task must be called ONLY from the SLO-03 \
+             supervisor loop (found {inner_call_sites} non-comment mentions; \
+             expected exactly 2: the fn definition + the supervisor call site)"
+        );
+    }
 }

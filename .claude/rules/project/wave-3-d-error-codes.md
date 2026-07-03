@@ -109,6 +109,57 @@ notification variants `RealtimeGuaranteeDegraded` and
 plus the Criterion bench `bench_score_compute_le_1us` in
 `crates/core/benches/slo_score.rs`.
 
+## SLO-03 — SLO evaluator/publisher task died and was respawned
+
+**Trigger:** the 10-second SLO evaluator/publisher task (the scheduler in
+`crates/app/src/main.rs` that samples the six dimensions, calls
+`evaluate_slo_score`, and emits `tv_realtime_guarantee_score` + the six
+`tv_realtime_guarantee_dimension` gauges) exited — panic, external cancel,
+or unexpected clean return. The task is an infinite loop, so ANY resolution
+of its `JoinHandle` is abnormal. The supervisor
+(`spawn_supervised_slo_publisher` in `crates/app/src/main.rs` — mirrors
+`spawn_supervised_oom_monitor` / DISK-WATCHER-01 / WS-GAP-05) caught the
+death, logged `error!(code = "SLO-03", reason, ...)`, incremented
+`tv_slo_publisher_respawn_total{reason}` (`reason` ∈ `panic` / `cancelled` /
+`clean_exit` / `unknown` per `classify_join_exit`), waited the bounded 5s
+backoff (`SLO_PUBLISHER_RESPAWN_BACKOFF_SECS`), and respawned the publisher
+so the metric stream resumes.
+
+**Why this code exists (live incident 2026-07-03 10:35 IST):** the publisher
+was a bare `tokio::spawn` with a dropped `JoinHandle`. It died silently
+mid-market at 10:35 IST (context: WS-GAP-06 tick-gap storm + a STAGE-C.2b
+LiveFeed re-injection burst, dropped=1,127,801, at 10:36) — last
+`tv_realtime_guarantee_score` datapoint 10:35, no `error!` (a tokio task
+panic prints to stderr, not the tracing pipeline), no respawn. The
+guarantee-critical alarm false-OK'd on missing data (missing→NonBreaching);
+only the `market-hours-liveness-missing` alarm caught it. Severity::High —
+the respawn self-heals, but a dying publisher blinds the guarantee alarm,
+so the operator must see it.
+
+**Triage:**
+1. A one-off SLO-03 with the metric stream resumed = healthy self-heal;
+   read the `reason` field and (for `reason="panic"`) the backtrace in
+   `data/logs/errors.jsonl.*` / stderr at leisure.
+2. A sustained `tv_slo_publisher_respawn_total` rate (respawn storm) means
+   the publisher keeps dying — a real bug in the loop (QDB probe, tick-gap
+   scan, token headroom read). Capture the backtrace preceding each SLO-03
+   line and file it; restart the app to reset from clean state if it flaps.
+3. `reason="cancelled"` at shutdown is benign (runtime teardown).
+4. Cross-check `tv_realtime_guarantee_score` in CloudWatch — datapoints
+   must resume within ~15s of the SLO-03 line.
+
+**Auto-triage safe:** YES (Severity::High; the respawn already restored the
+metric stream — the operator inspects the reason/backtrace, never
+auto-fixes anything).
+
+**Source:** `crates/app/src/main.rs` (`spawn_slo_publisher_task` /
+`spawn_supervised_slo_publisher` + the once-per-process spawn guard at the
+`start_dhan_lane` feature-gated site),
+`crates/common/src/error_code.rs::Slo03PublisherRespawned`,
+`crates/storage/src/disk_health_watcher.rs::classify_join_exit` (shared
+exit classifier). Wiring ratchet:
+`crates/core/src/auth/secret_manager.rs::test_slo_publisher_supervisor_is_wired_into_main`.
+
 ## The honest 100% claim
 
 Per `stream-resilience.md` Section 7 of the Wave 3-D scope: SLO-02

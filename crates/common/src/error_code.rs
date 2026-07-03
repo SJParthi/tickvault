@@ -301,6 +301,13 @@ pub enum ErrorCode {
     /// (Degraded) or 0.80 (Critical). Edge-triggered on the rising edge
     /// into a worse tier. Operator action required for `Critical`.
     Slo02Degraded,
+    /// SLO-03: the SLO evaluator/publisher task (the 10s scheduler that
+    /// emits `tv_realtime_guarantee_score`) exited — panic, cancel, or
+    /// unexpected clean return — and the supervisor respawned it so the
+    /// guarantee-score metric stream can never vanish silently (live
+    /// incident 2026-07-03 10:35 IST: task died mid-market, alarm
+    /// false-OK'd on missing data).
+    Slo03PublisherRespawned,
 
     // -----------------------------------------------------------------------
     // Wave 3 — Telegram dispatcher (Item 11)
@@ -757,6 +764,7 @@ impl ErrorCode {
             // Wave 3-D — composite real-time guarantee score (Item 13)
             Self::Slo01Healthy => "SLO-01",
             Self::Slo02Degraded => "SLO-02",
+            Self::Slo03PublisherRespawned => "SLO-03",
             // Dhan Trading API
             Self::Dh901InvalidAuth => "DH-901",
             Self::Dh902NoApiAccess => "DH-902",
@@ -875,6 +883,10 @@ impl ErrorCode {
             | Self::AggregatorHb01Heartbeat => Severity::Info,
             // High: composite SLO degradation summary signal
             Self::Slo02Degraded => Severity::High,
+            // High: the guarantee-score publisher died and was respawned —
+            // the respawn self-heals, but a dying publisher blinds the
+            // guarantee-critical alarm (missing→NonBreaching), so page.
+            Self::Slo03PublisherRespawned => Severity::High,
             // High: regulatory / order / risk / rate-limit
             Self::Dh904RateLimit
             | Self::Dh905InputException
@@ -1063,7 +1075,7 @@ impl ErrorCode {
             Self::Selftest01Passed | Self::Selftest02Failed => {
                 ".claude/rules/project/wave-3-c-error-codes.md"
             }
-            Self::Slo01Healthy | Self::Slo02Degraded => {
+            Self::Slo01Healthy | Self::Slo02Degraded | Self::Slo03PublisherRespawned => {
                 ".claude/rules/project/wave-3-d-error-codes.md"
             }
             Self::Dh901InvalidAuth
@@ -1267,6 +1279,7 @@ impl ErrorCode {
             Self::Selftest02Failed,
             Self::Slo01Healthy,
             Self::Slo02Degraded,
+            Self::Slo03PublisherRespawned,
             Self::PrevClose03BootRoutingAssertion,
             Self::Volume01MonotonicityBreach,
             // PR #5 (2026-05-19): Phase2Ready01PreflightFailed retired.
@@ -1596,7 +1609,10 @@ mod tests {
         // (OOM-kill monitor — cgroup-v2 memory.events oom_kill vs boot baseline).
         // 2026-07-01 (audit sweep): bumped 111 -> 115 for AUTH-GAP-04 (AUTH-P11)
         // + RESOURCE-01/02/03 (BP-08 fd / RSS / spill-free monitors).
-        assert_eq!(ErrorCode::all().len(), 115);
+        // 2026-07-03 (SLO publisher supervisor): bumped 115 -> 116 for SLO-03
+        // (the 10s tv_realtime_guarantee_score publisher died silently at
+        // 10:35 IST mid-market; now supervised + respawned).
+        assert_eq!(ErrorCode::all().len(), 116);
     }
 
     #[test]
