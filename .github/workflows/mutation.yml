@@ -127,15 +127,28 @@ jobs:
 
       - name: Check for survived mutants
         if: steps.changed.outputs.skip == 'false'
+        # cargo-mutants (v27) prints "MISSED" for a surviving mutant — the old
+        # grep for "SURVIVED" (mutmut/PIT/Stryker wording) could NEVER match,
+        # so this gate was dead code: the job only failed via the run step's
+        # exit code + pipefail (PR #1375). Grep the wording cargo-mutants
+        # actually emits. A missing or empty results file means the mutation
+        # step produced no output at all — that is a broken run and MUST fail
+        # loudly here, never pass silently (the old `2>/dev/null` +
+        # else-branch printed "All mutants killed" on a missing file).
         run: |
-          if grep -q "SURVIVED" mutation-results.txt 2>/dev/null; then
+          set -euo pipefail
+          if [ ! -s mutation-results.txt ]; then
+            echo "::error::mutation-results.txt is missing or empty — the mutation step produced no output"
+            exit 1
+          fi
+          if grep -q "MISSED" mutation-results.txt; then
             echo ""
             echo "╔══════════════════════════════════════════════╗"
             echo "║  MUTATION TESTING FAILED                      ║"
-            echo "║  Survived mutants = untested code paths       ║"
+            echo "║  MISSED mutants = untested code paths         ║"
             echo "╚══════════════════════════════════════════════╝"
             echo ""
-            grep "SURVIVED" mutation-results.txt
+            grep "MISSED" mutation-results.txt
             echo ""
             echo "Add or improve tests to kill these mutants."
             exit 1
@@ -151,13 +164,22 @@ jobs:
             # the old `|| echo 0` produced a two-line "0\n0" value and the
             # `[: 0\n0: integer expression expected` noise. Use `|| true` and
             # normalize the empty-file/missing-file case explicitly.
-            TOTAL=$(grep -cE '(KILLED|SURVIVED|TIMEOUT)' mutation-results.txt 2>/dev/null || true)
-            KILLED=$(grep -c 'KILLED' mutation-results.txt 2>/dev/null || true)
-            SURVIVED=$(grep -c 'SURVIVED' mutation-results.txt 2>/dev/null || true)
-            TIMEOUT=$(grep -c 'TIMEOUT' mutation-results.txt 2>/dev/null || true)
-            TOTAL=${TOTAL:-0}; KILLED=${KILLED:-0}; SURVIVED=${SURVIVED:-0}; TIMEOUT=${TIMEOUT:-0}
+            #
+            # cargo-mutants v27 wording (the old KILLED/SURVIVED greps matched
+            # NOTHING — those are mutmut/PIT terms): surviving mutants print a
+            # per-line "MISSED"; timeouts print "TIMEOUT"; caught mutants are
+            # NOT listed per-line — the caught count exists only in the final
+            # summary line "N mutants tested in Xm: A missed, B caught,
+            # C unviable". CARGO_TERM_COLOR=always means the tee'd file
+            # carries ANSI codes, so strip them before parsing.
+            sed 's/\x1b\[[0-9;]*m//g' mutation-results.txt > mutation-results.clean.txt
+            MISSED=$(grep -c 'MISSED' mutation-results.clean.txt 2>/dev/null || true)
+            TIMEOUT=$(grep -c 'TIMEOUT' mutation-results.clean.txt 2>/dev/null || true)
+            CAUGHT=$(grep -oE '[0-9]+ caught' mutation-results.clean.txt 2>/dev/null | tail -1 | cut -d' ' -f1 || true)
+            TOTAL=$(grep -oE '[0-9]+ mutants tested' mutation-results.clean.txt 2>/dev/null | tail -1 | cut -d' ' -f1 || true)
+            TOTAL=${TOTAL:-0}; MISSED=${MISSED:-0}; CAUGHT=${CAUGHT:-0}; TIMEOUT=${TIMEOUT:-0}
             if [ "$TOTAL" -gt 0 ]; then
-              SCORE=$(python3 -c "print(f'{$KILLED / $TOTAL * 100:.1f}')")
+              SCORE=$(python3 -c "print(f'{$CAUGHT / $TOTAL * 100:.1f}')")
             else
               SCORE="N/A"
             fi
@@ -165,9 +187,9 @@ jobs:
               echo "## Mutation Testing Results"
               echo "| Metric | Count |"
               echo "|--------|-------|"
-              echo "| Total mutants | $TOTAL |"
-              echo "| Killed | $KILLED |"
-              echo "| Survived | $SURVIVED |"
+              echo "| Total mutants tested | $TOTAL |"
+              echo "| Caught | $CAUGHT |"
+              echo "| Missed | $MISSED |"
               echo "| Timeout | $TIMEOUT |"
               echo "| **Score** | **${SCORE}%** |"
             } >> "$GITHUB_STEP_SUMMARY"

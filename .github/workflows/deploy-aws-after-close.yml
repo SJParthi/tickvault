@@ -33,8 +33,12 @@
 #     never-cross step stops the box again once the deploy finishes.
 #
 # Idempotent: before dispatching, we compare main's current HEAD against the
-# `head_sha` of the most recent SUCCESSFUL deploy-aws run on main. If equal,
-# nothing to deploy — exit clean (no spurious restart on quiet days).
+# `head_sha` of the most recent deploy-aws run on main that ACTUALLY DEPLOYED
+# (status=success AND its B9 "Record deployed binary git SHA" step executed —
+# a green intentional-skip run, box stopped off-hours, concludes success while
+# deploying NOTHING and must NOT count; 2026-07-03 false-OK fix, see the
+# Compare step below). If equal, nothing to deploy — exit clean (no spurious
+# restart on quiet days).
 #
 # Triggers:
 #   - schedule: 03:00 + 03:15 + 10:16 + 10:46 + 11:31 UTC Mon–Fri
@@ -99,11 +103,48 @@ jobs:
           MAIN_SHA=$(git rev-parse HEAD)
           echo "main HEAD = $MAIN_SHA"
 
-          # Pull the most recent SUCCESSFUL deploy-aws run on main.
-          # If there is none yet (fresh repo), we treat it as "deploy needed".
-          LAST_DEPLOYED=$(gh api \
-            "repos/${{ github.repository }}/actions/workflows/deploy-aws.yml/runs?branch=main&status=success&per_page=1" \
-            --jq '.workflow_runs[0].head_sha // ""')
+          # ── FALSE-OK FIX (2026-07-03) — a green NO-OP SKIP run is NOT a deploy ──
+          # A push to main while the box is intentionally stopped (evening /
+          # weekend, outside the 08:30-16:30 IST up-window) exits deploy-aws
+          # GREEN as a deliberate no-op (DEPLOY_SKIP_REASON=intentional_stopped
+          # in its "Ensure instance running" step): the run concludes SUCCESS
+          # with head_sha = the merged commit, but S3 upload / SSM swap / B9
+          # provenance steps are all `skipped` — NOTHING was deployed.
+          #
+          # The old check here took the head_sha of the single most recent
+          # status=success run, so such a skip run poisoned the idempotency
+          # comparison: MAIN_SHA == skip-run sha ⇒ dispatch=false ⇒ the merge
+          # NEVER deploys and the box runs stale code indefinitely. Live proof
+          # (2026-07-03): run 28662389892 (push 18:34 IST, sha 52fcd6f8) was a
+          # green skip while the box actually ran 8ec44176 — only a LATER
+          # CI-only merge moving HEAD saved the Monday-morning cron from
+          # skipping the whole Friday-evening batch.
+          #
+          # Fix: walk the recent successful runs and accept as "last deployed"
+          # only a run whose deploy job actually EXECUTED the B9 provenance
+          # step ("Record deployed binary git SHA") — that step runs exactly
+          # when a verified-healthy binary swap happened (deploy-aws.yml,
+          # `if: success() && env.DEPLOY_SKIP_REASON == ''`). Green skips show
+          # that step as `skipped` and are ignored. If no qualifying run is
+          # found in the window (fresh repo / pre-B9 history / API hiccup),
+          # FAIL OPEN to dispatching: an extra off-hours deploy is idempotent
+          # and cheap; a silently-stale trading box is not.
+          LAST_DEPLOYED=""
+          RUNS=$(gh api \
+            "repos/${{ github.repository }}/actions/workflows/deploy-aws.yml/runs?branch=main&status=success&per_page=10" \
+            --jq '.workflow_runs[] | "\(.id) \(.head_sha)"')
+          while read -r RUN_ID RUN_SHA; do
+            [ -z "${RUN_ID:-}" ] && continue
+            REAL=$(gh api "repos/${{ github.repository }}/actions/runs/${RUN_ID}/jobs?per_page=30" \
+              --jq '[.jobs[].steps[]? | select((.name | contains("Record deployed binary git SHA")) and .conclusion == "success")] | length' \
+              2>/dev/null || echo 0)
+            if [ "${REAL:-0}" -gt 0 ]; then
+              LAST_DEPLOYED="$RUN_SHA"
+              echo "last REAL deploy: run $RUN_ID sha $RUN_SHA (B9 provenance step executed)"
+              break
+            fi
+            echo "run $RUN_ID sha $RUN_SHA concluded success but deployed nothing (green no-op skip) — ignoring"
+          done <<< "$RUNS"
           echo "last successful deploy sha = ${LAST_DEPLOYED:-<none>}"
 
           if [ -z "$LAST_DEPLOYED" ]; then
