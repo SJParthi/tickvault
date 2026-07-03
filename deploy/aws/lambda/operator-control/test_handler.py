@@ -1368,6 +1368,20 @@ class RedesignThreeTabs(unittest.TestCase):
         self.assertNotIn("<details open", html)
         self.assertNotIn('id="danger" open', html)
 
+    def test_fold_has_visible_disclosure_affordance(self) -> None:
+        # The operator TWICE read the folded danger zone as "the wipes were
+        # DELETED" because the fold had no visual cue. Pin: every .fold summary
+        # shows a ▸ chevron that flips to ▾ when open (CSS ::after), and the
+        # danger summary NAMES its contents so nothing looks removed.
+        html = handler._console_html()
+        self.assertIn("details.fold>summary::after{ content:' ▸'", html)
+        self.assertIn("details.fold[open]>summary::after{ content:' ▾'", html)
+
+    def test_danger_summary_names_its_contents(self) -> None:
+        html = handler._console_html()
+        summary = html.split('<details class="fold" id="danger">', 1)[1].split("</summary>", 1)[0]
+        self.assertIn("(contains: Wipe GROWW · Wipe ALL · Docker reset · Bare nuke)", summary)
+
     def test_severity_picker_maps_each_choice_to_action_and_token(self) -> None:
         html = handler._console_html()
         # One dispatch map, radio value → the UNCHANGED per-action function.
