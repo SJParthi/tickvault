@@ -1,0 +1,118 @@
+# =============================================================================
+# tickvault — Groww QuestDB E2E lane (B7 coverage-honesty)
+# =============================================================================
+# The 3 QuestDB-backed proofs in crates/app/tests/groww_live_pipeline_e2e.rs
+# self-SKIP when no QuestDB is reachable — so in the ordinary ci.yml test jobs
+# they silently skip = vacuous green. This lane brings up a REAL QuestDB
+# (compose service tv-questdb), runs the e2e with TV_REQUIRE_QDB=1 (an
+# unreachable DB PANICS instead of skipping), and then mechanically asserts
+# no SKIP line was printed and >=3 PROVED: lines were (audit-findings Rule 11:
+# no false-OK signals).
+#
+# Cadence: manual dispatch + Sunday 19:30 UTC (Mon 01:00 IST, off-market) +
+# push-to-main filtered to the files that feed this pipeline.
+# =============================================================================
+
+name: Groww QuestDB E2E
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Sunday 19:30 UTC = Monday 01:00 IST — off-market, offset from
+    # chaos-nightly (Sat 18:30 UTC) and full-test-nightly to avoid contention.
+    - cron: "30 19 * * 0"
+  push:
+    branches: [main]
+    paths:
+      - "crates/app/src/groww_bridge.rs"
+      - "crates/app/tests/groww_live_pipeline_e2e.rs"
+      - "crates/storage/src/**"
+      - "deploy/docker/docker-compose.yml"
+      - ".github/workflows/groww-e2e.yml"
+
+concurrency:
+  group: groww-e2e
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  groww-e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      CARGO_TERM_COLOR: always
+      # Ephemeral CI-only QuestDB container: the compose file requires PG creds
+      # (prod pulls them from SSM via bootstrap.sh). The QuestDB PUBLIC defaults
+      # are fine for a throwaway CI container — same fallback deploy-aws.yml uses.
+      TV_QUESTDB_PG_USER: admin
+      TV_QUESTDB_PG_PASSWORD: quest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@67ef31d5b988238dd797d409d6f9574278e20537 # SHA-pinned (supply-chain hardening)
+        with:
+          toolchain: '1.95.0'
+
+      - name: Cache cargo
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: groww-e2e-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: groww-e2e-${{ runner.os }}-
+
+      - name: Bring up QuestDB (compose service tv-questdb only)
+        run: |
+          docker compose -f deploy/docker/docker-compose.yml up -d tv-questdb
+          echo "Waiting for QuestDB to be ready..."
+          for i in {1..60}; do
+            if curl -fsS http://127.0.0.1:9000/status >/dev/null 2>&1; then
+              echo "QuestDB ready on attempt $i"
+              break
+            fi
+            sleep 2
+          done
+          curl -fsS http://127.0.0.1:9000/status || {
+            echo "::error::QuestDB failed to come up after 120s"
+            docker compose -f deploy/docker/docker-compose.yml logs --tail=50 tv-questdb
+            exit 1
+          }
+
+      - name: Run Groww e2e (TV_REQUIRE_QDB=1 — no vacuous pass allowed)
+        run: |
+          set -o pipefail
+          TV_REQUIRE_QDB=1 cargo test -p tickvault-app \
+            --features daily_universe_fetcher \
+            --test groww_live_pipeline_e2e \
+            -- --nocapture 2>&1 | tee groww-e2e.log
+
+      - name: Assert no SKIP and >=3 PROVED lines (anti-false-OK)
+        run: |
+          if grep -q "^SKIP " groww-e2e.log; then
+            echo "::error::e2e skipped — vacuous pass forbidden (audit Rule 11)"
+            exit 1
+          fi
+          proved=$(grep -c "PROVED:" groww-e2e.log || true)
+          if [ "${proved:-0}" -lt 3 ]; then
+            echo "::error::expected >=3 PROVED lines, got ${proved:-0}"
+            exit 1
+          fi
+          echo "OK: ${proved} PROVED lines, zero SKIP lines"
+
+      - name: Tear down QuestDB
+        if: always()
+        run: docker compose -f deploy/docker/docker-compose.yml down -v
+
+      - name: Upload e2e log
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: groww-e2e-log
+          path: groww-e2e.log
+          retention-days: 14
