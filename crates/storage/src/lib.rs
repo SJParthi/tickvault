@@ -79,6 +79,13 @@ mod global_qcfg_tests {
 }
 
 pub mod boot_probe;
+// C2 (2026-07-03): HTTP-CLIENT-01 — panic-free reqwest client construction.
+// Shared OnceLock probe client for the repeating QuestDB readiness probes
+// (boot + every-5s pool watchdog + every-10s SLO scheduler); typed
+// HttpClientBuildError replaces the `unwrap_or_else(|_| Client::new())`
+// panic fallback (Client::new() panics on TLS/resolver/fd init failure —
+// a silent tokio-task death).
+pub mod http_client;
 // SP5 (parity plan, operator directive 2026-06-02 narrowed cross-verify): ONE
 // unified post-market live-vs-backtest 1m parity audit table + writer + CSV
 // (`feed` IN the DEDUP key). Merges the two former siloed modules

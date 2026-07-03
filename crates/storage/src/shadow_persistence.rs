@@ -167,10 +167,31 @@ pub async fn ensure_shadow_candle_tables(questdb_config: &QuestDbConfig) {
         "http://{}:{}/exec",
         questdb_config.host, questdb_config.http_port
     );
-    let client = Client::builder()
+    // C2 (2026-07-03): panic-free client build — Client::new() panics on
+    // TLS/resolver/fd init failure (silent tokio-task death). Degrade:
+    // skip the DDL this boot; the next boot re-runs it (idempotent), and
+    // the seal writer falls back to ring/spill on ILP errors as documented.
+    let client = match Client::builder()
         .timeout(Duration::from_secs(QUESTDB_DDL_TIMEOUT_SECS))
         .build()
-        .unwrap_or_else(|_| Client::new());
+    {
+        Ok(client) => client,
+        Err(err) => {
+            error!(
+                error = %err,
+                code = tickvault_common::error_code::ErrorCode::HttpClient01BuildFailed.code_str(),
+                "HTTP-CLIENT-01 reqwest client build failed — candle-table DDL skipped: \
+                 if a table does not exist yet, ILP auto-create will lack DEDUP keys until \
+                 the next successful boot (duplicate-row window)"
+            );
+            metrics::counter!(
+                "tv_http_client_build_failed_total",
+                "site" => "shadow_ensure_tables"
+            )
+            .increment(1);
+            return;
+        }
+    };
 
     for table in candle_table_names() {
         // Schema self-heal: candle tables created before the
@@ -420,10 +441,29 @@ pub async fn drop_legacy_candle_objects(questdb_config: &QuestDbConfig) {
         "http://{}:{}/exec",
         questdb_config.host, questdb_config.http_port
     );
-    let client = Client::builder()
+    // C2 (2026-07-03): panic-free client build — Client::new() panics on
+    // TLS/resolver/fd init failure (silent tokio-task death). Degrade:
+    // skip the legacy cleanup this boot (marker not written, so the next
+    // boot retries the sweep).
+    let client = match Client::builder()
         .timeout(Duration::from_secs(QUESTDB_DDL_TIMEOUT_SECS))
         .build()
-        .unwrap_or_else(|_| Client::new());
+    {
+        Ok(client) => client,
+        Err(err) => {
+            error!(
+                error = %err,
+                code = tickvault_common::error_code::ErrorCode::HttpClient01BuildFailed.code_str(),
+                "HTTP-CLIENT-01 reqwest client build failed — legacy candle cleanup skipped this boot"
+            );
+            metrics::counter!(
+                "tv_http_client_build_failed_total",
+                "site" => "shadow_drop_legacy"
+            )
+            .increment(1);
+            return;
+        }
+    };
 
     // 1. Drop legacy candle MATERIALIZED VIEWS FIRST — before the base
     //    table they cascade from, AND before `ensure_shadow_candle_tables`

@@ -688,6 +688,18 @@ pub enum ErrorCode {
     /// resumes on respawn. Severity::High (a supervisor that keeps dying points at
     /// a real bug), auto-triage-safe (the respawn already self-healed).
     FeedSupervisor01Respawned,
+    /// HTTP-CLIENT-01 (C2 2026-07-03) — `reqwest::ClientBuilder::build()`
+    /// failed (TLS backend init / resolver init / fd exhaustion). Previously
+    /// 8 storage sites fell back to `Client::new()`, which PANICS on the
+    /// exact same failure conditions — a silent tokio-task death (the
+    /// suspected mechanism behind the 2026-07-03 10:35 IST SLO-publisher
+    /// death during a 1.13M-frame storm). Now a typed error degrades the
+    /// single probe/write and the site logs + counts
+    /// (`tv_http_client_build_failed_total{site}`), never the process.
+    /// Severity::High, auto-triage-safe (the degrade already happened; the
+    /// operator inspects the fd/resolver pressure — cross-check
+    /// RESOURCE-01).
+    HttpClient01BuildFailed,
 }
 
 impl ErrorCode {
@@ -845,6 +857,8 @@ impl ErrorCode {
             Self::GrowwMaster01PersistFailed => "GROWW-MASTER-01",
             Self::FeedStall01SidecarRestarted => "FEED-STALL-01",
             Self::FeedSupervisor01Respawned => "FEED-SUPERVISOR-01",
+            // C2 (2026-07-03): panic-free reqwest client construction
+            Self::HttpClient01BuildFailed => "HTTP-CLIENT-01",
         }
     }
 
@@ -954,7 +968,11 @@ impl ErrorCode {
             // monitors: page at 80% so the operator acts before exhaustion.
             | Self::Resource01FdCountHigh
             | Self::Resource02ResidentMemoryHigh
-            | Self::Resource03SpillFreeLow => Severity::High,
+            | Self::Resource03SpillFreeLow
+            // HTTP-CLIENT-01 (C2 2026-07-03) — a failed client build means the
+            // host is under TLS/resolver/fd pressure; the site already
+            // degraded gracefully, but the operator must see it (High).
+            | Self::HttpClient01BuildFailed => Severity::High,
             // Medium: data pipeline correctness
             // PR #6b (2026-05-19): I-P0-01/02/04/05 retired with their modules.
             Self::InstrumentP1CrossSegmentCollision
@@ -1189,6 +1207,10 @@ impl ErrorCode {
             Self::FeedStall01SidecarRestarted | Self::FeedSupervisor01Respawned => {
                 ".claude/rules/project/feed-stall-watchdog-error-codes.md"
             }
+            // C2 (2026-07-03): panic-free reqwest client construction
+            Self::HttpClient01BuildFailed => {
+                ".claude/rules/project/http-client-error-codes.md"
+            }
         }
     }
 
@@ -1346,6 +1368,8 @@ impl ErrorCode {
             // 2026-06-30: feed-agnostic sidecar stall-watchdog + supervisor respawn
             Self::FeedStall01SidecarRestarted,
             Self::FeedSupervisor01Respawned,
+            // C2 (2026-07-03): panic-free reqwest client construction
+            Self::HttpClient01BuildFailed,
         ]
     }
 }
@@ -1632,7 +1656,10 @@ mod tests {
         // 10:35 IST mid-market; now supervised + respawned).
         // 2026-07-03 (B6 latency-histogram split): bumped 116 -> 117 for
         // TICK-FLUSH-01 (off-thread tick ILP flush worker respawned).
-        assert_eq!(ErrorCode::all().len(), 117);
+        // 2026-07-03 (C2 panic-free reqwest client): bumped 117 -> 118 for
+        // HTTP-CLIENT-01 (ClientBuilder::build failed — typed degrade
+        // replaces the Client::new() panic fallback at 8 storage sites).
+        assert_eq!(ErrorCode::all().len(), 118);
     }
 
     #[test]
@@ -1733,7 +1760,9 @@ mod tests {
                 || s.starts_with("FEED-STALL-")
                 || s.starts_with("FEED-SUPERVISOR-")
                 // Wave-4-E1 / BP-07 (2026-07-01): OOM-kill monitor.
-                || s.starts_with("PROC-");
+                || s.starts_with("PROC-")
+                // C2 (2026-07-03): panic-free reqwest client construction.
+                || s.starts_with("HTTP-CLIENT-");
             assert!(has_known_prefix, "unexpected code prefix: {s}");
         }
     }
