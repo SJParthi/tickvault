@@ -453,6 +453,26 @@ fn receipt_ist_nanos() -> i64 {
         .saturating_add(tickvault_common::constants::IST_UTC_OFFSET_NANOS)
 }
 
+/// Pure liveness-advance decision (2026-07-03 frozen-snapshot masking fix):
+/// returns `true` — and advances `prev_max` — ONLY when the max exchange
+/// timestamp seen this wake is STRICTLY greater than the max ever seen. Feed
+/// liveness (the FEED-STALL-01 watchdog's `last_tick_age_secs` input) is
+/// stamped only on `true`, so:
+/// - a frozen snapshot re-dumped forever (same exchange ts, any price) stops
+///   counting as alive → the stall watchdog fires instead of being masked;
+/// - a byte-0 re-tail REPLAY of already-seen lines (ts ≤ max) never stamps;
+/// - a healthy in-market feed (tsInMillis advances every second across the
+///   universe) stamps every wake, exactly as before.
+/// O(1), no allocation. `wake_max = 0` (no parsed lines) never advances.
+pub(crate) fn liveness_ts_advanced(prev_max: &mut i64, wake_max_exchange_ts_nanos: i64) -> bool {
+    if wake_max_exchange_ts_nanos > *prev_max {
+        *prev_max = wake_max_exchange_ts_nanos;
+        true
+    } else {
+        false
+    }
+}
+
 /// Pure per-wake read-budget decision (F3 hostile finding 2026-07-02): 0 when
 /// the retained ILP buffer is over [`GROWW_ILP_BUFFER_MAX_BYTES`] (pause
 /// consumption — the capture file is the durable spill tier, offset not
@@ -612,6 +632,14 @@ pub(crate) struct GrowwBridgeState {
     /// a crash mid-drain resumes the SAME archive from the flushed offset
     /// instead of orphaning its tail.
     active_drain_ist_day: Option<i64>,
+    /// Max exchange timestamp (ts_ist_nanos) ever seen across parsed lines this
+    /// bridge lifetime (2026-07-03 frozen-snapshot masking fix). Feed LIVENESS
+    /// is stamped ONLY when this ADVANCES: a feed re-dumping a frozen snapshot
+    /// (same exchange ts, same or changing price — the 2026-07-03 09:00:00.183
+    /// flood) must NOT count as alive, so the FEED-STALL-01 stall watchdog
+    /// (`should_restart_on_stall` via `last_tick_age_secs`) can fire instead of
+    /// being masked by duplicate re-dumps.
+    liveness_max_exchange_ts_nanos: i64,
 }
 
 impl GrowwBridgeState {
@@ -635,6 +663,7 @@ impl GrowwBridgeState {
             last_offset_persist: None,
             ilp_backpressure_active: false,
             active_drain_ist_day: None,
+            liveness_max_exchange_ts_nanos: 0,
         }
     }
 
@@ -881,6 +910,9 @@ impl GrowwBridgeState {
         // written to QuestDB, never in-memory buffer appends (the 0-rows-despite-
         // counter bug, 2026-06-29).
         let mut last_receipt_ist_nanos: i64 = 0;
+        // Max exchange ts across the lines parsed THIS wake — feeds the
+        // liveness-advance gate below (2026-07-03 frozen-snapshot fix).
+        let mut wake_max_exchange_ts_nanos: i64 = 0;
         let mut parsed_any = false;
         // Drain only COMPLETE newline-terminated lines; a trailing partial line
         // (incl. a partial UTF-8 char from the chunk boundary) stays buffered.
@@ -924,6 +956,7 @@ impl GrowwBridgeState {
                 continue;
             }
             parsed_any = true;
+            wake_max_exchange_ts_nanos = wake_max_exchange_ts_nanos.max(parsed.tick.ts_ist_nanos);
             let seq = next_capture_seq(&self.capture_seq, parsed.tick.ts_ist_nanos);
             if let Err(err) = self.live_writer.append_row(&live_tick_row(&parsed, seq)) {
                 error!(
@@ -1017,7 +1050,21 @@ impl GrowwBridgeState {
         // `last_tick_age_secs`) never mistakes a QuestDB outage for a dead
         // socket and kills the healthy Python sidecar in a restart storm. Tick
         // COUNTS stay persist-honest via record_ticks in the flush arm below.
-        if last_receipt_ist_nanos != 0 {
+        // TIMESTAMP-ADVANCING GATE (2026-07-03 live incident): stamp liveness
+        // ONLY when the max exchange ts across this wake's parsed lines ADVANCES
+        // past the max ever seen. The 09:00–09:17 IST flood (530K duplicate rows
+        // all frozen at 09:00:00.183) kept the old unconditional stamp fresh, so
+        // the FEED-STALL-01 watchdog saw a "live" feed while Groww delivered
+        // nothing new — a frozen snapshot re-dump must NOT count as alive. The
+        // stamped VALUE stays the wall-clock receipt time (consistent with the
+        // /api/feeds/health age math); a healthy feed advances tsInMillis every
+        // second across the universe, so this gate never starves on real data.
+        if last_receipt_ist_nanos != 0
+            && liveness_ts_advanced(
+                &mut self.liveness_max_exchange_ts_nanos,
+                wake_max_exchange_ts_nanos,
+            )
+        {
             feed_health.record_feed_liveness(Feed::Groww, last_receipt_ist_nanos);
         }
         if self.live_writer.pending() > 0 {
@@ -2881,6 +2928,69 @@ mod tests {
             liveness_idx < flush_idx,
             "record_feed_liveness must be stamped BEFORE (independent of) the \
              QuestDB flush — persist-coupled liveness is the bug this fixes"
+        );
+    }
+
+    #[test]
+    fn test_liveness_ts_advanced_first_tick() {
+        // First real tick from a fresh bridge (prev_max = 0) stamps liveness.
+        let mut prev = 0i64;
+        assert!(liveness_ts_advanced(&mut prev, 1_000));
+        assert_eq!(prev, 1_000);
+    }
+
+    #[test]
+    fn test_liveness_ts_advanced_frozen_ts_does_not_stamp() {
+        // The 2026-07-03 incident shape: the same exchange ts re-dumped forever
+        // (with any price) must NOT keep the feed looking alive — the stall
+        // watchdog needs the age to grow so FEED-STALL-01 can fire.
+        let mut prev = 0i64;
+        assert!(liveness_ts_advanced(&mut prev, 1_783_069_200_183_000_000));
+        for _ in 0..25 {
+            assert!(
+                !liveness_ts_advanced(&mut prev, 1_783_069_200_183_000_000),
+                "a frozen exchange ts must never re-stamp liveness"
+            );
+        }
+        assert_eq!(prev, 1_783_069_200_183_000_000);
+    }
+
+    #[test]
+    fn test_liveness_ts_advanced_replay_lower_ts_does_not_stamp() {
+        // A byte-0 re-tail replay of already-seen (older) lines is not fresh
+        // delivery; neither is a no-parsed-lines wake (wake_max = 0).
+        let mut prev = 5_000i64;
+        assert!(!liveness_ts_advanced(&mut prev, 4_999));
+        assert!(!liveness_ts_advanced(&mut prev, 0));
+        assert_eq!(prev, 5_000, "replay must not move the max backwards");
+    }
+
+    #[test]
+    fn test_liveness_ts_advanced_monotonic_updates() {
+        // A healthy in-market feed advances every wake — stamps every time.
+        let mut prev = 0i64;
+        for ts in [10i64, 20, 30, 40] {
+            assert!(liveness_ts_advanced(&mut prev, ts));
+            assert_eq!(prev, ts);
+        }
+    }
+
+    #[test]
+    fn test_liveness_gate_is_wired_into_drain() {
+        // Ratchet (2026-07-03): the parse-time record_feed_liveness call must
+        // be gated by the timestamp-advance decision — an unconditional stamp
+        // silently restores the frozen-snapshot masking bug.
+        let src = include_str!("groww_bridge.rs");
+        let gate_idx = src
+            .find("liveness_ts_advanced(\n                &mut self.liveness_max_exchange_ts_nanos")
+            .or_else(|| src.find("liveness_ts_advanced(&mut self.liveness_max_exchange_ts_nanos"))
+            .expect("the drain path must gate liveness on liveness_ts_advanced");
+        let liveness_idx = src
+            .find("feed_health.record_feed_liveness(Feed::Groww")
+            .expect("the bridge must record parse-time liveness");
+        assert!(
+            gate_idx < liveness_idx,
+            "liveness_ts_advanced must guard the record_feed_liveness stamp"
         );
     }
 }
