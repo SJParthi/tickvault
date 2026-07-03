@@ -499,7 +499,13 @@ resource "aws_iam_role_policy" "eventbridge_ec2_scheduler" {
           "arn:aws:ssm:${data.aws_region.current.name}::document/AWS-StartEC2Instance",
           "arn:aws:ssm:${data.aws_region.current.name}::document/AWS-StopEC2Instance",
           "arn:aws:ssm:${data.aws_region.current.name}::automation-definition/AWS-StartEC2Instance:*",
-          "arn:aws:ssm:${data.aws_region.current.name}::automation-definition/AWS-StopEC2Instance:*"
+          "arn:aws:ssm:${data.aws_region.current.name}::automation-definition/AWS-StopEC2Instance:*",
+          # Layer 2 (CloudTrail 2026-07-03 03:00:23Z): after the document/ ARN
+          # layer (#1323) passed, IAM ALSO evaluates the EventBridge->SSM
+          # Automation invoke against the account-scoped execution ARN being
+          # created (arn:aws:ssm:ap-south-1:<acct>:automation-execution/*).
+          # Without this entry every fire is AccessDenied -> 5 retries -> DLQ.
+          "arn:aws:ssm:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:automation-execution/*"
         ]
       },
       {
