@@ -118,7 +118,7 @@ resource "aws_security_group" "tv_app" {
   dynamic "ingress" {
     for_each = var.enable_questdb_console ? [1] : []
     content {
-      description     = "QuestDB console proxy Lambda (B4) — SG-to-SG only, never public"
+      description     = "QuestDB console proxy Lambda (B4) - SG-to-SG only, never public"
       from_port       = 9000
       to_port         = 9000
       protocol        = "tcp"
