@@ -94,6 +94,17 @@ pub fn init_prev_close_cache_dir() -> std::io::Result<()> {
 /// instrument master at boot.
 const CANARY_UNDERLYINGS: &[(u64, &str)] = &[(13, "NIFTY"), (25, "BANKNIFTY"), (51, "SENSEX")];
 
+/// B6 adversarial round 1 (HIGH-3): idle-drain cadence for the tick loop.
+///
+/// `flush_if_needed` (which drains worker-failed flush batches into the
+/// ring → spill → DLQ rescue chain AND time-flushes a partial buffer) used
+/// to run only per-frame — a flush failing after the day's LAST tick left
+/// up to 16 batches parked in RAM until graceful shutdown. The recv loop's
+/// `tokio::select!` interval arm invokes the same call at this cadence even
+/// when no frame arrives, restoring the pre-B6 bound (an inline failure hit
+/// ring → spill immediately; now ≤1s).
+const IDLE_FLUSH_DRAIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1); // APPROVED: this IS the named constant the rule asks for
+
 // Phase 4b (2026-05-05): `MOVERS_PERSIST_START_SECS_OF_DAY_IST`
 // constant DELETED — only used by the now-removed legacy
 // stock_movers / option_movers persist call block. Unified
@@ -979,7 +990,49 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
     // PR #4 (2026-05-19): `depth_seq_tracker` retired alongside the
     // deleted depth_sequence_tracker module. Depth feeds are gone.
 
-    while let Some((frame_seq, raw_frame)) = frame_receiver.recv().await {
+    // HIGH-3 (B6 adversarial round 1): worker-side spill was evaluated and
+    // rejected (the spill/DLQ machinery is `&mut TickPersistenceWriter`
+    // state — file handles, counters, disk pre-flight, ring-first ordering,
+    // mid-session reconnect drain — a worker-owned spill file would bypass
+    // the in-session recovery drain and defer every failed batch to next
+    // boot). Instead the recv loop selects over a 1s idle interval whose
+    // tick calls the SAME `flush_if_needed` (drain failed batches +
+    // time-based flush) even when no frame arrives. `biased` + recv-first
+    // preserves the frame-path semantics byte-for-byte when frames flow.
+    let mut idle_flush_interval = tokio::time::interval(IDLE_FLUSH_DRAIN_INTERVAL);
+    idle_flush_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+    loop {
+        let (frame_seq, raw_frame) = tokio::select! {
+            biased;
+            maybe_frame = frame_receiver.recv() => match maybe_frame {
+                Some(frame) => frame,
+                None => break, // channel closed — shutdown
+            },
+            _ = idle_flush_interval.tick() => {
+                if let Some(ref mut writer) = tick_writer {
+                    if let Err(err) = writer.flush_if_needed() {
+                        // Rule 5: flush/persist failures are error! (routes
+                        // to Telegram) — same treatment as the per-frame
+                        // periodic flush below.
+                        error!(
+                            ?err,
+                            "idle-interval tick flush failed — QuestDB write path broken"
+                        );
+                        metrics::counter!("tv_tick_flush_errors_total").increment(1);
+                    }
+                    // MEDIUM-4: any stall this idle drain accrued belongs to
+                    // the flush side — discard it so it can never deflate a
+                    // later frame's compute sample.
+                    let deferred_stall_ns = writer.take_last_stall_ns();
+                    if deferred_stall_ns > 0 {
+                        metrics::counter!("tv_tick_flush_deferred_stall_ns_total")
+                            .increment(deferred_stall_ns);
+                    }
+                }
+                continue;
+            }
+        };
         // TICK-SEQ-01: the read-loop `frame_seq` IS this frame's capture
         // sequence (1 frame = 1 tick — review CRITICAL #1). It is replay-stable:
         // WAL replay re-delivers the SAME frame_seq, so the persisted
@@ -1878,18 +1931,29 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
 
         // Periodic flush check (every ~100ms worth of frames)
         if last_flush_check.elapsed().as_millis() > 100 {
-            if let Some(ref mut writer) = tick_writer
-                && let Err(err) = writer.flush_if_needed()
-            {
-                // Audit finding #2 (2026-04-17): must be ERROR, not WARN —
-                // Telegram alert path is keyed on log level. A persistent
-                // flush failure means ticks are stuck in the ring buffer
-                // or spill path with no operator visibility at WARN level.
-                error!(
-                    ?err,
-                    "periodic tick flush failed — QuestDB write path broken"
-                );
-                metrics::counter!("tv_tick_flush_errors_total").increment(1);
+            if let Some(ref mut writer) = tick_writer {
+                if let Err(err) = writer.flush_if_needed() {
+                    // Audit finding #2 (2026-04-17): must be ERROR, not WARN —
+                    // Telegram alert path is keyed on log level. A persistent
+                    // flush failure means ticks are stuck in the ring buffer
+                    // or spill path with no operator visibility at WARN level.
+                    error!(
+                        ?err,
+                        "periodic tick flush failed — QuestDB write path broken"
+                    );
+                    metrics::counter!("tv_tick_flush_errors_total").increment(1);
+                }
+                // MEDIUM-4 (B6 adversarial round 1): flush_if_needed runs
+                // AFTER this iteration's compute record — the stall it
+                // accrues (failed-batch rescue, time-based flush fallback)
+                // must NOT leak into the NEXT frame's compute sample, where
+                // saturating_sub would deflate it toward a bogus 0ns.
+                // Drain + discard it into flush-side accounting.
+                let deferred_stall_ns = writer.take_last_stall_ns();
+                if deferred_stall_ns > 0 {
+                    metrics::counter!("tv_tick_flush_deferred_stall_ns_total")
+                        .increment(deferred_stall_ns);
+                }
             }
 
             // Candle-engine re-architecture #T1b: periodic candle
@@ -1977,6 +2041,36 @@ mod tests {
         assert!(
             source.contains("histogram!(\"tv_tick_processing_duration_ns\")"),
             "the total-span histogram must stay (back-compat)"
+        );
+        // MEDIUM-4 ratchet (adversarial round 1): the post-record
+        // flush_if_needed paths must DISCARD the stall they accrue
+        // (cross-iteration leak → bogus 0ns compute samples otherwise).
+        assert!(
+            source.contains("tv_tick_flush_deferred_stall_ns_total"),
+            "flush-side stall accrued after the compute record must be \
+             drained + discarded (never subtracted from the next frame)"
+        );
+    }
+
+    /// HIGH-3 ratchet (B6 adversarial round 1): the recv loop MUST select
+    /// over the 1s idle-drain interval so worker-failed flush batches are
+    /// routed to the ring → spill → DLQ rescue chain even when no frame
+    /// arrives (end-of-day / weekend). Removing the arm re-opens the
+    /// "≤16 batches parked in RAM until shutdown" gap.
+    #[test]
+    fn test_idle_flush_drain_interval_arm_present() {
+        let source = include_str!("tick_processor.rs");
+        assert!(
+            source.contains("IDLE_FLUSH_DRAIN_INTERVAL"),
+            "the idle-drain cadence must be the named constant"
+        );
+        assert!(
+            source.contains("idle_flush_interval.tick()"),
+            "the recv loop must select over the idle flush interval"
+        );
+        assert!(
+            source.contains("idle-interval tick flush failed"),
+            "the idle arm must call flush_if_needed and error! on failure"
         );
     }
 
