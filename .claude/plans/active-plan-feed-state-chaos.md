@@ -110,9 +110,10 @@ Time control: all decision fns take explicit `now_ist_nanos` / `market_open` /
 
 ## Test Plan
 
-File: `crates/app/tests/chaos_feed_state_matrix.rs` — 8 `#[test]` fns (7 permutations +
-1 meta-ratchet), all plain tests, no Docker, no network, no `#[ignore]`, temp dirs
-cleaned up (chaos_tmp idiom from `chaos_ws_frame_spill_saturation.rs`).
+File: `crates/app/tests/chaos_feed_state_matrix.rs` — 9 `#[test]` fns (7 permutations +
+1 zero-slack meta-ratchet + 1 Groww-residual source pin), all plain tests, no Docker,
+no network, no `#[ignore]`, temp dirs cleaned up (chaos_tmp idiom from
+`chaos_ws_frame_spill_saturation.rs`).
 
 Run: `cargo test -p tickvault-app --test chaos_feed_state_matrix` (plus the full
 `cargo test -p tickvault-app` scoped suite, fmt, clippy, banned-pattern scanner,
@@ -122,17 +123,18 @@ Verification evidence (REAL output, 2026-07-03,
 `cargo test -p tickvault-app --test chaos_feed_state_matrix`):
 
 ```
-running 8 tests
+running 9 tests
 test chaos_matrix_completeness_ratchet_all_7_permutations_iterate_feed_all ... ok
 test chaos_perm1_silent_feed_watchdog_fires_ledger_balanced_wal_recovers ... ok
 test chaos_perm3_same_price_advancing_healthy_no_false_positive ... ok
 test chaos_perm2_frozen_timestamp_duplicates_watchdog_quiet_all_duplicates_durable ... ok
-test chaos_perm5_partial_universe_feed_level_liveness_no_false_kill ... ok
 test chaos_perm6_late_resume_at_market_open_never_fires_pre_open ... ok
+test chaos_perm5_partial_universe_feed_level_liveness_no_false_kill ... ok
+test groww_residual_derivation_source_pin_matches_test_arithmetic ... ok
 test chaos_perm7_process_down_mid_market_replay_recovers_partial_never_balanced ... ok
 test chaos_perm4_flooding_burst_absorbed_storm_bounded_leak_reported_honestly ... ok
 
-test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.21s
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.21s
 ```
 
 Also green: `cargo fmt --check`; `bash .claude/hooks/banned-pattern-scanner.sh` (exit 0);
@@ -155,6 +157,24 @@ classify Balanced — the WAL lane pages it as Leak
   left: Leak
  right: Balanced
 test result: FAILED. 7 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.55s
+```
+
+Negative proof #2 (adversarial-review HIGH fix — zero-slack meta-ratchet, REAL
+sabotage evidence): temporarily de-generalized perm 3's loop to a single-feed
+array (`for &feed in &[Feed::Dhan]`); the per-body meta-ratchet failed as
+required (a global occurrence count would have stayed green), then the
+sabotage was reverted and the suite re-ran green:
+
+```
+thread 'chaos_matrix_completeness_ratchet_all_7_permutations_iterate_feed_all' (9969)
+panicked at crates/app/tests/chaos_feed_state_matrix.rs:964:9:
+assertion `left == right` failed: zero-slack ratchet: permutation
+`chaos_perm3_same_price_advancing_healthy_no_false_positive` must iterate Feed::ALL
+exactly once in its own body (found 0) — a de-generalized single-feed loop or a
+duplicated loop both break the feed-agnostic contract
+  left: 0
+ right: 1
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 8 filtered out; finished in 0.43s
 ```
 
 ## Rollback
@@ -216,6 +236,19 @@ operational validation, not by this matrix.
 - [x] Item 3 — Verification battery + negative sabotage proof recorded in this plan
   - Files: .claude/plans/active-plan-feed-state-chaos.md
   - Tests: N/A (evidence capture — real outputs pasted in Test Plan above)
+
+- [x] Item 4 — Adversarial-review hardening (1 HIGH + 3 MEDIUM + 2 LOW): zero-slack
+  per-body meta-ratchet (each permutation body must contain the `Feed::ALL` iteration
+  exactly once — global-count slack removed, negative proof #2 above); Groww
+  delivery-residual source-scan pin against the non-exported orchestrator expression;
+  independent NDJSON recovery signal (capture-time count with the producer handle held,
+  post-death recount from a freshly copied file; tuple renamed
+  `persisted_at_capture`/`recovered_after_reopen`); storm window-edge pins (Δ==WINDOW
+  still in-window → trips, Δ==WINDOW+1 → fresh window); tautological perm-5
+  universe-size assert removed; FEED_STALE_TICK_SECS verdict boundary pinned
+  independently of FEED_STALL_RESTART_SECS (Ok at threshold, Down at threshold+1)
+  - Files: crates/app/tests/chaos_feed_state_matrix.rs
+  - Tests: groww_residual_derivation_source_pin_matches_test_arithmetic, chaos_matrix_completeness_ratchet_all_7_permutations_iterate_feed_all
 
 ## Scenarios
 

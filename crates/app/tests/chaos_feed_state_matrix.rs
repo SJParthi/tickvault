@@ -52,7 +52,7 @@ use tickvault_app::tick_conservation_boot::{
 };
 use tickvault_common::constants::RESPONSE_CODE_TICKER;
 use tickvault_common::feed::Feed;
-use tickvault_common::feed_health::{FeedHealthRegistry, FeedHealthVerdict};
+use tickvault_common::feed_health::{FEED_STALE_TICK_SECS, FeedHealthRegistry, FeedHealthVerdict};
 use tickvault_storage::tick_conservation_audit_persistence::ConservationOutcome;
 use tickvault_storage::ws_frame_spill::{
     AppendOutcome, WsFrameSpill, WsType, confirm_replayed, count_frames_for_ist_day,
@@ -161,7 +161,10 @@ fn durable_floor(feed: Feed) -> DurableFloor {
 
 /// Write `n` synthetic NDJSON tick lines for `NDJSON_TARGET_DAY` and fsync.
 /// `advance_ts=false` models frozen (duplicate) exchange timestamps.
-fn write_ndjson_ticks(path: &Path, n: u64, advance_ts: bool) {
+/// Returns the STILL-OPEN producer handle so the caller controls the
+/// process-death boundary explicitly (`drop(handle)` = the crash instant).
+#[must_use]
+fn write_ndjson_ticks(path: &Path, n: u64, advance_ts: bool) -> std::fs::File {
     let base = ndjson_day_base(NDJSON_TARGET_DAY);
     let mut f = std::fs::File::create(path).expect("ndjson create");
     for i in 0..n {
@@ -173,16 +176,19 @@ fn write_ndjson_ticks(path: &Path, n: u64, advance_ts: bool) {
         writeln!(f, "{{\"ts_ist_nanos\": {ts}}}").expect("ndjson write");
     }
     f.sync_all().expect("ndjson fsync");
+    f
 }
 
 /// Capture `n` synthetic ticks onto `feed`'s durable floor in `dir` (WAL
-/// payloads built by `wal_payload`), simulate process death (drop every writer
-/// handle), then recover through the feed's REAL pub recovery surface.
-/// Returns `(delivered, recovered)`:
-///   - `delivered` = the per-day durable count the conservation audit consumes
-///     (`count_frames_for_ist_day(..).tick_frames` / NDJSON per-day line count)
-///   - `recovered` = the frames handed back on restart (`replay_all` count /
-///     the crash-stable NDJSON re-read — see the `DurableFloor::Ndjson` docs).
+/// payloads built by `wal_payload`), then simulate process death and recover
+/// through the feed's REAL pub recovery surface. Returns
+/// `(persisted_at_capture, recovered_after_reopen)` — two INDEPENDENT signals:
+///   - `persisted_at_capture` = the per-day durable count taken while the
+///     producer is still ALIVE (writer thread / open NDJSON handle held);
+///   - `recovered_after_reopen` = the count handed back AFTER the death
+///     boundary through a fresh path (`replay_all` post-drop / a recount from
+///     a freshly copied NDJSON file — fresh inode, fresh open), so a cached
+///     or still-held handle can never satisfy the recovery assertion.
 fn capture_then_recover_with(
     feed: Feed,
     dir: &Path,
@@ -208,20 +214,30 @@ fn capture_then_recover_with(
             );
             let persisted = wait_until_persisted_at_least(&spill, n, Duration::from_secs(15));
             assert_eq!(persisted, n, "writer must persist every enqueued frame");
-            drop(spill); // simulated process death: writer joined, segments fsynced
+            // Capture-time signal: read-only per-day scan while the writer is
+            // still alive (documented safe against a live appender).
+            let persisted_at_capture = count_frames_for_ist_day(dir, day).tick_frames;
+            drop(spill); // process death: writer joined, segments fsynced
 
-            let delivered = count_frames_for_ist_day(dir, day).tick_frames;
-            let recovered = replay_all(dir).expect("replay after crash").len() as u64;
-            (delivered, recovered)
+            let recovered_after_reopen = replay_all(dir).expect("replay after crash").len() as u64;
+            (persisted_at_capture, recovered_after_reopen)
         }
         DurableFloor::Ndjson => {
             // No WAL on this feed (honest envelope — see DurableFloor::Ndjson).
             let path = dir.join("ticks.ndjson");
-            write_ndjson_ticks(&path, n, true);
-            // File handle dropped above = the crash boundary; fsync'd lines survive.
-            let delivered = count_groww_ndjson_lines_for_ist_day(&path, NDJSON_TARGET_DAY);
-            let recovered = count_groww_ndjson_lines_for_ist_day(&path, NDJSON_TARGET_DAY);
-            (delivered, recovered)
+            let producer_handle = write_ndjson_ticks(&path, n, true);
+            // Capture-time signal: producer handle still held (process alive).
+            let persisted_at_capture =
+                count_groww_ndjson_lines_for_ist_day(&path, NDJSON_TARGET_DAY);
+            drop(producer_handle); // process-death boundary
+            // Independent recovery signal: recount AFTER the death boundary from
+            // a freshly copied file (fresh inode + fresh open) — proves the
+            // on-disk BYTES carry the recovery, not any held handle or cache.
+            let reopened = dir.join("ticks-reopened.ndjson");
+            std::fs::copy(&path, &reopened).expect("durable bytes must survive the restart copy");
+            let recovered_after_reopen =
+                count_groww_ndjson_lines_for_ist_day(&reopened, NDJSON_TARGET_DAY);
+            (persisted_at_capture, recovered_after_reopen)
         }
     }
 }
@@ -312,12 +328,22 @@ fn chaos_perm1_silent_feed_watchdog_fires_ledger_balanced_wal_recovers() {
             false,
             FEED_STALL_RESTART_SECS
         ));
-        // The verdict engine agrees: silent during market hours = Down.
-        let report = reg.snapshot(feed, true, true, true, now);
+        // The verdict engine's OWN stale boundary, pinned INDEPENDENTLY of the
+        // restart threshold via FEED_STALE_TICK_SECS (strict >): age == stale
+        // threshold is still Ok; one second past is Down. Changing either
+        // constant breaks exactly the assertions that reference it by name.
+        let at_stale = T0 + secs_nanos(FEED_STALE_TICK_SECS);
         assert_eq!(
-            report.verdict,
+            reg.snapshot(feed, true, true, true, at_stale).verdict,
+            FeedHealthVerdict::Ok,
+            "feed {}: age == FEED_STALE_TICK_SECS is not yet stale (strict >)",
+            feed.as_str()
+        );
+        assert_eq!(
+            reg.snapshot(feed, true, true, true, at_stale + NANOS_PER_SEC)
+                .verdict,
             FeedHealthVerdict::Down,
-            "feed {}: in-market silence past the stale threshold must report Down",
+            "feed {}: age == FEED_STALE_TICK_SECS + 1 in-market must report Down",
             feed.as_str()
         );
 
@@ -325,16 +351,21 @@ fn chaos_perm1_silent_feed_watchdog_fires_ledger_balanced_wal_recovers() {
         // the identity closes → Balanced.
         let dir = chaos_tmp(&format!("perm1-{}", feed.as_str()));
         const N: u64 = 64;
-        let (delivered, recovered) = capture_then_recover(feed, &dir, N);
+        let (persisted_at_capture, recovered_after_reopen) = capture_then_recover(feed, &dir, N);
         assert_eq!(
-            delivered,
+            persisted_at_capture,
             N,
             "feed {}: durable per-day count",
             feed.as_str()
         );
-        assert_eq!(recovered, N, "feed {}: crash recovery count", feed.as_str());
         assert_eq!(
-            classify_ledger_for_feed(feed, delivered, 0, &balanced_counters(N), false),
+            recovered_after_reopen,
+            N,
+            "feed {}: crash recovery count",
+            feed.as_str()
+        );
+        assert_eq!(
+            classify_ledger_for_feed(feed, persisted_at_capture, 0, &balanced_counters(N), false),
             ConservationOutcome::Balanced,
             "feed {}: wal==processed==persisted must classify Balanced",
             feed.as_str()
@@ -401,7 +432,7 @@ fn chaos_perm2_frozen_timestamp_duplicates_watchdog_quiet_all_duplicates_durable
             DurableFloor::Ndjson => {
                 // Identical-ts lines: each duplicate is its own durable line.
                 let path = dir.join("ticks.ndjson");
-                write_ndjson_ticks(&path, DUPES, false);
+                drop(write_ndjson_ticks(&path, DUPES, false)); // crash boundary
                 assert_eq!(
                     count_groww_ndjson_lines_for_ist_day(&path, NDJSON_TARGET_DAY),
                     DUPES,
@@ -481,12 +512,15 @@ fn chaos_perm3_same_price_advancing_healthy_no_false_positive() {
         );
 
         let dir = chaos_tmp(&format!("perm3-{}", feed.as_str()));
-        let (delivered, recovered) =
+        let (persisted_at_capture, recovered_after_reopen) =
             capture_then_recover_with(feed, &dir, N, flat_price_ticker_frame);
-        assert_eq!(delivered, N);
-        assert_eq!(recovered, N, "every flat-price frame must be recovered");
+        assert_eq!(persisted_at_capture, N);
         assert_eq!(
-            classify_ledger_for_feed(feed, delivered, 0, &balanced_counters(N), false),
+            recovered_after_reopen, N,
+            "every flat-price frame must be recovered after the reopen"
+        );
+        assert_eq!(
+            classify_ledger_for_feed(feed, persisted_at_capture, 0, &balanced_counters(N), false),
             ConservationOutcome::Balanced
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -536,11 +570,40 @@ fn chaos_perm4_flooding_burst_absorbed_storm_bounded_leak_reported_honestly() {
         );
         assert_eq!(storm.count_in_window(), 1);
 
+        // (a'') window-EDGE pins — production resets on `now − start > WINDOW`,
+        // so Δ == WINDOW is still INSIDE the window (storm can trip) and
+        // Δ == WINDOW + 1 starts a fresh window (no storm). Pin BOTH sides.
+        let mut edge_in = StallRestartStorm::default();
+        let w0 = STALL_RESTART_STORM_WINDOW_SECS + 1;
+        assert!(!edge_in.record_and_is_storm(w0)); // fresh window, count = 1
+        for k in 1..u64::from(STALL_RESTART_STORM_MAX) {
+            assert!(!edge_in.record_and_is_storm(w0 + k)); // counts 2..=MAX
+        }
+        assert!(
+            edge_in.record_and_is_storm(w0 + STALL_RESTART_STORM_WINDOW_SECS),
+            "Δ == STALL_RESTART_STORM_WINDOW_SECS exactly is still INSIDE the \
+             window — the storm MUST trip on this restart"
+        );
+        let mut edge_out = StallRestartStorm::default();
+        assert!(!edge_out.record_and_is_storm(w0));
+        for k in 1..u64::from(STALL_RESTART_STORM_MAX) {
+            assert!(!edge_out.record_and_is_storm(w0 + k));
+        }
+        assert!(
+            !edge_out.record_and_is_storm(w0 + STALL_RESTART_STORM_WINDOW_SECS + 1),
+            "Δ == STALL_RESTART_STORM_WINDOW_SECS + 1 starts a FRESH window — no storm"
+        );
+        assert_eq!(edge_out.count_in_window(), 1);
+
         // (c) the durable floor absorbs the whole burst — zero drops, all recovered.
         let dir = chaos_tmp(&format!("perm4-{}", feed.as_str()));
-        let (delivered, recovered) = capture_then_recover(feed, &dir, BURST);
-        assert_eq!(delivered, BURST);
-        assert_eq!(recovered, BURST, "the burst must replay in full");
+        let (persisted_at_capture, recovered_after_reopen) =
+            capture_then_recover(feed, &dir, BURST);
+        assert_eq!(persisted_at_capture, BURST);
+        assert_eq!(
+            recovered_after_reopen, BURST,
+            "the burst must replay in full"
+        );
 
         // (b) HONESTY: `lost` ticks vanish from the processor view. The verdict
         // must surface the residual — NEVER a false Balanced.
@@ -606,19 +669,24 @@ fn chaos_perm5_partial_universe_feed_level_liveness_no_false_kill() {
         );
 
         let dir = chaos_tmp(&format!("perm5-{}", feed.as_str()));
-        let (delivered, recovered) = capture_then_recover(feed, &dir, ARRIVED);
-        assert_eq!(delivered, ARRIVED);
+        let (persisted_at_capture, recovered_after_reopen) =
+            capture_then_recover(feed, &dir, ARRIVED);
+        // Recovery is judged against what ARRIVED (the captured subset of
+        // STREAMING_SIDS × TICKS_PER_STREAMING_SID), NEVER against a
+        // universe-sized (UNIVERSE_SIDS × per-SID) expectation.
+        assert_eq!(persisted_at_capture, ARRIVED);
         assert_eq!(
-            recovered, ARRIVED,
+            recovered_after_reopen, ARRIVED,
             "recovery must match what ARRIVED — the captured subset"
         );
-        assert_ne!(
-            recovered,
-            UNIVERSE_SIDS * TICKS_PER_STREAMING_SID,
-            "recovery must never be judged against a universe-sized expectation"
-        );
         assert_eq!(
-            classify_ledger_for_feed(feed, delivered, 0, &balanced_counters(ARRIVED), false),
+            classify_ledger_for_feed(
+                feed,
+                persisted_at_capture,
+                0,
+                &balanced_counters(ARRIVED),
+                false
+            ),
             ConservationOutcome::Balanced,
             "feed {}: Balanced for what arrived — honesty here means NOT claiming loss",
             feed.as_str()
@@ -690,15 +758,15 @@ fn chaos_perm6_late_resume_at_market_open_never_fires_pre_open() {
         // vouch → Partial even with ZERO residuals (never a false Balanced).
         let dir = chaos_tmp(&format!("perm6-{}", feed.as_str()));
         const N: u64 = 32;
-        let (delivered, recovered) = capture_then_recover(feed, &dir, N);
-        assert_eq!(delivered, N);
-        assert_eq!(recovered, N);
+        let (persisted_at_capture, recovered_after_reopen) = capture_then_recover(feed, &dir, N);
+        assert_eq!(persisted_at_capture, N);
+        assert_eq!(recovered_after_reopen, N);
         assert_eq!(
-            classify_ledger_for_feed(feed, delivered, 0, &balanced_counters(N), false),
+            classify_ledger_for_feed(feed, persisted_at_capture, 0, &balanced_counters(N), false),
             ConservationOutcome::Balanced
         );
         assert_eq!(
-            classify_ledger_for_feed(feed, delivered, 0, &balanced_counters(N), true),
+            classify_ledger_for_feed(feed, persisted_at_capture, 0, &balanced_counters(N), true),
             ConservationOutcome::Partial,
             "feed {}: partial coverage must win over zero residuals",
             feed.as_str()
@@ -817,7 +885,7 @@ fn chaos_perm7_process_down_mid_market_replay_recovers_partial_never_balanced() 
                 // audit trusts: exact + stable across process-death re-reads, and
                 // append-only across a re-open (the restart appends, never rewrites).
                 let path = dir.join("ticks.ndjson");
-                write_ndjson_ticks(&path, N, true);
+                drop(write_ndjson_ticks(&path, N, true)); // process-death boundary
                 let first = count_groww_ndjson_lines_for_ist_day(&path, NDJSON_TARGET_DAY);
                 let second = count_groww_ndjson_lines_for_ist_day(&path, NDJSON_TARGET_DAY);
                 assert_eq!(first, N);
@@ -849,11 +917,15 @@ fn chaos_perm7_process_down_mid_market_replay_recovers_partial_never_balanced() 
 
 // ───────────────────────────── META-RATCHET ─────────────────────────────────
 
-/// Matrix-completeness ratchet: (1) all 7 permutation tests exist by exact
-/// name; (2) every permutation iterates `Feed::ALL`; (3) ZERO quoted
-/// feed-label string literals appear in this file (the banned patterns are
-/// built at runtime from `Feed::ALL` so this meta test cannot self-match).
-/// Deleting/renaming a permutation, or hardcoding a feed label, fails the build.
+/// Matrix-completeness ratchet, ZERO-SLACK: (1) all 7 permutation tests exist
+/// by exact name; (2) EACH permutation's OWN BODY (the source region from its
+/// `fn` up to the next `#[test]`) contains the `Feed::ALL` iteration exactly
+/// once — a global count would let a permutation be silently de-generalized to
+/// a single-feed array while other occurrences keep the total high; (3) ZERO
+/// quoted feed-label string literals appear in this file (the banned patterns
+/// are built at runtime from `Feed::ALL` so this meta test cannot self-match).
+/// Deleting/renaming a permutation, de-generalizing one, or hardcoding a feed
+/// label fails the build.
 #[test]
 fn chaos_matrix_completeness_ratchet_all_7_permutations_iterate_feed_all() {
     let path = concat!(
@@ -871,21 +943,32 @@ fn chaos_matrix_completeness_ratchet_all_7_permutations_iterate_feed_all() {
         "chaos_perm6_late_resume_at_market_open_never_fires_pre_open",
         "chaos_perm7_process_down_mid_market_replay_recovers_partial_never_balanced",
     ];
+    // Built at runtime so the pattern never self-matches in this meta test's
+    // own body (which is deliberately NOT one of the scanned regions anyway).
+    let feed_all_iter = format!("for &feed in {}::ALL", "Feed");
     for name in PERMUTATION_TESTS {
-        assert!(
-            src.contains(&format!("fn {name}()")),
-            "matrix incomplete: permutation test `{name}` is missing — every \
-             feed-state permutation must stay covered"
+        let fn_marker = format!("fn {name}()");
+        let start = src.find(&fn_marker).unwrap_or_else(|| {
+            panic!(
+                "matrix incomplete: permutation test `{name}` is missing — every \
+                 feed-state permutation must stay covered"
+            )
+        });
+        // Body region = from this fn to the next `#[test]` (or EOF for the last).
+        let rest = &src[start..];
+        let end = rest[fn_marker.len()..]
+            .find("#[test]")
+            .map_or(rest.len(), |i| i + fn_marker.len());
+        let body = &rest[..end];
+        let loops_in_body = body.matches(&feed_all_iter).count();
+        assert_eq!(
+            loops_in_body, 1,
+            "zero-slack ratchet: permutation `{name}` must iterate Feed::ALL \
+             exactly once in its own body (found {loops_in_body}) — a \
+             de-generalized single-feed loop or a duplicated loop both break \
+             the feed-agnostic contract"
         );
     }
-
-    let feed_all_loops = src.matches("for &feed in Feed::ALL").count();
-    assert!(
-        feed_all_loops >= PERMUTATION_TESTS.len(),
-        "every permutation test must iterate Feed::ALL (found {feed_all_loops} \
-         loops for {} permutations)",
-        PERMUTATION_TESTS.len()
-    );
 
     for &feed in Feed::ALL {
         let banned = format!("\"{}\"", feed.as_str());
@@ -896,4 +979,43 @@ fn chaos_matrix_completeness_ratchet_all_7_permutations_iterate_feed_all() {
              `match feed` arms are the only allowed feed naming"
         );
     }
+}
+
+/// Source-scan pin for the ONE piece of arithmetic this file derives instead
+/// of calling: the Groww lane's delivery residual. The production derivation
+/// lives INLINE in the non-exported `run_groww_tick_conservation_audit`
+/// (crates/app/src/tick_conservation_boot.rs) as
+/// `ndjson_lines − db_rows` feeding `classify_groww_outcome(delivery_residual,
+/// partial_coverage)`. `classify_ledger_for_feed` above derives the classifier
+/// INPUT with the same subtraction — this pin makes any drift in the
+/// production expression a build failure, so the test arithmetic can never
+/// silently diverge from the orchestrator it models. Whitespace-normalized so
+/// rustfmt line-wrapping cannot false-fail it. No src file is modified.
+#[test]
+fn groww_residual_derivation_source_pin_matches_test_arithmetic() {
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/src/tick_conservation_boot.rs");
+    let src = std::fs::read_to_string(path).expect("read tick_conservation_boot.rs");
+    let collapsed = src.split_whitespace().collect::<Vec<_>>().join(" ");
+
+    let pinned_residual = "let delivery_residual = i64::try_from(ndjson_lines) \
+                           .unwrap_or(i64::MAX) \
+                           .saturating_sub(groww_db_rows.max(0));";
+    let pinned_collapsed = pinned_residual
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        collapsed.contains(&pinned_collapsed),
+        "the Groww orchestrator's delivery-residual derivation \
+         (`ndjson_lines − db_rows`) has drifted from the expression \
+         `classify_ledger_for_feed` in this file derives — update BOTH in the \
+         same commit (the chaos matrix models the orchestrator's classifier \
+         input; drift here makes the matrix assert the wrong contract)"
+    );
+    assert!(
+        collapsed.contains("classify_groww_outcome(delivery_residual, partial_coverage)"),
+        "the Groww orchestrator no longer feeds its delivery residual into \
+         classify_groww_outcome(delivery_residual, partial_coverage) — the \
+         matrix's ledger-honesty assertions model exactly that call"
+    );
 }
