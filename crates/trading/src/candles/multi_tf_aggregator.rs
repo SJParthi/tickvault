@@ -569,6 +569,48 @@ impl MultiTfAggregator {
         }
     }
 
+    /// Session-scoped force-seal (close-time force-seal, 2026-07-03).
+    ///
+    /// Identical to [`Self::force_seal_all`] EXCEPT it SKIPS instruments in
+    /// the `always_on` exemption set (operator lock 2026-06-01 §30 — e.g.
+    /// GIFT Nifty's ~21h session). Used by the 15:30:05 IST close-time
+    /// force-seal task in `crates/app/src/main.rs` (Task 3b) so the final
+    /// NSE session buckets (the 15:29 M1 bar and every TF's last bucket)
+    /// seal + flush the same day instead of waiting for the IST-midnight
+    /// backstop — which the daily 16:30 IST instance auto-stop destroys.
+    ///
+    /// Why always-on instruments MUST be skipped here: their session
+    /// continues past the NSE 15:30 close, so force-sealing them at
+    /// 15:30:05 would truncate the open bucket; the later boundary re-seal
+    /// of the SAME bucket would then DEDUP-UPSERT a candle missing the
+    /// pre-seal ticks. Only the IST-midnight `force_seal_all` (the day
+    /// boundary) seals always-on cells.
+    ///
+    /// Idempotent vs the midnight seal: `force_seal` on an emptied slot
+    /// returns `None`, so the midnight pass double-flushes nothing; any
+    /// duplicate row is absorbed by the candle tables' DEDUP UPSERT KEYS.
+    ///
+    /// `O(N × 21)` where N = number of instruments (flagged O(N) honestly —
+    /// cold path, runs once per trading day, never per tick).
+    pub fn force_seal_all_session_scoped<F>(&self, mut on_seal: F)
+    where
+        F: FnMut(u64, u8, TfIndex, LiveCandleState),
+    {
+        let pin = self.inner.pin();
+        for (key, entry) in pin.iter() {
+            // O(1) EXEMPT: `always_on` is a HashSet — contains is O(1) hashing.
+            if self.always_on.contains(key) {
+                continue;
+            }
+            let (security_id, segment_code) = *key;
+            for tf in TfIndex::ALL {
+                if let Some(sealed) = entry.cell.force_seal(tf) {
+                    on_seal(security_id, segment_code, tf, sealed);
+                }
+            }
+        }
+    }
+
     /// Watermark-aware catch-up seal across every instrument × 21 TFs
     /// (BOUNDARY-01, 2026-07-03). Mirrors [`Self::force_seal_all`]'s papaya
     /// iteration but calls [`AggregatorCell::catch_up_seal`] per slot, so a
@@ -786,6 +828,154 @@ mod tests {
         assert!(
             !entry.cell.snapshot(TfIndex::ALL[0]).is_uninitialised(),
             "exempt GIFT Nifty tick outside the window MUST aggregate"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Session-gate boundary ratchets (operator rule 2026-07-03): the
+    // regular session is [09:15:00 IST inclusive, 15:30:00 exclusive) on
+    // the EXCHANGE timestamp — 09:14:59 rejected, 09:15:00 accepted —
+    // and a pre-market tick must NEVER become the 09:15 candle's open.
+    // ------------------------------------------------------------------
+
+    /// Day-aligned IST epoch base (multiple of 86_400) for exact
+    /// seconds-of-day arithmetic. 09:15:00 IST = base + 33_300.
+    const GATE_DAY_BASE: u32 = 1_779_321_600;
+
+    #[test]
+    fn test_session_gate_boundary_091459_rejected_091500_accepted_dhan() {
+        let agg = MultiTfAggregator::new();
+        agg.pre_populate(vec![(13, 0)]);
+        // 09:14:59.xxx (secs-of-day 33_299) — one second BEFORE open: rejected.
+        let pre = mk_tick(13, 0, GATE_DAY_BASE + 33_299, 99.0, 10, 0);
+        agg.consume_tick(&pre, 0, FeedStrategy::DHAN, None, |_, _| {});
+        let entry = agg.get(13, 0).expect("present");
+        assert!(
+            entry.cell.snapshot(TfIndex::M1).is_uninitialised(),
+            "09:14:59 tick must NOT open any candle bucket"
+        );
+        // 09:15:00.000 exactly (secs-of-day 33_300) — inclusive open: accepted.
+        let open = mk_tick(13, 0, GATE_DAY_BASE + 33_300, 100.5, 10, 0);
+        agg.consume_tick(&open, 0, FeedStrategy::DHAN, None, |_, _| {});
+        let snap = entry.cell.snapshot(TfIndex::M1);
+        assert!(
+            !snap.is_uninitialised(),
+            "09:15:00 exactly must open the first candle bucket"
+        );
+        assert_eq!(
+            snap.open, 100.5,
+            "the 09:15 candle open must be the 09:15:00 tick's LTP"
+        );
+    }
+
+    #[test]
+    fn test_session_gate_boundary_091459_rejected_091500_accepted_groww() {
+        // Same boundary via the Groww strategy + cumulative-volume override
+        // (a Groww ms timestamp 09:14:59.999 floors to secs-of-day 33_299
+        // in the bridge's build_parsed_tick, so this pins that path too).
+        let agg = MultiTfAggregator::new();
+        agg.pre_populate(vec![(1_333, 1)]);
+        agg.seed_cumulative(1_333, 1, 100);
+        let pre = mk_tick(1_333, 1, GATE_DAY_BASE + 33_299, 99.0, 0, 0);
+        agg.consume_tick(&pre, 1, FeedStrategy::GROWW, Some(100), |_, _| {});
+        let entry = agg.get(1_333, 1).expect("present");
+        assert!(
+            entry.cell.snapshot(TfIndex::M1).is_uninitialised(),
+            "Groww 09:14:59 tick must NOT open any candle bucket"
+        );
+        let open = mk_tick(1_333, 1, GATE_DAY_BASE + 33_300, 100.5, 0, 0);
+        agg.consume_tick(&open, 1, FeedStrategy::GROWW, Some(150), |_, _| {});
+        let snap = entry.cell.snapshot(TfIndex::M1);
+        assert!(
+            !snap.is_uninitialised(),
+            "Groww 09:15:00 exactly must open the first candle bucket"
+        );
+        assert_eq!(
+            snap.open, 100.5,
+            "the Groww 09:15 candle open must be the 09:15:00 tick's LTP"
+        );
+    }
+
+    #[test]
+    fn test_session_gate_close_boundary_152959_accepted_153000_rejected() {
+        // Close boundary is EXCLUSIVE: 15:29:59 folds, 15:30:00 is rejected.
+        let agg = MultiTfAggregator::new();
+        agg.pre_populate(vec![(13, 0)]);
+        let last_in = mk_tick(13, 0, GATE_DAY_BASE + 55_799, 102.0, 10, 0);
+        agg.consume_tick(&last_in, 0, FeedStrategy::DHAN, None, |_, _| {});
+        let entry = agg.get(13, 0).expect("present");
+        let snap_before = entry.cell.snapshot(TfIndex::M1);
+        assert!(
+            !snap_before.is_uninitialised(),
+            "15:29:59 tick must fold into the final session minute"
+        );
+        let tick_count_before = snap_before.tick_count;
+        // 15:30:00 exactly — must NOT fold (exclusive close) and must not
+        // seal-and-reopen a post-close bucket.
+        let at_close = mk_tick(13, 0, GATE_DAY_BASE + 55_800, 999.0, 10, 0);
+        agg.consume_tick(&at_close, 0, FeedStrategy::DHAN, None, |_, _| {});
+        let snap_after = entry.cell.snapshot(TfIndex::M1);
+        assert_eq!(
+            snap_after.tick_count, tick_count_before,
+            "15:30:00 tick must be rejected (exclusive close boundary)"
+        );
+        assert_ne!(
+            snap_after.close, 999.0,
+            "the 15:30:00 tick's price must not leak into any candle"
+        );
+    }
+
+    #[test]
+    fn test_pre_market_tick_never_becomes_0915_open_groww() {
+        // Groww mirror of the purity test: a pre-market tick (09:10) with a
+        // different price, then the first regular tick at 09:15:01 — the
+        // M1 open MUST be the 09:15:01 price under LatePolicy::Discard too.
+        let agg = MultiTfAggregator::new();
+        agg.pre_populate(vec![(1_333, 1)]);
+        agg.seed_cumulative(1_333, 1, 100);
+        let pre_market = mk_tick(1_333, 1, GATE_DAY_BASE + 9 * 3600 + 10 * 60, 90.0, 0, 0);
+        agg.consume_tick(&pre_market, 1, FeedStrategy::GROWW, Some(100), |_, _| {});
+        let first_regular = mk_tick(1_333, 1, GATE_DAY_BASE + 33_301, 101.25, 0, 0);
+        agg.consume_tick(&first_regular, 1, FeedStrategy::GROWW, Some(120), |_, _| {});
+        let entry = agg.get(1_333, 1).expect("present");
+        let snap = entry.cell.snapshot(TfIndex::M1);
+        assert_eq!(
+            snap.open, 101.25,
+            "the Groww 09:15 candle open must be the first REGULAR-session \
+             tick's price, never the pre-market price"
+        );
+        assert_eq!(
+            snap.tick_count, 1,
+            "the Groww pre-market tick must not fold into the 09:15 bucket"
+        );
+    }
+
+    #[test]
+    fn test_pre_market_tick_never_becomes_0915_open() {
+        // A pre-market tick at 09:10 carrying a DIFFERENT price, followed by
+        // the first regular-session tick at 09:15:01 — the 09:15 M1 candle's
+        // open MUST be the 09:15:01 price, and the pre-market tick must not
+        // have folded into the bucket at all (tick_count == 1).
+        let agg = MultiTfAggregator::new();
+        agg.pre_populate(vec![(13, 0)]);
+        let pre_market = mk_tick(13, 0, GATE_DAY_BASE + 9 * 3600 + 10 * 60, 90.0, 10, 0);
+        agg.consume_tick(&pre_market, 0, FeedStrategy::DHAN, None, |_, _| {});
+        let first_regular = mk_tick(13, 0, GATE_DAY_BASE + 33_301, 101.25, 20, 0);
+        agg.consume_tick(&first_regular, 0, FeedStrategy::DHAN, None, |_, _| {});
+        let entry = agg.get(13, 0).expect("present");
+        let snap = entry.cell.snapshot(TfIndex::M1);
+        assert_eq!(
+            snap.open, 101.25,
+            "the 09:15 candle open must be the first REGULAR-session tick's \
+             price, never the pre-market price"
+        );
+        assert_eq!(
+            snap.tick_count, 1,
+            "the pre-market tick must not fold into the 09:15 bucket"
+        );
+        assert_eq!(
+            snap.high, 101.25,
+            "pre-market price must not leak into the candle high/low"
         );
     }
 
@@ -1046,6 +1236,76 @@ mod tests {
         let mut count: u32 = 0;
         agg.force_seal_all(|_, _, _, _| count += 1);
         assert_eq!(count, 0, "force_seal_all must skip uninitialised slots");
+    }
+
+    #[test]
+    fn test_force_seal_all_session_scoped_skips_always_on() {
+        // Close-time force-seal (2026-07-03): GIFT Nifty (always-on, ~21h
+        // session) must NOT be sealed at the 15:30:05 IST close-time seal —
+        // only regular NSE-session instruments are.
+        let mut set = HashSet::new();
+        set.insert((5024_u64, 0_u8));
+        let agg = MultiTfAggregator::with_capacity(8).with_always_on(Arc::new(set));
+        agg.pre_populate(vec![(5024, 0), (13, 0)]);
+        for sid in [5024_u64, 13] {
+            let t = mk_tick(sid, 0, 1_779_354_960, 100.0, 50, 0);
+            agg.consume_tick(&t, 0, FeedStrategy::DHAN, None, |_, _| {});
+        }
+        let mut emitted: Vec<(u64, u8, TfIndex)> = Vec::new();
+        agg.force_seal_all_session_scoped(|sid, seg, tf, _| emitted.push((sid, seg, tf)));
+        assert_eq!(
+            emitted.len(),
+            21,
+            "only the regular instrument's 21 TFs seal; got {}",
+            emitted.len()
+        );
+        assert!(
+            emitted.iter().all(|(sid, _, _)| *sid == 13),
+            "always-on sid 5024 must be skipped by the session-scoped seal"
+        );
+        // GIFT Nifty's open bucket survives; the regular instrument's is drained.
+        let gift = agg.get(5024, 0).expect("present");
+        assert!(
+            !gift.cell.snapshot(TfIndex::ALL[0]).is_uninitialised(),
+            "always-on open bucket must survive the close-time seal"
+        );
+        let nifty = agg.get(13, 0).expect("present");
+        assert!(nifty.cell.snapshot(TfIndex::ALL[0]).is_uninitialised());
+    }
+
+    #[test]
+    fn test_force_seal_all_session_scoped_seals_regular_instruments() {
+        // With an empty always_on set the session-scoped seal behaves
+        // exactly like force_seal_all: 2 instruments × 21 TFs = 42 bars.
+        let agg = MultiTfAggregator::new();
+        agg.pre_populate(vec![(13, 0), (25, 0)]);
+        for sid in [13_u64, 25] {
+            let t = mk_tick(sid, 0, 1_779_354_960, 100.0, 50, 0);
+            agg.consume_tick(&t, 0, FeedStrategy::DHAN, None, |_, _| {});
+        }
+        let mut count: u32 = 0;
+        agg.force_seal_all_session_scoped(|_, _, _, _| count += 1);
+        assert_eq!(count, 2 * 21);
+    }
+
+    #[test]
+    fn test_close_then_midnight_force_seal_is_idempotent() {
+        // The close-time seal (15:30:05) followed by the IST-midnight
+        // force_seal_all must NOT double-flush: force_seal on an emptied
+        // slot returns None, so the midnight pass emits 0 seals.
+        let agg = MultiTfAggregator::new();
+        agg.pre_populate(vec![(13, 0)]);
+        let t = mk_tick(13, 0, 1_779_354_960, 100.0, 50, 0);
+        agg.consume_tick(&t, 0, FeedStrategy::DHAN, None, |_, _| {});
+        let mut first: u32 = 0;
+        agg.force_seal_all_session_scoped(|_, _, _, _| first += 1);
+        assert_eq!(first, 21, "close-time seal drains the 21 open TF buckets");
+        let mut second: u32 = 0;
+        agg.force_seal_all(|_, _, _, _| second += 1);
+        assert_eq!(
+            second, 0,
+            "midnight force_seal_all after the close-time seal must emit 0 (idempotent)"
+        );
     }
 
     #[test]
