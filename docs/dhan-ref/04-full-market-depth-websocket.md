@@ -32,6 +32,17 @@ wss://full-depth-api.dhan.co/?token=<TOKEN>&clientId=<CLIENT_ID>&authType=2
 
 > **SDK verified (2026-04-06):** Dhan API (Python SDK ref) (fulldepth.py) uses `wss://full-depth-api.dhan.co/` (root path, no `/twohundreddepth`). Our code now matches the SDK. Earlier Dhan documentation referenced `/twohundreddepth` but the Dhan docs are the ground truth for what works in production.
 
+> **2026-07-03 upstream update — 200-level URL flip-flop, UNRESOLVED (doc-only, moot at runtime):**
+> the CURRENT live Full Market Depth page again shows
+> `wss://full-depth-api.dhan.co/twohundreddepth?token=...` — the same path the 2026-06-02
+> upstream snapshot showed. History: docs said `/twohundreddepth` → the SDK's `fulldepth.py`
+> used the root path (2026-04-06 SDK-verified note above, PRESERVED) → docs say
+> `/twohundreddepth` again. Both URLs are recorded here; neither has been live-verified since
+> 2026-04-06 and none will be from this codebase: **depth WebSockets are FORBIDDEN FOREVER**
+> per `.claude/rules/project/websocket-connection-scope-lock.md` (modules deleted in
+> AWS-lifecycle PR #4). This document is retained as API reference only. If depth is ever
+> re-authorized (rule-file edit + dated operator quote FIRST), live-probe BOTH paths.
+
 | Parameter   | Required | Value                          |
 |-------------|----------|--------------------------------|
 | `token`     | Yes      | Access Token                   |
