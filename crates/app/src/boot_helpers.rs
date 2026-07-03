@@ -206,6 +206,53 @@ pub fn compute_market_close_sleep(market_close_time_str: &str) -> std::time::Dur
     std::time::Duration::from_secs(close_secs.saturating_sub(now_secs))
 }
 
+/// Close-time force-seal trigger instant: 15:30:05 IST as seconds-of-day
+/// (15 × 3600 + 30 × 60 + 5 = 55_805).
+///
+/// Why 15:30:05 (close-time force-seal, 2026-07-03): the aggregator's
+/// session gate closes the [09:15, 15:30) IST window at exactly 15:30:00,
+/// and the market-close sequence aborts the WS read loops at
+/// ~15:30:02.8 (close + `MARKET_CLOSE_DRAIN_BUFFER_SECS`). Sealing at
+/// 15:30:05 is therefore strictly AFTER the last in-session tick can fold,
+/// so the final session buckets (the 15:29 M1 bar and every TF's last
+/// bucket) flush the same day instead of waiting for the IST-midnight
+/// backstop (which the daily 16:30 IST instance auto-stop destroys).
+pub const CLOSE_SEAL_SECS_OF_DAY_IST: u32 = 15 * 3600 + 30 * 60 + 5;
+
+/// Seconds per day (IST wall clock; NSE has no DST).
+const CLOSE_SEAL_SECS_PER_DAY: u64 = 86_400;
+
+/// Pure trigger-time math for the close-time force-seal task: seconds to
+/// sleep from `now_secs_of_day` (IST seconds since midnight) until the NEXT
+/// 15:30:05 IST instant.
+///
+/// - Before the trigger (e.g. 15:29:59 = 55_799) returns the short gap (6s).
+/// - AT or after the trigger it wraps to TOMORROW's 15:30:05 (never 0, so
+///   the task loop can never busy-spin on the trigger instant).
+#[must_use]
+pub fn secs_until_close_seal_ist(now_secs_of_day: u32) -> u64 {
+    let now = u64::from(now_secs_of_day);
+    let trigger = u64::from(CLOSE_SEAL_SECS_OF_DAY_IST);
+    if now < trigger {
+        trigger - now
+    } else {
+        trigger + CLOSE_SEAL_SECS_PER_DAY - now
+    }
+}
+
+/// Wall-clock wrapper for [`secs_until_close_seal_ist`]: reads the current
+/// IST time and returns the sleep until the next 15:30:05 IST trigger.
+/// Used by the close-time force-seal task (Task 3b) in `main.rs`.
+#[must_use]
+// TEST-EXEMPT: thin wall-clock read; the trigger math is unit-tested via
+// secs_until_close_seal_ist and the spawn is pinned by
+// ratchet_main_rs_spawns_close_time_force_seal.
+pub fn compute_close_seal_sleep() -> std::time::Duration {
+    let now_ist = chrono::Utc::now().with_timezone(&ist_offset());
+    let now_secs = now_ist.time().num_seconds_from_midnight();
+    std::time::Duration::from_secs(secs_until_close_seal_ist(now_secs))
+}
+
 /// Opens (or creates) the app log file for Alloy consumption.
 ///
 /// Creates `data/logs/` directory if needed. Returns `None` if the file
@@ -497,6 +544,76 @@ pub fn drain_replayed_order_updates_to_broadcast(
 mod tests {
     use super::*;
     use std::net::SocketAddr;
+
+    // -----------------------------------------------------------------------
+    // Close-time force-seal trigger math (15:30:05 IST) + wiring ratchet
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_close_seal_constant_is_153005_ist() {
+        assert_eq!(
+            CLOSE_SEAL_SECS_OF_DAY_IST, 55_805,
+            "close-time force-seal trigger must be 15:30:05 IST (55,805s of day)"
+        );
+    }
+
+    #[test]
+    fn test_secs_until_close_seal_at_152959_is_6s() {
+        // 15:29:59 IST = 55,799s → 6 seconds before the 15:30:05 trigger.
+        assert_eq!(secs_until_close_seal_ist(55_799), 6);
+    }
+
+    #[test]
+    fn test_secs_until_close_seal_at_exact_trigger_wraps_to_next_day() {
+        // AT 15:30:05 the trigger already fired — wrap to tomorrow (never 0,
+        // so the task loop cannot busy-spin on the trigger instant).
+        assert_eq!(secs_until_close_seal_ist(55_805), 86_400);
+    }
+
+    #[test]
+    fn test_secs_until_close_seal_just_after_trigger() {
+        assert_eq!(secs_until_close_seal_ist(55_806), 86_399);
+    }
+
+    #[test]
+    fn test_secs_until_close_seal_at_midnight() {
+        assert_eq!(secs_until_close_seal_ist(0), 55_805);
+    }
+
+    /// Wiring ratchet (source-scan, repo style — mirrors
+    /// `wal_reinject::tests::ratchet_main_rs_uses_bounded_reinject_helper`):
+    /// the close-time force-seal task MUST stay spawned in
+    /// `spawn_engine_b_aggregator` (main.rs Task 3b) with (a) the
+    /// `compute_close_seal_sleep` trigger, (b) the trading-day calendar
+    /// gate, and (c) the session-scoped seal that skips always-on
+    /// instruments. Removing any of these silently restores the daily
+    /// lost-15:29-candle bug (2026-07-03).
+    #[test]
+    fn ratchet_main_rs_spawns_close_time_force_seal() {
+        let main_src = include_str!("main.rs");
+        assert!(
+            main_src.contains("compute_close_seal_sleep("),
+            "main.rs must sleep on compute_close_seal_sleep() for the \
+             close-time force-seal task (Task 3b)"
+        );
+        assert!(
+            main_src.contains("force_seal_all_session_scoped("),
+            "main.rs must call force_seal_all_session_scoped() at the \
+             15:30:05 IST close-time seal — force_seal_all would truncate \
+             always-on (GIFT Nifty) open buckets mid-session"
+        );
+        // The trading-day gate must live inside the close-seal task block:
+        // find the task marker and require the calendar gate within it.
+        let block_start = main_src
+            .find("close-time force-seal")
+            .expect("main.rs must carry the close-time force-seal task block");
+        let block = &main_src[block_start..block_start.saturating_add(4_000).min(main_src.len())];
+        assert!(
+            block.contains("is_trading_day_today()"),
+            "the close-time force-seal task must gate on \
+             TradingCalendar::is_trading_day_today() (weekends/holidays skip)"
+        );
+    }
 
     // -----------------------------------------------------------------------
     // resolve_config_env — env-var precedence (TV_ENVIRONMENT > ENVIRONMENT > prod)
