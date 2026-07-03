@@ -328,21 +328,37 @@ fn bench_composite(c: &mut Criterion) {
     drop(handle.render());
 }
 
+/// MEDIUM-7 (B6 adversarial round 1): the writer benches are (or gate)
+/// bench-budget rows in `quality/benchmark-budgets.toml`. A silent early
+/// return on loopback-bind failure would leave no Criterion estimate, so
+/// `scripts/bench-gate.sh` would never evaluate the budget row and exit 0
+/// — the gate self-disarms invisibly. A runner that cannot execute a
+/// gated bench MUST fail loudly instead. (Benches are exempt from the
+/// prod no-panic lints — the scanner excludes `/benches/`.)
+fn bind_loopback_or_die(bench: &str) -> (std::net::TcpListener, std::net::SocketAddr) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap_or_else(|e| {
+        panic!(
+            "{bench}: cannot bind loopback TCP listener — the bench-gate budget \
+             row would silently self-disarm; fix the runner (loopback sockets \
+             required): {e}"
+        )
+    });
+    let addr = listener.local_addr().unwrap_or_else(|e| {
+        panic!("{bench}: cannot read loopback listener addr — fix the runner: {e}")
+    });
+    (listener, addr)
+}
+
 /// REAL writer against a local TCP drain: measures
 /// `append_tick_with_seq` including the amortized 1-in-1000 batch handoff.
 /// B6 (2026-07-03): the batch flush is now handed to the off-thread
 /// tick-flush-worker (O(1) buffer swap) instead of a blocking inline TCP
 /// write, so this bench measures the offloaded hot path — the residual
 /// 1-in-1000 cost is the swap + channel send, not the flush I/O.
-/// Self-skips when the sandbox forbids loopback sockets.
+/// Panics loudly if the runner forbids loopback sockets (MEDIUM-7).
 fn bench_writer_append_amortized_flush(c: &mut Criterion) {
     install_prometheus_recorder();
-    let Ok(listener) = std::net::TcpListener::bind("127.0.0.1:0") else {
-        return;
-    };
-    let Ok(addr) = listener.local_addr() else {
-        return;
-    };
+    let (listener, addr) = bind_loopback_or_die("writer/append_with_seq_amortized_flush");
     std::thread::spawn(move || {
         for stream in listener.incoming() {
             let Ok(mut s) = stream else { return };
@@ -362,9 +378,12 @@ fn bench_writer_append_amortized_flush(c: &mut Criterion) {
         pg_port: 0,
         ilp_port: addr.port(),
     };
-    let Ok(mut writer) = TickPersistenceWriter::new(&cfg) else {
-        return;
-    };
+    let mut writer = TickPersistenceWriter::new(&cfg).unwrap_or_else(|e| {
+        panic!(
+            "writer/append_with_seq_amortized_flush: writer setup failed against \
+             the local drain listener — bench must not silently self-skip: {e}"
+        )
+    });
     let tick = sample_tick();
     let mut seq: i64 = 1;
     c.bench_function("writer/append_with_seq_amortized_flush", |b| {
@@ -383,15 +402,12 @@ fn bench_writer_append_amortized_flush(c: &mut Criterion) {
 /// steady-state per-tick hot path the operator's p50 ≈ 30µs claim refers
 /// to. Budget: `composite_quote_tick_compute_only = 10000` ns in
 /// `quality/benchmark-budgets.toml`, enforced by `scripts/bench-gate.sh`.
-/// Self-skips when the sandbox forbids loopback sockets.
+/// Panics loudly if the runner forbids loopback sockets (MEDIUM-7 — a
+/// silent skip would leave no estimates.json, so the 10µs gate would
+/// never be evaluated and the budget row silently self-disarms).
 fn bench_composite_compute_only(c: &mut Criterion) {
     let handle = install_prometheus_recorder();
-    let Ok(listener) = std::net::TcpListener::bind("127.0.0.1:0") else {
-        return;
-    };
-    let Ok(addr) = listener.local_addr() else {
-        return;
-    };
+    let (listener, addr) = bind_loopback_or_die("composite/quote_tick_compute_only");
     // Multi-accept drain: the writer AND its off-thread flush worker each
     // open one ILP TCP connection.
     std::thread::spawn(move || {
@@ -413,9 +429,13 @@ fn bench_composite_compute_only(c: &mut Criterion) {
         pg_port: 0,
         ilp_port: addr.port(),
     };
-    let Ok(mut writer) = TickPersistenceWriter::new(&cfg) else {
-        return;
-    };
+    let mut writer = TickPersistenceWriter::new(&cfg).unwrap_or_else(|e| {
+        panic!(
+            "composite/quote_tick_compute_only: writer setup failed against the \
+             local drain listener — the 10µs bench-gate row must not silently \
+             self-disarm: {e}"
+        )
+    });
 
     let packet = build_quote_packet(13);
     let m_frames = metrics::counter!("bench_co_frames_total");
