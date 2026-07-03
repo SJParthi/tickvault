@@ -942,13 +942,31 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
                 );
             }
             Err(err) => {
-                error!(
-                    ?err,
-                    code =
-                        tickvault_common::error_code::ErrorCode::Boot02DeadlineExceeded.code_str(),
-                    "BOOT-02 tick processor refusing to consume — QuestDB never reached \
-                     ready state within deadline"
-                );
+                // C2 (2026-07-03): attribute the failure honestly. A
+                // ClientBuild error means OUR HTTP client could not be
+                // constructed (host fd/TLS/resolver pressure) — routing
+                // that to the BOOT-02 Docker/QuestDB runbook misdirects
+                // triage. Control flow is identical in both arms.
+                if matches!(
+                    &err,
+                    tickvault_storage::boot_probe::BootProbeError::ClientBuild(_)
+                ) {
+                    error!(
+                        ?err,
+                        code = tickvault_common::error_code::ErrorCode::HttpClient01BuildFailed
+                            .code_str(),
+                        "HTTP-CLIENT-01 tick processor refusing to consume — HTTP client \
+                         build failed (host fd/TLS/resolver problem, not QuestDB)"
+                    );
+                } else {
+                    error!(
+                        ?err,
+                        code = tickvault_common::error_code::ErrorCode::Boot02DeadlineExceeded
+                            .code_str(),
+                        "BOOT-02 tick processor refusing to consume — QuestDB never reached \
+                         ready state within deadline"
+                    );
+                }
                 // Refuse to start the hot loop. The caller's processor
                 // task ends; ticks remain buffered in the SPSC ring + WAL
                 // spill. Process-level HALT is the boot path's call (the
