@@ -110,11 +110,39 @@ auto-triage-safe) for the supervisor respawn, with runbook
 
 ## Failure Modes
 
-- **Worker panic / fatal return:** catch_unwind supervisor respawns with
-  the SAME channels after a 200ms backoff (mirrors WS-SPILL-01);
-  `error!(code = "TICK-FLUSH-01")` + counter
-  `tv_tick_flush_worker_respawn_total{reason}`. Batches queued in the
-  channel survive the respawn (channel outlives the panic).
+- **Worker panic — HONEST envelope (adversarial round 1, HIGH-1):** the
+  workspace RELEASE profile sets `panic = "abort"`, so in the production
+  binary a worker panic ABORTS the whole process at the panic site — the
+  catch_unwind supervision can never observe it there; recovery is
+  next-boot WAL replay (`ws_frame_spill` captures every frame durably
+  BEFORE the pipeline). The supervision covers NON-panic fatal returns in
+  production, and panics in unwind (dev/test) builds only. No in-process
+  panic self-healing is claimed for release.
+- **Worker panic in unwind builds (HIGH-2 fix):** panic isolation is
+  PER-JOB — the catch_unwind closure only borrows the `FlushJob`, so a
+  panic mid-flush rescues the in-flight batch to the failed channel and
+  recycles its pool pair BEFORE the supervisor respawns
+  (`reason="job_panic"`); the supervisor re-enters with a FRESH
+  `WorkerState` so a possibly half-written Sender is never reused.
+  Batches queued in the channel survive the respawn (channel outlives
+  the panic). Pre-fix, an unwind dropped the in-flight batch and leaked
+  the pool pair (4 panics → permanent inline fallback).
+- **Flush fails after the day's LAST tick (HIGH-3 fix):** the tick recv
+  loop selects (biased, recv-first) over a 1s `IDLE_FLUSH_DRAIN_INTERVAL`
+  whose tick calls `flush_if_needed()` even when idle, so worker-failed
+  batches reach ring → spill within ≤1s instead of parking in RAM until
+  graceful shutdown. Worker-side spill was evaluated and REJECTED: the
+  spill/DLQ machinery is `&mut TickPersistenceWriter` state (file
+  handles, counters, disk pre-flight, ring-first ordering, mid-session
+  reconnect drain) — a worker-owned spill file would bypass in-session
+  recovery and defer every failed batch to next boot.
+- **Bounded blocking windows (MEDIUM-6, documented):** the backpressure
+  `send` blocks the tokio worker thread for at most one worker flush
+  (worst case bounded only by the OS TCP write timeout against a
+  black-holed peer — identical to the pre-B6 inline flush); the cold
+  shutdown join polls ≤10s under `tokio::task::block_in_place` when on a
+  multi-thread runtime. Both are intentional zero-loss-over-latency
+  trades.
 - **Worker flush error:** `tv_tick_flush_worker_errors_total` + `error!`;
   sender dropped; batch returned via failed channel; writer marks itself
   disconnected and rescues — no tick lost (ring → spill → DLQ chain).
@@ -177,10 +205,19 @@ no DEDUP-key change → no data migration on rollback.
   the unchanged `force_flush` sync escape hatch).
 - NEW histogram: `tv_tick_compute_duration_ns` (suffix-bucketed
   automatically by the exporter).
-- NEW counters: `tv_tick_flush_worker_respawn_total{reason}` (supervisor),
+- NEW counters: `tv_tick_flush_worker_respawn_total{reason}` (supervisor;
+  reasons `panic` / `job_panic` — unwind builds only, see Failure Modes),
   `tv_tick_flush_worker_errors_total` (flush failures),
-  `tv_tick_flush_backpressure_block_total{reason}` (queue_full /
-  pool_empty / inline fallbacks).
+  `tv_tick_flush_backpressure_block_total{reason}` (`queue_full` /
+  `pool_empty` = worker behind / `worker_unavailable` = never spawned or
+  channel gone — LOW-2 split),
+  `tv_tick_flush_deferred_stall_ns_total` (ns sum of flush-side stall
+  accrued AFTER a frame's compute record, discarded from compute —
+  MEDIUM-4).
+- Bench-gate self-disarm closed (MEDIUM-7): the two loopback-binding
+  benches PANIC loudly on bind/writer-setup failure instead of silently
+  skipping (a skip left no estimates.json, so bench-gate never evaluated
+  the 10µs budget row and exited 0).
 - NEW ErrorCode `TICK-FLUSH-01` with runbook
   `.claude/rules/project/tick-flush-worker-error-codes.md`; worker flush
   failures log `error!` (Rule 5: flush failures are error-level).
@@ -212,6 +249,25 @@ no DEDUP-key change → no data migration on rollback.
 - [x] Item 6 — DHAT steady-state allocation test
   - Files: crates/storage/tests/dhat_tick_flush_offload.rs
   - Tests: dhat_offloaded_append_steady_state_zero_alloc
+
+- [x] Item 7 — Adversarial review round 1 fixes (see section below)
+  - Files: crates/storage/src/tick_flush_worker.rs, crates/storage/src/tick_persistence.rs, crates/core/src/pipeline/tick_processor.rs, crates/core/benches/full_tick_processing.rs, .claude/rules/project/tick-flush-worker-error-codes.md
+  - Tests: test_job_panic_rescues_batch_and_recycles_pool_pair, test_idle_flush_drain_interval_arm_present, test_compute_histogram_recorded_and_subtracts_stall (extended), test_worker_failure_routes_batch_to_ring_and_disconnects (extended)
+
+## Adversarial review round 1 (2026-07-03) — findings → resolutions
+
+| # | Severity | Finding | Resolution |
+|---|---|---|---|
+| HIGH-1 | security | Release `panic = "abort"` makes the catch_unwind respawn unreachable in prod — a worker panic aborts the process | Honesty fix (no redesign): module doc, rule file §1, and this plan now state release recovery = next-boot WAL replay; respawn covers non-panic fatal returns in prod + panics in unwind builds only. catch_unwind kept (correct in dev/test, harmless in release). |
+| HIGH-2 | hostile | Worker panic mid-job dropped the in-flight batch during unwind + permanently leaked its pool pair (4 panics → empty pool → permanent inline fallback) | Per-job catch_unwind (closure borrows the job) — on panic the batch is pushed to the failed channel + pool pair recycled BEFORE the supervisor respawn; fresh `WorkerState` on re-entry (half-written Sender never reused). cfg(test) injection hook + `test_job_panic_rescues_batch_and_recycles_pool_pair`. |
+| HIGH-3 | hostile | Failed batches parked in RAM when no more frames arrive (drain only ran per-frame) | Timer fallback chosen (worker-side spill rejected — spill/DLQ is `&mut` writer state; rationale in Failure Modes): recv loop is a biased `tokio::select!` over recv + a 1s `IDLE_FLUSH_DRAIN_INTERVAL` arm calling `flush_if_needed()` when idle. Ratchet `test_idle_flush_drain_interval_arm_present`. |
+| MEDIUM-4 | hostile | Stall accrued by `flush_if_needed` (post-record) leaked into the NEXT frame's compute sample → bogus 0ns samples | Both flush_if_needed call sites drain `take_last_stall_ns()` immediately after and discard into `tv_tick_flush_deferred_stall_ns_total`. Ratchet extended in `test_compute_histogram_recorded_and_subtracts_stall`. |
+| MEDIUM-5 | hostile | `drain_failed_batches` rescue I/O inside `dispatch_batch` counted as compute | Rescue work wrapped in `note_stall` (empty-channel fast path un-measured). Assertion added to `test_worker_failure_routes_batch_to_ring_and_disconnects`: drained batch adds stall > 0. |
+| MEDIUM-6 | both | Blocking bounded `send` + 10s shutdown poll-join run on tokio worker threads; black-holed TCP peer bounded only by OS timeout | Envelope documented at both call sites + module doc + rule file; shutdown join wrapped in `tokio::task::block_in_place` when on a multi-thread runtime (cold path only; hot path unchanged). |
+| MEDIUM-7 | both | 10µs gate silently self-disarms when the bench can't bind loopback (early return → no estimates.json → bench-gate exits 0) | Both loopback-binding benches now panic loudly with a message naming the disarmed gate (benches exempt from prod no-panic lints). |
+| LOW-a | hostile | WorkerGone restore path dropped the just-taken spare pool pair | `restore_full_pair` returns the spare to the pool via a writer-side `recycle_tx` clone. |
+| LOW-b | hostile | `reason="inline_fallback"` conflated "worker behind" vs "never spawned/gone" | Split into `pool_empty` / `worker_unavailable` (static `&'static str` labels). |
+| LOW-c | hostile | Stale ILP rows left in `self.buffer` after failed-batch rescue | `drain_failed_batches` clears the buffer after `rescue_in_flight` (locally airtight; reconnect replaced it anyway; any replay is DEDUP-collapsed). |
 
 ## Scenarios
 
