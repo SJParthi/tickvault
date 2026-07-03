@@ -27,6 +27,32 @@
 //! or returns the batch for the EXISTING ring → spill → DLQ rescue chain.
 //! No path drops a tick. All channels are BOUNDED (hot-path rule).
 //!
+//! **Panic honesty (HIGH-1, adversarial round 1).** The workspace release
+//! profile sets `panic = "abort"`, so in the PRODUCTION binary a worker
+//! panic ABORTS the whole process at the panic site — none of the
+//! `catch_unwind` supervision below can observe it. Recovery for that case
+//! is next-boot WAL replay (`ws_frame_spill` durably captures every frame
+//! BEFORE the pipeline, so the in-flight batch is not lost — it is
+//! re-delivered on restart). What the supervision DOES cover:
+//! - in production (abort): NON-panic fatal returns of `worker_loop`
+//!   (channel teardown races) — the supervisor re-enters with a fresh
+//!   `WorkerState`;
+//! - in dev/test (unwind) builds: per-job panic isolation (the panicking
+//!   job is rescued to the failed channel + its pool pair recycled) and
+//!   the respawn-with-backoff loop.
+//! No claim of in-process panic self-healing is made for release builds.
+//!
+//! **Blocking-send envelope (MEDIUM-6).** The backpressure fallback in
+//! [`FlushOffload::try_dispatch`] runs a BLOCKING bounded `send` on the
+//! calling (tokio worker) thread, and the graceful-shutdown join in
+//! [`FlushOffload::shutdown_and_join`] polls the worker thread for up to
+//! 10s. Both are intentional zero-loss-over-latency trades: the hot-path
+//! block is bounded by ONE worker flush (the queue frees as soon as the
+//! worker finishes its current job); the worst case is a black-holed TCP
+//! peer where the flush has no explicit timeout and is bounded only by the
+//! OS TCP write timeout. This mirrors the pre-B6 inline-flush behavior —
+//! B6 never made that window WORSE, it made the steady state avoid it.
+//!
 //! **Ordering + idempotency:** a single worker + FIFO channel preserves
 //! batch order among offloaded batches. The worker owns its OWN questdb
 //! `Sender` (a second ILP TCP connection); interleaving with the writer's
@@ -108,6 +134,11 @@ pub(crate) type FailedBatch = Vec<(ParsedTick, i64)>;
 pub(crate) struct FlushOffload {
     pub(crate) work_tx: ChannelSender<FlushJob>,
     pub(crate) recycle_rx: Receiver<PoolPair>,
+    /// Writer-side clone of the pool sender so the `WorkerGone` restore
+    /// path can return the just-taken spare pair to the pool instead of
+    /// dropping it (LOW-1 — repeated WorkerGone must never silently
+    /// shrink the pool into permanent inline fallback).
+    recycle_tx: ChannelSender<PoolPair>,
     pub(crate) failed_rx: Receiver<FailedBatch>,
     join: Option<thread::JoinHandle<()>>,
 }
@@ -153,9 +184,14 @@ impl FlushOffload {
             Ok(()) => DispatchOutcome::Sent,
             Err(crossbeam_channel::TrySendError::Full(job)) => {
                 // Worker > FLUSH_WORK_QUEUE_CAP batches behind. Block on the
-                // bounded send (bounded by one flush duration) — zero-loss
-                // preferred over drop. The caller records the stall so the
-                // compute histogram stays honest.
+                // bounded send — zero-loss preferred over drop. MEDIUM-6
+                // envelope: this blocks the calling tokio worker thread for
+                // AT MOST one worker flush duration (the queue frees when
+                // the worker finishes its current job); a black-holed TCP
+                // peer bounds that flush only by the OS TCP write timeout —
+                // identical to the pre-B6 inline flush worst case. The
+                // caller records the stall so the compute histogram stays
+                // honest.
                 metrics::counter!(
                     "tv_tick_flush_backpressure_block_total",
                     "reason" => "queue_full"
@@ -170,18 +206,35 @@ impl FlushOffload {
                     }
                     Err(crossbeam_channel::SendError(job)) => {
                         // Worker channel disconnected mid-block: restore the
-                        // full pair so the inline fallback flushes it.
-                        *buffer = job.buffer;
-                        *in_flight = job.in_flight;
+                        // full pair so the inline fallback flushes it, and
+                        // return the just-taken spare pair to the pool
+                        // (LOW-1).
+                        self.restore_full_pair(buffer, in_flight, job);
                         DispatchOutcome::WorkerGone
                     }
                 }
             }
             Err(crossbeam_channel::TrySendError::Disconnected(job)) => {
-                *buffer = job.buffer;
-                *in_flight = job.in_flight;
+                self.restore_full_pair(buffer, in_flight, job);
                 DispatchOutcome::WorkerGone
             }
+        }
+    }
+
+    /// `WorkerGone` restore: puts the full job back into the caller's slots
+    /// (so the inline fallback flushes it) and returns the spare pair that
+    /// was swapped in — currently sitting in the caller's slots — to the
+    /// pool instead of dropping it (LOW-1, adversarial round 1).
+    fn restore_full_pair(
+        &self,
+        buffer: &mut Buffer,
+        in_flight: &mut Vec<(ParsedTick, i64)>,
+        job: FlushJob,
+    ) {
+        let spare_buf = std::mem::replace(buffer, job.buffer);
+        let spare_vec = std::mem::replace(in_flight, job.in_flight);
+        if self.recycle_tx.try_send((spare_buf, spare_vec)).is_err() {
+            debug!("recycle channel unavailable — spare pool pair dropped");
         }
     }
 
@@ -197,29 +250,47 @@ impl FlushOffload {
         let FlushOffload {
             work_tx,
             recycle_rx,
+            recycle_tx,
             failed_rx,
             join,
         } = self;
         drop(work_tx);
         drop(recycle_rx);
+        drop(recycle_tx);
         if let Some(handle) = join {
-            let deadline = Instant::now() + timeout;
-            // Cold path (graceful shutdown only): a bounded poll-join. std
-            // JoinHandle has no timed join; 10ms polling is fine off-market.
-            while !handle.is_finished() && Instant::now() < deadline {
-                thread::sleep(SHUTDOWN_JOIN_POLL_INTERVAL);
-            }
-            if handle.is_finished() {
-                if handle.join().is_err() {
-                    // Supervisor catch_unwind makes this ~unreachable; still
-                    // surfaced honestly rather than discarded.
-                    warn!("tick flush worker supervisor panicked at final join");
+            // MEDIUM-6: this bounded poll-join blocks the calling thread for
+            // up to `timeout` (cold path — graceful shutdown only, zero-loss
+            // over latency: the worker is draining queued batches). When the
+            // caller sits on a MULTI-THREAD tokio runtime worker,
+            // `block_in_place` hands the blocking wait to tokio so sibling
+            // tasks keep running; otherwise (current-thread runtime, plain
+            // thread, tests) we block directly — same behavior as before.
+            let poll_join = || {
+                let deadline = Instant::now() + timeout;
+                // std JoinHandle has no timed join; 10ms polling is fine
+                // off-market.
+                while !handle.is_finished() && Instant::now() < deadline {
+                    thread::sleep(SHUTDOWN_JOIN_POLL_INTERVAL);
                 }
-            } else {
-                warn!(
-                    "tick flush worker did not finish within shutdown timeout — \
-                     proceeding (WAL replay covers any in-flight batch)"
-                );
+                if handle.is_finished() {
+                    if handle.join().is_err() {
+                        // Reachable only in unwind builds (release
+                        // panic=abort aborts the process at the panic site);
+                        // still surfaced honestly rather than discarded.
+                        warn!("tick flush worker supervisor panicked at final join");
+                    }
+                } else {
+                    warn!(
+                        "tick flush worker did not finish within shutdown timeout — \
+                         proceeding (WAL replay covers any in-flight batch)"
+                    );
+                }
+            };
+            match tokio::runtime::Handle::try_current() {
+                Ok(rt) if rt.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+                    tokio::task::block_in_place(poll_join);
+                }
+                _ => poll_join(),
             }
         }
         failed_rx
@@ -230,12 +301,62 @@ impl FlushOffload {
 // Spawn + supervision
 // ---------------------------------------------------------------------------
 
+/// HIGH-2 (adversarial round 1) test-only panic injection: when the armed
+/// flag is set, the NEXT `process_job` panics before touching the sender,
+/// modelling a panic mid-job. Compiled out of production builds entirely
+/// (zero cost — the parameter itself does not exist in non-test builds).
+#[cfg(test)]
+pub(crate) type FlushPanicHook = std::sync::Arc<std::sync::atomic::AtomicBool>;
+
+/// Why the worker loop returned — drives the supervisor's logging + respawn.
+enum WorkerExit {
+    /// Work channel closed + drained: graceful shutdown.
+    Clean,
+    /// A job panicked mid-flush (reachable in unwind — dev/test — builds
+    /// only; release `panic = "abort"` aborts the process at the panic
+    /// site). The job was ALREADY rescued to the failed channel and its
+    /// pool pair recycled; the supervisor re-enters with a FRESH
+    /// `WorkerState`, so a possibly half-written `Sender` is never reused.
+    JobPanicked,
+}
+
+/// Outcome of processing one job. Side effects (recycle / fail) are applied
+/// by the CALLER, so a panic mid-job leaves the job OWNED by the loop frame
+/// for rescue instead of being dropped during unwind (HIGH-2).
+enum JobOutcome {
+    /// Flush succeeded — caller clears + recycles the pool pair.
+    Flushed,
+    /// Flush (or connect) failed — caller routes the batch to the failed
+    /// channel for ring → spill → DLQ rescue.
+    Failed,
+}
+
 /// Spawns the supervised flush worker and pre-allocates the buffer pool.
 ///
 /// The worker's questdb `Sender` is built LAZILY (throttled) from
 /// `ilp_conf_string` on the first job — so a writer constructed in
 /// disconnected mode does not attempt TCP at spawn time.
 pub(crate) fn spawn_flush_offload(ilp_conf_string: &str) -> anyhow::Result<FlushOffload> {
+    spawn_flush_offload_inner(
+        ilp_conf_string,
+        #[cfg(test)]
+        None,
+    )
+}
+
+/// Test-only spawn with the HIGH-2 panic-injection hook attached.
+#[cfg(test)]
+pub(crate) fn spawn_flush_offload_with_panic_hook(
+    ilp_conf_string: &str,
+    hook: FlushPanicHook,
+) -> anyhow::Result<FlushOffload> {
+    spawn_flush_offload_inner(ilp_conf_string, Some(hook))
+}
+
+fn spawn_flush_offload_inner(
+    ilp_conf_string: &str,
+    #[cfg(test)] panic_hook: Option<FlushPanicHook>,
+) -> anyhow::Result<FlushOffload> {
     let (work_tx, work_rx) = bounded::<FlushJob>(FLUSH_WORK_QUEUE_CAP);
     let (recycle_tx, recycle_rx) = bounded::<PoolPair>(FLUSH_BUFFER_POOL_SPARES + 1);
     let (failed_tx, failed_rx) = bounded::<FailedBatch>(FLUSH_FAILED_QUEUE_CAP);
@@ -255,25 +376,56 @@ pub(crate) fn spawn_flush_offload(ilp_conf_string: &str) -> anyhow::Result<Flush
     // O(1) EXEMPT: end
 
     let conf = ilp_conf_string.to_string();
+    let recycle_tx_writer = recycle_tx.clone();
     let handle = thread::Builder::new()
         .name("tick-flush-worker".to_string())
         .spawn(move || {
             // Supervisor loop (mirrors WS-SPILL-01 / WS-GAP-05 /
-            // DISK-WATCHER-01): a panic or fatal return must NOT silently
-            // remove the off-thread flush path — re-enter `worker_loop` with
-            // the SAME channels so queued batches survive and the writer's
-            // dispatch never sees `Disconnected`.
+            // DISK-WATCHER-01): a fatal return — or, in unwind (dev/test)
+            // builds, a panic — must NOT silently remove the off-thread
+            // flush path: re-enter `worker_loop` with the SAME channels so
+            // queued batches survive and the writer's dispatch never sees
+            // `Disconnected`. HIGH-1 honesty: in the RELEASE binary
+            // (workspace `panic = "abort"`) a panic aborts the whole
+            // process at the panic site — the Err/JobPanicked arms below
+            // are unreachable there and recovery is next-boot WAL replay.
             loop {
                 let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    worker_loop(&work_rx, &recycle_tx, &failed_tx, &conf)
+                    worker_loop(
+                        &work_rx,
+                        &recycle_tx,
+                        &failed_tx,
+                        &conf,
+                        #[cfg(test)]
+                        panic_hook.clone(),
+                    )
                 }));
                 match outcome {
-                    Ok(()) => {
+                    Ok(WorkerExit::Clean) => {
                         // Clean shutdown: work channel closed + drained.
                         info!("tick-flush-worker exited cleanly (channel closed)");
                         break;
                     }
+                    Ok(WorkerExit::JobPanicked) => {
+                        // HIGH-2: the panicking job was ALREADY rescued to
+                        // the failed channel + its pool pair recycled inside
+                        // `worker_loop`. Re-enter with a FRESH `WorkerState`
+                        // so a possibly half-written Sender is never reused.
+                        error!(
+                            code = ErrorCode::TickFlush01WorkerRespawn.code_str(),
+                            "CRITICAL: tick flush worker job PANICKED — batch rescued \
+                             to the failed channel; respawning with a fresh ILP sender"
+                        );
+                        metrics::counter!(
+                            "tv_tick_flush_worker_respawn_total",
+                            "reason" => "job_panic"
+                        )
+                        .increment(1);
+                    }
                     Err(_panic) => {
+                        // Panic OUTSIDE per-job processing (no job in
+                        // flight — e.g. metrics registry). Unwind builds
+                        // only, per the HIGH-1 note above.
                         error!(
                             code = ErrorCode::TickFlush01WorkerRespawn.code_str(),
                             "CRITICAL: tick flush worker PANICKED — respawning to keep \
@@ -296,6 +448,7 @@ pub(crate) fn spawn_flush_offload(ilp_conf_string: &str) -> anyhow::Result<Flush
     Ok(FlushOffload {
         work_tx,
         recycle_rx,
+        recycle_tx: recycle_tx_writer,
         failed_rx,
         join: Some(handle),
     })
@@ -311,12 +464,21 @@ struct WorkerState {
 /// Drains `FlushJob`s until the work channel is closed AND empty (crossbeam
 /// `iter()` yields every queued message before terminating on disconnect —
 /// no queued batch is lost on shutdown).
+///
+/// HIGH-2 (adversarial round 1): panic isolation is PER-JOB. The job stays
+/// owned by this loop frame (the `catch_unwind` closure only borrows it),
+/// so a panic mid-flush cannot drop the in-flight batch during unwind — it
+/// is rescued to the failed channel and its pool pair recycled BEFORE the
+/// supervisor's respawn logic runs. Reachable in unwind builds only; the
+/// release binary (panic=abort) aborts at the panic site and recovers via
+/// next-boot WAL replay (module doc, HIGH-1).
 fn worker_loop(
     work_rx: &Receiver<FlushJob>,
     recycle_tx: &ChannelSender<PoolPair>,
     failed_tx: &ChannelSender<FailedBatch>,
     conf: &str,
-) {
+    #[cfg(test)] panic_hook: Option<FlushPanicHook>,
+) -> WorkerExit {
     // Metric handle captured once per (re)entry — cold-path lookups only.
     let m_flush_duration = metrics::histogram!("tv_tick_flush_duration_ns");
     let mut state = WorkerState {
@@ -324,28 +486,61 @@ fn worker_loop(
         next_reconnect_allowed: Instant::now(),
     };
     for job in work_rx.iter() {
-        process_job(
-            job,
-            recycle_tx,
-            failed_tx,
-            conf,
-            &mut state,
-            &m_flush_duration,
-        );
+        let mut job = job;
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            process_job(
+                &mut job,
+                conf,
+                &mut state,
+                &m_flush_duration,
+                #[cfg(test)]
+                panic_hook.as_ref(),
+            )
+        }));
+        match outcome {
+            Ok(JobOutcome::Flushed) => {
+                job.buffer.clear();
+                job.in_flight.clear();
+                // Pool channel capacity == pool size, so try_send cannot
+                // legitimately fail; a failure here only shrinks the pool
+                // (writer degrades to inline fallback — still zero-loss).
+                if recycle_tx.try_send((job.buffer, job.in_flight)).is_err() {
+                    debug!("tick flush worker: recycle channel unavailable — pool pair dropped");
+                }
+            }
+            Ok(JobOutcome::Failed) => fail_batch(job, recycle_tx, failed_tx),
+            Err(_panic) => {
+                // HIGH-2: rescue the in-flight batch + recycle the pool pair
+                // BEFORE the supervisor respawns. The state (and its possibly
+                // half-written Sender) is dropped with this frame; the
+                // supervisor re-enters with a fresh one.
+                fail_batch(job, recycle_tx, failed_tx);
+                return WorkerExit::JobPanicked;
+            }
+        }
     }
+    WorkerExit::Clean
 }
 
-/// Flushes one batch; on any failure the batch is returned to the writer via
-/// the failed channel for ring → spill → DLQ rescue. A per-batch failure
-/// NEVER kills the thread (mirrors the ws_frame_spill resilient loop).
+/// Flushes one batch; returns the outcome for the CALLER to apply (recycle
+/// on success, failed-channel rescue on failure) — see [`JobOutcome`]. A
+/// per-batch failure NEVER kills the thread (mirrors the ws_frame_spill
+/// resilient loop).
 fn process_job(
-    mut job: FlushJob,
-    recycle_tx: &ChannelSender<PoolPair>,
-    failed_tx: &ChannelSender<FailedBatch>,
+    job: &mut FlushJob,
     conf: &str,
     state: &mut WorkerState,
     m_flush_duration: &metrics::Histogram,
-) {
+    #[cfg(test)] panic_hook: Option<&FlushPanicHook>,
+) -> JobOutcome {
+    // HIGH-2 test ratchet injection point — compiled out of prod builds.
+    #[cfg(test)]
+    if let Some(hook) = panic_hook
+        && hook.swap(false, std::sync::atomic::Ordering::SeqCst)
+    {
+        panic!("test-injected flush panic (HIGH-2 per-job isolation ratchet)");
+    }
+
     // Lazily (re)connect, throttled — same policy class as the writer's
     // try_reconnect_on_error so a sustained outage never storms QuestDB.
     if state.sender.is_none() {
@@ -376,8 +571,7 @@ fn process_job(
     }
 
     let Some(sender) = state.sender.as_mut() else {
-        fail_batch(job, recycle_tx, failed_tx);
-        return;
+        return JobOutcome::Failed;
     };
 
     // Time the actual ILP TCP write — the operator's flush-latency tile
@@ -392,19 +586,11 @@ fn process_job(
 
     match flush_result {
         Ok(()) => {
-            let flushed = job.in_flight.len();
-            job.buffer.clear();
-            job.in_flight.clear();
-            // Pool channel capacity == pool size, so try_send cannot
-            // legitimately fail; a failure here only shrinks the pool
-            // (writer degrades to inline fallback — still zero-loss).
-            if recycle_tx.try_send((job.buffer, job.in_flight)).is_err() {
-                debug!("tick flush worker: recycle channel unavailable — pool pair dropped");
-            }
             debug!(
-                flushed_rows = flushed,
+                flushed_rows = job.in_flight.len(),
                 "tick batch flushed to QuestDB (off-thread)"
             );
+            JobOutcome::Flushed
         }
         Err(err) => {
             metrics::counter!("tv_tick_flush_worker_errors_total").increment(1);
@@ -417,7 +603,7 @@ fn process_job(
             );
             // Sender is broken — drop it; the next job re-connects (throttled).
             state.sender = None;
-            fail_batch(job, recycle_tx, failed_tx);
+            JobOutcome::Failed
         }
     }
 }
@@ -635,6 +821,68 @@ mod tests {
             1,
             "NoSpare must leave the caller's in-flight mirror untouched"
         );
+        drop(offload.shutdown_and_join(Duration::from_secs(2)));
+    }
+
+    /// HIGH-2 (adversarial round 1): a panic MID-JOB must not drop the
+    /// in-flight batch during unwind — the job is rescued to the failed
+    /// channel and its pool pair recycled; the supervisor then respawns
+    /// the worker (fresh Sender) so subsequent jobs keep flowing.
+    /// (Unwind-build behavior; release panic=abort aborts the process and
+    /// recovers via next-boot WAL replay — module doc HIGH-1.)
+    #[test]
+    fn test_job_panic_rescues_batch_and_recycles_pool_pair() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let hook: FlushPanicHook = Arc::new(AtomicBool::new(true));
+        let offload = spawn_flush_offload_with_panic_hook("tcp::addr=127.0.0.1:9;", hook.clone())
+            .expect("spawn"); // APPROVED: test
+        let (buf, mut vec) = offload.recycle_rx.try_recv().expect("pool has spares"); // APPROVED: test
+        vec.push((sample_tick(13), 1));
+        vec.push((sample_tick(25), 2));
+        offload
+            .work_tx
+            .send(FlushJob {
+                buffer: buf,
+                in_flight: vec,
+            })
+            .expect("worker alive"); // APPROVED: test
+        // The panicking job must be RESCUED, not dropped during unwind.
+        let failed = offload
+            .failed_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("panicked job must land on the failed channel"); // APPROVED: test
+        assert_eq!(failed.len(), 2, "both ticks must survive the panic");
+        assert_eq!(failed[0].1, 1, "capture_seq order preserved");
+        assert_eq!(failed[1].1, 2, "capture_seq order preserved");
+        // ...and its pool pair must be recycled (pool refills, never shrinks).
+        let (rbuf, rvec) = offload
+            .recycle_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("panicked job's pool pair must be recycled"); // APPROVED: test
+        assert_eq!(rbuf.len(), 0, "recycled buffer must be cleared");
+        assert!(rvec.is_empty(), "recycled in-flight vec must be cleared");
+        assert!(!hook.load(Ordering::SeqCst), "injection hook consumed");
+        // The worker must have respawned: a second (non-panicking) job on the
+        // closed port fails its connect and comes back on the failed channel.
+        let (buf2, mut vec2) = (
+            Buffer::new(ProtocolVersion::V1),
+            Vec::with_capacity(TICK_FLUSH_BATCH_SIZE),
+        );
+        vec2.push((sample_tick(51), 3));
+        offload
+            .work_tx
+            .send(FlushJob {
+                buffer: buf2,
+                in_flight: vec2,
+            })
+            .expect("respawned worker alive"); // APPROVED: test
+        let failed2 = offload
+            .failed_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("respawned worker must keep processing jobs"); // APPROVED: test
+        assert_eq!(failed2.len(), 1, "post-respawn job round-trips");
         drop(offload.shutdown_and_join(Duration::from_secs(2)));
     }
 
