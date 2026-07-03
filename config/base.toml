@@ -301,6 +301,23 @@ auto_start_docker = true
 dhan_enabled = true
 groww_enabled = false
 
+# Groww multi-connection AUTO-SCALE ladder (operator authorization 2026-07-03,
+# §34 of .claude/rules/project/groww-second-feed-scope-2026-06-19.md).
+# enabled = false (the default) keeps the single-connection sidecar path
+# byte-identical. Tier A ceiling = 10 connections (Monday); raising
+# target_connections beyond the current tier requires the §34.2 gate evidence.
+[feeds.groww.scale]
+enabled = false
+target_connections = 10
+instruments_per_conn = 1000
+ladder = [1, 2, 5, 10]
+gate_hold_minutes = 15
+gate_max_cpu_pct = 70.0
+gate_min_disk_free_pct = 20.0
+gate_max_capture_lag_ms = 30000
+rollback_hold_base_minutes = 10
+advance_window_ist = ["09:20", "14:30"]
+
 # [movers] section retired in PR #2 (2026-05-18) alongside the deleted
 # movers pipeline. Under the 4-IDX_I-only universe top-N gainers/losers/
 # most-active queries are meaningless.

@@ -524,6 +524,7 @@ mod tests {
         let feeds = FeedsConfig {
             dhan_enabled: true,
             groww_enabled: true,
+            ..Default::default()
         };
         let state = FeedRuntimeState::from_config(&feeds);
         assert!(state.is_enabled(Feed::Dhan));

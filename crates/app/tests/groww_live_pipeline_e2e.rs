@@ -255,6 +255,7 @@ async fn groww_ticks_and_candles_land_tagged_feed_groww() {
     let feeds = FeedsConfig {
         dhan_enabled: false,
         groww_enabled: true,
+        ..Default::default()
     };
     let feed_runtime = Arc::new(FeedRuntimeState::from_config(&feeds));
     let feed_health = Arc::new(FeedHealthRegistry::new());
@@ -414,6 +415,7 @@ async fn malformed_ndjson_line_is_skipped_and_valid_lines_land() {
     let feeds = FeedsConfig {
         dhan_enabled: false,
         groww_enabled: true,
+        ..Default::default()
     };
     let feed_runtime = Arc::new(FeedRuntimeState::from_config(&feeds));
     let feed_health = Arc::new(FeedHealthRegistry::new());
@@ -484,6 +486,7 @@ async fn replay_same_ndjson_is_idempotent_no_duplicate_rows() {
         let feeds = FeedsConfig {
             dhan_enabled: false,
             groww_enabled: true,
+            ..Default::default()
         };
         let feed_runtime = Arc::new(FeedRuntimeState::from_config(&feeds));
         let feed_health = Arc::new(FeedHealthRegistry::new());
