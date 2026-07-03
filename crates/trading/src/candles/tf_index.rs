@@ -319,6 +319,35 @@ impl TfIndex {
 mod tests {
     use super::*;
 
+    /// Session-constant drift pin (operator directive 2026-07-03): the
+    /// trading-crate seconds-of-day session constants that gate the candle
+    /// grid MUST stay 09:15:00 / 15:30:00 IST AND agree exactly with the
+    /// canonical common-crate G1 gate constants (`MARKET_OPEN_IST_NANOS` /
+    /// `MARKET_CLOSE_IST_NANOS`, nanos-of-day). If either representation is
+    /// edited alone, this test fails the build — the day-OHLC gate
+    /// (`day_ohlc_session_accepts` in the app crate) delegates to the
+    /// common-crate gate, so this pin keeps ALL session windows identical.
+    #[test]
+    fn test_session_constants_pinned_and_agree_with_common_crate() {
+        use tickvault_common::constants::{MARKET_CLOSE_IST_NANOS, MARKET_OPEN_IST_NANOS};
+
+        assert_eq!(MARKET_OPEN_SECS_OF_DAY_IST, 33_300, "09:15:00 IST");
+        assert_eq!(
+            MARKET_CLOSE_SECS_OF_DAY_IST, 55_800,
+            "15:30:00 IST (exclusive)"
+        );
+        assert_eq!(
+            i64::from(MARKET_OPEN_SECS_OF_DAY_IST) * 1_000_000_000,
+            MARKET_OPEN_IST_NANOS,
+            "trading-crate open constant drifted from common-crate G1 gate open"
+        );
+        assert_eq!(
+            i64::from(MARKET_CLOSE_SECS_OF_DAY_IST) * 1_000_000_000,
+            MARKET_CLOSE_IST_NANOS,
+            "trading-crate close constant drifted from common-crate G1 gate close"
+        );
+    }
+
     #[test]
     fn test_tf_index_all_has_twenty_one_distinct_variants() {
         let mut seen = std::collections::HashSet::new();
