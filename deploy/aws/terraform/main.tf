@@ -105,6 +105,27 @@ resource "aws_security_group" "tv_app" {
     cidr_blocks = [var.operator_cidr]
   }
 
+  # B4 QuestDB console (questdb-console.tf): the console's VPC back-Lambda
+  # reaches QuestDB on the box's private IP. MECHANISM CHOICE: tv_app uses
+  # INLINE ingress blocks, and with aws provider ~>5.80 mixing inline rules
+  # with external aws_security_group_rule / aws_vpc_security_group_ingress_rule
+  # resources on the SAME SG makes Terraform fight itself (the inline set
+  # revokes the external rule on every plan → perpetual drift). So the 9000
+  # rule lives HERE as a dynamic inline block, keyed on the same feature flag
+  # as every other console resource — zero drift, destroys with the flag.
+  # SG-to-SG only: source is the console Lambda's SG id, NEVER a CIDR —
+  # port 9000 stays closed to the internet.
+  dynamic "ingress" {
+    for_each = var.enable_questdb_console ? [1] : []
+    content {
+      description     = "QuestDB console proxy Lambda (B4) — SG-to-SG only, never public"
+      from_port       = 9000
+      to_port         = 9000
+      protocol        = "tcp"
+      security_groups = [aws_security_group.qdb_console_lambda[0].id]
+    }
+  }
+
   egress {
     description = "All outbound (Dhan WS + REST + AWS services)"
     from_port   = 0
