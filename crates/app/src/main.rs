@@ -1662,45 +1662,46 @@ async fn main() -> Result<()> {
                     channel_capacity = capacity,
                     "STAGE-C.2b: re-injecting replayed LiveFeed frames into pool mpsc"
                 );
-                let mut injected = 0u64;
-                let mut dropped = 0u64;
-                for frame in to_inject {
-                    match sender.try_send(frame) {
-                        Ok(()) => injected += 1,
-                        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                            dropped += 1;
-                        }
-                        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                            dropped += 1;
-                        }
-                    }
-                }
+                // C3 fix (2026-07-03): bounded chunked backpressure via
+                // `reinject_wal_frames` (send().await + per-chunk yield +
+                // bounded per-send timeout) replaces the raw try_send loop
+                // that silently dropped everything past
+                // FRAME_CHANNEL_CAPACITY (dropped=1,127,801 at 10:35 IST)
+                // and kept the WAL unconfirmed — the self-feeding re-replay
+                // storm. A clean run lets confirm_replayed() below archive
+                // the staged segments. Runbook: ws-reinject-error-codes.md.
+                let outcome = tickvault_app::wal_reinject::reinject_wal_frames(
+                    &sender,
+                    to_inject,
+                    tickvault_common::constants::WAL_REINJECT_CHUNK_SIZE,
+                    std::time::Duration::from_secs(
+                        tickvault_common::constants::WAL_REINJECT_SEND_TIMEOUT_SECS,
+                    ),
+                )
+                .await;
                 metrics::counter!(
                     "tv_ws_frame_wal_reinjected_total",
                     "ws_type" => "live_feed"
                 )
-                .increment(injected);
-                if dropped > 0 {
-                    // Channel full or closed — replayed frames remain in the
-                    // archive for forensic replay but could not be handed
-                    // to the live consumer. This is a degraded mode, not a
-                    // data loss (the frames are still on disk).
-                    fast_ws_wal_replay_reinjection_clean = false;
-                    error!(
-                        dropped,
-                        injected,
-                        "STAGE-C.2b: LiveFeed re-injection dropped frames — channel full/closed, \
-                         frames remain in WAL archive"
-                    );
-                    metrics::counter!(
-                        "tv_ws_frame_wal_reinjected_dropped_total",
-                        "ws_type" => "live_feed"
-                    )
-                    .increment(dropped);
-                } else {
+                .increment(outcome.injected);
+                if outcome.clean {
                     info!(
-                        injected,
-                        "STAGE-C.2b: LiveFeed re-injection complete — all replayed frames queued"
+                        injected = outcome.injected,
+                        "STAGE-C.2b: LiveFeed re-injection complete — all replayed frames \
+                         delivered with backpressure"
+                    );
+                } else {
+                    // WS-REINJECT-01 was already error!-paged (typed code +
+                    // abort counters) inside the helper; here we only record
+                    // the not-clean flag so confirm_replayed() below is
+                    // skipped and the staged segments re-replay next boot
+                    // (durable WAL floor — no silent loss).
+                    fast_ws_wal_replay_reinjection_clean = false;
+                    warn!(
+                        injected = outcome.injected,
+                        aborted_remaining = outcome.aborted_remaining,
+                        "STAGE-C.2b: LiveFeed re-injection aborted — staged WAL segments \
+                         remain in replaying/ for re-replay next boot"
                     );
                 }
             } else {
@@ -5999,37 +6000,39 @@ async fn start_dhan_lane(
                 channel_capacity = capacity,
                 "STAGE-C.2b: re-injecting replayed LiveFeed frames into pool mpsc (slow boot)"
             );
-            let mut injected = 0u64;
-            let mut dropped = 0u64;
-            for frame in to_inject {
-                match sender.try_send(frame) {
-                    Ok(()) => injected += 1,
-                    Err(tokio::sync::mpsc::error::TrySendError::Full(_))
-                    | Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => dropped += 1,
-                }
-            }
+            // C3 fix (2026-07-03): slow-boot mirror of the fast-boot bounded
+            // chunked-backpressure re-injection — see the fast-boot comment.
+            // Runbook: ws-reinject-error-codes.md.
+            let outcome = tickvault_app::wal_reinject::reinject_wal_frames(
+                &sender,
+                to_inject,
+                tickvault_common::constants::WAL_REINJECT_CHUNK_SIZE,
+                std::time::Duration::from_secs(
+                    tickvault_common::constants::WAL_REINJECT_SEND_TIMEOUT_SECS,
+                ),
+            )
+            .await;
             metrics::counter!(
                 "tv_ws_frame_wal_reinjected_total",
                 "ws_type" => "live_feed"
             )
-            .increment(injected);
-            if dropped > 0 {
-                ws_wal_replay_reinjection_clean = false;
-                error!(
-                    dropped,
-                    injected,
-                    "STAGE-C.2b: LiveFeed re-injection dropped frames (slow boot) — \
-                     channel full/closed, frames stay staged in WAL replaying/ and re-replay next boot"
-                );
-                metrics::counter!(
-                    "tv_ws_frame_wal_reinjected_dropped_total",
-                    "ws_type" => "live_feed"
-                )
-                .increment(dropped);
-            } else {
+            .increment(outcome.injected);
+            if outcome.clean {
                 info!(
-                    injected,
-                    "STAGE-C.2b: LiveFeed re-injection complete (slow boot)"
+                    injected = outcome.injected,
+                    "STAGE-C.2b: LiveFeed re-injection complete (slow boot) — all replayed \
+                     frames delivered with backpressure"
+                );
+            } else {
+                // WS-REINJECT-01 already error!-paged inside the helper;
+                // record the not-clean flag so the slow-boot confirm is
+                // skipped and the staged segments re-replay next boot.
+                ws_wal_replay_reinjection_clean = false;
+                warn!(
+                    injected = outcome.injected,
+                    aborted_remaining = outcome.aborted_remaining,
+                    "STAGE-C.2b: LiveFeed re-injection aborted (slow boot) — staged WAL \
+                     segments remain in replaying/ for re-replay next boot"
                 );
             }
         } else {
