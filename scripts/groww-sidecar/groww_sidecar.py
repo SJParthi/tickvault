@@ -24,8 +24,13 @@ has to map to an integer here.
 Each received tick is appended as one NDJSON line to data/groww/live-ticks.ndjson
 — the EXACT schema the Rust bridge (crates/app/src/groww_bridge.rs) parses.
 Index ticks are emitted with segment="IDX_I" and ltp=<index value>.
-Capture-at-receipt: write + flush + fsync the instant the callback fires (durable
-floor one hop downstream of the socket; lock §32.3).
+Capture-at-receipt: write + flush + fsync per emitted record (durable floor one
+hop downstream of the socket; lock §32.3). Since the 2026-07-03 lag fix the
+NATS callbacks are O(1) dirty-flag sets and a walker thread drains the SDK
+snapshot at a bounded cadence (WALK_INTERVAL_MS, default 200ms) — the SDK
+snapshot only ever holds latest-per-instrument, so coalescing loses nothing
+the callback-time walk could have seen, and it stops the full-tree-per-callback
+decode work that starved the SDK's NATS consumer (the measured unbounded lag).
 
 Volume is Option A (price-only, operator 2026-06-20): the Groww live feed carries
 NO traded volume (only ltp/value + tsInMillis), so cum_volume is always 0.
@@ -207,6 +212,100 @@ MARKET_CLOSE_SEC_OF_DAY = 15 * 3600 + 30 * 60  # 15:30:00 IST, exclusive
 # seconds and re-subscribes"). NEVER give up while the market is open.
 MARKET_OPEN_RECONNECT_BASE_SECS = 0.05
 MARKET_OPEN_RECONNECT_CAP_SECS = 5.0
+
+# Coalesced snapshot walks (2026-07-03 lag forensics — THE cure). Before this
+# fix every NATS callback walked the ENTIRE 768-entry get_ltp()/
+# get_index_value() snapshot (~42 full walks/sec ≈ 32,500 record decodes/sec of
+# pure Python on one core), starving the SDK's NATS consumer so its snapshot —
+# our ONLY data source — fell behind wall-clock UNBOUNDED (measured 8s → 428s
+# over 13 min, consuming exchange-time at 0.53× real-time). Callbacks now do
+# ONLY an O(1) dirty-flag set; a dedicated walker thread drains each dirty
+# snapshot at most once per WALK_INTERVAL_MS. Net: ≤ 2×5 walks/sec instead of
+# ~42, the NATS consumer runs real-time, watermark lag bounded to ≈ one walk
+# interval + drain cadence. The walk bodies + change-dedup are UNCHANGED.
+WALK_INTERVAL_MS_DEFAULT = 200
+# Clamp bounds for the env override (GROWW_WALK_INTERVAL_MS): a 0/negative
+# interval must never spin-loop the walker; a huge one must never stall the
+# feed behind a fat coalesce window.
+WALK_INTERVAL_MS_MIN = 20
+WALK_INTERVAL_MS_MAX = 5000
+
+# Watermark-lag stall criterion (2026-07-03 lag forensics — fix #2). The
+# timestamp-ADVANCING liveness (the 5s frozen-watermark criterion below + the
+# Rust 30s FEED-STALL-01) has a blind spot: a +2 ms micro-advance resets the
+# clock while the watermark drifts MINUTES behind wall-clock (measured: 0 stall
+# events in 90 min despite a 7-min lag). During market hours, a watermark lag
+# (now_ms − max_ts_millis) STRICTLY greater than this threshold for
+# WATERMARK_LAG_CONSECUTIVE_CHECKS consecutive 1s polls is treated as stalled
+# and force-closes the NATS socket — the SAME restart path as the frozen
+# criterion. tsInMillis is UTC epoch ms, so the comparison clock is
+# time.time()*1000 (UTC ms) — no IST offset anywhere in this math.
+WATERMARK_MAX_LAG_MS_DEFAULT = 120_000
+WATERMARK_MAX_LAG_MS_MIN = 10_000
+WATERMARK_MAX_LAG_MS_MAX = 3_600_000
+WATERMARK_LAG_CONSECUTIVE_CHECKS = 3
+# Refire cooldown: a backlog that survives one reconnect refires at a bounded
+# ~3-min cadence, never a 3s kill storm (the reconnected feed needs time to
+# re-seed its snapshot and catch the watermark up to wall-clock).
+WATERMARK_LAG_REFIRE_COOLDOWN_SECS = 180.0
+
+
+def _resolve_env_int(raw, default: int, lo: int, hi: int) -> int:
+    """Pure clamp for an integer env override: garbage/absent → default;
+    otherwise clamped to [lo, hi]. Never raises."""
+    try:
+        value = int(float(raw))
+    except (TypeError, ValueError):
+        return default
+    return max(lo, min(value, hi))
+
+
+def resolve_walk_interval_ms(raw) -> int:
+    """Pure: GROWW_WALK_INTERVAL_MS env value → clamped walk interval (ms)."""
+    return _resolve_env_int(
+        raw, WALK_INTERVAL_MS_DEFAULT, WALK_INTERVAL_MS_MIN, WALK_INTERVAL_MS_MAX
+    )
+
+
+def resolve_watermark_max_lag_ms(raw) -> int:
+    """Pure: GROWW_WATERMARK_MAX_LAG_MS env value → clamped lag threshold (ms)."""
+    return _resolve_env_int(
+        raw,
+        WATERMARK_MAX_LAG_MS_DEFAULT,
+        WATERMARK_MAX_LAG_MS_MIN,
+        WATERMARK_MAX_LAG_MS_MAX,
+    )
+
+
+def watermark_lag_stalled(
+    now_ms: float, max_ts_millis: int, market_open: bool, lag_threshold_ms: int
+) -> bool:
+    """PURE per-check verdict (2026-07-03 lag forensics fix #2): is the feed
+    watermark lagging wall-clock beyond the threshold?
+
+    True ONLY when the market is open, the watermark is KNOWN (> 0 — a
+    cold/never-streamed feed is owned by the silent-feed diagnostic + the Rust
+    process-kill backstop, never by this criterion), and the lag is STRICTLY
+    greater than `lag_threshold_ms` (119s no / 120s no / 121s yes at the
+    default 120_000). Off-hours lag is NORMAL (overnight watermark = yesterday
+    15:29) → never stalled. O(1), no I/O; unit-tested in test_dedup.py."""
+    if not market_open:
+        return False
+    if max_ts_millis <= 0:
+        return False
+    return (now_ms - max_ts_millis) > lag_threshold_ms
+
+
+def watermark_lag_should_fire(
+    consecutive_stalled_checks: int, needed: int, cooldown_remaining_secs: float
+) -> bool:
+    """PURE fire decision: force-reconnect only after `needed` CONSECUTIVE
+    stalled verdicts AND outside the refire cooldown (a persistent backlog
+    refires at a bounded cadence, never a kill storm). O(1), no I/O."""
+    if cooldown_remaining_secs > 0.0:
+        return False
+    return consecutive_stalled_checks >= needed
+
 
 # NATS reject-reason surfacing (2026-06-29). VERIFIED against growwapi-1.5.0 +
 # nats-py 2.15.0 source (quoted in groww_sidecar.py header / the plan):
@@ -1488,6 +1587,78 @@ def wait_for_subscriptions():
 # under the GIL.
 _CURRENT_FEED = [None]
 
+# Per-kind dirty flags for the coalesced snapshot walker (2026-07-03 lag
+# forensics fix #1). The NATS callbacks do ONLY `Event.set()` (O(1)) so the
+# SDK's consumer is never blocked by our decode work; the walker below drains
+# each dirty snapshot at most once per WALK_INTERVAL_MS. The flag race is
+# BENIGN BY DESIGN: the walker clears the flag BEFORE walking, so an SDK
+# update landing during/after the walk re-marks dirty and is drained on the
+# next interval — never lost (the SDK snapshot only holds latest-per-
+# instrument anyway), at worst one redundant walk that change-dedup collapses.
+_LTP_DIRTY = threading.Event()
+_INDEX_DIRTY = threading.Event()
+# Capped walk-failure logging (first 5, then every 100th) so a transient
+# mid-walk mutation (e.g. dict-changed-size during iteration while the SDK
+# consumer writes) can never flood the log; the next interval retries and
+# change-dedup makes the retry idempotent.
+_WALK_ERRORS_TOTAL = 0
+
+
+def _snapshot_walker_loop(out, sid_map, feed_cell) -> None:
+    """Daemon: drain the dirty SDK snapshots at a bounded cadence (fix #1).
+
+    Every `WALK_INTERVAL_MS` (default 200ms, env GROWW_WALK_INTERVAL_MS,
+    clamped [20, 5000] — pure `resolve_walk_interval_ms`), and ONLY when the
+    matching dirty flag is set, walk `get_ltp()` / `get_index_value()` through
+    the UNCHANGED emit paths (capture-at-receipt fsync + change-dedup + drop
+    accounting + watermark advance all preserved). Reads the CURRENT feed from
+    the shared cell each iteration so reconnect cycles are followed
+    automatically; a freshly-connected pre-subscribe feed walks an empty tree
+    (emits nothing). Clear-BEFORE-walk ordering makes the dirty-flag race
+    benign (see the flag comment above). The status-file heartbeat is NOT
+    starved: `note_emit`'s 1/s status re-write runs inside these walks exactly
+    as it did inside the callbacks; the stall detector + reject poller run on
+    their own threads. Worst added first-tick latency = one walk interval.
+
+    Backstop honesty: if this thread ever died, walks stop → emits stop → the
+    watermark freezes → the EXISTING frozen-watermark criterion force-closes
+    and the Rust FEED-STALL-01 process-kill is the outer backstop — never a
+    silent-forever failure. The per-iteration broad except makes death
+    practically unreachable."""
+    global _WALK_ERRORS_TOTAL
+    interval_secs = (
+        resolve_walk_interval_ms(os.environ.get("GROWW_WALK_INTERVAL_MS")) / 1000.0
+    )
+    print(
+        f"groww sidecar: coalesced snapshot walker armed "
+        f"(interval={int(interval_secs * 1000)}ms; callbacks are O(1) flag sets)",
+        flush=True,
+    )
+    while True:
+        time.sleep(interval_secs)
+        feed = feed_cell[0]
+        if feed is None:
+            continue
+        try:
+            if _LTP_DIRTY.is_set():
+                # Clear BEFORE the walk: an update landing mid-walk re-marks
+                # dirty and is drained next interval — never lost.
+                _LTP_DIRTY.clear()
+                emit_ltp_records(out, feed.get_ltp(), sid_map)
+            if _INDEX_DIRTY.is_set():
+                _INDEX_DIRTY.clear()
+                emit_index_records(out, feed.get_index_value(), sid_map)
+        except Exception as exc:  # noqa: BLE001 - the walker must never die
+            _WALK_ERRORS_TOTAL += 1
+            if _WALK_ERRORS_TOTAL <= 5 or _WALK_ERRORS_TOTAL % 100 == 0:
+                print(
+                    f"groww sidecar: snapshot walk failed "
+                    f"({type(exc).__name__}, total={_WALK_ERRORS_TOTAL}); "
+                    "next interval retries (dedup makes retries idempotent)",
+                    file=sys.stderr,
+                    flush=True,
+                )
+
 
 def _stall_recovery_loop(feed_cell) -> None:
     """ACTIVE self-heal (2026-06-30): once data has started flowing, force the
@@ -1513,36 +1684,96 @@ def _stall_recovery_loop(feed_cell) -> None:
     09:38:53. A frozen-timestamp re-dump now reads as STALLED and force-closes
     within the deadline; the same pure `should_force_reconnect` decision applies
     (the watermark is the progress counter: 0 = cold/never-streamed → never
-    close-loop; unchanged past the deadline in market hours → force-close)."""
+    close-loop; unchanged past the deadline in market hours → force-close).
+
+    SECOND CRITERION — WATERMARK LAG (2026-07-03 lag forensics fix #2): the
+    advance-based criterion above has a blind spot — a +2 ms micro-advance
+    resets its clock while the watermark drifts MINUTES behind wall-clock
+    (measured: 8s → 428s over 13 min with ZERO stall events). So each poll
+    ALSO evaluates the pure `watermark_lag_stalled` (now_ms − max_ts_millis
+    strictly > WATERMARK_MAX_LAG_MS during market hours, watermark known);
+    after WATERMARK_LAG_CONSECUTIVE_CHECKS consecutive stalled verdicts —
+    gated by the pure `watermark_lag_should_fire` refire cooldown — it fires
+    the SAME force-close restart path. A healthy post-reconnect feed advances
+    the watermark to ≈ now, the verdict flips False and the counter resets; a
+    backlog that survives the reconnect refires at a bounded ~3-min cadence."""
     last_watermark = MAX_TS_MILLIS_SEEN
     last_change_monotonic = time.monotonic()
+    lag_threshold_ms = resolve_watermark_max_lag_ms(
+        os.environ.get("GROWW_WATERMARK_MAX_LAG_MS")
+    )
+    lag_consecutive = 0
+    last_lag_fire_monotonic = None
     while True:
         time.sleep(STALL_POLL_SECS)
         watermark = MAX_TS_MILLIS_SEEN
+        market_open = _is_within_market_hours_ist(time.time())
         if watermark != last_watermark:
             last_watermark = watermark
             last_change_monotonic = time.monotonic()
-            continue
-        secs_since_change = time.monotonic() - last_change_monotonic
-        market_open = _is_within_market_hours_ist(time.time())
-        if should_force_reconnect(
-            watermark, last_watermark, secs_since_change, market_open, STALL_DEADLINE_SECS
+        else:
+            secs_since_change = time.monotonic() - last_change_monotonic
+            if should_force_reconnect(
+                watermark,
+                last_watermark,
+                secs_since_change,
+                market_open,
+                STALL_DEADLINE_SECS,
+            ):
+                print(
+                    f"groww sidecar: FEED STALLED — {STALL_DEADLINE_SECS}s with NO advancing "
+                    f"exchange timestamp across the universe during market hours "
+                    f"(max_ts_millis={MAX_TS_MILLIS_SEEN}, emitted={EMITTED_TOTAL}, "
+                    f"deduped={DEDUPED_TOTAL}, dropped={DROPPED_TOTAL}); a frozen snapshot "
+                    "re-dump counts as stalled. Force-closing the NATS socket to trigger "
+                    "reconnect + re-subscribe (self-heal).",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                feed = feed_cell[0]
+                if feed is not None:
+                    _force_close_nats_socket(feed)
+                # Reset the clock so we don't hammer close() every poll while the
+                # reconnect is in flight; the next real record re-arms the detector.
+                last_change_monotonic = time.monotonic()
+                # One restart is in flight — the lag criterion must not stack a
+                # second force-close on top of it this window.
+                lag_consecutive = 0
+                continue
+        # Criterion 2 — watermark LAG (micro-advances do NOT reset this one).
+        if watermark_lag_stalled(
+            time.time() * 1000.0, watermark, market_open, lag_threshold_ms
         ):
+            lag_consecutive += 1
+        else:
+            lag_consecutive = 0
+        cooldown_remaining = 0.0
+        if last_lag_fire_monotonic is not None:
+            cooldown_remaining = WATERMARK_LAG_REFIRE_COOLDOWN_SECS - (
+                time.monotonic() - last_lag_fire_monotonic
+            )
+        if watermark_lag_should_fire(
+            lag_consecutive, WATERMARK_LAG_CONSECUTIVE_CHECKS, cooldown_remaining
+        ):
+            lag_ms = int(time.time() * 1000.0 - watermark)
             print(
-                f"groww sidecar: FEED STALLED — {STALL_DEADLINE_SECS}s with NO advancing "
-                f"exchange timestamp across the universe during market hours "
-                f"(max_ts_millis={MAX_TS_MILLIS_SEEN}, emitted={EMITTED_TOTAL}, "
-                f"deduped={DEDUPED_TOTAL}, dropped={DROPPED_TOTAL}); a frozen snapshot "
-                "re-dump counts as stalled. Force-closing the NATS socket to trigger "
-                "reconnect + re-subscribe (self-heal).",
+                f"groww sidecar: FEED STALLED — watermark lag {lag_ms}ms behind "
+                f"wall-clock (> {lag_threshold_ms}ms for "
+                f"{WATERMARK_LAG_CONSECUTIVE_CHECKS} consecutive checks) during "
+                f"market hours (max_ts_millis={watermark}, emitted={EMITTED_TOTAL}, "
+                f"deduped={DEDUPED_TOTAL}, dropped={DROPPED_TOTAL}); micro-advancing "
+                "timestamps that never catch up count as stalled. Force-closing the "
+                "NATS socket to trigger reconnect + re-subscribe (self-heal).",
                 file=sys.stderr,
                 flush=True,
             )
             feed = feed_cell[0]
             if feed is not None:
                 _force_close_nats_socket(feed)
-            # Reset the clock so we don't hammer close() every poll while the
-            # reconnect is in flight; the next real record re-arms the detector.
+            lag_consecutive = 0
+            last_lag_fire_monotonic = time.monotonic()
+            # Also reset the advance clock so the frozen-watermark criterion
+            # does not immediately double-fire while the reconnect is in flight.
             last_change_monotonic = time.monotonic()
 
 
@@ -1709,14 +1940,20 @@ def main() -> None:
             global _SUBSCRIBED_STOCKS, _SUBSCRIBED_INDICES
             _SUBSCRIBED_STOCKS = len(stock_list)
             _SUBSCRIBED_INDICES = len(index_list)
+            # COALESCED WALKS (2026-07-03 lag forensics fix #1): the callbacks
+            # are O(1) dirty-flag sets ONLY — walking the full 768-entry
+            # snapshot inside the SDK's consumer context starved the NATS
+            # consumer (~42 walks/sec ≈ 32,500 decodes/sec) and let the SDK
+            # snapshot lag wall-clock unboundedly. The walker thread (armed
+            # once below) drains the dirty snapshots at ≤ 1/WALK_INTERVAL_MS.
             if stock_list:
                 def on_ltp(_meta) -> None:
-                    emit_ltp_records(out, feed.get_ltp(), sid_map)
+                    _LTP_DIRTY.set()
 
                 feed.subscribe_ltp(stock_list, on_data_received=on_ltp)
             if index_list:
                 def on_index(_meta) -> None:
-                    emit_index_records(out, feed.get_index_value(), sid_map)
+                    _INDEX_DIRTY.set()
 
                 feed.subscribe_index_value(index_list, on_data_received=on_index)
 
@@ -1764,6 +2001,15 @@ def main() -> None:
                     target=silent_feed_watchdog,
                     args=(len(stock_list), len(index_list), _CURRENT_FEED),
                     name="groww-silent-feed-watchdog",
+                    daemon=True,
+                ).start()
+                # Arm the coalesced snapshot walker once per process (fix #1):
+                # it follows reconnects via the shared current-feed cell, and
+                # it only walks when a callback has marked a snapshot dirty.
+                threading.Thread(
+                    target=_snapshot_walker_loop,
+                    args=(out, sid_map, _CURRENT_FEED),
+                    name="groww-snapshot-walker",
                     daemon=True,
                 ).start()
                 watchdog_started = True
@@ -1975,6 +2221,42 @@ def _selftest_dedup() -> None:
     print("groww sidecar dedup self-test: PASS")
 
 
+def _selftest_coalesce_and_watermark_lag() -> None:
+    """Prove the coalesced-walk interval clamp + the watermark-lag stall
+    decisions (2026-07-03 lag fix). Guarded behind `--selftest` so it NEVER
+    runs in prod. Full matrix in test_dedup.py."""
+    # Walk-interval clamp: garbage/absent → default; out-of-range → clamped.
+    assert resolve_walk_interval_ms(None) == WALK_INTERVAL_MS_DEFAULT, \
+        "absent env must resolve to the default walk interval"
+    assert resolve_walk_interval_ms("garbage") == WALK_INTERVAL_MS_DEFAULT, \
+        "garbage env must resolve to the default walk interval"
+    assert resolve_walk_interval_ms("0") == WALK_INTERVAL_MS_MIN, \
+        "a 0 interval must clamp up (never spin-loop the walker)"
+    assert resolve_walk_interval_ms("999999") == WALK_INTERVAL_MS_MAX, \
+        "a huge interval must clamp down (never stall the feed)"
+    assert resolve_walk_interval_ms("200") == 200, "in-range passes through"
+
+    # Watermark-lag verdict boundaries (threshold = 120_000ms default).
+    thr = WATERMARK_MAX_LAG_MS_DEFAULT
+    now = 1_783_069_320_000.0
+    assert not watermark_lag_stalled(now, int(now) - 119_000, True, thr), \
+        "119s lag must NOT be stalled"
+    assert not watermark_lag_stalled(now, int(now) - 120_000, True, thr), \
+        "exactly-threshold lag must NOT be stalled (strict >)"
+    assert watermark_lag_stalled(now, int(now) - 121_000, True, thr), \
+        "121s lag must be stalled"
+    assert not watermark_lag_stalled(now, int(now) - 999_000, False, thr), \
+        "off-market lag must NEVER be stalled"
+    assert not watermark_lag_stalled(now, 0, True, thr), \
+        "an unknown watermark must NEVER be stalled"
+
+    # Fire decision: consecutive count + refire cooldown.
+    assert not watermark_lag_should_fire(2, 3, 0.0), "below N consecutive: no fire"
+    assert watermark_lag_should_fire(3, 3, 0.0), "at N consecutive: fire"
+    assert not watermark_lag_should_fire(5, 3, 1.0), "cooldown suppresses refire"
+    print("groww sidecar coalesce+watermark-lag self-test: PASS")
+
+
 def _utc_epoch_for_ist(hour: int, minute: int) -> float:
     """Helper: a UTC epoch whose IST wall-clock is exactly `hour:minute` today.
     IST = UTC + 5:30, so UTC h:m = IST h:m − 5:30. Pure arithmetic for the test."""
@@ -1989,5 +2271,6 @@ if __name__ == "__main__":
         _selftest_redaction()
         _selftest_self_heal()
         _selftest_dedup()
+        _selftest_coalesce_and_watermark_lag()
     else:
         main()
