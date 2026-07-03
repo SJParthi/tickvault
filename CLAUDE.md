@@ -320,7 +320,7 @@ make questdb                         # localhost:9000 (QuestDB web console)
 4. Secret Scan: blocks .env, AWS keys, private keys, tokens
 
 **Post-merge only:**
-5. Coverage (100% minimum for ALL crates — see `quality/crate-coverage-thresholds.toml`)
+5. Coverage (ratcheted per-crate floors — see `quality/crate-coverage-thresholds.toml`; floors only move up, 100% is the target)
 6. Benchmarks (budgets in `quality/benchmark-budgets.toml`, 5% regression gate)
 7. DHAT zero-allocation (hard fail for core + trading crates)
 
