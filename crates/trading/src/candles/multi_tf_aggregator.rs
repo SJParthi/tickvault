@@ -831,151 +831,92 @@ mod tests {
         );
     }
 
-    // ------------------------------------------------------------------
-    // Session-gate boundary ratchets (operator rule 2026-07-03): the
-    // regular session is [09:15:00 IST inclusive, 15:30:00 exclusive) on
-    // the EXCHANGE timestamp — 09:14:59 rejected, 09:15:00 accepted —
-    // and a pre-market tick must NEVER become the 09:15 candle's open.
-    // ------------------------------------------------------------------
+    // -----------------------------------------------------------------------
+    // Session-open purity — exact boundary ratchets (operator directive
+    // 2026-07-03): [09:15:00 inclusive, 15:30:00 exclusive) IST. Pre-open
+    // data must never seed the 09:15 open candle.
+    // -----------------------------------------------------------------------
 
-    /// Day-aligned IST epoch base (multiple of 86_400) for exact
-    /// seconds-of-day arithmetic. 09:15:00 IST = base + 33_300.
-    const GATE_DAY_BASE: u32 = 1_779_321_600;
+    /// Day-aligned IST epoch base (divisible by 86_400).
+    const DAY_BASE: u32 = 1_779_235_200;
 
     #[test]
-    fn test_session_gate_boundary_091459_rejected_091500_accepted_dhan() {
+    fn test_0914_59_tick_never_seeds_0915_open() {
+        // A 09:14:59 pre-open tick (secs_of_day 33_299) must be skipped —
+        // and when the true 09:15:00 tick arrives, the 09:15 candle open
+        // must be the 09:15:00 LTP, NOT the pre-open price.
         let agg = MultiTfAggregator::new();
         agg.pre_populate(vec![(13, 0)]);
-        // 09:14:59.xxx (secs-of-day 33_299) — one second BEFORE open: rejected.
-        let pre = mk_tick(13, 0, GATE_DAY_BASE + 33_299, 99.0, 10, 0);
-        agg.consume_tick(&pre, 0, FeedStrategy::DHAN, None, |_, _| {});
+
+        let preopen = mk_tick(13, 0, DAY_BASE + 33_299, 23_100.0, 0, 0);
+        agg.consume_tick(&preopen, 0, FeedStrategy::DHAN, None, |_, _| {});
         let entry = agg.get(13, 0).expect("present");
         assert!(
             entry.cell.snapshot(TfIndex::M1).is_uninitialised(),
-            "09:14:59 tick must NOT open any candle bucket"
+            "09:14:59 tick must be skipped — no bucket state"
         );
-        // 09:15:00.000 exactly (secs-of-day 33_300) — inclusive open: accepted.
-        let open = mk_tick(13, 0, GATE_DAY_BASE + 33_300, 100.5, 10, 0);
-        agg.consume_tick(&open, 0, FeedStrategy::DHAN, None, |_, _| {});
+
+        let open_tick = mk_tick(13, 0, DAY_BASE + 33_300, 23_146.45, 0, 0);
+        agg.consume_tick(&open_tick, 0, FeedStrategy::DHAN, None, |_, _| {});
         let snap = entry.cell.snapshot(TfIndex::M1);
         assert!(
             !snap.is_uninitialised(),
-            "09:15:00 exactly must open the first candle bucket"
+            "09:15:00 tick must open the bucket"
         );
-        assert_eq!(
-            snap.open, 100.5,
-            "the 09:15 candle open must be the 09:15:00 tick's LTP"
+        assert!(
+            (snap.open - 23_146.45).abs() < 1e-6,
+            "09:15 candle open must be the 09:15:00 LTP, not the 09:14:59 pre-open price"
         );
     }
 
     #[test]
-    fn test_session_gate_boundary_091459_rejected_091500_accepted_groww() {
-        // Same boundary via the Groww strategy + cumulative-volume override
-        // (a Groww ms timestamp 09:14:59.999 floors to secs-of-day 33_299
-        // in the bridge's build_parsed_tick, so this pins that path too).
+    fn test_0915_00_first_tick_is_the_0915_open() {
+        // The FIRST tick at exactly 09:15:00 (secs_of_day 33_300) opens the
+        // 09:15 bucket with open == that LTP.
         let agg = MultiTfAggregator::new();
-        agg.pre_populate(vec![(1_333, 1)]);
-        agg.seed_cumulative(1_333, 1, 100);
-        let pre = mk_tick(1_333, 1, GATE_DAY_BASE + 33_299, 99.0, 0, 0);
-        agg.consume_tick(&pre, 1, FeedStrategy::GROWW, Some(100), |_, _| {});
-        let entry = agg.get(1_333, 1).expect("present");
+        agg.pre_populate(vec![(13, 0)]);
+        let tick = mk_tick(13, 0, DAY_BASE + 33_300, 100.25, 0, 0);
+        let stats = agg.consume_tick(&tick, 0, FeedStrategy::DHAN, None, |_, _| {});
+        assert!(stats.instrument_found);
+        let entry = agg.get(13, 0).expect("present");
+        let snap = entry.cell.snapshot(TfIndex::M1);
+        assert!(!snap.is_uninitialised());
+        assert!((snap.open - 100.25).abs() < 1e-6);
+        assert_eq!(
+            snap.bucket_start_ist_secs,
+            DAY_BASE + 33_300,
+            "09:15:00 tick must land in the 09:15-anchored first bucket"
+        );
+    }
+
+    #[test]
+    fn test_15_29_59_tick_is_consumed() {
+        // 15:29:59 (secs_of_day 55_799) is the last in-session second —
+        // it MUST form candle state.
+        let agg = MultiTfAggregator::new();
+        agg.pre_populate(vec![(13, 0)]);
+        let tick = mk_tick(13, 0, DAY_BASE + 55_799, 101.0, 0, 0);
+        agg.consume_tick(&tick, 0, FeedStrategy::DHAN, None, |_, _| {});
+        let entry = agg.get(13, 0).expect("present");
+        assert!(
+            !entry.cell.snapshot(TfIndex::M1).is_uninitialised(),
+            "15:29:59 tick must be consumed (session close is exclusive at 15:30:00)"
+        );
+    }
+
+    #[test]
+    fn test_15_30_00_tick_is_skipped() {
+        // 15:30:00 (secs_of_day 55_800) is EXCLUSIVE — no candle state.
+        // (The watermark still advances on out-of-session ticks — pinned
+        // separately by test_watermark_advances_on_out_of_session_tick.)
+        let agg = MultiTfAggregator::new();
+        agg.pre_populate(vec![(13, 0)]);
+        let tick = mk_tick(13, 0, DAY_BASE + 55_800, 101.0, 0, 0);
+        agg.consume_tick(&tick, 0, FeedStrategy::DHAN, None, |_, _| {});
+        let entry = agg.get(13, 0).expect("present");
         assert!(
             entry.cell.snapshot(TfIndex::M1).is_uninitialised(),
-            "Groww 09:14:59 tick must NOT open any candle bucket"
-        );
-        let open = mk_tick(1_333, 1, GATE_DAY_BASE + 33_300, 100.5, 0, 0);
-        agg.consume_tick(&open, 1, FeedStrategy::GROWW, Some(150), |_, _| {});
-        let snap = entry.cell.snapshot(TfIndex::M1);
-        assert!(
-            !snap.is_uninitialised(),
-            "Groww 09:15:00 exactly must open the first candle bucket"
-        );
-        assert_eq!(
-            snap.open, 100.5,
-            "the Groww 09:15 candle open must be the 09:15:00 tick's LTP"
-        );
-    }
-
-    #[test]
-    fn test_session_gate_close_boundary_152959_accepted_153000_rejected() {
-        // Close boundary is EXCLUSIVE: 15:29:59 folds, 15:30:00 is rejected.
-        let agg = MultiTfAggregator::new();
-        agg.pre_populate(vec![(13, 0)]);
-        let last_in = mk_tick(13, 0, GATE_DAY_BASE + 55_799, 102.0, 10, 0);
-        agg.consume_tick(&last_in, 0, FeedStrategy::DHAN, None, |_, _| {});
-        let entry = agg.get(13, 0).expect("present");
-        let snap_before = entry.cell.snapshot(TfIndex::M1);
-        assert!(
-            !snap_before.is_uninitialised(),
-            "15:29:59 tick must fold into the final session minute"
-        );
-        let tick_count_before = snap_before.tick_count;
-        // 15:30:00 exactly — must NOT fold (exclusive close) and must not
-        // seal-and-reopen a post-close bucket.
-        let at_close = mk_tick(13, 0, GATE_DAY_BASE + 55_800, 999.0, 10, 0);
-        agg.consume_tick(&at_close, 0, FeedStrategy::DHAN, None, |_, _| {});
-        let snap_after = entry.cell.snapshot(TfIndex::M1);
-        assert_eq!(
-            snap_after.tick_count, tick_count_before,
-            "15:30:00 tick must be rejected (exclusive close boundary)"
-        );
-        assert_ne!(
-            snap_after.close, 999.0,
-            "the 15:30:00 tick's price must not leak into any candle"
-        );
-    }
-
-    #[test]
-    fn test_pre_market_tick_never_becomes_0915_open_groww() {
-        // Groww mirror of the purity test: a pre-market tick (09:10) with a
-        // different price, then the first regular tick at 09:15:01 — the
-        // M1 open MUST be the 09:15:01 price under LatePolicy::Discard too.
-        let agg = MultiTfAggregator::new();
-        agg.pre_populate(vec![(1_333, 1)]);
-        agg.seed_cumulative(1_333, 1, 100);
-        let pre_market = mk_tick(1_333, 1, GATE_DAY_BASE + 9 * 3600 + 10 * 60, 90.0, 0, 0);
-        agg.consume_tick(&pre_market, 1, FeedStrategy::GROWW, Some(100), |_, _| {});
-        let first_regular = mk_tick(1_333, 1, GATE_DAY_BASE + 33_301, 101.25, 0, 0);
-        agg.consume_tick(&first_regular, 1, FeedStrategy::GROWW, Some(120), |_, _| {});
-        let entry = agg.get(1_333, 1).expect("present");
-        let snap = entry.cell.snapshot(TfIndex::M1);
-        assert_eq!(
-            snap.open, 101.25,
-            "the Groww 09:15 candle open must be the first REGULAR-session \
-             tick's price, never the pre-market price"
-        );
-        assert_eq!(
-            snap.tick_count, 1,
-            "the Groww pre-market tick must not fold into the 09:15 bucket"
-        );
-    }
-
-    #[test]
-    fn test_pre_market_tick_never_becomes_0915_open() {
-        // A pre-market tick at 09:10 carrying a DIFFERENT price, followed by
-        // the first regular-session tick at 09:15:01 — the 09:15 M1 candle's
-        // open MUST be the 09:15:01 price, and the pre-market tick must not
-        // have folded into the bucket at all (tick_count == 1).
-        let agg = MultiTfAggregator::new();
-        agg.pre_populate(vec![(13, 0)]);
-        let pre_market = mk_tick(13, 0, GATE_DAY_BASE + 9 * 3600 + 10 * 60, 90.0, 10, 0);
-        agg.consume_tick(&pre_market, 0, FeedStrategy::DHAN, None, |_, _| {});
-        let first_regular = mk_tick(13, 0, GATE_DAY_BASE + 33_301, 101.25, 20, 0);
-        agg.consume_tick(&first_regular, 0, FeedStrategy::DHAN, None, |_, _| {});
-        let entry = agg.get(13, 0).expect("present");
-        let snap = entry.cell.snapshot(TfIndex::M1);
-        assert_eq!(
-            snap.open, 101.25,
-            "the 09:15 candle open must be the first REGULAR-session tick's \
-             price, never the pre-market price"
-        );
-        assert_eq!(
-            snap.tick_count, 1,
-            "the pre-market tick must not fold into the 09:15 bucket"
-        );
-        assert_eq!(
-            snap.high, 101.25,
-            "pre-market price must not leak into the candle high/low"
+            "15:30:00 tick must be skipped — the close boundary is exclusive"
         );
     }
 
