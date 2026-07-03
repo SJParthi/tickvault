@@ -1887,23 +1887,26 @@ rules:
       one-off respawn at shutdown is benign; a sustained respawn rate is a real
       supervisor bug — escalate so the operator inspects the panic backtrace.
 
-  # PROC-01 = the supervised OOM monitor observed the cgroup-v2 oom_kill counter
-  # rise above its boot-time baseline — one or more processes in this cgroup
-  # (tickvault itself OR a sidecar) were killed by the kernel OOM killer. This is
-  # Critical severity (is_auto_triage_safe() == false), so it MUST escalate:
-  # a real OOM points at a memory leak or an unexpected working-set spike, and a
-  # repeating OOM-loop during market hours will keep starving the feeds until the
-  # operator acts. Never auto-action.
-  - name: proc-01-oom-kill-detected-escalate
+  # HTTP-CLIENT-01 = reqwest ClientBuilder::build() failed at a storage
+  # HTTP-client site (TLS backend / resolver init / fd exhaustion). The site
+  # already degraded gracefully (typed error — skipped one probe/DDL write,
+  # never a panic, never the process; C2 fix 2026-07-03 replacing the
+  # Client::new() panic fallback). Escalate so the operator inspects the
+  # underlying resource pressure (fd count, RESOURCE-01) per the runbook;
+  # 5-min cooldown since a pressured host can emit on every 5s/10s probe tick.
+  - name: http-client-01-build-failed-escalate
     match:
-      code: PROC-01
+      code: HTTP-CLIENT-01
     action: escalate
-    runbook_path: .claude/rules/project/wave-4-error-codes.md
+    runbook_path: .claude/rules/project/http-client-error-codes.md
     confidence: 1.0
-    cooldown_secs: 0
+    cooldown_secs: 300
     justification: >-
-      PROC-01 = the OOM monitor detected a kernel OOM kill in this cgroup
-      (tickvault or a sidecar) via a positive oom_kill delta vs the boot-time
-      baseline. Critical severity — never auto-action; escalate so the operator
-      inspects host memory pressure + the offending subsystem per the runbook
-      before a repeating OOM-loop starves the feeds.
+      HTTP-CLIENT-01 = a reqwest client could not be built (TLS/resolver/fd
+      init failure). The degrade already happened — the single probe or
+      cold-path DDL write was skipped with error!+counter
+      (tv_http_client_build_failed_total{site}); no auto-fix applies because
+      the root cause is host resource pressure (check /proc/<pid>/fd,
+      cross-check RESOURCE-01 and WS reconnect churn). Escalate with a 300s
+      cooldown so a sustained-pressure window pages once per 5 minutes, not
+      once per probe tick.
