@@ -615,6 +615,10 @@ async fn main() -> Result<()> {
             config.questdb.clone(),
             groww_max_subscribe,
             config.network.request_timeout_ms,
+            // 2026-07-03 Telegram feed parity: same lazily-filled notifier
+            // slot the sidecar supervisor uses — carries the Groww
+            // instruments-load Info ping once the watch-set resolves.
+            std::sync::Arc::clone(&groww_sidecar_notifier_slot),
             // §34: in scale mode the watcher publishes the daily subscribe
             // set here so the ladder can cut shards. `None` (scale OFF) is
             // byte-identical to the pre-scale watcher behavior.
