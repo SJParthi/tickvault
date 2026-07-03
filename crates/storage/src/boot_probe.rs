@@ -6,7 +6,6 @@
 
 use std::time::Duration;
 
-use reqwest::Client;
 use tracing::{debug, error, info, warn};
 
 use tickvault_common::config::QuestDbConfig;
@@ -34,8 +33,9 @@ const ESCALATION_INFO_AT_SECS: u64 = BOOT_ESCALATION_INFO_AT_SECS;
 const ESCALATION_WARN_AT_SECS: u64 = BOOT_ESCALATION_WARN_AT_SECS;
 const ESCALATION_ERROR_AT_SECS: u64 = BOOT_ESCALATION_ERROR_AT_SECS;
 
-/// HTTP request timeout for a single QuestDB readiness probe.
-const PROBE_REQUEST_TIMEOUT_SECS: u64 = 2;
+// HTTP request timeout for a single QuestDB readiness probe now lives at
+// `crate::http_client::PROBE_REQUEST_TIMEOUT_SECS` (C2 2026-07-03) — the
+// shared OnceLock probe client owns its own timeout.
 /// Sleep between consecutive QuestDB readiness probes.
 const PROBE_POLL_INTERVAL_MS: u64 = 500;
 
@@ -64,11 +64,28 @@ pub async fn wait_for_questdb_ready(
         "http://{}:{}/exec?query=SELECT%201",
         questdb_config.host, questdb_config.http_port
     );
-    // O(1) EXEMPT: constructor — runs once at boot.
-    let client = Client::builder()
-        .timeout(Duration::from_secs(PROBE_REQUEST_TIMEOUT_SECS))
-        .build()
-        .unwrap_or_else(|_| Client::new());
+    // O(1) EXEMPT: shared process-wide client — built ONCE (OnceLock), a
+    // single atomic load on every later call. This fn is invoked on the
+    // every-5s pool-watchdog tick and the every-10s SLO scheduler tick, so
+    // the previous per-invocation `Client::builder()...unwrap_or_else(|_|
+    // Client::new())` re-ran TLS/resolver init thousands of times per
+    // session AND panicked (silent tokio-task death) exactly when the
+    // builder could fail — fd/resolver exhaustion under a frame storm
+    // (2026-07-03 10:35 IST SLO-publisher incident). C2 fix: typed error,
+    // never panic.
+    let client = match crate::http_client::shared_probe_client() {
+        Ok(client) => client,
+        Err(err) => {
+            error!(
+                error = %err,
+                code = ErrorCode::HttpClient01BuildFailed.code_str(),
+                "HTTP-CLIENT-01 reqwest client build failed — QuestDB readiness probe cannot run"
+            );
+            metrics::counter!("tv_http_client_build_failed_total", "site" => "boot_probe")
+                .increment(1);
+            return Err(BootProbeError::ClientBuild(err));
+        }
+    };
 
     let started = std::time::Instant::now();
     let deadline = Duration::from_secs(deadline_secs);
@@ -170,6 +187,12 @@ pub enum BootProbeError {
         /// Configured deadline.
         deadline_secs: u64,
     },
+    /// The shared probe HTTP client could not be built (TLS backend /
+    /// resolver init / fd exhaustion). C2 (2026-07-03): replaces the
+    /// `Client::new()` panic fallback — a typed error degrades the single
+    /// probe invocation, never the process. HTTP-CLIENT-01.
+    #[error("QuestDB probe HTTP client build failed — HTTP-CLIENT-01: {0}")]
+    ClientBuild(crate::http_client::HttpClientBuildError),
 }
 
 #[cfg(test)]
@@ -220,6 +243,37 @@ mod tests {
                 assert_eq!(deadline_secs, 2);
                 assert!(elapsed_secs >= 2, "elapsed must be >= deadline");
             }
+            other @ BootProbeError::ClientBuild(_) => {
+                panic!("unreachable host must yield DeadlineExceeded, not {other}");
+            }
         }
+    }
+
+    /// C2 (2026-07-03): unreachable host + shared client still returns the
+    /// typed DeadlineExceeded — never a panic — proving the shared-client
+    /// path preserves the probe's error contract.
+    #[tokio::test]
+    async fn test_wait_for_questdb_ready_unreachable_returns_deadline_not_panic_with_shared_client()
+    {
+        // Pre-warm the shared client so this test exercises the reuse path.
+        let shared = crate::http_client::shared_probe_client();
+        assert!(shared.is_ok(), "shared probe client must build in tests");
+        let cfg = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: 1,
+            pg_port: 8812,
+            ilp_port: 9009,
+        };
+        let result = wait_for_questdb_ready(&cfg, 2).await;
+        assert!(
+            matches!(
+                result,
+                Err(BootProbeError::DeadlineExceeded {
+                    deadline_secs: 2,
+                    ..
+                })
+            ),
+            "expected DeadlineExceeded, got {result:?}"
+        );
     }
 }

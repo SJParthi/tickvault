@@ -1898,12 +1898,32 @@ pub async fn ensure_tick_table_dedup_keys(questdb_config: &QuestDbConfig) {
         questdb_config.host, questdb_config.http_port
     );
 
-    // Client::builder().timeout().build() is infallible (no custom TLS).
-    // Coverage: unwrap_or_else avoids uncoverable else-return on dead path.
-    let client = Client::builder()
+    // C2 (2026-07-03): panic-free client build. The old comment claimed
+    // "infallible (no custom TLS)" — WRONG under fd/resolver exhaustion,
+    // where the builder fails AND the Client::new() fallback panics (silent
+    // tokio-task death). Degrade: skip the DDL this boot; the next boot
+    // re-runs it (idempotent), and the ILP writer's ring/spill absorbs.
+    let client = match Client::builder()
         .timeout(Duration::from_secs(QUESTDB_DDL_TIMEOUT_SECS))
         .build()
-        .unwrap_or_else(|_| Client::new());
+    {
+        Ok(client) => client,
+        Err(err) => {
+            error!(
+                error = %err,
+                code = tickvault_common::error_code::ErrorCode::HttpClient01BuildFailed.code_str(),
+                "HTTP-CLIENT-01 reqwest client build failed — ticks table DDL skipped: \
+                 if the table does not exist yet, ILP auto-create will lack DEDUP keys until \
+                 the next successful boot (duplicate-row window)"
+            );
+            metrics::counter!(
+                "tv_http_client_build_failed_total",
+                "site" => "ticks_ensure_dedup"
+            )
+            .increment(1);
+            return;
+        }
+    };
 
     // Step 1: Create the table with explicit schema (idempotent).
     match client
@@ -2136,12 +2156,29 @@ pub async fn check_tick_gaps_after_recovery(questdb_config: &QuestDbConfig, look
         questdb_config.host, questdb_config.http_port
     );
 
-    // Client::builder().timeout().build() is infallible (no custom TLS).
-    // Coverage: unwrap_or_else avoids uncoverable else-return on dead path.
-    let client = Client::builder()
+    // C2 (2026-07-03): panic-free client build. The old comment claimed
+    // "infallible (no custom TLS)" — WRONG under fd/resolver exhaustion,
+    // where the builder fails AND the Client::new() fallback panics (silent
+    // tokio-task death). Degrade: skip this one best-effort gap check.
+    let client = match Client::builder()
         .timeout(Duration::from_secs(QUESTDB_DDL_TIMEOUT_SECS))
         .build()
-        .unwrap_or_else(|_| Client::new());
+    {
+        Ok(client) => client,
+        Err(err) => {
+            error!(
+                error = %err,
+                code = tickvault_common::error_code::ErrorCode::HttpClient01BuildFailed.code_str(),
+                "HTTP-CLIENT-01 reqwest client build failed — post-recovery tick gap check skipped"
+            );
+            metrics::counter!(
+                "tv_http_client_build_failed_total",
+                "site" => "tick_gap_check"
+            )
+            .increment(1);
+            return;
+        }
+    };
 
     // Query: count ticks per 1-minute bucket in the last N minutes.
     let sql = format!(
