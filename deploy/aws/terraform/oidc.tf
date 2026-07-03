@@ -131,6 +131,15 @@ resource "aws_iam_role_policy" "github_deploy" {
         Resource = aws_sns_topic.tv_alerts.arn
       },
       {
+        # B9 deploy provenance: after a VERIFIED swap, deploy-aws.yml
+        # records the deployed binary's git SHA to this one parameter.
+        # Read back by the operator-portal footer + the deploy-watchdog
+        # binary-vs-main mismatch metric. Scoped to exactly this ARN.
+        Effect   = "Allow"
+        Action   = ["ssm:PutParameter"]
+        Resource = "arn:aws:ssm:${var.aws_region}:*:parameter/tickvault/${var.environment}/deploy/binary-git-sha"
+      },
+      {
         # EC2 describe — read-only, used by the workflow to fetch
         # the instance state during the post-deploy monitor
         Effect = "Allow"

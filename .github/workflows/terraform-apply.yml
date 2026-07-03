@@ -93,6 +93,15 @@ env:
   # false, so local/other applies are unaffected). This creates the portal
   # Lambda + Function URL on the next apply.
   TF_VAR_enable_operator_control_lambda: "true"
+  # B4 QuestDB console: opt prod IN the same way (variable default stays
+  # false). Creates the console API-GW + front/back Lambdas + the SG-to-SG
+  # 9000 ingress on the next apply.
+  TF_VAR_enable_questdb_console: "true"
+  # B9 deploy provenance: the git SHA of the repo tree this plan/apply runs
+  # from — surfaces as the operator-portal footer "portal <sha7>" and the
+  # terraform output portal_git_sha. Workflow-level env so BOTH the plan
+  # and apply jobs see the same value.
+  TF_VAR_portal_git_sha: ${{ github.sha }}
   AWS_REGION: ap-south-1
   TF_DIR: deploy/aws/terraform
 
@@ -363,6 +372,25 @@ jobs:
             --message "Your tickvault operator portal is live. Tap to open (your key is baked in — do NOT forward this message): ${LINK}" >/dev/null
           echo "✅ Published the ready-made portal link to Telegram (key NOT shown here)."
           echo "Operator portal URL (key sent privately via Telegram): ${URL}" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Publish QuestDB console URL to Telegram
+        # B4: mirrors the portal-link publish above. No key is minted here —
+        # the console reuses the SAME control-secret; the one-click 90s link
+        # is minted live by the portal's 🗄 button, and the console's own
+        # login page accepts the device key directly. The bare URL is not a
+        # secret (device-key gated inside the handler).
+        run: |
+          set +e
+          QURL=$(terraform -chdir=${{ env.TF_DIR }} output -raw questdb_console_url 2>/dev/null)
+          if [ -z "$QURL" ] || [ "$QURL" = "null" ]; then
+            echo "questdb console disabled — nothing to publish"; exit 0
+          fi
+          aws sns publish --region ${{ env.AWS_REGION }} \
+            --topic-arn "arn:aws:sns:${{ env.AWS_REGION }}:${{ steps.aws_account.outputs.account_id }}:tv-prod-alerts" \
+            --subject "QuestDB console ready" \
+            --message "Your QuestDB console is live (read-only, device-key gated): ${QURL} — one-click open via the portal's 🗄 button, or paste your device key on its login page." >/dev/null
+          echo "✅ Published the QuestDB console link to Telegram."
+          echo "QuestDB console URL: ${QURL}" >> "$GITHUB_STEP_SUMMARY"
 
   # ─────────────────────────────────────────────────────────────────
   # Job 3b: scheduled retry found no drift — skip green, but LOUDLY.

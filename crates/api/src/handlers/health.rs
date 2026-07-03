@@ -11,6 +11,9 @@ use crate::state::SharedAppState;
 pub struct HealthResponse {
     pub status: &'static str,
     pub version: &'static str,
+    /// Git commit SHA the running binary was built from (B9 deploy
+    /// provenance) — `tickvault_common::build_info::BUILD_GIT_SHA`.
+    pub git_sha: &'static str,
     pub subsystems: SubsystemStatus,
 }
 
@@ -111,6 +114,7 @@ pub async fn health_check(State(state): State<SharedAppState>) -> Json<HealthRes
     Json(HealthResponse {
         status: overall,
         version: env!("CARGO_PKG_VERSION"),
+        git_sha: tickvault_common::build_info::BUILD_GIT_SHA,
         subsystems: SubsystemStatus {
             websocket,
             order_update,
@@ -231,6 +235,7 @@ mod tests {
         let resp = HealthResponse {
             status: "healthy",
             version: "0.1.0",
+            git_sha: "0123456789abcdef0123456789abcdef01234567",
             subsystems: SubsystemStatus {
                 websocket: SubsystemInfo {
                     status: "connected",
@@ -261,6 +266,7 @@ mod tests {
         let json = serde_json::to_string(&resp).expect("serialization should succeed");
         assert!(json.contains("\"status\":\"healthy\""));
         assert!(json.contains("\"version\":\"0.1.0\""));
+        assert!(json.contains("\"git_sha\":\"0123456789abcdef0123456789abcdef01234567\""));
         assert!(json.contains("\"websocket\""));
         assert!(json.contains("\"questdb\""));
         assert!(json.contains("\"tick_persistence\""));
@@ -307,6 +313,32 @@ mod tests {
             response.version,
             env!("CARGO_PKG_VERSION"),
             "version must match CARGO_PKG_VERSION"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // HealthResponse: git_sha comes from build_info (B9 deploy provenance)
+    // -------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_health_check_git_sha_matches_build_info() {
+        let health = Arc::new(SystemHealthStatus::new());
+        let state = make_test_state(health);
+        let Json(response) = health_check(State(state)).await;
+
+        assert_eq!(
+            response.git_sha,
+            tickvault_common::build_info::BUILD_GIT_SHA,
+            "git_sha must match the compile-time embedded BUILD_GIT_SHA"
+        );
+        assert!(!response.git_sha.is_empty(), "git_sha must never be empty");
+
+        // The serialized JSON must carry the field under the exact name
+        // the operator/tooling greps for.
+        let json = serde_json::to_string(&response).expect("serialize HealthResponse");
+        assert!(
+            json.contains("\"git_sha\""),
+            "serialized /health must contain the git_sha field: {json}"
         );
     }
 

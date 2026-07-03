@@ -46,3 +46,38 @@ def test_is_stale_ignores_surrounding_whitespace() -> None:
 def test_is_stale_is_case_sensitive_on_real_shas() -> None:
     # Git shas are lowercase hex; a case flip is a genuine difference, not noise.
     assert handler.is_stale("ABCDEF0", "abcdef0") is True
+
+
+# --------------------------------------------------------------------------- #
+# B9 deploy provenance — binary_mismatch_value (pure)
+# --------------------------------------------------------------------------- #
+
+
+def test_binary_mismatch_one_when_known_and_different() -> None:
+    assert handler.binary_mismatch_value("aaaaaaa" + "0" * 33, "bbbbbbb" + "0" * 33) == 1.0
+
+
+def test_binary_mismatch_zero_when_known_and_equal() -> None:
+    sha = "deadbeefcafe0123456789abcdef012345678901"
+    assert handler.binary_mismatch_value(sha, sha) == 0.0
+
+
+def test_binary_mismatch_compares_short7_prefix_and_case_insensitive() -> None:
+    # A 40-hex full sha vs its short-7 form must compare EQUAL (0.0), and
+    # case is normalized (SSM/API sources could disagree on case).
+    full = "deadbeefcafe0123456789abcdef012345678901"
+    assert handler.binary_mismatch_value(full, "deadbee") == 0.0
+    assert handler.binary_mismatch_value(full.upper(), full) == 0.0
+
+
+def test_binary_mismatch_none_when_binary_unknown() -> None:
+    # Never publish a false signal on uncertainty — skip (None).
+    assert handler.binary_mismatch_value(None, "deadbee") is None
+    assert handler.binary_mismatch_value("", "deadbee") is None
+    assert handler.binary_mismatch_value("unknown", "deadbee") is None
+
+
+def test_binary_mismatch_none_when_desired_unknown() -> None:
+    assert handler.binary_mismatch_value("deadbee", None) is None
+    assert handler.binary_mismatch_value("deadbee", "") is None
+    assert handler.binary_mismatch_value("deadbee", "unknown") is None
