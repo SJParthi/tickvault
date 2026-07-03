@@ -1992,6 +1992,41 @@ pub const TOKEN_SWEEP_STALENESS_THRESHOLD_SECS: i64 = 4 * 3600;
 /// - ZERO frame loss guarantee — backpressure, never drop.
 pub const FRAME_CHANNEL_CAPACITY: usize = 131_072;
 
+/// WAL re-injection chunk size (STAGE-C.2b boot recovery — COLD path).
+///
+/// The boot-time WAL replay re-injects recovered frames into the pool's
+/// frame channel with backpressured `send().await` (never `try_send`,
+/// never drop). Every `WAL_REINJECT_CHUNK_SIZE` delivered frames the
+/// injector calls `tokio::task::yield_now()` so the live WS read loop and
+/// the tick processor get scheduled — a 1M+ frame replay must never
+/// monopolize the runtime. Must stay well under
+/// [`FRAME_CHANNEL_CAPACITY`] (131,072) so one chunk can always fit the
+/// channel and per-chunk progress is guaranteed while the consumer drains.
+pub const WAL_REINJECT_CHUNK_SIZE: usize = 8_192;
+
+/// Per-send stall timeout for the WAL re-injection (seconds).
+///
+/// Each backpressured `send().await` during STAGE-C.2b re-injection is
+/// wrapped in `tokio::time::timeout`. A healthy tick processor drains the
+/// frame channel continuously, so 30 seconds of ZERO progress on a single
+/// send means the consumer is wedged or dead — the injector aborts
+/// (WS-REINJECT-01), leaving the remaining frames staged in the WAL
+/// `replaying/` directory for re-replay next boot. Fail-closed: an abort
+/// keeps the re-injection NOT-clean so `confirm_replayed()` never
+/// archives a partially delivered replay (durable WAL floor preserved).
+pub const WAL_REINJECT_SEND_TIMEOUT_SECS: u64 = 30;
+
+/// Emit a WAL re-injection progress `info!` every this many delivered chunks.
+///
+/// 16 chunks × [`WAL_REINJECT_CHUNK_SIZE`] (8,192) = every ~131,072 frames —
+/// one progress line per channel-capacity's worth of replay. A pathologically
+/// large WAL (1M+ frames) drains inline before `notify_systemd_ready`, so an
+/// operator tailing logs during a long boot sees periodic
+/// `WAL re-injection progress` lines instead of a silent multi-second stall
+/// (boot wall-clock scales linearly with WAL backlog size by design —
+/// zero-drop trade-off; systemd tolerates it via `TimeoutStartSec=infinity`).
+pub const WAL_REINJECT_PROGRESS_LOG_CHUNKS: u64 = 16;
+
 /// Power-of-two exponent for the tick deduplication ring buffer.
 ///
 /// Size = 2^16 = 65,536 slots x 8 bytes = 512 KiB.
@@ -3544,5 +3579,63 @@ mod tests {
         assert!(has("NIFTY MIDCAP SELECT", "MIDCPNIFTY"));
         assert!(has("NIFTY MIDCAP 50", "NIFTYMCAP50"));
         assert!(has("NIFTY TOTAL MARKET", "NIFTY TOTAL MKT"));
+    }
+
+    // =======================================================================
+    // B6 mutation kills (2026-07-03) — exact computed values for every
+    // arithmetic const initializer the unmasked mutation gate found MISSED.
+    // Each assert pins the fully-evaluated number so ANY operator swap
+    // (`*`→`+`, `*`→`/`, `+`→`-`, `/`→`%`, ...) in the initializer fails.
+    // =======================================================================
+
+    #[test]
+    fn test_max_csv_body_bytes_is_exactly_50_mib() {
+        // 50 * 1024 * 1024 — kills the 4 arithmetic mutants at the initializer.
+        assert_eq!(MAX_CSV_BODY_BYTES, 52_428_800);
+    }
+
+    #[test]
+    fn test_tick_buffer_high_watermark_is_exactly_80_percent() {
+        // TICK_BUFFER_CAPACITY * 4 / 5 — kills `*`/`/` swaps at the initializer.
+        assert_eq!(TICK_BUFFER_CAPACITY, 100_000);
+        assert_eq!(TICK_BUFFER_HIGH_WATERMARK, 80_000);
+    }
+
+    #[test]
+    fn test_tick_spill_min_disk_space_is_exactly_100_mib() {
+        // 100 * 1024 * 1024 — kills the 4 arithmetic mutants at the initializer.
+        assert_eq!(TICK_SPILL_MIN_DISK_SPACE_BYTES, 104_857_600);
+    }
+
+    #[test]
+    fn test_spill_file_max_age_is_exactly_7_days() {
+        // 7 * 24 * 3600 — kills the 4 arithmetic mutants at the initializer.
+        assert_eq!(SPILL_FILE_MAX_AGE_SECS, 604_800);
+    }
+
+    #[test]
+    fn test_stock_contracts_per_expiry_is_exactly_43() {
+        // (1 + 10 + 10) * 2 + 1 = 43 — kills all 8 arithmetic mutants at the
+        // initializer (every operator swap yields a value ≠ 43).
+        assert_eq!(STOCK_ATM_STRIKES_ABOVE, 10);
+        assert_eq!(STOCK_ATM_STRIKES_BELOW, 10);
+        assert_eq!(STOCK_CONTRACTS_PER_EXPIRY, 43);
+    }
+
+    #[test]
+    fn test_token_sweep_interval_is_exactly_4_hours() {
+        // 4 * 3600 — kills the `*`→`+` / `*`→`/` mutants at the initializer.
+        assert_eq!(TOKEN_SWEEP_INTERVAL_SECS, 14_400);
+    }
+
+    #[test]
+    fn test_token_sweep_staleness_threshold_is_exactly_4_hours() {
+        // 4 * 3600 — kills the `*`→`+` / `*`→`/` mutants at the initializer,
+        // and pins the alignment with TOKEN_SWEEP_INTERVAL_SECS.
+        assert_eq!(TOKEN_SWEEP_STALENESS_THRESHOLD_SECS, 14_400);
+        assert_eq!(
+            TOKEN_SWEEP_STALENESS_THRESHOLD_SECS,
+            TOKEN_SWEEP_INTERVAL_SECS as i64
+        );
     }
 }

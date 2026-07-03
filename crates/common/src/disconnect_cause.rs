@@ -335,6 +335,92 @@ mod tests {
     }
 
     #[test]
+    fn test_label_exact_strings_kill_mutants() {
+        // B6 mutation kill (label -> "" / "xyzzy"): the non-empty check alone
+        // let the "xyzzy" mutant survive — pin every operator-facing string
+        // EXACTLY (these are the Telegram "Likely source:" lines).
+        assert_eq!(
+            DisconnectCause::DhanTooManyConnections.label(),
+            "Dhan (another login)"
+        );
+        assert_eq!(
+            DisconnectCause::DhanTokenExpired.label(),
+            "Dhan (login token expired)"
+        );
+        assert_eq!(
+            DisconnectCause::DhanAuthOrSubscription.label(),
+            "Dhan (login / data plan)"
+        );
+        assert_eq!(
+            DisconnectCause::DhanOrNetworkReset.label(),
+            "Dhan or network"
+        );
+        assert_eq!(
+            DisconnectCause::NetworkOrTls.label(),
+            "Network / connection"
+        );
+        assert_eq!(DisconnectCause::Unknown.label(), "Unknown");
+    }
+
+    #[test]
+    fn test_explanation_exact_strings_kill_mutants() {
+        // B6 mutation kill (explanation -> "" / "xyzzy"): exact-string pins.
+        assert_eq!(
+            DisconnectCause::DhanTooManyConnections.explanation(),
+            "another device or app is logged into your Dhan account, so Dhan dropped this one"
+        );
+        assert_eq!(
+            DisconnectCause::DhanTokenExpired.explanation(),
+            "your daily Dhan login expired; the app refreshes it automatically"
+        );
+        assert_eq!(
+            DisconnectCause::DhanAuthOrSubscription.explanation(),
+            "Dhan refused the connection — likely a login or data-plan issue"
+        );
+        assert_eq!(
+            DisconnectCause::DhanOrNetworkReset.explanation(),
+            "Dhan's server or the line in between dropped the connection; the app reconnects on its own"
+        );
+        assert_eq!(
+            DisconnectCause::NetworkOrTls.explanation(),
+            "the connection could not be completed (network, DNS or handshake)"
+        );
+        assert_eq!(
+            DisconnectCause::Unknown.explanation(),
+            "the cause could not be identified — see the exact error above"
+        );
+    }
+
+    #[test]
+    fn test_confirm_hint_exact_strings_kill_mutants() {
+        // B6 mutation kill (confirm_hint -> "" / "xyzzy"): exact-string pins.
+        assert_eq!(
+            DisconnectCause::DhanTooManyConnections.confirm_hint(),
+            "close other Dhan logins (the Dhan website's live chart, the Dhan mobile app, any other script)"
+        );
+        assert_eq!(
+            DisconnectCause::DhanTokenExpired.confirm_hint(),
+            "auto-refresh handles it; if it keeps repeating, re-check the token / TOTP"
+        );
+        assert_eq!(
+            DisconnectCause::DhanAuthOrSubscription.confirm_hint(),
+            "check your Dhan data plan + login is active"
+        );
+        assert_eq!(
+            DisconnectCause::DhanOrNetworkReset.confirm_hint(),
+            "if other Dhan calls failed at the same time it is the network; if only the feed dropped it is Dhan-side"
+        );
+        assert_eq!(
+            DisconnectCause::NetworkOrTls.confirm_hint(),
+            "check this server's internet + DNS to Dhan; if other sites work it is likely Dhan-side"
+        );
+        assert_eq!(
+            DisconnectCause::Unknown.confirm_hint(),
+            "investigate the exact error shown above"
+        );
+    }
+
+    #[test]
     fn test_classify_disconnect_cause_is_total_and_deterministic() {
         // Summary coverage: classify_disconnect_cause is a TOTAL function (every
         // input yields a valid variant, never panics) and deterministic (same

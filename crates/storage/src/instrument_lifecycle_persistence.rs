@@ -378,10 +378,30 @@ pub async fn ensure_instrument_lifecycle_table(questdb_config: &QuestDbConfig) {
         "http://{}:{}/exec",
         questdb_config.host, questdb_config.http_port
     );
-    let client = Client::builder()
+    // C2 (2026-07-03): panic-free client build — Client::new() panics on
+    // TLS/resolver/fd init failure (silent tokio-task death). Degrade:
+    // skip the DDL this boot; the next boot re-runs it (idempotent).
+    let client = match Client::builder()
         .timeout(Duration::from_secs(QUESTDB_EXEC_TIMEOUT_SECS))
         .build()
-        .unwrap_or_else(|_| Client::new());
+    {
+        Ok(client) => client,
+        Err(err) => {
+            error!(
+                error = %err,
+                code = tickvault_common::error_code::ErrorCode::HttpClient01BuildFailed.code_str(),
+                "HTTP-CLIENT-01 reqwest client build failed — instrument_lifecycle DDL \
+                 skipped: if the table does not exist yet, ILP auto-create will lack DEDUP \
+                 keys until the next successful boot (duplicate-row window)"
+            );
+            metrics::counter!(
+                "tv_http_client_build_failed_total",
+                "site" => "lifecycle_ensure"
+            )
+            .increment(1);
+            return;
+        }
+    };
 
     let create_ddl = format!(
         "CREATE TABLE IF NOT EXISTS {QUESTDB_TABLE_INSTRUMENT_LIFECYCLE} (\
@@ -803,10 +823,30 @@ pub async fn ensure_instrument_lifecycle_audit_table(questdb_config: &QuestDbCon
         "http://{}:{}/exec",
         questdb_config.host, questdb_config.http_port
     );
-    let client = Client::builder()
+    // C2 (2026-07-03): panic-free client build — Client::new() panics on
+    // TLS/resolver/fd init failure (silent tokio-task death). Degrade:
+    // skip the DDL this boot; the next boot re-runs it (idempotent).
+    let client = match Client::builder()
         .timeout(Duration::from_secs(QUESTDB_EXEC_TIMEOUT_SECS))
         .build()
-        .unwrap_or_else(|_| Client::new());
+    {
+        Ok(client) => client,
+        Err(err) => {
+            error!(
+                error = %err,
+                code = tickvault_common::error_code::ErrorCode::HttpClient01BuildFailed.code_str(),
+                "HTTP-CLIENT-01 reqwest client build failed — instrument_lifecycle_audit DDL \
+                 skipped: if the table does not exist yet, ILP auto-create will lack DEDUP \
+                 keys until the next successful boot (duplicate-row window)"
+            );
+            metrics::counter!(
+                "tv_http_client_build_failed_total",
+                "site" => "lifecycle_audit_ensure"
+            )
+            .increment(1);
+            return;
+        }
+    };
 
     let create_ddl = format!(
         "CREATE TABLE IF NOT EXISTS {QUESTDB_TABLE_INSTRUMENT_LIFECYCLE_AUDIT} (\

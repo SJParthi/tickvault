@@ -244,6 +244,30 @@ pub enum ErrorCode {
     /// durable-loss signal — previously this arm returned silently.
     /// Severity::Critical.
     WsSpill02FrameDropped,
+    /// WS-REINJECT-01: the boot-time STAGE-C.2b WAL re-injection ABORTED —
+    /// a backpressured `send().await` into the pool frame channel either
+    /// returned `SendError` (tick-processor consumer dropped) or exceeded
+    /// the bounded per-send timeout (`WAL_REINJECT_SEND_TIMEOUT_SECS` —
+    /// consumer wedged). The injector STOPS, counts the remaining frames
+    /// as aborted, and the re-injection is NOT marked clean, so
+    /// `confirm_replayed()` is skipped and the staged WAL segments
+    /// re-replay next boot — no frame is silently lost (durable WAL
+    /// floor). Replaces the pre-2026-07-03 silent `try_send` drop storm
+    /// (dropped=1,127,801 at 10:35 IST — everything past
+    /// `FRAME_CHANNEL_CAPACITY` dropped, the WAL never confirmed, and the
+    /// replay re-grew every restart). Severity::High — the abort
+    /// self-heals via next boot's replay; a dead consumer usually means
+    /// the process is restarting anyway.
+    WsReinject01Aborted,
+    /// TICK-FLUSH-01: the off-thread tick ILP flush worker died (panic or a
+    /// fatal return) and the supervisor respawned it — mirrors WS-SPILL-01
+    /// (WAL writer) and WS-GAP-05 (pool supervisor). Self-healing: the
+    /// respawn re-enters the loop with the SAME channels, so queued flush
+    /// batches survive and the writer's `append` never sees `Disconnected`.
+    /// B6 (2026-07-03): this worker is what keeps the blocking questdb ILP
+    /// TCP flush OFF the tick-consumer thread. Severity::High (a flapping
+    /// flush worker means QuestDB ILP or the host is degrading).
+    TickFlush01WorkerRespawn,
     /// PROC-01: an OOM kill was detected — the cgroup-v2 `memory.events`
     /// `oom_kill` counter rose above the boot-time baseline. Some process in
     /// this cgroup (tickvault itself or a sidecar) was killed by the kernel
@@ -679,6 +703,18 @@ pub enum ErrorCode {
     /// resumes on respawn. Severity::High (a supervisor that keeps dying points at
     /// a real bug), auto-triage-safe (the respawn already self-healed).
     FeedSupervisor01Respawned,
+    /// HTTP-CLIENT-01 (C2 2026-07-03) — `reqwest::ClientBuilder::build()`
+    /// failed (TLS backend init / resolver init / fd exhaustion). Previously
+    /// 8 storage sites fell back to `Client::new()`, which PANICS on the
+    /// exact same failure conditions — a silent tokio-task death (the
+    /// suspected mechanism behind the 2026-07-03 10:35 IST SLO-publisher
+    /// death during a 1.13M-frame storm). Now a typed error degrades the
+    /// single probe/write and the site logs + counts
+    /// (`tv_http_client_build_failed_total{site}`), never the process.
+    /// Severity::High, auto-triage-safe (the degrade already happened; the
+    /// operator inspects the fd/resolver pressure — cross-check
+    /// RESOURCE-01).
+    HttpClient01BuildFailed,
 }
 
 impl ErrorCode {
@@ -740,6 +776,8 @@ impl ErrorCode {
             Self::DiskWatcher01Respawned => "DISK-WATCHER-01",
             Self::WsSpill01WriterRespawn => "WS-SPILL-01",
             Self::WsSpill02FrameDropped => "WS-SPILL-02",
+            Self::WsReinject01Aborted => "WS-REINJECT-01",
+            Self::TickFlush01WorkerRespawn => "TICK-FLUSH-01",
             Self::Proc01OomKillDetected => "PROC-01",
             Self::AuthGap03TokenForceRenewedOnWake => "AUTH-GAP-03",
             Self::AuthGap04TotpRotatedExternally => "AUTH-GAP-04",
@@ -835,6 +873,8 @@ impl ErrorCode {
             Self::GrowwMaster01PersistFailed => "GROWW-MASTER-01",
             Self::FeedStall01SidecarRestarted => "FEED-STALL-01",
             Self::FeedSupervisor01Respawned => "FEED-SUPERVISOR-01",
+            // C2 (2026-07-03): panic-free reqwest client construction
+            Self::HttpClient01BuildFailed => "HTTP-CLIENT-01",
         }
     }
 
@@ -923,6 +963,13 @@ impl ErrorCode {
             | Self::WsGap07LiveChannelClosed
             // WS-SPILL-01 — WAL writer respawned (flapping writer = disk dying)
             | Self::WsSpill01WriterRespawn
+            // WS-REINJECT-01 — boot WAL re-injection aborted (consumer dead/
+            // wedged); frames stay staged in replaying/ — self-heals on the
+            // next boot's replay, but the operator must see a dead consumer
+            | Self::WsReinject01Aborted
+            // TICK-FLUSH-01 — off-thread tick flush worker respawned (B6);
+            // flapping = QuestDB ILP / host degrading
+            | Self::TickFlush01WorkerRespawn
             // DHAN-LANE-01/02/03 — runtime Dhan-lane cold-start failures (D2b
             // 2026-06-26): a failed cold-start returns the FSM to Off + pages
             // the operator, never a half-running lane. High (operator must
@@ -941,7 +988,11 @@ impl ErrorCode {
             // monitors: page at 80% so the operator acts before exhaustion.
             | Self::Resource01FdCountHigh
             | Self::Resource02ResidentMemoryHigh
-            | Self::Resource03SpillFreeLow => Severity::High,
+            | Self::Resource03SpillFreeLow
+            // HTTP-CLIENT-01 (C2 2026-07-03) — a failed client build means the
+            // host is under TLS/resolver/fd pressure; the site already
+            // degraded gracefully, but the operator must see it (High).
+            | Self::HttpClient01BuildFailed => Severity::High,
             // Medium: data pipeline correctness
             // PR #6b (2026-05-19): I-P0-01/02/04/05 retired with their modules.
             Self::InstrumentP1CrossSegmentCollision
@@ -1047,6 +1098,12 @@ impl ErrorCode {
             | Self::PrevClose04CacheEmptyAtBoot => ".claude/rules/project/wave-1-error-codes.md",
             Self::WsSpill01WriterRespawn | Self::WsSpill02FrameDropped => {
                 ".claude/rules/project/ws-frame-spill-error-codes.md"
+            }
+            // C3 (2026-07-03): bounded chunked backpressure WAL re-injection
+            Self::WsReinject01Aborted => ".claude/rules/project/ws-reinject-error-codes.md",
+            // B6 (2026-07-03): off-thread tick ILP flush worker
+            Self::TickFlush01WorkerRespawn => {
+                ".claude/rules/project/tick-flush-worker-error-codes.md"
             }
             Self::WsGap04PostCloseSleep
             | Self::WsGap05PoolRespawn
@@ -1172,6 +1229,10 @@ impl ErrorCode {
             Self::FeedStall01SidecarRestarted | Self::FeedSupervisor01Respawned => {
                 ".claude/rules/project/feed-stall-watchdog-error-codes.md"
             }
+            // C2 (2026-07-03): panic-free reqwest client construction
+            Self::HttpClient01BuildFailed => {
+                ".claude/rules/project/http-client-error-codes.md"
+            }
         }
     }
 
@@ -1258,6 +1319,8 @@ impl ErrorCode {
             Self::DiskWatcher01Respawned,
             Self::WsSpill01WriterRespawn,
             Self::WsSpill02FrameDropped,
+            Self::WsReinject01Aborted,
+            Self::TickFlush01WorkerRespawn,
             Self::Proc01OomKillDetected,
             Self::AuthGap03TokenForceRenewedOnWake,
             Self::AuthGap04TotpRotatedExternally,
@@ -1328,6 +1391,8 @@ impl ErrorCode {
             // 2026-06-30: feed-agnostic sidecar stall-watchdog + supervisor respawn
             Self::FeedStall01SidecarRestarted,
             Self::FeedSupervisor01Respawned,
+            // C2 (2026-07-03): panic-free reqwest client construction
+            Self::HttpClient01BuildFailed,
         ]
     }
 }
@@ -1612,7 +1677,15 @@ mod tests {
         // 2026-07-03 (SLO publisher supervisor): bumped 115 -> 116 for SLO-03
         // (the 10s tv_realtime_guarantee_score publisher died silently at
         // 10:35 IST mid-market; now supervised + respawned).
-        assert_eq!(ErrorCode::all().len(), 116);
+        // 2026-07-03 (B6 latency-histogram split): bumped 116 -> 117 for
+        // TICK-FLUSH-01 (off-thread tick ILP flush worker respawned).
+        // 2026-07-03 (C3 re-injection storm fix): bumped 117 -> 118 for
+        // WS-REINJECT-01 (boot WAL re-injection aborted — chunked
+        // backpressure replaces the silent try_send drop storm).
+        // 2026-07-03 (C2 panic-free reqwest client): bumped 118 -> 119 for
+        // HTTP-CLIENT-01 (ClientBuilder::build failed — typed degrade
+        // replaces the Client::new() panic fallback at 8 storage sites).
+        assert_eq!(ErrorCode::all().len(), 119);
     }
 
     #[test]
@@ -1636,6 +1709,35 @@ mod tests {
             .expect("workspace root");
         let shown = abs.display().to_string();
         assert!(abs.exists(), "PREVDAY-01 runbook missing on disk: {shown}");
+        // Listed in the catalogue.
+        assert!(ErrorCode::all().contains(&code));
+    }
+
+    #[test]
+    fn test_ws_reinject_01_aborted_contract() {
+        let code = ErrorCode::WsReinject01Aborted;
+        // Wire-format string + roundtrip via FromStr.
+        assert_eq!(code.code_str(), "WS-REINJECT-01");
+        assert_eq!("WS-REINJECT-01".parse::<ErrorCode>(), Ok(code));
+        // High (abort self-heals via next boot's WAL re-replay) and
+        // therefore auto-triage-safe.
+        assert_eq!(code.severity(), Severity::High);
+        assert!(code.is_auto_triage_safe());
+        // Runbook points at the dedicated rule file and exists on disk.
+        assert_eq!(
+            code.runbook_path(),
+            ".claude/rules/project/ws-reinject-error-codes.md"
+        );
+        let abs = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(std::path::Path::parent)
+            .map(|root| root.join(code.runbook_path()))
+            .expect("workspace root");
+        let shown = abs.display().to_string();
+        assert!(
+            abs.exists(),
+            "WS-REINJECT-01 runbook missing on disk: {shown}"
+        );
         // Listed in the catalogue.
         assert!(ErrorCode::all().contains(&code));
     }
@@ -1674,6 +1776,8 @@ mod tests {
                 || s.starts_with("VOLUME-")
                 // DHAN-REST-400 (2026-06-10): scheduled REST-health canary.
                 || s.starts_with("REST-CANARY-")
+                // B6 (2026-07-03): off-thread tick ILP flush worker.
+                || s.starts_with("TICK-FLUSH-")
                 // PR #450 commit 8b (2026-05-03): prev_oi cache state.
                 || s.starts_with("PREVOI-")
                 // Wave 6 Sub-PR #1: multi-TF aggregator + boundary timer.
@@ -1697,6 +1801,8 @@ mod tests {
                 || s.starts_with("DISK-WATCHER-")
                 // zero-tick-loss 2026-06-09: WAL frame-spill writer hardening
                 || s.starts_with("WS-SPILL-")
+                // C3 2026-07-03: bounded chunked-backpressure WAL re-injection
+                || s.starts_with("WS-REINJECT-")
                 // NTM Sub-PR #10a (§31): niftyindices constituent source degrade
                 || s.starts_with("NTM-CONSTITUENCY-")
                 // Operator 2026-06-10: daily end-to-end tick-conservation audit
@@ -1711,7 +1817,9 @@ mod tests {
                 || s.starts_with("FEED-STALL-")
                 || s.starts_with("FEED-SUPERVISOR-")
                 // Wave-4-E1 / BP-07 (2026-07-01): OOM-kill monitor.
-                || s.starts_with("PROC-");
+                || s.starts_with("PROC-")
+                // C2 (2026-07-03): panic-free reqwest client construction.
+                || s.starts_with("HTTP-CLIENT-");
             assert!(has_known_prefix, "unexpected code prefix: {s}");
         }
     }

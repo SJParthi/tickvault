@@ -321,6 +321,18 @@ pub struct TickPersistenceWriter {
     /// `set_spill_dir_for_test()` to avoid shared-path races under parallel
     /// execution. All spill/DLQ paths are derived from this directory.
     spill_dir: std::path::PathBuf,
+    /// B6 (2026-07-03): off-thread ILP flush worker. `Some` in production —
+    /// batch flushes are handed to a dedicated supervised OS thread so the
+    /// blocking questdb TCP write never runs inside the tick-consumer loop's
+    /// timed span. `None` only if the worker thread failed to spawn (the
+    /// writer then degrades to the legacy inline `force_flush`).
+    flush_offload: Option<crate::tick_flush_worker::FlushOffload>,
+    /// B6: nanoseconds of persistence STALL accrued on the hot path since the
+    /// last `take_last_stall_ns()` — the blocking-send fallback, the inline
+    /// force_flush fallback, and the disconnected-branch reconnect/buffer
+    /// work. The tick processor subtracts this from the total span so
+    /// `tv_tick_compute_duration_ns` reports true compute.
+    stall_ns: u64,
 }
 
 impl TickPersistenceWriter {
@@ -343,6 +355,19 @@ impl TickPersistenceWriter {
         // this emission just sets a healthy initial value.
         metrics::gauge!("tv_questdb_connected").set(1.0);
 
+        // B6: spawn the off-thread flush worker. Spawn failure is survivable
+        // — the writer degrades to the legacy inline flush (logged).
+        let flush_offload = match crate::tick_flush_worker::spawn_flush_offload(&conf_string) {
+            Ok(offload) => Some(offload),
+            Err(err) => {
+                error!(
+                    ?err,
+                    "tick flush worker spawn failed — degrading to inline sync flush"
+                );
+                None
+            }
+        };
+
         Ok(Self {
             sender: Some(sender),
             buffer,
@@ -361,6 +386,8 @@ impl TickPersistenceWriter {
             dlq_path: None,
             dlq_ticks_total: 0,
             spill_dir: std::path::PathBuf::from(TICK_SPILL_DIR),
+            flush_offload,
+            stall_ns: 0,
         })
     }
 
@@ -383,6 +410,19 @@ impl TickPersistenceWriter {
         // RED, indistinguishable from a metrics-pipeline outage.
         metrics::gauge!("tv_questdb_connected").set(0.0);
 
+        // B6: the worker connects lazily (throttled) on its first job, so
+        // spawning it here does NOT attempt TCP while QuestDB is down.
+        let flush_offload = match crate::tick_flush_worker::spawn_flush_offload(&conf_string) {
+            Ok(offload) => Some(offload),
+            Err(err) => {
+                error!(
+                    ?err,
+                    "tick flush worker spawn failed — degrading to inline sync flush"
+                );
+                None
+            }
+        };
+
         Self {
             sender: None,
             buffer,
@@ -401,6 +441,8 @@ impl TickPersistenceWriter {
             dlq_path: None,
             dlq_ticks_total: 0,
             spill_dir: std::path::PathBuf::from(TICK_SPILL_DIR),
+            flush_offload,
+            stall_ns: 0,
         }
     }
 
@@ -426,15 +468,21 @@ impl TickPersistenceWriter {
     // TEST-EXEMPT: exercised by every `append_tick` test (the seq-less delegate calls this) + the ring-seq round-trip in test_spill_roundtrip_preserves_capture_seq + chaos_index_same_value_burst_preserved; a direct unit test needs a live/mock QuestDB ILP writer.
     pub fn append_tick_with_seq(&mut self, tick: &ParsedTick, capture_seq: i64) -> Result<()> {
         // If sender is None (previous failure), attempt reconnect before writing.
+        // B6: this recovery branch (reconnect + ring drain / ring buffering)
+        // is persistence STALL, not compute — measured so the compute
+        // histogram can subtract it.
         if self.sender.is_none() {
+            let stall_start = std::time::Instant::now();
             match self.try_reconnect_on_error() {
                 Ok(()) => {
                     // Reconnected — drain any buffered ticks first.
                     self.drain_tick_buffer();
+                    self.note_stall(stall_start);
                 }
                 Err(_) => {
                     // Still can't connect — buffer this tick instead of losing it.
                     self.buffer_tick_seq(*tick, capture_seq);
+                    self.note_stall(stall_start);
                     return Ok(());
                 }
             }
@@ -447,18 +495,11 @@ impl TickPersistenceWriter {
         self.in_flight.push((*tick, capture_seq));
         self.pending_count = self.pending_count.saturating_add(1);
 
-        if self.pending_count >= TICK_FLUSH_BATCH_SIZE
-            && let Err(err) = self.force_flush()
-        {
-            // Wave 5 Item 8: flush/persist failure must be `error!` (Loki →
-            // Telegram), not `warn!`. See
-            // .claude/rules/project/observability-architecture.md Rule 5.
-            // Item 9 will attach a typed `code` field once the dedicated
-            // TickFlushFailed ErrorCode variant lands.
-            error!(
-                ?err,
-                "tick auto-flush failed — in-flight ticks rescued to ring buffer"
-            );
+        // B6: the batch flush is handed to the off-thread worker (zero-stall
+        // O(1) buffer swap in steady state). All failure/fallback paths keep
+        // the zero-loss chain — see `dispatch_batch`.
+        if self.pending_count >= TICK_FLUSH_BATCH_SIZE {
+            self.dispatch_batch();
         }
 
         Ok(())
@@ -492,12 +533,17 @@ impl TickPersistenceWriter {
         capture_seq: i64,
     ) -> Result<()> {
         if self.sender.is_none() {
+            // B6: recovery branch measured as persistence stall (see the
+            // seq-path twin above).
+            let stall_start = std::time::Instant::now();
             match self.try_reconnect_on_error() {
                 Ok(()) => {
                     self.drain_tick_buffer();
+                    self.note_stall(stall_start);
                 }
                 Err(_) => {
                     self.buffer_tick_seq(*tick, capture_seq);
+                    self.note_stall(stall_start);
                     return Ok(());
                 }
             }
@@ -508,13 +554,9 @@ impl TickPersistenceWriter {
         self.in_flight.push((*tick, capture_seq));
         self.pending_count = self.pending_count.saturating_add(1);
 
-        if self.pending_count >= TICK_FLUSH_BATCH_SIZE
-            && let Err(err) = self.force_flush()
-        {
-            error!(
-                ?err,
-                "tick auto-flush failed (enriched path) — in-flight ticks rescued to ring buffer"
-            );
+        // B6: off-thread batch handoff (zero-stall in steady state).
+        if self.pending_count >= TICK_FLUSH_BATCH_SIZE {
+            self.dispatch_batch();
         }
 
         Ok(())
@@ -524,17 +566,170 @@ impl TickPersistenceWriter {
     ///
     /// Call this periodically (e.g., after each batch of frames) to ensure
     /// ticks don't sit in the buffer too long.
+    ///
+    /// B6: this timer path routes through the SAME off-thread offload as the
+    /// batch-threshold path (`dispatch_batch`), and it is also where
+    /// worker-failed batches are drained into the ring rescue chain when the
+    /// tick flow is too slow to hit `dispatch_batch`.
     pub fn flush_if_needed(&mut self) -> Result<()> {
+        // Route any worker-failed batches to the ring even when no new tick
+        // has crossed the batch threshold (≤100ms cadence from the caller).
+        self.drain_failed_batches();
+
         if self.pending_count == 0 {
             return Ok(());
         }
 
         let now_ms = current_time_ms();
         if now_ms.saturating_sub(self.last_flush_ms) >= TICK_FLUSH_INTERVAL_MS {
-            self.force_flush()?;
+            self.dispatch_batch();
         }
 
         Ok(())
+    }
+
+    /// B6: hands the current full ILP buffer + in-flight mirror to the
+    /// off-thread flush worker. Zero-stall O(1) buffer swap in steady state;
+    /// bounded-blocking or inline-sync fallbacks otherwise — every path
+    /// preserves the zero-loss chain and MEASURES any stall so the compute
+    /// histogram (`tv_tick_compute_duration_ns`) stays honest.
+    fn dispatch_batch(&mut self) {
+        // Worker-failed batches are strictly OLDER than the current buffer —
+        // rescue them first so ring FIFO order is preserved.
+        self.drain_failed_batches();
+        if self.pending_count == 0 {
+            return;
+        }
+        if self.sender.is_none() {
+            // Disconnected: rescue in-flight rows + throttled reconnect via
+            // the unchanged synchronous path (cold, measured as stall).
+            let stall_start = std::time::Instant::now();
+            if let Err(err) = self.force_flush() {
+                debug!(?err, "dispatch while disconnected — ticks rescued/buffered");
+            }
+            self.note_stall(stall_start);
+            return;
+        }
+
+        // Disjoint-field borrows: `flush_offload` (shared) vs `buffer` +
+        // `in_flight` (mut) — no aliasing.
+        let outcome = match self.flush_offload.as_ref() {
+            Some(offload) => offload.try_dispatch(&mut self.buffer, &mut self.in_flight),
+            // Worker never spawned — same "unavailable" class as a gone
+            // worker channel (LOW-2).
+            None => crate::tick_flush_worker::DispatchOutcome::WorkerGone,
+        };
+        match outcome {
+            crate::tick_flush_worker::DispatchOutcome::Sent => {
+                self.pending_count = 0;
+                self.last_flush_ms = current_time_ms();
+            }
+            crate::tick_flush_worker::DispatchOutcome::SentAfterBlock(stall) => {
+                self.stall_ns = self.stall_ns.saturating_add(stall);
+                self.pending_count = 0;
+                self.last_flush_ms = current_time_ms();
+            }
+            ref outcome @ (crate::tick_flush_worker::DispatchOutcome::NoSpare
+            | crate::tick_flush_worker::DispatchOutcome::WorkerGone) => {
+                // Legacy inline sync flush (pre-B6 behavior) — measured as
+                // stall + counted so a worker that cannot keep up is visible.
+                // LOW-2: distinguish "worker behind" (pool exhausted) from
+                // "worker unavailable" (never spawned / channel gone) —
+                // static label values only.
+                let reason: &'static str =
+                    if matches!(outcome, crate::tick_flush_worker::DispatchOutcome::NoSpare) {
+                        "pool_empty"
+                    } else {
+                        "worker_unavailable"
+                    };
+                metrics::counter!(
+                    "tv_tick_flush_backpressure_block_total",
+                    "reason" => reason
+                )
+                .increment(1);
+                let stall_start = std::time::Instant::now();
+                let flush_result = self.force_flush();
+                self.note_stall(stall_start);
+                if let Err(err) = flush_result {
+                    // Rule 5: flush/persist failure must be `error!` (routes
+                    // to Telegram), never `warn!`.
+                    error!(
+                        ?err,
+                        "tick auto-flush failed — in-flight ticks rescued to ring buffer"
+                    );
+                }
+            }
+        }
+    }
+
+    /// B6: routes batches the off-thread worker could not flush into the
+    /// EXISTING ring → spill → DLQ rescue chain, then marks the writer
+    /// disconnected so the unchanged throttled-reconnect + drain recovery
+    /// machinery takes over — behavior-equivalent to the pre-B6 inline
+    /// flush-failure path, delivered asynchronously.
+    fn drain_failed_batches(&mut self) {
+        // O(1) when empty (a single atomic try_recv per call). The rescue
+        // body below is a cold failure path (QuestDB outage only).
+        // MEDIUM-5 (adversarial round 1): the rescue work is ring/spill disk
+        // I/O — persistence STALL, not compute. Measured (note_stall at the
+        // end) only when a batch was actually rescued, so the empty-channel
+        // fast path stays a bare try_recv.
+        let stall_start = std::time::Instant::now();
+        let mut rescued: usize = 0;
+        loop {
+            // Scoped borrow: end the `flush_offload` borrow before the
+            // `buffer_tick_seq` (&mut self) rescue calls.
+            let batch = {
+                let Some(offload) = self.flush_offload.as_ref() else {
+                    return;
+                };
+                match offload.failed_rx.try_recv() {
+                    Ok(batch) => batch,
+                    Err(_) => break,
+                }
+            };
+            for (tick, capture_seq) in batch {
+                self.buffer_tick_seq(tick, capture_seq);
+                rescued = rescued.saturating_add(1);
+            }
+        }
+        if rescued == 0 {
+            return;
+        }
+        // Preserve the writer invariant "sender is None ⇒ in_flight is empty":
+        // rescue the current partial rows BEFORE dropping the sender, exactly
+        // as the inline flush-failure path does (sender=None + rescue).
+        self.rescue_in_flight();
+        // LOW-3: the ILP rows just rescued are now stale in `buffer`; the
+        // reconnect path replaces the buffer anyway (`reconnect()` builds a
+        // fresh one), but clearing here makes the no-duplicate-flush
+        // invariant local — and any replay would be DEDUP-collapsed
+        // (idempotent) regardless.
+        self.buffer.clear();
+        self.sender = None;
+        // Rule 5: flush failures are error! (Telegram-routable).
+        error!(
+            rescued,
+            ring_buffer = self.tick_buffer.len(),
+            "off-thread tick flush failed — batches rescued to ring buffer; \
+             writer marked disconnected for throttled reconnect + drain"
+        );
+        self.note_stall(stall_start);
+    }
+
+    /// B6: accrues persistence-stall nanoseconds (blocking-send fallback,
+    /// inline-flush fallback, disconnected-branch recovery work).
+    fn note_stall(&mut self, start: std::time::Instant) {
+        let ns = u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        self.stall_ns = self.stall_ns.saturating_add(ns);
+    }
+
+    /// B6: drains the persistence-stall accumulator. The tick processor calls
+    /// this once per loop iteration, right before recording the histograms,
+    /// and records `tv_tick_compute_duration_ns = total − stall`. Steady
+    /// state (off-thread flush healthy): returns 0 and compute ≈ total.
+    pub fn take_last_stall_ns(&mut self) -> u64 {
+        std::mem::take(&mut self.stall_ns)
     }
 
     /// Forces an immediate flush of all buffered ticks to QuestDB.
@@ -1206,6 +1401,29 @@ impl TickPersistenceWriter {
     /// ingests any disk spill files into QuestDB.
     // TEST-EXEMPT: orchestrates force_flush + drain_tick_buffer + spill_tick_to_disk, all individually tested by 40+ tests
     pub fn flush_on_shutdown(&mut self) {
+        // B6: complete the off-thread flushes FIRST. Dropping the work
+        // channel makes the worker drain every queued batch and exit; the
+        // bounded join waits for it; any batch it could not flush comes back
+        // on the failed channel and is rescued into the ring below so the
+        // existing shutdown steps (flush → drain → disk spill) cover it.
+        if let Some(offload) = self.flush_offload.take() {
+            let failed_rx = offload
+                .shutdown_and_join(crate::tick_flush_worker::FLUSH_WORKER_SHUTDOWN_JOIN_TIMEOUT);
+            let mut rescued: usize = 0;
+            while let Ok(batch) = failed_rx.try_recv() {
+                for (tick, capture_seq) in batch {
+                    self.buffer_tick_seq(tick, capture_seq);
+                    rescued = rescued.saturating_add(1);
+                }
+            }
+            if rescued > 0 {
+                warn!(
+                    rescued,
+                    "shutdown: off-thread flush batches rescued to ring for spill"
+                );
+            }
+        }
+
         let ring_count = self.tick_buffer.len();
         let pending = self.pending_count;
         let spilled = self.ticks_spilled_total;
@@ -1680,12 +1898,32 @@ pub async fn ensure_tick_table_dedup_keys(questdb_config: &QuestDbConfig) {
         questdb_config.host, questdb_config.http_port
     );
 
-    // Client::builder().timeout().build() is infallible (no custom TLS).
-    // Coverage: unwrap_or_else avoids uncoverable else-return on dead path.
-    let client = Client::builder()
+    // C2 (2026-07-03): panic-free client build. The old comment claimed
+    // "infallible (no custom TLS)" — WRONG under fd/resolver exhaustion,
+    // where the builder fails AND the Client::new() fallback panics (silent
+    // tokio-task death). Degrade: skip the DDL this boot; the next boot
+    // re-runs it (idempotent), and the ILP writer's ring/spill absorbs.
+    let client = match Client::builder()
         .timeout(Duration::from_secs(QUESTDB_DDL_TIMEOUT_SECS))
         .build()
-        .unwrap_or_else(|_| Client::new());
+    {
+        Ok(client) => client,
+        Err(err) => {
+            error!(
+                error = %err,
+                code = tickvault_common::error_code::ErrorCode::HttpClient01BuildFailed.code_str(),
+                "HTTP-CLIENT-01 reqwest client build failed — ticks table DDL skipped: \
+                 if the table does not exist yet, ILP auto-create will lack DEDUP keys until \
+                 the next successful boot (duplicate-row window)"
+            );
+            metrics::counter!(
+                "tv_http_client_build_failed_total",
+                "site" => "ticks_ensure_dedup"
+            )
+            .increment(1);
+            return;
+        }
+    };
 
     // Step 1: Create the table with explicit schema (idempotent).
     match client
@@ -1918,12 +2156,29 @@ pub async fn check_tick_gaps_after_recovery(questdb_config: &QuestDbConfig, look
         questdb_config.host, questdb_config.http_port
     );
 
-    // Client::builder().timeout().build() is infallible (no custom TLS).
-    // Coverage: unwrap_or_else avoids uncoverable else-return on dead path.
-    let client = Client::builder()
+    // C2 (2026-07-03): panic-free client build. The old comment claimed
+    // "infallible (no custom TLS)" — WRONG under fd/resolver exhaustion,
+    // where the builder fails AND the Client::new() fallback panics (silent
+    // tokio-task death). Degrade: skip this one best-effort gap check.
+    let client = match Client::builder()
         .timeout(Duration::from_secs(QUESTDB_DDL_TIMEOUT_SECS))
         .build()
-        .unwrap_or_else(|_| Client::new());
+    {
+        Ok(client) => client,
+        Err(err) => {
+            error!(
+                error = %err,
+                code = tickvault_common::error_code::ErrorCode::HttpClient01BuildFailed.code_str(),
+                "HTTP-CLIENT-01 reqwest client build failed — post-recovery tick gap check skipped"
+            );
+            metrics::counter!(
+                "tv_http_client_build_failed_total",
+                "site" => "tick_gap_check"
+            )
+            .increment(1);
+            return;
+        }
+    };
 
     // Query: count ticks per 1-minute bucket in the last N minutes.
     let sql = format!(
@@ -2237,6 +2492,176 @@ mod tests {
             metric.ends_with("_duration_ns"),
             "flush metric must keep the _duration_ns suffix so the exporter's \
              Matcher::Suffix bucket config applies"
+        );
+    }
+
+    /// B6 ratchet: the hot-path append fns MUST dispatch the batch flush to
+    /// the off-thread worker (`dispatch_batch`) and MUST NOT call the
+    /// blocking `force_flush(` inline — reinstating the inline sync flush
+    /// silently re-folds flush I/O into the tick-consumer timed span
+    /// (the exact regression B6 removed).
+    #[test]
+    fn test_append_hot_path_dispatches_offload_not_inline_flush() {
+        let source = include_str!("tick_persistence.rs");
+        // NOTE: signatures deliberately omit the `pub` prefix so the
+        // pub-fn-test-guard's literal scan does not count these strings as
+        // fn declarations. `find` hits the real definitions (they precede
+        // this test module in the file).
+        for fn_sig in [
+            "fn append_tick_with_seq(",
+            "fn append_tick_enriched_with_seq(",
+        ] {
+            let fn_start = source
+                .find(fn_sig)
+                .unwrap_or_else(|| panic!("{fn_sig} must exist"));
+            let fn_region = &source[fn_start..source.len().min(fn_start + 2500)];
+            assert!(
+                fn_region.contains("self.dispatch_batch()"),
+                "{fn_sig} must hand the batch flush to dispatch_batch (off-thread offload)"
+            );
+            assert!(
+                !fn_region.contains("self.force_flush()"),
+                "{fn_sig} must NOT call force_flush inline on the hot path — \
+                 that re-folds the blocking ILP TCP write into the tick span (B6)"
+            );
+        }
+    }
+
+    /// B6 ratchet: the off-thread worker records the SAME
+    /// `tv_tick_flush_duration_ns` histogram `force_flush` records, so the
+    /// operator's flush-latency tile keeps working after the offload.
+    #[test]
+    fn test_flush_worker_records_flush_duration_histogram() {
+        let source = include_str!("tick_flush_worker.rs");
+        assert!(
+            source.contains("tv_tick_flush_duration_ns"),
+            "tick_flush_worker must record tv_tick_flush_duration_ns around \
+             its ILP sender flush"
+        );
+        assert!(
+            source.contains("tv_tick_flush_worker_respawn_total"),
+            "tick_flush_worker supervisor must count respawns (TICK-FLUSH-01)"
+        );
+    }
+
+    /// B6: steady-state offload — appending a full batch against a live TCP
+    /// drain hands the buffer to the worker, resets pending, stays connected,
+    /// and accrues ZERO persistence stall.
+    #[test]
+    fn test_offload_dispatch_resets_pending_and_stays_connected() {
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: port,
+            pg_port: port,
+            ilp_port: port,
+        };
+        let mut writer = TickPersistenceWriter::new(&config).unwrap();
+        for i in 0..TICK_FLUSH_BATCH_SIZE as u32 {
+            let tick = make_test_tick(50_000 + i, 24_500.0 + i as f32);
+            writer.append_tick(&tick).unwrap();
+        }
+        assert_eq!(
+            writer.pending_count(),
+            0,
+            "offload dispatch at the batch boundary must reset pending count"
+        );
+        assert!(
+            writer.is_connected(),
+            "steady-state dispatch keeps the writer connected"
+        );
+        assert_eq!(
+            writer.buffered_tick_count(),
+            0,
+            "no tick may land in the ring on the healthy offload path"
+        );
+        assert_eq!(
+            writer.take_last_stall_ns(),
+            0,
+            "the zero-stall Sent path must not accrue persistence stall"
+        );
+    }
+
+    /// B6: worker flush failure routes the WHOLE batch into the ring rescue
+    /// chain and marks the writer disconnected — behavior-equivalent to the
+    /// pre-B6 inline flush-failure path (zero loss).
+    #[test]
+    fn test_worker_failure_routes_batch_to_ring_and_disconnects() {
+        // Listener accepts exactly ONE connection (the writer's own sender),
+        // then closes — so the worker's lazy connect is REFUSED and its first
+        // batch must come back on the failed channel.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let conn = listener.accept().ok();
+            drop(listener); // further connects refused
+            std::thread::sleep(std::time::Duration::from_secs(5));
+            drop(conn);
+        });
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: port,
+            pg_port: port,
+            ilp_port: port,
+        };
+        let mut writer = TickPersistenceWriter::new(&config).unwrap();
+        for i in 0..TICK_FLUSH_BATCH_SIZE as u32 {
+            let tick = make_test_tick(60_000 + i, 24_500.0 + i as f32);
+            writer.append_tick(&tick).unwrap();
+        }
+        assert_eq!(writer.pending_count(), 0, "dispatch must have fired");
+        // Give the worker time to fail its lazy connect + return the batch.
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        let _ = writer.flush_if_needed(); // drains the failed channel
+        assert_eq!(
+            writer.buffered_tick_count(),
+            TICK_FLUSH_BATCH_SIZE,
+            "every tick of the failed batch must be rescued to the ring"
+        );
+        assert!(
+            !writer.is_connected(),
+            "a worker flush failure must mark the writer disconnected so the \
+             throttled reconnect + drain recovery runs"
+        );
+        assert_eq!(
+            writer.ticks_dropped_total(),
+            0,
+            "zero-loss: nothing may be dropped on the failure path"
+        );
+        // MEDIUM-5 (adversarial round 1): rescuing a worker-failed batch is
+        // ring/spill I/O — it must be accounted as persistence STALL, never
+        // as compute.
+        assert!(
+            writer.take_last_stall_ns() > 0,
+            "draining a failed batch must accrue persistence stall, not compute"
+        );
+    }
+
+    /// B6: `take_last_stall_ns` drains the accumulator and resets it to 0.
+    /// A disconnected append (failed reconnect + ring buffering) accrues
+    /// measurable stall.
+    #[test]
+    fn test_take_last_stall_ns_drains_and_resets() {
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: 1,
+            pg_port: 1,
+            ilp_port: 1, // closed port — reconnect fails fast
+        };
+        let mut writer = TickPersistenceWriter::new_disconnected(&config);
+        assert_eq!(writer.take_last_stall_ns(), 0, "fresh writer has no stall");
+        let tick = make_test_tick(70_000, 100.0);
+        writer.append_tick(&tick).unwrap();
+        let stall = writer.take_last_stall_ns();
+        assert!(
+            stall > 0,
+            "a disconnected append (failed reconnect + ring buffer) must be \
+             measured as persistence stall"
+        );
+        assert_eq!(
+            writer.take_last_stall_ns(),
+            0,
+            "take_last_stall_ns must reset the accumulator"
         );
     }
 

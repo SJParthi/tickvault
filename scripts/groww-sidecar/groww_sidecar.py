@@ -32,6 +32,27 @@ snapshot only ever holds latest-per-instrument, so coalescing loses nothing
 the callback-time walk could have seen, and it stops the full-tree-per-callback
 decode work that starved the SDK's NATS consumer (the measured unbounded lag).
 
+PER-CALLBACK INSTANT CAPTURE (2026-07-03, operator: "if ticks receivable within
+1-3ms we must achieve the same latency"): the primary capture path now hooks
+`feed._nats_client.callback` (the plain instance attribute the SDK's
+`_on_data_cb` reads PER MESSAGE at nats_client.py:197 in growwapi==1.5.0) with
+an ENQUEUE-ONLY wrapper (~µs: stamp time.time_ns() as capture_ns, put_nowait on
+a BOUNDED queue — NEVER blocks the SDK's NATS consumer thread; on Full it drops
+to a counter). A dedicated writer thread drains the queue in batches, decodes
+the ONE protobuf per message via the SDK's own get_data_dict, maps the NATS
+subject → instrument via a topic map built from the SDK's own topic builders,
+applies the SAME change-dedup, and appends NDJSON records carrying a NEW
+`capture_ns` field with ONE group-commit fsync per batch. Our-side added
+latency drops from the walker's avg ~100ms to ≤1ms typical (≤5ms p99 under
+GIL/fsync jitter — the honest Python envelope; the external Groww floor is
+unchanged and now SEPARATELY measurable as capture_ns − tsInMillis). The
+snapshot walker is DEMOTED to a slow reconciliation sweep
+(GROWW_RECONCILE_INTERVAL_MS, default 5000ms) that catches anything the hook
+missed; its emissions share the dedup cache so no duplicates. Kill-switch:
+GROWW_CALLBACK_CAPTURE=off reverts to walker-only at WALK_INTERVAL_MS; a
+failed hook attach (future-wheel attribute change) logs one line and falls
+back to the walker path unchanged — the feature degrades, never breaks.
+
 Volume is Option A (price-only, operator 2026-06-20): the Groww live feed carries
 NO traded volume (only ltp/value + tsInMillis), so cum_volume is always 0.
 
@@ -60,6 +81,7 @@ import glob
 import json
 import logging
 import os
+import queue
 import random
 import re
 import sys
@@ -230,6 +252,26 @@ WALK_INTERVAL_MS_DEFAULT = 200
 WALK_INTERVAL_MS_MIN = 20
 WALK_INTERVAL_MS_MAX = 5000
 
+# Per-callback instant capture (2026-07-03 ≤1ms latency study, variant c2).
+# The NATS-layer hook enqueues (subject, raw_payload, capture_ns) per message
+# onto this BOUNDED queue; the writer thread drains it. 65,536 slots ≈ 25+
+# minutes of buffer at the measured ~42 msgs/sec steady rate (and > 1 minute
+# even at a full-universe 768 msgs/sec burst) — if the writer thread ever
+# falls that far behind, the hook DROPS to a counter instead of blocking the
+# SDK's NATS consumer thread (the #1344 starvation class must never recur).
+CAPTURE_QUEUE_MAX = 65536
+# Max records drained per group-commit batch (one flush+fsync per batch). A
+# bound keeps worst-case batch latency small; queue.Empty ends a batch early.
+CAPTURE_BATCH_MAX = 512
+# With the hook active the walker is DEMOTED to a slow reconciliation sweep:
+# it re-walks the SDK snapshot at this cadence to catch anything the hook
+# missed (its emissions share the change-dedup cache, so no duplicates).
+RECONCILE_INTERVAL_MS_DEFAULT = 5000
+RECONCILE_INTERVAL_MS_MIN = 1000
+RECONCILE_INTERVAL_MS_MAX = 60000
+# Bounded stderr CAPTURE-STATS heartbeat cadence (writer thread).
+CAPTURE_STATS_INTERVAL_SECS = 300.0
+
 # Watermark-lag stall criterion (2026-07-03 lag forensics — fix #2). The
 # timestamp-ADVANCING liveness (the 5s frozen-watermark criterion below + the
 # Rust 30s FEED-STALL-01) has a blind spot: a +2 ms micro-advance resets the
@@ -265,6 +307,25 @@ def resolve_walk_interval_ms(raw) -> int:
     return _resolve_env_int(
         raw, WALK_INTERVAL_MS_DEFAULT, WALK_INTERVAL_MS_MIN, WALK_INTERVAL_MS_MAX
     )
+
+
+def resolve_reconcile_interval_ms(raw) -> int:
+    """Pure: GROWW_RECONCILE_INTERVAL_MS env → clamped reconcile-sweep interval
+    for the demoted walker while per-callback capture is active. Garbage/absent
+    → 5000ms default; clamped to [1000, 60000]. Never raises."""
+    return _resolve_env_int(
+        raw,
+        RECONCILE_INTERVAL_MS_DEFAULT,
+        RECONCILE_INTERVAL_MS_MIN,
+        RECONCILE_INTERVAL_MS_MAX,
+    )
+
+
+def resolve_callback_capture_enabled(raw) -> bool:
+    """Pure kill-switch: GROWW_CALLBACK_CAPTURE env → capture on/off.
+    Default ON (unset/empty/anything else); `off`/`0`/`false`/`no`
+    (case-insensitive) turn it OFF → walker-only at WALK_INTERVAL_MS."""
+    return (raw or "").strip().lower() not in ("off", "0", "false", "no")
 
 
 def resolve_watermark_max_lag_ms(raw) -> int:
@@ -569,6 +630,30 @@ _LAST_EMITTED = {}
 DROP_REASONS = {}
 _DROP_SAMPLES_LOGGED = {}
 DROP_SAMPLE_LIMIT_PER_REASON = 5
+# Per-callback capture counters (2026-07-03). Single-writer-per-counter
+# threading model (documented, no locks needed for the counters themselves):
+#   _HOOK_ENQUEUED / _HOOK_DROPPED_FULL — written ONLY by the SDK's NATS
+#     consumer thread (inside the enqueue-only hook); read by the writer
+#     thread + status writer (a stale read is advisory-only).
+#   CAPTURE_EMITTED_TOTAL — written ONLY by the capture writer thread.
+#   RECONCILE_EMITTED_TOTAL — written ONLY by the walker thread (counts its
+#     reconcile-sweep emissions while capture is active — i.e. what the hook
+#     path MISSED; steady non-zero growth means the hook is degraded).
+# One-element list cells so the hook closure mutates by reference (same
+# pattern as _CURRENT_FEED); item assignment is atomic under the GIL.
+_HOOK_ENQUEUED = [0]
+_HOOK_DROPPED_FULL = [0]
+CAPTURE_EMITTED_TOTAL = 0
+RECONCILE_EMITTED_TOTAL = 0
+# NDJSON out-handle lock: with the capture writer thread AND the walker
+# (reconcile) thread both appending records, interleaved partial writes /
+# rotation races must be impossible. Every record write (and the writer
+# thread's group-commit flush+fsync) holds this lock; the critical section is
+# one line write (+ optional fsync), so contention is µs-scale.
+_OUT_LOCK = threading.Lock()
+# Status-file lock: write_status uses a pid-based temp name, which two threads
+# in the SAME process would collide on. Serialize the temp+rename.
+_STATUS_LOCK = threading.Lock()
 # Max exchange timestamp (tsInMillis) seen across ALL decoded records this
 # process lifetime + the monotonic instant it last ADVANCED. This is the stall
 # detector's liveness signal (2026-07-03 feed-death forensics): the 09:07:55
@@ -1186,17 +1271,26 @@ def write_status(event: str, stocks: int, indices: int) -> None:
         # these are additive-safe.
         "deduped": int(DEDUPED_TOTAL),
         "dropped_reasons": dict(DROP_REASONS),
+        # Per-callback capture counters (2026-07-03; additive-safe — the Rust
+        # status reader ignores unknown fields).
+        "hook_captured": int(CAPTURE_EMITTED_TOTAL),
+        "hook_dropped_full": int(_HOOK_DROPPED_FULL[0]),
+        "reconcile_emitted": int(RECONCILE_EMITTED_TOTAL),
         "ts_ist_nanos": now_ist_nanos(),
     }
     try:
         directory = os.path.dirname(STATUS_PATH) or "."
         os.makedirs(directory, exist_ok=True)
         tmp = f"{STATUS_PATH}.{os.getpid()}.tmp"
-        with open(tmp, "w") as fh:
-            fh.write(json.dumps(rec))
-            fh.flush()
-            os.fsync(fh.fileno())
-        os.replace(tmp, STATUS_PATH)  # atomic rename
+        # _STATUS_LOCK: the writer thread AND the walker thread both call
+        # note_emit → write_status; the pid-based temp name is shared within
+        # the process, so the temp+rename must be serialized.
+        with _STATUS_LOCK:
+            with open(tmp, "w") as fh:
+                fh.write(json.dumps(rec))
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp, STATUS_PATH)  # atomic rename
     except OSError as exc:
         # Never embed paths/values that could leak anything; type only.
         print(
@@ -1302,6 +1396,29 @@ def note_drop(
         )
 
 
+def note_drop_bulk(reason: str, count: int) -> None:
+    """Count `count` drops of one reason in a single call (writer thread).
+
+    Used to fold the hook's queue-full counter (mutated only on the SDK's NATS
+    consumer thread — the hook must stay enqueue-only, no accounting there)
+    into the shared DROP_REASONS breakdown, with ONE bounded sample line per
+    reason (reuses the note_drop sample cap)."""
+    global DROPPED_TOTAL
+    if count <= 0:
+        return
+    DROPPED_TOTAL += count
+    DROP_REASONS[reason] = DROP_REASONS.get(reason, 0) + count
+    sampled = _DROP_SAMPLES_LOGGED.get(reason, 0)
+    if sampled < DROP_SAMPLE_LIMIT_PER_REASON:
+        _DROP_SAMPLES_LOGGED[reason] = sampled + 1
+        print(
+            f"groww sidecar: DROP[{reason}] sample "
+            f"{sampled + 1}/{DROP_SAMPLE_LIMIT_PER_REASON}: bulk count={count}",
+            file=sys.stderr,
+            flush=True,
+        )
+
+
 def note_emit() -> None:
     """Count one DECODED+EMITTED record and drive the honest `streaming` status.
 
@@ -1322,6 +1439,169 @@ def note_emit() -> None:
     if now - _last_status_rewrite_monotonic >= STATUS_REWRITE_MIN_INTERVAL_SECS:
         write_status("streaming", _SUBSCRIBED_STOCKS, _SUBSCRIBED_INDICES)
         _last_status_rewrite_monotonic = now
+
+
+# ---------------------------------------------------------------------------
+# RAW-TICK-PROBE (2026-07-03, LOG-ONLY) — settle whether Groww's live feed
+# POPULATES the SDK-exposed `volume` field. The growwapi==1.5.0 SDK decodes the
+# full 16-field StocksLivePriceProto per instrument (volume, openInterest,
+# OHLC, avgPrice, …) even though Groww's docs list only tsInMillis+ltp — but
+# proto3 doubles have NO presence, so `volume: 0.0` appears whether the server
+# omits it or sends zero. Only inspecting REAL live tick dicts answers the
+# question. This probe:
+#   1. Prints the FIRST RAW_PROBE_SAMPLE_COUNT stock/FNO tick dicts (and the
+#      first RAW_PROBE_INDEX_SAMPLE_COUNT index dicts) verbatim as ONE
+#      `RAW-TICK-PROBE kind=… token=… fields=<compact json>` stderr line each,
+#      then ONE `RAW-TICK-PROBE-SUMMARY …` line scanning those samples.
+#   2. Keeps CHEAP process-lifetime running counters (two float compares + int
+#      increments per drained tick — O(1)) of how many drained stock/FNO ticks
+#      had volume != 0 / openInterest != 0, surfaced via a bounded
+#      `RAW-TICK-PROBE-HEARTBEAT` stderr line at most once per
+#      RAW_PROBE_HEARTBEAT_SECS — so even if the first 8 ticks are all zero we
+#      learn whether ANY tick all day carries volume.
+# It observes DRAINED snapshot entries inside the walker thread's emit paths —
+# NEVER the O(1) NATS callbacks (the 2026-07-03 lag-fix contract is untouched).
+# Emission/persistence are UNCHANGED: cum_volume stays 0 pending the verdict.
+# Market-data identifiers/values only — never a credential.
+# Default: sample once per process. GROWW_RAW_PROBE=always re-arms the sampler
+# on every reconnect cycle (running counters are NEVER reset).
+# CloudWatch: log group /tickvault/prod/app, filter "RAW-TICK-PROBE".
+# ---------------------------------------------------------------------------
+
+RAW_PROBE_SAMPLE_COUNT = 8
+RAW_PROBE_INDEX_SAMPLE_COUNT = 2
+RAW_PROBE_HEARTBEAT_SECS = 300.0
+# The OHLC keys scanned for the summary's nonzero_ohlc count.
+_RAW_PROBE_OHLC_KEYS = ("open", "high", "low", "close")
+
+
+def probe_field_nonzero(value) -> bool:
+    """Pure: True iff `value` coerces to a NON-ZERO float. Non-numeric /
+    missing values are honestly False (never raise) — proto3's no-presence
+    `0.0` and an absent key both read as \"not populated\". O(1)."""
+    try:
+        return float(value) != 0.0
+    except (TypeError, ValueError):
+        return False
+
+
+class RawTickProbe:
+    """Bounded raw-tick sampler + cheap running field-population counters.
+
+    Injectable `emit` (defaults to a flushed stderr print) so unit tests can
+    capture lines without patching stdio (test_dedup.py::RawTickProbeTests).
+    All state is plain ints/lists mutated from the single walker thread — no
+    locks needed (same threading model as the module counters above)."""
+
+    def __init__(
+        self,
+        mode: str = "",
+        ltp_limit: int = RAW_PROBE_SAMPLE_COUNT,
+        index_limit: int = RAW_PROBE_INDEX_SAMPLE_COUNT,
+        emit=None,
+    ) -> None:
+        self.always = (mode or "").strip().lower() == "always"
+        self._ltp_limit = ltp_limit
+        self._index_limit = index_limit
+        self._emit = emit or (
+            lambda line: print(line, file=sys.stderr, flush=True)
+        )
+        # Per-arming sampling state (reset by rearm_for_reconnect in `always`).
+        self._ltp_sampled = 0
+        self._index_sampled = 0
+        self._samples = []  # the sampled stock/FNO dicts, for the summary scan
+        self._summary_printed = False
+        # Process-lifetime running counters — NEVER reset, even on re-arm.
+        self.total_ltp_ticks = 0
+        self.nonzero_volume_ticks = 0
+        self.nonzero_oi_ticks = 0
+        self._last_heartbeat_monotonic = None
+
+    def observe(self, kind: str, token, tick) -> None:
+        """Observe ONE drained snapshot entry. O(1) fast path: once sampling
+        is exhausted this is an int compare + (for kind=\"ltp\") two float
+        compares + int increments. Called from the walker thread ONLY."""
+        if not isinstance(tick, dict):
+            return
+        if kind == "ltp":
+            self.total_ltp_ticks += 1
+            if probe_field_nonzero(tick.get("volume")):
+                self.nonzero_volume_ticks += 1
+            if probe_field_nonzero(tick.get("openInterest")):
+                self.nonzero_oi_ticks += 1
+            if self._ltp_sampled < self._ltp_limit:
+                self._ltp_sampled += 1
+                self._samples.append(dict(tick))
+                self._emit_sample("ltp", token, tick)
+                if self._ltp_sampled == self._ltp_limit and not self._summary_printed:
+                    self._print_summary()
+        elif kind == "index":
+            if self._index_sampled < self._index_limit:
+                self._index_sampled += 1
+                self._emit_sample("index", token, tick)
+
+    def _emit_sample(self, kind: str, token, tick: dict) -> None:
+        try:
+            fields = json.dumps(tick, sort_keys=True, separators=(",", ":"), default=str)
+        except (TypeError, ValueError):
+            fields = repr(tick)
+        self._emit(f"RAW-TICK-PROBE kind={kind} token={token} fields={fields}")
+
+    def _print_summary(self) -> None:
+        """ONE summary line scanning the sampled stock/FNO dicts."""
+        self._summary_printed = True
+        total = len(self._samples)
+        nz_vol = sum(1 for t in self._samples if probe_field_nonzero(t.get("volume")))
+        nz_oi = sum(
+            1 for t in self._samples if probe_field_nonzero(t.get("openInterest"))
+        )
+        nz_ohlc = sum(
+            1
+            for t in self._samples
+            if any(probe_field_nonzero(t.get(k)) for k in _RAW_PROBE_OHLC_KEYS)
+        )
+        self._emit(
+            f"RAW-TICK-PROBE-SUMMARY nonzero_volume_ticks={nz_vol}/{total} "
+            f"nonzero_oi={nz_oi}/{total} nonzero_ohlc={nz_ohlc}/{total}"
+        )
+
+    def rearm_for_reconnect(self) -> None:
+        """Re-arm the bounded sampler for a new reconnect cycle — ONLY under
+        GROWW_RAW_PROBE=always (default: once per process). The running
+        counters are process-lifetime truth and are NEVER reset."""
+        if not self.always:
+            return
+        self._ltp_sampled = 0
+        self._index_sampled = 0
+        self._samples = []
+        self._summary_printed = False
+
+    def maybe_heartbeat(self, now_monotonic: float) -> bool:
+        """Bounded periodic running-counter line (≤ 1 per
+        RAW_PROBE_HEARTBEAT_SECS; nothing before the first drained stock/FNO
+        tick). One float compare per call — safe to invoke every walker
+        iteration. Returns True iff a line was emitted (unit-testable)."""
+        if self.total_ltp_ticks == 0:
+            return False
+        if self._last_heartbeat_monotonic is None:
+            # Arm the cadence at the first observed tick; first line fires one
+            # full interval later (the samples already covered t=0).
+            self._last_heartbeat_monotonic = now_monotonic
+            return False
+        if now_monotonic - self._last_heartbeat_monotonic < RAW_PROBE_HEARTBEAT_SECS:
+            return False
+        self._last_heartbeat_monotonic = now_monotonic
+        self._emit(
+            "RAW-TICK-PROBE-HEARTBEAT "
+            f"nonzero_volume_ticks={self.nonzero_volume_ticks}/{self.total_ltp_ticks} "
+            f"nonzero_oi={self.nonzero_oi_ticks}/{self.total_ltp_ticks}"
+        )
+        return True
+
+
+# Module singleton wired into the walker-thread emit paths. Env read once at
+# import (the sidecar process is restarted by the Rust supervisor anyway).
+RAW_PROBE = RawTickProbe(mode=os.environ.get("GROWW_RAW_PROBE", ""))
 
 
 def latest_watch_file(watch_dir: str):
@@ -1371,27 +1651,63 @@ def load_subscriptions(watch_path: str):
     return stock_list, index_list, sid_map
 
 
-def _write_record(out, security_id: int, segment: str, ts_millis: int, price) -> None:
-    """Append one NDJSON tick (Rust bridge schema) + capture-at-receipt fsync."""
+def _write_record(
+    out,
+    security_id: int,
+    segment: str,
+    ts_millis: int,
+    price,
+    capture_ns=None,
+    sync: bool = True,
+) -> None:
+    """Append one NDJSON tick (Rust bridge schema) + capture-at-receipt fsync.
+
+    2026-07-03 per-callback capture additions (both backward-compatible —
+    the Rust bridge treats an absent `capture_ns` as the old format):
+    - `capture_ns` (optional int, UTC epoch nanos from time.time_ns() stamped
+      INSIDE the NATS-callback hook) — the true capture-at-receipt instant,
+      making our-side latency (received_at − capture) and the external Groww
+      floor (capture − tsInMillis) SEPARATELY measurable columns.
+    - `sync=False` lets the capture writer thread group-commit: it writes N
+      records then does ONE flush+fsync per batch (the out handle is
+      line-buffered, so the bridge's notify watcher sees each row at write
+      time; the fsync is the durability floor per batch).
+    Every record write holds _OUT_LOCK — the capture writer thread and the
+    walker (reconcile) thread share the same rotating out handle.
+    """
     rec = {
         "security_id": int(security_id),
         "segment": segment,
         "ts_ist_nanos": ms_to_ist_nanos(ts_millis) if ts_millis else 0,
         "exchange_ts_millis": ts_millis,
         "ltp": float(price),
-        # Option A: Groww live feed carries no volume -> always 0.
+        # Option A: Groww docs list no volume; the SDK exposes a `volume`
+        # field — population under live probe (RAW-TICK-PROBE, 2026-07-03);
+        # emission unchanged pending verdict -> always 0.
         "cum_volume": 0,
     }
-    out.write(json.dumps(rec) + "\n")
-    out.flush()
-    os.fsync(out.fileno())  # capture-at-receipt durability
+    if capture_ns is not None:
+        rec["capture_ns"] = int(capture_ns)
+    line = json.dumps(rec) + "\n"
+    with _OUT_LOCK:
+        out.write(line)
+        if sync:
+            out.flush()
+            os.fsync(out.fileno())  # capture-at-receipt durability
 
 
-def emit_ltp_records(out, ltp_tree: dict, sid_map: dict) -> None:
+def emit_ltp_records(out, ltp_tree: dict, sid_map: dict, reconcile: bool = False) -> None:
     """Flatten get_ltp() `{exchange:{segment:{token:{ltp,tsInMillis}}}}` -> NDJSON.
 
     Stock identity comes from the tree path; security_id from sid_map (falls back
     to the numeric token, which IS the stock security_id).
+
+    `reconcile=True` (walker thread while per-callback capture is active):
+    every record that still emits from this SNAPSHOT walk was MISSED by the
+    hook path (the shared change-dedup cache already swallowed everything the
+    hook captured) — counted in RECONCILE_EMITTED_TOTAL as the hook-health
+    signal. Snapshot rows carry no per-message capture stamp, so no
+    capture_ns (the Rust bridge falls back to its per-wake receipt stamp).
     """
     if not isinstance(ltp_tree, dict):
         return
@@ -1429,6 +1745,10 @@ def emit_ltp_records(out, ltp_tree: dict, sid_map: dict) -> None:
                 # Advance the stall detector's ts watermark for EVERY decoded
                 # record — before dedup/drop — so liveness = fresh timestamps.
                 _note_ts_advance(tick)
+                # RAW-TICK-PROBE (log-only): observe the raw decoded dict —
+                # before drop/dedup — from the walker thread (never the O(1)
+                # NATS callbacks). Emission below is unchanged.
+                RAW_PROBE.observe("ltp", token, tick)
                 # A decoded record with no `ltp` field — DROP (honest-feed count).
                 if not isinstance(tick, dict) or "ltp" not in tick:
                     note_drop(
@@ -1462,6 +1782,8 @@ def emit_ltp_records(out, ltp_tree: dict, sid_map: dict) -> None:
                         continue
                     _write_record(out, security_id, canonical, ts_millis, price)
                     note_emit()
+                    if reconcile:
+                        _note_reconcile_emit()
                 except (KeyError, ValueError, TypeError) as exc:
                     note_drop(
                         "coerce_error",
@@ -1473,11 +1795,12 @@ def emit_ltp_records(out, ltp_tree: dict, sid_map: dict) -> None:
                     continue
 
 
-def emit_index_records(out, index_tree: dict, sid_map: dict) -> None:
+def emit_index_records(out, index_tree: dict, sid_map: dict, reconcile: bool = False) -> None:
     """Flatten get_index_value() `{exchange:{segment:{token:{value,tsInMillis}}}}`.
 
     Index value field is `value` (not `ltp`); stored as ltp with segment IDX_I.
     security_id MUST come from sid_map (the token may be a NAME) — no fallback.
+    `reconcile` semantics: see emit_ltp_records.
     """
     if not isinstance(index_tree, dict):
         return
@@ -1508,6 +1831,8 @@ def emit_index_records(out, index_tree: dict, sid_map: dict) -> None:
                 # Advance the stall detector's ts watermark for EVERY decoded
                 # record — before dedup/drop — so liveness = fresh timestamps.
                 _note_ts_advance(tick)
+                # RAW-TICK-PROBE (log-only): first 2 raw index dicts, verbatim.
+                RAW_PROBE.observe("index", token, tick)
                 # A decoded index record with no `value` field — DROP (count it).
                 if not isinstance(tick, dict) or "value" not in tick:
                     note_drop(
@@ -1542,6 +1867,8 @@ def emit_index_records(out, index_tree: dict, sid_map: dict) -> None:
                         out, security_id, CANONICAL_INDEX_SEGMENT, ts_millis, price
                     )
                     note_emit()
+                    if reconcile:
+                        _note_reconcile_emit()
                 except (KeyError, ValueError, TypeError) as exc:
                     note_drop(
                         "coerce_error",
@@ -1551,6 +1878,308 @@ def emit_index_records(out, index_tree: dict, sid_map: dict) -> None:
                         detail=f"exc={type(exc).__name__}",
                     )
                     continue
+
+
+# ---------------------------------------------------------------------------
+# PER-CALLBACK INSTANT CAPTURE (2026-07-03 ≤1ms latency study, variant c2 with
+# walker fallback). The SDK's NATS consumer invokes `self.callback(subject,
+# data)` PER MESSAGE (nats_client.py:197, growwapi==1.5.0) where `callback` is
+# a plain instance attribute read at call time — so wrapping it captures the
+# EXACT raw protobuf payload + subject per message (zero intra-window loss,
+# unlike the latest-only snapshot the walker drains). The wrapper is
+# ENQUEUE-ONLY (~µs): stamp time.time_ns(), put_nowait on the bounded queue,
+# delegate to the original callback. ALL decode/dedup/write happens on the
+# dedicated writer thread — the SDK's consumer thread is never blocked (the
+# #1344 starvation contract). Precedent for SDK attribute hooking:
+# install_nats_reason_hooks above. Guarded: any attach failure logs one line
+# and the sidecar falls back to the CURRENT walker path unchanged.
+# ---------------------------------------------------------------------------
+
+# The bounded hand-off queue (process-lifetime; survives reconnect cycles —
+# each cycle's fresh feed gets a fresh hook that feeds the same queue).
+_CAPTURE_QUEUE = queue.Queue(maxsize=CAPTURE_QUEUE_MAX)
+# subject -> (kind, exchange, segment, token, security_id, canonical_segment).
+# Rebuilt per reconnect cycle (same contents — same watch lists); a 1-element
+# cell so the long-lived writer thread always reads the CURRENT map.
+_CAPTURE_TOPIC_MAP = [None]
+# True while the hook is attached to the CURRENT feed — the walker reads this
+# per iteration to pick its cadence (reconcile sweep vs full-speed walk).
+_CAPTURE_MODE = [False]
+# Kill-switch (GROWW_CALLBACK_CAPTURE=off → walker-only, exactly the pre-PR
+# behaviour). Resolved once at import; pure resolver unit-tested.
+CAPTURE_ENABLED = resolve_callback_capture_enabled(
+    os.environ.get("GROWW_CALLBACK_CAPTURE")
+)
+
+
+def _note_reconcile_emit() -> None:
+    """Count one walker-thread reconcile-sweep emission (hook-missed record)."""
+    global RECONCILE_EMITTED_TOTAL
+    RECONCILE_EMITTED_TOTAL += 1
+
+
+def make_capture_hook(orig_callback, cap_queue, enqueued_cell, dropped_cell):
+    """Build the enqueue-only NATS-callback wrapper (PURE factory, unit-tested).
+
+    The wrapper runs on the SDK's NATS consumer thread and MUST stay ~µs:
+    one clock read + one bounded put_nowait + two int bumps, then delegate to
+    the ORIGINAL callback so the SDK snapshot/dirty-flag path is untouched.
+    On a full queue it DROPS to the counter — it NEVER blocks, NEVER raises
+    (queue.Full is the only exception put_nowait raises; the counters are
+    plain list-cell int bumps that cannot raise)."""
+
+    def hooked(subject, data):
+        capture_ns = time.time_ns()
+        try:
+            cap_queue.put_nowait((subject, data, capture_ns))
+            enqueued_cell[0] += 1
+        except queue.Full:
+            dropped_cell[0] += 1
+        return orig_callback(subject, data)
+
+    return hooked
+
+
+def install_callback_capture(feed, cap_queue) -> bool:
+    """Attach the capture hook to THIS feed's NATS client. Returns True on
+    success. Best-effort: a future-wheel attribute rename (no `_nats_client`,
+    no callable `callback`) or ANY exception returns False — the caller falls
+    back to the walker path unchanged (feature degrades, never breaks)."""
+    try:
+        nats_client = getattr(feed, "_nats_client", None)
+        orig = getattr(nats_client, "callback", None) if nats_client is not None else None
+        if nats_client is None or not callable(orig):
+            return False
+        nats_client.callback = make_capture_hook(
+            orig, cap_queue, _HOOK_ENQUEUED, _HOOK_DROPPED_FULL
+        )
+        return True
+    except Exception as exc:  # noqa: BLE001 - capture must never break the feed
+        print(
+            f"groww sidecar: callback-capture attach failed ({type(exc).__name__})",
+            file=sys.stderr,
+            flush=True,
+        )
+        return False
+
+
+def build_capture_topic_map(stock_list, index_list, sid_map):
+    """subject → (kind, exchange, segment, token, security_id, canonical_segment).
+
+    Built with the SDK's OWN topic builders (FeedConstants.get_live_price_topic
+    / get_live_index_topic — the exact functions subscribe_ltp /
+    subscribe_index_value use via _get_topics), so the subject strings and the
+    topic META (exchange/segment/feed_key) are IDENTICAL to what the SDK keys
+    its snapshot trees on. The dedup keys derived from this map therefore
+    match the walker's tree-path keys exactly — the reconcile sweep can never
+    double-emit a hook-captured record. security_id resolution mirrors the
+    walker: sid_map lookup by the META triple, entry-key fallback, then the
+    numeric-token fallback for stocks (never for indices).
+
+    Returns None on ANY failure (e.g. a future wheel moved FeedConstants) —
+    the caller falls back to walker-only capture.
+    """
+    try:
+        from growwapi.groww.constants import FeedConstants
+
+        def resolve_sid(meta_key, entry_key, token, is_stock):
+            sid = sid_map.get(meta_key)
+            if sid is None:
+                sid = sid_map.get(entry_key)
+            if (sid is None or sid <= 0) and is_stock and token.isdigit():
+                sid = int(token)
+            return sid if isinstance(sid, int) else 0
+
+        topic_map = {}
+        for kind, subs, builder in (
+            ("ltp", stock_list, FeedConstants.get_live_price_topic),
+            ("idx", index_list, FeedConstants.get_live_index_topic),
+        ):
+            for sub in subs:
+                topic = builder(
+                    sub["segment"], sub["exchange"], sub["exchange_token"]
+                )
+                meta = topic.get_meta()
+                exchange = str(meta[FeedConstants.EXCHANGE])
+                segment = str(meta[FeedConstants.SEGMENT])
+                token = str(meta[FeedConstants.FEED_KEY])
+                entry_key = (
+                    str(sub["exchange"]),
+                    str(sub["segment"]),
+                    str(sub["exchange_token"]),
+                )
+                sid = resolve_sid(
+                    (exchange, segment, token), entry_key, token, kind == "ltp"
+                )
+                canonical = (
+                    SEGMENT_MAP.get((exchange, segment))
+                    if kind == "ltp"
+                    else CANONICAL_INDEX_SEGMENT
+                )
+                topic_map[topic.get_topic()] = (
+                    kind,
+                    exchange,
+                    segment,
+                    token,
+                    sid,
+                    canonical,
+                )
+        return topic_map
+    except Exception as exc:  # noqa: BLE001 - degrade to walker-only, never break
+        print(
+            f"groww sidecar: capture topic-map build failed ({type(exc).__name__}); "
+            "falling back to walker-only capture",
+            file=sys.stderr,
+            flush=True,
+        )
+        return None
+
+
+def _decode_captured_payload(kind: str, payload):
+    """Decode ONE raw NATS protobuf payload via the SDK's OWN parser —
+    get_data_dict(data, feed_type) — producing the EXACT leaf-dict shape the
+    walker's snapshot trees carry ({ltp, tsInMillis, volume, …} for stocks;
+    {value, tsInMillis} for indices). One ~20-50µs decode per message (vs the
+    walker's 768-decode full-tree walk). Imported lazily so unit tests run
+    without the wheel (they monkeypatch this function)."""
+    from growwapi.groww.constants import FeedConstants
+    from growwapi.groww.proto.proto_parser import get_data_dict
+
+    feed_type = (
+        FeedConstants.LIVE_DATA if kind == "ltp" else FeedConstants.LIVE_INDEX
+    )
+    return get_data_dict(payload, feed_type)
+
+
+def _capture_emit_one(out, subject, payload, capture_ns) -> int:
+    """Decode + dedup + write ONE captured message (writer thread). Returns the
+    number of records written (0 or 1) so the batch loop knows whether a
+    group-commit fsync is due. Reuses the walker's exact accounting: watermark
+    advance + RAW-TICK-PROBE observation before drop/dedup decisions; the SAME
+    dedup-cache keys as the snapshot walk (reconcile parity)."""
+    global CAPTURE_EMITTED_TOTAL
+    topic_map = _CAPTURE_TOPIC_MAP[0]
+    entry = topic_map.get(subject) if topic_map else None
+    if entry is None:
+        note_drop("capture_subject_miss", detail=f"subject={subject}")
+        return 0
+    kind, exchange, segment, token, security_id, canonical = entry
+    try:
+        tick = _decode_captured_payload(kind, payload)
+    except Exception as exc:  # noqa: BLE001 - one bad payload must never kill the writer
+        note_drop(
+            "capture_decode_error",
+            exchange,
+            segment,
+            token,
+            detail=f"exc={type(exc).__name__}",
+        )
+        return 0
+    if not isinstance(tick, dict):
+        note_drop("capture_decode_error", exchange, segment, token, detail="non_dict")
+        return 0
+    # Same liveness + probe accounting as the walker paths (before drop/dedup).
+    _note_ts_advance(tick)
+    RAW_PROBE.observe("ltp" if kind == "ltp" else "index", token, tick)
+    price_field = "ltp" if kind == "ltp" else "value"
+    if price_field not in tick:
+        note_drop(
+            "no_price_field",
+            exchange,
+            segment,
+            token,
+            detail=f"leaf_keys={sorted(map(str, tick.keys()))}",
+        )
+        return 0
+    if canonical is None:
+        note_drop("unmapped_segment", exchange, segment, token)
+        return 0
+    if not isinstance(security_id, int) or security_id <= 0:
+        note_drop("sid_map_miss", exchange, segment, token)
+        return 0
+    try:
+        ts_millis = int(tick.get("tsInMillis", 0))
+        price = float(tick[price_field])
+    except (ValueError, TypeError) as exc:
+        note_drop(
+            "coerce_error", exchange, segment, token, detail=f"exc={type(exc).__name__}"
+        )
+        return 0
+    # SAME dedup keys as emit_ltp_records / emit_index_records — the reconcile
+    # sweep and the hook path share one cache, so neither double-emits.
+    if not dedup_should_emit(_LAST_EMITTED, (kind, exchange, segment, token), ts_millis, price):
+        note_dedup()
+        return 0
+    # sync=False: the batch loop group-commits ONE flush+fsync per drain.
+    _write_record(
+        out, security_id, canonical, ts_millis, price, capture_ns=capture_ns, sync=False
+    )
+    note_emit()
+    CAPTURE_EMITTED_TOTAL += 1
+    return 1
+
+
+def _capture_writer_loop(out, cap_queue) -> None:
+    """Daemon: drain the capture queue in group-commit batches (writer thread).
+
+    Blocking get() for the first item (zero idle CPU), then get_nowait() up to
+    CAPTURE_BATCH_MAX — decode/dedup/write each, then ONE flush+fsync for the
+    whole batch (the fsync ~0.5-2ms cost is amortized under burst; the
+    line-buffered handle makes each row visible to the bridge's notify watcher
+    at write time, pre-fsync). Folds the hook's queue-full counter into the
+    drop breakdown and prints a bounded CAPTURE-STATS stderr line. The
+    per-item broad except in _capture_emit_one makes death practically
+    unreachable; if this thread ever died anyway, the walker's reconcile sweep
+    still emits everything (at its slow cadence) and the frozen-watermark /
+    Rust FEED-STALL-01 backstops remain — never a silent-forever failure."""
+    print(
+        "groww sidecar: per-callback capture writer armed "
+        f"(queue={CAPTURE_QUEUE_MAX}, batch≤{CAPTURE_BATCH_MAX}, group-commit fsync)",
+        flush=True,
+    )
+    reported_dropped_full = 0
+    last_stats_monotonic = time.monotonic()
+    while True:
+        batch = [cap_queue.get()]  # blocking — wakes per message, sub-ms
+        try:
+            while len(batch) < CAPTURE_BATCH_MAX:
+                batch.append(cap_queue.get_nowait())
+        except queue.Empty:
+            pass
+        wrote = 0
+        for subject, payload, capture_ns in batch:
+            try:
+                wrote += _capture_emit_one(out, subject, payload, capture_ns)
+            except Exception as exc:  # noqa: BLE001 - the writer must never die
+                print(
+                    f"groww sidecar: capture emit failed ({type(exc).__name__}); "
+                    "record dropped to counter, writer continues",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                note_drop("capture_emit_error", detail=f"exc={type(exc).__name__}")
+        if wrote:
+            with _OUT_LOCK:
+                out.flush()
+                os.fsync(out.fileno())  # ONE durability fsync per batch
+        # Fold the hook thread's queue-full drops into the shared breakdown.
+        dropped_full_now = _HOOK_DROPPED_FULL[0]
+        if dropped_full_now > reported_dropped_full:
+            note_drop_bulk("capture_queue_full", dropped_full_now - reported_dropped_full)
+            reported_dropped_full = dropped_full_now
+        now_monotonic = time.monotonic()
+        if now_monotonic - last_stats_monotonic >= CAPTURE_STATS_INTERVAL_SECS:
+            last_stats_monotonic = now_monotonic
+            print(
+                "groww sidecar: CAPTURE-STATS "
+                f"hook_captured={CAPTURE_EMITTED_TOTAL} "
+                f"hook_enqueued={_HOOK_ENQUEUED[0]} "
+                f"hook_dropped_full={_HOOK_DROPPED_FULL[0]} "
+                f"reconcile_emitted={RECONCILE_EMITTED_TOTAL} "
+                f"qsize={cap_queue.qsize()}",
+                file=sys.stderr,
+                flush=True,
+            )
 
 
 def wait_for_subscriptions():
@@ -1626,16 +2255,31 @@ def _snapshot_walker_loop(out, sid_map, feed_cell) -> None:
     silent-forever failure. The per-iteration broad except makes death
     practically unreachable."""
     global _WALK_ERRORS_TOTAL
-    interval_secs = (
+    walk_secs = (
         resolve_walk_interval_ms(os.environ.get("GROWW_WALK_INTERVAL_MS")) / 1000.0
+    )
+    # DEMOTION (2026-07-03 per-callback capture): while the NATS-callback hook
+    # is attached (_CAPTURE_MODE), this walker is a slow RECONCILIATION sweep
+    # — it catches anything the hook missed; the shared dedup cache swallows
+    # everything the hook already emitted. If capture is disabled (kill-switch)
+    # or the attach failed, the walker runs at its full WALK_INTERVAL_MS
+    # cadence exactly as before — the unchanged fallback path.
+    reconcile_secs = (
+        resolve_reconcile_interval_ms(os.environ.get("GROWW_RECONCILE_INTERVAL_MS"))
+        / 1000.0
     )
     print(
         f"groww sidecar: coalesced snapshot walker armed "
-        f"(interval={int(interval_secs * 1000)}ms; callbacks are O(1) flag sets)",
+        f"(interval={int(walk_secs * 1000)}ms; "
+        f"reconcile={int(reconcile_secs * 1000)}ms while callback-capture is "
+        "active; callbacks are O(1) flag sets)",
         flush=True,
     )
     while True:
-        time.sleep(interval_secs)
+        # Re-read per iteration: capture mode can flip on a reconnect cycle
+        # (attach succeeded/failed on the fresh feed).
+        capture_active = _CAPTURE_MODE[0]
+        time.sleep(reconcile_secs if capture_active else walk_secs)
         feed = feed_cell[0]
         if feed is None:
             continue
@@ -1644,10 +2288,15 @@ def _snapshot_walker_loop(out, sid_map, feed_cell) -> None:
                 # Clear BEFORE the walk: an update landing mid-walk re-marks
                 # dirty and is drained next interval — never lost.
                 _LTP_DIRTY.clear()
-                emit_ltp_records(out, feed.get_ltp(), sid_map)
+                emit_ltp_records(out, feed.get_ltp(), sid_map, reconcile=capture_active)
             if _INDEX_DIRTY.is_set():
                 _INDEX_DIRTY.clear()
-                emit_index_records(out, feed.get_index_value(), sid_map)
+                emit_index_records(
+                    out, feed.get_index_value(), sid_map, reconcile=capture_active
+                )
+            # RAW-TICK-PROBE heartbeat: one float compare per iteration; a
+            # bounded stderr line at most once per RAW_PROBE_HEARTBEAT_SECS.
+            RAW_PROBE.maybe_heartbeat(time.monotonic())
         except Exception as exc:  # noqa: BLE001 - the walker must never die
             _WALK_ERRORS_TOTAL += 1
             if _WALK_ERRORS_TOTAL <= 5 or _WALK_ERRORS_TOTAL % 100 == 0:
@@ -1874,6 +2523,9 @@ def main() -> None:
     # Print the SDK version + the REAL feed methods available in this environment
     # exactly ONCE (first feed-connect), not per reconnect cycle.
     feed_introspection_printed = False
+    # Log the callback-capture kill-switch state / attach failure exactly once.
+    capture_disabled_logged = False
+    capture_attach_failed_logged = False
 
     # Reconnect loop — never give up (lock: not a single received tick missed).
     while True:
@@ -1913,6 +2565,47 @@ def main() -> None:
             # always force-closes the live socket on a mid-session stall, not the
             # stale first-cycle handle (the 10:31 IST self-heal).
             _CURRENT_FEED[0] = feed
+
+            # PER-CALLBACK INSTANT CAPTURE (2026-07-03): attach the enqueue-only
+            # hook to THIS cycle's fresh NATS client BEFORE subscribing, so the
+            # very first message is captured. Re-attached every reconnect cycle
+            # (each cycle constructs a new GrowwFeed). On kill-switch OFF or an
+            # attach/topic-map failure: one log line, walker path unchanged.
+            if CAPTURE_ENABLED:
+                capture_topic_map = build_capture_topic_map(
+                    stock_list, index_list, sid_map
+                )
+                attached = capture_topic_map is not None and install_callback_capture(
+                    feed, _CAPTURE_QUEUE
+                )
+                if attached:
+                    _CAPTURE_TOPIC_MAP[0] = capture_topic_map
+                    if not _CAPTURE_MODE[0]:
+                        print(
+                            "groww sidecar: per-callback capture ARMED — "
+                            "walker demoted to reconcile sweep "
+                            "(GROWW_CALLBACK_CAPTURE=off reverts)",
+                            flush=True,
+                        )
+                    _CAPTURE_MODE[0] = True
+                else:
+                    if not capture_attach_failed_logged:
+                        capture_attach_failed_logged = True
+                        print(
+                            "groww sidecar: callback-capture hook NOT attached "
+                            "(SDK internals changed?) — falling back to the "
+                            "walker path unchanged",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                    _CAPTURE_MODE[0] = False
+            elif not capture_disabled_logged:
+                capture_disabled_logged = True
+                print(
+                    "groww sidecar: per-callback capture DISABLED by "
+                    "GROWW_CALLBACK_CAPTURE — walker-only mode",
+                    flush=True,
+                )
 
             # DIAGNOSTIC (2026-06-29): print the installed SDK version + the REAL
             # public feed methods available in THIS environment, exactly once. This
@@ -1967,6 +2660,10 @@ def main() -> None:
             # subscribe counts in feed-health. Counts only, never a credential. This
             # is the honest "attempted" signal; it does NOT flip `connected=true`.
             write_status("subscribed", len(stock_list), len(index_list))
+            # RAW-TICK-PROBE: under GROWW_RAW_PROBE=always, re-arm the bounded
+            # sampler each reconnect cycle (default: once per process; the
+            # running counters are never reset). No-op on the first cycle.
+            RAW_PROBE.rearm_for_reconnect()
             # A full cycle succeeded up to the blocking consume — reset backoff so
             # the next genuine disconnect retries quickly, not at the capped delay.
             consecutive_failures = 0
@@ -2006,12 +2703,25 @@ def main() -> None:
                 # Arm the coalesced snapshot walker once per process (fix #1):
                 # it follows reconnects via the shared current-feed cell, and
                 # it only walks when a callback has marked a snapshot dirty.
+                # (With callback-capture active it runs as the reconcile sweep.)
                 threading.Thread(
                     target=_snapshot_walker_loop,
                     args=(out, sid_map, _CURRENT_FEED),
                     name="groww-snapshot-walker",
                     daemon=True,
                 ).start()
+                # Arm the per-callback capture writer once per process (2026-07-03):
+                # it drains the process-lifetime bounded queue across reconnect
+                # cycles (each cycle's fresh hook feeds the same queue). Armed
+                # only when the kill-switch is on; if the hook never attaches,
+                # the queue stays empty and this thread idles on a blocking get.
+                if CAPTURE_ENABLED:
+                    threading.Thread(
+                        target=_capture_writer_loop,
+                        args=(out, _CAPTURE_QUEUE),
+                        name="groww-capture-writer",
+                        daemon=True,
+                    ).start()
                 watchdog_started = True
             phase = "consume"
             # HONEST-FEED FIX (2026-06-29): the optimistic pre-consume
@@ -2257,6 +2967,89 @@ def _selftest_coalesce_and_watermark_lag() -> None:
     print("groww sidecar coalesce+watermark-lag self-test: PASS")
 
 
+def _selftest_raw_probe() -> None:
+    """Prove the RAW-TICK-PROBE sampler (2026-07-03, log-only). Guarded behind
+    `--selftest` so it NEVER runs in prod. Full matrix in test_dedup.py."""
+    lines = []
+    probe = RawTickProbe(mode="", emit=lines.append)
+    # Bounded at N: 20 drained stock ticks -> exactly N sample lines + 1 summary.
+    for i in range(20):
+        probe.observe(
+            "ltp",
+            str(2885 + i),
+            {"tsInMillis": 1_783_069_200_000 + i, "ltp": 100.0 + i,
+             "volume": 5000.0 if i % 2 == 0 else 0.0, "openInterest": 0.0,
+             "open": 99.0, "high": 101.0, "low": 98.0, "close": 0.0},
+        )
+    samples = [l for l in lines if l.startswith("RAW-TICK-PROBE kind=ltp")]
+    summaries = [l for l in lines if l.startswith("RAW-TICK-PROBE-SUMMARY")]
+    assert len(samples) == RAW_PROBE_SAMPLE_COUNT, "sampler must be bounded at N"
+    assert len(summaries) == 1, "exactly ONE summary after sampling completes"
+    assert f"nonzero_volume_ticks=4/{RAW_PROBE_SAMPLE_COUNT}" in summaries[0], \
+        "summary must count nonzero-volume samples (i=0,2,4,6 of the first 8)"
+    assert f"nonzero_oi=0/{RAW_PROBE_SAMPLE_COUNT}" in summaries[0], \
+        "summary must count nonzero-OI samples"
+    assert f"nonzero_ohlc={RAW_PROBE_SAMPLE_COUNT}/{RAW_PROBE_SAMPLE_COUNT}" in summaries[0], \
+        "any nonzero O/H/L/C marks the sample OHLC-populated"
+    # Running counters keep counting PAST the sample bound (all 20).
+    assert probe.total_ltp_ticks == 20 and probe.nonzero_volume_ticks == 10, \
+        "running counters must cover every drained tick, not just samples"
+    # Index sampling bounded at its own limit; never touches the ltp counters.
+    for i in range(5):
+        probe.observe("index", "NIFTY", {"tsInMillis": 1, "value": 26965.05})
+    idx = [l for l in lines if l.startswith("RAW-TICK-PROBE kind=index")]
+    assert len(idx) == RAW_PROBE_INDEX_SAMPLE_COUNT, "index sampler bounded"
+    assert probe.total_ltp_ticks == 20, "index dicts never count as ltp ticks"
+    # Default mode: rearm is a no-op. always mode: rearm resets sampling ONLY.
+    probe.rearm_for_reconnect()
+    probe.observe("ltp", "1", {"ltp": 1.0, "volume": 0.0})
+    assert len([l for l in lines if l.startswith("RAW-TICK-PROBE kind=ltp")]) \
+        == RAW_PROBE_SAMPLE_COUNT, "default mode samples once per process"
+    always = RawTickProbe(mode="always", ltp_limit=2, emit=lines.append)
+    assert always.always, "GROWW_RAW_PROBE=always must arm re-triggering"
+    # probe_field_nonzero: proto3 no-presence 0.0 / absent / garbage are False.
+    assert probe_field_nonzero(12.5) and probe_field_nonzero("3")
+    assert not probe_field_nonzero(0.0) and not probe_field_nonzero(None)
+    assert not probe_field_nonzero("x") and not probe_field_nonzero({})
+    print("groww sidecar raw-probe self-test: PASS")
+
+
+def _selftest_callback_capture() -> None:
+    """Prove the per-callback capture primitives (2026-07-03, ≤1ms study
+    variant c2). Guarded behind `--selftest` so it NEVER runs in prod. The
+    full matrix (incl. dedup parity + capture_ns end-to-end) is in
+    test_dedup.py; the Rust-side capture_ns parse is in groww_bridge.rs."""
+    # Kill-switch resolver: default ON; off/0/false/no (any case) → OFF.
+    assert resolve_callback_capture_enabled(None)
+    assert resolve_callback_capture_enabled("") and resolve_callback_capture_enabled("on")
+    for off in ("off", "OFF", "0", "false", "no"):
+        assert not resolve_callback_capture_enabled(off), f"{off!r} must disable"
+    # Reconcile-sweep interval clamp.
+    assert resolve_reconcile_interval_ms(None) == RECONCILE_INTERVAL_MS_DEFAULT
+    assert resolve_reconcile_interval_ms("50") == RECONCILE_INTERVAL_MS_MIN
+    assert resolve_reconcile_interval_ms("999999") == RECONCILE_INTERVAL_MS_MAX
+    # Hook: enqueue-only, bounded, never blocks, ALWAYS delegates.
+    delegated = []
+    bounded_queue = queue.Queue(maxsize=2)
+    enqueued_cell, dropped_cell = [0], [0]
+    hook = make_capture_hook(
+        lambda subject, data: delegated.append((subject, data)),
+        bounded_queue,
+        enqueued_cell,
+        dropped_cell,
+    )
+    before_ns = time.time_ns()
+    for i in range(5):
+        hook(f"/ld/eq/nse/price.{i}", b"payload")
+    assert len(delegated) == 5, "original callback must ALWAYS be invoked"
+    assert enqueued_cell[0] == 2 and dropped_cell[0] == 3, \
+        "bounded queue: 2 enqueued, 3 dropped to counter (never blocked)"
+    subject, payload, capture_ns = bounded_queue.get_nowait()
+    assert subject == "/ld/eq/nse/price.0" and payload == b"payload"
+    assert before_ns <= capture_ns <= time.time_ns(), "capture_ns is a real stamp"
+    print("groww sidecar callback-capture self-test: PASS")
+
+
 def _utc_epoch_for_ist(hour: int, minute: int) -> float:
     """Helper: a UTC epoch whose IST wall-clock is exactly `hour:minute` today.
     IST = UTC + 5:30, so UTC h:m = IST h:m − 5:30. Pure arithmetic for the test."""
@@ -2272,5 +3065,7 @@ if __name__ == "__main__":
         _selftest_self_heal()
         _selftest_dedup()
         _selftest_coalesce_and_watermark_lag()
+        _selftest_raw_probe()
+        _selftest_callback_capture()
     else:
         main()

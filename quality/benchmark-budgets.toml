@@ -37,6 +37,26 @@ compute_lag_secs                    = 50      # <50ns — saturating sub.
 should_emit_snapshot                = 50      # <50ns — single integer compare.
 parse_questdb_dataset_json_150_rows = 1000000 # <1ms — JSON parsing for 150-row payload (option_movers worst case).
 
+# B6 (2026-07-03) — operator-gated TRUE-COMPUTE per-tick budget.
+# Bench: composite/quote_tick_compute_only (crates/core/benches/
+# full_tick_processing.rs) — the full live-loop chain incl. the REAL
+# writer append under the off-thread flush offload (flush I/O on the
+# worker thread, NOT in the measured thread). Measured median ~1.94µs
+# on the 2026-07-03 dev box → ~5× headroom under the operator's 10µs
+# gate. Key checked bidirectionally against every other budget key and
+# bench name (incl. composite_quote_tick_full_chain) — no substring
+# collision.
+composite_quote_tick_compute_only = 10000  # <10µs — B6 true-compute budget (2026-07-03)
+
+# C1 (2026-07-03) — full per-tick chain budget, wired into CI by bench.yml.
+# Bench: composite/quote_tick_full_chain (crates/core/benches/
+# full_tick_processing.rs:256) — parse → heartbeat → gap detector → canary
+# scan → enricher → ILP row → persisted counter → broadcast → monotonicity
+# guard → histogram records. Key checked bidirectionally against every other
+# budget key and bench dir name (incl. composite_quote_tick_compute_only) —
+# no substring collision.
+composite_quote_tick_full_chain = 10000  # <10µs full per-tick chain p50 (measured p50 1526 ns on 2026-07-03, this container)
+
 # Trading crate — OMS
 oms_state_transition     = 100          # <100ns — matches oms/state_transition
 

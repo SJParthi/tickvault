@@ -124,10 +124,14 @@ _VIEW_POLL_SECS = 0.4
 # Latency probes run metrics-scrape-T0 + feeds-health-T0 + PARALLEL per-feed
 # TCP/TLS probes (2 samples × --max-time 2, all feeds concurrently) + QuestDB
 # + a 4s window floor + metrics-scrape-T1 + feeds-health-T1 ON the box.
-# Worst case ≈ 3+4+4+3+4+3+4 = 25s; typical ~7-9s. Lambda timeout is 30s,
-# so 26s leaves margin. Per-curl --max-time bounds every network leg — one
-# dead feed endpoint can never hang the whole measure (probes are parallel).
-_LATENCY_TIMEOUT_SECS = 26.0
+# Worst case ≈ 3+4+4+3+4+3+4 = 25s; typical ~7-9s. The per-feed lag
+# PERCENTILE block (2026-07-03) runs as ONE background job launched
+# alongside the parallel probes, so it shares the same wait — its own
+# worst case (3s feed-discovery + 3s parallel per-feed aggregates) adds
+# at most ~2s over the probes' 4s, keeping worst ≈ 27s. Lambda timeout
+# is 30s, so 28s leaves margin. Per-curl --max-time bounds every leg —
+# one dead endpoint (or a slow QuestDB) can never hang the whole measure.
+_LATENCY_TIMEOUT_SECS = 28.0
 
 # Read-only SQL gate: the first keyword must be one of these.
 _SQL_ALLOWED_PREFIXES = ("select", "show", "explain", "with")
@@ -169,6 +173,12 @@ _SQL_BANNED = (
 # Server-side row cap for the read-only SQL console (both the Data-tab query
 # box and the DB tab share the same `sql` action).
 _SQL_MAX_ROWS = 1000
+
+# B4 QuestDB console: TTL of the one-click link token minted by the
+# `qdb_console_url` action. The console front Lambda verifies it (same
+# control secret, HMAC over "qdblink|<exp>") and swaps it for a 12h session
+# cookie — so the link in a browser history / Telegram scroll dies in 90s.
+_QDB_LINK_TTL_SECS = 90
 
 
 def _is_market_hours(now_utc: datetime.datetime) -> bool:
@@ -257,6 +267,17 @@ def _cap_sql_rows(query: str, cap: int = _SQL_MAX_ROWS) -> str:
     if first in ("select", "with"):
         return f"{q} LIMIT {cap}"
     return q
+
+
+def _mint_qdb_link_token(secret: str, now_epoch: int, ttl: int = _QDB_LINK_TTL_SECS) -> str:
+    """One-click console link token: <exp>.<hexhmac(secret, "qdblink|<exp>")>.
+    Verified constant-time by the questdb-console-front Lambda against the
+    SAME SSM control secret — no second key to manage. Pure function."""
+    import hashlib  # noqa: PLC0415
+
+    exp = now_epoch + ttl
+    sig = hmac.new(secret.encode(), f"qdblink|{exp}".encode(), hashlib.sha256).hexdigest()
+    return f"{exp}.{sig}"
 
 
 def _ssm_shell(commands: list[str]) -> str:
@@ -559,6 +580,93 @@ _FEED_LIVE_HOSTS = {
 _FEED_PROBE_SAMPLES = 2
 _FEED_PROBE_MAX_SECS = 2
 
+# ---- per-feed exchange→received lag percentiles (operator demand 2026-07-03:
+# "p50, p99, so many" PER FEED, like a proper latency dashboard).
+#
+# Source: the box's QuestDB HTTP /exp (CSV) — the same local endpoint the
+# existing portal queries use. Lag = received_at − ts (both IST-aligned
+# TIMESTAMPs on the `ticks` table; direct timestamp subtraction in QuestDB
+# yields MICROSECONDS). Percentiles are computed SERVER-SIDE with QuestDB's
+# approx_percentile(value, q, 3) — HdrHistogram, 3 significant figures,
+# verified against QuestDB docs 2026-07-03 (approx_percentile requires
+# NON-NEGATIVE input, hence the CASE clamp below; clamped rows are counted
+# and shown honestly on the page).
+#
+# Complexity (honest): the Lambda side is O(feeds ≤ cap) fixed-width CSV
+# lines — effectively O(1). Each QuestDB aggregate is LIMIT-bounded to the
+# latest _PCTL_SAMPLE_CAP receive-stamped rows per feed inside the 10-min
+# interval scan (ORDER BY ts DESC on the designated timestamp = backward
+# scan that stops at the cap) — a BOUNDED SAMPLE, honestly O(window rows)
+# inside QuestDB per feed, never an unbounded table scan. Feed discovery is
+# one interval-scanned DISTINCT over the same 10-min window. NO feed name
+# is hardcoded — any future feed in `ticks` gets its row automatically.
+_PCTL_WINDOW_MINS = 10
+_PCTL_SAMPLE_CAP = 50_000
+_PCTL_MAX_FEEDS = 6  # loop bound — keeps the parallel query fan-out finite
+_PCTL_QUERY_MAX_SECS = 3
+_PCTL_QUANTILES = (("p50", "0.5"), ("p90", "0.9"), ("p95", "0.95"), ("p99", "0.99"))
+# Shell-side allowlist for feed tokens read back from the DB before they are
+# interpolated into the per-feed SQL (defense in depth — feed values are our
+# own 'dhan'/'groww' symbols, but NOTHING unvalidated ever enters a query).
+_PCTL_FEED_TOKEN_RE = "^[a-z0-9_-]{1,32}$"
+
+
+def _pctl_feeds_sql() -> str:
+    """Feed-discovery SQL: every feed with ticks in the window (pure)."""
+    return (
+        "select distinct feed from ticks "
+        f"where ts > dateadd('m', -{_PCTL_WINDOW_MINS}, now())"
+    )
+
+
+def _pctl_feed_sql() -> str:
+    """Per-feed lag-percentile SQL with a `$f` shell placeholder (pure).
+
+    One statement per feed: count + clamped-negative count + p50/p90/p95/p99
+    (approx, 3 sig figs) + max, over the latest ≤_PCTL_SAMPLE_CAP rows that
+    carry a receive stamp (`received_at != null`) in the last
+    _PCTL_WINDOW_MINS minutes. Lag unit inside SQL = microseconds (direct
+    QuestDB timestamp subtraction); the Lambda converts to ms."""
+    pctls = ", ".join(
+        f"approx_percentile(lag_us, {q}, 3) {name}" for name, q in _PCTL_QUANTILES
+    )
+    return (
+        f"select count() rows, sum(neg) negs, {pctls}, max(lag_us) pmax from ("
+        "select case when received_at - ts < 0 then 0 else received_at - ts end lag_us, "
+        "case when received_at - ts < 0 then 1 else 0 end neg "
+        "from ticks where feed = '$f' and received_at != null "
+        f"and ts > dateadd('m', -{_PCTL_WINDOW_MINS}, now()) "
+        f"order by ts desc limit {_PCTL_SAMPLE_CAP})"
+    )
+
+
+def _pctl_commands() -> list[str]:
+    """Shell block for the per-feed percentile grid (pure — static inputs).
+
+    Launched as ONE background job alongside the parallel TCP/TLS probes so
+    it shares their `wait` (no serial wall-clock cost beyond the shared
+    window). Inside: discover feeds (validated against the token allowlist
+    BEFORE interpolation, capped at _PCTL_MAX_FEEDS), fire one bounded
+    aggregate per feed IN PARALLEL, then emit one `PCTL_ROW=<feed>,<csv>`
+    line per feed. A failed query yields an empty CSV tail — the parser
+    degrades that feed honestly instead of fabricating numbers."""
+    exp = "http://127.0.0.1:9000/exp"
+    return [
+        "( PCTL_FEEDS=$(curl -fsS --max-time 3 -G '" + exp + "' "
+        f'--data-urlencode "query={_pctl_feeds_sql()}" 2>/dev/null '
+        "| tail -n +2 | tr -d '\"\\r' "
+        f"| grep -E '{_PCTL_FEED_TOKEN_RE}' | head -{_PCTL_MAX_FEEDS}); "
+        "for f in $PCTL_FEEDS; do "
+        f"( curl -fsS --max-time {_PCTL_QUERY_MAX_SECS} -G '" + exp + "' "
+        f'--data-urlencode "query={_pctl_feed_sql()}" 2>/dev/null '
+        "| tail -n +2 | head -1 | tr -d '\"\\r' > /tmp/tv-pctl-$f.txt ) & "
+        "done; wait; "
+        "for f in $PCTL_FEEDS; do "
+        'echo "PCTL_ROW=$f,$(cat /tmp/tv-pctl-$f.txt 2>/dev/null)"; '
+        "rm -f /tmp/tv-pctl-$f.txt; done "
+        ") > /tmp/tv-pctl.out 2>/dev/null &",
+    ]
+
 
 def _latency_commands() -> list[str]:
     """Build the on-box latency snapshot script (pure — static inputs only).
@@ -601,6 +709,9 @@ def _latency_commands() -> list[str]:
             f"--max-time {_FEED_PROBE_MAX_SECS} https://{host}/ 2>/dev/null || echo 'x x'; "
             f"done > /tmp/tv-probe-{feed}.txt 2>/dev/null) &"
         )
+    # Per-feed lag-percentile job runs CONCURRENTLY with the probes and is
+    # reaped by the same `wait` below (see _pctl_commands for the contract).
+    cmds += _pctl_commands()
     cmds.append("wait")
     for feed in sorted(_FEED_LIVE_HOSTS):
         cmds += [
@@ -610,6 +721,9 @@ def _latency_commands() -> list[str]:
             f"rm -f /tmp/tv-probe-{feed}.txt",
         ]
     cmds += [
+        # The pctl job finished under the shared `wait` above — surface its
+        # PCTL_ROW lines into the labeled stdout stream now.
+        "cat /tmp/tv-pctl.out 2>/dev/null; rm -f /tmp/tv-pctl.out",
         "echo \"QDB=$(curl -o /dev/null -s -w '%{time_total}' --max-time 3 'http://127.0.0.1:9000/exec?query=SELECT%201' 2>/dev/null)\"",
         "echo \"SKEW=$(chronyc tracking 2>/dev/null | awk '/Last offset/{print $4}')\"",
         # Floor the window at ~4 s so fast-failing probes (network down →
@@ -755,6 +869,77 @@ def _feed_comparison_winners(rows: list) -> dict:
     return winners
 
 
+_PCTL_COLS = ("p50_ms", "p90_ms", "p95_ms", "p99_ms", "max_ms")
+
+
+def _parse_pctl_row(raw: str) -> tuple:
+    """Parse one `<feed>,<rows>,<negs>,<p50>,<p90>,<p95>,<p99>,<max>` CSV
+    line (lag values in MICROSECONDS from QuestDB) into `(feed, dict)`, or
+    `(None, None)` for anything malformed — a failed on-box query yields an
+    empty tail after the feed name and is skipped, never fabricated. Pure."""
+    import re  # noqa: PLC0415
+
+    parts = raw.split(",")
+    if len(parts) != 8:
+        return (None, None)
+    feed = parts[0].strip()
+    if not re.fullmatch(r"[a-z0-9_-]{1,32}", feed):
+        return (None, None)  # defense in depth — mirror the shell allowlist
+
+    def _num(s: str) -> float | None:
+        s = s.strip()
+        if not s or s.lower() in ("null", "nan"):
+            return None
+        try:
+            return float(s)
+        except ValueError:
+            return None
+
+    rows = _num(parts[1])
+    if rows is None or rows < 0:
+        return (None, None)
+    negs = _num(parts[2])
+    out: dict = {"rows": int(rows), "neg_clamped": int(negs) if negs else 0}
+    for key, val in zip(_PCTL_COLS, parts[3:8]):
+        n = _num(val)
+        # µs → ms, 2 decimals (sub-ms resolution matters for the groww share).
+        out[key] = round(n / 1000.0, 2) if n is not None else None
+    return (feed, out)
+
+
+def _feed_percentile_map(pctl_lines: list) -> dict:
+    """feed → percentile dict from the PCTL_ROW payload lines (pure)."""
+    out: dict = {}
+    for raw in pctl_lines:
+        feed, row = _parse_pctl_row(raw)
+        if feed is not None:
+            out[feed] = row
+    return out
+
+
+def _percentile_winners(pctl: dict) -> dict:
+    """column → feed with the STRICTLY lowest lag value (pure).
+
+    Lower is better for every lag column. Same honesty contract as
+    _feed_comparison_winners: a winner needs ≥2 comparable values and a
+    strictly unique best — ties, single-feed measures, and zero-row feeds
+    yield NO winner."""
+    winners: dict = {}
+    for col in _PCTL_COLS:
+        vals = [
+            (row[col], feed)
+            for feed, row in pctl.items()
+            if row.get(col) is not None and row.get("rows", 0) > 0
+        ]
+        if len(vals) < 2:
+            continue
+        vals.sort(key=lambda x: x[0])
+        if vals[0][0] == vals[1][0]:
+            continue  # tie — no single winner
+        winners[col] = vals[0][1]
+    return winners
+
+
 def _feed_latency_rows(health_t0: object, health_t1: object, probes: dict, window: str) -> list:
     """Join the app's per-feed health rows with the on-box network probes
     (pure). One output row per feed the APP reports (never hardcoded);
@@ -830,10 +1015,16 @@ def _parse_latency(stdout: str) -> dict:
     t1_lines: list[str] = []
     feeds_t0_lines: list[str] = []
     feeds_t1_lines: list[str] = []
+    pctl_lines: list[str] = []
     fields: dict[str, str] = {}
     mode = ""
     probe_feed = ""
     for line in (stdout or "").splitlines():
+        if line.startswith("PCTL_ROW="):
+            # Per-feed lag-percentile CSV (2026-07-03) — intercepted BEFORE
+            # the generic K=V branch so multiple rows never clobber a key.
+            pctl_lines.append(line[len("PCTL_ROW=") :])
+            continue
         if line in ("METRICS_BEGIN", "METRICS_T0_BEGIN", "FEEDS_T0_BEGIN", "FEEDS_T1_BEGIN"):
             mode = {
                 "METRICS_BEGIN": "METRICS",
@@ -934,6 +1125,7 @@ def _parse_latency(stdout: str) -> dict:
     health_t0, err_t0 = health_json(feeds_t0_lines)
     health_t1, err_t1 = health_json(feeds_t1_lines)
     feed_rows = _feed_latency_rows(health_t0, health_t1, probes, window_secs())
+    pctl_map = _feed_percentile_map(pctl_lines)
 
     return {
         # Per-feed comparison (operator demand 2026-07-03): one row per feed
@@ -942,6 +1134,14 @@ def _parse_latency(stdout: str) -> dict:
         "feeds": feed_rows,
         "feeds_error": "" if feed_rows else (err_t1 or err_t0 or ""),
         "winners": _feed_comparison_winners(feed_rows),
+        # Per-feed exchange→received lag percentile grid (2026-07-03).
+        # Empty dict = the box returned no PCTL rows (QuestDB down, no
+        # receive-stamped rows in the window, or query failed) — the page
+        # says so honestly instead of showing fake numbers.
+        "percentiles": pctl_map,
+        "percentile_winners": _percentile_winners(pctl_map),
+        "percentile_window_mins": _PCTL_WINDOW_MINS,
+        "percentile_sample_cap": _PCTL_SAMPLE_CAP,
         "questdb_ms": sec_to_ms(fields.get("QDB", "")),
         "clock_skew_ms": sec_to_ms(fields.get("SKEW", "")),
         "tick_process_avg_ns": avg("tv_tick_processing_duration_ns"),
@@ -1873,6 +2073,17 @@ def lambda_handler(event, _context):
             enc = urllib.parse.quote(q)
             out = _ssm_shell_sync(["set +e", f"curl -fsS 'http://127.0.0.1:9000/exp?query={enc}&limit={_SQL_MAX_ROWS}' 2>/dev/null | head -{_SQL_MAX_ROWS + 1} || echo 'query failed'"])
             return _resp(200, {"ok": True, "action": "sql", "csv": out})
+        if action == "qdb_console_url":
+            # READ-ONLY: mint a one-click 90s HMAC link to the B4 QuestDB
+            # console (questdb-console-front Lambda). Same control secret
+            # signs the token; the console verifies it constant-time and
+            # swaps it for a 12h session cookie. Env QDB_CONSOLE_URL is
+            # injected by Terraform only when var.enable_questdb_console.
+            base = os.environ.get("QDB_CONSOLE_URL", "").rstrip("/")
+            if not base:
+                return _resp(400, {"error": "console not enabled", "action": action})
+            tok = _mint_qdb_link_token(_control_secret(), int(time.time()))
+            return _resp(200, {"ok": True, "action": action, "url": f"{base}/open?tok={tok}"})
         if action == "logs":
             out = _ssm_shell_sync(
                 [
@@ -2146,6 +2357,17 @@ def _console_html() -> str:
         <div class="row" style="margin-bottom:12px"><button class="b-blu" onclick="loadLatency()">⚡ Measure now</button></div>
         <div id="latfeeds" style="overflow:auto"></div>
         <div class="muted" id="latload" style="margin-top:8px"></div>
+        <div class="lbl" style="margin-top:14px">exchange → received lag percentiles, per feed (last 10 min)</div>
+        <div id="latpctl" style="overflow:auto"></div>
+        <div class="muted" id="latpctlnote" style="margin-top:8px"></div>
+        <div class="muted" style="margin-top:6px">Lag = exchange timestamp → our receive stamp, per stored tick.
+          Method (honest): approximate percentiles (3-significant-figure histogram, computed inside the database)
+          over the latest ≤50,000 receive-stamped rows per feed in the last 10 minutes — a bounded sample, not the
+          full tape; negative lags are clamped to 0 and counted. dhan caveat: dhan exchange timestamps tick in
+          WHOLE SECONDS, so its lag values carry up to ~1s quantization — never read them as millisecond-precise.
+          groww rows carry receive-stamps; after the next deploy the stamp = capture-at-NIC (capture_ns).
+          Lower is better; best per column is <span class="ok">green</span>. Auto-extends to any future feed
+          (the feed list comes from the database, never hardcoded).</div>
         <div class="lbl" style="margin-top:14px">box-wide (shared by all feeds)</div>
         <div class="shields" id="latnet"></div>
         <div class="shields" id="latproc" style="margin-top:10px"></div>
@@ -2167,6 +2389,7 @@ def _console_html() -> str:
       </div>
       <div class="card">
         <div class="lbl">database console &nbsp;<span class="badge unknown">READ-ONLY — writes are blocked server-side</span></div>
+        <div class="row" style="margin-bottom:10px"><button class="b-blu" onclick="openQdbConsole()">🗄 Open QuestDB Console</button></div>
         <div style="display:flex;gap:16px;flex-wrap:wrap">
           <div style="flex:1 1 200px;min-width:180px">
             <div class="lbl">tables</div>
@@ -2422,6 +2645,10 @@ async function runDbSql(){ const q=$('dbsql').value.trim(); if(!q){ toast('Type 
   const j=await call('sql',{query:q}); if(!j){ $('dbout').innerHTML=''; return; }
   dbCsv=j.csv||''; const n=renderGrid($('dbout'),parseCsv(dbCsv));
   $('dbcount').textContent=n+' row'+(n===1?'':'s')+(n>=1000?' — server cap 1000 reached':''); }
+async function openQdbConsole(){ const w=window.open('','_blank'); // open SYNC in the click (popup-safe) BEFORE the await
+  const j=await call('qdb_console_url');
+  if(j&&j.url){ if(w) w.location=j.url; else window.open(j.url,'_blank'); }
+  else { if(w) w.close(); } } // call() already toasts the {error}/non-ok case
 function dbDownloadCsv(){ if(!dbCsv){ toast('Run a query first'); return; }
   const a=document.createElement('a'); a.href=URL.createObjectURL(new Blob([dbCsv],{type:'text/csv'}));
   a.download='tickvault-query-'+new Date().toISOString().slice(0,19).replace(/[:T]/g,'-')+'.csv';
@@ -2484,9 +2711,33 @@ function fmtMs(s){ return (s===''||s==null)?'—':s+' ms'; }
 // the probe map doesn't know it) with zero portal changes. The best value per
 // column (server-computed j.winners — strict best, never on a tie or a
 // single-feed measure) is highlighted green.
+function fmtLagMs(v){ if(v==null) return '—'; v=Number(v);
+  if(v>=1000) return (v/1000).toFixed(2)+' s'; return v.toFixed(2)+' ms'; }
 async function loadLatency(){ $('latnet').dataset.loaded='1'; $('latnet').innerHTML='<span class="muted">measuring…</span>'; $('latproc').innerHTML='';
   $('latfeeds').innerHTML='<span class="muted">measuring…</span>'; $('latload').textContent='';
-  const j=await call('latency'); if(!j){ $('latnet').innerHTML=''; $('latfeeds').innerHTML=''; return; }
+  $('latpctl').innerHTML='<span class="muted">measuring…</span>'; $('latpctlnote').textContent='';
+  const j=await call('latency'); if(!j){ $('latnet').innerHTML=''; $('latfeeds').innerHTML=''; $('latpctl').innerHTML=''; return; }
+  // Per-feed lag percentile grid — iterates the SERVER's j.percentiles keys
+  // (feeds discovered from the database at measure time, never hardcoded),
+  // so a future feed #3 gets its row with zero portal changes. Best (lowest)
+  // value per column = server-computed j.percentile_winners, green.
+  const p=j.percentiles||{}; const pw=j.percentile_winners||{}; const pf=Object.keys(p).sort();
+  if(pf.length){
+    const pcols=[['p50_ms','p50'],['p90_ms','p90'],['p95_ms','p95'],['p99_ms','p99'],['max_ms','max'],['rows','rows in window']];
+    let ph='<table><tr><th>feed</th>'+pcols.map(c=>'<th>'+c[1]+'</th>').join('')+'</tr>';
+    pf.forEach(f=>{ const r=p[f]; ph+='<tr><td><b>'+esc(String(f))+'</b></td>';
+      pcols.forEach(c=>{ const k=c[0]; const v=r[k]; let txt;
+        if(k==='rows') txt=(v==null)?'—':Number(v).toLocaleString();
+        else txt=(r.rows>0)?fmtLagMs(v):'no receive-stamped rows';
+        ph+='<td class="'+(pw[k]===f?'win':'')+'">'+esc(String(txt))+'</td>'; });
+      ph+='</tr>'; });
+    $('latpctl').innerHTML=ph+'</table>';
+    const clamped=pf.filter(f=>p[f].neg_clamped>0).map(f=>f+': '+Number(p[f].neg_clamped).toLocaleString());
+    $('latpctlnote').textContent=clamped.length?('negative lags clamped to 0 in this sample — '+clamped.join(' · ')):'';
+  } else {
+    $('latpctl').innerHTML='<span class="warn">no lag-percentile data — no receive-stamped rows in the last '
+      +(j.percentile_window_mins||10)+' min (market closed?) or the database query failed on the box</span>';
+  }
   const feeds=Array.isArray(j.feeds)?j.feeds:[]; const w=j.winners||{};
   if(feeds.length){
     const cols=[['tcp_ms','TCP connect'],['tls_ms','+ TLS'],['last_tick_age_secs','last tick age'],['ticks_per_sec','ticks/sec (window)'],['subscribed_total','subscribed']];
