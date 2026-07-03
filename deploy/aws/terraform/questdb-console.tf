@@ -35,15 +35,23 @@ resource "aws_security_group" "qdb_console_lambda" {
   description = "QuestDB console proxy Lambda (B4): egress-only; box SG admits 9000 from this SG"
   vpc_id      = aws_vpc.dlt.id
 
-  # Least-privilege egress: TCP 9000 to the box private IP ONLY (a known
-  # plan-time attribute; the relay dials a raw IP so it needs no DNS/other
-  # egress).
+  # Least-privilege egress: TCP 9000 into the VPC CIDR ONLY. We deliberately
+  # scope to the VPC CIDR (aws_vpc.dlt.cidr_block, a static plan-time value)
+  # rather than the box private IP (aws_instance.tv_app.private_ip): the box
+  # is the sole :9000 listener in the /16, so port-locking to 9000 is the real
+  # control, while referencing the instance here would drag the instance — and
+  # therefore aws_security_group.tv_app, whose SG-to-SG ingress references THIS
+  # SG — into a dependency cycle (qdb_console_lambda → instance → tv_app SG →
+  # qdb_console_lambda). VPC-CIDR egress depends only on the VPC, breaking the
+  # cycle while keeping every rule inline (no inline/external drift) and the
+  # box's 9000 ingress SG-to-SG only (never public). The relay dials a raw IP,
+  # so it needs no DNS/other egress.
   egress {
-    description = "QuestDB :9000 on the box private IP only"
+    description = "QuestDB :9000, VPC CIDR only (box is the sole :9000 listener)"
     from_port   = 9000
     to_port     = 9000
     protocol    = "tcp"
-    cidr_blocks = ["${aws_instance.tv_app.private_ip}/32"]
+    cidr_blocks = [aws_vpc.dlt.cidr_block]
   }
 
   tags = {
