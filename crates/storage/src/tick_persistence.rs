@@ -615,7 +615,9 @@ impl TickPersistenceWriter {
         // `in_flight` (mut) — no aliasing.
         let outcome = match self.flush_offload.as_ref() {
             Some(offload) => offload.try_dispatch(&mut self.buffer, &mut self.in_flight),
-            None => crate::tick_flush_worker::DispatchOutcome::NoSpare,
+            // Worker never spawned — same "unavailable" class as a gone
+            // worker channel (LOW-2).
+            None => crate::tick_flush_worker::DispatchOutcome::WorkerGone,
         };
         match outcome {
             crate::tick_flush_worker::DispatchOutcome::Sent => {
@@ -627,13 +629,22 @@ impl TickPersistenceWriter {
                 self.pending_count = 0;
                 self.last_flush_ms = current_time_ms();
             }
-            crate::tick_flush_worker::DispatchOutcome::NoSpare
-            | crate::tick_flush_worker::DispatchOutcome::WorkerGone => {
+            ref outcome @ (crate::tick_flush_worker::DispatchOutcome::NoSpare
+            | crate::tick_flush_worker::DispatchOutcome::WorkerGone) => {
                 // Legacy inline sync flush (pre-B6 behavior) — measured as
                 // stall + counted so a worker that cannot keep up is visible.
+                // LOW-2: distinguish "worker behind" (pool exhausted) from
+                // "worker unavailable" (never spawned / channel gone) —
+                // static label values only.
+                let reason: &'static str =
+                    if matches!(outcome, crate::tick_flush_worker::DispatchOutcome::NoSpare) {
+                        "pool_empty"
+                    } else {
+                        "worker_unavailable"
+                    };
                 metrics::counter!(
                     "tv_tick_flush_backpressure_block_total",
-                    "reason" => "inline_fallback"
+                    "reason" => reason
                 )
                 .increment(1);
                 let stall_start = std::time::Instant::now();
@@ -659,6 +670,11 @@ impl TickPersistenceWriter {
     fn drain_failed_batches(&mut self) {
         // O(1) when empty (a single atomic try_recv per call). The rescue
         // body below is a cold failure path (QuestDB outage only).
+        // MEDIUM-5 (adversarial round 1): the rescue work is ring/spill disk
+        // I/O — persistence STALL, not compute. Measured (note_stall at the
+        // end) only when a batch was actually rescued, so the empty-channel
+        // fast path stays a bare try_recv.
+        let stall_start = std::time::Instant::now();
         let mut rescued: usize = 0;
         loop {
             // Scoped borrow: end the `flush_offload` borrow before the
@@ -684,6 +700,12 @@ impl TickPersistenceWriter {
         // rescue the current partial rows BEFORE dropping the sender, exactly
         // as the inline flush-failure path does (sender=None + rescue).
         self.rescue_in_flight();
+        // LOW-3: the ILP rows just rescued are now stale in `buffer`; the
+        // reconnect path replaces the buffer anyway (`reconnect()` builds a
+        // fresh one), but clearing here makes the no-duplicate-flush
+        // invariant local — and any replay would be DEDUP-collapsed
+        // (idempotent) regardless.
+        self.buffer.clear();
         self.sender = None;
         // Rule 5: flush failures are error! (Telegram-routable).
         error!(
@@ -692,6 +714,7 @@ impl TickPersistenceWriter {
             "off-thread tick flush failed — batches rescued to ring buffer; \
              writer marked disconnected for throttled reconnect + drain"
         );
+        self.note_stall(stall_start);
     }
 
     /// B6: accrues persistence-stall nanoseconds (blocking-send fallback,
@@ -2567,6 +2590,13 @@ mod tests {
             writer.ticks_dropped_total(),
             0,
             "zero-loss: nothing may be dropped on the failure path"
+        );
+        // MEDIUM-5 (adversarial round 1): rescuing a worker-failed batch is
+        // ring/spill I/O — it must be accounted as persistence STALL, never
+        // as compute.
+        assert!(
+            writer.take_last_stall_ns() > 0,
+            "draining a failed batch must accrue persistence stall, not compute"
         );
     }
 
