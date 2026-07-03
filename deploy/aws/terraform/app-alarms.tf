@@ -232,16 +232,18 @@ resource "aws_cloudwatch_metric_alarm" "ticks_dropped" {
 # ---------------------------------------------------------------------------
 # 9. Aggregator producing zero seals during market hours
 #
-# Note: this alarm is NOT market-hours-gated at the CloudWatch level (CW
-# alarms can't query Prometheus). It will fire during off-hours (15:30 IST
-# onwards). Acceptable cost: ~16h/day of expected ALARM state, but those
-# fires coalesce into the Telegram webhook's bucket and the operator
-# learns to ignore them after 15:30 IST. Better than missing a mid-market
-# aggregator death because we hardcoded a market-hours gate.
+# MARKET-HOURS-GATED (2026-07-03, 5 AM false-SOS fix): zero seals is the
+# CORRECT, by-design state whenever the market is closed but the app is
+# running (early manual start, 15:30-16:30 IST post-close idle). The prior
+# "operator learns to ignore off-hours fires" stance is exactly the
+# pager-fatigue anti-pattern audit-findings Rule 3 (market-hours-aware)
+# forbids. Actions are OFF by default; the shared market-hours gate Lambda
+# (market-hours-liveness-alarm.tf) enables them 09:20-15:35 IST Mon-Fri
+# only. In-market sensitivity is UNCHANGED (same metric/threshold/periods).
 # ---------------------------------------------------------------------------
 resource "aws_cloudwatch_metric_alarm" "aggregator_no_seals" {
   alarm_name          = "tv-${var.environment}-aggregator-no-seals"
-  alarm_description   = "Aggregator emitted zero seals in the last 5 minutes. Expected during off-hours (15:30 IST onwards) — investigate ONLY during 09:15-15:30 IST."
+  alarm_description   = "Aggregator emitted zero seals in the last 5 minutes DURING MARKET HOURS. Actions gated to 09:20-15:35 IST Mon-Fri by the market-hours gate Lambda — off-hours zero-seal is by design and never pages."
   comparison_operator = "LessThanOrEqualToThreshold"
   evaluation_periods  = 1
   metric_name         = "tv_aggregator_seals_emitted_total"
@@ -251,7 +253,10 @@ resource "aws_cloudwatch_metric_alarm" "aggregator_no_seals" {
   threshold           = 0
   treat_missing_data  = "notBreaching"
   dimensions          = local.app_dimensions
-  alarm_actions       = local.app_alarm_actions
+  # Actions OFF by default; the market-hours gate Lambda flips them ON
+  # 09:20-15:35 IST Mon-Fri (market-hours-liveness-alarm.tf).
+  actions_enabled = false
+  alarm_actions   = local.app_alarm_actions
   # No ok_actions — would page on every off-hour transition.
 }
 
@@ -276,10 +281,23 @@ resource "aws_cloudwatch_metric_alarm" "orders_rejected" {
 
 # ---------------------------------------------------------------------------
 # 11. Composite real-time guarantee score critical (< 0.80)
+#
+# MARKET-HOURS-GATED (2026-07-03, 5 AM false-SOS fix): the SLO score is
+# LEGITIMATELY 0 outside market hours — its dimensions (tick freshness,
+# aggregator health, ...) are market-gated in-app, so the metric is PRESENT
+# with value 0.0 whenever the app runs off-hours. treat_missing_data does
+# NOT help (the data is not missing). VERIFIED incident 2026-07-03 05:40
+# IST: operator manually started the box pre-market and got an SOS Telegram
+# ("2 datapoints 0.0 ... less than threshold (0.8)") for a healthy, idle
+# system. Actions are OFF by default; the shared market-hours gate Lambda
+# (market-hours-liveness-alarm.tf) enables them 09:20-15:35 IST Mon-Fri and
+# resets state to OK on open so a stale off-hours ALARM never re-fires. A
+# genuine in-market degradation (score < 0.80 for 2 min) pages exactly as
+# before — in-market sensitivity is UNCHANGED.
 # ---------------------------------------------------------------------------
 resource "aws_cloudwatch_metric_alarm" "realtime_guarantee_critical" {
   alarm_name          = "tv-${var.environment}-realtime-guarantee-critical"
-  alarm_description   = "Composite real-time guarantee score < 0.80 — at least one dimension (WS, QuestDB, tick freshness, token, spill, Phase 2) is severely degraded. See SLO-02 runbook."
+  alarm_description   = "Composite real-time guarantee score < 0.80 DURING MARKET HOURS — at least one dimension (WS, QuestDB, tick freshness, token, spill, Phase 2) is severely degraded. Actions gated to 09:20-15:35 IST Mon-Fri by the market-hours gate Lambda — the score is legitimately 0 off-hours (feeds idle by design) and never pages then. See SLO-02 runbook."
   comparison_operator = "LessThanThreshold"
   evaluation_periods  = 2
   metric_name         = "tv_realtime_guarantee_score"
@@ -289,8 +307,11 @@ resource "aws_cloudwatch_metric_alarm" "realtime_guarantee_critical" {
   threshold           = 0.80
   treat_missing_data  = "notBreaching"
   dimensions          = local.app_dimensions
-  alarm_actions       = local.app_alarm_actions
-  ok_actions          = local.app_alarm_ok
+  # Actions OFF by default; the market-hours gate Lambda flips them ON
+  # 09:20-15:35 IST Mon-Fri (market-hours-liveness-alarm.tf).
+  actions_enabled = false
+  alarm_actions   = local.app_alarm_actions
+  ok_actions      = local.app_alarm_ok
 }
 
 # ---------------------------------------------------------------------------
