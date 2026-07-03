@@ -20,6 +20,7 @@ with the tab (deploys/merges happen via GitHub itself).
 - IAM scoped to: this one instance (ec2 start/stop/reboot, ssm send+read), the control-secret SSM param, and read-only `cloudwatch:DescribeAlarms` + `ce:GetCostAndUsage`. Nothing else. (The former GitHub-PAT read went with the GitHub tab; Terraform may still set `OPERATOR_GITHUB_TOKEN_PARAM` — the Lambda ignores it. IAM/terraform cleanup is a follow-up.)
 - The SQL box is **read-only** — mutating keywords are rejected before the query reaches QuestDB.
 - Destructive box actions are blocked 09:15–15:30 IST Mon–Fri unless you tick **force**.
+- **DATA-destructive actions (Wipe GROWW / Wipe ALL / Docker reset / Bare Nuke) are HARD-LOCKED 09:15–15:30 IST Mon–Fri — refused even with force.** A mid-market wipe destroys data that can never be re-fetched (2026-07-02 incident: a forced 15:05 IST wipe deleted ~4.5M rows + 77s of live feed). The danger zone shows a 🔒 lock label while the market is open; run these after 15:30.
 
 ## Zero-touch enable (prod, via CI)
 

@@ -32,6 +32,12 @@ SECURITY MODEL (deliberately strict — this can stop a live trading box):
   GitHub tab; Terraform may still set OPERATOR_GITHUB_TOKEN_PARAM — ignored.)
 * Destructive box actions (stop/reboot/restart-app/stop-app) are blocked during
   market hours (09:15-15:30 IST Mon-Fri) unless {"force": true}.
+* DATA-DESTRUCTIVE actions (wipe-questdb/wipe-groww/docker-reset/
+  docker-nuke-bare) are HARD-LOCKED during market hours — refused with 409
+  even with {"force": true}. A mid-market wipe destroys data that can never
+  be re-fetched (operator incident 2026-07-02 15:05 IST: forced wipe-ALL +
+  docker-reset deleted ~4.5M rows + 77s of live feed). Lifecycle actions
+  keep the force override so emergencies stay possible.
 * The SQL box is READ-ONLY: only SELECT/SHOW/EXPLAIN/WITH are accepted; any
   mutating keyword is rejected before it ever reaches QuestDB.
 """
@@ -88,6 +94,23 @@ def _control_secret() -> str:
 
 # Destructive box actions blocked during market hours unless force=true.
 _DESTRUCTIVE = {"stop", "reboot", "restart-app", "stop-app", "wipe-questdb", "wipe-groww", "docker-reset", "docker-nuke-bare"}
+
+# HARD LOCK — the DATA-DESTRUCTIVE subset of _DESTRUCTIVE: actions that DELETE
+# market data which can NEVER be re-fetched from upstream (Dhan/Groww deliver
+# live ticks once; a wiped window is gone forever). During market hours
+# (09:15-15:30 IST Mon-Fri) these are REFUSED with 409 EVEN WHEN force=true —
+# audit fix #2 (operator incident 2026-07-02 15:05 IST: a mid-market forced
+# wipe-ALL + docker-reset deleted the QuestDB volume — ~4.5M rows wiped, 77s
+# of feed darkness, upstream ticks unrecoverable). Lifecycle actions
+# (stop / reboot / restart-app / stop-app) deliberately KEEP the force
+# override above so emergencies stay possible.
+_DATA_DESTRUCTIVE = {"wipe-questdb", "wipe-groww", "docker-reset", "docker-nuke-bare"}
+
+_DATA_DESTRUCTIVE_LOCK_MSG = (
+    "Data-destructive actions are locked during market hours "
+    "(09:15-15:30 IST) — a mid-market wipe destroys data that can never "
+    "be re-fetched. Run after 15:30."
+)
 
 _MKT_OPEN_SECS = 9 * 3600 + 15 * 60
 _MKT_CLOSE_SECS = 15 * 3600 + 30 * 60
@@ -1146,6 +1169,15 @@ def lambda_handler(event, _context):
     action = str(payload.get("action", "")).strip()
     force = bool(payload.get("force", False))
 
+    # HARD gate first: data-destructive actions have NO force escape during
+    # market hours (audit fix #2 — see _DATA_DESTRUCTIVE above). Must run
+    # BEFORE the soft gate below because _DATA_DESTRUCTIVE ⊂ _DESTRUCTIVE.
+    if action in _DATA_DESTRUCTIVE and _is_market_hours(datetime.datetime.utcnow()):
+        return _resp(
+            409,
+            {"error": _DATA_DESTRUCTIVE_LOCK_MSG, "action": action, "market_hours_locked": True},
+        )
+
     if action in _DESTRUCTIVE and _is_market_hours(datetime.datetime.utcnow()) and not force:
         return _resp(
             409,
@@ -1709,6 +1741,10 @@ def _console_html() -> str:
   .banner{ border:1px solid #3a3110; background:#141207; color:var(--amb); border-radius:12px; padding:12px 14px;
            font-size:13px; margin-bottom:10px; }
   details.fold>summary{ cursor:pointer; list-style:none; } details.fold>summary::-webkit-details-marker{ display:none; }
+  /* Visible disclosure affordance — the operator twice read the folded danger
+     zone as "the wipes were DELETED" because the fold had no visual cue. */
+  details.fold>summary::after{ content:' ▸'; color:var(--mut); font-size:12px; }
+  details.fold[open]>summary::after{ content:' ▾'; }
   .strip{ display:flex; gap:14px; flex-wrap:wrap; align-items:center; font-size:13px; font-weight:700; }
   .danger-opt{ display:flex; gap:10px; align-items:flex-start; margin:12px 0; cursor:pointer; }
   .danger-opt input{ width:auto; margin-top:3px; }
@@ -1857,7 +1893,8 @@ def _console_html() -> str:
       </div>
       <div class="card">
         <details class="fold" id="danger">
-          <summary><span class="lbl" style="display:inline">⚠️ danger zone — destructive data actions (tap to open)</span></summary>
+          <summary><span class="lbl" style="display:inline">⚠️ danger zone — destructive data actions (tap to open)</span> <span class="muted" style="font-size:11px">(contains: Wipe GROWW · Wipe ALL · Docker reset · Bare nuke)</span></summary>
+          <div class="warn" id="dangerlock" hidden style="margin-top:10px">🔒 Locked until 3:30 PM IST — data-destructive actions are refused during market hours, even with force. A mid-market wipe destroys data that can never be re-fetched.</div>
           <div class="muted" style="margin-top:10px">Pick ONE severity, then Execute. Every action still asks you to type its own confirm word — nothing fires from a mis-click.</div>
           <label class="danger-opt"><input type="radio" name="danger" value="groww">
             <span><b>🧹 Wipe GROWW data only</b> — <span class="muted">surgical per-feed wipe: deletes every <b>groww</b> tick &amp; candle from every timeframe table (per-table rewrite — the DB can't delete rows in place) AND the groww capture file + offsets so nothing resurrects. <b>Dhan data untouched. Audit tables kept (SEBI).</b> Box must be RUNNING. Asks you to type GROWW.</span></span></label>
@@ -1944,6 +1981,9 @@ async function loadOverview(){ $('refbtn').innerHTML='<span class="spin">🔄</s
   $('p_inst').innerHTML='<span class="'+(running?'ok':'bad')+'">'+(j.instance_state||'?')+'</span>';
   $('p_app').innerHTML='<span class="'+(appOk?'ok':'bad')+'">'+(appOk?'up':(j.app||'down'))+'</span>';
   $('p_mkt').innerHTML='<span class="'+(j.market_hours?'warn':'')+'">'+(j.market_hours?'OPEN':'closed')+'</span>';
+  // Danger-zone hard-lock label: data-destructive actions are server-refused
+  // (409, no force escape) while the market is open — surface that BEFORE a click.
+  const dl=$('dangerlock'); if(dl) dl.hidden=!j.market_hours;
   const tpsN=parseInt(j.max_ticks_per_second,10)||0; $('p_tps').innerHTML='<span class="cy">'+tpsN+'</span>';
   hist.push(tpsN); if(hist.length>60) hist.shift(); drawSpark();
   // Per-feed split of today's ticks, e.g. "dhan: 152,340 | groww: 8,102" —
