@@ -1409,13 +1409,13 @@ def lambda_handler(event, _context):
             #   6. `docker compose up -d` on the now-empty volume + restart app —
             #      it recreates `ticks` + candle + audit tables fresh via
             #      `ensure_*_table_dedup_keys` with the correct DEDUP keys.
-            if not force:
-                return _resp(409, {"error": 'docker-reset is the FULL nuke (deletes volumes + images + ALL data incl. SEBI audit tables) — re-send with {"force": true}', "action": action})
-            # PR-5 H-1: server-side token (mirror of the wipe-groww gate).
-            if str(payload.get("confirm", "")).strip() != "NUKE":
+            if str(payload.get("confirm", "")).strip() != "NUKE-DOCKER":
                 return _resp(
                     409,
-                    {"error": 'docker-reset destroys ALL data incl. SEBI audit tables — re-send with {"confirm": "NUKE"}', "action": action},
+                    {
+                        "error": 'docker-reset is the FULL DOCKER NUKE (deletes containers + volumes + images = ALL data incl. SEBI audit tables, then fresh start) — re-send with {"confirm": "NUKE-DOCKER"}',
+                        "action": action,
+                    },
                 )
             compose_dir = "/opt/tickvault/repo/deploy/docker"
             data_dir = "/opt/tickvault/data"
@@ -2222,8 +2222,8 @@ async function wipeGroww(){
 async function dockerReset(){
   if(prompt('☢ FULL DOCKER NUKE. Stops the app, DELETES Docker containers + volumes + images (full QuestDB wipe — ALL data INCLUDING the SEBI-retention audit tables) + prune, then rebuilds QuestDB fresh + restarts the app. The box must be RUNNING. Type NUKE-DOCKER to confirm:')!=='NUKE-DOCKER'){ toast('cancelled'); return; }
   if(!confirm('Last check: every table is destroyed, including audit history. Continue?')){ toast('cancelled'); return; }
-  toast('💥 nuke dispatched → wiping in background (~2-3 min)…');
-  const j=await call('docker-reset',{force:true,confirm:'NUKE'});
+  toast('☢ full docker nuke dispatched → wiping in background (~2-3 min)…');
+  const j=await call('docker-reset',{force:$('force').checked,confirm:'NUKE-DOCKER'});
   if(!(j&&j.ok)){ toast((j&&j.error)||'docker-reset failed — is the box running?'); return; }
   if(!j.command_id){ toast('⚠️ nuke dispatched but no command id — re-check the ticks count in ~3 min'); setTimeout(loadOverview,8000); return; }
   pollNuke(j.command_id,0); }

@@ -525,7 +525,7 @@ class WipeGate(unittest.TestCase):
 
         src = inspect.getsource(handler)
         self.assertIn("call('wipe-questdb',{force:true,confirm:'WIPE'})", src)
-        self.assertIn("call('docker-reset',{force:true,confirm:'NUKE'})", src)
+        self.assertIn("call('docker-reset',{force:$('force').checked,confirm:'NUKE-DOCKER'})", src)
         self.assertIn("call('docker-nuke-bare',{force:true,confirm:'ERASE'})", src)
 
     def test_wipe_questdb_removes_replay_sources_before_truncate_and_disables_unit(self) -> None:
@@ -582,11 +582,11 @@ class WipeGate(unittest.TestCase):
             self.assertIn("/groww", block, f"{name} must remove the Groww capture dir")
             self.assertIn("live-ticks.ndjson", block, f"{name} must sweep future feeds' capture files")
 
-    def _docker_reset(self, force: bool, confirm: str = "NUKE"):
+    def _docker_reset(self, force: bool, confirm: str = "NUKE-DOCKER", token: str = "s3cret-token"):
         return handler.lambda_handler(
             {
                 "requestContext": {"http": {"method": "POST"}},
-                "headers": {"authorization": "Bearer s3cret-token"},
+                "headers": {"authorization": f"Bearer {token}"},
                 "body": json.dumps({"action": "docker-reset", "force": force, "confirm": confirm}),
             },
             None,
