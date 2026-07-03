@@ -4683,10 +4683,18 @@ fn spawn_engine_b_aggregator(
                     tickvault_app::seal_routing::SealOutcome::DroppedD1 => {}
                 }
             });
+            // F2 self-heal (2026-07-03): restart the day's event-time
+            // watermark from 0 so (a) a POISONED watermark (garbage
+            // future-dated tick advanced the never-regressing fetch_max past
+            // the future-skew guard, disabling catch-up) self-heals within
+            // one day, and (b) each day's watermark rebuilds from the day's
+            // first real tick. The catch-up driver's watermark==0 gate keeps
+            // the scan idle until then.
+            agg_for_boundary.reset_watermark();
             tracing::info!(
                 sealed,
                 dropped,
-                "IST-midnight force-seal complete — open buckets flushed"
+                "IST-midnight force-seal complete — open buckets flushed (watermark reset)"
             );
         }
     });
@@ -4701,36 +4709,88 @@ fn spawn_engine_b_aggregator(
     // out-of-session gate blocks ≥15:30 ticks from folding. This task closes
     // both gaps SAFELY: every CATCHUP_SEAL_POLL_INTERVAL_SECS it reads the
     // Dhan aggregator instance's event-time watermark (max exchange_timestamp
-    // ever consumed — post-close ticks still advance it) and, ONLY when the
-    // watermark ADVANCED since the last scan, seals buckets whose end ≤
-    // watermark − CATCHUP_SEAL_LATENESS_MARGIN_SECS. Buckets past that cutoff
-    // are still potentially being filled by a backlogged stream and stay
-    // open — a naive wall-clock force-seal here would convert the backlog
-    // into DiscardLate drops and corrupt candles on re-open. A STALLED
-    // watermark (dead feed / broadcast starvation) gets NO catch-up seals —
-    // FEED-STALL-01 owns the dead-feed page; no "assume dead then force-seal
-    // anyway" escape hatch exists by design. Same bare-spawn supervision
-    // level as the sibling Task 3 midnight force-seal.
+    // ever consumed — post-close ticks still advance it) and gates via the
+    // shared pure `compute_catchup_cutoff`: scan ONLY when the watermark
+    // ADVANCED since the last scan AND is not POISONED (more than the
+    // future-skew guard ahead of the IST wall clock — a garbage future-dated
+    // tick advanced the never-regressing fetch_max); the cutoff is
+    // min(watermark − CATCHUP_SEAL_LATENESS_MARGIN_SECS_DHAN, now_ist) so a
+    // bucket can never seal before the wall clock passes its end. Buckets
+    // past that cutoff are still potentially being filled by a backlogged
+    // stream and stay open — a naive wall-clock force-seal here would
+    // convert the backlog into DiscardLate drops and corrupt candles on
+    // re-open. A STALLED watermark (dead feed / broadcast starvation) gets
+    // NO catch-up seals — FEED-STALL-01 owns the dead-feed page; no "assume
+    // dead then force-seal anyway" escape hatch exists by design. A POISONED
+    // watermark disables catch-up (coalesced BOUNDARY-01 error,
+    // reason=watermark_future_skew) until the IST-midnight watermark reset
+    // self-heals it. Same bare-spawn supervision level as the sibling Task 3
+    // midnight force-seal.
     let agg_for_catchup = std::sync::Arc::clone(&aggregator);
     let prev_day_cache_for_catchup = std::sync::Arc::clone(&prev_day_cache);
     let heartbeat_for_catchup = heartbeat.clone();
     tokio::spawn(async move {
         use tickvault_trading::candles::{
-            CATCHUP_SEAL_LATENESS_MARGIN_SECS, CATCHUP_SEAL_POLL_INTERVAL_SECS,
+            CATCHUP_SEAL_LATENESS_MARGIN_SECS_DHAN, CATCHUP_SEAL_POLL_INTERVAL_SECS,
+            CATCHUP_WATERMARK_FUTURE_SKEW_GUARD_SECS, compute_catchup_cutoff,
         };
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(
             CATCHUP_SEAL_POLL_INTERVAL_SECS,
         ));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut last_scanned_watermark: u32 = 0;
+        // Edge latch for the poisoned-watermark error — ONE coalesced line
+        // per poisoning episode (audit Rule 4), not one per 5 s wave.
+        let mut poison_logged = false;
         loop {
             interval.tick().await;
-            // Self-gating: overnight / holiday / dead feed = static watermark
-            // = one atomic load per wave, no scan, no seals.
             let watermark = agg_for_catchup.watermark_secs();
-            if watermark == 0 || watermark == last_scanned_watermark {
+            // IST wall-clock now (epoch seconds) — the SAME canonical
+            // Utc::now + IST-offset path the market-hours helpers use
+            // (audit-findings Rule 3). A pre-1970 / post-2106 degenerate
+            // clock maps to 0, which makes every watermark look poisoned →
+            // catch-up stays disabled (fail-closed, BOOT-03-class posture).
+            let now_ist_secs = u32::try_from(chrono::Utc::now().timestamp().saturating_add(
+                i64::from(tickvault_common::constants::IST_UTC_OFFSET_SECONDS),
+            ))
+            .unwrap_or(0);
+            let Some(cutoff) = compute_catchup_cutoff(
+                watermark,
+                last_scanned_watermark,
+                now_ist_secs,
+                CATCHUP_SEAL_LATENESS_MARGIN_SECS_DHAN,
+                CATCHUP_WATERMARK_FUTURE_SKEW_GUARD_SECS,
+            ) else {
+                // None = no tick yet / watermark unchanged (self-gate) /
+                // POISONED. Only the poisoned arm is observable: watermark
+                // non-zero and advanced, yet the gate refused — meaning it
+                // sits past now + guard. last_scanned is NOT updated, so
+                // scanning resumes the moment the watermark self-heals
+                // (IST-midnight reset_watermark).
+                if watermark != 0 && watermark != last_scanned_watermark {
+                    metrics::counter!(
+                        "tv_boundary_catchup_skipped_total",
+                        "feed" => "dhan", "reason" => "future_skew"
+                    )
+                    .increment(1);
+                    if !poison_logged {
+                        poison_logged = true;
+                        tracing::error!(
+                            code = tickvault_common::error_code::ErrorCode::Boundary01CatchupSeal
+                                .code_str(),
+                            reason = "watermark_future_skew",
+                            feed = "dhan",
+                            watermark_secs = watermark,
+                            now_ist_secs,
+                            "BOUNDARY-01: poisoned event-time watermark (further ahead of the \
+                             IST wall clock than host skew allows) — catch-up sealing disabled \
+                             until the IST-midnight watermark reset self-heals it"
+                        );
+                    }
+                }
                 continue;
-            }
+            };
+            poison_logged = false;
             // Trading-day gate — mirrors the Task 3 midnight force-seal.
             if !calendar_for_catchup.is_trading_day_today() {
                 continue;
@@ -4741,40 +4801,49 @@ fn spawn_engine_b_aggregator(
                 continue;
             };
             last_scanned_watermark = watermark;
-            let cutoff = watermark.saturating_sub(CATCHUP_SEAL_LATENESS_MARGIN_SECS);
-            let sealed = agg_for_catchup.catch_up_seal_all(
-                cutoff,
-                |security_id, segment_code, tf, state| {
-                    metrics::counter!("tv_boundary_catchup_total", "feed" => "dhan").increment(1);
-                    // EXACT same Dhan routing policy as the per-tick seal site
-                    // (spawn_engine_b_aggregator Task 1): drop D1
-                    // (`live-feed-purity.md` rule 10), pct-stamp from the
-                    // prev-day cache, drive the heartbeat + tv_aggregator_*
-                    // counters. A full-mpsc drop is already counted by
-                    // route_seal (`tv_seal_mpsc_dropped_total`).
-                    tickvault_app::seal_routing::route_seal(
-                        tickvault_app::seal_routing::SealRouteParams {
-                            feed: tickvault_common::feed::Feed::Dhan,
-                            drop_d1: true,
-                            prev_day_cache: Some(prev_day_cache_for_catchup.as_ref()),
-                            heartbeat: Some(&heartbeat_for_catchup),
-                            feed_health_on_m1: None,
-                        },
-                        security_id,
-                        segment_code,
-                        tf,
-                        state,
-                        sender,
-                    );
-                },
-            );
-            if sealed > 0 {
+            // F5 (2026-07-03): count only ROUTED catch-up seals — Dhan drops
+            // D1 at the write boundary (`live-feed-purity.md` rule 10), so a
+            // D1 catch-up seal must not inflate the counter or the coalesced
+            // `seals` count. DroppedFull IS counted here (the row reaches the
+            // ring→spill→DLQ absorption chain and is separately counted by
+            // `tv_seal_mpsc_dropped_total`).
+            let mut routed: u64 = 0;
+            agg_for_catchup.catch_up_seal_all(cutoff, |security_id, segment_code, tf, state| {
+                // EXACT same Dhan routing policy as the per-tick seal site
+                // (spawn_engine_b_aggregator Task 1): drop D1, pct-stamp from
+                // the prev-day cache, drive the heartbeat + tv_aggregator_*
+                // counters.
+                match tickvault_app::seal_routing::route_seal(
+                    tickvault_app::seal_routing::SealRouteParams {
+                        feed: tickvault_common::feed::Feed::Dhan,
+                        drop_d1: true,
+                        prev_day_cache: Some(prev_day_cache_for_catchup.as_ref()),
+                        heartbeat: Some(&heartbeat_for_catchup),
+                        feed_health_on_m1: None,
+                    },
+                    security_id,
+                    segment_code,
+                    tf,
+                    state,
+                    sender,
+                ) {
+                    // D1 dropped at the write boundary — not a routed seal.
+                    tickvault_app::seal_routing::SealOutcome::DroppedD1 => {}
+                    tickvault_app::seal_routing::SealOutcome::Sent
+                    | tickvault_app::seal_routing::SealOutcome::DroppedFull => {
+                        routed = routed.saturating_add(1);
+                        metrics::counter!("tv_boundary_catchup_total", "feed" => "dhan")
+                            .increment(1);
+                    }
+                }
+            });
+            if routed > 0 {
                 // ONE coalesced line per scan wave — never per-seal spam.
                 tracing::warn!(
                     code =
                         tickvault_common::error_code::ErrorCode::Boundary01CatchupSeal.code_str(),
                     feed = "dhan",
-                    seals = sealed,
+                    seals = routed,
                     cutoff_secs = cutoff,
                     watermark_secs = watermark,
                     "BOUNDARY-01: watermark catch-up sealed lagging candle bucket(s) — \

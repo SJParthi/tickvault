@@ -677,7 +677,8 @@ impl AggregatorCell {
     /// Seals the open bucket of `tf` ONLY when its (exclusive) bucket end is
     /// at or before `cutoff_secs` — the caller's per-feed event-time
     /// watermark minus the allowed-lateness margin
-    /// ([`crate::candles::CATCHUP_SEAL_LATENESS_MARGIN_SECS`]). A bucket
+    /// ([`crate::candles::CATCHUP_SEAL_LATENESS_MARGIN_SECS_DHAN`] /
+    /// [`crate::candles::CATCHUP_SEAL_LATENESS_MARGIN_SECS_GROWW`]). A bucket
     /// ending past the cutoff is still potentially being filled by a
     /// backlogged tick stream, so sealing it would either mass-discard the
     /// backlog (Groww, `LatePolicy::Discard` — research Failure A) or corrupt
@@ -704,9 +705,19 @@ impl AggregatorCell {
             return None;
         }
         // NEVER seal a bucket whose end is past the watermark cutoff — the
-        // no-mass-discard contract. `bucket_end` reuses the TfIndex bucket
-        // math (no duplicated arithmetic).
-        if tf.bucket_end(guard.bucket_start_ist_secs) > cutoff_secs {
+        // no-mass-discard contract. Saturating add (F3, 2026-07-03 security
+        // review): a bucket_start near u32::MAX (reachable only via a
+        // poisoned watermark / garbage timestamp) must not overflow-panic
+        // (release profile pins `overflow-checks = true`); saturation pins
+        // the end at u32::MAX, which exceeds every real cutoff → the bucket
+        // simply never seals (fail-safe). Same bucket math as
+        // `TfIndex::bucket_end` minus the overflow — the plain-`+` variant
+        // keeps its semantics for all other callers.
+        if guard
+            .bucket_start_ist_secs
+            .saturating_add(tf.seconds_per_bucket())
+            > cutoff_secs
+        {
             return None;
         }
         let sealed_state = std::mem::replace(&mut *guard, LiveCandleState::empty());
@@ -1423,6 +1434,41 @@ mod tests {
         assert_eq!(sealed.bucket_start_ist_secs, b1);
         assert_eq!(sealed.close, 100.0);
         assert!(cell.snapshot(TfIndex::M1).is_uninitialised());
+    }
+
+    #[test]
+    fn test_catch_up_seal_bucket_end_saturates_at_u32_max() {
+        // F3 (2026-07-03 security review): a bucket_start near u32::MAX
+        // (reachable only via a poisoned watermark / garbage timestamp) must
+        // not overflow-panic in the bucket-end comparison — the release
+        // profile pins `overflow-checks = true`, so a plain `+` would abort
+        // the process. The saturating computation pins end = u32::MAX, which
+        // exceeds every real cutoff → the absurd bucket never seals
+        // (fail-safe). The slot is planted directly because `bucket_start`
+        // itself cannot construct a start this large without overflowing.
+        let cell = AggregatorCell::empty();
+        let start = u32::MAX - 30; // start + 60 (M1) would overflow u32
+        {
+            let mut guard = cell.slots[TfIndex::M1.as_ordinal()].lock();
+            *guard = LiveCandleState::from_first_tick(
+                &mk_tick(start, 100.0, 10, 0),
+                start,
+                0,
+                false,
+                10,
+            );
+        }
+        // No panic; saturated end (u32::MAX) > cutoff → never seals.
+        assert!(cell.catch_up_seal(TfIndex::M1, u32::MAX - 1).is_none());
+        assert!(
+            !cell.snapshot(TfIndex::M1).is_uninitialised(),
+            "refused catch-up must leave the bucket open"
+        );
+        // Degenerate ceiling: only cutoff == u32::MAX admits the saturated
+        // end (end <= cutoff) — pinning that this is saturation semantics,
+        // not a hard-disable. Unreachable in production: the driver clamps
+        // the cutoff to the IST wall clock.
+        assert!(cell.catch_up_seal(TfIndex::M1, u32::MAX).is_some());
     }
 
     #[test]
