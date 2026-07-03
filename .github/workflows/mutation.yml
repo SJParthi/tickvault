@@ -109,11 +109,20 @@ jobs:
 
       - name: Run mutation testing
         if: steps.changed.outputs.skip == 'false'
+        # pipefail is MANDATORY here: without it, `| tee` masks cargo-mutants
+        # failures (the step exits with tee's status 0) — run 28654790130 went
+        # green with ZERO mutants tested after `--test-threads` became an
+        # unrecognized top-level flag. cargo-mutants passes args after the
+        # first `--` to `cargo test` and after the second `--` to the test
+        # binary; `--test-threads` is a libtest (test binary) flag, so the
+        # correct shape preserving the original intent (bound test
+        # parallelism to 2 threads) is `-- -- --test-threads=2`.
         run: |
+          set -euo pipefail
           cargo mutants ${{ steps.changed.outputs.packages }} \
-            --test-threads=2 \
             --timeout=120 \
             --no-shuffle \
+            -- -- --test-threads=2 \
             2>&1 | tee mutation-results.txt
 
       - name: Check for survived mutants
@@ -138,10 +147,15 @@ jobs:
         if: always() && steps.changed.outputs.skip == 'false'
         run: |
           if [ -f mutation-results.txt ]; then
-            TOTAL=$(grep -cE '(KILLED|SURVIVED|TIMEOUT)' mutation-results.txt 2>/dev/null || echo 0)
-            KILLED=$(grep -c 'KILLED' mutation-results.txt 2>/dev/null || echo 0)
-            SURVIVED=$(grep -c 'SURVIVED' mutation-results.txt 2>/dev/null || echo 0)
-            TIMEOUT=$(grep -c 'TIMEOUT' mutation-results.txt 2>/dev/null || echo 0)
+            # NOTE: `grep -c` prints "0" itself AND exits 1 on zero matches, so
+            # the old `|| echo 0` produced a two-line "0\n0" value and the
+            # `[: 0\n0: integer expression expected` noise. Use `|| true` and
+            # normalize the empty-file/missing-file case explicitly.
+            TOTAL=$(grep -cE '(KILLED|SURVIVED|TIMEOUT)' mutation-results.txt 2>/dev/null || true)
+            KILLED=$(grep -c 'KILLED' mutation-results.txt 2>/dev/null || true)
+            SURVIVED=$(grep -c 'SURVIVED' mutation-results.txt 2>/dev/null || true)
+            TIMEOUT=$(grep -c 'TIMEOUT' mutation-results.txt 2>/dev/null || true)
+            TOTAL=${TOTAL:-0}; KILLED=${KILLED:-0}; SURVIVED=${SURVIVED:-0}; TIMEOUT=${TIMEOUT:-0}
             if [ "$TOTAL" -gt 0 ]; then
               SCORE=$(python3 -c "print(f'{$KILLED / $TOTAL * 100:.1f}')")
             else
