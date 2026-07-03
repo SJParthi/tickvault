@@ -227,6 +227,14 @@ struct GrowwTickLine {
     exchange_ts_millis: i64,
     ltp: f64,
     cum_volume: i64,
+    /// Optional per-message capture stamp (2026-07-03 per-callback instant
+    /// capture): UTC epoch NANOS from `time.time_ns()` stamped INSIDE the
+    /// sidecar's NATS-callback hook — the true capture-at-receipt instant.
+    /// Absent (`None`) on old-format lines and on the walker's reconcile-sweep
+    /// rows (snapshot drains have no per-message stamp) — those fall back to
+    /// the per-wake receipt stamp, exactly the pre-PR behaviour.
+    #[serde(default)]
+    capture_ns: Option<i64>,
 }
 
 /// A normalised Groww live tick — the aggregator input. Self-contained (no
@@ -248,6 +256,9 @@ struct GrowwTick {
 struct ParsedGrowwTick {
     tick: GrowwTick,
     exchange_ts_millis: i64,
+    /// Sidecar capture-at-receipt stamp (UTC epoch nanos), when the line
+    /// carried one — see [`GrowwTickLine::capture_ns`].
+    capture_ns: Option<i64>,
 }
 
 /// Maps the canonical segment string to [`ExchangeSegment`]. Pure + testable.
@@ -279,6 +290,7 @@ fn parse_groww_tick_line(line: &str) -> Result<ParsedGrowwTick> {
             cum_volume: l.cum_volume,
         },
         exchange_ts_millis: l.exchange_ts_millis,
+        capture_ns: l.capture_ns,
     })
 }
 
@@ -514,6 +526,34 @@ fn live_tick_row(
 /// per wake (O(1) preserved — no per-line syscall added).
 fn row_received_at(receipt_ist_nanos: i64) -> Option<i64> {
     (receipt_ist_nanos > GROWW_MIN_PLAUSIBLE_RECEIPT_IST_NANOS).then_some(receipt_ist_nanos)
+}
+
+/// Per-ROW received_at (2026-07-03 per-callback instant capture): prefer the
+/// sidecar's per-message `capture_ns` stamp (UTC epoch nanos, stamped inside
+/// the NATS-callback hook — the true capture-at-receipt instant) converted to
+/// the IST-nanos convention `received_at` already uses; fall back to the
+/// per-wake receipt stamp for old-format / reconcile-sweep lines. The capture
+/// stamp is accepted ONLY when plausible: above the same ~2020 floor as
+/// [`row_received_at`] AND not ahead of the wake receipt clock beyond
+/// [`GROWW_FUTURE_TS_TOLERANCE_NANOS`] (the sidecar and the bridge share the
+/// host clock — a capture stamp "after" the wake that read it means a broken
+/// clock, so fail toward the pre-PR wake stamp, never a garbage column).
+/// Pure arithmetic — O(1), no clock read, no allocation per line.
+fn row_received_at_with_capture(
+    capture_ns_utc: Option<i64>,
+    wake_receipt_ist_nanos: i64,
+) -> Option<i64> {
+    if let Some(ns) = capture_ns_utc {
+        let capture_ist_nanos =
+            ns.saturating_add(tickvault_common::constants::IST_UTC_OFFSET_NANOS);
+        if capture_ist_nanos > GROWW_MIN_PLAUSIBLE_RECEIPT_IST_NANOS
+            && capture_ist_nanos
+                <= wake_receipt_ist_nanos.saturating_add(GROWW_FUTURE_TS_TOLERANCE_NANOS)
+        {
+            return Some(capture_ist_nanos);
+        }
+    }
+    row_received_at(wake_receipt_ist_nanos)
 }
 
 /// Monotonic, replay-stable `capture_seq` source (TICK-SEQ-01): `max(prev+1,
@@ -937,10 +977,11 @@ impl GrowwBridgeState {
         // PR-4: one clock read per WAKE (not per line — O(1) preserved) for
         // the relative future-timestamp clamp in validate_groww_tick.
         let wake_receipt_ist_nanos = receipt_ist_nanos();
-        // Fix #3 (2026-07-03 lag forensics): the receipt stamp persisted on
-        // every row this wake — plausibility-gated so a broken clock writes
-        // NULL. Makes per-feed lag (received_at − ts) measurable in SQL.
-        let wake_received_at = row_received_at(wake_receipt_ist_nanos);
+        // Fix #3 (2026-07-03 lag forensics) + per-callback capture: each row's
+        // received_at prefers the sidecar's per-message capture_ns stamp (true
+        // capture-at-receipt) and falls back to this per-wake receipt stamp —
+        // plausibility-gated so a broken clock writes NULL. Makes per-feed lag
+        // (received_at − ts) measurable in SQL, now at per-message fidelity.
         for line_bytes in prefix.split(|&b| b == b'\n') {
             if line_bytes.is_empty() {
                 continue;
@@ -979,9 +1020,11 @@ impl GrowwBridgeState {
             parsed_any = true;
             wake_max_exchange_ts_nanos = wake_max_exchange_ts_nanos.max(parsed.tick.ts_ist_nanos);
             let seq = next_capture_seq(&self.capture_seq, parsed.tick.ts_ist_nanos);
+            let row_received =
+                row_received_at_with_capture(parsed.capture_ns, wake_receipt_ist_nanos);
             if let Err(err) =
                 self.live_writer
-                    .append_row(&live_tick_row(&parsed, seq, wake_received_at))
+                    .append_row(&live_tick_row(&parsed, seq, row_received))
             {
                 error!(
                     ?err,
@@ -1788,6 +1831,20 @@ mod tests {
         assert_eq!(p.tick.ltp, 2847.55);
         assert_eq!(p.tick.cum_volume, 123_456);
         assert_eq!(p.exchange_ts_millis, 1_780_000_020_123);
+        // Old-format line (no capture_ns): the optional field defaults None —
+        // backward compatible with every pre-2026-07-03 sidecar row.
+        assert_eq!(p.capture_ns, None);
+    }
+
+    #[test]
+    fn test_parse_groww_tick_line_with_capture_ns() {
+        // New-format line from the per-callback capture path: capture_ns is
+        // UTC epoch nanos stamped inside the sidecar's NATS-callback hook.
+        let line = r#"{"security_id":1333,"segment":"NSE_EQ","ts_ist_nanos":1780000020123000000,"exchange_ts_millis":1780000020123,"ltp":2847.55,"cum_volume":0,"capture_ns":1780000020125000000}"#;
+        let p = parse_groww_tick_line(line).expect("parse");
+        assert_eq!(p.capture_ns, Some(1_780_000_020_125_000_000));
+        assert_eq!(p.tick.security_id, 1333);
+        assert_eq!(p.tick.ltp, 2847.55);
     }
 
     #[test]
@@ -1974,6 +2031,47 @@ mod tests {
         );
         let plausible = GROWW_MIN_PLAUSIBLE_RECEIPT_IST_NANOS + 1;
         assert_eq!(row_received_at(plausible), Some(plausible));
+    }
+
+    #[test]
+    fn test_row_received_at_prefers_plausible_capture_ns() {
+        // 2026-07-03 per-callback capture: a plausible per-message capture_ns
+        // (UTC nanos) wins over the per-wake stamp, converted UTC→IST nanos —
+        // received_at now means TRUE capture-at-receipt time per message.
+        let wake = GROWW_MIN_PLAUSIBLE_RECEIPT_IST_NANOS + 10_000_000_000;
+        let capture_utc = wake - tickvault_common::constants::IST_UTC_OFFSET_NANOS - 5;
+        assert_eq!(
+            row_received_at_with_capture(Some(capture_utc), wake),
+            Some(capture_utc.saturating_add(tickvault_common::constants::IST_UTC_OFFSET_NANOS)),
+            "plausible capture stamp (IST-converted) must be used per-row"
+        );
+    }
+
+    #[test]
+    fn test_row_received_at_falls_back_without_capture_ns() {
+        // Old-format / reconcile-sweep rows: exact pre-PR per-wake behaviour.
+        let wake = GROWW_MIN_PLAUSIBLE_RECEIPT_IST_NANOS + 1;
+        assert_eq!(row_received_at_with_capture(None, wake), Some(wake));
+        assert_eq!(row_received_at_with_capture(None, 0), None);
+    }
+
+    #[test]
+    fn test_row_received_at_falls_back_on_implausible_capture_ns() {
+        let wake = GROWW_MIN_PLAUSIBLE_RECEIPT_IST_NANOS + 10_000_000_000;
+        // Pre-2020 garbage stamp (0 / negative) → wake fallback.
+        assert_eq!(row_received_at_with_capture(Some(0), wake), Some(wake));
+        assert_eq!(row_received_at_with_capture(Some(-1), wake), Some(wake));
+        // Capture ahead of the wake clock beyond tolerance (impossible on a
+        // sane shared host clock — the wake read happens AFTER the sidecar's
+        // write) → broken clock → wake fallback, never a garbage column.
+        let far_future = wake + GROWW_FUTURE_TS_TOLERANCE_NANOS + 1;
+        assert_eq!(
+            row_received_at_with_capture(Some(far_future), wake),
+            Some(wake)
+        );
+        // Both implausible (broken clock everywhere) → NULL, matching the
+        // pre-PR broken-clock behaviour.
+        assert_eq!(row_received_at_with_capture(Some(0), 0), None);
     }
 
     #[test]
