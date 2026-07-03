@@ -170,6 +170,12 @@ _SQL_BANNED = (
 # box and the DB tab share the same `sql` action).
 _SQL_MAX_ROWS = 1000
 
+# B4 QuestDB console: TTL of the one-click link token minted by the
+# `qdb_console_url` action. The console front Lambda verifies it (same
+# control secret, HMAC over "qdblink|<exp>") and swaps it for a 12h session
+# cookie — so the link in a browser history / Telegram scroll dies in 90s.
+_QDB_LINK_TTL_SECS = 90
+
 
 def _is_market_hours(now_utc: datetime.datetime) -> bool:
     """True during NSE market hours (Mon-Fri 09:15-15:30 IST)."""
@@ -257,6 +263,17 @@ def _cap_sql_rows(query: str, cap: int = _SQL_MAX_ROWS) -> str:
     if first in ("select", "with"):
         return f"{q} LIMIT {cap}"
     return q
+
+
+def _mint_qdb_link_token(secret: str, now_epoch: int, ttl: int = _QDB_LINK_TTL_SECS) -> str:
+    """One-click console link token: <exp>.<hexhmac(secret, "qdblink|<exp>")>.
+    Verified constant-time by the questdb-console-front Lambda against the
+    SAME SSM control secret — no second key to manage. Pure function."""
+    import hashlib  # noqa: PLC0415
+
+    exp = now_epoch + ttl
+    sig = hmac.new(secret.encode(), f"qdblink|{exp}".encode(), hashlib.sha256).hexdigest()
+    return f"{exp}.{sig}"
 
 
 def _ssm_shell(commands: list[str]) -> str:
@@ -1873,6 +1890,17 @@ def lambda_handler(event, _context):
             enc = urllib.parse.quote(q)
             out = _ssm_shell_sync(["set +e", f"curl -fsS 'http://127.0.0.1:9000/exp?query={enc}&limit={_SQL_MAX_ROWS}' 2>/dev/null | head -{_SQL_MAX_ROWS + 1} || echo 'query failed'"])
             return _resp(200, {"ok": True, "action": "sql", "csv": out})
+        if action == "qdb_console_url":
+            # READ-ONLY: mint a one-click 90s HMAC link to the B4 QuestDB
+            # console (questdb-console-front Lambda). Same control secret
+            # signs the token; the console verifies it constant-time and
+            # swaps it for a 12h session cookie. Env QDB_CONSOLE_URL is
+            # injected by Terraform only when var.enable_questdb_console.
+            base = os.environ.get("QDB_CONSOLE_URL", "").rstrip("/")
+            if not base:
+                return _resp(400, {"error": "console not enabled", "action": action})
+            tok = _mint_qdb_link_token(_control_secret(), int(time.time()))
+            return _resp(200, {"ok": True, "action": action, "url": f"{base}/open?tok={tok}"})
         if action == "logs":
             out = _ssm_shell_sync(
                 [
@@ -2167,6 +2195,7 @@ def _console_html() -> str:
       </div>
       <div class="card">
         <div class="lbl">database console &nbsp;<span class="badge unknown">READ-ONLY — writes are blocked server-side</span></div>
+        <div class="row" style="margin-bottom:10px"><button class="b-blu" onclick="openQdbConsole()">🗄 Open QuestDB Console</button></div>
         <div style="display:flex;gap:16px;flex-wrap:wrap">
           <div style="flex:1 1 200px;min-width:180px">
             <div class="lbl">tables</div>
@@ -2422,6 +2451,10 @@ async function runDbSql(){ const q=$('dbsql').value.trim(); if(!q){ toast('Type 
   const j=await call('sql',{query:q}); if(!j){ $('dbout').innerHTML=''; return; }
   dbCsv=j.csv||''; const n=renderGrid($('dbout'),parseCsv(dbCsv));
   $('dbcount').textContent=n+' row'+(n===1?'':'s')+(n>=1000?' — server cap 1000 reached':''); }
+async function openQdbConsole(){ const w=window.open('','_blank'); // open SYNC in the click (popup-safe) BEFORE the await
+  const j=await call('qdb_console_url');
+  if(j&&j.url){ if(w) w.location=j.url; else window.open(j.url,'_blank'); }
+  else { if(w) w.close(); } } // call() already toasts the {error}/non-ok case
 function dbDownloadCsv(){ if(!dbCsv){ toast('Run a query first'); return; }
   const a=document.createElement('a'); a.href=URL.createObjectURL(new Blob([dbCsv],{type:'text/csv'}));
   a.download='tickvault-query-'+new Date().toISOString().slice(0,19).replace(/[:T]/g,'-')+'.csv';
