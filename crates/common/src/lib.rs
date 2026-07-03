@@ -21,6 +21,7 @@
 /// This crate is imported by every other crate in the workspace.
 /// It contains no business logic — only definitions and data structures.
 pub mod always_on;
+pub mod build_info;
 pub mod candle_fold;
 pub mod config;
 pub mod constants;

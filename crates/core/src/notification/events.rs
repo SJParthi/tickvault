@@ -1120,9 +1120,14 @@ impl NotificationEvent {
                 // CloudWatch-only migration. Operator-facing observability
                 // is now the QuestDB Console (local dev) + CloudWatch
                 // Dashboards (AWS prod).
+                // B9 deploy provenance: the `Build:` short-SHA line is a
+                // conscious operator-approved override of the "no version
+                // numbers in body" Telegram commandment (B9 directive
+                // 2026-07-03) — it answers "WHICH code booted?" at a glance.
                 format!(
-                    "<b>tickvault started</b>\nMode: {mode}\n\n\
-                     Dashboards: QuestDB Console (local) / CloudWatch (prod)"
+                    "<b>tickvault started</b>\nMode: {mode}\nBuild: {build}\n\n\
+                     Dashboards: QuestDB Console (local) / CloudWatch (prod)",
+                    build = tickvault_common::build_info::build_git_sha_short(),
                 )
             }
             Self::AuthenticationSuccess => "<b>Auth OK</b> — Dhan JWT acquired".to_string(),
@@ -2242,11 +2247,32 @@ mod tests {
         let msg = event.to_message();
         assert!(msg.contains("LIVE"));
         assert!(msg.contains("started"));
+        // B9 deploy provenance: strip the `Build: <sha>` line BEFORE the
+        // port-leak assertions — a random commit SHA can legitimately
+        // contain digit runs like "9000"/"3000" as substrings, and the
+        // ratchet must stay deterministic across commits.
+        let msg_sans_build: String = msg
+            .lines()
+            .filter(|line| !line.starts_with("Build: "))
+            .collect::<Vec<_>>()
+            .join("\n");
         // SECURITY: ports and URLs must NOT appear in Telegram message
-        assert!(!msg.contains("3000"), "internal port leaked: {msg}");
-        assert!(!msg.contains("9090"), "internal port leaked: {msg}");
-        assert!(!msg.contains("16686"), "internal port leaked: {msg}");
-        assert!(!msg.contains("9000"), "internal port leaked: {msg}");
+        assert!(
+            !msg_sans_build.contains("3000"),
+            "internal port leaked: {msg}"
+        );
+        assert!(
+            !msg_sans_build.contains("9090"),
+            "internal port leaked: {msg}"
+        );
+        assert!(
+            !msg_sans_build.contains("16686"),
+            "internal port leaked: {msg}"
+        );
+        assert!(
+            !msg_sans_build.contains("9000"),
+            "internal port leaked: {msg}"
+        );
         assert!(!msg.contains("localhost"), "localhost leaked: {msg}");
         assert!(msg.contains("Dashboards"));
         assert!(msg.contains("QuestDB"));
@@ -2257,6 +2283,22 @@ mod tests {
         assert!(!msg.contains("Prometheus"), "retired in #O3: {msg}");
         assert!(!msg.contains("Alertmanager"), "retired in #O2: {msg}");
         assert!(!msg.contains("Valkey"), "retired in #O4: {msg}");
+    }
+
+    #[test]
+    fn test_startup_complete_message_contains_build_sha() {
+        // B9 deploy provenance: the boot Telegram must carry the short git
+        // SHA of the running binary so the operator sees WHICH code booted.
+        let event = NotificationEvent::StartupComplete { mode: "LIVE" };
+        let msg = event.to_message();
+        let expected = format!(
+            "Build: {}",
+            tickvault_common::build_info::build_git_sha_short()
+        );
+        assert!(
+            msg.contains(&expected),
+            "boot message must carry '{expected}': {msg}"
+        );
     }
 
     #[test]
