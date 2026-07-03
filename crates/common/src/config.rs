@@ -201,6 +201,23 @@ pub struct GrowwScaleConfig {
     /// open/close burst windows.
     #[serde(default = "default_groww_scale_advance_window_ist")]
     pub advance_window_ist: [String; 2],
+    /// §34 PR-3 cap-probe mode: when `true` the ladder runs EXACTLY
+    /// 2 connections × 600 instruments (overriding `ladder` /
+    /// `target_connections` / `instruments_per_conn`), classifies whether the
+    /// Groww limit is per-CONNECTION or per-ACCOUNT, prints the verdict, and
+    /// then holds at 2 conns for the session. Default OFF.
+    #[serde(default)]
+    pub probe_mode: bool,
+    /// §34 PR-3 weekend SMOKE mode: when `true` AND the market is CLOSED
+    /// (weekend / NSE holiday / off-hours), the ladder still exercises the
+    /// full machinery (shard cut, fleet spawn, rung climbing) with the
+    /// tick-dependent gates honestly SKIPPED (no live market ⇒ no ticks by
+    /// design, never a failure), and every outcome is labelled SMOKE so a
+    /// machinery-validated run is never mistaken for a live validation.
+    /// Has NO effect while the market is open (normal gates apply).
+    /// Default OFF — production keeps the off-hours ladder freeze.
+    #[serde(default)]
+    pub weekend_smoke: bool,
 }
 
 fn default_groww_scale_target_connections() -> usize {
@@ -244,6 +261,8 @@ impl Default for GrowwScaleConfig {
             gate_max_capture_lag_ms: default_groww_scale_gate_max_capture_lag_ms(),
             rollback_hold_base_minutes: default_groww_scale_rollback_hold_base_minutes(),
             advance_window_ist: default_groww_scale_advance_window_ist(),
+            probe_mode: false,
+            weekend_smoke: false,
         }
     }
 }
@@ -3354,9 +3373,49 @@ mod tests {
         assert_eq!(scale.rollback_hold_base_minutes, 10);
         assert_eq!(scale.advance_window_ist[0], "09:20");
         assert_eq!(scale.advance_window_ist[1], "14:30");
+        assert!(!scale.probe_mode, "probe_mode must default OFF");
+        assert!(!scale.weekend_smoke, "weekend_smoke must default OFF");
         // Tier ordering sanity: A < B < hard max.
         assert!(GROWW_SCALE_TIER_A_MAX_CONNS < GROWW_SCALE_TIER_B_MAX_CONNS);
         assert!(GROWW_SCALE_TIER_B_MAX_CONNS < GROWW_SCALE_HARD_MAX_CONNS);
+    }
+
+    /// PR-3: `probe_mode` + `weekend_smoke` round-trip via figment TOML.
+    #[test]
+    fn test_groww_scale_probe_mode_and_weekend_smoke_parse_from_toml() {
+        use figment::Figment;
+        use figment::providers::{Format, Toml};
+
+        #[derive(Deserialize)]
+        struct Wrapper {
+            #[serde(default)]
+            feeds: FeedsConfig,
+        }
+        let toml = concat!(
+            "[feeds]
+",
+            "dhan_enabled = false
+",
+            "groww_enabled = true
+",
+            "[feeds.groww.scale]
+",
+            "enabled = true
+",
+            "probe_mode = true
+",
+            "weekend_smoke = true
+",
+        );
+        let wrapper: Wrapper = Figment::new()
+            .merge(Toml::string(toml))
+            .extract()
+            .expect("probe/smoke TOML must parse");
+        assert!(wrapper.feeds.groww.scale.probe_mode);
+        assert!(wrapper.feeds.groww.scale.weekend_smoke);
+        // A probe/smoke config is still a VALID envelope (booleans never
+        // break the ladder-bound validation).
+        assert!(wrapper.feeds.groww.scale.validate().is_ok());
     }
 
     /// `[feeds.groww.scale]` parses from TOML (partial keys allowed —
