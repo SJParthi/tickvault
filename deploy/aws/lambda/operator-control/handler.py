@@ -1741,6 +1741,10 @@ def _console_html() -> str:
   .banner{ border:1px solid #3a3110; background:#141207; color:var(--amb); border-radius:12px; padding:12px 14px;
            font-size:13px; margin-bottom:10px; }
   details.fold>summary{ cursor:pointer; list-style:none; } details.fold>summary::-webkit-details-marker{ display:none; }
+  /* Visible disclosure affordance — the operator twice read the folded danger
+     zone as "the wipes were DELETED" because the fold had no visual cue. */
+  details.fold>summary::after{ content:' ▸'; color:var(--mut); font-size:12px; }
+  details.fold[open]>summary::after{ content:' ▾'; }
   .strip{ display:flex; gap:14px; flex-wrap:wrap; align-items:center; font-size:13px; font-weight:700; }
   .danger-opt{ display:flex; gap:10px; align-items:flex-start; margin:12px 0; cursor:pointer; }
   .danger-opt input{ width:auto; margin-top:3px; }
@@ -1889,7 +1893,7 @@ def _console_html() -> str:
       </div>
       <div class="card">
         <details class="fold" id="danger">
-          <summary><span class="lbl" style="display:inline">⚠️ danger zone — destructive data actions (tap to open)</span></summary>
+          <summary><span class="lbl" style="display:inline">⚠️ danger zone — destructive data actions (tap to open)</span> <span class="muted" style="font-size:11px">(contains: Wipe GROWW · Wipe ALL · Docker reset · Bare nuke)</span></summary>
           <div class="warn" id="dangerlock" hidden style="margin-top:10px">🔒 Locked until 3:30 PM IST — data-destructive actions are refused during market hours, even with force. A mid-market wipe destroys data that can never be re-fetched.</div>
           <div class="muted" style="margin-top:10px">Pick ONE severity, then Execute. Every action still asks you to type its own confirm word — nothing fires from a mis-click.</div>
           <label class="danger-opt"><input type="radio" name="danger" value="groww">
