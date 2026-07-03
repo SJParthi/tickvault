@@ -1626,6 +1626,27 @@ rules:
       (Telegram + draft Issue) so the operator restores disk health, with a
       5-min cooldown to avoid spamming on a benign one-off respawn.
 
+  - name: tick-flush-01-worker-respawn-escalate
+    match:
+      code: TICK-FLUSH-01
+    action: escalate
+    runbook_path: .claude/rules/project/tick-flush-worker-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 300
+    justification: >-
+      TICK-FLUSH-01 means the B6 off-thread tick ILP flush worker died
+      (panic) and the supervisor respawned it with the same channels, so
+      queued flush batches survive and the writer's dispatch never sees
+      Disconnected. A single respawn self-heals; a sustained respawn or
+      flush-error rate (tv_tick_flush_worker_respawn_total /
+      tv_tick_flush_worker_errors_total) means QuestDB ILP or the host is
+      degrading — the writer degrades gracefully to the inline-flush
+      fallback (measured as stall, counted via
+      tv_tick_flush_backpressure_block_total) and zero-loss is preserved
+      via the ring/spill/DLQ rescue of failed batches. High severity;
+      mirrors WS-SPILL-01 / WS-GAP-05. Escalate (Telegram + draft Issue)
+      with a 5-min cooldown to avoid spamming on a benign one-off respawn.
+
   - name: ws-spill-02-frame-dropped-escalate
     match:
       code: WS-SPILL-02
