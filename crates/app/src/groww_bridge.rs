@@ -227,6 +227,14 @@ struct GrowwTickLine {
     exchange_ts_millis: i64,
     ltp: f64,
     cum_volume: i64,
+    /// Optional per-message capture stamp (2026-07-03 per-callback instant
+    /// capture): UTC epoch NANOS from `time.time_ns()` stamped INSIDE the
+    /// sidecar's NATS-callback hook — the true capture-at-receipt instant.
+    /// Absent (`None`) on old-format lines and on the walker's reconcile-sweep
+    /// rows (snapshot drains have no per-message stamp) — those fall back to
+    /// the per-wake receipt stamp, exactly the pre-PR behaviour.
+    #[serde(default)]
+    capture_ns: Option<i64>,
 }
 
 /// A normalised Groww live tick — the aggregator input. Self-contained (no
@@ -248,6 +256,9 @@ struct GrowwTick {
 struct ParsedGrowwTick {
     tick: GrowwTick,
     exchange_ts_millis: i64,
+    /// Sidecar capture-at-receipt stamp (UTC epoch nanos), when the line
+    /// carried one — see [`GrowwTickLine::capture_ns`].
+    capture_ns: Option<i64>,
 }
 
 /// Maps the canonical segment string to [`ExchangeSegment`]. Pure + testable.
@@ -279,6 +290,7 @@ fn parse_groww_tick_line(line: &str) -> Result<ParsedGrowwTick> {
             cum_volume: l.cum_volume,
         },
         exchange_ts_millis: l.exchange_ts_millis,
+        capture_ns: l.capture_ns,
     })
 }
 
@@ -355,11 +367,16 @@ const MAX_PLAUSIBLE_TS_IST_NANOS: i64 = 4_102_444_800_000_000_000;
 const GROWW_FUTURE_TS_TOLERANCE_NANOS: i64 = 60 * 1_000_000_000;
 
 /// Minimum plausible wall-clock receipt (2020-01-01 UTC expressed in the same
-/// IST-nanos convention). F6 hostile finding (2026-07-02): a degenerate clock
-/// read yields `IST_UTC_OFFSET_NANOS` (a ~1970 instant), NOT 0 — so the
-/// future-ts clamp must fail OPEN for any implausibly OLD receipt, otherwise
-/// a dead clock would mass-reject every valid tick as FutureTimestamp
-/// (fail-closed by accident).
+/// IST-nanos convention). A degenerate clock read yields
+/// `IST_UTC_OFFSET_NANOS` (a ~1970 instant), NOT 0 — both fall below this
+/// floor. F1 security finding (2026-07-03, supersedes the 2026-07-02
+/// fail-open F6 behavior): a receipt at/below this floor now REJECTS the
+/// tick (fail-closed, [`GrowwTickReject::ImplausibleReceiptClock`]) instead
+/// of skipping the ±60 s future-skew clamp — a skipped clamp let a tick
+/// dated years in the future (inside the static `[2020, 2100)` bounds)
+/// poison the per-feed seal watermark (`fetch_max` never regresses) and fold
+/// garbage into candle cells. A broken host clock is a BOOT-03-class
+/// condition; dropping Groww ticks then is strictly safer.
 const GROWW_MIN_PLAUSIBLE_RECEIPT_IST_NANOS: i64 = 1_577_836_800 * 1_000_000_000;
 
 /// Upper bound for a plausible cumulative day volume (1 trillion shares).
@@ -392,6 +409,12 @@ enum GrowwTickReject {
     FutureTimestamp,
     /// `ts_ist_nanos` is outside the plausible `[2020, 2100)` IST window.
     TimestampOutOfRange,
+    /// OUR receipt clock read is implausible (≤ 2020-01-01 — a 0 /
+    /// negative / degenerate ~1970 read), so the ±60 s future-skew clamp
+    /// cannot anchor. F1 (2026-07-03): fail CLOSED — reject the tick rather
+    /// than admit a possibly-future-dated stamp that would poison the seal
+    /// watermark. BOOT-03-class host condition.
+    ImplausibleReceiptClock,
 }
 
 /// Validates a parsed Groww tick before persist. Pure, O(1) (a handful of
@@ -425,13 +448,20 @@ fn validate_groww_tick(
     {
         return Err(GrowwTickReject::TimestampOutOfRange);
     }
+    // F1 (2026-07-03 security review, supersedes the 2026-07-02 fail-open
+    // F6 behavior): the receipt clock anchors the ±60 s future-skew clamp.
+    // An implausible read (0 / negative / degenerate ~1970) means the clamp
+    // CANNOT run — and skipping it would let a tick dated years in the
+    // future (still inside the static [2020, 2100) bounds above) poison the
+    // per-feed seal watermark (fetch_max never regresses) and fold garbage
+    // into candle cells. A broken host clock is a BOOT-03-class condition:
+    // dropping Groww ticks then is strictly safer, so fail CLOSED.
+    if receipt_ist_nanos <= GROWW_MIN_PLAUSIBLE_RECEIPT_IST_NANOS {
+        return Err(GrowwTickReject::ImplausibleReceiptClock);
+    }
     // PR-4 relative clamp: reject a tick stamped ahead of OUR receipt clock
-    // beyond the skew tolerance. Applies only when the clock read succeeded
-    // (receipt > 0) — a broken clock fails OPEN to the static bounds above,
-    // never mass-rejecting a healthy feed.
-    if receipt_ist_nanos > GROWW_MIN_PLAUSIBLE_RECEIPT_IST_NANOS
-        && parsed.tick.ts_ist_nanos
-            > receipt_ist_nanos.saturating_add(GROWW_FUTURE_TS_TOLERANCE_NANOS)
+    // beyond the skew tolerance.
+    if parsed.tick.ts_ist_nanos > receipt_ist_nanos.saturating_add(GROWW_FUTURE_TS_TOLERANCE_NANOS)
     {
         return Err(GrowwTickReject::FutureTimestamp);
     }
@@ -444,8 +474,10 @@ fn validate_groww_tick(
 /// for persistence (rows keep the exchange `ts_ist_nanos`). A clock read that
 /// somehow fails saturates to `IST_UTC_OFFSET_NANOS` (a ~1970 instant, NOT 0)
 /// — treated as "very old": fails safe toward Down for health math, and fails
-/// OPEN for the future-ts clamp (guarded by
-/// [`GROWW_MIN_PLAUSIBLE_RECEIPT_IST_NANOS`], F6 hostile finding 2026-07-02).
+/// CLOSED for the validator (every tick rejected as
+/// [`GrowwTickReject::ImplausibleReceiptClock`] while below
+/// [`GROWW_MIN_PLAUSIBLE_RECEIPT_IST_NANOS`] — F1 security finding
+/// 2026-07-03, supersedes the 2026-07-02 fail-open F6 behavior).
 fn receipt_ist_nanos() -> i64 {
     chrono::Utc::now()
         .timestamp_nanos_opt()
@@ -509,11 +541,40 @@ fn live_tick_row(
 
 /// Pure receipt-stamp gate (fix #3, 2026-07-03 lag forensics): the `received_at`
 /// value persisted on every `feed='groww'` row — `Some(receipt)` only when the
-/// per-wake clock read is plausible (mirrors `validate_groww_tick`'s fail-open
-/// guard), so a broken clock writes NULL, never a ~1970 stamp. One clock read
-/// per wake (O(1) preserved — no per-line syscall added).
+/// per-wake clock read is plausible (same plausibility floor as
+/// `validate_groww_tick`, which since F1 2026-07-03 REJECTS ticks outright
+/// below it), so a broken clock writes NULL, never a ~1970 stamp. One clock
+/// read per wake (O(1) preserved — no per-line syscall added).
 fn row_received_at(receipt_ist_nanos: i64) -> Option<i64> {
     (receipt_ist_nanos > GROWW_MIN_PLAUSIBLE_RECEIPT_IST_NANOS).then_some(receipt_ist_nanos)
+}
+
+/// Per-ROW received_at (2026-07-03 per-callback instant capture): prefer the
+/// sidecar's per-message `capture_ns` stamp (UTC epoch nanos, stamped inside
+/// the NATS-callback hook — the true capture-at-receipt instant) converted to
+/// the IST-nanos convention `received_at` already uses; fall back to the
+/// per-wake receipt stamp for old-format / reconcile-sweep lines. The capture
+/// stamp is accepted ONLY when plausible: above the same ~2020 floor as
+/// [`row_received_at`] AND not ahead of the wake receipt clock beyond
+/// [`GROWW_FUTURE_TS_TOLERANCE_NANOS`] (the sidecar and the bridge share the
+/// host clock — a capture stamp "after" the wake that read it means a broken
+/// clock, so fail toward the pre-PR wake stamp, never a garbage column).
+/// Pure arithmetic — O(1), no clock read, no allocation per line.
+fn row_received_at_with_capture(
+    capture_ns_utc: Option<i64>,
+    wake_receipt_ist_nanos: i64,
+) -> Option<i64> {
+    if let Some(ns) = capture_ns_utc {
+        let capture_ist_nanos =
+            ns.saturating_add(tickvault_common::constants::IST_UTC_OFFSET_NANOS);
+        if capture_ist_nanos > GROWW_MIN_PLAUSIBLE_RECEIPT_IST_NANOS
+            && capture_ist_nanos
+                <= wake_receipt_ist_nanos.saturating_add(GROWW_FUTURE_TS_TOLERANCE_NANOS)
+        {
+            return Some(capture_ist_nanos);
+        }
+    }
+    row_received_at(wake_receipt_ist_nanos)
 }
 
 /// Monotonic, replay-stable `capture_seq` source (TICK-SEQ-01): `max(prev+1,
@@ -937,10 +998,11 @@ impl GrowwBridgeState {
         // PR-4: one clock read per WAKE (not per line — O(1) preserved) for
         // the relative future-timestamp clamp in validate_groww_tick.
         let wake_receipt_ist_nanos = receipt_ist_nanos();
-        // Fix #3 (2026-07-03 lag forensics): the receipt stamp persisted on
-        // every row this wake — plausibility-gated so a broken clock writes
-        // NULL. Makes per-feed lag (received_at − ts) measurable in SQL.
-        let wake_received_at = row_received_at(wake_receipt_ist_nanos);
+        // Fix #3 (2026-07-03 lag forensics) + per-callback capture: each row's
+        // received_at prefers the sidecar's per-message capture_ns stamp (true
+        // capture-at-receipt) and falls back to this per-wake receipt stamp —
+        // plausibility-gated so a broken clock writes NULL. Makes per-feed lag
+        // (received_at − ts) measurable in SQL, now at per-message fidelity.
         for line_bytes in prefix.split(|&b| b == b'\n') {
             if line_bytes.is_empty() {
                 continue;
@@ -979,9 +1041,11 @@ impl GrowwBridgeState {
             parsed_any = true;
             wake_max_exchange_ts_nanos = wake_max_exchange_ts_nanos.max(parsed.tick.ts_ist_nanos);
             let seq = next_capture_seq(&self.capture_seq, parsed.tick.ts_ist_nanos);
+            let row_received =
+                row_received_at_with_capture(parsed.capture_ns, wake_receipt_ist_nanos);
             if let Err(err) =
                 self.live_writer
-                    .append_row(&live_tick_row(&parsed, seq, wake_received_at))
+                    .append_row(&live_tick_row(&parsed, seq, row_received))
             {
                 error!(
                     ?err,
@@ -1051,6 +1115,19 @@ impl GrowwBridgeState {
                     );
                 },
             );
+            if stats.late_count > 0 {
+                // AGGREGATOR-LATE-01 visibility (2026-07-03): Groww late
+                // discards were previously COMPLETELY silent — this path
+                // captured `stats` but never read `late_count` (no counter,
+                // no log), so a Discard-policy drop wave was invisible. Count
+                // them with the `feed=groww` label; the Dhan site keeps its
+                // label-less series (mirroring the `tv_seal_mpsc_dropped_total`
+                // per-feed labelling precedent in `seal_routing.rs`) so the
+                // existing tv-aggregator-late-tick-sustained alert series is
+                // not renamed or broken.
+                metrics::counter!("tv_aggregator_late_ticks_discarded_total", "feed" => "groww")
+                    .increment(u64::from(stats.late_count));
+            }
             if !stats.instrument_found {
                 self.aggregator.pre_populate(std::iter::once(key));
             }
@@ -1227,14 +1304,184 @@ fn spawn_groww_ist_midnight_force_seal(
                     crate::seal_routing::SealOutcome::DroppedD1 => {}
                 }
             });
+            // F2 self-heal (2026-07-03): restart the day's event-time
+            // watermark from 0 so a POISONED watermark (garbage future-dated
+            // tick advanced the never-regressing fetch_max past the
+            // future-skew guard, disabling catch-up) self-heals within one
+            // day and the next day's watermark rebuilds from the first real
+            // tick (mirrors the Dhan Task 3 reset).
+            aggregator.reset_watermark();
             info!(
                 sealed,
                 dropped,
-                "Groww IST-midnight force-seal complete — open buckets flushed (feed=groww)"
+                "Groww IST-midnight force-seal complete — open buckets flushed (feed=groww, watermark reset)"
             );
         }
     });
     info!("Groww bridge — IST-midnight force-seal task spawned (parity with Dhan)");
+}
+
+/// Spawn the watermark-aware per-minute catch-up seal driver for the Groww
+/// aggregator (BOUNDARY-01, 2026-07-03).
+///
+/// Bounds candle seal lag WITHOUT mass-discarding backlogged ticks: every
+/// [`tickvault_trading::candles::CATCHUP_SEAL_POLL_INTERVAL_SECS`] it reads
+/// the Groww instance's event-time watermark (the max `exchange_timestamp`
+/// ever consumed — advanced only by real, newer ticks, so a frozen-snapshot
+/// re-dump never moves it) and gates via the shared pure
+/// [`tickvault_trading::candles::compute_catchup_cutoff`]: scan ONLY when the
+/// watermark ADVANCED since the last scan AND is not POISONED (further ahead
+/// of the IST wall clock than
+/// [`tickvault_trading::candles::CATCHUP_WATERMARK_FUTURE_SKEW_GUARD_SECS`]
+/// allows); the cutoff is `min(watermark −`
+/// [`tickvault_trading::candles::CATCHUP_SEAL_LATENESS_MARGIN_SECS_GROWW`]`,
+/// now_ist)`. The Groww margin is a FULL MINUTE (vs Dhan's 5 s) because the
+/// NDJSON path has measured per-subject delivery skew (snapshot freezes,
+/// byte-0 re-tail) — a wider margin means only >60 s skew becomes a counted
+/// discard, while seal lag stays bounded at ~65 s instead of unbounded. A
+/// backlogged bridge (ILP-backpressure pause, post-restart re-tail) has a
+/// trailing watermark, so its still-filling buckets are NEVER sealed ahead of
+/// the backlog — the exact mass-discard failure a naive wall-clock force-seal
+/// would cause under `LatePolicy::Discard`. A STALLED watermark (dead feed)
+/// gets NO catch-up seals — FEED-STALL-01 owns the dead-feed page; there is
+/// deliberately no "assume dead then force-seal anyway" escape hatch. A
+/// POISONED watermark disables catch-up (coalesced BOUNDARY-01 error,
+/// reason=watermark_future_skew) until the IST-midnight watermark reset
+/// self-heals it.
+///
+/// Routing is the SAME Groww policy as the IST-midnight force-seal closure
+/// above (feed=Groww, drop_d1=false, no prev-day pct-stamp, no Dhan
+/// heartbeat) through the SAME shared seal-writer chain, so a later amend or
+/// re-seal of the same bucket UPSERTs in place (DEDUP `ts, security_id,
+/// segment, feed`; `ts` = bucket start, never wall-clock). The midnight
+/// force-seal task keeps its cross-day duties (clear `last_sealed`, re-arm
+/// day-open) — post-catch-up it is idempotent (`force_seal` on an emptied
+/// slot returns `None`).
+// TEST-EXEMPT: cold-path tokio interval driver (same supervision level as the
+// sibling IST-midnight force-seal task). The load-bearing logic is unit-tested
+// in the trading crate (catch_up_seal / catch_up_seal_all / watermark tests);
+// the routing params are pinned by test_groww_force_seal_routes_with_feed_groww
+// (identical SealRouteParams).
+fn spawn_groww_catchup_seal(
+    aggregator: MultiTfAggregator,
+    feed_runtime: Arc<FeedRuntimeState>,
+    trading_calendar: Arc<tickvault_common::trading_calendar::TradingCalendar>,
+) {
+    use tickvault_trading::candles::{
+        CATCHUP_SEAL_LATENESS_MARGIN_SECS_GROWW, CATCHUP_SEAL_POLL_INTERVAL_SECS,
+        CATCHUP_WATERMARK_FUTURE_SKEW_GUARD_SECS, compute_catchup_cutoff,
+    };
+    tokio::spawn(async move {
+        let mut interval =
+            tokio::time::interval(Duration::from_secs(CATCHUP_SEAL_POLL_INTERVAL_SECS));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut last_scanned_watermark: u32 = 0;
+        // Edge latch for the poisoned-watermark error — ONE coalesced line
+        // per poisoning episode (audit Rule 4), not one per 5 s wave.
+        let mut poison_logged = false;
+        loop {
+            interval.tick().await;
+            let watermark = aggregator.watermark_secs();
+            // IST wall-clock now (epoch seconds) via the bridge's EXISTING
+            // clock helper (`receipt_ist_nanos` — the same path the
+            // feed-health math uses). A broken clock returns a ~1970 value →
+            // every watermark looks poisoned → catch-up stays disabled
+            // (fail-closed, BOOT-03-class posture, matching the F1
+            // fail-closed validator).
+            let now_ist_secs = u32::try_from(receipt_ist_nanos() / 1_000_000_000).unwrap_or(0);
+            // Shared pure gate: self-gate (watermark unchanged), no-tick-yet,
+            // and the poisoned-watermark defense in one testable place.
+            let Some(cutoff) = compute_catchup_cutoff(
+                watermark,
+                last_scanned_watermark,
+                now_ist_secs,
+                CATCHUP_SEAL_LATENESS_MARGIN_SECS_GROWW,
+                CATCHUP_WATERMARK_FUTURE_SKEW_GUARD_SECS,
+            ) else {
+                // Only the poisoned arm is observable: watermark non-zero and
+                // advanced, yet the gate refused — it sits past now + guard.
+                // last_scanned is NOT updated, so scanning resumes the moment
+                // the watermark self-heals (IST-midnight reset_watermark).
+                if watermark != 0 && watermark != last_scanned_watermark {
+                    metrics::counter!(
+                        "tv_boundary_catchup_skipped_total",
+                        "feed" => "groww", "reason" => "future_skew"
+                    )
+                    .increment(1);
+                    if !poison_logged {
+                        poison_logged = true;
+                        error!(
+                            code = tickvault_common::error_code::ErrorCode::Boundary01CatchupSeal
+                                .code_str(),
+                            reason = "watermark_future_skew",
+                            feed = "groww",
+                            watermark_secs = watermark,
+                            now_ist_secs,
+                            "BOUNDARY-01: poisoned event-time watermark (further ahead of the \
+                             IST wall clock than host skew allows) — catch-up sealing disabled \
+                             until the IST-midnight watermark reset self-heals it"
+                        );
+                    }
+                }
+                continue;
+            };
+            poison_logged = false;
+            // Trading-day + runtime-enable gates, mirroring the IST-midnight
+            // task. The enable flag is read into a local so this gate does
+            // not collide with the `run_groww_bridge` disable-branch
+            // source-scan anchor (which `find`s the FIRST literal occurrence).
+            if !trading_calendar.is_trading_day_today() {
+                continue;
+            }
+            let groww_enabled_for_catchup = feed_runtime.is_enabled(Feed::Groww);
+            if !groww_enabled_for_catchup {
+                continue;
+            }
+            let Some(sender) = global_seal_sender() else {
+                // Seal-writer not installed yet — retry next wave WITHOUT
+                // consuming the watermark advance (no seal is lost).
+                continue;
+            };
+            last_scanned_watermark = watermark;
+            let sealed =
+                aggregator.catch_up_seal_all(cutoff, |security_id, segment_code, tf, state| {
+                    metrics::counter!("tv_boundary_catchup_total", "feed" => "groww").increment(1);
+                    // SAME Groww routing policy as the IST-midnight force-seal
+                    // closure: feed=Groww, drop_d1=false (Groww routes D1),
+                    // no prev-day pct-stamp, no Dhan heartbeat. A full-mpsc
+                    // drop is already counted by route_seal
+                    // (`tv_seal_mpsc_dropped_total{feed=groww}`).
+                    crate::seal_routing::route_seal(
+                        crate::seal_routing::SealRouteParams {
+                            feed: Feed::Groww,
+                            drop_d1: false,
+                            prev_day_cache: None,
+                            heartbeat: None,
+                            feed_health_on_m1: None,
+                        },
+                        security_id,
+                        segment_code,
+                        tf,
+                        state,
+                        sender,
+                    );
+                });
+            if sealed > 0 {
+                // ONE coalesced line per scan wave — never per-seal spam.
+                warn!(
+                    code =
+                        tickvault_common::error_code::ErrorCode::Boundary01CatchupSeal.code_str(),
+                    feed = "groww",
+                    seals = sealed,
+                    cutoff_secs = cutoff,
+                    watermark_secs = watermark,
+                    "BOUNDARY-01: watermark catch-up sealed lagging candle bucket(s) — \
+                     late but correct; buckets past the watermark stay open for the backlog"
+                );
+            }
+        }
+    });
+    info!("Groww bridge — watermark catch-up seal task spawned (BOUNDARY-01)");
 }
 
 /// Persisted bridge read-position (PR-3, 2026-07-02): written AFTER each
@@ -1430,6 +1677,16 @@ pub fn spawn_supervised_groww_bridge(
         // bridge task respawns.
         let aggregator = MultiTfAggregator::with_capacity(GROWW_AGGREGATOR_CAPACITY);
         spawn_groww_ist_midnight_force_seal(
+            aggregator.clone(),
+            Arc::clone(&feed_runtime),
+            Arc::clone(&trading_calendar),
+        );
+        // BOUNDARY-01 (2026-07-03): watermark-aware per-minute catch-up seal —
+        // spawned ONCE alongside the midnight force-seal (outside the respawn
+        // loop, same process-lifetime ownership) so bridge respawns never leak
+        // duplicate driver tasks. The clone shares the SAME papaya map + the
+        // SAME event-time watermark the bridge's consume path advances.
+        spawn_groww_catchup_seal(
             aggregator.clone(),
             Arc::clone(&feed_runtime),
             trading_calendar,
@@ -1788,6 +2045,20 @@ mod tests {
         assert_eq!(p.tick.ltp, 2847.55);
         assert_eq!(p.tick.cum_volume, 123_456);
         assert_eq!(p.exchange_ts_millis, 1_780_000_020_123);
+        // Old-format line (no capture_ns): the optional field defaults None —
+        // backward compatible with every pre-2026-07-03 sidecar row.
+        assert_eq!(p.capture_ns, None);
+    }
+
+    #[test]
+    fn test_parse_groww_tick_line_with_capture_ns() {
+        // New-format line from the per-callback capture path: capture_ns is
+        // UTC epoch nanos stamped inside the sidecar's NATS-callback hook.
+        let line = r#"{"security_id":1333,"segment":"NSE_EQ","ts_ist_nanos":1780000020123000000,"exchange_ts_millis":1780000020123,"ltp":2847.55,"cum_volume":0,"capture_ns":1780000020125000000}"#;
+        let p = parse_groww_tick_line(line).expect("parse");
+        assert_eq!(p.capture_ns, Some(1_780_000_020_125_000_000));
+        assert_eq!(p.tick.security_id, 1333);
+        assert_eq!(p.tick.ltp, 2847.55);
     }
 
     #[test]
@@ -1803,9 +2074,17 @@ mod tests {
         parse_groww_tick_line(LINE).expect("parse")
     }
 
+    /// Plausible receipt clock for validator tests, anchored at the valid
+    /// tick's own stamp. F1 (2026-07-03): `receipt = 0` now fails CLOSED
+    /// (`ImplausibleReceiptClock`), so every non-clock test must supply a
+    /// plausible clock to reach the field-specific reject arms.
+    fn ok_receipt() -> i64 {
+        valid_parsed().tick.ts_ist_nanos
+    }
+
     #[test]
     fn test_validate_groww_tick_accepts_valid() {
-        assert_eq!(validate_groww_tick(&valid_parsed(), 0), Ok(()));
+        assert_eq!(validate_groww_tick(&valid_parsed(), ok_receipt()), Ok(()));
     }
 
     #[test]
@@ -1813,12 +2092,12 @@ mod tests {
         let mut p = valid_parsed();
         p.tick.ltp = f64::NAN;
         assert_eq!(
-            validate_groww_tick(&p, 0),
+            validate_groww_tick(&p, ok_receipt()),
             Err(GrowwTickReject::NonFinitePrice)
         );
         p.tick.ltp = f64::INFINITY;
         assert_eq!(
-            validate_groww_tick(&p, 0),
+            validate_groww_tick(&p, ok_receipt()),
             Err(GrowwTickReject::NonFinitePrice)
         );
     }
@@ -1828,12 +2107,12 @@ mod tests {
         let mut p = valid_parsed();
         p.tick.ltp = 0.0;
         assert_eq!(
-            validate_groww_tick(&p, 0),
+            validate_groww_tick(&p, ok_receipt()),
             Err(GrowwTickReject::NonPositivePrice)
         );
         p.tick.ltp = -1.5;
         assert_eq!(
-            validate_groww_tick(&p, 0),
+            validate_groww_tick(&p, ok_receipt()),
             Err(GrowwTickReject::NonPositivePrice)
         );
     }
@@ -1843,7 +2122,7 @@ mod tests {
         let mut p = valid_parsed();
         p.tick.ltp = f64::from(tickvault_common::constants::MAX_PLAUSIBLE_LTP) + 1.0;
         assert_eq!(
-            validate_groww_tick(&p, 0),
+            validate_groww_tick(&p, ok_receipt()),
             Err(GrowwTickReject::ImplausiblePrice)
         );
     }
@@ -1853,7 +2132,7 @@ mod tests {
         let mut p = valid_parsed();
         p.tick.cum_volume = -1;
         assert_eq!(
-            validate_groww_tick(&p, 0),
+            validate_groww_tick(&p, ok_receipt()),
             Err(GrowwTickReject::NegativeVolume)
         );
     }
@@ -1863,12 +2142,12 @@ mod tests {
         let mut p = valid_parsed();
         p.tick.cum_volume = MAX_PLAUSIBLE_VOLUME + 1;
         assert_eq!(
-            validate_groww_tick(&p, 0),
+            validate_groww_tick(&p, ok_receipt()),
             Err(GrowwTickReject::ImplausibleVolume)
         );
         // Boundary is inclusive-valid.
         p.tick.cum_volume = MAX_PLAUSIBLE_VOLUME;
-        assert_eq!(validate_groww_tick(&p, 0), Ok(()));
+        assert_eq!(validate_groww_tick(&p, ok_receipt()), Ok(()));
     }
 
     #[test]
@@ -1905,12 +2184,12 @@ mod tests {
         let mut p = valid_parsed();
         p.tick.security_id = 0;
         assert_eq!(
-            validate_groww_tick(&p, 0),
+            validate_groww_tick(&p, ok_receipt()),
             Err(GrowwTickReject::NonPositiveSecurityId)
         );
         p.tick.security_id = -7;
         assert_eq!(
-            validate_groww_tick(&p, 0),
+            validate_groww_tick(&p, ok_receipt()),
             Err(GrowwTickReject::NonPositiveSecurityId)
         );
     }
@@ -1920,24 +2199,26 @@ mod tests {
         let mut p = valid_parsed();
         p.tick.ts_ist_nanos = 0;
         assert_eq!(
-            validate_groww_tick(&p, 0),
+            validate_groww_tick(&p, ok_receipt()),
             Err(GrowwTickReject::TimestampOutOfRange)
         );
         p.tick.ts_ist_nanos = -1;
         assert_eq!(
-            validate_groww_tick(&p, 0),
+            validate_groww_tick(&p, ok_receipt()),
             Err(GrowwTickReject::TimestampOutOfRange)
         );
         p.tick.ts_ist_nanos = i64::MAX;
         assert_eq!(
-            validate_groww_tick(&p, 0),
+            validate_groww_tick(&p, ok_receipt()),
             Err(GrowwTickReject::TimestampOutOfRange)
         );
         // Boundaries are inclusive-valid.
         p.tick.ts_ist_nanos = MIN_PLAUSIBLE_TS_IST_NANOS;
-        assert_eq!(validate_groww_tick(&p, 0), Ok(()));
+        assert_eq!(validate_groww_tick(&p, ok_receipt()), Ok(()));
+        // The 2100 upper bound needs a same-era receipt clock — with a 2026
+        // receipt the (correct) ±60 s future-skew clamp fires first.
         p.tick.ts_ist_nanos = MAX_PLAUSIBLE_TS_IST_NANOS;
-        assert_eq!(validate_groww_tick(&p, 0), Ok(()));
+        assert_eq!(validate_groww_tick(&p, MAX_PLAUSIBLE_TS_IST_NANOS), Ok(()));
     }
 
     #[test]
@@ -1974,6 +2255,47 @@ mod tests {
         );
         let plausible = GROWW_MIN_PLAUSIBLE_RECEIPT_IST_NANOS + 1;
         assert_eq!(row_received_at(plausible), Some(plausible));
+    }
+
+    #[test]
+    fn test_row_received_at_prefers_plausible_capture_ns() {
+        // 2026-07-03 per-callback capture: a plausible per-message capture_ns
+        // (UTC nanos) wins over the per-wake stamp, converted UTC→IST nanos —
+        // received_at now means TRUE capture-at-receipt time per message.
+        let wake = GROWW_MIN_PLAUSIBLE_RECEIPT_IST_NANOS + 10_000_000_000;
+        let capture_utc = wake - tickvault_common::constants::IST_UTC_OFFSET_NANOS - 5;
+        assert_eq!(
+            row_received_at_with_capture(Some(capture_utc), wake),
+            Some(capture_utc.saturating_add(tickvault_common::constants::IST_UTC_OFFSET_NANOS)),
+            "plausible capture stamp (IST-converted) must be used per-row"
+        );
+    }
+
+    #[test]
+    fn test_row_received_at_falls_back_without_capture_ns() {
+        // Old-format / reconcile-sweep rows: exact pre-PR per-wake behaviour.
+        let wake = GROWW_MIN_PLAUSIBLE_RECEIPT_IST_NANOS + 1;
+        assert_eq!(row_received_at_with_capture(None, wake), Some(wake));
+        assert_eq!(row_received_at_with_capture(None, 0), None);
+    }
+
+    #[test]
+    fn test_row_received_at_falls_back_on_implausible_capture_ns() {
+        let wake = GROWW_MIN_PLAUSIBLE_RECEIPT_IST_NANOS + 10_000_000_000;
+        // Pre-2020 garbage stamp (0 / negative) → wake fallback.
+        assert_eq!(row_received_at_with_capture(Some(0), wake), Some(wake));
+        assert_eq!(row_received_at_with_capture(Some(-1), wake), Some(wake));
+        // Capture ahead of the wake clock beyond tolerance (impossible on a
+        // sane shared host clock — the wake read happens AFTER the sidecar's
+        // write) → broken clock → wake fallback, never a garbage column.
+        let far_future = wake + GROWW_FUTURE_TS_TOLERANCE_NANOS + 1;
+        assert_eq!(
+            row_received_at_with_capture(Some(far_future), wake),
+            Some(wake)
+        );
+        // Both implausible (broken clock everywhere) → NULL, matching the
+        // pre-PR broken-clock behaviour.
+        assert_eq!(row_received_at_with_capture(Some(0), 0), None);
     }
 
     #[test]
@@ -2679,8 +3001,9 @@ mod tests {
     #[test]
     fn test_validate_rejects_future_timestamp() {
         // PR-4: a tick stamped ahead of the receipt clock beyond the 60s skew
-        // tolerance is rejected; at/below tolerance passes; a broken clock
-        // (receipt=0) fails OPEN to the static bounds (never mass-rejects).
+        // tolerance is rejected; at/below tolerance passes. (The broken-clock
+        // arm is F1 fail-CLOSED since 2026-07-03 — see the dedicated
+        // test_validate_groww_tick_fail_closed_on_implausible_receipt_clock.)
         let mut p = valid_parsed();
         let now = p.tick.ts_ist_nanos; // pretend receipt == the tick's stamp
         assert_eq!(validate_groww_tick(&p, now), Ok(()), "same-instant passes");
@@ -2702,16 +3025,41 @@ mod tests {
             validate_groww_tick(&p, now),
             Err(GrowwTickReject::FutureTimestamp)
         );
-        // Broken clock: fail-open (static bounds only).
-        assert_eq!(validate_groww_tick(&p, 0), Ok(()), "receipt=0 fails open");
-        // F6: a degenerate clock read yields IST_UTC_OFFSET_NANOS (~1970),
-        // NOT 0 — it must ALSO fail open (below the min-plausible receipt),
-        // never mass-reject a valid tick as FutureTimestamp.
-        p.tick.ts_ist_nanos = now;
+    }
+
+    #[test]
+    fn test_validate_groww_tick_fail_closed_on_implausible_receipt_clock() {
+        // F1 (2026-07-03 security review, supersedes the 2026-07-02 fail-open
+        // F6 behavior): an implausible receipt clock (0 / negative /
+        // degenerate ~1970 / at the plausibility floor) REJECTS every tick —
+        // fail CLOSED. A skipped future-skew clamp previously let a tick
+        // dated years in the future (inside the static [2020, 2100) bounds)
+        // poison the per-feed seal watermark (fetch_max never regresses) and
+        // fold garbage into candle cells. A broken host clock is a
+        // BOOT-03-class condition; dropping Groww ticks then is strictly
+        // safer than corrupting the seal path.
+        let p = valid_parsed();
+        for broken in [
+            0,
+            -1,
+            tickvault_common::constants::IST_UTC_OFFSET_NANOS, // degenerate ~1970 read
+            GROWW_MIN_PLAUSIBLE_RECEIPT_IST_NANOS,             // boundary: floor is exclusive
+        ] {
+            assert_eq!(
+                validate_groww_tick(&p, broken),
+                Err(GrowwTickReject::ImplausibleReceiptClock),
+                "receipt {broken} must fail closed"
+            );
+        }
+        // Just above the floor the clamp anchors normally: a same-era tick
+        // passes, a future-dated one is caught by the clamp (not by the
+        // clock guard).
+        assert_eq!(validate_groww_tick(&p, p.tick.ts_ist_nanos), Ok(()));
+        let mut future = valid_parsed();
+        future.tick.ts_ist_nanos = p.tick.ts_ist_nanos + 3600 * 1_000_000_000;
         assert_eq!(
-            validate_groww_tick(&p, tickvault_common::constants::IST_UTC_OFFSET_NANOS),
-            Ok(()),
-            "degenerate ~1970 clock fails open"
+            validate_groww_tick(&future, p.tick.ts_ist_nanos),
+            Err(GrowwTickReject::FutureTimestamp)
         );
     }
 

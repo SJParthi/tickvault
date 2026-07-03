@@ -13,7 +13,12 @@ NOT wired into CI (no Python test harness exists in CI today) — the same
 assertions also run under `python3 groww_sidecar.py --selftest`
 (_selftest_dedup), which the deployed environment can execute.
 """
+import json
+import os
+import queue
 import sys
+import tempfile
+import time
 import types
 import unittest
 
@@ -26,22 +31,32 @@ if "growwapi" not in sys.modules:
     sys.modules["growwapi"] = _stub
 
 from groww_sidecar import (  # noqa: E402  (stub must precede)
+    CAPTURE_QUEUE_MAX,
     RAW_PROBE_HEARTBEAT_SECS,
     RAW_PROBE_INDEX_SAMPLE_COUNT,
     RAW_PROBE_SAMPLE_COUNT,
+    RECONCILE_INTERVAL_MS_DEFAULT,
+    RECONCILE_INTERVAL_MS_MAX,
+    RECONCILE_INTERVAL_MS_MIN,
     RawTickProbe,
     WALK_INTERVAL_MS_DEFAULT,
     WALK_INTERVAL_MS_MAX,
     WALK_INTERVAL_MS_MIN,
     WATERMARK_MAX_LAG_MS_DEFAULT,
+    build_capture_topic_map,
     dedup_should_emit,
+    install_callback_capture,
+    make_capture_hook,
     probe_field_nonzero,
+    resolve_callback_capture_enabled,
+    resolve_reconcile_interval_ms,
     resolve_walk_interval_ms,
     resolve_watermark_max_lag_ms,
     ts_watermark_advanced,
     watermark_lag_should_fire,
     watermark_lag_stalled,
 )
+import groww_sidecar  # noqa: E402  (module handle for capture-path tests)
 
 TS0 = 1_783_069_200_183  # the live incident's frozen 09:00:00.183 IST print
 PRICE0 = 26965.05
@@ -398,6 +413,374 @@ class RawTickProbeTests(unittest.TestCase):
         self.assertIn("nonzero_oi=0/1", beats[0])
         # Immediately after firing -> silent again until the next interval.
         self.assertFalse(self.probe.maybe_heartbeat(t0 + RAW_PROBE_HEARTBEAT_SECS + 1))
+
+
+class CaptureResolverTests(unittest.TestCase):
+    """GROWW_CALLBACK_CAPTURE kill-switch + GROWW_RECONCILE_INTERVAL_MS clamp."""
+
+    def test_capture_enabled_by_default(self) -> None:
+        self.assertTrue(resolve_callback_capture_enabled(None))
+        self.assertTrue(resolve_callback_capture_enabled(""))
+        self.assertTrue(resolve_callback_capture_enabled("on"))
+        self.assertTrue(resolve_callback_capture_enabled("garbage"))
+
+    def test_kill_switch_values_case_insensitive(self) -> None:
+        for raw in ("off", "OFF", " Off ", "0", "false", "FALSE", "no", "No"):
+            self.assertFalse(resolve_callback_capture_enabled(raw), raw)
+
+    def test_reconcile_interval_default_and_clamp(self) -> None:
+        self.assertEqual(
+            resolve_reconcile_interval_ms(None), RECONCILE_INTERVAL_MS_DEFAULT
+        )
+        self.assertEqual(
+            resolve_reconcile_interval_ms("garbage"), RECONCILE_INTERVAL_MS_DEFAULT
+        )
+        self.assertEqual(resolve_reconcile_interval_ms("1"), RECONCILE_INTERVAL_MS_MIN)
+        self.assertEqual(
+            resolve_reconcile_interval_ms("9999999"), RECONCILE_INTERVAL_MS_MAX
+        )
+        self.assertEqual(resolve_reconcile_interval_ms("7000"), 7000)
+
+
+class CaptureHookTests(unittest.TestCase):
+    """The enqueue-only NATS-callback wrapper: non-blocking, bounded, always
+    delegates (design study §Q1 c2; starvation guard for the #1344 class)."""
+
+    def test_hook_delegates_and_enqueues_with_capture_ns(self) -> None:
+        delegated = []
+        q = queue.Queue(maxsize=8)
+        enq, drop = [0], [0]
+        hook = make_capture_hook(lambda s, d: delegated.append((s, d)), q, enq, drop)
+        before = time.time_ns()
+        hook("/ld/eq/nse/price.2885", b"\x01\x02")
+        after = time.time_ns()
+        self.assertEqual(delegated, [("/ld/eq/nse/price.2885", b"\x01\x02")])
+        self.assertEqual((enq[0], drop[0]), (1, 0))
+        subject, payload, capture_ns = q.get_nowait()
+        self.assertEqual(subject, "/ld/eq/nse/price.2885")
+        self.assertEqual(payload, b"\x01\x02")
+        self.assertTrue(before <= capture_ns <= after, "capture_ns stamped in-hook")
+
+    def test_hook_full_queue_drops_to_counter_never_blocks(self) -> None:
+        q = queue.Queue(maxsize=2)
+        enq, drop = [0], [0]
+        delegated = [0]
+
+        def orig(_s, _d):
+            delegated[0] += 1
+
+        hook = make_capture_hook(orig, q, enq, drop)
+        start = time.monotonic()
+        for i in range(10_000):
+            hook(f"subj{i}", b"p")  # 9,998 hit a FULL queue
+        elapsed = time.monotonic() - start
+        self.assertEqual(enq[0], 2)
+        self.assertEqual(drop[0], 9_998, "overflow drops to the counter")
+        self.assertEqual(delegated[0], 10_000, "delegation NEVER skipped")
+        self.assertEqual(q.qsize(), 2, "queue stays bounded")
+        # Non-blocking proof: 10K full-queue calls complete in well under a
+        # second (a blocking put would hang forever with no consumer).
+        self.assertLess(elapsed, 1.0, f"hook must never block (took {elapsed:.3f}s)")
+
+    def test_queue_bound_constant_is_sane(self) -> None:
+        # ≈25 min of buffer at the measured ~42 msgs/sec steady rate.
+        self.assertEqual(CAPTURE_QUEUE_MAX, 65536)
+
+    def test_install_returns_false_without_sdk_internals(self) -> None:
+        class NoNatsFeed:  # future-wheel shape: no _nats_client at all
+            pass
+
+        class NoCallbackFeed:
+            class _NC:
+                callback = None  # not callable
+
+            _nats_client = _NC()
+
+        self.assertFalse(install_callback_capture(NoNatsFeed(), queue.Queue()))
+        self.assertFalse(install_callback_capture(NoCallbackFeed(), queue.Queue()))
+
+    def test_install_wraps_callback_and_preserves_delegation(self) -> None:
+        seen = []
+
+        class NC:
+            def callback(self, subject, data):  # bound method — callable
+                seen.append((subject, data))
+
+        class Feed:
+            _nats_client = NC()
+
+        feed = Feed()
+        # Bind the ORIGINAL bound method the way the SDK does (instance attr).
+        feed._nats_client.callback = feed._nats_client.callback
+        q = queue.Queue(maxsize=4)
+        self.assertTrue(install_callback_capture(feed, q))
+        feed._nats_client.callback("/ld/indices/nse/price.NIFTY", b"raw")
+        self.assertEqual(seen, [("/ld/indices/nse/price.NIFTY", b"raw")])
+        self.assertEqual(q.qsize(), 1)
+
+    def test_topic_map_build_degrades_to_none_without_sdk(self) -> None:
+        # The stubbed growwapi has no .groww.constants — the builder must
+        # return None (walker-only fallback), never raise (c1-fallback rule).
+        result = build_capture_topic_map(
+            [{"exchange": "NSE", "segment": "CASH", "exchange_token": "2885"}],
+            [],
+            {("NSE", "CASH", "2885"): 2885},
+        )
+        self.assertIsNone(result)
+
+
+class _FakeTopic:
+    def __init__(self, topic, meta):
+        self._topic = topic
+        self._meta = meta
+
+    def get_topic(self):
+        return self._topic
+
+    def get_meta(self):
+        return self._meta
+
+
+class _FakeFeedConstants:
+    """Mirrors growwapi==1.5.0 FeedConstants topic-builder surface (verified
+    against the wheel source: subjects /ld/{eq,fo}/{nse,bse}/price.<token> and
+    /ld/indices/{nse,bse}/price.<token>; index meta segment is ALWAYS CASH)."""
+
+    EXCHANGE = "exchange"
+    SEGMENT = "segment"
+    FEED_KEY = "feed_key"
+    FEED_TYPE = "feed_type"
+    LIVE_DATA = "ltp"
+    LIVE_INDEX = "index_value"
+
+    @staticmethod
+    def get_live_price_topic(segment, exchange, token):
+        seg_path = "eq" if segment == "CASH" else "fo"
+        return _FakeTopic(
+            f"/ld/{seg_path}/{exchange.lower()}/price.{token}",
+            {
+                "exchange": exchange,
+                "segment": segment,
+                "feed_key": token,
+                "feed_type": "ltp",
+            },
+        )
+
+    @staticmethod
+    def get_live_index_topic(segment, exchange, token):
+        return _FakeTopic(
+            f"/ld/indices/{exchange.lower()}/price.{token}",
+            {
+                "exchange": exchange,
+                # The REAL SDK stamps index meta segment as CASH regardless of
+                # the subscribe entry's segment — the map must follow the META.
+                "segment": "CASH",
+                "feed_key": token,
+                "feed_type": "index_value",
+            },
+        )
+
+
+def _install_fake_sdk_constants():
+    """Register growwapi.groww.constants with the fake FeedConstants so the
+    topic-map builder + decode-path tests exercise the real code paths."""
+    groww_pkg = types.ModuleType("growwapi.groww")
+    constants_mod = types.ModuleType("growwapi.groww.constants")
+    constants_mod.FeedConstants = _FakeFeedConstants
+    sys.modules["growwapi.groww"] = groww_pkg
+    sys.modules["growwapi.groww.constants"] = constants_mod
+
+
+class CaptureTopicMapTests(unittest.TestCase):
+    def setUp(self) -> None:
+        _install_fake_sdk_constants()
+
+    def tearDown(self) -> None:
+        sys.modules.pop("growwapi.groww.constants", None)
+        sys.modules.pop("growwapi.groww", None)
+
+    def test_topic_map_stock_and_index_entries(self) -> None:
+        sid_map = {
+            ("NSE", "CASH", "2885"): 2885,
+            ("NSE", "CASH", "NIFTY"): 4611686018427387913,
+        }
+        topic_map = build_capture_topic_map(
+            [{"exchange": "NSE", "segment": "CASH", "exchange_token": "2885"}],
+            [{"exchange": "NSE", "segment": "CASH", "exchange_token": "NIFTY"}],
+            sid_map,
+        )
+        self.assertEqual(
+            topic_map["/ld/eq/nse/price.2885"],
+            ("ltp", "NSE", "CASH", "2885", 2885, "NSE_EQ"),
+        )
+        self.assertEqual(
+            topic_map["/ld/indices/nse/price.NIFTY"],
+            ("idx", "NSE", "CASH", "NIFTY", 4611686018427387913, "IDX_I"),
+        )
+
+    def test_stock_falls_back_to_numeric_token_and_index_never_does(self) -> None:
+        topic_map = build_capture_topic_map(
+            [{"exchange": "NSE", "segment": "FNO", "exchange_token": "49081"}],
+            [{"exchange": "NSE", "segment": "CASH", "exchange_token": "BANKNIFTY"}],
+            {},  # empty sid_map
+        )
+        kind, _ex, _seg, _tok, sid, canonical = topic_map["/ld/fo/nse/price.49081"]
+        self.assertEqual((kind, sid, canonical), ("ltp", 49081, "NSE_FNO"))
+        _k, _e, _s, _t, idx_sid, _c = topic_map["/ld/indices/nse/price.BANKNIFTY"]
+        self.assertEqual(idx_sid, 0, "index token name must NEVER coerce to an id")
+
+
+class CaptureEmitTests(unittest.TestCase):
+    """End-to-end writer-thread emit: capture_ns lands on the NDJSON row; the
+    walker's reconcile sweep dedups against hook emissions (shared cache)."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.NamedTemporaryFile(  # noqa: SIM115 - handle kept
+            mode="a", suffix=".ndjson", delete=False
+        )
+        # Snapshot + isolate the module state the emit paths mutate.
+        self._saved_last_emitted = dict(groww_sidecar._LAST_EMITTED)
+        groww_sidecar._LAST_EMITTED.clear()
+        self._saved_topic_map = groww_sidecar._CAPTURE_TOPIC_MAP[0]
+        self._saved_decode = groww_sidecar._decode_captured_payload
+        self._saved_write_status = groww_sidecar.write_status
+        groww_sidecar.write_status = lambda *a, **k: None  # no status file I/O
+        self._saved_deduped = groww_sidecar.DEDUPED_TOTAL
+
+    def tearDown(self) -> None:
+        groww_sidecar._LAST_EMITTED.clear()
+        groww_sidecar._LAST_EMITTED.update(self._saved_last_emitted)
+        groww_sidecar._CAPTURE_TOPIC_MAP[0] = self._saved_topic_map
+        groww_sidecar._decode_captured_payload = self._saved_decode
+        groww_sidecar.write_status = self._saved_write_status
+        self._tmp.close()
+        os.unlink(self._tmp.name)
+
+    def _lines(self):
+        self._tmp.flush()
+        with open(self._tmp.name) as fh:
+            return [json.loads(l) for l in fh.read().splitlines() if l]
+
+    def test_capture_emit_writes_capture_ns_row(self) -> None:
+        groww_sidecar._CAPTURE_TOPIC_MAP[0] = {
+            "/ld/eq/nse/price.2885": ("ltp", "NSE", "CASH", "2885", 2885, "NSE_EQ"),
+        }
+        groww_sidecar._decode_captured_payload = lambda kind, payload: {
+            "tsInMillis": TS0,
+            "ltp": 2847.55,
+            "volume": 0.0,
+        }
+        wrote = groww_sidecar._capture_emit_one(
+            self._tmp, "/ld/eq/nse/price.2885", b"raw", 1_751_500_000_123_456_789
+        )
+        self.assertEqual(wrote, 1)
+        rows = self._lines()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["security_id"], 2885)
+        self.assertEqual(rows[0]["segment"], "NSE_EQ")
+        self.assertEqual(rows[0]["exchange_ts_millis"], TS0)
+        self.assertEqual(rows[0]["ltp"], 2847.55)
+        self.assertEqual(rows[0]["capture_ns"], 1_751_500_000_123_456_789)
+
+    def test_walker_reconcile_dedups_against_hook_emission(self) -> None:
+        # 1. Hook path emits (ts, price) for stock 2885.
+        groww_sidecar._CAPTURE_TOPIC_MAP[0] = {
+            "/ld/eq/nse/price.2885": ("ltp", "NSE", "CASH", "2885", 2885, "NSE_EQ"),
+        }
+        groww_sidecar._decode_captured_payload = lambda kind, payload: {
+            "tsInMillis": TS0,
+            "ltp": 2847.55,
+        }
+        self.assertEqual(
+            groww_sidecar._capture_emit_one(
+                self._tmp, "/ld/eq/nse/price.2885", b"raw", 123
+            ),
+            1,
+        )
+        deduped_before = groww_sidecar.DEDUPED_TOTAL
+        # 2. The reconcile sweep re-walks the SAME snapshot entry — the shared
+        #    dedup cache must swallow it (no duplicate row).
+        groww_sidecar.emit_ltp_records(
+            self._tmp,
+            {"NSE": {"CASH": {"2885": {"tsInMillis": TS0, "ltp": 2847.55}}}},
+            {("NSE", "CASH", "2885"): 2885},
+            reconcile=True,
+        )
+        self.assertEqual(len(self._lines()), 1, "reconcile must not double-emit")
+        self.assertEqual(groww_sidecar.DEDUPED_TOTAL, deduped_before + 1)
+        # 3. A GENUINELY new print (fresh ts) still emits from the sweep and
+        #    counts as a hook-missed reconcile emission.
+        reconcile_before = groww_sidecar.RECONCILE_EMITTED_TOTAL
+        groww_sidecar.emit_ltp_records(
+            self._tmp,
+            {"NSE": {"CASH": {"2885": {"tsInMillis": TS0 + 1000, "ltp": 2848.0}}}},
+            {("NSE", "CASH", "2885"): 2885},
+            reconcile=True,
+        )
+        self.assertEqual(len(self._lines()), 2)
+        self.assertEqual(groww_sidecar.RECONCILE_EMITTED_TOTAL, reconcile_before + 1)
+        # The reconcile row is snapshot-sourced: NO capture_ns (Rust bridge
+        # falls back to its per-wake receipt stamp — old-format compatible).
+        self.assertNotIn("capture_ns", self._lines()[1])
+
+    def test_hook_then_reconcile_then_hook_roundtrip_dedup(self) -> None:
+        # Reverse order: walker emits first, hook re-delivery of the SAME
+        # (ts, price) is swallowed by the shared cache.
+        groww_sidecar.emit_ltp_records(
+            self._tmp,
+            {"NSE": {"CASH": {"2885": {"tsInMillis": TS0, "ltp": 100.0}}}},
+            {("NSE", "CASH", "2885"): 2885},
+            reconcile=False,
+        )
+        groww_sidecar._CAPTURE_TOPIC_MAP[0] = {
+            "/ld/eq/nse/price.2885": ("ltp", "NSE", "CASH", "2885", 2885, "NSE_EQ"),
+        }
+        groww_sidecar._decode_captured_payload = lambda kind, payload: {
+            "tsInMillis": TS0,
+            "ltp": 100.0,
+        }
+        self.assertEqual(
+            groww_sidecar._capture_emit_one(
+                self._tmp, "/ld/eq/nse/price.2885", b"raw", 123
+            ),
+            0,
+            "hook re-delivery of a walker-emitted (ts, price) must dedup",
+        )
+        self.assertEqual(len(self._lines()), 1)
+
+    def test_subject_miss_and_decode_error_drop_not_raise(self) -> None:
+        groww_sidecar._CAPTURE_TOPIC_MAP[0] = {}
+        self.assertEqual(
+            groww_sidecar._capture_emit_one(self._tmp, "/unknown", b"raw", 1), 0
+        )
+        groww_sidecar._CAPTURE_TOPIC_MAP[0] = {
+            "/ld/eq/nse/price.1": ("ltp", "NSE", "CASH", "1", 1, "NSE_EQ"),
+        }
+
+        def boom(kind, payload):
+            raise ValueError("bad proto")
+
+        groww_sidecar._decode_captured_payload = boom
+        self.assertEqual(
+            groww_sidecar._capture_emit_one(self._tmp, "/ld/eq/nse/price.1", b"x", 1),
+            0,
+        )
+        self.assertEqual(len(self._lines()), 0)
+        self.assertGreaterEqual(
+            groww_sidecar.DROP_REASONS.get("capture_subject_miss", 0), 1
+        )
+        self.assertGreaterEqual(
+            groww_sidecar.DROP_REASONS.get("capture_decode_error", 0), 1
+        )
+
+    def test_write_record_omits_capture_ns_when_absent(self) -> None:
+        groww_sidecar._write_record(self._tmp, 13, "IDX_I", TS0, 26965.05)
+        groww_sidecar._write_record(
+            self._tmp, 13, "IDX_I", TS0 + 1, 26966.0, capture_ns=42, sync=False
+        )
+        rows = self._lines()
+        self.assertNotIn("capture_ns", rows[0], "legacy schema unchanged")
+        self.assertEqual(rows[1]["capture_ns"], 42)
 
 
 if __name__ == "__main__":
