@@ -486,8 +486,15 @@ pub(crate) fn wake_read_budget(buffered_bytes: usize, len: u64, offset: u64) -> 
 }
 
 /// Builds the shared `ticks` (feed='groww') row for a parsed tick. `capture_seq`
-/// is the monotonic, replay-stable dedup tiebreaker (TICK-SEQ-01). Pure + testable.
-fn live_tick_row(parsed: &ParsedGrowwTick, capture_seq: i64) -> GrowwLiveTickRow {
+/// is the monotonic, replay-stable dedup tiebreaker (TICK-SEQ-01).
+/// `received_at_ist_nanos` is the per-WAKE receipt stamp from [`row_received_at`]
+/// (fix #3, 2026-07-03 lag forensics) — a stored column only, NOT part of the
+/// DEDUP key, so replay idempotency is untouched. Pure + testable.
+fn live_tick_row(
+    parsed: &ParsedGrowwTick,
+    capture_seq: i64,
+    received_at_ist_nanos: Option<i64>,
+) -> GrowwLiveTickRow {
     GrowwLiveTickRow {
         ts_ist_nanos: parsed.tick.ts_ist_nanos,
         security_id: parsed.tick.security_id,
@@ -496,7 +503,17 @@ fn live_tick_row(parsed: &ParsedGrowwTick, capture_seq: i64) -> GrowwLiveTickRow
         volume: parsed.tick.cum_volume,
         exchange_ts_millis: parsed.exchange_ts_millis,
         capture_seq,
+        received_at_ist_nanos,
     }
+}
+
+/// Pure receipt-stamp gate (fix #3, 2026-07-03 lag forensics): the `received_at`
+/// value persisted on every `feed='groww'` row — `Some(receipt)` only when the
+/// per-wake clock read is plausible (mirrors `validate_groww_tick`'s fail-open
+/// guard), so a broken clock writes NULL, never a ~1970 stamp. One clock read
+/// per wake (O(1) preserved — no per-line syscall added).
+fn row_received_at(receipt_ist_nanos: i64) -> Option<i64> {
+    (receipt_ist_nanos > GROWW_MIN_PLAUSIBLE_RECEIPT_IST_NANOS).then_some(receipt_ist_nanos)
 }
 
 /// Monotonic, replay-stable `capture_seq` source (TICK-SEQ-01): `max(prev+1,
@@ -920,6 +937,10 @@ impl GrowwBridgeState {
         // PR-4: one clock read per WAKE (not per line — O(1) preserved) for
         // the relative future-timestamp clamp in validate_groww_tick.
         let wake_receipt_ist_nanos = receipt_ist_nanos();
+        // Fix #3 (2026-07-03 lag forensics): the receipt stamp persisted on
+        // every row this wake — plausibility-gated so a broken clock writes
+        // NULL. Makes per-feed lag (received_at − ts) measurable in SQL.
+        let wake_received_at = row_received_at(wake_receipt_ist_nanos);
         for line_bytes in prefix.split(|&b| b == b'\n') {
             if line_bytes.is_empty() {
                 continue;
@@ -958,7 +979,10 @@ impl GrowwBridgeState {
             parsed_any = true;
             wake_max_exchange_ts_nanos = wake_max_exchange_ts_nanos.max(parsed.tick.ts_ist_nanos);
             let seq = next_capture_seq(&self.capture_seq, parsed.tick.ts_ist_nanos);
-            if let Err(err) = self.live_writer.append_row(&live_tick_row(&parsed, seq)) {
+            if let Err(err) =
+                self.live_writer
+                    .append_row(&live_tick_row(&parsed, seq, wake_received_at))
+            {
                 error!(
                     ?err,
                     "groww bridge: shared ticks (feed=groww) append failed"
@@ -1919,7 +1943,8 @@ mod tests {
     #[test]
     fn test_live_tick_row_maps_all_fields() {
         let p = parse_groww_tick_line(LINE).expect("parse");
-        let row = live_tick_row(&p, 42);
+        let receipt = Some(1_780_000_020_500_000_000);
+        let row = live_tick_row(&p, 42, receipt);
         assert_eq!(row.security_id, 1333);
         assert_eq!(row.segment, "NSE_EQ");
         assert_eq!(row.ltp, 2847.55);
@@ -1927,6 +1952,28 @@ mod tests {
         assert_eq!(row.exchange_ts_millis, 1_780_000_020_123);
         assert_eq!(row.capture_seq, 42);
         assert_eq!(row.ts_ist_nanos, 1_780_000_020_123_000_000);
+        // Fix #3 (2026-07-03 lag forensics): the per-wake receipt stamp is
+        // carried onto the row so received_at is no longer NULL for groww.
+        assert_eq!(row.received_at_ist_nanos, receipt);
+    }
+
+    #[test]
+    fn test_live_tick_row_received_at_gated_by_plausibility() {
+        // A broken clock (receipt saturates to ~1970 = IST offset) must yield
+        // None → the shared builder OMITS the column → NULL, never a garbage
+        // 1970 received_at stamp.
+        assert_eq!(row_received_at(0), None);
+        assert_eq!(
+            row_received_at(tickvault_common::constants::IST_UTC_OFFSET_NANOS),
+            None
+        );
+        assert_eq!(
+            row_received_at(GROWW_MIN_PLAUSIBLE_RECEIPT_IST_NANOS),
+            None,
+            "boundary is exclusive — exactly the floor is still implausible"
+        );
+        let plausible = GROWW_MIN_PLAUSIBLE_RECEIPT_IST_NANOS + 1;
+        assert_eq!(row_received_at(plausible), Some(plausible));
     }
 
     #[test]
