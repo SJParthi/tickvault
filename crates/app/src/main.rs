@@ -6968,16 +6968,20 @@ async fn start_dhan_lane(
                     // documented meaning ("last tick > 60s old — silent
                     // socket likely", wave-3-c) is FEED-level liveness,
                     // but the old wiring fed it the WORST per-SID gap
-                    // (`scan_gaps_top_n(now, 1)`) with no exclusions —
+                    // (the top-1 worst-gap scan) with no exclusions —
                     // ~33 always-silent illiquid SIDs made SELFTEST-02
                     // page Critical at 09:16:30 IST on pure illiquidity
                     // (same false-alarm class as the fixed #1342 SLO
                     // tick_freshness). Feed it the FRESHEST tick age
                     // instead: seconds since ANY subscribed SID last
-                    // ticked. Fail-safe: `None` (detector missing, or
-                    // map empty = no tick and no boot seed ever seen)
-                    // maps to `u64::MAX` so an in-market self-test with
-                    // zero tick evidence FAILS instead of false-passing.
+                    // ticked. Round-2 (review MEDIUM-2): the age is
+                    // REAL-tick-only — NT-15 boot seeds cannot arm it,
+                    // so a lane (re)start < 60s before 09:16:30 cannot
+                    // false-PASS with zero real ticks. Fail-safe:
+                    // `None` (detector missing, or no REAL tick ever
+                    // recorded — seeds don't count) maps to `u64::MAX`
+                    // so an in-market self-test with zero tick evidence
+                    // FAILS instead of false-passing.
                     let feed_freshest_age_secs =
                         tickvault_core::pipeline::tick_gap_detector::global_tick_gap_detector()
                             .and_then(|d| d.freshest_tick_age_secs(std::time::Instant::now()))
@@ -7343,19 +7347,19 @@ async fn start_dhan_lane(
                         // global OnceLock so a runtime stop→re-start reports the new
                         // manager's headroom, not the dead boot-time manager's.
                         let token_secs = gauge_token_headroom_secs(&slo_feed_runtime);
-                        // B3 (2026-07-03): this loop is the ONE production
-                        // writer of the shared health-state token block.
-                        // Before this wiring `token_remaining_secs` /
-                        // `token_valid` had ZERO production writers, so the
-                        // 09:14 IST READY Telegram, the 15:31:30 IST EOD
-                        // digest and `GET /health` all rendered a ghost
-                        // "Token headroom: 0.0h" / "invalid" forever.
-                        // `token_secs == 0` means no token / expired (per
-                        // `seconds_until_expiry`), so `> 0` is the honest
-                        // validity signal. Two lock-free atomic stores every
-                        // 10s on a cold-path task — not the tick hot path.
-                        slo_health.set_token_remaining_secs(token_secs);
-                        slo_health.set_token_valid(token_secs > 0);
+                        // B3 round-2 (2026-07-03, review HIGH): the shared
+                        // health-state token block (remaining-secs +
+                        // validity setters) is NO LONGER written here.
+                        // Round 1 put the stores in this loop, but this loop
+                        // is gated on `config.features.realtime_guarantee_score`
+                        // — flipping that UNRELATED feature flag off would
+                        // silently re-ghost the 09:14 IST READY Telegram, the
+                        // 15:31:30 IST EOD digest and `GET /health`, AND pin
+                        // `overall_status()` "degraded" (state.rs degrades on
+                        // `!token_valid`). The dedicated UNCONDITIONAL
+                        // `spawn_token_health_writer` lane task is the ONE
+                        // production writer now; `token_secs` here feeds ONLY
+                        // the Token_freshness SLO dimension.
                         let token_freshness = if token_secs > SLO_TOKEN_HEADROOM_THRESHOLD_SECS {
                             1.0
                         } else {
@@ -7749,6 +7753,22 @@ async fn start_dhan_lane(
     info!("token renewal task started");
 
     // -----------------------------------------------------------------------
+    // Step 12′: B3 round-2 — dedicated token-health writer (UNCONDITIONAL,
+    // NOT behind `realtime_guarantee_score` or any other feature flag). Its
+    // JoinHandle is registered in `DhanLaneRunHandles` below so a runtime
+    // Dhan disable aborts it instead of leaving an orphan writer reporting
+    // the dead boot manager's `token_valid=true` for up to 24h.
+    // -----------------------------------------------------------------------
+    let token_health_handle = spawn_token_health_writer(
+        std::sync::Arc::clone(&health_status),
+        std::sync::Arc::clone(&feed_runtime),
+    );
+    info!(
+        interval_secs = TOKEN_HEALTH_WRITER_INTERVAL_SECS,
+        "token-health writer started (unconditional; lane-owned)"
+    );
+
+    // -----------------------------------------------------------------------
     // Step 12a: Spawn mid-session profile watchdog (queue item I7)
     // -----------------------------------------------------------------------
     // Every 15 minutes during market hours, re-runs `pre_market_check`
@@ -8078,6 +8098,10 @@ async fn start_dhan_lane(
         renewal_handle: Some(renewal_handle),
         order_update_handle: Some(order_update_handle),
         trading_handle,
+        // B3 round-2 (MEDIUM-1): lane-owned so teardown aborts it + resets
+        // the shared token block to the honest lane-off state.
+        token_health_handle: Some(token_health_handle),
+        health: Some(std::sync::Arc::clone(&health_status)),
         ws_pool_arc,
         shutdown_notify,
         // H7: `Some` only for a runtime lane — the parked task watches this for
@@ -8104,6 +8128,18 @@ struct DhanLaneRunHandles {
     renewal_handle: Option<tokio::task::JoinHandle<()>>,
     order_update_handle: Option<tokio::task::JoinHandle<()>>,
     trading_handle: Option<tokio::task::JoinHandle<()>>,
+    /// B3 round-2 (MEDIUM-1): the dedicated unconditional token-health writer
+    /// (`spawn_token_health_writer`). Lane-owned so a runtime Dhan disable
+    /// aborts it — an unregistered `tokio::spawn` would survive the lane
+    /// teardown, fall back to the global boot manager after
+    /// `clear_live_token_manager`, and keep writing `token_valid=true` for up
+    /// to 24h while Dhan is deliberately OFF. `None` on the FAST
+    /// crash-recovery boot arm, which never spawns the writer.
+    token_health_handle: Option<tokio::task::JoinHandle<()>>,
+    /// Shared health registry — held so teardown/Drop can reset the token
+    /// block to the honest deliberate-lane-off state (0 / false). `None`
+    /// only on the FAST crash-recovery boot arm (no writer to reset for).
+    health: Option<SharedHealthStatus>,
     // S4-T1b: shared pool handle + shutdown notifier. `ws_pool_arc` is None
     // when no WebSocket pool was spawned. `shutdown_notify` is fired before
     // the abort loop so the pool watchdog stops polling (no false-positive
@@ -8148,6 +8184,17 @@ impl Drop for DhanLaneRunHandles {
         if let Some(handle) = self.trading_handle.as_ref() {
             handle.abort();
         }
+        if let Some(handle) = self.token_health_handle.as_ref() {
+            handle.abort();
+        }
+        // B3 round-2 honesty reset: deliberate lane-off → token block reads
+        // 0/false, same as the pre-wiring (pre-B3) perpetual state, so no
+        // NEW alarm class is introduced. Sync atomic stores — Drop-safe.
+        // Idempotent after `teardown_dhan_lane_tasks` already reset it.
+        if let Some(health) = self.health.as_ref() {
+            health.set_token_remaining_secs(0);
+            health.set_token_valid(false);
+        }
     }
 }
 
@@ -8184,6 +8231,22 @@ async fn teardown_dhan_lane_tasks(mut lane: DhanLaneRunHandles) {
     // at their point of use, so `lane`'s Drop guards them until then. The fields
     // consumed BEFORE any `.await` are taken out immediately (already aborted on
     // a later drop — no leak). `Arc` fields are cheaply cloned.
+
+    // 0. B3 round-2 (MEDIUM-1): stop the lane-owned token-health writer and
+    //    reset the shared token block (no `.await` yet — safe to take now).
+    //    Deliberate lane-off → the token block reads 0/false — the same as
+    //    the pre-wiring (pre-B3) perpetual state, so no NEW alarm class is
+    //    introduced. Without this the orphan writer would fall back to the
+    //    global boot manager (after `clear_live_token_manager`) and keep
+    //    reporting `token_valid=true` for up to 24h while Dhan is
+    //    deliberately OFF.
+    if let Some(handle) = lane.token_health_handle.take() {
+        handle.abort();
+    }
+    if let Some(health) = lane.health.as_ref() {
+        health.set_token_remaining_secs(0);
+        health.set_token_valid(false);
+    }
 
     // 1. Stop token renewal (no `.await` before this — safe to take + abort now).
     if let Some(handle) = lane.renewal_handle.take() {
@@ -8470,6 +8533,50 @@ fn gauge_token_headroom_secs(
     tickvault_core::auth::token_manager::global_token_manager()
         .map(|tm| tm.seconds_until_expiry())
         .unwrap_or(0)
+}
+
+/// Cadence (seconds) of the dedicated token-health writer task. Matches the
+/// SLO scheduler's 10s sampling cadence so the `/health` / READY / EOD token
+/// block stays within the same ≤10s staleness envelope the B3 plan documents.
+const TOKEN_HEALTH_WRITER_INTERVAL_SECS: u64 = 10;
+
+/// B3 round-2 (adversarial review HIGH + MEDIUM-1, 2026-07-03): dedicated,
+/// UNCONDITIONAL writer of the shared health-state token block
+/// (`token_remaining_secs` + `token_valid`).
+///
+/// Round 1 placed the two stores inside the SLO score loop, which is gated on
+/// `config.features.realtime_guarantee_score` — flipping that UNRELATED flag
+/// off would silently re-ghost the 09:14 IST READY Telegram, the 15:31:30 IST
+/// EOD digest and `GET /health`, AND pin `overall_status()` "degraded"
+/// (`state.rs` degrades on `!token_valid`). This task is spawned in
+/// `start_dhan_lane` OUTSIDE any feature gate, and its `JoinHandle` is
+/// registered in `DhanLaneRunHandles` so `teardown_dhan_lane_tasks` aborts it
+/// on a runtime Dhan disable (MEDIUM-1: a bare `tokio::spawn` would survive
+/// the lane teardown, fall back to the global boot manager after
+/// `clear_live_token_manager`, and keep writing `token_valid=true` for up to
+/// 24h while Dhan is deliberately OFF).
+///
+/// Two lock-free atomic stores every 10s on a cold-path task — not the tick
+/// hot path. `secs == 0` means no token / expired (per `seconds_until_expiry`),
+/// so `> 0` is the honest validity signal.
+// TEST-EXEMPT: infinite 10s interval loop over live token-manager state; the
+// wiring (both setter calls, unconditional spawn site, teardown abort+reset)
+// is pinned by crates/api/tests/token_headroom_wired_guard.rs.
+fn spawn_token_health_writer(
+    health: SharedHealthStatus,
+    feed_runtime: std::sync::Arc<tickvault_api::feed_state::FeedRuntimeState>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(
+            TOKEN_HEALTH_WRITER_INTERVAL_SECS,
+        ));
+        loop {
+            interval.tick().await;
+            let secs = gauge_token_headroom_secs(&feed_runtime);
+            health.set_token_remaining_secs(secs);
+            health.set_token_valid(secs > 0);
+        }
+    })
 }
 
 /// Stable static label for the lane state (no allocation on the metric path).
@@ -9335,6 +9442,11 @@ async fn run_shutdown_fast(
             renewal_handle,
             order_update_handle,
             trading_handle,
+            // B3 round-2: the FAST crash-recovery arm never spawns the
+            // token-health writer (pre-B3 it had no token-block writer at
+            // all), so there is nothing to abort or reset here.
+            token_health_handle: None,
+            health: None,
             ws_pool_arc,
             shutdown_notify,
             // H7: BOOT-ON (FAST-boot) handles are not parked — the watchdog
@@ -10623,6 +10735,8 @@ mod tests {
             renewal_handle: None,
             order_update_handle: None,
             trading_handle: None,
+            token_health_handle: None,
+            health: None,
             ws_pool_arc: None,
             shutdown_notify: std::sync::Arc::new(tokio::sync::Notify::new()),
             lane_halt_notify: None,
