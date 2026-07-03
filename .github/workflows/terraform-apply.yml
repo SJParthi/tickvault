@@ -97,6 +97,11 @@ env:
   # false). Creates the console API-GW + front/back Lambdas + the SG-to-SG
   # 9000 ingress on the next apply.
   TF_VAR_enable_questdb_console: "true"
+  # B9 deploy provenance: the git SHA of the repo tree this plan/apply runs
+  # from — surfaces as the operator-portal footer "portal <sha7>" and the
+  # terraform output portal_git_sha. Workflow-level env so BOTH the plan
+  # and apply jobs see the same value.
+  TF_VAR_portal_git_sha: ${{ github.sha }}
   AWS_REGION: ap-south-1
   TF_DIR: deploy/aws/terraform
 

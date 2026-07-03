@@ -89,6 +89,7 @@ fn no_panic_health_response_serialization() {
     let resp = HealthResponse {
         status: "healthy",
         version: "0.1.0",
+        git_sha: "unknown",
         subsystems: SubsystemStatus {
             websocket: SubsystemInfo {
                 status: "connected",

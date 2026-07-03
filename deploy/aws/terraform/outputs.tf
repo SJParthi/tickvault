@@ -44,3 +44,13 @@ output "dashboard_url" {
   description = "Direct URL to the CloudWatch operator dashboard (open in any browser)"
   value       = "https://${var.aws_region}.console.aws.amazon.com/cloudwatch/home?region=${var.aws_region}#dashboards/dashboard/${aws_cloudwatch_dashboard.operator.dashboard_name}"
 }
+
+output "portal_git_sha" {
+  description = "B9 deploy provenance: git SHA of the repo tree this terraform state was last applied from (CI-set; \"unknown\" for local applies)"
+  value       = var.portal_git_sha
+}
+
+output "binary_git_sha_ssm_param" {
+  description = "B9 deploy provenance: SSM param holding the git SHA of the last successfully deployed binary (written by deploy-aws.yml after a verified swap)"
+  value       = "/tickvault/${var.environment}/deploy/binary-git-sha"
+}
