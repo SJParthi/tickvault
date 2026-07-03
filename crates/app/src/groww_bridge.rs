@@ -691,7 +691,10 @@ pub(crate) struct GrowwBridgeState {
     /// `ticks` row and the candle fold for Groww's native exchange_token.
     seeded: std::collections::HashSet<(u64, u8)>,
     /// Monotonic, replay-stable dedup tiebreaker source (TICK-SEQ-01).
-    capture_seq: AtomicI64,
+    /// `Arc` so the auto-scale shard bridges (§34 PR-2) can draw from ONE
+    /// process-wide counter — globally unique + monotonic across shards.
+    /// The single-conn path owns a private instance (behavior-identical).
+    capture_seq: Arc<AtomicI64>,
     /// Byte read offset into the tick file (resumes across wakes).
     offset: u64,
     /// Partial-line byte residual: a bounded chunked read can split a multi-byte
@@ -730,12 +733,28 @@ impl GrowwBridgeState {
     /// the SAME aggregator the per-tick path folds into — parity with the Dhan
     /// IST-midnight force-seal (`crates/app/src/main.rs`). The per-tick fold path
     /// (`drain_new_data`) is UNCHANGED.
+    /// (Test-only convenience since §34 PR-2: production callers —
+    /// `run_groww_bridge` + the shard fleet — pass an explicit shared
+    /// counter via [`Self::with_aggregator_and_seq`].)
+    #[cfg(test)]
     pub(crate) fn with_aggregator(qdb: &QuestDbConfig, aggregator: MultiTfAggregator) -> Self {
+        Self::with_aggregator_and_seq(qdb, aggregator, Arc::new(AtomicI64::new(0)))
+    }
+
+    /// Build a bridge state around a CALLER-OWNED aggregator AND a
+    /// CALLER-OWNED capture-seq counter (§34 auto-scale PR-2): the shard
+    /// bridges all draw from ONE `Arc<AtomicI64>` so capture_seq stays
+    /// globally unique + monotonic across N connections' NDJSON files.
+    pub(crate) fn with_aggregator_and_seq(
+        qdb: &QuestDbConfig,
+        aggregator: MultiTfAggregator,
+        capture_seq: Arc<AtomicI64>,
+    ) -> Self {
         Self {
             live_writer: GrowwLiveTickWriter::new(qdb),
             aggregator,
             seeded: std::collections::HashSet::new(),
-            capture_seq: AtomicI64::new(0),
+            capture_seq,
             offset: 0,
             residual: Vec::new(),
             last_offset_persist: None,
@@ -1754,6 +1773,46 @@ pub fn spawn_supervised_groww_bridge(
         // bridge respawn so the forensic chain stays Connected → Disconnected →
         // Reconnected, never Connected → Connected.
         let audit_latches = Arc::new(GrowwAuditLatches::default());
+        // Single-conn path: a fresh private counter — behavior-identical to
+        // the pre-scale bridge (the shard path shares one across conns).
+        let capture_seq = Arc::new(AtomicI64::new(0));
+        supervise_groww_bridge_loop(
+            qdb,
+            tick_file_path,
+            status_file_path,
+            feed_runtime,
+            feed_health,
+            ws_audit_tx,
+            aggregator,
+            audit_latches,
+            capture_seq,
+            None,
+        )
+        .await;
+    })
+}
+
+/// One connection's supervised respawn loop (extracted from
+/// `spawn_supervised_groww_bridge` for §34 PR-2 shard reuse — the
+/// FEED-SUPERVISOR-01 / WS-GAP-05 pattern, byte-identical semantics).
+/// `conn_id = None` = the single-conn path; `Some(n)` = shard bridge `n`
+/// under the auto-scale fleet (log context only — same respawn policy).
+// TEST-EXEMPT: supervision loop (spawn/await/sleep); the pure backoff curve is unit-tested (test_bridge_respawn_backoff_curve) and the shared-seq + shard-path contracts have their own unit tests.
+// APPROVED: supervision wiring — every arg is a distinct owned resource
+#[allow(clippy::too_many_arguments)]
+async fn supervise_groww_bridge_loop(
+    qdb: QuestDbConfig,
+    tick_file_path: PathBuf,
+    status_file_path: PathBuf,
+    feed_runtime: Arc<FeedRuntimeState>,
+    feed_health: Arc<tickvault_common::feed_health::FeedHealthRegistry>,
+    ws_audit_tx: Option<tokio::sync::mpsc::Sender<WsEventAuditRow>>,
+    aggregator: MultiTfAggregator,
+    audit_latches: Arc<GrowwAuditLatches>,
+    capture_seq: Arc<AtomicI64>,
+    conn_id: Option<usize>,
+) {
+    {
         let mut consecutive_respawns: u32 = 0;
         loop {
             let started = std::time::Instant::now();
@@ -1766,6 +1825,7 @@ pub fn spawn_supervised_groww_bridge(
                 ws_audit_tx.clone(),
                 aggregator.clone(),
                 Arc::clone(&audit_latches),
+                Arc::clone(&capture_seq),
             ));
             let reason = match handle.await {
                 Err(err) if err.is_panic() => "panic",
@@ -1811,6 +1871,7 @@ pub fn spawn_supervised_groww_bridge(
                     tickvault_common::error_code::ErrorCode::FeedSupervisor01Respawned.code_str(),
                 reason,
                 consecutive_respawns,
+                conn_id = conn_id.map_or(-1i64, |c| c as i64),
                 backoff_secs = backoff.as_secs(),
                 "FEED-SUPERVISOR-01: groww bridge task died — respawning (the \
                  NDJSON re-tail is DEDUP-idempotent; in-memory bars survive on \
@@ -1823,6 +1884,105 @@ pub fn spawn_supervised_groww_bridge(
             )
             .increment(1);
             tokio::time::sleep(backoff).await;
+        }
+    }
+}
+
+/// One shard's derived file paths under the auto-scale layout (§34 PR-2):
+/// `data/groww/shards/c<NN>/` holds that connection's watch file, NDJSON
+/// tick capture, and PROOF status file. Pure — path math only.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GrowwShardFiles {
+    /// Zero-based connection id (matches the cutter's `GrowwShard::conn_id`).
+    pub conn_id: usize,
+    /// The per-conn watch DIRECTORY the Rust side writes the shard watch
+    /// file into and the sidecar polls (`GROWW_WATCH_DIR`).
+    pub watch_dir: PathBuf,
+    /// Per-conn capture-at-receipt NDJSON (`GROWW_TICK_FILE`).
+    pub tick_file: PathBuf,
+    /// Per-conn connect+subscribe PROOF status file (`GROWW_STATUS_FILE`).
+    pub status_file: PathBuf,
+}
+
+/// Root under which per-conn shard directories live.
+pub const GROWW_SHARDS_DIR_DEFAULT: &str = "data/groww/shards";
+
+/// Pure path derivation for shard `conn_id` (zero-padded 2-digit directory:
+/// `c00` … `c99` — the config hard max is 100 conns, so 2 digits always
+/// sort correctly in `ls`).
+#[must_use]
+pub fn shard_files(shards_root: &Path, conn_id: usize) -> GrowwShardFiles {
+    let dir = shards_root.join(format!("c{conn_id:02}"));
+    GrowwShardFiles {
+        conn_id,
+        watch_dir: dir.clone(),
+        tick_file: dir.join("live-ticks.ndjson"),
+        status_file: dir.join("groww-status.json"),
+    }
+}
+
+/// §34 PR-2 Item 7: ONE process-lifetime aggregator + midnight force-seal +
+/// catch-up seal + ONE shared capture-seq counter, then one supervised
+/// bridge tail-loop PER SHARD FILE — all folding into the SAME papaya map
+/// and the SAME `ticks`/`candles_*` write chain the single-conn path uses.
+///
+/// Bridges are spawned for EVERY conn id up to `max_conns` upfront: a bridge
+/// tailing a not-yet-created shard file idles at zero cost (the tail loop
+/// already handles a missing file), so bridge lifecycle never has to track
+/// the ladder — only the sidecar PROCESSES scale up/down.
+// TEST-EXEMPT: composition-only spawn wiring; the pieces it composes (supervise_groww_bridge_loop via the single-conn wrapper, shard_files, next_capture_seq sharing) are unit-tested, and per_feed_boot_isolation_guard pins the single-conn path.
+pub fn spawn_supervised_groww_shard_bridges(
+    qdb: QuestDbConfig,
+    shards_root: PathBuf,
+    max_conns: usize,
+    feed_runtime: Arc<FeedRuntimeState>,
+    feed_health: Arc<tickvault_common::feed_health::FeedHealthRegistry>,
+    ws_audit_tx: Option<tokio::sync::mpsc::Sender<WsEventAuditRow>>,
+    trading_calendar: Arc<tickvault_common::trading_calendar::TradingCalendar>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        // Process-lifetime shared state — created ONCE for the whole fleet
+        // (mirrors the single-conn wrapper): one aggregator, one midnight
+        // force-seal, one catch-up seal, one capture-seq counter.
+        let aggregator = MultiTfAggregator::with_capacity(GROWW_AGGREGATOR_CAPACITY);
+        spawn_groww_ist_midnight_force_seal(
+            aggregator.clone(),
+            Arc::clone(&feed_runtime),
+            Arc::clone(&trading_calendar),
+        );
+        spawn_groww_catchup_seal(
+            aggregator.clone(),
+            Arc::clone(&feed_runtime),
+            trading_calendar,
+        );
+        let capture_seq = Arc::new(AtomicI64::new(0));
+        let mut handles = Vec::with_capacity(max_conns);
+        for conn_id in 0..max_conns {
+            let files = shard_files(&shards_root, conn_id);
+            // Per-conn audit latches: each connection carries its own
+            // Connected/Disconnected/Reconnected forensic chain (the
+            // ws_event_audit rows stay per-connection honest).
+            let audit_latches = Arc::new(GrowwAuditLatches::default());
+            handles.push(tokio::spawn(supervise_groww_bridge_loop(
+                qdb.clone(),
+                files.tick_file,
+                files.status_file,
+                Arc::clone(&feed_runtime),
+                Arc::clone(&feed_health),
+                ws_audit_tx.clone(),
+                aggregator.clone(),
+                audit_latches,
+                Arc::clone(&capture_seq),
+                Some(conn_id),
+            )));
+        }
+        info!(
+            max_conns,
+            root = %shards_root.display(),
+            "[feeds] groww shard bridges spawned (idle until their shard files appear)"
+        );
+        for h in handles {
+            let _join = h.await;
         }
     })
 }
@@ -1870,6 +2030,11 @@ pub async fn run_groww_bridge(
     // supervisor wrapper) — survive a bridge respawn so the forensic
     // Connected/Disconnected/Reconnected chain stays consistent (finding M3).
     audit_latches: Arc<GrowwAuditLatches>,
+    // Process-lifetime capture-seq counter (§34 auto-scale PR-2): the shard
+    // bridges all share ONE counter so capture_seq stays globally unique +
+    // monotonic across N connections. The single-conn wrapper passes a
+    // fresh private counter — behavior-identical to the pre-scale path.
+    capture_seq: Arc<AtomicI64>,
 ) {
     info!(
         path = %tick_file_path.display(),
@@ -1882,7 +2047,7 @@ pub async fn run_groww_bridge(
     // so a supervised RESPAWN of this task reuses the same shared papaya map
     // (in-memory bars survive a bridge panic) and never leaks a duplicate
     // force-seal task. Parity with the Dhan IST-midnight force-seal (`main.rs`).
-    let mut state = GrowwBridgeState::with_aggregator(&qdb, aggregator);
+    let mut state = GrowwBridgeState::with_aggregator_and_seq(&qdb, aggregator, capture_seq);
     // PR-3 (2026-07-02): resume from the persisted flushed-offset when it
     // provably belongs to the current capture file — otherwise byte-0 re-tail
     // (DEDUP-idempotent, the pre-PR-3 behavior).
@@ -2468,6 +2633,72 @@ mod tests {
         assert_eq!(b, 1_001);
         assert_eq!(d, 5_000);
         assert!(b > a && d > b, "strictly monotonic");
+    }
+
+    /// §34 PR-2 Item 7 ratchet: two shard bridges drawing from the SAME
+    /// shared counter never emit the same capture_seq and stay globally
+    /// monotonic — the cross-shard uniqueness half of the `ticks` DEDUP key
+    /// (shard disjointness is the other half).
+    #[test]
+    fn test_with_aggregator_and_seq_shares_the_caller_counter() {
+        // §34 PR-2: every shard bridge draws from ONE caller-owned counter —
+        // the constructor must store the SAME Arc, never a private clone of
+        // the value.
+        let shared = Arc::new(AtomicI64::new(41));
+        let state = GrowwBridgeState::with_aggregator_and_seq(
+            &QuestDbConfig {
+                host: "127.0.0.1".to_string(),
+                http_port: 9000,
+                pg_port: 8812,
+                ilp_port: 9009,
+            },
+            MultiTfAggregator::with_capacity(GROWW_AGGREGATOR_CAPACITY),
+            Arc::clone(&shared),
+        );
+        assert!(Arc::ptr_eq(&state.capture_seq, &shared));
+        // A draw through the state's counter is visible to the shared handle.
+        let _ = next_capture_seq(&state.capture_seq, 1_000);
+        assert!(shared.load(std::sync::atomic::Ordering::Relaxed) > 41);
+    }
+
+    #[test]
+    fn test_shared_capture_seq_monotonic_across_shards() {
+        let shared = Arc::new(AtomicI64::new(0));
+        // Shard 0 and shard 1 interleave draws at the same wall instant.
+        let s0 = Arc::clone(&shared);
+        let s1 = Arc::clone(&shared);
+        let mut seen = Vec::new();
+        for _ in 0..4 {
+            seen.push(next_capture_seq(&s0, 1_000));
+            seen.push(next_capture_seq(&s1, 1_000));
+        }
+        let mut sorted = seen.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), seen.len(), "no duplicate seq across shards");
+        assert!(
+            seen.windows(2).all(|w| w[1] > w[0]),
+            "globally monotonic across interleaved shard draws: {seen:?}"
+        );
+    }
+
+    /// §34 PR-2 shard layout: pure path derivation, zero-padded 2-digit
+    /// per-conn directories under the shards root.
+    #[test]
+    fn test_shard_files_layout_and_padding() {
+        let root = Path::new("data/groww/shards");
+        let f0 = shard_files(root, 0);
+        assert_eq!(f0.conn_id, 0);
+        assert_eq!(f0.watch_dir, root.join("c00"));
+        assert_eq!(f0.tick_file, root.join("c00").join("live-ticks.ndjson"));
+        assert_eq!(f0.status_file, root.join("c00").join("groww-status.json"));
+        let f7 = shard_files(root, 7);
+        assert_eq!(f7.watch_dir, root.join("c07"));
+        let f42 = shard_files(root, 42);
+        assert_eq!(f42.watch_dir, root.join("c42"));
+        // Distinct conns never share a file (disjoint capture chains).
+        assert_ne!(f0.tick_file, f7.tick_file);
+        assert_eq!(GROWW_SHARDS_DIR_DEFAULT, "data/groww/shards");
     }
 
     #[test]

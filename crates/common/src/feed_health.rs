@@ -416,6 +416,13 @@ impl FeedHealthRegistry {
         self.mark_instrumented(i);
     }
 
+    /// Read `feed`'s auth-rejected state (§34 auto-scale advance gate: any
+    /// fleet-wide credential rejection blocks laddering up). O(1) load.
+    #[must_use]
+    pub fn is_auth_rejected(&self, feed: Feed) -> bool {
+        self.auth_rejected[feed.index()].load(Ordering::Relaxed)
+    }
+
     /// Clear `feed`'s auth-rejected flag on a NON-TICK recovery edge — a
     /// confirmed re-auth / streaming signal (e.g. the Groww sidecar's
     /// `groww auth OK` / NDJSON-append line) that proves the alert is over even
@@ -926,18 +933,20 @@ mod tests {
     }
 
     #[test]
-    fn test_registry_set_auth_rejected_round_trip_and_clear() {
+    fn test_registry_is_auth_rejected_round_trip_and_clear() {
         let reg = FeedHealthRegistry::new();
         reg.set_connected(Feed::Groww, true);
         reg.record_tick(Feed::Groww, T0);
         // Provider rejected the credential → actionable Down even with a fresh tick.
         reg.set_auth_rejected(Feed::Groww, true);
+        assert!(reg.is_auth_rejected(Feed::Groww));
         let r = reg.snapshot(Feed::Groww, true, true, true, T0 + 1_000_000_000);
         assert!(r.input.auth_rejected);
         assert_eq!(r.verdict, FeedHealthVerdict::Down);
         assert_eq!(r.reason, "auth rejected — refresh the Groww SSM api-key");
         // Auth recovers → flag cleared → resolves back to a normal verdict.
         reg.set_auth_rejected(Feed::Groww, false);
+        assert!(!reg.is_auth_rejected(Feed::Groww));
         let r2 = reg.snapshot(Feed::Groww, true, true, true, T0 + 2 * 1_000_000_000);
         assert!(!r2.input.auth_rejected);
         assert_eq!(r2.verdict, FeedHealthVerdict::Ok);
@@ -992,7 +1001,10 @@ mod tests {
         // whole session.
         let reg = FeedHealthRegistry::new();
         reg.set_connected(Feed::Groww, true);
+        assert!(!reg.is_auth_rejected(Feed::Groww));
         reg.set_auth_rejected(Feed::Groww, true);
+        // §34 getter mirrors the stored flag (the ladder's advance gate).
+        assert!(reg.is_auth_rejected(Feed::Groww));
         let down = reg.snapshot(Feed::Groww, true, true, true, T0);
         assert!(down.input.auth_rejected);
         assert_eq!(down.verdict, FeedHealthVerdict::Down);
