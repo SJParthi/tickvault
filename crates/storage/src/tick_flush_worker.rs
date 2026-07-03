@@ -513,7 +513,7 @@ mod tests {
     }
 
     #[test]
-    fn test_offload_pool_preallocates_spares() {
+    fn test_spawn_flush_offload_pool_preallocates_spares() {
         let offload = spawn_flush_offload("tcp::addr=127.0.0.1:1;").expect("spawn"); // APPROVED: test
         let mut drained = 0;
         while offload.recycle_rx.try_recv().is_ok() {
@@ -584,7 +584,7 @@ mod tests {
     }
 
     #[test]
-    fn test_shutdown_drains_queued_jobs_before_join() {
+    fn test_shutdown_and_join_drains_queued_jobs() {
         let Some(port) = spawn_tcp_drain() else {
             return; // sandbox forbids loopback sockets — skip honestly
         };
@@ -608,6 +608,34 @@ mod tests {
             failed_rx.try_recv().is_err(),
             "queued job must be flushed (not failed) during shutdown drain"
         );
+    }
+
+    #[test]
+    fn test_try_dispatch_no_spare_returns_nospare_and_leaves_batch_intact() {
+        let offload = spawn_flush_offload("tcp::addr=127.0.0.1:1;").expect("spawn"); // APPROVED: test
+        // Exhaust the pool.
+        while offload.recycle_rx.try_recv().is_ok() {}
+        let mut buffer = Buffer::new(ProtocolVersion::V1);
+        crate::tick_persistence_testing::build_tick_row_seq_pub(&mut buffer, &sample_tick(13), 3)
+            .expect("row build"); // APPROVED: test
+        let rows_before = buffer.row_count();
+        let mut in_flight = vec![(sample_tick(13), 3_i64)];
+        let outcome = offload.try_dispatch(&mut buffer, &mut in_flight);
+        assert!(
+            matches!(outcome, DispatchOutcome::NoSpare),
+            "an exhausted pool must return NoSpare (inline-fallback signal)"
+        );
+        assert_eq!(
+            buffer.row_count(),
+            rows_before,
+            "NoSpare must leave the caller's full buffer untouched"
+        );
+        assert_eq!(
+            in_flight.len(),
+            1,
+            "NoSpare must leave the caller's in-flight mirror untouched"
+        );
+        drop(offload.shutdown_and_join(Duration::from_secs(2)));
     }
 
     #[test]

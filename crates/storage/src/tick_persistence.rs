@@ -2443,9 +2443,13 @@ mod tests {
     #[test]
     fn test_append_hot_path_dispatches_offload_not_inline_flush() {
         let source = include_str!("tick_persistence.rs");
+        // NOTE: signatures deliberately omit the `pub` prefix so the
+        // pub-fn-test-guard's literal scan does not count these strings as
+        // fn declarations. `find` hits the real definitions (they precede
+        // this test module in the file).
         for fn_sig in [
-            "pub fn append_tick_with_seq(",
-            "pub fn append_tick_enriched_with_seq(",
+            "fn append_tick_with_seq(",
+            "fn append_tick_enriched_with_seq(",
         ] {
             let fn_start = source
                 .find(fn_sig)
