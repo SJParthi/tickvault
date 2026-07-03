@@ -149,6 +149,22 @@ pub fn spawn_day_ohlc_tick_consumer(
                         metrics::counter!("tv_day_ohlc_session_gate_skipped_total").increment(1);
                         continue;
                     }
+                    // Session-open purity (operator directive 2026-07-03):
+                    // only ticks inside [09:15:00, 15:30:00) IST reach the
+                    // tracker — a pre-open (09:00–09:14) indicative tick or a
+                    // post-close snapshot can never arm day_open or move
+                    // high/low/close. Always-on SIDs (GIFT Nifty §30) are
+                    // EXEMPT, matching the candle aggregator. O(1) skip, no
+                    // per-tick log.
+                    if !day_ohlc_gate_allows(
+                        &always_on,
+                        tick.security_id,
+                        tick.exchange_segment_code,
+                        tick.exchange_timestamp,
+                    ) {
+                        metrics::counter!("tv_day_ohlc_session_gate_skipped_total").increment(1);
+                        continue;
+                    }
                     // Pure-function hot path: O(1) per tick, ≤50ns budget.
                     let _ = tracker.update_tick(
                         tick.security_id,
