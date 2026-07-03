@@ -29,9 +29,19 @@ jobs:
     name: "Enable Auto-Merge"
     runs-on: ubuntu-latest
     timeout-minutes: 5
-    # Only auto-merge for trusted actors, skip draft PRs
+    # Only auto-merge for trusted actors, skip draft PRs.
+    #
+    # SECURITY (mandatory gate): the PR must originate from a branch in THIS
+    # repository, not a fork. `github.head_ref` is the PR branch name, which is
+    # fully attacker-controlled on a fork PR — a stranger could fork this PUBLIC
+    # repo, push a branch named `claude/anything`, open a PR, and (if CI passed)
+    # have the bot arm auto-merge and self-merge into main. The
+    # `head.repo.full_name == github.repository` check makes same-repo origin the
+    # non-negotiable requirement; the actor / claude-branch clauses only further
+    # narrow WITHIN same-repo. Fork PRs must never self-arm auto-merge.
     if: >-
-      github.event.pull_request.draft != true && (
+      github.event.pull_request.draft != true &&
+      github.event.pull_request.head.repo.full_name == github.repository && (
       github.actor == 'dependabot[bot]' ||
       github.actor == 'renovate[bot]' ||
       github.actor == 'SJParthi' ||
