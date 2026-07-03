@@ -9489,6 +9489,19 @@ fn spawn_slo_publisher_task(
             // global OnceLock so a runtime stop→re-start reports the new
             // manager's headroom, not the dead boot-time manager's.
             let token_secs = gauge_token_headroom_secs(&slo_feed_runtime);
+            // B3 round-2 (2026-07-03, review HIGH): the shared
+            // health-state token block (remaining-secs +
+            // validity setters) is NO LONGER written here.
+            // Round 1 put the stores in this loop, but this loop
+            // is gated on `config.features.realtime_guarantee_score`
+            // — flipping that UNRELATED feature flag off would
+            // silently re-ghost the 09:14 IST READY Telegram, the
+            // 15:31:30 IST EOD digest and `GET /health`, AND pin
+            // `overall_status()` "degraded" (state.rs degrades on
+            // `!token_valid`). The dedicated UNCONDITIONAL
+            // `spawn_token_health_writer` lane task is the ONE
+            // production writer now; `token_secs` here feeds ONLY
+            // the Token_freshness SLO dimension.
             let token_freshness = if token_secs > SLO_TOKEN_HEADROOM_THRESHOLD_SECS {
                 1.0
             } else {
