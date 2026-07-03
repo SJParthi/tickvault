@@ -3,14 +3,17 @@
 //! The provenance chain (see `.claude/rules/project/deploy-provenance.md`):
 //!
 //! ```text
-//! GITHUB_SHA (CI) / git rev-parse HEAD (dev)
+//! TICKVAULT_BUILD_GIT_SHA (deploy CI) / git rev-parse HEAD (dev)
 //!     └─ crates/common/build.rs ─▶ env!("TICKVAULT_GIT_SHA")
 //!            ├─ GET /health  "git_sha" field   (crates/api handlers/health.rs)
 //!            └─ boot Telegram "Build: <short>" (crates/core notification/events.rs)
 //! ```
 //!
-//! Honest envelope: the SHA is EXACT for CI-built artifacts (`GITHUB_SHA`
-//! is authoritative in GitHub Actions). Local dev builds fall back to
+//! Honest envelope: the SHA is EXACT for deploy-CI-built artifacts (the
+//! deploy workflow's build steps set `TICKVAULT_BUILD_GIT_SHA` from
+//! `github.sha` — the only path that produces the prod binary; other
+//! workflows never set it so their caches stay valid). Local dev builds
+//! fall back to
 //! `git rev-parse HEAD` at build-script run time and may lag the working
 //! tree's HEAD until the build script re-runs; builds without git embed
 //! the literal `"unknown"`. The value is validated at build time as 40

@@ -145,6 +145,13 @@ jobs:
           # musl needs the right C compiler/linker for aws-lc-rs's cmake build
           CC_aarch64_unknown_linux_musl: musl-gcc
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+          # B9 deploy provenance: the DEPLOY build (and only the deploy build)
+          # sets the dedicated TICKVAULT_BUILD_GIT_SHA var so crates/common/
+          # build.rs embeds the EXACT sha. Other workflows never set it, so
+          # their restored target caches stay valid (2026-07-03 adversarial-
+          # review HIGH fix — a rerun-if-env-changed on GITHUB_SHA killed the
+          # Build & Verify cache on every commit).
+          TICKVAULT_BUILD_GIT_SHA: ${{ github.sha }}
         run: cargo build --release --target aarch64-unknown-linux-musl --bin tickvault -p tickvault-app
 
       - name: Build smoke_test binary (ARM64 musl static)
@@ -153,6 +160,9 @@ jobs:
         env:
           CC_aarch64_unknown_linux_musl: musl-gcc
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+          # Same provenance var as the main build — BOTH shipped binaries
+          # embed the exact deploy sha.
+          TICKVAULT_BUILD_GIT_SHA: ${{ github.sha }}
         run: cargo build --release --target aarch64-unknown-linux-musl --bin smoke_test -p tickvault-app
 
       - name: Verify binaries exist + tickvault under 30MB + statically linked
@@ -878,13 +888,25 @@ jobs:
         # oidc.tf (ssm:PutParameter on exactly this parameter ARN).
         if: success() && env.DEPLOY_SKIP_REASON == ''
         run: |
-          aws ssm put-parameter \
-            --region ${{ vars.AWS_REGION || 'ap-south-1' }} \
-            --name "/tickvault/prod/deploy/binary-git-sha" \
-            --type String \
-            --overwrite \
-            --value "${GITHUB_SHA}" \
-          || echo "::warning::WARN: provenance param write failed — /tickvault/prod/deploy/binary-git-sha NOT updated (deploy itself is verified healthy; portal footer + stale-binary alarm will show the previous/unknown sha until the next deploy)"
+          # LOCKSTEP NOTE: the SSM path below hardcodes the single real env
+          # (prod) while terraform reads /tickvault/${var.environment}/deploy/
+          # binary-git-sha (operator-control-lambda.tf + deploy-watchdog-
+          # lambda.tf) — the two MUST stay in lockstep; a future staging env
+          # would need this step parameterized on the target environment.
+          # 2026-07-03 hardening: validate the sha is 40 lowercase hex before
+          # recording it (mirrors the Rust is_full_lower_hex_sha guard) —
+          # still non-fatal overall.
+          if [[ "${GITHUB_SHA}" =~ ^[0-9a-f]{40}$ ]]; then
+            aws ssm put-parameter \
+              --region ${{ vars.AWS_REGION || 'ap-south-1' }} \
+              --name "/tickvault/prod/deploy/binary-git-sha" \
+              --type String \
+              --overwrite \
+              --value "${GITHUB_SHA}" \
+            || echo "::warning::WARN: provenance param write failed — /tickvault/prod/deploy/binary-git-sha NOT updated (deploy itself is verified healthy; portal footer + stale-binary alarm will show the previous/unknown sha until the next deploy)"
+          else
+            echo "::warning::refusing to record non-hex sha to /tickvault/prod/deploy/binary-git-sha (GITHUB_SHA failed the 40-lowercase-hex check; deploy itself is verified healthy)"
+          fi
 
       - name: Notify Telegram on success
         # ANTI-FALSE-OK: an intentional off-hours skip now exits the deploy job

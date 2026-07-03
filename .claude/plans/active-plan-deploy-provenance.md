@@ -20,7 +20,7 @@ The git commit SHA becomes a first-class provenance signal across four
 surfaces, chained end-to-end:
 
 ```
-GITHUB_SHA (CI) ──▶ crates/common/build.rs ──▶ env!("TICKVAULT_GIT_SHA")
+TICKVAULT_BUILD_GIT_SHA (deploy CI) ──▶ crates/common/build.rs ──▶ env!("TICKVAULT_GIT_SHA")
                                               │
                     ┌─────────────────────────┤
                     ▼                         ▼
@@ -40,10 +40,13 @@ terraform: var.portal_git_sha (set by CI TF_VAR) → Lambda env PORTAL_GIT_SHA
 ```
 
 1. **Binary embed** — new `crates/common/build.rs` resolves the SHA at
-   compile time: `GITHUB_SHA` env (CI, exact) → `git rev-parse HEAD`
-   (local dev) → `"unknown"` (fail-soft, never garbage; 40-lowercase-hex
-   validated). Exposed as `tickvault_common::build_info::BUILD_GIT_SHA`
-   const + `build_git_sha_short()` (7-char prefix, no panic path).
+   compile time: dedicated `TICKVAULT_BUILD_GIT_SHA` env (set ONLY by the
+   deploy workflow's build steps — exact for shipped artifacts, and other
+   workflows' target caches stay valid because they never set it) →
+   `git rev-parse HEAD` (local dev) → `"unknown"` (fail-soft, never
+   garbage; 40-lowercase-hex validated). Exposed as
+   `tickvault_common::build_info::BUILD_GIT_SHA` const +
+   `build_git_sha_short()` (7-char prefix, no panic path).
 2. **/health** — `HealthResponse` gains `git_sha: &'static str`.
 3. **Boot Telegram** — the `StartupComplete` `to_message()` arm appends a
    `Build: <short7>` line. Variant signature UNCHANGED (no callsite churn).
@@ -71,9 +74,12 @@ terraform: var.portal_git_sha (set by CI TF_VAR) → Lambda env PORTAL_GIT_SHA
 
 ## Edge Cases
 
-- **Local dev build without `GITHUB_SHA`**: build.rs shells `git rev-parse
-  HEAD`; stale until the build script re-runs (rerun-if-changed on
-  `.git/HEAD` + rerun-if-env-changed on `GITHUB_SHA` bound the staleness).
+- **Local dev build without `TICKVAULT_BUILD_GIT_SHA`**: build.rs shells
+  `git rev-parse HEAD`; stale until the build script re-runs
+  (rerun-if-changed on `.git/HEAD` AND on the resolved branch-ref file —
+  a plain commit only rewrites the ref file — plus rerun-if-env-changed on
+  `TICKVAULT_BUILD_GIT_SHA` bound the staleness; worktrees where `.git` is
+  a file remain a documented skip).
 - **No git / no .git dir (vendored source, docker builds)**: SHA =
   `"unknown"` — build never fails, value never garbage (40-hex validated).
 - **Short SHA slicing on `"unknown"`**: `get(..7)` falls back to the full
@@ -201,11 +207,35 @@ terraform: var.portal_git_sha (set by CI TF_VAR) → Lambda env PORTAL_GIT_SHA
   - Files: crates/common/tests/deploy_provenance_guard.rs, .claude/rules/project/deploy-provenance.md
   - Tests: rule_file_exists_and_documents_chain
 
+## 2026-07-03 adversarial-review fixes (post-impl 3-agent pass)
+
+All findings fixed on this branch (see `.claude/rules/project/deploy-provenance.md` §1.1 for the full table):
+
+- **HIGH** — CI cache-kill: `rerun-if-env-changed=GITHUB_SHA` invalidated
+  every workflow's restored target cache. Fixed via the dedicated
+  `TICKVAULT_BUILD_GIT_SHA` env var, set only by the deploy build steps
+  (both the shipped and smoke binaries); build.rs never reads/registers
+  GITHUB_SHA (negative ratchet in `deploy_provenance_guard.rs`).
+- **MEDIUM** — local-dev stale-sha rerun gap: a plain `git commit` doesn't
+  rewrite `.git/HEAD`; build.rs now also registers the resolved branch-ref
+  file for `rerun-if-changed`.
+- **MEDIUM** — portal footer XSS hardening: `_safe_provenance_sha`
+  (`re.fullmatch(r"[0-9a-f]{7,40}")` → else `unknown`) on all three SHAs +
+  `html.escape` of the assembled footer line (defense in depth); unittest
+  cases prove `<script` renders as `unknown`.
+- **MEDIUM** — hardcoded prod SSM path vs terraform `var.environment`:
+  lockstep comments added at the workflow step + both Lambda tf env blocks
+  + the rule-file staging caveat.
+- **LOW** — `_main_sha` unbounded stale cache: hard 600s max-age; a failed
+  refresh past 600s returns `unknown` (60s fresh TTL kept).
+- **LOW** — SSM provenance write now hex-validates `GITHUB_SHA`
+  (`^[0-9a-f]{40}$`) before put-parameter; non-hex → warning, non-fatal.
+
 ## Scenarios
 
 | # | Scenario | Expected |
 |---|----------|----------|
-| 1 | CI build with GITHUB_SHA set | binary embeds the exact 40-hex sha |
+| 1 | Deploy CI build with TICKVAULT_BUILD_GIT_SHA set | binary embeds the exact 40-hex sha |
 | 2 | Local dev build, git available | binary embeds `git rev-parse HEAD` |
 | 3 | Build without git/.git | binary embeds `unknown`; build succeeds |
 | 4 | Deploy verified → SSM write fails | deploy stays green; WARN visible |

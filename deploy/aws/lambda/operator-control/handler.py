@@ -1353,6 +1353,10 @@ _PROVENANCE_GH_REPO = os.environ.get("GH_REPO", "SJParthi/tickvault")
 _PROVENANCE_GH_TOKEN_PARAM = os.environ.get("OPERATOR_GITHUB_TOKEN_PARAM", "")
 
 _MAIN_SHA_TTL_SECS = 60.0
+# 2026-07-03 hardening (adversarial-review LOW): on sustained GitHub failure
+# the cached main-HEAD value must not be served forever — past this hard
+# max-age a failed refresh degrades to "unknown" instead of a stale sha.
+_MAIN_SHA_MAX_AGE_SECS = 600.0
 _main_sha_cache: dict = {"value": "", "ts": 0.0}
 
 
@@ -1374,7 +1378,9 @@ def _portal_sha() -> str:
 def _main_sha() -> str:
     """HEAD sha of main via the GitHub API (existing operator token), with a
     60s module-global cache so the page adds at most one 3s-bounded GitHub
-    round-trip per minute. Fail-soft to the cached value, else "unknown"."""
+    round-trip per minute. Fail-soft to the cached value while it is younger
+    than the 600s hard max-age, else "unknown" (never an unboundedly stale
+    sha)."""
     now = time.monotonic()
     if _main_sha_cache["value"] and (now - _main_sha_cache["ts"]) <= _MAIN_SHA_TTL_SECS:
         return _main_sha_cache["value"]
@@ -1398,16 +1404,42 @@ def _main_sha() -> str:
             return sha
     except Exception:  # noqa: BLE001 — provenance must never break the page
         pass
-    return _main_sha_cache["value"] or "unknown"
+    # Refresh failed: serve the cached value only while it is younger than
+    # the 600s hard max-age; a sustained GitHub outage degrades to "unknown"
+    # instead of an unboundedly stale sha (2026-07-03 adversarial-review LOW).
+    if _main_sha_cache["value"] and (now - _main_sha_cache["ts"]) <= _MAIN_SHA_MAX_AGE_SECS:
+        return _main_sha_cache["value"]
+    return "unknown"
+
+
+def _safe_provenance_sha(sha: object) -> str:
+    """Hex-validate one provenance sha (mirrors the Rust
+    is_full_lower_hex_sha guard, widened to 7-40 for short values): anything
+    that is not 7-40 lowercase-hex becomes "unknown", so a poisoned SSM
+    param / GitHub response can never smuggle markup into the footer
+    (2026-07-03 adversarial-review MEDIUM fix)."""
+    import re  # noqa: PLC0415
+
+    if isinstance(sha, str) and re.fullmatch(r"[0-9a-f]{7,40}", sha):
+        return sha
+    return "unknown"
 
 
 def _provenance_line(binary_sha: str, portal_sha: str, main_sha: str) -> str:
-    """Pure formatter (unit-tested): short-7 provenance triple."""
-    return f"binary {binary_sha[:7]} · portal {portal_sha[:7]} · main {main_sha[:7]}"
+    """Pure formatter (unit-tested): short-7 provenance triple. Every input
+    is hex-validated via _safe_provenance_sha before use."""
+    b = _safe_provenance_sha(binary_sha)
+    p = _safe_provenance_sha(portal_sha)
+    m = _safe_provenance_sha(main_sha)
+    return f"binary {b[:7]} · portal {p[:7]} · main {m[:7]}"
 
 
 def _provenance_footer_html() -> str:
-    line = _provenance_line(_binary_sha(), _portal_sha(), _main_sha())
+    # Defense in depth: the line is already hex-validated per sha, and the
+    # assembled string is ALSO html-escaped before splicing into the page.
+    import html as _html  # noqa: PLC0415
+
+    line = _html.escape(_provenance_line(_binary_sha(), _portal_sha(), _main_sha()))
     return (
         '<footer style="margin-top:26px;text-align:center;font-size:11px;'
         'color:var(--mut);opacity:.75">' + line + "</footer>"

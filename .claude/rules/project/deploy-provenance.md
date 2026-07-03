@@ -11,7 +11,7 @@
 ## §0. The chain (single diagram)
 
 ```
-GITHUB_SHA (CI, exact) / git rev-parse HEAD (dev) / "unknown" (no git)
+TICKVAULT_BUILD_GIT_SHA (deploy CI, exact) / git rev-parse HEAD (dev) / "unknown" (no git)
         └─▶ crates/common/build.rs ─▶ env!("TICKVAULT_GIT_SHA")
                 └─▶ build_info::BUILD_GIT_SHA (+ build_git_sha_short())
                         ├─▶ GET /health  "git_sha" field        (crates/api)
@@ -35,13 +35,21 @@ terraform outputs: portal_git_sha + binary_git_sha_ssm_param
 
 ## §1. Honest envelope
 
-- The SHA is **exact for CI-built artifacts** (`GITHUB_SHA` is authoritative
-  in GitHub Actions — the only path that produces the prod binary).
+- The SHA is **exact for deploy-CI-built artifacts**: the deploy workflow's
+  two build steps set the **dedicated `TICKVAULT_BUILD_GIT_SHA` env var**
+  from `github.sha` (the only path that produces the prod binary). The
+  build script deliberately does NOT read GitHub's own `GITHUB_SHA` — a
+  `rerun-if-env-changed` registration on it changes every commit in EVERY
+  workflow and invalidated the restored target cache (full workspace
+  rebuild per commit in Build & Verify). Only the deploy build sets the
+  dedicated var; other workflows keep their caches valid.
 - **Local dev builds** fall back to `git rev-parse HEAD` at build-script run
   time and may lag HEAD until the build script re-runs
-  (`rerun-if-changed=.git/HEAD` + `rerun-if-env-changed=GITHUB_SHA` bound
-  the staleness). Builds without git embed the literal `unknown` — never
-  garbage (40-lowercase-hex validated at build time).
+  (`rerun-if-changed` on `.git/HEAD` PLUS on the resolved branch-ref file —
+  a plain `git commit` rewrites only the branch ref, not HEAD — bound the
+  staleness; worktrees where `.git` is a file remain a documented skip).
+  Builds without git embed the literal `unknown` — never garbage
+  (40-lowercase-hex validated at build time).
 - The 24h alarm evaluates `Minimum ≥ 1` over one 86400s period at the
   watchdog's ~2-3 samples/weekday cadence — it **approximates** ">24h
   stale", it is not an exact wall-clock measurement. Missing data (box off,
@@ -57,6 +65,24 @@ terraform outputs: portal_git_sha + binary_git_sha_ssm_param
   code booted?".
 - No new ErrorCode: this feature adds no Rust `error!` emit site. No
   hot-path code is touched (boot/API/deploy-time only; zero per-tick cost).
+- **Staging caveat:** the deploy workflow writes the SSM param at the
+  HARDCODED `/tickvault/prod/deploy/binary-git-sha` path while terraform
+  reads `/tickvault/${var.environment}/deploy/binary-git-sha`
+  (operator-control-lambda.tf + deploy-watchdog-lambda.tf). Prod is the
+  single real environment, so the two match today — but they MUST stay in
+  lockstep, and a future staging environment would need the workflow's
+  put-parameter step parameterized on the target environment.
+
+## §1.1. 2026-07-03 adversarial-review fixes (post-impl 3-agent pass)
+
+| Sev | Finding | Fix |
+|---|---|---|
+| HIGH | `rerun-if-env-changed` on `GITHUB_SHA` invalidated every workflow's restored target cache (GITHUB_SHA changes per commit, set everywhere) — full workspace rebuild per commit | Dedicated `TICKVAULT_BUILD_GIT_SHA` env var, set ONLY by the deploy build steps in `deploy-aws.yml`; build.rs never reads/registers GITHUB_SHA (ratcheted) |
+| MEDIUM | `rerun-if-changed=.git/HEAD` misses a plain `git commit` (only the branch ref file changes) — local dev could embed a stale sha | build.rs also registers the resolved branch-ref file (`ref: ` prefix in HEAD) when it exists; worktrees stay a documented skip |
+| MEDIUM | Portal footer spliced un-sanitized SHAs into HTML (poisoned SSM param / GitHub response = markup injection) | `_safe_provenance_sha` (`re.fullmatch(r"[0-9a-f]{7,40}")` → else `unknown`) on all three SHAs + `html.escape` on the assembled line (defense in depth) |
+| MEDIUM | Workflow-vs-terraform SSM path (hardcoded prod vs `var.environment`) could silently diverge | Lockstep comments at all three sites + the staging caveat above |
+| LOW | `_main_sha` module cache served the last GitHub value indefinitely on sustained failure | Hard 600s max-age: stale-refresh past 600s returns `unknown` (60s fresh TTL kept) |
+| LOW | SSM provenance write recorded `GITHUB_SHA` unvalidated | `[[ "${GITHUB_SHA}" =~ ^[0-9a-f]{40}$ ]]` guard; non-hex → warning, still non-fatal |
 
 ## §2. What a PR that violates this looks like (REJECT)
 
@@ -72,6 +98,12 @@ terraform outputs: portal_git_sha + binary_git_sha_ssm_param
   with SSM + GitHub both down).
 - Embeds an UNVALIDATED sha (anything not 40-lowercase-hex must degrade to
   `unknown`).
+- Re-introduces a `rerun-if-env-changed` registration on `GITHUB_SHA` in
+  any build script (kills the CI target cache in every workflow), or drops
+  `TICKVAULT_BUILD_GIT_SHA` from the deploy build steps (a cached deploy
+  build could embed a stale sha).
+- Renders a provenance sha in the portal footer without the hex validation
+  + html-escape (markup injection surface).
 
 All of the above are pinned by the build-failing ratchet
 `crates/common/tests/deploy_provenance_guard.rs`.
