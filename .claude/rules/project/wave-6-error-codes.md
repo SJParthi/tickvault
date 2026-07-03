@@ -69,7 +69,11 @@ cross-bucket merge — it corrects the candle the tick always belonged to.
 Observability: `tv_aggregator_amended_ticks_total` + the heartbeat `amended`
 field. `AGGREGATOR-LATE-01` (`ErrorCode::AggregatorLate01...`) now fires ONLY
 for a tick that is **≥ 2 buckets late** OR has **no amendable sealed bucket**
-(e.g. just after the IST-midnight / 15:30 `force_seal` cleared it — the
+(e.g. just after a `force_seal` cleared it — the IST-midnight day-boundary
+task, or the **15:30:05 IST close-time force-seal** added 2026-07-03
+(`spawn_engine_b_aggregator` Task 3b, `force_seal_all_session_scoped` —
+skips always-on/GIFT-Nifty cells; earlier versions of this file referenced
+a "15:30 force_seal" that did NOT exist in code until then) — the
 cross-day-amend guard §4b) — only THEN is it `error!` + counter + discard.
 
 **Original trigger (pre-2026-06-05, retained for history):** at a minute
@@ -250,11 +254,14 @@ overflow-panics — it simply never seals.
 **Honest envelope:** (a) a feed whose watermark STALLS (dead feed,
 ILP-backpressure pause) gets NO catch-up seals — FEED-STALL-01 owns the
 dead-feed page; there is deliberately NO "assume dead then force-seal
-anyway" escape hatch. (b) If zero post-close ticks arrive after 15:29:59,
-the final session minute still waits for the IST-midnight force-seal
-(backstop unchanged) — and a day whose LAST tick lands inside
-[15:30:00, 15:30:00 + margin) also still waits for the midnight force-seal
-(the watermark never clears that bucket's end + margin). (c) Worst catch-up
+anyway" escape hatch. (b) Since 2026-07-03 the Dhan final session minute
+(the 15:29 M1 bar + every TF's last bucket) is sealed by the **15:30:05
+IST close-time force-seal** (main.rs Task 3b,
+`force_seal_all_session_scoped`, trading-day-gated, always-on cells
+excluded) — the IST-midnight force-seal remains the backstop for
+restarts-after-close, always-on instruments, and the Groww instance; a
+day whose LAST tick lands inside [15:30:00, 15:30:00 + margin) is also
+covered by the close-time seal. (c) Worst catch-up
 wave ≤ ~25K seals at the 1200-SID cap (1200 × 21 TFs), inside the 200K
 `SEAL_BUFFER_CAPACITY` ring envelope. (d) D1 never catch-up seals intraday
 (its bucket ends next-day 09:15, past any same-day watermark) — the
