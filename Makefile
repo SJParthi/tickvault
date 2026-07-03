@@ -247,10 +247,12 @@ audit: ## Security audit (cargo audit + cargo deny)
 	cargo deny check
 	@echo "  ✅ Security audit clean"
 
-coverage: ## Code coverage report (HTML, 99% threshold)
-	@echo "📊 Running coverage..."
-	cargo llvm-cov --workspace --fail-under-lines 99
-	cargo llvm-cov --workspace --html --output-dir target/llvm-cov
+coverage: ## Code coverage report (HTML + the same per-crate TOML floors as CI)
+	@echo "📊 Running coverage (per-crate floors from quality/crate-coverage-thresholds.toml)..."
+	@mkdir -p target/llvm-cov
+	cargo llvm-cov --workspace --no-fail-fast --json --output-path target/llvm-cov/coverage.json -- --skip dhat_
+	bash scripts/coverage-gate.sh target/llvm-cov/coverage.json
+	cargo llvm-cov report --html --output-dir target/llvm-cov
 	@echo "  📊 Report: target/llvm-cov/html/index.html"
 
 bench: ## Run benchmarks (Criterion)
