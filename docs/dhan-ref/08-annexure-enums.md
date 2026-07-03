@@ -3,6 +3,47 @@
 > **Source**: https://dhanhq.co/docs/v2/annexure/
 > **Extracted**: 2026-03-13
 > **Purpose**: Shared reference — load alongside any other Dhan API doc in Claude Code
+> **⚠ Read the "2026-07-03 Upstream Update" section below FIRST** — three enum tables in this
+> file drifted from the live annexure after the 2026-06-02 upstream snapshot. Original tables
+> are retained per repo convention (dated supersede sections, never silent rewrites).
+
+---
+
+## 2026-07-03 Upstream Update (post-2026-06-02 live-annexure drift)
+
+The repo's upstream snapshot `dhanhq-v2-upstream-2026-06-02/` still matched the tables below.
+The CURRENT live annexure (compared 2026-07-03) has three changes. Original tables in §1/§6/§7
+are RETAINED as annotated history; do NOT silently rewrite them.
+
+### (a) Exchange Segment — NSE_CURRENCY (3) and BSE_CURRENCY (7) REMOVED upstream
+
+The live annexure now lists only: `IDX_I=0`, `NSE_EQ=1`, `NSE_FNO=2`, `BSE_EQ=4`, `MCX_COMM=5`,
+`BSE_FNO=8`. NSE currency derivatives were discontinued, and Dhan dropped both currency segments
+from the docs. **Our runtime enums (`crates/common/src/types.rs` / `segment.rs`) RETAIN 3 and 7
+as defensive decode arms** — harmless (Dhan simply never emits them; no subscription path uses
+currency, which is explicitly EXCLUDED per the daily-universe lock §5), and consistent with the
+no-panic-on-unknown contract. The "NO enum 6" gap note in §1 remains true; there are now
+additional gaps at 3 and 7 upstream.
+
+### (b) Expiry Code — upstream renumbered to 1=Near, 2=Next, 3=Far — **UNVERIFIED-LIVE**
+
+The live annexure now reads `1`=Near, `2`=Next, `3`=Far (was `0`=Current/Near, `1`=Next,
+`2`=Far per §7 below and the 2026-06-02 snapshot). It is NOT determinable from docs alone
+whether this is a REAL API renumber or a Dhan docs error — the long-standing SDK note in §7
+(Python SDK accepts an undocumented `3`) hints the API may have tolerated a 4th value for a
+while, consistent with a genuine 1/2/3 renumber. **Runtime impact: NONE today** — `ExpiryCode`
+exists only as an unused type in `crates/common/src/instrument_types.rs` (zero send sites; the
+historical fetch chain, the only `expiryCode` consumer, was deleted 2026-05-26 and re-adding it
+is banned by `no-rest-except-live-feed-2026-06-27.md`). **Any future consumer MUST live-probe
+the API before trusting EITHER numbering** (send both conventions to `/v2/charts/historical`
+and compare responses). Do NOT change the §7 table or the Rust enum without that live probe.
+
+### (c) Instrument Types — now 8 upstream (FUTCUR / OPTCUR dropped)
+
+With the currency segments gone, the live annexure lists 8 instrument types (the §6 table's 10
+minus `FUTCUR` and `OPTCUR`). Our enum variants are KEPT for CSV back-compat — in crates they
+appear only in the F&O extractor's EXCLUSION filters and `types.rs`; if the master CSV stops
+carrying those rows the exclusion filter simply matches nothing. No code change.
 
 ---
 

@@ -1,0 +1,77 @@
+# DhanHQ API v2 — Rate Limits
+
+> **Source:** Official DhanHQ documentation (docs.dhanhq.co) — captured from DhanHQ's own "Export .md for LLMs" file, generated 2026-06-30.
+> **Pages covered in this file:**
+> - https://docs.dhanhq.co/api/v2/guides/rate-limits
+
+
+---
+
+## Rate Limits
+
+DhanHQ API rate limits and best practices
+
+DhanHQ enforces rate limits to ensure fair usage and platform stability.
+
+## Rate Limit Table
+
+| API Category | Per Second | Daily Limit |
+|--------------|------------|-------------|
+| **Order APIs** | 10 requests | 100,000 |
+| **Data APIs** | 5 requests | 7,000 |
+| **Market Quote** | 1 request | — |
+| **Option Chain** | 1 per 3 sec | — |
+
+## Market Quote Limits
+
+- Maximum **1,000 instruments** per request for LTP/OHLC/Quote endpoints
+- **1 request per second** across all market quote endpoints
+
+## Option Chain Limits
+
+- **1 request per 3 seconds** per underlying/expiry combination
+
+## Handling Rate Limits
+
+When you exceed the rate limit, the API returns:
+
+```json
+{
+  "status": "failure",
+  "errorType": "RATE_LIMIT_ERROR",
+  "errorCode": "RL001",
+  "errorMessage": "Too many requests. Please retry after 1 second."
+}
+```
+
+### Best Practices
+
+1. **Batch requests** — Use multi-instrument endpoints (e.g., LTP for multiple instruments in one call)
+2. **Cache data** — Cache market data locally and refresh at appropriate intervals
+3. **Exponential backoff** — When rate limited, wait and retry with increasing delays
+4. **Queue orders** — Don't fire all orders simultaneously; space them out
+
+### Python Example with Rate Limiting
+
+```python
+import time
+from dhanhq import DhanContext, dhanhq
+
+context = DhanContext("client_id", "access_token")
+dhan = dhanhq(context)
+
+# Get LTP for multiple instruments in a single call
+instruments = [
+    ("NSE_EQ", "1333"),
+    ("NSE_EQ", "11536"),
+    ("NSE_EQ", "2885"),
+]
+ltp = dhan.get_ltp(instruments)
+
+# Space out order placements
+orders = [...]  # your order list
+for order in orders:
+    response = dhan.place_order(**order)
+    print(response)
+    time.sleep(0.1)  # 100ms delay between orders
+```
