@@ -36,6 +36,15 @@ at the 09:15:00 IST boundary was replaced with auto-arm-on-first-tick:
 `DayOhlcTracker::update_tick` initialises all four OHLC fields on its
 first call after a daily reset.
 
+**2026-07-03 update (session-open purity, operator directive 2026-07-03):**
+the day-OHLC tick consumer (`crates/app/src/day_ohlc_orchestrator.rs::spawn_day_ohlc_tick_consumer`)
+is now session-gated to `[09:15:00, 15:30:00)` IST via `day_ohlc_session_accepts`
+(delegates to the canonical `g1_exchange_gate_accepts`) — pre-open indicative
+ticks (Dhan streams from 09:00 IST) and post-close snapshots can no longer arm
+`day_open` or advance high/low/close. "First observed live tick" above now
+means the first IN-SESSION tick; the 09:15:00 tick IS the day open. Skips are
+counted by `tv_day_ohlc_session_gate_skipped_total`.
+
 ---
 
 ## §1. INDEX-OHLC-02 — daily reset failed at IST midnight
