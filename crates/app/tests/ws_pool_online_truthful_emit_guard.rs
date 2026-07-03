@@ -35,6 +35,7 @@ fn pool_online_message_for_fully_connected_pool_says_live() {
         boot_path: BootPathLabel::Slow,
         boot_wall_clock_secs: 11.2,
         last_real_tick_age_secs: Some(3),
+        feeds: vec![],
     };
     let msg = event.to_message();
     assert!(
@@ -112,6 +113,7 @@ fn pool_online_severity_is_low_partial_is_high() {
         boot_path: BootPathLabel::Slow,
         boot_wall_clock_secs: 10.0,
         last_real_tick_age_secs: Some(1),
+        feeds: vec![],
     };
     let partial = NotificationEvent::WebSocketPoolPartialAfterDeadline {
         connected: 0,
@@ -187,6 +189,7 @@ fn pool_online_shows_real_tick_age_when_ticks_flowing() {
         boot_path: BootPathLabel::Slow,
         boot_wall_clock_secs: 0.9,
         last_real_tick_age_secs: Some(2),
+        feeds: vec![],
     };
     let msg = event.to_message();
     assert!(
@@ -206,6 +209,7 @@ fn pool_online_warns_when_no_real_ticks_only_pings() {
         boot_path: BootPathLabel::Slow,
         boot_wall_clock_secs: 0.9,
         last_real_tick_age_secs: None,
+        feeds: vec![],
     };
     let msg = event.to_message();
     assert!(
