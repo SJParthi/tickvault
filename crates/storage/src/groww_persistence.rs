@@ -125,6 +125,14 @@ pub struct GrowwLiveTickRow {
     pub exchange_ts_millis: i64,
     /// Monotonic, replay-stable dedup tiebreaker (TICK-SEQ-01).
     pub capture_seq: i64,
+    /// Wall-clock receipt time (IST nanos) stamped by the bridge at the wake
+    /// that parsed this row — `None` when the receipt clock read was
+    /// implausible (broken clock ⇒ NULL, never a ~1970 stamp). Stored column
+    /// ONLY, deliberately NOT in the `ticks` DEDUP key (`data-integrity.md`:
+    /// re-stamped on replay, so keying it would duplicate rows). Makes
+    /// per-feed pipeline lag (`received_at − ts`) measurable in SQL for
+    /// `feed='groww'` (2026-07-03 lag forensics fix #3 — previously NULL).
+    pub received_at_ist_nanos: Option<i64>,
 }
 
 /// Ensure the SHARED `ticks` table + its DEDUP keys exist — Groww writes here
@@ -261,7 +269,7 @@ impl GrowwLiveTickWriter {
             // column); the full ms lives in the designated `ts`.
             exchange_timestamp: Some(row.ts_ist_nanos / 1_000_000_000),
             // Groww supplies none of the OHLC / OI / qty / avg_price /
-            // payload_hash / received_at columns → NULL (not 0).
+            // payload_hash columns → NULL (not 0).
             open: None,
             high: None,
             low: None,
@@ -271,7 +279,11 @@ impl GrowwLiveTickWriter {
             last_trade_qty: None,
             total_buy_qty: None,
             total_sell_qty: None,
-            received_at_ist_nanos: None,
+            // Fix #3 (2026-07-03 lag forensics): the bridge's per-wake receipt
+            // stamp — `Some` only when the clock read was plausible, so per-feed
+            // pipeline lag is measurable in SQL; NULL-not-0 on `None` preserved
+            // by the shared builder.
+            received_at_ist_nanos: row.received_at_ist_nanos,
             payload_hash: None,
         };
         build_tick_row_for_feed(&mut self.buffer, &fields, Feed::Groww)
@@ -462,6 +474,7 @@ mod tests {
             volume: 1_234_567,
             exchange_ts_millis: 1_780_000_000_123,
             capture_seq: 42,
+            received_at_ist_nanos: Some(1_780_000_000_200_000_000),
         }
     }
 
@@ -507,6 +520,37 @@ mod tests {
             "ms-precise ts (nanos) on wire: {text}"
         );
         assert!(text.contains("capture_seq=42"), "capture_seq on wire");
+    }
+
+    #[test]
+    fn test_append_row_writes_received_at_when_stamped() {
+        // Fix #3 (2026-07-03 lag forensics): a plausible receipt stamp reaches
+        // the wire as the `received_at` TIMESTAMP column (ILP micros + `t`),
+        // so per-feed pipeline lag (received_at − ts) is measurable in SQL for
+        // feed='groww' (previously always NULL).
+        let mut w = GrowwLiveTickWriter::for_test();
+        w.append_row(&sample_row()).expect("append");
+        let text = String::from_utf8_lossy(w.buffer_bytes());
+        let micros = 1_780_000_000_200_000_000_i64 / 1_000;
+        assert!(
+            text.contains(&format!("received_at={micros}t")),
+            "received_at (ILP micros) on wire: {text}"
+        );
+    }
+
+    #[test]
+    fn test_append_row_omits_received_at_when_none() {
+        // NULL-not-0 contract preserved: a broken-clock wake (`None`) OMITS the
+        // column token entirely so QuestDB stores NULL — never a ~1970 stamp.
+        let mut w = GrowwLiveTickWriter::for_test();
+        let mut row = sample_row();
+        row.received_at_ist_nanos = None;
+        w.append_row(&row).expect("append");
+        let text = String::from_utf8_lossy(w.buffer_bytes());
+        assert!(
+            !text.contains("received_at="),
+            "received_at must be OMITTED (NULL) when unstamped: {text}"
+        );
     }
 
     #[test]
