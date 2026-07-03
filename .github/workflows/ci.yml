@@ -272,7 +272,8 @@ jobs:
 
   # -------------------------------------------------------------------------
   # Coverage & Perf — post-merge only. Runs cargo-llvm-cov and enforces
-  # the per-crate 100% thresholds in quality/crate-coverage-thresholds.toml.
+  # the ratcheted per-crate floors in quality/crate-coverage-thresholds.toml
+  # (floors only move up; 100% is the target, not the current floor).
   # -------------------------------------------------------------------------
   coverage-and-perf:
     name: "Coverage & Perf"

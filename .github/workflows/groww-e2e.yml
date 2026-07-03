@@ -1,0 +1,132 @@
+# =============================================================================
+# tickvault — Groww QuestDB E2E lane (B7 coverage-honesty)
+# =============================================================================
+# The 3 QuestDB-backed proofs in crates/app/tests/groww_live_pipeline_e2e.rs
+# self-skip when no QuestDB is reachable — so in the ordinary ci.yml test jobs
+# they silently skip = vacuous green. This lane brings up a REAL QuestDB,
+# runs the e2e with the require-QuestDB env switch set (an unreachable DB
+# panics instead of skipping), and then mechanically asserts the log carries
+# zero skip lines and at least 3 proof lines (audit-findings Rule 11:
+# no false-OK signals).
+#
+# WHY `docker run` instead of the compose file: deploy/docker/docker-compose.yml
+# pins the tv-questdb service to `platform: linux/arm64` (prod Graviton
+# parity), which exec-format-fails on ubuntu-latest (amd64). We run the SAME
+# pinned image version directly (no --platform flag → native amd64 layer of
+# the multi-arch tag). Version pin matches the compose file
+# (deploy/docker/docker-compose.yml tv-questdb image: questdb/questdb:9.3.5);
+# the compose file itself carries no sha256 digest (its earlier digest pinned
+# the amd64-only manifest and was deliberately dropped for multi-arch).
+#
+# Cadence: manual dispatch + Sunday 19:30 UTC (Mon 01:00 IST, off-market) +
+# push-to-main filtered to the files that feed this pipeline.
+# =============================================================================
+
+name: Groww QuestDB E2E
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Sunday 19:30 UTC = Monday 01:00 IST — off-market, offset from
+    # chaos-nightly (Sat 18:30 UTC) and full-test-nightly to avoid contention.
+    - cron: "30 19 * * 0"
+  push:
+    branches: [main]
+    paths:
+      - "crates/app/src/groww_bridge.rs"
+      - "crates/app/tests/groww_live_pipeline_e2e.rs"
+      - "crates/core/src/feed/**"
+      - "crates/storage/src/**"
+      - ".github/workflows/groww-e2e.yml"
+
+concurrency:
+  group: groww-e2e
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  groww-e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@67ef31d5b988238dd797d409d6f9574278e20537 # SHA-pinned (supply-chain hardening)
+        with:
+          toolchain: '1.95.0'
+
+      - name: Cache cargo
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: groww-e2e-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: groww-e2e-${{ runner.os }}-
+
+      # docker run (not compose) — see the header comment: the compose service
+      # pins platform linux/arm64 for prod Graviton parity and cannot run on
+      # amd64 runners. Same pinned version as the compose file.
+      - name: Bring up QuestDB (docker run, native amd64)
+        run: |
+          docker run -d --name tv-questdb-ci \
+            -p 127.0.0.1:9000:9000 -p 127.0.0.1:9009:9009 -p 127.0.0.1:8812:8812 \
+            questdb/questdb:9.3.5
+          echo "Waiting for QuestDB to be ready..."
+          # Readiness probe = the same SELECT 1 /exec probe the app's own
+          # wait_for_questdb_ready boot gate uses (BOOT-01/BOOT-02). QuestDB
+          # 9.3.5 serves NO /status on the :9000 HTTP server — that path 404s
+          # forever via StaticContentProcessor even when the DB is healthy
+          # (proven live in run 28649380025).
+          for i in {1..90}; do
+            if curl -fsS "http://127.0.0.1:9000/exec?query=SELECT%201" >/dev/null 2>&1; then
+              echo "QuestDB ready on attempt $i"
+              break
+            fi
+            sleep 2
+          done
+          curl -fsS "http://127.0.0.1:9000/exec?query=SELECT%201" || {
+            echo "::error::QuestDB failed to come up after 180s"
+            docker logs --tail=50 tv-questdb-ci || true
+            exit 1
+          }
+
+      - name: Run Groww e2e (require-QuestDB switch on — no vacuous pass allowed)
+        run: |
+          set -o pipefail
+          TV_REQUIRE_QDB=1 cargo test -p tickvault-app \
+            --features daily_universe_fetcher \
+            --test groww_live_pipeline_e2e \
+            -- --nocapture 2>&1 | tee groww-e2e.log
+
+      - name: Assert zero skip lines and >=3 proof lines (anti-false-OK)
+        run: |
+          if grep -q "^SKIP " groww-e2e.log; then
+            echo "::error::e2e skipped — vacuous pass forbidden (audit Rule 11)"
+            exit 1
+          fi
+          proved=$(grep -c "PROVED:" groww-e2e.log || true)
+          if [ "${proved:-0}" -lt 3 ]; then
+            echo "::error::expected >=3 proof lines, got ${proved:-0}"
+            exit 1
+          fi
+          echo "OK: ${proved} proof lines, zero skip lines"
+
+      - name: Tear down QuestDB
+        if: always()
+        run: docker rm -f tv-questdb-ci || true
+
+      - name: Upload e2e log
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: groww-e2e-log
+          path: groww-e2e.log
+          retention-days: 14

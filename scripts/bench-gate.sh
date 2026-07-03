@@ -8,7 +8,19 @@
 # Usage: bash scripts/bench-gate.sh [criterion-dir]
 #
 # Default criterion-dir: target/criterion
-# Exit 0 = all benchmarks within budget. Exit 1 = budget exceeded.
+#
+# Exit codes (consumed by .github/workflows/bench.yml baseline-ratchet logic):
+#   0 = clean — all benchmarks within budget, no confident regression
+#   1 = absolute-budget breach ONLY (per-element ns budget exceeded)
+#   2 = regression breach (>max_regression_pct, CI-lower-bound confident) —
+#       wins over 1 when both breach, so a regressed run can never be
+#       mistaken for a mere hardware-calibration misfit.
+#
+# Regression semantics: a benchmark FAILS the regression arm only when the
+# LOWER bound of Criterion's 95% confidence interval for the mean change
+# exceeds max_regression_pct — i.e. even the optimistic bound of the measured
+# change is a >5% slowdown. Point-estimate-only deltas (cross-runner noise,
+# statistically insignificant jitter) do NOT fail the gate.
 # =============================================================================
 
 set -euo pipefail
@@ -77,7 +89,8 @@ with open('$BUDGETS_FILE') as f:
             val = val.split('#')[0].strip()
             elements[key.strip()] = int(val)
 
-failed = False
+abs_failed = False   # absolute per-element ns budget breach -> exit 1
+reg_failed = False   # confident (CI lower bound) regression breach -> exit 2
 checked = 0
 
 # Walk criterion results
@@ -124,7 +137,7 @@ for root, dirs, files in os.walk(criterion_dir):
             unit = f' ({median_ns:.0f}ns / {n_elements})' if n_elements > 1 else ''
             if per_elem_ns > budget_ns:
                 print(f'  FAIL: {bench_name}: {per_elem_ns:.0f}ns{unit} (budget: {budget_ns:.0f}ns)')
-                failed = True
+                abs_failed = True
             else:
                 print(f'  PASS: {bench_name}: {per_elem_ns:.0f}ns{unit} (budget: {budget_ns:.0f}ns)')
         else:
@@ -139,20 +152,37 @@ for root, dirs, files in os.walk(criterion_dir):
         rel = os.path.relpath(root, criterion_dir)
         bench_name = rel.replace('/change', '').replace('/', '_').lower()
 
-        # Regression is stored as a fraction (0.05 = 5%)
-        mean_change = data.get('mean', {}).get('point_estimate', 0)
-        pct_change = mean_change * 100
-
-        if pct_change > max_regression:
-            print(f'  FAIL: {bench_name}: {pct_change:+.1f}% regression (max: {max_regression}%)')
-            failed = True
+        # Change values are fractions (0.05 = 5%). Criterion writes change/
+        # even for statistically insignificant noise, and heterogeneous CI
+        # runners produce 10-30% cross-machine point-estimate deltas — so the
+        # gate uses the 95% confidence-interval LOWER bound: fail only when
+        # even the optimistic bound of the measured change exceeds the budget
+        # (a statistically confident regression, not noise). Fall back to the
+        # point estimate only if the CI structure is absent (schema drift).
+        mean_data = data.get('mean', {})
+        point_pct = mean_data.get('point_estimate', 0) * 100
+        ci = mean_data.get('confidence_interval', {})
+        lower_bound = ci.get('lower_bound') if isinstance(ci, dict) else None
+        if lower_bound is not None:
+            lower_pct = lower_bound * 100
+            if lower_pct > max_regression:
+                print(f'  FAIL: {bench_name}: {point_pct:+.1f}% regression (CI lower bound {lower_pct:+.1f}% > {max_regression}%)')
+                reg_failed = True
+        else:
+            print(f'  NOTE: {bench_name}: change/estimates.json has no confidence_interval — falling back to point estimate')
+            if point_pct > max_regression:
+                print(f'  FAIL: {bench_name}: {point_pct:+.1f}% regression (point estimate, no CI available; max: {max_regression}%)')
+                reg_failed = True
 
 if checked == 0:
     print('  INFO: No benchmarks matched budget entries — gate passed (no violations).')
 
 print('')
-if failed:
-    print('  Benchmark budget gate FAILED.')
+if reg_failed:
+    print('  Benchmark budget gate FAILED (confident regression).')
+    sys.exit(2)
+elif abs_failed:
+    print('  Benchmark budget gate FAILED (absolute budget breach).')
     sys.exit(1)
 else:
     print('  All benchmarks within budget.')
