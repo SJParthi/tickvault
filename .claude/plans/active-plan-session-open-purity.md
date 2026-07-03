@@ -71,6 +71,7 @@ this file). The consumer only sees IDX_I broadcast ticks (~a few/sec × 4 SIDs).
 - **Multi-day epoch values:** `% SECONDS_PER_DAY` reduces any IST epoch second correctly (Dhan LTT is IST epoch seconds per `data-integrity.md`).
 - **Post-close snapshot ticks (e.g. 15:35, overnight):** rejected — day_close stays the last in-session LTP instead of drifting on stale post-close snapshots.
 - **exchange_timestamp = 0 (malformed):** secs_of_day 0 → rejected (fail-closed; previously it would have armed day_open).
+- **Always-on SIDs (GIFT Nifty, operator lock 2026-06-01 §30):** EXEMPT from the window via `day_ohlc_gate_allows` — GIFT is an IDX_I index (~21 h NSE-IX session), so its legitimate out-of-window ticks pass the gate instead of being skipped + inflating `tv_day_ohlc_session_gate_skipped_total`. Reuses the SAME boot-computed set the candle aggregator + tick processor use (`tickvault_common::always_on::current()` at the spawn site, passed explicitly for testability — mirrors `with_always_on`). A same-SID-different-segment tick is NOT exempt (I-P1-11 composite key).
 
 ## Failure Modes
 
@@ -127,6 +128,10 @@ behaviour exactly.
 - [x] Item 4 — Docs: dated 2026-07-03 update in index-day-ohlc-tracker-error-codes.md §0
   - Files: .claude/rules/project/index-day-ohlc-tracker-error-codes.md
   - Tests: (docs only)
+
+- [x] Item 5 — Review fix (MEDIUM): always-on (§30 GIFT Nifty) exemption in the day-OHLC gate via `day_ohlc_gate_allows`, reusing `tickvault_common::always_on::current()` at the spawn site (same source as the aggregator); + doc nit (Dhan-only LTT wording — Groww never reaches this consumer)
+  - Files: crates/app/src/day_ohlc_orchestrator.rs, crates/app/src/main.rs
+  - Tests: test_day_ohlc_gate_allows_exempts_always_on_sid_at_2000_ist, test_day_ohlc_session_accepts_is_the_gate_when_always_on_empty
 
 ## Scenarios
 

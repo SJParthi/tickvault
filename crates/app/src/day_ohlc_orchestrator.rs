@@ -25,8 +25,12 @@
 //! (`g1_exchange_gate_accepts`). Pre-open indicative ticks (Dhan streams
 //! from 09:00 IST) and post-close snapshot ticks can therefore NEVER arm
 //! `day_open` or advance high/low/close — the 09:15:00 tick IS the day open,
-//! matching the candle aggregator's session window exactly.
+//! matching the candle aggregator's session window exactly. Always-on SIDs
+//! (GIFT Nifty, operator lock 2026-06-01 §30) are EXEMPT from the window,
+//! mirroring the candle aggregator + tick processor — see
+//! [`day_ohlc_gate_allows`].
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -47,9 +51,10 @@ use tickvault_trading::in_mem::day_ohlc_tracker::{
 const NANOS_PER_SECOND: i64 = 1_000_000_000;
 
 /// Session-open purity gate (operator directive 2026-07-03): returns `true`
-/// iff a tick's `exchange_timestamp` (IST epoch SECONDS, the Dhan/Groww LTT
-/// convention per `data-integrity.md`) falls inside the regular NSE session
-/// `[09:15:00, 15:30:00)` IST.
+/// iff a tick's `exchange_timestamp` (IST epoch SECONDS, the Dhan LTT
+/// convention per `data-integrity.md` — Groww ticks never reach this
+/// consumer; they flow through the separate Groww bridge) falls inside the
+/// regular NSE session `[09:15:00, 15:30:00)` IST.
 ///
 /// Delegates to the canonical `g1_exchange_gate_accepts`
 /// (`crates/common/src/constants.rs`) — the SAME half-open window the candle
@@ -63,6 +68,40 @@ pub fn day_ohlc_session_accepts(exchange_timestamp_ist_secs: u32) -> bool {
     g1_exchange_gate_accepts(i64::from(secs_of_day) * NANOS_PER_SECOND)
 }
 
+/// Full day-OHLC admission gate: session window + the always-on exemption
+/// (operator lock 2026-06-01 §30, GIFT Nifty — an NSE-IX INDEX with a ~21 h
+/// session). Returns `true` iff the tick may reach the tracker.
+///
+/// Always-on `(security_id, exchange_segment_code)` pairs are EXEMPT from the
+/// `[09:15, 15:30)` window, mirroring the candle aggregator
+/// (`multi_tf_aggregator.rs::consume_tick`) and the tick processor's
+/// `is_window_exempt`. The set is the SAME boot-computed source of truth both
+/// of those use — `DailyUniverse::always_on_segments` installed once via
+/// `tickvault_common::always_on::init_always_on_segments` and read at the
+/// spawn site via `tickvault_common::always_on::current()` — passed in
+/// EXPLICITLY (never read from the global here) so this stays unit-testable,
+/// exactly like the aggregator's `with_always_on`.
+///
+/// Honesty note: GIFT Nifty IS an IDX_I index (segment code 0 — see
+/// `always_on.rs` / `daily_universe.rs::always_on_segments`), so when it is in
+/// the subscribed universe its ticks DO pass this consumer's IDX_I filter
+/// today. Without this exemption its legitimate out-of-window ticks would be
+/// (a) skipped from day-OHLC and (b) continuously inflate
+/// `tv_day_ohlc_session_gate_skipped_total`, destroying that counter's
+/// diagnostic value.
+#[inline]
+#[must_use]
+pub fn day_ohlc_gate_allows(
+    always_on: &HashSet<(u64, u8)>,
+    security_id: u64,
+    exchange_segment_code: u8,
+    exchange_timestamp_ist_secs: u32,
+) -> bool {
+    // O(1) EXEMPT: HashSet `contains` is O(1) hashing, not an O(n) Vec scan.
+    always_on.contains(&(security_id, exchange_segment_code))
+        || day_ohlc_session_accepts(exchange_timestamp_ist_secs)
+}
+
 /// IST midnight = 00:00:00.
 pub const IST_MIDNIGHT_HOUR: u32 = 0;
 pub const IST_MIDNIGHT_MINUTE: u32 = 0;
@@ -73,7 +112,7 @@ pub const IST_MIDNIGHT_SECOND: u32 = 0;
 /// in-session tick for a SID auto-arms day_open/high/low/close to that LTP;
 /// subsequent ticks advance day_high/day_low/day_close. Non-IDX_I ticks and
 /// out-of-session ticks (outside [09:15, 15:30) IST per
-/// [`day_ohlc_session_accepts`]) are skipped O(1).
+/// [`day_ohlc_gate_allows`], always-on SIDs exempt per §30) are skipped O(1).
 ///
 /// On `broadcast::Lagged`, increments a counter and continues. Closed
 /// channel exits the task (process shutdown).
@@ -81,6 +120,7 @@ pub const IST_MIDNIGHT_SECOND: u32 = 0;
 pub fn spawn_day_ohlc_tick_consumer(
     tracker: Arc<DayOhlcTracker>,
     mut rx: broadcast::Receiver<ParsedTick>,
+    always_on: Arc<HashSet<(u64, u8)>>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         info!("day_ohlc tick consumer started");
@@ -94,8 +134,15 @@ pub fn spawn_day_ohlc_tick_consumer(
                     // only ticks inside [09:15:00, 15:30:00) IST reach the
                     // tracker — a pre-open (09:00–09:14) indicative tick or a
                     // post-close snapshot can never arm day_open or move
-                    // high/low/close. O(1) skip, no per-tick log.
-                    if !day_ohlc_session_accepts(tick.exchange_timestamp) {
+                    // high/low/close. Always-on SIDs (GIFT Nifty §30) are
+                    // EXEMPT, matching the candle aggregator. O(1) skip, no
+                    // per-tick log.
+                    if !day_ohlc_gate_allows(
+                        &always_on,
+                        tick.security_id,
+                        tick.exchange_segment_code,
+                        tick.exchange_timestamp,
+                    ) {
                         metrics::counter!("tv_day_ohlc_session_gate_skipped_total").increment(1);
                         continue;
                     }
@@ -291,6 +338,53 @@ mod tests {
         // 15:30:00 IST = 55_800 — the close is EXCLUSIVE, matching the
         // candle aggregator gate and g1_exchange_gate_accepts.
         assert!(!day_ohlc_session_accepts(DAY_BASE_IST_EPOCH + 55_800));
+    }
+
+    #[test]
+    fn test_day_ohlc_gate_allows_exempts_always_on_sid_at_2000_ist() {
+        // Operator lock 2026-06-01 §30: GIFT Nifty (an IDX_I index trading
+        // ~21 h/day on NSE-IX) must pass the gate OUTSIDE [09:15, 15:30),
+        // exactly like the candle aggregator's always_on exemption. A normal
+        // SID at the same 20:00 IST instant must still be rejected.
+        let mut always_on = std::collections::HashSet::new();
+        always_on.insert((5024_u64, 0_u8)); // GIFT Nifty (sid, IDX_I=0)
+
+        // 20:00:00 IST = 72_000 secs-of-day — far outside the regular session.
+        let ts_2000 = DAY_BASE_IST_EPOCH + 72_000;
+        assert!(
+            day_ohlc_gate_allows(&always_on, 5024, 0, ts_2000),
+            "always-on GIFT Nifty tick at 20:00 IST must be exempt from the session gate"
+        );
+        assert!(
+            !day_ohlc_gate_allows(&always_on, 13, 0, ts_2000),
+            "normal SID (NIFTY) at 20:00 IST must be rejected"
+        );
+        // In-session, both pass (the exemption never REJECTS anything).
+        let ts_open = DAY_BASE_IST_EPOCH + 33_300;
+        assert!(day_ohlc_gate_allows(&always_on, 5024, 0, ts_open));
+        assert!(day_ohlc_gate_allows(&always_on, 13, 0, ts_open));
+        // Same SID on a DIFFERENT segment is NOT exempt (composite key per
+        // I-P1-11 — matching the aggregator's (sid, segment) exempt_key).
+        assert!(!day_ohlc_gate_allows(&always_on, 5024, 2, ts_2000));
+    }
+
+    #[test]
+    fn test_day_ohlc_session_accepts_is_the_gate_when_always_on_empty() {
+        // With no exemptions installed (today's default when GIFT is absent),
+        // the gate is exactly the session window (`day_ohlc_session_accepts`).
+        let always_on = std::collections::HashSet::new();
+        assert!(!day_ohlc_gate_allows(
+            &always_on,
+            13,
+            0,
+            DAY_BASE_IST_EPOCH + 72_000
+        ));
+        assert!(day_ohlc_gate_allows(
+            &always_on,
+            13,
+            0,
+            DAY_BASE_IST_EPOCH + 33_300
+        ));
     }
 
     #[test]

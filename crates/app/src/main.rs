@@ -2522,6 +2522,7 @@ async fn main() -> Result<()> {
         let _consumer_handle = tickvault_app::day_ohlc_orchestrator::spawn_day_ohlc_tick_consumer(
             consumer_tracker,
             consumer_rx,
+            tickvault_common::always_on::current(), // §30 GIFT exemption — same source as the aggregator/tick processor
         );
     }
     {
