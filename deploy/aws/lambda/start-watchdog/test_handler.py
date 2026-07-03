@@ -266,3 +266,198 @@ def test_default_mode_is_check(monkeypatch) -> None:
     _wire(monkeypatch, sns, ec2)
     out = handler.lambda_handler({})
     assert out["mode"] == "check"
+
+
+# ---------------------------------------------------------------------------
+# Curfew guard (mode="curfew_check") — operator directive 2026-07-03:
+# a manually-started box left running outside operating hours must be
+# auto-stopped; "manual human error is not acceptable".
+# ---------------------------------------------------------------------------
+
+# Thu 2026-07-02 23:51 IST = 18:21 UTC — the operator's real incident time.
+CURFEW_NIGHT_NOW = datetime(2026, 7, 2, 18, 21, tzinfo=timezone.utc)
+# Launched hours earlier (17:30 IST) — well past the 45-min grace.
+CURFEW_OLD_LAUNCH = datetime(2026, 7, 2, 12, 0, tzinfo=timezone.utc)
+# Launched 20 min before now — inside the 45-min grace window.
+CURFEW_FRESH_LAUNCH = datetime(2026, 7, 2, 18, 1, tzinfo=timezone.utc)
+# Tue 2026-06-30 10:00 IST = 04:30 UTC — mid-market, guard must never act.
+MARKET_HOURS_NOW = datetime(2026, 6, 30, 4, 30, tzinfo=timezone.utc)
+# Sat 2026-07-04 11:00 IST = 05:30 UTC — weekend, guard active all day.
+WEEKEND_NOW = datetime(2026, 7, 4, 5, 30, tzinfo=timezone.utc)
+
+
+class _FakeSsm:
+    def __init__(self, value: str | None = None, raises: bool = False) -> None:
+        self._value = value
+        self._raises = raises
+
+    def get_parameter(self, *, Name: str) -> dict[str, Any]:  # noqa: N803
+        if self._raises or self._value is None:
+            raise RuntimeError("ParameterNotFound")
+        return {"Parameter": {"Name": Name, "Value": self._value}}
+
+
+def _wire_curfew(
+    monkeypatch,
+    sns: _FakeSns,
+    ec2: _FakeEc2,
+    ssm: _FakeSsm,
+    now: datetime,
+) -> None:
+    def _client(svc: str):
+        if svc == "ec2":
+            return ec2
+        if svc == "ssm":
+            return ssm
+        return sns
+
+    monkeypatch.setattr(handler.boto3, "client", _client)
+    monkeypatch.setattr(handler, "_now", lambda: now)
+
+
+def test_curfew_running_no_override_out_of_hours_stops_and_pages(monkeypatch) -> None:
+    """The 23:51 incident: box left running at night, no keep-alive → STOP."""
+    sns = _FakeSns()
+    ec2 = _FakeEc2("running", launch_time=CURFEW_OLD_LAUNCH)
+    _wire_curfew(monkeypatch, sns, ec2, _FakeSsm(None), CURFEW_NIGHT_NOW)
+    out = handler.lambda_handler({"mode": "curfew_check"})
+    assert out["stopped"] is True
+    assert ec2.stop_calls == [["i-0test"]]
+    assert "Curfew auto-stop" in sns.published[0]["subject"]
+    assert "💤" in sns.published[0]["message"]
+    assert "keep-alive" in sns.published[0]["message"]
+
+
+def test_curfew_keep_alive_override_skips(monkeypatch) -> None:
+    """Explicit keep-alive in the future → the operator WANTS it running."""
+    sns = _FakeSns()
+    ec2 = _FakeEc2("running", launch_time=CURFEW_OLD_LAUNCH)
+    ssm = _FakeSsm("2026-07-03T06:00:00+05:30")  # tomorrow 6 AM IST
+    _wire_curfew(monkeypatch, sns, ec2, ssm, CURFEW_NIGHT_NOW)
+    out = handler.lambda_handler({"mode": "curfew_check"})
+    assert out["stopped"] is False
+    assert out["skipped"] == "keep_alive"
+    assert ec2.stop_calls == []
+    assert sns.published == []
+
+
+def test_curfew_expired_keep_alive_still_stops(monkeypatch) -> None:
+    """A keep-alive that already lapsed no longer protects the box."""
+    sns = _FakeSns()
+    ec2 = _FakeEc2("running", launch_time=CURFEW_OLD_LAUNCH)
+    ssm = _FakeSsm("2026-07-02T20:00:00+05:30")  # 8 PM IST — already past
+    _wire_curfew(monkeypatch, sns, ec2, ssm, CURFEW_NIGHT_NOW)
+    out = handler.lambda_handler({"mode": "curfew_check"})
+    assert out["stopped"] is True
+    assert ec2.stop_calls == [["i-0test"]]
+
+
+def test_curfew_naive_keep_alive_is_interpreted_as_ist(monkeypatch) -> None:
+    """Operator pastes a plain IST timestamp with no offset — still honored."""
+    sns = _FakeSns()
+    ec2 = _FakeEc2("running", launch_time=CURFEW_OLD_LAUNCH)
+    ssm = _FakeSsm("2026-07-03T06:00:00")  # naive → IST → still in the future
+    _wire_curfew(monkeypatch, sns, ec2, ssm, CURFEW_NIGHT_NOW)
+    out = handler.lambda_handler({"mode": "curfew_check"})
+    assert out["stopped"] is False
+    assert out["skipped"] == "keep_alive"
+
+
+def test_curfew_malformed_keep_alive_treated_as_no_override(monkeypatch) -> None:
+    """Garbage in the param must not silently disable budget protection."""
+    sns = _FakeSns()
+    ec2 = _FakeEc2("running", launch_time=CURFEW_OLD_LAUNCH)
+    _wire_curfew(monkeypatch, sns, ec2, _FakeSsm("not-a-timestamp"), CURFEW_NIGHT_NOW)
+    out = handler.lambda_handler({"mode": "curfew_check"})
+    assert out["stopped"] is True
+
+
+def test_curfew_grace_window_skips_fresh_manual_start(monkeypatch) -> None:
+    """Launched 20 min ago (<45 min grace) → operator is actively working."""
+    sns = _FakeSns()
+    ec2 = _FakeEc2("running", launch_time=CURFEW_FRESH_LAUNCH)
+    _wire_curfew(monkeypatch, sns, ec2, _FakeSsm(None), CURFEW_NIGHT_NOW)
+    out = handler.lambda_handler({"mode": "curfew_check"})
+    assert out["stopped"] is False
+    assert out["skipped"] == "grace"
+    assert ec2.stop_calls == []
+    assert sns.published == []
+
+
+def test_curfew_never_fires_during_operating_hours(monkeypatch) -> None:
+    """08:00-17:00 IST Mon-Fri belongs to the normal schedule — the curfew
+    guard must return WITHOUT touching EC2, SSM, or SNS."""
+    sns = _FakeSns()
+    ec2 = _FakeEc2("running", launch_time=CURFEW_OLD_LAUNCH)
+    _wire_curfew(monkeypatch, sns, ec2, _FakeSsm(None), MARKET_HOURS_NOW)
+    out = handler.lambda_handler({"mode": "curfew_check"})
+    assert out["skipped"] == "operating_hours"
+    assert out["stopped"] is False
+    assert ec2.stop_calls == []
+    assert sns.published == []
+
+
+def test_curfew_active_on_weekend_midday(monkeypatch) -> None:
+    """Saturday 11:00 IST is OUTSIDE operating hours (Mon-Fri only) —
+    a forgotten weekend box is stopped."""
+    sns = _FakeSns()
+    ec2 = _FakeEc2("running", launch_time=CURFEW_OLD_LAUNCH)
+    _wire_curfew(monkeypatch, sns, ec2, _FakeSsm(None), WEEKEND_NOW)
+    out = handler.lambda_handler({"mode": "curfew_check"})
+    assert out["stopped"] is True
+    assert ec2.stop_calls == [["i-0test"]]
+
+
+def test_curfew_stopped_box_stays_silent(monkeypatch) -> None:
+    sns = _FakeSns()
+    ec2 = _FakeEc2("stopped")
+    _wire_curfew(monkeypatch, sns, ec2, _FakeSsm(None), CURFEW_NIGHT_NOW)
+    out = handler.lambda_handler({"mode": "curfew_check"})
+    assert out["stopped"] is False
+    assert sns.published == []
+
+
+def test_curfew_unknown_launch_time_pages_but_never_stops(monkeypatch) -> None:
+    """Fail-safe (same idiom as stop_check): can't prove it isn't a
+    seconds-old manual start → page, don't stop; next hour retries."""
+    sns = _FakeSns()
+    ec2 = _FakeEc2("running", launch_time=None)
+    _wire_curfew(monkeypatch, sns, ec2, _FakeSsm(None), CURFEW_NIGHT_NOW)
+    out = handler.lambda_handler({"mode": "curfew_check"})
+    assert out["stopped"] is False
+    assert out["alerted"] is True
+    assert ec2.stop_calls == []
+    assert "could not verify start time" in sns.published[0]["subject"]
+
+
+def test_curfew_stop_failure_pages_manual(monkeypatch) -> None:
+    sns = _FakeSns()
+    ec2 = _FakeEc2("running", launch_time=CURFEW_OLD_LAUNCH, stop_raises=True)
+    _wire_curfew(monkeypatch, sns, ec2, _FakeSsm(None), CURFEW_NIGHT_NOW)
+    out = handler.lambda_handler({"mode": "curfew_check"})
+    assert out["stopped"] is False
+    assert out["alerted"] is True
+    assert "manual stop NEEDED" in sns.published[0]["subject"]
+    assert "stop-instances" in sns.published[0]["message"]
+
+
+def test_operating_hours_boundaries() -> None:
+    """Pin the exact window: [08:00, 17:00) IST, Mon-Fri only."""
+    ist = timezone(handler.IST_OFFSET)
+    # Wed 2026-07-01 boundaries.
+    assert not handler._is_within_operating_hours(
+        datetime(2026, 7, 1, 7, 59, tzinfo=ist).astimezone(timezone.utc)
+    )
+    assert handler._is_within_operating_hours(
+        datetime(2026, 7, 1, 8, 0, tzinfo=ist).astimezone(timezone.utc)
+    )
+    assert handler._is_within_operating_hours(
+        datetime(2026, 7, 1, 16, 59, tzinfo=ist).astimezone(timezone.utc)
+    )
+    assert not handler._is_within_operating_hours(
+        datetime(2026, 7, 1, 17, 0, tzinfo=ist).astimezone(timezone.utc)
+    )
+    # Sunday midday is never operating hours.
+    assert not handler._is_within_operating_hours(
+        datetime(2026, 7, 5, 12, 0, tzinfo=ist).astimezone(timezone.utc)
+    )
