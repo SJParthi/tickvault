@@ -508,21 +508,48 @@ async fn main() -> Result<()> {
     // killed the WRONG process (the healthy Python sidecar). The supervisor
     // respawns it (FEED-SUPERVISOR-01 + tv_feed_supervisor_respawn_total,
     // WS-GAP-05 pattern); the NDJSON re-tail is DEDUP-idempotent.
-    let _groww_bridge_supervisor = tickvault_app::groww_bridge::spawn_supervised_groww_bridge(
-        config.questdb.clone(),
-        std::path::PathBuf::from(tickvault_app::groww_bridge::GROWW_TICK_FILE_DEFAULT),
-        std::path::PathBuf::from(tickvault_app::groww_bridge::GROWW_STATUS_FILE_DEFAULT),
-        std::sync::Arc::clone(&feed_runtime),
-        std::sync::Arc::clone(&feed_health),
-        // ws_event_audit forensic sender (2026-06-29): one `feed='groww'` row per
-        // Groww connect/disconnect/reconnect, drained by the SAME consumer Dhan +
-        // order-update use. Closes the audit gap (Groww connected but wrote no row).
-        Some(spawn_ws_event_audit_consumer(config.questdb.clone())),
-        // Trading calendar (2026-06-29): drives the Groww IST-midnight force-seal
-        // boundary task's trading-day gate — built from the SAME `config.trading`
-        // the Dhan IST-midnight force-seal calendar uses.
-        groww_trading_calendar,
-    );
+    // §34 auto-scale (PR-2): default OFF → the single-conn spawns below are
+    // byte-identical to the pre-scale boot. When `[feeds.groww.scale]`
+    // enabled=true, the shard-bridge fleet + per-conn sidecar fleet + ladder
+    // replace the single bridge + single sidecar (same aggregator engine,
+    // same ring→spill→DLQ chain, ONE shared capture-seq across shards).
+    let groww_scale_cfg = config.feeds.groww.scale.clone();
+    let groww_scale_enabled = groww_scale_cfg.enabled;
+    let groww_shards_root =
+        std::path::PathBuf::from(tickvault_app::groww_bridge::GROWW_SHARDS_DIR_DEFAULT);
+    // Watch-entries slot: the activation watcher publishes the daily
+    // subscribe set here so the ladder can cut shards (scale mode only).
+    let groww_scale_entries: std::sync::Arc<
+        arc_swap::ArcSwapOption<Vec<tickvault_core::feed::groww::instruments::WatchEntry>>,
+    > = std::sync::Arc::new(arc_swap::ArcSwapOption::empty());
+    if groww_scale_enabled {
+        let _groww_shard_bridges =
+            tickvault_app::groww_bridge::spawn_supervised_groww_shard_bridges(
+                config.questdb.clone(),
+                groww_shards_root.clone(),
+                groww_scale_cfg.target_connections,
+                std::sync::Arc::clone(&feed_runtime),
+                std::sync::Arc::clone(&feed_health),
+                Some(spawn_ws_event_audit_consumer(config.questdb.clone())),
+                groww_trading_calendar,
+            );
+    } else {
+        let _groww_bridge_supervisor = tickvault_app::groww_bridge::spawn_supervised_groww_bridge(
+            config.questdb.clone(),
+            std::path::PathBuf::from(tickvault_app::groww_bridge::GROWW_TICK_FILE_DEFAULT),
+            std::path::PathBuf::from(tickvault_app::groww_bridge::GROWW_STATUS_FILE_DEFAULT),
+            std::sync::Arc::clone(&feed_runtime),
+            std::sync::Arc::clone(&feed_health),
+            // ws_event_audit forensic sender (2026-06-29): one `feed='groww'` row per
+            // Groww connect/disconnect/reconnect, drained by the SAME consumer Dhan +
+            // order-update use. Closes the audit gap (Groww connected but wrote no row).
+            Some(spawn_ws_event_audit_consumer(config.questdb.clone())),
+            // Trading calendar (2026-06-29): drives the Groww IST-midnight force-seal
+            // boundary task's trading-day gate — built from the SAME `config.trading`
+            // the Dhan IST-midnight force-seal calendar uses.
+            groww_trading_calendar,
+        );
+    }
     // Deferred Telegram slot for the Groww sidecar supervisor: the supervisor is
     // spawned here (before the notifier is built), so it gets a shared slot that
     // is filled with the live `NotificationService` once it exists (below). On a
@@ -535,12 +562,36 @@ async fn main() -> Result<()> {
     // FEED-SUPERVISOR-01: spawn the feed-agnostic sidecar supervisor under a
     // respawning wrapper so the stall-watchdog (FEED-STALL-01) can never die
     // silently — a panic/return respawns it (WS-GAP-05 / DISK-WATCHER-01 pattern).
-    tickvault_app::groww_sidecar_supervisor::spawn_supervised_groww_sidecar_supervisor(
-        std::sync::Arc::clone(&feed_runtime),
-        tickvault_app::groww_sidecar_supervisor::GrowwSidecarOptions::default(),
-        std::sync::Arc::clone(&feed_health),
-        std::sync::Arc::clone(&groww_sidecar_notifier_slot),
-    );
+    if groww_scale_enabled {
+        // §34: the ladder publishes desired_conns; the fleet reconciles the
+        // per-conn Python children to it (spawn missing / kill newest).
+        let scale_runtime = tickvault_app::groww_scale_ladder::GrowwScaleRuntime::default();
+        let _groww_fleet = tickvault_app::groww_sidecar_supervisor::spawn_groww_scale_fleet(
+            std::sync::Arc::clone(&feed_runtime),
+            tickvault_app::groww_sidecar_supervisor::GrowwSidecarOptions::default(),
+            groww_shards_root.clone(),
+            std::sync::Arc::clone(&scale_runtime.desired_conns),
+            std::sync::Arc::clone(&scale_runtime.wake),
+            std::sync::Arc::clone(&feed_health),
+            std::sync::Arc::clone(&groww_sidecar_notifier_slot),
+        );
+        tokio::spawn(tickvault_app::groww_scale_ladder::run_groww_scale_ladder(
+            groww_scale_cfg.clone(),
+            config.questdb.clone(),
+            std::sync::Arc::clone(&feed_runtime),
+            std::sync::Arc::clone(&feed_health),
+            scale_runtime,
+            std::sync::Arc::clone(&groww_scale_entries),
+            groww_shards_root.clone(),
+        ));
+    } else {
+        tickvault_app::groww_sidecar_supervisor::spawn_supervised_groww_sidecar_supervisor(
+            std::sync::Arc::clone(&feed_runtime),
+            tickvault_app::groww_sidecar_supervisor::GrowwSidecarOptions::default(),
+            std::sync::Arc::clone(&feed_health),
+            std::sync::Arc::clone(&groww_sidecar_notifier_slot),
+        );
+    }
     tokio::spawn(
         tickvault_app::groww_activation::run_groww_activation_watcher(
             std::sync::Arc::clone(&feed_runtime),
@@ -548,6 +599,10 @@ async fn main() -> Result<()> {
             config.questdb.clone(),
             groww_max_subscribe,
             config.network.request_timeout_ms,
+            // §34: in scale mode the watcher publishes the daily subscribe
+            // set here so the ladder can cut shards. `None` (scale OFF) is
+            // byte-identical to the pre-scale watcher behavior.
+            groww_scale_enabled.then(|| std::sync::Arc::clone(&groww_scale_entries)),
         ),
     );
     // ── Dhan dormant activation watcher (PR-2, feed-toggle-full-lifecycle) ──

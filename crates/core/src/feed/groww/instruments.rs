@@ -679,6 +679,36 @@ struct WatchFile<'a> {
     entries: &'a [WatchEntry],
 }
 
+/// §34 auto-scale PR-2 (Item 5): writes ONE SHARD's watch file — the same
+/// on-disk contract the sidecar already reads (`WatchFile` JSON), scoped to
+/// the shard's entries. Each per-conn sidecar polls its OWN `GROWW_WATCH_DIR`
+/// for this file, so the ladder writes one per connection per trading day.
+/// Atomic (tmp + rename), same as the daily single-conn watch file.
+///
+/// # Errors
+/// [`WatchBuildError::WriteFailed`] on serialization or filesystem failure.
+pub fn write_watch_entries_file(
+    path: &Path,
+    entries: &[WatchEntry],
+    trading_date_ist: &str,
+) -> Result<(), WatchBuildError> {
+    let indices = entries
+        .iter()
+        .filter(|e| matches!(e.kind, WatchKind::IndexValue))
+        .count();
+    let file = WatchFile {
+        trading_date_ist,
+        feed: "groww",
+        count: entries.len(),
+        resolved_stocks: entries.len().saturating_sub(indices),
+        indices,
+        entries,
+    };
+    let content = serde_json::to_string_pretty(&file)
+        .map_err(|e| WatchBuildError::WriteFailed(e.to_string()))?;
+    write_watch_file_atomic(path, &content)
+}
+
 /// Serializes the watch set to the sidecar watch-file JSON. Pure + testable.
 fn serialize_watch_file(
     set: &GrowwWatchSet,
@@ -856,6 +886,49 @@ pub async fn build_and_write_groww_watch(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_write_watch_entries_file_roundtrips_shard_entries() {
+        // §34 PR-2: the ladder writes one per-conn shard watch file per day;
+        // the JSON must carry the entries + counts the sidecar contract needs.
+        let dir = std::env::temp_dir().join(format!("tv-shard-watch-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mkdir temp shard dir");
+        let path = dir.join("groww-watch-2026-07-03.json");
+        let entries = vec![
+            WatchEntry {
+                exchange: "NSE".to_owned(),
+                segment: "CASH".to_owned(),
+                exchange_token: "2885".to_owned(),
+                kind: WatchKind::Ltp,
+                security_id: 2885,
+                isin: Some("INE002A01018".to_owned()),
+                symbol_name: Some("RELIANCE".to_owned()),
+                index_name: None,
+            },
+            WatchEntry {
+                exchange: "NSE".to_owned(),
+                segment: "CASH".to_owned(),
+                exchange_token: "NIFTY".to_owned(),
+                kind: WatchKind::IndexValue,
+                security_id: 1,
+                isin: None,
+                symbol_name: None,
+                index_name: Some("NSE-NIFTY".to_owned()),
+            },
+        ];
+        write_watch_entries_file(&path, &entries, "2026-07-03").expect("write shard watch file");
+        let raw = std::fs::read_to_string(&path).expect("read back");
+        let json: serde_json::Value = serde_json::from_str(&raw).expect("valid JSON");
+        assert_eq!(json["trading_date_ist"], "2026-07-03");
+        assert_eq!(json["feed"], "groww");
+        assert_eq!(json["count"], 2);
+        assert_eq!(json["indices"], 1);
+        assert_eq!(json["resolved_stocks"], 1);
+        assert_eq!(json["entries"].as_array().map(Vec::len), Some(2));
+        assert_eq!(json["entries"][0]["exchange_token"], "2885");
+        assert_eq!(json["entries"][1]["exchange_token"], "NIFTY");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     // §18-parity Content-Type allowlist guard (2026-07-01 security review).
     fn ct(v: &'static str) -> reqwest::header::HeaderValue {

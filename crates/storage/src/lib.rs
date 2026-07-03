@@ -94,6 +94,9 @@ pub mod http_client;
 // rule 11 + docs/design/sp5-unified-parity-audit-design.md. The two old physical
 // QuestDB tables are RETAINED on disk (SEBI 5y) but no longer written.
 pub mod feed_parity_1m_audit_persistence;
+/// Groww auto-scale ladder forensic chain (§34, auto-scale PR-2 Item 8) —
+/// one row per ladder transition; feeds restart rehydration.
+pub mod groww_scale_audit_persistence;
 pub mod tick_conservation_audit_persistence;
 pub mod ws_event_audit_persistence;
 // PR-E (2026-05-26): `candle_persistence` module deleted alongside the

@@ -119,6 +119,12 @@ pub async fn run_groww_activation_watcher(
     questdb: QuestDbConfig,
     max_subscribe: Option<usize>,
     auth_timeout_ms: u64,
+    // §34 auto-scale (PR-2): when the scale ladder is active, the watcher
+    // publishes each built daily subscribe set here so the ladder can cut
+    // per-conn shards. `None` = single-conn mode, byte-identical behavior.
+    scale_entries_slot: Option<
+        Arc<arc_swap::ArcSwapOption<Vec<tickvault_core::feed::groww::instruments::WatchEntry>>>,
+    >,
 ) {
     // The SINGLE owned activation task for the current ON period. `Some` iff the
     // lane is activated. Holding the handle lets us `abort()` ALL in-flight Groww
@@ -168,6 +174,7 @@ pub async fn run_groww_activation_watcher(
                     questdb.clone(),
                     max_subscribe,
                     auth_timeout_ms,
+                    scale_entries_slot.clone(),
                 ));
                 active_task = Some(task);
             }
@@ -210,6 +217,10 @@ async fn activate_groww_lane(
     questdb: QuestDbConfig,
     max_subscribe: Option<usize>,
     auth_timeout_ms: u64,
+    // §34: scale-mode subscribe-set publication slot (None = single-conn).
+    scale_entries_slot: Option<
+        Arc<arc_swap::ArcSwapOption<Vec<tickvault_core::feed::groww::instruments::WatchEntry>>>,
+    >,
 ) {
     // Not live until the watch-list is built; clear any stale true from a prior
     // ON period so the feed page reports honestly during activation.
@@ -321,6 +332,11 @@ async fn activate_groww_lane(
         .await
         {
             Ok(set) => {
+                // §34 auto-scale: publish the daily subscribe set for the
+                // ladder's shard cutter (scale mode only; cheap Arc swap).
+                if let Some(slot) = &scale_entries_slot {
+                    slot.store(Some(std::sync::Arc::new(set.entries.clone())));
+                }
                 info!(
                     entries = set.entries.len(),
                     master_entries = set.master_entries.len(),

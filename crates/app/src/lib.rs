@@ -47,6 +47,10 @@ pub mod dhan_activation;
 pub mod groww_activation;
 /// Groww second-feed bridge — consumer side (operator lock §32). Default-OFF.
 pub mod groww_bridge;
+/// Groww auto-scale ladder FSM + gates + restart rehydration (§34, PR-2 of
+/// `.claude/plans/active-plan-groww-autoscale.md`). Default-OFF behind
+/// `[feeds.groww.scale] enabled`.
+pub mod groww_scale_ladder;
 /// Groww Python-sidecar auto-launcher + supervisor (operator lock §32 +
 /// "no manual commands" 2026-06-19). Default-OFF.
 pub mod groww_sidecar_supervisor;
