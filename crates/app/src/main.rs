@@ -6984,412 +6984,40 @@ async fn start_dhan_lane(
             // Gated on `config.features.realtime_guarantee_score`.
             if config.features.realtime_guarantee_score {
                 // 2026-05-11 v3: SLO Telegram dispatch removed — see the
-                // `slo_notifier.notify(...)` removal note in the
-                // `cur_tier > prev_tier` block below. The clone is
-                // retained under `_` so a future "re-enable SLO Telegram"
-                // PR has a one-line revert (drop the underscore + restore
-                // the notify() calls).
-                let _slo_notifier = notifier.clone();
-                let slo_health = health_status.clone();
-                let slo_qcfg = config.questdb.clone();
-                // D2c (C4): capture the shared feed state so the token-freshness
-                // SLO dimension reads the LIVE lane manager (preferred) over the
-                // global OnceLock after a runtime stop→re-start.
-                let slo_feed_runtime = std::sync::Arc::clone(&feed_runtime);
-                // D2a: pre-extract the Copy config fields (see the readiness
-                // spawn above) so the `'static` SLO task does not capture the
-                // lane-lifetime `&config`. Behaviour-identical.
-                let slo_main_feed_pool_size =
-                    tickvault_common::config::effective_main_feed_pool_size(
-                        config.subscription.scope,
-                        config.dhan.max_websocket_connections,
+                // suppression note inside `spawn_slo_publisher_task`. To
+                // re-enable SLO Telegram, pass the notifier into
+                // `spawn_slo_publisher_task` and restore the notify() calls
+                // there.
+                //
+                // SLO-03 (live incident 2026-07-03 10:35 IST): the publisher
+                // used to be a bare `tokio::spawn` with a dropped JoinHandle —
+                // it died silently mid-market and the guarantee-critical alarm
+                // false-OK'd on missing data. It is now wrapped in the standard
+                // supervisor-respawn pattern (mirrors
+                // `spawn_supervised_oom_monitor` / DISK-WATCHER-01 / WS-GAP-05)
+                // so a task death logs `error!(code = "SLO-03")`, increments
+                // `tv_slo_publisher_respawn_total{reason}`, and respawns after
+                // a bounded backoff. The once-per-process guard keeps lane
+                // restarts (D2b re-runs `start_dhan_lane`) from leaking
+                // duplicate supervisors — the same per-lane-leak class as the
+                // 2026-07-01 DayOhlcTracker fix.
+                if SLO_PUBLISHER_SUPERVISOR_SPAWNED.swap(true, std::sync::atomic::Ordering::SeqCst)
+                {
+                    info!(
+                        "SLO publisher supervisor already running — skipping duplicate spawn \
+                         (lane restart)"
                     );
-                // PR #509d (Wave-5 §R.1): the Phase 2 dispatcher chain is
-                // retired. The phase2_health SLO dimension is permanently
-                // pinned to 1.0 inside the score loop — see comment there.
-                tokio::spawn(async move {
-                    use std::time::{Duration, Instant};
-                    use tickvault_common::constants::{IST_UTC_OFFSET_SECONDS, SECONDS_PER_DAY};
-                    use tickvault_common::error_code::ErrorCode;
-                    use tickvault_core::instrument::slo_score::{
-                        SloInputs, SloOutcome, evaluate_slo_score,
-                    };
-
-                    /// Sum of expected connections across the four pools:
-                    /// Default = 12. Breakdown: 5 main feed, 4 depth-20 (NIFTY,
-                    /// BANKNIFTY, FINNIFTY, MIDCPNIFTY per pre-2026-04-25
-                    /// universe; rebuild reduced to 2 but pool capacity still
-                    /// permits 4), 2 depth-200 (NIFTY ATM CE/PE + BANKNIFTY
-                    /// ATM CE/PE), 1 order-update.
-                    ///
-                    /// Phase 0 Item 2 fix (operator-locked 2026-05-13,
-                    /// hostile-review CRITICAL #1): main-feed component
-                    /// scope-aware. Under `IndicesUnderlyingsOnly` the main
-                    /// pool is clamped to `PHASE_0_MAIN_FEED_CONNECTION_COUNT
-                    /// = 1`, so the expected denominator must match the
-                    /// effective pool size — otherwise `ws_health = 8/12 =
-                    /// 0.667` → `SLO-02 Critical` Telegram every 10s during
-                    /// market hours (pager fatigue).
-                    ///
-                    /// Phase 0 Item 3 (operator-locked 2026-05-13): depth-20
-                    /// + depth-200 expected components ALSO scope-aware via
-                    /// `should_spawn_depth_dynamic_pipeline`. Under
-                    /// `IndicesUnderlyingsOnly` the depth pipeline is parked
-                    /// → expected count is 0, matching the actual 0 active.
-                    /// Phase 0 denominator: `1 + 0 + 0 + 1 = 2` (matches
-                    /// active when main + OMS up → `ws_health = 1.0`).
-                    // PR #4 (2026-05-19): depth-20 + depth-200 expected
-                    // components dropped — depth pipelines retired entirely
-                    // per operator lock 2026-05-15.
-                    const SLO_WS_EXPECTED_ORDER_UPDATE: f64 = 1.0;
-                    let slo_ws_expected_main_feed: f64 = slo_main_feed_pool_size as f64;
-                    let slo_ws_expected_total: f64 =
-                        slo_ws_expected_main_feed + SLO_WS_EXPECTED_ORDER_UPDATE;
-
-                    /// Tick-freshness silence threshold during market hours:
-                    /// a tick gap >= this many seconds counts that SID as
-                    /// SILENT in the fractional coverage computation
-                    /// (`compute_tick_freshness` — 2026-07-03 fix; the gap no
-                    /// longer binary-zeroes the whole dimension). Aligned with
-                    /// the operator's "silent socket" boundary used elsewhere
-                    /// (the 60s pool watchdog) and with the tick-gap
-                    /// detector's own `TICK_GAP_THRESHOLD_SECS_DEFAULT = 30`.
-                    const SLO_TICK_FRESHNESS_DEGRADED_SECS: u64 = 30;
-
-                    /// Token headroom threshold: < this many seconds remaining
-                    /// drives `token_freshness = 0.0`. Aligned with
-                    /// `force_renewal_if_stale(threshold_secs = 14400)` used
-                    /// by the post-sleep WebSocket wake path (AUTH-GAP-03).
-                    const SLO_TOKEN_HEADROOM_THRESHOLD_SECS: u64 = 4 * 3600;
-
-                    // PR #509d: SLO_PHASE2_* grace constants retired with the
-                    // dispatcher chain. phase2_health is pinned to 1.0
-                    // unconditionally below.
-
-                    /// Uniform boot-relative grace covering ALL six SLO
-                    /// dimensions (ws_health, qdb_health, tick_freshness,
-                    /// token_freshness, spill_health, phase2_health).
-                    /// During the first 60s after the scheduler starts,
-                    /// the composite score is pinned to `1.0` regardless
-                    /// of inputs.
-                    ///
-                    /// Rationale: at boot the scheduler's 10s tick can
-                    /// fire before all 12 expected WS connections are
-                    /// up (DEGRADED with weakest=ws_health) or before the
-                    /// tick-gap coalescer's 30s window has filled
-                    /// (CRITICAL with weakest=tick_freshness). Both are
-                    /// transient partial-state reads, not real
-                    /// degradation. Live incident 2026-04-28 15:06–15:07
-                    /// IST proved this: DEGRADED at boot+10s, CRITICAL
-                    /// at boot+60s, both recovered on their own once
-                    /// the system steady-stated.
-                    ///
-                    /// 60s is the same magnitude as the per-dimension
-                    /// grace and is comfortably longer than the typical
-                    /// boot settle window (~30s for connections + ~30s
-                    /// for tick-gap coalescer).
-                    const SLO_BOOT_UNIFORM_GRACE_SECS: u64 = 60;
-
-                    /// Sample interval. SCOPE §13.1.
-                    const SLO_TICK_INTERVAL_SECS: u64 = 10;
-
-                    /// Hard upper-bound for the per-tick QDB-readiness probe.
-                    /// Adversarial review (general-purpose, 2026-04-28
-                    /// HIGH #3): caps `wait_for_questdb_ready` so a hung
-                    /// TCP connect cannot stretch the 10s scheduler tick.
-                    const SLO_QDB_PROBE_TIMEOUT_SECS: u64 = 2;
-
-                    /// Helper: returns true iff `now_ist_secs_of_day` falls
-                    /// inside the data-collection window
-                    /// `[09:00, 16:00)` IST. Off-hours we relax 3 of 6
-                    /// dimensions to avoid false-positive pages on
-                    /// by-design idle state.
-                    // Wave-Holiday-Gate (2026-05-09): delegate to the
-                    // canonical helper so weekend boots no longer drive
-                    // the SLO score to 0.0 via tick_freshness/ws_health.
-                    // The legacy `secs_of_day` argument is unused now;
-                    // call sites pass it but the helper ignores it.
-                    fn is_within_market_hours_ist(_now_ist_secs_of_day: u32) -> bool {
-                        tickvault_common::market_hours::is_within_trading_session_ist()
-                    }
-
-                    let mut interval =
-                        tokio::time::interval(Duration::from_secs(SLO_TICK_INTERVAL_SECS));
-                    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-                    // Skip the immediate first tick — let other systems boot.
-                    interval.tick().await;
-
-                    // Edge-trigger state. Initial tier 0 (Healthy) so a
-                    // genuine first-tick Degraded/Critical fires Telegram
-                    // exactly once on the rising edge.
-                    let mut prev_tier: u8 = 0;
-                    // Spill delta tracker — saturate-subtract previous total
-                    // to detect any new drops in the last 10s.
-                    let mut last_spill_total: u64 = slo_health.ticks_spilled();
-                    // Scheduler boot instant — used by the boot-relative
-                    // Phase 2 grace below to suppress SLO-02 false-positive
-                    // on mid-market boots (live incident 2026-04-28).
-                    let scheduler_boot_at = std::time::Instant::now();
-
-                    info!("Wave 3-D SLO score scheduler: started (10s tick)");
-
-                    loop {
-                        interval.tick().await;
-
-                        // Compute "now" in IST for market-hours + Phase 2
-                        // gates. `chrono::Utc::now()` is the canonical
-                        // wall-clock source per existing usage in this file.
-                        let now_utc_secs = chrono::Utc::now().timestamp();
-                        let now_ist_secs =
-                            now_utc_secs.saturating_add(i64::from(IST_UTC_OFFSET_SECONDS));
-                        let secs_of_day =
-                            now_ist_secs.rem_euclid(i64::from(SECONDS_PER_DAY)) as u32;
-                        let in_market = is_within_market_hours_ist(secs_of_day);
-
-                        // ---- WS_health -----------------------------------
-                        let active_main = slo_health.websocket_connections() as f64;
-                        let active_ou = if slo_health.order_update_connected() {
-                            1.0
-                        } else {
-                            0.0
-                        };
-                        let active_total = active_main + active_ou;
-                        let raw_ws_health = active_total / slo_ws_expected_total;
-                        // Off-hours: by-design sleeping connections must
-                        // NOT degrade the SLO. Pin to 1.0.
-                        let ws_health = if !in_market { 1.0 } else { raw_ws_health };
-
-                        // ---- QDB_health ---------------------------------
-                        // 1s probe wrapped in tokio::time::timeout(2s) as a
-                        // hard upper-bound. Adversarial review (general-
-                        // purpose, 2026-04-28 HIGH #3): the boot probe's
-                        // internal max_wait_secs may not strictly cap on a
-                        // hung TCP connect (OS-default connect timeout can
-                        // be 20-75s). Timeout-bounding here keeps the 10s
-                        // scheduler interval from compounding into a
-                        // slow-loop under prolonged QDB outages.
-                        let qdb_ok = tokio::time::timeout(
-                            Duration::from_secs(SLO_QDB_PROBE_TIMEOUT_SECS),
-                            tickvault_storage::boot_probe::wait_for_questdb_ready(&slo_qcfg, 1),
-                        )
-                        .await
-                        .is_ok_and(|res| res.is_ok());
-                        let qdb_health = if qdb_ok { 1.0 } else { 0.0 };
-
-                        // ---- Tick_freshness ------------------------------
-                        // 2026-05-26: INDIA VIX (SID 21) is a derived
-                        // volatility index that legitimately ticks every
-                        // 30-60s during quiet sessions — its silence is
-                        // not a degradation, so it is excluded from the
-                        // silent count (kept from the original design).
-                        //
-                        // 2026-07-03 (D2 root-cause fix): FRACTIONAL
-                        // coverage replaces the binary worst-gap check.
-                        // The binary check ("ANY non-excluded gap >= 30s
-                        // → 0.0") was designed for the 4-SID Indices4Only
-                        // era. Under the ~775-SID DailyUniverse, ~33
-                        // illiquid/suspended SIDs are ALWAYS silent —
-                        // NT-15 boot seeding (2026-07-01) guarantees every
-                        // subscribed SID is a tick-gap map key, so a
-                        // never-ticking SID's gap grows monotonically from
-                        // boot. Result: tick_freshness was flat 0.0 all
-                        // session, the multiplicative score was 0, and
-                        // `tv-prod-realtime-guarantee-critical` fired all
-                        // day — pure noise that masked real degradation.
-                        //   tick_freshness = 1 − silent/universe (clamped)
-                        // 33/775 silent → 0.957 (healthy); a genuine broad
-                        // outage (dead socket → most SIDs silent) still
-                        // crashes the dimension toward 0. Off-hours stays
-                        // pinned 1.0. Pure math + rationale in
-                        // `compute_tick_freshness` (unit-tested).
-                        const SLO_TICK_FRESHNESS_EXCLUDED_SIDS: &[u64] = &[21]; // INDIA VIX
-                        let tick_freshness = if !in_market {
-                            1.0
-                        } else {
-                            tickvault_core::pipeline::tick_gap_detector::global_tick_gap_detector()
-                                .map(|d| {
-                                    // Full silent set (cap = map size). This
-                                    // is the 10s SLO scheduler — a cold-path
-                                    // task, NOT the tick hot path; the
-                                    // O(universe) walk is the same scan the
-                                    // 60s coalescer already performs.
-                                    let universe = d.len();
-                                    let (silent_entries, _total) =
-                                        d.scan_gaps_top_n(Instant::now(), universe);
-                                    let silent = silent_entries
-                                        .iter()
-                                        .filter(|(sid, _, gap)| {
-                                            *gap >= SLO_TICK_FRESHNESS_DEGRADED_SECS
-                                                && !SLO_TICK_FRESHNESS_EXCLUDED_SIDS.contains(sid)
-                                        })
-                                        .count();
-                                    compute_tick_freshness(silent, universe)
-                                })
-                                .unwrap_or(1.0)
-                        };
-
-                        // ---- Token_freshness -----------------------------
-                        // D2c (C4): prefer the LIVE lane-owned manager over the
-                        // global OnceLock so a runtime stop→re-start reports the new
-                        // manager's headroom, not the dead boot-time manager's.
-                        let token_secs = gauge_token_headroom_secs(&slo_feed_runtime);
-                        let token_freshness = if token_secs > SLO_TOKEN_HEADROOM_THRESHOLD_SECS {
-                            1.0
-                        } else {
-                            0.0
-                        };
-
-                        // ---- Spill_health --------------------------------
-                        // Delta over the last 10s sample window. Strict
-                        // signal — any new drop drives 0.0 for one tick.
-                        let cur_spill = slo_health.ticks_spilled();
-                        let spill_delta = cur_spill.saturating_sub(last_spill_total);
-                        last_spill_total = cur_spill;
-                        let spill_health = if spill_delta == 0 { 1.0 } else { 0.0 };
-
-                        // ---- Phase2_health -------------------------------
-                        // PR #509d (Wave-5 §R.1): the legacy Phase 2 dispatcher
-                        // was retired. The phase2_health SLO dimension is
-                        // permanently pinned to 1.0 — the dispatcher chain no
-                        // longer exists, there is no outcome to consult.
-                        // Future scope re-enabling stock F&O will introduce a
-                        // new dispatch path with its own health dimension.
-                        let phase2_health = 1.0_f64;
-
-                        let inputs = SloInputs {
-                            ws_health,
-                            qdb_health,
-                            tick_freshness,
-                            token_freshness,
-                            spill_health,
-                            phase2_health,
-                        };
-                        // Uniform boot grace: pin Healthy across ALL
-                        // dimensions during the first 60s after the
-                        // scheduler started. See
-                        // SLO_BOOT_UNIFORM_GRACE_SECS docstring.
-                        let outcome = if scheduler_boot_at.elapsed().as_secs()
-                            < SLO_BOOT_UNIFORM_GRACE_SECS
-                        {
-                            SloOutcome::Healthy { score: 1.0 }
-                        } else {
-                            evaluate_slo_score(&inputs)
-                        };
-
-                        // Always emit gauges (operator dashboard reads them
-                        // in real-time, off-hours included). Clamp each
-                        // per-dimension gauge value into [0, 1] before
-                        // emit so that a future regression that lets a
-                        // raw f64 (e.g. NaN from div-by-zero or > 1.0
-                        // from a misconfigured `slo_ws_expected_total`)
-                        // cannot pollute the dashboard. `evaluate_slo_score`
-                        // already clamps internally for the composite —
-                        // this is the same defense for the per-dimension
-                        // panels (hot-path-reviewer hardening, 2026-04-28).
-                        let dim_clamp =
-                            |v: f64| -> f64 { if v.is_nan() { 0.0 } else { v.clamp(0.0, 1.0) } };
-                        metrics::gauge!("tv_realtime_guarantee_score").set(outcome.score());
-                        metrics::gauge!(
-                            "tv_realtime_guarantee_dimension",
-                            "name" => "ws_health"
-                        )
-                        .set(dim_clamp(ws_health));
-                        metrics::gauge!(
-                            "tv_realtime_guarantee_dimension",
-                            "name" => "qdb_health"
-                        )
-                        .set(dim_clamp(qdb_health));
-                        metrics::gauge!(
-                            "tv_realtime_guarantee_dimension",
-                            "name" => "tick_freshness"
-                        )
-                        .set(dim_clamp(tick_freshness));
-                        metrics::gauge!(
-                            "tv_realtime_guarantee_dimension",
-                            "name" => "token_freshness"
-                        )
-                        .set(dim_clamp(token_freshness));
-                        metrics::gauge!(
-                            "tv_realtime_guarantee_dimension",
-                            "name" => "spill_health"
-                        )
-                        .set(dim_clamp(spill_health));
-                        metrics::gauge!(
-                            "tv_realtime_guarantee_dimension",
-                            "name" => "phase2_health"
-                        )
-                        .set(dim_clamp(phase2_health));
-
-                        let cur_tier = outcome.tier();
-
-                        // 2026-05-11 hotfix v3 — Telegram-suppress ALL three
-                        // SLO transitions (Degraded, Critical, Healthy).
-                        // Operator directive: the composite SLO score is
-                        // computed from six dimensions (ws_health,
-                        // qdb_health, tick_freshness, token_freshness,
-                        // spill_health, phase2_health) and the underlying
-                        // typed errors for each dimension (WS-GAP-06,
-                        // BOOT-01/02, AUTH-GAP-03, STORAGE-GAP-03,
-                        // PHASE2-01) ALREADY fire their own Telegram alerts.
-                        // SLO-02 paging is duplicate operator noise — the
-                        // 10s scheduler flaps multiple times per minute
-                        // because `tick_freshness` momentarily reads 0 when
-                        // illiquid IDX_I instruments don't tick within the
-                        // 30s window (normal market behaviour). Keep the
-                        // log (warn / info) + counter for the
-                        // operator-health Grafana dashboard, but DO NOT
-                        // dispatch to the notification service.
-                        // Defense-in-depth: events.rs also demotes
-                        // `RealtimeGuaranteeCritical` to Severity::Low so
-                        // any accidental future notify() call still does
-                        // not page.
-                        if in_market {
-                            if cur_tier > prev_tier {
-                                match &outcome {
-                                    SloOutcome::Healthy { .. } => {
-                                        // Cannot reach: tier 0 is Healthy
-                                        // and prev_tier > 0 contradicts
-                                        // cur_tier > prev_tier with
-                                        // cur_tier == 0. Defensive only.
-                                    }
-                                    SloOutcome::Degraded { score, weakest } => {
-                                        warn!(
-                                            code = ErrorCode::Slo02Degraded.code_str(),
-                                            score = *score,
-                                            weakest = weakest,
-                                            "SLO score crossed below 0.95 — DEGRADED (log-only, Telegram suppressed)"
-                                        );
-                                    }
-                                    SloOutcome::Critical { score, weakest } => {
-                                        warn!(
-                                            code = ErrorCode::Slo02Degraded.code_str(),
-                                            score = *score,
-                                            weakest = weakest,
-                                            "SLO score crossed below 0.80 — CRITICAL (log-only, Telegram suppressed)"
-                                        );
-                                    }
-                                }
-                            } else if cur_tier < prev_tier && cur_tier == 0 {
-                                // Recovery to Healthy — log-only (no
-                                // Telegram ping per operator directive
-                                // 2026-05-11; the underlying typed events
-                                // already announced their own recovery).
-                                info!(
-                                    code = ErrorCode::Slo01Healthy.code_str(),
-                                    score = outcome.score(),
-                                    "SLO score recovered to healthy (log-only, Telegram suppressed)"
-                                );
-                            }
-                        }
-                        prev_tier = cur_tier;
-
-                        metrics::counter!(
-                            "tv_realtime_guarantee_evaluations_total",
-                            "tier" => outcome.outcome_str()
-                        )
-                        .increment(1);
-                    }
-                });
+                } else {
+                    let _slo_publisher_supervisor = spawn_supervised_slo_publisher(
+                        health_status.clone(),
+                        config.questdb.clone(),
+                        std::sync::Arc::clone(&feed_runtime),
+                        tickvault_common::config::effective_main_feed_pool_size(
+                            config.subscription.scope,
+                            config.dhan.max_websocket_connections,
+                        ),
+                    );
+                }
             }
         }
     }
@@ -9311,6 +8939,470 @@ fn compute_tick_freshness(silent_count: usize, universe_size: usize) -> f64 {
         return 1.0;
     }
     (1.0 - (silent_count as f64 / universe_size as f64)).clamp(0.0, 1.0)
+}
+
+/// SLO-03: once-per-process guard for the SLO publisher supervisor spawn.
+///
+/// `start_dhan_lane` re-runs on every runtime Dhan enable / stop→restart /
+/// cold-start retry (D2b). Without this guard every lane restart would leak
+/// an extra never-exiting supervisor plus a duplicate gauge publisher — the
+/// same per-lane-leak class the 2026-07-01 DayOhlcTracker fix addressed.
+/// The first lane start wins; the supervisor reads process-shared state
+/// (`SharedHealthStatus`, `FeedRuntimeState` — the token-headroom helper
+/// already prefers the LIVE lane manager), so it stays correct across lane
+/// restarts.
+static SLO_PUBLISHER_SUPERVISOR_SPAWNED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Bounded backoff between SLO publisher respawns (SLO-03). Mirrors the
+/// OOM-monitor / disk-watcher supervisor cadence: long enough to avoid a hot
+/// respawn loop, short enough that the `tv_realtime_guarantee_score` stream
+/// resumes well inside one alarm evaluation period.
+const SLO_PUBLISHER_RESPAWN_BACKOFF_SECS: u64 = 5;
+
+/// Wave 3-D Item 13 — the SLO evaluator/publisher task (extracted verbatim
+/// from the former inline `tokio::spawn` in `start_dhan_lane` for SLO-03).
+///
+/// Every 10s it samples the six dimensions (WS, QDB, tick freshness, token,
+/// spill, phase2), computes the composite score via `evaluate_slo_score`, and
+/// emits `tv_realtime_guarantee_score` + the six per-dimension gauges. The
+/// loop is infinite — ANY resolution of the returned `JoinHandle` is abnormal
+/// and is handled by [`spawn_supervised_slo_publisher`].
+// TEST-EXEMPT: tokio task spawn — the pure evaluator (`slo_score.rs`) and
+// `compute_tick_freshness` are fully unit-tested; the loop is a scheduler
+// wrapper exercised in production and pinned by the wiring ratchet
+// `test_slo_publisher_supervisor_is_wired_into_main`.
+#[must_use]
+fn spawn_slo_publisher_task(
+    slo_health: SharedHealthStatus,
+    slo_qcfg: tickvault_common::config::QuestDbConfig,
+    slo_feed_runtime: std::sync::Arc<tickvault_api::feed_state::FeedRuntimeState>,
+    slo_main_feed_pool_size: usize,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        use std::time::{Duration, Instant};
+        use tickvault_common::constants::{IST_UTC_OFFSET_SECONDS, SECONDS_PER_DAY};
+        use tickvault_common::error_code::ErrorCode;
+        use tickvault_core::instrument::slo_score::{SloInputs, SloOutcome, evaluate_slo_score};
+
+        /// Sum of expected connections across the four pools:
+        /// Default = 12. Breakdown: 5 main feed, 4 depth-20 (NIFTY,
+        /// BANKNIFTY, FINNIFTY, MIDCPNIFTY per pre-2026-04-25
+        /// universe; rebuild reduced to 2 but pool capacity still
+        /// permits 4), 2 depth-200 (NIFTY ATM CE/PE + BANKNIFTY
+        /// ATM CE/PE), 1 order-update.
+        ///
+        /// Phase 0 Item 2 fix (operator-locked 2026-05-13,
+        /// hostile-review CRITICAL #1): main-feed component
+        /// scope-aware. Under `IndicesUnderlyingsOnly` the main
+        /// pool is clamped to `PHASE_0_MAIN_FEED_CONNECTION_COUNT
+        /// = 1`, so the expected denominator must match the
+        /// effective pool size — otherwise `ws_health = 8/12 =
+        /// 0.667` → `SLO-02 Critical` Telegram every 10s during
+        /// market hours (pager fatigue).
+        ///
+        /// Phase 0 Item 3 (operator-locked 2026-05-13): depth-20
+        /// + depth-200 expected components ALSO scope-aware via
+        /// `should_spawn_depth_dynamic_pipeline`. Under
+        /// `IndicesUnderlyingsOnly` the depth pipeline is parked
+        /// → expected count is 0, matching the actual 0 active.
+        /// Phase 0 denominator: `1 + 0 + 0 + 1 = 2` (matches
+        /// active when main + OMS up → `ws_health = 1.0`).
+        // PR #4 (2026-05-19): depth-20 + depth-200 expected
+        // components dropped — depth pipelines retired entirely
+        // per operator lock 2026-05-15.
+        const SLO_WS_EXPECTED_ORDER_UPDATE: f64 = 1.0;
+        let slo_ws_expected_main_feed: f64 = slo_main_feed_pool_size as f64;
+        let slo_ws_expected_total: f64 = slo_ws_expected_main_feed + SLO_WS_EXPECTED_ORDER_UPDATE;
+
+        /// Tick-freshness silence threshold during market hours:
+        /// a tick gap >= this many seconds counts that SID as
+        /// SILENT in the fractional coverage computation
+        /// (`compute_tick_freshness` — 2026-07-03 fix; the gap no
+        /// longer binary-zeroes the whole dimension). Aligned with
+        /// the operator's "silent socket" boundary used elsewhere
+        /// (the 60s pool watchdog) and with the tick-gap
+        /// detector's own `TICK_GAP_THRESHOLD_SECS_DEFAULT = 30`.
+        const SLO_TICK_FRESHNESS_DEGRADED_SECS: u64 = 30;
+
+        /// Token headroom threshold: < this many seconds remaining
+        /// drives `token_freshness = 0.0`. Aligned with
+        /// `force_renewal_if_stale(threshold_secs = 14400)` used
+        /// by the post-sleep WebSocket wake path (AUTH-GAP-03).
+        const SLO_TOKEN_HEADROOM_THRESHOLD_SECS: u64 = 4 * 3600;
+
+        // PR #509d: SLO_PHASE2_* grace constants retired with the
+        // dispatcher chain. phase2_health is pinned to 1.0
+        // unconditionally below.
+
+        /// Uniform boot-relative grace covering ALL six SLO
+        /// dimensions (ws_health, qdb_health, tick_freshness,
+        /// token_freshness, spill_health, phase2_health).
+        /// During the first 60s after the scheduler starts,
+        /// the composite score is pinned to `1.0` regardless
+        /// of inputs.
+        ///
+        /// Rationale: at boot the scheduler's 10s tick can
+        /// fire before all 12 expected WS connections are
+        /// up (DEGRADED with weakest=ws_health) or before the
+        /// tick-gap coalescer's 30s window has filled
+        /// (CRITICAL with weakest=tick_freshness). Both are
+        /// transient partial-state reads, not real
+        /// degradation. Live incident 2026-04-28 15:06–15:07
+        /// IST proved this: DEGRADED at boot+10s, CRITICAL
+        /// at boot+60s, both recovered on their own once
+        /// the system steady-stated.
+        ///
+        /// 60s is the same magnitude as the per-dimension
+        /// grace and is comfortably longer than the typical
+        /// boot settle window (~30s for connections + ~30s
+        /// for tick-gap coalescer).
+        const SLO_BOOT_UNIFORM_GRACE_SECS: u64 = 60;
+
+        /// Sample interval. SCOPE §13.1.
+        const SLO_TICK_INTERVAL_SECS: u64 = 10;
+
+        /// Hard upper-bound for the per-tick QDB-readiness probe.
+        /// Adversarial review (general-purpose, 2026-04-28
+        /// HIGH #3): caps `wait_for_questdb_ready` so a hung
+        /// TCP connect cannot stretch the 10s scheduler tick.
+        const SLO_QDB_PROBE_TIMEOUT_SECS: u64 = 2;
+
+        /// Helper: returns true iff `now_ist_secs_of_day` falls
+        /// inside the data-collection window
+        /// `[09:00, 16:00)` IST. Off-hours we relax 3 of 6
+        /// dimensions to avoid false-positive pages on
+        /// by-design idle state.
+        // Wave-Holiday-Gate (2026-05-09): delegate to the
+        // canonical helper so weekend boots no longer drive
+        // the SLO score to 0.0 via tick_freshness/ws_health.
+        // The legacy `secs_of_day` argument is unused now;
+        // call sites pass it but the helper ignores it.
+        fn is_within_market_hours_ist(_now_ist_secs_of_day: u32) -> bool {
+            tickvault_common::market_hours::is_within_trading_session_ist()
+        }
+
+        let mut interval = tokio::time::interval(Duration::from_secs(SLO_TICK_INTERVAL_SECS));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // Skip the immediate first tick — let other systems boot.
+        interval.tick().await;
+
+        // Edge-trigger state. Initial tier 0 (Healthy) so a
+        // genuine first-tick Degraded/Critical fires Telegram
+        // exactly once on the rising edge.
+        let mut prev_tier: u8 = 0;
+        // Spill delta tracker — saturate-subtract previous total
+        // to detect any new drops in the last 10s.
+        let mut last_spill_total: u64 = slo_health.ticks_spilled();
+        // Scheduler boot instant — used by the boot-relative
+        // Phase 2 grace below to suppress SLO-02 false-positive
+        // on mid-market boots (live incident 2026-04-28).
+        let scheduler_boot_at = std::time::Instant::now();
+
+        info!("Wave 3-D SLO score scheduler: started (10s tick)");
+
+        loop {
+            interval.tick().await;
+
+            // Compute "now" in IST for market-hours + Phase 2
+            // gates. `chrono::Utc::now()` is the canonical
+            // wall-clock source per existing usage in this file.
+            let now_utc_secs = chrono::Utc::now().timestamp();
+            let now_ist_secs = now_utc_secs.saturating_add(i64::from(IST_UTC_OFFSET_SECONDS));
+            let secs_of_day = now_ist_secs.rem_euclid(i64::from(SECONDS_PER_DAY)) as u32;
+            let in_market = is_within_market_hours_ist(secs_of_day);
+
+            // ---- WS_health -----------------------------------
+            let active_main = slo_health.websocket_connections() as f64;
+            let active_ou = if slo_health.order_update_connected() {
+                1.0
+            } else {
+                0.0
+            };
+            let active_total = active_main + active_ou;
+            let raw_ws_health = active_total / slo_ws_expected_total;
+            // Off-hours: by-design sleeping connections must
+            // NOT degrade the SLO. Pin to 1.0.
+            let ws_health = if !in_market { 1.0 } else { raw_ws_health };
+
+            // ---- QDB_health ---------------------------------
+            // 1s probe wrapped in tokio::time::timeout(2s) as a
+            // hard upper-bound. Adversarial review (general-
+            // purpose, 2026-04-28 HIGH #3): the boot probe's
+            // internal max_wait_secs may not strictly cap on a
+            // hung TCP connect (OS-default connect timeout can
+            // be 20-75s). Timeout-bounding here keeps the 10s
+            // scheduler interval from compounding into a
+            // slow-loop under prolonged QDB outages.
+            let qdb_ok = tokio::time::timeout(
+                Duration::from_secs(SLO_QDB_PROBE_TIMEOUT_SECS),
+                tickvault_storage::boot_probe::wait_for_questdb_ready(&slo_qcfg, 1),
+            )
+            .await
+            .is_ok_and(|res| res.is_ok());
+            let qdb_health = if qdb_ok { 1.0 } else { 0.0 };
+
+            // ---- Tick_freshness ------------------------------
+            // 2026-05-26: INDIA VIX (SID 21) is a derived
+            // volatility index that legitimately ticks every
+            // 30-60s during quiet sessions — its silence is
+            // not a degradation, so it is excluded from the
+            // silent count (kept from the original design).
+            //
+            // 2026-07-03 (D2 root-cause fix): FRACTIONAL
+            // coverage replaces the binary worst-gap check.
+            // The binary check ("ANY non-excluded gap >= 30s
+            // → 0.0") was designed for the 4-SID Indices4Only
+            // era. Under the ~775-SID DailyUniverse, ~33
+            // illiquid/suspended SIDs are ALWAYS silent —
+            // NT-15 boot seeding (2026-07-01) guarantees every
+            // subscribed SID is a tick-gap map key, so a
+            // never-ticking SID's gap grows monotonically from
+            // boot. Result: tick_freshness was flat 0.0 all
+            // session, the multiplicative score was 0, and
+            // `tv-prod-realtime-guarantee-critical` fired all
+            // day — pure noise that masked real degradation.
+            //   tick_freshness = 1 − silent/universe (clamped)
+            // 33/775 silent → 0.957 (healthy); a genuine broad
+            // outage (dead socket → most SIDs silent) still
+            // crashes the dimension toward 0. Off-hours stays
+            // pinned 1.0. Pure math + rationale in
+            // `compute_tick_freshness` (unit-tested).
+            const SLO_TICK_FRESHNESS_EXCLUDED_SIDS: &[u64] = &[21]; // INDIA VIX
+            let tick_freshness = if !in_market {
+                1.0
+            } else {
+                tickvault_core::pipeline::tick_gap_detector::global_tick_gap_detector()
+                    .map(|d| {
+                        // Full silent set (cap = map size). This
+                        // is the 10s SLO scheduler — a cold-path
+                        // task, NOT the tick hot path; the
+                        // O(universe) walk is the same scan the
+                        // 60s coalescer already performs.
+                        let universe = d.len();
+                        let (silent_entries, _total) = d.scan_gaps_top_n(Instant::now(), universe);
+                        let silent = silent_entries
+                            .iter()
+                            .filter(|(sid, _, gap)| {
+                                *gap >= SLO_TICK_FRESHNESS_DEGRADED_SECS
+                                    && !SLO_TICK_FRESHNESS_EXCLUDED_SIDS.contains(sid)
+                            })
+                            .count();
+                        compute_tick_freshness(silent, universe)
+                    })
+                    .unwrap_or(1.0)
+            };
+
+            // ---- Token_freshness -----------------------------
+            // D2c (C4): prefer the LIVE lane-owned manager over the
+            // global OnceLock so a runtime stop→re-start reports the new
+            // manager's headroom, not the dead boot-time manager's.
+            let token_secs = gauge_token_headroom_secs(&slo_feed_runtime);
+            let token_freshness = if token_secs > SLO_TOKEN_HEADROOM_THRESHOLD_SECS {
+                1.0
+            } else {
+                0.0
+            };
+
+            // ---- Spill_health --------------------------------
+            // Delta over the last 10s sample window. Strict
+            // signal — any new drop drives 0.0 for one tick.
+            let cur_spill = slo_health.ticks_spilled();
+            let spill_delta = cur_spill.saturating_sub(last_spill_total);
+            last_spill_total = cur_spill;
+            let spill_health = if spill_delta == 0 { 1.0 } else { 0.0 };
+
+            // ---- Phase2_health -------------------------------
+            // PR #509d (Wave-5 §R.1): the legacy Phase 2 dispatcher
+            // was retired. The phase2_health SLO dimension is
+            // permanently pinned to 1.0 — the dispatcher chain no
+            // longer exists, there is no outcome to consult.
+            // Future scope re-enabling stock F&O will introduce a
+            // new dispatch path with its own health dimension.
+            let phase2_health = 1.0_f64;
+
+            let inputs = SloInputs {
+                ws_health,
+                qdb_health,
+                tick_freshness,
+                token_freshness,
+                spill_health,
+                phase2_health,
+            };
+            // Uniform boot grace: pin Healthy across ALL
+            // dimensions during the first 60s after the
+            // scheduler started. See
+            // SLO_BOOT_UNIFORM_GRACE_SECS docstring.
+            let outcome = if scheduler_boot_at.elapsed().as_secs() < SLO_BOOT_UNIFORM_GRACE_SECS {
+                SloOutcome::Healthy { score: 1.0 }
+            } else {
+                evaluate_slo_score(&inputs)
+            };
+
+            // Always emit gauges (operator dashboard reads them
+            // in real-time, off-hours included). Clamp each
+            // per-dimension gauge value into [0, 1] before
+            // emit so that a future regression that lets a
+            // raw f64 (e.g. NaN from div-by-zero or > 1.0
+            // from a misconfigured `slo_ws_expected_total`)
+            // cannot pollute the dashboard. `evaluate_slo_score`
+            // already clamps internally for the composite —
+            // this is the same defense for the per-dimension
+            // panels (hot-path-reviewer hardening, 2026-04-28).
+            let dim_clamp = |v: f64| -> f64 { if v.is_nan() { 0.0 } else { v.clamp(0.0, 1.0) } };
+            metrics::gauge!("tv_realtime_guarantee_score").set(outcome.score());
+            metrics::gauge!(
+                "tv_realtime_guarantee_dimension",
+                "name" => "ws_health"
+            )
+            .set(dim_clamp(ws_health));
+            metrics::gauge!(
+                "tv_realtime_guarantee_dimension",
+                "name" => "qdb_health"
+            )
+            .set(dim_clamp(qdb_health));
+            metrics::gauge!(
+                "tv_realtime_guarantee_dimension",
+                "name" => "tick_freshness"
+            )
+            .set(dim_clamp(tick_freshness));
+            metrics::gauge!(
+                "tv_realtime_guarantee_dimension",
+                "name" => "token_freshness"
+            )
+            .set(dim_clamp(token_freshness));
+            metrics::gauge!(
+                "tv_realtime_guarantee_dimension",
+                "name" => "spill_health"
+            )
+            .set(dim_clamp(spill_health));
+            metrics::gauge!(
+                "tv_realtime_guarantee_dimension",
+                "name" => "phase2_health"
+            )
+            .set(dim_clamp(phase2_health));
+
+            let cur_tier = outcome.tier();
+
+            // 2026-05-11 hotfix v3 — Telegram-suppress ALL three
+            // SLO transitions (Degraded, Critical, Healthy).
+            // Operator directive: the composite SLO score is
+            // computed from six dimensions (ws_health,
+            // qdb_health, tick_freshness, token_freshness,
+            // spill_health, phase2_health) and the underlying
+            // typed errors for each dimension (WS-GAP-06,
+            // BOOT-01/02, AUTH-GAP-03, STORAGE-GAP-03,
+            // PHASE2-01) ALREADY fire their own Telegram alerts.
+            // SLO-02 paging is duplicate operator noise — the
+            // 10s scheduler flaps multiple times per minute
+            // because `tick_freshness` momentarily reads 0 when
+            // illiquid IDX_I instruments don't tick within the
+            // 30s window (normal market behaviour). Keep the
+            // log (warn / info) + counter for the
+            // operator-health Grafana dashboard, but DO NOT
+            // dispatch to the notification service.
+            // Defense-in-depth: events.rs also demotes
+            // `RealtimeGuaranteeCritical` to Severity::Low so
+            // any accidental future notify() call still does
+            // not page.
+            if in_market {
+                if cur_tier > prev_tier {
+                    match &outcome {
+                        SloOutcome::Healthy { .. } => {
+                            // Cannot reach: tier 0 is Healthy
+                            // and prev_tier > 0 contradicts
+                            // cur_tier > prev_tier with
+                            // cur_tier == 0. Defensive only.
+                        }
+                        SloOutcome::Degraded { score, weakest } => {
+                            warn!(
+                                code = ErrorCode::Slo02Degraded.code_str(),
+                                score = *score,
+                                weakest = weakest,
+                                "SLO score crossed below 0.95 — DEGRADED (log-only, Telegram suppressed)"
+                            );
+                        }
+                        SloOutcome::Critical { score, weakest } => {
+                            warn!(
+                                code = ErrorCode::Slo02Degraded.code_str(),
+                                score = *score,
+                                weakest = weakest,
+                                "SLO score crossed below 0.80 — CRITICAL (log-only, Telegram suppressed)"
+                            );
+                        }
+                    }
+                } else if cur_tier < prev_tier && cur_tier == 0 {
+                    // Recovery to Healthy — log-only (no
+                    // Telegram ping per operator directive
+                    // 2026-05-11; the underlying typed events
+                    // already announced their own recovery).
+                    info!(
+                        code = ErrorCode::Slo01Healthy.code_str(),
+                        score = outcome.score(),
+                        "SLO score recovered to healthy (log-only, Telegram suppressed)"
+                    );
+                }
+            }
+            prev_tier = cur_tier;
+
+            metrics::counter!(
+                "tv_realtime_guarantee_evaluations_total",
+                "tier" => outcome.outcome_str()
+            )
+            .increment(1);
+        }
+    })
+}
+
+/// SLO-03 — supervise the SLO evaluator/publisher (live incident 2026-07-03
+/// 10:35 IST: the publisher died silently mid-market; last
+/// `tv_realtime_guarantee_score` datapoint 10:35, no `error!`, no respawn,
+/// and the guarantee-critical alarm false-OK'd on missing data).
+///
+/// [`spawn_slo_publisher_task`] runs an infinite loop, so its `JoinHandle`
+/// resolves ONLY on a fatal event (panic or external cancel). This supervisor
+/// mirrors `spawn_supervised_oom_monitor` / DISK-WATCHER-01 / WS-GAP-05: on
+/// every publisher death it logs `error!` (code `SLO-03`), increments
+/// `tv_slo_publisher_respawn_total{reason}`, backs off
+/// [`SLO_PUBLISHER_RESPAWN_BACKOFF_SECS`], and respawns so the guarantee
+/// score metric stream can never vanish silently again. The supervisor body
+/// has no panic path of its own (pure-function classification, no
+/// `unwrap`/`expect`).
+// TEST-EXEMPT: cold-path supervisor spawn wrapper — exit classification is the
+// unit-tested `disk_health_watcher::classify_join_exit`; the boot wiring is
+// pinned by `test_slo_publisher_supervisor_is_wired_into_main`.
+// O(1) EXEMPT: cold-path supervisor — one task per session, fires only on publisher death.
+#[must_use]
+fn spawn_supervised_slo_publisher(
+    health: SharedHealthStatus,
+    qdb_config: tickvault_common::config::QuestDbConfig,
+    feed_runtime: std::sync::Arc<tickvault_api::feed_state::FeedRuntimeState>,
+    main_feed_pool_size: usize,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            let handle = spawn_slo_publisher_task(
+                health.clone(),
+                qdb_config.clone(),
+                std::sync::Arc::clone(&feed_runtime),
+                main_feed_pool_size,
+            );
+            let join_result = handle.await;
+            let reason = tickvault_storage::disk_health_watcher::classify_join_exit(&join_result);
+            error!(
+                code = tickvault_common::error_code::ErrorCode::Slo03PublisherRespawned.code_str(),
+                reason,
+                backoff_secs = SLO_PUBLISHER_RESPAWN_BACKOFF_SECS,
+                "SLO-03: SLO publisher task exited — respawning so the \
+                 tv_realtime_guarantee_score stream cannot vanish silently"
+            );
+            metrics::counter!("tv_slo_publisher_respawn_total", "reason" => reason).increment(1);
+            tokio::time::sleep(std::time::Duration::from_secs(
+                SLO_PUBLISHER_RESPAWN_BACKOFF_SECS,
+            ))
+            .await;
+        }
+    })
 }
 
 // All pure helper function tests are in boot_helpers.rs (lib.rs target).
