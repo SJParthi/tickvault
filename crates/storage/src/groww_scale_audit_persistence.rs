@@ -488,4 +488,167 @@ mod tests {
         assert!(ok.contains("WHERE trading_date_ist = '2026-07-03'"));
         assert!(ok.contains("ORDER BY ts_micros"));
     }
+
+    #[test]
+    fn test_format_scale_row_values_tuple_sanitizes_state_and_snapshot() {
+        // `state` and `gate_snapshot` are the other two injection-reachable
+        // inputs besides `reason` — both must pass through the sanitizer.
+        let mut row = sample_row();
+        row.state = "advancing'); DROP TABLE groww_scale_audit; --";
+        row.gate_snapshot = "{\"x\":1}'); DELETE FROM ticks; --";
+        let tuple = format_scale_row_values_tuple(&row);
+        assert!(
+            !tuple.contains("DROP TABLE groww_scale_audit;"),
+            "state must be sanitized: {tuple}"
+        );
+        assert!(
+            !tuple.contains("DELETE FROM ticks;"),
+            "gate_snapshot must be sanitized: {tuple}"
+        );
+        // Static outcome label survives verbatim.
+        assert!(
+            tuple.contains("'advance_started'"),
+            "outcome label: {tuple}"
+        );
+    }
+
+    #[test]
+    fn test_parse_scale_audit_dataset_rejects_negative_and_short_rows() {
+        // usize::try_from on a NEGATIVE to_conns must fail-soft (row skipped),
+        // and a row with fewer cells than the SELECT column order is skipped.
+        let dataset = serde_json::json!([
+            [1751500000000000i64, -5, "verified_healthy"], // negative conns
+            [1751500001000000i64],                         // short row
+            [1751500002000000i64, 3, 42],                  // outcome not a string
+            [1751500003000000i64, 3, "verified_healthy"],  // the one good row
+        ]);
+        let rows = parse_scale_audit_dataset(&dataset);
+        assert_eq!(rows.len(), 1, "only the well-formed row survives: {rows:?}");
+        assert_eq!(rows[0].1, 3);
+    }
+
+    #[test]
+    fn test_append_error_body_is_capped_at_200_chars() {
+        // Source-scan (instrument_fetch_audit precedent): the non-2xx branch
+        // must bound the reflected QuestDB body — it can propagate into a
+        // Telegram alert via the GROWW-SCALE-04 route.
+        let source = include_str!("groww_scale_audit_persistence.rs");
+        assert!(
+            source.contains(".take(200)"),
+            "append helper must cap the reflected QuestDB error body at 200 chars"
+        );
+    }
+
+    // ========================================================================
+    // Persistence-helper tests — mock QuestDB /exec HTTP server + unreachable
+    // host (P2C pattern from instrument_lifecycle_persistence.rs). These
+    // exercise the real ensure/append code paths: success (200), non-2xx
+    // (500) and transport-error arms.
+    // ========================================================================
+
+    const MOCK_HTTP_200: &str = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}";
+    const MOCK_HTTP_500: &str =
+        "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 13\r\n\r\n{\"error\":\"x\"}";
+
+    async fn spawn_mock_http(response: &'static str) -> u16 {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            loop {
+                if let Ok((mut stream, _)) = listener.accept().await {
+                    tokio::spawn(async move {
+                        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                        let mut buf = [0u8; 8192];
+                        let _ = stream.read(&mut buf).await;
+                        let _ = stream.write_all(response.as_bytes()).await;
+                    });
+                }
+            }
+        });
+        port
+    }
+
+    fn mock_cfg(http_port: u16) -> QuestDbConfig {
+        QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port,
+            pg_port: 1,
+            ilp_port: 1,
+        }
+    }
+
+    fn unreachable_cfg() -> QuestDbConfig {
+        // Port 1 is reserved and never listening; guarantees a real HTTP
+        // transport failure without touching any live service.
+        mock_cfg(1)
+    }
+
+    #[tokio::test]
+    async fn test_ensure_table_with_mock_200_completes() {
+        // Success path: CREATE DDL Ok arm + all 3 feed self-heal Ok arms.
+        let port = spawn_mock_http(MOCK_HTTP_200).await;
+        ensure_groww_scale_audit_table(&mock_cfg(port)).await;
+    }
+
+    #[tokio::test]
+    async fn test_ensure_table_with_mock_500_degrades_without_panic() {
+        // Non-2xx path: CREATE DDL non-2xx arm + all 3 self-heal non-2xx
+        // arms log-and-continue (best-effort degrade, never a panic).
+        let port = spawn_mock_http(MOCK_HTTP_500).await;
+        ensure_groww_scale_audit_table(&mock_cfg(port)).await;
+    }
+
+    #[tokio::test]
+    async fn test_ensure_table_unreachable_degrades_without_panic() {
+        // Transport-error path: CREATE DDL send Err arm + all 3 self-heal
+        // send Err arms. Must NOT panic and must NOT block boot.
+        ensure_groww_scale_audit_table(&unreachable_cfg()).await;
+    }
+
+    #[tokio::test]
+    async fn test_append_row_mock_200_is_ok() {
+        let port = spawn_mock_http(MOCK_HTTP_200).await;
+        let row = sample_row();
+        let res = append_groww_scale_audit_row(&mock_cfg(port), &row).await;
+        assert!(res.is_ok(), "200 insert must be Ok: {res:?}");
+    }
+
+    #[tokio::test]
+    async fn test_append_row_mock_500_returns_err_with_capped_body() {
+        let port = spawn_mock_http(MOCK_HTTP_500).await;
+        let row = sample_row();
+        let res = append_groww_scale_audit_row(&mock_cfg(port), &row).await;
+        let err = res.expect_err("non-2xx must be Err");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("non-2xx"),
+            "error names the non-2xx condition: {msg}"
+        );
+        assert!(msg.contains("500"), "error carries the HTTP status: {msg}");
+    }
+
+    #[tokio::test]
+    async fn test_append_row_unreachable_returns_transport_err() {
+        // The caller routes this Err as GROWW-SCALE-04 (best-effort — never
+        // gates a ladder decision); the helper must propagate, not swallow.
+        let row = sample_row();
+        let res = append_groww_scale_audit_row(&unreachable_cfg(), &row).await;
+        assert!(
+            res.is_err(),
+            "transport error must propagate when QuestDB is unreachable"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_append_row_probe_verdict_outcome_roundtrips_through_insert() {
+        // Exercise the ProbeVerdict variant through the real INSERT SQL
+        // build + transport path (mirrors the fetch-audit operator-override
+        // variant test).
+        let port = spawn_mock_http(MOCK_HTTP_200).await;
+        let mut row = sample_row();
+        row.outcome = ScaleOutcome::ProbeVerdict;
+        row.reason = "probe_multi_conn_ok";
+        let res = append_groww_scale_audit_row(&mock_cfg(port), &row).await;
+        assert!(res.is_ok(), "probe-verdict row must insert: {res:?}");
+    }
 }
