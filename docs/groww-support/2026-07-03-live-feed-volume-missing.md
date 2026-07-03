@@ -9,13 +9,13 @@ GMAIL BODY TO PASTE (one line + the link — nothing else):
 
     Hi Groww API team, we are seeing zero volume/openInterest/OHLC on every
     live-feed tick (only ltp + tsInMillis populate) — full evidence, verbatim
-    tick JSON, and 4 specific questions here:
+    tick JSON, and 5 specific questions here:
     https://github.com/SJParthi/tickvault/blob/main/docs/groww-support/2026-07-03-live-feed-volume-missing.md
     Thank you, Parthiban
 
 BEFORE SENDING — operator-fill checklist (every intentional placeholder):
-  1. <GROWW_API_SUPPORT_EMAIL — operator fill before sending>
-       — no Groww support email exists in this repo; do NOT guess one.
+  1. Recipient: FILLED — support@groww.in (confirmed from the groww.in/help
+       Contact-us panel, 2026-07-03 screenshot).
   2. <GROWW_CLIENT_ID — operator fill before sending>  (appears 2x)
        — Groww account identifier; NEVER substitute the Dhan Client ID / UCC
          (those are Dhan credentials — see docs/dhan-support/).
@@ -25,7 +25,7 @@ BEFORE SENDING — operator-fill checklist (every intentional placeholder):
 
 # Live feed delivers zero volume / openInterest / OHLC on every tick — only `ltp` + `tsInMillis` populate — New request
 
-**To:** <GROWW_API_SUPPORT_EMAIL — operator fill before sending>
+**To:** support@groww.in
 **From:** subramaniaparthiban@gmail.com (the Groww-registered account)
 **Subject:** Live feed (growwapi SDK, subscribe_ltp) — volume / openInterest / OHLC are 0.0 on 444,657 consecutive market-hours ticks; only ltp + tsInMillis ever populate (2026-07-03 evidence)
 **Date:** 2026-07-03
@@ -133,6 +133,12 @@ cause of the zero fields.
    instrument on the live feed** (768 NSE_EQ/index instruments), given
    the constraint that we consume the live stream only (no per-instrument
    REST polling)?
+5. **If cumulative day volume / OI is not currently available on ANY
+   live-feed subscription mode, please treat this as a formal feature
+   request:** adding a per-instrument cumulative `volume` (and
+   `openInterest` for F&O) field to the live feed would make it fully
+   usable for volume-aware trading systems — is this on your roadmap,
+   and can it be prioritized?
 
 ---
 
