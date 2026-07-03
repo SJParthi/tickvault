@@ -235,9 +235,12 @@ pub fn load_feed_state(path: &Path) -> Option<PersistedFeedState> {
 pub fn overlay_feeds(config: FeedsConfig, persisted: Option<PersistedFeedState>) -> FeedsConfig {
     match persisted {
         None => config,
+        // The persisted overlay carries ONLY the runtime toggles; the
+        // `[feeds.groww]` tuning (auto-scale §34) always comes from config.
         Some(p) => FeedsConfig {
             dhan_enabled: p.dhan_enabled,
             groww_enabled: p.groww_enabled,
+            groww: config.groww,
         },
     }
 }
@@ -398,6 +401,7 @@ mod tests {
         let config = FeedsConfig {
             dhan_enabled: true,
             groww_enabled: false,
+            ..Default::default()
         };
         let persisted = Some(PersistedFeedState {
             dhan_enabled: false,
@@ -415,6 +419,7 @@ mod tests {
         let config = FeedsConfig {
             dhan_enabled: true,
             groww_enabled: false,
+            ..Default::default()
         };
         let effective = overlay_feeds(config.clone(), None);
         assert_eq!(effective.dhan_enabled, config.dhan_enabled);
@@ -437,6 +442,7 @@ mod tests {
         let config = FeedsConfig {
             dhan_enabled: true,
             groww_enabled: false,
+            ..Default::default()
         };
         let effective = overlay_feeds(config.clone(), load_feed_state(&path));
         assert_eq!(effective.dhan_enabled, config.dhan_enabled);
@@ -475,6 +481,7 @@ mod tests {
         let cfg = FeedsConfig {
             dhan_enabled: true,
             groww_enabled: false,
+            ..Default::default()
         };
         let identity = overlay_feeds(cfg.clone(), None);
         assert_eq!(identity.dhan_enabled, cfg.dhan_enabled);

@@ -96,6 +96,11 @@ pub struct FeedsConfig {
     /// Groww live feed (feed #2). Default OFF — opt-in so prod behaviour
     /// is unchanged until explicitly enabled.
     pub groww_enabled: bool,
+    /// `[feeds.groww]` — Groww-feed tuning sub-table (auto-scale §34,
+    /// operator authorization 2026-07-03). A missing sub-table keeps the
+    /// single-connection behaviour byte-identical.
+    #[serde(default)]
+    pub groww: GrowwFeedTuning,
 }
 
 impl Default for FeedsConfig {
@@ -103,7 +108,242 @@ impl Default for FeedsConfig {
         Self {
             dhan_enabled: true,
             groww_enabled: false,
+            groww: GrowwFeedTuning::default(),
         }
+    }
+}
+
+/// `[feeds.groww]` — Groww feed tuning container (auto-scale §34).
+///
+/// Nested under `[feeds]` so the TOML surface reads
+/// `[feeds.groww.scale]` exactly as the design doc specifies, while the
+/// existing flat `groww_enabled` key in `[feeds]` is untouched.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct GrowwFeedTuning {
+    /// `[feeds.groww.scale]` — multi-connection auto-scale ladder config.
+    #[serde(default)]
+    pub scale: GrowwScaleConfig,
+}
+
+/// Tier A ceiling (§34.2, operator lock 2026-07-03): the Monday-approved
+/// maximum connection count. Raising `target_connections` above this
+/// requires the Tier B live-measurement gate recorded with a dated note.
+pub const GROWW_SCALE_TIER_A_MAX_CONNS: usize = 10;
+
+/// Tier B ceiling (§34.2): 11–25 connections, gated on a live RAM/CPU/disk
+/// measurement at the Tier A ceiling.
+pub const GROWW_SCALE_TIER_B_MAX_CONNS: usize = 25;
+
+/// Hard maximum connection count (§34.2 Tier C): 100 connections requires
+/// infra sign-off (instance/EBS/QuestDB re-measure). `validate()` REJECTS
+/// any `target_connections` above this regardless of tier evidence.
+pub const GROWW_SCALE_HARD_MAX_CONNS: usize = 100;
+
+/// Groww live-feed per-session subscription hard cap (documented "upto 1000
+/// subscriptions are allowed at a time"). Mirrors
+/// `tickvault-core::feed::groww::instruments::GROWW_MAX_SUBSCRIPTIONS`
+/// (common cannot depend on core; core's `groww_scale_config_cap_matches`
+/// ratchet pins the two constants equal).
+pub const GROWW_SCALE_MAX_INSTRUMENTS_PER_CONN: usize = 1000;
+
+/// `[feeds.groww.scale]` — Groww multi-connection AUTO-SCALE ladder
+/// (operator authorization 2026-07-03, §34 of
+/// `.claude/rules/project/groww-second-feed-scope-2026-06-19.md`).
+///
+/// `enabled = false` (the default) routes through the existing
+/// single-connection sidecar path — zero new processes, zero new file
+/// paths, byte-identical behaviour. When enabled, the ladder grows the
+/// sidecar fleet through `ladder` rungs toward `target_connections`, each
+/// connection owning a disjoint range-based shard of ≤
+/// `instruments_per_conn` instruments, advancing ONLY while every gate
+/// holds for `gate_hold_minutes` inside the `advance_window_ist` window,
+/// and auto-correcting every failure (rollback to last-healthy + expo
+/// hold; fleet-wide failure → global cooldown + halve). See
+/// `.claude/rules/project/groww-scale-error-codes.md` for the failure
+/// taxonomy (GROWW-SCALE-01..04).
+#[derive(Debug, Clone, Deserialize)]
+pub struct GrowwScaleConfig {
+    /// Master switch. Default OFF — single-connection path, byte-identical.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Ladder ceiling. Default 10 = Tier A (§34.2). Values above
+    /// [`GROWW_SCALE_HARD_MAX_CONNS`] are rejected at boot.
+    #[serde(default = "default_groww_scale_target_connections")]
+    pub target_connections: usize,
+    /// Instruments per connection shard. Default 1000 = the documented
+    /// Groww per-session cap ([`GROWW_SCALE_MAX_INSTRUMENTS_PER_CONN`]).
+    #[serde(default = "default_groww_scale_instruments_per_conn")]
+    pub instruments_per_conn: usize,
+    /// Day-1 rungs the ladder climbs (strictly increasing; last rung ≤
+    /// `target_connections`). Default `[1, 2, 5, 10]`.
+    #[serde(default = "default_groww_scale_ladder")]
+    pub ladder: Vec<usize>,
+    /// How long EVERY advance gate must hold before the next rung fires.
+    #[serde(default = "default_groww_scale_gate_hold_minutes")]
+    pub gate_hold_minutes: u64,
+    /// Advance gate: box CPU must be below this percentage.
+    #[serde(default = "default_groww_scale_gate_max_cpu_pct")]
+    pub gate_max_cpu_pct: f64,
+    /// Advance gate: free disk in the capture directory must exceed this
+    /// percentage of the volume.
+    #[serde(default = "default_groww_scale_gate_min_disk_free_pct")]
+    pub gate_min_disk_free_pct: f64,
+    /// Advance gate: per-shard capture lag (now − max tick ts) p99 must be
+    /// below this many milliseconds. Default 30_000 (30s).
+    #[serde(default = "default_groww_scale_gate_max_capture_lag_ms")]
+    pub gate_max_capture_lag_ms: u64,
+    /// Base hold after a failed rung attempt; doubles per consecutive
+    /// failure at the SAME rung, capped at 4h (ladder-side constant).
+    #[serde(default = "default_groww_scale_rollback_hold_base_minutes")]
+    pub rollback_hold_base_minutes: u64,
+    /// ADVANCING is allowed only inside this IST window (`["HH:MM","HH:MM"]`,
+    /// start < end) or pre-open. Default `["09:20", "14:30"]` — never in the
+    /// open/close burst windows.
+    #[serde(default = "default_groww_scale_advance_window_ist")]
+    pub advance_window_ist: [String; 2],
+}
+
+fn default_groww_scale_target_connections() -> usize {
+    GROWW_SCALE_TIER_A_MAX_CONNS
+}
+fn default_groww_scale_instruments_per_conn() -> usize {
+    GROWW_SCALE_MAX_INSTRUMENTS_PER_CONN
+}
+fn default_groww_scale_ladder() -> Vec<usize> {
+    vec![1, 2, 5, 10]
+}
+fn default_groww_scale_gate_hold_minutes() -> u64 {
+    15
+}
+fn default_groww_scale_gate_max_cpu_pct() -> f64 {
+    70.0
+}
+fn default_groww_scale_gate_min_disk_free_pct() -> f64 {
+    20.0
+}
+fn default_groww_scale_gate_max_capture_lag_ms() -> u64 {
+    30_000
+}
+fn default_groww_scale_rollback_hold_base_minutes() -> u64 {
+    10
+}
+fn default_groww_scale_advance_window_ist() -> [String; 2] {
+    [String::from("09:20"), String::from("14:30")]
+}
+
+impl Default for GrowwScaleConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            target_connections: default_groww_scale_target_connections(),
+            instruments_per_conn: default_groww_scale_instruments_per_conn(),
+            ladder: default_groww_scale_ladder(),
+            gate_hold_minutes: default_groww_scale_gate_hold_minutes(),
+            gate_max_cpu_pct: default_groww_scale_gate_max_cpu_pct(),
+            gate_min_disk_free_pct: default_groww_scale_gate_min_disk_free_pct(),
+            gate_max_capture_lag_ms: default_groww_scale_gate_max_capture_lag_ms(),
+            rollback_hold_base_minutes: default_groww_scale_rollback_hold_base_minutes(),
+            advance_window_ist: default_groww_scale_advance_window_ist(),
+        }
+    }
+}
+
+impl GrowwScaleConfig {
+    /// Validates the auto-scale envelope at boot, BEFORE any sidecar
+    /// process spawns (fail-closed per §34). Pure — no I/O, no clock.
+    ///
+    /// # Errors
+    /// Returns a descriptive error for the first violation found:
+    /// connection/instrument caps, non-increasing ladder, ladder rung above
+    /// the target, malformed/inverted advance window, zero gate values, or
+    /// non-finite percentage gates.
+    pub fn validate(&self) -> Result<()> {
+        if self.target_connections == 0 || self.target_connections > GROWW_SCALE_HARD_MAX_CONNS {
+            bail!(
+                "feeds.groww.scale.target_connections must be in [1, {}], got {}",
+                GROWW_SCALE_HARD_MAX_CONNS,
+                self.target_connections
+            );
+        }
+        if self.instruments_per_conn == 0
+            || self.instruments_per_conn > GROWW_SCALE_MAX_INSTRUMENTS_PER_CONN
+        {
+            bail!(
+                "feeds.groww.scale.instruments_per_conn must be in [1, {}] (Groww per-session cap), got {}",
+                GROWW_SCALE_MAX_INSTRUMENTS_PER_CONN,
+                self.instruments_per_conn
+            );
+        }
+        if self.ladder.is_empty() {
+            bail!("feeds.groww.scale.ladder must not be empty");
+        }
+        for pair in self.ladder.windows(2) {
+            if pair[1] <= pair[0] {
+                bail!(
+                    "feeds.groww.scale.ladder must be strictly increasing, got {:?}",
+                    self.ladder
+                );
+            }
+        }
+        if self.ladder[0] == 0 {
+            bail!("feeds.groww.scale.ladder rungs must be >= 1");
+        }
+        // Strictly-increasing + non-empty ⇒ last() exists and is the max.
+        if let Some(&last) = self.ladder.last()
+            && last > self.target_connections
+        {
+            bail!(
+                "feeds.groww.scale.ladder last rung ({}) exceeds target_connections ({})",
+                last,
+                self.target_connections
+            );
+        }
+        if self.gate_hold_minutes == 0 {
+            bail!("feeds.groww.scale.gate_hold_minutes must be > 0");
+        }
+        if self.rollback_hold_base_minutes == 0 {
+            bail!("feeds.groww.scale.rollback_hold_base_minutes must be > 0");
+        }
+        if self.gate_max_capture_lag_ms == 0 {
+            bail!("feeds.groww.scale.gate_max_capture_lag_ms must be > 0");
+        }
+        if !self.gate_max_cpu_pct.is_finite()
+            || self.gate_max_cpu_pct <= 0.0
+            || self.gate_max_cpu_pct > 100.0
+        {
+            bail!(
+                "feeds.groww.scale.gate_max_cpu_pct must be a finite value in (0, 100], got {}",
+                self.gate_max_cpu_pct
+            );
+        }
+        if !self.gate_min_disk_free_pct.is_finite()
+            || self.gate_min_disk_free_pct < 0.0
+            || self.gate_min_disk_free_pct >= 100.0
+        {
+            bail!(
+                "feeds.groww.scale.gate_min_disk_free_pct must be a finite value in [0, 100), got {}",
+                self.gate_min_disk_free_pct
+            );
+        }
+        let parse_hm = |field: &str, value: &str| -> Result<NaiveTime> {
+            NaiveTime::parse_from_str(value, "%H:%M").map_err(|_| {
+                anyhow::anyhow!(
+                    "feeds.groww.scale.advance_window_ist {} is not a valid HH:MM time: '{}'",
+                    field,
+                    value
+                )
+            })
+        };
+        let start = parse_hm("start", &self.advance_window_ist[0])?;
+        let end = parse_hm("end", &self.advance_window_ist[1])?;
+        if start >= end {
+            bail!(
+                "feeds.groww.scale.advance_window_ist start ('{}') must be before end ('{}')",
+                self.advance_window_ist[0],
+                self.advance_window_ist[1]
+            );
+        }
+        Ok(())
     }
 }
 
@@ -1428,6 +1668,12 @@ impl ApplicationConfig {
                 "https://",
             )?;
         }
+
+        // §34 (2026-07-03): Groww multi-connection auto-scale — the ladder
+        // envelope is validated at boot, BEFORE any sidecar process spawns
+        // (fail-closed; the default scale.enabled=false section is always
+        // valid, so today's single-conn boot is unaffected).
+        self.feeds.groww.scale.validate()?;
 
         Ok(())
     }
@@ -3050,30 +3296,233 @@ mod tests {
         assert!(
             !FeedsConfig {
                 dhan_enabled: false,
-                groww_enabled: false
+                groww_enabled: false,
+                ..Default::default()
             }
             .any_enabled()
         );
         assert!(
             FeedsConfig {
                 dhan_enabled: true,
-                groww_enabled: false
+                groww_enabled: false,
+                ..Default::default()
             }
             .any_enabled()
         );
         assert!(
             FeedsConfig {
                 dhan_enabled: false,
-                groww_enabled: true
+                groww_enabled: true,
+                ..Default::default()
             }
             .any_enabled()
         );
         assert!(
             FeedsConfig {
                 dhan_enabled: true,
-                groww_enabled: true
+                groww_enabled: true,
+                ..Default::default()
             }
             .any_enabled()
         );
+    }
+
+    // =======================================================================
+    // Groww multi-connection auto-scale (§34, operator authorization
+    // 2026-07-03) — `[feeds.groww.scale]` contract tests.
+    // See `.claude/rules/project/groww-scale-error-codes.md` +
+    // `.claude/plans/active-plan-groww-autoscale.md`.
+    // =======================================================================
+
+    /// RATCHET: the scale defaults MUST be OFF + Tier A. Flipping
+    /// `enabled` to true by default, or raising the default target above
+    /// the Tier A ceiling, requires a fresh dated operator quote (§34.4).
+    #[test]
+    fn test_groww_scale_defaults_are_off_and_tier_a() {
+        let scale = GrowwScaleConfig::default();
+        assert!(!scale.enabled, "scale must default OFF (single-conn path)");
+        assert_eq!(scale.target_connections, GROWW_SCALE_TIER_A_MAX_CONNS);
+        assert_eq!(
+            scale.instruments_per_conn,
+            GROWW_SCALE_MAX_INSTRUMENTS_PER_CONN
+        );
+        assert_eq!(scale.ladder, vec![1, 2, 5, 10], "day-1 rungs per design");
+        assert_eq!(scale.gate_hold_minutes, 15);
+        assert!((scale.gate_max_cpu_pct - 70.0).abs() < f64::EPSILON);
+        assert!((scale.gate_min_disk_free_pct - 20.0).abs() < f64::EPSILON);
+        assert_eq!(scale.gate_max_capture_lag_ms, 30_000);
+        assert_eq!(scale.rollback_hold_base_minutes, 10);
+        assert_eq!(scale.advance_window_ist[0], "09:20");
+        assert_eq!(scale.advance_window_ist[1], "14:30");
+        // Tier ordering sanity: A < B < hard max.
+        assert!(GROWW_SCALE_TIER_A_MAX_CONNS < GROWW_SCALE_TIER_B_MAX_CONNS);
+        assert!(GROWW_SCALE_TIER_B_MAX_CONNS < GROWW_SCALE_HARD_MAX_CONNS);
+    }
+
+    /// `[feeds.groww.scale]` parses from TOML (partial keys allowed —
+    /// unspecified fields fall back to defaults).
+    #[test]
+    fn test_groww_scale_parses_from_toml() {
+        use figment::Figment;
+        use figment::providers::{Format, Toml};
+
+        #[derive(Deserialize)]
+        struct Wrapper {
+            #[serde(default)]
+            feeds: FeedsConfig,
+        }
+        let toml = concat!(
+            "[feeds]\n",
+            "dhan_enabled = false\n",
+            "groww_enabled = true\n",
+            "\n",
+            "[feeds.groww.scale]\n",
+            "enabled = true\n",
+            "target_connections = 4\n",
+            "instruments_per_conn = 500\n",
+            "ladder = [1, 2, 4]\n",
+        );
+        let wrapper: Wrapper = Figment::new()
+            .merge(Toml::string(toml))
+            .extract()
+            .expect("[feeds.groww.scale] must parse");
+        let scale = &wrapper.feeds.groww.scale;
+        assert!(scale.enabled);
+        assert_eq!(scale.target_connections, 4);
+        assert_eq!(scale.instruments_per_conn, 500);
+        assert_eq!(scale.ladder, vec![1, 2, 4]);
+        // Unspecified keys fall back to defaults.
+        assert_eq!(scale.gate_hold_minutes, 15);
+        assert_eq!(scale.advance_window_ist[0], "09:20");
+        assert!(scale.validate().is_ok());
+    }
+
+    /// A missing `[feeds.groww]` / `[feeds.groww.scale]` sub-table must
+    /// fall back to the safe OFF default — never error (byte-identical
+    /// single-conn behaviour).
+    #[test]
+    fn test_groww_scale_missing_section_defaults() {
+        use figment::Figment;
+        use figment::providers::{Format, Toml};
+
+        #[derive(Deserialize)]
+        struct Wrapper {
+            #[serde(default)]
+            feeds: FeedsConfig,
+        }
+        let wrapper: Wrapper = Figment::new()
+            .merge(Toml::string(
+                "[feeds]\ndhan_enabled = true\ngroww_enabled = false\n",
+            ))
+            .extract()
+            .expect("missing [feeds.groww.scale] must use defaults, not error");
+        assert!(!wrapper.feeds.groww.scale.enabled);
+        assert_eq!(
+            wrapper.feeds.groww.scale.target_connections,
+            GROWW_SCALE_TIER_A_MAX_CONNS
+        );
+    }
+
+    /// The shipped defaults must validate clean (a fresh deployment can
+    /// never fail boot on the scale section).
+    #[test]
+    fn test_groww_scale_validate_accepts_defaults() {
+        assert!(GrowwScaleConfig::default().validate().is_ok());
+    }
+
+    /// FINANCIAL/ENVELOPE BOUNDARY: per-conn cap 0 and >1000 (the Groww
+    /// per-session hard cap) are both rejected; exactly 1000 is accepted.
+    #[test]
+    fn test_groww_scale_validate_rejects_zero_per_conn() {
+        let per_conn = |n: usize| GrowwScaleConfig {
+            instruments_per_conn: n,
+            ..Default::default()
+        };
+        assert!(
+            per_conn(0).validate().is_err(),
+            "0 per-conn must be rejected"
+        );
+        assert!(
+            per_conn(GROWW_SCALE_MAX_INSTRUMENTS_PER_CONN + 1)
+                .validate()
+                .is_err(),
+            "1001 per-conn must be rejected"
+        );
+        assert!(
+            per_conn(GROWW_SCALE_MAX_INSTRUMENTS_PER_CONN)
+                .validate()
+                .is_ok(),
+            "exactly 1000 is the boundary-OK"
+        );
+    }
+
+    /// ENVELOPE BOUNDARY: target_connections 0 and >100 (Tier C hard max)
+    /// are rejected; exactly 100 passes the config envelope (tier
+    /// EVIDENCE is a review-time gate per §34.2, not a config check).
+    #[test]
+    fn test_groww_scale_validate_rejects_over_hard_max() {
+        let mut scale = GrowwScaleConfig {
+            target_connections: 0,
+            ..Default::default()
+        };
+        assert!(scale.validate().is_err(), "0 target must be rejected");
+        scale.target_connections = GROWW_SCALE_HARD_MAX_CONNS + 1;
+        assert!(scale.validate().is_err(), "101 target must be rejected");
+        scale.target_connections = GROWW_SCALE_HARD_MAX_CONNS;
+        assert!(scale.validate().is_ok(), "exactly 100 is the boundary-OK");
+    }
+
+    /// The ladder must be strictly increasing and non-empty; rung 0 is
+    /// rejected.
+    #[test]
+    fn test_groww_scale_validate_rejects_non_increasing_ladder() {
+        let mut scale = GrowwScaleConfig {
+            ladder: vec![10, 5],
+            ..Default::default()
+        };
+        assert!(scale.validate().is_err(), "decreasing ladder rejected");
+        scale.ladder = vec![1, 1, 2];
+        assert!(scale.validate().is_err(), "duplicate rung rejected");
+        scale.ladder = vec![];
+        assert!(scale.validate().is_err(), "empty ladder rejected");
+        scale.ladder = vec![0, 1];
+        assert!(scale.validate().is_err(), "rung 0 rejected");
+        scale.ladder = vec![1, 2, 5, 10];
+        assert!(scale.validate().is_ok());
+    }
+
+    /// The last rung must not exceed target_connections (the ladder can
+    /// never climb past its own ceiling).
+    #[test]
+    fn test_groww_scale_validate_rejects_ladder_above_target() {
+        let mut scale = GrowwScaleConfig {
+            target_connections: 5,
+            ladder: vec![1, 2, 5, 10],
+            ..Default::default()
+        };
+        assert!(scale.validate().is_err(), "rung 10 > target 5 rejected");
+        scale.ladder = vec![1, 2, 5];
+        assert!(
+            scale.validate().is_ok(),
+            "rung == target is the boundary-OK"
+        );
+    }
+
+    /// The advance window must be two valid HH:MM strings with start < end.
+    #[test]
+    fn test_groww_scale_validate_rejects_bad_window() {
+        let mut scale = GrowwScaleConfig {
+            advance_window_ist: [String::from("nine-ish"), String::from("14:30")],
+            ..Default::default()
+        };
+        assert!(scale.validate().is_err(), "non-time string rejected");
+        scale.advance_window_ist = [String::from("25:00"), String::from("26:00")];
+        assert!(scale.validate().is_err(), "hour 25 rejected");
+        scale.advance_window_ist = [String::from("14:30"), String::from("09:20")];
+        assert!(scale.validate().is_err(), "inverted window rejected");
+        scale.advance_window_ist = [String::from("09:20"), String::from("09:20")];
+        assert!(scale.validate().is_err(), "zero-width window rejected");
+        scale.advance_window_ist = [String::from("09:20"), String::from("14:30")];
+        assert!(scale.validate().is_ok());
     }
 }

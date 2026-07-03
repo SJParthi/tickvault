@@ -297,3 +297,98 @@ can the PR land.
 
 Always loaded (this file is under `.claude/rules/project/`). Reinforced on any session that
 edits Groww feed code, the parity plan, or proposes any Groww historical/backtest fetch.
+
+---
+
+# §34 — Groww multi-connection AUTO-SCALE (operator authorization 2026-07-03)
+
+> **Authority:** this section EXTENDS the Groww feed scope (§1/§2). The **Dhan
+> 2-WS lock is UNCHANGED** — zero new Dhan connections, no Dhan code touched.
+> The §33 LIVE-FEED-ONLY lock is UNCHANGED — the scaled connections carry LIVE
+> ticks only, no historical pulls. Companion plan:
+> `.claude/plans/active-plan-groww-autoscale.md`. Companion error codes:
+> `.claude/rules/project/groww-scale-error-codes.md` (GROWW-SCALE-01..04).
+
+## §34.0 The verbatim operator demands (preserve exactly, do not paraphrase)
+
+**Quote 11 (2026-07-03 evening — multi-connection auto-scale):**
+> "I planned to establish multiple connections… 100 parallel connections to
+> test 100k instruments… every ten connection should hold 1k instruments per
+> connection… incremental dynamic scalable connections of max 100 connections
+> starting 10… when auto scale up happens if there is any failure how that can
+> be auto corrected"
+
+**Execution confirmation (2026-07-03 evening):** Mac-first execution confirmed
+— the first live scale test runs on the operator's Mac (Dhan disabled,
+groww-only profile, local QuestDB), NOT on the AWS prod box.
+
+## §34.1 The rule — one paragraph
+
+The GROWW feed (only) is authorized to open up to `target_connections` Groww
+NATS-over-WS connections, each subscribing ≤ 1,000 instruments (the documented
+Groww per-session cap), driven by a **gated auto-scale ladder** (day-1 rungs
+`[1, 2, 5, 10]`; PROBING → HOLDING → ADVANCING with rollback-to-last-healthy +
+exponential hold on any rung failure, and global cooldown + halve on
+fleet-wide failure). Sharding is deterministic RANGE-BASED (contiguous
+`(exchange, segment, security_id)` ranges of ≤ `instruments_per_conn`), with a
+fail-closed disjointness + coverage assertion. Every shard reuses the existing
+capture-at-receipt → ring → spill → DLQ → shared-aggregator chain unchanged;
+capture_seq stays globally unique via the ONE shared process-wide atomic. The
+default remains `feeds.groww.scale.enabled = false` — single connection,
+byte-identical to today.
+
+## §34.2 Capacity tiers (capacity-math, 2026-07-03 — mechanical bounds)
+
+| Tier | Conns / SIDs | Status | Gate to enter |
+|---|---|---|---|
+| **A** | ≤ 10 conns / ≤ 10k SIDs | **Approved for Monday** (Mac-first, then r8g.large 16 GiB within measured envelope) | this §34 authorization |
+| **B** | 11–25 conns / ≤ 25k SIDs | GATED | live RAM + CPU + disk measurement at the Tier A ceiling, recorded with a dated note |
+| **C** | 26–100 conns / ≤ 100k SIDs | REQUIRES INFRA SIGN-OFF | instance re-size per §7 Mechanical Rule 1 of the daily-universe lock + QuestDB write-pressure re-measure + EBS re-size, each with dated operator approval |
+
+A PR raising `target_connections` beyond the current tier without the dated
+measurement + sign-off = REJECT.
+
+## §34.3 Honest envelope (mandatory §F wording)
+
+> "100% inside the tested envelope, with ratcheted regression coverage:
+> auto-correction covers the 16 failure classes in the design taxonomy —
+> detect ≤30s (per-conn stall watchdog), rollback to last-healthy rung, expo
+> hold 10m→4h, retry forever in market hours; capture-at-receipt durability
+> per shard → the existing ring→spill→DLQ. NOT claimed: Groww's server-side
+> per-account connection AND subscription caps are UNKNOWN until live-probed —
+> the ladder (and the 2×600 cap probe) DISCOVERS them and holds below; that is
+> the design, not a defect. The Python hop is not O(1) (GIL jitter, existing
+> §32 envelope); upstream ticks Groww never delivers are invisible (existing
+> §5 CAPTURE vs UPSTREAM split)."
+
+## §34.4 What a PR that violates this section looks like (REJECT)
+
+- Ships `feeds.groww.scale.enabled = true` as the DEFAULT without a fresh
+  dated operator quote.
+- Exceeds the current tier's connection cap without the §34.2 gate evidence.
+- Adds a Dhan connection, or touches the Dhan pipeline, in the name of
+  scaling Groww.
+- Bypasses the ladder (jumping straight to N conns with no gates/rollback).
+- Weakens the shard disjointness/coverage assertion or removes the shared
+  capture_seq atomic (silent cross-shard dedup collision risk).
+- Gives a scaled shard a weaker resilience chain than the single-conn path.
+
+## §34.5 Auto-driver / Insta-reel explanation
+
+> Sir, the juice shop's Groww price board gets helpers. Today ONE boy watches
+> 1,000 fruits. The new plan: start with a few boys, and only when every boy
+> has been reading prices smoothly for 15 minutes do we add more — 1, then 2,
+> then 5, then 10 boys (each watching his OWN 1,000 fruits, no two boys
+> watching the same fruit). If a new boy faints, we send the newest boys home
+> and go back to the last team that worked, wait, and try again — all
+> automatically, no phone call needed. If ALL boys collapse at once, that's
+> the market gate telling us to slow down: we wait 5 minutes and come back
+> with half the team. The dream is 100 boys / 100,000 fruits — but only after
+> we PROVE the shop floor (the Mac first, then the server) can hold them.
+
+## §34.6 Trigger (auto-loaded)
+
+Always loaded. Reinforced on any session editing `crates/core/src/feed/groww/shard_cutter.rs`,
+`crates/app/src/groww_scale_ladder.rs`, `crates/app/src/groww_sidecar_supervisor.rs`,
+`[feeds.groww.scale]` config, or any file containing `GrowwScaleConfig`, `cut_shards`,
+`GROWW_SHARD_SPEC`, or `groww_scale_audit`.

@@ -461,6 +461,7 @@ mod tests {
         let fr = Arc::new(FeedRuntimeState::from_config(&FeedsConfig {
             dhan_enabled: true,
             groww_enabled: true,
+            ..Default::default()
         }));
         let state = SharedAppState::new_with_feed_runtime(
             QuestDbConfig {
