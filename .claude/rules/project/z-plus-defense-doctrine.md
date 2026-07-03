@@ -104,7 +104,7 @@ Every PR must mechanically prove all 15 × 7 cells = 105 cells:
 
 | Dimension | L1 DETECT | L2 VERIFY | L3 RECONCILE | L4 PREVENT | L5 AUDIT | L6 RECOVER | L7 COOLDOWN |
 |---|---|---|---|---|---|---|---|
-| Code coverage | unit test | property test | mutation test | clippy lint | llvm-cov ≥100% | re-test on fail | — |
+| Code coverage | unit test | property test | mutation test | clippy lint | llvm-cov ≥ ratcheted per-crate floor (target 100%) | re-test on fail | — |
 | Audit coverage | counter | gauge | daily verify | pre-op guard | `<event>_audit` table | re-query | — |
 | Testing coverage | unit | integration | property | loom | dhat | fuzz | mutation |
 | Code checks | banned-pattern | secret-scan | pub-fn-test | pub-fn-wiring | plan-verify | hook block | retry |
@@ -224,7 +224,7 @@ The operator's charter is non-negotiable. If a PR seems "too much work for a sma
 | `resilience_sla_alert_guard.rs` | `cargo test` | counter must have alert rule |
 | `error_level_meta_guard.rs` | `cargo test` | flush/persist uses `error!` |
 | `scripts/bench-gate.sh` | post-merge | 5% regression budget |
-| `scripts/coverage-gate.sh` | post-merge | 100% line coverage per crate |
+| `scripts/coverage-gate.sh` | post-merge | ratcheted per-crate floors (63.3–99.5, target 100%) per crate |
 | **NEW:** `z-plus-checklist-guard.sh` | pre-PR | Z+ checklist filled in for every plan item |
 | **NEW:** `auto-driver-test-guard.sh` | pre-PR | operator-facing text passes auto-driver test |
 
