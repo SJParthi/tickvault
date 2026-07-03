@@ -142,6 +142,13 @@ Smallest packet. LTP + LTT only.
 
 Sent automatically whenever ANY instrument is subscribed (any mode). Provides previous day's close data.
 
+> **VERIFIED (Ticket #5525125, 2026-04-10) — the upstream wording above is WRONG about scope:**
+> Dhan support CONFIRMED the standalone code-6 PrevClose packet is emitted **for IDX_I
+> (indices) ONLY**. NSE_EQ and NSE_FNO subscriptions NEVER receive code-6 packets — their
+> previous-day close arrives inside the Quote/Full packets via the "Day Close" field (see
+> §7.3/§7.5 corrections). Waiting for code 6 on equities/derivatives is a bug. Authoritative
+> routing matrix + ratchet tests: `.claude/rules/dhan/live-market-feed.md` rules 7/8/10.
+
 | Byte Position | Type    | Size (bytes) | Description                          |
 |---------------|---------|--------------|--------------------------------------|
 | `0-8`         | array   | 8            | Response Header (code `6`)           |
@@ -169,11 +176,18 @@ Complete trade data without market depth.
 | `27-30`       | uint32  | 4            | Total Sell Quantity                                 |
 | `31-34`       | uint32  | 4            | Total Buy Quantity                                  |
 | `35-38`       | float32 | 4            | Day Open                                            |
-| `39-42`       | float32 | 4            | Day Close (only sent **post market close**)         |
+| `39-42`       | float32 | 4            | Day Close (only sent **post market close**) — upstream wording, WRONG per verified note below |
 | `43-46`       | float32 | 4            | Day High                                            |
 | `47-50`       | float32 | 4            | Day Low                                             |
 
 **Total: 50 bytes**
+
+> **VERIFIED (Ticket #5525125, 2026-04-10):** the bytes 39-42 field (0-based `38..42`) is NOT
+> "only sent post market close". Dhan support CONFIRMED it carries the **PREVIOUS trading
+> session's close, streamed LIVE in every Quote packet** — it is the prev-close source for
+> NSE_EQ/NSE_FNO (which never receive a code-6 packet). The upstream label is preserved above
+> for provenance; the ticket-verified semantics are authoritative. Ratchet:
+> `test_prev_close_routing_nse_eq_from_quote` (see `.claude/rules/dhan/live-market-feed.md` rule 8).
 
 ---
 
@@ -210,12 +224,19 @@ Everything: trade data + OI + 5-level market depth in a single packet.
 | `39-42`       | uint32                | 4            | Highest OI for the day (NSE_FNO only)                |
 | `43-46`       | uint32                | 4            | Lowest OI for the day (NSE_FNO only)                 |
 | `47-50`       | float32               | 4            | Day Open                                             |
-| `51-54`       | float32               | 4            | Day Close (only sent **post market close**)          |
+| `51-54`       | float32               | 4            | Day Close (only sent **post market close**) — upstream wording, WRONG per verified note below |
 | `55-58`       | float32               | 4            | Day High                                             |
 | `59-62`       | float32               | 4            | Day Low                                              |
 | `63-162`      | Market Depth (5x20B)  | 100          | 5 levels of market depth (see below)                 |
 
 **Total: 162 bytes**
+
+> **VERIFIED (Ticket #5525125, 2026-04-10):** the bytes 51-54 field (0-based `50..54`) is NOT
+> "only sent post market close". Dhan support CONFIRMED it carries the **PREVIOUS trading
+> session's close, streamed LIVE in every Full packet** — it is the prev-close source for
+> NSE_FNO in Full mode (no code-6 packet exists for derivatives). The upstream label is
+> preserved above for provenance; the ticket-verified semantics are authoritative. Ratchet:
+> `test_prev_close_routing_nse_fno_from_full` (see `.claude/rules/dhan/live-market-feed.md` rule 10).
 
 #### Market Depth Structure (20 bytes per level × 5 levels)
 
@@ -474,10 +495,18 @@ pub struct DisconnectPacket {
 3. **Byte indexing in docs is 1-based** — Dhan docs use 1-based byte positions. In code (0-based arrays), subtract 1. E.g., "bytes 9-12" in docs = `buffer[8..12]` in code.
 
 4. **Response code `6` (Prev Close) arrives on ANY subscription** — even Ticker mode. Your binary dispatcher must handle all response codes.
+   > **VERIFIED (Ticket #5525125, 2026-04-10) — upstream claim WRONG:** code-6 packets are
+   > emitted for **IDX_I ONLY** (any mode). NSE_EQ/NSE_FNO never receive them; their
+   > prev-close arrives in the Quote/Full `close` field. The dispatcher must still HANDLE
+   > code 6 (that part is correct), but never WAIT for it on equities/derivatives.
 
 5. **OI packet (code `5`) is separate from Quote packet (code `4`)** — subscribing to Quote gives you TWO different packet types.
 
 6. **Day Close (in Quote and Full packets) is only valid post-market** — during market hours this field may be zero or stale.
+   > **VERIFIED (Ticket #5525125, 2026-04-10) — upstream claim WRONG:** the field carries the
+   > **PREVIOUS trading session's close, streamed live** in every Quote/Full packet during
+   > market hours. It is the prev-close source for NSE_EQ/NSE_FNO. See the §7.3/§7.5
+   > corrections + `.claude/rules/dhan/live-market-feed.md` (prev-close routing matrix).
 
 7. **OI fields in Full Packet**: `highest_oi` and `lowest_oi` (bytes 39-46) are only populated for NSE_FNO. Other segments = zero.
 
