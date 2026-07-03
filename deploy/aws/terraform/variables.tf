@@ -113,6 +113,12 @@ variable "operator_cidr" {
   }
 }
 
+variable "enable_questdb_console" {
+  description = "Deploy the B4 QuestDB one-click console: API-GW → front Lambda (device-key auth + read-only SQL gate) → VPC proxy Lambda → box:9000 via SG-to-SG only (port 9000 never public). Reuses SSM SecureString /tickvault/<env>/operator/control-secret for auth. Mirrors enable_operator_control_lambda: default false; CI opts prod in via TF_VAR_enable_questdb_console."
+  type        = bool
+  default     = false
+}
+
 variable "telegram_bot_token_ssm_param" {
   description = "SSM parameter name where the Telegram bot token is stored. Defaults to /tickvault/prod/telegram/bot-token: the single real env is prod (TV_ENVIRONMENT=prod, operator 2026-06-30 — dev/staging retired), and the operator-populated prod params already EXIST while the old /tickvault/staging/* path is now EMPTY (the stale staging default would 404 ParameterNotFound in the webhook Lambda)."
   type        = string

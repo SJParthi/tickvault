@@ -1,6 +1,6 @@
 # Operator portal Lambda — action backend for the single-page operator portal
 # (Overview / Data / DB / GitHub / Logs / AWS / Latency tabs).
-# Re-trigger marker: bump to fire terraform-apply (re-zips handler.py). (2026-07-02b — portal DB console: new READ-ONLY "DB" tab (tables list via tables(), click → table_columns + first-100-rows, query grid + client-side CSV download) + hardened _is_safe_sql (single-statement — any ';' except one trailing rejects; '--'/'/*' comments reject; QuestDB mutators backup/checkpoint/snapshot/cancel/set/refresh/detach/attach/dedup/squash/resume/suspend banned anywhere — closes the "select 1; backup table ticks" chaining gap) + server-side 1000-row cap (_cap_sql_rows clamps/appends LIMIT; /exp limit= + head bound output). handler.py-only changes need this bump because terraform-apply only watches deploy/aws/terraform/**)
+# Re-trigger marker: bump to fire terraform-apply (re-zips handler.py). (2026-07-03 — B4 QuestDB one-click console: new `qdb_console_url` action mints a 90s HMAC link token over the same control secret + the Data-tab DB card gains a 🗄 Open QuestDB Console button; QDB_CONSOLE_URL env injected below from questdb-console.tf when var.enable_questdb_console. Previous: 2026-07-02b — portal DB console: new READ-ONLY "DB" tab (tables list via tables(), click → table_columns + first-100-rows, query grid + client-side CSV download) + hardened _is_safe_sql (single-statement — any ';' except one trailing rejects; '--'/'/*' comments reject; QuestDB mutators backup/checkpoint/snapshot/cancel/set/refresh/detach/attach/dedup/squash/resume/suspend banned anywhere — closes the "select 1; backup table ticks" chaining gap) + server-side 1000-row cap (_cap_sql_rows clamps/appends LIMIT; /exp limit= + head bound output). handler.py-only changes need this bump because terraform-apply only watches deploy/aws/terraform/**)
 #
 # WHY: the operator wants ONE place (console URL + Telegram) to view AND control
 # the box, without the AWS console or GitHub UI. Grafana = view; this = control.
@@ -165,6 +165,10 @@ resource "aws_lambda_function" "operator_control" {
       OPERATOR_GITHUB_TOKEN_PARAM   = "/tickvault/${var.environment}/operator/github-token"
       GH_REPO                       = var.operator_github_repo
       GH_DEPLOY_WORKFLOW            = "deploy-aws.yml"
+      # B4: base URL of the QuestDB console front (questdb-console.tf). The
+      # portal's `qdb_console_url` action mints a 90s HMAC link off it; empty
+      # string (console disabled) → the action returns "console not enabled".
+      QDB_CONSOLE_URL = var.enable_questdb_console ? aws_apigatewayv2_stage.questdb_console[0].invoke_url : ""
     }
   }
 }
