@@ -480,12 +480,12 @@ class WipeGate(unittest.TestCase):
     def tearDown(self) -> None:
         handler._control_secret = self._orig  # type: ignore[assignment]
 
-    def _wipe(self, force: bool):
+    def _wipe(self, force: bool, confirm: str = "WIPE"):
         return handler.lambda_handler(
             {
                 "requestContext": {"http": {"method": "POST"}},
                 "headers": {"authorization": "Bearer s3cret-token"},
-                "body": json.dumps({"action": "wipe-questdb", "force": force}),
+                "body": json.dumps({"action": "wipe-questdb", "force": force, "confirm": confirm}),
             },
             None,
         )
@@ -498,6 +498,48 @@ class WipeGate(unittest.TestCase):
 
     def test_wipe_is_in_destructive_set(self) -> None:
         self.assertIn("wipe-questdb", handler._DESTRUCTIVE)
+
+    def test_legacy_destructive_actions_require_server_side_tokens(self) -> None:
+        # PR-5 H-1 (2026-07-02 security MEDIUM): a scripted call with a stolen
+        # bearer + force=true must be 409'd unless it carries the SAME typed
+        # word the portal makes the operator type — verified SERVER-side for
+        # ALL THREE legacy destructive actions (wipe-groww already had this).
+        for resp in (
+            self._wipe(force=True, confirm=""),
+            self._wipe(force=True, confirm="wipe"),
+            self._docker_reset(force=True, confirm=""),
+            self._docker_reset(force=True, confirm="YES"),
+            self._docker_nuke_bare(force=True, confirm=""),
+            self._docker_nuke_bare(force=True, confirm="erase"),
+        ):
+            self.assertEqual(resp["statusCode"], 409)
+            self.assertIn("confirm", json.loads(resp["body"])["error"])
+        # And the client JS forwards each token (no dead server gate).
+        import inspect
+
+        src = inspect.getsource(handler)
+        self.assertIn("call('wipe-questdb',{force:true,confirm:'WIPE'})", src)
+        self.assertIn("call('docker-reset',{force:$('force').checked,confirm:'NUKE-DOCKER'})", src)
+        self.assertIn("call('docker-nuke-bare',{force:true,confirm:'ERASE'})", src)
+
+    def test_wipe_questdb_removes_replay_sources_before_truncate_and_disables_unit(self) -> None:
+        # PR-5 H-2 (hostile F5): the resurrection race — an external
+        # `systemctl start` between TRUNCATE and the replay-source rm let the
+        # booting bridge re-tail the capture file. Two pinned layers:
+        #  (a) replay sources are removed BEFORE the TRUNCATE python block;
+        #  (b) the unit is DISABLED for the wipe window and re-enabled before
+        #      the final start;
+        #  (c) prev_day_ohlcv is in the dynamic truncate targets.
+        import inspect
+
+        src = inspect.getsource(handler)
+        rm_pos = src.index("feed capture/replay sources removed")
+        truncate_pos = src.index("PYWIPE")
+        self.assertLess(rm_pos, truncate_pos, "replay-source rm must precede TRUNCATE")
+        disable_pos = src.index('"systemctl disable tickvault || true",\n                "pkill -f groww_sidecar.py')
+        self.assertLess(disable_pos, rm_pos, "unit must be disabled before the wipe body")
+        self.assertIn("t == 'prev_day_ohlcv'", src)
+        self.assertIn('"systemctl enable tickvault || true"', src)
 
     def test_wipe_is_resurrect_proof_and_dynamic(self) -> None:
         # Operator incident 2026-07-02: the wipe TRUNCATEd 6 hardcoded tables
@@ -615,12 +657,12 @@ class WipeGate(unittest.TestCase):
         self.assertIn("ensure-questdb.sh", joined)
         self.assertIn("systemctl restart tickvault", joined)
 
-    def _docker_nuke_bare(self, force: bool):
+    def _docker_nuke_bare(self, force: bool, confirm: str = "ERASE"):
         return handler.lambda_handler(
             {
                 "requestContext": {"http": {"method": "POST"}},
                 "headers": {"authorization": "Bearer s3cret-token"},
-                "body": json.dumps({"action": "docker-nuke-bare", "force": force}),
+                "body": json.dumps({"action": "docker-nuke-bare", "force": force, "confirm": confirm}),
             },
             None,
         )

@@ -14,6 +14,12 @@
    - Exact mapping: `IDX_I=0`, `NSE_EQ=1`, `NSE_FNO=2`, `NSE_CURRENCY=3`, `BSE_EQ=4`, `MCX_COMM=5`, `BSE_CURRENCY=7`, `BSE_FNO=8`
    - **There is NO enum 6.** Gap between MCX_COMM(5) and BSE_CURRENCY(7).
    - `from_byte()` must return `None` for unknown values including 6. No panic, no unreachable.
+   - **2026-07-03 upstream update:** the live annexure REMOVED `NSE_CURRENCY=3` and
+     `BSE_CURRENCY=7` (NSE currency derivatives discontinued; the 2026-06-02 snapshot still
+     had them). Our decode-side enums RETAIN 3/7 as defensive arms — Dhan never emits them,
+     no subscription path uses currency, and keeping them honors the no-panic-on-unknown
+     contract. Do NOT delete the variants; do NOT add currency subscriptions. See
+     `docs/dhan-ref/08-annexure-enums.md` "2026-07-03 Upstream Update" §(a).
 
 3. **FeedRequestCode — exact numeric codes.**
    - `11`=Connect, `12`=Disconnect, `15`=SubscribeTicker, `16`=UnsubscribeTicker, `17`=SubscribeQuote, `18`=UnsubscribeQuote, `21`=SubscribeFull, `22`=UnsubscribeFull, `23`=SubscribeFullDepth, `25`=UnsubscribeFullDepth
@@ -35,9 +41,20 @@
 
 7. **InstrumentType — exactly 10 variants.**
    - `INDEX`, `FUTIDX`, `OPTIDX`, `EQUITY`, `FUTSTK`, `OPTSTK`, `FUTCOM`, `OPTFUT`, `FUTCUR`, `OPTCUR`
+   - **2026-07-03 upstream update:** the live annexure now lists 8 types — `FUTCUR`/`OPTCUR`
+     dropped with the currency-segment removal. Our enum variants are KEPT (CSV back-compat;
+     in crates they appear only in exclusion filters + `types.rs`). See
+     `docs/dhan-ref/08-annexure-enums.md` "2026-07-03 Upstream Update" §(c).
 
 8. **ExpiryCode — exactly 3 values.**
    - `0`=Current/Near, `1`=Next, `2`=Far
+   - **2026-07-03 upstream update — UNVERIFIED-LIVE:** the live annexure renumbered to
+     `1`=Near, `2`=Next, `3`=Far. No runtime consumer exists (the historical fetch chain —
+     the only `expiryCode` send site — was deleted 2026-05-26; re-adding it is banned by
+     `no-rest-except-live-feed-2026-06-27.md`), so our `ExpiryCode` enum stays 0/1/2. Any
+     FUTURE consumer MUST live-probe `/v2/charts/historical` with BOTH conventions before
+     trusting either numbering. See `docs/dhan-ref/08-annexure-enums.md` "2026-07-03
+     Upstream Update" §(b).
 
 9. **AfterMarketOrder — exactly 4 values.**
    - `PRE_OPEN`, `OPEN`, `OPEN_30`, `OPEN_60`

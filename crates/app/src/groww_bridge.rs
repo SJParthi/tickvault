@@ -69,6 +69,15 @@ pub const GROWW_AGGREGATOR_CAPACITY: usize = 1_200;
 /// 8 GiB host. The event-driven watcher re-fires immediately if more remains.
 const GROWW_BRIDGE_MAX_READ_BYTES: u64 = 4 * 1024 * 1024;
 
+/// F3 hostile finding (2026-07-02): cap on RETAINED ILP-buffer bytes during a
+/// sustained QuestDB outage. Beyond this, the bridge PAUSES NDJSON consumption
+/// (reads 0 bytes; offset NOT advanced) — the capture file itself is the
+/// durable spill tier, so nothing is lost while RAM stays bounded and the
+/// flush retries a fixed-size buffer instead of an ever-growing one
+/// (previously: unbounded RAM ramp + quadratic re-transmit across a
+/// multi-hour outage).
+const GROWW_ILP_BUFFER_MAX_BYTES: usize = 64 * 1024 * 1024;
+
 /// Default path of the Python sidecar's capture-at-receipt append-only tick file.
 pub const GROWW_TICK_FILE_DEFAULT: &str = "data/groww/live-ticks.ndjson";
 
@@ -338,6 +347,21 @@ const MIN_PLAUSIBLE_TS_IST_NANOS: i64 = 1_577_836_800_000_000_000;
 /// Rejects `i64::MAX` / mangled far-future stamps.
 const MAX_PLAUSIBLE_TS_IST_NANOS: i64 = 4_102_444_800_000_000_000;
 
+/// PR-4 (2026-07-02): max tolerated FUTURE skew between a tick's exchange
+/// timestamp and our receipt clock. Generous for legitimate exchange-vs-box
+/// skew (~15x observed), fatal for day-level poison: a tick stamped
+/// "tomorrow" (sidecar bug / SDK clock glitch) would land in a future candle
+/// bucket and confuse the IST-midnight force-seal.
+const GROWW_FUTURE_TS_TOLERANCE_NANOS: i64 = 60 * 1_000_000_000;
+
+/// Minimum plausible wall-clock receipt (2020-01-01 UTC expressed in the same
+/// IST-nanos convention). F6 hostile finding (2026-07-02): a degenerate clock
+/// read yields `IST_UTC_OFFSET_NANOS` (a ~1970 instant), NOT 0 — so the
+/// future-ts clamp must fail OPEN for any implausibly OLD receipt, otherwise
+/// a dead clock would mass-reject every valid tick as FutureTimestamp
+/// (fail-closed by accident).
+const GROWW_MIN_PLAUSIBLE_RECEIPT_IST_NANOS: i64 = 1_577_836_800 * 1_000_000_000;
+
 /// Upper bound for a plausible cumulative day volume (1 trillion shares).
 /// ~1000× the busiest real NSE day-volume — rejects an absurd-but-finite `i64`
 /// (e.g. a mangled field) before it can reach the shared `ticks` table, while
@@ -362,6 +386,10 @@ enum GrowwTickReject {
     ImplausibleVolume,
     /// `security_id` is zero or negative.
     NonPositiveSecurityId,
+    /// `ts_ist_nanos` is ahead of OUR receipt clock beyond
+    /// `GROWW_FUTURE_TS_TOLERANCE_NANOS` (PR-4 2026-07-02) — a "tomorrow"
+    /// stamp would poison a future candle bucket.
+    FutureTimestamp,
     /// `ts_ist_nanos` is outside the plausible `[2020, 2100)` IST window.
     TimestampOutOfRange,
 }
@@ -369,7 +397,10 @@ enum GrowwTickReject {
 /// Validates a parsed Groww tick before persist. Pure, O(1) (a handful of
 /// finite/compare checks), no allocation. Mirrors the Dhan `is_valid_ltp`
 /// upper/lower bounds so it can never reject a genuine price.
-fn validate_groww_tick(parsed: &ParsedGrowwTick) -> Result<(), GrowwTickReject> {
+fn validate_groww_tick(
+    parsed: &ParsedGrowwTick,
+    receipt_ist_nanos: i64,
+) -> Result<(), GrowwTickReject> {
     let ltp = parsed.tick.ltp;
     if !ltp.is_finite() {
         return Err(GrowwTickReject::NonFinitePrice);
@@ -394,6 +425,16 @@ fn validate_groww_tick(parsed: &ParsedGrowwTick) -> Result<(), GrowwTickReject> 
     {
         return Err(GrowwTickReject::TimestampOutOfRange);
     }
+    // PR-4 relative clamp: reject a tick stamped ahead of OUR receipt clock
+    // beyond the skew tolerance. Applies only when the clock read succeeded
+    // (receipt > 0) — a broken clock fails OPEN to the static bounds above,
+    // never mass-rejecting a healthy feed.
+    if receipt_ist_nanos > GROWW_MIN_PLAUSIBLE_RECEIPT_IST_NANOS
+        && parsed.tick.ts_ist_nanos
+            > receipt_ist_nanos.saturating_add(GROWW_FUTURE_TS_TOLERANCE_NANOS)
+    {
+        return Err(GrowwTickReject::FutureTimestamp);
+    }
     Ok(())
 }
 
@@ -401,13 +442,27 @@ fn validate_groww_tick(parsed: &ParsedGrowwTick) -> Result<(), GrowwTickReject> 
 /// instant WE captured a tick. Used ONLY for live-feed-health last-tick-age math
 /// so it is consistent with the `/api/feeds/health` endpoint's clock; never used
 /// for persistence (rows keep the exchange `ts_ist_nanos`). A clock read that
-/// somehow fails saturates to 0 (treated as "very old" — fails safe toward Down,
-/// never a false Ok).
+/// somehow fails saturates to `IST_UTC_OFFSET_NANOS` (a ~1970 instant, NOT 0)
+/// — treated as "very old": fails safe toward Down for health math, and fails
+/// OPEN for the future-ts clamp (guarded by
+/// [`GROWW_MIN_PLAUSIBLE_RECEIPT_IST_NANOS`], F6 hostile finding 2026-07-02).
 fn receipt_ist_nanos() -> i64 {
     chrono::Utc::now()
         .timestamp_nanos_opt()
         .unwrap_or(0)
         .saturating_add(tickvault_common::constants::IST_UTC_OFFSET_NANOS)
+}
+
+/// Pure per-wake read-budget decision (F3 hostile finding 2026-07-02): 0 when
+/// the retained ILP buffer is over [`GROWW_ILP_BUFFER_MAX_BYTES`] (pause
+/// consumption — the capture file is the durable spill tier, offset not
+/// advanced, zero loss), else the bounded chunk size.
+#[must_use]
+pub(crate) fn wake_read_budget(buffered_bytes: usize, len: u64, offset: u64) -> u64 {
+    if buffered_bytes >= GROWW_ILP_BUFFER_MAX_BYTES {
+        return 0;
+    }
+    len.saturating_sub(offset).min(GROWW_BRIDGE_MAX_READ_BYTES)
 }
 
 /// Builds the shared `ticks` (feed='groww') row for a parsed tick. `capture_seq`
@@ -549,6 +604,14 @@ pub(crate) struct GrowwBridgeState {
     /// Last offset-snapshot write instant (PR-3 throttle — one write per
     /// [`GROWW_OFFSET_PERSIST_MIN_SECS`], cold path).
     last_offset_persist: Option<std::time::Instant>,
+    /// F3 rising-edge latch: true while NDJSON consumption is paused because
+    /// the retained ILP buffer is over cap (one error! per episode, not per wake).
+    ilp_backpressure_active: bool,
+    /// PR-5 H-3: while draining a PREVIOUS day's archive tail at boot, the
+    /// offset snapshot must be stamped with the ARCHIVE's day (not today's) so
+    /// a crash mid-drain resumes the SAME archive from the flushed offset
+    /// instead of orphaning its tail.
+    active_drain_ist_day: Option<i64>,
 }
 
 impl GrowwBridgeState {
@@ -570,6 +633,8 @@ impl GrowwBridgeState {
             offset: 0,
             residual: Vec::new(),
             last_offset_persist: None,
+            ilp_backpressure_active: false,
+            active_drain_ist_day: None,
         }
     }
 
@@ -593,7 +658,11 @@ impl GrowwBridgeState {
     /// any mismatch falls back to the byte-0 re-tail (DEDUP-idempotent —
     /// exactly the pre-PR-3 behavior).
     // TEST-EXEMPT: async file I/O wrapper; the pure resume decision (resume_from_snapshot) + snapshot round-trip are unit-tested.
-    pub(crate) async fn try_resume_from_snapshot(&mut self, tick_file_path: &Path) {
+    pub(crate) async fn try_resume_from_snapshot(
+        &mut self,
+        tick_file_path: &Path,
+        feed_health: &tickvault_common::feed_health::FeedHealthRegistry,
+    ) {
         let snap_path = offset_snapshot_path(tick_file_path);
         let Ok(raw) = tokio::fs::read_to_string(&snap_path).await else {
             info!("groww bridge: no offset snapshot — starting from byte 0");
@@ -617,7 +686,8 @@ impl GrowwBridgeState {
             }
         };
         let current_head = Self::read_file_head(tick_file_path).await;
-        match resume_from_snapshot(&snap, current_len, &current_head) {
+        let today_ist_day = ist_day_from_ist_nanos(receipt_ist_nanos());
+        match resume_from_snapshot(&snap, current_len, &current_head, today_ist_day) {
             Some((offset, capture_seq)) => {
                 self.offset = offset;
                 self.capture_seq.store(capture_seq, Ordering::Relaxed);
@@ -631,6 +701,51 @@ impl GrowwBridgeState {
                     .increment(1);
             }
             None => {
+                // PR-5 H-3 (hostile F4): if the snapshot belongs to a PREVIOUS
+                // IST day, the sidecar rotated the live file at midnight and
+                // any bytes appended after our last flush were ARCHIVED unread
+                // (deleted after 2 days). Drain that archive's tail ONCE
+                // through the SAME parse/validate/persist path before the
+                // byte-0 re-tail of the fresh live file. Bounded + non-fatal:
+                // an absent/short archive falls straight through to byte-0.
+                let today_ist_day = ist_day_from_ist_nanos(receipt_ist_nanos());
+                let archive = archive_path_for_ist_day(tick_file_path, snap.ist_day);
+                let archive_len = tokio::fs::metadata(&archive).await.ok().map(|m| m.len());
+                if should_drain_archive(snap.ist_day, today_ist_day, archive_len, snap.offset) {
+                    let len = archive_len.unwrap_or(0);
+                    info!(
+                        archive = %archive.display(),
+                        from_offset = snap.offset,
+                        archive_len = len,
+                        "groww bridge: draining rotated archive tail (bytes flushed before \
+                         the downtime resume from the flushed offset; DEDUP-idempotent)"
+                    );
+                    metrics::counter!("tv_groww_bridge_archive_tail_drains_total").increment(1);
+                    self.offset = snap.offset;
+                    self.capture_seq.store(snap.capture_seq, Ordering::Relaxed);
+                    self.active_drain_ist_day = Some(snap.ist_day);
+                    let mut wakes: u32 = 0;
+                    while self.offset < len && wakes < GROWW_ARCHIVE_DRAIN_MAX_WAKES {
+                        let before = self.offset;
+                        self.drain_new_data(&archive, feed_health).await;
+                        wakes = wakes.saturating_add(1);
+                        if self.offset <= before {
+                            break; // no forward progress — read error / EOF
+                        }
+                    }
+                    if wakes >= GROWW_ARCHIVE_DRAIN_MAX_WAKES {
+                        warn!(
+                            archive = %archive.display(),
+                            drained_to = self.offset,
+                            archive_len = len,
+                            "groww bridge: archive tail drain hit the wake cap — proceeding \
+                             to the live file (remaining archive rows stay on disk)"
+                        );
+                    }
+                    self.active_drain_ist_day = None;
+                    self.residual.clear();
+                }
+                self.offset = 0;
                 info!(
                     snapshot_offset = snap.offset,
                     file_len = current_len,
@@ -664,11 +779,23 @@ impl GrowwBridgeState {
             .await
             .map(|m| m.len())
             .unwrap_or(self.offset);
+        if file_len < self.offset {
+            // F2 (2026-07-02): the file at this PATH is shorter than the
+            // offset we drained — the sidecar rotated it between our read and
+            // this persist. Re-reading head+len by path would pair the NEW
+            // file's head with the OLD file's offset (a poisoned snapshot that
+            // could silently skip the new file's prefix). Skip this persist;
+            // the next flush writes a consistent snapshot for the new file.
+            return;
+        }
         let snap = GrowwOffsetSnapshot {
             offset: self.offset,
             capture_seq: self.capture_seq.load(Ordering::Relaxed),
             file_len,
             head,
+            ist_day: self
+                .active_drain_ist_day
+                .unwrap_or_else(|| ist_day_from_ist_nanos(receipt_ist_nanos())),
         };
         let Ok(json) = serde_json::to_string(&snap) else {
             return;
@@ -723,9 +850,21 @@ impl GrowwBridgeState {
         if file.seek(SeekFrom::Start(self.offset)).await.is_err() {
             return false;
         }
-        // Bounded chunked read: read at most GROWW_BRIDGE_MAX_READ_BYTES this wake —
-        // never the whole (possibly multi-GB) file at once.
-        let to_read = (len - self.offset).min(GROWW_BRIDGE_MAX_READ_BYTES);
+        // Bounded chunked read: read at most GROWW_BRIDGE_MAX_READ_BYTES this wake
+        // — never the whole (possibly multi-GB) file at once. F3 (2026-07-02):
+        // budget is 0 while the retained ILP buffer is over cap (sustained
+        // QuestDB outage) — consumption pauses (offset NOT advanced; the
+        // capture file is the durable spill tier) while the flush arm below
+        // keeps retrying the bounded buffer. Rising-edge error! only.
+        let to_read = wake_read_budget(self.live_writer.buffer_byte_count(), len, self.offset);
+        if to_read == 0 && !self.ilp_backpressure_active {
+            self.ilp_backpressure_active = true;
+            metrics::counter!("tv_groww_ilp_buffer_backpressure_total").increment(1);
+            error!(
+                buffered_bytes = self.live_writer.buffer_byte_count(),
+                "groww bridge: ILP buffer over cap — pausing NDJSON consumption until QuestDB recovers (capture file holds the tail; zero loss)"
+            );
+        }
         let mut chunk: Vec<u8> = Vec::new();
         match (&mut file).take(to_read).read_to_end(&mut chunk).await {
             Ok(n) => self.offset = self.offset.saturating_add(n as u64),
@@ -746,6 +885,9 @@ impl GrowwBridgeState {
         // Drain only COMPLETE newline-terminated lines; a trailing partial line
         // (incl. a partial UTF-8 char from the chunk boundary) stays buffered.
         let prefix = drain_complete_prefix(&mut self.residual);
+        // PR-4: one clock read per WAKE (not per line — O(1) preserved) for
+        // the relative future-timestamp clamp in validate_groww_tick.
+        let wake_receipt_ist_nanos = receipt_ist_nanos();
         for line_bytes in prefix.split(|&b| b == b'\n') {
             if line_bytes.is_empty() {
                 continue;
@@ -773,7 +915,7 @@ impl GrowwBridgeState {
             // ticks/candles_1m tables (which Dhan also reads + the 15:31
             // cross-verify compares). Reject + log + skip before persist AND
             // before the aggregator fold, so one bad tick can't poison a candle.
-            if let Err(reason) = validate_groww_tick(&parsed) {
+            if let Err(reason) = validate_groww_tick(&parsed, wake_receipt_ist_nanos) {
                 error!(
                     ?reason,
                     security_id = parsed.tick.security_id,
@@ -888,6 +1030,13 @@ impl GrowwBridgeState {
             };
             match self.live_writer.flush() {
                 Ok(outcome) => {
+                    if self.ilp_backpressure_active {
+                        self.ilp_backpressure_active = false;
+                        info!(
+                            persisted = outcome.persisted,
+                            "groww bridge: ILP backpressure released — resuming NDJSON consumption"
+                        );
+                    }
                     feed_health.record_ticks(Feed::Groww, outcome.persisted as u64, ts);
                     // PR-3: persist the FLUSHED-THROUGH offset (ordering
                     // ratcheted — never ahead of rows persisted to QuestDB).
@@ -1035,10 +1184,23 @@ pub struct GrowwOffsetSnapshot {
     pub file_len: u64,
     /// First bytes of the capture file at the flush (identity guard).
     pub head: String,
+    /// IST day index (IST nanos / 86_400e9) at the flush (F1 hostile finding
+    /// 2026-07-02): the sidecar rotates the capture file at IST midnight, so a
+    /// snapshot from a PREVIOUS IST day can never belong to today's live file —
+    /// rejected outright even when the head coincidentally matches.
+    /// `#[serde(default)]` (0) makes pre-F1 snapshots fail the day check →
+    /// safe byte-0 re-tail.
+    #[serde(default)]
+    pub ist_day: i64,
 }
 
 /// How many leading bytes of the capture file form the identity guard.
-pub const GROWW_OFFSET_HEAD_LEN: usize = 64;
+/// 256 (was 64 — F1 hostile finding 2026-07-02): with a 19-digit bit-62 Groww
+/// index token, 64 bytes ended BEFORE the first timestamp digit, so two
+/// different days' files could share an identical head when the same
+/// instrument ticked first each day. 256 always reaches past `ts_ist_nanos`
+/// (day-varying content) for any line shape.
+pub const GROWW_OFFSET_HEAD_LEN: usize = 256;
 
 /// Minimum seconds between offset-snapshot writes (cold-path throttle).
 pub const GROWW_OFFSET_PERSIST_MIN_SECS: u64 = 5;
@@ -1062,7 +1224,14 @@ pub fn resume_from_snapshot(
     snap: &GrowwOffsetSnapshot,
     current_len: u64,
     current_head: &str,
+    today_ist_day: i64,
 ) -> Option<(u64, i64)> {
+    if snap.ist_day != today_ist_day {
+        // F1 (2026-07-02): rotation happens at IST midnight — a snapshot from
+        // a previous IST day can NEVER belong to today's live file, even when
+        // the head coincidentally matches (same first instrument every day).
+        return None;
+    }
     if snap.head.is_empty() || snap.head != current_head {
         return None; // rotated / replaced / unreadable — identity broken
     }
@@ -1070,6 +1239,49 @@ pub fn resume_from_snapshot(
         return None; // shrank below the flushed point — rotated/truncated
     }
     Some((snap.offset, snap.capture_seq))
+}
+
+/// IST day index (days since epoch in IST wall-clock) for an IST-nanos
+/// instant — the same day boundary the sidecar's `_ist_day` rotation uses.
+#[must_use]
+pub fn ist_day_from_ist_nanos(ist_nanos: i64) -> i64 {
+    ist_nanos.div_euclid(86_400 * 1_000_000_000)
+}
+
+/// Max archive-drain iterations (× 4 MiB chunks ⇒ ≤16 GiB) — a hard bound so
+/// a pathological archive can never wedge boot (PR-5 H-3, hostile F4).
+pub const GROWW_ARCHIVE_DRAIN_MAX_WAKES: u32 = 4096;
+
+/// The dated archive the sidecar leaves at IST-midnight rotation for a
+/// COMPLETED IST day index: `live-ticks-YYYYMMDD.ndjson`, sibling of the live
+/// capture file (mirrors the sidecar's `_archive_path`).
+#[must_use]
+pub fn archive_path_for_ist_day(tick_file_path: &Path, ist_day: i64) -> PathBuf {
+    let date = chrono::DateTime::<chrono::Utc>::from_timestamp(ist_day.saturating_mul(86_400), 0)
+        .map(|d| d.format("%Y%m%d").to_string())
+        .unwrap_or_default();
+    let name = format!("live-ticks-{date}.ndjson");
+    tick_file_path
+        .parent()
+        .map(|d| d.join(&name))
+        .unwrap_or_else(|| PathBuf::from(name))
+}
+
+/// Pure drain decision (PR-5 H-3): drain a PREVIOUS day's archive tail ONLY
+/// when the snapshot provably belongs to an earlier IST day (a legacy
+/// `ist_day == 0` snapshot is NOT trusted to name an archive), the archive
+/// exists, and it holds bytes beyond the flushed offset. Everything else →
+/// exact prior behavior (byte-0 re-tail of the live file).
+#[must_use]
+pub fn should_drain_archive(
+    snap_ist_day: i64,
+    today_ist_day: i64,
+    archive_len: Option<u64>,
+    snap_offset: u64,
+) -> bool {
+    snap_ist_day > 0
+        && snap_ist_day < today_ist_day
+        && archive_len.is_some_and(|len| len > snap_offset)
 }
 
 /// ws_event_audit edge latches shared between the supervisor wrapper and the
@@ -1287,7 +1499,9 @@ pub async fn run_groww_bridge(
     // PR-3 (2026-07-02): resume from the persisted flushed-offset when it
     // provably belongs to the current capture file — otherwise byte-0 re-tail
     // (DEDUP-idempotent, the pre-PR-3 behavior).
-    state.try_resume_from_snapshot(&tick_file_path).await;
+    state
+        .try_resume_from_snapshot(&tick_file_path, &feed_health)
+        .await;
 
     // PRIMARY path: install the event-driven filesystem watcher. If it fails, the
     // fallback poll alone keeps the bridge working (degraded, logged once). The
@@ -1520,7 +1734,7 @@ mod tests {
 
     #[test]
     fn test_validate_groww_tick_accepts_valid() {
-        assert_eq!(validate_groww_tick(&valid_parsed()), Ok(()));
+        assert_eq!(validate_groww_tick(&valid_parsed(), 0), Ok(()));
     }
 
     #[test]
@@ -1528,12 +1742,12 @@ mod tests {
         let mut p = valid_parsed();
         p.tick.ltp = f64::NAN;
         assert_eq!(
-            validate_groww_tick(&p),
+            validate_groww_tick(&p, 0),
             Err(GrowwTickReject::NonFinitePrice)
         );
         p.tick.ltp = f64::INFINITY;
         assert_eq!(
-            validate_groww_tick(&p),
+            validate_groww_tick(&p, 0),
             Err(GrowwTickReject::NonFinitePrice)
         );
     }
@@ -1543,12 +1757,12 @@ mod tests {
         let mut p = valid_parsed();
         p.tick.ltp = 0.0;
         assert_eq!(
-            validate_groww_tick(&p),
+            validate_groww_tick(&p, 0),
             Err(GrowwTickReject::NonPositivePrice)
         );
         p.tick.ltp = -1.5;
         assert_eq!(
-            validate_groww_tick(&p),
+            validate_groww_tick(&p, 0),
             Err(GrowwTickReject::NonPositivePrice)
         );
     }
@@ -1558,7 +1772,7 @@ mod tests {
         let mut p = valid_parsed();
         p.tick.ltp = f64::from(tickvault_common::constants::MAX_PLAUSIBLE_LTP) + 1.0;
         assert_eq!(
-            validate_groww_tick(&p),
+            validate_groww_tick(&p, 0),
             Err(GrowwTickReject::ImplausiblePrice)
         );
     }
@@ -1568,7 +1782,7 @@ mod tests {
         let mut p = valid_parsed();
         p.tick.cum_volume = -1;
         assert_eq!(
-            validate_groww_tick(&p),
+            validate_groww_tick(&p, 0),
             Err(GrowwTickReject::NegativeVolume)
         );
     }
@@ -1578,12 +1792,12 @@ mod tests {
         let mut p = valid_parsed();
         p.tick.cum_volume = MAX_PLAUSIBLE_VOLUME + 1;
         assert_eq!(
-            validate_groww_tick(&p),
+            validate_groww_tick(&p, 0),
             Err(GrowwTickReject::ImplausibleVolume)
         );
         // Boundary is inclusive-valid.
         p.tick.cum_volume = MAX_PLAUSIBLE_VOLUME;
-        assert_eq!(validate_groww_tick(&p), Ok(()));
+        assert_eq!(validate_groww_tick(&p, 0), Ok(()));
     }
 
     #[test]
@@ -1620,12 +1834,12 @@ mod tests {
         let mut p = valid_parsed();
         p.tick.security_id = 0;
         assert_eq!(
-            validate_groww_tick(&p),
+            validate_groww_tick(&p, 0),
             Err(GrowwTickReject::NonPositiveSecurityId)
         );
         p.tick.security_id = -7;
         assert_eq!(
-            validate_groww_tick(&p),
+            validate_groww_tick(&p, 0),
             Err(GrowwTickReject::NonPositiveSecurityId)
         );
     }
@@ -1635,24 +1849,24 @@ mod tests {
         let mut p = valid_parsed();
         p.tick.ts_ist_nanos = 0;
         assert_eq!(
-            validate_groww_tick(&p),
+            validate_groww_tick(&p, 0),
             Err(GrowwTickReject::TimestampOutOfRange)
         );
         p.tick.ts_ist_nanos = -1;
         assert_eq!(
-            validate_groww_tick(&p),
+            validate_groww_tick(&p, 0),
             Err(GrowwTickReject::TimestampOutOfRange)
         );
         p.tick.ts_ist_nanos = i64::MAX;
         assert_eq!(
-            validate_groww_tick(&p),
+            validate_groww_tick(&p, 0),
             Err(GrowwTickReject::TimestampOutOfRange)
         );
         // Boundaries are inclusive-valid.
         p.tick.ts_ist_nanos = MIN_PLAUSIBLE_TS_IST_NANOS;
-        assert_eq!(validate_groww_tick(&p), Ok(()));
+        assert_eq!(validate_groww_tick(&p, 0), Ok(()));
         p.tick.ts_ist_nanos = MAX_PLAUSIBLE_TS_IST_NANOS;
-        assert_eq!(validate_groww_tick(&p), Ok(()));
+        assert_eq!(validate_groww_tick(&p, 0), Ok(()));
     }
 
     #[test]
@@ -2369,6 +2583,113 @@ mod tests {
     }
 
     #[test]
+    fn test_validate_rejects_future_timestamp() {
+        // PR-4: a tick stamped ahead of the receipt clock beyond the 60s skew
+        // tolerance is rejected; at/below tolerance passes; a broken clock
+        // (receipt=0) fails OPEN to the static bounds (never mass-rejects).
+        let mut p = valid_parsed();
+        let now = p.tick.ts_ist_nanos; // pretend receipt == the tick's stamp
+        assert_eq!(validate_groww_tick(&p, now), Ok(()), "same-instant passes");
+        p.tick.ts_ist_nanos = now + 59 * 1_000_000_000;
+        assert_eq!(
+            validate_groww_tick(&p, now),
+            Ok(()),
+            "within tolerance passes"
+        );
+        p.tick.ts_ist_nanos = now + 61 * 1_000_000_000;
+        assert_eq!(
+            validate_groww_tick(&p, now),
+            Err(GrowwTickReject::FutureTimestamp),
+            "beyond tolerance rejected"
+        );
+        // 24h future (the candle-poison case) definitely rejected.
+        p.tick.ts_ist_nanos = now + 24 * 3600 * 1_000_000_000;
+        assert_eq!(
+            validate_groww_tick(&p, now),
+            Err(GrowwTickReject::FutureTimestamp)
+        );
+        // Broken clock: fail-open (static bounds only).
+        assert_eq!(validate_groww_tick(&p, 0), Ok(()), "receipt=0 fails open");
+        // F6: a degenerate clock read yields IST_UTC_OFFSET_NANOS (~1970),
+        // NOT 0 — it must ALSO fail open (below the min-plausible receipt),
+        // never mass-reject a valid tick as FutureTimestamp.
+        p.tick.ts_ist_nanos = now;
+        assert_eq!(
+            validate_groww_tick(&p, tickvault_common::constants::IST_UTC_OFFSET_NANOS),
+            Ok(()),
+            "degenerate ~1970 clock fails open"
+        );
+    }
+
+    #[test]
+    fn test_ist_day_from_ist_nanos_day_boundaries() {
+        // F1 helper: day index flips exactly at the IST-midnight nanos boundary
+        // (same boundary as the sidecar rotation).
+        let day_nanos: i64 = 86_400 * 1_000_000_000;
+        assert_eq!(ist_day_from_ist_nanos(0), 0);
+        assert_eq!(ist_day_from_ist_nanos(day_nanos - 1), 0);
+        assert_eq!(ist_day_from_ist_nanos(day_nanos), 1);
+        assert_eq!(ist_day_from_ist_nanos(20_636 * day_nanos + 5), 20_636);
+        // Negative (pre-epoch, defensive): div_euclid floors, never panics.
+        assert_eq!(ist_day_from_ist_nanos(-1), -1);
+    }
+
+    #[test]
+    fn test_archive_path_for_ist_day_matches_sidecar_rotation() {
+        // PR-5 H-3: the archive name must match the sidecar's rotation output
+        // (live-ticks-YYYYMMDD.ndjson, sibling of the live capture file).
+        // 2026-07-01 in IST-day-index terms: days since epoch for that date.
+        let day_20026_07_01 = 20_635; // 20635 * 86400 = 2026-07-01T00:00:00
+        let p =
+            archive_path_for_ist_day(Path::new("/data/groww/live-ticks.ndjson"), day_20026_07_01);
+        assert_eq!(p, PathBuf::from("/data/groww/live-ticks-20260701.ndjson"));
+        // Parent-less path degrades to a bare file name (never panics).
+        let bare = archive_path_for_ist_day(Path::new("live-ticks.ndjson"), day_20026_07_01);
+        assert!(
+            bare.to_string_lossy()
+                .ends_with("live-ticks-20260701.ndjson")
+        );
+    }
+
+    #[test]
+    fn test_should_drain_archive_decision() {
+        // PR-5 H-3 decision matrix — drain ONLY a provable previous-day
+        // archive holding bytes beyond the flushed offset.
+        let today = 20_636;
+        // Previous day, archive longer than offset → drain.
+        assert!(should_drain_archive(today - 1, today, Some(500), 100));
+        // Archive absent → no drain (retention passed / wiped).
+        assert!(!should_drain_archive(today - 1, today, None, 100));
+        // Archive shorter/equal (already fully flushed) → no drain.
+        assert!(!should_drain_archive(today - 1, today, Some(100), 100));
+        assert!(!should_drain_archive(today - 1, today, Some(50), 100));
+        // Same-day snapshot → never an archive case.
+        assert!(!should_drain_archive(today, today, Some(500), 100));
+        // Legacy pre-F1 snapshot (ist_day=0) names no trustworthy archive.
+        assert!(!should_drain_archive(0, today, Some(500), 100));
+        // Future-day snapshot (clock weirdness) → fail safe, no drain.
+        assert!(!should_drain_archive(today + 1, today, Some(500), 100));
+    }
+
+    #[test]
+    fn test_wake_read_budget_pauses_consumption_over_ilp_cap() {
+        // F3: over-cap buffer → 0 budget (pause; capture file is the spill);
+        // under cap → bounded chunk as before.
+        assert_eq!(wake_read_budget(GROWW_ILP_BUFFER_MAX_BYTES, 1_000, 0), 0);
+        assert_eq!(
+            wake_read_budget(GROWW_ILP_BUFFER_MAX_BYTES + 1, u64::MAX, 0),
+            0
+        );
+        assert_eq!(wake_read_budget(0, 1_000, 400), 600);
+        assert_eq!(
+            wake_read_budget(0, u64::MAX, 0),
+            GROWW_BRIDGE_MAX_READ_BYTES,
+            "chunk stays bounded"
+        );
+        assert_eq!(wake_read_budget(0, 100, 100), 0, "nothing new");
+    }
+
+    #[test]
     fn test_offset_snapshot_roundtrip() {
         // PR-3: the persisted snapshot must serialize/parse losslessly.
         let snap = GrowwOffsetSnapshot {
@@ -2376,6 +2697,7 @@ mod tests {
             capture_seq: 1_780_000_020_123_000_000,
             file_len: 200_000,
             head: "{\"security_id\":1333".to_string(),
+            ist_day: 20_636,
         };
         let json = serde_json::to_string(&snap).expect("serialize");
         let back: GrowwOffsetSnapshot = serde_json::from_str(&json).expect("parse");
@@ -2386,26 +2708,47 @@ mod tests {
     fn test_resume_from_snapshot_decision_matrix() {
         // PR-3: resume ONLY when the snapshot provably belongs to the current
         // file — every mismatch is a fail-safe byte-0 re-tail.
+        let today = 20_636;
         let snap = GrowwOffsetSnapshot {
             offset: 100,
             capture_seq: 42,
             file_len: 100,
             head: "HEAD".to_string(),
+            ist_day: today,
         };
-        // Match: same head, file grew → resume.
-        assert_eq!(resume_from_snapshot(&snap, 150, "HEAD"), Some((100, 42)));
+        // Match: same head, same IST day, file grew → resume.
+        assert_eq!(
+            resume_from_snapshot(&snap, 150, "HEAD", today),
+            Some((100, 42))
+        );
         // Match: same head, file unchanged → resume (nothing new).
-        assert_eq!(resume_from_snapshot(&snap, 100, "HEAD"), Some((100, 42)));
+        assert_eq!(
+            resume_from_snapshot(&snap, 100, "HEAD", today),
+            Some((100, 42))
+        );
         // Rotated: fresh file has a different first line → byte-0.
-        assert_eq!(resume_from_snapshot(&snap, 150, "OTHER"), None);
+        assert_eq!(resume_from_snapshot(&snap, 150, "OTHER", today), None);
         // Truncated below the flushed point → byte-0.
-        assert_eq!(resume_from_snapshot(&snap, 50, "HEAD"), None);
+        assert_eq!(resume_from_snapshot(&snap, 50, "HEAD", today), None);
+        // F1: PREVIOUS-day snapshot never resumes — even with a matching head
+        // and plausible length (identical first instrument across rotations).
+        assert_eq!(
+            resume_from_snapshot(&snap, 150, "HEAD", today + 1),
+            None,
+            "cross-day snapshot must byte-0 re-tail"
+        );
+        // Pre-F1 snapshot (serde default ist_day=0) never resumes.
+        let legacy = GrowwOffsetSnapshot {
+            ist_day: 0,
+            ..snap.clone()
+        };
+        assert_eq!(resume_from_snapshot(&legacy, 150, "HEAD", today), None);
         // Empty-head snapshot (unreadable at persist) never resumes.
         let empty = GrowwOffsetSnapshot {
             head: String::new(),
             ..snap
         };
-        assert_eq!(resume_from_snapshot(&empty, 150, ""), None);
+        assert_eq!(resume_from_snapshot(&empty, 150, "", today), None);
     }
 
     #[test]
