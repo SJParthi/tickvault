@@ -12,16 +12,20 @@
 //!    `tracker.reset_daily_all()` to clear stale state so the next live
 //!    tick re-arms `day_open` to that day's first observed LTP.
 //!
-//! ## Why `day_open` is the first live tick (not a pre-market value)
+//! ## Why `day_open` is the first REGULAR-SESSION tick (never pre-market)
 //!
 //! Per operator directive 2026-05-26, all Dhan historical / pre-market
 //! buffer code was removed from the workspace. `day_open` for the 4 LOCKED
-//! IDX_I SIDs (NIFTY=13, BANKNIFTY=25, SENSEX=51, INDIA VIX=21) now equals
-//! the first observed live WebSocket tick after the midnight reset.
-//!
-//! For trading-day correctness this is the LTP of the first tick that
-//! arrives after 09:15:00 IST. For non-trading windows it is whatever LTP
-//! Dhan happens to stream first (typically the pre-open snapshot tick).
+//! IDX_I SIDs (NIFTY=13, BANKNIFTY=25, SENSEX=51, INDIA VIX=21) equals the
+//! first observed live WebSocket tick after the midnight reset **whose
+//! exchange timestamp falls inside the regular trading session
+//! `[09:15:00, 15:30:00)` IST** (operator rule 2026-07-03: pre-market data
+//! must NEVER become the day open). The tick broadcast starts carrying
+//! IDX_I ticks from 09:00 IST (the `TICK_PERSIST_START_SECS_OF_DAY_IST`
+//! pipeline window), so without this gate the pre-open snapshot tick would
+//! arm `day_open` — [`should_route_day_ohlc_tick`] drops those on the
+//! tick's EXCHANGE timestamp via
+//! [`g1_exchange_gate_accepts`](tickvault_common::constants::g1_exchange_gate_accepts).
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -29,7 +33,9 @@ use std::time::Duration;
 use tokio::sync::broadcast::{self, error::RecvError};
 use tracing::{error, info, warn};
 
-use tickvault_common::constants::{INDIA_VIX_SECURITY_ID, IST_UTC_OFFSET_SECONDS, SECONDS_PER_DAY};
+use tickvault_common::constants::{
+    INDIA_VIX_SECURITY_ID, IST_UTC_OFFSET_SECONDS, SECONDS_PER_DAY, g1_exchange_gate_accepts,
+};
 use tickvault_common::tick_types::ParsedTick;
 use tickvault_common::types::ExchangeSegment;
 use tickvault_trading::in_mem::day_ohlc_tracker::{
@@ -58,7 +64,10 @@ pub fn spawn_day_ohlc_tick_consumer(
         loop {
             match rx.recv().await {
                 Ok(tick) => {
-                    if tick.exchange_segment_code != idx_i_segment_code() {
+                    if !should_route_day_ohlc_tick(
+                        tick.exchange_segment_code,
+                        tick.exchange_timestamp,
+                    ) {
                         continue;
                     }
                     // Pure-function hot path: O(1) per tick, ≤50ns budget.
@@ -85,6 +94,28 @@ pub fn spawn_day_ohlc_tick_consumer(
 #[inline]
 const fn idx_i_segment_code() -> u8 {
     0
+}
+
+/// Pure routing gate for the day-OHLC tick consumer (operator rule
+/// 2026-07-03): route ONLY IDX_I ticks whose EXCHANGE timestamp (IST epoch
+/// seconds, per `data-integrity.md` — never receive time) falls inside the
+/// regular trading session `[09:15:00, 15:30:00)` IST. Pre-market /
+/// pre-open ticks (< 09:15:00) must never arm `day_open`; post-close stale
+/// ticks (>= 15:30:00) must never mutate day high/low/close. Delegates the
+/// window check to the canonical G1 exchange gate
+/// (`g1_exchange_gate_accepts`, half-open, boundary-exact). O(1), zero
+/// allocation, no panic path.
+#[inline]
+#[must_use]
+pub const fn should_route_day_ohlc_tick(
+    exchange_segment_code: u8,
+    exchange_timestamp_secs: u32,
+) -> bool {
+    if exchange_segment_code != idx_i_segment_code() {
+        return false;
+    }
+    let secs_of_day = (exchange_timestamp_secs % 86_400) as i64;
+    g1_exchange_gate_accepts(secs_of_day * 1_000_000_000)
 }
 
 /// Spawns the IST midnight reset task. At 00:00:00 IST every day, calls
@@ -277,5 +308,61 @@ mod tests {
             "supervisor must keep running, not exit after spawning the reset task"
         );
         handle.abort();
+    }
+
+    // ------------------------------------------------------------------
+    // should_route_day_ohlc_tick — session-window ratchets (operator rule
+    // 2026-07-03: pre-market data must NEVER become day_open).
+    // ------------------------------------------------------------------
+
+    /// A day-aligned IST epoch base (multiple of 86_400) so seconds-of-day
+    /// arithmetic below is exact.
+    const DAY_BASE: u32 = 1_779_321_600;
+
+    #[test]
+    fn test_should_route_rejects_pre_open_and_pre_market() {
+        // 09:00:00 IST (pre-open session start — the broadcast carries these).
+        assert!(!should_route_day_ohlc_tick(0, DAY_BASE + 9 * 3600));
+        // 09:14:59 IST — one second before the regular session opens.
+        assert!(
+            !should_route_day_ohlc_tick(0, DAY_BASE + 33_299),
+            "09:14:59 pre-market tick must NOT arm day_open"
+        );
+        // 08:00:00 IST — any earlier tick.
+        assert!(!should_route_day_ohlc_tick(0, DAY_BASE + 8 * 3600));
+    }
+
+    #[test]
+    fn test_should_route_accepts_091500_and_in_session() {
+        // 09:15:00.000 exactly — the first regular-session second (inclusive).
+        assert!(
+            should_route_day_ohlc_tick(0, DAY_BASE + 33_300),
+            "09:15:00 exactly must be accepted (inclusive open boundary)"
+        );
+        // Mid-session 11:30:00 IST.
+        assert!(should_route_day_ohlc_tick(
+            0,
+            DAY_BASE + 11 * 3600 + 30 * 60
+        ));
+        // Last in-session second 15:29:59 IST.
+        assert!(should_route_day_ohlc_tick(0, DAY_BASE + 55_799));
+    }
+
+    #[test]
+    fn test_should_route_rejects_1530_and_later() {
+        // 15:30:00 exactly — exclusive close boundary.
+        assert!(
+            !should_route_day_ohlc_tick(0, DAY_BASE + 55_800),
+            "15:30:00 exactly must be rejected (exclusive close boundary)"
+        );
+        // 20:00:00 IST post-close stale tick.
+        assert!(!should_route_day_ohlc_tick(0, DAY_BASE + 72_000));
+    }
+
+    #[test]
+    fn test_should_route_rejects_non_idx_i_segment() {
+        // NSE_EQ (1) / NSE_FNO (2) in-session ticks are never day-OHLC routed.
+        assert!(!should_route_day_ohlc_tick(1, DAY_BASE + 33_300));
+        assert!(!should_route_day_ohlc_tick(2, DAY_BASE + 40_000));
     }
 }
