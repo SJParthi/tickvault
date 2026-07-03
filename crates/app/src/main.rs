@@ -11039,12 +11039,18 @@ fn spawn_daily_tick_conservation_task(
                 info!("tick_conservation: skipping (non-trading day)");
                 return;
             }
-            ConservationStart::SkipPastTrigger => {
-                debug!(
+            ConservationStart::RunCatchUp => {
+                // Audit fix #2 (2026-07-03): a trading-day boot past 15:40 IST
+                // used to SKIP the day's audit entirely — a post-incident
+                // evening recovery boot left no forensic WAL-vs-DB row. Run
+                // once, immediately; the row is honestly `partial` (post-09:00
+                // boot counters cannot vouch for the session) but the WAL
+                // frame count + QuestDB row count for the day ARE recorded.
+                info!(
                     now = %boot_ist.time(),
-                    "tick_conservation: skipping (past 15:40 — mid-evening boot)"
+                    "tick_conservation: late boot (past 15:40 IST) — running \
+                     the day's audit now as a catch-up"
                 );
-                return;
             }
             ConservationStart::RunNow => {
                 info!(
