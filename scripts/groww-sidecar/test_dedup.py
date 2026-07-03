@@ -26,8 +26,16 @@ if "growwapi" not in sys.modules:
     sys.modules["growwapi"] = _stub
 
 from groww_sidecar import (  # noqa: E402  (stub must precede)
+    WALK_INTERVAL_MS_DEFAULT,
+    WALK_INTERVAL_MS_MAX,
+    WALK_INTERVAL_MS_MIN,
+    WATERMARK_MAX_LAG_MS_DEFAULT,
     dedup_should_emit,
+    resolve_walk_interval_ms,
+    resolve_watermark_max_lag_ms,
     ts_watermark_advanced,
+    watermark_lag_should_fire,
+    watermark_lag_stalled,
 )
 
 TS0 = 1_783_069_200_183  # the live incident's frozen 09:00:00.183 IST print
@@ -114,6 +122,102 @@ class TsWatermarkAdvancedTests(unittest.TestCase):
     def test_garbage_ts_never_raises_and_never_advances(self) -> None:
         for bad in (None, "not-a-ts", {}, []):
             self.assertFalse(ts_watermark_advanced(0, bad))
+
+
+class ResolveWalkIntervalTests(unittest.TestCase):
+    """The coalesced-walk interval clamp (2026-07-03 lag fix #1): the env
+    override can tune the cadence but can never spin-loop the walker (0ms) or
+    stall the feed behind a fat coalesce window (huge ms)."""
+
+    def test_absent_env_resolves_to_default(self) -> None:
+        self.assertEqual(resolve_walk_interval_ms(None), WALK_INTERVAL_MS_DEFAULT)
+
+    def test_garbage_env_resolves_to_default(self) -> None:
+        for bad in ("garbage", "", {}, []):
+            self.assertEqual(resolve_walk_interval_ms(bad), WALK_INTERVAL_MS_DEFAULT)
+
+    def test_zero_and_negative_clamp_to_min(self) -> None:
+        self.assertEqual(resolve_walk_interval_ms("0"), WALK_INTERVAL_MS_MIN)
+        self.assertEqual(resolve_walk_interval_ms("-500"), WALK_INTERVAL_MS_MIN)
+
+    def test_huge_clamps_to_max(self) -> None:
+        self.assertEqual(resolve_walk_interval_ms("999999"), WALK_INTERVAL_MS_MAX)
+
+    def test_in_range_passes_through(self) -> None:
+        self.assertEqual(resolve_walk_interval_ms("200"), 200)
+        self.assertEqual(resolve_walk_interval_ms("50"), 50)
+
+    def test_watermark_lag_env_clamp_shares_the_same_contract(self) -> None:
+        self.assertEqual(
+            resolve_watermark_max_lag_ms(None), WATERMARK_MAX_LAG_MS_DEFAULT
+        )
+        self.assertEqual(
+            resolve_watermark_max_lag_ms("junk"), WATERMARK_MAX_LAG_MS_DEFAULT
+        )
+
+
+class WatermarkLagStalledTests(unittest.TestCase):
+    """The watermark-lag stall verdict (2026-07-03 lag fix #2): micro-advances
+    (+2 ms) must not hide a watermark drifting minutes behind wall-clock —
+    but off-market lag and an unknown watermark must NEVER count as stalled."""
+
+    NOW_MS = 1_783_069_320_000.0
+    THR = WATERMARK_MAX_LAG_MS_DEFAULT  # 120_000
+
+    def test_119s_lag_is_not_stalled(self) -> None:
+        self.assertFalse(
+            watermark_lag_stalled(self.NOW_MS, int(self.NOW_MS) - 119_000, True, self.THR)
+        )
+
+    def test_exactly_threshold_lag_is_not_stalled(self) -> None:
+        # Strict > : exactly 120.000s is NOT past the threshold.
+        self.assertFalse(
+            watermark_lag_stalled(self.NOW_MS, int(self.NOW_MS) - 120_000, True, self.THR)
+        )
+
+    def test_121s_lag_is_stalled(self) -> None:
+        self.assertTrue(
+            watermark_lag_stalled(self.NOW_MS, int(self.NOW_MS) - 121_000, True, self.THR)
+        )
+
+    def test_off_market_lag_is_never_stalled(self) -> None:
+        # Overnight the watermark legitimately sits at yesterday 15:29 IST.
+        self.assertFalse(
+            watermark_lag_stalled(self.NOW_MS, int(self.NOW_MS) - 999_000, False, self.THR)
+        )
+
+    def test_unknown_watermark_is_never_stalled(self) -> None:
+        # Cold / never-streamed: the silent-feed diagnostic + the Rust
+        # process-kill backstop own that case, never this criterion.
+        self.assertFalse(watermark_lag_stalled(self.NOW_MS, 0, True, self.THR))
+        self.assertFalse(watermark_lag_stalled(self.NOW_MS, -1, True, self.THR))
+
+    def test_future_watermark_is_not_stalled(self) -> None:
+        # A watermark slightly AHEAD of our clock (skew) is negative lag.
+        self.assertFalse(
+            watermark_lag_stalled(self.NOW_MS, int(self.NOW_MS) + 5_000, True, self.THR)
+        )
+
+
+class WatermarkLagShouldFireTests(unittest.TestCase):
+    """The fire decision: N consecutive stalled verdicts + refire cooldown so
+    a backlog that survives one reconnect refires at a bounded cadence."""
+
+    def test_below_consecutive_does_not_fire(self) -> None:
+        self.assertFalse(watermark_lag_should_fire(2, 3, 0.0))
+
+    def test_at_consecutive_fires(self) -> None:
+        self.assertTrue(watermark_lag_should_fire(3, 3, 0.0))
+
+    def test_above_consecutive_fires(self) -> None:
+        self.assertTrue(watermark_lag_should_fire(10, 3, 0.0))
+
+    def test_cooldown_suppresses_refire(self) -> None:
+        self.assertFalse(watermark_lag_should_fire(10, 3, 0.1))
+
+    def test_expired_cooldown_fires_again(self) -> None:
+        self.assertTrue(watermark_lag_should_fire(3, 3, 0.0))
+        self.assertTrue(watermark_lag_should_fire(3, 3, -5.0))
 
 
 if __name__ == "__main__":
