@@ -99,11 +99,10 @@ the app-side consumer, which owns the routing policy).
   - `test_session_gate_boundary_091459_rejected_091500_accepted_dhan`
   - `test_session_gate_boundary_091459_rejected_091500_accepted_groww`
   - `test_pre_market_tick_never_becomes_0915_open`
-- `crates/app/src/day_ohlc_orchestrator.rs::tests` (new):
-  - `test_should_route_rejects_pre_open_and_pre_market`
-  - `test_should_route_accepts_091500_and_in_session`
-  - `test_should_route_rejects_1530_and_later`
-  - `test_should_route_rejects_non_idx_i_segment`
+- `crates/app/src/day_ohlc_orchestrator.rs`: SUPERSEDED by #1379 (merged to
+  main 2026-07-03) — main's `day_ohlc_session_accepts` + `day_ohlc_gate_allows`
+  (with the §30 always-on exemption) implement the same gate; this PR keeps
+  main's version verbatim and its tests (`test_session_gate_*` in that file).
 - Scoped runs: `cargo test -p tickvault-trading candles` +
   `cargo test -p tickvault-app day_ohlc`.
 
@@ -136,12 +135,12 @@ midnight, so rollback has zero data-cleanup cost.
   - Tests: test_session_gate_boundary_091459_rejected_091500_accepted_dhan,
     test_session_gate_boundary_091459_rejected_091500_accepted_groww,
     test_pre_market_tick_never_becomes_0915_open
-- [x] Item 2 — Session-gate the DayOhlcTracker tick routing (the fix)
-  - Files: crates/app/src/day_ohlc_orchestrator.rs
-  - Tests: test_should_route_rejects_pre_open_and_pre_market,
-    test_should_route_accepts_091500_and_in_session,
-    test_should_route_rejects_1530_and_later,
-    test_should_route_rejects_non_idx_i_segment
+- [x] Item 2 — Session-gate the DayOhlcTracker tick routing (the fix) —
+  SUPERSEDED by #1379 (merged to main first, same session-gate + always-on
+  exemption). Conflict resolved by keeping main's day_ohlc_orchestrator.rs
+  verbatim; this PR contributes Item 1's aggregator ratchets only.
+  - Files: crates/app/src/day_ohlc_orchestrator.rs (identical to main)
+  - Tests: covered by main's day_ohlc_session_accepts / day_ohlc_gate_allows tests
 
 ## Scenarios
 
