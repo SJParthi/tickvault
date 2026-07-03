@@ -7046,10 +7046,14 @@ async fn start_dhan_lane(
                     let slo_ws_expected_total: f64 =
                         slo_ws_expected_main_feed + SLO_WS_EXPECTED_ORDER_UPDATE;
 
-                    /// Tick-freshness threshold during market hours: a tick
-                    /// gap >= this many seconds drives `tick_freshness = 0.0`.
-                    /// Aligned with the operator's "silent socket" boundary
-                    /// used elsewhere (the 60s pool watchdog).
+                    /// Tick-freshness silence threshold during market hours:
+                    /// a tick gap >= this many seconds counts that SID as
+                    /// SILENT in the fractional coverage computation
+                    /// (`compute_tick_freshness` — 2026-07-03 fix; the gap no
+                    /// longer binary-zeroes the whole dimension). Aligned with
+                    /// the operator's "silent socket" boundary used elsewhere
+                    /// (the 60s pool watchdog) and with the tick-gap
+                    /// detector's own `TICK_GAP_THRESHOLD_SECS_DEFAULT = 30`.
                     const SLO_TICK_FRESHNESS_DEGRADED_SECS: u64 = 30;
 
                     /// Token headroom threshold: < this many seconds remaining
@@ -7176,36 +7180,52 @@ async fn start_dhan_lane(
                         // 2026-05-26: INDIA VIX (SID 21) is a derived
                         // volatility index that legitimately ticks every
                         // 30-60s during quiet sessions — its silence is
-                        // not a degradation, so excluding it stops the
-                        // SLO-02 flap the operator saw on 2026-05-26.
-                        // We scan the top-N gaps and take the worst that
-                        // is NOT a SLO-excluded SID. N=10 is comfortably
-                        // above 4 (the entire universe) so we always see
-                        // the full picture when called.
+                        // not a degradation, so it is excluded from the
+                        // silent count (kept from the original design).
+                        //
+                        // 2026-07-03 (D2 root-cause fix): FRACTIONAL
+                        // coverage replaces the binary worst-gap check.
+                        // The binary check ("ANY non-excluded gap >= 30s
+                        // → 0.0") was designed for the 4-SID Indices4Only
+                        // era. Under the ~775-SID DailyUniverse, ~33
+                        // illiquid/suspended SIDs are ALWAYS silent —
+                        // NT-15 boot seeding (2026-07-01) guarantees every
+                        // subscribed SID is a tick-gap map key, so a
+                        // never-ticking SID's gap grows monotonically from
+                        // boot. Result: tick_freshness was flat 0.0 all
+                        // session, the multiplicative score was 0, and
+                        // `tv-prod-realtime-guarantee-critical` fired all
+                        // day — pure noise that masked real degradation.
+                        //   tick_freshness = 1 − silent/universe (clamped)
+                        // 33/775 silent → 0.957 (healthy); a genuine broad
+                        // outage (dead socket → most SIDs silent) still
+                        // crashes the dimension toward 0. Off-hours stays
+                        // pinned 1.0. Pure math + rationale in
+                        // `compute_tick_freshness` (unit-tested).
                         const SLO_TICK_FRESHNESS_EXCLUDED_SIDS: &[u64] = &[21]; // INDIA VIX
-                        const SLO_TICK_FRESHNESS_SCAN_TOP_N: usize = 10;
                         let tick_freshness = if !in_market {
                             1.0
                         } else {
-                            let worst_gap = tickvault_core::pipeline::tick_gap_detector::global_tick_gap_detector()
+                            tickvault_core::pipeline::tick_gap_detector::global_tick_gap_detector()
                                 .map(|d| {
-                                    let (top, _total) = d.scan_gaps_top_n(
-                                        Instant::now(),
-                                        SLO_TICK_FRESHNESS_SCAN_TOP_N,
-                                    );
-                                    top.iter()
-                                        .find(|(sid, _, _)| {
-                                            !SLO_TICK_FRESHNESS_EXCLUDED_SIDS.contains(sid)
+                                    // Full silent set (cap = map size). This
+                                    // is the 10s SLO scheduler — a cold-path
+                                    // task, NOT the tick hot path; the
+                                    // O(universe) walk is the same scan the
+                                    // 60s coalescer already performs.
+                                    let universe = d.len();
+                                    let (silent_entries, _total) =
+                                        d.scan_gaps_top_n(Instant::now(), universe);
+                                    let silent = silent_entries
+                                        .iter()
+                                        .filter(|(sid, _, gap)| {
+                                            *gap >= SLO_TICK_FRESHNESS_DEGRADED_SECS
+                                                && !SLO_TICK_FRESHNESS_EXCLUDED_SIDS.contains(sid)
                                         })
-                                        .map(|(_, _, gap)| *gap)
-                                        .unwrap_or(0)
+                                        .count();
+                                    compute_tick_freshness(silent, universe)
                                 })
-                                .unwrap_or(0);
-                            if worst_gap < SLO_TICK_FRESHNESS_DEGRADED_SECS {
-                                1.0
-                            } else {
-                                0.0
-                            }
+                                .unwrap_or(1.0)
                         };
 
                         // ---- Token_freshness -----------------------------
@@ -9265,6 +9285,34 @@ fn build_inline_greeks_enricher(
     None
 }
 
+/// Fractional tick-freshness coverage for the SLO composite score
+/// (2026-07-03 — replaces the binary worst-gap check; see the call site
+/// in the SLO scheduler for the full incident narrative).
+///
+/// Returns `1.0 − silent_count / universe_size`, clamped to `[0.0, 1.0]`.
+///
+/// Why fractional and not binary: the SLO score is a MULTIPLICATIVE
+/// product of six dimensions, so a binary 0.0 on any one dimension
+/// zeroes the composite. Under the ~775-SID DailyUniverse a handful of
+/// illiquid/suspended SIDs (~33 observed live, D2 investigation
+/// 2026-07-03) are always silent ≥30s during market hours, which made
+/// the binary input a PERMANENT 0 — a constant that carries no signal.
+/// The fraction of silent SIDs is the honest liveness measure: small
+/// silent tails degrade the score proportionally (33/775 → 0.957,
+/// still Healthy ≥0.95), while a genuine broad outage (dead socket →
+/// most of the universe silent) still collapses the dimension toward 0
+/// and pages via the existing SLO tiers.
+///
+/// `universe_size == 0` (pre-seed boot window, detector map empty)
+/// returns `1.0` — an empty map is "no evidence of staleness", not an
+/// outage; the 60s uniform boot grace covers the same window anyway.
+fn compute_tick_freshness(silent_count: usize, universe_size: usize) -> f64 {
+    if universe_size == 0 {
+        return 1.0;
+    }
+    (1.0 - (silent_count as f64 / universe_size as f64)).clamp(0.0, 1.0)
+}
+
 // All pure helper function tests are in boot_helpers.rs (lib.rs target).
 // Only integration-level tests that require main.rs-specific code remain here.
 #[cfg(test)]
@@ -9287,6 +9335,59 @@ mod tests {
     // withholds it and the boot-heartbeat alarm pages. No feed enabled emits
     // (headless run must not false-page). A running-but-disabled feed never
     // counts.
+
+    // ── compute_tick_freshness (SLO fractional coverage, 2026-07-03) ──
+    // Pins the D2 fix: tick_freshness is 1 − silent/universe (clamped),
+    // NOT a binary worst-gap zero. Regression back to binary semantics
+    // fails these tests.
+
+    #[test]
+    fn test_compute_tick_freshness_fractional_33_of_775_stays_healthy() {
+        // The live D2 signature: 33 silent SIDs out of the ~775-SID
+        // DailyUniverse must NOT zero the dimension.
+        let v = compute_tick_freshness(33, 775);
+        let expected = 1.0 - (33.0 / 775.0);
+        assert!((v - expected).abs() < 1e-12, "got {v}, expected {expected}");
+        assert!(
+            v > 0.95,
+            "33/775 silent must stay in the Healthy band, got {v}"
+        );
+    }
+
+    #[test]
+    fn test_compute_tick_freshness_zero_silent_is_one() {
+        assert!((compute_tick_freshness(0, 775) - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_compute_tick_freshness_all_silent_is_zero() {
+        // Genuine broad outage: whole universe silent → dimension 0 →
+        // multiplicative score 0 → Critical still fires.
+        assert!(compute_tick_freshness(775, 775).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_compute_tick_freshness_empty_universe_is_one() {
+        // Pre-seed boot window (empty detector map) — no evidence of
+        // staleness, must not zero the score.
+        assert!((compute_tick_freshness(0, 0) - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_compute_tick_freshness_clamps_when_silent_exceeds_universe() {
+        // Defensive: racing map mutation between len() and the scan can
+        // in theory yield silent > universe; must clamp to 0, not go
+        // negative.
+        assert!(compute_tick_freshness(1_000, 775).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_compute_tick_freshness_broad_outage_drops_below_critical_band() {
+        // 700/775 silent → 0.0967 — far below the 0.80 Critical
+        // boundary; real outages still page.
+        let v = compute_tick_freshness(700, 775);
+        assert!(v < 0.80, "broad outage must land below Critical, got {v}");
+    }
 
     #[test]
     fn test_boot_completed_should_emit_both_off_emits() {
