@@ -61,9 +61,11 @@ fn test_state() -> SharedAppState {
 }
 
 /// Router with bearer auth ENABLED (a real token configured).
-/// `feed_toggle_public` only affects `POST /api/feeds/{feed}` routing — the
-/// debug-route bearer gate must hold in BOTH modes (consolidated from
-/// PR #1402: prove the gate is independent of the feed-toggle mode).
+/// Since the 2026-07-04 operator quote (websocket-connection-scope-lock.md
+/// "FEED TOGGLE BEARER-GATED IN ALL MODES") `feed_toggle_public` is accepted
+/// but IGNORED — `POST /api/feeds/{feed}` is bearer-gated in both modes too.
+/// The both-modes loops below stay as ratchets that the debug gate (and now
+/// the whole router) is independent of the flag (consolidated from PR #1402).
 fn enabled_router_with_toggle(feed_toggle_public: bool) -> axum::Router {
     build_router_with_auth(
         test_state(),
@@ -73,7 +75,7 @@ fn enabled_router_with_toggle(feed_toggle_public: bool) -> axum::Router {
     )
 }
 
-/// Router with bearer auth ENABLED, default feed-toggle mode (public).
+/// Router with bearer auth ENABLED (flag value irrelevant since 2026-07-04).
 fn enabled_router() -> axum::Router {
     enabled_router_with_toggle(true)
 }
