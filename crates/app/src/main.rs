@@ -625,6 +625,22 @@ async fn main() -> Result<()> {
             groww_scale_enabled.then(|| std::sync::Arc::clone(&groww_scale_entries)),
         ),
     );
+    // ── Groww NATIVE-RUST shadow client (PR-R1, operator "go" 2026-07-04) ──
+    // Default-OFF behind `[feeds] groww_native_shadow`. When enabled it runs
+    // ALONGSIDE the Python sidecar (same watch file, own NDJSON capture at
+    // data/groww/rust-live-ticks.ndjson) for the exact per-tick parity
+    // comparer. Shadow-only: NO shared-table writes, NO strategy/order wiring,
+    // NO sidecar changes — the flag is the kill switch.
+    if config.feeds.groww_native_shadow {
+        let _groww_native_shadow_supervisor =
+            tickvault_app::groww_native_shadow::spawn_supervised_groww_native_shadow(
+                std::path::PathBuf::from(tickvault_common::constants::GROWW_DATA_DIR),
+            );
+        tracing::info!(
+            "groww native shadow client ENABLED (PR-R1) — capturing to {}",
+            tickvault_common::constants::GROWW_NATIVE_SHADOW_NDJSON_PATH
+        );
+    }
     // ── Dhan dormant activation watcher (PR-2, feed-toggle-full-lifecycle) ──
     // Spawned UNCONDITIONALLY at boot (like the Groww watcher), BEFORE the
     // per-feed Dhan-OFF dispatcher below — so it survives a

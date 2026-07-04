@@ -727,6 +727,15 @@ fn serialize_watch_file(
 
 /// Atomically writes `content` to `path` (write `.tmp` → rename). Creates parent
 /// dirs. Testable via tempdir.
+/// Test-only bridge to the private serializer so the native shadow client's
+/// watch READER (`native::watch_reader`, PR-R1 2026-07-04) round-trips against
+/// the REAL writer instead of a hand-copied fixture.
+#[cfg(test)]
+// TEST-EXEMPT: cfg(test)-only shim over the private serializer; exercised by the watch_reader round-trip test.
+pub(crate) fn serialize_watch_file_for_test(set: &GrowwWatchSet, trading_date_ist: &str) -> String {
+    serialize_watch_file(set, trading_date_ist).expect("test watch-file serialization")
+}
+
 fn write_watch_file_atomic(path: &Path, content: &str) -> Result<(), WatchBuildError> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| WatchBuildError::WriteFailed(e.to_string()))?;

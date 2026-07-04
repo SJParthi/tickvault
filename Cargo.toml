@@ -135,6 +135,13 @@ zeroize = { version = "1.8.2", features = ["derive"] }
 # an explicit CryptoProvider. We use aws-lc-rs (already in the dep tree).
 rustls = { version = "0.23.40", default-features = false, features = ["aws_lc_rs"] }
 rustls-native-certs = "0.8.4"
+# 2026-07-04 (Groww native shadow client PR-R1, operator "go" this session):
+# promote aws-lc-rs from transitive (rustls already pulls it — Cargo.lock had
+# 1.17.0 resolved before this line existed) to a DIRECT dep for ed25519
+# session-keypair generation + NATS nonce signing in
+# crates/core/src/feed/groww/native/. No new supply-chain root — same crate,
+# same version the workspace already compiles.
+aws-lc-rs = "1.17.0"
 
 # ---- Section 11: AWS SDK ----
 # 2026-05-23: opt out of each crate's legacy `rustls` feature (which pulls

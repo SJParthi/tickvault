@@ -638,6 +638,56 @@ pub const GROWW_INSTRUMENT_CSV_URL: &str =
     "https://growwapi-assets.groww.in/instruments/instrument.csv"; // APPROVED: constants.rs is the single static-URL source (same as INDEX_CONSTITUENCY_BASE_URL)
 
 // ---------------------------------------------------------------------------
+// Groww NATIVE-RUST shadow client (PR-R1, operator "go" 2026-07-04 —
+// `.claude/rules/project/groww-second-feed-scope-2026-06-19.md` §35).
+// Protocol extracted from the official growwapi-1.5.0 wheel (the sanctioned
+// reference per §32; brutex code banned) — see `docs/groww-ref/`.
+// ---------------------------------------------------------------------------
+
+/// Groww live-feed NATS-over-WebSocket endpoint (wheel `feed.py::_GROWW_SOCKET_URL`).
+pub const GROWW_SOCKET_URL: &str = "wss://socket-api.groww.in"; // APPROVED: constants.rs is the single WS-URL source
+
+/// Groww per-session socket-token mint endpoint (wheel `client.py::generate_socket_token`).
+///
+/// LIVE-FEED-AUTH class (the KEEP class of
+/// `no-rest-except-live-feed-2026-06-27.md` §2/§3 — recorded there 2026-07-04):
+/// consumes the SSM-read ACCESS token (`Authorization: Bearer …`) to mint a
+/// per-session NATS user JWT bound to a fresh ed25519 nkey. It does NOT mint
+/// the access token (shared-minter lock 2026-07-02 untouched) and carries NO
+/// market data. This is exactly the call the Python sidecar's SDK already
+/// makes on every feed (re)construction.
+pub const GROWW_SOCKET_TOKEN_URL: &str = "https://api.groww.in/v1/api/apex/v1/socket/token/create/"; // APPROVED: constants.rs is the single REST-URL source
+
+/// Groww data directory (watch files, sidecar NDJSON, shadow NDJSON).
+pub const GROWW_DATA_DIR: &str = "data/groww";
+
+/// The native shadow client's OWN NDJSON capture file (same `GrowwTickLine`
+/// line schema as the sidecar's `data/groww/live-ticks.ndjson`), rotated to
+/// `rust-live-ticks-YYYYMMDD.ndjson` at the IST day boundary — mirrors the
+/// sidecar's rotation so the parity comparer sees symmetrical archives.
+pub const GROWW_NATIVE_SHADOW_NDJSON_PATH: &str = "data/groww/rust-live-ticks.ndjson";
+
+/// First reconnect delay for the native shadow client (bounded expo backoff).
+pub const GROWW_NATIVE_RECONNECT_BASE_SECS: u64 = 5;
+
+/// Reconnect backoff ceiling for the native shadow client.
+pub const GROWW_NATIVE_RECONNECT_MAX_SECS: u64 = 60;
+
+/// Floor between access-token SSM re-reads after an auth-class failure —
+/// mirrors the sidecar's `AUTH_RETRY_FLOOR_SECS` (token-minter lock 2026-07-02:
+/// re-read, never mint).
+pub const GROWW_NATIVE_AUTH_RETRY_FLOOR_SECS: u64 = 60;
+
+/// Poll interval while waiting for today's watch file to appear.
+pub const GROWW_NATIVE_WATCH_POLL_SECS: u64 = 30;
+
+/// Bounded channel capacity between the shadow client's read loop and its
+/// NDJSON writer task. Shadow-only: overflow drops are counted loudly
+/// (`tv_groww_native_dropped_total`) and never touch the production capture
+/// chain (the sidecar remains the durable path in R1).
+pub const GROWW_NATIVE_WRITER_CHANNEL_CAPACITY: usize = 65_536;
+
+// ---------------------------------------------------------------------------
 // SSM Parameter Store — QuestDB Service
 // ---------------------------------------------------------------------------
 
@@ -3637,5 +3687,35 @@ mod tests {
             TOKEN_SWEEP_STALENESS_THRESHOLD_SECS,
             TOKEN_SWEEP_INTERVAL_SECS as i64
         );
+    }
+
+    /// PR-R1 (2026-07-04): pins the Groww native-shadow constants — the wheel-
+    /// verified endpoints, the shadow NDJSON path (distinct from the sidecar's
+    /// `live-ticks.ndjson`), and the bounded-backoff/pacing envelope
+    /// (base <= cap; auth floor mirrors the sidecar's 60s token-minter pacing).
+    #[test]
+    fn test_groww_native_constants_pinned() {
+        assert_eq!(GROWW_SOCKET_URL, "wss://socket-api.groww.in");
+        assert_eq!(
+            GROWW_SOCKET_TOKEN_URL,
+            "https://api.groww.in/v1/api/apex/v1/socket/token/create/"
+        );
+        assert!(GROWW_SOCKET_TOKEN_URL.starts_with("https://"));
+        assert_eq!(GROWW_DATA_DIR, "data/groww");
+        assert_eq!(
+            GROWW_NATIVE_SHADOW_NDJSON_PATH,
+            "data/groww/rust-live-ticks.ndjson"
+        );
+        assert!(GROWW_NATIVE_SHADOW_NDJSON_PATH.starts_with(GROWW_DATA_DIR));
+        assert_ne!(
+            GROWW_NATIVE_SHADOW_NDJSON_PATH, "data/groww/live-ticks.ndjson",
+            "shadow capture must never collide with the sidecar's file"
+        );
+        assert_eq!(GROWW_NATIVE_RECONNECT_BASE_SECS, 5);
+        assert_eq!(GROWW_NATIVE_RECONNECT_MAX_SECS, 60);
+        assert!(GROWW_NATIVE_RECONNECT_BASE_SECS <= GROWW_NATIVE_RECONNECT_MAX_SECS);
+        assert_eq!(GROWW_NATIVE_AUTH_RETRY_FLOOR_SECS, 60);
+        assert_eq!(GROWW_NATIVE_WATCH_POLL_SECS, 30);
+        assert_eq!(GROWW_NATIVE_WRITER_CHANNEL_CAPACITY, 65_536);
     }
 }
