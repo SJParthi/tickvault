@@ -194,7 +194,7 @@ Types:    feat, fix, refactor, test, docs, chore, perf, security
 ```
 
 Every commit compiles + passes tests. One logical change per commit.
-Branch protection ON: Build & Verify, Security & Audit, Commit Lint, Secret Scan must pass before merge. Enforced for admins. No direct pushes to main.
+Branch protection ON: **All Green** (the ci.yml fan-in over the ENTIRE PR suite) + Build & Verify, Security & Audit, Commit Lint, Secret Scan must pass before merge. Enforced for admins. No direct pushes to main. Auto-merge arms ONLY after All Green succeeds (never at PR open). See `.claude/rules/project/merge-gate-lock-2026-07-04.md`.
 
 ## CARGO
 
@@ -313,21 +313,32 @@ make questdb                         # localhost:9000 (QuestDB web console)
 
 ## CI/CD PIPELINE
 
-**On every push/PR:**
-1. Build & Verify (25min): compile → binary size <15MB → fmt → clippy → doc → typos → pattern guards → test
-2. Security & Audit (10min): `cargo deny` + `cargo audit --deny yanked`
-3. Commit Lint (PR only): conventional commit format
-4. Secret Scan: blocks .env, AWS keys, private keys, tokens
+(Corrected 2026-07-04 — merge-gate hardening; the previous text was stale.)
 
-**Post-merge only:**
-5. Coverage (ratcheted per-crate floors — see `quality/crate-coverage-thresholds.toml`; floors only move up, 100% is the target)
-6. Benchmarks (budgets in `quality/benchmark-budgets.toml`, 5% regression gate)
-7. DHAT zero-allocation (hard fail for core + trading crates)
+**On every PR (all feed the `All Green` fan-in gate; nothing merges without it):**
+1. Build & Verify: `cargo fmt --check` + `cargo clippy --workspace --no-deps`
+2. Test (common/storage/core/trading/api/app): full per-crate lib + integration suites via nextest — includes DHAT zero-alloc + proptest (DHAT was never post-merge-only; the old claim was wrong)
+3. Security & Audit: `cargo deny` + `cargo audit --deny yanked`
+4. Commit Lint (PR only): conventional commit format
+5. Secret Scan: changed-files scope — blocks .env, AWS keys, private keys, tokens
+6. Design-First Wall (PR only): `plan-gate.sh` server-side
+7. Deploy Lint: SSM quoting guard
+8. Coverage & Perf: `cargo llvm-cov` + ratcheted per-crate floors (`quality/crate-coverage-thresholds.toml`) — **pre-merge since 2026-07-04** (was post-merge-only; skips `dhat_*` tests under coverage instrumentation only)
+9. Repo Guards: banned-pattern + data-integrity + O(1)/dedup + boot-symmetry source scans server-side (closes the `--no-verify` bypass class)
+10. **All Green**: fan-in job over ALL of the above — the single required merge choke point. Auto-merge arms only after it succeeds.
+11. Groww QuestDB E2E: path-filtered PR lane (feed/storage paths only; not in All Green because path-filtered)
+
+**On push to main (post-merge; never cancel-in-progress):**
+- The same suite re-runs on the merge commit (incl. Coverage ratchet artifact)
+- Benchmarks (budgets in `quality/benchmark-budgets.toml`, 5% regression gate)
+- Mutation testing (scoped to changed critical crates; the per-PR mutation lane was removed 2026-07-04 — every PR run died at the 60-min timeout and gated nothing; full sweep is ~18h-class)
+- Deploy (path-filtered), Groww E2E (path-filtered)
 
 **Weekly (Monday):**
 - Fuzz testing (tick_parser, config_parser)
-- Mutation testing (survived mutants = hard fail)
+- Mutation testing full sweep of core/trading/common (MISSED mutants = hard fail)
 - Safety net: cargo-careful + AddressSanitizer + ThreadSanitizer
+- Secret Scan full-tree sweep (every tracked file, not just diffs)
 
 ## LOCAL HOOKS (18 scripts)
 

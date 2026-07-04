@@ -1,27 +1,36 @@
 # =============================================================================
-# tickvault — Mutation Testing (PR Gate for Critical Crates)
+# tickvault — Mutation Testing (SCHEDULED sweep — NOT a PR gate)
 # =============================================================================
-# Runs cargo-mutants on PRs that touch .rs files in core/trading/common crates.
-# Mutation testing verifies that tests actually catch bugs — if a mutant survives,
-# it means there's a code path where tests don't detect a behavior change.
+# Runs cargo-mutants on push-to-main (scoped to the changed critical crates),
+# weekly (full sweep of core/trading/common), and on manual dispatch.
+# Mutation testing verifies that tests actually catch bugs — if a mutant
+# survives (MISSED), a code path exists where tests miss a behavior change.
 #
-# Cost optimization: Skips on draft PRs. Schedule changed from nightly to weekly.
-# This is a required status check — PR cannot merge if mutation score drops.
+# THE pull_request TRIGGER WAS REMOVED 2026-07-04 (merge-gate hardening).
+# Verified reality before removal: EVERY recent PR run (and push run) was
+# killed at the 60-minute `timeout-minutes` ceiling — 4/4 recent runs ended
+# `cancelled` at 60.3–60.6 min, and 8 of the 15 most-recently merged PRs
+# merged with this job still in_progress (later cancelled every time). A
+# scoped `cargo mutants` over even ONE critical crate builds + tests hundreds
+# of mutants; the FULL sweep is an ~18-hour-class job — it can NEVER complete
+# inside a per-PR runner budget. The PR lane therefore gated NOTHING and
+# burned one 60-minute runner per PR touching core/trading/common. The
+# header's old claim "this is a required status check" was also false — a
+# path-filtered workflow cannot safely be a required check (non-matching PRs
+# would never report it).
+#
+# Mutation coverage remains enforced on the SCHEDULED lane (weekly full sweep
+# + per-merge scoped run on main): any MISSED mutant fails the run loudly.
+# If a per-PR mutation gate is ever wanted, it must be redesigned around
+# `cargo mutants --in-diff` with a realistic timeout — not re-added as-is.
 # =============================================================================
 
 name: Mutation Testing
 
 on:
   schedule:
-    - cron: '0 3 * * 1'  # Weekly Monday 3 AM UTC — catches untested code without burning daily minutes
+    - cron: '0 3 * * 1'  # Weekly Monday 3 AM UTC — full sweep of the 3 critical crates
   workflow_dispatch: # Manual trigger for on-demand mutation testing
-  pull_request:
-    branches: [main]
-    types: [opened, synchronize, reopened, ready_for_review]
-    paths:
-      - 'crates/core/**/*.rs'
-      - 'crates/trading/**/*.rs'
-      - 'crates/common/**/*.rs'
   push:
     branches: [main]
     paths:
@@ -32,10 +41,14 @@ on:
 permissions:
   contents: read
 
-# Cancel stale runs
+# Do NOT cancel-in-progress: with the PR trigger gone, the remaining triggers
+# are push-to-main (path-filtered), weekly schedule, and dispatch. Rapid
+# back-to-back merges must QUEUE their mutation runs, not cancel them —
+# cancel-in-progress here was part of the "post-merge gates silently skipped
+# via cancellation" hole (merge-gate hardening 2026-07-04).
 concurrency:
   group: mutation-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
@@ -43,7 +56,6 @@ env:
 jobs:
   mutants:
     name: "Mutation Testing (critical crates)"
-    if: github.event.pull_request.draft != true || github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
@@ -69,13 +81,8 @@ jobs:
         run: |
           set -euo pipefail
           # Get list of changed .rs files in critical crates, event-aware.
-          # github.base_ref is only set on pull_request events — the old
-          # unconditional fallback `git diff origin/${base_ref}...HEAD`
-          # expanded to `origin/...HEAD` on push/schedule and exited 128
-          # on every push-triggered run.
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
-            CHANGED=$(gh pr diff ${{ github.event.pull_request.number }} --name-only 2>/dev/null || git diff --name-only "origin/${{ github.base_ref }}...HEAD")
-          elif [ "${{ github.event_name }}" = "push" ]; then
+          # (The pull_request arm was removed with the PR trigger, 2026-07-04.)
+          if [ "${{ github.event_name }}" = "push" ]; then
             before="${{ github.event.before }}"
             if [ -z "$before" ] || [ "$before" = "0000000000000000000000000000000000000000" ] || ! git cat-file -e "$before" 2>/dev/null; then
               # Force-push / new branch: fall back to the last commit.

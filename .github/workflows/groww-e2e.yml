@@ -19,7 +19,13 @@
 # the amd64-only manifest and was deliberately dropped for multi-arch).
 #
 # Cadence: manual dispatch + Sunday 19:30 UTC (Mon 01:00 IST, off-market) +
-# push-to-main filtered to the files that feed this pipeline.
+# push-to-main filtered to the files that feed this pipeline + (merge-gate
+# hardening 2026-07-04) a pull_request lane with the SAME path filter, so a
+# PR touching the Groww/storage pipeline proves the 3 QuestDB-backed e2e
+# proofs non-vacuously BEFORE merge instead of only after. NOTE: this lane is
+# path-filtered, so it must NOT be made a plain branch-protection required
+# check (non-matching PRs would never report it) and is deliberately NOT in
+# ci.yml's All Green needs list (cross-workflow needs are impossible anyway).
 # =============================================================================
 
 name: Groww QuestDB E2E
@@ -38,9 +44,19 @@ on:
       - "crates/core/src/feed/**"
       - "crates/storage/src/**"
       - ".github/workflows/groww-e2e.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "crates/app/src/groww_bridge.rs"
+      - "crates/app/tests/groww_live_pipeline_e2e.rs"
+      - "crates/core/src/feed/**"
+      - "crates/storage/src/**"
+      - ".github/workflows/groww-e2e.yml"
 
+# Group by ref so a PR run can never cancel a main-push run (and vice versa);
+# within one ref, a newer run supersedes the older one.
 concurrency:
-  group: groww-e2e
+  group: groww-e2e-${{ github.ref }}
   cancel-in-progress: true
 
 permissions:

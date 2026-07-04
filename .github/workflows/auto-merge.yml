@@ -1,55 +1,68 @@
 # =============================================================================
-# tickvault — Auto-Merge Workflow
+# tickvault — Auto-Merge (manual fallback ONLY — merge-gate hardening 2026-07-04)
 # =============================================================================
-# Automatically enables auto-merge on PRs when all CI checks pass.
-# Zero human intervention — CI is the sole gatekeeper.
+# The at-open `pull_request` arming that used to live here is RETIRED.
 #
-# Flow: PR opened → CI runs → all checks green → auto-merge enabled → merged
+# WHY: arming `gh pr merge --auto --squash` at PR open meant the merge fired
+# the moment the branch-protection REQUIRED checks passed — and only 4 checks
+# were required (Build & Verify, Security & Audit, Commit Lint, Secret Scan).
+# On 2026-07-03, PRs #1387 / #1388 / #1382 merged seconds BEFORE their
+# (non-required) Test (storage) job failed, turning main red for hours.
 #
-# Security: All actions pinned to SHA. No mutable tags.
+# Auto-merge is now armed by the `enable-auto-merge` job in ci.yml, which runs
+# `needs: all-green` — i.e. strictly AFTER the ENTIRE PR suite (build, all 6
+# Test crates, security, coverage, repo guards, design-first wall, deploy
+# lint) is green. Same token pattern, same same-repo/fork-safety guard from
+# PR #1390. See .claude/rules/project/merge-gate-lock-2026-07-04.md.
+#
+# This file is kept ONLY as an operator-initiated manual fallback (e.g. the
+# ci.yml arming job was itself cancelled and the operator wants to re-arm
+# without pushing an empty commit). It never fires automatically.
+#
+# Security: All actions pinned. Same-repo origin is re-verified via the API
+# before arming — a fork PR can never be armed even via manual dispatch.
 # =============================================================================
 
 name: Auto-Merge
 
 on:
-  pull_request:
-    branches: [main]
-    types: [opened, synchronize, reopened, ready_for_review]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: "PR number to arm auto-merge (squash) on. Same-repo PRs only."
+        required: true
+        type: string
 
 permissions:
   contents: write
   pull-requests: write
 
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
-
 jobs:
   auto-merge:
-    name: "Enable Auto-Merge"
+    name: "Enable Auto-Merge (manual fallback)"
     runs-on: ubuntu-latest
     timeout-minutes: 5
-    # Only auto-merge for trusted actors, skip draft PRs.
-    #
-    # SECURITY (mandatory gate): the PR must originate from a branch in THIS
-    # repository, not a fork. `github.head_ref` is the PR branch name, which is
-    # fully attacker-controlled on a fork PR — a stranger could fork this PUBLIC
-    # repo, push a branch named `claude/anything`, open a PR, and (if CI passed)
-    # have the bot arm auto-merge and self-merge into main. The
-    # `head.repo.full_name == github.repository` check makes same-repo origin the
-    # non-negotiable requirement; the actor / claude-branch clauses only further
-    # narrow WITHIN same-repo. Fork PRs must never self-arm auto-merge.
-    if: >-
-      github.event.pull_request.draft != true &&
-      github.event.pull_request.head.repo.full_name == github.repository && (
-      github.actor == 'dependabot[bot]' ||
-      github.actor == 'renovate[bot]' ||
-      github.actor == 'SJParthi' ||
-      startsWith(github.head_ref, 'claude/')
-      )
     steps:
-      - name: Enable auto-merge (squash)
-        run: gh pr merge --auto --squash "$PR_URL"
+      - name: Verify same-repo origin + non-draft, then arm auto-merge (squash)
+        shell: bash
         env:
-          PR_URL: ${{ github.event.pull_request.html_url }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          if ! [[ "$PR_NUMBER" =~ ^[0-9]+$ ]]; then
+            echo "::error::pr_number must be a plain integer, got: $PR_NUMBER"
+            exit 1
+          fi
+          head_repo=$(gh api "repos/${REPO}/pulls/${PR_NUMBER}" --jq '.head.repo.full_name')
+          is_draft=$(gh api "repos/${REPO}/pulls/${PR_NUMBER}" --jq '.draft')
+          if [ "$head_repo" != "$REPO" ]; then
+            echo "::error::PR #${PR_NUMBER} originates from fork '$head_repo' — refusing to arm auto-merge (PR #1390 fork-safety guard)."
+            exit 1
+          fi
+          if [ "$is_draft" = "true" ]; then
+            echo "::error::PR #${PR_NUMBER} is a draft — refusing to arm auto-merge."
+            exit 1
+          fi
+          gh pr merge --auto --squash "https://github.com/${REPO}/pull/${PR_NUMBER}"
