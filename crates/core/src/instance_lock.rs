@@ -850,7 +850,15 @@ async fn put_parameter(ssm: &SsmClient, path: &str, value: &str, overwrite: bool
         .overwrite(overwrite)
         .send()
         .await
-        .map_err(|err| anyhow!("{err}"))?;
+        // DisplayErrorContext (fix 2026-07-04): `SdkError`'s bare Display is
+        // just "service error" — the error CODE never reached the anyhow
+        // message, so `is_already_exists` could NEVER match and a genuine
+        // dual boot fail-closed Err'd instead of returning the typed
+        // `AlreadyHeld` (the RESILIENCE-01 / GROWW-SCALE-05 page path).
+        // The full-context formatter preserves "ParameterAlreadyExists"
+        // in the chain. Pinned by
+        // `test_try_acquire_named_lock_already_held_by_fresh_peer`.
+        .map_err(|err| anyhow!("{}", aws_sdk_ssm::error::DisplayErrorContext(&err)))?;
     Ok(())
 }
 
@@ -862,11 +870,16 @@ async fn get_parameter(ssm: &SsmClient, path: &str) -> Result<Option<String>> {
             .and_then(|p| p.value())
             .map(|v| v.to_string())),
         Err(err) => {
-            let msg = format!("{err}");
+            // DisplayErrorContext (fix 2026-07-04): same as put_parameter —
+            // the bare Display hid "ParameterNotFound", so an absent
+            // parameter surfaced as a generic Err instead of Ok(None)
+            // (release-after-expiry became a spurious failure). Pinned by
+            // `test_renew_named_lock_false_when_parameter_not_found_error`.
+            let msg = format!("{}", aws_sdk_ssm::error::DisplayErrorContext(&err));
             if msg.contains("ParameterNotFound") {
                 Ok(None)
             } else {
-                Err(anyhow!("{err}"))
+                Err(anyhow!("{msg}"))
             }
         }
     }
@@ -1316,5 +1329,559 @@ mod tests {
         assert!(json.contains("\"host_id\""));
         assert!(json.contains("\"started_at_unix\""));
         assert!(json.contains("\"last_heartbeat_unix\""));
+    }
+
+    // -----------------------------------------------------------------------
+    // Local SSM stub — serves canned aws-json responses over loopback so the
+    // acquire / renew / release / heartbeat SSM code paths execute
+    // end-to-end WITHOUT a real AWS endpoint. House pattern: the
+    // token_manager mock server (`start_mock_server`) + the notification
+    // service's `endpoint_url("http://127.0.0.1:1")` SDK client.
+    // -----------------------------------------------------------------------
+
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    use tokio::net::TcpListener;
+
+    /// Starts a local stub that answers one queued `(status, body)`
+    /// response per connection, in order, then stops accepting (later
+    /// connects fail once the listener drops — deliberately, so tests can
+    /// prove a code path issues NO further SSM call).
+    async fn start_ssm_stub(
+        responses: Vec<(u16, String)>,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ssm stub");
+        let url = format!(
+            "http://127.0.0.1:{}",
+            listener.local_addr().expect("local addr").port()
+        );
+        let handle = tokio::spawn(async move {
+            for (status, body) in responses {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                // Consume (part of) the request — the SDK tolerates the
+                // server responding without draining the full body.
+                let mut buf = vec![0u8; 8192];
+                let _ = stream.read(&mut buf).await;
+                let response = format!(
+                    "HTTP/1.1 {status} STUB\r\nContent-Type: application/x-amz-json-1.1\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.shutdown().await;
+            }
+        });
+        (url, handle)
+    }
+
+    /// Real `aws-sdk-ssm` client pointed at the stub (or at a
+    /// connection-refused port for transport-error paths). Retries are
+    /// DISABLED so each SSM call maps to exactly one stub connection.
+    fn stub_ssm_client(endpoint: &str) -> SsmClient {
+        let config = aws_sdk_ssm::Config::builder()
+            .endpoint_url(endpoint)
+            .region(aws_sdk_ssm::config::Region::new("ap-south-1"))
+            .behavior_version_latest()
+            .retry_config(aws_sdk_ssm::config::retry::RetryConfig::disabled())
+            .credentials_provider(aws_sdk_ssm::config::Credentials::new(
+                "fake-access-key",
+                "fake-secret-key",
+                None,
+                None,
+                "test",
+            ))
+            .build();
+        SsmClient::from_conf(config)
+    }
+
+    fn put_ok_response() -> (u16, String) {
+        (200, r#"{"Version":1}"#.to_string())
+    }
+
+    fn parameter_already_exists_response() -> (u16, String) {
+        (
+            400,
+            r#"{"__type":"ParameterAlreadyExists","message":"The parameter already exists."}"#
+                .to_string(),
+        )
+    }
+
+    fn get_parameter_response(value: &str) -> (u16, String) {
+        (
+            200,
+            serde_json::json!({
+                "Parameter": {
+                    "Name": "/tickvault/testenv/instance-lock-groww-scale",
+                    "Type": "String",
+                    "Value": value,
+                    "Version": 1
+                }
+            })
+            .to_string(),
+        )
+    }
+
+    /// A 200 with NO `Parameter` field — `get_parameter` maps this to
+    /// `Ok(None)` (parameter absent).
+    fn get_parameter_absent_response() -> (u16, String) {
+        (200, "{}".to_string())
+    }
+
+    // -----------------------------------------------------------------------
+    // try_acquire_named_lock — end-to-end against the stub
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_try_acquire_named_lock_acquired_on_clean_slate() {
+        // PutParameter(overwrite=false) succeeds → atomic claim.
+        let (url, _stub) = start_ssm_stub(vec![put_ok_response()]).await;
+        let ssm = stub_ssm_client(&url);
+        let outcome =
+            try_acquire_named_lock(&ssm, "testenv", GROWW_SCALE_FLEET_LOCK_NAME, "host-a")
+                .await
+                .expect("acquire against stub");
+        assert_eq!(outcome, AcquireOutcome::Acquired);
+    }
+
+    #[tokio::test]
+    async fn test_try_acquire_named_lock_already_held_by_fresh_peer() {
+        // Put rejected (ParameterAlreadyExists) → Get returns a FRESH
+        // holder → AlreadyHeld carrying the peer's host_id.
+        let fresh = LockValue::new("peer-host", now_unix_secs())
+            .to_json()
+            .expect("serialise fresh peer");
+        let (url, _stub) = start_ssm_stub(vec![
+            parameter_already_exists_response(),
+            get_parameter_response(&fresh),
+        ])
+        .await;
+        let ssm = stub_ssm_client(&url);
+        let outcome =
+            try_acquire_named_lock(&ssm, "testenv", GROWW_SCALE_FLEET_LOCK_NAME, "host-a")
+                .await
+                .expect("acquire path");
+        assert_eq!(
+            outcome,
+            AcquireOutcome::AlreadyHeld {
+                holder: "peer-host".to_string()
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn test_try_acquire_named_lock_stale_takeover() {
+        // Put rejected → Get returns a holder whose heartbeat is ancient
+        // → stale takeover via PutParameter(overwrite=true) → Acquired.
+        let stale = LockValue::new("dead-host", 1)
+            .to_json()
+            .expect("serialise stale holder");
+        let (url, _stub) = start_ssm_stub(vec![
+            parameter_already_exists_response(),
+            get_parameter_response(&stale),
+            put_ok_response(),
+        ])
+        .await;
+        let ssm = stub_ssm_client(&url);
+        let outcome =
+            try_acquire_named_lock(&ssm, "testenv", GROWW_SCALE_FLEET_LOCK_NAME, "host-a")
+                .await
+                .expect("stale takeover path");
+        assert_eq!(outcome, AcquireOutcome::Acquired);
+    }
+
+    #[tokio::test]
+    async fn test_try_acquire_named_lock_corrupt_json_refuses_boot() {
+        // Put rejected → Get returns garbage JSON → refuse boot with the
+        // corrupt payload surfaced in the holder diagnostic (operator must
+        // clean the parameter up manually — never silent auto-recovery).
+        let (url, _stub) = start_ssm_stub(vec![
+            parameter_already_exists_response(),
+            get_parameter_response("not-json"),
+        ])
+        .await;
+        let ssm = stub_ssm_client(&url);
+        let outcome =
+            try_acquire_named_lock(&ssm, "testenv", GROWW_SCALE_FLEET_LOCK_NAME, "host-a")
+                .await
+                .expect("corrupt-json path");
+        match outcome {
+            AcquireOutcome::AlreadyHeld { holder } => {
+                assert!(
+                    holder.contains("corrupt-json"),
+                    "holder must surface the corrupt payload: {holder}"
+                );
+            }
+            AcquireOutcome::Acquired => panic!("corrupt JSON must NEVER acquire"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_try_acquire_named_lock_vanished_after_put_rejection() {
+        // Rare race: parameter deleted between the rejected Put and the
+        // diagnostic Get → refuse boot with an empty holder.
+        let (url, _stub) = start_ssm_stub(vec![
+            parameter_already_exists_response(),
+            get_parameter_absent_response(),
+        ])
+        .await;
+        let ssm = stub_ssm_client(&url);
+        let outcome =
+            try_acquire_named_lock(&ssm, "testenv", GROWW_SCALE_FLEET_LOCK_NAME, "host-a")
+                .await
+                .expect("vanished-parameter race path");
+        assert_eq!(
+            outcome,
+            AcquireOutcome::AlreadyHeld {
+                holder: String::new()
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn test_try_acquire_named_lock_get_error_refuses_boot() {
+        // Stub serves ONLY the Put rejection then stops accepting — the
+        // best-effort diagnostic Get fails and the acquire refuses boot
+        // (fail-closed, empty holder).
+        let (url, _stub) = start_ssm_stub(vec![parameter_already_exists_response()]).await;
+        let ssm = stub_ssm_client(&url);
+        let outcome =
+            try_acquire_named_lock(&ssm, "testenv", GROWW_SCALE_FLEET_LOCK_NAME, "host-a")
+                .await
+                .expect("get-error path refuses boot without Err");
+        assert_eq!(
+            outcome,
+            AcquireOutcome::AlreadyHeld {
+                holder: String::new()
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn test_try_acquire_named_lock_fail_closed_on_transport_error() {
+        // Connection-refused endpoint: the overwrite=false Put fails with
+        // a NON-already-exists error → fail-closed Err (cannot prove there
+        // is no peer).
+        let ssm = stub_ssm_client("http://127.0.0.1:1");
+        let err = try_acquire_named_lock(&ssm, "testenv", GROWW_SCALE_FLEET_LOCK_NAME, "host-a")
+            .await
+            .expect_err("transport error must fail closed");
+        assert!(
+            format!("{err:#}").contains("PutParameter(overwrite=false)"),
+            "error context must name the failing SSM call: {err:#}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // renew_named_lock — ownership-checked renewal against the stub
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_renew_named_lock_true_when_owned() {
+        let ours = LockValue::new("host-a", now_unix_secs())
+            .to_json()
+            .expect("serialise our value");
+        let (url, _stub) =
+            start_ssm_stub(vec![get_parameter_response(&ours), put_ok_response()]).await;
+        let ssm = stub_ssm_client(&url);
+        let renewed = renew_named_lock(&ssm, "testenv", GROWW_SCALE_FLEET_LOCK_NAME, "host-a")
+            .await
+            .expect("renew against stub");
+        assert!(renewed, "owned lock must renew to true");
+    }
+
+    #[tokio::test]
+    async fn test_renew_named_lock_false_when_lock_vanished() {
+        let (url, _stub) = start_ssm_stub(vec![get_parameter_absent_response()]).await;
+        let ssm = stub_ssm_client(&url);
+        let renewed = renew_named_lock(&ssm, "testenv", GROWW_SCALE_FLEET_LOCK_NAME, "host-a")
+            .await
+            .expect("vanished-lock renewal");
+        assert!(!renewed, "vanished lock = lost ownership");
+    }
+
+    #[tokio::test]
+    async fn test_renew_named_lock_false_when_foreign_holder() {
+        let foreign = LockValue::new("intruder-host", now_unix_secs())
+            .to_json()
+            .expect("serialise foreign value");
+        let (url, _stub) = start_ssm_stub(vec![get_parameter_response(&foreign)]).await;
+        let ssm = stub_ssm_client(&url);
+        let renewed = renew_named_lock(&ssm, "testenv", GROWW_SCALE_FLEET_LOCK_NAME, "host-a")
+            .await
+            .expect("foreign-holder renewal");
+        assert!(!renewed, "foreign holder = lost ownership");
+    }
+
+    #[tokio::test]
+    async fn test_renew_named_lock_false_when_corrupt_json() {
+        let (url, _stub) = start_ssm_stub(vec![get_parameter_response("not-json")]).await;
+        let ssm = stub_ssm_client(&url);
+        let renewed = renew_named_lock(&ssm, "testenv", GROWW_SCALE_FLEET_LOCK_NAME, "host-a")
+            .await
+            .expect("corrupt-json renewal");
+        assert!(!renewed, "corrupt value = treat as lost ownership");
+    }
+
+    #[tokio::test]
+    async fn test_renew_named_lock_false_when_parameter_not_found_error() {
+        // SSM's typed ParameterNotFound error (as opposed to a 200 with no
+        // Parameter field) must ALSO classify as Ok(None) → lost ownership,
+        // not a transport Err. Pins the DisplayErrorContext classification
+        // fix in `get_parameter` (2026-07-04).
+        let (url, _stub) = start_ssm_stub(vec![(
+            400,
+            r#"{"__type":"ParameterNotFound","message":"Parameter not found."}"#.to_string(),
+        )])
+        .await;
+        let ssm = stub_ssm_client(&url);
+        let renewed = renew_named_lock(&ssm, "testenv", GROWW_SCALE_FLEET_LOCK_NAME, "host-a")
+            .await
+            .expect("ParameterNotFound must be Ok(false), not Err");
+        assert!(!renewed, "ParameterNotFound = lost ownership");
+    }
+
+    #[tokio::test]
+    async fn test_renew_named_lock_errors_on_transport_failure() {
+        let ssm = stub_ssm_client("http://127.0.0.1:1");
+        let err = renew_named_lock(&ssm, "testenv", GROWW_SCALE_FLEET_LOCK_NAME, "host-a")
+            .await
+            .expect_err("transport failure must Err (WARN + retry at caller)");
+        assert!(
+            format!("{err:#}").contains("during renewal"),
+            "error context must name the renewal stage: {err:#}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // release_named_lock — ownership-checked delete against the stub
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_release_named_lock_deletes_when_owned() {
+        let ours = LockValue::new("host-a", now_unix_secs())
+            .to_json()
+            .expect("serialise our value");
+        let (url, _stub) = start_ssm_stub(vec![
+            get_parameter_response(&ours),
+            (200, "{}".to_string()), // DeleteParameter OK
+        ])
+        .await;
+        let ssm = stub_ssm_client(&url);
+        release_named_lock(&ssm, "testenv", GROWW_SCALE_FLEET_LOCK_NAME, "host-a")
+            .await
+            .expect("owned release must delete cleanly");
+    }
+
+    #[tokio::test]
+    async fn test_release_named_lock_ok_when_already_gone() {
+        let (url, _stub) = start_ssm_stub(vec![get_parameter_absent_response()]).await;
+        let ssm = stub_ssm_client(&url);
+        release_named_lock(&ssm, "testenv", GROWW_SCALE_FLEET_LOCK_NAME, "host-a")
+            .await
+            .expect("already-gone release is not an error");
+    }
+
+    #[tokio::test]
+    async fn test_release_named_lock_leaves_foreign_lock_intact() {
+        // Only ONE stub response is queued: if release attempted a
+        // DeleteParameter the second SSM call would fail and the fn would
+        // Err — Ok() therefore PROVES no delete was issued for a foreign
+        // holder.
+        let foreign = LockValue::new("intruder-host", now_unix_secs())
+            .to_json()
+            .expect("serialise foreign value");
+        let (url, _stub) = start_ssm_stub(vec![get_parameter_response(&foreign)]).await;
+        let ssm = stub_ssm_client(&url);
+        release_named_lock(&ssm, "testenv", GROWW_SCALE_FLEET_LOCK_NAME, "host-a")
+            .await
+            .expect("foreign lock must be left intact, not an error");
+    }
+
+    #[tokio::test]
+    async fn test_release_named_lock_leaves_corrupt_value_alone() {
+        let (url, _stub) = start_ssm_stub(vec![get_parameter_response("not-json")]).await;
+        let ssm = stub_ssm_client(&url);
+        release_named_lock(&ssm, "testenv", GROWW_SCALE_FLEET_LOCK_NAME, "host-a")
+            .await
+            .expect("corrupt value is left alone, not an error");
+    }
+
+    // -----------------------------------------------------------------------
+    // Legacy Dhan wrappers + force takeover — delegate to the same shared
+    // bodies; exercised once each so the thin wrappers stay covered.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_legacy_dhan_wrappers_delegate_to_shared_bodies() {
+        // Acquire (clean slate).
+        let (url, _s1) = start_ssm_stub(vec![put_ok_response()]).await;
+        let acquired = try_acquire_instance_lock(&stub_ssm_client(&url), "testenv", "host-a")
+            .await
+            .expect("legacy acquire");
+        assert_eq!(acquired, AcquireOutcome::Acquired);
+
+        // Renew (owned).
+        let ours = LockValue::new("host-a", now_unix_secs())
+            .to_json()
+            .expect("serialise our value");
+        let (url2, _s2) =
+            start_ssm_stub(vec![get_parameter_response(&ours), put_ok_response()]).await;
+        assert!(
+            renew_instance_lock(&stub_ssm_client(&url2), "testenv", "host-a")
+                .await
+                .expect("legacy renew")
+        );
+
+        // Release (already gone — WARN + Ok).
+        let (url3, _s3) = start_ssm_stub(vec![get_parameter_absent_response()]).await;
+        release_instance_lock(&stub_ssm_client(&url3), "testenv", "host-a")
+            .await
+            .expect("legacy release");
+    }
+
+    #[tokio::test]
+    async fn test_force_takeover_overwrites_and_names_displaced_holder() {
+        // Displaced holder present: best-effort read for the audit line,
+        // then unconditional PutParameter(overwrite=true).
+        let displaced = LockValue::new("victim-host", now_unix_secs())
+            .to_json()
+            .expect("serialise displaced value");
+        let (url, _s1) =
+            start_ssm_stub(vec![get_parameter_response(&displaced), put_ok_response()]).await;
+        force_takeover_instance_lock(&stub_ssm_client(&url), "testenv", "host-b")
+            .await
+            .expect("force takeover with displaced holder");
+
+        // Lock absent: still overwrites (audit line says lock absent).
+        let (url2, _s2) =
+            start_ssm_stub(vec![get_parameter_absent_response(), put_ok_response()]).await;
+        force_takeover_instance_lock(&stub_ssm_client(&url2), "testenv", "host-b")
+            .await
+            .expect("force takeover with absent lock");
+    }
+
+    // -----------------------------------------------------------------------
+    // spawn_named_lock_heartbeat — lifecycle against the stub
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_named_lock_heartbeat_shutdown_releases_and_exits() {
+        // Shutdown before the first 30s renewal tick: the select! takes
+        // the shutdown arm (permit stored by notify_one), flips the flag,
+        // performs the final ownership-checked release, and returns.
+        let ours = LockValue::new("host-a", now_unix_secs())
+            .to_json()
+            .expect("serialise our value");
+        let (url, _stub) = start_ssm_stub(vec![
+            get_parameter_response(&ours),
+            (200, "{}".to_string()), // DeleteParameter OK
+        ])
+        .await;
+        let ssm = Arc::new(stub_ssm_client(&url));
+        let shutdown = Arc::new(Notify::new());
+        let held = Arc::new(AtomicBool::new(true));
+        let handle = spawn_named_lock_heartbeat(
+            ssm,
+            "testenv".to_string(),
+            GROWW_SCALE_FLEET_LOCK_NAME,
+            "host-a".to_string(),
+            Arc::clone(&shutdown),
+            Arc::clone(&held),
+            ErrorCode::GrowwScale05DualFleetDetected,
+        );
+        shutdown.notify_one();
+        tokio::time::timeout(Duration::from_secs(30), handle)
+            .await
+            .expect("heartbeat must exit promptly on shutdown")
+            .expect("heartbeat task must not panic");
+        assert!(
+            !held.load(Ordering::Acquire),
+            "held_flag must flip false on shutdown"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_named_lock_heartbeat_pages_and_exits_on_lost_ownership() {
+        // Paused clock — the 30s renewal ticks auto-advance. Renewal #1
+        // succeeds (Ok(true) re-arms the failure episode); renewal #2
+        // observes a foreign holder → Ok(false) → flag flips false, the
+        // loss page fires with the caller's code, and the task exits on
+        // its own (NO shutdown signal sent).
+        let ours = LockValue::new("host-a", now_unix_secs())
+            .to_json()
+            .expect("serialise our value");
+        let foreign = LockValue::new("intruder-host", now_unix_secs())
+            .to_json()
+            .expect("serialise foreign value");
+        let (url, _stub) = start_ssm_stub(vec![
+            get_parameter_response(&ours),
+            put_ok_response(),
+            get_parameter_response(&foreign),
+        ])
+        .await;
+        let ssm = Arc::new(stub_ssm_client(&url));
+        let shutdown = Arc::new(Notify::new());
+        let held = Arc::new(AtomicBool::new(true));
+        let handle = spawn_named_lock_heartbeat(
+            ssm,
+            "testenv".to_string(),
+            GROWW_SCALE_FLEET_LOCK_NAME,
+            "host-a".to_string(),
+            Arc::clone(&shutdown),
+            Arc::clone(&held),
+            ErrorCode::GrowwScale05DualFleetDetected,
+        );
+        tokio::time::timeout(Duration::from_secs(3600), handle)
+            .await
+            .expect("heartbeat must exit after losing ownership")
+            .expect("heartbeat task must not panic");
+        assert!(
+            !held.load(Ordering::Acquire),
+            "held_flag must flip false when ownership is lost"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_named_lock_heartbeat_survives_errors_escalates_past_ttl() {
+        // Connection-refused SSM: every renewal Errs. The task must WARN
+        // and keep retrying (never exit on Err), fire the one-per-episode
+        // TTL escalation once failures span the 90s TTL, and still honour
+        // shutdown afterwards (the final release also fails → WARN arm).
+        let ssm = Arc::new(stub_ssm_client("http://127.0.0.1:1"));
+        let shutdown = Arc::new(Notify::new());
+        let held = Arc::new(AtomicBool::new(true));
+        let handle = spawn_named_lock_heartbeat(
+            ssm,
+            "testenv".to_string(),
+            GROWW_SCALE_FLEET_LOCK_NAME,
+            "host-a".to_string(),
+            Arc::clone(&shutdown),
+            Arc::clone(&held),
+            ErrorCode::GrowwScale05DualFleetDetected,
+        );
+        // Let at least THRESHOLD (+2 margin) renewal ticks elapse so the
+        // consecutive-failure counter crosses the TTL escalation.
+        tokio::time::sleep(Duration::from_secs(
+            INSTANCE_LOCK_HEARTBEAT_INTERVAL_SECS
+                * (u64::from(NAMED_LOCK_RENEWAL_ERRORS_ESCALATE_THRESHOLD) + 2),
+        ))
+        .await;
+        assert!(
+            !handle.is_finished(),
+            "renewal errors must NEVER exit the heartbeat task"
+        );
+        shutdown.notify_one();
+        tokio::time::timeout(Duration::from_secs(3600), handle)
+            .await
+            .expect("heartbeat must exit on shutdown even under SSM outage")
+            .expect("heartbeat task must not panic");
+        assert!(
+            !held.load(Ordering::Acquire),
+            "held_flag must flip false on shutdown"
+        );
     }
 }
