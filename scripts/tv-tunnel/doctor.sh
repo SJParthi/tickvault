@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# tv-tunnel doctor.sh — verify the Tailscale Funnel exposes all 5 ports
-# and that the tickvault services behind them respond.
+# tv-tunnel doctor.sh — verify the Tailscale Funnel exposes the tickvault
+# API port (3001) and that the service behind it responds.
 #
 # Run on either Mac or AWS. Also usable as `--emit-config` to produce a
 # TOML snippet ready to paste into config/claude-mcp-endpoints.toml.
@@ -36,14 +36,14 @@ HOSTNAME_FQDN="$($TS_BIN status --json 2>/dev/null | awk -F '"' '/"DNSName":/{pr
 [[ -z "$HOSTNAME_FQDN" ]] && { fail_row "tailscale not logged in"; exit 1; }
 
 # Prometheus(9090)/Alertmanager(9093)/Grafana(3000) removed in the CloudWatch-only
-# migration (#O1/#O2/#O3) — the tunnel only fronts QuestDB + the tickvault API now.
-declare -a PORTS=(9000 3001)
+# migration (#O1/#O2/#O3). Security trim 2026-07-04: QuestDB (9000) is
+# intentionally NO LONGER funnelled — auth-less raw SQL stays local-only.
+# The tunnel fronts ONLY the tickvault API (3001, bearer-auth).
+declare -a PORTS=(3001)
 declare -A NAMES=(
-  [9000]="QuestDB HTTP"
   [3001]="tickvault API"
 )
 declare -A PATHS=(
-  [9000]="/"
   [3001]="/health"
 )
 
@@ -52,10 +52,13 @@ if [[ $EMIT_CONFIG -eq 1 ]]; then
   host_dashed="${HOSTNAME_FQDN//./-}"
   profile_name=$([[ "$(uname -s)" == "Darwin" ]] && echo "mac-dev" || echo "aws-prod")
   echo "# Paste under [profiles.${profile_name}] in config/claude-mcp-endpoints.toml"
+  echo "# QuestDB (9000) is no longer funnelled (auth-less raw SQL — local only);"
+  echo "# questdb_url stays a localhost URL usable only on the host itself."
   echo "[profiles.${profile_name}]"
-  echo "questdb_url       = \"https://${HOSTNAME_FQDN}:9000\""
+  echo "questdb_url       = \"http://127.0.0.1:9000\""
   echo "tickvault_api_url = \"https://${HOSTNAME_FQDN}:3001\""
-  echo "logs_source       = \"http\""
+  echo "# log tools read the local filesystem — no HTTP log fetch is implemented"
+  echo "logs_source       = \"local\""
   echo "logs_dir_local    = \"./data/logs\""
   exit 0
 fi
@@ -84,13 +87,20 @@ for port in "${PORTS[@]}"; do
   fi
 done
 
-# 3. Hit the new debug endpoints specifically
+# 3. Hit the new debug endpoints specifically.
+# Security trim 2026-07-04: /api/debug/* is gated behind bearer auth, and every
+# real boot fetches the SSM token (auth always ENABLED) — so a tokenless probe
+# returning 401 is the CORRECT, healthy answer on a secured host. 200/404 only
+# occur when auth is disabled (unit-test-style constructions).
 for dbg in "/api/debug/logs/summary" "/api/debug/logs/jsonl/latest"; do
   url="https://${HOSTNAME_FQDN}:3001${dbg}"
   code=$(curl -s -o /dev/null -m 5 -w "%{http_code}" "$url" || echo "000")
-  if [[ "$code" =~ ^(200|404)$ ]]; then
-    # 404 is acceptable if the app hasn't written errors.summary.md yet
-    pass "tickvault debug endpoint ${dbg} reachable (HTTP ${code})"
+  if [[ "$code" == "401" ]]; then
+    pass "tickvault debug endpoint ${dbg} reachable + gated (HTTP 401 — bearer auth enforced, expected)"
+  elif [[ "$code" =~ ^(200|404)$ ]]; then
+    # 404 is acceptable if the app hasn't written errors.summary.md yet;
+    # 200/404 without a token means auth is disabled on this host.
+    pass "tickvault debug endpoint ${dbg} reachable (HTTP ${code} — auth disabled on this host)"
   else
     fail_row "tickvault debug endpoint ${dbg} — HTTP ${code}"
   fi

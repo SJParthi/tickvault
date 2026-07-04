@@ -3,11 +3,12 @@
 #
 # Run once on your EC2 instance (Amazon Linux 2023 / Ubuntu). After that,
 # the funnel auto-starts via systemd, survives reboots, and exposes:
-#   - Prometheus       (port 9090)
-#   - Alertmanager     (port 9093)
-#   - QuestDB HTTP     (port 9000)
-#   - Grafana          (port 3000)
-#   - tickvault API    (port 3001) — includes /api/debug/logs/*
+#   - tickvault API    (port 3001) — includes /api/debug/logs/* (bearer-auth)
+#
+# Security trim 2026-07-04: ONLY 3001 is funnelled. Prometheus 9090 /
+# Alertmanager 9093 / Grafana 3000 are retired (CloudWatch-only migration);
+# QuestDB 9000 is intentionally NO LONGER funnelled — it is an auth-less
+# raw-SQL surface (local access only).
 #
 # After this runs, every Claude session (sandbox, web, Mac) on any branch
 # can query the live AWS stack without further setup.
@@ -105,7 +106,7 @@ pass "tickvault-tunnel.service enabled and started"
 info "probing funnel endpoint (up to 30s)…"
 tunnel_ok=0
 for i in {1..15}; do
-  if $SUDO tailscale funnel status 2>/dev/null | grep -q ":9090"; then
+  if $SUDO tailscale funnel status 2>/dev/null | grep -q ":3001"; then
     tunnel_ok=1
     break
   fi
@@ -113,7 +114,7 @@ for i in {1..15}; do
 done
 
 if [[ $tunnel_ok -eq 1 ]]; then
-  pass "funnel is serving on ports 9090, 9093, 9000, 3000, 3001"
+  pass "funnel is serving on port 3001 (tickvault API only)"
 else
   warn "funnel did not report status within 30s — check with 'sudo tailscale funnel status'"
 fi
@@ -126,12 +127,11 @@ echo "=============================================================="
 echo "  SETUP COMPLETE"
 echo "=============================================================="
 echo
-echo "Your stable Tailscale Funnel URLs:"
-echo "  Prometheus:     https://$HOSTNAME_FQDN:9090"
-echo "  Alertmanager:   https://$HOSTNAME_FQDN:9093"
-echo "  QuestDB HTTP:   https://$HOSTNAME_FQDN:9000"
-echo "  Grafana:        https://$HOSTNAME_FQDN:3000"
+echo "Your stable Tailscale Funnel URL (3001 only — security trim 2026-07-04):"
 echo "  tickvault API:  https://$HOSTNAME_FQDN:3001"
+echo
+echo "NOTE: QuestDB (9000) is intentionally no longer funnelled — auth-less"
+echo "raw SQL stays local-only. Prometheus/Alertmanager/Grafana are retired."
 echo
 echo "NEXT: update config/claude-mcp-endpoints.toml to set these URLs"
 echo "under [profiles.aws-prod], set active = \"aws-prod\", commit + push."

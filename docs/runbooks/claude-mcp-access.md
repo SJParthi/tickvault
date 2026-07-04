@@ -39,7 +39,10 @@ observability access from any Claude session, nothing else works.
 
 After install-mac.sh / install-aws.sh runs:
 - Tailscale Funnel auto-starts on reboot (launchd on Mac, systemd on AWS)
-- Ports 9090/9093/9000/3000/3001 are exposed via stable `.ts.net` URLs
+- Port 3001 (tickvault API, bearer-auth) is exposed via a stable `.ts.net` URL
+  — security trim 2026-07-04: ports 9090/9093/3000 are retired
+  (CloudWatch-only migration) and QuestDB 9000 is intentionally NO LONGER
+  funnelled (auth-less raw SQL — local access only)
 - The URLs never change
 - Write them into `config/claude-mcp-endpoints.toml`, commit, push
 - Every future clone of the repo has working MCP — zero per-session setup
@@ -59,7 +62,7 @@ After install-mac.sh / install-aws.sh runs:
            ↓
 ┌──────────────────────────────────────────────────────────────┐
 │ Tailscale Funnel (stable public URL on .ts.net)              │
-│ mac-hostname.your-tailnet.ts.net:9000  → QuestDB HTTP       │
+│ (QuestDB :9000 no longer funnelled — auth-less SQL, local)   │
 │ mac-hostname.your-tailnet.ts.net:3001  → tickvault API      │
 │                                         ├── /api/debug/logs/summary         │
 │                                         └── /api/debug/logs/jsonl/latest    │
@@ -74,7 +77,9 @@ Key properties:
 - **Stable URLs**: `.ts.net` hostnames never change across Tailscale restarts.
 - **Branch-independent**: endpoints in repo, so every branch checkout works.
 - **Universal**: works identically on Mac dev, AWS prod, claude.ai sandbox.
-- **Logs over HTTP, not filesystem**: `/api/debug/logs/*` eliminates rsync.
+- **Log endpoints exist over HTTP** (`/api/debug/logs/*`, bearer-gated since
+  2026-07-04); the MCP server's log tools themselves read the LOCAL
+  filesystem (`logs_source = "local"` — no HTTP log fetch is implemented).
 - **Auto-heal**: launchd/systemd restart the funnel on crash or reboot.
 
 ## Five inputs the MCP server reads
@@ -103,8 +108,8 @@ Every surface of the tickvault stack is reachable through one MCP server
 
 | Tool | What it reads |
 |---|---|
-| `summary_snapshot` | `errors.summary.md` (local OR via `/api/debug/logs/summary`) |
-| `tail_errors` | `errors.jsonl.*` (local OR via `/api/debug/logs/jsonl/latest`) |
+| `summary_snapshot` | `errors.summary.md` (local filesystem read) |
+| `tail_errors` | `errors.jsonl.*` (local filesystem read) |
 | `list_novel_signatures` | first-seen signatures over a time window |
 | `signature_history` | all events matching a signature hash |
 | `triage_log_tail` | `data/logs/auto-fix.log` |
@@ -155,7 +160,9 @@ The script:
 - Launches `tailscale up` (login flow in browser) if not already logged in
 - Verifies Funnel feature is enabled on your tailnet (if not, points you to the admin ACL URL)
 - Installs `~/Library/LaunchAgents/com.tickvault.tunnel.plist`
-- Loads the launchd service, which calls `tailscale funnel --bg 9090 9093 9000 3000 3001`
+- Loads the launchd service, which calls `tailscale funnel --bg 3001`
+  (security trim 2026-07-04: only the bearer-auth tickvault API is funnelled;
+  QuestDB 9000 — auth-less raw SQL — is intentionally NOT funnelled)
 - Probes for the funnel to come up within 30s
 - Prints your stable URLs — paste them into `config/claude-mcp-endpoints.toml`
 
@@ -180,7 +187,8 @@ bash scripts/tv-tunnel/doctor.sh --emit-config
 This prints a TOML block like:
 ```toml
 [profiles.mac-dev]
-questdb_url       = "https://your-mac.tailnet-name.ts.net:9000"
+# QuestDB is no longer funnelled (auth-less raw SQL) — local-only URL.
+questdb_url       = "http://127.0.0.1:9000"
 tickvault_api_url = "https://your-mac.tailnet-name.ts.net:3001"
 logs_source       = "http"
 logs_dir_local    = "./data/logs"
@@ -236,9 +244,19 @@ unreachable services.
   gated by the Funnel feature's per-node ACL.
 - The debug log endpoints return ERROR signatures and metric values
   only — never auth tokens, order payloads, or user PII.
-- tickvault's protected endpoints (order place/cancel) remain behind
-  `TV_API_TOKEN` bearer auth. The debug endpoints are read-only and
-  intentionally outside that wall so observability is always available.
+- The debug endpoints (`/api/debug/*`) are read-only and — since the
+  2026-07-04 security trim — gated by the SAME bearer-auth wall as the
+  mutating endpoints (`route_layer(require_bearer_auth)`, applied
+  unconditionally). They pass through tokenless ONLY when auth itself is
+  disabled (an empty-token construction, i.e. tests) — never a separate
+  "outside the wall" exemption. Every real boot fetches the bearer token
+  from SSM (hard-fail), so on a running host these endpoints ALWAYS
+  demand `Authorization: Bearer <token>` and 401 otherwise. Fetch the
+  token from SSM: `aws ssm get-parameter --name
+  /tickvault/<env>/api/bearer-token --with-decryption --query
+  Parameter.Value --output text`, then
+  `curl -H "Authorization: Bearer $TOK" https://<host>:3001/api/debug/logs/summary`.
+  Tokenless observability fallback: CloudWatch logs + local MCP file reads.
 - The Dhan access token, AWS credentials, and private keys are never
   logged to `errors.jsonl` (enforced by
   `.claude/hooks/banned-pattern-scanner.sh`).

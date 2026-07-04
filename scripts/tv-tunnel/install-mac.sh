@@ -3,11 +3,12 @@
 #
 # Run once on your Mac. After that, the funnel auto-starts on reboot
 # (launchd), auto-reconnects if the Mac sleeps/wakes, and exposes:
-#   - Prometheus       (port 9090)
-#   - Alertmanager     (port 9093)
-#   - QuestDB HTTP     (port 9000)
-#   - Grafana          (port 3000)
-#   - tickvault API    (port 3001) — includes /api/debug/logs/*
+#   - tickvault API    (port 3001) — includes /api/debug/logs/* (bearer-auth)
+#
+# Security trim 2026-07-04: ONLY 3001 is funnelled. Prometheus 9090 /
+# Alertmanager 9093 / Grafana 3000 are retired (CloudWatch-only migration);
+# QuestDB 9000 is intentionally NO LONGER funnelled — it is an auth-less
+# raw-SQL surface (local access only).
 #
 # Resulting stable URLs are committed to config/claude-mcp-endpoints.toml
 # (via the `--emit-config` flag of doctor.sh after tunnel is up).
@@ -115,7 +116,7 @@ pass "launchd service loaded — tunnel will start within 10 seconds"
 info "probing funnel endpoint (up to 30s)…"
 tunnel_ok=0
 for i in {1..15}; do
-  if "$TAILSCALE_BIN" funnel status 2>/dev/null | grep -q ":9090"; then
+  if "$TAILSCALE_BIN" funnel status 2>/dev/null | grep -q ":3001"; then
     tunnel_ok=1
     break
   fi
@@ -123,7 +124,7 @@ for i in {1..15}; do
 done
 
 if [[ $tunnel_ok -eq 1 ]]; then
-  pass "funnel is serving on ports 9090, 9093, 9000, 3000, 3001"
+  pass "funnel is serving on port 3001 (tickvault API only)"
 else
   warn "funnel did not report status within 30s — check with 'tailscale funnel status'"
 fi
@@ -136,14 +137,18 @@ echo "=============================================================="
 echo "  SETUP COMPLETE"
 echo "=============================================================="
 echo
-echo "Your stable Tailscale Funnel URLs:"
-echo "  Prometheus:     https://$HOSTNAME_FQDN:9090"
-echo "  Alertmanager:   https://$HOSTNAME_FQDN:9093"
-echo "  QuestDB HTTP:   https://$HOSTNAME_FQDN:9000"
-echo "  Grafana:        https://$HOSTNAME_FQDN:3000"
+echo "Your stable Tailscale Funnel URL (3001 only — security trim 2026-07-04):"
 echo "  tickvault API:  https://$HOSTNAME_FQDN:3001"
 echo "  Log summary:    https://$HOSTNAME_FQDN:3001/api/debug/logs/summary"
 echo "  Log JSONL:      https://$HOSTNAME_FQDN:3001/api/debug/logs/jsonl/latest"
+echo
+echo "NOTE: /api/debug/* is bearer-gated — every real boot loads the SSM"
+echo "token, so these URLs need: -H \"Authorization: Bearer \$TOK\" where"
+echo "TOK comes from SSM /tickvault/<env>/api/bearer-token. Tokenless"
+echo "requests return 401 (that is the intended fail-closed behavior)."
+echo
+echo "NOTE: QuestDB (9000) is intentionally no longer funnelled — auth-less"
+echo "raw SQL stays local-only. Prometheus/Alertmanager/Grafana are retired."
 echo
 echo "NEXT: update config/claude-mcp-endpoints.toml to set these URLs"
 echo "under [profiles.mac-dev], then commit + push:"

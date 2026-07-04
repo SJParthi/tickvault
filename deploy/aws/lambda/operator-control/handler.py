@@ -1199,10 +1199,23 @@ def _parse_storage(stdout: str) -> dict:
 # re-emits ONLY the summary as labeled lines — the mismatch CSV itself stays
 # on the box (SSM command output is size-capped). Read-only; degrades to
 # blank fields when the box/app is down or no run has happened yet.
+#
+# Security trim 2026-07-04: /api/debug/* is bearer-gated (auth is ALWAYS
+# enabled on a real boot — the app hard-fails without the SSM token), so the
+# probe fetches the SAME token box-side via the instance role and sends it as
+# an Authorization header. The token is resolved at RUN time on the box —
+# the SSM command document text (logged in RunCommand history) carries only
+# the literal `$TVTOK`, never the value, and stdout prints only CV_* lines.
+# Empty/unfetchable token → 401 → curl -f fails → CV_DATE= blank, the same
+# truthful "no data" degrade as a stopped box (audit Rule 11 — never a
+# fabricated PASS, and post-gating never a silently-blank card either).
 _CROSS_VERIFY_COMMANDS = [
     "set +e",
     (
-        "curl -fsS --max-time 4 http://127.0.0.1:3001/api/debug/cross-verify/latest 2>/dev/null | "
+        'TVTOK="$(aws ssm get-parameter --name /tickvault/prod/api/bearer-token '
+        "--with-decryption --query Parameter.Value --output text 2>/dev/null || true)\"; "
+        'curl -fsS --max-time 4 -H "Authorization: Bearer $TVTOK" '
+        "http://127.0.0.1:3001/api/debug/cross-verify/latest 2>/dev/null | "
         'python3 -c \'import json,sys; d=json.load(sys.stdin); s=d.get("summary") or {}; '
         'print("CV_DATE="+str(d.get("date",""))); '
         'print("CV_MISMATCH_ROWS="+str(d.get("mismatch_rows",""))); '

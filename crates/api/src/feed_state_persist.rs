@@ -197,7 +197,11 @@ pub fn persist_feed_state(status: &FeedStatus, path: &Path) -> std::io::Result<(
         std::fs::rename(&tmp_path, path)
     };
     write_then_rename().inspect_err(|_| {
-        let _ = std::fs::remove_file(&tmp_path);
+        // Best-effort cleanup — a stray tmp is harmless (never promoted).
+        // Explicit Err arm satisfies clippy::let_underscore_must_use.
+        if let Err(cleanup_err) = std::fs::remove_file(&tmp_path) {
+            tracing::debug!(?cleanup_err, "failed to remove stray feed-state tmp file");
+        }
     })
 }
 
