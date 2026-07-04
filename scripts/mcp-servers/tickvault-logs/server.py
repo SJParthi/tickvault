@@ -691,6 +691,28 @@ def tool_tickvault_api(
     request = urllib.request.Request(full)  # noqa: S310
     bearer = os.environ.get("TICKVAULT_API_BEARER_TOKEN", "").strip()
     if bearer:
+        # Security (adversarial re-review 2026-07-04): never leak the bearer
+        # token in cleartext. Attach the Authorization header ONLY when the
+        # URL is https:// or targets the local host — a plaintext http://
+        # profile value pointing at a remote host gets a refusal, not a
+        # silently-exfiltrated token. (Mirrors the portal-token plaintext
+        # refusal precedent elsewhere in this file.)
+        from urllib.parse import urlsplit
+
+        parts = urlsplit(full)
+        host = (parts.hostname or "").lower()
+        is_local = host in ("127.0.0.1", "localhost", "::1")
+        if parts.scheme != "https" and not is_local:
+            return {
+                "ok": False,
+                "error": (
+                    "refusing to send TICKVAULT_API_BEARER_TOKEN over plaintext "
+                    "http to a non-localhost host — use an https:// "
+                    "tickvault_api_url, or unset the token for the tokenless "
+                    "public GETs"
+                ),
+                "url": full,
+            }
         request.add_header("Authorization", f"Bearer {bearer}")
     try:
         with urllib.request.urlopen(request, timeout=10) as resp:  # noqa: S310
