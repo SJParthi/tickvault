@@ -84,6 +84,9 @@ Pre-staged branch `claude/aws-resume-jul9` = exact revert commit of this change 
 - [x] Pause aws-autopilot + deploy-aws-after-close auto triggers (workflow_dispatch kept)
   - Files: .github/workflows/aws-autopilot.yml, .github/workflows/deploy-aws-after-close.yml
   - Tests: github_workflow_guard, aws_infra_wiring (kept green — substring pins survive in comments)
+- [x] Pause deploy-aws.yml push-to-main + tag triggers (workflow_dispatch kept) — the LAST residual auto-start vector: a merge touching its path filters fires a deploy whose "Ensure instance running" step self-starts the box (the follow-up flagged in Design above; same 2026-07-04 operator authorization)
+  - Files: .github/workflows/deploy-aws.yml
+  - Tests: github_workflow_guard r11/r13, deploy_provenance_guard, aws_infra_wiring (kept green — substring pins survive verbatim inside the commented block); revert appended to claude/aws-resume-jul9
 - [x] Validate: terraform fmt -check + validate green; terraform-pinning ratchet tests green
   - Files: (none — verification)
   - Tests: aws_infra_wiring, aws_alarm_semantics_guard, boot_completed_metric_guard, aws_deploy_safety_guard, instance_type_lock_guard
