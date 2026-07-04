@@ -3,11 +3,13 @@
 #
 # Run once on your Mac. After that, the funnel auto-starts on reboot
 # (launchd), auto-reconnects if the Mac sleeps/wakes, and exposes:
-#   - Prometheus       (port 9090)
-#   - Alertmanager     (port 9093)
-#   - QuestDB HTTP     (port 9000)
-#   - Grafana          (port 3000)
-#   - tickvault API    (port 3001) — includes /api/debug/logs/*
+#   - tickvault API    (port 3001) — the ONLY funneled port
+#
+# 2026-07-04 security hardening (GAP-SEC-01): the funnel is PUBLIC internet
+# with no auth. The former 5-port list (9090 9093 9000 3000 3001) exposed
+# the unauthenticated QuestDB SQL port (9000) + 3 retired-service ports.
+# Only 3001 is funneled now; its /api/debug/* routes are bearer-gated in
+# crates/api. QuestDB stays reachable on-box at 127.0.0.1:9000.
 #
 # Resulting stable URLs are committed to config/claude-mcp-endpoints.toml
 # (via the `--emit-config` flag of doctor.sh after tunnel is up).
@@ -115,7 +117,7 @@ pass "launchd service loaded — tunnel will start within 10 seconds"
 info "probing funnel endpoint (up to 30s)…"
 tunnel_ok=0
 for i in {1..15}; do
-  if "$TAILSCALE_BIN" funnel status 2>/dev/null | grep -q ":9090"; then
+  if "$TAILSCALE_BIN" funnel status 2>/dev/null | grep -q ":3001"; then
     tunnel_ok=1
     break
   fi
@@ -123,7 +125,7 @@ for i in {1..15}; do
 done
 
 if [[ $tunnel_ok -eq 1 ]]; then
-  pass "funnel is serving on ports 9090, 9093, 9000, 3000, 3001"
+  pass "funnel is serving on port 3001 (tickvault API only)"
 else
   warn "funnel did not report status within 30s — check with 'tailscale funnel status'"
 fi
@@ -136,14 +138,13 @@ echo "=============================================================="
 echo "  SETUP COMPLETE"
 echo "=============================================================="
 echo
-echo "Your stable Tailscale Funnel URLs:"
-echo "  Prometheus:     https://$HOSTNAME_FQDN:9090"
-echo "  Alertmanager:   https://$HOSTNAME_FQDN:9093"
-echo "  QuestDB HTTP:   https://$HOSTNAME_FQDN:9000"
-echo "  Grafana:        https://$HOSTNAME_FQDN:3000"
+echo "Your stable Tailscale Funnel URL (3001 only — security hardening 2026-07-04):"
 echo "  tickvault API:  https://$HOSTNAME_FQDN:3001"
-echo "  Log summary:    https://$HOSTNAME_FQDN:3001/api/debug/logs/summary"
-echo "  Log JSONL:      https://$HOSTNAME_FQDN:3001/api/debug/logs/jsonl/latest"
+echo "  Log summary:    https://$HOSTNAME_FQDN:3001/api/debug/logs/summary  (bearer token required)"
+echo "  Log JSONL:      https://$HOSTNAME_FQDN:3001/api/debug/logs/jsonl/latest  (bearer token required)"
+echo
+echo "NOT funneled (on-box only): QuestDB 127.0.0.1:9000 — the raw SQL port"
+echo "must never be on the public internet."
 echo
 echo "NEXT: update config/claude-mcp-endpoints.toml to set these URLs"
 echo "under [profiles.mac-dev], then commit + push:"

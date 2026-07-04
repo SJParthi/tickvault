@@ -1,5 +1,5 @@
 [Unit]
-Description=tickvault Tailscale Funnel — exposes observability ports for Claude MCP access
+Description=tickvault Tailscale Funnel — exposes the tickvault API (3001 ONLY) for Claude MCP access
 Documentation=file:///home/ec2-user/tickvault/docs/runbooks/claude-mcp-access.md
 After=network-online.target tailscaled.service
 Wants=network-online.target tailscaled.service
@@ -7,7 +7,11 @@ Wants=network-online.target tailscaled.service
 [Service]
 Type=simple
 # Funnel foreground mode so systemd owns the lifecycle.
-ExecStart=/usr/bin/tailscale funnel 9090 9093 9000 3000 3001
+# 2026-07-04 security hardening (GAP-SEC-01): funnel is PUBLIC internet with
+# no auth — narrowed from `9090 9093 9000 3000 3001` to 3001 only. This drops
+# the unauthenticated QuestDB SQL port (9000) + 3 retired-service ports
+# (9090/9093/3000). QuestDB stays reachable on-box at 127.0.0.1:9000.
+ExecStart=/usr/bin/tailscale funnel 3001
 ExecStopPost=/usr/bin/tailscale funnel reset
 Restart=always
 RestartSec=10

@@ -39,8 +39,13 @@ observability access from any Claude session, nothing else works.
 
 After install-mac.sh / install-aws.sh runs:
 - Tailscale Funnel auto-starts on reboot (launchd on Mac, systemd on AWS)
-- Ports 9090/9093/9000/3000/3001 are exposed via stable `.ts.net` URLs
-- The URLs never change
+- Port **3001 ONLY** (tickvault API) is exposed via a stable `.ts.net` URL —
+  2026-07-04 security hardening narrowed the funnel from
+  `9090 9093 9000 3000 3001` to `3001`: the funnel is public internet with
+  no auth, so the raw QuestDB SQL port (9000) and 3 retired-service ports
+  were dropped. QuestDB stays reachable on-box at `127.0.0.1:9000`, and the
+  `/api/debug/*` routes on 3001 are bearer-gated in `crates/api`.
+- The URL never changes
 - Write them into `config/claude-mcp-endpoints.toml`, commit, push
 - Every future clone of the repo has working MCP — zero per-session setup
 
@@ -59,10 +64,10 @@ After install-mac.sh / install-aws.sh runs:
            ↓
 ┌──────────────────────────────────────────────────────────────┐
 │ Tailscale Funnel (stable public URL on .ts.net)              │
-│ mac-hostname.your-tailnet.ts.net:9000  → QuestDB HTTP       │
 │ mac-hostname.your-tailnet.ts.net:3001  → tickvault API      │
-│                                         ├── /api/debug/logs/summary         │
-│                                         └── /api/debug/logs/jsonl/latest    │
+│   (the ONLY funneled port — 2026-07-04 hardening)            │
+│              ├── /api/debug/logs/summary       (bearer-gated)│
+│              └── /api/debug/logs/jsonl/latest  (bearer-gated)│
 └──────────────────────────────────────────────────────────────┘
            ↓ (Mac launchd | AWS systemd restarts on crash/reboot)
 ┌──────────────────────────────────────────────────────────────┐
@@ -155,7 +160,8 @@ The script:
 - Launches `tailscale up` (login flow in browser) if not already logged in
 - Verifies Funnel feature is enabled on your tailnet (if not, points you to the admin ACL URL)
 - Installs `~/Library/LaunchAgents/com.tickvault.tunnel.plist`
-- Loads the launchd service, which calls `tailscale funnel --bg 9090 9093 9000 3000 3001`
+- Loads the launchd service, which calls `tailscale funnel --bg 3001`
+  (3001 only — 2026-07-04 security hardening)
 - Probes for the funnel to come up within 30s
 - Prints your stable URLs — paste them into `config/claude-mcp-endpoints.toml`
 
@@ -180,7 +186,9 @@ bash scripts/tv-tunnel/doctor.sh --emit-config
 This prints a TOML block like:
 ```toml
 [profiles.mac-dev]
-questdb_url       = "https://your-mac.tailnet-name.ts.net:9000"
+# 2026-07-04 hardening: the funnel no longer fronts QuestDB (9000) —
+# questdb_sql works ON the box only; remote sessions use the API.
+questdb_url       = "http://127.0.0.1:9000"
 tickvault_api_url = "https://your-mac.tailnet-name.ts.net:3001"
 logs_source       = "http"
 logs_dir_local    = "./data/logs"

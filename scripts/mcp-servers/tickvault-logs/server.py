@@ -668,6 +668,14 @@ def tool_tickvault_api(
 
     Lets Claude inspect the running app's own state without the
     operator copy-pasting curl output.
+
+    2026-07-04 tunnel-exposure hardening: the `/api/debug/*` routes are now
+    BEARER-GATED in crates/api. When the operator exports TICKVAULT_API_TOKEN
+    (the same bearer the app reads from SSM), it is sent as the Authorization
+    header so remote sessions keep read access. The token is NEVER included
+    in the returned dict or any log line. Without the env var, gated routes
+    answer 401 — honest, and the canonical file-reading MCP log tools are
+    unaffected (they read data/logs/* directly).
     """
     import urllib.request
 
@@ -680,8 +688,13 @@ def tool_tickvault_api(
     if not path.startswith("/"):
         path = f"/{path}"
     full = f"{api_url}{path}"
+    headers: dict[str, str] = {}
+    api_token = os.environ.get("TICKVAULT_API_TOKEN", "").strip()
+    if api_token:
+        headers["Authorization"] = f"Bearer {api_token}"
+    req = urllib.request.Request(full, headers=headers)  # noqa: S310
     try:
-        with urllib.request.urlopen(full, timeout=10) as resp:  # noqa: S310
+        with urllib.request.urlopen(req, timeout=10) as resp:  # noqa: S310
             body = resp.read().decode("utf-8")
             status = resp.status
     except Exception as err:  # noqa: BLE001

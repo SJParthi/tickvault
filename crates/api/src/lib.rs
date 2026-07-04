@@ -119,14 +119,46 @@ pub fn build_router_with_auth(
     // `auth_config` is consumed by the layer below regardless of branch (so no
     // unused-variable lint when the toggle is public and the router is empty).
     const FEED_TOGGLE_PATH: &str = "/api/feeds/{feed}";
-    let protected_base: Router<SharedAppState> = if feed_toggle_public {
-        Router::new()
-    } else {
-        Router::new().route(
+    // 2026-07-04 tunnel-exposure hardening (GAP-SEC-01): the read-only
+    // `/api/debug/*` log routes are bearer-gated. They live on port 3001 —
+    // the ONLY port the Tailscale Funnel still fronts after the funnel was
+    // narrowed to 3001-only (see scripts/tv-tunnel/) — so leaving them public
+    // would expose the error-log artefacts (errors.summary.md, hourly ERROR
+    // JSONL, spill-dir status, cross-verify CSV) to the PUBLIC INTERNET with
+    // no auth. Gating them behind `require_bearer_auth` (the same middleware
+    // guarding the feed-toggle POST) closes that hole.
+    //
+    // MCP-contract note (verified): the canonical MCP observability tools
+    // (`summary_snapshot`, `tail_errors`, `list_novel_signatures`,
+    // `triage_log_tail`, `signature_history`) read `data/logs/*` files
+    // DIRECTLY on the box in `scripts/mcp-servers/tickvault-logs/server.py`,
+    // NOT via these HTTP routes — so gating them does NOT break the MCP
+    // read-only observability contract in CLAUDE.md. Only the redundant
+    // `tool_tickvault_api` generic HTTP passthrough to a debug path now needs
+    // the bearer token; the file-reading tools are unaffected.
+    let mut protected_base: Router<SharedAppState> = Router::new()
+        .route(
+            "/api/debug/logs/summary",
+            axum::routing::get(handlers::debug::logs_summary),
+        )
+        .route(
+            "/api/debug/logs/jsonl/latest",
+            axum::routing::get(handlers::debug::logs_jsonl_latest),
+        )
+        .route(
+            "/api/debug/spill/status",
+            axum::routing::get(handlers::debug::spill_status),
+        )
+        .route(
+            "/api/debug/cross-verify/latest",
+            axum::routing::get(handlers::debug::cross_verify_latest),
+        );
+    if !feed_toggle_public {
+        protected_base = protected_base.route(
             FEED_TOGGLE_PATH,
             axum::routing::post(handlers::feeds::set_feed),
-        )
-    };
+        );
+    }
     let protected_routes: Router<SharedAppState> = protected_base.layer(
         axum::middleware::from_fn_with_state(auth_config, require_bearer_auth),
     );
@@ -183,28 +215,11 @@ pub fn build_router_with_auth(
         .route(
             "/api/quote/{security_id}",
             axum::routing::get(handlers::quote::get_quote),
-        )
-        // Autonomous-ops Layer 1 (observability): read-only log access
-        // for Claude MCP / remote sessions.
-        .route(
-            "/api/debug/logs/summary",
-            axum::routing::get(handlers::debug::logs_summary),
-        )
-        .route(
-            "/api/debug/logs/jsonl/latest",
-            axum::routing::get(handlers::debug::logs_jsonl_latest),
-        )
-        .route(
-            "/api/debug/spill/status",
-            axum::routing::get(handlers::debug::spill_status),
-        )
-        // Visibility directive 2026-06-10: latest post-market 1-minute
-        // cross-verify artefacts (CSV + summary) for the operator portal
-        // Cross-verify card + MCP sessions.
-        .route(
-            "/api/debug/cross-verify/latest",
-            axum::routing::get(handlers::debug::cross_verify_latest),
         );
+    // NOTE: the 4 `/api/debug/*` observability routes were MOVED into the
+    // bearer-gated `protected_base` above (2026-07-04 tunnel-exposure
+    // hardening). They are no longer public — see the rationale comment at
+    // the `protected_base` construction.
 
     // dry-run/sandbox: the mutating feed-toggle is PUBLIC (tokenless) so the
     // /feeds page can flip feeds without a token on localhost. In live trading
@@ -617,6 +632,117 @@ mod tests {
                     .uri("/api/feeds/groww")
                     .header("content-type", "application/json")
                     .body(Body::from(r#"{"enabled":true}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+    }
+
+    /// The 4 read-only `/api/debug/*` observability routes (2026-07-04
+    /// tunnel-exposure hardening). They live on port 3001 — the only port
+    /// the Tailscale Funnel fronts — so they MUST be bearer-gated.
+    const DEBUG_ROUTES: [&str; 4] = [
+        "/api/debug/logs/summary",
+        "/api/debug/logs/jsonl/latest",
+        "/api/debug/spill/status",
+        "/api/debug/cross-verify/latest",
+    ];
+
+    #[tokio::test]
+    async fn test_debug_routes_require_auth_401_without_token() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use secrecy::SecretString;
+        use tower::ServiceExt;
+
+        // 2026-07-04 tunnel-exposure hardening ratchet: with auth ENABLED,
+        // every /api/debug/* route MUST 401 without a bearer token — in BOTH
+        // feed-toggle modes (the debug gate is independent of the dry-run
+        // feed-toggle publicity flag). A future edit that re-publicizes any
+        // of these routes fails this test.
+        for feed_toggle_public in [false, true] {
+            let auth = ApiAuthConfig::from_token(SecretString::from("secret-tok".to_string()));
+            let router = build_router_with_auth(auth_test_state(), &[], auth, feed_toggle_public);
+            for route in DEBUG_ROUTES {
+                let response = router
+                    .clone()
+                    .oneshot(Request::builder().uri(route).body(Body::empty()).unwrap())
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    response.status(),
+                    axum::http::StatusCode::UNAUTHORIZED,
+                    "{route} must be bearer-gated (feed_toggle_public={feed_toggle_public})",
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_debug_routes_pass_with_valid_token() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use secrecy::SecretString;
+        use tower::ServiceExt;
+
+        // With the valid bearer token the gate opens. /api/debug/spill/status
+        // always answers 200 (in-memory snapshot); the file-backed routes
+        // answer 200 or 404 depending on whether the artefact exists on the
+        // test box — the ratchet is "never 401 with a valid token".
+        let auth = ApiAuthConfig::from_token(SecretString::from("secret-tok".to_string()));
+        let router = build_router_with_auth(auth_test_state(), &[], auth, false);
+
+        for route in DEBUG_ROUTES {
+            let response = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(route)
+                        .header("Authorization", "Bearer secret-tok")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_ne!(
+                response.status(),
+                axum::http::StatusCode::UNAUTHORIZED,
+                "{route} must accept the valid bearer token",
+            );
+        }
+
+        // The in-memory snapshot route is deterministic: authed = 200.
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/api/debug/spill/status")
+                    .header("Authorization", "Bearer secret-tok")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_debug_routes_public_when_auth_disabled() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        // Auth disabled (local dev box: dry-run + no SSM token) →
+        // require_bearer_auth passes through, so the debug routes stay usable
+        // with no token. On prod / any box with the SSM token, auth is
+        // enabled and the 401 gate above applies.
+        let router =
+            build_router_with_auth(auth_test_state(), &[], ApiAuthConfig::disabled(), true);
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/api/debug/spill/status")
+                    .body(Body::empty())
                     .unwrap(),
             )
             .await

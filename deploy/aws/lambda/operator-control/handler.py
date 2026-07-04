@@ -1199,10 +1199,35 @@ def _parse_storage(stdout: str) -> dict:
 # re-emits ONLY the summary as labeled lines — the mismatch CSV itself stays
 # on the box (SSM command output is size-capped). Read-only; degrades to
 # blank fields when the box/app is down or no run has happened yet.
+#
+# 2026-07-04 tunnel-exposure hardening: /api/debug/* is now BEARER-GATED in
+# crates/api (GAP-SEC-01). The SSM command fetches the bearer token ON the
+# box (instance role — the same SSM read the app performs at boot) and sends
+# the Authorization header. The token never appears in this command TEXT and
+# is never echoed to command output; any fetch/auth failure degrades exactly
+# as before (`|| echo CV_DATE=` → truthful blank card, never a fake PASS).
+_API_BEARER_TOKEN_PARAM = os.environ.get(
+    "API_BEARER_TOKEN_PARAM", "/tickvault/prod/api/bearer-token"
+)
+# The token is passed to curl via a mode-0600 header FILE (`-H @file`), NOT
+# argv, so it is never visible in `ps`/`/proc/<pid>/cmdline` on the box and
+# arbitrary token bytes cannot break shell quoting (security-review MEDIUMs,
+# 2026-07-04). printf writes it verbatim; the file is removed immediately.
 _CROSS_VERIFY_COMMANDS = [
     "set +e",
+    "umask 077",
+    'TV_CV_HDR="$(mktemp /tmp/tv-cv-auth.XXXXXX)"',
     (
-        "curl -fsS --max-time 4 http://127.0.0.1:3001/api/debug/cross-verify/latest 2>/dev/null | "
+        f"aws ssm get-parameter --name {_API_BEARER_TOKEN_PARAM} "
+        f"--region {REGION} --with-decryption --query Parameter.Value "
+        "--output text 2>/dev/null | "
+        'python3 -c \'import sys; t=sys.stdin.read().strip(); '
+        'print("Authorization: Bearer "+t) if t else None\' '
+        '> "$TV_CV_HDR" 2>/dev/null'
+    ),
+    (
+        'curl -fsS --max-time 4 -H "@${TV_CV_HDR}" '
+        "http://127.0.0.1:3001/api/debug/cross-verify/latest 2>/dev/null | "
         'python3 -c \'import json,sys; d=json.load(sys.stdin); s=d.get("summary") or {}; '
         'print("CV_DATE="+str(d.get("date",""))); '
         'print("CV_MISMATCH_ROWS="+str(d.get("mismatch_rows",""))); '
@@ -1212,6 +1237,7 @@ _CROSS_VERIFY_COMMANDS = [
         'print("CV_DEGRADED="+str(s.get("degraded","")))\' '
         "2>/dev/null || echo CV_DATE="
     ),
+    'rm -f "$TV_CV_HDR"',
 ]
 
 

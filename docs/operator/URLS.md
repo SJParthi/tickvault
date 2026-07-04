@@ -68,9 +68,11 @@ aws ssm start-session \
 
 Then open **http://localhost:9000** in Chrome. Press Ctrl+C in terminal to close.
 
-**Option B — Tailscale Funnel** (after one-time setup):
-
-URL: `https://<your-tailnet>.ts.net:9000` (stable, bookmark it)
+**Option B — Tailscale Funnel:** RETIRED for QuestDB (2026-07-04 security
+hardening). The funnel is public internet with no auth, so the raw QuestDB
+SQL port (9000) is no longer funneled — use Option A (SSM port-forward)
+above. The funnel now fronts ONLY the tickvault API on port 3001, and its
+`/api/debug/*` routes require the bearer token.
 
 ## 🚀 Deploys & Code
 
