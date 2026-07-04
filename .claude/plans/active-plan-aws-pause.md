@@ -30,7 +30,7 @@ Minimal + loud terraform-only change: flip the EventBridge rules that (a) auto-S
 
 Why gate-rule-disable instead of `actions_enabled = false` on the alarms: both liveness alarms are ALREADY `actions_enabled = false` in terraform; the live enable comes exclusively from the window-gate Lambda fired by the `*_open` rules. Disabling the open rules is the single smallest change that silences them, needs no alarm-resource edit, and the still-enabled `*_close` rules re-assert actions-off daily as defense in depth.
 
-GitHub-Actions self-start paths (guarded post-merge via GitHub's NATIVE workflow enable/disable toggle — no new machinery): `aws-autopilot.yml` (cron every 15 min 08:30–16:30 IST Mon-Fri; `scripts/aws-autopilot.sh` runs `ec2 start-instances` on any stopped box inside the up-window), `deploy-aws-after-close.yml` (5 weekday crons; would see main moved and dispatch deploy-aws), and `deploy-aws.yml` (`Ensure instance running` step self-starts a stopped box inside the up-window or on any workflow_dispatch). All three are disabled with `gh workflow disable` for the window and MUST be re-enabled (`gh workflow enable`) on Thu Jul 9 before 08:30 IST alongside the terraform revert.
+GitHub-Actions self-start paths (guarded by commenting out their AUTO triggers — the same declarative toggle pattern as the terraform `state = "DISABLED"`, no new machinery, and the revert branch restores them atomically with the terraform revert): `aws-autopilot.yml` (cron every 15 min 08:30-16:30 IST Mon-Fri; `scripts/aws-autopilot.sh` runs `ec2 start-instances` on any stopped box inside the up-window) — schedule commented out; `deploy-aws-after-close.yml` (5 weekday crons; would see main moved by the terraform PR and dispatch deploy-aws) — crons commented out; `deploy-aws.yml` (`Ensure instance running` step self-starts a stopped box inside the up-window on a push to main) — push/tag triggers commented out (landing in the immediate follow-up commit; until it lands, do NOT merge PRs touching crates/config/deploy paths during 08:30-16:30 IST Mon Jul 6 - Wed Jul 8, as that push would self-start the box; the still-enabled 16:30 daily stop + curfew guard bound any such start to the same day). All three keep `workflow_dispatch` (a manual dispatch is the operator's deliberate act). Every commented block carries the dated PAUSED marker. Workflow-pinning ratchet tests stay green because they are substring pins and the pinned text survives verbatim inside the comments (documented transparently in the PR body).
 
 ## Edge Cases
 
@@ -58,11 +58,11 @@ GitHub-Actions self-start paths (guarded post-merge via GitHub's NATIVE workflow
 
 ## Rollback
 
-Pre-staged branch `claude/aws-resume-jul9` = exact revert commit of this change (`chore(aws): resume weekday auto-start from Thu Jul 9 (revert pause window)`). To resume: open + merge that branch's PR before Thu Jul 9 08:30 IST (03:00 UTC), ensure terraform-apply runs to SUCCESS, and re-enable the three GitHub workflows (`gh workflow enable aws-autopilot.yml deploy-aws-after-close.yml deploy-aws.yml` — one call each). Emergency same-day rollback: `aws events enable-rule --name tv-prod-daily-start` (and siblings) restores behavior instantly without terraform; the next terraform-apply would re-disable until the revert merges, so prefer the revert PR.
+Pre-staged branch `claude/aws-resume-jul9` = exact revert commit of this change (`chore(aws): resume weekday auto-start from Thu Jul 9 (revert pause window)`) — it restores BOTH the terraform rules AND the three workflows' auto triggers in one commit. To resume: open + merge that branch's PR before Thu Jul 9 08:30 IST (03:00 UTC) and ensure terraform-apply runs to SUCCESS. Emergency same-day rollback: `aws events enable-rule --name tv-prod-daily-start` (and siblings) restores behavior instantly without terraform; the next terraform-apply would re-disable until the revert merges, so prefer the revert PR.
 
 ## Observability
 
-- Every changed resource carries the dated `# PAUSED 2026-07-04 ... MUST BE REVERTED` comment — greppable (`grep -rn "PAUSED 2026-07-04" deploy/aws/terraform/`).
+- Every changed resource carries the dated `# PAUSED 2026-07-04 ... MUST BE REVERTED` comment — greppable (`grep -rn "PAUSED 2026-07-04" deploy/aws/terraform/ .github/workflows/`).
 - The terraform-apply run output (Telegram-notified per that workflow) shows the 7 rule updates.
 - Post-apply CLI verification pasted verbatim in the task report (describe-rule + describe-alarms).
 - During the window the operator deliberately receives NO box-liveness Telegram (accepted consequence, quoted above); budget digest + curfew/stop guards remain live.
@@ -81,6 +81,9 @@ Pre-staged branch `claude/aws-resume-jul9` = exact revert commit of this change 
 - [x] Disable deploy-watchdog premarket + postmarket cron rules (keep instance-start event rule)
   - Files: deploy/aws/terraform/deploy-watchdog-lambda.tf
   - Tests: test_deploy_watchdog_lambda_is_wired (kept green)
+- [x] Pause aws-autopilot + deploy-aws-after-close auto triggers (workflow_dispatch kept)
+  - Files: .github/workflows/aws-autopilot.yml, .github/workflows/deploy-aws-after-close.yml
+  - Tests: github_workflow_guard, aws_infra_wiring (kept green — substring pins survive in comments)
 - [x] Validate: terraform fmt -check + validate green; terraform-pinning ratchet tests green
   - Files: (none — verification)
   - Tests: aws_infra_wiring, aws_alarm_semantics_guard, boot_completed_metric_guard, aws_deploy_safety_guard, instance_type_lock_guard
@@ -89,11 +92,11 @@ Pre-staged branch `claude/aws-resume-jul9` = exact revert commit of this change 
 
 | # | Scenario | Expected |
 |---|----------|----------|
-| 1 | Mon Jul 6 03:00 UTC | daily_start DISABLED — box stays stopped; no start-watchdog ping/check; no boot-heartbeat page |
+| 1 | Mon Jul 6 03:00 UTC | daily_start DISABLED — box stays stopped; no start-watchdog ping/check; no boot-heartbeat page; no autopilot cron; no after-close cron |
 | 2 | Mon-Wed 09:20-15:35 IST | liveness gate never opens — no "box is dead" Telegram despite missing metrics |
 | 3 | Mon 08:50 IST | deploy-watchdog premarket DISABLED — no HIGH "cron slipped" page, no dispatch chain |
 | 4 | Operator manually starts box Tue | allowed; curfew guard + hard-stop guard still protect against a forgotten box |
-| 5 | Thu Jul 9 03:00 UTC (post-revert) | daily_start ENABLED again — normal 08:30 IST start, watchdogs + alarms restored |
+| 5 | Thu Jul 9 03:00 UTC (post-revert) | daily_start ENABLED again — normal 08:30 IST start, watchdogs + alarms + workflow crons restored |
 
 ## Guarantee matrices
 
