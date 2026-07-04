@@ -2031,6 +2031,28 @@ rules:
       Silence: the tv_groww_scale_audit_write_errors_total counter records it;
       persistence-layer degradation already escalates via BOOT-01/02.
 
+  # GROWW-SCALE-05 = the Groww scale-FLEET spawn was REFUSED by the fleet
+  # dual-instance SSM lock (a peer instance already holds it, SSM was
+  # unreachable past the bounded retry budget, or the lock was lost mid-run
+  # to a foreign takeover). The boot already degraded fail-closed to the
+  # SINGLE-CONNECTION Groww path (capture continues) — but two hosts scaling
+  # the SAME Groww account is exactly the failure that masquerades as
+  # provider throttle, so the operator MUST decide which host runs the scale
+  # test. Critical is never auto-triage-safe — escalate.
+  - name: groww-scale-05-dual-fleet-detected-escalate
+    match:
+      code: GROWW-SCALE-05
+    action: escalate
+    runbook_path: .claude/rules/project/groww-scale-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 0
+    justification: >-
+      GROWW-SCALE-05 = dual scale-fleet detected (or fleet lock unprovable /
+      lost). Severity::Critical. The refusal already self-degraded to the
+      single-connection Groww path, but only the operator can decide which
+      host owns the multi-connection scale test — shutting the peer down or
+      forcing takeover is never auto-actioned (mirror of RESILIENCE-01/03).
+
   # GROWW-NATIVE-01 = the native-Rust SHADOW client (PR-R1, default-OFF)
   # disconnected / failed to connect / had its supervised runner respawned.
   # Bounded expo backoff + supervisor respawn already self-heal; shadow-only —
