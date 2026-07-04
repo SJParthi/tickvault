@@ -622,6 +622,126 @@ questdb_owner_verdict() {
   esac
 }
 
+# ── FIX 15: final pre-Monday hardening — pure helpers ───────────────────────
+
+# fd_limit_target <desired> <hard> → the soft open-files value to request:
+# desired clamped to the hard limit ("unlimited" hard passes desired
+# through). Garbage/empty inputs → rc 1 (caller leaves limits as-is).
+# FIX 15.1: the 100-connection fleet exhausts the macOS default 256 fds.
+fd_limit_target() {
+  local desired="${1:-}" hard="${2:-}"
+  case "$desired" in '' | *[!0-9]*) return 1 ;; esac
+  if [ "$hard" = "unlimited" ]; then
+    echo "$desired"
+    return 0
+  fi
+  case "$hard" in '' | *[!0-9]*) return 1 ;; esac
+  if ((desired > hard)); then echo "$hard"; else echo "$desired"; fi
+}
+
+# raise_fd_limit — best-effort soft-limit raise to FD_LIMIT_DESIRED (clamped
+# to the hard limit). Plain log either way; NEVER gates a start.
+FD_LIMIT_DESIRED="${FD_LIMIT_DESIRED:-4096}"
+raise_fd_limit() {
+  local soft hard target
+  soft=$(ulimit -Sn 2>/dev/null || echo "")
+  hard=$(ulimit -Hn 2>/dev/null || echo "")
+  [ "$soft" = "unlimited" ] && return 0
+  if ! target=$(fd_limit_target "$FD_LIMIT_DESIRED" "$hard"); then
+    log "open-files limit probe unreadable (soft=${soft:-?} hard=${hard:-?}) — leaving limits as-is"
+    return 0
+  fi
+  case "$soft" in '' | *[!0-9]*) soft=0 ;; esac
+  if ((soft >= target)); then return 0; fi
+  if ulimit -n "$target" 2>/dev/null; then
+    log "raised open-files limit ${soft} → ${target} (the 100-connection fleet needs more than the macOS default 256)"
+  else
+    log "could not raise the open-files limit (soft=${soft}, wanted ${target}, hard=${hard:-?}) — a big fleet may hit 'too many open files'"
+  fi
+  return 0
+}
+
+# probe_launch_failed <rows_before> <rows_after> → 0 when the probe wrote
+# ZERO new ladder evidence rows (it never launched at all — distinct from a
+# partial run). Garbage → rc 1 (fail-safe: never un-burn an attempt on
+# unreadable evidence). FIX 15.6.
+probe_launch_failed() {
+  case "${1:-}" in '' | *[!0-9]*) return 1 ;; esac
+  case "${2:-}" in '' | *[!0-9]*) return 1 ;; esac
+  (("$2" <= "$1"))
+}
+
+# tg_latch_expired <now_epoch> <disabled_at_epoch> <retry_secs> → 0 when the
+# Telegram-disabled latch is old enough to retry the credential read.
+# Garbage disabled_at → EXPIRED (retry rather than stay dead all day);
+# garbage now → not expired. FIX 15.7.
+tg_latch_expired() {
+  case "${2:-}" in '' | *[!0-9]*) return 0 ;; esac
+  case "${1:-}" in '' | *[!0-9]*) return 1 ;; esac
+  (("$1" - "$2" >= "${3:-3600}"))
+}
+
+# vm_disk_high <pct> <threshold> → 0 when pct is a plain integer above the
+# threshold. Garbage/empty pct → rc 1 (no warning on unreadable probe).
+# FIX 15.8: the host df cannot see Docker's VM virtual disk filling.
+vm_disk_high() {
+  case "${1:-}" in '' | *[!0-9]*) return 1 ;; esac
+  (("$1" > "${2:-85}"))
+}
+
+# docker_vm_disk_pct → integer use% of the Docker VM's own filesystem, read
+# THROUGH the database container (its / IS the VM overlay fs — the host df
+# cannot see it). Empty on any failure.
+docker_vm_disk_pct() {
+  docker exec tv-questdb df -Pk / 2>/dev/null | awk 'NR==2 {gsub(/%/, "", $5); print $5}'
+}
+
+# dhan_enabled_from_files <file...> → the effective dhan_enabled value:
+# FIRST file carrying the key wins (pass local.toml before base.toml);
+# handles the no-spaces `dhan_enabled=true` variant and trailing comments;
+# no file carries it → "false". FIX 15.9.
+dhan_enabled_from_files() {
+  local f v
+  for f in "$@"; do
+    v=$(grep -E '^[[:space:]]*dhan_enabled[[:space:]]*=' "$f" 2>/dev/null |
+      tail -1 | sed -E 's/.*=[[:space:]]*//; s/[[:space:]#].*$//')
+    if [ -n "$v" ]; then
+      echo "$v"
+      return 0
+    fi
+  done
+  echo false
+}
+
+# questdb_session_healthy — cheap per-iteration database liveness: the
+# tv-questdb container must be running (owner verdict) AND answer one short
+# HTTP ping. FIX 15.2 (the docker DAEMON can be alive while the container
+# is dead — OOM-kill, crash — previously undetected all day).
+questdb_session_healthy() {
+  [ "$(questdb_owner_verdict "$(questdb_container_state)")" = "ok" ] || return 1
+  curl -sf -m 3 -G "$QUESTDB_HTTP/exec" --data-urlencode "query=select 1" >/dev/null 2>&1
+}
+
+# aws_prod_running_check — FIX 15.9 (belt-and-braces): the AWS prod box
+# RUNNING while this Mac boots Dhan-enabled = dual-instance token fight
+# (the safety lock makes it fail-closed, but the local day is lost). Warn
+# loudly; never gates.
+PROD_INSTANCE_ID="${PROD_INSTANCE_ID:-i-0b956d0209231a48b}"
+aws_prod_running_check() {
+  command -v aws >/dev/null 2>&1 || return 0
+  [ "$(dhan_enabled_from_files config/local.toml config/base.toml)" = "true" ] || return 0
+  local state
+  state=$(aws ec2 describe-instances --region ap-south-1 \
+    --instance-ids "$PROD_INSTANCE_ID" \
+    --query 'Reservations[0].Instances[0].State.Name' --output text \
+    --no-cli-pager --cli-connect-timeout 5 --cli-read-timeout 10 2>/dev/null || true)
+  if [ "$state" = "running" ]; then
+    log "AWS prod box $PROD_INSTANCE_ID is RUNNING while this Mac is Dhan-enabled — dual-instance risk"
+    tg "⚠️ The AWS trading machine is RUNNING right now while this Mac is also set to use the Dhan feed. Only ONE machine can hold the Dhan session — the safety lock will stop the second one. Pause the AWS machine (or turn Dhan off locally) before market open."
+  fi
+  return 0
+}
+
 # ── FIX 9: one-shot probe-then-run marker (two-buttons-forever) ─────────────
 
 # probe_once_decision <marker_date> <today> <stamp_exists 0|1> → run|skip.
@@ -797,6 +917,8 @@ log() {
 # Mac → log ONCE, disable for the run, never spam per message.
 TG_INIT_DONE=0
 TG_DISABLED=0
+TG_DISABLED_AT=""
+TG_RETRY_SECS="${TG_RETRY_SECS:-3600}"
 tg_init() {
   if ((TG_INIT_DONE)); then return 0; fi
   TG_INIT_DONE=1
@@ -831,13 +953,25 @@ tg_init() {
     done
   fi
   TG_DISABLED=1
-  log "Telegram unavailable (tried env path(s): ${candidates// /, } under /tickvault/<env>/telegram/ in ap-south-1 — no internet, no AWS credentials, or missing parameter). Messages will appear in this log only for the rest of this run."
+  TG_DISABLED_AT=$(date +%s)
+  log "Telegram unavailable (tried env path(s): ${candidates// /, } under /tickvault/<env>/telegram/ in ap-south-1 — no internet, no AWS credentials, or missing parameter). Messages go to this log only; the credential read is retried automatically after $((TG_RETRY_SECS / 60)) minutes (FIX 15.7)."
 }
 
 tg() { # best-effort Telegram; the log always carries the message
   log "TELEGRAM: $*"
   tg_init
-  if ((TG_DISABLED)); then return 0; fi
+  if ((TG_DISABLED)); then
+    # FIX 15.7: time-based re-arm — one transient SSM failure at the first
+    # message must not kill Telegram for the whole 08:55–15:35 run. After
+    # TG_RETRY_SECS the credential read is attempted again.
+    if tg_latch_expired "$(date +%s)" "${TG_DISABLED_AT:-}" "$TG_RETRY_SECS"; then
+      log "Telegram retry window reached — re-attempting the credential read"
+      TG_INIT_DONE=0
+      TG_DISABLED=0
+      tg_init
+    fi
+    if ((TG_DISABLED)); then return 0; fi
+  fi
   bash scripts/notify-telegram.sh "💻 LOCAL autopilot — $*" >>"$(current_log)" 2>&1 || true
 }
 
@@ -966,7 +1100,7 @@ ensure_questdb() {
   # Zero operator action — Stop→Start (or just Start) recovers it.
   local i restarted=0 state verdict
   for i in $(seq 1 24); do
-    if curl -sf -G "$QUESTDB_HTTP/exec" --data-urlencode "query=select 1" >/dev/null 2>&1; then
+    if curl -sf -m 5 -G "$QUESTDB_HTTP/exec" --data-urlencode "query=select 1" >/dev/null 2>&1; then
       # B6: verify the responder IS our tv-questdb container — any local
       # process could hold port 9000 (a foreign QuestDB, a dev server).
       # Writing the day's capture into a stranger's database is silent loss.
@@ -1265,8 +1399,25 @@ start_app_inner() { # $1 = label for the log
     tg "🆘 Build FAILED — the app cannot start. Last lines: $(tail -5 "$(current_log)" | tr '\n' ' | ')"
     return 1
   fi
-  nohup ./target/release/tickvault >>"$(current_log)" 2>&1 &
-  echo $! >"$APP_PIDFILE"
+  # FIX 15.3: honor a Stop clicked DURING the (possibly minutes-long) build —
+  # previously the launch below silently overrode a marker written mid-build.
+  if manual_stop_active "$MANUAL_STOP_MARKER" "$(ist_date)"; then
+    log "manual stop marker appeared during the build — NOT launching the app (Stop always wins)"
+    tg "🔔 Stop was pressed while the app was still building — honoring it: the app was NOT started. Double-click Start TickVault whenever you are ready."
+    return 1
+  fi
+  # FIX 15.1: raise the open-files soft limit before launch (inherited by
+  # the app) — the 100-connection fleet exhausts the macOS default 256.
+  raise_fd_limit
+  # FIX 15.4: launch in its OWN process group (`set -m` gives background
+  # jobs their own pgid — the portable equivalent of setsid, which macOS
+  # has no binary for) so a Ctrl-C / IDE-Stop in the tail window can never
+  # SIGINT the app; nohup keeps the SIGHUP immunity.
+  (
+    set -m
+    nohup ./target/release/tickvault >>"$(current_log)" 2>&1 &
+    echo $! >"$APP_PIDFILE"
+  )
   rm -f "$FOREIGN_PID_MARK" 2>/dev/null || true # B5: re-arm the foreign-pid alert
   log "app launched ($1) — pid $(cat "$APP_PIDFILE"), log $ONE_FILE_LINK → $(current_log)"
   # FIX 5.1 — early-exit detection: an app that dies within ~5s (port clash,
@@ -1553,7 +1704,7 @@ apply_overlay() { # $1 = groww-scale-test.sh mode (probe|max|...) or "none"
 # ── Probe verdict polling ───────────────────────────────────────────────────
 
 fetch_probe_verdict() {
-  curl -sf -G "$QUESTDB_HTTP/exec" --data-urlencode \
+  curl -sf -m 5 -G "$QUESTDB_HTTP/exec" --data-urlencode \
     "query=select reason from groww_scale_audit where outcome = 'probe_verdict' and trading_date_ist = '$TODAY' order by ts desc limit 1" \
     2>/dev/null | parse_probe_verdict
 }
@@ -1590,14 +1741,28 @@ maybe_run_probe_once() {
   # Stamp BEFORE the probe: even a crash mid-probe must not re-trigger it —
   # the very next click goes straight to the normal start.
   printf '%s %s probe-once attempt %s\n' "$today" "$(ist_hms)" "$attempt" >"$stamp"
-  local probe_start_epoch
+  local probe_start_epoch rows_before rows_after
   probe_start_epoch=$(date +%s)
+  # FIX 15.6: snapshot the ladder-evidence row count so a FAILED-TO-LAUNCH
+  # probe (zero new rows) can be told apart from a partial run.
+  rows_before=$(tsv_sentinel "$(wc -l <"data/groww-scale/summary-${today}.tsv" 2>/dev/null || echo 0)")
   export_compose_creds
   if PROBE_AUTO_STOP_MIN="${PROBE_ONCE_MAX_MIN:-45}" bash scripts/scale-100-probe.sh; then
     log "probe finished — continuing into normal live start"
   else
     bash scripts/groww-scale-test.sh clean >>"$(current_log)" 2>&1 || true
-    log "probe did not complete cleanly — overlay cleaned; continuing into normal live start anyway"
+    rows_after=$(tsv_sentinel "$(wc -l <"data/groww-scale/summary-${today}.tsv" 2>/dev/null || echo 0)")
+    if probe_launch_failed "$rows_before" "$rows_after"; then
+      # FIX 15.6: the probe never even launched (no ladder rows at all) —
+      # un-burn the attempt so the NEXT click retries automatically instead
+      # of needing a coordinator marker bump.
+      rm -f "$stamp"
+      log "probe FAILED TO LAUNCH (zero new ladder evidence rows) — attempt stamp deleted; the next Start click will retry the probe automatically"
+      tg "🆘 The one-time 100-connection lab test could not even start (no evidence was written). The attempt was NOT used up — double-click Start TickVault to try again. Continuing a NORMAL session now."
+    else
+      log "probe did not complete cleanly — overlay cleaned; continuing into normal live start anyway"
+      tg "⚠️ The one-time 100-connection lab test stopped partway. The evidence rows it DID write are saved for the verdict; continuing a NORMAL session now. Details are in the log."
+    fi
   fi
   # FIX 10 A8: honor an operator Stop pressed DURING the probe. The probe's
   # OWN internal stop writes the manual-stop marker within seconds of probe
@@ -1621,6 +1786,9 @@ maybe_run_probe_once() {
 cmd_start() {
   log "== MANUAL START (manual always wins — clearing manual-stop marker) =="
   rm -f "$MANUAL_STOP_MARKER"
+  # FIX 15.1: raise the open-files limit at entry so the 100-connection
+  # probe (launched from THIS shell) inherits it too, not just the app.
+  raise_fd_limit
   ensure_docker || return 1
   check_docker_vm_memory
   # FIX 10 A6: arm caffeinate BEFORE the (possibly long) probe so Mac sleep
@@ -1685,6 +1853,35 @@ cmd_stop() {
 
 cmd_dev() {
   log "== ONE-BUTTON DEV RUN (ensure-ready → docker → questdb → app → tail) =="
+  # FIX 15.5: the IntelliJ Run button is how the operator actually clicks —
+  # give it the SAME self-update Start TickVault.command has (fetch +
+  # ff-only merge, graceful fallback; skipped off-branch). After a REAL
+  # update, re-exec the fresh script once (guard env stops a loop) so the
+  # new code — including a bumped probe marker — actually runs.
+  if [ "${TICKVAULT_DEV_SELF_UPDATED:-0}" != "1" ]; then
+    local dev_branch head_before head_after
+    dev_branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "?")
+    if [ "$dev_branch" = "local-runtime" ]; then
+      head_before=$(git rev-parse HEAD 2>/dev/null || echo "")
+      if git fetch origin local-runtime >>"$(current_log)" 2>&1; then
+        if git merge --ff-only origin/local-runtime >>"$(current_log)" 2>&1; then
+          head_after=$(git rev-parse HEAD 2>/dev/null || echo "")
+          if [ -n "$head_before" ] && [ "$head_before" != "$head_after" ]; then
+            log "self-update applied ($head_before -> $head_after) — restarting the launcher on the new code"
+            TICKVAULT_DEV_SELF_UPDATED=1 exec bash "$0" dev
+          fi
+          log "self-update: code already up to date"
+        else
+          log "self-update: could not fast-forward (local changes in the way?) — running the EXISTING code"
+          tg "⚠️ The Run button could not apply the latest update — started with the code already on the Mac. Everything still runs."
+        fi
+      else
+        log "self-update: git fetch failed (offline?) — running the existing code"
+      fi
+    else
+      log "self-update: not on the local-runtime branch ($dev_branch) — skipping"
+    fi
+  fi
   if [ -x scripts/ensure-ready.sh ]; then
     bash scripts/ensure-ready.sh || {
       log "ensure-ready failed — cannot continue"
@@ -1783,6 +1980,8 @@ eod_summary() {
 
 monitor_until_eod() {
   local relaunches=0 decision alive manual iter=0 disk_warned=0 avail_gb
+  local qdb_warned=0 vm_disk_warned=0 vm_pct
+  VM_DISK_WARN_PCT="${VM_DISK_WARN_PCT:-85}"
   while :; do
     if (($(secs_until "$EOD_STOP_IST" "$(ist_hms)") == 0)); then break; fi
     sleep "$MONITOR_INTERVAL_SECS"
@@ -1814,6 +2013,24 @@ monitor_until_eod() {
         fi
         disk_warned=0
       fi
+      # FIX 15.8: the host df above cannot see Docker's own virtual disk
+      # filling (QuestDB writes land INSIDE the VM). Probe the VM fs use%
+      # through the database container; edge-latched warning >85%; a
+      # `docker system df` breakdown goes to the log for context.
+      vm_pct=$(docker_vm_disk_pct)
+      if vm_disk_high "$vm_pct" "$VM_DISK_WARN_PCT"; then
+        if [ "$vm_disk_warned" = "0" ]; then
+          docker system df >>"$(current_log)" 2>&1 || true
+          tg "⚠️ Docker's own virtual disk is ${vm_pct}% full (above ${VM_DISK_WARN_PCT}%). The database lives inside it — raise the Docker Desktop 'Virtual disk limit' (Settings → Resources) soon or the capture can stall. A space breakdown was written to the log."
+          vm_disk_warned=1
+        fi
+        log "VM disk re-check: HIGH (${vm_pct}% > ${VM_DISK_WARN_PCT}%)"
+      else
+        if [ "$vm_disk_warned" = "1" ] && [ -n "$vm_pct" ]; then
+          log "VM disk re-check: recovered (${vm_pct}%) — warn latch re-armed"
+          vm_disk_warned=0
+        fi
+      fi
     fi
     decision=$(monitor_decision "$alive" "$manual" "$relaunches")
     case "$decision" in
@@ -1836,6 +2053,26 @@ monitor_until_eod() {
     if ! docker_alive && [ "$manual" = "0" ]; then
       tg "⚠️ Docker daemon went away mid-session — attempting restart"
       ensure_docker && ensure_questdb || true
+    fi
+    # FIX 15.2: the docker DAEMON can be alive while the tv-questdb
+    # CONTAINER is dead (OOM-kill, crash after a hard sleep) — previously
+    # undetected for the rest of the day (ticks spill, no alert). Cheap
+    # per-iteration probe; ensure_questdb carries the restart self-heal.
+    # Edge-latched Telegram: one dead episode = one message.
+    if [ "$manual" = "0" ] && docker_alive; then
+      if ! questdb_session_healthy; then
+        if [ "$qdb_warned" = "0" ]; then
+          tg "⚠️ The database stopped answering mid-session — recovering it automatically now (the app buffers safely meanwhile)."
+          qdb_warned=1
+        fi
+        log "database re-check: tv-questdb unhealthy — running the ensure_questdb self-heal"
+        ensure_questdb || true
+      else
+        if [ "$qdb_warned" = "1" ]; then
+          log "database re-check: recovered — warn latch re-armed"
+          qdb_warned=0
+        fi
+      fi
     fi
   done
 }
@@ -1880,6 +2117,13 @@ cmd_run() {
     log "already past $EOD_STOP_IST IST — nothing to do today"
     exit 0
   fi
+
+  # FIX 15.9 (belt-and-braces): warn if the AWS prod box is RUNNING while
+  # this Mac boots Dhan-enabled — the dual-instance lock keeps it SAFE
+  # (fail-closed) but the local day would be lost to a token fight.
+  # Best-effort, never gates; the FIX 15.1 fd raise also covers the robot path.
+  raise_fd_limit
+  aws_prod_running_check
 
   # B2: bounded boot retry — a transient failure at 08:55 (network blip,
   # Docker still waking after login, database slow) retries every

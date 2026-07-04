@@ -81,3 +81,21 @@ RUSTFLAGS="-Zsanitizer=address" cargo +nightly test
 RUSTFLAGS="-Zsanitizer=thread" cargo +nightly test
 cargo fuzz run tick_parser -- -max_total_time=3600
 ```
+
+## Local-runtime deferred items (FIX 15, 2026-07-05 — noted, NOT implemented)
+
+Deferred from the final pre-Monday hardening batch (residual-gaps audit); each
+needs an operator decision or is inert while the Mac stays on IST:
+
+1. **EOD data backup** — the local window's capture lives ONLY inside the
+   Docker VM virtual-disk volume; no end-of-day export/snapshot/S3 push exists
+   in the two-button chain. Operator decision needed (docker volume export vs
+   `docker exec` snapshot vs S3 sync) before local data is treated as durable.
+2. **config/local.toml drift lint** — hand-edited format drift (duplicate
+   `[feeds]` sections, malformed lines) can silently defeat the overlay or
+   kill boot; a normalize/parse-verify pass before applying overrides is
+   still missing. (The no-spaces `dhan_enabled=true` READ side is handled by
+   FIX 15.9's parser; the WRITE/lint side is the deferred half.)
+3. **launchd timezone validation** — the 08:55 auto-start is Mac-LOCAL time
+   with no IST-offset validation at install; inert while the Mac stays on
+   IST, wrong the day it doesn't.

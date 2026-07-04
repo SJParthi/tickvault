@@ -100,7 +100,11 @@ else
     exit 2
 fi
 
-RESPONSE=$(curl -s -X POST "${TELEGRAM_API}/bot${BOT_TOKEN}/sendMessage" \
+# FIX 15.7: hard time bounds — a black-holed network must never hang this
+# script (it runs inside the autopilot monitor loop; an unbounded curl
+# would delay relaunches and the 15:35 EOD stop).
+RESPONSE=$(curl -s --max-time 10 --connect-timeout 5 \
+    -X POST "${TELEGRAM_API}/bot${BOT_TOKEN}/sendMessage" \
     -H "Content-Type: application/json" \
     -d "${PAYLOAD}")
 

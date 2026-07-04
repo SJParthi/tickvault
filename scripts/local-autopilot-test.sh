@@ -361,6 +361,67 @@ t "qdb owner: running no-health → ok" "ok" "$(questdb_owner_verdict "running "
 t "qdb owner: empty (no container, port answers) → foreign" "foreign" "$(questdb_owner_verdict "")"
 t "qdb owner: exited container → not_running" "not_running" "$(questdb_owner_verdict "exited unhealthy")"
 
+# ── FIX 15: final pre-Monday hardening ──────────────────────────────────────
+# 15.1: fd-limit clamp
+t "fd clamp: desired below hard → desired" "4096" "$(fd_limit_target 4096 10240)"
+t "fd clamp: desired above hard → hard" "256" "$(fd_limit_target 4096 256)"
+t "fd clamp: unlimited hard → desired" "4096" "$(fd_limit_target 4096 unlimited)"
+t "fd clamp: garbage hard → rc 1" "1" "$(fd_limit_target 4096 abc >/dev/null 2>&1 && echo 0 || echo 1)"
+t "fd clamp: empty desired → rc 1" "1" "$(fd_limit_target "" 256 >/dev/null 2>&1 && echo 0 || echo 1)"
+
+# 15.6: probe failed-to-launch (zero new ladder rows)
+t "probe launch: no new rows → failed-to-launch" "0" "$(probe_launch_failed 5 5 && echo 0 || echo 1)"
+t "probe launch: fewer rows (rotated) → failed-to-launch" "0" "$(probe_launch_failed 5 3 && echo 0 || echo 1)"
+t "probe launch: new rows → partial run (attempt stays burned)" "1" "$(probe_launch_failed 5 9 && echo 0 || echo 1)"
+t "probe launch: garbage before → fail-safe not-failed" "1" "$(probe_launch_failed abc 9 && echo 0 || echo 1)"
+t "probe launch: garbage after → fail-safe not-failed" "1" "$(probe_launch_failed 5 '' && echo 0 || echo 1)"
+
+# 15.7: Telegram disable latch re-arm
+t "tg latch: 61+ min old → expired" "0" "$(tg_latch_expired 10000 6300 3600 && echo 0 || echo 1)"
+t "tg latch: 30 min old → not expired" "1" "$(tg_latch_expired 10000 8200 3600 && echo 0 || echo 1)"
+t "tg latch: exactly retry_secs → expired" "0" "$(tg_latch_expired 10000 6400 3600 && echo 0 || echo 1)"
+t "tg latch: garbage disabled_at → expired (retry, not dead-all-day)" "0" "$(tg_latch_expired 10000 '' 3600 && echo 0 || echo 1)"
+t "tg latch: garbage now → not expired" "1" "$(tg_latch_expired abc 6300 3600 && echo 0 || echo 1)"
+
+# 15.8: Docker VM disk threshold
+t "vm disk: 90% > 85 → high" "0" "$(vm_disk_high 90 85 && echo 0 || echo 1)"
+t "vm disk: 85% (at threshold) → not high" "1" "$(vm_disk_high 85 85 && echo 0 || echo 1)"
+t "vm disk: 50% → not high" "1" "$(vm_disk_high 50 85 && echo 0 || echo 1)"
+t "vm disk: empty probe → not high (no warning on unreadable)" "1" "$(vm_disk_high "" 85 && echo 0 || echo 1)"
+t "vm disk: garbage probe → not high" "1" "$(vm_disk_high '9x' 85 && echo 0 || echo 1)"
+
+# 15.9: effective dhan_enabled read (local overrides base; no-spaces variant)
+printf '[feeds]\ndhan_enabled = true\n' >"$TMP/f15-base.toml"
+printf '[feeds]\ndhan_enabled=false\n' >"$TMP/f15-local.toml"
+printf '[feeds]\ngroww_enabled = true\n' >"$TMP/f15-nokey.toml"
+printf '[feeds]\ndhan_enabled = true # comment\n' >"$TMP/f15-comment.toml"
+t "dhan flag: local false overrides base true" "false" "$(dhan_enabled_from_files "$TMP/f15-local.toml" "$TMP/f15-base.toml")"
+t "dhan flag: local silent → base wins" "true" "$(dhan_enabled_from_files "$TMP/f15-nokey.toml" "$TMP/f15-base.toml")"
+t "dhan flag: no-spaces variant parsed" "false" "$(dhan_enabled_from_files "$TMP/f15-local.toml")"
+t "dhan flag: trailing comment stripped" "true" "$(dhan_enabled_from_files "$TMP/f15-comment.toml")"
+t "dhan flag: both files absent → false" "false" "$(dhan_enabled_from_files "$TMP/f15-absent-a.toml" "$TMP/f15-absent-b.toml")"
+
+# 15.4: own-process-group launch — functional pgid check + source ordering pins
+pg_self=$(ps -o pgid= -p $$ | tr -d '[:space:]')
+pg_child=$( (
+  set -m
+  sleep 1 &
+  ps -o pgid= -p $! | tr -d '[:space:]'
+  kill %1 2>/dev/null
+) )
+t "set -m: background job gets its OWN process group" "differs" "$([ -n "$pg_child" ] && [ "$pg_child" != "$pg_self" ] && echo differs || echo "same:$pg_child/$pg_self")"
+t "launch: set -m precedes the nohup app launch (FIX 15.4)" "1" "$(grep -B4 'nohup \./target/release/tickvault' scripts/local-autopilot.sh | grep -c 'set -m')"
+# 15.3: the manual-stop re-check sits BETWEEN cargo build and the nohup launch
+build_ln=$(grep -n 'cargo build --release' scripts/local-autopilot.sh | head -1 | cut -d: -f1)
+launch_ln=$(grep -n 'nohup \./target/release/tickvault' scripts/local-autopilot.sh | head -1 | cut -d: -f1)
+stop_between=$(awk -v a="$build_ln" -v b="$launch_ln" 'NR>a && NR<b && /manual_stop_active/ {found=1} END {print found+0}' scripts/local-autopilot.sh)
+t "stop-mid-build: marker re-check between build and launch (FIX 15.3)" "1" "$stop_between"
+# 15.5: the IntelliJ dev path carries the self-update (fetch + ff-only)
+t "cmd_dev: self-update fetch present (FIX 15.5)" "1" "$(sed -n '/^cmd_dev()/,/^}/p' scripts/local-autopilot.sh | grep -c 'git fetch origin local-runtime')"
+t "cmd_dev: ff-only merge present (FIX 15.5)" "1" "$(sed -n '/^cmd_dev()/,/^}/p' scripts/local-autopilot.sh | grep -c 'git merge --ff-only origin/local-runtime')"
+# 15.7: the Telegram send curl is time-bounded
+t "notify-telegram: curl has --max-time (FIX 15.7)" "1" "$(grep -c 'curl -s --max-time 10 --connect-timeout 5' scripts/notify-telegram.sh)"
+
 echo
 echo "local-autopilot pure-logic tests: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]
