@@ -128,8 +128,44 @@ pub fn build_router_with_auth(
         )
     };
     let protected_routes: Router<SharedAppState> = protected_base.layer(
-        axum::middleware::from_fn_with_state(auth_config, require_bearer_auth),
+        axum::middleware::from_fn_with_state(auth_config.clone(), require_bearer_auth),
     );
+
+    // Security trim 2026-07-04 (operator directive, Session A): the 4 read-only
+    // `/api/debug/*` routes move OFF the public router and behind the SAME
+    // bearer-auth middleware — applied UNCONDITIONALLY (deliberately NOT gated
+    // on `feed_toggle_public`). `require_bearer_auth` self-passthroughs when
+    // auth is disabled (dry-run / no token), so local development and the
+    // tickvault-logs MCP read-only contract (local file reads + tokenless
+    // localhost API calls with auth disabled) are unchanged. In production
+    // (SSM-resolved token, auth enabled) these routes now demand
+    // `Authorization: Bearer <token>` and 401 otherwise — fail-closed.
+    let debug_routes: Router<SharedAppState> = Router::new()
+        // Autonomous-ops Layer 1 (observability): read-only log access
+        // for Claude MCP / remote sessions.
+        .route(
+            "/api/debug/logs/summary",
+            axum::routing::get(handlers::debug::logs_summary),
+        )
+        .route(
+            "/api/debug/logs/jsonl/latest",
+            axum::routing::get(handlers::debug::logs_jsonl_latest),
+        )
+        .route(
+            "/api/debug/spill/status",
+            axum::routing::get(handlers::debug::spill_status),
+        )
+        // Visibility directive 2026-06-10: latest post-market 1-minute
+        // cross-verify artefacts (CSV + summary) for the operator portal
+        // Cross-verify card + MCP sessions.
+        .route(
+            "/api/debug/cross-verify/latest",
+            axum::routing::get(handlers::debug::cross_verify_latest),
+        )
+        .route_layer(axum::middleware::from_fn_with_state(
+            auth_config,
+            require_bearer_auth,
+        ));
 
     // Public routes — read-only GET endpoints (no auth required).
     //
@@ -183,28 +219,9 @@ pub fn build_router_with_auth(
         .route(
             "/api/quote/{security_id}",
             axum::routing::get(handlers::quote::get_quote),
-        )
-        // Autonomous-ops Layer 1 (observability): read-only log access
-        // for Claude MCP / remote sessions.
-        .route(
-            "/api/debug/logs/summary",
-            axum::routing::get(handlers::debug::logs_summary),
-        )
-        .route(
-            "/api/debug/logs/jsonl/latest",
-            axum::routing::get(handlers::debug::logs_jsonl_latest),
-        )
-        .route(
-            "/api/debug/spill/status",
-            axum::routing::get(handlers::debug::spill_status),
-        )
-        // Visibility directive 2026-06-10: latest post-market 1-minute
-        // cross-verify artefacts (CSV + summary) for the operator portal
-        // Cross-verify card + MCP sessions.
-        .route(
-            "/api/debug/cross-verify/latest",
-            axum::routing::get(handlers::debug::cross_verify_latest),
         );
+    // The 4 `/api/debug/*` routes live on `debug_routes` above (bearer-auth
+    // gated, security trim 2026-07-04) — no longer on the public router.
 
     // dry-run/sandbox: the mutating feed-toggle is PUBLIC (tokenless) so the
     // /feeds page can flip feeds without a token on localhost. In live trading
@@ -222,6 +239,7 @@ pub fn build_router_with_auth(
     // `cascade_fanout` accessor on AppState retired. See above comment
     // on the merged routes block.
     public_routes
+        .merge(debug_routes)
         .merge(protected_routes)
         .layer(axum::middleware::from_fn(request_tracing))
         .layer(cors)
