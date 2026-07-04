@@ -93,7 +93,7 @@ localhost defaults.
 | Prometheus URL (app exporter / CloudWatch source) | `TICKVAULT_PROMETHEUS_URL` | `prometheus_url` |
 | QuestDB HTTP URL | `TICKVAULT_QUESTDB_URL` | `questdb_url` |
 | tickvault API URL | `TICKVAULT_API_URL` | `tickvault_api_url` |
-| Logs source | `TICKVAULT_LOGS_SOURCE` (`http` or `local`) | `logs_source` |
+| Logs source | `TICKVAULT_LOGS_SOURCE` (use `local` — no HTTP log fetch is implemented) | `logs_source` |
 | Logs directory (when `local`) | `TICKVAULT_LOGS_DIR` | `logs_dir_local` |
 
 Profile selection order:
@@ -190,7 +190,8 @@ This prints a TOML block like:
 # QuestDB is no longer funnelled (auth-less raw SQL) — local-only URL.
 questdb_url       = "http://127.0.0.1:9000"
 tickvault_api_url = "https://your-mac.tailnet-name.ts.net:3001"
-logs_source       = "http"
+# log tools read the local filesystem — no HTTP log fetch is implemented
+logs_source       = "local"
 logs_dir_local    = "./data/logs"
 ```
 

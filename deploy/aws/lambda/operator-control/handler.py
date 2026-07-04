@@ -1209,12 +1209,24 @@ def _parse_storage(stdout: str) -> dict:
 # Empty/unfetchable token → 401 → curl -f fails → CV_DATE= blank, the same
 # truthful "no data" degrade as a stopped box (audit Rule 11 — never a
 # fabricated PASS, and post-gating never a silently-blank card either).
+#
+# Token-never-in-argv (consolidated from PR #1402, 2026-07-04): the token is
+# passed to curl via a mode-0600 header FILE (`-H @file`, umask 077 + mktemp),
+# NOT curl argv, so it is never visible in `ps`/`/proc/<pid>/cmdline` on the
+# box and arbitrary token bytes cannot break shell quoting. `printf` is a
+# shell BUILTIN (no forked process → no argv exposure) writing the header
+# verbatim; the trap removes the file when the SSM script exits. A failed
+# mktemp/write degrades to the same truthful CV_DATE= blank.
 _CROSS_VERIFY_COMMANDS = [
     "set +e",
+    "umask 077",
+    'TV_CV_HDR="$(mktemp /tmp/tv-cv-auth.XXXXXX)"',
+    "trap 'rm -f \"$TV_CV_HDR\"' EXIT",
     (
         'TVTOK="$(aws ssm get-parameter --name /tickvault/prod/api/bearer-token '
         "--with-decryption --query Parameter.Value --output text 2>/dev/null || true)\"; "
-        'curl -fsS --max-time 4 -H "Authorization: Bearer $TVTOK" '
+        'printf \'Authorization: Bearer %s\\n\' "$TVTOK" > "$TV_CV_HDR" 2>/dev/null; '
+        'curl -fsS --max-time 4 -H "@${TV_CV_HDR}" '
         "http://127.0.0.1:3001/api/debug/cross-verify/latest 2>/dev/null | "
         'python3 -c \'import json,sys; d=json.load(sys.stdin); s=d.get("summary") or {}; '
         'print("CV_DATE="+str(d.get("date",""))); '

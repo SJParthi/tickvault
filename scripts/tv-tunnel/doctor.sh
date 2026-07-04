@@ -120,6 +120,36 @@ for dbg in "/api/debug/logs/summary" "/api/debug/logs/jsonl/latest"; do
   fi
 done
 
+# 3b. Authenticated positive probe (optional — consolidated from PR #1402).
+# When TV_API_TOKEN is exported, ALSO prove the gate OPENS for the real
+# token: one debug route must answer non-401 (200 = artefact present,
+# 404 = authed but the file hasn't been written yet). The tokenless
+# 401-as-PASS probes above are unchanged — they never send the token.
+# The token goes to curl via a mode-0600 header FILE (-H @file, umask 077
+# + mktemp; printf is a shell builtin), NEVER argv, so it cannot leak
+# through `ps` / /proc/<pid>/cmdline; the trap removes the file on exit.
+if [[ -n "${TV_API_TOKEN:-}" ]]; then
+  AUTH_HDR_FILE="$(umask 077 && mktemp "${TMPDIR:-/tmp}/tv-doctor-auth.XXXXXX")"
+  if [[ -n "$AUTH_HDR_FILE" ]]; then
+    trap 'rm -f "$AUTH_HDR_FILE"' EXIT
+    printf 'Authorization: Bearer %s\n' "${TV_API_TOKEN}" >"$AUTH_HDR_FILE"
+    dbg="/api/debug/logs/summary"
+    url="https://${HOSTNAME_FQDN}:3001${dbg}"
+    code=$(curl -s -o /dev/null -m 5 -w "%{http_code}" -H "@${AUTH_HDR_FILE}" "$url" || echo "000")
+    if [[ "$code" =~ ^(200|404)$ ]]; then
+      pass "authed probe ${dbg} — gate OPENS for TV_API_TOKEN (HTTP ${code})"
+    elif [[ "$code" == "401" ]]; then
+      fail_row "authed probe ${dbg} — TV_API_TOKEN REJECTED (HTTP 401); wrong or rotated token"
+    else
+      fail_row "authed probe ${dbg} — HTTP ${code}"
+    fi
+  else
+    fail_row "authed probe skipped — mktemp failed for the 0600 header file"
+  fi
+else
+  info "TV_API_TOKEN not set — skipping authenticated gate-open probe (export TV_API_TOKEN=... to enable)"
+fi
+
 echo "==========================================================="
 if [[ $FAIL_COUNT -eq 0 ]]; then
   printf "${c_green}ALL CHECKS PASSED${c_reset} — tunnel is healthy.\n"
