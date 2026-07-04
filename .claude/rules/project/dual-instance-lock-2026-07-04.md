@@ -87,6 +87,19 @@ ownership check flips its flag false within one beat. The lock protects the
 Dhan session; it does not gate the Groww feed (independent token architecture
 per `groww-shared-token-minter-2026-07-02.md`).
 
+**2026-07-04 addendum (Session-B fix plan, operator go 2026-07-04):** the
+Groww scale FLEET now has ITS OWN dual-instance SSM lock —
+`/tickvault/<env>/instance-lock-groww-scale` (outside the banned `groww/*`
+namespace), reusing this file's `instance_lock.rs` machinery via the
+named-lock knob (`compute_named_lock_path` / `try_acquire_named_lock` /
+`spawn_named_lock_heartbeat`). It closes the residual this section left
+open for scale-test boots (`dhan_enabled=false` → this Dhan lock never
+runs): a peer fleet is refused fail-closed with `GROWW-SCALE-05` and the
+boot degrades to the single-connection Groww path. The Dhan lock path,
+semantics, and log text are byte-identical (ratchet:
+`test_named_lock_path_dhan_name_matches_legacy_path`). Runbook:
+`groww-scale-error-codes.md` §4b.
+
 ## §4. What a PR that violates this lock looks like (REJECT)
 
 - Re-introduces a trading-mode (`is_live()`) or any other gate that can skip the

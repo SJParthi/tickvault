@@ -167,6 +167,38 @@ fn test_smoke_script_never_mints() {
 }
 
 #[test]
+fn test_requirements_pins_growwapi_sdk_version() {
+    // Session-B fix #2 (operator go 2026-07-04): the sidecar's WIRE PROTOCOL
+    // is the growwapi==1.5.0 wheel — the native-Rust proto/subject extraction
+    // (docs/groww-ref/) and the shadow-client parity contract were derived
+    // from EXACTLY that version. A silent SDK bump can change the NATS
+    // subject grammar / protobuf schema and previously passed every test.
+    // This ratchet makes any growwapi version change a BUILD FAILURE that
+    // forces a fresh wheel extraction + a deliberate pin update.
+    let req = read("scripts/groww-sidecar/requirements.txt");
+    assert!(
+        req.lines().any(|l| l.trim() == "growwapi==1.5.0"),
+        "requirements.txt must pin the EXACT line `growwapi==1.5.0` — the \
+         native proto/subjects were extracted from that wheel; bumping the \
+         SDK requires re-extracting the wire protocol and updating this pin \
+         deliberately (Session-B fix #2, 2026-07-04)."
+    );
+    // Every version stays exact-pinned (`==`) per the project pinning rule —
+    // no `>=` / `~=` / unpinned lines may sneak into the manifest.
+    for line in req.lines() {
+        let t = line.trim();
+        if t.is_empty() || t.starts_with('#') {
+            continue;
+        }
+        assert!(
+            t.contains("=="),
+            "requirements.txt line `{t}` is not exact-pinned (`==`) — \
+             `^`/`~`/`>=`/unpinned dependencies are banned project-wide."
+        );
+    }
+}
+
+#[test]
 fn test_requirements_manifest_has_boto3_not_pyotp() {
     let req = read("scripts/groww-sidecar/requirements.txt");
     assert!(
