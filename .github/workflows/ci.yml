@@ -5,13 +5,32 @@ on:
   pull_request:
     branches: [main]
     types: [opened, synchronize, reopened, ready_for_review]
+  # Post-merge catch-up 2026-07-04: a merge performed by github-actions[bot]
+  # (the enable-auto-merge job merging via GITHUB_TOKEN) SUPPRESSES the
+  # push-triggered run on the merge commit — GitHub never fires push workflows
+  # for GITHUB_TOKEN-caused events (proven live: merge commit aafa226 of
+  # PR #1392 got ZERO post-merge runs). workflow_dispatch is the documented
+  # EXCEPTION to that suppression rule, so postmerge-catchup.yml dispatches
+  # this workflow on main whenever main HEAD has no run. A dispatched run on
+  # main MUST behave exactly like a push-to-main run (full battery incl.
+  # Coverage & Perf + the ratchet artifact) — see the all-green and
+  # concurrency expressions below.
+  workflow_dispatch:
 
 permissions:
   contents: read
 
+# Merge-gate hardening 2026-07-04: PR runs stay cancel-in-progress (a new push
+# supersedes the old run), but push-to-main runs are NEVER cancelled — rapid
+# back-to-back merges used to cancel the post-merge Coverage/DHAT gates
+# entirely (observed cancelled main runs 09:46–12:47 IST on 2026-07-03, so
+# those commits' post-merge gates never ran at all). Group push runs by SHA so
+# every main commit gets its own full run. workflow_dispatch runs (the
+# post-merge catch-up path) are grouped by SHA too — they stand in for the
+# suppressed push run and must never be cancelled either.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name != 'pull_request' && github.sha || 'pr' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -271,14 +290,29 @@ jobs:
         run: cargo audit --deny yanked
 
   # -------------------------------------------------------------------------
-  # Coverage & Perf — post-merge only. Runs cargo-llvm-cov and enforces
+  # Coverage & Perf — runs on PRs AND on push-to-main (merge-gate hardening
+  # 2026-07-04). Runs cargo-llvm-cov and enforces
   # the ratcheted per-crate floors in quality/crate-coverage-thresholds.toml
   # (floors only move up; 100% is the target, not the current floor).
+  # NOTE: "ratcheted per-crate floors" must stay CONTIGUOUS on one line —
+  # the B7 honesty ratchet crates/storage/tests/coverage_claim_honesty_guard.rs
+  # does a literal substring check on this file (proven: run 28692694701's
+  # Test (storage) failed when a reflow split the phrase across lines).
+  #
+  # HISTORY: this job was `if: github.event_name == 'push'` (post-merge only)
+  # until 2026-07-04. That let coverage-floor breaches MERGE and turn main red
+  # (proven: main run 28675492296 — storage 90.90% < 91.2% floor, breached by
+  # PRs that were already merged). It now runs pre-merge on every PR and feeds
+  # the All Green fan-in gate. The push-to-main run is KEPT so the ratchet
+  # artifact continues to be produced on main. A workflow_dispatch run on main
+  # (the post-merge catch-up for GITHUB_TOKEN-suppressed bot merges,
+  # 2026-07-04) runs this job too — no `if:` gate excludes it — so a
+  # dispatched catch-up run produces the same coverage ratchet artifact a
+  # push run would have.
   # -------------------------------------------------------------------------
   coverage-and-perf:
     name: "Coverage & Perf"
     needs: build-and-verify
-    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
@@ -334,3 +368,177 @@ jobs:
           name: coverage-report
           path: target/llvm-cov/coverage.json
           retention-days: 14
+
+  # -------------------------------------------------------------------------
+  # Repo Guards — runs the self-contained local guard scripts SERVER-SIDE
+  # (merge-gate hardening 2026-07-04). Before this job, the 15+-script local
+  # hook battery ran ONLY on developer machines: a `git push --no-verify`, a
+  # web-UI edit, or a Cowork push bypassed banned-pattern / data-integrity /
+  # O(1)-dedup / boot-symmetry scanning entirely (only plan-gate + the secret
+  # scanner had server-side twins).
+  #
+  # Only the PURE SOURCE-SCAN guards run here — the ratchet guards
+  # (test-count, pub-fn-test "all" mode, financial-test) depend on gitignored
+  # local baseline files and would establish a fresh baseline (vacuous pass)
+  # on every CI checkout, and the diff-based guards (pub-fn-wiring) scan the
+  # staged diff which is empty on a clean checkout. Each script wired below
+  # was verified to exit 0 from a fresh checkout of main on 2026-07-04.
+  # The dhan-locked-facts gate is a cargo test that already runs inside
+  # Test (common), so it is not duplicated here.
+  # -------------------------------------------------------------------------
+  repo-guards:
+    name: "Repo Guards"
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7.0.0
+
+      - name: Banned pattern scan (full workspace)
+        shell: bash
+        run: |
+          set -euo pipefail
+          ALL_RS=$(find crates -name '*.rs' -not -path '*/target/*' | tr '\n' ' ')
+          bash .claude/hooks/banned-pattern-scanner.sh "$GITHUB_WORKSPACE" $ALL_RS
+
+      - name: Data integrity guard (price precision, IST timestamp rules)
+        shell: bash
+        run: bash .claude/hooks/data-integrity-guard.sh "$GITHUB_WORKSPACE"
+
+      - name: O(1) latency + dedup scanner
+        shell: bash
+        run: |
+          set -euo pipefail
+          ALL_RS=$(find crates -name '*.rs' -not -path '*/target/*' | tr '\n' ' ')
+          bash .claude/hooks/dedup-latency-scanner.sh "$GITHUB_WORKSPACE" $ALL_RS
+
+      - name: Boot symmetry + state-machine wiring guard (S6-G3+G4)
+        shell: bash
+        run: bash .claude/hooks/boot-symmetry-guard.sh
+
+  # -------------------------------------------------------------------------
+  # All Green — the single merge choke point (merge-gate hardening 2026-07-04).
+  #
+  # WHY: on 2026-07-03 three PRs (#1387, #1388, #1382) merged seconds BEFORE
+  # their Test (storage) job failed, because only 4 checks were
+  # branch-protection-required and auto-merge armed at PR open. This fan-in
+  # job needs EVERY PR-relevant job in this workflow and fails unless every
+  # one of them succeeded. Branch protection requires "All Green" (plus the
+  # original 4), so nothing can merge while any part of the suite is red,
+  # pending, or cancelled.
+  #
+  # Adding a new job to this workflow? Add it to the `needs:` list below —
+  # a job not listed here does NOT gate merges.
+  #
+  # GUARD CHOICE — `!cancelled()`, NOT `always()` (fixed 2026-07-04, same day):
+  # with `always()`, All Green also executed inside a run that was CANCELLED
+  # by the PR concurrency group (a newer event superseding an older run —
+  # proven live on PR #1392: the PR-open run was superseded by the
+  # ready-for-review run seconds later, and the superseded run's All Green
+  # stamped a misleading RED on the SHA with every need `cancelled`).
+  # `!cancelled()` keeps the essential property — All Green still RUNS when
+  # upstream jobs merely FAIL, so it reports the red verdict — but SKIPS when
+  # the whole run was cancelled, leaving the verdict to the superseding run.
+  # Safety: a skipped All Green can never arm auto-merge (enable-auto-merge
+  # requires result == 'success'), and a cancelled run also leaves
+  # Build & Verify / Security & Audit / etc. in `cancelled` state, which
+  # blocks required checks — a cancelled suite can never read as mergeable.
+  # -------------------------------------------------------------------------
+  all-green:
+    name: "All Green"
+    needs:
+      - commit-lint
+      - design-first-wall
+      - deploy-lint
+      - build-and-verify
+      - test
+      - security-and-audit
+      - coverage-and-perf
+      - repo-guards
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Verify every needed job succeeded
+        shell: bash
+        env:
+          NEEDS_JSON: ${{ toJSON(needs) }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PYEOF'
+          import json, os, sys
+
+          needs = json.loads(os.environ["NEEDS_JSON"])
+          event = os.environ["EVENT_NAME"]
+
+          # Jobs that are PR-only by design (their own `if:` skips them on
+          # push-to-main). A 'skipped' result for these is legitimate ONLY on
+          # push events and on workflow_dispatch runs (the post-merge catch-up
+          # dispatcher fires this workflow on main to stand in for a
+          # bot-merge-suppressed push run — same non-PR semantics); on a
+          # pull_request event they MUST have run.
+          PR_ONLY_JOBS = {"commit-lint", "design-first-wall"}
+          NON_PR_EVENTS = {"push", "workflow_dispatch"}
+
+          failed = []
+          for job, meta in sorted(needs.items()):
+              result = meta.get("result")
+              if result == "success":
+                  continue
+              if result == "skipped" and event in NON_PR_EVENTS and job in PR_ONLY_JOBS:
+                  continue
+              # Everything else — failure, cancelled, or an unexpected skip —
+              # fails the gate. 'skipped' counts as FAILURE on pull_request
+              # events so a silently-skipped job can never fake green.
+              failed.append(f"{job}={result}")
+
+          if failed:
+              print("::error::All Green FAILED — non-success needed jobs: "
+                    + ", ".join(failed))
+              sys.exit(1)
+          print(f"All Green: every needed job succeeded (event={event}).")
+          PYEOF
+
+  # -------------------------------------------------------------------------
+  # Enable Auto-Merge — armed ONLY after All Green succeeds (merge-gate
+  # hardening 2026-07-04). This replaces the at-open arming that lived in
+  # auto-merge.yml: arming at PR open meant the merge fired the instant the
+  # (then only 4) required checks passed, while Test/Coverage were still
+  # running. Arming here, strictly AFTER the full suite is green, means even
+  # a branch-protection misconfiguration cannot merge a red PR through this
+  # bot path.
+  #
+  # SECURITY (preserved verbatim from auto-merge.yml / PR #1390 — do NOT
+  # weaken): the PR must originate from a branch in THIS repository, not a
+  # fork. `github.head_ref` is fully attacker-controlled on a fork PR — a
+  # stranger could fork this PUBLIC repo, push a branch named
+  # `claude/anything`, open a PR, and have the bot arm auto-merge. The
+  # `head.repo.full_name == github.repository` check makes same-repo origin
+  # the non-negotiable requirement; the actor / claude-branch clauses only
+  # further narrow WITHIN same-repo. Draft PRs are never armed.
+  # -------------------------------------------------------------------------
+  enable-auto-merge:
+    name: "Enable Auto-Merge"
+    needs: all-green
+    if: >-
+      github.event_name == 'pull_request' &&
+      needs.all-green.result == 'success' &&
+      github.event.pull_request.draft != true &&
+      github.event.pull_request.head.repo.full_name == github.repository && (
+      github.actor == 'dependabot[bot]' ||
+      github.actor == 'renovate[bot]' ||
+      github.actor == 'SJParthi' ||
+      startsWith(github.head_ref, 'claude/')
+      )
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Enable auto-merge (squash)
+        run: gh pr merge --auto --squash "$PR_URL"
+        env:
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
