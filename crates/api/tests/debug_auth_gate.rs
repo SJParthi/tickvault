@@ -145,6 +145,30 @@ async fn test_debug_routes_pass_when_auth_disabled() {
     }
 }
 
+/// HEAD requests (axum auto-derives HEAD from `get()` handlers) must hit
+/// the SAME `route_layer` gate — defense-in-depth pin so a method-variant
+/// request can never skip the bearer wall (security review 2026-07-04).
+#[tokio::test]
+async fn test_debug_routes_401_on_head_without_token() {
+    for path in DEBUG_PATHS {
+        let request = Request::builder()
+            .method(axum::http::Method::HEAD)
+            .uri(path)
+            .body(Body::empty())
+            .expect("request build should succeed"); // APPROVED: test-only
+        let status = enabled_router()
+            .oneshot(request)
+            .await
+            .expect("router should respond") // APPROVED: test-only
+            .status();
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "HEAD {path} must 401 without a token when auth is enabled"
+        );
+    }
+}
+
 /// Non-debug public route `/health` stays 200 with NO auth header even
 /// while bearer auth is enabled — the gate covers ONLY the debug routes.
 #[tokio::test]

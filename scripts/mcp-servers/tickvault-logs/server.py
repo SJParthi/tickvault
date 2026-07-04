@@ -668,6 +668,14 @@ def tool_tickvault_api(
 
     Lets Claude inspect the running app's own state without the
     operator copy-pasting curl output.
+
+    Security trim 2026-07-04: `/api/debug/*` is bearer-gated and every
+    real tickvault boot enables auth (SSM token, hard-fail fetch) — so
+    tokenless calls to those paths 401 even on localhost. Set the
+    `TICKVAULT_API_BEARER_TOKEN` env var (value of SSM
+    `/tickvault/<env>/api/bearer-token`) and this tool sends it as an
+    `Authorization: Bearer` header. Env-only by design — the token is
+    never read from (or written to) the committed endpoints TOML.
     """
     import urllib.request
 
@@ -680,11 +688,17 @@ def tool_tickvault_api(
     if not path.startswith("/"):
         path = f"/{path}"
     full = f"{api_url}{path}"
+    request = urllib.request.Request(full)  # noqa: S310
+    bearer = os.environ.get("TICKVAULT_API_BEARER_TOKEN", "").strip()
+    if bearer:
+        request.add_header("Authorization", f"Bearer {bearer}")
     try:
-        with urllib.request.urlopen(full, timeout=10) as resp:  # noqa: S310
+        with urllib.request.urlopen(request, timeout=10) as resp:  # noqa: S310
             body = resp.read().decode("utf-8")
             status = resp.status
     except Exception as err:  # noqa: BLE001
+        # Never echo the Authorization header/token — urllib errors carry
+        # only the URL + status, not request headers.
         return {"ok": False, "error": str(err), "url": full}
     # Try JSON — fall back to raw text if not JSON.
     try:

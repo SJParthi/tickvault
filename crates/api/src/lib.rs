@@ -134,12 +134,19 @@ pub fn build_router_with_auth(
     // Security trim 2026-07-04 (operator directive, Session A): the 4 read-only
     // `/api/debug/*` routes move OFF the public router and behind the SAME
     // bearer-auth middleware — applied UNCONDITIONALLY (deliberately NOT gated
-    // on `feed_toggle_public`). `require_bearer_auth` self-passthroughs when
-    // auth is disabled (dry-run / no token), so local development and the
-    // tickvault-logs MCP read-only contract (local file reads + tokenless
-    // localhost API calls with auth disabled) are unchanged. In production
-    // (SSM-resolved token, auth enabled) these routes now demand
-    // `Authorization: Bearer <token>` and 401 otherwise — fail-closed.
+    // on `feed_toggle_public`).
+    //
+    // HONEST CONTRACT (adversarial-review fix 2026-07-04): on EVERY real boot
+    // (prod AND local Mac) main.rs constructs `ApiAuthConfig::from_token` with
+    // the SSM-fetched token and HARD-FAILS if the fetch fails — so auth is
+    // ALWAYS enabled at runtime and these routes ALWAYS demand
+    // `Authorization: Bearer <token>` (401 otherwise, fail-closed). The
+    // `require_bearer_auth` disabled-passthrough is reachable ONLY for
+    // empty-token constructions (unit/router tests, `ApiAuthConfig::disabled`)
+    // — it is NOT a "local dev is tokenless" carve-out. Tokenless callers
+    // (curl, MCP `tool_tickvault_api` without TICKVAULT_API_BEARER_TOKEN) get
+    // 401 here even on localhost; the tickvault-logs MCP LOG tools are
+    // unaffected because they read the local filesystem, never these routes.
     let debug_routes: Router<SharedAppState> = Router::new()
         // Autonomous-ops Layer 1 (observability): read-only log access
         // for Claude MCP / remote sessions.
