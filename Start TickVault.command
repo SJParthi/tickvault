@@ -15,4 +15,8 @@ if [ $rc -ne 0 ]; then
 fi
 echo "App is running. Live log below — closing this window is safe."
 echo "-----------------------------------------------------------"
-exec tail -f "data/local-autopilot/app-$(TZ=Asia/Kolkata date +%F).log"
+# Tail the app's own canonical log (the human one); fall back to the ONE
+# common autopilot log if the app has not created its file yet.
+APP_LOG_FILE=$(ls -t data/logs/app.*.log 2>/dev/null | head -1)
+if [ -z "$APP_LOG_FILE" ]; then APP_LOG_FILE="data/logs/autopilot/autopilot.log"; fi
+exec tail -f "$APP_LOG_FILE"

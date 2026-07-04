@@ -29,7 +29,9 @@
 # =============================================================================
 
 # ── Tunables (env-overridable) ──────────────────────────────────────────────
-AUTOPILOT_DIR="${AUTOPILOT_DIR:-data/local-autopilot}"
+AUTOPILOT_DIR="${AUTOPILOT_DIR:-data/local-autopilot}" # runtime STATE (pids, markers, lock) — NOT logs
+LOG_DIR="${LOG_DIR:-data/logs/autopilot}"              # ALL autopilot/dev-run log lines — ONE rolling file
+LOG_KEEP="${LOG_KEEP:-7}"                              # rotated day-files kept; older deleted
 MANUAL_STOP_MARKER="${MANUAL_STOP_MARKER:-data/local-manual-stop.marker}"
 SCALE_WINDOW_START="${SCALE_WINDOW_START:-2026-07-06}"
 SCALE_WINDOW_END="${SCALE_WINDOW_END:-2026-07-08}"
@@ -59,6 +61,23 @@ LOCKDIR="$AUTOPILOT_DIR/autopilot.lock.d"
 ist_date() { TZ=Asia/Kolkata date +%F; }
 ist_hms() { TZ=Asia/Kolkata date +%H:%M:%S; }
 ist_weekday() { TZ=Asia/Kolkata date +%u; } # 1=Mon .. 7=Sun
+
+# log_rotate_needed <last_stamp_date> <today> → yes|no.
+# Day-change rotation for the ONE common autopilot.log (operator 2026-07-04:
+# "one common log folder and one common log file with rolling appender").
+log_rotate_needed() {
+  if [ -n "${1:-}" ] && [ "${1:-}" != "$2" ]; then echo yes; else echo no; fi
+}
+
+# rotated_logs_to_delete <keep_n> <rotated file...> → the files BEYOND the
+# newest keep_n, one per line (date-suffixed names sort lexicographically ==
+# chronologically). Pure; portable (tail -n +N works on BSD + GNU).
+rotated_logs_to_delete() {
+  local keep="$1"
+  shift
+  [ $# -gt 0 ] || return 0
+  printf '%s\n' "$@" | sort -r | tail -n +"$((keep + 1))"
+}
 
 # hhmm_to_secs "HH:MM[:SS]" → seconds of day (empty on garbage).
 hhmm_to_secs() {
@@ -183,13 +202,43 @@ fi
 
 set -euo pipefail
 cd "$(dirname "$0")/.."
-mkdir -p "$AUTOPILOT_DIR"
+mkdir -p "$AUTOPILOT_DIR" "$LOG_DIR"
 
 TODAY="$(ist_date)"
-LOG="$AUTOPILOT_DIR/autopilot-$TODAY.log"
-APP_LOG="$AUTOPILOT_DIR/app-$TODAY.log"
+# ONE COMMON LOG FILE (operator 2026-07-04: "just have one common log folder
+# and one common log file with rolling appender"). Every autopilot line, the
+# cargo build output, AND the app's stdout/stderr land in this single file.
+# Rolling: at day change the file rotates to autopilot.log.<date>; the newest
+# LOG_KEEP rotated files are kept, older deleted. State files (pids, markers,
+# lock, stamp) stay in data/local-autopilot/ — state, not logs. The app's own
+# canonical sinks (data/logs/app.*.log, errors.log, errors.jsonl.*) are
+# RULE-LOCKED (observability-architecture.md) and untouched.
+LOG="$LOG_DIR/autopilot.log"
 
-log() { echo "[$(ist_hms) IST] $*" | tee -a "$LOG"; }
+rotate_autopilot_log() {
+  local stamp="$AUTOPILOT_DIR/.log-date" last=""
+  [ -f "$stamp" ] && last="$(cat "$stamp" 2>/dev/null || true)"
+  if [ "$(log_rotate_needed "$last" "$TODAY")" = "yes" ] && [ -f "$LOG" ]; then
+    mv "$LOG" "$LOG_DIR/autopilot.log.$last" 2>/dev/null || true
+    local rotated=("$LOG_DIR"/autopilot.log.*)
+    if [ -e "${rotated[0]}" ]; then
+      while IFS= read -r doomed; do
+        if [ -n "$doomed" ]; then rm -f "$doomed"; fi
+      done < <(rotated_logs_to_delete "$LOG_KEEP" "${rotated[@]}")
+    fi
+  fi
+  echo "$TODAY" >"$stamp"
+}
+rotate_autopilot_log
+
+# log(): append to the ONE file; echo to the terminal only when interactive.
+# (The launchd plist points its own stdout/stderr at the SAME file — a tee
+# to stdout there would double-write every line.)
+log() {
+  local line="[$(ist_hms) IST] $*"
+  echo "$line" >>"$LOG"
+  if [ -t 1 ]; then echo "$line"; fi
+}
 
 tg() { # best-effort Telegram; the log always carries the message
   log "TELEGRAM: $*"
@@ -276,16 +325,16 @@ start_app() { # $1 = label for the log
     return 0
   fi
   log "building release binary (first build of the day can take minutes)..."
-  if ! cargo build --release >>"$APP_LOG" 2>&1; then
-    tg "🆘 Build FAILED — the app cannot start. Last lines: $(tail -5 "$APP_LOG" | tr '\n' ' | ')"
+  if ! cargo build --release >>"$LOG" 2>&1; then
+    tg "🆘 Build FAILED — the app cannot start. Last lines: $(tail -5 "$LOG" | tr '\n' ' | ')"
     return 1
   fi
-  nohup ./target/release/tickvault >>"$APP_LOG" 2>&1 &
+  nohup ./target/release/tickvault >>"$LOG" 2>&1 &
   echo $! >"$APP_PIDFILE"
-  log "app launched ($1) — pid $(cat "$APP_PIDFILE"), log $APP_LOG"
+  log "app launched ($1) — pid $(cat "$APP_PIDFILE"), log $LOG"
   sleep 60
   if ! app_alive; then
-    tg "🆘 App DIED within 60s of launch ($1). Log tail: $(tail -8 "$APP_LOG" | tr '\n' ' | ')"
+    tg "🆘 App DIED within 60s of launch ($1). Log tail: $(tail -8 "$LOG" | tr '\n' ' | ')"
     return 1
   fi
   return 0
@@ -376,10 +425,16 @@ cmd_dev() {
     log "scripts/ensure-ready.sh missing/not executable — skipping (docker + questdb still ensured below)"
   fi
   cmd_start || return 1
-  echo "=== tickvault is RUNNING — tailing $APP_LOG ==="
+  # Tail the APP's own canonical log (data/logs/app.YYYY-MM-DD.log — the
+  # human sink, rule-locked in observability-architecture.md) rather than
+  # duplicating it; fall back to the common autopilot.log if the app has not
+  # created its file yet.
+  local app_log
+  app_log=$(ls -t data/logs/app.*.log 2>/dev/null | head -1 || true)
+  if [ -z "$app_log" ]; then app_log="$LOG"; fi
+  echo "=== tickvault is RUNNING — tailing $app_log ==="
   echo "=== stopping this tail does NOT stop the app; use the 'Stop tickvault' run config ==="
-  touch "$APP_LOG"
-  exec tail -f "$APP_LOG"
+  exec tail -f "$app_log"
 }
 
 # ── Subcommand: status ──────────────────────────────────────────────────────
@@ -394,6 +449,7 @@ cmd_status() {
   else
     echo "manual : no active stop marker"
   fi
+  echo "logs   : $LOG (single rolling file; app log = data/logs/app.<date>.log)"
 }
 
 # scale-window override file: "START END" (ISO dates) in
@@ -439,7 +495,7 @@ wait_until_ist() { # $1 = "HH:MM"; returns immediately if already past
 
 eod_summary() {
   local mode="$1" summary="data/groww-scale/summary-$TODAY.tsv" digest="" errors
-  errors=$(grep -c "ERROR" "$APP_LOG" 2>/dev/null || true)
+  errors=$(grep -c "ERROR" "$LOG" 2>/dev/null || true)
   if [ -f "$summary" ]; then
     digest=$'\nStage table (outcome | conns | proof | capturing | bytes | cpu | mem):\n'
     digest+=$(awk -F'\t' 'NR>1 {printf "%s | %s | %s | %s | %s | %s%% | %s%%\n", $2, $3, $6, $7, $8, $9, $10}' "$summary" | tail -12)
@@ -464,12 +520,12 @@ monitor_until_eod() {
       ;;
     relaunch)
       relaunches=$((relaunches + 1))
-      tg "⚠️ App died mid-session — relaunching once (attempt $relaunches). Log tail: $(tail -5 "$APP_LOG" | tr '\n' ' | ')"
+      tg "⚠️ App died mid-session — relaunching once (attempt $relaunches). Log tail: $(tail -5 "$LOG" | tr '\n' ' | ')"
       sleep 30
       start_app "auto-relaunch" || true
       ;;
     alert)
-      tg "🆘 App died AGAIN after the one relaunch — NOT retrying (avoid crash-looping the feed). Log tail: $(tail -8 "$APP_LOG" | tr '\n' ' | '). Double-click Start TickVault after investigating."
+      tg "🆘 App died AGAIN after the one relaunch — NOT retrying (avoid crash-looping the feed). Log tail: $(tail -8 "$LOG" | tr '\n' ' | '). Double-click Start TickVault after investigating."
       relaunches=$((relaunches + 1)) # alert once, then idle on this state
       ;;
     esac

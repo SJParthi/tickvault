@@ -94,6 +94,18 @@ t "in_scale_window after"   "1" "$(in_scale_window 2026-07-09 2026-07-06 2026-07
 # ── real repo holiday file sanity (Republic Day 2026 is listed) ────────────
 t "real base.toml holiday hit" "holiday" "$(classify_day 2026-01-26 1 config/base.toml 2026-07-06 2026-07-08)"
 
+# ── ONE common rolling log: rotation decision + retention pruning ──────────
+t "rotate: day changed" "yes" "$(log_rotate_needed 2026-07-03 2026-07-04)"
+t "rotate: same day" "no" "$(log_rotate_needed 2026-07-04 2026-07-04)"
+t "rotate: first run (no stamp)" "no" "$(log_rotate_needed "" 2026-07-04)"
+# retention: keep the newest 2 of 4 rotated files → oldest 2 listed for delete
+DOOMED=$(rotated_logs_to_delete 2 \
+  "d/autopilot.log.2026-07-01" "d/autopilot.log.2026-07-03" \
+  "d/autopilot.log.2026-07-02" "d/autopilot.log.2026-07-04" | tr '\n' ' ')
+t "retention deletes oldest beyond keep" "d/autopilot.log.2026-07-02 d/autopilot.log.2026-07-01 " "$DOOMED"
+t "retention: under the cap deletes nothing" "" "$(rotated_logs_to_delete 7 "d/autopilot.log.2026-07-03" | tr -d '\n')"
+t "retention: no files is a no-op" "" "$(rotated_logs_to_delete 7 | tr -d '\n')"
+
 echo
 echo "local-autopilot pure-logic tests: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

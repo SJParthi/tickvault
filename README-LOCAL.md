@@ -143,6 +143,24 @@ runs the harness flips `dhan_enabled` OFF in place (restored by
 NORMAL local window only. Full sequence + evidence locations:
 `docs/runbooks/groww-scale-test.md` ("100K MAX-SCALE LAB" section).
 
+## WHERE ARE MY LOGS (one line per file + who reads it)
+
+Operator 2026-07-04: "one common log folder and one common log file with
+rolling appender." One folder: `data/logs/`. What remains:
+
+| File | Who reads it | What it is |
+|---|---|---|
+| `data/logs/app.YYYY-MM-DD.log` | **HUMAN** — the one to open | The app's full log, daily rotation (rule-locked canonical sink; the Run/Start windows tail this) |
+| `data/logs/autopilot/autopilot.log` | **the launcher** (and you when boot fails) | The ONE autopilot/dev-run file: autopilot decisions + cargo build output + app stdout/stderr + launchd stray output. Rolls at day change to `autopilot.log.<date>`, keeps the last 7, deletes older |
+| `data/logs/errors.log` | human grep | WARN+ only, single file (rule-locked) |
+| `data/logs/errors.jsonl.YYYY-MM-DD-HH` | **triage ROBOT** (MCP/Telegram chain) | ERROR-only JSONL, hourly, 48h auto-swept (rule-locked — never touch) |
+| `data/logs/errors.summary.md` | robot + human snapshot | 60s-refresh summary (rule-locked) |
+
+The old per-date scatter (`data/local-autopilot/app-<date>.log`,
+`autopilot-<date>.log`, `launchd.out/err.log`) is GONE — any leftovers from
+earlier runs are inert and can be deleted. `data/local-autopilot/` now holds
+runtime STATE only (pid files, manual-stop marker, lock, scale-window.conf).
+
 ## Where the data lives
 
 Everything is on the Mac, under the repo:
@@ -150,9 +168,11 @@ Everything is on the Mac, under the repo:
 | Data | Path |
 |---|---|
 | QuestDB (ticks, candles, audit tables) | Docker volume `tv-questdb-data` (inspect via `make questdb` → localhost:9000) |
-| App + error logs | `data/logs/` (`app.YYYY-MM-DD.log`, `errors.jsonl.*`) |
+| Logs (ALL of them) | `data/logs/` — see "WHERE ARE MY LOGS" above |
+| Autopilot runtime state (pids, markers, lock) | `data/local-autopilot/` (state, not logs) |
 | WAL frame spill / overflow / safety net | `data/spill/`, `data/dlq/` |
 | Cross-verify CSVs | `data/cross-verify/` |
+| Scale-lab per-stage evidence | `data/groww-scale/summary-<date>.tsv` |
 | Instrument cache + plan snapshot | `data/instrument-cache/` |
 
 ## Honest envelope
