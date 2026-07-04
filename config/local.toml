@@ -18,3 +18,17 @@ csv_cache_directory = "data/instrument-cache"
 
 [observability]
 otlp_endpoint = "http://localhost:4317"
+
+# =============================================================================
+# LOCAL-RUNTIME BRANCH OVERLAY (branch `local-runtime` ONLY — never on main)
+# =============================================================================
+# Operator directive 2026-07-04: this branch is "purely for local and it
+# should run only on local". During the local window (AWS box paused) the
+# operator's Mac carries BOTH live feeds, so pin them ON explicitly here —
+# local behaviour must not depend on config/production.toml (merged for the
+# default `prod` env). dry_run stays true (base.toml [strategy]) — NO real
+# orders; with AWS off during the window, Dhan-on locally is safe (no
+# dual-instance fight over the static-IP / connection budget).
+[feeds]
+dhan_enabled = true
+groww_enabled = true

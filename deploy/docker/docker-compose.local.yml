@@ -1,0 +1,27 @@
+# =============================================================================
+# docker-compose.local.yml — LOCAL-RUNTIME BRANCH OVERLAY (never on main)
+# =============================================================================
+# Compose OVERRIDE file for the local window (operator's Mac carries the live
+# feeds while the AWS box is paused). It changes RESOURCE LIMITS ONLY via the
+# existing env-var pattern — NO image/version changes, NO new services, NO
+# port changes. The base file stays byte-identical to main (the sync robot
+# merges main into this branch; keeping the delta in an override file keeps
+# those merges conflict-free).
+#
+# Usage (see README-LOCAL.md):
+#   docker compose -f deploy/docker/docker-compose.yml \
+#                  -f deploy/docker/docker-compose.local.yml up -d
+#
+# Equivalent env-var form (the base file already reads QDB_MEM_LIMIT):
+#   QDB_MEM_LIMIT=6g make docker-up
+#
+# Why 6g: the base default is 4g (sized for the r8g.large 16 GiB prod box
+# budget in daily-universe-scope-expansion-2026-05-27.md §7 Rule 2). During
+# the local window the Mac is the ONLY writer for BOTH feeds (Dhan + Groww,
+# ~1,500 combined SIDs), so QuestDB gets extra headroom for the day's
+# partitions + the 15:31 IST cross-verify reads. QuestDB mmaps data files —
+# actual RSS stays well below the limit.
+
+services:
+  tv-questdb:
+    mem_limit: ${QDB_MEM_LIMIT:-6g}
