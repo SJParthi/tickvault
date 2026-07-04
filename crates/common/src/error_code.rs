@@ -482,6 +482,15 @@ pub enum ErrorCode {
     /// the other instance shuts down (or its 90 s TTL expires after
     /// a hard crash). Severity::Critical.
     Resilience01DualInstanceDetected,
+    /// RESILIENCE-03: a Dhan `generateAccessToken` mint was REFUSED
+    /// because this process no longer holds the SSM dual-instance lock
+    /// (the heartbeat observed a peer taking ownership, or shutdown
+    /// released it). Dhan enforces one active token at a time — minting
+    /// while a peer owns the session would invalidate the peer's JWT
+    /// and start a cross-host mint ping-pong (coexistence audit
+    /// 2026-07-04). Fail-closed refusal, loud, never silent.
+    /// Severity::Critical.
+    Resilience03MintRefusedLockNotHeld,
     /// RESOURCE-01: open file-descriptor count crossed the early-warning
     /// threshold (default 80% of `LimitNOFILE`). A leaked WS / QuestDB
     /// socket can exhaust the fd table with zero signal until `connect()`
@@ -750,6 +759,34 @@ pub enum ErrorCode {
     /// during the outage rehydrates from the last PERSISTED (always
     /// previously-verified) rung. Severity::Medium, auto-triage-safe.
     GrowwScale04AuditWriteFailed,
+    /// GROWW-NATIVE-01 (PR-R1 shadow client, 2026-07-04) — the native-Rust
+    /// Groww NATS-over-WebSocket shadow client failed to connect / lost the
+    /// connection / had its supervised task respawned. Bounded expo backoff
+    /// reconnect (`GROWW_NATIVE_RECONNECT_*_SECS`); shadow-only — the Python
+    /// sidecar capture chain is UNAFFECTED. Severity::Medium,
+    /// auto-triage-safe (self-healing reconnect; a sustained rate is the
+    /// live-probe answer the shadow run exists to collect).
+    GrowwNative01ConnectFailed,
+    /// GROWW-NATIVE-02 (PR-R1 shadow client, 2026-07-04) — the per-session
+    /// socket-token mint (`GROWW_SOCKET_TOKEN_URL`, live-feed-AUTH KEEP
+    /// class) failed, or the NATS `CONNECT` was rejected with an auth-class
+    /// `-ERR`. Recovery: fresh ed25519 keypair + fresh socket-token mint;
+    /// the ACCESS token is only ever RE-READ from SSM at
+    /// `GROWW_NATIVE_AUTH_RETRY_FLOOR_SECS` pacing — NEVER minted
+    /// (token-minter lock 2026-07-02). Severity::Medium, auto-triage-safe.
+    GrowwNative02AuthFailed,
+    /// GROWW-NATIVE-03 (PR-R1 shadow client, 2026-07-04) — a NATS frame or
+    /// protobuf tick payload failed to decode (typed error, never a panic).
+    /// Proto-level failures are counted + skipped; framing-level failures
+    /// close + reconnect the socket. Severity::Medium, auto-triage-safe.
+    GrowwNative03DecodeFailed,
+    /// GROWW-NATIVE-04 (PR-R1 shadow client, 2026-07-04) — the shadow NDJSON
+    /// writer failed a write / flush / IST-midnight rotation, or its bounded
+    /// channel overflowed. Capture continues (rotation failures retry next
+    /// midnight, mirroring the sidecar); the loss is shadow comparison data
+    /// only — the production capture chain is untouched. Severity::Medium,
+    /// auto-triage-safe.
+    GrowwNative04WriterFailed,
 }
 
 impl ErrorCode {
@@ -877,6 +914,7 @@ impl ErrorCode {
             Self::AggregatorHb01Heartbeat => "AGGREGATOR-HB-01",
             Self::Boundary01CatchupSeal => "BOUNDARY-01",
             Self::Resilience01DualInstanceDetected => "RESILIENCE-01",
+            Self::Resilience03MintRefusedLockNotHeld => "RESILIENCE-03",
             Self::Resource01FdCountHigh => "RESOURCE-01",
             Self::Resource02ResidentMemoryHigh => "RESOURCE-02",
             Self::Resource03SpillFreeLow => "RESOURCE-03",
@@ -915,6 +953,11 @@ impl ErrorCode {
             Self::GrowwScale02GlobalHalve => "GROWW-SCALE-02",
             Self::GrowwScale03ShardOverlap => "GROWW-SCALE-03",
             Self::GrowwScale04AuditWriteFailed => "GROWW-SCALE-04",
+            // PR-R1 (2026-07-04): Groww native-Rust shadow client
+            Self::GrowwNative01ConnectFailed => "GROWW-NATIVE-01",
+            Self::GrowwNative02AuthFailed => "GROWW-NATIVE-02",
+            Self::GrowwNative03DecodeFailed => "GROWW-NATIVE-03",
+            Self::GrowwNative04WriterFailed => "GROWW-NATIVE-04",
         }
     }
 
@@ -940,6 +983,7 @@ impl ErrorCode {
             | Self::PrevClose03BootRoutingAssertion
             | Self::AggregatorDrop01
             | Self::Resilience01DualInstanceDetected
+            | Self::Resilience03MintRefusedLockNotHeld
             | Self::OrphanPosition01Detected
             | Self::BarMismatch01CorrectedFromHistorical
             | Self::BarMismatch02CrossCheckInconclusive
@@ -1093,7 +1137,15 @@ impl ErrorCode {
             | Self::GrowwMaster01PersistFailed
             // GROWW-SCALE-04 (§34 2026-07-03): best-effort groww_scale_audit
             // row write failed; ladder continues on in-memory state. Medium.
-            | Self::GrowwScale04AuditWriteFailed => Severity::Medium,
+            | Self::GrowwScale04AuditWriteFailed
+            // GROWW-NATIVE-01..04 (PR-R1 2026-07-04): shadow-only validation
+            // client — failures lose comparison data for the window, never
+            // production capture. Medium so the operator sees sustained
+            // rates without paging on every live-probe reject.
+            | Self::GrowwNative01ConnectFailed
+            | Self::GrowwNative02AuthFailed
+            | Self::GrowwNative03DecodeFailed
+            | Self::GrowwNative04WriterFailed => Severity::Medium,
             // Low: trading-day / Dhan other
             // PR #6a (2026-05-19): I-P1-01 (DailyScheduler) + I-P1-02 (DeltaFieldCoverage) retired
             Self::InstrumentP2TradingDayGuard
@@ -1228,6 +1280,10 @@ impl ErrorCode {
             | Self::Resource01FdCountHigh
             | Self::Resource02ResidentMemoryHigh
             | Self::Resource03SpillFreeLow => ".claude/rules/project/wave-4-error-codes.md",
+            // 2026-07-04 dual-instance lock hardening (lock-before-mint)
+            Self::Resilience03MintRefusedLockNotHeld => {
+                ".claude/rules/project/dual-instance-lock-2026-07-04.md"
+            }
             Self::OrphanPosition01Detected => {
                 ".claude/rules/project/phase-0-item-20-error-codes.md"
             }
@@ -1292,6 +1348,13 @@ impl ErrorCode {
             | Self::GrowwScale03ShardOverlap
             | Self::GrowwScale04AuditWriteFailed => {
                 ".claude/rules/project/groww-scale-error-codes.md"
+            }
+            // PR-R1 (2026-07-04): Groww native-Rust shadow client
+            Self::GrowwNative01ConnectFailed
+            | Self::GrowwNative02AuthFailed
+            | Self::GrowwNative03DecodeFailed
+            | Self::GrowwNative04WriterFailed => {
+                ".claude/rules/project/groww-native-rust-error-codes.md"
             }
         }
     }
@@ -1415,6 +1478,8 @@ impl ErrorCode {
             Self::Boundary01CatchupSeal,
             // Wave 4 — Item 19 dual-instance lock
             Self::Resilience01DualInstanceDetected,
+            // 2026-07-04 dual-instance lock hardening (lock-before-mint tripwire)
+            Self::Resilience03MintRefusedLockNotHeld,
             // BP-08 (2026-07-01) — fd / RSS / spill-free early-warning monitors
             Self::Resource01FdCountHigh,
             Self::Resource02ResidentMemoryHigh,
@@ -1458,6 +1523,11 @@ impl ErrorCode {
             Self::GrowwScale02GlobalHalve,
             Self::GrowwScale03ShardOverlap,
             Self::GrowwScale04AuditWriteFailed,
+            // PR-R1 (2026-07-04): Groww native-Rust shadow client
+            Self::GrowwNative01ConnectFailed,
+            Self::GrowwNative02AuthFailed,
+            Self::GrowwNative03DecodeFailed,
+            Self::GrowwNative04WriterFailed,
         ]
     }
 }
@@ -1755,7 +1825,15 @@ mod tests {
         // (fleet-wide failure → global cooldown + halve) + GROWW-SCALE-03
         // (shard disjointness/coverage contract violated) + GROWW-SCALE-04
         // (groww_scale_audit row write failed, best-effort).
-        assert_eq!(ErrorCode::all().len(), 123);
+        // 2026-07-04 (dual-instance lock hardening): bumped 123 -> 124 for
+        // RESILIENCE-03 (generateAccessToken mint refused — instance lock
+        // not held; lock-before-mint tripwire, operator "go" 2026-07-04).
+        // 2026-07-04 (PR-R1 Groww native-Rust shadow client): bumped 124 -> 128
+        // for GROWW-NATIVE-01 (connect/reconnect/respawn) + GROWW-NATIVE-02
+        // (socket-token mint / CONNECT auth rejected) + GROWW-NATIVE-03
+        // (NATS/proto decode failure) + GROWW-NATIVE-04 (shadow NDJSON
+        // writer/rotation/channel failure).
+        assert_eq!(ErrorCode::all().len(), 128);
     }
 
     #[test]
@@ -1885,6 +1963,8 @@ mod tests {
                 || s.starts_with("GROWW-MASTER-")
                 // §34 (2026-07-03): Groww multi-connection auto-scale ladder
                 || s.starts_with("GROWW-SCALE-")
+                // PR-R1 (2026-07-04): Groww native-Rust shadow client
+                || s.starts_with("GROWW-NATIVE-")
                 // 2026-06-30: feed-agnostic sidecar stall-watchdog + respawn
                 || s.starts_with("FEED-STALL-")
                 || s.starts_with("FEED-SUPERVISOR-")

@@ -101,6 +101,18 @@ pub struct FeedsConfig {
     /// single-connection behaviour byte-identical.
     #[serde(default)]
     pub groww: GrowwFeedTuning,
+    /// Groww NATIVE-RUST SHADOW client (PR-R1 of the parity migration,
+    /// operator "go" 2026-07-04 — `groww-second-feed-scope-2026-06-19.md`
+    /// §35). Default OFF. When true, a supervised task connects the native
+    /// Rust NATS-over-WebSocket client to Groww ALONGSIDE the Python
+    /// sidecar (same watch set) and writes its OWN NDJSON file
+    /// (`data/groww/rust-live-ticks.ndjson`, same line schema as the
+    /// sidecar's capture file) for the future exact per-tick parity
+    /// comparer. NO shared-table writes, NO strategy/order wiring, NO
+    /// sidecar changes. `#[serde(default)]` so existing TOMLs without the
+    /// key behave byte-identically.
+    #[serde(default)]
+    pub groww_native_shadow: bool,
 }
 
 impl Default for FeedsConfig {
@@ -109,6 +121,7 @@ impl Default for FeedsConfig {
             dhan_enabled: true,
             groww_enabled: false,
             groww: GrowwFeedTuning::default(),
+            groww_native_shadow: false,
         }
     }
 }
@@ -3247,6 +3260,41 @@ mod tests {
             !feeds.groww_enabled,
             "Groww must default OFF (opt-in; zero prod behaviour change)"
         );
+    }
+
+    /// PR-R1 (2026-07-04): the native-Rust shadow client is DEFAULT-OFF —
+    /// both via `Default` and via a `[feeds]` TOML that omits the key
+    /// (`#[serde(default)]`). Flipping the default requires a fresh dated
+    /// operator quote per `groww-second-feed-scope-2026-06-19.md` §35.
+    #[test]
+    fn test_feeds_config_groww_native_shadow_defaults_off() {
+        use figment::Figment;
+        use figment::providers::{Format, Toml};
+
+        assert!(
+            !FeedsConfig::default().groww_native_shadow,
+            "native shadow client must default OFF"
+        );
+
+        #[derive(Deserialize)]
+        struct Wrapper {
+            feeds: FeedsConfig,
+        }
+        let wrapper: Wrapper = Figment::new()
+            .merge(Toml::string(
+                "[feeds]\ndhan_enabled = true\ngroww_enabled = false\n",
+            ))
+            .extract()
+            .expect("missing groww_native_shadow key must default, not error");
+        assert!(!wrapper.feeds.groww_native_shadow);
+
+        let wrapper_on: Wrapper = Figment::new()
+            .merge(Toml::string(
+                "[feeds]\ndhan_enabled = true\ngroww_enabled = false\ngroww_native_shadow = true\n",
+            ))
+            .extract()
+            .expect("explicit groww_native_shadow must round-trip");
+        assert!(wrapper_on.feeds.groww_native_shadow);
     }
 
     /// A missing `[feeds]` section must fall back to the safe default

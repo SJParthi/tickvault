@@ -13,6 +13,7 @@
 
 pub mod auth;
 pub mod instruments;
+pub mod native;
 pub mod nats;
 pub mod nkey;
 pub mod parity_1m;

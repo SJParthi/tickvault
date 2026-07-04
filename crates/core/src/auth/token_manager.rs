@@ -99,6 +99,19 @@ pub struct TokenManager {
 
     /// Notification service for Telegram/SNS alerts on auth events.
     notifier: Arc<NotificationService>,
+
+    /// RESILIENCE-03 mint tripwire (dual-instance lock hardening,
+    /// operator "go" 2026-07-04). `Some(flag)` = this process acquired
+    /// the SSM dual-instance lock at boot and `flag` mirrors ownership
+    /// (`true` = held; the heartbeat flips it `false` on lock loss /
+    /// shutdown release). Every `generateAccessToken` MINT (never
+    /// `RenewToken`) checks the flag first and REFUSES fail-closed when
+    /// ownership is gone — minting while a peer owns the Dhan session
+    /// would invalidate the peer's JWT (one active token at a time).
+    /// `None` = no lock expected (tests; the fast-boot crash-recovery
+    /// arm, which never mints at boot — documented residual gap in
+    /// `.claude/rules/project/dual-instance-lock-2026-07-04.md`).
+    instance_lock_held: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
 
 impl TokenManager {
@@ -113,12 +126,18 @@ impl TokenManager {
     ///
     /// Returns error only for permanent credential failures or shutdown (Ctrl+C).
     /// Transient errors (network, timeout, rate limit) are retried indefinitely.
+    ///
+    /// `instance_lock_held`: RESILIENCE-03 mint tripwire — see the field
+    /// doc. The caller (boot) MUST have acquired the dual-instance lock
+    /// BEFORE calling this (lock-before-mint, 2026-07-04) and pass the
+    /// ownership flag in; `None` disarms the tripwire.
     #[instrument(skip_all)]
     pub async fn initialize(
         dhan_config: &DhanConfig,
         token_config: &TokenConfig,
         network_config: &NetworkConfig,
         notifier: &Arc<NotificationService>,
+        instance_lock_held: Option<Arc<std::sync::atomic::AtomicBool>>,
     ) -> Result<Arc<Self>, ApplicationError> {
         info!("initializing authentication — fetching credentials from SSM");
 
@@ -178,6 +197,7 @@ impl TokenManager {
             token_config: token_config.clone(),
             network_config: network_config.clone(),
             notifier: Arc::clone(notifier),
+            instance_lock_held,
         });
 
         // Fast path: try loading a cached token from a previous run.
@@ -353,6 +373,9 @@ impl TokenManager {
     /// # Arguments
     /// * `token_handle` — Pre-existing handle already populated with a cached token.
     /// * `cached_client_id` — Client ID from the token cache (for validation).
+    /// * `instance_lock_held` — RESILIENCE-03 mint tripwire flag (see the
+    ///   field doc). The fast-boot arm currently passes `None` — it holds
+    ///   no dual-instance lock (documented residual gap, 2026-07-04).
     #[instrument(skip_all)]
     pub async fn initialize_deferred(
         token_handle: TokenHandle,
@@ -361,6 +384,7 @@ impl TokenManager {
         token_config: &TokenConfig,
         network_config: &NetworkConfig,
         notifier: &Arc<NotificationService>,
+        instance_lock_held: Option<Arc<std::sync::atomic::AtomicBool>>,
     ) -> Result<Arc<Self>, ApplicationError> {
         info!("deferred auth: fetching SSM credentials for validation + renewal");
 
@@ -418,6 +442,7 @@ impl TokenManager {
             token_config: token_config.clone(),
             network_config: network_config.clone(),
             notifier: Arc::clone(notifier),
+            instance_lock_held,
         });
 
         // Validate cached client_id against SSM. If they differ, the cache was
@@ -667,6 +692,37 @@ impl TokenManager {
     /// `dhanClientId`, `pin`, `totp`. Response is flat JSON with camelCase fields.
     #[instrument(skip_all)]
     async fn acquire_token(&self) -> Result<(), ApplicationError> {
+        // RESILIENCE-03 mint tripwire (lock-before-mint, 2026-07-04):
+        // refuse the MINT fail-closed if this process no longer holds the
+        // dual-instance lock. Checked BEFORE TOTP generation and before
+        // any network I/O so a refused mint has zero external side
+        // effects. `RenewToken` (try_renew_token) is deliberately NOT
+        // gated — renewing our own still-active token harms no peer.
+        if mint_refused_by_instance_lock(self.instance_lock_held.as_deref()) {
+            error!(
+                code = tickvault_common::error_code::ErrorCode::Resilience03MintRefusedLockNotHeld
+                    .code_str(),
+                severity =
+                    tickvault_common::error_code::ErrorCode::Resilience03MintRefusedLockNotHeld
+                        .severity()
+                        .as_str(),
+                "RESILIENCE-03: refusing generateAccessToken — this process no longer \
+                 holds the dual-instance lock; a peer instance owns the Dhan session \
+                 and minting would invalidate its token (one active token at a time)"
+            );
+            self.notifier
+                .notify(NotificationEvent::AuthenticationFailed {
+                    reason: "RESILIENCE-03: token mint refused — another tickvault instance \
+                         holds the dual-instance lock"
+                        .to_string(),
+                });
+            return Err(ApplicationError::AuthenticationFailed {
+                reason: "RESILIENCE-03: instance lock not held — generateAccessToken mint \
+                         refused (fail-closed)"
+                    .to_string(),
+            });
+        }
+
         let totp_code = generate_totp_code(&self.credentials.totp_secret)?;
 
         let url = join_api_url(&self.auth_base_url, DHAN_GENERATE_TOKEN_PATH);
@@ -1172,6 +1228,18 @@ impl TokenManager {
     #[cfg(test)]
     // TEST-EXEMPT: #[cfg(test)]-only test constructor (no production surface); exercised by every make_test_manager / new_for_test caller across the auth + websocket test modules.
     pub(crate) fn new_for_test(initial_token: Option<TokenState>) -> Arc<Self> {
+        Self::new_for_test_with_lock_flag(initial_token, None)
+    }
+
+    /// Test-only constructor variant that also installs the RESILIENCE-03
+    /// mint-tripwire flag so the refusal path is exercisable without SSM
+    /// or network I/O (dual-instance lock hardening 2026-07-04).
+    #[cfg(test)]
+    // TEST-EXEMPT: #[cfg(test)]-only test constructor (no production surface); exercised by the RESILIENCE-03 tripwire tests below.
+    pub(crate) fn new_for_test_with_lock_flag(
+        initial_token: Option<TokenState>,
+        instance_lock_held: Option<Arc<std::sync::atomic::AtomicBool>>,
+    ) -> Arc<Self> {
         let token: TokenHandle = Arc::new(ArcSwap::new(Arc::new(initial_token)));
         Arc::new(Self {
             token,
@@ -1195,6 +1263,7 @@ impl TokenManager {
                 retry_max_attempts: 3,
             },
             notifier: crate::notification::service::NotificationService::disabled(),
+            instance_lock_held,
         })
     }
 }
@@ -1217,6 +1286,26 @@ fn is_permanent_auth_error(reason: &str) -> bool {
         || lower.contains("blocked")
         || lower.contains("suspended")
         || lower.contains("disabled")
+        // RESILIENCE-03 (2026-07-04): a mint refused because the
+        // dual-instance lock is not held cannot succeed on retry —
+        // the peer owns the session. Fail fast so the boot retry
+        // loop / renewal loop escalates instead of spinning.
+        || lower.contains("resilience-03")
+}
+
+/// RESILIENCE-03 pure decision: should a `generateAccessToken` MINT be
+/// refused given the current dual-instance-lock ownership flag?
+///
+/// * `None` — no lock expected for this manager (tests, fast-boot arm):
+///   never refuse (tripwire disarmed).
+/// * `Some(flag)` with `flag == true` — lock held: allow the mint.
+/// * `Some(flag)` with `flag == false` — lock LOST (peer took over, or
+///   shutdown released it): REFUSE fail-closed.
+fn mint_refused_by_instance_lock(flag: Option<&std::sync::atomic::AtomicBool>) -> bool {
+    match flag {
+        None => false,
+        Some(held) => !held.load(std::sync::atomic::Ordering::Acquire),
+    }
 }
 
 /// Returns `true` if the error is a TOTP-related auth failure.
@@ -1250,6 +1339,67 @@ mod tests {
     /// test-only construction lives in one place.
     fn make_test_manager(initial_token: Option<TokenState>) -> Arc<TokenManager> {
         TokenManager::new_for_test(initial_token)
+    }
+
+    // -----------------------------------------------------------------------
+    // RESILIENCE-03 mint tripwire (dual-instance lock hardening 2026-07-04)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_mint_refused_when_lock_flag_false() {
+        let flag = std::sync::atomic::AtomicBool::new(false);
+        assert!(
+            mint_refused_by_instance_lock(Some(&flag)),
+            "a lost lock (flag=false) MUST refuse the mint fail-closed"
+        );
+    }
+
+    #[test]
+    fn test_mint_allowed_when_lock_flag_true_or_absent() {
+        let flag = std::sync::atomic::AtomicBool::new(true);
+        assert!(
+            !mint_refused_by_instance_lock(Some(&flag)),
+            "a held lock (flag=true) must allow the mint"
+        );
+        assert!(
+            !mint_refused_by_instance_lock(None),
+            "no lock expected (None — tests / fast-boot arm) must allow the mint"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_acquire_token_refuses_before_any_network_when_lock_lost() {
+        // The tripwire sits BEFORE TOTP generation and any HTTP call, so a
+        // refused mint completes instantly against the dummy example.com
+        // base URLs of the test constructor — zero external side effects.
+        let flag = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let manager = TokenManager::new_for_test_with_lock_flag(None, Some(Arc::clone(&flag)));
+        // Simulate the heartbeat losing the lock to a peer mid-session.
+        flag.store(false, std::sync::atomic::Ordering::Release);
+        let err = manager
+            .acquire_token()
+            .await
+            .expect_err("mint MUST be refused when the instance lock is not held");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("RESILIENCE-03"),
+            "typed refusal expected, got: {msg}"
+        );
+        // The refusal must classify PERMANENT so the boot retry loop /
+        // renewal loop fails fast instead of spinning against the peer.
+        assert!(
+            is_permanent_auth_error(&msg),
+            "RESILIENCE-03 refusal must be a permanent auth error: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_resilience03_is_permanent_auth_error() {
+        assert!(is_permanent_auth_error(
+            "RESILIENCE-03: instance lock not held — generateAccessToken mint refused (fail-closed)"
+        ));
+        // Unrelated transient errors stay transient.
+        assert!(!is_permanent_auth_error("connection reset by peer"));
     }
 
     #[test]
@@ -1572,6 +1722,7 @@ mod tests {
             &token_config,
             &network_config,
             &crate::notification::service::NotificationService::disabled(),
+            None,
         )
         .await;
         let Err(err) = result else {
@@ -1614,6 +1765,7 @@ mod tests {
             &token_config,
             &network_config,
             &crate::notification::service::NotificationService::disabled(),
+            None,
         )
         .await;
         let Err(err) = result else {
@@ -1806,6 +1958,7 @@ mod tests {
                 retry_max_attempts: 2,
             },
             notifier: crate::notification::service::NotificationService::disabled(),
+            instance_lock_held: None,
         })
     }
 
@@ -2000,6 +2153,7 @@ mod tests {
             &token_config,
             &network_config,
             &crate::notification::service::NotificationService::disabled(),
+            None,
         )
         .await;
         assert!(result.is_err(), "both HTTP URLs must be rejected");
@@ -2119,6 +2273,7 @@ mod tests {
                 retry_max_attempts: 2,
             },
             notifier: crate::notification::service::NotificationService::disabled(),
+            instance_lock_held: None,
         })
     }
 
@@ -2392,6 +2547,7 @@ mod tests {
                 retry_max_attempts: 1,
             },
             notifier: crate::notification::service::NotificationService::disabled(),
+            instance_lock_held: None,
         });
 
         let handle = manager.spawn_renewal_task();
@@ -2566,6 +2722,7 @@ mod tests {
                 retry_max_attempts: 2,
             },
             notifier: crate::notification::service::NotificationService::disabled(),
+            instance_lock_held: None,
         });
 
         let handle = tokio::spawn(Arc::clone(&manager).renewal_loop());
@@ -2629,6 +2786,7 @@ mod tests {
                 retry_max_attempts: 1,
             },
             notifier: crate::notification::service::NotificationService::disabled(),
+            instance_lock_held: None,
         });
 
         let handle = tokio::spawn(Arc::clone(&manager).renewal_loop());
@@ -2955,6 +3113,7 @@ mod tests {
             &token_config,
             &network_config,
             &crate::notification::service::NotificationService::disabled(),
+            None,
         )
         .await;
         // Should fail on the first check (rest_api_base_url)

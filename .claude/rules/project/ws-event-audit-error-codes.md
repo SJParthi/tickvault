@@ -79,6 +79,25 @@ or reconnect behaviour.
   no `ws_event_audit` row even though the table is already feed-keyed. Best-effort
   `try_send` through the SAME consumer Dhan uses — an ILP failure is still
   AUDIT-WS-01 (no new ErrorCode).
+- **2026-07-04 update — boot-time Groww Connected row added (operator parity
+  directive: "i need the same view display everything even for groww").** The
+  streaming-edge latch above meant a CLOSED-market boot wrote NO Groww row at
+  all (socket connected + 768 subscriptions, zero signals). The bridge now
+  ALSO emits ONE `Connected` row (source `groww_subscribed`, reason "socket
+  connected + subscribed — awaiting first tick") AT SOCKET-CONNECT time — on
+  the first observed sidecar `subscribed`/`streaming` status per connected
+  episode, edge-latched by `GrowwAuditLatches::boot_connect_announced`
+  (re-armed only on a genuine disconnect falling edge: feed disable / bridge
+  death — never per poll turn or reconnect attempt). The EXISTING
+  first-streaming-tick rising-edge row (source `groww_sidecar` /
+  `groww_resumed`, reason "groww streaming") is KEPT UNCHANGED as the
+  streaming confirmation — the boot-time row is ADDITIVE; the two are
+  distinguished by `source`/`reason`, and the companion Telegram ping
+  (`FeedConnectedAwaitingTicks`) keeps saying "awaiting first tick" so
+  socket-connected is never presented as streaming (the
+  `groww-second-feed-scope-2026-06-19.md` §5 honest-envelope split —
+  CAPTURE vs UPSTREAM, connected ≠ streaming — still holds). Same
+  best-effort `try_send`; a write failure is still AUDIT-WS-01.
 
 ---
 
