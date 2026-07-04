@@ -272,6 +272,87 @@ pub fn index_constituency_migration_should_run(marker_path: &std::path::Path) ->
     !marker_path.exists()
 }
 
+/// Ordering gate for the one-shot ts-pin TRUNCATE migration (FIX 13a,
+/// 2026-07-04).
+///
+/// `TRUNCATE TABLE index_constituency` wipes ALL rows — QuestDB has no
+/// row-level `DELETE ... WHERE feed='dhan'`, so the migration cannot be
+/// feed-scoped. The Groww shared-master writer persists `feed='groww'` rows
+/// into the SAME table from an unordered fire-and-forget boot spawn, so
+/// without ordering the migration could wipe another feed's just-written
+/// rows. Writers of OTHER feeds await this gate (bounded) before their
+/// `index_constituency` append; the migration marks it complete on EVERY
+/// exit path (ran / skipped-via-marker / failed — the failure case is safe
+/// because the marker is not written and the NEXT boot both re-truncates
+/// and re-persists, DEDUP-idempotent).
+///
+/// Instance-testable struct + one process-wide static accessor
+/// ([`index_constituency_migration_gate`]) so unit tests never share global
+/// state.
+pub struct MigrationGate {
+    done: std::sync::atomic::AtomicBool,
+    notify: tokio::sync::Notify,
+}
+
+impl MigrationGate {
+    /// Fresh, un-marked gate.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            done: std::sync::atomic::AtomicBool::new(false),
+            notify: tokio::sync::Notify::new(),
+        }
+    }
+
+    /// Mark the migration COMPLETE (ran, skipped, or failed for this boot)
+    /// and wake every waiter. Idempotent.
+    pub fn mark_complete(&self) {
+        self.done.store(true, std::sync::atomic::Ordering::Release);
+        self.notify.notify_waiters();
+    }
+
+    /// Whether the gate has been marked complete.
+    #[must_use]
+    pub fn is_complete(&self) -> bool {
+        self.done.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Await the gate with a bounded timeout. `true` = gate opened; `false` =
+    /// timed out (the caller proceeds degrade-safe — e.g. a Groww-only boot
+    /// never runs the Dhan-lane migration, so the truncate cannot fire and
+    /// proceeding is CORRECT). Registration-before-recheck ordering makes the
+    /// `notify_waiters` wake race-free.
+    pub async fn wait(&self, timeout: Duration) -> bool {
+        if self.is_complete() {
+            return true;
+        }
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let notified = self.notify.notified();
+            if self.is_complete() {
+                return true;
+            }
+            if tokio::time::timeout_at(deadline, notified).await.is_err() {
+                return self.is_complete();
+            }
+        }
+    }
+}
+
+impl Default for MigrationGate {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// The process-wide ts-pin migration gate instance (`OnceLock` accessor
+/// convention, mirroring `http_client::shared_probe_client`).
+#[must_use]
+pub fn index_constituency_migration_gate() -> &'static MigrationGate {
+    static GATE: std::sync::OnceLock<MigrationGate> = std::sync::OnceLock::new();
+    GATE.get_or_init(MigrationGate::new)
+}
+
 /// One-time, marker-gated `TRUNCATE TABLE index_constituency` to clear the
 /// legacy day-floored rows accumulated before the `ts`-pin fix.
 ///
@@ -295,9 +376,19 @@ pub fn index_constituency_migration_should_run(marker_path: &std::path::Path) ->
 /// niftyindices/Dhan CSV on every boot, so clearing it loses no record that
 /// was not already reproducible (SEBI-safe, same current-state model as
 /// `instrument_lifecycle`).
+/// FIX 13a (2026-07-04): outer wrapper — the inner body carries the real
+/// logic; the wrapper marks the [`index_constituency_migration_gate`]
+/// complete on EVERY exit path (a future early return in the body can never
+/// forget to open the gate for the waiting Groww writer).
 // WIRING-EXEMPT: boot wiring lives in crates/app/src/index_constituency_boot.rs before the normal write.
-// TEST-EXEMPT: network I/O orchestration (live QuestDB TRUNCATE) — the pure marker-gate predicate `index_constituency_migration_should_run` is unit-tested.
+// TEST-EXEMPT: network I/O orchestration (live QuestDB TRUNCATE) — the pure marker-gate predicate `index_constituency_migration_should_run` + the `MigrationGate` primitives are unit-tested.
 pub async fn migrate_index_constituency_truncate_once(questdb_config: &QuestDbConfig) {
+    migrate_index_constituency_truncate_once_inner(questdb_config).await;
+    index_constituency_migration_gate().mark_complete();
+}
+
+// TEST-EXEMPT: network I/O orchestration (live QuestDB TRUNCATE) — see the public wrapper above.
+async fn migrate_index_constituency_truncate_once_inner(questdb_config: &QuestDbConfig) {
     let marker_path = std::path::Path::new(INDEX_CONSTITUENCY_TS_PIN_MARKER_PATH);
     if !index_constituency_migration_should_run(marker_path) {
         tracing::debug!(
@@ -679,5 +770,51 @@ mod tests {
         );
         // The via_isin field still carries the resolution flag.
         assert!(line.contains("via_isin=t"), "got: {line}");
+    }
+
+    // ── FIX 13a: MigrationGate primitives (instance-scoped — no global state) ──
+
+    #[tokio::test]
+    async fn test_migration_gate_wait_returns_after_mark() {
+        let gate = MigrationGate::new();
+        gate.mark_complete();
+        assert!(gate.wait(std::time::Duration::from_millis(10)).await);
+    }
+
+    #[tokio::test]
+    async fn test_migration_gate_times_out_when_not_marked() {
+        let gate = MigrationGate::new();
+        // Short real timeout (50ms) — bounded, deterministic false.
+        assert!(!gate.wait(std::time::Duration::from_millis(50)).await);
+    }
+
+    #[tokio::test]
+    async fn test_migration_gate_wakes_concurrent_waiter() {
+        let gate = std::sync::Arc::new(MigrationGate::new());
+        let waiter = {
+            let gate = std::sync::Arc::clone(&gate);
+            tokio::spawn(async move { gate.wait(std::time::Duration::from_secs(5)).await })
+        };
+        tokio::task::yield_now().await;
+        gate.mark_complete();
+        assert!(waiter.await.unwrap_or(false), "waiter must see the mark");
+    }
+
+    #[test]
+    fn test_migration_gate_is_complete_flag() {
+        let gate = MigrationGate::default();
+        assert!(!gate.is_complete());
+        gate.mark_complete();
+        assert!(gate.is_complete());
+        // Idempotent re-mark.
+        gate.mark_complete();
+        assert!(gate.is_complete());
+    }
+
+    #[test]
+    fn test_migration_gate_static_accessor_is_stable() {
+        let a = index_constituency_migration_gate() as *const MigrationGate;
+        let b = index_constituency_migration_gate() as *const MigrationGate;
+        assert_eq!(a, b, "accessor must return the same process-wide instance");
     }
 }

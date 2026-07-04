@@ -53,6 +53,39 @@ re-emits (DEDUP UPSERT KEYS). `dry_run` skips the emission (§27 isolation). The
 diff/parser/builders are unit-tested; the live diff-vs-yesterday needs a real QuestDB carrying
 prior-day rows (boot-exercised).
 
+### 2026-07-04 — boot-parity hardening (FIX 13): readiness gate + bounded retry + truncate ordering gate
+
+Three hardening changes landed 2026-07-04 (branch `claude/groww-boot-parity-hardening`):
+
+1. **Truncate ordering gate (FIX 13a).** The Dhan-lane one-shot ts-pin migration runs
+   `TRUNCATE TABLE index_constituency` — QuestDB has NO row-level `DELETE ... WHERE feed='dhan'`,
+   so the migration cannot be feed-scoped and could wipe just-written `feed='groww'` rows (both
+   were unordered fire-and-forget boot spawns). A `MigrationGate` (AtomicBool + tokio Notify,
+   `index_constituency_persistence::index_constituency_migration_gate()`) is now marked complete
+   on EVERY migration exit path (outer-wrapper pattern), the migration itself moved to the TOP of
+   `persist_index_constituency_mapping` (before the niftyindices CSV fetch, so the gate opens on
+   every boot path), and `persist_groww_instruments` awaits the gate (bounded 120s) before its
+   `index_constituency` append. A Groww-only boot (Dhan lane OFF → migration never spawns) times
+   out once and proceeds — correct, since no truncate can run in that mode. Ratchets:
+   `ratchet_migration_runs_before_csv_fetch` (app), `ratchet_constituency_append_waits_for_migration_gate`
+   (core), `MigrationGate` unit tests (storage).
+2. **Readiness gate + bounded retry (FIX 13b).** `persist_groww_instruments` first runs a QUIET
+   QuestDB readiness probe (`SELECT 1` via `shared_probe_client`, 3 attempts, 5s backoff —
+   deliberately NOT `wait_for_questdb_ready`, which emits BOOT-01/02 pages reserved for the boot
+   path). A probe that never succeeds degrades with the SAME GROWW-MASTER-01 contract under the
+   NEW `stage="readiness"` label on `tv_groww_master_persist_errors_total`. Each append stage
+   (`lifecycle`, `constituency`) then gets bounded retry — 3 attempts, 2s/4s backoff — with the
+   final failure keeping the exact prior degrade-safe semantics (error + counter +
+   continue/return; activation and the live feed are never blocked). Triage is unchanged; a
+   `readiness` stage rate means QuestDB was down at activation time — the next boot/activation
+   re-runs idempotently.
+3. **Boot Telegram Groww counts (FIX 13c).** `activate_groww_lane`'s watch-set `Ok(set)` arm now
+   calls `feed_health.set_subscribed(Feed::Groww, resolved_stocks, indices)` at activation time
+   (mirror of the Dhan subscription-plan call in main.rs), so the boot/readiness Telegram feed
+   lines and the /feeds page show real Groww counts before the sidecar's first status report
+   (which remains authoritative — idempotent overwrite). Ratchet:
+   `ratchet_activation_sets_groww_subscribed_counts`.
+
 ---
 
 ## §1. GROWW-MASTER-01 — shared-master persist failed
