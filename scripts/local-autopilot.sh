@@ -44,6 +44,12 @@ PROBE_TIMEOUT_MIN="${PROBE_TIMEOUT_MIN:-20}"
 EOD_STOP_IST="${EOD_STOP_IST:-15:35}"
 CAFFEINATE_UNTIL_IST="${CAFFEINATE_UNTIL_IST:-15:45}"
 MONITOR_INTERVAL_SECS="${MONITOR_INTERVAL_SECS:-60}"
+# B2: the 08:55 robot's boot chain (git/Docker/disk/database) gets a bounded
+# retry on transient failure — every BOOT_RETRY_INTERVAL_SECS until
+# BOOT_RETRY_DEADLINE_IST, one Telegram on the first failure. Previously any
+# single blip at 08:55 killed the whole trading day's capture.
+BOOT_RETRY_DEADLINE_IST="${BOOT_RETRY_DEADLINE_IST:-09:10}"
+BOOT_RETRY_INTERVAL_SECS="${BOOT_RETRY_INTERVAL_SECS:-300}"
 # Mid-session disk re-check cadence: every N monitor iterations (default
 # 30 × 60s = ~30 min). Edge-latched Telegram — one warn per low-disk episode.
 DISK_RECHECK_ITERS="${DISK_RECHECK_ITERS:-30}"
@@ -518,6 +524,95 @@ manual_stop_during_probe() {
   ((m > s + g))
 }
 
+# ── FIX 10 (PUSH B): Monday-morning robustness — pure helpers ───────────────
+
+# boot_retry_should_retry <secs_until_deadline> → rc 0 when a failed boot
+# chain should be retried (deadline not yet reached). B2: a transient
+# 08:55 failure (network blip, Docker still waking, database slow) must
+# not kill the whole trading day — retry every 5 min until 09:10 IST.
+boot_retry_should_retry() {
+  case "${1:-}" in '' | *[!0-9]*) return 1 ;; esac
+  (("$1" > 0))
+}
+
+# pid_cmdline_is_tickvault <ps command line> → rc 0 when the process is our
+# release binary. B5: a pidfile pid can be RECYCLED by macOS to a totally
+# different program after a crash — adopt/kill must never touch a foreign
+# process.
+pid_cmdline_is_tickvault() {
+  case "${1:-}" in *target/release/tickvault*) return 0 ;; *) return 1 ;; esac
+}
+
+# etime_to_secs <ps -o etime= value> → elapsed seconds on stdout, or empty
+# when unparseable (caller then SKIPS the start-time plausibility check —
+# fail-open on the time leg; the cmdline check above remains mandatory).
+# Formats: mm:ss, hh:mm:ss, dd-hh:mm:ss all handled.
+etime_to_secs() {
+  local e="${1:-}" d=0 h=0 m=0 s=0 rest v
+  if [ -z "$e" ]; then
+    echo ""
+    return 0
+  fi
+  case "$e" in
+  *-*)
+    d="${e%%-*}"
+    rest="${e#*-}"
+    ;;
+  *) rest="$e" ;;
+  esac
+  local IFS=':'
+  # shellcheck disable=SC2086
+  set -- $rest
+  case $# in
+  3)
+    h=$1 m=$2 s=$3
+    ;;
+  2)
+    m=$1 s=$2
+    ;;
+  1) s=$1 ;;
+  *)
+    echo ""
+    return 0
+    ;;
+  esac
+  for v in "$d" "$h" "$m" "$s"; do
+    case "$v" in '' | *[!0-9]*)
+      echo ""
+      return 0
+      ;;
+    esac
+  done
+  echo $((10#$d * 86400 + 10#$h * 3600 + 10#$m * 60 + 10#$s))
+}
+
+# pid_start_plausible <proc_start_epoch> <pidfile_mtime_epoch> → rc 0 when
+# the process could genuinely be the one the pidfile points at: it started
+# AT/BEFORE the pidfile write (+60s clock slack). A recycled pid always
+# starts AFTER the pidfile was written. Garbage → rc 1 (fail-safe: treat
+# as not-ours; the launcher then treats it as no-app).
+pid_start_plausible() {
+  case "${1:-}" in '' | *[!0-9]*) return 1 ;; esac
+  case "${2:-}" in '' | *[!0-9]*) return 1 ;; esac
+  (("$1" <= "$2" + 60))
+}
+
+# questdb_owner_verdict <docker inspect state string> → ok|foreign|not_running.
+# B6: "port 9000 answers" is NOT proof OUR database is up — any local
+# process could hold the port. Empty state = the tv-questdb container does
+# not even exist while something answers → foreign responder.
+questdb_owner_verdict() {
+  local s="${1:-}"
+  if [ -z "$s" ]; then
+    echo foreign
+    return 0
+  fi
+  case "$s" in
+  running*) echo ok ;;
+  *) echo not_running ;;
+  esac
+}
+
 # ── FIX 9: one-shot probe-then-run marker (two-buttons-forever) ─────────────
 
 # probe_once_decision <marker_date> <today> <stamp_exists 0|1> → run|skip.
@@ -752,8 +847,52 @@ export_compose_creds() {
 
 # ── Service primitives (shared by autopilot + manual start/stop) ───────────
 
+# file_mtime_epoch <file> → mtime as epoch seconds (empty when unreadable).
+# macOS (stat -f) first, Linux/CI (stat -c) fallback.
+file_mtime_epoch() {
+  stat -f %m "${1:-}" 2>/dev/null || stat -c %Y "${1:-}" 2>/dev/null || echo ""
+}
+
+# B5: PID-reuse guard. A pidfile pid that a crashed launcher left behind
+# can be RECYCLED by the OS to a completely different program — blind
+# kill -0 then adopted/killed a FOREIGN process. pid_is_our_app verifies
+# (a) the pid is alive, (b) its command line IS the tickvault release
+# binary, and (c) when a pidfile mtime is supplied, the process started
+# AT/BEFORE the pidfile write (a recycled pid always starts after).
+# Foreign pid → rc 1 (treat as no-app) + a once-per-episode Telegram via a
+# marker file (a variable latch would be lost in command-substitution
+# subshells). NEVER kills anything itself.
+FOREIGN_PID_MARK="$AUTOPILOT_DIR/foreign-pid-warned"
+pid_is_our_app() { # $1 = pid, $2 = pidfile mtime epoch (optional)
+  local pid="${1:-}" mtime="${2:-}" cmd et secs start
+  case "$pid" in '' | *[!0-9]*) return 1 ;; esac
+  kill -0 "$pid" 2>/dev/null || return 1
+  cmd=$(ps -o command= -p "$pid" 2>/dev/null || true)
+  if ! pid_cmdline_is_tickvault "$cmd"; then
+    log "pid $pid from the pidfile is NOT the tickvault app (it is: ${cmd:-unknown}) — treating as no-app; never touching a foreign program"
+    if [ ! -f "$FOREIGN_PID_MARK" ]; then
+      touch "$FOREIGN_PID_MARK" 2>/dev/null || true
+      tg "⚠️ The app's saved process number now belongs to a DIFFERENT program (the app is not actually running). Treating it as stopped — the other program is left alone."
+    fi
+    return 1
+  fi
+  if [ -n "$mtime" ]; then
+    et=$(ps -o etime= -p "$pid" 2>/dev/null | tr -d ' ' || true)
+    secs=$(etime_to_secs "$et")
+    if [ -n "$secs" ]; then
+      start=$(($(date +%s) - secs))
+      if ! pid_start_plausible "$start" "$mtime"; then
+        log "pid $pid started AFTER the pidfile was written (recycled pid) — treating as no-app"
+        return 1
+      fi
+    fi
+  fi
+  return 0
+}
+
 app_alive() {
-  [ -f "$APP_PIDFILE" ] && kill -0 "$(cat "$APP_PIDFILE")" 2>/dev/null
+  [ -f "$APP_PIDFILE" ] || return 1
+  pid_is_our_app "$(cat "$APP_PIDFILE" 2>/dev/null || true)" "$(file_mtime_epoch "$APP_PIDFILE")"
 }
 
 docker_alive() { docker info >/dev/null 2>&1; }
@@ -785,16 +924,32 @@ questdb_container_state() {
 
 ensure_questdb() {
   export_compose_creds # FIX 5.3 — compose interpolates TV_QUESTDB_PG_* env
-  docker compose -f deploy/docker/docker-compose.yml \
-    -f deploy/docker/docker-compose.local.yml up -d tv-questdb >>"$(current_log)" 2>&1
+  # B6: a compose failure must not be swallowed — log it loudly and keep
+  # probing (the container may already be running from an earlier start),
+  # but the timeout message will name the compose failure as the lead cause.
+  local compose_failed=0
+  if ! docker compose -f deploy/docker/docker-compose.yml \
+    -f deploy/docker/docker-compose.local.yml up -d tv-questdb >>"$(current_log)" 2>&1; then
+    compose_failed=1
+    log "docker compose up for the database FAILED (details above in this log) — still probing in case the container is already running"
+  fi
   # Self-heal (2026-07-04): a degraded container (unhealthy/exited/dead/
   # paused — e.g. after a hard Mac sleep or an out-of-memory kill) gets ONE
   # automatic `docker restart` if the database has not answered after ~30s.
   # Zero operator action — Stop→Start (or just Start) recovers it.
-  local i restarted=0 state
+  local i restarted=0 state verdict
   for i in $(seq 1 24); do
     if curl -sf -G "$QUESTDB_HTTP/exec" --data-urlencode "query=select 1" >/dev/null 2>&1; then
-      log "QuestDB HTTP ready"
+      # B6: verify the responder IS our tv-questdb container — any local
+      # process could hold port 9000 (a foreign QuestDB, a dev server).
+      # Writing the day's capture into a stranger's database is silent loss.
+      verdict="$(questdb_owner_verdict "$(questdb_container_state)")"
+      if [ "$verdict" != "ok" ]; then
+        log "port answers but the tv-questdb container is '$verdict' — a foreign program is on the database port"
+        tg "🆘 Something else is answering on the database port and it is NOT our database container. Quit that other program (check Docker Desktop / anything using port 9000), then double-click Start TickVault."
+        return 1
+      fi
+      log "QuestDB HTTP ready (tv-questdb container confirmed running)"
       return 0
     fi
     state="$(questdb_container_state)"
@@ -806,7 +961,11 @@ ensure_questdb() {
     fi
     sleep 5
   done
-  tg "🆘 The database did not start within 2 minutes. Double-click Stop TickVault, wait 10 seconds, then double-click Start TickVault. If it still fails, restart the Mac and double-click Start TickVault again."
+  if ((compose_failed)); then
+    tg "🆘 Docker could not bring the database container up (the compose command itself failed) and the database never answered. Open Docker Desktop, make sure it is running, then double-click Start TickVault."
+  else
+    tg "🆘 The database did not start within 2 minutes. Double-click Stop TickVault, wait 10 seconds, then double-click Start TickVault. If it still fails, restart the Mac and double-click Start TickVault again."
+  fi
   return 1
 }
 
@@ -1081,6 +1240,7 @@ start_app_inner() { # $1 = label for the log
   fi
   nohup ./target/release/tickvault >>"$(current_log)" 2>&1 &
   echo $! >"$APP_PIDFILE"
+  rm -f "$FOREIGN_PID_MARK" 2>/dev/null || true # B5: re-arm the foreign-pid alert
   log "app launched ($1) — pid $(cat "$APP_PIDFILE"), log $ONE_FILE_LINK → $(current_log)"
   # FIX 5.1 — early-exit detection: an app that dies within ~5s (port clash,
   # config error) gets its last log lines SHOWN with a plain-English message
@@ -1287,25 +1447,45 @@ stop_app() {
 }
 
 stop_app_inner() {
-  if ! app_alive; then
-    log "app not running — nothing to stop"
-    rm -f "$APP_PIDFILE"
-    return 0
-  fi
-  local pid
-  pid=$(cat "$APP_PIDFILE")
-  log "stopping app (pid $pid) gracefully..."
-  kill -TERM "$pid" 2>/dev/null || true
-  local i
-  for i in $(seq 1 12); do
-    kill -0 "$pid" 2>/dev/null || break
-    sleep 5
-  done
-  if kill -0 "$pid" 2>/dev/null; then
-    log "app did not exit in 60s — force kill"
-    kill -KILL "$pid" 2>/dev/null || true
+  # B5: app_alive now verifies the pidfile pid IS our binary (cmdline +
+  # start-time plausibility) — a recycled/foreign pid is treated as no-app
+  # and is NEVER killed. The pidfile-blind sweep below still finds and
+  # stops the REAL app if one is running without a (valid) pidfile.
+  if app_alive; then
+    local pid
+    pid=$(cat "$APP_PIDFILE")
+    log "stopping app (pid $pid) gracefully..."
+    kill -TERM "$pid" 2>/dev/null || true
+    local i
+    for i in $(seq 1 12); do
+      kill -0 "$pid" 2>/dev/null || break
+      sleep 5
+    done
+    if kill -0 "$pid" 2>/dev/null; then
+      log "app did not exit in 60s — force kill"
+      kill -KILL "$pid" 2>/dev/null || true
+    fi
+  else
+    log "no (valid) pidfile app to stop — checking for a stray app process"
   fi
   rm -f "$APP_PIDFILE"
+  # B5: pidfile-blind sweep — Stop must ALWAYS win. Any remaining tickvault
+  # release binary (crashed launcher's orphan, foreign pidfile case) is
+  # stopped by NAME, so it can never be a stranger's process.
+  local stray w
+  stray="$(find_running_app)"
+  if [ -n "$stray" ]; then
+    log "stray tickvault process (pid $stray) survived the pidfile stop — stopping it by name"
+    pkill -TERM -f 'target/release/tickvault' 2>/dev/null || true
+    for w in $(seq 1 12); do
+      pgrep -f 'target/release/tickvault' >/dev/null 2>&1 || break
+      sleep 5
+    done
+    if pgrep -f 'target/release/tickvault' >/dev/null 2>&1; then
+      log "stray app ignored the polite stop — forcing"
+      pkill -KILL -f 'target/release/tickvault' 2>/dev/null || true
+    fi
+  fi
 }
 
 apply_overlay() { # $1 = groww-scale-test.sh mode (probe|max|...) or "none"
@@ -1507,6 +1687,19 @@ preflight_git() {
   fi
 }
 
+# boot_chain_once — the 08:55 robot's boot-critical prerequisites, one
+# attempt. rc 1 on any gating failure so cmd_run's B2 bounded retry loop
+# can try again (preflight_git + the VM-memory check are advisory and
+# never gate).
+boot_chain_once() {
+  preflight_git
+  ensure_docker || return 1
+  check_docker_vm_memory
+  disk_free_ok || return 1
+  ensure_questdb || return 1
+  return 0
+}
+
 wait_until_ist() { # $1 = "HH:MM"; returns immediately if already past
   local secs
   secs=$(secs_until "$1" "$(ist_hms)")
@@ -1535,7 +1728,11 @@ monitor_until_eod() {
     alive=0
     app_alive && alive=1
     manual=0
-    manual_stop_active "$MANUAL_STOP_MARKER" "$TODAY" && manual=1
+    # B3: recompute the IST date PER ITERATION (mirror the per-write
+    # daily_app_log pattern) — the $TODAY snapshot from script start goes
+    # stale across IST midnight in this long-lived loop, which blinded the
+    # loop to a Stop pressed after midnight.
+    manual_stop_active "$MANUAL_STOP_MARKER" "$(ist_date)" && manual=1
     # Periodic disk re-check (2026-07-04 resilience fix): the boot-time
     # disk_free_ok gate cannot see a disk that fills MID-SESSION (ticks +
     # spill + logs all grow). Re-probe every DISK_RECHECK_ITERS iterations;
@@ -1622,11 +1819,31 @@ cmd_run() {
     exit 0
   fi
 
-  preflight_git
-  ensure_docker || exit 1
-  check_docker_vm_memory
-  disk_free_ok || exit 1
-  ensure_questdb || exit 1
+  # B2: bounded boot retry — a transient failure at 08:55 (network blip,
+  # Docker still waking after login, database slow) retries every
+  # BOOT_RETRY_INTERVAL_SECS until BOOT_RETRY_DEADLINE_IST instead of
+  # killing the whole trading day. Telegram fires ONCE on the first
+  # failure; a final give-up page fires if the deadline passes.
+  local boot_ok=0 boot_warned=0
+  while :; do
+    if boot_chain_once; then
+      boot_ok=1
+      break
+    fi
+    if ! boot_retry_should_retry "$(secs_until "$BOOT_RETRY_DEADLINE_IST" "$(ist_hms)")"; then
+      break
+    fi
+    if ((boot_warned == 0)); then
+      boot_warned=1
+      tg "⚠️ Morning start hit a temporary problem (network / Docker / database). Retrying automatically every $((BOOT_RETRY_INTERVAL_SECS / 60)) minutes until $BOOT_RETRY_DEADLINE_IST — no action needed yet."
+    fi
+    log "boot chain failed — retrying in ${BOOT_RETRY_INTERVAL_SECS}s (deadline $BOOT_RETRY_DEADLINE_IST IST)"
+    sleep "$BOOT_RETRY_INTERVAL_SECS"
+  done
+  if ((boot_ok == 0)); then
+    tg "🆘 Morning start could NOT get the basics up (Docker / disk space / database) by $BOOT_RETRY_DEADLINE_IST. Open Docker Desktop and check disk space, then double-click Start TickVault."
+    exit 1
+  fi
   start_caffeinate
 
   if [ "$day" = "scale" ]; then
@@ -1637,7 +1854,9 @@ cmd_run() {
     wait_until_ist "$PROBE_POLL_START_IST"
     local verdict="" waited=0 timeout=$((PROBE_TIMEOUT_MIN * 60))
     while ((waited < timeout)); do
-      if manual_stop_active "$MANUAL_STOP_MARKER" "$TODAY"; then
+      # B3: fresh IST date inside the polling loop (same rule as the
+      # monitor loop — never trust the script-start $TODAY in a loop).
+      if manual_stop_active "$MANUAL_STOP_MARKER" "$(ist_date)"; then
         log "manual stop during probe wait — standing down"
         monitor_until_eod
         eod_summary "$day"
@@ -1687,7 +1906,8 @@ cmd_run() {
   monitor_until_eod
 
   # ── 15:35 IST: graceful end of day (skip app-stop if manual stop won). ──
-  if ! manual_stop_active "$MANUAL_STOP_MARKER" "$TODAY"; then
+  # B3: fresh IST date — this check runs AFTER the hours-long monitor loop.
+  if ! manual_stop_active "$MANUAL_STOP_MARKER" "$(ist_date)"; then
     stop_app
     bash scripts/groww-scale-test.sh clean >>"$(current_log)" 2>&1 || true
   fi

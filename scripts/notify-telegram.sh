@@ -82,9 +82,27 @@ fi
 # ---------------------------------------------------------------------------
 # Send Telegram message
 # ---------------------------------------------------------------------------
+# FIX 10 B4: build the JSON payload with a REAL JSON encoder (jq or
+# python3), never string interpolation — a message containing a double
+# quote, backslash, or newline (log tails do, constantly) previously
+# produced invalid JSON and the send silently failed. parse_mode is
+# dropped entirely: messages are plain text (HTML mode also broke on `<`
+# characters in log tails).
+if command -v jq > /dev/null 2>&1; then
+    PAYLOAD=$(jq -cn --arg chat_id "${CHAT_ID}" --arg text "${MESSAGE}" \
+        '{chat_id: $chat_id, text: $text}')
+elif command -v python3 > /dev/null 2>&1; then
+    PAYLOAD=$(python3 -c 'import json, sys; print(json.dumps({"chat_id": sys.argv[1], "text": sys.argv[2]}))' \
+        "${CHAT_ID}" "${MESSAGE}")
+else
+    echo "ERROR: neither jq nor python3 available to JSON-encode the message — Telegram NOT sent" >&2
+    echo "  Message was: ${MESSAGE}" >&2
+    exit 2
+fi
+
 RESPONSE=$(curl -s -X POST "${TELEGRAM_API}/bot${BOT_TOKEN}/sendMessage" \
     -H "Content-Type: application/json" \
-    -d "{\"chat_id\": \"${CHAT_ID}\", \"text\": \"${MESSAGE}\", \"parse_mode\": \"HTML\"}")
+    -d "${PAYLOAD}")
 
 # Check response
 OK=$(echo "${RESPONSE}" | python3 -c "import sys,json; print(json.load(sys.stdin).get('ok', False))" 2>/dev/null)

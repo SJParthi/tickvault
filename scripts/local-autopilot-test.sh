@@ -311,6 +311,36 @@ t "settings set: file untouched on failure" '{"cpus": 8}' "$(cat "$TMP/settings-
 t "settings set: garbage mib → rc 1" "1" "$(docker_settings_set_mem "$TMP/settings.json" memoryMiB tenGB >/dev/null 2>&1 && echo 0 || echo 1)"
 t "settings set: missing file → rc 1" "1" "$(docker_settings_set_mem "$TMP/settings-absent.json" memoryMiB 10240 >/dev/null 2>&1 && echo 0 || echo 1)"
 
+# ── FIX 10 PUSH B: Monday-morning robustness pure helpers ───────────────────
+# B2: bounded boot retry (retry while the 09:10 deadline has not passed)
+t "boot retry: 300s left → retry" "0" "$(boot_retry_should_retry 300 && echo 0 || echo 1)"
+t "boot retry: deadline passed (0s) → give up" "1" "$(boot_retry_should_retry 0 && echo 0 || echo 1)"
+t "boot retry: garbage → give up (fail-safe)" "1" "$(boot_retry_should_retry abc && echo 0 || echo 1)"
+t "boot retry: empty → give up (fail-safe)" "1" "$(boot_retry_should_retry '' && echo 0 || echo 1)"
+
+# B5: PID-reuse guard (cmdline match + elapsed-time parse + start plausibility)
+t "pid cmdline: our binary → ours" "0" "$(pid_cmdline_is_tickvault "./target/release/tickvault" && echo 0 || echo 1)"
+t "pid cmdline: absolute path → ours" "0" "$(pid_cmdline_is_tickvault "/Users/op/tickvault/target/release/tickvault" && echo 0 || echo 1)"
+t "pid cmdline: foreign program → not ours" "1" "$(pid_cmdline_is_tickvault "/usr/bin/python3 something.py" && echo 0 || echo 1)"
+t "pid cmdline: empty → not ours" "1" "$(pid_cmdline_is_tickvault "" && echo 0 || echo 1)"
+t "etime mm:ss" "125" "$(etime_to_secs 02:05)"
+t "etime hh:mm:ss" "3725" "$(etime_to_secs 01:02:05)"
+t "etime dd-hh:mm:ss" "93784" "$(etime_to_secs 1-02:03:04)"
+t "etime leading zeros safe (08:09)" "489" "$(etime_to_secs 08:09)"
+t "etime garbage → empty (skip plausibility check)" "" "$(etime_to_secs abc)"
+t "etime empty → empty" "" "$(etime_to_secs '')"
+t "pid start: before pidfile write → plausible" "0" "$(pid_start_plausible 1000000 1000300 && echo 0 || echo 1)"
+t "pid start: within 60s slack after write → plausible" "0" "$(pid_start_plausible 1000050 1000000 && echo 0 || echo 1)"
+t "pid start: 100s after pidfile write → recycled pid" "1" "$(pid_start_plausible 1000100 1000000 && echo 0 || echo 1)"
+t "pid start: garbage start → fail-safe not-ours" "1" "$(pid_start_plausible abc 1000000 && echo 0 || echo 1)"
+t "pid start: garbage mtime → fail-safe not-ours" "1" "$(pid_start_plausible 1000000 '' && echo 0 || echo 1)"
+
+# B6: database-port ownership (docker inspect state → verdict)
+t "qdb owner: running → ok" "ok" "$(questdb_owner_verdict "running healthy")"
+t "qdb owner: running no-health → ok" "ok" "$(questdb_owner_verdict "running ")"
+t "qdb owner: empty (no container, port answers) → foreign" "foreign" "$(questdb_owner_verdict "")"
+t "qdb owner: exited container → not_running" "not_running" "$(questdb_owner_verdict "exited unhealthy")"
+
 echo
 echo "local-autopilot pure-logic tests: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

@@ -48,6 +48,32 @@ execute_ddl() {
 }
 
 # ---------------------------------------------------------------------------
+# FIX 10 B1: never re-key an EXISTING table's dedup.
+# An `ALTER TABLE ... DEDUP ENABLE UPSERT KEYS(...)` with a DIFFERENT
+# (narrower) key set silently REPLACES the key — the live risk this closes:
+# this script's stale 3-column ticks key would have DOWNGRADED the app's
+# canonical 5-column key (ts, security_id, segment, capture_seq, feed),
+# collapsing distinct Dhan/Groww ticks into one row (silent data loss).
+# Policy: a dedup key is applied ONLY when the table has none yet; a table
+# that already carries a key (the app's boot DDL owns several) is SKIPPED.
+# ---------------------------------------------------------------------------
+table_dedup_enabled() { # $1 = table name → rc 0 when dedup is already enabled
+    local resp
+    resp=$(curl -s --max-time 10 -G "${QUESTDB_URL}" \
+        --data-urlencode "query=select dedup from tables() where table_name='${1}'" 2>/dev/null) || return 1
+    echo "${resp}" | grep -q '"dataset":\[\[true\]\]'
+}
+
+apply_dedup_if_absent() { # $1 = label, $2 = table name, $3 = ALTER sql
+    if table_dedup_enabled "$2"; then
+        echo "  SKIP  $1 (dedup already enabled — never re-keying an existing table)"
+        SKIP=$((SKIP + 1))
+        return 0
+    fi
+    execute_ddl "$1" "$3"
+}
+
+# ---------------------------------------------------------------------------
 # Wait for QuestDB to be ready
 # ---------------------------------------------------------------------------
 wait_for_questdb() {
@@ -79,9 +105,14 @@ create_base_tables() {
     echo "  Phase 1: Base Tables"
     echo "  --------------------"
 
-    # 1. ticks
-    execute_ddl "ticks" \
-        "CREATE TABLE IF NOT EXISTS ticks (segment SYMBOL, security_id LONG, ltp DOUBLE, open DOUBLE, high DOUBLE, low DOUBLE, close DOUBLE, volume LONG, oi LONG, avg_price DOUBLE, last_trade_qty LONG, total_buy_qty LONG, total_sell_qty LONG, exchange_timestamp LONG, received_at TIMESTAMP, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY HOUR WAL"
+    # 1. ticks — APP-OWNED, SKIPPED (FIX 10 B1). The app's boot DDL
+    # (crates/storage/src/tick_persistence.rs) owns the canonical ticks
+    # schema (feed + payload_hash + capture_seq columns) and its 5-column
+    # DEDUP key (ts, security_id, segment, capture_seq, feed). This
+    # script's stale column set + 3-column key must never touch it —
+    # creating here forces a wrong-key window until the app boots.
+    echo "  SKIP  ticks (app-owned — the app's boot DDL creates it with the canonical schema + dedup key)"
+    SKIP=$((SKIP + 1))
 
     # 2. market_depth
     execute_ddl "market_depth" \
@@ -150,49 +181,53 @@ apply_dedup_keys() {
     echo "  Phase 2: DEDUP Keys"
     echo "  -------------------"
 
-    execute_ddl "ticks DEDUP" \
-        "ALTER TABLE ticks DEDUP ENABLE UPSERT KEYS(ts, security_id, segment)"
+    # FIX 10 B1: ticks DEDUP retired here — app-owned (see Phase 1 note).
+    echo "  SKIP  ticks DEDUP (app-owned canonical key — this script never touches it)"
+    SKIP=$((SKIP + 1))
 
-    execute_ddl "market_depth DEDUP" \
+    # FIX 10 B1: every remaining key goes through apply_dedup_if_absent —
+    # a table that ALREADY carries a dedup key (the app's boot DDL owns
+    # several and may have keyed them wider) is never re-keyed.
+    apply_dedup_if_absent "market_depth DEDUP" market_depth \
         "ALTER TABLE market_depth DEDUP ENABLE UPSERT KEYS(ts, security_id, segment, level)"
 
-    execute_ddl "previous_close DEDUP" \
+    apply_dedup_if_absent "previous_close DEDUP" previous_close \
         "ALTER TABLE previous_close DEDUP ENABLE UPSERT KEYS(ts, security_id, segment)"
 
-    execute_ddl "candles_1s DEDUP" \
+    apply_dedup_if_absent "candles_1s DEDUP" candles_1s \
         "ALTER TABLE candles_1s DEDUP ENABLE UPSERT KEYS(ts, security_id, segment)"
 
     # PR-E (2026-05-26): historical_candles DEDUP retired.
 
-    execute_ddl "instrument_build_metadata DEDUP" \
+    apply_dedup_if_absent "instrument_build_metadata DEDUP" instrument_build_metadata \
         "ALTER TABLE instrument_build_metadata DEDUP ENABLE UPSERT KEYS(timestamp)"
 
-    execute_ddl "fno_underlyings DEDUP" \
+    apply_dedup_if_absent "fno_underlyings DEDUP" fno_underlyings \
         "ALTER TABLE fno_underlyings DEDUP ENABLE UPSERT KEYS(timestamp, underlying_symbol)"
 
-    execute_ddl "derivative_contracts DEDUP" \
+    apply_dedup_if_absent "derivative_contracts DEDUP" derivative_contracts \
         "ALTER TABLE derivative_contracts DEDUP ENABLE UPSERT KEYS(timestamp, underlying_symbol, expiry_date, strike_price, option_type, security_id)"
 
-    execute_ddl "subscribed_indices DEDUP" \
+    apply_dedup_if_absent "subscribed_indices DEDUP" subscribed_indices \
         "ALTER TABLE subscribed_indices DEDUP ENABLE UPSERT KEYS(timestamp, symbol)"
 
-    execute_ddl "nse_holidays DEDUP" \
+    apply_dedup_if_absent "nse_holidays DEDUP" nse_holidays \
         "ALTER TABLE nse_holidays DEDUP ENABLE UPSERT KEYS(ts, name)"
 
-    execute_ddl "index_constituents DEDUP" \
+    apply_dedup_if_absent "index_constituents DEDUP" index_constituents \
         "ALTER TABLE index_constituents DEDUP ENABLE UPSERT KEYS(ts, index_name, symbol)"
 
     # Greeks tables (12-15)
-    execute_ddl "option_greeks DEDUP" \
+    apply_dedup_if_absent "option_greeks DEDUP" option_greeks \
         "ALTER TABLE option_greeks DEDUP ENABLE UPSERT KEYS(ts, security_id, segment)"
 
-    execute_ddl "pcr_snapshots DEDUP" \
+    apply_dedup_if_absent "pcr_snapshots DEDUP" pcr_snapshots \
         "ALTER TABLE pcr_snapshots DEDUP ENABLE UPSERT KEYS(ts, underlying_symbol, expiry_date)"
 
-    execute_ddl "dhan_option_chain_raw DEDUP" \
+    apply_dedup_if_absent "dhan_option_chain_raw DEDUP" dhan_option_chain_raw \
         "ALTER TABLE dhan_option_chain_raw DEDUP ENABLE UPSERT KEYS(ts, security_id, segment)"
 
-    execute_ddl "greeks_verification DEDUP" \
+    apply_dedup_if_absent "greeks_verification DEDUP" greeks_verification \
         "ALTER TABLE greeks_verification DEDUP ENABLE UPSERT KEYS(ts, security_id, segment)"
 
     echo ""
@@ -245,7 +280,7 @@ show_dashboard() {
     echo "  Tables in QuestDB: ${table_count}"
     echo ""
     echo "  ============================================"
-    echo "  Summary: ${PASS} OK / ${FAIL} FAIL"
+    echo "  Summary: ${PASS} OK / ${FAIL} FAIL / ${SKIP} SKIP"
     echo "  ============================================"
 
     if [ "${FAIL}" -gt 0 ]; then
