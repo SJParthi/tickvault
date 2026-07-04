@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# tv-tunnel doctor.sh — verify the Tailscale Funnel exposes all 5 ports
-# and that the tickvault services behind them respond.
+# tv-tunnel doctor.sh — verify the Tailscale Funnel exposes the tickvault
+# API port (3001) and that the service behind it responds.
 #
 # Run on either Mac or AWS. Also usable as `--emit-config` to produce a
 # TOML snippet ready to paste into config/claude-mcp-endpoints.toml.
@@ -36,14 +36,14 @@ HOSTNAME_FQDN="$($TS_BIN status --json 2>/dev/null | awk -F '"' '/"DNSName":/{pr
 [[ -z "$HOSTNAME_FQDN" ]] && { fail_row "tailscale not logged in"; exit 1; }
 
 # Prometheus(9090)/Alertmanager(9093)/Grafana(3000) removed in the CloudWatch-only
-# migration (#O1/#O2/#O3) — the tunnel only fronts QuestDB + the tickvault API now.
-declare -a PORTS=(9000 3001)
+# migration (#O1/#O2/#O3). Security trim 2026-07-04: QuestDB (9000) is
+# intentionally NO LONGER funnelled — auth-less raw SQL stays local-only.
+# The tunnel fronts ONLY the tickvault API (3001, bearer-auth).
+declare -a PORTS=(3001)
 declare -A NAMES=(
-  [9000]="QuestDB HTTP"
   [3001]="tickvault API"
 )
 declare -A PATHS=(
-  [9000]="/"
   [3001]="/health"
 )
 
@@ -52,8 +52,10 @@ if [[ $EMIT_CONFIG -eq 1 ]]; then
   host_dashed="${HOSTNAME_FQDN//./-}"
   profile_name=$([[ "$(uname -s)" == "Darwin" ]] && echo "mac-dev" || echo "aws-prod")
   echo "# Paste under [profiles.${profile_name}] in config/claude-mcp-endpoints.toml"
+  echo "# QuestDB (9000) is no longer funnelled (auth-less raw SQL — local only);"
+  echo "# questdb_url stays a localhost URL usable only on the host itself."
   echo "[profiles.${profile_name}]"
-  echo "questdb_url       = \"https://${HOSTNAME_FQDN}:9000\""
+  echo "questdb_url       = \"http://127.0.0.1:9000\""
   echo "tickvault_api_url = \"https://${HOSTNAME_FQDN}:3001\""
   echo "logs_source       = \"http\""
   echo "logs_dir_local    = \"./data/logs\""

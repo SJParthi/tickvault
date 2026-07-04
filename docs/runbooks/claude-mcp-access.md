@@ -39,7 +39,10 @@ observability access from any Claude session, nothing else works.
 
 After install-mac.sh / install-aws.sh runs:
 - Tailscale Funnel auto-starts on reboot (launchd on Mac, systemd on AWS)
-- Ports 9090/9093/9000/3000/3001 are exposed via stable `.ts.net` URLs
+- Port 3001 (tickvault API, bearer-auth) is exposed via a stable `.ts.net` URL
+  — security trim 2026-07-04: ports 9090/9093/3000 are retired
+  (CloudWatch-only migration) and QuestDB 9000 is intentionally NO LONGER
+  funnelled (auth-less raw SQL — local access only)
 - The URLs never change
 - Write them into `config/claude-mcp-endpoints.toml`, commit, push
 - Every future clone of the repo has working MCP — zero per-session setup
@@ -59,7 +62,7 @@ After install-mac.sh / install-aws.sh runs:
            ↓
 ┌──────────────────────────────────────────────────────────────┐
 │ Tailscale Funnel (stable public URL on .ts.net)              │
-│ mac-hostname.your-tailnet.ts.net:9000  → QuestDB HTTP       │
+│ (QuestDB :9000 no longer funnelled — auth-less SQL, local)   │
 │ mac-hostname.your-tailnet.ts.net:3001  → tickvault API      │
 │                                         ├── /api/debug/logs/summary         │
 │                                         └── /api/debug/logs/jsonl/latest    │
@@ -155,7 +158,9 @@ The script:
 - Launches `tailscale up` (login flow in browser) if not already logged in
 - Verifies Funnel feature is enabled on your tailnet (if not, points you to the admin ACL URL)
 - Installs `~/Library/LaunchAgents/com.tickvault.tunnel.plist`
-- Loads the launchd service, which calls `tailscale funnel --bg 9090 9093 9000 3000 3001`
+- Loads the launchd service, which calls `tailscale funnel --bg 3001`
+  (security trim 2026-07-04: only the bearer-auth tickvault API is funnelled;
+  QuestDB 9000 — auth-less raw SQL — is intentionally NOT funnelled)
 - Probes for the funnel to come up within 30s
 - Prints your stable URLs — paste them into `config/claude-mcp-endpoints.toml`
 
@@ -180,7 +185,8 @@ bash scripts/tv-tunnel/doctor.sh --emit-config
 This prints a TOML block like:
 ```toml
 [profiles.mac-dev]
-questdb_url       = "https://your-mac.tailnet-name.ts.net:9000"
+# QuestDB is no longer funnelled (auth-less raw SQL) — local-only URL.
+questdb_url       = "http://127.0.0.1:9000"
 tickvault_api_url = "https://your-mac.tailnet-name.ts.net:3001"
 logs_source       = "http"
 logs_dir_local    = "./data/logs"
