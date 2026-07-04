@@ -1,6 +1,6 @@
 # Implementation Plan: Tunnel Trim to 3001-Only + /api/debug/* Bearer-Auth Gating
 
-**Status:** APPROVED
+**Status:** VERIFIED
 **Date:** 2026-07-04
 **Approved by:** Parthiban (operator directive, Session A task, 2026-07-04 — verbatim: "trim to only 3001 ... gate the 4 /api/debug/* routes ... behind the existing auth middleware WITHOUT breaking the tickvault-logs MCP read-only contract; router tests for authd-200/unauthd-401")
 
