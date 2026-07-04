@@ -106,6 +106,17 @@ pub async fn persist_index_constituency_mapping(
     trading_date_ist_nanos: i64,
     dry_run: bool,
 ) {
+    // 0. FIX 13a (2026-07-04): ensure the table + run the one-time, marker-gated
+    //    ts-pin TRUNCATE migration FIRST — before the niftyindices CSV fetch —
+    //    so (a) the truncate→write order is preserved (the append happens later
+    //    in this same fn) and (b) the `index_constituency_migration_gate` opens
+    //    regardless of any CSV-fetch/parse/resolve early return below. The
+    //    Groww shared-master writer awaits that gate before persisting its
+    //    `feed='groww'` rows, so the truncate can never wipe another feed's
+    //    just-written rows. The migration marks the gate on EVERY exit path.
+    ensure_index_constituency_table(&questdb).await;
+    migrate_index_constituency_truncate_once(&questdb).await;
+
     // 1. Full constituency map (all ~46 tracked indices) — map-only, best-effort.
     let downloader = match ConstituencyDownloader::new() {
         Ok(d) => d,
@@ -181,13 +192,10 @@ pub async fn persist_index_constituency_mapping(
         })
         .collect();
 
-    // 5. Persist (idempotent UPSERT). Ensure the table first (self-heal), then
-    //    run the one-time, marker-gated ts-pin migration BEFORE the write so the
-    //    order is truncate → write: it clears the legacy day-floored rows once
-    //    (the `ts` is now pinned to epoch 0, so new writes UPSERT in place but
-    //    can't overwrite the old per-day rows). Degrade-safe — never blocks.
-    ensure_index_constituency_table(&questdb).await;
-    migrate_index_constituency_truncate_once(&questdb).await;
+    // 5. Persist (idempotent UPSERT). The table ensure + one-time ts-pin
+    //    migration already ran at step 0 (FIX 13a) — truncate → write order
+    //    holds because this append is later in the same fn. Degrade-safe —
+    //    never blocks.
     match append_index_constituency_rows(&questdb, &ilp_rows).await {
         Ok(()) => {
             info!(
@@ -317,5 +325,27 @@ mod tests {
         let map = map_with(&[]);
         let rows = build_index_constituency_rows(&map, &[]);
         assert!(rows.is_empty());
+    }
+
+    /// FIX 13a ratchet (source-scan, wal_reinject pattern): the one-time
+    /// TRUNCATE migration must run BEFORE the niftyindices CSV fetch inside
+    /// `persist_index_constituency_mapping`, so the migration gate opens on
+    /// every boot path (early CSV-fetch returns included) and the
+    /// truncate→write order can never be inverted by a refactor.
+    #[test]
+    fn ratchet_migration_runs_before_csv_fetch() {
+        let src = include_str!("index_constituency_boot.rs");
+        let migrate = src
+            .find("migrate_index_constituency_truncate_once(&questdb)")
+            .expect("migration call must exist in persist_index_constituency_mapping");
+        let fetch = src
+            .find("build_constituency_map(&downloader")
+            .expect("constituency CSV fetch call must exist");
+        assert!(
+            migrate < fetch,
+            "FIX 13a regression: the ts-pin TRUNCATE migration must be awaited \
+             BEFORE the constituency CSV fetch so the migration gate opens on \
+             every boot path"
+        );
     }
 }
