@@ -158,6 +158,25 @@ the `instance_lock.rs` machinery via the named-lock knob) and was refused:
   prove there is no peer, so the fleet is refused.
 - **Lock lost mid-run** — the fleet-lock heartbeat observed a foreign
   takeover (renewal returned not-owned) and exited after paging.
+- **Renewals stale past TTL** — the heartbeat's SSM renewals failed
+  CONSECUTIVELY for ≥ the full 90s TTL (3 × 30s — e.g. an SSM partition on
+  the lock holder). Escalated ONCE per failure episode (the
+  `consecutive_failures` field): a legitimately booting peer can take the
+  stale slot and run a SECOND fleet while this holder's renewals keep
+  erroring, and the mid-run loss page cannot fire until connectivity
+  recovers — this escalation closes that previously-unpaged window
+  (2026-07-04 adversarial-review MEDIUM fix). The heartbeat keeps retrying
+  after the escalation.
+
+**Delivery boundary (HONEST — no false-OK):** GROWW-SCALE-05 has NO typed
+Telegram `NotificationEvent` variant and NO dedicated CloudWatch alarm yet.
+Every emission is `error!` → the log-sink chain (stdout / app.log /
+errors.log / errors.jsonl) → the generic ERROR→CloudWatch-log routing. At
+the boot-gate stage the deferred Telegram notifier slot is unfilled by
+design, so "pages Critical" here means **log-sink +
+CloudWatch-log-derived alerting only** until a typed NotificationEvent
+lands (tracked follow-up). `mcp__tickvault-logs__tail_errors` is the
+authoritative surface for this code today.
 
 **Consequence (degrade, NOT halt):** the multi-connection fleet + ladder +
 shard bridges are SKIPPED for this boot; the boot falls back to the proven
@@ -183,12 +202,28 @@ The rest of the app keeps running.
 
 **Honest envelope:** the lock gates the FLEET spawn only (smallest safe
 scope) — the single-conn Groww path is NOT gated, so two hosts each running
-single-conn remain possible (pre-existing behavior, unchanged). On process
-death without a clean shutdown the SSM parameter goes stale within the 90s
-TTL and the next boot takes over — the fleet lock relies on TTL self-heal
-rather than the Dhan lock's explicit shutdown chain. A mid-run foreign
-takeover pages but does NOT tear down an already-running fleet (the collision
-is loud, never silent).
+single-conn remain possible (pre-existing behavior, unchanged).
+
+- **Clean shutdown RELEASES the lock** (2026-07-04 adversarial-review HIGH
+  fix): the graceful SIGINT/SIGTERM path calls
+  `GrowwScaleFleetLockGuard::release_on_shutdown()` inside
+  `run_process_runloop` — bounded 5s wait for the SSM DeleteParameter — so
+  a same-host restart (the dominant Mac scale-test iteration workflow)
+  re-acquires IMMEDIATELY instead of seeing its own dead slot as a peer.
+- **Hard crash (kill -9 / panic-abort) still relies on the 90s TTL**: a
+  restart within that window sees AlreadyHeld, falls back to single-conn
+  for the WHOLE session (the gate runs once at boot — no mid-run
+  re-acquire), and fires a GROWW-SCALE-05 page whose `peer` is your own
+  previous `host_id`. Recovery: wait ~90s after a crash, then restart.
+- **Stale-takeover race**: two boots that BOTH observe the same stale slot
+  can BOTH return Acquired (PutParameter overwrite has no compare-and-swap);
+  the loser detects foreign ownership at its first renewal (≤30s) and pages
+  — but its already-running fleet is NOT torn down, so the dual-fleet state
+  persists until the operator stops one host (one Critical page, then
+  coexistence — bounded-loud, not self-healing).
+- **A mid-run foreign takeover pages but does NOT tear down an
+  already-running fleet** (the collision is loud, never silent). Wiring the
+  guard's `held` flag into a ladder freeze/teardown is the PR-2 follow-up.
 
 ## §5. Honest envelope (§F wording)
 

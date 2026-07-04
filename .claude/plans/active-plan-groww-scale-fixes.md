@@ -93,10 +93,14 @@ SSM lock** gating the scale-fleet spawn, REUSING the
   default boot).
 - **Dhan + Groww-scale both ON:** two INDEPENDENT locks at two distinct SSM
   paths — neither can stomp the other (distinct parameter names).
-- **Shutdown:** the heartbeat guard is held for the life of `main`; on
-  process death without notify, the SSM parameter goes stale within the
-  90s TTL and the next boot takes over (documented honest envelope; the
-  Dhan lock has an explicit shutdown chain, the fleet lock relies on TTL).
+- **Shutdown (revised — 2026-07-04 adversarial-review HIGH fix):** the
+  graceful SIGINT/SIGTERM path calls
+  `GrowwScaleFleetLockGuard::release_on_shutdown()` inside
+  `run_process_runloop` (bounded 5s wait on the heartbeat's SSM
+  DeleteParameter), so a same-host restart re-acquires immediately. On a
+  hard crash (kill -9 / panic-abort) the SSM parameter goes stale within
+  the 90s TTL and the next boot takes over (honest envelope: restart
+  within that window sees AlreadyHeld → single-conn fallback; wait ~90s).
 - **Lock lost mid-run (foreign takeover):** the generic heartbeat logs
   `error!(code = GROWW-SCALE-05)` + flips its held flag and exits — the
   fleet is NOT torn down mid-run (documented residual; the peer's ladder
@@ -163,8 +167,11 @@ SSM lock** gating the scale-fleet spawn, REUSING the
 ## Observability
 
 - `error!(code = "GROWW-SCALE-05", severity = "critical", peer/error, …)` on
-  every fleet refusal → 5-sink chain (stdout / app.log / errors.log /
-  errors.jsonl / Telegram+SNS ERROR routing).
+  every fleet refusal → log-sink chain (stdout / app.log / errors.log /
+  errors.jsonl → CloudWatch-log-derived alerting). HONEST delivery
+  boundary: no typed Telegram NotificationEvent exists for this code yet
+  (the boot-stage notifier slot is unfilled); a typed event is a tracked
+  follow-up.
 - `info!` on successful fleet-lock acquisition with path + ttl.
 - Heartbeat lifecycle logs inherited from the instance_lock module
   (acquired / stale-takeover / renewal-failure WARN / loss ERROR).
@@ -205,6 +212,22 @@ keys untouched.
 - [x] Item 5 — Groww fleet lock gate module + main.rs wiring
   - Files: crates/app/src/groww_scale_lock.rs, crates/app/src/lib.rs, crates/app/src/main.rs, crates/core/src/auth/secret_manager.rs
   - Tests: test_groww_scale_lock_backoff_secs_mirrors_dhan_policy, test_groww_scale_lock_max_attempts_pinned, test_fleet_gate_allows_only_acquired, test_acquire_groww_scale_fleet_lock_smoke, test_groww_scale_fleet_lock_is_wired_into_main
+- [x] Item 6 — Adversarial-review HIGH fix: release the fleet lock on
+  graceful shutdown (release_on_shutdown wired into run_process_runloop /
+  run_shutdown_fast; bounded GROWW_SCALE_LOCK_RELEASE_TIMEOUT_SECS wait)
+  - Files: crates/app/src/groww_scale_lock.rs, crates/app/src/main.rs, .claude/rules/project/groww-scale-error-codes.md
+  - Tests: test_release_on_shutdown_completes_within_bound, test_release_on_shutdown_returns_even_if_heartbeat_already_exited, test_release_timeout_is_bounded_and_below_ttl
+- [x] Item 7 — Adversarial-review MEDIUM fix: escalate named-lock renewal
+  failures past the TTL (edge-triggered ERROR with the caller's loss code —
+  closes the unpaged SSM-partition dual-fleet window)
+  - Files: crates/core/src/instance_lock.rs, .claude/rules/project/groww-scale-error-codes.md
+  - Tests: test_named_lock_renewal_escalate_threshold_spans_ttl
+- [x] Item 8 — Adversarial-review LOW fixes: strip '/' and '.' in
+  compute_named_lock_path (namespace-escape defense-in-depth) + sanitize
+  the peer holder string before the GROWW-SCALE-05 log field + honest
+  delivery-boundary wording (no typed Telegram event yet)
+  - Files: crates/core/src/instance_lock.rs, crates/app/src/groww_scale_lock.rs, .claude/rules/project/groww-scale-error-codes.md
+  - Tests: test_compute_named_lock_path_strips_path_separators
 
 ## Scenarios
 
