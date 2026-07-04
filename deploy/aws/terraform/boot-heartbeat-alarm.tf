@@ -195,6 +195,13 @@ resource "aws_cloudwatch_event_rule" "tv_boot_heartbeat_open" {
   name                = "tv-${var.environment}-boot-heartbeat-open"
   description         = "Enable boot-heartbeat alarm actions at 08:50 IST (Mon-Fri)"
   schedule_expression = "cron(20 3 ? * MON-FRI *)"
+  # PAUSED 2026-07-04 per operator: local-only verification Mon Jul 6 - Wed Jul 8 2026.
+  # MUST BE REVERTED for Thu Jul 9 resume — revert branch: claude/aws-resume-jul9
+  # (the box is intentionally OFF, so tv_boot_completed is missing by design;
+  # with the OPEN gate disabled the alarm's actions stay actions_enabled=false
+  # and it can never page. The CLOSE gate below stays ENABLED as a harmless
+  # safety net that re-asserts actions-disabled at 09:10 IST.)
+  state = "DISABLED"
 }
 
 # Close the window at 09:10 IST (03:40 UTC) Mon-Fri — before market open so the
