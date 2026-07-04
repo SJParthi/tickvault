@@ -1,0 +1,113 @@
+# Local Branch Sync — one-way main → local-runtime merge robot
+#
+# Operator directive 2026-07-04 (verbatim): "we need to maintain the branch
+# something like this is purely for local and it should run only on local...
+# whatever the changes or codes or functionalities changes also everything
+# should be merged entirely from all different branches to this branch alone"
+#
+# Contract:
+#   - `local-runtime` is a PERMANENT branch the operator RUNS on his Mac
+#     during the local window. It carries local-only overlay commits (local
+#     feed flags, Docker resource bumps, README-LOCAL runbook).
+#   - Direction is ONE-WAY: every push to main is merged INTO local-runtime
+#     here. local-runtime NEVER merges into main (blocked by the
+#     `local-runtime-block` job in ci.yml, wired into All Green).
+#   - Idempotent: if local-runtime already contains main HEAD, this is a
+#     no-op. If the branch does not exist yet, this is a no-op (the branch
+#     is created manually once, from main, with the overlay commits).
+#   - On merge CONFLICT: NEVER guess a resolution. Abort the merge, open or
+#     update a single tracking issue titled "local-runtime sync conflict"
+#     listing the conflicting files, and exit loudly (red run). The operator
+#     resolves on his Mac (`git merge origin/main` there) and pushes.
+#
+# Loop safety: pushes made here use GITHUB_TOKEN, and GitHub suppresses
+# workflow triggers for GITHUB_TOKEN-caused events — and local-runtime is a
+# leaf branch no other workflow triggers on anyway. No recursion is possible.
+#
+# Honest envelope: sync latency = one workflow run after each main push
+# (~1 min). A push to local-runtime that races this run can make the
+# fast-forward push fail; the NEXT main push (or a manual dispatch) retries —
+# the concurrency group below serialises overlapping sync runs.
+
+name: Local Branch Sync
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: local-branch-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: "Merge main into local-runtime"
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout (full history for a real merge)
+        uses: actions/checkout@v7.0.0
+        with:
+          fetch-depth: 0
+
+      - name: Merge main into local-runtime (abort + file issue on conflict)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # No-op when the permanent branch has not been created yet.
+          if ! git ls-remote --exit-code --heads origin local-runtime >/dev/null; then
+            echo "Branch local-runtime does not exist — nothing to sync (no-op)."
+            exit 0
+          fi
+
+          git fetch origin main local-runtime
+          git checkout -B local-runtime origin/local-runtime
+
+          # Idempotent no-op: local-runtime already contains main HEAD.
+          if git merge-base --is-ancestor origin/main HEAD; then
+            echo "local-runtime already contains main HEAD — up to date (no-op)."
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          if ! git merge --no-ff origin/main \
+               -m "chore(local): merge main into local-runtime"; then
+            # NEVER guess a conflict resolution — capture, abort, page.
+            conflicts="$(git diff --name-only --diff-filter=U || true)"
+            git merge --abort || true
+            echo "::error::local-runtime sync conflict — operator must resolve on the Mac. Conflicting files: ${conflicts//$'\n'/, }"
+
+            title="local-runtime sync conflict"
+            body="$(printf 'Automatic main → local-runtime merge hit conflicts at main commit %s.\n\nConflicting files:\n\n```\n%s\n```\n\nResolve on the Mac:\n\n```\ngit fetch origin\ngit checkout local-runtime\ngit merge origin/main   # resolve conflicts, keep the local overlay\ngit push origin local-runtime\n```\n\nThis issue is updated (not duplicated) on every conflicting sync run.\n' "${GITHUB_SHA}" "${conflicts}")"
+
+            # Single tracking issue: update the open one if it exists,
+            # otherwise create it. Never a second open duplicate. Plain
+            # list + exact jq title match (NOT --search) — the search API
+            # has indexing lag that could duplicate the issue on rapid
+            # back-to-back conflicting runs; the list API is consistent.
+            existing="$(gh issue list --repo "${REPO}" --state open \
+              --limit 100 --json number,title \
+              --jq '[.[] | select(.title == "local-runtime sync conflict")][0].number // empty')"
+            if [[ -n "${existing}" ]]; then
+              gh issue comment "${existing}" --repo "${REPO}" --body "${body}"
+              echo "Updated tracking issue #${existing}."
+            else
+              gh issue create --repo "${REPO}" --title "${title}" --body "${body}"
+              echo "Opened tracking issue."
+            fi
+            exit 1
+          fi
+
+          git push origin local-runtime
+          echo "Merged main (${GITHUB_SHA}) into local-runtime and pushed."

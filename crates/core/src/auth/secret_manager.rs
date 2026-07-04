@@ -765,6 +765,70 @@ mod tests {
         );
     }
 
+    /// Dual-instance lock hardening (operator "go" 2026-07-04) ratchet 1:
+    /// LOCK-BEFORE-MINT. Inside `start_dhan_lane` the SSM dual-instance
+    /// lock MUST be acquired BEFORE the Step 6 `TokenManager::initialize`
+    /// token mint. Dhan enforces one active token at a time, so a mint
+    /// that precedes the lock lets a losing second instance invalidate
+    /// the winner's JWT before it is blocked — the exact 2026-07-04
+    /// coexistence-audit incident class. Source-order scan: the first
+    /// `try_acquire_instance_lock` call site must appear BEFORE the
+    /// first `TokenManager::initialize(` call site in main.rs.
+    #[test]
+    fn test_instance_lock_acquired_before_token_mint() {
+        let main_rs = std::fs::read_to_string("../app/src/main.rs")
+            .or_else(|_| std::fs::read_to_string("crates/app/src/main.rs"))
+            .expect("main.rs must be readable from secret_manager test working dir");
+
+        let lock_idx = main_rs
+            .find("try_acquire_instance_lock")
+            .expect("main.rs must acquire the dual-instance lock");
+        let mint_idx = main_rs
+            .find("TokenManager::initialize(")
+            .expect("main.rs must call TokenManager::initialize (slow-boot mint)");
+        assert!(
+            lock_idx < mint_idx,
+            "LOCK-BEFORE-MINT regression: `try_acquire_instance_lock` (byte {lock_idx}) \
+             must appear BEFORE `TokenManager::initialize(` (byte {mint_idx}) in \
+             crates/app/src/main.rs — see \
+             .claude/rules/project/dual-instance-lock-2026-07-04.md"
+        );
+    }
+
+    /// Dual-instance lock hardening (operator "go" 2026-07-04) ratchet 2:
+    /// ALWAYS-ON. The lock block MUST NOT be gated on `is_live()` — the
+    /// pre-2026-07-04 gate left it permanently OFF (prod + local both run
+    /// mode = "sandbox") while every Dhan-enabled boot still mints the
+    /// shared one-active-token JWT. Pins (a) the always-on marker comment
+    /// and (b) the absence of the retired live-mode gate expression, and
+    /// (c) the RESILIENCE-03 tripwire flag riding into the TokenManager.
+    #[test]
+    fn test_instance_lock_not_gated_on_live_mode() {
+        let main_rs = std::fs::read_to_string("../app/src/main.rs")
+            .or_else(|_| std::fs::read_to_string("crates/app/src/main.rs"))
+            .expect("main.rs must be readable from secret_manager test working dir");
+
+        assert!(
+            main_rs.contains("LOCK BEFORE MINT"),
+            "main.rs lost the `LOCK BEFORE MINT` Step 6a-prime marker — the \
+             dual-instance lock must stay always-on + pre-mint per \
+             .claude/rules/project/dual-instance-lock-2026-07-04.md"
+        );
+        assert!(
+            !main_rs
+                .contains("instance_lock_handle: Option<tokio::task::JoinHandle<()>> = if trading_mode.is_live()"),
+            "the dual-instance lock regressed to the retired `is_live()` gate — \
+             it must run for EVERY Dhan-enabled boot (sandbox included) per \
+             .claude/rules/project/dual-instance-lock-2026-07-04.md"
+        );
+        assert!(
+            main_rs.contains("instance_lock_held"),
+            "main.rs lost the RESILIENCE-03 mint-tripwire flag (`instance_lock_held`) \
+             that rides into TokenManager::initialize — see \
+             .claude/rules/project/dual-instance-lock-2026-07-04.md"
+        );
+    }
+
     // #T2b (2026-05-20): test_auth_renewal_audit_is_wired_into_token_manager
     // removed — the auth_renewal_audit table + write_renewal_audit_row
     // wiring it guarded were dropped in the QuestDB table cleanup.

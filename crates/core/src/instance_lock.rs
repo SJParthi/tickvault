@@ -389,6 +389,60 @@ pub async fn release_instance_lock(ssm: &SsmClient, env: &str, host_id: &str) ->
     Ok(())
 }
 
+/// Overwrites the instance lock UNCONDITIONALLY — the operator escape
+/// hatch behind the `--force-instance-takeover` CLI flag (dual-instance
+/// lock hardening, operator "go" 2026-07-04).
+///
+/// The 90 s TTL already auto-clears a crashed holder via the stale-
+/// takeover path in [`try_acquire_instance_lock`]; this function exists
+/// ONLY for the wedged-lock case that TTL cannot clear (e.g. corrupt
+/// JSON in the SSM parameter, or a holder whose heartbeat keeps
+/// renewing but that the operator has decided must yield). It logs a
+/// loud RESILIENCE-01-coded `error!` audit line (Telegram pages) naming
+/// the displaced holder — a force takeover is NEVER silent.
+///
+/// # Errors
+///
+/// Propagates the SSM `PutParameter(overwrite=true)` failure.
+// TEST-EXEMPT: end-to-end behaviour requires a real AWS SSM endpoint
+// (same class as try_acquire_instance_lock). The pure-logic pieces
+// (path format, JSON payload) are covered by the unit tests below;
+// a smoke test pins the public symbol.
+pub async fn force_takeover_instance_lock(ssm: &SsmClient, env: &str, host_id: &str) -> Result<()> {
+    let path = compute_instance_lock_path(env);
+    let now = now_unix_secs();
+    // Best-effort read of the displaced holder for the audit line.
+    let displaced = match get_parameter(ssm, &path).await {
+        Ok(Some(raw)) => LockValue::from_json(&raw)
+            .map(|v| v.host_id)
+            .unwrap_or_else(|_| format!("(corrupt-json: {raw})")),
+        Ok(None) => "(none — lock absent)".to_string(),
+        Err(err) => format!("(unreadable: {err})"),
+    };
+    let payload = LockValue::new(host_id, now).to_json()?;
+    put_parameter(ssm, &path, &payload, true)
+        .await
+        .with_context(|| {
+            format!("PutParameter(overwrite=true) force-takeover failed for path={path}")
+        })?;
+    // Loud audit line — operator-initiated, but it MUST page so a
+    // mistaken takeover against a live peer is never invisible.
+    error!(
+        target: "tickvault::instance_lock",
+        code = ErrorCode::Resilience01DualInstanceDetected.code_str(),
+        severity = ErrorCode::Resilience01DualInstanceDetected
+            .severity()
+            .as_str(),
+        path = %path,
+        host_id = %host_id,
+        displaced_holder = %displaced,
+        "RESILIENCE-01: OPERATOR FORCE TAKEOVER — instance lock overwritten via \
+         --force-instance-takeover; the displaced instance (if live) will observe \
+         lock loss within one 30s heartbeat and must halt its Dhan session"
+    );
+    Ok(())
+}
+
 /// Spawns the instance-lock heartbeat task.
 ///
 /// The returned `JoinHandle` is held by the boot code so a clean shutdown
@@ -400,9 +454,13 @@ pub async fn release_instance_lock(ssm: &SsmClient, env: &str, host_id: &str) ->
 ///
 /// Heartbeat loss-of-ownership policy: if `renew_instance_lock` returns
 /// `Ok(false)` — meaning a foreign instance has stolen our slot — the
-/// task logs `RESILIENCE-01` at ERROR level and EXITS. The boot code
-/// that owns this `JoinHandle` MUST observe the exit (e.g. via a
-/// watchdog or by treating lock-loss as a HALT signal).
+/// task logs `RESILIENCE-01` at ERROR level, flips `held_flag` to
+/// `false` (so the RESILIENCE-03 mint tripwire in
+/// `TokenManager::acquire_token` refuses any further
+/// `generateAccessToken` calls — dual-instance lock hardening
+/// 2026-07-04), and EXITS. The boot code that owns this `JoinHandle`
+/// MUST observe the exit (e.g. via a watchdog or by treating lock-loss
+/// as a HALT signal).
 ///
 /// Heartbeat transient errors: an SSM API error during renewal is logged
 /// at WARN and the loop continues. With a 30 s heartbeat interval against
@@ -418,6 +476,7 @@ pub fn spawn_instance_lock_heartbeat(
     env: String,
     host_id: String,
     shutdown: Arc<Notify>,
+    held_flag: Arc<std::sync::atomic::AtomicBool>,
 ) -> JoinHandle<()> {
     let interval = Duration::from_secs(INSTANCE_LOCK_HEARTBEAT_INTERVAL_SECS);
     tokio::spawn(async move {
@@ -440,6 +499,10 @@ pub fn spawn_instance_lock_heartbeat(
                         target: "tickvault::instance_lock",
                         "shutdown signalled — releasing instance lock"
                     );
+                    // We are about to give the lock up — refuse any
+                    // further mint from this process (fail-closed;
+                    // RESILIENCE-03 tripwire).
+                    held_flag.store(false, std::sync::atomic::Ordering::Release);
                     if let Err(err) = release_instance_lock(&ssm, &env, &host_id).await {
                         warn!(
                             target: "tickvault::instance_lock",
@@ -459,6 +522,10 @@ pub fn spawn_instance_lock_heartbeat(
                             // daily positive ping.
                         }
                         Ok(false) => {
+                            // Flip BEFORE logging so the mint tripwire
+                            // (RESILIENCE-03) is armed at the earliest
+                            // possible instant.
+                            held_flag.store(false, std::sync::atomic::Ordering::Release);
                             error!(
                                 target: "tickvault::instance_lock",
                                 code = ErrorCode::Resilience01DualInstanceDetected.code_str(),
@@ -468,7 +535,8 @@ pub fn spawn_instance_lock_heartbeat(
                                 env = %env,
                                 host_id = %host_id,
                                 "instance lock lost — another process now holds the lock; \
-                                 heartbeat task exiting"
+                                 heartbeat task exiting; token mint is now REFUSED \
+                                 (RESILIENCE-03 tripwire armed)"
                             );
                             return;
                         }
@@ -588,6 +656,33 @@ mod tests {
     #[test]
     fn test_spawn_instance_lock_heartbeat_smoke() {
         let _ = spawn_instance_lock_heartbeat;
+    }
+
+    #[test]
+    fn test_force_takeover_instance_lock_smoke() {
+        // Pins the operator escape-hatch symbol (--force-instance-takeover).
+        // End-to-end behaviour is TEST-EXEMPT (real SSM endpoint required);
+        // the payload + path logic it delegates to is covered by the
+        // LockValue / compute_instance_lock_path tests in this module.
+        let _ = force_takeover_instance_lock;
+    }
+
+    #[test]
+    fn test_crashed_holder_stale_after_ttl_is_takeover_eligible() {
+        // Dual-instance lock hardening 2026-07-04: a holder that hard-crashed
+        // (heartbeat stopped, no release) MUST become takeover-eligible once
+        // its last heartbeat is older than the TTL — this is the automatic
+        // self-heal that makes the --force-instance-takeover flag a
+        // wedged-lock-only tool, never a routine one.
+        let crashed = LockValue::new("i-dead:1:0000000000000001", 1_000);
+        // One heartbeat interval later: still fresh — NOT takeover-eligible.
+        assert!(!crashed.is_stale(
+            1_000 + INSTANCE_LOCK_HEARTBEAT_INTERVAL_SECS,
+            INSTANCE_LOCK_TTL_SECS
+        ));
+        // Just past the TTL: stale — the next booting instance takes over
+        // WITHOUT any operator flag.
+        assert!(crashed.is_stale(1_000 + INSTANCE_LOCK_TTL_SECS + 1, INSTANCE_LOCK_TTL_SECS));
     }
 
     // -----------------------------------------------------------------------

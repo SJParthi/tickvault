@@ -49,6 +49,55 @@
 
 ---
 
+## §3.1. 2026-07-04 (same day) — GITHUB_TOKEN bot-merge suppression gap + the post-merge catch-up contract
+
+**The gap (Verified, live on the FIRST bot merge):** §3 row 3 moved auto-merge
+arming behind All Green, armed via the workflow's own `GITHUB_TOKEN`
+(`gh pr merge --auto --squash` in ci.yml `enable-auto-merge`). PR #1392 then
+merged as `github-actions[bot]` (merged_at 2026-07-04T03:06:05Z) — and GitHub
+**suppresses push-triggered workflows for events created with `GITHUB_TOKEN`**
+(recursion protection). Merge commit `aafa226` therefore landed on `main` with
+**ZERO post-merge runs**: no CI (no Coverage & Perf ratchet artifact on main),
+no Benchmarks & Perf Gate, no deploy-aws push trigger. Earlier merges fired
+post-merge runs only because auto-merge had been armed with the operator's own
+token (PR #1391, merged_by SJParthi → push runs fired normally). The repo has
+NO PAT secret and the operator wants zero manual steps, so "arm with a
+PAT/GitHub-App token" is not the chosen fix.
+
+**The catch-up contract (the fix — cron/dispatch redundancy, the proven house
+pattern from `deploy-aws-after-close.yml`):** `workflow_dispatch` and
+`repository_dispatch` are the DOCUMENTED exceptions to the GITHUB_TOKEN
+suppression rule — a GITHUB_TOKEN-created dispatch DOES fire the workflow.
+
+| # | Mechanism | Where |
+|---|---|---|
+| 1 | `.github/workflows/postmerge-catchup.yml` — every 30 min (+ manual dispatch): read main HEAD; for each of `ci.yml` and `bench.yml`, list runs filtered by `head_sha=HEAD` (ANY event, ANY status); if ZERO exist → `gh workflow run <wf> --ref main` and log loudly. Idempotent + self-terminating: the dispatched run itself carries `head_sha == HEAD`, so the next firing finds it; a run in any state (queued/in_progress/completed incl. failed) counts as covered — the dispatcher backfills MISSING runs, it never re-runs red ones | `postmerge-catchup.yml` |
+| 2 | ci.yml gains a `workflow_dispatch` trigger; a dispatched run on main behaves EXACTLY like a push-to-main run: concurrency groups non-PR runs by SHA (never cancelled), Coverage & Perf runs (no `if:` excludes it — ratchet artifact produced), and All Green tolerates the PR-only jobs (Commit Lint, Design-First Wall) as `skipped` on `workflow_dispatch` exactly as it does on `push` | `ci.yml` `on:` / `concurrency` / `all-green` |
+| 3 | bench.yml already had `workflow_dispatch` (and no push-only `if:` conditions) — no change needed | `bench.yml` |
+| 4 | deploy-aws is NOT handled by the catch-up dispatcher: it already self-heals via `deploy-aws-after-close.yml` (5 weekday crons + idempotent HEAD-vs-last-deployed-sha compare + `workflow_dispatch` of deploy-aws — a dispatch fires regardless of the suppressed merge push). A weekday bot merge deploys at the next cron slot; a weekend bot merge deploys Monday 08:30 IST | `deploy-aws-after-close.yml` (unchanged) |
+
+**Honest envelope of the catch-up:** detection latency is up to ~30 min (plus
+GitHub's scheduler jitter; cron slots CAN be dropped repo-wide as on
+2026-07-02 — the next slot covers it, so worst-case latency is bounded only by
+the scheduler recovering). The dispatched run is attributed to
+`github-actions[bot]` with event `workflow_dispatch` — required-check UI on
+the merge COMMIT differs cosmetically from a push run, but every job, gate,
+and artifact is identical. The dispatcher cannot backfill SHAs that are no
+longer main HEAD (an older suppressed merge that was immediately superseded
+by a newer merge is covered transitively — the newer HEAD's full battery runs
+against a tree that CONTAINS the older commit).
+
+**What a PR that violates §3.1 looks like (REJECT):** removes
+`postmerge-catchup.yml` or its schedule; removes the `workflow_dispatch`
+trigger from ci.yml or bench.yml; adds an `if: github.event_name == 'push'`
+(or any dispatch-excluding condition) to `coverage-and-perf` or any other
+post-merge-relevant ci.yml job; makes All Green fail dispatched main runs on
+the PR-only jobs' legitimate skips; or re-points the dispatcher's existence
+check at anything weaker than the `head_sha` run filter (the loop-safety
+core).
+
+---
+
 ## §4. The honest envelope (mandatory per operator-charter §F — no illusion)
 
 - **Pre-merge gate = the fast battery** (build, clippy, the full 6-crate test suites incl. DHAT + proptest, security audit, coverage ratchet, source-scan guards, plan gate, secret diff-scan). Warm-cache PR wall-clock moves from ~4 min to ~8–10 min (coverage is the new critical path; ~20–25 min on a cold cache).

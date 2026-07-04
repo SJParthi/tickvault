@@ -24,9 +24,15 @@
 name: aws-autopilot
 
 on:
-  schedule:
-    # Every 15 min, 03:00-11:00 UTC (08:30-16:30 IST), Mon-Fri.
-    - cron: '*/15 3-11 * * 1-5'
+  # PAUSED 2026-07-04 per operator: local-only verification Mon Jul 6 - Wed Jul 8 2026.
+  # MUST BE REVERTED for Thu Jul 9 resume — revert branch: claude/aws-resume-jul9
+  # (autopilot runs `aws ec2 start-instances` on ANY stopped box inside the
+  #  08:30-16:30 IST Mon-Fri up-window — it would undo the pause every 15 min.
+  #  The schedule trigger below is commented out for the window; manual
+  #  workflow_dispatch remains available.)
+  # schedule:
+  #   # Every 15 min, 03:00-11:00 UTC (08:30-16:30 IST), Mon-Fri.
+  #   - cron: '*/15 3-11 * * 1-5'
   workflow_dispatch:
     inputs:
       strict:

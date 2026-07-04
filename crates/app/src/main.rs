@@ -2083,6 +2083,15 @@ async fn main() -> Result<()> {
                         &config.token,
                         &config.network,
                         &notifier,
+                        // RESILIENCE-03 tripwire flag: the FAST crash-recovery
+                        // arm holds NO dual-instance lock today (it never mints
+                        // at boot — cached token; a mint happens only on the
+                        // rare client_id-mismatch / renewal-fallback paths).
+                        // Documented residual gap in
+                        // `.claude/rules/project/dual-instance-lock-2026-07-04.md`
+                        // — wiring the lock into this arm needs an operator
+                        // decision on mid-market halt semantics.
+                        None,
                     ),
                 )
                 .await
@@ -5425,6 +5434,26 @@ struct DhanLaneContext<'a> {
     lane_scoped: bool,
 }
 
+/// CLI flag that authorizes overwriting a WEDGED dual-instance lock at
+/// boot (dual-instance lock hardening, operator "go" 2026-07-04). The
+/// 90 s TTL already auto-clears a crashed holder WITHOUT this flag — it
+/// exists only for a lock that TTL cannot clear (corrupt JSON, or a live
+/// holder the operator has decided must yield). The takeover is logged
+/// at `error!` (pages Telegram) naming the displaced holder — never
+/// silent. See `.claude/rules/project/dual-instance-lock-2026-07-04.md`.
+const FORCE_INSTANCE_TAKEOVER_FLAG: &str = "--force-instance-takeover";
+
+/// Pure matcher for [`FORCE_INSTANCE_TAKEOVER_FLAG`] — unit-testable
+/// without touching process args.
+fn is_force_takeover_arg(arg: &str) -> bool {
+    arg == FORCE_INSTANCE_TAKEOVER_FLAG
+}
+
+/// True when the operator passed `--force-instance-takeover` on the CLI.
+fn force_instance_takeover_requested() -> bool {
+    std::env::args().any(|a| is_force_takeover_arg(&a))
+}
+
 /// Why `start_dhan_lane` ended early. Maps 1:1 to the inline gate's two
 /// boot-abort flavours so the caller reproduces `main()`'s EXACT prior return:
 /// `BootAbortClean` → `main()` `return Ok(())` (clean exit, code 0);
@@ -5550,15 +5579,279 @@ async fn start_dhan_lane(
     }
 
     // -----------------------------------------------------------------------
+    // Step 6a-prime: Dual-instance SSM lock (Phase 0 Item 19) — LOCK BEFORE MINT
+    // -----------------------------------------------------------------------
+    // RESILIENCE-01: only ONE tickvault process per Dhan client-id may
+    // ever be live. Two processes against the same account fight over
+    // static-IP enforcement (Item 18), fragment the WebSocket connection
+    // budget, silently break order reconciliation — and, decisively
+    // (coexistence audit 2026-07-04): Dhan enforces ONE ACTIVE TOKEN AT A
+    // TIME, so a second instance's `generateAccessToken` mint at Step 6
+    // INVALIDATES the first instance's JWT even in sandbox/dry-run mode.
+    // We hold an SSM-Parameter-Store-backed lock (90s TTL, 30s heartbeat)
+    // for the lifetime of the process; this gate fails the boot if
+    // another live peer is already holding it. SSM is the source of
+    // truth so an AWS prod instance and a dev Mac sharing the same env
+    // name cannot accidentally run in parallel.
+    //
+    // Dual-instance lock hardening (operator "go" 2026-07-04 —
+    // `.claude/rules/project/dual-instance-lock-2026-07-04.md`):
+    //   1. ALWAYS-ON: the lock is acquired for EVERY Dhan-enabled boot,
+    //      sandbox/paper INCLUDED (this lane only runs when
+    //      `feeds.dhan_enabled == true`). The previous `is_live()` gate
+    //      left the lock permanently OFF — both prod and local run
+    //      mode = "sandbox" — yet a sandbox boot still mints the shared
+    //      one-active-token JWT.
+    //   2. LOCK-BEFORE-MINT: runs BEFORE Step 6 auth so a losing peer
+    //      halts BEFORE it can invalidate the winner's token. The lock
+    //      needs only an AWS SSM client — no Dhan token.
+    //   3. SSM transport errors get the SAME bounded 3-attempt /
+    //      exponential-backoff budget as the Step 6 SSM credential fetch,
+    //      then HALT fail-closed (cannot prove there's no peer; a
+    //      sustained SSM outage would fail Step 6 right after anyway).
+    //   4. Escape hatch: `--force-instance-takeover` overwrites a wedged
+    //      lock with a loud audited error! line. The 90s TTL already
+    //      auto-clears crashed holders without any flag.
+    //
+    // Costs: standard-tier SSM PutParameter is free; ~2,880 calls/day at
+    // the 30 s heartbeat interval is well under the 40 TPS SSM rate cap
+    // (operator lock 2026-05-24 chose SSM as the source of truth).
+    //
+    // Phase 0 Item 19f — chain bridge from the broader `shutdown_notify`
+    // (constructed at Step 8b below) to the heartbeat's own `Notify`.
+    //
+    // `instance_lock_held` is the RESILIENCE-03 mint-tripwire flag: set
+    // `true` here on acquisition; the heartbeat flips it `false` on lock
+    // loss / shutdown release; `TokenManager::acquire_token` refuses any
+    // `generateAccessToken` mint while it reads `false`.
+    let instance_lock_held = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut instance_lock_shutdown_chain: Option<std::sync::Arc<tokio::sync::Notify>>;
+    let instance_lock_handle: Option<tokio::task::JoinHandle<()>> = {
+        info!(
+            mode = trading_mode.as_str(),
+            "Phase 0 Item 19: acquiring dual-instance SSM lock (always-on for every \
+             Dhan-enabled boot, BEFORE the token mint — lock-before-mint 2026-07-04)"
+        );
+
+        // Bounded transport-retry budget — mirrors the Step 6 SSM
+        // credential fetch (3 attempts, exponential backoff).
+        const INSTANCE_LOCK_ACQUIRE_MAX_ATTEMPTS: u32 = 3;
+
+        let ssm_client = std::sync::Arc::new(
+            tickvault_core::auth::secret_manager::create_ssm_client_public().await,
+        );
+
+        // host_id composition: pid + boot_random + aws_instance_id (when
+        // present). The instance lock path is env-qualified, so dev /
+        // sandbox / prod cannot collide.
+        let env = tickvault_core::auth::secret_manager::resolve_environment()
+            .context("Phase 0 Item 19: cannot resolve environment for lock path")
+            .map_err(StartLaneError::BootAbortErr)?;
+        let host_id = tickvault_core::instance_lock::generate_host_id(
+            std::process::id(),
+            // Boot-once 64-bit value derived from nanos-since-UNIX-EPOCH.
+            // Not cryptographically random, but the goal here is
+            // cross-host uniqueness within the 90s TTL window — two
+            // boxes booting at the same nanosecond is exceedingly
+            // unlikely, and rand isn't a workspace dep.
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos() as u64)
+                .unwrap_or(0),
+            None,
+        );
+        let lock_key = tickvault_core::instance_lock::compute_instance_lock_path(&env);
+
+        // Transport (SSM) errors are retried on the bounded budget;
+        // AlreadyHeld is a DEFINITIVE answer and is never retried.
+        let acquire_result = {
+            let mut attempt: u32 = 0;
+            loop {
+                attempt = attempt.saturating_add(1);
+                match tickvault_core::instance_lock::try_acquire_instance_lock(
+                    &ssm_client,
+                    &env,
+                    &host_id,
+                )
+                .await
+                {
+                    Ok(outcome) => break Ok(outcome),
+                    Err(err) if attempt >= INSTANCE_LOCK_ACQUIRE_MAX_ATTEMPTS => break Err(err),
+                    Err(err) => {
+                        warn!(
+                            attempt,
+                            max_attempts = INSTANCE_LOCK_ACQUIRE_MAX_ATTEMPTS,
+                            error = %err,
+                            "Phase 0 Item 19: SSM lock acquire failed (transient) — retrying"
+                        );
+                        tokio::time::sleep(std::time::Duration::from_secs(u64::from(
+                            2u32.saturating_pow(attempt),
+                        )))
+                        .await;
+                    }
+                }
+            }
+        };
+
+        match acquire_result {
+            Ok(tickvault_core::instance_lock::AcquireOutcome::Acquired) => {
+                instance_lock_held.store(true, std::sync::atomic::Ordering::Release);
+                info!(
+                    env = %env,
+                    host_id = %host_id,
+                    lock_key = %lock_key,
+                    ttl_secs = tickvault_core::instance_lock::INSTANCE_LOCK_TTL_SECS,
+                    "Phase 0 Item 19: dual-instance lock acquired (pre-mint)"
+                );
+            }
+            Ok(tickvault_core::instance_lock::AcquireOutcome::AlreadyHeld { holder })
+                if force_instance_takeover_requested() =>
+            {
+                // Operator escape hatch (--force-instance-takeover): a
+                // wedged lock that the 90s TTL cannot clear. The
+                // takeover itself logs a loud RESILIENCE-01 error!
+                // audit line naming the displaced holder.
+                match tickvault_core::instance_lock::force_takeover_instance_lock(
+                    &ssm_client,
+                    &env,
+                    &host_id,
+                )
+                .await
+                {
+                    Ok(()) => {
+                        instance_lock_held.store(true, std::sync::atomic::Ordering::Release);
+                        warn!(
+                            env = %env,
+                            host_id = %host_id,
+                            lock_key = %lock_key,
+                            displaced_holder = %holder,
+                            "Phase 0 Item 19: dual-instance lock FORCE-TAKEN via \
+                             --force-instance-takeover — proceeding as sole owner"
+                        );
+                    }
+                    Err(err) => {
+                        error!(
+                            code = tickvault_common::error_code::ErrorCode::Resilience01DualInstanceDetected
+                                .code_str(),
+                            severity = tickvault_common::error_code::ErrorCode::Resilience01DualInstanceDetected
+                                .severity()
+                                .as_str(),
+                            error = %err,
+                            env = %env,
+                            host_id = %host_id,
+                            lock_key = %lock_key,
+                            "Phase 0 Item 19: force-takeover failed — BLOCKING BOOT"
+                        );
+                        notifier.notify(
+                            tickvault_core::notification::events::NotificationEvent::DualInstanceDetected {
+                                holder: format!("(force-takeover-failed: {err})"),
+                                lock_key,
+                            },
+                        );
+                        return Err(StartLaneError::BootAbortClean);
+                    }
+                }
+            }
+            Ok(tickvault_core::instance_lock::AcquireOutcome::AlreadyHeld { holder }) => {
+                error!(
+                    code = tickvault_common::error_code::ErrorCode::Resilience01DualInstanceDetected
+                        .code_str(),
+                    severity = tickvault_common::error_code::ErrorCode::Resilience01DualInstanceDetected
+                        .severity()
+                        .as_str(),
+                    env = %env,
+                    host_id = %host_id,
+                    lock_key = %lock_key,
+                    peer = %holder,
+                    "Phase 0 Item 19: another tickvault process holds the lock — BLOCKING BOOT \
+                     (before any token mint — the peer's Dhan session is untouched)"
+                );
+                notifier.notify(
+                    tickvault_core::notification::events::NotificationEvent::DualInstanceDetected {
+                        holder,
+                        lock_key,
+                    },
+                );
+                return Err(StartLaneError::BootAbortClean);
+            }
+            Err(err) => {
+                // SSM PutParameter / GetParameter failed after the bounded
+                // retry budget (network outage, IAM denial, sustained
+                // throttle). Same HALT semantics as already-held: we
+                // cannot prove there's no peer. Note: a sustained SSM
+                // outage would fail Step 6's credential fetch immediately
+                // after this anyway — this arm does not add a new
+                // boot-failure class, it only surfaces it earlier.
+                error!(
+                    code = tickvault_common::error_code::ErrorCode::Resilience01DualInstanceDetected
+                        .code_str(),
+                    severity = tickvault_common::error_code::ErrorCode::Resilience01DualInstanceDetected
+                        .severity()
+                        .as_str(),
+                    error = %err,
+                    env = %env,
+                    host_id = %host_id,
+                    lock_key = %lock_key,
+                    "Phase 0 Item 19: SSM acquire-attempt failed — BLOCKING BOOT"
+                );
+                notifier.notify(
+                    tickvault_core::notification::events::NotificationEvent::DualInstanceDetected {
+                        holder: format!("(ssm-error: {err})"),
+                        lock_key,
+                    },
+                );
+                return Err(StartLaneError::BootAbortClean);
+            }
+        }
+
+        // Lock held — spawn the heartbeat. The heartbeat owns its
+        // own `Notify` shutdown source; main.rs's broader
+        // `shutdown_notify` (constructed at the Step 8b stage) is
+        // chained into it via the bridge task installed further
+        // down (Item 19f). On the bridge firing, the heartbeat
+        // releases the lock by deleting the SSM Parameter so the next
+        // boot sees a clean slate immediately. The held-flag clone lets
+        // the heartbeat disarm the RESILIENCE-03 mint tripwire on lock
+        // loss / shutdown release.
+        let heartbeat_shutdown_inner = std::sync::Arc::new(tokio::sync::Notify::new());
+        let heartbeat_shutdown_for_chain = heartbeat_shutdown_inner.clone();
+        let heartbeat_handle = tickvault_core::instance_lock::spawn_instance_lock_heartbeat(
+            ssm_client,
+            env,
+            host_id,
+            heartbeat_shutdown_inner,
+            std::sync::Arc::clone(&instance_lock_held),
+        );
+        instance_lock_shutdown_chain = Some(heartbeat_shutdown_for_chain);
+        Some(heartbeat_handle)
+    };
+    // Keep the heartbeat handle alive for the lifetime of main.
+    // Dropped on return (boot-halt or graceful shutdown). The task
+    // itself observes the dropped Notify on shutdown when Item 19e
+    // wires the chained shutdown.
+    let _instance_lock_handle = instance_lock_handle;
+
+    // -----------------------------------------------------------------------
     // Step 6: Authenticate with Dhan API (infinite retry for transient errors)
     // -----------------------------------------------------------------------
+    // Runs AFTER Step 6a-prime (lock-before-mint, 2026-07-04): the
+    // dual-instance lock is held by now, so the `generateAccessToken`
+    // mint below can never invalidate a live peer's token. The
+    // RESILIENCE-03 tripwire flag rides into the TokenManager so a
+    // mid-session lock loss also refuses any renewal-fallback mint.
     info!("authenticating with Dhan API via SSM → TOTP → JWT");
 
     let token_init_timeout =
         std::time::Duration::from_secs(tickvault_common::constants::TOKEN_INIT_TIMEOUT_SECS);
     let token_manager = match tokio::time::timeout(
         token_init_timeout,
-        TokenManager::initialize(&config.dhan, &config.token, &config.network, &notifier),
+        TokenManager::initialize(
+            &config.dhan,
+            &config.token,
+            &config.network,
+            &notifier,
+            Some(std::sync::Arc::clone(&instance_lock_held)),
+        ),
     )
     .await
     {
@@ -5597,156 +5890,6 @@ async fn start_dhan_lane(
             return Err(StartLaneError::BootAbortClean);
         }
     };
-
-    // -----------------------------------------------------------------------
-    // Step 6a-prime: Dual-instance SSM lock (Phase 0 Item 19)
-    // -----------------------------------------------------------------------
-    // RESILIENCE-01: only ONE tickvault process per Dhan client-id may
-    // ever be live. Two processes against the same account fight over
-    // static-IP enforcement (Item 18), fragment the 5-conn WebSocket
-    // budget, and silently break order reconciliation. We hold an
-    // SSM-Parameter-Store-backed lock (90s TTL, 30s heartbeat) for the
-    // lifetime of the process; this gate fails the boot if another
-    // live peer is already holding it. SSM is the source of truth so
-    // an AWS prod instance and a dev Mac sharing the same env name
-    // cannot accidentally run in parallel.
-    //
-    // Runs AFTER auth (Step 6) so the boot-halt Telegram + SNS path
-    // is fully wired. Runs BEFORE Step 6a static IP boot gate so we
-    // don't burn Dhan API quota on a peer-side race we'd lose anyway.
-    //
-    // Like the static IP gate, this is live-mode only — sandbox/paper
-    // modes don't subscribe to depth or place real orders, so a second
-    // sandbox instance is not a regulatory hazard.
-    // Phase 0 Item 19f — chain bridge from the broader `shutdown_notify`
-    // (constructed at Step 8b below) to the heartbeat's own `Notify`.
-    // `None` outside live mode or when the lock acquire path skips the
-    // heartbeat spawn.
-    let mut instance_lock_shutdown_chain: Option<std::sync::Arc<tokio::sync::Notify>> = None;
-    let instance_lock_handle: Option<tokio::task::JoinHandle<()>> = if trading_mode.is_live() {
-        info!("Phase 0 Item 19: acquiring dual-instance SSM lock");
-
-        // SSM is the source of truth for the lock (operator lock
-        // 2026-05-24 — replaced the earlier in-memory KV implementation
-        // alongside the CloudWatch-only migration). Constructing the
-        // client here keeps the lock self-contained; no auxiliary
-        // service needs to be running. Costs: standard-tier SSM
-        // PutParameter is free; ~2,880 calls/day at the 30 s heartbeat
-        // interval is well under the 40 TPS SSM rate cap.
-        let ssm_client = std::sync::Arc::new(
-            tickvault_core::auth::secret_manager::create_ssm_client_public().await,
-        );
-
-        // host_id composition: pid + boot_random + aws_instance_id (when
-        // present). The instance lock path is env-qualified, so dev /
-        // sandbox / prod cannot collide.
-        let env = tickvault_core::auth::secret_manager::resolve_environment()
-            .context("Phase 0 Item 19: cannot resolve environment for lock path")
-            .map_err(StartLaneError::BootAbortErr)?;
-        let host_id = tickvault_core::instance_lock::generate_host_id(
-            std::process::id(),
-            // Boot-once 64-bit value derived from nanos-since-UNIX-EPOCH.
-            // Not cryptographically random, but the goal here is
-            // cross-host uniqueness within the 90s TTL window — two
-            // boxes booting at the same nanosecond is exceedingly
-            // unlikely, and rand isn't a workspace dep.
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos() as u64)
-                .unwrap_or(0),
-            None,
-        );
-        let lock_key = tickvault_core::instance_lock::compute_instance_lock_path(&env);
-
-        match tickvault_core::instance_lock::try_acquire_instance_lock(&ssm_client, &env, &host_id)
-            .await
-        {
-            Ok(tickvault_core::instance_lock::AcquireOutcome::Acquired) => {
-                info!(
-                    env = %env,
-                    host_id = %host_id,
-                    lock_key = %lock_key,
-                    ttl_secs = tickvault_core::instance_lock::INSTANCE_LOCK_TTL_SECS,
-                    "Phase 0 Item 19: dual-instance lock acquired"
-                );
-            }
-            Ok(tickvault_core::instance_lock::AcquireOutcome::AlreadyHeld { holder }) => {
-                error!(
-                    code = tickvault_common::error_code::ErrorCode::Resilience01DualInstanceDetected
-                        .code_str(),
-                    severity = tickvault_common::error_code::ErrorCode::Resilience01DualInstanceDetected
-                        .severity()
-                        .as_str(),
-                    env = %env,
-                    host_id = %host_id,
-                    lock_key = %lock_key,
-                    peer = %holder,
-                    "Phase 0 Item 19: another tickvault process holds the lock — BLOCKING BOOT"
-                );
-                notifier.notify(
-                    tickvault_core::notification::events::NotificationEvent::DualInstanceDetected {
-                        holder,
-                        lock_key,
-                    },
-                );
-                return Err(StartLaneError::BootAbortClean);
-            }
-            Err(err) => {
-                // SSM PutParameter / GetParameter failed (network blip,
-                // IAM denial, throttle). Same HALT semantics as
-                // already-held: we cannot prove there's no peer.
-                error!(
-                    code = tickvault_common::error_code::ErrorCode::Resilience01DualInstanceDetected
-                        .code_str(),
-                    severity = tickvault_common::error_code::ErrorCode::Resilience01DualInstanceDetected
-                        .severity()
-                        .as_str(),
-                    error = %err,
-                    env = %env,
-                    host_id = %host_id,
-                    lock_key = %lock_key,
-                    "Phase 0 Item 19: SSM acquire-attempt failed — BLOCKING BOOT"
-                );
-                notifier.notify(
-                    tickvault_core::notification::events::NotificationEvent::DualInstanceDetected {
-                        holder: format!("(ssm-error: {err})"),
-                        lock_key,
-                    },
-                );
-                return Err(StartLaneError::BootAbortClean);
-            }
-        }
-
-        // Lock held — spawn the heartbeat. The heartbeat owns its
-        // own `Notify` shutdown source; main.rs's broader
-        // `shutdown_notify` (constructed at the Step 8b stage) is
-        // chained into it via the bridge task installed further
-        // down (Item 19f). On the bridge firing, the heartbeat
-        // releases the lock by deleting the SSM Parameter so the next
-        // boot sees a clean slate immediately.
-        let heartbeat_shutdown_inner = std::sync::Arc::new(tokio::sync::Notify::new());
-        let heartbeat_shutdown_for_chain = heartbeat_shutdown_inner.clone();
-        let heartbeat_handle = tickvault_core::instance_lock::spawn_instance_lock_heartbeat(
-            ssm_client,
-            env,
-            host_id,
-            heartbeat_shutdown_inner,
-        );
-        instance_lock_shutdown_chain = Some(heartbeat_shutdown_for_chain);
-        Some(heartbeat_handle)
-    } else {
-        info!(
-            "Phase 0 Item 19: skipping dual-instance lock (mode={:?} — sandbox/paper do not \
-             place real orders)",
-            trading_mode
-        );
-        None
-    };
-    // Keep the heartbeat handle alive for the lifetime of main.
-    // Dropped on return (boot-halt or graceful shutdown). The task
-    // itself observes the dropped Notify on shutdown when Item 19e
-    // wires the chained shutdown.
-    let _instance_lock_handle = instance_lock_handle;
 
     // -----------------------------------------------------------------------
     // Step 6a: Dhan-side static IP boot gate (Phase 0 Item 18 + 18b)
@@ -10056,6 +10199,21 @@ mod tests {
 
     // All pure helper tests moved to boot_helpers.rs in the lib target.
     // Tests below verify main.rs-specific smoke behavior.
+
+    // ── --force-instance-takeover (dual-instance lock hardening 2026-07-04) ──
+
+    #[test]
+    fn test_force_takeover_flag_matcher() {
+        assert!(is_force_takeover_arg("--force-instance-takeover"));
+        assert_eq!(FORCE_INSTANCE_TAKEOVER_FLAG, "--force-instance-takeover");
+        // Near-misses must NOT trigger a lock takeover.
+        assert!(!is_force_takeover_arg("--force-instance-takeover=1"));
+        assert!(!is_force_takeover_arg("force-instance-takeover"));
+        assert!(!is_force_takeover_arg("--force-takeover"));
+        assert!(!is_force_takeover_arg(""));
+        // Pin the process-args reader symbol (exercised at boot only).
+        let _ = force_instance_takeover_requested;
+    }
 
     // ── build_feed_status_lines (Telegram feed parity, 2026-07-03) ──
     // The readiness + end-of-day messages must list EVERY enabled feed

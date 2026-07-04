@@ -1219,6 +1219,23 @@ rules:
       connection budget. Operator inspects live_instance_lock table
       and stops one of the instances immediately.
 
+  - name: resilience-03-mint-refused-lock-not-held-escalate
+    match:
+      code: RESILIENCE-03
+    action: escalate
+    runbook_path: .claude/rules/project/dual-instance-lock-2026-07-04.md
+    confidence: 1.0
+    cooldown_secs: 0
+    justification: >-
+      RESILIENCE-03 = a Dhan generateAccessToken mint was REFUSED because
+      this process no longer holds the SSM dual-instance lock (a peer
+      instance took ownership, or shutdown released it). Severity::Critical.
+      Dhan enforces one active token at a time, so minting would
+      invalidate the lock-holding peer's JWT (the 2026-07-04
+      coexistence-audit incident class). Operator decides which instance
+      owns the Dhan session: shut the refusing process down, or stop the
+      peer / restart with --force-instance-takeover. Never auto-actioned.
+
   - name: proc-01-oom-kill-detected-escalate
     match:
       code: PROC-01

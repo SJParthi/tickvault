@@ -5,6 +5,17 @@ on:
   pull_request:
     branches: [main]
     types: [opened, synchronize, reopened, ready_for_review]
+  # Post-merge catch-up 2026-07-04: a merge performed by github-actions[bot]
+  # (the enable-auto-merge job merging via GITHUB_TOKEN) SUPPRESSES the
+  # push-triggered run on the merge commit — GitHub never fires push workflows
+  # for GITHUB_TOKEN-caused events (proven live: merge commit aafa226 of
+  # PR #1392 got ZERO post-merge runs). workflow_dispatch is the documented
+  # EXCEPTION to that suppression rule, so postmerge-catchup.yml dispatches
+  # this workflow on main whenever main HEAD has no run. A dispatched run on
+  # main MUST behave exactly like a push-to-main run (full battery incl.
+  # Coverage & Perf + the ratchet artifact) — see the all-green and
+  # concurrency expressions below.
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -14,9 +25,11 @@ permissions:
 # back-to-back merges used to cancel the post-merge Coverage/DHAT gates
 # entirely (observed cancelled main runs 09:46–12:47 IST on 2026-07-03, so
 # those commits' post-merge gates never ran at all). Group push runs by SHA so
-# every main commit gets its own full run.
+# every main commit gets its own full run. workflow_dispatch runs (the
+# post-merge catch-up path) are grouped by SHA too — they stand in for the
+# suppressed push run and must never be cancelled either.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name == 'push' && github.sha || 'pr' }}
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name != 'pull_request' && github.sha || 'pr' }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
@@ -31,6 +44,40 @@ env:
   # to "-D warnings" and tighten clippy back up.
 
 jobs:
+  # -------------------------------------------------------------------------
+  # Local-Runtime Branch Guard — the `local-runtime` branch is ONE-WAY
+  # (operator directive 2026-07-04: "it should be merged entirely from all
+  # different branches to this branch alone"). main → local-runtime merges
+  # are performed by local-branch-sync.yml; local-runtime → main is FORBIDDEN
+  # because the branch carries local-only overlay commits (local feed flags,
+  # Docker resource bumps, the local runbook) that must never reach prod.
+  # This guard FAILS any PR whose head branch is `local-runtime` (or a
+  # `local-runtime/*` prefix) so All Green — and therefore auto-merge — can
+  # never go green for it. Honest envelope: the guard keys on the HEAD
+  # BRANCH NAME; renaming the branch bypasses it (a rename is a deliberate
+  # operator act, not an accident — the accident class this blocks is
+  # opening/merging a PR from the real local-runtime branch).
+  # -------------------------------------------------------------------------
+  local-runtime-block:
+    name: "Local-Runtime Branch Guard"
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Reject PRs from the one-way local-runtime branch
+        env:
+          HEAD_REF: ${{ github.head_ref }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${HEAD_REF}" == "local-runtime" || "${HEAD_REF}" == local-runtime/* ]]; then
+            echo "::error::local-runtime is one-way (main → local-runtime only). \
+          It carries local-only overlay commits that must never merge to main. \
+          PR generally-useful changes from a normal feature branch instead."
+            exit 1
+          fi
+          echo "Head branch '${HEAD_REF}' is not local-runtime — OK."
+
   # -------------------------------------------------------------------------
   # Commit Lint — conventional-commit format check on PR commits
   # -------------------------------------------------------------------------
@@ -291,7 +338,11 @@ jobs:
   # (proven: main run 28675492296 — storage 90.90% < 91.2% floor, breached by
   # PRs that were already merged). It now runs pre-merge on every PR and feeds
   # the All Green fan-in gate. The push-to-main run is KEPT so the ratchet
-  # artifact continues to be produced on main.
+  # artifact continues to be produced on main. A workflow_dispatch run on main
+  # (the post-merge catch-up for GITHUB_TOKEN-suppressed bot merges,
+  # 2026-07-04) runs this job too — no `if:` gate excludes it — so a
+  # dispatched catch-up run produces the same coverage ratchet artifact a
+  # push run would have.
   # -------------------------------------------------------------------------
   coverage-and-perf:
     name: "Coverage & Perf"
@@ -430,6 +481,7 @@ jobs:
   all-green:
     name: "All Green"
     needs:
+      - local-runtime-block
       - commit-lint
       - design-first-wall
       - deploy-lint
@@ -457,15 +509,19 @@ jobs:
 
           # Jobs that are PR-only by design (their own `if:` skips them on
           # push-to-main). A 'skipped' result for these is legitimate ONLY on
-          # push events; on a pull_request event they MUST have run.
-          PR_ONLY_JOBS = {"commit-lint", "design-first-wall"}
+          # push events and on workflow_dispatch runs (the post-merge catch-up
+          # dispatcher fires this workflow on main to stand in for a
+          # bot-merge-suppressed push run — same non-PR semantics); on a
+          # pull_request event they MUST have run.
+          PR_ONLY_JOBS = {"commit-lint", "design-first-wall", "local-runtime-block"}
+          NON_PR_EVENTS = {"push", "workflow_dispatch"}
 
           failed = []
           for job, meta in sorted(needs.items()):
               result = meta.get("result")
               if result == "success":
                   continue
-              if result == "skipped" and event == "push" and job in PR_ONLY_JOBS:
+              if result == "skipped" and event in NON_PR_EVENTS and job in PR_ONLY_JOBS:
                   continue
               # Everything else — failure, cancelled, or an unexpected skip —
               # fails the gate. 'skipped' counts as FAILURE on pull_request

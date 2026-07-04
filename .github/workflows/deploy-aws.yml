@@ -38,25 +38,32 @@ on:
         description: 'Deploying during market hours? Type "yes" to override the guard.'
         required: false
         default: 'no'
-  push:
-    branches: [main]
-    paths:
-      # Rust sources + deps
-      - 'crates/**'
-      - 'Cargo.toml'
-      - 'Cargo.lock'
-      # systemd unit (apps's runtime contract)
-      - 'deploy/systemd/**'
-      # Docker compose (QuestDB infra; arch / image / env)
-      - 'deploy/docker/**'
-      # Config TOML (loaded by app at boot)
-      - 'config/**'
-      # The deploy workflow ITSELF (so a PR that fixes the deploy
-      # auto-redeploys without the operator clicking "Run workflow").
-      # Charter: "everything completely comprehensively fully automated".
-      - '.github/workflows/deploy-aws.yml'
-    tags:
-      - 'v*.*.*'
+  # PAUSED 2026-07-04 per operator: local-only window Mon Jul 6 - Wed Jul 8 2026. Restore with claude/aws-resume-jul9.
+  # The push-to-main trigger below was the LAST residual auto-start vector
+  # after PRs #1394 + #1396: any merge touching these path filters would
+  # fire a deploy whose "Ensure instance running" step SELF-STARTS the
+  # prod box during the pause window. workflow_dispatch above remains the
+  # manual override. Operator quote (2026-07-04, same authorization as
+  # #1394): "will you ensure it is entirely off in aws dude no auto start".
+  # push:
+  #   branches: [main]
+  #   paths:
+  #     # Rust sources + deps
+  #     - 'crates/**'
+  #     - 'Cargo.toml'
+  #     - 'Cargo.lock'
+  #     # systemd unit (apps's runtime contract)
+  #     - 'deploy/systemd/**'
+  #     # Docker compose (QuestDB infra; arch / image / env)
+  #     - 'deploy/docker/**'
+  #     # Config TOML (loaded by app at boot)
+  #     - 'config/**'
+  #     # The deploy workflow ITSELF (so a PR that fixes the deploy
+  #     # auto-redeploys without the operator clicking "Run workflow").
+  #     # Charter: "everything completely comprehensively fully automated".
+  #     - '.github/workflows/deploy-aws.yml'
+  #   tags:
+  #     - 'v*.*.*'
 
 concurrency:
   group: deploy-aws-prod
