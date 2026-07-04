@@ -215,4 +215,4 @@ bash scripts/questdb-init.sh || true
 echo "launching tickvault (scale mode=${MODE})..."
 echo "watch:  GET http://127.0.0.1:3001/api/feeds/health  -> groww_scale.connections[]"
 echo "stop:   Ctrl-C, then 'make scale-test-clean' to remove the overlay"
-exec cargo run --release
+exec cargo run --release --bin tickvault

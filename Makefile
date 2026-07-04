@@ -52,7 +52,7 @@ help: ## Show this help
 run: ## Run app in dev mode (pretty logs, localhost config)
 	@echo "🚀 Starting $(APP_NAME)..."
 	@./scripts/ensure-ready.sh
-	@cargo run
+	@cargo run --bin tickvault
 
 scale-test: ## Groww auto-scale ladder test (Mac; prod untouched) — §34
 	@bash scripts/groww-scale-test.sh ladder
@@ -124,7 +124,7 @@ run-supervised: docker-up ## Supervised run: restarts on crash up to 5 times wit
 	while [ $$attempt -lt $$max_restarts ]; do \
 		attempt=$$((attempt + 1)); \
 		echo "[supervisor] Attempt $$attempt/$$max_restarts"; \
-		cargo run --release 2>&1; \
+		cargo run --release --bin tickvault 2>&1; \
 		exit_code=$$?; \
 		if [ $$exit_code -eq 0 ]; then \
 			echo "[supervisor] Clean exit (code 0) — not restarting"; \

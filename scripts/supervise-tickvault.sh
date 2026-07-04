@@ -70,7 +70,7 @@ case "$MODE" in
         CMD=("$BIN")
         ;;
     debug)
-        CMD=(cargo run --)
+        CMD=(cargo run --bin tickvault --)
         ;;
 esac
 

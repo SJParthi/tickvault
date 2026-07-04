@@ -231,6 +231,18 @@ t "probe once: no marker → skip" "skip" "$(probe_once_decision "" 2026-07-04 0
 t "probe once: malformed marker → skip" "skip" "$(probe_once_decision garbage 2026-07-04 0)"
 t "probe once: missing stamp arg fail-safe → skip" "skip" "$(probe_once_decision 2026-07-04 2026-07-04 "")"
 
+# FIX 11: attempt-numbered marker ("<date> N"; bare date = attempt 1)
+t "marker date: bare date" "2026-07-04" "$(probe_marker_date "2026-07-04")"
+t "marker date: date + attempt" "2026-07-04" "$(probe_marker_date "2026-07-04 2")"
+t "marker attempt: bare date → 1" "1" "$(probe_marker_attempt "2026-07-04")"
+t "marker attempt: explicit 2" "2" "$(probe_marker_attempt "2026-07-04 2")"
+t "marker attempt: garbage → 1" "1" "$(probe_marker_attempt "2026-07-04 two")"
+t "marker attempt: zero → 1" "1" "$(probe_marker_attempt "2026-07-04 0")"
+t "marker attempt: empty line → 1" "1" "$(probe_marker_attempt "")"
+# end-to-end: attempt-2 marker still gates on TODAY + its OWN stamp
+t "attempt-2 marker: date matches, attempt-2 stamp absent → run" "run" \
+  "$(probe_once_decision "$(probe_marker_date "2026-07-04 2")" 2026-07-04 0)"
+
 # ── FIX 6: 100-conn probe helpers ───────────────────────────────────────────
 # shellcheck source=scripts/groww-scale-test.sh
 SCALE_TEST_LIB=1 source scripts/groww-scale-test.sh

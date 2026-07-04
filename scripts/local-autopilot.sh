@@ -637,6 +637,24 @@ probe_once_decision() {
   if [ "$1" = "${2:-}" ]; then echo run; else echo skip; fi
 }
 
+# ── FIX 11: attempt-numbered probe-once marker ──────────────────────────────
+# The marker line may be `YYYY-MM-DD` (= attempt 1, backward compatible) or
+# `YYYY-MM-DD N`. The completion stamp is per-attempt
+# (probe-once.done.<date>.<N>), so committing the marker as "<date> 2"
+# re-arms EXACTLY ONE more probe the same day after a fix — still one-shot
+# per attempt, interface still two buttons.
+
+# probe_marker_date <marker line> → the date (1st whitespace field). Pure.
+probe_marker_date() { printf '%s\n' "${1:-}" | awk '{print $1}'; }
+
+# probe_marker_attempt <marker line> → the attempt number (2nd field);
+# missing / garbage / 0 → 1 (a bare-date marker is attempt 1). Pure.
+probe_marker_attempt() {
+  local a
+  a=$(printf '%s\n' "${1:-}" | awk '{print $2}')
+  case "$a" in '' | *[!0-9]* | 0) echo 1 ;; *) echo "$a" ;; esac
+}
+
 # ── FIX 8: launcher Telegram env + stale-adopt / recreated-DB guards ───────
 
 # tg_env_resolve <tv_environment> <environment> → the SSM environment the
@@ -1513,21 +1531,30 @@ fetch_probe_verdict() {
 # clicks anything extra.
 PROBE_ONCE_MARKER="deploy/local/probe-once.date"
 maybe_run_probe_once() {
-  local today marker_date="" stamp stamp_exists=0
+  local today marker_line="" marker_date="" attempt stamp stamp_exists=0
   today="$(ist_date)"
-  stamp="data/groww-scale/probe-once.done.${today}"
-  [ -f "$stamp" ] && stamp_exists=1
   if [ -f "$PROBE_ONCE_MARKER" ]; then
-    marker_date="$(head -1 "$PROBE_ONCE_MARKER" | tr -d '[:space:]')"
+    marker_line="$(head -1 "$PROBE_ONCE_MARKER")"
+  fi
+  # FIX 11: the marker may carry an attempt number ("<date> N"); the stamp
+  # is per-attempt so a coordinator bump to attempt 2 re-arms exactly one
+  # more probe the same day (attempt 1's stamp stays behind as audit).
+  marker_date="$(probe_marker_date "$marker_line")"
+  attempt="$(probe_marker_attempt "$marker_line")"
+  stamp="data/groww-scale/probe-once.done.${today}.${attempt}"
+  [ -f "$stamp" ] && stamp_exists=1
+  # Backward compat: a pre-FIX-11 unsuffixed stamp counts as attempt 1.
+  if [ "$attempt" = "1" ] && [ -f "data/groww-scale/probe-once.done.${today}" ]; then
+    stamp_exists=1
   fi
   if [ "$(probe_once_decision "$marker_date" "$today" "$stamp_exists")" != "run" ]; then
     return 0
   fi
-  log "one-time lab marker is dated TODAY (${marker_date}) — running the 100-connection probe once BEFORE the normal start"
+  log "one-time lab marker is dated TODAY (${marker_date}, attempt ${attempt}) — running the 100-connection probe once BEFORE the normal start"
   mkdir -p data/groww-scale
   # Stamp BEFORE the probe: even a crash mid-probe must not re-trigger it —
   # the very next click goes straight to the normal start.
-  printf '%s %s probe-once attempt\n' "$today" "$(ist_hms)" >"$stamp"
+  printf '%s %s probe-once attempt %s\n' "$today" "$(ist_hms)" "$attempt" >"$stamp"
   local probe_start_epoch
   probe_start_epoch=$(date +%s)
   export_compose_creds
