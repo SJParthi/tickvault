@@ -94,10 +94,21 @@ t "in_scale_window after"   "1" "$(in_scale_window 2026-07-09 2026-07-06 2026-07
 # ── real repo holiday file sanity (Republic Day 2026 is listed) ────────────
 t "real base.toml holiday hit" "holiday" "$(classify_day 2026-01-26 1 config/base.toml 2026-07-06 2026-07-08)"
 
-# ── ONE common rolling log: rotation decision + retention pruning ──────────
-t "rotate: day changed" "yes" "$(log_rotate_needed 2026-07-03 2026-07-04)"
-t "rotate: same day" "no" "$(log_rotate_needed 2026-07-04 2026-07-04)"
-t "rotate: first run (no stamp)" "no" "$(log_rotate_needed "" 2026-07-04)"
+# ── ONE log file (FIX 4): day-rollover filename + fixed-name symlink ───────
+t "daily log path for a date" "data/logs/app.2026-07-04.log" "$(daily_app_log 2026-07-04)"
+t "daily log rolls with the date (per-write recompute)" "data/logs/app.2026-07-05.log" "$(daily_app_log 2026-07-05)"
+t "daily log garbage date → fail-quiet fixed name" "data/logs/app.unknown-date.log" "$(daily_app_log not-a-date)"
+t "daily log empty date → fail-quiet fixed name" "data/logs/app.unknown-date.log" "$(daily_app_log "")"
+# symlink helper: points the fixed name at today's file; re-points on rollover
+mkdir -p "$TMP/logs"
+touch "$TMP/logs/app.2026-07-04.log" "$TMP/logs/app.2026-07-05.log"
+refresh_one_file_symlink "$TMP/logs/app.2026-07-04.log" "$TMP/logs/tickvault.log"
+t "symlink points at today's file" "app.2026-07-04.log" "$(readlink "$TMP/logs/tickvault.log")"
+refresh_one_file_symlink "$TMP/logs/app.2026-07-05.log" "$TMP/logs/tickvault.log"
+t "symlink re-points on day rollover" "app.2026-07-05.log" "$(readlink "$TMP/logs/tickvault.log")"
+t "symlink helper quiet on empty args" "0" "$(refresh_one_file_symlink "" "" && echo 0 || echo 1)"
+
+# retention pruning (still used by the dated run-stamp files)
 # retention: keep the newest 2 of 4 rotated files → oldest 2 listed for delete
 DOOMED=$(rotated_logs_to_delete 2 \
   "d/autopilot.log.2026-07-01" "d/autopilot.log.2026-07-03" \

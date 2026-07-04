@@ -76,8 +76,11 @@ if [ $rc -ne 0 ]; then
 fi
 echo "App is running. Live log below — closing this window is safe."
 echo "-----------------------------------------------------------"
-# Tail the app's own canonical log (the human one); fall back to the ONE
-# common autopilot log if the app has not created its file yet.
-APP_LOG_FILE=$(ls -t data/logs/app.*.log 2>/dev/null | head -1)
-if [ -z "$APP_LOG_FILE" ]; then APP_LOG_FILE="data/logs/autopilot/autopilot.log"; fi
+# ONE file (FIX 4, operator 2026-07-04): launcher + build output + app all
+# write today's data/logs/app.<date>.log, and data/logs/tickvault.log is a
+# fixed-name symlink kept pointed at it — tail that one name.
+APP_LOG_FILE="data/logs/tickvault.log"
+if [ ! -e "$APP_LOG_FILE" ]; then
+  APP_LOG_FILE=$(ls -t data/logs/app.*.log 2>/dev/null | head -1)
+fi
 exec tail -f "$APP_LOG_FILE"

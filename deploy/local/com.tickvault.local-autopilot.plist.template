@@ -31,14 +31,17 @@
     <dict><key>Weekday</key><integer>4</integer><key>Hour</key><integer>8</integer><key>Minute</key><integer>55</integer></dict>
     <dict><key>Weekday</key><integer>5</integer><key>Hour</key><integer>8</integer><key>Minute</key><integer>55</integer></dict>
   </array>
-  <!-- ONE common log file (operator 2026-07-04): launchd's stray stdout/
-       stderr land in the SAME rolling data/logs/autopilot/autopilot.log the
-       script writes (log() is tty-aware, so no duplicate lines under
-       launchd; launchd opens the path with append). -->
+  <!-- ONE log file (FIX 4, operator 2026-07-04): every normal launcher line
+       goes into the daily data/logs/app.<date>.log via the SCRIPT's own
+       redirects (recomputed per write — launchd cannot date-template paths
+       itself). This fixed shim file exists ONLY for pre-script crashes
+       (bash not found, repo moved, permission error) — in normal operation
+       it stays empty. The operator-facing ONE file is the
+       data/logs/tickvault.log symlink → today's app.<date>.log. -->
   <key>StandardOutPath</key>
-  <string>__REPO__/data/logs/autopilot/autopilot.log</string>
+  <string>__REPO__/data/logs/launchd-boot.log</string>
   <key>StandardErrorPath</key>
-  <string>__REPO__/data/logs/autopilot/autopilot.log</string>
+  <string>__REPO__/data/logs/launchd-boot.log</string>
   <key>EnvironmentVariables</key>
   <dict>
     <!-- launchd agents get a minimal PATH; the script needs docker, cargo,

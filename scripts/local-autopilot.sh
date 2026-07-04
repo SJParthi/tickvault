@@ -30,8 +30,11 @@
 
 # ── Tunables (env-overridable) ──────────────────────────────────────────────
 AUTOPILOT_DIR="${AUTOPILOT_DIR:-data/local-autopilot}" # runtime STATE (pids, markers, lock) — NOT logs
-LOG_DIR="${LOG_DIR:-data/logs/autopilot}"              # ALL autopilot/dev-run log lines — ONE rolling file
-LOG_KEEP="${LOG_KEEP:-7}"                              # rotated day-files kept; older deleted
+# FIX 4 (operator 2026-07-04): ONE human log. All launcher output appends
+# into the SAME daily rolling file the app uses (data/logs/app.<date>.log,
+# recomputed per write — see current_log). ONE_FILE_LINK is the fixed name
+# the operator always opens — a symlink kept pointed at today's file.
+ONE_FILE_LINK="${ONE_FILE_LINK:-data/logs/tickvault.log}"
 MANUAL_STOP_MARKER="${MANUAL_STOP_MARKER:-data/local-manual-stop.marker}"
 SCALE_WINDOW_START="${SCALE_WINDOW_START:-2026-07-06}"
 SCALE_WINDOW_END="${SCALE_WINDOW_END:-2026-07-08}"
@@ -68,13 +71,6 @@ LOCKDIR="$AUTOPILOT_DIR/autopilot.lock.d"
 ist_date() { TZ=Asia/Kolkata date +%F; }
 ist_hms() { TZ=Asia/Kolkata date +%H:%M:%S; }
 ist_weekday() { TZ=Asia/Kolkata date +%u; } # 1=Mon .. 7=Sun
-
-# log_rotate_needed <last_stamp_date> <today> → yes|no.
-# Day-change rotation for the ONE common autopilot.log (operator 2026-07-04:
-# "one common log folder and one common log file with rolling appender").
-log_rotate_needed() {
-  if [ -n "${1:-}" ] && [ "${1:-}" != "$2" ]; then echo yes; else echo no; fi
-}
 
 # rotated_logs_to_delete <keep_n> <rotated file...> → the files BEYOND the
 # newest keep_n, one per line (date-suffixed names sort lexicographically ==
@@ -301,6 +297,29 @@ questdb_state_degraded() {
   esac
 }
 
+# daily_app_log <YYYY-MM-DD> → the ONE human-readable daily log file the app
+# and the launcher SHARE (pure). FIX 4 (operator 2026-07-04: literally ONE
+# log): all launcher output appends into the SAME data/logs/app.<date>.log.
+# Garbage date → a fixed fail-quiet name inside data/logs/ (a write can
+# never land outside the logs directory).
+daily_app_log() {
+  case "$1" in
+  [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]) echo "data/logs/app.$1.log" ;;
+  *) echo "data/logs/app.unknown-date.log" ;;
+  esac
+}
+
+# refresh_one_file_symlink <daily-log-path> <symlink-path> → keeps the
+# operator-facing ONE-file name (data/logs/tickvault.log) pointed at TODAY's
+# daily log via `ln -sfn` (atomic replace; macOS Finder follows it fine).
+# Relative target (basename) — both live in data/logs/. Failures are quiet:
+# the daily file itself is always the truth; the symlink is convenience.
+# I/O helper (testable in a tmpdir), safe to define in library mode.
+refresh_one_file_symlink() {
+  [ -n "${1:-}" ] && [ -n "${2:-}" ] || return 0
+  ln -sfn "$(basename "$1")" "$2" 2>/dev/null || true
+}
+
 # ── End of pure functions. Library mode stops here. ────────────────────────
 if [[ "${AUTOPILOT_LIB:-0}" == "1" ]]; then
   return 0 2>/dev/null || exit 0
@@ -308,47 +327,52 @@ fi
 
 set -euo pipefail
 cd "$(dirname "$0")/.."
-mkdir -p "$AUTOPILOT_DIR" "$LOG_DIR"
+mkdir -p "$AUTOPILOT_DIR" data/logs
 
 TODAY="$(ist_date)"
-# ONE COMMON LOG FILE (operator 2026-07-04: "just have one common log folder
-# and one common log file with rolling appender"). Every autopilot line, the
-# cargo build output, AND the app's stdout/stderr land in this single file.
-# Rolling: at day change the file rotates to autopilot.log.<date>; the newest
-# LOG_KEEP rotated files are kept, older deleted. State files (pids, markers,
-# lock, stamp) stay in data/local-autopilot/ — state, not logs. The app's own
-# canonical sinks (data/logs/app.*.log, errors.log, errors.jsonl.*) are
-# RULE-LOCKED (observability-architecture.md) and untouched.
-LOG="$LOG_DIR/autopilot.log"
-
-rotate_autopilot_log() {
-  local stamp="$AUTOPILOT_DIR/.log-date" last=""
-  [ -f "$stamp" ] && last="$(cat "$stamp" 2>/dev/null || true)"
-  if [ "$(log_rotate_needed "$last" "$TODAY")" = "yes" ] && [ -f "$LOG" ]; then
-    mv "$LOG" "$LOG_DIR/autopilot.log.$last" 2>/dev/null || true
-    local rotated=("$LOG_DIR"/autopilot.log.*)
-    if [ -e "${rotated[0]}" ]; then
-      while IFS= read -r doomed; do
-        if [ -n "$doomed" ]; then rm -f "$doomed"; fi
-      done < <(rotated_logs_to_delete "$LOG_KEEP" "${rotated[@]}")
-    fi
-  fi
-  echo "$TODAY" >"$stamp"
+# ONE HUMAN LOG FILE (FIX 4, operator 2026-07-04 escalated: literally ONE
+# file, no date-picking). EVERYTHING human-readable — the launcher's own
+# lines (prefixed [launcher]), the cargo build output, AND the app's
+# stdout/stderr — appends into the SAME daily rolling file the app uses:
+#   data/logs/app.<YYYY-MM-DD>.log        (one file per day)
+#   data/logs/tickvault.log               (symlink → always TODAY's file)
+# The filename is recomputed on EVERY write (current_log), so long-running
+# loops roll to the new day's file at IST midnight, and the tickvault.log
+# symlink is re-pointed on every launcher write (ln -sfn — atomic, cheap).
+# Machine-format sinks (errors.jsonl.*, errors.log, the app's hourly
+# app.YYYY-MM-DD-HH tracing chunks) are RULE-LOCKED robot copies
+# (observability-architecture.md) and untouched — this consolidation is the
+# HUMAN file only. Honest notes: (a) raw tool output (cargo/docker) appends
+# unprefixed between [launcher] marker lines; (b) the app PROCESS keeps the
+# file handle it was launched with, so a run crossing IST midnight keeps
+# writing its launch-day file until the daily 15:35 stop → next-morning
+# start rolls it — in practice each trading day's file carries that day's
+# run; (c) launchd itself cannot date-template paths, so the plist points
+# at a tiny fixed shim (launchd-boot.log) that only ever sees pre-script
+# crashes — every normal line lands in the daily file via this script.
+current_log() {
+  local f
+  f="$(daily_app_log "$(ist_date)")"
+  refresh_one_file_symlink "$f" "$ONE_FILE_LINK"
+  echo "$f"
 }
-rotate_autopilot_log
 
-# log(): append to the ONE file; echo to the terminal only when interactive.
-# (The launchd plist points its own stdout/stderr at the SAME file — a tee
-# to stdout there would double-write every line.)
+# Legacy sweep (FIX 4): the pre-2026-07-04 separate launcher log
+# (data/logs/autopilot/autopilot.log + its dated rotations) is retired —
+# remove it so the operator can never open a stale second file.
+rm -rf data/logs/autopilot 2>/dev/null || true
+
+# log(): append to the ONE daily file with a greppable [launcher] prefix;
+# echo to the terminal only when interactive.
 log() {
-  local line="[$(ist_hms) IST] $*"
-  echo "$line" >>"$LOG"
+  local line="[$(ist_hms) IST] [launcher] $*"
+  echo "$line" >>"$(current_log)"
   if [ -t 1 ]; then echo "$line"; fi
 }
 
 tg() { # best-effort Telegram; the log always carries the message
   log "TELEGRAM: $*"
-  bash scripts/notify-telegram.sh "💻 LOCAL autopilot — $*" >>"$LOG" 2>&1 || true
+  bash scripts/notify-telegram.sh "💻 LOCAL autopilot — $*" >>"$(current_log)" 2>&1 || true
 }
 
 # ── Service primitives (shared by autopilot + manual start/stop) ───────────
@@ -366,7 +390,7 @@ ensure_docker() {
   fi
   if docker_alive; then return 0; fi
   log "Docker daemon not running — attempting to launch Docker.app"
-  if [ "$(uname -s)" = "Darwin" ]; then open -a Docker >>"$LOG" 2>&1 || true; fi
+  if [ "$(uname -s)" = "Darwin" ]; then open -a Docker >>"$(current_log)" 2>&1 || true; fi
   local i
   for i in $(seq 1 24); do
     sleep 5
@@ -386,7 +410,7 @@ questdb_container_state() {
 
 ensure_questdb() {
   docker compose -f deploy/docker/docker-compose.yml \
-    -f deploy/docker/docker-compose.local.yml up -d tv-questdb >>"$LOG" 2>&1
+    -f deploy/docker/docker-compose.local.yml up -d tv-questdb >>"$(current_log)" 2>&1
   # Self-heal (2026-07-04): a degraded container (unhealthy/exited/dead/
   # paused — e.g. after a hard Mac sleep or an out-of-memory kill) gets ONE
   # automatic `docker restart` if the database has not answered after ~30s.
@@ -401,7 +425,7 @@ ensure_questdb() {
     if ((restarted == 0 && i >= 6)) && questdb_state_degraded "$state"; then
       log "QuestDB container degraded ('$state') — one automatic docker restart"
       tg "⚠️ The database container was stuck — restarting it automatically. No action needed."
-      docker restart tv-questdb >>"$LOG" 2>&1 || true
+      docker restart tv-questdb >>"$(current_log)" 2>&1 || true
       restarted=1
     fi
     sleep 5
@@ -448,16 +472,16 @@ start_app() { # $1 = label for the log
     return 0
   fi
   log "building release binary (first build of the day can take minutes)..."
-  if ! cargo build --release >>"$LOG" 2>&1; then
-    tg "🆘 Build FAILED — the app cannot start. Last lines: $(tail -5 "$LOG" | tr '\n' ' | ')"
+  if ! cargo build --release >>"$(current_log)" 2>&1; then
+    tg "🆘 Build FAILED — the app cannot start. Last lines: $(tail -5 "$(current_log)" | tr '\n' ' | ')"
     return 1
   fi
-  nohup ./target/release/tickvault >>"$LOG" 2>&1 &
+  nohup ./target/release/tickvault >>"$(current_log)" 2>&1 &
   echo $! >"$APP_PIDFILE"
-  log "app launched ($1) — pid $(cat "$APP_PIDFILE"), log $LOG"
+  log "app launched ($1) — pid $(cat "$APP_PIDFILE"), log $ONE_FILE_LINK → $(current_log)"
   sleep 60
   if ! app_alive; then
-    tg "🆘 App DIED within 60s of launch ($1). Log tail: $(tail -8 "$LOG" | tr '\n' ' | ')"
+    tg "🆘 App DIED within 60s of launch ($1). Log tail: $(tail -8 "$(current_log)" | tr '\n' ' | ')"
     return 1
   fi
   write_run_stamp
@@ -546,9 +570,9 @@ stop_app() {
 
 apply_overlay() { # $1 = groww-scale-test.sh mode (probe|max|...) or "none"
   if [ "$1" = "none" ]; then
-    bash scripts/groww-scale-test.sh clean >>"$LOG" 2>&1
+    bash scripts/groww-scale-test.sh clean >>"$(current_log)" 2>&1
   else
-    DRY_RUN=1 bash scripts/groww-scale-test.sh "$1" >>"$LOG" 2>&1
+    DRY_RUN=1 bash scripts/groww-scale-test.sh "$1" >>"$(current_log)" 2>&1
   fi
   log "config overlay: $1"
 }
@@ -580,7 +604,7 @@ cmd_start() {
 cmd_stop() {
   log "== MANUAL STOP (writing manual-stop marker — autopilot stands down today) =="
   stop_app
-  bash scripts/groww-scale-test.sh clean >>"$LOG" 2>&1 || true
+  bash scripts/groww-scale-test.sh clean >>"$(current_log)" 2>&1 || true
   stop_caffeinate
   # Leave QuestDB up — but if the container is degraded, restart it now so
   # the next Start (and any manual queries) find a healthy database.
@@ -589,7 +613,7 @@ cmd_stop() {
     qdb_state="$(questdb_container_state)"
     if questdb_state_degraded "$qdb_state"; then
       log "QuestDB container degraded at stop ('$qdb_state') — restarting it so it is healthy for the next Start"
-      docker restart tv-questdb >>"$LOG" 2>&1 || true
+      docker restart tv-questdb >>"$(current_log)" 2>&1 || true
     fi
   fi
   printf '%s %s manual stop\n' "$TODAY" "$(ist_hms)" >"$MANUAL_STOP_MARKER"
@@ -618,14 +642,10 @@ cmd_dev() {
     log "scripts/ensure-ready.sh missing/not executable — skipping (docker + questdb still ensured below)"
   fi
   cmd_start || return 1
-  # Tail the APP's own canonical log (data/logs/app.YYYY-MM-DD.log — the
-  # human sink, rule-locked in observability-architecture.md) rather than
-  # duplicating it; fall back to the common autopilot.log if the app has not
-  # created its file yet.
+  # ONE file (FIX 4): launcher + app all write today's daily file; tail it.
   local app_log
-  app_log=$(ls -t data/logs/app.*.log 2>/dev/null | head -1 || true)
-  if [ -z "$app_log" ]; then app_log="$LOG"; fi
-  echo "=== tickvault is RUNNING — tailing $app_log ==="
+  app_log="$(current_log)"
+  echo "=== tickvault is RUNNING — tailing $app_log (fixed name: $ONE_FILE_LINK) ==="
   echo "=== stopping this tail does NOT stop the app; use the 'Stop tickvault' run config ==="
   exec tail -f "$app_log"
 }
@@ -642,7 +662,7 @@ cmd_status() {
   else
     echo "manual : no active stop marker"
   fi
-  echo "logs   : $LOG (single rolling file; app log = data/logs/app.<date>.log)"
+  echo "logs   : $ONE_FILE_LINK → $(current_log) (ONE file — app + launcher + build output)"
 }
 
 # scale-window override file: "START END" (ISO dates) in
@@ -663,13 +683,13 @@ preflight_git() {
   branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "?")
   if [ "$branch" != "local-runtime" ]; then
     log "on branch '$branch' — attempting checkout of local-runtime"
-    if ! git checkout local-runtime >>"$LOG" 2>&1; then
+    if ! git checkout local-runtime >>"$(current_log)" 2>&1; then
       tg "⚠️ Could not switch to the local-runtime branch (uncommitted changes?). Running the EXISTING checkout '$branch' — code may be stale."
       return 0
     fi
   fi
-  if git fetch origin >>"$LOG" 2>&1; then
-    if ! git merge --ff-only origin/local-runtime >>"$LOG" 2>&1; then
+  if git fetch origin >>"$(current_log)" 2>&1; then
+    if ! git merge --ff-only origin/local-runtime >>"$(current_log)" 2>&1; then
       tg "⚠️ local-runtime has diverged from origin (conflict?) — running the EXISTING local code. Resolve with: git merge origin/local-runtime"
     fi
   else
@@ -688,7 +708,7 @@ wait_until_ist() { # $1 = "HH:MM"; returns immediately if already past
 
 eod_summary() {
   local mode="$1" summary="data/groww-scale/summary-$TODAY.tsv" digest="" errors
-  errors=$(grep -c "ERROR" "$LOG" 2>/dev/null || true)
+  errors=$(grep -c "ERROR" "$(current_log)" 2>/dev/null || true)
   if [ -f "$summary" ]; then
     digest=$'\nStage table (outcome | conns | proof | capturing | bytes | cpu | mem):\n'
     digest+=$(awk -F'\t' 'NR>1 {printf "%s | %s | %s | %s | %s | %s%% | %s%%\n", $2, $3, $6, $7, $8, $9, $10}' "$summary" | tail -12)
@@ -734,12 +754,12 @@ monitor_until_eod() {
       ;;
     relaunch)
       relaunches=$((relaunches + 1))
-      tg "⚠️ App died mid-session — relaunching once (attempt $relaunches). Log tail: $(tail -5 "$LOG" | tr '\n' ' | ')"
+      tg "⚠️ App died mid-session — relaunching once (attempt $relaunches). Log tail: $(tail -5 "$(current_log)" | tr '\n' ' | ')"
       sleep 30
       start_app "auto-relaunch" || true
       ;;
     alert)
-      tg "🆘 App died AGAIN after the one relaunch — NOT retrying (avoid crash-looping the feed). Log tail: $(tail -8 "$LOG" | tr '\n' ' | '). Double-click Start TickVault after investigating."
+      tg "🆘 App died AGAIN after the one relaunch — NOT retrying (avoid crash-looping the feed). Log tail: $(tail -8 "$(current_log)" | tr '\n' ' | '). Double-click Start TickVault after investigating."
       relaunches=$((relaunches + 1)) # alert once, then idle on this state
       ;;
     esac
@@ -859,7 +879,7 @@ cmd_run() {
   # ── 15:35 IST: graceful end of day (skip app-stop if manual stop won). ──
   if ! manual_stop_active "$MANUAL_STOP_MARKER" "$TODAY"; then
     stop_app
-    bash scripts/groww-scale-test.sh clean >>"$LOG" 2>&1 || true
+    bash scripts/groww-scale-test.sh clean >>"$(current_log)" 2>&1 || true
   fi
   stop_caffeinate
   eod_summary "$day"

@@ -180,23 +180,34 @@ runs the harness flips `dhan_enabled` OFF in place (restored by
 NORMAL local window only. Full sequence + evidence locations:
 `docs/runbooks/groww-scale-test.md` ("100K MAX-SCALE LAB" section).
 
-## WHERE ARE MY LOGS (one line per file + who reads it)
+## WHERE ARE MY LOGS — ONE file: `data/logs/tickvault.log`
 
-Operator 2026-07-04: "one common log folder and one common log file with
-rolling appender." One folder: `data/logs/`. What remains:
+Operator 2026-07-04 (escalated): literally ONE file, no date-picking.
+**Open `data/logs/tickvault.log` — always today, always everything
+(Dhan + Groww + launcher + build output).** It is a fixed-name shortcut
+(macOS Finder follows it fine) that the launcher keeps pointed at today's
+`data/logs/app.<date>.log`; yesterday's files auto-trim. Every launcher
+line is prefixed `[launcher]` so it is greppable inside the shared file.
 
 | File | Who reads it | What it is |
 |---|---|---|
-| `data/logs/app.YYYY-MM-DD.log` | **HUMAN** — the one to open | The app's full log, daily rotation (rule-locked canonical sink; the Run/Start windows tail this) |
-| `data/logs/autopilot/autopilot.log` | **the launcher** (and you when boot fails) | The ONE autopilot/dev-run file: autopilot decisions + cargo build output + app stdout/stderr + launchd stray output. Rolls at day change to `autopilot.log.<date>`, keeps the last 7, deletes older |
-| `data/logs/errors.log` | human grep | WARN+ only, single file (rule-locked) |
+| `data/logs/tickvault.log` | **HUMAN — the ONLY one to open** | Fixed-name shortcut → today's `app.<date>.log`. Everything human-readable lives here |
+| `data/logs/app.YYYY-MM-DD.log` | the shortcut's target (one per day) | The shared daily file: app output + `[launcher]` lines + cargo build output (the Run/Start windows tail this) |
+| `data/logs/launchd-boot.log` | you, ONLY if the 8:55 AM auto-start never printed anything | Tiny fixed shim for pre-script crashes (macOS cannot date-route its own capture); empty in normal operation |
+| `data/logs/errors.log` | human grep | WARN+ only, single file (rule-locked robot copy) |
 | `data/logs/errors.jsonl.YYYY-MM-DD-HH` | **triage ROBOT** (MCP/Telegram chain) | ERROR-only JSONL, hourly, 48h auto-swept (rule-locked — never touch) |
 | `data/logs/errors.summary.md` | robot + human snapshot | 60s-refresh summary (rule-locked) |
 
-The old per-date scatter (`data/local-autopilot/app-<date>.log`,
-`autopilot-<date>.log`, `launchd.out/err.log`) is GONE — any leftovers from
-earlier runs are inert and can be deleted. `data/local-autopilot/` now holds
+The old separate launcher log (`data/logs/autopilot/autopilot.log` + dated
+rotations) is GONE — the launcher sweeps it away on start so a stale second
+file can never be opened by mistake. The even older per-date scatter
+(`data/local-autopilot/app-<date>.log`, `autopilot-<date>.log`,
+`launchd.out/err.log`) is also gone. `data/local-autopilot/` now holds
 runtime STATE only (pid files, manual-stop marker, lock, scale-window.conf).
+
+Honest note: a run that crosses midnight keeps writing its launch-day file
+until the daily stop/start cycle rolls it — in practice each trading day's
+file carries that day's run, and the shortcut always names today.
 
 ## Where the data lives
 
