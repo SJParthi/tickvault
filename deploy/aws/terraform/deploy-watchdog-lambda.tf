@@ -146,24 +146,12 @@ resource "aws_cloudwatch_event_rule" "deploy_watchdog_premarket" {
   name                = "tv-${var.environment}-deploy-watchdog-premarket"
   description         = "08:50 IST (Mon-Fri) — cover a missed 08:45 pre-market auto-deploy"
   schedule_expression = "cron(20 3 ? * MON-FRI *)"
-  # PAUSED 2026-07-04 per operator: local-only verification Mon Jul 6 - Wed Jul 8 2026.
-  # MUST BE REVERTED for Thu Jul 9 resume — revert branch: claude/aws-resume-jul9
-  # (with the box intentionally OFF and this PR having moved main HEAD, the
-  # stale-check would fire every weekday morning: HIGH Telegram "cron slipped"
-  # + a deploy-aws-after-close dispatch whose deploy-aws run SELF-STARTS the
-  # paused box. Disabled for the window; the instance-start event rule below
-  # stays ENABLED so a deliberate MANUAL start still gets an instant deploy.)
-  state = "DISABLED"
 }
 
 resource "aws_cloudwatch_event_rule" "deploy_watchdog_postmarket" {
   name                = "tv-${var.environment}-deploy-watchdog-postmarket"
   description         = "15:51 IST (Mon-Fri) — cover a missed 15:46 post-market auto-deploy"
   schedule_expression = "cron(21 10 ? * MON-FRI *)"
-  # PAUSED 2026-07-04 per operator: local-only verification Mon Jul 6 - Wed Jul 8 2026.
-  # MUST BE REVERTED for Thu Jul 9 resume — revert branch: claude/aws-resume-jul9
-  # (same rationale as the premarket rule above.)
-  state = "DISABLED"
 }
 
 resource "aws_cloudwatch_event_target" "deploy_watchdog_premarket" {
