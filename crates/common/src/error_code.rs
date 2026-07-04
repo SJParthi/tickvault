@@ -748,9 +748,17 @@ pub enum ErrorCode {
     /// the watch-set. The ladder step HALTs; the younger conflicting
     /// connection is killed. Should be unreachable (the `cut_shards` ratchet
     /// tests pin disjointness + coverage) — a firing means a real cutter/
-    /// ladder bug. Severity::Critical (never auto-triaged). The `ticks`
-    /// DEDUP key still prevents duplicate rows — this is a contract breach
-    /// signal, not data loss.
+    /// ladder bug. Severity::Critical (never auto-triaged).
+    ///
+    /// CORRECTED 2026-07-04 (Session-B verdict): the `ticks` DEDUP key
+    /// `(ts, security_id, segment, capture_seq, feed)` does NOT collapse
+    /// cross-connection overlap — `capture_seq` is globally unique and IN
+    /// the key, so two connections streaming the SAME instrument produce
+    /// DISTINCT `capture_seq` values → TWO rows per tick (silent duplicate
+    /// rows). The cut-time fail-closed cutter is the actual protection;
+    /// until the PR-2 runtime duplicate-SID detector ships, an overlap that
+    /// escapes the cutter IS silent data duplication — which is exactly why
+    /// this code is Critical, not Medium.
     GrowwScale03ShardOverlap,
     /// GROWW-SCALE-04 (§34 auto-scale, 2026-07-03) — a `groww_scale_audit`
     /// rung-transition row could not be persisted (ILP down / QuestDB
