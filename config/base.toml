@@ -300,6 +300,13 @@ auto_start_docker = true
 [feeds]
 dhan_enabled = true
 groww_enabled = false
+# Groww NATIVE-RUST SHADOW client (PR-R1 of the parity migration, operator
+# "go" 2026-07-04 — groww-second-feed-scope-2026-06-19.md §35). Default OFF.
+# When true, the native Rust client runs ALONGSIDE the Python sidecar (same
+# watch set) and writes its own NDJSON capture file
+# (data/groww/rust-live-ticks.ndjson) for the exact per-tick parity comparer.
+# No shared-table writes, no strategy/order wiring, no sidecar changes.
+groww_native_shadow = false
 
 # Groww multi-connection AUTO-SCALE ladder (operator authorization 2026-07-03,
 # §34 of .claude/rules/project/groww-second-feed-scope-2026-06-19.md).

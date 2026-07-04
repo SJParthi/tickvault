@@ -392,3 +392,69 @@ Always loaded. Reinforced on any session editing `crates/core/src/feed/groww/sha
 `crates/app/src/groww_scale_ladder.rs`, `crates/app/src/groww_sidecar_supervisor.rs`,
 `[feeds.groww.scale]` config, or any file containing `GrowwScaleConfig`, `cut_shards`,
 `GROWW_SHARD_SPEC`, or `groww_scale_audit`.
+
+---
+
+# §35 — Native-Rust SHADOW client authorized (operator "go" 2026-07-04 — PR-R1 of the parity migration)
+
+> **Authority:** this section EXTENDS §32 ("native Rust remains the production
+> option") and honors §33 (LIVE-FEED-ONLY — the shadow client makes ZERO
+> historical calls). The Python sidecar path (§32) is UNCHANGED and remains the
+> production capture chain. Companion plan:
+> `.claude/plans/active-plan-groww-native-r1.md`. Companion error codes:
+> `.claude/rules/project/groww-native-rust-error-codes.md`
+> (GROWW-NATIVE-01..04).
+
+## §35.0 The operator authorization (2026-07-04, this session)
+
+Operator approved **"go"** for PR-R1: the native-Rust Groww client, built from
+the growwapi-1.5.0 wheel protocol extraction (the sanctioned §32 reference;
+brutex code banned), runs **DEFAULT-OFF in SHADOW** alongside the Python
+sidecar — same watch set, its OWN NDJSON capture
+(`data/groww/rust-live-ticks.ndjson`, same line schema as the sidecar's) for
+the future exact per-tick parity comparer (PR-R2). NO shared-table writes, NO
+strategy/order wiring, NO sidecar changes. The approval INCLUDED new
+dependencies (`async-nats` + `nkeys` + `prost`).
+
+**Dependency outcome (honest record, SMALLER than approved):** implementation
+found the repo already carries merged, tested, zero-dep native equivalents —
+`feed/groww/nats.rs` (framing), `feed/groww/nkey.rs` (nkey codec),
+`feed/groww/proto.rs` (protobuf decode), `feed/groww/subjects.rs` (subject
+grammar) — so NONE of the 3 approved crates was added. The ONLY dependency
+change is promoting **`aws-lc-rs` 1.17.0** (already resolved in Cargo.lock via
+rustls) to a direct workspace dep for ed25519 session-keypair generation +
+NATS nonce signing. Rationale: (a) zero new supply-chain roots; (b) full
+control of the `CONNECT` frame fields to mimic nats-py (the #1 live-probe
+risk — `async-nats` does not allow that); (c) the hand-written decoders are
+exactly the "prefer hand-written structs" guidance. Adding any of the 3
+approved crates later requires no new approval (already granted) but MUST
+update this section with the reason.
+
+## §35.1 The contract (LOCKED)
+
+| Aspect | Locked value |
+|---|---|
+| Config gate | `[feeds] groww_native_shadow = false` (default OFF; `#[serde(default)]`) — flipping the DEFAULT needs a fresh dated quote |
+| Universe | READ the Rust-built watch file (`data/groww/groww-watch-<date>.json`) — the sidecar's exact source; NEVER a self-built universe |
+| Auth | Access token = SSM READ-ONLY (token-minter lock 2026-07-02 UNTOUCHED). Per-session socket-token mint = live-feed-AUTH KEEP class, recorded in `no-rest-except-live-feed-2026-06-27.md` §3 |
+| Output | `data/groww/rust-live-ticks.ndjson` ONLY (GrowwTickLine schema, IST-midnight rotation mirroring the sidecar). NO `ticks`/`candles_*`/audit-table writes in R1 |
+| Recovery | Bounded expo reconnect (5s→60s); auth-class failure → fresh keypair + fresh socket-token mint; SSM re-read ≥60s pacing; supervised respawn (WS-GAP-05 pattern) |
+| Historical | ZERO (§33 stands — live feed only) |
+| Migration | PR-R2 = parity comparer; PR-R3 = cutover ONLY after clean parity days + a fresh dated operator quote (sidecar demoted to kill-switch fallback first) |
+
+## §35.2 What a PR that violates this looks like (REJECT)
+
+- Ships `groww_native_shadow = true` as the DEFAULT without a fresh dated quote.
+- Makes the shadow client write ANY shared table, or wires it into strategy/orders.
+- Builds its own universe instead of reading the watch file.
+- Mints or caches-past-auth-failure the ACCESS token (token-minter lock).
+- Adds a Groww historical/backtest call (§33).
+- Removes the Python sidecar or changes its behaviour in the name of the shadow client (that is PR-R3, gated on parity evidence + a dated quote).
+
+## §35.3 Trigger (auto-loaded)
+
+Always loaded. Reinforced on any session editing
+`crates/core/src/feed/groww/native/`, `crates/app/src/groww_native_shadow.rs`,
+the `[feeds] groww_native_shadow` key, or any file containing
+`groww_native_shadow` / `rust-live-ticks.ndjson` / `GROWW_SOCKET_TOKEN_URL`.
+
