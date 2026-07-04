@@ -116,6 +116,16 @@ pub fn build_router_with_auth(
     //     the operator flips feeds tokenless on localhost (operator 2026-06-23);
     //   • live trading (false) → bearer-protected.
     // The Dhan-disable safety gate (can_disable_dhan) is unchanged either way.
+    //
+    // ⚠ SECURITY NOTE (adversarial re-review 2026-07-04, HIGH — DEFERRED,
+    // OPERATOR DECISION PENDING): with the 3001 tailscale funnel live, the
+    // dry-run `feed_toggle_public=true` branch exposes this MUTATING toggle
+    // TOKENLESS to the internet (feed-disable DoS on the data capture).
+    // Gating it behind bearer auth unconditionally would change the
+    // operator-locked 2026-06-23 tokenless-localhost dry-run workflow, so per
+    // the PR-E lock protocol it needs a dated operator quote FIRST — this
+    // comment records the exposure honestly until that ruling lands.
+    //
     // `auth_config` is consumed by the layer below regardless of branch (so no
     // unused-variable lint when the toggle is public and the router is empty).
     const FEED_TOGGLE_PATH: &str = "/api/feeds/{feed}";
