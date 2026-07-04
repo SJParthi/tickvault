@@ -191,8 +191,37 @@ t "clamp: garbage input → rc 1 (keep configured limit)" "1" "$(clamp_qdb_mem_g
 # 5.2 Telegram SSM parameter path — MUST match the app's own namespace
 t "tg param path dev bot-token" "/tickvault/dev/telegram/bot-token" "$(tg_ssm_path dev bot-token)"
 t "tg param path prod chat-id" "/tickvault/prod/telegram/chat-id" "$(tg_ssm_path prod chat-id)"
-t "tg param path empty env defaults to dev" "/tickvault/dev/telegram/bot-token" "$(tg_ssm_path "" bot-token)"
+t "tg param path empty env defaults to prod (the app's default)" "/tickvault/prod/telegram/bot-token" "$(tg_ssm_path "" bot-token)"
 t "tg param path never uses the /dlt namespace" "0" "$(case "$(tg_ssm_path dev bot-token)" in /dlt/*) echo 1 ;; *) echo 0 ;; esac)"
+
+# ── FIX 8.1: launcher resolves the SSM env exactly like the app ─────────────
+t "tg env: TV_ENVIRONMENT wins" "prod" "$(tg_env_resolve prod dev)"
+t "tg env: falls back to ENVIRONMENT" "dev" "$(tg_env_resolve "" dev)"
+t "tg env: both empty → prod (app default)" "prod" "$(tg_env_resolve "" "")"
+t "tg env: only TV set" "staging" "$(tg_env_resolve staging "")"
+
+# ── FIX 8.2/8.3: stale-adopt + recreated-DB guards ─────────────────────────
+t "sha: match" "match" "$(sha_compare abc123 abc123)"
+t "sha: mismatch" "mismatch" "$(sha_compare abc123 def456)"
+t "sha: empty app sha → unknown" "unknown" "$(sha_compare "" def456)"
+t "sha: literal unknown build → unknown" "unknown" "$(sha_compare unknown def456)"
+t "db probe: missing table detected" "missing" "$(db_probe_verdict '{"query":"select 1 from ws_event_audit limit 1","error":"table does not exist [table=ws_event_audit]","position":15}')"
+t "db probe: dataset present → ok" "ok" "$(db_probe_verdict '{"query":"...","columns":[{"name":"1"}],"dataset":[[1]],"count":1}')"
+t "db probe: empty body → unknown" "unknown" "$(db_probe_verdict "")"
+t "db probe: garbage → unknown" "unknown" "$(db_probe_verdict 'connection refused')"
+t "market hours: 10:00 Tue → in session" "0" "$(in_market_hours_ist "$(hhmm_to_secs 10:00)" 2 && echo 0 || echo 1)"
+t "market hours: 08:59 → out" "1" "$(in_market_hours_ist "$(hhmm_to_secs 08:59)" 2 && echo 0 || echo 1)"
+t "market hours: 15:30 close → out" "1" "$(in_market_hours_ist "$(hhmm_to_secs 15:30)" 2 && echo 0 || echo 1)"
+t "market hours: Saturday → out" "1" "$(in_market_hours_ist "$(hhmm_to_secs 10:00)" 6 && echo 0 || echo 1)"
+t "market hours: garbage secs → out (restart allowed)" "1" "$(in_market_hours_ist abc 2 && echo 0 || echo 1)"
+t "adopt: fresh build + tables ok → adopt" "adopt" "$(adopt_health_decision match ok 0)"
+t "adopt: stale build off-hours → restart on new build" "restart_stale" "$(adopt_health_decision mismatch ok 0)"
+t "adopt: stale build MID-MARKET → never restart, warn" "warn_stale" "$(adopt_health_decision mismatch ok 1)"
+t "adopt: db recreated off-hours → restart to rebuild tables" "restart_db" "$(adopt_health_decision match missing 0)"
+t "adopt: db recreated MID-MARKET → page, keep app" "warn_db" "$(adopt_health_decision match missing 1)"
+t "adopt: db missing outranks stale build" "restart_db" "$(adopt_health_decision mismatch missing 0)"
+t "adopt: unknown sha + unknown db → conservative adopt" "adopt" "$(adopt_health_decision unknown unknown 0)"
+t "adopt: unknown sha, tables ok, mid-market → adopt" "adopt" "$(adopt_health_decision unknown ok 1)"
 
 # ── FIX 6: 100-conn probe helpers ───────────────────────────────────────────
 # shellcheck source=scripts/groww-scale-test.sh

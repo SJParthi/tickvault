@@ -384,10 +384,12 @@ clamp_qdb_mem_g() {
 
 # tg_ssm_path <env> <key> → the SSM parameter path the tickvault APP itself
 # uses for Telegram (crates/core/src/auth/secret_manager.rs build_ssm_path:
-# /tickvault/<env>/telegram/<key>). Pure; empty env defaults to dev.
+# /tickvault/<env>/telegram/<key>). Pure; empty env defaults to prod —
+# the SAME default the app's resolve_environment uses (FIX 8.1; the earlier
+# dev default pointed at a parameter that does not exist in SSM).
 # FIX 5.2: the launcher's Telegram previously read /dlt/<env>/telegram/* —
 # another project's namespace — so every launcher Telegram silently failed.
-tg_ssm_path() { echo "/tickvault/${1:-dev}/telegram/$2"; }
+tg_ssm_path() { echo "/tickvault/${1:-prod}/telegram/$2"; }
 
 # ── FIX 7: auto-raise Docker Desktop VM memory (macOS) — pure helpers ──────
 
@@ -472,6 +474,78 @@ except Exception:
 PY
 }
 
+# ── FIX 8: launcher Telegram env + stale-adopt / recreated-DB guards ───────
+
+# tg_env_resolve <tv_environment> <environment> → the SSM environment the
+# APP itself resolves (secret_manager.rs resolve_environment precedence:
+# TV_ENVIRONMENT → ENVIRONMENT → "prod"). FIX 8.1: the launcher previously
+# defaulted to "dev" while the app defaults to "prod" — so the launcher read
+# a nonexistent /tickvault/dev/telegram/* param while the app's prod one
+# worked from the same Mac. Pure.
+tg_env_resolve() {
+  if [ -n "${1:-}" ]; then
+    echo "$1"
+  elif [ -n "${2:-}" ]; then
+    echo "$2"
+  else
+    echo prod
+  fi
+}
+
+# sha_compare <app_sha> <repo_sha> → match|mismatch|unknown. Pure. FIX 8.2:
+# an adopted app may be an OLD build; the B9 provenance /health git_sha vs
+# `git rev-parse HEAD` decides. Empty or the literal "unknown" (a build
+# without git) on either side → "unknown" (conservative: adopt + honest log).
+sha_compare() {
+  local a="${1:-}" r="${2:-}"
+  if [ -z "$a" ] || [ -z "$r" ] || [ "$a" = "unknown" ] || [ "$r" = "unknown" ]; then
+    echo unknown
+    return 0
+  fi
+  if [ "$a" = "$r" ]; then echo match; else echo mismatch; fi
+}
+
+# db_probe_verdict <questdb /exec response body> → ok|missing|unknown. Pure.
+# FIX 8.3: after a QuestDB container RECREATE the app-owned tables are gone
+# until the app's boot DDL re-runs — probing a canonical app-owned table
+# (ws_event_audit) tells us whether the adopted app's tables still exist.
+db_probe_verdict() {
+  case "${1:-}" in
+  *'table does not exist'*) echo missing ;;
+  *'"dataset"'*) echo ok ;;
+  *) echo unknown ;;
+  esac
+}
+
+# in_market_hours_ist <secs_of_day> <dow 1..7> → rc 0 during the NSE session
+# window 09:00–15:30 IST on a weekday. Pure; garbage input → rc 1 (treated
+# as off-hours: restarts stay allowed — the conservative default for a
+# maintenance action is "not mid-market").
+in_market_hours_ist() {
+  case "${1:-}" in '' | *[!0-9]*) return 1 ;; esac
+  case "${2:-}" in [1-5]) ;; *) return 1 ;; esac
+  (($1 >= 32400 && $1 < 55800))
+}
+
+# adopt_health_decision <sha_state match|mismatch|unknown>
+#                       <db_state ok|missing|unknown> <market_open 0|1>
+# → adopt | warn_stale | warn_db | restart_stale | restart_db. Pure.
+# Rules: a missing database table set outranks a stale build; during market
+# hours a healthy streaming app is NEVER auto-restarted (warn/page instead);
+# unknown states adopt conservatively (runtime logs honestly).
+adopt_health_decision() {
+  local sha="${1:-unknown}" db="${2:-unknown}" mkt="${3:-0}"
+  if [ "$db" = "missing" ]; then
+    if [ "$mkt" = "1" ]; then echo warn_db; else echo restart_db; fi
+    return 0
+  fi
+  if [ "$sha" = "mismatch" ]; then
+    if [ "$mkt" = "1" ]; then echo warn_stale; else echo restart_stale; fi
+    return 0
+  fi
+  echo adopt
+}
+
 # ── End of pure functions. Library mode stops here. ────────────────────────
 if [[ "${AUTOPILOT_LIB:-0}" == "1" ]]; then
   return 0 2>/dev/null || exit 0
@@ -537,21 +611,35 @@ tg_init() {
   if [ -n "${TV_TELEGRAM_BOT_TOKEN:-}" ] && [ -n "${TV_TELEGRAM_CHAT_ID:-}" ]; then
     return 0 # already cached (e.g. bootstrap.sh exported them)
   fi
-  local env="${ENVIRONMENT:-dev}" tok="" chat=""
+  # FIX 8.1: resolve the SSM environment the way the APP does
+  # (TV_ENVIRONMENT → ENVIRONMENT → "prod"). The launcher's previous
+  # dev-default read /tickvault/dev/telegram/* — a parameter that does not
+  # exist — while the app's Telegram worked from the same Mac via the prod
+  # default. Try the resolved env first, then fall back to prod, and log
+  # WHICH path worked. Region stays ap-south-1 (same as bootstrap.sh) so a
+  # different Mac-default AWS region cannot break the read.
+  local env candidates cand tok chat
+  env="$(tg_env_resolve "${TV_ENVIRONMENT:-}" "${ENVIRONMENT:-}")"
+  candidates="$env"
+  [ "$env" != "prod" ] && candidates="$env prod"
   if command -v aws >/dev/null 2>&1; then
-    tok=$(aws ssm get-parameter --region ap-south-1 --with-decryption \
-      --name "$(tg_ssm_path "$env" bot-token)" \
-      --query Parameter.Value --output text --no-cli-pager 2>/dev/null || true)
-    chat=$(aws ssm get-parameter --region ap-south-1 --with-decryption \
-      --name "$(tg_ssm_path "$env" chat-id)" \
-      --query Parameter.Value --output text --no-cli-pager 2>/dev/null || true)
+    for cand in $candidates; do
+      tok=$(aws ssm get-parameter --region ap-south-1 --with-decryption \
+        --name "$(tg_ssm_path "$cand" bot-token)" \
+        --query Parameter.Value --output text --no-cli-pager 2>/dev/null || true)
+      chat=$(aws ssm get-parameter --region ap-south-1 --with-decryption \
+        --name "$(tg_ssm_path "$cand" chat-id)" \
+        --query Parameter.Value --output text --no-cli-pager 2>/dev/null || true)
+      if [ -n "$tok" ] && [ "$tok" != "None" ] && [ -n "$chat" ] && [ "$chat" != "None" ]; then
+        export TV_TELEGRAM_BOT_TOKEN="$tok" TV_TELEGRAM_CHAT_ID="$chat"
+        log "Telegram credentials loaded from $(tg_ssm_path "$cand" bot-token) (region ap-south-1)"
+        return 0
+      fi
+      log "Telegram parameter $(tg_ssm_path "$cand" bot-token) unreadable — trying next candidate"
+    done
   fi
-  if [ -n "$tok" ] && [ "$tok" != "None" ] && [ -n "$chat" ] && [ "$chat" != "None" ]; then
-    export TV_TELEGRAM_BOT_TOKEN="$tok" TV_TELEGRAM_CHAT_ID="$chat"
-  else
-    TG_DISABLED=1
-    log "Telegram unavailable ($(tg_ssm_path "$env" bot-token) unreadable — no internet or missing parameter). Messages will appear in this log only for the rest of this run."
-  fi
+  TG_DISABLED=1
+  log "Telegram unavailable (tried env path(s): ${candidates// /, } under /tickvault/<env>/telegram/ in ap-south-1 — no internet, no AWS credentials, or missing parameter). Messages will appear in this log only for the rest of this run."
 }
 
 tg() { # best-effort Telegram; the log always carries the message
@@ -707,11 +795,114 @@ app_health_ok() { # the /health endpoint is deliberately public
   curl -sf -m 3 "http://127.0.0.1:${APP_API_PORT}/health" >/dev/null 2>&1
 }
 
-start_app() { # $1 = label for the log
-  if app_alive; then
-    log "app already running (pid $(cat "$APP_PIDFILE")) — not double-starting"
+# app_git_sha — the running app's build provenance from GET /health (B9
+# git_sha field). Empty on any failure (app down, old build without the
+# field). Runtime (network); the compare itself is the pure sha_compare.
+app_git_sha() {
+  curl -sf -m 3 "http://127.0.0.1:${APP_API_PORT}/health" 2>/dev/null |
+    python3 -c '
+import json, sys
+try:
+    print(json.load(sys.stdin).get("git_sha", ""))
+except Exception:
+    pass' 2>/dev/null || true
+}
+
+# db_app_tables_probe → ok|missing|unknown. Probes a canonical APP-owNED
+# table (ws_event_audit — created by the app boot DDL, not by schema-init)
+# via QuestDB /exec. NOTE: no curl -f — QuestDB answers a missing table
+# with HTTP 400 + a JSON error body, which is exactly the signal we parse.
+db_app_tables_probe() {
+  local body
+  body=$(curl -s -m 3 --get "${QDB_HTTP_URL:-http://127.0.0.1:9000}/exec" \
+    --data-urlencode "query=select 1 from ws_event_audit limit 1" 2>/dev/null || true)
+  db_probe_verdict "$body"
+}
+
+# adopt_gate — FIX 8.2 + 8.3: decide whether a healthy running app may be
+# ADOPTED as today's app. Checks (a) build freshness: /health git_sha vs
+# repo HEAD (a self-updated repo must not keep Monday's robot on Friday's
+# binary), and (b) database integrity: the app-owned tables still exist
+# (a QuestDB container RECREATE after the app booted wipes them — the
+# app's boot DDL must re-run, i.e. the app must restart). stdout: the
+# adopt_health_decision verdict. log() inside is safe — its tty echo is
+# suppressed under command substitution.
+adopt_gate() {
+  local app_sha repo_sha sha_state db_state mkt=0
+  app_sha="$(app_git_sha)"
+  repo_sha="$(git rev-parse HEAD 2>/dev/null || true)"
+  sha_state="$(sha_compare "$app_sha" "$repo_sha")"
+  db_state="$(db_app_tables_probe)"
+  if in_market_hours_ist "$(hhmm_to_secs "$(ist_hms)")" "$(date +%u)"; then mkt=1; fi
+  if [ "$sha_state" = "unknown" ]; then
+    log "adopt check: build version unverifiable (health/sha unavailable) — adopting conservatively"
+  fi
+  if [ "$db_state" = "unknown" ]; then
+    log "adopt check: database table probe inconclusive — adopting conservatively"
+  fi
+  adopt_health_decision "$sha_state" "$db_state" "$mkt"
+}
+
+# handle_adopt_verdict <verdict> <pid> — apply an adopt_gate verdict to a
+# running app. rc 0 = adopted (caller returns); rc 1 = the app was stopped
+# and the caller must fall through to a fresh launch.
+handle_adopt_verdict() {
+  local verdict="$1" pid="$2"
+  case "$verdict" in
+  adopt)
+    echo "$pid" >"$APP_PIDFILE"
+    log "adopted running app pid $pid (build + database check out — no relaunch needed)"
     write_run_stamp
     return 0
+    ;;
+  warn_stale)
+    echo "$pid" >"$APP_PIDFILE"
+    log "running app is an OLDER build than the repo — market hours, so NOT restarting a healthy streaming app; it will pick up the new build at the next off-hours start"
+    tg "ℹ️ The running app is an older version than the latest update. It keeps running through market hours; the new version starts automatically at the next restart."
+    write_run_stamp
+    return 0
+    ;;
+  warn_db)
+    echo "$pid" >"$APP_PIDFILE"
+    log "database looks RECREATED after the app booted (app tables missing) — market hours, so NOT auto-restarting; operator paged"
+    tg "🆘 The database was recreated AFTER the app started, so the app's tables are missing and new data may not be stored. Double-click Stop TickVault then Start TickVault as soon as convenient."
+    write_run_stamp
+    return 0
+    ;;
+  restart_stale)
+    log "running app is an older build (sha $(app_git_sha | cut -c1-7) vs repo $(git rev-parse --short HEAD 2>/dev/null)) — restarting on the new build"
+    ;;
+  restart_db)
+    log "database was recreated after the app booted — restarting app so it can rebuild its tables"
+    ;;
+  esac
+  # restart_* verdicts: stop the old app politely, then force.
+  kill "$pid" 2>/dev/null || true
+  local w
+  for w in $(seq 1 10); do
+    kill -0 "$pid" 2>/dev/null || break
+    sleep 1
+  done
+  if kill -0 "$pid" 2>/dev/null; then
+    kill -9 "$pid" 2>/dev/null || true
+    sleep 1
+  fi
+  rm -f "$APP_PIDFILE"
+  return 1
+}
+
+start_app() { # $1 = label for the log
+  if app_alive; then
+    # FIX 8: a pidfile-alive app gets the SAME freshness + database gate as
+    # a discovered one — otherwise Monday's robot keeps Friday's binary (or
+    # an app whose tables were wiped by a database recreate) alive forever.
+    local kept_pid
+    kept_pid=$(cat "$APP_PIDFILE")
+    if handle_adopt_verdict "$(adopt_gate)" "$kept_pid"; then
+      log "app already running (pid $kept_pid) — not double-starting"
+      return 0
+    fi
+    log "previous app (pid $kept_pid) stopped by the adopt gate — launching fresh"
   fi
   # FIX 5.1 — adopt-or-kill BEFORE launching: an existing app process
   # (found by name + confirmed by ports/health) is ADOPTED when healthy,
@@ -731,10 +922,12 @@ start_app() { # $1 = label for the log
   fi
   case "$decision" in
   adopt)
-    echo "$existing" >"$APP_PIDFILE"
-    log "adopted running app pid $existing (pidfile was missing/stale — no relaunch needed)"
-    write_run_stamp
-    return 0
+    # FIX 8: a healthy discovered app must ALSO pass the build-freshness +
+    # database-integrity gate before being adopted as today's app.
+    if handle_adopt_verdict "$(adopt_gate)" "$existing"; then
+      return 0
+    fi
+    log "discovered app (pid $existing) stopped by the adopt gate — launching fresh"
     ;;
   kill)
     log "found a stale/unhealthy app process (pid $existing) — stopping it before a fresh launch"

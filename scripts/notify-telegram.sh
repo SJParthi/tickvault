@@ -29,7 +29,11 @@ set -euo pipefail
 # Config
 # ---------------------------------------------------------------------------
 REGION="ap-south-1"
-ENV="${ENVIRONMENT:-dev}"
+# FIX 8.1: resolve the SSM environment the way the APP does
+# (TV_ENVIRONMENT → ENVIRONMENT → "prod", per secret_manager.rs
+# resolve_environment). The previous dev-default read a nonexistent
+# /tickvault/dev/telegram/* parameter while the app's prod default worked.
+ENV="${TV_ENVIRONMENT:-${ENVIRONMENT:-prod}}"
 SSM_BOT_TOKEN_PATH="/tickvault/${ENV}/telegram/bot-token"
 SSM_CHAT_ID_PATH="/tickvault/${ENV}/telegram/chat-id"
 TELEGRAM_API="https://api.telegram.org"
