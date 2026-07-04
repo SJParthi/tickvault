@@ -2030,3 +2030,75 @@ rules:
       ladder is unaffected and the write is idempotent on retry (DEDUP UPSERT).
       Silence: the tv_groww_scale_audit_write_errors_total counter records it;
       persistence-layer degradation already escalates via BOOT-01/02.
+
+  # GROWW-NATIVE-01 = the native-Rust SHADOW client (PR-R1, default-OFF)
+  # disconnected / failed to connect / had its supervised runner respawned.
+  # Bounded expo backoff + supervisor respawn already self-heal; shadow-only —
+  # the Python sidecar capture chain is untouched. Silence: a sustained rate
+  # during an enabled run is the live-probe measurement the shadow exists to
+  # collect (counter tv_groww_native_reconnects_total carries it), not an
+  # operator emergency.
+  - name: groww-native-01-connect-failed-silence
+    match:
+      code: GROWW-NATIVE-01
+    action: silence
+    runbook_path: .claude/rules/project/groww-native-rust-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 0
+    justification: >-
+      GROWW-NATIVE-01 = shadow-client transport failure/reconnect/respawn.
+      Self-healing (bounded backoff + supervisor) and validation-only: losing
+      shadow lines never touches production capture. The reconnect counters
+      ARE the deliverable of the shadow run.
+
+  # GROWW-NATIVE-02 = the shadow client's per-session socket-token mint or
+  # NATS CONNECT was rejected (auth class). The re-key + re-mint ladder (SSM
+  # re-read >=60s, NEVER minting the access token) already applied. Silence:
+  # around 06:00 IST this is the daily token reset; any persistent reject with
+  # a healthy sidecar is a recorded live-probe finding, not a production
+  # incident.
+  - name: groww-native-02-auth-failed-silence
+    match:
+      code: GROWW-NATIVE-02
+    action: silence
+    runbook_path: .claude/rules/project/groww-native-rust-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 0
+    justification: >-
+      GROWW-NATIVE-02 = shadow-client auth-class failure with the re-key +
+      re-mint ladder already applied (token-minter lock honored: SSM re-read
+      only). Shadow validation artifact; the sidecar keeps capturing.
+
+  # GROWW-NATIVE-03 = a NATS frame / protobuf payload / daily watch file
+  # failed to decode in the shadow client. Skip-or-reconnect already applied;
+  # counted by tv_groww_native_decode_errors_total{kind}. Silence — the
+  # decode-error counters are parity-run telemetry.
+  - name: groww-native-03-decode-failed-silence
+    match:
+      code: GROWW-NATIVE-03
+    action: silence
+    runbook_path: .claude/rules/project/groww-native-rust-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 0
+    justification: >-
+      GROWW-NATIVE-03 = shadow-client decode failure, already skipped or
+      reconnected, fail-closed on the watch file. A high proto rate = schema
+      drift to re-extract from the wheel — an engineering follow-up, not an
+      operator page.
+
+  # GROWW-NATIVE-04 = the shadow NDJSON writer failed a write/rotation or its
+  # bounded channel overflowed. Capture retries next write / next midnight
+  # (sidecar-identical semantics); only SHADOW comparison lines are lost —
+  # the parity comparer surfaces them as missing-in-rust. Silence.
+  - name: groww-native-04-writer-failed-silence
+    match:
+      code: GROWW-NATIVE-04
+    action: silence
+    runbook_path: .claude/rules/project/groww-native-rust-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 0
+    justification: >-
+      GROWW-NATIVE-04 = shadow capture-file write/rotation/channel failure,
+      already retried; a shadow-only data gap that the parity comparer
+      reports honestly. Disk-full class root causes page via the existing
+      disk watchers (DISK-WATCHER-01 / RESOURCE-03).

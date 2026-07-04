@@ -3912,6 +3912,7 @@ dependencies = [
  "arc-swap",
  "arrayvec",
  "aws-config",
+ "aws-lc-rs",
  "aws-sdk-sns",
  "aws-sdk-ssm",
  "bytes",
@@ -3943,6 +3944,7 @@ dependencies = [
  "totp-rs",
  "tracing",
  "tracing-subscriber",
+ "uuid",
  "zeroize",
 ]
 
