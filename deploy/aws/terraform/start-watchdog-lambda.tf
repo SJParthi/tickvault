@@ -149,22 +149,12 @@ resource "aws_cloudwatch_event_rule" "start_watchdog_ping" {
   name                = "tv-${var.environment}-start-watchdog-ping"
   description         = "08:30 IST (Mon-Fri) positive 'instance start triggered' Telegram"
   schedule_expression = "cron(0 3 ? * MON-FRI *)"
-  # PAUSED 2026-07-04 per operator: local-only verification Mon Jul 6 - Wed Jul 8 2026.
-  # MUST BE REVERTED for Thu Jul 9 resume — revert branch: claude/aws-resume-jul9
-  # (daily_start is disabled for the window, so the 08:30 ping would falsely
-  # announce a start and the 08:45 check would self-heal-START the box we
-  # deliberately paused, then page about a "failed start".)
-  state = "DISABLED"
 }
 
 resource "aws_cloudwatch_event_rule" "start_watchdog_check" {
   name                = "tv-${var.environment}-start-watchdog-check"
   description         = "08:45 IST (Mon-Fri) verify the box actually started; page if not"
   schedule_expression = "cron(15 3 ? * MON-FRI *)"
-  # PAUSED 2026-07-04 per operator: local-only verification Mon Jul 6 - Wed Jul 8 2026.
-  # MUST BE REVERTED for Thu Jul 9 resume — revert branch: claude/aws-resume-jul9
-  # (the check mode issues ec2:StartInstances as self-heal — it would undo the pause.)
-  state = "DISABLED"
 }
 
 resource "aws_cloudwatch_event_target" "start_watchdog_ping" {

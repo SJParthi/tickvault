@@ -22,10 +22,15 @@ active = "local"
 # Replace <mac-host> with your Mac's Tailscale hostname (run `tailscale status`
 # on the Mac to find it). The .ts.net domain is stable across reboots.
 [profiles.mac-dev]
-questdb_url       = "https://MAC-HOSTNAME.YOUR-TAILNET.ts.net:9000"
+# Security trim 2026-07-04: QuestDB (9000) is NO LONGER funnelled — auth-less
+# raw SQL stays local-only, so questdb_url is a localhost URL usable only on
+# the host itself.
+questdb_url       = "http://127.0.0.1:9000"
 tickvault_api_url = "https://MAC-HOSTNAME.YOUR-TAILNET.ts.net:3001"
-logs_source       = "http"  # "http" = fetch via /api/debug/logs/* | "local" = filesystem
-logs_dir_local    = "./data/logs"  # only used when logs_source = "local"
+# Log tools read the local filesystem — no HTTP log fetch is implemented in
+# the MCP server ("http" mode does not exist; keep "local").
+logs_source       = "local"
+logs_dir_local    = "./data/logs"
 
 # -----------------------------------------------------------------------------
 # aws-prod profile
@@ -33,9 +38,10 @@ logs_dir_local    = "./data/logs"  # only used when logs_source = "local"
 # Your AWS EC2 instance exposing tickvault's services via Tailscale Funnel.
 # Activated once the instance is provisioned (scripts/tv-tunnel/install-aws.sh).
 [profiles.aws-prod]
-questdb_url       = "https://AWS-HOSTNAME.YOUR-TAILNET.ts.net:9000"
+# QuestDB (9000) is not funnelled (security trim 2026-07-04) — localhost only.
+questdb_url       = "http://127.0.0.1:9000"
 tickvault_api_url = "https://AWS-HOSTNAME.YOUR-TAILNET.ts.net:3001"
-logs_source       = "http"
+logs_source       = "local"
 logs_dir_local    = "./data/logs"
 
 # -----------------------------------------------------------------------------

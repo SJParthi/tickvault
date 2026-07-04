@@ -2419,8 +2419,10 @@ async fn main() -> Result<()> {
             api_state,
             &config.api.allowed_origins,
             api_auth_config_fast,
-            // dry-run/sandbox → tokenless feed-toggle so the /feeds page flips feeds
-            // without a token; live trading keeps the toggle bearer-protected.
+            // 2026-07-04 operator quote (websocket-connection-scope-lock.md
+            // "FEED TOGGLE BEARER-GATED IN ALL MODES"): this flag is now
+            // accepted-but-IGNORED — the feed toggle is bearer-protected in
+            // ALL modes. Kept to avoid a signature cascade.
             config.strategy.dry_run,
         );
         let bind_addr: SocketAddr = format_bind_addr(&config.api.host, config.api.port)
@@ -5377,6 +5379,9 @@ async fn build_shared_infra(
         api_state,
         &config.api.allowed_origins,
         api_auth_config,
+        // 2026-07-04 operator quote: flag accepted-but-IGNORED — the feed
+        // toggle is bearer-protected in ALL modes (see
+        // websocket-connection-scope-lock.md). Kept to avoid a cascade.
         config.strategy.dry_run,
     );
     let bind_addr: SocketAddr = format_bind_addr(&config.api.host, config.api.port)

@@ -10,11 +10,15 @@
 //!   live-toggleable; the Dhan *disable* direction is safety-gated server-side
 //!   (refused once live trading is on) and the page surfaces that 409 + re-syncs.
 //!
-//! The HTML shell itself carries no secrets, so it is a PUBLIC route; every data
-//! read + toggle action it performs goes through the bearer-auth `/api/feeds`
-//! endpoints. The page keeps the operator's API token in `sessionStorage` and
-//! sends it as `Authorization: Bearer <token>` (in dev, with auth disabled, it
-//! works with no token). The feed rows are rendered from a small descriptor list
+//! The HTML shell itself carries no secrets, so it is a PUBLIC route; the
+//! read-only `GET /api/feeds` + `/api/feeds/health` reads it renders from are
+//! public too. The MUTATING toggle `POST /api/feeds/{feed}` is bearer-gated in
+//! ALL modes (2026-07-04 operator quote, websocket-connection-scope-lock.md
+//! "FEED TOGGLE BEARER-GATED IN ALL MODES" — the 2026-06-23 tokenless dry-run
+//! carve-out is retired). The page keeps the operator's API token in
+//! `sessionStorage` and sends it as `Authorization: Bearer <token>`; fetch the
+//! token via `aws ssm get-parameter --name /tickvault/<env>/api/bearer-token
+//! --with-decryption`. The feed rows are rendered from a small descriptor list
 //! so adding a future feed is a one-line change here once the API reports it.
 
 use axum::http::header;
@@ -91,7 +95,7 @@ const FEEDS_PAGE_HTML: &str = r#"<!DOCTYPE html>
      Changes apply live (no restart).</p>
 
   <div class="token-row">
-    <input id="token" type="password" placeholder="API token (leave blank in dev)"
+    <input id="token" type="password" placeholder="API token (required to toggle feeds)"
            autocomplete="off">
     <button id="save">Save &amp; refresh</button>
   </div>

@@ -1,8 +1,13 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!--
-  tv-tunnel launchd agent — starts Tailscale Funnel for tickvault's 5
-  observability ports on Mac boot. Installed by install-mac.sh into
+  tv-tunnel launchd agent — starts Tailscale Funnel for the tickvault API
+  port (3001, bearer-auth) on Mac boot. Installed by install-mac.sh into
   ~/Library/LaunchAgents/ so it runs under the logged-in user, not root.
+
+  Security trim 2026-07-04: ONLY 3001 is funnelled. Prometheus 9090 /
+  Alertmanager 9093 / Grafana 3000 are retired (CloudWatch-only migration);
+  QuestDB 9000 is intentionally NO LONGER funnelled — it is an auth-less
+  raw-SQL surface (local access only).
 
   The @TAILSCALE_BIN@ placeholder is substituted at install time because
   the Tailscale app path may vary between standard Mac App Store
@@ -19,10 +24,6 @@
     <string>@TAILSCALE_BIN@</string>
     <string>funnel</string>
     <string>--bg</string>
-    <string>9090</string>
-    <string>9093</string>
-    <string>9000</string>
-    <string>3000</string>
     <string>3001</string>
   </array>
 
