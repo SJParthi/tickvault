@@ -65,27 +65,87 @@ pub const INSTANCE_LOCK_TTL_SECS: u64 = 90;
 /// 30 seconds of headroom before the lock is considered stale.
 pub const INSTANCE_LOCK_HEARTBEAT_INTERVAL_SECS: u64 = 30;
 
+/// After this many CONSECUTIVE named-lock renewal FAILURES the slot has
+/// gone un-refreshed for ≥ the TTL (3 × 30s = 90s): a legitimately booting
+/// peer may take over the stale slot while THIS holder cannot observe it
+/// (renewal keeps `Err`-ing during an SSM partition, so the `Ok(false)`
+/// loss page only fires after connectivity recovers — the previously
+/// UNPAGED dual-fleet window from the 2026-07-04 adversarial review).
+/// [`spawn_named_lock_heartbeat`] escalates ONCE per failure episode at
+/// ERROR with the caller's loss code when this threshold is reached, then
+/// keeps retrying.
+pub const NAMED_LOCK_RENEWAL_ERRORS_ESCALATE_THRESHOLD: u32 =
+    (INSTANCE_LOCK_TTL_SECS / INSTANCE_LOCK_HEARTBEAT_INTERVAL_SECS) as u32;
+
 /// SSM Parameter path prefix. Full path is `{prefix}/{env}/instance-lock`
 /// so dev / sandbox / prod cannot stomp on each other.
 pub const INSTANCE_LOCK_SSM_PATH_PREFIX: &str = "/tickvault";
 
-/// Formats the canonical SSM Parameter path for the dual-instance lock.
+/// The Dhan-session dual-instance lock name (the original Phase 0 Item 19
+/// lock). Kept as a named constant so the generic named-lock knob below can
+/// prove the legacy path stays byte-identical.
+pub const DHAN_INSTANCE_LOCK_NAME: &str = "instance-lock";
+
+/// The Groww scale-FLEET dual-instance lock name (Session-B fix, operator go
+/// 2026-07-04). A scale-test boot runs `dhan_enabled=false`, so it never
+/// reaches the Dhan lock — without THIS lock two hosts (Mac + AWS, or two
+/// Macs) can scale the SAME Groww account simultaneously and the failure
+/// masquerades as provider throttle.
 ///
-/// The environment string is sanitised through `sanitize_ilp_symbol` so a
+/// Deliberately OUTSIDE the `/tickvault/<env>/groww/*` namespace: the
+/// token-minter lock (`groww-shared-token-minter-2026-07-02.md`) bans
+/// TickVault from WRITING any `groww/*` parameter, and this lock parameter
+/// is written (Put/Delete) by the lock machinery. The name yields
+/// `/tickvault/<env>/instance-lock-groww-scale` — sibling of the Dhan lock,
+/// never under `groww/`.
+pub const GROWW_SCALE_FLEET_LOCK_NAME: &str = "instance-lock-groww-scale";
+
+/// Formats the SSM Parameter path for a NAMED dual-instance lock:
+/// `/tickvault/<env>/<lock_name>`.
+///
+/// Both components are sanitised through `sanitize_ilp_symbol` so a
 /// misconfigured value (`prod\n` or `prod;`) cannot inject a path break.
 /// Empty / whitespace-only environments fall back to a literal
 /// `"unknown"` so the path remains valid and the operator sees the issue
 /// in the boot log.
 #[must_use]
-pub fn compute_instance_lock_path(env: &str) -> String {
-    let sanitised = sanitize_ilp_symbol(env);
+pub fn compute_named_lock_path(env: &str, lock_name: &str) -> String {
+    // Defense-in-depth (2026-07-04 adversarial review LOW): the generic
+    // `sanitize_ilp_symbol` strips control chars / ',' / '=' but NOT '/'
+    // or '.', so a garbage env ("prod/groww") or lock name could inject a
+    // path break and escape the `/tickvault/<env>/` namespace — including
+    // into the token-minter-banned `groww/*` subtree. Production callers
+    // already validate (resolve_environment allows [a-zA-Z0-9-] only;
+    // lock names are &'static consts), but both fns are `pub`, so strip
+    // here as well. No-op for every legitimate input; the Dhan wrapper
+    // delegates here, so Dhan vs named paths stay identical by
+    // construction (pinned by test_named_lock_path_dhan_name_matches_legacy_path).
+    let sanitised: String = sanitize_ilp_symbol(env)
+        .chars()
+        .filter(|c| *c != '/' && *c != '.')
+        .collect();
     let trimmed = sanitised.trim();
     let effective = if trimmed.is_empty() {
         "unknown"
     } else {
         trimmed
     };
-    format!("{INSTANCE_LOCK_SSM_PATH_PREFIX}/{effective}/instance-lock")
+    let name_sanitised: String = sanitize_ilp_symbol(lock_name)
+        .chars()
+        .filter(|c| *c != '/' && *c != '.')
+        .collect();
+    let name = name_sanitised.trim();
+    format!("{INSTANCE_LOCK_SSM_PATH_PREFIX}/{effective}/{name}")
+}
+
+/// Formats the canonical SSM Parameter path for the Dhan dual-instance lock.
+///
+/// Delegates to [`compute_named_lock_path`] with the unchanged
+/// [`DHAN_INSTANCE_LOCK_NAME`] — output is byte-identical to the pre-knob
+/// implementation (pinned by `test_named_lock_path_dhan_name_matches_legacy_path`).
+#[must_use]
+pub fn compute_instance_lock_path(env: &str) -> String {
+    compute_named_lock_path(env, DHAN_INSTANCE_LOCK_NAME)
 }
 
 /// Composes the `host_id` written into the lock value.
@@ -188,7 +248,36 @@ pub async fn try_acquire_instance_lock(
     env: &str,
     host_id: &str,
 ) -> Result<AcquireOutcome> {
-    let path = compute_instance_lock_path(env);
+    try_acquire_lock_at_path(ssm, &compute_instance_lock_path(env), host_id).await
+}
+
+/// Named-lock variant of [`try_acquire_instance_lock`] (Session-B fix,
+/// operator go 2026-07-04): identical acquire/stale-takeover/fail-closed
+/// semantics against `/tickvault/<env>/<lock_name>` instead of the Dhan
+/// path. Used by the Groww scale-fleet gate
+/// ([`GROWW_SCALE_FLEET_LOCK_NAME`]).
+// TEST-EXEMPT: end-to-end behaviour requires a real AWS SSM endpoint —
+// same class as try_acquire_instance_lock; the shared path/JSON/staleness
+// pure logic is covered by the unit tests below, and a smoke test pins the
+// public symbol.
+pub async fn try_acquire_named_lock(
+    ssm: &SsmClient,
+    env: &str,
+    lock_name: &str,
+    host_id: &str,
+) -> Result<AcquireOutcome> {
+    try_acquire_lock_at_path(ssm, &compute_named_lock_path(env, lock_name), host_id).await
+}
+
+/// Shared acquire body — the SSM `PutParameter(overwrite=false)` atomic
+/// claim + stale-takeover + fail-closed evaluation, against an explicit
+/// parameter path. Private so the public surface stays the two thin
+/// wrappers above.
+async fn try_acquire_lock_at_path(
+    ssm: &SsmClient,
+    path: &str,
+    host_id: &str,
+) -> Result<AcquireOutcome> {
     let now = now_unix_secs();
     let value = LockValue::new(host_id, now);
     let payload = value.to_json()?;
@@ -196,7 +285,7 @@ pub async fn try_acquire_instance_lock(
     // Step 1 — atomic claim via overwrite=false. SSM rejects if the
     // parameter already exists. This is the SSM equivalent of Redis
     // SET NX.
-    match put_parameter(ssm, &path, &payload, false).await {
+    match put_parameter(ssm, path, &payload, false).await {
         Ok(()) => {
             info!(
                 target: "tickvault::instance_lock",
@@ -218,7 +307,7 @@ pub async fn try_acquire_instance_lock(
     }
 
     // Step 2 — read the existing holder.
-    let raw = match get_parameter(ssm, &path).await {
+    let raw = match get_parameter(ssm, path).await {
         Ok(Some(value)) => value,
         Ok(None) => {
             // Rare race: the previous holder's parameter was deleted
@@ -253,7 +342,7 @@ pub async fn try_acquire_instance_lock(
                 age_secs = now.saturating_sub(existing.last_heartbeat_unix),
                 "prior lock holder is stale — taking over via overwrite"
             );
-            put_parameter(ssm, &path, &payload, true)
+            put_parameter(ssm, path, &payload, true)
                 .await
                 .with_context(|| {
                     format!("PutParameter(overwrite=true) takeover failed for path={path}")
@@ -303,8 +392,26 @@ pub async fn try_acquire_instance_lock(
 /// has broken.
 // TEST-EXEMPT: end-to-end behaviour requires a real AWS SSM endpoint.
 pub async fn renew_instance_lock(ssm: &SsmClient, env: &str, host_id: &str) -> Result<bool> {
-    let path = compute_instance_lock_path(env);
-    let raw = get_parameter(ssm, &path).await.with_context(|| {
+    renew_lock_at_path(ssm, &compute_instance_lock_path(env), host_id).await
+}
+
+/// Named-lock variant of [`renew_instance_lock`] (Session-B fix 2026-07-04):
+/// identical ownership-checked renewal against `/tickvault/<env>/<lock_name>`.
+/// Called by [`spawn_named_lock_heartbeat`].
+// TEST-EXEMPT: end-to-end behaviour requires a real AWS SSM endpoint —
+// same class as renew_instance_lock; a smoke test pins the public symbol.
+pub async fn renew_named_lock(
+    ssm: &SsmClient,
+    env: &str,
+    lock_name: &str,
+    host_id: &str,
+) -> Result<bool> {
+    renew_lock_at_path(ssm, &compute_named_lock_path(env, lock_name), host_id).await
+}
+
+/// Shared ownership-checked renewal body against an explicit parameter path.
+async fn renew_lock_at_path(ssm: &SsmClient, path: &str, host_id: &str) -> Result<bool> {
+    let raw = get_parameter(ssm, path).await.with_context(|| {
         format!("GetParameter failed for instance lock path={path} during renewal")
     })?;
     let Some(raw_value) = raw else {
@@ -325,7 +432,7 @@ pub async fn renew_instance_lock(ssm: &SsmClient, env: &str, host_id: &str) -> R
         last_heartbeat_unix: now,
     };
     let payload = refreshed.to_json()?;
-    put_parameter(ssm, &path, &payload, true)
+    put_parameter(ssm, path, &payload, true)
         .await
         .with_context(|| {
             format!("PutParameter(overwrite=true) failed for path={path} during renewal")
@@ -341,8 +448,27 @@ pub async fn renew_instance_lock(ssm: &SsmClient, env: &str, host_id: &str) -> R
 /// have expired naturally — that's not an alertable condition.
 // TEST-EXEMPT: end-to-end behaviour requires a real AWS SSM endpoint.
 pub async fn release_instance_lock(ssm: &SsmClient, env: &str, host_id: &str) -> Result<()> {
-    let path = compute_instance_lock_path(env);
-    let raw = get_parameter(ssm, &path).await.with_context(|| {
+    release_lock_at_path(ssm, &compute_instance_lock_path(env), host_id).await
+}
+
+/// Named-lock variant of [`release_instance_lock`] (Session-B fix
+/// 2026-07-04): identical ownership-checked delete against
+/// `/tickvault/<env>/<lock_name>`. Called by [`spawn_named_lock_heartbeat`]
+/// on shutdown.
+// TEST-EXEMPT: end-to-end behaviour requires a real AWS SSM endpoint —
+// same class as release_instance_lock; a smoke test pins the public symbol.
+pub async fn release_named_lock(
+    ssm: &SsmClient,
+    env: &str,
+    lock_name: &str,
+    host_id: &str,
+) -> Result<()> {
+    release_lock_at_path(ssm, &compute_named_lock_path(env, lock_name), host_id).await
+}
+
+/// Shared ownership-checked release body against an explicit parameter path.
+async fn release_lock_at_path(ssm: &SsmClient, path: &str, host_id: &str) -> Result<()> {
+    let raw = get_parameter(ssm, path).await.with_context(|| {
         format!("GetParameter failed for instance lock path={path} during release")
     })?;
     let Some(raw_value) = raw else {
@@ -377,7 +503,7 @@ pub async fn release_instance_lock(ssm: &SsmClient, env: &str, host_id: &str) ->
         return Ok(());
     }
     ssm.delete_parameter()
-        .name(&path)
+        .name(path)
         .send()
         .await
         .map_err(|err| anyhow!("DeleteParameter failed for path={path}: {err}"))?;
@@ -555,6 +681,162 @@ pub fn spawn_instance_lock_heartbeat(
     })
 }
 
+/// Spawns the heartbeat task for a NAMED dual-instance lock (Session-B fix,
+/// operator go 2026-07-04). Generic sibling of
+/// [`spawn_instance_lock_heartbeat`], which stays byte-identical for the
+/// Dhan session lock.
+///
+/// Same renewal cadence + TTL semantics: every
+/// [`INSTANCE_LOCK_HEARTBEAT_INTERVAL_SECS`] the owner re-writes
+/// `/tickvault/<env>/<lock_name>`; on `shutdown` it performs one last
+/// [`release_named_lock`]; transient renewal errors are WARN + retry.
+///
+/// Loss-of-ownership policy: if [`renew_named_lock`] returns `Ok(false)`
+/// (a foreign instance stole the slot), the task flips `held_flag` to
+/// `false`, logs an `error!` tagged with the CALLER-SUPPLIED `loss_code`
+/// (e.g. `GROWW-SCALE-05` for the Groww scale-fleet lock), and EXITS. The
+/// caller decides what "lock lost" means for its subsystem — the Groww
+/// fleet gate pages the operator; it does not tear down a running fleet
+/// (the collision is loud, never silent).
+///
+/// Stale-window escalation (2026-07-04 adversarial-review MEDIUM fix):
+/// after [`NAMED_LOCK_RENEWAL_ERRORS_ESCALATE_THRESHOLD`] CONSECUTIVE
+/// renewal FAILURES (= the full 90s TTL un-refreshed), the task fires ONE
+/// `error!` per failure episode tagged with `loss_code` — because during
+/// an SSM partition a legitimately booting peer can take the stale slot
+/// and run a duplicate subsystem while the `Ok(false)` loss page cannot
+/// fire until OUR connectivity recovers. The task keeps retrying (WARN)
+/// after the escalation; a later successful renewal re-arms the episode.
+// TEST-EXEMPT: real SSM endpoint required for the renew/release round trip
+// (same class as spawn_instance_lock_heartbeat); the pure primitives it
+// delegates to are unit-tested below and a smoke test pins the symbol.
+pub fn spawn_named_lock_heartbeat(
+    ssm: Arc<SsmClient>,
+    env: String,
+    lock_name: &'static str,
+    host_id: String,
+    shutdown: Arc<Notify>,
+    held_flag: Arc<std::sync::atomic::AtomicBool>,
+    loss_code: ErrorCode,
+) -> JoinHandle<()> {
+    let interval = Duration::from_secs(INSTANCE_LOCK_HEARTBEAT_INTERVAL_SECS);
+    tokio::spawn(async move {
+        info!(
+            target: "tickvault::instance_lock",
+            env = %env,
+            lock_name,
+            host_id = %host_id,
+            interval_secs = INSTANCE_LOCK_HEARTBEAT_INTERVAL_SECS,
+            ttl_secs = INSTANCE_LOCK_TTL_SECS,
+            "named-lock heartbeat task started (SSM backend)"
+        );
+        let mut ticker = tokio::time::interval(interval);
+        // First tick fires immediately — skip it so we don't redundantly
+        // re-write the parameter that the acquire just put.
+        ticker.tick().await;
+        // Consecutive renewal-FAILURE counter (2026-07-04 adversarial-review
+        // MEDIUM fix): once failures span the full TTL, the slot is stale and
+        // a peer can legitimately take it over WITHOUT this holder observing
+        // it — escalate that previously-unpaged window ONCE per episode.
+        let mut consecutive_renew_errors: u32 = 0;
+        loop {
+            tokio::select! {
+                () = shutdown.notified() => {
+                    info!(
+                        target: "tickvault::instance_lock",
+                        lock_name,
+                        "shutdown signalled — releasing named lock"
+                    );
+                    held_flag.store(false, std::sync::atomic::Ordering::Release);
+                    if let Err(err) = release_named_lock(&ssm, &env, lock_name, &host_id).await {
+                        warn!(
+                            target: "tickvault::instance_lock",
+                            lock_name,
+                            error = %err,
+                            "named-lock release on shutdown failed (slot will be \
+                             considered stale within {}s by the next booting instance)",
+                            INSTANCE_LOCK_TTL_SECS
+                        );
+                    }
+                    return;
+                }
+                _ = ticker.tick() => {
+                    match renew_named_lock(&ssm, &env, lock_name, &host_id).await {
+                        Ok(true) => {
+                            // Successful renewal — silent to avoid every-30s
+                            // log chatter. Re-arms the per-episode
+                            // stale-window escalation below.
+                            consecutive_renew_errors = 0;
+                        }
+                        Ok(false) => {
+                            // Flip BEFORE logging so a (current or future)
+                            // consumer of `held_flag` observes the loss at
+                            // the earliest instant. HONEST boundary: the
+                            // Groww fleet gate stores the flag for future
+                            // ladder-side wiring — no runtime reader exists
+                            // yet, so the ERROR page below is the operator
+                            // signal today.
+                            held_flag.store(false, std::sync::atomic::Ordering::Release);
+                            error!(
+                                target: "tickvault::instance_lock",
+                                code = loss_code.code_str(),
+                                severity = loss_code.severity().as_str(),
+                                env = %env,
+                                lock_name,
+                                host_id = %host_id,
+                                "named dual-instance lock lost — another process now \
+                                 holds the lock; heartbeat task exiting (the collision \
+                                 is paged, never silent)"
+                            );
+                            return;
+                        }
+                        Err(err) => {
+                            consecutive_renew_errors =
+                                consecutive_renew_errors.saturating_add(1);
+                            if consecutive_renew_errors
+                                == NAMED_LOCK_RENEWAL_ERRORS_ESCALATE_THRESHOLD
+                            {
+                                // Edge-triggered per failure episode (audit
+                                // Rule 4): the slot has now gone
+                                // un-refreshed for ≥ the 90s TTL. During an
+                                // SSM partition a legitimately booting peer
+                                // can take the stale slot and run a SECOND
+                                // fleet while renewals here keep Err-ing —
+                                // the Ok(false) loss page would only fire
+                                // after OUR connectivity recovers. Page NOW
+                                // so that window is never silent.
+                                error!(
+                                    target: "tickvault::instance_lock",
+                                    code = loss_code.code_str(),
+                                    severity = loss_code.severity().as_str(),
+                                    env = %env,
+                                    lock_name,
+                                    host_id = %host_id,
+                                    consecutive_failures = consecutive_renew_errors,
+                                    error = %err,
+                                    "named-lock renewals have failed past the TTL \
+                                     window — the SSM slot is now stale and a peer \
+                                     instance may take it over unobserved; heartbeat \
+                                     keeps retrying"
+                                );
+                            } else {
+                                warn!(
+                                    target: "tickvault::instance_lock",
+                                    lock_name,
+                                    consecutive_failures = consecutive_renew_errors,
+                                    error = %err,
+                                    "transient named-lock renewal failure; will retry on \
+                                     next heartbeat tick"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    })
+}
+
 // ---------------------------------------------------------------------------
 // SSM transport helpers (thin async wrappers — kept private so the public
 // surface stays small and the error mapping is centralised).
@@ -707,6 +989,122 @@ mod tests {
     // -----------------------------------------------------------------------
     // compute_instance_lock_path
     // -----------------------------------------------------------------------
+
+    // -----------------------------------------------------------------------
+    // compute_named_lock_path (Session-B fix 2026-07-04 — the named-lock knob)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_compute_named_lock_path_groww_scale() {
+        assert_eq!(
+            compute_named_lock_path("prod", GROWW_SCALE_FLEET_LOCK_NAME),
+            "/tickvault/prod/instance-lock-groww-scale"
+        );
+        assert_eq!(
+            compute_named_lock_path("dev", GROWW_SCALE_FLEET_LOCK_NAME),
+            "/tickvault/dev/instance-lock-groww-scale"
+        );
+    }
+
+    #[test]
+    fn test_groww_scale_lock_name_is_outside_groww_namespace() {
+        // Token-minter lock (2026-07-02): TickVault must NEVER write any
+        // /tickvault/<env>/groww/* parameter. The fleet lock parameter is
+        // written (Put/Delete) by the lock machinery, so its path must NOT
+        // sit under the groww/ namespace.
+        let path = compute_named_lock_path("prod", GROWW_SCALE_FLEET_LOCK_NAME);
+        assert!(
+            !path.contains("/groww/"),
+            "fleet lock path must be OUTSIDE /tickvault/<env>/groww/*: {path}"
+        );
+        assert!(path.starts_with("/tickvault/prod/"), "path={path}");
+    }
+
+    #[test]
+    fn test_named_lock_path_dhan_name_matches_legacy_path() {
+        // The named-lock knob must keep the Dhan lock path BYTE-IDENTICAL
+        // to the pre-knob implementation (`/tickvault/<env>/instance-lock`).
+        for env in ["prod", "dev", "sandbox", "", "  ", "prod\nX"] {
+            assert_eq!(
+                compute_named_lock_path(env, DHAN_INSTANCE_LOCK_NAME),
+                compute_instance_lock_path(env),
+                "env={env:?}"
+            );
+        }
+        assert_eq!(DHAN_INSTANCE_LOCK_NAME, "instance-lock");
+        assert_eq!(GROWW_SCALE_FLEET_LOCK_NAME, "instance-lock-groww-scale");
+    }
+
+    #[test]
+    fn test_compute_named_lock_path_sanitises_env() {
+        let path = compute_named_lock_path("prod\nMALICIOUS", GROWW_SCALE_FLEET_LOCK_NAME);
+        assert!(!path.contains('\n'), "newline must not survive: {path}");
+        assert!(
+            path.ends_with("/instance-lock-groww-scale"),
+            "suffix must stay intact: {path}"
+        );
+        // Empty env falls back to "unknown" — same as the Dhan path fn.
+        assert_eq!(
+            compute_named_lock_path("", GROWW_SCALE_FLEET_LOCK_NAME),
+            "/tickvault/unknown/instance-lock-groww-scale"
+        );
+    }
+
+    #[test]
+    fn test_compute_named_lock_path_strips_path_separators() {
+        // 2026-07-04 adversarial-review LOW: a '/'-bearing env must NOT
+        // inject a path break — nothing may escape /tickvault/<env>/ into
+        // the token-minter-banned groww/* subtree.
+        let path = compute_named_lock_path("prod/groww", GROWW_SCALE_FLEET_LOCK_NAME);
+        assert_eq!(path, "/tickvault/prodgroww/instance-lock-groww-scale");
+        assert!(!path.contains("/groww/"), "namespace escape: {path}");
+        // '.' is stripped too (defense-in-depth).
+        assert_eq!(
+            compute_named_lock_path("pr.od", GROWW_SCALE_FLEET_LOCK_NAME),
+            "/tickvault/prod/instance-lock-groww-scale"
+        );
+        // A '/'-bearing lock NAME cannot escape either.
+        let name_path = compute_named_lock_path("prod", "groww/evil");
+        assert_eq!(name_path, "/tickvault/prod/growwevil");
+        // An env that becomes empty after stripping falls back to "unknown".
+        assert_eq!(
+            compute_named_lock_path("///", GROWW_SCALE_FLEET_LOCK_NAME),
+            "/tickvault/unknown/instance-lock-groww-scale"
+        );
+    }
+
+    #[test]
+    fn test_named_lock_renewal_escalate_threshold_spans_ttl() {
+        // The escalation must fire exactly when consecutive renewal
+        // failures span the full TTL (3 × 30s = 90s) — earlier is noise,
+        // later leaves the peer-takeover window unpaged.
+        assert_eq!(
+            NAMED_LOCK_RENEWAL_ERRORS_ESCALATE_THRESHOLD,
+            (INSTANCE_LOCK_TTL_SECS / INSTANCE_LOCK_HEARTBEAT_INTERVAL_SECS) as u32
+        );
+        assert_eq!(NAMED_LOCK_RENEWAL_ERRORS_ESCALATE_THRESHOLD, 3);
+    }
+
+    #[test]
+    fn test_try_acquire_named_lock_smoke() {
+        // End-to-end is TEST-EXEMPT (real SSM endpoint); pin the symbol.
+        let _ = try_acquire_named_lock;
+    }
+
+    #[test]
+    fn test_renew_named_lock_smoke() {
+        let _ = renew_named_lock;
+    }
+
+    #[test]
+    fn test_release_named_lock_smoke() {
+        let _ = release_named_lock;
+    }
+
+    #[test]
+    fn test_spawn_named_lock_heartbeat_smoke() {
+        let _ = spawn_named_lock_heartbeat;
+    }
 
     #[test]
     fn test_compute_instance_lock_path_smoke() {

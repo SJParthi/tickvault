@@ -533,6 +533,38 @@ async fn main() -> Result<()> {
             }
             ok
         };
+    // ── Session-B fix #1 (operator go 2026-07-04): Groww FLEET dual-instance
+    // lock. A scale-test boot runs dhan_enabled=false and never reaches the
+    // Dhan RESILIENCE-01 lock, so without THIS gate two hosts (Mac + AWS, or
+    // two Macs) could scale the SAME Groww account simultaneously — a failure
+    // that masquerades as provider throttle. The lock is attempted ONLY after
+    // cfg.enabled + preflight pass (a default boot performs ZERO new SSM
+    // calls). AlreadyHeld / SSM-unavailable-after-retries → fail-closed:
+    // fleet SKIPPED with a GROWW-SCALE-05 Critical page (emitted inside the
+    // gate module via the error! log-sink chain — HONEST delivery boundary:
+    // no typed Telegram NotificationEvent exists for this code yet, so
+    // boot-stage delivery is log-sink + CloudWatch-log-derived alerting
+    // only; the deferred Telegram notifier slot is not filled at this boot
+    // stage), single-connection fallback, app keeps running. See
+    // groww-scale-error-codes.md §4b. The guard is handed to
+    // `run_process_runloop`, which calls `release_on_shutdown()` at
+    // graceful teardown so the SSM slot frees IMMEDIATELY for a same-host
+    // restart (2026-07-04 adversarial-review HIGH fix; hard crash still
+    // relies on the 90s TTL).
+    let mut groww_scale_fleet_lock: Option<
+        tickvault_app::groww_scale_lock::GrowwScaleFleetLockGuard,
+    > = None;
+    let groww_scale_enabled = if groww_scale_enabled {
+        match tickvault_app::groww_scale_lock::acquire_groww_scale_fleet_lock().await {
+            tickvault_app::groww_scale_lock::GrowwScaleFleetLockOutcome::Acquired(guard) => {
+                groww_scale_fleet_lock = Some(guard);
+                true
+            }
+            tickvault_app::groww_scale_lock::GrowwScaleFleetLockOutcome::SkipFleet => false,
+        }
+    } else {
+        false
+    };
     // Deferred Telegram slot shared by the Groww bridge + sidecar supervisor +
     // activation watcher: all three spawn here (before the notifier is built),
     // so they get a shared slot that is filled with the live
@@ -2510,6 +2542,7 @@ async fn main() -> Result<()> {
             ws_pool_arc,
             shutdown_notify,
             trading_calendar.clone(),
+            groww_scale_fleet_lock,
         )
         .await;
     }
@@ -2807,6 +2840,7 @@ async fn main() -> Result<()> {
         &notifier,
         &config,
         trading_calendar.clone(),
+        groww_scale_fleet_lock,
     )
     .await
 }
@@ -9446,6 +9480,11 @@ async fn run_process_runloop(
     // calendar (Saturday/Sunday/holiday suppression). See
     // `boot_helpers::should_emit_post_market_alert`.
     trading_calendar: std::sync::Arc<TradingCalendar>,
+    // Session-B HIGH fix (2026-07-04 adversarial review): the Groww
+    // scale-fleet dual-instance lock guard, released at graceful teardown
+    // below so a same-host restart never sees its own dead slot as a peer.
+    // `None` on every non-scale boot (the overwhelming default).
+    groww_scale_fleet_lock: Option<tickvault_app::groww_scale_lock::GrowwScaleFleetLockGuard>,
 ) -> Result<()> {
     let mode = "LIVE";
     info!(
@@ -9583,6 +9622,20 @@ async fn run_process_runloop(
         teardown_dhan_lane_tasks(lane).await;
     }
 
+    // 5b. Release the Groww scale-fleet dual-instance lock (2026-07-04
+    // adversarial-review HIGH fix). Without this, every clean shutdown left
+    // the SSM slot fresh for up to 90s (TTL), so a same-host restart — the
+    // dominant Mac scale-test iteration workflow — saw its OWN dead slot as
+    // a fresh AlreadyHeld peer: fleet refused for the whole session + a
+    // false-positive GROWW-SCALE-05 page naming the operator's previous
+    // pid. `release_on_shutdown` is permit-based (Rule 16 lost-wake safe)
+    // and bounded (GROWW_SCALE_LOCK_RELEASE_TIMEOUT_SECS), so a black-holed
+    // SSM endpoint can never hang process exit; on timeout the 90s TTL
+    // remains the backstop.
+    if let Some(fleet_lock) = groww_scale_fleet_lock {
+        fleet_lock.release_on_shutdown().await;
+    }
+
     // 6. Stop API server (PROCESS-shared).
     if let Some(handle) = api_handle {
         handle.abort();
@@ -9615,6 +9668,7 @@ async fn run_shutdown_fast(
     ws_pool_arc: Option<std::sync::Arc<WebSocketConnectionPool>>,
     shutdown_notify: std::sync::Arc<tokio::sync::Notify>,
     trading_calendar: std::sync::Arc<TradingCalendar>,
+    groww_scale_fleet_lock: Option<tickvault_app::groww_scale_lock::GrowwScaleFleetLockGuard>,
 ) -> Result<()> {
     run_process_runloop(
         Some(DhanLaneRunHandles {
@@ -9640,6 +9694,7 @@ async fn run_shutdown_fast(
         notifier,
         config,
         trading_calendar,
+        groww_scale_fleet_lock,
     )
     .await
 }

@@ -55,6 +55,11 @@ pub mod groww_native_shadow;
 /// `.claude/plans/active-plan-groww-autoscale.md`). Default-OFF behind
 /// `[feeds.groww.scale] enabled`.
 pub mod groww_scale_ladder;
+/// Groww scale-FLEET dual-instance SSM lock gate (Session-B fix #1,
+/// operator go 2026-07-04): refuses the multi-connection fleet spawn when a
+/// peer instance already holds `/tickvault/<env>/instance-lock-groww-scale`
+/// (GROWW-SCALE-05, fail-closed; single-connection fallback).
+pub mod groww_scale_lock;
 /// Groww Python-sidecar auto-launcher + supervisor (operator lock §32 +
 /// "no manual commands" 2026-06-19). Default-OFF.
 pub mod groww_sidecar_supervisor;
