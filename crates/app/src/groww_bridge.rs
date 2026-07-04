@@ -1691,6 +1691,52 @@ pub struct GrowwAuditLatches {
     /// A Disconnected row was emitted since the last connect — the next rising
     /// edge classifies as Reconnected, not a second Connected.
     pub prior_disconnect: std::sync::atomic::AtomicBool,
+    /// Boot-stage socket-connected announcement (operator 2026-07-04 — Groww
+    /// boot-visibility parity): set once the "feed connected — subscribed N —
+    /// awaiting first tick" Telegram + the boot-time `ws_event_audit`
+    /// Connected row have fired for the CURRENT connected episode. Re-armed
+    /// ONLY on a genuine disconnect falling edge (feed disable / bridge
+    /// death) — never per poll turn, never per reconnect attempt — so a
+    /// closed-market boot announces exactly once and a genuine reconnect
+    /// announces exactly once more.
+    pub boot_connect_announced: std::sync::atomic::AtomicBool,
+}
+
+impl GrowwAuditLatches {
+    /// Consume the boot-connect edge: returns `true` exactly once per
+    /// connected episode (first caller wins; subsequent polls read `false`
+    /// until [`Self::rearm_boot_connect`]).
+    pub fn try_announce_boot_connect(&self) -> bool {
+        !self
+            .boot_connect_announced
+            .swap(true, std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Re-arm the boot-connect edge on a GENUINE disconnect falling edge
+    /// (feed disable / bridge death) so the next observed subscribe state
+    /// announces one fresh "connected — awaiting first tick".
+    pub fn rearm_boot_connect(&self) {
+        self.boot_connect_announced
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Pure decision for the boot-stage socket-connected announcement
+/// (operator 2026-07-04 parity). Announce ONLY when:
+/// - the sidecar status file reported a KNOWN subscribe state (`subscribed`
+///   or `streaming` — never the forward-compat `Unknown` tag), AND
+/// - this connected episode has not been announced yet (edge latch), AND
+/// - the Telegram notifier is deliverable (`notifier_ready`) — a slot that
+///   exists but is not yet filled (boot ordering) defers to the NEXT wake
+///   instead of consuming the edge, so the announcement is delayed, never
+///   silently lost.
+#[must_use]
+pub fn should_announce_boot_connect(
+    status_known: bool,
+    already_announced: bool,
+    notifier_ready: bool,
+) -> bool {
+    status_known && !already_announced && notifier_ready
 }
 
 /// Pure: the next consecutive-respawn count given how long the previous bridge
@@ -1739,6 +1785,8 @@ pub fn bridge_respawn_backoff(consecutive_respawns: u32) -> std::time::Duration 
 /// off ([`bridge_respawn_backoff`]) and respawn. A respawned bridge re-tails
 /// the NDJSON from byte 0 — residual-neutral: the deterministic `capture_seq`
 /// regenerates identical DEDUP keys, so QuestDB collapses the replay.
+// APPROVED: supervision wiring — every arg is a distinct owned resource
+#[allow(clippy::too_many_arguments)]
 // TEST-EXEMPT: supervision loop (spawn/await/sleep); the pure backoff curve is unit-tested (test_bridge_respawn_backoff_curve) and the wiring is pinned by per_feed_boot_isolation_guard + test_spawn_supervised_groww_bridge_owns_aggregator_and_force_seal_once.
 pub fn spawn_supervised_groww_bridge(
     qdb: QuestDbConfig,
@@ -1747,6 +1795,13 @@ pub fn spawn_supervised_groww_bridge(
     feed_runtime: Arc<FeedRuntimeState>,
     feed_health: Arc<tickvault_common::feed_health::FeedHealthRegistry>,
     ws_audit_tx: Option<tokio::sync::mpsc::Sender<WsEventAuditRow>>,
+    // 2026-07-04 boot-visibility parity: the same lazily-filled Telegram slot
+    // the sidecar supervisor + activation watcher share — carries the ONE
+    // "feed connected — subscribed N — awaiting first tick" boot ping.
+    // `None` (tests) = audit row only, no Telegram.
+    notifier_slot: Option<
+        Arc<arc_swap::ArcSwapOption<tickvault_core::notification::NotificationService>>,
+    >,
     trading_calendar: Arc<tickvault_common::trading_calendar::TradingCalendar>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
@@ -1783,6 +1838,7 @@ pub fn spawn_supervised_groww_bridge(
             feed_runtime,
             feed_health,
             ws_audit_tx,
+            notifier_slot,
             aggregator,
             audit_latches,
             capture_seq,
@@ -1807,6 +1863,9 @@ async fn supervise_groww_bridge_loop(
     feed_runtime: Arc<FeedRuntimeState>,
     feed_health: Arc<tickvault_common::feed_health::FeedHealthRegistry>,
     ws_audit_tx: Option<tokio::sync::mpsc::Sender<WsEventAuditRow>>,
+    notifier_slot: Option<
+        Arc<arc_swap::ArcSwapOption<tickvault_core::notification::NotificationService>>,
+    >,
     aggregator: MultiTfAggregator,
     audit_latches: Arc<GrowwAuditLatches>,
     capture_seq: Arc<AtomicI64>,
@@ -1823,6 +1882,7 @@ async fn supervise_groww_bridge_loop(
                 Arc::clone(&feed_runtime),
                 Arc::clone(&feed_health),
                 ws_audit_tx.clone(),
+                notifier_slot.clone(),
                 aggregator.clone(),
                 Arc::clone(&audit_latches),
                 Arc::clone(&capture_seq),
@@ -1865,6 +1925,10 @@ async fn supervise_groww_bridge_loop(
                 audit_latches
                     .prior_disconnect
                     .store(true, std::sync::atomic::Ordering::Relaxed);
+                // 2026-07-04 parity: a bridge death is a genuine disconnect —
+                // re-arm the boot-connect edge so the respawned bridge
+                // announces the (re)connected socket exactly once.
+                audit_latches.rearm_boot_connect();
             }
             error!(
                 code =
@@ -1930,6 +1994,8 @@ pub fn shard_files(shards_root: &Path, conn_id: usize) -> GrowwShardFiles {
 /// tailing a not-yet-created shard file idles at zero cost (the tail loop
 /// already handles a missing file), so bridge lifecycle never has to track
 /// the ladder — only the sidecar PROCESSES scale up/down.
+// APPROVED: supervision wiring — every arg is a distinct owned resource
+#[allow(clippy::too_many_arguments)]
 // TEST-EXEMPT: composition-only spawn wiring; the pieces it composes (supervise_groww_bridge_loop via the single-conn wrapper, shard_files, next_capture_seq sharing) are unit-tested, and per_feed_boot_isolation_guard pins the single-conn path.
 pub fn spawn_supervised_groww_shard_bridges(
     qdb: QuestDbConfig,
@@ -1938,6 +2004,10 @@ pub fn spawn_supervised_groww_shard_bridges(
     feed_runtime: Arc<FeedRuntimeState>,
     feed_health: Arc<tickvault_common::feed_health::FeedHealthRegistry>,
     ws_audit_tx: Option<tokio::sync::mpsc::Sender<WsEventAuditRow>>,
+    // 2026-07-04 boot-visibility parity — see `spawn_supervised_groww_bridge`.
+    notifier_slot: Option<
+        Arc<arc_swap::ArcSwapOption<tickvault_core::notification::NotificationService>>,
+    >,
     trading_calendar: Arc<tickvault_common::trading_calendar::TradingCalendar>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
@@ -1970,6 +2040,7 @@ pub fn spawn_supervised_groww_shard_bridges(
                 Arc::clone(&feed_runtime),
                 Arc::clone(&feed_health),
                 ws_audit_tx.clone(),
+                notifier_slot.clone(),
                 aggregator.clone(),
                 audit_latches,
                 Arc::clone(&capture_seq),
@@ -2005,10 +2076,13 @@ pub fn spawn_supervised_groww_shard_bridges(
 /// subscribed N stocks + M indices` log + records the counts in feed-health; flips
 /// `connected=true` ONLY on the `streaming` status OR the first parsed tick — NOT
 /// on mere file existence (removing the false-OK).
-// TEST-EXEMPT: event-driven file-tail + live-QuestDB ILP I/O driver; the pure
-// primitives (parse_groww_tick_line, parse_groww_status_line, segment_from_str,
-// live_tick_row, build_parsed_tick, next_capture_seq) + the GrowwBridgeState
-// ingestion body are unit/integration-tested below + in groww_live_pipeline_e2e.
+// APPROVED: I/O driver wiring — every arg is a distinct owned resource
+#[allow(clippy::too_many_arguments)]
+// The pure primitives (parse_groww_tick_line, parse_groww_status_line,
+// segment_from_str, live_tick_row, build_parsed_tick, next_capture_seq) + the
+// GrowwBridgeState ingestion body are unit/integration-tested below + in
+// groww_live_pipeline_e2e.
+// TEST-EXEMPT: event-driven file-tail + live-QuestDB ILP I/O driver.
 pub async fn run_groww_bridge(
     qdb: QuestDbConfig,
     tick_file_path: PathBuf,
@@ -2022,6 +2096,14 @@ pub async fn run_groww_bridge(
     // (`spawn_ws_event_audit_consumer`). `Option` mirrors the Dhan `ws_audit_tx`
     // convention so a `None` build (defensive / test) is a no-op.
     ws_audit_tx: Option<tokio::sync::mpsc::Sender<WsEventAuditRow>>,
+    // Boot-visibility parity (operator 2026-07-04): the lazily-filled
+    // Telegram slot for the ONE "feed connected — subscribed N — awaiting
+    // first tick" boot ping, emitted at SOCKET-CONNECT time off the SAME
+    // sidecar status-file transition that drives the /feeds panel
+    // (`set_subscribed`). `None` (tests) = audit row only, no Telegram.
+    notifier_slot: Option<
+        Arc<arc_swap::ArcSwapOption<tickvault_core::notification::NotificationService>>,
+    >,
     // The process-lifetime Groww aggregator, created ONCE by the supervisor
     // wrapper — a respawned bridge reuses it (bars survive a panic) and the
     // IST-midnight force-seal (spawned once by the wrapper) keeps sealing it.
@@ -2150,6 +2232,10 @@ pub async fn run_groww_bridge(
             audit_latches
                 .audited_connected
                 .store(false, std::sync::atomic::Ordering::Relaxed);
+            // 2026-07-04 parity: a feed disable is a genuine disconnect —
+            // re-arm the boot-connect edge so a later re-enable announces
+            // the fresh subscribe exactly once (never per reconnect attempt).
+            audit_latches.rearm_boot_connect();
             connect_logged = false;
             streaming_observed = false;
             continue;
@@ -2174,6 +2260,48 @@ pub async fn run_groww_bridge(
             } else if status.event != GrowwStatusEvent::Unknown {
                 // Keep the counts fresh on a re-subscribe (reconnect) without re-logging.
                 feed_health.set_subscribed(Feed::Groww, status.stocks, status.indices);
+            }
+            // Boot-stage socket-connected announcement (operator 2026-07-04 —
+            // "i need the same view display everything even for groww"): on
+            // the FIRST observed subscribe state per connected episode, emit
+            // ONE ws_event_audit Connected row AT SOCKET-CONNECT time + ONE
+            // Telegram ping — WITHOUT waiting for the first streaming tick
+            // (a closed market previously meant total boot silence). The
+            // existing first-streaming-tick rising edge below is KEPT
+            // unchanged as the streaming confirmation; this is ADDITIVE.
+            // Edge-latched via `boot_connect_announced` (once per episode,
+            // never per poll); a notifier slot that exists but is not yet
+            // filled (boot ordering) defers to the next wake so the ping is
+            // delayed, never lost.
+            let notifier = notifier_slot.as_ref().and_then(|slot| slot.load_full());
+            let notifier_ready = match notifier_slot.as_ref() {
+                None => true, // no Telegram wiring (tests) — audit row only
+                Some(_) => notifier.is_some(),
+            };
+            if should_announce_boot_connect(
+                status.event != GrowwStatusEvent::Unknown,
+                audit_latches
+                    .boot_connect_announced
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                notifier_ready,
+            ) && audit_latches.try_announce_boot_connect()
+            {
+                emit_groww_ws_audit(
+                    ws_audit_tx.as_ref(),
+                    WsEventKind::Connected,
+                    "groww_subscribed",
+                    "groww socket connected + subscribed — awaiting first tick",
+                );
+                if let Some(notifier) = notifier {
+                    notifier.notify(
+                        tickvault_core::notification::NotificationEvent::FeedConnectedAwaitingTicks {
+                            feed: Feed::Groww.display_name().to_string(),
+                            subscribed: status.stocks.saturating_add(status.indices),
+                            market_open:
+                                tickvault_common::market_hours::is_within_market_hours_ist(),
+                        },
+                    );
+                }
             }
             // HONEST-FEED PROOF (operator 2026-06-29): surface the producer-side
             // decoded+emitted vs decoded-but-dropped counts so a sid-map mismatch
@@ -3090,6 +3218,68 @@ mod tests {
             build_groww_ws_audit_row(WsEventKind::Disconnected, "feed_disabled", "groww disabled");
         assert_eq!(on.event_kind, WsEventKind::Disconnected);
         assert_eq!(on.source, "feed_disabled");
+    }
+
+    // --- 2026-07-04 boot-visibility parity: boot-time socket-connected edge ---
+
+    #[test]
+    fn test_boot_connect_audit_row_is_connected_kind_groww_feed() {
+        // The NEW boot-time announcement row (socket connected + subscribed,
+        // BEFORE any tick) — Connected kind, feed=Groww, ws_type=GrowwBridge,
+        // source `groww_subscribed`, honest awaiting-first-tick reason.
+        let row = build_groww_ws_audit_row(
+            WsEventKind::Connected,
+            "groww_subscribed",
+            "groww socket connected + subscribed — awaiting first tick",
+        );
+        assert_eq!(row.event_kind, WsEventKind::Connected);
+        assert_eq!(row.feed, Feed::Groww);
+        assert_eq!(row.ws_type, WsType::GrowwBridge);
+        assert_eq!(row.source, "groww_subscribed");
+        assert!(row.reason.contains("awaiting first tick"), "{}", row.reason);
+    }
+
+    #[test]
+    fn test_try_announce_boot_connect_latch_fires_once_not_per_poll() {
+        // The bridge re-reads the status file every wake (≤1s) — the latch
+        // must consume the edge exactly once per connected episode.
+        let latches = GrowwAuditLatches::default();
+        assert!(latches.try_announce_boot_connect(), "first poll announces");
+        for _ in 0..10 {
+            assert!(
+                !latches.try_announce_boot_connect(),
+                "subsequent polls must NEVER re-announce (spam trap)"
+            );
+        }
+    }
+
+    #[test]
+    fn test_rearm_boot_connect_latch_rearms_after_genuine_disconnect() {
+        // A genuine disconnect falling edge (feed disable / bridge death)
+        // re-arms the edge so the NEXT observed subscribe state announces
+        // exactly once more — a genuine reconnect is visible, attempts are not.
+        let latches = GrowwAuditLatches::default();
+        assert!(latches.try_announce_boot_connect());
+        assert!(!latches.try_announce_boot_connect());
+        latches.rearm_boot_connect();
+        assert!(
+            latches.try_announce_boot_connect(),
+            "post-disconnect subscribe must announce once more"
+        );
+        assert!(!latches.try_announce_boot_connect(), "and only once");
+    }
+
+    #[test]
+    fn test_should_announce_boot_connect_decision_table() {
+        // Announce: known subscribe state + not yet announced + notifier ready.
+        assert!(should_announce_boot_connect(true, false, true));
+        // Unknown/absent status (forward-compat tag, no file yet) → never.
+        assert!(!should_announce_boot_connect(false, false, true));
+        // Already announced this episode → never (per-poll spam trap).
+        assert!(!should_announce_boot_connect(true, true, true));
+        // Notifier slot exists but not yet filled (boot ordering) → defer,
+        // do NOT consume the edge — delayed, never lost.
+        assert!(!should_announce_boot_connect(true, false, false));
     }
 
     #[test]
