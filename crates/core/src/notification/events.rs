@@ -4872,4 +4872,190 @@ mod tests {
         assert!(msg.contains("Reason: task panicked"));
         assert!(msg.contains("What to do RIGHT NOW"));
     }
+
+    // -----------------------------------------------------------------------
+    // Coverage for the boot-message rendering branches adjacent to the
+    // 2026-07-04 Groww boot-parity change (PR #1400 coverage gate: core
+    // dipped 90.16% vs the 90.2% ratcheted floor — these pin the previously
+    // uncovered cold arms; the floor is NEVER lowered).
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_format_ping_freshness_bands() {
+        // None = no inbound frame yet — explicit dash, never a fake "0s".
+        assert_eq!(format_ping_freshness(None), "—");
+        // 0–10s: healthy (Dhan pings every 10s).
+        assert!(format_ping_freshness(Some(5)).contains('✓'));
+        // 11–30s: still alive but flagged.
+        assert!(format_ping_freshness(Some(20)).contains('⚠'));
+        // >30s: watchdog territory.
+        assert!(format_ping_freshness(Some(45)).contains('❌'));
+    }
+
+    #[test]
+    fn test_feed_status_block_mid_age_band_is_neutral() {
+        // 31–120s band: age shown WITHOUT a verdict emoji (neither the
+        // healthy ✓ nor a false-red ❌ — post-lull silence is normal).
+        let block = format_feed_status_block(&[FeedStatusLine {
+            name: "Groww".to_string(),
+            instruments: Some(768),
+            last_tick_age_secs: Some(90),
+        }]);
+        assert!(block.contains("last tick 90s ago"), "got: {block}");
+        assert!(
+            !block.contains('✓'),
+            "31-120s band must not claim healthy: {block}"
+        );
+        assert!(
+            !block.contains('❌'),
+            "31-120s band must not claim broken: {block}"
+        );
+    }
+
+    #[test]
+    fn test_pool_online_message_zero_capacity_and_no_real_ticks_is_honest() {
+        // Zero-capacity per-connection rows must render 0% (no div-by-zero)
+        // and zero REAL ticks must render the loud NONE warning (2026-06-02
+        // false-OK fix), never a fabricated freshness.
+        let ev = NotificationEvent::WebSocketPoolOnline {
+            connected: 1,
+            total: 1,
+            per_connection: vec![(0, 0, None)],
+            boot_path: BootPathLabel::Slow,
+            boot_wall_clock_secs: 1.0,
+            last_real_tick_age_secs: None,
+            feeds: vec![],
+        };
+        let msg = ev.to_message();
+        assert!(msg.contains("NONE captured yet"), "got: {msg}");
+        assert!(msg.contains("0% full"), "zero capacity renders 0%: {msg}");
+    }
+
+    #[test]
+    fn test_pool_online_message_full_connection_and_fresh_tick() {
+        let ev = NotificationEvent::WebSocketPoolOnline {
+            connected: 1,
+            total: 1,
+            per_connection: vec![(100, 100, Some(2))],
+            boot_path: BootPathLabel::Slow,
+            boot_wall_clock_secs: 1.0,
+            last_real_tick_age_secs: Some(3),
+            feeds: vec![],
+        };
+        let msg = ev.to_message();
+        assert!(msg.contains("(full)"), "100% renders as 'full': {msg}");
+        assert!(
+            msg.contains("Real market ticks: last one 3s ago"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_ws_pool_degraded_recovered_halt_messages() {
+        let d = NotificationEvent::WebSocketPoolDegraded { down_secs: 42 }.to_message();
+        assert!(
+            d.contains("WS POOL DEGRADED") && d.contains("42"),
+            "got: {d}"
+        );
+        let r = NotificationEvent::WebSocketPoolRecovered { was_down_secs: 7 }.to_message();
+        assert!(r.contains("recovered") && r.contains('7'), "got: {r}");
+        let h = NotificationEvent::WebSocketPoolHalt { down_secs: 301 }.to_message();
+        assert!(h.contains("WS POOL HALT") && h.contains("301"), "got: {h}");
+    }
+
+    #[test]
+    fn test_market_open_streaming_and_readiness_messages() {
+        let ok = NotificationEvent::MarketOpenStreamingConfirmation {
+            main_feed_active: 1,
+            main_feed_total: 1,
+            order_update_active: true,
+        }
+        .to_message();
+        assert!(
+            ok.contains("Streaming live") && ok.contains("1/1"),
+            "got: {ok}"
+        );
+        let fail = NotificationEvent::MarketOpenStreamingFailed {
+            main_feed_active: 0,
+            main_feed_total: 1,
+            order_update_active: false,
+        }
+        .to_message();
+        assert!(
+            fail.contains("STREAMING FAILED") && fail.contains("0/1"),
+            "got: {fail}"
+        );
+        let ready = NotificationEvent::MarketOpenReadinessConfirmation {
+            main_feed_active: 1,
+            main_feed_total: 1,
+            order_update_active: true,
+            token_remaining_secs: 7200,
+        }
+        .to_message();
+        assert!(
+            ready.contains("READY for market open") && ready.contains("2.0h"),
+            "got: {ready}"
+        );
+    }
+
+    #[test]
+    fn test_ws_sleep_wake_and_order_update_lifecycle_messages() {
+        // WS-GAP-04 dormant sleep/wake + AUTH-GAP-03 wake-time renewal +
+        // order-update lifecycle arms (previously uncovered cold branches).
+        let sleep = NotificationEvent::WebSocketSleepEntered {
+            feed: "main".to_string(),
+            connection_index: 0,
+            sleep_secs: 3600,
+        }
+        .to_message();
+        assert!(
+            sleep.contains("sleeping (slot 1)") && sleep.contains("3600"),
+            "got: {sleep}"
+        );
+        let wake = NotificationEvent::WebSocketSleepResumed {
+            feed: "main".to_string(),
+            connection_index: 0,
+            slept_for_secs: 3600,
+        }
+        .to_message();
+        assert!(
+            wake.contains("waking (slot 1)") && wake.contains("attempting reconnect"),
+            "got: {wake}"
+        );
+        let renewed = NotificationEvent::WebSocketTokenForceRenewedOnWake {
+            feed: "main".to_string(),
+            connection_index: 0,
+            remaining_secs_before: 100,
+            threshold_secs: 14400,
+        }
+        .to_message();
+        assert!(
+            renewed.contains("wake-time token renewed") && renewed.contains("14400"),
+            "got: {renewed}"
+        );
+        let connected = NotificationEvent::OrderUpdateConnected.to_message();
+        assert!(
+            connected.contains("Order Update WS connected"),
+            "got: {connected}"
+        );
+        let authed = NotificationEvent::OrderUpdateAuthenticated.to_message();
+        assert!(authed.contains("streaming live"), "got: {authed}");
+        let reconnected = NotificationEvent::OrderUpdateReconnected {
+            consecutive_failures: 3,
+        }
+        .to_message();
+        assert!(
+            reconnected.contains("reconnected") && reconnected.contains('3'),
+            "got: {reconnected}"
+        );
+        let silent = NotificationEvent::NoLiveTicksDuringMarketHours {
+            silent_for_secs: 120,
+            threshold_secs: 60,
+        }
+        .to_message();
+        assert!(
+            silent.contains("zero live ticks") && silent.contains("120"),
+            "got: {silent}"
+        );
+    }
 }
