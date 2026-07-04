@@ -241,6 +241,9 @@ pub fn overlay_feeds(config: FeedsConfig, persisted: Option<PersistedFeedState>)
             dhan_enabled: p.dhan_enabled,
             groww_enabled: p.groww_enabled,
             groww: config.groww,
+            // PR-R1 (2026-07-04): the native-shadow flag is CONFIG-ONLY (no
+            // runtime toggle in R1) — always from config, never persisted.
+            groww_native_shadow: config.groww_native_shadow,
         },
     }
 }
