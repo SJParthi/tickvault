@@ -57,7 +57,8 @@ if [[ $EMIT_CONFIG -eq 1 ]]; then
   echo "[profiles.${profile_name}]"
   echo "questdb_url       = \"http://127.0.0.1:9000\""
   echo "tickvault_api_url = \"https://${HOSTNAME_FQDN}:3001\""
-  echo "logs_source       = \"http\""
+  echo "# log tools read the local filesystem — no HTTP log fetch is implemented"
+  echo "logs_source       = \"local\""
   echo "logs_dir_local    = \"./data/logs\""
   exit 0
 fi
@@ -86,13 +87,20 @@ for port in "${PORTS[@]}"; do
   fi
 done
 
-# 3. Hit the new debug endpoints specifically
+# 3. Hit the new debug endpoints specifically.
+# Security trim 2026-07-04: /api/debug/* is gated behind bearer auth, and every
+# real boot fetches the SSM token (auth always ENABLED) — so a tokenless probe
+# returning 401 is the CORRECT, healthy answer on a secured host. 200/404 only
+# occur when auth is disabled (unit-test-style constructions).
 for dbg in "/api/debug/logs/summary" "/api/debug/logs/jsonl/latest"; do
   url="https://${HOSTNAME_FQDN}:3001${dbg}"
   code=$(curl -s -o /dev/null -m 5 -w "%{http_code}" "$url" || echo "000")
-  if [[ "$code" =~ ^(200|404)$ ]]; then
-    # 404 is acceptable if the app hasn't written errors.summary.md yet
-    pass "tickvault debug endpoint ${dbg} reachable (HTTP ${code})"
+  if [[ "$code" == "401" ]]; then
+    pass "tickvault debug endpoint ${dbg} reachable + gated (HTTP 401 — bearer auth enforced, expected)"
+  elif [[ "$code" =~ ^(200|404)$ ]]; then
+    # 404 is acceptable if the app hasn't written errors.summary.md yet;
+    # 200/404 without a token means auth is disabled on this host.
+    pass "tickvault debug endpoint ${dbg} reachable (HTTP ${code} — auth disabled on this host)"
   else
     fail_row "tickvault debug endpoint ${dbg} — HTTP ${code}"
   fi

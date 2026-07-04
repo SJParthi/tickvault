@@ -142,6 +142,11 @@ echo "  tickvault API:  https://$HOSTNAME_FQDN:3001"
 echo "  Log summary:    https://$HOSTNAME_FQDN:3001/api/debug/logs/summary"
 echo "  Log JSONL:      https://$HOSTNAME_FQDN:3001/api/debug/logs/jsonl/latest"
 echo
+echo "NOTE: /api/debug/* is bearer-gated — every real boot loads the SSM"
+echo "token, so these URLs need: -H \"Authorization: Bearer \$TOK\" where"
+echo "TOK comes from SSM /tickvault/<env>/api/bearer-token. Tokenless"
+echo "requests return 401 (that is the intended fail-closed behavior)."
+echo
 echo "NOTE: QuestDB (9000) is intentionally no longer funnelled — auth-less"
 echo "raw SQL stays local-only. Prometheus/Alertmanager/Grafana are retired."
 echo

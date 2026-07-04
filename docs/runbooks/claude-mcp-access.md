@@ -77,7 +77,9 @@ Key properties:
 - **Stable URLs**: `.ts.net` hostnames never change across Tailscale restarts.
 - **Branch-independent**: endpoints in repo, so every branch checkout works.
 - **Universal**: works identically on Mac dev, AWS prod, claude.ai sandbox.
-- **Logs over HTTP, not filesystem**: `/api/debug/logs/*` eliminates rsync.
+- **Log endpoints exist over HTTP** (`/api/debug/logs/*`, bearer-gated since
+  2026-07-04); the MCP server's log tools themselves read the LOCAL
+  filesystem (`logs_source = "local"` — no HTTP log fetch is implemented).
 - **Auto-heal**: launchd/systemd restart the funnel on crash or reboot.
 
 ## Five inputs the MCP server reads
@@ -106,8 +108,8 @@ Every surface of the tickvault stack is reachable through one MCP server
 
 | Tool | What it reads |
 |---|---|
-| `summary_snapshot` | `errors.summary.md` (local OR via `/api/debug/logs/summary`) |
-| `tail_errors` | `errors.jsonl.*` (local OR via `/api/debug/logs/jsonl/latest`) |
+| `summary_snapshot` | `errors.summary.md` (local filesystem read) |
+| `tail_errors` | `errors.jsonl.*` (local filesystem read) |
 | `list_novel_signatures` | first-seen signatures over a time window |
 | `signature_history` | all events matching a signature hash |
 | `triage_log_tail` | `data/logs/auto-fix.log` |
@@ -242,9 +244,19 @@ unreachable services.
   gated by the Funnel feature's per-node ACL.
 - The debug log endpoints return ERROR signatures and metric values
   only — never auth tokens, order payloads, or user PII.
-- tickvault's protected endpoints (order place/cancel) remain behind
-  `TV_API_TOKEN` bearer auth. The debug endpoints are read-only and
-  intentionally outside that wall so observability is always available.
+- The debug endpoints (`/api/debug/*`) are read-only and — since the
+  2026-07-04 security trim — gated by the SAME bearer-auth wall as the
+  mutating endpoints (`route_layer(require_bearer_auth)`, applied
+  unconditionally). They pass through tokenless ONLY when auth itself is
+  disabled (an empty-token construction, i.e. tests) — never a separate
+  "outside the wall" exemption. Every real boot fetches the bearer token
+  from SSM (hard-fail), so on a running host these endpoints ALWAYS
+  demand `Authorization: Bearer <token>` and 401 otherwise. Fetch the
+  token from SSM: `aws ssm get-parameter --name
+  /tickvault/<env>/api/bearer-token --with-decryption --query
+  Parameter.Value --output text`, then
+  `curl -H "Authorization: Bearer $TOK" https://<host>:3001/api/debug/logs/summary`.
+  Tokenless observability fallback: CloudWatch logs + local MCP file reads.
 - The Dhan access token, AWS credentials, and private keys are never
   logged to `errors.jsonl` (enforced by
   `.claude/hooks/banned-pattern-scanner.sh`).
