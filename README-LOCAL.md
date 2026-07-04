@@ -95,10 +95,22 @@ The autopilot handles everything; double-click Stop to take over manually
 any time; double-click Start to resume. The autopilot never fights a
 manual decision.
 
-| Action | Double-click (repo root, no terminal) | Terminal equivalent |
-|---|---|---|
-| Take over / resume | **`Start TickVault.command`** | `make local-start` |
-| Stop everything now | **`Stop TickVault.command`** | `make local-stop` |
+| Action | Double-click (repo root, no terminal) | IntelliJ (one button) | Terminal equivalent |
+|---|---|---|---|
+| Take over / resume | **`Start TickVault.command`** | **Run tickvault** | `make local-start` |
+| Stop everything now | **`Stop TickVault.command`** | **Stop tickvault** | `make local-stop` |
+
+**IntelliJ: ONE button does everything** (operator 2026-07-04: "just provide
+everything in the fucking run tickvault"). The **Run tickvault** run config is
+the FULL chain from a cold Mac — dev tools + Docker auto-setup (idempotent
+ensure-ready, <1s when already provisioned) → QuestDB up with the local
+override (8 GB memory, same as the scale lab) → wait for QuestDB to answer →
+build + boot the app → tail the live log in the run window. Idempotent: if the
+app is already running it adopts it and just tails. Stopping the run window
+stops ONLY the log tail — use **Stop tickvault** for a graceful stop. The old
+"Docker Restart" / "Ensure Ready" / "Run tickvault (make)" configs are removed
+(folded into the one button); "Groww Scale Test" stays separate because it
+applies config overrides a normal run must never apply.
 
 - **Stop** gracefully stops the app, cleans the scale overlay, leaves
   QuestDB up, and writes `data/local-manual-stop.marker` — the autopilot

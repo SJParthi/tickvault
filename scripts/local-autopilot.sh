@@ -354,6 +354,34 @@ cmd_stop() {
   tg "🔔 Manual stop done — app stopped, overlay cleaned, QuestDB left running. Autopilot will NOT auto-restart today. Double-click Start TickVault to resume."
 }
 
+# ── Subcommand: dev (the ONE-BUTTON IntelliJ "Run tickvault") ───────────────
+# Operator 2026-07-04: "just provide everything in the fucking run tickvault
+# thats it and it should have everything". Full chain from a cold Mac:
+#   ensure-ready (dev tools + docker auto-setup, idempotent, fast-path <1s)
+#   → docker compose up with the local override (QDB_MEM_LIMIT=8g exported in
+#     the tunables block above) → wait for QuestDB to answer → build + boot
+#     the app (idempotent — adopts an already-running app via the pidfile)
+#   → tail the app log in the FOREGROUND so the IntelliJ run window shows it.
+# Stopping the tail (red square / Ctrl+C) does NOT stop the app — use the
+# "Stop tickvault" run config (make local-stop) for a graceful stop.
+
+cmd_dev() {
+  log "== ONE-BUTTON DEV RUN (ensure-ready → docker → questdb → app → tail) =="
+  if [ -x scripts/ensure-ready.sh ]; then
+    bash scripts/ensure-ready.sh || {
+      log "ensure-ready failed — cannot continue"
+      return 1
+    }
+  else
+    log "scripts/ensure-ready.sh missing/not executable — skipping (docker + questdb still ensured below)"
+  fi
+  cmd_start || return 1
+  echo "=== tickvault is RUNNING — tailing $APP_LOG ==="
+  echo "=== stopping this tail does NOT stop the app; use the 'Stop tickvault' run config ==="
+  touch "$APP_LOG"
+  exec tail -f "$APP_LOG"
+}
+
 # ── Subcommand: status ──────────────────────────────────────────────────────
 
 cmd_status() {
@@ -567,9 +595,10 @@ case "${1:-run}" in
 run) cmd_run ;;
 start) cmd_start ;;
 stop) cmd_stop ;;
+dev) cmd_dev ;;
 status) cmd_status ;;
 *)
-  echo "usage: $0 [run|start|stop|status]" >&2
+  echo "usage: $0 [run|start|stop|dev|status]" >&2
   exit 2
   ;;
 esac

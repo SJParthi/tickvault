@@ -1,23 +1,24 @@
 <component name="ProjectRunConfigurationManager">
-  <configuration default="false" name="Run tickvault" type="CargoCommandRunConfiguration" factoryName="Cargo Command">
-    <option name="buildProfileId" value="dev" />
-    <option name="command" value="run --bin tickvault -p tickvault-app" />
-    <option name="workingDirectory" value="file://$PROJECT_DIR$" />
-    <envs>
-      <env name="RUST_LOG" value="info,tickvault=debug" />
-      <env name="RUST_BACKTRACE" value="1" />
-    </envs>
-    <option name="emulateTerminal" value="true" />
-    <option name="channel" value="DEFAULT" />
-    <option name="requiredFeatures" value="true" />
-    <option name="allFeatures" value="false" />
-    <option name="withSudo" value="false" />
-    <option name="buildTarget" value="REMOTE" />
-    <option name="backtrace" value="SHORT" />
-    <option name="isRedirectInput" value="false" />
-    <option name="redirectInputPath" value="" />
-    <method v="2">
-      <option name="RunConfigurationTask" enabled="true" run_configuration_name="Ensure Ready" run_configuration_type="ShConfigurationType" />
-    </method>
+  <!-- ONE BUTTON = EVERYTHING (operator 2026-07-04: "just provide everything
+       in the fucking run tickvault thats it and it should have everything").
+       Full chain from a cold Mac: ensure-ready (dev tools + docker setup,
+       idempotent) -> docker compose up with the local override
+       (QDB_MEM_LIMIT=8g) -> wait for QuestDB -> build + boot the app
+       (idempotent, adopts a running app) -> tail the app log in this window.
+       Stopping this window stops only the log tail, NOT the app - use the
+       "Stop tickvault" run config for a graceful stop. -->
+  <configuration default="false" name="Run tickvault" type="ShConfigurationType">
+    <option name="SCRIPT_TEXT" value="bash scripts/local-autopilot.sh dev" />
+    <option name="INDEPENDENT_SCRIPT_PATH" value="true" />
+    <option name="SCRIPT_PATH" value="" />
+    <option name="SCRIPT_OPTIONS" value="" />
+    <option name="INDEPENDENT_SCRIPT_WORKING_DIRECTORY" value="true" />
+    <option name="SCRIPT_WORKING_DIRECTORY" value="$PROJECT_DIR$" />
+    <option name="INDEPENDENT_INTERPRETER_PATH" value="true" />
+    <option name="INTERPRETER_PATH" value="/bin/bash" />
+    <option name="INTERPRETER_OPTIONS" value="" />
+    <option name="EXECUTE_IN_TERMINAL" value="true" />
+    <option name="EXECUTE_SCRIPT_FILE" value="false" />
+    <method v="2" />
   </configuration>
 </component>

@@ -1,6 +1,10 @@
 <component name="ProjectRunConfigurationManager">
-  <configuration default="false" name="Run tickvault (make)" type="ShConfigurationType">
-    <option name="SCRIPT_TEXT" value="make run" />
+  <!-- Graceful stop counterpart of "Run tickvault": stops the app (TERM ->
+       60s -> KILL), cleans any scale-test config overlay, writes the
+       manual-stop marker so the autopilot stands down for the day, and
+       leaves QuestDB running. Resume with "Run tickvault". -->
+  <configuration default="false" name="Stop tickvault" type="ShConfigurationType">
+    <option name="SCRIPT_TEXT" value="make local-stop" />
     <option name="INDEPENDENT_SCRIPT_PATH" value="true" />
     <option name="SCRIPT_PATH" value="" />
     <option name="SCRIPT_OPTIONS" value="" />
