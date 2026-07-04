@@ -1,0 +1,24 @@
+<component name="ProjectRunConfigurationManager">
+  <!-- ONE-CLICK Saturday 100-connection Groww probe (SMOKE, no ticks):
+       stops any running normal app first (the scale run needs the OVERLAY
+       config — adopting a normal-config app would be a false probe), runs
+       the ladder to 100 connections with 3-minute holds (~25 min) in the
+       foreground so the output streams here, and on ANY exit (done, failed,
+       Ctrl-C) removes the config overlay + prints a plain-English verdict
+       of where the ladder stopped, plus the evidence TSV path. The next
+       "Run tickvault" click is normal again. -->
+  <configuration default="false" name="Groww Scale 100 Probe" type="ShConfigurationType">
+    <option name="SCRIPT_TEXT" value="bash scripts/scale-100-probe.sh" />
+    <option name="INDEPENDENT_SCRIPT_PATH" value="true" />
+    <option name="SCRIPT_PATH" value="" />
+    <option name="SCRIPT_OPTIONS" value="" />
+    <option name="INDEPENDENT_SCRIPT_WORKING_DIRECTORY" value="true" />
+    <option name="SCRIPT_WORKING_DIRECTORY" value="$PROJECT_DIR$" />
+    <option name="INDEPENDENT_INTERPRETER_PATH" value="true" />
+    <option name="INTERPRETER_PATH" value="/bin/bash" />
+    <option name="INTERPRETER_OPTIONS" value="" />
+    <option name="EXECUTE_IN_TERMINAL" value="true" />
+    <option name="EXECUTE_SCRIPT_FILE" value="false" />
+    <method v="2" />
+  </configuration>
+</component>

@@ -6,7 +6,7 @@
 # =============================================================================
 
 .PHONY: help run run-supervised stop build test check fmt clippy clean \
-        scale-test scale-probe scale-smoke scale-max scale-max-smoke scale-test-clean \
+        scale-test scale-probe scale-smoke scale-max scale-max-smoke scale-100-probe scale-test-clean \
         local-start local-stop local-status local-autopilot-install local-autopilot-uninstall local-autopilot-test \
         docker-up docker-down docker-restart docker-status docker-logs questdb-init \
         health status open questdb questdb-prod questdb-autoopen-install questdb-autoopen-uninstall \
@@ -68,6 +68,9 @@ scale-max: ## Groww 100K MAX-SCALE LAB — full master, ladder to 100 conns (loc
 
 scale-max-smoke: ## 100K max-scale config, weekend SMOKE (machinery-only dry run)
 	@bash scripts/groww-scale-test.sh max-smoke
+
+scale-100-probe: ## Saturday 100-conn connect/auth/subscribe probe (SMOKE, 3-min holds, no ticks)
+	@GATE_HOLD_MIN=3 bash scripts/groww-scale-test.sh max-smoke
 
 scale-test-clean: ## Remove the scale-test overlay from config/local.toml
 	@bash scripts/groww-scale-test.sh clean

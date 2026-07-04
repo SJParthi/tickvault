@@ -26,6 +26,20 @@
 # (idempotent add/replace; `clean` removes it). Operator content outside
 # the markers is never touched.
 
+# ── Pure helpers (testable: `SCALE_TEST_LIB=1 source scripts/groww-scale-test.sh`) ──
+
+# valid_gate_hold_min <value> — rc 0 when <value> is a plain integer in
+# [1, 1440] minutes (1 min floor: the ladder evaluates every 30s; 1440 =
+# 24h ceiling — anything longer is a config mistake, not a hold).
+valid_gate_hold_min() {
+  case "${1:-}" in '' | *[!0-9]*) return 1 ;; esac
+  [ "$1" -ge 1 ] && [ "$1" -le 1440 ]
+}
+
+if [ "${SCALE_TEST_LIB:-0}" = "1" ]; then
+  return 0 2>/dev/null || exit 0
+fi
+
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -157,6 +171,17 @@ fi
     echo "instruments_per_conn = 1000"
     echo "ladder = [1, 2, 5, 10, 20, 40, 80, 100]"
     echo "gate_max_mem_used_pct = 75.0"
+    # Optional hold override for fast weekend probes (minutes). Unset ⇒
+    # byte-identical overlay (config default gate_hold_minutes applies).
+    # `gate_hold_minutes` is a real GrowwScaleConfig key with a serde
+    # default, so emitting it here is legal TOML.
+    if [ -n "${GATE_HOLD_MIN:-}" ]; then
+      if valid_gate_hold_min "${GATE_HOLD_MIN}"; then
+        echo "gate_hold_minutes = ${GATE_HOLD_MIN}"
+      else
+        echo "GATE_HOLD_MIN='${GATE_HOLD_MIN}' invalid (integer minutes 1..1440) — keeping the config default hold" >&2
+      fi
+    fi
   fi
   echo "$END_MARK"
 } >> "$LOCAL_TOML"

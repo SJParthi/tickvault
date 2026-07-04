@@ -194,6 +194,28 @@ t "tg param path prod chat-id" "/tickvault/prod/telegram/chat-id" "$(tg_ssm_path
 t "tg param path empty env defaults to dev" "/tickvault/dev/telegram/bot-token" "$(tg_ssm_path "" bot-token)"
 t "tg param path never uses the /dlt namespace" "0" "$(case "$(tg_ssm_path dev bot-token)" in /dlt/*) echo 1 ;; *) echo 0 ;; esac)"
 
+# ── FIX 6: 100-conn probe helpers ───────────────────────────────────────────
+# shellcheck source=scripts/groww-scale-test.sh
+SCALE_TEST_LIB=1 source scripts/groww-scale-test.sh
+# GATE_HOLD_MIN parse/validation (env override for fast weekend probes)
+t "gate hold: 3 ok" "0" "$(valid_gate_hold_min 3 && echo 0 || echo 1)"
+t "gate hold: 15 ok" "0" "$(valid_gate_hold_min 15 && echo 0 || echo 1)"
+t "gate hold: 1440 ceiling ok" "0" "$(valid_gate_hold_min 1440 && echo 0 || echo 1)"
+t "gate hold: 0 rejected" "1" "$(valid_gate_hold_min 0 && echo 0 || echo 1)"
+t "gate hold: 1441 rejected" "1" "$(valid_gate_hold_min 1441 && echo 0 || echo 1)"
+t "gate hold: empty rejected" "1" "$(valid_gate_hold_min "" && echo 0 || echo 1)"
+t "gate hold: garbage rejected" "1" "$(valid_gate_hold_min abc && echo 0 || echo 1)"
+t "gate hold: negative rejected" "1" "$(valid_gate_hold_min -3 && echo 0 || echo 1)"
+# shellcheck source=scripts/scale-100-probe.sh
+SCALE_PROBE_LIB=1 source scripts/scale-100-probe.sh
+# probe verdict classifier (hit_ceiling, max_conns, target)
+t "verdict: ceiling at 100 → reached" "Reached 100" "$(scale_probe_verdict 1 100 100 | cut -c1-11)"
+t "verdict: capped at 40 names the rung" "Groww (or this Mac) capped us at 40 of 100" "$(scale_probe_verdict 0 40 100 | cut -c1-42)"
+t "verdict: ceiling flag but below target is still the cap answer" "Groww (or this Mac) capped us at 80 of 100" "$(scale_probe_verdict 1 80 100 | cut -c1-42)"
+t "verdict: never climbed" "No ladder stage was recorded" "$(scale_probe_verdict 0 0 100 | cut -c1-28)"
+t "verdict: garbage hit flag → rc 1" "1" "$(scale_probe_verdict 2 40 100 >/dev/null 2>&1 && echo 0 || echo 1)"
+t "verdict: garbage max → rc 1" "1" "$(scale_probe_verdict 1 abc 100 >/dev/null 2>&1 && echo 0 || echo 1)"
+
 echo
 echo "local-autopilot pure-logic tests: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]
