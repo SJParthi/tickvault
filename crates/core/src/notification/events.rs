@@ -326,6 +326,13 @@ pub enum NotificationEvent {
         deferred: usize,
         total: usize,
         boot_path: BootPathLabel,
+        /// One status line per ENABLED market-data feed (operator directive
+        /// 2026-07-04 — Groww boot-visibility parity: the off-hours "Boot
+        /// complete" message previously counted only the Dhan connection
+        /// pool, so a connected-and-subscribed Groww feed was invisible on a
+        /// Saturday boot). Built from the same per-feed health registry the
+        /// feed-control page reads.
+        feeds: Vec<FeedStatusLine>,
     },
 
     /// Pool-level CRITICAL alert: every connection has been down longer than
@@ -692,6 +699,37 @@ pub enum NotificationEvent {
         /// Instruments that could not be matched/resolved today (skipped —
         /// logged by name in the app log, counted here for the operator).
         skipped: usize,
+    },
+
+    /// A market-data feed's access token was read and accepted at
+    /// boot/activation (operator directive 2026-07-04 — Groww boot-visibility
+    /// parity: "i need the same view display everything even for groww").
+    /// Mirrors Dhan's `AuthenticationSuccess` ("Auth OK") ping for every
+    /// OTHER feed. Fired once per activation (once per boot when the feed is
+    /// enabled at boot; again after a genuine disable → re-enable).
+    /// Severity::Low, immediate dispatch (boot milestone).
+    FeedAuthOk {
+        /// Feed display name (e.g. "Groww").
+        feed: String,
+    },
+
+    /// A market-data feed's socket connected + subscribe completed — BEFORE
+    /// any tick has streamed (operator directive 2026-07-04 — Groww
+    /// boot-visibility parity). On a closed market this is the ONLY honest
+    /// "the feed is up" signal: the streaming confirmation (first tick) may
+    /// be days away. The message text deliberately says "awaiting first
+    /// tick" — socket-connected ≠ streaming, so this event NEVER claims
+    /// ticks are flowing (audit Rule 11 — no false-OK). Edge-latched: once
+    /// per connected episode, re-armed only on a genuine disconnect.
+    FeedConnectedAwaitingTicks {
+        /// Feed display name (e.g. "Groww").
+        feed: String,
+        /// Instruments the feed's subscribe completed with.
+        subscribed: u64,
+        /// Whether the market was open at connect time — flips the honest
+        /// suffix between "market closed — idle is normal" and "market open
+        /// — ticks should arrive shortly".
+        market_open: bool,
     },
 
     /// Instrument build failed — includes manual trigger URL for retry.
@@ -1340,12 +1378,15 @@ impl NotificationEvent {
                 deferred,
                 total,
                 boot_path,
+                feeds,
             } => format!(
-                "<b>✅ Boot complete — {deferred}/{total} main feeds DEFERRED until 09:00 IST</b>\n\n\
+                "<b>✅ Boot complete — {deferred}/{total} Dhan connections DEFERRED until 09:00 IST</b>\n\n\
                  📡 Outside [09:00, 15:30) IST. Dhan resets idle pre-/post-market sockets, \
                  so the WebSocket pool intentionally waits for the next market open before \
-                 opening any TCP connection.\n  \
+                 opening any TCP connection.\n\n\
+                 {feed_block}\n  \
                  Boot path: {path}",
+                feed_block = format_feed_status_block(feeds),
                 path = boot_path.human(),
             ),
             Self::WebSocketPoolDegraded { down_secs } => {
@@ -1685,6 +1726,37 @@ impl NotificationEvent {
                      {skipped_line}",
                     feed_name = html_escape(feed),
                     sub = format_with_commas(*subscribed),
+                )
+            }
+            Self::FeedAuthOk { feed } => {
+                // Groww boot-visibility parity (operator 2026-07-04): the
+                // exact mirror of Dhan's "Auth OK" boot ping — access token
+                // in hand, feed can connect. Plain English, provider name
+                // only (charter §D).
+                format!(
+                    "✅ <b>{feed_name} Auth OK</b> — access token in hand, feed can connect",
+                    feed_name = html_escape(feed),
+                )
+            }
+            Self::FeedConnectedAwaitingTicks {
+                feed,
+                subscribed,
+                market_open,
+            } => {
+                // HONEST wording (no false-OK): socket-connected ≠ streaming.
+                // This message must ALWAYS say "awaiting first tick" — the
+                // streaming confirmation is a separate event that fires only
+                // when a real tick is observed.
+                let suffix = if *market_open {
+                    "market open — ticks should arrive shortly"
+                } else {
+                    "market closed — idle is normal"
+                };
+                format!(
+                    "✅ <b>{feed_name} feed connected</b>\n\
+                     Subscribed {sub} instruments — awaiting first tick ({suffix})",
+                    feed_name = html_escape(feed),
+                    sub = format_with_commas(*subscribed as usize),
                 )
             }
             Self::InstrumentBuildFailed {
@@ -2078,6 +2150,8 @@ impl NotificationEvent {
             Self::ShutdownComplete => "ShutdownComplete",
             Self::InstrumentBuildSuccess { .. } => "InstrumentBuildSuccess",
             Self::FeedInstrumentsLoaded { .. } => "FeedInstrumentsLoaded",
+            Self::FeedAuthOk { .. } => "FeedAuthOk",
+            Self::FeedConnectedAwaitingTicks { .. } => "FeedConnectedAwaitingTicks",
             Self::InstrumentBuildFailed { .. } => "InstrumentBuildFailed",
             Self::IpVerificationFailed { .. } => "IpVerificationFailed",
             Self::IpVerificationSuccess { .. } => "IpVerificationSuccess",
@@ -2246,6 +2320,12 @@ impl NotificationEvent {
             // a non-Dhan feed loaded + subscribed its instruments. Info so
             // it never pages — a purely positive signal, like the EOD digest.
             Self::FeedInstrumentsLoaded { .. } => Severity::Info,
+            // 2026-07-04 Groww boot-visibility parity: green ✅ boot-stage
+            // pings, exact mirrors of `AuthenticationSuccess` (Low) and the
+            // Dhan connect signals — never page, ship immediately via
+            // `dispatch_policy()`.
+            Self::FeedAuthOk { .. } => Severity::Low,
+            Self::FeedConnectedAwaitingTicks { .. } => Severity::Low,
             Self::BootHealthCheck { .. } => Severity::Low,
             Self::OrphanPositionDetected { .. } => Severity::Critical,
             Self::OrphanPositionsClean => Severity::Info,
@@ -2290,6 +2370,12 @@ impl NotificationEvent {
             // ping is a boot-success milestone — ship instantly like the
             // Dhan `InstrumentBuildSuccess` it mirrors, never coalesced.
             | Self::FeedInstrumentsLoaded { .. }
+            // 2026-07-04 Groww boot-visibility parity: the per-feed Auth OK
+            // + connected-awaiting-ticks pings are boot-success milestones —
+            // ship instantly (Low would otherwise coalesce 60s and break the
+            // boot-Telegram ordering the operator reads).
+            | Self::FeedAuthOk { .. }
+            | Self::FeedConnectedAwaitingTicks { .. }
             | Self::WebSocketPoolOnline { .. }
             | Self::WebSocketPoolDeferredOffHours { .. }
             // PR #5 (2026-05-19): Phase2Complete retired.
@@ -3439,6 +3525,7 @@ mod tests {
             deferred: 5,
             total: 5,
             boot_path: BootPathLabel::Slow,
+            feeds: feed_lines(),
         };
         assert_eq!(
             event.severity(),
@@ -4558,6 +4645,87 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // Groww boot-visibility parity (operator directive 2026-07-04):
+    // FeedAuthOk + FeedConnectedAwaitingTicks + feed-aware off-hours boot
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_feed_auth_ok_message_topic_severity() {
+        let ev = NotificationEvent::FeedAuthOk {
+            feed: "Groww".to_string(),
+        };
+        assert_eq!(ev.topic(), "FeedAuthOk");
+        assert_eq!(ev.severity(), Severity::Low);
+        // Boot milestone — ships instantly like Dhan's AuthenticationSuccess.
+        assert_eq!(ev.dispatch_policy(), DispatchPolicy::Immediate);
+        let msg = ev.to_message();
+        assert!(msg.contains("Groww Auth OK"), "got: {msg}");
+        assert!(msg.contains("access token in hand"), "got: {msg}");
+    }
+
+    #[test]
+    fn test_feed_connected_awaiting_ticks_market_closed_wording() {
+        let ev = NotificationEvent::FeedConnectedAwaitingTicks {
+            feed: "Groww".to_string(),
+            subscribed: 768,
+            market_open: false,
+        };
+        assert_eq!(ev.topic(), "FeedConnectedAwaitingTicks");
+        assert_eq!(ev.severity(), Severity::Low);
+        assert_eq!(ev.dispatch_policy(), DispatchPolicy::Immediate);
+        let msg = ev.to_message();
+        assert!(msg.contains("Groww feed connected"), "got: {msg}");
+        assert!(msg.contains("Subscribed 768 instruments"), "got: {msg}");
+        // FALSE-OK TRAP (operator 2026-07-04 + audit Rule 11): the boot-time
+        // connect ping must say "awaiting first tick" — socket-connected is
+        // NOT streaming, and on a closed market the idle is normal.
+        assert!(msg.contains("awaiting first tick"), "got: {msg}");
+        assert!(msg.contains("market closed — idle is normal"), "got: {msg}");
+        assert!(
+            !msg.contains("streaming"),
+            "must never claim streaming: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_feed_connected_awaiting_ticks_market_open_wording_never_claims_streaming() {
+        let ev = NotificationEvent::FeedConnectedAwaitingTicks {
+            feed: "Groww".to_string(),
+            subscribed: 768,
+            market_open: true,
+        };
+        let msg = ev.to_message();
+        assert!(msg.contains("awaiting first tick"), "got: {msg}");
+        assert!(
+            msg.contains("market open — ticks should arrive shortly"),
+            "got: {msg}"
+        );
+        assert!(
+            !msg.contains("streaming"),
+            "must never claim streaming: {msg}"
+        );
+        assert!(!msg.contains("idle is normal"), "wrong suffix: {msg}");
+    }
+
+    #[test]
+    fn test_pool_deferred_off_hours_lists_enabled_feeds() {
+        // Operator 2026-07-04: the Saturday "Boot complete" message must name
+        // EVERY enabled feed — not just the Dhan connection count.
+        let ev = NotificationEvent::WebSocketPoolDeferredOffHours {
+            deferred: 1,
+            total: 1,
+            boot_path: BootPathLabel::Slow,
+            feeds: feed_lines(),
+        };
+        let msg = ev.to_message();
+        assert!(msg.contains("Boot complete"), "got: {msg}");
+        // The header count is honestly labelled as the Dhan pool.
+        assert!(msg.contains("Dhan connections DEFERRED"), "got: {msg}");
+        assert!(msg.contains("Market-data feeds:"), "got: {msg}");
+        assert!(msg.contains("Groww: 768 instruments"), "got: {msg}");
+    }
+
+    // -----------------------------------------------------------------------
     // CrossVerify1mSummary + CrossVerify1mAborted (2026-06-10 — visibility)
     // -----------------------------------------------------------------------
 
@@ -4703,5 +4871,191 @@ mod tests {
         assert!(msg.contains("did NOT run"));
         assert!(msg.contains("Reason: task panicked"));
         assert!(msg.contains("What to do RIGHT NOW"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Coverage for the boot-message rendering branches adjacent to the
+    // 2026-07-04 Groww boot-parity change (PR #1400 coverage gate: core
+    // dipped 90.16% vs the 90.2% ratcheted floor — these pin the previously
+    // uncovered cold arms; the floor is NEVER lowered).
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_format_ping_freshness_bands() {
+        // None = no inbound frame yet — explicit dash, never a fake "0s".
+        assert_eq!(format_ping_freshness(None), "—");
+        // 0–10s: healthy (Dhan pings every 10s).
+        assert!(format_ping_freshness(Some(5)).contains('✓'));
+        // 11–30s: still alive but flagged.
+        assert!(format_ping_freshness(Some(20)).contains('⚠'));
+        // >30s: watchdog territory.
+        assert!(format_ping_freshness(Some(45)).contains('❌'));
+    }
+
+    #[test]
+    fn test_feed_status_block_mid_age_band_is_neutral() {
+        // 31–120s band: age shown WITHOUT a verdict emoji (neither the
+        // healthy ✓ nor a false-red ❌ — post-lull silence is normal).
+        let block = format_feed_status_block(&[FeedStatusLine {
+            name: "Groww".to_string(),
+            instruments: Some(768),
+            last_tick_age_secs: Some(90),
+        }]);
+        assert!(block.contains("last tick 90s ago"), "got: {block}");
+        assert!(
+            !block.contains('✓'),
+            "31-120s band must not claim healthy: {block}"
+        );
+        assert!(
+            !block.contains('❌'),
+            "31-120s band must not claim broken: {block}"
+        );
+    }
+
+    #[test]
+    fn test_pool_online_message_zero_capacity_and_no_real_ticks_is_honest() {
+        // Zero-capacity per-connection rows must render 0% (no div-by-zero)
+        // and zero REAL ticks must render the loud NONE warning (2026-06-02
+        // false-OK fix), never a fabricated freshness.
+        let ev = NotificationEvent::WebSocketPoolOnline {
+            connected: 1,
+            total: 1,
+            per_connection: vec![(0, 0, None)],
+            boot_path: BootPathLabel::Slow,
+            boot_wall_clock_secs: 1.0,
+            last_real_tick_age_secs: None,
+            feeds: vec![],
+        };
+        let msg = ev.to_message();
+        assert!(msg.contains("NONE captured yet"), "got: {msg}");
+        assert!(msg.contains("0% full"), "zero capacity renders 0%: {msg}");
+    }
+
+    #[test]
+    fn test_pool_online_message_full_connection_and_fresh_tick() {
+        let ev = NotificationEvent::WebSocketPoolOnline {
+            connected: 1,
+            total: 1,
+            per_connection: vec![(100, 100, Some(2))],
+            boot_path: BootPathLabel::Slow,
+            boot_wall_clock_secs: 1.0,
+            last_real_tick_age_secs: Some(3),
+            feeds: vec![],
+        };
+        let msg = ev.to_message();
+        assert!(msg.contains("(full)"), "100% renders as 'full': {msg}");
+        assert!(
+            msg.contains("Real market ticks: last one 3s ago"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_ws_pool_degraded_recovered_halt_messages() {
+        let d = NotificationEvent::WebSocketPoolDegraded { down_secs: 42 }.to_message();
+        assert!(
+            d.contains("WS POOL DEGRADED") && d.contains("42"),
+            "got: {d}"
+        );
+        let r = NotificationEvent::WebSocketPoolRecovered { was_down_secs: 7 }.to_message();
+        assert!(r.contains("recovered") && r.contains('7'), "got: {r}");
+        let h = NotificationEvent::WebSocketPoolHalt { down_secs: 301 }.to_message();
+        assert!(h.contains("WS POOL HALT") && h.contains("301"), "got: {h}");
+    }
+
+    #[test]
+    fn test_market_open_streaming_and_readiness_messages() {
+        let ok = NotificationEvent::MarketOpenStreamingConfirmation {
+            main_feed_active: 1,
+            main_feed_total: 1,
+            order_update_active: true,
+        }
+        .to_message();
+        assert!(
+            ok.contains("Streaming live") && ok.contains("1/1"),
+            "got: {ok}"
+        );
+        let fail = NotificationEvent::MarketOpenStreamingFailed {
+            main_feed_active: 0,
+            main_feed_total: 1,
+            order_update_active: false,
+        }
+        .to_message();
+        assert!(
+            fail.contains("STREAMING FAILED") && fail.contains("0/1"),
+            "got: {fail}"
+        );
+        let ready = NotificationEvent::MarketOpenReadinessConfirmation {
+            main_feed_active: 1,
+            main_feed_total: 1,
+            order_update_active: true,
+            token_remaining_secs: 7200,
+        }
+        .to_message();
+        assert!(
+            ready.contains("READY for market open") && ready.contains("2.0h"),
+            "got: {ready}"
+        );
+    }
+
+    #[test]
+    fn test_ws_sleep_wake_and_order_update_lifecycle_messages() {
+        // WS-GAP-04 dormant sleep/wake + AUTH-GAP-03 wake-time renewal +
+        // order-update lifecycle arms (previously uncovered cold branches).
+        let sleep = NotificationEvent::WebSocketSleepEntered {
+            feed: "main".to_string(),
+            connection_index: 0,
+            sleep_secs: 3600,
+        }
+        .to_message();
+        assert!(
+            sleep.contains("sleeping (slot 1)") && sleep.contains("3600"),
+            "got: {sleep}"
+        );
+        let wake = NotificationEvent::WebSocketSleepResumed {
+            feed: "main".to_string(),
+            connection_index: 0,
+            slept_for_secs: 3600,
+        }
+        .to_message();
+        assert!(
+            wake.contains("waking (slot 1)") && wake.contains("attempting reconnect"),
+            "got: {wake}"
+        );
+        let renewed = NotificationEvent::WebSocketTokenForceRenewedOnWake {
+            feed: "main".to_string(),
+            connection_index: 0,
+            remaining_secs_before: 100,
+            threshold_secs: 14400,
+        }
+        .to_message();
+        assert!(
+            renewed.contains("wake-time token renewed") && renewed.contains("14400"),
+            "got: {renewed}"
+        );
+        let connected = NotificationEvent::OrderUpdateConnected.to_message();
+        assert!(
+            connected.contains("Order Update WS connected"),
+            "got: {connected}"
+        );
+        let authed = NotificationEvent::OrderUpdateAuthenticated.to_message();
+        assert!(authed.contains("streaming live"), "got: {authed}");
+        let reconnected = NotificationEvent::OrderUpdateReconnected {
+            consecutive_failures: 3,
+        }
+        .to_message();
+        assert!(
+            reconnected.contains("reconnected") && reconnected.contains('3'),
+            "got: {reconnected}"
+        );
+        let silent = NotificationEvent::NoLiveTicksDuringMarketHours {
+            silent_for_secs: 120,
+            threshold_secs: 60,
+        }
+        .to_message();
+        assert!(
+            silent.contains("zero live ticks") && silent.contains("120"),
+            "got: {silent}"
+        );
     }
 }

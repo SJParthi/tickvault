@@ -50,6 +50,44 @@ use tracing::{error, info, warn};
 const GROWW_ACTIVATION_POLL_SECS: u64 = 2;
 const GROWW_ACTIVATION_POLL: Duration = Duration::from_secs(GROWW_ACTIVATION_POLL_SECS);
 
+/// Poll cadence while waiting for the lazily-filled notifier slot (boot
+/// ordering: the Groww lane spawns BEFORE the `NotificationService` exists).
+const NOTIFIER_READY_POLL_MS: u64 = 500;
+const NOTIFIER_READY_POLL: Duration = Duration::from_millis(NOTIFIER_READY_POLL_MS);
+/// Max polls before giving up on a boot-stage Telegram ping (500ms × 240 =
+/// 2 minutes — far beyond any healthy notification boot). Giving up logs;
+/// it never blocks or fails activation.
+const NOTIFIER_READY_MAX_POLLS: u32 = 240;
+
+/// Deliver one boot-stage Telegram event as soon as the lazily-filled
+/// notifier slot is populated (operator 2026-07-04 — Groww boot-visibility
+/// parity). Before this, boot-ordering could race the slot fill and the
+/// ping was SILENTLY skipped (part of the "Groww emitted NOTHING" Saturday
+/// boot). Bounded: polls `poll` up to `max_polls` times, then gives up with
+/// an `info!` (the structured log for the same milestone already fired).
+/// Returns whether the event was delivered — unit-testable with tiny budgets.
+pub async fn notify_when_ready(
+    notifier_slot: Arc<arc_swap::ArcSwapOption<tickvault_core::notification::NotificationService>>,
+    event: tickvault_core::notification::NotificationEvent,
+    max_polls: u32,
+    poll: Duration,
+) -> bool {
+    for _ in 0..max_polls {
+        if let Some(notifier) = notifier_slot.load_full() {
+            notifier.notify(event);
+            return true;
+        }
+        tokio::time::sleep(poll).await;
+    }
+    info!(
+        topic = event.topic(),
+        "[feeds] boot-stage Telegram skipped — notifier slot never filled \
+         within the wait budget (the structured log for this milestone \
+         already recorded it)"
+    );
+    false
+}
+
 /// Today's IST date as `YYYY-MM-DD`. Computed at ACTIVATION time (not boot) so a
 /// runtime re-enable past IST midnight uses today's watch date, never a stale
 /// boot-day date (security-review MEDIUM: a date frozen at boot would build the
@@ -282,6 +320,22 @@ async fn activate_groww_lane(
             // Token present + plausible — clear any stale auth-rejected flag so
             // the Feed Control page resolves back to a normal verdict.
             feed_health.set_auth_rejected(Feed::Groww, false);
+            // 2026-07-04 Groww boot-visibility parity (operator: "i need the
+            // same view display everything even for groww"): mirror Dhan's
+            // "Auth OK" boot ping. Detached bounded wait — the notifier slot
+            // may not be filled yet this early in boot; activation is never
+            // blocked and the ping is not silently lost. Once per activation
+            // (edge-latched by construction: one activation task per ON
+            // period), so a genuine disable → re-enable re-announces while
+            // poll turns never do.
+            tokio::spawn(notify_when_ready(
+                Arc::clone(&notifier_slot),
+                tickvault_core::notification::NotificationEvent::FeedAuthOk {
+                    feed: Feed::Groww.display_name().to_string(),
+                },
+                NOTIFIER_READY_MAX_POLLS,
+                NOTIFIER_READY_POLL,
+            ));
         }
         Err(GrowwAuthSmokeError::Rejected { status: _, body }) => {
             // The token parameter was READ but its value is unusable (empty /
@@ -356,20 +410,23 @@ async fn activate_groww_lane(
                 // have provided for dhan the same should be provided for
                 // groww also — instruments load message"). Mirror of the
                 // Dhan `InstrumentBuildSuccess` ping: one Info Telegram when
-                // the Groww watch-set resolves. Slot not yet filled (boot
-                // ordering) → skipped; the info! line above still records
-                // the counts, and activation is never blocked.
-                if let Some(notifier) = notifier_slot.load_full() {
-                    notifier.notify(
-                        tickvault_core::notification::events::NotificationEvent::FeedInstrumentsLoaded {
-                            feed: Feed::Groww.display_name().to_string(),
-                            subscribed: set.entries.len(),
-                            indices: set.indices,
-                            stocks: set.resolved_stocks,
-                            skipped: set.unresolved_stocks.len(),
-                        },
-                    );
-                }
+                // the Groww watch-set resolves. 2026-07-04 hardening: a slot
+                // not yet filled (boot ordering) is now a bounded detached
+                // wait instead of a silent skip — the ping is delayed, never
+                // lost; the info! line above still records the counts, and
+                // activation is never blocked.
+                tokio::spawn(notify_when_ready(
+                    Arc::clone(&notifier_slot),
+                    tickvault_core::notification::events::NotificationEvent::FeedInstrumentsLoaded {
+                        feed: Feed::Groww.display_name().to_string(),
+                        subscribed: set.entries.len(),
+                        indices: set.indices,
+                        stocks: set.resolved_stocks,
+                        skipped: set.unresolved_stocks.len(),
+                    },
+                    NOTIFIER_READY_MAX_POLLS,
+                    NOTIFIER_READY_POLL,
+                ));
                 // PR-A: persist the Groww instrument set into the SHARED
                 // `instrument_lifecycle` (+ `index_constituency`) master tables
                 // tagged `feed='groww'`. Fire-and-forget + degrade-safe — a
@@ -485,6 +542,64 @@ mod tests {
         // running flag (running is false until the watch-list builds).
         assert!(!is_dead_activation(true, false, false));
         assert!(!is_dead_activation(true, false, true));
+    }
+
+    #[tokio::test]
+    async fn test_notify_when_ready_delivers_after_slot_fills() {
+        // Boot-ordering race (2026-07-04 parity fix): the slot fills AFTER
+        // the ping is queued — the bounded poll must still deliver it.
+        let slot: Arc<arc_swap::ArcSwapOption<tickvault_core::notification::NotificationService>> =
+            Arc::new(arc_swap::ArcSwapOption::empty());
+        let filler = Arc::clone(&slot);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            filler.store(Some(
+                tickvault_core::notification::NotificationService::disabled(),
+            ));
+        });
+        let delivered = notify_when_ready(
+            slot,
+            tickvault_core::notification::NotificationEvent::FeedAuthOk {
+                feed: "Groww".to_string(),
+            },
+            50,
+            Duration::from_millis(10),
+        )
+        .await;
+        assert!(delivered, "ping must deliver once the slot fills");
+    }
+
+    #[tokio::test]
+    async fn test_notify_when_ready_gives_up_after_budget() {
+        // A never-filled slot must NOT hang forever — bounded give-up,
+        // activation is never blocked (the helper runs detached anyway).
+        let slot: Arc<arc_swap::ArcSwapOption<tickvault_core::notification::NotificationService>> =
+            Arc::new(arc_swap::ArcSwapOption::empty());
+        let delivered = notify_when_ready(
+            slot,
+            tickvault_core::notification::NotificationEvent::FeedAuthOk {
+                feed: "Groww".to_string(),
+            },
+            3,
+            Duration::from_millis(1),
+        )
+        .await;
+        assert!(
+            !delivered,
+            "never-filled slot must give up after the budget"
+        );
+    }
+
+    #[test]
+    fn test_notifier_ready_budget_is_bounded_boot_scale() {
+        // ~2 minutes of 500ms polls — far beyond any healthy notification
+        // boot, yet strictly bounded (never an infinite background poll).
+        assert_eq!(NOTIFIER_READY_POLL_MS, 500);
+        assert_eq!(
+            NOTIFIER_READY_POLL,
+            Duration::from_millis(NOTIFIER_READY_POLL_MS)
+        );
+        assert_eq!(NOTIFIER_READY_MAX_POLLS, 240);
     }
 
     #[test]

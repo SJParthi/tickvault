@@ -533,6 +533,15 @@ async fn main() -> Result<()> {
             }
             ok
         };
+    // Deferred Telegram slot shared by the Groww bridge + sidecar supervisor +
+    // activation watcher: all three spawn here (before the notifier is built),
+    // so they get a shared slot that is filled with the live
+    // `NotificationService` once it exists (below). Declared BEFORE the bridge
+    // spawn (2026-07-04 boot-visibility parity) so the bridge can emit the
+    // boot-stage "feed connected — awaiting first tick" ping.
+    let groww_sidecar_notifier_slot: std::sync::Arc<
+        arc_swap::ArcSwapOption<tickvault_core::notification::NotificationService>,
+    > = std::sync::Arc::new(arc_swap::ArcSwapOption::empty());
     // Watch-entries slot: the activation watcher publishes the daily
     // subscribe set here so the ladder can cut shards (scale mode only).
     let groww_scale_entries: std::sync::Arc<
@@ -547,6 +556,9 @@ async fn main() -> Result<()> {
                 std::sync::Arc::clone(&feed_runtime),
                 std::sync::Arc::clone(&feed_health),
                 Some(spawn_ws_event_audit_consumer(config.questdb.clone())),
+                // 2026-07-04 boot-visibility parity: the boot-stage
+                // "connected — awaiting first tick" Telegram ping.
+                Some(std::sync::Arc::clone(&groww_sidecar_notifier_slot)),
                 groww_trading_calendar,
             );
     } else {
@@ -560,21 +572,21 @@ async fn main() -> Result<()> {
             // Groww connect/disconnect/reconnect, drained by the SAME consumer Dhan +
             // order-update use. Closes the audit gap (Groww connected but wrote no row).
             Some(spawn_ws_event_audit_consumer(config.questdb.clone())),
+            // 2026-07-04 boot-visibility parity: the boot-stage
+            // "connected — awaiting first tick" Telegram ping (same
+            // lazily-filled slot the sidecar supervisor uses).
+            Some(std::sync::Arc::clone(&groww_sidecar_notifier_slot)),
             // Trading calendar (2026-06-29): drives the Groww IST-midnight force-seal
             // boundary task's trading-day gate — built from the SAME `config.trading`
             // the Dhan IST-midnight force-seal calendar uses.
             groww_trading_calendar,
         );
     }
-    // Deferred Telegram slot for the Groww sidecar supervisor: the supervisor is
-    // spawned here (before the notifier is built), so it gets a shared slot that
-    // is filled with the live `NotificationService` once it exists (below). On a
-    // sidecar auth/entitlement/error diagnostic the supervisor fires ONE
-    // `GrowwSidecarRejected` Telegram event + marks Groww rejected in feed_health
-    // — so the operator sees WHY Groww has 0 ticks instead of a silent log line.
-    let groww_sidecar_notifier_slot: std::sync::Arc<
-        arc_swap::ArcSwapOption<tickvault_core::notification::NotificationService>,
-    > = std::sync::Arc::new(arc_swap::ArcSwapOption::empty());
+    // On a sidecar auth/entitlement/error diagnostic the sidecar supervisor
+    // fires ONE `GrowwSidecarRejected` Telegram event (via the shared
+    // `groww_sidecar_notifier_slot` declared above) + marks Groww rejected in
+    // feed_health — so the operator sees WHY Groww has 0 ticks instead of a
+    // silent log line.
     // FEED-SUPERVISOR-01: spawn the feed-agnostic sidecar supervisor under a
     // respawning wrapper so the stall-watchdog (FEED-STALL-01) can never die
     // silently — a panic/return respawns it (WS-GAP-05 / DISK-WATCHER-01 pattern).
@@ -3799,6 +3811,11 @@ async fn emit_websocket_connected_alerts(
             deferred,
             total,
             boot_path,
+            // 2026-07-04 boot-visibility parity: the off-hours "Boot complete"
+            // message must name EVERY enabled feed — a Saturday boot with a
+            // connected-and-subscribed Groww previously reported only the
+            // deferred Dhan connection count.
+            feeds: build_feed_status_lines(feed_runtime, feed_health),
         });
     } else {
         notifier.notify(NotificationEvent::WebSocketPoolPartialAfterDeadline {
