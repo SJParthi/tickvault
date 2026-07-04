@@ -50,14 +50,30 @@ local-runtime ──▶ main                                ❌ FORBIDDEN, CI-bl
 
 ## ZERO-TOUCH autopilot (operator 2026-07-04: "i won't run any command")
 
-**The ONE bootstrap step** (a Mac-side Claude session can run it for you —
-after this, Mon–Wed is 100% hands-off):
+**Bootstrap is now ZERO commands (2026-07-04):** the ENTIRE operator
+interface is TWO buttons — **`Start TickVault.command`** and
+**`Stop TickVault.command`**. Nothing else, ever. Every double-click of
+Start is a complete self-contained bootstrap, in this order:
+
+1. **Self-update** — pulls the latest code from GitHub (fast-forward
+   only). If the update can't apply (no internet, local changes), it
+   says so in plain English, sends a Telegram, and starts with the code
+   already on the Mac — the button never dies on an update problem.
+2. **Auto-install the daily auto-start** — installs/loads the 8:55 AM
+   weekday agent if missing (idempotent — an already-installed agent is
+   left untouched).
+3. **Start everything** — Docker up, database up (a stuck/unhealthy
+   database container gets ONE automatic restart — Stop→Start always
+   recovers it), app up, keep-awake armed, live log on screen.
+
+No terminal, no `make` needed. The terminal equivalent still
+exists for Claude sessions / debugging:
 
 ```bash
 make local-autopilot-install
 ```
 
-That installs a launchd agent that fires `scripts/local-autopilot.sh run`
+Either path installs a launchd agent that fires `scripts/local-autopilot.sh run`
 every weekday at **08:55 (Mac local time — the Mac must be on IST)**. From
 then on, each morning the autopilot, entirely by itself:
 
@@ -81,19 +97,40 @@ then on, each morning the autopilot, entirely by itself:
    directly.
 5. All-day monitor loop: app died → one auto-relaunch with 30s backoff; a
    second death → Telegram alert with the log tail (no crash-looping).
-   Docker died mid-session → one self-heal try + Telegram.
+   Docker died mid-session → one self-heal try + Telegram. Disk is
+   re-checked every ~30 minutes mid-session — below 50 GB free → one
+   Telegram warning per episode (2026-07-04).
 6. 15:35 IST: graceful app stop, overlay clean, end-of-day Telegram digest
    (scale stage table + app-log error count).
+
+**Extra safety nets (2026-07-04):**
+
+- **Missed-run detection:** every successful start writes a dated stamp;
+  the next run checks the PREVIOUS trading day (weekends + NSE holidays
+  skipped) and Telegrams "⚠️ yesterday's run was missed" if the Mac was
+  off/asleep at 8:55 AM. Honest physics caveat: an OFFLINE Mac cannot send
+  Telegram — the alert about a missed day arrives on the NEXT day the Mac
+  is actually on. There is no way around that; keep the Mac on with the
+  lid open on trading mornings.
+- **Docker memory check:** at every start the autopilot compares Docker
+  Desktop's VM memory against the database's pinned budget (8g) and warns
+  (log + Telegram) if the VM is smaller — otherwise the database would be
+  silently killed under load instead of using its full budget.
 
 Watch or intervene any time: `make local-status`, the logs in
 `data/local-autopilot/`, and the Telegram messages (all prefixed
 "💻 LOCAL autopilot"). Remove with `make local-autopilot-uninstall`.
 
-## Manual control (manual ALWAYS wins)
+## Manual control (manual ALWAYS wins — TWO buttons, nothing else)
 
-The autopilot handles everything; double-click Stop to take over manually
-any time; double-click Start to resume. The autopilot never fights a
-manual decision.
+The operator flow is exactly two buttons: **Start** and **Stop**. The
+autopilot handles everything else; double-click Stop to take over manually
+any time; double-click Start to resume (it self-updates, self-installs the
+daily agent, and self-heals a stuck database on every click). Every failure
+path prints one plain-English line on screen AND sends the same message to
+Telegram — no terminal knowledge is ever assumed. Stop leaves the database
+running (and restarts it once if it is unhealthy) so data stays queryable
+and the next Start is instant.
 
 | Action | Double-click (repo root, no terminal) | IntelliJ (one button) | Terminal equivalent |
 |---|---|---|---|

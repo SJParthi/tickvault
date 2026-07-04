@@ -41,6 +41,13 @@ PROBE_TIMEOUT_MIN="${PROBE_TIMEOUT_MIN:-20}"
 EOD_STOP_IST="${EOD_STOP_IST:-15:35}"
 CAFFEINATE_UNTIL_IST="${CAFFEINATE_UNTIL_IST:-15:45}"
 MONITOR_INTERVAL_SECS="${MONITOR_INTERVAL_SECS:-60}"
+# Mid-session disk re-check cadence: every N monitor iterations (default
+# 30 × 60s = ~30 min). Edge-latched Telegram — one warn per low-disk episode.
+DISK_RECHECK_ITERS="${DISK_RECHECK_ITERS:-30}"
+# Missed-run detection: a dated stamp file is written on every successful
+# app start; on the next invocation, if the PREVIOUS TRADING day has no
+# stamp, the operator gets a "yesterday's run was missed" Telegram.
+RUN_STAMP_KEEP="${RUN_STAMP_KEEP:-14}"
 QUESTDB_HTTP="${QUESTDB_HTTP:-http://127.0.0.1:9000}"
 HOLIDAYS_FILE="${HOLIDAYS_FILE:-config/base.toml}"
 # QuestDB memory: pin 8g for EVERY autopilot-driven compose up so the
@@ -195,6 +202,105 @@ monitor_decision() {
   if ((relaunches < 1)); then echo relaunch; else echo alert; fi
 }
 
+# disk_low <avail_gb> <min_gb> → 0 when free space is below the floor (pure).
+# Non-numeric avail (probe failure) → NOT low (1) — a broken probe must not
+# spam warnings; the in-app disk gate is the authoritative guard.
+disk_low() {
+  case "$1" in '' | *[!0-9]*) return 1 ;; esac
+  (($1 < $2))
+}
+
+# disk_recheck_due <loop_iter> <every_n> → 0 when this iteration should
+# re-probe the disk (pure). every_n <= 0 disables the re-check entirely.
+disk_recheck_due() {
+  case "$1" in '' | *[!0-9]*) return 1 ;; esac
+  case "$2" in '' | *[!0-9]*) return 1 ;; esac
+  (($2 > 0)) || return 1
+  (($1 % $2 == 0))
+}
+
+# mem_limit_bytes <spec like 8g|512m|1024k|1073741824> → bytes (pure).
+# Empty/garbage → non-zero return (caller skips the check, never guesses).
+mem_limit_bytes() {
+  local v n
+  v=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
+  case "$v" in
+  *g)
+    n="${v%g}"
+    case "$n" in '' | *[!0-9]*) return 1 ;; esac
+    echo $((n * 1024 * 1024 * 1024))
+    ;;
+  *m)
+    n="${v%m}"
+    case "$n" in '' | *[!0-9]*) return 1 ;; esac
+    echo $((n * 1024 * 1024))
+    ;;
+  *k)
+    n="${v%k}"
+    case "$n" in '' | *[!0-9]*) return 1 ;; esac
+    echo $((n * 1024))
+    ;;
+  *)
+    case "$v" in '' | *[!0-9]*) return 1 ;; esac
+    echo "$v"
+    ;;
+  esac
+}
+
+# docker_vm_mem_sufficient <vm_total_bytes> <required_bytes> → 0 when the
+# Docker VM has at least the required memory (pure). Either arg empty or
+# non-numeric → insufficient (fail-quiet — caller already logged the skip).
+docker_vm_mem_sufficient() {
+  case "$1" in '' | *[!0-9]*) return 1 ;; esac
+  case "$2" in '' | *[!0-9]*) return 1 ;; esac
+  (($1 >= $2))
+}
+
+# prev_trading_day <YYYY-MM-DD> <holidays-toml> → the most recent trading
+# day strictly BEFORE the given date (skips Sat/Sun + [[trading.nse_holidays]]
+# entries, same regex as is_nse_holiday). Pure over its arguments; empty
+# output on garbage input. Looks back at most 30 calendar days.
+prev_trading_day() {
+  python3 -c '
+import sys, re, datetime as dt
+try:
+    today = dt.date.fromisoformat(sys.argv[1])
+except (ValueError, IndexError):
+    sys.exit(0)
+hols = set()
+try:
+    with open(sys.argv[2]) as fh:
+        for line in fh:
+            m = re.match(r"^date = \"(\d{4}-\d{2}-\d{2})\"", line)
+            if m:
+                hols.add(m.group(1))
+except OSError:
+    pass
+d = today
+for _ in range(30):
+    d -= dt.timedelta(days=1)
+    if d.weekday() < 5 and d.isoformat() not in hols:
+        print(d.isoformat())
+        break
+' "$1" "$2" 2>/dev/null
+}
+
+# questdb_state_degraded <docker-state-string> → 0 when the container state
+# says the database is stuck/degraded and ONE `docker restart` is warranted
+# (pure over its argument). Input is the output of
+#   docker inspect --format '{{.State.Status}} {{if .State.Health}}{{.State.Health.Status}}{{end}}' tv-questdb
+# e.g. "running healthy", "running unhealthy", "exited (…)", "dead",
+# "paused", "running starting". Empty/garbage → NOT degraded (fail-quiet:
+# no container info means compose-up will create it fresh — never restart
+# blind). "restarting" is NOT degraded — Docker is already restarting it.
+questdb_state_degraded() {
+  case "$1" in
+  *unhealthy*) return 0 ;;
+  exited* | dead* | paused*) return 0 ;;
+  *) return 1 ;;
+  esac
+}
+
 # ── End of pure functions. Library mode stops here. ────────────────────────
 if [[ "${AUTOPILOT_LIB:-0}" == "1" ]]; then
   return 0 2>/dev/null || exit 0
@@ -273,18 +379,34 @@ ensure_docker() {
   return 1
 }
 
+# Live container state string for tv-questdb (empty when no container).
+questdb_container_state() {
+  docker inspect --format '{{.State.Status}} {{if .State.Health}}{{.State.Health.Status}}{{end}}' tv-questdb 2>/dev/null || true
+}
+
 ensure_questdb() {
   docker compose -f deploy/docker/docker-compose.yml \
     -f deploy/docker/docker-compose.local.yml up -d tv-questdb >>"$LOG" 2>&1
-  local i
+  # Self-heal (2026-07-04): a degraded container (unhealthy/exited/dead/
+  # paused — e.g. after a hard Mac sleep or an out-of-memory kill) gets ONE
+  # automatic `docker restart` if the database has not answered after ~30s.
+  # Zero operator action — Stop→Start (or just Start) recovers it.
+  local i restarted=0 state
   for i in $(seq 1 24); do
     if curl -sf -G "$QUESTDB_HTTP/exec" --data-urlencode "query=select 1" >/dev/null 2>&1; then
       log "QuestDB HTTP ready"
       return 0
     fi
+    state="$(questdb_container_state)"
+    if ((restarted == 0 && i >= 6)) && questdb_state_degraded "$state"; then
+      log "QuestDB container degraded ('$state') — one automatic docker restart"
+      tg "⚠️ The database container was stuck — restarting it automatically. No action needed."
+      docker restart tv-questdb >>"$LOG" 2>&1 || true
+      restarted=1
+    fi
     sleep 5
   done
-  tg "🆘 QuestDB did not answer on $QUESTDB_HTTP within 120s. If another program holds port 9000, quit it (lsof -i :9000) and double-click Start TickVault."
+  tg "🆘 The database did not start within 2 minutes. Double-click Stop TickVault, wait 10 seconds, then double-click Start TickVault. If it still fails, restart the Mac and double-click Start TickVault again."
   return 1
 }
 
@@ -322,6 +444,7 @@ stop_caffeinate() {
 start_app() { # $1 = label for the log
   if app_alive; then
     log "app already running (pid $(cat "$APP_PIDFILE")) — not double-starting"
+    write_run_stamp
     return 0
   fi
   log "building release binary (first build of the day can take minutes)..."
@@ -336,6 +459,65 @@ start_app() { # $1 = label for the log
   if ! app_alive; then
     tg "🆘 App DIED within 60s of launch ($1). Log tail: $(tail -8 "$LOG" | tr '\n' ' | ')"
     return 1
+  fi
+  write_run_stamp
+  return 0
+}
+
+# Missed-run detection support: a dated stamp file per SUCCESSFUL app start
+# (auto or manual — both mean "the app ran today"). Old stamps pruned beyond
+# RUN_STAMP_KEEP (date-suffixed names sort chronologically).
+write_run_stamp() {
+  printf '%s %s\n' "$TODAY" "$(ist_hms)" >"$AUTOPILOT_DIR/run-stamp.$TODAY"
+  local stamps=("$AUTOPILOT_DIR"/run-stamp.*)
+  if [ -e "${stamps[0]}" ]; then
+    while IFS= read -r doomed; do
+      if [ -n "$doomed" ]; then rm -f "$doomed"; fi
+    done < <(rotated_logs_to_delete "$RUN_STAMP_KEEP" "${stamps[@]}")
+  fi
+}
+
+# check_missed_previous_run — if the previous TRADING day has no run stamp
+# (Mac off/asleep, launchd never fired, or the run died before start), warn
+# the operator ONCE. Suppressed on a fresh install (no stamps at all yet —
+# nothing to compare against, warning would be noise).
+check_missed_previous_run() {
+  local prev
+  prev=$(prev_trading_day "$TODAY" "$HOLIDAYS_FILE")
+  [ -n "$prev" ] || return 0
+  if ! ls "$AUTOPILOT_DIR"/run-stamp.* >/dev/null 2>&1; then
+    log "missed-run check: no run stamps yet (first install) — skipping"
+    return 0
+  fi
+  if [ ! -f "$AUTOPILOT_DIR/run-stamp.$prev" ]; then
+    tg "⚠️ Yesterday's run was missed ($prev had no capture — Mac likely off or asleep at 8:55 AM). Today's run is starting now; keep the Mac on with the lid open on trading mornings."
+  else
+    log "missed-run check: $prev has a run stamp — OK"
+  fi
+}
+
+# check_docker_vm_memory — warn (log + Telegram, non-blocking) when the
+# Docker VM has less memory than the QuestDB pin (QDB_MEM_LIMIT). On Docker
+# Desktop the VM ceiling silently caps the container limit — QuestDB would
+# be OOM-killed under load instead of using its pinned budget.
+check_docker_vm_memory() {
+  local vm_bytes limit_bytes
+  vm_bytes=$(docker info --format '{{.MemTotal}}' 2>/dev/null || true)
+  case "$vm_bytes" in '' | *[!0-9]*)
+    log "docker VM memory probe unavailable — skipping check"
+    return 0
+    ;;
+  esac
+  if ! limit_bytes=$(mem_limit_bytes "$QDB_MEM_LIMIT"); then
+    log "QDB_MEM_LIMIT '$QDB_MEM_LIMIT' unparsable — skipping VM memory check"
+    return 0
+  fi
+  if ! docker_vm_mem_sufficient "$vm_bytes" "$limit_bytes"; then
+    local vm_gb=$((vm_bytes / 1024 / 1024 / 1024))
+    log "Docker VM memory ${vm_bytes} bytes < QDB_MEM_LIMIT ${QDB_MEM_LIMIT}"
+    tg "⚠️ Docker Desktop only has ${vm_gb} GB memory but the database needs ${QDB_MEM_LIMIT}. Open Docker Desktop → Settings → Resources → Memory and raise it above ${QDB_MEM_LIMIT}, then restart. Running anyway — but the database may crash under load until this is fixed."
+  else
+    log "docker VM memory OK (${vm_bytes} bytes >= QDB_MEM_LIMIT ${QDB_MEM_LIMIT})"
   fi
   return 0
 }
@@ -385,6 +567,7 @@ cmd_start() {
   log "== MANUAL START (manual always wins — clearing manual-stop marker) =="
   rm -f "$MANUAL_STOP_MARKER"
   ensure_docker || return 1
+  check_docker_vm_memory
   ensure_questdb || return 1
   disk_free_ok || true # warn-only on manual start — operator's call
   start_caffeinate
@@ -399,6 +582,16 @@ cmd_stop() {
   stop_app
   bash scripts/groww-scale-test.sh clean >>"$LOG" 2>&1 || true
   stop_caffeinate
+  # Leave QuestDB up — but if the container is degraded, restart it now so
+  # the next Start (and any manual queries) find a healthy database.
+  if docker_alive; then
+    local qdb_state
+    qdb_state="$(questdb_container_state)"
+    if questdb_state_degraded "$qdb_state"; then
+      log "QuestDB container degraded at stop ('$qdb_state') — restarting it so it is healthy for the next Start"
+      docker restart tv-questdb >>"$LOG" 2>&1 || true
+    fi
+  fi
   printf '%s %s manual stop\n' "$TODAY" "$(ist_hms)" >"$MANUAL_STOP_MARKER"
   tg "🔔 Manual stop done — app stopped, overlay cleaned, QuestDB left running. Autopilot will NOT auto-restart today. Double-click Start TickVault to resume."
 }
@@ -504,14 +697,35 @@ eod_summary() {
 }
 
 monitor_until_eod() {
-  local relaunches=0 decision alive manual
+  local relaunches=0 decision alive manual iter=0 disk_warned=0 avail_gb
   while :; do
     if (($(secs_until "$EOD_STOP_IST" "$(ist_hms)") == 0)); then break; fi
     sleep "$MONITOR_INTERVAL_SECS"
+    iter=$((iter + 1))
     alive=0
     app_alive && alive=1
     manual=0
     manual_stop_active "$MANUAL_STOP_MARKER" "$TODAY" && manual=1
+    # Periodic disk re-check (2026-07-04 resilience fix): the boot-time
+    # disk_free_ok gate cannot see a disk that fills MID-SESSION (ticks +
+    # spill + logs all grow). Re-probe every DISK_RECHECK_ITERS iterations;
+    # edge-latched so one low-disk episode = one Telegram, re-armed on
+    # recovery. Warn-only — the in-app disk gate owns any halting decision.
+    if disk_recheck_due "$iter" "$DISK_RECHECK_ITERS"; then
+      avail_gb=$(df -Pk . 2>/dev/null | awk 'NR==2 {print int($4/1024/1024)}')
+      if disk_low "$avail_gb" "$MIN_DISK_FREE_GB"; then
+        if [ "$disk_warned" = "0" ]; then
+          tg "⚠️ Low disk MID-SESSION: ${avail_gb} GB free (below the ${MIN_DISK_FREE_GB} GB floor). Free up space soon — the capture keeps running but the safety systems will start protecting themselves if the disk keeps filling."
+          disk_warned=1
+        fi
+        log "disk re-check: LOW (${avail_gb} GB free < ${MIN_DISK_FREE_GB} GB)"
+      else
+        if [ "$disk_warned" = "1" ]; then
+          log "disk re-check: recovered (${avail_gb:-?} GB free) — warn latch re-armed"
+        fi
+        disk_warned=0
+      fi
+    fi
     decision=$(monitor_decision "$alive" "$manual" "$relaunches")
     case "$decision" in
     idle) : ;;
@@ -553,6 +767,10 @@ cmd_run() {
   trap 'rm -rf "$LOCKDIR"' EXIT
 
   log "===== LOCAL AUTOPILOT run starting ====="
+  # Missed-run detection (2026-07-04 resilience fix): if the previous
+  # TRADING day has no run stamp, the Mac was likely off/asleep and a whole
+  # session's capture was silently lost — tell the operator.
+  check_missed_previous_run
   local day
   day=$(classify_day "$TODAY" "$(ist_weekday)" "$HOLIDAYS_FILE" "$(scale_window_start)" "$(scale_window_end)")
   log "day classification: $day (scale window $(scale_window_start)..$(scale_window_end))"
@@ -576,6 +794,7 @@ cmd_run() {
 
   preflight_git
   ensure_docker || exit 1
+  check_docker_vm_memory
   disk_free_ok || exit 1
   ensure_questdb || exit 1
   start_caffeinate
