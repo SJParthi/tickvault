@@ -443,6 +443,9 @@ resource "aws_cloudwatch_event_rule" "daily_start" {
   name                = "tv-${var.environment}-daily-start"
   description         = "Start tickvault instance at 08:30 IST on trading weekdays (Mon-Fri)"
   schedule_expression = "cron(0 3 ? * MON-FRI *)"
+  # PAUSED 2026-07-04 per operator: local-only verification Mon Jul 6 - Wed Jul 8 2026.
+  # MUST BE REVERTED for Thu Jul 9 resume — revert branch: claude/aws-resume-jul9
+  state = "DISABLED"
 }
 
 resource "aws_cloudwatch_event_rule" "daily_stop" {
