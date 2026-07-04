@@ -61,13 +61,21 @@ fn test_state() -> SharedAppState {
 }
 
 /// Router with bearer auth ENABLED (a real token configured).
-fn enabled_router() -> axum::Router {
+/// `feed_toggle_public` only affects `POST /api/feeds/{feed}` routing — the
+/// debug-route bearer gate must hold in BOTH modes (consolidated from
+/// PR #1402: prove the gate is independent of the feed-toggle mode).
+fn enabled_router_with_toggle(feed_toggle_public: bool) -> axum::Router {
     build_router_with_auth(
         test_state(),
         &[],
         ApiAuthConfig::new(TEST_TOKEN.to_owned()),
-        true,
+        feed_toggle_public,
     )
+}
+
+/// Router with bearer auth ENABLED, default feed-toggle mode (public).
+fn enabled_router() -> axum::Router {
+    enabled_router_with_toggle(true)
 }
 
 /// Router with bearer auth DISABLED (dry-run / no token — passthrough).
@@ -90,16 +98,22 @@ async fn get_status(router: axum::Router, path: &str, auth_header: Option<&str>)
         .status()
 }
 
-/// Auth enabled + NO Authorization header → 401 on every debug route.
+/// Auth enabled + NO Authorization header → 401 on every debug route,
+/// in BOTH feed-toggle modes (`feed_toggle_public` ∈ {true, false}) — the
+/// debug bearer gate must be independent of the feed-toggle routing mode.
 #[tokio::test]
 async fn test_debug_routes_401_without_token() {
-    for path in DEBUG_PATHS {
-        let status = get_status(enabled_router(), path, None).await;
-        assert_eq!(
-            status,
-            StatusCode::UNAUTHORIZED,
-            "{path} must 401 without a token when auth is enabled"
-        );
+    for feed_toggle_public in [true, false] {
+        for path in DEBUG_PATHS {
+            let status =
+                get_status(enabled_router_with_toggle(feed_toggle_public), path, None).await;
+            assert_eq!(
+                status,
+                StatusCode::UNAUTHORIZED,
+                "{path} must 401 without a token when auth is enabled \
+                 (feed_toggle_public={feed_toggle_public})"
+            );
+        }
     }
 }
 
