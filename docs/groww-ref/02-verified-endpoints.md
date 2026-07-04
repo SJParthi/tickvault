@@ -27,11 +27,22 @@
 
 ## Implication for native Rust (future)
 - The URL + transport + auth flow are now known → native is **de-risked**.
-- BUT: `async-nats` is **TCP-only** — it does NOT speak NATS-over-WebSocket. A
+- ~~BUT: `async-nats` is **TCP-only** — it does NOT speak NATS-over-WebSocket. A
   native client needs a NATS-over-WS layer (no mature Rust crate today) +
-  nkey/JWT auth + the extracted `.proto`. This is weeks, not days.
-- Therefore: **Python SDK for validation now; native Rust is the production
-  option once Groww proves worth it.**
+  nkey/JWT auth + the extracted `.proto`. This is weeks, not days.~~
+  **STALE — corrected 2026-07-04:** `async-nats` has supported WebSocket
+  transport since **v0.38.0** (feature `websockets`, default-on; 0.49.1
+  current as of 2026-06-04 — verified via crates.io + the nats.rs CHANGELOG
+  during the 2026-07-04 wheel re-extraction). The schemas were also fully
+  decoded from the wheel's embedded descriptors, superseding the ".proto NOT
+  FOUND" note above. PR-R1 (operator "go" 2026-07-04) shipped the native
+  shadow client anyway on the repo's OWN zero-dep primitives
+  (`crates/core/src/feed/groww/{nats,nkey,proto,subjects}.rs` + tungstenite)
+  — see `groww-second-feed-scope-2026-06-19.md` §35 for the dependency
+  decision record.
+- Therefore: **Python SDK remains the production capture path; the native
+  Rust client runs DEFAULT-OFF in shadow (PR-R1) toward the parity-gated
+  cutover (PR-R3).**
 
 ## Sources
 - [NithinSGowda/growwapi (NodeJS, 3rd-party)](https://github.com/NithinSGowda/growwapi) — `src/config.ts`, `src/utils/LiveFeed/index.ts`, `src/utils/Protobuffer/protobuffer.ts`

@@ -47,6 +47,10 @@ pub mod dhan_activation;
 pub mod groww_activation;
 /// Groww second-feed bridge — consumer side (operator lock §32). Default-OFF.
 pub mod groww_bridge;
+/// Groww NATIVE-RUST shadow client runner (PR-R1 parity migration, operator
+/// "go" 2026-07-04 — `groww-second-feed-scope-2026-06-19.md` §35). Default-OFF
+/// behind `[feeds] groww_native_shadow`.
+pub mod groww_native_shadow;
 /// Groww auto-scale ladder FSM + gates + restart rehydration (§34, PR-2 of
 /// `.claude/plans/active-plan-groww-autoscale.md`). Default-OFF behind
 /// `[feeds.groww.scale] enabled`.
