@@ -92,10 +92,12 @@ jobs:
             body="$(printf 'Automatic main → local-runtime merge hit conflicts at main commit %s.\n\nConflicting files:\n\n```\n%s\n```\n\nResolve on the Mac:\n\n```\ngit fetch origin\ngit checkout local-runtime\ngit merge origin/main   # resolve conflicts, keep the local overlay\ngit push origin local-runtime\n```\n\nThis issue is updated (not duplicated) on every conflicting sync run.\n' "${GITHUB_SHA}" "${conflicts}")"
 
             # Single tracking issue: update the open one if it exists,
-            # otherwise create it. Never a second open duplicate.
+            # otherwise create it. Never a second open duplicate. Plain
+            # list + exact jq title match (NOT --search) — the search API
+            # has indexing lag that could duplicate the issue on rapid
+            # back-to-back conflicting runs; the list API is consistent.
             existing="$(gh issue list --repo "${REPO}" --state open \
-              --search "\"${title}\" in:title" \
-              --json number,title \
+              --limit 100 --json number,title \
               --jq '[.[] | select(.title == "local-runtime sync conflict")][0].number // empty')"
             if [[ -n "${existing}" ]]; then
               gh issue comment "${existing}" --repo "${REPO}" --body "${body}"
