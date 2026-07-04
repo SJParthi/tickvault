@@ -7,6 +7,30 @@
 
 ---
 
+## 📍 2026-07-04 Update — runtime source badge (💻 LOCAL / ☁️ AWS)
+
+Operator directive 2026-07-04 (verbatim): *"in telegram when it displays
+message then it should clearly tell whether it is from local or aws"*.
+
+Every outgoing Telegram message now carries a source badge immediately after
+the severity tag on the first line:
+
+| Runtime | First line looks like |
+|---|---|
+| Operator's Mac (`make run`) | `🚨 [CRITICAL] 💻 LOCAL <message>` |
+| AWS prod box (systemd) | `🚨 [CRITICAL] ☁️ AWS <message>` |
+
+- ONE implementation point: `telegram_message_prefix` in the notification
+  service — both the immediate path and the coalesced-summary path build
+  their prefix there. No per-event edits, ever.
+- Commandment 10 preserved: the severity emoji stays at the very START of
+  the subject; the badge follows the severity tag block.
+- The badge is plain English (one emoji + one word) — no env-var names, no
+  hostnames, no paths. Honest envelope: AWS = systemd-managed process (the
+  prod unit is the only systemd deployment); everything else badges LOCAL.
+
+---
+
 ## 🎯 The 10 commandments of Telegram messages
 
 | # | Rule | Why |

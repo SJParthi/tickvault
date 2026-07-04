@@ -45,6 +45,40 @@ env:
 
 jobs:
   # -------------------------------------------------------------------------
+  # Local-Runtime Branch Guard — the `local-runtime` branch is ONE-WAY
+  # (operator directive 2026-07-04: "it should be merged entirely from all
+  # different branches to this branch alone"). main → local-runtime merges
+  # are performed by local-branch-sync.yml; local-runtime → main is FORBIDDEN
+  # because the branch carries local-only overlay commits (local feed flags,
+  # Docker resource bumps, the local runbook) that must never reach prod.
+  # This guard FAILS any PR whose head branch is `local-runtime` (or a
+  # `local-runtime/*` prefix) so All Green — and therefore auto-merge — can
+  # never go green for it. Honest envelope: the guard keys on the HEAD
+  # BRANCH NAME; renaming the branch bypasses it (a rename is a deliberate
+  # operator act, not an accident — the accident class this blocks is
+  # opening/merging a PR from the real local-runtime branch).
+  # -------------------------------------------------------------------------
+  local-runtime-block:
+    name: "Local-Runtime Branch Guard"
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Reject PRs from the one-way local-runtime branch
+        env:
+          HEAD_REF: ${{ github.head_ref }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${HEAD_REF}" == "local-runtime" || "${HEAD_REF}" == local-runtime/* ]]; then
+            echo "::error::local-runtime is one-way (main → local-runtime only). \
+          It carries local-only overlay commits that must never merge to main. \
+          PR generally-useful changes from a normal feature branch instead."
+            exit 1
+          fi
+          echo "Head branch '${HEAD_REF}' is not local-runtime — OK."
+
+  # -------------------------------------------------------------------------
   # Commit Lint — conventional-commit format check on PR commits
   # -------------------------------------------------------------------------
   commit-lint:
@@ -447,6 +481,7 @@ jobs:
   all-green:
     name: "All Green"
     needs:
+      - local-runtime-block
       - commit-lint
       - design-first-wall
       - deploy-lint
@@ -478,7 +513,7 @@ jobs:
           # dispatcher fires this workflow on main to stand in for a
           # bot-merge-suppressed push run — same non-PR semantics); on a
           # pull_request event they MUST have run.
-          PR_ONLY_JOBS = {"commit-lint", "design-first-wall"}
+          PR_ONLY_JOBS = {"commit-lint", "design-first-wall", "local-runtime-block"}
           NON_PR_EVENTS = {"push", "workflow_dispatch"}
 
           failed = []
