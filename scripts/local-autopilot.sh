@@ -674,7 +674,7 @@ export_compose_creds() {
       --query Parameter.Value --output text --no-cli-pager 2>/dev/null || true)
   fi
   if [ -n "$u" ] && [ "$u" != "None" ] && [ -n "$p" ] && [ "$p" != "None" ]; then
-    export TV_QUESTDB_PG_USER="$u" TV_QUESTDB_PG_PASSWORD="$p"
+    export TV_QUESTDB_PG_USER="$u" TV_QUESTDB_PG_PASSWORD="$p" # secret-scan-ignore: values read from AWS SSM above, never hardcoded
   else
     log "QuestDB credentials unreadable from SSM (/tickvault/${env}/questdb/*) — the database container can still START if it already exists, but compose cannot (re)create it until the Mac is online"
   fi
@@ -833,7 +833,11 @@ adopt_gate() {
   repo_sha="$(git rev-parse HEAD 2>/dev/null || true)"
   sha_state="$(sha_compare "$app_sha" "$repo_sha")"
   db_state="$(db_app_tables_probe)"
-  if in_market_hours_ist "$(hhmm_to_secs "$(ist_hms)")" "$(date +%u)"; then mkt=1; fi
+  # ist_weekday (NOT host-local `date +%u`): the time-of-day is IST, so the
+  # day-of-week must be too — on a non-IST Mac (e.g. US TZ) 10:00 IST Monday
+  # is Sunday evening locally, which would misread mid-market as off-hours
+  # and allow an auto-restart of a healthy streaming app during the session.
+  if in_market_hours_ist "$(hhmm_to_secs "$(ist_hms)")" "$(ist_weekday)"; then mkt=1; fi
   if [ "$sha_state" = "unknown" ]; then
     log "adopt check: build version unverifiable (health/sha unavailable) — adopting conservatively"
   fi
