@@ -223,6 +223,14 @@ t "adopt: db missing outranks stale build" "restart_db" "$(adopt_health_decision
 t "adopt: unknown sha + unknown db → conservative adopt" "adopt" "$(adopt_health_decision unknown unknown 0)"
 t "adopt: unknown sha, tables ok, mid-market → adopt" "adopt" "$(adopt_health_decision unknown ok 1)"
 
+# ── FIX 9: one-shot probe-then-run marker (two buttons forever) ─────────────
+t "probe once: marker == today, no stamp → run" "run" "$(probe_once_decision 2026-07-04 2026-07-04 0)"
+t "probe once: marker != today → skip (inert Monday)" "skip" "$(probe_once_decision 2026-07-04 2026-07-06 0)"
+t "probe once: stamp exists → skip (one attempt only)" "skip" "$(probe_once_decision 2026-07-04 2026-07-04 1)"
+t "probe once: no marker → skip" "skip" "$(probe_once_decision "" 2026-07-04 0)"
+t "probe once: malformed marker → skip" "skip" "$(probe_once_decision garbage 2026-07-04 0)"
+t "probe once: missing stamp arg fail-safe → skip" "skip" "$(probe_once_decision 2026-07-04 2026-07-04 "")"
+
 # ── FIX 6: 100-conn probe helpers ───────────────────────────────────────────
 # shellcheck source=scripts/groww-scale-test.sh
 SCALE_TEST_LIB=1 source scripts/groww-scale-test.sh

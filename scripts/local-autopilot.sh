@@ -474,6 +474,30 @@ except Exception:
 PY
 }
 
+# ── FIX 9: one-shot probe-then-run marker (two-buttons-forever) ─────────────
+
+# probe_once_decision <marker_date> <today> <stamp_exists 0|1> → run|skip.
+# Pure. "run" ONLY when the COMMITTED marker (deploy/local/probe-once.date)
+# is a well-formed YYYY-MM-DD equal to TODAY (IST) and no local completion
+# stamp exists — so the marker is inert on every other day and after the one
+# attempt. The operator's interface stays EXACTLY two buttons: a dated
+# marker committed by the coordinator makes the NEXT "Run tickvault" click
+# run the one-time lab probe first, then continue into the normal start.
+probe_once_decision() {
+  [ "${3:-1}" = "0" ] || {
+    echo skip
+    return 0
+  }
+  case "${1:-}" in
+  [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]) ;;
+  *)
+    echo skip
+    return 0
+    ;;
+  esac
+  if [ "$1" = "${2:-}" ]; then echo run; else echo skip; fi
+}
+
 # ── FIX 8: launcher Telegram env + stale-adopt / recreated-DB guards ───────
 
 # tg_env_resolve <tv_environment> <environment> → the SSM environment the
@@ -1187,6 +1211,39 @@ fetch_probe_verdict() {
     2>/dev/null | parse_probe_verdict
 }
 
+# ── FIX 9: one-shot probe-then-run (operator interface = TWO buttons only) ──
+# A committed dated marker (deploy/local/probe-once.date) makes the NEXT
+# "Run tickvault" click run the one-time 100-connection lab probe FIRST,
+# then continue into the normal live start automatically. Inert on any
+# other day and after the one attempt (local stamp). The operator never
+# clicks anything extra.
+PROBE_ONCE_MARKER="deploy/local/probe-once.date"
+maybe_run_probe_once() {
+  local today marker_date="" stamp stamp_exists=0
+  today="$(ist_date)"
+  stamp="data/groww-scale/probe-once.done.${today}"
+  [ -f "$stamp" ] && stamp_exists=1
+  if [ -f "$PROBE_ONCE_MARKER" ]; then
+    marker_date="$(head -1 "$PROBE_ONCE_MARKER" | tr -d '[:space:]')"
+  fi
+  if [ "$(probe_once_decision "$marker_date" "$today" "$stamp_exists")" != "run" ]; then
+    return 0
+  fi
+  log "one-time lab marker is dated TODAY (${marker_date}) — running the 100-connection probe once BEFORE the normal start"
+  mkdir -p data/groww-scale
+  # Stamp BEFORE the probe: even a crash mid-probe must not re-trigger it —
+  # the very next click goes straight to the normal start.
+  printf '%s %s probe-once attempt\n' "$today" "$(ist_hms)" >"$stamp"
+  export_compose_creds
+  if PROBE_AUTO_STOP_MIN="${PROBE_ONCE_MAX_MIN:-45}" bash scripts/scale-100-probe.sh; then
+    log "probe finished — continuing into normal live start"
+  else
+    bash scripts/groww-scale-test.sh clean >>"$(current_log)" 2>&1 || true
+    log "probe did not complete cleanly — overlay cleaned; continuing into normal live start anyway"
+  fi
+  return 0
+}
+
 # ── Subcommand: manual start ────────────────────────────────────────────────
 
 cmd_start() {
@@ -1194,6 +1251,12 @@ cmd_start() {
   rm -f "$MANUAL_STOP_MARKER"
   ensure_docker || return 1
   check_docker_vm_memory
+  # FIX 9: one-shot lab probe (inert unless the committed marker is dated
+  # today). Runs AFTER docker is up (the probe manages QuestDB itself);
+  # the probe's internal stop re-arms the manual-stop marker, so clear it
+  # again — this click is a START.
+  maybe_run_probe_once
+  rm -f "$MANUAL_STOP_MARKER"
   ensure_questdb || return 1
   disk_free_ok || true # warn-only on manual start — operator's call
   start_caffeinate

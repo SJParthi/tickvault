@@ -106,6 +106,44 @@ if [ -z "${QDB_MEM_LIMIT:-}" ]; then
   fi
 fi
 
-# 3. The probe itself — foreground, output streams here. Ctrl-C to stop
-#    holding at the ceiling; cleanup then runs automatically.
-make scale-100-probe
+# 3. The probe itself — foreground, output streams here.
+#    Interactive (default): Ctrl-C to stop holding at the ceiling; cleanup
+#    then runs automatically.
+#    PROBE_AUTO_STOP_MIN=<minutes> (FIX 9 — the one-shot Run-click path):
+#    the probe ENDS BY ITSELF — ~3 minutes after the ladder records
+#    halted_at_ceiling in the summary TSV, or at the hard time cap — so the
+#    launcher can continue into the normal live start with zero extra clicks.
+if [ -n "${PROBE_AUTO_STOP_MIN:-}" ]; then
+  case "$PROBE_AUTO_STOP_MIN" in '' | *[!0-9]*) PROBE_AUTO_STOP_MIN=45 ;; esac
+  echo "auto-stop armed: probe ends ~3 min after reaching the ceiling (hard cap ${PROBE_AUTO_STOP_MIN} min)"
+  make scale-100-probe &
+  probe_pid=$!
+  deadline=$((SECONDS + PROBE_AUTO_STOP_MIN * 60))
+  ceiling_hold_until=0
+  while kill -0 "$probe_pid" 2>/dev/null; do
+    if ((SECONDS >= deadline)); then
+      echo "hard time cap reached — stopping the probe"
+      break
+    fi
+    if ((ceiling_hold_until == 0)) && [ -f "$TSV" ] && grep -q "halted_at_ceiling" "$TSV" 2>/dev/null; then
+      echo "ceiling reached — holding 3 more minutes, then stopping automatically"
+      ceiling_hold_until=$((SECONDS + 180))
+    fi
+    if ((ceiling_hold_until > 0)) && ((SECONDS >= ceiling_hold_until)); then break; fi
+    sleep 10
+  done
+  if kill -0 "$probe_pid" 2>/dev/null; then
+    echo "stopping the probe app (graceful)..."
+    pkill -TERM -f 'target/release/tickvault' 2>/dev/null || true
+    for _ in $(seq 1 30); do
+      kill -0 "$probe_pid" 2>/dev/null || break
+      sleep 2
+    done
+    if kill -0 "$probe_pid" 2>/dev/null; then
+      pkill -KILL -f 'target/release/tickvault' 2>/dev/null || true
+    fi
+  fi
+  wait "$probe_pid" 2>/dev/null || true
+else
+  make scale-100-probe
+fi

@@ -149,6 +149,16 @@ stops ONLY the log tail — use **Stop tickvault** for a graceful stop. The old
 (folded into the one button); "Groww Scale Test" stays separate because it
 applies config overrides a normal run must never apply.
 
+**Two buttons, forever.** No third button is ever added for lab runs. When a
+ONE-TIME lab run is wanted (e.g. the 100-connection probe), the coordinator
+commits a dated marker file `deploy/local/probe-once.date`. If that marker's
+date equals TODAY, the next **Run tickvault** click runs the lab probe first
+(its output streams in the same window; the config overlay is auto-removed
+afterwards), then continues into the normal live start automatically — the
+operator clicks nothing extra. On every other day — and after the one
+attempt (a local `data/groww-scale/probe-once.done.<date>` stamp) — the
+marker is inert and the click is a pure normal start.
+
 - **Stop** gracefully stops the app, cleans the scale overlay, leaves
   QuestDB up, and writes `data/local-manual-stop.marker` — the autopilot
   stands down for the REST OF THE DAY (no auto-relaunch, no probe actions).
