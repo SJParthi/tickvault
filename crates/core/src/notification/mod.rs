@@ -17,6 +17,7 @@
 pub mod coalescer;
 pub mod events;
 pub mod service;
+pub mod source_badge;
 pub mod summary_writer;
 
 pub use coalescer::{

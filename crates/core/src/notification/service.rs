@@ -368,10 +368,11 @@ impl NotificationService {
                 )
                 .increment(1);
 
-                // Bypass path: prefix the body with the severity tag once.
-                // (The coalesced path applies the same prefix in
-                // `deliver_summaries` on drain.)
-                let message = format!("{} {}", severity.tag(), body);
+                // Bypass path: prefix the body with the severity tag + the
+                // runtime source badge once. (The coalesced path applies the
+                // same prefix in `deliver_summaries` on drain — both sites
+                // go through the single `telegram_message_prefix` helper.)
+                let message = format!("{} {}", telegram_message_prefix(severity), body);
 
                 // Always: Telegram. Messages > 4000 chars get split into
                 // ordered chunks per Telegram's 4096-char hard limit so
@@ -543,6 +544,28 @@ impl NotificationService {
 /// Renders + sends one Telegram message per drained summary.
 ///
 /// Called by the drain task spawned in [`NotificationService::enable_coalescer`].
+/// The SINGLE implementation point for the Telegram first-line prefix:
+/// severity tag (emoji + `[LEVEL]`) followed by the runtime source badge
+/// (`💻 LOCAL` / `☁️ AWS`).
+///
+/// Operator directive 2026-07-04: every Telegram message must clearly say
+/// whether it came from the local Mac or the AWS box — during the local
+/// window BOTH runtimes can post into the same chat. Both dispatch paths
+/// (the immediate/bypass path in `notify` and the coalesced path in
+/// `deliver_summaries`) build their prefix HERE, so the badge can never
+/// drift between paths and per-event edits are never needed.
+///
+/// Commandment 10 is preserved: the severity emoji stays at the very start
+/// of the subject line; the badge follows immediately after the severity
+/// tag block.
+pub(crate) fn telegram_message_prefix(severity: Severity) -> String {
+    format!(
+        "{} {}",
+        severity.tag(),
+        super::source_badge::runtime_source().badge()
+    )
+}
+
 async fn deliver_summaries(
     client: &reqwest::Client,
     base_url: &str,
@@ -553,8 +576,13 @@ async fn deliver_summaries(
     for summary in summaries {
         // The coalesced summary inherits the original severity tag from
         // the bucket key — operators still see the [LOW] / [INFO] tag
-        // they would have got from the un-coalesced events.
-        let body = format!("{} {}", summary.severity.tag(), summary.render_message());
+        // they would have got from the un-coalesced events. The runtime
+        // source badge rides on the same shared prefix helper.
+        let body = format!(
+            "{} {}",
+            telegram_message_prefix(summary.severity),
+            summary.render_message()
+        );
         let chunks = split_message_for_telegram(&body);
         let total = chunks.len();
         let mut failed = 0_usize;
@@ -945,6 +973,56 @@ mod tests {
     fn test_disabled_service_is_not_active() {
         let service = NotificationService::disabled();
         assert!(!service.is_active());
+    }
+
+    // -----------------------------------------------------------------------
+    // telegram_message_prefix — severity tag + runtime source badge
+    // Operator directive 2026-07-04: every Telegram must say LOCAL or AWS.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_telegram_message_prefix_starts_with_severity_tag() {
+        // Commandment 10: severity emoji stays at the START of the subject.
+        for sev in [
+            Severity::Info,
+            Severity::Low,
+            Severity::Medium,
+            Severity::High,
+            Severity::Critical,
+        ] {
+            let prefix = telegram_message_prefix(sev);
+            assert!(
+                prefix.starts_with(sev.tag()),
+                "prefix must start with the severity tag: {prefix:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_telegram_message_prefix_carries_source_badge_after_tag() {
+        let prefix = telegram_message_prefix(Severity::Critical);
+        let badge = crate::notification::source_badge::runtime_source().badge();
+        let expected = format!("{} {}", Severity::Critical.tag(), badge);
+        assert_eq!(prefix, expected);
+        // The badge is exactly one of the two allowed values — never both.
+        let has_local = prefix.contains("LOCAL");
+        let has_aws = prefix.contains("AWS");
+        assert!(
+            has_local ^ has_aws,
+            "exactly one badge expected: {prefix:?}"
+        );
+    }
+
+    #[test]
+    fn test_telegram_message_prefix_under_cargo_test_is_local() {
+        // `cargo test` is never a systemd-managed process on the dev/CI
+        // boxes this suite runs on, so the cached runtime source resolves
+        // LOCAL here. (The AWS arm is covered by the pure classifier tests
+        // in source_badge.rs — env mutation is deliberately avoided.)
+        if std::env::var_os("NOTIFY_SOCKET").is_none() {
+            let prefix = telegram_message_prefix(Severity::Info);
+            assert!(prefix.contains("LOCAL"), "expected LOCAL badge: {prefix:?}");
+        }
     }
 
     // -----------------------------------------------------------------------
