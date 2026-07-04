@@ -213,9 +213,17 @@ resource "aws_cloudwatch_log_group" "tv_market_hours_liveness_gate" {
 # 09:15 IST market open, giving the post-boot SLO loop time to publish its first
 # tv_realtime_guarantee_score sample on a healthy session.
 resource "aws_cloudwatch_event_rule" "tv_market_hours_liveness_open" {
+  # PAUSED 2026-07-04 per operator: local-only verification Mon Jul 6 - Wed Jul 8 2026.
+  # MUST BE REVERTED for Thu Jul 9 resume — revert branch: claude/aws-resume-jul9
+  # (the box is intentionally OFF, so tv_realtime_guarantee_score is missing by
+  # design; with the OPEN gate disabled, this alarm + the two value-based gated
+  # alarms in app-alarms.tf keep actions_enabled=false all day and never page.
+  # The CLOSE gate below stays ENABLED as a harmless safety net that re-asserts
+  # actions-disabled at 15:35 IST.)
   name                = "tv-${var.environment}-market-hours-liveness-open"
   description         = "Enable market-hours liveness alarm actions at 09:20 IST (Mon-Fri)"
   schedule_expression = "cron(50 3 ? * MON-FRI *)"
+  state               = "DISABLED"
 }
 
 # Close the window at 15:35 IST (10:05 UTC) Mon-Fri — 5 min after the 15:30 IST
