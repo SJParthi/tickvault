@@ -389,6 +389,89 @@ clamp_qdb_mem_g() {
 # another project's namespace — so every launcher Telegram silently failed.
 tg_ssm_path() { echo "/tickvault/${1:-dev}/telegram/$2"; }
 
+# ── FIX 7: auto-raise Docker Desktop VM memory (macOS) — pure helpers ──────
+
+# docker_vm_raise_target <vm_mib> <required_mib> <pref_target_mib> <host_mib>
+# The raise DECISION, pure. stdout:
+#   "ok"         — the VM already has enough memory (no raise needed)
+#   "host_small" — a raise is needed but the host cannot afford it
+#                  (target must stay ≤ host RAM / 3)
+#   "<N>"        — raise the Docker VM to N MiB (max(pref_target, required))
+# rc 1 on any non-numeric input (caller falls back to the FIX-5 clamp).
+docker_vm_raise_target() {
+  local v
+  for v in "${1:-}" "${2:-}" "${3:-}" "${4:-}"; do
+    case "$v" in '' | *[!0-9]*) return 1 ;; esac
+  done
+  if (($1 >= $2)); then
+    echo ok
+    return 0
+  fi
+  local target="$3"
+  ((target >= $2)) || target="$2"
+  if ((target > $4 / 3)); then
+    echo host_small
+    return 0
+  fi
+  echo "$target"
+}
+
+# docker_settings_mem_key <settings-json-file> → which memory key this Docker
+# Desktop settings file uses: "MemoryMiB" (settings-store.json, Docker
+# Desktop ≥ 4.30) or "memoryMiB" (legacy settings.json). rc 1 when the file
+# is missing, is not valid JSON, or carries neither key. JSON round-trip via
+# python3 — never sed on a settings file.
+docker_settings_mem_key() {
+  [ -f "${1:-}" ] || return 1
+  python3 - "$1" <<'PY'
+import json, sys
+try:
+    with open(sys.argv[1]) as f:
+        d = json.load(f)
+except Exception:
+    sys.exit(1)
+if not isinstance(d, dict):
+    sys.exit(1)
+for k in ("MemoryMiB", "memoryMiB"):
+    if k in d:
+        print(k)
+        sys.exit(0)
+sys.exit(1)
+PY
+}
+
+# docker_settings_set_mem <settings-json-file> <key> <mib> — set the memory
+# key to <mib> via a python3 JSON round-trip (temp file + atomic replace;
+# every other setting preserved). rc 1 on missing file / bad JSON / absent
+# key / non-numeric mib — the FILE IS UNTOUCHED on every failure path.
+docker_settings_set_mem() {
+  [ -f "${1:-}" ] || return 1
+  case "${3:-}" in '' | *[!0-9]*) return 1 ;; esac
+  python3 - "$1" "$2" "$3" <<'PY'
+import json, os, sys
+path, key, mib = sys.argv[1], sys.argv[2], int(sys.argv[3])
+try:
+    with open(path) as f:
+        d = json.load(f)
+except Exception:
+    sys.exit(1)
+if not isinstance(d, dict) or key not in d:
+    sys.exit(1)
+d[key] = mib
+tmp = path + ".tickvault-tmp"
+try:
+    with open(tmp, "w") as f:
+        json.dump(d, f, indent=2)
+    os.replace(tmp, path)
+except Exception:
+    try:
+        os.unlink(tmp)
+    except OSError:
+        pass
+    sys.exit(1)
+PY
+}
+
 # ── End of pure functions. Library mode stops here. ────────────────────────
 if [[ "${AUTOPILOT_LIB:-0}" == "1" ]]; then
   return 0 2>/dev/null || exit 0
@@ -733,6 +816,99 @@ check_missed_previous_run() {
   fi
 }
 
+# ── FIX 7: auto-raise Docker Desktop VM memory (macOS, once per run) ───────
+# auto_raise_docker_vm_memory <vm_bytes> <limit_bytes> — rc 0 when the raise
+# succeeded AND the restarted Docker VM covers the QuestDB pin; rc 1 on any
+# other outcome (caller falls back to the FIX-5 clamp + manual advice).
+# Never bricks Docker: settings file is backed up first and restored on ANY
+# failure (missing file, bad JSON, restart timeout). Skipped on Linux/CI.
+DOCKER_VM_RAISE_ATTEMPTED=0
+auto_raise_docker_vm_memory() {
+  [ "$(uname -s)" = "Darwin" ] || return 1
+  [ -z "${CI:-}" ] || return 1
+  [ "$DOCKER_VM_RAISE_ATTEMPTED" = "0" ] || return 1
+  DOCKER_VM_RAISE_ATTEMPTED=1
+  local vm_mib=$(($1 / 1048576))
+  # Required = QuestDB pin + 2 GB headroom (Docker itself + the app's containers).
+  local required_mib=$(($2 / 1048576 + 2048))
+  local pref="${TV_DOCKER_VM_MEM_MIB:-10240}"
+  case "$pref" in '' | *[!0-9]*) pref=10240 ;; esac
+  local host_bytes host_mib
+  host_bytes=$(sysctl -n hw.memsize 2>/dev/null || true)
+  case "$host_bytes" in '' | *[!0-9]*)
+    log "host RAM probe unavailable — skipping Docker VM auto-raise"
+    return 1
+    ;;
+  esac
+  host_mib=$((host_bytes / 1048576))
+  local target
+  if ! target=$(docker_vm_raise_target "$vm_mib" "$required_mib" "$pref" "$host_mib"); then
+    return 1
+  fi
+  case "$target" in
+  ok) return 0 ;;
+  host_small)
+    log "Docker VM auto-raise skipped — this Mac's RAM (${host_mib} MiB) is too small to give Docker ${required_mib} MiB"
+    return 1
+    ;;
+  esac
+  # Locate the settings file + its memory key (Docker Desktop ≥ 4.30 first,
+  # then the legacy file).
+  local gc="$HOME/Library/Group Containers/group.com.docker"
+  local file="" key="" cand
+  for cand in "$gc/settings-store.json" "$gc/settings.json"; do
+    if key=$(docker_settings_mem_key "$cand"); then
+      file="$cand"
+      break
+    fi
+  done
+  if [ -z "$file" ]; then
+    log "Docker Desktop settings file not found under '$gc' — cannot auto-raise VM memory"
+    return 1
+  fi
+  local bak="${file}.tickvault-bak"
+  cp "$file" "$bak" 2>/dev/null || return 1
+  if ! docker_settings_set_mem "$file" "$key" "$target"; then
+    cp "$bak" "$file" 2>/dev/null || true
+    log "Docker settings edit failed — backup restored; falling back to the memory clamp"
+    return 1
+  fi
+  log "raising Docker Desktop memory ${vm_mib} MiB → ${target} MiB ($(basename "$file") key ${key}) — restarting Docker Desktop now"
+  osascript -e 'quit app "Docker"' >/dev/null 2>&1 || true
+  local i
+  for i in $(seq 1 10); do # wait for the daemon to go down (~30s max)
+    docker info >/dev/null 2>&1 || break
+    sleep 3
+  done
+  open -a Docker 2>/dev/null || true
+  local ready=0
+  for i in $(seq 1 40); do # wait for the daemon to come back (~120s max)
+    if docker info >/dev/null 2>&1; then
+      ready=1
+      break
+    fi
+    sleep 3
+  done
+  if [ "$ready" != "1" ]; then
+    cp "$bak" "$file" 2>/dev/null || true
+    open -a Docker 2>/dev/null || true
+    log "Docker did not come back within ~120s after the memory raise — old setting restored; falling back to the memory clamp"
+    tg "⚠️ Tried to raise Docker's memory automatically but Docker did not restart in time. The old setting was put back and the database will run with a smaller memory budget this run."
+    return 1
+  fi
+  local new_vm
+  new_vm=$(docker info --format '{{.MemTotal}}' 2>/dev/null || true)
+  case "$new_vm" in '' | *[!0-9]*) return 1 ;; esac
+  local new_mib=$((new_vm / 1048576))
+  if [ "$new_vm" -ge "$2" ]; then
+    log "Docker VM memory raised: ${vm_mib} MiB → ${new_mib} MiB (target ${target} MiB) — database keeps its full ${QDB_MEM_LIMIT} budget"
+    tg "✅ Docker's memory was raised automatically (${vm_mib} → ${new_mib} MiB) so the database gets its full budget. No action needed."
+    return 0
+  fi
+  log "Docker restarted but its VM still has ${new_mib} MiB (< required) — falling back to the memory clamp"
+  return 1
+}
+
 # check_docker_vm_memory — warn (log + Telegram, non-blocking) when the
 # Docker VM has less memory than the QuestDB pin (QDB_MEM_LIMIT). On Docker
 # Desktop the VM ceiling silently caps the container limit — QuestDB would
@@ -752,6 +928,13 @@ check_docker_vm_memory() {
   if ! docker_vm_mem_sufficient "$vm_bytes" "$limit_bytes"; then
     local vm_gb=$((vm_bytes / 1024 / 1024 / 1024))
     log "Docker VM memory ${vm_bytes} bytes < QDB_MEM_LIMIT ${QDB_MEM_LIMIT}"
+    # FIX 7: first try to RAISE Docker Desktop's VM memory automatically
+    # (macOS only, once per run, backup + restore on any failure). Success
+    # means the database keeps its full pinned budget — no clamp needed.
+    if auto_raise_docker_vm_memory "$vm_bytes" "$limit_bytes"; then
+      log "docker VM memory sufficient after auto-raise — keeping QDB_MEM_LIMIT ${QDB_MEM_LIMIT}"
+      return 0
+    fi
     # FIX 5.4: do NOT launch a database container doomed to be killed for
     # memory — clamp the limit for THIS RUN to (VM memory − 1 GB, min 1g).
     local clamped

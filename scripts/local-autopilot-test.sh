@@ -216,6 +216,35 @@ t "verdict: never climbed" "No ladder stage was recorded" "$(scale_probe_verdict
 t "verdict: garbage hit flag → rc 1" "1" "$(scale_probe_verdict 2 40 100 >/dev/null 2>&1 && echo 0 || echo 1)"
 t "verdict: garbage max → rc 1" "1" "$(scale_probe_verdict 1 abc 100 >/dev/null 2>&1 && echo 0 || echo 1)"
 
+# ── FIX 7: Docker Desktop VM memory auto-raise (pure decision + JSON edit) ──
+# decision: vm / required / preferred-target / host (all MiB)
+t "vm raise: already sufficient → ok" "ok" "$(docker_vm_raise_target 10240 10240 10240 49152)"
+t "vm raise: 7GB VM, 48GB host → raise to 10240" "10240" "$(docker_vm_raise_target 7168 10240 10240 49152)"
+t "vm raise: required above preferred wins" "12288" "$(docker_vm_raise_target 7168 12288 10240 49152)"
+t "vm raise: 16GB host too small (target > host/3)" "host_small" "$(docker_vm_raise_target 7168 10240 10240 16384)"
+t "vm raise: garbage vm → rc 1" "1" "$(docker_vm_raise_target abc 10240 10240 49152 >/dev/null 2>&1 && echo 0 || echo 1)"
+t "vm raise: empty host → rc 1" "1" "$(docker_vm_raise_target 7168 10240 10240 "" >/dev/null 2>&1 && echo 0 || echo 1)"
+# JSON key pick (Docker Desktop >= 4.30 settings-store vs legacy settings)
+printf '{"MemoryMiB": 7168, "Cpus": 8}\n' >"$TMP/settings-store.json"
+printf '{"memoryMiB": 7168, "cpus": 8}\n' >"$TMP/settings.json"
+printf '{"MemoryMiB": 7168, "memoryMiB": 7168}\n' >"$TMP/settings-both.json"
+printf '{"cpus": 8}\n' >"$TMP/settings-nokey.json"
+printf 'not json at all\n' >"$TMP/settings-bad.json"
+t "settings key: new store file → MemoryMiB" "MemoryMiB" "$(docker_settings_mem_key "$TMP/settings-store.json")"
+t "settings key: legacy file → memoryMiB" "memoryMiB" "$(docker_settings_mem_key "$TMP/settings.json")"
+t "settings key: both present → new key wins" "MemoryMiB" "$(docker_settings_mem_key "$TMP/settings-both.json")"
+t "settings key: no memory key → rc 1" "1" "$(docker_settings_mem_key "$TMP/settings-nokey.json" >/dev/null 2>&1 && echo 0 || echo 1)"
+t "settings key: bad JSON → rc 1" "1" "$(docker_settings_mem_key "$TMP/settings-bad.json" >/dev/null 2>&1 && echo 0 || echo 1)"
+t "settings key: missing file → rc 1" "1" "$(docker_settings_mem_key "$TMP/settings-absent.json" >/dev/null 2>&1 && echo 0 || echo 1)"
+# JSON round-trip edit (never osascript / never a live Docker in tests)
+docker_settings_set_mem "$TMP/settings-store.json" MemoryMiB 10240
+t "settings set: memory raised to 10240" "10240" "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["MemoryMiB"])' "$TMP/settings-store.json")"
+t "settings set: other keys preserved" "8" "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["Cpus"])' "$TMP/settings-store.json")"
+t "settings set: absent key → rc 1" "1" "$(docker_settings_set_mem "$TMP/settings-nokey.json" memoryMiB 10240 >/dev/null 2>&1 && echo 0 || echo 1)"
+t "settings set: file untouched on failure" '{"cpus": 8}' "$(cat "$TMP/settings-nokey.json")"
+t "settings set: garbage mib → rc 1" "1" "$(docker_settings_set_mem "$TMP/settings.json" memoryMiB tenGB >/dev/null 2>&1 && echo 0 || echo 1)"
+t "settings set: missing file → rc 1" "1" "$(docker_settings_set_mem "$TMP/settings-absent.json" memoryMiB 10240 >/dev/null 2>&1 && echo 0 || echo 1)"
+
 echo
 echo "local-autopilot pure-logic tests: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]
