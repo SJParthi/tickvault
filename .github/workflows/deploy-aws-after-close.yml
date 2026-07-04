@@ -62,17 +62,24 @@
 name: deploy-aws-after-close
 
 on:
-  schedule:
-    # 03:00 UTC = 08:30 IST (instance-start). 03:15 UTC = 08:45 IST (pre-market).
-    # 10:16 UTC = 15:46 IST (post-market, just after the 15:45 no-deploy band).
-    # 10:46 UTC = 16:16 IST + 11:31 UTC = 17:01 IST (scheduler-drop retries,
-    # 2026-07-02 — see header; idempotent sha check makes extras free).
-    # Mon–Fri only.
-    - cron: '0 3 * * 1-5'
-    - cron: '15 3 * * 1-5'
-    - cron: '16 10 * * 1-5'
-    - cron: '46 10 * * 1-5'
-    - cron: '31 11 * * 1-5'
+  # PAUSED 2026-07-04 per operator: local-only verification Mon Jul 6 - Wed Jul 8 2026.
+  # MUST BE REVERTED for Thu Jul 9 resume — revert branch: claude/aws-resume-jul9
+  # (this PR moves main HEAD, so the Monday 08:30 IST cron would see an
+  #  undeployed commit and dispatch deploy-aws.yml via workflow_dispatch —
+  #  whose "Ensure instance running" step SELF-STARTS the paused box
+  #  regardless of clock. All 5 crons are commented out for the window;
+  #  manual workflow_dispatch remains available.)
+  # schedule:
+  #   # 03:00 UTC = 08:30 IST (instance-start). 03:15 UTC = 08:45 IST (pre-market).
+  #   # 10:16 UTC = 15:46 IST (post-market, just after the 15:45 no-deploy band).
+  #   # 10:46 UTC = 16:16 IST + 11:31 UTC = 17:01 IST (scheduler-drop retries,
+  #   # 2026-07-02 — see header; idempotent sha check makes extras free).
+  #   # Mon–Fri only.
+  #   - cron: '0 3 * * 1-5'
+  #   - cron: '15 3 * * 1-5'
+  #   - cron: '16 10 * * 1-5'
+  #   - cron: '46 10 * * 1-5'
+  #   - cron: '31 11 * * 1-5'
   workflow_dispatch: {}
 
 concurrency:
