@@ -406,6 +406,18 @@ async fn activate_groww_lane(
                     unresolved = set.unresolved_stocks.len(),
                     "[feeds] Groww watch-list ready"
                 );
+                // FIX 13c (2026-07-04): record the watch-set counts in the
+                // shared feed-health registry AT ACTIVATION time — the mirror
+                // of the Dhan subscription-plan `set_subscribed` call in
+                // main.rs — so the boot/readiness Telegram feed lines and the
+                // /feeds page show REAL Groww counts instead of unknown until
+                // the sidecar's first status report. Idempotent overwrite: the
+                // bridge's later sidecar-status set stays authoritative.
+                feed_health.set_subscribed(
+                    Feed::Groww,
+                    set.resolved_stocks as u64,
+                    set.indices as u64,
+                );
                 // 2026-07-03 Telegram feed parity (operator: "whatever we
                 // have provided for dhan the same should be provided for
                 // groww also — instruments load message"). Mirror of the
@@ -609,5 +621,27 @@ mod tests {
         assert!(!is_dead_activation(false, true, false));
         assert!(!is_dead_activation(false, true, true));
         assert!(!is_dead_activation(false, false, false));
+    }
+
+    /// FIX 13c ratchet (source-scan, groww_bridge pattern): the watch-set
+    /// `Ok(set)` arm must record the Groww subscribe counts in feed-health at
+    /// ACTIVATION time — the mirror of Dhan's subscription-plan
+    /// `set_subscribed` call — so the boot/readiness Telegram never shows an
+    /// unknown Groww count while the sidecar is still coming up.
+    #[test]
+    fn ratchet_activation_sets_groww_subscribed_counts() {
+        // Whitespace-normalized scan so rustfmt line-breaking can't break the pin.
+        let src: String = include_str!("groww_activation.rs")
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        // Needle split via concat! so the test's own source can never satisfy
+        // the scan vacuously.
+        let needle = concat!("feed_health.set_subscribed(", "Feed::Groww,");
+        assert!(
+            src.contains(needle),
+            "activation must record the Groww subscribe counts in feed-health \
+             in the watch-set Ok(set) arm (FIX 13c)"
+        );
     }
 }
