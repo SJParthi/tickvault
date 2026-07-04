@@ -311,15 +311,23 @@ printf 'not json at all\n' >"$TMP/settings-bad.json"
 t "settings key: new store file → MemoryMiB" "MemoryMiB" "$(docker_settings_mem_key "$TMP/settings-store.json")"
 t "settings key: legacy file → memoryMiB" "memoryMiB" "$(docker_settings_mem_key "$TMP/settings.json")"
 t "settings key: both present → new key wins" "MemoryMiB" "$(docker_settings_mem_key "$TMP/settings-both.json")"
-t "settings key: no memory key → rc 1" "1" "$(docker_settings_mem_key "$TMP/settings-nokey.json" >/dev/null 2>&1 && echo 0 || echo 1)"
-t "settings key: bad JSON → rc 1" "1" "$(docker_settings_mem_key "$TMP/settings-bad.json" >/dev/null 2>&1 && echo 0 || echo 1)"
-t "settings key: missing file → rc 1" "1" "$(docker_settings_mem_key "$TMP/settings-absent.json" >/dev/null 2>&1 && echo 0 || echo 1)"
+# FIX 14: a valid dict with NO memory key prints the modern default and
+# signals rc 10 (insert path) — the distinct failure rcs let the caller
+# log file-absent / bad-JSON / python3-fail as separate messages.
+t "settings key: no memory key → default MemoryMiB" "MemoryMiB" "$(docker_settings_mem_key "$TMP/settings-nokey.json" 2>/dev/null || true)"
+t "settings key: no memory key → rc 10 (insert signal)" "10" "$(docker_settings_mem_key "$TMP/settings-nokey.json" >/dev/null 2>&1 && echo 0 || echo $?)"
+t "settings key: bad JSON → rc 3" "3" "$(docker_settings_mem_key "$TMP/settings-bad.json" >/dev/null 2>&1 && echo 0 || echo $?)"
+t "settings key: missing file → rc 2" "2" "$(docker_settings_mem_key "$TMP/settings-absent.json" >/dev/null 2>&1 && echo 0 || echo $?)"
 # JSON round-trip edit (never osascript / never a live Docker in tests)
 docker_settings_set_mem "$TMP/settings-store.json" MemoryMiB 10240
 t "settings set: memory raised to 10240" "10240" "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["MemoryMiB"])' "$TMP/settings-store.json")"
 t "settings set: other keys preserved" "8" "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["Cpus"])' "$TMP/settings-store.json")"
-t "settings set: absent key → rc 1" "1" "$(docker_settings_set_mem "$TMP/settings-nokey.json" memoryMiB 10240 >/dev/null 2>&1 && echo 0 || echo 1)"
-t "settings set: file untouched on failure" '{"cpus": 8}' "$(cat "$TMP/settings-nokey.json")"
+# FIX 14: absent key is INSERTED (fresh settings-store.json), other keys kept
+docker_settings_set_mem "$TMP/settings-nokey.json" MemoryMiB 10240
+t "settings set: absent key inserted (FIX 14)" "10240" "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["MemoryMiB"])' "$TMP/settings-nokey.json")"
+t "settings set: insert preserves other keys" "8" "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["cpus"])' "$TMP/settings-nokey.json")"
+t "settings set: garbage json → rc 1" "1" "$(docker_settings_set_mem "$TMP/settings-bad.json" MemoryMiB 10240 >/dev/null 2>&1 && echo 0 || echo 1)"
+t "settings set: garbage json file untouched" "not json at all" "$(cat "$TMP/settings-bad.json")"
 t "settings set: garbage mib → rc 1" "1" "$(docker_settings_set_mem "$TMP/settings.json" memoryMiB tenGB >/dev/null 2>&1 && echo 0 || echo 1)"
 t "settings set: missing file → rc 1" "1" "$(docker_settings_set_mem "$TMP/settings-absent.json" memoryMiB 10240 >/dev/null 2>&1 && echo 0 || echo 1)"
 

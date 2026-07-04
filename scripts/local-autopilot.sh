@@ -426,32 +426,41 @@ docker_vm_raise_target() {
 
 # docker_settings_mem_key <settings-json-file> → which memory key this Docker
 # Desktop settings file uses: "MemoryMiB" (settings-store.json, Docker
-# Desktop ≥ 4.30) or "memoryMiB" (legacy settings.json). rc 1 when the file
-# is missing, is not valid JSON, or carries neither key. JSON round-trip via
-# python3 — never sed on a settings file.
+# Desktop ≥ 4.30) or "memoryMiB" (legacy settings.json). FIX 14: a file
+# that parses as a JSON dict but carries NEITHER key (a fresh
+# settings-store.json before the user ever changed memory) prints the
+# modern default "MemoryMiB" and returns rc 10 — the caller INSERTS the
+# key instead of giving up. Distinct failure codes so the caller can log
+# WHY: rc 2 = file absent, rc 3 = not valid JSON / not a dict, any other
+# nonzero = python3 itself failed to run. JSON round-trip via python3 —
+# never sed on a settings file.
 docker_settings_mem_key() {
-  [ -f "${1:-}" ] || return 1
+  [ -f "${1:-}" ] || return 2
   python3 - "$1" <<'PY'
 import json, sys
 try:
     with open(sys.argv[1]) as f:
         d = json.load(f)
 except Exception:
-    sys.exit(1)
+    sys.exit(3)
 if not isinstance(d, dict):
-    sys.exit(1)
+    sys.exit(3)
 for k in ("MemoryMiB", "memoryMiB"):
     if k in d:
         print(k)
         sys.exit(0)
-sys.exit(1)
+# Neither key present yet — modern store default; caller inserts (FIX 14).
+print("MemoryMiB")
+sys.exit(10)
 PY
 }
 
 # docker_settings_set_mem <settings-json-file> <key> <mib> — set the memory
 # key to <mib> via a python3 JSON round-trip (temp file + atomic replace;
-# every other setting preserved). rc 1 on missing file / bad JSON / absent
-# key / non-numeric mib — the FILE IS UNTOUCHED on every failure path.
+# every other setting preserved). FIX 14: the key is INSERTED when absent
+# (a fresh settings-store.json carries no memory key until the user edits
+# it). rc 1 on missing file / bad JSON / non-numeric mib — the FILE IS
+# UNTOUCHED on every failure path.
 docker_settings_set_mem() {
   [ -f "${1:-}" ] || return 1
   case "${3:-}" in '' | *[!0-9]*) return 1 ;; esac
@@ -463,9 +472,9 @@ try:
         d = json.load(f)
 except Exception:
     sys.exit(1)
-if not isinstance(d, dict) or key not in d:
+if not isinstance(d, dict):
     sys.exit(1)
-d[key] = mib
+d[key] = mib  # FIX 14: inserts when absent, updates when present
 tmp = path + ".tickvault-tmp"
 try:
     with open(tmp, "w") as f:
@@ -1354,17 +1363,43 @@ auto_raise_docker_vm_memory() {
     ;;
   esac
   # Locate the settings file + its memory key (Docker Desktop ≥ 4.30 first,
-  # then the legacy file).
+  # then the legacy file). FIX 14: each failure mode gets its own
+  # plain-English log line, and a valid file with no memory key gets the
+  # key INSERTED instead of being rejected.
   local gc="$HOME/Library/Group Containers/group.com.docker"
-  local file="" key="" cand
+  local file="" key="" cand rc unusable=0
   for cand in "$gc/settings-store.json" "$gc/settings.json"; do
-    if key=$(docker_settings_mem_key "$cand"); then
+    # errexit-safe capture: the || arm keeps a nonzero rc from aborting.
+    key=$(docker_settings_mem_key "$cand") && rc=0 || rc=$?
+    case "$rc" in
+    0)
       file="$cand"
       break
-    fi
+      ;;
+    10)
+      file="$cand"
+      log "Docker settings '$(basename "$cand")' has no memory size entry yet — inserting a new ${key} entry"
+      break
+      ;;
+    2)
+      : # this candidate file does not exist — try the next one
+      ;;
+    3)
+      unusable=1
+      log "Docker settings '$(basename "$cand")' is not readable as JSON — skipping it"
+      ;;
+    *)
+      unusable=1
+      log "python3 could not inspect Docker settings '$(basename "$cand")' — skipping it"
+      ;;
+    esac
   done
   if [ -z "$file" ]; then
-    log "Docker Desktop settings file not found under '$gc' — cannot auto-raise VM memory"
+    if [ "$unusable" = "1" ]; then
+      log "no usable Docker Desktop settings file under '$gc' — cannot auto-raise VM memory"
+    else
+      log "Docker Desktop settings file not found under '$gc' — cannot auto-raise VM memory"
+    fi
     return 1
   fi
   local bak="${file}.tickvault-bak"
