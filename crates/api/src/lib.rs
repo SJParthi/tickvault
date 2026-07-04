@@ -69,7 +69,8 @@ pub fn build_router(state: SharedAppState, allowed_origins: &[String], dry_run: 
     // In dry_run mode: missing token = passthrough (dev mode).
     // In live mode: missing token = auto-generated token, auth still enforced.
     let auth_config = ApiAuthConfig::from_env(dry_run);
-    // dry-run → tokenless feed-toggle (operator flips feeds on the page without a token).
+    // 2026-07-04 operator quote (websocket-connection-scope-lock.md): the feed
+    // toggle is bearer-gated in ALL modes — the 4th argument is now ignored.
     build_router_with_auth(state, allowed_origins, auth_config, dry_run)
 }
 
@@ -87,17 +88,20 @@ pub fn build_router(state: SharedAppState, allowed_origins: &[String], dry_run: 
 /// * `state` — shared application state for handlers
 /// * `allowed_origins` — list of allowed CORS origin URLs (from config)
 /// * `auth_config` — pre-resolved auth config (SSM-fetched in prod, env-fallback in dev)
-/// * `auth_config` — pre-resolved auth config (SSM-fetched in prod, env-fallback in dev)
-/// * `feed_toggle_public` — when `true` (dry-run/sandbox, no real orders) the mutating
-///   `POST /api/feeds/{feed}` is PUBLIC so the operator flips feeds tokenless on
-///   localhost; when `false` (live trading) it stays bearer-protected. The
-///   Dhan-disable safety gate (`can_disable_dhan`) is unchanged either way.
+/// * `_feed_toggle_public` — ACCEPTED BUT IGNORED since 2026-07-04. The mutating
+///   `POST /api/feeds/{feed}` is bearer-protected in ALL modes per the dated
+///   operator quote in `.claude/rules/project/websocket-connection-scope-lock.md`
+///   ("⚠ 2026-07-04 OPERATOR UPDATE — FEED TOGGLE BEARER-GATED IN ALL MODES",
+///   verbatim: "whicghever is recommended go ahea dudde okay?"). The parameter is
+///   kept only to avoid an 11-call-site signature cascade (both main.rs boot
+///   paths, the `build_router` wrapper, and the router test suites); it changes
+///   NOTHING. The Dhan-disable safety gate (`can_disable_dhan`) is unchanged.
 // O(1) EXEMPT: begin — cold path, called once at boot
 pub fn build_router_with_auth(
     state: SharedAppState,
     allowed_origins: &[String],
     auth_config: ApiAuthConfig,
-    feed_toggle_public: bool,
+    _feed_toggle_public: bool,
 ) -> Router {
     let cors = build_cors_layer(allowed_origins);
 
@@ -107,39 +111,34 @@ pub fn build_router_with_auth(
     // (handlers::instruments::rebuild_instruments) are deleted.
     // Feed-toggle API (operator AskUserQuestion 2026-06-19): authenticated
     // runtime per-feed enable/disable. `GET /api/feeds` reports state;
-    // `POST /api/feeds/{feed}` flips it (Groww only — slice 1). Behind bearer
-    // auth so only the operator can change the live feed topology.
+    // `POST /api/feeds/{feed}` flips it. Behind bearer auth so only the
+    // operator can change the live feed topology.
     // The read-only status + health GETs carry no secrets (FeedHealthRow is
     // &'static str only) → always PUBLIC (below) so the /feeds page renders with
-    // no token. The MUTATING flip `POST /api/feeds/{feed}`:
-    //   • dry-run/sandbox (feed_toggle_public=true, no real orders) → PUBLIC, so
-    //     the operator flips feeds tokenless on localhost (operator 2026-06-23);
-    //   • live trading (false) → bearer-protected.
-    // The Dhan-disable safety gate (can_disable_dhan) is unchanged either way.
+    // no token (operator 2026-06-23 "public read, authed toggle" — the READ half
+    // of that ruling still holds).
     //
-    // ⚠ SECURITY NOTE (adversarial re-review 2026-07-04, HIGH — DEFERRED,
-    // OPERATOR DECISION PENDING): with the 3001 tailscale funnel live, the
-    // dry-run `feed_toggle_public=true` branch exposes this MUTATING toggle
-    // TOKENLESS to the internet (feed-disable DoS on the data capture).
-    // Gating it behind bearer auth unconditionally would change the
-    // operator-locked 2026-06-23 tokenless-localhost dry-run workflow, so per
-    // the PR-E lock protocol it needs a dated operator quote FIRST — this
-    // comment records the exposure honestly until that ruling lands.
-    //
-    // `auth_config` is consumed by the layer below regardless of branch (so no
-    // unused-variable lint when the toggle is public and the router is empty).
+    // RESOLVED (2026-07-04, dated operator quote — supersedes the former
+    // "⚠ SECURITY NOTE ... DEFERRED" here): the MUTATING `POST /api/feeds/{feed}`
+    // is bearer-protected UNCONDITIONALLY, in ALL modes. The 2026-06-23
+    // tokenless-localhost dry-run carve-out (`feed_toggle_public=true` → public
+    // toggle) is RETIRED — with the 3001 tailscale funnel live it exposed a
+    // tokenless feed-disable DoS to the internet. Rule file updated FIRST per
+    // the PR-E lock protocol: websocket-connection-scope-lock.md
+    // "⚠ 2026-07-04 OPERATOR UPDATE — FEED TOGGLE BEARER-GATED IN ALL MODES"
+    // (verbatim: "whicghever is recommended go ahea dudde okay?"). Localhost
+    // dry-run toggling now uses the same SSM bearer token as live mode.
+    // The Dhan-disable safety gate (can_disable_dhan) is unchanged.
     const FEED_TOGGLE_PATH: &str = "/api/feeds/{feed}";
-    let protected_base: Router<SharedAppState> = if feed_toggle_public {
-        Router::new()
-    } else {
-        Router::new().route(
+    let protected_routes: Router<SharedAppState> = Router::new()
+        .route(
             FEED_TOGGLE_PATH,
             axum::routing::post(handlers::feeds::set_feed),
         )
-    };
-    let protected_routes: Router<SharedAppState> = protected_base.layer(
-        axum::middleware::from_fn_with_state(auth_config.clone(), require_bearer_auth),
-    );
+        .layer(axum::middleware::from_fn_with_state(
+            auth_config.clone(),
+            require_bearer_auth,
+        ));
 
     // Security trim 2026-07-04 (operator directive, Session A): the 4 read-only
     // `/api/debug/*` routes move OFF the public router and behind the SAME
@@ -239,18 +238,10 @@ pub fn build_router_with_auth(
         );
     // The 4 `/api/debug/*` routes live on `debug_routes` above (bearer-auth
     // gated, security trim 2026-07-04) — no longer on the public router.
-
-    // dry-run/sandbox: the mutating feed-toggle is PUBLIC (tokenless) so the
-    // /feeds page can flip feeds without a token on localhost. In live trading
-    // this branch is skipped and the toggle lives in `protected_routes` above.
-    let public_routes = if feed_toggle_public {
-        public_routes.route(
-            FEED_TOGGLE_PATH,
-            axum::routing::post(handlers::feeds::set_feed),
-        )
-    } else {
-        public_routes
-    };
+    //
+    // 2026-07-04 operator quote: the former dry-run PUBLIC feed-toggle branch
+    // (tokenless POST /api/feeds/{feed} when feed_toggle_public=true) is
+    // DELETED — the toggle lives in `protected_routes` above in ALL modes.
 
     // PR #2 (2026-05-18): conditional `/api/movers/v2` route + the
     // `cascade_fanout` accessor on AppState retired. See above comment
@@ -607,56 +598,77 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_feeds_post_requires_auth_401_without_token() {
+    async fn test_feeds_post_requires_auth_401_without_token_in_both_modes() {
         use axum::body::Body;
         use axum::http::Request;
         use secrecy::SecretString;
         use tower::ServiceExt;
 
-        let auth = ApiAuthConfig::from_token(SecretString::from("secret-tok".to_string()));
-        let router = build_router_with_auth(auth_test_state(), &[], auth, false);
+        // 2026-07-04 operator quote ("whicghever is recommended go ahea dudde
+        // okay?" — websocket-connection-scope-lock.md "FEED TOGGLE BEARER-GATED
+        // IN ALL MODES"): the mutating POST /api/feeds/{feed} demands a bearer
+        // token REGARDLESS of the (now-ignored) feed_toggle_public flag. The
+        // former 2026-06-23 tokenless dry-run carve-out is RETIRED — with the
+        // 3001 funnel live it was a public feed-disable DoS surface. Regression
+        // ratchet: 401 without a token in BOTH modes, forever.
+        for feed_toggle_public in [true, false] {
+            let auth = ApiAuthConfig::from_token(SecretString::from("secret-tok".to_string()));
+            let router = build_router_with_auth(auth_test_state(), &[], auth, feed_toggle_public);
 
-        let response = router
-            .oneshot(
-                Request::builder()
-                    .method(axum::http::Method::POST)
-                    .uri("/api/feeds/groww")
-                    .header("content-type", "application/json")
-                    .body(Body::from(r#"{"enabled":true}"#))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), axum::http::StatusCode::UNAUTHORIZED);
+            let response = router
+                .oneshot(
+                    Request::builder()
+                        .method(axum::http::Method::POST)
+                        .uri("/api/feeds/groww")
+                        .header("content-type", "application/json")
+                        .body(Body::from(r#"{"enabled":true}"#))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                axum::http::StatusCode::UNAUTHORIZED,
+                "POST /api/feeds/{{feed}} must 401 without a token \
+                 (feed_toggle_public={feed_toggle_public})"
+            );
+        }
     }
 
     #[tokio::test]
-    async fn test_feeds_post_public_200_without_token_in_dry_run() {
+    async fn test_feeds_post_with_valid_token_not_401_in_both_modes() {
         use axum::body::Body;
         use axum::http::Request;
         use secrecy::SecretString;
         use tower::ServiceExt;
 
-        // operator AskUserQuestion 2026-06-23 ("tokenless toggle in dev"): with
-        // feed_toggle_public=true (dry-run/sandbox, no real orders) the mutating
-        // POST /api/feeds/{feed} is PUBLIC so the operator flips feeds on the page
-        // with no token. Auth is still ENABLED (token present) — proving the route
-        // is public, not that auth is off. Regression ratchet: must stay 200.
-        let auth = ApiAuthConfig::from_token(SecretString::from("secret-tok".to_string()));
-        let router = build_router_with_auth(auth_test_state(), &[], auth, true);
+        // Companion ratchet to the 401 test above: the gate OPENS for the real
+        // token in BOTH modes — the 2026-07-04 gating must never lock the
+        // operator out. The groww enable flip through auth_test_state() returns
+        // 200 (same handler the retired public-route test exercised).
+        for feed_toggle_public in [true, false] {
+            let auth = ApiAuthConfig::from_token(SecretString::from("secret-tok".to_string()));
+            let router = build_router_with_auth(auth_test_state(), &[], auth, feed_toggle_public);
 
-        let response = router
-            .oneshot(
-                Request::builder()
-                    .method(axum::http::Method::POST)
-                    .uri("/api/feeds/groww")
-                    .header("content-type", "application/json")
-                    .body(Body::from(r#"{"enabled":true}"#))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), axum::http::StatusCode::OK);
+            let response = router
+                .oneshot(
+                    Request::builder()
+                        .method(axum::http::Method::POST)
+                        .uri("/api/feeds/groww")
+                        .header("content-type", "application/json")
+                        .header("authorization", "Bearer secret-tok")
+                        .body(Body::from(r#"{"enabled":true}"#))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                axum::http::StatusCode::OK,
+                "POST /api/feeds/{{feed}} with the valid bearer token must pass \
+                 the gate (feed_toggle_public={feed_toggle_public})"
+            );
+        }
     }
 
     #[tokio::test]
