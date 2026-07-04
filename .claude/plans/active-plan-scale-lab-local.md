@@ -100,6 +100,20 @@ Extension (all on this branch):
   machinery with tick gates skipped (SMOKE-labelled, never a live claim).
 - Summary file unwritable: append is best-effort; the `info!` mirror + audit
   rows still carry the evidence.
+- Autopilot edge permutations (Item 6/7): Docker not installed (Telegram +
+  abort) / not running (`open -a Docker` + 120s wait); QuestDB port bound by
+  another program (120s wait + Telegram naming `lsof -i :9000`); app boot
+  panic (60s liveness check + log tail into the Telegram alert); probe
+  verdict absent after 20 min (treated inconclusive, Telegram, normal
+  session continues); mid-day Mac sleep/wake (caffeinate prevents; the
+  monitor loop re-checks app+docker on resume); git conflict at preflight
+  (run existing code + warn — never blocks the trading day); Groww token
+  stale (existing retry ladder + feed-health alerts own it — autopilot does
+  not duplicate); duplicate autopilot instance (atomic mkdir lock with
+  stale-pid reclaim); launchd fired on a weekend/holiday (quiet no-op);
+  fired after 15:35 (no-op); manual stop mid-probe-wait (monitor stands
+  down, EOD digest still sent); Telegram send failure (best-effort — the
+  message is always in the autopilot log).
 
 ## Failure Modes
 
@@ -172,6 +186,29 @@ Extension (all on this branch):
   - Tests: DRY_RUN=1 sandbox run (evidence in report)
 - [x] Item 5 — runbook Monday sequence + max-scale section (purely Groww)
   - Files: docs/runbooks/groww-scale-test.md
+  - Tests: n/a (docs)
+- [x] Item 6 — ZERO-TOUCH autopilot (operator 2026-07-04: "nope i won't run
+  any command since everything is on local testing make everything
+  automatic"): full trading-day orchestrator `run` (day classification →
+  git/Docker/disk/QuestDB preflight → caffeinate → probe-overlay boot →
+  verdict self-read from groww_scale_audit via QuestDB HTTP → automatic
+  scale-max transition / record / normal fallback → all-day monitor →
+  15:35 IST stop + EOD Telegram digest), launchd weekday 08:55 agent,
+  lockfile duplicate guard
+  - Files: scripts/local-autopilot.sh, deploy/local/com.tickvault.local-autopilot.plist.template, Makefile
+  - Tests: scripts/local-autopilot-test.sh (40 assertions over the pure decision fns)
+- [x] Item 7 — MANUAL control alongside (operator addition 2026-07-04: "let
+  me autostart or autostop manually also since it is in local" — manual
+  always wins): `make local-start` / `local-stop` / `local-status`,
+  double-clickable `Start TickVault.command` / `Stop TickVault.command`,
+  manual-stop marker `data/local-manual-stop.marker` respected by the
+  monitor loop (no auto-relaunch after a manual stop; expires next trading
+  day or on Start), idempotent start (shared pid file — never
+  double-starts)
+  - Files: scripts/local-autopilot.sh, Start TickVault.command, Stop TickVault.command, Makefile
+  - Tests: manual_stop_active + monitor_decision assertions in scripts/local-autopilot-test.sh
+- [x] Item 8 — README-LOCAL.md documents the ONE bootstrap step + both modes
+  - Files: README-LOCAL.md
   - Tests: n/a (docs)
 
 ## Scenarios

@@ -7,6 +7,7 @@
 
 .PHONY: help run run-supervised stop build test check fmt clippy clean \
         scale-test scale-probe scale-smoke scale-max scale-max-smoke scale-test-clean \
+        local-start local-stop local-status local-autopilot-install local-autopilot-uninstall local-autopilot-test \
         docker-up docker-down docker-restart docker-status docker-logs questdb-init \
         health status open questdb questdb-prod questdb-autoopen-install questdb-autoopen-uninstall \
         jaeger prometheus traefik alloy loki \
@@ -70,6 +71,35 @@ scale-max-smoke: ## 100K max-scale config, weekend SMOKE (machinery-only dry run
 
 scale-test-clean: ## Remove the scale-test overlay from config/local.toml
 	@bash scripts/groww-scale-test.sh clean
+
+local-start: ## MANUAL start: docker + app + keep-awake (clears manual-stop marker)
+	@bash scripts/local-autopilot.sh start
+
+local-stop: ## MANUAL stop: graceful app stop + overlay clean + marker (autopilot stands down)
+	@bash scripts/local-autopilot.sh stop
+
+local-status: ## One-glance local autopilot state
+	@bash scripts/local-autopilot.sh status
+
+local-autopilot-install: ## Install the launchd agent (weekdays 08:55 local time)
+	@mkdir -p data/local-autopilot ~/Library/LaunchAgents
+	@sed -e "s|__REPO__|$(CURDIR)|g" -e "s|__HOME__|$(HOME)|g" \
+		deploy/local/com.tickvault.local-autopilot.plist.template \
+		> ~/Library/LaunchAgents/com.tickvault.local-autopilot.plist
+	@launchctl bootout gui/$$(id -u)/com.tickvault.local-autopilot 2>/dev/null || true
+	@launchctl bootstrap gui/$$(id -u) ~/Library/LaunchAgents/com.tickvault.local-autopilot.plist \
+		|| launchctl load ~/Library/LaunchAgents/com.tickvault.local-autopilot.plist
+	@echo "local-autopilot installed — fires weekdays 08:55 (Mac local time)."
+	@echo "Manual control any time: double-click 'Start TickVault.command' / 'Stop TickVault.command'."
+
+local-autopilot-uninstall: ## Remove the launchd agent
+	@launchctl bootout gui/$$(id -u)/com.tickvault.local-autopilot 2>/dev/null \
+		|| launchctl unload ~/Library/LaunchAgents/com.tickvault.local-autopilot.plist 2>/dev/null || true
+	@rm -f ~/Library/LaunchAgents/com.tickvault.local-autopilot.plist
+	@echo "local-autopilot uninstalled."
+
+local-autopilot-test: ## Unit-test the autopilot's pure decision logic
+	@bash scripts/local-autopilot-test.sh
 
 stop: ## Stop running app (also wipes the on-disk JWT cache)
 	@echo "🛑 Stopping $(APP_NAME)..."

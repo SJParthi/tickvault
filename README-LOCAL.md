@@ -48,36 +48,78 @@ local-runtime ──▶ main                                ❌ FORBIDDEN, CI-bl
   git push origin local-runtime
   ```
 
-## Daily run (Mon–Wed local window)
+## ZERO-TOUCH autopilot (operator 2026-07-04: "i won't run any command")
 
-Pre-flight (evening before or ~08:30 IST):
+**The ONE bootstrap step** (a Mac-side Claude session can run it for you —
+after this, Mon–Wed is 100% hands-off):
 
 ```bash
-git checkout local-runtime && git pull      # sync robot keeps it fresh
-docker compose -f deploy/docker/docker-compose.yml \
-               -f deploy/docker/docker-compose.local.yml up -d   # QuestDB with the 6g local ceiling
-# (plain `make docker-up` also works; add QDB_MEM_LIMIT=6g to match)
-make run                                    # boots the app (pretty logs)
-make doctor                                 # 7-section health check — all green before 09:00
+make local-autopilot-install
 ```
 
-During the session:
+That installs a launchd agent that fires `scripts/local-autopilot.sh run`
+every weekday at **08:55 (Mac local time — the Mac must be on IST)**. From
+then on, each morning the autopilot, entirely by itself:
 
-- **Keep the Mac AWAKE 09:00–15:30 IST.** System Settings → prevent sleep
-  on power, or `caffeinate -dims` in a spare terminal. A sleeping Mac drops
-  the WebSockets and the local window loses ticks.
+1. Classifies the day: weekend / NSE holiday → quiet no-op; **Jul 6–8**
+   (the scale window; `data/local-autopilot/scale-window.conf` overrides
+   the dates) → scale-lab day; otherwise normal local day.
+2. Preflight: on `local-runtime` + fast-forwards to origin (a conflict →
+   runs the existing code + warns on Telegram), launches Docker.app if the
+   daemon is down (waits up to 120s), checks ≥ 50 GB free disk, brings
+   QuestDB up (6g local override) and waits until it answers.
+3. Arms `caffeinate -dims` until 15:45 IST so the Mac never sleeps
+   mid-session (**lid must stay OPEN** — honest caveat: a closed lid still
+   sleeps most MacBooks regardless of caffeinate unless on power with an
+   external display attached).
+4. Scale day: boots the app with the 2×600 cap-probe overlay, then from
+   09:45 IST **reads the ProbeVerdict itself** from the audit table —
+   multi-conn OK → automatically restarts into the full 100K ladder;
+   per-account-limited → Telegrams the answer (that IS the experiment's
+   result) and continues a normal session; inconclusive / 20-min timeout →
+   Telegram + normal session. Normal day: boots the branch profile
+   directly.
+5. All-day monitor loop: app died → one auto-relaunch with 30s backoff; a
+   second death → Telegram alert with the log tail (no crash-looping).
+   Docker died mid-session → one self-heal try + Telegram.
+6. 15:35 IST: graceful app stop, overlay clean, end-of-day Telegram digest
+   (scale stage table + app-log error count).
+
+Watch or intervene any time: `make local-status`, the logs in
+`data/local-autopilot/`, and the Telegram messages (all prefixed
+"💻 LOCAL autopilot"). Remove with `make local-autopilot-uninstall`.
+
+## Manual control (manual ALWAYS wins)
+
+The autopilot handles everything; double-click Stop to take over manually
+any time; double-click Start to resume. The autopilot never fights a
+manual decision.
+
+| Action | Double-click (repo root, no terminal) | Terminal equivalent |
+|---|---|---|
+| Take over / resume | **`Start TickVault.command`** | `make local-start` |
+| Stop everything now | **`Stop TickVault.command`** | `make local-stop` |
+
+- **Stop** gracefully stops the app, cleans the scale overlay, leaves
+  QuestDB up, and writes `data/local-manual-stop.marker` — the autopilot
+  stands down for the REST OF THE DAY (no auto-relaunch, no probe actions).
+  The marker expires automatically at the next trading day, or the moment
+  you Start again.
+- **Start** clears the marker and is idempotent: if the autopilot already
+  has the app running it detects that (shared pid file) and does NOT
+  double-start — it adopts the running session and tails the live log.
+
+During the session (both modes):
+
 - The AWS box must be OFF/paused during the window (that is the premise of
-  Dhan-on locally — no dual-instance fight).
+  Dhan-on locally — no dual-instance fight). Scale-lab runs are PURELY
+  GROWW — the harness flips Dhan off for the run and restores it on clean.
 - Telegram messages from this run are tagged **💻 LOCAL** right after the
   severity tag (AWS runs tag **☁️ AWS**), so you always know which machine
   is talking. (The badge ships to main via the local-window PR; it reaches
   this branch through the sync robot.)
-
-After the close (15:31 IST cross-verify + digest run automatically):
-
-```bash
-make stop            # stop the app when you're done for the day
-```
+- The 15:31 IST cross-verify + digest still run automatically inside the
+  app before the 15:35 stop.
 
 ## Groww 100K max-scale lab (Mon Jul 6 – Wed Jul 8)
 
