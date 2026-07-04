@@ -41,6 +41,12 @@ CAFFEINATE_UNTIL_IST="${CAFFEINATE_UNTIL_IST:-15:45}"
 MONITOR_INTERVAL_SECS="${MONITOR_INTERVAL_SECS:-60}"
 QUESTDB_HTTP="${QUESTDB_HTTP:-http://127.0.0.1:9000}"
 HOLIDAYS_FILE="${HOLIDAYS_FILE:-config/base.toml}"
+# QuestDB memory: pin 8g for EVERY autopilot-driven compose up so the
+# zero-touch max-ladder day gets the SAME limit as a manual `make scale-max`
+# (verification finding 2026-07-04: compose default is 6g via the local
+# override — a 100k ladder under 6g would gate/roll back earlier than the
+# manual path). Env-overridable like every other tunable.
+export QDB_MEM_LIMIT="${QDB_MEM_LIMIT:-8g}"
 
 APP_PIDFILE="$AUTOPILOT_DIR/app.pid"
 CAFF_PIDFILE="$AUTOPILOT_DIR/caffeinate.pid"
