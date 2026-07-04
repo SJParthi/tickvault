@@ -2,15 +2,22 @@
 # =============================================================================
 # tickvault — Send Telegram notification
 # =============================================================================
-# Reads bot token + chat ID from AWS SSM Parameter Store only. No env var
-# fallback: AWS SSM is the single source of truth for all secrets.
+# Reads bot token + chat ID from AWS SSM Parameter Store — the SAME
+# /tickvault/<env>/telegram/{bot-token,chat-id} parameters the app itself
+# uses (crates/core/src/auth/secret_manager.rs build_ssm_path). FIX 5.2
+# (operator live run 2026-07-04 20:00 IST): the previous /dlt/<env>/...
+# path belonged to another project — every launcher Telegram failed with
+# "bot-token missing from SSM (/dlt/dev/telegram/bot-token)".
+#
+# In-memory cache: when the caller has already exported
+# TV_TELEGRAM_BOT_TOKEN + TV_TELEGRAM_CHAT_ID (the exact names
+# bootstrap.sh and the launcher's tg_init export after THEIR OWN SSM
+# fetch), the per-message SSM round-trip is skipped. SSM remains the
+# single source of truth — the env values are the SSM fetch, cached.
 #
 # Usage:
 #   ./scripts/notify-telegram.sh "Task completed: environment setup done"
 #   ./scripts/notify-telegram.sh "Error: QuestDB write failed"
-#
-# Prerequisites: AWS CLI configured with credentials that can read
-# /dlt/<env>/telegram/{bot-token,chat-id} from SSM Parameter Store.
 #
 # Environment:
 #   ENVIRONMENT — "dev" (default) or "prod"
@@ -23,8 +30,8 @@ set -euo pipefail
 # ---------------------------------------------------------------------------
 REGION="ap-south-1"
 ENV="${ENVIRONMENT:-dev}"
-SSM_BOT_TOKEN_PATH="/dlt/${ENV}/telegram/bot-token"
-SSM_CHAT_ID_PATH="/dlt/${ENV}/telegram/chat-id"
+SSM_BOT_TOKEN_PATH="/tickvault/${ENV}/telegram/bot-token"
+SSM_CHAT_ID_PATH="/tickvault/${ENV}/telegram/chat-id"
 TELEGRAM_API="https://api.telegram.org"
 
 # ---------------------------------------------------------------------------
@@ -39,19 +46,22 @@ fi
 MESSAGE="$1"
 
 # ---------------------------------------------------------------------------
-# Require AWS CLI — SSM is the single source of truth
+# Credentials: cached env (the caller's earlier SSM fetch) → SSM fetch.
 # ---------------------------------------------------------------------------
-if ! command -v aws > /dev/null 2>&1; then
-    echo "ERROR: aws CLI not available — Telegram notification NOT sent" >&2
-    echo "  Message was: ${MESSAGE}" >&2
-    echo "  Install aws CLI and configure credentials with SSM read access." >&2
-    exit 2
+BOT_TOKEN="${TV_TELEGRAM_BOT_TOKEN:-}"
+CHAT_ID="${TV_TELEGRAM_CHAT_ID:-}"
+
+if [ -z "${BOT_TOKEN}" ] || [ -z "${CHAT_ID}" ]; then
+    if ! command -v aws > /dev/null 2>&1; then
+        echo "ERROR: aws CLI not available — Telegram notification NOT sent" >&2
+        echo "  Message was: ${MESSAGE}" >&2
+        echo "  Install aws CLI and configure credentials with SSM read access." >&2
+        exit 2
+    fi
+    SSM_ARGS="--region ${REGION} --with-decryption --output text --query Parameter.Value --no-cli-pager"
+    BOT_TOKEN=$(aws ssm get-parameter --name "${SSM_BOT_TOKEN_PATH}" ${SSM_ARGS} 2>/dev/null) || true
+    CHAT_ID=$(aws ssm get-parameter --name "${SSM_CHAT_ID_PATH}" ${SSM_ARGS} 2>/dev/null) || true
 fi
-
-SSM_ARGS="--region ${REGION} --with-decryption --output text --query Parameter.Value --no-cli-pager"
-
-BOT_TOKEN=$(aws ssm get-parameter --name "${SSM_BOT_TOKEN_PATH}" ${SSM_ARGS} 2>/dev/null) || true
-CHAT_ID=$(aws ssm get-parameter --name "${SSM_CHAT_ID_PATH}" ${SSM_ARGS} 2>/dev/null) || true
 
 if [ -z "${BOT_TOKEN}" ]; then
     echo "ERROR: Telegram bot-token missing from SSM (${SSM_BOT_TOKEN_PATH})" >&2

@@ -166,6 +166,34 @@ t "qdb paused → degraded"                "0" "$(questdb_state_degraded "paused
 t "qdb restarting → not degraded (docker already on it)" "1" "$(questdb_state_degraded "restarting " && echo 0 || echo 1)"
 t "qdb empty state → not degraded (no container = compose creates it)" "1" "$(questdb_state_degraded "" && echo 0 || echo 1)"
 
+# ── FIX 5 (operator live-run bugs 2026-07-04 20:00 IST) ────────────────────
+# 5.1 adopt-or-kill decision before app launch
+t "adopt: found + healthy" "adopt" "$(adopt_or_kill_decision 1 1)"
+t "kill: found + unhealthy" "kill" "$(adopt_or_kill_decision 1 0)"
+t "launch: nothing found" "launch" "$(adopt_or_kill_decision 0 0)"
+t "launch: healthy-but-no-proc is still launch" "launch" "$(adopt_or_kill_decision 0 1)"
+t "launch: garbage args fail-safe to launch" "launch" "$(adopt_or_kill_decision "" "")"
+# 5.1 first_pid — pick one pid out of pgrep output
+t "first_pid: first of several" "123" "$(first_pid $'123\n456')"
+t "first_pid: skips non-numeric lines" "77" "$(first_pid $'abc\n77')"
+t "first_pid: empty input → empty" "" "$(first_pid "")"
+# 5.1 early-exit classify
+t "launch verdict: alive → ok" "ok" "$(app_launch_verdict 1 5 5)"
+t "launch verdict: dead within window → early_exit" "early_exit" "$(app_launch_verdict 0 5 5)"
+t "launch verdict: dead after window → died_later" "died_later" "$(app_launch_verdict 0 60 5)"
+t "launch verdict: garbage secs fail-safe → died_later" "died_later" "$(app_launch_verdict 0 abc 5)"
+# 5.4 Docker-VM memory clamp: floor(vm/1GiB) − 1, min 1g
+t "clamp: 7GB VM → 6g" "6g" "$(clamp_qdb_mem_g 7516192768)"
+t "clamp: 8GiB VM → 7g" "7g" "$(clamp_qdb_mem_g 8589934592)"
+t "clamp: 2GiB VM → 1g" "1g" "$(clamp_qdb_mem_g 2147483648)"
+t "clamp: 1GiB VM floors at 1g" "1g" "$(clamp_qdb_mem_g 1073741824)"
+t "clamp: garbage input → rc 1 (keep configured limit)" "1" "$(clamp_qdb_mem_g garbage >/dev/null 2>&1 && echo 0 || echo 1)"
+# 5.2 Telegram SSM parameter path — MUST match the app's own namespace
+t "tg param path dev bot-token" "/tickvault/dev/telegram/bot-token" "$(tg_ssm_path dev bot-token)"
+t "tg param path prod chat-id" "/tickvault/prod/telegram/chat-id" "$(tg_ssm_path prod chat-id)"
+t "tg param path empty env defaults to dev" "/tickvault/dev/telegram/bot-token" "$(tg_ssm_path "" bot-token)"
+t "tg param path never uses the /dlt namespace" "0" "$(case "$(tg_ssm_path dev bot-token)" in /dlt/*) echo 1 ;; *) echo 0 ;; esac)"
+
 echo
 echo "local-autopilot pure-logic tests: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

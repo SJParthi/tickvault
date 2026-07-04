@@ -52,6 +52,12 @@ DISK_RECHECK_ITERS="${DISK_RECHECK_ITERS:-30}"
 # stamp, the operator gets a "yesterday's run was missed" Telegram.
 RUN_STAMP_KEEP="${RUN_STAMP_KEEP:-14}"
 QUESTDB_HTTP="${QUESTDB_HTTP:-http://127.0.0.1:9000}"
+# FIX 5.1 (adopt-or-kill): ports the app binds — used to detect an already-
+# running app (or a foreign port holder) BEFORE launching a new one.
+# 3001 = API (config/base.toml [api]); 9091 = metrics exporter
+# (config/base.toml metrics_port).
+APP_API_PORT="${APP_API_PORT:-3001}"
+APP_METRICS_PORT="${APP_METRICS_PORT:-9091}"
 HOLIDAYS_FILE="${HOLIDAYS_FILE:-config/base.toml}"
 # QuestDB memory: pin 8g for EVERY autopilot-driven compose up so the
 # zero-touch max-ladder day gets the SAME limit as a manual `make scale-max`
@@ -320,6 +326,69 @@ refresh_one_file_symlink() {
   ln -sfn "$(basename "$1")" "$2" 2>/dev/null || true
 }
 
+# ── FIX 5 pure helpers (operator LIVE-run bugs, 2026-07-04 20:00 IST) ──────
+
+# first_pid <text> → the first line that is a bare numeric pid (empty when
+# none). Pure. Picks one pid out of pgrep output.
+first_pid() { printf '%s\n' "${1:-}" | awk '/^[0-9]+$/ {print; exit}'; }
+
+# adopt_or_kill_decision <proc_found 0/1> <healthy 0/1> → adopt|kill|launch.
+# Pure. FIX 5.1: a stale app held the metrics port and the fresh launch died
+# with "Address already in use (os error 48)".
+#   found + healthy   → ADOPT it (write pidfile; manual-wins unchanged)
+#   found + unhealthy → KILL it (TERM→wait→KILL), then launch fresh
+#   not found         → LAUNCH
+adopt_or_kill_decision() {
+  if [ "${1:-0}" = "1" ] && [ "${2:-0}" = "1" ]; then
+    echo adopt
+  elif [ "${1:-0}" = "1" ]; then
+    echo kill
+  else
+    echo launch
+  fi
+}
+
+# app_launch_verdict <alive 0/1> <waited_secs> <early_window_secs> →
+# ok|early_exit|died_later. Pure. FIX 5.1: an app that exits within the
+# early window (~5s — port clash, config error) gets the last ~20 log lines
+# surfaced with a plain-English message instead of a silent tail of nothing.
+app_launch_verdict() {
+  if [ "${1:-0}" = "1" ]; then
+    echo ok
+    return 0
+  fi
+  case "${2:-}" in '' | *[!0-9]*)
+    echo died_later
+    return 0
+    ;;
+  esac
+  case "${3:-}" in '' | *[!0-9]*)
+    echo died_later
+    return 0
+    ;;
+  esac
+  if (($2 <= $3)); then echo early_exit; else echo died_later; fi
+}
+
+# clamp_qdb_mem_g <vm_total_bytes> → "<N>g" where N = floor(vm/1GiB) − 1
+# (leave ~1 GB for Docker itself), never below 1g. Pure; non-numeric input
+# → rc 1 (caller keeps the configured limit). FIX 5.4: a QDB_MEM_LIMIT above
+# the Docker VM's total memory launches a database container doomed to be
+# killed for memory — clamp for this run instead.
+clamp_qdb_mem_g() {
+  case "${1:-}" in '' | *[!0-9]*) return 1 ;; esac
+  local g=$(($1 / 1073741824 - 1))
+  ((g >= 1)) || g=1
+  echo "${g}g"
+}
+
+# tg_ssm_path <env> <key> → the SSM parameter path the tickvault APP itself
+# uses for Telegram (crates/core/src/auth/secret_manager.rs build_ssm_path:
+# /tickvault/<env>/telegram/<key>). Pure; empty env defaults to dev.
+# FIX 5.2: the launcher's Telegram previously read /dlt/<env>/telegram/* —
+# another project's namespace — so every launcher Telegram silently failed.
+tg_ssm_path() { echo "/tickvault/${1:-dev}/telegram/$2"; }
+
 # ── End of pure functions. Library mode stops here. ────────────────────────
 if [[ "${AUTOPILOT_LIB:-0}" == "1" ]]; then
   return 0 2>/dev/null || exit 0
@@ -370,9 +439,74 @@ log() {
   if [ -t 1 ]; then echo "$line"; fi
 }
 
+# tg_init — FIX 5.2: fetch the Telegram credentials ONCE per run from the
+# SAME SSM parameters the app itself uses (/tickvault/<env>/telegram/*, per
+# secret_manager.rs build_ssm_path — the launcher previously pointed at a
+# /dlt/... path from another project, so every launcher Telegram failed).
+# Cached in-memory (exported env — the same names bootstrap.sh exports, so a
+# bootstrap-launched run skips the fetch entirely). Missing param / offline
+# Mac → log ONCE, disable for the run, never spam per message.
+TG_INIT_DONE=0
+TG_DISABLED=0
+tg_init() {
+  if ((TG_INIT_DONE)); then return 0; fi
+  TG_INIT_DONE=1
+  if [ -n "${TV_TELEGRAM_BOT_TOKEN:-}" ] && [ -n "${TV_TELEGRAM_CHAT_ID:-}" ]; then
+    return 0 # already cached (e.g. bootstrap.sh exported them)
+  fi
+  local env="${ENVIRONMENT:-dev}" tok="" chat=""
+  if command -v aws >/dev/null 2>&1; then
+    tok=$(aws ssm get-parameter --region ap-south-1 --with-decryption \
+      --name "$(tg_ssm_path "$env" bot-token)" \
+      --query Parameter.Value --output text --no-cli-pager 2>/dev/null || true)
+    chat=$(aws ssm get-parameter --region ap-south-1 --with-decryption \
+      --name "$(tg_ssm_path "$env" chat-id)" \
+      --query Parameter.Value --output text --no-cli-pager 2>/dev/null || true)
+  fi
+  if [ -n "$tok" ] && [ "$tok" != "None" ] && [ -n "$chat" ] && [ "$chat" != "None" ]; then
+    export TV_TELEGRAM_BOT_TOKEN="$tok" TV_TELEGRAM_CHAT_ID="$chat"
+  else
+    TG_DISABLED=1
+    log "Telegram unavailable ($(tg_ssm_path "$env" bot-token) unreadable — no internet or missing parameter). Messages will appear in this log only for the rest of this run."
+  fi
+}
+
 tg() { # best-effort Telegram; the log always carries the message
   log "TELEGRAM: $*"
+  tg_init
+  if ((TG_DISABLED)); then return 0; fi
   bash scripts/notify-telegram.sh "💻 LOCAL autopilot — $*" >>"$(current_log)" 2>&1 || true
+}
+
+# export_compose_creds — FIX 5.3: the launcher's own `docker compose`
+# invocations previously ran WITHOUT the SSM-fetched credentials that
+# bootstrap.sh exports, so compose failed interpolating
+# TV_QUESTDB_PG_PASSWORD whenever the launcher had to (re)create the
+# database container. Fetch ONCE per run, same SSM paths bootstrap.sh /
+# ensure-questdb.sh use; already-exported env (a bootstrap-launched run)
+# skips the fetch. Failure logs once and continues — an EXISTING container
+# needs no creds to start.
+COMPOSE_CREDS_DONE=0
+export_compose_creds() {
+  if ((COMPOSE_CREDS_DONE)); then return 0; fi
+  COMPOSE_CREDS_DONE=1
+  if [ -n "${TV_QUESTDB_PG_USER:-}" ] && [ -n "${TV_QUESTDB_PG_PASSWORD:-}" ]; then
+    return 0
+  fi
+  local env="${ENVIRONMENT:-dev}" u="" p=""
+  if command -v aws >/dev/null 2>&1; then
+    u=$(aws ssm get-parameter --region ap-south-1 --with-decryption \
+      --name "/tickvault/${env}/questdb/pg-user" \
+      --query Parameter.Value --output text --no-cli-pager 2>/dev/null || true)
+    p=$(aws ssm get-parameter --region ap-south-1 --with-decryption \
+      --name "/tickvault/${env}/questdb/pg-password" \
+      --query Parameter.Value --output text --no-cli-pager 2>/dev/null || true)
+  fi
+  if [ -n "$u" ] && [ "$u" != "None" ] && [ -n "$p" ] && [ "$p" != "None" ]; then
+    export TV_QUESTDB_PG_USER="$u" TV_QUESTDB_PG_PASSWORD="$p"
+  else
+    log "QuestDB credentials unreadable from SSM (/tickvault/${env}/questdb/*) — the database container can still START if it already exists, but compose cannot (re)create it until the Mac is online"
+  fi
 }
 
 # ── Service primitives (shared by autopilot + manual start/stop) ───────────
@@ -409,6 +543,7 @@ questdb_container_state() {
 }
 
 ensure_questdb() {
+  export_compose_creds # FIX 5.3 — compose interpolates TV_QUESTDB_PG_* env
   docker compose -f deploy/docker/docker-compose.yml \
     -f deploy/docker/docker-compose.local.yml up -d tv-questdb >>"$(current_log)" 2>&1
   # Self-heal (2026-07-04): a degraded container (unhealthy/exited/dead/
@@ -465,12 +600,74 @@ stop_caffeinate() {
   fi
 }
 
+# find_running_app — FIX 5.1: detect an already-running app by PROCESS, not
+# just the pidfile (the pidfile can be missing/stale after a crashed
+# launcher — the live 2026-07-04 failure: a healthy app was running, the
+# blind relaunch died on "Address already in use").
+find_running_app() {
+  first_pid "$(pgrep -f 'target/release/tickvault' 2>/dev/null || true)"
+}
+
+app_port_busy() { # $1 = port → rc 0 when SOMETHING is listening on it
+  if command -v lsof >/dev/null 2>&1; then
+    lsof -nP -iTCP:"$1" -sTCP:LISTEN >/dev/null 2>&1
+  else
+    (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null && {
+      exec 3>&- 3<&- || true
+      return 0
+    }
+    return 1
+  fi
+}
+
+app_health_ok() { # the /health endpoint is deliberately public
+  curl -sf -m 3 "http://127.0.0.1:${APP_API_PORT}/health" >/dev/null 2>&1
+}
+
 start_app() { # $1 = label for the log
   if app_alive; then
     log "app already running (pid $(cat "$APP_PIDFILE")) — not double-starting"
     write_run_stamp
     return 0
   fi
+  # FIX 5.1 — adopt-or-kill BEFORE launching: an existing app process
+  # (found by name + confirmed by ports/health) is ADOPTED when healthy,
+  # or stopped (polite then forced) when zombie/unhealthy, so "Run
+  # tickvault" NEVER dies on a port clash.
+  local existing decision healthy=0
+  existing="$(find_running_app)"
+  if [ -n "$existing" ]; then
+    if app_health_ok; then healthy=1; fi
+    decision="$(adopt_or_kill_decision 1 "$healthy")"
+  else
+    if app_port_busy "$APP_METRICS_PORT" || app_port_busy "$APP_API_PORT"; then
+      tg "🆘 Another program is holding the app's network port (${APP_METRICS_PORT} or ${APP_API_PORT}) and it is not tickvault — quit that program, then double-click Start TickVault."
+      return 1
+    fi
+    decision=launch
+  fi
+  case "$decision" in
+  adopt)
+    echo "$existing" >"$APP_PIDFILE"
+    log "adopted running app pid $existing (pidfile was missing/stale — no relaunch needed)"
+    write_run_stamp
+    return 0
+    ;;
+  kill)
+    log "found a stale/unhealthy app process (pid $existing) — stopping it before a fresh launch"
+    kill "$existing" 2>/dev/null || true
+    local w
+    for w in $(seq 1 10); do
+      kill -0 "$existing" 2>/dev/null || break
+      sleep 1
+    done
+    if kill -0 "$existing" 2>/dev/null; then
+      log "old app pid $existing ignored the polite stop — forcing"
+      kill -9 "$existing" 2>/dev/null || true
+      sleep 1
+    fi
+    ;;
+  esac
   log "building release binary (first build of the day can take minutes)..."
   if ! cargo build --release >>"$(current_log)" 2>&1; then
     tg "🆘 Build FAILED — the app cannot start. Last lines: $(tail -5 "$(current_log)" | tr '\n' ' | ')"
@@ -479,7 +676,23 @@ start_app() { # $1 = label for the log
   nohup ./target/release/tickvault >>"$(current_log)" 2>&1 &
   echo $! >"$APP_PIDFILE"
   log "app launched ($1) — pid $(cat "$APP_PIDFILE"), log $ONE_FILE_LINK → $(current_log)"
-  sleep 60
+  # FIX 5.1 — early-exit detection: an app that dies within ~5s (port clash,
+  # config error) gets its last log lines SHOWN with a plain-English message
+  # instead of the old silent 60s wait.
+  sleep 5
+  local verdict
+  verdict="$(app_launch_verdict "$(app_alive && echo 1 || echo 0)" 5 5)"
+  if [ "$verdict" = "early_exit" ]; then
+    log "app exited within 5s of launch ($1) — the last 20 log lines follow"
+    if [ -t 1 ]; then
+      echo "---- why the app stopped (last 20 log lines) ----"
+      tail -20 "$(current_log)"
+      echo "-------------------------------------------------"
+    fi
+    tg "🆘 App stopped immediately after launch ($1). Most recent messages: $(tail -8 "$(current_log)" | tr '\n' ' | '). Double-click Stop TickVault, wait 10 seconds, then Start TickVault."
+    return 1
+  fi
+  sleep 55
   if ! app_alive; then
     tg "🆘 App DIED within 60s of launch ($1). Log tail: $(tail -8 "$(current_log)" | tr '\n' ' | ')"
     return 1
@@ -539,7 +752,16 @@ check_docker_vm_memory() {
   if ! docker_vm_mem_sufficient "$vm_bytes" "$limit_bytes"; then
     local vm_gb=$((vm_bytes / 1024 / 1024 / 1024))
     log "Docker VM memory ${vm_bytes} bytes < QDB_MEM_LIMIT ${QDB_MEM_LIMIT}"
-    tg "⚠️ Docker Desktop only has ${vm_gb} GB memory but the database needs ${QDB_MEM_LIMIT}. Open Docker Desktop → Settings → Resources → Memory and raise it above ${QDB_MEM_LIMIT}, then restart. Running anyway — but the database may crash under load until this is fixed."
+    # FIX 5.4: do NOT launch a database container doomed to be killed for
+    # memory — clamp the limit for THIS RUN to (VM memory − 1 GB, min 1g).
+    local clamped
+    if clamped=$(clamp_qdb_mem_g "$vm_bytes"); then
+      log "auto-clamping QDB_MEM_LIMIT ${QDB_MEM_LIMIT} → ${clamped} for this run"
+      tg "⚠️ Docker Desktop only has ${vm_gb} GB memory but the database wants ${QDB_MEM_LIMIT}. Using ${clamped} for this run so the database cannot crash from memory. For full speed: open Docker Desktop → Settings → Resources → Memory, raise it to 10 GB, click Apply & Restart, then double-click Start TickVault."
+      export QDB_MEM_LIMIT="$clamped"
+    else
+      tg "⚠️ Docker Desktop only has ${vm_gb} GB memory but the database needs ${QDB_MEM_LIMIT}. Open Docker Desktop → Settings → Resources → Memory and raise it to 10 GB, then restart. Running anyway — but the database may crash under load until this is fixed."
+    fi
   else
     log "docker VM memory OK (${vm_bytes} bytes >= QDB_MEM_LIMIT ${QDB_MEM_LIMIT})"
   fi
