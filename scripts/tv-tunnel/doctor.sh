@@ -68,11 +68,24 @@ echo "  tv-tunnel doctor — ${HOSTNAME_FQDN}"
 echo "==========================================================="
 
 # 1. Check funnel status
-if $TS_BIN funnel status 2>/dev/null | grep -q "https"; then
+FUNNEL_STATUS="$($TS_BIN funnel status 2>/dev/null || true)"
+if grep -q "https" <<<"$FUNNEL_STATUS"; then
   pass "tailscale funnel active"
 else
   fail_row "tailscale funnel inactive — run install-mac.sh or install-aws.sh"
 fi
+
+# 1b. Negative assertion (adversarial re-review HIGH, 2026-07-04): funnel
+# state persists inside tailscaled across installs, so an upgraded host can
+# still be publicly serving the RETIRED ports from a pre-trim install. The
+# trim is only real if none of them appear in `funnel status`.
+for stale_port in 9000 9090 9093 3000; do
+  if grep -Eq ":${stale_port}([^0-9]|$)" <<<"$FUNNEL_STATUS"; then
+    fail_row "retired port ${stale_port} is STILL publicly funnelled — stale pre-trim state; run 'tailscale funnel reset' then re-run the install script"
+  else
+    pass "retired port ${stale_port} not funnelled"
+  fi
+done
 
 # 2. Probe each port
 for port in "${PORTS[@]}"; do
@@ -90,17 +103,18 @@ done
 # 3. Hit the new debug endpoints specifically.
 # Security trim 2026-07-04: /api/debug/* is gated behind bearer auth, and every
 # real boot fetches the SSM token (auth always ENABLED) — so a tokenless probe
-# returning 401 is the CORRECT, healthy answer on a secured host. 200/404 only
-# occur when auth is disabled (unit-test-style constructions).
+# returning 401 is the CORRECT, healthy answer on a secured host. Auth is NEVER
+# legitimately disabled on a real boot (the disabled passthrough is reachable
+# only in unit-test constructions), so a tokenless 200/404 on a funnelled host
+# means the bearer wall was removed/bypassed — a regression, never a healthy
+# state (audit Rule 11: no false-OK).
 for dbg in "/api/debug/logs/summary" "/api/debug/logs/jsonl/latest"; do
   url="https://${HOSTNAME_FQDN}:3001${dbg}"
   code=$(curl -s -o /dev/null -m 5 -w "%{http_code}" "$url" || echo "000")
   if [[ "$code" == "401" ]]; then
     pass "tickvault debug endpoint ${dbg} reachable + gated (HTTP 401 — bearer auth enforced, expected)"
   elif [[ "$code" =~ ^(200|404)$ ]]; then
-    # 404 is acceptable if the app hasn't written errors.summary.md yet;
-    # 200/404 without a token means auth is disabled on this host.
-    pass "tickvault debug endpoint ${dbg} reachable (HTTP ${code} — auth disabled on this host)"
+    fail_row "tickvault debug endpoint ${dbg} answered WITHOUT auth (HTTP ${code}) — bearer gate missing/bypassed; auth must be enabled on every real boot"
   else
     fail_row "tickvault debug endpoint ${dbg} — HTTP ${code}"
   fi

@@ -107,6 +107,14 @@ pass "installed launchd plist: $PLIST_DEST"
 # Load the launchd service (idempotent)
 # -----------------------------------------------------------------------------
 /bin/launchctl unload "$PLIST_DEST" 2>/dev/null || true
+# Security trim 2026-07-04 (adversarial re-review HIGH): funnel state is
+# PERSISTED inside tailscaled — unload/load alone never removes ports enabled
+# by an older install (9000/9090/9093/3000 would stay publicly funnelled
+# forever on an upgraded Mac). Reset wipes the whole funnel config; the plist
+# re-adds ONLY 3001 on load. Mirrors the AWS unit's ExecStopPost=funnel reset.
+info "clearing previously-funnelled ports (tailscale funnel reset)…"
+"$TAILSCALE_BIN" funnel reset 2>/dev/null \
+  || warn "tailscale funnel reset failed — check 'tailscale funnel status' for stale ports (9000/9090/9093/3000 must NOT appear)"
 /bin/launchctl load -w "$PLIST_DEST"
 pass "launchd service loaded — tunnel will start within 10 seconds"
 
