@@ -278,9 +278,13 @@ jobs:
 
   # -------------------------------------------------------------------------
   # Coverage & Perf — runs on PRs AND on push-to-main (merge-gate hardening
-  # 2026-07-04). Runs cargo-llvm-cov and enforces the ratcheted per-crate
-  # floors in quality/crate-coverage-thresholds.toml (floors only move up;
-  # 100% is the target, not the current floor).
+  # 2026-07-04). Runs cargo-llvm-cov and enforces
+  # the ratcheted per-crate floors in quality/crate-coverage-thresholds.toml
+  # (floors only move up; 100% is the target, not the current floor).
+  # NOTE: "ratcheted per-crate floors" must stay CONTIGUOUS on one line —
+  # the B7 honesty ratchet crates/storage/tests/coverage_claim_honesty_guard.rs
+  # does a literal substring check on this file (proven: run 28692694701's
+  # Test (storage) failed when a reflow split the phrase across lines).
   #
   # HISTORY: this job was `if: github.event_name == 'push'` (post-merge only)
   # until 2026-07-04. That let coverage-floor breaches MERGE and turn main red
@@ -408,6 +412,20 @@ jobs:
   #
   # Adding a new job to this workflow? Add it to the `needs:` list below —
   # a job not listed here does NOT gate merges.
+  #
+  # GUARD CHOICE — `!cancelled()`, NOT `always()` (fixed 2026-07-04, same day):
+  # with `always()`, All Green also executed inside a run that was CANCELLED
+  # by the PR concurrency group (a newer event superseding an older run —
+  # proven live on PR #1392: the PR-open run was superseded by the
+  # ready-for-review run seconds later, and the superseded run's All Green
+  # stamped a misleading RED on the SHA with every need `cancelled`).
+  # `!cancelled()` keeps the essential property — All Green still RUNS when
+  # upstream jobs merely FAIL, so it reports the red verdict — but SKIPS when
+  # the whole run was cancelled, leaving the verdict to the superseding run.
+  # Safety: a skipped All Green can never arm auto-merge (enable-auto-merge
+  # requires result == 'success'), and a cancelled run also leaves
+  # Build & Verify / Security & Audit / etc. in `cancelled` state, which
+  # blocks required checks — a cancelled suite can never read as mergeable.
   # -------------------------------------------------------------------------
   all-green:
     name: "All Green"
@@ -420,7 +438,7 @@ jobs:
       - security-and-audit
       - coverage-and-perf
       - repo-guards
-    if: always()
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:

@@ -165,6 +165,12 @@ independent).
 - [x] This plan file (6 gate sections, APPROVED)
   - Files: .claude/plans/active-plan-merge-gate-hardening.md
   - Tests: plan-gate section check
+- [x] Live-fix 1 (PR #1392 first run): all-green guard `always()` → `!cancelled()` — the superseded PR-open run (cancelled by the ready-for-review run via PR-lane concurrency) still executed All Green under `always()` and stamped a misleading red on the SHA with every need `cancelled` (run 28692692142). `!cancelled()` still runs on upstream FAILURE (reports the red verdict) but skips on run cancellation; a skipped All Green can never arm auto-merge (enable-auto-merge requires result == 'success') and a cancelled run leaves the other required checks in merge-blocking `cancelled` state
+  - Files: .github/workflows/ci.yml, .claude/rules/project/merge-gate-lock-2026-07-04.md
+  - Tests: PyYAML parse; live PR #1392 re-run shows a single authoritative All Green
+- [x] Live-fix 2 (PR #1392 first run): coverage comment reflow broke the B7 honesty ratchet — `crates/storage/tests/coverage_claim_honesty_guard.rs::coverage_claims_in_ci_yml_are_honest` does a LITERAL substring check for "ratcheted per-crate floors" in ci.yml and the rewritten comment wrapped the phrase across two lines (Test (storage) failure, run 28692694701 job 85096789052). Restored the phrase contiguous + added a loud NOTE in ci.yml pointing at the ratchet
+  - Files: .github/workflows/ci.yml
+  - Tests: cargo test -p tickvault-storage --test coverage_claim_honesty_guard (local, green before push)
 
 ## Scenarios
 
