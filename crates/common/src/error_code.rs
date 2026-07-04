@@ -482,6 +482,15 @@ pub enum ErrorCode {
     /// the other instance shuts down (or its 90 s TTL expires after
     /// a hard crash). Severity::Critical.
     Resilience01DualInstanceDetected,
+    /// RESILIENCE-03: a Dhan `generateAccessToken` mint was REFUSED
+    /// because this process no longer holds the SSM dual-instance lock
+    /// (the heartbeat observed a peer taking ownership, or shutdown
+    /// released it). Dhan enforces one active token at a time — minting
+    /// while a peer owns the session would invalidate the peer's JWT
+    /// and start a cross-host mint ping-pong (coexistence audit
+    /// 2026-07-04). Fail-closed refusal, loud, never silent.
+    /// Severity::Critical.
+    Resilience03MintRefusedLockNotHeld,
     /// RESOURCE-01: open file-descriptor count crossed the early-warning
     /// threshold (default 80% of `LimitNOFILE`). A leaked WS / QuestDB
     /// socket can exhaust the fd table with zero signal until `connect()`
@@ -877,6 +886,7 @@ impl ErrorCode {
             Self::AggregatorHb01Heartbeat => "AGGREGATOR-HB-01",
             Self::Boundary01CatchupSeal => "BOUNDARY-01",
             Self::Resilience01DualInstanceDetected => "RESILIENCE-01",
+            Self::Resilience03MintRefusedLockNotHeld => "RESILIENCE-03",
             Self::Resource01FdCountHigh => "RESOURCE-01",
             Self::Resource02ResidentMemoryHigh => "RESOURCE-02",
             Self::Resource03SpillFreeLow => "RESOURCE-03",
@@ -940,6 +950,7 @@ impl ErrorCode {
             | Self::PrevClose03BootRoutingAssertion
             | Self::AggregatorDrop01
             | Self::Resilience01DualInstanceDetected
+            | Self::Resilience03MintRefusedLockNotHeld
             | Self::OrphanPosition01Detected
             | Self::BarMismatch01CorrectedFromHistorical
             | Self::BarMismatch02CrossCheckInconclusive
@@ -1228,6 +1239,10 @@ impl ErrorCode {
             | Self::Resource01FdCountHigh
             | Self::Resource02ResidentMemoryHigh
             | Self::Resource03SpillFreeLow => ".claude/rules/project/wave-4-error-codes.md",
+            // 2026-07-04 dual-instance lock hardening (lock-before-mint)
+            Self::Resilience03MintRefusedLockNotHeld => {
+                ".claude/rules/project/dual-instance-lock-2026-07-04.md"
+            }
             Self::OrphanPosition01Detected => {
                 ".claude/rules/project/phase-0-item-20-error-codes.md"
             }
@@ -1415,6 +1430,8 @@ impl ErrorCode {
             Self::Boundary01CatchupSeal,
             // Wave 4 — Item 19 dual-instance lock
             Self::Resilience01DualInstanceDetected,
+            // 2026-07-04 dual-instance lock hardening (lock-before-mint tripwire)
+            Self::Resilience03MintRefusedLockNotHeld,
             // BP-08 (2026-07-01) — fd / RSS / spill-free early-warning monitors
             Self::Resource01FdCountHigh,
             Self::Resource02ResidentMemoryHigh,
@@ -1755,7 +1772,10 @@ mod tests {
         // (fleet-wide failure → global cooldown + halve) + GROWW-SCALE-03
         // (shard disjointness/coverage contract violated) + GROWW-SCALE-04
         // (groww_scale_audit row write failed, best-effort).
-        assert_eq!(ErrorCode::all().len(), 123);
+        // 2026-07-04 (dual-instance lock hardening): bumped 123 -> 124 for
+        // RESILIENCE-03 (generateAccessToken mint refused — instance lock
+        // not held; lock-before-mint tripwire, operator "go" 2026-07-04).
+        assert_eq!(ErrorCode::all().len(), 124);
     }
 
     #[test]
