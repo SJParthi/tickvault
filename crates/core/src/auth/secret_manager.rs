@@ -1340,4 +1340,40 @@ mod tests {
              expected exactly 2: the fn definition + the supervisor call site)"
         );
     }
+
+    /// Session-B fix #1 (operator go 2026-07-04): the Groww scale-FLEET
+    /// spawn in `main.rs` MUST be gated by the fleet dual-instance SSM lock
+    /// (`acquire_groww_scale_fleet_lock`). A scale-test boot runs
+    /// `dhan_enabled=false` and never reaches the Dhan RESILIENCE-01 lock,
+    /// so removing this gate silently re-opens the class where two hosts
+    /// (Mac + AWS, or two Macs) scale the SAME Groww account simultaneously
+    /// and the failure masquerades as provider throttle (GROWW-SCALE-05).
+    #[test]
+    fn test_groww_scale_fleet_lock_is_wired_into_main() {
+        let main_rs = std::fs::read_to_string("../app/src/main.rs")
+            .or_else(|_| std::fs::read_to_string("crates/app/src/main.rs"))
+            .expect("main.rs must be readable");
+        assert!(
+            main_rs.contains("acquire_groww_scale_fleet_lock("),
+            "main.rs MUST gate the Groww scale-fleet spawn behind \
+             `groww_scale_lock::acquire_groww_scale_fleet_lock` \
+             (GROWW-SCALE-05, Session-B fix 2026-07-04). Without it, two \
+             tickvault instances can scale the SAME Groww account and the \
+             failure masquerades as provider throttle."
+        );
+        // The lock decision must happen BEFORE the fleet spawn in source
+        // order — gating after the spawn would be a false gate.
+        let lock_idx = main_rs
+            .find("acquire_groww_scale_fleet_lock(")
+            .expect("lock call site present (asserted above)");
+        let fleet_idx = main_rs
+            .find("spawn_groww_scale_fleet(")
+            .expect("main.rs must still spawn the scale fleet somewhere");
+        assert!(
+            lock_idx < fleet_idx,
+            "the fleet dual-instance lock must be acquired BEFORE \
+             spawn_groww_scale_fleet in main.rs source order \
+             (lock at byte {lock_idx}, fleet spawn at byte {fleet_idx})"
+        );
+    }
 }
