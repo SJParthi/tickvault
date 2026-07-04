@@ -218,6 +218,22 @@ pub struct GrowwScaleConfig {
     /// Default OFF — production keeps the off-hours ladder freeze.
     #[serde(default)]
     pub weekend_smoke: bool,
+    /// LOCAL-RUNTIME max-scale lab (operator 2026-07-04, `local-runtime`
+    /// branch only): when `true` the SCALE LANE builds its subscribe set from
+    /// the ENTIRE Groww master CSV (~100K rows) instead of the daily
+    /// indices+NTM watch set, bypassing the `[100, 1200]` universe envelope
+    /// for the scale lane ONLY. The single-connection path, the master
+    /// tables, and the Dhan feed are untouched. Default OFF — without the
+    /// scale-test overlay the binary is byte-identical.
+    #[serde(default)]
+    pub full_master_universe: bool,
+    /// Advance gate: host memory-used percentage must stay below this value
+    /// (the memory watermark the shipped CPU/disk gate set lacked). A breach
+    /// rolls the fleet back BEFORE the host becomes unusable. Probe
+    /// unavailable on a platform → gate honestly skipped (same contract as
+    /// CPU/disk).
+    #[serde(default = "default_groww_scale_gate_max_mem_used_pct")]
+    pub gate_max_mem_used_pct: f64,
 }
 
 fn default_groww_scale_target_connections() -> usize {
@@ -244,6 +260,9 @@ fn default_groww_scale_gate_max_capture_lag_ms() -> u64 {
 fn default_groww_scale_rollback_hold_base_minutes() -> u64 {
     10
 }
+fn default_groww_scale_gate_max_mem_used_pct() -> f64 {
+    85.0
+}
 fn default_groww_scale_advance_window_ist() -> [String; 2] {
     [String::from("09:20"), String::from("14:30")]
 }
@@ -263,6 +282,8 @@ impl Default for GrowwScaleConfig {
             advance_window_ist: default_groww_scale_advance_window_ist(),
             probe_mode: false,
             weekend_smoke: false,
+            full_master_universe: false,
+            gate_max_mem_used_pct: default_groww_scale_gate_max_mem_used_pct(),
         }
     }
 }
@@ -342,6 +363,15 @@ impl GrowwScaleConfig {
             bail!(
                 "feeds.groww.scale.gate_min_disk_free_pct must be a finite value in [0, 100), got {}",
                 self.gate_min_disk_free_pct
+            );
+        }
+        if !self.gate_max_mem_used_pct.is_finite()
+            || self.gate_max_mem_used_pct <= 0.0
+            || self.gate_max_mem_used_pct > 100.0
+        {
+            bail!(
+                "feeds.groww.scale.gate_max_mem_used_pct must be a finite value in (0, 100], got {}",
+                self.gate_max_mem_used_pct
             );
         }
         let parse_hm = |field: &str, value: &str| -> Result<NaiveTime> {
@@ -3487,6 +3517,49 @@ mod tests {
     #[test]
     fn test_groww_scale_validate_accepts_defaults() {
         assert!(GrowwScaleConfig::default().validate().is_ok());
+    }
+
+    /// local-runtime max-scale lab (operator 2026-07-04): the full-master
+    /// switch defaults OFF and the memory watermark defaults 85% — the
+    /// overlay-free binary stays byte-identical to the shipped Tier-A path.
+    #[test]
+    fn test_groww_scale_full_master_and_mem_gate_defaults() {
+        let scale = GrowwScaleConfig::default();
+        assert!(
+            !scale.full_master_universe,
+            "full-master universe must default OFF (lab overlay only)"
+        );
+        assert!((scale.gate_max_mem_used_pct - 85.0).abs() < f64::EPSILON);
+        // TOML round-trip for the new keys.
+        use figment::Figment;
+        use figment::providers::{Format, Toml};
+        let scale: GrowwScaleConfig = Figment::new()
+            .merge(Toml::string(concat!(
+                "enabled = true\n",
+                "full_master_universe = true\n",
+                "gate_max_mem_used_pct = 90.0\n",
+            )))
+            .extract()
+            .expect("new scale keys must parse");
+        assert!(scale.full_master_universe);
+        assert!((scale.gate_max_mem_used_pct - 90.0).abs() < f64::EPSILON);
+        assert!(scale.validate().is_ok());
+    }
+
+    /// The memory watermark must be a finite percentage in (0, 100].
+    #[test]
+    fn test_groww_scale_validate_rejects_bad_mem_gate() {
+        let mut scale = GrowwScaleConfig {
+            gate_max_mem_used_pct: 0.0,
+            ..GrowwScaleConfig::default()
+        };
+        assert!(scale.validate().is_err(), "0% mem gate rejected");
+        scale.gate_max_mem_used_pct = 101.0;
+        assert!(scale.validate().is_err(), ">100% mem gate rejected");
+        scale.gate_max_mem_used_pct = f64::NAN;
+        assert!(scale.validate().is_err(), "NaN mem gate rejected");
+        scale.gate_max_mem_used_pct = 85.0;
+        assert!(scale.validate().is_ok());
     }
 
     /// FINANCIAL/ENVELOPE BOUNDARY: per-conn cap 0 and >1000 (the Groww

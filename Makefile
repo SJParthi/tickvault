@@ -6,7 +6,7 @@
 # =============================================================================
 
 .PHONY: help run run-supervised stop build test check fmt clippy clean \
-        scale-test scale-probe scale-smoke scale-test-clean \
+        scale-test scale-probe scale-smoke scale-max scale-max-smoke scale-test-clean \
         docker-up docker-down docker-restart docker-status docker-logs questdb-init \
         health status open questdb questdb-prod questdb-autoopen-install questdb-autoopen-uninstall \
         jaeger prometheus traefik alloy loki \
@@ -61,6 +61,12 @@ scale-probe: ## Groww 2x600 cap-probe: per-conn vs per-account verdict — §34 
 
 scale-smoke: ## Groww weekend SMOKE run (market closed; machinery validation)
 	@bash scripts/groww-scale-test.sh smoke
+
+scale-max: ## Groww 100K MAX-SCALE LAB — full master, ladder to 100 conns (local-runtime branch)
+	@bash scripts/groww-scale-test.sh max
+
+scale-max-smoke: ## 100K max-scale config, weekend SMOKE (machinery-only dry run)
+	@bash scripts/groww-scale-test.sh max-smoke
 
 scale-test-clean: ## Remove the scale-test overlay from config/local.toml
 	@bash scripts/groww-scale-test.sh clean

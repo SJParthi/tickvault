@@ -149,6 +149,10 @@ pub struct GateInputs {
     pub cpu_pct: Option<f64>,
     /// Capture-volume free-disk percentage, if the probe is available.
     pub disk_free_pct: Option<f64>,
+    /// Host memory-used percentage, if the probe is available (local-runtime
+    /// max-scale lab 2026-07-04 — the watermark the shipped CPU/disk set
+    /// lacked; auto-abort must trip BEFORE the host becomes unusable).
+    pub mem_used_pct: Option<f64>,
     /// QuestDB drain healthy (ILP reachable, no sustained buffered growth).
     pub questdb_ok: bool,
     /// Max per-shard bridge behind-ness (file size − consumed offset), bytes.
@@ -265,6 +269,7 @@ pub const fn smoke_gate_inputs(
     auth_rejected: bool,
     cpu_pct: Option<f64>,
     disk_free_pct: Option<f64>,
+    mem_used_pct: Option<f64>,
 ) -> GateInputs {
     GateInputs {
         conns_ok: current,
@@ -273,6 +278,7 @@ pub const fn smoke_gate_inputs(
         capture_lag_ms_max: 0,
         cpu_pct,
         disk_free_pct,
+        mem_used_pct,
         questdb_ok: true,
         behind_bytes_max: 0,
     }
@@ -301,6 +307,11 @@ pub fn gate_failure_reason(inputs: &GateInputs, cfg: &GrowwScaleConfig) -> Optio
         && free <= cfg.gate_min_disk_free_pct
     {
         return Some("disk_low");
+    }
+    if let Some(mem) = inputs.mem_used_pct
+        && mem >= cfg.gate_max_mem_used_pct
+    {
+        return Some("mem_high");
     }
     if !inputs.questdb_ok {
         return Some("questdb_degraded");
@@ -442,6 +453,17 @@ pub const WATCH_SET_POLL_INTERVAL_SECS: u64 = 5;
 /// (mirrors the audit-read timeouts elsewhere in the app crate).
 pub const REHYDRATE_HTTP_TIMEOUT_SECS: u64 = 10;
 
+/// Max-scale lab (2026-07-04): bounded full-master fetch attempts before the
+/// ladder degrades LOUDLY to the daily activation watch set.
+pub const FULL_MASTER_FETCH_ATTEMPTS: u32 = 3;
+
+/// Backoff between full-master fetch attempts (cold boot path).
+pub const FULL_MASTER_FETCH_BACKOFF_SECS: u64 = 10;
+
+/// A shard connection counts as "capturing" in the stage summary when its
+/// tick file was written within this many seconds.
+pub const SUMMARY_CAPTURING_AGE_SECS: u64 = 60;
+
 /// Shared handles between the ladder (producer of `desired_conns`) and the
 /// fleet reconciler + operators (consumers).
 #[derive(Clone)]
@@ -528,6 +550,59 @@ pub async fn run_groww_scale_ladder(
             break entries;
         }
         tokio::time::sleep(std::time::Duration::from_secs(WATCH_SET_POLL_INTERVAL_SECS)).await;
+    };
+
+    // ── local-runtime MAX-SCALE LAB (operator 2026-07-04): when the
+    // full-master switch is ON, the scale lane's watch set is the ENTIRE
+    // Groww master (~100K rows), not the daily indices+NTM set. Bounded
+    // retry; on exhaustion fall back LOUDLY to the activation set so the
+    // run degrades to the shipped Tier-A behaviour instead of blocking.
+    let mut lab_fallback_reason: Option<&'static str> = None;
+    let entries = if cfg.full_master_universe {
+        let mut fetched = None;
+        for attempt in 1..=FULL_MASTER_FETCH_ATTEMPTS {
+            match tickvault_core::feed::groww::instruments::fetch_full_master_entries().await {
+                Ok((lab_entries, skipped)) => {
+                    info!(
+                        entries = lab_entries.len(),
+                        skipped,
+                        attempt,
+                        "[feeds] groww scale ladder: FULL-MASTER lab watch set built"
+                    );
+                    fetched = Some(std::sync::Arc::new(lab_entries));
+                    break;
+                }
+                Err(err) => {
+                    warn!(
+                        attempt,
+                        max_attempts = FULL_MASTER_FETCH_ATTEMPTS,
+                        error = ?err,
+                        "[feeds] groww scale ladder: full-master fetch attempt failed"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_secs(
+                        FULL_MASTER_FETCH_BACKOFF_SECS,
+                    ))
+                    .await;
+                }
+            }
+        }
+        match fetched {
+            Some(lab) => lab,
+            None => {
+                // Loud degrade — never a silent false-OK: the run continues
+                // on the ~767 activation set and every summary row records it.
+                error!(
+                    fallback_entries = entries.len(),
+                    "groww scale ladder: full-master fetch exhausted — DEGRADED \
+                     to the daily activation watch set (Tier-A scale only; the \
+                     100K lab goal is NOT exercised this run)"
+                );
+                lab_fallback_reason = Some("full_master_fetch_failed");
+                entries
+            }
+        }
+    } else {
+        entries
     };
 
     // ── Cut shards + write per-conn watch files for EVERY potential conn. ──
@@ -634,19 +709,23 @@ pub async fn run_groww_scale_ladder(
         let tick_age = feed_health.last_tick_age_secs(Feed::Groww, now_nanos);
         let feed_streaming = tick_age.is_some_and(|age| age < 60);
         let auth_rejected = feed_health.is_auth_rejected(Feed::Groww);
-        let (cpu_pct, disk_free_pct) = sample_host_probes(&shards_root);
-        if (cpu_pct.is_none() || disk_free_pct.is_none()) && !host_probe_warned {
+        let (cpu_pct, disk_free_pct, mem_used_pct) = sample_host_probes(&shards_root);
+        if (cpu_pct.is_none() || disk_free_pct.is_none() || mem_used_pct.is_none())
+            && !host_probe_warned
+        {
             host_probe_warned = true;
             warn!(
                 cpu_available = cpu_pct.is_some(),
                 disk_available = disk_free_pct.is_some(),
+                mem_available = mem_used_pct.is_some(),
                 "[feeds] groww scale ladder: host probe unavailable on this platform — \
-                 that gate is SKIPPED (honest envelope; Mac scale-test host has no /proc)"
+                 that gate is SKIPPED (honest envelope; Linux + macOS probes are wired, \
+                 anything else skips)"
             );
         }
         let inputs = if smoke {
             // Addendum C: tick-dependent gates skipped; auth + host stay real.
-            smoke_gate_inputs(current, auth_rejected, cpu_pct, disk_free_pct)
+            smoke_gate_inputs(current, auth_rejected, cpu_pct, disk_free_pct, mem_used_pct)
         } else {
             GateInputs {
                 conns_ok: if feed_streaming { current } else { 0 },
@@ -655,11 +734,15 @@ pub async fn run_groww_scale_ladder(
                 capture_lag_ms_max: tick_age.map_or(0, |s| s.saturating_mul(1_000)),
                 cpu_pct,
                 disk_free_pct,
+                mem_used_pct,
                 questdb_ok: true, // BOOT-01/02 + doctor own QuestDB health signals
                 behind_bytes_max: 0, // per-shard behind-ness: see snapshot rows
             }
         };
         let gate_failure = gate_failure_reason(&inputs, &cfg);
+        // Stage-summary trigger for this evaluation tick (max-scale lab):
+        // set by the transition arms, consumed after the snapshot builds.
+        let mut stage_outcome: Option<&'static str> = None;
 
         // ── Global-failure classification preempts the per-rung path. ──
         if auth_rejected && !feed_streaming && !smoke && state != LadderState::RollingBack {
@@ -694,6 +777,27 @@ pub async fn run_groww_scale_ladder(
             );
             hold_started = None;
             publish_state(state, current, cfg.target_connections);
+            let snapshot = build_scale_snapshot(
+                state,
+                current,
+                cfg.target_connections,
+                cfg.probe_mode,
+                smoke,
+                ceiling,
+                &shards_root,
+                now_nanos,
+            );
+            feed_runtime.set_groww_scale_snapshot(std::sync::Arc::new(snapshot.clone()));
+            emit_stage_summary(
+                &today,
+                "global_halved",
+                current,
+                cfg.target_connections,
+                ceiling,
+                &snapshot,
+                &inputs,
+                lab_fallback_reason,
+            );
             continue;
         }
 
@@ -744,6 +848,7 @@ pub async fn run_groww_scale_ladder(
                     hold_until =
                         Some(std::time::Instant::now() + std::time::Duration::from_secs(hold));
                     hold_started = None;
+                    stage_outcome = Some("rolled_back");
                     next
                 }
                 None => match state {
@@ -761,6 +866,7 @@ pub async fn run_groww_scale_ladder(
                                 &inputs,
                             )
                             .await;
+                            stage_outcome = Some("verified_healthy");
                         }
                         last_healthy = current;
                         consecutive_failures_at_rung = 0;
@@ -816,6 +922,7 @@ pub async fn run_groww_scale_ladder(
                                     &inputs,
                                 )
                                 .await;
+                                stage_outcome = Some("halted_at_ceiling");
                                 next_ladder_state(state, LadderEvent::CeilingReached)
                             }
                             _ => state,
@@ -844,6 +951,20 @@ pub async fn run_groww_scale_ladder(
             now_nanos,
         );
         feed_runtime.set_groww_scale_snapshot(std::sync::Arc::new(snapshot.clone()));
+
+        // ── Max-scale lab: one stage-summary row per rung transition. ──
+        if let Some(outcome) = stage_outcome {
+            emit_stage_summary(
+                &today,
+                outcome,
+                current,
+                cfg.target_connections,
+                ceiling,
+                &snapshot,
+                &inputs,
+                lab_fallback_reason,
+            );
+        }
 
         // ── §34 PR-3 (Item 11): emit the cap-probe verdict ONCE, when the ──
         // probe run reaches a terminal signal: HALTED_AT_CEILING (both rungs
@@ -883,6 +1004,16 @@ pub async fn run_groww_scale_ladder(
                 &inputs,
             )
             .await;
+            emit_stage_summary(
+                &today,
+                verdict.as_str(),
+                current,
+                cfg.target_connections,
+                ceiling,
+                &snapshot,
+                &inputs,
+                lab_fallback_reason,
+            );
         }
     }
 }
@@ -935,6 +1066,98 @@ fn build_scale_snapshot(
         probe_mode,
         smoke,
         connections,
+    }
+}
+
+/// Pure formatter for ONE stage-summary TSV row (max-scale lab 2026-07-04 —
+/// this becomes the operator's per-stage evidence table:
+/// stage | target | subscribed | actually-ticking | bytes | host | verdict).
+/// `ticks/sec` is deliberately NOT synthesized here — derive it from QuestDB
+/// (`select count() from ticks where feed='groww' and ts > ...`) per the
+/// runbook; a fabricated rate would violate the no-false-OK rule.
+#[must_use]
+#[allow(clippy::too_many_arguments)] // APPROVED: TSV row fields, one write site
+pub fn format_stage_summary_row(
+    ts_ist: &str,
+    outcome: &str,
+    conns: usize,
+    target: usize,
+    ceiling: usize,
+    snapshot: &tickvault_api::feed_state::GrowwScaleSnapshot,
+    inputs: &GateInputs,
+    degraded: Option<&str>,
+) -> String {
+    let proof = snapshot
+        .connections
+        .iter()
+        .filter(|c| c.subscribed_proof)
+        .count();
+    let capturing = snapshot
+        .connections
+        .iter()
+        .filter(|c| {
+            c.tick_file_bytes > 0
+                && c.last_capture_age_secs
+                    .is_some_and(|a| a <= SUMMARY_CAPTURING_AGE_SECS)
+        })
+        .count();
+    let tick_bytes: u64 = snapshot.connections.iter().map(|c| c.tick_file_bytes).sum();
+    let fmt_pct = |v: Option<f64>| v.map_or_else(|| "n/a".to_string(), |p| format!("{p:.1}"));
+    format!(
+        "{ts_ist}\t{outcome}\t{conns}\t{target}\t{ceiling}\t{proof}\t{capturing}\t{tick_bytes}\t{cpu}\t{mem}\t{disk}\t{degraded}\n",
+        cpu = fmt_pct(inputs.cpu_pct),
+        mem = fmt_pct(inputs.mem_used_pct),
+        disk = fmt_pct(inputs.disk_free_pct),
+        degraded = degraded.unwrap_or("-"),
+    )
+}
+
+/// Header line for the stage-summary TSV (written once per file).
+pub const STAGE_SUMMARY_HEADER: &str = "ts_ist\toutcome\tconns\ttarget\tceiling\tsubscribe_proof\tcapturing\ttick_bytes\tcpu_pct\tmem_used_pct\tdisk_free_pct\tdegraded\n";
+
+/// Appends one stage-summary row to `data/groww-scale/summary-<date>.tsv`
+/// AND mirrors it as an `info!` line. Best-effort forensic side-record —
+/// never gates a ladder decision; the audit table + gauges remain the
+/// primary evidence if the file is unwritable.
+// TEST-EXEMPT: thin fs append; the row formatter (format_stage_summary_row) is unit-tested.
+#[allow(clippy::too_many_arguments)] // APPROVED: summary fields, one call pattern
+fn emit_stage_summary(
+    today: &str,
+    outcome: &str,
+    conns: usize,
+    target: usize,
+    ceiling: usize,
+    snapshot: &tickvault_api::feed_state::GrowwScaleSnapshot,
+    inputs: &GateInputs,
+    degraded: Option<&str>,
+) {
+    use tracing::{info, warn};
+    let ts_ist = (chrono::Utc::now()
+        + chrono::TimeDelta::seconds(tickvault_common::constants::IST_UTC_OFFSET_SECONDS_I64))
+    .format("%Y-%m-%d %H:%M:%S")
+    .to_string();
+    let row = format_stage_summary_row(
+        &ts_ist, outcome, conns, target, ceiling, snapshot, inputs, degraded,
+    );
+    info!(summary_row = %row.trim_end(), "[feeds] groww scale STAGE SUMMARY");
+    let dir = std::path::Path::new("data/groww-scale");
+    let path = dir.join(format!("summary-{today}.tsv"));
+    let write = || -> std::io::Result<()> {
+        std::fs::create_dir_all(dir)?;
+        let fresh = !path.exists();
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)?;
+        use std::io::Write as _;
+        if fresh {
+            file.write_all(STAGE_SUMMARY_HEADER.as_bytes())?;
+        }
+        file.write_all(row.as_bytes())
+    };
+    if let Err(err) = write() {
+        warn!(error = %err, path = %path.display(),
+            "groww scale stage-summary file append skipped (info! mirror + audit rows carry the evidence)");
     }
 }
 
@@ -1034,17 +1257,151 @@ async fn rehydrate_last_healthy(
     Some(resume_conns_from_audit(&audit_rows, 1))
 }
 
-/// Host probes for the advance gate. `None` = probe unavailable on this
-/// platform (Mac) → the gate is honestly skipped. Linux: /proc/loadavg as a
-/// CPU proxy (1-min load / cores × 100) + the spill-dir statvfs free pct via
-/// the storage disk probe.
+/// Parses a loadavg text (`"1.52 1.40 1.30 ..."` — Linux `/proc/loadavg` and
+/// the brace-stripped macOS `sysctl -n vm.loadavg` share this shape) into a
+/// CPU percentage: 1-min load / cores × 100. Pure; `None` on garbage.
+#[must_use]
+pub fn parse_loadavg_pct(text: &str, cores: usize) -> Option<f64> {
+    if cores == 0 {
+        return None;
+    }
+    let first = text
+        .split_whitespace()
+        .find(|tok| !tok.starts_with('{') && !tok.ends_with('}'))?;
+    let load: f64 = first.parse().ok()?;
+    if !load.is_finite() || load < 0.0 {
+        return None;
+    }
+    // APPROVED: ratio display only
+    #[allow(clippy::cast_precision_loss)]
+    Some((load / cores as f64) * 100.0)
+}
+
+/// Parses Linux `/proc/meminfo` into memory-used percent:
+/// `(1 − MemAvailable/MemTotal) × 100`. Pure; `None` on missing fields.
+#[must_use]
+pub fn parse_meminfo_used_pct(meminfo: &str) -> Option<f64> {
+    fn field_kb(meminfo: &str, name: &str) -> Option<f64> {
+        meminfo
+            .lines()
+            .find(|l| l.starts_with(name))?
+            .split_whitespace()
+            .nth(1)?
+            .parse::<f64>()
+            .ok()
+    }
+    let total = field_kb(meminfo, "MemTotal:")?;
+    let avail = field_kb(meminfo, "MemAvailable:")?;
+    if total <= 0.0 || !total.is_finite() || !avail.is_finite() {
+        return None;
+    }
+    Some(((1.0 - (avail / total).min(1.0)) * 100.0).max(0.0))
+}
+
+/// Parses macOS `vm_stat` output into memory-used percent given the host's
+/// total bytes (`sysctl -n hw.memsize`). Available ≈ (free + inactive +
+/// speculative + purgeable) pages × page size — the standard Mac watermark
+/// approximation (macOS keeps "free" deliberately low). Pure; `None` on
+/// garbage.
+#[must_use]
+pub fn parse_vm_stat_used_pct(vm_stat: &str, total_bytes: u64) -> Option<f64> {
+    if total_bytes == 0 {
+        return None;
+    }
+    // "Mach Virtual Memory Statistics: (page size of 16384 bytes)"
+    let page_size: f64 = vm_stat
+        .lines()
+        .next()?
+        .split("page size of ")
+        .nth(1)?
+        .split_whitespace()
+        .next()?
+        .parse()
+        .ok()?;
+    fn pages(vm_stat: &str, name: &str) -> f64 {
+        vm_stat
+            .lines()
+            .find(|l| l.trim_start().starts_with(name))
+            .and_then(|l| l.rsplit(':').next())
+            .and_then(|v| v.trim().trim_end_matches('.').parse::<f64>().ok())
+            .unwrap_or(0.0)
+    }
+    let available_pages = pages(vm_stat, "Pages free")
+        + pages(vm_stat, "Pages inactive")
+        + pages(vm_stat, "Pages speculative")
+        + pages(vm_stat, "Pages purgeable");
+    // APPROVED: ratio display only
+    #[allow(clippy::cast_precision_loss)]
+    let total = total_bytes as f64;
+    let avail_frac = ((available_pages * page_size) / total).min(1.0);
+    Some(((1.0 - avail_frac) * 100.0).max(0.0))
+}
+
+/// Shells a command and returns trimmed stdout (cold path, 30s ladder tick).
+#[cfg(target_os = "macos")]
+fn shell_stdout(cmd: &str, args: &[&str]) -> Option<String> {
+    let out = std::process::Command::new(cmd).args(args).output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+/// CPU probe: Linux `/proc/loadavg`; macOS `sysctl -n vm.loadavg` (the Mac
+/// scale-test host is no longer a skipped gate — local-runtime lab
+/// 2026-07-04). `None` elsewhere / on failure → gate honestly skipped.
+// TEST-EXEMPT: platform I/O shim; the pure parser (parse_loadavg_pct) and the consuming gate logic are unit-tested.
+#[cfg(target_os = "linux")]
+fn sample_cpu_pct() -> Option<f64> {
+    let cores = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
+    parse_loadavg_pct(&std::fs::read_to_string("/proc/loadavg").ok()?, cores)
+}
+
+/// CPU probe (macOS): `sysctl -n vm.loadavg` yields "{ 1.52 1.40 1.30 }" —
+/// the parser skips the braces. The Mac scale-test host is no longer a
+/// skipped gate (local-runtime lab 2026-07-04).
+// TEST-EXEMPT: platform I/O shim; the pure parser (parse_loadavg_pct) and the consuming gate logic are unit-tested.
+#[cfg(target_os = "macos")]
+fn sample_cpu_pct() -> Option<f64> {
+    let cores = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
+    parse_loadavg_pct(&shell_stdout("sysctl", &["-n", "vm.loadavg"])?, cores)
+}
+
+/// CPU probe (other platforms): unavailable → gate honestly skipped.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn sample_cpu_pct() -> Option<f64> {
+    None
+}
+
+/// Memory-used probe (Linux): `/proc/meminfo`.
+// TEST-EXEMPT: platform I/O shim; the pure parser (parse_meminfo_used_pct) and the consuming gate logic are unit-tested.
+#[cfg(target_os = "linux")]
+fn sample_mem_used_pct() -> Option<f64> {
+    parse_meminfo_used_pct(&std::fs::read_to_string("/proc/meminfo").ok()?)
+}
+
+/// Memory-used probe (macOS): `vm_stat` + `sysctl -n hw.memsize`.
+// TEST-EXEMPT: platform I/O shim; the pure parser (parse_vm_stat_used_pct) and the consuming gate logic are unit-tested.
+#[cfg(target_os = "macos")]
+fn sample_mem_used_pct() -> Option<f64> {
+    let total: u64 = shell_stdout("sysctl", &["-n", "hw.memsize"])?
+        .parse()
+        .ok()?;
+    parse_vm_stat_used_pct(&shell_stdout("vm_stat", &[])?, total)
+}
+
+/// Memory-used probe (other platforms): unavailable → gate honestly skipped.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn sample_mem_used_pct() -> Option<f64> {
+    None
+}
+
+/// Host probes for the advance gate: `(cpu_pct, disk_free_pct, mem_used_pct)`.
+/// `None` = probe unavailable on this platform → the gate is honestly
+/// skipped, never silently passed as a measured value and never fail-closed.
 // TEST-EXEMPT: platform I/O probe; the consuming gate logic (gate_failure_reason with Option inputs) is unit-tested for both Some and None arms.
-fn sample_host_probes(dir: &std::path::Path) -> (Option<f64>, Option<f64>) {
-    let cpu = std::fs::read_to_string("/proc/loadavg").ok().and_then(|s| {
-        let load: f64 = s.split_whitespace().next()?.parse().ok()?;
-        let cores = std::thread::available_parallelism().map_or(1, std::num::NonZero::get) as f64;
-        Some((load / cores) * 100.0)
-    });
+fn sample_host_probes(dir: &std::path::Path) -> (Option<f64>, Option<f64>, Option<f64>) {
+    let cpu = sample_cpu_pct();
     let disk = match tickvault_storage::disk_health_watcher::probe_disk_free_bytes(dir) {
         tickvault_storage::disk_health_watcher::DiskHealthOutcome::Ok {
             free_bytes,
@@ -1056,7 +1413,7 @@ fn sample_host_probes(dir: &std::path::Path) -> (Option<f64>, Option<f64>) {
         }
         _ => None,
     };
-    (cpu, disk)
+    (cpu, disk, sample_mem_used_pct())
 }
 
 #[cfg(test)]
@@ -1075,6 +1432,7 @@ mod tests {
             capture_lag_ms_max: 100,
             cpu_pct: Some(20.0),
             disk_free_pct: Some(60.0),
+            mem_used_pct: Some(40.0),
             questdb_ok: true,
             behind_bytes_max: 1024,
         }
@@ -1267,6 +1625,142 @@ mod tests {
         assert_eq!(gate_failure_reason(&i, &cfg()), None);
     }
 
+    /// Max-scale lab (2026-07-04): the memory watermark gates at the
+    /// configured percentage and is honestly skipped when unavailable.
+    #[test]
+    fn test_gate_mem_high_and_unavailable_probe_skips() {
+        let mut i = green_inputs();
+        i.mem_used_pct = Some(cfg().gate_max_mem_used_pct);
+        assert_eq!(gate_failure_reason(&i, &cfg()), Some("mem_high"));
+        i.mem_used_pct = Some(cfg().gate_max_mem_used_pct - 0.1);
+        assert_eq!(gate_failure_reason(&i, &cfg()), None);
+        i.mem_used_pct = None; // probe unavailable → gate honestly skipped
+        assert_eq!(gate_failure_reason(&i, &cfg()), None);
+    }
+
+    // ── Max-scale lab: pure host-probe parsers (Linux + macOS shapes) ──
+
+    #[test]
+    fn test_parse_loadavg_pct() {
+        // test coverage (pub-fn-test-guard line): parse_loadavg_pct
+        // Linux /proc/loadavg shape.
+        assert_eq!(
+            parse_loadavg_pct("1.00 0.80 0.60 2/345 6789", 2),
+            Some(50.0)
+        );
+        // macOS `sysctl -n vm.loadavg` shape (braces skipped).
+        assert_eq!(parse_loadavg_pct("{ 2.00 1.50 1.20 }", 4), Some(50.0));
+        // Garbage / zero cores → None (gate skipped, never a fake value).
+        assert_eq!(parse_loadavg_pct("not a load", 4), None);
+        assert_eq!(parse_loadavg_pct("1.0 1.0 1.0", 0), None);
+        assert_eq!(parse_loadavg_pct("-1.0 0 0", 4), None);
+    }
+
+    #[test]
+    fn test_parse_meminfo_used_pct() {
+        // test coverage (pub-fn-test-guard line): parse_meminfo_used_pct
+        let meminfo = "MemTotal:       16384000 kB\nMemFree:         1000000 kB\nMemAvailable:    4096000 kB\n";
+        let used = parse_meminfo_used_pct(meminfo).expect("parses");
+        assert!(
+            (used - 75.0).abs() < 0.01,
+            "1 - 4096/16384 = 75%, got {used}"
+        );
+        assert_eq!(parse_meminfo_used_pct("MemTotal: 100 kB\n"), None);
+        assert_eq!(parse_meminfo_used_pct(""), None);
+    }
+
+    #[test]
+    fn test_parse_vm_stat_used_pct() {
+        // test coverage (pub-fn-test-guard line): parse_vm_stat_used_pct
+        let vm_stat = concat!(
+            "Mach Virtual Memory Statistics: (page size of 16384 bytes)\n",
+            "Pages free:                              100000.\n",
+            "Pages active:                            500000.\n",
+            "Pages inactive:                          100000.\n",
+            "Pages speculative:                        30000.\n",
+            "Pages purgeable:                          20000.\n",
+        );
+        // available = 250_000 pages × 16384 B = 4_096_000_000 B of 16_384_000_000 B
+        // → 25% available → 75% used.
+        let used = parse_vm_stat_used_pct(vm_stat, 16_384_000_000).expect("parses");
+        assert!((used - 75.0).abs() < 0.01, "expected 75%, got {used}");
+        // Zero total / garbage → None.
+        assert_eq!(parse_vm_stat_used_pct(vm_stat, 0), None);
+        assert_eq!(parse_vm_stat_used_pct("garbage", 1), None);
+    }
+
+    // ── Max-scale lab: stage-summary row formatter ──
+
+    #[test]
+    fn test_format_stage_summary_row() {
+        // test coverage (pub-fn-test-guard line): format_stage_summary_row
+        let snapshot = tickvault_api::feed_state::GrowwScaleSnapshot {
+            ladder_state: "holding",
+            desired_conns: 2,
+            target_conns: 100,
+            probe_mode: false,
+            smoke: false,
+            connections: vec![
+                tickvault_api::feed_state::GrowwScaleConnRow {
+                    conn_id: 0,
+                    desired: true,
+                    subscribed_proof: true,
+                    tick_file_bytes: 1024,
+                    last_capture_age_secs: Some(5),
+                },
+                tickvault_api::feed_state::GrowwScaleConnRow {
+                    conn_id: 1,
+                    desired: true,
+                    subscribed_proof: true,
+                    tick_file_bytes: 2048,
+                    last_capture_age_secs: Some(600), // stale → NOT capturing
+                },
+                tickvault_api::feed_state::GrowwScaleConnRow {
+                    conn_id: 2,
+                    desired: false,
+                    subscribed_proof: false,
+                    tick_file_bytes: 0,
+                    last_capture_age_secs: None,
+                },
+            ],
+        };
+        let row = format_stage_summary_row(
+            "2026-07-06 09:50:00",
+            "verified_healthy",
+            2,
+            100,
+            100,
+            &snapshot,
+            &green_inputs(),
+            None,
+        );
+        assert_eq!(
+            row,
+            "2026-07-06 09:50:00\tverified_healthy\t2\t100\t100\t2\t1\t3072\t20.0\t40.0\t60.0\t-\n"
+        );
+        // Degraded-run marker + n/a probes round-trip.
+        let mut inputs = green_inputs();
+        inputs.cpu_pct = None;
+        inputs.mem_used_pct = None;
+        let row = format_stage_summary_row(
+            "2026-07-06 09:50:00",
+            "rolled_back",
+            1,
+            100,
+            100,
+            &snapshot,
+            &inputs,
+            Some("full_master_fetch_failed"),
+        );
+        assert!(row.contains("\tn/a\t"));
+        assert!(row.ends_with("\tfull_master_fetch_failed\n"));
+        // Header column count matches row column count.
+        assert_eq!(
+            STAGE_SUMMARY_HEADER.trim_end().split('\t').count(),
+            row.trim_end().split('\t').count()
+        );
+    }
+
     #[test]
     fn test_gate_questdb_and_behind() {
         let mut i = green_inputs();
@@ -1371,19 +1865,22 @@ mod tests {
         let c = cfg();
         // Healthy smoke: no auth reject, healthy host → every gate passes
         // even though zero ticks exist (market closed).
-        let ok = smoke_gate_inputs(2, false, Some(20.0), Some(60.0));
+        let ok = smoke_gate_inputs(2, false, Some(20.0), Some(60.0), Some(40.0));
         assert_eq!(gate_failure_reason(&ok, &c), None);
         // Auth reject stays a REAL failure in smoke.
-        let auth = smoke_gate_inputs(2, true, Some(20.0), Some(60.0));
+        let auth = smoke_gate_inputs(2, true, Some(20.0), Some(60.0), Some(40.0));
         assert!(gate_failure_reason(&auth, &c).is_some());
         // Host CPU gate stays REAL in smoke.
-        let hot = smoke_gate_inputs(2, false, Some(99.0), Some(60.0));
+        let hot = smoke_gate_inputs(2, false, Some(99.0), Some(60.0), Some(40.0));
         assert!(gate_failure_reason(&hot, &c).is_some());
         // Host disk gate stays REAL in smoke.
-        let full = smoke_gate_inputs(2, false, Some(20.0), Some(1.0));
+        let full = smoke_gate_inputs(2, false, Some(20.0), Some(1.0), Some(40.0));
         assert!(gate_failure_reason(&full, &c).is_some());
-        // Unavailable host probes are honestly skipped in smoke too (Mac).
-        let mac = smoke_gate_inputs(2, false, None, None);
+        // Host MEMORY watermark stays REAL in smoke (max-scale lab).
+        let ram = smoke_gate_inputs(2, false, Some(20.0), Some(60.0), Some(99.0));
+        assert!(gate_failure_reason(&ram, &c).is_some());
+        // Unavailable host probes are honestly skipped in smoke too.
+        let mac = smoke_gate_inputs(2, false, None, None, None);
         assert_eq!(gate_failure_reason(&mac, &c), None);
     }
 

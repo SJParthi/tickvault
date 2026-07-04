@@ -33,7 +33,20 @@ ONLY AWS interaction is the read-only SSM read of the Groww token
 | Full ladder run (trading day) | `make scale-test` |
 | 2×600 cap-probe (per-conn vs per-account verdict) | `make scale-probe` |
 | Weekend / holiday machinery validation | `make scale-smoke` |
+| **100K MAX-SCALE LAB** (local-runtime branch; full master, ladder to 100 conns) | `make scale-max` |
+| Max-scale config, weekend SMOKE (machinery-only dry run) | `make scale-max-smoke` |
 | Remove the harness config overlay afterwards | `make scale-test-clean` |
+
+`DRY_RUN=1` before any command writes/show the overlay without starting
+Docker or the app (harness validation on any machine).
+
+**Composition with the local-runtime branch overlay:** that branch pins its
+own `[feeds]` table in `config/local.toml` (Dhan + Groww ON for the normal
+local window — see `README-LOCAL.md`). TOML forbids a duplicate `[feeds]`
+table, so during scale runs the harness overrides the keys IN PLACE
+(`dhan_enabled = false # scale-override(was: true)`) — the run is PURELY
+GROWW per the operator's 2026-07-04 directive — and `make scale-test-clean`
+restores the original values exactly.
 
 Each command: writes a marker-delimited overlay block into
 `config/local.toml` (Dhan OFF, Groww ON, scale ON + the mode flags), starts
@@ -107,6 +120,88 @@ never mistaken for a live validation. While the market is open,
 | Shard overlap detected | ladder step HALTS fail-closed (cutter bug — should be unreachable) | GROWW-SCALE-03 |
 | Audit row write fails | ladder continues; row re-appends next transition | GROWW-SCALE-04 |
 
+## 100K MAX-SCALE LAB (local-runtime branch — operator 2026-07-04)
+
+> **Authorization (verbatim, 2026-07-04):** "check the dynamic scaling
+> connections and subscribing entirely the 100k instruments... the max to
+> check whether we can fetch the entire 100k or not" — LOCAL-ONLY, on the
+> `local-runtime` branch (never merges to main; main's scope locks are
+> untouched). Operator update the same day: the experiment is **PURELY
+> GROWW** — Dhan stays OFF for the whole run (the overlay writes
+> `dhan_enabled = false`).
+
+What `make scale-max` changes vs the normal ladder:
+
+| Knob | Normal ladder | Max-scale lab |
+|---|---|---|
+| Watch set | daily indices+NTM (~767, [100,1200] envelope) | **FULL Groww master** (~100K rows → shard-cuttable entries) |
+| Ladder rungs (connections) | `[1, 2, 5, 10]` | `[1, 2, 5, 10, 20, 40, 80, 100]` |
+| Target | 10 conns | 100 conns × 1000/conn = 100K |
+| Memory gate | 85% used | **75% used** (~36 GB of the M4 Pro's 48 GB — macOS keeps headroom) |
+| QuestDB container memory | 4g | 8g |
+
+The FSM itself is unchanged — the shipped probe-first pace applies: each
+rung must hold every gate green for 15 minutes inside the advance window
+before the next rung fires, so the earliest 100-conn arrival is ~7 stages
+after the first verified rung.
+
+**Fail-closed "subscribe what exists":** if the master yields fewer
+entries than 100K, the ladder's ceiling clamps to the shard count, halts
+at ceiling there, and the ACTUAL count is recorded (audit rows + the
+stage-summary TSV). If the full-master download fails 3 times, the run
+degrades LOUDLY to the daily ~767 set (summary rows carry
+`full_master_fetch_failed` in the `degraded` column) — capture continues,
+the 100K question just stays unanswered that day.
+
+### Mac hardware prerequisites (operator's MacBook Pro, M4 Pro, 14c/48 GB)
+
+- **≥ 50 GB free SSD** before starting — ~100K SIDs of NDJSON capture +
+  QuestDB grows fast; the disk gate AUTO-ABORTS (rolls the fleet back) if
+  free space drops below 20% of the volume.
+- Memory watermark 75%: the ladder rolls back BEFORE the Mac becomes
+  unusable (~36 GB used). CPU gate 70% of the 14 cores. Both probes are
+  live on macOS (`sysctl vm.loadavg` / `vm_stat`) — no longer skipped.
+
+### Monday 2026-07-06 sequence (IST)
+
+| Time | Action | Why |
+|---|---|---|
+| 09:15 | Normal boot NOT needed for the lab — but if the Mac is already running the normal Groww profile, `Ctrl-C` it first | one app instance at a time |
+| 09:45 | `make scale-probe` — the **make-or-break** 2×600 probe | answers per-CONNECTION vs per-ACCOUNT before any big ladder run; 09:45 avoids the open burst |
+| ~10:05 | Read the ProbeVerdict line (also in `groww_scale_audit`, `outcome='probe_verdict'`) | see the verdict table above |
+| verdict `probe_multi_conn_ok` | `Ctrl-C`, then `make scale-max` | full ladder toward 100K; advance window 09:20–14:30 |
+| verdict `probe_per_account_limited` | STOP — do NOT run `scale-max`; record with a dated note | the account streams one session; laddering would just storm GROWW-SCALE-02 |
+| verdict `probe_inconclusive` | fix the base feed (token/entitlement/network) and re-probe | not a limit signal |
+| through the day | watch `GET /api/feeds/health .groww_scale` + `data/groww-scale/summary-<date>.tsv` | per-stage evidence accrues automatically |
+| any time | `Ctrl-C` then `make scale-test-clean` | full stop + overlay removal |
+
+Tuesday: read the evidence (below) and decide whether Wednesday re-runs a
+tuned ladder.
+
+### Where the evidence lands (the Tuesday table)
+
+| Evidence | Where |
+|---|---|
+| Per-stage summary rows: `ts | outcome | conns | target | ceiling | subscribe_proof | capturing | tick_bytes | cpu% | mem% | disk_free% | degraded` | `data/groww-scale/summary-<date>.tsv` (+ mirrored as `info!` log lines) |
+| Every rung transition (forensic) | `groww_scale_audit` table — `select * from groww_scale_audit order by ts` |
+| Live per-conn panel | `curl -s http://127.0.0.1:3001/api/feeds/health \| jq .groww_scale` |
+| Ticks/sec per stage (derive, never synthesized) | QuestDB: `select count() from ticks where feed = 'groww' and ts > dateadd('m', -1, now())` |
+| Per-conn capture files | `ls -la data/groww/shards/c*/` |
+
+### Auto-abort semantics (what stops the ladder by itself)
+
+| Trigger | Action | Signal |
+|---|---|---|
+| Memory used ≥ 75% of 48 GB | rollback to last healthy rung + expo hold | `GROWW-SCALE-01`, reason `mem_high` |
+| CPU load ≥ 70% of 14 cores | same | reason `cpu_high` |
+| Disk free ≤ 20% of the volume | same | reason `disk_low` |
+| Capture lag > 30s / bridge behind > 4 MiB | same | reason `capture_lag` / `bridge_behind` |
+| ALL conns fail within 60s (provider throttle) | 5-min cooldown + HALVE the fleet | `GROWW-SCALE-02` |
+| Repeated failure at the same rung | exponential hold `10m → 4h`, retry below the discovered ceiling | audit rows show the discovered cap |
+
+Manual stop at any moment: `Ctrl-C` (the app), then `make scale-test-clean`
+(removes the overlay so the next boot is the normal single-conn profile).
+
 ## Honest envelope
 
 100% inside the tested envelope, with ratcheted regression coverage: the
@@ -116,3 +211,11 @@ the last verified rung after a restart. NOT claimed: Groww's server-side
 per-account/per-connection limits — discovering them IS this experiment;
 a persistent provider reject surfaces as a repeating GROWW-SCALE-02, which
 is the honest signal, not a silent workaround.
+
+Max-scale lab additions to the envelope: whether Groww streams anything
+close to 100K instruments to one account is UNKNOWN until the live Monday
+run — the ladder discovers and holds below whatever the provider allows;
+the sidecar's Python hop is not O(1) (existing §32 envelope); the summary
+TSV is a best-effort forensic side-record (the audit table + gauges are
+primary). The 75%/70%/20% Mac gates bound the blast radius on the host —
+they do not make the provider accept more connections.

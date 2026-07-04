@@ -79,6 +79,16 @@ After the close (15:31 IST cross-verify + digest run automatically):
 make stop            # stop the app when you're done for the day
 ```
 
+## Groww 100K max-scale lab (Mon Jul 6 – Wed Jul 8)
+
+This branch also hosts the PURELY-GROWW max-scale experiment (operator
+2026-07-04): `make scale-probe` (the Monday 09:45 2×600 make-or-break) and
+`make scale-max` (full master, ladder to 100 connections). During scale
+runs the harness flips `dhan_enabled` OFF in place (restored by
+`make scale-test-clean`) — the feeds-ON overlay above applies to the
+NORMAL local window only. Full sequence + evidence locations:
+`docs/runbooks/groww-scale-test.md` ("100K MAX-SCALE LAB" section).
+
 ## Where the data lives
 
 Everything is on the Mac, under the repo:

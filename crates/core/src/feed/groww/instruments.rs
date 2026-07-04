@@ -883,6 +883,124 @@ pub async fn build_and_write_groww_watch(
     Ok(set)
 }
 
+// ---------------------------------------------------------------------------
+// local-runtime MAX-SCALE LAB (operator 2026-07-04, `local-runtime` branch
+// ONLY — never merges to main). The §34 ladder shards whatever watch set it
+// is handed; the daily indices+NTM set (~767, [100,1200]-enveloped) can never
+// need more than 1 connection. To exercise the 100K goal the scale lane needs
+// the ENTIRE Groww master as its watch set. These two fns provide exactly
+// that, behind `feeds.groww.scale.full_master_universe = true` (default OFF).
+// The [100,1200] envelope is DELIBERATELY not applied here — it bounds the
+// production subscription universe, not the lab's discovery set; the ladder's
+// own `effective_ceiling` + `target_connections × instruments_per_conn`
+// bound the subscribed subset (subscribe what exists, record actual).
+// ---------------------------------------------------------------------------
+
+/// Pure full-master watch-set builder (max-scale lab). Maps EVERY usable
+/// Groww master row to a [`WatchEntry`]:
+///
+/// - `instrument_type == "IDX"` → [`WatchKind::IndexValue`] with the stable
+///   Groww-native index id (`stable_index_security_id`), same as the daily
+///   builder — an index tick from the lab set folds identically.
+/// - every other row with a NUMERIC `exchange_token` → [`WatchKind::Ltp`]
+///   with `security_id = token` (stocks + FNO derivatives).
+/// - rows with an empty or non-numeric token (non-IDX) are SKIPPED and
+///   counted — never a `security_id = 0` entry.
+///
+/// Output is deduped by the shard cutter's fail-closed identity
+/// `(exchange, segment, security_id)` and sorted in the cutter's own
+/// deterministic order, so `cut_shards` can never reject the set for
+/// upstream duplicates (GROWW-SCALE-03 stays a genuine-bug signal).
+///
+/// Returns `(entries, skipped_rows)` — `skipped_rows` counts unusable +
+/// duplicate-identity rows so the caller can log the honest delta between
+/// master rows and subscribable entries.
+///
+/// O(1) EXEMPT: cold-path, once per scale-lab boot (~100K rows), never the
+/// per-tick path.
+///
+/// # Errors
+/// [`WatchBuildError::GrowwMasterEmpty`] when the CSV parses to zero usable
+/// entries (missing header propagates the parser's own error).
+pub fn full_master_entries_from_csv(
+    groww_csv: &str,
+) -> Result<(Vec<WatchEntry>, usize), WatchBuildError> {
+    let rows = parse_groww_master(groww_csv)?;
+    let total = rows.len();
+    let mut entries: Vec<WatchEntry> = Vec::with_capacity(total);
+    for r in rows {
+        if r.exchange_token.is_empty() || r.exchange.is_empty() {
+            continue;
+        }
+        if r.instrument_type == "IDX" {
+            entries.push(WatchEntry {
+                exchange: r.exchange.clone(),
+                segment: if r.segment.is_empty() {
+                    "CASH".to_string()
+                } else {
+                    r.segment.clone()
+                },
+                exchange_token: r.exchange_token.clone(),
+                kind: WatchKind::IndexValue,
+                security_id: stable_index_security_id(&r.groww_symbol),
+                isin: None,
+                symbol_name: (!r.name.is_empty()).then(|| r.name.clone()),
+                index_name: Some(r.groww_symbol.clone()),
+            });
+        } else if let Ok(token) = r.exchange_token.parse::<i64>() {
+            if token <= 0 {
+                continue; // 0/negative token can never be a valid identity
+            }
+            entries.push(WatchEntry {
+                exchange: r.exchange.clone(),
+                segment: if r.segment.is_empty() {
+                    "CASH".to_string()
+                } else {
+                    r.segment.clone()
+                },
+                exchange_token: r.exchange_token.clone(),
+                kind: WatchKind::Ltp,
+                security_id: token,
+                isin: (!r.isin.is_empty()).then(|| r.isin.clone()),
+                symbol_name: (!r.name.is_empty()).then(|| r.name.clone()),
+                index_name: None,
+            });
+        }
+        // non-IDX row with a non-numeric token: skipped (counted below).
+    }
+    // Cutter-order sort + fail-closed-identity dedup (keep first occurrence).
+    entries.sort_by(|a, b| {
+        (a.exchange.as_str(), a.segment.as_str(), a.security_id).cmp(&(
+            b.exchange.as_str(),
+            b.segment.as_str(),
+            b.security_id,
+        ))
+    });
+    entries.dedup_by(|a, b| {
+        a.exchange == b.exchange && a.segment == b.segment && a.security_id == b.security_id
+    });
+    if entries.is_empty() {
+        return Err(WatchBuildError::GrowwMasterEmpty);
+    }
+    let skipped = total.saturating_sub(entries.len());
+    Ok((entries, skipped))
+}
+
+/// Downloads the Groww master CSV (hardened client, same §18-parity policy as
+/// the daily builder) and builds the full-master lab watch set. One attempt;
+/// the ladder wraps this in its bounded retry + loud fallback.
+///
+/// # Errors
+/// [`WatchBuildError::FetchFailed`] on download failure; builder errors
+/// propagate from [`full_master_entries_from_csv`].
+// TEST-EXEMPT: network download orchestration; the pure builder it composes (full_master_entries_from_csv) is unit-tested below.
+pub async fn fetch_full_master_entries() -> Result<(Vec<WatchEntry>, usize), WatchBuildError> {
+    let client = hardened_client()?;
+    info!("groww max-scale lab: downloading FULL Groww master instrument.csv");
+    let csv = fetch_text_hardened(&client, GROWW_INSTRUMENT_CSV_URL).await?;
+    full_master_entries_from_csv(&csv)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -928,6 +1046,116 @@ mod tests {
         assert_eq!(json["entries"][0]["exchange_token"], "2885");
         assert_eq!(json["entries"][1]["exchange_token"], "NIFTY");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── local-runtime max-scale lab: full-master builder (2026-07-04) ──
+
+    const LAB_HEADER: &str =
+        "exchange,exchange_token,groww_symbol,name,instrument_type,segment,series,isin";
+
+    fn lab_csv(rows: &[&str]) -> String {
+        let mut s = String::from(LAB_HEADER);
+        for r in rows {
+            s.push('\n');
+            s.push_str(r);
+        }
+        s
+    }
+
+    #[test]
+    fn test_full_master_entries_from_csv_builds_all_kinds() {
+        // test coverage (pub-fn-test-guard line): full_master_entries_from_csv
+        let csv = lab_csv(&[
+            "NSE,NIFTY,NSE-NIFTY,NIFTY 50,IDX,CASH,,",
+            "NSE,2885,NSE-RELIANCE,Reliance,EQ,CASH,EQ,INE002A01018",
+            "NSE,55555,NSE-NIFTY-FUT,Nifty Fut,FUT,FNO,,",
+            "NSE,66666,NSE-NIFTY-CE,Nifty CE,CE,FNO,,",
+            "BSE,1,BSE-SENSEX,SENSEX,IDX,CASH,,",
+        ]);
+        let (entries, skipped) = full_master_entries_from_csv(&csv).expect("builds");
+        assert_eq!(entries.len(), 5);
+        assert_eq!(skipped, 0);
+        let idx: Vec<&WatchEntry> = entries
+            .iter()
+            .filter(|e| matches!(e.kind, WatchKind::IndexValue))
+            .collect();
+        assert_eq!(idx.len(), 2, "both IDX rows become index_value entries");
+        assert!(idx.iter().all(|e| e.security_id >= INDEX_SECURITY_ID_BIT));
+        let fno = entries.iter().filter(|e| e.segment == "FNO").count();
+        assert_eq!(fno, 2, "derivatives are included in the lab set");
+        let rel = entries
+            .iter()
+            .find(|e| e.exchange_token == "2885")
+            .expect("stock present");
+        assert_eq!(rel.security_id, 2885);
+        assert!(matches!(rel.kind, WatchKind::Ltp));
+        assert_eq!(rel.isin.as_deref(), Some("INE002A01018"));
+    }
+
+    #[test]
+    fn test_full_master_entries_dedup_and_order() {
+        // Duplicate (exchange, segment, security_id) must collapse to ONE
+        // entry so cut_shards' fail-closed identity check can never reject
+        // the lab set for upstream duplicates; order must match the cutter's
+        // (exchange, segment, security_id) sort.
+        let csv = lab_csv(&[
+            "NSE,300,NSE-B,B,EQ,CASH,EQ,",
+            "NSE,100,NSE-A,A,EQ,CASH,EQ,",
+            "NSE,100,NSE-A-DUP,A dup,EQ,CASH,EQ,",
+            "BSE,100,BSE-A,A bse,EQ,CASH,EQ,",
+        ]);
+        let (entries, skipped) = full_master_entries_from_csv(&csv).expect("builds");
+        assert_eq!(
+            entries.len(),
+            3,
+            "NSE dup collapsed; BSE 100 kept (exchange in key)"
+        );
+        assert_eq!(skipped, 1);
+        let ids: Vec<(String, i64)> = entries
+            .iter()
+            .map(|e| (e.exchange.clone(), e.security_id))
+            .collect();
+        assert_eq!(
+            ids,
+            vec![
+                ("BSE".to_string(), 100),
+                ("NSE".to_string(), 100),
+                ("NSE".to_string(), 300),
+            ],
+            "deterministic cutter order (exchange, segment, security_id)"
+        );
+        // The set must be cutter-clean: cut_shards accepts it.
+        let shards = crate::feed::groww::shard_cutter::cut_shards(&entries, 2).expect("cuttable");
+        assert_eq!(shards.len(), 2);
+    }
+
+    #[test]
+    fn test_full_master_entries_skips_non_numeric_non_idx() {
+        let csv = lab_csv(&[
+            "NSE,2885,NSE-RELIANCE,Reliance,EQ,CASH,EQ,",
+            "NSE,NOTNUM,NSE-WEIRD,Weird,EQ,CASH,EQ,",
+            "NSE,0,NSE-ZERO,Zero,EQ,CASH,EQ,",
+            "NSE,,NSE-EMPTY,Empty,EQ,CASH,EQ,",
+        ]);
+        let (entries, skipped) = full_master_entries_from_csv(&csv).expect("builds");
+        assert_eq!(entries.len(), 1, "only the numeric-token stock survives");
+        assert_eq!(skipped, 3);
+        assert_eq!(entries[0].security_id, 2885);
+    }
+
+    #[test]
+    fn test_full_master_entries_empty_csv_fails() {
+        // Header-only → zero usable entries → fail-closed.
+        assert_eq!(
+            full_master_entries_from_csv(LAB_HEADER),
+            Err(WatchBuildError::GrowwMasterEmpty)
+        );
+        // No usable rows (all tokens bad) → fail-closed too.
+        let csv = lab_csv(&["NSE,BAD,NSE-X,X,EQ,CASH,EQ,"]);
+        assert_eq!(
+            full_master_entries_from_csv(&csv),
+            Err(WatchBuildError::GrowwMasterEmpty)
+        );
     }
 
     // §18-parity Content-Type allowlist guard (2026-07-01 security review).
