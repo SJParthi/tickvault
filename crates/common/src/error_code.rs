@@ -767,6 +767,21 @@ pub enum ErrorCode {
     /// during the outage rehydrates from the last PERSISTED (always
     /// previously-verified) rung. Severity::Medium, auto-triage-safe.
     GrowwScale04AuditWriteFailed,
+    /// GROWW-SCALE-05 (Session-B fix, operator go 2026-07-04) — the Groww
+    /// scale-FLEET spawn was REFUSED by the fleet dual-instance SSM lock
+    /// (`/tickvault/<env>/instance-lock-groww-scale`, reusing the
+    /// RESILIENCE-01 `instance_lock` machinery via the named-lock knob).
+    /// Fires when (a) another tickvault instance ALREADY holds the fleet
+    /// lock (Mac + AWS, or two Macs, scaling the SAME Groww account — a
+    /// failure that previously masqueraded as provider throttle), (b) SSM
+    /// was unavailable after the bounded 3-attempt / 2s-4s retry budget
+    /// (fail-closed: we cannot prove there is no peer), or (c) the fleet
+    /// lock was lost mid-run to a foreign takeover. The boot degrades to
+    /// the SINGLE-CONNECTION Groww path (same fallback as a failed scale
+    /// PREFLIGHT — capture continues; only the multi-conn fleet is
+    /// refused). Severity::Critical (never auto-triaged — the operator
+    /// must decide which host runs the scale test).
+    GrowwScale05DualFleetDetected,
     /// GROWW-NATIVE-01 (PR-R1 shadow client, 2026-07-04) — the native-Rust
     /// Groww NATS-over-WebSocket shadow client failed to connect / lost the
     /// connection / had its supervised task respawned. Bounded expo backoff
@@ -961,6 +976,7 @@ impl ErrorCode {
             Self::GrowwScale02GlobalHalve => "GROWW-SCALE-02",
             Self::GrowwScale03ShardOverlap => "GROWW-SCALE-03",
             Self::GrowwScale04AuditWriteFailed => "GROWW-SCALE-04",
+            Self::GrowwScale05DualFleetDetected => "GROWW-SCALE-05",
             // PR-R1 (2026-07-04): Groww native-Rust shadow client
             Self::GrowwNative01ConnectFailed => "GROWW-NATIVE-01",
             Self::GrowwNative02AuthFailed => "GROWW-NATIVE-02",
@@ -1011,7 +1027,11 @@ impl ErrorCode {
             | Self::Proc01OomKillDetected
             // GROWW-SCALE-03 — shard disjointness/coverage contract violated
             // (a cutter/ladder bug; ladder step HALTs fail-closed)
-            | Self::GrowwScale03ShardOverlap => Severity::Critical,
+            | Self::GrowwScale03ShardOverlap
+            // GROWW-SCALE-05 (Session-B 2026-07-04) — dual scale-fleet
+            // instance detected / lock unprovable: fleet spawn refused
+            // fail-closed; operator must pick the winning host.
+            | Self::GrowwScale05DualFleetDetected => Severity::Critical,
             // Info: positive-ping / lifecycle confirmations
             Self::Selftest01Passed
             | Self::Slo01Healthy
@@ -1354,7 +1374,8 @@ impl ErrorCode {
             Self::GrowwScale01RollbackFired
             | Self::GrowwScale02GlobalHalve
             | Self::GrowwScale03ShardOverlap
-            | Self::GrowwScale04AuditWriteFailed => {
+            | Self::GrowwScale04AuditWriteFailed
+            | Self::GrowwScale05DualFleetDetected => {
                 ".claude/rules/project/groww-scale-error-codes.md"
             }
             // PR-R1 (2026-07-04): Groww native-Rust shadow client
@@ -1531,6 +1552,8 @@ impl ErrorCode {
             Self::GrowwScale02GlobalHalve,
             Self::GrowwScale03ShardOverlap,
             Self::GrowwScale04AuditWriteFailed,
+            // Session-B fix (2026-07-04): Groww fleet dual-instance lock
+            Self::GrowwScale05DualFleetDetected,
             // PR-R1 (2026-07-04): Groww native-Rust shadow client
             Self::GrowwNative01ConnectFailed,
             Self::GrowwNative02AuthFailed,
@@ -1841,7 +1864,38 @@ mod tests {
         // (socket-token mint / CONNECT auth rejected) + GROWW-NATIVE-03
         // (NATS/proto decode failure) + GROWW-NATIVE-04 (shadow NDJSON
         // writer/rotation/channel failure).
-        assert_eq!(ErrorCode::all().len(), 128);
+        // 2026-07-04 (Session-B fix — Groww fleet dual-instance lock):
+        // bumped 128 -> 129 for GROWW-SCALE-05 (dual scale-fleet instance
+        // detected / SSM lock unprovable — fleet spawn refused fail-closed,
+        // single-connection fallback).
+        assert_eq!(ErrorCode::all().len(), 129);
+    }
+
+    #[test]
+    fn test_groww_scale_05_dual_fleet_contract() {
+        // Session-B fix (operator go 2026-07-04): the Groww scale fleet's
+        // dual-instance lock refusal signal. Critical + never auto-triaged —
+        // the operator must pick which host runs the scale test.
+        let code = ErrorCode::GrowwScale05DualFleetDetected;
+        assert_eq!(code.code_str(), "GROWW-SCALE-05");
+        assert_eq!("GROWW-SCALE-05".parse::<ErrorCode>(), Ok(code));
+        assert_eq!(code.severity(), Severity::Critical);
+        assert!(!code.is_auto_triage_safe());
+        assert_eq!(
+            code.runbook_path(),
+            ".claude/rules/project/groww-scale-error-codes.md"
+        );
+        let abs = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(std::path::Path::parent)
+            .map(|root| root.join(code.runbook_path()))
+            .expect("workspace root");
+        let shown = abs.display().to_string();
+        assert!(
+            abs.exists(),
+            "GROWW-SCALE-05 runbook missing on disk: {shown}"
+        );
+        assert!(ErrorCode::all().contains(&code));
     }
 
     #[test]

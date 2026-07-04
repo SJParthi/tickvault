@@ -533,6 +533,31 @@ async fn main() -> Result<()> {
             }
             ok
         };
+    // ── Session-B fix #1 (operator go 2026-07-04): Groww FLEET dual-instance
+    // lock. A scale-test boot runs dhan_enabled=false and never reaches the
+    // Dhan RESILIENCE-01 lock, so without THIS gate two hosts (Mac + AWS, or
+    // two Macs) could scale the SAME Groww account simultaneously — a failure
+    // that masquerades as provider throttle. The lock is attempted ONLY after
+    // cfg.enabled + preflight pass (a default boot performs ZERO new SSM
+    // calls). AlreadyHeld / SSM-unavailable-after-retries → fail-closed:
+    // fleet SKIPPED with a GROWW-SCALE-05 Critical page (emitted inside the
+    // gate module via the error! 5-sink chain — the deferred Telegram
+    // notifier slot is not filled at this boot stage), single-connection
+    // fallback, app keeps running. See groww-scale-error-codes.md §4b.
+    let mut _groww_scale_fleet_lock: Option<
+        tickvault_app::groww_scale_lock::GrowwScaleFleetLockGuard,
+    > = None;
+    let groww_scale_enabled = if groww_scale_enabled {
+        match tickvault_app::groww_scale_lock::acquire_groww_scale_fleet_lock().await {
+            tickvault_app::groww_scale_lock::GrowwScaleFleetLockOutcome::Acquired(guard) => {
+                _groww_scale_fleet_lock = Some(guard);
+                true
+            }
+            tickvault_app::groww_scale_lock::GrowwScaleFleetLockOutcome::SkipFleet => false,
+        }
+    } else {
+        false
+    };
     // Deferred Telegram slot shared by the Groww bridge + sidecar supervisor +
     // activation watcher: all three spawn here (before the notifier is built),
     // so they get a shared slot that is filled with the live

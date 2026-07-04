@@ -1,6 +1,6 @@
 # Implementation Plan: Groww Scale-Fleet Session-B Fixes (dual-instance lock + SDK pin + DEDUP-claim correction)
 
-**Status:** APPROVED
+**Status:** VERIFIED
 **Date:** 2026-07-04
 **Approved by:** Parthiban (operator, 2026-07-04 — "fixing and working?" go-ahead on the Session-B fix plan, fixes #1+#2)
 
