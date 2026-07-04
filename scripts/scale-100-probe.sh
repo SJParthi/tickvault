@@ -25,17 +25,25 @@
 
 # ── Pure helpers (testable) ─────────────────────────────────────────────────
 
-# scale_probe_verdict <hit_ceiling 0|1> <max_conns> <target> — one
-# plain-English line naming where the ladder stopped. rc 1 on garbage args.
+# scale_probe_verdict <hit_ceiling 0|1> <max_conns> <target> <real_subscribed>
+# — one plain-English line naming where the ladder stopped. rc 1 on garbage
+# args. FIX 10 A2: in weekend smoke the gates hardcode the tick checks, so
+# "held the rung" alone can be hollow — the verdict demands REAL per-conn
+# subscribe proof (the summary TSV subscribe_proof column) and never prints
+# ✅ unless real_subscribed >= target.
 scale_probe_verdict() {
-  local hit="${1:-}" max="${2:-}" target="${3:-}"
+  local hit="${1:-}" max="${2:-}" target="${3:-}" proof="${4:-}"
   case "$hit" in 0 | 1) ;; *) return 1 ;; esac
-  case "$max" in '' | *[!0-9]*) return 1 ;; esac
-  case "$target" in '' | *[!0-9]*) return 1 ;; esac
-  if [ "$hit" = "1" ] && [ "$max" -ge "$target" ]; then
-    echo "Reached ${target} connections ✅ — Groww accepted the full fleet (SMOKE: connect + auth + subscribe only, no ticks on a closed market)."
+  local v
+  for v in "$max" "$target" "$proof"; do
+    case "$v" in '' | *[!0-9]*) return 1 ;; esac
+  done
+  if [ "$hit" = "1" ] && [ "$proof" -ge "$target" ]; then
+    echo "Reached ${target} connections ✅ — ${proof} of ${target} REALLY subscribed (SMOKE: connect + auth + subscribe only, no ticks on a closed market)."
+  elif [ "$hit" = "1" ] && [ "$max" -ge "$target" ]; then
+    echo "Held rung ${target}, but only ${proof} of ${target} connections REALLY subscribed — NOT a full pass. Record the real number."
   elif [ "$max" -gt 0 ]; then
-    echo "Groww (or this Mac) capped us at ${max} of ${target} connections — that IS the probe answer. Record rung ${max}."
+    echo "Groww (or this Mac) capped us at ${max} of ${target} connections (${proof} REALLY subscribed) — that IS the probe answer. Record rung ${max}."
   else
     echo "No ladder stage was recorded — the probe never climbed. Read the app output above for the failure reason."
   fi
@@ -49,21 +57,38 @@ set -uo pipefail
 cd "$(dirname "$0")/.."
 
 TARGET_CONNS=100
-TSV="data/groww-scale/summary-$(date +%F).tsv"
+# A1: the app writes the summary TSV under the IST date (its rows are IST
+# timestamps) — the wrapper must use the SAME calendar, not host-local.
+TSV="data/groww-scale/summary-$(TZ=Asia/Kolkata date +%F).tsv"
+
+# A1: run-start sentinel — the TSV is APPEND-per-day, so rows from any
+# EARLIER scale run today must never feed this run's watcher/verdict (a
+# stale halted_at_ceiling row would kill the probe ~3 min in and print a
+# FALSE "Reached 100"). Only rows appended after this line count exist.
+# shellcheck source=scripts/local-autopilot.sh
+AUTOPILOT_LIB=1 source scripts/local-autopilot.sh
+TSV_SENTINEL=$(tsv_sentinel "$(wc -l <"$TSV" 2>/dev/null || echo 0)")
+
+probe_new_rows() { # rows appended AFTER this probe started (may be empty)
+  tail -n +"$((TSV_SENTINEL + 1))" "$TSV" 2>/dev/null || true
+}
 
 verdict_from_tsv() {
-  local hit=0 max=0 ts outcome conns _rest
-  if [ -f "$TSV" ]; then
-    while IFS=$'\t' read -r ts outcome conns _rest; do
-      [ "$ts" = "ts_ist" ] && continue
-      case "$outcome" in *halted_at_ceiling*) hit=1 ;; esac
-      case "$conns" in
-        '' | *[!0-9]*) : ;;
-        *) [ "$conns" -gt "$max" ] && max="$conns" ;;
-      esac
-    done <"$TSV"
-  fi
-  scale_probe_verdict "$hit" "$max" "$TARGET_CONNS"
+  local hit=0 max=0 proof=0 ts outcome conns target ceiling sp _rest
+  while IFS=$'\t' read -r ts outcome conns target ceiling sp _rest; do
+    [ -z "$ts" ] && continue
+    [ "$ts" = "ts_ist" ] && continue
+    case "$outcome" in *halted_at_ceiling*) hit=1 ;; esac
+    case "$conns" in
+      '' | *[!0-9]*) : ;;
+      *) [ "$conns" -gt "$max" ] && max="$conns" ;;
+    esac
+    case "$sp" in
+      '' | *[!0-9]*) : ;;
+      *) [ "$sp" -gt "$proof" ] && proof="$sp" ;;
+    esac
+  done < <(probe_new_rows)
+  scale_probe_verdict "$hit" "$max" "$TARGET_CONNS" "$proof"
 }
 
 cleanup() {
@@ -89,12 +114,25 @@ echo "============================================================"
 # 1. Stop any running normal app (make local-stop semantics — never adopt).
 echo "stopping any running normal app first (scale run needs the overlay config)..."
 make local-stop || true
+# A5: local-stop is pidfile-based — ALSO stop any tickvault release binary
+# still alive without a pidfile (stale/foreign session), or the probe app
+# port-clashes into a false probe.
+if pgrep -f 'target/release/tickvault' >/dev/null 2>&1; then
+  echo "a tickvault app is still running without a pidfile — stopping it before the probe"
+  pkill -TERM -f 'target/release/tickvault' 2>/dev/null || true
+  for _ in $(seq 1 15); do
+    pgrep -f 'target/release/tickvault' >/dev/null 2>&1 || break
+    sleep 2
+  done
+  if pgrep -f 'target/release/tickvault' >/dev/null 2>&1; then
+    pkill -KILL -f 'target/release/tickvault' 2>/dev/null || true
+  fi
+fi
 
 # 2. FIX-5 memory clamp reuse: respect the Docker VM size before max-smoke
 #    pins QDB_MEM_LIMIT=8g. groww-scale-test.sh honors a pre-set value.
 if [ -z "${QDB_MEM_LIMIT:-}" ]; then
-  # shellcheck source=scripts/local-autopilot.sh
-  AUTOPILOT_LIB=1 source scripts/local-autopilot.sh
+  # (pure helpers already sourced above — clamp_qdb_mem_g is available)
   vm_bytes=$(docker info --format '{{.MemTotal}}' 2>/dev/null || true)
   if clamped=$(clamp_qdb_mem_g "${vm_bytes:-}"); then
     clamped_g="${clamped%g}"
@@ -125,7 +163,7 @@ if [ -n "${PROBE_AUTO_STOP_MIN:-}" ]; then
       echo "hard time cap reached — stopping the probe"
       break
     fi
-    if ((ceiling_hold_until == 0)) && [ -f "$TSV" ] && grep -q "halted_at_ceiling" "$TSV" 2>/dev/null; then
+    if ((ceiling_hold_until == 0)) && probe_new_rows | grep -q "halted_at_ceiling"; then
       echo "ceiling reached — holding 3 more minutes, then stopping automatically"
       ceiling_hold_until=$((SECONDS + 180))
     fi

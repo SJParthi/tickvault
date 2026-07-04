@@ -245,13 +245,42 @@ t "gate hold: garbage rejected" "1" "$(valid_gate_hold_min abc && echo 0 || echo
 t "gate hold: negative rejected" "1" "$(valid_gate_hold_min -3 && echo 0 || echo 1)"
 # shellcheck source=scripts/scale-100-probe.sh
 SCALE_PROBE_LIB=1 source scripts/scale-100-probe.sh
-# probe verdict classifier (hit_ceiling, max_conns, target)
-t "verdict: ceiling at 100 → reached" "Reached 100" "$(scale_probe_verdict 1 100 100 | cut -c1-11)"
-t "verdict: capped at 40 names the rung" "Groww (or this Mac) capped us at 40 of 100" "$(scale_probe_verdict 0 40 100 | cut -c1-42)"
-t "verdict: ceiling flag but below target is still the cap answer" "Groww (or this Mac) capped us at 80 of 100" "$(scale_probe_verdict 1 80 100 | cut -c1-42)"
-t "verdict: never climbed" "No ladder stage was recorded" "$(scale_probe_verdict 0 0 100 | cut -c1-28)"
-t "verdict: garbage hit flag → rc 1" "1" "$(scale_probe_verdict 2 40 100 >/dev/null 2>&1 && echo 0 || echo 1)"
-t "verdict: garbage max → rc 1" "1" "$(scale_probe_verdict 1 abc 100 >/dev/null 2>&1 && echo 0 || echo 1)"
+# probe verdict classifier (hit_ceiling, max_conns, target, real_subscribed)
+# FIX 10 A2: ✅ demands REAL subscribe proof, never the smoke-hollow rung alone
+t "verdict: ceiling + 100 REALLY subscribed → reached" "Reached 100" "$(scale_probe_verdict 1 100 100 100 | cut -c1-11)"
+t "verdict: held rung but only 40 proven → NOT a pass" "Held rung 100, but only 40 of 100 connections REALLY subscribed" "$(scale_probe_verdict 1 100 100 40 | cut -c1-63)"
+t "verdict: held-rung wording never shows the checkmark" "0" "$(case "$(scale_probe_verdict 1 100 100 40)" in *✅*) echo 1 ;; *) echo 0 ;; esac)"
+t "verdict: capped at 40 names the rung + proof" "Groww (or this Mac) capped us at 40 of 100" "$(scale_probe_verdict 0 40 100 12 | cut -c1-42)"
+t "verdict: ceiling flag but below target is still the cap answer" "Groww (or this Mac) capped us at 80 of 100" "$(scale_probe_verdict 1 80 100 80 | cut -c1-42)"
+t "verdict: never climbed" "No ladder stage was recorded" "$(scale_probe_verdict 0 0 100 0 | cut -c1-28)"
+t "verdict: garbage hit flag → rc 1" "1" "$(scale_probe_verdict 2 40 100 40 >/dev/null 2>&1 && echo 0 || echo 1)"
+t "verdict: garbage max → rc 1" "1" "$(scale_probe_verdict 1 abc 100 1 >/dev/null 2>&1 && echo 0 || echo 1)"
+t "verdict: missing proof arg → rc 1" "1" "$(scale_probe_verdict 1 100 100 >/dev/null 2>&1 && echo 0 || echo 1)"
+
+# ── FIX 10 (PUSH A): probe correctness + launcher safety helpers ────────────
+# A1: TSV run-start sentinel normalization (macOS wc pads with spaces)
+t "sentinel: padded wc output → clean int" "42" "$(tsv_sentinel "     42 ")"
+t "sentinel: empty → 0" "0" "$(tsv_sentinel "")"
+t "sentinel: garbage → 0" "0" "$(tsv_sentinel "abc")"
+# A3: leftover scale overlay detection
+printf '[feeds]\ndhan_enabled = false # scale-override(was: true)\n' >"$TMP/local-overlay.toml"
+printf '# >>> groww-scale-test (managed by scripts/groww-scale-test.sh) >>>\n[feeds.groww.scale]\n' >"$TMP/local-block.toml"
+printf '[feeds]\ndhan_enabled = true\n' >"$TMP/local-clean.toml"
+t "overlay: in-place override detected" "0" "$(has_scale_overlay "$TMP/local-overlay.toml" && echo 0 || echo 1)"
+t "overlay: managed block detected" "0" "$(has_scale_overlay "$TMP/local-block.toml" && echo 0 || echo 1)"
+t "overlay: clean config → none" "1" "$(has_scale_overlay "$TMP/local-clean.toml" && echo 0 || echo 1)"
+t "overlay: missing file → none" "1" "$(has_scale_overlay "$TMP/local-absent.toml" && echo 0 || echo 1)"
+# A4: launcher lock staleness (pid check)
+t "lock: our own live pid → NOT stale" "1" "$(launcher_lock_stale $$ && echo 0 || echo 1)"
+t "lock: dead pid → stale" "0" "$(launcher_lock_stale 4194000 && echo 0 || echo 1)"
+t "lock: empty pid → stale" "0" "$(launcher_lock_stale "" && echo 0 || echo 1)"
+t "lock: garbage pid → stale" "0" "$(launcher_lock_stale abc && echo 0 || echo 1)"
+# A8: operator Stop during probe (marker mtime vs probe start + grace)
+t "stop-during-probe: marker 200s after start → operator stop" "0" "$(manual_stop_during_probe 1000200 1000000 && echo 0 || echo 1)"
+t "stop-during-probe: marker 5s after start → probe's own stop" "1" "$(manual_stop_during_probe 1000005 1000000 && echo 0 || echo 1)"
+t "stop-during-probe: marker exactly at grace edge → own stop" "1" "$(manual_stop_during_probe 1000120 1000000 && echo 0 || echo 1)"
+t "stop-during-probe: garbage marker → fail-safe not-operator" "1" "$(manual_stop_during_probe abc 1000000 && echo 0 || echo 1)"
+t "stop-during-probe: custom grace honored" "0" "$(manual_stop_during_probe 1000031 1000000 30 && echo 0 || echo 1)"
 
 # ── FIX 7: Docker Desktop VM memory auto-raise (pure decision + JSON edit) ──
 # decision: vm / required / preferred-target / host (all MiB)

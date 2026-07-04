@@ -474,6 +474,50 @@ except Exception:
 PY
 }
 
+# ── FIX 10 (PUSH A): probe correctness + launcher safety — pure helpers ────
+
+# tsv_sentinel <raw wc -l output> → a clean integer line count (macOS wc
+# pads with spaces; empty/garbage → 0). A1: the probe evaluates ONLY rows
+# appended AFTER its own start — earlier scale runs the same day share the
+# append-per-day TSV and previously produced a FALSE verdict.
+tsv_sentinel() {
+  local v="${1:-}"
+  v="${v//[[:space:]]/}"
+  case "$v" in '' | *[!0-9]*) echo 0 ;; *) echo "$v" ;; esac
+}
+
+# has_scale_overlay <config file> → rc 0 when the file carries the scale
+# harness managed block or in-place key overrides. A3: a window-close /
+# SIGHUP / reboot mid-probe leaks the max-smoke overlay — the next NORMAL
+# run must detect + remove it instead of silently booting Dhan-OFF.
+has_scale_overlay() {
+  [ -f "${1:-}" ] || return 1
+  grep -qE '^# >>> groww-scale-test |scale-override\(was: ' "$1"
+}
+
+# launcher_lock_stale <pid> → rc 0 (stale — safe to steal) when the pid is
+# empty/garbage or no longer alive. A4 mutual-exclusion support.
+launcher_lock_stale() {
+  case "${1:-}" in '' | *[!0-9]*) return 0 ;; esac
+  ! kill -0 "$1" 2>/dev/null
+}
+
+# manual_stop_during_probe <marker_epoch> <probe_start_epoch> [grace=120]
+# → rc 0 when the manual-stop marker was written NOTICEABLY AFTER probe
+# start — i.e. the OPERATOR pressed Stop during the probe (must stand; no
+# auto live-start). The probe's own internal stop writes the marker within
+# seconds of probe start, inside the grace window. Garbage → rc 1
+# (fail-safe: treat as not-an-operator-stop). Honest limitation: an
+# operator Stop within the first ~2 minutes is indistinguishable from the
+# probe's own stop and is cleared.
+manual_stop_during_probe() {
+  local m="${1:-}" s="${2:-}" g="${3:-120}"
+  case "$m" in '' | *[!0-9]*) return 1 ;; esac
+  case "$s" in '' | *[!0-9]*) return 1 ;; esac
+  case "$g" in '' | *[!0-9]*) g=120 ;; esac
+  ((m > s + g))
+}
+
 # ── FIX 9: one-shot probe-then-run marker (two-buttons-forever) ─────────────
 
 # probe_once_decision <marker_date> <today> <stamp_exists 0|1> → run|skip.
@@ -615,9 +659,11 @@ rm -rf data/logs/autopilot 2>/dev/null || true
 # log(): append to the ONE daily file with a greppable [launcher] prefix;
 # echo to the terminal only when interactive.
 log() {
+  # A7: a full disk must degrade to console output, never kill the monitor
+  # loop under set -e — every write here is guarded.
   local line="[$(ist_hms) IST] [launcher] $*"
-  echo "$line" >>"$(current_log)"
-  if [ -t 1 ]; then echo "$line"; fi
+  echo "$line" >>"$(current_log)" 2>/dev/null || echo "$line" >&2 || true
+  if [ -t 1 ]; then echo "$line" || true; fi
 }
 
 # tg_init — FIX 5.2: fetch the Telegram credentials ONCE per run from the
@@ -795,6 +841,48 @@ stop_caffeinate() {
   fi
 }
 
+# ── FIX 10 A4: launcher mutual exclusion ────────────────────────────────────
+# Two launchers at once (double Run click, 08:54 manual vs 08:55 robot)
+# previously raced the pidfile and could double-launch the app. A mkdir
+# lock (atomic on every filesystem) around the start/stop critical
+# sections serializes them; a dead holder's lock is stolen (pid check).
+LAUNCHER_LOCK_DIR="${LAUNCHER_LOCK_DIR:-data/launcher.lock}"
+launcher_lock_acquire() {
+  if mkdir "$LAUNCHER_LOCK_DIR" 2>/dev/null; then
+    echo $$ >"$LAUNCHER_LOCK_DIR/pid" 2>/dev/null || true
+    return 0
+  fi
+  local other
+  other=$(cat "$LAUNCHER_LOCK_DIR/pid" 2>/dev/null || true)
+  if launcher_lock_stale "$other"; then
+    log "stale launcher lock (pid ${other:-?} is gone) — taking over"
+    rm -rf "$LAUNCHER_LOCK_DIR" 2>/dev/null || true
+    if mkdir "$LAUNCHER_LOCK_DIR" 2>/dev/null; then
+      echo $$ >"$LAUNCHER_LOCK_DIR/pid" 2>/dev/null || true
+      return 0
+    fi
+  fi
+  return 1
+}
+launcher_lock_release() {
+  # Only the owner releases (best-effort).
+  if [ "$(cat "$LAUNCHER_LOCK_DIR/pid" 2>/dev/null || true)" = "$$" ]; then
+    rm -rf "$LAUNCHER_LOCK_DIR" 2>/dev/null || true
+  fi
+}
+launcher_lock_acquire_wait() { # $1 = max seconds to wait
+  local waited=0
+  while ! launcher_lock_acquire; do
+    if ((waited == 0)); then
+      log "another launcher is mid-flight (lock: $LAUNCHER_LOCK_DIR, pid $(cat "$LAUNCHER_LOCK_DIR/pid" 2>/dev/null || echo '?')) — waiting up to ${1}s"
+    fi
+    sleep 2
+    waited=$((waited + 2))
+    if ((waited >= $1)); then return 1; fi
+  done
+  return 0
+}
+
 # find_running_app — FIX 5.1: detect an already-running app by PROCESS, not
 # just the pidfile (the pidfile can be missing/stale after a crashed
 # launcher — the live 2026-07-04 failure: a healthy app was running, the
@@ -919,7 +1007,21 @@ handle_adopt_verdict() {
   return 1
 }
 
+# A4: the launch critical section runs under the launcher lock — a second
+# entrant (double click / manual-vs-robot overlap) waits briefly, then
+# SKIPS (the other launcher owns the start; adopt-on-next-click covers it).
 start_app() { # $1 = label for the log
+  if ! launcher_lock_acquire_wait 60; then
+    log "another launcher still owns the start after 60s — skipping this launch to avoid a double-start (the other launcher is handling it)"
+    return 0
+  fi
+  local _rc=0
+  start_app_inner "$@" || _rc=$?
+  launcher_lock_release
+  return $_rc
+}
+
+start_app_inner() { # $1 = label for the log
   if app_alive; then
     # FIX 8: a pidfile-alive app gets the SAME freshness + database gate as
     # a discovered one — otherwise Monday's robot keeps Friday's binary (or
@@ -1172,7 +1274,19 @@ check_docker_vm_memory() {
   return 0
 }
 
+# A4: stop shares the same lock so a stop can never interleave with a
+# mid-flight start (pidfile corruption class).
 stop_app() {
+  if ! launcher_lock_acquire_wait 90; then
+    log "another launcher is mid-flight — proceeding with the stop anyway after 90s (stop must always win)"
+  fi
+  local _rc=0
+  stop_app_inner || _rc=$?
+  launcher_lock_release
+  return $_rc
+}
+
+stop_app_inner() {
   if ! app_alive; then
     log "app not running — nothing to stop"
     rm -f "$APP_PIDFILE"
@@ -1234,12 +1348,28 @@ maybe_run_probe_once() {
   # Stamp BEFORE the probe: even a crash mid-probe must not re-trigger it —
   # the very next click goes straight to the normal start.
   printf '%s %s probe-once attempt\n' "$today" "$(ist_hms)" >"$stamp"
+  local probe_start_epoch
+  probe_start_epoch=$(date +%s)
   export_compose_creds
   if PROBE_AUTO_STOP_MIN="${PROBE_ONCE_MAX_MIN:-45}" bash scripts/scale-100-probe.sh; then
     log "probe finished — continuing into normal live start"
   else
     bash scripts/groww-scale-test.sh clean >>"$(current_log)" 2>&1 || true
     log "probe did not complete cleanly — overlay cleaned; continuing into normal live start anyway"
+  fi
+  # FIX 10 A8: honor an operator Stop pressed DURING the probe. The probe's
+  # OWN internal stop writes the manual-stop marker within seconds of probe
+  # start (inside the grace window); a marker noticeably NEWER than that
+  # means the OPERATOR pressed Stop mid-probe — it must stand: rc 1 tells
+  # the caller to NOT continue into a live start.
+  if [ -f "$MANUAL_STOP_MARKER" ]; then
+    local marker_mtime
+    marker_mtime=$(stat -f %m "$MANUAL_STOP_MARKER" 2>/dev/null ||
+      stat -c %Y "$MANUAL_STOP_MARKER" 2>/dev/null || echo 0)
+    if manual_stop_during_probe "$marker_mtime" "$probe_start_epoch"; then
+      log "Stop was pressed DURING the probe — honoring it: no live start (double-click Start TickVault when ready)"
+      return 1
+    fi
   fi
   return 0
 }
@@ -1251,15 +1381,30 @@ cmd_start() {
   rm -f "$MANUAL_STOP_MARKER"
   ensure_docker || return 1
   check_docker_vm_memory
+  # FIX 10 A6: arm caffeinate BEFORE the (possibly long) probe so Mac sleep
+  # cannot freeze the ladder into its hard time cap.
+  start_caffeinate
   # FIX 9: one-shot lab probe (inert unless the committed marker is dated
-  # today). Runs AFTER docker is up (the probe manages QuestDB itself);
-  # the probe's internal stop re-arms the manual-stop marker, so clear it
-  # again — this click is a START.
-  maybe_run_probe_once
+  # today). Runs AFTER docker is up (the probe manages QuestDB itself).
+  # FIX 10 A8: rc 1 = the operator pressed Stop DURING the probe — it
+  # stands; no auto live-start.
+  if ! maybe_run_probe_once; then
+    stop_caffeinate
+    return 0
+  fi
+  # The probe's internal stop re-arms the manual-stop marker and disarms
+  # caffeinate — clear + re-arm both: this click is a START.
   rm -f "$MANUAL_STOP_MARKER"
+  start_caffeinate
+  # FIX 10 A3: a window-close / SIGHUP / reboot mid-probe can leak the
+  # scale overlay — a NORMAL run must never silently boot the Dhan-OFF
+  # scale config.
+  if has_scale_overlay config/local.toml; then
+    log "leftover scale-test overlay found in config/local.toml — removing it (this is a NORMAL run)"
+    bash scripts/groww-scale-test.sh clean >>"$(current_log)" 2>&1 || true
+  fi
   ensure_questdb || return 1
   disk_free_ok || true # warn-only on manual start — operator's call
-  start_caffeinate
   start_app "manual start" || return 1
   tg "🚀 Manual start complete — app running, feed capture live. Autopilot (if scheduled) will adopt this app, not double-start."
 }
