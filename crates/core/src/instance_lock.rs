@@ -65,6 +65,18 @@ pub const INSTANCE_LOCK_TTL_SECS: u64 = 90;
 /// 30 seconds of headroom before the lock is considered stale.
 pub const INSTANCE_LOCK_HEARTBEAT_INTERVAL_SECS: u64 = 30;
 
+/// After this many CONSECUTIVE named-lock renewal FAILURES the slot has
+/// gone un-refreshed for ≥ the TTL (3 × 30s = 90s): a legitimately booting
+/// peer may take over the stale slot while THIS holder cannot observe it
+/// (renewal keeps `Err`-ing during an SSM partition, so the `Ok(false)`
+/// loss page only fires after connectivity recovers — the previously
+/// UNPAGED dual-fleet window from the 2026-07-04 adversarial review).
+/// [`spawn_named_lock_heartbeat`] escalates ONCE per failure episode at
+/// ERROR with the caller's loss code when this threshold is reached, then
+/// keeps retrying.
+pub const NAMED_LOCK_RENEWAL_ERRORS_ESCALATE_THRESHOLD: u32 =
+    (INSTANCE_LOCK_TTL_SECS / INSTANCE_LOCK_HEARTBEAT_INTERVAL_SECS) as u32;
+
 /// SSM Parameter path prefix. Full path is `{prefix}/{env}/instance-lock`
 /// so dev / sandbox / prod cannot stomp on each other.
 pub const INSTANCE_LOCK_SSM_PATH_PREFIX: &str = "/tickvault";
@@ -98,14 +110,30 @@ pub const GROWW_SCALE_FLEET_LOCK_NAME: &str = "instance-lock-groww-scale";
 /// in the boot log.
 #[must_use]
 pub fn compute_named_lock_path(env: &str, lock_name: &str) -> String {
-    let sanitised = sanitize_ilp_symbol(env);
+    // Defense-in-depth (2026-07-04 adversarial review LOW): the generic
+    // `sanitize_ilp_symbol` strips control chars / ',' / '=' but NOT '/'
+    // or '.', so a garbage env ("prod/groww") or lock name could inject a
+    // path break and escape the `/tickvault/<env>/` namespace — including
+    // into the token-minter-banned `groww/*` subtree. Production callers
+    // already validate (resolve_environment allows [a-zA-Z0-9-] only;
+    // lock names are &'static consts), but both fns are `pub`, so strip
+    // here as well. No-op for every legitimate input; the Dhan wrapper
+    // delegates here, so Dhan vs named paths stay identical by
+    // construction (pinned by test_named_lock_path_dhan_name_matches_legacy_path).
+    let sanitised: String = sanitize_ilp_symbol(env)
+        .chars()
+        .filter(|c| *c != '/' && *c != '.')
+        .collect();
     let trimmed = sanitised.trim();
     let effective = if trimmed.is_empty() {
         "unknown"
     } else {
         trimmed
     };
-    let name_sanitised = sanitize_ilp_symbol(lock_name);
+    let name_sanitised: String = sanitize_ilp_symbol(lock_name)
+        .chars()
+        .filter(|c| *c != '/' && *c != '.')
+        .collect();
     let name = name_sanitised.trim();
     format!("{INSTANCE_LOCK_SSM_PATH_PREFIX}/{effective}/{name}")
 }
@@ -670,6 +698,15 @@ pub fn spawn_instance_lock_heartbeat(
 /// caller decides what "lock lost" means for its subsystem — the Groww
 /// fleet gate pages the operator; it does not tear down a running fleet
 /// (the collision is loud, never silent).
+///
+/// Stale-window escalation (2026-07-04 adversarial-review MEDIUM fix):
+/// after [`NAMED_LOCK_RENEWAL_ERRORS_ESCALATE_THRESHOLD`] CONSECUTIVE
+/// renewal FAILURES (= the full 90s TTL un-refreshed), the task fires ONE
+/// `error!` per failure episode tagged with `loss_code` — because during
+/// an SSM partition a legitimately booting peer can take the stale slot
+/// and run a duplicate subsystem while the `Ok(false)` loss page cannot
+/// fire until OUR connectivity recovers. The task keeps retrying (WARN)
+/// after the escalation; a later successful renewal re-arms the episode.
 // TEST-EXEMPT: real SSM endpoint required for the renew/release round trip
 // (same class as spawn_instance_lock_heartbeat); the pure primitives it
 // delegates to are unit-tested below and a smoke test pins the symbol.
@@ -697,6 +734,11 @@ pub fn spawn_named_lock_heartbeat(
         // First tick fires immediately — skip it so we don't redundantly
         // re-write the parameter that the acquire just put.
         ticker.tick().await;
+        // Consecutive renewal-FAILURE counter (2026-07-04 adversarial-review
+        // MEDIUM fix): once failures span the full TTL, the slot is stale and
+        // a peer can legitimately take it over WITHOUT this holder observing
+        // it — escalate that previously-unpaged window ONCE per episode.
+        let mut consecutive_renew_errors: u32 = 0;
         loop {
             tokio::select! {
                 () = shutdown.notified() => {
@@ -722,11 +764,18 @@ pub fn spawn_named_lock_heartbeat(
                     match renew_named_lock(&ssm, &env, lock_name, &host_id).await {
                         Ok(true) => {
                             // Successful renewal — silent to avoid every-30s
-                            // log chatter.
+                            // log chatter. Re-arms the per-episode
+                            // stale-window escalation below.
+                            consecutive_renew_errors = 0;
                         }
                         Ok(false) => {
-                            // Flip BEFORE logging so any gate reading the
-                            // flag observes the loss at the earliest instant.
+                            // Flip BEFORE logging so a (current or future)
+                            // consumer of `held_flag` observes the loss at
+                            // the earliest instant. HONEST boundary: the
+                            // Groww fleet gate stores the flag for future
+                            // ladder-side wiring — no runtime reader exists
+                            // yet, so the ERROR page below is the operator
+                            // signal today.
                             held_flag.store(false, std::sync::atomic::Ordering::Release);
                             error!(
                                 target: "tickvault::instance_lock",
@@ -742,13 +791,44 @@ pub fn spawn_named_lock_heartbeat(
                             return;
                         }
                         Err(err) => {
-                            warn!(
-                                target: "tickvault::instance_lock",
-                                lock_name,
-                                error = %err,
-                                "transient named-lock renewal failure; will retry on \
-                                 next heartbeat tick"
-                            );
+                            consecutive_renew_errors =
+                                consecutive_renew_errors.saturating_add(1);
+                            if consecutive_renew_errors
+                                == NAMED_LOCK_RENEWAL_ERRORS_ESCALATE_THRESHOLD
+                            {
+                                // Edge-triggered per failure episode (audit
+                                // Rule 4): the slot has now gone
+                                // un-refreshed for ≥ the 90s TTL. During an
+                                // SSM partition a legitimately booting peer
+                                // can take the stale slot and run a SECOND
+                                // fleet while renewals here keep Err-ing —
+                                // the Ok(false) loss page would only fire
+                                // after OUR connectivity recovers. Page NOW
+                                // so that window is never silent.
+                                error!(
+                                    target: "tickvault::instance_lock",
+                                    code = loss_code.code_str(),
+                                    severity = loss_code.severity().as_str(),
+                                    env = %env,
+                                    lock_name,
+                                    host_id = %host_id,
+                                    consecutive_failures = consecutive_renew_errors,
+                                    error = %err,
+                                    "named-lock renewals have failed past the TTL \
+                                     window — the SSM slot is now stale and a peer \
+                                     instance may take it over unobserved; heartbeat \
+                                     keeps retrying"
+                                );
+                            } else {
+                                warn!(
+                                    target: "tickvault::instance_lock",
+                                    lock_name,
+                                    consecutive_failures = consecutive_renew_errors,
+                                    error = %err,
+                                    "transient named-lock renewal failure; will retry on \
+                                     next heartbeat tick"
+                                );
+                            }
                         }
                     }
                 }
@@ -968,6 +1048,41 @@ mod tests {
             compute_named_lock_path("", GROWW_SCALE_FLEET_LOCK_NAME),
             "/tickvault/unknown/instance-lock-groww-scale"
         );
+    }
+
+    #[test]
+    fn test_compute_named_lock_path_strips_path_separators() {
+        // 2026-07-04 adversarial-review LOW: a '/'-bearing env must NOT
+        // inject a path break — nothing may escape /tickvault/<env>/ into
+        // the token-minter-banned groww/* subtree.
+        let path = compute_named_lock_path("prod/groww", GROWW_SCALE_FLEET_LOCK_NAME);
+        assert_eq!(path, "/tickvault/prodgroww/instance-lock-groww-scale");
+        assert!(!path.contains("/groww/"), "namespace escape: {path}");
+        // '.' is stripped too (defense-in-depth).
+        assert_eq!(
+            compute_named_lock_path("pr.od", GROWW_SCALE_FLEET_LOCK_NAME),
+            "/tickvault/prod/instance-lock-groww-scale"
+        );
+        // A '/'-bearing lock NAME cannot escape either.
+        let name_path = compute_named_lock_path("prod", "groww/evil");
+        assert_eq!(name_path, "/tickvault/prod/growwevil");
+        // An env that becomes empty after stripping falls back to "unknown".
+        assert_eq!(
+            compute_named_lock_path("///", GROWW_SCALE_FLEET_LOCK_NAME),
+            "/tickvault/unknown/instance-lock-groww-scale"
+        );
+    }
+
+    #[test]
+    fn test_named_lock_renewal_escalate_threshold_spans_ttl() {
+        // The escalation must fire exactly when consecutive renewal
+        // failures span the full TTL (3 × 30s = 90s) — earlier is noise,
+        // later leaves the peer-takeover window unpaged.
+        assert_eq!(
+            NAMED_LOCK_RENEWAL_ERRORS_ESCALATE_THRESHOLD,
+            (INSTANCE_LOCK_TTL_SECS / INSTANCE_LOCK_HEARTBEAT_INTERVAL_SECS) as u32
+        );
+        assert_eq!(NAMED_LOCK_RENEWAL_ERRORS_ESCALATE_THRESHOLD, 3);
     }
 
     #[test]
