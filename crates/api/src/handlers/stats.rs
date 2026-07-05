@@ -110,6 +110,14 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_build_stats_client_constructs_with_timeout() {
+        // pub(crate) reuse surface (Live Board): the builder must always
+        // yield a usable client (falls back to default on builder failure).
+        let client = build_stats_client(1);
+        assert!(!format!("{client:?}").is_empty());
+    }
+
+    #[test]
     fn test_stats_response_serialization() {
         let stats = StatsResponse {
             questdb_reachable: true,

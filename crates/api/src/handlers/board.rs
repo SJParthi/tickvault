@@ -679,6 +679,20 @@ mod tests {
     }
 
     #[test]
+    fn test_now_ist_nanos_is_ahead_of_utc() {
+        // The pub(crate) IST-nanos helper (reused from feeds) must sit the
+        // IST offset ahead of raw UTC nanos.
+        let utc = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+        let ist = crate::handlers::feeds::now_ist_nanos();
+        let delta = ist - utc;
+        let offset = tickvault_common::constants::IST_UTC_OFFSET_NANOS;
+        assert!(
+            (delta - offset).abs() < 2_000_000_000,
+            "IST nanos ~offset ahead of UTC (delta={delta})"
+        );
+    }
+
+    #[test]
     fn test_sanitize_tag_truncates() {
         let long = "a".repeat(100);
         assert_eq!(sanitize_tag(&long).len(), 32);
