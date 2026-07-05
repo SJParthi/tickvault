@@ -853,5 +853,136 @@ class NatsErrorFilterTests(unittest.TestCase):
         self.assertEqual(count, 1)
 
 
+class RealPathNatsErrorTests(unittest.TestCase):
+    """FIX 20: reproduce the REAL emission path the earlier unit tests missed.
+
+    In production the SDK-named logger ("growwapi.groww.nats_client") has NO
+    handler of its own — records PROPAGATE to the root stderr handler that
+    basicConfig installed. The pre-FIX-20 tests attached a handler directly
+    to the SDK logger with propagate=False, so they passed while the live
+    run streamed bare "Error: " lines every ~4.1s (attempt 2, 2026-07-05
+    13:21 IST — the filter was never attached because its install site
+    lived in the post-subscribe success path). These tests install through
+    the real two-layer install_sdk_error_filter and assert THROUGH
+    propagation to a root handler.
+    """
+
+    def setUp(self) -> None:
+        import io
+        import logging
+
+        self._io = io
+        self._logging = logging
+        self._logger = logging.getLogger(groww_sidecar.SDK_NATS_LOGGER_NAME)
+        self._logger.propagate = True
+        self._logger.setLevel(logging.DEBUG)
+        for f in list(self._logger.filters):
+            if isinstance(f, groww_sidecar.NatsErrorDetailFilter):
+                self._logger.removeFilter(f)
+        self._root = logging.getLogger()
+        # sweep stale filter instances off ALL root handlers (fresh counts)
+        for h in self._root.handlers:
+            for f in list(h.filters):
+                if isinstance(f, groww_sidecar.NatsErrorDetailFilter):
+                    h.removeFilter(f)
+        self._buf = io.StringIO()
+        self._root_handler = logging.StreamHandler(self._buf)
+        self._saved_level = self._root.level
+        self._root.addHandler(self._root_handler)
+        self._root.setLevel(logging.DEBUG)
+        groww_sidecar.install_sdk_error_filter([])
+
+    def tearDown(self) -> None:
+        self._root.removeHandler(self._root_handler)
+        self._root.setLevel(self._saved_level)
+        for f in list(self._logger.filters):
+            if isinstance(f, groww_sidecar.NatsErrorDetailFilter):
+                self._logger.removeFilter(f)
+        for h in self._root.handlers:
+            for f in list(h.filters):
+                if isinstance(f, groww_sidecar.NatsErrorDetailFilter):
+                    h.removeFilter(f)
+        self._logger.propagate = False
+
+    def _lines(self):
+        return [ln for ln in self._buf.getvalue().splitlines() if ln]
+
+    def test_real_path_empty_exception_enriched_via_propagation(self) -> None:
+        class EmptyStrException(Exception):
+            def __str__(self) -> str:
+                return ""
+
+        self._logger.error("Error: %s", EmptyStrException())
+        lines = self._lines()
+        self.assertEqual(len(lines), 1, lines)
+        self.assertIn("class=EmptyStrException", lines[0])
+        self.assertIn("EmptyStrException()", lines[0])
+
+    def test_real_path_bare_error_no_args_names_the_gap(self) -> None:
+        # The SDK pre-formatting the line ("Error: " with NO args) must
+        # still never emit a bare line — the gap itself is named.
+        self._logger.error("Error: ")
+        lines = self._lines()
+        self.assertEqual(len(lines), 1, lines)
+        self.assertIn("no reason from SDK — args empty", lines[0])
+
+    def test_real_path_empty_string_arg_is_named(self) -> None:
+        self._logger.error("Error: %s", "")
+        lines = self._lines()
+        self.assertEqual(len(lines), 1, lines)
+        self.assertIn("empty reason string from SDK", lines[0])
+
+    def test_real_path_two_layers_never_double_count(self) -> None:
+        # logger-level AND root-handler attachments see the SAME record; the
+        # per-record marker must count it ONCE. With double counting, 16
+        # emissions reach count 30 (printed) at emission 15 -> 2 lines.
+        class EmptyStrException(Exception):
+            def __str__(self) -> str:
+                return ""
+
+        for _ in range(16):
+            self._logger.error("Error: %s", EmptyStrException())
+        self.assertEqual(len(self._lines()), 1, self._lines())
+
+    def test_real_path_other_sdk_logger_covered_by_handler_layer(self) -> None:
+        # A record from a DIFFERENT SDK logger (no logger-level filter) is
+        # still enriched by the root-handler layer.
+        class EmptyStrException(Exception):
+            def __str__(self) -> str:
+                return ""
+
+        other = self._logging.getLogger("nats.aio.client")
+        saved = other.propagate
+        other.propagate = True
+        other.setLevel(self._logging.DEBUG)
+        try:
+            other.error("Error: %s", EmptyStrException())
+        finally:
+            other.propagate = saved
+        lines = self._lines()
+        self.assertEqual(len(lines), 1, lines)
+        self.assertIn("class=EmptyStrException", lines[0])
+
+    def test_real_path_repeats_coalesce_through_propagation(self) -> None:
+        for _ in range(31):
+            self._logger.error("Error: ")
+        lines = self._lines()
+        self.assertEqual(len(lines), 2, lines)  # 1st + 30th
+        self.assertIn("seen 30x", lines[1])
+
+    def test_fix20_install_sites_wired_at_process_start(self) -> None:
+        # Source-scan ratchet: main() must install the filter + the class
+        # wrap right after the redaction filter — the FIX 20 root cause was
+        # the install living only in the post-subscribe success path.
+        import inspect as _inspect
+
+        src = _inspect.getsource(groww_sidecar.main)
+        redaction = src.index("_install_sdk_log_redaction(")
+        flt = src.index("install_sdk_error_filter(")
+        wrap = src.index("install_sdk_error_cb_class_wrap(")
+        self.assertLess(redaction, flt, "filter must install right after redaction")
+        self.assertLess(flt, wrap, "class wrap must install at process start too")
+
+
 if __name__ == "__main__":
     unittest.main()

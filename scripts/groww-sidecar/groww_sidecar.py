@@ -408,7 +408,23 @@ _NATS_ERROR_COUNT_CAP = 512  # bound the dedup map; clear if ever exceeded
 
 
 class NatsErrorDetailFilter(logging.Filter):
-    """Enrich empty 'Error: %s' SDK records + coalesce repeats (FIX 19)."""
+    """Enrich empty 'Error: %s' SDK records + coalesce repeats (FIX 19/20).
+
+    FIX 20 hardening — the operator's attempt-2 run STILL showed bare
+    "Error: " lines every ~4.1s. Root cause: this filter was ONLY attached
+    inside the consume-cycle's post-subscribe success path
+    (`if not watchdog_started:`), while the redaction filter attaches at
+    main() start — a cycle erroring before/without a successful subscribe
+    never had the filter. It now installs at PROCESS START next to the
+    redaction filter, PLUS on the root handlers as a second layer, and:
+      * carries an idempotence marker on the record so logger-level +
+        handler-level attachments can never double-count or double-enrich;
+      * scopes to growwapi*/nats* records only (the handler-level layer
+        must never touch our own records);
+      * ALWAYS explains an empty reason: exception arg -> class+repr;
+        exc_info -> class+repr; args empty -> "(no reason from SDK — args
+        empty)"; args present but blank -> "(empty reason string from SDK)".
+    """
 
     def __init__(self, secrets):
         super().__init__()
@@ -417,24 +433,58 @@ class NatsErrorDetailFilter(logging.Filter):
 
     def filter(self, record):  # noqa: A003 - logging.Filter API name
         try:
+            # Idempotence: the same record can pass a logger-level AND a
+            # handler-level attachment — process it exactly once.
+            if getattr(record, "_tv_nats_detail_done", False):
+                return bool(getattr(record, "_tv_nats_detail_keep", True))
+            name = str(getattr(record, "name", ""))
+            if not (name.startswith("growwapi") or name.startswith("nats")):
+                return True
             if not str(record.msg).startswith("Error"):
                 return True
+            record._tv_nats_detail_done = True
+            record._tv_nats_detail_keep = True
             args = record.args
             if args is not None and not isinstance(args, tuple):
                 args = (args,)
             exc = args[0] if args else None
             rendered = record.getMessage()
+            reason_is_empty = not rendered.split(":", 1)[-1].strip()
             if isinstance(exc, BaseException) and not str(exc).strip():
                 detail = _redact(repr(exc), self._secrets)
                 rendered = (
                     f"{rendered}[empty message; class={type(exc).__name__}; "
                     f"{detail}]"
                 )
+            elif reason_is_empty:
+                # FIX 20: the reason is STILL blank — say WHY. A bare
+                # "Error: " line must never be emitted again.
+                exc_info = getattr(record, "exc_info", None)
+                if (
+                    exc_info
+                    and isinstance(exc_info, tuple)
+                    and len(exc_info) > 1
+                    and exc_info[1] is not None
+                ):
+                    detail = _redact(repr(exc_info[1]), self._secrets)
+                    rendered = (
+                        f"{rendered}[empty message; exc_info class="
+                        f"{type(exc_info[1]).__name__}; {detail}]"
+                    )
+                elif not args:
+                    rendered = f"{rendered}(no reason from SDK — args empty)"
+                else:
+                    detail = _redact(repr(args), self._secrets)[:200]
+                    rendered = (
+                        f"{rendered}(empty reason string from SDK; "
+                        f"args={detail})"
+                    )
             if len(self._counts) > _NATS_ERROR_COUNT_CAP:
                 self._counts.clear()
             count = self._counts.get(rendered, 0) + 1
             self._counts[rendered] = count
             if count > 1 and count % NATS_ERROR_LOG_EVERY != 0:
+                record._tv_nats_detail_keep = False
                 return False
             if count > 1:
                 rendered = (
@@ -449,10 +499,95 @@ class NatsErrorDetailFilter(logging.Filter):
 
 
 def install_sdk_error_filter(secrets) -> None:
-    """Attach the enrich+coalesce filter to the SDK NATS logger (idempotent)."""
+    """Attach the enrich+coalesce filter — two layers, idempotent (FIX 20).
+
+    Layer 1: logger-level on the SDK NATS logger (runs where the record is
+    created). Layer 2: the SAME filter instance on every root HANDLER — a
+    handler-level filter sees every record that reaches the handler,
+    including records from OTHER SDK loggers (e.g. `nats.aio.client`) that
+    propagate up; the per-record marker keeps the two layers exactly-once.
+    """
     logger = logging.getLogger(SDK_NATS_LOGGER_NAME)
-    if not any(isinstance(f, NatsErrorDetailFilter) for f in logger.filters):
-        logger.addFilter(NatsErrorDetailFilter(secrets))
+    existing = next(
+        (f for f in logger.filters if isinstance(f, NatsErrorDetailFilter)), None
+    )
+    flt = existing or NatsErrorDetailFilter(secrets)
+    if existing is None:
+        logger.addFilter(flt)
+    try:
+        for h in logging.getLogger().handlers:
+            if not any(isinstance(f, NatsErrorDetailFilter) for f in h.filters):
+                h.addFilter(flt)
+    except Exception:  # noqa: BLE001 - layer 2 is best-effort
+        pass
+
+
+# FIX 20 belt-and-braces: nats-py captures the SDK's bound `_on_error_cb` at
+# connect() time, so INSTANCE-attribute hooks miss the callback nats actually
+# holds. Patching the CLASS method BEFORE any NatsClient exists (process
+# start) means the method nats binds IS the wrapped one. The wrap prints one
+# line per DISTINCT exception type (bounded), then always defers to the
+# original callback. Best-effort: any failure is logged (type only), ignored.
+_NATS_CB_SEEN_TYPES = set()
+_NATS_CB_SEEN_CAP = 64
+
+
+def _note_nats_cb_error(exc, secrets) -> None:
+    try:
+        kind = type(exc).__name__
+        if kind in _NATS_CB_SEEN_TYPES or len(_NATS_CB_SEEN_TYPES) >= _NATS_CB_SEEN_CAP:
+            return
+        _NATS_CB_SEEN_TYPES.add(kind)
+        detail = _redact(repr(exc), secrets)
+        print(
+            f"groww sidecar: NATS error_cb (class wrap) -> class={kind}; {detail}",
+            file=sys.stderr,
+            flush=True,
+        )
+    except Exception:  # noqa: BLE001 - diagnostics must never break the feed
+        pass
+
+
+def install_sdk_error_cb_class_wrap(secrets) -> None:
+    """Wrap growwapi NatsClient._on_error_cb at the CLASS level (idempotent)."""
+    try:
+        import inspect
+
+        from growwapi.groww import nats_client as _sdk_nats_mod
+
+        klass = getattr(_sdk_nats_mod, "NatsClient", None)
+        if klass is None:
+            return
+        orig = getattr(klass, "_on_error_cb", None)
+        if orig is None or getattr(orig, "_tv_wrapped", False):
+            return
+        if inspect.iscoroutinefunction(orig):
+
+            async def wrapped(self, e):  # mirrors the SDK signature
+                _note_nats_cb_error(e, secrets)
+                return await orig(self, e)
+
+        else:
+
+            def wrapped(self, e):
+                _note_nats_cb_error(e, secrets)
+                return orig(self, e)
+
+        wrapped._tv_wrapped = True
+        klass._on_error_cb = wrapped
+        print(
+            "groww sidecar: NATS error_cb class wrap installed "
+            "(distinct error types will be named once each)",
+            file=sys.stderr,
+            flush=True,
+        )
+    except Exception as exc:  # noqa: BLE001 - never break the feed
+        print(
+            f"groww sidecar: could not wrap NatsClient._on_error_cb "
+            f"({type(exc).__name__}); the log filter still enriches",
+            file=sys.stderr,
+            flush=True,
+        )
 
 # Substrings that mark a true authorization / permissions / protocol reject.
 _REJECT_MARKERS = (
@@ -2566,6 +2701,15 @@ def main() -> None:
     # records are scrubbed structurally, not just our own print() lines.
     secrets = []  # the access token is added the moment it is read (below)
     _install_sdk_log_redaction(secrets)
+    # FIX 20: the NATS error-detail filter must attach at PROCESS START,
+    # exactly like the redaction filter above — the old install site lived
+    # in the consume-cycle's post-subscribe success path, so a cycle that
+    # errored before/without a successful subscribe streamed bare
+    # "Error: " lines every ~4.1s with the filter never attached (the
+    # attempt-2 live incident, 2026-07-05 13:21 IST). The in-loop install
+    # stays as an idempotent belt-and-braces re-attach.
+    install_sdk_error_filter(secrets)
+    install_sdk_error_cb_class_wrap(secrets)
 
     # Cached access token, reused across FEED reconnects. Re-READ from SSM
     # ONLY when there is no token yet or the previous failure was auth-class

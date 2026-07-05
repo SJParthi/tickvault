@@ -674,12 +674,21 @@ t "F19-A: the warm-Docker hint default is host-aware too" "0" "$(sed -n '/^hint_
 
 # Item 7: guaranteed per-feed Telegram status pings
 t "F19-7: OFF feed is announced, never silent" "⏸️ dhan: switched OFF for this run (expected in a lab/max-smoke session — not an error)" "$(feed_ping_text dhan false unknown false 0)"
-t "F19-7: ok verdict → connected + count" "✅ groww: connected, 1000 instruments subscribed, data flowing" "$(feed_ping_text groww true ok true 1000)"
+# FIX 20 task 2: "data flowing" is claimed ONLY with ticks>0 — the ok
+# verdict wording is state-based (ticks + market-open), never a false claim.
+t "F20: ok + ticks flowing → data flowing" "✅ groww: connected, 1000 instruments subscribed, data flowing" "$(feed_ping_text groww true ok true 1000 42 1)"
+t "F20: ok + 0 ticks + market closed → awaiting first tick" "✅ groww: connected, 768 subscribed — awaiting first tick (market closed)" "$(feed_ping_text groww true ok true 768 0 0)"
+t "F20: ok + 0 ticks + market OPEN → honest no-ticks warning" "⚠️ groww: connected, 768 subscribed — NO ticks yet (investigating if it persists)" "$(feed_ping_text groww true ok true 768 0 1)"
+t "F20: omitted tick args fail SAFE (never claims data flowing)" "0" "$(case "$(feed_ping_text groww true ok true 1000)" in *"data flowing"*) echo 1 ;; *) echo 0 ;; esac)"
+t "F20: garbage ticks count renders as 0 (no false flowing)" "0" "$(case "$(feed_ping_text groww true ok true 1000 banana 1)" in *"data flowing"*) echo 1 ;; *) echo 0 ;; esac)"
+t "F20: garbage market flag fails safe to closed wording" "✅ groww: connected, 10 subscribed — awaiting first tick (market closed)" "$(feed_ping_text groww true ok true 10 0 x)"
+t "F20: health rows carry the ticks column" "0" "$(grep -q '"ticks_total"' scripts/local-autopilot.sh && echo 0 || echo 1)"
+t "F20: pinger passes ticks + market flag to the wording fn" "0" "$(grep -q 'feed_ping_text "\$name" "\$enabled" "\$verdict" "\$connected" "\$sub" "\$ticks" "\$mkt"' scripts/local-autopilot.sh && echo 0 || echo 1)"
 t "F19-7: unknown verdict but connected → awaiting ticks" "✅ groww: connected, 1000 instruments subscribed, awaiting ticks" "$(feed_ping_text groww true unknown true 1000)"
 t "F19-7: down verdict → failed wording" "0" "$(feed_ping_text groww true down false 0 | grep -q 'NOT connected (failed: down)' && echo 0 || echo 1)"
 t "F19-7: degraded verdict named" "0" "$(feed_ping_text groww true degraded true 42 | grep -q 'DEGRADED' && echo 0 || echo 1)"
 t "F19-7: enabled but not yet connected → still connecting" "0" "$(feed_ping_text dhan true unknown false 0 | grep -q 'still connecting' && echo 0 || echo 1)"
-t "F19-7: garbage subscribed count renders as 0" "0" "$(feed_ping_text groww true ok true banana | grep -q ' 0 instruments' && echo 0 || echo 1)"
+t "F19-7: garbage subscribed count renders as 0" "0" "$(feed_ping_text groww true ok true banana | grep -q ' 0 subscribed' && echo 0 || echo 1)"
 t "F19-7: settled when every enabled row connected" "0" "$(feed_rows_settled 'dhan|false|disabled|false|0
 groww|true|ok|true|1000' && echo 0 || echo 1)"
 t "F19-7: NOT settled while an enabled row is unknown+disconnected" "1" "$(feed_rows_settled 'groww|true|unknown|false|0' && echo 0 || echo 1)"

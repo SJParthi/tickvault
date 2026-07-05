@@ -649,19 +649,33 @@ stop_notice_mode() {
 # announced by NOBODY. The launcher now guarantees one Telegram per feed
 # after every launch by reading the app's public /api/feeds/health endpoint.
 
-# feed_ping_text <feed_name> <enabled true|false> <verdict> <connected true|false> <subscribed>
+# feed_ping_text <feed_name> <enabled true|false> <verdict> <connected true|false> <subscribed> [ticks] [market_open 0|1]
 # → one plain-English Telegram line for the feed. An OFF feed is ANNOUNCED
 # (silence was the bug); garbage subscribed counts render as 0. Pure.
+# FIX 20 task 2: "data flowing" was claimed unconditionally on the ok
+# verdict — during a CLOSED market with 0 ticks that is a FALSE claim
+# (audit Rule 11, no false-OK). The wording is now state-based on the
+# tick count (arg 6) + market-open flag (arg 7); omitted args fail SAFE
+# to the honest "awaiting first tick" wording, never to "data flowing".
 feed_ping_text() {
   local name="${1:-feed}" enabled="${2:-}" verdict="${3:-unknown}" connected="${4:-}" sub="${5:-0}"
+  local ticks="${6:-0}" market_open="${7:-0}"
   case "$sub" in '' | *[!0-9]*) sub=0 ;; esac
+  case "$ticks" in '' | *[!0-9]*) ticks=0 ;; esac
+  case "$market_open" in 0 | 1) ;; *) market_open=0 ;; esac
   if [ "$enabled" != "true" ]; then
     echo "⏸️ ${name}: switched OFF for this run (expected in a lab/max-smoke session — not an error)"
     return 0
   fi
   case "$verdict" in
   ok)
-    echo "✅ ${name}: connected, ${sub} instruments subscribed, data flowing"
+    if [ "$ticks" -gt 0 ]; then
+      echo "✅ ${name}: connected, ${sub} instruments subscribed, data flowing"
+    elif [ "$market_open" = "1" ]; then
+      echo "⚠️ ${name}: connected, ${sub} subscribed — NO ticks yet (investigating if it persists)"
+    else
+      echo "✅ ${name}: connected, ${sub} subscribed — awaiting first tick (market closed)"
+    fi
     ;;
   degraded)
     echo "⚠️ ${name}: connected but DEGRADED — ${sub} instruments subscribed; watch the next messages"
@@ -1896,7 +1910,7 @@ try:
 except Exception:
     sys.exit(1)
 for f in d.get("feeds", []):
-    print("|".join(str(f.get(k, "")) for k in ("feed", "enabled", "verdict", "connected", "subscribed_total")).lower())
+    print("|".join(str(f.get(k, "")) for k in ("feed", "enabled", "verdict", "connected", "subscribed_total", "ticks_total")).lower())
 ' 2>/dev/null || true
 }
 
@@ -1919,10 +1933,15 @@ send_feed_status_pings() {
     tg "⚠️ Feed status check: the app did not answer its status endpoint within ${wait_secs}s, so the per-feed states are unknown. It may still be booting — check the next messages or the log."
     return 0
   fi
-  local name enabled verdict connected sub
-  while IFS='|' read -r name enabled verdict connected sub; do
+  # FIX 20 task 2: compute the market-open flag ONCE so the wording is
+  # state-based (ticks>0 = flowing; 0 ticks + closed = awaiting; 0 ticks +
+  # open = honest warning).
+  local mkt=0
+  if in_market_hours_ist "$(hhmm_to_secs "$(ist_hms)")" "$(ist_weekday)"; then mkt=1; fi
+  local name enabled verdict connected sub ticks
+  while IFS='|' read -r name enabled verdict connected sub ticks; do
     [ -n "$name" ] || continue
-    tg "$(feed_ping_text "$name" "$enabled" "$verdict" "$connected" "$sub")"
+    tg "$(feed_ping_text "$name" "$enabled" "$verdict" "$connected" "$sub" "$ticks" "$mkt")"
   done <<<"$rows"
   return 0
 }
