@@ -57,9 +57,9 @@ echo
 
 echo "--- logs directory ---"
 if [[ -d "$LOGS_DIR" ]]; then
-    jsonl_count=$(find "$LOGS_DIR" -maxdepth 1 -name 'errors.jsonl.*' 2>/dev/null | wc -l | tr -d ' ')
+    jsonl_count=$(find "$LOGS_DIR/machine" "$LOGS_DIR" -maxdepth 1 -name 'errors.jsonl.*' 2>/dev/null | wc -l | tr -d ' ')
     summary_exists="no"
-    [[ -f "$LOGS_DIR/errors.summary.md" ]] && summary_exists="yes"
+    { [[ -f "$LOGS_DIR/machine/errors.summary.md" ]] || [[ -f "$LOGS_DIR/errors.summary.md" ]]; } && summary_exists="yes"
     check_pass "logs dir exists: $LOGS_DIR (jsonl_files=$jsonl_count summary=$summary_exists)"
 else
     check_fail "logs dir: $LOGS_DIR" "directory does not exist"

@@ -272,6 +272,103 @@ pub fn index_constituency_migration_should_run(marker_path: &std::path::Path) ->
     !marker_path.exists()
 }
 
+/// Ordering gate for the one-shot ts-pin TRUNCATE migration (FIX 13a,
+/// 2026-07-04).
+///
+/// `TRUNCATE TABLE index_constituency` wipes ALL rows — QuestDB has no
+/// row-level `DELETE ... WHERE feed='dhan'`, so the migration cannot be
+/// feed-scoped. The Groww shared-master writer persists `feed='groww'` rows
+/// into the SAME table from an unordered fire-and-forget boot spawn, so
+/// without ordering the migration could wipe another feed's just-written
+/// rows. Writers of OTHER feeds await this gate (bounded) before their
+/// `index_constituency` append; the migration marks it complete on EVERY
+/// exit path (ran / skipped-via-marker / failed — the failure case is safe
+/// because the marker is not written and the NEXT boot both re-truncates
+/// and re-persists, DEDUP-idempotent).
+///
+/// Instance-testable struct + one process-wide static accessor
+/// ([`index_constituency_migration_gate`]) so unit tests never share global
+/// state.
+pub struct MigrationGate {
+    done: std::sync::atomic::AtomicBool,
+    notify: tokio::sync::Notify,
+    /// F15 hardening (2026-07-05): in-process EXACTLY-ONCE latch for the
+    /// TRUNCATE body. The marker FILE alone is not enough — its post-truncate
+    /// write is best-effort, and the migration wrapper is re-invoked on every
+    /// Dhan lane restart in the SAME process (runtime enable / cold-start
+    /// retry). Without this latch a marker-write failure (or the documented
+    /// operator delete-marker re-run procedure) lets a later in-process
+    /// TRUNCATE wipe rows behind a permanently-green gate. `OnceCell` also
+    /// SERIALIZES concurrent invocations (boot-prefix task racing the
+    /// Dhan-lane call): the second caller waits for the single run instead of
+    /// firing a second TRUNCATE.
+    run_once: tokio::sync::OnceCell<()>,
+}
+
+impl MigrationGate {
+    /// Fresh, un-marked gate.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            done: std::sync::atomic::AtomicBool::new(false),
+            notify: tokio::sync::Notify::new(),
+            run_once: tokio::sync::OnceCell::new(),
+        }
+    }
+
+    /// Mark the migration COMPLETE (ran, skipped, or failed for this boot)
+    /// and wake every waiter. Idempotent.
+    pub fn mark_complete(&self) {
+        self.done.store(true, std::sync::atomic::Ordering::Release);
+        self.notify.notify_waiters();
+    }
+
+    /// Whether the gate has been marked complete.
+    #[must_use]
+    pub fn is_complete(&self) -> bool {
+        self.done.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Await the gate with a bounded timeout. `true` = gate opened; `false` =
+    /// timed out (the caller proceeds degrade-safe). Since the F14 hardening
+    /// (2026-07-05) the migration runs process-globally in the boot prefix
+    /// regardless of feed flags, so a timeout no longer means "no truncate can
+    /// run this process" — it means the boot-prefix migration (including its
+    /// quiet QuestDB readiness probe) has not completed yet; the caller's
+    /// append is best-effort and re-persists next boot if the truncate lands
+    /// after it. Registration-before-recheck ordering makes the
+    /// `notify_waiters` wake race-free.
+    pub async fn wait(&self, timeout: Duration) -> bool {
+        if self.is_complete() {
+            return true;
+        }
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let notified = self.notify.notified();
+            if self.is_complete() {
+                return true;
+            }
+            if tokio::time::timeout_at(deadline, notified).await.is_err() {
+                return self.is_complete();
+            }
+        }
+    }
+}
+
+impl Default for MigrationGate {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// The process-wide ts-pin migration gate instance (`OnceLock` accessor
+/// convention, mirroring `http_client::shared_probe_client`).
+#[must_use]
+pub fn index_constituency_migration_gate() -> &'static MigrationGate {
+    static GATE: std::sync::OnceLock<MigrationGate> = std::sync::OnceLock::new();
+    GATE.get_or_init(MigrationGate::new)
+}
+
 /// One-time, marker-gated `TRUNCATE TABLE index_constituency` to clear the
 /// legacy day-floored rows accumulated before the `ts`-pin fix.
 ///
@@ -295,9 +392,74 @@ pub fn index_constituency_migration_should_run(marker_path: &std::path::Path) ->
 /// niftyindices/Dhan CSV on every boot, so clearing it loses no record that
 /// was not already reproducible (SEBI-safe, same current-state model as
 /// `instrument_lifecycle`).
-// WIRING-EXEMPT: boot wiring lives in crates/app/src/index_constituency_boot.rs before the normal write.
-// TEST-EXEMPT: network I/O orchestration (live QuestDB TRUNCATE) — the pure marker-gate predicate `index_constituency_migration_should_run` is unit-tested.
+/// FIX 13a (2026-07-04): outer wrapper — the inner body carries the real
+/// logic; the wrapper marks the [`index_constituency_migration_gate`]
+/// complete on EVERY exit path (a future early return in the body can never
+/// forget to open the gate for the waiting Groww writer).
+/// F15 hardening (2026-07-05): the wrapper is now EXACTLY-ONCE per process
+/// via the gate's `run_once` latch — see
+/// [`migrate_index_constituency_truncate_once_with_gate`].
+// WIRING-EXEMPT: boot wiring lives in crates/app/src/index_constituency_boot.rs (boot-prefix task + before the normal write).
+// TEST-EXEMPT: thin delegation to the gate-parameterized fn below, which is unit-tested (skip / run-once / concurrent-single-run).
 pub async fn migrate_index_constituency_truncate_once(questdb_config: &QuestDbConfig) {
+    let _ = migrate_index_constituency_truncate_once_with_gate(
+        questdb_config,
+        index_constituency_migration_gate(),
+    )
+    .await;
+}
+
+/// Outcome of one wrapper invocation — observable so the exactly-once
+/// semantics are unit-testable with a LOCAL gate (never shared global state).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TsPinMigrationOutcome {
+    /// This invocation executed the inner migration body (marker check +
+    /// TRUNCATE attempt). At most ONE invocation per gate ever returns this.
+    Ran,
+    /// The inner body was skipped: the gate was already complete, or another
+    /// invocation ran (or is running — this caller waited for it) the body.
+    Skipped,
+}
+
+/// Gate-parameterized migration wrapper (F15 hardening, 2026-07-05).
+///
+/// Semantics:
+/// * The inner TRUNCATE body executes AT MOST ONCE per gate (per process for
+///   the global gate) — `run_once.get_or_init` both latches and SERIALIZES:
+///   a concurrent second caller WAITS for the single run to finish instead of
+///   racing a second TRUNCATE (which could land after another feed's append).
+/// * The gate is marked complete after the once-cell resolves, on every path.
+/// * A marker-write failure (or operator marker delete) can therefore no
+///   longer re-TRUNCATE in the SAME process behind a green gate; the re-run
+///   happens at the NEXT process boot (fresh gate + once-cell), where the
+///   boot-prefix ordering again puts the truncate before the feed appends.
+pub async fn migrate_index_constituency_truncate_once_with_gate(
+    questdb_config: &QuestDbConfig,
+    gate: &MigrationGate,
+) -> TsPinMigrationOutcome {
+    if gate.is_complete() {
+        tracing::debug!(
+            "index_constituency ts-pin migration already complete in-process — skipping"
+        );
+        return TsPinMigrationOutcome::Skipped;
+    }
+    let mut ran = false;
+    gate.run_once
+        .get_or_init(|| async {
+            migrate_index_constituency_truncate_once_inner(questdb_config).await;
+            ran = true;
+        })
+        .await;
+    gate.mark_complete();
+    if ran {
+        TsPinMigrationOutcome::Ran
+    } else {
+        TsPinMigrationOutcome::Skipped
+    }
+}
+
+// TEST-EXEMPT: network I/O orchestration (live QuestDB TRUNCATE) — see the public wrapper above.
+async fn migrate_index_constituency_truncate_once_inner(questdb_config: &QuestDbConfig) {
     let marker_path = std::path::Path::new(INDEX_CONSTITUENCY_TS_PIN_MARKER_PATH);
     if !index_constituency_migration_should_run(marker_path) {
         tracing::debug!(
@@ -679,5 +841,128 @@ mod tests {
         );
         // The via_isin field still carries the resolution flag.
         assert!(line.contains("via_isin=t"), "got: {line}");
+    }
+
+    // ── FIX 13a: MigrationGate primitives (instance-scoped — no global state) ──
+
+    #[tokio::test]
+    async fn test_migration_gate_wait_returns_after_mark() {
+        let gate = MigrationGate::new();
+        gate.mark_complete();
+        assert!(gate.wait(std::time::Duration::from_millis(10)).await);
+    }
+
+    #[tokio::test]
+    async fn test_migration_gate_times_out_when_not_marked() {
+        let gate = MigrationGate::new();
+        // Short real timeout (50ms) — bounded, deterministic false.
+        assert!(!gate.wait(std::time::Duration::from_millis(50)).await);
+    }
+
+    #[tokio::test]
+    async fn test_migration_gate_wakes_concurrent_waiter() {
+        let gate = std::sync::Arc::new(MigrationGate::new());
+        let waiter = {
+            let gate = std::sync::Arc::clone(&gate);
+            tokio::spawn(async move { gate.wait(std::time::Duration::from_secs(5)).await })
+        };
+        tokio::task::yield_now().await;
+        gate.mark_complete();
+        assert!(waiter.await.unwrap_or(false), "waiter must see the mark");
+    }
+
+    #[test]
+    fn test_migration_gate_is_complete_flag() {
+        let gate = MigrationGate::default();
+        assert!(!gate.is_complete());
+        gate.mark_complete();
+        assert!(gate.is_complete());
+        // Idempotent re-mark.
+        gate.mark_complete();
+        assert!(gate.is_complete());
+    }
+
+    #[test]
+    fn test_migration_gate_static_accessor_is_stable() {
+        let a = index_constituency_migration_gate() as *const MigrationGate;
+        let b = index_constituency_migration_gate() as *const MigrationGate;
+        assert_eq!(a, b, "accessor must return the same process-wide instance");
+    }
+
+    // ── F15 hardening (2026-07-05): exactly-once wrapper semantics ──
+    // All tests use a LOCAL gate + an unreachable QuestDB config, so the inner
+    // body's TRUNCATE attempt fails fast (connect refused on 127.0.0.1:1) and
+    // never touches a live database or writes the marker file.
+
+    fn unreachable_questdb() -> QuestDbConfig {
+        QuestDbConfig {
+            host: "127.0.0.1".to_owned(),
+            http_port: 1,
+            pg_port: 1,
+            ilp_port: 1,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_with_gate_skips_when_gate_already_complete() {
+        let gate = MigrationGate::new();
+        gate.mark_complete();
+        let outcome =
+            migrate_index_constituency_truncate_once_with_gate(&unreachable_questdb(), &gate).await;
+        assert_eq!(
+            outcome,
+            TsPinMigrationOutcome::Skipped,
+            "a pre-complete gate must short-circuit without running the inner body"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_with_gate_runs_once_then_skips() {
+        let gate = MigrationGate::new();
+        let cfg = unreachable_questdb();
+        let first = migrate_index_constituency_truncate_once_with_gate(&cfg, &gate).await;
+        assert_eq!(
+            first,
+            TsPinMigrationOutcome::Ran,
+            "first call runs the body"
+        );
+        assert!(gate.is_complete(), "gate marked after the single run");
+        // F15 pin: even though the inner run FAILED (unreachable host — marker
+        // never written), a second in-process invocation must NOT re-run the
+        // TRUNCATE body behind the now-green gate.
+        let second = migrate_index_constituency_truncate_once_with_gate(&cfg, &gate).await;
+        assert_eq!(
+            second,
+            TsPinMigrationOutcome::Skipped,
+            "F15 regression: in-process re-invocation re-ran the TRUNCATE body"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_with_gate_concurrent_callers_single_run() {
+        let gate = std::sync::Arc::new(MigrationGate::new());
+        let cfg = std::sync::Arc::new(unreachable_questdb());
+        let spawn = |gate: std::sync::Arc<MigrationGate>, cfg: std::sync::Arc<QuestDbConfig>| {
+            tokio::spawn(async move {
+                migrate_index_constituency_truncate_once_with_gate(&cfg, &gate).await
+            })
+        };
+        let a = spawn(std::sync::Arc::clone(&gate), std::sync::Arc::clone(&cfg));
+        let b = spawn(std::sync::Arc::clone(&gate), std::sync::Arc::clone(&cfg));
+        let (ra, rb) = (a.await, b.await);
+        let outcomes = [
+            ra.unwrap_or(TsPinMigrationOutcome::Skipped),
+            rb.unwrap_or(TsPinMigrationOutcome::Skipped),
+        ];
+        let ran = outcomes
+            .iter()
+            .filter(|o| **o == TsPinMigrationOutcome::Ran)
+            .count();
+        assert_eq!(
+            ran, 1,
+            "exactly ONE concurrent caller may execute the TRUNCATE body \
+             (OnceCell serializes; the other waits then skips), got {outcomes:?}"
+        );
+        assert!(gate.is_complete(), "gate marked after the serialized run");
     }
 }

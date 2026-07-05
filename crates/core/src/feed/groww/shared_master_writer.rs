@@ -161,6 +161,96 @@ fn classify_persist_failure(stage: &'static str) -> (&'static str, ErrorCode) {
     (stage, ErrorCode::GrowwMaster01PersistFailed)
 }
 
+// ── FIX 13b (2026-07-04): readiness gate + bounded per-stage retry ──────────
+
+/// Max append attempts per master-table stage (1 initial + 2 retries).
+#[cfg(feature = "daily_universe_fetcher")]
+const MASTER_PERSIST_MAX_ATTEMPTS: u32 = 3;
+
+/// QUIET QuestDB readiness probe attempts before the persist gives up
+/// (`stage="readiness"` GROWW-MASTER-01). Deliberately NOT
+/// `wait_for_questdb_ready` — that fn emits BOOT-01/BOOT-02 pages reserved
+/// for the boot path; a cold-path master persist must never fire boot pages.
+#[cfg(feature = "daily_universe_fetcher")]
+const MASTER_READINESS_ATTEMPTS: u32 = 3;
+
+/// Backoff between readiness probe attempts.
+#[cfg(feature = "daily_universe_fetcher")]
+const MASTER_READINESS_BACKOFF_SECS: u64 = 5;
+
+/// Bounded wait for the `index_constituency` ts-pin migration gate (FIX 13a)
+/// before the constituency append. Since the F14 hardening (2026-07-05) the
+/// migration runs in the PROCESS-GLOBAL boot prefix on every boot mode
+/// (spawned before the Groww activation watcher, regardless of
+/// `feeds.dhan_enabled`), so the gate is marked within ~75s worst case
+/// (60s quiet readiness probe + one bounded TRUNCATE attempt) — 120s leaves
+/// ≥ 45s headroom. A timeout means the boot-prefix task is pathologically
+/// delayed; the append proceeds best-effort (rows re-persist next boot if
+/// the truncate lands after them).
+#[cfg(feature = "daily_universe_fetcher")]
+const CONSTITUENCY_MIGRATION_GATE_TIMEOUT_SECS: u64 = 120;
+
+/// PURE retry predicate: another attempt allowed after attempt `n`?
+/// (`n` is 1-based; retries happen while `n < MASTER_PERSIST_MAX_ATTEMPTS`.)
+#[cfg(feature = "daily_universe_fetcher")]
+#[must_use]
+fn master_persist_should_retry(attempt: u32) -> bool {
+    attempt < MASTER_PERSIST_MAX_ATTEMPTS
+}
+
+/// PURE backoff ladder for stage retries: attempt 1 → 2s, attempt 2 → 4s
+/// (exponential, saturating; attempts beyond the ladder cap at 4s — total
+/// worst-case sleep per stage is bounded at ~6s).
+#[cfg(feature = "daily_universe_fetcher")]
+#[must_use]
+fn master_persist_backoff_secs(attempt: u32) -> u64 {
+    2u64.saturating_mul(1u64 << attempt.saturating_sub(1).min(1))
+}
+
+/// QUIET QuestDB readiness probe: `SELECT 1` over the shared probe client,
+/// up to [`MASTER_READINESS_ATTEMPTS`] attempts with
+/// [`MASTER_READINESS_BACKOFF_SECS`] backoff between them. `true` = ready.
+/// Emits ONLY `warn!` per failed attempt (never BOOT-01/02 — see the const
+/// doc above).
+#[cfg(feature = "daily_universe_fetcher")]
+// TEST-EXEMPT: network I/O probe (live QuestDB) — the attempt/backoff constants + retry predicate are unit-tested; the probe body is a bounded loop over the storage-crate-tested shared_probe_client.
+async fn questdb_master_ready(questdb: &QuestDbConfig) -> bool {
+    let url = format!(
+        "http://{}:{}/exec?query=SELECT%201",
+        questdb.host, questdb.http_port
+    );
+    for attempt in 1..=MASTER_READINESS_ATTEMPTS {
+        match tickvault_storage::http_client::shared_probe_client() {
+            Ok(client) => match client.get(&url).send().await {
+                Ok(resp) if resp.status().is_success() => return true,
+                Ok(resp) => {
+                    warn!(
+                        status = %resp.status(),
+                        attempt,
+                        "[feeds] Groww master persist: QuestDB readiness probe non-2xx"
+                    );
+                }
+                Err(err) => {
+                    warn!(
+                        ?err,
+                        attempt, "[feeds] Groww master persist: QuestDB readiness probe failed"
+                    );
+                }
+            },
+            Err(err) => {
+                warn!(
+                    ?err,
+                    attempt, "[feeds] Groww master persist: probe client build failed"
+                );
+            }
+        }
+        if attempt < MASTER_READINESS_ATTEMPTS {
+            tokio::time::sleep(Duration::from_secs(MASTER_READINESS_BACKOFF_SECS)).await;
+        }
+    }
+    false
+}
+
 /// Builds the `instrument_lifecycle` rows for the Groww watch set, all tagged `feed='groww'`.
 ///
 /// Spot/index-only sentinels per the row contract (no derivatives in the watch set):
@@ -841,6 +931,24 @@ pub async fn persist_groww_instruments(
         return;
     }
 
+    // ── FIX 13b (2026-07-04): QuestDB readiness gate ──
+    // One-shot appends previously lost the day's feed='groww' rows on any
+    // transient QuestDB hiccup at activation time. Probe quietly first; if
+    // QuestDB never answers, degrade with the SAME GROWW-MASTER-01 contract
+    // (stage="readiness") and return — the next boot/activation re-runs.
+    if !questdb_master_ready(questdb).await {
+        let (stage, code) = classify_persist_failure("readiness");
+        metrics::counter!("tv_groww_master_persist_errors_total", "stage" => stage).increment(1);
+        error!(
+            code = code.code_str(),
+            stage,
+            attempts = MASTER_READINESS_ATTEMPTS,
+            "[feeds] Groww shared-master persist skipped — QuestDB not ready; \
+             best-effort cold-path master write; feed + ticks unaffected, next boot re-runs"
+        );
+        return;
+    }
+
     // ── instrument_lifecycle table — CREATE FIRST (fresh-DB fix) ──
     // The audit emit below reads the prior `feed='groww'` snapshot from
     // `instrument_lifecycle`. On a fresh-clone / fresh-QuestDB boot that table does
@@ -860,64 +968,125 @@ pub async fn persist_groww_instruments(
     // degrade-safe internally — never aborts the data writes below.
     emit_groww_lifecycle_audit(questdb, set, now_ist_nanos, trading_date_ist_nanos, dry_run).await;
 
-    // ── instrument_lifecycle DATA UPSERT ──
-    match tickvault_storage::instrument_lifecycle_persistence::append_instrument_lifecycle_rows(
-        questdb,
-        &lifecycle_rows,
-    )
-    .await
-    {
-        Ok(()) => {
-            info!(
-                lifecycle_rows = lifecycle_rows.len(),
-                "[feeds] Groww instrument_lifecycle rows persisted (feed=groww)"
-            );
-        }
-        Err(err) => {
-            // Degrade-safe: log + count + RETURN (continue to the next table). The
-            // classifier keeps the stage label + GROWW-MASTER-01 code in one place.
-            let (stage, code) = classify_persist_failure("lifecycle");
-            metrics::counter!("tv_groww_master_persist_errors_total", "stage" => stage)
-                .increment(1);
-            error!(
-                code = code.code_str(),
-                stage,
-                rows = lifecycle_rows.len(),
-                ?err,
-                "[feeds] Groww instrument_lifecycle persist failed — best-effort cold-path \
-                 master write; feed + ticks unaffected, next boot re-runs"
-            );
+    // ── instrument_lifecycle DATA UPSERT (FIX 13b: bounded retry) ──
+    let mut attempt: u32 = 0;
+    loop {
+        attempt = attempt.saturating_add(1);
+        match tickvault_storage::instrument_lifecycle_persistence::append_instrument_lifecycle_rows(
+            questdb,
+            &lifecycle_rows,
+        )
+        .await
+        {
+            Ok(()) => {
+                info!(
+                    lifecycle_rows = lifecycle_rows.len(),
+                    "[feeds] Groww instrument_lifecycle rows persisted (feed=groww)"
+                );
+                break;
+            }
+            Err(err) if master_persist_should_retry(attempt) => {
+                let backoff_secs = master_persist_backoff_secs(attempt);
+                warn!(
+                    ?err,
+                    attempt,
+                    backoff_secs,
+                    "[feeds] Groww instrument_lifecycle persist attempt failed — retrying"
+                );
+                tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
+            }
+            Err(err) => {
+                // Degrade-safe FINAL failure: log + count + continue to the next
+                // table (unchanged contract). The classifier keeps the stage
+                // label + GROWW-MASTER-01 code in one place.
+                let (stage, code) = classify_persist_failure("lifecycle");
+                metrics::counter!("tv_groww_master_persist_errors_total", "stage" => stage)
+                    .increment(1);
+                error!(
+                    code = code.code_str(),
+                    stage,
+                    rows = lifecycle_rows.len(),
+                    attempts = attempt,
+                    ?err,
+                    "[feeds] Groww instrument_lifecycle persist failed — best-effort cold-path \
+                     master write; feed + ticks unaffected, next boot re-runs"
+                );
+                break;
+            }
         }
     }
 
-    // ── index_constituency ──
+    // ── index_constituency (FIX 13a gate + FIX 13b bounded retry) ──
+    // The one-shot ts-pin TRUNCATE migration wipes ALL rows — QuestDB has no
+    // row-level DELETE, so it cannot be feed-scoped. Await the migration gate
+    // (bounded) so our feed='groww' rows land AFTER the truncate. Since the
+    // F14 hardening (2026-07-05) the migration runs in the PROCESS-GLOBAL
+    // boot prefix on every boot mode (never only behind the Dhan lane), is
+    // exactly-once in-process, and marks the gate within ~75s worst case —
+    // so a timeout here means the boot-prefix task (incl. its quiet QuestDB
+    // readiness probe) is pathologically delayed, NOT that no truncate can
+    // run. Proceeding on timeout is best-effort: if the truncate lands after
+    // this append, the rows are re-persisted next boot/activation
+    // (GROWW-MASTER-01 envelope).
+    if !tickvault_storage::index_constituency_persistence::index_constituency_migration_gate()
+        .wait(Duration::from_secs(
+            CONSTITUENCY_MIGRATION_GATE_TIMEOUT_SECS,
+        ))
+        .await
+    {
+        warn!(
+            timeout_secs = CONSTITUENCY_MIGRATION_GATE_TIMEOUT_SECS,
+            "[feeds] Groww index_constituency persist: ts-pin migration gate not marked \
+             within the bounded wait — appending best-effort; if the one-shot table \
+             migration's truncate lands after this append, today's feed='groww' rows \
+             are wiped and re-persisted at the next boot/activation"
+        );
+    }
     tickvault_storage::index_constituency_persistence::ensure_index_constituency_table(questdb)
         .await;
-    match tickvault_storage::index_constituency_persistence::append_index_constituency_rows(
-        questdb,
-        &constituency_rows,
-    )
-    .await
-    {
-        Ok(()) => {
-            info!(
-                constituency_rows = constituency_rows.len(),
-                "[feeds] Groww index_constituency rows persisted (feed=groww)"
-            );
-        }
-        Err(err) => {
-            // Degrade-safe: log + count + RETURN. Same classifier, never aborts.
-            let (stage, code) = classify_persist_failure("constituency");
-            metrics::counter!("tv_groww_master_persist_errors_total", "stage" => stage)
-                .increment(1);
-            error!(
-                code = code.code_str(),
-                stage,
-                rows = constituency_rows.len(),
-                ?err,
-                "[feeds] Groww index_constituency persist failed — best-effort cold-path \
-                 master write; feed + ticks unaffected, next boot re-runs"
-            );
+    let mut attempt: u32 = 0;
+    loop {
+        attempt = attempt.saturating_add(1);
+        match tickvault_storage::index_constituency_persistence::append_index_constituency_rows(
+            questdb,
+            &constituency_rows,
+        )
+        .await
+        {
+            Ok(()) => {
+                info!(
+                    constituency_rows = constituency_rows.len(),
+                    "[feeds] Groww index_constituency rows persisted (feed=groww)"
+                );
+                break;
+            }
+            Err(err) if master_persist_should_retry(attempt) => {
+                let backoff_secs = master_persist_backoff_secs(attempt);
+                warn!(
+                    ?err,
+                    attempt,
+                    backoff_secs,
+                    "[feeds] Groww index_constituency persist attempt failed — retrying"
+                );
+                tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
+            }
+            Err(err) => {
+                // Degrade-safe FINAL failure: log + count + return. Same
+                // classifier, never aborts the feed or activation.
+                let (stage, code) = classify_persist_failure("constituency");
+                metrics::counter!("tv_groww_master_persist_errors_total", "stage" => stage)
+                    .increment(1);
+                error!(
+                    code = code.code_str(),
+                    stage,
+                    rows = constituency_rows.len(),
+                    attempts = attempt,
+                    ?err,
+                    "[feeds] Groww index_constituency persist failed — best-effort cold-path \
+                     master write; feed + ticks unaffected, next boot re-runs"
+                );
+                break;
+            }
         }
     }
 }
@@ -1955,5 +2124,83 @@ mod tests {
         };
         // Returns () without any network I/O — the stub body is empty.
         persist_groww_instruments(&questdb, &set, "2026-06-28", false).await;
+    }
+
+    // ── FIX 13b (2026-07-04): readiness + bounded-retry primitives ──
+
+    #[cfg(feature = "daily_universe_fetcher")]
+    #[test]
+    fn test_master_persist_backoff_secs_ladder() {
+        // attempt 1 → 2s, attempt 2 → 4s, beyond the ladder caps at 4s.
+        assert_eq!(master_persist_backoff_secs(1), 2);
+        assert_eq!(master_persist_backoff_secs(2), 4);
+        assert_eq!(master_persist_backoff_secs(3), 4);
+        assert_eq!(master_persist_backoff_secs(u32::MAX), 4);
+        // Defensive: attempt 0 (unreachable — attempts are 1-based) still bounded.
+        assert_eq!(master_persist_backoff_secs(0), 2);
+    }
+
+    #[cfg(feature = "daily_universe_fetcher")]
+    #[test]
+    fn test_master_persist_should_retry_boundaries() {
+        assert!(master_persist_should_retry(1));
+        assert!(master_persist_should_retry(2));
+        assert!(!master_persist_should_retry(MASTER_PERSIST_MAX_ATTEMPTS));
+        assert!(!master_persist_should_retry(
+            MASTER_PERSIST_MAX_ATTEMPTS + 1
+        ));
+        assert_eq!(MASTER_PERSIST_MAX_ATTEMPTS, 3, "operator-locked 3 attempts");
+    }
+
+    #[cfg(feature = "daily_universe_fetcher")]
+    #[test]
+    fn test_classify_persist_failure_readiness_stage() {
+        let (stage, code) = classify_persist_failure("readiness");
+        assert_eq!(stage, "readiness");
+        assert_eq!(code.code_str(), "GROWW-MASTER-01");
+    }
+
+    /// FIX 13a ratchet (source-scan): the constituency append must await the
+    /// ts-pin migration gate FIRST, so the Dhan-lane TRUNCATE can never wipe
+    /// just-written `feed='groww'` rows (QuestDB has no row-level DELETE).
+    #[cfg(feature = "daily_universe_fetcher")]
+    #[test]
+    fn ratchet_constituency_append_waits_for_migration_gate() {
+        let src = include_str!("shared_master_writer.rs");
+        let gate = src
+            .find("index_constituency_migration_gate()")
+            .expect("the constituency stage must await the migration gate");
+        let append = src
+            .find("append_index_constituency_rows(")
+            .expect("the constituency append must exist");
+        assert!(
+            gate < append,
+            "FIX 13a regression: the migration-gate wait must precede the \
+             index_constituency append in persist_groww_instruments"
+        );
+    }
+
+    /// F13 wording pin (2026-07-05): the gate-timeout `warn!` must NOT carry
+    /// the FALSE "Dhan lane likely OFF; no truncate can run" premise (untrue
+    /// on the dhan+groww profile AND under the D2b runtime-enable lifecycle —
+    /// it misdirected triage), and MUST state the honest best-effort
+    /// consequence instead.
+    #[cfg(feature = "daily_universe_fetcher")]
+    #[test]
+    fn ratchet_gate_timeout_warn_is_honest() {
+        let src = include_str!("shared_master_writer.rs");
+        // Needle assembled at runtime so THIS test's own source (which
+        // include_str! sees) never contains the banned literal.
+        let false_premise = ["no truncate", " can run)"].concat();
+        assert!(
+            !src.contains(&false_premise),
+            "F13 regression: the gate-timeout warn re-acquired the false \
+             'Dhan lane OFF => no truncate' premise"
+        );
+        assert!(
+            src.contains("re-persisted at the next boot/activation"),
+            "F13 regression: the gate-timeout warn lost its honest \
+             best-effort consequence wording"
+        );
     }
 }
