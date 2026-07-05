@@ -143,7 +143,7 @@ fi
 # LIVE ERROR TAIL — inline the last 10 structured ERROR events, if any.
 # Every Claude session / cowork task starts with this in context so nobody
 # has to call tail_errors manually.
-LATEST_JSONL=$(ls -t "$CWD"/data/logs/errors.jsonl.* 2>/dev/null | head -1)
+LATEST_JSONL=$(ls -t "$CWD"/data/logs/machine/errors.jsonl.* "$CWD"/data/logs/errors.jsonl.* 2>/dev/null | head -1)
 if [ -n "$LATEST_JSONL" ] && [ -f "$LATEST_JSONL" ]; then
   TAIL_COUNT=$(wc -l < "$LATEST_JSONL" 2>/dev/null | tr -d ' ')
   if [ -n "$TAIL_COUNT" ] && [ "$TAIL_COUNT" -gt 0 ]; then
@@ -163,11 +163,14 @@ if [ -n "$LATEST_JSONL" ] && [ -f "$LATEST_JSONL" ]; then
 fi
 
 # ERROR SUMMARY GLANCE — one-line answer to "anything broken?"
-SUMMARY_FILE="$CWD/data/logs/errors.summary.md"
+SUMMARY_FILE="$CWD/data/logs/machine/errors.summary.md"
+if [ ! -f "$SUMMARY_FILE" ]; then
+  SUMMARY_FILE="$CWD/data/logs/errors.summary.md"
+fi
 if [ -f "$SUMMARY_FILE" ]; then
   TOTAL=$(grep -oE 'Total events: [0-9]+' "$SUMMARY_FILE" 2>/dev/null | head -1 | awk '{print $3}')
   NOVEL=$(grep -oE 'Novel signatures: [0-9]+' "$SUMMARY_FILE" 2>/dev/null | head -1 | awk '{print $3}')
   if [ -n "$TOTAL" ] || [ -n "$NOVEL" ]; then
-    echo "Error snapshot: total=${TOTAL:-?}  novel=${NOVEL:-?}  (open data/logs/errors.summary.md)" >&2
+    echo "Error snapshot: total=${TOTAL:-?}  novel=${NOVEL:-?}  (open data/logs/machine/errors.summary.md)" >&2
   fi
 fi

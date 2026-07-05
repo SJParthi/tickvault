@@ -6,8 +6,8 @@ error observability pipeline to Claude Code as structured MCP tools.
 ## Why
 
 The observability chain already writes:
-- `data/logs/errors.jsonl.YYYY-MM-DD-HH` — structured JSONL, ERROR-only, hourly rotated
-- `data/logs/errors.summary.md` — human + Claude-readable signature summary
+- `data/logs/machine/errors.jsonl.YYYY-MM-DD-HH` — structured JSONL, ERROR-only, hourly rotated
+- `data/logs/machine/errors.summary.md` — human + Claude-readable signature summary
 - `data/logs/auto-fix.log` — audit trail of triage-hook actions
 - `.claude/state/triage-seen.jsonl` — edge-trigger dedup state
 

@@ -228,14 +228,17 @@ pub async fn ensure_infra_running(questdb_config: &QuestDbConfig) {
         ),
     ];
 
-    // Ensure data/logs/app.log exists before Docker mounts it.
-    // Alloy container mounts ../../data/logs → /var/log/tickvault/ to watch app.log.
+    // Ensure the machine app.log placeholder exists before Docker mounts it.
+    // Alloy container mounts ../../data/logs → /var/log/tv-app to watch the
+    // log files; 2026-07-05 operator directive moved every machine sink
+    // (incl. this placeholder) under data/logs/machine/ so the data/logs/
+    // top level stays the one human log surface.
     // If the directory doesn't exist, Docker creates it as root-owned.
     // If app.log doesn't exist, Alloy's file watch fails → healthcheck fails → DOWN.
-    if let Err(err) = std::fs::create_dir_all("data/logs") {
+    if let Err(err) = std::fs::create_dir_all(crate::observability::MACHINE_LOGS_DIR) {
         warn!(
             ?err,
-            "failed to create data/logs directory for Alloy log mount"
+            "failed to create data/logs/machine directory for Alloy log mount"
         );
     }
     // Create the app.log file itself (Alloy needs it to exist at startup).
@@ -243,11 +246,11 @@ pub async fn ensure_infra_running(questdb_config: &QuestDbConfig) {
     if let Err(err) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open("data/logs/app.log")
+        .open(crate::boot_helpers::APP_LOG_FILE_PATH)
     {
         warn!(
             ?err,
-            "failed to create data/logs/app.log for Alloy file watch"
+            "failed to create data/logs/machine/app.log for Alloy file watch"
         );
     }
 
