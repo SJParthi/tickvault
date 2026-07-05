@@ -798,6 +798,40 @@ t "F22: watcher reads the real per-conn status files" "0" "$(sed -n '/^conn_rece
 t "F22: watcher self-terminates on a duration bound" "0" "$(sed -n '/^run_rung_receipt_watcher()/,/^}/p' scripts/local-autopilot.sh | grep -q 'elapsed.*duration' && echo 0 || echo 1)"
 t "F22: NoServers hint scans the log for the known signature" "0" "$(sed -n '/^noservers_recent()/,/^}/p' scripts/local-autopilot.sh | grep -q 'NoServersError' && echo 0 || echo 1)"
 
+# ── FIX 23: stray sweep decision + log-storm guard + load snapshot ─────────
+t "F23: extras beyond expected → the OLDEST pids are killed" \
+  "$(printf '100\n200')" "$(stray_kill_pids 1 100 200 300)"
+t "F23: expected 0 → every stray pid is killed" \
+  "$(printf '100\n200\n300')" "$(stray_kill_pids 0 100 200 300)"
+t "F23: count within expected → nothing killed" "" "$(stray_kill_pids 3 100 200 300)"
+t "F23: no pids at all → nothing killed" "" "$(stray_kill_pids 0)"
+t "F23: garbage expected fails SAFE (kill nothing)" "" "$(stray_kill_pids banana 100 200)"
+t "F23: garbage pids are ignored, numeric ones decided" "100" "$(stray_kill_pids 1 100 banana 200)"
+t "F23: unsorted input still keeps the newest" "$(printf '5\n90')" "$(stray_kill_pids 1 90 300 5)"
+t "F23: pids_except drops only the keeper" "$(printf '100\n300')" "$(pids_except 200 100 200 300)"
+t "F23: pids_except with empty keeper keeps all" "$(printf '100\n200')" "$(pids_except '' 100 200)"
+t "F23: log growth over the cap → warn" "0" "$(log_growth_exceeded 100 350 200 && echo 0 || echo 1)"
+t "F23: log growth at the cap → no warn" "1" "$(log_growth_exceeded 100 300 200 && echo 0 || echo 1)"
+t "F23: log shrank (rotation) → no warn" "1" "$(log_growth_exceeded 300 100 200 && echo 0 || echo 1)"
+t "F23: garbage sizes fail SAFE (no warn)" "1" "$(log_growth_exceeded banana 300 200 && echo 0 || echo 1)"
+t "F23: empty sizes fail SAFE (no warn)" "1" "$(log_growth_exceeded '' '' 200 && echo 0 || echo 1)"
+t "F23: load snapshot line renders all three parts" \
+  "load: cpu 42% total, ~12.3 GB in use, top: tickvault 25%, questdb 9%, python3 3%" \
+  "$(load_snapshot_text 42 12.3 "tickvault 25%, questdb 9%, python3 3%")"
+t "F23: missing probe values render ? (never fabricated)" \
+  "load: cpu ?% total, ~? GB in use, top: ?" "$(load_snapshot_text '' '' '')"
+# wiring pins
+t "F23: probe outcome path sweeps strays" "1" "$(grep -c 'sweep_stray_lab_processes 0 # FIX 23: post-probe stray sweep' scripts/local-autopilot.sh || true)"
+t "F23: manual stop sweeps strays" "1" "$(grep -c 'sweep_stray_lab_processes 0 # FIX 23: a Stop leaves NO leftover lab process behind' scripts/local-autopilot.sh || true)"
+t "F23: both adopt paths sweep non-children strays" "2" "$(grep -c 'sweep_stray_lab_processes 0 "\$' scripts/local-autopilot.sh || true)"
+t "F23: adopted app's own sidecars are excluded (parent match)" "0" "$(sed -n '/^stray_sidecar_candidates()/,/^}/p' scripts/local-autopilot.sh | grep -q 'ppid' && echo 0 || echo 1)"
+t "F23: telegram fires only when something was swept" "0" "$(sed -n '/^sweep_stray_lab_processes()/,/^}/p' scripts/local-autopilot.sh | grep -q 'caff_killed" -gt 0' && echo 0 || echo 1)"
+t "F23: a single caffeinate is never touched" "0" "$(sed -n '/^sweep_stray_lab_processes()/,/^}/p' scripts/local-autopilot.sh | grep -q 'caff_total:-0}" -gt 1' && echo 0 || echo 1)"
+t "F23: monitor loop carries the log-storm guard" "0" "$(sed -n '/^monitor_until_eod()/,/^}/p' scripts/local-autopilot.sh | grep -q 'log_growth_exceeded' && echo 0 || echo 1)"
+t "F23: monitor loop logs the load snapshot" "0" "$(sed -n '/^monitor_until_eod()/,/^}/p' scripts/local-autopilot.sh | grep -q 'load_snapshot_line' && echo 0 || echo 1)"
+t "F23: cmd_status shows the load snapshot" "0" "$(sed -n '/^cmd_status()/,/^}/p' scripts/local-autopilot.sh | grep -q 'load_snapshot_line' && echo 0 || echo 1)"
+t "F23: sweep subcommand dispatched" "0" "$(grep -q 'sweep) sweep_stray_lab_processes' scripts/local-autopilot.sh && echo 0 || echo 1)"
+
 echo
 echo "local-autopilot pure-logic tests: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

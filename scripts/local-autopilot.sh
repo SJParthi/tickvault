@@ -1426,6 +1426,55 @@ fleet_summary_text() {
   echo "${v} fleet at ceiling ${conns}/${ceiling}: ${s} streaming, ${l} loaded-unverified, ${r} retrying — ${subs} instruments subscribed across the fleet"
 }
 
+# ── FIX 23 pure cores: stray sweep decision + log-storm + load snapshot ────
+
+# stray_kill_pids <expected> <pid…> → the pids to kill, one per line: sort
+# numerically, KEEP the NEWEST <expected> (highest pids — strays are
+# leftovers from EARLIER runs, so older pids go), kill the rest. Garbage
+# expected or no extras → output nothing (fail SAFE: never kill on doubt).
+# Pure.
+stray_kill_pids() {
+  local expected="${1:-0}"
+  shift 2>/dev/null || true
+  case "$expected" in '' | *[!0-9]*) return 0 ;; esac
+  local pids total
+  pids=$(printf '%s\n' "$@" | tr ' ' '\n' | grep -E '^[0-9]+$' | sort -n || true)
+  [ -n "$pids" ] || return 0
+  total=$(printf '%s\n' "$pids" | grep -c .)
+  [ "$total" -gt "$expected" ] || return 0
+  printf '%s\n' "$pids" | head -n $((total - expected))
+  return 0
+}
+
+# pids_except <keeper> <pid…> → every valid pid except the keeper, one per
+# line (duplicate-caffeinate sweep). Pure.
+pids_except() {
+  local keeper="${1:-}"
+  shift 2>/dev/null || true
+  printf '%s\n' "$@" | tr ' ' '\n' | grep -E '^[0-9]+$' | grep -vx "${keeper:-NONE}" || true
+  return 0
+}
+
+# log_growth_exceeded <start_mb> <now_mb> <limit_mb> → rc 0 when the log
+# directory grew MORE than limit_mb this session. Garbage/negative → rc 1
+# (fail safe: never warn on doubt). Pure.
+log_growth_exceeded() {
+  local a="${1:-}" b="${2:-}" lim="${3:-200}"
+  [ -n "$a" ] && [ -n "$b" ] && [ -n "$lim" ] || return 1
+  case "${a}${b}${lim}" in *[!0-9]*) return 1 ;; esac
+  [ $((b - a)) -gt "$lim" ]
+}
+
+# load_snapshot_text <cpu_pct> <mem_gb> <top3> → one status line; empty
+# inputs render "?" (never fabricated numbers). Pure.
+load_snapshot_text() {
+  local cpu="${1:-?}" mem="${2:-?}" top="${3:-?}"
+  [ -n "$cpu" ] || cpu="?"
+  [ -n "$mem" ] || mem="?"
+  [ -n "$top" ] || top="?"
+  echo "load: cpu ${cpu}% total, ~${mem} GB in use, top: ${top}"
+}
+
 # ── End of pure functions. Library mode stops here. ────────────────────────
 if [[ "${AUTOPILOT_LIB:-0}" == "1" ]]; then
   return 0 2>/dev/null || exit 0
@@ -2334,6 +2383,76 @@ spawn_rung_receipt_watcher() {
   ) || true
 }
 
+# ═══ FIX 23 runtime — stray sweep + log-storm guard + load snapshot ═════════
+# A crashed probe/run can leave orphan sidecar processes fighting the next
+# run for the socket + duplicate caffeinate holders. Sweep them at the
+# natural boundaries (probe cleanup, manual stop, app adopt) — ONE Telegram
+# only when strays were actually found.
+
+# stray_sidecar_candidates [app_pid] → sidecar pids NOT parented by the live
+# app (an app's own supervised sidecars are never candidates). Runtime.
+stray_sidecar_candidates() {
+  local app="${1:-}" p ppid
+  for p in $(pgrep -f 'groww_sidecar\.py' 2>/dev/null || true); do
+    if [ -n "$app" ]; then
+      ppid=$(ps -o ppid= -p "$p" 2>/dev/null | tr -d ' ')
+      [ "$ppid" = "$app" ] && continue
+    fi
+    echo "$p"
+  done
+  return 0
+}
+
+# sweep_stray_lab_processes [expected] [app_pid] — kill leftover sidecars
+# beyond <expected> (default 0; candidates exclude the live app's own
+# children) + duplicate caffeinate processes (keep the pidfile holder, or
+# the newest when >1 with no holder; a SINGLE caffeinate is never touched —
+# it may be the operator's own). Telegram fires ONLY when something was
+# actually swept. Runtime.
+sweep_stray_lab_processes() {
+  local expected="${1:-0}" app_pid="${2:-}" candidates kill_list killed=0 p
+  candidates=$(stray_sidecar_candidates "$app_pid")
+  # shellcheck disable=SC2086
+  kill_list=$(stray_kill_pids "$expected" $candidates)
+  for p in $kill_list; do
+    kill -TERM "$p" 2>/dev/null || true
+    killed=$((killed + 1))
+  done
+  local caff_pids caff_total caff_keeper="" caff_killed=0
+  caff_pids=$(pgrep -x caffeinate 2>/dev/null || true)
+  caff_total=$(printf '%s\n' "$caff_pids" | grep -c . || true)
+  if [ "${caff_total:-0}" -gt 1 ]; then
+    if [ -f "$CAFF_PIDFILE" ] && kill -0 "$(cat "$CAFF_PIDFILE")" 2>/dev/null; then
+      caff_keeper=$(cat "$CAFF_PIDFILE")
+    else
+      caff_keeper=$(printf '%s\n' "$caff_pids" | sort -n | tail -1)
+    fi
+    # shellcheck disable=SC2086
+    for p in $(pids_except "$caff_keeper" $caff_pids); do
+      kill -TERM "$p" 2>/dev/null || true
+      caff_killed=$((caff_killed + 1))
+    done
+  fi
+  if [ "$killed" -gt 0 ] || [ "$caff_killed" -gt 0 ]; then
+    log "stray sweep: killed ${killed} sidecar(s) [$(printf '%s' "$kill_list" | tr '\n' ' ')] + ${caff_killed} duplicate caffeinate (expected=${expected} app_pid=${app_pid:--})"
+    tg "🧹 Stray process sweep: stopped ${killed} leftover feed helper(s) and ${caff_killed} duplicate keep-awake process(es) left behind by an earlier run — they were holding resources the next run needs."
+  else
+    log "stray sweep: clean (expected=${expected} app_pid=${app_pid:--}, no duplicate caffeinate)"
+  fi
+  return 0
+}
+
+# load_snapshot_line — cpu% total + memory in use + top 3 processes by cpu.
+# ps-only (portable Mac/Linux), degrade-safe to "?". Runtime.
+load_snapshot_line() {
+  local cpu mem top
+  cpu=$(ps -A -o %cpu= 2>/dev/null | awk '{s+=$1} END {printf "%.0f", s}')
+  mem=$(ps -A -o rss= 2>/dev/null | awk '{s+=$1} END {printf "%.1f", s/1048576}')
+  top=$(ps -A -o %cpu=,comm= 2>/dev/null | sort -rn | head -3 |
+    awk '{n=split($2,a,"/"); printf "%s%s %.0f%%", (NR>1?", ":""), a[n], $1}')
+  load_snapshot_text "$cpu" "$mem" "$top"
+}
+
 # app_git_sha — the running app's build provenance from GET /health (B9
 # git_sha field). Empty on any failure (app down, old build without the
 # field). Runtime (network); the compare itself is the pure sha_compare.
@@ -2476,6 +2595,9 @@ start_app_inner() { # $1 = label for the log
     kept_pid=$(cat "$APP_PIDFILE")
     if handle_adopt_verdict "$(adopt_gate)" "$kept_pid"; then
       log "app already running (pid $kept_pid) — not double-starting"
+      # FIX 23: the adopted app's OWN sidecars are excluded (parent match);
+      # anything else claiming the Groww socket is a stray from an earlier run.
+      sweep_stray_lab_processes 0 "$kept_pid"
       return 0
     fi
     log "previous app (pid $kept_pid) stopped by the adopt gate — launching fresh"
@@ -2501,6 +2623,7 @@ start_app_inner() { # $1 = label for the log
     # FIX 8: a healthy discovered app must ALSO pass the build-freshness +
     # database-integrity gate before being adopted as today's app.
     if handle_adopt_verdict "$(adopt_gate)" "$existing"; then
+      sweep_stray_lab_processes 0 "$existing" # FIX 23: sweep non-children strays
       return 0
     fi
     log "discovered app (pid $existing) stopped by the adopt gate — launching fresh"
@@ -2908,6 +3031,10 @@ maybe_run_probe_once() {
     fi
     ;;
   esac
+  # FIX 23: whatever the probe outcome, no sidecar process may outlive it —
+  # a leftover fleet member would fight the upcoming live start for the
+  # Groww socket and masquerade as a provider reject.
+  sweep_stray_lab_processes 0 # FIX 23: post-probe stray sweep
   # FIX 10 A8: honor an operator Stop pressed DURING the probe. The probe's
   # OWN internal stop writes the manual-stop marker within seconds of probe
   # start (inside the grace window); a marker noticeably NEWER than that
@@ -3061,6 +3188,7 @@ cmd_stop() {
   stop_app
   bash scripts/groww-scale-test.sh clean >>"$(current_log)" 2>&1 || true
   stop_caffeinate
+  sweep_stray_lab_processes 0 # FIX 23: a Stop leaves NO leftover lab process behind
   # Leave QuestDB up — but if the container is degraded, restart it now so
   # the next Start (and any manual queries) find a healthy database.
   if docker_alive; then
@@ -3166,6 +3294,7 @@ cmd_status() {
     echo "manual : no active stop marker"
   fi
   echo "logs   : $ONE_FILE_LINK → $(current_log) (ONE file — app + launcher + build output)"
+  echo "$(load_snapshot_line)" # FIX 23: cpu/mem/top-3 at a glance
 }
 
 # scale-window override file: "START END" (ISO dates) in
@@ -3263,6 +3392,12 @@ monitor_until_eod() {
   # FIX 21: once-per-day edge latches keyed on the IST date so a loop that
   # survives IST midnight re-arms for the next trading day.
   local socket_probe_day="" tick_class_day="" now_secs today_ist
+  # FIX 23: log-storm guard — baseline the log dir at session start; warn
+  # ONCE when it grows past the per-session cap (a repeating error can
+  # otherwise fill the disk in silence).
+  local log_mb_start log_mb_now log_storm_warned=0
+  log_mb_start=$(du -sm data/logs 2>/dev/null | awk '{print $1}')
+  LOG_STORM_SESSION_MB="${LOG_STORM_SESSION_MB:-200}"
   VM_DISK_WARN_PCT="${VM_DISK_WARN_PCT:-85}"
   while :; do
     if (($(secs_until "$EOD_STOP_IST" "$(ist_hms)") == 0)); then break; fi
@@ -3318,6 +3453,15 @@ monitor_until_eod() {
       # filling (QuestDB writes land INSIDE the VM). Probe the VM fs use%
       # through the database container; edge-latched warning >85%; a
       # `docker system df` breakdown goes to the log for context.
+      # FIX 23: log-storm guard (once per session) + a load snapshot line so
+      # the log carries the machine's health context on the same cadence.
+      log_mb_now=$(du -sm data/logs 2>/dev/null | awk '{print $1}')
+      if [ "$log_storm_warned" = "0" ] &&
+        log_growth_exceeded "${log_mb_start:-}" "${log_mb_now:-}" "$LOG_STORM_SESSION_MB"; then
+        tg "⚠️ The log folder grew $((log_mb_now - log_mb_start)) MB this session (over the ${LOG_STORM_SESSION_MB} MB cap) — something is writing errors in a loop. The capture keeps running; check the log when convenient."
+        log_storm_warned=1
+      fi
+      log "$(load_snapshot_line)"
       vm_pct=$(docker_vm_disk_pct)
       if vm_disk_high "$vm_pct" "$VM_DISK_WARN_PCT"; then
         if [ "$vm_disk_warned" = "0" ]; then
@@ -3607,6 +3751,7 @@ feed-pings) send_feed_status_pings "${2:-180}" ;;  # FIX 19 item 7: detached per
 tick-class-check) run_tick_class_check ;;          # FIX 21: on-demand per-class tick coverage verdict
 socket-probe) run_groww_socket_probe ;;            # FIX 21 addendum: on-demand groww socket reachability
 rung-receipts) run_rung_receipt_watcher "${2:-5400}" "${3:-30}" ;; # FIX 22: detached rung receipt watcher
+sweep) sweep_stray_lab_processes "${2:-0}" "${3:-}" ;;             # FIX 23: on-demand stray-process sweep
 status) cmd_status ;;
 *)
   echo "usage: $0 [run|start|stop|dev|monitor|feed-pings|status]" >&2
