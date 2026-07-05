@@ -370,12 +370,19 @@ t "mem hint: below target → write" "write" "$(docker_mem_hint_decision 8192 10
 t "mem hint: no current value → write" "write" "$(docker_mem_hint_decision "" 10240)"
 t "mem hint: garbage current → write" "write" "$(docker_mem_hint_decision abc 10240)"
 t "mem hint: garbage target → skip (fail-quiet)" "skip" "$(docker_mem_hint_decision 8192 "")"
-# Ratchets: the default path is clamp-and-proceed with NO Docker restart
-# reachable — no osascript quit anywhere; 'open -a Docker' only at the
-# ensure-docker start site (Docker not running at all ≠ a mid-run restart);
-# the hint log promises next-start semantics; the clamp remains wired.
-t "FIX 17: no Docker Desktop quit/restart anywhere" "0" "$(grep -c 'quit app' scripts/local-autopilot.sh || true)"
-t "FIX 17: 'open -a Docker' only at the not-running start site" "1" "$(grep -c 'open -a Docker' scripts/local-autopilot.sh || true)"
+# Ratchets (FIX 17 → FIX 31): the default path is clamp-and-proceed; a
+# Docker quit exists ONLY inside the FIX 31 cold-start cycle (app + database
+# provably down before it may fire — never a mid-run restart); every
+# 'open -a Docker' code site lives in either the FIX 31 cycle or the
+# ensure-docker not-running start site; the hint log promises next-start
+# semantics; the clamp remains wired.
+t "FIX 31: exactly ONE Docker quit command in the whole script" "1" "$(grep -c "osascript -e 'quit app" scripts/local-autopilot.sh || true)"
+t "FIX 31: that quit lives INSIDE fix31_auto_raise_docker_mem" "1" \
+  "$(sed -n '/^fix31_auto_raise_docker_mem()/,/^}/p' scripts/local-autopilot.sh | grep -c "osascript -e 'quit app" || true)"
+t "FIX 31: 'open -a Docker' code sites = 3 in fix31 + 1 at the not-running start site" "4" \
+  "$(grep -cE '^[[:space:]]+open -a Docker' scripts/local-autopilot.sh || true)"
+t "FIX 31: ensure_docker keeps its single not-running start site" "1" \
+  "$(sed -n '/^ensure_docker()/,/^}/p' scripts/local-autopilot.sh | grep -c 'open -a Docker' || true)"
 t "FIX 17: hint log promises next-start (no mid-run apply claim)" "1" "$(grep -c 'continuing now at current memory' scripts/local-autopilot.sh || true)"
 t "FIX 17: clamp-and-proceed remains the primary path" "1" "$(grep -c 'auto-clamping QDB_MEM_LIMIT' scripts/local-autopilot.sh || true)"
 t "FIX 17: hint call is non-blocking (|| true) in check_docker_vm_memory" "1" "$(sed -n '/^check_docker_vm_memory()/,/^}/p' scripts/local-autopilot.sh | grep -c 'hint_docker_vm_memory .* || true')"
@@ -1072,6 +1079,81 @@ t "F30: scale-day precedence — armed marker owns the fleet budget" "0" \
   "$(sed -n '/^cmd_run()/,/^}/p' scripts/local-autopilot.sh | grep -q 'the marker owns the fleet budget' && echo 0 || echo 1)"
 t "F30: scale-day precedence gate reads the same marker state" "0" \
   "$(sed -n '/^cmd_run()/,/^}/p' scripts/local-autopilot.sh | grep -q 'probe_marker_state "\$PROBE_ONCE_MARKER" "\$TODAY"' && echo 0 || echo 1)"
+
+# ── FIX 31: cold-start Docker VM memory auto-raise (quit→write→relaunch→verify)
+# Decision boundaries — raise fires ONLY at a true cold start (app + database
+# both down), below target, once per run.
+t "F31: below target, cold, first attempt → raise" "raise" "$(fix31_raise_decision 8192 12288 0 0 0)"
+t "F31: exactly at target → skip_at_target" "skip_at_target" "$(fix31_raise_decision 12288 12288 0 0 0)"
+t "F31: above target → skip_at_target" "skip_at_target" "$(fix31_raise_decision 16384 12288 0 0 0)"
+t "F31: app already running (warm) → skip_app_running" "skip_app_running" "$(fix31_raise_decision 8192 12288 1 0 0)"
+t "F31: database container up (warm) → skip_qdb_running" "skip_qdb_running" "$(fix31_raise_decision 8192 12288 0 1 0)"
+t "F31: second attempt same run → skip_attempted (single attempt)" "skip_attempted" "$(fix31_raise_decision 8192 12288 0 0 1)"
+t "F31: attempted latch beats every other input" "skip_attempted" "$(fix31_raise_decision '' '' 1 1 1)"
+t "F31: VM probe empty (daemon down → FIX 19 owns it) → skip_no_probe" "skip_no_probe" "$(fix31_raise_decision "" 12288 0 0 0)"
+t "F31: VM probe garbage → skip_no_probe" "skip_no_probe" "$(fix31_raise_decision abc 12288 0 0 0)"
+t "F31: garbage target → skip_no_target (fail-quiet)" "skip_no_target" "$(fix31_raise_decision 8192 "" 0 0 0)"
+t "F31: garbage app flag fails SAFE to skip (never quit on uncertainty)" "skip_app_running" "$(fix31_raise_decision 8192 12288 banana 0 0)"
+t "F31: garbage qdb flag fails SAFE to skip" "skip_qdb_running" "$(fix31_raise_decision 8192 12288 0 banana 0)"
+# TV_DOCKER_VM_MEM_MIB override flows through the FIX 29 single source.
+t "F31: override 16384 above a 12 GB VM → raise" "raise" "$(fix31_raise_decision 12288 "$(docker_mem_advice_mib 16384 '')" 0 0 0)"
+t "F31: override already satisfied by the VM → skip_at_target" "skip_at_target" "$(fix31_raise_decision 16384 "$(docker_mem_advice_mib 16384 '')" 0 0 0)"
+
+# Verification boundary: ok only at ≥ (target − 1 GB); garbage NEVER
+# verifies (the 🧠 success Telegram fires only on proof — audit Rule 11).
+t "F31 verify: full target bytes → ok" "ok" "$(fix31_verify_mem $((12288 * 1048576)) 12288)"
+t "F31 verify: exactly target−1GB → ok" "ok" "$(fix31_verify_mem $((11264 * 1048576)) 12288)"
+t "F31 verify: 1 byte under target−1GB → fail" "fail" "$(fix31_verify_mem $((11264 * 1048576 - 1)) 12288)"
+t "F31 verify: old 8 GB VM after a clobbered write → fail" "fail" "$(fix31_verify_mem $((8192 * 1048576)) 12288)"
+t "F31 verify: empty probe → fail (no false success)" "fail" "$(fix31_verify_mem "" 12288)"
+t "F31 verify: garbage probe → fail" "fail" "$(fix31_verify_mem banana 12288)"
+t "F31 verify: garbage target → fail" "fail" "$(fix31_verify_mem 123456789 "")"
+t "F31 verify: tiny target floors at 1 MiB (no zero/negative floor)" "ok" "$(fix31_verify_mem $((2 * 1048576)) 100)"
+
+# Quit-escalation ladder: polite osascript wait → pkill → give_up; gone = done.
+t "F31 quit: app gone → done" "done" "$(fix31_quit_next 0 0 30 45)"
+t "F31 quit: still up at 0s → wait" "wait" "$(fix31_quit_next 1 0 30 45)"
+t "F31 quit: still up at 27s → wait" "wait" "$(fix31_quit_next 1 27 30 45)"
+t "F31 quit: still up at 30s → pkill (polite window over)" "pkill" "$(fix31_quit_next 1 30 30 45)"
+t "F31 quit: still up at 44s → pkill" "pkill" "$(fix31_quit_next 1 44 30 45)"
+t "F31 quit: still up at 45s → give_up (hard window over)" "give_up" "$(fix31_quit_next 1 45 30 45)"
+t "F31 quit: garbage waited-secs → give_up (never loop)" "give_up" "$(fix31_quit_next 1 banana 30 45)"
+t "F31 quit: empty deadlines → give_up (never loop)" "give_up" "$(fix31_quit_next 1 10 "" "")"
+
+# Clobber forensics (the FIX 17 "ignored" post-mortem channel).
+t "F31 forensics: file below target after relaunch → clobbered" "clobbered" "$(fix31_clobber_verdict 8192 12288)"
+t "F31 forensics: file still at target → held" "held" "$(fix31_clobber_verdict 12288 12288)"
+t "F31 forensics: file above target → held" "held" "$(fix31_clobber_verdict 16384 12288)"
+t "F31 forensics: unreadable file value → unknown" "unknown" "$(fix31_clobber_verdict "" 12288)"
+t "F31 forensics: garbage target → unknown" "unknown" "$(fix31_clobber_verdict 8192 banana)"
+
+# Wiring pins — the executor's ORDER is the whole fix (FIX 14 wrote the file
+# while Docker was running, then the exit-time flush clobbered it).
+FIX31_BODY=$(sed -n '/^fix31_auto_raise_docker_mem()/,/^}/p' scripts/local-autopilot.sh)
+t "F31 wiring: QUIT precedes the settings WRITE (the FIX 14 clobber lesson)" "ordered" \
+  "$(printf '%s\n' "$FIX31_BODY" | awk '/quit app/{if(!q)q=NR} /docker_settings_set_mem/{if(!w)w=NR} END{print (q && w && q<w) ? "ordered" : "bad"}')"
+t "F31 wiring: WRITE precedes the VERIFY (verify-after-relaunch)" "ordered" \
+  "$(printf '%s\n' "$FIX31_BODY" | awk '/docker_settings_set_mem/{if(!w)w=NR} /fix31_verify_mem/{if(!v)v=NR} END{print (w && v && w<v) ? "ordered" : "bad"}')"
+t "F31 wiring: single-attempt latch set inside the executor (exactly once)" "1" \
+  "$(printf '%s\n' "$FIX31_BODY" | grep -c 'FIX31_RAISE_ATTEMPTED=1' || true)"
+t "F31 wiring: cold gate consults app_alive" "0" \
+  "$(printf '%s\n' "$FIX31_BODY" | grep -q 'app_alive' && echo 0 || echo 1)"
+t "F31 wiring: cold gate consults the database container state" "0" \
+  "$(printf '%s\n' "$FIX31_BODY" | grep -q 'questdb_container_state' && echo 0 || echo 1)"
+t "F31 wiring: override reaches the executor via the FIX 29 single source" "0" \
+  "$(printf '%s\n' "$FIX31_BODY" | grep -q 'docker_mem_advice_mib "\${TV_DOCKER_VM_MEM_MIB' && echo 0 || echo 1)"
+t "F31 wiring: success Telegram fires only on the PROVEN raise" "0" \
+  "$(printf '%s\n' "$FIX31_BODY" | grep -q '🧠 Docker memory raised' && echo 0 || echo 1)"
+t "F31 wiring: verified failure logs the clobber forensics" "0" \
+  "$(printf '%s\n' "$FIX31_BODY" | grep -q 'fix31_clobber_verdict' && echo 0 || echo 1)"
+t "F31 wiring: whole cycle bounded to 3 minutes" "1" \
+  "$(grep -c 'FIX31_CYCLE_BUDGET_SECS=180' scripts/local-autopilot.sh || true)"
+t "F31 wiring: boot_chain_once runs fix31 (non-gating) before the memory check" "ordered" \
+  "$(sed -n '/^boot_chain_once()/,/^}/p' scripts/local-autopilot.sh | awk '/ensure_docker/{if(!d)d=NR} /fix31_auto_raise_docker_mem \|\| true/{if(!f)f=NR} /check_docker_vm_memory/{if(!c)c=NR} END{print (d && f && c && d<f && f<c) ? "ordered" : "bad"}')"
+t "F31 wiring: cmd_start runs fix31 (non-gating) before the memory check" "ordered" \
+  "$(sed -n '/^cmd_start()/,/^}/p' scripts/local-autopilot.sh | awk '/ensure_docker/{if(!d)d=NR} /fix31_auto_raise_docker_mem \|\| true/{if(!f)f=NR} /check_docker_vm_memory/{if(!c)c=NR} END{print (d && f && c && d<f && f<c) ? "ordered" : "bad"}')"
+t "F31 wiring: honest manual-slider fallback messages are KEPT (both branches)" "2" \
+  "$(sed -n '/^check_docker_vm_memory()/,/^}/p' scripts/local-autopilot.sh | grep -c 'manual slider raise is the reliable fix' || true)"
 
 echo
 echo "local-autopilot pure-logic tests: $PASS passed, $FAIL failed"

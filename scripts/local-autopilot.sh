@@ -665,6 +665,138 @@ cold_start_mem_write_decision() {
   return 0
 }
 
+# ── FIX 31: cold-start Docker VM memory auto-raise (full verified cycle) ────
+# Research verdict (2026-07-05, CONFIRMED against the FIX 7/14 git history):
+# Docker Desktop reads settings-store.json ONLY at APP launch and keeps the
+# settings IN MEMORY while running, flushing them back to the file when the
+# app EXITS. The FIX 7/14 code order was: (1) write the file, (2) osascript
+# quit, (3) open -a Docker — so step 2's exit-time flush CLOBBERED step 1's
+# fresh edit, the relaunch read the OLD value, and FIX 17 honestly observed
+# "the edit was ignored even across a restart". The edit was never ignored —
+# it was overwritten before Docker ever read it. Community guidance is
+# uniform: FULLY quit Docker Desktop FIRST, edit the file, THEN relaunch.
+# The `docker desktop` admin CLI (4.3x-4.8x) carries only
+# start/stop/restart/status/update/module — no settings/resource setter —
+# so quit→write→relaunch IS the programmatic path. FIX 31 does exactly
+# that, at COLD START ONLY (never mid-run — FIX 17's rule stands), with a
+# post-relaunch `docker info MemTotal` VERIFICATION so success is proven,
+# never claimed. Verified failure falls back to the FIX-17 clamp + honest
+# manual-slider Telegram, plus a file-value forensic read (did Docker
+# clobber the write even when made while it was down?).
+
+# fix31_raise_decision <vm_mib> <target_mib> <app_alive 0|1> <qdb_running 0|1> <attempted 0|1>
+# The FIX 31 raise DECISION, pure. Always prints one word, always rc 0:
+#   raise            — cold start, VM below target: run the full cycle
+#   skip_attempted   — the one attempt this run is spent (never loop)
+#   skip_app_running — the tickvault app is up: NOT a cold start
+#   skip_qdb_running — the database container is up: quitting Docker would
+#                      kill it (the exact FIX 17 mid-run incident)
+#   skip_no_target   — target unparsable (fail-quiet: never act on garbage)
+#   skip_no_probe    — VM memory unknown (daemon down — the FIX 19
+#                      write-before-launch path owns that case)
+#   skip_at_target   — VM already at/above target: nothing to do
+fix31_raise_decision() {
+  local vm="${1:-}" tgt="${2:-}" app="${3:-1}" qdb="${4:-1}" att="${5:-1}"
+  if [ "$att" != "0" ]; then
+    echo skip_attempted
+    return 0
+  fi
+  if [ "$app" != "0" ]; then
+    echo skip_app_running
+    return 0
+  fi
+  if [ "$qdb" != "0" ]; then
+    echo skip_qdb_running
+    return 0
+  fi
+  case "$tgt" in '' | *[!0-9]*)
+    echo skip_no_target
+    return 0
+    ;;
+  esac
+  case "$vm" in '' | *[!0-9]*)
+    echo skip_no_probe
+    return 0
+    ;;
+  esac
+  if [ "$vm" -ge "$tgt" ]; then echo skip_at_target; else echo raise; fi
+  return 0
+}
+
+# fix31_verify_mem <mem_total_bytes> <target_mib> → ok|fail. The post-cycle
+# VERIFICATION: ok only when the relaunched daemon reports at least
+# (target − 1 GB) — Docker's VM reserves some memory, so exact equality is
+# never seen. Garbage/empty input → fail (no false-OK: the success Telegram
+# fires only on a PROVEN raise — audit Rule 11). Pure.
+fix31_verify_mem() {
+  case "${1:-}" in '' | *[!0-9]*)
+    echo fail
+    return 0
+    ;;
+  esac
+  case "${2:-}" in '' | *[!0-9]*)
+    echo fail
+    return 0
+    ;;
+  esac
+  local floor_mib=$(($2 - 1024))
+  ((floor_mib >= 1)) || floor_mib=1
+  if [ "$1" -ge $((floor_mib * 1048576)) ]; then echo ok; else echo fail; fi
+  return 0
+}
+
+# fix31_quit_next <app_running 0|1> <waited_secs> <polite_secs> <hard_secs>
+# The quit-escalation ladder, pure: done (app process gone) | wait (keep
+# polling the polite osascript quit) | pkill (escalate) | give_up (even
+# pkill did not clear it — abort the raise, relaunch as-is). Garbage
+# numerics → give_up (fail-safe: never loop on uncertain input). Pure.
+fix31_quit_next() {
+  if [ "${1:-1}" = "0" ]; then
+    echo done
+    return 0
+  fi
+  local w
+  for w in "${2:-}" "${3:-}" "${4:-}"; do
+    case "$w" in '' | *[!0-9]*)
+      echo give_up
+      return 0
+      ;;
+    esac
+  done
+  if [ "$2" -lt "$3" ]; then
+    echo wait
+  elif [ "$2" -lt "$4" ]; then
+    echo pkill
+  else
+    echo give_up
+  fi
+  return 0
+}
+
+# fix31_clobber_verdict <file_mib_after_relaunch> <written_target_mib>
+# Forensic classifier for a verified FAILURE: did Docker rewrite the
+# settings file after our while-down write?
+#   clobbered — the file now carries a DIFFERENT (lower) value: Docker
+#               overwrote our edit even though it was made while down
+#   held      — the file still carries >= our target: the write survived
+#               but the VM did not size from it (engine-side ignore)
+#   unknown   — the file/key is unreadable post-relaunch
+# Garbage target → unknown. Pure.
+fix31_clobber_verdict() {
+  case "${2:-}" in '' | *[!0-9]*)
+    echo unknown
+    return 0
+    ;;
+  esac
+  case "${1:-}" in '' | *[!0-9]*)
+    echo unknown
+    return 0
+    ;;
+  esac
+  if [ "$1" -ge "$2" ]; then echo held; else echo clobbered; fi
+  return 0
+}
+
 # ── FIX 19 item 3: probe-prep stop wording ──────────────────────────────────
 # stop_notice_mode <probe_prep_flag> → probe_prep|manual. The probe wrapper's
 # internal pre-probe stop used to send the manual-stop Telegram ("Autopilot
@@ -2034,6 +2166,158 @@ raise_docker_mem_at_cold_start() {
   return 0
 }
 
+# ── FIX 31: cold-start full-cycle auto-raise (quit→write→relaunch→verify) ──
+# Covers the case FIX 19 cannot: Docker Desktop is ALREADY RUNNING at cold
+# start with a too-small VM. FIX 19's write-before-launch only fires when
+# Docker is down; FIX 17's clamp handled the running case with a MANUAL
+# slider Telegram — which the operator rejects. The full cycle here is the
+# researched programmatic path (see the FIX 31 pure-helper block): fully
+# QUIT Docker Desktop (poll the app process out, escalate to pkill), write
+# MemoryMiB while Docker is provably down (the one moment its exit-time
+# flush cannot clobber the edit), relaunch, wait for the daemon, VERIFY via
+# `docker info MemTotal`. Success → one 🧠 Telegram. Verified failure →
+# forensic file re-read (clobbered vs held) + fall through to the existing
+# clamp + manual-slider Telegram in check_docker_vm_memory (kept — honest).
+# Cold-start gate: single attempt per run; skipped when the app or the
+# database container is already up (quitting Docker mid-run killed the
+# database once — the FIX 17 incident — never again); whole cycle bounded
+# to FIX31_CYCLE_BUDGET_SECS. License-modal edge: this path only runs when
+# the daemon answered (license already accepted once), so the FIX 18
+# first-launch detection in ensure_docker keeps owning fresh installs.
+FIX31_RAISE_ATTEMPTED=0
+FIX31_CYCLE_BUDGET_SECS=180
+FIX31_QUIT_POLITE_SECS=30
+FIX31_QUIT_HARD_SECS=45
+
+# Docker.app process probe (covers /Applications AND ~/Applications
+# per-user installs — the FIX 18 G10 lesson). Echoes 1|0, always rc 0.
+fix31_docker_app_running() {
+  if pgrep -f "Docker.app/Contents" >/dev/null 2>&1; then echo 1; else echo 0; fi
+  return 0
+}
+
+fix31_auto_raise_docker_mem() {
+  [ "$(uname -s)" = "Darwin" ] || return 0
+  [ -z "${CI:-}" ] || return 0
+  # Inputs for the pure decision. dk bounded (FIX 18 G1); an empty probe
+  # means the daemon is down → skip (FIX 19 owns the daemon-down write).
+  local vm_bytes vm_mib=""
+  vm_bytes=$(dk info --format '{{.MemTotal}}' 2>/dev/null || true)
+  case "$vm_bytes" in '' | *[!0-9]*) : ;; *) vm_mib=$((vm_bytes / 1048576)) ;; esac
+  local host_bytes target
+  host_bytes=$(sysctl -n hw.memsize 2>/dev/null || true)
+  # FIX 29 single source — TV_DOCKER_VM_MEM_MIB override wins here too.
+  target=$(docker_mem_advice_mib "${TV_DOCKER_VM_MEM_MIB:-}" "$host_bytes")
+  local app_up=0 qdb_up=0
+  if app_alive; then app_up=1; fi
+  case "$(questdb_container_state)" in running*) qdb_up=1 ;; esac
+  local decision
+  decision=$(fix31_raise_decision "$vm_mib" "$target" "$app_up" "$qdb_up" "$FIX31_RAISE_ATTEMPTED")
+  if [ "$decision" != "raise" ]; then
+    log "FIX 31 cold-start memory raise: ${decision} (VM ${vm_mib:-unknown} MiB, target ${target} MiB)"
+    return 0
+  fi
+  FIX31_RAISE_ATTEMPTED=1 # single attempt per run — even a failed cycle never re-fires
+  local t0 deadline
+  t0=$(date +%s)
+  deadline=$((t0 + FIX31_CYCLE_BUDGET_SECS))
+  log "FIX 31: Docker VM has ${vm_mib} MiB < target ${target} MiB at COLD START — running the full auto-raise cycle: quit Docker → write setting → relaunch → verify (bounded ${FIX31_CYCLE_BUDGET_SECS}s)"
+  # (1) FULLY quit Docker Desktop — the write is safe ONLY once the app
+  # process is gone (its exit-time settings flush clobbered FIX 14's edit).
+  with_timeout 15 osascript -e 'quit app "Docker"' >/dev/null 2>&1 || true
+  local waited=0 nxt
+  while :; do
+    nxt=$(fix31_quit_next "$(fix31_docker_app_running)" "$waited" "$FIX31_QUIT_POLITE_SECS" "$FIX31_QUIT_HARD_SECS")
+    case "$nxt" in
+    done) break ;;
+    wait)
+      sleep 3
+      waited=$((waited + 3))
+      ;;
+    pkill)
+      log "FIX 31: Docker Desktop did not quit politely within ${waited}s — escalating to pkill"
+      pkill -f "Docker.app/Contents" 2>/dev/null || true
+      sleep 3
+      waited=$((waited + 3))
+      ;;
+    *)
+      log "FIX 31: Docker Desktop would not exit even after pkill (${waited}s) — aborting the raise; relaunching Docker as-is (the clamp path takes over)"
+      open -a Docker >/dev/null 2>&1 || true
+      return 0
+      ;;
+    esac
+  done
+  log "FIX 31: Docker Desktop fully exited after ${waited}s — writing the memory setting while Docker is provably down"
+  # (2) Write the raised memory into settings-store.json AND legacy
+  # settings.json when present (JSON-safe python3 round-trip, backup first,
+  # every other key preserved — the FIX 14 helpers).
+  local gc="$HOME/Library/Group Containers/group.com.docker"
+  local wrote=0 store_file="" store_key="" cand key rc cur
+  for cand in "$gc/settings-store.json" "$gc/settings.json"; do
+    key=$(docker_settings_mem_key "$cand") && rc=0 || rc=$?
+    case "$rc" in 0 | 10) ;; *) continue ;; esac
+    cp "$cand" "${cand}.tickvault-bak" 2>/dev/null || true
+    cur=$(docker_settings_mem_get "$cand" "$key" 2>/dev/null || true)
+    if docker_settings_set_mem "$cand" "$key" "$target"; then
+      wrote=1
+      if [ -z "$store_file" ]; then
+        store_file="$cand"
+        store_key="$key"
+      fi
+      log "FIX 31: wrote ${key}=${target} MiB into $(basename "$cand") (was ${cur:-unset}; backup $(basename "$cand").tickvault-bak)"
+    else
+      log "FIX 31: could not write $(basename "$cand") — file left untouched"
+    fi
+  done
+  if [ "$wrote" != "1" ]; then
+    log "FIX 31: no writable Docker settings file found — relaunching Docker unchanged (the clamp path takes over)"
+    open -a Docker >/dev/null 2>&1 || true
+    return 0
+  fi
+  # (3) relaunch — THIS app launch reads the file.
+  open -a Docker >/dev/null 2>&1 || true
+  # (4) wait for the daemon within the remaining cycle budget.
+  local ready=0
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    if docker_alive; then
+      ready=1
+      break
+    fi
+    sleep 5
+  done
+  if [ "$ready" != "1" ]; then
+    log "FIX 31: Docker did not come back within the ${FIX31_CYCLE_BUDGET_SECS}s cycle budget — verification deferred (the next docker probe/log line shows whether the raise stuck); boot continues on the normal Docker wait"
+    return 0
+  fi
+  # (5) VERIFY — success is proven by the daemon, never claimed from the file.
+  local new_bytes verdict
+  new_bytes=$(dk info --format '{{.MemTotal}}' 2>/dev/null || true)
+  verdict=$(fix31_verify_mem "$new_bytes" "$target")
+  if [ "$verdict" = "ok" ]; then
+    local new_gb=$(((new_bytes / 1048576 + 1023) / 1024))
+    log "FIX 31: VERIFIED — Docker VM memory is now ${new_bytes} bytes (~${new_gb} GB; target ${target} MiB) after quit→write→relaunch"
+    tg "🧠 Docker memory raised to ${new_gb} GB automatically — the database gets its full budget from now on. No action needed."
+    return 0
+  fi
+  # Verified FAILURE — forensics: did Docker clobber the file on its way up?
+  local file_now clobber
+  file_now=$(docker_settings_mem_get "$store_file" "$store_key" 2>/dev/null || true)
+  clobber=$(fix31_clobber_verdict "$file_now" "$target")
+  case "$clobber" in
+  clobbered)
+    log "FIX 31 FORENSICS: $(basename "$store_file") now carries ${file_now} MiB (we wrote ${target} while Docker was DOWN) — Docker REWROTE the file after relaunch: the while-down write is clobbered on this Docker version too"
+    ;;
+  held)
+    log "FIX 31 FORENSICS: $(basename "$store_file") still carries ${file_now} MiB (our write HELD) but the VM reports ${new_bytes:-unknown} bytes — Docker read the file without sizing the VM from it"
+    ;;
+  *)
+    log "FIX 31 FORENSICS: could not re-read $(basename "$store_file") after relaunch — clobber state unknown"
+    ;;
+  esac
+  log "FIX 31: verification FAILED (VM ${new_bytes:-unknown} bytes, target ${target} MiB) — falling back to clamp-and-proceed; the manual-slider Telegram from the memory check remains the honest path"
+  return 0
+}
+
 ensure_docker() {
   # FIX 18 G10: Docker Desktop 4.x per-user installs put the docker CLI in
   # ~/.docker/bin (and Docker.app's Resources/bin) WITHOUT the privileged
@@ -2083,8 +2367,10 @@ ensure_docker() {
   # human clicks Accept. Detect the never-initialized state (app process up,
   # no settings store on disk) and say exactly that instead of the generic
   # "start Docker manually". Pre-seeding the accepted-license flag is NOT
-  # done: Docker Desktop 4.80 ignores settings-file edits (proven live
-  # 2026-07-05, FIX 17) — the one-time human Accept is the honest path.
+  # done: with Docker.app already up showing the modal, a settings-file edit
+  # is clobbered by its exit-time flush (the FIX 31 root-cause finding), and
+  # a fresh install has no settings file to edit anyway — the one-time human
+  # Accept is the honest path.
   local app_running=0 settings_exists=0 hint
   if pgrep -f "/Applications/Docker.app" >/dev/null 2>&1; then app_running=1; fi
   if [ -f "$HOME/Library/Group Containers/group.com.docker/settings-store.json" ] ||
@@ -3053,7 +3339,12 @@ docker_mem_advice_gb_now() {
 # Docker Desktop 4.x `docker desktop` admin CLI carries only
 # start/stop/restart/status/update/module subcommands — there is NO
 # memory/resource setter, so NO reliable non-restarting programmatic path
-# exists. The HONEST behavior is therefore:
+# exists. (FIX 31 root cause of the "ignored" observation: the FIX-7/14
+# write happened while Docker was RUNNING, so Docker's exit-time settings
+# flush clobbered it before the relaunch ever read the file. The COLD-START
+# quit→write→relaunch→verify cycle in fix31_auto_raise_docker_mem is the
+# working programmatic path; THIS hint stays the mid-run-safe one.)
+# The HONEST behavior mid-run is therefore:
 #   PRIMARY  — the caller clamps QDB_MEM_LIMIT to (VM − 1 GB) and PROCEEDS
 #              (QuestDB is healthy at 4g per aws-budget; 8 GB Docker works).
 #   OPTIONAL — the operator may raise the slider ONCE in Docker Desktop →
@@ -3388,6 +3679,9 @@ cmd_start() {
   # probe (launched from THIS shell) inherits it too, not just the app.
   raise_fd_limit
   ensure_docker || return 1
+  # FIX 31: cold-start full-cycle memory raise (quit→write→relaunch→verify)
+  # — before any compose up; best-effort, never gates the start.
+  fix31_auto_raise_docker_mem || true
   check_docker_vm_memory
   # FIX 10 A6: arm caffeinate BEFORE the (possibly long) probe so Mac sleep
   # cannot freeze the ladder into its hard time cap.
@@ -3759,6 +4053,9 @@ preflight_git() {
 boot_chain_once() {
   preflight_git
   ensure_docker || return 1
+  # FIX 31: cold-start full-cycle memory raise (quit→write→relaunch→verify)
+  # — before any compose up; best-effort, never gates the boot chain.
+  fix31_auto_raise_docker_mem || true
   check_docker_vm_memory
   disk_free_ok || return 1
   ensure_questdb || return 1
