@@ -322,6 +322,79 @@ pub fn gate_failure_reason(inputs: &GateInputs, cfg: &GrowwScaleConfig) -> Optio
     None
 }
 
+// ---------------------------------------------------------------------------
+// FIX 19 item 1 — gate warm-up grace + 2-consecutive-breach rule
+// ---------------------------------------------------------------------------
+// Live incident 2026-07-05 11:00:59 IST: rung 1 rolled back on `cpu_high`
+// 109.1% because the FIRST gate sample landed 45s after a 2m14s cold cargo
+// build — the breach was build/spawn churn, not rung load. Two rules close
+// the class: (a) gate samples are SKIPPED for a warm-up window after every
+// rung transition (default [`GATE_WARMUP_SECS_DEFAULT`], env-overridable via
+// `GATE_WARMUP_SECS`); (b) a rung fails only after
+// [`GATE_CONSECUTIVE_BREACHES_TO_FAIL`] CONSECUTIVE breaches — a single
+// transient spike is counted + logged, never rolled back on.
+
+/// Default post-transition warm-up window (seconds) during which gate
+/// samples are skipped. Overridable via env `GATE_WARMUP_SECS`.
+pub const GATE_WARMUP_SECS_DEFAULT: u64 = 120;
+
+/// Consecutive gate breaches required before a rung is failed.
+pub const GATE_CONSECUTIVE_BREACHES_TO_FAIL: u32 = 2;
+
+/// Pure parse of the `GATE_WARMUP_SECS` env override — fail-safe to
+/// [`GATE_WARMUP_SECS_DEFAULT`] on absent/malformed input (never panics).
+#[must_use]
+pub fn gate_warmup_secs(raw: Option<&str>) -> u64 {
+    raw.and_then(|s| s.trim().parse::<u64>().ok())
+        .unwrap_or(GATE_WARMUP_SECS_DEFAULT)
+}
+
+/// One evaluation tick's gate-grace verdict (pure — see [`apply_gate_grace`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GateGraceDecision {
+    /// Inside the post-transition warm-up window — the sample is skipped
+    /// entirely (neither fails the rung nor accrues green hold credit).
+    WarmupSkip,
+    /// Gates green — the caller resets the breach streak to 0.
+    Pass,
+    /// Gate breached but below the consecutive threshold — counted + logged,
+    /// the rung is NOT failed and NO green credit accrues this tick.
+    BreachPending {
+        /// The updated consecutive-breach streak the caller must store.
+        streak: u32,
+    },
+    /// Consecutive-breach threshold reached — fail the rung (rollback).
+    Fail {
+        /// The streak at failure (>= [`GATE_CONSECUTIVE_BREACHES_TO_FAIL`]).
+        streak: u32,
+    },
+}
+
+/// Pure gate-grace decision for one evaluation tick. `secs_since_transition`
+/// is wall-clock since the LAST rung transition (advance / rollback / global
+/// halve / ladder start); `prior_streak` is the stored consecutive-breach
+/// count; `breached` is this tick's raw [`gate_failure_reason`] outcome.
+#[must_use]
+pub fn apply_gate_grace(
+    secs_since_transition: u64,
+    warmup_secs: u64,
+    prior_streak: u32,
+    breached: bool,
+) -> GateGraceDecision {
+    if secs_since_transition < warmup_secs {
+        return GateGraceDecision::WarmupSkip;
+    }
+    if !breached {
+        return GateGraceDecision::Pass;
+    }
+    let streak = prior_streak.saturating_add(1);
+    if streak >= GATE_CONSECUTIVE_BREACHES_TO_FAIL {
+        GateGraceDecision::Fail { streak }
+    } else {
+        GateGraceDecision::BreachPending { streak }
+    }
+}
+
 /// Parses `"HH:MM"` to seconds-of-day. Fail-closed `None` on malformed input
 /// (config validation already rejects it at boot; this is defense in depth).
 #[must_use]
@@ -717,6 +790,11 @@ pub async fn run_groww_scale_ladder(
 
     let mut host_probe_warned = false;
     let mut smoke_warned = false;
+    // FIX 19 item 1 — warm-up grace + 2-consecutive-breach state.
+    let warmup_secs = gate_warmup_secs(std::env::var("GATE_WARMUP_SECS").ok().as_deref());
+    let mut rung_transition_at = std::time::Instant::now();
+    let mut gate_breach_streak: u32 = 0;
+    let mut warmup_skip_logged = false;
     loop {
         tokio::time::sleep(std::time::Duration::from_secs(LADDER_EVAL_INTERVAL_SECS)).await;
         if !feed_runtime.is_enabled(Feed::Groww) {
@@ -738,6 +816,23 @@ pub async fn run_groww_scale_ladder(
                 "[feeds] groww scale ladder: SMOKE mode — market closed; tick \
                  gates SKIPPED (machinery validation only, NOT a live validation)"
             );
+        }
+
+        // ── FIX 19 item 1a — post-transition warm-up: skip gate samples ──
+        // for `warmup_secs` after every rung transition. Cold spawn (cargo
+        // build, venv provisioning, auth + subscribe churn) otherwise lands
+        // a bogus first sample (live incident: cpu_high 109.1% at rung
+        // start, 45s after a 2m14s cold build).
+        if rung_transition_at.elapsed().as_secs() < warmup_secs {
+            if !warmup_skip_logged {
+                warmup_skip_logged = true;
+                info!(
+                    warmup_secs,
+                    "[feeds] groww scale ladder: post-transition warm-up — \
+                     gate samples skipped (set GATE_WARMUP_SECS to override)"
+                );
+            }
+            continue;
         }
 
         // ── Sample telemetry → GateInputs (feed-level; per-conn = PR-3). ──
@@ -775,7 +870,42 @@ pub async fn run_groww_scale_ladder(
                 behind_bytes_max: 0, // per-shard behind-ness: see snapshot rows
             }
         };
-        let gate_failure = gate_failure_reason(&inputs, &cfg);
+        // ── FIX 19 item 1b — 2-consecutive-breach rule: a single transient ──
+        // breach is counted + logged but never fails the rung; only
+        // GATE_CONSECUTIVE_BREACHES_TO_FAIL breaches in a row roll back.
+        let gate_failure_raw = gate_failure_reason(&inputs, &cfg);
+        let gate_failure = match apply_gate_grace(
+            rung_transition_at.elapsed().as_secs(),
+            warmup_secs,
+            gate_breach_streak,
+            gate_failure_raw.is_some(),
+        ) {
+            // Defensive — the warm-up early-skip above owns this arm.
+            GateGraceDecision::WarmupSkip => continue,
+            GateGraceDecision::Pass => {
+                gate_breach_streak = 0;
+                None
+            }
+            GateGraceDecision::BreachPending { streak } => {
+                gate_breach_streak = streak;
+                let reason = gate_failure_raw.unwrap_or("unknown");
+                warn!(
+                    reason,
+                    streak,
+                    need = GATE_CONSECUTIVE_BREACHES_TO_FAIL,
+                    "[feeds] groww scale ladder: gate breach PENDING — rung \
+                     NOT failed yet (2-consecutive-breach rule)"
+                );
+                metrics::counter!(
+                    "tv_groww_scale_gate_breach_pending_total", "reason" => reason
+                )
+                .increment(1);
+                // Skip the FSM this tick: neither fail the rung nor accrue
+                // green hold credit on a breached sample.
+                continue;
+            }
+            GateGraceDecision::Fail { .. } => gate_failure_raw,
+        };
         // Stage-summary trigger for this evaluation tick (max-scale lab):
         // set by the transition arms, consumed after the snapshot builds.
         let mut stage_outcome: Option<&'static str> = None;
@@ -812,6 +942,10 @@ pub async fn run_groww_scale_ladder(
                 std::time::Instant::now() + std::time::Duration::from_secs(GLOBAL_COOLDOWN_SECS),
             );
             hold_started = None;
+            // FIX 19 item 1 — rung transition: re-arm the warm-up window.
+            rung_transition_at = std::time::Instant::now();
+            gate_breach_streak = 0;
+            warmup_skip_logged = false;
             publish_state(state, current, cfg.target_connections);
             let snapshot = build_scale_snapshot(
                 state,
@@ -884,6 +1018,12 @@ pub async fn run_groww_scale_ladder(
                     hold_until =
                         Some(std::time::Instant::now() + std::time::Duration::from_secs(hold));
                     hold_started = None;
+                    // FIX 19 item 1 — rung transition: re-arm the warm-up
+                    // window (the hold sleep dominates, but a short hold at
+                    // a large warm-up must still skip cold samples).
+                    rung_transition_at = std::time::Instant::now();
+                    gate_breach_streak = 0;
+                    warmup_skip_logged = false;
                     stage_outcome = Some("rolled_back");
                     next
                 }
@@ -940,6 +1080,12 @@ pub async fn run_groww_scale_ladder(
                                 runtime.desired_conns.store(current, Ordering::Relaxed);
                                 runtime.wake.notify_waiters();
                                 hold_started = None;
+                                // FIX 19 item 1 — rung transition: re-arm
+                                // the warm-up window so the new conns' cold
+                                // spawn never lands the first gate sample.
+                                rung_transition_at = std::time::Instant::now();
+                                gate_breach_streak = 0;
+                                warmup_skip_logged = false;
                                 next_ladder_state(state, LadderEvent::HoldComplete)
                             }
                             (true, None) => {
@@ -1672,6 +1818,104 @@ mod tests {
         assert_eq!(gate_failure_reason(&i, &cfg()), None);
         i.mem_used_pct = None; // probe unavailable → gate honestly skipped
         assert_eq!(gate_failure_reason(&i, &cfg()), None);
+    }
+
+    // ── FIX 19 item 1 — warm-up grace + 2-consecutive-breach rule ──
+
+    #[test]
+    fn test_gate_warmup_secs_default_and_env_override() {
+        assert_eq!(gate_warmup_secs(None), GATE_WARMUP_SECS_DEFAULT);
+        assert_eq!(gate_warmup_secs(Some("300")), 300);
+        assert_eq!(gate_warmup_secs(Some(" 45 ")), 45);
+        assert_eq!(gate_warmup_secs(Some("0")), 0); // explicit disable
+        // Malformed input fails safe to the default, never panics.
+        assert_eq!(gate_warmup_secs(Some("abc")), GATE_WARMUP_SECS_DEFAULT);
+        assert_eq!(gate_warmup_secs(Some("-5")), GATE_WARMUP_SECS_DEFAULT);
+        assert_eq!(gate_warmup_secs(Some("")), GATE_WARMUP_SECS_DEFAULT);
+    }
+
+    #[test]
+    fn test_apply_gate_grace_warmup_skips_even_a_breach() {
+        // Inside the warm-up window: breach AND pass both skip the sample —
+        // the live-incident class (cold-build cpu_high 45s after transition).
+        assert_eq!(
+            apply_gate_grace(45, 120, 0, true),
+            GateGraceDecision::WarmupSkip
+        );
+        assert_eq!(
+            apply_gate_grace(119, 120, 5, false),
+            GateGraceDecision::WarmupSkip
+        );
+        // Boundary: exactly at warmup_secs the window is over.
+        assert_ne!(
+            apply_gate_grace(120, 120, 0, false),
+            GateGraceDecision::WarmupSkip
+        );
+    }
+
+    #[test]
+    fn test_apply_gate_grace_single_breach_pending_second_fails() {
+        // First breach after warm-up: pending, rung NOT failed.
+        assert_eq!(
+            apply_gate_grace(200, 120, 0, true),
+            GateGraceDecision::BreachPending { streak: 1 }
+        );
+        // Second consecutive breach: fail the rung.
+        assert_eq!(
+            apply_gate_grace(230, 120, 1, true),
+            GateGraceDecision::Fail { streak: 2 }
+        );
+        // A prior streak beyond the threshold still fails (saturating).
+        assert_eq!(
+            apply_gate_grace(260, 120, u32::MAX, true),
+            GateGraceDecision::Fail { streak: u32::MAX }
+        );
+    }
+
+    #[test]
+    fn test_apply_gate_grace_pass_after_breach_yields_pass() {
+        // A green tick after a single breach returns Pass — the caller
+        // resets the streak, so an intermittent flap never accumulates.
+        assert_eq!(
+            apply_gate_grace(200, 120, 1, false),
+            GateGraceDecision::Pass
+        );
+        // With warm-up disabled (0), evaluation starts immediately.
+        assert_eq!(
+            apply_gate_grace(0, 0, 0, true),
+            GateGraceDecision::BreachPending { streak: 1 }
+        );
+    }
+
+    /// Source-scan ratchet: the runner loop must apply the grace (warm-up
+    /// early-skip + streak filter) and re-arm the window at every rung
+    /// transition. Removing any of these silently restores the
+    /// first-sample-rollback incident class.
+    #[test]
+    fn test_gate_grace_is_wired_into_runner_loop() {
+        let src = include_str!("groww_scale_ladder.rs");
+        assert!(
+            src.contains("apply_gate_grace("),
+            "runner must route gate outcomes through apply_gate_grace"
+        );
+        assert!(
+            src.contains("GATE_WARMUP_SECS\").ok()"),
+            "warm-up window must be env-overridable via GATE_WARMUP_SECS"
+        );
+        // 5 = the `let mut` init + 3 in-loop re-arms (global halve,
+        // rollback, advance) + this test's own literal (include_str! sees
+        // the whole file, tests included).
+        assert_eq!(
+            src.matches("rung_transition_at = std::time::Instant::now();")
+                .count(),
+            5,
+            "warm-up window must re-arm at all 3 rung transitions \
+             (global halve, rollback, advance)"
+        );
+        assert!(
+            src.contains("tv_groww_scale_gate_breach_pending_total"),
+            "pending breaches must be counted, never silent"
+        );
     }
 
     // ── Max-scale lab: pure host-probe parsers (Linux + macOS shapes) ──
