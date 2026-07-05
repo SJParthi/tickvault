@@ -651,6 +651,25 @@ t "F19-A: post-start VM memory is logged (proof channel)" "0" "$(grep -q 'Docker
 t "F19-A: the flush-on-exit theory is labeled Assumed" "0" "$(grep -q 'Assumed' scripts/local-autopilot.sh && echo 0 || echo 1)"
 t "F19-A: the warm-Docker hint default is host-aware too" "0" "$(sed -n '/^hint_docker_vm_memory()/,/^}/p' scripts/local-autopilot.sh | grep -q 'docker_mem_target_mib' && echo 0 || echo 1)"
 
+# Item 7: guaranteed per-feed Telegram status pings
+t "F19-7: OFF feed is announced, never silent" "⏸️ dhan: switched OFF for this run (expected in a lab/max-smoke session — not an error)" "$(feed_ping_text dhan false unknown false 0)"
+t "F19-7: ok verdict → connected + count" "✅ groww: connected, 1000 instruments subscribed, data flowing" "$(feed_ping_text groww true ok true 1000)"
+t "F19-7: unknown verdict but connected → awaiting ticks" "✅ groww: connected, 1000 instruments subscribed, awaiting ticks" "$(feed_ping_text groww true unknown true 1000)"
+t "F19-7: down verdict → failed wording" "0" "$(feed_ping_text groww true down false 0 | grep -q 'NOT connected (failed: down)' && echo 0 || echo 1)"
+t "F19-7: degraded verdict named" "0" "$(feed_ping_text groww true degraded true 42 | grep -q 'DEGRADED' && echo 0 || echo 1)"
+t "F19-7: enabled but not yet connected → still connecting" "0" "$(feed_ping_text dhan true unknown false 0 | grep -q 'still connecting' && echo 0 || echo 1)"
+t "F19-7: garbage subscribed count renders as 0" "0" "$(feed_ping_text groww true ok true banana | grep -q ' 0 instruments' && echo 0 || echo 1)"
+t "F19-7: settled when every enabled row connected" "0" "$(feed_rows_settled 'dhan|false|disabled|false|0
+groww|true|ok|true|1000' && echo 0 || echo 1)"
+t "F19-7: NOT settled while an enabled row is unknown+disconnected" "1" "$(feed_rows_settled 'groww|true|unknown|false|0' && echo 0 || echo 1)"
+t "F19-7: settled when the unknown row is disabled" "0" "$(feed_rows_settled 'dhan|false|unknown|false|0' && echo 0 || echo 1)"
+t "F19-7: empty rows are NOT settled (keep polling)" "1" "$(feed_rows_settled "" && echo 0 || echo 1)"
+t "F19-7: enabled row with a real verdict is settled even if disconnected" "0" "$(feed_rows_settled 'groww|true|down|false|0' && echo 0 || echo 1)"
+# wiring scans: dispatch entry + one spawn per start-complete Telegram
+t "F19-7: feed-pings subcommand dispatched" "0" "$(grep -q 'feed-pings) send_feed_status_pings' scripts/local-autopilot.sh && echo 0 || echo 1)"
+t "F19-7: all 3 start paths spawn the pinger" "3" "$(grep -c 'spawn_feed_status_pings # FIX 19 item 7' scripts/local-autopilot.sh || true)"
+t "F19-7: the pinger reads the public feeds-health endpoint" "0" "$(grep -q 'api/feeds/health' scripts/local-autopilot.sh && echo 0 || echo 1)"
+
 echo
 echo "local-autopilot pure-logic tests: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

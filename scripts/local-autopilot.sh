@@ -640,6 +640,62 @@ stop_notice_mode() {
   return 0
 }
 
+# ── FIX 19 item 7: guaranteed per-feed Telegram status pings ────────────────
+# The operator's 11:01 live run showed ZERO feed-level Telegram messages —
+# only launcher messages. Root cause (main-lane bug, noted for a crate PR):
+# the app's Groww boot-ping notifier slot is filled ONLY on the fast-boot
+# arm (main.rs), so a slow-boot / groww-only (max-smoke) run defers the
+# "connected — awaiting first tick" ping forever; and a Dhan that is OFF is
+# announced by NOBODY. The launcher now guarantees one Telegram per feed
+# after every launch by reading the app's public /api/feeds/health endpoint.
+
+# feed_ping_text <feed_name> <enabled true|false> <verdict> <connected true|false> <subscribed>
+# → one plain-English Telegram line for the feed. An OFF feed is ANNOUNCED
+# (silence was the bug); garbage subscribed counts render as 0. Pure.
+feed_ping_text() {
+  local name="${1:-feed}" enabled="${2:-}" verdict="${3:-unknown}" connected="${4:-}" sub="${5:-0}"
+  case "$sub" in '' | *[!0-9]*) sub=0 ;; esac
+  if [ "$enabled" != "true" ]; then
+    echo "⏸️ ${name}: switched OFF for this run (expected in a lab/max-smoke session — not an error)"
+    return 0
+  fi
+  case "$verdict" in
+  ok)
+    echo "✅ ${name}: connected, ${sub} instruments subscribed, data flowing"
+    ;;
+  degraded)
+    echo "⚠️ ${name}: connected but DEGRADED — ${sub} instruments subscribed; watch the next messages"
+    ;;
+  down)
+    echo "🆘 ${name}: NOT connected (failed: down) — the app keeps retrying automatically; if this persists 10 minutes, double-click Stop TickVault then Start TickVault"
+    ;;
+  *)
+    if [ "$connected" = "true" ]; then
+      echo "✅ ${name}: connected, ${sub} instruments subscribed, awaiting ticks"
+    else
+      echo "⏳ ${name}: enabled, still connecting (${sub} subscribed so far) — a follow-up message will confirm"
+    fi
+    ;;
+  esac
+  return 0
+}
+
+# feed_rows_settled <rows> → rc 0 when every ENABLED feed row is connected or
+# carries a non-unknown verdict (nothing left to wait for), rc 1 otherwise
+# (keep polling). Rows are "name|enabled|verdict|connected|subscribed" lines.
+# Empty input → rc 1. Pure.
+feed_rows_settled() {
+  [ -n "${1:-}" ] || return 1
+  local name enabled verdict connected sub
+  while IFS='|' read -r name enabled verdict connected sub; do
+    [ -n "$name" ] || continue
+    if [ "$enabled" = "true" ] && [ "$connected" != "true" ] && [ "$verdict" = "unknown" ]; then
+      return 1
+    fi
+  done <<<"$1"
+  return 0
+}
+
 # ── FIX 10 (PUSH A): probe correctness + launcher safety — pure helpers ────
 
 # tsv_sentinel <raw wc -l output> → a clean integer line count (macOS wc
@@ -1828,6 +1884,59 @@ app_health_ok() { # the /health endpoint is deliberately public
   curl -sf -m 3 "http://127.0.0.1:${APP_API_PORT}/health" >/dev/null 2>&1
 }
 
+# FIX 19 item 7: read the app's public per-feed health (GET /api/feeds/health)
+# and print one "name|enabled|verdict|connected|subscribed" line per feed
+# (lowercased). Empty output on any failure — the caller keeps polling.
+feed_health_rows() {
+  curl -sf -m 5 "http://127.0.0.1:${APP_API_PORT}/api/feeds/health" 2>/dev/null |
+    python3 -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(1)
+for f in d.get("feeds", []):
+    print("|".join(str(f.get(k, "")) for k in ("feed", "enabled", "verdict", "connected", "subscribed_total")).lower())
+' 2>/dev/null || true
+}
+
+# FIX 19 item 7: GUARANTEED per-feed Telegram status after a launch — one
+# message per feed, EVERY mode (an OFF feed is announced too; silence was
+# the bug). Polls the app's public feeds-health endpoint for up to
+# <wait_secs> (default 180) so the subscribe counts have time to land, then
+# sends whatever truth is available. Runs as the detached `feed-pings`
+# subcommand so no start path blocks on it.
+send_feed_status_pings() {
+  local wait_secs="${1:-180}" waited=0 rows=""
+  case "$wait_secs" in '' | *[!0-9]*) wait_secs=180 ;; esac
+  while [ "$waited" -lt "$wait_secs" ]; do
+    rows=$(feed_health_rows)
+    if feed_rows_settled "$rows"; then break; fi
+    sleep 5
+    waited=$((waited + 5))
+  done
+  if [ -z "$rows" ]; then
+    tg "⚠️ Feed status check: the app did not answer its status endpoint within ${wait_secs}s, so the per-feed states are unknown. It may still be booting — check the next messages or the log."
+    return 0
+  fi
+  local name enabled verdict connected sub
+  while IFS='|' read -r name enabled verdict connected sub; do
+    [ -n "$name" ] || continue
+    tg "$(feed_ping_text "$name" "$enabled" "$verdict" "$connected" "$sub")"
+  done <<<"$rows"
+  return 0
+}
+
+# FIX 19 item 7: detach the feed-status pinger so no start path blocks on
+# the up-to-3-minute poll (mirrors the FIX 18 G5 monitor spawn pattern —
+# own process group, survives the parent's exit).
+spawn_feed_status_pings() {
+  (
+    set -m
+    nohup bash "$0" feed-pings >>"$(current_log)" 2>&1 &
+  ) || true
+}
+
 # app_git_sha — the running app's build provenance from GET /health (B9
 # git_sha field). Empty on any failure (app down, old build without the
 # field). Runtime (network); the compare itself is the pure sha_compare.
@@ -2453,6 +2562,7 @@ cmd_start() {
   fi
   [ "$start_rc" = "0" ] || return 1
   tg "🚀 Manual start complete — app running, feed capture live. Autopilot (if scheduled) will adopt this app, not double-start."
+  spawn_feed_status_pings # FIX 19 item 7: one Telegram per feed, every mode
   # FIX 18 G5: a manual Start with no 08:55 robot alive previously ran the
   # whole day with NO monitor — no 15:35 EOD stop (the app + broker session
   # ran on for hours after close), no one-shot crash relaunch, no
@@ -2979,6 +3089,7 @@ cmd_run() {
     apply_overlay probe
     start_app_tolerate_peer "scale day — probe overlay" || exit 1
     tg "🚀 Scale-lab day: app booted with the 2×600 cap-probe. Verdict expected between $PROBE_POLL_START_IST and ~10:05 IST — I will read it and act automatically."
+    spawn_feed_status_pings # FIX 19 item 7: one Telegram per feed, every mode
 
     wait_until_ist "$PROBE_POLL_START_IST"
     local verdict="" waited=0 timeout=$((PROBE_TIMEOUT_MIN * 60))
@@ -3041,6 +3152,7 @@ cmd_run() {
     apply_overlay none # normal local day: branch overlay (feeds ON) applies
     start_app_tolerate_peer "normal local day" || exit 1
     tg "🚀 Normal local day: app booted, both-feed capture live (dry_run — no orders)."
+    spawn_feed_status_pings # FIX 19 item 7: one Telegram per feed, every mode
   fi
 
   monitor_until_eod
@@ -3061,10 +3173,11 @@ run) cmd_run ;;
 start) cmd_start ;;
 stop) cmd_stop ;;
 dev) cmd_dev ;;
-monitor) cmd_monitor ;; # FIX 18 G5: detached safety net behind a manual Start
+monitor) cmd_monitor ;;       # FIX 18 G5: detached safety net behind a manual Start
+feed-pings) send_feed_status_pings "${2:-180}" ;; # FIX 19 item 7: detached per-feed Telegram status
 status) cmd_status ;;
 *)
-  echo "usage: $0 [run|start|stop|dev|monitor|status]" >&2
+  echo "usage: $0 [run|start|stop|dev|monitor|feed-pings|status]" >&2
   exit 2
   ;;
 esac
