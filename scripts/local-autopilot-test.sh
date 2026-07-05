@@ -700,6 +700,60 @@ t "F19-7: feed-pings subcommand dispatched" "0" "$(grep -q 'feed-pings) send_fee
 t "F19-7: all 3 start paths spawn the pinger" "3" "$(grep -c 'spawn_feed_status_pings # FIX 19 item 7' scripts/local-autopilot.sh || true)"
 t "F19-7: the pinger reads the public feeds-health endpoint" "0" "$(grep -q 'api/feeds/health' scripts/local-autopilot.sh && echo 0 || echo 1)"
 
+# ── FIX 21: post-open per-class tick coverage + pre-open socket probe ───────
+t "F21: class label idx_i → indices" "indices" "$(tick_class_label idx_i)"
+t "F21: class label nse_eq → spots" "spots" "$(tick_class_label nse_eq)"
+t "F21: class label nse_fno → FNO" "FNO" "$(tick_class_label nse_fno)"
+t "F21: unknown class label passes through" "weird" "$(tick_class_label weird)"
+t "F21: every class flowing → ✅ verdict" \
+  "✅ groww ticks by class since open: indices 120, spots 4500 — every class flowing" \
+  "$(tick_class_verdict groww "idx_i nse_eq" "$(printf 'idx_i|120\nnse_eq|4500')")"
+t "F21: one silent class → 🆘 names the dead class, keeps the live one" \
+  "🆘 groww: SPOTS silent since open (0 ticks) while indices 120 flowing — mapping or server-side filter issue" \
+  "$(tick_class_verdict groww "idx_i nse_eq" "idx_i|120")"
+t "F21: all classes silent → feed-wide 🆘" \
+  "🆘 groww: NO ticks in ANY class since open (INDICES, SPOTS all at 0) — feed-wide problem; check the feed status messages" \
+  "$(tick_class_verdict groww "idx_i nse_eq" "")"
+t "F21: missing watch file → honest could-not-verify (never ✅)" \
+  "0" "$(case "$(tick_class_verdict groww "" "idx_i|120")" in "⚠️"*"NOT performed"*) echo 0 ;; *) echo 1 ;; esac)"
+t "F21: garbage count row fails safe to 0 (dead)" \
+  "0" "$(case "$(tick_class_verdict groww "idx_i" "idx_i|banana")" in "🆘"*) echo 0 ;; *) echo 1 ;; esac)"
+t "F21: QuestDB dataset parses to segment|count rows" \
+  "$(printf 'idx_i|120\nnse_eq|4500')" \
+  "$(printf '%s' '{"columns":[{"name":"segment"},{"name":"count"}],"dataset":[["IDX_I",120],["NSE_EQ",4500]]}' | tick_class_counts_parse)"
+t "F21: QuestDB error body → rc 1" \
+  "1" "$(printf '%s' '{"error":"table does not exist","query":"x"}' | tick_class_counts_parse >/dev/null && echo 0 || echo 1)"
+t "F21: non-JSON body → rc 1" \
+  "1" "$(printf '<html>proxy error</html>' | tick_class_counts_parse >/dev/null && echo 0 || echo 1)"
+cat >"$TMP/watch-ok.json" <<'EOF'
+{"entries":[{"kind":"index_value","symbol":"NIFTY"},{"kind":"ltp","symbol":"RELIANCE"}]}
+EOF
+cat >"$TMP/watch-idx-only.json" <<'EOF'
+{"entries":[{"kind":"index_value","symbol":"NIFTY"}]}
+EOF
+t "F21: watch file with indices + spots → both classes expected" "idx_i nse_eq" "$(watch_expected_classes "$TMP/watch-ok.json")"
+t "F21: indices-only watch file → idx_i only" "idx_i" "$(watch_expected_classes "$TMP/watch-idx-only.json")"
+t "F21: missing watch file → rc 1" "1" "$(watch_expected_classes "$TMP/nope.json" >/dev/null 2>&1 && echo 0 || echo 1)"
+t "F21: tick-class check due at 09:20 IST" "0" "$(tick_class_check_due 33600 && echo 0 || echo 1)"
+t "F21: tick-class check NOT due at 09:19:59" "1" "$(tick_class_check_due 33599 && echo 0 || echo 1)"
+t "F21: garbage secs → not due" "1" "$(tick_class_check_due banana && echo 0 || echo 1)"
+# addendum: pre-open socket reachability probe
+t "F21: socket reachable → ✅ verdict" \
+  "✅ groww socket reachable (socket-api.groww.in:443) — feed should connect at open" \
+  "$(socket_probe_verdict 0)"
+t "F21: socket unreachable → 🆘 names the Sunday timeout signature" \
+  "0" "$(case "$(socket_probe_verdict 1)" in "🆘 groww socket UNREACHABLE at 09:05"*"not an account/cap issue"*) echo 0 ;; *) echo 1 ;; esac)"
+t "F21: socket probe due at 09:05 IST" "0" "$(socket_probe_due 32700 && echo 0 || echo 1)"
+t "F21: socket probe NOT due at 09:04:59" "1" "$(socket_probe_due 32699 && echo 0 || echo 1)"
+t "F21: garbage secs → probe not due" "1" "$(socket_probe_due x && echo 0 || echo 1)"
+# wiring pins: monitor loop fires both checks once/day; dispatch entries exist
+t "F21: monitor loop fires the tick-class check" "0" "$(grep -q 'run_tick_class_check >>"\$(current_log)"' scripts/local-autopilot.sh && echo 0 || echo 1)"
+t "F21: monitor loop fires the socket probe" "0" "$(grep -q 'run_groww_socket_probe >>"\$(current_log)"' scripts/local-autopilot.sh && echo 0 || echo 1)"
+t "F21: both checks are trading-day gated" "0" "$(sed -n '/^monitor_until_eod()/,/^}/p' scripts/local-autopilot.sh | grep -q 'is_trading_day_now' && echo 0 || echo 1)"
+t "F21: tick-class-check subcommand dispatched" "0" "$(grep -q 'tick-class-check) run_tick_class_check' scripts/local-autopilot.sh && echo 0 || echo 1)"
+t "F21: socket-probe subcommand dispatched" "0" "$(grep -q 'socket-probe) run_groww_socket_probe' scripts/local-autopilot.sh && echo 0 || echo 1)"
+t "F21: socket probe runner is timeout-bounded" "0" "$(sed -n '/^run_groww_socket_probe()/,/^}/p' scripts/local-autopilot.sh | grep -q -- '-w 5' && echo 0 || echo 1)"
+
 echo
 echo "local-autopilot pure-logic tests: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

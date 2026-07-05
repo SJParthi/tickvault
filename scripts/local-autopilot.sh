@@ -1236,6 +1236,119 @@ oomkilled_is_true() { [ "$(printf '%s' "${1:-}" | tr -d '[:space:]')" = "true" ]
 # Groww per-account cap. A clamped run skips the max rung.
 scale_max_gate() { if [ "${1:-0}" = "1" ]; then echo skip_max; else echo max; fi; }
 
+# ── FIX 21 pure cores: per-class tick coverage + socket-probe wording ──────
+
+# tick_class_counts_parse — stdin: QuestDB /exec JSON for
+#   select segment, count() from ticks ... group by segment
+# → one "segment|count" line per row (lowercased). rc 1 on error/bad JSON. Pure.
+tick_class_counts_parse() {
+  python3 -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(1)
+if "error" in d:
+    sys.exit(1)
+for row in d.get("dataset", []):
+    try:
+        print(f"{str(row[0]).lower()}|{int(row[1])}")
+    except Exception:
+        continue
+' 2>/dev/null
+}
+
+# watch_expected_classes <watch-file> → space-separated expected tick classes
+# ("idx_i nse_eq") from the day watch file kinds (index_value → idx_i index
+# ticks, ltp → nse_eq spot ticks). Missing/garbage file → rc 1 (the caller
+# says so honestly).
+watch_expected_classes() {
+  local f="${1:-}"
+  [ -f "$f" ] || return 1
+  python3 - "$f" <<'PYEOF' 2>/dev/null || return 1
+import json, sys
+try:
+    with open(sys.argv[1]) as fh:
+        d = json.load(fh)
+except Exception:
+    sys.exit(1)
+entries = d.get("entries", d if isinstance(d, list) else [])
+kinds = {str(e.get("kind", "")).lower() for e in entries if isinstance(e, dict)}
+out = []
+if "index_value" in kinds:
+    out.append("idx_i")
+if "ltp" in kinds:
+    out.append("nse_eq")
+if not out:
+    sys.exit(1)
+print(" ".join(out))
+PYEOF
+}
+
+# tick_class_label <segment> → operator-friendly class name. Pure.
+tick_class_label() {
+  case "${1:-}" in
+  idx_i) echo "indices" ;;
+  nse_eq) echo "spots" ;;
+  nse_fno | bse_fno) echo "FNO" ;;
+  *) echo "${1:-?}" ;;
+  esac
+}
+
+# tick_class_verdict <feed> <expected segs space-sep> <count rows "seg|n">
+# → ONE Telegram line. Never ✅ unless EVERY expected class has ticks. Pure.
+tick_class_verdict() {
+  local feed="${1:-feed}" expected="${2:-}" rows="${3:-}"
+  if [ -z "$expected" ]; then
+    echo "⚠️ ${feed}: could not determine today's expected instrument classes (watch file missing) — per-class tick check NOT performed"
+    return 0
+  fi
+  local seg n label live="" dead=""
+  for seg in $expected; do
+    n=$(printf '%s\n' "$rows" | awk -F'|' -v s="$seg" '$1==s {print $2; exit}')
+    case "$n" in '' | *[!0-9]*) n=0 ;; esac
+    label=$(tick_class_label "$seg")
+    if [ "$n" -gt 0 ]; then
+      live="${live:+$live, }${label} ${n}"
+    else
+      dead="${dead:+$dead, }$(printf '%s' "$label" | tr '[:lower:]' '[:upper:]')"
+    fi
+  done
+  if [ -z "$dead" ]; then
+    echo "✅ ${feed} ticks by class since open: ${live} — every class flowing"
+  elif [ -z "$live" ]; then
+    echo "🆘 ${feed}: NO ticks in ANY class since open (${dead} all at 0) — feed-wide problem; check the feed status messages"
+  else
+    echo "🆘 ${feed}: ${dead} silent since open (0 ticks) while ${live} flowing — mapping or server-side filter issue"
+  fi
+}
+
+# tick_class_check_due <secs_of_day> → rc 0 at/after 09:20 IST (33600s). Pure.
+tick_class_check_due() {
+  local s="${1:-}"
+  case "$s" in '' | *[!0-9]*) return 1 ;; esac
+  [ "$s" -ge 33600 ]
+}
+
+# socket_probe_verdict <rc> [host] → ONE Telegram line (FIX 21 addendum:
+# Sunday's blank errors were pre-auth connect timeouts to the Groww live
+# socket — asyncio.TimeoutError stringifies to ""). Pure.
+socket_probe_verdict() {
+  local rc="${1:-1}" host="${2:-socket-api.groww.in}"
+  if [ "$rc" = "0" ]; then
+    echo "✅ groww socket reachable (${host}:443) — feed should connect at open"
+  else
+    echo "🆘 groww socket UNREACHABLE at 09:05 (${host}:443) — connects will fail with timeouts (same as Sunday); not an account/cap issue. Check the Mac's network/DNS/VPN before 09:15."
+  fi
+}
+
+# socket_probe_due <secs_of_day> → rc 0 at/after 09:05 IST (32700s). Pure.
+socket_probe_due() {
+  local s="${1:-}"
+  case "$s" in '' | *[!0-9]*) return 1 ;; esac
+  [ "$s" -ge 32700 ]
+}
+
 # ── End of pure functions. Library mode stops here. ────────────────────────
 if [[ "${AUTOPILOT_LIB:-0}" == "1" ]]; then
   return 0 2>/dev/null || exit 0
@@ -1954,6 +2067,82 @@ spawn_feed_status_pings() {
     set -m
     nohup bash "$0" feed-pings >>"$(current_log)" 2>&1 &
   ) || true
+}
+
+# ═══ FIX 21 runtime — post-open per-class tick coverage check (~09:20 IST) ══
+# A silently-dead instrument class (wrong mapping / server-side filter) must
+# scream within minutes of open, not be found at 15:30. The PURE cores
+# (tick_class_counts_parse / watch_expected_classes / tick_class_label /
+# tick_class_verdict / tick_class_check_due / socket_probe_*) live ABOVE the
+# library gate so the test suite loads them. Degrade-safe: DB/endpoint down
+# → honest "could not verify", NEVER a false ✅ (audit Rule 11).
+
+# is_trading_day_now → rc 0 on an IST Mon-Fri that is not an NSE holiday.
+is_trading_day_now() {
+  local dow
+  dow=$(ist_weekday)
+  case "$dow" in 6 | 7) return 1 ;; esac
+  ! is_nse_holiday "$(ist_date)" "$HOLIDAYS_FILE"
+}
+
+# run_tick_class_check — query per-feed per-class tick counts since 09:15 IST
+# and Telegram one verdict per ENABLED feed. Runtime.
+run_tick_class_check() {
+  local today since feeds name enabled _v _c _s _t expected body rows
+  today=$(ist_date)
+  since="${today}T09:15:00.000000Z"
+  feeds=$(feed_health_rows)
+  if [ -z "$feeds" ]; then
+    tg "⚠️ Per-class tick check: the app did not answer its status endpoint — could not verify which instrument classes are receiving ticks (NOT claiming OK)."
+    return 0
+  fi
+  while IFS='|' read -r name enabled _v _c _s _t; do
+    [ -n "$name" ] || continue
+    [ "$enabled" = "true" ] || continue
+    if [ "$name" = "groww" ]; then
+      expected=$(watch_expected_classes "data/groww/groww-watch-${today}.json" || true)
+    else
+      # Dhan daily universe = indices + F&O underlying spots.
+      expected="idx_i nse_eq"
+    fi
+    body=$(curl -sf -m 8 -G "$QUESTDB_HTTP/exec" --data-urlencode \
+      "query=select segment, count() from ticks where feed='${name}' and ts >= '${since}' group by segment" 2>/dev/null || true)
+    if [ -z "$body" ]; then
+      tg "⚠️ ${name}: could not verify per-class tick delivery (database not answering) — NOT claiming OK."
+      continue
+    fi
+    rows=$(printf '%s' "$body" | tick_class_counts_parse || true)
+    tg "$(tick_class_verdict "$name" "$expected" "$rows")"
+  done <<<"$feeds"
+  return 0
+}
+
+# ── FIX 21 ADDENDUM: pre-open Groww socket reachability probe (~09:05 IST) ──
+# Sunday's blank sidecar errors were pre-auth CONNECT TIMEOUTS to
+# wss://socket-api.groww.in (asyncio.TimeoutError stringifies to "" — the
+# 2s connect timeout + 2s retry wait produced the exact 4.1s cadence). This
+# probe answers "will connects even reach the server?" BEFORE market open,
+# so a dead network path is named at 09:05 instead of masquerading as an
+# account/cap problem all session.
+
+GROWW_SOCKET_HOST="${GROWW_SOCKET_HOST:-socket-api.groww.in}"
+
+# run_groww_socket_probe — TCP reach test against the Groww live-feed host.
+# nc primary (5s bound); curl confirms/falls back (5s bound — without -f,
+# curl exits 0 on ANY HTTP response, nonzero only on connect/TLS/timeout
+# failure, which is exactly the reachability signal). One Telegram either
+# way. Runtime; every leg is timeout-bounded.
+run_groww_socket_probe() {
+  local host="$GROWW_SOCKET_HOST" rc=1
+  if command -v nc >/dev/null 2>&1; then
+    if nc -z -w 5 "$host" 443 >/dev/null 2>&1; then rc=0; fi
+  fi
+  # curl confirm/fallback: never page 🆘 on an nc quirk alone.
+  if [ "$rc" != "0" ] && command -v curl >/dev/null 2>&1; then
+    if curl -s --max-time 5 -o /dev/null "https://${host}" 2>/dev/null; then rc=0; fi
+  fi
+  tg "$(socket_probe_verdict "$rc" "$host")"
+  return 0
 }
 
 # app_git_sha — the running app's build provenance from GET /health (B9
@@ -2881,6 +3070,9 @@ eod_summary() {
 monitor_until_eod() {
   local relaunches=0 decision alive manual iter=0 disk_warned=0 avail_gb
   local qdb_warned=0 vm_disk_warned=0 vm_pct qdb_fail_streak=0 healthy_streak=0
+  # FIX 21: once-per-day edge latches keyed on the IST date so a loop that
+  # survives IST midnight re-arms for the next trading day.
+  local socket_probe_day="" tick_class_day="" now_secs today_ist
   VM_DISK_WARN_PCT="${VM_DISK_WARN_PCT:-85}"
   while :; do
     if (($(secs_until "$EOD_STOP_IST" "$(ist_hms)") == 0)); then break; fi
@@ -2894,6 +3086,25 @@ monitor_until_eod() {
     # stale across IST midnight in this long-lived loop, which blinded the
     # loop to a Stop pressed after midnight.
     manual_stop_active "$MANUAL_STOP_MARKER" "$(ist_date)" && manual=1
+    # FIX 21 + ADDENDUM: trading-day checks — pre-open socket reachability
+    # (~09:05 IST) and post-open per-class tick coverage (~09:20 IST). One
+    # Telegram verdict each per day; backgrounded so a slow probe never
+    # delays the relaunch watchdog cycle. Both skip when the operator has
+    # pressed Stop (manual) or on weekends/holidays.
+    if [ "$manual" = "0" ] && is_trading_day_now; then
+      today_ist=$(ist_date)
+      now_secs=$(hhmm_to_secs "$(ist_hms)")
+      if [ "$socket_probe_day" != "$today_ist" ] && socket_probe_due "$now_secs"; then
+        socket_probe_day="$today_ist"
+        log "pre-open socket reachability probe firing (FIX 21 addendum)"
+        run_groww_socket_probe >>"$(current_log)" 2>&1 &
+      fi
+      if [ "$tick_class_day" != "$today_ist" ] && tick_class_check_due "$now_secs"; then
+        tick_class_day="$today_ist"
+        log "post-open per-class tick coverage check firing (FIX 21)"
+        run_tick_class_check >>"$(current_log)" 2>&1 &
+      fi
+    fi
     # Periodic disk re-check (2026-07-04 resilience fix): the boot-time
     # disk_free_ok gate cannot see a disk that fills MID-SESSION (ticks +
     # spill + logs all grow). Re-probe every DISK_RECHECK_ITERS iterations;
@@ -3202,7 +3413,9 @@ start) cmd_start ;;
 stop) cmd_stop ;;
 dev) cmd_dev ;;
 monitor) cmd_monitor ;;       # FIX 18 G5: detached safety net behind a manual Start
-feed-pings) send_feed_status_pings "${2:-180}" ;; # FIX 19 item 7: detached per-feed Telegram status
+feed-pings) send_feed_status_pings "${2:-180}" ;;  # FIX 19 item 7: detached per-feed Telegram status
+tick-class-check) run_tick_class_check ;;          # FIX 21: on-demand per-class tick coverage verdict
+socket-probe) run_groww_socket_probe ;;            # FIX 21 addendum: on-demand groww socket reachability
 status) cmd_status ;;
 *)
   echo "usage: $0 [run|start|stop|dev|monitor|feed-pings|status]" >&2
