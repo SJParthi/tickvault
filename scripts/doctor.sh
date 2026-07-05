@@ -105,9 +105,9 @@ print_section "zero-touch artefacts"
 run_check "logs" "data/logs/ directory exists" \
     test -d data/logs
 run_check "logs" "errors.jsonl appender wrote at least once (optional — depends on uptime)" \
-    bash -c "ls data/logs/errors.jsonl* >/dev/null 2>&1 || true"
+    bash -c "ls data/logs/machine/errors.jsonl* data/logs/errors.jsonl* >/dev/null 2>&1 || true"
 run_check "logs" "errors.summary.md exists (if app has run)" \
-    bash -c "test ! -d data/logs || test -f data/logs/errors.summary.md || ls data/logs/app.*.log >/dev/null 2>&1 || true"
+    bash -c "test ! -d data/logs || test -f data/logs/machine/errors.summary.md || test -f data/logs/errors.summary.md || ls data/logs/app.*.log >/dev/null 2>&1 || true"
 run_check "hooks" "error-triage hook executable" \
     test -x .claude/hooks/error-triage.sh
 run_check "hooks" "validate-automation script executable" \
@@ -118,14 +118,16 @@ run_check "hooks" "validate-automation script executable" \
 # ---------------------------------------------------------------------------
 print_section "live error signal"
 
-if [ -f data/logs/errors.summary.md ]; then
-    if grep -q "Zero ERROR-level events" data/logs/errors.summary.md; then
+ERR_SUMMARY="data/logs/machine/errors.summary.md"
+[ -f "$ERR_SUMMARY" ] || ERR_SUMMARY="data/logs/errors.summary.md"
+if [ -f "$ERR_SUMMARY" ]; then
+    if grep -q "Zero ERROR-level events" "$ERR_SUMMARY"; then
         printf "[PASS] %-14s no ERROR events in lookback window\n" "errors"
         PASS=$((PASS + 1))
     else
         # Surface the top signatures for operator visibility
-        sig_count=$(grep -c '^| [0-9]\+ | ' data/logs/errors.summary.md 2>/dev/null || echo 0)
-        printf "[WARN] %-14s %s active signature(s) — see data/logs/errors.summary.md\n" "errors" "${sig_count}"
+        sig_count=$(grep -c '^| [0-9]\+ | ' "$ERR_SUMMARY" 2>/dev/null || echo 0)
+        printf "[WARN] %-14s %s active signature(s) — see data/logs/machine/errors.summary.md\n" "errors" "${sig_count}"
     fi
 else
     printf "[SKIP] %-14s errors.summary.md not present (app hasn't run since Phase 5 shipped)\n" "errors"

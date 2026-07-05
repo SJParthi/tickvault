@@ -72,7 +72,11 @@ if [ -n "$BRANCH" ] && command -v gh >/dev/null 2>&1; then
 fi
 
 # 3. Error count in last hour from errors.jsonl rotation files
-LOGS_DIR="$CWD/data/logs"
+LOGS_DIR="$CWD/data/logs/machine"
+# 2026-07-05 grace window: pre-move rotations at the legacy top level.
+if [ ! -d "$LOGS_DIR" ]; then
+  LOGS_DIR="$CWD/data/logs"
+fi
 if [ -d "$LOGS_DIR" ]; then
   CURRENT_HOUR=$(date -u +%Y-%m-%d-%H)
   CURRENT_FILE="$LOGS_DIR/errors.jsonl.$CURRENT_HOUR"
