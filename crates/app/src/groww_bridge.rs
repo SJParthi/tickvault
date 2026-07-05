@@ -161,13 +161,34 @@ fn emit_groww_ws_audit(
         return;
     };
     let row = build_groww_ws_audit_row(event_kind, source, reason);
+    // 2026-07-05: upgraded from debug! (silent-loss window — the operator found
+    // ws_event_audit feed='groww' EMPTY with zero signal). Static reason label
+    // only ("full"/"closed") — never the dropped row, whose pre-redaction
+    // reason must never reach a log (security review).
     if let Err(err) = tx.try_send(row) {
-        // %err (Display) prints only "full"/"closed" — NOT the dropped row, whose
-        // pre-redaction reason must never reach a log (security review).
-        debug!(
-            reason = %err,
+        let drop_reason = groww_ws_audit_drop_reason(&err);
+        error!(
+            code = tickvault_common::error_code::ErrorCode::AuditWs01EventWriteFailed.code_str(),
+            reason = drop_reason,
             "groww ws_event_audit channel full/closed — row dropped (log+feed_health still fired)"
         );
+        metrics::counter!("tv_ws_event_audit_dropped_total", "reason" => drop_reason).increment(1);
+    }
+}
+
+/// 2026-07-05: static drop-reason label for a Groww `ws_event_audit`
+/// `try_send` failure — `"full"` / `"closed"`. Mirrors the core helper
+/// (`tickvault_core::websocket::connection::ws_audit_drop_reason`, crate-private
+/// there) so the `tv_ws_event_audit_dropped_total{reason}` counter never
+/// allocates a label and the dropped row's content is never formatted.
+#[inline]
+#[must_use]
+fn groww_ws_audit_drop_reason(
+    err: &tokio::sync::mpsc::error::TrySendError<WsEventAuditRow>,
+) -> &'static str {
+    match err {
+        tokio::sync::mpsc::error::TrySendError::Full(_) => "full",
+        tokio::sync::mpsc::error::TrySendError::Closed(_) => "closed",
     }
 }
 
@@ -3312,6 +3333,21 @@ mod tests {
             .append_row(&row)
             .expect("groww row appends to the shared writer");
         assert_eq!(writer.pending(), 1);
+    }
+
+    #[test]
+    fn test_groww_ws_audit_drop_reason_labels() {
+        // 2026-07-05 loud-drop fix: Full → "full", Closed → "closed". Static
+        // labels only — the counter `tv_ws_event_audit_dropped_total{reason}`
+        // must never see a third value or a formatted row.
+        let row = build_groww_ws_audit_row(WsEventKind::Connected, "n/a", "test");
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        tx.try_send(row.clone()).expect("first send fills capacity");
+        let full_err = tx.try_send(row.clone()).expect_err("second send is Full");
+        assert_eq!(groww_ws_audit_drop_reason(&full_err), "full");
+        drop(rx);
+        let closed_err = tx.try_send(row).expect_err("send on closed channel");
+        assert_eq!(groww_ws_audit_drop_reason(&closed_err), "closed");
     }
 
     #[test]
