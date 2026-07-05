@@ -1455,6 +1455,14 @@ pids_except() {
   return 0
 }
 
+# board_open_decision <http_code> → open|skip. FIX 26: the Live Board
+# (GET /board, PR #1415 on main) auto-opens on the Run click ONLY when the
+# running build actually serves it — 200 → open; anything else (404 on an
+# older build, 000 timeout/no answer, garbage) → skip silently. Pure.
+board_open_decision() {
+  if [ "${1:-}" = "200" ]; then echo open; else echo skip; fi
+}
+
 # is_sidecar_cmdline <full command line> → rc 0 ONLY for a real sidecar
 # process: a python interpreter token BEFORE the script path. FIX 25:
 # `pgrep -f 'groww_sidecar\.py'` also matches an operator's editor/pager
@@ -2254,6 +2262,26 @@ rust_shadow_status_line() {
   rust_shadow_status_text "$enabled" "$lines" "$native_err"
 }
 
+# maybe_open_live_board — FIX 26: auto-open the Live Board page (GET /board,
+# PR #1415) in the browser on the Run click, the same way the operator opens
+# the database console — but ONLY when the running build actually serves the
+# route (older builds 404 → skip silently, no browser tab, no Telegram).
+# Bounded 3s probe; degrade-safe where `open` is absent (Linux CI). Runtime.
+maybe_open_live_board() {
+  local code
+  code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 \
+    "http://127.0.0.1:${APP_API_PORT}/board" 2>/dev/null || echo 000)
+  if [ "$(board_open_decision "$code")" = "open" ]; then
+    log "Live Board route answered 200 — opening http://localhost:${APP_API_PORT}/board"
+    if command -v open >/dev/null 2>&1; then
+      open "http://localhost:${APP_API_PORT}/board" >>"$(current_log)" 2>&1 || true
+    fi
+  else
+    log "Live Board route not served by this build (http ${code}) — skipping the auto-open"
+  fi
+  return 0
+}
+
 # FIX 19 item 7: detach the feed-status pinger so no start path blocks on
 # the up-to-3-minute poll (mirrors the FIX 18 G5 monitor spawn pattern —
 # own process group, survives the parent's exit).
@@ -2673,6 +2701,7 @@ start_app_inner() { # $1 = label for the log
       # FIX 23: the adopted app's OWN sidecars are excluded (parent match);
       # anything else claiming the Groww socket is a stray from an earlier run.
       sweep_stray_lab_processes 0 "$kept_pid"
+      maybe_open_live_board # FIX 26: adopt path opens the Live Board too
       return 0
     fi
     log "previous app (pid $kept_pid) stopped by the adopt gate — launching fresh"
@@ -2699,6 +2728,7 @@ start_app_inner() { # $1 = label for the log
     # database-integrity gate before being adopted as today's app.
     if handle_adopt_verdict "$(adopt_gate)" "$existing"; then
       sweep_stray_lab_processes 0 "$existing" # FIX 23: sweep non-children strays
+      maybe_open_live_board                   # FIX 26: adopt path opens the Live Board too
       return 0
     fi
     log "discovered app (pid $existing) stopped by the adopt gate — launching fresh"
@@ -3171,6 +3201,7 @@ cmd_start() {
   fi
   [ "$start_rc" = "0" ] || return 1
   tg "🚀 Manual start complete — app running, feed capture live. Autopilot (if scheduled) will adopt this app, not double-start."
+  maybe_open_live_board   # FIX 26: open the Live Board when the build serves it
   spawn_feed_status_pings # FIX 19 item 7: one Telegram per feed, every mode
   # FIX 18 G5: a manual Start with no 08:55 robot alive previously ran the
   # whole day with NO monitor — no 15:35 EOD stop (the app + broker session

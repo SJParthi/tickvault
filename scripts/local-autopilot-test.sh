@@ -890,6 +890,25 @@ t "F25: empty cmdline fails SAFE (not a candidate)" "1" \
 t "F25: candidates fn requires the real-cmdline classifier" "0" \
   "$(sed -n '/^stray_sidecar_candidates()/,/^}/p' scripts/local-autopilot.sh | grep -q 'is_sidecar_cmdline' && echo 0 || echo 1)"
 
+# ── FIX 26: auto-open the Live Board on Run click when the build serves it ──
+t "F26: route answers 200 → open" "open" "$(board_open_decision 200)"
+t "F26: 404 (older build) → skip" "skip" "$(board_open_decision 404)"
+t "F26: 000 (timeout/no answer) → skip" "skip" "$(board_open_decision 000)"
+t "F26: 500 → skip (never open a broken page)" "skip" "$(board_open_decision 500)"
+t "F26: empty code fails safe to skip" "skip" "$(board_open_decision '')"
+t "F26: garbage code fails safe to skip" "skip" "$(board_open_decision banana)"
+# wiring pins
+t "F26: manual-start path opens the board after health confirmation" "0" \
+  "$(sed -n '/^cmd_start()/,/^}/p' scripts/local-autopilot.sh | grep -q 'maybe_open_live_board' && echo 0 || echo 1)"
+t "F26: both adopt paths open the board" "2" \
+  "$(sed -n '/^start_app_inner()/,/^}/p' scripts/local-autopilot.sh | grep -c 'maybe_open_live_board' || true)"
+t "F26: probe is timeout-bounded" "0" \
+  "$(sed -n '/^maybe_open_live_board()/,/^}/p' scripts/local-autopilot.sh | grep -q -- '--max-time 3' && echo 0 || echo 1)"
+t "F26: opener consults the pure decision (never opens on non-200)" "0" \
+  "$(sed -n '/^maybe_open_live_board()/,/^}/p' scripts/local-autopilot.sh | grep -q 'board_open_decision' && echo 0 || echo 1)"
+t "F26: opener targets the /board route" "0" \
+  "$(sed -n '/^maybe_open_live_board()/,/^}/p' scripts/local-autopilot.sh | grep -q '/board' && echo 0 || echo 1)"
+
 echo
 echo "local-autopilot pure-logic tests: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]
