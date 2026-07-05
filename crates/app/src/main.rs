@@ -251,6 +251,14 @@ async fn emit_boot_completed_when_feed_live(
     feed_runtime: &std::sync::Arc<tickvault_api::feed_state::FeedRuntimeState>,
     dhan_enabled: bool,
     groww_enabled: bool,
+    // BUG-2 fix (2026-07-05): `true` when the Dhan lane COMPLETED its boot
+    // but deliberately built no pool (non-trading day / offline slow boot).
+    // The lane is honestly NOT running (`dhan_running=false` on the feeds
+    // page), but the BOOT itself succeeded — withholding the alive signal
+    // would false-page the boot-heartbeat alarm on every holiday/weekend
+    // boot. `false` everywhere a pool was intended (the gate then genuinely
+    // waits for the lane-running flag).
+    dhan_poolless_idle: bool,
 ) {
     if !dhan_enabled && !groww_enabled {
         // Deliberately feed-less run — emit immediately (no feed to wait for),
@@ -267,7 +275,9 @@ async fn emit_boot_completed_when_feed_live(
     let deadline = std::time::Instant::now()
         + std::time::Duration::from_secs(BOOT_COMPLETED_FEED_LIVENESS_WAIT_SECS);
     loop {
-        let dhan_running = feed_runtime.is_dhan_lane_running();
+        // BUG-2 fix: a poolless-idle Dhan lane counts as "alive" for the
+        // boot signal — the boot completed; there is simply no market today.
+        let dhan_running = feed_runtime.is_dhan_lane_running() || dhan_poolless_idle;
         let groww_running = feed_runtime.is_groww_lane_running();
         if boot_completed_should_emit(dhan_enabled, groww_enabled, dhan_running, groww_running) {
             info!(
@@ -275,7 +285,9 @@ async fn emit_boot_completed_when_feed_live(
                 groww_enabled,
                 dhan_running,
                 groww_running,
-                "boot-completed: a live feed is up — emitting the alive signal"
+                dhan_poolless_idle,
+                "boot-completed: a live feed is up (or the Dhan lane completed a \
+                 pool-less non-trading-day boot) — emitting the alive signal"
             );
             emit_boot_completed();
             return;
@@ -432,19 +444,19 @@ async fn main() -> Result<()> {
     // mid-trade. The Dhan connection tasks always spawn below (gated dormant when
     // disabled), so the lane is "running" whenever the pool is built.
     feed_runtime.set_dhan_disable_allowed(config.strategy.dry_run);
-    // Mark the Dhan lane "running" ONLY when Dhan is enabled at boot — that is
-    // the only case the pool is actually built below. If Dhan is OFF at boot the
-    // pool is never spawned, so reporting it running would be a false-OK
-    // (hostile-review HIGH 2026-06-21) — mirrors the groww_lane_running honesty.
-    // PR-2: `mark_dhan_pool_present()` records that a REAL pool exists this
-    // process (the sentinel PR-E's in-loop dormancy needs to resume). On a
-    // boot-OFF run this stays false, so the Dhan activation watcher REFUSES to
-    // mark the lane running on a runtime enable (no pool ⇒ no stream ⇒ no
-    // false-OK) — the boot-OFF cold-start of the inline Dhan spine is the
-    // documented deferred residual (a restart with dhan_enabled=true is required).
+    // BUG-2 fix (2026-07-05): `mark_dhan_lane_running()` +
+    // `mark_dhan_pool_present()` are NO LONGER set here. Being "enabled at
+    // boot" is NOT the same as "the pool is actually built" — a
+    // non-trading-day boot (weekend/holiday) SKIPS the WebSocket pool
+    // ("WebSocket pool skipped — non-trading day"), yet this block used to
+    // report dhan_running=true + pool_present=true (false-OK, live proof
+    // 2026-07-05 17:59 IST Saturday boot). Both flags are now set at the
+    // ONLY honest place: the pool-spawn sites (FAST arm + `start_dhan_lane`
+    // boot-ON arm) right after a REAL pool is spawned. On a pool-less boot
+    // (non-trading day / offline) they stay false — the feeds page shows
+    // Dhan as enabled-but-idle, not running, and the PR-2 no-pool
+    // protection in the activation watcher stays truthful.
     if feeds.dhan_enabled {
-        feed_runtime.mark_dhan_lane_running();
-        feed_runtime.mark_dhan_pool_present();
         // D2b: seed the lane FSM to `Starting` for the boot-ON case so the
         // runtime cold-start supervisor (spawned below) NEVER race-spawns a
         // second cold-start while the inline boot spine is bringing the lane up.
@@ -710,9 +722,11 @@ async fn main() -> Result<()> {
     // the supervisor layer (a second layer behind the handler's CONFLICT). It
     // mutates ONLY the FeedRuntimeState atomics — NO new WS connection/endpoint
     // (the 2-WS Dhan lock is untouched). Enabled-default is byte-identical: the
-    // inline Dhan boot block below already calls mark_dhan_lane_running(), so the
-    // watcher's first tick sees desired-ON + already-running → None → it does
-    // NOTHING to the boot. (Honest boundary: the full boot-OFF → cold-start lift
+    // inline Dhan boot block below calls mark_dhan_lane_running() at the
+    // pool-spawn site (BUG-2 fix 2026-07-05), and the watcher holds off while
+    // the lane FSM reads Starting, so its first ACTIVE tick sees desired-ON +
+    // already-running → None → it does NOTHING to the boot. (Honest boundary:
+    // the full boot-OFF → cold-start lift
     // of the inline Dhan boot spine is the deferred residual of this plan; see
     // dhan_activation.rs module docs — PR-E's in-loop dormancy already handles the
     // live disconnect/reconnect for a boot-ON Dhan feed.)
@@ -2101,6 +2115,21 @@ async fn main() -> Result<()> {
                 &feed_health,
             )
             .await;
+            // BUG-2 fix (2026-07-05): mark the Dhan lane running + the PR-2
+            // pool-present sentinel ONLY now that a REAL pool is spawned
+            // (moved from the unconditional dhan_enabled block at the top of
+            // main() — see the comment there). Also drive the lane FSM
+            // Starting→Running here: the FAST arm never reaches the slow
+            // arm's `StartSucceeded` drive, and the activation watcher now
+            // holds off while the FSM reads `Starting`, so leaving the seed
+            // in place would keep the watcher dormant for the whole run.
+            feed_runtime.mark_dhan_lane_running();
+            feed_runtime.mark_dhan_pool_present();
+            feed_runtime.set_dhan_lane_state(tickvault_api::feed_state::LaneState::Running);
+            record_dhan_lane_transition(
+                tickvault_api::feed_state::LaneState::Starting,
+                tickvault_api::feed_state::LaneState::Running,
+            );
             (handles, Some(pool_arc))
         } else {
             (Vec::new(), None)
@@ -2544,6 +2573,10 @@ async fn main() -> Result<()> {
             &feed_runtime,
             config.feeds.dhan_enabled,
             config.feeds.groww_enabled,
+            // BUG-2: the FAST crash-recovery arm always intends a pool
+            // (market-hours trading-day restarts only) — the gate genuinely
+            // waits for the lane-running flag here.
+            false,
         )
         .await;
 
@@ -5731,7 +5764,7 @@ async fn start_dhan_lane(
     // loss / shutdown release; `TokenManager::acquire_token` refuses any
     // `generateAccessToken` mint while it reads `false`.
     let instance_lock_held = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let mut instance_lock_shutdown_chain: Option<std::sync::Arc<tokio::sync::Notify>>;
+    let instance_lock_shutdown_chain: Option<std::sync::Arc<tokio::sync::Notify>>;
     let instance_lock_handle: Option<tokio::task::JoinHandle<()>> = {
         info!(
             mode = trading_mode.as_str(),
@@ -5931,11 +5964,16 @@ async fn start_dhan_lane(
         instance_lock_shutdown_chain = Some(heartbeat_shutdown_for_chain);
         Some(heartbeat_handle)
     };
-    // Keep the heartbeat handle alive for the lifetime of main.
-    // Dropped on return (boot-halt or graceful shutdown). The task
-    // itself observes the dropped Notify on shutdown when Item 19e
-    // wires the chained shutdown.
-    let _instance_lock_handle = instance_lock_handle;
+    // BUG-1 fix (2026-07-05, live 15:35 IST stop proof): the heartbeat
+    // JoinHandle is NO LONGER dropped here. It rides into
+    // `DhanLaneRunHandles` below so `teardown_dhan_lane_tasks` can
+    // bound-await the shutdown release (SSM DeleteParameter) BEFORE the
+    // process exits. Previously the handle was dropped on this line
+    // (`let _instance_lock_handle = ...`), so the release RACED process
+    // exit — the 15:35 IST graceful EOD stop left the lock parameter in
+    // SSM, and a quick Stop→Start (<90s TTL) HALTed with RESILIENCE-01.
+    // An early boot-abort return between here and the handles struct
+    // still just detaches the task (pre-fix behaviour, TTL backstop).
 
     // -----------------------------------------------------------------------
     // Step 6: Authenticate with Dhan API (infinite retry for transient errors)
@@ -6704,10 +6742,19 @@ async fn start_dhan_lane(
             None => return Err(StartLaneError::WsPoolSpawn),
         }
     } else if !is_trading && !is_mock_trading {
-        info!("WebSocket pool skipped — non-trading day (no live market data to capture)");
+        // BUG-2 fix (2026-07-05): no pool ⇒ the lane-running flag + the PR-2
+        // pool-present sentinel stay FALSE (they are only set at the
+        // pool-spawn site). The feeds page shows Dhan as enabled-but-idle.
+        info!(
+            "WebSocket pool skipped — non-trading day (no live market data to capture); \
+             Dhan lane stays enabled-but-idle (dhan_running=false, no pool)"
+        );
         (None, None)
     } else {
-        warn!("WebSocket pool skipped — running in offline mode");
+        warn!(
+            "WebSocket pool skipped — running in offline mode; Dhan lane stays \
+             enabled-but-idle (dhan_running=false, no pool)"
+        );
         (None, None)
     };
 
@@ -7250,7 +7297,14 @@ async fn start_dhan_lane(
     // in practice); now Ctrl-C / 15:30 IST close / pool-halt all
     // trigger the heartbeat's `GracefulRelease` audit row + lock
     // release before the process exits.
-    if let Some(heartbeat_shutdown) = instance_lock_shutdown_chain.take() {
+    //
+    // BUG-1 fix (2026-07-05): `.clone()` instead of `.take()` — the same
+    // Notify ALSO rides into `DhanLaneRunHandles.instance_lock_shutdown`
+    // so `teardown_dhan_lane_tasks` can `notify_one()` it DIRECTLY
+    // (permit-storing, lost-wake safe per audit Rule 16 — this bridge's
+    // `notify_waiters()` wake can be lost if it fires before the bridge
+    // task parks) and then bound-await the heartbeat's release.
+    if let Some(heartbeat_shutdown) = instance_lock_shutdown_chain.clone() {
         let shutdown_signal = shutdown_notify.clone();
         tokio::spawn(async move {
             shutdown_signal.notified().await;
@@ -7309,6 +7363,18 @@ async fn start_dhan_lane(
             &feed_health,
         )
         .await;
+        // BUG-2 fix (2026-07-05): mark the Dhan lane running + the PR-2
+        // pool-present sentinel ONLY now that a REAL pool is spawned (moved
+        // from the unconditional dhan_enabled block at the top of main()).
+        // Boot-ON only: the RUNTIME cold-start (`lane_scoped`) keeps its
+        // phantom-running closure — pool-present + lane-running are set
+        // exclusively after the `StartSucceeded` CAS wins (main.rs, the
+        // runtime Ok arm), so a disable-during-cold-start race can never
+        // leave a torn-down pool marked present.
+        if !lane_scoped {
+            feed_runtime.mark_dhan_lane_running();
+            feed_runtime.mark_dhan_pool_present();
+        }
         (handles, Some(pool_arc))
     } else {
         (Vec::new(), None)
@@ -8205,6 +8271,14 @@ async fn start_dhan_lane(
         &feed_runtime,
         config.feeds.dhan_enabled,
         config.feeds.groww_enabled,
+        // BUG-2: a slow boot that deliberately skipped the pool
+        // (non-trading day / offline) completed its boot — the lane is
+        // honestly NOT running, but the alive signal must still emit or the
+        // boot-heartbeat alarm false-pages on every holiday/weekend boot.
+        // A pool-build FAILURE never reaches this line (StartLaneError
+        // returns above), so `ws_pool_arc.is_none()` here means
+        // "deliberately pool-less", never "pool died".
+        ws_pool_arc.is_none(),
     )
     .await;
 
@@ -8373,6 +8447,11 @@ async fn start_dhan_lane(
         // the lane-scoped watchdog Halt signal. `None` for boot-ON (the watchdog
         // keeps its `process::exit(2)` contract; boot-ON handles are not parked).
         lane_halt_notify,
+        // BUG-1 fix (2026-07-05): the dual-instance lock heartbeat handle +
+        // its shutdown Notify ride into the lane so teardown bound-awaits
+        // the SSM DeleteParameter release before process exit.
+        instance_lock_heartbeat: instance_lock_handle,
+        instance_lock_shutdown: instance_lock_shutdown_chain,
     })
 }
 
@@ -8418,6 +8497,22 @@ struct DhanLaneRunHandles {
     /// Groww + shared infra ALIVE). `None` for a BOOT-ON lane (not parked; the
     /// watchdog keeps the pre-existing single-feed `process::exit(2)` behaviour).
     lane_halt_notify: Option<std::sync::Arc<tokio::sync::Notify>>,
+    /// BUG-1 fix (2026-07-05): the Phase 0 Item 19 dual-instance SSM lock
+    /// heartbeat task. Teardown signals `instance_lock_shutdown` then
+    /// bound-awaits this handle ([`INSTANCE_LOCK_RELEASE_TIMEOUT_SECS`]) so
+    /// the heartbeat's shutdown release (SSM DeleteParameter) LANDS before
+    /// the process exits — previously the handle was dropped at spawn time
+    /// and the release RACED process exit (live proof: the 15:35 IST
+    /// 2026-07-05 graceful EOD stop left the lock in SSM; the 17:59 boot
+    /// found it stale at age 8622s). `None` on the FAST crash-recovery boot
+    /// arm, which holds no lock (dual-instance-lock-2026-07-04 §3 honest
+    /// envelope). NEVER aborted in Drop — aborting would kill the in-flight
+    /// DeleteParameter; dropping the handle detaches (pre-fix best-effort).
+    instance_lock_heartbeat: Option<tokio::task::JoinHandle<()>>,
+    /// The heartbeat's own shutdown `Notify`. `notify_one()` stores a permit
+    /// (Rule 16 lost-wake safe) — teardown/Drop fire it directly instead of
+    /// relying only on the `shutdown_notify` bridge task's `notified()` wake.
+    instance_lock_shutdown: Option<std::sync::Arc<tokio::sync::Notify>>,
 }
 
 /// Defense-in-depth (H8 no-leak floor): if a `DhanLaneRunHandles` is dropped
@@ -8451,6 +8546,15 @@ impl Drop for DhanLaneRunHandles {
         }
         if let Some(handle) = self.token_health_handle.as_ref() {
             handle.abort();
+        }
+        // BUG-1: implicit teardown — signal the instance-lock heartbeat's
+        // release (permit-based `notify_one`, sync + non-blocking, Drop-safe)
+        // but do NOT abort its JoinHandle: aborting would kill the in-flight
+        // SSM DeleteParameter. Dropping the handle with the struct detaches
+        // the task so the release proceeds best-effort in the background
+        // (the 90s TTL remains the backstop on a hard crash).
+        if let Some(shutdown) = self.instance_lock_shutdown.as_ref() {
+            shutdown.notify_one();
         }
         // B3 round-2 honesty reset: deliberate lane-off → token block reads
         // 0/false, same as the pre-wiring (pre-B3) perpetual state, so no
@@ -8594,6 +8698,44 @@ async fn teardown_dhan_lane_tasks(mut lane: DhanLaneRunHandles) {
     if let Some(handle) = lane.trading_handle.take() {
         handle.abort();
     }
+
+    // 6. BUG-1 fix (2026-07-05): release the dual-instance SSM lock and
+    //    bound-await the release BEFORE the process exits. Signal the
+    //    heartbeat's own Notify DIRECTLY (`notify_one` stores a permit —
+    //    Rule 16 lost-wake safe; the step-3 `shutdown_notify.notify_waiters()`
+    //    bridge wake can be lost if the bridge task was not yet parked), then
+    //    await the heartbeat JoinHandle with a bounded timeout so a
+    //    black-holed SSM endpoint can never hang shutdown (mirror of
+    //    `GrowwScaleFleetLockGuard::release_on_shutdown`, 2026-07-04).
+    //    Live proof this was broken: the 15:35 IST 2026-07-05 graceful EOD
+    //    stop exited before the DeleteParameter landed, leaving the lock in
+    //    SSM (17:59 boot found it stale, age 8622s); a Stop→Start inside the
+    //    90s TTL would have HALTed with RESILIENCE-01.
+    //    Fields are taken only here (past every earlier `.await`); a
+    //    mid-flight drop leaves them in `lane` → Drop fires `notify_one` so
+    //    the release still proceeds best-effort in the background.
+    if let Some(shutdown) = lane.instance_lock_shutdown.take() {
+        shutdown.notify_one();
+    }
+    if let Some(handle) = lane.instance_lock_heartbeat.take() {
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(INSTANCE_LOCK_RELEASE_TIMEOUT_SECS),
+            handle,
+        )
+        .await
+        {
+            Ok(_) => info!(
+                "dual-instance lock released on shutdown — the SSM slot is free \
+                 for an immediate same-host restart"
+            ),
+            Err(_) => warn!(
+                timeout_secs = INSTANCE_LOCK_RELEASE_TIMEOUT_SECS,
+                "dual-instance lock release did not settle within the bound — \
+                 the 90s TTL self-heals the slot; a restart inside that window \
+                 sees a fresh peer and HALTs with RESILIENCE-01 (retry after ~90s)"
+            ),
+        }
+    }
     // H7: `lane_halt_notify` is consumed by the parked task's `select!`, not
     // needed during teardown — left in `lane` (it is not a JoinHandle, so Drop
     // does not touch it). `lane` drops here as a no-op (all handle fields taken).
@@ -8645,6 +8787,15 @@ async fn teardown_dhan_lane_tasks(mut lane: DhanLaneRunHandles) {
 //     manager handle out through `DhanLaneRunHandles` so the Stop can drop it
 //     deterministically is a deeper spine refactor tracked for D2c.
 // ===========================================================================
+
+/// BUG-1 fix (2026-07-05): bounded wait for the dual-instance lock
+/// heartbeat's clean SSM release (one GetParameter + DeleteParameter
+/// round-trip) at graceful teardown. On timeout shutdown proceeds anyway —
+/// the 90s TTL remains the self-heal backstop; the bound only exists so a
+/// black-holed SSM endpoint can never hang process exit. Mirrors
+/// `GROWW_SCALE_LOCK_RELEASE_TIMEOUT_SECS` (the 2026-07-04 fleet-lock
+/// release pattern this fix makes the Dhan lock match).
+const INSTANCE_LOCK_RELEASE_TIMEOUT_SECS: u64 = 5;
 
 /// Cap on the per-failed-cold-start retry backoff, mirroring the Groww
 /// activation watcher's `min(10 * 2^n, 300)` ladder (cold control-plane).
@@ -9738,6 +9889,11 @@ async fn run_shutdown_fast(
             // keeps its `process::exit(2)` single-feed contract, so no
             // lane-scoped Halt signal is needed here.
             lane_halt_notify: None,
+            // BUG-1: the FAST crash-recovery arm holds NO dual-instance lock
+            // (dual-instance-lock-2026-07-04 §3 honest envelope — it never
+            // mints at boot), so there is no heartbeat to release.
+            instance_lock_heartbeat: None,
+            instance_lock_shutdown: None,
         }),
         api_handle,
         otel_provider,
@@ -11566,6 +11722,8 @@ mod tests {
             ws_pool_arc: None,
             shutdown_notify: std::sync::Arc::new(tokio::sync::Notify::new()),
             lane_halt_notify: None,
+            instance_lock_heartbeat: None,
+            instance_lock_shutdown: None,
         };
         drop(handles);
 
@@ -11579,6 +11737,110 @@ mod tests {
         assert!(
             abort_handle.is_finished(),
             "dropping DhanLaneRunHandles must abort (not detach) the live ws pool task"
+        );
+    }
+
+    /// BUG-1 ratchet (2026-07-05): the graceful teardown must bound-await
+    /// the dual-instance lock heartbeat so the SSM DeleteParameter release
+    /// LANDS before process exit. Live proof this regression class is real:
+    /// the 15:35 IST 2026-07-05 graceful EOD stop left the lock in SSM
+    /// (the 17:59 boot found it stale at age 8622s); a Stop→Start inside
+    /// the 90s TTL HALTs with RESILIENCE-01.
+    #[test]
+    fn ratchet_teardown_bound_awaits_instance_lock_release() {
+        let src = include_str!("main.rs");
+        let teardown_start = src
+            .find("async fn teardown_dhan_lane_tasks(")
+            .expect("teardown_dhan_lane_tasks must exist");
+        let teardown_end = src[teardown_start..]
+            .find("\n}\n")
+            .map(|o| teardown_start + o)
+            .expect("teardown_dhan_lane_tasks must have a body end");
+        let body = &src[teardown_start..teardown_end];
+        // Direct permit-storing wake (Rule 16 lost-wake safe) — never rely
+        // only on the notify_waiters bridge.
+        assert!(
+            body.contains("lane.instance_lock_shutdown.take()")
+                && body.contains("shutdown.notify_one()"),
+            "teardown must directly notify_one() the instance-lock heartbeat's shutdown Notify"
+        );
+        // Bounded await of the heartbeat handle (the release round-trip).
+        assert!(
+            body.contains("lane.instance_lock_heartbeat.take()")
+                && body.contains("INSTANCE_LOCK_RELEASE_TIMEOUT_SECS"),
+            "teardown must bound-await the instance-lock heartbeat JoinHandle \
+             (tokio::time::timeout(INSTANCE_LOCK_RELEASE_TIMEOUT_SECS, handle)) \
+             so the SSM release lands before process exit"
+        );
+        // The handle must actually ride into the lane struct from the
+        // boot-ON construction site (not stay a dropped local).
+        assert!(
+            src.contains("instance_lock_heartbeat: instance_lock_handle"),
+            "start_dhan_lane must thread the heartbeat JoinHandle into DhanLaneRunHandles"
+        );
+        // The old drop-at-spawn binding must never come back. (Needle
+        // assembled at runtime so this test's own source never self-matches.)
+        let dropped_binding = format!("let _instance_lock_handle = {}", "instance_lock_handle;");
+        assert!(
+            !src.contains(&dropped_binding),
+            "the heartbeat JoinHandle must not be silently dropped at spawn time \
+             (that is exactly the race that leaked the SSM lock on graceful stop)"
+        );
+        // Bound sanity: short enough to never hang a Ctrl-C exit.
+        assert!(
+            INSTANCE_LOCK_RELEASE_TIMEOUT_SECS >= 1 && INSTANCE_LOCK_RELEASE_TIMEOUT_SECS <= 10,
+            "the release bound must stay a short, non-hanging shutdown wait"
+        );
+    }
+
+    /// BUG-2 ratchet (2026-07-05): `dhan_lane_running` + the PR-2
+    /// `dhan_pool_present` sentinel are set ONLY at the pool-spawn sites —
+    /// never from the bare `feeds.dhan_enabled` config flag. A
+    /// non-trading-day boot skips the pool and must stay enabled-but-idle
+    /// (live proof: the 2026-07-05 Saturday boot logged "WebSocket pool
+    /// skipped — non-trading day" yet reported dhan_running:true).
+    #[test]
+    fn ratchet_dhan_running_marked_only_at_pool_spawn() {
+        let src = include_str!("main.rs");
+        // The early feeds block (seeding the FSM) must NOT mark the flags.
+        let feeds_block_start = src
+            .find("if feeds.dhan_enabled {")
+            .expect("the early dhan_enabled boot block must exist");
+        let feeds_block_end = feeds_block_start
+            + src[feeds_block_start..]
+                .find("\n    }\n")
+                .expect("the early dhan_enabled boot block must close");
+        let feeds_block = &src[feeds_block_start..feeds_block_end];
+        assert!(
+            !feeds_block.contains("mark_dhan_lane_running()")
+                && !feeds_block.contains("mark_dhan_pool_present()"),
+            "the early `if feeds.dhan_enabled` block must NOT mark the lane \
+             running / pool present — enabled-at-boot is not pool-built \
+             (non-trading-day boots skip the pool)"
+        );
+        // Both boot-path pool-spawn sites must mark the flags (FAST arm +
+        // slow-arm boot-ON). The distinctive fix-comment marker sits inside
+        // each pool-built branch, right after spawn_websocket_connections;
+        // the runtime cold-start keeps its separate CAS-gated mark.
+        // (Marker assembled at runtime so this test's own source never
+        // self-matches and inflates the count.)
+        let marker = format!(
+            "pool-present sentinel ONLY now that a REAL pool {}",
+            "is spawned"
+        );
+        let mark_sites = src.matches(marker.as_str()).count();
+        assert!(
+            mark_sites >= 2,
+            "both boot-path pool-spawn branches (FAST arm + slow-arm boot-ON) \
+             must mark running/pool-present at the pool-spawn site; found \
+             {mark_sites} marker(s)"
+        );
+        // The alive signal must treat a deliberately pool-less slow boot as
+        // a completed boot (no false boot-heartbeat page on holidays).
+        assert!(
+            src.contains("dhan_poolless_idle: bool") && src.contains("ws_pool_arc.is_none(),"),
+            "emit_boot_completed_when_feed_live must carry the poolless-idle \
+             input, fed from ws_pool_arc.is_none() on the slow boot path"
         );
     }
 

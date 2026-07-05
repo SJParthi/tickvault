@@ -50,15 +50,19 @@
 //! ## Enabled-default is byte-identical
 //! The inline Dhan boot block in `main()` is UNCHANGED. When `dhan_enabled=true`
 //! at boot (the production default) the inline spine runs exactly as before and
-//! calls `mark_dhan_lane_running()`. This watcher runs ALONGSIDE it; on its first
-//! tick it observes desired-ON + already-running → `LaneAction::None` → it does
-//! NOTHING to the boot (no re-auth, no second pool, no reordering). The watcher
-//! only ACTS on a *runtime* toggle.
+//! calls `mark_dhan_lane_running()` at the pool-spawn site (BUG-2 fix
+//! 2026-07-05: the mark moved from "enabled at boot" to "pool actually built",
+//! so a non-trading-day boot honestly stays NOT running). This watcher runs
+//! ALONGSIDE it; while the lane FSM reads `Starting` (the inline spine is
+//! bringing the lane up) it holds off entirely, and once the boot completes it
+//! observes desired-ON + already-running → `LaneAction::None` → it does NOTHING
+//! to the boot (no re-auth, no second pool, no reordering). The watcher only
+//! ACTS on a *runtime* toggle.
 
 use std::sync::Arc;
 use std::time::Duration;
 
-use tickvault_api::feed_state::{Feed, FeedRuntimeState};
+use tickvault_api::feed_state::{Feed, FeedRuntimeState, LaneState};
 use tracing::info;
 
 /// Poll cadence for the enable flag. This is the COLD control-plane (a feed
@@ -192,6 +196,17 @@ pub async fn run_dhan_activation_watcher(feed_runtime: Arc<FeedRuntimeState>) {
     // any teardown / desired-OFF so a later re-enable logs again.
     let mut warned_boot_off = false;
     loop {
+        // BUG-2 fix (2026-07-05): while the lane FSM reads `Starting`, the
+        // inline boot spine / runtime cold-start OWNS the lane — the
+        // lane-running flag is legitimately still false because the pool has
+        // not been spawned yet (the mark moved from "enabled at boot" to the
+        // pool-spawn site). Reconciling mid-start would log a misleading
+        // "no pool was spawned at boot" line on every normal slow boot.
+        // Hold off until the FSM leaves `Starting`.
+        if feed_runtime.dhan_lane_state() == LaneState::Starting {
+            tokio::time::sleep(DHAN_ACTIVATION_POLL).await;
+            continue;
+        }
         let desired = feed_runtime.is_enabled(Feed::Dhan);
         let disable_allowed = feed_runtime.can_disable_dhan();
 
@@ -234,12 +249,12 @@ pub async fn run_dhan_activation_watcher(feed_runtime: Arc<FeedRuntimeState>) {
                     // config and restart to actually stream".
                     if !warned_boot_off {
                         info!(
-                            "[feeds] Dhan enabled at runtime, but no main-feed pool was \
-                             spawned at boot (Dhan was OFF at boot) — runtime cold-start \
-                             from cold is the deferred residual of feed-toggle-full-lifecycle. \
-                             The desired flag is recorded, but the lane stays NOT running \
-                             (no false-OK); a restart with dhan_enabled=true is required to \
-                             actually stream."
+                            "[feeds] Dhan enabled, but no main-feed pool exists in this \
+                             process (Dhan was OFF at boot, or this boot deliberately \
+                             skipped the pool — non-trading day / offline). The desired \
+                             flag is recorded, but the lane stays NOT running (no \
+                             false-OK, enabled-but-idle); a pool-building boot (a trading \
+                             day with dhan_enabled=true) is required to actually stream."
                         );
                         warned_boot_off = true;
                     }
