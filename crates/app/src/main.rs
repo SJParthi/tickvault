@@ -2604,6 +2604,17 @@ async fn main() -> Result<()> {
         std::sync::Arc::clone(&tick_storage),
     )
     .await?;
+    // 2026-07-05 feed-Telegram parity (operator: "why dhan messages and groww
+    // messages are not same"): fill the Groww deferred notifier slot on THIS
+    // boot path too. Before this, only the FAST boot path stored the notifier
+    // (the store next to `fast_notifier` above) — the slow-boot / GROWW-ONLY
+    // shared-infra path never filled the slot, so every Groww boot-stage ping
+    // (FeedAuthOk / FeedInstrumentsLoaded / sidecar-reject / connected) waited
+    // out its budget and was skipped ("notifier slot never filled within the
+    // wait budget"). Provably safe here: the notifier is fully constructed
+    // (strict init + coalescer wrap) inside `build_shared_infra` before this
+    // line runs — the exact mirror of the fast-path store.
+    groww_sidecar_notifier_slot.store(Some(std::sync::Arc::clone(&notifier)));
 
     // =======================================================================
     // PROCESS-GLOBAL supervised observability monitors (2026-07-01 per-lane-leak
