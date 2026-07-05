@@ -5696,7 +5696,7 @@ async fn start_dhan_lane(
     // loss / shutdown release; `TokenManager::acquire_token` refuses any
     // `generateAccessToken` mint while it reads `false`.
     let instance_lock_held = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let mut instance_lock_shutdown_chain: Option<std::sync::Arc<tokio::sync::Notify>>;
+    let instance_lock_shutdown_chain: Option<std::sync::Arc<tokio::sync::Notify>>;
     let instance_lock_handle: Option<tokio::task::JoinHandle<()>> = {
         info!(
             mode = trading_mode.as_str(),
@@ -5896,11 +5896,16 @@ async fn start_dhan_lane(
         instance_lock_shutdown_chain = Some(heartbeat_shutdown_for_chain);
         Some(heartbeat_handle)
     };
-    // Keep the heartbeat handle alive for the lifetime of main.
-    // Dropped on return (boot-halt or graceful shutdown). The task
-    // itself observes the dropped Notify on shutdown when Item 19e
-    // wires the chained shutdown.
-    let _instance_lock_handle = instance_lock_handle;
+    // BUG-1 fix (2026-07-05, live 15:35 IST stop proof): the heartbeat
+    // JoinHandle is NO LONGER dropped here. It rides into
+    // `DhanLaneRunHandles` below so `teardown_dhan_lane_tasks` can
+    // bound-await the shutdown release (SSM DeleteParameter) BEFORE the
+    // process exits. Previously the handle was dropped on this line
+    // (`let _instance_lock_handle = ...`), so the release RACED process
+    // exit — the 15:35 IST graceful EOD stop left the lock parameter in
+    // SSM, and a quick Stop→Start (<90s TTL) HALTed with RESILIENCE-01.
+    // An early boot-abort return between here and the handles struct
+    // still just detaches the task (pre-fix behaviour, TTL backstop).
 
     // -----------------------------------------------------------------------
     // Step 6: Authenticate with Dhan API (infinite retry for transient errors)
@@ -7215,7 +7220,14 @@ async fn start_dhan_lane(
     // in practice); now Ctrl-C / 15:30 IST close / pool-halt all
     // trigger the heartbeat's `GracefulRelease` audit row + lock
     // release before the process exits.
-    if let Some(heartbeat_shutdown) = instance_lock_shutdown_chain.take() {
+    //
+    // BUG-1 fix (2026-07-05): `.clone()` instead of `.take()` — the same
+    // Notify ALSO rides into `DhanLaneRunHandles.instance_lock_shutdown`
+    // so `teardown_dhan_lane_tasks` can `notify_one()` it DIRECTLY
+    // (permit-storing, lost-wake safe per audit Rule 16 — this bridge's
+    // `notify_waiters()` wake can be lost if it fires before the bridge
+    // task parks) and then bound-await the heartbeat's release.
+    if let Some(heartbeat_shutdown) = instance_lock_shutdown_chain.clone() {
         let shutdown_signal = shutdown_notify.clone();
         tokio::spawn(async move {
             shutdown_signal.notified().await;
@@ -8338,6 +8350,11 @@ async fn start_dhan_lane(
         // the lane-scoped watchdog Halt signal. `None` for boot-ON (the watchdog
         // keeps its `process::exit(2)` contract; boot-ON handles are not parked).
         lane_halt_notify,
+        // BUG-1 fix (2026-07-05): the dual-instance lock heartbeat handle +
+        // its shutdown Notify ride into the lane so teardown bound-awaits
+        // the SSM DeleteParameter release before process exit.
+        instance_lock_heartbeat: instance_lock_handle,
+        instance_lock_shutdown: instance_lock_shutdown_chain,
     })
 }
 
@@ -8383,6 +8400,22 @@ struct DhanLaneRunHandles {
     /// Groww + shared infra ALIVE). `None` for a BOOT-ON lane (not parked; the
     /// watchdog keeps the pre-existing single-feed `process::exit(2)` behaviour).
     lane_halt_notify: Option<std::sync::Arc<tokio::sync::Notify>>,
+    /// BUG-1 fix (2026-07-05): the Phase 0 Item 19 dual-instance SSM lock
+    /// heartbeat task. Teardown signals `instance_lock_shutdown` then
+    /// bound-awaits this handle ([`INSTANCE_LOCK_RELEASE_TIMEOUT_SECS`]) so
+    /// the heartbeat's shutdown release (SSM DeleteParameter) LANDS before
+    /// the process exits — previously the handle was dropped at spawn time
+    /// and the release RACED process exit (live proof: the 15:35 IST
+    /// 2026-07-05 graceful EOD stop left the lock in SSM; the 17:59 boot
+    /// found it stale at age 8622s). `None` on the FAST crash-recovery boot
+    /// arm, which holds no lock (dual-instance-lock-2026-07-04 §3 honest
+    /// envelope). NEVER aborted in Drop — aborting would kill the in-flight
+    /// DeleteParameter; dropping the handle detaches (pre-fix best-effort).
+    instance_lock_heartbeat: Option<tokio::task::JoinHandle<()>>,
+    /// The heartbeat's own shutdown `Notify`. `notify_one()` stores a permit
+    /// (Rule 16 lost-wake safe) — teardown/Drop fire it directly instead of
+    /// relying only on the `shutdown_notify` bridge task's `notified()` wake.
+    instance_lock_shutdown: Option<std::sync::Arc<tokio::sync::Notify>>,
 }
 
 /// Defense-in-depth (H8 no-leak floor): if a `DhanLaneRunHandles` is dropped
@@ -8416,6 +8449,15 @@ impl Drop for DhanLaneRunHandles {
         }
         if let Some(handle) = self.token_health_handle.as_ref() {
             handle.abort();
+        }
+        // BUG-1: implicit teardown — signal the instance-lock heartbeat's
+        // release (permit-based `notify_one`, sync + non-blocking, Drop-safe)
+        // but do NOT abort its JoinHandle: aborting would kill the in-flight
+        // SSM DeleteParameter. Dropping the handle with the struct detaches
+        // the task so the release proceeds best-effort in the background
+        // (the 90s TTL remains the backstop on a hard crash).
+        if let Some(shutdown) = self.instance_lock_shutdown.as_ref() {
+            shutdown.notify_one();
         }
         // B3 round-2 honesty reset: deliberate lane-off → token block reads
         // 0/false, same as the pre-wiring (pre-B3) perpetual state, so no
@@ -8559,6 +8601,44 @@ async fn teardown_dhan_lane_tasks(mut lane: DhanLaneRunHandles) {
     if let Some(handle) = lane.trading_handle.take() {
         handle.abort();
     }
+
+    // 6. BUG-1 fix (2026-07-05): release the dual-instance SSM lock and
+    //    bound-await the release BEFORE the process exits. Signal the
+    //    heartbeat's own Notify DIRECTLY (`notify_one` stores a permit —
+    //    Rule 16 lost-wake safe; the step-3 `shutdown_notify.notify_waiters()`
+    //    bridge wake can be lost if the bridge task was not yet parked), then
+    //    await the heartbeat JoinHandle with a bounded timeout so a
+    //    black-holed SSM endpoint can never hang shutdown (mirror of
+    //    `GrowwScaleFleetLockGuard::release_on_shutdown`, 2026-07-04).
+    //    Live proof this was broken: the 15:35 IST 2026-07-05 graceful EOD
+    //    stop exited before the DeleteParameter landed, leaving the lock in
+    //    SSM (17:59 boot found it stale, age 8622s); a Stop→Start inside the
+    //    90s TTL would have HALTed with RESILIENCE-01.
+    //    Fields are taken only here (past every earlier `.await`); a
+    //    mid-flight drop leaves them in `lane` → Drop fires `notify_one` so
+    //    the release still proceeds best-effort in the background.
+    if let Some(shutdown) = lane.instance_lock_shutdown.take() {
+        shutdown.notify_one();
+    }
+    if let Some(handle) = lane.instance_lock_heartbeat.take() {
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(INSTANCE_LOCK_RELEASE_TIMEOUT_SECS),
+            handle,
+        )
+        .await
+        {
+            Ok(_) => info!(
+                "dual-instance lock released on shutdown — the SSM slot is free \
+                 for an immediate same-host restart"
+            ),
+            Err(_) => warn!(
+                timeout_secs = INSTANCE_LOCK_RELEASE_TIMEOUT_SECS,
+                "dual-instance lock release did not settle within the bound — \
+                 the 90s TTL self-heals the slot; a restart inside that window \
+                 sees a fresh peer and HALTs with RESILIENCE-01 (retry after ~90s)"
+            ),
+        }
+    }
     // H7: `lane_halt_notify` is consumed by the parked task's `select!`, not
     // needed during teardown — left in `lane` (it is not a JoinHandle, so Drop
     // does not touch it). `lane` drops here as a no-op (all handle fields taken).
@@ -8610,6 +8690,15 @@ async fn teardown_dhan_lane_tasks(mut lane: DhanLaneRunHandles) {
 //     manager handle out through `DhanLaneRunHandles` so the Stop can drop it
 //     deterministically is a deeper spine refactor tracked for D2c.
 // ===========================================================================
+
+/// BUG-1 fix (2026-07-05): bounded wait for the dual-instance lock
+/// heartbeat's clean SSM release (one GetParameter + DeleteParameter
+/// round-trip) at graceful teardown. On timeout shutdown proceeds anyway —
+/// the 90s TTL remains the self-heal backstop; the bound only exists so a
+/// black-holed SSM endpoint can never hang process exit. Mirrors
+/// `GROWW_SCALE_LOCK_RELEASE_TIMEOUT_SECS` (the 2026-07-04 fleet-lock
+/// release pattern this fix makes the Dhan lock match).
+const INSTANCE_LOCK_RELEASE_TIMEOUT_SECS: u64 = 5;
 
 /// Cap on the per-failed-cold-start retry backoff, mirroring the Groww
 /// activation watcher's `min(10 * 2^n, 300)` ladder (cold control-plane).
@@ -9703,6 +9792,11 @@ async fn run_shutdown_fast(
             // keeps its `process::exit(2)` single-feed contract, so no
             // lane-scoped Halt signal is needed here.
             lane_halt_notify: None,
+            // BUG-1: the FAST crash-recovery arm holds NO dual-instance lock
+            // (dual-instance-lock-2026-07-04 §3 honest envelope — it never
+            // mints at boot), so there is no heartbeat to release.
+            instance_lock_heartbeat: None,
+            instance_lock_shutdown: None,
         }),
         api_handle,
         otel_provider,
@@ -11531,6 +11625,8 @@ mod tests {
             ws_pool_arc: None,
             shutdown_notify: std::sync::Arc::new(tokio::sync::Notify::new()),
             lane_halt_notify: None,
+            instance_lock_heartbeat: None,
+            instance_lock_shutdown: None,
         };
         drop(handles);
 
@@ -11544,6 +11640,59 @@ mod tests {
         assert!(
             abort_handle.is_finished(),
             "dropping DhanLaneRunHandles must abort (not detach) the live ws pool task"
+        );
+    }
+
+    /// BUG-1 ratchet (2026-07-05): the graceful teardown must bound-await
+    /// the dual-instance lock heartbeat so the SSM DeleteParameter release
+    /// LANDS before process exit. Live proof this regression class is real:
+    /// the 15:35 IST 2026-07-05 graceful EOD stop left the lock in SSM
+    /// (the 17:59 boot found it stale at age 8622s); a Stop→Start inside
+    /// the 90s TTL HALTs with RESILIENCE-01.
+    #[test]
+    fn ratchet_teardown_bound_awaits_instance_lock_release() {
+        let src = include_str!("main.rs");
+        let teardown_start = src
+            .find("async fn teardown_dhan_lane_tasks(")
+            .expect("teardown_dhan_lane_tasks must exist");
+        let teardown_end = src[teardown_start..]
+            .find("\n}\n")
+            .map(|o| teardown_start + o)
+            .expect("teardown_dhan_lane_tasks must have a body end");
+        let body = &src[teardown_start..teardown_end];
+        // Direct permit-storing wake (Rule 16 lost-wake safe) — never rely
+        // only on the notify_waiters bridge.
+        assert!(
+            body.contains("lane.instance_lock_shutdown.take()")
+                && body.contains("shutdown.notify_one()"),
+            "teardown must directly notify_one() the instance-lock heartbeat's shutdown Notify"
+        );
+        // Bounded await of the heartbeat handle (the release round-trip).
+        assert!(
+            body.contains("lane.instance_lock_heartbeat.take()")
+                && body.contains("INSTANCE_LOCK_RELEASE_TIMEOUT_SECS"),
+            "teardown must bound-await the instance-lock heartbeat JoinHandle \
+             (tokio::time::timeout(INSTANCE_LOCK_RELEASE_TIMEOUT_SECS, handle)) \
+             so the SSM release lands before process exit"
+        );
+        // The handle must actually ride into the lane struct from the
+        // boot-ON construction site (not stay a dropped local).
+        assert!(
+            src.contains("instance_lock_heartbeat: instance_lock_handle"),
+            "start_dhan_lane must thread the heartbeat JoinHandle into DhanLaneRunHandles"
+        );
+        // The old drop-at-spawn binding must never come back. (Needle
+        // assembled at runtime so this test's own source never self-matches.)
+        let dropped_binding = format!("let _instance_lock_handle = {}", "instance_lock_handle;");
+        assert!(
+            !src.contains(&dropped_binding),
+            "the heartbeat JoinHandle must not be silently dropped at spawn time \
+             (that is exactly the race that leaked the SSM lock on graceful stop)"
+        );
+        // Bound sanity: short enough to never hang a Ctrl-C exit.
+        assert!(
+            INSTANCE_LOCK_RELEASE_TIMEOUT_SECS >= 1 && INSTANCE_LOCK_RELEASE_TIMEOUT_SECS <= 10,
+            "the release bound must stay a short, non-hanging shutdown wait"
         );
     }
 
