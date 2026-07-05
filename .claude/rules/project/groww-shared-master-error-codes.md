@@ -131,11 +131,40 @@ Groww activation, the live feed, or any order/tick path).
 (ILP/HTTP down, QuestDB unreachable, flush error, prior-snapshot read error). The `stage` label
 on `tv_groww_master_persist_errors_total` distinguishes `lifecycle` / `constituency` /
 `lifecycle_audit` (the 2026-06-29 audit-chain emit, which can fail on EITHER the prior-snapshot
-read OR the audit append).
+read OR the audit append) / `lifecycle_flip` (the 2026-07-05 disappearance state-flip below).
+
+### 2026-07-05 — lifecycle-integrity fixes (disappearance flip + first_seen preservation)
+
+Three audit-confirmed gaps closed in one PR:
+
+1. **Disappearance now flips the DATA row (`stage="lifecycle_flip"`).** A Groww
+   instrument that disappears from the universe previously kept its
+   `instrument_lifecycle` master row `active` forever (it is absent from the daily
+   UPSERT batch), and — because the DATA row never flipped — the audit diff re-emitted
+   a DUPLICATE `expired` transition row EVERY day. `persist_groww_instruments` now
+   applies a FEED-SCOPED in-place state flip
+   (`instrument_lifecycle_persistence::update_lifecycle_state_for_feed`, WHERE
+   `... AND feed='groww' AND dry_run=false`) for every non-active audit transition
+   (`shared_master_writer::groww_disappearance_flips`), AFTER the audit append
+   succeeded (§24 audit-first) — NEVER a DELETE (SEBI §25). A flip failure logs
+   GROWW-MASTER-01 with the NEW `stage="lifecycle_flip"`; the audit row is already
+   durable and the next boot's diff re-emits + re-flips.
+2. **`first_seen_date` is PRESERVED across the daily UPSERT.** The prior
+   `feed='groww'` snapshot (now loaded ONCE in persist and shared by the audit diff,
+   the DATA UPSERT, and the flips) carries each row's prior `first_seen_date`;
+   `resolve_groww_first_seen_nanos` keeps it on the full-row UPSERT instead of
+   resetting it to today (mirror of the Dhan `resolve_first_seen_nanos` guard;
+   SEBI forensic). A prior-snapshot READ failure now skips the audit + DATA UPSERT +
+   flips together (writing without the prior would reset every first_seen) —
+   the constituency append still runs.
+3. **The Dhan warm-skip `last_seen` bump is scoped.**
+   `build_bump_active_last_seen_sql` now carries `AND feed='dhan' AND dry_run=false`
+   — previously it mutated `feed='groww'` + §27 dry-run rows.
 
 **Triage:**
 1. `mcp__tickvault-logs__tail_errors` — look for `GROWW-MASTER-01`; the payload carries the
-   `stage` (`lifecycle` / `constituency` / `lifecycle_audit`) and the error context.
+   `stage` (`lifecycle` / `constituency` / `lifecycle_audit` / `lifecycle_flip`) and the
+   error context.
 2. `tv_groww_master_persist_errors_total` rate non-zero → QuestDB ILP degraded; run
    `make doctor` (cross-check BOOT-01/BOOT-02 if it coincides with boot).
 3. The Groww live feed, the `ticks` table, and trading are UNAFFECTED — only the queryable
