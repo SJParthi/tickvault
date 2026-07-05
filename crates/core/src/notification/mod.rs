@@ -16,6 +16,7 @@
 
 pub mod coalescer;
 pub mod events;
+pub mod feed_badge;
 pub mod service;
 pub mod source_badge;
 pub mod summary_writer;

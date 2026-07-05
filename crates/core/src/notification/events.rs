@@ -1244,7 +1244,85 @@ impl NotificationEvent {
     ///
     /// HTML parse_mode is used by the sender, so basic `<b>` tags are safe.
     /// Keep messages short — they appear as phone notifications.
+    ///
+    /// Feed-scoped events (operator directive 2026-07-05: "dhan and groww
+    /// should be uniquely seen to view easily") lead their body with a feed
+    /// badge (`🔷 DHAN` / `🟢 GROWW` — see [`super::feed_badge`]). Applied
+    /// HERE so BOTH dispatch paths (immediate bypass + coalescer samples)
+    /// carry the badge identically; non-feed events are byte-identical to
+    /// before (badge = `None`). The severity emoji stays first on the wire
+    /// (commandment 10) — the severity-tag + source-badge prefix is
+    /// prepended by the dispatch layer on top of this body.
     pub fn to_message(&self) -> String {
+        let body = self.message_body();
+        match self.feed_badge() {
+            Some(badge) => format!("{badge} — {body}"),
+            None => body,
+        }
+    }
+
+    /// Which feed badge, if any, this event's Telegram body leads with.
+    ///
+    /// `Some` ONLY for events provably scoped to exactly one feed:
+    /// - Dhan-scoped (static): Dhan JWT/auth/profile, main-feed +
+    ///   order-update WebSocket lifecycle, Dhan instrument build.
+    /// - Groww-scoped (static): the sidecar reject diagnostic.
+    /// - Feed-generic (dynamic): the `Feed*` events resolve from their
+    ///   `feed` field; an unknown feed name renders un-badged (honest —
+    ///   never a wrong badge).
+    ///
+    /// Everything else (QuestDB, boot, risk, orders, self-test, SLO, market
+    /// digests) returns `None` and renders exactly as before.
+    #[must_use]
+    pub fn feed_badge(&self) -> Option<&'static str> {
+        use super::feed_badge::{FeedBadge, feed_badge_for_name};
+        match self {
+            // ── Dhan-scoped: auth / token / profile ──
+            Self::AuthenticationSuccess
+            | Self::AuthenticationFailed { .. }
+            | Self::AuthenticationTransientFailure { .. }
+            | Self::PreMarketProfileCheckFailed { .. }
+            | Self::MidSessionProfileInvalidated { .. }
+            | Self::TokenRenewed
+            | Self::TokenRenewalFailed { .. }
+            // ── Dhan-scoped: main-feed WebSocket lifecycle ──
+            | Self::WebSocketConnected { .. }
+            | Self::WebSocketPoolOnline { .. }
+            | Self::WebSocketPoolPartialAfterDeadline { .. }
+            | Self::WebSocketPoolDeferredOffHours { .. }
+            | Self::WebSocketPoolDegraded { .. }
+            | Self::WebSocketPoolRecovered { .. }
+            | Self::WebSocketPoolHalt { .. }
+            | Self::WebSocketDisconnected { .. }
+            | Self::WebSocketDisconnectedOffHours { .. }
+            | Self::WebSocketReconnected { .. }
+            | Self::WebSocketSleepEntered { .. }
+            | Self::WebSocketSleepResumed { .. }
+            | Self::WebSocketTokenForceRenewedOnWake { .. }
+            | Self::WebSocketReconnectionExhausted { .. }
+            // ── Dhan-scoped: order-update WebSocket ──
+            | Self::OrderUpdateConnected
+            | Self::OrderUpdateAuthenticated
+            | Self::OrderUpdateDisconnected { .. }
+            | Self::OrderUpdateReconnected { .. }
+            // ── Dhan-scoped: instrument master build ──
+            | Self::InstrumentBuildSuccess { .. }
+            | Self::InstrumentBuildFailed { .. } => Some(FeedBadge::Dhan.badge()),
+            // ── Groww-scoped ──
+            Self::GrowwSidecarRejected { .. } => Some(FeedBadge::Groww.badge()),
+            // ── Feed-generic: badge follows the `feed` field ──
+            Self::FeedAuthOk { feed }
+            | Self::FeedInstrumentsLoaded { feed, .. }
+            | Self::FeedConnectedAwaitingTicks { feed, .. } => {
+                feed_badge_for_name(feed).map(|b| b.badge())
+            }
+            _ => None,
+        }
+    }
+
+    /// The badge-less message body — the per-variant formatting match.
+    /// Callers outside this impl use [`Self::to_message`].
+    fn message_body(&self) -> String {
         match self {
             Self::StartupComplete { mode } => {
                 // SECURITY: Do not expose internal service ports in Telegram.
@@ -4661,6 +4739,112 @@ mod tests {
         let msg = ev.to_message();
         assert!(msg.contains("Groww Auth OK"), "got: {msg}");
         assert!(msg.contains("access token in hand"), "got: {msg}");
+    }
+
+    // -----------------------------------------------------------------------
+    // Per-feed visual identity (operator directive 2026-07-05: "dhan and
+    // groww should be uniquely seen to view easily") — the feed badge leads
+    // every feed-scoped Telegram body.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_dhan_scoped_events_carry_dhan_badge_in_message() {
+        // Dhan auth / order-update WS / main-feed WS / instrument events all
+        // lead with the Dhan badge so the operator can tell feeds apart at
+        // a glance.
+        let events = [
+            NotificationEvent::AuthenticationSuccess,
+            NotificationEvent::OrderUpdateConnected,
+            NotificationEvent::TokenRenewed,
+            NotificationEvent::InstrumentBuildSuccess {
+                source: "fresh_csv_build".to_string(),
+                derivative_count: 0,
+                underlying_count: 4,
+            },
+        ];
+        for ev in events {
+            assert_eq!(ev.feed_badge(), Some("🔷 DHAN"), "event: {}", ev.topic());
+            let msg = ev.to_message();
+            assert!(
+                msg.starts_with("🔷 DHAN — "),
+                "Dhan-scoped body must lead with the Dhan badge: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_groww_feed_events_carry_groww_badge_in_message() {
+        let sidecar = NotificationEvent::GrowwSidecarRejected {
+            reason: "access token stale".to_string(),
+        };
+        assert_eq!(sidecar.feed_badge(), Some("🟢 GROWW"));
+        assert!(
+            sidecar.to_message().starts_with("🟢 GROWW — "),
+            "got: {}",
+            sidecar.to_message()
+        );
+        let auth = NotificationEvent::FeedAuthOk {
+            feed: "Groww".to_string(),
+        };
+        let msg = auth.to_message();
+        assert!(
+            msg.starts_with("🟢 GROWW — "),
+            "Groww feed events must lead with the Groww badge: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_dynamic_feed_events_badge_follows_feed_field() {
+        // The generic Feed* events resolve their badge from the `feed`
+        // field — Dhan-tagged renders Dhan, Groww-tagged renders Groww, an
+        // unknown future feed renders UN-badged (honest, never wrong).
+        let dhan = NotificationEvent::FeedInstrumentsLoaded {
+            feed: "Dhan".to_string(),
+            subscribed: 243,
+            indices: 25,
+            stocks: 218,
+            skipped: 0,
+        };
+        assert_eq!(dhan.feed_badge(), Some("🔷 DHAN"));
+        let groww = NotificationEvent::FeedConnectedAwaitingTicks {
+            feed: "Groww".to_string(),
+            subscribed: 768,
+            market_open: false,
+        };
+        assert_eq!(groww.feed_badge(), Some("🟢 GROWW"));
+        let unknown = NotificationEvent::FeedAuthOk {
+            feed: "SomeFutureFeed".to_string(),
+        };
+        assert_eq!(unknown.feed_badge(), None);
+        assert!(
+            !unknown.to_message().contains("DHAN") && !unknown.to_message().contains("GROWW"),
+            "unknown feed must render un-badged"
+        );
+    }
+
+    #[test]
+    fn test_non_feed_events_carry_no_feed_badge() {
+        // Non-feed events are byte-identical to before — no badge, no "—"
+        // prefix injected.
+        let events = [
+            NotificationEvent::StartupComplete { mode: "sandbox" },
+            NotificationEvent::QuestDbReconnected {
+                writer: "ticks".to_string(),
+                failed_checks_before_recovery: 3,
+            },
+            NotificationEvent::IpVerificationSuccess {
+                verified_ip: "1.2.3.4".to_string(),
+            },
+            NotificationEvent::ShutdownComplete,
+        ];
+        for ev in events {
+            assert_eq!(ev.feed_badge(), None, "event: {}", ev.topic());
+            let msg = ev.to_message();
+            assert!(
+                !msg.starts_with("🔷") && !msg.starts_with("🟢"),
+                "non-feed body must not lead with a feed badge: {msg}"
+            );
+        }
     }
 
     #[test]
