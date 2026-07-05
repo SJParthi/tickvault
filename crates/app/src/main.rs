@@ -652,6 +652,21 @@ async fn main() -> Result<()> {
             std::sync::Arc::clone(&groww_sidecar_notifier_slot),
         );
     }
+    // ── index_constituency ts-pin migration — PROCESS-GLOBAL boot prefix ──
+    // F13/F14 hardening (2026-07-05): the one-shot, marker-gated TRUNCATE
+    // migration runs here — BEFORE the Groww activation watcher and regardless
+    // of `feeds.dhan_enabled` (it needs only the QuestDB config) — so the
+    // `index_constituency_migration_gate` the Groww shared-master writer
+    // awaits is marked within its bounded 120s wait on EVERY boot mode. The
+    // wrapper's exactly-once latch (F15) means the Dhan lane's later
+    // defense-in-depth call can never fire a LATE first truncate that wipes
+    // just-written `feed='groww'` rows. Ratchet:
+    // `index_constituency_boot::tests::ratchet_ts_pin_migration_spawns_before_groww_watcher`.
+    tokio::spawn(
+        tickvault_app::index_constituency_boot::run_index_constituency_ts_pin_migration_at_boot(
+            config.questdb.clone(),
+        ),
+    );
     tokio::spawn(
         tickvault_app::groww_activation::run_groww_activation_watcher(
             std::sync::Arc::clone(&feed_runtime),
