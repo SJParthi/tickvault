@@ -54,37 +54,176 @@ const GROWW_ACTIVATION_POLL: Duration = Duration::from_secs(GROWW_ACTIVATION_POL
 /// ordering: the Groww lane spawns BEFORE the `NotificationService` exists).
 const NOTIFIER_READY_POLL_MS: u64 = 500;
 const NOTIFIER_READY_POLL: Duration = Duration::from_millis(NOTIFIER_READY_POLL_MS);
-/// Max polls before giving up on a boot-stage Telegram ping (500ms × 240 =
-/// 2 minutes — far beyond any healthy notification boot). Giving up logs;
-/// it never blocks or fails activation.
+/// Max flusher polls before the deferred-ping queue is cleared (500ms × 240 =
+/// 2 minutes — far beyond any healthy notification boot). The budget bounds
+/// the flusher task's lifetime + the queue's memory; it never blocks or
+/// fails activation.
 const NOTIFIER_READY_MAX_POLLS: u32 = 240;
 
-/// Deliver one boot-stage Telegram event as soon as the lazily-filled
-/// notifier slot is populated (operator 2026-07-04 — Groww boot-visibility
-/// parity). Before this, boot-ordering could race the slot fill and the
-/// ping was SILENTLY skipped (part of the "Groww emitted NOTHING" Saturday
-/// boot). Bounded: polls `poll` up to `max_polls` times, then gives up with
-/// an `info!` (the structured log for the same milestone already fired).
-/// Returns whether the event was delivered — unit-testable with tiny budgets.
-pub async fn notify_when_ready(
+/// Capacity of the deferred boot-ping queue. Boot emits a handful of
+/// feed-stage milestones (auth OK, instruments loaded, connected, sidecar
+/// reject) — 16 is generous headroom while keeping memory strictly bounded.
+pub const MAX_PENDING_BOOT_PINGS: usize = 16;
+
+/// Outcome of [`PendingBootPings::notify_or_queue`] — unit-testable.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BootPingDelivery {
+    /// Notifier present — delivered immediately (any stale queued pings were
+    /// flushed FIRST, so boot-stage order is preserved).
+    Sent,
+    /// Notifier absent — held in the bounded queue for the flusher.
+    Queued,
+    /// Queued, and the OLDEST pending ping was dropped to stay bounded.
+    QueuedDroppedOldest,
+}
+
+/// Queue-and-flush for boot-stage feed Telegrams (operator 2026-07-05 —
+/// feed-Telegram parity: "why dhan messages and groww messages are not
+/// same"). Replaces the former give-up poll (`notify_when_ready`): a ping
+/// emitted BEFORE the lazily-filled notifier slot is populated is no longer
+/// skipped after a wait budget — it is HELD in this bounded FIFO and flushed
+/// the moment the notifier arrives (order preserved, `info!` per late
+/// flush). No busy-wait (the flusher sleeps between bounded polls), no
+/// unbounded memory (capacity [`MAX_PENDING_BOOT_PINGS`], drop-oldest).
+#[derive(Default)]
+pub struct PendingBootPings {
+    pending: std::sync::Mutex<
+        std::collections::VecDeque<tickvault_core::notification::NotificationEvent>,
+    >,
+}
+
+impl PendingBootPings {
+    /// Lock the pending queue, recovering from a poisoned lock (cold path;
+    /// the queue holds plain event data — no invariant a panicking peer
+    /// could have corrupted).
+    fn lock_pending(
+        &self,
+    ) -> std::sync::MutexGuard<
+        '_,
+        std::collections::VecDeque<tickvault_core::notification::NotificationEvent>,
+    > {
+        self.pending
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Deliver `event` now if the notifier slot is filled (flushing any
+    /// stale queued pings FIRST so order is preserved); otherwise hold it in
+    /// the bounded queue. Non-blocking, O(1) — safe to call inline from the
+    /// activation task.
+    pub fn notify_or_queue(
+        &self,
+        notifier_slot: &arc_swap::ArcSwapOption<tickvault_core::notification::NotificationService>,
+        event: tickvault_core::notification::NotificationEvent,
+    ) -> BootPingDelivery {
+        if let Some(notifier) = notifier_slot.load_full() {
+            // Drain anything still queued BEFORE the fresh event so the
+            // operator sees boot milestones in emission order.
+            let _ = self.flush(&notifier);
+            notifier.notify(event);
+            return BootPingDelivery::Sent;
+        }
+        let dropped_oldest = {
+            let mut queue = self.lock_pending();
+            let dropped = if queue.len() >= MAX_PENDING_BOOT_PINGS {
+                if let Some(oldest) = queue.pop_front() {
+                    warn!(
+                        dropped_topic = oldest.topic(),
+                        "[feeds] deferred boot-ping queue full — dropped the \
+                         OLDEST pending Telegram to stay bounded (newest boot \
+                         milestones win)"
+                    );
+                }
+                true
+            } else {
+                false
+            };
+            queue.push_back(event);
+            dropped
+        };
+        // Close the store race: if the notifier landed while we were
+        // queuing, flush immediately — no ping is ever stranded behind a
+        // just-filled slot.
+        if let Some(notifier) = notifier_slot.load_full() {
+            let _ = self.flush(&notifier);
+        }
+        if dropped_oldest {
+            BootPingDelivery::QueuedDroppedOldest
+        } else {
+            BootPingDelivery::Queued
+        }
+    }
+
+    /// Drain every queued ping into `notifier` in FIFO (emission) order,
+    /// logging an `info!` per late-flushed ping. Returns the flushed topics
+    /// in send order — unit-testable proof of order preservation.
+    pub fn flush(
+        &self,
+        notifier: &Arc<tickvault_core::notification::NotificationService>,
+    ) -> Vec<&'static str> {
+        let drained: Vec<tickvault_core::notification::NotificationEvent> = {
+            let mut queue = self.lock_pending();
+            queue.drain(..).collect()
+        };
+        let mut topics = Vec::with_capacity(drained.len());
+        for event in drained {
+            let topic = event.topic();
+            info!(
+                topic,
+                "[feeds] deferred boot-stage Telegram flushed late — the \
+                 notifier arrived after this milestone fired; sending now"
+            );
+            notifier.notify(event);
+            topics.push(topic);
+        }
+        topics
+    }
+
+    /// Empty the queue WITHOUT sending (flusher budget expiry — the notifier
+    /// never arrived). Returns how many pings were discarded so the caller
+    /// can log loudly. Keeps memory bounded on the regression path.
+    pub fn clear(&self) -> usize {
+        let mut queue = self.lock_pending();
+        let cleared = queue.len();
+        queue.clear();
+        cleared
+    }
+}
+
+/// Flush the deferred boot-ping queue as soon as the lazily-filled notifier
+/// slot is populated. Bounded: polls up to `max_polls` times (sleeping
+/// `poll` between checks — no busy-wait), then clears whatever is still
+/// queued with a loud `warn!` so memory stays bounded even if the notifier
+/// never arrives (regression class). Returns whether the notifier was
+/// observed within the budget — unit-testable with tiny budgets.
+pub async fn flush_when_ready(
+    pings: Arc<PendingBootPings>,
     notifier_slot: Arc<arc_swap::ArcSwapOption<tickvault_core::notification::NotificationService>>,
-    event: tickvault_core::notification::NotificationEvent,
     max_polls: u32,
     poll: Duration,
 ) -> bool {
     for _ in 0..max_polls {
         if let Some(notifier) = notifier_slot.load_full() {
-            notifier.notify(event);
+            let _ = pings.flush(&notifier);
             return true;
         }
         tokio::time::sleep(poll).await;
     }
-    info!(
-        topic = event.topic(),
-        "[feeds] boot-stage Telegram skipped — notifier slot never filled \
-         within the wait budget (the structured log for this milestone \
-         already recorded it)"
-    );
+    let cleared = pings.clear();
+    if cleared > 0 {
+        warn!(
+            cleared,
+            "[feeds] boot-stage Telegrams discarded — notifier slot never \
+             filled within the wait budget (the structured logs for these \
+             milestones already recorded them; boot wiring must store the \
+             notifier into the slot on every boot path)"
+        );
+    } else {
+        info!(
+            "[feeds] deferred boot-ping flusher retiring — notifier slot \
+             never filled within the wait budget and nothing was queued"
+        );
+    }
     false
 }
 
@@ -169,6 +308,18 @@ pub async fn run_groww_activation_watcher(
         Arc<arc_swap::ArcSwapOption<Vec<tickvault_core::feed::groww::instruments::WatchEntry>>>,
     >,
 ) {
+    // Deferred boot-ping queue (2026-07-05 feed-Telegram parity): boot-stage
+    // feed Telegrams emitted BEFORE the notifier slot fills are HELD here and
+    // flushed by the single bounded flusher below the moment the notifier
+    // arrives — order preserved, never silently skipped. Shared with every
+    // activation task this watcher spawns.
+    let boot_pings = Arc::new(PendingBootPings::default());
+    tokio::spawn(flush_when_ready(
+        Arc::clone(&boot_pings),
+        Arc::clone(&notifier_slot),
+        NOTIFIER_READY_MAX_POLLS,
+        NOTIFIER_READY_POLL,
+    ));
     // The SINGLE owned activation task for the current ON period. `Some` iff the
     // lane is activated. Holding the handle lets us `abort()` ALL in-flight Groww
     // work (auth-check + watch-list build, which run inline inside it) the moment
@@ -218,6 +369,7 @@ pub async fn run_groww_activation_watcher(
                     max_subscribe,
                     auth_timeout_ms,
                     Arc::clone(&notifier_slot),
+                    Arc::clone(&boot_pings),
                     scale_entries_slot.clone(),
                 ));
                 active_task = Some(task);
@@ -255,6 +407,7 @@ pub async fn run_groww_activation_watcher(
 /// The watch date is computed HERE (at activation time) via `today_ist_date()`,
 /// never frozen at boot — so a runtime re-enable past IST midnight builds today's
 /// watch-list, not a stale boot-day one (security-review MEDIUM).
+#[allow(clippy::too_many_arguments)] // APPROVED: activation carries the lane's full boot context
 async fn activate_groww_lane(
     feed_runtime: Arc<FeedRuntimeState>,
     feed_health: Arc<FeedHealthRegistry>,
@@ -262,6 +415,10 @@ async fn activate_groww_lane(
     max_subscribe: Option<usize>,
     auth_timeout_ms: u64,
     notifier_slot: Arc<arc_swap::ArcSwapOption<tickvault_core::notification::NotificationService>>,
+    // 2026-07-05 feed-Telegram parity: the watcher's deferred boot-ping
+    // queue — boot-stage pings emitted before the notifier slot fills are
+    // queued here and flushed in order, never skipped.
+    boot_pings: Arc<PendingBootPings>,
     // §34: scale-mode subscribe-set publication slot (None = single-conn).
     scale_entries_slot: Option<
         Arc<arc_swap::ArcSwapOption<Vec<tickvault_core::feed::groww::instruments::WatchEntry>>>,
@@ -322,20 +479,19 @@ async fn activate_groww_lane(
             feed_health.set_auth_rejected(Feed::Groww, false);
             // 2026-07-04 Groww boot-visibility parity (operator: "i need the
             // same view display everything even for groww"): mirror Dhan's
-            // "Auth OK" boot ping. Detached bounded wait — the notifier slot
-            // may not be filled yet this early in boot; activation is never
-            // blocked and the ping is not silently lost. Once per activation
-            // (edge-latched by construction: one activation task per ON
-            // period), so a genuine disable → re-enable re-announces while
-            // poll turns never do.
-            tokio::spawn(notify_when_ready(
-                Arc::clone(&notifier_slot),
+            // "Auth OK" boot ping. 2026-07-05 hardening: queue-and-flush —
+            // a not-yet-filled notifier slot HOLDS the ping (bounded FIFO)
+            // and the watcher's flusher sends it the moment the notifier
+            // arrives; never skipped, activation never blocked. Once per
+            // activation (edge-latched by construction: one activation task
+            // per ON period), so a genuine disable → re-enable re-announces
+            // while poll turns never do.
+            let _ = boot_pings.notify_or_queue(
+                &notifier_slot,
                 tickvault_core::notification::NotificationEvent::FeedAuthOk {
                     feed: Feed::Groww.display_name().to_string(),
                 },
-                NOTIFIER_READY_MAX_POLLS,
-                NOTIFIER_READY_POLL,
-            ));
+            );
         }
         Err(GrowwAuthSmokeError::Rejected { status: _, body }) => {
             // The token parameter was READ but its value is unusable (empty /
@@ -422,13 +578,14 @@ async fn activate_groww_lane(
                 // have provided for dhan the same should be provided for
                 // groww also — instruments load message"). Mirror of the
                 // Dhan `InstrumentBuildSuccess` ping: one Info Telegram when
-                // the Groww watch-set resolves. 2026-07-04 hardening: a slot
-                // not yet filled (boot ordering) is now a bounded detached
-                // wait instead of a silent skip — the ping is delayed, never
-                // lost; the info! line above still records the counts, and
-                // activation is never blocked.
-                tokio::spawn(notify_when_ready(
-                    Arc::clone(&notifier_slot),
+                // the Groww watch-set resolves. 2026-07-05 hardening: a slot
+                // not yet filled (boot ordering) queues the ping in the
+                // watcher's bounded FIFO and the flusher sends it the moment
+                // the notifier arrives — delayed, never lost, order
+                // preserved; the info! line above still records the counts,
+                // and activation is never blocked.
+                let _ = boot_pings.notify_or_queue(
+                    &notifier_slot,
                     tickvault_core::notification::events::NotificationEvent::FeedInstrumentsLoaded {
                         feed: Feed::Groww.display_name().to_string(),
                         subscribed: set.entries.len(),
@@ -436,9 +593,7 @@ async fn activate_groww_lane(
                         stocks: set.resolved_stocks,
                         skipped: set.unresolved_stocks.len(),
                     },
-                    NOTIFIER_READY_MAX_POLLS,
-                    NOTIFIER_READY_POLL,
-                ));
+                );
                 // PR-A: persist the Groww instrument set into the SHARED
                 // `instrument_lifecycle` (+ `index_constituency`) master tables
                 // tagged `feed='groww'`. Fire-and-forget + degrade-safe — a
@@ -556,12 +711,135 @@ mod tests {
         assert!(!is_dead_activation(true, false, true));
     }
 
+    fn empty_slot()
+    -> Arc<arc_swap::ArcSwapOption<tickvault_core::notification::NotificationService>> {
+        Arc::new(arc_swap::ArcSwapOption::empty())
+    }
+
+    fn auth_ok_event(feed: &str) -> tickvault_core::notification::NotificationEvent {
+        tickvault_core::notification::NotificationEvent::FeedAuthOk {
+            feed: feed.to_string(),
+        }
+    }
+
+    #[test]
+    fn test_notify_or_queue_queues_before_notifier_then_flushes_in_order() {
+        // The 2026-07-05 root-cause hardening: pings emitted BEFORE the
+        // notifier slot fills are held, then flushed in FIFO emission order
+        // the moment the notifier arrives — never skipped.
+        let slot = empty_slot();
+        let pings = PendingBootPings::default();
+        assert_eq!(
+            pings.notify_or_queue(&slot, auth_ok_event("Groww")),
+            BootPingDelivery::Queued
+        );
+        assert_eq!(
+            pings.notify_or_queue(
+                &slot,
+                tickvault_core::notification::NotificationEvent::FeedInstrumentsLoaded {
+                    feed: "Groww".to_string(),
+                    subscribed: 767,
+                    indices: 25,
+                    stocks: 742,
+                    skipped: 0,
+                },
+            ),
+            BootPingDelivery::Queued
+        );
+        // Notifier arrives (no-op service — delivery side effects disabled).
+        let notifier = tickvault_core::notification::NotificationService::disabled();
+        let flushed = pings.flush(&notifier);
+        assert_eq!(
+            flushed,
+            vec!["FeedAuthOk", "FeedInstrumentsLoaded"],
+            "queued pings must flush in FIFO emission order"
+        );
+        // Queue is now empty — a second flush sends nothing.
+        assert!(pings.flush(&notifier).is_empty());
+    }
+
+    #[test]
+    fn test_notify_or_queue_sends_directly_when_notifier_present() {
+        // Filled slot → immediate send, nothing queued.
+        let slot = empty_slot();
+        slot.store(Some(
+            tickvault_core::notification::NotificationService::disabled(),
+        ));
+        let pings = PendingBootPings::default();
+        assert_eq!(
+            pings.notify_or_queue(&slot, auth_ok_event("Groww")),
+            BootPingDelivery::Sent
+        );
+        assert_eq!(pings.clear(), 0, "direct send must leave nothing queued");
+    }
+
+    #[test]
+    fn test_notify_or_queue_drops_oldest_at_capacity() {
+        // Bounded memory: at capacity the OLDEST ping is dropped (newest
+        // boot milestones win) and the queue length is pinned at the cap.
+        let slot = empty_slot();
+        let pings = PendingBootPings::default();
+        for i in 0..MAX_PENDING_BOOT_PINGS {
+            assert_eq!(
+                pings.notify_or_queue(&slot, auth_ok_event(&format!("Feed{i}"))),
+                BootPingDelivery::Queued
+            );
+        }
+        assert_eq!(
+            pings.notify_or_queue(
+                &slot,
+                tickvault_core::notification::NotificationEvent::FeedInstrumentsLoaded {
+                    feed: "Groww".to_string(),
+                    subscribed: 1,
+                    indices: 1,
+                    stocks: 0,
+                    skipped: 0,
+                },
+            ),
+            BootPingDelivery::QueuedDroppedOldest
+        );
+        // Still exactly at capacity, and the NEWEST event survived (flush
+        // order ends with it).
+        let notifier = tickvault_core::notification::NotificationService::disabled();
+        let flushed = pings.flush(&notifier);
+        assert_eq!(flushed.len(), MAX_PENDING_BOOT_PINGS);
+        assert_eq!(flushed.last().copied(), Some("FeedInstrumentsLoaded"));
+    }
+
+    #[test]
+    fn test_notify_or_queue_recheck_flushes_after_racing_store() {
+        // Store-race closure: if the notifier lands between the empty-slot
+        // check and the queue push, the post-queue re-check flushes — the
+        // ping is never stranded behind a just-filled slot.
+        let slot = empty_slot();
+        let pings = PendingBootPings::default();
+        // Simulate the race by pre-queuing while empty, then storing, then
+        // sending a fresh ping: the Sent path must drain the stale queue
+        // FIRST (order preserved), leaving nothing behind.
+        assert_eq!(
+            pings.notify_or_queue(&slot, auth_ok_event("Groww")),
+            BootPingDelivery::Queued
+        );
+        slot.store(Some(
+            tickvault_core::notification::NotificationService::disabled(),
+        ));
+        assert_eq!(
+            pings.notify_or_queue(&slot, auth_ok_event("Groww")),
+            BootPingDelivery::Sent
+        );
+        assert_eq!(pings.clear(), 0, "stale queue must drain on the Sent path");
+    }
+
     #[tokio::test]
-    async fn test_notify_when_ready_delivers_after_slot_fills() {
-        // Boot-ordering race (2026-07-04 parity fix): the slot fills AFTER
-        // the ping is queued — the bounded poll must still deliver it.
-        let slot: Arc<arc_swap::ArcSwapOption<tickvault_core::notification::NotificationService>> =
-            Arc::new(arc_swap::ArcSwapOption::empty());
+    async fn test_flush_when_ready_flushes_after_slot_fills() {
+        // Boot-ordering race: the slot fills AFTER pings queue — the bounded
+        // flusher must deliver them (late, with order preserved).
+        let slot = empty_slot();
+        let pings = Arc::new(PendingBootPings::default());
+        assert_eq!(
+            pings.notify_or_queue(&slot, auth_ok_event("Groww")),
+            BootPingDelivery::Queued
+        );
         let filler = Arc::clone(&slot);
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(20)).await;
@@ -569,36 +847,30 @@ mod tests {
                 tickvault_core::notification::NotificationService::disabled(),
             ));
         });
-        let delivered = notify_when_ready(
-            slot,
-            tickvault_core::notification::NotificationEvent::FeedAuthOk {
-                feed: "Groww".to_string(),
-            },
-            50,
-            Duration::from_millis(10),
-        )
-        .await;
-        assert!(delivered, "ping must deliver once the slot fills");
+        let observed =
+            flush_when_ready(Arc::clone(&pings), slot, 50, Duration::from_millis(10)).await;
+        assert!(observed, "flusher must observe the slot fill and flush");
+        assert_eq!(pings.clear(), 0, "flusher must have drained the queue");
     }
 
     #[tokio::test]
-    async fn test_notify_when_ready_gives_up_after_budget() {
-        // A never-filled slot must NOT hang forever — bounded give-up,
-        // activation is never blocked (the helper runs detached anyway).
-        let slot: Arc<arc_swap::ArcSwapOption<tickvault_core::notification::NotificationService>> =
-            Arc::new(arc_swap::ArcSwapOption::empty());
-        let delivered = notify_when_ready(
-            slot,
-            tickvault_core::notification::NotificationEvent::FeedAuthOk {
-                feed: "Groww".to_string(),
-            },
-            3,
-            Duration::from_millis(1),
-        )
-        .await;
-        assert!(
-            !delivered,
-            "never-filled slot must give up after the budget"
+    async fn test_flush_when_ready_budget_expiry_clears_queue_bounded() {
+        // A never-filled slot must NOT hang forever or hold memory: bounded
+        // give-up clears the queue loudly (the milestone info! logs already
+        // recorded the events).
+        let slot = empty_slot();
+        let pings = Arc::new(PendingBootPings::default());
+        assert_eq!(
+            pings.notify_or_queue(&slot, auth_ok_event("Groww")),
+            BootPingDelivery::Queued
+        );
+        let observed =
+            flush_when_ready(Arc::clone(&pings), slot, 3, Duration::from_millis(1)).await;
+        assert!(!observed, "never-filled slot must give up after the budget");
+        assert_eq!(
+            pings.clear(),
+            0,
+            "budget expiry must leave the queue empty (bounded memory)"
         );
     }
 
