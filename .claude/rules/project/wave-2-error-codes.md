@@ -136,9 +136,40 @@ file is fail-open).
 **Source:** `crates/core/src/websocket/rate_limit_cooldown.rs`
 (`remaining_cooldown_ms` / `read_cooldown` / `record_rate_limit_hit`),
 the 429 classification write site in
-`crates/core/src/websocket/connection.rs`, the boot read+wait site in
-`crates/app/src/main.rs` (`start_dhan_lane`),
+`crates/core/src/websocket/connection.rs`, the boot read+wait sites in
+`crates/app/src/main.rs` (`start_dhan_lane` slow lane + the FAST
+crash-recovery boot arm — see the 2026-07-06 update below),
 `crates/common/src/error_code.rs::WsGap08RateLimitCooldown`.
+
+### 2026-07-06 Update — FAST crash-recovery boot arm now waits too (audit gap closed)
+
+**The gap (audit-confirmed HIGH, 2026-07-06):** the boot-time wait above
+(`wait_out_persisted_ws_rate_limit_cooldown`) had exactly ONE call site —
+the SLOW lane (`start_dhan_lane`, gated on `should_connect_ws`). The FAST
+crash-recovery boot arm (market-hours restart with a valid cached token)
+created + spawned its WS pool with NO cooldown read. A mid-market
+`process::exit(2)` — still reachable via the WS-GAP-09 `ceiling_exceeded`
+fallback — with a valid cached JWT (a 429 does NOT invalidate the token)
+routes through FAST BOOT, wipes the in-memory `rate_limit_streak`, and
+reconnects with a 0ms first retry straight back into Dhan's still-active
+429 window: the exact instant-429 restart loop this code exists to break,
+just through the other boot door.
+
+**The fix:** the fast arm now calls the SAME
+`wait_out_persisted_ws_rate_limit_cooldown().await` immediately BEFORE its
+`create_websocket_pool` call, mirroring the slow-lane invocation. Semantics
+unchanged: fail-open on a missing/corrupt/stale file (no wait), bounded by
+`WS_RATE_LIMIT_BACKOFF_CAP_MS` (5 min). Honest envelope: the fast lane's
+crash-recovery boot is delayed ONLY when a real persisted 429 cooldown is
+active — and then waiting is exactly the desired behaviour (reconnecting
+instantly would earn the next 429); worst case is the 5-minute cap.
+
+**Ratchet:** `crates/app/tests/ws_rate_limit_cooldown_wiring_guard.rs` —
+source-order scan (house pattern of
+`ratchet_tick_processor_spawns_before_reinject_await`) pinning that BOTH
+`create_websocket_pool(` call sites in main.rs are preceded by their own
+cooldown wait, plus a stub-guard that the wait keeps reading the persisted
+file and stays clamped to the cap.
 
 ## WS-GAP-09 — pool watchdog reconnected IN PLACE instead of `process::exit`
 
