@@ -9,6 +9,12 @@
 
 ## DEPTH-20-DYN-03 — depth-20 dynamic top-volume selector returned a sub-capacity set
 
+> **⚠ RETIRED 2026-07-06 (audit finding).** The movers runtime feeding this
+> code (`movers_1m` view + `depth_dynamic_pipeline_v2`) was deleted
+> 2026-05-19 (AWS-lifecycle PRs #2-#4) and the `Depth20Dyn03TopGainersEmpty`
+> ErrorCode variant was deleted with it. Content below retained for
+> historical audit.
+
 **Trigger:** every 60s the unified depth-dynamic pipeline (`depth_dynamic_pipeline_v2`,
 introduced by the depth-dynamic redesign — supersedes the legacy "conn 5
 single-dynamic" wording) queries the `movers_1m` materialised view through
@@ -56,6 +62,11 @@ metrics; the legacy MOVERS-02 code retired in Phase 4b).
 `crates/app/src/depth_dynamic_pipeline_v2.rs`.
 
 ## DEPTH-200-DYN-01 — depth-200 dynamic top-volume selector returned a sub-capacity set
+
+> **⚠ RETIRED 2026-07-06 (audit finding).** The movers runtime feeding this
+> code was deleted 2026-05-19 (AWS-lifecycle PRs #2-#4) and the
+> `Depth200Dyn01TopGainersEmpty` ErrorCode variant was deleted with it.
+> Content below retained for historical audit.
 
 **Trigger:** the same unified pipeline runs depth-200 with
 `PoolShape { conns: 5, sids_per_conn: 1 }` and `[depth_200.dynamic.universe]`

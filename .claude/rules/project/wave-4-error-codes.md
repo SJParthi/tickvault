@@ -35,6 +35,11 @@ follow the SELFTEST-02 (market-open) triage pattern in
 
 ## DEPTH-DYN-01 — top-150 selector returned empty set (Wave-4-D, Phase 7 SHIPPED 2026-04-28)
 
+> **⚠ RETIRED 2026-07-06 (audit finding).** The movers runtime feeding this
+> code was deleted 2026-05-19 (AWS-lifecycle PRs #2-#4 — movers pipeline +
+> depth-20/200 feeds removed) and the `Depth20Dyn01TopSetEmpty` ErrorCode
+> variant was deleted with it. Content below retained for historical audit.
+
 **Status (2026-04-28):** PROMOTED FROM RESERVED — defined as
 `ErrorCode::Depth20Dyn01TopSetEmpty` with `code_str() == "DEPTH-DYN-01"`.
 Severity::High. NOT auto-triage-safe.
@@ -67,6 +72,11 @@ with edge-triggered semantics (rising-edge fire only).
 `.claude/triage/error-rules.yaml::depth-dyn-01-top-set-empty-escalate`.
 
 ## DEPTH-DYN-02 — Swap20 command channel broken (Wave-4-D, Phase 7 SHIPPED 2026-04-28)
+
+> **⚠ RETIRED 2026-07-06 (audit finding).** The movers runtime feeding this
+> code was deleted 2026-05-19 (AWS-lifecycle PRs #2-#4) and the
+> `Depth20Dyn02SwapChannelBroken` ErrorCode variant was deleted with it.
+> Content below retained for historical audit.
 
 **Status (2026-04-28):** PROMOTED FROM RESERVED — defined as
 `ErrorCode::Depth20Dyn02SwapChannelBroken` with `code_str() == "DEPTH-DYN-02"`.

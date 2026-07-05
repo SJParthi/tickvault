@@ -166,41 +166,14 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# Section 8 — Movers DDL Integrity (Phase 13 of v3 plan)
-# ---------------------------------------------------------------------------
-# Verifies the 22 movers_{T} table DDL files + partition manager + S3
-# lifecycle config are all in sync. Source-only checks (no QuestDB
-# round-trip) so this stays fast and runs on a fresh clone.
-
-print_section "movers DDL integrity (Phase 13 sec 8)"
-
-# 22 movers tables registered in partition manager
-run_check "movers" "22 movers_{T} tables in partition manager" \
-    bash -c 'grep -cE "\"movers_(1s|5s|10s|15s|30s|[0-9]+m|1h)\"," crates/storage/src/partition_manager.rs | awk "{ exit (\$1 == 22 ? 0 : 1) }"'
-
-# S3 lifecycle config exists
-run_check "movers" "S3 lifecycle config exists for movers" \
-    test -f deploy/aws/s3-lifecycle-movers-tables.json
-
-# Movers base table + materialized views (post 2026-05-01 cleanup).
-# Module file kept its `_unified_` filename to minimise the rename diff —
-# the operator-visible table is `movers_1s` (not `movers_unified_1s`).
-run_check "movers" "movers persistence module (movers_1s base + 24 mat views)" \
-    test -f crates/storage/src/movers_unified_persistence.rs
-
-# ---------------------------------------------------------------------------
-# Section 9 — Movers Universe Coverage (Phase 13 of v3 plan)
-# ---------------------------------------------------------------------------
-# Live runtime check — only meaningful after the snapshot scheduler ships
-# in Phase 10. Until then it's a SKIP. Once shipped, queries Prometheus
-# for `tv_movers_universe_size` (target ~24,324 ± 5% during market hours).
-
-print_section "movers universe coverage (Phase 13 sec 9)"
-
-# This section's checks are wired in Phase 10 once the metrics emit.
-# Documented here so the section header is in place.
-printf "[SKIP] %-14s Prometheus metric tv_movers_universe_size — wires up in Phase 10\n" "movers"
-printf "[SKIP] %-14s Prometheus metric tv_movers_per_segment_count — wires up in Phase 10\n" "movers"
+# Sections 8+9 (movers DDL integrity + movers universe coverage) RETIRED
+# 2026-07-06 — audit finding: the movers runtime was deleted in
+# AWS-lifecycle PR #2/#3 (2026-05-19). The checks required 22 movers_{T}
+# partition-manager entries + a `movers_unified_persistence.rs` module,
+# neither of which exists anymore, making `make doctor` permanently RED
+# on phantom checks. The orphan artefacts they referenced
+# (deploy/aws/s3-lifecycle-movers-tables.json,
+# scripts/migrate-drop-movers-tables.sql) were removed in the same sweep.
 
 # ---------------------------------------------------------------------------
 # Summary
