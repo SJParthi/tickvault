@@ -1475,6 +1475,28 @@ load_snapshot_text() {
   echo "load: cpu ${cpu}% total, ~${mem} GB in use, top: ${top}"
 }
 
+# ── FIX 24 pure core: rust shadow client status → text ─────────────────────
+
+# rust_shadow_status_text <enabled 0|1> <lines_today> <recent_native_err 0|1>
+# → one honest status line. "capturing" is claimed ONLY with real captured
+# lines; enabled-but-empty says so (with the error hint when the log shows
+# GROWW-NATIVE trouble); OFF renders plainly. Pure.
+rust_shadow_status_text() {
+  local enabled="${1:-0}" lines="${2:-0}" err="${3:-0}"
+  case "$lines" in '' | *[!0-9]*) lines=0 ;; esac
+  if [ "$enabled" != "1" ]; then
+    echo "rust shadow: OFF"
+    return 0
+  fi
+  if [ "$lines" -gt 0 ]; then
+    echo "🦀 rust shadow: capturing (${lines} lines today)"
+  elif [ "$err" = "1" ]; then
+    echo "🦀 rust shadow: ON but retrying (no capture yet — connection problems in the log)"
+  else
+    echo "🦀 rust shadow: ON, no capture yet (awaiting first tick)"
+  fi
+}
+
 # ── End of pure functions. Library mode stops here. ────────────────────────
 if [[ "${AUTOPILOT_LIB:-0}" == "1" ]]; then
   return 0 2>/dev/null || exit 0
@@ -2182,7 +2204,40 @@ send_feed_status_pings() {
     [ -n "$name" ] || continue
     tg "$(feed_ping_text "$name" "$enabled" "$verdict" "$connected" "$sub" "$ticks" "$mkt")"
   done <<<"$rows"
+  # FIX 24: third line — the native rust SHADOW capture state (its own
+  # NDJSON file; independent of the sidecar), so the operator sees whether
+  # the parity capture is actually collecting. OFF renders honestly too.
+  tg "$(rust_shadow_status_line)"
   return 0
+}
+
+# ═══ FIX 24 runtime — rust shadow client status ═════════════════════════════
+RUST_SHADOW_NDJSON="${RUST_SHADOW_NDJSON:-data/groww/rust-live-ticks.ndjson}"
+
+# rust_shadow_enabled → rc 0 when groww_native_shadow=true resolves from the
+# config overlay chain (local.toml overrides base.toml — mirrors figment).
+rust_shadow_enabled() {
+  local v
+  v=$(grep -E '^[[:space:]]*groww_native_shadow[[:space:]]*=' config/local.toml 2>/dev/null |
+    tail -1 | grep -oE 'true|false' || true)
+  if [ -z "$v" ]; then
+    v=$(grep -E '^[[:space:]]*groww_native_shadow[[:space:]]*=' config/base.toml 2>/dev/null |
+      tail -1 | grep -oE 'true|false' || true)
+  fi
+  [ "$v" = "true" ]
+}
+
+# rust_shadow_status_line — gather enabled flag + today's capture line count
+# (the NDJSON rotates at IST midnight, so the live file IS today) + recent
+# GROWW-NATIVE error signature from the log; render via the pure mapper.
+rust_shadow_status_line() {
+  local enabled=0 lines=0 native_err=0
+  rust_shadow_enabled && enabled=1
+  if [ "$enabled" = "1" ] && [ -f "$RUST_SHADOW_NDJSON" ]; then
+    lines=$(wc -l <"$RUST_SHADOW_NDJSON" 2>/dev/null | tr -d ' ' || echo 0)
+  fi
+  if tail -n 400 "$(current_log)" 2>/dev/null | grep -q 'GROWW-NATIVE-'; then native_err=1; fi
+  rust_shadow_status_text "$enabled" "$lines" "$native_err"
 }
 
 # FIX 19 item 7: detach the feed-status pinger so no start path blocks on
@@ -3294,7 +3349,8 @@ cmd_status() {
     echo "manual : no active stop marker"
   fi
   echo "logs   : $ONE_FILE_LINK → $(current_log) (ONE file — app + launcher + build output)"
-  echo "$(load_snapshot_line)" # FIX 23: cpu/mem/top-3 at a glance
+  echo "$(load_snapshot_line)"       # FIX 23: cpu/mem/top-3 at a glance
+  echo "$(rust_shadow_status_line)"  # FIX 24: parity-capture state
 }
 
 # scale-window override file: "START END" (ISO dates) in

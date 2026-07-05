@@ -32,3 +32,10 @@ otlp_endpoint = "http://localhost:4317"
 [feeds]
 dhan_enabled = true
 groww_enabled = true
+# FIX 24 (local window, 2026-07-05): run the native-Rust Groww SHADOW client
+# alongside the Python sidecar — its own NDJSON capture only
+# (data/groww/rust-live-ticks.ndjson), no shared-table writes — so the
+# PR-R2 python-vs-rust parity comparer gets real same-day data. Key name
+# verified against FeedsConfig::groww_native_shadow (crates/common/src/config.rs).
+# LOCAL overlay only — the base.toml default stays false per the §35 lock.
+groww_native_shadow = true

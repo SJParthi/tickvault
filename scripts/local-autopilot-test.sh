@@ -832,6 +832,27 @@ t "F23: monitor loop logs the load snapshot" "0" "$(sed -n '/^monitor_until_eod(
 t "F23: cmd_status shows the load snapshot" "0" "$(sed -n '/^cmd_status()/,/^}/p' scripts/local-autopilot.sh | grep -q 'load_snapshot_line' && echo 0 || echo 1)"
 t "F23: sweep subcommand dispatched" "0" "$(grep -q 'sweep) sweep_stray_lab_processes' scripts/local-autopilot.sh && echo 0 || echo 1)"
 
+# ── FIX 24: rust shadow client status → text ────────────────────────────────
+t "F24: disabled shadow renders OFF" "rust shadow: OFF" "$(rust_shadow_status_text 0 0 0)"
+t "F24: capturing claimed ONLY with real lines" \
+  "🦀 rust shadow: capturing (1234 lines today)" "$(rust_shadow_status_text 1 1234 0)"
+t "F24: ON + empty + native errors → honest retrying" \
+  "🦀 rust shadow: ON but retrying (no capture yet — connection problems in the log)" \
+  "$(rust_shadow_status_text 1 0 1)"
+t "F24: ON + empty + quiet log → awaiting first tick" \
+  "🦀 rust shadow: ON, no capture yet (awaiting first tick)" "$(rust_shadow_status_text 1 0 0)"
+t "F24: garbage line count fails safe (never fake capturing)" \
+  "🦀 rust shadow: ON, no capture yet (awaiting first tick)" "$(rust_shadow_status_text 1 banana 0)"
+t "F24: garbage enabled flag renders OFF (fail safe)" "rust shadow: OFF" "$(rust_shadow_status_text x 100 0)"
+# wiring pins
+t "F24: local overlay enables the shadow client" "1" "$(grep -c '^groww_native_shadow = true' config/local.toml || true)"
+t "F24: base default stays OFF (§35 lock untouched)" "1" "$(grep -c '^groww_native_shadow = false' config/base.toml || true)"
+t "F24: feed pings carry the shadow status line" "0" "$(sed -n '/^send_feed_status_pings()/,/^}/p' scripts/local-autopilot.sh | grep -q 'rust_shadow_status_line' && echo 0 || echo 1)"
+t "F24: cmd_status carries the shadow status line" "0" "$(sed -n '/^cmd_status()/,/^}/p' scripts/local-autopilot.sh | grep -q 'rust_shadow_status_line' && echo 0 || echo 1)"
+t "F24: status reads the real shadow NDJSON capture file" "0" "$(grep -q 'rust-live-ticks.ndjson' scripts/local-autopilot.sh && echo 0 || echo 1)"
+t "F24: status checks the GROWW-NATIVE log signature" "0" "$(sed -n '/^rust_shadow_status_line()/,/^}/p' scripts/local-autopilot.sh | grep -q 'GROWW-NATIVE-' && echo 0 || echo 1)"
+t "F24: enabled flag resolves local.toml over base.toml" "0" "$(sed -n '/^rust_shadow_enabled()/,/^}/p' scripts/local-autopilot.sh | grep -q 'config/local.toml' && echo 0 || echo 1)"
+
 echo
 echo "local-autopilot pure-logic tests: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]
