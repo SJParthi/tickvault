@@ -25,19 +25,37 @@ use tracing_opentelemetry::OpenTelemetryLayer;
 
 use tickvault_common::config::ObservabilityConfig;
 
-/// Directory that holds the structured `errors.jsonl` stream.
+/// Top-level log directory — the HUMAN surface.
+///
+/// 2026-07-05 operator directive ("one human log file; robot files into
+/// machine/ subfolder"): `data/logs/` top level holds ONLY the
+/// launcher-owned human surface (`tickvault.log` symlink +
+/// `app.<IST-date>.log` daily rolling). Every machine/robot sink the app
+/// writes lives under [`MACHINE_LOGS_DIR`]. This constant is retained for
+/// the grace-window retention sweep of legacy files at the old paths.
+pub const LEGACY_LOGS_DIR: &str = "data/logs";
+
+/// Directory that holds every MACHINE log sink the app writes.
 ///
 /// Relative to the process working directory. In Docker + AWS the compose
-/// stack mounts `./data/logs` so the file survives restarts and can be
-/// tailed by Alloy/Loki or by the Claude triage daemon.
-pub const ERRORS_JSONL_DIR: &str = "data/logs";
+/// stack mounts `./data/logs` (the subdirectory rides along) so the files
+/// survive restarts and can be tailed by Alloy/Loki or by the Claude
+/// triage daemon.
+pub const MACHINE_LOGS_DIR: &str = "data/logs/machine";
+
+/// Directory that holds the structured `errors.jsonl` stream.
+///
+/// 2026-07-05: moved from `data/logs` to `data/logs/machine` — see
+/// [`MACHINE_LOGS_DIR`]. The name is kept because it doubles as the
+/// shared dir for the rolling app log appender + summary writer.
+pub const ERRORS_JSONL_DIR: &str = MACHINE_LOGS_DIR;
 
 /// File-name prefix for the rolling FULL-app JSON log appender.
 ///
 /// Mirror of `ERRORS_JSONL_PREFIX` for the all-levels app log. `RollingFileAppender`
 /// with `Rotation::HOURLY` produces files named `app.{YYYY-MM-DD-HH}`:
-///   data/logs/app.2026-05-02-04
-///   data/logs/app.2026-05-02-05
+///   data/logs/machine/app.2026-05-02-04
+///   data/logs/machine/app.2026-05-02-05
 ///   ...
 ///
 /// Hourly chunks bound any single file's size for industry-standard
@@ -52,7 +70,7 @@ pub const APP_LOG_PREFIX: &str = "app";
 /// logs can be tailed independently without grep'ing the giant
 /// `app.*` stream.
 ///
-/// Each category gets its own subdirectory under `data/logs/` with
+/// Each category gets its own subdirectory under `data/logs/machine/` with
 /// hourly-rotated files named `{prefix}.{YYYY-MM-DD-HH}`. The targets
 /// filter for each category is built by [`build_category_targets`].
 ///
@@ -63,9 +81,9 @@ pub const APP_LOG_PREFIX: &str = "app";
 /// `top_movers`) are now folded into `LogCategory::LiveTicks`. The
 /// existing on-disk `data/logs/movers/` directory is orphaned;
 /// operator deletes manually.
-pub const CATEGORY_CANDLES_DIR: &str = "data/logs/candles";
+pub const CATEGORY_CANDLES_DIR: &str = "data/logs/machine/candles";
 pub const CATEGORY_CANDLES_PREFIX: &str = "candles";
-pub const CATEGORY_LIVE_TICKS_DIR: &str = "data/logs/live_ticks";
+pub const CATEGORY_LIVE_TICKS_DIR: &str = "data/logs/machine/live_ticks";
 pub const CATEGORY_LIVE_TICKS_PREFIX: &str = "live_ticks";
 // PR-D (2026-05-26): CATEGORY_HISTORICAL_* constants retired alongside
 // the deleted Dhan historical fetch chain.
@@ -153,12 +171,13 @@ pub fn build_category_targets(cat: LogCategory) -> &'static [&'static str] {
 ///
 /// `RollingFileAppender` with `Rotation::HOURLY` produces files named
 /// `{prefix}.{YYYY-MM-DD-HH}`, so the set on disk looks like:
-///   data/logs/errors.jsonl.2026-04-18-09
-///   data/logs/errors.jsonl.2026-04-18-10
+///   data/logs/machine/errors.jsonl.2026-04-18-09
+///   data/logs/machine/errors.jsonl.2026-04-18-10
 ///   ...
 ///
 /// The bare filename `errors.jsonl` is kept as a compatibility symlink
-/// (future enhancement) so human operators can `tail -F data/logs/errors.jsonl`.
+/// (future enhancement) so human operators can
+/// `tail -F data/logs/machine/errors.jsonl`.
 pub const ERRORS_JSONL_PREFIX: &str = "errors.jsonl";
 
 /// Bucket boundaries (upper bounds) for nanosecond-scale duration histograms.
@@ -487,9 +506,13 @@ pub fn sweep_app_log_retention(
             continue;
         };
         // Match `app` OR `app.YYYY-MM-DD-HH` produced by the rolling
-        // appender. Skip `app.log` (legacy fixed name kept for the Alloy
-        // file mount) — owned by `infra.rs::ensure_app_log_exists`.
-        if name == "app.log" {
+        // appender. Skip ANY `*.log` name: `app.log` (fixed name kept for
+        // the Alloy file mount, owned by `infra.rs`) AND — critically —
+        // the launcher-owned HUMAN daily log `app.<IST-date>.log`. The
+        // 2026-07-05 grace-window sweep also runs against the legacy
+        // top-level `data/logs/`, where the human daily log lives; this
+        // guard guarantees the app can never delete it.
+        if name.ends_with(".log") {
             continue;
         }
         if !name.starts_with(APP_LOG_PREFIX) {
@@ -1077,7 +1100,57 @@ mod tests {
     #[test]
     fn errors_jsonl_prefix_and_dir_constants_are_stable() {
         assert_eq!(ERRORS_JSONL_PREFIX, "errors.jsonl");
-        assert_eq!(ERRORS_JSONL_DIR, "data/logs");
+        assert_eq!(ERRORS_JSONL_DIR, "data/logs/machine");
+        assert_eq!(MACHINE_LOGS_DIR, "data/logs/machine");
+        assert_eq!(LEGACY_LOGS_DIR, "data/logs");
+    }
+
+    /// 2026-07-05 ratchet (operator directive: "one human log file; robot
+    /// files into machine/ subfolder"): EVERY machine sink directory the
+    /// app writes MUST live under `data/logs/machine/`. The `data/logs/`
+    /// top level is the human surface (launcher-owned `tickvault.log`
+    /// symlink + `app.<IST-date>.log` daily rolling) — the app never
+    /// writes loose files there again.
+    #[test]
+    fn test_all_machine_sink_dirs_live_under_machine_subdir() {
+        let mut dirs = vec![ERRORS_JSONL_DIR, MACHINE_LOGS_DIR];
+        for cat in LogCategory::all() {
+            dirs.push(cat.dir());
+        }
+        for dir in dirs {
+            assert!(
+                dir == "data/logs/machine" || dir.starts_with("data/logs/machine/"),
+                "machine sink dir `{dir}` escaped data/logs/machine/ — \
+                 the data/logs/ top level is reserved for the human log surface"
+            );
+        }
+    }
+
+    /// 2026-07-05 ratchet: the grace-window sweep of the legacy top-level
+    /// `data/logs/` must NEVER delete the launcher-owned human daily log
+    /// `app.<IST-date>.log` (or the Alloy placeholder `app.log`), even
+    /// when older than the retention cutoff. Hourly robot captures
+    /// (`app.YYYY-MM-DD-HH`, no `.log` suffix) ARE swept.
+    #[test]
+    fn test_sweep_app_log_retention_skips_human_daily_log() {
+        let tmp = std::env::temp_dir().join(format!("tv-sweep-human-guard-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).expect("create temp dir");
+
+        let human = tmp.join("app.2026-07-01.log");
+        let placeholder = tmp.join("app.log");
+        let robot = tmp.join("app.2026-07-01-09");
+        for p in [&human, &placeholder, &robot] {
+            std::fs::write(p, b"x").expect("write file");
+        }
+        // retention_hours = 0 → everything sweepable is older than cutoff.
+        let deleted = sweep_app_log_retention(&tmp, 0).expect("sweep must succeed");
+        assert_eq!(deleted, 1, "only the hourly robot capture is swept");
+        assert!(human.exists(), "human daily log must survive the sweep");
+        assert!(placeholder.exists(), "app.log placeholder must survive");
+        assert!(!robot.exists(), "hourly robot capture must be swept");
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
@@ -1305,9 +1378,9 @@ mod tests {
     fn test_log_category_dir_and_prefix_stable_for_each_variant() {
         // Pin the on-disk paths so an accidental rename doesn't break
         // operator runbooks or external Loki/Alloy scrape configs.
-        assert_eq!(LogCategory::Candles.dir(), "data/logs/candles");
+        assert_eq!(LogCategory::Candles.dir(), "data/logs/machine/candles");
         assert_eq!(LogCategory::Candles.prefix(), "candles");
-        assert_eq!(LogCategory::LiveTicks.dir(), "data/logs/live_ticks");
+        assert_eq!(LogCategory::LiveTicks.dir(), "data/logs/machine/live_ticks");
         assert_eq!(LogCategory::LiveTicks.prefix(), "live_ticks");
     }
 
