@@ -251,6 +251,14 @@ async fn emit_boot_completed_when_feed_live(
     feed_runtime: &std::sync::Arc<tickvault_api::feed_state::FeedRuntimeState>,
     dhan_enabled: bool,
     groww_enabled: bool,
+    // BUG-2 fix (2026-07-05): `true` when the Dhan lane COMPLETED its boot
+    // but deliberately built no pool (non-trading day / offline slow boot).
+    // The lane is honestly NOT running (`dhan_running=false` on the feeds
+    // page), but the BOOT itself succeeded — withholding the alive signal
+    // would false-page the boot-heartbeat alarm on every holiday/weekend
+    // boot. `false` everywhere a pool was intended (the gate then genuinely
+    // waits for the lane-running flag).
+    dhan_poolless_idle: bool,
 ) {
     if !dhan_enabled && !groww_enabled {
         // Deliberately feed-less run — emit immediately (no feed to wait for),
@@ -267,7 +275,9 @@ async fn emit_boot_completed_when_feed_live(
     let deadline = std::time::Instant::now()
         + std::time::Duration::from_secs(BOOT_COMPLETED_FEED_LIVENESS_WAIT_SECS);
     loop {
-        let dhan_running = feed_runtime.is_dhan_lane_running();
+        // BUG-2 fix: a poolless-idle Dhan lane counts as "alive" for the
+        // boot signal — the boot completed; there is simply no market today.
+        let dhan_running = feed_runtime.is_dhan_lane_running() || dhan_poolless_idle;
         let groww_running = feed_runtime.is_groww_lane_running();
         if boot_completed_should_emit(dhan_enabled, groww_enabled, dhan_running, groww_running) {
             info!(
@@ -275,7 +285,9 @@ async fn emit_boot_completed_when_feed_live(
                 groww_enabled,
                 dhan_running,
                 groww_running,
-                "boot-completed: a live feed is up — emitting the alive signal"
+                dhan_poolless_idle,
+                "boot-completed: a live feed is up (or the Dhan lane completed a \
+                 pool-less non-trading-day boot) — emitting the alive signal"
             );
             emit_boot_completed();
             return;
@@ -432,19 +444,19 @@ async fn main() -> Result<()> {
     // mid-trade. The Dhan connection tasks always spawn below (gated dormant when
     // disabled), so the lane is "running" whenever the pool is built.
     feed_runtime.set_dhan_disable_allowed(config.strategy.dry_run);
-    // Mark the Dhan lane "running" ONLY when Dhan is enabled at boot — that is
-    // the only case the pool is actually built below. If Dhan is OFF at boot the
-    // pool is never spawned, so reporting it running would be a false-OK
-    // (hostile-review HIGH 2026-06-21) — mirrors the groww_lane_running honesty.
-    // PR-2: `mark_dhan_pool_present()` records that a REAL pool exists this
-    // process (the sentinel PR-E's in-loop dormancy needs to resume). On a
-    // boot-OFF run this stays false, so the Dhan activation watcher REFUSES to
-    // mark the lane running on a runtime enable (no pool ⇒ no stream ⇒ no
-    // false-OK) — the boot-OFF cold-start of the inline Dhan spine is the
-    // documented deferred residual (a restart with dhan_enabled=true is required).
+    // BUG-2 fix (2026-07-05): `mark_dhan_lane_running()` +
+    // `mark_dhan_pool_present()` are NO LONGER set here. Being "enabled at
+    // boot" is NOT the same as "the pool is actually built" — a
+    // non-trading-day boot (weekend/holiday) SKIPS the WebSocket pool
+    // ("WebSocket pool skipped — non-trading day"), yet this block used to
+    // report dhan_running=true + pool_present=true (false-OK, live proof
+    // 2026-07-05 17:59 IST Saturday boot). Both flags are now set at the
+    // ONLY honest place: the pool-spawn sites (FAST arm + `start_dhan_lane`
+    // boot-ON arm) right after a REAL pool is spawned. On a pool-less boot
+    // (non-trading day / offline) they stay false — the feeds page shows
+    // Dhan as enabled-but-idle, not running, and the PR-2 no-pool
+    // protection in the activation watcher stays truthful.
     if feeds.dhan_enabled {
-        feed_runtime.mark_dhan_lane_running();
-        feed_runtime.mark_dhan_pool_present();
         // D2b: seed the lane FSM to `Starting` for the boot-ON case so the
         // runtime cold-start supervisor (spawned below) NEVER race-spawns a
         // second cold-start while the inline boot spine is bringing the lane up.
@@ -710,9 +722,11 @@ async fn main() -> Result<()> {
     // the supervisor layer (a second layer behind the handler's CONFLICT). It
     // mutates ONLY the FeedRuntimeState atomics — NO new WS connection/endpoint
     // (the 2-WS Dhan lock is untouched). Enabled-default is byte-identical: the
-    // inline Dhan boot block below already calls mark_dhan_lane_running(), so the
-    // watcher's first tick sees desired-ON + already-running → None → it does
-    // NOTHING to the boot. (Honest boundary: the full boot-OFF → cold-start lift
+    // inline Dhan boot block below calls mark_dhan_lane_running() at the
+    // pool-spawn site (BUG-2 fix 2026-07-05), and the watcher holds off while
+    // the lane FSM reads Starting, so its first ACTIVE tick sees desired-ON +
+    // already-running → None → it does NOTHING to the boot. (Honest boundary:
+    // the full boot-OFF → cold-start lift
     // of the inline Dhan boot spine is the deferred residual of this plan; see
     // dhan_activation.rs module docs — PR-E's in-loop dormancy already handles the
     // live disconnect/reconnect for a boot-ON Dhan feed.)
@@ -2077,6 +2091,21 @@ async fn main() -> Result<()> {
                 &feed_health,
             )
             .await;
+            // BUG-2 fix (2026-07-05): mark the Dhan lane running + the PR-2
+            // pool-present sentinel ONLY now that a REAL pool is spawned
+            // (moved from the unconditional dhan_enabled block at the top of
+            // main() — see the comment there). Also drive the lane FSM
+            // Starting→Running here: the FAST arm never reaches the slow
+            // arm's `StartSucceeded` drive, and the activation watcher now
+            // holds off while the FSM reads `Starting`, so leaving the seed
+            // in place would keep the watcher dormant for the whole run.
+            feed_runtime.mark_dhan_lane_running();
+            feed_runtime.mark_dhan_pool_present();
+            feed_runtime.set_dhan_lane_state(tickvault_api::feed_state::LaneState::Running);
+            record_dhan_lane_transition(
+                tickvault_api::feed_state::LaneState::Starting,
+                tickvault_api::feed_state::LaneState::Running,
+            );
             (handles, Some(pool_arc))
         } else {
             (Vec::new(), None)
@@ -2520,6 +2549,10 @@ async fn main() -> Result<()> {
             &feed_runtime,
             config.feeds.dhan_enabled,
             config.feeds.groww_enabled,
+            // BUG-2: the FAST crash-recovery arm always intends a pool
+            // (market-hours trading-day restarts only) — the gate genuinely
+            // waits for the lane-running flag here.
+            false,
         )
         .await;
 
@@ -6674,10 +6707,19 @@ async fn start_dhan_lane(
             None => return Err(StartLaneError::WsPoolSpawn),
         }
     } else if !is_trading && !is_mock_trading {
-        info!("WebSocket pool skipped — non-trading day (no live market data to capture)");
+        // BUG-2 fix (2026-07-05): no pool ⇒ the lane-running flag + the PR-2
+        // pool-present sentinel stay FALSE (they are only set at the
+        // pool-spawn site). The feeds page shows Dhan as enabled-but-idle.
+        info!(
+            "WebSocket pool skipped — non-trading day (no live market data to capture); \
+             Dhan lane stays enabled-but-idle (dhan_running=false, no pool)"
+        );
         (None, None)
     } else {
-        warn!("WebSocket pool skipped — running in offline mode");
+        warn!(
+            "WebSocket pool skipped — running in offline mode; Dhan lane stays \
+             enabled-but-idle (dhan_running=false, no pool)"
+        );
         (None, None)
     };
 
@@ -7286,6 +7328,18 @@ async fn start_dhan_lane(
             &feed_health,
         )
         .await;
+        // BUG-2 fix (2026-07-05): mark the Dhan lane running + the PR-2
+        // pool-present sentinel ONLY now that a REAL pool is spawned (moved
+        // from the unconditional dhan_enabled block at the top of main()).
+        // Boot-ON only: the RUNTIME cold-start (`lane_scoped`) keeps its
+        // phantom-running closure — pool-present + lane-running are set
+        // exclusively after the `StartSucceeded` CAS wins (main.rs, the
+        // runtime Ok arm), so a disable-during-cold-start race can never
+        // leave a torn-down pool marked present.
+        if !lane_scoped {
+            feed_runtime.mark_dhan_lane_running();
+            feed_runtime.mark_dhan_pool_present();
+        }
         (handles, Some(pool_arc))
     } else {
         (Vec::new(), None)
@@ -8182,6 +8236,14 @@ async fn start_dhan_lane(
         &feed_runtime,
         config.feeds.dhan_enabled,
         config.feeds.groww_enabled,
+        // BUG-2: a slow boot that deliberately skipped the pool
+        // (non-trading day / offline) completed its boot — the lane is
+        // honestly NOT running, but the alive signal must still emit or the
+        // boot-heartbeat alarm false-pages on every holiday/weekend boot.
+        // A pool-build FAILURE never reaches this line (StartLaneError
+        // returns above), so `ws_pool_arc.is_none()` here means
+        // "deliberately pool-less", never "pool died".
+        ws_pool_arc.is_none(),
     )
     .await;
 
@@ -11693,6 +11755,57 @@ mod tests {
         assert!(
             INSTANCE_LOCK_RELEASE_TIMEOUT_SECS >= 1 && INSTANCE_LOCK_RELEASE_TIMEOUT_SECS <= 10,
             "the release bound must stay a short, non-hanging shutdown wait"
+        );
+    }
+
+    /// BUG-2 ratchet (2026-07-05): `dhan_lane_running` + the PR-2
+    /// `dhan_pool_present` sentinel are set ONLY at the pool-spawn sites —
+    /// never from the bare `feeds.dhan_enabled` config flag. A
+    /// non-trading-day boot skips the pool and must stay enabled-but-idle
+    /// (live proof: the 2026-07-05 Saturday boot logged "WebSocket pool
+    /// skipped — non-trading day" yet reported dhan_running:true).
+    #[test]
+    fn ratchet_dhan_running_marked_only_at_pool_spawn() {
+        let src = include_str!("main.rs");
+        // The early feeds block (seeding the FSM) must NOT mark the flags.
+        let feeds_block_start = src
+            .find("if feeds.dhan_enabled {")
+            .expect("the early dhan_enabled boot block must exist");
+        let feeds_block_end = feeds_block_start
+            + src[feeds_block_start..]
+                .find("\n    }\n")
+                .expect("the early dhan_enabled boot block must close");
+        let feeds_block = &src[feeds_block_start..feeds_block_end];
+        assert!(
+            !feeds_block.contains("mark_dhan_lane_running()")
+                && !feeds_block.contains("mark_dhan_pool_present()"),
+            "the early `if feeds.dhan_enabled` block must NOT mark the lane \
+             running / pool present — enabled-at-boot is not pool-built \
+             (non-trading-day boots skip the pool)"
+        );
+        // Both boot-path pool-spawn sites must mark the flags (FAST arm +
+        // slow-arm boot-ON). The distinctive fix-comment marker sits inside
+        // each pool-built branch, right after spawn_websocket_connections;
+        // the runtime cold-start keeps its separate CAS-gated mark.
+        // (Marker assembled at runtime so this test's own source never
+        // self-matches and inflates the count.)
+        let marker = format!(
+            "pool-present sentinel ONLY now that a REAL pool {}",
+            "is spawned"
+        );
+        let mark_sites = src.matches(marker.as_str()).count();
+        assert!(
+            mark_sites >= 2,
+            "both boot-path pool-spawn branches (FAST arm + slow-arm boot-ON) \
+             must mark running/pool-present at the pool-spawn site; found \
+             {mark_sites} marker(s)"
+        );
+        // The alive signal must treat a deliberately pool-less slow boot as
+        // a completed boot (no false boot-heartbeat page on holidays).
+        assert!(
+            src.contains("dhan_poolless_idle: bool") && src.contains("ws_pool_arc.is_none(),"),
+            "emit_boot_completed_when_feed_live must carry the poolless-idle \
+             input, fed from ws_pool_arc.is_none() on the slow boot path"
         );
     }
 
