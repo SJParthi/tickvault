@@ -1455,6 +1455,20 @@ pids_except() {
   return 0
 }
 
+# is_sidecar_cmdline <full command line> → rc 0 ONLY for a real sidecar
+# process: a python interpreter token BEFORE the script path. FIX 25:
+# `pgrep -f 'groww_sidecar\.py'` also matches an operator's editor/pager
+# (`vim groww_sidecar.py`, `less …`) — those must NEVER be TERM'd.
+# Case-insensitive; fail SAFE (no match → not a candidate). Pure.
+is_sidecar_cmdline() {
+  local c
+  c=$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')
+  case "$c" in
+  *python*groww_sidecar.py*) return 0 ;;
+  esac
+  return 1
+}
+
 # log_growth_exceeded <start_mb> <now_mb> <limit_mb> → rc 0 when the log
 # directory grew MORE than limit_mb this session. Garbage/negative → rc 1
 # (fail safe: never warn on doubt). Pure.
@@ -2447,8 +2461,14 @@ spawn_rung_receipt_watcher() {
 # stray_sidecar_candidates [app_pid] → sidecar pids NOT parented by the live
 # app (an app's own supervised sidecars are never candidates). Runtime.
 stray_sidecar_candidates() {
-  local app="${1:-}" p ppid
+  local app="${1:-}" p ppid cmd
   for p in $(pgrep -f 'groww_sidecar\.py' 2>/dev/null || true); do
+    # FIX 25: pgrep -f matches ANY cmdline containing the script name —
+    # including an operator's editor/pager (vim/less groww_sidecar.py).
+    # Require a REAL interpreter invocation (pure is_sidecar_cmdline) so
+    # only actual sidecar processes are ever candidates.
+    cmd=$(ps -o command= -p "$p" 2>/dev/null || true)
+    is_sidecar_cmdline "$cmd" || continue
     if [ -n "$app" ]; then
       ppid=$(ps -o ppid= -p "$p" 2>/dev/null | tr -d ' ')
       [ "$ppid" = "$app" ] && continue

@@ -646,7 +646,12 @@ t "F19-4: the filter is installed at hook time" "0" "$(grep -q 'install_sdk_erro
 t "F19-4: coalescing cadence is 30" "0" "$(grep -q 'NATS_ERROR_LOG_EVERY = 30' scripts/groww-sidecar/groww_sidecar.py && echo 0 || echo 1)"
 
 # Item 5: attempt-2 re-arm marker
-t "F19-5: probe-once marker is armed for attempt 2" "2026-07-05 2" "$(head -1 deploy/local/probe-once.date)"
+# FIX 25 supersedes the F19-5 armed-marker pin: attempt 2 COMPLETED
+# (halted_at_ceiling 86/86), so the committed marker is now DISARMED —
+# a fresh clone must never re-fire the consumed probe. The disarmed-state
+# pins live in the F25 block below.
+t "F19-5→F25: probe-once marker is no longer armed with a date" "1" \
+  "$(head -1 deploy/local/probe-once.date | grep -Eq '^[0-9]{4}-[0-9]{2}-[0-9]{2}' && echo 0 || echo 1)"
 
 # Addendum: raise Docker VM memory at its NATURAL cold start
 t "F19-A: mem target on a 48GB host → 12288" "12288" "$(docker_mem_target_mib $((48 * 1024 * 1024 * 1024)))"
@@ -852,6 +857,38 @@ t "F24: cmd_status carries the shadow status line" "0" "$(sed -n '/^cmd_status()
 t "F24: status reads the real shadow NDJSON capture file" "0" "$(grep -q 'rust-live-ticks.ndjson' scripts/local-autopilot.sh && echo 0 || echo 1)"
 t "F24: status checks the GROWW-NATIVE log signature" "0" "$(sed -n '/^rust_shadow_status_line()/,/^}/p' scripts/local-autopilot.sh | grep -q 'GROWW-NATIVE-' && echo 0 || echo 1)"
 t "F24: enabled flag resolves local.toml over base.toml" "0" "$(sed -n '/^rust_shadow_enabled()/,/^}/p' scripts/local-autopilot.sh | grep -q 'config/local.toml' && echo 0 || echo 1)"
+
+# ── FIX 25: disarmed probe marker + narrowed stray-sweep candidates ─────────
+# 1) probe marker: a blank or comment-only marker must NEVER fire the probe
+#    (fresh-clone trap: a committed dated marker + gitignored burned stamp
+#    would re-fire the ~50-min 100-conn probe on every fresh clone).
+t "F25: blank marker line → skip (never probe)" "skip" \
+  "$(probe_once_decision "$(probe_marker_date "")" 2026-07-05 0)"
+t "F25: comment-only marker line → skip (never probe)" "skip" \
+  "$(probe_once_decision "$(probe_marker_date "# disarmed 2026-07-05 — attempt 2 complete")" 2026-07-05 0)"
+t "F25: comment marker attempt parse fails safe to 1" "1" \
+  "$(probe_marker_attempt "# disarmed 2026-07-05 — attempt 2 complete")"
+t "F25: a real dated marker still fires (disarm did not break arming)" "run" \
+  "$(probe_once_decision 2026-07-05 2026-07-05 0)"
+t "F25: committed marker file is DISARMED (first line is a comment)" "0" \
+  "$(head -1 deploy/local/probe-once.date | grep -q '^#' && echo 0 || echo 1)"
+t "F25: disarmed marker documents the re-arm procedure" "0" \
+  "$(grep -q 're-arm deliberately' deploy/local/probe-once.date && echo 0 || echo 1)"
+# 2) stray-sweep candidates: only REAL interpreter invocations qualify.
+t "F25: python3 + script path IS a sidecar candidate" "0" \
+  "$(is_sidecar_cmdline 'python3 scripts/groww-sidecar/groww_sidecar.py --conn 3' && echo 0 || echo 1)"
+t "F25: venv python IS a sidecar candidate" "0" \
+  "$(is_sidecar_cmdline '/Users/p/.venv/bin/python scripts/groww-sidecar/groww_sidecar.py' && echo 0 || echo 1)"
+t "F25: capitalized Python framework binary IS a candidate" "0" \
+  "$(is_sidecar_cmdline '/System/Library/Python.app/Contents/MacOS/Python groww_sidecar.py' && echo 0 || echo 1)"
+t "F25: vim editing the script is NOT a candidate" "1" \
+  "$(is_sidecar_cmdline 'vim groww_sidecar.py' && echo 0 || echo 1)"
+t "F25: less paging the script is NOT a candidate" "1" \
+  "$(is_sidecar_cmdline 'less scripts/groww-sidecar/groww_sidecar.py' && echo 0 || echo 1)"
+t "F25: empty cmdline fails SAFE (not a candidate)" "1" \
+  "$(is_sidecar_cmdline '' && echo 0 || echo 1)"
+t "F25: candidates fn requires the real-cmdline classifier" "0" \
+  "$(sed -n '/^stray_sidecar_candidates()/,/^}/p' scripts/local-autopilot.sh | grep -q 'is_sidecar_cmdline' && echo 0 || echo 1)"
 
 echo
 echo "local-autopilot pure-logic tests: $PASS passed, $FAIL failed"
