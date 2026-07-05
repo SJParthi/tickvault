@@ -442,6 +442,24 @@ const CONNECTION_ID_LABELS: [&str; 6] = ["0", "1", "2", "3", "4", "unknown"];
 pub type WsEventAuditSender =
     tokio::sync::mpsc::Sender<tickvault_common::ws_event_types::WsEventAuditRow>;
 
+/// 2026-07-05: static drop-reason label for a `ws_event_audit` `try_send`
+/// failure — `"full"` (channel at capacity) or `"closed"` (consumer dead).
+/// Static `&'static str` so the `tv_ws_event_audit_dropped_total{reason}`
+/// counter never allocates a label, and the dropped row's content (whose
+/// pre-redaction `reason` field must never reach a log — security review)
+/// is never formatted. Pure, exhaustive, shared by the main-feed and
+/// order-update drop arms.
+#[inline]
+#[must_use]
+pub(crate) fn ws_audit_drop_reason(
+    err: &tokio::sync::mpsc::error::TrySendError<tickvault_common::ws_event_types::WsEventAuditRow>,
+) -> &'static str {
+    match err {
+        tokio::sync::mpsc::error::TrySendError::Full(_) => "full",
+        tokio::sync::mpsc::error::TrySendError::Closed(_) => "closed",
+    }
+}
+
 /// Returns the `&'static str` metric label for a given `ConnectionId`.
 /// Pure function, no I/O, no allocation. O(1) array index.
 #[inline]
@@ -733,14 +751,21 @@ impl WebSocketConnection {
         };
         // O(1) EXEMPT: end
         // Non-blocking: drop on full/closed — never stall the WS loop.
+        // 2026-07-05: upgraded from debug! (silent-loss window — the operator
+        // found ws_event_audit EMPTY with zero signal). The static reason label
+        // carries only "full"/"closed" — NOT the dropped row, whose
+        // pre-redaction reason must never reach a log (security review).
         if let Err(err) = tx.try_send(row) {
-            // %err (Display) prints only "full"/"closed" — NOT the dropped row,
-            // whose pre-redaction reason must never reach a log (security review).
-            debug!(
+            let drop_reason = ws_audit_drop_reason(&err);
+            error!(
+                code =
+                    tickvault_common::error_code::ErrorCode::AuditWs01EventWriteFailed.code_str(),
                 connection_id = usize::from(self.connection_id),
-                reason = %err,
+                reason = drop_reason,
                 "ws_event_audit channel full/closed — row dropped (log+Telegram still fired)"
             );
+            metrics::counter!("tv_ws_event_audit_dropped_total", "reason" => drop_reason)
+                .increment(1);
         }
     }
 
@@ -2493,6 +2518,41 @@ pub(crate) fn jitter_reconnect_delay(base_delay_ms: u64, connection_id: u8, atte
 mod tests {
     use super::*;
     use tickvault_common::types::ExchangeSegment;
+
+    // -----------------------------------------------------------------------
+    // 2026-07-05: ws_event_audit loud-drop labels
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_ws_audit_drop_reason_labels() {
+        // Full → "full"; Closed → "closed". Static labels only — the counter
+        // `tv_ws_event_audit_dropped_total{reason}` must never see a third
+        // value, and the row content is never formatted into the label.
+        let row = tickvault_common::ws_event_types::WsEventAuditRow {
+            event_ts_ist_nanos: 0,
+            trading_date_ist_nanos: 0,
+            feed: tickvault_common::feed::Feed::Dhan,
+            ws_type: tickvault_common::ws_event_types::WsType::MainFeed,
+            connection_index: 0,
+            pool_size: 1,
+            event_kind: tickvault_common::ws_event_types::WsEventKind::Connected,
+            source: "n/a".to_string(),
+            reason: String::new(),
+            dhan_code: tickvault_common::ws_event_types::WS_EVENT_NO_DHAN_CODE,
+            down_secs: 0,
+            attempts: 0,
+            market_hours: false,
+        };
+        // Capacity-1 channel: first try_send fills it, second returns Full.
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        tx.try_send(row.clone()).expect("first send fills capacity");
+        let full_err = tx.try_send(row.clone()).expect_err("second send is Full");
+        assert_eq!(ws_audit_drop_reason(&full_err), "full");
+        // Dropping the receiver closes the channel.
+        drop(rx);
+        let closed_err = tx.try_send(row).expect_err("send on closed channel");
+        assert_eq!(ws_audit_drop_reason(&closed_err), "closed");
+    }
 
     // -----------------------------------------------------------------------
     // B1: jitter_reconnect_delay — thundering-herd prevention
