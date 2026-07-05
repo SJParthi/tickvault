@@ -675,7 +675,9 @@ t "F19-A: the raise never runs while Docker.app is up" "0" "$(sed -n '/^raise_do
 t "F19-A: the settings file is backed up before the write" "0" "$(sed -n '/^raise_docker_mem_at_cold_start()/,/^}/p' scripts/local-autopilot.sh | grep -q 'tickvault-bak' && echo 0 || echo 1)"
 t "F19-A: post-start VM memory is logged (proof channel)" "0" "$(grep -q 'Docker VM memory after start' scripts/local-autopilot.sh && echo 0 || echo 1)"
 t "F19-A: the flush-on-exit theory is labeled Assumed" "0" "$(grep -q 'Assumed' scripts/local-autopilot.sh && echo 0 || echo 1)"
-t "F19-A: the warm-Docker hint default is host-aware too" "0" "$(sed -n '/^hint_docker_vm_memory()/,/^}/p' scripts/local-autopilot.sh | grep -q 'docker_mem_target_mib' && echo 0 || echo 1)"
+# FIX 29 update: the hint now reads the SAME single source every operator
+# message uses (docker_mem_advice_mib → docker_mem_target_mib underneath).
+t "F19-A: the warm-Docker hint default is host-aware too (via the FIX 29 single source)" "0" "$(sed -n '/^hint_docker_vm_memory()/,/^}/p' scripts/local-autopilot.sh | grep -q 'docker_mem_advice_mib' && echo 0 || echo 1)"
 
 # Item 7: guaranteed per-feed Telegram status pings
 t "F19-7: OFF feed is announced, never silent" "⏸️ dhan: switched OFF for this run (expected in a lab/max-smoke session — not an error)" "$(feed_ping_text dhan false unknown false 0)"
@@ -921,6 +923,73 @@ t "F26: opener consults the pure decision (never opens on non-200)" "0" \
   "$(sed -n '/^maybe_open_live_board()/,/^}/p' scripts/local-autopilot.sh | grep -q 'board_open_decision' && echo 0 || echo 1)"
 t "F26: opener targets the /board route" "0" \
   "$(sed -n '/^maybe_open_live_board()/,/^}/p' scripts/local-autopilot.sh | grep -q '/board' && echo 0 || echo 1)"
+
+# ── FIX 28: evening caffeinate re-arm guard (the 4h sleep-protection cliff) ─
+# Decision boundaries: plenty of protection left → wait; inside the lead
+# window with re-arms remaining → rearm; at the cap → expire (final
+# Telegram); garbage → expire (fail loud, never a silent loop).
+t "F28: hours of protection left → wait (no-op)" "wait" "$(caffeinate_guard_decision 10000 0 2 600)"
+t "F28: one second above the lead window → still wait" "wait" "$(caffeinate_guard_decision 601 0 2 600)"
+t "F28: lead boundary (600s left) → first re-arm" "rearm" "$(caffeinate_guard_decision 600 0 2 600)"
+t "F28: near expiry, one re-arm used → second re-arm" "rearm" "$(caffeinate_guard_decision 300 1 2 600)"
+t "F28: re-arm cap reached → expire (final Telegram)" "expire" "$(caffeinate_guard_decision 500 2 2 600)"
+t "F28: past the cap → expire" "expire" "$(caffeinate_guard_decision 500 3 2 600)"
+t "F28: zero cap → expire immediately (no extensions configured)" "expire" "$(caffeinate_guard_decision 500 0 0 600)"
+t "F28: already at 0s but re-arms remain → rearm (never a silent cliff)" "rearm" "$(caffeinate_guard_decision 0 0 2 600)"
+t "F28: lead defaults to 600s when omitted" "rearm" "$(caffeinate_guard_decision 600 0 2)"
+t "F28: garbage secs_left → expire (fail loud, never loop)" "expire" "$(caffeinate_guard_decision banana 0 2 600)"
+t "F28: empty rearms count → expire" "expire" "$(caffeinate_guard_decision 500 "" 2 600)"
+t "F28: garbage max → expire" "expire" "$(caffeinate_guard_decision 500 0 x 600)"
+t "F28: garbage lead → expire" "expire" "$(caffeinate_guard_decision 500 0 2 soon)"
+# wiring pins
+t "F28: guard loop consults the pure decision" "0" \
+  "$(sed -n '/^cmd_caff_guard()/,/^}/p' scripts/local-autopilot.sh | grep -q 'caffeinate_guard_decision' && echo 0 || echo 1)"
+t "F28: every disarm path also kills the guard (Stop always wins)" "0" \
+  "$(sed -n '/^stop_caffeinate()/,/^}/p' scripts/local-autopilot.sh | grep -q 'stop_caffeinate_guard' && echo 0 || echo 1)"
+t "F28: the evening no-monitor skip branch spawns the guard" "0" \
+  "$(sed -n '/^maybe_spawn_manual_monitor()/,/^}/p' scripts/local-autopilot.sh | grep -q 'spawn_caffeinate_guard' && echo 0 || echo 1)"
+t "F28: guard subcommand is dispatched" "0" \
+  "$(grep -q '^caff-guard) cmd_caff_guard' scripts/local-autopilot.sh && echo 0 || echo 1)"
+t "F28: cap defaults to 2 extensions (max ~12h total)" "0" \
+  "$(grep -q 'CAFF_MAX_REARMS:-2' scripts/local-autopilot.sh && echo 0 || echo 1)"
+t "F28: re-arm lead defaults to ~10 minutes before expiry" "0" \
+  "$(grep -q 'CAFF_REARM_LEAD_SECS:-600' scripts/local-autopilot.sh && echo 0 || echo 1)"
+t "F28: extension Telegram names the extension count + says press Stop" "0" \
+  "$(sed -n '/^cmd_caff_guard()/,/^}/p' scripts/local-autopilot.sh | grep -q 'sleep protection extended another' && echo 0 || echo 1)"
+t "F28: final-expiry Telegram says the Mac may sleep (no silent cliff)" "0" \
+  "$(sed -n '/^cmd_caff_guard()/,/^}/p' scripts/local-autopilot.sh | grep -q 'sleep protection expired — Mac may sleep; press Stop or Start again' && echo 0 || echo 1)"
+t "F28: guard pidfile lives under the autopilot state dir" "0" \
+  "$(grep -q 'CAFF_GUARD_PIDFILE="\$AUTOPILOT_DIR/caffeinate-guard.pid"' scripts/local-autopilot.sh && echo 0 || echo 1)"
+t "F28: re-arm updates the caffeinate pidfile (sweep + Stop track the new holder)" "0" \
+  "$(sed -n '/^cmd_caff_guard()/,/^}/p' scripts/local-autopilot.sh | grep -q 'echo \$! >"\$CAFF_PIDFILE"' && echo 0 || echo 1)"
+
+# ── FIX 29: ONE Docker memory number (Telegram == preference writer) ────────
+# The settings-store writer computed a host-aware 12 GB while every
+# Telegram said "raise it to 10 GB" — contradictory numbers for the same
+# knob. docker_mem_advice_mib/gb is the single source both now read.
+t "F29: advice mib — 48GB host → 12288" "12288" "$(docker_mem_advice_mib "" $((48 * 1024 * 1024 * 1024)))"
+t "F29: advice mib — 16GB host → 10240" "10240" "$(docker_mem_advice_mib "" $((16 * 1024 * 1024 * 1024)))"
+t "F29: advice mib — numeric override wins" "9000" "$(docker_mem_advice_mib 9000 $((48 * 1024 * 1024 * 1024)))"
+t "F29: advice mib — garbage override falls back to host-aware" "12288" "$(docker_mem_advice_mib banana $((48 * 1024 * 1024 * 1024)))"
+t "F29: advice gb — 48GB host → 12" "12" "$(docker_mem_advice_gb "" $((48 * 1024 * 1024 * 1024)))"
+t "F29: advice gb — 16GB host → 10" "10" "$(docker_mem_advice_gb "" $((16 * 1024 * 1024 * 1024)))"
+t "F29: advice gb rounds UP (9000 MiB → 9 GB)" "9" "$(docker_mem_advice_gb 9000 "")"
+t "F29: advice gb — everything empty → conservative 10" "10" "$(docker_mem_advice_gb "" "")"
+# wiring pins: no message may hardcode the old contradictory number, and
+# every advice number must come from the single source.
+t "F29: no operator message hardcodes 'to 10 GB' anymore" "0" "$(grep -c 'raise it to 10 GB' scripts/local-autopilot.sh || true)"
+t "F29: OOM Telegram reads the single source" "0" \
+  "$(grep 'OUT OF ITS MEMORY ALLOWANCE' scripts/local-autopilot.sh | grep -q 'docker_mem_advice_gb_now' && echo 0 || echo 1)"
+t "F29: both VM-memory-check Telegrams read the single source" "2" \
+  "$(sed -n '/^check_docker_vm_memory()/,/^}/p' scripts/local-autopilot.sh | grep -c 'docker_mem_advice_gb_now' || true)"
+t "F29: scale-day skip Telegram reads the single source" "0" \
+  "$(grep 'ladder is SKIPPED today' scripts/local-autopilot.sh | grep -q 'docker_mem_advice_gb_now' && echo 0 || echo 1)"
+t "F29: messages say the manual slider is the reliable path (hint may be ignored)" "4" \
+  "$(grep -c 'the automatic hint may be ignored by Docker' scripts/local-autopilot.sh || true)"
+t "F29: the cold-start writer reads the single source too" "0" \
+  "$(sed -n '/^raise_docker_mem_at_cold_start()/,/^}/p' scripts/local-autopilot.sh | grep -q 'docker_mem_advice_mib' && echo 0 || echo 1)"
+t "F29: single source honors the TV_DOCKER_VM_MEM_MIB override (runtime wrapper)" "0" \
+  "$(sed -n '/^docker_mem_advice_gb_now()/,/^}/p' scripts/local-autopilot.sh | grep -q 'TV_DOCKER_VM_MEM_MIB' && echo 0 || echo 1)"
 
 echo
 echo "local-autopilot pure-logic tests: $PASS passed, $FAIL failed"

@@ -93,9 +93,22 @@ GIT_NET_TIMEOUT_SECS="${GIT_NET_TIMEOUT_SECS:-60}"
 # now max(until CAFFEINATE_UNTIL_IST, this floor); the EOD stop still
 # disarms it early on trading days.
 CAFFEINATE_MIN_SECS="${CAFFEINATE_MIN_SECS:-14400}"
+# FIX 28 (2026-07-05 evening-run audit): the caffeinate CLIFF. A manual /
+# evening Start arms caffeinate for the 4h floor above, and an EVENING
+# session has NO monitor ("runs until you press Stop") — so after 4h the
+# sleep protection silently died: a forgotten Stop let the Mac idle-sleep
+# mid-run with ZERO signal. A tiny detached guard now wakes
+# CAFF_REARM_LEAD_SECS before expiry and re-arms a fresh 4h caffeinate up
+# to CAFF_MAX_REARMS more times (default 2 → max ~12h total), one Telegram
+# per extension; after the FINAL window it says plainly that the Mac may
+# sleep. Stop always kills the guard (stop_caffeinate → stop_caffeinate_guard).
+CAFF_REARM_LEAD_SECS="${CAFF_REARM_LEAD_SECS:-600}"
+CAFF_MAX_REARMS="${CAFF_MAX_REARMS:-2}"
 
 APP_PIDFILE="$AUTOPILOT_DIR/app.pid"
 CAFF_PIDFILE="$AUTOPILOT_DIR/caffeinate.pid"
+# FIX 28: the evening re-arm guard's own pidfile (cleaned by every stop path).
+CAFF_GUARD_PIDFILE="$AUTOPILOT_DIR/caffeinate-guard.pid"
 LOCKDIR="$AUTOPILOT_DIR/autopilot.lock.d"
 # FIX 18 G5: the manual-start background monitor's pidfile (spawned by
 # cmd_start when no 08:55 robot is covering the day).
@@ -594,6 +607,31 @@ docker_mem_target_mib() {
   esac
   if [ "$b" -ge $((32 * 1024 * 1024 * 1024)) ]; then echo 12288; else echo 10240; fi
   return 0
+}
+
+# docker_mem_advice_mib <pref_mib_or_empty> <host_bytes_or_empty> → the ONE
+# Docker VM memory target, in MiB. FIX 29 (2026-07-05 audit): the
+# settings-store preference writer computed a host-aware target (12 GB on
+# the operator's 48 GB Mac) while every Telegram instructed a "10 GB" raise —
+# two contradictory numbers for the same knob. Every writer AND every
+# operator-facing message now reads THIS single source: a numeric
+# TV_DOCKER_VM_MEM_MIB override wins (same precedence the writers always
+# had), else the host-aware docker_mem_target_mib. Pure.
+docker_mem_advice_mib() {
+  local pref="${1:-}"
+  case "$pref" in
+  '' | *[!0-9]*) docker_mem_target_mib "${2:-}" ;;
+  *) echo "$pref" ;;
+  esac
+  return 0
+}
+
+# docker_mem_advice_gb <pref_mib_or_empty> <host_bytes_or_empty> → the same
+# single-source number rendered for humans (whole GB, rounded UP). Pure.
+docker_mem_advice_gb() {
+  local mib
+  mib=$(docker_mem_advice_mib "${1:-}" "${2:-}")
+  echo $(((mib + 1023) / 1024))
 }
 
 # docker_cpu_target_cores <host_cores> → a matching Docker VM CPU count for
@@ -1192,6 +1230,33 @@ caffeinate_secs() {
   until=$(secs_until "${1:-}" "${2:-}")
   case "$floor" in '' | *[!0-9]*) floor=0 ;; esac
   if ((until > floor)); then echo "$until"; else echo "$floor"; fi
+}
+
+# caffeinate_guard_decision <secs_left> <rearms_done> <max_rearms>
+# [<lead_secs>=600] → wait|rearm|expire. FIX 28 pure core of the evening
+# re-arm guard: more than <lead_secs> of sleep protection left → wait
+# (nothing to do yet); inside the lead window with re-arms remaining →
+# rearm (fresh 4h caffeinate + one Telegram); inside the lead window at
+# the cap → expire (final "Mac may sleep" Telegram, guard exits). Garbage
+# input → expire (fail-LOUD-then-exit: a confused guard must never
+# silently loop or re-arm forever). Total: always one word, rc 0.
+caffeinate_guard_decision() {
+  local left="${1:-}" n="${2:-}" max="${3:-}" lead="${4:-600}" v
+  for v in "$left" "$n" "$max" "$lead"; do
+    case "$v" in '' | *[!0-9]*)
+      echo expire
+      return 0
+      ;;
+    esac
+  done
+  if ((left > lead)); then
+    echo wait
+  elif ((n < max)); then
+    echo rearm
+  else
+    echo expire
+  fi
+  return 0
 }
 
 # pull_failure_class <docker pull output> → rate_limit|offline|other. G13:
@@ -1835,8 +1900,8 @@ raise_docker_mem_at_cold_start() {
   fi
   local host_bytes target
   host_bytes=$(sysctl -n hw.memsize 2>/dev/null || true)
-  target="${TV_DOCKER_VM_MEM_MIB:-}"
-  case "$target" in '' | *[!0-9]*) target=$(docker_mem_target_mib "$host_bytes") ;; esac
+  # FIX 29: same single source as the warm hint + every operator message.
+  target=$(docker_mem_advice_mib "${TV_DOCKER_VM_MEM_MIB:-}" "$host_bytes")
   # Locate the settings file + memory key (store first, then legacy).
   local gc="$HOME/Library/Group Containers/group.com.docker"
   local file="" key="" cand rc
@@ -2064,7 +2129,7 @@ ensure_questdb() {
         oom=$(dk inspect --format '{{.State.OOMKilled}}' tv-questdb 2>/dev/null || true)
         if oomkilled_is_true "$oom"; then
           log "QuestDB container degraded ('$state') — OOM-KILLED by its own memory limit (QDB_MEM_LIMIT=$QDB_MEM_LIMIT); one automatic docker restart"
-          tg "⚠️ The database ran OUT OF ITS MEMORY ALLOWANCE and was stopped by Docker — restarting it automatically. If this repeats today, open Docker Desktop → Settings → Resources → Memory, raise it to 10 GB, click Apply & Restart."
+          tg "⚠️ The database ran OUT OF ITS MEMORY ALLOWANCE and was stopped by Docker — restarting it automatically. If this repeats today, set Docker Desktop → Settings → Resources → Memory to $(docker_mem_advice_gb_now) GB and click Apply & Restart — that manual slider raise is the reliable fix (the automatic hint may be ignored by Docker)."
         else
           log "QuestDB container degraded ('$state') — one automatic docker restart"
           tg "⚠️ The database container was stuck — restarting it automatically. No action needed."
@@ -2130,10 +2195,47 @@ start_caffeinate() {
 }
 
 stop_caffeinate() {
+  # FIX 28: a disarm must ALSO kill the re-arm guard — otherwise a leftover
+  # guard would re-arm the caffeinate this stop just killed.
+  stop_caffeinate_guard
   if [ -f "$CAFF_PIDFILE" ]; then
     kill "$(cat "$CAFF_PIDFILE")" 2>/dev/null || true
     rm -f "$CAFF_PIDFILE"
   fi
+}
+
+# ── FIX 28: evening caffeinate re-arm guard (runtime half) ──────────────────
+# spawn_caffeinate_guard — detach the `caff-guard` subcommand (own process
+# group, mirrors the FIX 18 G5 monitor spawn) behind an EVENING manual
+# start, where no monitor covers the session and the 4h caffeinate floor
+# would otherwise silently expire mid-run. Idempotent via its pidfile;
+# nothing to guard when caffeinate never armed (binary absent).
+spawn_caffeinate_guard() {
+  local pid
+  pid=$(cat "$CAFF_GUARD_PIDFILE" 2>/dev/null || true)
+  case "$pid" in
+  '' | *[!0-9]*) : ;;
+  *) if kill -0 "$pid" 2>/dev/null; then return 0; fi ;;
+  esac
+  [ -f "$CAFF_PIDFILE" ] || return 0 # no caffeinate armed — nothing to guard
+  (
+    set -m
+    nohup bash "$0" caff-guard "$CAFFEINATE_MIN_SECS" "$(TZ=Asia/Kolkata date +%H:%M)" >>"$(current_log)" 2>&1 &
+    echo $! >"$CAFF_GUARD_PIDFILE"
+  )
+  log "caffeinate re-arm guard spawned (pid $(cat "$CAFF_GUARD_PIDFILE" 2>/dev/null || echo '?')) — evening session: sleep protection auto-extends up to ${CAFF_MAX_REARMS}× $((CAFFEINATE_MIN_SECS / 3600))h; press Stop when done"
+}
+
+# stop_caffeinate_guard — Stop always wins: kill the guard + clean its
+# pidfile (called from stop_caffeinate, so EVERY disarm path covers it).
+stop_caffeinate_guard() {
+  local pid
+  pid=$(cat "$CAFF_GUARD_PIDFILE" 2>/dev/null || true)
+  case "$pid" in
+  '' | *[!0-9]*) : ;;
+  *) kill "$pid" 2>/dev/null || true ;;
+  esac
+  rm -f "$CAFF_GUARD_PIDFILE" 2>/dev/null || true
 }
 
 # ── FIX 10 A4: launcher mutual exclusion ────────────────────────────────────
@@ -2852,6 +2954,15 @@ check_missed_previous_run() {
   fi
 }
 
+# docker_mem_advice_gb_now — FIX 29 runtime wrapper over the pure single
+# source: env override + live host RAM (sysctl is macOS-only; elsewhere the
+# conservative 10 GB default applies). EVERY operator-facing Docker-memory
+# number (Telegram + log) MUST come from this one function so the message
+# can never contradict what the preference writers recorded.
+docker_mem_advice_gb_now() {
+  docker_mem_advice_gb "${TV_DOCKER_VM_MEM_MIB:-}" "$(sysctl -n hw.memsize 2>/dev/null || true)"
+}
+
 # ── FIX 7: auto-raise Docker Desktop VM memory (macOS, once per run) ───────
 # hint_docker_vm_memory <vm_bytes> <limit_bytes> — FIX 17. Replaces the
 # FIX-7/14 auto-raise, which QUIT + RELAUNCHED Docker Desktop mid-run:
@@ -2889,9 +3000,11 @@ hint_docker_vm_memory() {
   host_mib=$((host_bytes / 1048576))
   # FIX 19 addendum: the default target is host-aware — 12 GB on a >= 32 GB
   # Mac (the operator's is 48 GB), 10 GB otherwise. TV_DOCKER_VM_MEM_MIB
-  # still overrides both paths (hint here + cold-start raise).
-  local pref="${TV_DOCKER_VM_MEM_MIB:-}"
-  case "$pref" in '' | *[!0-9]*) pref=$(docker_mem_target_mib "$host_bytes") ;; esac
+  # still overrides both paths (hint here + cold-start raise). FIX 29: read
+  # via docker_mem_advice_mib — the SAME single source every operator-facing
+  # Telegram/log number comes from (no more 12-GB-file vs 10-GB-message).
+  local pref
+  pref=$(docker_mem_advice_mib "${TV_DOCKER_VM_MEM_MIB:-}" "$host_bytes")
   local target
   if ! target=$(docker_vm_raise_target "$vm_mib" "$required_mib" "$pref" "$host_mib"); then
     return 1
@@ -2921,9 +3034,12 @@ hint_docker_vm_memory() {
     return 1
   fi
   if docker_settings_set_mem "$file" "$key" "$target"; then
-    log "wrote Docker memory preference ($((target / 1024)) GB) — it applies the next time you start Docker; continuing now at current memory (${vm_mib} MiB)"
+    # FIX 29: name the SAME number the Telegram advice uses, and say plainly
+    # that the manual slider is the reliable path (Docker 4.80 was observed
+    # ignoring this file hint).
+    log "wrote Docker memory preference ($((target / 1024)) GB) — it MAY apply the next time you start Docker, but the reliable path is the manual raise: Docker Desktop → Settings → Resources → Memory to $((target / 1024)) GB, Apply & Restart; continuing now at current memory (${vm_mib} MiB)"
   else
-    log "could not write the Docker memory preference file — continuing at current memory (${vm_mib} MiB)"
+    log "could not write the Docker memory preference file — continuing at current memory (${vm_mib} MiB); reliable path: Docker Desktop → Settings → Resources → Memory to $((target / 1024)) GB, Apply & Restart"
   fi
   return 1
 }
@@ -2965,11 +3081,18 @@ check_docker_vm_memory() {
       # (an under-provisioned database's OOM pressure would be misread as
       # a Groww per-account cap).
       QDB_MEM_CLAMPED=1
-      tg "ℹ️ Docker Desktop has ${vm_gb} GB memory, so the database will use ${clamped} this run — fine for a NORMAL capture day. On a max-scale (100,000-instrument) day the full ladder needs more: open Docker Desktop → Settings → Resources → Memory, raise it to 10 GB, click Apply & Restart (one time)."
+      # FIX 29: the number below is the SAME host-aware target the
+      # preference writers record (docker_mem_advice_* single source) —
+      # the message previously said "10 GB" while the file said 12 GB.
+      local advice_gb
+      advice_gb=$(docker_mem_advice_gb_now)
+      tg "ℹ️ Docker Desktop has ${vm_gb} GB memory, so the database will use ${clamped} this run — fine for a NORMAL capture day. On a max-scale (100,000-instrument) day the full ladder needs more: set Docker Desktop → Settings → Resources → Memory to ${advice_gb} GB, click Apply & Restart (one time) — that manual slider raise is the reliable fix (the automatic hint may be ignored by Docker)."
       export QDB_MEM_LIMIT="$clamped"
     else
       QDB_MEM_CLAMPED=1 # FIX 18 G16: VM smaller than the pin — max ladder unsafe here too
-      tg "⚠️ Docker Desktop only has ${vm_gb} GB memory and the database's ${QDB_MEM_LIMIT} budget could not be adjusted automatically. Running anyway. Optional fix: open Docker Desktop → Settings → Resources → Memory and raise it to 10 GB, then Apply & Restart."
+      local advice_gb
+      advice_gb=$(docker_mem_advice_gb_now)
+      tg "⚠️ Docker Desktop only has ${vm_gb} GB memory and the database's ${QDB_MEM_LIMIT} budget could not be adjusted automatically. Running anyway. Fix: set Docker Desktop → Settings → Resources → Memory to ${advice_gb} GB, then Apply & Restart — that manual slider raise is the reliable fix (the automatic hint may be ignored by Docker)."
     fi
   else
     log "docker VM memory OK (${vm_bytes} bytes >= QDB_MEM_LIMIT ${QDB_MEM_LIMIT})"
@@ -3257,6 +3380,15 @@ maybe_spawn_manual_monitor() {
     log "background monitor spawned (pid $(cat "$MONITOR_PIDFILE" 2>/dev/null || echo '?')) — EOD stop $EOD_STOP_IST, crash relaunch and database self-heal now cover this manual start"
   else
     log "no separate monitor spawned (scheduled run active, monitor already running, or past $EOD_STOP_IST IST — an evening session runs until you press Stop)"
+    # FIX 28: the EVENING flavor of that skip ("runs until you press Stop")
+    # previously had NOTHING covering the caffeinate 4h cliff — after
+    # 14400s the sleep protection silently died and a forgotten Stop let
+    # the Mac idle-sleep mid-run. Spawn the re-arm guard when the skip is
+    # BECAUSE the EOD stop already passed and nothing else owns the day.
+    if [ "$run_alive" = "0" ] && [ "$mon_alive" = "0" ] &&
+      [ "$(secs_until "$EOD_STOP_IST" "$(ist_hms)")" = "0" ]; then
+      spawn_caffeinate_guard
+    fi
   fi
 }
 
@@ -3293,6 +3425,66 @@ stop_manual_monitor() {
     ;;
   esac
   rm -f "$MONITOR_PIDFILE" 2>/dev/null || true
+}
+
+# ── Subcommand: caff-guard (FIX 28 — evening sleep-protection re-arm) ──────
+# Detached behind an EVENING manual Start (no monitor covers the session:
+# "runs until you press Stop"). The 4h caffeinate arm previously expired
+# SILENTLY mid-evening; this guard sleeps until ~CAFF_REARM_LEAD_SECS
+# before expiry, then either re-arms a fresh 4h caffeinate (up to
+# CAFF_MAX_REARMS times — max ~12h total — one Telegram each) or announces
+# the final expiry plainly and exits. Stop kills it (stop_caffeinate →
+# stop_caffeinate_guard); the guard also stands down by itself the moment
+# its pidfile is gone/foreign or caffeinate was disarmed.
+cmd_caff_guard() {
+  local arm_secs="${1:-}" started="${2:-?}"
+  case "$arm_secs" in '' | *[!0-9]* | 0) arm_secs="$CAFFEINATE_MIN_SECS" ;; esac
+  echo $$ >"$CAFF_GUARD_PIDFILE"
+  local rearms=0 expires_at=$(($(date +%s) + arm_secs))
+  log "caffeinate guard engaged (pid $$) — evening session started ${started}; sleep protection auto-extends up to ${CAFF_MAX_REARMS}× $((arm_secs / 3600))h, then expires with a Telegram"
+  while :; do
+    # Stand down silently when Stop cleaned up (pidfile gone or another
+    # guard took over) or nothing is armed anymore (stop_caffeinate
+    # removed CAFF_PIDFILE).
+    [ "$(cat "$CAFF_GUARD_PIDFILE" 2>/dev/null || true)" = "$$" ] || exit 0
+    if [ ! -f "$CAFF_PIDFILE" ]; then
+      rm -f "$CAFF_GUARD_PIDFILE" 2>/dev/null || true
+      exit 0
+    fi
+    local secs_left=$((expires_at - $(date +%s)))
+    if ((secs_left < 0)); then secs_left=0; fi
+    case "$(caffeinate_guard_decision "$secs_left" "$rearms" "$CAFF_MAX_REARMS" "$CAFF_REARM_LEAD_SECS")" in
+    wait)
+      local nap=$((secs_left - CAFF_REARM_LEAD_SECS))
+      if ((nap < 60)); then nap=60; fi
+      sleep "$nap"
+      ;;
+    rearm)
+      # Fresh 4h caffeinate — same own-group arm start_caffeinate uses
+      # (FIX 16 F5); the old holder is killed and the pidfile updated so
+      # the stray sweep + Stop keep tracking the CURRENT holder.
+      kill "$(cat "$CAFF_PIDFILE" 2>/dev/null || echo NONE)" 2>/dev/null || true
+      (
+        set -m
+        nohup caffeinate -dims -t "$arm_secs" >/dev/null 2>&1 &
+        echo $! >"$CAFF_PIDFILE"
+      )
+      rearms=$((rearms + 1))
+      expires_at=$(($(date +%s) + arm_secs))
+      log "caffeinate re-armed for another ${arm_secs}s (extension ${rearms}/${CAFF_MAX_REARMS})"
+      tg "⏰ evening session still running (started ${started}) — sleep protection extended another $((arm_secs / 3600))h (extension ${rearms} of ${CAFF_MAX_REARMS}); press Stop when done."
+      ;;
+    expire)
+      # Ride out the final minutes of the LAST window, then say it plainly
+      # — never a silent cliff.
+      if ((secs_left > 0)); then sleep "$secs_left"; fi
+      [ "$(cat "$CAFF_GUARD_PIDFILE" 2>/dev/null || true)" = "$$" ] || exit 0
+      tg "🛑 sleep protection expired — Mac may sleep; press Stop or Start again."
+      rm -f "$CAFF_GUARD_PIDFILE" 2>/dev/null || true
+      exit 0
+      ;;
+    esac
+  done
 }
 
 # ── Subcommand: manual stop ─────────────────────────────────────────────────
@@ -3819,7 +4011,7 @@ cmd_run() {
       # an OOM'd database would masquerade as a Groww cap. Skip the ladder,
       # keep the normal capture, tell the operator the one-time fix.
       if [ "$(scale_max_gate "${QDB_MEM_CLAMPED:-0}")" = "skip_max" ]; then
-        tg "⚠️ PROBE VERDICT says the full 100K ladder could run — but Docker Desktop's memory is too small for the database at that scale, so the ladder is SKIPPED today (a normal capture continues). One-time fix: open Docker Desktop → Settings → Resources → Memory, raise it to 10 GB, click Apply & Restart — the next scale day will run the full ladder."
+        tg "⚠️ PROBE VERDICT says the full 100K ladder could run — but Docker Desktop's memory is too small for the database at that scale, so the ladder is SKIPPED today (a normal capture continues). One-time fix: set Docker Desktop → Settings → Resources → Memory to $(docker_mem_advice_gb_now) GB, click Apply & Restart — that manual slider raise is the reliable fix (the automatic hint may be ignored by Docker); the next scale day will run the full ladder."
         stop_app
         apply_overlay none
         start_app_tolerate_peer "normal session (max ladder skipped: Docker memory clamped)" || true
@@ -3875,6 +4067,7 @@ start) cmd_start ;;
 stop) cmd_stop ;;
 dev) cmd_dev ;;
 monitor) cmd_monitor ;;       # FIX 18 G5: detached safety net behind a manual Start
+caff-guard) cmd_caff_guard "${2:-}" "${3:-}" ;; # FIX 28: evening caffeinate re-arm guard
 feed-pings) send_feed_status_pings "${2:-180}" ;;  # FIX 19 item 7: detached per-feed Telegram status
 tick-class-check) run_tick_class_check ;;          # FIX 21: on-demand per-class tick coverage verdict
 socket-probe) run_groww_socket_probe ;;            # FIX 21 addendum: on-demand groww socket reachability
