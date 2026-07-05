@@ -396,6 +396,20 @@ pub fn effective_ceiling(cfg_target: usize, required_conns: usize) -> usize {
     cfg_target.min(required_conns)
 }
 
+/// FIX 19 item 8 BUG B (2026-07-05 live probe): the number of INSTRUMENTS in
+/// shards past the connection ceiling. Those shards get watch files written
+/// but NO sidecar is ever spawned for them — before this fix 42 of 142
+/// shards (41,109 instruments, ALL the NSE F&O by cutter sort order) were
+/// silently never subscribed, with zero log signal. Pure so the coverage gap
+/// is unit-testable; the run loop emits a loud `error!` + counter when this
+/// is non-zero.
+fn instruments_past_ceiling(
+    shards: &[tickvault_core::feed::groww::shard_cutter::GrowwShard],
+    ceiling: usize,
+) -> usize {
+    shards.iter().skip(ceiling).map(|s| s.entries.len()).sum()
+}
+
 /// The next rung above `current` in the configured ladder, clamped to
 /// `ceiling`. `None` when `current` already is (or exceeds) the ceiling or
 /// no higher rung exists.
@@ -628,6 +642,28 @@ pub async fn run_groww_scale_ladder(
     if ceiling == 0 {
         warn!("[feeds] groww scale ladder: empty universe — nothing to spawn");
         return;
+    }
+    // FIX 19 item 8 BUG B: a universe needing MORE connections than the
+    // ceiling silently dropped every shard past it (watch files written, no
+    // sidecar, no signal — 41,109 instruments on the 2026-07-05 live probe).
+    // Loud error + counter so a coverage gap is never invisible again. No
+    // typed ErrorCode: this is a lab-lane signal (adding a variant requires
+    // a rule-file mention per the cross-ref test); the message carries no
+    // code-like prefix so the tag guard stays quiet.
+    if required > ceiling {
+        let dropped_instruments = instruments_past_ceiling(&shards, ceiling);
+        error!(
+            required,
+            ceiling,
+            dropped_instruments,
+            "groww scale ladder COVERAGE GAP: the universe needs {required} \
+             connections but the ceiling is {ceiling} — every shard past the \
+             ceiling has a watch file but NO sidecar will ever be spawned for \
+             it ({dropped_instruments} instruments will not be subscribed \
+             this run); raise target_connections or narrow the watch set"
+        );
+        metrics::counter!("tv_groww_scale_shards_past_ceiling_total")
+            .increment((required.saturating_sub(ceiling)) as u64);
     }
     let today = {
         // Same wall-clock derivation the activation watcher uses.
@@ -1930,6 +1966,57 @@ mod tests {
         assert_eq!(effective_ceiling(10, 1), 1); // 768 SIDs @ 1000/conn
         assert_eq!(effective_ceiling(10, 100), 10);
         assert_eq!(effective_ceiling(10, 0), 0); // empty universe
+    }
+
+    /// FIX 19 item 8 BUG B: instruments in shards past the ceiling are the
+    /// silent coverage gap — this pins the pure count the loud error names.
+    #[test]
+    fn test_instruments_past_ceiling_counts_dropped_shards() {
+        use tickvault_core::feed::groww::instruments::{WatchEntry, WatchKind};
+        let entries: Vec<WatchEntry> = (1..=5)
+            .map(|i| WatchEntry {
+                exchange: "NSE".to_string(),
+                segment: "CASH".to_string(),
+                exchange_token: i.to_string(),
+                kind: WatchKind::Ltp,
+                security_id: i,
+                isin: None,
+                symbol_name: None,
+                index_name: None,
+            })
+            .collect();
+        let shards =
+            tickvault_core::feed::groww::shard_cutter::cut_shards(&entries, 2).expect("cuttable");
+        assert_eq!(shards.len(), 3, "5 entries at 2/conn = 3 shards");
+        // ceiling 2 → the 3rd shard (1 instrument) is past the ceiling
+        assert_eq!(instruments_past_ceiling(&shards, 2), 1);
+        // ceiling 1 → shards 2+3 (2 + 1 instruments) are past the ceiling
+        assert_eq!(instruments_past_ceiling(&shards, 1), 3);
+        // ceiling covers everything → zero gap
+        assert_eq!(instruments_past_ceiling(&shards, 3), 0);
+        assert_eq!(instruments_past_ceiling(&shards, 99), 0);
+        // empty fleet → zero gap
+        assert_eq!(instruments_past_ceiling(&[], 0), 0);
+    }
+
+    /// FIX 19 item 8 BUG B ratchet: the run loop MUST keep the loud
+    /// coverage-gap error wired at the ceiling site — a silent shard drop
+    /// (watch file written, no sidecar, no signal) must never come back.
+    #[test]
+    fn test_ratchet_run_loop_emits_coverage_gap_error() {
+        let src = include_str!("groww_scale_ladder.rs");
+        assert!(
+            src.contains("COVERAGE GAP"),
+            "the loud coverage-gap error! was removed from the run loop"
+        );
+        assert!(
+            src.contains("instruments_past_ceiling(&shards, ceiling)"),
+            "the run loop no longer computes the dropped-instrument count"
+        );
+        assert!(
+            src.contains("tv_groww_scale_shards_past_ceiling_total"),
+            "the shards-past-ceiling counter was removed"
+        );
     }
 
     #[test]

@@ -915,6 +915,11 @@ pub async fn build_and_write_groww_watch(
 ///   with `security_id = token` (stocks + FNO derivatives).
 /// - rows with an empty or non-numeric token (non-IDX) are SKIPPED and
 ///   counted — never a `security_id = 0` entry.
+/// - **operator scope 2026-07-05 (FIX 19 item 8):** only FNO (NSE+BSE),
+///   NSE CASH (EQ spots + IDX indices) and BSE CASH IDX (SENSEX family)
+///   rows are kept; COMMODITY (NSE+MCX) and BSE CASH EQ rows are SKIPPED
+///   and counted in `skipped` (the unfiltered master was 141,109 rows —
+///   the scoped set is ~100K, inside the 100-shard ceiling).
 ///
 /// Output is deduped by the shard cutter's fail-closed identity
 /// `(exchange, segment, security_id)` and sorted in the cutter's own
@@ -940,6 +945,28 @@ pub fn full_master_entries_from_csv(
     for r in rows {
         if r.exchange_token.is_empty() || r.exchange.is_empty() {
             continue;
+        }
+        // operator scope 2026-07-05 (FIX 19 item 8 BUG A): spots + indices +
+        // index/stock F&O only. The unfiltered master was 141,109 rows —
+        // NSE+BSE+MCX across CASH+FNO+COMMODITY — which overflowed the
+        // 100-shard ceiling and silently dropped 42 shards. In scope:
+        // FNO (NSE+BSE) + NSE CASH (EQ spots + IDX indices) + BSE CASH IDX
+        // (the SENSEX family). Excluded: COMMODITY (NSE+MCX), BSE CASH EQ.
+        // An empty segment normalizes to CASH (same default the entry
+        // mapping below applies). Excluded rows are counted in `skipped`.
+        let seg = if r.segment.is_empty() {
+            "CASH"
+        } else {
+            r.segment.as_str()
+        };
+        let in_scope = match (r.exchange.as_str(), seg) {
+            (_, "FNO") => true,
+            ("NSE", "CASH") => true,
+            ("BSE", "CASH") => r.instrument_type == "IDX",
+            _ => false,
+        };
+        if !in_scope {
+            continue; // counted in `skipped`
         }
         if r.instrument_type == "IDX" {
             entries.push(WatchEntry {
@@ -1107,11 +1134,13 @@ mod tests {
         // entry so cut_shards' fail-closed identity check can never reject
         // the lab set for upstream duplicates; order must match the cutter's
         // (exchange, segment, security_id) sort.
+        // FIX 19 item 8: the BSE row is FNO (BSE CASH EQ is now out of the
+        // operator scope) — still proves exchange-in-key dedup.
         let csv = lab_csv(&[
             "NSE,300,NSE-B,B,EQ,CASH,EQ,",
             "NSE,100,NSE-A,A,EQ,CASH,EQ,",
             "NSE,100,NSE-A-DUP,A dup,EQ,CASH,EQ,",
-            "BSE,100,BSE-A,A bse,EQ,CASH,EQ,",
+            "BSE,100,BSE-A,A bse fut,FUT,FNO,,",
         ]);
         let (entries, skipped) = full_master_entries_from_csv(&csv).expect("builds");
         assert_eq!(
@@ -1136,6 +1165,52 @@ mod tests {
         // The set must be cutter-clean: cut_shards accepts it.
         let shards = crate::feed::groww::shard_cutter::cut_shards(&entries, 2).expect("cuttable");
         assert_eq!(shards.len(), 2);
+    }
+
+    #[test]
+    fn test_full_master_entries_operator_scope_2026_07_05() {
+        // FIX 19 item 8 BUG A: the lab set is spots + indices + index/stock
+        // F&O ONLY. In scope: FNO (NSE+BSE), NSE CASH (EQ + IDX), BSE CASH
+        // IDX. Excluded: COMMODITY (NSE+MCX), BSE CASH EQ. The unfiltered
+        // 141,109-row master overflowed the 100-shard ceiling and silently
+        // dropped 42 shards on the 2026-07-05 live probe run.
+        let csv = lab_csv(&[
+            // in scope
+            "NSE,2885,NSE-RELIANCE,Reliance,EQ,CASH,EQ,", // NSE CASH EQ
+            "NSE,NIFTY,NSE-NIFTY,NIFTY 50,IDX,CASH,,",    // NSE CASH IDX
+            "NSE,55555,NSE-NIFTY-FUT,Nifty Fut,FUT,FNO,,", // NSE FNO
+            "BSE,66666,BSE-SENSEX-FUT,Sensex Fut,FUT,FNO,,", // BSE FNO
+            "BSE,SENSEX,BSE-SENSEX,SENSEX,IDX,CASH,,",    // BSE CASH IDX
+            // out of scope
+            "BSE,500325,BSE-RELIANCE,Reliance bse,EQ,CASH,A,", // BSE CASH EQ
+            "MCX,77777,MCX-GOLD,Gold,FUT,COMMODITY,,",         // MCX COMMODITY
+            "NSE,88888,NSE-GOLD,Gold nse,FUT,COMMODITY,,",     // NSE COMMODITY
+        ]);
+        let (entries, skipped) = full_master_entries_from_csv(&csv).expect("builds");
+        assert_eq!(entries.len(), 5, "exactly the in-scope rows survive");
+        assert_eq!(skipped, 3, "out-of-scope rows are counted, not silent");
+        assert!(
+            entries.iter().all(|e| e.segment != "COMMODITY"),
+            "no commodity row survives"
+        );
+        assert!(
+            !entries.iter().any(|e| e.exchange == "BSE"
+                && e.segment == "CASH"
+                && matches!(e.kind, WatchKind::Ltp)),
+            "no BSE cash equity survives"
+        );
+        assert!(
+            entries
+                .iter()
+                .any(|e| e.exchange == "BSE" && matches!(e.kind, WatchKind::IndexValue)),
+            "the BSE SENSEX-family index IS kept"
+        );
+        assert!(
+            entries
+                .iter()
+                .any(|e| e.exchange == "BSE" && e.segment == "FNO"),
+            "BSE F&O IS kept"
+        );
     }
 
     #[test]
