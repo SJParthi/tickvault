@@ -657,6 +657,14 @@ stop_notice_mode() {
 # (audit Rule 11, no false-OK). The wording is now state-based on the
 # tick count (arg 6) + market-open flag (arg 7); omitted args fail SAFE
 # to the honest "awaiting first tick" wording, never to "data flowing".
+# FIX 27: even the closed-market wording claimed "connected ✅" — but the
+# operator's 2026-07-05 17:56 IST live run showed the app log saying
+# "WebSocket boot connect deferred — outside market hours" at the exact
+# moment the ping said "✅ dhan: connected". Groww's "connected" only
+# proves the sidecar PROCESS is up, not the upstream socket. The closed-
+# market arm is now feed-aware and never says "connected": Dhan says the
+# connect is DEFERRED until market open; Groww says "sidecar up"; an
+# unknown future feed gets a neutral no-"connected" line (fail-safe).
 feed_ping_text() {
   local name="${1:-feed}" enabled="${2:-}" verdict="${3:-unknown}" connected="${4:-}" sub="${5:-0}"
   local ticks="${6:-0}" market_open="${7:-0}"
@@ -674,7 +682,20 @@ feed_ping_text() {
     elif [ "$market_open" = "1" ]; then
       echo "⚠️ ${name}: connected, ${sub} subscribed — NO ticks yet (investigating if it persists)"
     else
-      echo "✅ ${name}: connected, ${sub} subscribed — awaiting first tick (market closed)"
+      # FIX 27: market CLOSED + 0 ticks — the live socket is deferred (Dhan)
+      # or unproven (Groww: only the sidecar process is provably up), so the
+      # word "connected" is banned here (no-false-OK Rule 11).
+      case "$name" in
+      dhan)
+        echo "🔷 ${name}: ${sub} instruments ready — WebSocket connect deferred until market open (09:00 IST)"
+        ;;
+      groww)
+        echo "🟢 ${name}: sidecar up, ${sub} subscribed — awaiting first tick (market closed)"
+        ;;
+      *)
+        echo "⏳ ${name}: ${sub} subscribed — awaiting first tick (market closed)"
+        ;;
+      esac
     fi
     ;;
   degraded)

@@ -682,11 +682,24 @@ t "F19-7: OFF feed is announced, never silent" "⏸️ dhan: switched OFF for th
 # FIX 20 task 2: "data flowing" is claimed ONLY with ticks>0 — the ok
 # verdict wording is state-based (ticks + market-open), never a false claim.
 t "F20: ok + ticks flowing → data flowing" "✅ groww: connected, 1000 instruments subscribed, data flowing" "$(feed_ping_text groww true ok true 1000 42 1)"
-t "F20: ok + 0 ticks + market closed → awaiting first tick" "✅ groww: connected, 768 subscribed — awaiting first tick (market closed)" "$(feed_ping_text groww true ok true 768 0 0)"
+t "F20: ok + 0 ticks + market closed → awaiting first tick" "🟢 groww: sidecar up, 768 subscribed — awaiting first tick (market closed)" "$(feed_ping_text groww true ok true 768 0 0)"
 t "F20: ok + 0 ticks + market OPEN → honest no-ticks warning" "⚠️ groww: connected, 768 subscribed — NO ticks yet (investigating if it persists)" "$(feed_ping_text groww true ok true 768 0 1)"
 t "F20: omitted tick args fail SAFE (never claims data flowing)" "0" "$(case "$(feed_ping_text groww true ok true 1000)" in *"data flowing"*) echo 1 ;; *) echo 0 ;; esac)"
 t "F20: garbage ticks count renders as 0 (no false flowing)" "0" "$(case "$(feed_ping_text groww true ok true 1000 banana 1)" in *"data flowing"*) echo 1 ;; *) echo 0 ;; esac)"
-t "F20: garbage market flag fails safe to closed wording" "✅ groww: connected, 10 subscribed — awaiting first tick (market closed)" "$(feed_ping_text groww true ok true 10 0 x)"
+t "F20: garbage market flag fails safe to closed wording" "🟢 groww: sidecar up, 10 subscribed — awaiting first tick (market closed)" "$(feed_ping_text groww true ok true 10 0 x)"
+# FIX 27: market CLOSED must never claim "connected" — the 2026-07-05
+# 17:56 IST live run proved the Dhan socket was DEFERRED (app log:
+# "WebSocket boot connect deferred — outside market hours") while the
+# ping said "✅ dhan: connected". State-based honest wording per feed.
+t "F27: dhan closed → deferred wording (exact)" "🔷 dhan: 776 instruments ready — WebSocket connect deferred until market open (09:00 IST)" "$(feed_ping_text dhan true ok true 776 0 0)"
+t "F27: dhan closed wording never says connected" "0" "$(case "$(feed_ping_text dhan true ok true 776 0 0)" in *connected*) echo 1 ;; *) echo 0 ;; esac)"
+t "F27: dhan open + 0 ticks → honest no-ticks warning (says connected)" "⚠️ dhan: connected, 776 subscribed — NO ticks yet (investigating if it persists)" "$(feed_ping_text dhan true ok true 776 0 1)"
+t "F27: dhan open + ticks → data flowing (unchanged)" "✅ dhan: connected, 776 instruments subscribed, data flowing" "$(feed_ping_text dhan true ok true 776 9 1)"
+t "F27: groww closed → sidecar-up wording (exact)" "🟢 groww: sidecar up, 768 subscribed — awaiting first tick (market closed)" "$(feed_ping_text groww true ok true 768 0 0)"
+t "F27: groww closed wording never says connected" "0" "$(case "$(feed_ping_text groww true ok true 768 0 0)" in *connected*) echo 1 ;; *) echo 0 ;; esac)"
+t "F27: groww open + ticks → data flowing (unchanged)" "✅ groww: connected, 768 instruments subscribed, data flowing" "$(feed_ping_text groww true ok true 768 12 1)"
+t "F27: unknown future feed closed → neutral no-connected line" "⏳ newfeed: 5 subscribed — awaiting first tick (market closed)" "$(feed_ping_text newfeed true ok true 5 0 0)"
+t "F27: unknown future feed closed never says connected" "0" "$(case "$(feed_ping_text newfeed true ok true 5 0 0)" in *connected*) echo 1 ;; *) echo 0 ;; esac)"
 t "F20: health rows carry the ticks column" "0" "$(grep -q '"ticks_total"' scripts/local-autopilot.sh && echo 0 || echo 1)"
 t "F20: pinger passes ticks + market flag to the wording fn" "0" "$(grep -q 'feed_ping_text "\$name" "\$enabled" "\$verdict" "\$connected" "\$sub" "\$ticks" "\$mkt"' scripts/local-autopilot.sh && echo 0 || echo 1)"
 t "F19-7: unknown verdict but connected → awaiting ticks" "✅ groww: connected, 1000 instruments subscribed, awaiting ticks" "$(feed_ping_text groww true unknown true 1000)"
