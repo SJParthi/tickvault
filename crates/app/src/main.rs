@@ -1203,7 +1203,7 @@ async fn main() -> Result<()> {
 
     // File-based JSON log layer for Alloy → Loki ingestion.
     // HOURLY-rotated via `tracing_appender::rolling::Rotation::HOURLY`:
-    //   data/logs/app.YYYY-MM-DD-HH
+    //   data/logs/machine/app.YYYY-MM-DD-HH
     // Industry-standard chunk size: a daily file routinely exceeded
     // 100 MB during market hours and broke `less` / `grep` / IDE
     // ergonomics. Hourly chunks bound any single file to ~5–10 MB.
@@ -1246,7 +1246,7 @@ async fn main() -> Result<()> {
             }
         };
 
-    // Error-only file layer: data/logs/errors.log (WARN + ERROR only).
+    // Error-only file layer: data/logs/machine/errors.log (WARN + ERROR only).
     // Small, grep-friendly file containing ONLY problems for fast debugging.
     let error_log_layer: Option<Box<dyn tracing_subscriber::Layer<_> + Send + Sync + 'static>> =
         match create_error_log_writer() {
@@ -1267,7 +1267,7 @@ async fn main() -> Result<()> {
         };
 
     // Phase 2 of active-plan: ERROR-only JSONL stream at
-    // data/logs/errors.jsonl.YYYY-MM-DD-HH for Claude triage daemon,
+    // data/logs/machine/errors.jsonl.YYYY-MM-DD-HH for Claude triage daemon,
     // Loki/Alloy scraper, and the upcoming summary_writer. Hourly rotation,
     // 48h retention enforced by the background sweeper below.
     //
@@ -1370,7 +1370,7 @@ async fn main() -> Result<()> {
         .init();
 
     // Phase 5: background summary_writer task. Emits a human + Claude
-    // readable `data/logs/errors.summary.md` every 60s so `/loop` polling
+    // readable `data/logs/machine/errors.summary.md` every 60s so `/loop` polling
     // reads ONE file instead of parsing JSONL, and so `make status` can
     // cat it for an instant health view.
     {
@@ -1384,56 +1384,71 @@ async fn main() -> Result<()> {
     // Phase 2: hourly retention sweeper for errors.jsonl. Keeps ~48h of
     // rotated files on disk (~= 500KB at ERROR-only volume). Runs as a
     // best-effort background task — failures log at WARN, never halt.
+    // 2026-07-05 grace window: ALSO sweeps the legacy top-level
+    // data/logs/ so errors.jsonl.* files written before the machine/
+    // move age out naturally (no risky boot-time file moves).
     tokio::spawn(async {
         use std::path::Path;
         use std::time::Duration;
         const SWEEP_INTERVAL_SECS: u64 = 3600;
         const RETENTION_HOURS: u64 = 48;
-        let dir = Path::new(observability::ERRORS_JSONL_DIR);
         loop {
             tokio::time::sleep(Duration::from_secs(SWEEP_INTERVAL_SECS)).await;
-            match observability::sweep_errors_jsonl_retention(dir, RETENTION_HOURS) {
-                Ok(0) => {}
-                Ok(n) => tracing::info!(
-                    deleted = n,
-                    dir = %dir.display(),
-                    retention_hours = RETENTION_HOURS,
-                    "errors.jsonl retention sweep"
-                ),
-                Err(err) => tracing::warn!(
-                    ?err,
-                    dir = %dir.display(),
-                    "errors.jsonl retention sweep failed"
-                ),
+            for dir in [
+                Path::new(observability::ERRORS_JSONL_DIR),
+                Path::new(observability::LEGACY_LOGS_DIR),
+            ] {
+                match observability::sweep_errors_jsonl_retention(dir, RETENTION_HOURS) {
+                    Ok(0) => {}
+                    Ok(n) => tracing::info!(
+                        deleted = n,
+                        dir = %dir.display(),
+                        retention_hours = RETENTION_HOURS,
+                        "errors.jsonl retention sweep"
+                    ),
+                    Err(err) => tracing::warn!(
+                        ?err,
+                        dir = %dir.display(),
+                        "errors.jsonl retention sweep failed"
+                    ),
+                }
             }
         }
     });
 
     // Hourly retention sweeper for the rolling app log
-    // (data/logs/app.YYYY-MM-DD-HH). Keeps 7 days of files (168 hourly
-    // chunks at ~5–10 MB each = ~0.8–1.7 GB cap on disk), matching the
-    // prior daily-file retention semantic of "keep 7 daily files".
+    // (data/logs/machine/app.YYYY-MM-DD-HH). Keeps 7 days of files (168
+    // hourly chunks at ~5–10 MB each = ~0.8–1.7 GB cap on disk), matching
+    // the prior daily-file retention semantic of "keep 7 daily files".
+    // 2026-07-05 grace window: ALSO sweeps the legacy top-level
+    // data/logs/ for pre-move hourly captures. The sweeper skips every
+    // `*.log` name, so the launcher-owned HUMAN daily log
+    // (app.<IST-date>.log) can never be deleted by this task.
     tokio::spawn(async {
         use std::path::Path;
         use std::time::Duration;
         const SWEEP_INTERVAL_SECS: u64 = 3600;
         const RETENTION_HOURS: u64 = 168;
-        let dir = Path::new(observability::ERRORS_JSONL_DIR);
         loop {
             tokio::time::sleep(Duration::from_secs(SWEEP_INTERVAL_SECS)).await;
-            match observability::sweep_app_log_retention(dir, RETENTION_HOURS) {
-                Ok(0) => {}
-                Ok(n) => tracing::info!(
-                    deleted = n,
-                    dir = %dir.display(),
-                    retention_hours = RETENTION_HOURS,
-                    "app log retention sweep"
-                ),
-                Err(err) => tracing::warn!(
-                    ?err,
-                    dir = %dir.display(),
-                    "app log retention sweep failed"
-                ),
+            for dir in [
+                Path::new(observability::ERRORS_JSONL_DIR),
+                Path::new(observability::LEGACY_LOGS_DIR),
+            ] {
+                match observability::sweep_app_log_retention(dir, RETENTION_HOURS) {
+                    Ok(0) => {}
+                    Ok(n) => tracing::info!(
+                        deleted = n,
+                        dir = %dir.display(),
+                        retention_hours = RETENTION_HOURS,
+                        "app log retention sweep"
+                    ),
+                    Err(err) => tracing::warn!(
+                        ?err,
+                        dir = %dir.display(),
+                        "app log retention sweep failed"
+                    ),
+                }
             }
         }
     });
@@ -1450,26 +1465,35 @@ async fn main() -> Result<()> {
         loop {
             tokio::time::sleep(Duration::from_secs(SWEEP_INTERVAL_SECS)).await;
             for cat in tickvault_app::observability::LogCategory::all() {
-                let dir = Path::new(cat.dir());
-                match tickvault_app::observability::sweep_category_log_retention(
-                    dir,
-                    cat.prefix(),
-                    RETENTION_HOURS,
-                ) {
-                    Ok(0) => {}
-                    Ok(n) => tracing::info!(
-                        deleted = n,
-                        dir = %dir.display(),
-                        prefix = cat.prefix(),
-                        retention_hours = RETENTION_HOURS,
-                        "category log retention sweep"
-                    ),
-                    Err(err) => tracing::warn!(
-                        ?err,
-                        dir = %dir.display(),
-                        prefix = cat.prefix(),
-                        "category log retention sweep failed"
-                    ),
+                // 2026-07-05 grace window: sweep the machine/ category dir
+                // AND the legacy top-level data/logs/<prefix>/ dir so
+                // pre-move files age out naturally.
+                let legacy_dir = format!(
+                    "{}/{}",
+                    tickvault_app::observability::LEGACY_LOGS_DIR,
+                    cat.prefix()
+                );
+                for dir in [Path::new(cat.dir()), Path::new(legacy_dir.as_str())] {
+                    match tickvault_app::observability::sweep_category_log_retention(
+                        dir,
+                        cat.prefix(),
+                        RETENTION_HOURS,
+                    ) {
+                        Ok(0) => {}
+                        Ok(n) => tracing::info!(
+                            deleted = n,
+                            dir = %dir.display(),
+                            prefix = cat.prefix(),
+                            retention_hours = RETENTION_HOURS,
+                            "category log retention sweep"
+                        ),
+                        Err(err) => tracing::warn!(
+                            ?err,
+                            dir = %dir.display(),
+                            prefix = cat.prefix(),
+                            "category log retention sweep failed"
+                        ),
+                    }
                 }
             }
         }
@@ -2637,6 +2661,17 @@ async fn main() -> Result<()> {
         std::sync::Arc::clone(&tick_storage),
     )
     .await?;
+    // 2026-07-05 feed-Telegram parity (operator: "why dhan messages and groww
+    // messages are not same"): fill the Groww deferred notifier slot on THIS
+    // boot path too. Before this, only the FAST boot path stored the notifier
+    // (the store next to `fast_notifier` above) — the slow-boot / GROWW-ONLY
+    // shared-infra path never filled the slot, so every Groww boot-stage ping
+    // (FeedAuthOk / FeedInstrumentsLoaded / sidecar-reject / connected) waited
+    // out its budget and was skipped ("notifier slot never filled within the
+    // wait budget"). Provably safe here: the notifier is fully constructed
+    // (strict init + coalescer wrap) inside `build_shared_infra` before this
+    // line runs — the exact mirror of the fast-path store.
+    groww_sidecar_notifier_slot.store(Some(std::sync::Arc::clone(&notifier)));
 
     // =======================================================================
     // PROCESS-GLOBAL supervised observability monitors (2026-07-01 per-lane-leak

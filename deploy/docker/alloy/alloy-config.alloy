@@ -46,12 +46,17 @@ loki.source.docker "tv_containers" {
 }
 
 // ---- ERROR-only structured JSONL stream ----
-// Phase 2 of active-plan.md writes data/logs/errors.jsonl.YYYY-MM-DD-HH
+// Phase 2 of active-plan.md writes data/logs/machine/errors.jsonl.YYYY-MM-DD-HH
 // via tracing-appender. Alloy tails every hourly-rotated file so Loki
 // alert rules can pattern-match on code/severity/signature fields.
+// 2026-07-05: machine log sinks moved to data/logs/machine/ (operator
+// directive "one human log file; robot files into machine/ subfolder").
+// Both globs are kept during the grace window so pre-move rotations at
+// the legacy top level keep shipping until retention ages them out.
 
 local.file_match "errors_jsonl" {
   path_targets = [
+    {"__path__" = "/var/log/tv-app/machine/errors.jsonl*"},
     {"__path__" = "/var/log/tv-app/errors.jsonl*"},
   ]
 }

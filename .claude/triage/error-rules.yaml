@@ -1,7 +1,7 @@
 # Zero-Touch Error Triage Rules — Phase 6 of active-plan.md
 #
 # The triage hook (`.claude/hooks/error-triage.sh`) reads this file on every
-# run, walks the current `data/logs/errors.summary.md`, and for each
+# run, walks the current `data/logs/machine/errors.summary.md`, and for each
 # signature chooses ONE of:
 #
 #   action: silence       -> noop, mark as seen (expected recurring noise)
@@ -1147,7 +1147,7 @@ rules:
       respawned it. Per WS-GAP-05 supervisor pattern this is recoverable
       in isolation, but a panic LOOP indicates a deterministic crash
       bug that no respawn can heal. Severity::High; operator inspects
-      data/logs/errors.jsonl.* for the panic backtrace immediately
+      data/logs/machine/errors.jsonl.* for the panic backtrace immediately
       preceding the respawn.
 
   # -----------------------------------------------------------------------

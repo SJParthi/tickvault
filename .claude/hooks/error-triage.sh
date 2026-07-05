@@ -30,7 +30,11 @@ if [[ "${1:-}" == "--execute-autofix" ]]; then
     EXECUTE_AUTOFIX=1
 fi
 
-SUMMARY_FILE="data/logs/errors.summary.md"
+SUMMARY_FILE="data/logs/machine/errors.summary.md"
+# 2026-07-05 grace window: pre-move summary at the legacy top-level path.
+if [ ! -f "${SUMMARY_FILE}" ] && [ -f "data/logs/errors.summary.md" ]; then
+    SUMMARY_FILE="data/logs/errors.summary.md"
+fi
 RULES_FILE=".claude/triage/error-rules.yaml"
 STATE_FILE=".claude/state/triage-seen.jsonl"
 AUTO_FIX_LOG="data/logs/auto-fix.log"

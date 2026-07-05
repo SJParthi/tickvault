@@ -243,7 +243,7 @@ services:
 
   # ---------------------------------------------------------------------------
   # Alloy — log collector (Phase 3 of active-plan.md)
-  # Tails tv-* container logs AND data/logs/errors.jsonl.* on the host,
+  # Tails tv-* container logs AND data/logs/machine/errors.jsonl.* on the host,
   # forwards everything to tv-loki. 256MB memory.
   # ---------------------------------------------------------------------------
   tv-alloy:
@@ -266,7 +266,7 @@ services:
     volumes:
       - ./alloy/alloy-config.alloy:/etc/alloy/alloy-config.alloy:ro
       - /var/run/docker.sock:/var/run/docker.sock:ro
-      # Bind-mount the host's data/logs/ so Alloy can tail errors.jsonl.*
+      # Bind-mount the host's data/logs/ so Alloy can tail machine/errors.jsonl.*
       # and the daily app.*.log files that the Rust observability layer writes.
       - ../../data/logs:/var/log/tv-app:ro
     depends_on:
