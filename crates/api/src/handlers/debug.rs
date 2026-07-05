@@ -18,10 +18,12 @@ use axum::http::{StatusCode, header};
 use axum::response::IntoResponse;
 
 /// Default logs directory. Mirrors the MCP server's default resolution:
-/// `<repo_root>/data/logs`. Overridable via env var `TV_LOGS_DIR` so
-/// deployments that store logs elsewhere (e.g. EFS mount on AWS) work
+/// `<repo_root>/data/logs/machine` (2026-07-05 operator directive — every
+/// machine sink lives under `data/logs/machine/`; the `data/logs/` top
+/// level is the human log surface). Overridable via env var `TV_LOGS_DIR`
+/// so deployments that store logs elsewhere (e.g. EFS mount on AWS) work
 /// without code changes.
-const DEFAULT_LOGS_DIR: &str = "data/logs";
+const DEFAULT_LOGS_DIR: &str = "data/logs/machine";
 const ERRORS_SUMMARY_FILENAME: &str = "errors.summary.md";
 const ERRORS_JSONL_PREFIX: &str = "errors.jsonl";
 
