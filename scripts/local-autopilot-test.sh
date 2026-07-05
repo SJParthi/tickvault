@@ -482,7 +482,7 @@ t "F2: start_app lock-skip returns rc 3" "1" "$(sed -n '/^start_app()/,/^}/p' sc
 t "F2: peer-tolerant wrapper exists" "0" "$(grep -q '^start_app_tolerate_peer()' scripts/local-autopilot.sh && echo 0 || echo 1)"
 t "F2: cmd_start words the peer case honestly" "0" "$(grep -q 'Another launcher is already starting the app' scripts/local-autopilot.sh && echo 0 || echo 1)"
 # (8 sites since FIX 18 G16: the skip-max normal-session fallback added one.)
-t "F2: robot day flow uses the peer-tolerant wrapper" "8" "$(grep -c 'start_app_tolerate_peer "' scripts/local-autopilot.sh || true)"
+t "F2: robot day flow uses the peer-tolerant wrapper (9 since FIX 30 auto-probe resume)" "9" "$(grep -c 'start_app_tolerate_peer "' scripts/local-autopilot.sh || true)"
 # F1: BOTH git writers serialize (acquire-or-skip) against a lock-held build
 t "F1: both git writers take the launcher lock (acquire-or-skip)" "2" "$(grep -c 'launcher_lock_acquire_wait 5' scripts/local-autopilot.sh || true)"
 t "F1: cmd_dev releases the lock BEFORE the re-exec" "1" "$(sed -n '/^cmd_dev()/,/^}/p' scripts/local-autopilot.sh | grep -c 'launcher_lock_release # MUST release before exec')"
@@ -490,7 +490,7 @@ t "F1: cmd_dev releases the lock BEFORE the re-exec" "1" "$(sed -n '/^cmd_dev()/
 t "F3: merge-with-retry used by both writers" "2" "$(grep -c 'git_ff_merge_with_retry origin/local-runtime' scripts/local-autopilot.sh || true)"
 # F5: caffeinate survives an IDE group-kill (own process group) + monitor re-arm
 t "F5: caffeinate launched in its own process group" "1" "$(sed -n '/^start_caffeinate()/,/^}/p' scripts/local-autopilot.sh | grep -c 'set -m')"
-t "F5: monitor loop re-arms caffeinate" "1" "$(sed -n '/^monitor_until_eod()/,/^}/p' scripts/local-autopilot.sh | grep -c 'start_caffeinate')"
+t "F5: monitor loop re-arms caffeinate (2 since FIX 30: per-cycle + probe resume)" "2" "$(sed -n '/^monitor_until_eod()/,/^}/p' scripts/local-autopilot.sh | grep -c 'start_caffeinate')"
 # F10/F11: ensure_questdb alerts + restart budget are per-EPISODE latched
 t "F10: docker restart budget is one per outage episode" "0" "$(grep -q 'QDB_EPISODE_RESTARTED=1' scripts/local-autopilot.sh && echo 0 || echo 1)"
 t "F10: give-up page latched per episode" "0" "$(grep -q 'QDB_EPISODE_PAGED=1' scripts/local-autopilot.sh && echo 0 || echo 1)"
@@ -717,7 +717,7 @@ t "F19-7: empty rows are NOT settled (keep polling)" "1" "$(feed_rows_settled ""
 t "F19-7: enabled row with a real verdict is settled even if disconnected" "0" "$(feed_rows_settled 'groww|true|down|false|0' && echo 0 || echo 1)"
 # wiring scans: dispatch entry + one spawn per start-complete Telegram
 t "F19-7: feed-pings subcommand dispatched" "0" "$(grep -q 'feed-pings) send_feed_status_pings' scripts/local-autopilot.sh && echo 0 || echo 1)"
-t "F19-7: all 3 start paths spawn the pinger" "3" "$(grep -c 'spawn_feed_status_pings # FIX 19 item 7' scripts/local-autopilot.sh || true)"
+t "F19-7: all 4 start paths spawn the pinger (4th = FIX 30 auto-probe resume)" "4" "$(grep -c 'spawn_feed_status_pings # FIX 19 item 7' scripts/local-autopilot.sh || true)"
 t "F19-7: the pinger reads the public feeds-health endpoint" "0" "$(grep -q 'api/feeds/health' scripts/local-autopilot.sh && echo 0 || echo 1)"
 
 # ── FIX 21: post-open per-class tick coverage + pre-open socket probe ───────
@@ -885,9 +885,9 @@ t "F25: comment marker attempt parse fails safe to 1" "1" \
   "$(probe_marker_attempt "# disarmed 2026-07-05 — attempt 2 complete")"
 t "F25: a real dated marker still fires (disarm did not break arming)" "run" \
   "$(probe_once_decision 2026-07-05 2026-07-05 0)"
-t "F25: committed marker file is DISARMED (first line is a comment)" "0" \
-  "$(head -1 deploy/local/probe-once.date | grep -q '^#' && echo 0 || echo 1)"
-t "F25: disarmed marker documents the re-arm procedure" "0" \
+t "F25/F30: committed marker is DISARMED (comment) or a well-formed dated arm line — never garbage" "0" \
+  "$(head -1 deploy/local/probe-once.date | grep -Eq '^#|^[0-9]{4}-[0-9]{2}-[0-9]{2}( [0-9]+)?$' && echo 0 || echo 1)"
+t "F25: marker file documents the re-arm/disarm procedure" "0" \
   "$(grep -q 're-arm deliberately' deploy/local/probe-once.date && echo 0 || echo 1)"
 # 2) stray-sweep candidates: only REAL interpreter invocations qualify.
 t "F25: python3 + script path IS a sidecar candidate" "0" \
@@ -990,6 +990,84 @@ t "F29: the cold-start writer reads the single source too" "0" \
   "$(sed -n '/^raise_docker_mem_at_cold_start()/,/^}/p' scripts/local-autopilot.sh | grep -q 'docker_mem_advice_mib' && echo 0 || echo 1)"
 t "F29: single source honors the TV_DOCKER_VM_MEM_MIB override (runtime wrapper)" "0" \
   "$(sed -n '/^docker_mem_advice_gb_now()/,/^}/p' scripts/local-autopilot.sh | grep -q 'TV_DOCKER_VM_MEM_MIB' && echo 0 || echo 1)"
+
+# ── FIX 30: robot auto-fires the armed once-probe (10:00-13:30 IST window) ──
+# Decision boundaries: the 08:55 robot fires the SAME one-shot ladder probe
+# a manual Start click would, but only 10:00:00-13:29:59 IST (after the
+# 09:15 open + ~09:20 per-class verdict; before 13:30 so the 75-min cap +
+# resume land well before the 15:30 close).
+t "F30: 09:59:59 armed unstamped idle → wait" "wait" "$(probe_auto_fire_decision 09:59:59 1 0 idle)"
+t "F30: 10:00:00 → fire" "fire" "$(probe_auto_fire_decision 10:00:00 1 0 idle)"
+t "F30: 13:29:59 → fire (last eligible second)" "fire" "$(probe_auto_fire_decision 13:29:59 1 0 idle)"
+t "F30: 13:30:00 → skip (window missed)" "skip" "$(probe_auto_fire_decision 13:30:00 1 0 idle)"
+t "F30: stamped → skip (once-only preserved)" "skip" "$(probe_auto_fire_decision 11:00:00 1 1 idle)"
+t "F30: unarmed → skip (inert on every other day)" "skip" "$(probe_auto_fire_decision 11:00:00 0 0 idle)"
+t "F30: unarmed before window → skip, NOT wait" "skip" "$(probe_auto_fire_decision 09:00:00 0 0 idle)"
+t "F30: phase fired → skip (in-session double-fire guard)" "skip" "$(probe_auto_fire_decision 11:00:00 1 0 fired)"
+t "F30: phase manual → skip (Stop always wins)" "skip" "$(probe_auto_fire_decision 11:00:00 1 0 manual)"
+t "F30: empty phase fails safe → skip" "skip" "$(probe_auto_fire_decision 11:00:00 1 0 "")"
+t "F30: garbage time fails safe → skip" "skip" "$(probe_auto_fire_decision 9x:00:00 1 0 idle)"
+t "F30: empty time fails safe → skip" "skip" "$(probe_auto_fire_decision "" 1 0 idle)"
+t "F30: numeric secs-of-day 36000 → fire" "fire" "$(probe_auto_fire_decision 36000 1 0 idle)"
+t "F30: numeric secs-of-day 35999 → wait" "wait" "$(probe_auto_fire_decision 35999 1 0 idle)"
+t "F30: numeric secs-of-day 48600 → skip" "skip" "$(probe_auto_fire_decision 48600 1 0 idle)"
+# probe_marker_state — the marker + per-attempt stamp reads, factored so
+# the robot gate and the scale-day precedence gate see the same truth.
+mkdir -p "$TMP/f30"
+printf '2099-01-11 3\n' >"$TMP/f30/marker"
+t "F30: marker armed today, attempt 3, no stamp" "1 0 3" \
+  "$(probe_marker_state "$TMP/f30/marker" 2099-01-11 "$TMP/f30")"
+t "F30: date MISMATCH (Monday robot, Tuesday marker) → provably inert" "0 0 3" \
+  "$(probe_marker_state "$TMP/f30/marker" 2099-01-10 "$TMP/f30")"
+touch "$TMP/f30/probe-once.done.2099-01-11.3"
+t "F30: per-attempt stamp present → stamped" "1 1 3" \
+  "$(probe_marker_state "$TMP/f30/marker" 2099-01-11 "$TMP/f30")"
+printf '2099-02-11\n' >"$TMP/f30/marker2"
+t "F30: bare-date marker = attempt 1" "1 0 1" \
+  "$(probe_marker_state "$TMP/f30/marker2" 2099-02-11 "$TMP/f30")"
+touch "$TMP/f30/probe-once.done.2099-02-11"
+t "F30: legacy unsuffixed stamp counts for attempt 1" "1 1 1" \
+  "$(probe_marker_state "$TMP/f30/marker2" 2099-02-11 "$TMP/f30")"
+printf '# disarmed — attempt done\n' >"$TMP/f30/marker3"
+t "F30: disarmed comment marker → unarmed" "0 0 1" \
+  "$(probe_marker_state "$TMP/f30/marker3" 2099-03-11 "$TMP/f30")"
+t "F30: missing marker file → unarmed" "0 0 1" \
+  "$(probe_marker_state "$TMP/f30/absent" 2099-03-11 "$TMP/f30")"
+# End-to-end: a date-mismatched marker can never fire even mid-window.
+read -r _f30a _f30s _f30n <<<"$(probe_marker_state "$TMP/f30/marker" 2099-01-10 "$TMP/f30")"
+t "F30: mismatched marker feeds decision → skip at 11:00" "skip" \
+  "$(probe_auto_fire_decision 11:00:00 "$_f30a" "$_f30s" idle)"
+# Wiring pins: the robot loop consults the decision and fires the SAME
+# one-shot flow the manual Start click uses; only cmd_run's main
+# invocation arms it.
+t "F30: cmd_run main monitor invocation arms auto-fire (exactly once)" "1" \
+  "$(grep -c 'monitor_until_eod 1' scripts/local-autopilot.sh || true)"
+t "F30: monitor loop consults probe_auto_fire_decision" "0" \
+  "$(sed -n '/^monitor_until_eod()/,/^}/p' scripts/local-autopilot.sh | grep -q 'probe_auto_fire_decision' && echo 0 || echo 1)"
+t "F30: monitor loop reads marker state via probe_marker_state" "0" \
+  "$(sed -n '/^monitor_until_eod()/,/^}/p' scripts/local-autopilot.sh | grep -q 'probe_marker_state "\$PROBE_ONCE_MARKER"' && echo 0 || echo 1)"
+t "F30: fire path invokes the SAME maybe_run_probe_once flow" "0" \
+  "$(sed -n '/^monitor_until_eod()/,/^}/p' scripts/local-autopilot.sh | grep -q 'if maybe_run_probe_once; then' && echo 0 || echo 1)"
+t "F30: fire Telegram wording (pause + auto-resume promise)" "0" \
+  "$(grep -qF 'starting — live session pauses up to 75 min, resumes automatically' scripts/local-autopilot.sh && echo 0 || echo 1)"
+t "F30: resume path clears the probe's own internal-stop marker" "0" \
+  "$(sed -n '/^monitor_until_eod()/,/^}/p' scripts/local-autopilot.sh | grep -qF 'rm -f "$MANUAL_STOP_MARKER"' && echo 0 || echo 1)"
+t "F30: resume path re-arms caffeinate right after clearing the marker" "0" \
+  "$(sed -n '/^monitor_until_eod()/,/^}/p' scripts/local-autopilot.sh | grep -A1 'rm -f "\$MANUAL_STOP_MARKER"' | grep -q 'start_caffeinate' && echo 0 || echo 1)"
+t "F30: resume path sweeps a leaked scale overlay before relaunch" "0" \
+  "$(sed -n '/^monitor_until_eod()/,/^}/p' scripts/local-autopilot.sh | grep -q 'has_scale_overlay config/local.toml' && echo 0 || echo 1)"
+t "F30: resume relaunches the normal session (peer-tolerant)" "0" \
+  "$(sed -n '/^monitor_until_eod()/,/^}/p' scripts/local-autopilot.sh | grep -q 'start_app_tolerate_peer "normal session resume after auto-fired probe"' && echo 0 || echo 1)"
+t "F30: Stop pressed DURING the probe is honored (no auto-resume)" "0" \
+  "$(sed -n '/^monitor_until_eod()/,/^}/p' scripts/local-autopilot.sh | grep -q 'no auto-resume' && echo 0 || echo 1)"
+t "F30: window-missed case logs honestly (marker stays armed)" "0" \
+  "$(sed -n '/^monitor_until_eod()/,/^}/p' scripts/local-autopilot.sh | grep -q 'window missed' && echo 0 || echo 1)"
+t "F30: manual-start monitor (cmd_monitor) does NOT arm auto-fire" "0" \
+  "$(sed -n '/^cmd_monitor()/,/^}/p' scripts/local-autopilot.sh | grep -c 'monitor_until_eod 1' || true)"
+t "F30: scale-day precedence — armed marker owns the fleet budget" "0" \
+  "$(sed -n '/^cmd_run()/,/^}/p' scripts/local-autopilot.sh | grep -q 'the marker owns the fleet budget' && echo 0 || echo 1)"
+t "F30: scale-day precedence gate reads the same marker state" "0" \
+  "$(sed -n '/^cmd_run()/,/^}/p' scripts/local-autopilot.sh | grep -q 'probe_marker_state "\$PROBE_ONCE_MARKER" "\$TODAY"' && echo 0 || echo 1)"
 
 echo
 echo "local-autopilot pure-logic tests: $PASS passed, $FAIL failed"

@@ -1111,6 +1111,84 @@ probe_marker_attempt() {
   case "$a" in '' | *[!0-9]* | 0) echo 1 ;; *) echo "$a" ;; esac
 }
 
+# ── FIX 30: robot auto-fire of the armed once-probe (zero-touch) ────────────
+# Before FIX 30 the one-shot ladder probe fired ONLY from a manual Start
+# click (cmd_start → maybe_run_probe_once); the 08:55 weekday robot never
+# fired it, so "arm the marker" still needed one human click. The robot's
+# monitor loop now fires the SAME one-shot flow inside a bounded IST window.
+
+# probe_marker_state <marker_file> <today> [stamp_dir] →
+#   "<armed 0/1> <stamped 0/1> <attempt>"
+# The marker + per-attempt completion-stamp state on disk — the exact reads
+# maybe_run_probe_once performs, factored so the robot's auto-fire gate and
+# the scale-day precedence gate see the SAME truth. armed=1 ONLY when the
+# marker's first field is a well-formed YYYY-MM-DD equal to <today> (a
+# date-mismatched / disarmed / missing marker is provably inert here).
+# I/O limited to the declared file args (testable in lib mode).
+probe_marker_state() {
+  local mf="${1:-}" today="${2:-}" dir="${3:-data/groww-scale}"
+  local marker_line="" marker_date attempt armed=0 stamped=0
+  if [ -n "$mf" ] && [ -f "$mf" ]; then marker_line="$(head -1 "$mf")"; fi
+  marker_date="$(probe_marker_date "$marker_line")"
+  attempt="$(probe_marker_attempt "$marker_line")"
+  case "$marker_date" in
+  [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9])
+    if [ -n "$today" ] && [ "$marker_date" = "$today" ]; then armed=1; fi
+    ;;
+  esac
+  [ -f "${dir}/probe-once.done.${today}.${attempt}" ] && stamped=1
+  # Backward compat (FIX 11): a pre-FIX-11 unsuffixed stamp counts as attempt 1.
+  if [ "$attempt" = "1" ] && [ -f "${dir}/probe-once.done.${today}" ]; then
+    stamped=1
+  fi
+  echo "$armed $stamped $attempt"
+}
+
+# probe_auto_fire_decision <now HH:MM[:SS] | secs-of-day> <marker_armed 0/1>
+#   <already_stamped 0/1> <app_phase> → fire|wait|skip. Pure.
+# The robot fires the armed one-shot ladder probe ONLY inside
+# 10:00:00–13:29:59 IST:
+#   • not before 10:00 — the 09:15 open + the ~09:20 per-class tick verdict
+#     (FIX 21) must complete undisturbed first;
+#   • not at/after 13:30 — the probe's 75-minute hard cap
+#     (PROBE_ONCE_MAX_MIN) + the normal-session resume must land well
+#     before the 15:30 close (worst case 13:29 fire → ~14:45 resume).
+# app_phase must be the literal "idle": "fired" (this session already
+# fired — belt-and-braces beside the stamp), "manual" (Stop pressed),
+# or anything else refuses fail-safe.
+# Outside the window: before 10:00 → wait (armed marker stays live for a
+# later monitor iteration); at/after 13:30 → skip (window missed — the
+# marker stays armed for a manual Run click; the caller logs that honestly).
+PROBE_AUTO_FIRE_START_SECS=36000 # 10:00:00 IST
+PROBE_AUTO_FIRE_END_SECS=48600   # 13:30:00 IST (exclusive)
+probe_auto_fire_decision() {
+  local now="${1:-}" armed="${2:-0}" stamped="${3:-1}" phase="${4:-}" now_secs
+  case "$now" in
+  *:*)
+    now_secs=$(hhmm_to_secs "$now") || {
+      echo skip
+      return 0
+    }
+    ;;
+  '' | *[!0-9]*)
+    echo skip
+    return 0
+    ;;
+  *) now_secs="$now" ;;
+  esac
+  if [ "$armed" != "1" ] || [ "$stamped" != "0" ] || [ "$phase" != "idle" ]; then
+    echo skip
+    return 0
+  fi
+  if ((10#$now_secs < PROBE_AUTO_FIRE_START_SECS)); then
+    echo wait
+  elif ((10#$now_secs >= PROBE_AUTO_FIRE_END_SECS)); then
+    echo skip
+  else
+    echo fire
+  fi
+}
+
 # ── FIX 8: launcher Telegram env + stale-adopt / recreated-DB guards ───────
 
 # tg_env_resolve <tv_environment> <environment> → the SSM environment the
@@ -3707,6 +3785,12 @@ eod_summary() {
 }
 
 monitor_until_eod() {
+  # FIX 30: auto_probe=1 (ONLY the robot's main post-boot invocation in
+  # cmd_run) arms the once-probe auto-fire inside the loop. The manual-start
+  # monitor (cmd_monitor) and the stood-down probe-wait invocation pass
+  # nothing — provably inert there.
+  local auto_probe="${1:-0}" probe_fired=0 probe_missed_logged=0
+  local pm_armed pm_stamped pm_attempt probe_phase
   local relaunches=0 decision alive manual iter=0 disk_warned=0 avail_gb
   local qdb_warned=0 vm_disk_warned=0 vm_pct qdb_fail_streak=0 healthy_streak=0
   # FIX 21: once-per-day edge latches keyed on the IST date so a loop that
@@ -3873,6 +3957,62 @@ monitor_until_eod() {
         qdb_fail_streak=0
       fi
     fi
+    # ── FIX 30: robot auto-fire of the armed once-probe (zero-touch) ──────
+    # Placed at the END of the iteration so this iteration's alive/decision
+    # logic ran on consistent pre-probe state; the next iteration recomputes
+    # everything fresh against the resumed app. The stamp (written BEFORE
+    # the probe inside maybe_run_probe_once) plus the local probe_fired
+    # latch make a double-fire impossible even across restarts of this loop.
+    if [ "$auto_probe" = "1" ]; then
+      probe_phase="idle"
+      [ "$probe_fired" = "1" ] && probe_phase="fired"
+      [ "$manual" = "1" ] && probe_phase="manual"
+      read -r pm_armed pm_stamped pm_attempt <<<"$(probe_marker_state "$PROBE_ONCE_MARKER" "$(ist_date)")"
+      case "$(probe_auto_fire_decision "$(ist_hms)" "$pm_armed" "$pm_stamped" "$probe_phase")" in
+      fire)
+        probe_fired=1
+        log "FIX 30: armed once-probe marker + inside the 10:00-13:30 IST auto-fire window — the robot runs the ladder probe now (attempt ${pm_attempt}); the live session pauses and resumes automatically"
+        tg "🧪 scale ladder probe (attempt ${pm_attempt}) starting — live session pauses up to 75 min, resumes automatically"
+        if maybe_run_probe_once; then
+          # Mirror cmd_start's post-probe resume exactly: the probe's own
+          # internal stop re-arms the manual-stop marker and disarms
+          # caffeinate — clear + re-arm both (this is a RESUME, not a stop),
+          # sweep any leaked Dhan-OFF scale overlay, then relaunch the
+          # normal session and re-arm the per-feed status pings.
+          rm -f "$MANUAL_STOP_MARKER"
+          start_caffeinate
+          if has_scale_overlay config/local.toml; then
+            log "leftover scale-test overlay found after the auto-fired probe — removing it (resuming a NORMAL session)"
+            bash scripts/groww-scale-test.sh clean >>"$(current_log)" 2>&1 || true
+          fi
+          if start_app_tolerate_peer "normal session resume after auto-fired probe"; then
+            tg "🚀 Ladder probe finished — normal live session resumed automatically (capture continues until the usual 15:35 stop)."
+            spawn_feed_status_pings # FIX 19 item 7: one Telegram per feed, every mode
+          else
+            tg "🆘 The probe finished but the normal session could NOT restart — the monitor will relaunch it once automatically; if that fails too, double-click Start TickVault."
+          fi
+        else
+          # rc 1 = the operator pressed Stop DURING the probe (FIX 10 A8) —
+          # it stands: no auto-resume; the next iteration's manual latch
+          # stands the monitor down and the EOD tail skips the app stop.
+          log "Stop was pressed DURING the auto-fired probe — honoring it: no auto-resume (double-click Start TickVault when ready)"
+        fi
+        ;;
+      skip)
+        # Honest once-per-session log when an armed, unstamped marker's
+        # window has passed (≥13:30 IST) — the marker stays armed for a
+        # manual Run click; every other skip (unarmed day, stamped, manual)
+        # is silent by design.
+        if [ "$pm_armed" = "1" ] && [ "$pm_stamped" = "0" ] &&
+          [ "$probe_phase" = "idle" ] && [ "$probe_missed_logged" = "0" ]; then
+          probe_missed_logged=1
+          log "FIX 30: probe window missed (past 13:30 IST) — marker stays armed for a manual Run click"
+          tg "⚠️ The armed scale-ladder probe was NOT auto-fired today (its 10:00-13:30 window passed — the robot likely started late). It stays armed: double-click Start TickVault to run it manually."
+        fi
+        ;;
+      wait) : ;; # before 10:00 IST — armed marker stays live for a later iteration
+      esac
+    fi
   done
 }
 
@@ -3923,9 +4063,23 @@ cmd_run() {
   # TRADING day has no run stamp, the Mac was likely off/asleep and a whole
   # session's capture was silently lost — tell the operator.
   check_missed_previous_run
-  local day
+  local day pm_armed pm_stamped
   day=$(classify_day "$TODAY" "$(ist_weekday)" "$HOLIDAYS_FILE" "$(scale_window_start)" "$(scale_window_end)")
   log "day classification: $day (scale window $(scale_window_start)..$(scale_window_end))"
+  # FIX 30: an armed once-probe marker OWNS the day's Groww fleet budget.
+  # A day inside the legacy scale window that ALSO has the marker armed
+  # would otherwise run TWO fleet episodes (the morning 2x600 cap-probe /
+  # max-ladder flow AND the 10:00 auto-fired ladder probe) — the exact
+  # "never storm Groww twice in a day" hazard the stamp exists to prevent.
+  # Precedence: the marker wins; the day runs as a NORMAL session and the
+  # monitor loop auto-fires the one-shot probe in its 10:00-13:30 window.
+  if [ "$day" = "scale" ]; then
+    read -r pm_armed pm_stamped _ <<<"$(probe_marker_state "$PROBE_ONCE_MARKER" "$TODAY")"
+    if [ "$pm_armed" = "1" ] && [ "$pm_stamped" = "0" ]; then
+      log "scale day BUT the once-probe marker is armed for today — the marker owns the fleet budget; running a NORMAL morning session (probe auto-fires between 10:00 and 13:30 IST)"
+      day=normal
+    fi
+  fi
   if [ "$day" = "weekend" ] || [ "$day" = "holiday" ]; then
     log "market closed today — quiet no-op"
     exit 0
@@ -4048,7 +4202,9 @@ cmd_run() {
     spawn_feed_status_pings # FIX 19 item 7: one Telegram per feed, every mode
   fi
 
-  monitor_until_eod
+  # FIX 30: auto_probe=1 — the robot's monitor loop auto-fires an armed
+  # once-probe marker inside the 10:00-13:30 IST window (zero human clicks).
+  monitor_until_eod 1
 
   # ── 15:35 IST: graceful end of day (skip app-stop if manual stop won). ──
   # B3: fresh IST date — this check runs AFTER the hours-long monitor loop.
