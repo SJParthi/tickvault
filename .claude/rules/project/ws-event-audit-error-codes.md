@@ -101,6 +101,51 @@ or reconnect behaviour.
 
 ---
 
+## §1.1. 2026-07-05 Update — loud drops + ILP-HTTP ACK + order-update Connected row
+
+The operator caught `ws_event_audit` EMPTY on the Mac on 2026-07-05
+(`select * from ws_event_audit where feed='groww'` = 0 rows) — a silent
+false-OK class incident (audit-findings Rule 11). Two verified silent-loss
+windows were closed, plus one missing lifecycle row:
+
+1. **Producer drop arms are now LOUD.** The three `try_send` drop sites
+   (main-feed `connection.rs::emit_ws_audit`, order-update
+   `emit_order_update_ws_audit`, Groww bridge `emit_groww_ws_audit`) upgraded
+   from `debug!` to `error!(code = AUDIT-WS-01)` + the NEW counter
+   `tv_ws_event_audit_dropped_total{reason="full"|"closed"}` (static labels
+   only; the dropped row's pre-redaction content still never reaches a log).
+   Drops remain non-blocking — the WS loops are never stalled; they are just
+   no longer invisible. Ratchets:
+   `crates/core/tests/ws_audit_loud_drops_guard.rs` +
+   `crates/app/tests/ws_audit_loud_drops_guard.rs` (no `debug!` in any drop
+   arm; counter + code present).
+2. **Transport is ILP-over-HTTP with a per-flush server ACK.**
+   `WsEventAuditWriter::new` now builds `http::addr=host:<http_port>` (was
+   `tcp::addr=host:<ilp_port>`). ILP TCP flush is fire-and-forget — a
+   server-side reject (schema drift, DEDUP violation) NEVER returned `Err`, so
+   the §1 AUDIT-WS-01 flush arm never paged while the table stayed empty. HTTP
+   flush ACKs every request; rejects now surface as `Err` → the existing
+   AUDIT-WS-01 arm pages. Cold path (a handful of rows/day) — HTTP latency is
+   irrelevant. Ratchets: `test_ilp_http_conf_targets_http_port` (storage unit)
+   + the app guard's `test_ws_event_audit_writer_uses_ilp_http` (no
+   `tcp::addr` in the module).
+3. **Order-update WS now stamps its initial `Connected` row.** Previously the
+   order-update connection emitted Disconnected / DisconnectedOffHours /
+   Reconnected / SleepEntered / SleepResumed but NEVER `Connected` — "Order
+   Update WS connected" left no forensic row. `connect_and_listen` now emits
+   `WsEventKind::Connected` (source `n/a`, reason "order-update initial
+   connect / clean-close reconnect") on every successful connect that is NOT a
+   failure-recovery (those keep emitting `Reconnected`). Edge semantics hold:
+   exactly one row per connect episode, never per loop turn.
+4. **Metric semantics note:** `tv_ws_event_audit_rows_total{ws_type,event_kind}`
+   counts CLIENT-SIDE successful append+flush sends in the consumer — with the
+   HTTP ACK it now implies the server accepted the flush, but it remains a
+   client-side counter, not a table row count. The forensic ground truth is
+   the `ws_event_audit` table itself
+   (`mcp__tickvault-logs__questdb_sql "select count(*) from ws_event_audit"`).
+
+---
+
 ## §2. Trigger / auto-load
 
 This rule activates when editing:
