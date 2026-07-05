@@ -14,6 +14,8 @@
 //!   2026-05-30), and the QuestDB Console at
 //!   `localhost:9000` for ad-hoc queries.
 
+pub mod board;
+pub mod board_page;
 pub mod dashboard_page;
 pub mod debug;
 pub mod feeds;
