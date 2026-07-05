@@ -331,6 +331,31 @@ t "settings set: garbage json file untouched" "not json at all" "$(cat "$TMP/set
 t "settings set: garbage mib → rc 1" "1" "$(docker_settings_set_mem "$TMP/settings.json" memoryMiB tenGB >/dev/null 2>&1 && echo 0 || echo 1)"
 t "settings set: missing file → rc 1" "1" "$(docker_settings_set_mem "$TMP/settings-absent.json" memoryMiB 10240 >/dev/null 2>&1 && echo 0 || echo 1)"
 
+# ── FIX 17: Docker memory — clamp-and-proceed, NEVER restart Docker ─────────
+# Read-back helper (idempotence source for the hint)
+t "mem get: reads written value" "10240" "$(docker_settings_mem_get "$TMP/settings-store.json" MemoryMiB)"
+t "mem get: absent key → rc 1" "1" "$(docker_settings_mem_get "$TMP/settings.json" MemoryMiB >/dev/null 2>&1 && echo 0 || echo 1)"
+t "mem get: missing file → rc 1" "1" "$(docker_settings_mem_get "$TMP/settings-absent.json" MemoryMiB >/dev/null 2>&1 && echo 0 || echo 1)"
+t "mem get: bad JSON → rc 1" "1" "$(docker_settings_mem_get "$TMP/settings-bad.json" MemoryMiB >/dev/null 2>&1 && echo 0 || echo 1)"
+# No-loop property: once the hint equals/exceeds the target it is NEVER
+# rewritten — even though Docker Desktop 4.80 ignores the file, a later run
+# sees the recorded value and skips (no re-fire, no restart, no loop).
+t "mem hint: already at target → skip" "skip" "$(docker_mem_hint_decision 10240 10240)"
+t "mem hint: above target → skip" "skip" "$(docker_mem_hint_decision 12288 10240)"
+t "mem hint: below target → write" "write" "$(docker_mem_hint_decision 8192 10240)"
+t "mem hint: no current value → write" "write" "$(docker_mem_hint_decision "" 10240)"
+t "mem hint: garbage current → write" "write" "$(docker_mem_hint_decision abc 10240)"
+t "mem hint: garbage target → skip (fail-quiet)" "skip" "$(docker_mem_hint_decision 8192 "")"
+# Ratchets: the default path is clamp-and-proceed with NO Docker restart
+# reachable — no osascript quit anywhere; 'open -a Docker' only at the
+# ensure-docker start site (Docker not running at all ≠ a mid-run restart);
+# the hint log promises next-start semantics; the clamp remains wired.
+t "FIX 17: no Docker Desktop quit/restart anywhere" "0" "$(grep -c 'quit app' scripts/local-autopilot.sh || true)"
+t "FIX 17: 'open -a Docker' only at the not-running start site" "1" "$(grep -c 'open -a Docker' scripts/local-autopilot.sh || true)"
+t "FIX 17: hint log promises next-start (no mid-run apply claim)" "1" "$(grep -c 'continuing now at current memory' scripts/local-autopilot.sh || true)"
+t "FIX 17: clamp-and-proceed remains the primary path" "1" "$(grep -c 'auto-clamping QDB_MEM_LIMIT' scripts/local-autopilot.sh || true)"
+t "FIX 17: hint call is non-blocking (|| true) in check_docker_vm_memory" "1" "$(sed -n '/^check_docker_vm_memory()/,/^}/p' scripts/local-autopilot.sh | grep -c 'hint_docker_vm_memory .* || true')"
+
 # ── FIX 10 PUSH B: Monday-morning robustness pure helpers ───────────────────
 # B2: bounded boot retry (retry while the 09:10 deadline has not passed)
 t "boot retry: 300s left → retry" "0" "$(boot_retry_should_retry 300 && echo 0 || echo 1)"

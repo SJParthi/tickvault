@@ -489,6 +489,49 @@ except Exception:
 PY
 }
 
+# docker_settings_mem_get <settings-json-file> <key> — FIX 17: print the
+# CURRENT integer value of the memory key (read-only), rc 1 with nothing
+# printed when the file/key is absent or the value is not an integer. Used
+# to make the memory-preference hint idempotent (never rewrite, never loop).
+docker_settings_mem_get() {
+  [ -f "${1:-}" ] || return 1
+  python3 - "$1" "${2:-}" <<'PY'
+import json, sys
+try:
+    with open(sys.argv[1]) as f:
+        d = json.load(f)
+except Exception:
+    sys.exit(1)
+v = d.get(sys.argv[2]) if isinstance(d, dict) else None
+if isinstance(v, bool) or not isinstance(v, int):
+    sys.exit(1)
+print(v)
+PY
+}
+
+# docker_mem_hint_decision <current-mib-or-empty> <target-mib> — FIX 17 pure
+# no-loop guard: "skip" when the settings file ALREADY carries a numeric
+# value >= target (the hint was written on an earlier run — rewriting every
+# launch is what made the FIX-7 raise re-fire forever on Docker Desktop
+# 4.80, which ignores the file edit), else "write". Garbage target → "skip"
+# (fail-quiet: never write on uncertain input). Total: always prints one
+# word, always rc 0 — safe under set -e.
+docker_mem_hint_decision() {
+  local cur="${1:-}" tgt="${2:-}"
+  case "$tgt" in '' | *[!0-9]*)
+    echo skip
+    return 0
+    ;;
+  esac
+  case "$cur" in '' | *[!0-9]*)
+    echo write
+    return 0
+    ;;
+  esac
+  if [ "$cur" -ge "$tgt" ]; then echo skip; else echo write; fi
+  return 0
+}
+
 # ── FIX 10 (PUSH A): probe correctness + launcher safety — pure helpers ────
 
 # tsv_sentinel <raw wc -l output> → a clean integer line count (macOS wc
@@ -1478,17 +1521,33 @@ check_missed_previous_run() {
 }
 
 # ── FIX 7: auto-raise Docker Desktop VM memory (macOS, once per run) ───────
-# auto_raise_docker_vm_memory <vm_bytes> <limit_bytes> — rc 0 when the raise
-# succeeded AND the restarted Docker VM covers the QuestDB pin; rc 1 on any
-# other outcome (caller falls back to the FIX-5 clamp + manual advice).
-# Never bricks Docker: settings file is backed up first and restored on ANY
-# failure (missing file, bad JSON, restart timeout). Skipped on Linux/CI.
-DOCKER_VM_RAISE_ATTEMPTED=0
-auto_raise_docker_vm_memory() {
+# hint_docker_vm_memory <vm_bytes> <limit_bytes> — FIX 17. Replaces the
+# FIX-7/14 auto-raise, which QUIT + RELAUNCHED Docker Desktop mid-run:
+# proven live 2026-07-05, that (a) killed the QuestDB container the launcher
+# had just started and hung the whole run waiting for a fresh Docker
+# Desktop, and (b) on Docker Desktop 4.80 the settings-store.json MemoryMiB
+# edit was IGNORED anyway (Settings → Resources still showed 8 GB after the
+# restart), so every subsequent launch saw VM < target and re-fired the
+# raise + restart — an infinite restart loop. Investigated lever: the
+# Docker Desktop 4.x `docker desktop` admin CLI carries only
+# start/stop/restart/status/update/module subcommands — there is NO
+# memory/resource setter, so NO reliable non-restarting programmatic path
+# exists. The HONEST behavior is therefore:
+#   PRIMARY  — the caller clamps QDB_MEM_LIMIT to (VM − 1 GB) and PROCEEDS
+#              (QuestDB is healthy at 4g per aws-budget; 8 GB Docker works).
+#   OPTIONAL — the operator may raise the slider ONCE in Docker Desktop →
+#              Settings → Resources → Memory (clearly optional).
+#   HINT     — this function writes the preferred value into the settings
+#              file at most ONCE as a best-effort hint for the next natural
+#              Docker start. It NEVER quits/launches/restarts Docker, NEVER
+#              waits on the daemon, NEVER blocks the run, and NEVER claims
+#              the raise worked. Idempotent via docker_mem_hint_decision
+#              (skip when the file already carries >= target — no rewrite
+#              loop even though 4.80 ignores the file).
+# Always returns 1 so the caller ALWAYS takes the clamp-and-proceed path.
+hint_docker_vm_memory() {
   [ "$(uname -s)" = "Darwin" ] || return 1
   [ -z "${CI:-}" ] || return 1
-  [ "$DOCKER_VM_RAISE_ATTEMPTED" = "0" ] || return 1
-  DOCKER_VM_RAISE_ATTEMPTED=1
   local vm_mib=$(($1 / 1048576))
   # Required = QuestDB pin + 2 GB headroom (Docker itself + the app's containers).
   local required_mib=$(($2 / 1048576 + 2048))
@@ -1496,103 +1555,41 @@ auto_raise_docker_vm_memory() {
   case "$pref" in '' | *[!0-9]*) pref=10240 ;; esac
   local host_bytes host_mib
   host_bytes=$(sysctl -n hw.memsize 2>/dev/null || true)
-  case "$host_bytes" in '' | *[!0-9]*)
-    log "host RAM probe unavailable — skipping Docker VM auto-raise"
-    return 1
-    ;;
-  esac
+  case "$host_bytes" in '' | *[!0-9]*) return 1 ;; esac
   host_mib=$((host_bytes / 1048576))
   local target
   if ! target=$(docker_vm_raise_target "$vm_mib" "$required_mib" "$pref" "$host_mib"); then
     return 1
   fi
-  case "$target" in
-  ok) return 0 ;;
-  host_small)
-    log "Docker VM auto-raise skipped — this Mac's RAM (${host_mib} MiB) is too small to give Docker ${required_mib} MiB"
-    return 1
-    ;;
-  esac
-  # Locate the settings file + its memory key (Docker Desktop ≥ 4.30 first,
-  # then the legacy file). FIX 14: each failure mode gets its own
-  # plain-English log line, and a valid file with no memory key gets the
-  # key INSERTED instead of being rejected.
+  case "$target" in ok | host_small) return 1 ;; esac
+  # Locate the settings file + its memory key (Docker Desktop ≥ 4.30 store
+  # first, then the legacy file). FIX 14 insert path (rc 10) kept.
   local gc="$HOME/Library/Group Containers/group.com.docker"
-  local file="" key="" cand rc unusable=0
+  local file="" key="" cand rc
   for cand in "$gc/settings-store.json" "$gc/settings.json"; do
     # errexit-safe capture: the || arm keeps a nonzero rc from aborting.
     key=$(docker_settings_mem_key "$cand") && rc=0 || rc=$?
     case "$rc" in
-    0)
+    0 | 10)
       file="$cand"
       break
       ;;
-    10)
-      file="$cand"
-      log "Docker settings '$(basename "$cand")' has no memory size entry yet — inserting a new ${key} entry"
-      break
-      ;;
-    2)
-      : # this candidate file does not exist — try the next one
-      ;;
-    3)
-      unusable=1
-      log "Docker settings '$(basename "$cand")' is not readable as JSON — skipping it"
-      ;;
-    *)
-      unusable=1
-      log "python3 could not inspect Docker settings '$(basename "$cand")' — skipping it"
-      ;;
+    *) : ;; # absent / bad JSON / python3 failure — try the next candidate
     esac
   done
-  if [ -z "$file" ]; then
-    if [ "$unusable" = "1" ]; then
-      log "no usable Docker Desktop settings file under '$gc' — cannot auto-raise VM memory"
-    else
-      log "Docker Desktop settings file not found under '$gc' — cannot auto-raise VM memory"
-    fi
+  [ -n "$file" ] || return 1
+  local current decision
+  current=$(docker_settings_mem_get "$file" "$key" 2>/dev/null || true)
+  decision=$(docker_mem_hint_decision "$current" "$target")
+  if [ "$decision" = "skip" ]; then
+    log "Docker memory preference already recorded (${current:-n/a} MiB in $(basename "$file")) — not rewriting; it applies whenever Docker Desktop is next restarted"
     return 1
   fi
-  local bak="${file}.tickvault-bak"
-  cp "$file" "$bak" 2>/dev/null || return 1
-  if ! docker_settings_set_mem "$file" "$key" "$target"; then
-    cp "$bak" "$file" 2>/dev/null || true
-    log "Docker settings edit failed — backup restored; falling back to the memory clamp"
-    return 1
+  if docker_settings_set_mem "$file" "$key" "$target"; then
+    log "wrote Docker memory preference ($((target / 1024)) GB) — it applies the next time you start Docker; continuing now at current memory (${vm_mib} MiB)"
+  else
+    log "could not write the Docker memory preference file — continuing at current memory (${vm_mib} MiB)"
   fi
-  log "raising Docker Desktop memory ${vm_mib} MiB → ${target} MiB ($(basename "$file") key ${key}) — restarting Docker Desktop now"
-  osascript -e 'quit app "Docker"' >/dev/null 2>&1 || true
-  local i
-  for i in $(seq 1 10); do # wait for the daemon to go down (~30s max)
-    docker info >/dev/null 2>&1 || break
-    sleep 3
-  done
-  open -a Docker 2>/dev/null || true
-  local ready=0
-  for i in $(seq 1 40); do # wait for the daemon to come back (~120s max)
-    if docker info >/dev/null 2>&1; then
-      ready=1
-      break
-    fi
-    sleep 3
-  done
-  if [ "$ready" != "1" ]; then
-    cp "$bak" "$file" 2>/dev/null || true
-    open -a Docker 2>/dev/null || true
-    log "Docker did not come back within ~120s after the memory raise — old setting restored; falling back to the memory clamp"
-    tg "⚠️ Tried to raise Docker's memory automatically but Docker did not restart in time. The old setting was put back and the database will run with a smaller memory budget this run."
-    return 1
-  fi
-  local new_vm
-  new_vm=$(docker info --format '{{.MemTotal}}' 2>/dev/null || true)
-  case "$new_vm" in '' | *[!0-9]*) return 1 ;; esac
-  local new_mib=$((new_vm / 1048576))
-  if [ "$new_vm" -ge "$2" ]; then
-    log "Docker VM memory raised: ${vm_mib} MiB → ${new_mib} MiB (target ${target} MiB) — database keeps its full ${QDB_MEM_LIMIT} budget"
-    tg "✅ Docker's memory was raised automatically (${vm_mib} → ${new_mib} MiB) so the database gets its full budget. No action needed."
-    return 0
-  fi
-  log "Docker restarted but its VM still has ${new_mib} MiB (< required) — falling back to the memory clamp"
   return 1
 }
 
@@ -1615,22 +1612,22 @@ check_docker_vm_memory() {
   if ! docker_vm_mem_sufficient "$vm_bytes" "$limit_bytes"; then
     local vm_gb=$((vm_bytes / 1024 / 1024 / 1024))
     log "Docker VM memory ${vm_bytes} bytes < QDB_MEM_LIMIT ${QDB_MEM_LIMIT}"
-    # FIX 7: first try to RAISE Docker Desktop's VM memory automatically
-    # (macOS only, once per run, backup + restore on any failure). Success
-    # means the database keeps its full pinned budget — no clamp needed.
-    if auto_raise_docker_vm_memory "$vm_bytes" "$limit_bytes"; then
-      log "docker VM memory sufficient after auto-raise — keeping QDB_MEM_LIMIT ${QDB_MEM_LIMIT}"
-      return 0
-    fi
+    # FIX 17: NEVER restart Docker mid-run (the FIX-7 auto-raise quit +
+    # relaunched Docker Desktop — killing the just-started database
+    # container, hanging the launch, and re-firing every run because
+    # Docker Desktop 4.80 ignored the settings-file edit). The clamp below
+    # is the PRIMARY path; the hint write is best-effort, at-most-once,
+    # and never blocks or restarts anything.
+    hint_docker_vm_memory "$vm_bytes" "$limit_bytes" || true
     # FIX 5.4: do NOT launch a database container doomed to be killed for
     # memory — clamp the limit for THIS RUN to (VM memory − 1 GB, min 1g).
     local clamped
     if clamped=$(clamp_qdb_mem_g "$vm_bytes"); then
       log "auto-clamping QDB_MEM_LIMIT ${QDB_MEM_LIMIT} → ${clamped} for this run"
-      tg "⚠️ Docker Desktop only has ${vm_gb} GB memory but the database wants ${QDB_MEM_LIMIT}. Using ${clamped} for this run so the database cannot crash from memory. For full speed: open Docker Desktop → Settings → Resources → Memory, raise it to 10 GB, click Apply & Restart, then double-click Start TickVault."
+      tg "ℹ️ Docker Desktop has ${vm_gb} GB memory, so the database will use ${clamped} this run — this works fine. Optional (one time, only if you want the full ${QDB_MEM_LIMIT}): open Docker Desktop → Settings → Resources → Memory, raise it to 10 GB, click Apply & Restart."
       export QDB_MEM_LIMIT="$clamped"
     else
-      tg "⚠️ Docker Desktop only has ${vm_gb} GB memory but the database needs ${QDB_MEM_LIMIT}. Open Docker Desktop → Settings → Resources → Memory and raise it to 10 GB, then restart. Running anyway — but the database may crash under load until this is fixed."
+      tg "⚠️ Docker Desktop only has ${vm_gb} GB memory and the database's ${QDB_MEM_LIMIT} budget could not be adjusted automatically. Running anyway. Optional fix: open Docker Desktop → Settings → Resources → Memory and raise it to 10 GB, then Apply & Restart."
     fi
   else
     log "docker VM memory OK (${vm_bytes} bytes >= QDB_MEM_LIMIT ${QDB_MEM_LIMIT})"
