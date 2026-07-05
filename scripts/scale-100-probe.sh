@@ -67,6 +67,12 @@ TSV="data/groww-scale/summary-$(TZ=Asia/Kolkata date +%F).tsv"
 # FALSE "Reached 100"). Only rows appended after this line count exist.
 # shellcheck source=scripts/local-autopilot.sh
 AUTOPILOT_LIB=1 source scripts/local-autopilot.sh
+# FIX 16 (F16): this wrapper is a documented DIRECT entry point — raise the
+# open-files limit here too (the two-button paths raise it in cmd_start/
+# cmd_run, but a direct `bash scripts/scale-100-probe.sh` ran the 100-conn
+# fleet at the macOS default 256 fds and EMFILEd at rungs 80-100, recording
+# a FALSE "capped at N" verdict as the probe answer).
+raise_fd_limit || true
 TSV_SENTINEL=$(tsv_sentinel "$(wc -l <"$TSV" 2>/dev/null || echo 0)")
 
 probe_new_rows() { # rows appended AFTER this probe started (may be empty)
@@ -91,19 +97,49 @@ verdict_from_tsv() {
   scale_probe_verdict "$hit" "$max" "$TARGET_CONNS" "$proof"
 }
 
+# FIX 16 (F6/F7/F8): cleanup now (a) STOPS the ladder app on EVERY exit
+# path — a TERM delivered to this wrapper pid alone used to leave the
+# 100-conn Dhan-OFF fleet running (the pkill lived only inside the
+# auto-stop watcher), where the next "normal" start could silently ADOPT
+# it as the day's session; and (b) exits with DISTINCT codes so the
+# launcher can act honestly:
+#   130/143 — interrupted by INT/TERM: Groww connections may already have
+#             been opened, so the one-shot attempt must STAY burned;
+#   20      — never launched (zero new evidence rows, no signal): safe for
+#             the launcher to un-burn the attempt and page;
+#   rc      — natural completion with evidence rows (0 on success).
 cleanup() {
-  local rc=$?
+  local rc=$? sig="${1:-}"
   trap - EXIT INT TERM
   echo
   echo "── probe finished — cleaning up ─────────────────────────────────────"
+  if pgrep -f 'target/release/tickvault' >/dev/null 2>&1; then
+    echo "stopping the probe app (it must never outlive this wrapper)..."
+    pkill -TERM -f 'target/release/tickvault' 2>/dev/null || true
+    for _ in $(seq 1 15); do
+      pgrep -f 'target/release/tickvault' >/dev/null 2>&1 || break
+      sleep 2
+    done
+    pkill -KILL -f 'target/release/tickvault' 2>/dev/null || true
+  fi
   bash scripts/groww-scale-test.sh clean || true
   echo "Config overlay removed — the next 'Run tickvault' click is normal again."
   echo
   echo "VERDICT: $(verdict_from_tsv)"
   echo "Evidence (one row per ladder stage): ${TSV}"
+  local new_rows
+  new_rows=$(probe_new_rows | grep -c . || true)
+  if [ -n "$sig" ]; then
+    exit "$sig"
+  fi
+  if [ "${new_rows:-0}" = "0" ]; then
+    exit 20
+  fi
   exit "$rc"
 }
-trap cleanup EXIT INT TERM
+trap 'cleanup 130' INT
+trap 'cleanup 143' TERM
+trap cleanup EXIT
 
 echo "============================================================"
 echo " GROWW 100-CONNECTION PROBE (SMOKE — Saturday, no ticks)"

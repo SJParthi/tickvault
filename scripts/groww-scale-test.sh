@@ -212,6 +212,30 @@ bash scripts/questdb-init.sh || true
 # ── 3. Run the app. The in-app preflight prints the check results and the
 #      PROD-IS-UNTOUCHED banner; on any FAIL the fleet does NOT spawn (the
 #      single-connection Groww path runs instead — capture continues).
+# FIX 16 (F16): raise the open-files soft limit toward the hard limit before
+# the exec — `make scale-100-probe` / a direct run of this script otherwise
+# launches the 100-connection fleet at the macOS Terminal default 256 fds
+# (2 pipe fds per sidecar + ~60-100 baseline ≈ 300+ at rung 100) and EMFILEs
+# at the top rungs, recording a FALSE capacity verdict. rlimits inherit
+# through exec, so raising here covers the app. Best-effort, never gates.
+fd_hard=$(ulimit -Hn 2>/dev/null || echo "")
+fd_soft=$(ulimit -Sn 2>/dev/null || echo "")
+fd_want="${FD_LIMIT_DESIRED:-4096}"
+if [ "$fd_soft" != "unlimited" ]; then
+  case "$fd_hard" in
+  unlimited) fd_target="$fd_want" ;;
+  '' | *[!0-9]*) fd_target="" ;;
+  *) if [ "$fd_want" -gt "$fd_hard" ]; then fd_target="$fd_hard"; else fd_target="$fd_want"; fi ;;
+  esac
+  case "$fd_soft" in '' | *[!0-9]*) fd_soft=0 ;; esac
+  if [ -n "$fd_target" ] && [ "$fd_soft" -lt "$fd_target" ]; then
+    if ulimit -n "$fd_target" 2>/dev/null; then
+      echo "raised open-files limit ${fd_soft} -> ${fd_target} (the 100-connection fleet needs more than the macOS default 256)"
+    else
+      echo "WARNING: could not raise the open-files limit (soft=${fd_soft}, wanted ${fd_target}) — a big fleet may hit 'too many open files'"
+    fi
+  fi
+fi
 echo "launching tickvault (scale mode=${MODE})..."
 echo "watch:  GET http://127.0.0.1:3001/api/feeds/health  -> groww_scale.connections[]"
 echo "stop:   Ctrl-C, then 'make scale-test-clean' to remove the overlay"

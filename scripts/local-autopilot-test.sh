@@ -84,7 +84,10 @@ t "manual stop beats dead app (no fight)" "manual_standdown" "$(monitor_decision
 t "manual stop beats alive app too"       "manual_standdown" "$(monitor_decision 1 1 0)"
 t "dead app, first death → relaunch"      "relaunch"         "$(monitor_decision 0 0 0)"
 t "dead app, second death → alert"        "alert"            "$(monitor_decision 0 0 1)"
-t "dead app, already alerted → alert"     "alert"            "$(monitor_decision 0 0 2)"
+# FIX 16 (F4): after the one alert the loop goes QUIET — the old behavior
+# ("alert" forever) paged every 60s until 15:35 on a double-crash.
+t "dead app, already alerted → quiet"     "idle_alerted"     "$(monitor_decision 0 0 2)"
+t "dead app, long-alerted → still quiet"  "idle_alerted"     "$(monitor_decision 0 0 7)"
 
 # ── scale-window boundary logic ─────────────────────────────────────────────
 t "in_scale_window inside"  "0" "$(in_scale_window 2026-07-07 2026-07-06 2026-07-08 && echo 0 || echo 1)"
@@ -441,11 +444,57 @@ build_ln=$(grep -n 'cargo build --release' scripts/local-autopilot.sh | head -1 
 launch_ln=$(grep -n 'nohup \./target/release/tickvault' scripts/local-autopilot.sh | head -1 | cut -d: -f1)
 stop_between=$(awk -v a="$build_ln" -v b="$launch_ln" 'NR>a && NR<b && /manual_stop_active/ {found=1} END {print found+0}' scripts/local-autopilot.sh)
 t "stop-mid-build: marker re-check between build and launch (FIX 15.3)" "1" "$stop_between"
-# 15.5: the IntelliJ dev path carries the self-update (fetch + ff-only)
+# 15.5: the IntelliJ dev path carries the self-update (fetch + ff-only,
+# retried once per FIX 16 F3)
 t "cmd_dev: self-update fetch present (FIX 15.5)" "1" "$(sed -n '/^cmd_dev()/,/^}/p' scripts/local-autopilot.sh | grep -c 'git fetch origin local-runtime')"
-t "cmd_dev: ff-only merge present (FIX 15.5)" "1" "$(sed -n '/^cmd_dev()/,/^}/p' scripts/local-autopilot.sh | grep -c 'git merge --ff-only origin/local-runtime')"
+t "cmd_dev: ff-only merge present (FIX 15.5/16.3)" "1" "$(sed -n '/^cmd_dev()/,/^}/p' scripts/local-autopilot.sh | grep -c 'git_ff_merge_with_retry origin/local-runtime')"
 # 15.7: the Telegram send curl is time-bounded
 t "notify-telegram: curl has --max-time (FIX 15.7)" "1" "$(grep -c 'curl -s --max-time 10 --connect-timeout 5' scripts/notify-telegram.sh)"
+
+# ── FIX 16: delta-audit confirmed defects (shell batch F1-F12, F16, F17) ────
+# F9 (CRITICAL): a dead tv-questdb must never abort the monitor loop via
+# set -e + pipefail — the probe is total (rc 0, empty output on failure).
+t "F9: VM-disk probe never aborts under set -euo pipefail" "survived" "$( (set -euo pipefail; v=$(docker_vm_disk_pct); echo survived) 2>/dev/null || echo died)"
+t "F9: probe body carries the || true guard" "1" "$(sed -n '/^docker_vm_disk_pct()/,/^}/p' scripts/local-autopilot.sh | grep -c '|| true')"
+# F2: the start_app lock-skip path returns a DISTINCT rc (never a false 0)
+t "F2: start_app lock-skip returns rc 3" "1" "$(sed -n '/^start_app()/,/^}/p' scripts/local-autopilot.sh | grep -c 'return 3')"
+t "F2: peer-tolerant wrapper exists" "0" "$(grep -q '^start_app_tolerate_peer()' scripts/local-autopilot.sh && echo 0 || echo 1)"
+t "F2: cmd_start words the peer case honestly" "0" "$(grep -q 'Another launcher is already starting the app' scripts/local-autopilot.sh && echo 0 || echo 1)"
+t "F2: robot day flow uses the peer-tolerant wrapper" "7" "$(grep -c 'start_app_tolerate_peer "' scripts/local-autopilot.sh || true)"
+# F1: BOTH git writers serialize (acquire-or-skip) against a lock-held build
+t "F1: both git writers take the launcher lock (acquire-or-skip)" "2" "$(grep -c 'launcher_lock_acquire_wait 5' scripts/local-autopilot.sh || true)"
+t "F1: cmd_dev releases the lock BEFORE the re-exec" "1" "$(sed -n '/^cmd_dev()/,/^}/p' scripts/local-autopilot.sh | grep -c 'launcher_lock_release # MUST release before exec')"
+# F3: transient index.lock loser gets one retry in both writers
+t "F3: merge-with-retry used by both writers" "2" "$(grep -c 'git_ff_merge_with_retry origin/local-runtime' scripts/local-autopilot.sh || true)"
+# F5: caffeinate survives an IDE group-kill (own process group) + monitor re-arm
+t "F5: caffeinate launched in its own process group" "1" "$(sed -n '/^start_caffeinate()/,/^}/p' scripts/local-autopilot.sh | grep -c 'set -m')"
+t "F5: monitor loop re-arms caffeinate" "1" "$(sed -n '/^monitor_until_eod()/,/^}/p' scripts/local-autopilot.sh | grep -c 'start_caffeinate')"
+# F10/F11: ensure_questdb alerts + restart budget are per-EPISODE latched
+t "F10: docker restart budget is one per outage episode" "0" "$(grep -q 'QDB_EPISODE_RESTARTED=1' scripts/local-autopilot.sh && echo 0 || echo 1)"
+t "F10: give-up page latched per episode" "0" "$(grep -q 'QDB_EPISODE_PAGED=1' scripts/local-autopilot.sh && echo 0 || echo 1)"
+t "F11: foreign-responder page latched per episode" "0" "$(grep -q 'QDB_FOREIGN_PAGED=1' scripts/local-autopilot.sh && echo 0 || echo 1)"
+t "F10/F11: latches re-arm on recovery" "0" "$(sed -n '/^ensure_questdb()/,/^}/p' scripts/local-autopilot.sh | grep -q 'QDB_FOREIGN_PAGED=0' && echo 0 || echo 1)"
+# F12: the mid-session liveness probe is debounced (2 consecutive samples)
+t "F12: qdb probe debounced before heal/page" "0" "$(sed -n '/^monitor_until_eod()/,/^}/p' scripts/local-autopilot.sh | grep -q 'qdb_fail_streak < 2' && echo 0 || echo 1)"
+# F6/F7: wrapper exit-code contract classifier (pure)
+t "F6/F7: rc 0 → complete" "complete" "$(probe_rc_class 0)"
+t "F6/F7: rc 130 (Ctrl-C) → interrupted (stays burned)" "interrupted" "$(probe_rc_class 130)"
+t "F6/F7: rc 143 (TERM) → interrupted (stays burned)" "interrupted" "$(probe_rc_class 143)"
+t "F6/F7: rc 20 → never_launched (safe to un-burn)" "never_launched" "$(probe_rc_class 20)"
+t "F6/F7: rc 2 → other (evidence decides)" "other" "$(probe_rc_class 2)"
+t "F6/F7: garbage rc → other (fail-safe)" "other" "$(probe_rc_class "")"
+# F6/F7/F8: the wrapper carries the signal traps, the rc-20 arm, and the
+# kill-fleet-on-exit sweep (a TERM'd wrapper must never leave the Dhan-OFF
+# 100-conn ladder running for the next start to adopt).
+t "F7: wrapper traps INT distinctly" "1" "$(grep -c "trap 'cleanup 130' INT" scripts/scale-100-probe.sh || true)"
+t "F7: wrapper traps TERM distinctly" "1" "$(grep -c "trap 'cleanup 143' TERM" scripts/scale-100-probe.sh || true)"
+t "F6: wrapper exits 20 on zero evidence rows" "1" "$(grep -c 'exit 20' scripts/scale-100-probe.sh || true)"
+t "F8: wrapper cleanup stops the ladder app" "0" "$(sed -n '/^cleanup()/,/^}/p' scripts/scale-100-probe.sh | grep -q 'pkill -TERM -f' && echo 0 || echo 1)"
+# F16: the direct probe entries raise the open-files limit
+t "F16: probe wrapper raises the fd limit" "1" "$(grep -c '^raise_fd_limit' scripts/scale-100-probe.sh || true)"
+t "F16: groww-scale-test raises the fd limit before exec" "0" "$(grep -q 'ulimit -n "\$fd_target"' scripts/groww-scale-test.sh && echo 0 || echo 1)"
+# F17: the clamped-below-need path logs (no silent third outcome)
+t "F17: clamped hard-limit path logs a warning" "0" "$(sed -n '/^raise_fd_limit()/,/^}/p' scripts/local-autopilot.sh | grep -q 'cannot raise further' && echo 0 || echo 1)"
 
 echo
 echo "local-autopilot pure-logic tests: $PASS passed, $FAIL failed"

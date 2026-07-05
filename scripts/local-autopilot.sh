@@ -195,8 +195,13 @@ manual_stop_active() {
 }
 
 # monitor_decision <app_alive 0/1> <manual_stop 0/1> <relaunches so far>
-# → idle | manual_standdown | relaunch | alert   (the monitor-loop brain).
-# Manual ALWAYS wins: a manual stop is never fought with a relaunch.
+# → idle | manual_standdown | relaunch | alert | idle_alerted
+# (the monitor-loop brain). Manual ALWAYS wins: a manual stop is never
+# fought with a relaunch. FIX 16 (F4): after the ONE relaunch and the ONE
+# alert, the state is idle_alerted — the loop stays quiet instead of
+# paging every 60s until 15:35 (edge-triggered alerts only, audit Rule 4;
+# the old "# alert once, then idle" comment claimed a latch that never
+# existed — a double-crash produced ~300+ identical pages).
 monitor_decision() {
   local alive="$1" manual="$2" relaunches="$3"
   if [ "$manual" = "1" ]; then
@@ -207,7 +212,13 @@ monitor_decision() {
     echo idle
     return 0
   fi
-  if ((relaunches < 1)); then echo relaunch; else echo alert; fi
+  if ((relaunches < 1)); then
+    echo relaunch
+  elif ((relaunches < 2)); then
+    echo alert
+  else
+    echo idle_alerted
+  fi
 }
 
 # disk_low <avail_gb> <min_gb> → 0 when free space is below the floor (pure).
@@ -695,7 +706,17 @@ raise_fd_limit() {
     return 0
   fi
   case "$soft" in '' | *[!0-9]*) soft=0 ;; esac
-  if ((soft >= target)); then return 0; fi
+  if ((soft >= target)); then
+    # FIX 16 (F17): honour the "plain log either way" contract on the
+    # third outcome — the hard limit is pre-lowered (managed/MDM Mac) so
+    # the raise is impossible AND the fleet budget is short. Without this
+    # line the first symptom is EMFILE at rungs 80-100, indistinguishable
+    # from a genuine Groww-side cap in the recorded verdict.
+    if ((target < FD_LIMIT_DESIRED)); then
+      log "open-files hard limit is only ${hard:-?} (< ${FD_LIMIT_DESIRED} wanted) — cannot raise further; a big fleet may hit 'too many open files'"
+    fi
+    return 0
+  fi
   if ulimit -n "$target" 2>/dev/null; then
     log "raised open-files limit ${soft} → ${target} (the 100-connection fleet needs more than the macOS default 256)"
   else
@@ -712,6 +733,21 @@ probe_launch_failed() {
   case "${1:-}" in '' | *[!0-9]*) return 1 ;; esac
   case "${2:-}" in '' | *[!0-9]*) return 1 ;; esac
   (("$2" <= "$1"))
+}
+
+# probe_rc_class <wrapper-rc> → complete | interrupted | never_launched |
+# other. FIX 16 (F6/F7): the scale-100-probe wrapper's exit-code contract —
+# 130/143 = INT/TERM mid-run (Groww connections may already have been
+# opened → the one-shot attempt MUST stay burned); 20 = zero evidence rows
+# with no signal (never launched → safe to un-burn); 0 = natural
+# completion; anything else = partial/unknown (evidence decides).
+probe_rc_class() {
+  case "${1:-}" in
+  0) echo complete ;;
+  130 | 143) echo interrupted ;;
+  20) echo never_launched ;;
+  *) echo other ;;
+  esac
 }
 
 # tg_latch_expired <now_epoch> <disabled_at_epoch> <retry_secs> → 0 when the
@@ -734,9 +770,14 @@ vm_disk_high() {
 
 # docker_vm_disk_pct → integer use% of the Docker VM's own filesystem, read
 # THROUGH the database container (its / IS the VM overlay fs — the host df
-# cannot see it). Empty on any failure.
+# cannot see it). Empty on any failure — GUARANTEED rc 0 (FIX 16 F9): under
+# `set -euo pipefail` a dead tv-questdb made `docker exec` fail, pipefail
+# carried rc 1 through the pipeline into `vm_pct=$(docker_vm_disk_pct)`,
+# and errexit killed the WHOLE monitor loop silently — no relaunch, no
+# questdb heal, no EOD stop — at the next 30-min disk recheck. The exact
+# dead-container scenario the heal exists for must never abort the probe.
 docker_vm_disk_pct() {
-  docker exec tv-questdb df -Pk / 2>/dev/null | awk 'NR==2 {gsub(/%/, "", $5); print $5}'
+  docker exec tv-questdb df -Pk / 2>/dev/null | awk 'NR==2 {gsub(/%/, "", $5); print $5}' || true
 }
 
 # dhan_enabled_from_files <file...> → the effective dhan_enabled value:
@@ -1126,6 +1167,18 @@ questdb_container_state() {
   docker inspect --format '{{.State.Status}} {{if .State.Health}}{{.State.Health.Status}}{{end}}' tv-questdb 2>/dev/null || true
 }
 
+# FIX 16 (F10/F11): per-OUTAGE-EPISODE latches. The monitor loop re-invokes
+# ensure_questdb every 60s while the database is unhealthy; before this fix
+# every invocation re-initialised its restart budget (a fresh `docker
+# restart` per cycle, unbounded during a crash loop) and re-sent its own
+# unlatched ⚠️/🆘 Telegrams (~one page per 1-3 minutes for the rest of the
+# session — the qdb_warned latch covered only the LOOP's message, not
+# these). One episode = one restart + one page per message class; all
+# latches re-arm when the database answers again (next episode pages anew).
+QDB_EPISODE_RESTARTED=0
+QDB_EPISODE_PAGED=0
+QDB_FOREIGN_PAGED=0
+
 ensure_questdb() {
   export_compose_creds # FIX 5.3 — compose interpolates TV_QUESTDB_PG_* env
   # B6: a compose failure must not be swallowed — log it loudly and keep
@@ -1139,9 +1192,10 @@ ensure_questdb() {
   fi
   # Self-heal (2026-07-04): a degraded container (unhealthy/exited/dead/
   # paused — e.g. after a hard Mac sleep or an out-of-memory kill) gets ONE
-  # automatic `docker restart` if the database has not answered after ~30s.
-  # Zero operator action — Stop→Start (or just Start) recovers it.
-  local i restarted=0 state verdict
+  # automatic `docker restart` PER OUTAGE EPISODE if the database has not
+  # answered after ~30s. Zero operator action — Stop→Start (or just Start)
+  # recovers it.
+  local i state verdict
   for i in $(seq 1 24); do
     if curl -sf -m 5 -G "$QUESTDB_HTTP/exec" --data-urlencode "query=select 1" >/dev/null 2>&1; then
       # B6: verify the responder IS our tv-questdb container — any local
@@ -1150,25 +1204,42 @@ ensure_questdb() {
       verdict="$(questdb_owner_verdict "$(questdb_container_state)")"
       if [ "$verdict" != "ok" ]; then
         log "port answers but the tv-questdb container is '$verdict' — a foreign program is on the database port"
-        tg "🆘 Something else is answering on the database port and it is NOT our database container. Quit that other program (check Docker Desktop / anything using port 9000), then double-click Start TickVault."
+        # F11: this condition is unrecoverable in-loop (compose can never
+        # bind the taken port) — page ONCE per episode, then log-only.
+        if [ "$QDB_FOREIGN_PAGED" = "0" ]; then
+          QDB_FOREIGN_PAGED=1
+          tg "🆘 Something else is answering on the database port and it is NOT our database container. Quit that other program (check Docker Desktop / anything using port 9000), then double-click Start TickVault."
+        fi
         return 1
       fi
       log "QuestDB HTTP ready (tv-questdb container confirmed running)"
+      QDB_EPISODE_RESTARTED=0 # healthy again — re-arm the episode latches
+      QDB_EPISODE_PAGED=0
+      QDB_FOREIGN_PAGED=0
       return 0
     fi
     state="$(questdb_container_state)"
-    if ((restarted == 0 && i >= 6)) && questdb_state_degraded "$state"; then
-      log "QuestDB container degraded ('$state') — one automatic docker restart"
-      tg "⚠️ The database container was stuck — restarting it automatically. No action needed."
-      docker restart tv-questdb >>"$(current_log)" 2>&1 || true
-      restarted=1
+    if ((i >= 6)) && questdb_state_degraded "$state"; then
+      if [ "$QDB_EPISODE_RESTARTED" = "0" ]; then
+        QDB_EPISODE_RESTARTED=1
+        log "QuestDB container degraded ('$state') — one automatic docker restart"
+        tg "⚠️ The database container was stuck — restarting it automatically. No action needed."
+        docker restart tv-questdb >>"$(current_log)" 2>&1 || true
+      elif ((i == 6)); then
+        log "QuestDB container still degraded ('$state') — the one automatic restart for this outage was already used; waiting"
+      fi
     fi
     sleep 5
   done
-  if ((compose_failed)); then
-    tg "🆘 Docker could not bring the database container up (the compose command itself failed) and the database never answered. Open Docker Desktop, make sure it is running, then double-click Start TickVault."
+  if [ "$QDB_EPISODE_PAGED" = "0" ]; then
+    QDB_EPISODE_PAGED=1
+    if ((compose_failed)); then
+      tg "🆘 Docker could not bring the database container up (the compose command itself failed) and the database never answered. Open Docker Desktop, make sure it is running, then double-click Start TickVault."
+    else
+      tg "🆘 The database did not answer within 2 minutes. It will keep being retried automatically every minute; if this started mid-session, no clicks are needed unless the next message says so. If it happened at startup: double-click Stop TickVault, wait 10 seconds, then double-click Start TickVault."
+    fi
   else
-    tg "🆘 The database did not start within 2 minutes. Double-click Stop TickVault, wait 10 seconds, then double-click Start TickVault. If it still fails, restart the Mac and double-click Start TickVault again."
+    log "database still not answering after a full heal attempt — already paged this outage; retrying on the next monitor cycle"
   fi
   return 1
 }
@@ -1191,8 +1262,18 @@ start_caffeinate() {
   local secs
   secs=$(secs_until "$CAFFEINATE_UNTIL_IST" "$(ist_hms)")
   if ((secs > 0)); then
-    caffeinate -dims -t "$secs" &
-    echo $! >"$CAFF_PIDFILE"
+    # FIX 16 (F5): own process group (mirror of the FIX 15.4 app launch).
+    # A plain `caffeinate &` lived in the launcher shell's process group;
+    # cmd_dev then `exec tail -f`s in that SAME group, so the IDE Stop
+    # button (group signal) killed caffeinate with the tail while the app
+    # survived — the Mac silently lost sleep protection for the day, and
+    # the 08:55 robot even skipped re-arming while the doomed dev
+    # caffeinate still held the pidfile. The own-group launch detaches it.
+    (
+      set -m
+      nohup caffeinate -dims -t "$secs" >/dev/null 2>&1 &
+      echo $! >"$CAFF_PIDFILE"
+    )
     log "caffeinate armed for ${secs}s (Mac stays awake until $CAFFEINATE_UNTIL_IST IST; lid must stay OPEN)"
   fi
 }
@@ -1375,13 +1456,32 @@ handle_adopt_verdict() {
 # SKIPS (the other launcher owns the start; adopt-on-next-click covers it).
 start_app() { # $1 = label for the log
   if ! launcher_lock_acquire_wait 60; then
+    # FIX 16 (F2): rc 3 (NOT 0) — this launcher did NOT start anything and
+    # has no idea how the other launcher's start will end. Returning 0 here
+    # let cmd_start fire its unconditional "🚀 Manual start complete — app
+    # running" Telegram with no app running (charter Rule 11 false-OK).
     log "another launcher still owns the start after 60s — skipping this launch to avoid a double-start (the other launcher is handling it)"
-    return 0
+    return 3
   fi
   local _rc=0
   start_app_inner "$@" || _rc=$?
   launcher_lock_release
   return $_rc
+}
+
+# start_app_tolerate_peer <label> — FIX 16 (F2): maps start_app's rc 3
+# (another launcher owns the start — the app launch is in the PEER's hands)
+# to success for flows that only need "a start is underway" (the robot's
+# day flow + the monitor relaunch); every other rc passes through. The
+# manual cmd_start does NOT use this — it must word its Telegram honestly.
+start_app_tolerate_peer() {
+  local rc=0
+  start_app "$@" || rc=$?
+  if [ "$rc" = "3" ]; then
+    log "another launcher is starting the app — proceeding without a second start (the monitor will adopt it once up)"
+    return 0
+  fi
+  return $rc
 }
 
 start_app_inner() { # $1 = label for the log
@@ -1744,23 +1844,57 @@ maybe_run_probe_once() {
   # probe (zero new rows) can be told apart from a partial run.
   rows_before=$(tsv_sentinel "$(wc -l <"data/groww-scale/summary-${today}.tsv" 2>/dev/null || echo 0)")
   export_compose_creds
-  if PROBE_AUTO_STOP_MIN="${PROBE_ONCE_MAX_MIN:-45}" bash scripts/scale-100-probe.sh; then
-    log "probe finished — continuing into normal live start"
-  else
+  # FIX 16 (F6/F7): the wrapper now exits with DISTINCT codes — before this,
+  # it exited 0 on virtually every failure in auto-stop mode (the FIX 15.6
+  # un-burn was dead code for the real launch-failure class), while a
+  # Ctrl-C during the pre-first-row window DELETED the stamp and invited a
+  # second full Groww fleet storm the same day.
+  local probe_rc=0
+  PROBE_AUTO_STOP_MIN="${PROBE_ONCE_MAX_MIN:-45}" bash scripts/scale-100-probe.sh || probe_rc=$?
+  case "$(probe_rc_class "$probe_rc")" in
+  complete)
+    # Belt-and-braces (F6): a clean exit must still show evidence rows —
+    # zero rows on rc 0 is a launch failure whatever the wrapper thinks.
+    rows_after=$(tsv_sentinel "$(wc -l <"data/groww-scale/summary-${today}.tsv" 2>/dev/null || echo 0)")
+    if probe_launch_failed "$rows_before" "$rows_after"; then
+      rm -f "$stamp"
+      log "probe exited clean but wrote ZERO ladder evidence rows — treating as failed-to-launch; attempt stamp deleted"
+      tg "🆘 The one-time 100-connection lab test could not even start (no evidence was written). The attempt was NOT used up — double-click Start TickVault to try again. Continuing a NORMAL session now."
+    else
+      log "probe finished — continuing into normal live start"
+    fi
+    ;;
+  interrupted)
+    # F7: interrupted mid-run — Groww connections may ALREADY have been
+    # opened, so the one-shot attempt MUST stay burned (the whole point of
+    # the stamp is never storming Groww twice in a day).
+    bash scripts/groww-scale-test.sh clean >>"$(current_log)" 2>&1 || true
+    log "probe was interrupted (rc ${probe_rc}) — attempt stays used for today (Groww connections may already have been opened)"
+    tg "⚠️ The one-time 100-connection lab test was stopped before it finished. The attempt stays used for today — connections may already have been opened, and the test must never run twice in one day. Continuing a NORMAL session now."
+    ;;
+  never_launched)
+    # F6: the wrapper verified ZERO evidence rows and NO signal — the probe
+    # never launched (build failure, docker failure, in-app preflight FAIL
+    # falling back to single-conn). Safe to un-burn.
+    bash scripts/groww-scale-test.sh clean >>"$(current_log)" 2>&1 || true
+    rm -f "$stamp"
+    log "probe FAILED TO LAUNCH (zero new ladder evidence rows) — attempt stamp deleted; the next Start click will retry the probe automatically"
+    tg "🆘 The one-time 100-connection lab test could not even start (no evidence was written). The attempt was NOT used up — double-click Start TickVault to try again. Continuing a NORMAL session now."
+    ;;
+  *)
     bash scripts/groww-scale-test.sh clean >>"$(current_log)" 2>&1 || true
     rows_after=$(tsv_sentinel "$(wc -l <"data/groww-scale/summary-${today}.tsv" 2>/dev/null || echo 0)")
     if probe_launch_failed "$rows_before" "$rows_after"; then
-      # FIX 15.6: the probe never even launched (no ladder rows at all) —
-      # un-burn the attempt so the NEXT click retries automatically instead
-      # of needing a coordinator marker bump.
+      # Unknown failure with zero evidence — same never-launched class.
       rm -f "$stamp"
-      log "probe FAILED TO LAUNCH (zero new ladder evidence rows) — attempt stamp deleted; the next Start click will retry the probe automatically"
+      log "probe FAILED TO LAUNCH (rc ${probe_rc}, zero new ladder evidence rows) — attempt stamp deleted; the next Start click will retry the probe automatically"
       tg "🆘 The one-time 100-connection lab test could not even start (no evidence was written). The attempt was NOT used up — double-click Start TickVault to try again. Continuing a NORMAL session now."
     else
-      log "probe did not complete cleanly — overlay cleaned; continuing into normal live start anyway"
+      log "probe did not complete cleanly (rc ${probe_rc}) — overlay cleaned; continuing into normal live start anyway"
       tg "⚠️ The one-time 100-connection lab test stopped partway. The evidence rows it DID write are saved for the verdict; continuing a NORMAL session now. Details are in the log."
     fi
-  fi
+    ;;
+  esac
   # FIX 10 A8: honor an operator Stop pressed DURING the probe. The probe's
   # OWN internal stop writes the manual-stop marker within seconds of probe
   # start (inside the grace window); a marker noticeably NEWER than that
@@ -1812,7 +1946,15 @@ cmd_start() {
   fi
   ensure_questdb || return 1
   disk_free_ok || true # warn-only on manual start — operator's call
-  start_app "manual start" || return 1
+  # FIX 16 (F2): rc 3 = the OTHER launcher (e.g. the 08:55 robot mid-build)
+  # owns the start — say so honestly instead of the false "start complete".
+  local start_rc=0
+  start_app "manual start" || start_rc=$?
+  if [ "$start_rc" = "3" ]; then
+    tg "🔔 Another launcher is already starting the app (probably the scheduled 8:55 AM robot) — this click will not double-start. Watch this window; the app comes up when that start finishes."
+    return 0
+  fi
+  [ "$start_rc" = "0" ] || return 1
   tg "🚀 Manual start complete — app running, feed capture live. Autopilot (if scheduled) will adopt this app, not double-start."
 }
 
@@ -1859,21 +2001,34 @@ cmd_dev() {
     local dev_branch head_before head_after
     dev_branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "?")
     if [ "$dev_branch" = "local-runtime" ]; then
-      head_before=$(git rev-parse HEAD 2>/dev/null || echo "")
-      if git fetch origin local-runtime >>"$(current_log)" 2>&1; then
-        if git merge --ff-only origin/local-runtime >>"$(current_log)" 2>&1; then
-          head_after=$(git rev-parse HEAD 2>/dev/null || echo "")
-          if [ -n "$head_before" ] && [ "$head_before" != "$head_after" ]; then
-            log "self-update applied ($head_before -> $head_after) — restarting the launcher on the new code"
-            TICKVAULT_DEV_SELF_UPDATED=1 exec bash "$0" dev
-          fi
-          log "self-update: code already up to date"
-        else
-          log "self-update: could not fast-forward (local changes in the way?) — running the EXISTING code"
-          tg "⚠️ The Run button could not apply the latest update — started with the code already on the Mac. Everything still runs."
-        fi
+      # FIX 16 (F1): the ff-merge rewrites the tree — acquire-or-skip the
+      # launcher lock so it can never run while the 08:55 robot's lock-held
+      # `cargo build --release` is reading the sources (Monday: robot
+      # fetches 08:55, builds for minutes; a Run click at 08:57 must not
+      # merge fresh commits into crates/*.rs under rustc). F3: the merge
+      # gets one retry so a transient .git/index.lock loser is not
+      # misdiagnosed as local changes.
+      if ! launcher_lock_acquire_wait 5; then
+        log "self-update skipped — another launcher is mid-flight (likely building); running the existing code so the tree cannot change under its build"
       else
-        log "self-update: git fetch failed (offline?) — running the existing code"
+        head_before=$(git rev-parse HEAD 2>/dev/null || echo "")
+        if git fetch origin local-runtime >>"$(current_log)" 2>&1; then
+          if git_ff_merge_with_retry origin/local-runtime; then
+            head_after=$(git rev-parse HEAD 2>/dev/null || echo "")
+            if [ -n "$head_before" ] && [ "$head_before" != "$head_after" ]; then
+              log "self-update applied ($head_before -> $head_after) — restarting the launcher on the new code"
+              launcher_lock_release # MUST release before exec — same pid would deadlock itself in start_app
+              TICKVAULT_DEV_SELF_UPDATED=1 exec bash "$0" dev
+            fi
+            log "self-update: code already up to date"
+          else
+            log "self-update: could not fast-forward (local changes in the way?) — running the EXISTING code"
+            tg "⚠️ The Run button could not apply the latest update — started with the code already on the Mac. Everything still runs."
+          fi
+        else
+          log "self-update: git fetch failed (offline?) — running the existing code"
+        fi
+        launcher_lock_release
       fi
     else
       log "self-update: not on the local-runtime branch ($dev_branch) — skipping"
@@ -1924,23 +2079,46 @@ scale_window_end() {
 
 # ── Subcommand: the unattended trading-day run ──────────────────────────────
 
+# git_ff_merge_with_retry <ref> — FIX 16 (F3): one short retry absorbs a
+# transient .git/index.lock loser (two launchers merging in the same second
+# at 08:55 — the loser's error is indistinguishable from a dirty tree in
+# git's output, so without the retry it was misdiagnosed as "local changes
+# in the way" and paged the operator for nothing).
+git_ff_merge_with_retry() {
+  if git merge --ff-only "$1" >>"$(current_log)" 2>&1; then return 0; fi
+  sleep 1
+  git merge --ff-only "$1" >>"$(current_log)" 2>&1
+}
+
 preflight_git() {
+  # FIX 16 (F1): the merge below REWRITES the working tree — it must never
+  # run while another launcher's lock-held `cargo build --release` is
+  # reading the sources (rustc mid-build over a changing tree = compile
+  # failure or a mixed old/new binary the adopt gate cannot detect).
+  # Acquire-or-skip: a held lock means a build/start is in flight — run
+  # the existing code this round rather than mutate under it.
+  if ! launcher_lock_acquire_wait 5; then
+    log "another launcher is mid-flight — skipping the git code update this run (the tree must not change under an in-flight build)"
+    return 0
+  fi
   local branch
   branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "?")
   if [ "$branch" != "local-runtime" ]; then
     log "on branch '$branch' — attempting checkout of local-runtime"
     if ! git checkout local-runtime >>"$(current_log)" 2>&1; then
       tg "⚠️ Could not switch to the local-runtime branch (uncommitted changes?). Running the EXISTING checkout '$branch' — code may be stale."
+      launcher_lock_release
       return 0
     fi
   fi
   if git fetch origin >>"$(current_log)" 2>&1; then
-    if ! git merge --ff-only origin/local-runtime >>"$(current_log)" 2>&1; then
+    if ! git_ff_merge_with_retry origin/local-runtime; then
       tg "⚠️ local-runtime has diverged from origin (conflict?) — running the EXISTING local code. Resolve with: git merge origin/local-runtime"
     fi
   else
     log "git fetch failed (offline?) — running existing code"
   fi
+  launcher_lock_release
 }
 
 # boot_chain_once — the 08:55 robot's boot-critical prerequisites, one
@@ -1977,7 +2155,7 @@ eod_summary() {
 
 monitor_until_eod() {
   local relaunches=0 decision alive manual iter=0 disk_warned=0 avail_gb
-  local qdb_warned=0 vm_disk_warned=0 vm_pct
+  local qdb_warned=0 vm_disk_warned=0 vm_pct qdb_fail_streak=0 healthy_streak=0
   VM_DISK_WARN_PCT="${VM_DISK_WARN_PCT:-85}"
   while :; do
     if (($(secs_until "$EOD_STOP_IST" "$(ist_hms)") == 0)); then break; fi
@@ -2029,21 +2207,45 @@ monitor_until_eod() {
         fi
       fi
     fi
+    # FIX 16 (F5): re-arm caffeinate each cycle — cheap no-op while the
+    # pidfile holder is alive; restores sleep protection if caffeinate
+    # died (IDE window closed, -t expiry drift) without any operator step.
+    [ "$manual" = "0" ] && start_caffeinate
     decision=$(monitor_decision "$alive" "$manual" "$relaunches")
     case "$decision" in
-    idle) : ;;
+    idle)
+      # F4 re-arm: 30 healthy minutes after a death episode restores the
+      # one-relaunch + one-alert budget (a NEW death later in the day pages
+      # again), while a fast crash loop never re-arms (cap preserved).
+      if ((relaunches > 0)); then
+        healthy_streak=$((healthy_streak + 1))
+        if ((healthy_streak >= 30)); then
+          log "app healthy for 30 minutes — relaunch/alert budget re-armed"
+          relaunches=0
+          healthy_streak=0
+        fi
+      fi
+      ;;
+    idle_alerted)
+      # FIX 16 (F4): the ONE alert already fired — stay quiet (one line per
+      # cycle in the log, zero Telegram) instead of paging every 60s.
+      log "app still down after the one relaunch + one alert — standing by (double-click Start TickVault to relaunch)"
+      healthy_streak=0
+      ;;
     manual_standdown)
       log "manual stop marker present — autopilot stands down (no relaunch, no fight)"
       ;;
     relaunch)
       relaunches=$((relaunches + 1))
+      healthy_streak=0
       tg "⚠️ App died mid-session — relaunching once (attempt $relaunches). Log tail: $(tail -5 "$(current_log)" | tr '\n' ' | ')"
       sleep 30
-      start_app "auto-relaunch" || true
+      start_app_tolerate_peer "auto-relaunch" || true
       ;;
     alert)
       tg "🆘 App died AGAIN after the one relaunch — NOT retrying (avoid crash-looping the feed). Log tail: $(tail -8 "$(current_log)" | tr '\n' ' | '). Double-click Start TickVault after investigating."
-      relaunches=$((relaunches + 1)) # alert once, then idle on this state
+      relaunches=$((relaunches + 1)) # FIX 16 F4: moves the state to idle_alerted — this alert fires ONCE
+      healthy_streak=0
       ;;
     esac
     # Docker watchdog (independent of the app): one self-heal try + alert.
@@ -2058,17 +2260,27 @@ monitor_until_eod() {
     # Edge-latched Telegram: one dead episode = one message.
     if [ "$manual" = "0" ] && docker_alive; then
       if ! questdb_session_healthy; then
-        if [ "$qdb_warned" = "0" ]; then
-          tg "⚠️ The database stopped answering mid-session — recovering it automatically now (the app buffers safely meanwhile)."
-          qdb_warned=1
+        qdb_fail_streak=$((qdb_fail_streak + 1))
+        # FIX 16 (F12): the liveness probe is a single 3s curl sample — one
+        # slow /exec response (ILP burst, GC pause, Mac wake blip) must not
+        # page the operator or fire the heal. Require 2 CONSECUTIVE failed
+        # samples (~2 minutes) before acting; the first miss is log-only.
+        if ((qdb_fail_streak < 2)); then
+          log "database re-check: one slow/failed sample — confirming on the next cycle before healing"
+        else
+          if [ "$qdb_warned" = "0" ]; then
+            tg "⚠️ The database stopped answering mid-session — recovering it automatically now (the app buffers safely meanwhile)."
+            qdb_warned=1
+          fi
+          log "database re-check: tv-questdb unhealthy (${qdb_fail_streak} consecutive samples) — running the ensure_questdb self-heal"
+          ensure_questdb || true
         fi
-        log "database re-check: tv-questdb unhealthy — running the ensure_questdb self-heal"
-        ensure_questdb || true
       else
         if [ "$qdb_warned" = "1" ]; then
           log "database re-check: recovered — warn latch re-armed"
           qdb_warned=0
         fi
+        qdb_fail_streak=0
       fi
     fi
   done
@@ -2151,7 +2363,7 @@ cmd_run() {
 
   if [ "$day" = "scale" ]; then
     apply_overlay probe
-    start_app "scale day — probe overlay" || exit 1
+    start_app_tolerate_peer "scale day — probe overlay" || exit 1
     tg "🚀 Scale-lab day: app booted with the 2×600 cap-probe. Verdict expected between $PROBE_POLL_START_IST and ~10:05 IST — I will read it and act automatically."
 
     wait_until_ist "$PROBE_POLL_START_IST"
@@ -2179,30 +2391,30 @@ cmd_run() {
       tg "✅ PROBE VERDICT: both connections captured — the 1000 cap is PER-CONNECTION. Switching to the FULL 100K ladder now."
       stop_app
       apply_overlay max
-      start_app "max-scale ladder" || exit 1
+      start_app_tolerate_peer "max-scale ladder" || exit 1
       ;;
     record_continue)
       tg "🔔 PROBE VERDICT: per-ACCOUNT limit — only one connection streams. That IS the experiment's answer; recorded in the audit table. Continuing a NORMAL session (no laddering)."
       stop_app
       apply_overlay none
-      start_app "normal session after per-account verdict" || true
+      start_app_tolerate_peer "normal session after per-account verdict" || true
       ;;
     continue_normal)
       tg "⚠️ Probe inconclusive (base connection captured nothing) — infra/auth problem, not a limit answer. Continuing a NORMAL session; check the Groww token / feed page."
       stop_app
       apply_overlay none
-      start_app "normal session after inconclusive probe" || true
+      start_app_tolerate_peer "normal session after inconclusive probe" || true
       ;;
     none)
       tg "⚠️ Probe verdict TIMED OUT after ${PROBE_TIMEOUT_MIN}min — treating as inconclusive; continuing a NORMAL session. Check the app log + feed page."
       stop_app
       apply_overlay none
-      start_app "normal session after probe timeout" || true
+      start_app_tolerate_peer "normal session after probe timeout" || true
       ;;
     esac
   else
     apply_overlay none # normal local day: branch overlay (feeds ON) applies
-    start_app "normal local day" || exit 1
+    start_app_tolerate_peer "normal local day" || exit 1
     tg "🚀 Normal local day: app booted, both-feed capture live (dry_run — no orders)."
   fi
 
