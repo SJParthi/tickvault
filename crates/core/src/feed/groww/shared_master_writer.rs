@@ -179,11 +179,14 @@ const MASTER_READINESS_ATTEMPTS: u32 = 3;
 const MASTER_READINESS_BACKOFF_SECS: u64 = 5;
 
 /// Bounded wait for the `index_constituency` ts-pin migration gate (FIX 13a)
-/// before the constituency append. 120s covers the common ordering window
-/// (the Dhan-lane migration now runs at the top of
-/// `persist_index_constituency_mapping`); a Groww-only boot (Dhan lane OFF →
-/// migration never spawns) times out once and proceeds — CORRECT, because
-/// the truncate cannot run in that mode.
+/// before the constituency append. Since the F14 hardening (2026-07-05) the
+/// migration runs in the PROCESS-GLOBAL boot prefix on every boot mode
+/// (spawned before the Groww activation watcher, regardless of
+/// `feeds.dhan_enabled`), so the gate is marked within ~75s worst case
+/// (60s quiet readiness probe + one bounded TRUNCATE attempt) — 120s leaves
+/// ≥ 45s headroom. A timeout means the boot-prefix task is pathologically
+/// delayed; the append proceeds best-effort (rows re-persist next boot if
+/// the truncate lands after them).
 #[cfg(feature = "daily_universe_fetcher")]
 const CONSTITUENCY_MIGRATION_GATE_TIMEOUT_SECS: u64 = 120;
 
@@ -1014,12 +1017,17 @@ pub async fn persist_groww_instruments(
     }
 
     // ── index_constituency (FIX 13a gate + FIX 13b bounded retry) ──
-    // The one-shot ts-pin TRUNCATE migration (Dhan lane) wipes ALL rows —
-    // QuestDB has no row-level DELETE, so it cannot be feed-scoped. Await the
-    // migration gate (bounded) so our feed='groww' rows land AFTER any
-    // truncate this boot will run. A timeout (e.g. Groww-only boot — the
-    // Dhan-lane migration never spawns, so no truncate can fire) proceeds
-    // degrade-safe.
+    // The one-shot ts-pin TRUNCATE migration wipes ALL rows — QuestDB has no
+    // row-level DELETE, so it cannot be feed-scoped. Await the migration gate
+    // (bounded) so our feed='groww' rows land AFTER the truncate. Since the
+    // F14 hardening (2026-07-05) the migration runs in the PROCESS-GLOBAL
+    // boot prefix on every boot mode (never only behind the Dhan lane), is
+    // exactly-once in-process, and marks the gate within ~75s worst case —
+    // so a timeout here means the boot-prefix task (incl. its quiet QuestDB
+    // readiness probe) is pathologically delayed, NOT that no truncate can
+    // run. Proceeding on timeout is best-effort: if the truncate lands after
+    // this append, the rows are re-persisted next boot/activation
+    // (GROWW-MASTER-01 envelope).
     if !tickvault_storage::index_constituency_persistence::index_constituency_migration_gate()
         .wait(Duration::from_secs(
             CONSTITUENCY_MIGRATION_GATE_TIMEOUT_SECS,
@@ -1029,7 +1037,9 @@ pub async fn persist_groww_instruments(
         warn!(
             timeout_secs = CONSTITUENCY_MIGRATION_GATE_TIMEOUT_SECS,
             "[feeds] Groww index_constituency persist: ts-pin migration gate not marked \
-             within the bounded wait — proceeding (Dhan lane likely OFF; no truncate can run)"
+             within the bounded wait — appending best-effort; if the one-shot table \
+             migration's truncate lands after this append, today's feed='groww' rows \
+             are wiped and re-persisted at the next boot/activation"
         );
     }
     tickvault_storage::index_constituency_persistence::ensure_index_constituency_table(questdb)
@@ -2167,6 +2177,30 @@ mod tests {
             gate < append,
             "FIX 13a regression: the migration-gate wait must precede the \
              index_constituency append in persist_groww_instruments"
+        );
+    }
+
+    /// F13 wording pin (2026-07-05): the gate-timeout `warn!` must NOT carry
+    /// the FALSE "Dhan lane likely OFF; no truncate can run" premise (untrue
+    /// on the dhan+groww profile AND under the D2b runtime-enable lifecycle —
+    /// it misdirected triage), and MUST state the honest best-effort
+    /// consequence instead.
+    #[cfg(feature = "daily_universe_fetcher")]
+    #[test]
+    fn ratchet_gate_timeout_warn_is_honest() {
+        let src = include_str!("shared_master_writer.rs");
+        // Needle assembled at runtime so THIS test's own source (which
+        // include_str! sees) never contains the banned literal.
+        let false_premise = ["no truncate", " can run)"].concat();
+        assert!(
+            !src.contains(&false_premise),
+            "F13 regression: the gate-timeout warn re-acquired the false \
+             'Dhan lane OFF => no truncate' premise"
+        );
+        assert!(
+            src.contains("re-persisted at the next boot/activation"),
+            "F13 regression: the gate-timeout warn lost its honest \
+             best-effort consequence wording"
         );
     }
 }
