@@ -25,15 +25,23 @@
 
 # ── Pure helpers (testable) ─────────────────────────────────────────────────
 
-# scale_probe_verdict <hit_ceiling 0|1> <max_conns> <target> <real_subscribed>
+# scale_probe_verdict <hit_ceiling 0|1> <max_conns> <target> <real_subscribed> \
+#                     [timer_cap_hit 0|1] [last_row_rollback 0|1]
 # — one plain-English line naming where the ladder stopped. rc 1 on garbage
 # args. FIX 10 A2: in weekend smoke the gates hardcode the tick checks, so
 # "held the rung" alone can be hollow — the verdict demands REAL per-conn
 # subscribe proof (the summary TSV subscribe_proof column) and never prints
 # ✅ unless real_subscribed >= target.
+# FIX 19 item 9: if OUR OWN auto-stop timer fired while the ladder was
+# still CLIMBING (rungs reached < target AND the last evidence row is not a
+# rollback), the verdict must say so — claiming "Groww capped us at N" for
+# a self-inflicted timeout is the FIX 18 G15 truncation class re-introduced.
 scale_probe_verdict() {
   local hit="${1:-}" max="${2:-}" target="${3:-}" proof="${4:-}"
+  local timer_cap="${5:-0}" last_rollback="${6:-0}"
   case "$hit" in 0 | 1) ;; *) return 1 ;; esac
+  case "$timer_cap" in 0 | 1) ;; *) return 1 ;; esac
+  case "$last_rollback" in 0 | 1) ;; *) return 1 ;; esac
   local v
   for v in "$max" "$target" "$proof"; do
     case "$v" in '' | *[!0-9]*) return 1 ;; esac
@@ -42,6 +50,8 @@ scale_probe_verdict() {
     echo "Reached ${target} connections ✅ — ${proof} of ${target} REALLY subscribed (SMOKE: connect + auth + subscribe only, no ticks on a closed market)."
   elif [ "$hit" = "1" ] && [ "$max" -ge "$target" ]; then
     echo "Held rung ${target}, but only ${proof} of ${target} connections REALLY subscribed — NOT a full pass. Record the real number."
+  elif [ "$timer_cap" = "1" ] && [ "$last_rollback" = "0" ] && [ "$max" -gt 0 ]; then
+    echo "TIMER CAP HIT at rung ${max} of ${target} (${proof} REALLY subscribed) — NOT a Groww limit; the ladder was still climbing when OUR OWN time cap fired. The probe needs a longer cap (raise PROBE_ONCE_MAX_MIN). Do NOT record this as a Groww cap."
   elif [ "$max" -gt 0 ]; then
     echo "Groww (or this Mac) capped us at ${max} of ${target} connections (${proof} REALLY subscribed) — that IS the probe answer. Record rung ${max}."
   else
@@ -57,6 +67,9 @@ set -uo pipefail
 cd "$(dirname "$0")/.."
 
 TARGET_CONNS=100
+# FIX 19 item 9: set to 1 by the auto-stop watcher when OUR hard time cap
+# stops the run — feeds the honest TIMER-CAP verdict arm in cleanup.
+TIMER_CAP_HIT=0
 # A1: the app writes the summary TSV under the IST date (its rows are IST
 # timestamps) — the wrapper must use the SAME calendar, not host-local.
 TSV="data/groww-scale/summary-$(TZ=Asia/Kolkata date +%F).tsv"
@@ -83,10 +96,11 @@ probe_new_rows() { # rows appended AFTER this probe started (may be empty)
 }
 
 verdict_from_tsv() {
-  local hit=0 max=0 proof=0 ts outcome conns target ceiling sp _rest
+  local hit=0 max=0 proof=0 last_outcome="" ts outcome conns target ceiling sp _rest
   while IFS=$'\t' read -r ts outcome conns target ceiling sp _rest; do
     [ -z "$ts" ] && continue
     [ "$ts" = "ts_ist" ] && continue
+    last_outcome="$outcome"
     case "$outcome" in *halted_at_ceiling*) hit=1 ;; esac
     case "$conns" in
       '' | *[!0-9]*) : ;;
@@ -97,7 +111,12 @@ verdict_from_tsv() {
       *) [ "$sp" -gt "$proof" ] && proof="$sp" ;;
     esac
   done < <(probe_new_rows)
-  scale_probe_verdict "$hit" "$max" "$TARGET_CONNS" "$proof"
+  # FIX 19 item 9: was the LAST evidence row a failure/rollback? If yes the
+  # ladder was NOT climbing when the timer fired — the legacy capped wording
+  # stays honest. Only a clean climb + our own cap gets the TIMER CAP verdict.
+  local last_rollback=0
+  case "$last_outcome" in *rolled_back* | *global_halved*) last_rollback=1 ;; esac
+  scale_probe_verdict "$hit" "$max" "$TARGET_CONNS" "$proof" "${TIMER_CAP_HIT:-0}" "$last_rollback"
 }
 
 # FIX 16 (F6/F7/F8): cleanup now (a) STOPS the ladder app on EVERY exit
@@ -146,7 +165,8 @@ trap cleanup EXIT
 
 echo "============================================================"
 echo " GROWW 100-CONNECTION PROBE (SMOKE — Saturday, no ticks)"
-echo " Ladder 1→2→5→10→20→40→80→100, 3-minute holds (~25 min to 100)."
+echo " Ladder 1→2→5→10→20→40→80→100 — 3-minute holds + a 30s warm-up per"
+echo " rung (~50 min to 100 incl. setup; hard cap 75 min on the one-shot path)."
 echo " Prod is untouched: local QuestDB + local app only."
 echo "============================================================"
 
@@ -196,7 +216,12 @@ fi
 #    halted_at_ceiling in the summary TSV, or at the hard time cap — so the
 #    launcher can continue into the normal live start with zero extra clicks.
 if [ -n "${PROBE_AUTO_STOP_MIN:-}" ]; then
-  case "$PROBE_AUTO_STOP_MIN" in '' | *[!0-9]*) PROBE_AUTO_STOP_MIN=45 ;; esac
+  # FIX 19 item 9: fallback raised 45 → 75 min. Budget math: 8 rungs ×
+  # (~30s warm-up + ≤30s first gate pass + 180s hold + ≤30s advance tick)
+  # ≈ 36 min of ladder + ~10 min setup (docker-up, QuestDB init, boot,
+  # ~100K master download, shard writes) ≈ 46-50 min. 75 gives honest
+  # headroom without letting a wedged run hang past lunch.
+  case "$PROBE_AUTO_STOP_MIN" in '' | *[!0-9]*) PROBE_AUTO_STOP_MIN=75 ;; esac
   # FIX 18 G15: the hard time cap below must measure LADDER time, not a
   # cold `cargo build --release` (fresh clone: 15-40 min under lto +
   # codegen-units=1 — most of the 45-min cap), which previously truncated
@@ -218,6 +243,10 @@ if [ -n "${PROBE_AUTO_STOP_MIN:-}" ]; then
   while kill -0 "$probe_pid" 2>/dev/null; do
     if ((SECONDS >= deadline)); then
       echo "hard time cap reached — stopping the probe"
+      # FIX 19 item 9: remember that WE stopped the run — the verdict must
+      # say "timer cap", never "Groww capped us", when the ladder was
+      # still climbing (evaluated against the evidence rows in cleanup).
+      TIMER_CAP_HIT=1
       break
     fi
     if ((ceiling_hold_until == 0)) && probe_new_rows | grep -q "halted_at_ceiling"; then

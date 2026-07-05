@@ -2456,7 +2456,16 @@ maybe_run_probe_once() {
   # Ctrl-C during the pre-first-row window DELETED the stamp and invited a
   # second full Groww fleet storm the same day.
   local probe_rc=0
-  PROBE_AUTO_STOP_MIN="${PROBE_ONCE_MAX_MIN:-45}" bash scripts/scale-100-probe.sh || probe_rc=$?
+  # FIX 19 item 9: per-feed Telegram during the probe window too — the 3
+  # normal start paths already spawn the pinger (item 7), but the probe app
+  # serves the same feeds-health endpoint and the operator was blind here.
+  # Detached; polls up to 180s while the probe app boots.
+  spawn_feed_status_pings # FIX 19 item 9: probe-window per-feed Telegram
+  # FIX 19 item 9: cap default raised 45 -> 75 min. With the 30s smoke
+  # warm-up, 8 rungs x ~4.5 min + ~10 min setup = ~46-50 min — the old 45
+  # cap truncated the ladder around rung 80 and burned the attempt with a
+  # FALSE "Groww capped us" verdict (FIX 18 G15 class).
+  PROBE_AUTO_STOP_MIN="${PROBE_ONCE_MAX_MIN:-75}" bash scripts/scale-100-probe.sh || probe_rc=$?
   case "$(probe_rc_class "$probe_rc")" in
   complete)
     # Belt-and-braces (F6): a clean exit must still show evidence rows —

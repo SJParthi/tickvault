@@ -272,6 +272,27 @@ t "verdict: garbage hit flag → rc 1" "1" "$(scale_probe_verdict 2 40 100 40 >/
 t "verdict: garbage max → rc 1" "1" "$(scale_probe_verdict 1 abc 100 1 >/dev/null 2>&1 && echo 0 || echo 1)"
 t "verdict: missing proof arg → rc 1" "1" "$(scale_probe_verdict 1 100 100 >/dev/null 2>&1 && echo 0 || echo 1)"
 
+# ── FIX 19 item 9: honest timer-cap verdict — a self-inflicted auto-stop
+# must NEVER masquerade as "Groww capped us" (FIX 18 G15 class) ─────────────
+t "F19-9: timer cap mid-climb → TIMER CAP verdict" "TIMER CAP HIT at rung 80 of 100" "$(scale_probe_verdict 0 80 100 80 1 0 | cut -c1-31)"
+t "F19-9: timer-cap wording never blames Groww" "0" "$(case "$(scale_probe_verdict 0 80 100 80 1 0)" in *"capped us"*) echo 1 ;; *) echo 0 ;; esac)"
+t "F19-9: timer-cap wording points at the cap knob" "0" "$(scale_probe_verdict 0 80 100 80 1 0 | grep -q 'PROBE_ONCE_MAX_MIN' && echo 0 || echo 1)"
+t "F19-9: timer cap AFTER a rollback → legacy capped answer stands" "Groww (or this Mac) capped us at 40 of 100" "$(scale_probe_verdict 0 40 100 12 1 1 | cut -c1-42)"
+t "F19-9: no timer cap → legacy capped wording unchanged" "Groww (or this Mac) capped us at 40 of 100" "$(scale_probe_verdict 0 40 100 12 0 0 | cut -c1-42)"
+t "F19-9: timer cap but ceiling reached → reached wins" "Reached 100" "$(scale_probe_verdict 1 100 100 100 1 0 | cut -c1-11)"
+t "F19-9: timer cap with zero rungs → never-climbed answer" "No ladder stage was recorded" "$(scale_probe_verdict 0 0 100 0 1 0 | cut -c1-28)"
+t "F19-9: omitted grace args default to legacy behaviour" "Groww (or this Mac) capped us at 40 of 100" "$(scale_probe_verdict 0 40 100 12 | cut -c1-42)"
+t "F19-9: garbage timer-cap flag → rc 1" "1" "$(scale_probe_verdict 0 40 100 12 2 0 >/dev/null 2>&1 && echo 0 || echo 1)"
+t "F19-9: garbage rollback flag → rc 1" "1" "$(scale_probe_verdict 0 40 100 12 1 x >/dev/null 2>&1 && echo 0 || echo 1)"
+# FIX 19 item 9: time-budget wiring pins (warm-up env + 75-min cap + probe pings)
+t "F19-9: probe make target exports the 30s smoke warm-up" "1" "$(grep -cF 'GATE_WARMUP_SECS="$${GATE_WARMUP_SECS:-30}"' Makefile || true)"
+t "F19-9: launcher probe cap default is 75 min" "1" "$(grep -c 'PROBE_ONCE_MAX_MIN:-75' scripts/local-autopilot.sh || true)"
+t "F19-9: wrapper cap fallback is 75 min" "1" "$(grep -c 'PROBE_AUTO_STOP_MIN=75' scripts/scale-100-probe.sh || true)"
+t "F19-9: stale 45-min defaults are gone" "0" "$(grep -c 'PROBE_ONCE_MAX_MIN:-45\|PROBE_AUTO_STOP_MIN=45' scripts/local-autopilot.sh scripts/scale-100-probe.sh | awk -F: '{s+=$NF} END {print s+0}')"
+t "F19-9: banner estimate updated (no stale ~25 min claim)" "0" "$(grep -c '~25 min to 100' scripts/scale-100-probe.sh || true)"
+t "F19-9: hard-cap branch latches TIMER_CAP_HIT" "1" "$(sed -n '/hard time cap reached/,/break/p' scripts/scale-100-probe.sh | grep -c 'TIMER_CAP_HIT=1' || true)"
+t "F19-9: probe path spawns the feed pinger too" "1" "$(grep -c 'spawn_feed_status_pings # FIX 19 item 9' scripts/local-autopilot.sh || true)"
+
 # ── FIX 10 (PUSH A): probe correctness + launcher safety helpers ────────────
 # A1: TSV run-start sentinel normalization (macOS wc pads with spaces)
 t "sentinel: padded wc output → clean int" "42" "$(tsv_sentinel "     42 ")"

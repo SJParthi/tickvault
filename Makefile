@@ -70,7 +70,12 @@ scale-max-smoke: ## 100K max-scale config, weekend SMOKE (machinery-only dry run
 	@bash scripts/groww-scale-test.sh max-smoke
 
 scale-100-probe: ## Saturday 100-conn connect/auth/subscribe probe (SMOKE, 3-min holds, no ticks)
-	@GATE_HOLD_MIN=3 bash scripts/groww-scale-test.sh max-smoke
+	@# FIX 19 item 9: the smoke probe runs with a SHORT 30s gate warm-up
+	@# (venv already provisioned by attempt 1, no live ticks — 30s covers the
+	@# post-transition CPU settle). The 120s default warm-up x 8 rungs would
+	@# blow the probe's hard time cap and burn the attempt with a FALSE
+	@# "Groww capped us" verdict. Env-overridable as usual.
+	@GATE_HOLD_MIN=3 GATE_WARMUP_SECS="$${GATE_WARMUP_SECS:-30}" bash scripts/groww-scale-test.sh max-smoke
 
 scale-test-clean: ## Remove the scale-test overlay from config/local.toml
 	@bash scripts/groww-scale-test.sh clean
