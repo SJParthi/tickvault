@@ -754,6 +754,50 @@ t "F21: tick-class-check subcommand dispatched" "0" "$(grep -q 'tick-class-check
 t "F21: socket-probe subcommand dispatched" "0" "$(grep -q 'socket-probe) run_groww_socket_probe' scripts/local-autopilot.sh && echo 0 || echo 1)"
 t "F21: socket probe runner is timeout-bounded" "0" "$(sed -n '/^run_groww_socket_probe()/,/^}/p' scripts/local-autopilot.sh | grep -q -- '-w 5' && echo 0 || echo 1)"
 
+# ── FIX 22: per-connection subscribe receipts + fleet summary ───────────────
+t "F22: streaming conn → ✅ with real tick proof" \
+  "c03 ✅ streaming (1000 subscribed, 42 ticks)" "$(conn_receipt_token 03 streaming 1000 42 0)"
+t "F22: subscribed-only conn is NEVER faked as ✅" \
+  "c04 loaded 1000 — connect UNVERIFIED (no tick yet)" "$(conn_receipt_token 04 subscribed 1000 0 0)"
+t "F22: no status + NoServersError cycling → the known reason class" \
+  "c05 retrying: connect timeout (server not answering)" "$(conn_receipt_token 05 - 0 0 1)"
+t "F22: no status, no NoServers hint → plain retrying" \
+  "c05 retrying (no status yet)" "$(conn_receipt_token 05 - 0 0 0)"
+t "F22: garbage counts fail safe to 0" \
+  "c00 ✅ streaming (0 subscribed, 0 ticks)" "$(conn_receipt_token 00 streaming banana pear 0)"
+TOKENS_SMALL="$(printf 'c00 ✅ streaming (10 subscribed, 5 ticks)\nc01 loaded 10 — connect UNVERIFIED (no tick yet)')"
+t "F22: small rung → ONE receipt message, no part label" \
+  "🪜 rung 2 receipts: c00 ✅ streaming (10 subscribed, 5 ticks) | c01 loaded 10 — connect UNVERIFIED (no tick yet)" \
+  "$(rung_receipt_lines 2 "$TOKENS_SMALL")"
+TOKENS_BIG="$(for i in 0 1 2 3 4 5; do echo "c0$i ✅ streaming (10 subscribed, 5 ticks)"; done)"
+t "F22: rung larger than the chunk splits into parts" "3" \
+  "$(rung_receipt_lines 6 "$TOKENS_BIG" 2 | grep -c '🪜 rung 6 receipts (part ')"
+t "F22: chunked parts carry every token exactly once" "6" \
+  "$(rung_receipt_lines 6 "$TOKENS_BIG" 2 | grep -o 'c0[0-9]' | sort -u | wc -l | tr -d ' ')"
+t "F22: empty tokens → honest receipts-unavailable line (never silent)" \
+  "⚠️ rung 5: no connection status found — per-connection receipts unavailable (NOT claiming OK)" \
+  "$(rung_receipt_lines 5 "")"
+t "F22: garbage chunk falls back to the 25 default (single message)" "1" \
+  "$(rung_receipt_lines 2 "$TOKENS_SMALL" banana | wc -l | tr -d ' ')"
+t "F22: fleet all streaming → ✅ summary" \
+  "✅ fleet at ceiling 10/10: 10 streaming, 0 loaded-unverified, 0 retrying — 10000 instruments subscribed across the fleet" \
+  "$(fleet_summary_text 10 10 10 0 0 10000)"
+t "F22: mixed fleet → ⚠️ (never fake ✅)" \
+  "⚠️ fleet at ceiling 10/10: 8 streaming, 1 loaded-unverified, 1 retrying — 9000 instruments subscribed across the fleet" \
+  "$(fleet_summary_text 10 10 8 1 1 9000)"
+t "F22: zero streaming → 🆘 summary" \
+  "🆘 fleet at ceiling 10/10: 0 streaming, 0 loaded-unverified, 10 retrying — 0 instruments subscribed across the fleet" \
+  "$(fleet_summary_text 10 10 0 0 10 0)"
+t "F22: garbage summary inputs fail safe to 0" \
+  "🆘 fleet at ceiling 0/0: 0 streaming, 0 loaded-unverified, 0 retrying — 0 instruments subscribed across the fleet" \
+  "$(fleet_summary_text x y z '' - '')"
+# wiring pins
+t "F22: probe path spawns the rung-receipt watcher" "1" "$(grep -c 'spawn_rung_receipt_watcher # FIX 22' scripts/local-autopilot.sh || true)"
+t "F22: rung-receipts subcommand dispatched" "0" "$(grep -q 'rung-receipts) run_rung_receipt_watcher' scripts/local-autopilot.sh && echo 0 || echo 1)"
+t "F22: watcher reads the real per-conn status files" "0" "$(sed -n '/^conn_receipts()/,/^}/p' scripts/local-autopilot.sh | grep -q 'groww-status.json' && echo 0 || echo 1)"
+t "F22: watcher self-terminates on a duration bound" "0" "$(sed -n '/^run_rung_receipt_watcher()/,/^}/p' scripts/local-autopilot.sh | grep -q 'elapsed.*duration' && echo 0 || echo 1)"
+t "F22: NoServers hint scans the log for the known signature" "0" "$(sed -n '/^noservers_recent()/,/^}/p' scripts/local-autopilot.sh | grep -q 'NoServersError' && echo 0 || echo 1)"
+
 echo
 echo "local-autopilot pure-logic tests: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

@@ -1349,6 +1349,83 @@ socket_probe_due() {
   [ "$s" -ge 32700 ]
 }
 
+# ── FIX 22 pure cores: per-connection subscribe receipts + fleet summary ───
+
+# conn_receipt_token <cid> <event|-> <total> <emitted> <noservers 0|1>
+# → one honest per-connection token. ✅ ONLY on a streaming status (real
+# decoded-tick proof — the sidecar writes "streaming" on the FIRST emitted
+# tick, never optimistically); a subscribed-only conn is loaded but its
+# connect is UNVERIFIED; a conn with no status while the log shows
+# NoServersError cycling renders the KNOWN reason class: connect timeout
+# (server not answering). Pure.
+conn_receipt_token() {
+  local cid="${1:-??}" event="${2:--}" total="${3:-0}" emitted="${4:-0}" ns="${5:-0}"
+  case "$total" in '' | *[!0-9]*) total=0 ;; esac
+  case "$emitted" in '' | *[!0-9]*) emitted=0 ;; esac
+  case "$event" in
+  streaming) echo "c${cid} ✅ streaming (${total} subscribed, ${emitted} ticks)" ;;
+  subscribed) echo "c${cid} loaded ${total} — connect UNVERIFIED (no tick yet)" ;;
+  *)
+    if [ "$ns" = "1" ]; then
+      echo "c${cid} retrying: connect timeout (server not answering)"
+    else
+      echo "c${cid} retrying (no status yet)"
+    fi
+    ;;
+  esac
+}
+
+# rung_receipt_lines <rung_conns> <tokens newline-sep> [chunk] → one Telegram
+# MESSAGE PER OUTPUT LINE, ≤chunk (default 25) connection tokens per message
+# so a 100-conn rung never exceeds Telegram's size limit. Empty tokens →
+# an honest "receipts unavailable" line, never a silent skip. Pure.
+rung_receipt_lines() {
+  local rung="${1:-?}" tokens="${2:-}" chunk="${3:-25}"
+  case "$chunk" in '' | *[!0-9]* | 0) chunk=25 ;; esac
+  if [ -z "$tokens" ]; then
+    echo "⚠️ rung ${rung}: no connection status found — per-connection receipts unavailable (NOT claiming OK)"
+    return 0
+  fi
+  local n=0 buf="" part=0 tokline
+  while IFS= read -r tokline; do
+    [ -n "$tokline" ] || continue
+    buf="${buf:+$buf | }$tokline"
+    n=$((n + 1))
+    if [ "$n" -ge "$chunk" ]; then
+      part=$((part + 1))
+      echo "🪜 rung ${rung} receipts (part ${part}): ${buf}"
+      buf=""
+      n=0
+    fi
+  done <<<"$tokens"
+  if [ -n "$buf" ]; then
+    if [ "$part" -eq 0 ]; then
+      echo "🪜 rung ${rung} receipts: ${buf}"
+    else
+      echo "🪜 rung ${rung} receipts (part $((part + 1))): ${buf}"
+    fi
+  fi
+  return 0
+}
+
+# fleet_summary_text <conns> <ceiling> <streaming> <loaded> <retrying> <subs>
+# → the ONE at-ceiling fleet verdict. ✅ only when EVERY conn is streaming;
+# 🆘 when NONE is; ⚠️ for a mixed fleet. Pure.
+fleet_summary_text() {
+  local conns="${1:-0}" ceiling="${2:-0}" s="${3:-0}" l="${4:-0}" r="${5:-0}" subs="${6:-0}"
+  local x
+  for x in conns ceiling s l r subs; do
+    case "${!x}" in '' | *[!0-9]*) printf -v "$x" '0' ;; esac
+  done
+  local v="✅"
+  if [ "$s" = "0" ]; then
+    v="🆘"
+  elif [ "$l" != "0" ] || [ "$r" != "0" ]; then
+    v="⚠️"
+  fi
+  echo "${v} fleet at ceiling ${conns}/${ceiling}: ${s} streaming, ${l} loaded-unverified, ${r} retrying — ${subs} instruments subscribed across the fleet"
+}
+
 # ── End of pure functions. Library mode stops here. ────────────────────────
 if [[ "${AUTOPILOT_LIB:-0}" == "1" ]]; then
   return 0 2>/dev/null || exit 0
@@ -2145,6 +2222,118 @@ run_groww_socket_probe() {
   return 0
 }
 
+# ═══ FIX 22 runtime — per-connection subscribe receipts, per rung ═══════════
+# During a scale probe/run the operator sees "rung N held" but not WHICH
+# connections actually made it. This watcher tails the ladder's evidence
+# TSV; on every rung transition it reads each active connection's REAL
+# status file and Telegrams honest per-conn receipts (streaming ✅ /
+# loaded-UNVERIFIED / retrying), plus ONE fleet summary when the ladder
+# reaches its ceiling. Pure cores live above the library gate.
+
+GROWW_SHARDS_ROOT="${GROWW_SHARDS_ROOT:-data/groww/shards}"
+
+# shard_status_fields <status.json> → "event|total|emitted". rc 1 missing/bad.
+shard_status_fields() {
+  local f="${1:-}"
+  [ -f "$f" ] || return 1
+  python3 -c '
+import json, sys
+try:
+    with open(sys.argv[1]) as fh:
+        d = json.load(fh)
+    e = str(d.get("event", "-"))
+    t = int(d.get("total", 0))
+    m = int(d.get("emitted", 0))
+    print(e + "|" + str(t) + "|" + str(m))
+except Exception:
+    sys.exit(1)
+' "$f" 2>/dev/null
+}
+
+# noservers_recent → 1 when the recent log tail shows the NATS
+# NoServersError / connect-timeout cycling signature (the FIX 20 filter
+# surfaces the class), else 0. Runtime (reads the one log file).
+noservers_recent() {
+  if tail -n 400 "$(current_log)" 2>/dev/null |
+    grep -qiE 'NoServersError|no servers available|connect timeout'; then
+    echo 1
+  else
+    echo 0
+  fi
+}
+
+# conn_receipts <n> → one conn_receipt_token line per conn 0..n-1, from the
+# per-conn shard status files. Runtime (file reads).
+conn_receipts() {
+  local n="${1:-0}" ns cid fields event rest total emitted i=0
+  case "$n" in '' | *[!0-9]*) return 0 ;; esac
+  ns=$(noservers_recent)
+  while [ "$i" -lt "$n" ]; do
+    cid=$(printf '%02d' "$i")
+    if fields=$(shard_status_fields "$GROWW_SHARDS_ROOT/c${cid}/groww-status.json"); then
+      event=${fields%%|*}
+      rest=${fields#*|}
+      total=${rest%%|*}
+      emitted=${rest##*|}
+      conn_receipt_token "$cid" "$event" "$total" "$emitted" "$ns"
+    else
+      conn_receipt_token "$cid" "-" 0 0 "$ns"
+    fi
+    i=$((i + 1))
+  done
+  return 0
+}
+
+# run_rung_receipt_watcher [duration_secs] [interval_secs] — poll the
+# ladder evidence TSV; on each rung transition (conns changed) Telegram the
+# per-conn receipts; at the ceiling send ONE fleet summary. Self-terminates
+# after duration (default 90 min — covers the 75-min probe cap + margin).
+run_rung_receipt_watcher() {
+  local duration="${1:-5400}" interval="${2:-30}" tsv elapsed=0
+  local last_conns="" fleet_sent=0 rows last_rows=0 row conns ceiling tokens line
+  local streaming loaded retrying subs
+  tsv="data/groww-scale/summary-$(ist_date).tsv"
+  log "rung-receipt watcher up (FIX 22): tsv=$tsv duration=${duration}s interval=${interval}s"
+  while [ "$elapsed" -lt "$duration" ]; do
+    sleep "$interval"
+    elapsed=$((elapsed + interval))
+    [ -f "$tsv" ] || continue
+    rows=$(tsv_rows "$tsv")
+    [ "$rows" -gt "$last_rows" ] || continue
+    last_rows="$rows"
+    row=$(tail -1 "$tsv")
+    conns=$(printf '%s' "$row" | cut -f3)
+    ceiling=$(printf '%s' "$row" | cut -f5)
+    case "$conns" in '' | *[!0-9]*) continue ;; esac
+    [ "$conns" != "$last_conns" ] || continue
+    last_conns="$conns"
+    tokens=$(conn_receipts "$conns")
+    while IFS= read -r line; do
+      [ -n "$line" ] && tg "$line"
+    done <<<"$(rung_receipt_lines "$conns" "$tokens")"
+    if [ "$fleet_sent" = "0" ] && [ -n "$ceiling" ] && [ "$conns" = "$ceiling" ]; then
+      streaming=$(printf '%s\n' "$tokens" | grep -c '✅ streaming' || true)
+      loaded=$(printf '%s\n' "$tokens" | grep -c 'connect UNVERIFIED' || true)
+      retrying=$(printf '%s\n' "$tokens" | grep -c 'retrying' || true)
+      subs=$(printf '%s\n' "$tokens" | grep -oE '[0-9]+ subscribed|loaded [0-9]+' |
+        grep -oE '[0-9]+' | awk '{s+=$1} END {print s+0}')
+      tg "$(fleet_summary_text "$conns" "$ceiling" "$streaming" "$loaded" "$retrying" "$subs")"
+      fleet_sent=1
+    fi
+  done
+  log "rung-receipt watcher done (${elapsed}s elapsed)"
+  return 0
+}
+
+# spawn_rung_receipt_watcher — detach the watcher (feed-pings pattern) so it
+# survives this shell and never blocks the probe path.
+spawn_rung_receipt_watcher() {
+  (
+    set -m
+    nohup bash "$0" rung-receipts >>"$(current_log)" 2>&1 &
+  ) || true
+}
+
 # app_git_sha — the running app's build provenance from GET /health (B9
 # git_sha field). Empty on any failure (app down, old build without the
 # field). Runtime (network); the compare itself is the pure sha_compare.
@@ -2669,6 +2858,7 @@ maybe_run_probe_once() {
   # serves the same feeds-health endpoint and the operator was blind here.
   # Detached; polls up to 180s while the probe app boots.
   spawn_feed_status_pings # FIX 19 item 9: probe-window per-feed Telegram
+  spawn_rung_receipt_watcher # FIX 22: per-rung per-conn receipts + fleet summary
   # FIX 19 item 9: cap default raised 45 -> 75 min. With the 30s smoke
   # warm-up, 8 rungs x ~4.5 min + ~10 min setup = ~46-50 min — the old 45
   # cap truncated the ladder around rung 80 and burned the attempt with a
@@ -3416,6 +3606,7 @@ monitor) cmd_monitor ;;       # FIX 18 G5: detached safety net behind a manual S
 feed-pings) send_feed_status_pings "${2:-180}" ;;  # FIX 19 item 7: detached per-feed Telegram status
 tick-class-check) run_tick_class_check ;;          # FIX 21: on-demand per-class tick coverage verdict
 socket-probe) run_groww_socket_probe ;;            # FIX 21 addendum: on-demand groww socket reachability
+rung-receipts) run_rung_receipt_watcher "${2:-5400}" "${3:-30}" ;; # FIX 22: detached rung receipt watcher
 status) cmd_status ;;
 *)
   echo "usage: $0 [run|start|stop|dev|monitor|feed-pings|status]" >&2
