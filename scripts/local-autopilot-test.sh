@@ -647,14 +647,15 @@ t "F19-4: coalescing cadence is 30" "0" "$(grep -q 'NATS_ERROR_LOG_EVERY = 30' s
 
 # Item 5: attempt-2 re-arm marker
 # FIX 25 superseded the F19-5 armed-marker pin (attempt 2 complete →
-# disarmed). FIX 30 (2026-07-05) supersedes AGAIN: the marker is
-# DELIBERATELY re-armed as "2026-07-07 3" for the Tuesday live ladder run —
+# disarmed). FIX 30 (2026-07-05) superseded AGAIN (armed for Tue
+# 2026-07-07). Operator demand 2026-07-06: the exam runs TODAY — the
+# marker is re-armed as "2026-07-06 3" for the Monday live ladder run —
 # the robot auto-fires it in the 10:00-13:30 IST window, and the
 # per-attempt stamp keeps it one-shot. After the run, the disarm commit
 # flips this pin back to the comment form (the F25/F30 either-or formedness
 # pin below survives both states).
-t "F19-5→F30: probe-once marker is armed for Tue 2026-07-07 attempt 3" "1 0 3" \
-  "$(probe_marker_state deploy/local/probe-once.date 2026-07-07 "$TMP/f19-5-no-stamps")"
+t "F19-5→F30: probe-once marker is armed for Mon 2026-07-06 attempt 3" "1 0 3" \
+  "$(probe_marker_state deploy/local/probe-once.date 2026-07-06 "$TMP/f19-5-no-stamps")"
 
 # Addendum: raise Docker VM memory at its NATURAL cold start
 t "F19-A: mem target on a 48GB host → 12288" "12288" "$(docker_mem_target_mib $((48 * 1024 * 1024 * 1024)))"
