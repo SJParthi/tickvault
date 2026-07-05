@@ -3,6 +3,8 @@
 //! # Endpoints
 //! - `GET /` — redirect to `/dashboard`
 //! - `GET /dashboard` — comprehensive operator dashboard (feeds + ticks + candles + DB + health)
+//! - `GET /board` — animated Live Board operator page (approved design, real data)
+//! - `GET /api/board/data` — the JSON snapshot the Live Board polls (~3s)
 //! - `GET /health` — health check
 //! - `GET /feeds` — operator feed-control webpage (turn feeds on/off, single or multiple)
 //! - `GET /api/stats` — QuestDB table counts
@@ -209,6 +211,21 @@ pub fn build_router_with_auth(
         .route(
             "/dashboard",
             axum::routing::get(handlers::dashboard_page::dashboard_page),
+        )
+        // Live Board (operator-approved design mockup, 2026-07-05 "as of now
+        // just go ahead"): animated at-a-glance operator page. The HTML shell
+        // is public (no secrets — same posture as /feeds + /dashboard); it
+        // polls the public read-only `/api/board/data` snapshot below every
+        // ~3s. The problems panel client-fetches the EXISTING bearer-gated
+        // /api/debug/logs/jsonl/latest (2026-07-04 security trim respected —
+        // no raw error text is duplicated onto a public route).
+        .route(
+            "/board",
+            axum::routing::get(handlers::board_page::board_page),
+        )
+        .route(
+            "/api/board/data",
+            axum::routing::get(handlers::board::board_data),
         )
         .route(
             "/health",
