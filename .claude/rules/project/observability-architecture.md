@@ -138,13 +138,28 @@ summary file and drives the above flow.
 
 ## Canonical on-disk paths (DO NOT CHANGE without updating Loki/Alloy)
 
+> **2026-07-05 UPDATE (operator directive: "one human log file; robot files
+> into machine/ subfolder"):** every MACHINE sink the app writes moved from
+> the `data/logs/` top level to `data/logs/machine/`. The top level is the
+> HUMAN surface only: the launcher-owned `data/logs/tickvault.log` symlink +
+> `data/logs/app.<IST-date>.log` daily rolling file. Consumers (MCP server,
+> Makefile, doctor scripts, triage hooks/configs, Alloy config) were updated
+> in the same change; the retention sweepers sweep BOTH dirs during a grace
+> window so legacy files at the old paths age out naturally (no boot-time
+> file moves). The app-log sweeper skips every `*.log` name so it can never
+> delete the human daily log. Machine-dir ratchet:
+> `crates/app/src/observability.rs::test_all_machine_sink_dirs_live_under_machine_subdir`.
+
 | Path | Purpose | Writer |
 |------|---------|--------|
-| `data/logs/app.YYYY-MM-DD.log` | full app log | existing rolling writer |
-| `data/logs/errors.log` | WARN+ single file | existing |
-| `data/logs/errors.jsonl.YYYY-MM-DD-HH` | ERROR JSONL hourly | Phase 2 — `tracing-appender 0.2.3` |
-| `data/logs/errors.summary.md` | human/Claude-readable snapshot | Phase 5 — refreshed every 60s |
-| `data/logs/auto-fix.log` | audit trail of auto-triage actions | Phase 6 |
+| `data/logs/tickvault.log` → `app.<IST-date>.log` | the ONE human log surface (symlink + daily rolling) | launcher (local-runtime) |
+| `data/logs/machine/app.YYYY-MM-DD-HH` | full app log, hourly rotated (robot) | `init_app_log_appender` |
+| `data/logs/machine/app.log` | 0-byte Alloy file-watch placeholder | `infra.rs` |
+| `data/logs/machine/errors.log` | WARN+ single file | existing |
+| `data/logs/machine/errors.jsonl.YYYY-MM-DD-HH` | ERROR JSONL hourly | Phase 2 — `tracing-appender 0.2.3` |
+| `data/logs/machine/errors.summary.md` | human/Claude-readable snapshot | Phase 5 — refreshed every 60s |
+| `data/logs/machine/candles/`, `data/logs/machine/live_ticks/` | per-category hourly appenders | category layers |
+| `data/logs/auto-fix.log` | audit trail of auto-triage actions (script-owned; machine/ move is a flagged follow-up) | Phase 6 |
 | `.claude/triage/error-rules.yaml` | triage classifier | Phase 6 |
 | `.claude/triage/claude-loop-prompt.md` | Claude-watches-logs runbook | Phase 7 |
 | `.claude/state/triage-seen.jsonl` | edge-trigger dedup | Phase 6 |

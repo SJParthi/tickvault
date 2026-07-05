@@ -25,13 +25,17 @@ use tickvault_common::trading_calendar::{TradingCalendar, ist_offset};
 pub const CONFIG_BASE_PATH: &str = "config/base.toml";
 
 /// Log file path for Alloy/Loki consumption (legacy fixed name).
-pub const APP_LOG_FILE_PATH: &str = "data/logs/app.log";
+///
+/// 2026-07-05 operator directive ("one human log file; robot files into
+/// machine/ subfolder"): moved under `data/logs/machine/` — the
+/// `data/logs/` top level is the human surface only.
+pub const APP_LOG_FILE_PATH: &str = "data/logs/machine/app.log";
 
-/// Log directory for rotated log files.
-pub const LOG_DIRECTORY: &str = "data/logs";
+/// Log directory for rotated MACHINE log files (2026-07-05: machine/ subdir).
+pub const LOG_DIRECTORY: &str = "data/logs/machine";
 
 /// Error-only log file name (WARN + ERROR only, for fast debugging).
-pub const ERROR_LOG_FILE_PATH: &str = "data/logs/errors.log";
+pub const ERROR_LOG_FILE_PATH: &str = "data/logs/machine/errors.log";
 
 /// Fast boot window start (IST).
 pub const FAST_BOOT_WINDOW_START: &str = "09:00:00";
@@ -322,7 +326,7 @@ pub fn build_app_log_filter_directive(base_level: &str) -> String {
 pub fn create_log_file_writer_at(log_file_path: &str) -> Option<std::fs::File> {
     let log_dir = std::path::Path::new(log_file_path)
         .parent()
-        .unwrap_or(std::path::Path::new("data/logs"));
+        .unwrap_or(std::path::Path::new(LOG_DIRECTORY));
 
     // O(1) EXEMPT: begin — cold path, logging bootstrap before tracing is initialized
     #[allow(clippy::print_stderr)] // APPROVED: tracing not yet initialized at this point
