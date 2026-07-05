@@ -98,6 +98,60 @@ core).
 
 ---
 
+## §3.2. 2026-07-05 — auto-merge persists across branch updates (PR #1411 red merge)
+
+**The incident (Verified, 2026-07-05):** PR #1411 (head `1338c26b`) merged at
+**14:30:12Z — 4 seconds after the last legacy-required check** (the original
+4: Build & Verify, Security & Audit, Commit Lint, Secret Scan) went green,
+while **All Green and Coverage & Perf were still in-progress on that head and
+later FAILED** on it. The failure was the flaky
+`crates/api/tests/tv_api_token_prod_guard.rs` race (3 tests mutating the
+process-global `TV_API_TOKEN` env var on parallel test threads; under
+llvm-cov instrumentation the interleaving flipped an asserted branch —
+`1 target failed: -p tickvault-api --test tv_api_token_prod_guard`, exit
+101). The post-merge run on the MERGE COMMIT happened to pass, so `main`
+stayed green — luck, not the gate. PRs **#1412 and #1415** merged through
+the same gap with green-after-the-fact luck.
+
+**The two-hole chain (why §3 did not stop it):**
+
+| # | Hole | Detail |
+|---|---|---|
+| 1 | **All Green is still not a GitHub branch-protection required check** | §3 row 9 (the operator's one-time Settings → Branches click adding `All Green` to the required list) has NOT been performed. GitHub therefore considered the PR mergeable on the legacy 4 alone. |
+| 2 | **Auto-merge arming is per-PR and SURVIVES branch updates** | GitHub's auto-merge flag, once armed, persists when new commits are pushed to the PR branch. So an arming that was legitimately gated on All Green success for an OLD head (ci.yml `enable-auto-merge`, §3 row 3) stays armed for a NEW head — and the NEW head then merges the instant the legacy-4 required checks pass, without All Green ever succeeding on the head that actually merged. |
+
+**The operative rule until the §3 row 9 click lands (BINDING for every
+Claude/Cowork session):**
+
+1. **Do NOT arm auto-merge** (`gh pr merge --auto`, `enable_pr_auto_merge`,
+   or any equivalent) on any PR. The ci.yml `enable-auto-merge` job may still
+   arm bot-path PRs; agents must not ADD arming on top, and where an agent
+   controls the merge, it must disarm/skip arming.
+2. **Merge only after verifying `All Green` = `success` on the EXACT final
+   head SHA** of the PR (`pull_request_read` head vs the check run's
+   `head_sha` — they must match; a green All Green on a superseded head
+   counts for NOTHING).
+3. After the operator performs the §3 row 9 click (required checks include
+   `All Green`, require branches up to date, enforce for admins), this
+   operative rule relaxes back to §3's normal auto-merge-behind-All-Green
+   flow — the click makes hole 1 impossible and defangs hole 2 (GitHub
+   itself will refuse the merge until All Green passes on the final head).
+
+**The flaky-test fix (same PR as this section):**
+`tv_api_token_prod_guard.rs` now serializes its env-mutating tests behind a
+shared static `Mutex` with a scoped `TokenEnvGuard` (poisoning-safe via
+`unwrap_or_else(|e| e.into_inner())`, restores the prior env value on Drop).
+Assertions unchanged; verified 20/20 consecutive green runs locally. The
+gate hole and the flake are INDEPENDENT failures — fixing the flake does not
+excuse the gap, and closing the gap would not have fixed the flake.
+
+**What a PR that violates §3.2 looks like (REJECT):** re-introduces agent-side
+auto-merge arming before the branch-protection click is confirmed; merges on
+a stale-head All Green; treats "post-merge run passed" as retroactive
+justification for a red pre-merge gate.
+
+---
+
 ## §4. The honest envelope (mandatory per operator-charter §F — no illusion)
 
 - **Pre-merge gate = the fast battery** (build, clippy, the full 6-crate test suites incl. DHAT + proptest, security audit, coverage ratchet, source-scan guards, plan gate, secret diff-scan). Warm-cache PR wall-clock moves from ~4 min to ~8–10 min (coverage is the new critical path; ~20–25 min on a cold cache).
