@@ -595,6 +595,62 @@ t "G16: the clamp sets the flag" "0" "$(grep -q 'QDB_MEM_CLAMPED=1' scripts/loca
 t "G16: the 'works fine' false-OK wording is gone" "0" "$(grep -c 'this works fine' scripts/local-autopilot.sh || true)"
 t "G16: ensure_questdb names an OOM kill as OOM" "0" "$(sed -n '/^ensure_questdb()/,/^}/p' scripts/local-autopilot.sh | grep -q 'oomkilled_is_true' && echo 0 || echo 1)"
 
+# ── FIX 19: live-probe follow-ups (2026-07-05) ───────────────────────────────
+
+# Item 2: tsv_rows — missing file is 0 with NO stderr noise
+FIX19_TMP=$(mktemp -d)
+printf 'a\nb\nc\n' >"$FIX19_TMP/three.tsv"
+t "F19-2: tsv_rows counts an existing file" "3" "$(tsv_rows "$FIX19_TMP/three.tsv")"
+t "F19-2: tsv_rows missing file → 0" "0" "$(tsv_rows "$FIX19_TMP/absent.tsv")"
+t "F19-2: tsv_rows empty arg → 0" "0" "$(tsv_rows "")"
+t "F19-2: tsv_rows missing file emits NO stderr" "" "$(tsv_rows "$FIX19_TMP/absent.tsv" 2>&1 >/dev/null)"
+rm -rf "$FIX19_TMP"
+# the bare `wc -l <` pattern must be gone from BOTH probe-facing scripts
+t "F19-2: no bare wc redirection remains on the summary TSV" "0" "$(grep -c 'wc -l <"data/groww-scale/summary' scripts/local-autopilot.sh || true)"
+t "F19-2: probe wrapper uses tsv_rows" "0" "$(grep -q 'TSV_SENTINEL=$(tsv_rows "$TSV")' scripts/scale-100-probe.sh && echo 0 || echo 1)"
+
+# Item 3: probe-prep stop wording
+t "F19-3: probe-prep flag → probe_prep" "probe_prep" "$(stop_notice_mode 1)"
+t "F19-3: unset flag → manual" "manual" "$(stop_notice_mode "")"
+t "F19-3: zero flag → manual" "manual" "$(stop_notice_mode 0)"
+t "F19-3: garbage flag → manual" "manual" "$(stop_notice_mode banana)"
+t "F19-3: cmd_stop consults the notice mode" "0" "$(sed -n '/^cmd_stop()/,/^}/p' scripts/local-autopilot.sh | grep -q 'stop_notice_mode' && echo 0 || echo 1)"
+t "F19-3: probe-prep Telegram says the live start follows" "0" "$(grep -q 'the live start follows automatically' scripts/local-autopilot.sh && echo 0 || echo 1)"
+t "F19-3: probe wrapper exports the probe-prep flag before the stop" "0" "$(grep -q 'export AUTOPILOT_PROBE_PREP=1' scripts/scale-100-probe.sh && echo 0 || echo 1)"
+
+# Item 4: sidecar empty NATS error enrichment + coalescing (source scans;
+# the functional coverage lives in scripts/groww-sidecar/test_dedup.py)
+t "F19-4: sidecar carries the NATS error filter class" "0" "$(grep -q 'class NatsErrorDetailFilter' scripts/groww-sidecar/groww_sidecar.py && echo 0 || echo 1)"
+t "F19-4: the filter is installed at hook time" "0" "$(grep -q 'install_sdk_error_filter(secrets)' scripts/groww-sidecar/groww_sidecar.py && echo 0 || echo 1)"
+t "F19-4: coalescing cadence is 30" "0" "$(grep -q 'NATS_ERROR_LOG_EVERY = 30' scripts/groww-sidecar/groww_sidecar.py && echo 0 || echo 1)"
+
+# Item 5: attempt-2 re-arm marker
+t "F19-5: probe-once marker is armed for attempt 2" "2026-07-05 2" "$(head -1 deploy/local/probe-once.date)"
+
+# Addendum: raise Docker VM memory at its NATURAL cold start
+t "F19-A: mem target on a 48GB host → 12288" "12288" "$(docker_mem_target_mib $((48 * 1024 * 1024 * 1024)))"
+t "F19-A: mem target exactly 32GB → 12288" "12288" "$(docker_mem_target_mib $((32 * 1024 * 1024 * 1024)))"
+t "F19-A: mem target on a 16GB host → 10240" "10240" "$(docker_mem_target_mib $((16 * 1024 * 1024 * 1024)))"
+t "F19-A: mem target garbage → 10240" "10240" "$(docker_mem_target_mib banana)"
+t "F19-A: mem target empty → 10240" "10240" "$(docker_mem_target_mib "")"
+t "F19-A: cpu target on 14 cores → 10" "10" "$(docker_cpu_target_cores 14)"
+t "F19-A: cpu target on 12 cores → 8" "8" "$(docker_cpu_target_cores 12)"
+t "F19-A: cpu target on 8 cores → half" "4" "$(docker_cpu_target_cores 8)"
+t "F19-A: cpu target on 2 cores → floor 2" "2" "$(docker_cpu_target_cores 2)"
+t "F19-A: cpu target garbage → 0 (skip)" "0" "$(docker_cpu_target_cores banana)"
+t "F19-A: write only when daemon down AND app not running" "write" "$(cold_start_mem_write_decision 0 0)"
+t "F19-A: app running → skip" "skip" "$(cold_start_mem_write_decision 0 1)"
+t "F19-A: daemon up → skip" "skip" "$(cold_start_mem_write_decision 1 0)"
+t "F19-A: garbage inputs → skip (fail-quiet)" "skip" "$(cold_start_mem_write_decision "" "")"
+# wiring scans: the raise fires ONLY on the daemon-down launch path, backs
+# the file up first, and the post-start log proves whether it stuck
+t "F19-A: ensure_docker calls the cold-start raise before open -a Docker" "0" "$(sed -n '/^ensure_docker()/,/^}/p' scripts/local-autopilot.sh | grep -q 'raise_docker_mem_at_cold_start' && echo 0 || echo 1)"
+t "F19-A: the raise never runs while Docker.app is up" "0" "$(sed -n '/^raise_docker_mem_at_cold_start()/,/^}/p' scripts/local-autopilot.sh | grep -q 'cold_start_mem_write_decision' && echo 0 || echo 1)"
+t "F19-A: the settings file is backed up before the write" "0" "$(sed -n '/^raise_docker_mem_at_cold_start()/,/^}/p' scripts/local-autopilot.sh | grep -q 'tickvault-bak' && echo 0 || echo 1)"
+t "F19-A: post-start VM memory is logged (proof channel)" "0" "$(grep -q 'Docker VM memory after start' scripts/local-autopilot.sh && echo 0 || echo 1)"
+t "F19-A: the flush-on-exit theory is labeled Assumed" "0" "$(grep -q 'Assumed' scripts/local-autopilot.sh && echo 0 || echo 1)"
+t "F19-A: the warm-Docker hint default is host-aware too" "0" "$(sed -n '/^hint_docker_vm_memory()/,/^}/p' scripts/local-autopilot.sh | grep -q 'docker_mem_target_mib' && echo 0 || echo 1)"
+
 echo
 echo "local-autopilot pure-logic tests: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

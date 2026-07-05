@@ -568,6 +568,78 @@ docker_mem_hint_decision() {
   return 0
 }
 
+# ── FIX 19: raise Docker VM memory at its NATURAL cold start ────────────────
+# Theory of the FIX-7/17 failures (labeled Assumed — consistent with all the
+# live evidence, not directly proven): Docker Desktop keeps its settings in
+# memory while running and FLUSHES them to settings-store.json on exit. Our
+# earlier MemoryMiB writes happened while Docker was RUNNING, then the
+# quit/relaunch (or the operator's later quit) overwrote the edit — so the
+# file "ignored" the change. The fix: write the file ONLY when the daemon is
+# confirmed DOWN and Docker.app is NOT running, THEN launch Docker.app — a
+# cold start reads the file, so every natural start (reboot, morning, first
+# run of the day) comes up with the raised memory. Never touch the file
+# while Docker runs; never quit a running Docker. The post-start VM-memory
+# log line is the proof channel: the NEXT run's log shows whether it stuck.
+
+# docker_mem_target_mib <host_mem_bytes> → the default Docker VM memory
+# target for this host: 12288 MiB (12 GB) on a >= 32 GB Mac (the operator's
+# is 48 GB — the clamp math then gives the database 8g+ naturally), 10240
+# otherwise. Garbage/empty input → 10240 (conservative). Pure.
+docker_mem_target_mib() {
+  local b="${1:-}"
+  case "$b" in '' | *[!0-9]*)
+    echo 10240
+    return 0
+    ;;
+  esac
+  if [ "$b" -ge $((32 * 1024 * 1024 * 1024)) ]; then echo 12288; else echo 10240; fi
+  return 0
+}
+
+# docker_cpu_target_cores <host_cores> → a matching Docker VM CPU count for
+# the raised memory: hosts with >= 12 cores give the VM (host - 4) cores
+# (the operator's 14-core Mac → 10 — plenty for the 100k ladder while macOS
+# keeps 4); smaller hosts get half, floor 2. Garbage → 0 (caller skips). Pure.
+docker_cpu_target_cores() {
+  local c="${1:-}"
+  case "$c" in '' | *[!0-9]* | 0)
+    echo 0
+    return 0
+    ;;
+  esac
+  if [ "$c" -ge 12 ]; then
+    echo $((c - 4))
+  else
+    local half=$((c / 2))
+    if [ "$half" -lt 2 ]; then half=2; fi
+    echo "$half"
+  fi
+  return 0
+}
+
+# cold_start_mem_write_decision <daemon_up 0|1> <app_running 0|1> → write|skip.
+# The settings file may be written ONLY when the daemon is DOWN and the
+# Docker.app process is NOT running (see the Assumed flush-on-exit theory
+# above). Anything else — including garbage input — is skip (fail-quiet:
+# never risk a write that a running Docker will overwrite or race). Pure.
+cold_start_mem_write_decision() {
+  if [ "${1:-1}" = "0" ] && [ "${2:-1}" = "0" ]; then echo write; else echo skip; fi
+  return 0
+}
+
+# ── FIX 19 item 3: probe-prep stop wording ──────────────────────────────────
+# stop_notice_mode <probe_prep_flag> → probe_prep|manual. The probe wrapper's
+# internal pre-probe stop used to send the manual-stop Telegram ("Autopilot
+# will NOT auto-restart today — double-click Start TickVault to resume"),
+# which is terrifying to read seconds after clicking Run. When the stop is
+# part of the probe's own runway-clearing (AUTOPILOT_PROBE_PREP=1 exported by
+# the wrapper), the message says so and does NOT claim autopilot stands down
+# (the probe path tolerates the marker via its grace window anyway). Pure.
+stop_notice_mode() {
+  case "${1:-}" in 1 | true | yes) echo probe_prep ;; *) echo manual ;; esac
+  return 0
+}
+
 # ── FIX 10 (PUSH A): probe correctness + launcher safety — pure helpers ────
 
 # tsv_sentinel <raw wc -l output> → a clean integer line count (macOS wc
@@ -578,6 +650,20 @@ tsv_sentinel() {
   local v="${1:-}"
   v="${v//[[:space:]]/}"
   case "$v" in '' | *[!0-9]*) echo 0 ;; *) echo "$v" ;; esac
+}
+
+# tsv_rows <file> → the file's line count as a clean integer; a MISSING file
+# is 0 with NO stderr noise. FIX 19 item 2: `wc -l <"$file"` on an absent
+# file makes the SHELL print a raw "No such file or directory" line (the
+# input redirection fails before wc's own 2>/dev/null applies, and the
+# operator saw exactly two of those during the live probe run). The [ -f ]
+# guard means the redirection is never attempted on an absent file.
+tsv_rows() {
+  [ -f "${1:-}" ] || {
+    echo 0
+    return 0
+  }
+  tsv_sentinel "$(wc -l <"$1" 2>/dev/null || echo 0)"
 }
 
 # has_scale_overlay <config file> → rc 0 when the file carries the scale
@@ -1355,6 +1441,82 @@ app_alive() {
 # than erroring — previously this froze the monitor loop indefinitely).
 docker_alive() { dk info >/dev/null 2>&1; }
 
+# FIX 19 addendum: raise-at-natural-start. Called ONLY from ensure_docker's
+# daemon-is-down path, immediately BEFORE Docker.app is launched. Writes the raised
+# MemoryMiB (+ a matching Cpus when the key already exists) into the settings
+# file so THIS cold start reads it — never touches the file while Docker
+# runs, never quits a running Docker (the Assumed flush-on-exit theory above:
+# writing while Docker runs is overwritten when it exits). Best-effort: every
+# failure path logs and returns 0 so the launch always proceeds.
+raise_docker_mem_at_cold_start() {
+  [ "$(uname -s)" = "Darwin" ] || return 0
+  [ -z "${CI:-}" ] || return 0
+  local app_running=0
+  if pgrep -f "/Applications/Docker.app" >/dev/null 2>&1; then app_running=1; fi
+  # Daemon is confirmed down at this call site (ensure_docker's docker_alive
+  # already returned false), so daemon_up=0.
+  if [ "$(cold_start_mem_write_decision 0 "$app_running")" != "write" ]; then
+    log "Docker.app process is already running (engine still coming up) — leaving its settings file alone (a write now would be overwritten when Docker exits)"
+    return 0
+  fi
+  local host_bytes target
+  host_bytes=$(sysctl -n hw.memsize 2>/dev/null || true)
+  target="${TV_DOCKER_VM_MEM_MIB:-}"
+  case "$target" in '' | *[!0-9]*) target=$(docker_mem_target_mib "$host_bytes") ;; esac
+  # Locate the settings file + memory key (store first, then legacy).
+  local gc="$HOME/Library/Group Containers/group.com.docker"
+  local file="" key="" cand rc
+  for cand in "$gc/settings-store.json" "$gc/settings.json"; do
+    key=$(docker_settings_mem_key "$cand") && rc=0 || rc=$?
+    case "$rc" in
+    0 | 10)
+      file="$cand"
+      break
+      ;;
+    *) : ;;
+    esac
+  done
+  if [ -z "$file" ]; then
+    log "no Docker settings file found yet (first-time Docker Desktop setup) — nothing to raise; launching as-is"
+    return 0
+  fi
+  local current
+  current=$(docker_settings_mem_get "$file" "$key" 2>/dev/null || true)
+  if [ -n "$current" ] && [ "$current" -ge "$target" ] 2>/dev/null; then
+    log "Docker VM memory already set to ${current} MiB (>= target ${target}) in $(basename "$file") — no write needed before this cold start"
+    return 0
+  fi
+  # Backup first — the settings file carries every Docker Desktop setting.
+  cp "$file" "${file}.tickvault-bak" 2>/dev/null || true
+  if docker_settings_set_mem "$file" "$key" "$target"; then
+    log "COLD-START RAISE: wrote Docker VM memory ${target} MiB (was ${current:-unset}) into $(basename "$file") BEFORE launching Docker — a cold start reads this file, so Docker should come up with the raised memory (backup: $(basename "$file").tickvault-bak)"
+  else
+    log "could not write Docker VM memory into $(basename "$file") — launching Docker at its current setting"
+    return 0
+  fi
+  # Matching Cpus — only when the file ALREADY carries a Cpus key (never
+  # insert a CPU setting Docker did not have) and only upward.
+  local host_cores cpu_key cpu_cur cpu_target
+  host_cores=$(sysctl -n hw.ncpu 2>/dev/null || true)
+  cpu_target=$(docker_cpu_target_cores "$host_cores")
+  if [ "$cpu_target" -gt 0 ] 2>/dev/null; then
+    for cpu_key in Cpus cpus; do
+      cpu_cur=$(docker_settings_mem_get "$file" "$cpu_key" 2>/dev/null || true)
+      if [ -n "$cpu_cur" ]; then
+        if [ "$cpu_cur" -lt "$cpu_target" ] 2>/dev/null; then
+          if docker_settings_set_mem "$file" "$cpu_key" "$cpu_target"; then
+            log "COLD-START RAISE: Docker VM CPUs ${cpu_cur} → ${cpu_target} (host has ${host_cores} cores)"
+          fi
+        else
+          log "Docker VM CPUs already ${cpu_cur} (target ${cpu_target}) — unchanged"
+        fi
+        break
+      fi
+    done
+  fi
+  return 0
+}
+
 ensure_docker() {
   # FIX 18 G10: Docker Desktop 4.x per-user installs put the docker CLI in
   # ~/.docker/bin (and Docker.app's Resources/bin) WITHOUT the privileged
@@ -1379,12 +1541,22 @@ ensure_docker() {
   fi
   if docker_alive; then return 0; fi
   log "Docker daemon not running — attempting to launch Docker.app"
-  if [ "$(uname -s)" = "Darwin" ]; then open -a Docker >>"$(current_log)" 2>&1 || true; fi
+  if [ "$(uname -s)" = "Darwin" ]; then
+    # FIX 19 addendum: the daemon is DOWN — the one safe moment to write the
+    # raised VM memory into the settings file (see raise_docker_mem_at_cold_start).
+    raise_docker_mem_at_cold_start || true
+    open -a Docker >>"$(current_log)" 2>&1 || true
+  fi
   local i
   for i in $(seq 1 24); do
     sleep 5
     if docker_alive; then
       log "Docker daemon is up (waited $((i * 5))s)"
+      # FIX 19 addendum: proof channel — this line is how the NEXT run's log
+      # shows whether the cold-start raise actually stuck.
+      local vm_probe
+      vm_probe=$(dk info --format '{{.MemTotal}}' 2>/dev/null || true)
+      log "Docker VM memory after start: ${vm_probe:-unknown} bytes"
       return 0
     fi
   done
@@ -1956,12 +2128,15 @@ hint_docker_vm_memory() {
   local vm_mib=$(($1 / 1048576))
   # Required = QuestDB pin + 2 GB headroom (Docker itself + the app's containers).
   local required_mib=$(($2 / 1048576 + 2048))
-  local pref="${TV_DOCKER_VM_MEM_MIB:-10240}"
-  case "$pref" in '' | *[!0-9]*) pref=10240 ;; esac
   local host_bytes host_mib
   host_bytes=$(sysctl -n hw.memsize 2>/dev/null || true)
   case "$host_bytes" in '' | *[!0-9]*) return 1 ;; esac
   host_mib=$((host_bytes / 1048576))
+  # FIX 19 addendum: the default target is host-aware — 12 GB on a >= 32 GB
+  # Mac (the operator's is 48 GB), 10 GB otherwise. TV_DOCKER_VM_MEM_MIB
+  # still overrides both paths (hint here + cold-start raise).
+  local pref="${TV_DOCKER_VM_MEM_MIB:-}"
+  case "$pref" in '' | *[!0-9]*) pref=$(docker_mem_target_mib "$host_bytes") ;; esac
   local target
   if ! target=$(docker_vm_raise_target "$vm_mib" "$required_mib" "$pref" "$host_mib"); then
     return 1
@@ -2164,7 +2339,7 @@ maybe_run_probe_once() {
   probe_start_epoch=$(date +%s)
   # FIX 15.6: snapshot the ladder-evidence row count so a FAILED-TO-LAUNCH
   # probe (zero new rows) can be told apart from a partial run.
-  rows_before=$(tsv_sentinel "$(wc -l <"data/groww-scale/summary-${today}.tsv" 2>/dev/null || echo 0)")
+  rows_before=$(tsv_rows "data/groww-scale/summary-${today}.tsv")
   export_compose_creds
   # FIX 16 (F6/F7): the wrapper now exits with DISTINCT codes — before this,
   # it exited 0 on virtually every failure in auto-stop mode (the FIX 15.6
@@ -2177,7 +2352,7 @@ maybe_run_probe_once() {
   complete)
     # Belt-and-braces (F6): a clean exit must still show evidence rows —
     # zero rows on rc 0 is a launch failure whatever the wrapper thinks.
-    rows_after=$(tsv_sentinel "$(wc -l <"data/groww-scale/summary-${today}.tsv" 2>/dev/null || echo 0)")
+    rows_after=$(tsv_rows "data/groww-scale/summary-${today}.tsv")
     if probe_launch_failed "$rows_before" "$rows_after"; then
       rm -f "$stamp"
       log "probe exited clean but wrote ZERO ladder evidence rows — treating as failed-to-launch; attempt stamp deleted"
@@ -2205,7 +2380,7 @@ maybe_run_probe_once() {
     ;;
   *)
     bash scripts/groww-scale-test.sh clean >>"$(current_log)" 2>&1 || true
-    rows_after=$(tsv_sentinel "$(wc -l <"data/groww-scale/summary-${today}.tsv" 2>/dev/null || echo 0)")
+    rows_after=$(tsv_rows "data/groww-scale/summary-${today}.tsv")
     if probe_launch_failed "$rows_before" "$rows_after"; then
       # Unknown failure with zero evidence — same never-launched class.
       rm -f "$stamp"
@@ -2352,7 +2527,19 @@ stop_manual_monitor() {
 # ── Subcommand: manual stop ─────────────────────────────────────────────────
 
 cmd_stop() {
-  log "== MANUAL STOP (writing manual-stop marker — autopilot stands down today) =="
+  # FIX 19 item 3: when the probe wrapper invokes this stop as its own
+  # runway-clearing step (AUTOPILOT_PROBE_PREP=1 exported by the wrapper),
+  # the operator just clicked Run — the message must say the live start
+  # FOLLOWS automatically, not that autopilot stands down. Behavior is
+  # otherwise identical (the marker is still written; the probe path
+  # tolerates it via its manual_stop_during_probe grace window).
+  local notice_mode
+  notice_mode="$(stop_notice_mode "${AUTOPILOT_PROBE_PREP:-0}")"
+  if [ "$notice_mode" = "probe_prep" ]; then
+    log "== PROBE-PREP STOP (clearing the runway for the one-time lab test — part of the same Run click) =="
+  else
+    log "== MANUAL STOP (writing manual-stop marker — autopilot stands down today) =="
+  fi
   stop_manual_monitor # FIX 18 G5: Stop always wins over the background monitor
   stop_app
   bash scripts/groww-scale-test.sh clean >>"$(current_log)" 2>&1 || true
@@ -2368,7 +2555,11 @@ cmd_stop() {
     fi
   fi
   printf '%s %s manual stop\n' "$TODAY" "$(ist_hms)" >"$MANUAL_STOP_MARKER"
-  tg "🔔 Manual stop done — app stopped, overlay cleaned, QuestDB left running. Autopilot will NOT auto-restart today. Double-click Start TickVault to resume."
+  if [ "$notice_mode" = "probe_prep" ]; then
+    tg "🔬 probe preparing: clearing the runway (this is part of your Run click — the live start follows automatically)"
+  else
+    tg "🔔 Manual stop done — app stopped, overlay cleaned, QuestDB left running. Autopilot will NOT auto-restart today. Double-click Start TickVault to resume."
+  fi
 }
 
 # ── Subcommand: dev (the ONE-BUTTON IntelliJ "Run tickvault") ───────────────

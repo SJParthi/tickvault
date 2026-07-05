@@ -73,7 +73,10 @@ AUTOPILOT_LIB=1 source scripts/local-autopilot.sh
 # fleet at the macOS default 256 fds and EMFILEd at rungs 80-100, recording
 # a FALSE "capped at N" verdict as the probe answer).
 raise_fd_limit || true
-TSV_SENTINEL=$(tsv_sentinel "$(wc -l <"$TSV" 2>/dev/null || echo 0)")
+# FIX 19 item 2: tsv_rows guards the missing-file case — the bare input
+# redirection used to leak a raw shell "No such file or directory" line to
+# the operator's console on the first run of a day (TSV not created yet).
+TSV_SENTINEL=$(tsv_rows "$TSV")
 
 probe_new_rows() { # rows appended AFTER this probe started (may be empty)
   tail -n +"$((TSV_SENTINEL + 1))" "$TSV" 2>/dev/null || true
@@ -148,6 +151,11 @@ echo " Prod is untouched: local QuestDB + local app only."
 echo "============================================================"
 
 # 1. Stop any running normal app (make local-stop semantics — never adopt).
+# FIX 19 item 3: AUTOPILOT_PROBE_PREP=1 makes cmd_stop send the calm
+# "probe preparing: clearing the runway" message instead of the manual-stop
+# "autopilot will NOT auto-restart today" page — terrifying to read seconds
+# after clicking Run. The marker handling is unchanged (grace window covers it).
+export AUTOPILOT_PROBE_PREP=1
 echo "stopping any running normal app first (scale run needs the overlay config)..."
 make local-stop || true
 # A5: local-stop is pidfile-based — ALSO stop any tickvault release binary

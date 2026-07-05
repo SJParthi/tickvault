@@ -390,6 +390,70 @@ def watermark_lag_should_fire(
 #   mismatch on a future wheel is caught and logged, never breaks the sidecar.
 NATS_REASON_POLL_SECS = 2
 NATS_REASON_HEARTBEAT_SECS = 60
+# FIX 19 item 4: the SDK's own logger line ("growwapi.groww.nats_client:
+# Error: ") repeated every ~4.1s on the LIVE probe run with an EMPTY message.
+# nats-py captured the ORIGINAL bound `_on_error_cb` at connect() time, so
+# the instance-attribute hooks below cannot intercept THAT specific logging
+# call — but the logging module can: a Filter attached to the SDK's logger
+# runs where the record is CREATED. It (a) enriches an empty `Error: %s`
+# message with the exception CLASS + repr() so Monday's log names WHY, and
+# (b) coalesces identical repeats — the 1st prints, then every
+# NATS_ERROR_LOG_EVERYth (with the running count); the rest are suppressed.
+# Behavior is otherwise unchanged: non-"Error"-prefixed and non-repeating
+# records pass through untouched, and a broken filter fails OPEN (returns
+# True) so no log line can ever be lost to this diagnostic.
+NATS_ERROR_LOG_EVERY = 30
+SDK_NATS_LOGGER_NAME = "growwapi.groww.nats_client"
+_NATS_ERROR_COUNT_CAP = 512  # bound the dedup map; clear if ever exceeded
+
+
+class NatsErrorDetailFilter(logging.Filter):
+    """Enrich empty 'Error: %s' SDK records + coalesce repeats (FIX 19)."""
+
+    def __init__(self, secrets):
+        super().__init__()
+        self._secrets = secrets
+        self._counts = {}
+
+    def filter(self, record):  # noqa: A003 - logging.Filter API name
+        try:
+            if not str(record.msg).startswith("Error"):
+                return True
+            args = record.args
+            if args is not None and not isinstance(args, tuple):
+                args = (args,)
+            exc = args[0] if args else None
+            rendered = record.getMessage()
+            if isinstance(exc, BaseException) and not str(exc).strip():
+                detail = _redact(repr(exc), self._secrets)
+                rendered = (
+                    f"{rendered}[empty message; class={type(exc).__name__}; "
+                    f"{detail}]"
+                )
+            if len(self._counts) > _NATS_ERROR_COUNT_CAP:
+                self._counts.clear()
+            count = self._counts.get(rendered, 0) + 1
+            self._counts[rendered] = count
+            if count > 1 and count % NATS_ERROR_LOG_EVERY != 0:
+                return False
+            if count > 1:
+                rendered = (
+                    f"{rendered} [seen {count}x; printing the 1st + every "
+                    f"{NATS_ERROR_LOG_EVERY}th]"
+                )
+            record.msg = rendered
+            record.args = None
+            return True
+        except Exception:  # noqa: BLE001 - a broken filter must never lose logs
+            return True
+
+
+def install_sdk_error_filter(secrets) -> None:
+    """Attach the enrich+coalesce filter to the SDK NATS logger (idempotent)."""
+    logger = logging.getLogger(SDK_NATS_LOGGER_NAME)
+    if not any(isinstance(f, NatsErrorDetailFilter) for f in logger.filters):
+        logger.addFilter(NatsErrorDetailFilter(secrets))
+
 # Substrings that mark a true authorization / permissions / protocol reject.
 _REJECT_MARKERS = (
     "authorization",
@@ -2680,6 +2744,9 @@ def main() -> None:
             # attribute rename is caught and logged, never breaks the feed. Armed once
             # per process (the poller watches the global counters for the lifetime).
             if not watchdog_started:
+                # FIX 19 item 4: enrich + coalesce the SDK's empty "Error:"
+                # logger lines (idempotent; logger-level, survives reconnects).
+                install_sdk_error_filter(secrets)
                 install_nats_reason_hooks(feed, secrets)
                 threading.Thread(
                     target=nats_reject_poller,

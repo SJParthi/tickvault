@@ -783,5 +783,75 @@ class CaptureEmitTests(unittest.TestCase):
         self.assertEqual(rows[1]["capture_ns"], 42)
 
 
+class NatsErrorFilterTests(unittest.TestCase):
+    """FIX 19 item 4: the SDK's empty 'Error:' logger lines are enriched with
+    the exception class/repr and coalesced (1st + every 30th) so Monday's log
+    names WHY instead of printing a blank line every ~4.1s."""
+
+    def setUp(self) -> None:
+        import io
+        import logging
+
+        self._logger = logging.getLogger(groww_sidecar.SDK_NATS_LOGGER_NAME)
+        self._logger.propagate = False
+        self._buf = io.StringIO()
+        self._handler = logging.StreamHandler(self._buf)
+        self._logger.addHandler(self._handler)
+        self._logger.setLevel(logging.DEBUG)
+        # fresh filter per test (remove any left by another test)
+        for f in list(self._logger.filters):
+            if isinstance(f, groww_sidecar.NatsErrorDetailFilter):
+                self._logger.removeFilter(f)
+        groww_sidecar.install_sdk_error_filter([])
+
+    def tearDown(self) -> None:
+        self._logger.removeHandler(self._handler)
+        for f in list(self._logger.filters):
+            if isinstance(f, groww_sidecar.NatsErrorDetailFilter):
+                self._logger.removeFilter(f)
+
+    def _lines(self):
+        return [ln for ln in self._buf.getvalue().splitlines() if ln]
+
+    def test_empty_error_is_enriched_with_class_and_repr(self) -> None:
+        class EmptyErr(Exception):
+            def __str__(self) -> str:
+                return ""
+
+        self._logger.error("Error: %s", EmptyErr())
+        lines = self._lines()
+        self.assertEqual(len(lines), 1)
+        self.assertIn("class=EmptyErr", lines[0])
+
+    def test_repeats_coalesced_first_plus_every_30th(self) -> None:
+        class EmptyErr(Exception):
+            def __str__(self) -> str:
+                return ""
+
+        for _ in range(65):
+            self._logger.error("Error: %s", EmptyErr())
+        lines = self._lines()
+        self.assertEqual(len(lines), 3, lines)  # 1st, 30th, 60th
+        self.assertIn("seen 30x", lines[1])
+        self.assertIn("seen 60x", lines[2])
+
+    def test_non_error_records_pass_untouched(self) -> None:
+        self._logger.error("connected to %s", "server")
+        self.assertEqual(self._lines(), ["connected to server"])
+
+    def test_non_empty_error_detail_not_enriched(self) -> None:
+        self._logger.error("Error: %s", ValueError("real reason"))
+        self.assertEqual(self._lines(), ["Error: real reason"])
+
+    def test_install_is_idempotent(self) -> None:
+        groww_sidecar.install_sdk_error_filter([])
+        groww_sidecar.install_sdk_error_filter([])
+        count = sum(
+            isinstance(f, groww_sidecar.NatsErrorDetailFilter)
+            for f in self._logger.filters
+        )
+        self.assertEqual(count, 1)
+
+
 if __name__ == "__main__":
     unittest.main()
