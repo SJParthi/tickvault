@@ -996,7 +996,7 @@ mod tests {
     /// on Ctrl-C / 15:30 IST close instead of leaving the lock to
     /// expire silently after 90s TTL.
     ///
-    /// The bridge takes `instance_lock_shutdown_chain` (an
+    /// The bridge clones `instance_lock_shutdown_chain` (an
     /// `Option<Arc<Notify>>`), spawns a small bridge task that
     /// awaits the broader `shutdown_notify`, and triggers the
     /// heartbeat's own Notify. Without this chain, a graceful
@@ -1004,6 +1004,15 @@ mod tests {
     /// would only get released by TTL expiry, and the
     /// `live_instance_lock` audit table would be missing the
     /// `GracefulRelease` row for every clean exit.
+    ///
+    /// BUG-1 fix (2026-07-05): the bridge alone was NOT enough — the
+    /// heartbeat JoinHandle was dropped at spawn time, so the release
+    /// (SSM DeleteParameter) RACED process exit (the live 15:35 IST
+    /// graceful EOD stop left the lock in SSM; the 17:59 boot found it
+    /// stale at age 8622s). The chain is now `.clone()`d into the bridge
+    /// AND threaded (with the heartbeat handle) into `DhanLaneRunHandles`
+    /// so `teardown_dhan_lane_tasks` can `notify_one()` it directly and
+    /// bound-await the release before the process exits.
     #[test]
     fn test_instance_lock_shutdown_chain_is_wired() {
         let main_rs = std::fs::read_to_string("../app/src/main.rs")
@@ -1012,7 +1021,10 @@ mod tests {
 
         let calls_spawn_heartbeat = main_rs.contains("spawn_instance_lock_heartbeat");
         let declares_chain = main_rs.contains("instance_lock_shutdown_chain");
-        let takes_chain = main_rs.contains("instance_lock_shutdown_chain.take()");
+        let bridges_chain = main_rs.contains("instance_lock_shutdown_chain.clone()");
+        let threads_chain_into_lane =
+            main_rs.contains("instance_lock_shutdown: instance_lock_shutdown_chain");
+        let awaits_release = main_rs.contains("INSTANCE_LOCK_RELEASE_TIMEOUT_SECS");
 
         if calls_spawn_heartbeat {
             assert!(
@@ -1024,11 +1036,20 @@ mod tests {
                  Phase 0 Item 19f."
             );
             assert!(
-                takes_chain,
-                "main.rs declares `instance_lock_shutdown_chain` but does not call \
-                 `.take()` to spawn the bridge task. The chain must be consumed \
-                 once at the point `shutdown_notify` is constructed; otherwise the \
-                 heartbeat never observes the shutdown signal."
+                bridges_chain,
+                "main.rs declares `instance_lock_shutdown_chain` but does not \
+                 `.clone()` it into the bridge task at the point `shutdown_notify` \
+                 is constructed; the heartbeat would never observe the broader \
+                 shutdown signal."
+            );
+            assert!(
+                threads_chain_into_lane && awaits_release,
+                "main.rs must thread `instance_lock_shutdown_chain` (and the \
+                 heartbeat JoinHandle) into `DhanLaneRunHandles` and bound-await \
+                 the release (INSTANCE_LOCK_RELEASE_TIMEOUT_SECS) in \
+                 `teardown_dhan_lane_tasks` — otherwise the SSM DeleteParameter \
+                 races process exit and every graceful stop leaks the lock \
+                 (BUG-1, live proof 2026-07-05 15:35 IST)."
             );
         }
     }
