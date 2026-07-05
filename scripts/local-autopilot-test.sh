@@ -460,7 +460,8 @@ t "F9: probe body carries the || true guard" "1" "$(sed -n '/^docker_vm_disk_pct
 t "F2: start_app lock-skip returns rc 3" "1" "$(sed -n '/^start_app()/,/^}/p' scripts/local-autopilot.sh | grep -c 'return 3')"
 t "F2: peer-tolerant wrapper exists" "0" "$(grep -q '^start_app_tolerate_peer()' scripts/local-autopilot.sh && echo 0 || echo 1)"
 t "F2: cmd_start words the peer case honestly" "0" "$(grep -q 'Another launcher is already starting the app' scripts/local-autopilot.sh && echo 0 || echo 1)"
-t "F2: robot day flow uses the peer-tolerant wrapper" "7" "$(grep -c 'start_app_tolerate_peer "' scripts/local-autopilot.sh || true)"
+# (8 sites since FIX 18 G16: the skip-max normal-session fallback added one.)
+t "F2: robot day flow uses the peer-tolerant wrapper" "8" "$(grep -c 'start_app_tolerate_peer "' scripts/local-autopilot.sh || true)"
 # F1: BOTH git writers serialize (acquire-or-skip) against a lock-held build
 t "F1: both git writers take the launcher lock (acquire-or-skip)" "2" "$(grep -c 'launcher_lock_acquire_wait 5' scripts/local-autopilot.sh || true)"
 t "F1: cmd_dev releases the lock BEFORE the re-exec" "1" "$(sed -n '/^cmd_dev()/,/^}/p' scripts/local-autopilot.sh | grep -c 'launcher_lock_release # MUST release before exec')"
@@ -488,13 +489,111 @@ t "F6/F7: garbage rc → other (fail-safe)" "other" "$(probe_rc_class "")"
 # 100-conn ladder running for the next start to adopt).
 t "F7: wrapper traps INT distinctly" "1" "$(grep -c "trap 'cleanup 130' INT" scripts/scale-100-probe.sh || true)"
 t "F7: wrapper traps TERM distinctly" "1" "$(grep -c "trap 'cleanup 143' TERM" scripts/scale-100-probe.sh || true)"
-t "F6: wrapper exits 20 on zero evidence rows" "1" "$(grep -c 'exit 20' scripts/scale-100-probe.sh || true)"
+# (2 sites since FIX 18 G15: zero-evidence rows + failed pre-build — both
+#  are the never-launched class, safe to un-burn the attempt.)
+t "F6: wrapper exits 20 on the never-launched class" "2" "$(grep -c 'exit 20' scripts/scale-100-probe.sh || true)"
 t "F8: wrapper cleanup stops the ladder app" "0" "$(sed -n '/^cleanup()/,/^}/p' scripts/scale-100-probe.sh | grep -q 'pkill -TERM -f' && echo 0 || echo 1)"
 # F16: the direct probe entries raise the open-files limit
 t "F16: probe wrapper raises the fd limit" "1" "$(grep -c '^raise_fd_limit' scripts/scale-100-probe.sh || true)"
 t "F16: groww-scale-test raises the fd limit before exec" "0" "$(grep -q 'ulimit -n "\$fd_target"' scripts/groww-scale-test.sh && echo 0 || echo 1)"
 # F17: the clamped-below-need path logs (no silent third outcome)
 t "F17: clamped hard-limit path logs a warning" "0" "$(sed -n '/^raise_fd_limit()/,/^}/p' scripts/local-autopilot.sh | grep -q 'cannot raise further' && echo 0 || echo 1)"
+
+# ── FIX 18: real-environment permutation batch (G1-G16, 2026-07-05) ─────────
+
+# G1: timeout runner selection + timed-out rc classification (pure)
+t "G1: runner prefers timeout" "timeout" "$(timeout_runner 1 1 1)"
+t "G1: runner falls back to gtimeout (macOS coreutils)" "gtimeout" "$(timeout_runner 0 1 1)"
+t "G1: runner falls back to the perl alarm shim" "perl" "$(timeout_runner 0 0 1)"
+t "G1: no runner at all → none (unbounded, logged)" "none" "$(timeout_runner 0 0 0)"
+t "G1: rc 124 is a timeout" "0" "$(timed_out_rc 124 && echo 0 || echo 1)"
+t "G1: rc 142 (128+SIGALRM, perl shim) is a timeout" "0" "$(timed_out_rc 142 && echo 0 || echo 1)"
+t "G1: rc 1 is not a timeout" "1" "$(timed_out_rc 1 && echo 0 || echo 1)"
+t "G1: garbage rc is not a timeout" "1" "$(timed_out_rc "" && echo 0 || echo 1)"
+# G1 source scans: the monitor-loop docker probes are all bounded via dk
+t "G1: docker_alive goes through dk" "0" "$(sed -n '/^docker_alive()/,/}/p' scripts/local-autopilot.sh | grep -q 'dk info' && echo 0 || echo 1)"
+t "G1: container-state probe goes through dk" "0" "$(sed -n '/^questdb_container_state()/,/^}/p' scripts/local-autopilot.sh | grep -q 'dk inspect' && echo 0 || echo 1)"
+t "G1: VM-disk probe goes through dk" "0" "$(sed -n '/^docker_vm_disk_pct()/,/^}/p' scripts/local-autopilot.sh | grep -q 'dk exec' && echo 0 || echo 1)"
+t "G1: compose up is bounded (dk --long)" "0" "$(grep -q 'dk --long compose' scripts/local-autopilot.sh && echo 0 || echo 1)"
+t "G1: no bare 'docker restart' command remains" "0" "$(grep -cE '^[[:space:]]*docker restart' scripts/local-autopilot.sh || true)"
+t "G1: wedged-daemon page is marker-file latched" "0" "$(grep -q 'DOCKER_WEDGED_MARK' scripts/local-autopilot.sh && echo 0 || echo 1)"
+
+# G2/G6/G11: fresh Docker Desktop first-launch modal detection (pure)
+t "G2: app up, never initialized → first_launch" "first_launch" "$(docker_start_failure_hint 1 0)"
+t "G2: app up, settings exist → app_stuck" "app_stuck" "$(docker_start_failure_hint 1 1)"
+t "G2: app not running → not_running" "not_running" "$(docker_start_failure_hint 0 0)"
+t "G2: ensure_docker names the Accept step on first launch" "0" "$(sed -n '/^ensure_docker()/,/^}/p' scripts/local-autopilot.sh | grep -q 'service agreement' && echo 0 || echo 1)"
+t "G2: ensure-ready launches Docker FOREGROUND (modal visible)" "0" "$(grep -c 'open -a Docker --background' scripts/ensure-ready.sh || true)"
+t "G2: ensure-ready names the first-launch state on timeout" "0" "$(grep -q 'FIRST-TIME install' scripts/ensure-ready.sh && echo 0 || echo 1)"
+
+# G3/G7/G12: compose creds — app-parity env resolve + success-only latch
+t "G3/G7: compose creds resolve env like the app (tg_env_resolve)" "0" "$(sed -n '/^export_compose_creds()/,/^}/p' scripts/local-autopilot.sh | grep -q 'tg_env_resolve' && echo 0 || echo 1)"
+t "G3/G7: compose creds fall back to prod (tg_init parity)" "0" "$(sed -n '/^export_compose_creds()/,/^}/p' scripts/local-autopilot.sh | grep -q 'candidates="\$env prod"' && echo 0 || echo 1)"
+t "G3/G7: the dev default is gone from the creds path" "0" "$(sed -n '/^export_compose_creds()/,/^}/p' scripts/local-autopilot.sh | grep -c 'ENVIRONMENT:-dev' || true)"
+t "G12: creds latch is set ONLY on success (2 success sites, no unconditional)" "2" "$(sed -n '/^export_compose_creds()/,/^}/p' scripts/local-autopilot.sh | grep -c 'COMPOSE_CREDS_DONE=1' || true)"
+t "G12: no latch-set as the unconditional second statement" "0" "$(sed -n '/^export_compose_creds()/,/^}/p' scripts/local-autopilot.sh | sed -n '3p' | grep -c 'COMPOSE_CREDS_DONE=1' || true)"
+
+# G4/G9/G10: install-time wake + log dir + launchd PATH (source scans)
+t "G4: installer schedules the 08:50 auto-wake (best-effort)" "0" "$(grep -q 'pmset repeat wakeorpoweron MTWRF 08:50:00' Makefile && echo 0 || echo 1)"
+t "G4: Start button schedules the auto-wake too" "0" "$(grep -q 'pmset repeat wakeorpoweron' 'Start TickVault.command' && echo 0 || echo 1)"
+t "G4: uninstall cancels the auto-wake" "0" "$(grep -q 'pmset repeat cancel' Makefile && echo 0 || echo 1)"
+t "G9: Makefile install creates data/logs before bootstrap" "0" "$(sed -n '/^local-autopilot-install:/,/^$/p' Makefile | grep -q 'data/logs' && echo 0 || echo 1)"
+t "G9: Start button creates data/logs before bootstrap" "0" "$(grep -q 'mkdir -p data/local-autopilot data/logs' 'Start TickVault.command' && echo 0 || echo 1)"
+t "G9: runbook documents clone -b local-runtime" "0" "$(grep -q 'git clone -b local-runtime' README-LOCAL.md && echo 0 || echo 1)"
+t "G10: plist PATH carries ~/.docker/bin" "0" "$(grep -q '__HOME__/.docker/bin' deploy/local/com.tickvault.local-autopilot.plist.template && echo 0 || echo 1)"
+t "G10: plist PATH carries Docker.app Resources/bin" "0" "$(grep -q '/Applications/Docker.app/Contents/Resources/bin' deploy/local/com.tickvault.local-autopilot.plist.template && echo 0 || echo 1)"
+t "G10: ensure_docker probes ~/.docker/bin before 'not found'" "0" "$(sed -n '/^ensure_docker()/,/^}/p' scripts/local-autopilot.sh | grep -q '.docker/bin' && echo 0 || echo 1)"
+t "G1: plist has the 09:05 weekday catch-up fires" "5" "$(grep -c '<integer>9</integer><key>Minute</key><integer>5</integer>' deploy/local/com.tickvault.local-autopilot.plist.template || true)"
+
+# G1 compounding: run-lock takeover decision (pure)
+t "G1c: same-day live holder → exit (genuine duplicate)" "exit" "$(run_lock_takeover 1 2026-07-06 2026-07-06)"
+t "G1c: previous-day live holder → steal (wedged run)" "steal" "$(run_lock_takeover 1 2026-07-03 2026-07-06)"
+t "G1c: dateless live holder → exit (conservative)" "exit" "$(run_lock_takeover 1 "" 2026-07-06)"
+t "G1c: dead holder → reclaim" "reclaim" "$(run_lock_takeover 0 2026-07-03 2026-07-06)"
+t "G1c: cmd_run writes the date into the lock" "0" "$(grep -q '"$TODAY" >"$LOCKDIR/pid"' scripts/local-autopilot.sh && echo 0 || echo 1)"
+
+# G5: manual-start background monitor (pure decision + wiring scans)
+t "G5: nothing covers the day → spawn" "spawn" "$(manual_monitor_needed 0 0 3600)"
+t "G5: robot alive → skip" "skip" "$(manual_monitor_needed 1 0 3600)"
+t "G5: monitor already running → skip" "skip" "$(manual_monitor_needed 0 1 3600)"
+t "G5: past EOD → skip (evening session runs until Stop)" "skip" "$(manual_monitor_needed 0 0 0)"
+t "G5: garbage secs → skip (fail-safe)" "skip" "$(manual_monitor_needed 0 0 abc)"
+t "G5: cmd_start spawns the monitor" "0" "$(sed -n '/^cmd_start()/,/^}/p' scripts/local-autopilot.sh | grep -q 'maybe_spawn_manual_monitor' && echo 0 || echo 1)"
+t "G5: cmd_stop stops the monitor (Stop always wins)" "0" "$(sed -n '/^cmd_stop()/,/^}/p' scripts/local-autopilot.sh | grep -q 'stop_manual_monitor' && echo 0 || echo 1)"
+t "G5: cmd_run takes the day over from a manual monitor" "0" "$(sed -n '/^cmd_run()/,/^}/p' scripts/local-autopilot.sh | grep -q 'stop_manual_monitor' && echo 0 || echo 1)"
+t "G5: monitor subcommand is dispatchable" "0" "$(grep -q '^monitor) cmd_monitor ;;' scripts/local-autopilot.sh && echo 0 || echo 1)"
+
+# G8/G14: caffeinate floor (pure)
+t "G8: after-15:45 start still arms the 4h floor" "14400" "$(caffeinate_secs 15:45 16:00:00 14400)"
+t "G8: until-target wins when larger than the floor" "21600" "$(caffeinate_secs 15:45 09:45:00 14400)"
+t "G8: garbage floor degrades to plain until-target" "3600" "$(caffeinate_secs 10:00 09:00:00 abc)"
+t "G8: zero floor + passed target → 0 (legacy behavior reachable)" "0" "$(caffeinate_secs 15:45 16:00:00 0)"
+t "G8: start_caffeinate uses the floor helper" "0" "$(sed -n '/^start_caffeinate()/,/^}/p' scripts/local-autopilot.sh | grep -q 'caffeinate_secs' && echo 0 || echo 1)"
+
+# G13: image-pull failure classification (pure) + bounded git fetch
+t "G13: 429/toomanyrequests → rate_limit" "rate_limit" "$(pull_failure_class 'toomanyrequests: You have reached your pull rate limit')"
+t "G13: DNS lookup failure → offline" "offline" "$(pull_failure_class 'dial tcp: lookup registry-1.docker.io: no such host')"
+t "G13: unknown manifest → other" "other" "$(pull_failure_class 'manifest unknown')"
+t "G13: empty output → other" "other" "$(pull_failure_class "")"
+t "G13: ensure_questdb pre-pulls the image explicitly" "0" "$(sed -n '/^ensure_questdb()/,/^}/p' scripts/local-autopilot.sh | grep -q 'pull_failure_class' && echo 0 || echo 1)"
+t "G13: git fetch is time-bounded (both sites)" "2" "$(grep -c 'with_timeout "\$GIT_NET_TIMEOUT_SECS" git fetch' scripts/local-autopilot.sh || true)"
+
+# G15: probe pre-build outside the hard time cap (source scans)
+t "G15: launcher pre-builds before the probe" "0" "$(sed -n '/^maybe_run_probe_once()/,/^}/p' scripts/local-autopilot.sh | grep -q 'cargo build --release' && echo 0 || echo 1)"
+t "G15: probe wrapper builds a missing binary before its timer" "0" "$(grep -q 'BEFORE the probe timer starts' scripts/scale-100-probe.sh && echo 0 || echo 1)"
+
+# G16: clamped-memory max-ladder gate + OOM naming (pure + scans)
+t "G16: clamped run skips the max ladder" "skip_max" "$(scale_max_gate 1)"
+t "G16: unclamped run allows max" "max" "$(scale_max_gate 0)"
+t "G16: garbage clamp flag allows max (default 0)" "max" "$(scale_max_gate "")"
+t "G16: OOMKilled true detected" "0" "$(oomkilled_is_true 'true' && echo 0 || echo 1)"
+t "G16: OOMKilled false rejected" "1" "$(oomkilled_is_true 'false' && echo 0 || echo 1)"
+t "G16: OOMKilled with whitespace detected" "0" "$(oomkilled_is_true ' true
+' && echo 0 || echo 1)"
+t "G16: the scale branch consults the gate" "0" "$(grep -q 'scale_max_gate "\${QDB_MEM_CLAMPED:-0}"' scripts/local-autopilot.sh && echo 0 || echo 1)"
+t "G16: the clamp sets the flag" "0" "$(grep -q 'QDB_MEM_CLAMPED=1' scripts/local-autopilot.sh && echo 0 || echo 1)"
+t "G16: the 'works fine' false-OK wording is gone" "0" "$(grep -c 'this works fine' scripts/local-autopilot.sh || true)"
+t "G16: ensure_questdb names an OOM kill as OOM" "0" "$(sed -n '/^ensure_questdb()/,/^}/p' scripts/local-autopilot.sh | grep -q 'oomkilled_is_true' && echo 0 || echo 1)"
 
 echo
 echo "local-autopilot pure-logic tests: $PASS passed, $FAIL failed"

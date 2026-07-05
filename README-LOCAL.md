@@ -74,7 +74,15 @@ make local-autopilot-install
 ```
 
 Either path installs a launchd agent that fires `scripts/local-autopilot.sh run`
-every weekday at **08:55 (Mac local time — the Mac must be on IST)**. From
+every weekday at **08:55 (Mac local time — the Mac must be on IST)**, plus a
+**09:05 catch-up fire** (FIX 18: idempotent — a healthy 08:55 run makes the
+09:05 fire exit instantly; a missed or wedged 08:55 gets a second chance,
+and a stuck PREVIOUS-day run holding the lock is stopped and taken over).
+The installer also tries to schedule a weekday **08:50 auto-wake**
+(`pmset repeat wakeorpoweron MTWRF 08:50:00`) — launchd can NOT wake a
+sleeping Mac by itself, so without this a closed-lid morning silently skips
+the day. Setting it needs the admin password once; if the installer could
+not set it, run that one command in Terminal yourself. From
 then on, each morning the autopilot, entirely by itself:
 
 1. Classifies the day: weekend / NSE holiday → quiet no-op; **Jul 6–8**
@@ -115,7 +123,44 @@ then on, each morning the autopilot, entirely by itself:
 - **Docker memory check:** at every start the autopilot compares Docker
   Desktop's VM memory against the database's pinned budget (8g) and warns
   (log + Telegram) if the VM is smaller — otherwise the database would be
-  silently killed under load instead of using its full budget.
+  silently killed under load instead of using its full budget. FIX 18: a
+  clamped run also SKIPS the 100K max-scale ladder (an under-provisioned
+  database's memory pressure would masquerade as a Groww limit), and an
+  actually OOM-killed database is reported AS an out-of-memory kill, not
+  as a generic stall.
+- **Wedged-Docker protection (FIX 18):** every docker command the
+  automation runs is time-bounded — a Docker Desktop auto-update or a
+  half-dead socket after a hard sleep/wake can make docker HANG instead of
+  erroring, which previously froze the whole monitor loop (no 3:35 PM
+  stop, no relaunch, no self-heal). Now a hung command is cut off, one
+  Telegram warns per episode, and the day's schedule keeps running.
+
+### Fresh Mac setup — the three things automation cannot click for you (FIX 18)
+
+1. **Clone the RIGHT branch.** The two buttons exist ONLY on
+   `local-runtime` — a plain `git clone` lands on `main`, which has no
+   buttons at all. Clone with:
+
+   ```bash
+   git clone -b local-runtime https://github.com/SJParthi/tickvault.git
+   ```
+
+2. **Open Docker Desktop ONCE after installing it.** A brand-new Docker
+   Desktop shows a Subscription Service Agreement + setup screens on its
+   very first launch, and its engine will NOT start until a human clicks
+   **Accept** (skipping sign-in is fine). The Start button now detects
+   this state and tells you exactly that — pre-seeding the acceptance
+   programmatically is NOT done because Docker Desktop 4.80 ignores
+   settings-file edits (proven live 2026-07-05). One click, once, forever.
+   Related first-run note: the very first database start downloads the
+   database image from Docker Hub — on shared home internet the anonymous
+   download limit can block it; the Start button now says so explicitly
+   (wait an hour, or `docker login` once with a free account).
+
+3. **Allow the 08:50 auto-wake once** (admin password):
+   `sudo pmset repeat wakeorpoweron MTWRF 08:50:00` — without it, a Mac
+   that is asleep at 08:55 skips the trading day silently (the lid must
+   also stay open; caffeinate cannot prevent closed-lid sleep).
 
 Watch or intervene any time: `make local-status`, the logs in
 `data/local-autopilot/`, and the Telegram messages (all prefixed

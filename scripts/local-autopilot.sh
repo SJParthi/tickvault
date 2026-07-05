@@ -71,10 +71,35 @@ HOLIDAYS_FILE="${HOLIDAYS_FILE:-config/base.toml}"
 # override — a 100k ladder under 6g would gate/roll back earlier than the
 # manual path). Env-overridable like every other tunable.
 export QDB_MEM_LIMIT="${QDB_MEM_LIMIT:-8g}"
+# FIX 18 G16: set to 1 by check_docker_vm_memory when the pin above had to
+# be clamped to a smaller Docker VM — the scale branch refuses the 100k max
+# ladder on a clamped run (an OOM'd database would masquerade as a Groww cap).
+QDB_MEM_CLAMPED="${QDB_MEM_CLAMPED:-0}"
+# FIX 18 G1: every docker CLI call is bounded — a wedged daemon (mid
+# auto-update, half-dead socket after a hard Mac sleep/wake) previously hung
+# the single-threaded monitor loop forever: no 15:35 EOD stop, no crash
+# relaunch, no database self-heal, and the stuck run's lock blocked the next
+# morning's fire. Short timeout for probes; long for compose up / restart /
+# image pull (real work, still bounded).
+DOCKER_CMD_TIMEOUT_SECS="${DOCKER_CMD_TIMEOUT_SECS:-15}"
+DOCKER_LONG_TIMEOUT_SECS="${DOCKER_LONG_TIMEOUT_SECS:-300}"
+# FIX 18 G13: network git ops (fetch) are bounded too — a captive/black-hole
+# Wi-Fi at 08:55 previously HUNG the boot (a hang is not a failure, so the
+# graceful offline fallback never fired).
+GIT_NET_TIMEOUT_SECS="${GIT_NET_TIMEOUT_SECS:-60}"
+# FIX 18 G8/G14: keep-awake FLOOR. A Start after 15:45 IST previously armed
+# ZERO caffeinate (secs_until returned 0) — the evening cold release build /
+# weekend probe ladder ran with no idle-sleep protection. The keep-awake is
+# now max(until CAFFEINATE_UNTIL_IST, this floor); the EOD stop still
+# disarms it early on trading days.
+CAFFEINATE_MIN_SECS="${CAFFEINATE_MIN_SECS:-14400}"
 
 APP_PIDFILE="$AUTOPILOT_DIR/app.pid"
 CAFF_PIDFILE="$AUTOPILOT_DIR/caffeinate.pid"
 LOCKDIR="$AUTOPILOT_DIR/autopilot.lock.d"
+# FIX 18 G5: the manual-start background monitor's pidfile (spawned by
+# cmd_start when no 08:55 robot is covering the day).
+MONITOR_PIDFILE="$AUTOPILOT_DIR/monitor.pid"
 
 # ── Pure decision functions (unit-tested; no I/O beyond declared file args) ─
 
@@ -777,7 +802,10 @@ vm_disk_high() {
 # questdb heal, no EOD stop — at the next 30-min disk recheck. The exact
 # dead-container scenario the heal exists for must never abort the probe.
 docker_vm_disk_pct() {
-  docker exec tv-questdb df -Pk / 2>/dev/null | awk 'NR==2 {gsub(/%/, "", $5); print $5}' || true
+  # FIX 18 G1: bounded via dk — a wedged daemon made this exec BLOCK forever
+  # inside the monitor loop's 30-min disk recheck (runtime-only: dk is
+  # defined in the runtime section; this fn is never invoked in lib mode).
+  dk exec tv-questdb df -Pk / 2>/dev/null | awk 'NR==2 {gsub(/%/, "", $5); print $5}' || true
 }
 
 # dhan_enabled_from_files <file...> → the effective dhan_enabled value:
@@ -940,6 +968,118 @@ adopt_health_decision() {
   echo adopt
 }
 
+# ── FIX 18 pure helpers (real-environment permutation batch, 2026-07-05) ───
+
+# timeout_runner <have_timeout 0|1> <have_gtimeout 0|1> <have_perl 0|1>
+# → timeout|gtimeout|perl|none. G1: macOS ships NO `timeout` binary —
+# coreutils provides gtimeout; the perl-alarm shim (alarm survives exec)
+# is the always-present fallback; none = run unbounded (logged once).
+timeout_runner() {
+  if [ "${1:-0}" = "1" ]; then
+    echo timeout
+  elif [ "${2:-0}" = "1" ]; then
+    echo gtimeout
+  elif [ "${3:-0}" = "1" ]; then
+    echo perl
+  else
+    echo none
+  fi
+}
+
+# timed_out_rc <rc> → 0 when the rc means the wrapped command was KILLED by
+# the timeout (124 = timeout/gtimeout convention; 142 = 128+SIGALRM from
+# the perl shim). Any other rc — including garbage — is NOT a timeout.
+timed_out_rc() {
+  case "${1:-}" in 124 | 142) return 0 ;; *) return 1 ;; esac
+}
+
+# docker_start_failure_hint <app_running 0|1> <settings_exists 0|1>
+# → first_launch | app_stuck | not_running. G2/G6/G11: a FRESH Docker
+# Desktop's first-ever launch blocks the engine behind the Subscription
+# Service Agreement / onboarding modal — launching Docker.app shows the
+# window but the daemon never starts until a human clicks Accept. App
+# running with NO settings store on disk = never initialized = modal is up.
+docker_start_failure_hint() {
+  if [ "${1:-0}" != "1" ]; then
+    echo not_running
+    return 0
+  fi
+  if [ "${2:-0}" = "1" ]; then echo app_stuck; else echo first_launch; fi
+}
+
+# caffeinate_secs <target HH:MM> <now HH:MM:SS> <floor_secs> → keep-awake
+# seconds: max(secs-until-target, floor). G8/G14 (see CAFFEINATE_MIN_SECS).
+# Garbage floor → 0 (falls back to the plain until-target behavior).
+caffeinate_secs() {
+  local until floor="${3:-0}"
+  until=$(secs_until "${1:-}" "${2:-}")
+  case "$floor" in '' | *[!0-9]*) floor=0 ;; esac
+  if ((until > floor)); then echo "$until"; else echo "$floor"; fi
+}
+
+# pull_failure_class <docker pull output> → rate_limit|offline|other. G13:
+# a Docker Hub anonymous-pull 429 or an offline/captive network on the
+# first-ever image pull was misdiagnosed as "Docker not running".
+pull_failure_class() {
+  case "${1:-}" in
+  *toomanyrequests* | *"429"* | *"rate limit"* | *"pull rate"*) echo rate_limit ;;
+  *"no such host"* | *"lookup "* | *"connection refused"* | *"network is unreachable"* | *"i/o timeout"* | *"TLS handshake timeout"* | *"request canceled"*) echo offline ;;
+  *) echo other ;;
+  esac
+}
+
+# run_lock_takeover <holder_alive 0|1> <lock_date> <today> → exit|steal|reclaim
+# G1 compounding: a WEDGED previous-day run (hung on a dead docker socket)
+# held the run lock forever — every next-morning fire then saw the pid
+# "alive" and exited, losing the day. A live SAME-day holder is a genuine
+# duplicate (exit); a live holder whose lock date is a DIFFERENT day is
+# yesterday's stuck run (steal: stop it + take over); a dateless live
+# holder cannot be proven stale (exit — conservative); dead → reclaim.
+run_lock_takeover() {
+  if [ "${1:-0}" != "1" ]; then
+    echo reclaim
+    return 0
+  fi
+  if [ -z "${2:-}" ] || [ "${2:-}" = "${3:-}" ]; then echo exit; else echo steal; fi
+}
+
+# manual_monitor_needed <run_lock_alive 0|1> <monitor_alive 0|1>
+#                       <secs_until_eod> → spawn|skip. G5: a manual Start
+# with no 08:55 robot alive previously ran the whole day with NO monitor —
+# no 15:35 EOD stop, no crash relaunch, no mid-session disk/database
+# self-heal. Spawn only when nothing else covers the day and the EOD stop
+# is still ahead (an evening session runs until the operator presses Stop).
+manual_monitor_needed() {
+  [ "${1:-0}" = "0" ] || {
+    echo skip
+    return 0
+  }
+  [ "${2:-0}" = "0" ] || {
+    echo skip
+    return 0
+  }
+  case "${3:-}" in
+  '' | *[!0-9]*)
+    echo skip
+    return 0
+    ;;
+  esac
+  if (("${3}" > 0)); then echo spawn; else echo skip; fi
+}
+
+# oomkilled_is_true <docker inspect .State.OOMKilled output> → rc 0 when the
+# container was killed by its OWN memory limit. G16: an OOM-killed database
+# must be reported as OOM (raise Docker memory), never as a generic stall
+# or a Groww cap.
+oomkilled_is_true() { [ "$(printf '%s' "${1:-}" | tr -d '[:space:]')" = "true" ]; }
+
+# scale_max_gate <qdb_mem_clamped 0|1> → max|skip_max. G16: the 100k max
+# ladder was pinned QDB_MEM_LIMIT=8g precisely so it gets its full budget;
+# a clamped (smaller Docker VM) run silently defeated the pin and told the
+# operator "works fine" — then any OOM pressure would be misread as a
+# Groww per-account cap. A clamped run skips the max rung.
+scale_max_gate() { if [ "${1:-0}" = "1" ]; then echo skip_max; else echo max; fi; }
+
 # ── End of pure functions. Library mode stops here. ────────────────────────
 if [[ "${AUTOPILOT_LIB:-0}" == "1" ]]; then
   return 0 2>/dev/null || exit 0
@@ -1059,6 +1199,60 @@ tg() { # best-effort Telegram; the log always carries the message
   bash scripts/notify-telegram.sh "💻 LOCAL autopilot — $*" >>"$(current_log)" 2>&1 || true
 }
 
+# ── FIX 18 G1: bounded external commands ────────────────────────────────────
+# with_timeout <secs> <cmd...> — run cmd under a hard wall-clock timeout.
+# Runner picked once per process by timeout_runner (macOS: gtimeout or the
+# perl-alarm shim — alarm(2) survives execve, so the exec'd command gets
+# SIGALRM → rc 142). No runner at all → run unbounded, logged once.
+WITH_TIMEOUT_RUNNER=""
+with_timeout() {
+  local secs="$1"
+  shift
+  if [ -z "$WITH_TIMEOUT_RUNNER" ]; then
+    WITH_TIMEOUT_RUNNER=$(timeout_runner \
+      "$(command -v timeout >/dev/null 2>&1 && echo 1 || echo 0)" \
+      "$(command -v gtimeout >/dev/null 2>&1 && echo 1 || echo 0)" \
+      "$(command -v perl >/dev/null 2>&1 && echo 1 || echo 0)")
+    if [ "$WITH_TIMEOUT_RUNNER" = "none" ]; then
+      log "no timeout/gtimeout/perl available — external commands run UNBOUNDED (install coreutils for gtimeout)"
+    fi
+  fi
+  case "$WITH_TIMEOUT_RUNNER" in
+  timeout) timeout "$secs" "$@" ;;
+  gtimeout) gtimeout "$secs" "$@" ;;
+  perl) perl -e 'alarm shift @ARGV; exec @ARGV or exit 127' "$secs" "$@" ;;
+  *) "$@" ;;
+  esac
+}
+
+# dk [--long] <docker args...> — EVERY docker CLI call goes through here
+# (G1): a wedged daemon (mid auto-update, half-dead vpnkit socket after a
+# hard sleep/wake) must make the probe return "unknown" instead of hanging
+# the single-threaded monitor loop past the 15:35 EOD stop. A timeout pages
+# ONCE per wedged episode via a MARKER-FILE latch (a variable latch dies in
+# command-substitution subshells like $(docker_vm_disk_pct)); any later
+# successful docker call re-arms it.
+DOCKER_WEDGED_MARK="$AUTOPILOT_DIR/docker-wedged-paged"
+dk() {
+  local secs="$DOCKER_CMD_TIMEOUT_SECS" rc=0
+  if [ "${1:-}" = "--long" ]; then
+    secs="$DOCKER_LONG_TIMEOUT_SECS"
+    shift
+  fi
+  with_timeout "$secs" docker "$@" || rc=$?
+  if timed_out_rc "$rc"; then
+    log "docker command timed out after ${secs}s (docker ${1:-?} ...) — daemon wedged? treating this probe as unknown and moving on"
+    if [ ! -f "$DOCKER_WEDGED_MARK" ]; then
+      touch "$DOCKER_WEDGED_MARK" 2>/dev/null || true
+      tg "⚠️ Docker stopped answering (a command hung and was cut off safely). The run keeps going and keeps re-checking — if Docker Desktop is updating or shows a dialog, open it once and let it finish. The daily 3:35 PM stop is unaffected."
+    fi
+  elif [ "$rc" = "0" ] && [ -f "$DOCKER_WEDGED_MARK" ]; then
+    rm -f "$DOCKER_WEDGED_MARK" 2>/dev/null || true
+    log "docker answering again — wedged-daemon page re-armed"
+  fi
+  return $rc
+}
+
 # export_compose_creds — FIX 5.3: the launcher's own `docker compose`
 # invocations previously ran WITHOUT the SSM-fetched credentials that
 # bootstrap.sh exports, so compose failed interpolating
@@ -1070,24 +1264,41 @@ tg() { # best-effort Telegram; the log always carries the message
 COMPOSE_CREDS_DONE=0
 export_compose_creds() {
   if ((COMPOSE_CREDS_DONE)); then return 0; fi
-  COMPOSE_CREDS_DONE=1
   if [ -n "${TV_QUESTDB_PG_USER:-}" ] && [ -n "${TV_QUESTDB_PG_PASSWORD:-}" ]; then
+    COMPOSE_CREDS_DONE=1
     return 0
   fi
-  local env="${ENVIRONMENT:-dev}" u="" p=""
+  # FIX 18 G3/G7: resolve the SSM environment the way the APP does
+  # (TV_ENVIRONMENT → ENVIRONMENT → prod, via tg_env_resolve — the FIX 8.1
+  # pattern) and fall back to prod like tg_init. The previous dev default
+  # read the nonexistent /tickvault/dev/questdb/* on the operator's
+  # prod-seeded account, so a fresh-clone cold container could never be
+  # created (the compose ${TV_QUESTDB_PG_PASSWORD:?} guard aborted).
+  local env candidates cand u="" p=""
+  env="$(tg_env_resolve "${TV_ENVIRONMENT:-}" "${ENVIRONMENT:-}")"
+  candidates="$env"
+  [ "$env" != "prod" ] && candidates="$env prod"
   if command -v aws >/dev/null 2>&1; then
-    u=$(aws ssm get-parameter --region ap-south-1 --with-decryption \
-      --name "/tickvault/${env}/questdb/pg-user" \
-      --query Parameter.Value --output text --no-cli-pager 2>/dev/null || true)
-    p=$(aws ssm get-parameter --region ap-south-1 --with-decryption \
-      --name "/tickvault/${env}/questdb/pg-password" \
-      --query Parameter.Value --output text --no-cli-pager 2>/dev/null || true)
+    for cand in $candidates; do
+      u=$(aws ssm get-parameter --region ap-south-1 --with-decryption \
+        --name "/tickvault/${cand}/questdb/pg-user" \
+        --query Parameter.Value --output text --no-cli-pager 2>/dev/null || true)
+      p=$(aws ssm get-parameter --region ap-south-1 --with-decryption \
+        --name "/tickvault/${cand}/questdb/pg-password" \
+        --query Parameter.Value --output text --no-cli-pager 2>/dev/null || true)
+      if [ -n "$u" ] && [ "$u" != "None" ] && [ -n "$p" ] && [ "$p" != "None" ]; then
+        export TV_QUESTDB_PG_USER="$u" TV_QUESTDB_PG_PASSWORD="$p" # secret-scan-ignore: values read from AWS SSM above, never hardcoded
+        # FIX 18 G12: latch ONLY on success. A transient 08:55 SSM/network
+        # blip previously baked the empty result in for the whole process,
+        # defeating the 5-minute boot-retry loop built for exactly that
+        # blip (mirror of the tg_init FIX 15.7 pattern).
+        COMPOSE_CREDS_DONE=1
+        log "QuestDB compose credentials loaded from /tickvault/${cand}/questdb/* (region ap-south-1)"
+        return 0
+      fi
+    done
   fi
-  if [ -n "$u" ] && [ "$u" != "None" ] && [ -n "$p" ] && [ "$p" != "None" ]; then
-    export TV_QUESTDB_PG_USER="$u" TV_QUESTDB_PG_PASSWORD="$p" # secret-scan-ignore: values read from AWS SSM above, never hardcoded
-  else
-    log "QuestDB credentials unreadable from SSM (/tickvault/${env}/questdb/*) — the database container can still START if it already exists, but compose cannot (re)create it until the Mac is online"
-  fi
+  log "QuestDB credentials unreadable from SSM (tried: ${candidates// /, } under /tickvault/<env>/questdb/) — the database container can still START if it already exists, but compose cannot (re)create it; the read is retried on the next boot-chain attempt (latch only on success — FIX 18 G12)"
 }
 
 # ── Service primitives (shared by autopilot + manual start/stop) ───────────
@@ -1140,11 +1351,30 @@ app_alive() {
   pid_is_our_app "$(cat "$APP_PIDFILE" 2>/dev/null || true)" "$(file_mtime_epoch "$APP_PIDFILE")"
 }
 
-docker_alive() { docker info >/dev/null 2>&1; }
+# FIX 18 G1: docker info bounded via dk (a wedged daemon BLOCKS here rather
+# than erroring — previously this froze the monitor loop indefinitely).
+docker_alive() { dk info >/dev/null 2>&1; }
 
 ensure_docker() {
+  # FIX 18 G10: Docker Desktop 4.x per-user installs put the docker CLI in
+  # ~/.docker/bin (and Docker.app's Resources/bin) WITHOUT the privileged
+  # /usr/local/bin symlink — the launchd plist PATH missed those, so the
+  # 08:55 robot said "NOT INSTALLED" while a Terminal run (login shell,
+  # ~/.zprofile PATH) worked. Probe the known locations before declaring
+  # docker missing, and say "not found" (not "not installed") honestly.
   if ! command -v docker >/dev/null 2>&1; then
-    tg "🆘 Docker is NOT INSTALLED on this Mac — cannot start. Install Docker Desktop, then double-click Start TickVault."
+    local dkdir
+    for dkdir in "$HOME/.docker/bin" "/Applications/Docker.app/Contents/Resources/bin"; do
+      if [ -x "$dkdir/docker" ]; then
+        PATH="$PATH:$dkdir"
+        export PATH
+        log "docker CLI found at $dkdir (was not on PATH) — added for this run"
+        break
+      fi
+    done
+  fi
+  if ! command -v docker >/dev/null 2>&1; then
+    tg "🆘 The docker command was NOT FOUND on this Mac (checked the usual places including Docker Desktop's own folders). If Docker Desktop is installed, open it once and let it finish setup; otherwise install it. Then double-click Start TickVault."
     return 1
   fi
   if docker_alive; then return 0; fi
@@ -1158,13 +1388,40 @@ ensure_docker() {
       return 0
     fi
   done
-  tg "🆘 Docker daemon did not come up within 120s — start Docker Desktop manually, then double-click Start TickVault."
+  # FIX 18 G2/G6/G11: a FRESH Docker Desktop's first launch blocks the
+  # engine behind the Subscription Service Agreement / onboarding modal —
+  # launching Docker.app shows the window but the daemon never starts until a
+  # human clicks Accept. Detect the never-initialized state (app process up,
+  # no settings store on disk) and say exactly that instead of the generic
+  # "start Docker manually". Pre-seeding the accepted-license flag is NOT
+  # done: Docker Desktop 4.80 ignores settings-file edits (proven live
+  # 2026-07-05, FIX 17) — the one-time human Accept is the honest path.
+  local app_running=0 settings_exists=0 hint
+  if pgrep -f "/Applications/Docker.app" >/dev/null 2>&1; then app_running=1; fi
+  if [ -f "$HOME/Library/Group Containers/group.com.docker/settings-store.json" ] ||
+    [ -f "$HOME/Library/Group Containers/group.com.docker/settings.json" ]; then
+    settings_exists=1
+  fi
+  hint=$(docker_start_failure_hint "$app_running" "$settings_exists")
+  case "$hint" in
+  first_launch)
+    tg "🆘 Docker Desktop is open but has never finished its FIRST-TIME setup, so its engine cannot start. One-time fix: click the Docker window, press Accept on the service agreement, finish the setup screens (skipping sign-in is fine), wait for the whale icon to settle, then double-click Start TickVault again."
+    ;;
+  app_stuck)
+    tg "🆘 Docker Desktop is open but its engine did not answer within 120s. Click the Docker window — if it shows an update or a dialog, let it finish — then double-click Start TickVault again."
+    ;;
+  *)
+    tg "🆘 Docker daemon did not come up within 120s — start Docker Desktop manually, then double-click Start TickVault."
+    ;;
+  esac
   return 1
 }
 
 # Live container state string for tv-questdb (empty when no container).
+# FIX 18 G1: bounded via dk — `docker inspect` on a half-dead socket blocked
+# forever inside questdb_session_healthy's per-minute probe.
 questdb_container_state() {
-  docker inspect --format '{{.State.Status}} {{if .State.Health}}{{.State.Health.Status}}{{end}}' tv-questdb 2>/dev/null || true
+  dk inspect --format '{{.State.Status}} {{if .State.Health}}{{.State.Health.Status}}{{end}}' tv-questdb 2>/dev/null || true
 }
 
 # FIX 16 (F10/F11): per-OUTAGE-EPISODE latches. The monitor loop re-invokes
@@ -1181,11 +1438,42 @@ QDB_FOREIGN_PAGED=0
 
 ensure_questdb() {
   export_compose_creds # FIX 5.3 — compose interpolates TV_QUESTDB_PG_* env
+  # FIX 18 G13: a fresh Docker has no database image — `up -d` folds the
+  # pull in, and a Docker Hub rate-limit / offline network was then
+  # misdiagnosed as "Docker not running" (the dev-path setup script had the
+  # network diagnosis; the two-button path never reached it). Pull
+  # explicitly FIRST (only when the image is absent) and classify a pull
+  # failure by its own output.
+  local qdb_image
+  qdb_image=$(awk '/^  tv-questdb:/{f=1} f && /image:/{print $2; exit}' deploy/docker/docker-compose.yml 2>/dev/null || true)
+  if [ -n "$qdb_image" ] && ! dk image inspect "$qdb_image" >/dev/null 2>&1; then
+    log "database image ($qdb_image) is not on this Mac yet — downloading it first (one-time on a fresh Docker; bounded ${DOCKER_LONG_TIMEOUT_SECS}s)"
+    local pull_out pull_class
+    pull_out=$(with_timeout "$DOCKER_LONG_TIMEOUT_SECS" docker pull "$qdb_image" 2>&1) || true
+    printf '%s\n' "$pull_out" >>"$(current_log)" 2>/dev/null || true
+    if ! dk image inspect "$qdb_image" >/dev/null 2>&1; then
+      pull_class=$(pull_failure_class "$pull_out")
+      case "$pull_class" in
+      rate_limit)
+        tg "🆘 The database image download was BLOCKED by Docker Hub's download limit (shared home internet hits this). Wait about an hour and double-click Start TickVault again — or run 'docker login' once with a free Docker account to lift the limit."
+        return 1
+        ;;
+      offline)
+        tg "🆘 The database image could not be downloaded — this Mac looks OFFLINE (or the Wi-Fi needs a login page first). Get the internet working, then double-click Start TickVault."
+        return 1
+        ;;
+      *)
+        log "database image pull did not complete (unclassified) — letting compose retry the pull as part of start-up"
+        ;;
+      esac
+    fi
+  fi
   # B6: a compose failure must not be swallowed — log it loudly and keep
   # probing (the container may already be running from an earlier start),
   # but the timeout message will name the compose failure as the lead cause.
+  # FIX 18 G1: bounded via dk --long (a wedged daemon must not hang boot).
   local compose_failed=0
-  if ! docker compose -f deploy/docker/docker-compose.yml \
+  if ! dk --long compose -f deploy/docker/docker-compose.yml \
     -f deploy/docker/docker-compose.local.yml up -d tv-questdb >>"$(current_log)" 2>&1; then
     compose_failed=1
     log "docker compose up for the database FAILED (details above in this log) — still probing in case the container is already running"
@@ -1222,9 +1510,20 @@ ensure_questdb() {
     if ((i >= 6)) && questdb_state_degraded "$state"; then
       if [ "$QDB_EPISODE_RESTARTED" = "0" ]; then
         QDB_EPISODE_RESTARTED=1
-        log "QuestDB container degraded ('$state') — one automatic docker restart"
-        tg "⚠️ The database container was stuck — restarting it automatically. No action needed."
-        docker restart tv-questdb >>"$(current_log)" 2>&1 || true
+        # FIX 18 G16: an OOM-kill by the container's OWN memory limit must
+        # be named as OOM — a generic "was stuck" hid the real cause
+        # (Docker VM too small / clamped limit) behind a restart that would
+        # just OOM again under the same load.
+        local oom
+        oom=$(dk inspect --format '{{.State.OOMKilled}}' tv-questdb 2>/dev/null || true)
+        if oomkilled_is_true "$oom"; then
+          log "QuestDB container degraded ('$state') — OOM-KILLED by its own memory limit (QDB_MEM_LIMIT=$QDB_MEM_LIMIT); one automatic docker restart"
+          tg "⚠️ The database ran OUT OF ITS MEMORY ALLOWANCE and was stopped by Docker — restarting it automatically. If this repeats today, open Docker Desktop → Settings → Resources → Memory, raise it to 10 GB, click Apply & Restart."
+        else
+          log "QuestDB container degraded ('$state') — one automatic docker restart"
+          tg "⚠️ The database container was stuck — restarting it automatically. No action needed."
+        fi
+        dk --long restart tv-questdb >>"$(current_log)" 2>&1 || true
       elif ((i == 6)); then
         log "QuestDB container still degraded ('$state') — the one automatic restart for this outage was already used; waiting"
       fi
@@ -1260,7 +1559,13 @@ start_caffeinate() {
     return 0
   fi
   local secs
-  secs=$(secs_until "$CAFFEINATE_UNTIL_IST" "$(ist_hms)")
+  # FIX 18 G8/G14: keep-awake FLOOR — a Start after 15:45 IST previously
+  # armed ZERO caffeinate (secs_until returned 0, no log line either), so
+  # the evening cold release build / weekend probe ladder ran with no
+  # idle-sleep protection on battery. Now max(until 15:45, the floor); the
+  # 15:35 EOD stop still disarms it early on trading days. caffeinate -dims
+  # cannot prevent lid-CLOSE sleep — the lid must stay OPEN regardless.
+  secs=$(caffeinate_secs "$CAFFEINATE_UNTIL_IST" "$(ist_hms)" "$CAFFEINATE_MIN_SECS")
   if ((secs > 0)); then
     # FIX 16 (F5): own process group (mirror of the FIX 15.4 app launch).
     # A plain `caffeinate &` lived in the launcher shell's process group;
@@ -1274,7 +1579,7 @@ start_caffeinate() {
       nohup caffeinate -dims -t "$secs" >/dev/null 2>&1 &
       echo $! >"$CAFF_PIDFILE"
     )
-    log "caffeinate armed for ${secs}s (Mac stays awake until $CAFFEINATE_UNTIL_IST IST; lid must stay OPEN)"
+    log "caffeinate armed for ${secs}s (target $CAFFEINATE_UNTIL_IST IST or the $((CAFFEINATE_MIN_SECS / 3600))h floor, whichever is later; lid must stay OPEN)"
   fi
 }
 
@@ -1699,7 +2004,7 @@ hint_docker_vm_memory() {
 # be OOM-killed under load instead of using its pinned budget.
 check_docker_vm_memory() {
   local vm_bytes limit_bytes
-  vm_bytes=$(docker info --format '{{.MemTotal}}' 2>/dev/null || true)
+  vm_bytes=$(dk info --format '{{.MemTotal}}' 2>/dev/null || true)
   case "$vm_bytes" in '' | *[!0-9]*)
     log "docker VM memory probe unavailable — skipping check"
     return 0
@@ -1724,9 +2029,16 @@ check_docker_vm_memory() {
     local clamped
     if clamped=$(clamp_qdb_mem_g "$vm_bytes"); then
       log "auto-clamping QDB_MEM_LIMIT ${QDB_MEM_LIMIT} → ${clamped} for this run"
-      tg "ℹ️ Docker Desktop has ${vm_gb} GB memory, so the database will use ${clamped} this run — this works fine. Optional (one time, only if you want the full ${QDB_MEM_LIMIT}): open Docker Desktop → Settings → Resources → Memory, raise it to 10 GB, click Apply & Restart."
+      # FIX 18 G16: the clamp silently defeated the 8g max-ladder pin while
+      # telling the operator it was fine — honest wording now, and
+      # the clamped flag makes the scale branch SKIP the 100k max ladder
+      # (an under-provisioned database's OOM pressure would be misread as
+      # a Groww per-account cap).
+      QDB_MEM_CLAMPED=1
+      tg "ℹ️ Docker Desktop has ${vm_gb} GB memory, so the database will use ${clamped} this run — fine for a NORMAL capture day. On a max-scale (100,000-instrument) day the full ladder needs more: open Docker Desktop → Settings → Resources → Memory, raise it to 10 GB, click Apply & Restart (one time)."
       export QDB_MEM_LIMIT="$clamped"
     else
+      QDB_MEM_CLAMPED=1 # FIX 18 G16: VM smaller than the pin — max ladder unsafe here too
       tg "⚠️ Docker Desktop only has ${vm_gb} GB memory and the database's ${QDB_MEM_LIMIT} budget could not be adjusted automatically. Running anyway. Optional fix: open Docker Desktop → Settings → Resources → Memory and raise it to 10 GB, then Apply & Restart."
     fi
   else
@@ -1834,6 +2146,16 @@ maybe_run_probe_once() {
     return 0
   fi
   log "one-time lab marker is dated TODAY (${marker_date}, attempt ${attempt}) — running the 100-connection probe once BEFORE the normal start"
+  # FIX 18 G15: pre-build OUTSIDE the probe's hard time cap. A fresh
+  # clone's cold `cargo build --release` (codegen-units=1 + lto) previously
+  # burned most of the 45-minute cap and the truncated ladder was
+  # misrecorded as "Groww capped us at N" — corrupting the experiment. A
+  # failed build skips the probe WITHOUT burning the attempt.
+  log "pre-building the release binary before the probe (a cold build can take many minutes — it does NOT count against the probe's time cap)"
+  if ! cargo build --release >>"$(current_log)" 2>&1; then
+    tg "🆘 Build FAILED — the one-time 100-connection lab test cannot run today (the attempt was NOT used up). Last lines: $(tail -5 "$(current_log)" | tr '\n' ' | ')"
+    return 0
+  fi
   mkdir -p data/groww-scale
   # Stamp BEFORE the probe: even a crash mid-probe must not re-trigger it —
   # the very next click goes straight to the normal start.
@@ -1956,12 +2278,82 @@ cmd_start() {
   fi
   [ "$start_rc" = "0" ] || return 1
   tg "🚀 Manual start complete — app running, feed capture live. Autopilot (if scheduled) will adopt this app, not double-start."
+  # FIX 18 G5: a manual Start with no 08:55 robot alive previously ran the
+  # whole day with NO monitor — no 15:35 EOD stop (the app + broker session
+  # ran on for hours after close), no one-shot crash relaunch, no
+  # mid-session disk/database self-heal. Spawn the detached monitor
+  # subcommand when nothing else is covering the day.
+  maybe_spawn_manual_monitor
+}
+
+# maybe_spawn_manual_monitor — G5 runtime half of manual_monitor_needed:
+# spawn the detached `monitor` subcommand unless (a) a cmd_run instance is
+# alive (it owns the day), (b) a monitor is already running, or (c) the EOD
+# stop has already passed (an evening session runs until Stop is pressed).
+maybe_spawn_manual_monitor() {
+  local run_alive=0 mon_alive=0 pid
+  pid=$(awk '{print $1}' "$LOCKDIR/pid" 2>/dev/null || true)
+  case "$pid" in
+  '' | *[!0-9]*) : ;;
+  *) if kill -0 "$pid" 2>/dev/null; then run_alive=1; fi ;;
+  esac
+  pid=$(cat "$MONITOR_PIDFILE" 2>/dev/null || true)
+  case "$pid" in
+  '' | *[!0-9]*) : ;;
+  *) if kill -0 "$pid" 2>/dev/null; then mon_alive=1; fi ;;
+  esac
+  if [ "$(manual_monitor_needed "$run_alive" "$mon_alive" "$(secs_until "$EOD_STOP_IST" "$(ist_hms)")")" = "spawn" ]; then
+    (
+      set -m
+      nohup bash "$0" monitor >>"$(current_log)" 2>&1 &
+      echo $! >"$MONITOR_PIDFILE"
+    )
+    log "background monitor spawned (pid $(cat "$MONITOR_PIDFILE" 2>/dev/null || echo '?')) — EOD stop $EOD_STOP_IST, crash relaunch and database self-heal now cover this manual start"
+  else
+    log "no separate monitor spawned (scheduled run active, monitor already running, or past $EOD_STOP_IST IST — an evening session runs until you press Stop)"
+  fi
+}
+
+# ── Subcommand: monitor (FIX 18 G5 — safety net behind a manual Start) ─────
+# Reuses the EXACT monitor loop + EOD tail the 08:55 robot uses; detached by
+# maybe_spawn_manual_monitor. A later cmd_run takes the day over by stopping
+# this monitor (it reads MONITOR_PIDFILE at startup).
+cmd_monitor() {
+  echo $$ >"$MONITOR_PIDFILE"
+  log "manual-start monitor engaged (pid $$) — EOD stop $EOD_STOP_IST IST, crash relaunch + database self-heal active"
+  monitor_until_eod
+  if ! manual_stop_active "$MANUAL_STOP_MARKER" "$(ist_date)"; then
+    stop_app
+    bash scripts/groww-scale-test.sh clean >>"$(current_log)" 2>&1 || true
+  fi
+  stop_caffeinate
+  eod_summary "manual"
+  rm -f "$MONITOR_PIDFILE" 2>/dev/null || true
+  log "manual-start monitor complete"
+}
+
+# stop_manual_monitor — kill the G5 background monitor (Stop always wins;
+# cmd_run also calls this when it takes ownership of the day).
+stop_manual_monitor() {
+  local pid
+  pid=$(cat "$MONITOR_PIDFILE" 2>/dev/null || true)
+  case "$pid" in
+  '' | *[!0-9]*) : ;;
+  *)
+    if kill -0 "$pid" 2>/dev/null; then
+      log "stopping the background manual-start monitor (pid $pid)"
+      kill "$pid" 2>/dev/null || true
+    fi
+    ;;
+  esac
+  rm -f "$MONITOR_PIDFILE" 2>/dev/null || true
 }
 
 # ── Subcommand: manual stop ─────────────────────────────────────────────────
 
 cmd_stop() {
   log "== MANUAL STOP (writing manual-stop marker — autopilot stands down today) =="
+  stop_manual_monitor # FIX 18 G5: Stop always wins over the background monitor
   stop_app
   bash scripts/groww-scale-test.sh clean >>"$(current_log)" 2>&1 || true
   stop_caffeinate
@@ -1972,7 +2364,7 @@ cmd_stop() {
     qdb_state="$(questdb_container_state)"
     if questdb_state_degraded "$qdb_state"; then
       log "QuestDB container degraded at stop ('$qdb_state') — restarting it so it is healthy for the next Start"
-      docker restart tv-questdb >>"$(current_log)" 2>&1 || true
+      dk --long restart tv-questdb >>"$(current_log)" 2>&1 || true
     fi
   fi
   printf '%s %s manual stop\n' "$TODAY" "$(ist_hms)" >"$MANUAL_STOP_MARKER"
@@ -2012,7 +2404,9 @@ cmd_dev() {
         log "self-update skipped — another launcher is mid-flight (likely building); running the existing code so the tree cannot change under its build"
       else
         head_before=$(git rev-parse HEAD 2>/dev/null || echo "")
-        if git fetch origin local-runtime >>"$(current_log)" 2>&1; then
+        # FIX 18 G13: fetch is bounded — a captive/black-hole Wi-Fi made it
+        # HANG (a hang is not a failure; the offline fallback never fired).
+        if with_timeout "$GIT_NET_TIMEOUT_SECS" git fetch origin local-runtime >>"$(current_log)" 2>&1; then
           if git_ff_merge_with_retry origin/local-runtime; then
             head_after=$(git rev-parse HEAD 2>/dev/null || echo "")
             if [ -n "$head_before" ] && [ "$head_before" != "$head_after" ]; then
@@ -2111,12 +2505,14 @@ preflight_git() {
       return 0
     fi
   fi
-  if git fetch origin >>"$(current_log)" 2>&1; then
+  # FIX 18 G13: fetch is bounded — a captive/black-hole Wi-Fi at 08:55 made
+  # it HANG up to the OS TCP timeout instead of taking the offline fallback.
+  if with_timeout "$GIT_NET_TIMEOUT_SECS" git fetch origin >>"$(current_log)" 2>&1; then
     if ! git_ff_merge_with_retry origin/local-runtime; then
       tg "⚠️ local-runtime has diverged from origin (conflict?) — running the EXISTING local code. Resolve with: git merge origin/local-runtime"
     fi
   else
-    log "git fetch failed (offline?) — running existing code"
+    log "git fetch failed or timed out (offline / captive Wi-Fi?) — running existing code"
   fi
   launcher_lock_release
 }
@@ -2195,7 +2591,7 @@ monitor_until_eod() {
       vm_pct=$(docker_vm_disk_pct)
       if vm_disk_high "$vm_pct" "$VM_DISK_WARN_PCT"; then
         if [ "$vm_disk_warned" = "0" ]; then
-          docker system df >>"$(current_log)" 2>&1 || true
+          dk system df >>"$(current_log)" 2>&1 || true
           tg "⚠️ Docker's own virtual disk is ${vm_pct}% full (above ${VM_DISK_WARN_PCT}%). The database lives inside it — raise the Docker Desktop 'Virtual disk limit' (Settings → Resources) soon or the capture can stall. A space breakdown was written to the log."
           vm_disk_warned=1
         fi
@@ -2288,18 +2684,45 @@ monitor_until_eod() {
 
 cmd_run() {
   # Duplicate-instance lock (mkdir is atomic; stale lock from a dead pid is
-  # reclaimed).
+  # reclaimed). FIX 18 G1 compounding: the lock line now carries the DATE —
+  # a WEDGED previous-day run (hung on a dead docker socket) previously
+  # held the lock "alive" forever, so every next-morning fire exited
+  # "another instance is running" and the day was silently lost. A live
+  # holder from a DIFFERENT day is stopped and the lock taken over.
   if ! mkdir "$LOCKDIR" 2>/dev/null; then
-    local old
-    old=$(cat "$LOCKDIR/pid" 2>/dev/null || echo "")
-    if [ -n "$old" ] && kill -0 "$old" 2>/dev/null; then
+    local old_line old old_date holder_alive=0 verdict
+    old_line=$(cat "$LOCKDIR/pid" 2>/dev/null || echo "")
+    old=$(printf '%s' "$old_line" | awk '{print $1}')
+    old_date=$(printf '%s' "$old_line" | awk '{print $2}')
+    if [ -n "$old" ] && kill -0 "$old" 2>/dev/null; then holder_alive=1; fi
+    verdict=$(run_lock_takeover "$holder_alive" "$old_date" "$TODAY")
+    case "$verdict" in
+    exit)
       log "another autopilot instance (pid $old) is running — exiting"
       exit 0
-    fi
-    log "reclaiming stale lock (pid ${old:-?} is gone)"
+      ;;
+    steal)
+      log "autopilot lock is held by a PREVIOUS day's run (pid $old, lock date ${old_date:-?}) — that run is stuck; stopping it and taking over"
+      tg "⚠️ Yesterday's automation was found STUCK this morning — it was stopped automatically and today's run is starting normally."
+      kill -TERM "$old" 2>/dev/null || true
+      sleep 2
+      if kill -0 "$old" 2>/dev/null; then kill -KILL "$old" 2>/dev/null || true; fi
+      rm -rf "$LOCKDIR" 2>/dev/null || true
+      if ! mkdir "$LOCKDIR" 2>/dev/null; then
+        log "could not reclaim the autopilot lock after the takeover — exiting"
+        exit 1
+      fi
+      ;;
+    reclaim)
+      log "reclaiming stale lock (pid ${old:-?} is gone)"
+      ;;
+    esac
   fi
-  echo $$ >"$LOCKDIR/pid"
+  printf '%s %s\n' "$$" "$TODAY" >"$LOCKDIR/pid"
   trap 'rm -rf "$LOCKDIR"' EXIT
+  # FIX 18 G5: the robot owns the day — stop any manual-start background
+  # monitor so two monitor loops never fight over relaunch decisions.
+  stop_manual_monitor
 
   log "===== LOCAL AUTOPILOT run starting ====="
   # Missed-run detection (2026-07-04 resilience fix): if the previous
@@ -2388,10 +2811,21 @@ cmd_run() {
     log "probe verdict: '${verdict:-<none>}' → action: $action"
     case "$action" in
     scale_max)
-      tg "✅ PROBE VERDICT: both connections captured — the 1000 cap is PER-CONNECTION. Switching to the FULL 100K ladder now."
-      stop_app
-      apply_overlay max
-      start_app_tolerate_peer "max-scale ladder" || exit 1
+      # FIX 18 G16: the 100k max ladder was pinned QDB_MEM_LIMIT=8g so it
+      # gets its full database budget — on a clamped (small Docker VM) run
+      # an OOM'd database would masquerade as a Groww cap. Skip the ladder,
+      # keep the normal capture, tell the operator the one-time fix.
+      if [ "$(scale_max_gate "${QDB_MEM_CLAMPED:-0}")" = "skip_max" ]; then
+        tg "⚠️ PROBE VERDICT says the full 100K ladder could run — but Docker Desktop's memory is too small for the database at that scale, so the ladder is SKIPPED today (a normal capture continues). One-time fix: open Docker Desktop → Settings → Resources → Memory, raise it to 10 GB, click Apply & Restart — the next scale day will run the full ladder."
+        stop_app
+        apply_overlay none
+        start_app_tolerate_peer "normal session (max ladder skipped: Docker memory clamped)" || true
+      else
+        tg "✅ PROBE VERDICT: both connections captured — the 1000 cap is PER-CONNECTION. Switching to the FULL 100K ladder now."
+        stop_app
+        apply_overlay max
+        start_app_tolerate_peer "max-scale ladder" || exit 1
+      fi
       ;;
     record_continue)
       tg "🔔 PROBE VERDICT: per-ACCOUNT limit — only one connection streams. That IS the experiment's answer; recorded in the audit table. Continuing a NORMAL session (no laddering)."
@@ -2436,9 +2870,10 @@ run) cmd_run ;;
 start) cmd_start ;;
 stop) cmd_stop ;;
 dev) cmd_dev ;;
+monitor) cmd_monitor ;; # FIX 18 G5: detached safety net behind a manual Start
 status) cmd_status ;;
 *)
-  echo "usage: $0 [run|start|stop|dev|status]" >&2
+  echo "usage: $0 [run|start|stop|dev|monitor|status]" >&2
   exit 2
   ;;
 esac

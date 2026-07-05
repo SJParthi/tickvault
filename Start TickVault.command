@@ -46,14 +46,26 @@ if [ "$(uname -s)" = "Darwin" ] && [ -f "$AUTOPILOT_TEMPLATE" ]; then
   launchctl print "gui/$(id -u)/$AUTOPILOT_LABEL" >/dev/null 2>&1 && agent_loaded=1
   if [ ! -f "$AUTOPILOT_PLIST" ] || [ "$agent_loaded" = "0" ]; then
     echo "Setting up the daily auto-start (one-time, automatic)..."
-    mkdir -p data/local-autopilot "$HOME/Library/LaunchAgents"
+    # FIX 18 G9: data/logs must exist BEFORE launchd loads the agent —
+    # launchd does not create parent dirs for its StandardOut/ErrorPath,
+    # so a fresh clone's pre-script spawn failures had nowhere to land.
+    mkdir -p data/local-autopilot data/logs "$HOME/Library/LaunchAgents"
     if sed -e "s|__REPO__|$PWD|g" -e "s|__HOME__|$HOME|g" \
       "$AUTOPILOT_TEMPLATE" >"$AUTOPILOT_PLIST"; then
       launchctl bootout "gui/$(id -u)/$AUTOPILOT_LABEL" 2>/dev/null || true
       launchctl bootstrap "gui/$(id -u)" "$AUTOPILOT_PLIST" 2>/dev/null ||
         launchctl load "$AUTOPILOT_PLIST" 2>/dev/null || true
       if launchctl print "gui/$(id -u)/$AUTOPILOT_LABEL" >/dev/null 2>&1; then
-        echo "Daily auto-start installed — fires weekdays at 8:55 AM."
+        echo "Daily auto-start installed — fires weekdays at 8:55 AM (+ a 9:05 catch-up)."
+        # FIX 18 G4: launchd cannot fire while the Mac SLEEPS (a closed-lid
+        # morning silently skipped the whole day). Best-effort weekday
+        # 08:50 auto-wake; needs the admin password once if this fails.
+        if sudo -n pmset repeat wakeorpoweron MTWRF 08:50:00 2>/dev/null; then
+          echo "Auto-wake scheduled — the Mac wakes at 8:50 AM on weekdays (lid must stay open)."
+        else
+          echo "NOTE: auto-wake not set (needs the admin password). One-time command in Terminal:"
+          echo "      sudo pmset repeat wakeorpoweron MTWRF 08:50:00"
+        fi
       else
         echo "WARNING: could not load the daily auto-start agent (manual start below still works)."
         echo "         Run 'make local-autopilot-install' in Terminal to see the error."

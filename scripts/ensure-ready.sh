@@ -53,6 +53,19 @@ send_telegram_alert() {
 DOCKER_START_TIMEOUT=120
 
 ensure_docker_daemon_running() {
+    # FIX 18 G10: Docker Desktop 4.x per-user installs put the docker CLI in
+    # ~/.docker/bin (and Docker.app's Resources/bin) WITHOUT the privileged
+    # /usr/local/bin symlink — a non-login shell (launchd/cron) missed it.
+    if ! command -v docker > /dev/null 2>&1; then
+        local dkdir
+        for dkdir in "$HOME/.docker/bin" "/Applications/Docker.app/Contents/Resources/bin"; do
+            if [ -x "$dkdir/docker" ]; then
+                export PATH="$PATH:$dkdir"
+                echo -e "  ${CYAN}docker CLI found at $dkdir (was not on PATH) — added for this run${NC}"
+                break
+            fi
+        done
+    fi
     if docker info > /dev/null 2>&1; then
         return 0
     fi
@@ -60,9 +73,13 @@ ensure_docker_daemon_running() {
     echo -e "${CYAN}Docker daemon not running — auto-starting...${NC}"
 
     if [ "$(uname)" = "Darwin" ]; then
-        # macOS dev: launch Docker Desktop
+        # macOS dev: launch Docker Desktop. FIX 18 G2/G6/G11: NOT
+        # --background — a first-ever launch blocks the engine behind the
+        # Subscription Service Agreement / onboarding modal, and with
+        # --background that modal sat HIDDEN behind IntelliJ/Terminal while
+        # the operator watched a 120s spinner with no visible prompt.
         if [ -d "/Applications/Docker.app" ]; then
-            open -a Docker --background 2>/dev/null || true
+            open -a Docker 2>/dev/null || true
             echo -e "  ${CYAN}Launched Docker Desktop (macOS)${NC}"
         else
             echo -e "${RED}Docker Desktop not installed at /Applications/Docker.app${NC}"
@@ -100,7 +117,17 @@ ensure_docker_daemon_running() {
         return 0
     else
         echo -e "${RED}Docker daemon failed to start after ${DOCKER_START_TIMEOUT}s${NC}"
-        send_telegram_alert "CRITICAL: ensure-ready.sh auto-started Docker but the daemon did not become ready within ${DOCKER_START_TIMEOUT}s. Manual investigation needed. Host: $(hostname), user: ${USER:-unknown}."
+        # FIX 18 G2/G6/G11: a FRESH Docker Desktop's first launch never
+        # starts the engine until a human clicks Accept on the service
+        # agreement — say exactly that instead of a generic timeout.
+        local first_launch_hint=""
+        if [ "$(uname)" = "Darwin" ] &&
+            [ ! -f "$HOME/Library/Group Containers/group.com.docker/settings-store.json" ] &&
+            [ ! -f "$HOME/Library/Group Containers/group.com.docker/settings.json" ]; then
+            first_launch_hint=" Docker Desktop looks like a FIRST-TIME install: open Docker Desktop, click Accept on the service agreement, finish the setup screens (skipping sign-in is fine), then rerun."
+            echo -e "${YELLOW}First-time Docker Desktop setup detected — open Docker Desktop, click Accept on the agreement, finish setup, then rerun.${NC}"
+        fi
+        send_telegram_alert "CRITICAL: ensure-ready.sh auto-started Docker but the daemon did not become ready within ${DOCKER_START_TIMEOUT}s.${first_launch_hint} Host: $(hostname), user: ${USER:-unknown}."
         return 1
     fi
 }

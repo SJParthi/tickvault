@@ -189,6 +189,19 @@ fi
 #    launcher can continue into the normal live start with zero extra clicks.
 if [ -n "${PROBE_AUTO_STOP_MIN:-}" ]; then
   case "$PROBE_AUTO_STOP_MIN" in '' | *[!0-9]*) PROBE_AUTO_STOP_MIN=45 ;; esac
+  # FIX 18 G15: the hard time cap below must measure LADDER time, not a
+  # cold `cargo build --release` (fresh clone: 15-40 min under lto +
+  # codegen-units=1 — most of the 45-min cap), which previously truncated
+  # the ladder and misrecorded the verdict as "Groww capped us at N". The
+  # launcher pre-builds too; this is belt-and-braces for direct runs. A
+  # failed build exits 20 (never-launched class — the attempt un-burns).
+  if [ ! -x target/release/tickvault ]; then
+    echo "release binary missing — building it BEFORE the probe timer starts (a cold build can take many minutes)"
+    cargo build --release || {
+      echo "build failed — the probe cannot run"
+      exit 20
+    }
+  fi
   echo "auto-stop armed: probe ends ~3 min after reaching the ceiling (hard cap ${PROBE_AUTO_STOP_MIN} min)"
   make scale-100-probe &
   probe_pid=$!

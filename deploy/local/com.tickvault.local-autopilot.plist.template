@@ -23,6 +23,13 @@
   </array>
   <key>WorkingDirectory</key>
   <string>__REPO__</string>
+  <!-- FIX 18 G1/G4: TWO fires per weekday — 08:55 (primary) plus a 09:05
+       catch-up. cmd_run is idempotent (a live same-day instance makes the
+       second fire exit immediately; a previous-day WEDGED holder is now
+       stolen), so the catch-up costs nothing on a healthy morning and
+       rescues a missed/hung 08:55 fire. NOTE launchd cannot WAKE a
+       sleeping Mac — the installer schedules a best-effort
+       `pmset repeat wakeorpoweron MTWRF 08:50:00` (needs admin once). -->
   <key>StartCalendarInterval</key>
   <array>
     <dict><key>Weekday</key><integer>1</integer><key>Hour</key><integer>8</integer><key>Minute</key><integer>55</integer></dict>
@@ -30,6 +37,11 @@
     <dict><key>Weekday</key><integer>3</integer><key>Hour</key><integer>8</integer><key>Minute</key><integer>55</integer></dict>
     <dict><key>Weekday</key><integer>4</integer><key>Hour</key><integer>8</integer><key>Minute</key><integer>55</integer></dict>
     <dict><key>Weekday</key><integer>5</integer><key>Hour</key><integer>8</integer><key>Minute</key><integer>55</integer></dict>
+    <dict><key>Weekday</key><integer>1</integer><key>Hour</key><integer>9</integer><key>Minute</key><integer>5</integer></dict>
+    <dict><key>Weekday</key><integer>2</integer><key>Hour</key><integer>9</integer><key>Minute</key><integer>5</integer></dict>
+    <dict><key>Weekday</key><integer>3</integer><key>Hour</key><integer>9</integer><key>Minute</key><integer>5</integer></dict>
+    <dict><key>Weekday</key><integer>4</integer><key>Hour</key><integer>9</integer><key>Minute</key><integer>5</integer></dict>
+    <dict><key>Weekday</key><integer>5</integer><key>Hour</key><integer>9</integer><key>Minute</key><integer>5</integer></dict>
   </array>
   <!-- ONE log file (FIX 4, operator 2026-07-04): every normal launcher line
        goes into the daily data/logs/app.<date>.log via the SCRIPT's own
@@ -45,9 +57,13 @@
   <key>EnvironmentVariables</key>
   <dict>
     <!-- launchd agents get a minimal PATH; the script needs docker, cargo,
-         python3, aws (Telegram). Homebrew + cargo locations included. -->
+         python3, aws (Telegram). Homebrew + cargo locations included.
+         FIX 18 G10: ~/.docker/bin + Docker.app's Resources/bin appended —
+         Docker Desktop 4.x per-user installs put the docker CLI there
+         WITHOUT the /usr/local/bin symlink, so the 08:55 robot said
+         "docker not installed" while a Terminal (login-shell) run worked. -->
     <key>PATH</key>
-    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:__HOME__/.cargo/bin</string>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:__HOME__/.cargo/bin:__HOME__/.docker/bin:/Applications/Docker.app/Contents/Resources/bin</string>
   </dict>
   <!-- No KeepAlive: the script is a one-shot day orchestrator with its own
        in-run monitor loop; launchd re-fires it next weekday morning. -->

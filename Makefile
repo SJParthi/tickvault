@@ -85,20 +85,38 @@ local-status: ## One-glance local autopilot state
 	@bash scripts/local-autopilot.sh status
 
 local-autopilot-install: ## Install the launchd agent (weekdays 08:55 local time)
-	@mkdir -p data/local-autopilot ~/Library/LaunchAgents
+	@# FIX 18 G9: data/logs must exist BEFORE launchd bootstraps — launchd
+	@# does not create parent dirs for StandardOut/ErrorPath, so a fresh
+	@# clone's first pre-script spawn failure had nowhere to land.
+	@mkdir -p data/local-autopilot data/logs ~/Library/LaunchAgents
 	@sed -e "s|__REPO__|$(CURDIR)|g" -e "s|__HOME__|$(HOME)|g" \
 		deploy/local/com.tickvault.local-autopilot.plist.template \
 		> ~/Library/LaunchAgents/com.tickvault.local-autopilot.plist
 	@launchctl bootout gui/$$(id -u)/com.tickvault.local-autopilot 2>/dev/null || true
 	@launchctl bootstrap gui/$$(id -u) ~/Library/LaunchAgents/com.tickvault.local-autopilot.plist \
 		|| launchctl load ~/Library/LaunchAgents/com.tickvault.local-autopilot.plist
-	@echo "local-autopilot installed — fires weekdays 08:55 (Mac local time)."
+	@# FIX 18 G4: launchd cannot fire while the Mac SLEEPS (a closed-lid
+	@# morning silently skipped the whole day). Schedule a weekday 08:50
+	@# wake — needs admin, so best-effort non-interactive sudo with a
+	@# printed one-time command when it cannot be set here.
+	@if [ "$$(uname -s)" = "Darwin" ]; then \
+		if sudo -n pmset repeat wakeorpoweron MTWRF 08:50:00 2>/dev/null; then \
+			echo "auto-wake scheduled — the Mac wakes 08:50 on weekdays (lid must stay open)."; \
+		else \
+			echo "NOTE: could not schedule the 08:50 auto-wake (needs admin password)."; \
+			echo "      Run once:  sudo pmset repeat wakeorpoweron MTWRF 08:50:00"; \
+		fi; \
+	fi
+	@echo "local-autopilot installed — fires weekdays 08:55 + a 09:05 catch-up (Mac local time)."
 	@echo "Manual control any time: double-click 'Start TickVault.command' / 'Stop TickVault.command'."
 
 local-autopilot-uninstall: ## Remove the launchd agent
 	@launchctl bootout gui/$$(id -u)/com.tickvault.local-autopilot 2>/dev/null \
 		|| launchctl unload ~/Library/LaunchAgents/com.tickvault.local-autopilot.plist 2>/dev/null || true
 	@rm -f ~/Library/LaunchAgents/com.tickvault.local-autopilot.plist
+	@# FIX 18 G4: remove the weekday auto-wake too (best-effort; admin).
+	@if [ "$$(uname -s)" = "Darwin" ]; then sudo -n pmset repeat cancel 2>/dev/null || \
+		echo "NOTE: run once to remove the auto-wake:  sudo pmset repeat cancel"; fi
 	@echo "local-autopilot uninstalled."
 
 local-autopilot-test: ## Unit-test the autopilot's pure decision logic
