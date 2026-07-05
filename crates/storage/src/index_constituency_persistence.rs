@@ -965,4 +965,67 @@ mod tests {
         );
         assert!(gate.is_complete(), "gate marked after the serialized run");
     }
+
+    // ── pub-fn ratchet heal (2026-07-05): name-matched tests for the three
+    // F13/F14/F15 pub fns (the behavioral tests above predate them but their
+    // names don't embed the fn names, so the pub-fn-test guard cannot see
+    // them). Each test below adds a NEW assertion angle, not a duplicate. ──
+
+    #[test]
+    fn test_index_constituency_migration_gate_mark_visible_through_singleton() {
+        // The static accessor must hand out ONE process-wide gate: a
+        // mark_complete through one reference is observable through a second
+        // accessor call (Release store / Acquire load through the singleton).
+        // Marking the global gate here is safe: no other test asserts its
+        // pre-mark state (the accessor-stability test checks pointers only).
+        let first = index_constituency_migration_gate();
+        first.mark_complete();
+        assert!(
+            index_constituency_migration_gate().is_complete(),
+            "completion marked via one accessor call must be visible via another"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_migration_gate_mark_complete_wakes_all_waiters() {
+        // mark_complete uses notify_waiters, so EVERY registered waiter must
+        // wake on a single mark — not just one (notify_one would deadlock the
+        // second Groww-writer-class waiter).
+        let gate = std::sync::Arc::new(MigrationGate::new());
+        let spawn_waiter = |gate: std::sync::Arc<MigrationGate>| {
+            tokio::spawn(async move { gate.wait(std::time::Duration::from_secs(5)).await })
+        };
+        let w1 = spawn_waiter(std::sync::Arc::clone(&gate));
+        let w2 = spawn_waiter(std::sync::Arc::clone(&gate));
+        let w3 = spawn_waiter(std::sync::Arc::clone(&gate));
+        tokio::task::yield_now().await;
+        gate.mark_complete();
+        for (i, w) in [w1, w2, w3].into_iter().enumerate() {
+            assert!(
+                w.await.unwrap_or(false),
+                "waiter {i} must be woken by a single mark_complete"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_migrate_index_constituency_truncate_once_with_gate_opens_gate_for_waiters() {
+        // The FIX 13a contract: the wrapper opens the gate on EVERY exit path
+        // — including an inner-body FAILURE (unreachable QuestDB here) — so a
+        // waiting other-feed writer's wait() returns true immediately after,
+        // instead of burning its full bounded timeout.
+        let gate = MigrationGate::new();
+        let outcome =
+            migrate_index_constituency_truncate_once_with_gate(&unreachable_questdb(), &gate).await;
+        assert_eq!(
+            outcome,
+            TsPinMigrationOutcome::Ran,
+            "fresh gate runs the body"
+        );
+        assert!(
+            gate.wait(std::time::Duration::from_millis(1)).await,
+            "gate must be open for waiters immediately after the wrapper returns, \
+             even when the inner TRUNCATE failed"
+        );
+    }
 }

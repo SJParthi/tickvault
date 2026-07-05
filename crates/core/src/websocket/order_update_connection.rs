@@ -308,13 +308,18 @@ fn emit_order_update_ws_audit(
         market_hours: tickvault_common::market_hours::is_within_market_hours_ist(),
     };
     // O(1) EXEMPT: end
+    // 2026-07-05: upgraded from debug! (silent-loss window — the operator found
+    // ws_event_audit EMPTY with zero signal). Static reason label only — never
+    // the dropped row, whose pre-redaction reason must never reach a log
+    // (security review).
     if let Err(err) = tx.try_send(row) {
-        // %err (Display) prints only "full"/"closed" — NOT the dropped row,
-        // whose pre-redaction reason must never reach a log (security review).
-        debug!(
-            reason = %err,
+        let drop_reason = super::connection::ws_audit_drop_reason(&err);
+        error!(
+            code = tickvault_common::error_code::ErrorCode::AuditWs01EventWriteFailed.code_str(),
+            reason = drop_reason,
             "order-update ws_event_audit channel full/closed — row dropped (log+Telegram still fired)"
         );
+        metrics::counter!("tv_ws_event_audit_dropped_total", "reason" => drop_reason).increment(1);
     }
 }
 
@@ -499,6 +504,22 @@ async fn connect_and_listen(
             "order-update reconnected after failure streak",
             0,
             failures_before_attempt,
+        );
+    } else {
+        // 2026-07-05: the missing initial-`Connected` row — mirrors the
+        // main-feed initial-connect emit (`connection.rs`, the B1 fix). Every
+        // successful order-update connect that is NOT a failure-recovery
+        // (boot-time initial connect, or the fresh episode after a clean
+        // close) now leaves exactly one forensic row. Edge semantics hold:
+        // `connect_and_listen` connects once per invocation, so this fires
+        // once per connect episode — never per loop turn or per message.
+        emit_order_update_ws_audit(
+            ws_audit_tx,
+            tickvault_common::ws_event_types::WsEventKind::Connected,
+            "n/a",
+            "order-update initial connect / clean-close reconnect",
+            0,
+            0,
         );
     }
 
