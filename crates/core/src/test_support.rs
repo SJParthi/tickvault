@@ -34,7 +34,69 @@ pub fn has_aws_credentials() -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Mutex, MutexGuard};
+
     use super::*;
+
+    // -----------------------------------------------------------------------
+    // Env-var serialization guard
+    //
+    // Regression: 2026-07-05 — the tests below mutate the PROCESS-GLOBAL
+    // env vars AWS_ACCESS_KEY_ID / HOME / USERPROFILE (set_var/remove_var)
+    // while the default test harness runs them on parallel threads. Under
+    // llvm-cov instrumentation the race manifested live in CI:
+    // `test_has_aws_credentials_userprofile_with_credentials_file` panicked
+    // ("should return true when USERPROFILE has .aws/credentials") because a
+    // sibling test's remove_var("USERPROFILE") landed between this test's
+    // set_var and its has_aws_credentials() call. Same flake class as the
+    // PR #1411 tv_api_token_prod_guard incident (see
+    // `.claude/rules/project/merge-gate-lock-2026-07-04.md` §3.2).
+    //
+    // Fix: every env-mutating test takes CREDS_ENV_LOCK first via
+    // CredsEnvGuard, so the mutate → observe window is exclusive; the guard
+    // also restores all three vars' prior values on Drop (panic-safe).
+    // Poisoning-safe: a failing assertion in one test must not cascade
+    // poison-panics, so the lock recovers via
+    // `unwrap_or_else(|e| e.into_inner())`.
+    // -----------------------------------------------------------------------
+
+    static CREDS_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    const GUARDED_VARS: [&str; 3] = ["AWS_ACCESS_KEY_ID", "HOME", "USERPROFILE"];
+
+    /// Scoped guard: holds the serialization lock for the test's duration
+    /// and restores the pre-test values of all three credential-related env
+    /// vars on Drop (even on panic), so no test leaks env state into the
+    /// next lock holder.
+    struct CredsEnvGuard {
+        _lock: MutexGuard<'static, ()>,
+        saved: [(&'static str, Option<std::ffi::OsString>); 3],
+    }
+
+    impl CredsEnvGuard {
+        fn acquire() -> Self {
+            let lock = CREDS_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            Self {
+                _lock: lock,
+                saved: GUARDED_VARS.map(|name| (name, std::env::var_os(name))),
+            }
+        }
+    }
+
+    impl Drop for CredsEnvGuard {
+        fn drop(&mut self) {
+            // SAFETY: unsafe block required by Rust 2024 edition for
+            // std::env::set_var/remove_var; serialized by the held mutex.
+            unsafe {
+                for (name, val) in &self.saved {
+                    match val {
+                        Some(v) => std::env::set_var(name, v),
+                        None => std::env::remove_var(name),
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn test_has_aws_credentials_returns_bool() {
@@ -45,6 +107,7 @@ mod tests {
 
     #[test]
     fn test_has_aws_credentials_with_env_var_set() {
+        let _guard = CredsEnvGuard::acquire();
         // Temporarily set the env var and verify it returns true.
         let original = std::env::var("AWS_ACCESS_KEY_ID").ok();
         // SAFETY: test is single-threaded for this env var manipulation
@@ -67,6 +130,7 @@ mod tests {
 
     #[test]
     fn test_has_aws_credentials_without_env_var_checks_file() {
+        let _guard = CredsEnvGuard::acquire();
         // Remove the env var and verify it checks the file path.
         let original_key = std::env::var("AWS_ACCESS_KEY_ID").ok();
         // SAFETY: test is single-threaded for this env var manipulation
@@ -98,6 +162,7 @@ mod tests {
 
     #[test]
     fn test_has_aws_credentials_no_home_env_returns_false() {
+        let _guard = CredsEnvGuard::acquire();
         // If both HOME and USERPROFILE are unset and AWS_ACCESS_KEY_ID is unset,
         // the function should return false.
         let original_key = std::env::var("AWS_ACCESS_KEY_ID").ok();
@@ -134,6 +199,7 @@ mod tests {
 
     #[test]
     fn test_has_aws_credentials_userprofile_fallback() {
+        let _guard = CredsEnvGuard::acquire();
         // Test the USERPROFILE fallback path (Windows compat)
         let original_key = std::env::var("AWS_ACCESS_KEY_ID").ok();
         let original_home = std::env::var("HOME").ok();
@@ -178,6 +244,7 @@ mod tests {
 
     #[test]
     fn test_has_aws_credentials_userprofile_with_credentials_file() {
+        let _guard = CredsEnvGuard::acquire();
         // Test the USERPROFILE path when .aws/credentials exists
         let original_key = std::env::var("AWS_ACCESS_KEY_ID").ok();
         let original_home = std::env::var("HOME").ok();
@@ -228,6 +295,7 @@ mod tests {
 
     #[test]
     fn test_has_aws_credentials_home_with_credentials_file() {
+        let _guard = CredsEnvGuard::acquire();
         let original_key = std::env::var("AWS_ACCESS_KEY_ID").ok();
         let original_home = std::env::var("HOME").ok();
         let original_profile = std::env::var("USERPROFILE").ok();
@@ -273,6 +341,7 @@ mod tests {
 
     #[test]
     fn test_has_aws_credentials_home_without_credentials_file() {
+        let _guard = CredsEnvGuard::acquire();
         let original_key = std::env::var("AWS_ACCESS_KEY_ID").ok();
         let original_home = std::env::var("HOME").ok();
         let original_profile = std::env::var("USERPROFILE").ok();
@@ -319,6 +388,7 @@ mod tests {
 
     #[test]
     fn test_has_aws_credentials_env_var_takes_priority() {
+        let _guard = CredsEnvGuard::acquire();
         let original_key = std::env::var("AWS_ACCESS_KEY_ID").ok();
         let original_home = std::env::var("HOME").ok();
 
@@ -352,6 +422,7 @@ mod tests {
 
     #[test]
     fn test_has_aws_credentials_empty_env_var_is_ok() {
+        let _guard = CredsEnvGuard::acquire();
         let original_key = std::env::var("AWS_ACCESS_KEY_ID").ok();
 
         // std::env::var returns Ok("") for empty env var
