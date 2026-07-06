@@ -95,7 +95,7 @@ crates/
 | `websocket/` | Connection pool (max 5 WS), subscription builder (100 instruments/msg, string SecurityId), TLS (aws-lc-rs), order update WS (JSON, `wss://api-order-update.dhan.co`), depth connection (20-level 4×50 instruments, 200-level 4×1 instrument) |
 | `auth/` | Token manager (arc-swap, 24h JWT, 23h refresh), TOTP generator (RFC 6238), secret manager (AWS SSM), token cache (Valkey) |
 | `instrument/` | CSV downloader, CSV parser, universe builder (F&O filter), subscription planner, binary cache (rkyv zero-copy), daily scheduler, delta detector, S3 backup, validation, depth strike selector (ATM ± 10), depth rebalancer (60s spot drift check) |
-| `pipeline/` | Tick processor (SPSC 65K buffer), candle aggregator (21 timeframes from ticks), top movers |
+| `pipeline/` | Tick processor (SPSC 65K buffer), candle aggregator (21 timeframes from ticks) |
 | `historical/` | Candle fetcher (Dhan REST, 90-day chunks), cross-verification |
 | `network/` | IP monitor, IP verifier (static IP for order APIs) |
 | `notification/` | Telegram alerts (teloxide), event types |
@@ -120,7 +120,6 @@ crates/
 | `calendar_persistence.rs` | Trading calendar storage |
 | `materialized_views.rs` | QuestDB materialized view DDL |
 | `deep_depth_persistence.rs` | 20/200-level depth ILP writer to `deep_market_depth` table |
-| `movers_persistence.rs` | Stock + option movers ILP writer |
 | `indicator_snapshot_persistence.rs` | Indicator snapshot ILP writer |
 
 ### crates/api — HTTP Server (12 routes)
