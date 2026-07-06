@@ -63,6 +63,7 @@ const INDEX_PREV_CLOSE_CACHE_PATH: &str = "data/instrument-cache/index-prev-clos
 /// assumes the directory exists and only writes the file atomically.
 // HOT-PATH-EXEMPT: boot-only init, runs once before tick processor starts.
 pub fn init_prev_close_cache_dir() -> std::io::Result<()> {
+    // O(1) EXEMPT: boot-only init — called once from main.rs Step 6b, never on the tick path.
     std::fs::create_dir_all(INDEX_PREV_CLOSE_CACHE_DIR)
 }
 
@@ -144,12 +145,14 @@ fn is_within_persist_window(exchange_timestamp: u32, muhurat_active: bool) -> bo
     // exchange_timestamp is already IST epoch seconds — no offset needed.
     let ist_secs_of_day = exchange_timestamp % SECONDS_PER_DAY;
     if (TICK_PERSIST_START_SECS_OF_DAY_IST..TICK_PERSIST_END_SECS_OF_DAY_IST)
+        // O(1) EXEMPT: Range::contains — two-comparison O(1) bounds check (scanner heuristic misreads it as Vec::contains).
         .contains(&ist_secs_of_day)
     {
         return true;
     }
     muhurat_active
         && (MUHURAT_PERSIST_START_SECS_OF_DAY_IST..MUHURAT_PERSIST_END_SECS_OF_DAY_IST)
+            // O(1) EXEMPT: Range::contains — O(1) bounds check.
             .contains(&ist_secs_of_day)
 }
 
@@ -445,6 +448,7 @@ fn is_wall_clock_within_persist_window(received_at_nanos: i64, muhurat_active: b
     // wrongly rejected.
     let grace_upper_bound =
         TICK_PERSIST_END_SECS_OF_DAY_IST.saturating_add(WS_GRACE_AFTER_CLOSE_SECS_U32);
+    // O(1) EXEMPT: Range::contains — two-comparison O(1) bounds check (scanner heuristic misreads it as Vec::contains).
     if (TICK_PERSIST_START_SECS_OF_DAY_IST..grace_upper_bound).contains(&wall_clock_ist_secs_of_day)
     {
         return true;
@@ -452,6 +456,7 @@ fn is_wall_clock_within_persist_window(received_at_nanos: i64, muhurat_active: b
     // CCL-06: additive Muhurat evening window when today is a Muhurat session.
     muhurat_active
         && (MUHURAT_PERSIST_START_SECS_OF_DAY_IST..MUHURAT_PERSIST_END_SECS_OF_DAY_IST)
+            // O(1) EXEMPT: Range::contains — O(1) bounds check.
             .contains(&wall_clock_ist_secs_of_day)
 }
 
@@ -545,11 +550,13 @@ impl TickDedupRing {
     /// Debug-asserts that `power` is in [8, 24].
     fn new(power: u32) -> Self {
         debug_assert!(
+            // O(1) EXEMPT: RangeInclusive::contains inside a boot-time constructor debug_assert.
             (8..=24).contains(&power),
             "dedup ring buffer power out of range"
         );
         let size = 1_usize << power;
         Self {
+            // O(1) EXEMPT: ring pre-allocated ONCE at construction — zero alloc per tick thereafter.
             slots: vec![u64::MAX; size].into_boxed_slice(),
             mask: size.wrapping_sub(1),
         }
@@ -1777,7 +1784,7 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
                     // IDX_I segment
                     index_prev_close_cache.insert(security_id, previous_close);
                     //
-                    // Wave 1 Item 0.a — sync `std::fs::write` + rename moved to
+                    // Wave 1 Item 0.a — sync file write (`fs::write`) + rename moved to
                     // a dedicated writer task fed by a bounded
                     // `tokio::sync::mpsc::channel(64)`; the hot path enqueues
                     // a `bytes::Bytes` payload via `try_enqueue_global`. Drop
