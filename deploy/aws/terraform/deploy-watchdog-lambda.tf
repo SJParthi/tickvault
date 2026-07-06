@@ -146,12 +146,22 @@ resource "aws_cloudwatch_event_rule" "deploy_watchdog_premarket" {
   name                = "tv-${var.environment}-deploy-watchdog-premarket"
   description         = "08:50 IST (Mon-Fri) — cover a missed 08:45 pre-market auto-deploy"
   schedule_expression = "cron(20 3 ? * MON-FRI *)"
+  # RESUME 2026-07-06 per operator GO (moved up from Thu Jul 9): explicit state
+  # so terraform re-enables this rule. The Jul 4 pause set state = "DISABLED";
+  # the #1404 revert REMOVED the attribute, and with `state` absent the AWS
+  # provider stops managing rule state - the rule stayed DISABLED on AWS.
+  state = "ENABLED"
 }
 
 resource "aws_cloudwatch_event_rule" "deploy_watchdog_postmarket" {
   name                = "tv-${var.environment}-deploy-watchdog-postmarket"
   description         = "15:51 IST (Mon-Fri) — cover a missed 15:46 post-market auto-deploy"
   schedule_expression = "cron(21 10 ? * MON-FRI *)"
+  # RESUME 2026-07-06 per operator GO (moved up from Thu Jul 9): explicit state
+  # so terraform re-enables this rule. The Jul 4 pause set state = "DISABLED";
+  # the #1404 revert REMOVED the attribute, and with `state` absent the AWS
+  # provider stops managing rule state - the rule stayed DISABLED on AWS.
+  state = "ENABLED"
 }
 
 resource "aws_cloudwatch_event_target" "deploy_watchdog_premarket" {
