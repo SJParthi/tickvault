@@ -66,6 +66,14 @@ gives up during market hours — it keeps retrying at the ceiling. A persistent
 storm means the provider keeps closing the socket (entitlement / auth reject) —
 operator must check the credential / entitlement.
 
+**2026-07-06:** the storm signal now pages via the
+`tv-<env>-errcode-feed-stall-01` log-filter alarm (Sum ≥ 3 per 15 min → SNS →
+Telegram, `deploy/aws/terraform/error-code-alarms.tf`); a single benign
+self-heal restart stays page-free by design (this section's own
+operator-action bound). Before 2026-07-06 the `error!` reached only the log
+sinks — the error!→Telegram route was severed by the CloudWatch-only
+migration.
+
 **Triage:**
 1. `mcp__tickvault-logs__tail_errors` — find `FEED-STALL-01`; the payload carries
    `feed` + (on the storm escalation) `rapid_restarts`.

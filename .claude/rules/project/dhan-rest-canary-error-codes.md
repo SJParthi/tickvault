@@ -5,6 +5,15 @@
 > /v2/profile at 09:05 + 12:00 + 15:25 IST; on non-200, page HIGH immediately
 > with the captured body — never again discover at 15:33 that REST died at
 > 08:45."*
+> **Delivery boundary (2026-07-06):** until this date the "page HIGH
+> immediately" demand was NOT met — the `error!` reached only the log sinks
+> (the CloudWatch-only migration retired the Loki→Alertmanager→Telegram route
+> with no replacement; the 2026-07-06 12:00 IST probe failure produced ZERO
+> pages). Routing is now the metric-filter alarm chain: `error!` →
+> errors.jsonl (`data/logs/machine/`) → CloudWatch Logs `/tickvault/prod/app`
+> (CW agent) → `tv-<env>-errcode-rest-canary-01` log metric filter → metric →
+> alarm (≤5 min) → SNS `tv-prod-alerts` → Telegram webhook Lambda
+> (`deploy/aws/terraform/error-code-alarms.tf`).
 > **Companion code:** `crates/app/src/rest_canary_boot.rs`,
 > `crates/common/src/sanitize.rs::capture_rest_error_body`,
 > `crates/common/src/url_join.rs::join_api_url`.
@@ -34,7 +43,9 @@ root-cause-visibility gap; `join_api_url` closes the malformed-URL gap.
 
 **Trigger:** the canary task probes `GET /v2/profile` (with `access-token`
 header) at **09:05, 12:00 and 15:25 IST** on trading days. A probe fails when:
-- the response status is non-2xx (the dominant case — pages immediately), or
+- the response status is non-2xx (the dominant case — pages within ~1-5 min
+  via the `tv-<env>-errcode-rest-canary-01` CloudWatch log-filter alarm, added
+  2026-07-06), or
 - the HTTP send leg fails twice (one retry after 30s — mirrors the mid-session
   watchdog's 2026-04-26 transient-network lesson so a laptop DNS blip does not
   page), or
