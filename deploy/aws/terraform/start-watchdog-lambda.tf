@@ -149,12 +149,22 @@ resource "aws_cloudwatch_event_rule" "start_watchdog_ping" {
   name                = "tv-${var.environment}-start-watchdog-ping"
   description         = "08:30 IST (Mon-Fri) positive 'instance start triggered' Telegram"
   schedule_expression = "cron(0 3 ? * MON-FRI *)"
+  # RESUME 2026-07-06 per operator GO (moved up from Thu Jul 9): explicit state
+  # so terraform re-enables this rule. The Jul 4 pause set state = "DISABLED";
+  # the #1404 revert REMOVED the attribute, and with `state` absent the AWS
+  # provider stops managing rule state - the rule stayed DISABLED on AWS.
+  state = "ENABLED"
 }
 
 resource "aws_cloudwatch_event_rule" "start_watchdog_check" {
   name                = "tv-${var.environment}-start-watchdog-check"
   description         = "08:45 IST (Mon-Fri) verify the box actually started; page if not"
   schedule_expression = "cron(15 3 ? * MON-FRI *)"
+  # RESUME 2026-07-06 per operator GO (moved up from Thu Jul 9): explicit state
+  # so terraform re-enables this rule. The Jul 4 pause set state = "DISABLED";
+  # the #1404 revert REMOVED the attribute, and with `state` absent the AWS
+  # provider stops managing rule state - the rule stayed DISABLED on AWS.
+  state = "ENABLED"
 }
 
 resource "aws_cloudwatch_event_target" "start_watchdog_ping" {
