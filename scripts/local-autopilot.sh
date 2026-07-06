@@ -687,14 +687,26 @@ cold_start_mem_write_decision() {
 # fix31_raise_decision <vm_mib> <target_mib> <app_alive 0|1> <qdb_running 0|1> <attempted 0|1>
 # The FIX 31 raise DECISION, pure. Always prints one word, always rc 0:
 #   raise            — cold start, VM below target: run the full cycle
+#   raise_stop_qdb   — the APP is dead but the tv-questdb container is
+#                      idling (the 2026-07-06 exam incident: the old
+#                      skip_qdb_running arm refused the raise and the whole
+#                      86-conn exam ran with the database clamped 8g→6g).
+#                      The executor STOPS the idle container (bounded),
+#                      verifies it stopped, THEN runs the full cycle.
+#                      An idle database serving a DEAD app protects nothing.
 #   skip_attempted   — the one attempt this run is spent (never loop)
-#   skip_app_running — the tickvault app is up: NOT a cold start
-#   skip_qdb_running — the database container is up: quitting Docker would
-#                      kill it (the exact FIX 17 mid-run incident)
+#   skip_app_running — the tickvault app is up: NOT a cold start (the FIX 17
+#                      mid-run incident rule — NEVER act while the app runs)
 #   skip_no_target   — target unparsable (fail-quiet: never act on garbage)
 #   skip_no_probe    — VM memory unknown (daemon down — the FIX 19
 #                      write-before-launch path owns that case)
-#   skip_at_target   — VM already at/above target: nothing to do
+#   skip_at_target   — VM already at/above target: nothing to do (no stop)
+# Ordering note (2026-07-06): the qdb check moved AFTER target/vm/at_target
+# validation so a container is only ever stopped when the raise will really
+# run — garbage inputs or an at-target VM never touch the container. A
+# garbage qdb flag fails SAFE to raise_stop_qdb (treat unknown as running:
+# the bounded stop of a nonexistent container is harmless, and the app is
+# already confirmed dead by the earlier arm).
 fix31_raise_decision() {
   local vm="${1:-}" tgt="${2:-}" app="${3:-1}" qdb="${4:-1}" att="${5:-1}"
   if [ "$att" != "0" ]; then
@@ -703,10 +715,6 @@ fix31_raise_decision() {
   fi
   if [ "$app" != "0" ]; then
     echo skip_app_running
-    return 0
-  fi
-  if [ "$qdb" != "0" ]; then
-    echo skip_qdb_running
     return 0
   fi
   case "$tgt" in '' | *[!0-9]*)
@@ -719,7 +727,11 @@ fix31_raise_decision() {
     return 0
     ;;
   esac
-  if [ "$vm" -ge "$tgt" ]; then echo skip_at_target; else echo raise; fi
+  if [ "$vm" -ge "$tgt" ]; then
+    echo skip_at_target
+    return 0
+  fi
+  if [ "$qdb" != "0" ]; then echo raise_stop_qdb; else echo raise; fi
   return 0
 }
 
@@ -2178,9 +2190,13 @@ raise_docker_mem_at_cold_start() {
 # `docker info MemTotal`. Success → one 🧠 Telegram. Verified failure →
 # forensic file re-read (clobbered vs held) + fall through to the existing
 # clamp + manual-slider Telegram in check_docker_vm_memory (kept — honest).
-# Cold-start gate: single attempt per run; skipped when the app or the
-# database container is already up (quitting Docker mid-run killed the
-# database once — the FIX 17 incident — never again); whole cycle bounded
+# Cold-start gate: single attempt per run; skipped when the APP is already
+# up (quitting Docker mid-run killed the database once — the FIX 17
+# incident — never again). 2026-07-06 update: an idle tv-questdb container
+# with a DEAD app no longer blocks the raise (the old skip_qdb_running arm
+# let the 86-conn exam run with the database clamped 8g→6g) — the executor
+# now STOPS the idle container (bounded), verifies it stopped, then runs
+# the normal quit→write→relaunch→verify cycle; whole cycle bounded
 # to FIX31_CYCLE_BUDGET_SECS. License-modal edge: this path only runs when
 # the daemon answered (license already accepted once), so the FIX 18
 # first-launch detection in ensure_docker keeps owning fresh installs.
@@ -2188,6 +2204,10 @@ FIX31_RAISE_ATTEMPTED=0
 FIX31_CYCLE_BUDGET_SECS=180
 FIX31_QUIT_POLITE_SECS=30
 FIX31_QUIT_HARD_SECS=45
+# 2026-07-06: bounded wait for stopping an idle tv-questdb container before
+# the raise (app-dead case). 60s covers QuestDB's flush-on-stop while staying
+# well inside the 180s cycle budget.
+FIX31_QDB_STOP_TIMEOUT_SECS=60
 
 # Docker.app process probe (covers /Applications AND ~/Applications
 # per-user installs — the FIX 18 G10 lesson). Echoes 1|0, always rc 0.
@@ -2213,15 +2233,32 @@ fix31_auto_raise_docker_mem() {
   case "$(questdb_container_state)" in running*) qdb_up=1 ;; esac
   local decision
   decision=$(fix31_raise_decision "$vm_mib" "$target" "$app_up" "$qdb_up" "$FIX31_RAISE_ATTEMPTED")
-  if [ "$decision" != "raise" ]; then
+  case "$decision" in raise | raise_stop_qdb) : ;; *)
     log "FIX 31 cold-start memory raise: ${decision} (VM ${vm_mib:-unknown} MiB, target ${target} MiB)"
     return 0
-  fi
+    ;;
+  esac
   FIX31_RAISE_ATTEMPTED=1 # single attempt per run — even a failed cycle never re-fires
   local t0 deadline
   t0=$(date +%s)
   deadline=$((t0 + FIX31_CYCLE_BUDGET_SECS))
   log "FIX 31: Docker VM has ${vm_mib} MiB < target ${target} MiB at COLD START — running the full auto-raise cycle: quit Docker → write setting → relaunch → verify (bounded ${FIX31_CYCLE_BUDGET_SECS}s)"
+  if [ "$decision" = "raise_stop_qdb" ]; then
+    # 2026-07-06 fix: the app is DEAD but the database container idles from
+    # an earlier run. Stop it (bounded through dk so a wedged daemon still
+    # pages) BEFORE quitting Docker — never quit Docker over a running
+    # database container (the FIX 17 rule, now satisfied by stopping it
+    # first instead of abandoning the raise like the old skip_qdb_running).
+    log "FIX 31: app is NOT running but the tv-questdb container is idling — stopping it (bounded ${FIX31_QDB_STOP_TIMEOUT_SECS}s) so the memory raise can proceed"
+    DOCKER_CMD_TIMEOUT_SECS="$FIX31_QDB_STOP_TIMEOUT_SECS" dk stop tv-questdb >/dev/null 2>&1 || true
+    case "$(questdb_container_state)" in
+    running*)
+      log "FIX 31: tv-questdb did NOT stop within ${FIX31_QDB_STOP_TIMEOUT_SECS}s — aborting the raise (never quit Docker over a running database container); the clamp path takes over"
+      return 0
+      ;;
+    esac
+    tg "🧠 Stopped idle database container to apply the memory raise — the app was not running, so nothing was interrupted. The database restarts automatically with the next run."
+  fi
   # (1) FULLY quit Docker Desktop — the write is safe ONLY once the app
   # process is gone (its exit-time settings flush clobbered FIX 14's edit).
   with_timeout 15 osascript -e 'quit app "Docker"' >/dev/null 2>&1 || true

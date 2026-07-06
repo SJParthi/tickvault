@@ -1087,14 +1087,23 @@ t "F31: below target, cold, first attempt → raise" "raise" "$(fix31_raise_deci
 t "F31: exactly at target → skip_at_target" "skip_at_target" "$(fix31_raise_decision 12288 12288 0 0 0)"
 t "F31: above target → skip_at_target" "skip_at_target" "$(fix31_raise_decision 16384 12288 0 0 0)"
 t "F31: app already running (warm) → skip_app_running" "skip_app_running" "$(fix31_raise_decision 8192 12288 1 0 0)"
-t "F31: database container up (warm) → skip_qdb_running" "skip_qdb_running" "$(fix31_raise_decision 8192 12288 0 1 0)"
+t "F31: app dead + database container idling → raise_stop_qdb (2026-07-06 fix: stop it, then raise)" "raise_stop_qdb" "$(fix31_raise_decision 8192 12288 0 1 0)"
 t "F31: second attempt same run → skip_attempted (single attempt)" "skip_attempted" "$(fix31_raise_decision 8192 12288 0 0 1)"
 t "F31: attempted latch beats every other input" "skip_attempted" "$(fix31_raise_decision '' '' 1 1 1)"
 t "F31: VM probe empty (daemon down → FIX 19 owns it) → skip_no_probe" "skip_no_probe" "$(fix31_raise_decision "" 12288 0 0 0)"
 t "F31: VM probe garbage → skip_no_probe" "skip_no_probe" "$(fix31_raise_decision abc 12288 0 0 0)"
 t "F31: garbage target → skip_no_target (fail-quiet)" "skip_no_target" "$(fix31_raise_decision 8192 "" 0 0 0)"
 t "F31: garbage app flag fails SAFE to skip (never quit on uncertainty)" "skip_app_running" "$(fix31_raise_decision 8192 12288 banana 0 0)"
-t "F31: garbage qdb flag fails SAFE to skip" "skip_qdb_running" "$(fix31_raise_decision 8192 12288 0 banana 0)"
+t "F31: garbage qdb flag fails SAFE to raise_stop_qdb (unknown = treat as running, bounded stop; app confirmed dead)" "raise_stop_qdb" "$(fix31_raise_decision 8192 12288 0 banana 0)"
+# 2026-07-06 exam-incident matrix: the stop-container arm fires ONLY when the
+# raise would really run — app running always wins; garbage/at-target never
+# stop the container; the attempted latch still means single attempt.
+t "F31: app running beats qdb idle → skip_app_running (never act while the app is up)" "skip_app_running" "$(fix31_raise_decision 8192 12288 1 1 0)"
+t "F31: app dead + qdb idle + VM at target → skip_at_target (no stop, nothing to do)" "skip_at_target" "$(fix31_raise_decision 12288 12288 0 1 0)"
+t "F31: app dead + qdb idle + attempted latch → skip_attempted (single attempt even for the stop arm)" "skip_attempted" "$(fix31_raise_decision 8192 12288 0 1 1)"
+t "F31: app dead + qdb idle + garbage target → skip_no_target (never stop the container on garbage)" "skip_no_target" "$(fix31_raise_decision 8192 "" 0 1 0)"
+t "F31: app dead + qdb idle + empty VM probe → skip_no_probe (daemon down owns it, no stop)" "skip_no_probe" "$(fix31_raise_decision "" 12288 0 1 0)"
+t "F31: app dead + NO docker container → plain raise (no stop needed)" "raise" "$(fix31_raise_decision 8192 12288 0 0 0)"
 # TV_DOCKER_VM_MEM_MIB override flows through the FIX 29 single source.
 t "F31: override 16384 above a 12 GB VM → raise" "raise" "$(fix31_raise_decision 12288 "$(docker_mem_advice_mib 16384 '')" 0 0 0)"
 t "F31: override already satisfied by the VM → skip_at_target" "skip_at_target" "$(fix31_raise_decision 16384 "$(docker_mem_advice_mib 16384 '')" 0 0 0)"
@@ -1140,6 +1149,21 @@ t "F31 wiring: cold gate consults app_alive" "0" \
   "$(printf '%s\n' "$FIX31_BODY" | grep -q 'app_alive' && echo 0 || echo 1)"
 t "F31 wiring: cold gate consults the database container state" "0" \
   "$(printf '%s\n' "$FIX31_BODY" | grep -q 'questdb_container_state' && echo 0 || echo 1)"
+# 2026-07-06 fix: the app-dead + qdb-idle arm stops the container then raises.
+t "F31 wiring: executor handles the raise_stop_qdb decision" "0" \
+  "$(printf '%s\n' "$FIX31_BODY" | grep -q 'raise_stop_qdb' && echo 0 || echo 1)"
+t "F31 wiring: idle-container stop goes through dk with the bounded timeout" "0" \
+  "$(printf '%s\n' "$FIX31_BODY" | grep -q 'DOCKER_CMD_TIMEOUT_SECS="\$FIX31_QDB_STOP_TIMEOUT_SECS" dk stop tv-questdb' && echo 0 || echo 1)"
+t "F31 wiring: container STOP is ordered BEFORE the osascript quit" "ordered" \
+  "$(printf '%s\n' "$FIX31_BODY" | awk '/dk stop tv-questdb/{if(!s)s=NR} /quit app/{if(!q)q=NR} END{print (s && q && s<q) ? "ordered" : "bad"}')"
+t "F31 wiring: post-stop re-check aborts the raise if the container is still running" "0" \
+  "$(printf '%s\n' "$FIX31_BODY" | grep -q 'did NOT stop within' && echo 0 || echo 1)"
+t "F31 wiring: honest Telegram line for the stop-container arm" "0" \
+  "$(printf '%s\n' "$FIX31_BODY" | grep -q 'Stopped idle database container to apply the memory raise' && echo 0 || echo 1)"
+t "F31 wiring: qdb stop timeout constant pinned at 60s (inside the 180s cycle budget)" "1" \
+  "$(grep -c 'FIX31_QDB_STOP_TIMEOUT_SECS=60' scripts/local-autopilot.sh || true)"
+t "F31 wiring: verify-FAIL fallback arm unchanged (clamp-and-proceed message kept)" "0" \
+  "$(printf '%s\n' "$FIX31_BODY" | grep -q 'falling back to clamp-and-proceed' && echo 0 || echo 1)"
 t "F31 wiring: override reaches the executor via the FIX 29 single source" "0" \
   "$(printf '%s\n' "$FIX31_BODY" | grep -q 'docker_mem_advice_mib "\${TV_DOCKER_VM_MEM_MIB' && echo 0 || echo 1)"
 t "F31 wiring: success Telegram fires only on the PROVEN raise" "0" \
