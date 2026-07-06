@@ -44,11 +44,19 @@ METRIC_HOST = os.environ.get("METRIC_HOST", "tickvault-prod")
 BOOT_LOOKBACK_MINUTES = int(os.environ.get("BOOT_LOOKBACK_MINUTES", "10"))
 
 IST = timedelta(hours=5, minutes=30)
-# Launch today >= 08:25 IST followed by stop == the NSE-holiday gate's
-# deliberate self-stop (tickvault-holiday-gate.service). Only the holiday
-# gate ever calls StopInstances at that hour; EC2 never self-stops on app
-# failure, so a trading-day misread is theoretical (boot-heartbeat gate
-# window 08:50-09:10 is the backstop).
+# Launch today >= 08:25 IST followed by stop is TREATED as a deliberate
+# self-stop and silenced. Honest inventory of the stoppers that can hit the
+# 08:25-08:45 window (round-1 review fix 2026-07-06 - an earlier version
+# claimed the holiday gate was the ONLY one, which the repo's own terraform
+# disproves):
+#   1. the NSE-holiday gate (tickvault-holiday-gate.service) - the common case;
+#   2. the hourly hard-stop-guard's in-window budget breach_stop (its hourly
+#      cron's 03:00 UTC tick IS 08:30 IST; budget-guards.tf) and the
+#      SNS-driven budget-killswitch - BOTH publish their own page BEFORE
+#      stopping, so silence here never blinds the operator;
+#   3. a manual portal stop - operator-initiated by definition.
+# EC2 never self-stops on app FAILURE, and the boot-heartbeat gate window
+# (08:50-09:10) is the backstop pager for anything this heuristic misreads.
 HOLIDAY_SELF_STOP_EARLIEST_IST_MINUTES = 8 * 60 + 25
 
 # Verdicts (pure-string constants so tests assert on them)
@@ -57,6 +65,7 @@ HOLIDAY_SILENT = "holiday-silent"
 NOT_RUNNING_PAGE = "not-running-page"
 NOT_BOOTED_PAGE = "not-booted-page"
 VERIFY_FAILED_PAGE = "verify-failed-page"
+DRILL_PAGE = "drill-page"
 
 
 def _ist_minutes_of_day(dt_utc: datetime) -> int:
@@ -120,6 +129,11 @@ SUBJECTS_AND_MESSAGES = {
         "⚠️ 8:45 AM readiness check could not verify the app",
         "⚠️ I could not confirm whether the trading app is ready for the 9:15 AM open (an AWS lookup failed). "
         "Treat this as NOT READY until proven otherwise: open the portal now - if the app shows healthy, ignore this.",
+    ),
+    DRILL_PAGE: (
+        "🧪 readiness pager drill - this is only a test",
+        "🧪 Manual test of the 8:45 AM readiness pager. Nothing is wrong - no action needed. "
+        "Seeing this message proves the whole page route (checker to alert system to Telegram) works end-to-end.",
     ),
 }
 
@@ -192,7 +206,20 @@ def _publish(subject: str, message: str) -> None:
 
 
 def lambda_handler(event, _context=None):
-    """Entry point - 08:45 IST EventBridge (mode=readiness) or manual invoke."""
+    """Entry point - 08:45 IST EventBridge (mode=readiness), manual invoke,
+    or {"mode": "drill"} - the SNS end-to-end verification drill."""
+    if isinstance(event, dict) and event.get("mode") == "drill":
+        # Round-1 review fix (2026-07-06): an "evening stopped-box invoke"
+        # CANNOT prove the SNS leg - on any normal trading evening the box was
+        # auto-started at 08:30 IST, so LaunchTime is TODAY >= 08:25 IST and a
+        # stopped box classifies HOLIDAY_SILENT (no publish). This branch
+        # force-publishes a clearly-labelled test page through the REAL
+        # _publish path, so the operator can verify checker -> SNS -> Telegram
+        # end-to-end at any time of day without touching EC2 state.
+        subject, message = SUBJECTS_AND_MESSAGES[DRILL_PAGE]
+        _publish(subject, message)
+        logger.info("readiness verdict=%s (manual SNS drill)", DRILL_PAGE)
+        return {"verdict": DRILL_PAGE}
     now_utc = datetime.now(timezone.utc)
     state, launch_time, ec2_err = _instance_state(boto3.client("ec2"), EC2_INSTANCE_ID)
     boot_seen, cw_err = (False, False)

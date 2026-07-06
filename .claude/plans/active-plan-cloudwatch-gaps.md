@@ -20,9 +20,12 @@
 > Telegram. They do NOT guarantee: paging for un-filtered codes (log-sink-only),
 > paging through a total SNS/Telegram outage (outside the envelope, stated in
 > the handler), catching an UNLOGGED DH-906 reject (term-filter tripwire only;
-> Rust emit-site is a flagged follow-up), or seeing a reconnect storm masked by
-> a mid-window counter reset (one blind 5-min window; restarts are owned by the
-> liveness alarms). Claiming more than this envelope = REJECT in review.
+> Rust emit-site is a flagged follow-up), seeing a reconnect storm masked by
+> a mid-window counter reset (one blind 15-min window; restarts are owned by
+> the liveness alarms), or paging an order-update flap SLOWER than ~1 cycle
+> per 3 min (>5 once-per-cycle increments per 900s window = the detection
+> floor; the 3-min+ slow-flap band is a stated residual). Claiming more than
+> this envelope = REJECT in review.
 
 ## Design
 
@@ -66,7 +69,11 @@ flapper invisible) is the proof.
   NOT in the 21-name EMF allowlist (ratcheted pin preserved) — extracted via a
   log metric filter on `/tickvault/prod/metrics` (the tv_boot_completed
   fallback precedent, host dimension from `$.host`) + a `DIFF(recon_cum)` metric-math
-  alarm (>5 reconnects / 5 min). Market-hours-gated via a one-line
+  alarm (>5 reconnects / 15 min — round-1 review fix: the counter increments
+  ONCE per flap cycle, so a 5-min window could never exceed 5 for any cycle
+  ≥ 60s; over 900s the documented ~90s incident cadence yields ~10 ≫ 5 while
+  the ≤3-attempt close churn stays ≤3. Honest detection floor: cycles slower
+  than ~180s do not page — stated residual). Market-hours-gated via a one-line
   `ALARM_NAMES` append in market-hours-liveness-alarm.tf (the aggregator_no_seals
   precedent): 15:30-close churn (≤3 attempts before dormant sleep) stays silent,
   and the gate's open-time set_alarm_state(OK) immunizes against latched state.
@@ -95,7 +102,25 @@ flapper invisible) is the proof.
 
 - Counter reset on app restart → negative `DIFF()` datapoint → below threshold,
   no false page; a storm masked by a mid-window restart is missed for ONE
-  5-min window only (restarts are owned by the liveness alarms).
+  15-min window only (restarts are owned by the liveness alarms).
+- Order-update flap SLOWER than ~1 cycle per 3 min (≤5 once-per-cycle
+  increments per 900s window) never breaches `>5` → stated residual; the
+  durable-down alarm owns full outages, nothing owns the 3-min+ slow-flap
+  band today (round-1 review honesty).
+- Budget stop colliding with the holiday heuristic: the hourly
+  hard-stop-guard's in-window breach_stop (its cron ticks at exactly 08:30
+  IST) or the SNS budget-killswitch or a manual portal stop between
+  08:25-08:45 IST also matches the launch-today-≥-08:25-then-stopped shape →
+  HOLIDAY_SILENT. Not blind: every one of those stop paths publishes its OWN
+  page before/while stopping, and the boot-heartbeat gate window (08:50-09:10)
+  is the backstop — documented in the handler comment (round-1 review fix; the
+  earlier "only the holiday gate stops at that hour" premise was false).
+- The originally-specced "evening stopped-box invoke drill" can NEVER produce
+  the expected page: on a normal trading evening LaunchTime = today's 08:30
+  auto-start (LaunchTime updates on every start), so a stopped box classifies
+  HOLIDAY_SILENT. The SNS end-to-end drill is now the explicit
+  `{"mode": "drill"}` handler branch, which force-publishes a labelled test
+  page through the real publish path (round-1 review fix).
 - The WARN-level `code=DH-901` renewToken-fallback line (token_manager.rs:898)
   is excluded three ways: errors.jsonl layer is ERROR-only, the app stream nests
   fields under `$.fields`, and the `&& $.level = "ERROR"` pattern guard.
@@ -105,7 +130,8 @@ flapper invisible) is the proof.
 - `pending` state at 08:45 (start-watchdog self-heal race) → NOT_RUNNING_PAGE,
   whose wording explicitly says "watch for the watchdog's started message".
 - 15:30-close order-update reconnect churn (≤3 attempts before WS-GAP-04
-  dormant sleep) is below threshold 5 AND outside the 09:20-15:35 gate window.
+  dormant sleep) is ≤3 per 15-min window, below threshold 5, AND outside the
+  09:20-15:35 gate window.
 - Repeating DH-901 every 15 min (the 2026-07-06 shape): eval 3 / dta 1 holds
   ALARM across ≤15-min gaps → 1 page + 1 OK per episode instead of ~32.
 - Rollback of the machine/ move itself → the `-legacy` globs still ship the
@@ -153,7 +179,11 @@ flapper invisible) is the proof.
 - `bash .claude/hooks/banned-pattern-scanner.sh` + `bash .claude/hooks/plan-verify.sh`.
 - Post-apply (PR-body runbook): `describe-log-streams` freshness check on
   `/tickvault/prod/app`, `set-alarm-state` fire drill on
-  tv-prod-errcode-rest-canary-01, evening stopped-box Lambda invoke drill.
+  tv-prod-errcode-rest-canary-01, and the SNS end-to-end drill
+  `aws lambda invoke --function-name tv-prod-market-open-readiness
+  --payload '{"mode":"drill"}' /dev/stdout` → expect the 🧪 test page on
+  Telegram (round-1 review fix: the previously-specced evening stopped-box
+  invoke classifies HOLIDAY_SILENT and can never prove the SNS leg).
 
 ## Rollback
 
@@ -169,8 +199,13 @@ flapper invisible) is the proof.
 ## Observability
 
 - 10 new alarms (8 errcode + 1 reconnect-storm + 1 readiness-lambda-errors) →
-  tv_alerts → Telegram; ok_actions symmetric (the OK is the "recovered"
-  message the operator wanted on 2026-07-06).
+  tv_alerts → Telegram; ok_actions symmetric for repeat-emitters (the OK is
+  the "recovered" message the operator wanted on 2026-07-06) — EXCEPT the
+  REST canary (`ok_recovery = false`): its 3-probes/day cadence means the
+  auto-OK ~15 min after a failing probe only means "the episode aged out of
+  the lookback", not "REST recovered" — a Rule-11 false-OK, so its OK page is
+  suppressed; the next scheduled probe staying silent (or the DH-901 alarm)
+  is the recovery signal (round-1 review fix).
 - New metrics: 8 sparse `tv_errcode_*` (billed only in hours a code fires),
   1 `tv_order_update_reconnections_total` (host-dimensioned, /metrics-derived).
 - The readiness Lambda logs its verdict on every run (silent-healthy mornings
@@ -198,18 +233,21 @@ table); the honest-100% envelope wording is in the header block above.
 - [x] P1 log-shipping fix — Files: deploy/aws/cloudwatch-agent.json, deploy/aws/terraform/user-data.sh.tftpl, .github/workflows/deploy-aws.yml, crates/common/tests/cloudwatch_app_alarms_wiring.rs — Tests: test_cw_agent_collects_machine_log_paths
 - [x] P2 error-code filters+alarms — Files: deploy/aws/terraform/error-code-alarms.tf — Tests: terraform validate + post-apply fire drill
 - [x] P3 reconnect-storm — Files: deploy/aws/terraform/order-update-reconnect-storm-alarm.tf, deploy/aws/terraform/market-hours-liveness-alarm.tf — Tests: terraform validate
-- [x] P4 readiness pager — Files: deploy/aws/terraform/market-open-readiness-lambda.tf, deploy/aws/lambda/market-open-readiness/handler.py, deploy/aws/lambda/market-open-readiness/test_handler.py — Tests: test_running_and_booted_is_ready_silent, test_running_without_boot_metric_pages_not_booted, test_stopped_with_stale_launch_pages_not_running, test_stopped_after_holiday_gate_self_stop_is_silent, test_stopping_after_holiday_gate_self_stop_is_silent, test_stopped_with_early_launch_pages_not_running, test_pending_pages_not_running, test_probe_error_pages_verify_failed, test_subjects_are_emoji_first_and_within_sns_limit, test_holiday_cutoff_boundary_0825_ist, test_sns_publish_failure_propagates
+- [x] P4 readiness pager — Files: deploy/aws/terraform/market-open-readiness-lambda.tf, deploy/aws/lambda/market-open-readiness/handler.py, deploy/aws/lambda/market-open-readiness/test_handler.py — Tests: test_running_and_booted_is_ready_silent, test_running_without_boot_metric_pages_not_booted, test_stopped_with_stale_launch_pages_not_running, test_stopped_after_holiday_gate_self_stop_is_silent, test_stopping_after_holiday_gate_self_stop_is_silent, test_stopped_with_early_launch_pages_not_running, test_pending_pages_not_running, test_probe_error_pages_verify_failed, test_subjects_are_emoji_first_and_within_sns_limit, test_holiday_cutoff_boundary_0825_ist, test_sns_publish_failure_propagates, test_handler_drill_mode_force_publishes_test_page, test_drill_verdict_never_returned_by_classifier
 - [x] P5 runbook truth-sync — Files: .claude/rules/project/dhan-rest-canary-error-codes.md, .claude/rules/project/observability-architecture.md, .claude/rules/project/wave-4-error-codes.md, .claude/rules/project/ws-reinject-error-codes.md, .claude/rules/project/dual-instance-lock-2026-07-04.md, .claude/rules/project/feed-stall-watchdog-error-codes.md, .claude/rules/project/wave-2-error-codes.md, CLAUDE.md — Tests: n/a (docs)
 
 ## Scenarios
 
 | # | Scenario | Expected |
 |---|----------|----------|
-| 1 | 12:00 IST REST canary probe fails (2026-07-06 leg 1) | errcode filter → alarm ALARM within ~5 min → SNS → Telegram 🆘; OK message on recovery |
+| 1 | 12:00 IST REST canary probe fails (2026-07-06 leg 1) | errcode filter → alarm ALARM within ~5 min → SNS → Telegram 🆘; NO OK page for this alarm (the auto-OK ~15 min later means the episode aged out, NOT recovery — next probe / DH-901 alarm is the recovery signal) |
 | 2 | Box launches 94 min late / app hung at 08:45 (leg 2) | readiness Lambda pages NOT_RUNNING / NOT_BOOTED regardless of latched alarm state |
-| 3 | Order-update WS flaps every ~90s in market hours (leg 3) | DIFF()>5/5min storm alarm pages (gated 09:20-15:35 IST) |
+| 3 | Order-update WS flaps every ~90s in market hours (leg 3) | DIFF()>5/15min storm alarm pages (~10 once-per-cycle increments per 900s window; gated 09:20-15:35 IST) |
 | 4 | Healthy trading morning | readiness Lambda runs silent; verdict logged; zero pages |
 | 5 | NSE holiday (gate self-stops box at ~08:32) | HOLIDAY_SILENT — no page |
 | 6 | AWS API lookup fails at 08:45 | VERIFY_FAILED_PAGE ⚠️ (fail-toward-paging) |
 | 7 | DH-901 repeats every 15 min | 1 🆘 page + 1 🟢 OK per episode (eval 3/dta 1) |
 | 8 | Future session moves the log sinks again | test_cw_agent_collects_machine_log_paths fails the build |
+| 9 | Operator invokes the readiness Lambda with `{"mode":"drill"}` (any time, any EC2 state) | 🧪 test page through the real SNS→Telegram path — the end-to-end proof for leg 2 |
+| 10 | Budget breach_stop / killswitch / portal stop lands 08:25-08:45 IST | readiness classifies HOLIDAY_SILENT, but the stopping path itself already paged (breach_stop/killswitch publish before stopping); boot-heartbeat gate window is the backstop |
+| 11 | Order-update WS flaps slower than ~1 cycle / 3 min | NOT paged — stated residual (detection floor >5 per 15 min); durable-down alarm owns full outages |

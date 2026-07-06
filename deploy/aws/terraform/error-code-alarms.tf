@@ -33,22 +33,34 @@ locals {
   # eval/dta 3/1: identical first-page latency to 1/1, but holds ALARM across
   # <=15-min repeat gaps (2026-07-06 DH-901 shape: 2 messages per episode --
   # one ALARM + one OK -- instead of ~32 flapping pairs).
+  #
+  # ok_recovery (round-1 review fix, 2026-07-06): for repeat-emitters (DH-901
+  # every 15 min, etc.) the eval-3/dta-1 OK transition genuinely tracks
+  # recovery (the code stopped firing) -> ok_actions ON. The REST canary is
+  # the exception: it emits only at 09:05/12:00/15:25 IST, so with a sparse
+  # metric + notBreaching the alarm ALWAYS returns to OK ~15 min after the
+  # single failing datapoint ages out -- "OK" would mean "no new probe ran
+  # yet", NOT "REST recovered" (a Rule-11 false-OK). Its recovery signal is
+  # the NEXT scheduled probe staying silent (or the DH-901 profile-poll
+  # alarm), so ok_recovery = false suppresses the misleading recovered page.
   error_code_alerts = {
     "rest-canary-01" = {
-      pattern   = "{ $.code = \"REST-CANARY-01\" && $.level = \"ERROR\" }"
-      period    = 300
-      threshold = 1
-      eval      = 3
-      dta       = 1
-      desc      = "REST-CANARY-01: Dhan REST health probe FAILED (09:05/12:00/15:25 IST canary). REST surface down or rejecting while the WebSocket may still look healthy (2026-07-06 12:00 IST incident class). Read status/url/body in the errors-jsonl stream. Runbook: .claude/rules/project/dhan-rest-canary-error-codes.md"
+      pattern     = "{ $.code = \"REST-CANARY-01\" && $.level = \"ERROR\" }"
+      period      = 300
+      threshold   = 1
+      eval        = 3
+      dta         = 1
+      ok_recovery = false
+      desc        = "REST-CANARY-01: Dhan REST health probe FAILED (09:05/12:00/15:25 IST canary). REST surface down or rejecting while the WebSocket may still look healthy (2026-07-06 12:00 IST incident class). Read status/url/body in the errors-jsonl stream. NO recovered/OK page for this alarm: the probe runs 3x/day, so the auto-OK ~15 min later only means the episode aged out - the next probe staying silent is the recovery signal. Runbook: .claude/rules/project/dhan-rest-canary-error-codes.md"
     }
     "dh-901" = {
-      pattern   = "{ $.code = \"DH-901\" && $.level = \"ERROR\" }"
-      period    = 300
-      threshold = 1
-      eval      = 3
-      dta       = 1
-      desc      = "DH-901: Dhan auth failing - token invalid/expired or profile checks failing. Check tv_token_remaining_seconds + SSM TOTP secret. Runbook: .claude/rules/dhan/annexure-enums.md rule 11 + wave-4-error-codes.md"
+      pattern     = "{ $.code = \"DH-901\" && $.level = \"ERROR\" }"
+      period      = 300
+      threshold   = 1
+      eval        = 3
+      dta         = 1
+      ok_recovery = true
+      desc        = "DH-901: Dhan auth failing - token invalid/expired or profile checks failing. Check tv_token_remaining_seconds + SSM TOTP secret. Runbook: .claude/rules/dhan/annexure-enums.md rule 11 + wave-4-error-codes.md"
     }
     # DH-906 is a plain TERM filter, not a coded JSON filter: zero coded emit
     # sites exist in the codebase (verified 2026-07-06 - tests, one doc
@@ -60,55 +72,61 @@ locals {
     # error!(code = ErrorCode::Dh906OrderError.code_str(), ...) at the
     # OmsError classification site converts this to a coded filter.
     "dh-906" = {
-      pattern   = "\"DH-906\""
-      period    = 300
-      threshold = 1
-      eval      = 3
-      dta       = 1
-      desc      = "DH-906: Dhan order error - NEVER auto-retry; fix the order. NOTE: pre-armed tripwire - no coded emit site exists and dry_run=true means no live orders today; the literal arrives inside Dhan's response text via OmsError. Runbook: .claude/rules/dhan/annexure-enums.md rule 11"
+      pattern     = "\"DH-906\""
+      period      = 300
+      threshold   = 1
+      eval        = 3
+      dta         = 1
+      ok_recovery = true
+      desc        = "DH-906: Dhan order error - NEVER auto-retry; fix the order. NOTE: pre-armed tripwire - no coded emit site exists and dry_run=true means no live orders today; the literal arrives inside Dhan's response text via OmsError. Runbook: .claude/rules/dhan/annexure-enums.md rule 11"
     }
     "auth-gap-04" = {
-      pattern   = "{ $.code = \"AUTH-GAP-04\" && $.level = \"ERROR\" }"
-      period    = 300
-      threshold = 1
-      eval      = 3
-      dta       = 1
-      desc      = "AUTH-GAP-04: TOTP secret likely rotated externally - auth is DEAD until the SSM totp-secret is reconciled with dhan.co. Runbook: .claude/rules/project/wave-4-error-codes.md"
+      pattern     = "{ $.code = \"AUTH-GAP-04\" && $.level = \"ERROR\" }"
+      period      = 300
+      threshold   = 1
+      eval        = 3
+      dta         = 1
+      ok_recovery = true
+      desc        = "AUTH-GAP-04: TOTP secret likely rotated externally - auth is DEAD until the SSM totp-secret is reconciled with dhan.co. Runbook: .claude/rules/project/wave-4-error-codes.md"
     }
     "ws-gap-07" = {
-      pattern   = "{ $.code = \"WS-GAP-07\" && $.level = \"ERROR\" }"
-      period    = 300
-      threshold = 1
-      eval      = 3
-      dta       = 1
-      desc      = "WS-GAP-07: live-feed frame channel CLOSED - the tick consumer died; no ticks reach the pipeline from that connection until restart. Runbook: .claude/rules/project/wave-2-error-codes.md"
+      pattern     = "{ $.code = \"WS-GAP-07\" && $.level = \"ERROR\" }"
+      period      = 300
+      threshold   = 1
+      eval        = 3
+      dta         = 1
+      ok_recovery = true
+      desc        = "WS-GAP-07: live-feed frame channel CLOSED - the tick consumer died; no ticks reach the pipeline from that connection until restart. Runbook: .claude/rules/project/wave-2-error-codes.md"
     }
     # FEED-STALL-01 pages only on a STORM (Sum >= 3 per 15 min): the runbook
     # itself defines a single stall-restart as healthy self-heal; the storm is
     # the operator-action signal (persistent provider-side reject).
     "feed-stall-01" = {
-      pattern   = "{ $.code = \"FEED-STALL-01\" && $.level = \"ERROR\" }"
-      period    = 900
-      threshold = 3
-      eval      = 1
-      dta       = 1
-      desc      = "FEED-STALL-01 STORM: >=3 Groww sidecar stall-restarts in 15 min - the provider keeps closing the socket; a single self-heal restart never pages (per the runbook's own operator-action bound). Check credential/entitlement. Runbook: .claude/rules/project/feed-stall-watchdog-error-codes.md"
+      pattern     = "{ $.code = \"FEED-STALL-01\" && $.level = \"ERROR\" }"
+      period      = 900
+      threshold   = 3
+      eval        = 1
+      dta         = 1
+      ok_recovery = true
+      desc        = "FEED-STALL-01 STORM: >=3 Groww sidecar stall-restarts in 15 min - the provider keeps closing the socket; a single self-heal restart never pages (per the runbook's own operator-action bound). Check credential/entitlement. Runbook: .claude/rules/project/feed-stall-watchdog-error-codes.md"
     }
     "ws-reinject-01" = {
-      pattern   = "{ $.code = \"WS-REINJECT-01\" && $.level = \"ERROR\" }"
-      period    = 300
-      threshold = 1
-      eval      = 3
-      dta       = 1
-      desc      = "WS-REINJECT-01: boot WAL re-injection ABORTED - consumer dead/wedged; frames stay staged in WAL replaying/ and re-replay next boot. Runbook: .claude/rules/project/ws-reinject-error-codes.md"
+      pattern     = "{ $.code = \"WS-REINJECT-01\" && $.level = \"ERROR\" }"
+      period      = 300
+      threshold   = 1
+      eval        = 3
+      dta         = 1
+      ok_recovery = true
+      desc        = "WS-REINJECT-01: boot WAL re-injection ABORTED - consumer dead/wedged; frames stay staged in WAL replaying/ and re-replay next boot. Runbook: .claude/rules/project/ws-reinject-error-codes.md"
     }
     "proc-01" = {
-      pattern   = "{ $.code = \"PROC-01\" && $.level = \"ERROR\" }"
-      period    = 300
-      threshold = 1
-      eval      = 3
-      dta       = 1
-      desc      = "PROC-01: kernel OOM kill detected in this cgroup (Severity Critical). Cross-check tv_process_rss_bytes + host memory alarms. Runbook: .claude/rules/project/wave-4-error-codes.md"
+      pattern     = "{ $.code = \"PROC-01\" && $.level = \"ERROR\" }"
+      period      = 300
+      threshold   = 1
+      eval        = 3
+      dta         = 1
+      ok_recovery = true
+      desc        = "PROC-01: kernel OOM kill detected in this cgroup (Severity Critical). Cross-check tv_process_rss_bytes + host memory alarms. Runbook: .claude/rules/project/wave-4-error-codes.md"
     }
   }
 }
@@ -145,5 +163,8 @@ resource "aws_cloudwatch_metric_alarm" "error_code" {
   treat_missing_data  = "notBreaching"
   # deliberately NO dimensions (see filter comment)
   alarm_actions = local.app_alarm_actions
-  ok_actions    = local.app_alarm_ok
+  # ok_recovery = false (the REST canary) suppresses the OK page: with a
+  # 3-probes/day emit cadence the auto-OK ~15 min later would be a Rule-11
+  # false "recovered" message (see the locals comment above).
+  ok_actions = each.value.ok_recovery ? local.app_alarm_ok : []
 }

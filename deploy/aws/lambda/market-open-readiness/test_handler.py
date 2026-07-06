@@ -98,7 +98,7 @@ def test_subjects_are_emoji_first_and_within_sns_limit() -> None:
     Telegram commandments demand a severity emoji at the START."""
     for subject, message in handler.SUBJECTS_AND_MESSAGES.values():
         assert len(subject) <= 99, f"subject too long: {subject!r}"
-        assert subject[0] in "🆘⚠️", f"subject must start with an emoji: {subject!r}"
+        assert subject[0] in "🆘⚠️🧪", f"subject must start with an emoji: {subject!r}"
         assert message  # never an empty page body
 
 
@@ -199,6 +199,34 @@ def test_handler_cw_probe_error_pages_verify_failed(monkeypatch) -> None:
     out = handler.lambda_handler({"mode": "readiness"})
     assert out["verdict"] == handler.VERIFY_FAILED_PAGE
     assert "could not verify" in sns.published[0]["subject"]
+
+
+def test_handler_drill_mode_force_publishes_test_page(monkeypatch) -> None:
+    """Round-1 review fix: the SNS end-to-end drill. An evening stopped-box
+    invoke classifies HOLIDAY_SILENT (LaunchTime = today's 08:30 auto-start),
+    so it can NEVER prove the page route. {"mode": "drill"} must publish a
+    clearly-labelled test page regardless of EC2/boot state."""
+    sns = _FakeSns()
+    # This EC2/CW shape would be HOLIDAY_SILENT on a readiness run -- the
+    # drill must page anyway (it never consults the probes).
+    _wire(monkeypatch, sns, _FakeEc2("stopped", LAUNCH_TODAY_0831), _FakeCw())
+    out = handler.lambda_handler({"mode": "drill"})
+    assert out["verdict"] == handler.DRILL_PAGE
+    assert len(sns.published) == 1
+    assert "test" in sns.published[0]["subject"].lower()
+    assert "no action needed" in sns.published[0]["message"]
+
+
+def test_drill_verdict_never_returned_by_classifier() -> None:
+    """DRILL_PAGE exists only for the manual drill branch -- classify_readiness
+    can never emit it (its 5 real verdicts are pinned by the tests above)."""
+    for state in ("running", "stopped", "stopping", "pending", "unknown"):
+        for boot_seen in (True, False):
+            for probe_error in (True, False):
+                verdict = handler.classify_readiness(
+                    state, LAUNCH_TODAY_0831, boot_seen, probe_error, NOW
+                )
+                assert verdict != handler.DRILL_PAGE
 
 
 def test_sns_publish_failure_propagates(monkeypatch) -> None:
