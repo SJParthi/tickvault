@@ -2007,6 +2007,32 @@ pub fn shard_files(shards_root: &Path, conn_id: usize) -> GrowwShardFiles {
     }
 }
 
+/// Best-effort removal of one connection's subscribe-proof status file
+/// (hardening 2026-07-06): the status path is undated and the sidecar never
+/// deletes it, so a killed connection would otherwise keep "proving" its
+/// subscription forever — pinning the ladder's plateau gate at the fleet's
+/// historical maximum. Called on fleet scale-down (after the child abort)
+/// and by the ladder's start-of-run sweep. Returns `true` when a file was
+/// actually removed; a missing file is a clean no-op.
+pub(crate) fn remove_subscribe_proof(shards_root: &Path, conn_id: usize) -> bool {
+    let status_file = shard_files(shards_root, conn_id).status_file;
+    match std::fs::remove_file(&status_file) {
+        Ok(()) => true,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => false,
+        Err(err) => {
+            // Best-effort: the ladder's freshness gate ages the leftover
+            // out within its bound, so this is degraded, never silent.
+            tracing::warn!(
+                conn_id,
+                error = %err,
+                path = %status_file.display(),
+                "groww shard scale-down: subscribe-proof status file removal failed"
+            );
+            false
+        }
+    }
+}
+
 /// §34 PR-2 Item 7: ONE process-lifetime aggregator + midnight force-seal +
 /// catch-up seal + ONE shared capture-seq counter, then one supervised
 /// bridge tail-loop PER SHARD FILE — all folding into the SAME papaya map
@@ -2879,6 +2905,31 @@ mod tests {
         // Distinct conns never share a file (disjoint capture chains).
         assert_ne!(f0.tick_file, f7.tick_file);
         assert_eq!(GROWW_SHARDS_DIR_DEFAULT, "data/groww/shards");
+    }
+
+    /// Hardening 2026-07-06: scale-down must be able to drop the killed
+    /// conn's subscribe-proof file (undated path, never sidecar-deleted) so
+    /// the ladder's plateau gate cannot count dead connections.
+    /// test coverage (pub-fn-test-guard line): remove_subscribe_proof
+    #[test]
+    fn test_remove_subscribe_proof_removes_only_the_target_conn() {
+        let root = std::env::temp_dir().join(format!(
+            "tv_bridge_proof_rm_{}_{}",
+            std::process::id(),
+            line!()
+        ));
+        for conn_id in 0..2 {
+            let files = shard_files(&root, conn_id);
+            std::fs::create_dir_all(&files.watch_dir).unwrap_or_else(|e| panic!("mkdir: {e}"));
+            std::fs::write(&files.status_file, b"{}").unwrap_or_else(|e| panic!("write: {e}"));
+        }
+        // Removes the target, leaves the sibling.
+        assert!(remove_subscribe_proof(&root, 1));
+        assert!(!shard_files(&root, 1).status_file.exists());
+        assert!(shard_files(&root, 0).status_file.exists());
+        // Missing file → clean no-op (idempotent).
+        assert!(!remove_subscribe_proof(&root, 1));
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

@@ -196,7 +196,7 @@ pub struct GrowwScaleConnRow {
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct GrowwScaleSnapshot {
     /// Ladder FSM state label (`probing` / `holding` / `advancing` /
-    /// `rolling_back` / `halted_at_ceiling`).
+    /// `rolling_back` / `halted_at_ceiling` / `halted_at_plateau`).
     pub ladder_state: &'static str,
     /// Connections the ladder currently wants running.
     pub desired_conns: usize,
