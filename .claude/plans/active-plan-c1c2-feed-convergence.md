@@ -2,8 +2,7 @@
 
 **Status:** IN_PROGRESS
 **Date:** 2026-06-27
-**Approved by:** pending (C1 implemented as a DRAFT PR — code shipped behind the
-shared builder; C2 still design-only)
+**Approved by:** Parthiban (operator, 2026-07-06 — standing directive: "once it gets merged go ahead with the plan always")
 
 > **Scope:** This is a DESIGN document (docs-only). It plans, but does NOT yet
 > implement, the convergence of the two remaining per-feed code duplications
@@ -94,11 +93,28 @@ line is the original DRAFT and is superseded where it conflicts):
   - Files: `crates/storage/src/tick_persistence.rs`, `crates/storage/src/groww_persistence.rs`, `crates/storage/src/lib.rs`, `crates/app/src/groww_bridge.rs` (call-site swap), `crates/storage/tests/feed_tick_writer_convergence_guard.rs` (new)
   - Tests: `test_generic_tick_writer_dhan_full_columns`, `test_generic_tick_writer_groww_subset_columns_null_not_zero`, `test_generic_tick_writer_dedup_key_unchanged`, `test_generic_tick_writer_dhan_uses_f32_to_f64_clean`, `test_generic_tick_writer_groww_native_f64`, `test_one_raw_tick_writer_path_guard`, DHAT `dhat_generic_tick_writer_zero_alloc`
 
-- [ ] **Item C2 — Sub-PR #2: unify the tick CONSUMER LOOP (feed-parameterized), on top of C1**
+- [x] **Item C2 — Sub-PR #2: unify the tick CONSUMER LOOP (feed-parameterized), on top of C1** — implemented 2026-07-06
   - Files: `crates/core/src/pipeline/tick_processor.rs`, `crates/app/src/groww_bridge.rs`, `crates/core/src/pipeline/feed_consumer.rs` (new shared loop), `crates/core/tests/feed_consumer_convergence_guard.rs` (new)
   - Tests: `test_consumer_dhan_runs_greeks_enrichment`, `test_consumer_groww_skips_greeks`, `test_consumer_persist_then_aggregate_order_preserved`, `test_consumer_null_column_policy_per_feed`, `test_one_consumer_loop_path_guard`, DHAT `dhat_feed_consumer_zero_alloc`
+  - Implementation refs: `crates/core/src/pipeline/feed_consumer.rs::consume_feed_tick` (the ONE ordered enrich→persist→aggregate core, exhaustive greeks-for-Dhan-only gate); Dhan call site = `tick_processor.rs::run_tick_processor` `ParsedFrame::Tick` arm (aggregate handoff = the Engine-B tick broadcast); Groww call site = `groww_bridge.rs::GrowwBridgeState::drain_new_data` per-line body (aggregate handoff = the inline `MultiTfAggregator::consume_tick(FeedStrategy::GROWW)` fold + `route_seal`); guard = `crates/core/tests/feed_consumer_convergence_guard.rs::test_one_consumer_loop_path_guard`; DHAT = `crates/core/tests/dhat_feed_consumer.rs`.
+  - HONEST SCOPE NOTE (2026-07-06, per the re-verify instruction): the two loops
+    diverged since this plan was drafted — Dhan's `run_tick_processor` no longer
+    folds through the aggregator inline (#T1b: Engine B subscribes to the tick
+    broadcast in `crates/app/src/main.rs::spawn_engine_b_aggregator`), and the
+    per-seal routing was ALREADY converged into `tickvault_app::seal_routing::
+    route_seal`. The genuinely-shared per-tick consumer core is therefore the
+    ORDERED 3-stage sequence (enrich[Dhan-only] → persist → aggregate handoff),
+    extracted as `consume_feed_tick`. NOT force-shared (deliberately per-feed):
+    the pull/parse adapters, the validation gates, the resilience tiers, the
+    post-fold `ConsumeStats` counter arms (per-feed labels operator-pinned in
+    `wave-6-error-codes.md`), and the Dhan `TickWithDepth` (Full-packet) arm —
+    whose broadcast handoff is separated from persist by depth-frame gating with
+    loop-`continue`s; routing it through the core would change which frames are
+    broadcast (behavior change). The exception is pinned by the guard's
+    persist-call-site counts.
 
 - [ ] **(Option, within C2) C2-LOW hardening — explicit "absent field" capability mask**
+  - deferred per plan recommendation (minimal diff); needs operator call to include — NOT implemented in Sub-PR #2 (2026-07-06): touching `crates/common/` escalates testing scope to workspace and the plan itself marks it "NOT required for the core C1/C2 convergence".
   - Files: `crates/common/src/feed.rs` (capability accessor), `crates/core/src/pipeline/feed_consumer.rs`
   - Tests: `test_feed_capability_mask_dhan_has_ohlc_oi`, `test_feed_capability_mask_groww_ltp_volume_only`
 
@@ -325,7 +341,20 @@ replay, greeks-for-Groww, feed-mismatch, drop-counter semantics).
 
 ## Rollback
 
-- **Feature flag:** the converged path ships behind a config/compile toggle
+- **C2 ROLLBACK DECISION (locked 2026-07-06, implementer per task brief):
+  pure extraction — git-revert is the rollback path; NO runtime flag.**
+  Rationale: a runtime flag would require keeping BOTH old inline loop bodies
+  alive next to the shared core — re-introducing the exact duplication C2
+  removes and making `test_one_consumer_loop_path_guard` (the one-loop ratchet)
+  unenforceable. The shared core is a monomorphized 3-closure inline
+  (`#[inline(always)]`, Copy-enum match) that compiles to the pre-C2
+  straight-line code, so the revert surface is a small, self-contained diff:
+  `git revert` of the C2 commits restores both inline bodies verbatim from git
+  history (they were moved, not rewritten). This matches how C1 itself shipped
+  (the `tick_row_builder` rewiring carried no flag either). The original
+  feature-flag paragraph below is retained as the superseded DRAFT position.
+- **Feature flag (SUPERSEDED for C2 by the 2026-07-06 decision above):** the
+  converged path ships behind a config/compile toggle
   (mirroring `stream-resilience.md` B12 + the daily-universe feature-gate
   pattern). The DEFAULT for the first deploy keeps the two existing paths; the
   flag flips to the converged writer/loop once green. Flip-to-OFF is a TESTED
