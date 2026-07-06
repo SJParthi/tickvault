@@ -222,6 +222,17 @@ pub enum ErrorCode {
     /// (`reason="bare_dhan_reset"`) and the ceiling-exceeded fallback
     /// (`reason="ceiling_exceeded"`). Severity::Low.
     WsGap09WatchdogReconnectInPlace,
+    /// WS-GAP-10: the order-update WebSocket is in an in-market outage.
+    /// Tags three events (see `reason` field): `in_market_outage` — the
+    /// once-per-episode \[HIGH\] `OrderUpdateDisconnected` page fired from
+    /// INSIDE the never-give-up reconnect loop when consecutive in-market
+    /// failures reach 3 (the old task-exit emit in main.rs was dead code
+    /// since the WS-GAP-04 rewrite; verified live 2026-07-06: 39+ in-market
+    /// failures, zero HIGH pages); `threshold_streak` — the every-10th-failure
+    /// persist error; `task_exited_unreachable` — the defensive log at the
+    /// main.rs spawn site. Latch re-arms ONLY after a reconnect survives the
+    /// 60s stability window. Severity::High.
+    WsGap10OrderUpdateOutage,
     /// DISK-WATCHER-01: the spill disk-health watcher task exited
     /// (panic/cancel) and the supervisor respawned it so free-space
     /// monitoring — the early-warning for the "disk full + QuestDB down"
@@ -868,6 +879,7 @@ impl ErrorCode {
             Self::WsGap07LiveChannelClosed => "WS-GAP-07",
             Self::WsGap08RateLimitCooldown => "WS-GAP-08",
             Self::WsGap09WatchdogReconnectInPlace => "WS-GAP-09",
+            Self::WsGap10OrderUpdateOutage => "WS-GAP-10",
             Self::DiskWatcher01Respawned => "DISK-WATCHER-01",
             Self::WsSpill01WriterRespawn => "WS-SPILL-01",
             Self::WsSpill02FrameDropped => "WS-SPILL-02",
@@ -1076,6 +1088,9 @@ impl ErrorCode {
             | Self::RestCanary01ProbeFailed
             // WS-GAP-07 — live frame channel closed (tick consumer died)
             | Self::WsGap07LiveChannelClosed
+            // WS-GAP-10 — order confirmations feed down in-market; the loop
+            // self-retries but the operator must see it (2026-07-06 incident)
+            | Self::WsGap10OrderUpdateOutage
             // WS-SPILL-01 — WAL writer respawned (flapping writer = disk dying)
             | Self::WsSpill01WriterRespawn
             // WS-REINJECT-01 — boot WAL re-injection aborted (consumer dead/
@@ -1244,6 +1259,7 @@ impl ErrorCode {
             | Self::WsGap07LiveChannelClosed
             | Self::WsGap08RateLimitCooldown
             | Self::WsGap09WatchdogReconnectInPlace
+            | Self::WsGap10OrderUpdateOutage
             | Self::DiskWatcher01Respawned
             | Self::AuthGap03TokenForceRenewedOnWake
             | Self::Boot01QuestDbSlow
@@ -1468,6 +1484,7 @@ impl ErrorCode {
             Self::WsGap07LiveChannelClosed,
             Self::WsGap08RateLimitCooldown,
             Self::WsGap09WatchdogReconnectInPlace,
+            Self::WsGap10OrderUpdateOutage,
             Self::DiskWatcher01Respawned,
             Self::WsSpill01WriterRespawn,
             Self::WsSpill02FrameDropped,
@@ -1868,7 +1885,10 @@ mod tests {
         // bumped 128 -> 129 for GROWW-SCALE-05 (dual scale-fleet instance
         // detected / SSM lock unprovable — fleet spawn refused fail-closed,
         // single-connection fallback).
-        assert_eq!(ErrorCode::all().len(), 129);
+        // 2026-07-06 (order-update outage paging PR-1): bumped 129 -> 130 for
+        // WS-GAP-10 (order-update in-market outage — the reachable in-loop
+        // [HIGH] page; the old task-exit emit was dead code since WS-GAP-04).
+        assert_eq!(ErrorCode::all().len(), 130);
     }
 
     #[test]

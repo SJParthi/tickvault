@@ -40,6 +40,21 @@ use crate::parser::order_update::{build_order_update_login, parse_order_update};
 /// PR-E: poll cadence (secs) while the Dhan feed is disabled at runtime — the
 /// order-update WS idles, re-checking the enable flag at this interval.
 const ORDER_UPDATE_FEED_DISABLE_POLL_SECS: u64 = 2;
+
+/// 2026-07-06 RC1: consecutive in-market connect/read failures before the ONE
+/// \[HIGH\] `OrderUpdateDisconnected` Telegram fires per outage episode
+/// (edge-triggered per audit-findings Rule 4; market-hours-aware per Rule 3).
+/// With the 0ms/0ms/500ms backoff ladder the page lands ~1s into a genuine
+/// outage.
+const ORDER_UPDATE_OUTAGE_PAGE_FAILURE_THRESHOLD: u32 = 3;
+
+/// 2026-07-06 RC2: a reconnect counts as a REAL recovery only after the socket
+/// survives this long. TIME-survival, NOT first-frame gating: the order-update
+/// stream is legitimately silent for hours on idle days (watchdog threshold
+/// history 660s -> 1800s -> 14400s), so a frame gate would never fire. 60s is
+/// far beyond the observed die-after-login window (~10ms, 2026-07-06 incident)
+/// and far below `WATCHDOG_THRESHOLD_ORDER_UPDATE_SECS`.
+const ORDER_UPDATE_RECONNECT_STABILITY_SECS: u64 = 60;
 use crate::websocket::activity_watchdog::{
     ActivityWatchdog, WATCHDOG_THRESHOLD_ORDER_UPDATE_SECS, build_heartbeat_gauge,
     spawn_with_panic_notify,
@@ -83,6 +98,11 @@ pub async fn run_order_update_connection(
     dhan_feed_flag: Option<Arc<std::sync::atomic::AtomicBool>>,
 ) {
     let mut consecutive_failures: u32 = 0;
+    // 2026-07-06 RC1: once-per-outage-episode latch for the [HIGH]
+    // OrderUpdateDisconnected page (audit-findings Rule 4 — edge-triggered).
+    // Re-armed ONLY by a real recovery (a reconnect surviving the stability
+    // window), the WS-GAP-04 post-close sleep, or a PR-E Dhan re-enable.
+    let mut outage_paged: bool = false;
     let m_reconnections = metrics::counter!("tv_order_update_reconnections_total");
 
     info!("order update WebSocket starting");
@@ -116,16 +136,22 @@ pub async fn run_order_update_connection(
             }
             info!("PR-E: Dhan re-enabled — order-update WS resuming");
             consecutive_failures = 0;
+            outage_paged = false;
         }
 
         // Snapshot the failure count BEFORE the connect attempt. If the
-        // attempt succeeds AND this counter is > 0, we have just
-        // recovered from a streak of failures. `connect_and_listen`
-        // fires the `OrderUpdateReconnected` Telegram event from inside
-        // itself (right after successful connect), using this count.
+        // attempt succeeds AND this counter is > 0, we may be recovering
+        // from a streak of failures. 2026-07-06 RC2: the operator-facing
+        // OrderUpdateReconnected Telegram fires from the stability arm
+        // inside `connect_and_listen` ONLY after the new socket survives
+        // the 60s stability window — a connect that dies ~10ms after login
+        // must never read as "recovered" (the 2026-07-06 false-recovery
+        // storm). The audit row still records the physical reconnect at
+        // the connect edge.
         let failures_before_attempt = consecutive_failures;
+        let mut stability_reached = false;
 
-        match connect_and_listen(
+        let attempt_result = connect_and_listen(
             &order_update_url,
             &client_id,
             &token_handle,
@@ -137,19 +163,47 @@ pub async fn run_order_update_connection(
             notifier.as_ref(),
             failures_before_attempt,
             ws_audit_tx.as_ref(),
+            &mut stability_reached,
         )
-        .await
-        {
+        .await;
+        if stability_reached {
+            // REAL recovery (survived the stability window): the outage
+            // episode is over — re-arm the per-episode HIGH page latch
+            // (Rule 4 falling edge) and reset the streak so the next error
+            // starts a fresh episode.
+            outage_paged = false;
+            consecutive_failures = 0;
+        }
+
+        match attempt_result {
             Ok(()) => {
-                // Clean disconnect — reset backoff and reconnect.
-                consecutive_failures = 0;
-                info!("order update WebSocket disconnected cleanly — reconnecting");
+                // Clean disconnect — 2026-07-06 RC1 (hostile-review fix, same
+                // day): a session that ended BEFORE the stability window is a
+                // FAILURE regardless of delivery mode. Dhan's documented
+                // auth-rejection path is a clean Close frame, so a dead-token
+                // outage delivered as clean closes must reach the same
+                // 3-failure HIGH page as the TCP-reset regime. Sessions that
+                // survived ≥60s reset via the stability arm above.
+                let within_hours = is_within_market_hours(&calendar);
+                consecutive_failures =
+                    streak_after_clean_close(consecutive_failures, stability_reached);
+                if stability_reached {
+                    info!(
+                        "order update WebSocket disconnected cleanly after stable session — reconnecting"
+                    );
+                } else {
+                    warn!(
+                        consecutive_failures,
+                        "order update WebSocket closed cleanly before the stability window — \
+                         counted as a failure"
+                    );
+                }
                 // 2026-06-12 (hostile-review fix): a clean server-initiated close
                 // (the documented Dhan idle-RST case) returns Ok(()) — it is STILL
                 // a disconnect and MUST be tracked, else a clean disconnect/reconnect
                 // cycle is invisible in ws_event_audit. Kind mirrors in-market vs
                 // off-hours; no transport error → source "clean close".
-                let ou_clean_kind = if is_within_market_hours(&calendar) {
+                let ou_clean_kind = if within_hours {
                     tickvault_common::ws_event_types::WsEventKind::Disconnected
                 } else {
                     tickvault_common::ws_event_types::WsEventKind::DisconnectedOffHours
@@ -160,8 +214,50 @@ pub async fn run_order_update_connection(
                     "clean close",
                     "order-update connection closed cleanly (server close / stream end)",
                     0,
-                    0,
+                    consecutive_failures,
                 );
+                if !stability_reached {
+                    // Same in-loop [HIGH] page decision as the error arm —
+                    // without this, a pure clean-close outage regime would
+                    // grow the streak but never page (the 2026-07-06
+                    // hostile-review finding).
+                    if should_page_outage(within_hours, consecutive_failures, outage_paged) {
+                        outage_paged = true;
+                        emit_in_market_outage_page(
+                            notifier.as_ref(),
+                            consecutive_failures,
+                            "clean close",
+                        );
+                    }
+                    // Off-hours parity with the error arm: after the same
+                    // attempt budget, sleep until the next market open
+                    // instead of flapping backoff-capped all night
+                    // (WS-GAP-04). `error_is_read_timeout = false`: a clean
+                    // close is not the expected off-hours idle timeout.
+                    if decide_reconnect_action(false, within_hours, consecutive_failures)
+                        == ReconnectAction::Exhausted
+                    {
+                        error!(
+                            attempts = consecutive_failures,
+                            code = tickvault_common::error_code::ErrorCode::WsGap04PostCloseSleep
+                                .code_str(),
+                            "WS-GAP-04 order update WebSocket exhausted reconnection attempts \
+                             (clean-close flap) — sleeping until next market open"
+                        );
+                        order_update_post_close_sleep(
+                            &calendar,
+                            consecutive_failures,
+                            notifier.as_ref(),
+                            ws_audit_tx.as_ref(),
+                        )
+                        .await;
+                        // The WS-GAP-04 sleep ends the outage episode —
+                        // fresh streak + re-armed page latch.
+                        consecutive_failures = 0;
+                        outage_paged = false;
+                        continue;
+                    }
+                }
             }
             Err(err) => {
                 let is_timeout = matches!(err, OrderUpdateConnectionError::ReadTimeout);
@@ -222,13 +318,28 @@ pub async fn run_order_update_connection(
                         )
                         .await;
                         // Reset attempt counter so the post-sleep attempt
-                        // starts fresh.
+                        // starts fresh. 2026-07-06 RC1: the WS-GAP-04 sleep
+                        // ends the outage episode — re-arm the page latch.
                         consecutive_failures = 0;
+                        outage_paged = false;
                         // Continue the reconnect loop after sleep.
                         continue;
                     }
                     ReconnectAction::IncrementAndRetry => {
                         consecutive_failures = tentative_failures;
+                        // 2026-07-06 RC1: the REACHABLE [HIGH] disconnect page
+                        // — in-loop, edge-triggered once per outage episode,
+                        // market-hours-gated (audit-findings Rules 3+4). The
+                        // old emit site at the main.rs spawn point was dead
+                        // code: this function never returns (WS-GAP-04).
+                        if should_page_outage(within_hours, consecutive_failures, outage_paged) {
+                            outage_paged = true;
+                            emit_in_market_outage_page(
+                                notifier.as_ref(),
+                                consecutive_failures,
+                                ou_source,
+                            );
+                        }
                         // Parthiban directive (2026-04-21): always ERROR on
                         // 10-failure streak and WARN on every error,
                         // regardless of market hours. Full audit +
@@ -236,6 +347,9 @@ pub async fn run_order_update_connection(
                         if consecutive_failures.is_multiple_of(10) {
                             error!(
                                 consecutive_failures,
+                                code = tickvault_common::error_code::ErrorCode::WsGap10OrderUpdateOutage
+                                    .code_str(),
+                                reason = "threshold_streak",
                                 "order update WebSocket reconnection threshold hit — still retrying"
                             );
                         } else {
@@ -320,6 +434,47 @@ fn emit_order_update_ws_audit(
             "order-update ws_event_audit channel full/closed — row dropped (log+Telegram still fired)"
         );
         metrics::counter!("tv_ws_event_audit_dropped_total", "reason" => drop_reason).increment(1);
+    }
+}
+
+/// 2026-07-06 RC1: the once-per-episode \[HIGH\] in-market outage page —
+/// coded `error!` (WS-GAP-10) + `[HIGH]` `OrderUpdateDisconnected` Telegram +
+/// page counter. Shared by BOTH reconnect-loop arms: the transport-error arm
+/// AND the sub-stability clean-close arm (hostile-review fix, same day —
+/// Dhan's documented auth-rejection delivery is a clean Close frame, so the
+/// page must be reachable from that arm too).
+///
+/// COLD PATH — at most once per outage episode (caller gates via
+/// `should_page_outage` + the `outage_paged` latch).
+fn emit_in_market_outage_page(
+    notifier: Option<&Arc<crate::notification::NotificationService>>,
+    consecutive_failures: u32,
+    cause: &str,
+) {
+    metrics::counter!("tv_order_update_outage_pages_total").increment(1);
+    error!(
+        consecutive_failures,
+        cause,
+        code = tickvault_common::error_code::ErrorCode::WsGap10OrderUpdateOutage.code_str(),
+        reason = "in_market_outage",
+        "WS-GAP-10 order update WebSocket outage during market hours — \
+         paging operator, reconnect loop continues"
+    );
+    if let Some(n) = notifier {
+        // O(1) EXEMPT: begin — cold path, at most once per outage episode.
+        n.notify(
+            crate::notification::events::NotificationEvent::OrderUpdateDisconnected {
+                reason: format!(
+                    "Order confirmations from the broker have STOPPED during market hours — \
+                     {consecutive_failures} connection attempts in a row failed ({cause}). \
+                     The system keeps retrying automatically. \
+                     What you need to do RIGHT NOW: 1. Check the Dhan login token is still \
+                     valid — a dead token makes every attempt fail within milliseconds. \
+                     2. If any order is live, watch it in the Dhan app until this recovers."
+                ),
+            },
+        );
+        // O(1) EXEMPT: end
     }
 }
 
@@ -435,7 +590,7 @@ async fn order_update_post_close_sleep(
 }
 
 /// Single connection lifecycle: connect → login → read loop.
-#[allow(clippy::too_many_arguments)] // APPROVED: STAGE-C wal_spill + O2 authenticated signal
+#[allow(clippy::too_many_arguments)] // APPROVED: STAGE-C wal_spill + O2 authenticated signal + 2026-07-06 stability flag
 async fn connect_and_listen(
     url: &str,
     client_id: &str,
@@ -450,6 +605,10 @@ async fn connect_and_listen(
     ws_audit_tx: Option<
         &tokio::sync::mpsc::Sender<tickvault_common::ws_event_types::WsEventAuditRow>,
     >,
+    // 2026-07-06 RC2: set to true once this session survives the stability
+    // window; the caller uses it to end the outage episode (re-arm the HIGH
+    // page latch + reset the streak).
+    stability_reached: &mut bool,
 ) -> Result<(), OrderUpdateConnectionError> {
     // Read current token.
     let token_guard = token_handle.load();
@@ -484,18 +643,12 @@ async fn connect_and_listen(
 
     info!("order update WebSocket connected");
 
-    // Parthiban directive (2026-04-21): fire Telegram on every successful
-    // reconnect. A reconnect is defined as "connect() succeeded AND we
-    // had >=1 prior consecutive failure". First boot (failures=0) does
-    // not qualify — `OrderUpdateConnected` covers that already.
+    // 2026-07-06 RC2: the audit row still records the physical reconnect
+    // here, but the operator-facing recovery Telegram moved to the stability
+    // arm below — a connect that dies ~10ms after login must not read as
+    // "recovered" (the 2026-07-06 incident produced false
+    // "[LOW] reconnected x8" storms from the old connect-edge emission).
     if failures_before_attempt > 0 {
-        if let Some(n) = notifier {
-            n.notify(
-                crate::notification::events::NotificationEvent::OrderUpdateReconnected {
-                    consecutive_failures: failures_before_attempt,
-                },
-            );
-        }
         // 2026-06-12: forensic reconnect row (attempts = prior failure streak).
         emit_order_update_ws_audit(
             ws_audit_tx,
@@ -579,6 +732,15 @@ async fn connect_and_listen(
     // O(1) EXEMPT: one gauge lookup per reconnect cycle
     let m_last_frame_epoch = build_heartbeat_gauge("order_update", "order-update".to_string());
 
+    // 2026-07-06 RC2: honest recovery signal — announce "reconnected" only
+    // after the socket survives the stability window. TIME-survival, never
+    // frame-gated: the order-update stream is legitimately silent for hours
+    // on idle days. In the 2026-07-06 incident every connect died ~10ms
+    // after login, so the old connect-edge emit produced false
+    // "[LOW] reconnected x8" storms.
+    let stability_sleep = time::sleep(Duration::from_secs(ORDER_UPDATE_RECONNECT_STABILITY_SECS));
+    tokio::pin!(stability_sleep);
+
     // The read loop is wrapped in a helper closure so every exit path can
     // abort the watchdog handle exactly once. This avoids sprinkling
     // `watchdog_handle.abort()` at every `return` site.
@@ -590,6 +752,29 @@ async fn connect_and_listen(
                 break Err(OrderUpdateConnectionError::WatchdogFired(
                     WATCHDOG_THRESHOLD_ORDER_UPDATE_SECS,
                 ));
+            }
+            () = &mut stability_sleep, if !*stability_reached => {
+                // Guard is load-bearing: a completed tokio Sleep must never
+                // be re-polled. Set unconditionally (also on fresh-connect
+                // sessions with failures==0) so the caller's episode re-arm
+                // always works; the Telegram fires only on genuine recovery.
+                *stability_reached = true;
+                if should_emit_stable_recovery(failures_before_attempt) {
+                    metrics::counter!("tv_order_update_stable_reconnects_total").increment(1);
+                    info!(
+                        failures_before_attempt,
+                        stability_secs = ORDER_UPDATE_RECONNECT_STABILITY_SECS,
+                        "order update WebSocket reconnect survived stability window — recovery confirmed"
+                    );
+                    if let Some(n) = notifier {
+                        n.notify(
+                            crate::notification::events::NotificationEvent::OrderUpdateReconnected {
+                                consecutive_failures: failures_before_attempt,
+                            },
+                        );
+                    }
+                }
+                continue;
             }
             next_frame = read.next() => next_frame,
         };
@@ -969,6 +1154,58 @@ fn decide_reconnect_action(
     } else {
         ReconnectAction::IncrementAndRetry
     }
+}
+
+/// 2026-07-06 RC1: decides whether the once-per-episode \[HIGH\]
+/// `OrderUpdateDisconnected` page fires for the current failure streak.
+///
+/// Pure function — no I/O. Edge-triggered per audit-findings Rule 4 (the
+/// `already_paged_this_episode` latch), market-hours-aware per Rule 3.
+fn should_page_outage(
+    within_market_hours: bool,
+    consecutive_failures: u32,
+    already_paged_this_episode: bool,
+) -> bool {
+    // >= (not ==) so an outage whose streak accumulated off-hours pages on the
+    // FIRST in-market failure after 09:00 IST (Rule 3 + Rule 4 latch).
+    within_market_hours
+        && !already_paged_this_episode
+        && consecutive_failures >= ORDER_UPDATE_OUTAGE_PAGE_FAILURE_THRESHOLD
+}
+
+/// 2026-07-06 RC1 (hostile-review fix, same day): streak after a CLEAN close
+/// (`Ok(())` exit).
+///
+/// A session that ended BEFORE the stability window is a FAILURE regardless
+/// of delivery mode. Dhan's documented auth-rejection path is a clean Close
+/// frame (see the auth-failure notes above `connect_and_listen`'s read loop),
+/// so a dead-token outage delivered as clean closes MUST count toward the
+/// same 3-failure HIGH page as the TCP-reset regime — the original
+/// reset-to-zero-when-unpaged version made the page unreachable for that
+/// regime, and a mixed regime (≤2 errors then one clean close, repeating)
+/// perpetually defeated the threshold.
+///
+/// Sessions that survived the stability window (≥60s connected) reset the
+/// streak — normal idle-day clean closes live minutes/hours and are
+/// unaffected; only sub-60s clean-close flaps count.
+///
+/// Pure function — no I/O.
+fn streak_after_clean_close(prev_streak: u32, stability_reached: bool) -> u32 {
+    if stability_reached {
+        0
+    } else {
+        prev_streak.saturating_add(1)
+    }
+}
+
+/// 2026-07-06 RC2: the stability-window arm announces a recovery Telegram
+/// only when the connect attempt was actually recovering from a failure
+/// streak — a fresh-boot / clean-close connect (failures 0) surviving 60s is
+/// normal operation, not a recovery.
+///
+/// Pure function — no I/O.
+fn should_emit_stable_recovery(failures_before_attempt: u32) -> bool {
+    failures_before_attempt > 0
 }
 
 // ---------------------------------------------------------------------------
@@ -1898,5 +2135,118 @@ mod tests {
         let err = OrderUpdateConnectionError::AuthTimeout;
         let debug = format!("{err:?}");
         assert!(debug.contains("AuthTimeout"));
+    }
+
+    // -----------------------------------------------------------------------
+    // 2026-07-06 RC1 — should_page_outage (in-loop [HIGH] page decision)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_should_page_outage_fires_at_threshold_in_market() {
+        assert!(should_page_outage(true, 3, false));
+    }
+
+    #[test]
+    fn test_should_page_outage_below_threshold_is_silent() {
+        assert!(!should_page_outage(true, 1, false));
+        assert!(!should_page_outage(true, 2, false));
+    }
+
+    #[test]
+    fn test_should_page_outage_never_off_hours() {
+        // Rule 3: off-hours failures never page HIGH — the existing
+        // off-hours Low/audit semantics stand.
+        assert!(!should_page_outage(false, 3, false));
+        assert!(!should_page_outage(false, 100, false));
+    }
+
+    #[test]
+    fn test_should_page_outage_edge_triggered_once_per_episode() {
+        // Rule 4: the per-episode latch suppresses re-pages while the
+        // streak keeps climbing.
+        assert!(!should_page_outage(true, 4, true));
+        assert!(!should_page_outage(true, 50, true));
+    }
+
+    #[test]
+    fn test_should_page_outage_fires_on_first_in_market_failure_after_off_hours_streak() {
+        // The `>=` (not `==`) comparison: a streak accumulated off-hours
+        // pages on the FIRST in-market failure after 09:00 IST.
+        assert!(should_page_outage(true, 7, false));
+    }
+
+    #[test]
+    fn test_should_page_outage_at_u32_max_saturation() {
+        // The streak uses saturating_add; the decision must hold at the cap.
+        assert!(should_page_outage(true, u32::MAX, false));
+    }
+
+    // -----------------------------------------------------------------------
+    // 2026-07-06 RC1 — streak_after_clean_close (hostile-review fix: a
+    // sub-stability clean close is a FAILURE — Dhan's documented
+    // auth-rejection delivery is a clean Close frame)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_streak_after_clean_close_counts_as_failure_when_unstable() {
+        // A session that ended BEFORE the 60s stability window increments the
+        // streak — the original reset-to-zero made the HIGH page unreachable
+        // for a pure clean-close dead-token regime.
+        assert_eq!(streak_after_clean_close(0, false), 1);
+        assert_eq!(streak_after_clean_close(5, false), 6);
+    }
+
+    #[test]
+    fn test_streak_after_clean_close_mixed_regime_reaches_page_threshold() {
+        // The hostile-review mixed regime: 2 transport errors then one clean
+        // close, repeating, must NOT perpetually defeat the 3-failure page.
+        let streak = streak_after_clean_close(2, false);
+        assert_eq!(streak, 3);
+        assert!(should_page_outage(true, streak, false));
+    }
+
+    #[test]
+    fn test_streak_after_clean_close_resets_after_stable_session() {
+        // Surviving the stability window ends the episode — a normal
+        // idle-day clean close (session lived minutes/hours) never counts.
+        assert_eq!(streak_after_clean_close(5, true), 0);
+        assert_eq!(streak_after_clean_close(0, true), 0);
+    }
+
+    #[test]
+    fn test_streak_after_clean_close_saturates_at_u32_max() {
+        assert_eq!(streak_after_clean_close(u32::MAX, false), u32::MAX);
+    }
+
+    // -----------------------------------------------------------------------
+    // 2026-07-06 RC2 — should_emit_stable_recovery (honest recovery signal)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_should_emit_stable_recovery_requires_prior_failures() {
+        // A fresh connect (failures 0) surviving 60s is normal operation,
+        // not a recovery — no Telegram.
+        assert!(!should_emit_stable_recovery(0));
+        assert!(should_emit_stable_recovery(1));
+        assert!(should_emit_stable_recovery(39));
+    }
+
+    // -----------------------------------------------------------------------
+    // 2026-07-06 — outage paging constants pinned
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_outage_constants_pinned() {
+        // Threshold 3: with the 0/0/500ms backoff ladder the HIGH page lands
+        // ~1s into a genuine outage; anything shorter is absorbed silently.
+        assert_eq!(ORDER_UPDATE_OUTAGE_PAGE_FAILURE_THRESHOLD, 3);
+        // Stability 60s: far beyond the observed die-after-login window
+        // (~10ms, 2026-07-06 incident), far below the activity watchdog.
+        assert_eq!(ORDER_UPDATE_RECONNECT_STABILITY_SECS, 60);
+        assert!(
+            ORDER_UPDATE_RECONNECT_STABILITY_SECS < WATCHDOG_THRESHOLD_ORDER_UPDATE_SECS,
+            "the stability window must complete well before the activity \
+             watchdog could kill a healthy idle socket"
+        );
     }
 }

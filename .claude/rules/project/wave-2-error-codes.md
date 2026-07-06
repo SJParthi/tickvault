@@ -266,6 +266,69 @@ and the ceiling fallback restarts exactly as the legacy Halt did).
 (`ConnectionHealth::{rate_limit_streak, saw_non_reconnectable}`),
 `crates/common/src/error_code.rs::WsGap09WatchdogReconnectInPlace`.
 
+## WS-GAP-10 — order-update WebSocket in-market outage (in-loop HIGH page)
+
+**Trigger:** ≥ `ORDER_UPDATE_OUTAGE_PAGE_FAILURE_THRESHOLD` (3) consecutive
+in-market order-update reconnect failures → ONE
+`error!(code = "WS-GAP-10", reason = "in_market_outage")` + ONE `[HIGH]`
+`OrderUpdateDisconnected` Telegram per outage episode. The per-episode latch
+re-arms ONLY after a reconnect survives
+`ORDER_UPDATE_RECONNECT_STABILITY_SECS` (60s); the WS-GAP-04 post-close sleep
+and a PR-E Dhan re-enable also start a fresh episode. Every 10th failure
+re-logs `error!(reason = "threshold_streak")` — CloudWatch-visible, never a
+re-page. An outage whose streak accumulated off-hours pages on the FIRST
+in-market failure at/above the threshold (the `>=` latch). A third tagged
+event, `reason = "task_exited_unreachable"`, is the defensive log at the
+main.rs order-update spawn site — `run_order_update_connection` is an
+infinite never-give-up loop and structurally cannot return; if that line ever
+executes, a future refactor broke the loop contract.
+
+**Why it exists (2026-07-06 incident):** 14:05:49 IST — dead token → Dhan
+TCP-RST ~10ms after the MsgCode-42 login, 39+ consecutive failures at ~1/min;
+the operator saw ONLY false `[LOW] OrderUpdateReconnected x8`-style batches
+because the recovery event fired on the CONNECT edge (10ms before each socket
+died) and the only High emit site was dead code behind a never-returning
+function (the WS-GAP-04 rewrite removed the legacy `return`).
+
+**Triage:**
+1. `mcp__tickvault-logs__tail_errors` — find `WS-GAP-10`; the payload carries
+   `consecutive_failures` + `cause` (the classified disconnect source).
+2. Dead-token signature: "Connection reset without closing handshake" ~10ms
+   after login + DH-901/"Invalid Token" from the 15-min profile watchdog →
+   restart / force re-auth (token re-mint automation is a LATER PR).
+3. Cross-check the `tv-prod-order-update-ws-inactive` CloudWatch alarm +
+   `tv_order_update_ws_active` gauge.
+4. Counters: `tv_order_update_outage_pages_total` (one per HIGH page) /
+   `tv_order_update_stable_reconnects_total` (one per survived recovery).
+
+**Honest envelope:** the recovery Telegram means "survived 60s connected",
+NOT "an order frame arrived" — the order-update stream is legitimately
+silent for hours on idle days (watchdog threshold history
+660s → 1800s → 14400s), so first-frame gating would never fire; time-survival
+is the honest gate, with the 14400s activity watchdog as the dead-socket
+backstop. Clean-close flaps (server Close frame / stream end — Dhan's OTHER
+documented auth-rejection delivery mode) COUNT toward the same 3-failure
+page since the 2026-07-06 hostile-review fix: any session that ends BEFORE
+the 60s stability window increments the streak regardless of delivery mode
+(`streak_after_clean_close`), the page decision is evaluated in BOTH
+reconnect-loop arms via the shared `emit_in_market_outage_page` helper, and
+a mixed regime (≤2 errors then one clean close, repeating) can no longer
+perpetually defeat the threshold. Only a stability-window survival resets
+the streak, so normal idle-day clean closes (sessions living minutes/hours)
+never count. Off-hours clean-close flaps enter the same WS-GAP-04
+sleep-until-open after the attempt budget as the error regime. A
+pathological connect → survive-60s → die metronome re-pages at most ~1 HIGH
+per ~2 min — bounded, and each cycle is a genuine outage + recovery. An
+outage shorter than 3 failures pages nothing (absorbed by the 0/0/500ms
+backoff ladder).
+
+**Auto-triage safe:** YES (the loop self-retries; triage inspects — the page
+is the visibility, not an action request).
+
+**Source:** `crates/core/src/websocket/order_update_connection.rs::{run_order_update_connection, should_page_outage, streak_after_clean_close, should_emit_stable_recovery, emit_in_market_outage_page}`
+(`ErrorCode::WsGap10OrderUpdateOutage`); defensive unreachable-return log in
+`crates/app/src/main.rs` (order-update spawn site).
+
 ## AUTH-GAP-03 — token force-renewed on WebSocket wake
 
 **Trigger:** Item 5's wake-from-sleep path observed
