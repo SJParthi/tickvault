@@ -107,7 +107,7 @@ mod tests {
     }
 
     #[test]
-    fn test_consumer_dhan_runs_greeks_enrichment() {
+    fn test_consume_feed_tick_dhan_runs_greeks_enrichment() {
         // Plan test 9 (Dhan half): the enrich stage (the greeks/lifecycle
         // slot) IS invoked for Feed::Dhan, and its mutation is visible to the
         // persist + aggregate stages (enrich runs FIRST).

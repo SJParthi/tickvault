@@ -95,7 +95,7 @@ line is the original DRAFT and is superseded where it conflicts):
 
 - [x] **Item C2 — Sub-PR #2: unify the tick CONSUMER LOOP (feed-parameterized), on top of C1** — implemented 2026-07-06
   - Files: `crates/core/src/pipeline/tick_processor.rs`, `crates/app/src/groww_bridge.rs`, `crates/core/src/pipeline/feed_consumer.rs` (new shared loop), `crates/core/tests/feed_consumer_convergence_guard.rs` (new)
-  - Tests: `test_consumer_dhan_runs_greeks_enrichment`, `test_consumer_groww_skips_greeks`, `test_consumer_persist_then_aggregate_order_preserved`, `test_consumer_null_column_policy_per_feed`, `test_one_consumer_loop_path_guard`, DHAT `dhat_feed_consumer_zero_alloc`
+  - Tests: `test_consume_feed_tick_dhan_runs_greeks_enrichment`, `test_consumer_groww_skips_greeks`, `test_consumer_persist_then_aggregate_order_preserved`, `test_consumer_null_column_policy_per_feed`, `test_one_consumer_loop_path_guard`, DHAT `dhat_feed_consumer_zero_alloc`
   - Implementation refs: `crates/core/src/pipeline/feed_consumer.rs::consume_feed_tick` (the ONE ordered enrich→persist→aggregate core, exhaustive greeks-for-Dhan-only gate); Dhan call site = `tick_processor.rs::run_tick_processor` `ParsedFrame::Tick` arm (aggregate handoff = the Engine-B tick broadcast); Groww call site = `groww_bridge.rs::GrowwBridgeState::drain_new_data` per-line body (aggregate handoff = the inline `MultiTfAggregator::consume_tick(FeedStrategy::GROWW)` fold + `route_seal`); guard = `crates/core/tests/feed_consumer_convergence_guard.rs::test_one_consumer_loop_path_guard`; DHAT = `crates/core/tests/dhat_feed_consumer.rs`.
   - HONEST SCOPE NOTE (2026-07-06, per the re-verify instruction): the two loops
     diverged since this plan was drafted — Dhan's `run_tick_processor` no longer
@@ -319,7 +319,7 @@ escalates to a `FULL_QA=1` workspace run.
    the capture_seq dedup + ring/spill/DLQ survive the convergence).
 
 **C2 (Sub-PR #2) — consumer-loop convergence:**
-9. `test_consumer_dhan_runs_greeks_enrichment` / `test_consumer_groww_skips_greeks`.
+9. `test_consume_feed_tick_dhan_runs_greeks_enrichment` / `test_consumer_groww_skips_greeks`.
 10. `test_consumer_persist_then_aggregate_order_preserved` — persist precedes the
     aggregator fold for both feeds (no reordering).
 11. `test_consumer_null_column_policy_per_feed` — end-to-end: a Groww tick through
