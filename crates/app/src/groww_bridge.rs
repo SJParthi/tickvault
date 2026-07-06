@@ -134,8 +134,11 @@ fn build_groww_ws_audit_row(
         connection_index: 0,
         pool_size: 1,
         event_kind,
+        // O(1) EXEMPT: begin — WS lifecycle audit row: at most one per
+        // connect/disconnect transition (COLD PATH per the fn docs), never per tick.
         source: source.to_string(),
         reason: reason.to_string(),
+        // O(1) EXEMPT: end
         // Groww has no Dhan disconnect codes.
         dhan_code: WS_EVENT_NO_DHAN_CODE,
         down_secs: 0,
@@ -465,6 +468,7 @@ fn validate_groww_tick(
         return Err(GrowwTickReject::NonPositiveSecurityId);
     }
     if !(MIN_PLAUSIBLE_TS_IST_NANOS..=MAX_PLAUSIBLE_TS_IST_NANOS)
+        // O(1) EXEMPT: RangeInclusive::contains — two-comparison O(1) bounds check (scanner heuristic misreads it as Vec::contains).
         .contains(&parsed.tick.ts_ist_nanos)
     {
         return Err(GrowwTickReject::TimestampOutOfRange);
@@ -622,8 +626,12 @@ fn next_capture_seq(counter: &AtomicI64, seed_nanos: i64) -> i64 {
 /// testable; O(n) single drain (no per-line shift).
 fn drain_complete_prefix(residual: &mut Vec<u8>) -> Vec<u8> {
     match residual.iter().rposition(|&b| b == b'\n') {
+        // O(1) EXEMPT: begin — per-WAKE bounded residual drain (capped by the
+        // 4 MiB read budget), amortized across the lines it yields; documented
+        // "O(n) single drain" in the fn docs. Not a per-tick allocation site.
         Some(last_nl) => residual.drain(..=last_nl).collect(),
         None => Vec::new(),
+        // O(1) EXEMPT: end
     }
 }
 
@@ -682,6 +690,7 @@ fn spawn_tick_file_watcher(
     let watch_dir = tick_file_path.parent().unwrap_or_else(|| Path::new("."));
     watcher
         .watch(watch_dir, RecursiveMode::NonRecursive)
+        // O(1) EXEMPT: watcher-setup error path — once per bridge start.
         .with_context(|| format!("groww bridge: failed to watch dir {}", watch_dir.display()))?;
     Ok((watcher, wake_rx))
 }
@@ -777,6 +786,7 @@ impl GrowwBridgeState {
             seeded: std::collections::HashSet::new(),
             capture_seq,
             offset: 0,
+            // O(1) EXEMPT: bridge-state construction — once per bridge start, not per tick.
             residual: Vec::new(),
             last_offset_persist: None,
             ilp_backpressure_active: false,
@@ -790,10 +800,12 @@ impl GrowwBridgeState {
     /// empty head never matches a snapshot, forcing the byte-0 re-tail).
     async fn read_file_head(tick_file_path: &Path) -> String {
         let Ok(mut f) = File::open(tick_file_path).await else {
+            // O(1) EXEMPT: resume/persist identity-guard fail-safe arm — cold path (boot resume + throttled offset persist).
             return String::new();
         };
         let mut buf = [0u8; GROWW_OFFSET_HEAD_LEN];
         let Ok(n) = f.read(&mut buf).await else {
+            // O(1) EXEMPT: resume/persist identity-guard fail-safe arm — cold path.
             return String::new();
         };
         String::from_utf8_lossy(&buf[..n]).into_owned()
@@ -1071,6 +1083,7 @@ impl GrowwBridgeState {
                 "groww bridge: ILP buffer over cap — pausing NDJSON consumption until QuestDB recovers (capture file holds the tail; zero loss)"
             );
         }
+        // O(1) EXEMPT: per-WAKE read buffer, bounded by wake_read_budget (≤ 4 MiB take()); not per-tick.
         let mut chunk: Vec<u8> = Vec::new();
         match (&mut file).take(to_read).read_to_end(&mut chunk).await {
             Ok(n) => self.offset = self.offset.saturating_add(n as u64),
@@ -1116,7 +1129,7 @@ impl GrowwBridgeState {
             if line.is_empty() {
                 continue;
             }
-            let parsed = match parse_groww_tick_line(line) {
+            let mut parsed = match parse_groww_tick_line(line) {
                 Ok(p) => p,
                 Err(err) => {
                     error!(?err, "groww bridge: skipping malformed tick line");
@@ -1142,94 +1155,106 @@ impl GrowwBridgeState {
             let seq = next_capture_seq(&self.capture_seq, parsed.tick.ts_ist_nanos);
             let row_received =
                 row_received_at_with_capture(parsed.capture_ns, wake_receipt_ist_nanos);
-            if let Err(err) =
-                self.live_writer
-                    .append_row(&live_tick_row(&parsed, seq, row_received))
-            {
-                error!(
-                    ?err,
-                    "groww bridge: shared ticks (feed=groww) append failed"
-                );
-            } else {
-                // The dashboard counter is bumped ONLY on a successful flush below,
-                // by the number of rows actually persisted. Stamp the WALL-CLOCK
-                // receipt time (NOT the exchange ts) for the most-recent row.
-                last_receipt_ist_nanos = receipt_ist_nanos();
-            }
-            // Fold through the SHARED 21-TF engine (ONE common candle engine).
-            let pt = match build_parsed_tick(&parsed) {
-                Ok(pt) => pt,
-                Err(reason) => {
-                    error!(
-                        ?reason,
-                        security_id = parsed.tick.security_id,
-                        "groww bridge: tick cannot fold through the shared 21-TF engine (width guard)"
-                    );
-                    continue;
-                }
-            };
-            let seg_code = pt.exchange_segment_code;
-            let key = (pt.security_id, seg_code);
-            let cum_volume_u64 = match u64::try_from(parsed.tick.cum_volume) {
-                Ok(v) => v,
-                Err(_) => {
-                    error!(
-                        security_id = parsed.tick.security_id,
-                        cum_volume = parsed.tick.cum_volume,
-                        "groww bridge: negative cum_volume past validation — dropping tick"
-                    );
-                    continue;
-                }
-            };
-            // First sight: register + seed the cumulative baseline (idempotent).
-            if self.seeded.insert(key) {
-                self.aggregator.pre_populate(std::iter::once(key));
-                self.aggregator
-                    .seed_cumulative(pt.security_id, seg_code, cum_volume_u64);
-            }
-            // Route every sealed bar across ALL 21 TFs through the SHARED
-            // seal-writer chain, tagged feed=Groww.
-            let stats = self.aggregator.consume_tick(
-                &pt,
-                seg_code,
-                FeedStrategy::GROWW,
-                Some(cum_volume_u64),
-                |tf, state| {
-                    let Some(sender) = global_seal_sender() else {
+            // C2 (feed convergence): the ordered enrich → persist → aggregate
+            // per-tick consumer sequence is the ONE shared `consume_feed_tick`
+            // core (`tickvault_core::pipeline::feed_consumer`) — the same core
+            // the Dhan tick processor delegates to. The core NEVER invokes the
+            // enrich stage for Feed::Groww (no greeks/OI — plan edge E5), and
+            // pins the persist-before-fold order. Monomorphized closures over
+            // the private ParsedGrowwTick — zero-alloc, no dyn.
+            let live_writer = &mut self.live_writer;
+            let seeded = &mut self.seeded;
+            let aggregator = &self.aggregator;
+            tickvault_core::pipeline::feed_consumer::consume_feed_tick(
+                Feed::Groww,
+                &mut parsed,
+                |_| {}, // Groww has no enrichment stage; the core gates it anyway.
+                |p| {
+                    if let Err(err) = live_writer.append_row(&live_tick_row(p, seq, row_received)) {
+                        error!(
+                            ?err,
+                            "groww bridge: shared ticks (feed=groww) append failed"
+                        );
+                    } else {
+                        // The dashboard counter is bumped ONLY on a successful flush below,
+                        // by the number of rows actually persisted. Stamp the WALL-CLOCK
+                        // receipt time (NOT the exchange ts) for the most-recent row.
+                        last_receipt_ist_nanos = receipt_ist_nanos();
+                    }
+                },
+                |p| {
+                    // Fold through the SHARED 21-TF engine (ONE common candle engine).
+                    let pt = match build_parsed_tick(p) {
+                        Ok(pt) => pt,
+                        Err(reason) => {
+                            error!(
+                                ?reason,
+                                security_id = p.tick.security_id,
+                                "groww bridge: tick cannot fold through the shared 21-TF engine (width guard)"
+                            );
+                            return;
+                        }
+                    };
+                    let seg_code = pt.exchange_segment_code;
+                    let key = (pt.security_id, seg_code);
+                    let Ok(cum_volume_u64) = u64::try_from(p.tick.cum_volume) else {
+                        error!(
+                            security_id = p.tick.security_id,
+                            cum_volume = p.tick.cum_volume,
+                            "groww bridge: negative cum_volume past validation — dropping tick"
+                        );
                         return;
                     };
-                    crate::seal_routing::route_seal(
-                        crate::seal_routing::SealRouteParams {
-                            feed: Feed::Groww,
-                            drop_d1: false,
-                            prev_day_cache: None,
-                            heartbeat: None,
-                            feed_health_on_m1: Some(feed_health),
-                        },
-                        pt.security_id,
+                    // First sight: register + seed the cumulative baseline (idempotent).
+                    if seeded.insert(key) {
+                        aggregator.pre_populate(std::iter::once(key));
+                        aggregator.seed_cumulative(pt.security_id, seg_code, cum_volume_u64);
+                    }
+                    // Route every sealed bar across ALL 21 TFs through the SHARED
+                    // seal-writer chain, tagged feed=Groww.
+                    let stats = aggregator.consume_tick(
+                        &pt,
                         seg_code,
-                        tf,
-                        state,
-                        sender,
+                        FeedStrategy::GROWW,
+                        Some(cum_volume_u64),
+                        |tf, state| {
+                            let Some(sender) = global_seal_sender() else {
+                                return;
+                            };
+                            crate::seal_routing::route_seal(
+                                crate::seal_routing::SealRouteParams {
+                                    feed: Feed::Groww,
+                                    drop_d1: false,
+                                    prev_day_cache: None,
+                                    heartbeat: None,
+                                    feed_health_on_m1: Some(feed_health),
+                                },
+                                pt.security_id,
+                                seg_code,
+                                tf,
+                                state,
+                                sender,
+                            );
+                        },
                     );
+                    if stats.late_count > 0 {
+                        // AGGREGATOR-LATE-01 visibility (2026-07-03): Groww late
+                        // discards were previously COMPLETELY silent — this path
+                        // captured `stats` but never read `late_count` (no counter,
+                        // no log), so a Discard-policy drop wave was invisible. Count
+                        // them with the `feed=groww` label; the Dhan site keeps its
+                        // label-less series (mirroring the `tv_seal_mpsc_dropped_total`
+                        // per-feed labelling precedent in `seal_routing.rs`) so the
+                        // existing tv-aggregator-late-tick-sustained alert series is
+                        // not renamed or broken.
+                        metrics::counter!("tv_aggregator_late_ticks_discarded_total", "feed" => "groww")
+                            .increment(u64::from(stats.late_count));
+                    }
+                    if !stats.instrument_found {
+                        aggregator.pre_populate(std::iter::once(key));
+                    }
                 },
             );
-            if stats.late_count > 0 {
-                // AGGREGATOR-LATE-01 visibility (2026-07-03): Groww late
-                // discards were previously COMPLETELY silent — this path
-                // captured `stats` but never read `late_count` (no counter,
-                // no log), so a Discard-policy drop wave was invisible. Count
-                // them with the `feed=groww` label; the Dhan site keeps its
-                // label-less series (mirroring the `tv_seal_mpsc_dropped_total`
-                // per-feed labelling precedent in `seal_routing.rs`) so the
-                // existing tv-aggregator-late-tick-sustained alert series is
-                // not renamed or broken.
-                metrics::counter!("tv_aggregator_late_ticks_discarded_total", "feed" => "groww")
-                    .increment(u64::from(stats.late_count));
-            }
-            if !stats.instrument_found {
-                self.aggregator.pre_populate(std::iter::once(key));
-            }
         }
         // Flush the buffered rows. The dashboard "ticks" counter is bumped ONLY by
         // the number of rows ACTUALLY persisted to QuestDB (the flush return value),
@@ -1675,8 +1700,10 @@ pub const GROWW_ARCHIVE_DRAIN_MAX_WAKES: u32 = 4096;
 #[must_use]
 pub fn archive_path_for_ist_day(tick_file_path: &Path, ist_day: i64) -> PathBuf {
     let date = chrono::DateTime::<chrono::Utc>::from_timestamp(ist_day.saturating_mul(86_400), 0)
+        // O(1) EXEMPT: IST-midnight archive-path naming — once per day/rotation, cold path.
         .map(|d| d.format("%Y%m%d").to_string())
         .unwrap_or_default();
+    // O(1) EXEMPT: archive-path naming — once per rotation, cold path.
     let name = format!("live-ticks-{date}.ndjson");
     tick_file_path
         .parent()
@@ -1831,6 +1858,7 @@ pub fn spawn_supervised_groww_bridge(
         // bridge task respawns.
         let aggregator = MultiTfAggregator::with_capacity(GROWW_AGGREGATOR_CAPACITY);
         spawn_groww_ist_midnight_force_seal(
+            // O(1) EXEMPT: spawn-time wiring (once per process) — MultiTfAggregator::clone shares the same papaya Arc.
             aggregator.clone(),
             Arc::clone(&feed_runtime),
             Arc::clone(&trading_calendar),
@@ -1841,6 +1869,7 @@ pub fn spawn_supervised_groww_bridge(
         // duplicate driver tasks. The clone shares the SAME papaya map + the
         // SAME event-time watermark the bridge's consume path advances.
         spawn_groww_catchup_seal(
+            // O(1) EXEMPT: spawn-time wiring (once per process) — shares the same papaya Arc.
             aggregator.clone(),
             Arc::clone(&feed_runtime),
             trading_calendar,
@@ -1897,6 +1926,8 @@ async fn supervise_groww_bridge_loop(
         loop {
             let started = std::time::Instant::now();
             let handle = tokio::spawn(run_groww_bridge(
+                // O(1) EXEMPT: begin — supervisor respawn wiring (at most one per
+                // bridge death + backoff): Arc/PathBuf/config handle clones, cold path.
                 qdb.clone(),
                 tick_file_path.clone(),
                 status_file_path.clone(),
@@ -1905,6 +1936,7 @@ async fn supervise_groww_bridge_loop(
                 ws_audit_tx.clone(),
                 notifier_slot.clone(),
                 aggregator.clone(),
+                // O(1) EXEMPT: end
                 Arc::clone(&audit_latches),
                 Arc::clone(&capture_seq),
                 conn_id,
@@ -1998,9 +2030,11 @@ pub const GROWW_SHARDS_DIR_DEFAULT: &str = "data/groww/shards";
 /// sort correctly in `ls`).
 #[must_use]
 pub fn shard_files(shards_root: &Path, conn_id: usize) -> GrowwShardFiles {
+    // O(1) EXEMPT: fleet path derivation — once per connection spawn/scale event, cold path.
     let dir = shards_root.join(format!("c{conn_id:02}"));
     GrowwShardFiles {
         conn_id,
+        // O(1) EXEMPT: PathBuf clone at shard-path derivation — cold fleet path.
         watch_dir: dir.clone(),
         tick_file: dir.join("live-ticks.ndjson"),
         status_file: dir.join("groww-status.json"),
@@ -2016,6 +2050,7 @@ pub fn shard_files(shards_root: &Path, conn_id: usize) -> GrowwShardFiles {
 /// actually removed; a missing file is a clean no-op.
 pub(crate) fn remove_subscribe_proof(shards_root: &Path, conn_id: usize) -> bool {
     let status_file = shard_files(shards_root, conn_id).status_file;
+    // O(1) EXEMPT: best-effort proof-file removal — fleet scale-down / boot sweep, cold path.
     match std::fs::remove_file(&status_file) {
         Ok(()) => true,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => false,
@@ -2064,11 +2099,13 @@ pub fn spawn_supervised_groww_shard_bridges(
         // force-seal, one catch-up seal, one capture-seq counter.
         let aggregator = MultiTfAggregator::with_capacity(GROWW_AGGREGATOR_CAPACITY);
         spawn_groww_ist_midnight_force_seal(
+            // O(1) EXEMPT: fleet spawn-time wiring (once per process) — shares the same papaya Arc.
             aggregator.clone(),
             Arc::clone(&feed_runtime),
             Arc::clone(&trading_calendar),
         );
         spawn_groww_catchup_seal(
+            // O(1) EXEMPT: fleet spawn-time wiring (once per process) — shares the same papaya Arc.
             aggregator.clone(),
             Arc::clone(&feed_runtime),
             trading_calendar,
@@ -2082,6 +2119,8 @@ pub fn spawn_supervised_groww_shard_bridges(
             // ws_event_audit rows stay per-connection honest).
             let audit_latches = Arc::new(GrowwAuditLatches::default());
             handles.push(tokio::spawn(supervise_groww_bridge_loop(
+                // O(1) EXEMPT: begin — per-conn fleet spawn wiring (once per connection
+                // at scale-up): Arc/config handle clones, cold path.
                 qdb.clone(),
                 files.tick_file,
                 files.status_file,
@@ -2090,6 +2129,7 @@ pub fn spawn_supervised_groww_shard_bridges(
                 ws_audit_tx.clone(),
                 notifier_slot.clone(),
                 aggregator.clone(),
+                // O(1) EXEMPT: end
                 audit_latches,
                 Arc::clone(&capture_seq),
                 Some(conn_id),
@@ -2373,6 +2413,7 @@ pub async fn run_groww_bridge(
                 } else if let Some(notifier) = notifier {
                     notifier.notify(
                         tickvault_core::notification::NotificationEvent::FeedConnectedAwaitingTicks {
+                            // O(1) EXEMPT: one Telegram event per fleet connect edge — cold notification path.
                             feed: Feed::Groww.display_name().to_string(),
                             subscribed: status.stocks.saturating_add(status.indices),
                             market_open:

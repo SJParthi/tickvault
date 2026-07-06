@@ -22,6 +22,7 @@ pub mod boot_ordering_gate;
 // Candle-engine re-architecture #T1b: `candle_aggregator` (Engine A)
 // DELETED — Engine B (the multi-TF aggregator) is the only candle engine.
 // PR #4 (2026-05-19): `depth_sequence_tracker` module DELETED.
+pub mod feed_consumer;
 pub mod first_seen_set;
 pub mod no_tick_watchdog;
 pub mod prev_close_writer;
