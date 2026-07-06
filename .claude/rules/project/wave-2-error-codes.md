@@ -318,7 +318,8 @@ the streak, so normal idle-day clean closes (sessions living minutes/hours)
 never count. Off-hours clean-close flaps enter the same WS-GAP-04
 sleep-until-open after the attempt budget as the error regime. A
 pathological connect → survive-60s → die metronome re-pages at most ~1 HIGH
-per ~2 min — bounded, and each cycle is a genuine outage + recovery. An
+per ~61s worst case (stability window + 3-failure ladder) — bounded, and
+each cycle is a genuine outage + recovery. An
 outage shorter than 3 failures pages nothing (absorbed by the 0/0/500ms
 backoff ladder).
 

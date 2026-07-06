@@ -738,7 +738,7 @@ async fn connect_and_listen(
     // on idle days. In the 2026-07-06 incident every connect died ~10ms
     // after login, so the old connect-edge emit produced false
     // "[LOW] reconnected x8" storms.
-    let stability_sleep = time::sleep(Duration::from_secs(ORDER_UPDATE_RECONNECT_STABILITY_SECS));
+    let stability_sleep = time::sleep(stability_window());
     tokio::pin!(stability_sleep);
 
     // The read loop is wrapped in a helper closure so every exit path can
@@ -1206,6 +1206,19 @@ fn streak_after_clean_close(prev_streak: u32, stability_reached: bool) -> u32 {
 /// Pure function — no I/O.
 fn should_emit_stable_recovery(failures_before_attempt: u32) -> bool {
     failures_before_attempt > 0
+}
+
+/// 2026-07-06 hostile-review medium B: the stability window as a single pure
+/// source. A reconnected session counts as recovered only after staying
+/// connected for this long; the sole production consumer is the pinned
+/// `Sleep` in `connect_and_listen`'s read-loop select. The paused-time
+/// boundary tests build their `Sleep` from THIS function (59s → not stable,
+/// 60s/61s → stable), so the tested boundary can never silently drift from
+/// the window production actually uses.
+///
+/// Pure function — no I/O.
+fn stability_window() -> Duration {
+    Duration::from_secs(ORDER_UPDATE_RECONNECT_STABILITY_SECS)
 }
 
 // ---------------------------------------------------------------------------
@@ -2229,6 +2242,84 @@ mod tests {
         assert!(!should_emit_stable_recovery(0));
         assert!(should_emit_stable_recovery(1));
         assert!(should_emit_stable_recovery(39));
+    }
+
+    // -----------------------------------------------------------------------
+    // 2026-07-06 hostile-review medium B — stability-window BOUNDARY tests
+    // (59s vs 60s vs 61s). Exercises the REAL mechanism: a `Sleep` built
+    // from the same `stability_window()` the production select arm pins,
+    // driven under paused tokio time.
+    // -----------------------------------------------------------------------
+
+    /// Polls a pinned `Sleep` once with a noop waker. The first poll
+    /// registers the timer with the (paused) driver so `time::advance`
+    /// can complete it — mirrors how the production select arm polls the
+    /// pinned stability sleep.
+    fn poll_stability_sleep_once(
+        sleep: &mut std::pin::Pin<&mut tokio::time::Sleep>,
+    ) -> std::task::Poll<()> {
+        use std::future::Future;
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        sleep.as_mut().poll(&mut cx)
+    }
+
+    #[test]
+    fn test_stability_window_is_the_pinned_60s_constant() {
+        assert_eq!(
+            stability_window(),
+            Duration::from_secs(ORDER_UPDATE_RECONNECT_STABILITY_SECS),
+            "stability_window() must derive from the pinned constant"
+        );
+        assert_eq!(
+            stability_window().as_secs(),
+            60,
+            "the stability window must stay 60s — far beyond the observed \
+             ~10ms die-after-login window, far below the 14400s watchdog"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_stability_boundary_59s_is_not_stable() {
+        let sleep = time::sleep(stability_window());
+        tokio::pin!(sleep);
+        assert!(
+            poll_stability_sleep_once(&mut sleep).is_pending(),
+            "a fresh session must not count as stable at 0s"
+        );
+        time::advance(Duration::from_secs(59)).await;
+        assert!(
+            poll_stability_sleep_once(&mut sleep).is_pending(),
+            "a session dying at 59s must NOT count as stable — the \
+             2026-07-06 incident sockets died ~10ms after login; anything \
+             short of the full window is an unstable session (the streak \
+             keeps growing, the recovery Telegram must not fire)"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_stability_boundary_60s_is_stable() {
+        let sleep = time::sleep(stability_window());
+        tokio::pin!(sleep);
+        assert!(poll_stability_sleep_once(&mut sleep).is_pending());
+        time::advance(Duration::from_secs(60)).await;
+        assert!(
+            poll_stability_sleep_once(&mut sleep).is_ready(),
+            "surviving EXACTLY the 60s window flips the stability arm ready \
+             — this is the boundary where the streak resets and the page \
+             latch re-arms"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_stability_boundary_61s_is_stable() {
+        let sleep = time::sleep(stability_window());
+        tokio::pin!(sleep);
+        assert!(poll_stability_sleep_once(&mut sleep).is_pending());
+        time::advance(Duration::from_secs(61)).await;
+        assert!(
+            poll_stability_sleep_once(&mut sleep).is_ready(),
+            "any survival beyond the window remains stable (monotonic)"
+        );
     }
 
     // -----------------------------------------------------------------------
