@@ -1343,98 +1343,122 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
                     }
                 }
 
-                // O(1) inline Greeks enrichment: compute IV + delta/gamma/theta/vega
-                // for F&O option ticks, update underlying LTP cache for index/equity.
-                // Runs BEFORE persistence so Greeks values are stored in QuestDB.
-                if let Some(ref mut enricher) = greeks_enricher {
-                    enricher.enrich(&mut tick);
-                }
-
-                // 29-tf engine Phase 2.7 (hostile bug-hunt CRITICAL C2 fix):
-                // run the lifecycle enricher ONCE per tick BEFORE both the
-                // VOLUME-MONO-01 guard and the persistence branch. The
-                // enricher's `volume_is_first_seen` + `phase` flags must
-                // suppress the monotonicity check when (a) it's the first
-                // tick of the day for this instrument or (b) phase != OPEN.
-                // Without this gate, IST midnight rollover fires ~24,300
-                // false VOLUME-MONO-01 alerts at 09:15 IST every trading
-                // day (per L13).
-                let lifecycle_for_tick: Option<(
-                    bool,
-                    super::tick_enricher::EnrichedTickFlags,
-                    TickLifecycle,
-                )> = tick_enricher.as_ref().map(|enricher| {
-                    // Phase 2.10 M1 fix: per-tick exchange_timestamp drives
-                    // phase classification (not wall-clock arrival).
-                    let tick_secs_of_day = tick.exchange_timestamp % 86_400;
-                    let enriched = enricher.enrich_tick(&tick, tick_secs_of_day);
-                    let life = TickLifecycle {
-                        volume_delta: enriched.volume_delta,
-                        prev_day_close: enriched.prev_day_close,
-                        prev_day_oi: enriched.prev_day_oi,
-                        phase: enriched.phase as u8,
-                    };
-                    let flags = super::tick_enricher::EnrichedTickFlags {
-                        volume_is_first_seen: enriched.volume_is_first_seen,
-                        volume_is_regression: enriched.volume_is_regression,
-                        phase: enriched.phase,
-                    };
-                    (enriched.volume_is_first_seen, flags, life)
-                });
-
-                // Persist tick to QuestDB — ingestion gate above already verified
-                // [09:00, 15:30) IST and today's date. This block only handles
-                // QuestDB write errors (connection down, buffer full, etc.).
-                if let Some(ref mut writer) = tick_writer {
-                    let result = if let Some((_, _, life)) = lifecycle_for_tick {
-                        writer.append_tick_enriched_with_seq(&tick, life, capture_seq)
-                    } else {
-                        writer.append_tick_with_seq(&tick, capture_seq)
-                    };
-                    match result {
-                        Ok(()) => {
-                            m_ticks_persisted.increment(1);
-                            ticks_persisted = ticks_persisted.saturating_add(1);
+                // C2 (feed convergence): the ordered enrich → persist →
+                // aggregate-handoff per-tick consumer sequence is the ONE
+                // shared `consume_feed_tick` core (`super::feed_consumer`) —
+                // the same core the Groww bridge delegates to. Dhan's
+                // aggregate handoff is the tick broadcast: Engine B (the
+                // multi-TF aggregator) subscribes to it off this hot path
+                // (#T1b). Monomorphized closures — inlines to the exact
+                // pre-C2 straight-line code (DHAT + bench-gated).
+                //
+                // The lifecycle result crosses from the enrich stage to the
+                // persist stage (and to the VOLUME-MONO-01 gate below) via a
+                // zero-alloc `Cell` of Copy data — two closures cannot share
+                // a `&mut` local, and the tuple is `Copy` end-to-end.
+                let lifecycle_cell: std::cell::Cell<
+                    Option<(bool, super::tick_enricher::EnrichedTickFlags, TickLifecycle)>,
+                > = std::cell::Cell::new(None);
+                super::feed_consumer::consume_feed_tick(
+                    tickvault_common::feed::Feed::Dhan,
+                    &mut tick,
+                    |t| {
+                        // O(1) inline Greeks enrichment: compute IV +
+                        // delta/gamma/theta/vega for F&O option ticks, update
+                        // underlying LTP cache for index/equity. Runs BEFORE
+                        // persistence so Greeks values are stored in QuestDB.
+                        if let Some(ref mut enricher) = greeks_enricher {
+                            enricher.enrich(t);
                         }
-                        Err(err) => {
-                            storage_errors = storage_errors.saturating_add(1);
-                            m_storage_errors.increment(1);
-                            // Audit Rule 5: persist failures use error! (Telegram-
-                            // routable). Edge-triggered (Rule 4): page on the FIRST
-                            // error + every 1000th to avoid per-tick spam. The tick
-                            // is NOT lost — force_flush rescues it into the
-                            // ring → spill → WAL chain.
-                            if storage_errors == 1 || storage_errors.is_multiple_of(1000) {
-                                error!(
-                                    ?err,
-                                    security_id = tick.security_id,
-                                    total_errors = storage_errors,
-                                    "failed to append tick to QuestDB (tick rescued to ring/spill/WAL)"
-                                );
+
+                        // 29-tf engine Phase 2.7 (hostile bug-hunt CRITICAL C2 fix):
+                        // run the lifecycle enricher ONCE per tick BEFORE both the
+                        // VOLUME-MONO-01 guard and the persistence branch. The
+                        // enricher's `volume_is_first_seen` + `phase` flags must
+                        // suppress the monotonicity check when (a) it's the first
+                        // tick of the day for this instrument or (b) phase != OPEN.
+                        // Without this gate, IST midnight rollover fires ~24,300
+                        // false VOLUME-MONO-01 alerts at 09:15 IST every trading
+                        // day (per L13).
+                        lifecycle_cell.set(tick_enricher.as_ref().map(|enricher| {
+                            // Phase 2.10 M1 fix: per-tick exchange_timestamp drives
+                            // phase classification (not wall-clock arrival).
+                            let tick_secs_of_day = t.exchange_timestamp % 86_400;
+                            let enriched = enricher.enrich_tick(t, tick_secs_of_day);
+                            let life = TickLifecycle {
+                                volume_delta: enriched.volume_delta,
+                                prev_day_close: enriched.prev_day_close,
+                                prev_day_oi: enriched.prev_day_oi,
+                                phase: enriched.phase as u8,
+                            };
+                            let flags = super::tick_enricher::EnrichedTickFlags {
+                                volume_is_first_seen: enriched.volume_is_first_seen,
+                                volume_is_regression: enriched.volume_is_regression,
+                                phase: enriched.phase,
+                            };
+                            (enriched.volume_is_first_seen, flags, life)
+                        }));
+                    },
+                    |t| {
+                        // Persist tick to QuestDB — ingestion gate above already
+                        // verified [09:00, 15:30) IST and today's date. This block
+                        // only handles QuestDB write errors (connection down,
+                        // buffer full, etc.).
+                        if let Some(ref mut writer) = tick_writer {
+                            let result = if let Some((_, _, life)) = lifecycle_cell.get() {
+                                writer.append_tick_enriched_with_seq(t, life, capture_seq)
+                            } else {
+                                writer.append_tick_with_seq(t, capture_seq)
+                            };
+                            match result {
+                                Ok(()) => {
+                                    m_ticks_persisted.increment(1);
+                                    ticks_persisted = ticks_persisted.saturating_add(1);
+                                }
+                                Err(err) => {
+                                    storage_errors = storage_errors.saturating_add(1);
+                                    m_storage_errors.increment(1);
+                                    // Audit Rule 5: persist failures use error! (Telegram-
+                                    // routable). Edge-triggered (Rule 4): page on the FIRST
+                                    // error + every 1000th to avoid per-tick spam. The tick
+                                    // is NOT lost — force_flush rescues it into the
+                                    // ring → spill → WAL chain.
+                                    if storage_errors == 1 || storage_errors.is_multiple_of(1000) {
+                                        error!(
+                                            ?err,
+                                            security_id = t.security_id,
+                                            total_errors = storage_errors,
+                                            "failed to append tick to QuestDB (tick rescued to ring/spill/WAL)"
+                                        );
+                                    }
+                                }
                             }
                         }
-                    }
-                }
-
-                // O(1) broadcast to browser WebSocket clients (if any are connected).
-                // Lagging receivers auto-skip — chart only needs latest price.
-                //
-                // Audit finding #1/#19 (2026-04-17): `sender.send()` returns
-                // `Err(SendError)` ONLY when ALL receivers have closed (not
-                // on lag — lag is surfaced to each receiver individually).
-                // A closed-all-receivers state means downstream trading
-                // signals are dead. Count + error-log so operator sees it.
-                if let Some(ref sender) = tick_broadcast
-                    && sender.send(tick).is_err()
-                {
-                    metrics::counter!("tv_tick_broadcast_send_errors_total").increment(1);
-                    // O(1) EXEMPT: error path — tracing static dispatch is
-                    // the only allocation and it's off the zero-loss fast path.
-                    error!(
-                        "tick broadcast send failed — ALL subscribers closed; \
-                         trading pipeline + browser feed are dead"
-                    );
-                }
+                    },
+                    |t| {
+                        // Aggregate handoff = O(1) broadcast (Engine B + browser
+                        // WebSocket clients). Lagging receivers auto-skip — the
+                        // chart only needs the latest price.
+                        //
+                        // Audit finding #1/#19 (2026-04-17): `sender.send()` returns
+                        // `Err(SendError)` ONLY when ALL receivers have closed (not
+                        // on lag — lag is surfaced to each receiver individually).
+                        // A closed-all-receivers state means downstream trading
+                        // signals are dead. Count + error-log so operator sees it.
+                        if let Some(ref sender) = tick_broadcast
+                            && sender.send(*t).is_err()
+                        {
+                            metrics::counter!("tv_tick_broadcast_send_errors_total").increment(1);
+                            // O(1) EXEMPT: error path — tracing static dispatch is
+                            // the only allocation and it's off the zero-loss fast path.
+                            error!(
+                                "tick broadcast send failed — ALL subscribers closed; \
+                                 trading pipeline + browser feed are dead"
+                            );
+                        }
+                    },
+                );
+                let lifecycle_for_tick = lifecycle_cell.get();
 
                 // Candle-engine re-architecture #T1b: in-loop candle
                 // aggregation removed. Engine B (the multi-TF aggregator)
@@ -1582,6 +1606,19 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
                     }
 
                     // O(1) inline Greeks enrichment for Full packet ticks.
+                    //
+                    // C2 exception (documented + pinned by
+                    // `feed_consumer_convergence_guard.rs`): this Full-packet
+                    // arm does NOT delegate to `consume_feed_tick` — its
+                    // aggregate handoff (the broadcast ~100 lines below) is
+                    // separated from this enrich+persist block by DEPTH-frame
+                    // gating whose loop-`continue`s decide which frames are
+                    // broadcast. Routing it through the shared core would
+                    // either broadcast frames that today are skipped (behavior
+                    // change) or drop persistence for depth-invalid frames
+                    // (data loss). The Quote/Ticker `Tick` arm above — the
+                    // production path under the Quote-mode locked universe —
+                    // and the Groww bridge both delegate.
                     if let Some(ref mut enricher) = greeks_enricher {
                         enricher.enrich(&mut tick);
                     }

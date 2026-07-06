@@ -69,15 +69,22 @@ fn legacy_wall_clock_helper_no_longer_imported_in_tick_processor() {
 #[test]
 fn enricher_called_with_tick_secs_of_day_at_both_packet_call_sites() {
     let src = read("core/src/pipeline/tick_processor.rs");
-    // Phase 2.10 expects two `enrich_tick(&tick, tick_secs_of_day)` calls
+    // Phase 2.10 expects two `enrich_tick(<tick>, tick_secs_of_day)` calls
     // — one in the Quote arm and one in the Full arm. Each carries the
-    // same `tick.exchange_timestamp % 86_400` derivation.
+    // same `<tick>.exchange_timestamp % 86_400` derivation. Since C2
+    // (feed-consumer convergence, 2026-07-06) the Quote-arm site lives
+    // inside the `consume_feed_tick` enrich closure where the tick binding
+    // is the closure param `t` — count BOTH spellings; the invariant (the
+    // per-tick exchange timestamp drives phase at both sites) is unchanged.
     let count = src
         .matches("enricher.enrich_tick(&tick, tick_secs_of_day)")
-        .count();
+        .count()
+        + src
+            .matches("enricher.enrich_tick(t, tick_secs_of_day)")
+            .count();
     assert!(
         count >= 2,
-        "tick_processor must call `enrich_tick(&tick, tick_secs_of_day)` at BOTH packet \
+        "tick_processor must call `enrich_tick(<tick>, tick_secs_of_day)` at BOTH packet \
          call sites (Quote + Full) — found {count}"
     );
 }

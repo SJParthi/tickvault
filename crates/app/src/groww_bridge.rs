@@ -1129,7 +1129,7 @@ impl GrowwBridgeState {
             if line.is_empty() {
                 continue;
             }
-            let parsed = match parse_groww_tick_line(line) {
+            let mut parsed = match parse_groww_tick_line(line) {
                 Ok(p) => p,
                 Err(err) => {
                     error!(?err, "groww bridge: skipping malformed tick line");
@@ -1155,94 +1155,106 @@ impl GrowwBridgeState {
             let seq = next_capture_seq(&self.capture_seq, parsed.tick.ts_ist_nanos);
             let row_received =
                 row_received_at_with_capture(parsed.capture_ns, wake_receipt_ist_nanos);
-            if let Err(err) =
-                self.live_writer
-                    .append_row(&live_tick_row(&parsed, seq, row_received))
-            {
-                error!(
-                    ?err,
-                    "groww bridge: shared ticks (feed=groww) append failed"
-                );
-            } else {
-                // The dashboard counter is bumped ONLY on a successful flush below,
-                // by the number of rows actually persisted. Stamp the WALL-CLOCK
-                // receipt time (NOT the exchange ts) for the most-recent row.
-                last_receipt_ist_nanos = receipt_ist_nanos();
-            }
-            // Fold through the SHARED 21-TF engine (ONE common candle engine).
-            let pt = match build_parsed_tick(&parsed) {
-                Ok(pt) => pt,
-                Err(reason) => {
-                    error!(
-                        ?reason,
-                        security_id = parsed.tick.security_id,
-                        "groww bridge: tick cannot fold through the shared 21-TF engine (width guard)"
-                    );
-                    continue;
-                }
-            };
-            let seg_code = pt.exchange_segment_code;
-            let key = (pt.security_id, seg_code);
-            let cum_volume_u64 = match u64::try_from(parsed.tick.cum_volume) {
-                Ok(v) => v,
-                Err(_) => {
-                    error!(
-                        security_id = parsed.tick.security_id,
-                        cum_volume = parsed.tick.cum_volume,
-                        "groww bridge: negative cum_volume past validation — dropping tick"
-                    );
-                    continue;
-                }
-            };
-            // First sight: register + seed the cumulative baseline (idempotent).
-            if self.seeded.insert(key) {
-                self.aggregator.pre_populate(std::iter::once(key));
-                self.aggregator
-                    .seed_cumulative(pt.security_id, seg_code, cum_volume_u64);
-            }
-            // Route every sealed bar across ALL 21 TFs through the SHARED
-            // seal-writer chain, tagged feed=Groww.
-            let stats = self.aggregator.consume_tick(
-                &pt,
-                seg_code,
-                FeedStrategy::GROWW,
-                Some(cum_volume_u64),
-                |tf, state| {
-                    let Some(sender) = global_seal_sender() else {
+            // C2 (feed convergence): the ordered enrich → persist → aggregate
+            // per-tick consumer sequence is the ONE shared `consume_feed_tick`
+            // core (`tickvault_core::pipeline::feed_consumer`) — the same core
+            // the Dhan tick processor delegates to. The core NEVER invokes the
+            // enrich stage for Feed::Groww (no greeks/OI — plan edge E5), and
+            // pins the persist-before-fold order. Monomorphized closures over
+            // the private ParsedGrowwTick — zero-alloc, no dyn.
+            let live_writer = &mut self.live_writer;
+            let seeded = &mut self.seeded;
+            let aggregator = &self.aggregator;
+            tickvault_core::pipeline::feed_consumer::consume_feed_tick(
+                Feed::Groww,
+                &mut parsed,
+                |_| {}, // Groww has no enrichment stage; the core gates it anyway.
+                |p| {
+                    if let Err(err) = live_writer.append_row(&live_tick_row(p, seq, row_received)) {
+                        error!(
+                            ?err,
+                            "groww bridge: shared ticks (feed=groww) append failed"
+                        );
+                    } else {
+                        // The dashboard counter is bumped ONLY on a successful flush below,
+                        // by the number of rows actually persisted. Stamp the WALL-CLOCK
+                        // receipt time (NOT the exchange ts) for the most-recent row.
+                        last_receipt_ist_nanos = receipt_ist_nanos();
+                    }
+                },
+                |p| {
+                    // Fold through the SHARED 21-TF engine (ONE common candle engine).
+                    let pt = match build_parsed_tick(p) {
+                        Ok(pt) => pt,
+                        Err(reason) => {
+                            error!(
+                                ?reason,
+                                security_id = p.tick.security_id,
+                                "groww bridge: tick cannot fold through the shared 21-TF engine (width guard)"
+                            );
+                            return;
+                        }
+                    };
+                    let seg_code = pt.exchange_segment_code;
+                    let key = (pt.security_id, seg_code);
+                    let Ok(cum_volume_u64) = u64::try_from(p.tick.cum_volume) else {
+                        error!(
+                            security_id = p.tick.security_id,
+                            cum_volume = p.tick.cum_volume,
+                            "groww bridge: negative cum_volume past validation — dropping tick"
+                        );
                         return;
                     };
-                    crate::seal_routing::route_seal(
-                        crate::seal_routing::SealRouteParams {
-                            feed: Feed::Groww,
-                            drop_d1: false,
-                            prev_day_cache: None,
-                            heartbeat: None,
-                            feed_health_on_m1: Some(feed_health),
-                        },
-                        pt.security_id,
+                    // First sight: register + seed the cumulative baseline (idempotent).
+                    if seeded.insert(key) {
+                        aggregator.pre_populate(std::iter::once(key));
+                        aggregator.seed_cumulative(pt.security_id, seg_code, cum_volume_u64);
+                    }
+                    // Route every sealed bar across ALL 21 TFs through the SHARED
+                    // seal-writer chain, tagged feed=Groww.
+                    let stats = aggregator.consume_tick(
+                        &pt,
                         seg_code,
-                        tf,
-                        state,
-                        sender,
+                        FeedStrategy::GROWW,
+                        Some(cum_volume_u64),
+                        |tf, state| {
+                            let Some(sender) = global_seal_sender() else {
+                                return;
+                            };
+                            crate::seal_routing::route_seal(
+                                crate::seal_routing::SealRouteParams {
+                                    feed: Feed::Groww,
+                                    drop_d1: false,
+                                    prev_day_cache: None,
+                                    heartbeat: None,
+                                    feed_health_on_m1: Some(feed_health),
+                                },
+                                pt.security_id,
+                                seg_code,
+                                tf,
+                                state,
+                                sender,
+                            );
+                        },
                     );
+                    if stats.late_count > 0 {
+                        // AGGREGATOR-LATE-01 visibility (2026-07-03): Groww late
+                        // discards were previously COMPLETELY silent — this path
+                        // captured `stats` but never read `late_count` (no counter,
+                        // no log), so a Discard-policy drop wave was invisible. Count
+                        // them with the `feed=groww` label; the Dhan site keeps its
+                        // label-less series (mirroring the `tv_seal_mpsc_dropped_total`
+                        // per-feed labelling precedent in `seal_routing.rs`) so the
+                        // existing tv-aggregator-late-tick-sustained alert series is
+                        // not renamed or broken.
+                        metrics::counter!("tv_aggregator_late_ticks_discarded_total", "feed" => "groww")
+                            .increment(u64::from(stats.late_count));
+                    }
+                    if !stats.instrument_found {
+                        aggregator.pre_populate(std::iter::once(key));
+                    }
                 },
             );
-            if stats.late_count > 0 {
-                // AGGREGATOR-LATE-01 visibility (2026-07-03): Groww late
-                // discards were previously COMPLETELY silent — this path
-                // captured `stats` but never read `late_count` (no counter,
-                // no log), so a Discard-policy drop wave was invisible. Count
-                // them with the `feed=groww` label; the Dhan site keeps its
-                // label-less series (mirroring the `tv_seal_mpsc_dropped_total`
-                // per-feed labelling precedent in `seal_routing.rs`) so the
-                // existing tv-aggregator-late-tick-sustained alert series is
-                // not renamed or broken.
-                metrics::counter!("tv_aggregator_late_ticks_discarded_total", "feed" => "groww")
-                    .increment(u64::from(stats.late_count));
-            }
-            if !stats.instrument_found {
-                self.aggregator.pre_populate(std::iter::once(key));
-            }
         }
         // Flush the buffered rows. The dashboard "ticks" counter is bumped ONLY by
         // the number of rows ACTUALLY persisted to QuestDB (the flush return value),
