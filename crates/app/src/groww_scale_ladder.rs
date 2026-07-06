@@ -428,6 +428,41 @@ pub fn next_rung(ladder: &[usize], current: usize, ceiling: usize) -> Option<usi
 /// across the post-advance hold window is the server's answer).
 pub const PLATEAU_CONFIRM_EVALS: u32 = 2;
 
+/// FLOOR of the plateau confirmation window in seconds (hardening
+/// 2026-07-06, hostile finding "2 evals ≈ 60-120s is not the hold
+/// window"): a plateau is declared only after the post-advance watch has
+/// spanned at least `max(gate_hold_minutes * 60, THIS)` seconds, so a
+/// slow-but-healthy spawn wave (60s token-read pacing per the shared
+/// token-minter lock, venv re-provisioning taking minutes) cannot produce
+/// a false sticky plateau in two 30s ticks.
+pub const PLATEAU_CONFIRM_MIN_WINDOW_SECS: u64 = 300;
+
+/// Freshness bound for a per-conn subscribe proof (hardening 2026-07-06,
+/// hostile findings "stale status files are never deleted" + "the
+/// capturing-degradation signal is never consulted"): a status file counts
+/// toward the fleet proof ONLY when it was (re)written within this many
+/// seconds. The sidecar re-writes its status at most once per second while
+/// STREAMING (`note_emit`, groww_sidecar.py) and once at subscribe time, so
+/// a healthy conn is always fresh, while a killed / stalled / yesterday's
+/// conn ages out — which both un-pins the proof count (growth is
+/// detectable again) and makes the regression arm a REAL capture-
+/// degradation signal instead of dead code.
+pub const PLATEAU_PROOF_FRESHNESS_SECS: u64 = 300;
+
+/// The effective plateau confirmation window: the SAME hold the advance
+/// gates get (`gate_hold_minutes`), floored at
+/// [`PLATEAU_CONFIRM_MIN_WINDOW_SECS`] so a mis-configured tiny hold can
+/// never declare a plateau faster than one spawn wave can stabilize.
+#[must_use]
+pub const fn plateau_confirm_window_secs(gate_hold_minutes: u64) -> u64 {
+    let hold_secs = gate_hold_minutes.saturating_mul(60);
+    if hold_secs > PLATEAU_CONFIRM_MIN_WINDOW_SECS {
+        hold_secs
+    } else {
+        PLATEAU_CONFIRM_MIN_WINDOW_SECS
+    }
+}
+
 /// The plateau gate's verdict for one post-advance Holding evaluation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PlateauVerdict {
@@ -453,29 +488,40 @@ pub enum PlateauVerdict {
 
 /// PURE plateau decision for one post-advance Holding evaluation.
 ///
-/// * `baseline_proof` — fleet subscribe-proof count captured at the instant
-///   the last advance was dispatched.
-/// * `current_proof` — fleet subscribe-proof count at this evaluation.
+/// * `baseline_proof` — fleet FRESH subscribe-proof count captured at the
+///   instant the last advance was dispatched.
+/// * `current_proof` — fleet FRESH subscribe-proof count at this evaluation.
 /// * `pinned_evals_so_far` — consecutive PRIOR evaluations (since that
 ///   advance) where proof failed to grow.
 /// * `last_efficient_rung` — the last rung observed with `proof >= conns`.
+/// * `watch_elapsed_secs` — wall-clock seconds since the advance was
+///   dispatched (the plateau watch start).
+/// * `confirm_window_secs` — [`plateau_confirm_window_secs`] for the run.
 ///
-/// Growth → [`PlateauVerdict::AdvanceAllowed`]. Pinned (equal) → plateau on
-/// the [`PLATEAU_CONFIRM_EVALS`]-th confirmation. Regression → plateau
-/// IMMEDIATELY with rollback target = the last efficient rung.
+/// Growth → [`PlateauVerdict::AdvanceAllowed`]. Pinned (equal) → plateau
+/// only once BOTH [`PLATEAU_CONFIRM_EVALS`] consecutive confirmations AND
+/// the confirmation window have elapsed (a slow-but-healthy spawn wave is
+/// Watching, never a plateau). Regression → plateau IMMEDIATELY with
+/// rollback target = the last efficient rung: with freshness-gated proof
+/// counting, a regression means a previously-healthy connection stopped
+/// re-writing its status for over [`PLATEAU_PROOF_FRESHNESS_SECS`] — the
+/// exam's "capturing fell 30→24" degradation signature.
 #[must_use]
 pub const fn evaluate_plateau(
     baseline_proof: usize,
     current_proof: usize,
     pinned_evals_so_far: u32,
     last_efficient_rung: usize,
+    watch_elapsed_secs: u64,
+    confirm_window_secs: u64,
 ) -> PlateauVerdict {
     if current_proof > baseline_proof {
         return PlateauVerdict::AdvanceAllowed;
     }
     let regressed = current_proof < baseline_proof;
     let confirmations = pinned_evals_so_far.saturating_add(1);
-    if regressed || confirmations >= PLATEAU_CONFIRM_EVALS {
+    let window_spanned = watch_elapsed_secs >= confirm_window_secs;
+    if regressed || (confirmations >= PLATEAU_CONFIRM_EVALS && window_spanned) {
         // In this branch current_proof <= baseline_proof, so the highest
         // count the server ever acknowledged is the baseline.
         let measured_cap = baseline_proof;
@@ -543,19 +589,78 @@ fn write_scale_summary(
     }
 }
 
-/// Counts connections with an on-disk subscribe proof (status file present
-/// — the SAME per-conn evidence `build_scale_snapshot` surfaces on the
-/// `/feeds` panel). Cold path: ≤ `ceiling` (≤100) existence probes per
-/// 30s Holding evaluation. Honest envelope: file-derived — a stale status
-/// file from a killed higher-rung connection can inflate the count.
-fn count_subscribe_proofs(shards_root: &std::path::Path, ceiling: usize) -> usize {
+/// PURE freshness classification of one subscribe-proof file. A proof is
+/// fresh ONLY when its age is known and within
+/// [`PLATEAU_PROOF_FRESHNESS_SECS`] — a missing file, an unreadable mtime,
+/// or a clock anomaly (mtime in the future of `now` yields no age) all
+/// classify NOT-fresh, so the count can only ever under-report, never
+/// inflate (fail-closed for growth detection).
+const fn proof_is_fresh(age_secs: Option<u64>) -> bool {
+    match age_secs {
+        Some(age) => age <= PLATEAU_PROOF_FRESHNESS_SECS,
+        None => false,
+    }
+}
+
+/// Counts connections with a FRESH on-disk subscribe proof (status file
+/// present AND re-written within [`PLATEAU_PROOF_FRESHNESS_SECS`] of
+/// `now`). The sidecar re-writes the status ≤1s apart while streaming and
+/// once at subscribe, so healthy conns always count; killed / stalled /
+/// prior-day conns age out (hardening 2026-07-06 — the bare `exists()`
+/// count was monotone-nondecreasing across halves, restarts and days,
+/// turning the plateau gate into a false-halt latch). Cold path: ≤
+/// `ceiling` (≤100) metadata probes per 30s Holding evaluation. Honest
+/// envelope: a status file re-written by a dying sidecar in the ~1s
+/// between abort and process reap stays "fresh" for up to
+/// [`PLATEAU_PROOF_FRESHNESS_SECS`] — bounded, and the scale-down path
+/// also DELETES the file (see the fleet reconciler), so this residual
+/// only survives a lost delete.
+fn count_subscribe_proofs(
+    shards_root: &std::path::Path,
+    ceiling: usize,
+    now: std::time::SystemTime,
+) -> usize {
     (0..ceiling)
         .filter(|&conn_id| {
-            crate::groww_bridge::shard_files(shards_root, conn_id)
-                .status_file
-                .exists()
+            let status_file = crate::groww_bridge::shard_files(shards_root, conn_id).status_file;
+            let age_secs = std::fs::metadata(&status_file)
+                .ok()
+                .and_then(|meta| meta.modified().ok())
+                .and_then(|mtime| now.duration_since(mtime).ok())
+                .map(|age| age.as_secs());
+            proof_is_fresh(age_secs)
         })
         .count()
+}
+
+/// Best-effort sweep of ALL per-conn subscribe-proof status files under
+/// `shards_root` at ladder start (hardening 2026-07-06): a prior run / day
+/// / weekend-smoke climb leaves undated status files behind, and a fresh
+/// run must never count them as today's proof. Live conns re-write their
+/// file within ~1s of (re)subscribing, so sweeping at start loses nothing.
+/// Returns the number of files removed.
+fn remove_stale_subscribe_proofs(shards_root: &std::path::Path, ceiling: usize) -> usize {
+    use tracing::warn;
+    let mut removed = 0usize;
+    let mut failed = 0usize;
+    for conn_id in 0..ceiling {
+        let status_file = crate::groww_bridge::shard_files(shards_root, conn_id).status_file;
+        match std::fs::remove_file(&status_file) {
+            Ok(()) => removed += 1,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => failed += 1,
+        }
+    }
+    if failed > 0 {
+        // Best-effort cleanup: the freshness gate in
+        // `count_subscribe_proofs` still ages the leftovers out within
+        // PLATEAU_PROOF_FRESHNESS_SECS, so this is degraded, not broken.
+        warn!(
+            failed,
+            removed, "groww scale ladder: some stale subscribe-proof files could not be removed"
+        );
+    }
+    removed
 }
 
 /// One parsed `groww_scale_audit` row, as consumed by restart rehydration.
@@ -760,13 +865,27 @@ pub async fn run_groww_scale_ladder(
     let mut consecutive_failures_at_rung: u32 = 0;
     // ── Plateau-stop gate state (exam-fix 2026-07-06). ──
     // `plateau_baseline_proof` arms at each advance dispatch (the fleet
-    // subscribe-proof count BEFORE the new connections spawn);
+    // FRESH subscribe-proof count BEFORE the new connections spawn);
     // `plateau_pinned_evals` counts consecutive non-growing Holding
-    // evaluations since; `last_efficient_rung` is the last rung observed
-    // with proof >= conns (the rollback target when the plateau fires).
+    // evaluations since; `plateau_watch_started` timestamps the advance so
+    // a plateau can only be declared after the confirmation window (the
+    // same hold the gates get, floored at 5 minutes) has elapsed;
+    // `last_efficient_rung` is the last rung observed with proof >= conns
+    // (the rollback target when the plateau fires).
     let mut plateau_baseline_proof: Option<usize> = None;
     let mut plateau_pinned_evals: u32 = 0;
+    let mut plateau_watch_started: Option<std::time::Instant> = None;
     let mut last_efficient_rung: usize = current;
+    let plateau_confirm_secs = plateau_confirm_window_secs(cfg.gate_hold_minutes);
+    // Hardening 2026-07-06: stale status files from a prior run / day /
+    // halve would otherwise pin the proof count at its historical max.
+    let swept = remove_stale_subscribe_proofs(&shards_root, ceiling);
+    if swept > 0 {
+        info!(
+            swept,
+            "[feeds] groww scale ladder: stale subscribe-proof files from a prior run removed"
+        );
+    }
     runtime.desired_conns.store(current, Ordering::Relaxed);
     runtime.wake.notify_waiters();
     info!(
@@ -867,6 +986,7 @@ pub async fn run_groww_scale_ladder(
             // A fleet-wide failure invalidates any in-flight plateau watch.
             plateau_baseline_proof = None;
             plateau_pinned_evals = 0;
+            plateau_watch_started = None;
             publish_state(state, current, cfg.target_connections);
             continue;
         }
@@ -921,6 +1041,7 @@ pub async fn run_groww_scale_ladder(
                     // A rung failure invalidates any in-flight plateau watch.
                     plateau_baseline_proof = None;
                     plateau_pinned_evals = 0;
+                    plateau_watch_started = None;
                     next
                 }
                 None => match state {
@@ -946,28 +1067,37 @@ pub async fn run_groww_scale_ladder(
                     }
                     LadderState::Holding => {
                         // ── Plateau-stop gate (exam-fix 2026-07-06): if the
-                        // fleet's subscribe-proof count failed to grow after
-                        // the last advance, the server's cap is reached —
-                        // discover it and STOP AT it instead of climbing
-                        // past it (pushing past DEGRADED healthy conns in
-                        // the live exam). SMOKE mode skips the gate — no
-                        // live subscribe evidence exists by design.
-                        let proof_count = count_subscribe_proofs(&shards_root, ceiling);
+                        // fleet's FRESH subscribe-proof count failed to grow
+                        // after the last advance, the server's cap is
+                        // reached — discover it and STOP AT it instead of
+                        // climbing past it (pushing past DEGRADED healthy
+                        // conns in the live exam). SMOKE mode skips the gate
+                        // — no live subscribe evidence exists by design.
+                        let proof_count = count_subscribe_proofs(
+                            &shards_root,
+                            ceiling,
+                            std::time::SystemTime::now(),
+                        );
                         if proof_count >= current {
                             last_efficient_rung = current;
                         }
                         let plateau_halt = if smoke {
                             None
                         } else if let Some(baseline) = plateau_baseline_proof {
+                            let watch_elapsed_secs =
+                                plateau_watch_started.map_or(0, |t| t.elapsed().as_secs());
                             match evaluate_plateau(
                                 baseline,
                                 proof_count,
                                 plateau_pinned_evals,
                                 last_efficient_rung,
+                                watch_elapsed_secs,
+                                plateau_confirm_secs,
                             ) {
                                 PlateauVerdict::AdvanceAllowed => {
                                     plateau_baseline_proof = None;
                                     plateau_pinned_evals = 0;
+                                    plateau_watch_started = None;
                                     None
                                 }
                                 PlateauVerdict::Watching => {
@@ -1026,6 +1156,7 @@ pub async fn run_groww_scale_ladder(
                                     hold_started = None;
                                     plateau_baseline_proof = None;
                                     plateau_pinned_evals = 0;
+                                    plateau_watch_started = None;
                                     Some(next)
                                 }
                             }
@@ -1061,11 +1192,15 @@ pub async fn run_groww_scale_ladder(
                                         &inputs,
                                     )
                                     .await;
-                                    // Arm the plateau gate: the proof count at
-                                    // dispatch time is the growth baseline the
-                                    // post-advance evaluations must beat.
+                                    // Arm the plateau gate: the FRESH proof
+                                    // count at dispatch time is the growth
+                                    // baseline the post-advance evaluations
+                                    // must beat, and the watch clock starts
+                                    // NOW (plateau only after the confirm
+                                    // window spans a full spawn wave).
                                     plateau_baseline_proof = Some(proof_count);
                                     plateau_pinned_evals = 0;
+                                    plateau_watch_started = Some(std::time::Instant::now());
                                     current = next;
                                     runtime.desired_conns.store(current, Ordering::Relaxed);
                                     runtime.wake.notify_waiters();
@@ -1758,29 +1893,37 @@ mod tests {
 
     // ── Plateau-stop gate (exam-fix 2026-07-06) ──
 
+    /// A confirm window already spanned, for tests that exercise the
+    /// eval-count dimension in isolation.
+    const SPANNED: u64 = PLATEAU_CONFIRM_MIN_WINDOW_SECS;
+
     /// Growing proof after an advance → climbing may continue.
     #[test]
     fn test_plateau_growing_proof_allows_advance() {
         // test coverage (pub-fn-test-guard line): evaluate_plateau
         assert_eq!(
-            evaluate_plateau(33, 40, 0, 30),
+            evaluate_plateau(33, 40, 0, 30, 0, SPANNED),
             PlateauVerdict::AdvanceAllowed
         );
         // Growth on a later evaluation clears any accrued pin count too.
         assert_eq!(
-            evaluate_plateau(33, 34, 1, 30),
+            evaluate_plateau(33, 34, 1, 30, SPANNED, SPANNED),
             PlateauVerdict::AdvanceAllowed
         );
     }
 
     /// Exam signature: proof pinned at 33 while conns climbed. One pinned
-    /// evaluation = Watching (advance blocked); the second confirms the
-    /// PLATEAU with the measured cap and the efficient-rung rollback target.
+    /// evaluation = Watching (advance blocked); the second — once the
+    /// confirmation window has elapsed — confirms the PLATEAU with the
+    /// measured cap and the efficient-rung rollback target.
     #[test]
     fn test_plateau_pinned_two_evals_declares_plateau() {
-        assert_eq!(evaluate_plateau(33, 33, 0, 30), PlateauVerdict::Watching);
         assert_eq!(
-            evaluate_plateau(33, 33, 1, 30),
+            evaluate_plateau(33, 33, 0, 30, SPANNED, SPANNED),
+            PlateauVerdict::Watching
+        );
+        assert_eq!(
+            evaluate_plateau(33, 33, 1, 30, SPANNED, SPANNED),
             PlateauVerdict::Plateau {
                 measured_cap: 33,
                 rollback_to: 30
@@ -1788,13 +1931,54 @@ mod tests {
         );
     }
 
+    /// Hardening 2026-07-06 (hostile finding: 2×30s ticks answered before a
+    /// spawn wave could stabilize): a pinned proof is only WATCHING — never
+    /// a plateau — until the confirmation window has elapsed, no matter how
+    /// many pinned evaluations accrued. The boundary second flips it.
+    #[test]
+    fn test_plateau_pinned_requires_confirm_window_elapsed() {
+        // Many pinned evals but the window not yet spanned → still Watching.
+        assert_eq!(
+            evaluate_plateau(33, 33, 10, 30, SPANNED - 1, SPANNED),
+            PlateauVerdict::Watching
+        );
+        // Exactly at the window boundary → plateau.
+        assert_eq!(
+            evaluate_plateau(33, 33, 10, 30, SPANNED, SPANNED),
+            PlateauVerdict::Plateau {
+                measured_cap: 33,
+                rollback_to: 30
+            }
+        );
+    }
+
+    /// The confirmation window is the SAME hold the advance gates get,
+    /// floored at 5 minutes so a tiny configured hold can never declare a
+    /// plateau faster than one spawn wave (60s token pacing + venv
+    /// provisioning) can stabilize.
+    #[test]
+    fn test_plateau_confirm_window_is_hold_window_with_floor() {
+        // test coverage (pub-fn-test-guard line): plateau_confirm_window_secs
+        assert_eq!(PLATEAU_CONFIRM_MIN_WINDOW_SECS, 300);
+        // Default 15-minute hold → 900s window.
+        assert_eq!(plateau_confirm_window_secs(15), 900);
+        // Tiny hold → floored at 300s.
+        assert_eq!(plateau_confirm_window_secs(1), 300);
+        assert_eq!(plateau_confirm_window_secs(0), 300);
+        // Boundary: 5-minute hold equals the floor exactly.
+        assert_eq!(plateau_confirm_window_secs(5), 300);
+    }
+
     /// Exam signature: pushing past the cap DEGRADED healthy connections
-    /// (capturing fell 30→24). A proof REGRESSION is an immediate plateau —
-    /// no 2-eval wait — with rollback target = the last efficient rung.
+    /// (capturing fell 30→24). A proof REGRESSION — with freshness-gated
+    /// counting this means a previously-healthy connection stopped
+    /// re-writing its status for over the freshness bound — is an immediate
+    /// plateau (no window wait) with rollback target = the last efficient
+    /// rung.
     #[test]
     fn test_plateau_regression_immediate_rollback_to_last_efficient() {
         assert_eq!(
-            evaluate_plateau(33, 24, 0, 30),
+            evaluate_plateau(33, 24, 0, 30, 0, SPANNED),
             PlateauVerdict::Plateau {
                 measured_cap: 33,
                 rollback_to: 30
@@ -1807,7 +1991,7 @@ mod tests {
     #[test]
     fn test_plateau_rollback_floor_is_one() {
         assert_eq!(
-            evaluate_plateau(5, 5, 1, 0),
+            evaluate_plateau(5, 5, 1, 0, SPANNED, SPANNED),
             PlateauVerdict::Plateau {
                 measured_cap: 5,
                 rollback_to: 1
@@ -1815,7 +1999,7 @@ mod tests {
         );
         // Saturating pin counter — u32::MAX prior evals still classify.
         assert_eq!(
-            evaluate_plateau(5, 5, u32::MAX, 3),
+            evaluate_plateau(5, 5, u32::MAX, 3, SPANNED, SPANNED),
             PlateauVerdict::Plateau {
                 measured_cap: 5,
                 rollback_to: 3
@@ -1824,10 +2008,89 @@ mod tests {
     }
 
     /// The confirmation window is exactly 2 consecutive evaluations
-    /// (mission contract 2026-07-06).
+    /// (mission contract 2026-07-06) — now paired with the elapsed-time
+    /// window (hardening 2026-07-06).
     #[test]
     fn test_plateau_confirm_evals_is_two() {
         assert_eq!(PLATEAU_CONFIRM_EVALS, 2);
+    }
+
+    // ── Subscribe-proof freshness + stale-file hygiene (hardening
+    // 2026-07-06 — the bare `exists()` count was monotone across halves,
+    // restarts and days, latching the gate at the historical max) ──
+
+    /// A proof is fresh only within the freshness bound; missing/unknown
+    /// ages are NOT fresh (fail-closed — the count can under-report, never
+    /// inflate).
+    #[test]
+    fn test_proof_is_fresh_boundaries() {
+        assert!(proof_is_fresh(Some(0)));
+        assert!(proof_is_fresh(Some(PLATEAU_PROOF_FRESHNESS_SECS)));
+        assert!(!proof_is_fresh(Some(PLATEAU_PROOF_FRESHNESS_SECS + 1)));
+        assert!(!proof_is_fresh(None));
+    }
+
+    /// Guard that removes its unique temp dir on drop (no `tempfile` dep —
+    /// mirrors the `TmpDir` pattern in `tick_conservation_boot.rs`).
+    struct TmpShardsRoot(std::path::PathBuf);
+    impl Drop for TmpShardsRoot {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    static SHARDS_TMP_COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+    fn tmp_shards_root_with_status_files(conns: usize) -> TmpShardsRoot {
+        let n = SHARDS_TMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let root =
+            std::env::temp_dir().join(format!("tv_ladder_proofs_{}_{}", std::process::id(), n));
+        for conn_id in 0..conns {
+            let files = crate::groww_bridge::shard_files(&root, conn_id);
+            std::fs::create_dir_all(&files.watch_dir).unwrap_or_else(|e| panic!("mkdir: {e}"));
+            std::fs::write(&files.status_file, b"{\"event\":\"subscribed\"}")
+                .unwrap_or_else(|e| panic!("write: {e}"));
+        }
+        TmpShardsRoot(root)
+    }
+
+    /// Only freshly-written status files count as subscribe proof; a file
+    /// written in the past (a killed connection, yesterday's run) ages out
+    /// of the count instead of latching it — the exact stale-latch failure
+    /// the hostile review demonstrated (day-2 boot: 33 stale files pinned
+    /// the proof, halving the fleet to 2 conns with a false "server limit"
+    /// page).
+    #[test]
+    fn test_count_subscribe_proofs_ignores_stale_files() {
+        let dir = tmp_shards_root_with_status_files(3);
+        let root = dir.0.as_path();
+        let now = std::time::SystemTime::now();
+        // Just written → all 3 fresh.
+        assert_eq!(count_subscribe_proofs(root, 3, now), 3);
+        // Conn ids past the ceiling are never scanned.
+        assert_eq!(count_subscribe_proofs(root, 2, now), 2);
+        // Advance the observer clock past the freshness bound: the same
+        // files are now STALE and stop counting — the monotone latch is
+        // broken.
+        let later = now + std::time::Duration::from_secs(PLATEAU_PROOF_FRESHNESS_SECS + 60);
+        assert_eq!(count_subscribe_proofs(root, 3, later), 0);
+        // Missing directories / files → not counted, never an error.
+        assert_eq!(count_subscribe_proofs(root, 10, now), 3);
+    }
+
+    /// The ladder-start sweep removes every leftover status file inside the
+    /// scanned ceiling so a fresh run never inherits a prior run's proof.
+    #[test]
+    fn test_remove_stale_subscribe_proofs_clears_status_files() {
+        let dir = tmp_shards_root_with_status_files(4);
+        let root = dir.0.as_path();
+        assert_eq!(remove_stale_subscribe_proofs(root, 4), 4);
+        assert_eq!(
+            count_subscribe_proofs(root, 4, std::time::SystemTime::now()),
+            0
+        );
+        // Idempotent: a second sweep removes nothing and does not error.
+        assert_eq!(remove_stale_subscribe_proofs(root, 4), 0);
     }
 
     /// The summary TSV carries the measured cap + efficient rung so future

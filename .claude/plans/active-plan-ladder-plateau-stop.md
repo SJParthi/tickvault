@@ -62,13 +62,37 @@ advance decision inside the Holding arm.
   false signal.
 - No advance yet (baseline `None`, e.g. resume at rung 1): the first
   advance is always allowed; the gate arms only after an advance.
-- Regression (proof < baseline): plateau declared IMMEDIATELY (no 2-eval
-  wait) — the over-cap climb is actively degrading healthy connections.
+- Regression (proof < baseline): plateau declared IMMEDIATELY (no window
+  wait) — with FRESHNESS-gated counting (hardening below) this means a
+  previously-healthy connection stopped re-writing its status for over
+  `PLATEAU_PROOF_FRESHNESS_SECS` — the exam's real capture-degradation
+  signature (capturing fell 30→24), now an actually-reachable arm.
 - `last_efficient_rung == 0` (proof never reached conns): rollback target
   floors at 1 (never 0 connections).
-- Stale status files from killed higher-rung connections can inflate the
-  proof count (file-derived evidence — same honest envelope as the
-  panel's `subscribed_proof`); documented, never a panic.
+- Stale status files (HARDENED 2026-07-06 after hostile review): the bare
+  `exists()` count was monotone-nondecreasing across halves, restarts and
+  days (undated path, never deleted in production) — a deterministic
+  false-plateau latch, NOT mere noise. Three closures: (a)
+  `count_subscribe_proofs` now counts only files (re)written within
+  `PLATEAU_PROOF_FRESHNESS_SECS` (300s; the sidecar re-writes ≤1s apart
+  while streaming — `note_emit` in `groww_sidecar.py` — and once at
+  subscribe, so healthy conns always count); (b) fleet scale-down deletes
+  the killed conn's status file (`remove_subscribe_proof` in
+  `groww_bridge.rs`, called from the reconciler's KillNewestTo arm); (c)
+  the ladder sweeps all status files at start
+  (`remove_stale_subscribe_proofs`). Residual: a dying sidecar can
+  re-write its file in the ~1s between abort and reap AFTER the delete —
+  bounded by the 300s freshness expiry; documented, never a panic.
+- Slow-but-healthy spawn wave (HARDENED 2026-07-06): a plateau is
+  declared only after the post-advance watch spans
+  `plateau_confirm_window_secs(gate_hold_minutes)` =
+  `max(gate_hold_minutes*60, 300)` seconds AND `PLATEAU_CONFIRM_EVALS`
+  consecutive pinned evaluations — a 60s token-read floor or a
+  minutes-long venv re-provision can no longer produce a false sticky
+  plateau in two 30s ticks. Honest envelope: a spawn wave slower than the
+  full confirm window (default 900s) can still false-plateau; the
+  gate-failure escape (`HaltedAtPlateau` + GateFailed → RollingBack)
+  remains the recovery path.
 - Gate failure from `HaltedAtPlateau` still rolls back (GROWW-SCALE-01
   path unchanged); after recovery the ladder may re-climb and re-measure
   the cap — bounded churn, each climb re-measures honestly.
@@ -96,9 +120,15 @@ Unit tests (22-category coverage: unit + adversarial boundary), scoped per
 - `cargo test -p tickvault-app --lib --tests` —
   `test_plateau_growing_proof_allows_advance`,
   `test_plateau_pinned_two_evals_declares_plateau`,
+  `test_plateau_pinned_requires_confirm_window_elapsed`,
+  `test_plateau_confirm_window_is_hold_window_with_floor`,
   `test_plateau_regression_immediate_rollback_to_last_efficient`,
   `test_plateau_rollback_floor_is_one`,
   `test_plateau_confirm_evals_is_two`,
+  `test_proof_is_fresh_boundaries`,
+  `test_count_subscribe_proofs_ignores_stale_files`,
+  `test_remove_stale_subscribe_proofs_clears_status_files`,
+  `test_remove_subscribe_proof_removes_only_the_target_conn`,
   `test_fsm_plateau_reached_from_holding_and_sticky`,
   `test_resume_honors_halted_at_plateau`,
   `test_format_scale_summary_tsv_carries_measured_cap`,
@@ -143,3 +173,8 @@ runtime effect.
 - [x] Storage outcome variant
   - Files: crates/storage/src/groww_scale_audit_persistence.rs
   - Tests: test_outcome_as_str_stable, test_verified_healthy_classification
+- [x] Hardening 2026-07-06 (hostile review): freshness-gated proof count +
+  status-file deletion on scale-down + ladder-start sweep + hold-window
+  plateau confirmation
+  - Files: crates/app/src/groww_scale_ladder.rs, crates/app/src/groww_bridge.rs, crates/app/src/groww_sidecar_supervisor.rs
+  - Tests: test_proof_is_fresh_boundaries, test_count_subscribe_proofs_ignores_stale_files, test_remove_stale_subscribe_proofs_clears_status_files, test_remove_subscribe_proof_removes_only_the_target_conn, test_plateau_pinned_requires_confirm_window_elapsed, test_plateau_confirm_window_is_hold_window_with_floor

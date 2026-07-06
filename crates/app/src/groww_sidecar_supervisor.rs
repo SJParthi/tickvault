@@ -1390,6 +1390,13 @@ pub fn spawn_groww_scale_fleet(
                             // Child → kill_on_drop reaps the Python process.
                             handle.abort();
                         }
+                        // Hardening 2026-07-06: drop the killed conn's
+                        // subscribe-proof status file so the ladder's
+                        // plateau gate never counts a dead connection as
+                        // acknowledged (the path is undated and the
+                        // sidecar never deletes it). Best-effort — the
+                        // ladder's freshness bound is the backstop.
+                        let _ = crate::groww_bridge::remove_subscribe_proof(&shards_root, conn_id);
                     }
                 }
                 FleetAction::Steady => {}
