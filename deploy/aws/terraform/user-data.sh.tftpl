@@ -137,15 +137,27 @@ cat > /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json <<CWCFG
             "log_stream_name": "{instance_id}"
           },
           {
-            "file_path": "/opt/tickvault/data/logs/errors.jsonl*",
+            "file_path": "/opt/tickvault/data/logs/machine/errors.jsonl.*",
             "log_group_name": "/tickvault/$${ENVIRONMENT}/app",
             "log_stream_name": "{instance_id}/errors-jsonl",
             "timezone": "UTC"
           },
           {
-            "file_path": "/opt/tickvault/data/logs/app.*.log",
+            "file_path": "/opt/tickvault/data/logs/machine/app.*",
             "log_group_name": "/tickvault/$${ENVIRONMENT}/app",
             "log_stream_name": "{instance_id}/app",
+            "timezone": "UTC"
+          },
+          {
+            "file_path": "/opt/tickvault/data/logs/errors.jsonl*",
+            "log_group_name": "/tickvault/$${ENVIRONMENT}/app",
+            "log_stream_name": "{instance_id}/errors-jsonl-legacy",
+            "timezone": "UTC"
+          },
+          {
+            "file_path": "/opt/tickvault/data/logs/app.*",
+            "log_group_name": "/tickvault/$${ENVIRONMENT}/app",
+            "log_stream_name": "{instance_id}/app-legacy",
             "timezone": "UTC"
           }
         ]
@@ -163,9 +175,11 @@ CWCFG
     -c file:/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json
 
 # ---- Step 4: Create application directories ----
-# NOTE: the app writes its logs to data/logs (WorkingDirectory=/opt/tickvault +
-# ReadWritePaths=/opt/tickvault/data), which is where the CloudWatch agent now
-# tails app.*.log + errors.jsonl from (NOT the old /opt/tickvault/logs).
+# NOTE: the app writes its MACHINE logs to data/logs/machine/ since 2026-07-05
+# (WorkingDirectory=/opt/tickvault + ReadWritePaths=/opt/tickvault/data), which
+# is where the CloudWatch agent now tails machine/app.* + machine/errors.jsonl.*
+# from (the pre-2026-07-05 top-level globs are kept as -legacy streams for a
+# grace window; NOT the old /opt/tickvault/logs).
 mkdir -p /opt/tickvault/{config,data/spill,data/logs,bin}
 chown -R ec2-user:ec2-user /opt/tickvault
 

@@ -199,6 +199,7 @@ resource "aws_lambda_function" "tv_market_hours_liveness_gate" {
         aws_cloudwatch_metric_alarm.market_hours_liveness_missing.alarm_name,
         aws_cloudwatch_metric_alarm.realtime_guarantee_critical.alarm_name,
         aws_cloudwatch_metric_alarm.aggregator_no_seals.alarm_name,
+        aws_cloudwatch_metric_alarm.order_update_reconnect_storm.alarm_name, # 2026-07-06 flapper alarm
       ])
     }
   }

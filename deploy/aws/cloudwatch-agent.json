@@ -30,8 +30,11 @@
     "logs_collected": {
       "files": {
         "collect_list": [
-          { "file_path": "/opt/tickvault/data/logs/errors.jsonl*", "log_group_name": "/tickvault/prod/app", "log_stream_name": "{instance_id}/errors-jsonl", "timezone": "UTC" },
-          { "file_path": "/opt/tickvault/data/logs/app.*", "log_group_name": "/tickvault/prod/app", "log_stream_name": "{instance_id}/app", "timezone": "UTC" }
+          { "file_path": "/var/log/messages", "log_group_name": "/tickvault/prod/system", "log_stream_name": "{instance_id}" },
+          { "file_path": "/opt/tickvault/data/logs/machine/errors.jsonl.*", "log_group_name": "/tickvault/prod/app", "log_stream_name": "{instance_id}/errors-jsonl", "timezone": "UTC" },
+          { "file_path": "/opt/tickvault/data/logs/machine/app.*", "log_group_name": "/tickvault/prod/app", "log_stream_name": "{instance_id}/app", "timezone": "UTC" },
+          { "file_path": "/opt/tickvault/data/logs/errors.jsonl*", "log_group_name": "/tickvault/prod/app", "log_stream_name": "{instance_id}/errors-jsonl-legacy", "timezone": "UTC" },
+          { "file_path": "/opt/tickvault/data/logs/app.*", "log_group_name": "/tickvault/prod/app", "log_stream_name": "{instance_id}/app-legacy", "timezone": "UTC" }
         ]
       }
     }

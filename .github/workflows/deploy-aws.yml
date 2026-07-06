@@ -51,6 +51,12 @@ on:
       - 'deploy/docker/**'
       # Config TOML (loaded by app at boot)
       - 'config/**'
+      # CloudWatch agent + prometheus scrape configs (2026-07-06): the deploy's
+      # OBSERVABILITY-LAST block copies these to the box + fetch-configs the
+      # agent on every deploy — an agent-config-only change (e.g. the machine/
+      # log-path fix) must self-deploy instead of waiting for the next Rust push.
+      - 'deploy/aws/cloudwatch-agent.json'
+      - 'deploy/aws/prometheus.yaml'
       # The deploy workflow ITSELF (so a PR that fixes the deploy
       # auto-redeploys without the operator clicking "Run workflow").
       # Charter: "everything completely comprehensively fully automated".
