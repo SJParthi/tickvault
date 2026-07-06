@@ -9,7 +9,7 @@
 > tick-drop path, ring→spill→DLQ reused unchanged, DEDUP keys untouched).
 
 Changed crate: **`crates/storage`** (files: `crates/storage/src/shadow_candle_writer.rs`,
-`crates/storage/src/seal_writer_loop.rs`).
+`crates/storage/src/seal_writer_loop.rs`, `crates/storage/src/seal_writer_task.rs`).
 
 ## Design
 
@@ -40,8 +40,53 @@ Fix (reuses the existing ring/spill/DLQ blocks — no redesign):
   `ws_event_audit_persistence.rs` fix (2026-07-05).
 - **Recovery visibility:** the writer's reconnect-recovery log upgrades
   `debug!` → `info!` ("flush recovered via reconnect + replay (zero drop)"),
-  matching the tick writer's visible line. Reconnect + same-buffer replay +
-  buffer/pending retention on exhausted retries are KEPT unchanged.
+  matching the tick writer's visible line. IN-CYCLE reconnect + same-buffer
+  replay are KEPT; CROSS-CYCLE buffer retention is REPLACED by rescue+discard
+  (see the 2026-07-06 hostile-review hardening below).
+
+### 2026-07-06 hostile-review hardening (same branch, post-review pass)
+
+Three CRITICAL/HIGH review findings were verified against the code and fixed:
+
+1. **Poison-buffer / unbounded ILP-buffer growth.** `flush()` retained the
+   buffer + `pending_count` on EVERY failure while `drain_once` also rescued
+   the same seals to spill/DLQ. A server-REJECTED row (non-connection `Err`,
+   newly reachable via the HTTP ACK) therefore replayed on every later flush —
+   one poisoned row killed candle persistence for the whole session — and a
+   sustained connection outage grew the buffer without bound (each 100 ms
+   cycle appended more already-rescued rows) toward the questdb-rs 100 MiB
+   `max_buf_size`, after which every flush failed pre-transport FOREVER.
+   Fix: new `ShadowCandleWriter::discard_pending()` called from `drain_once`'s
+   flush-failure arm AFTER the rescue cascade — the rows are durably parked in
+   spill/DLQ (recoverable records; `SealSpillWriter::read_all` is the replay
+   scan), so the buffer copy is redundant; the next cycle starts clean and the
+   buffer is bounded to ONE drain batch forever. In-cycle reconnect+replay
+   inside a single `flush()` call is unchanged.
+   HONEST NOTE: rows discarded this way are recovered via the spill/DLQ tier
+   (loud: AGGREGATOR-SEAL-01 + rescued counters + the 60s report), not via an
+   automatic buffer re-flush — spill replay wiring into the drain loop remains
+   a pre-existing Wave-6 follow-up.
+2. **Unbounded synchronous HTTP blocking on the shared tokio runtime.** The
+   HTTP conf left questdb-rs 6.1.0 defaults in force: `retry_timeout=10s` (a
+   HIDDEN internal sleep-and-resend loop inside every `sender.flush`) +
+   `request_timeout=10s` — so one failed drain cycle blocked ~80-120s
+   synchronously (4 outer attempts × internal retry × request timeout) inside
+   a bare `tokio::spawn` on the 2-vCPU prod box, and the internal retries
+   DOUBLED the writer's own reconnect ladder. Fix: the conf now pins
+   `retry_timeout=0` (library retry disabled — the outer `flush()` loop is the
+   single retry owner) + `request_timeout=5000` (ms), bounding a failed cycle
+   to ~4 × ~7.5s ≈ 30s worst-case against a black-holed server (milliseconds
+   on connection-refused); AND the loop runs each cycle under
+   `tokio::task::block_in_place` on the multi-thread runtime so even that
+   bounded block never pins a tokio worker's other tasks (current-thread test
+   runtimes call directly).
+3. **Vacuous ratchet test.** `test_ratchet_loop_wires_observability_not_silence`
+   scanned `include_str!` of its own file INCLUDING the test module, so every
+   needle matched its own assertion literal — deleting all production
+   observability left it green (false-OK, audit Rule 11). Fix: the scan now
+   splits at the first `#[cfg(test)]` marker and asserts against the
+   PRODUCTION region only; verified by mutation (deleting the ticker-arm
+   fan-out call fails the test).
 - **Loop observability:** `run_seal_writer_loop` now (a) fans every
   `CycleOutcome` into `tv_seal_writer_drain_total{kind=submitted|flushed_rows|
   flush_failed|rescued_spill|rescued_dlq|dropped}`, (b) fires
@@ -62,8 +107,11 @@ Fix (reuses the existing ring/spill/DLQ blocks — no redesign):
   only the current cycle's popped seals in `flushed_rows` (documented honest
   lower bound).
 - `for_test()` writers carry an empty conf — reconnect fails as a connection
-  error, retries exhaust, buffer + pending retained for the next cycle
-  (re-attempt proven by `test_shadow_writer_reattempts_flush_after_prior_failure`).
+  error, retries exhaust, and `flush()` returns with buffer + pending retained
+  so the CALLER can rescue (in-cycle contract, proven by
+  `test_shadow_writer_reattempts_flush_after_prior_failure`); `drain_once`
+  then rescues to spill/DLQ and discards the buffer so the next cycle starts
+  clean (`test_drain_once_discards_writer_buffer_after_flush_failure_rescue`).
 - HTTP `Sender::from_conf` does not dial at construction — an unreachable
   QuestDB surfaces at flush as `Err` (loud), not at boot.
 - Truly-dropped seals on BOTH the submit side (`mpsc_submit_dropped`) and the
@@ -74,12 +122,20 @@ Fix (reuses the existing ring/spill/DLQ blocks — no redesign):
 
 ## Failure Modes
 
-- QuestDB down: flush `Err` (connection class) → bounded reconnect+replay
-  (≤3 retries, ≤350 ms backoff) → on exhaustion `drain_once` fires
-  AGGREGATOR-SEAL-01 and rescues seals to spill/DLQ; next cycle re-attempts.
+- QuestDB down: flush `Err` (connection class) → bounded IN-CYCLE
+  reconnect+replay (≤3 reconnect retries, ≤350 ms of sleep backoff; each HTTP
+  attempt itself bounded by the pinned `request_timeout=5000` ms + ≤ ~2.5s
+  min-throughput extension, internal library retry DISABLED — honest
+  worst-case blocking per failed cycle ≈ 30s against a hung server, wrapped in
+  `block_in_place` so no tokio worker is pinned) → on exhaustion `drain_once`
+  fires AGGREGATOR-SEAL-01, rescues seals to spill/DLQ, and DISCARDS the ILP
+  buffer; the next cycle handles NEW seals cleanly and the rescued rows sit
+  durably in spill/DLQ for replay.
 - QuestDB rejects rows (schema drift / type mismatch): HTTP ACK returns a
-  non-connection `Err` immediately → AGGREGATOR-SEAL-01 + rescue (previously:
-  TOTAL SILENCE under TCP fire-and-forget — the exam bug).
+  non-connection `Err` immediately → AGGREGATOR-SEAL-01 + rescue + buffer
+  DISCARD, so the poisoned row is never replayed and later cycles keep
+  persisting (previously: TOTAL SILENCE under TCP fire-and-forget — the exam
+  bug; and pre-hardening, the retained buffer replayed the bad row forever).
 - Ring + spill + DLQ all fail: `error!(code = AGGREGATOR-DROP-01)` +
   `tv_seal_writer_drain_total{kind="dropped"}` (previously: dropped silently
   because the loop discarded the CycleOutcome).
@@ -108,7 +164,17 @@ All in `crates/storage` (`cargo test -p tickvault-storage --lib --tests`):
   signature the exam session should have shown).
 - `seal_writer_loop::tests::test_ratchet_loop_wires_observability_not_silence`
   — source-scan ratchet: counter fan-out + AGGREGATOR-DROP-01 emit +
-  unconditional progress report must stay wired.
+  unconditional progress report + block_in_place must stay wired
+  (hardened 2026-07-06: scans the PRODUCTION region only — split at
+  `#[cfg(test)]` — so the needles can never match the test's own literals;
+  mutation-verified).
+- `shadow_candle_writer::tests::test_discard_pending_clears_buffer_and_pending_for_clean_next_cycle`
+  — poison-buffer recovery primitive (NEW, 2026-07-06 hardening).
+- `seal_writer_task::tests::test_drain_once_discards_writer_buffer_after_flush_failure_rescue`
+  — end-to-end: failed drain rescues to spill AND leaves the writer buffer
+  empty across cycles; nothing lost (all seals present in spill) (NEW).
+- `shadow_candle_writer::tests::test_ilp_conf_targets_http_port_not_tcp` now
+  also pins `retry_timeout=0` + `request_timeout=5000` (blocking-bound ratchet).
 - Existing drain/rescue tests in `seal_writer_task.rs` continue to prove the
   error!(AGGREGATOR-SEAL-01)+rescue path on flush failure.
 
@@ -145,6 +211,9 @@ while this fix is live remain readable by the unchanged `seal_spill` format.
 - [x] Wire CycleOutcome into counters + AGGREGATOR-DROP-01 + 60s progress report
   - Files: crates/storage/src/seal_writer_loop.rs
   - Tests: test_progress_absorb_accumulates_every_dimension, test_progress_take_returns_snapshot_and_resets, test_progress_idle_cycle_still_counts_the_cycle, test_progress_absorbs_real_failed_cycle_from_runner, test_ratchet_loop_wires_observability_not_silence, test_progress_report_interval_constant_pinned
+- [x] 2026-07-06 hostile-review hardening: rescue+discard poison-proof buffer, pinned HTTP timeouts + block_in_place, non-vacuous ratchet
+  - Files: crates/storage/src/shadow_candle_writer.rs, crates/storage/src/seal_writer_task.rs, crates/storage/src/seal_writer_loop.rs
+  - Tests: test_discard_pending_clears_buffer_and_pending_for_clean_next_cycle, test_drain_once_discards_writer_buffer_after_flush_failure_rescue, test_ilp_conf_targets_http_port_not_tcp, test_ratchet_loop_wires_observability_not_silence
 
 ## Scenarios
 

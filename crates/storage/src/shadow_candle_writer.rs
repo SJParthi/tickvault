@@ -71,9 +71,45 @@ use crate::shadow_seal_columns::ShadowSealRow;
 /// every re-built sender all speak the V1 text line protocol — a reconnect can
 /// therefore always replay the SAME buffer without a client-side
 /// protocol-version mismatch (and no auto-detect settings round-trip).
+///
+/// **2026-07-06 hardening (hostile-review HIGH — blocking-flush bound):** the
+/// questdb-rs 6.1.0 defaults are `retry_timeout=10s` (an INTERNAL
+/// sleep-and-resend loop inside every `sender.flush`) and
+/// `request_timeout=10s`. Left at defaults, one outer flush() during a hung
+/// QuestDB outage blocked synchronously up to ~80-120s (4 outer attempts ×
+/// (10s internal retry + ~10s in-flight request)) — on the shared tokio
+/// runtime. The conf now pins:
+/// - `retry_timeout=[`SEAL_FLUSH_ILP_RETRY_TIMEOUT_MS`]` (= 0) — the internal
+///   questdb-rs retry loop is DISABLED; the writer's own bounded
+///   reconnect+replay loop in [`ShadowCandleWriter::flush`] is the single
+///   owner of retry policy (no doubled retries).
+/// - `request_timeout=[`SEAL_FLUSH_REQUEST_TIMEOUT_MS`]` (= 5000 ms) — one
+///   HTTP POST is bounded to ~5s (+ the questdb-rs min-throughput extension,
+///   ≤ ~2.5s at the 1024-seal max batch), so a failed drain cycle blocks at
+///   most ~4 × ~7.5s ≈ 30s worst-case against a black-holed server (and
+///   fails in milliseconds on connection-refused). The loop additionally
+///   wraps the cycle in `block_in_place` on the production multi-thread
+///   runtime (see `seal_writer_loop.rs`) so even that bounded block never
+///   pins a tokio worker's other tasks.
 fn build_ilp_conf_string(host: &str, http_port: u16) -> String {
-    format!("http::addr={host}:{http_port};protocol_version=1;")
+    format!(
+        "http::addr={host}:{http_port};protocol_version=1;retry_timeout={SEAL_FLUSH_ILP_RETRY_TIMEOUT_MS};request_timeout={SEAL_FLUSH_REQUEST_TIMEOUT_MS};"
+    )
 }
+
+/// Per-request HTTP timeout for one seal-flush POST, in milliseconds
+/// (questdb-rs conf-string durations are milliseconds). Bounds a single
+/// flush attempt against a hung/black-holed QuestDB; connection-refused
+/// still fails in milliseconds. 5s is generous for a ≤1024-row (~256 KB)
+/// LAN batch.
+const SEAL_FLUSH_REQUEST_TIMEOUT_MS: u64 = 5_000;
+
+/// questdb-rs INTERNAL retry budget, in milliseconds. Pinned to 0 —
+/// disabled — because [`ShadowCandleWriter::flush`]'s bounded
+/// reconnect+replay loop is the single owner of retry policy; the library's
+/// hidden sleep-and-resend loop would multiply every outer attempt by up to
+/// 10s of extra synchronous blocking.
+const SEAL_FLUSH_ILP_RETRY_TIMEOUT_MS: u64 = 0;
 
 /// Broker-source label this writer stamps on every candle row.
 ///
@@ -308,11 +344,21 @@ impl ShadowCandleWriter {
     ///   [`crate::groww_persistence::GROWW_FLUSH_RECONNECT_BACKOFF_MS`] backoff.
     ///   Replay is idempotent — `candles_1m` DEDUP `(ts, security_id, segment,
     ///   feed)` collapses any partially-written row, never a double candle.
-    /// - flush returns a NON-connection error (`InvalidName`, etc.): NOT retried —
-    ///   return `Err` immediately (re-sending a bad row fails again).
+    /// - flush returns a NON-connection error (`InvalidName`, server reject, etc.):
+    ///   NOT retried — return `Err` immediately (re-sending a bad row fails again).
     /// - retries exhausted: return `Err` with the buffer + `pending_count`
-    ///   RETAINED — `drain_once` rescues the seals to the spill/DLQ net (the
-    ///   durable floor, unchanged), and the next cycle re-attempts.
+    ///   RETAINED at THIS level (so the caller can still inspect/rescue) —
+    ///   `drain_once` then rescues the popped seals to the spill/DLQ net (the
+    ///   durable floor) and calls [`Self::discard_pending`] so the NEXT cycle
+    ///   starts with a CLEAN buffer. 2026-07-06 hostile-review fix: the old
+    ///   cross-cycle retain-and-replay contract meant (a) a single
+    ///   server-REJECTED row was replayed forever — every later flush failed on
+    ///   the same poisoned bytes, killing candle persistence for the session —
+    ///   and (b) during a sustained connection outage the buffer grew without
+    ///   bound (each 100 ms cycle appended more already-spilled rows) until the
+    ///   questdb-rs `max_buf_size` (100 MiB) turned every flush into a permanent
+    ///   pre-transport error. Rescue + discard is the bounded, poison-proof
+    ///   contract; DEDUP keys absorb any partially-committed rows.
     pub fn flush(&mut self) -> Result<()> {
         if self.buffer.is_empty() {
             self.pending_count = 0;
@@ -403,6 +449,27 @@ impl ShadowCandleWriter {
             Sender::from_conf(conf).context("shadow reconnect: ILP sender rebuild failed")?;
         self.sender = Some(new_sender);
         Ok(())
+    }
+
+    /// Discard every buffered-but-unflushed candle row (poison-buffer recovery,
+    /// 2026-07-06 hostile-review fix). Called by `seal_writer_task::drain_once`
+    /// AFTER the popped seals of a failed flush have been rescued to the
+    /// spill/DLQ durable floor (or counted as Dropped with AGGREGATOR-DROP-01).
+    ///
+    /// Why discarding is the SAFE move at that point:
+    /// - the same rows are durably parked in spill/DLQ as recoverable records
+    ///   (replayable via `SealSpillWriter::read_all` / the DLQ NDJSON), so the
+    ///   ILP buffer copy is redundant;
+    /// - retaining it replays a server-REJECTED row on every later flush — one
+    ///   poisoned row would kill candle persistence for the whole session;
+    /// - retaining it during a sustained connection outage grows the buffer
+    ///   without bound (each cycle appends more already-rescued rows) until the
+    ///   questdb-rs 100 MiB `max_buf_size` wedges every flush permanently.
+    ///
+    /// Cold path; O(1) — `Buffer::clear` keeps the allocation for reuse.
+    pub fn discard_pending(&mut self) {
+        self.buffer.clear();
+        self.pending_count = 0;
     }
 
     /// Sleep the bounded backoff for a 0-based attempt index — shares the Groww
@@ -507,7 +574,10 @@ mod tests {
         // returns Err instead of the fire-and-forget TCP silence that left
         // the candle tables empty on the 2026-07-06 groww-only exam session.
         let conf = build_ilp_conf_string("tv-questdb", 9000);
-        assert_eq!(conf, "http::addr=tv-questdb:9000;protocol_version=1;");
+        assert_eq!(
+            conf,
+            "http::addr=tv-questdb:9000;protocol_version=1;retry_timeout=0;request_timeout=5000;"
+        );
         assert!(
             conf.starts_with("http::addr="),
             "candle writer transport must be ILP-over-HTTP (per-flush ACK), got {conf}"
@@ -515,6 +585,55 @@ mod tests {
         assert!(
             !conf.contains("tcp::"),
             "ILP TCP is fire-and-forget — a server reject never Errs; banned here"
+        );
+        // 2026-07-06 hostile-review ratchet: the questdb-rs defaults
+        // (retry_timeout=10s + request_timeout=10s) turned one failed drain
+        // cycle into up to ~80-120s of synchronous blocking on the shared
+        // tokio runtime. The internal library retry MUST stay disabled (the
+        // outer flush() loop owns retry) and the per-request timeout bounded.
+        assert!(
+            conf.contains("retry_timeout=0;"),
+            "questdb-rs internal retry must be DISABLED (outer loop owns retry), got {conf}"
+        );
+        assert_eq!(SEAL_FLUSH_ILP_RETRY_TIMEOUT_MS, 0);
+        assert!(
+            conf.contains("request_timeout=5000;"),
+            "per-request HTTP timeout must be pinned (5s), got {conf}"
+        );
+        assert_eq!(SEAL_FLUSH_REQUEST_TIMEOUT_MS, 5_000);
+    }
+
+    #[test]
+    fn test_discard_pending_clears_buffer_and_pending_for_clean_next_cycle() {
+        // Poison-buffer recovery contract (2026-07-06 hostile-review fix):
+        // after drain_once has rescued a failed batch to spill/DLQ it discards
+        // the writer's retained ILP buffer, so a server-rejected row can never
+        // replay forever and the buffer can never grow across cycles toward
+        // the questdb-rs 100 MiB max_buf_size cliff.
+        let mut w = ShadowCandleWriter::for_test();
+        w.append_seal(&mk_seal(13, 0, TfIndex::M1, 1_716_000_900, 100.0))
+            .expect("append");
+        w.append_seal(&mk_seal(25, 0, TfIndex::M1, 1_716_001_500, 200.0))
+            .expect("append");
+        assert!(w.flush().is_err(), "disconnected flush fails");
+        assert_eq!(
+            w.pending_count(),
+            2,
+            "flush itself retains (in-cycle replay)"
+        );
+        w.discard_pending();
+        assert_eq!(w.pending_count(), 0, "discard must reset pending");
+        assert_eq!(w.buffer_byte_count(), 0, "discard must empty the buffer");
+        assert_eq!(w.buffer_row_count(), 0);
+        // The next cycle starts clean: a fresh append contains ONLY the new
+        // row's bytes — no poisoned replay of the failed batch.
+        w.append_seal(&mk_seal(51, 0, TfIndex::M1, 1_716_002_100, 300.0))
+            .expect("append after discard");
+        assert_eq!(w.pending_count(), 1);
+        let s = std::str::from_utf8(w.buffer_bytes()).expect("utf8");
+        assert!(
+            s.contains("security_id=51i") && !s.contains("security_id=13i"),
+            "post-discard buffer must contain only the new cycle's rows, got {s}"
         );
     }
 

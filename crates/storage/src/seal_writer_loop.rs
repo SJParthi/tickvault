@@ -210,6 +210,30 @@ fn utc_now_secs() -> i64 {
     Utc::now().timestamp()
 }
 
+/// Run one drain cycle, keeping its SYNCHRONOUS ILP-over-HTTP flush off the
+/// async worker (2026-07-06 hostile-review fix, HIGH).
+///
+/// `SealWriterRunner::run_one_cycle` ultimately calls the writer's blocking
+/// HTTP `flush()` — bounded per attempt by the conf-pinned
+/// `request_timeout=5000` (+ the questdb-rs min-throughput extension, ≤ ~2.5s
+/// at the 1024-seal max batch) with the library's internal retry DISABLED
+/// (`retry_timeout=0`), so a failed cycle against a hung QuestDB blocks at
+/// most ~4 × ~7.5s ≈ 30s (see `shadow_candle_writer::build_ilp_conf_string`).
+/// Even that bounded block must not pin one of the two tokio workers on the
+/// r8g.large prod box, so on a multi-thread runtime the cycle runs under
+/// `tokio::task::block_in_place` — the worker's other tasks migrate while the
+/// flush blocks. Current-thread runtimes (the `#[tokio::test]` harness) call
+/// directly, because `block_in_place` panics there.
+fn run_cycle(runner: &mut SealWriterRunner, now_unix_secs: i64) -> CycleOutcome {
+    if tokio::runtime::Handle::current().runtime_flavor()
+        == tokio::runtime::RuntimeFlavor::MultiThread
+    {
+        tokio::task::block_in_place(|| runner.run_one_cycle(now_unix_secs))
+    } else {
+        runner.run_one_cycle(now_unix_secs)
+    }
+}
+
 /// Long-running tokio task. Calls `runner.run_one_cycle` on a fixed
 /// 100 ms interval until cancelled. On cancellation, performs ONE
 /// final drain cycle so no buffered seal is silently lost.
@@ -253,7 +277,7 @@ pub async fn run_seal_writer_loop(
                 if *cancel_rx.borrow() {
                     info!("seal writer loop cancelled — performing final drain");
                     let now = utc_now_secs();
-                    let final_outcome = runner.run_one_cycle(now);
+                    let final_outcome = run_cycle(&mut runner, now);
                     let dropped = progress.absorb(&final_outcome);
                     record_cycle_observability(&final_outcome, dropped);
                     emit_progress_report(&progress.take(), runner.ring_len());
@@ -272,7 +296,7 @@ pub async fn run_seal_writer_loop(
             }
             _ = ticker.tick() => {
                 let now = utc_now_secs();
-                let outcome = runner.run_one_cycle(now);
+                let outcome = run_cycle(&mut runner, now);
                 let dropped = progress.absorb(&outcome);
                 record_cycle_observability(&outcome, dropped);
                 if !outcome.is_idle() {
@@ -494,22 +518,40 @@ mod tests {
         // error emit for truly-dropped seals, and (c) the unconditional
         // progress report. Deleting any of these restores the silent
         // candle-persist bug class.
-        let src = include_str!("seal_writer_loop.rs");
+        //
+        // 2026-07-06 hostile-review fix (HIGH — vacuous ratchet): the scan is
+        // restricted to the PRODUCTION region of this file (everything before
+        // the `#[cfg(test)]` module marker). The previous version scanned the
+        // whole file — including this test's own assertion string literals —
+        // so deleting every piece of production observability left the test
+        // green (the false-OK class audit Rule 11 bans). Splitting at the
+        // FIRST `#[cfg(test)]` occurrence (the real module attribute, which
+        // precedes any test-body literal) makes each needle provable against
+        // production code only.
+        let full = include_str!("seal_writer_loop.rs");
+        let (prod, _tests) = full
+            .split_once("#[cfg(test)]")
+            .unwrap_or_else(|| panic!("seal_writer_loop.rs must contain a test module marker"));
         assert!(
-            src.contains("record_cycle_observability(&outcome, dropped)"),
+            prod.contains("record_cycle_observability(&outcome, dropped)"),
             "ticker arm must fan the CycleOutcome into counters — not drop it"
         );
         assert!(
-            src.contains("ErrorCode::AggregatorDrop01.code_str()"),
+            prod.contains("ErrorCode::AggregatorDrop01.code_str()"),
             "truly-dropped seals must fire error!(code = AGGREGATOR-DROP-01)"
         );
         assert!(
-            src.contains("tv_seal_writer_drain_total"),
+            prod.contains("tv_seal_writer_drain_total"),
             "the promised tv_seal_writer_drain_total counter family must be emitted"
         );
         assert!(
-            src.contains("emit_progress_report(&progress.take(), runner.ring_len())"),
+            prod.contains("emit_progress_report(&progress.take(), runner.ring_len())"),
             "the unconditional 60s progress report must remain wired"
+        );
+        assert!(
+            prod.contains("block_in_place"),
+            "the drain cycle must stay off-worker on the multi-thread runtime \
+             (sync HTTP flush must never pin a tokio worker's other tasks)"
         );
     }
 

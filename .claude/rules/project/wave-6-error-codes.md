@@ -148,9 +148,29 @@ verified holes, both fixed on branch `claude/fix-candle-writer-recovery`:
    (`http::addr=host:http_port;protocol_version=1;`) — every flush gets a
    per-request server ACK, so a reject surfaces as `Err`, `drain_once`
    fires `error!(code = AGGREGATOR-SEAL-01)` and the ring→spill→DLQ rescue
-   engages. Reconnect + same-buffer replay is KEPT (recovery now logs at
-   `info!`, matching the tick writer's visible line). Ratchet:
+   engages. IN-CYCLE reconnect + same-buffer replay is KEPT (recovery now
+   logs at `info!`, matching the tick writer's visible line). Ratchet:
    `shadow_candle_writer::tests::test_ilp_conf_targets_http_port_not_tcp`.
+   **2026-07-06 hostile-review hardening (same branch):** (a) after a
+   failed flush, `drain_once` now rescues the popped seals to spill/DLQ
+   AND calls `ShadowCandleWriter::discard_pending()` — cross-cycle buffer
+   retention would replay a server-REJECTED row forever (one poisoned row
+   = dead candle leg for the session) and grow the buffer without bound
+   during an outage toward the questdb-rs 100 MiB `max_buf_size` wedge;
+   the spill/DLQ tier is the durable floor for the rescued rows. (b) The
+   HTTP conf pins `retry_timeout=0` (the questdb-rs INTERNAL 10s
+   sleep-and-resend loop is disabled — the writer's own bounded
+   reconnect ladder owns retry) + `request_timeout=5000` ms, and the loop
+   runs each drain cycle under `block_in_place` on the multi-thread
+   runtime — a failed cycle blocks ≤ ~30s worst-case (was ~80-120s of
+   synchronous blocking pinning a tokio worker with the library
+   defaults). (c) The observability ratchet below now scans the
+   PRODUCTION region only (split at `#[cfg(test)]`) — the previous
+   whole-file `include_str!` scan matched its own assertion literals
+   (vacuous; false-OK class); mutation-verified.
+   Additional ratchets:
+   `seal_writer_task::tests::test_drain_once_discards_writer_buffer_after_flush_failure_rescue`,
+   `shadow_candle_writer::tests::test_discard_pending_clears_buffer_and_pending_for_clean_next_cycle`.
 2. **The loop dropped every `CycleOutcome`** — the Wave-6 item-1.4 counter
    fan-out was never wired, and truly-dropped seals never fired
    AGGREGATOR-DROP-01. `run_seal_writer_loop` now fans every cycle into
