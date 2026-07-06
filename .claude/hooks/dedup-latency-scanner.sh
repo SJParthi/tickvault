@@ -31,18 +31,23 @@ scan_pattern() {
     local full_path="$PROJECT_DIR/$file"
     [ ! -f "$full_path" ] && continue
 
-    # Skip test files
-    if echo "$file" | grep -qE '(_test\.rs|/tests/|/test_|_tests\.rs|/benches/)'; then
+    # Skip test files (and, 2026-07-05, examples/ + src/bin/ non-production
+    # binaries — kept in lockstep with banned-pattern-scanner.sh).
+    if echo "$file" | grep -qE '(_test\.rs|/tests/|/test_|_tests\.rs|/benches/|/examples/|/src/bin/)'; then
       continue
     fi
 
-    # If hot-path only, filter to actual hot-path code:
-    # Full crates: trading/ (excl. oms/), websocket/, oms/
-    # Core submodules: core/src/websocket/, core/src/ticker/
-    # NOT: core/src/auth/, core/src/instrument/, core/src/notification/ (cold path)
-    # NOT: trading/src/oms/ (order management is network-bound cold path)
+    # If hot-path only, filter to actual hot-path code.
+    # 2026-07-05 REAL-PATH FIX: the previous filter referenced non-existent
+    # crates (`crates/websocket/`, `crates/oms/`) and `core/src/ticker/`, so
+    # the real per-tick chain was never scanned. The canonical set below is
+    # kept in lockstep with banned-pattern-scanner.sh (HOT_PATH_INCLUDE_REGEX)
+    # and self-tested by .claude/hooks/hot-path-scanner-selftest.sh.
+    # NOT hot: core/src/auth/, core/src/instrument/, core/src/notification/,
+    # core/src/historical/ (cold path); trading/src/oms/ (order management is
+    # network-I/O-bound, not per-tick latency-critical — documented exclusion).
     if [ "$is_hot_path" = "true" ]; then
-      if ! echo "$file" | grep -qE '^crates/(trading|websocket|oms)/|^crates/core/src/(websocket|ticker)/'; then
+      if ! echo "$file" | grep -qE '^crates/core/src/parser/|^crates/core/src/pipeline/|^crates/core/src/websocket/|^crates/trading/|^crates/storage/src/tick_persistence\.rs$|^crates/storage/src/tick_row_builder\.rs$|^crates/storage/src/ws_frame_spill\.rs$|^crates/app/src/groww_bridge\.rs$'; then
         continue
       fi
       # OMS is order management — I/O-bound, not latency-critical
@@ -137,7 +142,9 @@ scan_pattern '&dyn ' '&dyn on hot path — use enum_dispatch' "$STAGED_FILES" tr
 # These are reminders, not blockers. Idempotency/dedup logic may live in a separate module.
 # ─────────────────────────────────────────────
 
-HOT_FILES=$(echo "$STAGED_FILES" | grep -E '^crates/(trading|oms|core)/' || true)
+# (2026-07-05: dropped the phantom `oms` crate — it never existed; trading/src/oms
+# is already inside `crates/trading/`. Warnings-only section, non-blocking.)
+HOT_FILES=$(echo "$STAGED_FILES" | grep -E '^crates/(trading|core)/' || true)
 if [ -n "$HOT_FILES" ]; then
   while IFS= read -r file; do
     [ -z "$file" ] && continue
