@@ -93,13 +93,24 @@ def test_probe_error_pages_verify_failed() -> None:
         assert verdict == handler.VERIFY_FAILED_PAGE
 
 
-def test_subjects_are_emoji_first_and_within_sns_limit() -> None:
-    """SNS Subject hard limit is 100 chars (we truncate at 99); the 10
-    Telegram commandments demand a severity emoji at the START."""
+def test_subjects_are_ascii_and_within_sns_limit() -> None:
+    """SNS Subject hard limit is 100 chars (we truncate at 99) and the SNS
+    Publish API requires ASCII text beginning with a letter, number, or
+    punctuation mark — a non-ASCII (emoji-first) Subject is REJECTED with
+    InvalidParameter (round-2 review fix 2026-07-06). The severity emoji
+    leads the MESSAGE body instead (house precedent: hard-stop-guard)."""
+    import string
+
     for subject, message in handler.SUBJECTS_AND_MESSAGES.values():
         assert len(subject) <= 99, f"subject too long: {subject!r}"
-        assert subject[0] in "🆘⚠️🧪", f"subject must start with an emoji: {subject!r}"
+        assert subject.isascii(), f"SNS rejects non-ASCII subjects: {subject!r}"
+        assert (
+            subject[0] in string.ascii_letters + string.digits + string.punctuation
+        ), f"SNS subject must begin with a letter/number/punctuation: {subject!r}"
         assert message  # never an empty page body
+        assert not message.isascii(), (
+            f"message body must carry the severity emoji the subject cannot: {message!r}"
+        )
 
 
 def test_holiday_cutoff_boundary_0825_ist() -> None:

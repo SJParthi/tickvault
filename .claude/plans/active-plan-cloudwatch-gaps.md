@@ -17,22 +17,26 @@
 > paging 100% inside the tested envelope ONLY — a coded `error!` that reaches
 > the errors.jsonl sink AND is shipped by the CloudWatch agent AND matches one
 > of the 8 filtered codes pages within ~1-5 min via filter → alarm → SNS →
-> Telegram. They do NOT guarantee: paging for un-filtered codes (log-sink-only),
-> paging through a total SNS/Telegram outage (outside the envelope, stated in
-> the handler), catching an UNLOGGED DH-906 reject (term-filter tripwire only;
-> Rust emit-site is a flagged follow-up), seeing a reconnect storm masked by
-> a mid-window counter reset (one blind 15-min window; restarts are owned by
-> the liveness alarms), or paging an order-update flap SLOWER than ~1 cycle
-> per 3 min (>5 once-per-cycle increments per 900s window = the detection
-> floor; the 3-min+ slow-flap band is a stated residual). Claiming more than
-> this envelope = REJECT in review.
+> Telegram (FEED-STALL-01 excepted: storm-only by design — ≥3 restarts per
+> 15-min window, so worst-case first page ≈ 15-17 min after the FIRST stall;
+> round-2 review fix). They do NOT guarantee: paging for un-filtered codes
+> (log-sink-only), paging through a total SNS/Telegram outage (outside the
+> envelope, stated in the handler), catching an UNLOGGED DH-906 reject
+> (term-filter tripwire only; Rust emit-site is a flagged follow-up), or
+> paging an order-update flap SLOWER than ~1 cycle per 3 min (>5
+> once-per-cycle increments per 900s window = the detection floor; the
+> 3-min+ slow-flap band is a stated residual; an app restart costs at most
+> the agent's dropped first post-restart counter sample — restarts are owned
+> by the liveness alarms). Claiming more than this envelope = REJECT in
+> review.
 
 ## Design
 
 **The severed route + its restoration.** The canonical routing after this PR:
 `error!` → errors.jsonl (`data/logs/machine/`) → CloudWatch Logs
 `/tickvault/prod/app` (CW agent) → log metric filter → `tv_errcode_*` metric →
-CloudWatch alarm (≤5 min) → SNS `tv-prod-alerts` → Telegram webhook Lambda.
+CloudWatch alarm (≤5 min for the 300s-period alarms; the FEED-STALL storm
+window is 15 min) → SNS `tv-prod-alerts` → Telegram webhook Lambda.
 An `error!` ALONE does not reach Telegram; only codes with a filter+alarm (or
 paths that also call `NotificationService::notify`) page. The
 Loki→Alertmanager→Telegram path was retired in the CloudWatch-only migration
@@ -68,16 +72,26 @@ flapper invisible) is the proof.
   `tv_order_update_reconnections_total` (order_update_connection.rs:86/:254) is
   NOT in the 21-name EMF allowlist (ratcheted pin preserved) — extracted via a
   log metric filter on `/tickvault/prod/metrics` (the tv_boot_completed
-  fallback precedent, host dimension from `$.host`) + a `DIFF(recon_cum)` metric-math
-  alarm (>5 reconnects / 15 min — round-1 review fix: the counter increments
-  ONCE per flap cycle, so a 5-min window could never exceed 5 for any cycle
-  ≥ 60s; over 900s the documented ~90s incident cadence yields ~10 ≫ 5 while
-  the ≤3-attempt close churn stays ≤3. Honest detection floor: cycles slower
-  than ~180s do not page — stated residual). Market-hours-gated via a one-line
+  fallback precedent, host dimension from `$.host`) + a plain
+  `Sum > 5 / 900s` alarm (round-2 review fix: the CW agent's prometheus
+  pipeline ships COUNTER samples as PER-SCRAPE DELTAS — the AWS-documented
+  agent behavior and the model every Sum-based sibling counter alarm in
+  app-alarms.tf assumes — so Sum over the window IS the reconnect count in
+  the window; the earlier `DIFF(Maximum(cumulative))` math was dead on
+  arrival under delta shipping. Window is 900s per the round-1 fix: the
+  counter increments ONCE per flap cycle, so a 5-min window could never
+  exceed 5 for any cycle ≥ 60s; over 900s the documented ~90s incident
+  cadence yields ~10 ≫ 5 while the ≤3-attempt close churn stays ≤3. Honest
+  detection floor: cycles slower than ~180s do not page — stated residual.
+  Honest residual: the delta shape is not live-verified from the sandbox —
+  the post-apply runbook checks one /metrics event; if it proved cumulative,
+  Sum overcounts and pages too EAGERLY, never silently misses).
+  Market-hours-gated via a one-line
   `ALARM_NAMES` append in market-hours-liveness-alarm.tf (the aggregator_no_seals
   precedent): 15:30-close churn (≤3 attempts before dormant sleep) stays silent,
   and the gate's open-time set_alarm_state(OK) immunizes against latched state.
-  Counter reset on restart → one negative DIFF datapoint → cannot false-page.
+  Counter reset on restart → absorbed by the agent's delta calculation (first
+  post-restart sample dropped) → cannot false-page.
 - **P4 readiness pager** (`market-open-readiness-lambda.tf` + handler): a
   STATE-check Lambda at 08:45 IST (cron(15 3 ? * MON-FRI *)) evaluating raw
   reality (EC2 state + `tv_boot_completed` presence in the last 10 min) and
@@ -100,9 +114,21 @@ flapper invisible) is the proof.
 
 ## Edge Cases
 
-- Counter reset on app restart → negative `DIFF()` datapoint → below threshold,
-  no false page; a storm masked by a mid-window restart is missed for ONE
-  15-min window only (restarts are owned by the liveness alarms).
+- Counter reset on app restart → absorbed by the CW agent's per-scrape delta
+  calculation (the first post-restart sample is dropped) — no negative or
+  latched artifact; already-shipped in-window deltas still count, so a storm
+  loses at most ONE increment to a mid-window restart (restarts themselves
+  are owned by the liveness alarms; round-2 review fix — the earlier
+  "negative DIFF datapoint" wording described the retired cumulative model).
+- First evening after merge: the CW agent's new machine/ collect entries have
+  no saved state and default to `from_beginning=true`, so the newest matching
+  files backfill FROM BYTE 0 stamped with INGESTION time (no
+  timestamp_format) — up to a few one-time errcode ALARM pages can replay
+  today's already-known errors (e.g. the 12:00 REST-CANARY-01 lines) as if
+  current. Bounded: one newest file per stream, one time per path move.
+  Treat pages arriving within ~10 min of the agent-config deploy as backfill
+  (round-2 review fix; a timestamp_format for the errors-jsonl entry is a
+  flagged follow-up, not this PR).
 - Order-update flap SLOWER than ~1 cycle per 3 min (≤5 once-per-cycle
   increments per 900s window) never breaches `>5` → stated residual; the
   durable-down alarm owns full outages, nothing owns the 3-min+ slow-flap
@@ -160,8 +186,14 @@ flapper invisible) is the proof.
   (08:50-09:10) is the backstop pager.
 - An UNLOGGED DH-906 reject is invisible → flagged Rust emit-site follow-up;
   dormant while dry_run=true (no live orders).
-- A future sink-path move re-blinding the filters → the new
-  `test_cw_agent_collects_machine_log_paths` ratchet fails the build.
+- A future sink-path move re-blinding the filters → the
+  `test_cw_agent_collects_machine_log_paths` ratchet fails the build for
+  BOTH vectors (round-2 review fix): it derives the expected globs from the
+  Rust sink constants (`observability.rs::ERRORS_JSONL_DIR` /
+  `MACHINE_LOGS_DIR`) and asserts both agent configs carry them — a
+  code-side sink move (the exact 2026-07-05 vector) now fails the build
+  until the agent configs move in lockstep, not just a config-side glob
+  regression.
 
 ## Test Plan
 
@@ -178,12 +210,24 @@ flapper invisible) is the proof.
   inert per main.tf:356/383-392).
 - `bash .claude/hooks/banned-pattern-scanner.sh` + `bash .claude/hooks/plan-verify.sh`.
 - Post-apply (PR-body runbook): `describe-log-streams` freshness check on
-  `/tickvault/prod/app`, `set-alarm-state` fire drill on
-  tv-prod-errcode-rest-canary-01, and the SNS end-to-end drill
+  `/tickvault/prod/app` (expect up to a few one-time backfill errcode pages
+  within ~10 min of the agent-config deploy — from_beginning replay of
+  today's already-logged errors, see Edge Cases; wait for those to settle
+  BEFORE the fire drill), `set-alarm-state` fire drill on
+  tv-prod-errcode-rest-canary-01, the SNS end-to-end drill
   `aws lambda invoke --function-name tv-prod-market-open-readiness
-  --payload '{"mode":"drill"}' /dev/stdout` → expect the 🧪 test page on
-  Telegram (round-1 review fix: the previously-specced evening stopped-box
-  invoke classifies HOLIDAY_SILENT and can never prove the SNS leg).
+  --cli-binary-format raw-in-base64-out --payload '{"mode":"drill"}'
+  /dev/stdout` → expect the [DRILL] test page on Telegram (round-1 review
+  fix: the previously-specced evening stopped-box invoke classifies
+  HOLIDAY_SILENT and can never prove the SNS leg; round-2:
+  `--cli-binary-format raw-in-base64-out` is required on AWS CLI v2 or the
+  JSON payload errors as invalid base64), and the counter-shape check for
+  the storm alarm: filter one `/tickvault/prod/metrics` event for
+  `tv_order_update_reconnections_total` across two scrapes — the value must
+  behave as a per-scrape DELTA (0/small per scrape), NOT a growing
+  cumulative; if cumulative, rework the storm alarm to `DIFF(Maximum)`
+  (round-2 review fix — the Sum model is AWS-documented + sibling-alarm
+  consistent but not live-verified from the sandbox).
 
 ## Rollback
 
@@ -211,9 +255,11 @@ flapper invisible) is the proof.
 - The readiness Lambda logs its verdict on every run (silent-healthy mornings
   are visible in its log group); its AWS/Lambda Errors alarm watches the
   watchman.
-- Ratchet: `test_cw_agent_collects_machine_log_paths` pins the shipping paths
-  in both agent configs so the next sink move fails the build instead of
-  silently re-blinding every filter.
+- Ratchet: `test_cw_agent_collects_machine_log_paths` derives the shipping
+  globs from the Rust sink constants (observability.rs) and asserts both
+  agent configs carry them — the next sink move (code-side OR config-side)
+  fails the build instead of silently re-blinding every filter (round-2
+  review fix: literal-only pinning missed the code-side vector).
 - Alarm-count honesty: 33 → 43 (verified real count across 11 .tf files;
   the rule-file "10 free tier" claims were already stale pre-PR). Realistic
   cost delta ≈ +$1.2-1.5/mo (~₹105-130 incl 18% GST), inside the $35 pre-GST
@@ -233,7 +279,7 @@ table); the honest-100% envelope wording is in the header block above.
 - [x] P1 log-shipping fix — Files: deploy/aws/cloudwatch-agent.json, deploy/aws/terraform/user-data.sh.tftpl, .github/workflows/deploy-aws.yml, crates/common/tests/cloudwatch_app_alarms_wiring.rs — Tests: test_cw_agent_collects_machine_log_paths
 - [x] P2 error-code filters+alarms — Files: deploy/aws/terraform/error-code-alarms.tf — Tests: terraform validate + post-apply fire drill
 - [x] P3 reconnect-storm — Files: deploy/aws/terraform/order-update-reconnect-storm-alarm.tf, deploy/aws/terraform/market-hours-liveness-alarm.tf — Tests: terraform validate
-- [x] P4 readiness pager — Files: deploy/aws/terraform/market-open-readiness-lambda.tf, deploy/aws/lambda/market-open-readiness/handler.py, deploy/aws/lambda/market-open-readiness/test_handler.py — Tests: test_running_and_booted_is_ready_silent, test_running_without_boot_metric_pages_not_booted, test_stopped_with_stale_launch_pages_not_running, test_stopped_after_holiday_gate_self_stop_is_silent, test_stopping_after_holiday_gate_self_stop_is_silent, test_stopped_with_early_launch_pages_not_running, test_pending_pages_not_running, test_probe_error_pages_verify_failed, test_subjects_are_emoji_first_and_within_sns_limit, test_holiday_cutoff_boundary_0825_ist, test_sns_publish_failure_propagates, test_handler_drill_mode_force_publishes_test_page, test_drill_verdict_never_returned_by_classifier
+- [x] P4 readiness pager — Files: deploy/aws/terraform/market-open-readiness-lambda.tf, deploy/aws/lambda/market-open-readiness/handler.py, deploy/aws/lambda/market-open-readiness/test_handler.py — Tests: test_running_and_booted_is_ready_silent, test_running_without_boot_metric_pages_not_booted, test_stopped_with_stale_launch_pages_not_running, test_stopped_after_holiday_gate_self_stop_is_silent, test_stopping_after_holiday_gate_self_stop_is_silent, test_stopped_with_early_launch_pages_not_running, test_pending_pages_not_running, test_probe_error_pages_verify_failed, test_subjects_are_ascii_and_within_sns_limit, test_holiday_cutoff_boundary_0825_ist, test_sns_publish_failure_propagates, test_handler_drill_mode_force_publishes_test_page, test_drill_verdict_never_returned_by_classifier
 - [x] P5 runbook truth-sync — Files: .claude/rules/project/dhan-rest-canary-error-codes.md, .claude/rules/project/observability-architecture.md, .claude/rules/project/wave-4-error-codes.md, .claude/rules/project/ws-reinject-error-codes.md, .claude/rules/project/dual-instance-lock-2026-07-04.md, .claude/rules/project/feed-stall-watchdog-error-codes.md, .claude/rules/project/wave-2-error-codes.md, CLAUDE.md — Tests: n/a (docs)
 
 ## Scenarios
@@ -242,12 +288,12 @@ table); the honest-100% envelope wording is in the header block above.
 |---|----------|----------|
 | 1 | 12:00 IST REST canary probe fails (2026-07-06 leg 1) | errcode filter → alarm ALARM within ~5 min → SNS → Telegram 🆘; NO OK page for this alarm (the auto-OK ~15 min later means the episode aged out, NOT recovery — next probe / DH-901 alarm is the recovery signal) |
 | 2 | Box launches 94 min late / app hung at 08:45 (leg 2) | readiness Lambda pages NOT_RUNNING / NOT_BOOTED regardless of latched alarm state |
-| 3 | Order-update WS flaps every ~90s in market hours (leg 3) | DIFF()>5/15min storm alarm pages (~10 once-per-cycle increments per 900s window; gated 09:20-15:35 IST) |
+| 3 | Order-update WS flaps every ~90s in market hours (leg 3) | Sum>5/15min storm alarm pages (~10 once-per-cycle delta increments per 900s window — the agent ships per-scrape counter deltas; gated 09:20-15:35 IST) |
 | 4 | Healthy trading morning | readiness Lambda runs silent; verdict logged; zero pages |
 | 5 | NSE holiday (gate self-stops box at ~08:32) | HOLIDAY_SILENT — no page |
 | 6 | AWS API lookup fails at 08:45 | VERIFY_FAILED_PAGE ⚠️ (fail-toward-paging) |
 | 7 | DH-901 repeats every 15 min | 1 🆘 page + 1 🟢 OK per episode (eval 3/dta 1) |
-| 8 | Future session moves the log sinks again | test_cw_agent_collects_machine_log_paths fails the build |
+| 8 | Future session moves the log sinks again (code-side const move OR config-side glob edit) | test_cw_agent_collects_machine_log_paths fails the build — it derives the expected globs from the observability.rs sink constants and checks both agent configs (round-2 cross-coupling) |
 | 9 | Operator invokes the readiness Lambda with `{"mode":"drill"}` (any time, any EC2 state) | 🧪 test page through the real SNS→Telegram path — the end-to-end proof for leg 2 |
 | 10 | Budget breach_stop / killswitch / portal stop lands 08:25-08:45 IST | readiness classifies HOLIDAY_SILENT, but the stopping path itself already paged (breach_stop/killswitch publish before stopping); boot-heartbeat gate window is the backstop |
 | 11 | Order-update WS flaps slower than ~1 cycle / 3 min | NOT paged — stated residual (detection floor >5 per 15 min); durable-down alarm owns full outages |

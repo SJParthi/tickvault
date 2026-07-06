@@ -37,7 +37,8 @@ structured ERROR event in the last hour.
 
 **The canonical routing:** `error!` → errors.jsonl (`data/logs/machine/`) →
 CloudWatch Logs `/tickvault/prod/app` (CW agent) → log metric filter →
-`tv_errcode_*` metric → CloudWatch alarm (≤5 min) → SNS `tv-prod-alerts` →
+`tv_errcode_*` metric → CloudWatch alarm (≤5 min for the 300s-period alarms;
+the FEED-STALL storm window is 15 min) → SNS `tv-prod-alerts` →
 Telegram webhook Lambda. An `error!` ALONE does not reach Telegram; only codes
 with a filter+alarm (or paths that also call `NotificationService::notify`)
 page. The Loki→Alertmanager→Telegram path was retired in the CloudWatch-only

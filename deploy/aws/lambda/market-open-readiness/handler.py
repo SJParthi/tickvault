@@ -106,11 +106,18 @@ def classify_readiness(
     return NOT_RUNNING_PAGE  # stopped-old / pending / shutting-down / unknown / not-found
 
 
-# 10 Telegram commandments: plain English, emoji first, IST 12h, numbered
-# action verbs, no file paths / library names.
+# 10 Telegram commandments: plain English, IST 12h, numbered action verbs,
+# no file paths / library names. Severity emoji leads the MESSAGE body;
+# the SNS Subject is ASCII-only (round-2 review fix 2026-07-06): the SNS
+# Publish API requires Subject to be ASCII text beginning with a letter,
+# number, or punctuation mark - a non-ASCII (emoji-first) Subject is
+# rejected with InvalidParameter, which would degrade every readiness page
+# (incl. the drill) to the generic Lambda-Errors watchman page. House
+# precedent: hard-stop-guard / budget-digest / killswitch all use ASCII
+# subjects with emoji only in the body.
 SUBJECTS_AND_MESSAGES = {
     NOT_RUNNING_PAGE: (
-        "🆘 8:45 AM: trading computer is NOT running",
+        "SOS 8:45 AM: trading computer is NOT running",
         "🆘 At 8:45 AM the trading computer is not running. Market opens 9:15 AM.\n"
         "What you need to do RIGHT NOW:\n"
         "1. The 8:45 AM watchdog may be starting it - watch for its 'started' message by 8:55 AM.\n"
@@ -118,7 +125,7 @@ SUBJECTS_AND_MESSAGES = {
         "3. After it starts, watch for the 'tickvault started' message within 5 minutes.",
     ),
     NOT_BOOTED_PAGE: (
-        "🆘 8:45 AM: app NOT ready - market opens 9:15 AM",
+        "SOS 8:45 AM: app NOT ready - market opens 9:15 AM",
         "🆘 The trading computer is ON but the app has NOT reported a finished boot in the last 10 minutes. Market opens 9:15 AM.\n"
         "What you need to do RIGHT NOW:\n"
         "1. Open the portal and check the app status.\n"
@@ -126,12 +133,12 @@ SUBJECTS_AND_MESSAGES = {
         "3. Still stuck at 9:05 AM: treat today as a no-trade morning until it is fixed.",
     ),
     VERIFY_FAILED_PAGE: (
-        "⚠️ 8:45 AM readiness check could not verify the app",
+        "WARNING 8:45 AM: readiness check could not verify the app",
         "⚠️ I could not confirm whether the trading app is ready for the 9:15 AM open (an AWS lookup failed). "
         "Treat this as NOT READY until proven otherwise: open the portal now - if the app shows healthy, ignore this.",
     ),
     DRILL_PAGE: (
-        "🧪 readiness pager drill - this is only a test",
+        "[DRILL] readiness pager test - this is only a test",
         "🧪 Manual test of the 8:45 AM readiness pager. Nothing is wrong - no action needed. "
         "Seeing this message proves the whole page route (checker to alert system to Telegram) works end-to-end.",
     ),

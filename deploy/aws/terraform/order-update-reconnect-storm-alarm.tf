@@ -8,17 +8,38 @@
 # shows a whole minute of Minimum=0, so the durable-down alarm stays OK while
 # fill confirmations arrive late or duplicated all session.
 #
-# TUNING (round-1 review fix, 2026-07-06): the counter increments exactly ONCE
-# per disconnect/reconnect cycle (order_update_connection.rs:254 — the bottom
-# of the reconnect loop). So a 5-min DIFF window at threshold >5 could NEVER
-# see the documented incident shape: a ~90s cycle yields only 300/90 ≈ 3-4
-# increments per 5 min, and even a 60s cycle yields exactly 5 (not > 5). The
-# window is therefore 900s: a 90s cycle yields ~10 per 15 min (≫ 5) and a 60s
-# cycle ~15, while the routine 15:30-close churn (≤3 attempts before the
-# WS-GAP-04 dormant sleep) stays ≤3 per 15 min, below threshold. Honest
-# detection floor: flap cycles slower than ~180s (≤5 reconnects/15 min) do NOT
-# page — that slow-flap band is a stated residual (the durable-down alarm owns
-# full outages; nothing owns 3-min+ cycles today).
+# COUNTER SHAPE (round-2 review fix, 2026-07-06): the CloudWatch agent's
+# prometheus pipeline converts COUNTER-type samples to PER-SCRAPE DELTAS
+# (dropping each counter's first sample) before emitting the log/EMF event —
+# the AWS-documented agent behavior, and the model every sibling counter
+# alarm in app-alarms.tf already assumes (spill_dropped / dlq_ticks /
+# ticks_dropped / orders_rejected / disk_watcher_respawn all alarm
+# `Sum > 0 per 5m` — under cumulative shipping they would latch permanently
+# after the first increment, contradicting their documented in-window-rate
+# semantics and the aggregator_no_seals post-close-idle fire history). An
+# earlier draft alarmed on DIFF(Maximum(cumulative)) — dead on arrival under
+# delta shipping (DIFF of a 0/1-per-scrape series hovers at 0/±1, never >5).
+# So: plain `Sum` over the window = reconnect increments in that window.
+# HONEST RESIDUAL: the delta shape is NOT live-verified from this sandbox
+# (no AWS creds); the post-apply runbook verifies one /tickvault/prod/metrics
+# event. If the field ever proved CUMULATIVE, Sum would OVERCOUNT and page
+# too eagerly inside the gate window (fail-loud, never a silent miss) and
+# this alarm must be reworked to DIFF(Maximum).
+#
+# TUNING: the counter increments exactly ONCE per disconnect/reconnect cycle
+# (order_update_connection.rs:254 — the bottom of the reconnect loop). A
+# 5-min Sum at threshold >5 could NEVER see the documented incident shape:
+# a ~90s cycle yields only 300/90 ≈ 3-4 increments per 5 min, and even a 60s
+# cycle yields exactly 5 (not > 5). The window is therefore 900s: a 90s cycle
+# yields ~10 per 15 min (≫ 5) and a 60s cycle ~15, while the routine
+# 15:30-close churn (≤3 attempts before the WS-GAP-04 dormant sleep) stays
+# ≤3 per 15 min, below threshold. Honest detection floor: flap cycles slower
+# than ~180s (≤5 reconnects/15 min) do NOT page — that slow-flap band is a
+# stated residual (the durable-down alarm owns full outages; nothing owns
+# 3-min+ cycles today). Counter reset on app restart is absorbed by the
+# agent's delta calculation (first post-restart sample dropped — at most one
+# increment lost, never a latched or negative artifact; restarts themselves
+# are owned by the liveness alarms).
 #
 # ROUTE DECISION (verified 2026-07-06): the counter
 # `tv_order_update_reconnections_total` (order_update_connection.rs:86,
@@ -53,11 +74,20 @@ resource "aws_cloudwatch_log_metric_filter" "order_update_reconnections_fallback
 
 resource "aws_cloudwatch_metric_alarm" "order_update_reconnect_storm" {
   alarm_name          = "tv-${var.environment}-order-update-reconnect-storm"
-  alarm_description   = "Order-update WebSocket is FLAPPING: more than 5 reconnect attempts in 15 minutes during market hours (catches flap cycles faster than ~3 min, incl. the ~90s 2026-07-06 incident cadence; the counter increments once per cycle). The durable-down alarm (order-update-ws-inactive, Minimum<1 over 2x60s) cannot see a socket that reconnects within each minute (2026-07-06 incident class). Fill confirmations may arrive late or duplicated. Check the errors stream for order-update disconnect reasons; cross-check Dhan status + tv_token_remaining_seconds. Runbook: .claude/rules/project/wave-2-error-codes.md (WS-GAP family) + docs/dhan-ref/10-live-order-update-websocket.md"
+  alarm_description   = "Order-update WebSocket is FLAPPING: more than 5 reconnect attempts in 15 minutes during market hours (Sum of the agent's per-scrape counter deltas; catches flap cycles faster than ~3 min, incl. the ~90s 2026-07-06 incident cadence — the counter increments once per cycle). The durable-down alarm (order-update-ws-inactive, Minimum<1 over 2x60s) cannot see a socket that reconnects within each minute (2026-07-06 incident class). Fill confirmations may arrive late or duplicated. Check the errors stream for order-update disconnect reasons; cross-check Dhan status + tv_token_remaining_seconds. Runbook: .claude/rules/project/wave-2-error-codes.md (WS-GAP family) + docs/dhan-ref/10-live-order-update-websocket.md"
   comparison_operator = "GreaterThanThreshold"
   threshold           = 5
   evaluation_periods  = 1
-  treat_missing_data  = "notBreaching"
+  metric_name         = "tv_order_update_reconnections_total"
+  namespace           = local.app_namespace
+  # 900s window (NOT 300s): the counter increments once per flap cycle, so a
+  # 5-min window mathematically cannot exceed 5 for any cycle >= 60s — see
+  # the TUNING header block. Sum over the window = reconnects in the window
+  # (the agent ships per-scrape counter deltas — see COUNTER SHAPE header).
+  period             = 900
+  statistic          = "Sum"
+  dimensions         = local.app_dimensions # { host = "tickvault-prod" }
+  treat_missing_data = "notBreaching"
   # Actions OFF by default; the market-hours gate Lambda
   # (market-hours-liveness-alarm.tf ALARM_NAMES) flips them ON 09:20-15:35 IST
   # Mon-Fri. Rationale: 15:30-close churn is routine (<=3 attempts before the
@@ -69,30 +99,4 @@ resource "aws_cloudwatch_metric_alarm" "order_update_reconnect_storm" {
   actions_enabled = false
   alarm_actions   = local.app_alarm_actions
   ok_actions      = local.app_alarm_ok
-
-  metric_query {
-    id = "recon_cum"
-    metric {
-      metric_name = "tv_order_update_reconnections_total"
-      namespace   = local.app_namespace
-      # 900s window (NOT 300s): the counter increments once per flap cycle, so
-      # a 5-min window mathematically cannot exceed 5 for any cycle >= 60s —
-      # see the TUNING header block.
-      period     = 900
-      stat       = "Maximum"
-      dimensions = local.app_dimensions # { host = "tickvault-prod" }
-    }
-    return_data = false
-  }
-  metric_query {
-    id = "recon_15m_increase"
-    # Per-15-min increment of the cumulative counter (simpler than RATE*PERIOD,
-    # same semantics). Counter reset on app restart -> ONE negative datapoint
-    # -> below threshold -> cannot false-page; a storm masked by a mid-window
-    # restart is missed for one 15-min window only (the restart itself is owned
-    # by the liveness alarms).
-    expression  = "DIFF(recon_cum)"
-    label       = "order-update reconnects per 15 min"
-    return_data = true
-  }
 }

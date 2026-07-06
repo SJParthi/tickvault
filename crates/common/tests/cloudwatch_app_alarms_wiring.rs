@@ -336,29 +336,74 @@ fn test_emf_metric_namespace_is_tickvault_prod_in_both_configs() {
     }
 }
 
+/// Extract the string literal assigned to `pub const <name>: &str = "...";`
+/// in `crates/app/src/observability.rs`. If the RHS is another constant
+/// (e.g. `ERRORS_JSONL_DIR: &str = MACHINE_LOGS_DIR;`), resolve it one hop.
+/// Panics (fail-closed) if the declaration cannot be found — a rename must
+/// update THIS ratchet in the same PR as the agent configs.
+fn observability_dir_const(name: &str) -> String {
+    let src = read("crates/app/src/observability.rs");
+    let needle = format!("pub const {name}: &str =");
+    let line = src
+        .lines()
+        .find(|l| l.trim_start().starts_with(&needle))
+        .unwrap_or_else(|| {
+            panic!(
+                "Z+ L2 VERIFY ratchet: crates/app/src/observability.rs no longer \
+                 declares `{needle} ...` — the CW-agent log-shipping globs are \
+                 coupled to this constant; update this test + BOTH agent configs \
+                 in the same PR."
+            ) // APPROVED: test
+        });
+    let rhs = line[line.find('=').expect("has =") + 1..] // APPROVED: test
+        .trim()
+        .trim_end_matches(';')
+        .trim();
+    if let Some(stripped) = rhs.strip_prefix('"') {
+        return stripped
+            .split('"')
+            .next()
+            .expect("quoted literal") // APPROVED: test
+            .to_string();
+    }
+    // One-hop alias (ERRORS_JSONL_DIR = MACHINE_LOGS_DIR today).
+    observability_dir_const(rhs)
+}
+
 #[test]
 fn test_cw_agent_collects_machine_log_paths() {
     // 2026-07-06: the 2026-07-05 machine/ move silently killed BOTH app log
     // streams (old globs don't descend into machine/) — every log metric
-    // filter on /tickvault/prod/app was DOA. Pin the machine paths in both
-    // agent configs so a future sink move fails the build instead.
+    // filter on /tickvault/prod/app was DOA. Round-2 review fix: the globs
+    // are now CROSS-COUPLED to the Rust sink constants in observability.rs
+    // (not just pinned as literals), so BOTH a config-side glob regression
+    // AND a code-side sink move (the exact 2026-07-05 vector — Rust moved,
+    // configs untouched) fail this build until the two move in lockstep.
+    let errors_dir = observability_dir_const("ERRORS_JSONL_DIR");
+    let app_dir = observability_dir_const("MACHINE_LOGS_DIR");
+    let errors_glob = format!("/opt/tickvault/{errors_dir}/errors.jsonl.*");
+    let app_glob = format!("/opt/tickvault/{app_dir}/app.*");
     for rel in [
         "deploy/aws/terraform/user-data.sh.tftpl",
         "deploy/aws/cloudwatch-agent.json",
     ] {
         let body = read(rel);
         assert!(
-            body.contains("/opt/tickvault/data/logs/machine/errors.jsonl.*"),
-            "Z+ L2 VERIFY ratchet: {rel} must tail the machine/ ERROR JSONL glob \
-             (/opt/tickvault/data/logs/machine/errors.jsonl.* — dotted, so the bare \
-             errors.jsonl compat symlink is excluded). Without it every error-code \
-             log metric filter on /tickvault/prod/app is DOA."
+            body.contains(&errors_glob),
+            "Z+ L2 VERIFY ratchet: {rel} must tail the ERROR JSONL glob \
+             {errors_glob} (derived from observability.rs::ERRORS_JSONL_DIR; \
+             dotted, so the bare errors.jsonl compat symlink is excluded). \
+             Without it every error-code log metric filter on \
+             /tickvault/prod/app is DOA. If the Rust sink dir moved, move the \
+             agent-config globs in the SAME PR."
         );
         assert!(
-            body.contains("/opt/tickvault/data/logs/machine/app.*"),
-            "Z+ L2 VERIFY ratchet: {rel} must tail the machine/ hourly app-log glob \
-             (/opt/tickvault/data/logs/machine/app.*). The 2026-07-05 machine/ move \
-             took the hourly app log too (crates/app/src/main.rs init_app_log_appender)."
+            body.contains(&app_glob),
+            "Z+ L2 VERIFY ratchet: {rel} must tail the hourly app-log glob \
+             {app_glob} (derived from observability.rs::MACHINE_LOGS_DIR). The \
+             2026-07-05 machine/ move took the hourly app log too \
+             (crates/app/src/main.rs init_app_log_appender). If the Rust sink \
+             dir moved, move the agent-config globs in the SAME PR."
         );
     }
 }
