@@ -220,7 +220,7 @@ resource "aws_cloudwatch_event_rule" "tv_market_hours_liveness_open" {
   # so terraform re-enables this rule. The Jul 4 pause set state = "DISABLED";
   # the #1404 revert REMOVED the attribute, and with `state` absent the AWS
   # provider stops managing rule state - the rule stayed DISABLED on AWS.
-  state               = "ENABLED"
+  state = "ENABLED"
 }
 
 # Close the window at 15:35 IST (10:05 UTC) Mon-Fri — 5 min after the 15:30 IST
