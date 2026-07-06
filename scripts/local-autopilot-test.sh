@@ -50,6 +50,28 @@ t "scale window end"     "scale"   "$(classify_day 2026-07-08 3 "$TMP/holidays.t
 t "after window normal"  "normal"  "$(classify_day 2026-07-09 4 "$TMP/holidays.toml" 2026-07-06 2026-07-08)"
 t "missing holidays file → not holiday" "normal" "$(classify_day 2026-07-09 4 "$TMP/nope.toml" 2026-07-06 2026-07-08)"
 
+# ── operator lock 2026-07-06: scale-day window defaults are EMPTY ───────────
+# No scale day can EVER be classified unless the operator explicitly exports
+# SCALE_WINDOW_START/END or writes data/local-autopilot/scale-window.conf.
+t "default SCALE_WINDOW_START is empty" "" "$SCALE_WINDOW_START"
+t "default SCALE_WINDOW_END is empty"   "" "$SCALE_WINDOW_END"
+t "2026-07-07 with default (empty) window is normal" "normal" \
+  "$(classify_day 2026-07-07 2 "$TMP/nope.toml" "$SCALE_WINDOW_START" "$SCALE_WINDOW_END")"
+t "old window start 2026-07-06 with defaults is normal" "normal" \
+  "$(classify_day 2026-07-06 1 "$TMP/nope.toml" "$SCALE_WINDOW_START" "$SCALE_WINDOW_END")"
+t "old window end 2026-07-08 with defaults is normal" "normal" \
+  "$(classify_day 2026-07-08 3 "$TMP/nope.toml" "$SCALE_WINDOW_START" "$SCALE_WINDOW_END")"
+t "arbitrary far-future date with defaults is normal" "normal" \
+  "$(classify_day 2099-01-04 1 "$TMP/nope.toml" "$SCALE_WINDOW_START" "$SCALE_WINDOW_END")"
+t "in_scale_window empty window never matches" "1" \
+  "$(in_scale_window 2026-07-07 "" "" && echo 0 || echo 1)"
+t "in_scale_window empty start never matches (fail-closed)" "1" \
+  "$(in_scale_window 2026-07-07 "" 2026-07-08 && echo 0 || echo 1)"
+t "in_scale_window empty end never matches (fail-closed)" "1" \
+  "$(in_scale_window 2026-07-07 2026-07-06 "" && echo 0 || echo 1)"
+t "explicit operator-armed window still classifies scale" "scale" \
+  "$(classify_day 2026-07-07 2 "$TMP/nope.toml" 2026-07-06 2026-07-08)"
+
 # ── probe verdict parse (QuestDB /exec JSON shapes) ─────────────────────────
 t "verdict present" "probe_multi_conn_ok" \
   "$(echo '{"query":"...","columns":[{"name":"reason"}],"dataset":[["probe_multi_conn_ok"]],"count":1}' | parse_probe_verdict)"

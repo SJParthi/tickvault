@@ -36,8 +36,12 @@ AUTOPILOT_DIR="${AUTOPILOT_DIR:-data/local-autopilot}" # runtime STATE (pids, ma
 # the operator always opens — a symlink kept pointed at today's file.
 ONE_FILE_LINK="${ONE_FILE_LINK:-data/logs/tickvault.log}"
 MANUAL_STOP_MARKER="${MANUAL_STOP_MARKER:-data/local-manual-stop.marker}"
-SCALE_WINDOW_START="${SCALE_WINDOW_START:-2026-07-06}"
-SCALE_WINDOW_END="${SCALE_WINDOW_END:-2026-07-08}"
+# Operator lock 2026-07-06 (Groww scale experiments SUSPENDED — single Dhan
+# + single Groww only): the scale-day window defaults are EMPTY. classify_day
+# can never classify a scale day unless the operator explicitly exports
+# SCALE_WINDOW_START/END or writes data/local-autopilot/scale-window.conf.
+SCALE_WINDOW_START="${SCALE_WINDOW_START:-}"
+SCALE_WINDOW_END="${SCALE_WINDOW_END:-}"
 MIN_DISK_FREE_GB="${MIN_DISK_FREE_GB:-50}"
 PROBE_POLL_START_IST="${PROBE_POLL_START_IST:-09:45}"
 PROBE_TIMEOUT_MIN="${PROBE_TIMEOUT_MIN:-20}"
@@ -169,6 +173,11 @@ is_nse_holiday() {
 # scale-window.conf ("START END") overrides the env dates (read by caller).
 in_scale_window() {
   local d="$1" s="$2" e="$3"
+  # Operator lock 2026-07-06: an empty/half-set window is NO window — never
+  # a scale day. (Lexical compare already rejects both-empty because
+  # d < "" is false, but an empty START with a non-empty END would match
+  # every date up to END; guard both bounds explicitly, fail-closed.)
+  [ -n "$s" ] && [ -n "$e" ] || return 1
   [[ "$d" > "$s" || "$d" == "$s" ]] && [[ "$d" < "$e" || "$d" == "$e" ]]
 }
 
