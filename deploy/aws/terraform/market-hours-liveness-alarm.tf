@@ -216,6 +216,11 @@ resource "aws_cloudwatch_event_rule" "tv_market_hours_liveness_open" {
   name                = "tv-${var.environment}-market-hours-liveness-open"
   description         = "Enable market-hours liveness alarm actions at 09:20 IST (Mon-Fri)"
   schedule_expression = "cron(50 3 ? * MON-FRI *)"
+  # RESUME 2026-07-06 per operator GO (moved up from Thu Jul 9): explicit state
+  # so terraform re-enables this rule. The Jul 4 pause set state = "DISABLED";
+  # the #1404 revert REMOVED the attribute, and with `state` absent the AWS
+  # provider stops managing rule state - the rule stayed DISABLED on AWS.
+  state = "ENABLED"
 }
 
 # Close the window at 15:35 IST (10:05 UTC) Mon-Fri — 5 min after the 15:30 IST

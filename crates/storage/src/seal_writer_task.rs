@@ -186,6 +186,20 @@ pub fn drain_once(
             for seal in popped {
                 rescue_one(pipeline, &mut outcome, seal, now_unix_secs);
             }
+            // Poison-buffer recovery (2026-07-06 hostile-review fix): the
+            // popped seals are now durably parked in spill/DLQ (or counted as
+            // Dropped — AGGREGATOR-DROP-01 fires at the loop), so the writer's
+            // retained ILP buffer is redundant AND toxic:
+            // - a server-REJECTED (non-connection) row would otherwise replay
+            //   on EVERY later flush, permanently killing candle persistence
+            //   for the session, and
+            // - during a sustained connection outage the buffer would grow
+            //   without bound (each cycle appends more already-rescued rows)
+            //   until the questdb-rs 100 MiB max_buf_size wedges every flush
+            //   with a pre-transport error — forever, even after recovery.
+            // Discard so the next cycle starts clean; DEDUP keys absorb any
+            // partially-committed rows if the failure raced a server commit.
+            writer.discard_pending();
         }
     }
 
@@ -363,6 +377,55 @@ mod tests {
             crate::seal_spill::SealSpillWriter::with_spill_dir_for_test(spill.clone());
         let drained = spill_writer.read_all(now).expect("read");
         assert_eq!(drained.len(), 5);
+        cleanup(&spill, &dlq);
+    }
+
+    #[test]
+    fn test_drain_once_discards_writer_buffer_after_flush_failure_rescue() {
+        // Poison-buffer regression (2026-07-06 hostile-review fix): after a
+        // failed flush drain_once rescues the popped seals to spill/DLQ and
+        // MUST discard the writer's retained ILP buffer. Otherwise (a) a
+        // server-rejected row replays on every later flush — one poisoned row
+        // permanently kills candle persistence — and (b) the buffer grows
+        // without bound during a sustained outage, wedging at the questdb-rs
+        // 100 MiB max_buf_size even after QuestDB recovers.
+        let (spill, dlq) = temp_pair("discard-after-rescue");
+        let mut pipeline =
+            SealAbsorptionPipeline::with_capacity_and_dirs_for_test(8, spill.clone(), dlq.clone());
+        let now = jan1_noon_utc();
+        pipeline.submit(mk_seal(13, 0, TfIndex::M1, 1_716_000_900, 100.0), now);
+        pipeline.submit(mk_seal(25, 0, TfIndex::M1, 1_716_001_500, 200.0), now);
+        let mut writer = ShadowCandleWriter::for_test();
+
+        let outcome = drain_once(&mut pipeline, &mut writer, 16, now);
+        assert_eq!(outcome.ring_seals_popped, 2);
+        assert!(!outcome.flushed_ok);
+        assert_eq!(outcome.rescued_to_spill, 2, "both durably rescued");
+        assert_eq!(
+            writer.pending_count(),
+            0,
+            "writer pending MUST be discarded after rescue (poison-proof)"
+        );
+        assert_eq!(
+            writer.buffer_byte_count(),
+            0,
+            "writer ILP buffer MUST be empty after rescue — no cross-cycle replay/growth"
+        );
+
+        // A SECOND failed cycle must not accumulate the first cycle's bytes:
+        // the buffer is bounded to one drain batch forever.
+        pipeline.submit(mk_seal(51, 0, TfIndex::M1, 1_716_002_100, 300.0), now);
+        let outcome2 = drain_once(&mut pipeline, &mut writer, 16, now);
+        assert_eq!(outcome2.ring_seals_popped, 1);
+        assert_eq!(outcome2.rescued_to_spill, 1);
+        assert_eq!(writer.buffer_byte_count(), 0, "still clean after cycle 2");
+        assert_eq!(writer.pending_count(), 0);
+
+        // All 3 seals are durably in spill — nothing was lost by discarding.
+        let spill_writer =
+            crate::seal_spill::SealSpillWriter::with_spill_dir_for_test(spill.clone());
+        let drained = spill_writer.read_all(now).expect("read");
+        assert_eq!(drained.len(), 3);
         cleanup(&spill, &dlq);
     }
 
