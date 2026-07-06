@@ -200,8 +200,8 @@ connect survives 60s → ONE [LOW] reconnected → latch re-armed, streak 0.
 - Socket dying at 59.9s emits nothing and the latch stays armed (correct —
   not a recovery).
 - Pathological connect→survive-60s→die metronome re-pages at most ~1 HIGH per
-  ~2 min — bounded, and each cycle is a genuine outage+recovery (runbook
-  documents it).
+  ~61s worst case (stability window + 3-failure ladder) — bounded, and each
+  cycle is a genuine outage+recovery (runbook documents it).
 - `/health` order-update connected-flag never flipping false during an in-loop
   outage is a PRE-EXISTING gap — flagged follow-up, NOT fixed here (scope
   lock).

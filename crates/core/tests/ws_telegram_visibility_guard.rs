@@ -42,6 +42,18 @@ fn read(rel: &str) -> String {
     fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
 }
 
+/// Returns the PRODUCTION region of a source file — everything before the
+/// first `#[cfg(test)]` marker.
+///
+/// 2026-07-06 hostile-review medium A: ratchets that pin production call
+/// sites MUST scan this half only. The in-file test module calls the same
+/// pure helpers (`should_page_outage(...)` etc.), so a whole-file substring
+/// count stayed green even after the sole production call site was deleted
+/// — a vacuous ratchet.
+fn production_region(src: &str) -> &str {
+    src.split("#[cfg(test)]").next().unwrap_or(src)
+}
+
 // ---------------------------------------------------------------------------
 // (1) Every event variant exists in events.rs
 // ---------------------------------------------------------------------------
@@ -155,19 +167,43 @@ fn order_update_connection_fires_reconnect_notify() {
 #[test]
 fn order_update_high_page_is_emitted_inside_reconnect_loop() {
     let src = read("crates/core/src/websocket/order_update_connection.rs");
+    // 2026-07-06 hostile-review medium A: every pin below is scoped to the
+    // PRODUCTION region — the old whole-file `matches(...).count() >= 2`
+    // stayed green with the sole production call site deleted, because the
+    // in-file test module calls the same pure fn ~15 times.
+    let prod = production_region(&src);
     assert!(
-        src.contains("NotificationEvent::OrderUpdateDisconnected"),
-        "order_update_connection.rs must emit the [HIGH] \
-         OrderUpdateDisconnected page from INSIDE the reconnect loop — \
-         the main.rs task-exit emit was dead code (2026-07-06 incident)."
+        prod.contains("NotificationEvent::OrderUpdateDisconnected"),
+        "PRODUCTION code (the non-test region of order_update_connection.rs) \
+         must emit the [HIGH] OrderUpdateDisconnected page from INSIDE the \
+         reconnect loop (via emit_in_market_outage_page) — the main.rs \
+         task-exit emit was dead code (2026-07-06 incident)."
+    );
+    assert_eq!(
+        prod.matches("fn should_page_outage(").count(),
+        1,
+        "should_page_outage must be defined exactly once in production code."
+    );
+    let page_decision_calls = prod
+        .matches("should_page_outage(within_hours, consecutive_failures, outage_paged)")
+        .count();
+    assert_eq!(
+        page_decision_calls, 2,
+        "the edge-triggered, market-hours-aware page decision (audit-findings \
+         Rules 3+4) must be evaluated with the REAL loop state \
+         (within_hours, consecutive_failures, outage_paged) at BOTH \
+         production arms — transport-error AND sub-stability clean close. \
+         Got {page_decision_calls} production call sites."
+    );
+    assert_eq!(
+        prod.matches("outage_paged = true;").count(),
+        2,
+        "each production page arm must set the once-per-episode latch \
+         (`outage_paged = true;`) immediately before emitting — removing \
+         either latch reintroduces per-failure page spam (Rule 4)."
     );
     assert!(
-        src.matches("should_page_outage(").count() >= 2,
-        "should_page_outage must be defined AND called (edge-triggered, \
-         market-hours-aware page decision per audit-findings Rules 3+4)."
-    );
-    assert!(
-        src.contains("WsGap10OrderUpdateOutage"),
+        prod.contains("WsGap10OrderUpdateOutage"),
         "the in-loop outage error! must carry code = WS-GAP-10 so the \
          tag-guard + triage chain route it."
     );
@@ -183,26 +219,38 @@ fn order_update_clean_close_counts_as_failure_and_can_page() {
     // mixed regime (<=2 errors then one clean close, repeating) perpetually
     // defeat the threshold.
     let src = read("crates/core/src/websocket/order_update_connection.rs");
+    // 2026-07-06 hostile-review medium A: scope to the production region so
+    // test-module calls can never satisfy these pins vacuously.
+    let prod = production_region(&src);
     assert!(
-        src.contains("fn streak_after_clean_close(prev_streak: u32, stability_reached: bool)"),
+        prod.contains("fn streak_after_clean_close(prev_streak: u32, stability_reached: bool)"),
         "streak_after_clean_close must key on STABILITY SURVIVAL, not the \
          paged latch — a sub-60s clean close is a failure regardless of \
          delivery mode."
     );
-    assert!(
-        src.matches("if should_page_outage(within_hours, consecutive_failures, outage_paged)")
-            .count()
-            >= 2,
-        "the [HIGH] page decision must be evaluated in BOTH reconnect-loop \
-         arms — the transport-error arm AND the sub-stability clean-close \
-         (Ok) arm — else a pure clean-close outage grows the streak but \
-         never pages."
+    assert_eq!(
+        prod.matches("if should_page_outage(within_hours, consecutive_failures, outage_paged)")
+            .count(),
+        2,
+        "the [HIGH] page decision must be evaluated in BOTH production \
+         reconnect-loop arms — the transport-error arm AND the \
+         sub-stability clean-close (Ok) arm — else a pure clean-close \
+         outage grows the streak but never pages."
     );
-    assert!(
-        src.matches("emit_in_market_outage_page(").count() >= 3,
-        "both arms must route through the shared emit_in_market_outage_page \
-         helper (definition + 2 call sites) so the Telegram wording and the \
-         WS-GAP-10 coded error! can never diverge between regimes."
+    let emit_defs = prod.matches("fn emit_in_market_outage_page(").count();
+    assert_eq!(
+        emit_defs, 1,
+        "emit_in_market_outage_page must be defined exactly once in \
+         production code."
+    );
+    let emit_calls = prod.matches("emit_in_market_outage_page(").count() - emit_defs;
+    assert_eq!(
+        emit_calls, 2,
+        "both production arms must route through the shared \
+         emit_in_market_outage_page helper (2 call sites — transport-error \
+         + clean-close) so the Telegram wording and the WS-GAP-10 coded \
+         error! can never diverge between regimes. Got {emit_calls} \
+         production call sites."
     );
 }
 
@@ -234,6 +282,20 @@ fn order_update_reconnected_is_stability_gated_not_connect_edge() {
         "the stability window must stay pinned at 60s — far beyond the \
          observed ~10ms die-after-login window, far below the 14400s \
          activity watchdog."
+    );
+    // 2026-07-06 hostile-review medium B pins:
+    assert!(
+        src.contains(", if !*stability_reached =>"),
+        "the stability select arm must keep the `if !*stability_reached` \
+         re-poll guard — a completed tokio Sleep must never be re-polled \
+         (would panic); the guard is load-bearing."
+    );
+    assert!(
+        src.contains("time::sleep(stability_window())"),
+        "the production stability sleep must be built from the pure \
+         stability_window() source so the paused-time boundary tests \
+         (59s not stable / 60s stable) exercise the exact window \
+         production uses."
     );
 }
 
