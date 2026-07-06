@@ -233,13 +233,32 @@ STALL_POLL_SECS = 1
 # STALL_DEADLINE_SECS exactly as before; each CONSECUTIVE stall episode
 # WITHOUT an intervening real decoded live record (a watermark advance)
 # DOUBLES the wait before the next force-close — 5s → 10s → 20s → 40s →
-# capped at STALL_BACKOFF_CAP_SECS. Any real decoded live record resets the
-# ladder to the 5s base, so a healthy feed keeps today's fast detection.
-# Pure math in `compute_stall_backoff_secs` (self-tested + test_dedup.py).
+# capped at STALL_BACKOFF_CAP_SECS. The ladder resets to the fast 5s base
+# ONLY after a DWELL of sustained health (see the hostile-review hardening
+# below), so a healthy feed regains today's fast detection within ~1 minute
+# of genuine recovery. Pure math in `compute_stall_backoff_secs` +
+# `should_reset_stall_backoff` (self-tested + test_dedup.py).
 STALL_BACKOFF_CAP_SECS = 60.0
 # Overflow guard for the ladder exponent: 2**32 already dwarfs any cap, so
 # clamping the exponent keeps the float math exact without changing behavior.
 STALL_BACKOFF_MAX_EXPONENT = 32
+# Hostile-review hardening (2026-07-06, exam-fix round 2): the ladder MUST NOT
+# reset on a SINGLE watermark advance. `_note_ts_advance` advances the
+# watermark for EVERY decoded record BEFORE dedup/drop, and a starved/thin
+# shard's dominant flap mode is: force-close → reconnect → re-subscribe
+# snapshot delivers ≥1 record with a fresh exchange ts (indices tick every
+# second) → session starves again. A single-advance reset would zero the
+# ladder every cycle, pinning the force-close cadence at the 5s base — the
+# exact 1,393-fires/hour churn storm this backoff exists to stop. So the
+# reset is DWELL-GATED: the ladder returns to the 5s base only when a
+# watermark advance is observed AND at least
+# STALL_BACKOFF_RESET_DWELL_SECS have passed since the LAST force-close
+# (either criterion). Set equal to the cap: in the flap mode every fire is
+# ≤ cap seconds after the previous advance, so the advance always lands
+# inside the dwell and the ladder holds at the cap (~60 fires/hour/shard
+# worst case); a genuinely recovered feed streams continuously, so its next
+# advance after the dwell expires restores the fast 5s detection.
+STALL_BACKOFF_RESET_DWELL_SECS = 60.0
 # Cold-silent diagnostics rate limit (same exam fix, item 3): once the feed
 # has been persistently silent long enough that the stall ladder would sit at
 # its cap (STILL_SILENT_FAST_WARNS re-warns — the ladder depth 5→10→20→40→60),
@@ -809,6 +828,21 @@ def compute_stall_backoff_secs(
         return base_secs
     exponent = min(consecutive_stalls, STALL_BACKOFF_MAX_EXPONENT)
     return min(base_secs * (2.0**exponent), cap_secs)
+
+
+def should_reset_stall_backoff(secs_since_last_fire, dwell_secs: float) -> bool:
+    """Pure dwell-gated reset decision for the stall force-close backoff
+    ladder (2026-07-06 hostile-review hardening — see the
+    STALL_BACKOFF_RESET_DWELL_SECS comment). Called when a watermark advance
+    is observed. Returns True ONLY when the session has been stall-free for
+    at least `dwell_secs` since the LAST force-close — i.e. the advance is
+    part of sustained recovery, not the single post-reconnect snapshot record
+    that every flap cycle produces. `secs_since_last_fire is None` means no
+    force-close has fired yet this process (nothing to distrust — reset is
+    allowed; the ladder is 0 anyway). O(1), no I/O, never raises."""
+    if secs_since_last_fire is None:
+        return True
+    return secs_since_last_fire >= dwell_secs
 
 
 def still_silent_rewarn_interval_secs(
@@ -2412,14 +2446,19 @@ def _stall_recovery_loop(feed_cell) -> None:
     )
     lag_consecutive = 0
     last_lag_fire_monotonic = None
-    # Consecutive stall episodes (force-closes) WITHOUT an intervening real
-    # decoded live record. Drives the exponential force-close backoff
-    # (compute_stall_backoff_secs, 2026-07-06 exam fix) so a persistently
-    # starved shard cannot churn a fresh Groww NATS session every 5s (1,393
-    # force-closes/hour observed) and pile dead sessions against the
-    # account's concurrent-session slots. A watermark advance = a real
-    # decoded live record → resets the ladder to the 5s base.
+    # Consecutive stall episodes (force-closes). Drives the exponential
+    # force-close backoff (compute_stall_backoff_secs, 2026-07-06 exam fix)
+    # so a persistently starved shard cannot churn a fresh Groww NATS
+    # session every 5s (1,393 force-closes/hour observed) and pile dead
+    # sessions against the account's concurrent-session slots. The ladder
+    # resets to the 5s base ONLY on a DWELL-GATED watermark advance
+    # (should_reset_stall_backoff, hostile-review hardening): a single
+    # post-reconnect snapshot record inside the flap cycle must NOT reset —
+    # otherwise the churn cadence stays pinned at the 5s base forever.
     consecutive_stall_episodes = 0
+    # Monotonic instant of the LAST force-close fired by EITHER criterion
+    # (frozen-watermark or watermark-lag). None until the first fire.
+    last_stall_fire_monotonic = None
     while True:
         time.sleep(STALL_POLL_SECS)
         watermark = MAX_TS_MILLIS_SEEN
@@ -2427,9 +2466,22 @@ def _stall_recovery_loop(feed_cell) -> None:
         if watermark != last_watermark:
             last_watermark = watermark
             last_change_monotonic = time.monotonic()
-            # A real decoded live record arrived — the self-heal worked.
-            # Reset the force-close backoff ladder to the fast 5s base.
-            consecutive_stall_episodes = 0
+            # A real decoded live record arrived. Reset the force-close
+            # backoff ladder to the fast 5s base ONLY after a stall-free
+            # dwell since the last force-close (hostile-review hardening):
+            # the single post-reconnect snapshot record every flap cycle
+            # delivers must NOT zero the ladder, or the churn cadence
+            # stays pinned at the 5s base forever.
+            if consecutive_stall_episodes > 0:
+                secs_since_fire = (
+                    None
+                    if last_stall_fire_monotonic is None
+                    else time.monotonic() - last_stall_fire_monotonic
+                )
+                if should_reset_stall_backoff(
+                    secs_since_fire, STALL_BACKOFF_RESET_DWELL_SECS
+                ):
+                    consecutive_stall_episodes = 0
         else:
             secs_since_change = time.monotonic() - last_change_monotonic
             stall_deadline = compute_stall_backoff_secs(
@@ -2471,6 +2523,9 @@ def _stall_recovery_loop(feed_cell) -> None:
                 # Reset the clock so we don't hammer close() every poll while the
                 # reconnect is in flight; the next real record re-arms the detector.
                 last_change_monotonic = time.monotonic()
+                # Stamp the fire instant — the dwell-gated ladder reset
+                # measures stall-free time from HERE.
+                last_stall_fire_monotonic = last_change_monotonic
                 # One restart is in flight — the lag criterion must not stack a
                 # second force-close on top of it this window.
                 lag_consecutive = 0
@@ -2523,6 +2578,9 @@ def _stall_recovery_loop(feed_cell) -> None:
             # Also reset the advance clock so the frozen-watermark criterion
             # does not immediately double-fire while the reconnect is in flight.
             last_change_monotonic = time.monotonic()
+            # Stamp the shared fire instant — a lag fire also arms the
+            # dwell gate on the ladder reset.
+            last_stall_fire_monotonic = last_lag_fire_monotonic
 
 
 def silent_feed_watchdog(stocks: int, indices: int, feed_cell=None) -> None:
@@ -3029,10 +3087,24 @@ def _selftest_stall_backoff() -> None:
         "a huge episode count never overflows and stays at the cap"
     assert compute_stall_backoff_secs(-3, base, cap) == 5.0, \
         "a negative count clamps to the base (defensive)"
-    # Reset semantics: any real decoded live record zeroes the episode count,
-    # which by the assertions above restores the fast 5s base.
+    # Reset semantics (hostile-review hardening): the ladder zeroes ONLY on a
+    # dwell-gated advance — a single post-reconnect snapshot record inside
+    # the flap cycle (seconds after the fire) must NOT reset.
     assert compute_stall_backoff_secs(0, base, cap) == float(STALL_DEADLINE_SECS), \
         "reset ladder == today's fast detection deadline"
+    dwell = STALL_BACKOFF_RESET_DWELL_SECS
+    assert not should_reset_stall_backoff(3.0, dwell), \
+        "an advance seconds after a fire (the flap mode) must NOT reset"
+    assert not should_reset_stall_backoff(dwell - 0.001, dwell), \
+        "just under the dwell must NOT reset"
+    assert should_reset_stall_backoff(dwell, dwell), \
+        "exactly the dwell resets (inclusive boundary)"
+    assert should_reset_stall_backoff(dwell + 300.0, dwell), \
+        "a long-healthy session resets"
+    assert should_reset_stall_backoff(None, dwell), \
+        "no fire yet this process → reset allowed (ladder is 0 anyway)"
+    assert dwell >= cap, \
+        "dwell must be >= cap so a capped-cadence flap can never reset"
 
     # STILL SILENT cadence: fast (60s) for the first N warns, then one per 5min.
     fast, slow = SILENT_FEED_REWARN_SECS, STILL_SILENT_RATE_LIMIT_SECS
