@@ -1,2 +1,0 @@
-2026-07-06 3
-# armed 2026-07-06 for Mon 2026-07-06 attempt 3 — the 08:55 robot auto-fires the ladder probe in its 10:00-13:30 IST window (FIX 30), zero clicks, or a manual Start click fires it immediately; only the FIRST line is read. After the run, disarm by making line 1 a comment; re-arm deliberately with a future "YYYY-MM-DD N" line for a live ladder run.

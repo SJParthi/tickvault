@@ -3603,6 +3603,7 @@ fetch_probe_verdict() {
 }
 
 # ── FIX 9: one-shot probe-then-run (operator interface = TWO buttons only) ──
+# OPERATOR LOCK 2026-07-06: Groww scale experiments SUSPENDED — single Dhan + single Groww connection only. Re-arming the probe marker requires a fresh dated operator quote (account-level rate limiter: fleets starve BOTH tickvault and bruteX on the shared Groww account; measured caps: 33 ACKed fresh-morning, 7 after churn).
 # A committed dated marker (deploy/local/probe-once.date) makes the NEXT
 # "Run tickvault" click run the one-time 100-connection lab probe FIRST,
 # then continue into the normal live start automatically. Inert on any

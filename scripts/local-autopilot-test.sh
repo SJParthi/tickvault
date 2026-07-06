@@ -655,13 +655,13 @@ t "F19-4: coalescing cadence is 30" "0" "$(grep -q 'NATS_ERROR_LOG_EVERY = 30' s
 # Item 5: attempt-2 re-arm marker
 # FIX 25 superseded the F19-5 armed-marker pin (attempt 2 complete →
 # disarmed). FIX 30 (2026-07-05) superseded AGAIN (armed for Tue
-# 2026-07-07). Operator demand 2026-07-06: the exam runs TODAY — the
-# marker is re-armed as "2026-07-06 3" for the Monday live ladder run —
-# the robot auto-fires it in the 10:00-13:30 IST window, and the
-# per-attempt stamp keeps it one-shot. After the run, the disarm commit
-# flips this pin back to the comment form (the F25/F30 either-or formedness
-# pin below survives both states).
-t "F19-5→F30: probe-once marker is armed for Mon 2026-07-06 attempt 3" "1 0 3" \
+# 2026-07-07), then re-armed "2026-07-06 3" for the Monday exam.
+# OPERATOR LOCK 2026-07-06: Groww scale experiments SUSPENDED — the
+# probe marker file is DELETED from the branch (single Dhan + single
+# Groww connection only). probe_marker_state on the ABSENT file must
+# report DISARMED (armed=0). Re-arming requires a fresh dated operator
+# quote.
+t "F19-5→LOCK 2026-07-06: probe-once marker DELETED — disarmed state" "0 0 1" \
   "$(probe_marker_state deploy/local/probe-once.date 2026-07-06 "$TMP/f19-5-no-stamps")"
 
 # Addendum: raise Docker VM memory at its NATURAL cold start
@@ -896,10 +896,12 @@ t "F25: comment marker attempt parse fails safe to 1" "1" \
   "$(probe_marker_attempt "# disarmed 2026-07-05 — attempt 2 complete")"
 t "F25: a real dated marker still fires (disarm did not break arming)" "run" \
   "$(probe_once_decision 2026-07-05 2026-07-05 0)"
-t "F25/F30: committed marker is DISARMED (comment) or a well-formed dated arm line — never garbage" "0" \
-  "$(head -1 deploy/local/probe-once.date | grep -Eq '^#|^[0-9]{4}-[0-9]{2}-[0-9]{2}( [0-9]+)?$' && echo 0 || echo 1)"
-t "F25: marker file documents the re-arm/disarm procedure" "0" \
-  "$(grep -q 're-arm deliberately' deploy/local/probe-once.date && echo 0 || echo 1)"
+# OPERATOR LOCK 2026-07-06: the marker file must NOT exist on the branch —
+# its deletion is the permanent disarm (single Dhan + single Groww only).
+t "F25/LOCK 2026-07-06: probe marker file is ABSENT from the branch (permanently disarmed)" "1" \
+  "$([ -f deploy/local/probe-once.date ] && echo 0 || echo 1)"
+t "LOCK 2026-07-06: autopilot carries the operator suspension lock comment near the probe-arming logic" "0" \
+  "$(grep -q 'OPERATOR LOCK 2026-07-06: Groww scale experiments SUSPENDED' scripts/local-autopilot.sh && echo 0 || echo 1)"
 # 2) stray-sweep candidates: only REAL interpreter invocations qualify.
 t "F25: python3 + script path IS a sidecar candidate" "0" \
   "$(is_sidecar_cmdline 'python3 scripts/groww-sidecar/groww_sidecar.py --conn 3' && echo 0 || echo 1)"
