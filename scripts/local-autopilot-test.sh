@@ -1129,6 +1129,21 @@ t "F31 quit: still up at 45s → give_up (hard window over)" "give_up" "$(fix31_
 t "F31 quit: garbage waited-secs → give_up (never loop)" "give_up" "$(fix31_quit_next 1 banana 30 45)"
 t "F31 quit: empty deadlines → give_up (never loop)" "give_up" "$(fix31_quit_next 1 10 "" "")"
 
+# Post-stop verdict (2026-07-06 fail-closed hardening): ONLY a positive
+# `exited*` probe counts as verifiably stopped. Empty (dk timeout on a
+# wedged daemon / daemon error / no container) and every other state fail
+# CLOSED to not_stopped — the raise aborts instead of quitting Docker over
+# a container of unknown state (mirrors the decision side's unknown=running).
+t "F31 stop-verdict: exited → stopped" "stopped" "$(fix31_stop_verdict "exited")"
+t "F31 stop-verdict: exited + health suffix → stopped" "stopped" "$(fix31_stop_verdict "exited unhealthy")"
+t "F31 stop-verdict: running healthy → not_stopped" "not_stopped" "$(fix31_stop_verdict "running healthy")"
+t "F31 stop-verdict: EMPTY probe (dk timeout / wedged daemon) → not_stopped (fail closed)" "not_stopped" "$(fix31_stop_verdict "")"
+t "F31 stop-verdict: restarting → not_stopped" "not_stopped" "$(fix31_stop_verdict "restarting")"
+t "F31 stop-verdict: paused → not_stopped" "not_stopped" "$(fix31_stop_verdict "paused")"
+t "F31 stop-verdict: removing → not_stopped" "not_stopped" "$(fix31_stop_verdict "removing")"
+t "F31 stop-verdict: dead → not_stopped (fail closed on ambiguous state)" "not_stopped" "$(fix31_stop_verdict "dead")"
+t "F31 stop-verdict: garbage → not_stopped" "not_stopped" "$(fix31_stop_verdict "banana")"
+
 # Clobber forensics (the FIX 17 "ignored" post-mortem channel).
 t "F31 forensics: file below target after relaunch → clobbered" "clobbered" "$(fix31_clobber_verdict 8192 12288)"
 t "F31 forensics: file still at target → held" "held" "$(fix31_clobber_verdict 12288 12288)"
@@ -1158,6 +1173,17 @@ t "F31 wiring: container STOP is ordered BEFORE the osascript quit" "ordered" \
   "$(printf '%s\n' "$FIX31_BODY" | awk '/dk stop tv-questdb/{if(!s)s=NR} /quit app/{if(!q)q=NR} END{print (s && q && s<q) ? "ordered" : "bad"}')"
 t "F31 wiring: post-stop re-check aborts the raise if the container is still running" "0" \
   "$(printf '%s\n' "$FIX31_BODY" | grep -q 'did NOT stop within' && echo 0 || echo 1)"
+# 2026-07-06 fail-closed pins: the executor must decide via the pure
+# fix31_stop_verdict (positive `exited*` required — empty/unknown aborts),
+# NOT via a `running*)` positive-match arm that fails OPEN on an empty probe.
+t "F31 wiring: post-stop re-check decides via fix31_stop_verdict (fail closed)" "0" \
+  "$(printf '%s\n' "$FIX31_BODY" | grep -q 'fix31_stop_verdict' && echo 0 || echo 1)"
+t "F31 wiring: the fail-OPEN 'running*)' positive-match arm is GONE from the post-stop section" "0" \
+  "$(printf '%s\n' "$FIX31_BODY" | sed -n '/dk stop tv-questdb/,$p' | grep -q 'running\*)' && echo 1 || echo 0)"
+t "F31 wiring: stop-verdict check is ordered BEFORE the stopped-container Telegram" "ordered" \
+  "$(printf '%s\n' "$FIX31_BODY" | awk '/fix31_stop_verdict/{if(!v)v=NR} /Stopped idle database container/{if(!t)t=NR} END{print (v && t && v<t) ? "ordered" : "bad"}')"
+t "F31 wiring: stop-verdict check is ordered BEFORE the osascript quit" "ordered" \
+  "$(printf '%s\n' "$FIX31_BODY" | awk '/fix31_stop_verdict/{if(!v)v=NR} /quit app/{if(!q)q=NR} END{print (v && q && v<q) ? "ordered" : "bad"}')"
 t "F31 wiring: honest Telegram line for the stop-container arm" "0" \
   "$(printf '%s\n' "$FIX31_BODY" | grep -q 'Stopped idle database container to apply the memory raise' && echo 0 || echo 1)"
 t "F31 wiring: qdb stop timeout constant pinned at 60s (inside the 180s cycle budget)" "1" \

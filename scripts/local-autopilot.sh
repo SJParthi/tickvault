@@ -809,6 +809,24 @@ fix31_clobber_verdict() {
   return 0
 }
 
+# fix31_stop_verdict <post-stop container state> → stopped|not_stopped
+# FAIL-CLOSED verdict for the post-stop re-check before the Docker quit
+# (2026-07-06 hardening: the previous check only aborted on a POSITIVE
+# `running*` probe, so an EMPTY probe — dk timeout / daemon error, i.e.
+# the exact wedged-daemon scenario the re-check exists for — fell through
+# and Docker was quit over a container of UNKNOWN state, plus a false-OK
+# "Stopped idle database container" Telegram). Convention now matches the
+# decision side (fix31_raise_decision: unknown qdb = running): ONLY a
+# positive `exited*` probe counts as verifiably stopped; running /
+# restarting / paused / removing / created / dead / empty / garbage all
+# fail closed to not_stopped and the raise is aborted (the clamp path
+# takes over — never quit Docker over a container not PROVEN stopped).
+# Pure.
+fix31_stop_verdict() {
+  case "${1:-}" in exited*) echo stopped ;; *) echo not_stopped ;; esac
+  return 0
+}
+
 # ── FIX 19 item 3: probe-prep stop wording ──────────────────────────────────
 # stop_notice_mode <probe_prep_flag> → probe_prep|manual. The probe wrapper's
 # internal pre-probe stop used to send the manual-stop Telegram ("Autopilot
@@ -2251,12 +2269,19 @@ fix31_auto_raise_docker_mem() {
     # first instead of abandoning the raise like the old skip_qdb_running).
     log "FIX 31: app is NOT running but the tv-questdb container is idling — stopping it (bounded ${FIX31_QDB_STOP_TIMEOUT_SECS}s) so the memory raise can proceed"
     DOCKER_CMD_TIMEOUT_SECS="$FIX31_QDB_STOP_TIMEOUT_SECS" dk stop tv-questdb >/dev/null 2>&1 || true
-    case "$(questdb_container_state)" in
-    running*)
-      log "FIX 31: tv-questdb did NOT stop within ${FIX31_QDB_STOP_TIMEOUT_SECS}s — aborting the raise (never quit Docker over a running database container); the clamp path takes over"
+    # 2026-07-06 fail-closed re-check: proceed ONLY on a POSITIVE `exited*`
+    # probe (fix31_stop_verdict). An empty probe (dk timeout on a wedged
+    # daemon — the exact scenario this re-check exists for) or any other
+    # state is treated as NOT stopped: abort BEFORE the Telegram and BEFORE
+    # the osascript-quit/pkill escalation, mirroring the decision side's
+    # "unknown = running" convention. The 🧠 "Stopped idle database
+    # container" Telegram fires ONLY after the stop is positively verified.
+    local post_stop_state
+    post_stop_state="$(questdb_container_state)"
+    if [ "$(fix31_stop_verdict "$post_stop_state")" != "stopped" ]; then
+      log "FIX 31: tv-questdb did NOT stop within ${FIX31_QDB_STOP_TIMEOUT_SECS}s (post-stop probe: '${post_stop_state:-empty/unknown}') — aborting the raise, fail CLOSED (never quit Docker over a database container not PROVEN stopped); the clamp path takes over"
       return 0
-      ;;
-    esac
+    fi
     tg "🧠 Stopped idle database container to apply the memory raise — the app was not running, so nothing was interrupted. The database restarts automatically with the next run."
   fi
   # (1) FULLY quit Docker Desktop — the write is safe ONLY once the app
