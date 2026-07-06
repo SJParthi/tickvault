@@ -99,9 +99,12 @@ use tickvault_core::notification::{NotificationEvent, NotificationService};
 /// `scripts/groww-sidecar/groww_sidecar.py`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SidecarLineClass {
-    /// The Groww account has no LIVE market-data feed entitlement (the sidecar's
-    /// SILENT-FEED watchdog), or the line names a permissions/authorization
-    /// problem. The socket connects but streams nothing.
+    /// The server is not sending data to this connection — the sidecar's
+    /// SILENT-FEED watchdog fired (socket connects but streams nothing:
+    /// server-side session limit / throttle, or in the worst case a genuine
+    /// entitlement gap), or the line names a permissions/authorization
+    /// problem. The variant name is historical; the operator-facing prose
+    /// no longer claims an entitlement fault (exam-fix 2026-07-06).
     EntitlementRejected,
     /// An auth-phase reject (`groww sidecar error [auth]`) — the shared SSM
     /// access token is stale/unusable (the sidecar NEVER mints; it re-reads
@@ -164,17 +167,40 @@ impl SidecarLineClass {
     /// alert-triggering class. A FIXED `&'static str` per class — never the raw
     /// child line — so no runtime/credential text can reach Telegram
     /// (defense-in-depth). `None` for the non-alert classes.
+    ///
+    /// Wording note (exam-fix 2026-07-06): the `EntitlementRejected` prose
+    /// previously asserted "account lacks a live market-data feed
+    /// entitlement" — a CLAIM about the account that the classifier cannot
+    /// actually prove: the dominant real trigger during the fleet exam was
+    /// server-side SESSION STARVATION (the socket connects, the server just
+    /// sends nothing to that connection — session limit / throttle). The
+    /// honest wording states only what is OBSERVED.
     #[must_use]
     pub const fn alert_reason(self) -> Option<&'static str> {
         match self {
             Self::EntitlementRejected => Some(
-                "account lacks a live market-data feed entitlement (or feed permissions denied)",
+                "server is not sending data to this connection (session limit or throttle) \
+                 — retrying with backoff",
             ),
             Self::AuthRejected => Some(
                 "authentication rejected — the shared access token is stale/unusable; \
                  check the bruteX groww-token-minter Lambda's last daily mint",
             ),
             Self::Error => Some("the feed reported an error and is retrying"),
+            Self::Subscribed | Self::Streaming | Self::Info => None,
+        }
+    }
+
+    /// Short cause label for the FLEET-scoped coalesced summary (exam-fix
+    /// 2026-07-06) — the parenthetical inside "N of M connections retrying
+    /// (<label>) — no reject reported from the other K connections". Plain
+    /// English, fixed per class, `None` for the non-alert classes.
+    #[must_use]
+    pub const fn summary_label(self) -> Option<&'static str> {
+        match self {
+            Self::EntitlementRejected => Some("server session limit or throttle"),
+            Self::AuthRejected => Some("access token stale"),
+            Self::Error => Some("feed error"),
             Self::Subscribed | Self::Streaming | Self::Info => None,
         }
     }
@@ -801,6 +827,11 @@ fn spawn_pipe_drain<R>(
     feed_health: Arc<FeedHealthRegistry>,
     notifier: Option<Arc<NotificationService>>,
     alerted: Arc<std::sync::atomic::AtomicBool>,
+    // §34 fleet identity (exam-fix 2026-07-06): `Some(n)` routes the
+    // operator-facing Telegram through the FLEET-scoped coalescer (one
+    // summary per 60s per direction across ALL connections); `None`
+    // (single-conn path) keeps today's per-child semantics byte-identical.
+    conn_id: Option<usize>,
 ) -> tokio::task::JoinHandle<()>
 where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
@@ -861,6 +892,12 @@ where
             if class.clears_auth_rejected() {
                 feed_health.clear_auth_rejected(Feed::Groww);
                 alerted.store(false, std::sync::atomic::Ordering::Relaxed);
+                // Fleet bookkeeping (exam-fix 2026-07-06): a streaming
+                // recovery clears this connection from the fleet reject set
+                // WITHOUT consuming the Connected direction's window (the
+                // bridge's genuine connected ping owns that window). No-op on
+                // the single-conn path (`conn_id == None`).
+                crate::groww_fleet_alerts::global_record_fleet_recovery(conn_id);
             }
             // A SILENT-FEED watchdog line only counts as an operator-actionable
             // reject DURING market hours — after-hours silence must not mark the
@@ -879,10 +916,64 @@ where
                     if class.sets_auth_rejected() {
                         feed_health.set_auth_rejected(Feed::Groww, true);
                     }
+                    // FLEET-scoped Telegram coalescing (exam-fix 2026-07-06):
+                    // each of N fleet connections used to fire its own HIGH
+                    // alert per retry cycle (dozens of alternating messages
+                    // during the exam). Fleet connections now aggregate into
+                    // at most ONE summary per 60s window; suppressed events
+                    // keep their per-line `error!` log + feed-health state
+                    // above (only the Telegram fan-out is coalesced). The
+                    // single-conn path (`conn_id == None`) is Passthrough —
+                    // today's semantics byte-identical.
                     if let (Some(notifier), Some(reason)) = (&notifier, class.alert_reason()) {
-                        notifier.notify(NotificationEvent::GrowwSidecarRejected {
-                            reason: reason.to_string(),
-                        });
+                        use crate::groww_fleet_alerts::{
+                            FleetAlertDecision, FleetAlertKind, format_fleet_reject_summary,
+                            global_fleet_alert_decision,
+                        };
+                        match global_fleet_alert_decision(conn_id, FleetAlertKind::Reject) {
+                            FleetAlertDecision::Passthrough => {
+                                notifier.notify(NotificationEvent::GrowwSidecarRejected {
+                                    reason: reason.to_string(),
+                                    fleet_summary: false,
+                                });
+                            }
+                            FleetAlertDecision::EmitSummary {
+                                affected,
+                                fleet_size,
+                            } => {
+                                let label = class.summary_label().unwrap_or("feed error");
+                                notifier.notify(NotificationEvent::GrowwSidecarRejected {
+                                    reason: format_fleet_reject_summary(
+                                        affected, fleet_size, label,
+                                    ),
+                                    fleet_summary: true,
+                                });
+                            }
+                            FleetAlertDecision::Suppress => {
+                                // RE-ARM the per-child one-shot latch
+                                // (hostile-review fix 2026-07-06): a
+                                // suppressed child fired NO Telegram, so its
+                                // latch must survive. In a fleet-wide
+                                // auth/entitlement outage the children never
+                                // exit (they retry internally) and never
+                                // stream (no recovery edge re-arms), so a
+                                // consumed latch would make the ONE
+                                // first-window "1 of N" summary the
+                                // operator's entire signal forever. With the
+                                // latch re-armed, each later 60s window's
+                                // first still-unlatched child emits the
+                                // ACCUMULATED count; Telegram volume stays
+                                // bounded at ≤1 per window and ≤ fleet-size
+                                // messages per outage episode (each emitting
+                                // child latches on emit).
+                                alerted.store(false, std::sync::atomic::Ordering::Relaxed);
+                                metrics::counter!(
+                                    "tv_groww_fleet_alerts_suppressed_total",
+                                    "direction" => "reject",
+                                )
+                                .increment(1);
+                            }
+                        }
                     }
                 }
             }
@@ -915,6 +1006,8 @@ enum SuperviseOutcome {
 /// stall→restart with no new code. `now_ist_nanos` is injected (a fn ptr) so the
 /// pure decision is testable; production passes a wall-clock IST-nanos closure.
 // TEST-EXEMPT: drives a live child process + runtime toggle + stall poll via tokio::select!; the disable gate it reads (FeedRuntimeState::is_enabled) is unit-tested in the api crate; the pure decision fns (should_restart_on_stall, StallRestartStorm, classify_sidecar_line) are unit-tested below.
+// APPROVED: supervision wiring — every arg is a distinct owned resource
+#[allow(clippy::too_many_arguments)]
 async fn supervise_child(
     child: &mut tokio::process::Child,
     feed: Feed,
@@ -923,6 +1016,9 @@ async fn supervise_child(
     notifier: &Option<Arc<NotificationService>>,
     now_ist_nanos: fn() -> i64,
     storm: &mut StallRestartStorm,
+    // §34 fleet identity (exam-fix 2026-07-06) — forwarded to the pipe
+    // drains so fleet children route Telegram through the fleet coalescer.
+    conn_id: Option<usize>,
 ) -> SuperviseOutcome {
     // One latch per running child so the alert fires at most once per instance.
     let alerted = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -934,6 +1030,7 @@ async fn supervise_child(
             Arc::clone(feed_health),
             notifier.clone(),
             Arc::clone(&alerted),
+            conn_id,
         ));
     }
     if let Some(stderr) = child.stderr.take() {
@@ -943,6 +1040,7 @@ async fn supervise_child(
             Arc::clone(feed_health),
             notifier.clone(),
             Arc::clone(&alerted),
+            conn_id,
         ));
     }
     let abort_drains = || {
@@ -1194,6 +1292,7 @@ pub async fn run_groww_sidecar_supervisor(
             &notifier_now,
             now_ist_nanos_wall,
             &mut storm,
+            opts.conn_id,
         )
         .await;
         match outcome {
@@ -1394,6 +1493,10 @@ pub fn spawn_groww_scale_fleet(
                 }
                 FleetAction::Steady => {}
             }
+            // Publish the live fleet size to the fleet-scoped alert
+            // coalescer (exam-fix 2026-07-06) so the "N of M connections
+            // retrying" summaries carry an honest denominator.
+            crate::groww_fleet_alerts::set_global_fleet_size(children.len());
             metrics::gauge!("tv_groww_conns_active").set(children.len() as f64);
             tokio::select! {
                 () = wake.notified() => {}
@@ -2207,6 +2310,78 @@ mod tests {
         assert!(SidecarLineClass::Subscribed.alert_reason().is_none());
         assert!(SidecarLineClass::Streaming.alert_reason().is_none());
         assert!(SidecarLineClass::Info.alert_reason().is_none());
+    }
+
+    /// Exam-fix 2026-07-06: the silent-feed / permissions class prose must
+    /// describe the OBSERVED condition (server not sending data — session
+    /// limit or throttle), never assert an unproven account-entitlement
+    /// fault; and every alert class carries a short fleet summary label.
+    #[test]
+    fn test_alert_reason_wording_is_honest_and_summary_labels_exist() {
+        let reason = SidecarLineClass::EntitlementRejected
+            .alert_reason()
+            .expect("alert class must have a reason");
+        assert!(
+            reason.contains("server is not sending data to this connection"),
+            "reject prose must state the observation, got: {reason}"
+        );
+        assert!(
+            reason.contains("session limit or throttle") && reason.contains("retrying"),
+            "reject prose must name the likely cause + the retry, got: {reason}"
+        );
+        assert!(
+            !reason.contains("account lacks"),
+            "the misleading entitlement claim must not return: {reason}"
+        );
+        for class in [
+            SidecarLineClass::EntitlementRejected,
+            SidecarLineClass::AuthRejected,
+            SidecarLineClass::Error,
+        ] {
+            let label = class
+                .summary_label()
+                .expect("alert class must have a fleet summary label");
+            assert!(!label.is_empty() && !label.contains(".rs"));
+        }
+        assert!(SidecarLineClass::Subscribed.summary_label().is_none());
+        assert!(SidecarLineClass::Streaming.summary_label().is_none());
+        assert!(SidecarLineClass::Info.summary_label().is_none());
+    }
+
+    /// Hostile-review fixes 2026-07-06, pinned by source-scan (the drain loop
+    /// is a TEST-EXEMPT pipe driver):
+    /// (a) a fleet `Suppress` decision must RE-ARM the per-child one-shot
+    ///     latch — otherwise a fleet-wide outage collapses to a single
+    ///     never-corrected "1 of N" Telegram (the suppressed children's only
+    ///     notify attempt would be consumed forever);
+    /// (b) the fleet-coalesced summary must be marked `fleet_summary: true`
+    ///     (and the single-conn passthrough `false`) so the Telegram body
+    ///     does not wrap a partial-fleet count in the single-conn
+    ///     total-outage trailer.
+    #[test]
+    fn test_fleet_suppress_rearms_latch_and_summary_is_fleet_marked() {
+        let src = include_str!("groww_sidecar_supervisor.rs");
+        let suppress_arm = src
+            .split("FleetAlertDecision::Suppress => {")
+            .nth(1)
+            .expect("the reject Suppress arm must exist");
+        let suppress_body = suppress_arm
+            .split("tv_groww_fleet_alerts_suppressed_total")
+            .next()
+            .expect("the Suppress arm must count suppressions");
+        assert!(
+            suppress_body.contains("alerted.store(false"),
+            "the Suppress arm must re-arm the per-child latch BEFORE counting \
+             (a suppressed child must keep its one notify attempt)"
+        );
+        assert!(
+            src.contains("fleet_summary: true,"),
+            "the fleet EmitSummary notify must be marked fleet_summary: true"
+        );
+        assert!(
+            src.contains("fleet_summary: false,"),
+            "the single-conn passthrough notify must be marked fleet_summary: false"
+        );
     }
 
     #[test]

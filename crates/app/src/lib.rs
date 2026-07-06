@@ -47,6 +47,11 @@ pub mod dhan_activation;
 pub mod groww_activation;
 /// Groww second-feed bridge — consumer side (operator lock §32). Default-OFF.
 pub mod groww_bridge;
+/// Fleet-scoped Telegram alert coalescing for the Groww auto-scale fleet
+/// (§34, exam-fix 2026-07-06): reject/connected transitions across ALL fleet
+/// connections aggregate into at most ONE Telegram per 60s window per
+/// direction; single-connection semantics untouched.
+pub mod groww_fleet_alerts;
 /// Groww NATIVE-RUST shadow client runner (PR-R1 parity migration, operator
 /// "go" 2026-07-04 — `groww-second-feed-scope-2026-06-19.md` §35). Default-OFF
 /// behind `[feeds] groww_native_shadow`.
