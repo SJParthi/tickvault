@@ -9,11 +9,11 @@ license.workspace = true
 tickvault-common = { path = "../common" }
 tickvault-core = { path = "../core" }
 tickvault-storage = { path = "../storage" }
-# Phase 4a (2026-05-05): the dormant /api/movers?v=2 handler reads
-# OHLCV from the in-RAM 29-TF CascadeFanout which lives in
-# tickvault-trading. Promoted from [dev-dependencies] to
-# [dependencies] for production wiring. The actual route + handler
-# stays gated behind config.api.movers_v2_enabled (default false).
+# tickvault-trading: originally promoted to [dependencies] for the
+# /api/movers?v=2 handler (Phase 4a, 2026-05-05). That route + its
+# `movers_v2_enabled` gate were deleted (AWS-lifecycle PR #2,
+# 2026-05-18; knob removed 2026-07-06). Today only the crate's
+# integration tests use it (contract_tests.rs OMS types).
 tickvault-trading = { path = "../trading" }
 tokio = { workspace = true }
 axum = { workspace = true }

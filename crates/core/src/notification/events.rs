@@ -993,7 +993,14 @@ pub enum NotificationEvent {
     /// fires this ONCE per running-child reject (edge-triggered) with a fixed
     /// plain-English `reason` per class (never the raw child text — defense in
     /// depth so no runtime/credential data reaches Telegram). Severity::High.
-    GrowwSidecarRejected { reason: String },
+    ///
+    /// `fleet_summary` (exam-fix hardening 2026-07-06): `true` when `reason`
+    /// is a FLEET-coalesced "N of M connections retrying" summary — the body
+    /// then describes the partial-fleet condition instead of the single-conn
+    /// total-outage trailer ("receiving nothing … prices will not flow"),
+    /// which would contradict a partial summary with a false
+    /// whole-feed-down claim.
+    GrowwSidecarRejected { reason: String, fleet_summary: bool },
 
     /// Custom alert from any component.
     Custom { message: String },
@@ -2163,16 +2170,33 @@ impl NotificationEvent {
                      No action needed unless this recurs."
                 )
             }
-            Self::GrowwSidecarRejected { reason } => {
-                // `reason` is a fixed per-class &'static str mapped to String by
-                // the supervisor (never raw child text), but html_escape it
+            Self::GrowwSidecarRejected {
+                reason,
+                fleet_summary,
+            } => {
+                // `reason` is a fixed per-class &'static str (or the fleet
+                // coalescer's counted summary) mapped to String by the
+                // supervisor (never raw child text), but html_escape it
                 // anyway for defense-in-depth, consistent with every String arm.
-                format!(
-                    "🆘 <b>Groww live feed rejected</b>\n{}\n\nThe Groww feed is \
-                     connected but receiving nothing. Until this is fixed, Groww \
-                     prices will not flow.",
-                    html_escape(reason)
-                )
+                let reason = html_escape(reason);
+                if *fleet_summary {
+                    // Fleet-coalesced partial summary (hostile-review fix
+                    // 2026-07-06): the trailer must NOT claim the whole feed
+                    // is "receiving nothing" — only the counted connections
+                    // reported a problem, and nothing positive is claimed
+                    // about the rest.
+                    format!(
+                        "🆘 <b>Groww live feed rejected</b>\n{reason}\n\nThe affected \
+                         connections keep retrying automatically. Prices from those \
+                         connections will not flow until they recover."
+                    )
+                } else {
+                    format!(
+                        "🆘 <b>Groww live feed rejected</b>\n{reason}\n\nThe Groww feed is \
+                         connected but receiving nothing. Until this is fixed, Groww \
+                         prices will not flow."
+                    )
+                }
             }
             Self::Custom { message } => message.clone(),
         }
@@ -2603,6 +2627,7 @@ mod tests {
     fn test_groww_sidecar_rejected_renders_reason_and_topic_and_severity() {
         let event = NotificationEvent::GrowwSidecarRejected {
             reason: "account lacks live market-data feed entitlement".to_string(),
+            fleet_summary: false,
         };
         let msg = event.to_message();
         // The plain-English reason reaches the operator…
@@ -2623,12 +2648,54 @@ mod tests {
     }
 
     #[test]
+    fn test_groww_sidecar_rejected_fleet_summary_body_is_fleet_aware() {
+        // Hostile-review fix 2026-07-06: a PARTIAL-fleet coalesced summary
+        // must not be wrapped in the single-conn total-outage trailer — the
+        // body would simultaneously report a partial count AND claim the
+        // whole feed is "receiving nothing" / "prices will not flow".
+        let event = NotificationEvent::GrowwSidecarRejected {
+            reason: "7 of 40 connections retrying (server session limit or throttle) — \
+                     no reject reported from the other 33 connections"
+                .to_string(),
+            fleet_summary: true,
+        };
+        let msg = event.to_message();
+        assert!(
+            msg.contains("7 of 40 connections retrying"),
+            "fleet summary reason missing: {msg}"
+        );
+        assert!(
+            !msg.contains("receiving nothing"),
+            "total-outage trailer must not wrap a partial fleet summary: {msg}"
+        );
+        assert!(
+            !msg.contains("Groww prices will not flow"),
+            "whole-feed no-flow claim must not wrap a partial fleet summary: {msg}"
+        );
+        assert!(
+            msg.contains("Prices from those connections will not flow"),
+            "fleet trailer must scope the no-flow claim to the affected connections: {msg}"
+        );
+        // Same topic/severity/badge as the single-conn arm — only the body
+        // trailer is fleet-aware.
+        assert_eq!(event.topic(), "GrowwSidecarRejected");
+        assert_eq!(event.severity(), Severity::High);
+        // The single-conn arm keeps its original total-outage wording.
+        let single = NotificationEvent::GrowwSidecarRejected {
+            reason: "access token stale".to_string(),
+            fleet_summary: false,
+        };
+        assert!(single.to_message().contains("receiving nothing"));
+    }
+
+    #[test]
     fn test_groww_sidecar_rejected_html_escapes_reason() {
         // Defense-in-depth: even though the supervisor only passes a fixed
         // &'static str reason, any angle brackets are escaped at the render
         // boundary (consistent with every other String arm).
         let event = NotificationEvent::GrowwSidecarRejected {
             reason: "<script>".to_string(),
+            fleet_summary: false,
         };
         let msg = event.to_message();
         assert!(!msg.contains("<script>"), "raw HTML not escaped: {msg}");
@@ -4776,6 +4843,7 @@ mod tests {
     fn test_groww_feed_events_carry_groww_badge_in_message() {
         let sidecar = NotificationEvent::GrowwSidecarRejected {
             reason: "access token stale".to_string(),
+            fleet_summary: false,
         };
         assert_eq!(sidecar.feed_badge(), Some("🟢 GROWW"));
         assert!(

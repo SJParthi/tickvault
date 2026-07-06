@@ -1811,6 +1811,22 @@ async fn main() -> Result<()> {
             );
         }
 
+        // WS-GAP-08 (2026-07-06 audit fix): the FAST crash-recovery arm must
+        // ALSO honour a persisted Dhan 429 rate-limit cooldown BEFORE its
+        // first WS connect. A mid-market `process::exit(2)` (the WS-GAP-09
+        // ceiling_exceeded fallback still reaches exit) with a VALID cached
+        // token routes through THIS arm — previously it wiped the in-memory
+        // `rate_limit_streak` and reconnected at 0ms straight back into
+        // Dhan's still-active 429 window: the exact instant-429 restart loop
+        // WS-GAP-08 was built to break (only the slow lane waited). Same
+        // semantics as the slow-lane call: fail-open on a missing/corrupt/
+        // stale file (no wait) and bounded by WS_RATE_LIMIT_BACKOFF_CAP_MS
+        // (5 min), so a bad file can never hang crash recovery. The fast arm
+        // is only reachable on a market-hours trading-day restart, so no
+        // trading-day gate is needed here. Ratchet:
+        // crates/app/tests/ws_rate_limit_cooldown_wiring_guard.rs.
+        wait_out_persisted_ws_rate_limit_cooldown().await;
+
         // --- WebSocket pool create (channel only, NOT spawned yet) ---
         let (pool_receiver, ws_pool_ready) = match create_websocket_pool(
             &token_handle,
@@ -3705,6 +3721,11 @@ async fn run_ws_event_audit_consumer(
 /// the wait is clamped to `WS_RATE_LIMIT_BACKOFF_CAP_MS` (5 minutes) so a bad
 /// file can never hang boot. The pure `remaining_cooldown_ms` decision is
 /// unit-tested in `tickvault_core::websocket::rate_limit_cooldown`.
+///
+/// Called from BOTH boot paths (2026-07-06 audit fix — the FAST
+/// crash-recovery arm previously skipped it): each `create_websocket_pool`
+/// call site in main.rs must be preceded by this wait, ratcheted by
+/// `crates/app/tests/ws_rate_limit_cooldown_wiring_guard.rs`.
 async fn wait_out_persisted_ws_rate_limit_cooldown() {
     use tickvault_core::websocket::rate_limit_cooldown;
 

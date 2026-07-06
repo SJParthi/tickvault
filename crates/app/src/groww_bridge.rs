@@ -1907,6 +1907,7 @@ async fn supervise_groww_bridge_loop(
                 aggregator.clone(),
                 Arc::clone(&audit_latches),
                 Arc::clone(&capture_seq),
+                conn_id,
             ));
             let reason = match handle.await {
                 Err(err) if err.is_panic() => "panic",
@@ -2164,6 +2165,13 @@ pub async fn run_groww_bridge(
     // monotonic across N connections. The single-conn wrapper passes a
     // fresh private counter — behavior-identical to the pre-scale path.
     capture_seq: Arc<AtomicI64>,
+    // §34 fleet identity (exam-fix 2026-07-06): `Some(n)` routes the
+    // boot-connect Telegram ping through the FLEET-scoped alert coalescer
+    // (at most ONE connected ping per 60s window across ALL shard bridges,
+    // instead of one per connection per episode); `None` (single-conn path)
+    // keeps today's semantics byte-identical. ws_event_audit rows, logs and
+    // feed-health stay per-connection either way — only Telegram coalesces.
+    conn_id: Option<usize>,
 ) {
     info!(
         path = %tick_file_path.display(),
@@ -2339,7 +2347,30 @@ pub async fn run_groww_bridge(
                     "groww_subscribed",
                     "groww socket connected + subscribed — awaiting first tick",
                 );
-                if let Some(notifier) = notifier {
+                // FLEET-scoped Telegram coalescing (exam-fix 2026-07-06): in
+                // fleet mode every shard bridge used to fire its own LOW
+                // "connected — Subscribed N" ping per connected episode —
+                // alternating with the per-connection reject alerts into
+                // dozens of messages. Fleet connections now emit at most ONE
+                // connected ping per 60s window (the FIRST bridge in the
+                // window carries its own subscribe counts); suppressed pings
+                // keep their ws_event_audit row + CONNECT log + feed-health
+                // update above. Single-conn (`conn_id == None`) = today's
+                // behavior byte-identical.
+                let connected_decision = crate::groww_fleet_alerts::global_fleet_alert_decision(
+                    conn_id,
+                    crate::groww_fleet_alerts::FleetAlertKind::Connected,
+                );
+                if matches!(
+                    connected_decision,
+                    crate::groww_fleet_alerts::FleetAlertDecision::Suppress
+                ) {
+                    metrics::counter!(
+                        "tv_groww_fleet_alerts_suppressed_total",
+                        "direction" => "connected",
+                    )
+                    .increment(1);
+                } else if let Some(notifier) = notifier {
                     notifier.notify(
                         tickvault_core::notification::NotificationEvent::FeedConnectedAwaitingTicks {
                             feed: Feed::Groww.display_name().to_string(),
