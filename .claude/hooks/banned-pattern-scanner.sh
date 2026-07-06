@@ -84,8 +84,12 @@ scan_prod_code() {
     local full_path="$PROJECT_DIR/$file"
     [ ! -f "$full_path" ] && continue
 
-    # Skip test files entirely
-    if echo "$file" | grep -qE '(_test\.rs|/tests/|/test_|_tests\.rs|/benches/)'; then
+    # Skip test files entirely.
+    # 2026-07-05: also skip examples/ and src/bin/ — non-production binaries
+    # (proof examples + operator CLIs like tv_doctor whose OUTPUT is stdout).
+    # This mirrors the compile-time policy: the print/unwrap deny lints are
+    # scoped to each crate's prod lib.rs, not to examples/bins.
+    if echo "$file" | grep -qE '(_test\.rs|/tests/|/test_|_tests\.rs|/benches/|/examples/|/src/bin/)'; then
       continue
     fi
 
@@ -113,18 +117,41 @@ scan_prod_code() {
 }
 
 # Helper: scan ONLY hot-path code
-# Hot path = crates/trading/ (excluding oms/ — order management is network-bound cold path),
-#            crates/websocket/, crates/oms/ (full crates)
-#          + crates/core/src/websocket/, crates/core/src/ticker/ (specific modules within core)
-# Cold path within core (auth/, instrument/, notification/, config/) is NOT hot path.
-# Cold path within trading (oms/) — order placement is I/O-bound, not latency-critical.
+#
+# 2026-07-05 REAL-PATH FIX: the previous filter referenced crates that DO NOT
+# EXIST (`crates/websocket/`, `crates/oms/`) and a core module that does not
+# exist (`crates/core/src/ticker/`), so the actual per-tick chain (parser,
+# tick pipeline, tick persistence, WAL frame spill, groww bridge) was NEVER
+# scanned. The canonical hot-path file set is now shared with
+# dedup-latency-scanner.sh and self-tested by
+# .claude/hooks/hot-path-scanner-selftest.sh (fails if any configured path
+# matches zero existing files — a rename can never blind the scanner again).
+#
+# Hot path (the REAL per-tick chain, enumerated from the current tree):
+#   crates/core/src/parser/                 — binary packet parsing (per frame)
+#   crates/core/src/pipeline/               — tick processor + enricher + guards (per tick)
+#   crates/core/src/websocket/              — WS read loop + subscription path
+#   crates/trading/                         — candles aggregator + indicator + strategy + risk + in_mem
+#   crates/storage/src/tick_persistence.rs  — per-tick ILP append
+#   crates/storage/src/tick_row_builder.rs  — per-tick ILP row build
+#   crates/storage/src/ws_frame_spill.rs    — per-frame WAL append
+#   crates/app/src/groww_bridge.rs          — per-tick Groww NDJSON consume path
+# Cold path within core (auth/, instrument/, notification/, historical/) is NOT hot path.
+# Cold path within trading (oms/) — order placement is network-I/O-bound, not
+# per-tick latency-critical (pre-existing documented exclusion, kept).
+# NOTE: keep this regex a flat '|'-separated list of alternatives with NO
+# nested groups — hot-path-scanner-selftest.sh splits it on '|' to verify
+# every alternative matches at least one real file.
+HOT_PATH_INCLUDE_REGEX='^crates/core/src/parser/|^crates/core/src/pipeline/|^crates/core/src/websocket/|^crates/trading/|^crates/storage/src/tick_persistence\.rs$|^crates/storage/src/tick_row_builder\.rs$|^crates/storage/src/ws_frame_spill\.rs$|^crates/app/src/groww_bridge\.rs$'
+HOT_PATH_EXCLUDE_REGEX='^crates/trading/src/oms/'
+
 scan_hot_path() {
   local pattern="$1"
   local description="$2"
   local files="$3"
   local hot_path_files
 
-  hot_path_files=$(echo "$files" | grep -E '^crates/(trading|websocket|oms)/|^crates/core/src/(websocket|ticker)/' | grep -v '^crates/trading/src/oms/' || true)
+  hot_path_files=$(echo "$files" | grep -E "$HOT_PATH_INCLUDE_REGEX" | grep -vE "$HOT_PATH_EXCLUDE_REGEX" || true)
   if [ -z "$hot_path_files" ]; then
     return
   fi
