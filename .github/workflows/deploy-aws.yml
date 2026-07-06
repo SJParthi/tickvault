@@ -121,7 +121,7 @@ jobs:
         # A glibc-dynamic binary built on the runner refuses to load on the box
         # with `version GLIBC_2.38/2.39 not found`. Static musl binary = zero
         # runtime libc dependency = runs on any Linux forever. Z+ L4 PREVENT.
-        uses: dtolnay/rust-toolchain@67ef31d5b988238dd797d409d6f9574278e20537 # SHA-pinned (was @master, supply-chain hardening 2026-04-25)
+        uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88 # SHA-pinned (was @master, supply-chain hardening 2026-04-25)
         with:
           toolchain: 1.95.0
           targets: aarch64-unknown-linux-musl
