@@ -443,6 +443,11 @@ resource "aws_cloudwatch_event_rule" "daily_start" {
   name                = "tv-${var.environment}-daily-start"
   description         = "Start tickvault instance at 08:30 IST on trading weekdays (Mon-Fri)"
   schedule_expression = "cron(0 3 ? * MON-FRI *)"
+  # RESUME 2026-07-06 per operator GO (moved up from Thu Jul 9): explicit state
+  # so terraform re-enables this rule. The Jul 4 pause set state = "DISABLED";
+  # the #1404 revert REMOVED the attribute, and with `state` absent the AWS
+  # provider stops managing rule state - the rule stayed DISABLED on AWS.
+  state = "ENABLED"
 }
 
 resource "aws_cloudwatch_event_rule" "daily_stop" {
