@@ -337,6 +337,33 @@ fn test_emf_metric_namespace_is_tickvault_prod_in_both_configs() {
 }
 
 #[test]
+fn test_cw_agent_collects_machine_log_paths() {
+    // 2026-07-06: the 2026-07-05 machine/ move silently killed BOTH app log
+    // streams (old globs don't descend into machine/) — every log metric
+    // filter on /tickvault/prod/app was DOA. Pin the machine paths in both
+    // agent configs so a future sink move fails the build instead.
+    for rel in [
+        "deploy/aws/terraform/user-data.sh.tftpl",
+        "deploy/aws/cloudwatch-agent.json",
+    ] {
+        let body = read(rel);
+        assert!(
+            body.contains("/opt/tickvault/data/logs/machine/errors.jsonl.*"),
+            "Z+ L2 VERIFY ratchet: {rel} must tail the machine/ ERROR JSONL glob \
+             (/opt/tickvault/data/logs/machine/errors.jsonl.* — dotted, so the bare \
+             errors.jsonl compat symlink is excluded). Without it every error-code \
+             log metric filter on /tickvault/prod/app is DOA."
+        );
+        assert!(
+            body.contains("/opt/tickvault/data/logs/machine/app.*"),
+            "Z+ L2 VERIFY ratchet: {rel} must tail the machine/ hourly app-log glob \
+             (/opt/tickvault/data/logs/machine/app.*). The 2026-07-05 machine/ move \
+             took the hourly app log too (crates/app/src/main.rs init_app_log_appender)."
+        );
+    }
+}
+
+#[test]
 fn test_app_alarms_count_is_thirteen() {
     // Pin the count so future PRs that delete an alarm without updating
     // the rule files / PR body fail this guard. Cost note (aws-budget.md)
