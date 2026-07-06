@@ -37,8 +37,7 @@ structured ERROR event in the last hour.
 
 **The canonical routing:** `error!` → errors.jsonl (`data/logs/machine/`) →
 CloudWatch Logs `/tickvault/prod/app` (CW agent) → log metric filter →
-`tv_errcode_*` metric → CloudWatch alarm (≤5 min for the 300s-period alarms;
-the FEED-STALL storm window is 15 min) → SNS `tv-prod-alerts` →
+`tv_errcode_*` metric → CloudWatch alarm (≤5 min) → SNS `tv-prod-alerts` →
 Telegram webhook Lambda. An `error!` ALONE does not reach Telegram; only codes
 with a filter+alarm (or paths that also call `NotificationService::notify`)
 page. The Loki→Alertmanager→Telegram path was retired in the CloudWatch-only
@@ -47,7 +46,11 @@ now exists (`deploy/aws/terraform/error-code-alarms.tf`).
 
 Filtered+alarmed codes (each = one `error_code_alerts` map entry):
 REST-CANARY-01, DH-901, DH-906 (term-match tripwire — no coded emit site
-exists yet), AUTH-GAP-04, WS-GAP-07, FEED-STALL-01 (storm ≥3/15min only),
+exists yet), AUTH-GAP-04, WS-GAP-07, FEED-STALL-01 (ERROR lines = the
+sidecar's own >5-restarts-per-5-min STORM escalation ONLY; per-restart lines
+are warn!-level and invisible here — the ≥3-restarts-per-15-min restart pager
+is the separate `tv_feed_sidecar_stall_restart_total` counter alarm,
+`feed-stall-restart-alarm.tf`; round-3 correction 2026-07-06),
 WS-REINJECT-01, PROC-01. **Everything else is log-sink-only** unless it has
 its own metric alarm (app-alarms.tf) or a typed `NotificationEvent`.
 

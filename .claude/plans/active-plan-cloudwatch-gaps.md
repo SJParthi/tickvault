@@ -17,12 +17,22 @@
 > paging 100% inside the tested envelope ONLY — a coded `error!` that reaches
 > the errors.jsonl sink AND is shipped by the CloudWatch agent AND matches one
 > of the 8 filtered codes pages within ~1-5 min via filter → alarm → SNS →
-> Telegram (FEED-STALL-01 excepted: storm-only by design — ≥3 restarts per
-> 15-min window, so worst-case first page ≈ 15-17 min after the FIRST stall;
-> round-2 review fix). They do NOT guarantee: paging for un-filtered codes
-> (log-sink-only), paging through a total SNS/Telegram outage (outside the
-> envelope, stated in the handler), catching an UNLOGGED DH-906 reject
-> (term-filter tripwire only; Rust emit-site is a flagged follow-up), or
+> Telegram (FEED-STALL-01: the only ERROR-level emission is the sidecar's own
+> >5-restarts-per-5-min STORM escalation — per-restart emissions are
+> warn!-level and never reach the ERROR-only errors.jsonl sink, so the errcode
+> alarm pages within ~5 min of the 6th rapid restart, i.e. flap cycles faster
+> than ~50s; the ≥3-restarts-per-15-min band, all cadences, is covered by the
+> separate `tv-<env>-feed-stall-restarts` counter alarm — round-3 review fix;
+> the round-2 "≥3 restarts per 15-min window / first page ≈ 15-17 min" claim
+> was FALSE against the errors.jsonl route because 3-5 warn!-level restarts
+> produce zero ERROR lines). They do NOT guarantee: paging for un-filtered
+> codes (log-sink-only), paging through a total SNS/Telegram outage (outside
+> the envelope, stated in the handler), catching an UNLOGGED DH-906 reject
+> (term-filter tripwire only; Rust emit-site is a flagged follow-up), paging
+> a Groww stall-flap SLOWER than ~1 restart per 5 min (<3 counter increments
+> per aligned 900s window = the restart pager's floor; boundary-straddling
+> 2+1 bursts page one window later or, if the flap stops at exactly 3, not
+> at all — CloudWatch windows are aligned/tumbling, not sliding), or
 > paging an order-update flap SLOWER than ~1 cycle per 3 min (>5
 > once-per-cycle increments per 900s window = the detection floor; the
 > 3-min+ slow-flap band is a stated residual; an app restart costs at most
@@ -35,8 +45,7 @@
 **The severed route + its restoration.** The canonical routing after this PR:
 `error!` → errors.jsonl (`data/logs/machine/`) → CloudWatch Logs
 `/tickvault/prod/app` (CW agent) → log metric filter → `tv_errcode_*` metric →
-CloudWatch alarm (≤5 min for the 300s-period alarms; the FEED-STALL storm
-window is 15 min) → SNS `tv-prod-alerts` → Telegram webhook Lambda.
+CloudWatch alarm (≤5 min) → SNS `tv-prod-alerts` → Telegram webhook Lambda.
 An `error!` ALONE does not reach Telegram; only codes with a filter+alarm (or
 paths that also call `NotificationService::notify`) page. The
 Loki→Alertmanager→Telegram path was retired in the CloudWatch-only migration
@@ -66,8 +75,26 @@ flapper invisible) is the proof.
   Dimensionless metrics by design (errors.jsonl carries no host field; filters
   cannot emit constant dimensions); no default_value (sparse + notBreaching).
   eval 3 / dta 1 anti-flap (identical first-page latency; 1 page + 1 OK per
-  repeating-error episode); FEED-STALL-01 is Sum ≥ 3 per 900s (a single
-  self-heal restart never pages, per its own runbook's operator-action bound).
+  repeating-error episode); FEED-STALL-01 is Sum ≥ 1 per 300s (round-3 review
+  fix: the ONLY ERROR-level FEED-STALL-01 emission is the sidecar's own storm
+  escalation — the 6th+ rapid restart within a 300s sliding window; per-restart
+  emissions are warn!-level and invisible to the ERROR-only errors.jsonl route,
+  so the round-2 "Sum ≥ 3 restarts per 900s" tuning could never see 3-5
+  restarts/15 min. One storm line = page; a single self-heal restart still
+  never pages because the Rust detector debounces at >5 restarts/5 min).
+- **P3b feed-stall restart pager** (`feed-stall-restart-alarm.tf`, round-3
+  review fix): the ≥3-restarts-per-15-min claim is made TRUE by alarming on
+  the counter `tv_feed_sidecar_stall_restart_total`
+  (groww_sidecar_supervisor.rs:1118 — increments once per restart, warn! +
+  error! alike). Same route as P3: NOT in the 21-name EMF allowlist, extracted
+  via a log metric filter on `/tickvault/prod/metrics` ($.host dimension),
+  plain `Sum ≥ 3 / 900s` (per-scrape-delta model + the same
+  not-live-verified residual as P3). NO market-hours gate needed:
+  `should_restart_on_stall` requires market_open, so the counter cannot
+  increment off-hours. Honest floor: flap cycles slower than ~5 min (<3
+  restarts per aligned 15-min window) do not page — stated residual;
+  boundary-straddling 2+1 bursts page one window later (tumbling windows,
+  not sliding). Fast flaps (<~50s cycle) also trip the P2 storm tripwire.
 - **P3 reconnect-storm** (`order-update-reconnect-storm-alarm.tf`): the counter
   `tv_order_update_reconnections_total` (order_update_connection.rs:86/:254) is
   NOT in the 21-name EMF allowlist (ratcheted pin preserved) — extracted via a
@@ -223,7 +250,9 @@ flapper invisible) is the proof.
   `--cli-binary-format raw-in-base64-out` is required on AWS CLI v2 or the
   JSON payload errors as invalid base64), and the counter-shape check for
   the storm alarm: filter one `/tickvault/prod/metrics` event for
-  `tv_order_update_reconnections_total` across two scrapes — the value must
+  `tv_order_update_reconnections_total` (and, round-3, for
+  `tv_feed_sidecar_stall_restart_total` — the feed-stall restart pager rides
+  the same route) across two scrapes — the value must
   behave as a per-scrape DELTA (0/small per scrape), NOT a growing
   cumulative; if cumulative, rework the storm alarm to `DIFF(Maximum)`
   (round-2 review fix — the Sum model is AWS-documented + sibling-alarm
@@ -242,7 +271,8 @@ flapper invisible) is the proof.
 
 ## Observability
 
-- 10 new alarms (8 errcode + 1 reconnect-storm + 1 readiness-lambda-errors) →
+- 11 new alarms (8 errcode + 1 reconnect-storm + 1 feed-stall-restarts +
+  1 readiness-lambda-errors) →
   tv_alerts → Telegram; ok_actions symmetric for repeat-emitters (the OK is
   the "recovered" message the operator wanted on 2026-07-06) — EXCEPT the
   REST canary (`ok_recovery = false`): its 3-probes/day cadence means the
@@ -251,7 +281,9 @@ flapper invisible) is the proof.
   suppressed; the next scheduled probe staying silent (or the DH-901 alarm)
   is the recovery signal (round-1 review fix).
 - New metrics: 8 sparse `tv_errcode_*` (billed only in hours a code fires),
-  1 `tv_order_update_reconnections_total` (host-dimensioned, /metrics-derived).
+  2 host-dimensioned /metrics-derived counters
+  (`tv_order_update_reconnections_total`,
+  `tv_feed_sidecar_stall_restart_total`).
 - The readiness Lambda logs its verdict on every run (silent-healthy mornings
   are visible in its log group); its AWS/Lambda Errors alarm watches the
   watchman.
@@ -260,7 +292,7 @@ flapper invisible) is the proof.
   agent configs carry them — the next sink move (code-side OR config-side)
   fails the build instead of silently re-blinding every filter (round-2
   review fix: literal-only pinning missed the code-side vector).
-- Alarm-count honesty: 33 → 43 (verified real count across 11 .tf files;
+- Alarm-count honesty: 33 → 44 (verified real count across 12 .tf files;
   the rule-file "10 free tier" claims were already stale pre-PR). Realistic
   cost delta ≈ +$1.2-1.5/mo (~₹105-130 incl 18% GST), inside the $35 pre-GST
   budget-alarm ceiling.
@@ -279,6 +311,7 @@ table); the honest-100% envelope wording is in the header block above.
 - [x] P1 log-shipping fix — Files: deploy/aws/cloudwatch-agent.json, deploy/aws/terraform/user-data.sh.tftpl, .github/workflows/deploy-aws.yml, crates/common/tests/cloudwatch_app_alarms_wiring.rs — Tests: test_cw_agent_collects_machine_log_paths
 - [x] P2 error-code filters+alarms — Files: deploy/aws/terraform/error-code-alarms.tf — Tests: terraform validate + post-apply fire drill
 - [x] P3 reconnect-storm — Files: deploy/aws/terraform/order-update-reconnect-storm-alarm.tf, deploy/aws/terraform/market-hours-liveness-alarm.tf — Tests: terraform validate
+- [x] P3b feed-stall restart pager (round-3 review fix) — Files: deploy/aws/terraform/feed-stall-restart-alarm.tf, deploy/aws/terraform/error-code-alarms.tf (feed-stall-01 entry retuned to the storm-escalation tripwire) — Tests: terraform validate
 - [x] P4 readiness pager — Files: deploy/aws/terraform/market-open-readiness-lambda.tf, deploy/aws/lambda/market-open-readiness/handler.py, deploy/aws/lambda/market-open-readiness/test_handler.py — Tests: test_running_and_booted_is_ready_silent, test_running_without_boot_metric_pages_not_booted, test_stopped_with_stale_launch_pages_not_running, test_stopped_after_holiday_gate_self_stop_is_silent, test_stopping_after_holiday_gate_self_stop_is_silent, test_stopped_with_early_launch_pages_not_running, test_pending_pages_not_running, test_probe_error_pages_verify_failed, test_subjects_are_ascii_and_within_sns_limit, test_holiday_cutoff_boundary_0825_ist, test_sns_publish_failure_propagates, test_handler_drill_mode_force_publishes_test_page, test_drill_verdict_never_returned_by_classifier
 - [x] P5 runbook truth-sync — Files: .claude/rules/project/dhan-rest-canary-error-codes.md, .claude/rules/project/observability-architecture.md, .claude/rules/project/wave-4-error-codes.md, .claude/rules/project/ws-reinject-error-codes.md, .claude/rules/project/dual-instance-lock-2026-07-04.md, .claude/rules/project/feed-stall-watchdog-error-codes.md, .claude/rules/project/wave-2-error-codes.md, CLAUDE.md — Tests: n/a (docs)
 
@@ -297,3 +330,7 @@ table); the honest-100% envelope wording is in the header block above.
 | 9 | Operator invokes the readiness Lambda with `{"mode":"drill"}` (any time, any EC2 state) | 🧪 test page through the real SNS→Telegram path — the end-to-end proof for leg 2 |
 | 10 | Budget breach_stop / killswitch / portal stop lands 08:25-08:45 IST | readiness classifies HOLIDAY_SILENT, but the stopping path itself already paged (breach_stop/killswitch publish before stopping); boot-heartbeat gate window is the backstop |
 | 11 | Order-update WS flaps slower than ~1 cycle / 3 min | NOT paged — stated residual (detection floor >5 per 15 min); durable-down alarm owns full outages |
+| 12 | Groww sidecar stall-flaps at a ~90s-300s cycle (warn!-level restarts, no storm escalation) | `tv-prod-feed-stall-restarts` counter alarm pages (Sum ≥ 3 restarts per 15-min window) — round-3 fix; the errcode alarm alone could NEVER see this band (zero ERROR lines) |
+| 13 | Groww sidecar stall-flaps at a <~50s cycle (>5 restarts / 5 min) | BOTH page: the sidecar's storm-escalation ERROR line trips errcode-feed-stall-01 within ~5 min AND the counter alarm trips within the 15-min window |
+| 14 | Single Groww stall-restart that recovers | NO page on either route (self-heal by design; 1 < threshold 3, warn!-level line matches no filter) |
+| 15 | Groww stall-flap slower than ~1 restart / 5 min | NOT paged — stated residual (restart-pager floor <3 per aligned 15-min window; tumbling not sliding) |

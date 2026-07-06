@@ -51,8 +51,16 @@
 # (metrics-log-metric-filters.tf). So: log metric filter on /metrics; NO
 # allowlist edit, NO Rust pin rename.
 #
-# Future-compatible: if the counter is ever EMF-allowlisted, the same metric
-# identity dual-publishes harmlessly (tv_boot_completed precedent).
+# Future EMF-allowlisting (round-3 review fix, 2026-07-06): if the counter is
+# ever added to the EMF metric_selectors allowlist, REMOVE this log metric
+# filter in the same PR (or switch the alarm to a deduplicated source): both
+# pipelines would publish the same per-scrape delta into the same metric
+# identity, and under this alarm's Sum statistic every reconnect would count
+# TWICE — halving the effective storm threshold to ~2.5 cycles/15 min
+# (over-pages; fail-loud, never a silent miss). The tv_boot_completed
+# dual-publish precedent is harmless ONLY for its Maximum-stat consumers
+# (market-hours-liveness-alarm.tf + the readiness Lambda) — idempotence under
+# duplicate datapoints does not transfer to Sum.
 # =============================================================================
 
 resource "aws_cloudwatch_log_metric_filter" "order_update_reconnections_fallback" {
