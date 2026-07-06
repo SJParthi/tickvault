@@ -428,6 +428,14 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7.0.0
 
+      # 2026-07-05: guards that the hot-path filter paths inside the two
+      # scanners below always match REAL files — a rename can never blind
+      # them again (the pre-fix filters referenced crates/websocket/,
+      # crates/oms/ and core/src/ticker/, none of which exist).
+      - name: Hot-path scanner self-test (zero-match guard)
+        shell: bash
+        run: bash .claude/hooks/hot-path-scanner-selftest.sh "$GITHUB_WORKSPACE"
+
       - name: Banned pattern scan (full workspace)
         shell: bash
         run: |
