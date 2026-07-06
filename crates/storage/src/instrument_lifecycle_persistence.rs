@@ -1121,6 +1121,77 @@ pub fn build_lifecycle_state_update_sql(
     )
 }
 
+/// Build the FEED-SCOPED state-flip UPDATE — identical SET clause to
+/// [`build_lifecycle_state_update_sql`], with two extra WHERE predicates:
+/// `AND feed = '<feed>' AND dry_run = false`.
+///
+/// Required for any multi-feed caller (the Groww shared-master writer's
+/// disappearance flips): with `feed` in the composite identity (operator
+/// override 2026-06-28, `data-integrity.md` "feed-in-key EVERYWHERE"), a
+/// Dhan row and a Groww row can share the same
+/// `(security_id, exchange_segment)` — an un-scoped UPDATE would flip
+/// BOTH feeds' rows. The `dry_run = false` predicate preserves §27
+/// isolation (a live flip must never mutate `--dry-run-universe` rows).
+///
+/// `exchange_segment` and `feed` are sanitized; `new_state` is a static
+/// enum string; numerics are typed — no injection surface.
+#[must_use]
+pub fn build_lifecycle_state_update_sql_for_feed(
+    security_id: i64,
+    exchange_segment: &str,
+    new_state: LifecycleState,
+    expired_date_nanos: i64,
+    last_update_ts_nanos: i64,
+    feed: &str,
+) -> String {
+    let segment = sanitize_audit_string(exchange_segment);
+    let feed = sanitize_audit_string(feed);
+    let state = new_state.as_str();
+    let expired_micros = expired_date_nanos / 1_000;
+    let last_update_micros = last_update_ts_nanos / 1_000;
+    format!(
+        "UPDATE {QUESTDB_TABLE_INSTRUMENT_LIFECYCLE} \
+         SET lifecycle_state = '{state}', expired_date = {expired_micros}, \
+         last_update_ts = {last_update_micros} \
+         WHERE security_id = {security_id} AND exchange_segment = '{segment}' \
+         AND feed = '{feed}' AND dry_run = false;"
+    )
+}
+
+/// Execute one `instrument_lifecycle` UPDATE statement over `/exec`.
+/// Shared HTTP glue for the UPDATE helpers below (`label` names the
+/// caller in the error message).
+async fn exec_lifecycle_update(
+    questdb_config: &QuestDbConfig,
+    sql: &str,
+    label: &'static str,
+) -> anyhow::Result<()> {
+    let base_url = format!(
+        "http://{}:{}/exec",
+        questdb_config.host, questdb_config.http_port
+    );
+    let client = Client::builder()
+        .timeout(Duration::from_secs(QUESTDB_EXEC_TIMEOUT_SECS))
+        .build()?;
+    let resp = client
+        .get(&base_url)
+        .query(&[("query", sql)])
+        .send()
+        .await?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body: String = resp
+            .text()
+            .await
+            .unwrap_or_default()
+            .chars()
+            .take(200)
+            .collect();
+        anyhow::bail!("{label} non-2xx ({status}): {body}");
+    }
+    Ok(())
+}
+
 /// Flip an `instrument_lifecycle` row's state in place (expiry /
 /// segment-move / reactivation-without-fresh-attrs). Cold path — called
 /// by the daily reconciler per disappearance transition.
@@ -1137,13 +1208,6 @@ pub async fn update_lifecycle_state(
     expired_date_nanos: i64,
     last_update_ts_nanos: i64,
 ) -> anyhow::Result<()> {
-    let base_url = format!(
-        "http://{}:{}/exec",
-        questdb_config.host, questdb_config.http_port
-    );
-    let client = Client::builder()
-        .timeout(Duration::from_secs(QUESTDB_EXEC_TIMEOUT_SECS))
-        .build()?;
     let sql = build_lifecycle_state_update_sql(
         security_id,
         exchange_segment,
@@ -1151,23 +1215,42 @@ pub async fn update_lifecycle_state(
         expired_date_nanos,
         last_update_ts_nanos,
     );
-    let resp = client
-        .get(&base_url)
-        .query(&[("query", sql.as_str())])
-        .send()
-        .await?;
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let body: String = resp
-            .text()
-            .await
-            .unwrap_or_default()
-            .chars()
-            .take(200)
-            .collect();
-        anyhow::bail!("instrument_lifecycle UPDATE non-2xx ({status}): {body}");
-    }
-    Ok(())
+    exec_lifecycle_update(questdb_config, &sql, "instrument_lifecycle UPDATE").await
+}
+
+/// Feed-scoped variant of [`update_lifecycle_state`] — the WHERE clause
+/// additionally pins `feed = '<feed>' AND dry_run = false` so a flip for
+/// one feed can never mutate the other feed's row for the same
+/// `(security_id, exchange_segment)`, nor a §27 dry-run row. Used by the
+/// Groww shared-master writer's disappearance flips.
+///
+/// # Errors
+///
+/// Propagates the `reqwest` transport error, or returns `Err` on a
+/// non-2xx `/exec` response.
+pub async fn update_lifecycle_state_for_feed(
+    questdb_config: &QuestDbConfig,
+    security_id: i64,
+    exchange_segment: &str,
+    new_state: LifecycleState,
+    expired_date_nanos: i64,
+    last_update_ts_nanos: i64,
+    feed: &str,
+) -> anyhow::Result<()> {
+    let sql = build_lifecycle_state_update_sql_for_feed(
+        security_id,
+        exchange_segment,
+        new_state,
+        expired_date_nanos,
+        last_update_ts_nanos,
+        feed,
+    );
+    exec_lifecycle_update(
+        questdb_config,
+        &sql,
+        "instrument_lifecycle feed-scoped UPDATE",
+    )
+    .await
 }
 
 // ============================================================================
@@ -1175,11 +1258,19 @@ pub async fn update_lifecycle_state(
 // ============================================================================
 
 /// Build the O(1) warm-boot UPDATE: bump `last_seen_date` + `last_active_date`
-/// (+ `last_update_ts`) for ALL `active` rows in ONE statement. Used when the
-/// daily CSV SHA-256 is unchanged from the last boot — the universe is
+/// (+ `last_update_ts`) for the Dhan `active` rows in ONE statement. Used when
+/// the daily CSV SHA-256 is unchanged from the last boot — the universe is
 /// identical and already persisted, so re-UPSERTing every row is pure waste.
 /// This is O(1) in HTTP requests regardless of universe size (331 or 2M rows).
 /// PURE (no I/O) — extracted for deterministic testing.
+///
+/// SCOPED to `feed = 'dhan' AND dry_run = false` (fix 2026-07-05): this bump
+/// runs on the DHAN warm-skip path only — without the predicates it mutated
+/// `feed='groww'` rows (cross-feed contamination under the feed-in-key model,
+/// operator override 2026-06-28) AND §27 dry-run rows (isolation breach). The
+/// boot-time feed self-heal backfills legacy NULL-feed rows to `'dhan'`
+/// BEFORE this warm path can run, so the `feed = 'dhan'` predicate never
+/// misses a legitimate Dhan row.
 #[must_use]
 pub fn build_bump_active_last_seen_sql(today_ist_nanos: i64, last_update_ts_nanos: i64) -> String {
     let today_micros = today_ist_nanos / 1_000;
@@ -1191,7 +1282,8 @@ pub fn build_bump_active_last_seen_sql(today_ist_nanos: i64, last_update_ts_nano
         "UPDATE {QUESTDB_TABLE_INSTRUMENT_LIFECYCLE} \
          SET last_seen_date = {today_micros}, last_active_date = {today_micros}, \
          last_update_ts = {last_update_micros} \
-         WHERE lifecycle_state = '{active}';"
+         WHERE lifecycle_state = '{active}' \
+         AND feed = '{LIFECYCLE_FEED_DHAN}' AND dry_run = false;"
     )
 }
 
@@ -2164,11 +2256,119 @@ mod tests {
         assert!(sql.contains("last_update_ts = 1700000000000000"));
         // O(1) win: ONE statement scoped to active rows, no per-row VALUES.
         assert!(sql.contains("WHERE lifecycle_state = 'active'"));
+        // 2026-07-05 fix pin: the Dhan warm-skip bump MUST be scoped to
+        // feed='dhan' + dry_run=false — an unscoped UPDATE mutated
+        // feed='groww' rows AND §27 dry-run rows.
+        assert!(
+            sql.contains("feed = 'dhan'"),
+            "warm bump must be scoped to feed='dhan' (never mutate groww rows): {sql}"
+        );
+        assert!(
+            sql.contains("dry_run = false"),
+            "warm bump must exclude §27 dry-run rows: {sql}"
+        );
         assert!(
             !sql.contains("VALUES"),
             "warm bump is an UPDATE, never an INSERT"
         );
         assert!(sql.ends_with(';'));
+    }
+
+    // ========================================================================
+    // update_lifecycle_state_for_feed (feed-scoped state-flip) tests
+    // ========================================================================
+
+    #[test]
+    fn test_build_lifecycle_state_update_sql_for_feed_shape_and_predicates() {
+        let sql = build_lifecycle_state_update_sql_for_feed(
+            2885,
+            "NSE_EQ",
+            LifecycleState::ExpiredFromFno,
+            1_700_100_000_000_000_000,
+            1_700_000_000_000_000_000,
+            "groww",
+        );
+        assert!(sql.starts_with("UPDATE instrument_lifecycle SET"));
+        assert!(sql.contains("lifecycle_state = 'expired_from_fno'"));
+        // nanos → micros (year-9999 guard), same as the un-scoped builder.
+        assert!(sql.contains("expired_date = 1700100000000000"));
+        assert!(sql.contains("last_update_ts = 1700000000000000"));
+        // I-P1-11 composite WHERE key + the feed-in-key scoping predicates.
+        assert!(sql.contains("WHERE security_id = 2885 AND exchange_segment = 'NSE_EQ'"));
+        assert!(
+            sql.contains("AND feed = 'groww'"),
+            "feed-scoped flip must pin the feed: {sql}"
+        );
+        assert!(
+            sql.contains("AND dry_run = false"),
+            "feed-scoped flip must exclude §27 dry-run rows: {sql}"
+        );
+        assert!(sql.ends_with(';'));
+    }
+
+    #[test]
+    fn test_build_lifecycle_state_update_sql_for_feed_never_touches_dedup_key_columns() {
+        // Same contract as the un-scoped builder: SET assigns only
+        // lifecycle_state / expired_date / last_update_ts — never a
+        // DEDUP-key column (ts, security_id, exchange_segment, feed).
+        let sql = build_lifecycle_state_update_sql_for_feed(
+            1,
+            "NSE_EQ",
+            LifecycleState::Active,
+            0,
+            0,
+            "groww",
+        );
+        let set_clause = sql
+            .split("SET")
+            .nth(1)
+            .and_then(|s| s.split("WHERE").next())
+            .expect("SET ... WHERE present");
+        let allowed = ["lifecycle_state", "expired_date", "last_update_ts"];
+        for assignment in set_clause.split(',') {
+            let lhs = assignment
+                .split('=')
+                .next()
+                .map(str::trim)
+                .unwrap_or_default();
+            assert!(
+                allowed.contains(&lhs),
+                "SET assigns unexpected column `{lhs}` — must be one of {allowed:?} \
+                 (never a DEDUP-key column such as feed)"
+            );
+        }
+    }
+
+    #[test]
+    fn test_build_lifecycle_state_update_sql_for_feed_sanitizes_injection() {
+        let sql = build_lifecycle_state_update_sql_for_feed(
+            1,
+            "'); DROP TABLE instrument_lifecycle;--",
+            LifecycleState::ExpiredIndex,
+            0,
+            0,
+            "'); DROP TABLE instrument_lifecycle;--",
+        );
+        assert!(
+            !sql.contains("DROP TABLE instrument_lifecycle;"),
+            "segment + feed injection must be neutralized: {sql}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_update_lifecycle_state_for_feed_returns_err_when_questdb_unreachable() {
+        let cfg = cfg_unreachable();
+        let result = update_lifecycle_state_for_feed(
+            &cfg,
+            2885,
+            "NSE_EQ",
+            LifecycleState::ExpiredFromFno,
+            1_700_100_000_000_000_000,
+            1_700_000_000_000_000_000,
+            "groww",
+        )
+        .await;
+        assert!(result.is_err(), "must propagate transport error");
     }
 
     #[tokio::test]
