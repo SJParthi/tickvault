@@ -132,6 +132,36 @@ so it routes through Telegram per `error_level_meta_guard.rs` Rule 5.
 **Source:** `crates/storage/src/shadow_persistence.rs::ShadowCandleWriter`
 + existing fix at `candle_persistence.rs::flush_buffer` (legacy path).
 
+### 2026-07-06 Update — silent candle-persist exam bug closed (HTTP ACK + loud loop)
+
+The 2026-07-06 groww-only live exam exposed the worst-case silent variant:
+~71K candles sealed in RAM, ZERO rows in the `candles_*` tables, ZERO log
+lines from the seal-writer leg — no AGGREGATOR-SEAL-01, no heartbeat. Two
+verified holes, both fixed on branch `claude/fix-candle-writer-recovery`:
+
+1. **Fire-and-forget ILP TCP** — `ShadowCandleWriter` used
+   `tcp::addr=host:ilp_port`. A server-side reject NEVER returned `Err`
+   (the same class as the 2026-07-05 `ws_event_audit` empty-table
+   incident), so every drain cycle "flushed Ok" (or quietly recovered via
+   reconnect+replay at `debug!`) while QuestDB discarded the rows. The
+   writer now uses **ILP-over-HTTP**
+   (`http::addr=host:http_port;protocol_version=1;`) — every flush gets a
+   per-request server ACK, so a reject surfaces as `Err`, `drain_once`
+   fires `error!(code = AGGREGATOR-SEAL-01)` and the ring→spill→DLQ rescue
+   engages. Reconnect + same-buffer replay is KEPT (recovery now logs at
+   `info!`, matching the tick writer's visible line). Ratchet:
+   `shadow_candle_writer::tests::test_ilp_conf_targets_http_port_not_tcp`.
+2. **The loop dropped every `CycleOutcome`** — the Wave-6 item-1.4 counter
+   fan-out was never wired, and truly-dropped seals never fired
+   AGGREGATOR-DROP-01. `run_seal_writer_loop` now fans every cycle into
+   `tv_seal_writer_drain_total{kind=submitted|flushed_rows|flush_failed|
+   rescued_spill|rescued_dlq|dropped}`, fires
+   `error!(code = ErrorCode::AggregatorDrop01.code_str())` on any
+   truly-dropped seal, and emits an UNCONDITIONAL once-per-60s `info!`
+   progress report (`SEAL_WRITER_PROGRESS_REPORT_SECS`) — silence can never
+   again mean unknown. Ratchet:
+   `seal_writer_loop::tests::test_ratchet_loop_wires_observability_not_silence`.
+
 ## AGGREGATOR-HB-01 — per-minute aggregator seal-burst heartbeat (positive signal)
 
 **Trigger:** every minute boundary, after the seal burst completes, the
