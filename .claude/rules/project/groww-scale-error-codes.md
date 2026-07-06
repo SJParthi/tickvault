@@ -1,4 +1,4 @@
-# Groww Auto-Scale Ladder — Error Codes (GROWW-SCALE-01..04)
+# Groww Auto-Scale Ladder — Error Codes (GROWW-SCALE-01..05)
 
 > **Authority:** CLAUDE.md > `operator-charter-forever.md` §C/§F >
 > `groww-second-feed-scope-2026-06-19.md` §34 (the multi-connection
@@ -10,7 +10,10 @@
 > when auto scale up happens if there is any failure how that can be auto
 > corrected"* + Mac-first execution confirmed.
 > **Companion code:** `crates/common/src/error_code.rs::ErrorCode::{GrowwScale01RollbackFired,
-> GrowwScale02GlobalHalve, GrowwScale03ShardOverlap, GrowwScale04AuditWriteFailed}`,
+> GrowwScale02GlobalHalve, GrowwScale03ShardOverlap, GrowwScale04AuditWriteFailed,
+> GrowwScale05DualFleetDetected}`,
+> `crates/app/src/groww_scale_lock.rs` (the fleet dual-instance lock gate) +
+> `crates/core/src/instance_lock.rs` (the named-lock machinery it reuses),
 > `crates/core/src/feed/groww/shard_cutter.rs` (the fail-closed cutter),
 > `crates/common/src/config.rs::GrowwScaleConfig` (`[feeds.groww.scale]`).
 > Ladder emit sites land in PR-2 (`crates/app/src/groww_scale_ladder.rs` +
@@ -18,7 +21,8 @@
 > `.claude/plans/active-plan-groww-autoscale.md`.
 > **Cross-ref:** `crates/common/tests/error_code_rule_file_crossref.rs` requires
 > this file to mention every `GrowwScale0*` variant verbatim — `GROWW-SCALE-01`,
-> `GROWW-SCALE-02`, `GROWW-SCALE-03`, `GROWW-SCALE-04` appear below.
+> `GROWW-SCALE-02`, `GROWW-SCALE-03`, `GROWW-SCALE-04`, `GROWW-SCALE-05` appear
+> below.
 
 ---
 
@@ -91,9 +95,17 @@ never auto-actioned).
 union == watch-set, no duplicate `(exchange, segment, security_id)` identity)
 was violated at a ladder step, OR the runtime duplicate-SID detector (PR-2)
 saw the same instrument streaming from two shard files. The ladder step HALTs
-fail-closed; the younger conflicting connection is killed. The `ticks` DEDUP
-key `(ts, security_id, segment, capture_seq, feed)` still prevents duplicate
-rows — this code is about the CONTRACT violation, not data loss.
+fail-closed; the younger conflicting connection is killed.
+
+**CORRECTED 2026-07-04 (Session-B verdict — the earlier DEDUP claim here was
+REFUTED):** the `ticks` DEDUP key `(ts, security_id, segment, capture_seq,
+feed)` does NOT prevent duplicate rows on cross-connection overlap —
+`capture_seq` is globally unique and IN the key, so two connections streaming
+the SAME instrument produce DISTINCT `capture_seq` values → two rows per tick.
+Overlap = **silent duplicate-row data corruption** until the PR-2 runtime
+duplicate-SID detector ships. The cut-time fail-closed cutter (`cut_shards`
+disjointness + coverage assertion) is the ACTUAL protection — which is exactly
+why this code is Critical, not Medium.
 
 **Triage:**
 1. This should be unreachable (the cutter ratchet tests pin the invariant) —
@@ -121,11 +133,103 @@ fail-safe, never an unverified one).
 2. The next transition re-appends normally (DEDUP UPSERT keys make replays
    idempotent).
 
+## §4b. GROWW-SCALE-05 — dual scale-fleet instance detected (fleet spawn refused)
+
+> Added 2026-07-04 (Session-B fix plan, operator go 2026-07-04 — "fixing and
+> working?"). `ErrorCode::GrowwScale05DualFleetDetected`.
+
+**Severity:** Critical. **Auto-triage safe:** No (Critical is never
+auto-actioned; the refusal is the fail-closed protection itself).
+
+**Trigger:** a scale-enabled boot (`make scale-test` / `scale-smoke` / any
+boot with `feeds.groww.scale.enabled = true`, which runs with Dhan OFF and
+therefore NEVER reaches the Dhan RESILIENCE-01 lock in `start_dhan_lane`)
+attempted to acquire the **Groww-fleet dual-instance SSM lock**
+(`/tickvault/<env>/instance-lock-groww-scale` — deliberately OUTSIDE the
+banned `/tickvault/<env>/groww/*` namespace per the token-minter lock; reuses
+the `instance_lock.rs` machinery via the named-lock knob) and was refused:
+
+- **AlreadyHeld** — another tickvault instance (Mac + AWS, or two Macs) is
+  ALREADY running a scale fleet against the SAME Groww account. Before this
+  lock, that failure masqueraded as provider throttle (repeating close/auth
+  rejects) with triage pointing at Groww, never at a peer instance.
+- **SSM unavailable** — the bounded 3-attempt (2s/4s backoff, the same budget
+  as the Dhan Step 6a-prime lock) retry exhausted. Fail-closed: we cannot
+  prove there is no peer, so the fleet is refused.
+- **Lock lost mid-run** — the fleet-lock heartbeat observed a foreign
+  takeover (renewal returned not-owned) and exited after paging.
+- **Renewals stale past TTL** — the heartbeat's SSM renewals failed
+  CONSECUTIVELY for ≥ the full 90s TTL (3 × 30s — e.g. an SSM partition on
+  the lock holder). Escalated ONCE per failure episode (the
+  `consecutive_failures` field): a legitimately booting peer can take the
+  stale slot and run a SECOND fleet while this holder's renewals keep
+  erroring, and the mid-run loss page cannot fire until connectivity
+  recovers — this escalation closes that previously-unpaged window
+  (2026-07-04 adversarial-review MEDIUM fix). The heartbeat keeps retrying
+  after the escalation.
+
+**Delivery boundary (HONEST — no false-OK):** GROWW-SCALE-05 has NO typed
+Telegram `NotificationEvent` variant and NO dedicated CloudWatch alarm yet.
+Every emission is `error!` → the log-sink chain (stdout / app.log /
+errors.log / errors.jsonl) → the generic ERROR→CloudWatch-log routing. At
+the boot-gate stage the deferred Telegram notifier slot is unfilled by
+design, so "pages Critical" here means **log-sink +
+CloudWatch-log-derived alerting only** until a typed NotificationEvent
+lands (tracked follow-up). `mcp__tickvault-logs__tail_errors` is the
+authoritative surface for this code today.
+
+**Consequence (degrade, NOT halt):** the multi-connection fleet + ladder +
+shard bridges are SKIPPED for this boot; the boot falls back to the proven
+SINGLE-CONNECTION Groww path (identical fallback semantics to a failed scale
+PREFLIGHT — capture continues; only the multi-conn experiment is refused).
+The rest of the app keeps running.
+
+**Triage:**
+1. `mcp__tickvault-logs__tail_errors` — find `GROWW-SCALE-05`; the payload
+   carries `peer` (the holder's `host_id`: `<aws-instance-or-local>:<pid>:<hex>`)
+   or the SSM `error` string.
+2. AlreadyHeld with a live peer: decide which host should run the scale test;
+   stop the other (its heartbeat releases on shutdown, or the 90s TTL clears a
+   crashed holder automatically). A repeating GROWW-SCALE-05 on a scheduled
+   Mac scale test means the AWS box is ALSO scale-enabled — fix the config on
+   the box, do not fight the lock.
+3. SSM-unavailable: check AWS credentials/network on the host (`aws sts
+   get-caller-identity`); the Groww token read uses the same SSM reachability,
+   so a sustained outage will surface there too.
+4. Corrupt lock JSON: `aws ssm get-parameter --name
+   /tickvault/<env>/instance-lock-groww-scale`, then
+   `aws ssm delete-parameter` after confirming no peer is live.
+
+**Honest envelope:** the lock gates the FLEET spawn only (smallest safe
+scope) — the single-conn Groww path is NOT gated, so two hosts each running
+single-conn remain possible (pre-existing behavior, unchanged).
+
+- **Clean shutdown RELEASES the lock** (2026-07-04 adversarial-review HIGH
+  fix): the graceful SIGINT/SIGTERM path calls
+  `GrowwScaleFleetLockGuard::release_on_shutdown()` inside
+  `run_process_runloop` — bounded 5s wait for the SSM DeleteParameter — so
+  a same-host restart (the dominant Mac scale-test iteration workflow)
+  re-acquires IMMEDIATELY instead of seeing its own dead slot as a peer.
+- **Hard crash (kill -9 / panic-abort) still relies on the 90s TTL**: a
+  restart within that window sees AlreadyHeld, falls back to single-conn
+  for the WHOLE session (the gate runs once at boot — no mid-run
+  re-acquire), and fires a GROWW-SCALE-05 page whose `peer` is your own
+  previous `host_id`. Recovery: wait ~90s after a crash, then restart.
+- **Stale-takeover race**: two boots that BOTH observe the same stale slot
+  can BOTH return Acquired (PutParameter overwrite has no compare-and-swap);
+  the loser detects foreign ownership at its first renewal (≤30s) and pages
+  — but its already-running fleet is NOT torn down, so the dual-fleet state
+  persists until the operator stops one host (one Critical page, then
+  coexistence — bounded-loud, not self-healing).
+- **A mid-run foreign takeover pages but does NOT tear down an
+  already-running fleet** (the collision is loud, never silent). Wiring the
+  guard's `held` flag into a ladder freeze/teardown is the PR-2 follow-up.
+
 ## §5. Honest envelope (§F wording)
 
 > "100% inside the tested envelope, with ratcheted regression coverage: the
 > 16-row failure taxonomy of the auto-scale design maps every failure class to
-> one of these four codes or an existing code (FEED-STALL-01,
+> one of these five codes or an existing code (FEED-STALL-01,
 > FEED-SUPERVISOR-01, PROC-01, RESOURCE-01..03, BOOT-01/02); rollback always
 > returns to a KNOWN-healthy rung; the cutter invariant is build-failing
 > ratcheted. NOT claimed: Groww's server-side connection/subscription caps —
@@ -141,5 +245,8 @@ This rule activates when editing:
 - `crates/common/src/config.rs` (`GrowwScaleConfig`)
 - Future `crates/app/src/groww_scale_ladder.rs` /
   `crates/storage/src/groww_scale_audit_persistence.rs` (PR-2)
+- `crates/app/src/groww_scale_lock.rs` / `crates/core/src/instance_lock.rs`
+  (the named-lock machinery)
 - Any file containing `GROWW-SCALE-`, `GrowwScale0`, `cut_shards`,
-  `groww_scale_audit`, or `tv_groww_scale_rollbacks_total`
+  `groww_scale_audit`, `tv_groww_scale_rollbacks_total`,
+  `acquire_groww_scale_fleet_lock`, or `instance-lock-groww-scale`

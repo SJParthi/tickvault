@@ -1,5 +1,5 @@
 [Unit]
-Description=tickvault Tailscale Funnel — exposes observability ports for Claude MCP access
+Description=tickvault Tailscale Funnel — exposes the tickvault API (3001) for Claude MCP access
 Documentation=file:///home/ec2-user/tickvault/docs/runbooks/claude-mcp-access.md
 After=network-online.target tailscaled.service
 Wants=network-online.target tailscaled.service
@@ -7,7 +7,11 @@ Wants=network-online.target tailscaled.service
 [Service]
 Type=simple
 # Funnel foreground mode so systemd owns the lifecycle.
-ExecStart=/usr/bin/tailscale funnel 9090 9093 9000 3000 3001
+# Security trim 2026-07-04: ONLY the tickvault API (3001, bearer-auth) is
+# funnelled. Prometheus 9090 / Alertmanager 9093 / Grafana 3000 are retired
+# (CloudWatch-only migration); QuestDB 9000 is intentionally NO LONGER
+# funnelled — it is an auth-less raw-SQL surface (local access only).
+ExecStart=/usr/bin/tailscale funnel 3001
 ExecStopPost=/usr/bin/tailscale funnel reset
 Restart=always
 RestartSec=10

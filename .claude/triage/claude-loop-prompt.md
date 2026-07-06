@@ -16,7 +16,7 @@ summary on Telegram, so no wall-of-text.
 
 ### Step 1 — Read the current summary
 
-Read `data/logs/errors.summary.md` (the summary_writer task regenerates
+Read `data/logs/machine/errors.summary.md` (the summary_writer task regenerates
 it every 60s). If the file is missing or contains "Zero ERROR-level
 events in the lookback window" — output one line `all_green` and stop.
 

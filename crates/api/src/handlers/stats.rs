@@ -17,7 +17,8 @@ const QUESTDB_STATS_TIMEOUT_SECS: u64 = 3;
 /// `reqwest::Client::builder().build()` only fails if the TLS backend
 /// cannot be initialised, which never happens at runtime. The function
 /// returns a default client as ultimate fallback.
-fn build_stats_client(timeout_secs: u64) -> reqwest::Client {
+/// `pub(crate)`: reused by the Live Board aggregator (`handlers::board`).
+pub(crate) fn build_stats_client(timeout_secs: u64) -> reqwest::Client {
     reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(timeout_secs))
         .build()
@@ -79,7 +80,12 @@ pub async fn get_stats(State(state): State<SharedAppState>) -> Json<StatsRespons
 }
 
 /// Runs a count query against QuestDB's HTTP endpoint. Returns None on failure.
-async fn query_count(client: &reqwest::Client, base_url: &str, sql: &str) -> Option<u64> {
+/// `pub(crate)`: reused by the Live Board aggregator (`handlers::board`).
+pub(crate) async fn query_count(
+    client: &reqwest::Client,
+    base_url: &str,
+    sql: &str,
+) -> Option<u64> {
     let url = format!("{}/exec", base_url);
     let resp = client
         .get(&url)
@@ -102,6 +108,14 @@ async fn query_count(client: &reqwest::Client, base_url: &str, sql: &str) -> Opt
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_build_stats_client_constructs_with_timeout() {
+        // pub(crate) reuse surface (Live Board): the builder must always
+        // yield a usable client (falls back to default on builder failure).
+        let client = build_stats_client(1);
+        assert!(!format!("{client:?}").is_empty());
+    }
 
     #[test]
     fn test_stats_response_serialization() {

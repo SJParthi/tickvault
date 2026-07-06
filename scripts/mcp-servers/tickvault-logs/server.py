@@ -177,6 +177,24 @@ def _state_dir() -> Path:
     return _repo_root() / ".claude" / "state"
 
 
+def _machine_logs_dir() -> Path:
+    """Machine log sink directory (2026-07-05 operator directive).
+
+    Every robot file the app writes (errors.jsonl.*, errors.summary.md,
+    errors.log, hourly app captures, candles/, live_ticks/) lives under
+    `data/logs/machine/`; the `data/logs/` top level is the human log
+    surface (tickvault.log symlink + app.<IST-date>.log daily rolling).
+
+    Grace window: if the machine subdir does not exist yet (app not
+    upgraded / restarted), fall back to the legacy top-level dir so the
+    MCP tools never go dark mid-transition.
+    """
+    machine = _logs_dir() / "machine"
+    if machine.is_dir():
+        return machine
+    return _logs_dir()
+
+
 ERRORS_JSONL_PREFIX = "errors.jsonl"
 SUMMARY_FILENAME = "errors.summary.md"
 AUTO_FIX_LOG = "auto-fix.log"
@@ -189,13 +207,22 @@ TRIAGE_SEEN = "triage-seen.jsonl"
 
 
 def _iter_errors_jsonl_files(dir_path: Path) -> list[Path]:
-    """Newest-first list of errors.jsonl.* files under dir_path."""
-    if not dir_path.is_dir():
-        return []
-    out: list[Path] = []
-    for entry in dir_path.iterdir():
-        if entry.is_file() and entry.name.startswith(ERRORS_JSONL_PREFIX):
-            out.append(entry)
+    """Newest-first list of errors.jsonl.* files under dir_path.
+
+    2026-07-05 grace window: also merges legacy top-level files when
+    `dir_path` is the machine subdir, so pre-move rotations stay visible
+    until the retention sweeper ages them out. Duplicate rotation names
+    prefer the machine copy.
+    """
+    seen: dict[str, Path] = {}
+    legacy_parent = dir_path.parent if dir_path.name == "machine" else None
+    for candidate_dir in [legacy_parent, dir_path]:
+        if candidate_dir is None or not candidate_dir.is_dir():
+            continue
+        for entry in candidate_dir.iterdir():
+            if entry.is_file() and entry.name.startswith(ERRORS_JSONL_PREFIX):
+                seen[entry.name] = entry
+    out = list(seen.values())
     out.sort(key=lambda p: p.name, reverse=True)
     return out
 
@@ -246,7 +273,7 @@ def tool_tail_errors(
     If `code` is given, only events with that `code` field are returned.
     Newest-first ordering.
     """
-    dir_path = _logs_dir()
+    dir_path = _machine_logs_dir()
     files = _iter_errors_jsonl_files(dir_path)
     events: list[dict[str, Any]] = []
     for f in files:
@@ -280,7 +307,7 @@ def tool_list_novel_signatures(since_minutes: int = 60) -> dict[str, Any]:
     starts. Uses the signature_hash (FNV-1a of code + target + first-160-
     chars-of-message) — identical to the Rust summary_writer.
     """
-    dir_path = _logs_dir()
+    dir_path = _machine_logs_dir()
     files = _iter_errors_jsonl_files(dir_path)
     cutoff = datetime.now(tz=timezone.utc) - timedelta(minutes=since_minutes)
 
@@ -341,7 +368,13 @@ def tool_list_novel_signatures(since_minutes: int = 60) -> dict[str, Any]:
 
 def tool_summary_snapshot() -> dict[str, Any]:
     """Returns the current errors.summary.md contents as a string."""
-    path = _logs_dir() / SUMMARY_FILENAME
+    path = _machine_logs_dir() / SUMMARY_FILENAME
+    if not path.exists():
+        # 2026-07-05 grace window: pre-move summary at the legacy
+        # top-level path (app not yet restarted on the machine/ layout).
+        legacy = _logs_dir() / SUMMARY_FILENAME
+        if legacy.exists():
+            path = legacy
     if not path.exists():
         return {
             "path": str(path),
@@ -387,7 +420,7 @@ def tool_triage_log_tail(limit: int = 50) -> dict[str, Any]:
 
 def tool_signature_history(signature: str, limit: int = 500) -> dict[str, Any]:
     """All events whose computed signature hash equals `signature`."""
-    dir_path = _logs_dir()
+    dir_path = _machine_logs_dir()
     files = _iter_errors_jsonl_files(dir_path)
     matches: list[dict[str, Any]] = []
     for f in files:
@@ -668,6 +701,14 @@ def tool_tickvault_api(
 
     Lets Claude inspect the running app's own state without the
     operator copy-pasting curl output.
+
+    Security trim 2026-07-04: `/api/debug/*` is bearer-gated and every
+    real tickvault boot enables auth (SSM token, hard-fail fetch) — so
+    tokenless calls to those paths 401 even on localhost. Set the
+    `TICKVAULT_API_BEARER_TOKEN` env var (value of SSM
+    `/tickvault/<env>/api/bearer-token`) and this tool sends it as an
+    `Authorization: Bearer` header. Env-only by design — the token is
+    never read from (or written to) the committed endpoints TOML.
     """
     import urllib.request
 
@@ -680,11 +721,39 @@ def tool_tickvault_api(
     if not path.startswith("/"):
         path = f"/{path}"
     full = f"{api_url}{path}"
+    request = urllib.request.Request(full)  # noqa: S310
+    bearer = os.environ.get("TICKVAULT_API_BEARER_TOKEN", "").strip()
+    if bearer:
+        # Security (adversarial re-review 2026-07-04): never leak the bearer
+        # token in cleartext. Attach the Authorization header ONLY when the
+        # URL is https:// or targets the local host — a plaintext http://
+        # profile value pointing at a remote host gets a refusal, not a
+        # silently-exfiltrated token. (Mirrors the portal-token plaintext
+        # refusal precedent elsewhere in this file.)
+        from urllib.parse import urlsplit
+
+        parts = urlsplit(full)
+        host = (parts.hostname or "").lower()
+        is_local = host in ("127.0.0.1", "localhost", "::1")
+        if parts.scheme != "https" and not is_local:
+            return {
+                "ok": False,
+                "error": (
+                    "refusing to send TICKVAULT_API_BEARER_TOKEN over plaintext "
+                    "http to a non-localhost host — use an https:// "
+                    "tickvault_api_url, or unset the token for the tokenless "
+                    "public GETs"
+                ),
+                "url": full,
+            }
+        request.add_header("Authorization", f"Bearer {bearer}")
     try:
-        with urllib.request.urlopen(full, timeout=10) as resp:  # noqa: S310
+        with urllib.request.urlopen(request, timeout=10) as resp:  # noqa: S310
             body = resp.read().decode("utf-8")
             status = resp.status
     except Exception as err:  # noqa: BLE001
+        # Never echo the Authorization header/token — urllib errors carry
+        # only the URL + status, not request headers.
         return {"ok": False, "error": str(err), "url": full}
     # Try JSON — fall back to raw text if not JSON.
     try:
@@ -1276,7 +1345,7 @@ TOOLS: list[ToolSpec] = [
     ToolSpec(
         name="tail_errors",
         description=(
-            "Return the last N ERROR events from data/logs/errors.jsonl.*. "
+            "Return the last N ERROR events from data/logs/machine/errors.jsonl.*. "
             "Optionally filter by `code` (e.g. 'I-P1-11', 'DH-904')."
         ),
         input_schema={

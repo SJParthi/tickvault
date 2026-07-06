@@ -199,6 +199,74 @@ impl ApiAuthConfig {
 // Middleware
 // ---------------------------------------------------------------------------
 
+/// Upper bound on the peer label taken from a forwarded header. A client IP
+/// (IPv4 dotted-quad or bracketed IPv6) never legitimately exceeds this;
+/// anything longer is attacker-shaped input and is rejected as a label.
+const PEER_LABEL_MAX_LEN: usize = 64;
+
+/// Fixed label when no peer identity is available (no `ConnectInfo`
+/// extension wired at the serve site and no forwarded header present —
+/// e.g. a direct localhost request).
+const PEER_UNKNOWN: &str = "unknown";
+
+/// Fixed label when a forwarded header was present but its first hop did
+/// not look like an IP address (log-injection / garbage defence — the raw
+/// header value is NEVER logged).
+const PEER_INVALID_FORWARDED: &str = "invalid-forwarded";
+
+/// Best-effort client-IP label for auth-failure logs (BUG-3 fix
+/// 2026-07-05): the GAP-SEC-01 warns previously carried no context, so an
+/// operator could not distinguish their own browser from a credential
+/// probe on the public funnel.
+///
+/// Sources, in order:
+///   1. `ConnectInfo<SocketAddr>` request extension (only present when the
+///      serve site uses `into_make_service_with_connect_info` — not wired
+///      today, checked defensively for the future).
+///   2. First hop of `x-forwarded-for` (set by the funnel/reverse proxy).
+///      The value is attacker-controllable, so it is sanitized: bounded
+///      length + IP-address charset only; anything else degrades to
+///      [`PEER_INVALID_FORWARDED`]. No header value is ever echoed.
+///   3. [`PEER_UNKNOWN`].
+///
+/// Cold path only (auth failures) — the allocation here never touches the
+/// tick hot path.
+fn client_peer_label(request: &Request) -> String {
+    if let Some(connect_info) = request
+        .extensions()
+        .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+    {
+        return connect_info.0.ip().to_string();
+    }
+    if let Some(forwarded) = request
+        .headers()
+        .get("x-forwarded-for")
+        .and_then(|value| value.to_str().ok())
+    {
+        return sanitize_forwarded_peer(forwarded);
+    }
+    PEER_UNKNOWN.to_string()
+}
+
+/// Pure sanitizer for the first `x-forwarded-for` hop: accepts only
+/// IP-shaped strings (ASCII hex digits, `.`, `:`, `[`, `]`) up to
+/// [`PEER_LABEL_MAX_LEN`] bytes. Everything else maps to the fixed
+/// [`PEER_INVALID_FORWARDED`] label so a hostile header can never inject
+/// arbitrary bytes into the log line.
+fn sanitize_forwarded_peer(forwarded: &str) -> String {
+    let first_hop = forwarded.split(',').next().unwrap_or("").trim();
+    let ip_shaped = !first_hop.is_empty()
+        && first_hop.len() <= PEER_LABEL_MAX_LEN
+        && first_hop
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() || matches!(c, '.' | ':' | '[' | ']'));
+    if ip_shaped {
+        first_hop.to_string()
+    } else {
+        PEER_INVALID_FORWARDED.to_string()
+    }
+}
+
 /// Bearer token validation middleware for mutating endpoints.
 ///
 /// GAP-SEC-01: Protects mutating API endpoints with bearer token auth.
@@ -215,6 +283,12 @@ pub async fn require_bearer_auth(
     if !config.enabled {
         return Ok(next.run(request).await);
     }
+
+    // BUG-3 fix (2026-07-05): auth-failure warns carry the request path
+    // (URI path only — NEVER the query string, which could carry tokens)
+    // and a sanitized peer label, so the operator can distinguish their own
+    // browser from a credential probe. Header VALUES are never logged.
+    let request_path = request.uri().path().to_string();
 
     // Extract Authorization header
     let auth_header = request
@@ -240,16 +314,28 @@ pub async fn require_bearer_auth(
             if token_match {
                 Ok(next.run(request).await)
             } else {
-                warn!("GAP-SEC-01: API auth failed — invalid bearer token");
+                warn!(
+                    path = %request_path,
+                    peer = %client_peer_label(&request),
+                    "GAP-SEC-01: API auth failed — invalid bearer token"
+                );
                 Err(StatusCode::UNAUTHORIZED)
             }
         }
         Some(_) => {
-            warn!("GAP-SEC-01: API auth failed — malformed Authorization header");
+            warn!(
+                path = %request_path,
+                peer = %client_peer_label(&request),
+                "GAP-SEC-01: API auth failed — malformed Authorization header"
+            );
             Err(StatusCode::UNAUTHORIZED)
         }
         None => {
-            warn!("GAP-SEC-01: API auth failed — missing Authorization header");
+            warn!(
+                path = %request_path,
+                peer = %client_peer_label(&request),
+                "GAP-SEC-01: API auth failed — missing Authorization header"
+            );
             Err(StatusCode::UNAUTHORIZED)
         }
     }
@@ -1403,6 +1489,116 @@ mod tests {
         assert!(
             main_rs.contains("ApiAuthConfig::from_token("),
             "main.rs MUST construct the config via ApiAuthConfig::from_token(SecretString)."
+        );
+    }
+
+    // =====================================================================
+    // BUG-3 fix (2026-07-05): auth-failure warns carry path + peer context
+    // =====================================================================
+
+    #[test]
+    fn test_sanitize_forwarded_peer_accepts_ipv4_first_hop() {
+        assert_eq!(
+            sanitize_forwarded_peer("203.0.113.7, 10.0.0.1"),
+            "203.0.113.7",
+            "first hop of a comma-separated x-forwarded-for chain is the client"
+        );
+    }
+
+    #[test]
+    fn test_sanitize_forwarded_peer_accepts_ipv6() {
+        assert_eq!(sanitize_forwarded_peer("2001:db8::1"), "2001:db8::1");
+        assert_eq!(sanitize_forwarded_peer("[2001:db8::1]"), "[2001:db8::1]");
+    }
+
+    #[test]
+    fn test_sanitize_forwarded_peer_rejects_log_injection() {
+        // Hostile header values must map to the fixed label — never echoed.
+        assert_eq!(
+            sanitize_forwarded_peer("1.2.3.4 evil\ninjected=line"),
+            PEER_INVALID_FORWARDED
+        );
+        assert_eq!(sanitize_forwarded_peer(""), PEER_INVALID_FORWARDED);
+        assert_eq!(
+            sanitize_forwarded_peer("<script>alert(1)</script>"),
+            PEER_INVALID_FORWARDED
+        );
+        // Over-long "address" is attacker-shaped input.
+        let long = "1".repeat(PEER_LABEL_MAX_LEN + 1);
+        assert_eq!(sanitize_forwarded_peer(&long), PEER_INVALID_FORWARDED);
+    }
+
+    #[test]
+    fn test_client_peer_label_unknown_without_any_source() {
+        // No ConnectInfo extension, no forwarded header → the fixed
+        // "unknown" label (direct localhost request shape).
+        let request = axum::extract::Request::builder()
+            .uri("/api/feeds/dhan")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        assert_eq!(client_peer_label(&request), PEER_UNKNOWN);
+    }
+
+    #[test]
+    fn test_client_peer_label_prefers_connect_info_over_header() {
+        let mut request = axum::extract::Request::builder()
+            .uri("/api/feeds/dhan")
+            .header("x-forwarded-for", "203.0.113.7")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let addr: std::net::SocketAddr = "192.0.2.10:55555".parse().unwrap();
+        request
+            .extensions_mut()
+            .insert(axum::extract::ConnectInfo(addr));
+        assert_eq!(
+            client_peer_label(&request),
+            "192.0.2.10",
+            "a real socket address (when the serve site wires ConnectInfo) \
+             beats the attacker-controllable forwarded header"
+        );
+    }
+
+    #[test]
+    fn test_client_peer_label_falls_back_to_forwarded_header() {
+        let request = axum::extract::Request::builder()
+            .uri("/api/feeds/dhan")
+            .header("x-forwarded-for", "203.0.113.7")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        assert_eq!(client_peer_label(&request), "203.0.113.7");
+    }
+
+    /// Source-scan ratchet: every GAP-SEC-01 auth-failure warn must carry
+    /// the `path` + `peer` structured fields (BUG-3, 2026-07-05) — and must
+    /// never log the Authorization header value.
+    #[test]
+    fn test_auth_failure_warns_carry_path_and_peer_fields() {
+        let src = include_str!("middleware.rs");
+        for needle in [
+            "API auth failed — invalid bearer token",
+            "API auth failed — malformed Authorization header",
+            "API auth failed — missing Authorization header",
+        ] {
+            let pos = src.find(needle).unwrap_or_else(|| {
+                panic!("auth-failure warn message not found in middleware.rs: {needle}")
+            });
+            // The warn! block immediately preceding the message must carry
+            // the structured fields.
+            let window = &src[pos.saturating_sub(200)..pos];
+            assert!(
+                window.contains("path = %request_path")
+                    && window.contains("peer = %client_peer_label(&request)"),
+                "the warn for '{needle}' must carry `path` + `peer` structured fields"
+            );
+        }
+        // The failure arms must never interpolate the header value itself.
+        // (Needles assembled at runtime so this test's own source never
+        // self-matches the banned literals.)
+        let banned_header_field = format!("header = %{}", "header");
+        let banned_auth_field = format!("auth_header = {}", "%");
+        assert!(
+            !src.contains(&banned_header_field) && !src.contains(&banned_auth_field),
+            "auth-failure warns must NEVER log Authorization header values"
         );
     }
 }

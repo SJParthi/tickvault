@@ -17,7 +17,61 @@
 //! if the prod-vs-dev branch disappears, the CRITICAL log string changes,
 //! or the fail-closed random-token fallback is weakened.
 
+use std::sync::Mutex;
+
 use tickvault_api::middleware::ApiAuthConfig;
+
+// ---------------------------------------------------------------------------
+// Env-var serialization guard
+//
+// Regression: 2026-07-05 — the three behavioural tests below mutate the
+// PROCESS-GLOBAL `TV_API_TOKEN` env var (remove_var/set_var) while the
+// default test harness runs them on parallel threads. Under llvm-cov
+// instrumentation the race manifested live: PR #1411's Coverage & Perf job
+// failed with `1 target failed: -p tickvault-api --test
+// tv_api_token_prod_guard` (exit 101) — `set_var` from one test landed
+// between another test's `remove_var` and its `from_env` call, flipping the
+// asserted branch. The PR merged red through the auto-merge gap (see
+// `.claude/rules/project/merge-gate-lock-2026-07-04.md` §3.2).
+//
+// Fix: every env-mutating test takes `TV_API_TOKEN_LOCK` first, so the
+// mutate → observe window is exclusive. Poisoning-safe: a panicking test
+// (an assertion failure) must not cascade poison-panics into the other
+// tests, so we recover the guard via `unwrap_or_else(|e| e.into_inner())`.
+// ---------------------------------------------------------------------------
+
+static TV_API_TOKEN_LOCK: Mutex<()> = Mutex::new(());
+
+/// Scoped guard: holds the serialization lock for the test's duration and
+/// restores the pre-test `TV_API_TOKEN` value on Drop (even on panic), so
+/// no test leaks env state into the next lock holder.
+struct TokenEnvGuard {
+    _lock: std::sync::MutexGuard<'static, ()>,
+    prior: Option<String>,
+}
+
+impl TokenEnvGuard {
+    fn acquire() -> Self {
+        let lock = TV_API_TOKEN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        Self {
+            _lock: lock,
+            prior: std::env::var("TV_API_TOKEN").ok(),
+        }
+    }
+}
+
+impl Drop for TokenEnvGuard {
+    fn drop(&mut self) {
+        // SAFETY: unsafe block required by Rust 2024 edition for
+        // std::env::set_var/remove_var; serialized by the held mutex.
+        unsafe {
+            match self.prior.take() {
+                Some(v) => std::env::set_var("TV_API_TOKEN", v),
+                None => std::env::remove_var("TV_API_TOKEN"),
+            }
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Behavioural ratchets — exercise `from_env` directly
@@ -27,6 +81,7 @@ use tickvault_api::middleware::ApiAuthConfig;
 /// Matches the live 2026-04-21 13:06 IST log line.
 #[test]
 fn from_env_dry_run_unset_token_disables_auth() {
+    let _guard = TokenEnvGuard::acquire();
     // SAFETY: test-only env var manipulation; `.env` files are banned in prod.
     // Clear the env and run in dry-run mode.
     // O(1) EXEMPT: test setup
@@ -47,6 +102,7 @@ fn from_env_dry_run_unset_token_disables_auth() {
 /// endpoints to any caller.
 #[test]
 fn from_env_live_unset_token_fails_closed() {
+    let _guard = TokenEnvGuard::acquire();
     // SAFETY: unsafe block required by Rust 2024 edition for std::env::set_var.
     unsafe {
         std::env::remove_var("TV_API_TOKEN");
@@ -63,16 +119,14 @@ fn from_env_live_unset_token_fails_closed() {
 /// also exercises the "enabled with operator-provided token" branch.
 #[test]
 fn from_env_token_set_enables_auth() {
+    let _guard = TokenEnvGuard::acquire();
     // SAFETY: unsafe block required by Rust 2024 edition for std::env::set_var.
     unsafe {
         std::env::set_var("TV_API_TOKEN", "test-bearer-token-I6-ratchet");
     }
     let cfg = ApiAuthConfig::from_env(false);
     assert!(cfg.enabled, "explicit TV_API_TOKEN must enable auth");
-    // SAFETY: unsafe block required by Rust 2024 edition for std::env::set_var.
-    unsafe {
-        std::env::remove_var("TV_API_TOKEN");
-    }
+    // Prior value restored by TokenEnvGuard::drop.
 }
 
 // ---------------------------------------------------------------------------

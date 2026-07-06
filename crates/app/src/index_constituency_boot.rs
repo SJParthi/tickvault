@@ -42,6 +42,91 @@ use tickvault_storage::index_constituency_persistence::{
     ensure_index_constituency_table, migrate_index_constituency_truncate_once,
 };
 
+/// Quiet QuestDB readiness probe attempts for the boot-prefix ts-pin
+/// migration task (F13/F14 hardening, 2026-07-05). 12 × 5s = 60s bound —
+/// deliberately NOT `wait_for_questdb_ready` (that fn emits BOOT-01/BOOT-02
+/// pages reserved for the boot path; this is cold-path forensic-master work).
+pub const TS_PIN_MIGRATION_READINESS_ATTEMPTS: u32 = 12;
+
+/// Backoff between readiness probe attempts (seconds).
+pub const TS_PIN_MIGRATION_READINESS_BACKOFF_SECS: u64 = 5;
+
+/// Process-global boot-prefix ts-pin migration (F13 + F14 hardening,
+/// 2026-07-05).
+///
+/// The one-shot, marker-gated `TRUNCATE TABLE index_constituency` migration
+/// previously ran ONLY inside the Dhan lane (`persist_index_constituency_mapping`,
+/// spawned at the tail of `cold_build_daily_universe`) — behind the §4
+/// infinite-retry CSV boot, TOTP auth, QuestDB wait, and the ~219K-row
+/// lifecycle reconcile. That let the Groww writer's bounded 120s gate wait
+/// expire BEFORE the truncate (Monday cold boot, F13), and a runtime Dhan
+/// enable / lane cold-start retry ran the FIRST-EVER truncate hours after the
+/// Groww append (F14). This task runs the SAME gate-aware, exactly-once
+/// migration in the process-global boot prefix — spawned from `main()` BEFORE
+/// the Groww activation watcher, regardless of `feeds.dhan_enabled` (it needs
+/// only the QuestDB config) — so the gate is genuinely marked within
+/// ~75s worst case (60s quiet probe + one bounded TRUNCATE HTTP attempt),
+/// inside the Groww writer's 120s wait, on EVERY boot mode.
+///
+/// Degrade-safe: probe exhaustion or a failed TRUNCATE logs + marks the gate
+/// (appends proceed; marker not written; the NEXT process boot re-runs the
+/// migration in ITS boot prefix, again BEFORE that boot's feed appends). The
+/// Dhan-lane call site remains as defense-in-depth; the exactly-once latch in
+/// the wrapper makes it a no-op once this task has run.
+// TEST-EXEMPT: network I/O orchestration (quiet probe + live QuestDB TRUNCATE) — the ordering is pinned by the main.rs source-order ratchet below; the exactly-once wrapper + gate primitives are unit-tested in the storage crate; the probe-bound constants are unit-tested here.
+pub async fn run_index_constituency_ts_pin_migration_at_boot(questdb: QuestDbConfig) {
+    let probe_url = format!(
+        "http://{}:{}/exec?query=SELECT%201",
+        questdb.host, questdb.http_port
+    );
+    let mut ready = false;
+    match tickvault_storage::http_client::shared_probe_client() {
+        Ok(client) => {
+            for attempt in 1..=TS_PIN_MIGRATION_READINESS_ATTEMPTS {
+                match client.get(&probe_url).send().await {
+                    Ok(resp) if resp.status().is_success() => {
+                        ready = true;
+                        break;
+                    }
+                    Ok(_) | Err(_) => {
+                        if attempt < TS_PIN_MIGRATION_READINESS_ATTEMPTS {
+                            tokio::time::sleep(std::time::Duration::from_secs(
+                                TS_PIN_MIGRATION_READINESS_BACKOFF_SECS,
+                            ))
+                            .await;
+                        }
+                    }
+                }
+            }
+        }
+        Err(err) => {
+            // HTTP-CLIENT-01 class — the probe client could not be built; the
+            // migration attempt below builds its own client, so proceed.
+            warn!(
+                %err,
+                "ts-pin boot migration: probe client build failed — proceeding to the \
+                 migration attempt without a readiness probe"
+            );
+            ready = true; // unknown, not "down" — attempt the migration
+        }
+    }
+    if !ready {
+        warn!(
+            attempts = TS_PIN_MIGRATION_READINESS_ATTEMPTS,
+            backoff_secs = TS_PIN_MIGRATION_READINESS_BACKOFF_SECS,
+            "ts-pin boot migration: QuestDB not ready within the quiet probe bound — \
+             attempting the migration anyway (a failure marks the gate, keeps the \
+             marker unwritten, and the next boot retries in ITS boot prefix)"
+        );
+    }
+    ensure_index_constituency_table(&questdb).await;
+    migrate_index_constituency_truncate_once(&questdb).await;
+    info!(
+        questdb_ready = ready,
+        "ts-pin boot migration task complete — index_constituency migration gate marked"
+    );
+}
+
 /// One fully-resolved (index, stock) mapping row — OWNED so the pure builder is
 /// unit-testable without borrows; the writer converts to the borrowing
 /// [`IndexConstituencyRow`] for the ILP flush.
@@ -106,6 +191,23 @@ pub async fn persist_index_constituency_mapping(
     trading_date_ist_nanos: i64,
     dry_run: bool,
 ) {
+    // 0. FIX 13a (2026-07-04): ensure the table + run the one-time, marker-gated
+    //    ts-pin TRUNCATE migration FIRST — before the niftyindices CSV fetch —
+    //    so (a) the truncate→write order is preserved (the append happens later
+    //    in this same fn) and (b) the `index_constituency_migration_gate` opens
+    //    regardless of any CSV-fetch/parse/resolve early return below. The
+    //    Groww shared-master writer awaits that gate before persisting its
+    //    `feed='groww'` rows, so the truncate can never wipe another feed's
+    //    just-written rows. The migration marks the gate on EVERY exit path.
+    //    F14 hardening (2026-07-05): the PRIMARY migration site is now the
+    //    process-global boot-prefix task
+    //    (`run_index_constituency_ts_pin_migration_at_boot`, spawned before the
+    //    Groww watcher); this call is defense-in-depth — the wrapper's
+    //    exactly-once latch makes it a no-op once the boot-prefix run finished,
+    //    and it can never fire a LATE first truncate on a runtime Dhan enable.
+    ensure_index_constituency_table(&questdb).await;
+    migrate_index_constituency_truncate_once(&questdb).await;
+
     // 1. Full constituency map (all ~46 tracked indices) — map-only, best-effort.
     let downloader = match ConstituencyDownloader::new() {
         Ok(d) => d,
@@ -181,13 +283,10 @@ pub async fn persist_index_constituency_mapping(
         })
         .collect();
 
-    // 5. Persist (idempotent UPSERT). Ensure the table first (self-heal), then
-    //    run the one-time, marker-gated ts-pin migration BEFORE the write so the
-    //    order is truncate → write: it clears the legacy day-floored rows once
-    //    (the `ts` is now pinned to epoch 0, so new writes UPSERT in place but
-    //    can't overwrite the old per-day rows). Degrade-safe — never blocks.
-    ensure_index_constituency_table(&questdb).await;
-    migrate_index_constituency_truncate_once(&questdb).await;
+    // 5. Persist (idempotent UPSERT). The table ensure + one-time ts-pin
+    //    migration already ran at step 0 (FIX 13a) — truncate → write order
+    //    holds because this append is later in the same fn. Degrade-safe —
+    //    never blocks.
     match append_index_constituency_rows(&questdb, &ilp_rows).await {
         Ok(()) => {
             info!(
@@ -317,5 +416,68 @@ mod tests {
         let map = map_with(&[]);
         let rows = build_index_constituency_rows(&map, &[]);
         assert!(rows.is_empty());
+    }
+
+    /// FIX 13a ratchet (source-scan, wal_reinject pattern): the one-time
+    /// TRUNCATE migration must run BEFORE the niftyindices CSV fetch inside
+    /// `persist_index_constituency_mapping`, so the migration gate opens on
+    /// every boot path (early CSV-fetch returns included) and the
+    /// truncate→write order can never be inverted by a refactor.
+    #[test]
+    fn ratchet_migration_runs_before_csv_fetch() {
+        let src = include_str!("index_constituency_boot.rs");
+        let migrate = src
+            .find("migrate_index_constituency_truncate_once(&questdb)")
+            .expect("migration call must exist in persist_index_constituency_mapping");
+        let fetch = src
+            .find("build_constituency_map(&downloader")
+            .expect("constituency CSV fetch call must exist");
+        assert!(
+            migrate < fetch,
+            "FIX 13a regression: the ts-pin TRUNCATE migration must be awaited \
+             BEFORE the constituency CSV fetch so the migration gate opens on \
+             every boot path"
+        );
+    }
+
+    /// F14 ratchet (source-scan on main.rs, wal_reinject ordering pattern):
+    /// the process-global boot-prefix ts-pin migration task MUST be spawned
+    /// BEFORE the Groww activation watcher in `main()` source order, so the
+    /// gate the Groww writer awaits is driven by a task that exists on EVERY
+    /// boot mode (Dhan ON, Dhan OFF, Groww-only) — never only behind the Dhan
+    /// lane's serial auth/CSV/reconcile chain (F13) or a runtime Dhan enable
+    /// hours later (F14).
+    #[test]
+    fn ratchet_ts_pin_migration_spawns_before_groww_watcher() {
+        let src = include_str!("main.rs");
+        let migration = src
+            .find("run_index_constituency_ts_pin_migration_at_boot(")
+            .expect("the boot-prefix ts-pin migration spawn must exist in main.rs");
+        let watcher = src
+            .find("run_groww_activation_watcher(")
+            .expect("the Groww activation watcher spawn must exist in main.rs");
+        assert!(
+            migration < watcher,
+            "F13/F14 regression: the process-global ts-pin migration task must be \
+             spawned BEFORE the Groww activation watcher in main.rs source order"
+        );
+    }
+
+    /// F13 bound pin: the boot-prefix quiet probe (attempts × backoff) plus
+    /// one bounded TRUNCATE attempt must fit inside the Groww writer's 120s
+    /// migration-gate wait, or the gate wait becomes a guaranteed timeout on
+    /// slow-QuestDB boots.
+    #[test]
+    fn test_ts_pin_readiness_constants_bound_inside_groww_gate_wait() {
+        let probe_bound_secs = u64::from(TS_PIN_MIGRATION_READINESS_ATTEMPTS)
+            * TS_PIN_MIGRATION_READINESS_BACKOFF_SECS;
+        // 120 = CONSTITUENCY_MIGRATION_GATE_TIMEOUT_SECS in the core crate
+        // (not importable here without a dep cycle); leave ≥ 30s headroom for
+        // the migration's own bounded TRUNCATE HTTP attempt.
+        assert!(
+            probe_bound_secs + 30 <= 120,
+            "quiet probe bound ({probe_bound_secs}s) + 30s TRUNCATE headroom must \
+             fit inside the Groww writer's 120s migration-gate wait"
+        );
     }
 }

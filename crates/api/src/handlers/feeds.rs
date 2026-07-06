@@ -283,7 +283,9 @@ pub struct FeedsHealthResponse {
 }
 
 /// Current IST epoch nanos (Utc::now + IST offset) for last-tick-age math.
-fn now_ist_nanos() -> i64 {
+/// `pub(crate)`: the Live Board aggregator (`handlers::board`) reuses it for
+/// its status-file age math instead of forking the IST offset logic.
+pub(crate) fn now_ist_nanos() -> i64 {
     chrono::Utc::now()
         .timestamp_nanos_opt()
         .unwrap_or(0)

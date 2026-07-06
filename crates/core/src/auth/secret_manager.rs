@@ -996,7 +996,7 @@ mod tests {
     /// on Ctrl-C / 15:30 IST close instead of leaving the lock to
     /// expire silently after 90s TTL.
     ///
-    /// The bridge takes `instance_lock_shutdown_chain` (an
+    /// The bridge clones `instance_lock_shutdown_chain` (an
     /// `Option<Arc<Notify>>`), spawns a small bridge task that
     /// awaits the broader `shutdown_notify`, and triggers the
     /// heartbeat's own Notify. Without this chain, a graceful
@@ -1004,6 +1004,15 @@ mod tests {
     /// would only get released by TTL expiry, and the
     /// `live_instance_lock` audit table would be missing the
     /// `GracefulRelease` row for every clean exit.
+    ///
+    /// BUG-1 fix (2026-07-05): the bridge alone was NOT enough — the
+    /// heartbeat JoinHandle was dropped at spawn time, so the release
+    /// (SSM DeleteParameter) RACED process exit (the live 15:35 IST
+    /// graceful EOD stop left the lock in SSM; the 17:59 boot found it
+    /// stale at age 8622s). The chain is now `.clone()`d into the bridge
+    /// AND threaded (with the heartbeat handle) into `DhanLaneRunHandles`
+    /// so `teardown_dhan_lane_tasks` can `notify_one()` it directly and
+    /// bound-await the release before the process exits.
     #[test]
     fn test_instance_lock_shutdown_chain_is_wired() {
         let main_rs = std::fs::read_to_string("../app/src/main.rs")
@@ -1012,7 +1021,10 @@ mod tests {
 
         let calls_spawn_heartbeat = main_rs.contains("spawn_instance_lock_heartbeat");
         let declares_chain = main_rs.contains("instance_lock_shutdown_chain");
-        let takes_chain = main_rs.contains("instance_lock_shutdown_chain.take()");
+        let bridges_chain = main_rs.contains("instance_lock_shutdown_chain.clone()");
+        let threads_chain_into_lane =
+            main_rs.contains("instance_lock_shutdown: instance_lock_shutdown_chain");
+        let awaits_release = main_rs.contains("INSTANCE_LOCK_RELEASE_TIMEOUT_SECS");
 
         if calls_spawn_heartbeat {
             assert!(
@@ -1024,11 +1036,20 @@ mod tests {
                  Phase 0 Item 19f."
             );
             assert!(
-                takes_chain,
-                "main.rs declares `instance_lock_shutdown_chain` but does not call \
-                 `.take()` to spawn the bridge task. The chain must be consumed \
-                 once at the point `shutdown_notify` is constructed; otherwise the \
-                 heartbeat never observes the shutdown signal."
+                bridges_chain,
+                "main.rs declares `instance_lock_shutdown_chain` but does not \
+                 `.clone()` it into the bridge task at the point `shutdown_notify` \
+                 is constructed; the heartbeat would never observe the broader \
+                 shutdown signal."
+            );
+            assert!(
+                threads_chain_into_lane && awaits_release,
+                "main.rs must thread `instance_lock_shutdown_chain` (and the \
+                 heartbeat JoinHandle) into `DhanLaneRunHandles` and bound-await \
+                 the release (INSTANCE_LOCK_RELEASE_TIMEOUT_SECS) in \
+                 `teardown_dhan_lane_tasks` — otherwise the SSM DeleteParameter \
+                 races process exit and every graceful stop leaks the lock \
+                 (BUG-1, live proof 2026-07-05 15:35 IST)."
             );
         }
     }
@@ -1338,6 +1359,42 @@ mod tests {
             "spawn_slo_publisher_task must be called ONLY from the SLO-03 \
              supervisor loop (found {inner_call_sites} non-comment mentions; \
              expected exactly 2: the fn definition + the supervisor call site)"
+        );
+    }
+
+    /// Session-B fix #1 (operator go 2026-07-04): the Groww scale-FLEET
+    /// spawn in `main.rs` MUST be gated by the fleet dual-instance SSM lock
+    /// (`acquire_groww_scale_fleet_lock`). A scale-test boot runs
+    /// `dhan_enabled=false` and never reaches the Dhan RESILIENCE-01 lock,
+    /// so removing this gate silently re-opens the class where two hosts
+    /// (Mac + AWS, or two Macs) scale the SAME Groww account simultaneously
+    /// and the failure masquerades as provider throttle (GROWW-SCALE-05).
+    #[test]
+    fn test_groww_scale_fleet_lock_is_wired_into_main() {
+        let main_rs = std::fs::read_to_string("../app/src/main.rs")
+            .or_else(|_| std::fs::read_to_string("crates/app/src/main.rs"))
+            .expect("main.rs must be readable");
+        assert!(
+            main_rs.contains("acquire_groww_scale_fleet_lock("),
+            "main.rs MUST gate the Groww scale-fleet spawn behind \
+             `groww_scale_lock::acquire_groww_scale_fleet_lock` \
+             (GROWW-SCALE-05, Session-B fix 2026-07-04). Without it, two \
+             tickvault instances can scale the SAME Groww account and the \
+             failure masquerades as provider throttle."
+        );
+        // The lock decision must happen BEFORE the fleet spawn in source
+        // order — gating after the spawn would be a false gate.
+        let lock_idx = main_rs
+            .find("acquire_groww_scale_fleet_lock(")
+            .expect("lock call site present (asserted above)");
+        let fleet_idx = main_rs
+            .find("spawn_groww_scale_fleet(")
+            .expect("main.rs must still spawn the scale fleet somewhere");
+        assert!(
+            lock_idx < fleet_idx,
+            "the fleet dual-instance lock must be acquired BEFORE \
+             spawn_groww_scale_fleet in main.rs source order \
+             (lock at byte {lock_idx}, fleet spawn at byte {fleet_idx})"
         );
     }
 }

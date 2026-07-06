@@ -176,18 +176,37 @@ pub async fn ensure_ws_event_audit_table(questdb_config: &QuestDbConfig) {
 /// `TickConservationAuditWriter`: if QuestDB is unreachable at construction the
 /// writer still builds (`sender = None`); `append_row` fills the local buffer
 /// and `flush` returns `Err` until QuestDB is reachable.
+///
+/// 2026-07-05: transport is **ILP-over-HTTP** (`http::addr=host:http_port`),
+/// NOT ILP TCP. TCP flush is fire-and-forget — a server-side reject (schema
+/// drift, DEDUP violation, table error) NEVER surfaced as `Err`, so the
+/// AUDIT-WS-01 flush arm never paged and the table could stay silently EMPTY
+/// (the 2026-07-05 operator-caught incident). HTTP flush returns a real server
+/// ACK per request; rejects surface as `Err` → the existing AUDIT-WS-01 arm
+/// pages. Cold path (a handful of lifecycle rows per day) — the extra HTTP
+/// round-trip latency is irrelevant here.
 pub struct WsEventAuditWriter {
     sender: Option<Sender>,
     buffer: Buffer,
     pending: usize,
 }
 
+/// Builds the ILP-over-HTTP conf string for the `ws_event_audit` writer.
+/// Targets the QuestDB HTTP port (9000-class), NOT the ILP TCP port (9009) —
+/// HTTP gives a per-flush server ACK (see the 2026-07-05 note on
+/// [`WsEventAuditWriter`]). Pure + unit-tested (the transport ratchet).
+fn ilp_http_conf(config: &QuestDbConfig) -> String {
+    format!("http::addr={}:{};", config.host, config.http_port)
+}
+
 impl WsEventAuditWriter {
-    /// Production constructor — connects via ILP TCP, lazy on failure.
+    /// Production constructor — ILP-over-HTTP sender, lazy on failure.
+    /// (`Sender::from_conf` with `http::` does not dial at construction; an
+    /// unreachable QuestDB surfaces at `flush()` as `Err` → AUDIT-WS-01.)
     #[must_use]
     // TEST-EXEMPT: production ILP-connect constructor (needs live QuestDB); disconnected/append/flush paths covered via for_test()
     pub fn new(config: &QuestDbConfig) -> Self {
-        let conf = format!("tcp::addr={}:{};", config.host, config.ilp_port);
+        let conf = ilp_http_conf(config);
         match Sender::from_conf(&conf) {
             Ok(s) => {
                 let b = s.new_buffer();
@@ -282,10 +301,12 @@ impl WsEventAuditWriter {
         Ok(())
     }
 
-    /// Flushes buffered rows to QuestDB.
+    /// Flushes buffered rows to QuestDB over ILP-HTTP.
     ///
     /// # Errors
-    /// `Err` when disconnected or the TCP flush fails (rows stay buffered).
+    /// `Err` when disconnected or the HTTP flush fails — including a
+    /// SERVER-SIDE reject, which the HTTP ACK surfaces (TCP never did). Rows
+    /// stay buffered; the consumer's AUDIT-WS-01 arm pages.
     pub fn flush(&mut self) -> Result<()> {
         if self.pending == 0 {
             return Ok(());
@@ -370,6 +391,30 @@ mod tests {
     #[test]
     fn test_no_dhan_code_sentinel_is_negative_one() {
         assert_eq!(WS_EVENT_NO_DHAN_CODE, -1);
+    }
+
+    #[test]
+    fn test_ilp_http_conf_targets_http_port() {
+        // 2026-07-05 transport ratchet: the ws_event_audit writer MUST use
+        // ILP-over-HTTP (per-flush server ACK — server-side rejects surface as
+        // flush Err → AUDIT-WS-01). Regressing to `tcp::addr` restores the
+        // fire-and-forget silent-loss window the operator caught on 2026-07-05.
+        let cfg = QuestDbConfig {
+            host: "tv-questdb".to_string(),
+            http_port: 9000,
+            pg_port: 8812,
+            ilp_port: 9009,
+        };
+        let conf = ilp_http_conf(&cfg);
+        assert_eq!(conf, "http::addr=tv-questdb:9000;");
+        assert!(
+            conf.starts_with("http::addr="),
+            "must be ILP-over-HTTP, never tcp:: — got {conf}"
+        );
+        assert!(
+            !conf.contains("9009"),
+            "must target http_port, not the ILP TCP port — got {conf}"
+        );
     }
 
     #[test]

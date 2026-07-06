@@ -417,9 +417,12 @@ aws-cost: ## Show the current month AWS bill estimate (via Cost Explorer)
 # Phase 2.2 / 5.2 — Zero-touch observability operator commands
 # -----------------------------------------------------------------------------
 
-tail-errors: ## Live tail of data/logs/errors.jsonl.* with jq pretty-print
-	@echo "Tailing ERROR-only JSONL stream (data/logs/errors.jsonl.*). Ctrl-C to stop."
-	@if ls data/logs/errors.jsonl* >/dev/null 2>&1; then \
+tail-errors: ## Live tail of data/logs/machine/errors.jsonl.* with jq pretty-print
+	@echo "Tailing ERROR-only JSONL stream (data/logs/machine/errors.jsonl.*). Ctrl-C to stop."
+	@if ls data/logs/machine/errors.jsonl* >/dev/null 2>&1; then \
+		tail -n 50 -F data/logs/machine/errors.jsonl* 2>/dev/null | \
+			(command -v jq >/dev/null && jq -c '{ts: .timestamp, code, severity, target, message}' || cat); \
+	elif ls data/logs/errors.jsonl* >/dev/null 2>&1; then \
 		tail -n 50 -F data/logs/errors.jsonl* 2>/dev/null | \
 			(command -v jq >/dev/null && jq -c '{ts: .timestamp, code, severity, target, message}' || cat); \
 	else \
@@ -427,8 +430,10 @@ tail-errors: ## Live tail of data/logs/errors.jsonl.* with jq pretty-print
 		exit 0; \
 	fi
 
-errors-summary: ## Print data/logs/errors.summary.md (refreshed every 60s by app)
-	@if [ -f data/logs/errors.summary.md ]; then \
+errors-summary: ## Print data/logs/machine/errors.summary.md (refreshed every 60s by app)
+	@if [ -f data/logs/machine/errors.summary.md ]; then \
+		cat data/logs/machine/errors.summary.md; \
+	elif [ -f data/logs/errors.summary.md ]; then \
 		cat data/logs/errors.summary.md; \
 	else \
 		echo "  (no errors.summary.md yet — app may not have run since Phase 5 shipped)"; \

@@ -53,6 +53,71 @@ re-emits (DEDUP UPSERT KEYS). `dry_run` skips the emission (§27 isolation). The
 diff/parser/builders are unit-tested; the live diff-vs-yesterday needs a real QuestDB carrying
 prior-day rows (boot-exercised).
 
+### 2026-07-04 — boot-parity hardening (FIX 13): readiness gate + bounded retry + truncate ordering gate
+
+Three hardening changes landed 2026-07-04 (branch `claude/groww-boot-parity-hardening`):
+
+1. **Truncate ordering gate (FIX 13a).** The Dhan-lane one-shot ts-pin migration runs
+   `TRUNCATE TABLE index_constituency` — QuestDB has NO row-level `DELETE ... WHERE feed='dhan'`,
+   so the migration cannot be feed-scoped and could wipe just-written `feed='groww'` rows (both
+   were unordered fire-and-forget boot spawns). A `MigrationGate` (AtomicBool + tokio Notify,
+   `index_constituency_persistence::index_constituency_migration_gate()`) is now marked complete
+   on EVERY migration exit path (outer-wrapper pattern), the migration itself moved to the TOP of
+   `persist_index_constituency_mapping` (before the niftyindices CSV fetch, so the gate opens on
+   every boot path), and `persist_groww_instruments` awaits the gate (bounded 120s) before its
+   `index_constituency` append. A Groww-only boot (Dhan lane OFF → migration never spawns) times
+   out once and proceeds — correct, since no truncate can run in that mode. Ratchets:
+   `ratchet_migration_runs_before_csv_fetch` (app), `ratchet_constituency_append_waits_for_migration_gate`
+   (core), `MigrationGate` unit tests (storage).
+2. **Readiness gate + bounded retry (FIX 13b).** `persist_groww_instruments` first runs a QUIET
+   QuestDB readiness probe (`SELECT 1` via `shared_probe_client`, 3 attempts, 5s backoff —
+   deliberately NOT `wait_for_questdb_ready`, which emits BOOT-01/02 pages reserved for the boot
+   path). A probe that never succeeds degrades with the SAME GROWW-MASTER-01 contract under the
+   NEW `stage="readiness"` label on `tv_groww_master_persist_errors_total`. Each append stage
+   (`lifecycle`, `constituency`) then gets bounded retry — 3 attempts, 2s/4s backoff — with the
+   final failure keeping the exact prior degrade-safe semantics (error + counter +
+   continue/return; activation and the live feed are never blocked). Triage is unchanged; a
+   `readiness` stage rate means QuestDB was down at activation time — the next boot/activation
+   re-runs idempotently.
+3. **Boot Telegram Groww counts (FIX 13c).** `activate_groww_lane`'s watch-set `Ok(set)` arm now
+   calls `feed_health.set_subscribed(Feed::Groww, resolved_stocks, indices)` at activation time
+   (mirror of the Dhan subscription-plan call in main.rs), so the boot/readiness Telegram feed
+   lines and the /feeds page show real Groww counts before the sidecar's first status report
+   (which remains authoritative — idempotent overwrite). Ratchet:
+   `ratchet_activation_sets_groww_subscribed_counts`.
+
+### 2026-07-05 — MigrationGate hardening (delta-audit F13/F14/F15)
+
+The 2026-07-05 delta audit confirmed three residual holes in the FIX 13a truncate-ordering gate:
+(F13) the Groww writer's bounded 120s gate wait was shorter than the Dhan lane's realistic path
+to the TRUNCATE on a Monday cold boot (the migration sat behind the §4 infinite-retry CSV boot +
+TOTP + QuestDB wait + lifecycle reconcile), and the timeout `warn!` falsely claimed "Dhan lane
+likely OFF; no truncate can run" on the dhan+groww profile; (F14) a runtime Dhan enable / D2b
+lane cold-start retry ran the FIRST-EVER truncate hours after the Groww append — no bounded wait
+at append time can order against that; (F15) the gate was one-shot per process while the truncate
+was re-runnable per lane restart, so a best-effort marker-write failure (or the documented
+delete-marker operator procedure) could re-TRUNCATE behind a permanently-green gate. Hardened
+(branch `claude/migration-gate-hardening`):
+
+1. **Process-global boot-prefix migration (F13+F14).** The marker-gated migration now runs from
+   `main()`'s boot prefix (`index_constituency_boot::run_index_constituency_ts_pin_migration_at_boot`),
+   spawned BEFORE the Groww activation watcher and regardless of `feeds.dhan_enabled` — a quiet
+   12×5s QuestDB readiness probe (never BOOT-01/02 pages) then the gate-aware migration, marking
+   the gate within ~75s worst case, inside the 120s wait, on EVERY boot mode. Ratchet:
+   `ratchet_ts_pin_migration_spawns_before_groww_watcher` (main.rs source-order scan) +
+   `test_ts_pin_readiness_constants_bound_inside_groww_gate_wait`.
+2. **In-process exactly-once wrapper (F15).** `MigrationGate` gained a `run_once`
+   `tokio::sync::OnceCell` latch; `migrate_index_constituency_truncate_once_with_gate` executes
+   the TRUNCATE body at most once per process and SERIALIZES concurrent callers (no racing double
+   truncate). A marker-write failure or mid-session marker delete can no longer re-truncate
+   behind a green gate; the re-run happens at the next process boot, again ordered before the
+   feed appends. Ratchets: `test_with_gate_skips_when_gate_already_complete`,
+   `test_with_gate_runs_once_then_skips`, `test_with_gate_concurrent_callers_single_run`.
+3. **Honest timeout wording (F13 triage misdirection).** The gate-timeout `warn!` now states the
+   truth — the boot-prefix migration is delayed; the append proceeds best-effort and rows wiped
+   by a later-landing truncate re-persist at the next boot/activation (this file's §1 envelope).
+   Ratchet: `ratchet_gate_timeout_warn_is_honest` (the false premise is a banned literal).
+
 ---
 
 ## §1. GROWW-MASTER-01 — shared-master persist failed

@@ -1,8 +1,8 @@
 //! Phase 5 of `.claude/plans/active-plan.md` — `errors.summary.md` writer.
 //!
-//! Reads the most recent `data/logs/errors.jsonl.YYYY-MM-DD-HH` files,
+//! Reads the most recent `data/logs/machine/errors.jsonl.YYYY-MM-DD-HH` files,
 //! groups events by signature hash, and writes a human AND Claude-readable
-//! markdown snapshot at `data/logs/errors.summary.md` on a fixed cadence
+//! markdown snapshot at `data/logs/machine/errors.summary.md` on a fixed cadence
 //! (default 60 seconds).
 //!
 //! Claude Code `/loop 5m .claude/triage/claude-loop-prompt.md` reads the
@@ -321,7 +321,7 @@ fn render_markdown(
     out.push_str(&format!(
         "Generated at epoch **{now_epoch}** (UTC).  \
          Lookback window: last **{}** minutes.  \
-         Source: `data/logs/errors.jsonl.*`\n\n",
+         Source: `data/logs/machine/errors.jsonl.*`\n\n",
         config.lookback_minutes
     ));
 
