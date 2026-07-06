@@ -695,9 +695,10 @@ def tool_tickvault_api(
     base_url: str | None = None,
 ) -> dict[str, Any]:
     """HTTP GET against the tickvault app's own REST API
-    (`/health`, `/api/stats`, `/api/quote/{id}`, `/api/top-movers`,
+    (`/health`, `/api/stats`, `/api/quote/{id}`,
     `/api/instruments/diagnostic`, `/api/option-chain`, `/api/pcr`,
-    `/api/index-constituency`).
+    `/api/index-constituency`). (`/api/top-movers` removed 2026-07-06 —
+    the movers route family was deleted in AWS-lifecycle PR #2.)
 
     Lets Claude inspect the running app's own state without the
     operator copy-pasting curl output.
@@ -1551,7 +1552,7 @@ TOOLS: list[ToolSpec] = [
         description=(
             "HTTP GET against the tickvault app's own REST API (port "
             "3001 by default). Paths: /health, /api/stats, "
-            "/api/quote/{security_id}, /api/top-movers, "
+            "/api/quote/{security_id}, "
             "/api/instruments/diagnostic, /api/option-chain, /api/pcr, "
             "/api/index-constituency. Returns status + json (or text)."
         ),

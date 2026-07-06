@@ -783,5 +783,127 @@ class CaptureEmitTests(unittest.TestCase):
         self.assertEqual(rows[1]["capture_ns"], 42)
 
 
+class StallBackoffTests(unittest.TestCase):
+    """The stall self-heal exponential-backoff ladder (2026-07-06 exam fix —
+    5s force-close churn storm) + the STILL SILENT rate-limit cadence."""
+
+    BASE = groww_sidecar.STALL_DEADLINE_SECS
+    CAP = groww_sidecar.STALL_BACKOFF_CAP_SECS
+
+    def test_ladder_doubles_from_base_to_cap(self) -> None:
+        got = [
+            groww_sidecar.compute_stall_backoff_secs(n, self.BASE, self.CAP)
+            for n in range(6)
+        ]
+        self.assertEqual(got, [5.0, 10.0, 20.0, 40.0, 60.0, 60.0])
+
+    def test_cap_holds_for_huge_counts_without_overflow(self) -> None:
+        self.assertEqual(
+            groww_sidecar.compute_stall_backoff_secs(10_000, self.BASE, self.CAP),
+            60.0,
+        )
+        self.assertEqual(
+            groww_sidecar.compute_stall_backoff_secs(2**62, self.BASE, self.CAP),
+            60.0,
+        )
+
+    def test_reset_and_negative_clamp_to_fast_base(self) -> None:
+        # A dwell-gated reset zeroes the episode count → 5s base.
+        self.assertEqual(
+            groww_sidecar.compute_stall_backoff_secs(0, self.BASE, self.CAP), 5.0
+        )
+        self.assertEqual(
+            groww_sidecar.compute_stall_backoff_secs(-1, self.BASE, self.CAP), 5.0
+        )
+
+    def test_reset_is_dwell_gated_not_single_advance(self) -> None:
+        # Hostile-review hardening: a single watermark advance seconds after
+        # a force-close (the starved-shard flap mode — the re-subscribe
+        # snapshot almost always carries one fresh tsInMillis) must NOT
+        # reset the ladder; only a stall-free dwell does.
+        dwell = groww_sidecar.STALL_BACKOFF_RESET_DWELL_SECS
+        self.assertFalse(groww_sidecar.should_reset_stall_backoff(0.0, dwell))
+        self.assertFalse(groww_sidecar.should_reset_stall_backoff(3.0, dwell))
+        self.assertFalse(
+            groww_sidecar.should_reset_stall_backoff(dwell - 0.001, dwell)
+        )
+        self.assertTrue(groww_sidecar.should_reset_stall_backoff(dwell, dwell))
+        self.assertTrue(
+            groww_sidecar.should_reset_stall_backoff(dwell + 3600.0, dwell)
+        )
+        # No fire yet this process → reset allowed (ladder is 0 anyway).
+        self.assertTrue(groww_sidecar.should_reset_stall_backoff(None, dwell))
+
+    def test_flap_mode_ladder_climbs_to_cap_and_holds(self) -> None:
+        # Simulate the exact churn storm the hostile review described:
+        # fire → reconnect → ONE advance a few seconds later → starve →
+        # fire again. With the dwell gate the advance never resets (it is
+        # always < dwell after the previous fire, because the inter-fire
+        # gap is <= cap <= dwell), so the ladder climbs 5→10→20→40→60 and
+        # HOLDS at the cap — the cadence decays to ~1 fire/minute instead
+        # of staying pinned at the 5s base.
+        base = float(groww_sidecar.STALL_DEADLINE_SECS)
+        cap = groww_sidecar.STALL_BACKOFF_CAP_SECS
+        dwell = groww_sidecar.STALL_BACKOFF_RESET_DWELL_SECS
+        post_reconnect_advance_delay = 3.0  # advance arrives 3s after fire
+        episodes = 0
+        deadlines = []
+        for _ in range(8):
+            # Stall fires at the current backed-off deadline.
+            deadlines.append(
+                groww_sidecar.compute_stall_backoff_secs(episodes, base, cap)
+            )
+            episodes += 1
+            # Reconnect snapshot delivers ONE advancing record shortly
+            # after the fire — inside the dwell, so NO reset.
+            if groww_sidecar.should_reset_stall_backoff(
+                post_reconnect_advance_delay, dwell
+            ):
+                episodes = 0
+        self.assertEqual(
+            deadlines, [5.0, 10.0, 20.0, 40.0, 60.0, 60.0, 60.0, 60.0]
+        )
+        # And a genuine recovery (advance after a full dwell of health)
+        # restores the fast base.
+        self.assertTrue(
+            groww_sidecar.should_reset_stall_backoff(dwell + 1.0, dwell)
+        )
+
+    def test_dwell_is_at_least_the_cap(self) -> None:
+        # If dwell < cap, a flap whose inter-fire gap sits between dwell and
+        # cap would reset every cycle — the storm returns. Pin dwell >= cap.
+        self.assertGreaterEqual(
+            groww_sidecar.STALL_BACKOFF_RESET_DWELL_SECS,
+            groww_sidecar.STALL_BACKOFF_CAP_SECS,
+        )
+
+    def test_still_silent_cadence_slows_after_fast_warns(self) -> None:
+        fast = groww_sidecar.SILENT_FEED_REWARN_SECS
+        slow = groww_sidecar.STILL_SILENT_RATE_LIMIT_SECS
+        n_fast = groww_sidecar.STILL_SILENT_FAST_WARNS
+        for n in range(n_fast):
+            self.assertEqual(
+                groww_sidecar.still_silent_rewarn_interval_secs(
+                    n, fast, n_fast, slow
+                ),
+                fast,
+            )
+        for n in (n_fast, n_fast + 1, 999):
+            self.assertEqual(
+                groww_sidecar.still_silent_rewarn_interval_secs(
+                    n, fast, n_fast, slow
+                ),
+                300.0,
+            )
+
+    def test_constants_pinned(self) -> None:
+        # The exam-fix contract: 5s base, 60s cap, 5-min reminder rate limit.
+        self.assertEqual(groww_sidecar.STALL_DEADLINE_SECS, 5)
+        self.assertEqual(groww_sidecar.STALL_BACKOFF_CAP_SECS, 60.0)
+        self.assertEqual(groww_sidecar.STALL_BACKOFF_RESET_DWELL_SECS, 60.0)
+        self.assertEqual(groww_sidecar.STILL_SILENT_RATE_LIMIT_SECS, 300.0)
+        self.assertEqual(groww_sidecar.STILL_SILENT_FAST_WARNS, 5)
+
+
 if __name__ == "__main__":
     unittest.main()

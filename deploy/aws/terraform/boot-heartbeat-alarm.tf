@@ -195,6 +195,11 @@ resource "aws_cloudwatch_event_rule" "tv_boot_heartbeat_open" {
   name                = "tv-${var.environment}-boot-heartbeat-open"
   description         = "Enable boot-heartbeat alarm actions at 08:50 IST (Mon-Fri)"
   schedule_expression = "cron(20 3 ? * MON-FRI *)"
+  # RESUME 2026-07-06 per operator GO (moved up from Thu Jul 9): explicit state
+  # so terraform re-enables this rule. The Jul 4 pause set state = "DISABLED";
+  # the #1404 revert REMOVED the attribute, and with `state` absent the AWS
+  # provider stops managing rule state - the rule stayed DISABLED on AWS.
+  state = "ENABLED"
 }
 
 # Close the window at 09:10 IST (03:40 UTC) Mon-Fri — before market open so the
