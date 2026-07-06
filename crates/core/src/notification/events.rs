@@ -570,12 +570,22 @@ pub enum NotificationEvent {
     OrderUpdateAuthenticated,
 
     /// Order update WebSocket disconnected.
+    ///
+    /// 2026-07-06 fix (WS-GAP-10): emitted edge-triggered ONCE per outage
+    /// episode from inside the reconnect loop at ≥3 consecutive in-market
+    /// failures. The old emit at the main.rs task-exit point was
+    /// unreachable — `run_order_update_connection` never returns since
+    /// the WS-GAP-04 never-give-up rewrite.
     OrderUpdateDisconnected { reason: String },
 
     /// Order update WebSocket reconnected after a transient disconnect.
-    /// Fires on every successful reconnect, inside or outside market
-    /// hours (Parthiban directive 2026-04-21 — full audit trail on all
-    /// WS events).
+    ///
+    /// 2026-07-06 fix: fires ONLY after the reconnected socket survives
+    /// the 60s stability window (`ORDER_UPDATE_RECONNECT_STABILITY_SECS`)
+    /// — the old connect-edge emission produced false-recovery storms
+    /// when Dhan killed each socket ~10ms after login (dead-token
+    /// incident, 2026-07-06). Time-survival, never frame-gated: the order
+    /// stream is legitimately silent for hours on idle days.
     ///
     /// Severity intentionally downgraded to `Severity::Low` (was Medium
     /// before 2026-04-26). Dhan's order-update server idle-disconnects
@@ -584,8 +594,7 @@ pub enum NotificationEvent {
     /// successful recovery is operator-informational, not pager-worthy
     /// — MEDIUM at that volume is pure pager fatigue. The companion
     /// `OrderUpdateDisconnected` (Severity::High) still pages on the
-    /// disconnect leg, and `OrderUpdateReconnectionExhausted` (if/when
-    /// added) would page CRITICAL on actual loss-of-feed.
+    /// disconnect leg (unchanged: `test_order_update_reconnected_severity_is_low`).
     OrderUpdateReconnected { consecutive_failures: u32 },
 
     /// CRITICAL: zero live ticks received during market hours past the

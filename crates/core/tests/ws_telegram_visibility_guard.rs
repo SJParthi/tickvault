@@ -126,7 +126,7 @@ fn order_update_connection_fires_reconnect_notify() {
     assert!(
         src.contains("OrderUpdateReconnected"),
         "order_update_connection.rs must emit OrderUpdateReconnected \
-         inside connect_and_listen right after successful connect + login."
+         from the 60s stability arm inside connect_and_listen."
     );
     assert!(
         src.contains("failures_before_attempt"),
@@ -139,6 +139,87 @@ fn order_update_connection_fires_reconnect_notify() {
         !src.contains("if is_within_market_hours_ist()"),
         "order_update_connection.rs must NOT gate alerts by market hours — \
          Parthiban directive 2026-04-21."
+    );
+}
+
+// ---------------------------------------------------------------------------
+// (2b) 2026-07-06 incident ratchets — reachable HIGH page + honest recovery.
+// Root causes verified live (14:05:49 IST, dead token, Dhan TCP-RST ~10ms
+// after login, 39+ in-market failures, zero HIGH pages):
+//   RC1: the only OrderUpdateDisconnected emit site was dead code behind a
+//        never-returning function (WS-GAP-04 removed the legacy `return`).
+//   RC2: OrderUpdateReconnected fired on the CONNECT edge, 10ms before Dhan
+//        killed each socket — false "[LOW] reconnected x8" storms.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn order_update_high_page_is_emitted_inside_reconnect_loop() {
+    let src = read("crates/core/src/websocket/order_update_connection.rs");
+    assert!(
+        src.contains("NotificationEvent::OrderUpdateDisconnected"),
+        "order_update_connection.rs must emit the [HIGH] \
+         OrderUpdateDisconnected page from INSIDE the reconnect loop — \
+         the main.rs task-exit emit was dead code (2026-07-06 incident)."
+    );
+    assert!(
+        src.matches("should_page_outage(").count() >= 2,
+        "should_page_outage must be defined AND called (edge-triggered, \
+         market-hours-aware page decision per audit-findings Rules 3+4)."
+    );
+    assert!(
+        src.contains("WsGap10OrderUpdateOutage"),
+        "the in-loop outage error! must carry code = WS-GAP-10 so the \
+         tag-guard + triage chain route it."
+    );
+}
+
+#[test]
+fn order_update_reconnected_is_stability_gated_not_connect_edge() {
+    let src = read("crates/core/src/websocket/order_update_connection.rs");
+    let full_token = "NotificationEvent::OrderUpdateReconnected";
+    assert_eq!(
+        src.matches(full_token).count(),
+        1,
+        "exactly ONE OrderUpdateReconnected emission must exist — the \
+         connect-edge emission was DELETED 2026-07-06 (it fired 10ms before \
+         Dhan killed each dead-token socket → false-recovery storms)."
+    );
+    let pin_pos = src
+        .find("tokio::pin!(stability_sleep)")
+        .expect("the 60s stability sleep must be pinned before the read loop");
+    let emit_pos = src
+        .find(full_token)
+        .expect("checked non-zero above — count == 1");
+    assert!(
+        emit_pos > pin_pos,
+        "the OrderUpdateReconnected emission must live AFTER the stability \
+         sleep pin (i.e. inside the 60s-survival select arm), never at the \
+         connect edge."
+    );
+    assert!(
+        src.contains("ORDER_UPDATE_RECONNECT_STABILITY_SECS: u64 = 60"),
+        "the stability window must stay pinned at 60s — far beyond the \
+         observed ~10ms die-after-login window, far below the 14400s \
+         activity watchdog."
+    );
+}
+
+#[test]
+fn main_rs_does_not_emit_order_update_disconnected_after_task_await() {
+    let src = read("crates/app/src/main.rs");
+    assert_eq!(
+        src.matches("NotificationEvent::OrderUpdateDisconnected")
+            .count(),
+        0,
+        "main.rs must NOT emit OrderUpdateDisconnected — the post-await site \
+         was unreachable (run_order_update_connection never returns since \
+         WS-GAP-04); the reachable page lives inside the reconnect loop."
+    );
+    assert!(
+        src.contains("task_exited_unreachable"),
+        "main.rs must keep the defensive coded error! at the order-update \
+         spawn site so a future refactor that breaks the never-return loop \
+         contract surfaces loudly."
     );
 }
 

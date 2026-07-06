@@ -1,6 +1,6 @@
 # Implementation Plan: Order-Update WS Outage Page + Honest Recovery (PR-1)
 
-**Status:** APPROVED
+**Status:** VERIFIED
 **Date:** 2026-07-06
 **Approved by:** Parthiban (operator directive 2026-07-06, this session: "Make it ready for merge monitor it until it gets merged... then go ahead with the plan")
 **Branch:** `claude/sleepy-wright-lgj8am`
@@ -40,17 +40,17 @@
 
 ## Plan Items
 
-- [ ] Item 1 — Archive the merged AUTH-P12 plan (Status: VERIFIED, branch merged
+- [x] Item 1 — Archive the merged AUTH-P12 plan (Status: VERIFIED, branch merged
   to main) per plan-enforcement Phase 4; write this plan.
   - Files: .claude/plans/archive/2026-07-01-auth-p12-ip-monitor-wiring.md, .claude/plans/active-plan.md
 
-- [ ] Item 2 — Add `ErrorCode::WsGap10OrderUpdateOutage` ("WS-GAP-10",
+- [x] Item 2 — Add `ErrorCode::WsGap10OrderUpdateOutage` ("WS-GAP-10",
   Severity::High, runbook `.claude/rules/project/wave-2-error-codes.md`) +
   the `## WS-GAP-10` runbook section (cross-ref test satisfied same commit).
   - Files: crates/common/src/error_code.rs, .claude/rules/project/wave-2-error-codes.md
   - Tests: test_all_variants_have_unique_code_str, test_code_str_roundtrip_via_from_str, every_error_code_variant_appears_in_a_rule_file
 
-- [ ] Item 3 — Reachable [HIGH] `OrderUpdateDisconnected` page from INSIDE the
+- [x] Item 3 — Reachable [HIGH] `OrderUpdateDisconnected` page from INSIDE the
   reconnect loop: edge-triggered once per outage episode at ≥3 consecutive
   in-market failures (Rules 3+4); latch re-arms only after a 60s-survived
   reconnect; the every-10th-failure `error!` gains `code = WS-GAP-10`
@@ -58,7 +58,7 @@
   - Files: crates/core/src/websocket/order_update_connection.rs
   - Tests: test_should_page_outage_fires_at_threshold_in_market, test_should_page_outage_below_threshold_is_silent, test_should_page_outage_never_off_hours, test_should_page_outage_edge_triggered_once_per_episode, test_should_page_outage_fires_on_first_in_market_failure_after_off_hours_streak, test_should_page_outage_at_u32_max_saturation, test_outage_constants_pinned
 
-- [ ] Item 4 — Honest recovery: `OrderUpdateReconnected` fires ONLY after the
+- [x] Item 4 — Honest recovery: `OrderUpdateReconnected` fires ONLY after the
   new socket survives a 60s stability window (time-survival, NEVER
   first-frame-gated — the order stream is legitimately silent for hours);
   connect-edge Telegram emission deleted (both `ws_event_audit` rows kept);
@@ -66,14 +66,14 @@
   - Files: crates/core/src/websocket/order_update_connection.rs
   - Tests: test_streak_after_clean_close_resets_when_unpaged, test_streak_after_clean_close_keeps_streak_mid_paged_episode, test_should_emit_stable_recovery_requires_prior_failures
 
-- [ ] Item 5 — Dead site at the main.rs order-update spawn: the post-await
+- [x] Item 5 — Dead site at the main.rs order-update spawn: the post-await
   `OrderUpdateDisconnected` notify (unreachable since the WS-GAP-04
   never-give-up rewrite) replaced with a defensive coded `error!`
   (`reason = "task_exited_unreachable"`); unused `ou_notifier` binding removed;
   events.rs doc comments updated (doc-only — templates/severities unchanged).
   - Files: crates/app/src/main.rs, crates/core/src/notification/events.rs
 
-- [ ] Item 6 — Source-scan ratchets in the existing guard file: HIGH page
+- [x] Item 6 — Source-scan ratchets in the existing guard file: HIGH page
   emitted inside the reconnect loop; Reconnected emission is stability-gated
   (single full-token occurrence AFTER the stability pin); main.rs has zero
   post-await OrderUpdateDisconnected emissions; the existing reconnect-notify
