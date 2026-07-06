@@ -72,6 +72,53 @@ t "in_scale_window empty end never matches (fail-closed)" "1" \
 t "explicit operator-armed window still classifies scale" "scale" \
   "$(classify_day 2026-07-07 2 "$TMP/nope.toml" 2026-07-06 2026-07-08)"
 
+# ── operator lock 2026-07-06: Mac auto-start DISARMED (AWS is the runtime) ──
+# "hereafter we should never ever run this in local" — the robot can never
+# self-start the live app. Only STARTING is gated; stop/monitor/cleanup work.
+t "autostart switch default is 0 (disarmed)" "0" "$LOCAL_AUTOPILOT_AUTOSTART"
+t "autostart switch default pinned in the script" "1" \
+  "$(grep -c 'LOCAL_AUTOPILOT_AUTOSTART:-0' scripts/local-autopilot.sh || true)"
+t "autostart_allowed 0 → deny" "deny" "$(autostart_allowed 0)"
+t "autostart_allowed 1 → allow (deliberate operator arming)" "allow" "$(autostart_allowed 1)"
+t "autostart_allowed empty → deny (fail-closed)" "deny" "$(autostart_allowed "")"
+t "autostart_allowed unset arg → deny (fail-closed)" "deny" "$(autostart_allowed)"
+t "autostart_allowed garbage → deny (fail-closed)" "deny" "$(autostart_allowed yes)"
+t "autostart_allowed 'true' is NOT '1' → deny (exact-match only)" "deny" "$(autostart_allowed true)"
+t "operator-lock verbatim quote present at the kill-switch definition" "0" \
+  "$(grep -q 'hereafter we should never ever run this in local' scripts/local-autopilot.sh && echo 0 || echo 1)"
+# choke point: EVERY autonomous start funnels through start_app_tolerate_peer
+t "autonomous choke point gated: start_app_tolerate_peer checks the switch" "1" \
+  "$(sed -n '/^start_app_tolerate_peer()/,/^}/p' scripts/local-autopilot.sh | grep -c 'autostart_allowed "\$LOCAL_AUTOPILOT_AUTOSTART"' || true)"
+t "choke-point disarm skip returns a DISTINCT non-zero rc (no false-OK)" "1" \
+  "$(sed -n '/^start_app_tolerate_peer()/,/^}/p' scripts/local-autopilot.sh | grep -c 'return 4' || true)"
+t "choke-point gate is ordered BEFORE the start_app call" "ordered" \
+  "$(sed -n '/^start_app_tolerate_peer()/,/^}/p' scripts/local-autopilot.sh | awk '/autostart_allowed/{if(!g)g=NR} /start_app "\$@"/{if(!s)s=NR} END {print (g && s && g<s) ? "ordered" : "bad"}')"
+# robot entry: the launchd 08:55/09:05 day is a quiet no-op before ANY work
+t "robot entry gated: cmd_run checks the switch" "1" \
+  "$(sed -n '/^cmd_run()/,/^}/p' scripts/local-autopilot.sh | grep -c 'autostart_allowed "\$LOCAL_AUTOPILOT_AUTOSTART"' || true)"
+t "cmd_run disarm gate ordered BEFORE the instance lock (nothing runs first)" "ordered" \
+  "$(sed -n '/^cmd_run()/,/^}/p' scripts/local-autopilot.sh | awk '/autostart_allowed/{if(!g)g=NR} /mkdir "\$LOCKDIR"/{if(!l)l=NR} END {print (g && l && g<l) ? "ordered" : "bad"}')"
+# monitor crash auto-relaunch: skipped honestly (no false "relaunching" page)
+t "monitor relaunch arm honors the disarm honestly" "1" \
+  "$(sed -n '/^monitor_until_eod()/,/^}/p' scripts/local-autopilot.sh | grep -c 'NOT be auto-relaunched' || true)"
+t "monitor relaunch arm checks the switch itself (defense-in-depth)" "1" \
+  "$(sed -n '/^monitor_until_eod()/,/^}/p' scripts/local-autopilot.sh | grep -c 'autostart_allowed "\$LOCAL_AUTOPILOT_AUTOSTART"' || true)"
+# the DISARMED log line is greppable + names the re-arm knob
+t "DISARMED log lines name the deliberate re-arm knob" "3" \
+  "$(grep -c 'local autostart DISARMED — operator lock 2026-07-06' scripts/local-autopilot.sh || true)"
+# manual paths are NOT gated: a human click always works (with a warning)
+t "manual cmd_start is NOT gated by the autostart switch" "0" \
+  "$(sed -n '/^cmd_start()/,/^}/p' scripts/local-autopilot.sh | grep -c 'autostart_allowed' || true)"
+t "manual cmd_start prints the discouraged-local warning banner" "1" \
+  "$(sed -n '/^cmd_start()/,/^}/p' scripts/local-autopilot.sh | grep -c 'MANUAL LOCAL START — operator lock 2026-07-06' || true)"
+t "warning banner names the dual-instance boot-lock consequence" "1" \
+  "$(sed -n '/^cmd_start()/,/^}/p' scripts/local-autopilot.sh | grep -c 'dual-instance boot lock will refuse the Dhan lane' || true)"
+# stopping is NEVER gated: cmd_stop + the EOD stop paths carry no switch check
+t "cmd_stop is NOT gated (stopping is always allowed)" "0" \
+  "$(sed -n '/^cmd_stop()/,/^}/p' scripts/local-autopilot.sh | grep -c 'autostart_allowed' || true)"
+t "stop_app is NOT gated (EOD/cleanup stop always allowed)" "0" \
+  "$(sed -n '/^stop_app()/,/^}/p' scripts/local-autopilot.sh | grep -c 'autostart_allowed' || true)"
+
 # ── probe verdict parse (QuestDB /exec JSON shapes) ─────────────────────────
 t "verdict present" "probe_multi_conn_ok" \
   "$(echo '{"query":"...","columns":[{"name":"reason"}],"dataset":[["probe_multi_conn_ok"]],"count":1}' | parse_probe_verdict)"

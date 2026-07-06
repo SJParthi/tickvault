@@ -36,6 +36,25 @@ AUTOPILOT_DIR="${AUTOPILOT_DIR:-data/local-autopilot}" # runtime STATE (pids, ma
 # the operator always opens — a symlink kept pointed at today's file.
 ONE_FILE_LINK="${ONE_FILE_LINK:-data/logs/tickvault.log}"
 MANUAL_STOP_MARKER="${MANUAL_STOP_MARKER:-data/local-manual-stop.marker}"
+# ═══════════════════════════════════════════════════════════════════════════
+# OPERATOR LOCK 2026-07-06 — LOCAL AUTO-START DISARMED.
+# Operator verbatim: "hereafter we should never ever run this in local" —
+# AWS is the single production runtime from this date onward. Every
+# AUTONOMOUS app-start path — the 08:55/09:05 launchd robot (cmd_run), the
+# monitor loop's crash auto-relaunch, and the post-probe auto-resume (all
+# funnelled through start_app_tolerate_peer) — is gated on this switch and
+# SKIPS the app start while it is "0" (the permanent default), logging one
+# clear DISARMED line instead. ONLY STARTING is gated: monitoring, the
+# 15:35 EOD stop, cmd_stop, cleanup, and self-heal of Docker/QuestDB all
+# keep working unconditionally. The operator's own explicit Start click
+# (cmd_start / `make local-start` / Start TickVault.command) stays
+# functional WITHOUT this switch but prints a warning banner. For a
+# deliberate zero-touch local day: export LOCAL_AUTOPILOT_AUTOSTART=1.
+# Ratchets: the "operator lock 2026-07-06: Mac auto-start DISARMED" block
+# in scripts/local-autopilot-test.sh pins the default, the choke-point
+# gate, the cmd_run entry gate, and that cmd_start is NOT gated.
+# ═══════════════════════════════════════════════════════════════════════════
+LOCAL_AUTOPILOT_AUTOSTART="${LOCAL_AUTOPILOT_AUTOSTART:-0}"
 # Operator lock 2026-07-06 (Groww scale experiments SUSPENDED — single Dhan
 # + single Groww only): the scale-day window defaults are EMPTY. classify_day
 # can never classify a scale day unless the operator explicitly exports
@@ -239,6 +258,15 @@ manual_stop_active() {
   [ -f "$marker" ] || return 1
   marker_date=$(head -1 "$marker" 2>/dev/null | cut -c1-10)
   [ "$marker_date" = "$today" ]
+}
+
+# autostart_allowed <switch> → "allow" iff the switch is EXACTLY "1";
+# anything else (0, empty, unset, garbage) → "deny". FAIL-CLOSED by design
+# (operator lock 2026-07-06: "hereafter we should never ever run this in
+# local" — AWS is the single production runtime). Pure; gates ONLY the
+# autonomous app-START paths, never stop/monitor/cleanup.
+autostart_allowed() {
+  if [ "${1:-0}" = "1" ]; then echo allow; else echo deny; fi
 }
 
 # monitor_decision <app_alive 0/1> <manual_stop 0/1> <relaunches so far>
@@ -3238,6 +3266,15 @@ start_app() { # $1 = label for the log
 # day flow + the monitor relaunch); every other rc passes through. The
 # manual cmd_start does NOT use this — it must word its Telegram honestly.
 start_app_tolerate_peer() {
+  # Operator lock 2026-07-06: this wrapper is the AUTONOMOUS-start choke
+  # point (robot day flow, monitor crash auto-relaunch, post-probe
+  # auto-resume — the manual cmd_start calls start_app directly and is
+  # deliberately NOT gated). rc 4 = disarmed skip, distinct + non-zero so
+  # no caller can mistake it for "a start is underway" (charter Rule 11).
+  if [ "$(autostart_allowed "$LOCAL_AUTOPILOT_AUTOSTART")" = "deny" ]; then
+    log "local autostart DISARMED — operator lock 2026-07-06: AWS is the single production runtime; export LOCAL_AUTOPILOT_AUTOSTART=1 for a deliberate local run (skipped autonomous app start: ${1:-?})"
+    return 4
+  fi
   local rc=0
   start_app "$@" || rc=$?
   if [ "$rc" = "3" ]; then
@@ -3745,6 +3782,10 @@ maybe_run_probe_once() {
 # ── Subcommand: manual start ────────────────────────────────────────────────
 
 cmd_start() {
+  # Operator lock 2026-07-06: the explicit manual Start click stays
+  # FUNCTIONAL (no LOCAL_AUTOPILOT_AUTOSTART needed — a human clicked it)
+  # but is DISCOURAGED and says so plainly before doing anything.
+  log "⚠️ MANUAL LOCAL START — operator lock 2026-07-06: local runs are discouraged; AWS is the single production runtime. If the AWS box is running, the app's dual-instance boot lock will refuse the Dhan lane here (fail-closed) — proceed only for a deliberate local run."
   log "== MANUAL START (manual always wins — clearing manual-stop marker) =="
   rm -f "$MANUAL_STOP_MARKER"
   # FIX 15.1: raise the open-files limit at entry so the 100-connection
@@ -4281,9 +4322,17 @@ monitor_until_eod() {
     relaunch)
       relaunches=$((relaunches + 1))
       healthy_streak=0
-      tg "⚠️ App died mid-session — relaunching once (attempt $relaunches). Log tail: $(tail -5 "$(current_log)" | tr '\n' ' | ')"
-      sleep 30
-      start_app_tolerate_peer "auto-relaunch" || true
+      # Operator lock 2026-07-06: with autostart disarmed the crash
+      # auto-relaunch is SKIPPED (honestly — no "relaunching" page for a
+      # relaunch that will not happen); monitoring/EOD stop keep running.
+      if [ "$(autostart_allowed "$LOCAL_AUTOPILOT_AUTOSTART")" = "deny" ]; then
+        log "local autostart DISARMED — operator lock 2026-07-06: AWS is the single production runtime; the app died mid-session and will NOT be auto-relaunched (double-click Start TickVault for a deliberate local run)"
+        tg "🔔 App stopped mid-session — auto-relaunch is DISARMED (operator lock: AWS is the production runtime now). Double-click Start TickVault only if you deliberately want a local run."
+      else
+        tg "⚠️ App died mid-session — relaunching once (attempt $relaunches). Log tail: $(tail -5 "$(current_log)" | tr '\n' ' | ')"
+        sleep 30
+        start_app_tolerate_peer "auto-relaunch" || true
+      fi
       ;;
     alert)
       tg "🆘 App died AGAIN after the one relaunch — NOT retrying (avoid crash-looping the feed). Log tail: $(tail -8 "$(current_log)" | tr '\n' ' | '). Double-click Start TickVault after investigating."
@@ -4386,6 +4435,17 @@ monitor_until_eod() {
 }
 
 cmd_run() {
+  # Operator lock 2026-07-06: the scheduled robot day (launchd 08:55/09:05
+  # fires, or any unattended `run` invocation) is DISARMED by default —
+  # "hereafter we should never ever run this in local"; AWS is the single
+  # production runtime. Quiet no-op BEFORE the lock / boot chain / any
+  # start, so the robot can never self-start the live app. Manual
+  # start/stop/status/dev stay fully functional (cmd_start warns instead),
+  # and a manually-started day keeps its own monitor for the 15:35 EOD stop.
+  if [ "$(autostart_allowed "$LOCAL_AUTOPILOT_AUTOSTART")" = "deny" ]; then
+    log "local autostart DISARMED — operator lock 2026-07-06: AWS is the single production runtime; export LOCAL_AUTOPILOT_AUTOSTART=1 for a deliberate local run (the scheduled robot day is a quiet no-op; Start/Stop/status still work manually)"
+    exit 0
+  fi
   # Duplicate-instance lock (mkdir is atomic; stale lock from a dead pid is
   # reclaimed). FIX 18 G1 compounding: the lock line now carries the DATE —
   # a WEDGED previous-day run (hung on a dead docker socket) previously
