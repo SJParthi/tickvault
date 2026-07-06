@@ -8,10 +8,13 @@
 #
 # HONESTY NOTE (absolute budgets on shared runners): the absolute ns budgets
 # in quality/benchmark-budgets.toml were calibrated on dev hardware. GitHub
-# shared runners are slower and noisier. If the first live runs show spurious
-# absolute-budget failures on runner hardware, the documented remediation is
-# a runner-class multiplier applied in bench-gate.sh — do NOT silently loosen
-# the budgets in benchmark-budgets.toml (they remain the dev-hardware truth).
+# shared runners are slower and noisier. The first 55 live runs (2026-07-03..
+# 2026-07-06) ALL failed on exactly this misfit (e.g. dispatch_frame budget
+# 10ns measured 15ns; f32_to_f64_clean budget 50ns measured 84-112ns), so the
+# documented remediation is now IMPLEMENTED: BENCH_BUDGET_MULTIPLIER (set on
+# the gate step below) scales the absolute budgets by an explicit, logged
+# runner-class factor — the budgets in benchmark-budgets.toml are NOT loosened
+# (they remain the dev-hardware truth) and the 5% regression arm is untouched.
 #
 # REGRESSION ARM (the 5% gate): Criterion only writes
 # target/criterion/<id>/change/estimates.json when a PRIOR baseline exists in
@@ -33,6 +36,21 @@
 #     can never self-ratify by becoming the next run's comparison base
 # The workflow step still fails on ANY nonzero rc — this only governs
 # whether the Criterion baseline ratchets forward.
+#
+# CROSS-MACHINE BASELINE FIX (2026-07-06): the ratchet above still wedged in
+# practice — an early run on a fast runner saved the baseline, then every
+# subsequent run on a normal shared runner showed uniform +6..29% "regressions"
+# (even pure clock-read benches like clock_instant_now "regressed" +7.9%,
+# physically impossible from code), got rc=2, and never re-saved: a permanent
+# self-locking red loop. The 5% CI-lower-bound guard protects against jitter
+# on ONE machine, not against comparing two DIFFERENT machines. Fix: the
+# baseline cache key now includes a runner-hardware fingerprint (CPU-model
+# hash), so a baseline is only ever compared against a run on the same
+# hardware class — cross-machine comparisons structurally cannot happen.
+# Escape hatch: a workflow_dispatch with reset_baseline=true force-saves the
+# current run's criterion dir as the new baseline even on rc=2 (for a wedged
+# or corrupt baseline); the run itself still fails on rc=2 — the gate is
+# never advisory.
 name: Benchmarks & Perf Gate
 
 on:
@@ -43,6 +61,15 @@ on:
     # two heavy workflows don't contend for runner capacity.
     - cron: '0 20 * * *'
   workflow_dispatch:
+    inputs:
+      reset_baseline:
+        description: >-
+          Force-save this run's Criterion results as the new baseline even on
+          a regression verdict (rc=2). Escape hatch for a wedged/corrupt
+          baseline; the run itself still fails on rc=2.
+        type: boolean
+        required: false
+        default: false
 
 # Baselines must not be corrupted by overlapping runs: serialize, never cancel
 # an in-flight run (a cancelled bench could save a partial criterion dir).
@@ -79,19 +106,36 @@ jobs:
       - name: Scrub cached Criterion state
         run: rm -rf target/criterion
 
+      # Fingerprint the runner hardware class. Baselines are only meaningful
+      # when compared on the SAME hardware — heterogeneous shared runners
+      # produce uniform +6..29% phantom "regressions" (see header). The
+      # fingerprint (CPU-model hash) scopes the baseline cache key so a
+      # cross-machine comparison structurally cannot happen: a run on a new
+      # hardware class simply finds no baseline and runs absolute-only
+      # (honest first-run behaviour for that class).
+      - name: Compute runner hardware fingerprint
+        id: hw
+        run: |
+          cpu_model=$(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2- | xargs || true)
+          cpu_model="${cpu_model:-unknown}"
+          hw_hash=$(printf '%s' "$cpu_model" | sha256sum | cut -c1-12)
+          echo "fingerprint=$hw_hash" >> "$GITHUB_OUTPUT"
+          echo "Runner CPU: $cpu_model (fingerprint: $hw_hash)"
+
       # Restore the previous green run's Criterion baseline so this run's
       # `cargo bench` writes <id>/change/estimates.json (Criterion compares
       # against the restored `new/` dirs) and bench-gate.sh can enforce the
       # 5% regression budget. restore-keys prefix-matches the most recent
-      # saved baseline; an exact key hit is impossible (run_id is unique),
-      # which is intentional — we always want "latest previous baseline".
-      - name: Restore Criterion baseline (previous main run)
+      # saved baseline FOR THIS HARDWARE CLASS; an exact key hit is
+      # impossible (run_id is unique), which is intentional — we always want
+      # "latest previous same-hardware baseline".
+      - name: Restore Criterion baseline (previous same-hardware main run)
         uses: actions/cache/restore@v6
         with:
           path: target/criterion
-          key: criterion-baseline-${{ github.run_id }}
+          key: criterion-baseline-${{ steps.hw.outputs.fingerprint }}-${{ github.run_id }}
           restore-keys: |
-            criterion-baseline-
+            criterion-baseline-${{ steps.hw.outputs.fingerprint }}-
 
       - name: Run benchmarks (workspace)
         id: bench
@@ -99,8 +143,16 @@ jobs:
           set -o pipefail
           cargo bench --workspace 2>&1 | tee bench-output.log
 
+      # BENCH_BUDGET_MULTIPLIER rationale (measured, 2026-07-06 audit of all
+      # 55 red runs): worst observed absolute misfit on ubuntu-latest is
+      # f32_to_f64_clean at 112ns vs the 50ns dev budget (x2.24); x2.5 covers
+      # that worst case with modest headroom while still failing anything
+      # slower than 2.5x the dev-hardware truth. Applied ONLY to the absolute
+      # arm; the 5% regression arm is unaffected.
       - name: Run bench-gate (absolute budgets + 5% regression)
         id: gate
+        env:
+          BENCH_BUDGET_MULTIPLIER: '2.5'
         run: |
           set -o pipefail
           rc=0
@@ -119,13 +171,20 @@ jobs:
       # misfit (rc=1) does NOT starve the cache — otherwise dev-calibrated
       # budgets failing forever on slower runners would mean the baseline is
       # never saved and the regression arm never activates (deadlock). A >5%
-      # regression (rc=2) can never self-ratify as the next baseline.
+      # regression (rc=2) can never self-ratify as the next baseline —
+      # UNLESS the operator explicitly dispatched with reset_baseline=true
+      # (the wedged-baseline escape hatch; the run still fails on rc=2).
+      # The key carries the hardware fingerprint so this baseline is only
+      # ever consumed by a future run on the same hardware class.
       - name: Save Criterion baseline (benches ok, no regression)
-        if: always() && steps.bench.outcome == 'success' && steps.gate.outputs.gate_rc != '2'
+        if: >-
+          always() && steps.bench.outcome == 'success' &&
+          (steps.gate.outputs.gate_rc != '2' ||
+           (github.event_name == 'workflow_dispatch' && inputs.reset_baseline == true))
         uses: actions/cache/save@v6
         with:
           path: target/criterion
-          key: criterion-baseline-${{ github.run_id }}
+          key: criterion-baseline-${{ steps.hw.outputs.fingerprint }}-${{ github.run_id }}
 
       - name: Upload bench + gate logs
         if: always()
