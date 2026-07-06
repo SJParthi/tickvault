@@ -812,6 +812,23 @@ rules:
       Silence; sustained recurrence is visible via
       tv_ws_watchdog_reconnect_in_place_total.
 
+  - name: ws-gap-10-order-update-outage-escalate
+    match:
+      code: WS-GAP-10
+    action: escalate
+    runbook_path: .claude/rules/project/wave-2-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 300
+    justification: >-
+      WS-GAP-10 = the order-update WebSocket is in an in-market outage
+      (>=3 consecutive reconnect failures; 2026-07-06 incident: dead token,
+      Dhan TCP-RST ~10ms after login, 39+ failures with zero HIGH pages).
+      The reconnect loop keeps retrying, but the order-confirmation feed is
+      down during market hours — the operator must inspect (dominant cause:
+      invalid token; token re-mint automation is a later PR). Escalate;
+      the in-loop page is already edge-triggered once per episode, and the
+      300s cooldown bounds repeat escalations across reason labels.
+
   - name: disk-watcher-01-respawn-escalate
     match:
       code: DISK-WATCHER-01

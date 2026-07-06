@@ -4176,6 +4176,7 @@ const fn damp_questdb_exit_signal(consecutive_failures: u32, threshold: u32) -> 
     consecutive_failures < threshold
 }
 
+#[allow(clippy::too_many_arguments)] // APPROVED: watchdog orchestration requires the full shared-infra handle set (pool + shutdown + notifier + health + feed-health + lane-halt + dhan-flag + token + questdb)
 fn spawn_pool_watchdog_task(
     pool: std::sync::Arc<WebSocketConnectionPool>,
     shutdown_notify: std::sync::Arc<tokio::sync::Notify>,
@@ -4344,7 +4345,7 @@ fn spawn_pool_watchdog_task(
                     // UI-status flag with no ordering dependency).
                     let dhan_on = dhan_enabled
                         .as_ref()
-                        .map_or(true, |f| f.load(std::sync::atomic::Ordering::Relaxed));
+                        .is_none_or(|f| f.load(std::sync::atomic::Ordering::Relaxed));
                     // ACT (page + exit/teardown) ONLY when in market hours AND
                     // Dhan is enabled; otherwise the down pool is expected idle.
                     let should_act =
@@ -7963,7 +7964,6 @@ async fn start_dhan_lane(
         let token = token_manager.token_handle();
         let sender = order_update_sender.clone();
         let cal = trading_calendar.clone();
-        let ou_notifier = notifier.clone();
         let ou_connect_notifier = notifier.clone();
         let ou_health = health_status.clone();
         let ou_wal_spill = ws_frame_spill.clone();
@@ -8008,10 +8008,19 @@ async fn start_dhan_lane(
                 ou_dhan_flag,
             )
             .await;
-            // If run_order_update_connection returns, connection terminated
-            ou_notifier.notify(NotificationEvent::OrderUpdateDisconnected {
-                reason: "connection task exited".to_string(),
-            });
+            // Defensive only: run_order_update_connection is an infinite
+            // never-give-up loop (WS-GAP-04) and structurally cannot return —
+            // the OrderUpdateDisconnected notify that used to live here was
+            // DEAD CODE (2026-07-06 incident: 39+ in-market failures, zero
+            // HIGH pages). The reachable [HIGH] page now fires INSIDE the
+            // reconnect loop (WS-GAP-10). If this line ever executes, a
+            // future refactor broke the loop contract — surface it loudly,
+            // never silently.
+            error!(
+                code = tickvault_common::error_code::ErrorCode::WsGap10OrderUpdateOutage.code_str(),
+                reason = "task_exited_unreachable",
+                "order update WebSocket task exited — unreachable by design; investigate immediately"
+            );
             ou_health.set_order_update_connected(false);
         })
     };
