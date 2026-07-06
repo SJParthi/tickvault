@@ -306,18 +306,26 @@ NOT "an order frame arrived" — the order-update stream is legitimately
 silent for hours on idle days (watchdog threshold history
 660s → 1800s → 14400s), so first-frame gating would never fire; time-survival
 is the honest gate, with the 14400s activity watchdog as the dead-socket
-backstop. Clean-close flaps (server Close frame / stream end) that never
-error keep the legacy silent streak-reset (documented gap; a clean-close
-streak detector is a PR-2 candidate) — EXCEPT mid-paged-episode, where the
-streak + latch are kept. A pathological connect → survive-60s → die metronome
-re-pages at most ~1 HIGH per ~2 min — bounded, and each cycle is a genuine
-outage + recovery. An outage shorter than 3 failures pages nothing (absorbed
-by the 0/0/500ms backoff ladder).
+backstop. Clean-close flaps (server Close frame / stream end — Dhan's OTHER
+documented auth-rejection delivery mode) COUNT toward the same 3-failure
+page since the 2026-07-06 hostile-review fix: any session that ends BEFORE
+the 60s stability window increments the streak regardless of delivery mode
+(`streak_after_clean_close`), the page decision is evaluated in BOTH
+reconnect-loop arms via the shared `emit_in_market_outage_page` helper, and
+a mixed regime (≤2 errors then one clean close, repeating) can no longer
+perpetually defeat the threshold. Only a stability-window survival resets
+the streak, so normal idle-day clean closes (sessions living minutes/hours)
+never count. Off-hours clean-close flaps enter the same WS-GAP-04
+sleep-until-open after the attempt budget as the error regime. A
+pathological connect → survive-60s → die metronome re-pages at most ~1 HIGH
+per ~2 min — bounded, and each cycle is a genuine outage + recovery. An
+outage shorter than 3 failures pages nothing (absorbed by the 0/0/500ms
+backoff ladder).
 
 **Auto-triage safe:** YES (the loop self-retries; triage inspects — the page
 is the visibility, not an action request).
 
-**Source:** `crates/core/src/websocket/order_update_connection.rs::{run_order_update_connection, should_page_outage, streak_after_clean_close, should_emit_stable_recovery}`
+**Source:** `crates/core/src/websocket/order_update_connection.rs::{run_order_update_connection, should_page_outage, streak_after_clean_close, should_emit_stable_recovery, emit_in_market_outage_page}`
 (`ErrorCode::WsGap10OrderUpdateOutage`); defensive unreachable-return log in
 `crates/app/src/main.rs` (order-update spawn site).
 

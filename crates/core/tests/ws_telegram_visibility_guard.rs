@@ -174,6 +174,39 @@ fn order_update_high_page_is_emitted_inside_reconnect_loop() {
 }
 
 #[test]
+fn order_update_clean_close_counts_as_failure_and_can_page() {
+    // 2026-07-06 hostile-review fix (same day): Dhan's documented
+    // auth-rejection delivery is a clean Close frame (Ok(()) exit), not only
+    // a TCP reset. The original streak_after_clean_close reset the streak to
+    // 0 on an un-paged clean close, making the 3-failure HIGH page
+    // UNREACHABLE for a pure clean-close dead-token regime and letting a
+    // mixed regime (<=2 errors then one clean close, repeating) perpetually
+    // defeat the threshold.
+    let src = read("crates/core/src/websocket/order_update_connection.rs");
+    assert!(
+        src.contains("fn streak_after_clean_close(prev_streak: u32, stability_reached: bool)"),
+        "streak_after_clean_close must key on STABILITY SURVIVAL, not the \
+         paged latch — a sub-60s clean close is a failure regardless of \
+         delivery mode."
+    );
+    assert!(
+        src.matches("if should_page_outage(within_hours, consecutive_failures, outage_paged)")
+            .count()
+            >= 2,
+        "the [HIGH] page decision must be evaluated in BOTH reconnect-loop \
+         arms — the transport-error arm AND the sub-stability clean-close \
+         (Ok) arm — else a pure clean-close outage grows the streak but \
+         never pages."
+    );
+    assert!(
+        src.matches("emit_in_market_outage_page(").count() >= 3,
+        "both arms must route through the shared emit_in_market_outage_page \
+         helper (definition + 2 call sites) so the Telegram wording and the \
+         WS-GAP-10 coded error! can never diverge between regimes."
+    );
+}
+
+#[test]
 fn order_update_reconnected_is_stability_gated_not_connect_edge() {
     let src = read("crates/core/src/websocket/order_update_connection.rs");
     let full_token = "NotificationEvent::OrderUpdateReconnected";

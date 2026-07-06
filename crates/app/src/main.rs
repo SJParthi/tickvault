@@ -4176,6 +4176,7 @@ const fn damp_questdb_exit_signal(consecutive_failures: u32, threshold: u32) -> 
     consecutive_failures < threshold
 }
 
+#[allow(clippy::too_many_arguments)] // APPROVED: watchdog orchestration requires the full shared-infra handle set (pool + shutdown + notifier + health + feed-health + lane-halt + dhan-flag + token + questdb)
 fn spawn_pool_watchdog_task(
     pool: std::sync::Arc<WebSocketConnectionPool>,
     shutdown_notify: std::sync::Arc<tokio::sync::Notify>,
@@ -4344,7 +4345,7 @@ fn spawn_pool_watchdog_task(
                     // UI-status flag with no ordering dependency).
                     let dhan_on = dhan_enabled
                         .as_ref()
-                        .map_or(true, |f| f.load(std::sync::atomic::Ordering::Relaxed));
+                        .is_none_or(|f| f.load(std::sync::atomic::Ordering::Relaxed));
                     // ACT (page + exit/teardown) ONLY when in market hours AND
                     // Dhan is enabled; otherwise the down pool is expected idle.
                     let should_act =

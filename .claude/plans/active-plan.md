@@ -9,7 +9,7 @@
 > Guarantee matrices: carried by cross-reference to
 > `.claude/rules/project/per-wave-guarantee-matrix.md` (15-row + 7-row, mandatory
 > per `per-item-guarantee-check.sh`). Per-row this-PR specifics: code coverage —
-> 10 new unit tests + 3 new source-scan ratchets + 1 updated ratchet, coverage
+> 12 unit tests + 4 new source-scan ratchets + 1 updated ratchet, coverage
 > delta ≥ 0; audit coverage — `ws_event_audit` rows UNCHANGED (both Connected +
 > Reconnected forensic rows preserved); testing coverage — unit (pure fns),
 > edge/boundary (u32::MAX saturation, threshold boundaries), error-scenario
@@ -33,10 +33,11 @@
 > real-time proof — counters + coded error! + Telegram + audit rows.
 >
 > Honest 100% envelope: "100% inside the tested envelope: the HIGH page is
-> guaranteed for error-close outages reaching 3 consecutive in-market failures;
-> clean-close flap storms and upstream frame loss on a connected socket are
-> OUTSIDE this envelope (covered by ws_event_audit forensics and the 14400s
-> activity watchdog respectively)."
+> guaranteed for ANY outage reaching 3 consecutive in-market sub-stability
+> session ends — transport-error closes AND clean closes both count (2026-07-06
+> hostile-review fix; Dhan's documented auth-rejection delivery is a clean
+> Close frame); upstream frame loss on a connected socket stays OUTSIDE this
+> envelope (covered by the 14400s activity watchdog)."
 
 ## Plan Items
 
@@ -62,9 +63,9 @@
   new socket survives a 60s stability window (time-survival, NEVER
   first-frame-gated — the order stream is legitimately silent for hours);
   connect-edge Telegram emission deleted (both `ws_event_audit` rows kept);
-  mid-paged-episode clean close keeps the streak + latch.
+  sub-stability clean closes count toward the streak (see Item 7).
   - Files: crates/core/src/websocket/order_update_connection.rs
-  - Tests: test_streak_after_clean_close_resets_when_unpaged, test_streak_after_clean_close_keeps_streak_mid_paged_episode, test_should_emit_stable_recovery_requires_prior_failures
+  - Tests: test_streak_after_clean_close_resets_after_stable_session, test_should_emit_stable_recovery_requires_prior_failures
 
 - [x] Item 5 — Dead site at the main.rs order-update spawn: the post-await
   `OrderUpdateDisconnected` notify (unreachable since the WS-GAP-04
@@ -81,6 +82,20 @@
   - Files: crates/core/tests/ws_telegram_visibility_guard.rs
   - Tests: order_update_high_page_is_emitted_inside_reconnect_loop, order_update_reconnected_is_stability_gated_not_connect_edge, main_rs_does_not_emit_order_update_disconnected_after_task_await, order_update_connection_fires_reconnect_notify
 
+- [x] Item 7 — Hostile-review fix (2026-07-06, same day): clean-close outages
+  must page. Any session ending BEFORE the 60s stability window increments the
+  streak regardless of delivery mode (`streak_after_clean_close(prev,
+  stability_reached)` → `prev.saturating_add(1)` when unstable, 0 when
+  stable); the page decision (`should_page_outage`) is evaluated in BOTH
+  reconnect-loop arms via the shared `emit_in_market_outage_page` helper; the
+  off-hours clean-close flap enters the same WS-GAP-04 sleep after the attempt
+  budget (`decide_reconnect_action` parity). Closes the mixed regime (≤2
+  errors then one clean close, repeating) that perpetually defeated the
+  threshold, and the pure clean-close dead-token regime (the file's own
+  documented auth-rejection delivery mode).
+  - Files: crates/core/src/websocket/order_update_connection.rs, crates/core/tests/ws_telegram_visibility_guard.rs, .claude/rules/project/wave-2-error-codes.md
+  - Tests: test_streak_after_clean_close_counts_as_failure_when_unstable, test_streak_after_clean_close_mixed_regime_reaches_page_threshold, test_streak_after_clean_close_resets_after_stable_session, test_streak_after_clean_close_saturates_at_u32_max, order_update_clean_close_counts_as_failure_and_can_page
+
 ## Scenarios
 
 | # | Scenario | Expected |
@@ -89,8 +104,11 @@
 | 2 | Operator fixes token; connect survives 60s | ONE [LOW] reconnected; latch re-armed; streak 0 |
 | 3 | Off-hours failure streak of any length | No HIGH page (existing Low/audit semantics stand) |
 | 4 | Streak accumulated off-hours crosses 09:00 IST | HIGH page on FIRST in-market failure at/above threshold (`>=` latch) |
-| 5 | Clean close mid-paged-episode | Streak + latch kept; no duplicate page; no silent 0ms flap loop |
-| 6 | Un-paged clean-close flap | Legacy silent reset (documented gap, PR-2 candidate) |
+| 5 | Clean close mid-paged-episode | Streak keeps counting; latch prevents duplicate page; exponential backoff, no silent 0ms flap loop |
+| 6 | Pure clean-close dead-token flap (in-market) | Streak 1→2→3 → ONE [HIGH] page (hostile-review fix — was silent) |
+| 6b | Mixed regime: 2 errors + 1 clean close, repeating | Clean close is failure #3 → ONE [HIGH] page (was perpetually defeated) |
+| 6c | Off-hours clean-close flap | Counts + capped backoff, then WS-GAP-04 sleep-until-open after the attempt budget; no HIGH page (market-hours gate) |
+| 6d | Healthy 4h session ends with a clean close | Stability was reached → streak resets to 0; nothing counts, nothing pages |
 | 7 | Idle day: zero frames for hours on a healthy socket | Stability window still completes at 60s (time-survival, not frame-gated) |
 | 8 | Socket dies at 59.9s | No recovery Telegram; latch stays armed (correct) |
 
@@ -126,10 +144,16 @@ RC1 (dead HIGH emit) + RC2 (false-recovery storms), both verified 2026-07-06
 4. **Episode lifecycle**: `outage_paged` latch in the outer loop. Re-armed
    (with streak reset) when a connect attempt reaches the stability window;
    also re-armed by the WS-GAP-04 post-close sleep and the PR-E Dhan
-   re-enable (fresh episodes). A clean close DURING a paged episode keeps the
-   streak (`streak_after_clean_close`) — prevents the silent 0ms clean-close
-   flap loop and a duplicate HIGH page; un-paged clean closes keep the legacy
-   reset (no new paging regime in PR-1).
+   re-enable (fresh episodes). Hostile-review fix (2026-07-06, same day): a
+   session ending BEFORE the stability window is a FAILURE regardless of
+   delivery mode — `streak_after_clean_close(prev, stability_reached)`
+   increments on a sub-60s clean close (Dhan's documented auth-rejection
+   delivery is a clean Close frame) and resets only on stability survival.
+   The `Ok(())` arm evaluates the SAME `should_page_outage` decision and
+   routes through the shared `emit_in_market_outage_page` helper, plus the
+   same off-hours WS-GAP-04 exhaustion path (`decide_reconnect_action`
+   parity). Normal idle-day clean closes (sessions living minutes/hours)
+   reached stability and never count.
 5. **Dead site**: main.rs post-await notify → defensive coded `error!`
    (`task_exited_unreachable`); the fast-boot spawn site needs no change (no
    post-await code; the in-loop page lives in the shared core fn — boot
@@ -148,9 +172,14 @@ connect survives 60s → ONE [LOW] reconnected → latch re-armed, streak 0.
   existing off-hours Low/audit semantics stand untouched.
 - Off-hours streak crossing 09:00 IST: pages on first in-market failure
   (`>=` with latch).
-- Mid-outage clean close: keeps streak + latch (no duplicate page, no silent
-  0ms flap); un-paged clean-close flaps stay legacy-silent (documented gap,
-  PR-2 candidate).
+- Sub-stability clean close: counts as a failure (increments streak) and can
+  page — in-market pure clean-close and mixed regimes both reach the 3-failure
+  threshold; the paged latch still prevents duplicate pages.
+- Off-hours clean-close flap: counts + capped exponential backoff, then the
+  WS-GAP-04 sleep-until-open after the attempt budget (parity with the error
+  arm); never a HIGH page off-hours.
+- Healthy long-lived session ending in a clean close: `stability_reached`
+  is true → streak resets to 0; nothing counts.
 - PR-E Dhan runtime toggle + WS-GAP-04 post-close sleep both re-arm the
   episode (fresh streak + latch).
 - Boot-time in-market failure streak pages at 3 like any other episode.
@@ -181,10 +210,10 @@ connect survives 60s → ONE [LOW] reconnected → latch re-armed, streak 0.
 
 ## Test Plan
 
-- Unit tests (crates/core, `order_update_connection.rs::tests`): 10 new tests
-  over the 3 private pure fns + pinned constants (see Items 3+4 test lists).
+- Unit tests (crates/core, `order_update_connection.rs::tests`): 12 tests
+  over the 3 private pure fns + pinned constants (see Items 3+4+7 test lists).
 - Source-scan ratchets (crates/core/tests/ws_telegram_visibility_guard.rs):
-  3 new + 1 updated (see Item 6).
+  4 new + 1 updated (see Items 6+7).
 - Existing tests kept byte-identical-green:
   test_first_reconnect_attempt_is_zero_ms_instant, test_backoff_calculation,
   all test_compute_reconnect_backoff_*, all test_reconnect_action_*,

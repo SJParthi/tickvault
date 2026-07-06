@@ -177,25 +177,33 @@ pub async fn run_order_update_connection(
 
         match attempt_result {
             Ok(()) => {
-                // Clean disconnect — 2026-07-06 RC1: a clean close DURING a
-                // paged episode keeps the failure streak (only a stability
-                // survival ends an episode); un-paged clean closes keep the
-                // legacy reset-and-reconnect.
-                consecutive_failures = streak_after_clean_close(consecutive_failures, outage_paged);
-                if outage_paged {
+                // Clean disconnect — 2026-07-06 RC1 (hostile-review fix, same
+                // day): a session that ended BEFORE the stability window is a
+                // FAILURE regardless of delivery mode. Dhan's documented
+                // auth-rejection path is a clean Close frame, so a dead-token
+                // outage delivered as clean closes must reach the same
+                // 3-failure HIGH page as the TCP-reset regime. Sessions that
+                // survived ≥60s reset via the stability arm above.
+                let within_hours = is_within_market_hours(&calendar);
+                consecutive_failures =
+                    streak_after_clean_close(consecutive_failures, stability_reached);
+                if stability_reached {
                     info!(
-                        consecutive_failures,
-                        "order update WebSocket closed cleanly mid-outage — keeping failure streak"
+                        "order update WebSocket disconnected cleanly after stable session — reconnecting"
                     );
                 } else {
-                    info!("order update WebSocket disconnected cleanly — reconnecting");
+                    warn!(
+                        consecutive_failures,
+                        "order update WebSocket closed cleanly before the stability window — \
+                         counted as a failure"
+                    );
                 }
                 // 2026-06-12 (hostile-review fix): a clean server-initiated close
                 // (the documented Dhan idle-RST case) returns Ok(()) — it is STILL
                 // a disconnect and MUST be tracked, else a clean disconnect/reconnect
                 // cycle is invisible in ws_event_audit. Kind mirrors in-market vs
                 // off-hours; no transport error → source "clean close".
-                let ou_clean_kind = if is_within_market_hours(&calendar) {
+                let ou_clean_kind = if within_hours {
                     tickvault_common::ws_event_types::WsEventKind::Disconnected
                 } else {
                     tickvault_common::ws_event_types::WsEventKind::DisconnectedOffHours
@@ -206,8 +214,50 @@ pub async fn run_order_update_connection(
                     "clean close",
                     "order-update connection closed cleanly (server close / stream end)",
                     0,
-                    0,
+                    consecutive_failures,
                 );
+                if !stability_reached {
+                    // Same in-loop [HIGH] page decision as the error arm —
+                    // without this, a pure clean-close outage regime would
+                    // grow the streak but never page (the 2026-07-06
+                    // hostile-review finding).
+                    if should_page_outage(within_hours, consecutive_failures, outage_paged) {
+                        outage_paged = true;
+                        emit_in_market_outage_page(
+                            notifier.as_ref(),
+                            consecutive_failures,
+                            "clean close",
+                        );
+                    }
+                    // Off-hours parity with the error arm: after the same
+                    // attempt budget, sleep until the next market open
+                    // instead of flapping backoff-capped all night
+                    // (WS-GAP-04). `error_is_read_timeout = false`: a clean
+                    // close is not the expected off-hours idle timeout.
+                    if decide_reconnect_action(false, within_hours, consecutive_failures)
+                        == ReconnectAction::Exhausted
+                    {
+                        error!(
+                            attempts = consecutive_failures,
+                            code = tickvault_common::error_code::ErrorCode::WsGap04PostCloseSleep
+                                .code_str(),
+                            "WS-GAP-04 order update WebSocket exhausted reconnection attempts \
+                             (clean-close flap) — sleeping until next market open"
+                        );
+                        order_update_post_close_sleep(
+                            &calendar,
+                            consecutive_failures,
+                            notifier.as_ref(),
+                            ws_audit_tx.as_ref(),
+                        )
+                        .await;
+                        // The WS-GAP-04 sleep ends the outage episode —
+                        // fresh streak + re-armed page latch.
+                        consecutive_failures = 0;
+                        outage_paged = false;
+                        continue;
+                    }
+                }
             }
             Err(err) => {
                 let is_timeout = matches!(err, OrderUpdateConnectionError::ReadTimeout);
@@ -284,31 +334,11 @@ pub async fn run_order_update_connection(
                         // code: this function never returns (WS-GAP-04).
                         if should_page_outage(within_hours, consecutive_failures, outage_paged) {
                             outage_paged = true;
-                            metrics::counter!("tv_order_update_outage_pages_total").increment(1);
-                            error!(
+                            emit_in_market_outage_page(
+                                notifier.as_ref(),
                                 consecutive_failures,
-                                cause = ou_source,
-                                code = tickvault_common::error_code::ErrorCode::WsGap10OrderUpdateOutage
-                                    .code_str(),
-                                reason = "in_market_outage",
-                                "WS-GAP-10 order update WebSocket outage during market hours — \
-                                 paging operator, reconnect loop continues"
+                                ou_source,
                             );
-                            if let Some(n) = notifier.as_ref() {
-                                // O(1) EXEMPT: cold path, at most once per outage episode.
-                                n.notify(
-                                    crate::notification::events::NotificationEvent::OrderUpdateDisconnected {
-                                        reason: format!(
-                                            "Order confirmations from the broker have STOPPED during market hours — \
-                                             {consecutive_failures} connection attempts in a row failed ({ou_source}). \
-                                             The system keeps retrying automatically. \
-                                             What you need to do RIGHT NOW: 1. Check the Dhan login token is still \
-                                             valid — a dead token makes every attempt fail within milliseconds. \
-                                             2. If any order is live, watch it in the Dhan app until this recovers."
-                                        ),
-                                    },
-                                );
-                            }
                         }
                         // Parthiban directive (2026-04-21): always ERROR on
                         // 10-failure streak and WARN on every error,
@@ -404,6 +434,47 @@ fn emit_order_update_ws_audit(
             "order-update ws_event_audit channel full/closed — row dropped (log+Telegram still fired)"
         );
         metrics::counter!("tv_ws_event_audit_dropped_total", "reason" => drop_reason).increment(1);
+    }
+}
+
+/// 2026-07-06 RC1: the once-per-episode \[HIGH\] in-market outage page —
+/// coded `error!` (WS-GAP-10) + `[HIGH]` `OrderUpdateDisconnected` Telegram +
+/// page counter. Shared by BOTH reconnect-loop arms: the transport-error arm
+/// AND the sub-stability clean-close arm (hostile-review fix, same day —
+/// Dhan's documented auth-rejection delivery is a clean Close frame, so the
+/// page must be reachable from that arm too).
+///
+/// COLD PATH — at most once per outage episode (caller gates via
+/// `should_page_outage` + the `outage_paged` latch).
+fn emit_in_market_outage_page(
+    notifier: Option<&Arc<crate::notification::NotificationService>>,
+    consecutive_failures: u32,
+    cause: &str,
+) {
+    metrics::counter!("tv_order_update_outage_pages_total").increment(1);
+    error!(
+        consecutive_failures,
+        cause,
+        code = tickvault_common::error_code::ErrorCode::WsGap10OrderUpdateOutage.code_str(),
+        reason = "in_market_outage",
+        "WS-GAP-10 order update WebSocket outage during market hours — \
+         paging operator, reconnect loop continues"
+    );
+    if let Some(n) = notifier {
+        // O(1) EXEMPT: begin — cold path, at most once per outage episode.
+        n.notify(
+            crate::notification::events::NotificationEvent::OrderUpdateDisconnected {
+                reason: format!(
+                    "Order confirmations from the broker have STOPPED during market hours — \
+                     {consecutive_failures} connection attempts in a row failed ({cause}). \
+                     The system keeps retrying automatically. \
+                     What you need to do RIGHT NOW: 1. Check the Dhan login token is still \
+                     valid — a dead token makes every attempt fail within milliseconds. \
+                     2. If any order is live, watch it in the Dhan app until this recovers."
+                ),
+            },
+        );
+        // O(1) EXEMPT: end
     }
 }
 
@@ -1102,20 +1173,28 @@ fn should_page_outage(
         && consecutive_failures >= ORDER_UPDATE_OUTAGE_PAGE_FAILURE_THRESHOLD
 }
 
-/// 2026-07-06 RC1: streak carried across a CLEAN close (`Ok(())` exit).
+/// 2026-07-06 RC1 (hostile-review fix, same day): streak after a CLEAN close
+/// (`Ok(())` exit).
 ///
-/// A clean close DURING a paged episode keeps the streak (Dhan sometimes
-/// clean-closes instead of RST within the same dead-token episode) — only a
-/// stability-window survival ends an episode. Prevents the silent 0ms
-/// clean-close flap loop AND a duplicate HIGH page. Un-paged clean closes
-/// keep the legacy reset (no new paging regime in PR-1).
+/// A session that ended BEFORE the stability window is a FAILURE regardless
+/// of delivery mode. Dhan's documented auth-rejection path is a clean Close
+/// frame (see the auth-failure notes above `connect_and_listen`'s read loop),
+/// so a dead-token outage delivered as clean closes MUST count toward the
+/// same 3-failure HIGH page as the TCP-reset regime — the original
+/// reset-to-zero-when-unpaged version made the page unreachable for that
+/// regime, and a mixed regime (≤2 errors then one clean close, repeating)
+/// perpetually defeated the threshold.
+///
+/// Sessions that survived the stability window (≥60s connected) reset the
+/// streak — normal idle-day clean closes live minutes/hours and are
+/// unaffected; only sub-60s clean-close flaps count.
 ///
 /// Pure function — no I/O.
-fn streak_after_clean_close(prev_streak: u32, outage_paged_this_episode: bool) -> u32 {
-    if outage_paged_this_episode {
-        prev_streak
-    } else {
+fn streak_after_clean_close(prev_streak: u32, stability_reached: bool) -> u32 {
+    if stability_reached {
         0
+    } else {
+        prev_streak.saturating_add(1)
     }
 }
 
@@ -2103,22 +2182,40 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // 2026-07-06 RC1 — streak_after_clean_close (episode continuity)
+    // 2026-07-06 RC1 — streak_after_clean_close (hostile-review fix: a
+    // sub-stability clean close is a FAILURE — Dhan's documented
+    // auth-rejection delivery is a clean Close frame)
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_streak_after_clean_close_resets_when_unpaged() {
-        // Un-paged clean closes keep the legacy reset (no new paging regime).
-        assert_eq!(streak_after_clean_close(5, false), 0);
-        assert_eq!(streak_after_clean_close(0, false), 0);
+    fn test_streak_after_clean_close_counts_as_failure_when_unstable() {
+        // A session that ended BEFORE the 60s stability window increments the
+        // streak — the original reset-to-zero made the HIGH page unreachable
+        // for a pure clean-close dead-token regime.
+        assert_eq!(streak_after_clean_close(0, false), 1);
+        assert_eq!(streak_after_clean_close(5, false), 6);
     }
 
     #[test]
-    fn test_streak_after_clean_close_keeps_streak_mid_paged_episode() {
-        // A clean close DURING a paged episode keeps the streak — prevents
-        // the silent 0ms clean-close flap loop AND a duplicate HIGH page.
-        assert_eq!(streak_after_clean_close(5, true), 5);
-        assert_eq!(streak_after_clean_close(1, true), 1);
+    fn test_streak_after_clean_close_mixed_regime_reaches_page_threshold() {
+        // The hostile-review mixed regime: 2 transport errors then one clean
+        // close, repeating, must NOT perpetually defeat the 3-failure page.
+        let streak = streak_after_clean_close(2, false);
+        assert_eq!(streak, 3);
+        assert!(should_page_outage(true, streak, false));
+    }
+
+    #[test]
+    fn test_streak_after_clean_close_resets_after_stable_session() {
+        // Surviving the stability window ends the episode — a normal
+        // idle-day clean close (session lived minutes/hours) never counts.
+        assert_eq!(streak_after_clean_close(5, true), 0);
+        assert_eq!(streak_after_clean_close(0, true), 0);
+    }
+
+    #[test]
+    fn test_streak_after_clean_close_saturates_at_u32_max() {
+        assert_eq!(streak_after_clean_close(u32::MAX, false), u32::MAX);
     }
 
     // -----------------------------------------------------------------------
