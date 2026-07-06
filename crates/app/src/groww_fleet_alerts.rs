@@ -23,19 +23,33 @@
 //!   transitions across ALL fleet connections aggregate into at most ONE
 //!   Telegram per [`FLEET_ALERT_WINDOW_SECS`] window PER DIRECTION
 //!   ([`FleetAlertKind::Reject`] vs [`FleetAlertKind::Connected`]), with a
-//!   count summary ("7 of 40 connections retrying … — others streaming
-//!   normally").
+//!   count summary ("7 of 40 connections retrying … — no reject reported
+//!   from the other 33 connections").
 //!
 //! # Honest envelope
 //!
 //! The summary is edge-triggered (audit-findings Rule 4): the FIRST event of
 //! a window emits with the count known AT THAT INSTANT; connections that
 //! join the reject set later in the same window are counted by the NEXT
-//! window's summary (the reject set persists across windows). There is
+//! window's summary (the reject set persists across windows; the caller's
+//! per-child latch is NOT consumed by a [`FleetAlertDecision::Suppress`], so
+//! suppressed connections retry into later windows and the accumulated count
+//! genuinely reaches the operator — hostile-review fix 2026-07-06). There is
 //! deliberately NO delayed/debounced flush task — no timer, no new
 //! background task, no new silent-death surface. Per-connection `error!`
 //! logs, feed-health state, and `ws_event_audit` forensic rows are NEVER
 //! coalesced — only the operator-facing Telegram fan-out is.
+//!
+//! The summary NEVER makes a positive health claim about connections outside
+//! the reject set (audit-findings Rule 11: no false-OK; connected ≠
+//! streaming per `ws-event-audit` §1). Absence from the reject set means
+//! only "no reject reported" — a connection may still be booting or silently
+//! starving before its own watchdog fires — and the wording says exactly
+//! that. A connection is REMOVED from the reject set only on the supervisor's
+//! genuine streaming/auth-OK recovery edge ([`record_fleet_recovery`]) or on
+//! fleet scale-down pruning ([`FleetAlertState::set_fleet_size`]) — NEVER on
+//! the socket-connected (awaiting-first-tick) edge, which proves nothing
+//! about data flow.
 
 use std::collections::HashSet;
 use std::sync::{Mutex, OnceLock};
@@ -63,7 +77,8 @@ pub enum FleetAlertDecision {
     /// the count of connections currently affected + the fleet size.
     EmitSummary {
         /// Connections currently in the reject set (Reject direction) or
-        /// currently NOT rejecting (Connected direction).
+        /// connections with NO reject currently recorded (Connected
+        /// direction — "no reject reported", NOT proven healthy).
         affected: usize,
         /// Fleet size as last published by the reconciler (0 until known).
         fleet_size: usize,
@@ -85,10 +100,17 @@ pub struct FleetAlertState {
 
 impl FleetAlertState {
     /// Publish the current fleet size (called by the fleet reconciler each
-    /// pass). Never shrinks the reject set — a scaled-down conn id simply
-    /// stops producing events and is cleared on its next recovery edge.
+    /// pass) AND prune reject entries for scaled-down connections. Conn ids
+    /// are contiguous `0..n` by construction (the reconciler spawns with
+    /// `conn_id = children.len()` and scale-down pops the NEWEST), so any
+    /// id `>= n` belongs to a killed connection that can never produce a
+    /// recovery edge — leaving it in the set would inflate every later
+    /// summary toward a false whole-fleet-down claim (hostile-review fix
+    /// 2026-07-06: GROWW-SCALE-01 rollback kills exactly the connections
+    /// that just rejected).
     pub fn set_fleet_size(&mut self, n: usize) {
         self.fleet_size = n;
+        self.rejecting.retain(|conn| *conn < n);
     }
 
     /// Number of connections currently in the reject set (for tests +
@@ -118,7 +140,15 @@ pub fn decide_fleet_alert(
             state.rejecting.insert(conn);
         }
         FleetAlertKind::Connected => {
-            state.rejecting.remove(&conn);
+            // Deliberately does NOT touch the reject set (hostile-review fix
+            // 2026-07-06): the bridge feeds this on the boot-connect
+            // "awaiting first tick" edge — socket-connected, NOT streaming.
+            // Clearing here would let a connect→silence→reject cycle (the
+            // exam's server-side session starvation pattern) chronically
+            // undercount every reject summary. The ONLY reject-set clear
+            // edges are the supervisor's streaming/auth-OK recovery
+            // ([`record_fleet_recovery`]) and scale-down pruning
+            // ([`FleetAlertState::set_fleet_size`]).
         }
     }
     let last = match kind {
@@ -132,8 +162,9 @@ pub fn decide_fleet_alert(
     *last = Some(now_secs);
     let affected = match kind {
         FleetAlertKind::Reject => state.rejecting.len(),
-        // Connected direction: the healthy remainder (at least the reporting
-        // connection itself, so the count is never a misleading 0).
+        // Connected direction: connections with no reject currently recorded
+        // ("no reject reported" — NOT proven streaming; at least the
+        // reporting connection itself, so the count is never a misleading 0).
         FleetAlertKind::Connected => state
             .fleet_size
             .saturating_sub(state.rejecting.len())
@@ -159,14 +190,20 @@ pub fn record_fleet_recovery(state: &mut FleetAlertState, conn_id: Option<usize>
 
 /// Render the fleet reject summary in plain operator English (Telegram
 /// commandment 1: no library names, no file paths). Pure.
+///
+/// The suffix is deliberately NEGATIVE-evidence-only ("no reject reported"),
+/// never a positive health claim ("streaming normally") — membership outside
+/// the reject set proves nothing about data flow (audit-findings Rule 11;
+/// hostile-review fix 2026-07-06).
 #[must_use]
 pub fn format_fleet_reject_summary(affected: usize, fleet_size: usize, label: &str) -> String {
     if affected >= fleet_size {
         format!("{affected} of {fleet_size} connections retrying ({label})")
     } else {
+        let remainder = fleet_size.saturating_sub(affected);
         format!(
             "{affected} of {fleet_size} connections retrying ({label}) — \
-             others streaming normally"
+             no reject reported from the other {remainder} connections"
         )
     }
 }
@@ -316,10 +353,12 @@ mod tests {
         );
     }
 
-    /// Recovery edge: connected transitions clear the reject set; the
-    /// Connected direction has its OWN window so a recovery right after a
-    /// reject summary still reaches the operator, and the supervisor's
-    /// silent recovery bookkeeping never consumes the bridge's window.
+    /// Recovery edge: ONLY the supervisor's streaming/auth-OK recovery
+    /// (`record_fleet_recovery`) clears the reject set. The bridge's
+    /// Connected (socket-connected, awaiting-first-tick) event has its OWN
+    /// window but must NOT clear the reject set — the exam's
+    /// connect→silence→reject cycle would otherwise chronically undercount
+    /// every reject summary (hostile-review fix 2026-07-06).
     #[test]
     fn test_recovery_edge_clears_reject_set_and_connected_window_is_independent() {
         let mut state = FleetAlertState::default();
@@ -334,13 +373,13 @@ mod tests {
         record_fleet_recovery(&mut state, None); // non-fleet no-op
         assert_eq!(state.rejecting_count(), 2);
         // Bridge connected ping 5s after the reject summary: its OWN
-        // direction window is untouched → emits. The Connected event itself
-        // clears conn 1 from the reject set BEFORE counting, so the healthy
-        // count is 2 of 3 (conns 0 + 1 recovered; conn 2 still rejecting).
+        // direction window is untouched → emits. The remainder count is
+        // "no reject recorded" = 1 of 3 (only conn 0 recovered; conns 1 + 2
+        // are STILL in the reject set — socket-connected is not streaming).
         assert_eq!(
             decide_fleet_alert(&mut state, Some(1), FleetAlertKind::Connected, 105),
             FleetAlertDecision::EmitSummary {
-                affected: 2,
+                affected: 1,
                 fleet_size: 3
             }
         );
@@ -349,8 +388,46 @@ mod tests {
             decide_fleet_alert(&mut state, Some(2), FleetAlertKind::Connected, 106),
             FleetAlertDecision::Suppress
         );
-        // Both connected events still cleared their reject entries.
+        // Neither Connected event touched the reject set.
+        assert_eq!(state.rejecting_count(), 2);
+        // The NEXT reject window therefore still reports the honest
+        // accumulated count for the still-rejecting connections.
+        assert_eq!(
+            decide_fleet_alert(&mut state, Some(1), FleetAlertKind::Reject, 200),
+            FleetAlertDecision::EmitSummary {
+                affected: 2,
+                fleet_size: 3
+            }
+        );
+    }
+
+    /// Scale-down / GROWW-SCALE-01 rollback: the killed (newest) conn ids are
+    /// pruned from the reject set when the reconciler publishes the shrunken
+    /// fleet size — phantom dead connections can never inflate a later
+    /// summary into a false whole-fleet-down claim (hostile-review fix
+    /// 2026-07-06).
+    #[test]
+    fn test_set_fleet_size_prunes_scaled_down_conn_ids() {
+        let mut state = FleetAlertState::default();
+        state.set_fleet_size(20);
+        // The newest 10 connections reject (the exact set a ladder rollback
+        // then kills).
+        for conn in 10..20 {
+            let _ = decide_fleet_alert(&mut state, Some(conn), FleetAlertKind::Reject, 100);
+        }
+        assert_eq!(state.rejecting_count(), 10);
+        // Rollback 20 → 10: reconciler publishes the new size; phantoms gone.
+        state.set_fleet_size(10);
         assert_eq!(state.rejecting_count(), 0);
+        // A single later hiccup on a LIVE connection reports 1 of 10 — never
+        // "11 of 11".
+        assert_eq!(
+            decide_fleet_alert(&mut state, Some(3), FleetAlertKind::Reject, 200),
+            FleetAlertDecision::EmitSummary {
+                affected: 1,
+                fleet_size: 10
+            }
+        );
     }
 
     /// Backwards clock step must widen (never re-open) the window.
@@ -365,21 +442,28 @@ mod tests {
         );
     }
 
-    /// Summary wording: honest suffix only when some connections ARE healthy;
-    /// no library names, no file paths (Telegram commandments).
+    /// Summary wording: the remainder suffix carries ONLY the negative
+    /// evidence we actually have ("no reject reported") — never a positive
+    /// "streaming normally" health claim (audit-findings Rule 11 / the
+    /// connected≠streaming split); no library names, no file paths
+    /// (Telegram commandments).
     #[test]
     fn test_format_fleet_reject_summary_wording() {
         let partial = format_fleet_reject_summary(7, 40, "server session limit or throttle");
         assert!(partial.contains("7 of 40 connections retrying"));
         assert!(partial.contains("server session limit or throttle"));
-        assert!(partial.contains("others streaming normally"));
+        assert!(partial.contains("no reject reported from the other 33 connections"));
         let full = format_fleet_reject_summary(40, 40, "feed error");
         assert!(full.contains("40 of 40 connections retrying"));
         assert!(
-            !full.contains("others streaming normally"),
-            "no false 'others streaming' when the whole fleet is down"
+            !full.contains("no reject reported"),
+            "no remainder suffix when the whole fleet is down"
         );
         for msg in [&partial, &full] {
+            assert!(
+                !msg.contains("streaming normally") && !msg.contains("streaming"),
+                "positive health claim without positive evidence (false-OK): {msg}"
+            );
             assert!(!msg.contains(".rs"), "file path leaked: {msg}");
         }
     }

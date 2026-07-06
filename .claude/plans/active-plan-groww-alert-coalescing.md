@@ -4,9 +4,12 @@
 **Date:** 2026-07-06
 **Approved by:** Parthiban (operator) — exam-fix directive 2026-07-06
 
-> Crate touched: `crates/app` (tickvault-app) — `crates/app/src/groww_sidecar_supervisor.rs`,
+> Crates touched: `crates/app` (tickvault-app) — `crates/app/src/groww_sidecar_supervisor.rs`,
 > `crates/app/src/groww_bridge.rs`, new `crates/app/src/groww_fleet_alerts.rs`,
-> `crates/app/src/lib.rs`, `crates/app/tests/groww_live_pipeline_e2e.rs`.
+> `crates/app/src/lib.rs`, `crates/app/tests/groww_live_pipeline_e2e.rs` — and
+> `crates/core` (tickvault-core) — `crates/core/src/notification/events.rs`
+> (the `GrowwSidecarRejected` variant gains a `fleet_summary: bool` field so
+> the Telegram body is fleet-aware; hardening round 2026-07-06).
 
 ## Design
 
@@ -28,20 +31,40 @@ Two fixes, both in `crates/app`:
    set. Fleet connections (`conn_id == Some(n)`) aggregate into at most ONE
    Telegram per window per direction, the first event of a window emitting a
    count summary ("7 of 40 connections retrying (server session limit or
-   throttle) — others streaming normally" via `format_fleet_reject_summary` +
-   the new `SidecarLineClass::summary_label()`). `conn_id == None`
+   throttle) — no reject reported from the other 33 connections" via
+   `format_fleet_reject_summary` + the new
+   `SidecarLineClass::summary_label()`). `conn_id == None`
    (single-connection, non-fleet path) is `Passthrough` — today's semantics
    byte-identical. A process-wide `OnceLock<Mutex<FleetAlertState>>` shares
    the window across all supervisors + bridges; the fleet reconciler
    (`spawn_groww_scale_fleet`) publishes the live fleet size via
-   `set_global_fleet_size`. The supervisor's streaming-recovery edge clears
-   the reject set via `global_record_fleet_recovery` WITHOUT consuming the
-   Connected window (the bridge's genuine connected ping owns it). Suppressed
-   events keep their `error!` logs, feed-health state, and `ws_event_audit`
-   rows — only the Telegram fan-out coalesces. `conn_id` threads through
+   `set_global_fleet_size` (which ALSO prunes reject entries for
+   scaled-down conn ids — ids are contiguous `0..n` by construction, so a
+   GROWW-SCALE-01 rollback can never leave phantom dead connections
+   inflating later summaries). The supervisor's streaming-recovery edge
+   clears the reject set via `global_record_fleet_recovery` WITHOUT
+   consuming the Connected window (the bridge's genuine connected ping owns
+   it); the bridge's Connected (socket-connected, awaiting-first-tick) event
+   deliberately does NOT clear the reject set — connected ≠ streaming.
+   Suppressed events keep their `error!` logs, feed-health state, and
+   `ws_event_audit` rows — only the Telegram fan-out coalesces — and a
+   `Suppress` decision RE-ARMS the per-child one-shot latch so later 60s
+   windows carry the accumulated count (bounded at ≤1 Telegram/window and
+   ≤ fleet-size messages per outage episode). `conn_id` threads through
    `supervise_child` / `spawn_pipe_drain` (from `opts.conn_id`) and gains a
    new final parameter on `run_groww_bridge` (fleet loop passes its conn id;
    the single-conn wrapper path passes `None`).
+
+   **Hardening round (hostile review, 2026-07-06, same directive):** the
+   five CRITICAL/HIGH findings — false "others streaming normally" suffix,
+   Suppress consuming the per-child latch, no reject-set pruning on
+   scale-down, the single-conn total-outage trailer wrapping fleet
+   summaries, and the Connected edge clearing the reject set — are fixed as
+   described above plus a fleet-aware Telegram body:
+   `NotificationEvent::GrowwSidecarRejected` (crates/core) gains a
+   `fleet_summary: bool` field; when `true` the body says the AFFECTED
+   connections keep retrying and only their prices are stalled, never
+   "receiving nothing / Groww prices will not flow".
 
 2. **Honest reject wording** — `SidecarLineClass::EntitlementRejected::alert_reason()`
    no longer asserts "account lacks a live market-data feed entitlement" (an
@@ -59,19 +82,28 @@ Two fixes, both in `crates/app`:
   accumulated count (edge-triggered, no timer task — the first-event count
   can understate for that window; documented honest envelope).
 - Window rollover at exactly 60s emits a fresh summary.
-- Recovery edge: Connected clears the connection from the reject set; the
-  Connected direction has its own independent window, so a recovery right
-  after a reject summary still reaches the operator.
+- Recovery edge: ONLY the supervisor's streaming/auth-OK recovery
+  (`record_fleet_recovery`) clears the connection from the reject set; the
+  bridge's Connected (awaiting-first-tick) event never does. The Connected
+  direction has its own independent window, so a recovery ping right after a
+  reject summary still reaches the operator.
 - Whole fleet down (`affected >= fleet_size`): the summary drops the
-  "others streaming normally" suffix (no false-OK).
+  remainder suffix entirely (no false-OK); the partial-fleet suffix is
+  negative-evidence-only ("no reject reported from the other N
+  connections"), never a positive health claim.
 - Fleet size not yet published (reconciler lag): denominator is clamped to
   `max(fleet_size, affected)` — never "3 of 2" / "1 of 0".
 - Backwards wall-clock step: `saturating_sub` → Suppress (window widens,
   never double-fires). Clock read failure degrades to 0 secs (suppression
   only — fail-quiet, never a storm).
-- Scale-down: a removed conn id stops producing events; its stale reject
-  entry is cleared on its next recovery edge or stays inert (bounded ≤ 100
-  ids by the config hard max).
+- Scale-down / ladder rollback: `set_fleet_size(n)` prunes reject entries
+  with `conn_id >= n` (ids are contiguous `0..n`), so killed connections —
+  exactly the ones a rollback removes because they rejected — can never
+  render a later "N of N connections retrying" false whole-fleet-down claim.
+- Sustained fleet outage (children alive, retrying, never streaming): the
+  Suppress-rearm keeps unemitted children eligible, so each later window's
+  first unlatched child emits the accumulated count — bounded at ≤1
+  Telegram per 60s window and ≤ fleet-size messages per outage episode.
 - Poisoned mutex (panicked holder): `PoisonError::into_inner` recovery so
   fleet alerting can never be permanently disabled by one panic.
 
@@ -99,25 +131,39 @@ Unit tests in `crates/app/src/groww_fleet_alerts.rs`:
 - `test_window_rollover_emits_fresh_summary_with_accumulated_count` (rollover)
 - `test_recovery_edge_clears_reject_set_and_connected_window_is_independent` (recovery edge)
 - `test_backwards_clock_never_double_fires`
-- `test_format_fleet_reject_summary_wording`
+- `test_format_fleet_reject_summary_wording` (pins the negative-evidence
+  suffix + bans any "streaming" health claim)
+- `test_set_fleet_size_prunes_scaled_down_conn_ids` (rollback prune)
 - `test_fleet_size_never_smaller_than_affected`
 - `test_global_wrapper_end_to_end` (the one test that drives the process-wide state)
 
-Unit test in `crates/app/src/groww_sidecar_supervisor.rs`:
+Unit tests in `crates/app/src/groww_sidecar_supervisor.rs`:
 - `test_alert_reason_wording_is_honest_and_summary_labels_exist` (pins the new
   prose, bans the "account lacks" claim from returning, covers `summary_label`)
+- `test_fleet_suppress_rearms_latch_and_summary_is_fleet_marked`
+  (source-scan: Suppress re-arms the per-child latch; the fleet summary is
+  `fleet_summary: true`, passthrough `false`)
 
-Scoped run: `cargo test -p tickvault-app --lib --tests` (block-scoped per
-`testing-scope.md`; QuestDB-dependent e2e tests remain `#[ignore]`-gated as
-before). `cargo fmt --check` + banned-pattern scanner before push.
+Unit tests in `crates/core/src/notification/events.rs`:
+- `test_groww_sidecar_rejected_fleet_summary_body_is_fleet_aware` (a
+  fleet-summary body never carries the single-conn total-outage trailer; the
+  single-conn arm keeps it)
+- existing `test_groww_sidecar_rejected_*` tests updated for the new field
+
+Scoped run: `cargo test -p tickvault-app -p tickvault-core --lib --tests`
+(block-scoped per `testing-scope.md`; QuestDB-dependent e2e tests remain
+`#[ignore]`-gated as before). `cargo fmt --check` + banned-pattern scanner
+before push.
 
 ## Rollback
 
-Single revert of this branch's commit restores the prior behavior exactly:
-per-connection passthrough alerts + the old entitlement prose. No schema, no
-config, no persisted-state change — the coalescer state is in-memory only, so
-rollback has zero migration surface. The new `run_groww_bridge` /
-`supervise_child` parameters disappear with the same revert.
+Single revert of this branch's commits restores the prior behavior exactly:
+per-connection passthrough alerts + the old entitlement prose + the old
+single-shape `GrowwSidecarRejected` event. No schema, no config, no
+persisted-state change — the coalescer state is in-memory only, so rollback
+has zero migration surface. The new `run_groww_bridge` / `supervise_child`
+parameters and the `fleet_summary` event field disappear with the same
+revert.
 
 ## Observability
 

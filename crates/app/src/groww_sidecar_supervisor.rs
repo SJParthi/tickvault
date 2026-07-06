@@ -193,8 +193,8 @@ impl SidecarLineClass {
 
     /// Short cause label for the FLEET-scoped coalesced summary (exam-fix
     /// 2026-07-06) — the parenthetical inside "N of M connections retrying
-    /// (<label>) — others streaming normally". Plain English, fixed per
-    /// class, `None` for the non-alert classes.
+    /// (<label>) — no reject reported from the other K connections". Plain
+    /// English, fixed per class, `None` for the non-alert classes.
     #[must_use]
     pub const fn summary_label(self) -> Option<&'static str> {
         match self {
@@ -934,6 +934,7 @@ where
                             FleetAlertDecision::Passthrough => {
                                 notifier.notify(NotificationEvent::GrowwSidecarRejected {
                                     reason: reason.to_string(),
+                                    fleet_summary: false,
                                 });
                             }
                             FleetAlertDecision::EmitSummary {
@@ -945,9 +946,27 @@ where
                                     reason: format_fleet_reject_summary(
                                         affected, fleet_size, label,
                                     ),
+                                    fleet_summary: true,
                                 });
                             }
                             FleetAlertDecision::Suppress => {
+                                // RE-ARM the per-child one-shot latch
+                                // (hostile-review fix 2026-07-06): a
+                                // suppressed child fired NO Telegram, so its
+                                // latch must survive. In a fleet-wide
+                                // auth/entitlement outage the children never
+                                // exit (they retry internally) and never
+                                // stream (no recovery edge re-arms), so a
+                                // consumed latch would make the ONE
+                                // first-window "1 of N" summary the
+                                // operator's entire signal forever. With the
+                                // latch re-armed, each later 60s window's
+                                // first still-unlatched child emits the
+                                // ACCUMULATED count; Telegram volume stays
+                                // bounded at ≤1 per window and ≤ fleet-size
+                                // messages per outage episode (each emitting
+                                // child latches on emit).
+                                alerted.store(false, std::sync::atomic::Ordering::Relaxed);
                                 metrics::counter!(
                                     "tv_groww_fleet_alerts_suppressed_total",
                                     "direction" => "reject",
@@ -2327,6 +2346,42 @@ mod tests {
         assert!(SidecarLineClass::Subscribed.summary_label().is_none());
         assert!(SidecarLineClass::Streaming.summary_label().is_none());
         assert!(SidecarLineClass::Info.summary_label().is_none());
+    }
+
+    /// Hostile-review fixes 2026-07-06, pinned by source-scan (the drain loop
+    /// is a TEST-EXEMPT pipe driver):
+    /// (a) a fleet `Suppress` decision must RE-ARM the per-child one-shot
+    ///     latch — otherwise a fleet-wide outage collapses to a single
+    ///     never-corrected "1 of N" Telegram (the suppressed children's only
+    ///     notify attempt would be consumed forever);
+    /// (b) the fleet-coalesced summary must be marked `fleet_summary: true`
+    ///     (and the single-conn passthrough `false`) so the Telegram body
+    ///     does not wrap a partial-fleet count in the single-conn
+    ///     total-outage trailer.
+    #[test]
+    fn test_fleet_suppress_rearms_latch_and_summary_is_fleet_marked() {
+        let src = include_str!("groww_sidecar_supervisor.rs");
+        let suppress_arm = src
+            .split("FleetAlertDecision::Suppress => {")
+            .nth(1)
+            .expect("the reject Suppress arm must exist");
+        let suppress_body = suppress_arm
+            .split("tv_groww_fleet_alerts_suppressed_total")
+            .next()
+            .expect("the Suppress arm must count suppressions");
+        assert!(
+            suppress_body.contains("alerted.store(false"),
+            "the Suppress arm must re-arm the per-child latch BEFORE counting \
+             (a suppressed child must keep its one notify attempt)"
+        );
+        assert!(
+            src.contains("fleet_summary: true,"),
+            "the fleet EmitSummary notify must be marked fleet_summary: true"
+        );
+        assert!(
+            src.contains("fleet_summary: false,"),
+            "the single-conn passthrough notify must be marked fleet_summary: false"
+        );
     }
 
     #[test]
