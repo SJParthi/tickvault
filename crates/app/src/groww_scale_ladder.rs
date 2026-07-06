@@ -34,7 +34,7 @@ pub const ROLLBACK_HOLD_MAX_SECS: u64 = 4 * 3600;
 
 /// The ladder's operating state (design §2). Gauge values are stable
 /// wire-format (`tv_groww_ladder_state`): 0=Probing, 1=Holding, 2=Advancing,
-/// 3=RollingBack, 4=HaltedAtCeiling.
+/// 3=RollingBack, 4=HaltedAtCeiling, 5=HaltedAtPlateau.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LadderState {
     /// Rung just changed (or boot) — watching the fleet stabilize.
@@ -51,6 +51,11 @@ pub enum LadderState {
     /// is reached and verified healthy. Terminal for the day unless a
     /// failure knocks the fleet back down.
     HaltedAtCeiling,
+    /// The subscribe-proof PLATEAU gate measured the server's cap (proof
+    /// failed to grow after an advance — exam-fix directive 2026-07-06)
+    /// and the ladder rolled back to the last efficient rung and HALTED
+    /// there. Terminal for the day unless a failure knocks the fleet down.
+    HaltedAtPlateau,
 }
 
 impl LadderState {
@@ -63,6 +68,7 @@ impl LadderState {
             Self::Advancing => 2.0,
             Self::RollingBack => 3.0,
             Self::HaltedAtCeiling => 4.0,
+            Self::HaltedAtPlateau => 5.0,
         }
     }
 
@@ -75,6 +81,7 @@ impl LadderState {
             Self::Advancing => "advancing",
             Self::RollingBack => "rolling_back",
             Self::HaltedAtCeiling => "halted_at_ceiling",
+            Self::HaltedAtPlateau => "halted_at_plateau",
         }
     }
 }
@@ -101,6 +108,11 @@ pub enum LadderEvent {
     /// The current rung IS the ceiling (config target or universe-required
     /// count) and it is verified healthy.
     CeilingReached,
+    /// The subscribe-proof plateau gate confirmed the server's cap — the
+    /// fleet's acknowledged count failed to grow after an advance
+    /// ([`PLATEAU_CONFIRM_EVALS`] consecutive evaluations, or an immediate
+    /// regression). Halt at the efficient rung (exam-fix 2026-07-06).
+    PlateauReached,
 }
 
 /// Pure, TOTAL ladder transition function. Every `(state, event)` pair maps
@@ -113,13 +125,15 @@ pub const fn next_ladder_state(state: LadderState, event: LadderEvent) -> Ladder
         // A fleet-wide failure preempts everything (global cooldown + halve).
         (_, E::GlobalFailure) => S::RollingBack,
         // Per-rung gate failure knocks any non-rollback state back.
-        (S::Probing | S::Holding | S::Advancing | S::HaltedAtCeiling, E::GateFailed) => {
-            S::RollingBack
-        }
+        (
+            S::Probing | S::Holding | S::Advancing | S::HaltedAtCeiling | S::HaltedAtPlateau,
+            E::GateFailed,
+        ) => S::RollingBack,
         (S::Probing, E::GatesGreen) => S::Holding,
         (S::Probing, _) => S::Probing,
         (S::Holding, E::HoldComplete) => S::Advancing,
         (S::Holding, E::CeilingReached) => S::HaltedAtCeiling,
+        (S::Holding, E::PlateauReached) => S::HaltedAtPlateau,
         (S::Holding, _) => S::Holding,
         (S::Advancing, E::AdvanceVerified) => S::Probing,
         (S::Advancing, E::AdvanceFailed) => S::RollingBack,
@@ -127,6 +141,7 @@ pub const fn next_ladder_state(state: LadderState, event: LadderEvent) -> Ladder
         (S::RollingBack, E::HoldExpired) => S::Probing,
         (S::RollingBack, _) => S::RollingBack,
         (S::HaltedAtCeiling, _) => S::HaltedAtCeiling,
+        (S::HaltedAtPlateau, _) => S::HaltedAtPlateau,
     }
 }
 
@@ -400,6 +415,149 @@ pub fn next_rung(ladder: &[usize], current: usize, ceiling: usize) -> Option<usi
         .find(|&r| r > current)
 }
 
+// ---------------------------------------------------------------------------
+// Plateau-stop gate (exam-fix directive 2026-07-06)
+// ---------------------------------------------------------------------------
+// Exam TSV evidence: the fleet's subscribe-proof (ACK) count pinned at 33
+// while the ladder kept ADVANCING to rungs 40/80/86; pushing past the
+// server's cap DEGRADED healthy connections (capturing fell 30→24) and
+// multiplied reject churn. The ladder must DISCOVER the cap and STOP AT it.
+
+/// Consecutive non-growing post-advance Holding evaluations that confirm a
+/// PLATEAU (a single pinned evaluation could be spawn latency; two in a row
+/// across the post-advance hold window is the server's answer).
+pub const PLATEAU_CONFIRM_EVALS: u32 = 2;
+
+/// The plateau gate's verdict for one post-advance Holding evaluation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PlateauVerdict {
+    /// Subscribe-proof GREW past the pre-advance baseline — the server
+    /// absorbed the last advance; climbing may continue.
+    AdvanceAllowed,
+    /// Proof has not grown yet, but fewer than [`PLATEAU_CONFIRM_EVALS`]
+    /// evaluations confirm it — keep the NEXT advance blocked and watch.
+    Watching,
+    /// The server's cap is measured: proof failed to grow for
+    /// [`PLATEAU_CONFIRM_EVALS`] consecutive evaluations, or REGRESSED
+    /// (immediate — the over-cap climb is degrading healthy connections).
+    /// Stop climbing; roll back to the last efficient rung and halt.
+    Plateau {
+        /// Highest fleet-wide subscribe-proof count the server acknowledged
+        /// around this advance — the discovered connection cap.
+        measured_cap: usize,
+        /// The rung to hold at: the last rung where `proof >= conns`
+        /// (floor 1 — never 0 connections).
+        rollback_to: usize,
+    },
+}
+
+/// PURE plateau decision for one post-advance Holding evaluation.
+///
+/// * `baseline_proof` — fleet subscribe-proof count captured at the instant
+///   the last advance was dispatched.
+/// * `current_proof` — fleet subscribe-proof count at this evaluation.
+/// * `pinned_evals_so_far` — consecutive PRIOR evaluations (since that
+///   advance) where proof failed to grow.
+/// * `last_efficient_rung` — the last rung observed with `proof >= conns`.
+///
+/// Growth → [`PlateauVerdict::AdvanceAllowed`]. Pinned (equal) → plateau on
+/// the [`PLATEAU_CONFIRM_EVALS`]-th confirmation. Regression → plateau
+/// IMMEDIATELY with rollback target = the last efficient rung.
+#[must_use]
+pub const fn evaluate_plateau(
+    baseline_proof: usize,
+    current_proof: usize,
+    pinned_evals_so_far: u32,
+    last_efficient_rung: usize,
+) -> PlateauVerdict {
+    if current_proof > baseline_proof {
+        return PlateauVerdict::AdvanceAllowed;
+    }
+    let regressed = current_proof < baseline_proof;
+    let confirmations = pinned_evals_so_far.saturating_add(1);
+    if regressed || confirmations >= PLATEAU_CONFIRM_EVALS {
+        // In this branch current_proof <= baseline_proof, so the highest
+        // count the server ever acknowledged is the baseline.
+        let measured_cap = baseline_proof;
+        let rollback_to = if last_efficient_rung == 0 {
+            1
+        } else {
+            last_efficient_rung
+        };
+        PlateauVerdict::Plateau {
+            measured_cap,
+            rollback_to,
+        }
+    } else {
+        PlateauVerdict::Watching
+    }
+}
+
+/// PURE: the plateau summary TSV body (`metric\tvalue` lines — the same
+/// shape the parity comparer writes) so future runs and operators can start
+/// the ladder near the measured cap instead of re-climbing blind.
+#[must_use]
+pub fn format_scale_summary_tsv(
+    measured_cap: usize,
+    efficient_rung: usize,
+    ladder_state: &str,
+    trading_date_ist: &str,
+) -> String {
+    format!(
+        "metric\tvalue\n\
+         measured_cap\t{measured_cap}\n\
+         efficient_rung\t{efficient_rung}\n\
+         ladder_state\t{ladder_state}\n\
+         trading_date_ist\t{trading_date_ist}\n"
+    )
+}
+
+/// Best-effort plateau summary write to
+/// `<shards_root>/scale-summary-<IST-date>.tsv`. NEVER gates a ladder
+/// decision (mirror of the GROWW-SCALE-04 best-effort audit contract) —
+/// the measured cap also lands in the `groww_scale_audit` row, which is
+/// the rehydration source of truth.
+fn write_scale_summary(
+    shards_root: &std::path::Path,
+    measured_cap: usize,
+    efficient_rung: usize,
+    trading_date_ist: &str,
+    ladder_state: &str,
+) {
+    use tracing::{error, info};
+    let path = shards_root.join(format!("scale-summary-{trading_date_ist}.tsv"));
+    let body =
+        format_scale_summary_tsv(measured_cap, efficient_rung, ladder_state, trading_date_ist);
+    match std::fs::write(&path, body) {
+        Ok(()) => info!(
+            path = %path.display(),
+            measured_cap,
+            efficient_rung,
+            "plateau summary TSV written"
+        ),
+        Err(err) => error!(
+            error = %err,
+            path = %path.display(),
+            "plateau summary TSV write failed — measured cap still lands in groww_scale_audit"
+        ),
+    }
+}
+
+/// Counts connections with an on-disk subscribe proof (status file present
+/// — the SAME per-conn evidence `build_scale_snapshot` surfaces on the
+/// `/feeds` panel). Cold path: ≤ `ceiling` (≤100) existence probes per
+/// 30s Holding evaluation. Honest envelope: file-derived — a stale status
+/// file from a killed higher-rung connection can inflate the count.
+fn count_subscribe_proofs(shards_root: &std::path::Path, ceiling: usize) -> usize {
+    (0..ceiling)
+        .filter(|&conn_id| {
+            crate::groww_bridge::shard_files(shards_root, conn_id)
+                .status_file
+                .exists()
+        })
+        .count()
+}
+
 /// One parsed `groww_scale_audit` row, as consumed by restart rehydration.
 /// The persistence layer maps QuestDB rows into this shape; keeping the type
 /// here lets rehydration stay a pure, unit-testable function.
@@ -410,12 +568,16 @@ pub struct ScaleAuditRow {
     /// Connection count after the transition.
     pub to_conns: usize,
     /// Wire-format outcome label (`verified_healthy`, `advance_started`,
-    /// `rolled_back`, `global_halved`, `halted_at_ceiling`).
+    /// `rolled_back`, `global_halved`, `halted_at_ceiling`,
+    /// `halted_at_plateau`).
     pub outcome: String,
 }
 
 /// Outcome labels considered VERIFIED-healthy for rehydration purposes.
-const HEALTHY_OUTCOMES: [&str; 2] = ["verified_healthy", "halted_at_ceiling"];
+/// `halted_at_plateau` counts: its `to_conns` is the last EFFICIENT rung
+/// (proof >= conns), so a restart resumes near the measured cap instead of
+/// re-climbing blind past it (exam-fix 2026-07-06).
+const HEALTHY_OUTCOMES: [&str; 3] = ["verified_healthy", "halted_at_ceiling", "halted_at_plateau"];
 
 /// Restart rehydration (design §2 + plan Item 9): resume at the newest
 /// VERIFIED-healthy rung recorded today — an interrupted ADVANCING (an
@@ -596,6 +758,15 @@ pub async fn run_groww_scale_ladder(
     let mut hold_started: Option<std::time::Instant> = None;
     let mut hold_until: Option<std::time::Instant> = None;
     let mut consecutive_failures_at_rung: u32 = 0;
+    // ── Plateau-stop gate state (exam-fix 2026-07-06). ──
+    // `plateau_baseline_proof` arms at each advance dispatch (the fleet
+    // subscribe-proof count BEFORE the new connections spawn);
+    // `plateau_pinned_evals` counts consecutive non-growing Holding
+    // evaluations since; `last_efficient_rung` is the last rung observed
+    // with proof >= conns (the rollback target when the plateau fires).
+    let mut plateau_baseline_proof: Option<usize> = None;
+    let mut plateau_pinned_evals: u32 = 0;
+    let mut last_efficient_rung: usize = current;
     runtime.desired_conns.store(current, Ordering::Relaxed);
     runtime.wake.notify_waiters();
     info!(
@@ -693,6 +864,9 @@ pub async fn run_groww_scale_ladder(
                 std::time::Instant::now() + std::time::Duration::from_secs(GLOBAL_COOLDOWN_SECS),
             );
             hold_started = None;
+            // A fleet-wide failure invalidates any in-flight plateau watch.
+            plateau_baseline_proof = None;
+            plateau_pinned_evals = 0;
             publish_state(state, current, cfg.target_connections);
             continue;
         }
@@ -744,6 +918,9 @@ pub async fn run_groww_scale_ladder(
                     hold_until =
                         Some(std::time::Instant::now() + std::time::Duration::from_secs(hold));
                     hold_started = None;
+                    // A rung failure invalidates any in-flight plateau watch.
+                    plateau_baseline_proof = None;
+                    plateau_pinned_evals = 0;
                     next
                 }
                 None => match state {
@@ -768,57 +945,153 @@ pub async fn run_groww_scale_ladder(
                         next_ladder_state(state, LadderEvent::GatesGreen)
                     }
                     LadderState::Holding => {
-                        let held_long_enough = hold_started.is_some_and(|t| {
-                            t.elapsed().as_secs() >= cfg.gate_hold_minutes.saturating_mul(60)
-                        });
-                        let in_window = smoke
-                            || advance_window_allows(
-                                tickvault_common::market_hours::now_ist_secs_of_day(),
-                                &cfg.advance_window_ist,
-                            );
-                        match (held_long_enough, next_rung(&cfg.ladder, current, ceiling)) {
-                            (true, Some(next)) if in_window => {
-                                info!(
-                                    from_conns = current,
-                                    to_conns = next,
-                                    "[feeds] groww scale ladder: ADVANCING to next rung"
-                                );
-                                write_audit(
-                                    &qdb,
-                                    &today,
-                                    current,
-                                    next,
-                                    LadderState::Advancing,
-                                    ScaleOutcome::AdvanceStarted,
-                                    "hold_complete",
-                                    &inputs,
-                                )
-                                .await;
-                                current = next;
-                                runtime.desired_conns.store(current, Ordering::Relaxed);
-                                runtime.wake.notify_waiters();
-                                hold_started = None;
-                                next_ladder_state(state, LadderEvent::HoldComplete)
+                        // ── Plateau-stop gate (exam-fix 2026-07-06): if the
+                        // fleet's subscribe-proof count failed to grow after
+                        // the last advance, the server's cap is reached —
+                        // discover it and STOP AT it instead of climbing
+                        // past it (pushing past DEGRADED healthy conns in
+                        // the live exam). SMOKE mode skips the gate — no
+                        // live subscribe evidence exists by design.
+                        let proof_count = count_subscribe_proofs(&shards_root, ceiling);
+                        if proof_count >= current {
+                            last_efficient_rung = current;
+                        }
+                        let plateau_halt = if smoke {
+                            None
+                        } else if let Some(baseline) = plateau_baseline_proof {
+                            match evaluate_plateau(
+                                baseline,
+                                proof_count,
+                                plateau_pinned_evals,
+                                last_efficient_rung,
+                            ) {
+                                PlateauVerdict::AdvanceAllowed => {
+                                    plateau_baseline_proof = None;
+                                    plateau_pinned_evals = 0;
+                                    None
+                                }
+                                PlateauVerdict::Watching => {
+                                    plateau_pinned_evals = plateau_pinned_evals.saturating_add(1);
+                                    // The NEXT advance stays blocked until
+                                    // proof growth is confirmed (or the
+                                    // plateau is declared next evaluation).
+                                    Some(state)
+                                }
+                                PlateauVerdict::Plateau {
+                                    measured_cap,
+                                    rollback_to,
+                                } => {
+                                    let next =
+                                        next_ladder_state(state, LadderEvent::PlateauReached);
+                                    // ONE Telegram-routed page per plateau
+                                    // episode — the sticky HaltedAtPlateau
+                                    // state guarantees single emission.
+                                    error!(
+                                        code = tickvault_common::error_code::ErrorCode::GrowwScale01RollbackFired
+                                            .code_str(),
+                                        measured_cap,
+                                        from_conns = current,
+                                        to_conns = rollback_to,
+                                        "GROWW-SCALE-01: ladder stopped at the server's limit: \
+                                         {measured_cap} connections acknowledged — holding there"
+                                    );
+                                    metrics::counter!(
+                                        "tv_groww_scale_rollbacks_total",
+                                        "reason" => "plateau"
+                                    )
+                                    .increment(1);
+                                    let reason = format!("plateau_cap_{measured_cap}");
+                                    write_audit(
+                                        &qdb,
+                                        &today,
+                                        current,
+                                        rollback_to,
+                                        next,
+                                        ScaleOutcome::HaltedAtPlateau,
+                                        &reason,
+                                        &inputs,
+                                    )
+                                    .await;
+                                    write_scale_summary(
+                                        &shards_root,
+                                        measured_cap,
+                                        rollback_to,
+                                        &today,
+                                        next.as_str(),
+                                    );
+                                    current = rollback_to;
+                                    last_healthy = rollback_to;
+                                    runtime.desired_conns.store(current, Ordering::Relaxed);
+                                    runtime.wake.notify_waiters();
+                                    hold_started = None;
+                                    plateau_baseline_proof = None;
+                                    plateau_pinned_evals = 0;
+                                    Some(next)
+                                }
                             }
-                            (true, None) => {
-                                info!(
-                                    conns = current,
-                                    "[feeds] groww scale ladder: ceiling reached + healthy — HALTED AT CEILING"
+                        } else {
+                            None
+                        };
+                        if let Some(next) = plateau_halt {
+                            next
+                        } else {
+                            let held_long_enough = hold_started.is_some_and(|t| {
+                                t.elapsed().as_secs() >= cfg.gate_hold_minutes.saturating_mul(60)
+                            });
+                            let in_window = smoke
+                                || advance_window_allows(
+                                    tickvault_common::market_hours::now_ist_secs_of_day(),
+                                    &cfg.advance_window_ist,
                                 );
-                                write_audit(
-                                    &qdb,
-                                    &today,
-                                    current,
-                                    current,
-                                    LadderState::HaltedAtCeiling,
-                                    ScaleOutcome::HaltedAtCeiling,
-                                    "ceiling",
-                                    &inputs,
-                                )
-                                .await;
-                                next_ladder_state(state, LadderEvent::CeilingReached)
+                            match (held_long_enough, next_rung(&cfg.ladder, current, ceiling)) {
+                                (true, Some(next)) if in_window => {
+                                    info!(
+                                        from_conns = current,
+                                        to_conns = next,
+                                        "[feeds] groww scale ladder: ADVANCING to next rung"
+                                    );
+                                    write_audit(
+                                        &qdb,
+                                        &today,
+                                        current,
+                                        next,
+                                        LadderState::Advancing,
+                                        ScaleOutcome::AdvanceStarted,
+                                        "hold_complete",
+                                        &inputs,
+                                    )
+                                    .await;
+                                    // Arm the plateau gate: the proof count at
+                                    // dispatch time is the growth baseline the
+                                    // post-advance evaluations must beat.
+                                    plateau_baseline_proof = Some(proof_count);
+                                    plateau_pinned_evals = 0;
+                                    current = next;
+                                    runtime.desired_conns.store(current, Ordering::Relaxed);
+                                    runtime.wake.notify_waiters();
+                                    hold_started = None;
+                                    next_ladder_state(state, LadderEvent::HoldComplete)
+                                }
+                                (true, None) => {
+                                    info!(
+                                        conns = current,
+                                        "[feeds] groww scale ladder: ceiling reached + healthy — HALTED AT CEILING"
+                                    );
+                                    write_audit(
+                                        &qdb,
+                                        &today,
+                                        current,
+                                        current,
+                                        LadderState::HaltedAtCeiling,
+                                        ScaleOutcome::HaltedAtCeiling,
+                                        "ceiling",
+                                        &inputs,
+                                    )
+                                    .await;
+                                    next_ladder_state(state, LadderEvent::CeilingReached)
+                                }
+                                _ => state,
                             }
-                            _ => state,
                         }
                     }
                     LadderState::Advancing => {
@@ -1121,6 +1394,7 @@ mod tests {
             LadderState::Holding,
             LadderState::Advancing,
             LadderState::HaltedAtCeiling,
+            LadderState::HaltedAtPlateau,
         ] {
             assert_eq!(
                 next_ladder_state(s, LadderEvent::GateFailed),
@@ -1138,6 +1412,7 @@ mod tests {
             LadderState::Advancing,
             LadderState::RollingBack,
             LadderState::HaltedAtCeiling,
+            LadderState::HaltedAtPlateau,
         ] {
             assert_eq!(
                 next_ladder_state(s, LadderEvent::GlobalFailure),
@@ -1159,6 +1434,7 @@ mod tests {
             LadderEvent::AdvanceVerified,
             LadderEvent::AdvanceFailed,
             LadderEvent::CeilingReached,
+            LadderEvent::PlateauReached,
         ] {
             assert_eq!(
                 next_ladder_state(LadderState::RollingBack, e),
@@ -1191,6 +1467,7 @@ mod tests {
             LadderState::Advancing,
             LadderState::RollingBack,
             LadderState::HaltedAtCeiling,
+            LadderState::HaltedAtPlateau,
         ];
         let events = [
             LadderEvent::GatesGreen,
@@ -1201,6 +1478,7 @@ mod tests {
             LadderEvent::GlobalFailure,
             LadderEvent::HoldExpired,
             LadderEvent::CeilingReached,
+            LadderEvent::PlateauReached,
         ];
         for s in states {
             for e in events {
@@ -1216,9 +1494,40 @@ mod tests {
         assert_eq!(LadderState::Advancing.gauge_value(), 2.0);
         assert_eq!(LadderState::RollingBack.gauge_value(), 3.0);
         assert_eq!(LadderState::HaltedAtCeiling.gauge_value(), 4.0);
+        assert_eq!(LadderState::HaltedAtPlateau.gauge_value(), 5.0);
         assert_eq!(LadderState::Probing.as_str(), "probing");
         assert_eq!(LadderState::RollingBack.as_str(), "rolling_back");
         assert_eq!(LadderState::HaltedAtCeiling.as_str(), "halted_at_ceiling");
+        assert_eq!(LadderState::HaltedAtPlateau.as_str(), "halted_at_plateau");
+    }
+
+    #[test]
+    fn test_fsm_plateau_reached_from_holding_and_sticky() {
+        // Holding + PlateauReached → HaltedAtPlateau.
+        assert_eq!(
+            next_ladder_state(LadderState::Holding, LadderEvent::PlateauReached),
+            LadderState::HaltedAtPlateau
+        );
+        // Sticky: green gates / hold-complete never resume climbing.
+        assert_eq!(
+            next_ladder_state(LadderState::HaltedAtPlateau, LadderEvent::GatesGreen),
+            LadderState::HaltedAtPlateau
+        );
+        assert_eq!(
+            next_ladder_state(LadderState::HaltedAtPlateau, LadderEvent::HoldComplete),
+            LadderState::HaltedAtPlateau
+        );
+        // Only failures knock the fleet down (per-rung or global).
+        assert_eq!(
+            next_ladder_state(LadderState::HaltedAtPlateau, LadderEvent::GateFailed),
+            LadderState::RollingBack
+        );
+        // PlateauReached from a non-Holding state self-loops (no surprise
+        // transitions from Probing/Advancing).
+        assert_eq!(
+            next_ladder_state(LadderState::Probing, LadderEvent::PlateauReached),
+            LadderState::Probing
+        );
     }
 
     // ── Gates (every permutation) ──
@@ -1447,6 +1756,102 @@ mod tests {
         assert_eq!(next_rung(&ladder, 7, 7), None);
     }
 
+    // ── Plateau-stop gate (exam-fix 2026-07-06) ──
+
+    /// Growing proof after an advance → climbing may continue.
+    #[test]
+    fn test_plateau_growing_proof_allows_advance() {
+        // test coverage (pub-fn-test-guard line): evaluate_plateau
+        assert_eq!(
+            evaluate_plateau(33, 40, 0, 30),
+            PlateauVerdict::AdvanceAllowed
+        );
+        // Growth on a later evaluation clears any accrued pin count too.
+        assert_eq!(
+            evaluate_plateau(33, 34, 1, 30),
+            PlateauVerdict::AdvanceAllowed
+        );
+    }
+
+    /// Exam signature: proof pinned at 33 while conns climbed. One pinned
+    /// evaluation = Watching (advance blocked); the second confirms the
+    /// PLATEAU with the measured cap and the efficient-rung rollback target.
+    #[test]
+    fn test_plateau_pinned_two_evals_declares_plateau() {
+        assert_eq!(evaluate_plateau(33, 33, 0, 30), PlateauVerdict::Watching);
+        assert_eq!(
+            evaluate_plateau(33, 33, 1, 30),
+            PlateauVerdict::Plateau {
+                measured_cap: 33,
+                rollback_to: 30
+            }
+        );
+    }
+
+    /// Exam signature: pushing past the cap DEGRADED healthy connections
+    /// (capturing fell 30→24). A proof REGRESSION is an immediate plateau —
+    /// no 2-eval wait — with rollback target = the last efficient rung.
+    #[test]
+    fn test_plateau_regression_immediate_rollback_to_last_efficient() {
+        assert_eq!(
+            evaluate_plateau(33, 24, 0, 30),
+            PlateauVerdict::Plateau {
+                measured_cap: 33,
+                rollback_to: 30
+            }
+        );
+    }
+
+    /// The rollback target never reaches 0 connections, and the pin counter
+    /// never overflows.
+    #[test]
+    fn test_plateau_rollback_floor_is_one() {
+        assert_eq!(
+            evaluate_plateau(5, 5, 1, 0),
+            PlateauVerdict::Plateau {
+                measured_cap: 5,
+                rollback_to: 1
+            }
+        );
+        // Saturating pin counter — u32::MAX prior evals still classify.
+        assert_eq!(
+            evaluate_plateau(5, 5, u32::MAX, 3),
+            PlateauVerdict::Plateau {
+                measured_cap: 5,
+                rollback_to: 3
+            }
+        );
+    }
+
+    /// The confirmation window is exactly 2 consecutive evaluations
+    /// (mission contract 2026-07-06).
+    #[test]
+    fn test_plateau_confirm_evals_is_two() {
+        assert_eq!(PLATEAU_CONFIRM_EVALS, 2);
+    }
+
+    /// The summary TSV carries the measured cap + efficient rung so future
+    /// runs can start near the server's limit.
+    #[test]
+    fn test_format_scale_summary_tsv_carries_measured_cap() {
+        // test coverage (pub-fn-test-guard line): format_scale_summary_tsv
+        let tsv = format_scale_summary_tsv(33, 30, "halted_at_plateau", "2026-07-06");
+        assert!(tsv.starts_with("metric\tvalue\n"), "header row: {tsv}");
+        assert!(tsv.contains("measured_cap\t33\n"), "measured cap: {tsv}");
+        assert!(
+            tsv.contains("efficient_rung\t30\n"),
+            "efficient rung: {tsv}"
+        );
+        assert!(
+            tsv.contains("ladder_state\thalted_at_plateau\n"),
+            "state: {tsv}"
+        );
+        assert!(
+            tsv.contains("trading_date_ist\t2026-07-06\n"),
+            "date: {tsv}"
+        );
+    }
+
     // ── Restart rehydration (plan Item 9: resume at last healthy) ──
 
     #[test]
@@ -1495,5 +1900,32 @@ mod tests {
         // rung wins (the rollback's own later stabilization writes a fresh
         // verified_healthy row).
         assert_eq!(resume_conns_from_audit(&rows, 1), 10);
+    }
+
+    /// A plateau halt is a healthy resume point: its `to_conns` is the last
+    /// EFFICIENT rung, so a restart starts near the measured cap instead of
+    /// re-climbing blind past it (exam-fix 2026-07-06).
+    #[test]
+    fn test_resume_honors_halted_at_plateau() {
+        let rows = vec![
+            ScaleAuditRow {
+                ts_nanos: 1,
+                to_conns: 10,
+                outcome: "verified_healthy".to_string(),
+            },
+            // Interrupted climb past the cap, then the plateau halt at the
+            // efficient rung — the NEWEST healthy record wins.
+            ScaleAuditRow {
+                ts_nanos: 2,
+                to_conns: 40,
+                outcome: "advance_started".to_string(),
+            },
+            ScaleAuditRow {
+                ts_nanos: 3,
+                to_conns: 30,
+                outcome: "halted_at_plateau".to_string(),
+            },
+        ];
+        assert_eq!(resume_conns_from_audit(&rows, 1), 30);
     }
 }
