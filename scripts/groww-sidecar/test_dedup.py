@@ -783,5 +783,65 @@ class CaptureEmitTests(unittest.TestCase):
         self.assertEqual(rows[1]["capture_ns"], 42)
 
 
+class StallBackoffTests(unittest.TestCase):
+    """The stall self-heal exponential-backoff ladder (2026-07-06 exam fix —
+    5s force-close churn storm) + the STILL SILENT rate-limit cadence."""
+
+    BASE = groww_sidecar.STALL_DEADLINE_SECS
+    CAP = groww_sidecar.STALL_BACKOFF_CAP_SECS
+
+    def test_ladder_doubles_from_base_to_cap(self) -> None:
+        got = [
+            groww_sidecar.compute_stall_backoff_secs(n, self.BASE, self.CAP)
+            for n in range(6)
+        ]
+        self.assertEqual(got, [5.0, 10.0, 20.0, 40.0, 60.0, 60.0])
+
+    def test_cap_holds_for_huge_counts_without_overflow(self) -> None:
+        self.assertEqual(
+            groww_sidecar.compute_stall_backoff_secs(10_000, self.BASE, self.CAP),
+            60.0,
+        )
+        self.assertEqual(
+            groww_sidecar.compute_stall_backoff_secs(2**62, self.BASE, self.CAP),
+            60.0,
+        )
+
+    def test_reset_and_negative_clamp_to_fast_base(self) -> None:
+        # Any real decoded live record resets the episode count to 0 → 5s base.
+        self.assertEqual(
+            groww_sidecar.compute_stall_backoff_secs(0, self.BASE, self.CAP), 5.0
+        )
+        self.assertEqual(
+            groww_sidecar.compute_stall_backoff_secs(-1, self.BASE, self.CAP), 5.0
+        )
+
+    def test_still_silent_cadence_slows_after_fast_warns(self) -> None:
+        fast = groww_sidecar.SILENT_FEED_REWARN_SECS
+        slow = groww_sidecar.STILL_SILENT_RATE_LIMIT_SECS
+        n_fast = groww_sidecar.STILL_SILENT_FAST_WARNS
+        for n in range(n_fast):
+            self.assertEqual(
+                groww_sidecar.still_silent_rewarn_interval_secs(
+                    n, fast, n_fast, slow
+                ),
+                fast,
+            )
+        for n in (n_fast, n_fast + 1, 999):
+            self.assertEqual(
+                groww_sidecar.still_silent_rewarn_interval_secs(
+                    n, fast, n_fast, slow
+                ),
+                300.0,
+            )
+
+    def test_constants_pinned(self) -> None:
+        # The exam-fix contract: 5s base, 60s cap, 5-min reminder rate limit.
+        self.assertEqual(groww_sidecar.STALL_DEADLINE_SECS, 5)
+        self.assertEqual(groww_sidecar.STALL_BACKOFF_CAP_SECS, 60.0)
+        self.assertEqual(groww_sidecar.STILL_SILENT_RATE_LIMIT_SECS, 300.0)
+        self.assertEqual(groww_sidecar.STILL_SILENT_FAST_WARNS, 5)
+
+
 if __name__ == "__main__":
     unittest.main()

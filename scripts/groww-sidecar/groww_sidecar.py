@@ -224,6 +224,31 @@ SILENT_FEED_REWARN_SECS = 60
 STALL_DEADLINE_SECS = 5
 # How often the watchdog samples the decoded counters while consuming.
 STALL_POLL_SECS = 1
+# Stall self-heal exponential backoff (2026-07-06 exam fix — session churn
+# storm). On a starved/thin fleet shard the FIXED 5s force-close loop fired
+# 1,393 times in one exam hour: every force-close opens a NEW Groww NATS
+# session while the dead ones pile up against the account's limited
+# concurrent-session slots (~33), WORSENING the starvation for every shard —
+# including after restarts. Fix: the FIRST stall episode force-closes after
+# STALL_DEADLINE_SECS exactly as before; each CONSECUTIVE stall episode
+# WITHOUT an intervening real decoded live record (a watermark advance)
+# DOUBLES the wait before the next force-close — 5s → 10s → 20s → 40s →
+# capped at STALL_BACKOFF_CAP_SECS. Any real decoded live record resets the
+# ladder to the 5s base, so a healthy feed keeps today's fast detection.
+# Pure math in `compute_stall_backoff_secs` (self-tested + test_dedup.py).
+STALL_BACKOFF_CAP_SECS = 60.0
+# Overflow guard for the ladder exponent: 2**32 already dwarfs any cap, so
+# clamping the exponent keeps the float math exact without changing behavior.
+STALL_BACKOFF_MAX_EXPONENT = 32
+# Cold-silent diagnostics rate limit (same exam fix, item 3): once the feed
+# has been persistently silent long enough that the stall ladder would sit at
+# its cap (STILL_SILENT_FAST_WARNS re-warns — the ladder depth 5→10→20→40→60),
+# the repeating "STILL SILENT" reminder carries no new information. It then
+# slows from the 60s cadence to at most ONE line per
+# STILL_SILENT_RATE_LIMIT_SECS per process. Pure cadence decision in
+# `still_silent_rewarn_interval_secs` (self-tested).
+STILL_SILENT_RATE_LIMIT_SECS = 300.0
+STILL_SILENT_FAST_WARNS = 5
 # NSE trading window [09:15, 15:30) IST — the market-hours gate for the ms
 # reconnect ladder + the force-reconnect (off-hours silence is NORMAL; don't
 # fight a legitimately-idle feed).
@@ -767,6 +792,40 @@ def should_force_reconnect(
     if decoded_total != last_decode_total:
         return False  # data is still flowing — not stalled.
     return secs_since_change >= deadline_secs
+
+
+def compute_stall_backoff_secs(
+    consecutive_stalls: int, base_secs: float, cap_secs: float
+) -> float:
+    """Pure exponential-backoff ladder for the stall self-heal force-close
+    (2026-07-06 exam fix). `consecutive_stalls` = stall episodes already fired
+    WITHOUT an intervening real decoded live record (watermark advance).
+
+    0 (fresh / just reset) → base_secs (today's fast 5s detection);
+    N ≥ 1 → min(base_secs * 2**N, cap_secs): 5 → 10 → 20 → 40 → 60 cap.
+    Negative counts clamp to base; huge counts clamp the exponent (overflow
+    guard) and land on the cap. O(1), no I/O, never raises."""
+    if consecutive_stalls <= 0:
+        return base_secs
+    exponent = min(consecutive_stalls, STALL_BACKOFF_MAX_EXPONENT)
+    return min(base_secs * (2.0**exponent), cap_secs)
+
+
+def still_silent_rewarn_interval_secs(
+    warns_so_far: int,
+    fast_interval_secs: float,
+    fast_warns: int,
+    slow_interval_secs: float,
+) -> float:
+    """Pure cadence decision for the cold-silent "STILL SILENT" reminder
+    (2026-07-06 exam fix, item 3). The first `fast_warns` reminders keep the
+    fast cadence (operator sees the problem promptly); after that the feed is
+    persistently starved — equivalent to the stall ladder sitting at its cap —
+    and the reminder slows to `slow_interval_secs` (at most one line per ~5
+    minutes per process). O(1), no I/O, never raises."""
+    if warns_so_far < fast_warns:
+        return fast_interval_secs
+    return slow_interval_secs
 
 
 # ---------------------------------------------------------------------------
@@ -2353,6 +2412,14 @@ def _stall_recovery_loop(feed_cell) -> None:
     )
     lag_consecutive = 0
     last_lag_fire_monotonic = None
+    # Consecutive stall episodes (force-closes) WITHOUT an intervening real
+    # decoded live record. Drives the exponential force-close backoff
+    # (compute_stall_backoff_secs, 2026-07-06 exam fix) so a persistently
+    # starved shard cannot churn a fresh Groww NATS session every 5s (1,393
+    # force-closes/hour observed) and pile dead sessions against the
+    # account's concurrent-session slots. A watermark advance = a real
+    # decoded live record → resets the ladder to the 5s base.
+    consecutive_stall_episodes = 0
     while True:
         time.sleep(STALL_POLL_SECS)
         watermark = MAX_TS_MILLIS_SEEN
@@ -2360,22 +2427,41 @@ def _stall_recovery_loop(feed_cell) -> None:
         if watermark != last_watermark:
             last_watermark = watermark
             last_change_monotonic = time.monotonic()
+            # A real decoded live record arrived — the self-heal worked.
+            # Reset the force-close backoff ladder to the fast 5s base.
+            consecutive_stall_episodes = 0
         else:
             secs_since_change = time.monotonic() - last_change_monotonic
+            stall_deadline = compute_stall_backoff_secs(
+                consecutive_stall_episodes,
+                STALL_DEADLINE_SECS,
+                STALL_BACKOFF_CAP_SECS,
+            )
             if should_force_reconnect(
                 watermark,
                 last_watermark,
                 secs_since_change,
                 market_open,
-                STALL_DEADLINE_SECS,
+                stall_deadline,
             ):
+                consecutive_stall_episodes += 1
+                next_wait = compute_stall_backoff_secs(
+                    consecutive_stall_episodes,
+                    STALL_DEADLINE_SECS,
+                    STALL_BACKOFF_CAP_SECS,
+                )
+                # ONE coalesced line per stall episode (never per-poll spam):
+                # the episode number + the backed-off wait before the next
+                # force-close ride along with the diagnostic counts.
                 print(
-                    f"groww sidecar: FEED STALLED — {STALL_DEADLINE_SECS}s with NO advancing "
+                    f"groww sidecar: FEED STALLED — {stall_deadline:g}s with NO advancing "
                     f"exchange timestamp across the universe during market hours "
                     f"(max_ts_millis={MAX_TS_MILLIS_SEEN}, emitted={EMITTED_TOTAL}, "
                     f"deduped={DEDUPED_TOTAL}, dropped={DROPPED_TOTAL}); a frozen snapshot "
                     "re-dump counts as stalled. Force-closing the NATS socket to trigger "
-                    "reconnect + re-subscribe (self-heal).",
+                    "reconnect + re-subscribe (self-heal). "
+                    f"stall self-heal #{consecutive_stall_episodes}, "
+                    f"next check in {next_wait:g}s",
                     file=sys.stderr,
                     flush=True,
                 )
@@ -2404,6 +2490,17 @@ def _stall_recovery_loop(feed_cell) -> None:
         if watermark_lag_should_fire(
             lag_consecutive, WATERMARK_LAG_CONSECUTIVE_CHECKS, cooldown_remaining
         ):
+            # A lag fire is ALSO a stall episode without an intervening real
+            # live record — advance the shared force-close backoff ladder so
+            # the frozen-watermark criterion cannot resume 5s churn on top of
+            # a lag-driven restart (the lag path itself stays bounded by its
+            # own ~3-min refire cooldown).
+            consecutive_stall_episodes += 1
+            next_wait = compute_stall_backoff_secs(
+                consecutive_stall_episodes,
+                STALL_DEADLINE_SECS,
+                STALL_BACKOFF_CAP_SECS,
+            )
             lag_ms = int(time.time() * 1000.0 - watermark)
             print(
                 f"groww sidecar: FEED STALLED — watermark lag {lag_ms}ms behind "
@@ -2412,7 +2509,9 @@ def _stall_recovery_loop(feed_cell) -> None:
                 f"market hours (max_ts_millis={watermark}, emitted={EMITTED_TOTAL}, "
                 f"deduped={DEDUPED_TOTAL}, dropped={DROPPED_TOTAL}); micro-advancing "
                 "timestamps that never catch up count as stalled. Force-closing the "
-                "NATS socket to trigger reconnect + re-subscribe (self-heal).",
+                "NATS socket to trigger reconnect + re-subscribe (self-heal). "
+                f"stall self-heal #{consecutive_stall_episodes}, "
+                f"next check in {next_wait:g}s",
                 file=sys.stderr,
                 flush=True,
             )
@@ -2463,10 +2562,24 @@ def silent_feed_watchdog(stocks: int, indices: int, feed_cell=None) -> None:
         file=sys.stderr,
         flush=True,
     )
+    still_silent_warns = 0
     while EMITTED_TOTAL + DROPPED_TOTAL == 0:
-        time.sleep(SILENT_FEED_REWARN_SECS)
+        # Rate-limited reminder cadence (2026-07-06 exam fix, item 3): the
+        # first STILL_SILENT_FAST_WARNS reminders keep the 60s cadence; after
+        # that the feed is persistently starved (the stall backoff ladder
+        # would be at its cap) and the reminder slows to at most one line per
+        # STILL_SILENT_RATE_LIMIT_SECS per process.
+        time.sleep(
+            still_silent_rewarn_interval_secs(
+                still_silent_warns,
+                SILENT_FEED_REWARN_SECS,
+                STILL_SILENT_FAST_WARNS,
+                STILL_SILENT_RATE_LIMIT_SECS,
+            )
+        )
         if EMITTED_TOTAL + DROPPED_TOTAL > 0:
             break
+        still_silent_warns += 1
         print(
             "groww sidecar: STILL SILENT — 0 live records decoded "
             f"(emitted={EMITTED_TOTAL}, dropped={DROPPED_TOTAL}). "
@@ -2893,6 +3006,50 @@ def _selftest_self_heal() -> None:
     print("groww sidecar self-heal self-test: PASS")
 
 
+def _selftest_stall_backoff() -> None:
+    """Prove the stall self-heal exponential-backoff ladder math (2026-07-06
+    exam fix — 5s force-close churn storm) + the STILL SILENT rate-limit
+    cadence. Guarded behind `--selftest` so it NEVER runs in prod. Run:
+    `python3 groww_sidecar.py --selftest`. Full matrix in test_dedup.py."""
+    base, cap = STALL_DEADLINE_SECS, STALL_BACKOFF_CAP_SECS
+    # The ladder: 5 → 10 → 20 → 40 → 60 (cap) → 60 forever.
+    assert compute_stall_backoff_secs(0, base, cap) == 5.0, \
+        "fresh/reset ladder must use the fast 5s base"
+    assert compute_stall_backoff_secs(1, base, cap) == 10.0, \
+        "after 1 stall episode the wait doubles to 10s"
+    assert compute_stall_backoff_secs(2, base, cap) == 20.0, \
+        "after 2 stall episodes the wait doubles to 20s"
+    assert compute_stall_backoff_secs(3, base, cap) == 40.0, \
+        "after 3 stall episodes the wait doubles to 40s"
+    assert compute_stall_backoff_secs(4, base, cap) == 60.0, \
+        "after 4 stall episodes the wait caps at 60s (80 clamps)"
+    assert compute_stall_backoff_secs(5, base, cap) == 60.0, \
+        "the cap holds for every later episode"
+    assert compute_stall_backoff_secs(10_000, base, cap) == 60.0, \
+        "a huge episode count never overflows and stays at the cap"
+    assert compute_stall_backoff_secs(-3, base, cap) == 5.0, \
+        "a negative count clamps to the base (defensive)"
+    # Reset semantics: any real decoded live record zeroes the episode count,
+    # which by the assertions above restores the fast 5s base.
+    assert compute_stall_backoff_secs(0, base, cap) == float(STALL_DEADLINE_SECS), \
+        "reset ladder == today's fast detection deadline"
+
+    # STILL SILENT cadence: fast (60s) for the first N warns, then one per 5min.
+    fast, slow = SILENT_FEED_REWARN_SECS, STILL_SILENT_RATE_LIMIT_SECS
+    for n in range(STILL_SILENT_FAST_WARNS):
+        assert still_silent_rewarn_interval_secs(
+            n, fast, STILL_SILENT_FAST_WARNS, slow
+        ) == fast, "early reminders keep the fast cadence"
+    assert still_silent_rewarn_interval_secs(
+        STILL_SILENT_FAST_WARNS, fast, STILL_SILENT_FAST_WARNS, slow
+    ) == 300.0, "once persistently silent, at most one reminder per 5 minutes"
+    assert still_silent_rewarn_interval_secs(
+        999, fast, STILL_SILENT_FAST_WARNS, slow
+    ) == 300.0, "the slow cadence holds forever"
+
+    print("groww sidecar stall-backoff self-test: PASS")
+
+
 def _selftest_dedup() -> None:
     """Prove the change-dedup decision (2026-07-03 snapshot-flood fix). Guarded
     behind `--selftest` so it NEVER runs in prod. Run:
@@ -3063,6 +3220,7 @@ if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "--selftest":
         _selftest_redaction()
         _selftest_self_heal()
+        _selftest_stall_backoff()
         _selftest_dedup()
         _selftest_coalesce_and_watermark_lag()
         _selftest_raw_probe()
