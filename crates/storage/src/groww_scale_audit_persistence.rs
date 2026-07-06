@@ -63,6 +63,13 @@ pub enum ScaleOutcome {
     GlobalHalved,
     /// The effective ceiling was reached and verified.
     HaltedAtCeiling,
+    /// The subscribe-proof PLATEAU gate measured the server's connection
+    /// cap (proof failed to grow after an advance — exam-fix directive
+    /// 2026-07-06) and the ladder rolled back to the last efficient rung
+    /// and HALTED there. The `reason` column carries the measured cap
+    /// (`plateau_cap_<N>`); `to_conns` is the efficient rung future runs
+    /// resume at.
+    HaltedAtPlateau,
     /// §34 PR-3 (Item 11): the cap-probe run's per-conn-vs-per-account
     /// verdict row — the `reason` column carries the verdict label
     /// (`probe_multi_conn_ok` / `probe_per_account_limited` /
@@ -80,15 +87,22 @@ impl ScaleOutcome {
             Self::RolledBack => "rolled_back",
             Self::GlobalHalved => "global_halved",
             Self::HaltedAtCeiling => "halted_at_ceiling",
+            Self::HaltedAtPlateau => "halted_at_plateau",
             Self::ProbeVerdict => "probe_verdict",
         }
     }
 
     /// True for the outcomes restart rehydration treats as VERIFIED-healthy
-    /// (mirrors `HEALTHY_OUTCOMES` in the app-crate ladder module).
+    /// (mirrors `HEALTHY_OUTCOMES` in the app-crate ladder module). A
+    /// plateau halt counts: its `to_conns` is the last EFFICIENT rung
+    /// (proof >= conns), so future runs resume near the measured cap
+    /// instead of re-climbing blind.
     #[must_use]
     pub const fn is_verified_healthy(self) -> bool {
-        matches!(self, Self::VerifiedHealthy | Self::HaltedAtCeiling)
+        matches!(
+            self,
+            Self::VerifiedHealthy | Self::HaltedAtCeiling | Self::HaltedAtPlateau
+        )
     }
 }
 
@@ -104,7 +118,8 @@ pub struct GrowwScaleAuditRow<'a> {
     /// Connection count after the transition.
     pub to_conns: usize,
     /// Ladder state label at the transition (`probing` / `holding` /
-    /// `advancing` / `rolling_back` / `halted_at_ceiling`) — the app crate's
+    /// `advancing` / `rolling_back` / `halted_at_ceiling` /
+    /// `halted_at_plateau`) — the app crate's
     /// `LadderState::as_str()`; provably SQL-safe static labels, sanitized
     /// anyway as defense in depth.
     pub state: &'a str,
@@ -392,6 +407,7 @@ mod tests {
         assert_eq!(ScaleOutcome::RolledBack.as_str(), "rolled_back");
         assert_eq!(ScaleOutcome::GlobalHalved.as_str(), "global_halved");
         assert_eq!(ScaleOutcome::HaltedAtCeiling.as_str(), "halted_at_ceiling");
+        assert_eq!(ScaleOutcome::HaltedAtPlateau.as_str(), "halted_at_plateau");
         assert_eq!(ScaleOutcome::ProbeVerdict.as_str(), "probe_verdict");
     }
 
@@ -399,6 +415,9 @@ mod tests {
     fn test_verified_healthy_classification() {
         assert!(ScaleOutcome::VerifiedHealthy.is_verified_healthy());
         assert!(ScaleOutcome::HaltedAtCeiling.is_verified_healthy());
+        // A plateau halt resumes at the EFFICIENT rung on restart — its
+        // to_conns was live-acknowledged, so it is a healthy resume point.
+        assert!(ScaleOutcome::HaltedAtPlateau.is_verified_healthy());
         assert!(!ScaleOutcome::AdvanceStarted.is_verified_healthy());
         // A probe verdict is a REPORT, never a resume-here-healthy marker —
         // rehydration must not resume a rung off a verdict row.
