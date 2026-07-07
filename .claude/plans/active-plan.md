@@ -1,6 +1,6 @@
 # Implementation Plan: Telegram UX Overhaul — Episode Live-Edit Coalescing (One Incident = One Bubble)
 
-**Status:** APPROVED
+**Status:** VERIFIED
 **Date:** 2026-07-07
 **Approved by:** Parthiban (operator) — directive 2026-07-07
 **Branch:** `claude/blissful-fermi-3by0no`
@@ -201,37 +201,37 @@ Telegram surface itself is the primary operator observability: one bubble per in
 
 ## Plan Items
 
-- [ ] Item 1 — Pure episode core: `crates/core/src/notification/episode.rs` (NEW)
+- [x] Item 1 — Pure episode core: `crates/core/src/notification/episode.rs` (NEW)
   - Files: crates/core/src/notification/episode.rs, crates/core/src/notification/mod.rs
   - Tests: test_first_high_event_opens_episode_with_send_new, test_repeat_progress_edits_not_sends, test_resolve_enters_recovering_not_instant_green, test_recovering_promotes_to_closed_after_60s_stability_tick, test_flap_during_recovering_reverts_same_bubble_to_down, test_reopen_within_120s_reuses_tombstone_message_id, test_edit_throttle_folds_without_network_action, test_no_message_id_falls_back_to_send_new, proptest_fsm_total_never_ignores_high_critical, test_steady_render_max_3_lines_320_chars_adversarial, test_first_page_render_always_single_chunk, test_explanation_paragraph_only_on_first_render, test_recovery_render_one_line_green_ist_12h, test_episode_renders_pass_commandments_banned_strings, test_snapshot_roundtrip_stale_day_age_and_corrupt_fail_open
 
-- [ ] Item 2 — Event accessors: episode_key()/episode_role() in `crates/core/src/notification/events.rs` (message_body/to_message untouched; ws_event_audit choke points untouched)
+- [x] Item 2 — Event accessors: episode_key()/episode_role() in `crates/core/src/notification/events.rs` (message_body/to_message untouched; ws_event_audit choke points untouched)
   - Files: crates/core/src/notification/events.rs
-  - Tests: episode_edit_wiring_guard (g) + dhat episode_key zero-alloc pin
+  - Tests: guard_g_ws_audit_choke_points_untouched, test_episode_key_ws_lifecycle_variants_map_to_families, test_episode_role_resolve_for_reconnect_open_for_disconnect, bypass_path_zero_allocation
 
-- [ ] Item 3 — Transport shell + episode dispatch + persistence + shutdown_flush in `crates/core/src/notification/service.rs`
+- [x] Item 3 — Transport shell + episode dispatch + persistence + shutdown_flush in `crates/core/src/notification/service.rs`
   - Files: crates/core/src/notification/service.rs
   - Tests: test_parse_send_message_id_extracts_and_rejects_garbage, test_classify_edit_body_matrix, test_edit_fallback_replaces_message_id_and_counts, test_sms_fires_once_per_episode_open, test_shutdown_flush_drains_digest_and_persists_store
 
-- [ ] Item 4 — Digest lane: classify_dispatch + market_hours_window + close-boundary force-drain + render_digest in `crates/core/src/notification/coalescer.rs`
+- [x] Item 4 — Digest lane: classify_dispatch + market_hours_window + close-boundary force-drain + render_digest in `crates/core/src/notification/coalescer.rs`
   - Files: crates/core/src/notification/coalescer.rs
   - Tests: test_classify_dispatch_high_critical_never_digest_full_matrix, test_digest_window_900_market_60_off_and_config_clamped, test_digest_force_drain_at_market_close_boundary, test_render_digest_header_topic_counts_ist_window
 
-- [ ] Item 5 — ONE new ErrorCode + config knobs + rule-file append
+- [x] Item 5 — ONE new ErrorCode + config knobs + rule-file append
   - Files: crates/common/src/error_code.rs, crates/common/src/config.rs, config/base.toml, .claude/rules/project/wave-3-error-codes.md
-  - Tests: existing error_code cross-ref/tag-guard suites (crossref satisfied by the wave-3-error-codes.md append)
+  - Tests: existing error_code cross-ref/tag-guard suites — crossref satisfied by the wave-3-error-codes.md append, test_notification_digest_window_secs_clamped_to_60_3600
 
-- [ ] Item 6 — Boot/teardown wiring: rehydrate at boot + shutdown_flush in `crates/app/src/main.rs`
+- [x] Item 6 — Boot/teardown wiring: rehydrate at boot + shutdown_flush in `crates/app/src/main.rs`
   - Files: crates/app/src/main.rs
-  - Tests: test_shutdown_flush_drains_digest_and_persists_store, episode_edit_wiring_guard (a)
+  - Tests: test_shutdown_flush_drains_digest_and_persists_store, guard_a_notify_consults_episode_key_before_coalescer
 
-- [ ] Item 7 — Ratchet re-pins + NEW guards
+- [x] Item 7 — Ratchet re-pins + NEW guards
   - Files: crates/core/tests/dhat_telegram_dispatcher.rs, crates/core/tests/episode_edit_wiring_guard.rs, crates/core/tests/telegram_lambda_house_style_guard.rs
-  - Tests: the re-pinned DHAT {Critical,High} + episode_key zero-alloc assertions; the two source-scan guards (a)-(g) and the handler.py scans
+  - Tests: bypass_path_zero_allocation, guard_a_notify_consults_episode_key_before_coalescer, guard_b_edit_message_text_single_build_site, guard_c_edit_transport_blessed_callers_only, guard_d_episode_constants_pinned, guard_e_no_warn_in_episode_failure_arms, guard_f_telegram01_retained_on_terminal_failure, guard_g_ws_audit_choke_points_untouched, guard_sms_leg_rides_first_page_only, guard_escalation_edge_reaches_first_page_bypass, guard_stale_expiry_and_legacy_resolve_wired, guard_house_line_ist_12h_and_fold_records_present, guard_new_state_reason_never_in_telegram_text, guard_parse_mode_absent_from_payload, guard_alarm_never_suppressed_by_warm_cache
 
-- [ ] Item 8 — Lambda house-style formatter + tests + CI wiring
+- [x] Item 8 — Lambda house-style formatter + tests + CI wiring
   - Files: deploy/aws/lambda/telegram-webhook/handler.py, deploy/aws/lambda/telegram-webhook/test_handler.py, Makefile, .github/workflows/ci.yml
-  - Tests: test_house_line_no_raw_threshold_json, test_ok_flip_single_line_recovered, test_alarm_ok_pair_in_batch_folds_to_recovered_only, test_ist_12_hour_timestamp, test_alarm_never_suppressed_by_warm_cache, test_unknown_alarm_name_fallback_still_plain_english
+  - Tests: guard_python_test_lane_carries_contract_tests, guard_house_line_ist_12h_and_fold_records_present (the six Python unittest names — test_house_line_no_raw_threshold_json etc. — run via make lambda-test in the Repo Guards CI job and are name-pinned by guard_python_test_lane_carries_contract_tests)
 
 ---
 
@@ -299,3 +299,56 @@ page, one duplicate bubble, never a lost page); DHAT re-pins the {Critical,High}
 bypass; `episode_mode=false` restores byte-identical legacy dispatch. Beyond the envelope, a
 dead drain ticker leaves a bubble amber (visible via missing digests + TELEGRAM-01 signals) —
 bounded degradation, never silent loss."
+
+---
+
+## 2026-07-07 Hostile-Review Fix Addendum (post-implementation, pre-merge)
+
+The adversarial review of the implemented diff surfaced 3 CRITICAL/HIGH behavioral gaps +
+2 delivery gaps; all are FIXED in this branch (same PR):
+
+1. **Low→High escalation pages fresh (push + SMS).** `next_episode_action` now routes an
+   Open/Progress event at ≥High into a sub-High-peak episode (live state OR ≤120s
+   tombstone, both consult `severity_peak`) to `SendFirstPage` — the preserved bypass arm
+   the SNS-SMS leg rides. The pre-open Low off-hours storm can never swallow an in-market
+   HIGH outage as a silent edit. Counter: `tv_telegram_episode_events_total{action="escalate"}`.
+   Tests: test_next_episode_action_escalation_low_peak_to_high_pages_fresh,
+   test_apply_event_escalation_marks_decision_and_updates_peak,
+   test_tombstone_high_reopen_over_low_peak_pages_fresh,
+   test_low_episode_escalation_to_high_sends_fresh_page (mock transport),
+   guard_escalation_edge_reaches_first_page_bypass. `severity_peak` is now PERSISTED in the
+   snapshot (missing/legacy label → Low, so a post-restart High event re-pages —
+   duplicate-over-drop).
+2. **Stale-Down expiry + legacy resolve routing (restart edge).** `EpisodeRegistry::tick`
+   expires Down episodes with no events for `EPISODE_DOWN_STALE_EXPIRE_SECS = 1800` (no
+   tombstone — the next outage opens a FRESH first page with the SMS leg); the drain ticker
+   neutralizes the old bubble with a one-line ⚪ close. A `Resolve` with no state and no
+   fresh tombstone now maps to `EpisodeAction::SendLegacy` (delivered via the legacy
+   immediate lane + counted `legacy_passthrough`) instead of a silent Ignore; Ignore remains
+   ONLY for a resolve against a fresh tombstone (recovery already announced by the green
+   close). Tests: test_tick_expires_stale_down_and_live_count_drops,
+   test_run_episode_tick_expires_stale_down_bubble,
+   test_resolve_with_no_state_routes_send_legacy_and_fresh_tombstone_ignores,
+   test_resolve_without_state_sends_legacy_message_not_dropped,
+   guard_stale_expiry_and_legacy_resolve_wired.
+3. **No silent sub-threshold transient edit failure.** The Edit/Transient arm now (a) falls
+   back to a FRESH send on the FIRST exhausted transient for episodes with
+   `severity_peak ≥ High` (a structurally-final event — e.g. the once-per-outage WS-GAP-10
+   page — may never re-drive the ladder), and (b) for sub-High episodes below the threshold
+   emits `error!(code=TELEGRAM-03, reason="edit_transient_deferred")` +
+   `tv_telegram_edit_fallback_total{reason="transient_deferred"}` — no silent terminal path
+   remains. Tests: test_edit_transient_high_falls_back_immediately_low_stays_loud,
+   guard_escalation_edge_reaches_first_page_bypass.
+4. **`crates/core/tests/telegram_lambda_house_style_guard.rs` DELIVERED** (was promised in
+   Item 7 but missing from the diff) — the independent build-failing Rust source-scan of
+   handler.py: house-style chain present, `Reason: {reason}` + `parse_mode` payload key
+   banned, NewStateReason print-forensics-only, ALARM never routed through the warm-cache
+   suppression, the 6 Python contract test names pinned.
+5. **pub-fn-test-guard back at baseline 113** — name-matched tests added for every new pub
+   fn (episode.rs registry/render/accessor fns, coalescer window fns, service transport fns,
+   events episode_role, config digest_window_secs_clamped renamed test). No baseline bump.
+
+New TELEGRAM-03 reasons + counter labels are documented in
+`.claude/rules/project/wave-3-error-codes.md` (same PR). Honest envelope unchanged: a
+High-over-High tombstone reopen (<120s) still folds into the same bubble by design — that
+incident already paged + SMS'd at its open.
