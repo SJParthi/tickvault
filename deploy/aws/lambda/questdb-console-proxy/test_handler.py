@@ -389,6 +389,33 @@ class Relay(WithBase):
             r = handler.lambda_handler({"method": "GET", "path": "/"}, None)
             self.assertEqual(r, {"err": "upstream_timeout"})
 
+    def test_unframed_non_3xx_body_timeout_maps_to_upstream_timeout(self) -> None:
+        # Fixer round 2 (2026-07-06): a socket timeout raised while READING an
+        # unframed NON-3xx error body is raised INSIDE the `except HTTPError`
+        # handler, so the enclosing try's sibling timeout clause can NEVER
+        # catch it (an exception raised in an except suite escapes the whole
+        # try statement). Pre-guard this escaped lambda_handler as a Lambda
+        # FunctionError -> the front's generic err arm -> dishonest
+        # offline-503 (executed proof: `UNHANDLED EXCEPTION escapes
+        # lambda_handler: TimeoutError`). The explicit guard around
+        # _read_capped(exc) must map it to the honest upstream_timeout -> 504.
+        class _HangFp:
+            def read(self, *_a):
+                raise socket.timeout("unframed 500 body read hang")
+
+            def close(self):
+                return None
+
+        err = urllib.error.HTTPError(
+            url="http://10.42.1.99:9000/settings", code=500,
+            msg="Internal Server Error", hdrs={}, fp=_HangFp(),
+        )
+        # /settings is NOT rewritten, so this exercises the HTTPError non-3xx
+        # body read (the 3xx arm never reads — see the bomb-fp test above).
+        with mock.patch("urllib.request.urlopen", side_effect=err):
+            r = handler.lambda_handler({"method": "GET", "path": "/settings"}, None)
+            self.assertEqual(r, {"err": "upstream_timeout"})
+
     def test_http_error_is_relayed_not_swallowed(self) -> None:
         # QuestDB's own 400 (bad column etc.) must reach the console UI.
         err = urllib.error.HTTPError(

@@ -116,9 +116,18 @@ so the pre-fix behavior (504 after ~12s) can physically never pass.
   12s connect timeout — the front's 503 `box_unreachable` needs a connection
   REFUSAL (box running, QuestDB down). The smoke gate independently verifies
   the EC2 state before accepting ANY of 000/504/503 as the auto-stop window.
-- **Unframed NON-3xx on a future path** — bounded 12s → honest 504, never a
-  silent hang; read-until-idle was explicitly rejected in the repro design
-  notes (it would turn every load into a deliberate multi-second stall).
+- **Unframed NON-3xx on a future path** — bounded 12s read, explicitly
+  GUARDED inside the back lambda's HTTPError arm (fixer round 2, 2026-07-06)
+  → honest `upstream_timeout` → front 504, never a silent hang. Honesty
+  correction: before that guard, a socket timeout raised while reading the
+  error body INSIDE the `except HTTPError` handler was NOT caught by the
+  sibling timeout clause (an exception raised in an except suite escapes the
+  whole try statement) — it escaped `lambda_handler` as a Lambda
+  FunctionError, which the front mapped to a dishonest offline-503; proven
+  by execution and now pinned by
+  `test_unframed_non_3xx_body_timeout_maps_to_upstream_timeout`.
+  Read-until-idle was explicitly rejected in the repro design notes (it
+  would turn every load into a deliberate multi-second stall).
 - **Smoke gate cannot read the SSM secret / cannot resolve box state** — fails
   closed (the `aws ssm get-parameter` failure aborts under `set -euo
   pipefail`; unknown EC2 state is an explicit FATAL arm).

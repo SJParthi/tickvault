@@ -293,8 +293,12 @@ def lambda_handler(event, _context):
     # /index.html, one /assets/ file, /exec, HEAD /; no claim is made about
     # unprobed paths) and (2) the _NoFollowRedirect opener + body-less 3xx
     # relay (covers any FUTURE unframed 3xx class-wide; an unframed NON-3xx
-    # on an unprobed path would still be a bounded 12s read -> honest 504,
-    # never a silent hang).
+    # on an unprobed path is a bounded 12s read GUARDED inside the HTTPError
+    # arm below -> honest upstream_timeout -> front 504. Fixer round 2
+    # 2026-07-06: before that explicit guard, the timeout raised inside the
+    # except handler ESCAPED lambda_handler as a Lambda FunctionError ->
+    # dishonest front offline-503 — proven by execution, see the guard's
+    # comment and test_unframed_non_3xx_body_timeout_maps_to_upstream_timeout).
     # `Accept-Encoding: identity` still guarantees Content-Length-framed
     # uncompressed bodies on framed paths, under the MAX_BODY_BYTES cap.
     req.add_header("Accept-Encoding", "identity")
@@ -330,7 +334,20 @@ def lambda_handler(event, _context):
                 out_headers[k] = v
         if 300 <= int(exc.code) < 400:
             return {"status": int(exc.code), "headers": out_headers, "body_b64": ""}
-        body, _over = _read_capped(exc)
+        try:
+            body, _over = _read_capped(exc)
+        except (TimeoutError, socket.timeout):
+            # Fixer round 2 (2026-07-06): a socket timeout raised while READING
+            # an unframed NON-3xx error body is raised INSIDE this except
+            # handler, so the sibling `except (TimeoutError, socket.timeout)`
+            # clause of the enclosing try can NEVER catch it (Python: an
+            # exception raised in an except suite propagates out of the whole
+            # try statement). Pre-guard it escaped lambda_handler as a Lambda
+            # FunctionError, which the front's _invoke_back mapped through the
+            # generic err arm to a dishonest offline-503 — the exact
+            # misdiagnosis class this fix series eliminates. Guard the read
+            # explicitly: bounded 12s read -> honest upstream_timeout -> 504.
+            return {"err": "upstream_timeout"}
         return {
             "status": int(exc.code),
             "headers": out_headers,
