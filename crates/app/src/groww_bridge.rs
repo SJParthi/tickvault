@@ -1797,7 +1797,10 @@ impl GrowwAuditLatches {
     /// until [`Self::take_feed_recovery`] closes the episode.
     pub fn try_announce_feed_down(&self, now_epoch_secs: u64) -> bool {
         // First-down-wins: only stamp when no episode is in progress (0).
-        let _ = self.down_since_epoch_secs.compare_exchange(
+        // A lost CAS means an earlier falling edge already stamped this
+        // episode — exactly the desired outcome, so the Err is discarded
+        // into a named binding (must_use satisfied, no behavior on Err).
+        let _first_down_stamp = self.down_since_epoch_secs.compare_exchange(
             0,
             now_epoch_secs.max(1),
             std::sync::atomic::Ordering::Relaxed,
@@ -2053,18 +2056,14 @@ async fn supervise_groww_bridge_loop(
                 // per tick. The connected-level gauge drops to 0 so the
                 // CloudWatch inactivity alarm sees the outage too.
                 metrics::gauge!("tv_groww_ws_active").set(0.0);
-                if audit_latches.try_announce_feed_down(ist_epoch_secs_now()) {
-                    if let Some(notifier) = notifier_slot.as_ref().and_then(|slot| slot.load_full())
-                    {
-                        notifier.notify(
-                            tickvault_core::notification::NotificationEvent::FeedDown {
-                                feed: Feed::Groww.display_name().to_string(), // O(1) EXEMPT: cold path — once per DOWN episode
-                                reason: "internal restart — recovering automatically".to_string(), // O(1) EXEMPT: cold path — once per DOWN episode
-                                market_open:
-                                    tickvault_common::market_hours::is_within_market_hours_ist(),
-                            },
-                        );
-                    }
+                if audit_latches.try_announce_feed_down(ist_epoch_secs_now())
+                    && let Some(notifier) = notifier_slot.as_ref().and_then(|slot| slot.load_full())
+                {
+                    notifier.notify(tickvault_core::notification::NotificationEvent::FeedDown {
+                        feed: Feed::Groww.display_name().to_string(), // O(1) EXEMPT: cold path — once per DOWN episode
+                        reason: "internal restart — recovering automatically".to_string(), // O(1) EXEMPT: cold path — once per DOWN episode
+                        market_open: tickvault_common::market_hours::is_within_market_hours_ist(),
+                    });
                 }
             }
             error!(
@@ -2431,17 +2430,14 @@ pub async fn run_groww_bridge(
                 // audit row above is already written, the latch is still
                 // set, only the page is skipped — the disable path is never
                 // blocked. Cold path — event-driven, never per tick.
-                if audit_latches.try_announce_feed_down(ist_epoch_secs_now()) {
-                    if let Some(notifier) = notifier_slot.as_ref().and_then(|slot| slot.load_full())
-                    {
-                        notifier.notify(
-                            tickvault_core::notification::NotificationEvent::FeedDown {
-                                feed: Feed::Groww.display_name().to_string(), // O(1) EXEMPT: cold path — once per DOWN episode
-                                reason: "feed switched off by the operator".to_string(), // O(1) EXEMPT: cold path — once per DOWN episode
-                                market_open: in_market,
-                            },
-                        );
-                    }
+                if audit_latches.try_announce_feed_down(ist_epoch_secs_now())
+                    && let Some(notifier) = notifier_slot.as_ref().and_then(|slot| slot.load_full())
+                {
+                    notifier.notify(tickvault_core::notification::NotificationEvent::FeedDown {
+                        feed: Feed::Groww.display_name().to_string(), // O(1) EXEMPT: cold path — once per DOWN episode
+                        reason: "feed switched off by the operator".to_string(), // O(1) EXEMPT: cold path — once per DOWN episode
+                        market_open: in_market,
+                    });
                 }
             }
             audit_latches
@@ -2616,17 +2612,16 @@ pub async fn run_groww_bridge(
                 None => true, // no Telegram wiring (tests) — consume silently
                 Some(_) => notifier.is_some(),
             };
-            if notifier_ready {
-                if let Some(down_secs) = audit_latches.take_feed_recovery(ist_epoch_secs_now()) {
-                    if let Some(notifier) = notifier {
-                        notifier.notify(
-                            tickvault_core::notification::NotificationEvent::FeedRecovered {
-                                feed: Feed::Groww.display_name().to_string(), // O(1) EXEMPT: cold path — once per DOWN-episode recovery
-                                down_secs,
-                            },
-                        );
-                    }
-                }
+            if notifier_ready
+                && let Some(down_secs) = audit_latches.take_feed_recovery(ist_epoch_secs_now())
+                && let Some(notifier) = notifier
+            {
+                notifier.notify(
+                    tickvault_core::notification::NotificationEvent::FeedRecovered {
+                        feed: Feed::Groww.display_name().to_string(), // O(1) EXEMPT: cold path — once per DOWN-episode recovery
+                        down_secs,
+                    },
+                );
             }
         }
 
