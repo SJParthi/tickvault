@@ -394,17 +394,19 @@ jobs:
         # B4 r3 (2026-07-06): GET / had NEVER returned 200 in the console's
         # lifetime — QuestDB answers / with an UNFRAMED keep-alive 301 that
         # never closes the socket, hanging the back lambda's read until the
-        # 12s timeout -> front 504 (evidence: scratchpad/repro-evidence.md,
-        # branch claude/festive-bell-hm8w4d). The back lambda now rewrites
+        # 12s timeout -> front 504 (evidence:
+        # deploy/aws/lambda/questdb-console-proxy/repro-evidence.md,
+        # committed with the fix). The back lambda now rewrites
         # '/' -> '/index.html'. This gate asserts the fixed contract
         # END-TO-END (API-GW -> front device-key auth -> back VPC relay ->
         # box:9000): GET / must be HTTP 200 within 5 seconds. HARD FAIL on
         # any other outcome, with ONE honest exception: 000/504/503 while
         # the EC2 box is VERIFIABLY not running (auto-stop window) is the
-        # console working correctly — that case SKIPS LOUDLY. (running+503
-        # additionally gets ONE 90s grace re-probe before FATAL — QuestDB
-        # start/restart windows; see the running arm below — but a pass
-        # there still requires a genuine 200 + shell HTML, never a skip.)
+        # console working correctly — that case SKIPS LOUDLY. (Each of
+        # 000/503/504 on a RUNNING box gets ONE 90s grace re-probe before
+        # FATAL — box OS boot / QuestDB start/restart windows; see the
+        # running arm below — but a pass there still requires a genuine
+        # 200 + shell HTML, never a skip.)
         # Fixer round 6 (2026-07-06, TOCTOU): "verifiably not running" means
         # not running at BOTH a pre-probe AND a post-probe EC2 state sample —
         # a running->stopped transition across the probe window fails CLOSED
@@ -507,7 +509,8 @@ jobs:
           # off-window apply (nights/weekends/the 17:05 IST post-stop drift
           # retry) would hard-fail AFTER a successful terraform apply. All
           # three codes with the box RUNNING, or an unverifiable state, still
-          # FAIL CLOSED (running+503 only after the 90s grace re-probe below).
+          # FAIL CLOSED (each of 000/503/504 on a running box only after the
+          # ONE 90s grace re-probe in the running arm below).
           case "$CODE" in
             000|503|504)
               case "$STATE" in
@@ -533,8 +536,8 @@ jobs:
                   echo "⚠ SKIP (loud): console GET / -> '${CODE}' with the box ${STATE} (pre-probe sample: ${STATE_PRE}, post-probe sample: ${STATE}; auto-stop window, 08:30–16:30 IST schedule) — a not-running box cannot serve the shell (stopped box = 5s curl timeout = 000, never a fast 503); shell smoke re-runs on the next in-window apply" | tee -a "$GITHUB_STEP_SUMMARY"
                   exit 0 ;;
                 running)
-                  # Fixer round 5 (2026-07-06): running + fast 503 (connection
-                  # REFUSED -> back box_unreachable) is NOT only a
+                  # Fixer round 5 (2026-07-06): running + fast 503 (the front's
+                  # box_unreachable / generic-503 mapping) is NOT only a
                   # SG/bind/back-lambda regression — it is ALSO the transient
                   # signature of a RUNNING box whose QuestDB container is not
                   # (yet) listening on :9000. Two real windows: (a) the box
@@ -551,46 +554,75 @@ jobs:
                   # before declaring FATAL, re-probe ONCE after 90s. Still
                   # fail-closed: the grace pass requires a genuine 200 + the
                   # console shell HTML; a real regression persists past 90s
-                  # and still fails. 000/504 stay immediately FATAL — they ARE
-                  # the shell-hang class this gate exists to catch, and no
-                  # start-up window produces them on a running box whose ENI
-                  # is answering.
-                  if [ "$CODE" = "503" ]; then
-                    echo "running box + fast 503 (connection refused -> QuestDB not listening) — possible transient window (08:30 IST auto-start or docker-compose container recreate); grace re-probe in 90s"
-                    sleep 90
-                    CODE=$(curl -sS -o /tmp/qdb-shell.body -w '%{http_code}' --max-time 5 \
-                      -H @"$HDR" "${QURL%/}/" || true)
-                    CODE=${CODE:-000}
-                    echo "grace re-probe: GET / -> ${CODE}"
-                    if [ "$CODE" = "200" ]; then
-                      grep -qi '<!DOCTYPE html' /tmp/qdb-shell.body \
-                        || { echo "FATAL: grace re-probe gave 200 but the body is not the console shell HTML"; exit 1; }
-                      echo "✅ console shell smoke: GET / == 200 on the 90s grace re-probe (QuestDB was transiently starting/restarting — not a regression)"
-                      echo "✅ QuestDB console shell smoke passed (GET / = 200 on the 90s grace re-probe — QuestDB was starting/restarting)" >> "$GITHUB_STEP_SUMMARY"
-                      exit 0
-                    fi
-                    # Fixer round 6 (2026-07-06): the 90s sleep can span the
-                    # 16:30 IST auto-stop — the 10:50 UTC scheduled retry
-                    # slot starts at 16:20 IST and init+plan+apply+publish
-                    # can put this arm at ~16:27-16:29 IST. A box that
-                    # auto-stops mid-grace re-probes as 000 (its stopped ENI
-                    # drops packets), and the old code fell through to the
-                    # FATAL below asserting 'the box IS running' from the
-                    # PRE-sleep sample — a false-FATAL with misdirected
-                    # triage. Re-sample AFTER the sleep: a mid-grace stop
-                    # re-enters the loud not-running skip, which is honest —
-                    # the pre-grace fast 503 already proved only
-                    # QuestDB-not-listening on a then-running box (exactly
-                    # this arm's forgiven transient class), and a not-running
-                    # box cannot be probed further.
-                    STATE=$(box_state)
-                    case "$STATE" in
-                      stopped|stopping)
-                        echo "⚠ SKIP (loud): grace re-probe -> '${CODE}' but the box auto-stopped MID-GRACE (post-sleep state: ${STATE}) — the pre-grace fast 503 was QuestDB-not-listening on a then-running box (the forgiven transient class), and a not-running box cannot serve the shell; shell smoke re-runs on the next in-window apply" | tee -a "$GITHUB_STEP_SUMMARY"
-                        exit 0 ;;
-                    esac
+                  # and still fails (~90s later).
+                  # Fixer round 7 (2026-07-06): the grace re-probe now covers
+                  # 000/504 as well as 503. The round-5 claim that "no
+                  # start-up window produces 000/504 on a running box whose
+                  # ENI is answering" hid the real window in its qualifier:
+                  # on EVERY start (the 08:30 IST auto-start, or an operator
+                  # manual start colliding with a scheduled slot), EC2 flips
+                  # the state to 'running' within seconds while the guest
+                  # OS/network stack takes ~30-90s to come up — during that
+                  # phase the attached ENI silently DROPS SYNs (no RST; the
+                  # same mechanics as the stopped-box comment above), the
+                  # back lambda's connect blocks its full 12s timeout ->
+                  # front 504, and this gate's 5s-capped curl reads CODE=000
+                  # with box_state()=running. BOTH state samples can say
+                  # 'running' during that window ('pending' lasts only
+                  # seconds), and the start-side TOCTOU twin
+                  # (STATE_PRE=pending/stopped, box starts mid-probe-window,
+                  # post-sample running) lands here too — so gating the
+                  # grace on STATE_PRE would still miss the both-samples-
+                  # running boot case. Fail-closed is preserved: a genuine
+                  # shell-hang regression (the unframed-301 class) persists
+                  # past the grace and still FATALs. HONEST RESIDUAL: an OS
+                  # boot slower than the ~111s probe+grace budget still
+                  # false-FATALs — bounded and disclosed; the alternative
+                  # (skipping on running+000) would launder the exact
+                  # regression class this gate exists to catch.
+                  CODE_PRE="$CODE"
+                  echo "running box + '${CODE}' — possible start/restart transient window (08:30 IST auto-start OS/QuestDB boot, or docker-compose container recreate); ONE grace re-probe in 90s"
+                  sleep 90
+                  CODE=$(curl -sS -o /tmp/qdb-shell.body -w '%{http_code}' --max-time 5 \
+                    -H @"$HDR" "${QURL%/}/" || true)
+                  CODE=${CODE:-000}
+                  echo "grace re-probe: GET / -> ${CODE} (pre-grace: ${CODE_PRE})"
+                  if [ "$CODE" = "200" ]; then
+                    grep -qi '<!DOCTYPE html' /tmp/qdb-shell.body \
+                      || { echo "FATAL: grace re-probe gave 200 but the body is not the console shell HTML"; exit 1; }
+                    echo "✅ console shell smoke: GET / == 200 on the 90s grace re-probe (box OS / QuestDB was transiently starting or restarting — not a regression)"
+                    echo "✅ QuestDB console shell smoke passed (GET / = 200 on the 90s grace re-probe — box/QuestDB was starting/restarting)" >> "$GITHUB_STEP_SUMMARY"
+                    exit 0
                   fi
-                  echo "FATAL: console GET / -> '${CODE}' with box state '${STATE}' at the final sample (000/504 = the shell-hang class; 503 past the 90s grace re-probe = SG/bind/back-lambda regression OR QuestDB down/restarting >90s — check the QuestDB container via docker compose on the box)"; exit 1 ;;
+                  # Fixer round 6 (2026-07-06): the 90s sleep can span the
+                  # 16:30 IST auto-stop — the 10:50 UTC scheduled retry
+                  # slot starts at 16:20 IST and init+plan+apply+publish
+                  # can put this arm at ~16:27-16:29 IST. A box that
+                  # auto-stops mid-grace re-probes as 000 (its stopped ENI
+                  # drops packets), and the old code fell through to the
+                  # FATAL below asserting 'the box IS running' from the
+                  # PRE-sleep sample — a false-FATAL with misdirected
+                  # triage. Re-sample AFTER the sleep: a mid-grace stop
+                  # re-enters the loud not-running skip. Fixer round 7
+                  # honesty (2026-07-06): the skip wording must NOT claim
+                  # the pre-grace failure "proved QuestDB-not-listening" —
+                  # the front returns the SAME fast 503 for a back-lambda
+                  # crash (front handler.py maps back_function_error /
+                  # back_invoke_failed through its generic 503 arm), so a
+                  # pre-grace fast 503 is merely CONSISTENT WITH a
+                  # listen-layer transient OR a back-lambda invoke failure,
+                  # and the two are indistinguishable once the box has
+                  # stopped and cannot be probed further. The compound
+                  # window (grace arm + mid-grace auto-stop + a crash-class
+                  # regression) is accepted as narrower than red-failing
+                  # every mid-grace auto-stop.
+                  STATE=$(box_state)
+                  case "$STATE" in
+                    stopped|stopping)
+                      echo "⚠ SKIP (loud): grace re-probe -> '${CODE}' but the box auto-stopped MID-GRACE (post-sleep state: ${STATE}) — the pre-grace '${CODE_PRE}' on a then-running box is consistent with QuestDB-not-listening / a booting OS OR a back-lambda invoke failure (indistinguishable once the box stopped); a not-running box cannot serve the shell — shell smoke re-runs on the next in-window apply" | tee -a "$GITHUB_STEP_SUMMARY"
+                      exit 0 ;;
+                  esac
+                  echo "FATAL: console GET / -> '${CODE}' past the 90s grace re-probe (pre-grace: '${CODE_PRE}') with box state '${STATE}' at the final sample. 000/504 past the grace = the unframed-response shell-hang class (or — residual, disclosed — an OS boot slower than the ~111s probe+grace budget); 503 past the grace = SG/bind regression, a back-lambda crash (front maps back_function_error/back_invoke_failed to the same fast 503), OR QuestDB down/restarting >90s — check the QuestDB container via docker compose on the box"; exit 1 ;;
                 *)
                   echo "FATAL: console GET / -> '${CODE}' and box state could not be verified (state='${STATE}') — failing closed"; exit 1 ;;
               esac ;;

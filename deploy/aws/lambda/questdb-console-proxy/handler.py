@@ -41,7 +41,8 @@ QDB_CONSOLE_BUILD = "b4-qdb-console-2026-07-06-r3"
 
 class _NoFollowRedirect(urllib.request.HTTPRedirectHandler):
     """B4 r3 shell-hang fix, belt layer (2026-07-06, evidence:
-    scratchpad/repro-evidence.md §9a/§10). QuestDB 9.3.5 answers GET / with an
+    repro-evidence.md §9a/§10, committed alongside this handler).
+    QuestDB 9.3.5 answers GET / with an
     UNFRAMED keep-alive 301 (no Content-Length, no Transfer-Encoding, no
     Connection header) and NEVER closes the socket — even under request
     `Connection: close` (raw-socket proof: 20.017s recv gap, zero close).
@@ -263,7 +264,8 @@ def lambda_handler(event, _context):
     if denied:
         return {"err": denied}
 
-    # B4 r3 shell-load fix (2026-07-06, evidence: scratchpad/repro-evidence.md).
+    # B4 r3 shell-load fix (2026-07-06, evidence: repro-evidence.md — committed
+    # alongside this handler).
     # QuestDB 9.3.5 does NOT serve the console shell at "/": it answers an
     # UNFRAMED keep-alive 301 -> /index.html and never closes the socket, so
     # any read-until-EOF relay hangs until its socket timeout (GET / had
@@ -288,7 +290,7 @@ def lambda_handler(event, _context):
             req.add_header(k, str(v))
     # B4 r3 header hygiene (2026-07-06). These two headers are RETAINED as
     # defense-in-depth ONLY — they are NOT the shell fix. Raw-socket proof
-    # 2026-07-06 (scratchpad/repro-evidence.md §3/§10): QuestDB 9.3.5 does
+    # 2026-07-06 (repro-evidence.md §3/§10, this directory): QuestDB 9.3.5 does
     # NOT honor request `Connection: close` on the / 301 (no close after a
     # 20s recv gap), disproving the r2 theory that the server would EOF the
     # socket once the body was sent. The actual fixes are (1) the
