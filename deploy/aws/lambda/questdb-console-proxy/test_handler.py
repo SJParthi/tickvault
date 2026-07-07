@@ -209,11 +209,14 @@ class Relay(WithBase):
             self.assertEqual(up.call_args[1]["timeout"], handler._TIMEOUT_SECS)
 
     def test_shell_get_forces_identity_and_connection_close(self) -> None:
-        # B4 r2: the shell (GET /) upstream request MUST carry
-        # `Accept-Encoding: identity` + `Connection: close` so QuestDB frames
-        # the body with a length AND EOFs the socket — the browser's own
-        # `Accept-Encoding: gzip` must NOT be forwarded (that unframed gzip
-        # shell is what hung read() until the 12s timeout → false 503).
+        # B4 r3 (honest wording — the r2 premise is DISPROVEN): these two
+        # headers are RETAINED hygiene, NOT the shell fix. The 2026-07-06
+        # raw-socket probe (scratchpad/repro-evidence.md §3/§10) proved
+        # QuestDB 9.3.5 IGNORES request `Connection: close` on the / 301 and
+        # never closes the socket. The actual fix is the GET / -> /index.html
+        # rewrite (asserted below) + the _NoFollowRedirect body-less 3xx
+        # relay. `Accept-Encoding: identity` still keeps framed paths
+        # Content-Length'd (uncompressed) under the relay cap.
         resp = FakeResp([b"<!doctype html><html></html>"])
         with mock.patch("urllib.request.urlopen", return_value=resp) as up:
             r = handler.lambda_handler(
@@ -230,6 +233,112 @@ class Relay(WithBase):
             self.assertEqual(req.get_header("Accept-encoding"), "identity")
             self.assertEqual(req.get_header("Connection"), "close")
             self.assertEqual(req.get_header("Accept"), "text/html")  # browser accept still relayed
+            # B4 r3: the shell request must target the framed /index.html.
+            self.assertEqual(req.full_url, "http://10.42.1.99:9000/index.html")
+
+    def test_root_get_is_rewritten_to_index_html(self) -> None:
+        # B4 r3 L1: GET / never reaches QuestDB — the back fetches the framed
+        # shell directly (the / 301 is unframed + never-closed → 12s hang).
+        resp = FakeResp([b"<!DOCTYPE html>\n<html>"], headers={"content-type": "text/html"})
+        with mock.patch("urllib.request.urlopen", return_value=resp) as up:
+            r = handler.lambda_handler(
+                {"method": "GET", "path": "/", "headers": {"accept": "text/html"}}, None
+            )
+            self.assertEqual(r["status"], 200)
+            self.assertEqual(up.call_args[0][0].full_url, "http://10.42.1.99:9000/index.html")
+
+    def test_root_rewrite_preserves_whitelisted_query(self) -> None:
+        # The front's whitelisted static params must survive the rewrite.
+        resp = FakeResp([b"<!DOCTYPE html>"])
+        with mock.patch("urllib.request.urlopen", return_value=resp) as up:
+            r = handler.lambda_handler(
+                {"method": "GET", "path": "/", "rawQuery": "v=1"}, None
+            )
+            self.assertEqual(r["status"], 200)
+            self.assertEqual(up.call_args[0][0].full_url, "http://10.42.1.99:9000/index.html?v=1")
+
+    def test_head_root_not_rewritten(self) -> None:
+        # Scope pin (repro §8): HEAD / is a fast FRAMED chunked 405 from
+        # QuestDB — deliberately unchanged (HEAD /index.html is
+        # live-unverified). The rewrite is GET-gated.
+        resp = FakeResp([b""], status=405, headers={"content-type": "text/plain"})
+        with mock.patch("urllib.request.urlopen", return_value=resp) as up:
+            handler.lambda_handler({"method": "HEAD", "path": "/"}, None)
+            self.assertEqual(up.call_args[0][0].full_url, "http://10.42.1.99:9000/")
+
+    def test_non_root_paths_not_rewritten(self) -> None:
+        # Guards an over-eager rewrite: ONLY exactly GET "/" is rewritten.
+        for p in ("/index.html", "/chk", "/settings", "/assets/app.js"):
+            resp = FakeResp([b"x"])
+            with mock.patch("urllib.request.urlopen", return_value=resp) as up:
+                handler.lambda_handler({"method": "GET", "path": p}, None)
+                self.assertTrue(
+                    up.call_args[0][0].full_url.endswith(p),
+                    f"{p} was unexpectedly rewritten to {up.call_args[0][0].full_url}",
+                )
+        resp = FakeResp([b"[]"], headers={"content-type": "application/json"})
+        with mock.patch("urllib.request.urlopen", return_value=resp) as up:
+            handler.lambda_handler(
+                {"method": "GET", "path": "/exec", "rawQuery": "query=select+1"}, None
+            )
+            self.assertTrue(
+                up.call_args[0][0].full_url.startswith("http://10.42.1.99:9000/exec?")
+            )
+
+    def test_root_rewrite_kills_the_unframed_301_timeout_class(self) -> None:
+        # Behavioral proof of the fix: a fake box that HANGS (socket.timeout,
+        # exactly what the unframed keep-alive 301 read-until-EOF produced)
+        # for every path EXCEPT /index.html. On r2 bytes GET / returns
+        # {"err": "upstream_timeout"} (the prod 504); on r3 it returns the
+        # shell with status 200 because the 301 is never elicited.
+        def fake_urlopen(req, timeout=None):
+            if req.full_url.rstrip("?").endswith("/index.html"):
+                return FakeResp([b"<!DOCTYPE html>"])
+            raise socket.timeout("unframed 301 read-until-EOF hang")
+
+        with mock.patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            r = handler.lambda_handler({"method": "GET", "path": "/"}, None)
+            self.assertEqual(r["status"], 200)
+            self.assertIn(b"<!DOCTYPE html>", base64.b64decode(r["body_b64"]))
+
+    def test_redirect_relayed_bodyless_never_reads_body(self) -> None:
+        # B4 r3 L2 (non-vacuous hang guard): a 3xx body may be DELIMITER-LESS
+        # on a socket QuestDB never closes — reading it blocks until the 12s
+        # timeout. The bomb-fp proves the 3xx arm NEVER touches the body.
+        class _BombFp:
+            def read(self, *_a):
+                raise AssertionError("3xx body must NEVER be read (unframed; socket never closes)")
+
+            def close(self):
+                return None
+
+        err = urllib.error.HTTPError(
+            url="http://10.42.1.99:9000/settings", code=301,
+            msg="Moved Permanently", hdrs={"location": "/index.html"}, fp=_BombFp(),
+        )
+        # /settings is NOT rewritten, so this exercises the HTTPError 3xx arm.
+        with mock.patch("urllib.request.urlopen", side_effect=err):
+            r = handler.lambda_handler({"method": "GET", "path": "/settings"}, None)
+            self.assertEqual(
+                r, {"status": 301, "headers": {"location": "/index.html"}, "body_b64": ""}
+            )
+
+    def test_no_follow_redirect_opener_installed(self) -> None:
+        # The belt layer: redirect_request returns None (no fp.read() drain;
+        # every 3xx surfaces as HTTPError) and the opener is installed
+        # module-wide so plain urllib.request.urlopen uses it.
+        self.assertIsNone(
+            handler._NoFollowRedirect().redirect_request(None, None, 301, "Moved", {}, "/index.html")
+        )
+        src = (Path(__file__).resolve().parent / "handler.py").read_text()
+        self.assertIn("install_opener", src)
+
+    def test_disproven_r2_close_claim_removed(self) -> None:
+        # Source ratchet: the factually-wrong r2 claim (that QuestDB
+        # "closes the socket AFTER the body") can never return — the
+        # 2026-07-06 raw-socket probe disproved it verbatim.
+        src = (Path(__file__).resolve().parent / "handler.py").read_text()
+        self.assertNotIn("closes the socket AFTER the body", src)
 
     def test_size_cap_returns_too_large(self) -> None:
         chunk = b"x" * handler._READ_CHUNK

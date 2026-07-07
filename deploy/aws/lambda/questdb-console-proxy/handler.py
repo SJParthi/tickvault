@@ -32,7 +32,27 @@ import urllib.parse
 import urllib.request
 
 # Deployed-bytes proof marker (proof-3 ratchet: test_build_marker_present).
-QDB_CONSOLE_BUILD = "b4-qdb-console-2026-07-03-r2"
+QDB_CONSOLE_BUILD = "b4-qdb-console-2026-07-06-r3"
+
+
+class _NoFollowRedirect(urllib.request.HTTPRedirectHandler):
+    """B4 r3 shell-hang fix, belt layer (2026-07-06, evidence:
+    scratchpad/repro-evidence.md §9a/§10). QuestDB 9.3.5 answers GET / with an
+    UNFRAMED keep-alive 301 (no Content-Length, no Transfer-Encoding, no
+    Connection header) and NEVER closes the socket — even under request
+    `Connection: close` (raw-socket proof: 20.017s recv gap, zero close).
+    urllib's DEFAULT HTTPRedirectHandler drains that body with fp.read()
+    BEFORE following, so urlopen itself blocked until _TIMEOUT_SECS.
+    Returning None makes any 3xx surface as an HTTPError WITHOUT any body
+    read; the HTTPError arm below relays 3xx body-less. Safe globally: this
+    lambda makes exactly one kind of HTTP call (stdlib urllib to the box —
+    see module docstring; no AWS SDK, ratcheted by Hygiene tests)."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+urllib.request.install_opener(urllib.request.build_opener(_NoFollowRedirect))
 
 QDB_BASE = os.environ.get("QDB_BASE", "")  # e.g. http://<box_private_ip>:9000
 # Single-timeout tradeoff (FIX 8): urllib's `timeout` is the SOCKET-op timeout
@@ -239,6 +259,21 @@ def lambda_handler(event, _context):
     if denied:
         return {"err": denied}
 
+    # B4 r3 shell-load fix (2026-07-06, evidence: scratchpad/repro-evidence.md).
+    # QuestDB 9.3.5 does NOT serve the console shell at "/": it answers an
+    # UNFRAMED keep-alive 301 -> /index.html and never closes the socket, so
+    # any read-until-EOF relay hangs until its socket timeout (GET / had
+    # NEVER returned 200 through this console). Never elicit the 301: fetch
+    # the framed shell directly. /index.html is 200 + Content-Length: 765 in
+    # ~4ms through this exact relay code and itself carries the per-release
+    # hashed asset refs (assets/index-<hash>.js), so nothing drifts on a
+    # QuestDB upgrade. GET-only on purpose: HEAD / keeps relaying verbatim
+    # (QuestDB answers a FRAMED chunked 405 in 1.2ms; HEAD /index.html is
+    # live-unverified — don't change untested behavior). The browser URL
+    # stays "/"; the shell's RELATIVE asset refs resolve identically.
+    if method == "GET" and path == "/":
+        path = "/index.html"
+
     url = QDB_BASE.rstrip("/") + path + (f"?{raw_query}" if raw_query else "")
     req = urllib.request.Request(url, method=method)
     # Forward only `accept` + `content-type` from the browser. `accept-encoding`
@@ -247,21 +282,17 @@ def lambda_handler(event, _context):
         v = in_headers.get(k)
         if v:
             req.add_header(k, str(v))
-    # B4 shell-load fix (2026-07-03, r2). The QuestDB web console SHELL (GET /)
-    # response carries NO length delimiter — no Content-Length, and most
-    # plausibly on-the-fly gzip triggered by the browser's forwarded
-    # `Accept-Encoding: gzip`. With no delimiter, urllib's HTTPResponse.read()
-    # blocks with no EOF until the _TIMEOUT_SECS socket timeout fires, and the
-    # blanket except then converts that read-timeout into a false 503 "offline"
-    # — even though /exec returns a Content-Length'd JSON body in ~4ms through
-    # the SAME box:9000 hop. Two framing-agnostic guards make read() EOF
-    # immediately regardless of gzip / Content-Length:
-    #   (1) `Connection: close` — QuestDB closes the socket AFTER the body, so
-    #       read() gets a clean EOF with no length delimiter (PRIMARY, zero
-    #       downside: one urlopen per Lambda invocation, no keep-alive to lose).
-    #   (2) `Accept-Encoding: identity` — do NOT forward the browser's
-    #       `gzip`; the shell comes back Content-Length'd (uncompressed). It is
-    #       larger on the wire but stays well under the MAX_BODY_BYTES relay cap.
+    # B4 r3 header hygiene (2026-07-06). These two headers are RETAINED as
+    # defense-in-depth ONLY — they are NOT the shell fix. Raw-socket proof
+    # 2026-07-06 (scratchpad/repro-evidence.md §3/§10): QuestDB 9.3.5 does
+    # NOT honor request `Connection: close` on the / 301 (no close after a
+    # 20s recv gap), disproving the r2 theory that the server would EOF the
+    # socket once the body was sent. The actual fixes are (1) the
+    # GET / -> /index.html rewrite above (never elicit the only
+    # delimiter-less response the server produces) and (2) the
+    # _NoFollowRedirect opener + body-less 3xx relay.
+    # `Accept-Encoding: identity` still guarantees Content-Length-framed
+    # uncompressed bodies on framed paths, under the MAX_BODY_BYTES cap.
     req.add_header("Accept-Encoding", "identity")
     req.add_header("Connection", "close")
 
@@ -271,7 +302,7 @@ def lambda_handler(event, _context):
             if over:
                 return {"err": "too_large"}  # → front 502, never 503
             out_headers = {}
-            for k in ("content-type", "content-encoding", "cache-control"):
+            for k in ("content-type", "content-encoding", "cache-control", "location"):
                 v = resp.headers.get(k)
                 if v:
                     out_headers[k] = v
@@ -282,14 +313,20 @@ def lambda_handler(event, _context):
             }
     except urllib.error.HTTPError as exc:
         # QuestDB error responses (e.g. /exec 400 with JSON body) are VALID
-        # console traffic — relay them so the UI shows the real message. Read
-        # with the SAME size-capped incremental reader (no read-then-slice).
-        body, _over = _read_capped(exc)
+        # console traffic — relay them. 3xx is special: with _NoFollowRedirect
+        # installed it lands here WITHOUT a drained body, and it may be
+        # DELIMITER-LESS on a socket QuestDB never closes (the / 301 class) —
+        # reading it would block until _TIMEOUT_SECS. Relay 3xx body-less
+        # (status + Location); the front forwards Location and the browser
+        # follows. Non-3xx errors keep the size-capped incremental read.
         out_headers = {}
-        for k in ("content-type", "content-encoding", "cache-control"):
+        for k in ("content-type", "content-encoding", "cache-control", "location"):
             v = exc.headers.get(k) if exc.headers else None
             if v:
                 out_headers[k] = v
+        if 300 <= int(exc.code) < 400:
+            return {"status": int(exc.code), "headers": out_headers, "body_b64": ""}
+        body, _over = _read_capped(exc)
         return {
             "status": int(exc.code),
             "headers": out_headers,
