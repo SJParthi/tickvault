@@ -510,6 +510,14 @@ fn receipt_ist_nanos() -> i64 {
         .saturating_add(tickvault_common::constants::IST_UTC_OFFSET_NANOS)
 }
 
+/// IST epoch SECONDS "now" — the down-episode clock for the feed-down
+/// alerting latches (operator 2026-07-06). Same clock on the falling and
+/// rising edges, so `down_secs` is a well-formed duration regardless of the
+/// IST offset.
+fn ist_epoch_secs_now() -> u64 {
+    (receipt_ist_nanos() / 1_000_000_000).max(0) as u64
+}
+
 /// Pure liveness-advance decision (2026-07-03 frozen-snapshot masking fix):
 /// returns `true` — and advances `prev_max` — ONLY when the max exchange
 /// timestamp seen this wake is STRICTLY greater than the max ever seen. Feed
@@ -1748,6 +1756,18 @@ pub struct GrowwAuditLatches {
     /// closed-market boot announces exactly once and a genuine reconnect
     /// announces exactly once more.
     pub boot_connect_announced: std::sync::atomic::AtomicBool,
+    /// Feed-down alerting (operator 2026-07-06): a `FeedDown` Telegram was
+    /// consumed for the CURRENT down episode — set once on the FIRST falling
+    /// edge (feed disable / bridge death), cleared only when the streaming
+    /// rising edge fires the honest `FeedRecovered`. Edge-triggered per
+    /// audit-findings Rule 4: one DOWN page per episode, never per idle turn.
+    pub down_announced: std::sync::atomic::AtomicBool,
+    /// IST epoch SECONDS of the FIRST falling edge of the current down
+    /// episode (0 = not down). First-down-wins CAS (mirror of the Dhan
+    /// `record_disconnect` total-downtime semantics) so the recovery's
+    /// `down_secs` spans intermediate retry failures / repeated bridge
+    /// deaths, not just the latest one.
+    pub down_since_epoch_secs: std::sync::atomic::AtomicU64,
 }
 
 impl GrowwAuditLatches {
@@ -1766,6 +1786,46 @@ impl GrowwAuditLatches {
     pub fn rearm_boot_connect(&self) {
         self.boot_connect_announced
             .store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Consume the feed-DOWN falling edge (operator 2026-07-06): stamps the
+    /// episode's first-down instant (first-down-wins CAS — a second falling
+    /// edge inside the same episode keeps the original stamp so `down_secs`
+    /// spans the whole episode) and returns `true` exactly once per DOWN
+    /// episode. The caller fires ONE `FeedDown` Telegram on `true`; repeated
+    /// falling edges (bridge respawn storms, idle disable turns) read `false`
+    /// until [`Self::take_feed_recovery`] closes the episode.
+    pub fn try_announce_feed_down(&self, now_epoch_secs: u64) -> bool {
+        // First-down-wins: only stamp when no episode is in progress (0).
+        let _ = self.down_since_epoch_secs.compare_exchange(
+            0,
+            now_epoch_secs.max(1),
+            std::sync::atomic::Ordering::Relaxed,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        !self
+            .down_announced
+            .swap(true, std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Close the feed-DOWN episode on the STREAMING rising edge: returns
+    /// `Some(down_secs)` exactly once per episode (and re-arms the latch for
+    /// the next episode), `None` when no episode is in progress. The caller
+    /// fires ONE honest `FeedRecovered` Telegram on `Some` — recovery is
+    /// claimed on ticks/streaming, never on mere socket-connect. Call ONLY
+    /// when the Telegram notifier is deliverable: an unfilled boot-ordering
+    /// slot must DEFER (skip the call) so the episode is delayed, never lost.
+    pub fn take_feed_recovery(&self, now_epoch_secs: u64) -> Option<u64> {
+        if !self
+            .down_announced
+            .swap(false, std::sync::atomic::Ordering::Relaxed)
+        {
+            return None;
+        }
+        let since = self
+            .down_since_epoch_secs
+            .swap(0, std::sync::atomic::Ordering::Relaxed);
+        Some(now_epoch_secs.saturating_sub(since))
     }
 }
 
@@ -1983,6 +2043,29 @@ async fn supervise_groww_bridge_loop(
                 // re-arm the boot-connect edge so the respawned bridge
                 // announces the (re)connected socket exactly once.
                 audit_latches.rearm_boot_connect();
+                // Feed-down alerting (operator 2026-07-06): the connected
+                // feed just went DOWN — the previous DB-row-only silence was
+                // the incident class. ONE FeedDown Telegram per DOWN episode
+                // (latched; a respawn storm never re-pages), fail-open when
+                // the lazily-filled slot is still empty at boot ordering
+                // (audit row above is already written; the page is skipped,
+                // never blocks the respawn). Cold path — event-driven, never
+                // per tick. The connected-level gauge drops to 0 so the
+                // CloudWatch inactivity alarm sees the outage too.
+                metrics::gauge!("tv_groww_ws_active").set(0.0);
+                if audit_latches.try_announce_feed_down(ist_epoch_secs_now()) {
+                    if let Some(notifier) = notifier_slot.as_ref().and_then(|slot| slot.load_full())
+                    {
+                        notifier.notify(
+                            tickvault_core::notification::NotificationEvent::FeedDown {
+                                feed: Feed::Groww.display_name().to_string(), // O(1) EXEMPT: cold path — once per DOWN episode
+                                reason: "internal restart — recovering automatically".to_string(), // O(1) EXEMPT: cold path — once per DOWN episode
+                                market_open:
+                                    tickvault_common::market_hours::is_within_market_hours_ist(),
+                            },
+                        );
+                    }
+                }
             }
             error!(
                 code =
@@ -2264,6 +2347,22 @@ pub async fn run_groww_bridge(
     // and the respawned bridge's first rising edge classifies as RECONNECTED, so the
     // forensic chain never reads Connected→Connected with no disconnect between.
 
+    // Groww liveness gauges (operator 2026-07-06 feed-down alerting).
+    // Handles hoisted ONCE before the loop (the O(1)-EXEMPT hoisting pattern
+    // the Dhan connection read loop uses) — static &'static str labels, zero
+    // per-wake allocation. Published from THIS loop (≤1s wake cadence)
+    // because the Dhan pool watchdog is Dhan-lane-spawned and never runs on
+    // a groww-only boot.
+    // - `tv_groww_ws_active`: CONNECTED-level 0/1 (socket connected +
+    //   subscribed OR streaming) — connected-level so the pre-open
+    //   08:30→first-tick window does not page the inactivity alarm daily
+    //   (mirrors tv_order_update_ws_active semantics).
+    // - `tv_feed_last_tick_age_seconds{feed="groww"}`: seconds since the
+    //   feed's most-recent tick; SKIPPED (never a fake 0) until the first
+    //   tick of the session so missing-data + notBreaching stays silent.
+    let m_groww_active = metrics::gauge!("tv_groww_ws_active");
+    let m_groww_tick_age = metrics::gauge!("tv_feed_last_tick_age_seconds", "feed" => "groww");
+
     loop {
         // Wake on EITHER a filesystem event (zero-latency) OR the fallback timer.
         // The fallback also re-polls the status file (cheap) so a `subscribed`/
@@ -2309,7 +2408,8 @@ pub async fn run_groww_bridge(
                 .audited_connected
                 .load(std::sync::atomic::Ordering::Relaxed)
             {
-                let kind = if tickvault_common::market_hours::is_within_market_hours_ist() {
+                let in_market = tickvault_common::market_hours::is_within_market_hours_ist();
+                let kind = if in_market {
                     WsEventKind::Disconnected
                 } else {
                     WsEventKind::DisconnectedOffHours
@@ -2323,6 +2423,26 @@ pub async fn run_groww_bridge(
                 audit_latches
                     .prior_disconnect
                     .store(true, std::sync::atomic::Ordering::Relaxed);
+                // Feed-down alerting (operator 2026-07-06): the connected
+                // feed just went DOWN — the previous DB-row-only silence was
+                // the incident class. ONE FeedDown Telegram per DOWN episode
+                // (latched; repeat idle disable turns never re-page).
+                // Fail-open on an unfilled boot-ordering notifier slot: the
+                // audit row above is already written, the latch is still
+                // set, only the page is skipped — the disable path is never
+                // blocked. Cold path — event-driven, never per tick.
+                if audit_latches.try_announce_feed_down(ist_epoch_secs_now()) {
+                    if let Some(notifier) = notifier_slot.as_ref().and_then(|slot| slot.load_full())
+                    {
+                        notifier.notify(
+                            tickvault_core::notification::NotificationEvent::FeedDown {
+                                feed: Feed::Groww.display_name().to_string(), // O(1) EXEMPT: cold path — once per DOWN episode
+                                reason: "feed switched off by the operator".to_string(), // O(1) EXEMPT: cold path — once per DOWN episode
+                                market_open: in_market,
+                            },
+                        );
+                    }
+                }
             }
             audit_latches
                 .audited_connected
@@ -2333,6 +2453,11 @@ pub async fn run_groww_bridge(
             audit_latches.rearm_boot_connect();
             connect_logged = false;
             streaming_observed = false;
+            // Connected-level gauge drops to 0 while disabled so the
+            // CloudWatch inactivity alarm sees the outage (operator
+            // 2026-07-06). The tick-age gauge keeps its honest last value —
+            // no fake publish while idle.
+            m_groww_active.set(0.0);
             continue;
         }
 
@@ -2471,6 +2596,54 @@ pub async fn run_groww_bridge(
             audit_latches
                 .prior_disconnect
                 .store(false, std::sync::atomic::Ordering::Relaxed);
+        }
+
+        // FeedRecovered (operator 2026-07-06): close the DOWN episode ONCE,
+        // on the STREAMING rising edge only — recovery is claimed on ticks /
+        // the sidecar's own streaming status, never on mere socket-connect
+        // (the boot-connect ping above keeps saying "awaiting first tick").
+        // Deliberately OUTSIDE the `audited_connected` gate: if the lazily-
+        // filled Telegram slot is not deliverable yet (boot ordering), the
+        // episode latch is NOT consumed and the next ≤1s wake retries —
+        // delayed, never lost.
+        if streaming_observed
+            && audit_latches
+                .down_announced
+                .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            let notifier = notifier_slot.as_ref().and_then(|slot| slot.load_full());
+            let notifier_ready = match notifier_slot.as_ref() {
+                None => true, // no Telegram wiring (tests) — consume silently
+                Some(_) => notifier.is_some(),
+            };
+            if notifier_ready {
+                if let Some(down_secs) = audit_latches.take_feed_recovery(ist_epoch_secs_now()) {
+                    if let Some(notifier) = notifier {
+                        notifier.notify(
+                            tickvault_core::notification::NotificationEvent::FeedRecovered {
+                                feed: Feed::Groww.display_name().to_string(), // O(1) EXEMPT: cold path — once per DOWN-episode recovery
+                                down_secs,
+                            },
+                        );
+                    }
+                }
+            }
+        }
+
+        // Groww liveness gauges (operator 2026-07-06): published every wake
+        // (≤1s cadence, cold path, handles hoisted before the loop).
+        // Connected-level active bit — 1 while the connected episode holds
+        // (socket connected + subscribed OR streaming), 0 otherwise — so the
+        // pre-open 08:30→first-tick window never pages the inactivity alarm.
+        let connected_episode = streaming_observed
+            || audit_latches
+                .boot_connect_announced
+                .load(std::sync::atomic::Ordering::Relaxed);
+        m_groww_active.set(if connected_episode { 1.0 } else { 0.0 });
+        // Tick age: SKIP (never a fake 0) until the first tick of the
+        // session — missing data + the alarm's notBreaching stays silent.
+        if let Some(age) = feed_health.last_tick_age_secs(Feed::Groww, receipt_ist_nanos()) {
+            m_groww_tick_age.set(age as f64);
         }
     }
 }
@@ -3283,10 +3456,12 @@ mod tests {
         let disable_idx = src
             .find("if !feed_runtime.is_enabled(Feed::Groww) {")
             .expect("disable branch present");
-        // Window widened (PR-10, then 2026-07-02 M3 atomic-latch expansion) to
-        // span the ws_event_audit falling-edge emit block — the latch re-arm
-        // lives just below it.
-        let after = &src[disable_idx..disable_idx + 2600];
+        // Window widened (PR-10, then 2026-07-02 M3 atomic-latch expansion,
+        // then 2026-07-06 feed-down alerting: the latched FeedDown Telegram
+        // emit now lives inside the falling-edge block) to span the
+        // ws_event_audit + FeedDown emit blocks — the latch re-arm lives
+        // just below them.
+        let after = &src[disable_idx..disable_idx + 4200];
         assert!(
             after.contains(&clear)
                 && after.contains("connect_logged = false")
@@ -3411,6 +3586,63 @@ mod tests {
             "post-disconnect subscribe must announce once more"
         );
         assert!(!latches.try_announce_boot_connect(), "and only once");
+    }
+
+    #[test]
+    fn test_try_announce_feed_down_fires_once_per_episode() {
+        // Feed-down alerting (operator 2026-07-06): ONE FeedDown page per
+        // DOWN episode — repeated falling edges (idle disable turns, bridge
+        // respawn storms) must never re-page (audit-findings Rule 4).
+        let latches = GrowwAuditLatches::default();
+        assert!(
+            latches.try_announce_feed_down(1_000),
+            "first falling edge announces"
+        );
+        for _ in 0..10 {
+            assert!(
+                !latches.try_announce_feed_down(1_050),
+                "subsequent falling edges must NEVER re-announce (spam trap)"
+            );
+        }
+        // First-down-wins: the episode stamp stays at the FIRST edge so
+        // down_secs spans the whole episode, not just the latest death.
+        assert_eq!(
+            latches
+                .down_since_epoch_secs
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1_000
+        );
+    }
+
+    #[test]
+    fn test_take_feed_recovery_returns_down_secs_and_rearms() {
+        // Rising edge closes the episode ONCE (down_secs from the FIRST
+        // falling edge), then the next falling edge opens a fresh episode.
+        let latches = GrowwAuditLatches::default();
+        assert!(latches.try_announce_feed_down(1_000));
+        assert_eq!(latches.take_feed_recovery(1_154), Some(154));
+        assert_eq!(
+            latches.take_feed_recovery(1_155),
+            None,
+            "episode already closed — recovery fires once"
+        );
+        assert!(
+            latches.try_announce_feed_down(2_000),
+            "next falling edge opens a fresh episode"
+        );
+        assert_eq!(latches.take_feed_recovery(2_010), Some(10));
+    }
+
+    #[test]
+    fn test_take_feed_recovery_none_when_not_down() {
+        // No episode in progress → no recovery Telegram (no false-positive
+        // "streaming again" on a normal first connect).
+        let latches = GrowwAuditLatches::default();
+        assert_eq!(latches.take_feed_recovery(1_000), None);
+        // A clock stamped 0 at the falling edge is clamped to 1, so the
+        // recovery duration never reads as the "not down" sentinel.
+        assert!(latches.try_announce_feed_down(0));
+        assert_eq!(latches.take_feed_recovery(5), Some(4));
     }
 
     #[test]
