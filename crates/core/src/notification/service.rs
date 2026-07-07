@@ -24,7 +24,7 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use secrecy::{ExposeSecret, SecretString};
 use tracing::{error, info, instrument, warn};
@@ -39,7 +39,16 @@ use crate::auth::secret_manager::{
     build_ssm_path, create_ssm_client, fetch_secret, resolve_environment,
 };
 
-use super::coalescer::{CoalesceDecision, CoalescerConfig, DrainedSummary, TelegramCoalescer};
+use super::coalescer::{
+    CoalesceDecision, CoalescerConfig, DispatchLane, DrainedSummary, TelegramCoalescer,
+    classify_dispatch, effective_drain_window, render_digest, should_force_drain,
+};
+use super::episode::{
+    EPISODE_EDIT_FAILURES_FALLBACK_THRESHOLD, EpisodeAction, EpisodeConfig, EpisodeKey,
+    EpisodePhase, EpisodeRegistry, EpisodeRenderCtx, episode_snapshot, fnv1a_hash,
+    render_episode_first_page, render_episode_recovered, render_episode_recovering,
+    render_episode_steady,
+};
 use super::events::{NotificationEvent, Severity};
 
 // ---------------------------------------------------------------------------
@@ -80,23 +89,35 @@ pub struct NotificationService {
     /// Wave 3-B Item 11: optional Telegram bucket-coalescer.
     ///
     /// `None` means coalescing is disabled (legacy passthrough — every event
-    /// is sent immediately). `Some(...)` means Severity::Low and Severity::Info
+    /// is sent immediately). `Some(...)` means Severity::Medium/Low/Info
     /// events are folded into per-`(topic, severity)` windows; Critical /
-    /// High / Medium always bypass.
+    /// High always bypass (2026-07-07 UX overhaul re-routed Medium).
     ///
     /// Wired via `enable_coalescer()` after `initialize()` based on the
     /// `features.telegram_bucket_coalescer` config flag.
     coalescer: Option<Arc<TelegramCoalescer>>,
+    /// Telegram UX Overhaul (2026-07-07): episode live-edit kill switch.
+    /// `false` → `episode_key()` consultation is a no-op and dispatch is
+    /// byte-identical to legacy. Sourced from `[notification] episode_mode`.
+    episode_mode: bool,
+    /// One live bubble per (family, conn) incident — cold-path registry.
+    episodes: Arc<EpisodeRegistry>,
+    /// Best-effort snapshot writer channel (advisory episodes file).
+    /// `None` in NoOp mode / when episode_mode is off.
+    episode_store_tx: Option<tokio::sync::mpsc::Sender<String>>,
 }
 
 impl NotificationService {
     /// Internal helper — every constructor funnels through here so the
-    /// `coalescer` field default is in one place. Adding a new field to
-    /// the struct requires updating only this method.
+    /// field defaults live in one place. Adding a new field to the struct
+    /// requires updating only this method.
     fn build(mode: NotificationMode) -> Self {
         Self {
             mode,
             coalescer: None,
+            episode_mode: true,
+            episodes: Arc::new(EpisodeRegistry::new()),
+            episode_store_tx: None,
         }
     }
 
@@ -223,14 +244,24 @@ impl NotificationService {
             "notification service initialized — Telegram active"
         );
 
-        Arc::new(Self::build(NotificationMode::Active {
+        let mut service = Self::build(NotificationMode::Active {
             bot_token,
             chat_id,
             http_client,
             telegram_api_base_url: config.telegram_api_base_url.clone(),
             sns_client,
             sns_phone_number,
-        }))
+        });
+        // Telegram UX Overhaul (2026-07-07): episode live-edit machinery —
+        // kill switch + best-effort snapshot rehydrate/persist. Fail-open:
+        // NOTHING here can gate boot or any notify().
+        service.episode_mode = config.episode_mode;
+        if config.episode_mode {
+            let store_path = std::path::PathBuf::from(EPISODE_STORE_PATH);
+            rehydrate_episodes(&service.episodes, &store_path).await;
+            service.episode_store_tx = Some(spawn_episode_store_writer(store_path));
+        }
+        Arc::new(service)
     }
 
     /// Creates a disabled no-op instance.
@@ -316,6 +347,18 @@ impl NotificationService {
                 sns_phone_number,
             } => {
                 let severity = event.severity();
+                // Telegram UX Overhaul (2026-07-07): WS lifecycle storms
+                // fold into ONE live-edited episode bubble. Consulted
+                // BEFORE the coalescer branch (wiring-guard pinned).
+                // `episode_key()` is a zero-alloc Copy match, so the
+                // non-episode fast path pays one comparison only.
+                if self.episode_mode && event.episode_key().is_some() {
+                    let svc = Arc::clone(self);
+                    tokio::spawn(async move {
+                        svc.dispatch_episode_event(event).await;
+                    });
+                    return;
+                }
                 // UX fix 2026-04-17: prefix every Telegram message with a
                 // severity tag + emoji so the operator can visually scan
                 // a long chat list and pick out incidents at a glance.
@@ -330,24 +373,23 @@ impl NotificationService {
                 // Parthiban on 2026-05-03 (drain re-prepended the tag).
                 let body = event.to_message();
 
-                // 2026-05-09: dispatch policy is now decoupled from
-                // severity. Boot-success events (Auth/Instruments/PoolOnline/
-                // Phase2Complete) carry `Severity::Low` (green ✅) AND
-                // `DispatchPolicy::Immediate` so they ship immediately AND
-                // render green. See `DispatchPolicy` doc in events.rs for
-                // the rationale (operator complaint 2026-05-09).
-                let force_immediate = matches!(
+                // 2026-07-07 UX overhaul: the lane decision is the pure
+                // `classify_dispatch` — DispatchPolicy::Immediate always
+                // wins (green boot pings unchanged, operator complaint
+                // 2026-05-09); Critical/High NEVER batch; Medium/Low/Info
+                // batch into the in-market digest window or the legacy
+                // off-hours 60s coalescer. `episode` is None here — episode
+                // events already returned above (or episode_mode is off,
+                // the legacy rollback path).
+                let lane = classify_dispatch(
+                    severity,
                     event.dispatch_policy(),
-                    super::events::DispatchPolicy::Immediate
+                    None,
+                    tickvault_common::market_hours::is_within_market_hours_ist(),
                 );
-
-                // Wave 3-B Item 11: bucket-coalesce Severity::Low and
-                // Severity::Info events UNLESS the event explicitly
-                // requested `DispatchPolicy::Immediate`. Bypass for
-                // Critical/High/Medium remains driven by severity inside
-                // the coalescer's `observe` (we don't even call it when
-                // `force_immediate` is set).
-                if !force_immediate && let Some(coalescer) = self.coalescer.as_ref() {
+                if matches!(lane, DispatchLane::Digest | DispatchLane::Coalesce60)
+                    && let Some(coalescer) = self.coalescer.as_ref()
+                {
                     let decision = coalescer.observe(topic, severity, || body.clone());
                     if matches!(decision, CoalesceDecision::Coalesced) {
                         metrics::counter!(
@@ -499,6 +541,12 @@ impl NotificationService {
             let client = http_client.clone();
             let base_url = telegram_api_base_url.clone();
             let interval = config.flush_interval;
+            // 2026-07-07 UX overhaul: the SAME drain ticker also owns the
+            // episode stability promotion (Recovering → green close) and
+            // the market-phase digest window + 15:30 IST close force-drain.
+            let episodes = Arc::clone(&service.episodes);
+            let store_tx = service.episode_store_tx.clone();
+            let episode_mode = service.episode_mode;
 
             tokio::spawn(async move {
                 let mut ticker = tokio::time::interval(interval);
@@ -506,13 +554,45 @@ impl NotificationService {
                 // Skip the immediate first tick so we don't try to drain
                 // an empty coalescer right after spawn.
                 ticker.tick().await;
+                let mut prev_in_market =
+                    tickvault_common::market_hours::is_within_market_hours_ist();
                 loop {
                     ticker.tick().await;
-                    let summaries = drain_coalescer.drain_mature();
+                    if episode_mode {
+                        run_episode_tick(
+                            &episodes,
+                            &client,
+                            &base_url,
+                            &token,
+                            &chat_id,
+                            store_tx.as_ref(),
+                        )
+                        .await;
+                    }
+                    let now_in_market =
+                        tickvault_common::market_hours::is_within_market_hours_ist();
+                    let force = should_force_drain(prev_in_market, now_in_market);
+                    let window = effective_drain_window(now_in_market, &config);
+                    prev_in_market = now_in_market;
+                    let summaries = if force {
+                        // Market-close boundary — no digest straddles
+                        // overnight (robustness graft).
+                        drain_coalescer.drain_all()
+                    } else {
+                        drain_coalescer.drain_mature_with_window(window)
+                    };
                     if summaries.is_empty() {
                         continue;
                     }
-                    deliver_summaries(&client, &base_url, &token, &chat_id, summaries).await;
+                    deliver_drained(
+                        &client,
+                        &base_url,
+                        &token,
+                        &chat_id,
+                        summaries,
+                        now_in_market || force,
+                    )
+                    .await;
                 }
             });
         }
@@ -537,6 +617,388 @@ impl NotificationService {
                 );
                 arc
             }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Telegram UX Overhaul (2026-07-07) — episode live-edit dispatch
+    // -----------------------------------------------------------------------
+
+    /// Test/observability accessor — the live episode registry.
+    #[must_use]
+    pub fn episode_registry(&self) -> &Arc<EpisodeRegistry> {
+        &self.episodes
+    }
+
+    /// Returns `true` when the episode live-edit lane is on.
+    #[must_use]
+    pub fn episode_mode_enabled(&self) -> bool {
+        self.episode_mode
+    }
+
+    /// Fallback for boots where the coalescer drain ticker is DISABLED
+    /// (`features.telegram_bucket_coalescer = false`): spawns a tiny ticker
+    /// that owns the episode stability promotion (Recovering → green
+    /// close). No-op when the coalescer is wired (its drain loop already
+    /// ticks the registry) or in NoOp mode.
+    pub fn spawn_episode_ticker(service: &Arc<Self>) {
+        if !service.episode_mode || service.coalescer.is_some() {
+            return;
+        }
+        let NotificationMode::Active {
+            bot_token,
+            chat_id,
+            http_client,
+            telegram_api_base_url,
+            ..
+        } = &service.mode
+        else {
+            return;
+        };
+        let episodes = Arc::clone(&service.episodes);
+        let store_tx = service.episode_store_tx.clone();
+        let token = bot_token.clone();
+        let chat_id = chat_id.clone();
+        let client = http_client.clone();
+        let base_url = telegram_api_base_url.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(
+                super::coalescer::DEFAULT_FLUSH_INTERVAL_SECS,
+            ));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            ticker.tick().await;
+            loop {
+                ticker.tick().await;
+                run_episode_tick(
+                    &episodes,
+                    &client,
+                    &base_url,
+                    &token,
+                    &chat_id,
+                    store_tx.as_ref(),
+                )
+                .await;
+            }
+        });
+    }
+
+    /// Graceful-shutdown flush (robustness graft, bounded 10s): drains
+    /// every pending coalescer bucket, delivers the summaries, then writes
+    /// a final synchronous episode snapshot. Wired into the main.rs
+    /// shutdown teardown.
+    pub async fn shutdown_flush(&self) {
+        let flush = async {
+            if let NotificationMode::Active {
+                bot_token,
+                chat_id,
+                http_client,
+                telegram_api_base_url,
+                ..
+            } = &self.mode
+            {
+                if let Some(coalescer) = self.coalescer.as_ref() {
+                    let summaries = coalescer.drain_all();
+                    if !summaries.is_empty() {
+                        deliver_summaries(
+                            http_client,
+                            telegram_api_base_url,
+                            bot_token,
+                            chat_id,
+                            summaries,
+                        )
+                        .await;
+                    }
+                }
+                // Final synchronous snapshot — only when the persistence
+                // writer was wired at initialize (keeps tests + ad-hoc
+                // services from writing files).
+                if self.episode_mode && self.episode_store_tx.is_some() {
+                    let json = episode_snapshot::encode(&self.episodes.snapshot());
+                    write_episode_store(std::path::Path::new(EPISODE_STORE_PATH), &json).await;
+                }
+            }
+        };
+        if tokio::time::timeout(Duration::from_secs(SHUTDOWN_FLUSH_TIMEOUT_SECS), flush)
+            .await
+            .is_err()
+        {
+            error!(
+                target: "notification",
+                code = tickvault_common::error_code::ErrorCode::Telegram01Dropped.code_str(),
+                "TELEGRAM-01: shutdown flush timed out — pending coalesced summaries may be lost"
+            );
+        }
+    }
+
+    /// Enqueues a best-effort episode snapshot write (debounced writer
+    /// task). A busy writer skips this snapshot — the next mutation
+    /// re-enqueues; the shutdown flush writes synchronously.
+    fn persist_episodes(&self) {
+        if let Some(tx) = self.episode_store_tx.as_ref() {
+            let json = episode_snapshot::encode(&self.episodes.snapshot());
+            if let Err(err) = tx.try_send(json) {
+                // Best-effort by design: a full channel just skips this
+                // debounce slot (the write itself logs error! on failure).
+                tracing::debug!(error = %err, "episode snapshot enqueue skipped (writer busy)");
+            }
+        }
+    }
+
+    /// The episode dispatch shell — the ONLY caller of the Telegram
+    /// edit-message transport for live events (wiring-guard pinned; the
+    /// drain ticker's `run_episode_tick` owns the green close edits).
+    ///
+    /// Never drops: every action either edits the live bubble or falls
+    /// back to a fresh send; every terminal transport failure fires the
+    /// EXISTING TELEGRAM-01 error! + counter.
+    async fn dispatch_episode_event(self: Arc<Self>, event: NotificationEvent) {
+        let NotificationMode::Active {
+            bot_token,
+            chat_id,
+            http_client,
+            telegram_api_base_url,
+            sns_client,
+            sns_phone_number,
+        } = &self.mode
+        else {
+            return;
+        };
+        let Some(key) = event.episode_key() else {
+            return;
+        };
+        let role = event.episode_role();
+        let severity = event.severity();
+        let attempts_hint = episode_attempts_hint(&event);
+        let now_ms = epoch_ms_now();
+        let cfg = EpisodeConfig::default();
+        let decision = self
+            .episodes
+            .apply_event(key, role, severity, attempts_hint, now_ms, &cfg);
+
+        match decision.action {
+            EpisodeAction::Ignore => {
+                // Resolve for an episode we never tracked — nothing
+                // degraded to announce, nothing to edit. (Reachable only
+                // for Medium/Low recovery events; the proptest pins that
+                // High/Critical Open/Progress can never land here.)
+            }
+            EpisodeAction::SendFirstPage => {
+                metrics::counter!(
+                    "tv_telegram_dispatched_total",
+                    "severity" => severity.as_label(),
+                    "coalesced" => "false",
+                )
+                .increment(1);
+                metrics::counter!("tv_telegram_episode_events_total", "action" => "open")
+                    .increment(1);
+                let page = render_episode_first_page(&event.to_message());
+                let message = format!("{} {}", telegram_message_prefix(severity), page);
+                let (ok, msg_id) = send_telegram_chunk_with_retry_returning_id(
+                    http_client,
+                    telegram_api_base_url,
+                    bot_token,
+                    chat_id,
+                    &message,
+                )
+                .await;
+                if ok {
+                    self.episodes.record_sent(key, msg_id, now_ms);
+                } else {
+                    // Terminal transport failure — identical loudness to
+                    // the legacy path. The episode keeps message_id=None so
+                    // the NEXT event retries via SendNewFallback.
+                    metrics::counter!(
+                        "tv_telegram_dropped_total",
+                        "reason" => "send_failed",
+                    )
+                    .increment(1);
+                    error!(
+                        target: "notification",
+                        code = tickvault_common::error_code::ErrorCode::Telegram01Dropped.code_str(),
+                        topic = event.topic(),
+                        severity = severity.as_label(),
+                        "TELEGRAM-01: episode first page delivery failed — operator alerts MAY be missed"
+                    );
+                }
+                // SNS-SMS leg rides the FIRST page exactly once per episode
+                // open (severity routing contract unchanged).
+                if severity >= Severity::High
+                    && let (Some(sns), Some(phone)) = (sns_client, sns_phone_number)
+                {
+                    let sms_text = strip_html_tags(&message);
+                    send_sns_sms(sns, phone, &sms_text).await;
+                }
+                self.persist_episodes();
+            }
+            EpisodeAction::EditThrottled => {
+                // Counters folded — the next eligible edit carries them.
+                metrics::counter!(
+                    "tv_telegram_episode_events_total",
+                    "action" => "edit_throttled",
+                )
+                .increment(1);
+                self.persist_episodes();
+            }
+            EpisodeAction::Edit { message_id, .. } => {
+                let ctx = EpisodeRenderCtx { now_ms };
+                let rendered = match decision.state.phase {
+                    EpisodePhase::Recovering => render_episode_recovering(&decision.state, &ctx),
+                    EpisodePhase::Down => render_episode_steady(&decision.state, &ctx),
+                };
+                let text = format!(
+                    "{} {}",
+                    telegram_message_prefix(decision.state.severity_peak),
+                    rendered
+                );
+                let hash = fnv1a_hash(&text);
+                if hash == self.episodes.last_render_hash(key) {
+                    // Byte-identical render — a network edit would 400
+                    // "message is not modified"; skip it entirely.
+                    metrics::counter!(
+                        "tv_telegram_episode_events_total",
+                        "action" => "edit_throttled",
+                    )
+                    .increment(1);
+                    return;
+                }
+                if decision.reopened {
+                    metrics::counter!(
+                        "tv_telegram_episode_events_total",
+                        "action" => "reopen",
+                    )
+                    .increment(1);
+                }
+                match edit_telegram_message_with_retry(
+                    http_client,
+                    telegram_api_base_url,
+                    bot_token,
+                    chat_id,
+                    message_id,
+                    &text,
+                )
+                .await
+                {
+                    EditOutcome::Applied | EditOutcome::NotModifiedNoop => {
+                        self.episodes.record_edit_applied(key, now_ms, hash);
+                        metrics::counter!(
+                            "tv_telegram_episode_events_total",
+                            "action" => "edit",
+                        )
+                        .increment(1);
+                    }
+                    EditOutcome::Fallback => {
+                        // Message gone (>48h, operator-deleted) — fresh
+                        // bubble, duplicate-over-drop.
+                        self.episode_fallback_send(key, &text, "not_found", now_ms)
+                            .await;
+                    }
+                    EditOutcome::Transient => {
+                        let failures = self.episodes.record_edit_failure(key);
+                        if failures >= EPISODE_EDIT_FAILURES_FALLBACK_THRESHOLD {
+                            self.episode_fallback_send(key, &text, "transient_exhausted", now_ms)
+                                .await;
+                        }
+                    }
+                }
+                self.persist_episodes();
+            }
+            EpisodeAction::SendNewFallback => {
+                // The first page never landed (send failed or the id was
+                // unparseable) — send fresh; the explanation paragraph is
+                // re-sent ONLY if it never went out.
+                metrics::counter!(
+                    "tv_telegram_dispatched_total",
+                    "severity" => severity.as_label(),
+                    "coalesced" => "false",
+                )
+                .increment(1);
+                metrics::counter!("tv_telegram_episode_events_total", "action" => "open")
+                    .increment(1);
+                let ctx = EpisodeRenderCtx { now_ms };
+                let body = if decision.state.explained {
+                    render_episode_steady(&decision.state, &ctx)
+                } else {
+                    render_episode_first_page(&event.to_message())
+                };
+                let message = format!("{} {}", telegram_message_prefix(severity), body);
+                let (ok, msg_id) = send_telegram_chunk_with_retry_returning_id(
+                    http_client,
+                    telegram_api_base_url,
+                    bot_token,
+                    chat_id,
+                    &message,
+                )
+                .await;
+                if ok {
+                    self.episodes.record_sent(key, msg_id, now_ms);
+                } else {
+                    metrics::counter!(
+                        "tv_telegram_dropped_total",
+                        "reason" => "send_failed",
+                    )
+                    .increment(1);
+                    error!(
+                        target: "notification",
+                        code = tickvault_common::error_code::ErrorCode::Telegram01Dropped.code_str(),
+                        topic = event.topic(),
+                        severity = severity.as_label(),
+                        "TELEGRAM-01: episode fallback send failed — operator alerts MAY be missed"
+                    );
+                }
+                self.persist_episodes();
+            }
+        }
+    }
+
+    /// The edit-failure fallback rung: send a FRESH bubble carrying the
+    /// same render, replace the episode's message id, count the reason.
+    /// Duplicate-over-drop — a noisier chat beats a silent one.
+    async fn episode_fallback_send(
+        &self,
+        key: EpisodeKey,
+        text: &str,
+        reason: &'static str,
+        now_ms: u64,
+    ) {
+        let NotificationMode::Active {
+            bot_token,
+            chat_id,
+            http_client,
+            telegram_api_base_url,
+            ..
+        } = &self.mode
+        else {
+            return;
+        };
+        metrics::counter!("tv_telegram_edit_fallback_total", "reason" => reason).increment(1);
+        error!(
+            target: "notification",
+            code = tickvault_common::error_code::ErrorCode::Telegram03EpisodeDegraded.code_str(),
+            reason = "edit_fallback_storm",
+            fallback_cause = reason,
+            "TELEGRAM-03: episode bubble edit rejected — sending a fresh bubble (duplicate-over-drop)"
+        );
+        let (ok, msg_id) = send_telegram_chunk_with_retry_returning_id(
+            http_client,
+            telegram_api_base_url,
+            bot_token,
+            chat_id,
+            text,
+        )
+        .await;
+        if ok {
+            self.episodes.replace_message_id(key, msg_id, now_ms);
+        } else {
+            metrics::counter!(
+                "tv_telegram_dropped_total",
+                "reason" => "send_failed",
+            )
+            .increment(1);
+            error!(
+                target: "notification",
+                code = tickvault_common::error_code::ErrorCode::Telegram01Dropped.code_str(),
+                "TELEGRAM-01: episode fallback send failed after edit rejection — operator alerts MAY be missed"
+            );
         }
     }
 }
@@ -615,6 +1077,232 @@ async fn deliver_summaries(
                 "TELEGRAM-01: coalesced summary delivery failed for some chunks — operator alerts MAY be missed"
             );
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Telegram UX Overhaul (2026-07-07) — episode + digest plumbing
+// ---------------------------------------------------------------------------
+
+/// Advisory episode snapshot file — best-effort, fail-open. NOT a QuestDB
+/// surface; stale/corrupt files are ignored at rehydrate.
+pub(crate) const EPISODE_STORE_PATH: &str = "data/notify/episodes.json";
+
+/// Bound on the graceful-shutdown flush (drain + deliver + store write).
+pub(crate) const SHUTDOWN_FLUSH_TIMEOUT_SECS: u64 = 10;
+
+/// Episode snapshot writer channel depth (best-effort debounce buffer).
+const EPISODE_STORE_CHANNEL_CAPACITY: usize = 8;
+
+/// Debounce between consecutive snapshot writes (≤ 1 write/sec).
+const EPISODE_STORE_DEBOUNCE_MS: u64 = 1000;
+
+/// Wall-clock epoch milliseconds (shell-side only — the pure episode core
+/// never reads a clock).
+fn epoch_ms_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Today's IST calendar date (rehydrate same-day bound).
+fn today_ist_date() -> chrono::NaiveDate {
+    let offset = chrono::FixedOffset::east_opt(tickvault_common::constants::IST_UTC_OFFSET_SECONDS);
+    match offset {
+        Some(o) => chrono::Utc::now().with_timezone(&o).date_naive(),
+        None => chrono::Utc::now().date_naive(),
+    }
+}
+
+/// Reconnect-attempt context carried by recovery events (0 = unknown).
+fn episode_attempts_hint(event: &NotificationEvent) -> u32 {
+    match event {
+        NotificationEvent::WebSocketReconnected { attempts, .. } => *attempts,
+        NotificationEvent::OrderUpdateReconnected {
+            consecutive_failures,
+        } => *consecutive_failures,
+        _ => 0,
+    }
+}
+
+/// Spawns the debounced snapshot writer task (prev-close writer pattern:
+/// dedicated task owns the file I/O; the dispatch path only enqueues).
+fn spawn_episode_store_writer(path: std::path::PathBuf) -> tokio::sync::mpsc::Sender<String> {
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(EPISODE_STORE_CHANNEL_CAPACITY);
+    tokio::spawn(async move {
+        while let Some(mut json) = rx.recv().await {
+            // Coalesce any queued newer snapshots — write the latest only.
+            while let Ok(newer) = rx.try_recv() {
+                json = newer;
+            }
+            write_episode_store(&path, &json).await;
+            tokio::time::sleep(Duration::from_millis(EPISODE_STORE_DEBOUNCE_MS)).await;
+        }
+    });
+    tx
+}
+
+/// Writes the snapshot file. Failure → error! TELEGRAM-03
+/// (`store_write_failed`) — in-memory episodes keep working; only the
+/// cross-restart bubble linkage degrades.
+async fn write_episode_store(path: &std::path::Path, json: &str) {
+    if let Some(parent) = path.parent()
+        && let Err(err) = tokio::fs::create_dir_all(parent).await
+    {
+        error!(
+            target: "notification",
+            code = tickvault_common::error_code::ErrorCode::Telegram03EpisodeDegraded.code_str(),
+            reason = "store_write_failed",
+            error = %err,
+            "TELEGRAM-03: episode snapshot directory create failed — cross-restart bubble linkage degraded"
+        );
+        return;
+    }
+    if let Err(err) = tokio::fs::write(path, json).await {
+        error!(
+            target: "notification",
+            code = tickvault_common::error_code::ErrorCode::Telegram03EpisodeDegraded.code_str(),
+            reason = "store_write_failed",
+            error = %err,
+            "TELEGRAM-03: episode snapshot write failed — cross-restart bubble linkage degraded"
+        );
+    }
+}
+
+/// Boot-time rehydrate — fail-open, never gates boot. Corrupt JSON →
+/// error! TELEGRAM-03 (`rehydrate_corrupt`) + empty registry.
+async fn rehydrate_episodes(episodes: &EpisodeRegistry, path: &std::path::Path) {
+    let Ok(json) = tokio::fs::read_to_string(path).await else {
+        // No file yet — fresh start, nothing to report.
+        return;
+    };
+    if !json.trim().is_empty() && serde_json::from_str::<serde_json::Value>(&json).is_err() {
+        error!(
+            target: "notification",
+            code = tickvault_common::error_code::ErrorCode::Telegram03EpisodeDegraded.code_str(),
+            reason = "rehydrate_corrupt",
+            "TELEGRAM-03: episode snapshot is corrupt — starting with an empty registry (a live outage opens one fresh duplicate bubble)"
+        );
+        return;
+    }
+    let entries = episode_snapshot::decode(&json, epoch_ms_now(), today_ist_date());
+    episodes.rehydrate(entries);
+}
+
+/// The drain-ticker half of the episode machinery: promotes stable
+/// `Recovering` episodes to CLOSED and issues the final green close edit
+/// on each closed bubble. Close-edit failures fall back to a fresh green
+/// line (duplicate-over-drop) and terminal failures keep TELEGRAM-01
+/// loudness.
+pub(crate) async fn run_episode_tick(
+    episodes: &EpisodeRegistry,
+    client: &reqwest::Client,
+    base_url: &str,
+    token: &SecretString,
+    chat_id: &str,
+    store_tx: Option<&tokio::sync::mpsc::Sender<String>>,
+) {
+    let now_ms = epoch_ms_now();
+    let cfg = EpisodeConfig::default();
+    let closed = episodes.tick(now_ms, &cfg);
+    if closed.is_empty() {
+        return;
+    }
+    for st in &closed {
+        let Some(message_id) = st.message_id else {
+            continue;
+        };
+        let ctx = EpisodeRenderCtx { now_ms };
+        let text = format!(
+            "{} {}",
+            telegram_message_prefix(Severity::Low),
+            render_episode_recovered(st, &ctx)
+        );
+        metrics::counter!("tv_telegram_episode_events_total", "action" => "close").increment(1);
+        match edit_telegram_message_with_retry(client, base_url, token, chat_id, message_id, &text)
+            .await
+        {
+            EditOutcome::Applied | EditOutcome::NotModifiedNoop => {}
+            EditOutcome::Fallback | EditOutcome::Transient => {
+                // The episode is already closed in the registry — send the
+                // green line fresh so the recovery is never silent.
+                metrics::counter!(
+                    "tv_telegram_edit_fallback_total",
+                    "reason" => "not_found",
+                )
+                .increment(1);
+                let ok =
+                    send_telegram_chunk_with_retry(client, base_url, token, chat_id, &text).await;
+                if !ok {
+                    metrics::counter!(
+                        "tv_telegram_dropped_total",
+                        "reason" => "send_failed",
+                    )
+                    .increment(1);
+                    error!(
+                        target: "notification",
+                        code = tickvault_common::error_code::ErrorCode::Telegram01Dropped.code_str(),
+                        "TELEGRAM-01: episode close line delivery failed — operator alerts MAY be missed"
+                    );
+                }
+            }
+        }
+    }
+    if let Some(tx) = store_tx {
+        let json = episode_snapshot::encode(&episodes.snapshot());
+        if let Err(err) = tx.try_send(json) {
+            tracing::debug!(error = %err, "episode snapshot enqueue skipped (writer busy)");
+        }
+    }
+}
+
+/// Delivers a drained batch: in market hours (or at the close force-drain)
+/// the summaries fold into ONE digest bubble; off-hours keeps today's
+/// per-summary delivery. A single count==1 summary keeps the legacy
+/// bare-sample fast path (single-prefix contract preserved).
+async fn deliver_drained(
+    client: &reqwest::Client,
+    base_url: &str,
+    token: &SecretString,
+    chat_id: &str,
+    summaries: Vec<DrainedSummary>,
+    digest_mode: bool,
+) {
+    let single_bare = summaries.len() == 1 && summaries.first().is_some_and(|s| s.count == 1);
+    if !digest_mode || single_bare {
+        deliver_summaries(client, base_url, token, chat_id, summaries).await;
+        return;
+    }
+    let start = summaries.iter().map(|s| s.first_ts_ms).min().unwrap_or(0);
+    let end = summaries
+        .iter()
+        .map(|s| s.last_ts_ms)
+        .max()
+        .unwrap_or(start);
+    let max_severity = summaries
+        .iter()
+        .map(|s| s.severity)
+        .max()
+        .unwrap_or(Severity::Low);
+    let body = format!(
+        "{} {}",
+        telegram_message_prefix(max_severity),
+        render_digest(&summaries, start, end)
+    );
+    let ok = send_telegram_chunk_with_retry(client, base_url, token, chat_id, &body).await;
+    if !ok {
+        metrics::counter!(
+            "tv_telegram_dropped_total",
+            "reason" => "send_failed",
+        )
+        .increment(1);
+        error!(
+            target: "notification",
+            code = tickvault_common::error_code::ErrorCode::Telegram01Dropped.code_str(),
+            topics = summaries.len(),
+            "TELEGRAM-01: digest delivery failed — operator alerts MAY be missed"
+        );
     }
 }
 
@@ -871,6 +1559,177 @@ pub(crate) async fn send_telegram_chunk_with_retry(
         }
     }
     false
+}
+
+// ---------------------------------------------------------------------------
+// Telegram UX Overhaul (2026-07-07) — send-returning-id + edit transport
+// ---------------------------------------------------------------------------
+
+/// Parses `result.message_id` from a Telegram sendMessage 2xx response
+/// body. Unparseable body → `None` (delivered-without-id: the caller never
+/// re-sends; subsequent events take the SendNewFallback rung).
+#[must_use]
+pub(crate) fn parse_send_message_id(body: &str) -> Option<i64> {
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()?
+        .get("result")?
+        .get("message_id")?
+        .as_i64()
+}
+
+/// One sendMessage attempt that ALSO captures the created message id from
+/// the response body (the legacy `send_telegram_message` discards it).
+/// Used ONLY by the episode path.
+async fn send_telegram_message_capture(
+    client: &reqwest::Client,
+    base_url: &str,
+    bot_token: &SecretString,
+    chat_id: &str,
+    text: &str,
+) -> (TelegramSendOutcome, Option<i64>) {
+    let url = format!("{}/bot{}/sendMessage", base_url, bot_token.expose_secret());
+    let body = serde_json::json!({
+        "chat_id": chat_id,
+        "text": text,
+        "parse_mode": "HTML",
+    });
+    match client.post(&url).json(&body).send().await {
+        Ok(response) => {
+            let status = response.status();
+            let outcome = classify_telegram_status(status);
+            let message_id = if matches!(outcome, TelegramSendOutcome::Success) {
+                match response.text().await {
+                    Ok(text) => parse_send_message_id(&text),
+                    Err(_) => None,
+                }
+            } else {
+                None
+            };
+            (outcome, message_id)
+        }
+        Err(err) => {
+            // SECURITY: redact the bot token (reqwest errors may embed the URL).
+            let safe_msg = err
+                .to_string()
+                .replace(bot_token.expose_secret(), "[REDACTED]");
+            warn_transient_send_throttled(&safe_msg);
+            (TelegramSendOutcome::Transient, None)
+        }
+    }
+}
+
+/// Same 3-attempt / 100ms→2s ladder as `send_telegram_chunk_with_retry`,
+/// returning `(delivered, message_id)`. `(true, None)` = delivered but the
+/// id was unparseable — counted as delivered, never re-sent.
+pub(crate) async fn send_telegram_chunk_with_retry_returning_id(
+    client: &reqwest::Client,
+    base_url: &str,
+    bot_token: &SecretString,
+    chat_id: &str,
+    text: &str,
+) -> (bool, Option<i64>) {
+    let mut delay = Duration::from_millis(TELEGRAM_SEND_BACKOFF_INITIAL_MS);
+    let cap = Duration::from_secs(TELEGRAM_SEND_BACKOFF_CAP_SECS);
+    for attempt in 1..=TELEGRAM_SEND_MAX_ATTEMPTS {
+        match send_telegram_message_capture(client, base_url, bot_token, chat_id, text).await {
+            (TelegramSendOutcome::Success, message_id) => return (true, message_id),
+            (TelegramSendOutcome::Permanent, _) => return (false, None),
+            (TelegramSendOutcome::Transient, _) => {
+                if attempt < TELEGRAM_SEND_MAX_ATTEMPTS {
+                    tokio::time::sleep(delay).await;
+                    delay = delay.saturating_mul(2).min(cap);
+                }
+            }
+        }
+    }
+    (false, None)
+}
+
+/// Outcome of an editMessageText exchange.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EditOutcome {
+    /// 2xx — the bubble text was updated.
+    Applied,
+    /// 400 "message is not modified" — the text is already identical.
+    /// SUCCESS, never a fallback trigger (kills the fallback-spam bug).
+    NotModifiedNoop,
+    /// Permanent rejection (message gone / can't be edited / other 4xx) —
+    /// the fallback rung sends a fresh bubble.
+    Fallback,
+    /// 429 / 5xx / network — retryable; exhausted retries surface as this.
+    Transient,
+}
+
+/// Pure classifier for an editMessageText response (robustness matrix).
+#[must_use]
+pub(crate) fn classify_edit_body(status: u16, body: &str) -> EditOutcome {
+    if (200..300).contains(&status) {
+        return EditOutcome::Applied;
+    }
+    if status == 429 || status >= 500 {
+        return EditOutcome::Transient;
+    }
+    if status == 400 && body.contains("message is not modified") {
+        return EditOutcome::NotModifiedNoop;
+    }
+    // 400 "message to edit not found" / "message can't be edited" / any
+    // other permanent 4xx → fresh-send fallback (duplicate-over-drop).
+    EditOutcome::Fallback
+}
+
+/// Edits a Telegram message in place via the Bot API editMessageText
+/// method — raw HTTP through the SAME client/retry machinery as
+/// sendMessage (no new transport dependency). Retries Transient outcomes
+/// on the standard ladder; returns the final outcome.
+pub(crate) async fn edit_telegram_message_with_retry(
+    client: &reqwest::Client,
+    base_url: &str,
+    bot_token: &SecretString,
+    chat_id: &str,
+    message_id: i64,
+    text: &str,
+) -> EditOutcome {
+    // The ONLY site that builds this URL (wiring-guard pinned).
+    let url = format!(
+        "{}/bot{}/editMessageText",
+        base_url,
+        bot_token.expose_secret()
+    );
+    let body = serde_json::json!({
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "text": text,
+        "parse_mode": "HTML",
+    });
+    let mut delay = Duration::from_millis(TELEGRAM_SEND_BACKOFF_INITIAL_MS);
+    let cap = Duration::from_secs(TELEGRAM_SEND_BACKOFF_CAP_SECS);
+    let mut last = EditOutcome::Transient;
+    for attempt in 1..=TELEGRAM_SEND_MAX_ATTEMPTS {
+        last = match client.post(&url).json(&body).send().await {
+            Ok(response) => {
+                let status = response.status().as_u16();
+                let response_body = response.text().await.unwrap_or_default();
+                classify_edit_body(status, &response_body)
+            }
+            Err(err) => {
+                let safe_msg = err
+                    .to_string()
+                    .replace(bot_token.expose_secret(), "[REDACTED]");
+                warn_transient_send_throttled(&safe_msg);
+                EditOutcome::Transient
+            }
+        };
+        match last {
+            EditOutcome::Transient => {
+                if attempt < TELEGRAM_SEND_MAX_ATTEMPTS {
+                    tokio::time::sleep(delay).await;
+                    delay = delay.saturating_mul(2).min(cap);
+                }
+            }
+            _ => return last,
+        }
+    }
+    last
 }
 
 // ---------------------------------------------------------------------------
@@ -2350,5 +3209,368 @@ mod tests {
             });
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+
+    // =======================================================================
+    // Telegram UX Overhaul (2026-07-07) — episode dispatch + edit transport
+    // =======================================================================
+
+    use super::super::episode::{
+        EpisodeConfig, EpisodeFamily, EpisodeKey, EpisodeRole, episode_snapshot,
+    };
+
+    #[test]
+    fn test_parse_send_message_id_extracts_and_rejects_garbage() {
+        assert_eq!(
+            parse_send_message_id(r#"{"ok":true,"result":{"message_id":123,"date":1}}"#),
+            Some(123)
+        );
+        assert_eq!(
+            parse_send_message_id(r#"{"ok":true,"result":{"message_id":-5}}"#),
+            Some(-5)
+        );
+        // Garbage / shape mismatches → None (delivered-without-id path).
+        assert_eq!(parse_send_message_id(""), None);
+        assert_eq!(parse_send_message_id("not json"), None);
+        assert_eq!(parse_send_message_id(r#"{"ok":true}"#), None);
+        assert_eq!(
+            parse_send_message_id(r#"{"result":{"message_id":"str"}}"#),
+            None
+        );
+        assert_eq!(parse_send_message_id(r#"{"message_id":9}"#), None);
+    }
+
+    #[test]
+    fn test_classify_edit_body_matrix() {
+        // 2xx → Applied.
+        assert_eq!(
+            classify_edit_body(200, r#"{"ok":true}"#),
+            EditOutcome::Applied
+        );
+        // 400 "message is not modified" → benign noop (SUCCESS — never
+        // triggers the fallback ladder; the mvp-lens misclassified this).
+        assert_eq!(
+            classify_edit_body(
+                400,
+                r#"{"ok":false,"description":"Bad Request: message is not modified"}"#
+            ),
+            EditOutcome::NotModifiedNoop
+        );
+        // Message gone / uneditable → Fallback (fresh send).
+        assert_eq!(
+            classify_edit_body(
+                400,
+                r#"{"ok":false,"description":"Bad Request: message to edit not found"}"#
+            ),
+            EditOutcome::Fallback
+        );
+        assert_eq!(
+            classify_edit_body(
+                400,
+                r#"{"ok":false,"description":"Bad Request: message can't be edited"}"#
+            ),
+            EditOutcome::Fallback
+        );
+        // Other permanent 4xx → Fallback.
+        assert_eq!(classify_edit_body(403, ""), EditOutcome::Fallback);
+        assert_eq!(classify_edit_body(404, ""), EditOutcome::Fallback);
+        // 429 + 5xx → Transient (retry ladder).
+        assert_eq!(classify_edit_body(429, ""), EditOutcome::Transient);
+        for code in [500_u16, 502, 503, 504] {
+            assert_eq!(classify_edit_body(code, ""), EditOutcome::Transient);
+        }
+    }
+
+    /// Scripted mock Telegram server: editMessageText → 400 "message to
+    /// edit not found"; sendMessage → 200 with message_id 777. Serves
+    /// connections until the test ends.
+    async fn start_scripted_telegram_server() -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let base_url = format!("http://127.0.0.1:{}", addr.port());
+
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 8192];
+                    let n = stream.read(&mut buf).await.unwrap_or(0);
+                    let request = String::from_utf8_lossy(&buf[..n]);
+                    let (status_line, body) = if request.contains("/editMessageText") {
+                        (
+                            "HTTP/1.1 400 Bad Request",
+                            r#"{"ok":false,"description":"Bad Request: message to edit not found"}"#,
+                        )
+                    } else {
+                        (
+                            "HTTP/1.1 200 OK",
+                            r#"{"ok":true,"result":{"message_id":777}}"#,
+                        )
+                    };
+                    let response = format!(
+                        "{}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        status_line,
+                        body.len(),
+                        body
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                    let _ = stream.shutdown().await;
+                });
+            }
+        });
+
+        base_url
+    }
+
+    fn make_scripted_service(base_url: String) -> Arc<NotificationService> {
+        let http_client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(2))
+            .build()
+            .unwrap();
+        Arc::new(NotificationService::build(NotificationMode::Active {
+            bot_token: SecretString::from("test-bot-token".to_string()),
+            chat_id: "123".to_string(),
+            http_client,
+            telegram_api_base_url: base_url,
+            sns_client: None,
+            sns_phone_number: None,
+        }))
+    }
+
+    fn main_feed_key() -> EpisodeKey {
+        EpisodeKey {
+            family: EpisodeFamily::MainFeedWs,
+            conn: 0,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_edit_fallback_replaces_message_id_and_counts() {
+        // base_url-override fixture pattern (mock server): the edit is
+        // rejected 400 "message to edit not found" → the fallback rung
+        // sends a FRESH bubble (200, message_id 777) and replaces the
+        // episode's message id (duplicate-over-drop, never silent).
+        let base_url = start_scripted_telegram_server().await;
+        let service = make_scripted_service(base_url);
+        let key = main_feed_key();
+        let now = epoch_ms_now();
+        // Seed a live episode whose bubble is message 42, last edited 60s
+        // ago (outside the 20s throttle).
+        let _ = service.episodes.apply_event(
+            key,
+            EpisodeRole::Open,
+            Severity::High,
+            0,
+            now.saturating_sub(60_000),
+            &EpisodeConfig::default(),
+        );
+        service
+            .episodes
+            .record_sent(key, Some(42), now.saturating_sub(60_000));
+
+        let event = NotificationEvent::WebSocketDisconnected {
+            connection_index: 0,
+            reason: "reset".to_string(),
+        };
+        Arc::clone(&service).dispatch_episode_event(event).await;
+
+        let snap = service.episodes.snapshot();
+        assert_eq!(snap.len(), 1);
+        assert_eq!(
+            snap[0].message_id,
+            Some(777),
+            "fallback fresh send must replace the bubble message id"
+        );
+        assert_eq!(snap[0].occurrences, 2, "the repeat drop was folded");
+    }
+
+    #[tokio::test]
+    async fn test_sms_fires_once_per_episode_open() {
+        // The SNS-SMS leg rides EXACTLY the SendFirstPage action. This
+        // test pins the gating precondition mechanically: across a
+        // 3-event storm the registry opens ONE episode (one first page →
+        // one possible SMS), and the repeats fold as edits/throttles.
+        // (The SNS transport itself is exercised by the existing
+        // make_active_service_with_sns tests.)
+        let base_url = start_scripted_telegram_server().await;
+        let service = make_scripted_service(base_url);
+        for _ in 0..3 {
+            let event = NotificationEvent::WebSocketDisconnected {
+                connection_index: 0,
+                reason: "reset".to_string(),
+            };
+            Arc::clone(&service).dispatch_episode_event(event).await;
+        }
+        let snap = service.episodes.snapshot();
+        assert_eq!(snap.len(), 1, "one bubble per incident");
+        assert_eq!(
+            snap[0].message_id,
+            Some(777),
+            "first page delivered exactly once (id captured once)"
+        );
+        assert_eq!(snap[0].occurrences, 3, "repeats folded, never re-paged");
+        assert!(snap[0].explained, "explanation paragraph sent once");
+    }
+
+    #[tokio::test]
+    async fn test_notify_episode_event_routes_to_episode_lane() {
+        // notify() consults episode_key BEFORE the coalescer branch: a
+        // WS-lifecycle event lands in the registry, not the coalescer.
+        let base_url = start_scripted_telegram_server().await;
+        let service = make_scripted_service(base_url);
+        service.notify(NotificationEvent::WebSocketDisconnected {
+            connection_index: 0,
+            reason: "reset".to_string(),
+        });
+        // The dispatch runs in a spawned task — poll briefly.
+        for _ in 0..50 {
+            if service.episodes.live_count() == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(service.episodes.live_count(), 1);
+        assert!(service.episode_mode_enabled());
+    }
+
+    #[tokio::test]
+    async fn test_run_episode_tick_promotes_recovering_to_green_close() {
+        let base_url = start_scripted_telegram_server().await;
+        let service = make_scripted_service(base_url.clone());
+        let key = main_feed_key();
+        let cfg = EpisodeConfig::default();
+        let long_ago = epoch_ms_now().saturating_sub(10 * 60_000);
+        let _ =
+            service
+                .episodes
+                .apply_event(key, EpisodeRole::Open, Severity::High, 0, long_ago, &cfg);
+        service.episodes.record_sent(key, Some(42), long_ago);
+        let _ = service.episodes.apply_event(
+            key,
+            EpisodeRole::Resolve,
+            Severity::Medium,
+            5,
+            long_ago.saturating_add(1000),
+            &cfg,
+        );
+        // The recovery is >60s old → the tick closes it (the green-close
+        // edit is attempted against the mock; 400 → fresh green line).
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(2))
+            .build()
+            .unwrap();
+        let token = SecretString::from("test-bot-token".to_string());
+        run_episode_tick(&service.episodes, &client, &base_url, &token, "123", None).await;
+        assert_eq!(
+            service.episodes.live_count(),
+            0,
+            "stable recovery must close the episode"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_shutdown_flush_drains_digest_and_persists_store() {
+        // NoOp service: completes instantly (nothing to drain, no store).
+        let noop = NotificationService::disabled();
+        let started = std::time::Instant::now();
+        noop.shutdown_flush().await;
+        assert!(started.elapsed() < Duration::from_secs(SHUTDOWN_FLUSH_TIMEOUT_SECS));
+
+        // Active service with a coalescer: drain_all + deliver runs inside
+        // the 10s bound even against an unreachable Telegram (100ms client
+        // timeout × retry ladder). No store writer wired → no file writes.
+        let service = make_active_service();
+        let service = NotificationService::enable_coalescer(service, CoalescerConfig::default());
+        // Park one Low event in the coalescer so drain_all has work.
+        if let Some(c) = service.coalescer.as_ref() {
+            let _ = c.observe("TickGapsSummary", Severity::Low, || "gap".to_string());
+        }
+        let started = std::time::Instant::now();
+        service.shutdown_flush().await;
+        assert!(
+            started.elapsed() < Duration::from_secs(SHUTDOWN_FLUSH_TIMEOUT_SECS),
+            "shutdown flush must respect the bound"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_episode_store_write_and_rehydrate_roundtrip() {
+        // write_episode_store + rehydrate_episodes against a temp path.
+        let dir = std::env::temp_dir().join(format!(
+            "tickvault-episode-store-test-{}",
+            std::process::id()
+        ));
+        let path = dir.join("episodes.json");
+        let key = main_feed_key();
+        let reg = super::super::episode::EpisodeRegistry::new();
+        let now = epoch_ms_now();
+        let _ = reg.apply_event(
+            key,
+            EpisodeRole::Open,
+            Severity::High,
+            0,
+            now,
+            &EpisodeConfig::default(),
+        );
+        reg.record_sent(key, Some(55), now);
+        let json = episode_snapshot::encode(&reg.snapshot());
+        write_episode_store(&path, &json).await;
+
+        let fresh = super::super::episode::EpisodeRegistry::new();
+        rehydrate_episodes(&fresh, &path).await;
+        assert_eq!(fresh.live_count(), 1, "same-day fresh entry rehydrates");
+        assert_eq!(fresh.snapshot()[0].message_id, Some(55));
+
+        // Corrupt file → fail-open empty registry, no panic.
+        tokio::fs::write(&path, "{{{corrupt").await.unwrap();
+        let corrupt = super::super::episode::EpisodeRegistry::new();
+        rehydrate_episodes(&corrupt, &path).await;
+        assert_eq!(corrupt.live_count(), 0);
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn test_spawn_episode_ticker_safe_on_noop_and_active() {
+        // NoOp: returns without spawning (no transport).
+        let noop = NotificationService::disabled();
+        NotificationService::spawn_episode_ticker(&noop);
+        // Active without a coalescer: spawns the fallback ticker.
+        let service = make_active_service();
+        NotificationService::spawn_episode_ticker(&service);
+        // Active WITH a coalescer: no-op (the drain loop owns the tick).
+        let with_coalescer = NotificationService::enable_coalescer(
+            make_active_service(),
+            CoalescerConfig::default(),
+        );
+        NotificationService::spawn_episode_ticker(&with_coalescer);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    #[tokio::test]
+    async fn test_episode_mode_off_uses_legacy_dispatch() {
+        // Kill switch: episode_mode=false → the WS event takes the legacy
+        // per-event path (no episode state is created).
+        let base_url = start_scripted_telegram_server().await;
+        let mut owned = match Arc::try_unwrap(make_scripted_service(base_url)) {
+            Ok(s) => s,
+            Err(_) => unreachable!("fresh Arc has one owner"),
+        };
+        owned.episode_mode = false;
+        let service = Arc::new(owned);
+        service.notify(NotificationEvent::WebSocketDisconnected {
+            connection_index: 0,
+            reason: "reset".to_string(),
+        });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            service.episodes.live_count(),
+            0,
+            "episode_mode=false must never touch the registry"
+        );
     }
 }
