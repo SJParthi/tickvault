@@ -14,7 +14,7 @@
 //! - NO panics on any input (ratcheted by
 //!   `proptest_fsm_total_never_ignores_high_critical`)
 //!
-//! The transport shell (Telegram sendMessage / editMessageText, the snapshot
+//! The transport shell (the Telegram send/edit HTTP calls, the snapshot
 //! file writer) lives in `service.rs` and is a thin wrapper around this core.
 //!
 //! # Never-drop pin (operator law)
