@@ -114,18 +114,27 @@ resource "aws_cloudwatch_metric_alarm" "order_update_ws_inactive" {
 # ---------------------------------------------------------------------------
 # 3b. Groww feed inactive (operator 2026-07-06 — Groww feed-down alerting).
 # `tv_groww_ws_active` is the CONNECTED-level 0/1 gauge published every ≤1s
-# by the Groww bridge loop: 1 while the connected episode holds (socket
-# connected + subscribed OR streaming), 0 after a feed disable / bridge
-# death. Connected-level (not streaming-level) so the pre-open
-# 08:30→first-tick window does not page every morning — the exact clone of
-# order_update_ws_inactive above, same Minimum<1 60s×2 shape.
+# ENABLED wake of the Groww bridge loop: 1 while the connected episode holds
+# (socket connected + subscribed OR streaming, backed by FRESH sidecar
+# status / tick evidence — a stale status file left by a killed or
+# prior-day sidecar can never read 1, so a sidecar dead at boot publishes 0
+# and this alarm fires). Connected-level (not streaming-level) so the
+# pre-open 08:30→first-tick window does not page every morning. NOT an
+# exact clone of order_update_ws_inactive: that gauge is set only AFTER a
+# successful connect; this one is registered lazily on the first ENABLED
+# wake (0 pre-connect while enabled — ~2min grace via the 60s×2 shape) and
+# stays UNREGISTERED (missing → notBreaching → silent) for a session where
+# Groww is never enabled, so a deliberate multi-day disable never pages
+# daily. A mid-session runtime disable sets 0 once (a real transition —
+# one ALARM, honest).
 # treat_missing_data = notBreaching: metric is missing whenever the box is
-# intentionally stopped (16:30 IST / weekends) or during a deploy gap — the
-# same stuck-FIRING fix rationale as ws_pool_all_dead (2026-06-02).
+# intentionally stopped (16:30 IST / weekends), during a deploy gap, or for
+# a Groww-disabled session — the same stuck-FIRING fix rationale as
+# ws_pool_all_dead (2026-06-02).
 # ---------------------------------------------------------------------------
 resource "aws_cloudwatch_metric_alarm" "groww_ws_inactive" {
   alarm_name          = "tv-${var.environment}-groww-ws-inactive"
-  alarm_description   = "Groww feed connection is down. Groww prices are not flowing; reconnect is automatic — investigate if this stays firing."
+  alarm_description   = "Groww feed is not connected/streaming. Groww prices are not flowing. If the feed was deliberately switched off, re-enable it from the feeds page; otherwise recovery is automatic — investigate if this stays firing."
   comparison_operator = "LessThanThreshold"
   evaluation_periods  = 2
   metric_name         = "tv_groww_ws_active"
@@ -474,23 +483,29 @@ resource "aws_cloudwatch_metric_alarm" "disk_watcher_respawn" {
 # socket (reconnect→re-drop, the in-process storm escalation is >5 restarts
 # per 300s) means the provider keeps closing the socket — operator must
 # check the credential / entitlement.
-# Shape honesty: the metric is a CUMULATIVE session-scoped counter (the box
-# restarts daily at 08:30 IST, so it is fresh each session — the
-# late_tick_after_boundary Maximum-statistic precedent). Maximum >= 3 fires
-# on "3+ stall restarts since today's boot" — deliberately more sensitive
-# than the in-process >5/300s storm ladder, and it stays FIRING for the rest
-# of the session once breached (accepted, same as spill_dropped/dlq_ticks).
-# It is NOT a 5-minute delta.
+# Shape honesty (corrected 2026-07-06): although the in-process metric is a
+# cumulative session-scoped counter, the CloudWatch agent's Prometheus/EMF
+# pipeline DELTA-CONVERTS counter-type metrics — every datapoint that
+# reaches CloudWatch is the increase since the previous 60s scrape (the
+# first sample is dropped), NEVER the cumulative count. A Maximum-statistic
+# threshold of 3 could therefore never fire on the documented "3+ stall
+# restarts spread across the session" condition (each datapoint is ~1), and
+# a sustained storm throttled by the in-process backoff ladder to >=60s
+# between kills would read 0-1 per scrape and un-fire mid-storm. Sum over a
+# 1-hour window counts the restarts in that window under delta semantics:
+# Sum >= 3 / 3600s fires on 3+ stall restarts within an hour (a single
+# self-healing restart stays silent per the FEED-STALL-01 runbook) and
+# returns to OK an hour after the storm genuinely ends.
 # ---------------------------------------------------------------------------
 resource "aws_cloudwatch_metric_alarm" "groww_stall_restart_storm" {
   alarm_name          = "tv-${var.environment}-groww-stall-restart-storm"
-  alarm_description   = "Groww feed keeps stalling — 3+ silent-feed restarts since today's boot (flapping socket = provider-side reject). The system keeps reconnecting automatically; check the Groww credential/entitlement if this fires. See FEED-STALL-01."
+  alarm_description   = "Groww feed keeps stalling — 3+ silent-feed restarts within the last hour (flapping socket = provider-side reject). The system keeps reconnecting automatically; check the Groww credential/entitlement if this fires. See FEED-STALL-01."
   comparison_operator = "GreaterThanOrEqualToThreshold"
   evaluation_periods  = 1
   metric_name         = "tv_feed_sidecar_stall_restart_total"
   namespace           = local.app_namespace
-  period              = 300
-  statistic           = "Maximum"
+  period              = 3600
+  statistic           = "Sum"
   threshold           = 3
   treat_missing_data  = "notBreaching"
   dimensions          = local.app_dimensions

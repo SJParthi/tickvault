@@ -199,8 +199,11 @@ fn groww_ws_audit_drop_reason(
 /// `"streaming"`; the counts are the SIDs the sidecar actually subscribed today.
 /// `emitted`/`dropped` are the honest-feed PROOF (operator 2026-06-29): records the
 /// producer DECODED+EMITTED vs DECODED-but-DROPPED (a `sid_map` miss / missing
-/// field). Both are `#[serde(default)]` so an OLD sidecar status (no fields) parses
-/// to 0 — forward-safe, no error.
+/// field). All are `#[serde(default)]` so an OLD sidecar status (no fields) parses
+/// to 0 — forward-safe, no error. `ts_ist_nanos` (the sidecar's own write stamp,
+/// present in every `write_status` record) is the FRESHNESS signal: a status
+/// record with `ts_ist_nanos == 0` (old format) can never prove liveness — see
+/// [`groww_status_is_live`] (stale-status false-OK fix, 2026-07-06).
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq)]
 struct GrowwStatusLine {
     event: GrowwStatusEvent,
@@ -212,6 +215,11 @@ struct GrowwStatusLine {
     emitted: u64,
     #[serde(default)]
     dropped: u64,
+    /// IST epoch nanos the sidecar stamped when it WROTE this record
+    /// (`write_status` → `now_ist_nanos()` in `groww_sidecar.py`). 0 = the
+    /// stamp is absent (old-format line) — treated as NEVER-live, fail-closed.
+    #[serde(default)]
+    ts_ist_nanos: i64,
 }
 
 /// The sidecar's two PROOF status events. `Unknown` tolerates a future/unexpected
@@ -238,6 +246,48 @@ fn parse_groww_status_line(text: &str) -> Option<GrowwStatusLine> {
         return None;
     }
     serde_json::from_str::<GrowwStatusLine>(trimmed).ok()
+}
+
+/// Max age for a sidecar status record to count as LIVE evidence (the sidecar
+/// rewrites the status ≤1s apart while streaming and once at subscribe, so a
+/// healthy record is always well inside this bound; a record older than it is
+/// a fossil from a killed / stalled / prior-day sidecar). Generous enough to
+/// cover the boot-ordering notifier-slot deferral of the one-shot `subscribed`
+/// write, tight enough that yesterday's file can never read as today's proof
+/// (mirrors the ladder's `PLATEAU_PROOF_FRESHNESS_SECS` fossil-aging pattern).
+const GROWW_STATUS_LIVE_MAX_AGE_NANOS: i64 = 120 * NANOS_PER_SECOND;
+
+/// PURE freshness classification of one sidecar status record (stale-status
+/// false-OK fix, 2026-07-06). A status is LIVE evidence ONLY when ALL hold:
+///
+/// 1. it carries a write stamp (`ts_ist_nanos > 0` — an old-format record
+///    without one can never prove liveness, fail-closed),
+/// 2. the stamp is at/after the caller's live FLOOR (the bridge incarnation
+///    start, advanced on every runtime-disabled wake) — so yesterday's
+///    EBS-persisted file at boot AND the pre-disable frozen file on a
+///    disable→re-enable cycle are both fossils, never proof,
+/// 3. the stamp is within [`GROWW_STATUS_LIVE_MAX_AGE_NANOS`] of now (a
+///    killed sidecar's last write ages out), and
+/// 4. the stamp is not absurdly in the future (garbage / clock-skew guard —
+///    a future stamp beyond the same window is rejected, fail-closed).
+///
+/// The incident class this closes: the sidecar status file is NEVER deleted
+/// on a runtime disable (the child is `start_kill`ed mid-write-cadence) nor
+/// at boot (EBS persists it across the daily stop/start), so a bare
+/// `event == streaming` read latched `streaming_observed`, fired a false
+/// "✅ Prices are flowing" `FeedRecovered` on every disable→re-enable, and
+/// pinned `tv_groww_ws_active = 1` all session while a dead-at-boot sidecar
+/// streamed nothing (blinding the groww-ws-inactive alarm).
+#[must_use]
+fn groww_status_is_live(
+    status_ts_ist_nanos: i64,
+    now_ist_nanos: i64,
+    live_floor_ist_nanos: i64,
+) -> bool {
+    status_ts_ist_nanos > 0
+        && status_ts_ist_nanos >= live_floor_ist_nanos
+        && now_ist_nanos.saturating_sub(status_ts_ist_nanos) <= GROWW_STATUS_LIVE_MAX_AGE_NANOS
+        && status_ts_ist_nanos.saturating_sub(now_ist_nanos) <= GROWW_STATUS_LIVE_MAX_AGE_NANOS
 }
 
 /// One capture-at-receipt tick line the Python sidecar appends. The fields are
@@ -2062,7 +2112,13 @@ async fn supervise_groww_bridge_loop(
                     notifier.notify(tickvault_core::notification::NotificationEvent::FeedDown {
                         feed: Feed::Groww.display_name().to_string(), // O(1) EXEMPT: cold path — once per DOWN episode
                         reason: "internal restart — recovering automatically".to_string(), // O(1) EXEMPT: cold path — once per DOWN episode
-                        market_open: tickvault_common::market_hours::is_within_market_hours_ist(),
+                        // Calendar-aware (2026-07-06 fix): never page High +
+                        // SNS on a Saturday manual run / NSE weekday holiday
+                        // (the 2026-05-09 false-page class).
+                        market_open: tickvault_common::market_hours::is_trading_session_now(),
+                        // A bridge death IS auto-recovering (the supervisor
+                        // respawns it) — the auto-retry trailer is honest here.
+                        operator_initiated: false,
                     });
                 }
             }
@@ -2347,20 +2403,39 @@ pub async fn run_groww_bridge(
     // forensic chain never reads Connected→Connected with no disconnect between.
 
     // Groww liveness gauges (operator 2026-07-06 feed-down alerting).
-    // Handles hoisted ONCE before the loop (the O(1)-EXEMPT hoisting pattern
-    // the Dhan connection read loop uses) — static &'static str labels, zero
+    // Handles registered LAZILY on first publish (2026-07-06 stale-status
+    // hardening): a session where Groww is never enabled must leave BOTH
+    // metrics MISSING (the prometheus exporter renders a registered gauge at
+    // its last value on every scrape), so the groww-ws-inactive alarm's
+    // notBreaching keeps a deliberate config/runtime disable silent —
+    // mirroring the order-update precedent (tv_order_update_ws_active is
+    // only registered after a successful connect). Once registered, the
+    // handle is cached — O(1) per wake, static &'static str labels, zero
     // per-wake allocation. Published from THIS loop (≤1s wake cadence)
     // because the Dhan pool watchdog is Dhan-lane-spawned and never runs on
     // a groww-only boot.
     // - `tv_groww_ws_active`: CONNECTED-level 0/1 (socket connected +
-    //   subscribed OR streaming) — connected-level so the pre-open
-    //   08:30→first-tick window does not page the inactivity alarm daily
-    //   (mirrors tv_order_update_ws_active semantics).
+    //   subscribed OR streaming, FRESH evidence only — a stale status file
+    //   can never read 1). While ENABLED it publishes honestly from the
+    //   first wake (a sidecar dead at boot publishes 0 and the alarm fires
+    //   as its description promises); while DISABLED it publishes 0 only if
+    //   already registered this session (a genuine enabled→off transition
+    //   shows the outage; a never-enabled session stays missing/silent).
     // - `tv_feed_last_tick_age_seconds{feed="groww"}`: seconds since the
-    //   feed's most-recent tick; SKIPPED (never a fake 0) until the first
-    //   tick of the session so missing-data + notBreaching stays silent.
-    let m_groww_active = metrics::gauge!("tv_groww_ws_active");
-    let m_groww_tick_age = metrics::gauge!("tv_feed_last_tick_age_seconds", "feed" => "groww");
+    //   feed's most-recent tick; SKIPPED (never a fake 0, not even the
+    //   registration-default 0) until the first tick of the session so
+    //   missing-data + notBreaching stays silent.
+    let mut m_groww_active: Option<metrics::Gauge> = None;
+    let mut m_groww_tick_age: Option<metrics::Gauge> = None;
+    // Stale-status LIVE floor (2026-07-06 false-recovery fix): a sidecar
+    // status record only counts as evidence when its write stamp is at/after
+    // this floor. Initialized to THIS bridge incarnation's start (yesterday's
+    // EBS-persisted file / a pre-panic frozen file can never latch) and
+    // advanced on every runtime-disabled wake (the pre-disable frozen file
+    // can never close a DOWN episode after a re-enable).
+    let mut status_live_floor_ist_nanos: i64 = receipt_ist_nanos();
+    // One-per-incarnation triage breadcrumb for a skipped stale status file.
+    let mut stale_status_logged = false;
 
     loop {
         // Wake on EITHER a filesystem event (zero-latency) OR the fallback timer.
@@ -2436,7 +2511,17 @@ pub async fn run_groww_bridge(
                     notifier.notify(tickvault_core::notification::NotificationEvent::FeedDown {
                         feed: Feed::Groww.display_name().to_string(), // O(1) EXEMPT: cold path — once per DOWN episode
                         reason: "feed switched off by the operator".to_string(), // O(1) EXEMPT: cold path — once per DOWN episode
-                        market_open: in_market,
+                        // Calendar-aware (2026-07-06 fix): severity must not
+                        // page High + SNS inside the 09:00–15:30 clock window
+                        // on a Saturday manual run / NSE weekday holiday —
+                        // the 2026-05-09 false-page class. The audit-row kind
+                        // above keeps the time-of-day split (Dhan parity).
+                        market_open: tickvault_common::market_hours::is_trading_session_now(),
+                        // A runtime disable is a DELIBERATE toggle (the
+                        // bearer-gated feeds page) — the body must say "stays
+                        // off until you re-enable it", never a false
+                        // "retrying automatically" (2026-07-06 fix).
+                        operator_initiated: true,
                     });
                 }
             }
@@ -2449,90 +2534,124 @@ pub async fn run_groww_bridge(
             audit_latches.rearm_boot_connect();
             connect_logged = false;
             streaming_observed = false;
-            // Connected-level gauge drops to 0 while disabled so the
-            // CloudWatch inactivity alarm sees the outage (operator
-            // 2026-07-06). The tick-age gauge keeps its honest last value —
-            // no fake publish while idle.
-            m_groww_active.set(0.0);
+            // Advance the stale-status LIVE floor every disabled wake: after
+            // a re-enable, ONLY a status the sidecar writes AFTER this
+            // instant can latch streaming / close the DOWN episode — the
+            // pre-disable frozen "streaming" file is a fossil (2026-07-06
+            // false-recovery fix).
+            status_live_floor_ist_nanos = receipt_ist_nanos();
+            // Connected-level gauge drops to 0 while disabled ONLY when it
+            // was already registered this session (a genuine enabled→off
+            // transition shows the outage). A session where Groww was never
+            // enabled leaves the metric MISSING so notBreaching keeps the
+            // deliberate disable silent (no daily ALARM/OK churn).
+            if let Some(gauge) = m_groww_active.as_ref() {
+                gauge.set(0.0);
+            }
             continue;
         }
 
         // CONNECT+SUBSCRIBE PROOF: read the sidecar status file (cheap, best-effort).
+        // FRESHNESS-GATED (2026-07-06 stale-status false-OK fix): the sidecar
+        // never deletes this file (a killed child freezes it at its last
+        // write, EBS persists it across the daily stop/start), so a record is
+        // evidence ONLY when its own write stamp is at/after the live floor
+        // AND recent — a stale record is treated exactly like an absent file
+        // (no connect log, no boot-connect ping, no streaming latch, no
+        // count refresh). This is what keeps FeedRecovered ("Prices are
+        // flowing") and tv_groww_ws_active honest across disable→re-enable
+        // cycles and dead-at-boot sidecars.
         if let Some(status) = read_status_file(&status_file_path).await {
-            // First `subscribed`/`streaming` observation → emit the ONE CONNECT log
-            // + record the subscribe counts (idempotent; only logged once).
-            if !connect_logged && status.event != GrowwStatusEvent::Unknown {
-                info!(
-                    stocks = status.stocks,
-                    indices = status.indices,
-                    total = status.stocks + status.indices,
-                    "Groww live feed CONNECTED — subscribed {} stocks + {} indices = {}",
-                    status.stocks,
-                    status.indices,
-                    status.stocks + status.indices
-                );
-                feed_health.set_subscribed(Feed::Groww, status.stocks, status.indices);
-                connect_logged = true;
-            } else if status.event != GrowwStatusEvent::Unknown {
-                // Keep the counts fresh on a re-subscribe (reconnect) without re-logging.
-                feed_health.set_subscribed(Feed::Groww, status.stocks, status.indices);
-            }
-            // Boot-stage socket-connected announcement (operator 2026-07-04 —
-            // "i need the same view display everything even for groww"): on
-            // the FIRST observed subscribe state per connected episode, emit
-            // ONE ws_event_audit Connected row AT SOCKET-CONNECT time + ONE
-            // Telegram ping — WITHOUT waiting for the first streaming tick
-            // (a closed market previously meant total boot silence). The
-            // existing first-streaming-tick rising edge below is KEPT
-            // unchanged as the streaming confirmation; this is ADDITIVE.
-            // Edge-latched via `boot_connect_announced` (once per episode,
-            // never per poll); a notifier slot that exists but is not yet
-            // filled (boot ordering) defers to the next wake so the ping is
-            // delayed, never lost.
-            let notifier = notifier_slot.as_ref().and_then(|slot| slot.load_full());
-            let notifier_ready = match notifier_slot.as_ref() {
-                None => true, // no Telegram wiring (tests) — audit row only
-                Some(_) => notifier.is_some(),
-            };
-            if should_announce_boot_connect(
-                status.event != GrowwStatusEvent::Unknown,
-                audit_latches
-                    .boot_connect_announced
-                    .load(std::sync::atomic::Ordering::Relaxed),
-                notifier_ready,
-            ) && audit_latches.try_announce_boot_connect()
-            {
-                emit_groww_ws_audit(
-                    ws_audit_tx.as_ref(),
-                    WsEventKind::Connected,
-                    "groww_subscribed",
-                    "groww socket connected + subscribed — awaiting first tick",
-                );
-                // FLEET-scoped Telegram coalescing (exam-fix 2026-07-06): in
-                // fleet mode every shard bridge used to fire its own LOW
-                // "connected — Subscribed N" ping per connected episode —
-                // alternating with the per-connection reject alerts into
-                // dozens of messages. Fleet connections now emit at most ONE
-                // connected ping per 60s window (the FIRST bridge in the
-                // window carries its own subscribe counts); suppressed pings
-                // keep their ws_event_audit row + CONNECT log + feed-health
-                // update above. Single-conn (`conn_id == None`) = today's
-                // behavior byte-identical.
-                let connected_decision = crate::groww_fleet_alerts::global_fleet_alert_decision(
-                    conn_id,
-                    crate::groww_fleet_alerts::FleetAlertKind::Connected,
-                );
-                if matches!(
-                    connected_decision,
-                    crate::groww_fleet_alerts::FleetAlertDecision::Suppress
-                ) {
-                    metrics::counter!(
-                        "tv_groww_fleet_alerts_suppressed_total",
-                        "direction" => "connected",
-                    )
-                    .increment(1);
-                } else if let Some(notifier) = notifier {
-                    notifier.notify(
+            if !groww_status_is_live(
+                status.ts_ist_nanos,
+                receipt_ist_nanos(),
+                status_live_floor_ist_nanos,
+            ) {
+                if !stale_status_logged {
+                    stale_status_logged = true;
+                    info!(
+                        status_ts_ist_nanos = status.ts_ist_nanos,
+                        live_floor_ist_nanos = status_live_floor_ist_nanos,
+                        "groww bridge: ignoring STALE sidecar status file (leftover from a \
+                         prior sidecar incarnation) — waiting for fresh subscribe/streaming \
+                         proof before claiming the feed is live"
+                    );
+                }
+            } else {
+                // First `subscribed`/`streaming` observation → emit the ONE CONNECT log
+                // + record the subscribe counts (idempotent; only logged once).
+                if !connect_logged && status.event != GrowwStatusEvent::Unknown {
+                    info!(
+                        stocks = status.stocks,
+                        indices = status.indices,
+                        total = status.stocks + status.indices,
+                        "Groww live feed CONNECTED — subscribed {} stocks + {} indices = {}",
+                        status.stocks,
+                        status.indices,
+                        status.stocks + status.indices
+                    );
+                    feed_health.set_subscribed(Feed::Groww, status.stocks, status.indices);
+                    connect_logged = true;
+                } else if status.event != GrowwStatusEvent::Unknown {
+                    // Keep the counts fresh on a re-subscribe (reconnect) without re-logging.
+                    feed_health.set_subscribed(Feed::Groww, status.stocks, status.indices);
+                }
+                // Boot-stage socket-connected announcement (operator 2026-07-04 —
+                // "i need the same view display everything even for groww"): on
+                // the FIRST observed subscribe state per connected episode, emit
+                // ONE ws_event_audit Connected row AT SOCKET-CONNECT time + ONE
+                // Telegram ping — WITHOUT waiting for the first streaming tick
+                // (a closed market previously meant total boot silence). The
+                // existing first-streaming-tick rising edge below is KEPT
+                // unchanged as the streaming confirmation; this is ADDITIVE.
+                // Edge-latched via `boot_connect_announced` (once per episode,
+                // never per poll); a notifier slot that exists but is not yet
+                // filled (boot ordering) defers to the next wake so the ping is
+                // delayed, never lost.
+                let notifier = notifier_slot.as_ref().and_then(|slot| slot.load_full());
+                let notifier_ready = match notifier_slot.as_ref() {
+                    None => true, // no Telegram wiring (tests) — audit row only
+                    Some(_) => notifier.is_some(),
+                };
+                if should_announce_boot_connect(
+                    status.event != GrowwStatusEvent::Unknown,
+                    audit_latches
+                        .boot_connect_announced
+                        .load(std::sync::atomic::Ordering::Relaxed),
+                    notifier_ready,
+                ) && audit_latches.try_announce_boot_connect()
+                {
+                    emit_groww_ws_audit(
+                        ws_audit_tx.as_ref(),
+                        WsEventKind::Connected,
+                        "groww_subscribed",
+                        "groww socket connected + subscribed — awaiting first tick",
+                    );
+                    // FLEET-scoped Telegram coalescing (exam-fix 2026-07-06): in
+                    // fleet mode every shard bridge used to fire its own LOW
+                    // "connected — Subscribed N" ping per connected episode —
+                    // alternating with the per-connection reject alerts into
+                    // dozens of messages. Fleet connections now emit at most ONE
+                    // connected ping per 60s window (the FIRST bridge in the
+                    // window carries its own subscribe counts); suppressed pings
+                    // keep their ws_event_audit row + CONNECT log + feed-health
+                    // update above. Single-conn (`conn_id == None`) = today's
+                    // behavior byte-identical.
+                    let connected_decision = crate::groww_fleet_alerts::global_fleet_alert_decision(
+                        conn_id,
+                        crate::groww_fleet_alerts::FleetAlertKind::Connected,
+                    );
+                    if matches!(
+                        connected_decision,
+                        crate::groww_fleet_alerts::FleetAlertDecision::Suppress
+                    ) {
+                        metrics::counter!(
+                            "tv_groww_fleet_alerts_suppressed_total",
+                            "direction" => "connected",
+                        )
+                        .increment(1);
+                    } else if let Some(notifier) = notifier {
+                        notifier.notify(
                         tickvault_core::notification::NotificationEvent::FeedConnectedAwaitingTicks {
                             // O(1) EXEMPT: one Telegram event per fleet connect edge — cold notification path.
                             feed: Feed::Groww.display_name().to_string(),
@@ -2541,16 +2660,17 @@ pub async fn run_groww_bridge(
                                 tickvault_common::market_hours::is_within_market_hours_ist(),
                         },
                     );
+                    }
                 }
-            }
-            // HONEST-FEED PROOF (operator 2026-06-29): surface the producer-side
-            // decoded+emitted vs decoded-but-dropped counts so a sid-map mismatch
-            // ("streaming but 0 ticks") is a VISIBLE number, not a silent drop.
-            // Always refreshed from the latest status (the sidecar reports cumulative
-            // totals); display-only, never changes the verdict or `connected`.
-            feed_health.set_decode_counts(Feed::Groww, status.emitted, status.dropped);
-            if status.event == GrowwStatusEvent::Streaming {
-                streaming_observed = true;
+                // HONEST-FEED PROOF (operator 2026-06-29): surface the producer-side
+                // decoded+emitted vs decoded-but-dropped counts so a sid-map mismatch
+                // ("streaming but 0 ticks") is a VISIBLE number, not a silent drop.
+                // Always refreshed from the latest status (the sidecar reports cumulative
+                // totals); display-only, never changes the verdict or `connected`.
+                feed_health.set_decode_counts(Feed::Groww, status.emitted, status.dropped);
+                if status.event == GrowwStatusEvent::Streaming {
+                    streaming_observed = true;
+                }
             }
         }
 
@@ -2625,20 +2745,31 @@ pub async fn run_groww_bridge(
             }
         }
 
-        // Groww liveness gauges (operator 2026-07-06): published every wake
-        // (≤1s cadence, cold path, handles hoisted before the loop).
-        // Connected-level active bit — 1 while the connected episode holds
-        // (socket connected + subscribed OR streaming), 0 otherwise — so the
-        // pre-open 08:30→first-tick window never pages the inactivity alarm.
+        // Groww liveness gauges (operator 2026-07-06): published every
+        // ENABLED wake (≤1s cadence, cold path, handles cached after the
+        // first publish). Connected-level active bit — 1 while the connected
+        // episode holds (socket connected + subscribed OR streaming, FRESH
+        // evidence only — a stale status file can never latch it), 0
+        // otherwise — so the pre-open 08:30→first-tick window never pages
+        // the inactivity alarm, while a sidecar dead at boot honestly
+        // publishes 0 (yesterday's stale file is ignored) and the
+        // groww-ws-inactive alarm fires as its description promises.
         let connected_episode = streaming_observed
             || audit_latches
                 .boot_connect_announced
                 .load(std::sync::atomic::Ordering::Relaxed);
-        m_groww_active.set(if connected_episode { 1.0 } else { 0.0 });
-        // Tick age: SKIP (never a fake 0) until the first tick of the
+        m_groww_active
+            .get_or_insert_with(|| metrics::gauge!("tv_groww_ws_active"))
+            .set(if connected_episode { 1.0 } else { 0.0 });
+        // Tick age: SKIP (never a fake 0 — the gauge is not even REGISTERED,
+        // so the exporter renders nothing) until the first tick of the
         // session — missing data + the alarm's notBreaching stays silent.
         if let Some(age) = feed_health.last_tick_age_secs(Feed::Groww, receipt_ist_nanos()) {
-            m_groww_tick_age.set(age as f64);
+            m_groww_tick_age
+                .get_or_insert_with(
+                    || metrics::gauge!("tv_feed_last_tick_age_seconds", "feed" => "groww"),
+                )
+                .set(age as f64);
         }
     }
 }
@@ -3231,6 +3362,86 @@ mod tests {
         assert_eq!(got.event, GrowwStatusEvent::Streaming);
         assert_eq!(got.emitted, 0, "absent emitted → serde default 0");
         assert_eq!(got.dropped, 0, "absent dropped → serde default 0");
+        assert_eq!(
+            got.ts_ist_nanos, 0,
+            "absent ts_ist_nanos → serde default 0 (never-live, fail-closed)"
+        );
+    }
+
+    #[test]
+    fn test_parse_groww_status_line_carries_write_stamp() {
+        // Stale-status false-OK fix (2026-07-06): the sidecar's own write
+        // stamp (`ts_ist_nanos` from write_status) MUST survive the parse —
+        // it is the freshness signal that keeps a killed / prior-day
+        // sidecar's frozen "streaming" record from latching liveness.
+        let s = r#"{"event":"streaming","stocks":765,"indices":2,"total":767,"ts_ist_nanos":1780000020123000000}"#;
+        let got = parse_groww_status_line(s).expect("parse streaming");
+        assert_eq!(got.ts_ist_nanos, 1_780_000_020_123_000_000);
+    }
+
+    // test coverage (one line for pub-fn-test-guard test.*<fn>): groww_status_is_live
+
+    #[test]
+    fn test_groww_status_is_live_fresh_after_floor_is_live() {
+        // A record written after the floor and within the max-age window is
+        // live evidence (the healthy ≤1s streaming-rewrite case).
+        let now = 2_000_000_000 * NANOS_PER_SECOND;
+        let floor = now - 3_600 * NANOS_PER_SECOND;
+        assert!(groww_status_is_live(now - NANOS_PER_SECOND, now, floor));
+        assert!(groww_status_is_live(now, now, floor));
+    }
+
+    #[test]
+    fn test_groww_status_is_live_zero_stamp_is_never_live() {
+        // Old-format record without a write stamp → fail-closed, never live.
+        let now = 2_000_000_000 * NANOS_PER_SECOND;
+        assert!(!groww_status_is_live(0, now, 0));
+        assert!(!groww_status_is_live(-1, now, i64::MIN));
+    }
+
+    #[test]
+    fn test_groww_status_is_live_pre_floor_stamp_is_stale() {
+        // The disable→re-enable / boot-with-yesterdays-file class: a record
+        // written BEFORE the live floor (bridge incarnation start / last
+        // disabled wake) is a fossil from a killed sidecar — never evidence,
+        // even if it is recent by wall clock.
+        let now = 2_000_000_000 * NANOS_PER_SECOND;
+        let floor = now - 10 * NANOS_PER_SECOND;
+        assert!(!groww_status_is_live(floor - 1, now, floor));
+        assert!(
+            groww_status_is_live(floor, now, floor),
+            "at-floor stamp counts (>= floor)"
+        );
+    }
+
+    #[test]
+    fn test_groww_status_is_live_aged_out_stamp_is_stale() {
+        // A stamp older than GROWW_STATUS_LIVE_MAX_AGE_NANOS ages out (the
+        // sidecar rewrites ≤1s while streaming, so a healthy record is
+        // always far inside the bound).
+        let now = 2_000_000_000 * NANOS_PER_SECOND;
+        let floor = 0;
+        let stale = now - GROWW_STATUS_LIVE_MAX_AGE_NANOS - 1;
+        assert!(!groww_status_is_live(stale, now, floor));
+        let boundary = now - GROWW_STATUS_LIVE_MAX_AGE_NANOS;
+        assert!(
+            groww_status_is_live(boundary, now, floor),
+            "exactly-at-window stamp still counts"
+        );
+    }
+
+    #[test]
+    fn test_groww_status_is_live_absurd_future_stamp_is_rejected() {
+        // Garbage / clock-skew guard: a stamp absurdly in the FUTURE of the
+        // receipt clock is rejected fail-closed (it would otherwise pass the
+        // floor + age checks forever).
+        let now = 2_000_000_000 * NANOS_PER_SECOND;
+        let future = now + GROWW_STATUS_LIVE_MAX_AGE_NANOS + 1;
+        assert!(!groww_status_is_live(future, now, 0));
+        assert!(
+            groww_status_is_live(now + GROWW_STATUS_LIVE_MAX_AGE_NANOS, now, 0),
+            "small forward skew inside the window is tolerated"
+        );
     }
 
     #[test]

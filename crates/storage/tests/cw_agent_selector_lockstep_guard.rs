@@ -31,6 +31,20 @@ fn read(path: &Path) -> String {
     std::fs::read_to_string(path).unwrap_or_else(|e| panic!("read {} failed: {e}", path.display()))
 }
 
+/// Extract ONE terraform resource block by name, bounded at ITS closing
+/// brace (a top-level `\n}`) — never a fixed byte window, which overruns
+/// into the neighboring resource and lets the neighbor's identical literals
+/// satisfy assertions vacuously (the 2026-07-06 mutation-verified hole).
+fn resource_block<'a>(tf: &'a str, block_name: &str) -> &'a str {
+    let at = tf
+        .find(&format!(
+            "resource \"aws_cloudwatch_metric_alarm\" \"{block_name}\""
+        ))
+        .unwrap_or_else(|| panic!("app-alarms.tf: resource {block_name} not found"));
+    let end = tf[at..].find("\n}").map_or(tf.len(), |rel| at + rel + 2);
+    &tf[at..end]
+}
+
 /// Extract the `metric_selectors` regex literal (`"^(...)$"`) from a file.
 fn extract_selector_regex(content: &str, name: &str) -> String {
     let marker = "\"metric_selectors\":";
@@ -123,17 +137,39 @@ fn groww_feed_down_alarms_exist_and_are_registered() {
 
     // Missing-data honesty: both alarms must never stick FIRING across the
     // scheduled 16:30 IST box stop / weekends / deploy gaps.
+    // The scan is bounded at the resource block's OWN closing brace
+    // (2026-07-06 fix): a fixed byte window overran into the NEIGHBOR
+    // resource, whose identical `treat_missing_data` literal satisfied the
+    // assertion even after the alarm's own line was deleted (mutation-
+    // verified vacuous pass — terraform then defaults to "missing", the
+    // exact 2026-06-02 stuck-FIRING class this guard claims to prevent).
     for block_name in ["groww_ws_inactive", "groww_stall_restart_storm"] {
-        let at = tf
-            .find(&format!(
-                "resource \"aws_cloudwatch_metric_alarm\" \"{block_name}\""
-            ))
-            .expect("resource located above");
-        let block = &tf[at..(at + 1500).min(tf.len())];
+        let block = resource_block(&tf, block_name);
         assert!(
             block.contains("treat_missing_data  = \"notBreaching\""),
             "app-alarms.tf: {block_name} must use treat_missing_data = notBreaching \
              (the 2026-06-02 stuck-FIRING fix class)"
+        );
+    }
+
+    // Delta-semantics honesty (2026-07-06 fix): the CloudWatch agent's
+    // Prometheus/EMF pipeline DELTA-converts counter metrics (each datapoint
+    // is the per-scrape increase, never the cumulative count), so the storm
+    // alarm must aggregate with Sum over a window — a Maximum-vs-cumulative
+    // threshold >1 can NEVER fire on its documented condition and un-fires
+    // mid-storm once the in-process backoff throttles kills apart.
+    {
+        let block = resource_block(&tf, "groww_stall_restart_storm");
+        assert!(
+            block.contains("statistic           = \"Sum\""),
+            "app-alarms.tf: groww_stall_restart_storm must use statistic = Sum — \
+             the CW agent delta-converts Prometheus counters, so Maximum >= 3 \
+             never sees a cumulative count (behaviorally dead alarm)"
+        );
+        assert!(
+            !block.contains("\"Maximum\""),
+            "app-alarms.tf: groww_stall_restart_storm must NOT regress to Maximum \
+             on a delta-converted counter"
         );
     }
 
@@ -145,6 +181,32 @@ fn groww_feed_down_alarms_exist_and_are_registered() {
         assert!(
             tf.contains(entry),
             "app-alarms.tf: {entry} must be registered in the app_cloudwatch_alarms output"
+        );
+    }
+}
+
+#[test]
+fn resource_block_extractor_is_bounded_at_own_closing_brace() {
+    // Anti-vacuous self-test (2026-07-06): the block extractor must stop at
+    // the alarm's OWN closing brace — an overrunning window that swallows
+    // the neighboring resource would let the neighbor's identical
+    // `treat_missing_data` / `statistic` literals satisfy the assertions
+    // after the alarm's own lines were deleted.
+    let root = repo_root();
+    let tf = read(&root.join("deploy/aws/terraform/app-alarms.tf"));
+    for block_name in ["groww_ws_inactive", "groww_stall_restart_storm"] {
+        let block = resource_block(&tf, block_name);
+        assert_eq!(
+            block
+                .matches("resource \"aws_cloudwatch_metric_alarm\"")
+                .count(),
+            1,
+            "{block_name}: extracted block must contain exactly ONE resource \
+             declaration (no neighbor overrun): {block}"
+        );
+        assert!(
+            block.trim_end().ends_with('}'),
+            "{block_name}: extracted block must end at its own closing brace"
         );
     }
 }
