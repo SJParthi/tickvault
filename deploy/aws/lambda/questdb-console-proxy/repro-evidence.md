@@ -8,6 +8,15 @@
 > (zero-loss-guarantee-charter §4 evidence discipline). It lives alongside
 > `handler.py` because every citation is from this lambda pair. This is a
 > frozen evidence artifact, NOT documentation to keep updated.
+>
+> **Round-8 amendment (2026-07-07, the ONLY change below this note since the
+> round-7 freeze):** the §5 "stray body bytes" section was frozen with an
+> EMPTY code block — the promised dump was never captured in round 7. The
+> original capture file `/tmp/body2.out` (the §2 curl's `-o` target; 2 bytes,
+> mtime `2026-07-06 12:34:49 UTC` — matching §2's `Date:` header) survived in
+> the repro sandbox, so the hex dump below was captured from it verbatim on
+> 2026-07-07 with `od -A x -t x1z` (`xxd` is not installed in the sandbox —
+> the section header now names the command actually run).
 
 ## §0. Environment
 - Server: QuestDB 9.3.5 official jar from Maven Central
@@ -83,9 +92,14 @@ curl: (28) Operation timed out after 15002 milliseconds with 2 bytes received
 time_total=15.002950 size_download=2
 ```
 
-### stray body bytes of the 301 (xxd /tmp/body2.out)
+### stray body bytes of the 301 (od -A x -t x1z /tmp/body2.out — captured 2026-07-07 from the original 2026-07-06 file, see the round-8 provenance amendment above)
 ```
+$ od -A x -t x1z /tmp/body2.out
+000000 0d 0a                                            >..<
+000002
 ```
+(2 bytes, `\r\n` — corroborating §2's `size_download=2` and §10's raw-byte
+trailing `\r\n`.)
 
 ## §6a. GET /index.html (plain)
 ```

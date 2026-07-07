@@ -1,0 +1,158 @@
+#!/usr/bin/env bash
+# gate-matrix-r7.sh — behavioral scenario matrix for the terraform-apply.yml
+# step "Deploy gate: console shell GET / must return 200 within 5s".
+#
+# Provenance (fixer rounds 7-8, 2026-07-06/07): produced in the 2026-07-06
+# fixer-round-7 session scratchpad and COMMITTED here in round 8 because the
+# plan cites it as the gate's ONLY behavioral proof — a session-ephemeral
+# scratchpad path was a dangling reference for every future reader of HEAD
+# (zero-loss-guarantee-charter §4 evidence discipline; the identical fix
+# pattern as repro-evidence.md alongside). Round-8 changes vs the scratchpad
+# original, so the harness is re-runnable from HEAD instead of frozen:
+#   (a) the gate script is EXTRACTED from .github/workflows/terraform-apply.yml
+#       at run time (yaml.safe_load, GitHub `${{ env.* }}` expressions
+#       substituted, FAILS if any expression survives) — no manual
+#       /tmp/gate-step.sh prep step;
+#   (b) scenario L added: pending-at-both-samples skip must name the START
+#       transition (box booting), not the auto-stop window (round-8 message
+#       fix), and scenario E now pins the retained auto-stop wording;
+#   (c) per-scenario PASS/FAIL is counted and the harness exits non-zero on
+#       any failure.
+# It lives alongside handler.py because the gate it exercises is this lambda
+# pair's deploy gate; it is EXCLUDED from the lambda zip (questdb-console.tf
+# archive_file excludes — exact paths, no globs).
+#
+# Run from anywhere:  bash deploy/aws/lambda/questdb-console-proxy/gate-matrix-r7.sh
+# Stubs terraform/aws/curl/sleep on PATH and drives (curl-code sequence,
+# ec2-state sequence) scenarios end-to-end through the REAL gate script.
+set -u
+
+SELF_DIR=$(cd "$(dirname "$0")" && pwd)
+REPO_ROOT=$(cd "$SELF_DIR/../../../.." && pwd)
+WORKFLOW="$REPO_ROOT/.github/workflows/terraform-apply.yml"
+WORK=$(mktemp -d)
+GATE_SRC="$WORK/gate-step.sh"
+
+python3 - "$WORKFLOW" > "$GATE_SRC" <<'PY'
+import sys
+import yaml
+
+doc = yaml.safe_load(open(sys.argv[1]))
+for job in doc["jobs"].values():
+    for step in job.get("steps", []) or []:
+        name = step.get("name") or ""
+        if name.startswith("Deploy gate: console shell"):
+            run = step["run"]
+            run = run.replace("${{ env.TF_DIR }}", "deploy/aws/terraform")
+            run = run.replace("${{ env.AWS_REGION }}", "ap-south-1")
+            if "${{" in run:
+                raise SystemExit("unsubstituted GitHub expression remains in the gate script")
+            sys.stdout.write(run)
+            raise SystemExit(0)
+raise SystemExit("gate step not found in terraform-apply.yml")
+PY
+
+FAILS=0
+
+run_case() {
+  local name="$1" codes="$2" states="$3" body="$4" expect_rc="$5" expect_grep="$6"
+  local dir="$WORK/$name"
+  mkdir -p "$dir/bin"
+  echo "$codes" | tr ' ' '\n' > "$dir/codes.txt"
+  echo "$states" | tr ' ' '\n' > "$dir/states.txt"
+  printf '%s' "$body" > "$dir/body.txt"
+
+  cat > "$dir/bin/terraform" <<EOF
+#!/usr/bin/env bash
+for a in "\$@"; do
+  case "\$a" in
+    questdb_console_url) echo "https://console.example.test"; exit 0 ;;
+    instance_id) echo "i-0abc"; exit 0 ;;
+  esac
+done
+exit 1
+EOF
+  cat > "$dir/bin/aws" <<EOF
+#!/usr/bin/env bash
+if [ "\$1" = "ssm" ]; then echo "FAKETOKEN"; exit 0; fi
+if [ "\$1" = "ec2" ]; then
+  n=\$(cat "$dir/state_idx" 2>/dev/null || echo 1)
+  s=\$(sed -n "\${n}p" "$dir/states.txt")
+  [ -z "\$s" ] && s=\$(tail -1 "$dir/states.txt")
+  echo \$((n+1)) > "$dir/state_idx"
+  echo "\$s"; exit 0
+fi
+exit 1
+EOF
+  cat > "$dir/bin/curl" <<EOF
+#!/usr/bin/env bash
+n=\$(cat "$dir/curl_idx" 2>/dev/null || echo 1)
+c=\$(sed -n "\${n}p" "$dir/codes.txt")
+[ -z "\$c" ] && c=\$(tail -1 "$dir/codes.txt")
+echo \$((n+1)) > "$dir/curl_idx"
+# find -o target
+out=""
+prev=""
+for a in "\$@"; do
+  [ "\$prev" = "-o" ] && out="\$a"
+  prev="\$a"
+done
+if [ "\$c" = "200" ]; then cat "$dir/body.txt" > "\$out"; else : > "\$out"; fi
+if [ "\$c" = "000" ]; then printf '000'; exit 28; fi
+printf '%s' "\$c"
+EOF
+  cat > "$dir/bin/sleep" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+  chmod +x "$dir/bin/"*
+  : > "$dir/summary"
+  ( cd "$dir" && PATH="$dir/bin:$PATH" GITHUB_STEP_SUMMARY="$dir/summary" \
+      bash "$GATE_SRC" > "$dir/out" 2>&1 )
+  local rc=$?
+  local verdict="PASS"
+  [ "$rc" -ne "$expect_rc" ] && verdict="FAIL(rc=$rc want=$expect_rc)"
+  if [ -n "$expect_grep" ] && ! grep -qF "$expect_grep" "$dir/out"; then
+    verdict="$verdict FAIL(missing: $expect_grep)"
+  fi
+  [ "$verdict" != PASS ] && FAILS=$((FAILS + 1))
+  printf '%-42s rc=%d  %s\n' "$name" "$rc" "$verdict"
+  if [[ "$verdict" != PASS ]]; then sed 's/^/    | /' "$dir/out" | tail -8; fi
+}
+
+HTML='<!DOCTYPE html><html>console</html>'
+
+# A. boot window, both samples running, 000s, grace 200 -> pass via grace (round-7 fix)
+run_case A_boot_running_000_grace200 "000 000 000 200" "running running" "$HTML" 0 "200 on the 90s grace re-probe"
+# B1. start transition pre=pending post=running, 000s, grace 200 -> pass via grace
+run_case B1_pending_to_running_grace200 "000 000 000 200" "pending running" "$HTML" 0 "200 on the 90s grace re-probe"
+# B2. same but grace still 000 -> FATAL past grace, pre-grace code shown
+run_case B2_pending_to_running_grace000 "000 000 000 000" "pending running running" "" 1 "past the 90s grace re-probe (pre-grace: '000')"
+# C. running + 503, grace 200 -> pass (round-5 behavior preserved)
+run_case C_running_503_grace200 "503 503 503 200" "running running" "$HTML" 0 "200 on the 90s grace re-probe"
+# D. running + 503, grace 000, mid-grace auto-stop -> reworded loud SKIP
+run_case D_midgrace_stop_skip "503 503 503 000" "running running stopped" "" 0 "consistent with QuestDB-not-listening / a booting OS OR a back-lambda invoke failure"
+# E. stopped at both samples, 000 -> loud skip naming the auto-stop window (round-8 pin)
+run_case E_stopped_both_skip "000 000 000" "stopped stopped" "" 0 "auto-stop window, 08:30–16:30 IST schedule"
+# F. running->stopped TOCTOU (pre=running, post=stopped) -> fail closed (round-6, unchanged)
+run_case F_run_to_stop_failclosed "000 000 000" "running stopped" "" 1 "transitioned running->stopped ACROSS the probe window"
+# G. healthy 200 first attempt -> pass
+run_case G_healthy_200 "200" "running" "$HTML" 0 "GET / == 200 within 5s"
+# H. running + 504 persists past grace -> FATAL naming shell-hang class
+run_case H_running_504_grace504 "504 504 504 504" "running running running" "" 1 "the unframed-response shell-hang class"
+# I. weird code 401 -> generic FATAL (unchanged)
+run_case I_401_generic_fatal "401 401 401" "running running" "" 1 "deploy gate FAILED"
+# J. grace gives 200 but body is NOT shell html -> FATAL (fail-closed grace)
+run_case J_grace200_wrong_body "000 000 000 200" "running running" "not the shell" 1 "200 but the body is not the console shell HTML"
+# K. unknown state -> fail closed (unchanged)
+run_case K_unknown_state "000 000 000" "unknown unknown" "" 1 "state could not be verified"
+# L. pending at BOTH samples, 000 -> loud skip naming the START transition,
+#    never the auto-stop window (round-8 message-accuracy fix)
+run_case L_pending_both_start_wording "000 000 000" "pending pending" "" 0 "start transition — box booting"
+
+echo "---"
+if [ "$FAILS" -ne 0 ]; then
+  echo "gate-matrix: $FAILS scenario(s) FAILED"
+  exit 1
+fi
+echo "gate-matrix: all 13 scenarios green"

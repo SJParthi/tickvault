@@ -533,7 +533,21 @@ jobs:
                     echo "FATAL: console GET / -> '${CODE}' and the box transitioned running->${STATE} ACROSS the probe window (pre-probe sample: running) — the failed probes were made while the box WAS running, so this may be a genuine shell regression caught just before the 16:30 IST auto-stop. Failing closed (audit Rule 11: no false-OK); the box is no longer probeable — verify on the next in-window apply."
                     exit 1
                   fi
-                  echo "⚠ SKIP (loud): console GET / -> '${CODE}' with the box ${STATE} (pre-probe sample: ${STATE_PRE}, post-probe sample: ${STATE}; auto-stop window, 08:30–16:30 IST schedule) — a not-running box cannot serve the shell (stopped box = 5s curl timeout = 000, never a fast 503); shell smoke re-runs on the next in-window apply" | tee -a "$GITHUB_STEP_SUMMARY"
+                  # Fixer round 8 (2026-07-07): name the window honestly.
+                  # 'pending' is the START transition (box still BOOTING per
+                  # the round-1 comment above — the 08:30 IST auto-start or
+                  # an operator manual start), NOT the 16:30 IST auto-stop
+                  # window; labelling it "auto-stop window" misdirected the
+                  # triage of an 08:30-IST apply. Skip DECISION unchanged —
+                  # message accuracy only. Pinned by gate-matrix-r7.sh
+                  # scenarios E (stopped keeps the auto-stop wording) + L
+                  # (pending names the start transition).
+                  if [ "$STATE" = "pending" ]; then
+                    WINDOW="start transition — box booting"
+                  else
+                    WINDOW="auto-stop window"
+                  fi
+                  echo "⚠ SKIP (loud): console GET / -> '${CODE}' with the box ${STATE} (pre-probe sample: ${STATE_PRE}, post-probe sample: ${STATE}; ${WINDOW}, 08:30–16:30 IST schedule) — a not-running box cannot serve the shell (stopped box = 5s curl timeout = 000, never a fast 503); shell smoke re-runs on the next in-window apply" | tee -a "$GITHUB_STEP_SUMMARY"
                   exit 0 ;;
                 running)
                   # Fixer round 5 (2026-07-06): running + fast 503 (the front's

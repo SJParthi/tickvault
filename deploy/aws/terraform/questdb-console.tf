@@ -75,7 +75,14 @@ data "archive_file" "questdb_console_proxy" {
   type        = "zip"
   source_dir  = "${path.module}/../lambda/questdb-console-proxy"
   output_path = "${path.module}/.build/questdb-console-proxy.zip"
-  excludes    = ["test_handler.py", "README.md"]
+  # Ship handler.py ONLY. archive_file excludes are EXACT relative paths (no
+  # globs), so every non-handler file committed into this source_dir MUST be
+  # listed here explicitly — fixer round 8 (2026-07-07): the round-7 commit
+  # of repro-evidence.md (and round 8's gate-matrix-r7.sh) would otherwise
+  # ship inside the prod back-lambda zip, and any future edit to those
+  # docs/harness files would drift output_base64sha256 into a lambda
+  # redeploy from a non-code change.
+  excludes = ["test_handler.py", "README.md", "repro-evidence.md", "gate-matrix-r7.sh"]
 }
 
 # ─────────────────────────────────────────────────────────────────────────────

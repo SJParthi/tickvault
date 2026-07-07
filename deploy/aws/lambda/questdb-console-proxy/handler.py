@@ -272,8 +272,12 @@ def lambda_handler(event, _context):
     # NEVER returned 200 through this console). Never elicit the 301: fetch
     # the framed shell directly. /index.html is 200 + Content-Length: 765 in
     # ~4ms through this exact relay code and itself carries the per-release
-    # hashed asset refs (assets/index-<hash>.js), so nothing drifts on a
-    # QuestDB upgrade. GET-only on purpose: HEAD / keeps relaying verbatim
+    # hashed asset refs (assets/index-<hash>.js), so the ASSET-HASH refs
+    # never drift on a QuestDB upgrade. The /index.html LOCATION itself IS a
+    # drift surface (a future QuestDB renaming it breaks this rewrite
+    # target) — guarded by the deploy-aws box canary (same-day WARN on the
+    # image-bump lane) + the terraform-apply hard gate (FATAL on the next
+    # drift apply). GET-only on purpose: HEAD / keeps relaying verbatim
     # (QuestDB answers a FRAMED chunked 405 in 1.2ms; HEAD /index.html is
     # live-unverified — don't change untested behavior). The browser URL
     # stays "/"; the shell's RELATIVE asset refs resolve identically.
