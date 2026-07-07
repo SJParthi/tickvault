@@ -42,17 +42,22 @@ unmaintained = "workspace"
 # longer in the lockfile — see Cargo.toml Section 11 for the feature
 # selection. Closed advisories: RUSTSEC-2026-0098, 0099, 0104.
 #
-# 2026-06-22: RUSTSEC-2026-0185 (quinn-proto 0.11.14, HIGH 7.5 — QUIC remote
-# memory exhaustion from unbounded out-of-order stream reassembly). UNREACHABLE
-# in our binary: quinn/quinn-proto are pulled ONLY by reqwest's optional `http3`
-# feature, which we do NOT enable (reqwest features = json/rustls/charset/http2/
-# query, default-features = false). It is a phantom Cargo.lock entry, never
-# compiled — `cargo tree -i quinn-proto -e normal,build` returns empty. Mirrored
-# in .cargo/audit.toml. Removal condition: bump the lock to quinn-proto >= 0.11.15
-# in a maintenance sweep (the bump needs `cargo update`, blocked by the local
-# pre-tool hook; a follow-up will carry it). Sibling advisory RUSTSEC-2026-0186
-# (memmap2, which IS compiled) was properly fixed by bumping the pin to 0.9.11.
-ignore = ["RUSTSEC-2026-0185"]
+# 2026-07-07: the 2026-06-22 RUSTSEC-2026-0185 ignore (quinn-proto 0.11.14,
+# phantom lockfile-only entry via reqwest's disabled `http3` feature) was
+# REMOVED — cargo-deny now emits `warning[advisory-not-detected]: no crate
+# matched advisory criteria` for it (verified in the 2026-07-07 Security &
+# Audit CI log), so the ignore is stale housekeeping.
+#
+# 2026-07-07: RUSTSEC-2026-0204 — crossbeam-epoch 0.9.18 `fmt::Pointer`
+# invalid pointer dereference for `Atomic`/`Shared` when the underlying
+# pointer is invalid (e.g. `Atomic::null`). TRANSITIVE-ONLY in our graph:
+# (a) criterion → rayon → rayon-core → crossbeam-deque (dev/bench chain),
+# (b) metrics-exporter-prometheus → metrics-util (internals). We never
+# invoke `fmt` on `Atomic`/`Shared` — no direct crossbeam-epoch usage in
+# tickvault code. Real fix = bump the lock to crossbeam-epoch >= 0.9.20,
+# blocked on operator approval (`cargo update` is BANNED per CLAUDE.md);
+# a follow-up maintenance sweep will carry the targeted bump.
+ignore = ["RUSTSEC-2026-0204"]
 
 # --- Licenses: Block incompatible licenses ---
 [licenses]
