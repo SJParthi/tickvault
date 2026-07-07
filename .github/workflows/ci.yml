@@ -477,6 +477,18 @@ jobs:
       # run unconditionally inside this already-All-Green-gated job (a step
       # in an existing needed job, NOT a new job — merge-gate-lock §5 forbids
       # a PR-relevant job outside all-green's needs list).
+      #
+      # 2026-07-07 (fixer round 9): the step ALSO runs the FILE 5 deploy-gate
+      # behavioral matrix (gate-matrix-r7.sh, 13 scenarios, ~1-2s, bash +
+      # python3 + PyYAML — preinstalled on ubuntu-latest). Before this, the
+      # harness ran in NO CI lane, so every "pinned by gate-matrix-r7.sh"
+      # comment was a manual-run-only claim (the same unenforced-pin class
+      # round 4 fixed for the unittest suites). The harness self-extracts the
+      # gate step from terraform-apply.yml and fails loudly ("gate step not
+      # found") if the step is deleted or renamed — closing that half of the
+      # gate-existence ratchet gap disclosed in the plan's alerting row.
+      # Honest residual: a `continue-on-error:` added to the gate step is NOT
+      # caught (the harness executes the step's script, not its YAML attrs).
       - name: QuestDB console lambda unit tests (back + front)
         shell: bash
         run: |
@@ -485,6 +497,8 @@ jobs:
             echo "== ${d} =="
             (cd "$d" && python3 -m unittest test_handler -v)
           done
+          echo "== gate-matrix-r7.sh (terraform-apply.yml console deploy-gate scenarios) =="
+          bash deploy/aws/lambda/questdb-console-proxy/gate-matrix-r7.sh
 
   # -------------------------------------------------------------------------
   # All Green — the single merge choke point (merge-gate hardening 2026-07-04).

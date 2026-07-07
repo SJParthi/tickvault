@@ -17,6 +17,27 @@
 > the repro sandbox, so the hex dump below was captured from it verbatim on
 > 2026-07-07 with `od -A x -t x1z` (`xxd` is not installed in the sandbox —
 > the section header now names the command actually run).
+>
+> **Round-9 amendment (2026-07-07, curl COMMAND-line re-quoting ONLY — no
+> output byte changed, including the CRLF header line endings inside the
+> transcript blocks, which are real curl `-D -` bytes):** the curl command
+> lines in §1–§8 were shell-mangled during the round-7 freeze (quoting
+> stripped), so AS FROZEN they could not have produced the outputs shown
+> beneath them — executed proof (2026-07-07 fix sandbox, against a closed
+> port so no server is needed): running §3's line exactly as previously
+> frozen yields `curl: (6) Could not resolve host: close` and `curl: (6)
+> Could not resolve host: identity` (the unquoted `-H Connection:` turns
+> `close` into a URL argument) plus `curl: (3) URL rejected: Bad hostname`
+> (the space inside the unquoted `-w` format splits
+> `size_download=%{size_download}\n` off as a bogus URL). The command lines
+> below are re-quoted to the form that actually ran (`-H 'Connection:
+> close'`, `-w 'time_total=%{time_total}\n'`, …); every OUTPUT block is
+> byte-untouched. The round-7 "VERBATIM" claim above therefore holds for the
+> outputs and section structure, NOT for the command lines as originally
+> frozen — the same evidence-fidelity class as the round-8 empty-§5 fix.
+> Load-bearing conclusions are unaffected: §9 (python urllib repro) and §10
+> (raw-socket probe) are reproducible as written and independently sustain
+> §11's conclusions 2/3/5.
 
 ## §0. Environment
 - Server: QuestDB 9.3.5 official jar from Maven Central
@@ -33,7 +54,7 @@
 
 ## §1. GET /exec?query=SELECT%201 (HTTP/1.1 plain)
 ```
-$ curl -sS --max-time 15 -o /tmp/body1.out -D - -w time_total=%{time_total}\n http://127.0.0.1:9000/exec?query=SELECT%201
+$ curl -sS --max-time 15 -o /tmp/body1.out -D - -w 'time_total=%{time_total}\n' 'http://127.0.0.1:9000/exec?query=SELECT%201'
 HTTP/1.1 200 OK
 Server: questDB/1.0
 Date: Mon, 6 Jul 2026 12:34:34 GMT
@@ -46,7 +67,7 @@ time_total=0.022736
 
 ## §2. GET / (HTTP/1.1, plain curl defaults)
 ```
-$ curl -sS --max-time 15 -o /tmp/body2.out -D - -w time_total=%{time_total} size_download=%{size_download}\n http://127.0.0.1:9000/
+$ curl -sS --max-time 15 -o /tmp/body2.out -D - -w 'time_total=%{time_total} size_download=%{size_download}\n' http://127.0.0.1:9000/
 HTTP/1.1 301 Moved Permanently
 Server: questDB/1.0
 Date: Mon, 6 Jul 2026 12:34:34 GMT
@@ -58,7 +79,7 @@ time_total=15.002383 size_download=2
 
 ## §3. GET / with r2 headers (Connection: close + Accept-Encoding: identity — exactly what deployed back lambda sends)
 ```
-$ curl -sS --max-time 15 -o /tmp/body3.out -D - -w time_total=%{time_total} size_download=%{size_download}\n -H Connection: close -H Accept-Encoding: identity http://127.0.0.1:9000/
+$ curl -sS --max-time 15 -o /tmp/body3.out -D - -w 'time_total=%{time_total} size_download=%{size_download}\n' -H 'Connection: close' -H 'Accept-Encoding: identity' http://127.0.0.1:9000/
 HTTP/1.1 301 Moved Permanently
 Server: questDB/1.0
 Date: Mon, 6 Jul 2026 12:35:17 GMT
@@ -70,7 +91,7 @@ time_total=15.002692 size_download=2
 
 ## §4. GET / with Accept-Encoding: gzip
 ```
-$ curl -sS --max-time 15 -o /tmp/body4.out -D - -w time_total=%{time_total} size_download=%{size_download}\n -H Accept-Encoding: gzip http://127.0.0.1:9000/
+$ curl -sS --max-time 15 -o /tmp/body4.out -D - -w 'time_total=%{time_total} size_download=%{size_download}\n' -H 'Accept-Encoding: gzip' http://127.0.0.1:9000/
 HTTP/1.1 301 Moved Permanently
 Server: questDB/1.0
 Date: Mon, 6 Jul 2026 12:35:32 GMT
@@ -82,7 +103,7 @@ time_total=15.001979 size_download=2
 
 ## §5. GET / with --http1.0
 ```
-$ curl -sS --max-time 15 --http1.0 -o /tmp/body5.out -D - -w time_total=%{time_total} size_download=%{size_download}\n http://127.0.0.1:9000/
+$ curl -sS --max-time 15 --http1.0 -o /tmp/body5.out -D - -w 'time_total=%{time_total} size_download=%{size_download}\n' http://127.0.0.1:9000/
 HTTP/1.1 301 Moved Permanently
 Server: questDB/1.0
 Date: Mon, 6 Jul 2026 12:35:47 GMT
@@ -103,7 +124,7 @@ trailing `\r\n`.)
 
 ## §6a. GET /index.html (plain)
 ```
-$ curl -sS --max-time 15 -o /tmp/body6.out -D - -w time_total=%{time_total} size_download=%{size_download}\n http://127.0.0.1:9000/index.html
+$ curl -sS --max-time 15 -o /tmp/body6.out -D - -w 'time_total=%{time_total} size_download=%{size_download}\n' http://127.0.0.1:9000/index.html
 HTTP/1.1 200 OK
 Server: questDB/1.0
 Date: Mon, 6 Jul 2026 12:36:25 GMT
@@ -117,7 +138,7 @@ time_total=0.006288 size_download=765
 
 ## §6b. GET /index.html with r2 headers (Connection: close + Accept-Encoding: identity)
 ```
-$ curl -sS --max-time 15 -o /tmp/body6b.out -D - -w time_total=%{time_total} size_download=%{size_download}\n -H Connection: close -H Accept-Encoding: identity http://127.0.0.1:9000/index.html
+$ curl -sS --max-time 15 -o /tmp/body6b.out -D - -w 'time_total=%{time_total} size_download=%{size_download}\n' -H 'Connection: close' -H 'Accept-Encoding: identity' http://127.0.0.1:9000/index.html
 HTTP/1.1 200 OK
 Server: questDB/1.0
 Date: Mon, 6 Jul 2026 12:36:25 GMT
@@ -131,7 +152,7 @@ time_total=0.000915 size_download=765
 
 ## §7. GET /assets/index-Cg4NZQY-.js (real console asset)
 ```
-$ curl -sS --max-time 15 -o /tmp/body7.out -D - -w time_total=%{time_total} size_download=%{size_download}\n http://127.0.0.1:9000/assets/index-Cg4NZQY-.js
+$ curl -sS --max-time 15 -o /tmp/body7.out -D - -w 'time_total=%{time_total} size_download=%{size_download}\n' http://127.0.0.1:9000/assets/index-Cg4NZQY-.js
 HTTP/1.1 200 OK
 Server: questDB/1.0
 Date: Mon, 6 Jul 2026 12:36:25 GMT
@@ -145,7 +166,7 @@ time_total=0.005957 size_download=2918616
 
 ## §8. HEAD / (curl -I)
 ```
-$ curl -sS --max-time 15 -I -w time_total=%{time_total}\n http://127.0.0.1:9000/
+$ curl -sS --max-time 15 -I -w 'time_total=%{time_total}\n' http://127.0.0.1:9000/
 HTTP/1.1 405 Method Not Allowed
 Server: questDB/1.0
 Date: Mon, 6 Jul 2026 12:36:25 GMT

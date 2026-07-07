@@ -541,7 +541,14 @@ jobs:
                   # triage of an 08:30-IST apply. Skip DECISION unchanged —
                   # message accuracy only. Pinned by gate-matrix-r7.sh
                   # scenarios E (stopped keeps the auto-stop wording) + L
-                  # (pending names the start transition).
+                  # (pending names the start transition) — a merge-time pin
+                  # since round 9 (2026-07-07): ci.yml's Repo Guards step
+                  # "QuestDB console lambda unit tests (back + front)" runs
+                  # the harness on every PR (it feeds All Green), so a
+                  # wording regression here — or deleting/renaming this gate
+                  # step, which the harness's extractor fails on — goes red
+                  # BEFORE merge. (Rounds 7-8 the harness was manual-run-only
+                  # and this "Pinned by" was an unenforced claim.)
                   if [ "$STATE" = "pending" ]; then
                     WINDOW="start transition — box booting"
                   else
