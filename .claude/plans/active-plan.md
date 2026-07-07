@@ -27,9 +27,12 @@
 - [x] FILE 6 — box-local canary in deploy-aws.yml: two SSM command-array elements after the QUESTDB-UP loop, before the TRADING APP FIRST block — NON-FATAL loud WARN probing the rewrite TARGET `/index.html` (never bare `/`, which would hang the SSM shell) so a QuestDB image bump that breaks the shell is surfaced LOUDLY on the deploy that ships it — fixer round 1 (2026-07-06): the Fetch step now captures the SSM stdout to a file and greps for the canary WARN, emitting a job-level `::warning::` annotation + a `$GITHUB_STEP_SUMMARY` line (and a separate UNKNOWN warning when neither the WARN nor `QDB-SHELL-CANARY-OK` marker is present, e.g. SSM 24,000-char truncation). Non-fatal is mandated by deploy-aws.yml's own TRADING-APP-FIRST charter (a broken observability component must never block the trading deploy)
   - Files: .github/workflows/deploy-aws.yml
   - Tests: N/A-for-crates-grep (echoes QDB-SHELL-CANARY-OK or a WARN line in the SSM output the workflow already surfaces; YAML validated)
-- [x] FILE 7 — terraform comment truth + deploy trigger: questdb-console.tf back-lambda `timeout = 26` comment corrected (the back handler `_TIMEOUT_SECS` is 12s, not the stale "25s"). Zero infra diff, but LOAD-BEARING: terraform-apply.yml's push path filter covers only `deploy/aws/terraform/**` + the workflow file, so this touch makes the r3 lambdas deploy on the merge push (archive_file source_code_hash → plan exit 2 → apply) instead of waiting for the scheduled drift-apply
+- [x] FILE 7 — terraform comment truth-correction ONLY (the stale "25s" claim → the back handler's real 12s `_TIMEOUT_SECS`; fixer round 4 also relabels "~16 sequential recvs" → "~16 sequential capped read() calls, each of which may span MANY recvs" — the ~16 counts `fp.read()` CALLS in `_read_capped`, ceil(4,100,000 / 262,144), not socket recvs; http.client's BufferedReader loops raw recvs per read() and each recv resets the 12s timer, so under a dribble the recv count is bounded only by the Lambda 26s kill). Zero infra diff, and NOT deploy-load-bearing (fixer round 4 correction — the earlier "LOAD-BEARING … makes the r3 lambdas deploy on the merge push" claim was wrong on BOTH halves, Verified: (1) this PR edits `.github/workflows/terraform-apply.yml` itself, which is IN the workflow's own push path filter (`paths: - 'deploy/aws/terraform/**' - '.github/workflows/terraform-apply.yml'`), so the merge push triggers the workflow with or without this tf touch; (2) the apply fires on `terraform plan -detailed-exitcode` = 2, which the changed lambda handler bytes already guarantee via `data.archive_file.questdb_console_proxy[0].output_base64sha256` → `source_code_hash` drift — no .tf edit is needed to produce drift. Nuance: the push-triggered apply is still market-hours-guarded, so a mid-market merge deploys via the 15:50 IST scheduled slot, not literally "on the merge push". Do NOT copy a "touch a tf comment to force deploy" pattern from this item — it is a non-mechanism)
   - Files: deploy/aws/terraform/questdb-console.tf
   - Tests: N/A-for-crates-grep (terraform fmt -check stays clean; comment-only)
+- [x] FILE 8 — CI merge-time enforcement of the lambda test suites (fixer round 4, 2026-07-06): new step "QuestDB console lambda unit tests (back + front)" appended to the EXISTING ci.yml `repo-guards` job (already in All Green's `needs:` — a step in an existing needed job, never a new job, per merge-gate-lock §5). Runs `python3 -m unittest test_handler -v` in both console lambda dirs unconditionally (stdlib-only suites, <1s). Closes the adversarially-confirmed gap that NO CI lane executed these suites — a PR partially reverting the r3 handler fix previously merged with every check green, caught only by the FILE 5 runtime gate on the next terraform-drift apply
+  - Files: .github/workflows/ci.yml
+  - Tests: N/A-for-crates-grep (the CI step itself executes the FILE 3 + FILE 4 suites at merge time; YAML validated via python3 yaml.safe_load)
 
 ## Design
 
@@ -120,9 +123,13 @@ so the pre-fix behavior (504 after ~12s) can physically never pass.
   lambda's HTTPError arm (fixer rounds 2+3, 2026-07-06). HONEST BOUND (fixer
   round 3 — the earlier "bounded 12s read → honest upstream_timeout → front
   504, never a silent hang" wording overstated it; it holds only for total
-  silence): `_TIMEOUT_SECS=12` is PER socket recv (`_read_capped` can issue
-  up to ~16 sequential recvs, each resetting the 12s timer — same honest
-  bound the questdb-console.tf `timeout = 26` comment states). TOTAL SILENCE
+  silence): `_TIMEOUT_SECS=12` is PER socket recv (`_read_capped` issues up
+  to ~16 sequential capped `read()` calls — ceil(MAX_BODY_BYTES 4,100,000 /
+  _READ_CHUNK 262,144) counts `fp.read()` CALLS, not recvs; http.client's
+  BufferedReader loops raw socket recvs inside each read(), every recv
+  resetting the 12s timer, so under a dribble the recv count is bounded only
+  by the Lambda 26s kill — same honest bound the questdb-console.tf
+  `timeout = 26` comment states). TOTAL SILENCE
   → guarded `upstream_timeout` → front 504; a DRIBBLING body (≥1 byte per
   <12s recv) never times a recv out and is bounded by the back Lambda's 26s
   timeout instead → Lambda FunctionError → the front's generic 503 (a
@@ -167,9 +174,14 @@ so the pre-fix behavior (504 after ~12s) can physically never pass.
   behaviorally reproduces the prod 504 on r2 bytes.
 - **FILE 5 gate red-on-pre-fix / green-post-fix:** pre-fix GET / = 504 after
   ~12s can never pass `--max-time 5`; post-fix §9c measured 4ms box-side.
-- Workflow YAML: `python3 -c "import yaml; yaml.safe_load(...)"` on both
-  edited workflows. `terraform -chdir=deploy/aws/terraform fmt -check` stays
-  clean (comment-only change).
+- **CI merge-time enforcement (fixer round 4):** both suites also run on
+  every PR via the ci.yml Repo Guards step "QuestDB console lambda unit
+  tests (back + front)" (FILE 8), which feeds All Green — a red suite now
+  blocks the merge instead of waiting for the FILE 5 runtime gate on the
+  next terraform-drift apply.
+- Workflow YAML: `python3 -c "import yaml; yaml.safe_load(...)"` on all
+  edited workflows (incl. ci.yml). `terraform -chdir=deploy/aws/terraform
+  fmt -check` stays clean (comment-only change).
 
 ## Rollback
 
@@ -203,11 +215,11 @@ Rust-only):
 
 | Dimension | This plan |
 |---|---|
-| 100% code coverage (llvm-cov ratchet) | N/A — Python lambda, no llvm-cov surface; covered by the 9 new/updated unit tests + 2 workflow gates |
+| 100% code coverage (llvm-cov ratchet) | N/A — Python lambda, no llvm-cov surface; covered by the 12 new/updated unit tests (FILE 3: 10 new + 1 updated back; FILE 4: 1 new front — the earlier "9" predated fixer rounds 1–3) + 2 workflow gates. CI-enforced at merge time since fixer round 4 via the ci.yml Repo Guards step "QuestDB console lambda unit tests (back + front)" (FILE 8) — before that step, NO CI lane ran these suites, so every "pinned by test_*" claim in this plan was a local-only check, not a merge-time ratchet |
 | DHAT / Criterion / hot-path | N/A — cold-path observability lambda, zero Rust, zero hot-path code |
 | Audit table + DEDUP keys | N/A — no SEBI-relevant event, no DB write; forensic record = Actions log + step summary + the front's structured `_log` |
 | 100% logging | front `_log` structured JSON per request (unchanged, now shows ok/200 on "/") |
-| 100% alerting | the FILE 5 deploy gate IS the alert — a red workflow on any shell regression; FILE 6 WARNs on the box lane. HONEST ENVELOPE (fixer round 3, 2026-07-06): the gate step's own continued EXISTENCE is pinned by NO ratchet — no source-scan guard test covers terraform-apply.yml gate content (the repo's pattern for that is a Rust guard test à la `crates/storage/tests/groww_scale_aws_lockout_guard.rs`, which is outside this PR's no-Rust scope constraint), so a future PR deleting or `continue-on-error`-ing the gate step leaves every Python and Rust suite green. Flagged follow-up: add a workflow-content guard test pinning the gate step (name + no continue-on-error) in a Rust-allowed PR |
+| 100% alerting | the FILE 5 deploy gate IS the alert — a red workflow on any shell regression; FILE 6 WARNs on the box lane. HONEST ENVELOPE (fixer round 3, 2026-07-06): the gate step's own continued EXISTENCE is pinned by NO ratchet — no source-scan guard test covers terraform-apply.yml gate content (the repo's pattern for that is a Rust guard test à la `crates/storage/tests/groww_scale_aws_lockout_guard.rs`, which is outside this PR's no-Rust scope constraint), so a future PR deleting or `continue-on-error`-ing the gate step leaves every Python and Rust suite green; the SAME envelope applies to the FILE 8 ci.yml test step (its continued existence is likewise pinned by no guard test). Flagged follow-up: add a workflow-content guard test pinning both steps (name + no continue-on-error) in a Rust-allowed PR |
 | 100% security | secret hygiene: `::add-mask::` + header-FILE (umask 077 mktemp) + trap rm; device-key auth byte-untouched; SQL gates byte-untouched |
 | 100% scenarios | the behavior matrix in the PR body (GET /, HEAD /, assets, /exec, box stopped, box slow, future unframed 3xx/non-3xx) — each row evidence-cited |
 | 100% code review | adversarial pass on the diff before the PR opens |

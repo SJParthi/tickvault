@@ -467,6 +467,25 @@ jobs:
         shell: bash
         run: make lambda-test
 
+      # 2026-07-06 (console shell-hang fix, fixer round 4): before this step
+      # the QuestDB console lambda Python suites ran in NO CI lane — a PR
+      # reverting the B4 r3 handler fix (e.g. removing the _NoFollowRedirect
+      # opener or re-adding a body read in the 3xx arm) merged with every
+      # check green; only the terraform-apply.yml runtime deploy gate would
+      # catch it, and only on the next drift-apply. Both suites are
+      # stdlib-only (no boto3, no pip installs) and complete in <1s, so they
+      # run unconditionally inside this already-All-Green-gated job (a step
+      # in an existing needed job, NOT a new job — merge-gate-lock §5 forbids
+      # a PR-relevant job outside all-green's needs list).
+      - name: QuestDB console lambda unit tests (back + front)
+        shell: bash
+        run: |
+          set -euo pipefail
+          for d in deploy/aws/lambda/questdb-console-proxy deploy/aws/lambda/questdb-console-front; do
+            echo "== ${d} =="
+            (cd "$d" && python3 -m unittest test_handler -v)
+          done
+
   # -------------------------------------------------------------------------
   # All Green — the single merge choke point (merge-gate hardening 2026-07-04).
   #
