@@ -2812,7 +2812,7 @@ mod tests {
     }
 
     #[test]
-    fn test_notification_digest_window_clamped_to_60_3600() {
+    fn test_notification_digest_window_secs_clamped_to_60_3600() {
         let mut config = NotificationConfig::default();
         config.digest_window_secs = 0;
         assert_eq!(

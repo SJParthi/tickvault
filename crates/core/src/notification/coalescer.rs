@@ -643,6 +643,39 @@ mod tests {
         assert_eq!(ncfg.digest_window_secs_clamped(), 3_600);
     }
 
+    // Name-matched pub-fn coverage (pub-fn-test-guard contract).
+    #[test]
+    fn test_effective_drain_window_selects_market_window() {
+        let mut cfg = CoalescerConfig::default();
+        cfg.market_hours_window = Duration::from_secs(1234);
+        cfg.window = Duration::from_secs(77);
+        assert_eq!(
+            effective_drain_window(true, &cfg),
+            Duration::from_secs(1234)
+        );
+        assert_eq!(effective_drain_window(false, &cfg), Duration::from_secs(77));
+    }
+
+    #[test]
+    fn test_should_force_drain_close_falling_edge_only() {
+        assert!(should_force_drain(true, false));
+        assert!(!should_force_drain(false, true));
+        assert!(!should_force_drain(true, true));
+        assert!(!should_force_drain(false, false));
+    }
+
+    #[test]
+    fn test_drain_mature_with_window_honors_window_param() {
+        let c = make_coalescer(0);
+        c.observe("TickGapsSummary", Severity::Low, || "gap".to_string());
+        // A huge window keeps the bucket young; a zero window drains it.
+        assert!(
+            c.drain_mature_with_window(Duration::from_secs(3600))
+                .is_empty()
+        );
+        assert_eq!(c.drain_mature_with_window(Duration::from_secs(0)).len(), 1);
+    }
+
     #[test]
     fn test_digest_force_drain_at_market_close_boundary() {
         // Injected market-phase clock: only the in→out falling edge (the

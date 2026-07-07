@@ -2571,6 +2571,27 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
+    fn test_episode_role_resolve_for_reconnect_open_for_disconnect() {
+        use super::super::episode::EpisodeRole;
+        let disc = NotificationEvent::WebSocketDisconnected {
+            connection_index: 0,
+            reason: "reset".to_string(),
+        };
+        assert_eq!(disc.episode_role(), EpisodeRole::Open);
+        let rec = NotificationEvent::WebSocketReconnected {
+            connection_index: 0,
+            reason: None,
+            down_secs: 1,
+            attempts: 1,
+        };
+        assert_eq!(rec.episode_role(), EpisodeRole::Resolve);
+        let od_rec = NotificationEvent::OrderUpdateReconnected {
+            consecutive_failures: 2,
+        };
+        assert_eq!(od_rec.episode_role(), EpisodeRole::Resolve);
+    }
+
+    #[test]
     fn test_episode_key_ws_lifecycle_variants_map_to_families() {
         use super::super::episode::{EpisodeFamily, EpisodeRole};
         let disc = NotificationEvent::WebSocketDisconnected {
