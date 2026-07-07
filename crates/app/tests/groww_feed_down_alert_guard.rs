@@ -247,7 +247,7 @@ fn test_status_file_evidence_is_freshness_gated() {
     }
     // The disable arm must advance the live floor + reset the episode latch
     // so a post-re-enable read can never accept a pre-disable fossil as fresh.
-    let disable_windows = marker_windows(prod, "\"feed_disabled\"", 12, 60);
+    let disable_windows = marker_windows(prod, "\"feed_disabled\"", 12, 70);
     assert!(!disable_windows.is_empty());
     for (n, region) in disable_windows.iter().enumerate() {
         assert!(
@@ -262,6 +262,24 @@ fn test_status_file_evidence_is_freshness_gated() {
             "groww_bridge.rs: the disable arm #{n} must reset the per-episode \
              status-freshness latch (fresh_status_seen_this_episode = false) — \
              otherwise the pre-disable episode's proof leaks across the re-enable"
+        );
+        // 2026-07-07 fix (review finding): the disable arm's `gauge.set(0.0)`
+        // is the alarm's ONLY 0-signal for a runtime-disable episode — the
+        // loop `continue`s before the tail publish while disabled, so with
+        // this set deleted the metrics exporter keeps re-rendering the LAST
+        // value (1) on every 60s scrape: tv_groww_ws_active exports a false
+        // green 1 for the entire disable window and tv-<env>-groww-ws-inactive
+        // is blind to exactly the class its alarm_description claims to cover.
+        // The loop-tail publish site does NOT cover this (it is skipped by the
+        // `continue`), and the supervisor bridge-death arm publishes on a
+        // different vector — pin THIS emit site explicitly.
+        assert!(
+            region.contains("m_groww_active.as_ref()") && region.contains("gauge.set(0.0)"),
+            "groww_bridge.rs: the disable arm #{n} must drop the already-registered \
+             tv_groww_ws_active gauge to 0 (m_groww_active.as_ref() -> gauge.set(0.0)) \
+             BEFORE its `continue` — the disabled loop turn skips the tail publish, \
+             so without this set the exporter keeps rendering the stale 1 and the \
+             groww-ws-inactive alarm is blind for the whole disable window:\n{region}"
         );
     }
 }

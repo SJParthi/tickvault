@@ -3699,6 +3699,44 @@ mod tests {
              both return the plain UTC epoch, reintroducing the 19,800s-stale-forever \
              freshness-gate bug"
         );
+        // 2026-07-07 hardening (review finding): the wall-clock SOURCE line is
+        // the other half of the two-line function and was previously unpinned.
+        // A one-token revert to `datetime.now(timezone.utc)` — or dropping
+        // `tz=IST` on a UTC-configured box — makes the `replace(tzinfo=
+        // timezone.utc)` trick a no-op (the datetime is already UTC wall
+        // clock), so `now_ist_nanos` returns the plain UTC epoch again: the
+        // exact 19,800s stale-forever regression, with the replace-trick line
+        // still present to satisfy the positive pin above. Pin the IST-zoned
+        // now positively on an EXECUTABLE code line.
+        assert!(
+            code_lines
+                .iter()
+                .any(|l| l.contains("datetime.now(tz=IST)")),
+            "groww_sidecar.py: now_ist_nanos must take its wall clock from \
+             datetime.now(tz=IST) on an EXECUTABLE code line — any other now-source \
+             (datetime.now(timezone.utc), a naked datetime.now() on a UTC box) turns \
+             the replace(tzinfo=timezone.utc) trick into a no-op and the stamp back \
+             into the plain UTC epoch, so groww_status_is_live classifies every real \
+             status record as 19,800s stale forever:\n{body}"
+        );
+        // ...and ban every OTHER datetime.now(...) / utcnow() source in the
+        // body's code so the IST-keyword form is the ONLY wall-clock read
+        // (a positional `datetime.now(IST)` must be rewritten to the pinned
+        // `tz=IST` keyword form — the ratchet is deliberately strict).
+        let non_ist_now_calls = code_lines
+            .iter()
+            .filter(|l| {
+                (l.contains("datetime.now(") && !l.contains("datetime.now(tz=IST)"))
+                    || l.contains("utcnow(")
+            })
+            .count();
+        assert_eq!(
+            non_ist_now_calls, 0,
+            "groww_sidecar.py: now_ist_nanos must not read the wall clock from any \
+             source other than datetime.now(tz=IST) — datetime.now(timezone.utc) / \
+             naked datetime.now() / utcnow() all defeat the IST-epoch replace-trick \
+             and reintroduce the 19,800s-stale-forever freshness-gate bug"
+        );
     }
 
     #[test]
