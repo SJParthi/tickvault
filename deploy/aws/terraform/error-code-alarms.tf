@@ -35,15 +35,34 @@ locals {
   # <=15-min repeat gaps (2026-07-06 DH-901 shape: 2 messages per episode --
   # one ALARM + one OK -- instead of ~32 flapping pairs).
   #
-  # ok_recovery (round-1 review fix, 2026-07-06): for repeat-emitters (DH-901
-  # every 15 min, etc.) the eval-3/dta-1 OK transition genuinely tracks
-  # recovery (the code stopped firing) -> ok_actions ON. The REST canary is
-  # the exception: it emits only at 09:05/12:00/15:25 IST, so with a sparse
-  # metric + notBreaching the alarm ALWAYS returns to OK ~15 min after the
-  # single failing datapoint ages out -- "OK" would mean "no new probe ran
-  # yet", NOT "REST recovered" (a Rule-11 false-OK). Its recovery signal is
-  # the NEXT scheduled probe staying silent (or the DH-901 profile-poll
-  # alarm), so ok_recovery = false suppresses the misleading recovered page.
+  # ok_recovery (round-1 review fix, 2026-07-06; widened round-4): for
+  # repeat-emitters (DH-901 every 15 min, WS-GAP-07 storms, the FEED-STALL-01
+  # storm detector) the eval-3/dta-1 OK transition genuinely tracks recovery
+  # (the code stopped firing) -> ok_actions ON. For ONE-SHOT / DISCRETE
+  # emitters the same sparse-metric + notBreaching mechanics AUTO-transition
+  # to OK ~15 min after the single datapoint ages out of the lookback -- and
+  # the telegram-webhook Lambda forwards OK states as a green "recovered"
+  # page -- while the underlying condition still persists (a Rule-11
+  # false-recovery). ok_recovery = false suppresses that misleading OK for:
+  #   - rest-canary-01: 3 probes/day; OK = "no new probe ran yet". Recovery
+  #     signal = the NEXT scheduled probe staying silent (or the DH-901
+  #     profile-poll alarm).
+  #   - ws-reinject-01: emitted exactly ONCE per boot (wal_reinject.rs abort
+  #     arm); the condition -- frames staged in WAL replaying/ with a
+  #     dead/wedged consumer -- persists until the NEXT boot. OK ~15 min
+  #     later cannot mean recovered.
+  #   - proc-01: a discrete kernel OOM-kill event; the memory pressure that
+  #     caused it is not fixed by the episode aging out.
+  #   - dh-906: a discrete per-order reject; OK = aged out, never "orders
+  #     working again".
+  # auth-gap-04 stays ok_recovery = true with a stated ambiguity (round-4):
+  # its emit site returns Err from the boot mint path, systemd Restart=always
+  # re-boots and re-emits roughly every failing boot cycle (each cycle spans
+  # TOTP_MAX_RETRIES x 30s windows) -- a repeat-emitter whose OK ~= "stopped
+  # firing" (secret reconciled, or the unit stopped). Caveat: if systemd's
+  # StartLimitBurst (8/600s) ever halts the restart loop while the secret is
+  # still wrong, emissions stop and the OK would be an aged-out false
+  # recovery -- borderline, kept ON with this stated residual.
   error_code_alerts = {
     "rest-canary-01" = {
       pattern     = "{ $.code = \"REST-CANARY-01\" && $.level = \"ERROR\" }"
@@ -78,8 +97,8 @@ locals {
       threshold   = 1
       eval        = 3
       dta         = 1
-      ok_recovery = true
-      desc        = "DH-906: Dhan order error - NEVER auto-retry; fix the order. NOTE: pre-armed tripwire - no coded emit site exists and dry_run=true means no live orders today; the literal arrives inside Dhan's response text via OmsError. Runbook: .claude/rules/dhan/annexure-enums.md rule 11"
+      ok_recovery = false # round-4: discrete per-order reject - auto-OK ~15 min later means the episode aged out, never "orders working again" (Rule-11 false-recovery)
+      desc        = "DH-906: Dhan order error - NEVER auto-retry; fix the order. NO recovered/OK page: a reject is a discrete event, so the auto-OK ~15 min later only means the episode aged out of the lookback. NOTE: pre-armed tripwire - no coded emit site exists and dry_run=true means no live orders today; the literal arrives inside Dhan's response text via OmsError. Runbook: .claude/rules/dhan/annexure-enums.md rule 11"
     }
     "auth-gap-04" = {
       pattern     = "{ $.code = \"AUTH-GAP-04\" && $.level = \"ERROR\" }"
@@ -87,8 +106,8 @@ locals {
       threshold   = 1
       eval        = 3
       dta         = 1
-      ok_recovery = true
-      desc        = "AUTH-GAP-04: TOTP secret likely rotated externally - auth is DEAD until the SSM totp-secret is reconciled with dhan.co. Runbook: .claude/rules/project/wave-4-error-codes.md"
+      ok_recovery = true # round-4 documented ambiguity: repeat-emits per failing boot cycle under systemd Restart=always, so OK ~= stopped firing; if StartLimitBurst (8/600s) halts the loop, the OK would be aged-out - stated residual (see locals header)
+      desc        = "AUTH-GAP-04: TOTP secret likely rotated externally - auth is DEAD until the SSM totp-secret is reconciled with dhan.co. CAVEAT on the recovered/OK page: it is trustworthy while the systemd restart loop keeps re-emitting; if systemd's StartLimitBurst halted the unit, the OK only means emissions stopped - verify the app is actually up before treating it as recovery. Runbook: .claude/rules/project/wave-4-error-codes.md"
     }
     "ws-gap-07" = {
       pattern     = "{ $.code = \"WS-GAP-07\" && $.level = \"ERROR\" }"
@@ -127,8 +146,8 @@ locals {
       threshold   = 1
       eval        = 3
       dta         = 1
-      ok_recovery = true
-      desc        = "WS-REINJECT-01: boot WAL re-injection ABORTED - consumer dead/wedged; frames stay staged in WAL replaying/ and re-replay next boot. Runbook: .claude/rules/project/ws-reinject-error-codes.md"
+      ok_recovery = false # round-4: emitted exactly ONCE per boot; the staged-WAL condition persists until the NEXT boot - auto-OK would be a Rule-11 false recovery
+      desc        = "WS-REINJECT-01: boot WAL re-injection ABORTED - consumer dead/wedged; frames stay staged in WAL replaying/ and re-replay next boot. NO recovered/OK page: the code fires once per boot and the condition persists until the next boot, so the auto-OK ~15 min later only means the single datapoint aged out - recovery is the NEXT boot's clean replay. Runbook: .claude/rules/project/ws-reinject-error-codes.md"
     }
     "proc-01" = {
       pattern     = "{ $.code = \"PROC-01\" && $.level = \"ERROR\" }"
@@ -136,8 +155,8 @@ locals {
       threshold   = 1
       eval        = 3
       dta         = 1
-      ok_recovery = true
-      desc        = "PROC-01: kernel OOM kill detected in this cgroup (Severity Critical). Cross-check tv_process_rss_bytes + host memory alarms. Runbook: .claude/rules/project/wave-4-error-codes.md"
+      ok_recovery = false # round-4: discrete OOM-kill event - auto-OK means the episode aged out, not that the memory pressure is resolved (Rule-11 false-recovery)
+      desc        = "PROC-01: kernel OOM kill detected in this cgroup (Severity Critical). NO recovered/OK page: an OOM kill is a discrete event, so the auto-OK ~15 min later only means the episode aged out - the leak/pressure behind it is not thereby fixed; watch tv_process_rss_bytes + host memory alarms for the real recovery. Runbook: .claude/rules/project/wave-4-error-codes.md"
     }
   }
 }
@@ -174,8 +193,10 @@ resource "aws_cloudwatch_metric_alarm" "error_code" {
   treat_missing_data  = "notBreaching"
   # deliberately NO dimensions (see filter comment)
   alarm_actions = local.app_alarm_actions
-  # ok_recovery = false (the REST canary) suppresses the OK page: with a
-  # 3-probes/day emit cadence the auto-OK ~15 min later would be a Rule-11
-  # false "recovered" message (see the locals comment above).
+  # ok_recovery = false (rest-canary-01, ws-reinject-01, proc-01, dh-906 -
+  # the one-shot/discrete emitters) suppresses the OK page: their auto-OK
+  # ~15 min after the datapoint ages out would be a Rule-11 false
+  # "recovered" message while the condition persists (see the locals
+  # comment above for the per-code rationale).
   ok_actions = each.value.ok_recovery ? local.app_alarm_ok : []
 }

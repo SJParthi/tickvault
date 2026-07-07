@@ -76,7 +76,13 @@ restarts:
 1. **`tv-<env>-feed-stall-restarts`** (`feed-stall-restart-alarm.tf`) — the
    restart pager: a log metric filter on `/tickvault/<env>/metrics` extracts
    the per-scrape deltas of `tv_feed_sidecar_stall_restart_total` (increments
-   once per restart, warn! + error! alike), Sum ≥ 3 per aligned 15-min window
+   once per restart, warn! + error! alike; pre-registered at 0 at supervisor
+   spawn — round-4 fix 2026-07-06, ratcheted by
+   `test_stall_restart_counter_is_preregistered_before_supervise_loop` — so
+   the CW agent's dropped-first-sample delta baseline is the harmless 0, NOT
+   restart #1 of the session; without the registration the first restart of
+   every app session was uncounted and the effective first-episode threshold
+   was 4), Sum ≥ 3 per aligned 15-min window
    → SNS → Telegram. Honest floor: flap cycles slower than ~5 min (<3
    restarts/15 min) do not page — stated residual.
 2. **`tv-<env>-errcode-feed-stall-01`** (`error-code-alarms.tf`) — the

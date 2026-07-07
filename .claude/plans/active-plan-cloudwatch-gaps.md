@@ -4,7 +4,10 @@
 **Date:** 2026-07-06
 **Approved by:** Parthiban (operator directive 2026-07-06, this session: "ultracode... SCOPE (terraform + minimal code, NEW .tf files)..." — the zero-page incident day)
 **Branch:** `claude/trusting-sagan-n2jefi`
-**Changed crates:** none (production Rust untouched; one TEST-file addition in `crates/common/tests/`)
+**Changed crates:** `crates/app` (round-4 review fix: one spawn-time metric
+pre-registration line + a source-scan ratchet test in
+`crates/app/src/groww_sidecar_supervisor.rs` — cold-path, supervisor boot,
+zero hot-path code) + one TEST-file addition in `crates/common/tests/`
 
 > Guarantee matrices: carried by cross-reference to
 > `.claude/rules/project/per-wave-guarantee-matrix.md` (15-row + 7-row, mandatory
@@ -32,7 +35,11 @@
 > a Groww stall-flap SLOWER than ~1 restart per 5 min (<3 counter increments
 > per aligned 900s window = the restart pager's floor; boundary-straddling
 > 2+1 bursts page one window later or, if the flap stops at exactly 3, not
-> at all — CloudWatch windows are aligned/tumbling, not sliding), or
+> at all — CloudWatch windows are aligned/tumbling, not sliding; the counter
+> is pre-registered at 0 at supervisor spawn — round-4 fix — so the delta
+> pipeline's dropped first sample is the 0 baseline and the session's FIRST
+> restart counts; without that registration the first restart of every app
+> session was uncounted and the effective first-episode threshold was 4), or
 > paging an order-update flap SLOWER than ~1 cycle per 3 min (>5
 > once-per-cycle increments per 900s window = the detection floor; the
 > 3-min+ slow-flap band is a stated residual; an app restart costs at most
@@ -89,7 +96,14 @@ flapper invisible) is the proof.
   error! alike). Same route as P3: NOT in the 21-name EMF allowlist, extracted
   via a log metric filter on `/tickvault/prod/metrics` ($.host dimension),
   plain `Sum ≥ 3 / 900s` (per-scrape-delta model + the same
-  not-live-verified residual as P3). NO market-hours gate needed:
+  not-live-verified residual as P3). Round-4 fix: the counter is
+  PRE-REGISTERED at 0 at supervisor spawn (run_groww_sidecar_supervisor,
+  mirror of order_update_connection.rs:86; ratcheted by
+  test_stall_restart_counter_is_preregistered_before_supervise_loop) so the
+  agent's dropped-first-sample delta baseline is the harmless 0, not restart
+  #1 — without it the lazily-born series lost the first restart of every app
+  session (effective first-episode threshold 4, not 3, on a box that
+  restarts daily). NO market-hours gate needed:
   `should_restart_on_stall` requires market_open, so the counter cannot
   increment off-hours. Honest floor: flap cycles slower than ~5 min (<3
   restarts per aligned 15-min window) do not page — stated residual;
@@ -275,15 +289,24 @@ flapper invisible) is the proof.
   1 readiness-lambda-errors) →
   tv_alerts → Telegram; ok_actions symmetric for repeat-emitters (the OK is
   the "recovered" message the operator wanted on 2026-07-06) — EXCEPT the
-  REST canary (`ok_recovery = false`): its 3-probes/day cadence means the
-  auto-OK ~15 min after a failing probe only means "the episode aged out of
-  the lookback", not "REST recovered" — a Rule-11 false-OK, so its OK page is
-  suppressed; the next scheduled probe staying silent (or the DH-901 alarm)
-  is the recovery signal (round-1 review fix).
+  one-shot/discrete emitters (`ok_recovery = false`, round-1 fix widened in
+  round-4): rest-canary-01 (3 probes/day — OK means "no new probe ran yet"),
+  ws-reinject-01 (fires once per boot; the staged-WAL condition persists
+  until the NEXT boot), proc-01 (a discrete OOM kill — the pressure behind
+  it is not fixed by the episode aging out) and dh-906 (a discrete per-order
+  reject). For these the auto-OK ~15 min after the datapoint ages out would
+  be a Rule-11 false "recovered" page (the webhook Lambda forwards OK states
+  as a green message), so their OK pages are suppressed. auth-gap-04 keeps
+  ok_actions ON with a stated residual: it repeat-emits per failing boot
+  cycle under systemd Restart=always, so OK ≈ stopped firing — unless
+  StartLimitBurst (8/600s) halted the unit, in which case the OK is
+  aged-out; the alarm desc carries this caveat.
 - New metrics: 8 sparse `tv_errcode_*` (billed only in hours a code fires),
   2 host-dimensioned /metrics-derived counters
   (`tv_order_update_reconnections_total`,
-  `tv_feed_sidecar_stall_restart_total`).
+  `tv_feed_sidecar_stall_restart_total` — both DENSE during app uptime since
+  both counters are registered at task/supervisor start, so each ships a
+  0-delta event per 60s scrape; the 0s sum harmlessly).
 - The readiness Lambda logs its verdict on every run (silent-healthy mornings
   are visible in its log group); its AWS/Lambda Errors alarm watches the
   watchman.
@@ -313,6 +336,8 @@ table); the honest-100% envelope wording is in the header block above.
 - [x] P3 reconnect-storm — Files: deploy/aws/terraform/order-update-reconnect-storm-alarm.tf, deploy/aws/terraform/market-hours-liveness-alarm.tf — Tests: terraform validate
 - [x] P3b feed-stall restart pager (round-3 review fix) — Files: deploy/aws/terraform/feed-stall-restart-alarm.tf, deploy/aws/terraform/error-code-alarms.tf (feed-stall-01 entry retuned to the storm-escalation tripwire) — Tests: terraform validate
 - [x] P4 readiness pager — Files: deploy/aws/terraform/market-open-readiness-lambda.tf, deploy/aws/lambda/market-open-readiness/handler.py, deploy/aws/lambda/market-open-readiness/test_handler.py — Tests: test_running_and_booted_is_ready_silent, test_running_without_boot_metric_pages_not_booted, test_stopped_with_stale_launch_pages_not_running, test_stopped_after_holiday_gate_self_stop_is_silent, test_stopping_after_holiday_gate_self_stop_is_silent, test_stopped_with_early_launch_pages_not_running, test_pending_pages_not_running, test_probe_error_pages_verify_failed, test_subjects_are_ascii_and_within_sns_limit, test_holiday_cutoff_boundary_0825_ist, test_sns_publish_failure_propagates, test_handler_drill_mode_force_publishes_test_page, test_drill_verdict_never_returned_by_classifier
+- [x] P3c stall-restart counter pre-registration (round-4 review fix) — Files: crates/app/src/groww_sidecar_supervisor.rs, deploy/aws/terraform/feed-stall-restart-alarm.tf, .claude/rules/project/feed-stall-watchdog-error-codes.md — Tests: test_stall_restart_counter_is_preregistered_before_supervise_loop
+- [x] P2b one-shot-code OK-page suppression (round-4 review fix) — Files: deploy/aws/terraform/error-code-alarms.tf (ws-reinject-01 + proc-01 + dh-906 ok_recovery=false; auth-gap-04 cadence caveat documented) — Tests: terraform validate
 - [x] P5 runbook truth-sync — Files: .claude/rules/project/dhan-rest-canary-error-codes.md, .claude/rules/project/observability-architecture.md, .claude/rules/project/wave-4-error-codes.md, .claude/rules/project/ws-reinject-error-codes.md, .claude/rules/project/dual-instance-lock-2026-07-04.md, .claude/rules/project/feed-stall-watchdog-error-codes.md, .claude/rules/project/wave-2-error-codes.md, CLAUDE.md — Tests: n/a (docs)
 
 ## Scenarios
@@ -334,3 +359,5 @@ table); the honest-100% envelope wording is in the header block above.
 | 13 | Groww sidecar stall-flaps at a <~50s cycle (>5 restarts / 5 min) | BOTH page: the sidecar's storm-escalation ERROR line trips errcode-feed-stall-01 within ~5 min AND the counter alarm trips within the 15-min window |
 | 14 | Single Groww stall-restart that recovers | NO page on either route (self-heal by design; 1 < threshold 3, warn!-level line matches no filter) |
 | 15 | Groww stall-flap slower than ~1 restart / 5 min | NOT paged — stated residual (restart-pager floor <3 per aligned 15-min window; tumbling not sliding) |
+| 16 | First stall episode of the day (3 restarts, fresh app session) | `tv-prod-feed-stall-restarts` pages — the spawn-time counter registration makes the agent's dropped first sample the 0 baseline, so all 3 restarts count (round-4; previously Sum=2 → silent) |
+| 17 | WS-REINJECT-01 / PROC-01 / DH-906 fires once, episode ages out ~15 min later | NO green "recovered" OK page (ok_recovery=false, round-4) — the condition persists (staged WAL / memory pressure / rejected order); only genuine repeat-emitters send OK-on-silence |

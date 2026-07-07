@@ -1157,6 +1157,23 @@ pub async fn run_groww_sidecar_supervisor(
     notifier: Arc<arc_swap::ArcSwapOption<NotificationService>>,
 ) {
     let mut consecutive_failures: u32 = 0;
+    // Pre-register the stall-restart counter at 0 (round-4 review fix,
+    // 2026-07-06 — mirror of order_update_connection.rs's task-start
+    // registration): the CloudWatch agent's prometheus pipeline drops each
+    // counter series' FIRST observed sample as its delta baseline. A
+    // lazily-born series (first sample = 1, emitted AT the first restart)
+    // would therefore lose restart #1 of every app session — silently
+    // raising the tv-<env>-feed-stall-restarts pager's effective
+    // first-episode threshold from 3 to 4 on a box that restarts daily
+    // (feed-stall-restart-alarm.tf). Registered here, the dropped first
+    // sample is the harmless 0 baseline, so the pager genuinely sees EVERY
+    // restart, including the session's first. increment(0) is a no-op on the
+    // value that forces registration without an unused #[must_use] handle.
+    metrics::counter!(
+        "tv_feed_sidecar_stall_restart_total",
+        "feed" => Feed::Groww.as_str(),
+    )
+    .increment(0);
     // Sliding-window tracker that bounds a flapping (reconnect→re-drop) socket so
     // rapid stall-restarts escalate + hit the backoff ceiling instead of a tight
     // kill loop. Persists across child launches for the supervisor's lifetime.
@@ -1845,6 +1862,37 @@ mod tests {
                 && src.contains("supervise_child(")
                 && src.contains("sidecar_restart_backoff(consecutive_failures)"),
             "the relaunch must flow through the existing run_groww_sidecar_supervisor backoff loop"
+        );
+    }
+
+    #[test]
+    fn test_stall_restart_counter_is_preregistered_before_supervise_loop() {
+        // RATCHET (round-4 review fix, 2026-07-06): the CW agent's prometheus
+        // pipeline drops each counter series' FIRST sample as the delta
+        // baseline, so a lazily-born tv_feed_sidecar_stall_restart_total
+        // (first sample = 1, at the first restart) loses restart #1 of every
+        // app session — the tv-<env>-feed-stall-restarts pager's effective
+        // first-episode threshold silently becomes 4 instead of 3 on a box
+        // that restarts daily. The counter MUST be pre-registered at 0 at
+        // supervisor spawn (mirror of order_update_connection.rs:86) so the
+        // dropped first sample is the harmless 0 baseline. Source-order scan
+        // (house pattern): the registration must precede the supervise loop.
+        let src = include_str!("groww_sidecar_supervisor.rs");
+        let reg = src
+            .find("Pre-register the stall-restart counter at 0")
+            .expect("the stall-restart counter pre-registration (and its marker comment) must exist at supervisor spawn");
+        let call = src
+            .find("let outcome = supervise_child(")
+            .expect("the supervise_child call site must exist");
+        assert!(
+            reg < call,
+            "the counter pre-registration must precede the supervise loop in source order"
+        );
+        assert!(
+            src.matches("\"tv_feed_sidecar_stall_restart_total\"")
+                .count()
+                >= 2,
+            "expected BOTH the spawn-time registration and the per-restart increment of tv_feed_sidecar_stall_restart_total"
         );
     }
 

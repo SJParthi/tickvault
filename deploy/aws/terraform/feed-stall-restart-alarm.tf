@@ -13,12 +13,12 @@
 # ">=3 stall-restarts in 15 min pages".
 #
 # THE FIX: alarm on the counter instead. tv_feed_sidecar_stall_restart_total
-# (groww_sidecar_supervisor.rs:1118) increments exactly ONCE per stall-restart
-# — warn!- and error!-level alike — so this pager sees EVERY restart. Same
-# route as the order-update reconnect-storm alarm: the counter is NOT in the
-# ratcheted 21-name EMF metric_selectors allowlist, but every 60s scrape still
-# ships it as a plain-JSON event (with $.host) into /tickvault/<env>/metrics;
-# a log metric filter extracts the per-scrape delta.
+# increments exactly ONCE per stall-restart (groww_sidecar_supervisor.rs,
+# the restart branch) — warn!- and error!-level alike — so this pager sees
+# EVERY restart. Same route as the order-update reconnect-storm alarm: the
+# counter is NOT in the ratcheted 21-name EMF metric_selectors allowlist, but
+# every 60s scrape still ships it as a plain-JSON event (with $.host) into
+# /tickvault/<env>/metrics; a log metric filter extracts the per-scrape delta.
 #
 # COUNTER SHAPE: identical model + identical honest residual as
 # order-update-reconnect-storm-alarm.tf — the CW agent's prometheus pipeline
@@ -26,6 +26,19 @@
 # restarts in the window. Not live-verified from this sandbox; if the field
 # ever proved CUMULATIVE, Sum overcounts and pages too eagerly (fail-loud,
 # never a silent miss) and this alarm must be reworked to DIFF(Maximum).
+#
+# FIRST-SAMPLE BASELINE (round-4 review fix, 2026-07-06): the delta pipeline
+# DROPS each counter series' first observed sample as its baseline. The
+# restart counter is therefore PRE-REGISTERED at 0 at supervisor spawn
+# (run_groww_sidecar_supervisor, mirror of order_update_connection.rs:86 —
+# ratcheted by test_stall_restart_counter_is_preregistered_before_supervise_loop)
+# so the dropped first sample is the harmless 0 baseline. Without that
+# registration the series was BORN at the first restart (value 1) and the
+# dropped sample WAS restart #1 — the first stall episode of every app
+# session (the box restarts daily) ran at an effective threshold of 4, not
+# the documented 3, and "sees every restart" was false. Registration makes
+# the series DENSE while the app runs (a 0-delta event per 60s scrape) —
+# harmless to Sum, and the alarm no longer depends on metric sparseness.
 #
 # FEED LABEL: the Prometheus series carries feed="groww"; the JSON event
 # carries it as a field. The filter matches on the metric field only and
@@ -70,13 +83,17 @@ resource "aws_cloudwatch_log_metric_filter" "feed_stall_restarts_fallback" {
     dimensions = {
       host = "$.host" # /metrics events DO carry host (prometheus scrape label)
     }
-    # Deliberately no default_value (sparse metric; notBreaching alarm).
+    # Deliberately no default_value (that knob emits datapoints for
+    # NON-matching events — never wanted). Note: since the round-4 spawn-time
+    # registration the counter is DENSE while the app runs (a 0-delta event
+    # per 60s scrape), so this metric bills during uptime hours; the 0s sum
+    # harmlessly into the alarm window.
   }
 }
 
 resource "aws_cloudwatch_metric_alarm" "feed_stall_restarts" {
   alarm_name          = "tv-${var.environment}-feed-stall-restarts"
-  alarm_description   = "FEED-STALL-01 flap: >=3 Groww sidecar stall-restarts within one 15-min window (Sum of the agent's per-scrape deltas of tv_feed_sidecar_stall_restart_total - the counter increments once per restart, warn!- and error!-level alike, so THIS pager sees every restart; the errcode-feed-stall-01 alarm sees only the sidecar's own >5-per-5-min STORM escalation ERROR lines). A single self-heal restart never pages. Honest floor: flap cycles slower than ~5 min (<3 restarts per aligned 15-min window) do not page - stated residual. The provider keeps closing the socket - check credential/entitlement. Runbook: .claude/rules/project/feed-stall-watchdog-error-codes.md"
+  alarm_description   = "FEED-STALL-01 flap: >=3 Groww sidecar stall-restarts within one 15-min window (Sum of the agent's per-scrape deltas of tv_feed_sidecar_stall_restart_total - the counter increments once per restart, warn!- and error!-level alike, and is pre-registered at 0 at supervisor spawn so the delta pipeline's dropped first sample is the 0 baseline, not restart #1 - THIS pager therefore sees every restart incl. the session's first; the errcode-feed-stall-01 alarm sees only the sidecar's own >5-per-5-min STORM escalation ERROR lines). A single self-heal restart never pages. Honest floor: flap cycles slower than ~5 min (<3 restarts per aligned 15-min window) do not page - stated residual. The provider keeps closing the socket - check credential/entitlement. Runbook: .claude/rules/project/feed-stall-watchdog-error-codes.md"
   comparison_operator = "GreaterThanOrEqualToThreshold"
   threshold           = 3
   evaluation_periods  = 1
