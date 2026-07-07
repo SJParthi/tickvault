@@ -73,7 +73,21 @@ pub const EPISODE_REHYDRATE_MAX_AGE_SECS: u64 = 7200;
 
 /// Consecutive transient edit failures after which the fallback ladder
 /// sends a FRESH bubble (duplicate-over-drop) instead of retrying edits.
+/// Applies to episodes whose peak severity is BELOW High — a High/Critical
+/// episode falls back on the very first exhausted transient (the shell
+/// checks `severity_peak`), because a structurally-final event (e.g. the
+/// once-per-outage order-update page) may never re-drive the ladder.
 pub const EPISODE_EDIT_FAILURES_FALLBACK_THRESHOLD: u8 = 2;
+
+/// Seconds a `Down` episode may sit with NO events before it stops being
+/// live (hostile-review fix 2026-07-07). Covers the restart edge: a
+/// rehydrated Down episode whose recovery event never arrives (a clean
+/// first connect emits no reconnect event) would otherwise show DOWN
+/// forever AND swallow a later same-day outage as a silent edit with no
+/// fresh page and no SMS. Expiry closes the bubble neutrally and writes
+/// NO tombstone, so the next outage opens a FRESH first page (with the
+/// SNS-SMS leg).
+pub const EPISODE_DOWN_STALE_EXPIRE_SECS: u64 = 1800;
 
 const MS_PER_SEC: u64 = 1000;
 
@@ -242,6 +256,11 @@ impl EpisodeState {
 pub struct ClosedTombstone {
     pub message_id: i64,
     pub closed_at_ms: u64,
+    /// Peak severity of the closed episode. A High/Critical reopen may
+    /// only fold into a bubble that itself already paged at High/Critical
+    /// — folding a HIGH event into a Low-peak tombstone would produce no
+    /// push and no SMS (hostile-review fix 2026-07-07).
+    pub severity_peak: Severity,
 }
 
 /// Episode timing knobs. Defaults come from the pinned constants.
@@ -250,6 +269,8 @@ pub struct EpisodeConfig {
     pub edit_min_interval_secs: u64,
     pub stability_secs: u64,
     pub reopen_secs: u64,
+    /// Seconds a Down episode may sit event-less before stale expiry.
+    pub down_stale_expire_secs: u64,
 }
 
 impl Default for EpisodeConfig {
@@ -258,6 +279,7 @@ impl Default for EpisodeConfig {
             edit_min_interval_secs: EPISODE_EDIT_MIN_INTERVAL_SECS,
             stability_secs: EPISODE_STABILITY_SECS,
             reopen_secs: EPISODE_REOPEN_SECS,
+            down_stale_expire_secs: EPISODE_DOWN_STALE_EXPIRE_SECS,
         }
     }
 }
@@ -276,8 +298,15 @@ pub enum EpisodeAction {
     /// The bubble has no message id (first send failed / id unparseable) —
     /// send a fresh message (duplicate-over-drop).
     SendNewFallback,
-    /// Nothing to do. Reachable ONLY for `Resolve` with no live state and
-    /// no fresh tombstone (a recovery for an episode we never opened).
+    /// A recovery for an episode we never tracked (snapshot lost across a
+    /// restart, or a cross-task ordering race) — deliver the event through
+    /// the LEGACY immediate lane instead of dropping it (hostile-review
+    /// fix 2026-07-07: a bare Ignore silently dropped the boot-time
+    /// reconnect line).
+    SendLegacy,
+    /// Nothing to do. Reachable ONLY for `Resolve` against a FRESH
+    /// tombstone — the episode just closed with the green line, so the
+    /// recovery is already announced; a second line would be noise.
     Ignore,
 }
 
@@ -295,12 +324,26 @@ pub fn next_episode_action(
     state: Option<&EpisodeState>,
     tombstone: Option<&ClosedTombstone>,
     role: EpisodeRole,
-    _severity: Severity,
+    severity: Severity,
     now_ms: u64,
     cfg: &EpisodeConfig,
 ) -> EpisodeAction {
     match state {
         Some(st) => {
+            // Severity-escalation edge (hostile-review fix 2026-07-07): an
+            // episode whose peak is below High (e.g. the pre-open Low
+            // off-hours storm) crossing into High/Critical MUST page like
+            // a fresh incident — an in-place edit produces no Telegram
+            // push notification and the SNS-SMS leg never fires.
+            // SendFirstPage replaces the bubble and rides the preserved
+            // High/Critical bypass semantics (including the SMS leg), so
+            // an in-market HIGH outage always reaches the operator's phone.
+            if matches!(role, EpisodeRole::Open | EpisodeRole::Progress)
+                && severity >= Severity::High
+                && st.severity_peak < Severity::High
+            {
+                return EpisodeAction::SendFirstPage;
+            }
             let Some(message_id) = st.message_id else {
                 // First page never landed — fresh send, never a drop.
                 return EpisodeAction::SendNewFallback;
@@ -334,6 +377,11 @@ pub fn next_episode_action(
                 if let Some(t) = tombstone
                     && now_ms.saturating_sub(t.closed_at_ms)
                         <= cfg.reopen_secs.saturating_mul(MS_PER_SEC)
+                    // A High/Critical reopen may fold ONLY into a bubble
+                    // that itself paged at High/Critical — a Low-peak
+                    // tombstone swallowing a HIGH event would produce no
+                    // push and no SMS (escalation gap, 2026-07-07 fix).
+                    && !(severity >= Severity::High && t.severity_peak < Severity::High)
                 {
                     // Flap folds into the SAME closed bubble. If the edit
                     // later fails permanent, the ladder sends fresh.
@@ -345,9 +393,20 @@ pub fn next_episode_action(
                     EpisodeAction::SendFirstPage
                 }
             }
-            // A recovery for an episode we never tracked — nothing to edit,
-            // nothing degraded to announce.
-            EpisodeRole::Resolve => EpisodeAction::Ignore,
+            EpisodeRole::Resolve => {
+                if let Some(t) = tombstone
+                    && now_ms.saturating_sub(t.closed_at_ms)
+                        <= cfg.reopen_secs.saturating_mul(MS_PER_SEC)
+                {
+                    // Just closed green — the recovery is already
+                    // announced by the close line; nothing to add.
+                    EpisodeAction::Ignore
+                } else {
+                    // Recovery for an episode we never tracked — deliver
+                    // it through the legacy immediate lane, never drop it.
+                    EpisodeAction::SendLegacy
+                }
+            }
         },
     }
 }
@@ -364,6 +423,20 @@ pub struct EpisodeDecision {
     pub state: EpisodeState,
     /// `true` when a tombstone was folded back into a live episode.
     pub reopened: bool,
+    /// `true` when a live sub-High episode escalated into High/Critical
+    /// and the action is a fresh first page (SMS leg rides it).
+    pub escalated: bool,
+}
+
+/// Outcome of [`EpisodeRegistry::tick`].
+#[derive(Debug, Default)]
+pub struct EpisodeTickOutcome {
+    /// `Recovering` episodes promoted to the final green close line.
+    pub closed: Vec<EpisodeState>,
+    /// `Down` episodes expired after `down_stale_expire_secs` without any
+    /// event — closed neutrally, NO tombstone (a later outage must open a
+    /// FRESH first page with the SMS leg, never fold into a stale bubble).
+    pub expired: Vec<EpisodeState>,
 }
 
 /// In-memory episode registry — one live [`EpisodeState`] per key plus
@@ -422,6 +495,9 @@ impl EpisodeRegistry {
             now_ms,
             cfg,
         );
+        // A fresh first page decided WHILE live state exists == the
+        // severity-escalation edge (Low-peak episode crossed into High).
+        let escalated = matches!(action, EpisodeAction::SendFirstPage) && inner.contains_key(&key);
 
         let mut reopened = false;
         let state = match inner.get_mut(&key) {
@@ -445,9 +521,11 @@ impl EpisodeRegistry {
                 st.clone()
             }
             None => match action {
-                EpisodeAction::Ignore => {
+                EpisodeAction::Ignore | EpisodeAction::SendLegacy => {
                     // Resolve with no state — synthesize a throwaway
-                    // snapshot; the caller returns without rendering.
+                    // snapshot; the caller renders nothing (Ignore) or
+                    // routes the event through the legacy immediate lane
+                    // (SendLegacy) without creating episode state.
                     EpisodeState::open(key, severity, now_ms)
                 }
                 _ => {
@@ -471,6 +549,7 @@ impl EpisodeRegistry {
             action,
             state,
             reopened,
+            escalated,
         }
     }
 
@@ -529,14 +608,21 @@ impl EpisodeRegistry {
             .map_or(0, |st| st.last_render_hash)
     }
 
-    /// Stability promotion — called from the drain ticker every ~10s.
+    /// Stability promotion + stale-Down expiry — called from the drain
+    /// ticker every ~10s.
     ///
     /// Promotes `Recovering` episodes quiet for `cfg.stability_secs` to
     /// CLOSED: removes them, writes a [`ClosedTombstone`] (kept
     /// `cfg.reopen_secs`, then GC'd here too) and returns the closed states
     /// so the caller can issue the final green close edit.
+    ///
+    /// Additionally EXPIRES `Down` episodes that received NO event for
+    /// `cfg.down_stale_expire_secs` (hostile-review fix 2026-07-07 — the
+    /// restart edge): expired states are removed with NO tombstone, so a
+    /// later outage the same day opens a FRESH first page (with the
+    /// SNS-SMS leg) instead of silently editing an hours-old bubble.
     #[must_use]
-    pub fn tick(&self, now_ms: u64, cfg: &EpisodeConfig) -> Vec<EpisodeState> {
+    pub fn tick(&self, now_ms: u64, cfg: &EpisodeConfig) -> EpisodeTickOutcome {
         let mut inner = self.lock_inner();
         let mut tombstones = self.lock_tombstones();
         let stability_ms = cfg.stability_secs.saturating_mul(MS_PER_SEC);
@@ -558,6 +644,7 @@ impl EpisodeRegistry {
                         ClosedTombstone {
                             message_id: id,
                             closed_at_ms: now_ms,
+                            severity_peak: st.severity_peak,
                         },
                     );
                 }
@@ -565,10 +652,29 @@ impl EpisodeRegistry {
             }
         }
 
+        // Stale-Down expiry: an event-less Down episode is no longer a
+        // live incident view (typical cause: restart whose clean first
+        // connect emits no recovery event). NO tombstone on purpose.
+        let stale_ms = cfg.down_stale_expire_secs.saturating_mul(MS_PER_SEC);
+        let expired_keys: Vec<EpisodeKey> = inner
+            .iter()
+            .filter(|(_, st)| {
+                st.phase == EpisodePhase::Down
+                    && now_ms.saturating_sub(st.last_event_ms) >= stale_ms
+            })
+            .map(|(k, _)| *k)
+            .collect();
+        let mut expired: Vec<EpisodeState> = Vec::with_capacity(expired_keys.len());
+        for key in expired_keys {
+            if let Some(st) = inner.remove(&key) {
+                expired.push(st);
+            }
+        }
+
         // GC stale tombstones past the reopen window.
         let reopen_ms = cfg.reopen_secs.saturating_mul(MS_PER_SEC);
         tombstones.retain(|_, t| now_ms.saturating_sub(t.closed_at_ms) <= reopen_ms);
-        closed
+        EpisodeTickOutcome { closed, expired }
     }
 
     /// Snapshot of every live episode (for the persistence shell).
@@ -724,6 +830,18 @@ pub fn render_episode_recovering(state: &EpisodeState, _ctx: &EpisodeRenderCtx) 
     render_status_lines(state, "Now: reconnected — confirming…")
 }
 
+/// Neutral close line for a stale-expired Down episode — the incident
+/// stopped reporting (typical cause: a restart whose clean first connect
+/// emits no recovery event). ONE line, plain English, IST 12-hour time.
+#[must_use]
+pub fn render_episode_stale_closed(state: &EpisodeState) -> String {
+    let last = format_ist_12h(state.last_event_ms);
+    format!(
+        "\u{26aa} {desc} alert closed — no updates since {last} IST. Any new problem will open a fresh alert.",
+        desc = state.key.family.feed_desc(),
+    )
+}
+
 /// Final green close line — ONE line, no newlines.
 #[must_use]
 pub fn render_episode_recovered(state: &EpisodeState, ctx: &EpisodeRenderCtx) -> String {
@@ -749,7 +867,8 @@ pub fn render_episode_recovered(state: &EpisodeState, ctx: &EpisodeRenderCtx) ->
 /// Pure JSON codec for the advisory episode snapshot file.
 ///
 /// Serialized fields ONLY: `{family, conn, message_id, opened_at_ms,
-/// occurrences, attempts, explained, phase}` — no reasons, no secrets.
+/// occurrences, attempts, explained, phase, severity_peak}` — no reasons,
+/// no secrets.
 pub mod episode_snapshot {
     use super::{
         EPISODE_REHYDRATE_MAX_AGE_SECS, EpisodeFamily, EpisodeKey, EpisodePhase, EpisodeState,
@@ -771,6 +890,7 @@ pub mod episode_snapshot {
                     "attempts": st.attempts,
                     "explained": st.explained,
                     "phase": st.phase.snapshot_label(),
+                    "severity_peak": st.severity_peak.as_label(),
                 })
             })
             .collect();
@@ -824,13 +944,16 @@ pub mod episode_snapshot {
                 .and_then(|v| v.as_str())
                 .and_then(EpisodePhase::from_snapshot_label)
                 .unwrap_or(EpisodePhase::Down);
-            let mut st = EpisodeState::open(
-                EpisodeKey { family, conn },
-                // Severity is not persisted — conservative High default
-                // (both WS families page High on open today).
-                Severity::High,
-                opened_at_ms,
-            );
+            let severity_peak = item
+                .get("severity_peak")
+                .and_then(|v| v.as_str())
+                .and_then(severity_from_label)
+                // Missing/unknown label (legacy file) → Low, so a later
+                // High/Critical event pages FRESH via the escalation edge
+                // (duplicate-over-drop: a repeat page beats silence).
+                .unwrap_or(Severity::Low);
+            let mut st =
+                EpisodeState::open(EpisodeKey { family, conn }, severity_peak, opened_at_ms);
             st.message_id = item.get("message_id").and_then(serde_json::Value::as_i64);
             st.occurrences = item
                 .get("occurrences")
@@ -851,6 +974,19 @@ pub mod episode_snapshot {
             out.push(st);
         }
         out
+    }
+
+    /// Inverse of [`Severity::as_label`] for the snapshot file only.
+    /// Unknown → `None` (caller defaults Low — fail-loud on re-page).
+    fn severity_from_label(label: &str) -> Option<Severity> {
+        match label {
+            "info" => Some(Severity::Info),
+            "low" => Some(Severity::Low),
+            "medium" => Some(Severity::Medium),
+            "high" => Some(Severity::High),
+            "critical" => Some(Severity::Critical),
+            _ => None,
+        }
     }
 
     fn is_same_ist_day(epoch_ms: u64, today_ist: chrono::NaiveDate) -> bool {
@@ -979,10 +1115,15 @@ mod tests {
             &cfg(),
         );
         // Before stability: no close.
-        let closed = reg.tick(NOW + 1000 + 30_000, &cfg());
-        assert!(closed.is_empty(), "must not close inside stability window");
+        let outcome = reg.tick(NOW + 1000 + 30_000, &cfg());
+        assert!(
+            outcome.closed.is_empty(),
+            "must not close inside stability window"
+        );
+        assert!(outcome.expired.is_empty());
         // After stability: closed + tombstoned.
-        let closed = reg.tick(NOW + 1000 + EPISODE_STABILITY_SECS * 1000, &cfg());
+        let outcome = reg.tick(NOW + 1000 + EPISODE_STABILITY_SECS * 1000, &cfg());
+        let closed = outcome.closed;
         assert_eq!(closed.len(), 1);
         assert_eq!(closed[0].message_id, Some(42));
         assert_eq!(reg.live_count(), 0);
@@ -1036,6 +1177,7 @@ mod tests {
         let t = ClosedTombstone {
             message_id: 99,
             closed_at_ms: NOW,
+            severity_peak: Severity::High,
         };
         // Inside the reopen window → SAME bubble.
         let action = next_episode_action(
@@ -1108,7 +1250,10 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_with_no_state_no_tombstone_is_ignore() {
+    fn test_resolve_with_no_state_routes_send_legacy_and_fresh_tombstone_ignores() {
+        // No state, no tombstone — a recovery for an episode we never
+        // tracked (restart lost the snapshot) routes through the LEGACY
+        // immediate lane instead of being dropped (hostile-review fix).
         let action = next_episode_action(
             None,
             None,
@@ -1117,7 +1262,184 @@ mod tests {
             NOW,
             &cfg(),
         );
+        assert_eq!(action, EpisodeAction::SendLegacy);
+        // Fresh tombstone — the green close already announced the
+        // recovery; a second line would be noise.
+        let t = ClosedTombstone {
+            message_id: 9,
+            closed_at_ms: NOW,
+            severity_peak: Severity::High,
+        };
+        let action = next_episode_action(
+            None,
+            Some(&t),
+            EpisodeRole::Resolve,
+            Severity::Medium,
+            NOW + 1000,
+            &cfg(),
+        );
         assert_eq!(action, EpisodeAction::Ignore);
+        // Stale tombstone (past the reopen window) — legacy lane again.
+        let action = next_episode_action(
+            None,
+            Some(&t),
+            EpisodeRole::Resolve,
+            Severity::Medium,
+            NOW + EPISODE_REOPEN_SECS * 1000 + 1,
+            &cfg(),
+        );
+        assert_eq!(action, EpisodeAction::SendLegacy);
+        // Registry side: SendLegacy never creates episode state.
+        let reg = EpisodeRegistry::new();
+        let d = reg.apply_event(
+            key(),
+            EpisodeRole::Resolve,
+            Severity::Medium,
+            0,
+            NOW,
+            &cfg(),
+        );
+        assert_eq!(d.action, EpisodeAction::SendLegacy);
+        assert_eq!(reg.live_count(), 0, "SendLegacy must not open an episode");
+    }
+
+    #[test]
+    fn test_next_episode_action_escalation_low_peak_to_high_pages_fresh() {
+        // Hostile-review fix: a Low-opened episode (pre-open off-hours
+        // storm) crossing into High MUST page fresh — never a silent edit.
+        let mut st = EpisodeState::open(key(), Severity::Low, NOW);
+        st.message_id = Some(42);
+        st.last_edit_ms = NOW; // even inside the edit throttle window
+        for role in [EpisodeRole::Open, EpisodeRole::Progress] {
+            let action =
+                next_episode_action(Some(&st), None, role, Severity::High, NOW + 1000, &cfg());
+            assert_eq!(
+                action,
+                EpisodeAction::SendFirstPage,
+                "Low→High escalation must take the fresh-page bypass ({role:?})"
+            );
+        }
+        // Same-severity repeats keep folding as edits/throttles.
+        let action = next_episode_action(
+            Some(&st),
+            None,
+            EpisodeRole::Progress,
+            Severity::Low,
+            NOW + 1000,
+            &cfg(),
+        );
+        assert_eq!(action, EpisodeAction::EditThrottled);
+        // A High-peak episode never re-escalates on repeat High events.
+        let mut high = EpisodeState::open(key(), Severity::High, NOW);
+        high.message_id = Some(43);
+        high.last_edit_ms = 0;
+        let action = next_episode_action(
+            Some(&high),
+            None,
+            EpisodeRole::Progress,
+            Severity::High,
+            NOW + 60_000,
+            &cfg(),
+        );
+        assert_eq!(
+            action,
+            EpisodeAction::Edit {
+                message_id: 43,
+                close: false
+            }
+        );
+    }
+
+    #[test]
+    fn test_apply_event_escalation_marks_decision_and_updates_peak() {
+        let reg = EpisodeRegistry::new();
+        let _ = reg.apply_event(key(), EpisodeRole::Open, Severity::Low, 0, NOW, &cfg());
+        reg.record_sent(key(), Some(42), NOW);
+        let d = reg.apply_event(
+            key(),
+            EpisodeRole::Open,
+            Severity::High,
+            0,
+            NOW + 1000,
+            &cfg(),
+        );
+        assert_eq!(d.action, EpisodeAction::SendFirstPage);
+        assert!(d.escalated, "escalation edge must be flagged");
+        assert_eq!(d.state.severity_peak, Severity::High);
+        assert_eq!(d.state.occurrences, 2, "the escalating drop still folds");
+        // A plain first open is NOT an escalation.
+        let reg2 = EpisodeRegistry::new();
+        let d2 = reg2.apply_event(key(), EpisodeRole::Open, Severity::High, 0, NOW, &cfg());
+        assert_eq!(d2.action, EpisodeAction::SendFirstPage);
+        assert!(!d2.escalated);
+    }
+
+    #[test]
+    fn test_tombstone_high_reopen_over_low_peak_pages_fresh() {
+        // A HIGH disconnect inside the reopen window of a LOW-peak closed
+        // bubble must NOT fold silently — fresh first page (with SMS leg).
+        let low_tomb = ClosedTombstone {
+            message_id: 7,
+            closed_at_ms: NOW,
+            severity_peak: Severity::Low,
+        };
+        let action = next_episode_action(
+            None,
+            Some(&low_tomb),
+            EpisodeRole::Open,
+            Severity::High,
+            NOW + 1000,
+            &cfg(),
+        );
+        assert_eq!(action, EpisodeAction::SendFirstPage);
+        // Low reopen into the same Low tombstone still folds.
+        let action = next_episode_action(
+            None,
+            Some(&low_tomb),
+            EpisodeRole::Open,
+            Severity::Low,
+            NOW + 1000,
+            &cfg(),
+        );
+        assert_eq!(
+            action,
+            EpisodeAction::Edit {
+                message_id: 7,
+                close: false
+            }
+        );
+    }
+
+    #[test]
+    fn test_tick_expires_stale_down_and_live_count_drops() {
+        // Hostile-review fix: a Down episode with no events for
+        // EPISODE_DOWN_STALE_EXPIRE_SECS expires (no tombstone) so a later
+        // outage opens a FRESH first page instead of editing a stale bubble.
+        let reg = EpisodeRegistry::new();
+        let _ = reg.apply_event(key(), EpisodeRole::Open, Severity::High, 0, NOW, &cfg());
+        reg.record_sent(key(), Some(42), NOW);
+        assert_eq!(reg.live_count(), 1);
+        // Just under the bound: still live.
+        let outcome = reg.tick(NOW + EPISODE_DOWN_STALE_EXPIRE_SECS * 1000 - 1, &cfg());
+        assert!(outcome.expired.is_empty());
+        assert_eq!(reg.live_count(), 1);
+        // At the bound: expired, no tombstone.
+        let expire_at = NOW + EPISODE_DOWN_STALE_EXPIRE_SECS * 1000;
+        let outcome = reg.tick(expire_at, &cfg());
+        assert_eq!(outcome.expired.len(), 1);
+        assert_eq!(outcome.expired[0].message_id, Some(42));
+        assert!(outcome.closed.is_empty());
+        assert_eq!(reg.live_count(), 0, "expired episode leaves the registry");
+        // The NEXT outage opens a fresh first page — never a stale fold.
+        let d = reg.apply_event(
+            key(),
+            EpisodeRole::Open,
+            Severity::High,
+            0,
+            expire_at + 1000,
+            &cfg(),
+        );
+        assert_eq!(d.action, EpisodeAction::SendFirstPage);
     }
 
     // The never-drop pin: FSM is total AND High/Critical Open/Progress
@@ -1157,7 +1479,7 @@ mod tests {
             st.last_edit_ms = last_edit_ms;
             st.phase = if phase_recovering { EpisodePhase::Recovering } else { EpisodePhase::Down };
             let state = has_state.then_some(&st);
-            let tomb = ClosedTombstone { message_id: tomb_id, closed_at_ms: tomb_closed_ms };
+            let tomb = ClosedTombstone { message_id: tomb_id, closed_at_ms: tomb_closed_ms, severity_peak: severity };
             let tombstone = has_tombstone.then_some(&tomb);
 
             // Total: never panics.
@@ -1185,7 +1507,7 @@ mod tests {
             render_episode_recovering(&st, &ctx),
         ] {
             assert!(
-                rendered.matches('\n').count() <= EPISODE_STEADY_MAX_LINES - 1,
+                rendered.matches('\n').count() < EPISODE_STEADY_MAX_LINES,
                 "steady render exceeded {EPISODE_STEADY_MAX_LINES} lines: {rendered:?}"
             );
             assert!(
@@ -1359,6 +1681,20 @@ mod tests {
         assert_eq!(d.attempts, 31);
         assert!(d.explained);
         assert_eq!(d.phase, EpisodePhase::Recovering);
+        assert_eq!(
+            d.severity_peak,
+            Severity::High,
+            "severity_peak persists so escalation still pages after restart"
+        );
+
+        // Legacy entry with NO severity_peak label → Low default, so a
+        // later High event pages fresh (duplicate-over-drop).
+        let legacy = format!(
+            r#"[{{"family":"main_feed_ws","conn":0,"opened_at_ms":{NOW},"message_id":9}}]"#
+        );
+        let decoded_legacy = episode_snapshot::decode(&legacy, NOW + 1000, today);
+        assert_eq!(decoded_legacy.len(), 1);
+        assert_eq!(decoded_legacy[0].severity_peak, Severity::Low);
 
         // Age bound: > EPISODE_REHYDRATE_MAX_AGE_SECS old → dropped.
         let stale_now = NOW + (EPISODE_REHYDRATE_MAX_AGE_SECS + 1) * 1000;
@@ -1437,5 +1773,126 @@ mod tests {
             }
         );
         assert_eq!(d.state.attempts, 17, "attempts hint wins when provided");
+    }
+
+    // -- Name-matched pub-fn coverage (pub-fn-test-guard contract) ----------
+
+    #[test]
+    fn test_record_sent_sets_message_id_explained_and_resets_failures() {
+        let reg = EpisodeRegistry::new();
+        let _ = reg.apply_event(key(), EpisodeRole::Open, Severity::High, 0, NOW, &cfg());
+        let _ = reg.record_edit_failure(key());
+        reg.record_sent(key(), Some(64), NOW + 100);
+        let snap = reg.snapshot();
+        assert_eq!(snap[0].message_id, Some(64));
+        assert!(snap[0].explained);
+        assert_eq!(snap[0].edit_failures, 0);
+        assert_eq!(snap[0].last_edit_ms, NOW + 100);
+        // A failed send (None id) still marks explained, keeps id None.
+        let reg2 = EpisodeRegistry::new();
+        let _ = reg2.apply_event(key(), EpisodeRole::Open, Severity::High, 0, NOW, &cfg());
+        reg2.record_sent(key(), None, NOW + 100);
+        assert_eq!(reg2.snapshot()[0].message_id, None);
+        assert!(reg2.snapshot()[0].explained);
+    }
+
+    #[test]
+    fn test_record_edit_applied_and_last_render_hash_bookkeeping() {
+        let reg = EpisodeRegistry::new();
+        let _ = reg.apply_event(key(), EpisodeRole::Open, Severity::High, 0, NOW, &cfg());
+        assert_eq!(reg.last_render_hash(key()), 0, "no render applied yet");
+        let _ = reg.record_edit_failure(key());
+        reg.record_edit_applied(key(), NOW + 500, 4242);
+        assert_eq!(reg.last_render_hash(key()), 4242);
+        let snap = reg.snapshot();
+        assert_eq!(snap[0].last_edit_ms, NOW + 500);
+        assert_eq!(snap[0].edit_failures, 0, "success resets the failure run");
+    }
+
+    #[test]
+    fn test_replace_message_id_swaps_bubble_and_resets_failures() {
+        let reg = EpisodeRegistry::new();
+        let _ = reg.apply_event(key(), EpisodeRole::Open, Severity::High, 0, NOW, &cfg());
+        reg.record_sent(key(), Some(1), NOW);
+        let _ = reg.record_edit_failure(key());
+        reg.replace_message_id(key(), Some(2), NOW + 1000);
+        let snap = reg.snapshot();
+        assert_eq!(snap[0].message_id, Some(2));
+        assert_eq!(snap[0].edit_failures, 0);
+    }
+
+    #[test]
+    fn test_from_snapshot_label_family_phase_roundtrip_unknown_none() {
+        for family in [EpisodeFamily::MainFeedWs, EpisodeFamily::OrderUpdateWs] {
+            assert_eq!(
+                EpisodeFamily::from_snapshot_label(family.snapshot_label()),
+                Some(family)
+            );
+        }
+        assert_eq!(EpisodeFamily::from_snapshot_label("alien_ws"), None);
+        for phase in [EpisodePhase::Down, EpisodePhase::Recovering] {
+            assert_eq!(
+                EpisodePhase::from_snapshot_label(phase.snapshot_label()),
+                Some(phase)
+            );
+        }
+        assert_eq!(EpisodePhase::from_snapshot_label("half-open"), None);
+    }
+
+    #[test]
+    fn test_render_episode_first_page_small_and_huge() {
+        assert_eq!(render_episode_first_page("tiny body"), "tiny body");
+        let huge = "x".repeat(EPISODE_FIRST_PAGE_MAX_CHARS + 500);
+        assert_eq!(
+            render_episode_first_page(&huge).chars().count(),
+            EPISODE_FIRST_PAGE_MAX_CHARS
+        );
+    }
+
+    #[test]
+    fn test_render_episode_steady_shows_counters() {
+        let mut st = live_state(Some(1));
+        st.occurrences = 7;
+        st.attempts = 31;
+        let ctx = EpisodeRenderCtx { now_ms: NOW };
+        let rendered = render_episode_steady(&st, &ctx);
+        assert!(rendered.contains("7 drops"));
+        assert!(rendered.contains("31 reconnect attempts"));
+        assert!(rendered.contains("reconnecting automatically"));
+    }
+
+    #[test]
+    fn test_render_episode_recovering_shows_confirming() {
+        let st = live_state(Some(1));
+        let ctx = EpisodeRenderCtx { now_ms: NOW };
+        let rendered = render_episode_recovering(&st, &ctx);
+        assert!(rendered.contains("reconnected — confirming"));
+    }
+
+    #[test]
+    fn test_render_episode_recovered_contains_duration_and_attempts() {
+        let mut st = live_state(Some(1));
+        st.attempts = 4;
+        let ctx = EpisodeRenderCtx {
+            now_ms: NOW + 90_000,
+        };
+        let line = render_episode_recovered(&st, &ctx);
+        assert!(line.contains("1m 30s"));
+        assert!(line.contains("4 attempts"));
+    }
+
+    #[test]
+    fn test_render_episode_stale_closed_one_line_neutral() {
+        let mut st = live_state(Some(1));
+        st.last_event_ms = NOW;
+        let line = render_episode_stale_closed(&st);
+        assert!(line.starts_with('\u{26aa}'), "neutral marker: {line:?}");
+        assert_eq!(line.matches('\n').count(), 0, "one line only");
+        assert!(line.contains("IST"), "IST timestamp per commandment 9");
+        assert!(line.contains("fresh alert"));
+        // Commandments: no library names / paths / jargon.
+        for banned in ["rkyv", "papaya", "mpsc", ".rs", "data/", "editMessageText"] {
+            assert!(!line.contains(banned), "banned {banned:?} in {line:?}");
+        }
     }
 }

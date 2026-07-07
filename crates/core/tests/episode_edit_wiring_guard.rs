@@ -184,6 +184,9 @@ fn guard_d_episode_constants_pinned() {
         "pub const EPISODE_FIRST_PAGE_MAX_CHARS: usize = 3800;",
         "pub const EPISODE_REHYDRATE_MAX_AGE_SECS: u64 = 7200;",
         "pub const EPISODE_EDIT_FAILURES_FALLBACK_THRESHOLD: u8 = 2;",
+        // Hostile-review fix 2026-07-07: stale-Down expiry bound (the
+        // restart edge — a rehydrated Down bubble must never live forever).
+        "pub const EPISODE_DOWN_STALE_EXPIRE_SECS: u64 = 1800;",
     ] {
         assert!(
             src.contains(pin),
@@ -324,7 +327,9 @@ fn guard_episode_core_uses_notification_severity_only() {
 }
 
 // Bonus pin: the SNS-SMS leg rides ONLY the SendFirstPage arm — SMS
-// exactly once per episode open, never on edits/fallbacks.
+// exactly once per episode OPEN and once per Low→High ESCALATION (the
+// escalation edge routes SendFirstPage through the FSM, hostile-review
+// fix 2026-07-07), never on edits/fallbacks.
 #[test]
 fn guard_sms_leg_rides_first_page_only() {
     let src = service_src();
@@ -346,5 +351,90 @@ fn guard_sms_leg_rides_first_page_only() {
     assert!(
         first_page_arm.contains("send_sns_sms("),
         "the SMS leg must live inside the SendFirstPage arm"
+    );
+}
+
+// Escalation pin (hostile-review fix 2026-07-07): the pure FSM must route
+// a High/Critical event folding into a sub-High episode (live state OR a
+// fresh tombstone) to a FRESH first page — a silent edit produces no
+// Telegram push and no SMS for an in-market HIGH outage.
+#[test]
+fn guard_escalation_edge_reaches_first_page_bypass() {
+    let episode = episode_src();
+    let prod = region(&episode, "//! Telegram UX Overhaul", "#[cfg(test)]");
+    let fsm = region(
+        prod,
+        "pub fn next_episode_action",
+        "pub struct EpisodeDecision",
+    );
+    assert!(
+        fsm.contains("st.severity_peak < Severity::High"),
+        "the live-state escalation edge must consult severity_peak"
+    );
+    assert!(
+        fsm.contains("t.severity_peak < Severity::High"),
+        "the tombstone-reopen escalation edge must consult the tombstone peak"
+    );
+    // The sub-threshold transient edit failure must never be silent
+    // (counted + error!-loud), and High/Critical must fall back on the
+    // very first exhausted transient.
+    let src = service_src();
+    let dispatch = region(
+        &src,
+        "async fn dispatch_episode_event",
+        "async fn episode_fallback_send",
+    );
+    assert!(
+        dispatch.contains("decision.state.severity_peak >= Severity::High"),
+        "HIGH episodes must fall back on the first exhausted transient"
+    );
+    assert!(
+        dispatch.contains(r#"reason = "edit_transient_deferred""#),
+        "sub-threshold transient must stay error!-loud (TELEGRAM-03)"
+    );
+    assert!(
+        dispatch.contains(r#""reason" => "transient_deferred""#),
+        "sub-threshold transient must be counted"
+    );
+}
+
+// Stale-Down expiry pin (hostile-review fix 2026-07-07): the registry
+// tick must expire event-less Down episodes (restart edge) and the shell
+// must neutralize the old bubble; a Resolve with no state routes to the
+// legacy lane instead of a silent drop.
+#[test]
+fn guard_stale_expiry_and_legacy_resolve_wired() {
+    let episode = episode_src();
+    let prod = region(&episode, "//! Telegram UX Overhaul", "#[cfg(test)]");
+    assert!(
+        prod.contains("down_stale_expire_secs"),
+        "EpisodeConfig must carry the stale-Down expiry bound"
+    );
+    assert!(
+        prod.contains("EpisodeAction::SendLegacy"),
+        "the FSM must route untracked recoveries to the legacy lane"
+    );
+    let src = service_src();
+    let tick = region(
+        &src,
+        "pub(crate) async fn run_episode_tick",
+        "async fn deliver_drained",
+    );
+    assert!(
+        tick.contains("render_episode_stale_closed("),
+        "run_episode_tick must neutralize expired stale bubbles"
+    );
+    let dispatch = region(
+        &src,
+        "async fn dispatch_episode_event",
+        "async fn episode_fallback_send",
+    );
+    assert!(
+        dispatch.contains("EpisodeAction::SendLegacy =>"),
+        "dispatch must deliver SendLegacy through the legacy immediate lane"
+    );
+    assert!(
+        dispatch.contains(r#""action" => "legacy_passthrough""#),
+        "the legacy passthrough must be counted"
     );
 }

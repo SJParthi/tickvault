@@ -47,7 +47,7 @@ use super::episode::{
     EPISODE_EDIT_FAILURES_FALLBACK_THRESHOLD, EpisodeAction, EpisodeConfig, EpisodeKey,
     EpisodePhase, EpisodeRegistry, EpisodeRenderCtx, episode_snapshot, fnv1a_hash,
     render_episode_first_page, render_episode_recovered, render_episode_recovering,
-    render_episode_steady,
+    render_episode_stale_closed, render_episode_steady,
 };
 use super::events::{NotificationEvent, Severity};
 
@@ -777,10 +777,11 @@ impl NotificationService {
 
         match decision.action {
             EpisodeAction::Ignore => {
-                // Resolve for an episode we never tracked — nothing
-                // degraded to announce, nothing to edit. (Reachable only
-                // for Medium/Low recovery events; the proptest pins that
-                // High/Critical Open/Progress can never land here.)
+                // Resolve against a FRESH tombstone — the green close line
+                // already announced this recovery; a second line would be
+                // noise. (A resolve with NO tombstone routes SendLegacy —
+                // never dropped; the proptest pins that High/Critical
+                // Open/Progress can never land here.)
             }
             EpisodeAction::SendFirstPage => {
                 metrics::counter!(
@@ -789,7 +790,15 @@ impl NotificationService {
                     "coalesced" => "false",
                 )
                 .increment(1);
-                metrics::counter!("tv_telegram_episode_events_total", "action" => "open")
+                // `escalate` = a live sub-High episode crossed into
+                // High/Critical and re-paged fresh (hostile-review fix
+                // 2026-07-07); `open` = a brand-new episode first page.
+                let action_label: &'static str = if decision.escalated {
+                    "escalate"
+                } else {
+                    "open"
+                };
+                metrics::counter!("tv_telegram_episode_events_total", "action" => action_label)
                     .increment(1);
                 let page = render_episode_first_page(&event.to_message());
                 let message = format!("{} {}", telegram_message_prefix(severity), page);
@@ -894,9 +903,33 @@ impl NotificationService {
                     }
                     EditOutcome::Transient => {
                         let failures = self.episodes.record_edit_failure(key);
-                        if failures >= EPISODE_EDIT_FAILURES_FALLBACK_THRESHOLD {
+                        // High/Critical episodes fall back to a FRESH send
+                        // on the very first exhausted transient — a
+                        // structurally-final event (e.g. the once-per-
+                        // outage order-update page) may never re-drive the
+                        // ladder, so duplicate-over-drop wins immediately
+                        // (hostile-review fix 2026-07-07).
+                        if failures >= EPISODE_EDIT_FAILURES_FALLBACK_THRESHOLD
+                            || decision.state.severity_peak >= Severity::High
+                        {
                             self.episode_fallback_send(key, &text, "transient_exhausted", now_ms)
                                 .await;
+                        } else {
+                            // Sub-threshold transient on a <High episode:
+                            // NEVER silent — counted + error!-loud; the
+                            // next event or the drain ticker re-drives.
+                            metrics::counter!(
+                                "tv_telegram_edit_fallback_total",
+                                "reason" => "transient_deferred",
+                            )
+                            .increment(1);
+                            error!(
+                                target: "notification",
+                                code = tickvault_common::error_code::ErrorCode::Telegram03EpisodeDegraded.code_str(),
+                                reason = "edit_transient_deferred",
+                                consecutive_failures = failures,
+                                "TELEGRAM-03: episode bubble edit failed transiently — will retry on the next event or fall back to a fresh bubble"
+                            );
                         }
                     }
                 }
@@ -946,6 +979,49 @@ impl NotificationService {
                     );
                 }
                 self.persist_episodes();
+            }
+            EpisodeAction::SendLegacy => {
+                // A recovery for an episode we never tracked (snapshot
+                // lost across a restart / cross-task ordering) — deliver
+                // it through the legacy immediate lane instead of
+                // dropping the event (hostile-review fix 2026-07-07).
+                // No episode state is created; no SMS (a recovery is not
+                // an incident page).
+                metrics::counter!(
+                    "tv_telegram_dispatched_total",
+                    "severity" => severity.as_label(),
+                    "coalesced" => "false",
+                )
+                .increment(1);
+                metrics::counter!(
+                    "tv_telegram_episode_events_total",
+                    "action" => "legacy_passthrough",
+                )
+                .increment(1);
+                let body = render_episode_first_page(&event.to_message());
+                let message = format!("{} {}", telegram_message_prefix(severity), body);
+                let ok = send_telegram_chunk_with_retry(
+                    http_client,
+                    telegram_api_base_url,
+                    bot_token,
+                    chat_id,
+                    &message,
+                )
+                .await;
+                if !ok {
+                    metrics::counter!(
+                        "tv_telegram_dropped_total",
+                        "reason" => "send_failed",
+                    )
+                    .increment(1);
+                    error!(
+                        target: "notification",
+                        code = tickvault_common::error_code::ErrorCode::Telegram01Dropped.code_str(),
+                        topic = event.topic(),
+                        severity = severity.as_label(),
+                        "TELEGRAM-01: legacy passthrough delivery failed — operator alerts MAY be missed"
+                    );
+                }
             }
         }
     }
@@ -1205,25 +1281,48 @@ pub(crate) async fn run_episode_tick(
 ) {
     let now_ms = epoch_ms_now();
     let cfg = EpisodeConfig::default();
-    let closed = episodes.tick(now_ms, &cfg);
-    if closed.is_empty() {
+    let outcome = episodes.tick(now_ms, &cfg);
+    if outcome.closed.is_empty() && outcome.expired.is_empty() {
         return;
     }
-    for st in &closed {
+    // One loop, ONE edit call site (wiring-guard pinned): green close for
+    // recovered episodes; a neutral stale-close for expired Down episodes
+    // (hostile-review fix 2026-07-07 — a rehydrated Down bubble whose
+    // recovery event never arrives must not show DOWN forever).
+    let closed_iter = outcome.closed.iter().map(|st| (st, false));
+    let expired_iter = outcome.expired.iter().map(|st| (st, true));
+    for (st, stale) in closed_iter.chain(expired_iter) {
         let Some(message_id) = st.message_id else {
             continue;
         };
         let ctx = EpisodeRenderCtx { now_ms };
-        let text = format!(
-            "{} {}",
-            telegram_message_prefix(Severity::Low),
-            render_episode_recovered(st, &ctx)
-        );
-        metrics::counter!("tv_telegram_episode_events_total", "action" => "close").increment(1);
+        let (rendered, action_label): (String, &'static str) = if stale {
+            (render_episode_stale_closed(st), "expired")
+        } else {
+            (render_episode_recovered(st, &ctx), "close")
+        };
+        let text = format!("{} {}", telegram_message_prefix(Severity::Low), rendered);
+        metrics::counter!("tv_telegram_episode_events_total", "action" => action_label)
+            .increment(1);
         match edit_telegram_message_with_retry(client, base_url, token, chat_id, message_id, &text)
             .await
         {
             EditOutcome::Applied | EditOutcome::NotModifiedNoop => {}
+            EditOutcome::Fallback | EditOutcome::Transient if stale => {
+                // The stale close is cosmetic (no event content) — a fresh
+                // message would be noise; loud + counted, never silent.
+                metrics::counter!(
+                    "tv_telegram_edit_fallback_total",
+                    "reason" => "stale_close_edit_failed",
+                )
+                .increment(1);
+                error!(
+                    target: "notification",
+                    code = tickvault_common::error_code::ErrorCode::Telegram03EpisodeDegraded.code_str(),
+                    reason = "stale_close_edit_failed",
+                    "TELEGRAM-03: stale episode close edit failed — the old bubble may keep showing DOWN; any new problem still opens a fresh alert"
+                );
+            }
             EditOutcome::Fallback | EditOutcome::Transient => {
                 // The episode is already closed in the registry — send the
                 // green line fresh so the recovery is never silent.
@@ -3327,6 +3426,66 @@ mod tests {
         base_url
     }
 
+    /// Like `start_scripted_telegram_server` but RECORDS every request
+    /// path (so tests can assert which transport calls fired) and lets
+    /// the caller choose the editMessageText status (400-not-found vs
+    /// 429-transient).
+    async fn start_recording_telegram_server(
+        edit_status: u16,
+    ) -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let base_url = format!("http://127.0.0.1:{}", addr.port());
+        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let log_task = std::sync::Arc::clone(&log);
+
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let log_conn = std::sync::Arc::clone(&log_task);
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 8192];
+                    let n = stream.read(&mut buf).await.unwrap_or(0);
+                    let request = String::from_utf8_lossy(&buf[..n]);
+                    let (status_line, body) = if request.contains("/editMessageText") {
+                        log_conn.lock().unwrap().push("edit".to_string());
+                        match edit_status {
+                            429 => (
+                                "HTTP/1.1 429 Too Many Requests",
+                                r#"{"ok":false,"description":"Too Many Requests"}"#,
+                            ),
+                            _ => (
+                                "HTTP/1.1 400 Bad Request",
+                                r#"{"ok":false,"description":"Bad Request: message to edit not found"}"#,
+                            ),
+                        }
+                    } else {
+                        log_conn.lock().unwrap().push("send".to_string());
+                        (
+                            "HTTP/1.1 200 OK",
+                            r#"{"ok":true,"result":{"message_id":777}}"#,
+                        )
+                    };
+                    let response = format!(
+                        "{}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        status_line,
+                        body.len(),
+                        body
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                    let _ = stream.shutdown().await;
+                });
+            }
+        });
+
+        (base_url, log)
+    }
+
     fn make_scripted_service(base_url: String) -> Arc<NotificationService> {
         let http_client = reqwest::Client::builder()
             .timeout(Duration::from_secs(2))
@@ -3472,6 +3631,235 @@ mod tests {
             0,
             "stable recovery must close the episode"
         );
+    }
+
+    #[tokio::test]
+    async fn test_run_episode_tick_expires_stale_down_bubble() {
+        // Hostile-review fix: a Down episode with no events for 30 minutes
+        // (the restart edge — a clean first connect emits no recovery
+        // event) expires from the registry so a later outage opens a
+        // FRESH first page instead of silently editing a stale bubble.
+        let (base_url, log) = start_recording_telegram_server(400).await;
+        let service = make_scripted_service(base_url.clone());
+        let key = main_feed_key();
+        let cfg = EpisodeConfig::default();
+        let stale_ago = epoch_ms_now().saturating_sub(
+            super::super::episode::EPISODE_DOWN_STALE_EXPIRE_SECS
+                .saturating_mul(1000)
+                .saturating_add(60_000),
+        );
+        let _ = service.episodes.apply_event(
+            key,
+            EpisodeRole::Open,
+            Severity::High,
+            0,
+            stale_ago,
+            &cfg,
+        );
+        service.episodes.record_sent(key, Some(42), stale_ago);
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(2))
+            .build()
+            .unwrap();
+        let token = SecretString::from("test-bot-token".to_string());
+        run_episode_tick(&service.episodes, &client, &base_url, &token, "123", None).await;
+        assert_eq!(
+            service.episodes.live_count(),
+            0,
+            "stale Down episode must expire"
+        );
+        // A stale-close edit was attempted (best-effort neutral line).
+        assert!(
+            log.lock().unwrap().iter().any(|p| p == "edit"),
+            "stale close must attempt to neutralize the old bubble"
+        );
+        // The NEXT High outage opens a FRESH first page (with the SMS arm).
+        let d = service.episodes.apply_event(
+            key,
+            EpisodeRole::Open,
+            Severity::High,
+            0,
+            epoch_ms_now(),
+            &cfg,
+        );
+        assert_eq!(
+            d.action,
+            super::super::episode::EpisodeAction::SendFirstPage
+        );
+    }
+
+    #[tokio::test]
+    async fn test_low_episode_escalation_to_high_sends_fresh_page() {
+        // Hostile-review fix (pre-open storm): an episode opened by the
+        // Low off-hours variant crossing into the in-market High variant
+        // must send a FRESH first page (push notification + the SMS arm),
+        // never a silent edit of the Low bubble.
+        let (base_url, log) = start_recording_telegram_server(400).await;
+        let service = make_scripted_service(base_url);
+        // 08:59 IST: off-hours Low disconnect opens the episode.
+        Arc::clone(&service)
+            .dispatch_episode_event(NotificationEvent::WebSocketDisconnectedOffHours {
+                connection_index: 0,
+                reason: "reset".to_string(),
+            })
+            .await;
+        assert_eq!(service.episodes.live_count(), 1);
+        assert_eq!(
+            log.lock().unwrap().iter().filter(|p| *p == "send").count(),
+            1
+        );
+        // 09:00 IST: the storm continues in-market at HIGH — fresh page.
+        Arc::clone(&service)
+            .dispatch_episode_event(NotificationEvent::WebSocketDisconnected {
+                connection_index: 0,
+                reason: "reset".to_string(),
+            })
+            .await;
+        let sends = log.lock().unwrap().iter().filter(|p| *p == "send").count();
+        let edits = log.lock().unwrap().iter().filter(|p| *p == "edit").count();
+        assert_eq!(sends, 2, "escalation must send a FRESH page, not edit");
+        assert_eq!(edits, 0, "no silent edit for the Low→High escalation");
+        let snap = service.episodes.snapshot();
+        assert_eq!(snap.len(), 1, "still ONE episode (escalated in place)");
+        assert_eq!(snap[0].severity_peak, Severity::High);
+        assert_eq!(snap[0].occurrences, 2);
+    }
+
+    #[tokio::test]
+    async fn test_resolve_without_state_sends_legacy_message_not_dropped() {
+        // Hostile-review fix: a recovery for an episode we never tracked
+        // (restart lost the snapshot) is delivered through the legacy
+        // immediate lane — never silently dropped.
+        let (base_url, log) = start_recording_telegram_server(400).await;
+        let service = make_scripted_service(base_url);
+        Arc::clone(&service)
+            .dispatch_episode_event(NotificationEvent::WebSocketReconnected {
+                connection_index: 0,
+                reason: Some("reset".to_string()),
+                down_secs: 12,
+                attempts: 3,
+            })
+            .await;
+        assert_eq!(
+            log.lock().unwrap().iter().filter(|p| *p == "send").count(),
+            1,
+            "the solo recovery must be sent via the legacy lane"
+        );
+        assert_eq!(
+            service.episodes.live_count(),
+            0,
+            "a legacy passthrough never opens an episode"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_edit_transient_high_falls_back_immediately_low_stays_loud() {
+        // Hostile-review fix: a HIGH episode whose edit exhausts the
+        // transient ladder (429) falls back to a FRESH send on the FIRST
+        // failure — a structurally-final event may never re-drive the
+        // ladder (duplicate-over-drop).
+        let (base_url, log) = start_recording_telegram_server(429).await;
+        let service = make_scripted_service(base_url);
+        let key = main_feed_key();
+        let cfg = EpisodeConfig::default();
+        let now = epoch_ms_now();
+        let _ = service.episodes.apply_event(
+            key,
+            EpisodeRole::Open,
+            Severity::High,
+            0,
+            now.saturating_sub(60_000),
+            &cfg,
+        );
+        service
+            .episodes
+            .record_sent(key, Some(42), now.saturating_sub(60_000));
+        Arc::clone(&service)
+            .dispatch_episode_event(NotificationEvent::WebSocketDisconnected {
+                connection_index: 0,
+                reason: "reset".to_string(),
+            })
+            .await;
+        let snap = service.episodes.snapshot();
+        assert_eq!(
+            snap[0].message_id,
+            Some(777),
+            "HIGH transient must fall back to a fresh bubble on the first exhausted ladder"
+        );
+        assert!(
+            log.lock().unwrap().iter().any(|p| p == "send"),
+            "a fresh send must have fired"
+        );
+
+        // A LOW-peak episode below the threshold defers (counted + error!
+        // loud, asserted by the wiring guard) without a fallback send.
+        let (base_url2, log2) = start_recording_telegram_server(429).await;
+        let service2 = make_scripted_service(base_url2);
+        let key2 = main_feed_key();
+        let _ = service2.episodes.apply_event(
+            key2,
+            EpisodeRole::Open,
+            Severity::Low,
+            0,
+            now.saturating_sub(60_000),
+            &cfg,
+        );
+        service2
+            .episodes
+            .record_sent(key2, Some(42), now.saturating_sub(60_000));
+        Arc::clone(&service2)
+            .dispatch_episode_event(NotificationEvent::WebSocketDisconnectedOffHours {
+                connection_index: 0,
+                reason: "reset".to_string(),
+            })
+            .await;
+        let snap2 = service2.episodes.snapshot();
+        assert_eq!(
+            snap2[0].message_id,
+            Some(42),
+            "sub-threshold LOW transient keeps the bubble (no fallback yet)"
+        );
+        assert_eq!(snap2[0].edit_failures, 1, "the failure is recorded");
+        assert_eq!(
+            log2.lock().unwrap().iter().filter(|p| *p == "send").count(),
+            0,
+            "no fallback send below the threshold for a LOW episode"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_episode_registry_accessor_and_episode_mode_enabled() {
+        let service = make_active_service();
+        assert_eq!(service.episode_registry().live_count(), 0);
+        assert!(service.episode_mode_enabled(), "episode mode defaults ON");
+    }
+
+    #[tokio::test]
+    async fn test_send_telegram_chunk_with_retry_returning_id_captures_id() {
+        let base_url = start_scripted_telegram_server().await;
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(2))
+            .build()
+            .unwrap();
+        let token = SecretString::from("test-bot-token".to_string());
+        let (ok, id) =
+            send_telegram_chunk_with_retry_returning_id(&client, &base_url, &token, "123", "hi")
+                .await;
+        assert!(ok);
+        assert_eq!(id, Some(777));
+    }
+
+    #[tokio::test]
+    async fn test_edit_telegram_message_with_retry_returns_fallback_on_not_found() {
+        let base_url = start_scripted_telegram_server().await;
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(2))
+            .build()
+            .unwrap();
+        let token = SecretString::from("test-bot-token".to_string());
+        let outcome =
+            edit_telegram_message_with_retry(&client, &base_url, &token, "123", 42, "text").await;
+        assert_eq!(outcome, EditOutcome::Fallback);
     }
 
     #[tokio::test]
