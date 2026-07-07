@@ -3613,20 +3613,16 @@ mod tests {
             .find("\ndef ")
             .map_or(body_region.len(), |rel| rel + 1);
         let body = &body_region[..body_end];
-        assert!(
-            body.contains("replace(tzinfo=timezone.utc)"),
-            "groww_sidecar.py: now_ist_nanos (the status-file write stamp) must use the \
-             replace(tzinfo=timezone.utc) IST-epoch trick — the same convention as \
-             ms_to_ist_nanos and the Rust receipt_ist_nanos — or the bridge's \
-             groww_status_is_live gate classifies every real status record as \
-             19,800s stale forever:\n{body}"
-        );
-        // A bare aware-datetime `.timestamp()` in the same body's CODE
-        // (outside the docstring + `#` comments) would reintroduce the
-        // UTC-epoch bug; the replace-trick line is the only allowed
-        // `.timestamp()` call site.
+        // 2026-07-06 anti-vacuity hardening: every assertion below runs
+        // against the body's EXECUTABLE code lines only (docstring + `#`
+        // comment lines stripped). The function's own docstring quotes the
+        // `replace(tzinfo=timezone.utc)` literal in prose, so a positive
+        // `body.contains(...)` was self-satisfied by documentation — a
+        // rewrite to `return time.time_ns()` (plain UTC epoch, the exact
+        // stale-forever bug) passed the guard. Prose can no longer satisfy
+        // the pin.
         let mut in_docstring = false;
-        let bare_utc_calls = body
+        let code_lines: Vec<&str> = body
             .lines()
             .filter(|line| {
                 let t = line.trim_start();
@@ -3640,16 +3636,43 @@ mod tests {
                 if quotes >= 2 {
                     return false; // one-line docstring
                 }
-                !in_docstring
-                    && !t.starts_with('#')
-                    && t.contains(".timestamp()")
-                    && !t.contains("replace(tzinfo=timezone.utc)")
+                !in_docstring && !t.starts_with('#') && !t.is_empty()
             })
+            .collect();
+        assert!(
+            code_lines
+                .iter()
+                .any(|l| l.contains("replace(tzinfo=timezone.utc)") && l.contains(".timestamp()")),
+            "groww_sidecar.py: now_ist_nanos (the status-file write stamp) must use the \
+             replace(tzinfo=timezone.utc)...timestamp() IST-epoch trick on an EXECUTABLE \
+             code line (not just the docstring) — the same convention as ms_to_ist_nanos \
+             and the Rust receipt_ist_nanos — or the bridge's groww_status_is_live gate \
+             classifies every real status record as 19,800s stale forever:\n{body}"
+        );
+        // A bare aware-datetime `.timestamp()` in the same body's CODE
+        // would reintroduce the UTC-epoch bug; the replace-trick line is
+        // the only allowed `.timestamp()` call site.
+        let bare_utc_calls = code_lines
+            .iter()
+            .filter(|t| t.contains(".timestamp()") && !t.contains("replace(tzinfo=timezone.utc)"))
             .count();
         assert_eq!(
             bare_utc_calls, 0,
             "groww_sidecar.py: now_ist_nanos must not call .timestamp() on a bare aware \
              datetime in code (that returns the plain UTC epoch, not IST epoch)"
+        );
+        // `time.time()` / `time.time_ns()` are the other plain-UTC-epoch
+        // producers a future "pythonic simplification" would reach for —
+        // ban them from the body's code outright.
+        let plain_epoch_calls = code_lines
+            .iter()
+            .filter(|t| t.contains("time.time(") || t.contains("time.time_ns("))
+            .count();
+        assert_eq!(
+            plain_epoch_calls, 0,
+            "groww_sidecar.py: now_ist_nanos must not call time.time()/time.time_ns() — \
+             both return the plain UTC epoch, reintroducing the 19,800s-stale-forever \
+             freshness-gate bug"
         );
     }
 
