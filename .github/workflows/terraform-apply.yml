@@ -635,12 +635,32 @@ jobs:
                   # and the two are indistinguishable once the box has
                   # stopped and cannot be probed further. The compound
                   # window (grace arm + mid-grace auto-stop + a crash-class
-                  # regression) is accepted as narrower than red-failing
-                  # every mid-grace auto-stop.
+                  # regression — or, for a pre-grace 000/504, a HANG-class
+                  # regression, per the round-10 note below) is accepted as
+                  # narrower than red-failing every mid-grace auto-stop.
+                  # Fixer round 10 (2026-07-07, message accuracy only — skip
+                  # DECISION unchanged): the cause enumeration is now PER
+                  # pre-grace code. The old single message listed the
+                  # 503-specific causes for ANY code, so a pre-grace 000/504
+                  # (this 5s-capped curl reading the back lambda's 12s hang)
+                  # named an inapplicable cause (a back-lambda invoke failure
+                  # yields the front's FAST 503, never 000) and OMITTED the
+                  # one cause the terminal FATAL below itself assigns to
+                  # 000/504 — the unframed-response shell-hang class. A
+                  # hang-class regression spanning the grace sleep into the
+                  # auto-stop still exits 0 (the accepted compound window),
+                  # but the message now points triage at the right classes.
+                  # Pinned by gate-matrix-r7.sh scenarios D (503 wording) +
+                  # M (000 wording, added round 10).
                   STATE=$(box_state)
                   case "$STATE" in
                     stopped|stopping)
-                      echo "⚠ SKIP (loud): grace re-probe -> '${CODE}' but the box auto-stopped MID-GRACE (post-sleep state: ${STATE}) — the pre-grace '${CODE_PRE}' on a then-running box is consistent with QuestDB-not-listening / a booting OS OR a back-lambda invoke failure (indistinguishable once the box stopped); a not-running box cannot serve the shell — shell smoke re-runs on the next in-window apply" | tee -a "$GITHUB_STEP_SUMMARY"
+                      if [ "$CODE_PRE" = "503" ]; then
+                        PRE_CAUSES="QuestDB-not-listening / a booting OS OR a back-lambda invoke failure (the front maps back_function_error/back_invoke_failed to the same fast 503)"
+                      else
+                        PRE_CAUSES="a booting OS/ENI still dropping SYNs, a QuestDB response slower than the back lambda's 12s timeout, OR the unframed-response shell-hang class (the class the terminal FATAL assigns to 000/504; a back-lambda invoke failure is NOT a candidate — it yields a FAST 503, never 000/504)"
+                      fi
+                      echo "⚠ SKIP (loud): grace re-probe -> '${CODE}' but the box auto-stopped MID-GRACE (post-sleep state: ${STATE}) — the pre-grace '${CODE_PRE}' on a then-running box is consistent with ${PRE_CAUSES} (indistinguishable once the box stopped); a not-running box cannot serve the shell — shell smoke re-runs on the next in-window apply" | tee -a "$GITHUB_STEP_SUMMARY"
                       exit 0 ;;
                   esac
                   echo "FATAL: console GET / -> '${CODE}' past the 90s grace re-probe (pre-grace: '${CODE_PRE}') with box state '${STATE}' at the final sample. 000/504 past the grace = the unframed-response shell-hang class (or — residual, disclosed — an OS boot slower than the ~111s probe+grace budget); 503 past the grace = SG/bind regression, a back-lambda crash (front maps back_function_error/back_invoke_failed to the same fast 503), OR QuestDB down/restarting >90s — check the QuestDB container via docker compose on the box"; exit 1 ;;

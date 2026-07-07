@@ -20,7 +20,18 @@
 #       any failure.
 # It lives alongside handler.py because the gate it exercises is this lambda
 # pair's deploy gate; it is EXCLUDED from the lambda zip (questdb-console.tf
-# archive_file excludes — exact paths, no globs).
+# archive_file excludes — literal filenames; round-10 correction: the
+# provider DOES support glob excludes, see the questdb-console.tf comment).
+#
+# Round-10 changes (2026-07-07): (a) $WORK is cleaned up via an EXIT trap
+# (previously leaked one temp tree per run); (b) a grep-miss on a scenario
+# whose rc matched now REPLACES the PASS verdict instead of appending to it
+# (rows previously printed the contradictory "PASS FAIL(missing: ...)" —
+# exit code was already correct); (c) scenario M pins the 000-pre-grace
+# mid-grace-auto-stop skip wording (the hang-class cause enumeration added
+# to terraform-apply.yml in round 10 — scenario D pins only the 503-pre-grace
+# variant); (d) the scenario count in the green line is computed, not
+# hardcoded.
 #
 # Run from anywhere:  bash deploy/aws/lambda/questdb-console-proxy/gate-matrix-r7.sh
 # Stubs terraform/aws/curl/sleep on PATH and drives (curl-code sequence,
@@ -31,6 +42,7 @@ SELF_DIR=$(cd "$(dirname "$0")" && pwd)
 REPO_ROOT=$(cd "$SELF_DIR/../../../.." && pwd)
 WORKFLOW="$REPO_ROOT/.github/workflows/terraform-apply.yml"
 WORK=$(mktemp -d)
+trap 'rm -rf "$WORK"' EXIT
 GATE_SRC="$WORK/gate-step.sh"
 
 python3 - "$WORKFLOW" > "$GATE_SRC" <<'PY'
@@ -53,6 +65,7 @@ raise SystemExit("gate step not found in terraform-apply.yml")
 PY
 
 FAILS=0
+TOTAL=0
 
 run_case() {
   local name="$1" codes="$2" states="$3" body="$4" expect_rc="$5" expect_grep="$6"
@@ -110,10 +123,18 @@ EOF
   ( cd "$dir" && PATH="$dir/bin:$PATH" GITHUB_STEP_SUMMARY="$dir/summary" \
       bash "$GATE_SRC" > "$dir/out" 2>&1 )
   local rc=$?
+  TOTAL=$((TOTAL + 1))
   local verdict="PASS"
   [ "$rc" -ne "$expect_rc" ] && verdict="FAIL(rc=$rc want=$expect_rc)"
   if [ -n "$expect_grep" ] && ! grep -qF "$expect_grep" "$dir/out"; then
-    verdict="$verdict FAIL(missing: $expect_grep)"
+    # Round-10 fix: REPLACE a prior PASS instead of appending to it — rows
+    # used to print the contradictory "PASS FAIL(missing: ...)" (exit code
+    # was already correct; output honesty only).
+    if [ "$verdict" = PASS ]; then
+      verdict="FAIL(missing: $expect_grep)"
+    else
+      verdict="$verdict FAIL(missing: $expect_grep)"
+    fi
   fi
   [ "$verdict" != PASS ] && FAILS=$((FAILS + 1))
   printf '%-42s rc=%d  %s\n' "$name" "$rc" "$verdict"
@@ -130,7 +151,8 @@ run_case B1_pending_to_running_grace200 "000 000 000 200" "pending running" "$HT
 run_case B2_pending_to_running_grace000 "000 000 000 000" "pending running running" "" 1 "past the 90s grace re-probe (pre-grace: '000')"
 # C. running + 503, grace 200 -> pass (round-5 behavior preserved)
 run_case C_running_503_grace200 "503 503 503 200" "running running" "$HTML" 0 "200 on the 90s grace re-probe"
-# D. running + 503, grace 000, mid-grace auto-stop -> reworded loud SKIP
+# D. running + 503, grace 000, mid-grace auto-stop -> loud SKIP whose cause
+#    enumeration is the 503-specific one (round-10: causes are now per-code)
 run_case D_midgrace_stop_skip "503 503 503 000" "running running stopped" "" 0 "consistent with QuestDB-not-listening / a booting OS OR a back-lambda invoke failure"
 # E. stopped at both samples, 000 -> loud skip naming the auto-stop window (round-8 pin)
 run_case E_stopped_both_skip "000 000 000" "stopped stopped" "" 0 "auto-stop window, 08:30–16:30 IST schedule"
@@ -149,10 +171,16 @@ run_case K_unknown_state "000 000 000" "unknown unknown" "" 1 "state could not b
 # L. pending at BOTH samples, 000 -> loud skip naming the START transition,
 #    never the auto-stop window (round-8 message-accuracy fix)
 run_case L_pending_both_start_wording "000 000 000" "pending pending" "" 0 "start transition — box booting"
+# M. running + 000 pre-grace, grace 000, mid-grace auto-stop -> loud SKIP
+#    whose cause enumeration is the 000/504-specific one: it must name the
+#    hang class (which the terminal FATAL assigns to 000/504) and must NOT
+#    name a back-lambda invoke failure (that yields a FAST 503, never 000) —
+#    round-10 message-accuracy fix; scenario D pins only the 503 variant
+run_case M_midgrace_stop_skip_000_hangclass "000 000 000 000" "running running stopped" "" 0 "a booting OS/ENI still dropping SYNs"
 
 echo "---"
 if [ "$FAILS" -ne 0 ]; then
-  echo "gate-matrix: $FAILS scenario(s) FAILED"
+  echo "gate-matrix: $FAILS of $TOTAL scenario(s) FAILED"
   exit 1
 fi
-echo "gate-matrix: all 13 scenarios green"
+echo "gate-matrix: all $TOTAL scenarios green"

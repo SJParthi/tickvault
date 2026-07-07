@@ -75,13 +75,22 @@ data "archive_file" "questdb_console_proxy" {
   type        = "zip"
   source_dir  = "${path.module}/../lambda/questdb-console-proxy"
   output_path = "${path.module}/.build/questdb-console-proxy.zip"
-  # Ship handler.py ONLY. archive_file excludes are EXACT relative paths (no
-  # globs), so every non-handler file committed into this source_dir MUST be
-  # listed here explicitly — fixer round 8 (2026-07-07): the round-7 commit
-  # of repro-evidence.md (and round 8's gate-matrix-r7.sh) would otherwise
-  # ship inside the prod back-lambda zip, and any future edit to those
-  # docs/harness files would drift output_base64sha256 into a lambda
-  # redeploy from a non-code change.
+  # Ship handler.py ONLY. Fixer round 10 (2026-07-07) truth-correction: the
+  # round-8 claim here ("excludes are EXACT relative paths, no globs") was
+  # WRONG for the provider CI actually resolves — versions.tf pins only
+  # hashicorp/aws and no .terraform.lock.hcl is tracked, so `terraform init`
+  # pulls the LATEST hashicorp/archive provider, whose archive_file docs
+  # state excludes "Supports glob file matching patterns including
+  # doublestar/globstar (**) patterns". The entries below are LITERAL
+  # filenames, kept deliberately (they still match as exact names under glob
+  # semantics; zero packaging diff) so the zip contents stay hand-reviewable
+  # — but the POLICY stands on that choice, not on a no-globs limitation:
+  # every non-handler file committed into this source_dir MUST be added here
+  # (or the list switched to globs like "*.md"/"*.sh"). Fixer round 8
+  # (2026-07-07): the round-7 commit of repro-evidence.md (and round 8's
+  # gate-matrix-r7.sh) would otherwise ship inside the prod back-lambda zip,
+  # and any future edit to those docs/harness files would drift
+  # output_base64sha256 into a lambda redeploy from a non-code change.
   excludes = ["test_handler.py", "README.md", "repro-evidence.md", "gate-matrix-r7.sh"]
 }
 

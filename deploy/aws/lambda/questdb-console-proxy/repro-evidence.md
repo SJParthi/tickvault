@@ -38,6 +38,29 @@
 > Load-bearing conclusions are unaffected: §9 (python urllib repro) and §10
 > (raw-socket probe) are reproducible as written and independently sustain
 > §11's conclusions 2/3/5.
+>
+> **Round-10 amendment (2026-07-07, correcting the round-9 sentence directly
+> above — no transcript byte changed, including the CRLF header line endings
+> the round-9 note protects):** the round-9 claim that §9/§10 are
+> "reproducible as written" was an overclaim of the same dangling-evidence
+> class the round-7/8 commits of this file and gate-matrix-r7.sh were fixing:
+> the two probe scripts those sections invoke (`repro_backlambda.py`,
+> `raw_socket_probe.py`) were session-ephemeral in the 2026-07-06 repro
+> sandbox and are NOT committed anywhere in this repo, and their source is
+> not shown in this artifact — verified `git ls-files
+> deploy/aws/lambda/questdb-console-proxy/` lists only `handler.py`,
+> `test_handler.py`, `repro-evidence.md`, `gate-matrix-r7.sh`.
+> A reader of HEAD therefore cannot RE-RUN §9/§10 as written; they are
+> RECONSTRUCTABLE, not reproducible-as-written: §10's probe is fully
+> specified by its own transcript (the exact request bytes are printed on
+> the `sent:` line — a ~15-line socket send + timed recv loop), and §9's
+> script is the byte-for-byte urllib relay of `handler.py` (a
+> `urllib.request.Request(..., method='GET')` with the r2
+> Accept/identity/close headers + `urlopen(timeout=N)` + capped `read()`
+> loop, per §11 conclusion 5). The §11 conclusions 2/3/5 remain sustained by
+> the frozen OUTPUT blocks themselves (§10's raw received bytes, §9a/§9b's
+> timed TimeoutError traces, §2–§3's curl transcripts), which is what
+> "load-bearing conclusions are unaffected" should have said.
 
 ## §0. Environment
 - Server: QuestDB 9.3.5 official jar from Maven Central
