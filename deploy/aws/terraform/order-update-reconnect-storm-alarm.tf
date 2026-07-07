@@ -44,9 +44,11 @@
 # SUSTAINED flap keeps accumulating and always pages (the 2026-07-06
 # all-session incident shape is unaffected — stated residual, not a tuning
 # defect). Counter reset on app restart is absorbed by the
-# agent's delta calculation (first post-restart sample dropped — at most one
-# increment lost, never a latched or negative artifact; restarts themselves
-# are owned by the liveness alarms).
+# agent's delta calculation (first post-restart sample dropped — up to one
+# scrape-interval of reconnect increments lost: every attempt between the
+# task restart and the first post-restart 60s scrape, ~8 worst-case under
+# the 0ms/0.5s/1s/2s/4s/8s/16s/32s backoff ladder; never a latched or
+# negative artifact; restarts themselves are owned by the liveness alarms).
 #
 # ROUTE DECISION (verified 2026-07-06): the counter
 # `tv_order_update_reconnections_total` (order_update_connection.rs:86,

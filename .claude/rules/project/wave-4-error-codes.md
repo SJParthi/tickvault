@@ -195,7 +195,7 @@ now fires a distinctly-typed `error!(code = "AUTH-GAP-04", …)` — pages via
 the `tv-<env>-errcode-auth-gap-04` log-filter alarm → SNS → Telegram since
 2026-07-06 (the `error!` alone never routed to Telegram
 post-CloudWatch-migration); the site separately fires the generic
-`AuthenticationFailed` NotificationEvent (not AUTH-GAP-04-typed) — pointing
+`AuthenticationFailed` NotificationEvent (not typed as AUTH-GAP-04) — pointing
 the operator at the exact SSM parameter to reconcile.
 
 **Triage:**
