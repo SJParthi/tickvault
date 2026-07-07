@@ -378,3 +378,34 @@ fn test_misc_event_messages() {
     });
     assert!(m.contains("SYM-RELIANCE-88"), "{m}");
 }
+
+#[test]
+fn test_feed_down_and_recovered_message_coverage() {
+    // 2026-07-06 Groww feed-down alerting: exercise to_message + severity +
+    // dispatch_policy for both new variants (in-market + off-hours forms).
+    let m = render(&NotificationEvent::FeedDown {
+        feed: "Groww".to_string(),
+        reason: "RSN-FEEDDOWN-901".to_string(),
+        market_open: true,
+    });
+    assert!(
+        m.contains("RSN-FEEDDOWN-901") && m.contains("will not flow"),
+        "{m}"
+    );
+
+    let m = render(&NotificationEvent::FeedDown {
+        feed: "Groww".to_string(),
+        reason: "RSN-FEEDDOWN-902".to_string(),
+        market_open: false,
+    });
+    assert!(
+        m.contains("RSN-FEEDDOWN-902") && m.contains("idle is normal"),
+        "{m}"
+    );
+
+    let m = render(&NotificationEvent::FeedRecovered {
+        feed: "Groww".to_string(),
+        down_secs: 4253,
+    });
+    assert!(m.contains("4253") && m.contains("streaming again"), "{m}");
+}
