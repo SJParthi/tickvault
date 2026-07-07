@@ -405,6 +405,12 @@ jobs:
         # additionally gets ONE 90s grace re-probe before FATAL — QuestDB
         # start/restart windows; see the running arm below — but a pass
         # there still requires a genuine 200 + shell HTML, never a skip.)
+        # Fixer round 6 (2026-07-06, TOCTOU): "verifiably not running" means
+        # not running at BOTH a pre-probe AND a post-probe EC2 state sample —
+        # a running->stopped transition across the probe window fails CLOSED
+        # (the failed probes were made against a running box); and the 90s
+        # grace arm re-samples state AFTER its sleep so a mid-grace auto-stop
+        # re-enters the loud skip instead of a stale 'box IS running' FATAL.
         # NOTE (fixer
         # round 1, 2026-07-06): a STOPPED box manifests as CODE=000 here,
         # never a fast 503 — the stopped instance keeps its ENI/private IP
@@ -449,6 +455,30 @@ jobs:
           HDR="$(umask 077 && mktemp)"
           printf 'Authorization: Bearer %s\n' "$TOK" > "$HDR"
           trap 'rm -f "$HDR"' EXIT
+          # Fixer round 6 (2026-07-06, TOCTOU): sample the box state BEFORE
+          # the probes as well as after. The 16:30 IST auto-stop cron
+          # (daily-universe lock §7, stop cron 11:00 UTC) can flip the box
+          # running->stopping DURING the ~21s probe window or the 90s grace
+          # sleep. A single post-probe sample allowed two stale-state bugs:
+          # (a) a genuine running-box regression probed at ~16:29 IST was
+          # converted into the auto-stop SKIP when the stop landed before
+          # the sample (false-OK, audit Rule 11), and (b) the grace-arm
+          # FATAL asserted 'the box IS running' from a PRE-sleep sample
+          # after a mid-grace stop (false-FATAL, misdirected triage). The
+          # skip arm now requires the box to be not-running at BOTH samples
+          # (a running->stopped transition across the probe window fails
+          # CLOSED with an honest ambiguity message), and the grace arm
+          # re-samples after its sleep.
+          IID=$(terraform -chdir=${{ env.TF_DIR }} output -raw instance_id 2>/dev/null || echo "")
+          box_state() {
+            if [ -n "$IID" ]; then
+              aws ec2 describe-instances --instance-ids "$IID" --region ${{ env.AWS_REGION }} \
+                --query 'Reservations[0].Instances[0].State.Name' --output text 2>/dev/null || echo unknown
+            else
+              echo unknown
+            fi
+          }
+          STATE_PRE=$(box_state)
           CODE=000
           for i in 1 2 3; do
             CODE=$(curl -sS -o /tmp/qdb-shell.body -w '%{http_code}' --max-time 5 \
@@ -465,12 +495,7 @@ jobs:
             echo "✅ QuestDB console shell smoke passed (GET / = 200 ≤5s)" >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
-          IID=$(terraform -chdir=${{ env.TF_DIR }} output -raw instance_id 2>/dev/null || echo "")
-          STATE=unknown
-          if [ -n "$IID" ]; then
-            STATE=$(aws ec2 describe-instances --instance-ids "$IID" --region ${{ env.AWS_REGION }} \
-              --query 'Reservations[0].Instances[0].State.Name' --output text 2>/dev/null || echo unknown)
-          fi
+          STATE=$(box_state)
           # Stopped-box reachability truth (fixer round 1, 2026-07-06): the
           # loud auto-stop-window skip must cover 000 and 504 as well as 503.
           # A stopped box CANNOT produce a fast 503 through this stack — its
@@ -487,7 +512,25 @@ jobs:
             000|503|504)
               case "$STATE" in
                 stopped|stopping|pending)
-                  echo "⚠ SKIP (loud): console GET / -> '${CODE}' with the box ${STATE} (auto-stop window, 08:30–16:30 IST schedule) — a not-running box cannot serve the shell (stopped box = 5s curl timeout = 000, never a fast 503); shell smoke re-runs on the next in-window apply" | tee -a "$GITHUB_STEP_SUMMARY"
+                  # Fixer round 6 (2026-07-06): the skip may only forgive
+                  # probes that were made against a not-running box. If the
+                  # PRE-probe sample said running, the failed probes were
+                  # made while the box WAS running and the not-running state
+                  # here is the 16:30 IST auto-stop landing AFTER them — a
+                  # possible genuine regression must not be converted into
+                  # this skip (audit Rule 11: no false-OK). The box is no
+                  # longer probeable, so fail closed and let the next
+                  # in-window apply decide. STATE_PRE=unknown (a transient
+                  # describe-instances failure) still skips — loudly, with
+                  # both samples printed — because red-failing every
+                  # off-window apply on an EC2-API hiccup is a worse trade
+                  # than the compound coincidence (API hiccup + regression +
+                  # the 1-2min stop window) this leaves open.
+                  if [ "$STATE_PRE" = "running" ]; then
+                    echo "FATAL: console GET / -> '${CODE}' and the box transitioned running->${STATE} ACROSS the probe window (pre-probe sample: running) — the failed probes were made while the box WAS running, so this may be a genuine shell regression caught just before the 16:30 IST auto-stop. Failing closed (audit Rule 11: no false-OK); the box is no longer probeable — verify on the next in-window apply."
+                    exit 1
+                  fi
+                  echo "⚠ SKIP (loud): console GET / -> '${CODE}' with the box ${STATE} (pre-probe sample: ${STATE_PRE}, post-probe sample: ${STATE}; auto-stop window, 08:30–16:30 IST schedule) — a not-running box cannot serve the shell (stopped box = 5s curl timeout = 000, never a fast 503); shell smoke re-runs on the next in-window apply" | tee -a "$GITHUB_STEP_SUMMARY"
                   exit 0 ;;
                 running)
                   # Fixer round 5 (2026-07-06): running + fast 503 (connection
@@ -526,8 +569,28 @@ jobs:
                       echo "✅ QuestDB console shell smoke passed (GET / = 200 on the 90s grace re-probe — QuestDB was starting/restarting)" >> "$GITHUB_STEP_SUMMARY"
                       exit 0
                     fi
+                    # Fixer round 6 (2026-07-06): the 90s sleep can span the
+                    # 16:30 IST auto-stop — the 10:50 UTC scheduled retry
+                    # slot starts at 16:20 IST and init+plan+apply+publish
+                    # can put this arm at ~16:27-16:29 IST. A box that
+                    # auto-stops mid-grace re-probes as 000 (its stopped ENI
+                    # drops packets), and the old code fell through to the
+                    # FATAL below asserting 'the box IS running' from the
+                    # PRE-sleep sample — a false-FATAL with misdirected
+                    # triage. Re-sample AFTER the sleep: a mid-grace stop
+                    # re-enters the loud not-running skip, which is honest —
+                    # the pre-grace fast 503 already proved only
+                    # QuestDB-not-listening on a then-running box (exactly
+                    # this arm's forgiven transient class), and a not-running
+                    # box cannot be probed further.
+                    STATE=$(box_state)
+                    case "$STATE" in
+                      stopped|stopping)
+                        echo "⚠ SKIP (loud): grace re-probe -> '${CODE}' but the box auto-stopped MID-GRACE (post-sleep state: ${STATE}) — the pre-grace fast 503 was QuestDB-not-listening on a then-running box (the forgiven transient class), and a not-running box cannot serve the shell; shell smoke re-runs on the next in-window apply" | tee -a "$GITHUB_STEP_SUMMARY"
+                        exit 0 ;;
+                    esac
                   fi
-                  echo "FATAL: console GET / -> '${CODE}' while the box IS running (000/504 = the shell-hang class; 503 past the 90s grace re-probe = SG/bind/back-lambda regression OR QuestDB down/restarting >90s — check the QuestDB container via docker compose on the box)"; exit 1 ;;
+                  echo "FATAL: console GET / -> '${CODE}' with box state '${STATE}' at the final sample (000/504 = the shell-hang class; 503 past the 90s grace re-probe = SG/bind/back-lambda regression OR QuestDB down/restarting >90s — check the QuestDB container via docker compose on the box)"; exit 1 ;;
                 *)
                   echo "FATAL: console GET / -> '${CODE}' and box state could not be verified (state='${STATE}') — failing closed"; exit 1 ;;
               esac ;;

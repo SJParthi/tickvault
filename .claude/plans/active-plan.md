@@ -21,7 +21,7 @@
 - [x] FILE 4 — FRONT test suite: 1 new test (test_relay_forwards_location_on_3xx — FAILS on r2 because the front `_relay` header tuple drops `location`). No existing test modified; the 504 `upstream_timeout` mapping test stays as-is
   - Files: deploy/aws/lambda/questdb-console-front/test_handler.py
   - Tests: N/A-for-crates-grep (test_relay_forwards_location_on_3xx)
-- [x] FILE 5 — HARD deploy gate in terraform-apply.yml: new step "Deploy gate: console shell GET / must return 200 within 5s" inserted BEFORE "Publish QuestDB console URL to Telegram" (gate first, announce after). 3 attempts each hard-capped at 5s; body must contain the console shell HTML; 000/504/503 forgiven ONLY for a verifiably not-running box (terraform `instance_id` output → ec2 describe-instances; fixer round 1 2026-07-06: a STOPPED box manifests as CODE=000 through this gate — its ENI drops packets with no RST, so the back lambda's connect blocks the full 12s `_TIMEOUT_SECS` → upstream_timeout → front 504 at ~12s while the gate curl caps at 5s; a fast 503 needs a REFUSAL = box running with QuestDB down); unknown state FAILS CLOSED; a transient `terraform output questdb_console_url` failure also FAILS CLOSED (only the null/not-found console-disabled shape skips); fixer round 5 2026-07-06: running+503 gets ONE 90s grace re-probe before FATAL (a fast 503 on a RUNNING box is also the transient signature of QuestDB not yet listening — the 08:30 IST box auto-start window and the 15:46 IST `docker compose up -d` container-recreate window — and a grace pass still requires a genuine 200 + shell HTML, never a skip; 000/504 = the shell-hang class stay immediately FATAL). Secret hygiene: SSM read + ::add-mask:: + header-FILE (umask 077 mktemp), token never in argv
+- [x] FILE 5 — HARD deploy gate in terraform-apply.yml: new step "Deploy gate: console shell GET / must return 200 within 5s" inserted BEFORE "Publish QuestDB console URL to Telegram" (gate first, announce after). 3 attempts each hard-capped at 5s; body must contain the console shell HTML; 000/504/503 forgiven ONLY for a verifiably not-running box (terraform `instance_id` output → ec2 describe-instances; fixer round 1 2026-07-06: a STOPPED box manifests as CODE=000 through this gate — its ENI drops packets with no RST, so the back lambda's connect blocks the full 12s `_TIMEOUT_SECS` → upstream_timeout → front 504 at ~12s while the gate curl caps at 5s; a fast 503 needs a REFUSAL = box running with QuestDB down); unknown state FAILS CLOSED; a transient `terraform output questdb_console_url` failure also FAILS CLOSED (only the null/not-found console-disabled shape skips); fixer round 5 2026-07-06: running+503 gets ONE 90s grace re-probe before FATAL (a fast 503 on a RUNNING box is also the transient signature of QuestDB not yet listening — the 08:30 IST box auto-start window and the 15:46 IST `docker compose up -d` container-recreate window — and a grace pass still requires a genuine 200 + shell HTML, never a skip; 000/504 = the shell-hang class stay immediately FATAL); fixer round 6 2026-07-06 (TOCTOU vs the 16:30 IST auto-stop cron): "verifiably not running" = not running at BOTH a pre-probe AND a post-probe EC2 state sample — a running→stopped transition across the probe window FAILS CLOSED (the failed probes were made against a running box; possible genuine regression must not become the auto-stop skip), a pre-sample `unknown` (transient describe-instances failure) still skips LOUDLY with both samples printed, and the 90s grace arm re-samples state AFTER its sleep so a mid-grace auto-stop re-enters the loud not-running skip instead of a stale "box IS running" false-FATAL (the terminal FATAL now prints the re-verified final-sample state). Secret hygiene: SSM read + ::add-mask:: + header-FILE (umask 077 mktemp), token never in argv
   - Files: .github/workflows/terraform-apply.yml
   - Tests: N/A-for-crates-grep (the workflow gate itself IS the test; YAML validated via python3 yaml.safe_load; pre-fix bytes physically cannot pass — GET / needs ~12s while the per-attempt cap is 5s)
 - [x] FILE 6 — box-local canary in deploy-aws.yml: two SSM command-array elements after the QUESTDB-UP loop, before the TRADING APP FIRST block — NON-FATAL loud WARN probing the rewrite TARGET `/index.html` (never bare `/`, which would hang the SSM shell) so a QuestDB image bump that breaks the shell is surfaced LOUDLY on the deploy that ships it — fixer round 1 (2026-07-06): the Fetch step now captures the SSM stdout to a file and greps for the canary WARN, emitting a job-level `::warning::` annotation + a `$GITHUB_STEP_SUMMARY` line (and a separate UNKNOWN warning when neither the WARN nor `QDB-SHELL-CANARY-OK` marker is present, e.g. SSM 24,000-char truncation). Non-fatal is mandated by deploy-aws.yml's own TRADING-APP-FIRST charter (a broken observability component must never block the trading deploy)
@@ -93,7 +93,15 @@ so the pre-fix behavior (504 after ~12s) can physically never pass.
   working correctly — a stopped box shows as 000 through the 5s-capped curl,
   never a fast 503, because its ENI drops packets and the back lambda's
   connect blocks the full 12s socket timeout); any of those codes with the
-  box RUNNING or an UNKNOWN state FAILS CLOSED (audit Rule 11: no false-OK).
+  box RUNNING or an UNKNOWN post-probe state FAILS CLOSED (audit Rule 11: no
+  false-OK). Fixer round 6 (2026-07-06, TOCTOU): the state is sampled BEFORE
+  the probes as well as after — a running→stopped/stopping transition across
+  the probe window (an apply landing at ~16:29 IST, auto-stop firing after
+  the failed probes but before the state read) FAILS CLOSED instead of
+  skipping, because those probes were made against a RUNNING box; and the
+  90s grace arm re-samples after its sleep, so a box that auto-stops
+  mid-grace re-enters the loud not-running skip instead of a false-FATAL
+  asserting "the box IS running" from the pre-sleep sample.
 - **Lambda cold start vs the 5s budget** — 3 attempts with 3s sleeps absorb
   front + VPC-back cold starts; EACH attempt stays capped at 5s so the
   per-request contract holds.
@@ -118,7 +126,10 @@ so the pre-fix behavior (504 after ~12s) can physically never pass.
   RST), so the console answers 504 `upstream_timeout` after the back lambda's
   12s connect timeout — the front's 503 `box_unreachable` needs a connection
   REFUSAL (box running, QuestDB down). The smoke gate independently verifies
-  the EC2 state before accepting ANY of 000/504/503 as the auto-stop window.
+  the EC2 state before accepting ANY of 000/504/503 as the auto-stop window —
+  at BOTH a pre-probe and a post-probe sample since fixer round 6
+  (2026-07-06), so an auto-stop landing mid-window cannot launder a
+  running-box failure into the skip.
 - **Unframed NON-3xx on a future path** — explicitly GUARDED inside the back
   lambda's HTTPError arm (fixer rounds 2+3, 2026-07-06). HONEST BOUND (fixer
   round 3 — the earlier "bounded 12s read → honest upstream_timeout → front
