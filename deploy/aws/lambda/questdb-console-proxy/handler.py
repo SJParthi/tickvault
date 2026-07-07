@@ -6,8 +6,12 @@ lambda:InvokeFunction with a JSON envelope:
 Relays the request to QuestDB on the box's PRIVATE IP inside the VPC
 (env QDB_BASE, e.g. "http://<vpc-private-ip>:9000" — injected by Terraform from
 aws_instance.tv_app.private_ip; NEVER hardcoded) and returns:
-    {"status", "headers": {content-type, content-encoding, cache-control}, "body_b64"}
-or {"err": "box_unreachable" | "too_large"}.
+    {"status", "headers": {content-type, content-encoding, cache-control,
+                           location}, "body_b64"}
+(`location` added with the B4 r3 no-follow-redirect belt: both relay arms —
+the success path and the HTTPError path — forward it so the front can relay a
+body-less 3xx) or {"err": "box_unreachable" | "too_large" | "bad_path" |
+"denied" | "denied_sql" | "upstream_timeout"}.
 
 WHY THIS LAMBDA EXISTS + WHY IT IS SECRET-FREE: a VPC Lambda in this VPC has
 NO internet/AWS-API path (single public subnet, no NAT, no VPC endpoints), so
