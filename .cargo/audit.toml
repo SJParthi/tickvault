@@ -6,6 +6,11 @@
 # reason + upstream-release condition for removal lives in deny.toml.
 #
 # When removing an ignore here, also remove it from deny.toml.
+# EXCEPTION — audit-only ignores: cargo-audit scans the RAW Cargo.lock,
+# cargo-deny scans the RESOLVED feature graph. An advisory on a phantom
+# lockfile entry (optional dep of a disabled feature) is flagged ONLY by
+# cargo-audit; listing it in deny.toml triggers `advisory-not-detected`.
+# Such entries live here alone, marked AUDIT-ONLY (see RUSTSEC-2026-0185).
 #
 # 2026-04-22 cleanup: 4 entries removed after PR #323 landed the
 # aws-lc-sys / aws-lc-rs / rustls-webpki / rand bumps on main:
@@ -35,8 +40,20 @@ ignore = [
     # on operator approval (`cargo update` is BANNED per CLAUDE.md); a
     # follow-up maintenance sweep carries the targeted bump. Full reason
     # mirrored in deny.toml.
-    # (2026-06-22 RUSTSEC-2026-0185 ignore removed the same day — cargo-deny
-    # now reports `advisory-not-detected` for it; stale housekeeping.)
     "RUSTSEC-2026-0204",
+    # 2026-07-07 — RUSTSEC-2026-0185 (quinn-proto 0.11.14, remote memory
+    # exhaustion via unbounded out-of-order stream reassembly; high 7.5).
+    # AUDIT-ONLY IGNORE, deliberately ABSENT from deny.toml: quinn-proto is
+    # a PHANTOM lockfile entry — pulled only by reqwest's `http3` feature,
+    # which tickvault does NOT enable. `cargo tree -i quinn-proto` prints
+    # nothing (not in the resolved graph), so cargo-deny never sees it and
+    # emits `advisory-not-detected` if this ID is listed there. cargo-audit,
+    # however, scans the RAW Cargo.lock and flags it regardless of feature
+    # resolution — hence this entry lives ONLY here. Do NOT "clean up" this
+    # ignore based on cargo-deny output (that removal is exactly what broke
+    # the 2026-07-07 Security & Audit run). Remove only when the lockfile
+    # pins quinn-proto >= 0.11.15 (targeted bump, needs operator approval —
+    # `cargo update` is BANNED per CLAUDE.md) or reqwest drops the entry.
+    "RUSTSEC-2026-0185",
 ]
 

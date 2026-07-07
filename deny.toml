@@ -44,9 +44,11 @@ unmaintained = "workspace"
 #
 # 2026-07-07: the 2026-06-22 RUSTSEC-2026-0185 ignore (quinn-proto 0.11.14,
 # phantom lockfile-only entry via reqwest's disabled `http3` feature) was
-# REMOVED — cargo-deny now emits `warning[advisory-not-detected]: no crate
-# matched advisory criteria` for it (verified in the 2026-07-07 Security &
-# Audit CI log), so the ignore is stale housekeeping.
+# REMOVED FROM THIS FILE ONLY — cargo-deny resolves the feature graph, never
+# sees quinn-proto, and emits `warning[advisory-not-detected]` if listed here.
+# cargo-audit scans the RAW Cargo.lock and DOES flag it, so the ignore LIVES
+# ON in .cargo/audit.toml (AUDIT-ONLY entry — do not remove it there based on
+# cargo-deny output; that removal broke the 2026-07-07 Security & Audit run).
 #
 # 2026-07-07: RUSTSEC-2026-0204 — crossbeam-epoch 0.9.18 `fmt::Pointer`
 # invalid pointer dereference for `Atomic`/`Shared` when the underlying
