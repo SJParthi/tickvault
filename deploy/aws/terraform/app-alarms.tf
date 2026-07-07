@@ -148,7 +148,7 @@ resource "aws_cloudwatch_metric_alarm" "order_update_ws_inactive" {
 # ---------------------------------------------------------------------------
 resource "aws_cloudwatch_metric_alarm" "groww_ws_inactive" {
   alarm_name          = "tv-${var.environment}-groww-ws-inactive"
-  alarm_description   = "Groww feed lost its connection after being up this session. Groww prices are not flowing. If the feed was deliberately switched off, re-enable it from the feeds page; otherwise recovery is automatic — investigate if this stays firing. (A sidecar that never connected at boot is paged by the Groww reject alerts, not this alarm.)"
+  alarm_description   = "Groww feed lost its connection after being up this session. Groww prices are not flowing. If the feed was deliberately switched off, re-enable it from the feeds page; otherwise recovery is automatic — investigate if this stays firing. (A sidecar that never connected at boot is paged by the Groww reject alerts, not this alarm. A whole-process abort — e.g. a release-build panic — makes this metric go MISSING rather than 0, which stays silent here; that class is paged by the restart/boot Telegram chain.)"
   comparison_operator = "LessThanThreshold"
   evaluation_periods  = 2
   metric_name         = "tv_groww_ws_active"

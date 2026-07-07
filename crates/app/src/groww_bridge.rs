@@ -2137,6 +2137,13 @@ async fn supervise_groww_bridge_loop(
                 conn_id,
             ));
             let reason = match handle.await {
+                // PANIC HONESTY (house standard: tick-flush-worker-error-codes.md
+                // §1): this arm engages in UNWIND (dev/test) builds only — the
+                // workspace release profile sets `panic = "abort"`, so in the
+                // production binary a panic inside run_groww_bridge ABORTS the
+                // whole process before a JoinError can exist. Release-build
+                // recovery for that class is the EXTERNAL process restart +
+                // the boot Telegram chain, never this supervisor.
                 Err(err) if err.is_panic() => "panic",
                 // A non-panic JoinError = the inner task was CANCELLED — the
                 // runtime is shutting down (finding M2). Do NOT respawn onto a
@@ -2187,6 +2194,19 @@ async fn supervise_groww_bridge_loop(
                 // never blocks the respawn). Cold path — event-driven, never
                 // per tick. The connected-level gauge drops to 0 so the
                 // CloudWatch inactivity alarm sees the outage too.
+                //
+                // PANIC HONESTY (tick-flush-worker-error-codes.md §1 house
+                // standard): this whole bridge-death falling-edge block
+                // (audit row + gauge→0 + FeedDown page) is reachable for
+                // non-panic exits / UNWIND (dev/test) builds ONLY. In the
+                // release (panic = "abort") binary a bridge panic — e.g. an
+                // overflow-checks trip — aborts the PROCESS: no FeedDown
+                // page fires, and the gauge goes MISSING (the exporter is
+                // gone; notBreaching keeps the groww-ws-inactive alarm
+                // SILENT), not 0. Visibility + recovery for that class are
+                // the external process restart + the boot/StartupComplete
+                // Telegram chain. No in-process panic self-healing is
+                // claimed for release builds.
                 metrics::gauge!("tv_groww_ws_active").set(0.0);
                 if audit_latches.try_announce_feed_down(ist_epoch_secs_now())
                     && let Some(notifier) = notifier_slot.as_ref().and_then(|slot| slot.load_full())
@@ -2198,8 +2218,13 @@ async fn supervise_groww_bridge_loop(
                         // SNS on a Saturday manual run / NSE weekday holiday
                         // (the 2026-05-09 false-page class).
                         market_open: tickvault_common::market_hours::is_trading_session_now(),
-                        // A bridge death IS auto-recovering (the supervisor
-                        // respawns it) — the auto-retry trailer is honest here.
+                        // A bridge death that REACHES this arm is
+                        // auto-recovering (the supervisor respawns it), so
+                        // the auto-retry trailer is honest for every exit
+                        // that can fire this page. A release-build panic
+                        // never reaches here (panic = "abort" — process
+                        // abort; see the PANIC HONESTY note above): recovery
+                        // there is the external process restart.
                         operator_initiated: false,
                     });
                 }
