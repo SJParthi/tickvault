@@ -21,7 +21,7 @@
               "source_labels": ["host"],
               "label_matcher": "^tickvault-prod$",
               "dimensions": [["host"]],
-              "metric_selectors": ["^(tv_websocket_pool_all_dead|tv_websocket_failed_connections_count|tv_order_update_ws_active|tv_questdb_disconnected_seconds|tv_tick_gap_instruments_silent|tv_token_remaining_seconds|tv_spill_dropped_total|tv_dlq_ticks_total|tv_ticks_dropped_total|tv_aggregator_seals_emitted_total|tv_aggregator_close_pct_nonzero_total|tv_orders_rejected_total|tv_realtime_guarantee_score|tv_boot_completed|tv_clock_skew_seconds|tv_ws_frame_dropped_no_wal_total|tv_ws_reconnect_gap_seconds_total|tv_disk_watcher_respawn_total|tv_late_tick_after_boundary_total|tv_process_rss_bytes|tv_subsystem_memory_estimated_bytes)$"]
+              "metric_selectors": ["^(tv_websocket_pool_all_dead|tv_websocket_failed_connections_count|tv_order_update_ws_active|tv_questdb_disconnected_seconds|tv_tick_gap_instruments_silent|tv_token_remaining_seconds|tv_spill_dropped_total|tv_dlq_ticks_total|tv_ticks_dropped_total|tv_aggregator_seals_emitted_total|tv_aggregator_close_pct_nonzero_total|tv_orders_rejected_total|tv_realtime_guarantee_score|tv_boot_completed|tv_clock_skew_seconds|tv_ws_frame_dropped_no_wal_total|tv_ws_reconnect_gap_seconds_total|tv_disk_watcher_respawn_total|tv_late_tick_after_boundary_total|tv_process_rss_bytes|tv_subsystem_memory_estimated_bytes|tv_groww_ws_active|tv_feed_last_tick_age_seconds|tv_feed_sidecar_stall_restart_total)$"]
             }
           ]
         }

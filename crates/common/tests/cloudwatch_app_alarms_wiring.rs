@@ -70,16 +70,56 @@ fn collect_rs_sources(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
+/// Strip `//`-line-comments from a source body BEFORE needle matching.
+///
+/// 2026-07-06 anti-vacuity fix (mutation-proven hole): the whitespace
+/// compaction below made COMMENT text needle-matchable too — a doc comment
+/// in THIS very file mentioning a metric's emit macro self-satisfied the
+/// guard, so renaming the only real emit site left the guard green (the
+/// exact false-OK class, audit-findings Rule 11). Comments can never be an
+/// emit site, so they are removed before matching. `://` (URL scheme
+/// separators inside string literals) is treated as code, not a comment
+/// start — the `http_client_fallback_guard.rs` precedent.
+fn strip_line_comments(body: &str) -> String {
+    let mut out = String::with_capacity(body.len());
+    for line in body.lines() {
+        let bytes = line.as_bytes();
+        let mut cut = line.len();
+        let mut i = 0;
+        while i + 1 < bytes.len() {
+            if bytes[i] == b'/' && bytes[i + 1] == b'/' && (i == 0 || bytes[i - 1] != b':') {
+                cut = i;
+                break;
+            }
+            i += 1;
+        }
+        out.push_str(&line[..cut]);
+        out.push('\n');
+    }
+    out
+}
+
 /// True iff the literal metric name appears inside any
 /// `counter!`/`gauge!`/`histogram!` call in the workspace.
+///
+/// 2026-07-06 fix: each source body has its `//`-line-comments stripped
+/// (see [`strip_line_comments`]) and is then whitespace-STRIPPED before
+/// matching, so a rustfmt-wrapped multi-line `metrics::counter!` invocation
+/// naming e.g. `tv_feed_sidecar_stall_restart_total` normalizes to one
+/// contiguous needle and is guard-visible, while a mere COMMENT mention of
+/// the same macro-plus-name can never satisfy the guard (pinned by
+/// `test_emit_site_guard_ignores_comment_only_mentions`). Before the
+/// compaction fix the contiguous needles matched ONLY single-line emits —
+/// a multi-line emit made a real metric look missing (false-negative on
+/// the emit site, false-positive "missing" panic here).
 fn is_metric_emitted(name: &str) -> bool {
+    // No needle contains whitespace, so matching against the compacted
+    // body is exact. `counter!("name")` is covered by the `counter!("name`
+    // prefix, so three needles suffice.
     let needles = [
         format!("counter!(\"{name}\""),
         format!("gauge!(\"{name}\""),
         format!("histogram!(\"{name}\""),
-        format!("counter!(\"{name}\")"),
-        format!("gauge!(\"{name}\")"),
-        format!("histogram!(\"{name}\")"),
     ];
     let mut sources = Vec::new();
     collect_rs_sources(&workspace_root().join("crates"), &mut sources);
@@ -87,13 +127,52 @@ fn is_metric_emitted(name: &str) -> bool {
         let Ok(body) = fs::read_to_string(&path) else {
             continue;
         };
+        let code_only = strip_line_comments(&body);
+        let compact: String = code_only.chars().filter(|c| !c.is_whitespace()).collect();
         for needle in &needles {
-            if body.contains(needle) {
+            if compact.contains(needle) {
                 return true;
             }
         }
     }
     false
+}
+
+#[test]
+fn test_emit_site_guard_ignores_comment_only_mentions() {
+    // Anti-vacuity self-test (2026-07-06 mutation finding): a metric name
+    // that appears ONLY inside a comment must NOT count as an emit site.
+    // The sentinel below exists in the workspace exclusively inside the
+    // next comment line: counter!("tv_guard_vacuity_sentinel_comment_only_total"
+    assert!(
+        !is_metric_emitted("tv_guard_vacuity_sentinel_comment_only_total"),
+        "is_metric_emitted matched a name that appears ONLY in a comment — \
+         the emit-site guard is vacuous again (comment stripping regressed)."
+    );
+    // Positive control: the real FEED-STALL-01 multi-line emit in
+    // crates/app/src/groww_sidecar_supervisor.rs must still be found —
+    // proves comment stripping did not break REAL emit detection.
+    assert!(
+        is_metric_emitted("tv_feed_sidecar_stall_restart_total"),
+        "comment stripping broke detection of a REAL multi-line emit site \
+         (groww_sidecar_supervisor.rs FEED-STALL-01 counter)."
+    );
+}
+
+#[test]
+fn test_strip_line_comments_keeps_code_and_urls_drops_comments() {
+    let src = "let a = 1; // trailing comment counter!(\"tv_fake_total\"\n\
+               /// doc comment counter!(\"tv_fake_total\"\n\
+               let url = \"https://example.com\";\n";
+    let stripped = strip_line_comments(src);
+    assert!(
+        !stripped.contains("tv_fake_total"),
+        "comment text survived stripping: {stripped}"
+    );
+    assert!(
+        stripped.contains("let a = 1;") && stripped.contains("https://example.com"),
+        "code or URL text was wrongly removed: {stripped}"
+    );
 }
 
 #[test]
@@ -207,12 +286,20 @@ fn test_emf_metric_selectors_name_count_is_twenty_one() {
     // tv_subsystem_memory_estimated_bytes — crates/app/src/metrics_catalog.rs
     // SUBSYSTEM_MEMORY_GAUGE_NAME). Cost note: each custom metric is ~$0.30/mo.
     // If you intentionally add/remove a name, update BOTH configs + this pin.
+    //
+    // 24 (was 21) since 2026-07-06 (Groww feed-down alerting, operator
+    // directive): added `tv_groww_ws_active` (connected-level 0/1 gauge),
+    // `tv_feed_last_tick_age_seconds{feed}` (feed liveness age gauge — both
+    // emitted from crates/app/src/groww_bridge.rs), and
+    // `tv_feed_sidecar_stall_restart_total` (FEED-STALL-01 stall-kill
+    // counter — crates/app/src/groww_sidecar_supervisor.rs). Cost: +3
+    // custom metrics ≈ +$0.90/mo per the app-alarms.tf header cost note.
     let user_data = read("deploy/aws/terraform/user-data.sh.tftpl");
     let names = emf_declared_names(&user_data, "metric_selectors");
     assert_eq!(
         names.len(),
-        21,
-        "Z+ L2 VERIFY ratchet: expected exactly 21 names in the EMF metric_selectors \
+        24,
+        "Z+ L2 VERIFY ratchet: expected exactly 24 names in the EMF metric_selectors \
          list; found {}: {names:?}",
         names.len()
     );
@@ -361,10 +448,18 @@ fn test_app_alarms_count_is_thirteen() {
     // tick at/after 15:30 IST, without threading a notifier into the per-tick
     // hot path. Cost: +1 custom metric (~$0.30/mo) + 1 alarm (~$0.10/mo),
     // negligible within the ~₹2,058/mo envelope.
+    // 19 (was 17) since 2026-07-06 (Groww feed-down alerting, operator
+    // directive): added `tv_groww_ws_active` (alarm
+    // tv-<env>-groww-ws-inactive — Groww WS lost after being up this
+    // session) + `tv_feed_sidecar_stall_restart_total` (alarm
+    // tv-<env>-groww-stall-restart-storm — 3+ FEED-STALL-01 silent-feed
+    // kills within an hour = provider-side reject). Cost: +2 alarms
+    // (~$0.20/mo) + 3 custom metrics (~$0.90/mo incl. the un-alarmed
+    // tv_feed_last_tick_age_seconds), per the app-alarms.tf header note.
     let count = alarm_metric_names().len();
     assert_eq!(
-        count, 17,
-        "Z+ L2 VERIFY ratchet: expected exactly 17 app-level CloudWatch alarms \
+        count, 19,
+        "Z+ L2 VERIFY ratchet: expected exactly 19 app-level CloudWatch alarms \
          (one per critical app signal). Found {count}. If you intentionally added \
          or removed one, update aws-budget.md custom-metric cost line AND this guard."
     );
