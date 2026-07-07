@@ -186,7 +186,12 @@ def _ist_12h(state_change_time: str) -> str:
         parsed = datetime.now(timezone.utc)
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=timezone.utc)
-    ist = parsed.astimezone(_IST)
+    try:
+        ist = parsed.astimezone(_IST)
+    except (OverflowError, OSError, ValueError):
+        # Edge-dated inputs (year 0001 / 9999) parse fine but overflow on
+        # the tz conversion — degrade to invocation time, never crash.
+        ist = datetime.now(timezone.utc).astimezone(_IST)
     hour = ist.hour % 12 or 12
     ampm = "AM" if ist.hour < 12 else "PM"
     return f"{hour}:{ist.minute:02d} {ampm}"
@@ -319,35 +324,45 @@ def _fold_records(
     lone_ok_ist: str | None = None
 
     for name in name_order:
-        alarm = last_by_name[name]
-        final_state = str(alarm.get("NewStateValue") or "ALARM").upper()
+        # Per-record fail-open (never-drop law): one poisoned alarm must
+        # never crash the render loop and take genuine 🆘 pages with it.
+        try:
+            alarm = last_by_name[name]
+            final_state = str(alarm.get("NewStateValue") or "ALARM").upper()
 
-        if final_state == "OK" and saw_alarm.get(name, False):
-            # ALARM→OK inside one batch: ONLY the recovered line.
+            if final_state == "OK" and saw_alarm.get(name, False):
+                # ALARM→OK inside one batch: ONLY the recovered line.
+                out.append(_house_line(alarm))
+                if cache is not None:
+                    cache[name] = ("OK", now)
+                continue
+
+            if final_state == "OK":
+                # Lone OK flip — warm-cache dedupe, then fold into ONE line.
+                if cache is not None and _should_suppress_ok(name, now, cache):
+                    print(f"ok-repeat-suppressed name={name}")
+                    continue
+                lone_ok_phrases.append(_alarm_phrase(name))
+                lone_ok_ist = _ist_12h(str(alarm.get("StateChangeTime") or ""))
+                if cache is not None:
+                    cache[name] = ("OK", now)
+                continue
+
+            # ALARM / INSUFFICIENT_DATA final state — individual house line,
+            # NEVER suppressed, NEVER folded away by an earlier OK.
             out.append(_house_line(alarm))
             if cache is not None:
-                cache[name] = ("OK", now)
-            continue
-
-        if final_state == "OK":
-            # Lone OK flip — warm-cache dedupe, then fold into ONE line.
-            if cache is not None and _should_suppress_ok(name, now, cache):
-                print(f"ok-repeat-suppressed name={name}")
-                continue
-            lone_ok_phrases.append(_alarm_phrase(name))
-            lone_ok_ist = _ist_12h(str(alarm.get("StateChangeTime") or ""))
-            if cache is not None:
-                cache[name] = ("OK", now)
-            continue
-
-        # ALARM / INSUFFICIENT_DATA final state — individual house line,
-        # NEVER suppressed, NEVER folded away by an earlier OK.
-        out.append(_house_line(alarm))
-        if cache is not None:
-            cache[name] = (final_state, now)
+                cache[name] = (final_state, now)
+        except Exception:  # noqa: BLE001 — fail-open per contract
+            logger.exception("Alarm render failed — sending safe generic line")
+            out.append(_GENERIC_SAFE_LINE)
 
     if lone_ok_phrases:
-        out.append(_recovered_line(lone_ok_phrases, lone_ok_ist or _ist_12h("")))
+        try:
+            out.append(_recovered_line(lone_ok_phrases, lone_ok_ist or _ist_12h("")))
+        except Exception:  # noqa: BLE001 — fail-open per contract
+            logger.exception("Recovered-line render failed — sending safe generic line")
+            out.append(_GENERIC_SAFE_LINE)
 
     out.extend(plain_texts)
     return out
@@ -393,7 +408,11 @@ def lambda_handler(event: dict[str, Any], _context: Any) -> dict[str, Any]:
         # default policy. Without retry the alert is lost forever.
         raise
 
-    texts = _fold_records(records, now_epoch=time.time(), cache=_LAST_SENT)
+    try:
+        texts = _fold_records(records, now_epoch=time.time(), cache=_LAST_SENT)
+    except Exception:  # noqa: BLE001 — never-drop law: rendering must not kill the batch
+        logger.exception("Batch fold crashed — degrading to one safe generic line per record")
+        texts = [_GENERIC_SAFE_LINE for _ in records]
 
     sent = 0
     failures: list[str] = []
