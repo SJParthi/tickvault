@@ -77,6 +77,29 @@ if [ -z "$IID" ] || [ -z "$REGION" ]; then
   exit 0
 fi
 
+# --- Intentional-stop marker (2026-07-07 round-3 review fix) ----------------
+# The stop below leaves NO trace, and three holiday-blind actors would
+# otherwise fight it all day: the start-watchdog 08:45 IST check self-starts
+# a not-running box, aws-autopilot start-instances a stopped box every 15 min
+# inside 08:30-16:30 IST, and the market-hours alarm-gate Lambda samples the
+# instance state ONCE at ~09:20 IST. The resulting boot/stop war keeps the
+# box up in 1-3 min bursts all holiday — and a burst that brackets the 09:20
+# sample re-arms the breaching-on-missing alarms against a box this gate is
+# about to stop (the exact holiday false page). Stamping today's IST date
+# into this SSM param BEFORE the stop lets every restarter + the gate Lambda
+# recognise the stop as intentional. Stale markers are harmless (consumers
+# compare against TODAY's IST date). FAIL-OPEN: a failed put is logged and
+# the stop still proceeds (status quo ante — the war resumes, nothing worse).
+TV_ENV="${TV_ENVIRONMENT:-prod}"
+MARKER_PARAM="/tickvault/${TV_ENV}/holiday-stop-date"
+TODAY_IST=$(TZ='Asia/Kolkata' date +%F)
+if aws ssm put-parameter --region "$REGION" --name "$MARKER_PARAM" \
+    --type String --value "$TODAY_IST" --overwrite >/dev/null 2>&1; then
+  log "holiday-stop marker written: $MARKER_PARAM = $TODAY_IST"
+else
+  log "holiday-stop marker put FAILED ($MARKER_PARAM) — restarters may fight today's stop"
+fi
+
 log "stopping instance $IID in $REGION (NSE holiday — saves ~8h of billing)"
 aws ec2 stop-instances --region "$REGION" --instance-ids "$IID" >/dev/null 2>&1 \
   || log "aws ec2 stop-instances call failed (will retry on next boot)"
