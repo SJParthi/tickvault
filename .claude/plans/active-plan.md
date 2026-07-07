@@ -164,25 +164,36 @@ Every change is independently revertible with no data-loss surface (logs land lo
 
 ## Plan Items
 
-- [ ] Item 1 — Shipper glob fix in BOTH configs (`.2*` machine/ pins, drop top-level globs, mkdir + comment fix)
+- [x] Item 1 — Shipper glob fix in BOTH configs (`.2*` machine/ pins, drop top-level globs, mkdir + comment fix)
   - Files: deploy/aws/cloudwatch-agent.json, deploy/aws/terraform/user-data.sh.tftpl
   - Tests: test_reference_agent_config_globs_match_observability_constants, test_userdata_inline_config_globs_match_reference, test_stream_names_are_stable
 
-- [ ] Item 2 — `app_log_ingestion_silent` alarm + gate Lambda ALARM_NAMES 4th member
+- [x] Item 2 — `app_log_ingestion_silent` alarm + gate Lambda ALARM_NAMES 4th member
   - Files: deploy/aws/terraform/log-retention.tf, deploy/aws/terraform/market-hours-liveness-alarm.tf
-  - Tests: cloudwatch_app_alarms_wiring.rs extension (alarm pin + breaching pin + gate-join membership pin)
+  - Tests: test_app_log_ingestion_silent_alarm_pinned_in_terraform, test_alarm_is_gated_by_market_hours_lambda
+  - Deviation note (2026-07-07, per task directive): the alarm pins live in the NEW
+    `crates/app/tests/cloudwatch_agent_glob_guard.rs` instead of extending
+    `crates/common/tests/cloudwatch_app_alarms_wiring.rs` — one file owns the whole ratchet suite.
 
-- [ ] Item 3 — Deploy LOG-INGESTION-SMOKE step (non-fatal, warn + SNS) + oidc `logs:FilterLogEvents` grant + on-box machine/ dir listing
+- [x] Item 3 — Deploy LOG-INGESTION-SMOKE step (non-fatal, warn + SNS) + oidc `logs:FilterLogEvents` grant + on-box machine/ dir listing
   - Files: .github/workflows/deploy-aws.yml, deploy/aws/terraform/oidc.tf
   - Tests: test_deploy_workflow_carries_log_ingestion_smoke
 
-- [ ] Item 4 — Token countdown: sliced-sleep 30s gauge emission in renewal_loop
+- [x] Item 4 — Token countdown: dedicated 30s gauge emitter fused with renewal_loop via tokio::select!
   - Files: crates/core/src/auth/token_manager.rs
-  - Tests: test_next_gauge_slice_caps_at_30s_and_passes_short_remainders, test_renewal_loop_uses_sliced_sleep_gauge_countdown, pause/advance no-early-renewal test
+  - Tests: test_emit_token_remaining_gauge_computes_remaining_seconds, test_emit_token_remaining_gauge_skips_when_no_token, test_emit_token_remaining_gauge_saturates_to_zero_for_expired_token, test_token_gauge_loop_ticks_forever_and_is_cancel_safe, test_token_gauge_countdown_is_spawned_with_renewal_loop
+  - Deviation note (2026-07-07, per task directive — overrides final-design.md §4 sliced-sleep):
+    dedicated periodic emitter (`token_gauge_loop`, 30s interval) spawned at the renewal_loop
+    spawn site; renewal_loop timing + its two existing emit sites are byte-untouched. Fused into
+    the SAME JoinHandle via `tokio::select!` so lane teardown / renewal abort kills the countdown
+    too (closes the judge's C4 fire-and-forget leak objection).
 
-- [ ] Item 5 — Glob-drift ratchet suite (NEW test file, constants-derived assertions)
-  - Files: crates/app/tests/cw_agent_log_glob_guard.rs, crates/common/tests/cloudwatch_app_alarms_wiring.rs
-  - Tests: test_no_collect_list_glob_points_at_top_level_logs_dir (+ all Item 1/3 tests live here)
+- [x] Item 5 — Glob-drift ratchet suite (NEW test file, constants-derived assertions)
+  - Files: crates/app/tests/cloudwatch_agent_glob_guard.rs
+  - Tests: test_no_collect_list_glob_points_at_top_level_logs_dir, test_stream_names_are_stable
+  - Deviation note (2026-07-07): file named `cloudwatch_agent_glob_guard.rs` (the design's
+    `cw_agent_log_glob_guard.rs` never existed on disk); all 7 ratchet tests live here, including
+    the Item 2 alarm pins — no `cloudwatch_app_alarms_wiring.rs` edit.
 
 - [ ] Item 6 — Evidence + docs: PR body with live verification artefacts; runbook/rule notes for the new alarm
   - Files: .claude/plans/active-plan.md (checkbox ticks), PR body (config diff, on-box ls, smoke OK line, describe-log-streams)
