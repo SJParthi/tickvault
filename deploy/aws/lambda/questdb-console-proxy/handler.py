@@ -293,12 +293,18 @@ def lambda_handler(event, _context):
     # /index.html, one /assets/ file, /exec, HEAD /; no claim is made about
     # unprobed paths) and (2) the _NoFollowRedirect opener + body-less 3xx
     # relay (covers any FUTURE unframed 3xx class-wide; an unframed NON-3xx
-    # on an unprobed path is a bounded 12s read GUARDED inside the HTTPError
-    # arm below -> honest upstream_timeout -> front 504. Fixer round 2
-    # 2026-07-06: before that explicit guard, the timeout raised inside the
-    # except handler ESCAPED lambda_handler as a Lambda FunctionError ->
-    # dishonest front offline-503 — proven by execution, see the guard's
-    # comment and test_unframed_non_3xx_body_timeout_maps_to_upstream_timeout).
+    # on an unprobed path is GUARDED inside the HTTPError arm below. Honest
+    # bound, fixer round 3 2026-07-06: _TIMEOUT_SECS=12 is PER socket recv,
+    # so TOTAL SILENCE -> guarded upstream_timeout -> front 504, while a
+    # DRIBBLING body (>=1 byte per <12s recv) resets the per-recv timer each
+    # time and is bounded by the back Lambda's 26s timeout instead
+    # (questdb-console.tf), surfacing as a Lambda FunctionError -> the
+    # front's generic 503 — a hard-timeout kill cannot be mapped in-process.
+    # Fixer round 2 2026-07-06: before the explicit guard, the timeout raised
+    # inside the except handler ESCAPED lambda_handler as a Lambda
+    # FunctionError -> dishonest front offline-503 — proven by execution, see
+    # the guard's comment and
+    # test_unframed_non_3xx_body_timeout_maps_to_upstream_timeout).
     # `Accept-Encoding: identity` still guarantees Content-Length-framed
     # uncompressed bodies on framed paths, under the MAX_BODY_BYTES cap.
     req.add_header("Accept-Encoding", "identity")
@@ -346,8 +352,29 @@ def lambda_handler(event, _context):
             # FunctionError, which the front's _invoke_back mapped through the
             # generic err arm to a dishonest offline-503 — the exact
             # misdiagnosis class this fix series eliminates. Guard the read
-            # explicitly: bounded 12s read -> honest upstream_timeout -> 504.
+            # explicitly: TOTAL SILENCE times a recv out -> honest
+            # upstream_timeout -> front 504. (Per-recv honesty, fixer round 3
+            # 2026-07-06: _TIMEOUT_SECS is per socket recv, so a DRIBBLING
+            # body never times a recv out — that case is bounded by the back
+            # Lambda's 26s timeout -> Lambda FunctionError -> the front's
+            # generic 503, unmappable in-process.)
             return {"err": "upstream_timeout"}
+        except Exception:  # noqa: BLE001 — peer RST / IncompleteRead mid error-body read
+            # Fixer round 3 (2026-07-06): the round-2 guard covered ONLY the
+            # timeout member of its stated escape class. Any OTHER exception
+            # raised by this same read (ConnectionResetError when QuestDB
+            # restarts mid error body — which happens on every box deploy;
+            # http.client.IncompleteRead; ConnectionAbortedError — none are
+            # TimeoutError subclasses) also raises INSIDE this except suite,
+            # so the enclosing try's blanket `except Exception ->
+            # box_unreachable` can NEVER catch it — it ESCAPED lambda_handler
+            # as a Lambda FunctionError -> front `back_function_error` ->
+            # 503 'box offline' via an unhandled crash instead of the
+            # handler's typed-err contract (proven by execution:
+            # `ESCAPED lambda_handler: ConnectionResetError: peer RST mid
+            # error body`). Mirror the success path's blanket arm: a reset/
+            # aborted peer is unreachable-class -> typed box_unreachable.
+            return {"err": "box_unreachable"}
         return {
             "status": int(exc.code),
             "headers": out_headers,

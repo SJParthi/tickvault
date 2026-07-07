@@ -9,15 +9,15 @@
 
 ## Plan Items
 
-- [x] FILE 1 — BACK lambda fix: L1 rewrite `GET /` → `GET /index.html` (after `_gate`, before URL build), L2 `_NoFollowRedirect` opener + body-less 3xx relay in the `HTTPError` arm, `location` added to the success-path header tuple, r2 comment block rewritten (the disproven "closes the socket AFTER the body" claim removed), build marker → `b4-qdb-console-2026-07-06-r3`
+- [x] FILE 1 — BACK lambda fix: L1 rewrite `GET /` → `GET /index.html` (after `_gate`, before URL build), L2 `_NoFollowRedirect` opener + body-less 3xx relay in the `HTTPError` arm, `location` added to the success-path header tuple, r2 comment block rewritten (the disproven "closes the socket AFTER the body" claim removed), build marker → `b4-qdb-console-2026-07-06-r3`. Fixer round 2 (2026-07-06): explicit timeout guard around the non-3xx error-body read. Fixer round 3 (2026-07-06): sibling `except Exception → box_unreachable` on the SAME read (the round-2 guard covered only the timeout member of its stated escape class — ConnectionResetError / IncompleteRead / ConnectionAbortedError still escaped as a Lambda FunctionError, executed proof), plus per-recv-honest comment wording (see the Failure Modes bullet)
   - Files: deploy/aws/lambda/questdb-console-proxy/handler.py
   - Tests: N/A-for-crates-grep (Python unittest in FILE 3; run via python3 -m unittest test_handler -v)
 - [x] FILE 2 — FRONT lambda: build marker parity → `b4-qdb-console-2026-07-06-r3`; `location` added to the `_relay` forwarded-header tuple so a defense-in-depth relayed 3xx reaches the browser. Device-key auth, `/exec` handling, SQL gates, error mapping (incl. the 504 `upstream_timeout` text) byte-untouched
   - Files: deploy/aws/lambda/questdb-console-front/handler.py
   - Tests: N/A-for-crates-grep (Python unittest in FILE 4)
-- [x] FILE 3 — BACK test suite: 8 new tests + 1 updated (test_root_get_is_rewritten_to_index_html; test_root_rewrite_preserves_whitelisted_query; test_head_root_not_rewritten; test_non_root_paths_not_rewritten; test_root_rewrite_kills_the_unframed_301_timeout_class; test_redirect_relayed_bodyless_never_reads_body; test_no_follow_redirect_opener_installed; test_disproven_r2_close_claim_removed; updated test_shell_get_forces_identity_and_connection_close)
+- [x] FILE 3 — BACK test suite: 10 new tests + 1 updated (test_root_get_is_rewritten_to_index_html; test_root_rewrite_preserves_whitelisted_query; test_head_root_not_rewritten; test_non_root_paths_not_rewritten; test_root_rewrite_kills_the_unframed_301_timeout_class; test_redirect_relayed_bodyless_never_reads_body; test_no_follow_redirect_opener_installed; test_disproven_r2_close_claim_removed; test_unframed_non_3xx_body_timeout_maps_to_upstream_timeout [fixer round 2]; test_non_timeout_error_body_read_failure_maps_to_box_unreachable [fixer round 3]; updated test_shell_get_forces_identity_and_connection_close)
   - Files: deploy/aws/lambda/questdb-console-proxy/test_handler.py
-  - Tests: N/A-for-crates-grep (the 9 Python tests named in this item's description; non-vacuity proven by running tests 1 + 6 against patched-out r2 bytes — they FAIL)
+  - Tests: N/A-for-crates-grep (the 11 Python tests named in this item's description; non-vacuity proven by running tests 1 + 6 against patched-out r2 bytes — they FAIL — and the two error-body-read guard tests against pre-guard bytes where the exceptions ESCAPE lambda_handler)
 - [x] FILE 4 — FRONT test suite: 1 new test (test_relay_forwards_location_on_3xx — FAILS on r2 because the front `_relay` header tuple drops `location`). No existing test modified; the 504 `upstream_timeout` mapping test stays as-is
   - Files: deploy/aws/lambda/questdb-console-front/test_handler.py
   - Tests: N/A-for-crates-grep (test_relay_forwards_location_on_3xx)
@@ -116,16 +116,31 @@ so the pre-fix behavior (504 after ~12s) can physically never pass.
   12s connect timeout — the front's 503 `box_unreachable` needs a connection
   REFUSAL (box running, QuestDB down). The smoke gate independently verifies
   the EC2 state before accepting ANY of 000/504/503 as the auto-stop window.
-- **Unframed NON-3xx on a future path** — bounded 12s read, explicitly
-  GUARDED inside the back lambda's HTTPError arm (fixer round 2, 2026-07-06)
-  → honest `upstream_timeout` → front 504, never a silent hang. Honesty
-  correction: before that guard, a socket timeout raised while reading the
-  error body INSIDE the `except HTTPError` handler was NOT caught by the
-  sibling timeout clause (an exception raised in an except suite escapes the
-  whole try statement) — it escaped `lambda_handler` as a Lambda
-  FunctionError, which the front mapped to a dishonest offline-503; proven
-  by execution and now pinned by
-  `test_unframed_non_3xx_body_timeout_maps_to_upstream_timeout`.
+- **Unframed NON-3xx on a future path** — explicitly GUARDED inside the back
+  lambda's HTTPError arm (fixer rounds 2+3, 2026-07-06). HONEST BOUND (fixer
+  round 3 — the earlier "bounded 12s read → honest upstream_timeout → front
+  504, never a silent hang" wording overstated it; it holds only for total
+  silence): `_TIMEOUT_SECS=12` is PER socket recv (`_read_capped` can issue
+  up to ~16 sequential recvs, each resetting the 12s timer — same honest
+  bound the questdb-console.tf `timeout = 26` comment states). TOTAL SILENCE
+  → guarded `upstream_timeout` → front 504; a DRIBBLING body (≥1 byte per
+  <12s recv) never times a recv out and is bounded by the back Lambda's 26s
+  timeout instead → Lambda FunctionError → the front's generic 503 (a
+  hard-timeout kill cannot be mapped in-process). Round-2 honesty
+  correction retained: a socket timeout raised while reading the error body
+  INSIDE the `except HTTPError` handler was NOT caught by the sibling
+  timeout clause (an exception raised in an except suite escapes the whole
+  try statement) — it escaped `lambda_handler` as a Lambda FunctionError,
+  which the front mapped to a dishonest offline-503; proven by execution and
+  pinned by `test_unframed_non_3xx_body_timeout_maps_to_upstream_timeout`.
+  Fixer round 3 closed the NON-timeout members of the same escape class:
+  ConnectionResetError (peer RST mid error body — the QuestDB container
+  restart on every box deploy), http.client.IncompleteRead, and
+  ConnectionAbortedError also escaped as a FunctionError (executed proof:
+  `ESCAPED lambda_handler: ConnectionResetError: peer RST mid error body`);
+  a sibling `except Exception → box_unreachable` now mirrors the success
+  path's blanket arm, pinned by
+  `test_non_timeout_error_body_read_failure_maps_to_box_unreachable`.
   Read-until-idle was explicitly rejected in the repro design notes (it
   would turn every load into a deliberate multi-second stall).
 - **Smoke gate cannot read the SSM secret / cannot resolve box state** — fails
@@ -140,8 +155,9 @@ so the pre-fix behavior (504 after ~12s) can physically never pass.
 ## Test Plan
 
 - `cd deploy/aws/lambda/questdb-console-proxy && python3 -m unittest test_handler -v`
-  — all pass incl. the 8 new tests; the `OK` line is pasted in the PR body
-  (charter §4 evidence discipline).
+  — all pass incl. the 10 new tests (8 from r3 + 1 fixer round 2 + 1 fixer
+  round 3); the `OK` line is pasted in the PR body (charter §4 evidence
+  discipline).
 - `cd deploy/aws/lambda/questdb-console-front && python3 -m unittest test_handler -v`
   — all pass incl. test_relay_forwards_location_on_3xx.
 - **Non-vacuity:** tests 1 (test_root_get_is_rewritten_to_index_html) and 6
@@ -191,7 +207,7 @@ Rust-only):
 | DHAT / Criterion / hot-path | N/A — cold-path observability lambda, zero Rust, zero hot-path code |
 | Audit table + DEDUP keys | N/A — no SEBI-relevant event, no DB write; forensic record = Actions log + step summary + the front's structured `_log` |
 | 100% logging | front `_log` structured JSON per request (unchanged, now shows ok/200 on "/") |
-| 100% alerting | the FILE 5 deploy gate IS the alert — a red workflow on any shell regression; FILE 6 WARNs on the box lane |
+| 100% alerting | the FILE 5 deploy gate IS the alert — a red workflow on any shell regression; FILE 6 WARNs on the box lane. HONEST ENVELOPE (fixer round 3, 2026-07-06): the gate step's own continued EXISTENCE is pinned by NO ratchet — no source-scan guard test covers terraform-apply.yml gate content (the repo's pattern for that is a Rust guard test à la `crates/storage/tests/groww_scale_aws_lockout_guard.rs`, which is outside this PR's no-Rust scope constraint), so a future PR deleting or `continue-on-error`-ing the gate step leaves every Python and Rust suite green. Flagged follow-up: add a workflow-content guard test pinning the gate step (name + no continue-on-error) in a Rust-allowed PR |
 | 100% security | secret hygiene: `::add-mask::` + header-FILE (umask 077 mktemp) + trap rm; device-key auth byte-untouched; SQL gates byte-untouched |
 | 100% scenarios | the behavior matrix in the PR body (GET /, HEAD /, assets, /exec, box stopped, box slow, future unframed 3xx/non-3xx) — each row evidence-cited |
 | 100% code review | adversarial pass on the diff before the PR opens |

@@ -416,6 +416,51 @@ class Relay(WithBase):
             r = handler.lambda_handler({"method": "GET", "path": "/settings"}, None)
             self.assertEqual(r, {"err": "upstream_timeout"})
 
+    def test_non_timeout_error_body_read_failure_maps_to_box_unreachable(self) -> None:
+        # Fixer round 3 (2026-07-06): the round-2 guard covered ONLY the
+        # timeout member of its stated escape class. A NON-timeout failure of
+        # the same non-3xx error-body read — ConnectionResetError (peer RST
+        # mid error body, e.g. the QuestDB container restart on every box
+        # deploy), http.client.IncompleteRead, ConnectionAbortedError (none
+        # are TimeoutError subclasses) — is raised INSIDE the
+        # `except HTTPError` suite, so the enclosing try's blanket
+        # `except Exception -> box_unreachable` can NEVER catch it. Pre-guard
+        # each ESCAPED lambda_handler as a Lambda FunctionError (executed
+        # proof on the pre-fix bytes: `ESCAPED lambda_handler:
+        # ConnectionResetError: peer RST mid error body`, same for
+        # IncompleteRead + ConnectionAbortedError) -> front
+        # `back_function_error` -> 503 'box offline' via an unhandled crash
+        # instead of the handler's typed-err contract. The round-3 sibling
+        # guard must map them to the typed box_unreachable (a reset/aborted
+        # peer IS unreachable-class), mirroring the success path's blanket arm.
+        import http.client
+
+        class _FailFp:
+            def __init__(self, exc):
+                self._exc = exc
+
+            def read(self, *_a):
+                raise self._exc
+
+            def close(self):
+                return None
+
+        for raiser in (
+            ConnectionResetError("peer RST mid error body"),
+            http.client.IncompleteRead(b"partial"),
+            ConnectionAbortedError("aborted mid error body"),
+        ):
+            err = urllib.error.HTTPError(
+                url="http://10.42.1.99:9000/settings", code=500,
+                msg="Internal Server Error", hdrs={}, fp=_FailFp(raiser),
+            )
+            # /settings is NOT rewritten, so this exercises the HTTPError
+            # non-3xx body read (the 3xx arm never reads — see the bomb-fp
+            # test above).
+            with mock.patch("urllib.request.urlopen", side_effect=err):
+                r = handler.lambda_handler({"method": "GET", "path": "/settings"}, None)
+                self.assertEqual(r, {"err": "box_unreachable"}, repr(raiser))
+
     def test_http_error_is_relayed_not_swallowed(self) -> None:
         # QuestDB's own 400 (bad column etc.) must reach the console UI.
         err = urllib.error.HTTPError(
