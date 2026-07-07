@@ -1903,14 +1903,34 @@ mod tests {
              observability::init_metrics — a pre-install registration resolves to the \
              no-op recorder and the pager silently loses restart #1 of every session"
         );
-        // The per-restart increment (the real signal) must still exist here.
+        // The per-restart increment (the real signal) must still exist here —
+        // distinguishably from the defensive `.increment(0)` registration at
+        // supervisor start. Round-6 review fix: the round-5 `>= 1` count was
+        // VACUOUS — the defensive registration alone satisfied it, so deleting
+        // the per-restart `.increment(1)` (the ONLY site that ever moves the
+        // counter, hence the tv-<env>-feed-stall-restarts pager's only signal)
+        // kept the build green. Require BOTH quoted sites AND that at least
+        // one metric-name occurrence is followed by `.increment(1)` within the
+        // same counter! expression. (The escaped `\"tv_feed...\"` literals in
+        // THIS test do not match the quoted needle — the backslash breaks the
+        // substring — so the occurrences are exactly the two code sites.)
         let src = include_str!("groww_sidecar_supervisor.rs");
+        let needle = "\"tv_feed_sidecar_stall_restart_total\"";
+        let sites: Vec<usize> = src.match_indices(needle).map(|(i, _)| i).collect();
         assert!(
-            src.matches("\"tv_feed_sidecar_stall_restart_total\"")
-                .count()
-                >= 1,
-            "expected the per-restart increment of tv_feed_sidecar_stall_restart_total \
-             in the supervisor"
+            sites.len() >= 2,
+            "expected BOTH the defensive registration and the per-restart increment \
+             of tv_feed_sidecar_stall_restart_total in the supervisor"
+        );
+        let has_per_restart_increment = sites.iter().any(|&i| {
+            let window_end = (i + 200).min(src.len());
+            src[i..window_end].contains(".increment(1)")
+        });
+        assert!(
+            has_per_restart_increment,
+            "expected at least one tv_feed_sidecar_stall_restart_total site to call \
+             .increment(1) — the per-restart signal the tv-<env>-feed-stall-restarts \
+             pager depends on; deleting it blinds the pager entirely"
         );
     }
 
