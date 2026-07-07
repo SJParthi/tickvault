@@ -25,25 +25,18 @@
 
 [advisories]
 ignore = [
-    # 2026-06-22 — RUSTSEC-2026-0185 (quinn-proto 0.11.14, HIGH 7.5, QUIC remote
-    # memory exhaustion). UNREACHABLE in our binary: quinn/quinn-proto are pulled
-    # ONLY by reqwest's optional `http3` feature, which we do NOT enable (reqwest
-    # features = json/rustls/charset/http2/query, default-features = false). It is
-    # a phantom Cargo.lock entry — never compiled, so the QUIC stream-reassembly
-    # code can never run. `cargo tree -i quinn-proto -e normal,build` = empty.
-    # Removal condition: drop this once the lock is bumped to quinn-proto >= 0.11.15
-    # in a maintenance sweep (the bump needs `cargo update`, blocked by the local
-    # hook; a follow-up carries it). Full reason mirrored in deny.toml.
-    "RUSTSEC-2026-0185",
-    # 2026-07-07 — RUSTSEC-2026-0204 (crossbeam-epoch 0.9.18, invalid pointer
-    # dereference in `fmt::Pointer`/`fmt::Display` for `Atomic`/`Shared` when the
-    # pointer is invalid, e.g. `Atomic::null`). NOT reachable: crossbeam-epoch is
-    # pulled only via criterion (dev-only benches) and metrics-util →
-    # metrics-exporter-prometheus; neither our code nor those crates format
-    # `Atomic`/`Shared` pointers — the epoch GC use never hits the vulnerable
-    # Display path. Removal condition: bump the lock to crossbeam-epoch >= 0.9.20
-    # in an operator-approved maintenance sweep (`cargo update -p crossbeam-epoch`
-    # is banned by CLAUDE.md + the local hook). Full reason mirrored in deny.toml.
+    # 2026-07-07 — RUSTSEC-2026-0204 (crossbeam-epoch 0.9.18, `fmt::Pointer`
+    # invalid pointer dereference for `Atomic`/`Shared` when the underlying
+    # pointer is invalid, e.g. `Atomic::null`). TRANSITIVE-ONLY: pulled via
+    # criterion → rayon → crossbeam-deque (dev/bench chain) and
+    # metrics-exporter-prometheus → metrics-util (internals). tickvault code
+    # never invokes `fmt` on `Atomic`/`Shared` — no direct crossbeam-epoch
+    # usage. Real fix = bump the lock to crossbeam-epoch >= 0.9.20, blocked
+    # on operator approval (`cargo update` is BANNED per CLAUDE.md); a
+    # follow-up maintenance sweep carries the targeted bump. Full reason
+    # mirrored in deny.toml.
+    # (2026-06-22 RUSTSEC-2026-0185 ignore removed the same day — cargo-deny
+    # now reports `advisory-not-detected` for it; stale housekeeping.)
     "RUSTSEC-2026-0204",
 ]
 
