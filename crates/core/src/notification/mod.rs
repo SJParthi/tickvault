@@ -15,6 +15,7 @@
 //! ```
 
 pub mod coalescer;
+pub mod episode;
 pub mod events;
 pub mod feed_badge;
 pub mod service;
@@ -24,6 +25,10 @@ pub mod summary_writer;
 pub use coalescer::{
     BucketKey, CoalesceDecision, CoalescerConfig, DEFAULT_FLUSH_INTERVAL_SECS, DEFAULT_WINDOW_SECS,
     DrainedSummary, MAX_SAMPLES_PER_BUCKET, TelegramCoalescer,
+};
+pub use episode::{
+    EpisodeAction, EpisodeConfig, EpisodeFamily, EpisodeKey, EpisodePhase, EpisodeRegistry,
+    EpisodeRole, EpisodeState,
 };
 pub use events::{NotificationEvent, Severity};
 pub use service::NotificationService;
