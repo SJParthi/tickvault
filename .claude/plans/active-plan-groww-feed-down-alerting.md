@@ -40,16 +40,22 @@ boot-connect rising edge at ~2374). Fix (crates: **tickvault-core** +
 **tickvault-app**, ratchet in **tickvault-storage**):
 
 1. Two new `NotificationEvent` variants in `crates/core/src/notification/events.rs`
-   (tickvault-core): `FeedDown { feed, reason, market_open }` — field-driven
-   severity: **High in-market / Low off-hours** (precedent: CrossVerify1mSummary
-   field-driven severity; WebSocketDisconnected High vs …OffHours Low split) —
-   and `FeedRecovered { feed, down_secs }` (**Medium**, mirrors
-   WebSocketReconnected). Exhaustive arms: `message_body()`, `topic()`,
-   `severity()`; wildcard arms edited: `feed_badge()` (feed-generic
-   `feed_badge_for_name` arm). NO `dispatch_policy()` edit (High/Medium bypass
-   the coalescer; Low off-hours coalescing 60s is the desired
-   no-pre-market-spam behavior). NO `NotificationService` edit (generic
-   consumer). NO new ErrorCode (no new `error!` mentions a tracked code).
+   (tickvault-core): `FeedDown { feed, reason, market_open, operator_initiated }`
+   — field-driven severity: **High in-market / Low off-hours** (precedent:
+   CrossVerify1mSummary field-driven severity; WebSocketDisconnected High vs
+   …OffHours Low split). `market_open` is the CALENDAR-aware
+   `is_trading_session_now()` (never the clock-only helper — Saturday/holiday
+   false-page class, 2026-05-09 precedent; ratcheted in the guard).
+   `operator_initiated` branches the body trailer: a deliberate feeds-page
+   disable says "stays off until you re-enable it", a bridge death says the
+   honest "retrying automatically" — and `FeedRecovered { feed, down_secs }`
+   (**Medium**, mirrors WebSocketReconnected). Exhaustive arms:
+   `message_body()`, `topic()`, `severity()`; wildcard arms edited:
+   `feed_badge()` (feed-generic `feed_badge_for_name` arm). NO
+   `dispatch_policy()` edit (High/Medium bypass the coalescer; Low off-hours
+   coalescing 60s is the desired no-pre-market-spam behavior). NO
+   `NotificationService` edit (generic consumer). NO new ErrorCode (no new
+   `error!` mentions a tracked code).
 2. Emit sites in `crates/app/src/groww_bridge.rs` (tickvault-app), once per
    DOWN episode via two new `GrowwAuditLatches` fields — `down_announced:
    AtomicBool` + `down_since_epoch_secs: AtomicU64` (first-down-wins CAS so
@@ -74,31 +80,63 @@ boot-connect rising edge at ~2374). Fix (crates: **tickvault-core** +
 4. Gauges (tickvault-app), published from the `run_groww_bridge` loop (the pool
    watchdog is Dhan-lane-spawned and never runs on a groww-only boot; the
    bridge loop wakes ≤1s and already writes `feed_health.set_connected`).
-   Handles hoisted ONCE before the loop (zero per-wake allocation, static
-   labels): `tv_groww_ws_active` (connected-level 0/1 — 1 while the connected
-   episode holds [boot-connect announced OR streaming observed], explicitly 0
-   in both falling-edge arms; connected-level chosen so the pre-open
-   08:30→first-tick window does not page daily, mirroring
-   `tv_order_update_ws_active` semantics) and
-   `tv_feed_last_tick_age_seconds{feed="groww"}` from
-   `FeedHealthRegistry::last_tick_age_secs` — SKIP the `.set()` on `None`
+   Handles are registered LAZILY (`Option::get_or_insert_with`) — NOT hoisted
+   before the loop, and deliberately NOT an exact clone of the order-update
+   registration site, though the SEMANTICS mirror the order-update precedent:
+   `tv_groww_ws_active` (connected-level 0/1 — 1 while the connected episode
+   holds [boot-connect announced OR streaming observed]) is REGISTERED only at
+   the first connected episode of the session, so the metric stays MISSING
+   (notBreaching → alarm silent) through a boot/activation chain of ANY length
+   — the round-2 fix for the unverified "~2min grace" that false-paged every
+   slow boot morning. Once registered it publishes 0/1 every wake (and 0 on
+   disabled wakes), so mid-session outages, failed disable→re-enables, and
+   runtime disables all show. Honest envelope: a sidecar dead at boot leaves
+   the metric missing — that class pages via the sidecar reject alerts +
+   FEED-STALL-01, not this alarm. `tv_feed_last_tick_age_seconds{feed="groww"}`
+   from `FeedHealthRegistry::last_tick_age_secs` — SKIP the `.set()` on `None`
    (no first tick yet → missing data + `notBreaching` alarm = no false signal;
    NEVER a fake 0 age).
+4b. Evidence freshness (round-2 hardening, 2026-07-06): BOTH streaming-evidence
+   channels are floored so a fossil can never latch the connected episode,
+   fire FeedRecovered, or pin the gauge at 1 —
+   (a) STATUS channel: `groww_status_is_live(stamp, now, floor)` — stamp
+   present + at/after the live floor (bridge-incarnation start, advanced every
+   disabled wake) + within 120s of now + not absurdly future. The one-shot
+   `subscribed` record's freshness LATCHES per episode
+   (`fresh_status_seen_this_episode`) so the boot-connect notifier deferral
+   stays "delayed, never lost" on >120s boot chains. EPOCH CONTRACT: the
+   sidecar's `now_ist_nanos()` stamp is IST-epoch (UTC+19,800s, the
+   `replace(tzinfo=timezone.utc)` trick shared with `ms_to_ist_nanos`),
+   matching the bridge's `receipt_ist_nanos()` clock — cross-language ratchet
+   `test_sidecar_status_stamp_shares_the_ist_epoch_convention` (the round-1
+   gate compared a UTC stamp to an IST clock: every real record read 19,800s
+   stale forever).
+   (b) TICK channel: `parsed_a_tick` latches streaming ONLY when
+   `wake_had_fresh_capture(floor)` — the drained lines' per-message
+   `capture_ns` stamps prove capture AFTER the floor. The ≤2s pre-disable
+   NDJSON backlog replayed on re-enable, and a respawned bridge's byte-0
+   re-tail, still persist + fold (zero loss) but prove nothing about liveness.
 5. CloudWatch: append `tv_groww_ws_active`, `tv_feed_last_tick_age_seconds`,
    `tv_feed_sidecar_stall_restart_total` to BOTH selector copies
    (`deploy/aws/cloudwatch-agent.json` + `deploy/aws/terraform/user-data.sh.tftpl`
    — byte-identical, lockstep-ratcheted). Two new terraform alarms in
-   `app-alarms.tf`: `tv-${var.environment}-groww-ws-inactive` (exact clone of
-   `order_update_ws_inactive`: Minimum < 1, period 60, eval 2, notBreaching)
-   and `tv-${var.environment}-groww-stall-restart-storm` on
-   `tv_feed_sidecar_stall_restart_total` (Maximum >= 3, period 300, eval 1,
-   notBreaching — HOUSE-PRECEDENT shape: plain statistic on the session-scoped
-   cumulative counter exactly like `late_tick_after_boundary`; the box restarts
-   daily at 08:30 IST so the counter is fresh each session; "3+ stall restarts
-   since today's boot" is the flapping-socket / provider-reject page per
-   FEED-STALL-01 storm semantics [in-process storm = >5 restarts / 300s], while
-   a single self-healing restart never pages). Both registered in the
-   `app_cloudwatch_alarms` output list. Dhan files untouched.
+   `app-alarms.tf`: `tv-${var.environment}-groww-ws-inactive` (Minimum < 1,
+   period 60, eval 2, notBreaching — same SHAPE as `order_update_ws_inactive`;
+   registration semantics per item 4) and
+   `tv-${var.environment}-groww-stall-restart-storm` on
+   `tv_feed_sidecar_stall_restart_total` (**Sum >= 3 over one 3600s period**,
+   notBreaching). SHAPE HONESTY (corrected during implementation, ratcheted by
+   `cw_agent_selector_lockstep_guard.rs`): the CW agent's Prometheus pipeline
+   DELTA-CONVERTS counter-type metrics — each datapoint is the increase since
+   the previous 60s scrape, never the cumulative session count — so the
+   originally-planned "Maximum >= 3 / 300s on the session-scoped counter"
+   (modeled on the `late_tick_after_boundary` precedent) could NEVER fire (a
+   behaviorally dead alarm; that precedent is itself suspect under the same
+   delta analysis and is tracked separately). Sum over a 1-hour window counts
+   restarts within the window under delta semantics: 3+ stall restarts/hour
+   pages, a single self-healing restart stays silent per FEED-STALL-01. Both
+   alarms registered in the `app_cloudwatch_alarms` output list. Dhan files
+   untouched.
 
 ## Edge Cases
 
@@ -108,8 +146,20 @@ boot-connect rising edge at ~2374). Fix (crates: **tickvault-core** +
 - Off-hours disable → `FeedDown` Low, 60s-coalesced (no pre-market spam —
   the 2026-04-22 WebSocketDisconnectedOffHours precedent class).
 - Pre-open 08:30→first-tick: connected-level `tv_groww_ws_active` reads 1 once
-  the sidecar reports subscribed (no daily false page); the age gauge is
-  UNPUBLISHED until the first tick (missing + notBreaching = silent).
+  the sidecar reports a FRESH subscribed status (no daily false page); before
+  the first connected episode of the session the gauge is UNREGISTERED
+  (missing + notBreaching = silent for a boot chain of any length — round-2
+  fix); the age gauge is UNPUBLISHED until the first tick.
+- Disable→re-enable with a failing relaunch (auth reject / stale-token class):
+  the pre-disable frozen status file AND the ≤2s pre-disable NDJSON backlog
+  are BOTH below the live floor — no false FeedRecovered, no consumed DOWN
+  episode, gauge publishes 0 (registered earlier in the session) so the
+  groww-ws-inactive alarm fires honestly (round-2 fix — the round-1 gate
+  covered only the status channel).
+- Tickless window (closed-market run / pre-open) with a slow notifier fill:
+  the one-shot `subscribed` record ages past 120s, but the per-episode
+  freshness latch keeps the boot-connect deferral open — the ping is delayed,
+  never lost (round-2 fix).
 - One-off stall restart that self-heals: NO Telegram FeedDown (the stall path
   emits no typed event; FEED-STALL-01 stays `warn!`/`error!` per its runbook);
   the storm signal pages via the new CloudWatch alarm on the counter instead.
@@ -135,10 +185,18 @@ boot-connect rising edge at ~2374). Fix (crates: **tickvault-core** +
   TELEGRAM-01 drop accounting — no new handling.
 - CW-agent selector drift between the two copies: build-failing lockstep guard
   (`crates/storage/tests/cw_agent_selector_lockstep_guard.rs`).
-- Cumulative-counter alarm mis-shape: mirrored from the VERIFIED in-repo
-  precedent (`late_tick_after_boundary` Maximum-statistic on a session-scoped
-  counter); the alarm description states the honest "since today's boot"
-  semantics, never claiming a 5-minute delta.
+- Cumulative-counter alarm mis-shape: the CW agent DELTA-CONVERTS Prometheus
+  counters, so a plain-Maximum threshold on a "session-scoped cumulative"
+  counter can never fire (the `late_tick_after_boundary` precedent this plan
+  originally mirrored is itself suspect under the same analysis). Shipped
+  shape: Sum >= 3 over 3600s (delta semantics — restarts within the hour);
+  pinned by `cw_agent_selector_lockstep_guard.rs`, which rejects a regression
+  to Maximum.
+- Stale/replayed sidecar evidence (round-2): the status file is never deleted
+  and the NDJSON backlog replays on re-enable/respawn — both channels are
+  floored (`groww_status_is_live` / `wake_had_fresh_capture`) so fossils
+  persist+fold but never latch streaming, fire FeedRecovered, or pin the
+  gauge; a cross-language epoch ratchet pins the stamp convention.
 - Latch stuck true after a lost rising edge (process restart mid-episode):
   latches are per-process — a restart resets them; worst case one duplicate
   FeedDown after restart (idempotent for the operator, no false-OK).
@@ -156,7 +214,18 @@ boot-connect rising edge at ~2374). Fix (crates: **tickvault-core** +
   feed name, no `.rs`/lib jargon, topic, severity),
   `test_feed_down_html_escapes_reason`,
   `test_feed_recovered_renders_down_secs_and_topic`,
-  `test_feed_down_and_recovered_resolve_groww_badge`.
+  `test_feed_down_and_recovered_resolve_groww_badge`,
+  `test_feed_down_operator_disable_body_names_the_action_not_auto_retry`
+  (the `operator_initiated` trailer honesty).
+- Round-2 additions in `crates/app/src/groww_bridge.rs` inline:
+  `test_sidecar_status_stamp_shares_the_ist_epoch_convention` (cross-language
+  epoch ratchet), `test_capture_stamp_ist_nanos_trusted_stamp_only_no_fallback`,
+  `test_wake_had_fresh_capture_gates_on_floor_and_zero`,
+  `test_drain_replayed_backlog_parses_but_never_reads_fresh` (end-to-end
+  through the real drain body), plus the guard ratchets
+  `test_tick_channel_streaming_latch_is_freshness_gated` and the
+  `is_trading_session_now` / episode-latch / floor-rename pins in
+  `groww_feed_down_alert_guard.rs`.
 - `crates/core/tests/event_formatting_coverage.rs`: render cases for both
   variants (`test_feed_down_and_recovered_message_coverage`).
 - `crates/app/src/groww_bridge.rs` inline: latch unit tests
@@ -193,12 +262,14 @@ this branch is alerting-only.
 - Telegram: `FeedDown` (High in-market → immediate + SNS; Low off-hours →
   60s-coalesced), `FeedRecovered` (Medium → immediate), both feed-badged
   🟢 GROWW via `feed_badge_for_name`.
-- Metrics: `tv_groww_ws_active` (gauge 0/1, connected-level),
+- Metrics: `tv_groww_ws_active` (gauge 0/1, connected-level, registered at the
+  first connected episode of the session — missing through boot),
   `tv_feed_last_tick_age_seconds{feed="groww"}` (gauge, absent pre-first-tick),
   existing `tv_feed_sidecar_stall_restart_total` now CW-exported.
 - CloudWatch alarms: `tv-${env}-groww-ws-inactive` (Minimum < 1, 60s × 2,
-  notBreaching) and `tv-${env}-groww-stall-restart-storm` (Maximum >= 3 over
-  300s, notBreaching, session-scoped counter) → SNS `tv_alerts` → Telegram.
+  notBreaching) and `tv-${env}-groww-stall-restart-storm` (Sum >= 3 over one
+  3600s period, notBreaching — delta-converted counter semantics; see Design
+  item 5) → SNS `tv_alerts` → Telegram.
 - Audit: existing `ws_event_audit` rows unchanged (Connected / Disconnected /
   DisconnectedOffHours / Reconnected, feed='groww').
 - Logs: existing FEED-STALL-01 / FEED-SUPERVISOR-01 `error!` sites unchanged;

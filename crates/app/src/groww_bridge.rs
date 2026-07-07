@@ -215,9 +215,18 @@ struct GrowwStatusLine {
     emitted: u64,
     #[serde(default)]
     dropped: u64,
-    /// IST epoch nanos the sidecar stamped when it WROTE this record
-    /// (`write_status` → `now_ist_nanos()` in `groww_sidecar.py`). 0 = the
-    /// stamp is absent (old-format line) — treated as NEVER-live, fail-closed.
+    /// IST epoch nanos (UTC epoch + 19,800s — the SAME convention as
+    /// [`receipt_ist_nanos`] and the tick lines' `ts_ist_nanos`) the sidecar
+    /// stamped when it WROTE this record (`write_status` → `now_ist_nanos()`
+    /// in `groww_sidecar.py`). The cross-language epoch contract is ratcheted
+    /// by `test_sidecar_status_stamp_shares_the_ist_epoch_convention`
+    /// (2026-07-06 fix: the sidecar previously stamped the PLAIN UTC epoch,
+    /// so every real record read 19,800s old and the freshness gate rejected
+    /// it forever). 0 = the stamp is absent (old-format line) — treated as
+    /// NEVER-live, fail-closed. A pre-fix sidecar's UTC-epoch stamp reads
+    /// ~5.5h old under this gate and is likewise rejected — correct, since
+    /// any such file is by definition a pre-restart fossil (the supervisor
+    /// relaunches the sidecar from the same deployed tree as this binary).
     #[serde(default)]
     ts_ist_nanos: i64,
 }
@@ -248,13 +257,21 @@ fn parse_groww_status_line(text: &str) -> Option<GrowwStatusLine> {
     serde_json::from_str::<GrowwStatusLine>(trimmed).ok()
 }
 
-/// Max age for a sidecar status record to count as LIVE evidence (the sidecar
-/// rewrites the status ≤1s apart while streaming and once at subscribe, so a
-/// healthy record is always well inside this bound; a record older than it is
-/// a fossil from a killed / stalled / prior-day sidecar). Generous enough to
-/// cover the boot-ordering notifier-slot deferral of the one-shot `subscribed`
-/// write, tight enough that yesterday's file can never read as today's proof
-/// (mirrors the ladder's `PLATEAU_PROOF_FRESHNESS_SECS` fossil-aging pattern).
+/// Max age for a sidecar status record to count as LIVE evidence at FIRST
+/// observation per connected episode (the sidecar rewrites the status ≤1s
+/// apart while streaming and once at subscribe, so a healthy record is always
+/// well inside this bound; a record older than it is a fossil from a killed /
+/// stalled / prior-day sidecar — mirrors the ladder's
+/// `PLATEAU_PROOF_FRESHNESS_SECS` fossil-aging pattern). The one-shot
+/// `subscribed` write is NOT rewritten on a tickless window, so this window
+/// deliberately does NOT need to cover the boot-ordering notifier-slot
+/// deferral: once a record has been observed fresh, the bridge latches
+/// `fresh_status_seen_this_episode` and the deferral / gauge no longer
+/// require the record to STILL be fresh at announce time (2026-07-06 fix —
+/// the floor check alone kills fossils; without the latch, a >120s
+/// docker/notifier boot chain silently LOST the boot-connect ping and left
+/// the gauge 0 until the first tick, contradicting the in-code
+/// "delayed, never lost" contract).
 const GROWW_STATUS_LIVE_MAX_AGE_NANOS: i64 = 120 * NANOS_PER_SECOND;
 
 /// PURE freshness classification of one sidecar status record (stale-status
@@ -278,6 +295,16 @@ const GROWW_STATUS_LIVE_MAX_AGE_NANOS: i64 = 120 * NANOS_PER_SECOND;
 /// "✅ Prices are flowing" `FeedRecovered` on every disable→re-enable, and
 /// pinned `tv_groww_ws_active = 1` all session while a dead-at-boot sidecar
 /// streamed nothing (blinding the groww-ws-inactive alarm).
+///
+/// EPOCH CONTRACT (2026-07-06 fix): both sides of the comparison are "IST
+/// epoch" nanos (UTC epoch + 19,800s) — `status_ts_ist_nanos` is stamped by
+/// the sidecar's `now_ist_nanos()` (the `replace(tzinfo=timezone.utc)`
+/// trick, same as `ms_to_ist_nanos`), and `now`/`floor` come from
+/// [`receipt_ist_nanos`]. The sidecar previously stamped the PLAIN UTC epoch
+/// (`.timestamp()` on an aware datetime ignores the zone), making condition
+/// 3 unsatisfiable (every real record read ≈19,800s old) — every fresh
+/// status was rejected forever. Ratchet:
+/// `test_sidecar_status_stamp_shares_the_ist_epoch_convention`.
 #[must_use]
 fn groww_status_is_live(
     status_ts_ist_nanos: i64,
@@ -647,17 +674,31 @@ fn row_received_at_with_capture(
     capture_ns_utc: Option<i64>,
     wake_receipt_ist_nanos: i64,
 ) -> Option<i64> {
-    if let Some(ns) = capture_ns_utc {
-        let capture_ist_nanos =
-            ns.saturating_add(tickvault_common::constants::IST_UTC_OFFSET_NANOS);
-        if capture_ist_nanos > GROWW_MIN_PLAUSIBLE_RECEIPT_IST_NANOS
-            && capture_ist_nanos
-                <= wake_receipt_ist_nanos.saturating_add(GROWW_FUTURE_TS_TOLERANCE_NANOS)
-        {
-            return Some(capture_ist_nanos);
-        }
-    }
-    row_received_at(wake_receipt_ist_nanos)
+    capture_stamp_ist_nanos(capture_ns_utc, wake_receipt_ist_nanos)
+        .or_else(|| row_received_at(wake_receipt_ist_nanos))
+}
+
+/// The plausibility-gated per-message capture stamp ONLY (no wake-stamp
+/// fallback) in IST nanos — the TRUSTED evidence of WHEN the sidecar actually
+/// captured the line at its NATS callback. Extracted (2026-07-06 replayed-
+/// backlog false-recovery fix) so the liveness/recovery signal can
+/// distinguish a line captured FRESH this episode from a replayed
+/// pre-disable / pre-respawn backlog line: only a stamp at/after the live
+/// floor may latch `streaming_observed`. A line WITHOUT a capture stamp
+/// (old-format / reconcile-sweep row) returns `None` — it still persists and
+/// folds, but it can never prove liveness (the sidecar's ≤1s status rewrite
+/// on real emits covers those flows via the freshness-gated status channel).
+/// Pure arithmetic — O(1), no clock read, no allocation per line.
+fn capture_stamp_ist_nanos(
+    capture_ns_utc: Option<i64>,
+    wake_receipt_ist_nanos: i64,
+) -> Option<i64> {
+    let ns = capture_ns_utc?;
+    let capture_ist_nanos = ns.saturating_add(tickvault_common::constants::IST_UTC_OFFSET_NANOS);
+    (capture_ist_nanos > GROWW_MIN_PLAUSIBLE_RECEIPT_IST_NANOS
+        && capture_ist_nanos
+            <= wake_receipt_ist_nanos.saturating_add(GROWW_FUTURE_TS_TOLERANCE_NANOS))
+    .then_some(capture_ist_nanos)
 }
 
 /// Monotonic, replay-stable `capture_seq` source (TICK-SEQ-01): `max(prev+1,
@@ -809,6 +850,18 @@ pub(crate) struct GrowwBridgeState {
     /// (`should_restart_on_stall` via `last_tick_age_secs`) can fire instead of
     /// being masked by duplicate re-dumps.
     liveness_max_exchange_ts_nanos: i64,
+    /// Max plausibility-gated per-message capture stamp
+    /// ([`capture_stamp_ist_nanos`]) across the lines parsed by the MOST
+    /// RECENT `drain_new_data` call (reset each call; 0 = no trusted capture
+    /// stamp this wake). 2026-07-06 replayed-backlog false-recovery fix: the
+    /// run loop latches `streaming_observed` from the tick channel ONLY when
+    /// this is at/after the live floor — a drained pre-disable / pre-respawn
+    /// backlog (the sidecar keeps appending for ≤2s after a runtime disable;
+    /// a respawned bridge byte-0 re-tails already-captured bytes) carries
+    /// OLD capture stamps and must persist/fold WITHOUT firing FeedRecovered
+    /// ("Prices are flowing") or pinning `tv_groww_ws_active = 1` before the
+    /// relaunched sidecar has actually authenticated + subscribed + streamed.
+    wake_max_capture_ist_nanos: i64,
 }
 
 impl GrowwBridgeState {
@@ -850,7 +903,22 @@ impl GrowwBridgeState {
             ilp_backpressure_active: false,
             active_drain_ist_day: None,
             liveness_max_exchange_ts_nanos: 0,
+            wake_max_capture_ist_nanos: 0,
         }
+    }
+
+    /// TRUE when the most recent [`Self::drain_new_data`] call parsed at
+    /// least one line whose per-message capture stamp is at/after
+    /// `live_floor_ist_nanos` — i.e. the sidecar captured it FRESH this
+    /// episode, not a replayed pre-disable / pre-respawn backlog line. The
+    /// run loop gates the tick-channel `streaming_observed` latch (and only
+    /// that — persist/fold stay unconditional, zero-loss) on this, mirroring
+    /// the status channel's `groww_status_is_live` floor (2026-07-06
+    /// replayed-backlog false-recovery fix). Pure — O(1) compare.
+    #[must_use]
+    pub(crate) fn wake_had_fresh_capture(&self, live_floor_ist_nanos: i64) -> bool {
+        self.wake_max_capture_ist_nanos > 0
+            && self.wake_max_capture_ist_nanos >= live_floor_ist_nanos
     }
 
     /// Read the first [`GROWW_OFFSET_HEAD_LEN`] bytes of the capture file (the
@@ -1103,6 +1171,10 @@ impl GrowwBridgeState {
         tick_file_path: &Path,
         feed_health: &tickvault_common::feed_health::FeedHealthRegistry,
     ) -> bool {
+        // Reset the per-wake fresh-capture evidence BEFORE any early return
+        // so a quiet/failed wake can never re-report the PREVIOUS wake's
+        // freshness (2026-07-06 replayed-backlog false-recovery fix).
+        self.wake_max_capture_ist_nanos = 0;
         let mut file = match File::open(tick_file_path).await {
             Ok(f) => f,
             // Sidecar not started yet — nothing to read.
@@ -1211,6 +1283,16 @@ impl GrowwBridgeState {
             parsed_any = true;
             wake_max_exchange_ts_nanos = wake_max_exchange_ts_nanos.max(parsed.tick.ts_ist_nanos);
             let seq = next_capture_seq(&self.capture_seq, parsed.tick.ts_ist_nanos);
+            // Trusted per-message capture stamp (None for old-format /
+            // reconcile-sweep rows): tracked as the wake max so the run loop
+            // can gate the streaming latch on capture FRESHNESS — a replayed
+            // pre-disable backlog line carries an OLD stamp and must never
+            // prove liveness (2026-07-06 false-recovery fix). The persisted
+            // `received_at` keeps the exact pre-fix semantics (stamp, else
+            // per-wake fallback).
+            if let Some(c) = capture_stamp_ist_nanos(parsed.capture_ns, wake_receipt_ist_nanos) {
+                self.wake_max_capture_ist_nanos = self.wake_max_capture_ist_nanos.max(c);
+            }
             let row_received =
                 row_received_at_with_capture(parsed.capture_ns, wake_receipt_ist_nanos);
             // C2 (feed convergence): the ordered enrich → persist → aggregate
@@ -2414,26 +2496,44 @@ pub async fn run_groww_bridge(
     // per-wake allocation. Published from THIS loop (≤1s wake cadence)
     // because the Dhan pool watchdog is Dhan-lane-spawned and never runs on
     // a groww-only boot.
-    // - `tv_groww_ws_active`: CONNECTED-level 0/1 (socket connected +
-    //   subscribed OR streaming, FRESH evidence only — a stale status file
-    //   can never read 1). While ENABLED it publishes honestly from the
-    //   first wake (a sidecar dead at boot publishes 0 and the alarm fires
-    //   as its description promises); while DISABLED it publishes 0 only if
-    //   already registered this session (a genuine enabled→off transition
-    //   shows the outage; a never-enabled session stays missing/silent).
+    // - `tv_groww_ws_active`: CONNECTED-level 0/1. Registered ONLY at the
+    //   FIRST connected episode of the session (2026-07-06 boot-grace fix —
+    //   mirrors the order-update precedent exactly): the Groww activation
+    //   chain (CSV pull-until-success → sidecar launch incl. possible venv
+    //   re-provision → SSM token read → NATS connect → subscribe) routinely
+    //   exceeds the alarm's 60s×2 shape on cold/slow boots, so publishing an
+    //   honest 0 from the first enabled wake produced a false pre-open
+    //   ALARM/OK page pair on ordinary boot mornings. MISSING + notBreaching
+    //   keeps the alarm silent for a boot chain of ANY length; once
+    //   registered, 0/1 publishes every wake so a mid-session outage, a
+    //   failed disable→re-enable, and a runtime disable all show. Honest
+    //   envelope: a sidecar DEAD AT BOOT (never connects) leaves the metric
+    //   missing — that class is paged by the sidecar supervisor's reject
+    //   alerts + the FEED-STALL-01 watchdog, not by this alarm.
     // - `tv_feed_last_tick_age_seconds{feed="groww"}`: seconds since the
     //   feed's most-recent tick; SKIPPED (never a fake 0, not even the
     //   registration-default 0) until the first tick of the session so
     //   missing-data + notBreaching stays silent.
     let mut m_groww_active: Option<metrics::Gauge> = None;
     let mut m_groww_tick_age: Option<metrics::Gauge> = None;
-    // Stale-status LIVE floor (2026-07-06 false-recovery fix): a sidecar
-    // status record only counts as evidence when its write stamp is at/after
-    // this floor. Initialized to THIS bridge incarnation's start (yesterday's
-    // EBS-persisted file / a pre-panic frozen file can never latch) and
-    // advanced on every runtime-disabled wake (the pre-disable frozen file
-    // can never close a DOWN episode after a re-enable).
-    let mut status_live_floor_ist_nanos: i64 = receipt_ist_nanos();
+    // Live-evidence floor (2026-07-06 false-recovery fix): sidecar evidence
+    // — a status record's write stamp (`groww_status_is_live`) OR a tick
+    // line's per-message capture stamp (`wake_had_fresh_capture`) — only
+    // counts when it is at/after this floor. Initialized to THIS bridge
+    // incarnation's start (yesterday's EBS-persisted file / a pre-panic
+    // byte-0 re-tail can never latch) and advanced on every runtime-disabled
+    // wake (the pre-disable frozen status file AND the ≤2s pre-disable
+    // NDJSON backlog can never close a DOWN episode after a re-enable).
+    let mut live_floor_ist_nanos: i64 = receipt_ist_nanos();
+    // Episode latch for the one-shot `subscribed` status record (2026-07-06
+    // boot-deferral fix): the sidecar writes `subscribed` exactly ONCE and
+    // only rewrites on real emits, so on a tickless window the record is
+    // fresh for just GROWW_STATUS_LIVE_MAX_AGE_NANOS. Once observed FRESH
+    // (past the floor), this latch keeps the status-evidence path open so
+    // the boot-connect notifier deferral stays "delayed, never lost" and the
+    // connected gauge does not require the record to STILL be fresh at
+    // announce time. Reset on every disabled wake (with the floor advance).
+    let mut fresh_status_seen_this_episode = false;
     // One-per-incarnation triage breadcrumb for a skipped stale status file.
     let mut stale_status_logged = false;
 
@@ -2534,12 +2634,17 @@ pub async fn run_groww_bridge(
             audit_latches.rearm_boot_connect();
             connect_logged = false;
             streaming_observed = false;
-            // Advance the stale-status LIVE floor every disabled wake: after
-            // a re-enable, ONLY a status the sidecar writes AFTER this
-            // instant can latch streaming / close the DOWN episode — the
-            // pre-disable frozen "streaming" file is a fossil (2026-07-06
-            // false-recovery fix).
-            status_live_floor_ist_nanos = receipt_ist_nanos();
+            fresh_status_seen_this_episode = false;
+            // Advance the live-evidence floor every disabled wake: after a
+            // re-enable, ONLY evidence the sidecar produces AFTER this
+            // instant — a status write stamp OR a tick line's per-message
+            // capture stamp — can latch streaming / close the DOWN episode.
+            // The pre-disable frozen "streaming" file AND the ≤2s of
+            // pre-disable NDJSON backlog the sidecar appends before its
+            // kill are fossils (2026-07-06 false-recovery fix; the backlog
+            // still persists + folds on re-enable — zero loss — it just
+            // proves nothing about liveness).
+            live_floor_ist_nanos = receipt_ist_nanos();
             // Connected-level gauge drops to 0 while disabled ONLY when it
             // was already registered this session (a genuine enabled→off
             // transition shows the outage). A session where Groww was never
@@ -2555,23 +2660,35 @@ pub async fn run_groww_bridge(
         // FRESHNESS-GATED (2026-07-06 stale-status false-OK fix): the sidecar
         // never deletes this file (a killed child freezes it at its last
         // write, EBS persists it across the daily stop/start), so a record is
-        // evidence ONLY when its own write stamp is at/after the live floor
-        // AND recent — a stale record is treated exactly like an absent file
-        // (no connect log, no boot-connect ping, no streaming latch, no
-        // count refresh). This is what keeps FeedRecovered ("Prices are
-        // flowing") and tv_groww_ws_active honest across disable→re-enable
-        // cycles and dead-at-boot sidecars.
+        // evidence ONLY once it has been observed with a write stamp at/after
+        // the live floor AND recent — a stale record is treated exactly like
+        // an absent file (no connect log, no boot-connect ping, no streaming
+        // latch, no count refresh). This is what keeps FeedRecovered ("Prices
+        // are flowing") and tv_groww_ws_active honest across disable→
+        // re-enable cycles and dead-at-boot sidecars. EPISODE LATCH
+        // (2026-07-06 boot-deferral fix): the `subscribed` record is written
+        // ONCE and only rewritten on real emits, so freshness is required at
+        // the FIRST observation per episode, then latched — otherwise a
+        // >120s docker/notifier boot chain silently LOST the deferred
+        // boot-connect ping ("delayed, never lost" broken) and the connected
+        // gauge stayed 0 on tickless windows while the sidecar was healthily
+        // subscribed. The floor (advanced on every disabled wake) alone
+        // kills fossils; the max-age window ages out a KILLED sidecar's last
+        // write before it can ever latch.
         if let Some(status) = read_status_file(&status_file_path).await {
-            if !groww_status_is_live(
+            if groww_status_is_live(
                 status.ts_ist_nanos,
                 receipt_ist_nanos(),
-                status_live_floor_ist_nanos,
+                live_floor_ist_nanos,
             ) {
+                fresh_status_seen_this_episode = true;
+            }
+            if !fresh_status_seen_this_episode {
                 if !stale_status_logged {
                     stale_status_logged = true;
                     info!(
                         status_ts_ist_nanos = status.ts_ist_nanos,
-                        live_floor_ist_nanos = status_live_floor_ist_nanos,
+                        live_floor_ist_nanos,
                         "groww bridge: ignoring STALE sidecar status file (leftover from a \
                          prior sidecar incarnation) — waiting for fresh subscribe/streaming \
                          proof before claiming the feed is live"
@@ -2674,10 +2791,28 @@ pub async fn run_groww_bridge(
             }
         }
 
-        // Drain whatever new bytes arrived (the real ingestion body).
+        // Drain whatever new bytes arrived (the real ingestion body — ALWAYS
+        // unconditional: every drained line persists + folds, zero loss).
         let parsed_a_tick = state.drain_new_data(&tick_file_path, &feed_health).await;
-        if parsed_a_tick {
-            // A first parsed tick is the strongest proof the feed is live.
+        // FRESHNESS-GATED streaming latch (2026-07-06 replayed-backlog
+        // false-recovery fix): a parsed tick proves the feed is live ONLY
+        // when its per-message capture stamp is at/after the live floor —
+        // the SAME floor the status channel uses. Without the gate, the ≤2s
+        // pre-disable NDJSON backlog (the sidecar keeps appending until its
+        // 2s disable poll kills it, and the disable arm idles WITHOUT
+        // draining) replayed on the first re-enable wake: it latched
+        // streaming, fired a false "✅ Prices are flowing" FeedRecovered
+        // BEFORE the relaunched sidecar had even authenticated, consumed the
+        // DOWN episode, and pinned tv_groww_ws_active = 1 all session while
+        // the relaunch failed — the exact blind-alarm/false-OK class the
+        // status-file floor closed, through the second evidence channel. The
+        // same gate covers a respawned bridge's byte-0 re-tail of
+        // already-captured bytes. Lines WITHOUT a capture stamp (old-format /
+        // reconcile-sweep rows) never latch here — the sidecar's ≤1s status
+        // rewrite on real emits latches those flows via the status channel.
+        if parsed_a_tick && state.wake_had_fresh_capture(live_floor_ist_nanos) {
+            // A freshly-captured parsed tick is the strongest proof the feed
+            // is live.
             streaming_observed = true;
         }
 
@@ -2745,22 +2880,32 @@ pub async fn run_groww_bridge(
             }
         }
 
-        // Groww liveness gauges (operator 2026-07-06): published every
-        // ENABLED wake (≤1s cadence, cold path, handles cached after the
-        // first publish). Connected-level active bit — 1 while the connected
-        // episode holds (socket connected + subscribed OR streaming, FRESH
-        // evidence only — a stale status file can never latch it), 0
-        // otherwise — so the pre-open 08:30→first-tick window never pages
-        // the inactivity alarm, while a sidecar dead at boot honestly
-        // publishes 0 (yesterday's stale file is ignored) and the
-        // groww-ws-inactive alarm fires as its description promises.
+        // Groww liveness gauges (operator 2026-07-06): cold ≤1s cadence,
+        // handles cached after the first publish. Connected-level active bit
+        // — 1 while the connected episode holds (socket connected +
+        // subscribed OR streaming, FRESH evidence only — a stale status file
+        // or a replayed tick backlog can never latch it). BOOT GRACE
+        // (2026-07-06 fix — order-update precedent): the gauge is REGISTERED
+        // only at the first connected episode of the session, so the metric
+        // is MISSING (notBreaching → alarm silent) for the whole activation
+        // chain (CSV pull-until-success → sidecar launch/venv → token →
+        // connect → subscribe) — a chain of ANY length never produces the
+        // pre-open false ALARM/OK page pair the unverified "~2min grace"
+        // assumed away. Once registered, 0/1 publishes every enabled wake
+        // (plus 0 on disabled wakes), so a mid-session outage, a failed
+        // disable→re-enable, and a runtime disable all show honestly. A
+        // sidecar DEAD AT BOOT leaves the metric missing — that class pages
+        // via the sidecar supervisor's reject alerts + FEED-STALL-01, not
+        // this alarm (documented in app-alarms.tf).
         let connected_episode = streaming_observed
             || audit_latches
                 .boot_connect_announced
                 .load(std::sync::atomic::Ordering::Relaxed);
-        m_groww_active
-            .get_or_insert_with(|| metrics::gauge!("tv_groww_ws_active"))
-            .set(if connected_episode { 1.0 } else { 0.0 });
+        if connected_episode || m_groww_active.is_some() {
+            m_groww_active
+                .get_or_insert_with(|| metrics::gauge!("tv_groww_ws_active"))
+                .set(if connected_episode { 1.0 } else { 0.0 });
+        }
         // Tick age: SKIP (never a fake 0 — the gauge is not even REGISTERED,
         // so the exporter renders nothing) until the first tick of the
         // session — missing data + the alarm's notBreaching stays silent.
@@ -3442,6 +3587,190 @@ mod tests {
             groww_status_is_live(now + GROWW_STATUS_LIVE_MAX_AGE_NANOS, now, 0),
             "small forward skew inside the window is tolerated"
         );
+    }
+
+    #[test]
+    fn test_sidecar_status_stamp_shares_the_ist_epoch_convention() {
+        // CROSS-LANGUAGE EPOCH RATCHET (2026-07-06 CRITICAL fix): the Rust
+        // freshness gate (`groww_status_is_live`) compares the sidecar's
+        // status write stamp against `receipt_ist_nanos()` = UTC epoch +
+        // 19,800s ("IST epoch"). The sidecar's `now_ist_nanos()` previously
+        // returned `datetime.now(tz=IST).timestamp()` — the PLAIN UTC epoch
+        // (`.timestamp()` on an aware datetime ignores the zone) — so every
+        // genuinely fresh record read ≈19,800s old, 165× the 120s window:
+        // the gate rejected ALL real status evidence forever, killing the
+        // boot-connect announcement and false-firing the groww-ws-inactive
+        // alarm every morning. Pin that `now_ist_nanos` uses the SAME
+        // `replace(tzinfo=timezone.utc)` trick as `ms_to_ist_nanos` (the
+        // verified IST-epoch producer for the tick lines), so both sides of
+        // the gate share one epoch.
+        let sidecar = include_str!("../../../scripts/groww-sidecar/groww_sidecar.py");
+        let def_at = sidecar
+            .find("def now_ist_nanos(")
+            .expect("sidecar must define now_ist_nanos");
+        let body_region = &sidecar[def_at..];
+        let body_end = body_region[1..]
+            .find("\ndef ")
+            .map_or(body_region.len(), |rel| rel + 1);
+        let body = &body_region[..body_end];
+        assert!(
+            body.contains("replace(tzinfo=timezone.utc)"),
+            "groww_sidecar.py: now_ist_nanos (the status-file write stamp) must use the \
+             replace(tzinfo=timezone.utc) IST-epoch trick — the same convention as \
+             ms_to_ist_nanos and the Rust receipt_ist_nanos — or the bridge's \
+             groww_status_is_live gate classifies every real status record as \
+             19,800s stale forever:\n{body}"
+        );
+        // A bare aware-datetime `.timestamp()` in the same body's CODE
+        // (outside the docstring + `#` comments) would reintroduce the
+        // UTC-epoch bug; the replace-trick line is the only allowed
+        // `.timestamp()` call site.
+        let mut in_docstring = false;
+        let bare_utc_calls = body
+            .lines()
+            .filter(|line| {
+                let t = line.trim_start();
+                let quotes = t.matches("\"\"\"").count();
+                if quotes == 1 {
+                    // A lone triple-quote toggles docstring state; the line
+                    // itself is docstring text either way.
+                    in_docstring = !in_docstring;
+                    return false;
+                }
+                if quotes >= 2 {
+                    return false; // one-line docstring
+                }
+                !in_docstring
+                    && !t.starts_with('#')
+                    && t.contains(".timestamp()")
+                    && !t.contains("replace(tzinfo=timezone.utc)")
+            })
+            .count();
+        assert_eq!(
+            bare_utc_calls, 0,
+            "groww_sidecar.py: now_ist_nanos must not call .timestamp() on a bare aware \
+             datetime in code (that returns the plain UTC epoch, not IST epoch)"
+        );
+    }
+
+    #[test]
+    fn test_capture_stamp_ist_nanos_trusted_stamp_only_no_fallback() {
+        // 2026-07-06 replayed-backlog fix: the liveness/recovery signal needs
+        // the TRUSTED per-message capture stamp ONLY — a missing stamp
+        // (old-format / reconcile-sweep row) must return None, never the
+        // always-fresh wake fallback (which would defeat the floor gate).
+        let wake = 2_000_000_000 * NANOS_PER_SECOND;
+        assert_eq!(capture_stamp_ist_nanos(None, wake), None);
+        // A plausible capture converts UTC → IST-nanos convention.
+        let capture_utc = wake - tickvault_common::constants::IST_UTC_OFFSET_NANOS - 5;
+        assert_eq!(
+            capture_stamp_ist_nanos(Some(capture_utc), wake),
+            Some(capture_utc.saturating_add(tickvault_common::constants::IST_UTC_OFFSET_NANOS)),
+        );
+        // Implausible stamps (degenerate ~1970 / far ahead of the wake clock)
+        // are rejected exactly like row_received_at_with_capture's gate.
+        assert_eq!(capture_stamp_ist_nanos(Some(0), wake), None);
+        let far_future_utc = wake; // + offset lands ~5.5h ahead of the wake
+        assert_eq!(capture_stamp_ist_nanos(Some(far_future_utc), wake), None);
+    }
+
+    #[test]
+    fn test_wake_had_fresh_capture_gates_on_floor_and_zero() {
+        let mut state = retail_fresh_state();
+        // No trusted capture this wake → never fresh, for ANY floor
+        // (including i64::MIN-ish floors — the > 0 guard).
+        state.wake_max_capture_ist_nanos = 0;
+        assert!(!state.wake_had_fresh_capture(0));
+        assert!(!state.wake_had_fresh_capture(i64::MIN));
+        // A capture at/after the floor is fresh; before the floor is not
+        // (the replayed pre-disable backlog class).
+        let floor = 2_000_000_000 * NANOS_PER_SECOND;
+        state.wake_max_capture_ist_nanos = floor;
+        assert!(state.wake_had_fresh_capture(floor), "at-floor counts");
+        state.wake_max_capture_ist_nanos = floor - 1;
+        assert!(
+            !state.wake_had_fresh_capture(floor),
+            "a pre-floor capture stamp is a replayed fossil — never liveness"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_drain_replayed_backlog_parses_but_never_reads_fresh() {
+        // THE 2026-07-06 false-recovery regression class, end-to-end through
+        // the REAL drain body: a disable→re-enable replay of pre-disable
+        // bytes (old capture_ns) must PERSIST (parsed_a_tick == true, zero
+        // loss) yet never count as fresh liveness evidence — while a line
+        // the sidecar captures AFTER the floor must latch.
+        let dir = retail_tmp_dir("fresh_capture_gate");
+        let tick_file = dir.join("live-ticks.ndjson");
+        let reg = tickvault_common::feed_health::FeedHealthRegistry::new();
+        let mut state = retail_fresh_state();
+
+        // The live floor, as the run loop would advance it on a disabled wake.
+        let floor = receipt_ist_nanos();
+        let old_capture_utc =
+            floor - tickvault_common::constants::IST_UTC_OFFSET_NANOS - 3_600 * NANOS_PER_SECOND;
+        let line_old = format!(
+            "{{\"security_id\":1001,\"segment\":\"NSE_EQ\",\"ts_ist_nanos\":{RETAIL_BASE_TS_NANOS},\"exchange_ts_millis\":{},\"ltp\":100.5,\"cum_volume\":10,\"capture_ns\":{old_capture_utc}}}\n",
+            RETAIL_BASE_TS_NANOS / 1_000_000
+        );
+        std::fs::write(&tick_file, &line_old).expect("seed pre-disable backlog line");
+        assert!(
+            state.drain_new_data(&tick_file, &reg).await,
+            "the replayed backlog line must still parse + persist (zero loss)"
+        );
+        assert!(
+            !state.wake_had_fresh_capture(floor),
+            "a pre-floor capture stamp must NOT read as fresh liveness — this is the \
+             false-FeedRecovered / pinned-gauge regression class"
+        );
+
+        // A line WITHOUT capture_ns (reconcile-sweep / old format) also never
+        // latches — only the status channel can prove those flows live.
+        {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&tick_file)
+                .expect("open append");
+            f.write_all(retail_line(1).as_bytes()).expect("append");
+        }
+        assert!(state.drain_new_data(&tick_file, &reg).await);
+        assert!(
+            !state.wake_had_fresh_capture(floor),
+            "a stamp-less line must not satisfy the freshness gate"
+        );
+
+        // A genuinely fresh capture (stamped after the floor) latches.
+        let fresh_capture_utc =
+            receipt_ist_nanos() - tickvault_common::constants::IST_UTC_OFFSET_NANOS;
+        let ts2 = RETAIL_BASE_TS_NANOS + 2 * NANOS_PER_SECOND;
+        let line_fresh = format!(
+            "{{\"security_id\":1002,\"segment\":\"NSE_EQ\",\"ts_ist_nanos\":{ts2},\"exchange_ts_millis\":{},\"ltp\":101.5,\"cum_volume\":11,\"capture_ns\":{fresh_capture_utc}}}\n",
+            ts2 / 1_000_000
+        );
+        {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&tick_file)
+                .expect("open append");
+            f.write_all(line_fresh.as_bytes()).expect("append fresh");
+        }
+        assert!(state.drain_new_data(&tick_file, &reg).await);
+        assert!(
+            state.wake_had_fresh_capture(floor),
+            "a capture stamped after the floor is the strongest liveness proof"
+        );
+
+        // The per-wake evidence resets: a quiet wake (nothing new) must not
+        // re-report the previous wake's freshness.
+        assert!(!state.drain_new_data(&tick_file, &reg).await);
+        assert!(
+            !state.wake_had_fresh_capture(floor),
+            "freshness is per-wake evidence — a quiet wake proves nothing"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

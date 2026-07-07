@@ -113,20 +113,28 @@ resource "aws_cloudwatch_metric_alarm" "order_update_ws_inactive" {
 
 # ---------------------------------------------------------------------------
 # 3b. Groww feed inactive (operator 2026-07-06 — Groww feed-down alerting).
-# `tv_groww_ws_active` is the CONNECTED-level 0/1 gauge published every ≤1s
-# ENABLED wake of the Groww bridge loop: 1 while the connected episode holds
-# (socket connected + subscribed OR streaming, backed by FRESH sidecar
-# status / tick evidence — a stale status file left by a killed or
-# prior-day sidecar can never read 1, so a sidecar dead at boot publishes 0
-# and this alarm fires). Connected-level (not streaming-level) so the
-# pre-open 08:30→first-tick window does not page every morning. NOT an
-# exact clone of order_update_ws_inactive: that gauge is set only AFTER a
-# successful connect; this one is registered lazily on the first ENABLED
-# wake (0 pre-connect while enabled — ~2min grace via the 60s×2 shape) and
-# stays UNREGISTERED (missing → notBreaching → silent) for a session where
-# Groww is never enabled, so a deliberate multi-day disable never pages
-# daily. A mid-session runtime disable sets 0 once (a real transition —
-# one ALARM, honest).
+# `tv_groww_ws_active` is the CONNECTED-level 0/1 gauge from the Groww
+# bridge loop: 1 while the connected episode holds (socket connected +
+# subscribed OR streaming, backed by FRESH sidecar status / tick evidence —
+# a stale status file left by a killed or prior-day sidecar, or a replayed
+# pre-disable tick backlog, can never read 1). Connected-level (not
+# streaming-level) so the pre-open subscribed→first-tick window does not
+# page every morning. REGISTRATION MATCHES THE ORDER-UPDATE PRECEDENT
+# (2026-07-06 boot-grace fix): the gauge is registered only at the FIRST
+# connected episode of the session — the Groww activation chain (CSV
+# pull-until-success → sidecar launch incl. possible venv re-provision →
+# SSM token → NATS connect → subscribe → notifier-slot fill) routinely
+# exceeds any fixed N×60s grace on cold/slow boots, so an honest 0 from the
+# first enabled wake produced a deterministic pre-open false ALARM/OK page
+# pair; MISSING + notBreaching stays silent for a boot chain of ANY length.
+# Once registered, 0/1 publishes every wake (and 0 on disabled wakes), so a
+# mid-session outage, a FAILED disable→re-enable (sidecar auth reject), and
+# a runtime disable all fire honestly. HONEST ENVELOPE: a sidecar DEAD AT
+# BOOT (never connects at all) leaves the metric missing and this alarm
+# silent — that class is paged by the sidecar supervisor's reject Telegrams
+# + the FEED-STALL-01 watchdog, not by this alarm. A session where Groww is
+# never enabled also stays missing, so a deliberate multi-day disable never
+# pages daily.
 # treat_missing_data = notBreaching: metric is missing whenever the box is
 # intentionally stopped (16:30 IST / weekends), during a deploy gap, or for
 # a Groww-disabled session — the same stuck-FIRING fix rationale as
@@ -134,7 +142,7 @@ resource "aws_cloudwatch_metric_alarm" "order_update_ws_inactive" {
 # ---------------------------------------------------------------------------
 resource "aws_cloudwatch_metric_alarm" "groww_ws_inactive" {
   alarm_name          = "tv-${var.environment}-groww-ws-inactive"
-  alarm_description   = "Groww feed is not connected/streaming. Groww prices are not flowing. If the feed was deliberately switched off, re-enable it from the feeds page; otherwise recovery is automatic — investigate if this stays firing."
+  alarm_description   = "Groww feed lost its connection after being up this session. Groww prices are not flowing. If the feed was deliberately switched off, re-enable it from the feeds page; otherwise recovery is automatic — investigate if this stays firing. (A sidecar that never connected at boot is paged by the Groww reject alerts, not this alarm.)"
   comparison_operator = "LessThanThreshold"
   evaluation_periods  = 2
   metric_name         = "tv_groww_ws_active"
