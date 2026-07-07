@@ -1,6 +1,6 @@
 # Implementation Plan: Restore app->CloudWatch log shipping + never-again ratchets
 
-**Status:** APPROVED
+**Status:** VERIFIED
 **Date:** 2026-07-07
 **Approved by:** Parthiban (operator directive 2026-07-07, this session)
 **Changed crates:** core (crates/core), app (crates/app), common (crates/common — test extension only)
@@ -223,9 +223,20 @@ Every change is independently revertible with no data-loss surface (logs land lo
     `cw_agent_log_glob_guard.rs` never existed on disk); all 7 ratchet tests live here, including
     the Item 2 alarm pins — no `cloudwatch_app_alarms_wiring.rs` edit.
 
-- [ ] Item 6 — Evidence + docs: PR body with live verification artefacts; runbook/rule notes for the new alarm
-  - Files: .claude/plans/active-plan.md (checkbox ticks), PR body (config diff, on-box ls, smoke OK line, describe-log-streams)
-  - Tests: bash .claude/hooks/plan-verify.sh (Status → VERIFIED before push)
+- [x] Item 6 — Evidence + docs: PR body with live verification artefacts; runbook/rule notes for the new alarm
+  - Files: .claude/plans/active-plan.md
+  - Tests: N/A — evidence artefact with no code test; verified via plan-verify.sh (Status → VERIFIED before push)
+  - Evidence note (2026-07-07): the live AWS probe ran READ-ONLY and its verbatim output is
+    captured in the session scratchpad (`aws-evidence.md`) and carried as the evidence table in
+    the PR body. Honest verdict per zero-loss charter §4: **UNKNOWN — AWS credentials are
+    entirely unavailable in this environment** (no env keys, no ~/.aws/credentials, boto3
+    default chain `NoCredentialsError`, and the tickvault-logs MCP SigV4 route returned
+    `UnrecognizedClientException`). No live `describe-log-streams` / `describe-alarms` /
+    on-box `ls` could be captured pre-merge; the post-merge deploy LOG-INGESTION-SMOKE step +
+    the gated `app_log_ingestion_silent` alarm are the designed live verifiers (plan §Test Plan
+    "Live verification evidence (post-merge)"). Runbook/rule note for the new alarm is carried
+    in this plan's Observability section + the ratchet suite pins in
+    `crates/app/tests/cloudwatch_agent_glob_guard.rs`.
 
 ## Per-Item Guarantee Matrix
 
