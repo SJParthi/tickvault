@@ -387,6 +387,7 @@ fn test_feed_down_and_recovered_message_coverage() {
         feed: "Groww".to_string(),
         reason: "RSN-FEEDDOWN-901".to_string(),
         market_open: true,
+        operator_initiated: false,
     });
     assert!(
         m.contains("RSN-FEEDDOWN-901") && m.contains("will not flow"),
@@ -397,9 +398,36 @@ fn test_feed_down_and_recovered_message_coverage() {
         feed: "Groww".to_string(),
         reason: "RSN-FEEDDOWN-902".to_string(),
         market_open: false,
+        operator_initiated: false,
     });
     assert!(
         m.contains("RSN-FEEDDOWN-902") && m.contains("idle is normal"),
+        "{m}"
+    );
+
+    // Operator-initiated forms (2026-07-06 fix): the body names the
+    // re-enable action instead of a false auto-retry claim.
+    let m = render(&NotificationEvent::FeedDown {
+        feed: "Groww".to_string(),
+        reason: "RSN-FEEDDOWN-903".to_string(),
+        market_open: true,
+        operator_initiated: true,
+    });
+    assert!(
+        m.contains("RSN-FEEDDOWN-903") && m.contains("re-enable it from the feeds page"),
+        "{m}"
+    );
+
+    let m = render(&NotificationEvent::FeedDown {
+        feed: "Groww".to_string(),
+        reason: "RSN-FEEDDOWN-904".to_string(),
+        market_open: false,
+        operator_initiated: true,
+    });
+    assert!(
+        m.contains("RSN-FEEDDOWN-904")
+            && m.contains("idle is normal")
+            && m.contains("re-enable it from the feeds page"),
         "{m}"
     );
 

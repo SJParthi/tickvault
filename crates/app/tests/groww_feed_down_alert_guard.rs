@@ -174,6 +174,46 @@ fn test_gauges_published_from_bridge_loop() {
 }
 
 #[test]
+fn test_status_file_evidence_is_freshness_gated() {
+    // 2026-07-06 stale-status false-OK fix: the sidecar NEVER deletes its
+    // status file (a killed child freezes it at its last "streaming" write;
+    // EBS persists it across the daily stop/start), so the bridge MUST gate
+    // every status-file read through the pure freshness classifier before
+    // treating it as evidence. Without the gate: a disable→re-enable cycle
+    // fired a false "✅ Prices are flowing" FeedRecovered off the pre-disable
+    // fossil, and a sidecar dead at boot read yesterday's file as today's
+    // proof — pinning tv_groww_ws_active at 1 all session and blinding the
+    // groww-ws-inactive alarm (the exact silent-outage class this feature
+    // exists to close).
+    let src = read_repo_file("src/groww_bridge.rs");
+    let prod = production_region(&src);
+    let windows = marker_windows(prod, "read_status_file(&status_file_path)", 2, 12);
+    assert!(
+        !windows.is_empty(),
+        "groww_bridge.rs: expected the status-file read in the production region"
+    );
+    for (n, region) in windows.iter().enumerate() {
+        assert!(
+            region.contains("groww_status_is_live"),
+            "groww_bridge.rs: status-file read #{n} must gate on groww_status_is_live \
+             (a stale record must be treated exactly like an absent file):\n{region}"
+        );
+    }
+    // The disable arm must advance the live floor so a post-re-enable read
+    // can never accept a pre-disable fossil as fresh.
+    let disable_windows = marker_windows(prod, "\"feed_disabled\"", 12, 60);
+    assert!(!disable_windows.is_empty());
+    for (n, region) in disable_windows.iter().enumerate() {
+        assert!(
+            region.contains("status_live_floor_ist_nanos = receipt_ist_nanos()"),
+            "groww_bridge.rs: the disable arm #{n} must advance the stale-status \
+             live floor (status_live_floor_ist_nanos = receipt_ist_nanos()) so a \
+             re-enable can never latch off the pre-disable frozen status file"
+        );
+    }
+}
+
+#[test]
 fn test_cw_agent_selector_ships_the_new_metrics() {
     // The LIVE cw-agent copy (shipped on every deploy). The
     // terraform/user-data lockstep twin is pinned by

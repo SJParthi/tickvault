@@ -758,6 +758,16 @@ pub enum NotificationEvent {
         /// Whether the market was open at the falling edge — drives severity
         /// (High in-market, Low off-hours) and the message register.
         market_open: bool,
+        /// `true` when the feed was DELIBERATELY switched off (the runtime
+        /// feed toggle) — the body then says it stays OFF until re-enabled
+        /// from the feeds page. `false` for involuntary falling edges
+        /// (bridge death / internal restart) where the auto-retry trailer is
+        /// honest. Without this split the operator-disable page falsely
+        /// claimed "the system keeps retrying automatically" — a disabled
+        /// feed is NEVER retried, so the message actively delayed the one
+        /// action (re-enable) that fixes it (2026-07-06 fix, Telegram
+        /// commandment 7 + audit Rule 11).
+        operator_initiated: bool,
     },
 
     /// A previously-DOWN market-data feed is STREAMING again (operator
@@ -1891,27 +1901,42 @@ impl NotificationEvent {
                 feed,
                 reason,
                 market_open,
+                operator_initiated,
             } => {
                 // `reason` is a fixed plain-English literal at every emit
                 // site (never raw child text / URLs), but html_escape it
                 // anyway for defense-in-depth, consistent with every String
-                // arm. The trailer clones the hostile-review-passed
-                // GrowwSidecarRejected honesty wording: state what will NOT
-                // flow + that retry is automatic (no operator action baked
-                // into the off-hours form — idle is normal).
+                // arm. The trailer BRANCHES on `operator_initiated`
+                // (2026-07-06 fix): a deliberately switched-off feed is
+                // NEVER retried, so the auto-retry reassurance would be a
+                // false signal that delays the one action (re-enable) that
+                // fixes it — the operator-disable form names that action
+                // instead (Telegram commandment 7). The involuntary form
+                // keeps the hostile-review-passed GrowwSidecarRejected
+                // honesty wording: state what will NOT flow + that retry is
+                // automatic.
                 let feed_name = html_escape(feed);
                 let reason = html_escape(reason);
-                if *market_open {
-                    format!(
+                match (*market_open, *operator_initiated) {
+                    (true, true) => format!(
+                        "🆘 <b>{feed_name} feed is DOWN</b>\n{reason}\n\n\
+                         Prices from {feed_name} will not flow while it is switched off. \
+                         It stays OFF until you re-enable it from the feeds page."
+                    ),
+                    (true, false) => format!(
                         "🆘 <b>{feed_name} feed is DOWN</b>\n{reason}\n\n\
                          Prices from {feed_name} will not flow until it recovers. \
                          The system keeps retrying automatically — no restart needed."
-                    )
-                } else {
-                    format!(
+                    ),
+                    (false, true) => format!(
+                        "⚠️ <b>{feed_name} feed is down [off-hours]</b>\n{reason}\n\
+                         It stays off until you re-enable it from the feeds page — \
+                         idle is normal until then."
+                    ),
+                    (false, false) => format!(
                         "⚠️ <b>{feed_name} feed is down [off-hours]</b>\n{reason}\n\
                          Reconnect is automatic — idle is normal until market open."
-                    )
+                    ),
                 }
             }
             Self::FeedRecovered { feed, down_secs } => {
@@ -2812,6 +2837,7 @@ mod tests {
             feed: "Groww".to_string(),
             reason: "feed switched off by the operator".to_string(),
             market_open: true,
+            operator_initiated: true,
         };
         assert_eq!(ev.severity(), Severity::High);
     }
@@ -2826,6 +2852,7 @@ mod tests {
             feed: "Groww".to_string(),
             reason: "feed switched off by the operator".to_string(),
             market_open: false,
+            operator_initiated: true,
         };
         assert_eq!(ev.severity(), Severity::Low);
     }
@@ -2848,6 +2875,7 @@ mod tests {
             feed: "Groww".to_string(),
             reason: "internal restart — recovering automatically".to_string(),
             market_open: true,
+            operator_initiated: false,
         };
         let msg = ev.to_message();
         assert!(
@@ -2876,11 +2904,52 @@ mod tests {
             feed: "Groww".to_string(),
             reason: "feed switched off by the operator".to_string(),
             market_open: false,
+            operator_initiated: true,
         };
         let off_msg = off.to_message();
         assert!(
             off_msg.contains("off-hours") && off_msg.contains("idle is normal"),
             "off-hours body must say off-hours + idle is normal: {off_msg}"
+        );
+    }
+
+    #[test]
+    fn test_feed_down_operator_disable_body_names_the_action_not_auto_retry() {
+        // Regression pin (2026-07-06 fix): a DELIBERATE runtime disable is
+        // never retried by the system — the body must name the ONE action
+        // that fixes it (re-enable from the feeds page) and must NOT claim
+        // automatic retry/reconnect (Telegram commandment 7; a false
+        // auto-retry promise actively delays recovery — audit Rule 11).
+        let ev = NotificationEvent::FeedDown {
+            feed: "Groww".to_string(),
+            reason: "feed switched off by the operator".to_string(),
+            market_open: true,
+            operator_initiated: true,
+        };
+        let msg = ev.to_message();
+        assert!(
+            msg.contains("re-enable it from the feeds page"),
+            "operator-disable body must name the re-enable action: {msg}"
+        );
+        assert!(
+            !msg.contains("retrying automatically") && !msg.contains("Reconnect is automatic"),
+            "operator-disable body must NOT claim automatic retry: {msg}"
+        );
+        // Off-hours form of the same deliberate disable: same rule.
+        let off = NotificationEvent::FeedDown {
+            feed: "Groww".to_string(),
+            reason: "feed switched off by the operator".to_string(),
+            market_open: false,
+            operator_initiated: true,
+        };
+        let off_msg = off.to_message();
+        assert!(
+            off_msg.contains("re-enable it from the feeds page"),
+            "off-hours operator-disable body must name the re-enable action: {off_msg}"
+        );
+        assert!(
+            !off_msg.contains("Reconnect is automatic"),
+            "off-hours operator-disable body must NOT claim automatic reconnect: {off_msg}"
         );
     }
 
@@ -2893,6 +2962,7 @@ mod tests {
             feed: "Groww".to_string(),
             reason: "<script>".to_string(),
             market_open: true,
+            operator_initiated: false,
         };
         let msg = ev.to_message();
         assert!(!msg.contains("<script>"), "raw HTML not escaped: {msg}");
@@ -2928,6 +2998,7 @@ mod tests {
             feed: "Groww".to_string(),
             reason: "x".to_string(),
             market_open: true,
+            operator_initiated: false,
         };
         let rec = NotificationEvent::FeedRecovered {
             feed: "Groww".to_string(),
