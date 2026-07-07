@@ -125,15 +125,31 @@ if [ "$STATE" = "running" ]; then
   note_ok "EC2 instance running"
 elif [ "$STATE" = "stopped" ]; then
   if is_box_up_window; then
-    # The box should be RUNNING for the whole 08:30-16:30 IST window. Stopped
-    # here = the 08:30 EventBridge start failed. Diagnose WHICH layer broke,
-    # then self-start (the diagnostic only reports; it never starts the box).
-    echo "  instance stopped DURING up-window (08:30-16:30 IST) — diagnosing + starting it"
-    diagnose_eventbridge_start
-    if aws ec2 start-instances --region "$REGION" --instance-ids "$INSTANCE_ID" >/dev/null 2>&1; then
-      note_heal "started EC2 instance (was stopped during the 08:30-16:30 IST up-window)"
+    # NSE-holiday intentional stop (2026-07-07 round-3 review fix):
+    # deploy/aws/holiday-gate.sh self-stops the box at boot on a weekday NSE
+    # holiday and stamps today's IST date into this SSM param. Before this
+    # check, autopilot's holiday-blind up-window self-start re-booted the
+    # stopped box every 15 min all holiday — a boot/stop war whose 1-3 min
+    # up-bursts can bracket the 09:20 IST market-hours alarm-gate sample and
+    # restore the holiday false page. Marker == today => the stop is
+    # intentional; leave the box alone. FAIL-OPEN: a missing/stale/unreadable
+    # marker keeps the self-start (a real trading day never loses the heal).
+    HOLIDAY_MARKER=$(aws ssm get-parameter --region "$REGION" \
+      --name "/tickvault/${ENVIRONMENT}/holiday-stop-date" \
+      --query 'Parameter.Value' --output text 2>/dev/null || echo "")
+    if [ -n "$HOLIDAY_MARKER" ] && [ "$HOLIDAY_MARKER" = "$(TZ='Asia/Kolkata' date +%F)" ]; then
+      note_ok "EC2 instance stopped (expected — NSE-holiday self-stop marker for today)"
     else
-      note_issue "EC2 instance stopped during up-window and start-instances failed"
+      # The box should be RUNNING for the whole 08:30-16:30 IST window. Stopped
+      # here = the 08:30 EventBridge start failed. Diagnose WHICH layer broke,
+      # then self-start (the diagnostic only reports; it never starts the box).
+      echo "  instance stopped DURING up-window (08:30-16:30 IST) — diagnosing + starting it"
+      diagnose_eventbridge_start
+      if aws ec2 start-instances --region "$REGION" --instance-ids "$INSTANCE_ID" >/dev/null 2>&1; then
+        note_heal "started EC2 instance (was stopped during the 08:30-16:30 IST up-window)"
+      else
+        note_issue "EC2 instance stopped during up-window and start-instances failed"
+      fi
     fi
   else
     note_ok "EC2 instance stopped (expected — outside the 08:30-16:30 IST up-window)"

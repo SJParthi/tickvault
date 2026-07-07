@@ -140,6 +140,18 @@ resource "aws_iam_role_policy" "github_deploy" {
         Resource = "arn:aws:ssm:${var.aws_region}:*:parameter/tickvault/${var.environment}/deploy/binary-git-sha"
       },
       {
+        # NSE-holiday intentional-stop marker (2026-07-07 round-3 review
+        # fix): aws-autopilot.sh reads /tickvault/<env>/holiday-stop-date
+        # (stamped by deploy/aws/holiday-gate.sh before its holiday
+        # self-stop) so its every-15-min up-window self-start never fights
+        # the intentional holiday stop — the pre-fix boot/stop war could
+        # bracket the 09:20 IST alarm-gate sample and restore the holiday
+        # false page. Read-only, scoped to exactly that one parameter.
+        Effect   = "Allow"
+        Action   = ["ssm:GetParameter"]
+        Resource = "arn:aws:ssm:${var.aws_region}:*:parameter/tickvault/${var.environment}/holiday-stop-date"
+      },
+      {
         # LOG-INGESTION-SMOKE (deploy-aws.yml): after the verified swap, the
         # workflow polls filter-log-events on the app log group to prove the
         # CloudWatch agent is actually shipping fresh log events (incident

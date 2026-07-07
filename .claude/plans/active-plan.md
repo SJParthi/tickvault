@@ -78,16 +78,27 @@ zero app log events reach `/tickvault/prod/app` — app healthy, shipper dead-ta
 - **Nightly 16:30 IST stop / weekends:** box off ⇒ metric missing ⇒ alarm state ALARM, but
   `actions_enabled=false` outside the 09:20–15:35 gate window and the gate's open-time OK reset
   mean it can never page out of window.
-- **Weekday NSE holidays (round-1 review fix — the original premise here was FALSE):** the box does
-  NOT run on weekday NSE holidays — `deploy/aws/holiday-gate.sh` self-stops the instance at boot
-  (~08:32 IST) on a definitive holiday verdict, while the gate Lambda's open cron is a holiday-blind
-  plain MON-FRI schedule. A blind 09:20 enable + OK reset would therefore drive both
-  breaching-on-missing gated alarms (`market_hours_liveness_missing` ~09:25,
-  `app_log_ingestion_silent` ~09:35) OK→ALARM against an intentionally-stopped box every weekday
-  holiday. Fix: the gate Lambda's `open` mode now verifies the tv-app instance is up
-  (`ec2:DescribeInstances`, `EC2_INSTANCE_ID` env — the cycle-free start-watchdog pattern) before
-  enabling; not-up ⇒ actions stay disabled, no OK reset. FAIL-OPEN on any EC2 API error so a real
-  trading day never loses the liveness page. Ratchet: `test_gate_lambda_open_is_holiday_safe`.
+- **Weekday NSE holidays (round-1 fix, HARDENED by round-3 — the round-1 premise "the box does NOT
+  run on weekday NSE holidays" was itself incomplete):** `deploy/aws/holiday-gate.sh` self-stops the
+  instance at boot (~08:32 IST) on a definitive holiday verdict, while the gate Lambda's open cron is
+  a holiday-blind plain MON-FRI schedule — a blind 09:20 enable + OK reset would false-page both
+  breaching-on-missing gated alarms (~09:25 / ~09:35 IST) every weekday holiday. Round-1 fix: the
+  gate Lambda's `open` mode verifies the tv-app instance is up (`ec2:DescribeInstances`, fail-open)
+  before enabling. Round-3 finding (Verified): that single 09:20 sample was RACY — the box did NOT
+  stay stopped on holidays, because two pre-existing holiday-blind self-healers kept restarting it
+  all day (start-watchdog `mode=check` 08:45 IST self-start; aws-autopilot `start-instances` every
+  15 min inside its 08:30-16:30 IST up-window, incl. the 03:45 UTC ≈ 09:15 IST slot + GH cron
+  jitter), each boot re-stopped by holiday-gate ~2-3 min later — 1-3 min up-bursts that can bracket
+  the 09:20 sample and restore the false page (plus a pre-existing false Critical "auto-start
+  FAILED" page from the 08:45 watchdog every holiday). Round-3 fix: holiday-gate.sh stamps today's
+  IST date into the `/tickvault/<env>/holiday-stop-date` SSM marker BEFORE its stop; both restarters
+  consult it and skip their self-start (the restart war ends at the source), and the gate Lambda's
+  `open` checks the marker FIRST (race-proof) with the instance-state sample as the second line for
+  marker-less manual stops. FAIL-OPEN everywhere (missing/stale/unreadable marker = trading day) so
+  a real trading day never loses the page or the 08:45 rescue. Honest residual: marker-put failure
+  AND a raced sample together can still false-page — bounded to that double-failure. Ratchets:
+  `test_gate_lambda_open_is_holiday_safe`, `test_gate_lambda_open_checks_holiday_marker_first`,
+  `test_holiday_stop_marker_chain_is_wired` + 3 watchdog pytest cases.
 - **Mid-day deploy:** fetch-config agent restart (~1-2 min) + app restart/WAL replay are inside the
   15-min window.
 - **Pre-auth boot window:** gauge skip-on-None preserved — never emits 0 (would false-fire

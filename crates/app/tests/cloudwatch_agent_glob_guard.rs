@@ -30,6 +30,16 @@
 //!     breaching-on-missing gated alarms (~09:25 / ~09:35 IST) every
 //!     weekday holiday. The open path must verify the instance is up
 //!     (ec2:DescribeInstances, fail-open) before enabling.
+//!  8. Any link of the holiday-stop MARKER chain breaks (2026-07-07 round-3
+//!     review fix): the round-1 single instance-state sample was RACY —
+//!     two holiday-blind self-healers (start-watchdog 08:45 IST check,
+//!     aws-autopilot every 15 min) kept restarting the holiday-stopped box
+//!     all day, and a 1-3 min up-burst bracketing the 09:20 sample restored
+//!     the false page. holiday-gate.sh now stamps today's IST date into the
+//!     /tickvault/<env>/holiday-stop-date SSM param BEFORE its stop; both
+//!     restarters skip their self-start on marker == today (the war ends at
+//!     the source), and the gate Lambda checks the marker FIRST (race-proof)
+//!     with the instance-state sample as the second line.
 
 #![cfg(test)]
 
@@ -371,6 +381,165 @@ fn test_gate_lambda_open_is_holiday_safe() {
         guard_pos < enable_pos,
         "the instance-up guard must run BEFORE enable_alarm_actions — enabling \
          first re-opens the holiday false-page window"
+    );
+}
+
+/// Round-3 review fix (2026-07-07): the round-1 single 09:20 IST
+/// instance-state sample is RACY — holiday-blind restarters (start-watchdog
+/// 08:45 self-start + aws-autopilot every 15 min, incl. the 03:45 UTC ≈
+/// 09:15 IST slot + GH cron jitter) fight holiday-gate.sh's self-stop all
+/// day, and a 1-3 min up-burst bracketing the 09:20 sample re-arms the
+/// breaching-on-missing alarms → the exact holiday false page. The gate
+/// Lambda's open path must therefore consult the race-proof
+/// holiday-stop-date SSM marker (stamped by holiday-gate.sh BEFORE its
+/// stop) FIRST, with the instance-state sample as the second line for the
+/// marker-less manual-stop case, and must fail OPEN on any SSM error.
+#[test]
+fn test_gate_lambda_open_checks_holiday_marker_first() {
+    let tf = read("deploy/aws/terraform/market-hours-liveness-alarm.tf");
+    let norm = normalized(&tf);
+    for (pin, why) in [
+        (
+            "HOLIDAY_STOP_PARAM = \"/tickvault/${var.environment}/holiday-stop-date\"",
+            "the gate Lambda must be told WHERE holiday-gate.sh stamps the \
+             intentional-stop marker",
+        ),
+        (
+            "ssm.get_parameter(Name=HOLIDAY_STOP_PARAM)",
+            "the open path must READ the marker — marker == today is the only \
+             race-proof 'intentionally stopped today' signal",
+        ),
+        (
+            "fail-open, not a holiday",
+            "an SSM error / missing marker must NEVER suppress the trading-day \
+             liveness page — the marker check fails open",
+        ),
+        (
+            "parameter/tickvault/${var.environment}/holiday-stop-date",
+            "the gate role must carry the ssm:GetParameter grant on the marker \
+             param or every open throws AccessDenied and the fail-open arm \
+             silently degrades back to the racy instance-state-only check",
+        ),
+    ] {
+        assert!(
+            norm.contains(pin),
+            "market-hours-liveness-alarm.tf lost the round-3 marker pin `{pin}` — {why}. \
+             Regressing this restores the raced holiday false page (restart-war \
+             up-burst bracketing the single 09:20 instance-state sample)."
+        );
+    }
+    // Source order: marker check BEFORE the instance-up guard BEFORE enable.
+    let marker_pos = tf
+        .find("if holiday_stop_is_today():")
+        .expect("gate Lambda open path must carry the holiday-marker guard arm"); // APPROVED: test
+    let up_guard_pos = tf
+        .find("if not up:")
+        .expect("gate Lambda must keep the round-1 instance-up guard arm"); // APPROVED: test
+    let enable_pos = tf
+        .find("cw.enable_alarm_actions(AlarmNames=ALARM_NAMES)")
+        .expect("gate Lambda must still enable alarm actions on open"); // APPROVED: test
+    assert!(
+        marker_pos < up_guard_pos && up_guard_pos < enable_pos,
+        "gate Lambda open ordering must be marker-check -> instance-up-check -> \
+         enable; the marker is race-proof, the instance sample is not — \
+         checking the sample first (or enabling first) re-opens the raced \
+         holiday false-page window"
+    );
+}
+
+/// Round-3 review fix (2026-07-07): the holiday-stop marker chain. Every
+/// link must survive — losing ANY one restores the holiday restart war:
+///   writer:   holiday-gate.sh stamps the marker BEFORE stop-instances
+///   reader 1: start-watchdog mode=check skips self-start on marker==today
+///             (also kills the pre-existing false Critical "auto-start
+///             FAILED" page every weekday holiday)
+///   reader 2: aws-autopilot.sh skips its up-window self-start on
+///             marker==today
+///   IAM:      start-watchdog role + the GitHub OIDC deploy role (autopilot)
+///             can ssm:GetParameter the marker param
+#[test]
+fn test_holiday_stop_marker_chain_is_wired() {
+    // --- writer: holiday-gate.sh, marker put BEFORE the stop ---------------
+    let gate = read("deploy/aws/holiday-gate.sh");
+    assert!(
+        gate.contains("holiday-stop-date"),
+        "holiday-gate.sh lost the holiday-stop-date marker write — the \
+         intentional stop leaves no trace and the holiday-blind restarters \
+         (start-watchdog + aws-autopilot) fight it all day"
+    );
+    let put_pos = gate
+        .find("ssm put-parameter")
+        .expect("holiday-gate.sh must write the marker via `aws ssm put-parameter`"); // APPROVED: test
+    let stop_pos = gate
+        .find("ec2 stop-instances")
+        .expect("holiday-gate.sh must still stop the instance on a holiday verdict"); // APPROVED: test
+    assert!(
+        put_pos < stop_pos,
+        "holiday-gate.sh must stamp the marker BEFORE stop-instances — writing \
+         after (or never) leaves a window where every restarter + the 09:20 \
+         gate sample sees an unexplained stop"
+    );
+
+    // --- reader 1: start-watchdog handler.py -------------------------------
+    let watchdog = read("deploy/aws/lambda/start-watchdog/handler.py");
+    for pin in [
+        "HOLIDAY_STOP_PARAM",
+        "def _holiday_stop_is_today(",
+        "\"skipped\": \"holiday_stop\"",
+    ] {
+        assert!(
+            watchdog.contains(pin),
+            "start-watchdog handler.py lost `{pin}` — the 08:45 IST check will \
+             again self-start the holiday-stopped box AND false-page a Critical \
+             'auto-start FAILED' every weekday NSE holiday"
+        );
+    }
+    let marker_call = watchdog
+        .find("if _holiday_stop_is_today(_now()):")
+        .expect("check mode must consult the marker in its not-running branch"); // APPROVED: test
+    let self_start_call = watchdog
+        .find("self_started = _try_self_start(ec2_client, EC2_INSTANCE_ID)")
+        .expect("check mode must keep its self-heal start for real trading days"); // APPROVED: test
+    assert!(
+        marker_call < self_start_call,
+        "the marker consult must come BEFORE the self-heal start in mode=check \
+         — starting first rejoins the holiday restart war"
+    );
+
+    // --- reader 2: aws-autopilot.sh ----------------------------------------
+    let autopilot = read("scripts/aws-autopilot.sh");
+    let ap_marker = autopilot
+        .find("holiday-stop-date")
+        .expect("aws-autopilot.sh must read the holiday-stop-date marker"); // APPROVED: test
+    let ap_start = autopilot
+        .find("started EC2 instance (was stopped during the 08:30-16:30 IST up-window)")
+        .expect("aws-autopilot.sh must keep its up-window self-start for real trading days"); // APPROVED: test
+    assert!(
+        ap_marker < ap_start,
+        "autopilot must check the marker BEFORE its up-window start-instances — \
+         its 15-min cadence (03:45 UTC slot ≈ 09:15 IST + GH cron jitter) is \
+         exactly the restarter that bracketed the 09:20 gate sample"
+    );
+
+    // --- IAM: both reader roles can GetParameter the marker ----------------
+    let watchdog_tf = normalized(&read("deploy/aws/terraform/start-watchdog-lambda.tf"));
+    assert!(
+        watchdog_tf.contains("parameter/tickvault/${var.environment}/holiday-stop-date"),
+        "start-watchdog-lambda.tf lost the marker ssm:GetParameter grant — the \
+         fail-open marker read silently degrades and the 08:45 self-start \
+         (+ false Critical page) returns every holiday"
+    );
+    assert!(
+        watchdog_tf
+            .contains("HOLIDAY_STOP_PARAM = \"/tickvault/${var.environment}/holiday-stop-date\""),
+        "start-watchdog-lambda.tf lost the HOLIDAY_STOP_PARAM env var"
+    );
+    let oidc = normalized(&read("deploy/aws/terraform/oidc.tf"));
+    assert!(
+        oidc.contains("parameter/tickvault/${var.environment}/holiday-stop-date"),
+        "oidc.tf lost the marker ssm:GetParameter grant — autopilot's marker \
+         read AccessDenies, fails open, and its 15-min self-start rejoins the \
+         holiday restart war"
     );
 }
 
