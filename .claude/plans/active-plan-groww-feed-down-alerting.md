@@ -269,6 +269,12 @@ boot-connect rising edge at ~2374). Fix (crates: **tickvault-core** +
 - Scoped runs: `cargo test -p tickvault-core`, `-p tickvault-app`,
   `-p tickvault-storage` (new guard), `cargo fmt --check`, scoped clippy,
   banned-pattern scanner.
+- Gate-run note (2026-07-07): 3 PRE-EXISTING clippy `-D warnings` blockers
+  (unrelated to this feature; present at the merge-base) were fixed on this
+  branch as separate PLAN-EXEMPT ≤1-file commits so the scoped clippy gate is
+  green: `scale_test_preflight.rs` must_use bind, `main.rs`
+  `unnecessary_map_or` → `is_none_or` + APPROVED arity allow (house pattern),
+  `muhurat.rs` must_use bind. No logic change in any of the three.
 
 ## Rollback
 
