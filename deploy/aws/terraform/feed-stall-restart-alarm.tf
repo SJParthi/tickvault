@@ -27,18 +27,28 @@
 # ever proved CUMULATIVE, Sum overcounts and pages too eagerly (fail-loud,
 # never a silent miss) and this alarm must be reworked to DIFF(Maximum).
 #
-# FIRST-SAMPLE BASELINE (round-4 review fix, 2026-07-06): the delta pipeline
-# DROPS each counter series' first observed sample as its baseline. The
-# restart counter is therefore PRE-REGISTERED at 0 at supervisor spawn
-# (run_groww_sidecar_supervisor, mirror of order_update_connection.rs:86 —
-# ratcheted by test_stall_restart_counter_is_preregistered_before_supervise_loop)
-# so the dropped first sample is the harmless 0 baseline. Without that
-# registration the series was BORN at the first restart (value 1) and the
-# dropped sample WAS restart #1 — the first stall episode of every app
-# session (the box restarts daily) ran at an effective threshold of 4, not
-# the documented 3, and "sees every restart" was false. Registration makes
-# the series DENSE while the app runs (a 0-delta event per 60s scrape) —
-# harmless to Sum, and the alarm no longer depends on metric sparseness.
+# FIRST-SAMPLE BASELINE (round-5 review fix, 2026-07-06 — supersedes the
+# VOID round-4 supervisor-spawn registration): the delta pipeline DROPS each
+# counter series' first observed sample as its baseline. The restart counter
+# is therefore PRE-REGISTERED at 0 in main.rs immediately AFTER the metrics
+# recorder installs (boot Step 2, right next to prewarm_dispatcher_counters —
+# ratcheted by test_stall_restart_counter_is_preregistered_after_recorder_install,
+# a source-order scan of main.rs) so the dropped first sample is the harmless
+# 0 baseline. Without a post-install registration the series was BORN at the
+# first restart (value 1) and the dropped sample WAS restart #1 — the first
+# stall episode of every app session (the box restarts daily) ran at an
+# effective threshold of 4, not the documented 3, and "sees every restart"
+# was false. Round-4 had placed the registration at the TOP of the sidecar
+# supervisor task — but that task is spawned BEFORE the recorder install, so
+# its handle resolved to the no-op recorder and registered NOTHING (the
+# order_update_connection.rs task-start analogy does not transfer: that task
+# starts post-auth, long after the install). The post-install registration
+# makes the series DENSE while the app runs (a 0-delta event per 60s scrape)
+# — harmless to Sum, and the alarm no longer depends on metric sparseness.
+# Honest residual: a stall-restart inside the pre-install boot window
+# (supervisor spawn → Step 2) increments a no-op handle and is uncounted —
+# physically implausible (needs sidecar launch + a recorded tick + >30s feed
+# silence within the boot prefix).
 #
 # FEED LABEL: the Prometheus series carries feed="groww"; the JSON event
 # carries it as a field. The filter matches on the metric field only and
@@ -84,16 +94,17 @@ resource "aws_cloudwatch_log_metric_filter" "feed_stall_restarts_fallback" {
       host = "$.host" # /metrics events DO carry host (prometheus scrape label)
     }
     # Deliberately no default_value (that knob emits datapoints for
-    # NON-matching events — never wanted). Note: since the round-4 spawn-time
-    # registration the counter is DENSE while the app runs (a 0-delta event
-    # per 60s scrape), so this metric bills during uptime hours; the 0s sum
-    # harmlessly into the alarm window.
+    # NON-matching events — never wanted). Note: since the round-5
+    # post-recorder-install registration in main.rs (boot Step 2) the
+    # counter is DENSE while the app runs (a 0-delta event per 60s scrape),
+    # so this metric bills during uptime hours; the 0s sum harmlessly into
+    # the alarm window.
   }
 }
 
 resource "aws_cloudwatch_metric_alarm" "feed_stall_restarts" {
   alarm_name          = "tv-${var.environment}-feed-stall-restarts"
-  alarm_description   = "FEED-STALL-01 flap: >=3 Groww sidecar stall-restarts within one 15-min window (Sum of the agent's per-scrape deltas of tv_feed_sidecar_stall_restart_total - the counter increments once per restart, warn!- and error!-level alike, and is pre-registered at 0 at supervisor spawn so the delta pipeline's dropped first sample is the 0 baseline, not restart #1 - THIS pager therefore sees every restart incl. the session's first; the errcode-feed-stall-01 alarm sees only the sidecar's own >5-per-5-min STORM escalation ERROR lines). A single self-heal restart never pages. Honest floor: flap cycles slower than ~5 min (<3 restarts per aligned 15-min window) do not page - stated residual. The provider keeps closing the socket - check credential/entitlement. Runbook: .claude/rules/project/feed-stall-watchdog-error-codes.md"
+  alarm_description   = "FEED-STALL-01 flap: >=3 Groww sidecar stall-restarts within one 15-min window (Sum of the agent's per-scrape deltas of tv_feed_sidecar_stall_restart_total - the counter increments once per restart, warn!- and error!-level alike, and is pre-registered at 0 at boot right after the metrics recorder installs so the delta pipeline's dropped first sample is the 0 baseline, not restart #1 - THIS pager therefore sees every restart incl. the session's first; the errcode-feed-stall-01 alarm sees only the sidecar's own >5-per-5-min STORM escalation ERROR lines). A single self-heal restart never pages. Honest floor: flap cycles slower than ~5 min (<3 restarts per aligned 15-min window) do not page - stated residual. The provider keeps closing the socket - check credential/entitlement. Runbook: .claude/rules/project/feed-stall-watchdog-error-codes.md"
   comparison_operator = "GreaterThanOrEqualToThreshold"
   threshold           = 3
   evaluation_periods  = 1
