@@ -198,5 +198,20 @@ resource "aws_cloudwatch_metric_alarm" "error_code" {
   # ~15 min after the datapoint ages out would be a Rule-11 false
   # "recovered" message while the condition persists (see the locals
   # comment above for the per-code rationale).
+  #
+  # ONE-TIME apply-evening noise (round-8, accepted + pre-briefed in the PR
+  # body): every NEW alarm is created in INSUFFICIENT_DATA and - with
+  # treat_missing_data=notBreaching on sparse/absent metrics - transitions
+  # INSUFFICIENT_DATA -> OK on its first evaluation. CloudWatch invokes
+  # ok_actions on ANY transition into OK, and the telegram-webhook Lambda
+  # formats every OK as a green message (it reads only NewStateValue - no
+  # OldStateValue filter). Expect up to ~6 one-time green "recovered" pages
+  # the apply evening: the 4 ok_recovery=true codes here (dh-901,
+  # auth-gap-04, ws-gap-07, feed-stall-01) + feed-stall-restarts +
+  # readiness-lambda-errors (the reconnect-storm alarm is exempt via
+  # actions_enabled=false). Creation settling, NOT recoveries. Flagged
+  # follow-up (not this PR): an OldStateValue == INSUFFICIENT_DATA
+  # suppression branch in the telegram-webhook Lambda - benefits every
+  # future alarm PR.
   ok_actions = each.value.ok_recovery ? local.app_alarm_ok : []
 }

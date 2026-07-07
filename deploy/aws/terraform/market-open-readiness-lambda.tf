@@ -174,5 +174,8 @@ resource "aws_cloudwatch_metric_alarm" "market_open_readiness_lambda_errors" {
     FunctionName = aws_lambda_function.market_open_readiness.function_name
   }
   alarm_actions = [aws_sns_topic.tv_alerts.arn]
-  ok_actions    = [aws_sns_topic.tv_alerts.arn]
+  # Expect ONE one-time green OK page the apply evening: new-alarm
+  # INSUFFICIENT_DATA -> OK creation settling, not a recovery (round-8;
+  # full rationale in error-code-alarms.tf's ok_actions comment).
+  ok_actions = [aws_sns_topic.tv_alerts.arn]
 }

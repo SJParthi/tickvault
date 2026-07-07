@@ -47,7 +47,12 @@ zero hot-path code) + one TEST-file addition in `crates/common/tests/`
 > the pre-install boot window would be uncounted — physically implausible), or
 > paging an order-update flap SLOWER than ~1 cycle per 3 min (>5
 > once-per-cycle increments per 900s window = the detection floor; the
-> 3-min+ slow-flap band is a stated residual; an app restart costs at most
+> 3-min+ slow-flap band is a stated residual; boundary-straddling >5-cycle
+> bursts — ≤5 per side of the aligned 900s boundary, e.g. 4+4 over ~12 min —
+> page one window later or, if the flap stops at the boundary, not at all;
+> tumbling windows, not sliding — round-8, mirrors the feed-stall clause; a
+> SUSTAINED flap always pages, so the 2026-07-06 all-session shape is
+> unaffected; an app restart costs at most
 > the agent's dropped first post-restart counter sample — restarts are owned
 > by the liveness alarms). Claiming more than this envelope = REJECT in
 > review.
@@ -137,6 +142,10 @@ flapper invisible) is the proof.
   exceed 5 for any cycle ≥ 60s; over 900s the documented ~90s incident
   cadence yields ~10 ≫ 5 while the ≤3-attempt close churn stays ≤3. Honest
   detection floor: cycles slower than ~180s do not page — stated residual.
+  Aligned tumbling windows, not sliding (round-8, mirrors the feed-stall
+  clause): a >5-cycle burst straddling the 900s boundary (≤5 per side) pages
+  one window later or, if the flap stops at the boundary, not at all; a
+  SUSTAINED flap always pages.
   Honest residual: the delta shape is not live-verified from the sandbox —
   the post-apply runbook checks one /metrics event; if it proved cumulative,
   Sum overcounts and pages too EAGERLY, never silently misses).
@@ -183,10 +192,28 @@ flapper invisible) is the proof.
   Treat pages arriving within ~10 min of the agent-config deploy as backfill
   (round-2 review fix; a timestamp_format for the errors-jsonl entry is a
   flagged follow-up, not this PR).
+- Apply evening, one-time green-page burst (round-8, accepted + pre-briefed
+  in the PR body): every NEW alarm is created in INSUFFICIENT_DATA and — with
+  `treat_missing_data = notBreaching` on sparse/absent metrics — transitions
+  INSUFFICIENT_DATA→OK on its first evaluation; CloudWatch invokes ok_actions
+  on ANY transition into OK, and the telegram-webhook Lambda formats every OK
+  as a green ✅ message (it reads only NewStateValue — no OldStateValue
+  filter). Expect up to ~6 one-time "recovered" messages the apply evening
+  for conditions that were never in alarm: the 4 `ok_recovery = true` errcode
+  alarms (dh-901, auth-gap-04, ws-gap-07, feed-stall-01) + feed-stall-restarts
+  + readiness-lambda-errors (the reconnect-storm alarm is exempt —
+  `actions_enabled = false` until the market-hours gate arms it). Creation
+  settling, not recoveries; house precedent (every prior alarm PR did the
+  same). An OldStateValue == INSUFFICIENT_DATA suppression branch in the
+  telegram-webhook Lambda is a flagged follow-up (benefits all future alarm
+  PRs), NOT this PR.
 - Order-update flap SLOWER than ~1 cycle per 3 min (≤5 once-per-cycle
   increments per 900s window) never breaches `>5` → stated residual; the
   durable-down alarm owns full outages, nothing owns the 3-min+ slow-flap
-  band today (round-1 review honesty).
+  band today (round-1 review honesty). Boundary-straddling >5-cycle bursts
+  (≤5 per side of the aligned 900s tumbling window) page one window later
+  or, if the flap stops at the boundary, not at all — a SUSTAINED flap
+  always pages (round-8; same clause the feed-stall pager already carried).
 - Budget stop colliding with the holiday heuristic: the hourly
   hard-stop-guard's in-window breach_stop (its cron ticks at exactly 08:30
   IST) or the SNS budget-killswitch or a manual portal stop between
@@ -266,7 +293,10 @@ flapper invisible) is the proof.
 - Post-apply (PR-body runbook): `describe-log-streams` freshness check on
   `/tickvault/prod/app` (expect up to a few one-time backfill errcode pages
   within ~10 min of the agent-config deploy — from_beginning replay of
-  today's already-logged errors, see Edge Cases; wait for those to settle
+  today's already-logged errors, see Edge Cases; ALSO expect up to ~6
+  one-time green ✅ "OK" messages the apply evening — new-alarm
+  INSUFFICIENT_DATA→OK creation settling, not recoveries, see Edge Cases;
+  wait for those to settle
   BEFORE the fire drill), `set-alarm-state` fire drill on
   tv-prod-errcode-rest-canary-01, the SNS end-to-end drill
   `aws lambda invoke --function-name tv-prod-market-open-readiness
@@ -334,10 +364,15 @@ flapper invisible) is the proof.
   across 11 .tf files pre-PR; 44 alarms from 37 resource blocks across 15
   .tf files post-PR, the errcode block being a for_each over 8 codes; the
   rule-file "10 free tier" claims were already stale pre-PR). Realistic
-  cost delta (round-5 recompute): +11 alarms × $0.10 = $1.10, + 2 DENSE
+  cost delta (round-5 recompute; worst-case corrected round-8): +11 alarms
+  × $0.10 = $1.10, + 2 DENSE
   /metrics-derived custom metrics × $0.30 × 270/730 uptime-hrs ≈ $0.22, +
   sparse `tv_errcode_*` $0.05-0.40 ⇒ ≈ **+$1.4-1.7/mo (~₹135-175 incl 18%
-  GST; worst realistic ≈ +$2.0/mo)** — the earlier "+$1.2-1.5 (~₹105-130
+  GST; worst realistic ≈ +$2.2/mo, ~₹220 incl 18% GST — the sum of the
+  worst components: $1.10 alarms + $0.22 dense + $0.89 sparse worst-case,
+  a code firing every running hour = 8 × $0.30 × 270/730; the round-5
+  "≈ +$2.0" label sat below its own component arithmetic)** — the earlier
+  "+$1.2-1.5 (~₹105-130
   incl GST)" band understated both ends and its ₹ figure omitted the GST it
   claimed. Still comfortably inside the $35 pre-GST budget-alarm ceiling.
 

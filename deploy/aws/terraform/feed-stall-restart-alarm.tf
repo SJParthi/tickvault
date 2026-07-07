@@ -121,5 +121,8 @@ resource "aws_cloudwatch_metric_alarm" "feed_stall_restarts" {
   # should_restart_on_stall() sees market_open=true, so the counter cannot
   # increment outside 09:00-15:30 IST - there is no off-hours churn to gate.
   alarm_actions = local.app_alarm_actions
-  ok_actions    = local.app_alarm_ok
+  # Expect ONE one-time green OK page the apply evening: new-alarm
+  # INSUFFICIENT_DATA -> OK creation settling, not a recovery (round-8;
+  # full rationale in error-code-alarms.tf's ok_actions comment).
+  ok_actions = local.app_alarm_ok
 }

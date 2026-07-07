@@ -36,7 +36,14 @@
 # ≤3 per 15 min, below threshold. Honest detection floor: flap cycles slower
 # than ~180s (≤5 reconnects/15 min) do NOT page — that slow-flap band is a
 # stated residual (the durable-down alarm owns full outages; nothing owns
-# 3-min+ cycles today). Counter reset on app restart is absorbed by the
+# 3-min+ cycles today). Aligned-window semantics (round-8; mirrors the
+# feed-stall-restart-alarm.tf clause): CloudWatch evaluates aligned TUMBLING
+# 900s windows, not a sliding window — a short burst of >5 cycles that
+# STRADDLES a window boundary (≤5 on each side, e.g. 4+4 over ~12 min) pages
+# one window later, or not at all if the flap stops at the boundary; a
+# SUSTAINED flap keeps accumulating and always pages (the 2026-07-06
+# all-session incident shape is unaffected — stated residual, not a tuning
+# defect). Counter reset on app restart is absorbed by the
 # agent's delta calculation (first post-restart sample dropped — at most one
 # increment lost, never a latched or negative artifact; restarts themselves
 # are owned by the liveness alarms).
@@ -82,16 +89,18 @@ resource "aws_cloudwatch_log_metric_filter" "order_update_reconnections_fallback
 
 resource "aws_cloudwatch_metric_alarm" "order_update_reconnect_storm" {
   alarm_name          = "tv-${var.environment}-order-update-reconnect-storm"
-  alarm_description   = "Order-update WebSocket is FLAPPING: more than 5 reconnect attempts in 15 minutes during market hours (Sum of the agent's per-scrape counter deltas; catches flap cycles faster than ~3 min, incl. the ~90s 2026-07-06 incident cadence — the counter increments once per cycle). The durable-down alarm (order-update-ws-inactive, Minimum<1 over 2x60s) cannot see a socket that reconnects within each minute (2026-07-06 incident class). Fill confirmations may arrive late or duplicated. Check the errors stream for order-update disconnect reasons; cross-check Dhan status + tv_token_remaining_seconds. Runbook: .claude/rules/project/wave-2-error-codes.md (WS-GAP family) + docs/dhan-ref/10-live-order-update-websocket.md"
+  alarm_description   = "Order-update WebSocket is FLAPPING: more than 5 reconnect attempts in 15 minutes during market hours (Sum of the agent's per-scrape counter deltas; catches flap cycles faster than ~3 min, incl. the ~90s 2026-07-06 incident cadence — the counter increments once per cycle). Aligned tumbling window, not sliding: a >5-cycle burst straddling the 900s boundary (<=5 per side) pages one window later or, if the flap stops at the boundary, not at all; a SUSTAINED flap always pages. The durable-down alarm (order-update-ws-inactive, Minimum<1 over 2x60s) cannot see a socket that reconnects within each minute (2026-07-06 incident class). Fill confirmations may arrive late or duplicated. Check the errors stream for order-update disconnect reasons; cross-check Dhan status + tv_token_remaining_seconds. Runbook: .claude/rules/project/wave-2-error-codes.md (WS-GAP family) + docs/dhan-ref/10-live-order-update-websocket.md"
   comparison_operator = "GreaterThanThreshold"
   threshold           = 5
   evaluation_periods  = 1
   metric_name         = "tv_order_update_reconnections_total"
   namespace           = local.app_namespace
-  # 900s window (NOT 300s): the counter increments once per flap cycle, so a
-  # 5-min window mathematically cannot exceed 5 for any cycle >= 60s — see
-  # the TUNING header block. Sum over the window = reconnects in the window
-  # (the agent ships per-scrape counter deltas — see COUNTER SHAPE header).
+  # 900s ALIGNED window (NOT 300s): the counter increments once per flap
+  # cycle, so a 5-min window mathematically cannot exceed 5 for any cycle
+  # >= 60s — see the TUNING header block. Sum over the window = reconnects in
+  # the window (the agent ships per-scrape counter deltas — see COUNTER SHAPE
+  # header; boundary-straddling >5 bursts page one window later or, if the
+  # flap stops at the boundary, not at all — tumbling windows, not sliding).
   period             = 900
   statistic          = "Sum"
   dimensions         = local.app_dimensions # { host = "tickvault-prod" }
