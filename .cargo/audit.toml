@@ -35,5 +35,15 @@ ignore = [
     # in a maintenance sweep (the bump needs `cargo update`, blocked by the local
     # hook; a follow-up carries it). Full reason mirrored in deny.toml.
     "RUSTSEC-2026-0185",
+    # 2026-07-07 — RUSTSEC-2026-0204 (crossbeam-epoch 0.9.18, invalid pointer
+    # dereference in `fmt::Pointer`/`fmt::Display` for `Atomic`/`Shared` when the
+    # pointer is invalid, e.g. `Atomic::null`). NOT reachable: crossbeam-epoch is
+    # pulled only via criterion (dev-only benches) and metrics-util →
+    # metrics-exporter-prometheus; neither our code nor those crates format
+    # `Atomic`/`Shared` pointers — the epoch GC use never hits the vulnerable
+    # Display path. Removal condition: bump the lock to crossbeam-epoch >= 0.9.20
+    # in an operator-approved maintenance sweep (`cargo update -p crossbeam-epoch`
+    # is banned by CLAUDE.md + the local hook). Full reason mirrored in deny.toml.
+    "RUSTSEC-2026-0204",
 ]
 
