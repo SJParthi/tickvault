@@ -140,6 +140,17 @@ resource "aws_iam_role_policy" "github_deploy" {
         Resource = "arn:aws:ssm:${var.aws_region}:*:parameter/tickvault/${var.environment}/deploy/binary-git-sha"
       },
       {
+        # LOG-INGESTION-SMOKE (deploy-aws.yml): after the verified swap, the
+        # workflow polls filter-log-events on the app log group to prove the
+        # CloudWatch agent is actually shipping fresh log events (incident
+        # 2026-07-06: app healthy, shipper silently dead after the
+        # data/logs/machine/ reorg). Non-fatal check; least privilege —
+        # scoped to the app log group + its streams only.
+        Effect   = "Allow"
+        Action   = ["logs:FilterLogEvents"]
+        Resource = "${aws_cloudwatch_log_group.tv_app.arn}:*"
+      },
+      {
         # EC2 describe — read-only, used by the workflow to fetch
         # the instance state during the post-deploy monitor
         Effect = "Allow"

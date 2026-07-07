@@ -194,11 +194,15 @@ resource "aws_lambda_function" "tv_market_hours_liveness_gate" {
     variables = {
       # All market-hours-gated alarms (comma-separated). 2026-07-03: the two
       # app-alarms.tf value-based off-hours false-pagers joined the liveness
-      # alarm under the same 09:20-15:35 IST Mon-Fri window.
+      # alarm under the same 09:20-15:35 IST Mon-Fri window. 2026-07-07: the
+      # app-log-ingestion-silent alarm (log-retention.tf) joined — zero log
+      # ingestion is by design while the box is intentionally stopped, so it
+      # needs the same window gate to never false-page off-hours.
       ALARM_NAMES = join(",", [
         aws_cloudwatch_metric_alarm.market_hours_liveness_missing.alarm_name,
         aws_cloudwatch_metric_alarm.realtime_guarantee_critical.alarm_name,
         aws_cloudwatch_metric_alarm.aggregator_no_seals.alarm_name,
+        aws_cloudwatch_metric_alarm.app_log_ingestion_silent.alarm_name,
       ])
     }
   }

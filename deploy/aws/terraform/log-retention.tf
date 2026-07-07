@@ -63,3 +63,48 @@ resource "aws_cloudwatch_metric_alarm" "logs_ingestion_runaway" {
   alarm_actions = [aws_sns_topic.tv_alerts.arn]
   ok_actions    = [aws_sns_topic.tv_alerts.arn]
 }
+
+# ---------------------------------------------------------------------------
+# App log-group ingestion SILENCE alarm — the inverse of the runaway guard.
+# Incident 2026-07-06 17:19 IST: the app moved its machine logs to
+# data/logs/machine/ (the "one human log file" reorg) while the CloudWatch
+# agent kept tailing the OLD top-level globs — the app stayed healthy, the
+# shipper went dead, and /tickvault/prod/app ingested NOTHING with zero
+# operator signal (every value-based app alarm kept evaluating its metric;
+# nothing watched ingestion itself). This alarm pages when the app log group
+# ingests ZERO events for ~15 minutes during market hours.
+#
+# AWS/Logs publishes NO IncomingLogEvents datapoint for a period with zero
+# ingestion — silence IS missing data — so treat_missing_data must be
+# "breaching" for this alarm to detect anything at all. That makes it a
+# guaranteed false-pager while the box is intentionally stopped (nightly /
+# weekend), so actions are OFF by default and window-gated: the market-hours
+# gate Lambda (market-hours-liveness-alarm.tf) enables them 09:20-15:35 IST
+# Mon-Fri (with the OK-reset on open) — this alarm is the 4th member of its
+# ALARM_NAMES list. The deploy workflow's LOG-INGESTION-SMOKE step is the
+# independent per-deploy detector for the same failure class.
+# ---------------------------------------------------------------------------
+
+resource "aws_cloudwatch_metric_alarm" "app_log_ingestion_silent" {
+  alarm_name          = "tv-${var.environment}-app-log-ingestion-silent"
+  alarm_description   = "App log shipping is SILENT: /tickvault/${var.environment}/app ingested ZERO log events for ~15 min during market hours. The app itself may be perfectly healthy — the 2026-07-06 incident signature is the on-box CloudWatch agent tailing globs that no longer match the app's log files (data/logs/machine/ reorg). Triage via SSM on the box: 'sudo /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a status' + 'sudo tail -n 40 /opt/aws/amazon-cloudwatch-agent/logs/amazon-cloudwatch-agent.log' + 'ls -la /opt/tickvault/data/logs/machine/' — the agent's collect_list globs must match deploy/aws/cloudwatch-agent.json (machine/errors.jsonl.2* + machine/app.2*)."
+  namespace           = "AWS/Logs"
+  metric_name         = "IncomingLogEvents"
+  statistic           = "Sum"
+  period              = 300 # 5 min × 3 evaluation periods = ~15 min of silence
+  evaluation_periods  = 3
+  threshold           = 1
+  comparison_operator = "LessThanThreshold"
+  treat_missing_data  = "breaching" # INTENTIONAL inverse of the runaway guard — zero ingestion = no datapoint
+
+  dimensions = {
+    LogGroupName = aws_cloudwatch_log_group.tv_app.name
+  }
+
+  # Actions OFF by default; the market-hours gate Lambda flips them ON
+  # 09:20-15:35 IST Mon-Fri so the intentional nightly/weekend stop (box down
+  # => zero ingestion => missing datapoints) can never false-page.
+  actions_enabled = false
+  alarm_actions   = [aws_sns_topic.tv_alerts.arn]
+  ok_actions      = [aws_sns_topic.tv_alerts.arn]
+}
