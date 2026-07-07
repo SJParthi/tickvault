@@ -1541,6 +1541,7 @@ mod tests {
             send_timeout_ms: 100,
             telegram_api_base_url: "https://api.telegram.org".to_string(),
             sns_enabled: false,
+            ..NotificationConfig::default()
         };
         let service = NotificationService::initialize(&config).await;
         if crate::test_support::has_aws_credentials() {
@@ -1926,6 +1927,7 @@ mod tests {
             send_timeout_ms: 100,
             telegram_api_base_url: "https://api.telegram.org".to_string(),
             sns_enabled: false,
+            ..NotificationConfig::default()
         };
         let service = NotificationService::initialize(&config).await;
         // Without real SSM, should fall back to no-op
@@ -1944,6 +1946,7 @@ mod tests {
             send_timeout_ms: 100,
             telegram_api_base_url: "https://api.telegram.org".to_string(),
             sns_enabled: true,
+            ..NotificationConfig::default()
         };
         let service = NotificationService::initialize(&config).await;
         // Whether SSM is available or not, initialize should not panic

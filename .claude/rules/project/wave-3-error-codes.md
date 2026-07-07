@@ -70,3 +70,60 @@ so the tag-guard meta-test can pin it; routing to Telegram is via Loki
    impossible; recurrence indicates a logic bug.
 
 **Source:** `crates/core/src/notification/coalescer.rs::drain`.
+
+## TELEGRAM-03 — episode live-edit machinery degraded (2026-07-07 UX overhaul)
+
+**Trigger:** the one-incident-one-bubble episode machinery
+(`Telegram03EpisodeDegraded`, code_str `TELEGRAM-03`) hit a degraded path.
+Three reasons, carried on the `reason` field of the `error!` line:
+
+1. `store_write_failed` — the advisory episode snapshot file
+   (`data/notify/episodes.json`) could not be written (disk full,
+   unwritable directory). In-memory episode state keeps working; only the
+   cross-restart bubble linkage degrades (a restart mid-outage opens ONE
+   fresh duplicate bubble instead of resuming the old one).
+2. `rehydrate_corrupt` — boot-time rehydrate found corrupt JSON. The
+   registry starts empty, boot proceeds (fail-open, never gates boot or
+   any notify()).
+3. `edit_fallback_storm` — the edit-message fallback ladder is firing
+   repeatedly (see `tv_telegram_edit_fallback_total{reason}`): Telegram
+   keeps rejecting edits, so fresh bubbles are being sent instead
+   (duplicate-over-drop — noisier, never silent).
+
+**Severity:** Low. Delivery is NEVER at risk from this code — every
+transport failure still terminates at the existing TELEGRAM-01
+error!+counter loudness. TELEGRAM-03 signals only that the one-bubble UX
+is degraded.
+
+**Companion counters (episode machinery, static labels only):**
+`tv_telegram_episode_events_total{action="open"|"edit"|"edit_throttled"|"close"|"reopen"}`
+and `tv_telegram_edit_fallback_total{reason="not_found"|"transient_exhausted"}`.
+An edit-failure-triggered fallback replaces the bubble message id and
+increments the fallback counter; if the fallback send itself fails, the
+EXISTING `tv_telegram_dropped_total{reason="send_failed"}` + TELEGRAM-01
+`error!` fire exactly as before (the never-drop ladder's terminal rung).
+
+**Triage:**
+1. `reason="store_write_failed"` → `df -h data/` + `ls -la data/notify/`
+   — disk full / permissions. In-memory episodes still work; fix the disk
+   at leisure.
+2. `reason="rehydrate_corrupt"` → delete `data/notify/episodes.json`; the
+   file is advisory and self-recreates. One duplicate bubble per live
+   outage is the worst case.
+3. `reason="edit_fallback_storm"` → check
+   `tv_telegram_edit_fallback_total` label split: `not_found` means the
+   bubble message was deleted or aged out (>48h) — benign; sustained
+   `transient_exhausted` means Telegram's API is rate-limiting or flaky —
+   cross-check TELEGRAM-01 and the `tv-telegram-drops` alert.
+4. Config rollback (no code change): `[notification] episode_mode = false`
+   restores byte-identical legacy per-event dispatch.
+
+**Auto-triage safe:** YES (Severity::Low; the degrade already self-limited
+— never an operator-action pager).
+
+**Source:** `crates/core/src/notification/episode.rs` (pure core:
+`next_episode_action` FSM, `EpisodeRegistry`, `episode_snapshot`
+codec), `crates/core/src/notification/service.rs` (transport shell:
+`dispatch_episode_event`, `edit_telegram_message_with_retry`,
+`classify_edit_body`, snapshot writer task),
+`crates/common/src/error_code.rs::Telegram03EpisodeDegraded`.
