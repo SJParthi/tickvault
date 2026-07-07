@@ -72,14 +72,27 @@ fn collect_rs_sources(dir: &Path, out: &mut Vec<PathBuf>) {
 
 /// True iff the literal metric name appears inside any
 /// `counter!`/`gauge!`/`histogram!` call in the workspace.
+///
+/// 2026-07-06 fix: each source body is whitespace-STRIPPED before matching,
+/// so a rustfmt-wrapped multi-line invocation like
+/// ```text
+///     metrics::counter!(
+///         "tv_feed_sidecar_stall_restart_total",
+///         "feed" => feed.as_str(),
+///     )
+/// ```
+/// normalizes to `counter!("tv_feed_sidecar_stall_restart_total",` and is
+/// guard-visible. Before this fix the contiguous needles matched ONLY
+/// single-line emits — a multi-line emit made a real metric look missing
+/// (false-negative on the emit site, false-positive "missing" panic here).
 fn is_metric_emitted(name: &str) -> bool {
+    // No needle contains whitespace, so matching against the compacted
+    // body is exact. `counter!("name")` is covered by the `counter!("name`
+    // prefix, so three needles suffice.
     let needles = [
         format!("counter!(\"{name}\""),
         format!("gauge!(\"{name}\""),
         format!("histogram!(\"{name}\""),
-        format!("counter!(\"{name}\")"),
-        format!("gauge!(\"{name}\")"),
-        format!("histogram!(\"{name}\")"),
     ];
     let mut sources = Vec::new();
     collect_rs_sources(&workspace_root().join("crates"), &mut sources);
@@ -87,8 +100,9 @@ fn is_metric_emitted(name: &str) -> bool {
         let Ok(body) = fs::read_to_string(&path) else {
             continue;
         };
+        let compact: String = body.chars().filter(|c| !c.is_whitespace()).collect();
         for needle in &needles {
-            if body.contains(needle) {
+            if compact.contains(needle) {
                 return true;
             }
         }
@@ -207,12 +221,20 @@ fn test_emf_metric_selectors_name_count_is_twenty_one() {
     // tv_subsystem_memory_estimated_bytes — crates/app/src/metrics_catalog.rs
     // SUBSYSTEM_MEMORY_GAUGE_NAME). Cost note: each custom metric is ~$0.30/mo.
     // If you intentionally add/remove a name, update BOTH configs + this pin.
+    //
+    // 24 (was 21) since 2026-07-06 (Groww feed-down alerting, operator
+    // directive): added `tv_groww_ws_active` (connected-level 0/1 gauge),
+    // `tv_feed_last_tick_age_seconds{feed}` (feed liveness age gauge — both
+    // emitted from crates/app/src/groww_bridge.rs), and
+    // `tv_feed_sidecar_stall_restart_total` (FEED-STALL-01 stall-kill
+    // counter — crates/app/src/groww_sidecar_supervisor.rs). Cost: +3
+    // custom metrics ≈ +$0.90/mo per the app-alarms.tf header cost note.
     let user_data = read("deploy/aws/terraform/user-data.sh.tftpl");
     let names = emf_declared_names(&user_data, "metric_selectors");
     assert_eq!(
         names.len(),
-        21,
-        "Z+ L2 VERIFY ratchet: expected exactly 21 names in the EMF metric_selectors \
+        24,
+        "Z+ L2 VERIFY ratchet: expected exactly 24 names in the EMF metric_selectors \
          list; found {}: {names:?}",
         names.len()
     );
@@ -361,10 +383,18 @@ fn test_app_alarms_count_is_thirteen() {
     // tick at/after 15:30 IST, without threading a notifier into the per-tick
     // hot path. Cost: +1 custom metric (~$0.30/mo) + 1 alarm (~$0.10/mo),
     // negligible within the ~₹2,058/mo envelope.
+    // 19 (was 17) since 2026-07-06 (Groww feed-down alerting, operator
+    // directive): added `tv_groww_ws_active` (alarm
+    // tv-<env>-groww-ws-inactive — Groww WS lost after being up this
+    // session) + `tv_feed_sidecar_stall_restart_total` (alarm
+    // tv-<env>-groww-stall-restart-storm — 3+ FEED-STALL-01 silent-feed
+    // kills within an hour = provider-side reject). Cost: +2 alarms
+    // (~$0.20/mo) + 3 custom metrics (~$0.90/mo incl. the un-alarmed
+    // tv_feed_last_tick_age_seconds), per the app-alarms.tf header note.
     let count = alarm_metric_names().len();
     assert_eq!(
-        count, 17,
-        "Z+ L2 VERIFY ratchet: expected exactly 17 app-level CloudWatch alarms \
+        count, 19,
+        "Z+ L2 VERIFY ratchet: expected exactly 19 app-level CloudWatch alarms \
          (one per critical app signal). Found {count}. If you intentionally added \
          or removed one, update aws-budget.md custom-metric cost line AND this guard."
     );
