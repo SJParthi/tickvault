@@ -17,6 +17,7 @@ import re
 import sys
 import unittest
 from pathlib import Path
+from unittest import mock
 
 # Allow `import handler` when run from the repo root.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -141,6 +142,14 @@ class Ist12Hour(unittest.TestCase):
         self.assertRegex(out, re.compile(r"^\d{1,2}:\d{2} (AM|PM)$"))
         out2 = handler._ist_12h("")
         self.assertRegex(out2, re.compile(r"^\d{1,2}:\d{2} (AM|PM)$"))
+
+    def test_edge_dated_timestamps_fall_back_without_crash(self) -> None:
+        # Regression (2026-07-07 refute round 1): year-0001/9999 inputs
+        # parse fine but OverflowError'd on the IST conversion, crashing
+        # the whole SNS batch before any Telegram send.
+        for raw in ("9999-12-31T23:59:59+00:00", "0001-01-01T00:00:00+05:31"):
+            out = handler._ist_12h(raw)
+            self.assertRegex(out, re.compile(r"^\d{1,2}:\d{2} (AM|PM)$"), raw)
 
 
 class AlarmPhrase(unittest.TestCase):
@@ -305,6 +314,67 @@ class FormatPlainSns(unittest.TestCase):
     def test_no_subject_falls_back_to_bell(self) -> None:
         out = handler._format_plain_sns(None, "operator-test")
         self.assertTrue(out.startswith("🔔"))
+
+
+class LambdaHandlerDelivery(unittest.TestCase):
+    """End-to-end never-drop coverage through lambda_handler itself.
+
+    Pins the delivery boundary: an ALARM record must reach the Telegram
+    POST. A regression that filters or suppresses folded ALARM texts
+    between _fold_records and _post_to_telegram — or a per-record crash
+    that kills the whole batch — fails HERE, not just in theory.
+    SSM + HTTP are mocked; no AWS creds needed.
+    """
+
+    def setUp(self) -> None:
+        handler._LAST_SENT.clear()
+
+    def _invoke(self, records: list) -> tuple[dict, list[str]]:
+        posted: list[str] = []
+
+        def _fake_post(_token: str, _chat_id: str, text: str) -> tuple[int, str]:
+            posted.append(text)
+            return 200, '{"ok":true}'
+
+        with (
+            mock.patch.object(handler, "_get_credentials", return_value=("tok", "chat")),
+            mock.patch.object(handler, "_post_to_telegram", side_effect=_fake_post),
+            mock.patch.object(handler.time, "sleep", lambda _s: None),
+        ):
+            result = handler.lambda_handler({"Records": records}, None)
+        return result, posted
+
+    def test_alarm_record_reaches_telegram_post_through_lambda_handler(self) -> None:
+        result, posted = self._invoke([_alarm_record("tv-prod-ws-pool-all-dead")])
+        self.assertEqual(result["sent"], 1)
+        self.assertEqual(result["failures"], [])
+        self.assertEqual(len(posted), 1)
+        self.assertTrue(posted[0].startswith("🆘"))
+        self.assertIn("ALL live market data connections are down", posted[0])
+
+    def test_poisoned_timestamp_record_never_drops_genuine_alarm_in_batch(self) -> None:
+        # Regression (2026-07-07 refute round 1): a batch containing one
+        # edge-dated StateChangeTime crashed the ENTIRE invocation before
+        # any send — the genuine 🆘 in the same batch was dropped forever.
+        result, posted = self._invoke(
+            [
+                _alarm_record("tv-prod-ws-pool-all-dead"),
+                _alarm_record("tv-prod-cpu-high-5min", when="9999-12-31T23:59:59+00:00"),
+            ]
+        )
+        self.assertEqual(result["failures"], [])
+        self.assertEqual(result["sent"], 2)
+        genuine = [t for t in posted if "ALL live market data connections are down" in t]
+        self.assertEqual(len(genuine), 1)
+        self.assertTrue(genuine[0].startswith("🆘"))
+        # The edge-dated alarm still pages (degraded timestamp, not dropped).
+        poisoned = [t for t in posted if "Server CPU has been very high for 5 minutes" in t]
+        self.assertEqual(len(poisoned), 1)
+        self.assertTrue(poisoned[0].startswith("🆘"))
+
+    def test_empty_event_skips_cleanly_without_credentials(self) -> None:
+        result = handler.lambda_handler({}, None)
+        self.assertEqual(result, {"sent": 0, "skipped": 1})
 
 
 class SeverityEmojiHeuristic(unittest.TestCase):

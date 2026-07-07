@@ -17,6 +17,11 @@
 //! (d) ALARM-state records are NEVER routed through the warm-cache OK
 //!     suppression (`_should_suppress_ok` is consulted ONLY on the
 //!     lone-OK branch — a dropped 🆘 is unacceptable)
+//! (e) never-drop delivery boundary (2026-07-07 refute round 1): the
+//!     render chain is fail-open per record (an edge-dated
+//!     StateChangeTime OverflowError previously crashed the WHOLE SNS
+//!     batch before any send), lambda_handler backstops the fold, and
+//!     every folded text is iterated straight into the Telegram POST
 //!
 //! House pattern: source-order scans (see `episode_edit_wiring_guard.rs`).
 
@@ -144,7 +149,40 @@ fn guard_alarm_never_suppressed_by_warm_cache() {
     );
 }
 
-// Bonus pin: the companion Python test lane exists with the six
+// (e) Never-drop delivery boundary + fail-open render chain.
+#[test]
+fn guard_never_drop_delivery_boundary_and_fail_open_render() {
+    let src = handler_src();
+    // _ist_12h degrades on tz-conversion overflow instead of crashing
+    // (year-0001/9999 StateChangeTime → OverflowError regression).
+    assert!(
+        src.contains("except (OverflowError, OSError, ValueError):"),
+        "_ist_12h lost its edge-dated-timestamp fail-open arm"
+    );
+    // The render loop is per-record fail-open — one poisoned alarm can
+    // never take genuine 🆘 pages in the same batch down with it.
+    let render_loop = region(&src, "for name in name_order:", "if lone_ok_phrases:");
+    assert!(
+        render_loop.contains("except Exception"),
+        "the _fold_records render loop lost its per-record fail-open guard"
+    );
+    // lambda_handler: the fold call is backstopped (batch degrades to
+    // safe generic lines, never dropped) and every folded text is
+    // iterated straight into the Telegram POST (single choke point).
+    let delivery = region(&src, "def lambda_handler(", "return {\"sent\": sent");
+    assert!(
+        delivery.contains("_GENERIC_SAFE_LINE for _ in records"),
+        "lambda_handler lost the fold backstop (batch must degrade, never drop)"
+    );
+    assert!(
+        delivery.contains("for text in texts:")
+            && delivery.contains("_post_to_telegram(token, chat_id, text)"),
+        "lambda_handler must POST every folded text — no filtering between \
+         _fold_records and _post_to_telegram"
+    );
+}
+
+// Bonus pin: the companion Python test lane exists with the
 // judge-contract test names (the CI `make lambda-test` step runs them).
 #[test]
 fn guard_python_test_lane_carries_contract_tests() {
@@ -160,6 +198,9 @@ fn guard_python_test_lane_carries_contract_tests() {
         "test_ist_12_hour_timestamp",
         "test_alarm_never_suppressed_by_warm_cache",
         "test_unknown_alarm_name_fallback_still_plain_english",
+        "test_alarm_record_reaches_telegram_post_through_lambda_handler",
+        "test_poisoned_timestamp_record_never_drops_genuine_alarm_in_batch",
+        "test_edge_dated_timestamps_fall_back_without_crash",
     ] {
         assert!(
             tests.contains(name),
