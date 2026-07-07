@@ -52,7 +52,16 @@ unmaintained = "workspace"
 # in a maintenance sweep (the bump needs `cargo update`, blocked by the local
 # pre-tool hook; a follow-up will carry it). Sibling advisory RUSTSEC-2026-0186
 # (memmap2, which IS compiled) was properly fixed by bumping the pin to 0.9.11.
-ignore = ["RUSTSEC-2026-0185"]
+#
+# 2026-07-07: RUSTSEC-2026-0204 (crossbeam-epoch 0.9.18, transitive:
+# criterion/rayon dev-only + metrics-util prod via metrics-exporter-prometheus).
+# UNREACHABLE here: the invalid pointer deref exists only in the fmt::Pointer
+# impl for Atomic/Shared when formatting an invalid pointer — neither rayon nor
+# metrics-util Pointer-formats these types, so the vulnerable path is never
+# exercised. Fixed upstream in >= 0.9.20; the lock-only bump needs operator
+# approval (`cargo update` banned) — tracked for the next operator-approved
+# dependency pass. Mirrored in .cargo/audit.toml. Added 2026-07-07.
+ignore = ["RUSTSEC-2026-0185", "RUSTSEC-2026-0204"]
 
 # --- Licenses: Block incompatible licenses ---
 [licenses]

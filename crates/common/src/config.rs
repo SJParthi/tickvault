@@ -1009,6 +1009,49 @@ pub struct NotificationConfig {
     /// Enable SMS alerts via AWS SNS for Critical/High severity events.
     /// Phone number is fetched from SSM at `/tickvault/{env}/sns/phone-number`.
     pub sns_enabled: bool,
+    /// Telegram UX Overhaul (2026-07-07) kill switch #1: episode live-edit
+    /// coalescing (one incident = one live-edited bubble). `false` makes
+    /// the `episode_key()` consultation a no-op → byte-identical legacy
+    /// per-event dispatch.
+    #[serde(default = "default_notification_episode_mode")]
+    pub episode_mode: bool,
+    /// Telegram UX Overhaul (2026-07-07) kill switch #2: LOW/MEDIUM digest
+    /// window (seconds) during market hours. Clamped to
+    /// [`NOTIFICATION_DIGEST_WINDOW_MIN_SECS`, `NOTIFICATION_DIGEST_WINDOW_MAX_SECS`]
+    /// via [`Self::digest_window_secs_clamped`]. `60` == legacy 60s
+    /// coalescing behavior.
+    #[serde(default = "default_notification_digest_window_secs")]
+    pub digest_window_secs: u64,
+}
+
+/// Lower clamp bound for `[notification] digest_window_secs` (== the legacy
+/// 60s coalescer window, i.e. "digest off" behavior).
+pub const NOTIFICATION_DIGEST_WINDOW_MIN_SECS: u64 = 60;
+
+/// Upper clamp bound for `[notification] digest_window_secs` — one hour;
+/// anything longer would hide LOW/MEDIUM signal for an entire session.
+pub const NOTIFICATION_DIGEST_WINDOW_MAX_SECS: u64 = 3600;
+
+fn default_notification_episode_mode() -> bool {
+    true
+}
+
+fn default_notification_digest_window_secs() -> u64 {
+    900
+}
+
+impl NotificationConfig {
+    /// The digest window clamped to
+    /// [`NOTIFICATION_DIGEST_WINDOW_MIN_SECS`, `NOTIFICATION_DIGEST_WINDOW_MAX_SECS`].
+    /// A fat-fingered `0` or `86400` can never silence or flood the
+    /// operator — the clamp is applied at every consumer.
+    #[must_use]
+    pub fn digest_window_secs_clamped(&self) -> u64 {
+        self.digest_window_secs.clamp(
+            NOTIFICATION_DIGEST_WINDOW_MIN_SECS,
+            NOTIFICATION_DIGEST_WINDOW_MAX_SECS,
+        )
+    }
 }
 
 impl Default for NotificationConfig {
@@ -1018,6 +1061,8 @@ impl Default for NotificationConfig {
             telegram_api_base_url: "https://api.telegram.org".to_string(),
             send_timeout_ms: 10_000,
             sns_enabled: false,
+            episode_mode: default_notification_episode_mode(),
+            digest_window_secs: default_notification_digest_window_secs(),
         }
     }
 }
@@ -2761,6 +2806,49 @@ mod tests {
         assert_eq!(config.telegram_api_base_url, "https://api.telegram.org");
         assert_eq!(config.send_timeout_ms, 10_000);
         assert!(!config.sns_enabled);
+        // Telegram UX Overhaul (2026-07-07) kill switches.
+        assert!(config.episode_mode, "episode mode ships ON by default");
+        assert_eq!(config.digest_window_secs, 900);
+    }
+
+    #[test]
+    fn test_notification_digest_window_secs_clamped_to_60_3600() {
+        let mut config = NotificationConfig::default();
+        config.digest_window_secs = 0;
+        assert_eq!(
+            config.digest_window_secs_clamped(),
+            NOTIFICATION_DIGEST_WINDOW_MIN_SECS,
+            "fat-fingered 0 clamps to the 60s legacy floor"
+        );
+        config.digest_window_secs = 86_400;
+        assert_eq!(
+            config.digest_window_secs_clamped(),
+            NOTIFICATION_DIGEST_WINDOW_MAX_SECS,
+            "fat-fingered 86400 clamps to the 3600s ceiling"
+        );
+        config.digest_window_secs = 900;
+        assert_eq!(config.digest_window_secs_clamped(), 900);
+        config.digest_window_secs = 60;
+        assert_eq!(
+            config.digest_window_secs_clamped(),
+            60,
+            "60 == legacy behavior passes through"
+        );
+    }
+
+    #[test]
+    fn test_notification_episode_knobs_deserialize_with_defaults() {
+        // Old TOML without the new keys must still deserialize (serde
+        // defaults) — config-file rollback safety.
+        let toml_str = r#"
+            telegram_api_base_url = "https://api.telegram.org"
+            send_timeout_ms = 10000
+            sns_enabled = false
+        "#;
+        let config: NotificationConfig =
+            toml::from_str(toml_str).expect("legacy notification TOML must parse");
+        assert!(config.episode_mode);
+        assert_eq!(config.digest_window_secs, 900);
     }
 
     // --- Wave-5 §K-L6/L7/L8 (PR #504c) ratchets -----------------------

@@ -2297,6 +2297,55 @@ impl NotificationEvent {
         }
     }
 
+    /// Telegram UX Overhaul (2026-07-07): which episode bubble, if any,
+    /// this event folds into.
+    ///
+    /// `Some` ONLY for the WS lifecycle families that produce the observed
+    /// 40-message disconnect storms; EVERY other variant returns `None` so
+    /// the legacy dispatch path stays byte-identical. Zero-alloc (`Copy`
+    /// match) — DHAT-pinned on the dispatch bypass arm by
+    /// `crates/core/tests/dhat_telegram_dispatcher.rs`.
+    #[must_use]
+    pub fn episode_key(&self) -> Option<super::episode::EpisodeKey> {
+        use super::episode::{EpisodeFamily, EpisodeKey};
+        match self {
+            Self::WebSocketDisconnected {
+                connection_index, ..
+            }
+            | Self::WebSocketDisconnectedOffHours {
+                connection_index, ..
+            }
+            | Self::WebSocketReconnected {
+                connection_index, ..
+            } => Some(EpisodeKey {
+                family: EpisodeFamily::MainFeedWs,
+                conn: u8::try_from(*connection_index).unwrap_or(u8::MAX),
+            }),
+            Self::OrderUpdateDisconnected { .. } | Self::OrderUpdateReconnected { .. } => {
+                Some(EpisodeKey {
+                    family: EpisodeFamily::OrderUpdateWs,
+                    conn: 0,
+                })
+            }
+            _ => None,
+        }
+    }
+
+    /// Telegram UX Overhaul (2026-07-07): the role this event plays inside
+    /// its episode. Disconnect-class → `Open` (the FSM decides open-vs-fold
+    /// by state presence); reconnect-class → `Resolve`. Meaningful only for
+    /// variants where [`Self::episode_key`] is `Some`.
+    #[must_use]
+    pub fn episode_role(&self) -> super::episode::EpisodeRole {
+        use super::episode::EpisodeRole;
+        match self {
+            Self::WebSocketReconnected { .. } | Self::OrderUpdateReconnected { .. } => {
+                EpisodeRole::Resolve
+            }
+            _ => EpisodeRole::Open,
+        }
+    }
+
     /// Returns the severity level for this event.
     ///
     /// Severity drives channel selection in `NotificationService::notify`:
@@ -2516,6 +2565,105 @@ impl NotificationEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -----------------------------------------------------------------------
+    // Telegram UX Overhaul (2026-07-07) — episode_key / episode_role accessors
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_episode_role_resolve_for_reconnect_open_for_disconnect() {
+        use super::super::episode::EpisodeRole;
+        let disc = NotificationEvent::WebSocketDisconnected {
+            connection_index: 0,
+            reason: "reset".to_string(),
+        };
+        assert_eq!(disc.episode_role(), EpisodeRole::Open);
+        let rec = NotificationEvent::WebSocketReconnected {
+            connection_index: 0,
+            reason: None,
+            down_secs: 1,
+            attempts: 1,
+        };
+        assert_eq!(rec.episode_role(), EpisodeRole::Resolve);
+        let od_rec = NotificationEvent::OrderUpdateReconnected {
+            consecutive_failures: 2,
+        };
+        assert_eq!(od_rec.episode_role(), EpisodeRole::Resolve);
+    }
+
+    #[test]
+    fn test_episode_key_ws_lifecycle_variants_map_to_families() {
+        use super::super::episode::{EpisodeFamily, EpisodeRole};
+        let disc = NotificationEvent::WebSocketDisconnected {
+            connection_index: 0,
+            reason: "reset".to_string(),
+        };
+        let key = disc.episode_key().expect("main-feed disconnect has a key");
+        assert_eq!(key.family, EpisodeFamily::MainFeedWs);
+        assert_eq!(key.conn, 0);
+        assert_eq!(disc.episode_role(), EpisodeRole::Open);
+
+        let off = NotificationEvent::WebSocketDisconnectedOffHours {
+            connection_index: 0,
+            reason: "reset".to_string(),
+        };
+        assert_eq!(
+            off.episode_key().map(|k| k.family),
+            Some(EpisodeFamily::MainFeedWs)
+        );
+        assert_eq!(off.episode_role(), EpisodeRole::Open);
+
+        let rec = NotificationEvent::WebSocketReconnected {
+            connection_index: 0,
+            reason: None,
+            down_secs: 10,
+            attempts: 3,
+        };
+        assert_eq!(
+            rec.episode_key().map(|k| k.family),
+            Some(EpisodeFamily::MainFeedWs)
+        );
+        assert_eq!(rec.episode_role(), EpisodeRole::Resolve);
+
+        let od = NotificationEvent::OrderUpdateDisconnected {
+            reason: "reset".to_string(),
+        };
+        assert_eq!(
+            od.episode_key().map(|k| k.family),
+            Some(EpisodeFamily::OrderUpdateWs)
+        );
+        assert_eq!(od.episode_role(), EpisodeRole::Open);
+
+        let or = NotificationEvent::OrderUpdateReconnected {
+            consecutive_failures: 4,
+        };
+        assert_eq!(
+            or.episode_key().map(|k| k.family),
+            Some(EpisodeFamily::OrderUpdateWs)
+        );
+        assert_eq!(or.episode_role(), EpisodeRole::Resolve);
+    }
+
+    #[test]
+    fn test_episode_key_none_for_non_episode_variants() {
+        // Legacy path stays byte-identical for everything else.
+        for event in [
+            NotificationEvent::StartupComplete { mode: "LIVE" },
+            NotificationEvent::AuthenticationSuccess,
+            NotificationEvent::TokenRenewed,
+            NotificationEvent::ShutdownInitiated,
+            NotificationEvent::OrderUpdateConnected,
+            NotificationEvent::Custom {
+                message: "x".to_string(),
+            },
+        ] {
+            assert!(
+                event.episode_key().is_none(),
+                "non-episode variant must return None: {:?}",
+                event.topic()
+            );
+        }
+    }
 
     #[test]
     fn test_severity_as_label_returns_lowercase_string() {
