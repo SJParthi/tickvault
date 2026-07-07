@@ -1,256 +1,218 @@
-# Implementation Plan: Order-Update WS Outage Page + Honest Recovery (PR-1)
+# Implementation Plan: Restore app->CloudWatch log shipping + never-again ratchets
 
-**Status:** VERIFIED
-**Date:** 2026-07-06
-**Approved by:** Parthiban (operator directive 2026-07-06, this session: "Make it ready for merge monitor it until it gets merged... then go ahead with the plan")
-**Branch:** `claude/sleepy-wright-lgj8am`
-**Changed crates:** common (crates/common), core (crates/core), app (crates/app)
-
-> Guarantee matrices: carried by cross-reference to
-> `.claude/rules/project/per-wave-guarantee-matrix.md` (15-row + 7-row, mandatory
-> per `per-item-guarantee-check.sh`). Per-row this-PR specifics: code coverage —
-> 12 unit tests + 4 new source-scan ratchets + 1 updated ratchet, coverage
-> delta ≥ 0; audit coverage — `ws_event_audit` rows UNCHANGED (both Connected +
-> Reconnected forensic rows preserved); testing coverage — unit (pure fns),
-> edge/boundary (u32::MAX saturation, threshold boundaries), error-scenario
-> (off-hours suppression, latch), source-scan integration ratchets; code checks —
-> full pre-commit/pre-push battery, no `--no-verify`; performance — reconnect
-> COLD path only, zero hot-path allocation (every new `format!` carries
-> `// O(1) EXEMPT`); monitoring — 2 new static-label counters
-> (`tv_order_update_outage_pages_total`, `tv_order_update_stable_reconnects_total`);
-> logging — every new `error!` carries `code = ErrorCode::WsGap10OrderUpdateOutage`
-> with reason labels; alerting — the [HIGH] Telegram page (bypasses the coalescer)
-> + the existing `tv-prod-order-update-ws-inactive` CloudWatch alarm untouched;
-> security — no secrets in any new log/message, `reason` html-escaped downstream;
-> bugs fixing — closes RC1 (dead HIGH emit site) + RC2 (false-recovery storms)
-> from the verified 2026-07-06 incident; scenarios — 2026-07-06 replay traced in
-> Design; functionalities — no new pub fn (all new fns/consts private, each
-> unit-tested + called); code review — evidence-driven design (E5/E6) + judge
-> verdict; extreme check — 3 build-failing source-scan ratchets. Resilience rows:
-> no new tick-drop path (order-update WAL append untouched); `SubscribeRxGuard` /
-> pool watchdog untouched; no hot-path allocation; QuestDB self-heal untouched;
-> O(1) per-decision (pure fns over integers/bools); composite-key/DEDUP untouched;
-> real-time proof — counters + coded error! + Telegram + audit rows.
->
-> Honest 100% envelope: "100% inside the tested envelope: the HIGH page is
-> guaranteed for ANY outage reaching 3 consecutive in-market sub-stability
-> session ends — transport-error closes AND clean closes both count (2026-07-06
-> hostile-review fix; Dhan's documented auth-rejection delivery is a clean
-> Close frame); upstream frame loss on a connected socket stays OUTSIDE this
-> envelope (covered by the 14400s activity watchdog)."
-
-## Plan Items
-
-- [x] Item 1 — Archive the merged AUTH-P12 plan (Status: VERIFIED, branch merged
-  to main) per plan-enforcement Phase 4; write this plan.
-  - Files: .claude/plans/archive/2026-07-01-auth-p12-ip-monitor-wiring.md, .claude/plans/active-plan.md
-
-- [x] Item 2 — Add `ErrorCode::WsGap10OrderUpdateOutage` ("WS-GAP-10",
-  Severity::High, runbook `.claude/rules/project/wave-2-error-codes.md`) +
-  the `## WS-GAP-10` runbook section (cross-ref test satisfied same commit).
-  - Files: crates/common/src/error_code.rs, .claude/rules/project/wave-2-error-codes.md
-  - Tests: test_all_variants_have_unique_code_str, test_code_str_roundtrip_via_from_str, every_error_code_variant_appears_in_a_rule_file
-
-- [x] Item 3 — Reachable [HIGH] `OrderUpdateDisconnected` page from INSIDE the
-  reconnect loop: edge-triggered once per outage episode at ≥3 consecutive
-  in-market failures (Rules 3+4); latch re-arms only after a 60s-survived
-  reconnect; the every-10th-failure `error!` gains `code = WS-GAP-10`
-  (`reason = "threshold_streak"`).
-  - Files: crates/core/src/websocket/order_update_connection.rs
-  - Tests: test_should_page_outage_fires_at_threshold_in_market, test_should_page_outage_below_threshold_is_silent, test_should_page_outage_never_off_hours, test_should_page_outage_edge_triggered_once_per_episode, test_should_page_outage_fires_on_first_in_market_failure_after_off_hours_streak, test_should_page_outage_at_u32_max_saturation, test_outage_constants_pinned
-
-- [x] Item 4 — Honest recovery: `OrderUpdateReconnected` fires ONLY after the
-  new socket survives a 60s stability window (time-survival, NEVER
-  first-frame-gated — the order stream is legitimately silent for hours);
-  connect-edge Telegram emission deleted (both `ws_event_audit` rows kept);
-  sub-stability clean closes count toward the streak (see Item 7).
-  - Files: crates/core/src/websocket/order_update_connection.rs
-  - Tests: test_streak_after_clean_close_resets_after_stable_session, test_should_emit_stable_recovery_requires_prior_failures
-
-- [x] Item 5 — Dead site at the main.rs order-update spawn: the post-await
-  `OrderUpdateDisconnected` notify (unreachable since the WS-GAP-04
-  never-give-up rewrite) replaced with a defensive coded `error!`
-  (`reason = "task_exited_unreachable"`); unused `ou_notifier` binding removed;
-  events.rs doc comments updated (doc-only — templates/severities unchanged).
-  - Files: crates/app/src/main.rs, crates/core/src/notification/events.rs
-
-- [x] Item 6 — Source-scan ratchets in the existing guard file: HIGH page
-  emitted inside the reconnect loop; Reconnected emission is stability-gated
-  (single full-token occurrence AFTER the stability pin); main.rs has zero
-  post-await OrderUpdateDisconnected emissions; the existing reconnect-notify
-  ratchet message updated.
-  - Files: crates/core/tests/ws_telegram_visibility_guard.rs
-  - Tests: order_update_high_page_is_emitted_inside_reconnect_loop, order_update_reconnected_is_stability_gated_not_connect_edge, main_rs_does_not_emit_order_update_disconnected_after_task_await, order_update_connection_fires_reconnect_notify
-
-- [x] Item 7 — Hostile-review fix (2026-07-06, same day): clean-close outages
-  must page. Any session ending BEFORE the 60s stability window increments the
-  streak regardless of delivery mode (`streak_after_clean_close(prev,
-  stability_reached)` → `prev.saturating_add(1)` when unstable, 0 when
-  stable); the page decision (`should_page_outage`) is evaluated in BOTH
-  reconnect-loop arms via the shared `emit_in_market_outage_page` helper; the
-  off-hours clean-close flap enters the same WS-GAP-04 sleep after the attempt
-  budget (`decide_reconnect_action` parity). Closes the mixed regime (≤2
-  errors then one clean close, repeating) that perpetually defeated the
-  threshold, and the pure clean-close dead-token regime (the file's own
-  documented auth-rejection delivery mode).
-  - Files: crates/core/src/websocket/order_update_connection.rs, crates/core/tests/ws_telegram_visibility_guard.rs, .claude/rules/project/wave-2-error-codes.md
-  - Tests: test_streak_after_clean_close_counts_as_failure_when_unstable, test_streak_after_clean_close_mixed_regime_reaches_page_threshold, test_streak_after_clean_close_resets_after_stable_session, test_streak_after_clean_close_saturates_at_u32_max, order_update_clean_close_counts_as_failure_and_can_page
-
-## Scenarios
-
-| # | Scenario | Expected |
-|---|----------|----------|
-| 1 | 2026-07-06 replay: dead token, RST ~10ms after login, 39+ in-market failures | ONE [HIGH] page ≈1s in (failure 3); zero false Low "reconnected"; coded error! at 10/20/30 |
-| 2 | Operator fixes token; connect survives 60s | ONE [LOW] reconnected; latch re-armed; streak 0 |
-| 3 | Off-hours failure streak of any length | No HIGH page (existing Low/audit semantics stand) |
-| 4 | Streak accumulated off-hours crosses 09:00 IST | HIGH page on FIRST in-market failure at/above threshold (`>=` latch) |
-| 5 | Clean close mid-paged-episode | Streak keeps counting; latch prevents duplicate page; exponential backoff, no silent 0ms flap loop |
-| 6 | Pure clean-close dead-token flap (in-market) | Streak 1→2→3 → ONE [HIGH] page (hostile-review fix — was silent) |
-| 6b | Mixed regime: 2 errors + 1 clean close, repeating | Clean close is failure #3 → ONE [HIGH] page (was perpetually defeated) |
-| 6c | Off-hours clean-close flap | Counts + capped backoff, then WS-GAP-04 sleep-until-open after the attempt budget; no HIGH page (market-hours gate) |
-| 6d | Healthy 4h session ends with a clean close | Stability was reached → streak resets to 0; nothing counts, nothing pages |
-| 7 | Idle day: zero frames for hours on a healthy socket | Stability window still completes at 60s (time-survival, not frame-gated) |
-| 8 | Socket dies at 59.9s | No recovery Telegram; latch stays armed (correct) |
+**Status:** APPROVED
+**Date:** 2026-07-07
+**Approved by:** Parthiban (operator directive 2026-07-07, this session)
+**Changed crates:** core (crates/core), app (crates/app), common (crates/common — test extension only)
 
 ## Design
 
-RC1 (dead HIGH emit) + RC2 (false-recovery storms), both verified 2026-07-06
-(evidence: E5/E6). The fix:
+**Root cause:** commit `c81a81a` (2026-07-05, "one human log file; robot files into machine/ subfolder")
+moved every machine sink the app writes from `data/logs/` to `data/logs/machine/`
+(`crates/app/src/observability.rs::MACHINE_LOGS_DIR`), but the CloudWatch agent's watched globs at
+`deploy/aws/cloudwatch-agent.json:33-34` (and the divergent first-boot copy in
+`deploy/aws/terraform/user-data.sh.tftpl`) still point at the top level
+(`/opt/tickvault/data/logs/errors.jsonl*`, `/opt/tickvault/data/logs/app.*`). Since 2026-07-06 17:19 IST
+zero app log events reach `/tickvault/prod/app` — app healthy, shipper dead-tailing nothing.
 
-1. **WS-GAP-10 error code** (`WsGap10OrderUpdateOutage`, Severity::High,
-   wave-2 runbook) tagging three events by `reason` label: `in_market_outage`
-   (the once-per-episode HIGH page), `threshold_streak` (the every-10th-failure
-   persist error), `task_exited_unreachable` (the defensive main.rs log).
-2. **In-loop edge-triggered page**: private pure fn
-   `should_page_outage(within_market_hours, consecutive_failures, already_paged)`
-   — fires when in-market AND not already paged this episode AND
-   streak ≥ `ORDER_UPDATE_OUTAGE_PAGE_FAILURE_THRESHOLD` (3). Uses `>=` (not
-   `==`) so an off-hours-accumulated streak pages on the first in-market
-   failure. Wired into the `IncrementAndRetry` arm of
-   `run_order_update_connection`; market-hours input is the EXISTING
-   `is_within_market_hours(&calendar)` (trading-day + [09:00,16:00) IST).
-   [HIGH] severity bypasses the coalescer → instant Telegram. Telegram body
-   passes the 10 commandments (plain English, specific numbers, action verbs).
-3. **60s time-survival recovery gate**: `connect_and_listen` gains a
-   `stability_reached: &mut bool` param + a `tokio::select!` arm on a pinned
-   60s sleep (`ORDER_UPDATE_RECONNECT_STABILITY_SECS`). The arm sets the flag
-   unconditionally (so the episode re-arm always works) and emits
-   `OrderUpdateReconnected` only when `failures_before_attempt > 0`
-   (`should_emit_stable_recovery`). TIME-survival, NOT first-frame gating: the
-   order stream is legitimately silent for hours (watchdog threshold history
-   660s→1800s→14400s), so a frame gate would never fire. 60s is far beyond the
-   observed die-after-login window (~10ms) and far below the 14400s watchdog.
-   The connect-edge Telegram emission is DELETED; both audit rows stay.
-4. **Episode lifecycle**: `outage_paged` latch in the outer loop. Re-armed
-   (with streak reset) when a connect attempt reaches the stability window;
-   also re-armed by the WS-GAP-04 post-close sleep and the PR-E Dhan
-   re-enable (fresh episodes). Hostile-review fix (2026-07-06, same day): a
-   session ending BEFORE the stability window is a FAILURE regardless of
-   delivery mode — `streak_after_clean_close(prev, stability_reached)`
-   increments on a sub-60s clean close (Dhan's documented auth-rejection
-   delivery is a clean Close frame) and resets only on stability survival.
-   The `Ok(())` arm evaluates the SAME `should_page_outage` decision and
-   routes through the shared `emit_in_market_outage_page` helper, plus the
-   same off-hours WS-GAP-04 exhaustion path (`decide_reconnect_action`
-   parity). Normal idle-day clean closes (sessions living minutes/hours)
-   reached stability and never count.
-5. **Dead site**: main.rs post-await notify → defensive coded `error!`
-   (`task_exited_unreachable`); the fast-boot spawn site needs no change (no
-   post-await code; the in-loop page lives in the shared core fn — boot
-   symmetry by construction).
+**The fix package (judge-synthesized final design — full text in the task scratchpad `final-design.md`):**
 
-2026-07-06 event-flow replay: 14:05:49 watchdog kills 4h-silent socket
-(session had passed 60s → episode fresh) → RST failures 1 (0ms), 2 (0ms),
-3 (500ms) → ONE [HIGH] Telegram ≈1s in + `error!(code=WS-GAP-10)` → failures
-4..39: warn! each, coded error! at 10/20/30, ZERO further Telegram (no connect
-survives 10ms → stability never fires → no false Low) → operator fixes token →
-connect survives 60s → ONE [LOW] reconnected → latch re-armed, streak 0.
+1. **Shipper glob fix (both configs, byte-identical `.2*` pins):** replace both collect_list entries in
+   `deploy/aws/cloudwatch-agent.json:33-34` with
+   `/opt/tickvault/data/logs/machine/errors.jsonl.2*` (stream `{instance_id}/errors-jsonl`) and
+   `/opt/tickvault/data/logs/machine/app.2*` (stream `{instance_id}/app`); same two globs in
+   `deploy/aws/terraform/user-data.sh.tftpl` (keep `/tickvault/$${ENVIRONMENT}/app` group, keep
+   `/var/log/messages` entry, fix the stale comment, add `data/logs/machine` to the first-boot mkdir).
+   The `.2*` pin matches the hourly `errors.jsonl.YYYY-MM-DD-HH` / `app.YYYY-MM-DD-HH` files while
+   excluding the `errors.jsonl` compat symlink and the 0-byte `app.log` Alloy placeholder. Old
+   top-level globs are DROPPED (launcher-owned top level; dead globs ARE the drift class). Group and
+   stream names preserved — dashboards/queries/retention untouched. `machine/candles/`,
+   `machine/live_ticks/`, `errors.log`, `errors.summary.md` deliberately NOT shipped
+   (ingestion-runaway budget + duplicates).
+2. **Silence alarm:** new `aws_cloudwatch_metric_alarm.app_log_ingestion_silent` in
+   `deploy/aws/terraform/log-retention.tf` (below `logs_ingestion_runaway`): namespace `AWS/Logs`,
+   metric `IncomingLogEvents`, `dimensions = { LogGroupName = aws_cloudwatch_log_group.tv_app.name }`,
+   Sum / period 300 / evaluation_periods 3 / threshold 1 / `LessThanThreshold`,
+   `treat_missing_data = "breaching"` (AWS/Logs publishes NO datapoint at zero events — silence IS
+   missing), `actions_enabled = false`, alarm/ok actions `[aws_sns_topic.tv_alerts.arn]` (direct refs,
+   sibling style). Gated by appending a 4th member
+   `aws_cloudwatch_metric_alarm.app_log_ingestion_silent.alarm_name` to the existing market-hours gate
+   Lambda's `ALARM_NAMES` join in `deploy/aws/terraform/market-hours-liveness-alarm.tf` — inherits the
+   09:20 IST open + OK-reset / 15:35 IST close (no nightly-stop false pages, zero new infra).
+3. **Deploy smoke check (non-fatal):** new step "Verify log ingestion (LOG-INGESTION-SMOKE,
+   non-fatal)" in `.github/workflows/deploy-aws.yml` after "Verify app readiness", before "Record
+   deployed binary git SHA to SSM". Self-contained `START_MS=$(date +%s%3N)` captured in-step
+   (post-readiness — proves the NEW agent config ships), 12 polls × 25s of
+   `aws logs filter-log-events --log-group-name /tickvault/prod/app --start-time "$START_MS" --limit 1`.
+   Failure = `::warning::` + plain-English SNS page to `tv-prod-alerts`, then `exit 0` — NEVER fatal
+   (2026-06-09 observability-never-blocks-the-trading-deploy doctrine). IAM: one statement in
+   `deploy/aws/terraform/oidc.tf` github_deploy policy —
+   `logs:FilterLogEvents` on `${aws_cloudwatch_log_group.tv_app.arn}:*`. Also extend the on-box
+   `=== APP LOG DIR ===` echo with `ls -la /opt/tickvault/data/logs/machine/`.
+4. **Token countdown (`crates/core/src/auth/token_manager.rs`):** the flat ~23h
+   `tv_token_remaining_seconds` step becomes a live 30s countdown. New
+   `const TOKEN_GAUGE_INTERVAL_SECS: u64 = 30;` extract private
+   `fn emit_token_remaining_gauge(&self)` (arc-swap load, `time_until_refresh(0)`, skip-on-None —
+   never set 0 pre-auth); re-point both existing emit sites at it; replace the single renewal_loop
+   sleep with a sliced loop via pure `fn next_gauge_slice(remaining) -> Duration` (min(remaining, 30s)),
+   emitting per slice. NO new task / pub fn / main.rs wiring — gauge lifecycle stays coupled to the
+   lane-owned renewal task (dhan-lane C4). Metric name unchanged; the existing
+   `tv-<env>-token-remaining-low` alarm semantics are preserved.
+5. **Never-again ratchets:** NEW `crates/app/tests/cw_agent_log_glob_guard.rs` importing
+   `tickvault_app::observability` path constants — asserts both shipper configs' globs derive from the
+   Rust constants, no collect_list glob points at the top-level logs dir, stream names are stable, and
+   the deploy workflow carries the LOG-INGESTION-SMOKE step + oidc.tf grant. Extend
+   `crates/common/tests/cloudwatch_app_alarms_wiring.rs` to pin the new alarm resource, its
+   `treat_missing_data = "breaching"`, and its membership in the gate Lambda's ALARM_NAMES join.
 
 ## Edge Cases
 
-- Off-hours suppression: `should_page_outage` requires `within_market_hours`;
-  existing off-hours Low/audit semantics stand untouched.
-- Off-hours streak crossing 09:00 IST: pages on first in-market failure
-  (`>=` with latch).
-- Sub-stability clean close: counts as a failure (increments streak) and can
-  page — in-market pure clean-close and mixed regimes both reach the 3-failure
-  threshold; the paged latch still prevents duplicate pages.
-- Off-hours clean-close flap: counts + capped exponential backoff, then the
-  WS-GAP-04 sleep-until-open after the attempt budget (parity with the error
-  arm); never a HIGH page off-hours.
-- Healthy long-lived session ending in a clean close: `stability_reached`
-  is true → streak resets to 0; nothing counts.
-- PR-E Dhan runtime toggle + WS-GAP-04 post-close sleep both re-arm the
-  episode (fresh streak + latch).
-- Boot-time in-market failure streak pages at 3 like any other episode.
-- u32 saturation: `saturating_add` streak; `should_page_outage(true, u32::MAX,
-  false)` fires (tested).
-- `notifier = None` (tests / minimal wiring): coded `error!` + counter still
-  fire; only the Telegram leg is skipped.
-- Idle-day zero-frame sockets legitimately count stable at 60s (time-survival
-  by design).
-- Completed tokio Sleep is never re-polled: the select arm carries an
-  `if !*stability_reached` guard (load-bearing — re-polling a completed Sleep
-  panics).
+- **Compat symlink + 0-byte placeholder:** `machine/errors.jsonl` (symlink) and `machine/app.log`
+  (0-byte Alloy placeholder) sit next to the hourly files; the `.2*` pins structurally exclude both, so
+  the agent can never latch onto the wrong "newest" file. Pin safe until year 3000.
+- **Hourly rotation:** the CW agent tails the newest-mtime match per glob — the hour-boundary hop to
+  `app.YYYY-MM-DD-HH+1` is the same mechanism the old glob relied on; a hop delay is far inside the
+  15-min alarm window.
+- **First boot:** agent starts before the app creates `machine/` — pre-creating the dir in the
+  user-data mkdir removes the agent scan-error window.
+- **Nightly 16:30 IST stop / weekends / NSE holidays:** box off ⇒ metric missing ⇒ alarm state ALARM,
+  but `actions_enabled=false` outside the 09:20–15:35 gate window and the gate's open-time OK reset
+  mean it can never page out of window. Weekday NSE holidays: box runs, and the unconditional
+  once-per-60s seal-writer progress line guarantees ≥1 event/min — no false page.
+- **Mid-day deploy:** fetch-config agent restart (~1-2 min) + app restart/WAL replay are inside the
+  15-min window.
+- **Pre-auth boot window:** gauge skip-on-None preserved — never emits 0 (would false-fire
+  token-remaining-low, threshold 14400, stat Minimum).
+- **Short final sleep slice:** `next_gauge_slice` passes remainders < 30s through unchanged, so the
+  renewal instant never shifts (pause/advance test asserts no early renewal).
+- **Deploy outside market hours with broken shipper:** smoke-step SNS page is the immediate signal;
+  the alarm backstops at the next window open (~09:35 IST earliest).
 
 ## Failure Modes
 
-- Telegram send failure → TELEGRAM-01 path; the coded `error!` still reaches
-  errors.jsonl/CloudWatch independently (5-sink chain).
-- Socket dying at 59.9s emits nothing and the latch stays armed (correct —
-  not a recovery).
-- Pathological connect→survive-60s→die metronome re-pages at most ~1 HIGH per
-  ~61s worst case (stability window + 3-failure ladder) — bounded, and each
-  cycle is a genuine outage+recovery (runbook documents it).
-- `/health` order-update connected-flag never flipping false during an in-loop
-  outage is a PRE-EXISTING gap — flagged follow-up, NOT fixed here (scope
-  lock).
-- A future refactor that makes `run_order_update_connection` return is caught
-  loudly by the defensive `task_exited_unreachable` error! at the spawn site.
+- **Shipper still dead after fix (agent down, bad config merge):** smoke check pages at deploy time;
+  `app_log_ingestion_silent` pages within ~15 min of the next market-hours window. Neither ever fails
+  the deploy — trading unaffected by design.
+- **Gate Lambda EventBridge state drift (#1404 class):** alarm actions stay disabled silently — same
+  blast radius as the 3 existing gated alarms; the deploy smoke check is the independent second
+  detector (residual risk accepted, documented).
+- **Mid-window terraform apply:** ALARM_NAMES env change redeploys the gate Lambda; the new alarm's
+  actions stay disabled until the next 09:20 open (bounded one-session lag; smoke check covers it).
+- **AWS/Logs vended-metric publish lag (1-5 min observed):** absorbed by period 300 × 3; do not
+  tighten evaluation_periods without observing live lag.
+- **FilterLogEvents eventual consistency / throttling:** 300s poll budget covers it; a false ⚠️ is
+  non-fatal and self-corrects on operator check.
+- **Renewal retry storm:** gauge freezes between attempts (same as today, honest envelope); a frozen
+  countdown crossing 14400 still pages via the existing token alarm.
+- **Partial terraform apply (alarm created, join not updated):** alarm exists but never pages — the
+  `cloudwatch_app_alarms_wiring.rs` gate-membership rot guard pins the join in-repo; plan output
+  review required for all three resources.
 
 ## Test Plan
 
-- Unit tests (crates/core, `order_update_connection.rs::tests`): 12 tests
-  over the 3 private pure fns + pinned constants (see Items 3+4+7 test lists).
-- Source-scan ratchets (crates/core/tests/ws_telegram_visibility_guard.rs):
-  4 new + 1 updated (see Items 6+7).
-- Existing tests kept byte-identical-green:
-  test_first_reconnect_attempt_is_zero_ms_instant, test_backoff_calculation,
-  all test_compute_reconnect_backoff_*, all test_reconnect_action_*,
-  order_update_watchdog_threshold_is_at_least_1800_secs,
-  test_order_update_reconnected_severity_is_low,
-  test_order_update_disconnected_escapes_external_reason.
-- Command battery: `cargo fmt --check`; `cargo clippy -p tickvault-common -p
-  tickvault-core -p tickvault-app --no-deps -- -D warnings`; `cargo test -p
-  tickvault-common --lib --tests` (common touched → error-code catalogue +
-  cross-ref + tag-guard); `cargo test -p tickvault-core --lib --tests`;
-  `cargo test -p tickvault-app --lib`; plan-gate + plan-verify hooks.
-- Negative ratchet self-check: temporarily re-add a connect-edge Reconnected
-  emit → ratchet must FAIL; temporarily restore the main.rs notify → ratchet
-  must FAIL; revert both (noted in PR body).
+Scoped per `testing-scope.md`: `cargo test -p tickvault-core` (token_manager),
+`cargo test -p tickvault-app --test cw_agent_log_glob_guard`, `cargo test -p tickvault-common --test
+cloudwatch_app_alarms_wiring`. Tests:
+
+- `test_next_gauge_slice_caps_at_30s_and_passes_short_remainders` — pure fn (23h→30s, 7s→7s, 0→0).
+- `test_renewal_loop_uses_sliced_sleep_gauge_countdown` — source-scan: renewal_loop body contains
+  `next_gauge_slice` + `emit_token_remaining_gauge`; `TOKEN_GAUGE_INTERVAL_SECS == 30`.
+- Pause/advance (`tokio::time::pause`) test asserting the loop survives multiple slices with NO early
+  renewal.
+- `test_reference_agent_config_globs_match_observability_constants` — serde_json parse of
+  cloudwatch-agent.json; file_path set == globs derived from `MACHINE_LOGS_DIR` constants.
+- `test_userdata_inline_config_globs_match_reference` — line-scan of user-data.sh.tftpl (allowlist
+  `/var/log/messages`); set equality with the reference JSON.
+- `test_no_collect_list_glob_points_at_top_level_logs_dir` — every `/opt/tickvault/data/logs/...`
+  file_path in BOTH configs contains `/machine/` (the exact incident regression).
+- `test_stream_names_are_stable` — pins `{instance_id}/errors-jsonl` + `{instance_id}/app`.
+- `test_deploy_workflow_carries_log_ingestion_smoke` — pins "LOG-INGESTION-SMOKE",
+  "filter-log-events" in deploy-aws.yml and "logs:FilterLogEvents" in oidc.tf.
+- `cloudwatch_app_alarms_wiring.rs` extension — pins `app_log_ingestion_silent`,
+  `IncomingLogEvents`, `treat_missing_data  = "breaching"` in log-retention.tf, and
+  `app_log_ingestion_silent.alarm_name` inside the ALARM_NAMES join.
+
+Live verification evidence (post-merge, per zero-loss charter §4): two-file config diff; on-box
+`ls -la /opt/tickvault/data/logs/machine/`; first post-deploy `LOG-INGESTION-SMOKE OK` line verbatim;
+`aws logs describe-log-streams --order-by LastEventTime` showing fresh lastEventTimestamp on both
+streams; `aws cloudwatch describe-alarms` for the new alarm.
 
 ## Rollback
 
-`git revert` of the code commits restores prior behavior exactly; no
-schema/config/data migration; the ErrorCode variant is additive and inert
-after emit-site revert. No config toggle by design: operator-paging
-correctness must not be switch-off-able (audit Rule 11 no-false-OK); B12
-feature-flag rollback judged N/A with this rationale.
+Every change is independently revertible with no data-loss surface (logs land locally regardless):
+- Globs: `git revert` the two config files; next deploy re-copies + fetch-config's the old config.
+- Alarm + gate join: `terraform apply` after revert destroys the alarm and restores the 3-member join;
+  no state migration.
+- Smoke step + IAM grant: revert deploy-aws.yml step + oidc.tf statement; the step is additive and
+  non-fatal so an interim broken state cannot fail deploys.
+- Token countdown: revert restores the single flat sleep; both original emit sites remain semantically
+  identical (`time_until_refresh(0)`), so the alarm never notices.
+- Ratchet tests: deleting the reverted assertions in the same revert commit keeps CI green.
 
 ## Observability
 
-- `error!` sites carry `code = WS-GAP-10` with reason labels
-  `in_market_outage` / `threshold_streak` / `task_exited_unreachable` →
-  the 5-sink chain (stdout / app.log / errors.log / errors.jsonl /
-  CloudWatch).
-- New static-label counters: `tv_order_update_outage_pages_total` (one per
-  HIGH page) + `tv_order_update_stable_reconnects_total` (one per survived
-  60s recovery). Panel/alert guard files
-  (`operator_health_dashboard_guard.rs` / `resilience_sla_alert_guard.rs`)
-  verified ABSENT — retired with the CloudWatch-only migration.
-- `ws_event_audit` rows unchanged (Connected / Reconnected / Disconnected /
-  Sleep rows all preserved).
-- The `tv-prod-order-update-ws-inactive` CloudWatch alarm untouched.
-- Runbook: `## WS-GAP-10` section in
-  `.claude/rules/project/wave-2-error-codes.md` (trigger, incident evidence,
-  triage, honest envelope).
+- New alarm `tv-<env>-app-log-ingestion-silent` (AWS/Logs `IncomingLogEvents`, vended = $0; +1 alarm
+  ≈ $0.10/mo) — pages Telegram via `tv_alerts` SNS inside market hours; OK action self-clears.
+- Deploy-time signal: LOG-INGESTION-SMOKE step output + ⚠️ SNS page on failure (plain-English body per
+  the 10 Telegram commandments); on-box deploy log now carries `ls -la .../machine/` evidence.
+- `tv_token_remaining_seconds` becomes a live ≤30s-stale countdown (agent scrapes 60s; alarm period
+  300 stat Minimum sees ≥10 fresh samples) — the `tv-<env>-token-remaining-low` alarm finally
+  evaluates a decaying value instead of a ~23h flat step.
+- No new ErrorCode / rule file needed: no Rust `error!` emit site is added (cross-ref tests govern
+  ErrorCode variants only). No hot-path change — the gauge loop is cold path (one arc-swap load +
+  gauge set per 30s); no DHAT/Criterion required.
+
+## Plan Items
+
+- [ ] Item 1 — Shipper glob fix in BOTH configs (`.2*` machine/ pins, drop top-level globs, mkdir + comment fix)
+  - Files: deploy/aws/cloudwatch-agent.json, deploy/aws/terraform/user-data.sh.tftpl
+  - Tests: test_reference_agent_config_globs_match_observability_constants, test_userdata_inline_config_globs_match_reference, test_stream_names_are_stable
+
+- [ ] Item 2 — `app_log_ingestion_silent` alarm + gate Lambda ALARM_NAMES 4th member
+  - Files: deploy/aws/terraform/log-retention.tf, deploy/aws/terraform/market-hours-liveness-alarm.tf
+  - Tests: cloudwatch_app_alarms_wiring.rs extension (alarm pin + breaching pin + gate-join membership pin)
+
+- [ ] Item 3 — Deploy LOG-INGESTION-SMOKE step (non-fatal, warn + SNS) + oidc `logs:FilterLogEvents` grant + on-box machine/ dir listing
+  - Files: .github/workflows/deploy-aws.yml, deploy/aws/terraform/oidc.tf
+  - Tests: test_deploy_workflow_carries_log_ingestion_smoke
+
+- [ ] Item 4 — Token countdown: sliced-sleep 30s gauge emission in renewal_loop
+  - Files: crates/core/src/auth/token_manager.rs
+  - Tests: test_next_gauge_slice_caps_at_30s_and_passes_short_remainders, test_renewal_loop_uses_sliced_sleep_gauge_countdown, pause/advance no-early-renewal test
+
+- [ ] Item 5 — Glob-drift ratchet suite (NEW test file, constants-derived assertions)
+  - Files: crates/app/tests/cw_agent_log_glob_guard.rs, crates/common/tests/cloudwatch_app_alarms_wiring.rs
+  - Tests: test_no_collect_list_glob_points_at_top_level_logs_dir (+ all Item 1/3 tests live here)
+
+- [ ] Item 6 — Evidence + docs: PR body with live verification artefacts; runbook/rule notes for the new alarm
+  - Files: .claude/plans/active-plan.md (checkbox ticks), PR body (config diff, on-box ls, smoke OK line, describe-log-streams)
+  - Tests: bash .claude/hooks/plan-verify.sh (Status → VERIFIED before push)
+
+## Per-Item Guarantee Matrix
+
+Carried by CROSS-REFERENCE to `.claude/rules/project/per-wave-guarantee-matrix.md` (15-row + 7-row,
+mandatory) — permitted by that rule ("or cross-reference it"). Rows that genuinely apply here:
+
+| Row | How this plan satisfies it |
+|---|---|
+| 100% monitoring | New AWS/Logs silence alarm + smoke-step page + live token countdown gauge (7-layer subset appropriate to an infra fix) |
+| 100% alerting | Alarm gated via the market-hours Lambda (edge behavior via gate open OK-reset); rot-guard pins the alarm AND its gate membership so it can never silently fall out of the join |
+| 100% testing coverage | Unit + source-scan + pause/advance time-control + config-parse ratchets, scoped per testing-scope.md (core + app + common test lanes, all feeding All Green) |
+| No new hot-path allocation | Token gauge is cold path (1 arc-swap load / 30s); no per-tick code touched — O(1) hot path untouched |
+| 100% extreme check | Every fix is paired with a build-failing ratchet (glob drift, top-level regression, workflow-step deletion, gate-join rot, sliced-sleep refactor) |
+
+N/A rows (one-line reasons): audit coverage — no SEBI-relevant typed event added, no audit table;
+code performance (DHAT/Criterion) — no hot-path change; security hardening delta — one read-only,
+group-scoped IAM grant is the entire attack-surface change (least privilege, reviewed);
+scenarios/chaos — failure modes are AWS-side config drift, covered by ratchets + alarm, not by
+in-process chaos tests; bug-fixing 3-agent review — runs per operator-charter §E on the
+implementation diff (this is the plan artifact).
+
+**Honest 100% claim:** 100% inside the tested envelope, with ratcheted regression coverage: the two
+shipper configs' globs are build-fail-pinned to the Rust path constants; the silence alarm pages
+within ~15 min of a dead shipper inside the 09:20–15:35 IST gated window; the deploy smoke check
+proves fresh ingestion within 300s or pages, never failing a verified-healthy trading deploy; the
+token gauge decays with ≤30s staleness while a token is loaded. NOT claimed: paging outside the gate
+window (smoke page + next-window alarm are the bounded backstop), immunity to gate-Lambda EventBridge
+state drift (#1404 class — the smoke check is the independent detector), or gauge freshness during
+renewal retry storms (frozen between attempts, same as today).
