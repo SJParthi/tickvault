@@ -1,303 +1,336 @@
-# Implementation Plan: AUTH-P12 — wire the runtime static-IP / EIP-change monitor
+# Implementation Plan: Silent-Feed Alerting Hardening (2026-07-06 incident)
 
-**Status:** VERIFIED
-**Date:** 2026-07-01
-**Approved by:** Parthiban (operator) — standing approval for the permutation-coverage audit fix queue (`.claude/plans/permutation-coverage-audit-2026-07-01.md` §"Fix queue", PR-1 AUTH-P12).
-**Branch:** `claude/harden-ip-monitor-wiring`
-**Changed crates:** `core` (crates/core), `app` (crates/app)
+**Status:** APPROVED
+**Date:** 2026-07-06
+**Approved by:** Parthiban (operator directive 2026-07-06)
+**Changed crates:** core (`crates/core`), app (`crates/app`), common (test ratchets in `crates/common`) — plus terraform (`deploy/aws/terraform/`) and the operator-portal Lambda (`deploy/aws/lambda/operator-control/handler.py`).
 
-> Guarantee matrices: carried by cross-reference to
-> `.claude/rules/project/per-wave-guarantee-matrix.md` (15-row + 7-row, mandatory
-> per `per-item-guarantee-check.sh`). Dominant guarantee here: **strictly no worse
-> than today** — purely additive detection; boot-time IP verify unchanged; no
-> hot-path (tick) code touched; the monitor is a 5-min-cadence cold-path task.
-
-## Design
-
-**Gap (AUTH-P12).** `crates/core/src/network/ip_monitor.rs::spawn_ip_monitor` is
-defined + fully unit-tested but has ZERO production call site — every caller is
-`#[cfg(test)]`. `crates/app/src/main.rs` wires ONLY boot-time IP verification
-(`verify_public_ip` at Step 5.5 + `verify_static_ip_at_boot` at Step 6a). A
-mid-session public-IP / Elastic-IP change (EIP disassociation, NAT failover) is
-therefore never re-detected. `docs/architecture/guarantees.md:118` falsely cites
-the never-spawned detector as the proof artefact for "Static IP enforcement".
-
-**Fix.** Spawn `spawn_ip_monitor` from `run_dhan_lane` Step 5.5 (live mode only,
-where the boot `verify_public_ip` already runs and returns the verified egress
-IP). The monitor polls the public IP every `IP_MONITOR_CHECK_INTERVAL_SECS`
-against that boot-verified IP.
-
-**Halt-vs-alert decision (audit-mandated, NOT a blind halt).**
-On a *confirmed sustained* mismatch (confirm-twice debounce — a single transient
-metadata blip does not act):
-- Always emit `error!(code = GAP-NET-01)` CRITICAL (routes to Telegram via the
-  5-sink ERROR pipeline).
-- HALT the process (`std::process::exit(1)`) ONLY when `dry_run == false` — real
-  orders would be rejected by Dhan's static-IP mandate, so blinding-then-halting
-  is the safe outcome.
-- When `dry_run == true` (current state, ~3 months no real orders) DO NOT halt —
-  killing a working live feed for a no-orders IP change would drop ticks for zero
-  financial benefit. Alert only; keep streaming.
-
-The decision is a **pure function** `decide_ip_action(consecutive_mismatches,
-threshold, halt_on_mismatch) -> IpMonitorAction` so it is exhaustively
-unit-testable with no I/O.
-
-**Debounce.** The monitor tracks `consecutive_mismatches`; a `Match` or
-`CheckFailed` (network blip — indistinguishable from EIP-detach, handled as
-transient per existing `warn!`) resets the counter. Action fires only when
-`consecutive_mismatches >= IP_MONITOR_MISMATCH_CONFIRM_THRESHOLD` (= 2). Reuses
-the monitor's existing 5-minute polling loop, so a confirmed mismatch is ≥ 2 poll
-cycles of the SAME wrong IP — never a one-shot flap.
-
-**Market-hours awareness (audit-findings Rule 3).** An EIP/IP change is a
-host-infrastructure fact true 24/7 (not live-data-driven) and it breaks SSM +
-Dhan reachability whenever it happens — so detection itself is NOT market-hours
-gated (a weekend EIP detach must still be seen). The *halt* is gated by `dry_run`
-(a wrong IP is equally fatal for orders whenever real trading resumes), not by
-market hours. The alert is edge-triggered (fires once per confirmed episode;
-counter resets on recovery) — no spam (audit-findings Rule 4).
-
-**Lifetime.** Mirror the seal-writer pattern (main.rs:4153): create a
-`watch::channel(false)` shutdown handle, `std::mem::forget` the sender for
-process lifetime, hand the receiver to `spawn_ip_monitor`.
-
-## Edge Cases
-
-- **`dry_run == true` (today):** confirmed mismatch → alert only, NO halt, feed
-  keeps running. `decide_ip_action(2, 2, false) == AlertOnly`.
-- **`dry_run == false` (future live):** confirmed mismatch → alert + halt.
-  `decide_ip_action(2, 2, true) == AlertAndHalt`.
-- **Single transient mismatch (1 poll):** below threshold → Continue (no action,
-  no alert). `decide_ip_action(1, 2, _) == Continue`.
-- **`CheckFailed` (both IP-echo endpoints unreachable — e.g. EIP fully detached):**
-  transient `warn!`, resets the consecutive-mismatch counter. AUTH-P13
-  (stranded-box escalation) is OUT OF SCOPE for this PR — tracked separately in
-  the audit at medium.
-- **Non-live mode (paper/sandbox):** monitor is NOT spawned (no Dhan orders, no
-  static-IP mandate) — same gating as the existing `verify_public_ip` Step 5.5.
-- **Empty / disabled config:** existing `spawn_ip_monitor` guard exits the task
-  immediately (already tested).
-
-## Failure Modes
-
-- **False halt on a flap:** prevented by confirm-twice debounce (≥ 2 poll cycles
-  of the same wrong IP).
-- **Silent dead-code regression:** prevented by a source-scan wiring guard test
-  asserting `spawn_ip_monitor(` appears in `crates/app/src/main.rs`.
-- **IP-echo service outage misread as EIP change:** `CheckFailed` is handled as
-  transient and resets the counter, so an echo outage never triggers halt.
-- **Monitor task panic:** the task has no `unwrap`/`expect` on the poll path; a
-  panic kills only the monitor, never the feed. Supervised-respawn is a possible
-  follow-on but not required for this gap (boot-time gate remains primary).
-
-## Test Plan
-
-Unit (crates/core, `ip_monitor::tests`):
-- `test_decide_ip_action_below_threshold_continues`
-- `test_decide_ip_action_at_threshold_dry_run_alerts_only`
-- `test_decide_ip_action_at_threshold_live_alerts_and_halts`
-- `test_decide_ip_action_above_threshold_still_acts`
-- `test_ip_monitor_mismatch_confirm_threshold_is_two`
-
-Wiring guard (crates/app, `ip_monitor_wiring_guard.rs`):
-- `test_spawn_ip_monitor_has_production_call_site` — source-scan asserts
-  `spawn_ip_monitor(` is present in `crates/app/src/main.rs` (mirrors
-  `health_counter_fix7_guard.rs`), so it can never regress to dead code.
-- `test_ip_monitor_halt_is_dry_run_gated` — source-scan asserts the wiring reads
-  `dry_run` to decide halt-vs-alert.
-
-Verify: `cargo check -p tickvault-core -p tickvault-app` then
-`cargo test -p tickvault-core -p tickvault-app --lib` green.
-
-## Rollback
-
-Single-commit PR on a feature branch. Revert = `git revert <sha>`; the monitor is
-purely additive (a new spawned task + a new pure fn + two new constants + a guard
-test). Removing it returns to the prior boot-only IP-verify behaviour with zero
-data-path change. No schema change, no config-format change, no migration.
-
-## Observability
-
-- `error!(code = "GAP-NET-01", severity = "…")` on confirmed mismatch — routes to
-  Telegram via the 5-sink ERROR pipeline (existing GAP-NET-01 runbook:
-  `.claude/rules/dhan/authentication.md`, `docs/runbooks/README.md:40`).
-- The existing `spawn_ip_monitor` `info!("GAP-NET-01: IP monitoring started")`
-  positive-signal log confirms the monitor is live at boot.
-- Per-poll `IpCheckResult` logging (Match / Mismatch / CheckFailed) already exists;
-  no new Prometheus counter is strictly required (the ERROR-with-code is the
-  operator-actionable signal).
+> **Incident context (2026-07-06):** the Dhan feed degraded ALL day and the
+> operator received ZERO pages, despite FOUR independent signals firing
+> internally: (1) exchange→receive lag p99 46s / max 199s all session;
+> (2) 29–67 of 776 subscribed instruments silent EVERY minute — the
+> tick-gap alarm threshold of 100 was never crossed; (3) 125 SLO score
+> crossings in the 0.94–0.97 band — SLO-02 has been Telegram-suppressed
+> (log-only) since 2026-05-11 and the <0.80 Critical tier is mathematically
+> unreachable for feed degradation (tick_freshness alone bottoms at
+> 1−67/776 ≈ 0.914); (4) BOUNDARY-01 catch-up sealing ran at 9k–11.5k
+> seals/10min (coalesced warn!, no page). A fifth defect compounded the
+> blindness: the operator-portal lag SQL used `now()` (UTC) against
+> IST-shifted `ts`, producing a ~5h40m window that conflated WAL-replay
+> rows with live rows, AND its exchange-time window structurally
+> lag-censored the very lag it was meant to show (Rule-11 false-OK).
 
 ## Plan Items
 
-- [x] Item 1 — Add `IP_MONITOR_CHECK_INTERVAL_SECS` + `IP_MONITOR_MISMATCH_CONFIRM_THRESHOLD` constants and a pure `decide_ip_action` + `IpMonitorAction` to `ip_monitor.rs`; wire the debounce + dry_run-gated halt into the `spawn_ip_monitor` loop.
-  - Files: crates/core/src/network/ip_monitor.rs
-  - Tests: test_decide_ip_action_below_threshold_continues, test_decide_ip_action_at_threshold_dry_run_alerts_only, test_decide_ip_action_at_threshold_live_alerts_and_halts, test_decide_ip_action_above_threshold_still_acts, test_ip_monitor_mismatch_confirm_threshold_is_two
+- [ ] Item 1 — Retune `tick_gap_instruments_silent` IN PLACE (same resource address, no state churn): threshold 100 → 25 (fires ≥26; incident floor 29/min, peak 67 → pages within 10–12 min), period=60, statistic=Maximum, M-of-N 10-of-12 (`evaluation_periods=12`, `datapoints_to_alarm=10`), `treat_missing_data=notBreaching`, ABSOLUTE threshold (no %-of-universe denominator exists in CW; universe envelope-locked [100,1200] so 25 = 3.2% today / 2.1% at cap; dated revisit comment). Market-hours gate: `actions_enabled=false` + append alarm name to the window-gate Lambda `ALARM_NAMES` join (gauge is set only in-session, so the last in-session value keeps being scraped 15:30→16:30). Update stale alarm_description ("> 100" → "> 25 sustained ≥10 of 12 min in-market; WS-GAP-06 runbook") + the hardcoded alarm-count/cost text in the output block.
+  - Files: deploy/aws/terraform/app-alarms.tf, deploy/aws/terraform/market-hours-liveness-alarm.tf
+  - Tests: test_tick_gap_silent_alarm_threshold_is_twenty_five, test_tick_gap_silent_alarm_is_window_gated
 
-- [x] Item 2 — Spawn the monitor from `run_dhan_lane` Step 5.5 (live mode) using the boot-verified IP + `!config.strategy.dry_run` as the halt gate.
-  - Files: crates/app/src/main.rs
-  - Tests: (covered by wiring guard in Item 3)
+- [ ] Item 2 — NEW alarm `realtime_guarantee_degraded` in NEW FILE `silent-feed-alarms.tf`: metric `tv_realtime_guarantee_score` (ALREADY CW-exported — zero Rust, zero allowlist change), `LessThanThreshold` 0.95 (== `SLO_WARN_THRESHOLD`; score==0.95 is Healthy and correctly non-breaching), period=60, statistic=Minimum (1 datapoint/60s scrape today so Min==Max; Minimum is future-proof and mirrors the UNTOUCHED sibling `realtime_guarantee_critical` at <0.80), M-of-N 12-of-15 (strict 15/15 would never latch on the incident's 125 oscillating crossings = Rule-11 false-OK reproduction; 12/15 demands ≥80% of a quarter-hour degraded — incident tick_freshness 0.914–0.963 satisfies it, a 2–3 min single-reconnect dip cannot), `treat_missing_data=notBreaching`, `actions_enabled=false` + gate-Lambda `ALARM_NAMES` append (publisher runs 24/7). `ok_actions=[SNS tv_alerts]` for the falling-edge recovery note; edge-trigger is CloudWatch-native (Rule 4). Name/description say "degraded (Medium)" — no "critical" token. Same PR: fix the stale main.rs comment citing the retired Prometheus "tv-realtime-score-degraded" alert — point it at this alarm. Medium-tier Telegram VISUAL rendering is a flagged follow-up (telegram-webhook handler.py stamps the same emoji on any ALARM).
+  - Files: deploy/aws/terraform/silent-feed-alarms.tf, deploy/aws/terraform/market-hours-liveness-alarm.tf, crates/app/src/main.rs
+  - Tests: test_realtime_guarantee_degraded_alarm_threshold_matches_slo_warn, test_silent_feed_alarms_are_window_gated
 
-- [x] Item 3 — Add the source-scan wiring guard.
-  - Files: crates/app/tests/ip_monitor_wiring_guard.rs
-  - Tests: test_spawn_ip_monitor_has_production_call_site, test_ip_monitor_halt_is_dry_run_gated
+- [ ] Item 3 — BOUNDARY-01 catch-up storm alarm, two parts. EXPORT: add a SECOND byte-identical `emf_processor` metric_declaration entry to BOTH `deploy/aws/cloudwatch-agent.json` and `deploy/aws/terraform/user-data.sh.tftpl`: `{"source_labels":["host"],"label_matcher":"^tickvault-prod$","dimensions":[["host","feed"]],"metric_selectors":["^tv_boundary_catchup_total$"]}` — per-feed dimension is Rule-11-MANDATORY (Groww's 60s catch-up margin makes catch-up sealing its ROUTINE steady-state for quiet SIDs; host-only folding would mask a Dhan storm under the Groww baseline or page on healthy Groww). Zero Rust — both emit sites exist (main.rs dhan driver, groww_bridge.rs groww driver). Cost 2 series ~$0.60/mo, dated comment + aws-budget.md note. ALARM in `silent-feed-alarms.tf`: `boundary_catchup_storm_dhan`, metric `tv_boundary_catchup_total`, dimensions = explicit map `{ host = "tickvault-prod", feed = "dhan" }` (NOT `local.app_dimensions`), statistic=Sum, period=300 (CW agent ships counters as per-scrape DELTAS ⇒ Sum/300s IS increase(5m), Rule 12 — house precedent `tv_disk_watcher_respawn_total`), `GreaterThanThreshold` 2000 (incident 9k–11.5k/10min ≈ 4.5–5.75k/5min = 2.25–2.9× threshold → pages at minute 10; PROVISIONAL in alarm_description — healthy Dhan floor UNMEASURED, mandate 1 trading-week soak of the exported per-feed Sum(5m) distribution + dated ratchet note), 2-of-2 × 5min (a bounded one-shot restart catch-up wave ≤~25K drains inside one 5-min period → absorbed; the 08:30 boot wave sits outside the 09:20–15:35 gate), `notBreaching`, `actions_enabled=false` + gate append. Ratchets: EMF name pin bump + teach the two-file byte-equality + alarm-metric-superset tests the second-declaration SHAPE (extend, never weaken).
+  - Files: deploy/aws/cloudwatch-agent.json, deploy/aws/terraform/user-data.sh.tftpl, deploy/aws/terraform/silent-feed-alarms.tf, deploy/aws/terraform/market-hours-liveness-alarm.tf, crates/common/tests/cloudwatch_app_alarms_wiring.rs, .claude/rules/project/aws-budget.md
+  - Tests: test_emf_metric_selectors_name_count_is_twenty_three, test_reference_cloudwatch_agent_json_matches_deployed_emf_declaration, test_boundary_catchup_alarm_uses_per_feed_dimensions
 
-## Scenarios
+- [ ] Item 4 — THE ONLY RUST ITEM: new gauge `tv_dhan_exchange_lag_p99_seconds` (unlabeled, dhan-only NAME — sidesteps the host-only EMF dimension label-folding trap; a future Groww gauge gets its own name). HOT PATH (tick_processor.rs dhan persist site, `received_at_nanos` + `capture_seq` in scope — verify at impl time): `lag_ns = received_at_nanos.saturating_sub(exchange_ts × 1e9)`, clamp negatives to 0 (count clamps), write into a preallocated single-writer 32,768-slot ring with relaxed atomic head (~65s headroom at 500 ticks/s) — O(1), zero-alloc, DHAT + Criterion ratcheted + benchmark-budgets entry. REPLAY EXCLUSION discriminator: admit only if `received_at_nanos − capture_seq < REPLAY_EXCLUDE_DWELL_NANOS = 60_000_000_000` (named constant) — capture_seq is stamped once at the original WS-read instant and PRESERVED through WAL re-injection while received_at is RE-stamped at dequeue, so a replayed row shows receipt−capture = downtime (≥minutes, excluded EXACTLY) while genuinely-lagged live rows (the incident's real 46s/199s) have FRESH capture instants and are KEPT — no Rule-11 censoring of the measured signal. Every exclusion increments `tv_dhan_lag_samples_excluded_total` (/metrics-only; visible, never silent). PUBLISHER: supervised 10s cold task (WS-GAP-05/SLO-03 respawn pattern) in NEW module `crates/core/src/pipeline/feed_lag_monitor.rs`, spawned in `start_dhan_lane` next to the SLO publisher: snapshot trailing-60s window into preallocated scratch, p99 via `select_nth_unstable` — honestly labeled **O(N-window)**, N≤32,768, off the tick thread (NEVER claimed O(1)). Publish ONLY when (a) inside the trading session (Rule 3 — prevents the stale-gauge-after-close artifact) AND (b) window holds ≥ `MIN_LAG_SAMPLES = 50` (empty/thin window publishes NOTHING — 0 = "perfect lag" is a Rule-11 false-OK; feed-dead is owned by the silent-instruments + WS alarms via notBreaching). QUANTIZATION HONESTY (module doc + alarm_description + metrics catalog + portal caveat): Dhan LTT is u32 whole IST SECONDS → ≥1s floor; healthy p99 reads ~1–2s and can never read 0; sub-second wire lag UNMEASURABLE for feed=dhan; alarm threshold sits 10× above the floor. EXPORT: add the gauge to both allowlist regexes (+$0.30/mo, part of the 21→23 pin bump). ALARM (`silent-feed-alarms.tf`): `dhan_exchange_lag_p99_high` — `GreaterThanThreshold` 10 (seconds), period=60, statistic=Maximum, strict 10-of-10 (safe HERE unlike items 1/2: the metric is itself a trailing-60s p99 recomputed every 10s, so a one-burst transient decays out within ~60s and cannot hold 10 consecutive breaching minutes; incident all-day p99 46s pages at minute 10), `notBreaching`, `actions_enabled=false` + gate.
+  - Files: crates/core/src/pipeline/feed_lag_monitor.rs, crates/core/src/pipeline/tick_processor.rs, crates/core/src/pipeline/mod.rs, crates/app/src/main.rs, deploy/aws/cloudwatch-agent.json, deploy/aws/terraform/user-data.sh.tftpl, deploy/aws/terraform/silent-feed-alarms.tf, deploy/aws/terraform/market-hours-liveness-alarm.tf, quality/benchmark-budgets.toml, crates/core/tests/dhat_feed_lag_ring.rs
+  - Tests: test_replay_dwell_boundary_excludes_at_exactly_60s, test_thin_window_publishes_nothing, test_p99_on_known_distribution, test_ring_wraparound, test_negative_lag_clamped, test_out_of_session_publishes_nothing
 
-| # | Scenario | Expected |
-|---|----------|----------|
-| 1 | dry_run=true, IP changes for 2 poll cycles | CRITICAL Telegram + error!(GAP-NET-01); feed keeps running (no halt) |
-| 2 | dry_run=false, IP changes for 2 poll cycles | CRITICAL Telegram + error!; process halts (orders would be rejected) |
-| 3 | IP flaps for 1 poll cycle then recovers | No action, no alert (below confirm threshold) |
-| 4 | Both IP-echo endpoints unreachable | transient warn!, mismatch counter reset, no halt; AUTH-P13 CheckFailed streak escalates to CRITICAL past threshold |
-| 5 | paper/sandbox mode | monitor not spawned |
-
----
-
-# Implementation Plan: CCL-06 — stop silently dropping Muhurat-session ticks
-
-**Status:** VERIFIED
-**Date:** 2026-07-01
-**Approved by:** Parthiban (operator) — audit fix-queue PR-3, `.claude/plans/permutation-coverage-audit-2026-07-01.md` §140/§175
-
-> **Guarantee matrices:** carried by cross-reference to `.claude/rules/project/per-wave-guarantee-matrix.md` (mandatory per `per-item-guarantee-check.sh`). All 15 rows of the 100% Guarantee Matrix and all 7 rows of the Resilience Demand Matrix apply to every item in this plan.
+- [ ] Item 5 — Rewrite `_pctl_feed_sql` + the feed-discovery query in the operator-portal Lambda with the two-layer predicate + IST-now correction. VERIFIED LATENT BUG folded in: `ts` and `received_at` are stored IST-SHIFTED while QuestDB `now()` is UTC → the current `ts > dateadd('m',-10,now())` is really a ~5h40m window (root cause of the all-day replay conflation), AND an exchange-time window LAG-CENSORS (any row whose lag exceeds the window has ts outside it — the panel structurally cannot show lag above its own window, Rule-11 false-OK). All predicates use `IST_now := dateadd('m', 330, now())`, population defined by RECEIVE time. Exact new inner WHERE (per feed $f): `feed = '$f' AND received_at != null AND ts > dateadd('h', -6, IST_now) AND received_at >= dateadd('s', -120, IST_now) AND received_at < dateadd('s', 60, cast(capture_seq / 1000 + 19800000000 as timestamp))`. Roles: (1) K=120s receive-recency — honest population "rows received in the last 2 minutes" (6K–60K rows at incident rates → stable p99); (2) EXACT replay excluder (capture_seq nanos → micros → +19800000000µs IST alignment): frame-WAL re-injection re-stamps received_at but preserves capture_seq, so replayed rows show receipt−capture = downtime and are excluded EVEN INSIDE the drain window; genuinely-lagged live rows (46s/199s) pass; groww never excluded by construction (sidecar capture_ns predates bridge capture_seq → receipt−capture ≤ 0); TVW2 spill-drain rows preserve original received_at (correctly kept); (3) 6h ts bound = partition-pruning ONLY (`ticks` is PARTITION BY HOUR on ts; received_at is not the designated timestamp — without it, full-table scan); the implied >6h-lag ceiling is documented. Rule-11 additions: (a) companion cheap count of the excluded complement per feed, rendered in the panel ("N replay-restamped rows excluded"); (b) rows==0 renders "no rows received in last 120s" — never zero-valued percentiles; (c) extend the existing whole-second caveat block with the 6h ceiling + replay-exclusion + ≥1s Dhan LTT floor. Keep `received_at != null` (Groww NULL receipt legitimate) and `ORDER BY ts DESC LIMIT 50000`. Feed-discovery query gets the same IST fix with the 6h window. Live verification best-effort, non-blocking: `select now()` should confirm UTC; if the box returns IST, drop the `dateadd('m',330)` terms — nothing else changes; default: ship WITH the +330m shift.
+  - Files: deploy/aws/lambda/operator-control/handler.py
+  - Tests: N/A — Lambda Python; verified by live portal render + the QuestDB `select now()` timezone probe (documented in Test Plan)
 
 ## Design
 
-**The bug (CCL-06, high):** `crates/app/src/main.rs` sets
-`should_connect_ws = subscription_plan.is_some() && (is_trading || is_mock_trading || is_muhurat)`
-(main.rs ~5744) so on a Diwali Muhurat day the live feed **connects** — but the
-tick-processor persist gate `is_within_persist_window` (tick_processor.rs:119) is
-hardcoded to `[09:00, 15:30)` IST with NO Muhurat branch. A Muhurat evening tick
-(~18:15 IST) fails the range → `continue` (tick_processor.rs:1146/1418) → dropped
-before persist/seal/broadcast. The whole ~1h Muhurat session stores ZERO data
-despite a live connection. This is the audit Rule 11 "connect-and-drop-everything"
-false-OK — the worst of both states.
+Five defenses, one per silent signal, all gated to the trading session and
+edge-triggered natively by CloudWatch (Rule 4):
 
-**The fix (config-independent, constant-window, boot-gated — mirrors the §30
-`always_on` GIFT-Nifty exemption precedent):**
+1. **Silent-instruments retune (Item 1)** — the existing
+   `tick_gap_instruments_silent` alarm keeps its resource address (in-place
+   update in `app-alarms.tf`, zero state churn) and drops its threshold from
+   100 to 25 with an M-of-N 10-of-12 latch (a value flapping 24/26/24
+   neither pages nor lets one clean scrape erase 9 minutes of evidence; a
+   1–3 min reconnect blip cannot reach 10 breaching minutes). Absolute
+   threshold, not %-of-universe: no universe-size denominator exists in
+   CloudWatch (`tv_universe_size` is kind-labeled and folds under host-only
+   dims) and the universe is envelope-locked [100,1200].
+2. **SLO dead-band closure (Item 2)** — a NEW Medium-tier CloudWatch alarm on
+   the ALREADY-exported `tv_realtime_guarantee_score` at <0.95, 12-of-15.
+   In-app SLO-02 stays log-only (2026-05-11 suppression untouched); the
+   <0.80 Critical sibling alarm stays UNTOUCHED. This closes the exact
+   0.80–0.95 dead band with zero Rust and zero allowlist change.
+3. **Catch-up storm detector (Item 3)** — per-feed EMF export of
+   `tv_boundary_catchup_total` + a dhan-dimensioned Sum/5m alarm at a
+   PROVISIONAL 2000 threshold (2-of-2). Per-feed is mandatory: Groww's 60s
+   margin makes catch-up its healthy steady state; folding feeds together is
+   either a mask or a false page.
+4. **Exchange-lag gauge + alarm (Item 4, the only Rust)** — no
+   exchange→received metric exists today (`tv_wire_to_done_duration_ns` is
+   receive→done only). A zero-alloc O(1) ring write on the dhan persist path
+   feeds a supervised 10s publisher computing trailing-60s p99 (honestly
+   O(N-window), never O(1)) into `tv_dhan_exchange_lag_p99_seconds`, with an
+   exact WAL-replay exclusion via the received_at−capture_seq dwell
+   discriminator and Rule-3/Rule-11 publish gating.
+5. **Portal lag SQL truth (Item 5)** — IST-now correction + receive-time
+   population + exact capture_seq replay excluder + partition-pruning ts
+   bound, with Rule-11 companion rendering (excluded-count, no zero-valued
+   percentiles on empty sets).
 
-1. Add a Muhurat persist window as named constants in `crates/common/src/constants.rs`:
-   `MUHURAT_PERSIST_START_SECS_OF_DAY_IST = 64_800` (18:00 IST) and
-   `MUHURAT_PERSIST_END_SECS_OF_DAY_IST = 70_200` (19:30 IST). This is a deliberate
-   **superset** of the historical announced NSE Muhurat windows (2023 was 18:15–19:15,
-   2024 was 18:00–19:00), so a slightly-early/late tick is still captured. Compile-time
-   asserts pin start<end, both within a day, and start >= the regular window end
-   (disjoint from + after `[09:00, 15:30)`).
-
-2. Add a `crates/common/src/muhurat.rs` process-global (mirror of `always_on.rs`):
-   `init_muhurat_session(active: bool)` (OnceLock, first-call-wins) + `current() -> bool`.
-   Boot calls `init_muhurat_session(is_muhurat)` ONCE after the calendar loads; every
-   spawn site reads `current()` to obtain the flag it passes EXPLICITLY into
-   `run_tick_processor`. Default (never-init) = `false` → today's behaviour byte-for-byte.
-
-3. Widen the two persist-window free functions in `tick_processor.rs` to take an explicit
-   `muhurat_active: bool`. When `true`, the accepted set becomes
-   `[09:00,15:30) ∪ [18:00,19:30)` (exchange-ts gate) and
-   `[09:00,15:31) ∪ [18:00,19:30)` (wall-clock gate — Muhurat has no post-close grace
-   tail since 19:30 is already generous). When `false`, byte-identical to today. The
-   hot loop reads `tickvault_common::muhurat::current()` ONCE before the loop (O(1),
-   zero-alloc, `bool` Copy, exactly like `always_on`) and passes the bool into every
-   gate call.
-
-**Why constants, not config:** the audit offered "config-driven muhurat_open/muhurat_close
-OR a MUHURAT_*_SECS const set" — the const set is chosen because (a) it avoids
-`TradingConfig` Deserialize-schema churn and its round-trip guards, (b) it keeps every
-gate a pure unit-testable function, (c) the superset window makes the exact
-year-to-year announced time irrelevant for capture. The window can be widened later via
-a config follow-up without touching this contract.
-
-**Why widening can't regress a normal day:** `is_muhurat` is `false` on every
-trading/mock day, so `muhurat_active=false` and the accepted set is exactly `[09:00,15:30)`
-as today. The Muhurat branch is only ever active on the ~1 day/yr Muhurat date.
+Cross-cutting: all NEW alarms live in NEW `silent-feed-alarms.tf` (PR
+conflict isolation; Item 1 stays in `app-alarms.tf` to avoid a state-address
+change); namespace/dimensions/SNS come from the module-global locals in
+`app-alarms.tf`; every alarm is `actions_enabled=false` + appended to the
+window-gate Lambda `ALARM_NAMES` (market-hours-liveness-alarm.tf, 09:20–15:35
+IST Mon–Fri); `treat_missing_data=notBreaching` everywhere (nightly box
+stop). Ratchet bumps ship in the same PR: EMF name pin 21→23, two-file
+byte-equality + superset tests taught the second metric_declaration shape,
+alarm-count pin 17→20 — the current `test_app_alarms_count_is_thirteen`
+scanner (`alarm_metric_names()`) reads ONLY `app-alarms.tf` (verified
+file-scoped), so it MUST be extended to also scan `silent-feed-alarms.tf`.
+Total cost ~$1.20/mo — dated header comment + aws-budget.md note.
 
 ## Edge Cases
 
-- Normal trading day (`is_muhurat=false`): both gates identical to today — pinned by
-  keeping ALL existing `test_persist_window_*` tests green (updated to pass `false`).
-- Muhurat tick at 18:15 IST with `muhurat_active=true`: accepted (the new ratchet
-  `test_muhurat_tick_1815_ist_is_persisted`).
-- Muhurat tick at 18:15 IST with `muhurat_active=false`: still rejected (proves the flag
-  actually gates it — no accidental always-on widening).
-- Boundary 18:00:00 inclusive / 19:30:00 exclusive (half-open, matches the regular window's
-  half-open contract).
-- 17:59:59 (before Muhurat open) and 19:30:00 (at Muhurat close) rejected even when active.
-- `muhurat::current()` before init → `false` (never-boot / unit-test / Indices4Only scope).
-- always-on (`window_exempt`) instruments are unaffected — they still bypass BOTH gates
-  regardless of Muhurat.
+1. **Market-close boundary (15:30→16:30 scrape tail):** the silent-instruments
+   gauge and the lag gauge stop being SET after close but the agent keeps
+   scraping the LAST value until box stop — handled by (a) the window-gate
+   Lambda disabling actions outside 09:20–15:35 IST and (b) Item 4's Rule-3
+   in-session publish gate (gauge simply stops updating; notBreaching absorbs
+   the missing-data tail after box stop).
+2. **IST midnight / date rollover:** capture_seq is UTC-wall-nanos-monotonic
+   and received_at is IST-shifted storage; the Item 5 predicates compare
+   like-with-like (both IST-aligned after the +19800000000µs alignment) so
+   midnight does not flip sign; the Item 4 dwell discriminator is a pure
+   duration difference, date-free.
+3. **WAL replay at EXACTLY the 60s dwell boundary:** admission uses strict
+   `< REPLAY_EXCLUDE_DWELL_NANOS`; a row dwelling exactly 60.000000000s is
+   EXCLUDED (pinned by `test_replay_dwell_boundary_excludes_at_exactly_60s`).
+4. **Negative lag / clock skew:** exchange_ts ahead of received_at (Dhan
+   second-granularity rounding, ≤2s host skew per BOOT-03) →
+   `saturating_sub` clamps to 0 and the clamp is COUNTED — never a panic,
+   never a negative sample.
+5. **Groww rows at the dhan site:** the ring write is wired at the DHAN
+   persist site only; the dhan-only metric NAME prevents label folding even
+   if routing ever changed — and the Item 5 SQL excluder is a no-op for
+   groww by construction (receipt−capture ≤ 0).
+6. **Thin window (pre-open trickle, holiday, feed warming up):** <50 samples
+   in the trailing 60s → publish NOTHING (never 0 = "perfect lag");
+   notBreaching keeps the alarm quiet; feed-dead ownership stays with the
+   silent-instruments + WS alarms.
+7. **QuestDB now() is actually IST (fallback):** best-effort `select now()`
+   probe; if the box returns IST, drop the `dateadd('m',330)` terms — the
+   two-layer predicate structure is unchanged. Default ships WITH +330m.
+8. **CW agent restart mid-day:** counter DELTA semantics reset cleanly (first
+   post-restart scrape publishes the delta since agent start); Sum/5m dips
+   for ≤1 period; M-of-N latches tolerate the gap; missing scrapes are
+   notBreaching.
+9. **Gate-window edges (09:20 / 15:35 IST):** the 08:30 boot catch-up wave
+   sits entirely outside the gate so it can never page; an alarm latched
+   into ALARM before 09:20 pages only once actions are enabled by the gate
+   Lambda.
+10. **Universe re-scope toward the 1200 cap:** absolute threshold 25 becomes
+    2.1% of universe — dated comment in app-alarms.tf mandates a revisit if
+    the subscription set re-scopes; the [100,1200] envelope lock bounds the
+    drift.
+11. **Ring wraparound under burst (>32,768 ticks between snapshots):** oldest
+    samples overwritten — the trailing-60s window is best-effort above ~546
+    ticks/s sustained; 32,768 slots = ~65s headroom at the measured ~500/s;
+    documented in the module doc, and the p99 remains a valid sample-based
+    estimate of the window (pinned by `test_ring_wraparound`).
+12. **A 1–3 min reconnect blip:** cannot reach 10-of-12 breaching minutes
+    (Item 1), cannot hold 12-of-15 (Item 2), cannot hold 10/10 on a
+    self-decaying trailing p99 (Item 4) — by construction none of the new
+    alarms page on a healthy bounded reconnect.
 
 ## Failure Modes
 
-- Muhurat flag never set at boot → `current()` returns `false` → Muhurat ticks dropped
-  (degrades to today's behaviour, never a crash). Acceptable: it is exactly the
-  pre-fix state, not a regression.
-- Config carries a Muhurat DATE but NSE cancels the session → feed connects, no ticks
-  arrive in the window → nothing persisted (correct — no false data).
-- Zero hot-path allocation added; one `bool` Copy read before the loop. No new panic
-  paths (no unwrap/expect/println).
+1. **Window-gate Lambda dead → all gated alarms stay actions-disabled
+   (dark):** accepted single point of coupling — it already gates the
+   existing liveness alarms and its own health is covered by the
+   market-hours-liveness machinery. Documented in Open Questions.
+2. **Lag publisher task dies:** supervised respawn (WS-GAP-05/SLO-03
+   pattern) with a respawn counter; a flapping publisher is visible, and a
+   dead-forever publisher leaves the gauge UNSET → missing data →
+   notBreaching (silent-instruments + WS alarms still own feed-dead).
+3. **Ring writer starved / tick thread stalls:** no new samples → thin
+   window → publisher publishes nothing (never stale-republishes) — the
+   stall itself is owned by the existing tick-gap/WS alarms.
+4. **CW export lag / EMF drop:** missing datapoints are notBreaching on
+   every new alarm; M-of-N latches tolerate isolated gaps without either
+   paging falsely or erasing accumulated evidence.
+5. **Threshold-2000 healthy floor unknown:** labeled PROVISIONAL in the
+   alarm_description; one trading-week observation of the per-feed Sum(5m)
+   distribution is mandated; ratchet with a dated note if the healthy floor
+   approaches 2000.
+6. **Correlated 4-page fatigue:** one real feed-degradation incident will
+   page up to 4 alarms (silent-instruments, SLO-degraded, catchup-storm,
+   lag-p99) — ACCEPTED BY DESIGN: after a zero-page all-day incident,
+   redundant paging is the chosen failure direction.
+7. **Terraform apply partially fails (new file applies, gate append
+   doesn't):** alarms are created with `actions_enabled=false` → fail-dark,
+   not fail-noisy; the gate append is in the same PR/apply and the
+   liveness-alarm ratchets pin the ALARM_NAMES join.
 
 ## Test Plan
 
-Unit (truth-table, in `tick_processor.rs::tests` — no live box):
-- `test_muhurat_tick_1815_ist_is_persisted` — 18:15 IST + `muhurat_active=true` → accepted.
-- `test_muhurat_tick_1815_ist_dropped_when_flag_off` — 18:15 + `muhurat_active=false` → dropped.
-- `test_muhurat_window_boundaries` — 18:00:00 in, 17:59:59 out, 19:29:59 in, 19:30:00 out (active).
-- `test_regular_window_unchanged_when_muhurat_active` — 12:00 IST accepted, 08:00/16:00 dropped even with `muhurat_active=true` (regular window still additive).
-- `test_muhurat_wall_clock_1815_accepted_when_active` — wall-clock gate symmetric.
-- All existing `test_persist_window_*` updated to pass `false` and stay green.
-In `crates/common/src/muhurat.rs::tests`:
-- `current_before_init_is_false_then_reflects_init`.
-Constants (`constants.rs::tests`):
-- `test_muhurat_window_constants_pinned` (18:00/19:30, start<end, disjoint from regular).
-
-Meta-guards run pre-push: `per_item_guarantee_matrix_guard` (storage), `aws_infra_wiring`
-(common), `error_code_rule_file_crossref` + `error_code_tag_guard` (common — touched crate),
-`per-item-guarantee-check.sh`, `plan-verify.sh`, `banned-pattern-scanner.sh`,
-`pub-fn-test-guard.sh`, `pub-fn-wiring-guard.sh`.
+- **Rust unit (crates/core, `feed_lag_monitor` + tick_processor wiring):**
+  `test_replay_dwell_boundary_excludes_at_exactly_60s`,
+  `test_thin_window_publishes_nothing`, `test_p99_on_known_distribution`,
+  `test_ring_wraparound`, `test_negative_lag_clamped`,
+  `test_out_of_session_publishes_nothing`.
+- **DHAT zero-alloc:** `crates/core/tests/dhat_feed_lag_ring.rs` — ring write
+  path allocates nothing across 10K calls.
+- **Criterion + budget:** ring-write bench with a
+  `quality/benchmark-budgets.toml` entry; the publisher's p99 computation is
+  COLD path (10s cadence) — measured but budgeted as cold, labeled
+  O(N-window) in comments and PR body (NEVER O(1)).
+- **Ratchets (crates/common/tests/cloudwatch_app_alarms_wiring.rs):** EMF
+  name-count pin 21→23 (`test_emf_metric_selectors_name_count_is_twenty_three`
+  replaces `test_emf_metric_selectors_name_count_is_twenty_one`), two-file
+  byte-equality (`test_reference_cloudwatch_agent_json_matches_deployed_emf_declaration`)
+  + superset (`test_deployed_emf_declaration_is_superset_of_every_alarm_metric`)
+  tests extended to parse the SECOND metric_declaration shape; alarm-count
+  pin extended to scan `silent-feed-alarms.tf` (currently file-scoped to
+  app-alarms.tf — verified); new pins:
+  `test_tick_gap_silent_alarm_threshold_is_twenty_five`,
+  `test_tick_gap_silent_alarm_is_window_gated`,
+  `test_realtime_guarantee_degraded_alarm_threshold_matches_slo_warn`,
+  `test_silent_feed_alarms_are_window_gated`,
+  `test_boundary_catchup_alarm_uses_per_feed_dimensions`.
+- **Terraform:** `terraform validate` + `terraform plan` — Item 1 must show
+  an IN-PLACE update (`~`) on the existing alarm resource, never
+  destroy/create.
+- **Lambda (Item 5):** local `python -m py_compile`; live best-effort
+  `select now()` probe against QuestDB (UTC assumption); portal render check
+  post-deploy: excluded-count line present, zero-row case renders "no rows
+  received in last 120s", never zero-valued percentiles.
+- **Scoped per testing-scope.md:** `cargo test -p tickvault-core`; the
+  `crates/common` ratchet-file edit escalates to `cargo test --workspace`.
 
 ## Rollback
 
-Pure additive + gated-by-`false`-default change. Revert the single commit → the
-`muhurat` module + constants + the `muhurat_active` param disappear; `should_connect_ws`
-is untouched, so behaviour returns exactly to `34f0a970`. No schema migration, no data
-migration, no config change required. `git revert <sha>` is complete + safe.
+- **Terraform:** revert the PR and `terraform apply` — new alarms in
+  `silent-feed-alarms.tf` are deleted wholesale (new file, no shared state);
+  Item 1 reverts in place to threshold 100 (same resource address, no state
+  surgery); the gate-Lambda ALARM_NAMES join reverts with the same apply.
+- **Rust:** the ring write + publisher are behind the dhan lane
+  (`start_dhan_lane`) — reverting the commit removes the gauge; the metric
+  simply stops being published (missing data = notBreaching, no false page
+  during rollback).
+- **Portal SQL:** single-function revert of `_pctl_feed_sql` (+ the
+  feed-discovery query) in handler.py restores the previous behavior
+  verbatim.
+- No schema changes, no data migration, no DEDUP-key changes anywhere — all
+  rollbacks are pure code/config reverts.
 
 ## Observability
 
-- No new ErrorCode/metric needed for the happy path. The existing
-  `tv_outside_hours_filtered_total` counter still increments for genuinely-out-of-window
-  ticks; Muhurat ticks now simply pass the gate and flow through the existing
-  persist/seal/broadcast + their existing counters (`tv_ticks_processed_total`, etc.),
-  so a Muhurat session becomes visible in the SAME dashboards/tables as any session —
-  which is the whole point (kills the false-OK dark hole).
-- Boot already logs `is_muhurat_session` (main.rs:1343) — operator sees the flag at boot.
+- **New metrics:** `tv_dhan_exchange_lag_p99_seconds` (gauge, in-session
+  only, ≥50-sample gate), `tv_dhan_lag_samples_excluded_total`
+  (/metrics-only exclusion visibility — never silent censoring), publisher
+  respawn counter (WS-GAP-05-pattern `{reason}` labels), per-feed
+  `tv_boundary_catchup_total` CW series (host,feed dims).
+- **New/retuned alarms (4):** `tick_gap_instruments_silent` (retuned 25,
+  10-of-12), `realtime_guarantee_degraded` (<0.95, 12-of-15),
+  `boundary_catchup_storm_dhan` (Sum/5m >2000 PROVISIONAL, 2-of-2),
+  `dhan_exchange_lag_p99_high` (>10s, 10/10) — all window-gated
+  09:20–15:35 IST, all notBreaching, all edge-triggered natively (Rule 4).
+- **Portal:** honest lag panel — receive-time population, replay-excluded
+  count rendered, empty-population honesty line, extended caveat block (6h
+  ceiling, replay exclusion, ≥1s Dhan LTT floor).
+- **Docs:** metrics catalog entries, aws-budget.md cost note (~$1.20/mo
+  total), dated PROVISIONAL-threshold soak note for the catch-up storm
+  alarm.
 
-## Plan Items
+## Per-Item Guarantee Matrix (per `.claude/rules/project/per-wave-guarantee-matrix.md`)
 
-- [x] Item 1 — Add Muhurat persist-window constants + compile-time asserts + unit test.
-  - Files: crates/common/src/constants.rs
-  - Tests: test_muhurat_window_constants_pinned
+### 15-row 100% Guarantee Matrix
 
-- [x] Item 2 — Add `muhurat` process-global module (mirror of `always_on`) + wire `pub mod muhurat;`.
-  - Files: crates/common/src/muhurat.rs, crates/common/src/lib.rs
-  - Tests: current_before_init_is_false_then_reflects_init
+| Demand | Mechanical proof artefact | Real-time check | Per-item gate |
+|---|---|---|---|
+| 100% code coverage | unit tests on every `feed_lag_monitor` pure fn; coverage delta ≥ 0 vs `quality/crate-coverage-thresholds.toml` floors | post-merge llvm-cov | Item 4 PR includes coverage delta |
+| 100% audit coverage | N/A — no new SEBI-relevant typed event; alarms/metrics are observability-plane (CloudWatch alarm history is the record) | CW alarm history | noted per item |
+| 100% testing coverage | unit + DHAT + Criterion + ratchet source-scan, scoped to crates/core + crates/common per testing.md | `cargo test -p tickvault-core` + workspace on common | Test Plan section |
+| 100% code checks | banned-pattern + pub-fn-test + pub-fn-wiring + plan-verify + secret-scan + pre-commit gates | pre-push mandatory | all gates green before PR |
+| 100% code performance | DHAT zero-alloc on the ring write + Criterion + benchmark-budgets entry; publisher honestly O(N-window) COLD | `scripts/bench-gate.sh` | Item 4 is the only hot-path item |
+| 100% monitoring | the deliverable IS monitoring: 1 new gauge + 1 exclusion counter + 1 respawn counter + per-feed CW series + 4 alarms | CW console + `/metrics` | Observability section |
+| 100% logging | publisher respawn logs `error!` with an ErrorCode `code =` field (WS-GAP-05 pattern); no new silent path | errors.jsonl | Item 4 |
+| 100% alerting | 4 window-gated CW alarms → SNS → Telegram; notBreaching + M-of-N semantics documented per alarm | gate-Lambda ALARM_NAMES pin | Items 1–4 |
+| 100% security | no secrets, no new inputs, no unsafe; Lambda SQL interpolates only a fixed internal feed-name set (no user input) | secret-scan + cargo audit | all items |
+| 100% security hardening | no new attack surface (no new endpoints, no new deps) | post-deploy IP verify unchanged | N/A — observability-only change |
+| 100% bugs fixing | adversarial 3-agent review BEFORE + AFTER impl | per-PR | required |
+| 100% scenarios covering | 12 edge cases enumerated above, each with an owner (test, gate, or notBreaching) | Edge Cases section | per item |
+| 100% functionalities covering | every new pub fn in feed_lag_monitor has a call site + matching #[test] | pre-push gates 6+11 | Item 4 |
+| 100% code review | 3-agent adversarial on the diff before AND after implementation | per-PR | required |
+| 100% extreme check | ratchet tests fail the build on regression (thresholds, gate-wiring, EMF pins, alarm counts) | every commit | Items 1–4 ratchets |
 
-- [x] Item 3 — Widen the two persist-window gates to accept the Muhurat window when active; read the boot flag once in the hot loop; add ratchet tests.
-  - Files: crates/core/src/pipeline/tick_processor.rs
-  - Tests: test_muhurat_tick_1815_ist_is_persisted, test_muhurat_tick_1815_ist_dropped_when_flag_off, test_muhurat_window_boundaries, test_regular_window_unchanged_when_muhurat_active, test_muhurat_wall_clock_1815_accepted_when_active
+### 7-row Resilience Demand Matrix
 
-- [x] Item 4 — Boot: call `init_muhurat_session(is_muhurat)` once after calendar load.
-  - Files: crates/app/src/main.rs
-  - Tests: (wiring — covered by pub-fn-wiring-guard; boot is TEST-EXEMPT live path)
+| Demand | Honest envelope | Per-item proof |
+|---|---|---|
+| Zero ticks lost | NO new tick-drop path — the ring write is a side-observation; ring→spill→DLQ untouched | Item 4 touches only the persist-site observation point |
+| WS never disconnects | `SubscribeRxGuard` + pool watchdog untouched; new alarms only OBSERVE degradation | Items 1–4 are read-side |
+| Never slow/locked/hanged | ring write O(1) zero-alloc (DHAT + Criterion); p99 compute is honestly O(N-window), N≤32,768, on a 10s COLD task off the tick thread | Item 4 DHAT + bench |
+| QuestDB never fails | no schema change, no new write path; Item 5 is read-only SQL with a partition-pruning bound (no full-table scan) | Item 5 |
+| O(1) latency | hot-path insert O(1); the p99 computation is O(N) and is LABELED O(N) in code comments + PR body — never claimed O(1) | Item 4 |
+| Uniqueness + dedup | N/A — no new table, no DEDUP-key change; the per-feed CW dimension prevents cross-feed series folding (the CW analogue of I-P1-11) | Item 3 |
+| Real-time proof | 4 alarms + gauge + excluded-samples counter + respawn counter; incident replay: each of the 4 silent signals now pages within 10–15 min | Observability section |
 
-## Scenarios
+## Honest 100% Claim (operator-charter §F wording)
 
-| # | Scenario | Expected |
-|---|----------|----------|
-| 1 | Normal trading day, 12:00 IST tick | Persisted (unchanged) |
-| 2 | Normal trading day, 18:15 IST tick | Dropped (is_muhurat=false; unchanged) |
-| 3 | Muhurat day, 18:15 IST tick | Persisted (the fix) |
-| 4 | Muhurat day, 12:00 IST tick | Persisted (regular window still additive) |
-| 5 | Muhurat day, 17:59:59 IST tick | Dropped (before Muhurat open) |
-| 6 | Muhurat day, 19:30:00 IST tick | Dropped (Muhurat close exclusive) |
-| 7 | Boot without calendar (Indices4Only/test) | muhurat::current()=false → today's behaviour |
+> 100% inside the tested envelope, with ratcheted regression coverage:
+> the four 2026-07-06 silent signals each gain a window-gated, notBreaching,
+> M-of-N-latched CloudWatch page that fires within 10–15 minutes on an
+> incident replay (thresholds pinned by build-failing ratchets in
+> `crates/common/tests/cloudwatch_app_alarms_wiring.rs`); the lag ring write
+> is DHAT-zero-alloc + Criterion-budgeted O(1) on the hot path while the
+> p99 computation is honestly O(N-window), N≤32,768, on a cold 10s task;
+> the ≤100,000-tick rescue ring / spill / DLQ chain is untouched (no new
+> tick-drop path). Beyond the envelope: the boundary-catchup threshold 2000
+> is PROVISIONAL until a one-trading-week soak measures the healthy Dhan
+> floor; sub-second Dhan wire lag is UNMEASURABLE (u32 whole-second LTT
+> floor); the alarms depend on the window-gate Lambda being alive (its
+> failure leaves them dark — accepted and documented); and lag above 6h is
+> invisible to the portal panel by the documented partition-pruning ceiling.
+
+## Open Questions (with shipped defaults)
+
+1. **QuestDB `now()` timezone** — Assumed UTC (matches storage code:
+   received_at is written `Utc::now()+IST_UTC_OFFSET_NANOS`, i.e. the DB
+   clock is UTC and rows are IST-shifted). Ship WITH
+   `dateadd('m',330,now())`; best-effort live `select now()` probe; if the
+   box returns IST, drop the +330m terms — nothing else changes.
+2. **capture_seq wall-clock assumption** — Assumed: capture_seq ≈ UTC wall
+   nanos at the original WS-read instant (`max(prev+1, wall_nanos)` per
+   data-integrity.md) and is PRESERVED through WAL re-injection. Spot-check
+   on live data pre-merge (compare capture_seq vs received_at on fresh
+   rows).
+3. **Boundary-catchup healthy Dhan floor** — Unknown. Ship PROVISIONAL 2000
+   (2.25–2.9× below incident rate) + mandatory 1-trading-week soak of the
+   exported per-feed Sum(5m) distribution; ratchet with a dated note if the
+   healthy floor approaches 2000.
+4. **M-of-N deviation from literal "sustained N×M" wording** — Deliberate:
+   strict-consecutive evaluation on the oscillating incident data (125
+   crossings, 24/26/24 flapping) would never latch and reproduces the miss
+   (Rule-11 false-OK). 10-of-12 / 12-of-15 are the honest latches; Item 4
+   keeps strict 10/10 because its metric is self-smoothing.
+5. **Medium-tier Telegram rendering** — Limitation: telegram-webhook
+   handler.py stamps the same emoji on any ALARM; a Medium-vs-Critical
+   visual split is a FLAGGED FOLLOW-UP, not in this PR.
+6. **Alarm-count ratchet scan scope** — Verified file-scoped to
+   `app-alarms.tf` (`alarm_metric_names()` reads only that file); MUST be
+   extended in this PR to also scan `silent-feed-alarms.tf`, else the new
+   alarms escape the three-way drift guard.
+7. **Gate-Lambda single point of coupling** — Accepted risk: all four
+   alarms are dark if the window-gate Lambda dies; it already gates the
+   existing liveness alarms and is itself covered by the
+   market-hours-liveness machinery.
+8. **Correlated-page fatigue** — Accepted by design: one real feed
+   degradation may fire up to 4 pages; after a zero-page all-day incident,
+   redundancy is the chosen failure direction.
+9. **Seconds-vs-milliseconds units** — Seconds chosen for the lag gauge:
+   Dhan LTT has a ≥1s quantization floor, so millisecond units would imply
+   false precision; the name carries `_seconds` and the module doc states
+   the floor.
