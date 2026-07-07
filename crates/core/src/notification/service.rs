@@ -3427,14 +3427,15 @@ mod tests {
             connection_index: 0,
             reason: "reset".to_string(),
         });
-        // The dispatch runs in a spawned task — poll briefly.
+        // The dispatch runs in a spawned task — poll briefly (via the
+        // public registry accessor, which is also its call-site pin).
         for _ in 0..50 {
-            if service.episodes.live_count() == 1 {
+            if service.episode_registry().live_count() == 1 {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        assert_eq!(service.episodes.live_count(), 1);
+        assert_eq!(service.episode_registry().live_count(), 1);
         assert!(service.episode_mode_enabled());
     }
 
