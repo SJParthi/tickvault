@@ -23,6 +23,9 @@
 # Filter is configured in user-data.sh.tftpl::amazon-cloudwatch-agent.json
 # emf_processor block — keeps custom-metric cost capped (12 metrics × $0.30
 # = $3.60/mo ≈ ₹306/mo vs. ~₹4500/mo for an unfiltered 150-metric scrape).
+# 2026-07-06 groww feed-down alerting: +3 selected metrics
+# (tv_groww_ws_active, tv_feed_last_tick_age_seconds,
+# tv_feed_sidecar_stall_restart_total) ≈ +$0.90/mo, +2 alarms ≈ +$0.20/mo.
 #
 # Cost honesty:
 #   - CloudWatch free tier: 10 alarms + 10 custom metrics + 5GB logs.
@@ -98,6 +101,34 @@ resource "aws_cloudwatch_metric_alarm" "order_update_ws_inactive" {
   comparison_operator = "LessThanThreshold"
   evaluation_periods  = 2
   metric_name         = "tv_order_update_ws_active"
+  namespace           = local.app_namespace
+  period              = 60
+  statistic           = "Minimum"
+  threshold           = 1
+  treat_missing_data  = "notBreaching"
+  dimensions          = local.app_dimensions
+  alarm_actions       = local.app_alarm_actions
+  ok_actions          = local.app_alarm_ok
+}
+
+# ---------------------------------------------------------------------------
+# 3b. Groww feed inactive (operator 2026-07-06 — Groww feed-down alerting).
+# `tv_groww_ws_active` is the CONNECTED-level 0/1 gauge published every ≤1s
+# by the Groww bridge loop: 1 while the connected episode holds (socket
+# connected + subscribed OR streaming), 0 after a feed disable / bridge
+# death. Connected-level (not streaming-level) so the pre-open
+# 08:30→first-tick window does not page every morning — the exact clone of
+# order_update_ws_inactive above, same Minimum<1 60s×2 shape.
+# treat_missing_data = notBreaching: metric is missing whenever the box is
+# intentionally stopped (16:30 IST / weekends) or during a deploy gap — the
+# same stuck-FIRING fix rationale as ws_pool_all_dead (2026-06-02).
+# ---------------------------------------------------------------------------
+resource "aws_cloudwatch_metric_alarm" "groww_ws_inactive" {
+  alarm_name          = "tv-${var.environment}-groww-ws-inactive"
+  alarm_description   = "Groww feed connection is down. Groww prices are not flowing; reconnect is automatic — investigate if this stays firing."
+  comparison_operator = "LessThanThreshold"
+  evaluation_periods  = 2
+  metric_name         = "tv_groww_ws_active"
   namespace           = local.app_namespace
   period              = 60
   statistic           = "Minimum"
@@ -435,6 +466,39 @@ resource "aws_cloudwatch_metric_alarm" "disk_watcher_respawn" {
 }
 
 # ---------------------------------------------------------------------------
+# 16b. Groww sidecar stall-restart storm (operator 2026-07-06 — Groww
+# feed-down alerting). `tv_feed_sidecar_stall_restart_total` increments once
+# per FEED-STALL-01 stall-kill (feed alive but silent across the whole
+# subscribed universe during market hours). Per the FEED-STALL-01 runbook a
+# SINGLE restart that recovers is a healthy self-heal (no page); a FLAPPING
+# socket (reconnect→re-drop, the in-process storm escalation is >5 restarts
+# per 300s) means the provider keeps closing the socket — operator must
+# check the credential / entitlement.
+# Shape honesty: the metric is a CUMULATIVE session-scoped counter (the box
+# restarts daily at 08:30 IST, so it is fresh each session — the
+# late_tick_after_boundary Maximum-statistic precedent). Maximum >= 3 fires
+# on "3+ stall restarts since today's boot" — deliberately more sensitive
+# than the in-process >5/300s storm ladder, and it stays FIRING for the rest
+# of the session once breached (accepted, same as spill_dropped/dlq_ticks).
+# It is NOT a 5-minute delta.
+# ---------------------------------------------------------------------------
+resource "aws_cloudwatch_metric_alarm" "groww_stall_restart_storm" {
+  alarm_name          = "tv-${var.environment}-groww-stall-restart-storm"
+  alarm_description   = "Groww feed keeps stalling — 3+ silent-feed restarts since today's boot (flapping socket = provider-side reject). The system keeps reconnecting automatically; check the Groww credential/entitlement if this fires. See FEED-STALL-01."
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  evaluation_periods  = 1
+  metric_name         = "tv_feed_sidecar_stall_restart_total"
+  namespace           = local.app_namespace
+  period              = 300
+  statistic           = "Maximum"
+  threshold           = 3
+  treat_missing_data  = "notBreaching"
+  dimensions          = local.app_dimensions
+  alarm_actions       = local.app_alarm_actions
+  ok_actions          = local.app_alarm_ok
+}
+
+# ---------------------------------------------------------------------------
 # Post-close tick anomaly — Dhan stamped a tick at/after 15:30:00 IST.
 # Hot-path-safe equivalent of the retired LastTickAfterBoundary Telegram
 # variant (2026-06-12): the per-tick check + tv_late_tick_after_boundary_total
@@ -494,13 +558,15 @@ resource "aws_cloudwatch_metric_alarm" "mem_used_high" {
 # ---------------------------------------------------------------------------
 
 output "app_cloudwatch_alarms" {
-  description = "17 application-level alarms (15 Prometheus-via-CW-agent + 1 disk-used + 1 mem-used Metrics-Insights). Cost note: total alarms 6 → 23; overage above the 10 free-tier alarms ≈ $1.30/mo + 15 custom metrics ≈ $0.75/mo ≈ ₹175/mo — well inside the $55 budget cap."
+  description = "20 application-level alarms (18 Prometheus-via-CW-agent + 1 disk-used + 1 mem-used Metrics-Insights). Cost note (2026-07-06 groww feed-down alerting adds 2 alarms + 3 selected metrics ≈ +$1.10/mo): overage above the 10 free-tier alarms ≈ $1.50/mo + 18 custom metrics ≈ $1.65/mo ≈ ₹270/mo — well inside the $55 budget cap."
   value = [
     aws_cloudwatch_metric_alarm.disk_used_high.alarm_name,
     aws_cloudwatch_metric_alarm.mem_used_high.alarm_name,
     aws_cloudwatch_metric_alarm.ws_pool_all_dead.alarm_name,
     aws_cloudwatch_metric_alarm.ws_failed_connections.alarm_name,
     aws_cloudwatch_metric_alarm.order_update_ws_inactive.alarm_name,
+    aws_cloudwatch_metric_alarm.groww_ws_inactive.alarm_name,
+    aws_cloudwatch_metric_alarm.groww_stall_restart_storm.alarm_name,
     aws_cloudwatch_metric_alarm.questdb_disconnected.alarm_name,
     aws_cloudwatch_metric_alarm.tick_gap_instruments_silent.alarm_name,
     aws_cloudwatch_metric_alarm.token_remaining_low.alarm_name,
