@@ -13,7 +13,7 @@
 # Data path:
 #   tickvault Rust binary -> :9091/metrics (Prometheus exporter)
 #                         -> CloudWatch agent prometheus scrape (60s interval)
-#                         -> EMF processor filter (only the 12 metrics below)
+#                         -> EMF processor filter (only the selected metrics)
 #                         -> CloudWatch namespace "Tickvault/Prod"
 #                         -> CloudWatch alarm
 #                         -> SNS tv_alerts
@@ -21,19 +21,25 @@
 #                         -> Operator's phone
 #
 # Filter is configured in user-data.sh.tftpl::amazon-cloudwatch-agent.json
-# emf_processor block — keeps custom-metric cost capped (12 metrics × $0.30
-# = $3.60/mo ≈ ₹306/mo vs. ~₹4500/mo for an unfiltered 150-metric scrape).
+# emf_processor block — keeps custom-metric cost capped (24 selected
+# metrics × ~$0.30 = $7.20/mo ≈ ₹612/mo absolute, $4.20/mo above the
+# 10-free-metric tier — vs. ~₹4500/mo for an unfiltered 150-metric scrape;
+# the 24-name count is pinned by cloudwatch_app_alarms_wiring.rs).
 # 2026-07-06 groww feed-down alerting: +3 selected metrics
 # (tv_groww_ws_active, tv_feed_last_tick_age_seconds,
 # tv_feed_sidecar_stall_restart_total) ≈ +$0.90/mo, +2 alarms ≈ +$0.20/mo.
 #
 # Cost honesty:
 #   - CloudWatch free tier: 10 alarms + 10 custom metrics + 5GB logs.
-#   - Pre-PR:  6 alarms (alarms.tf=5, telegram-webhook-lambda.tf=1). 0 custom metrics.
-#   - Post-PR: 18 alarms, 12 custom metrics.
-#   - Overage: 8 alarms × $0.10 = $0.80/mo + 2 custom metrics × $0.30 = $0.60/mo.
-#   - Net: ~$1.40/mo ≈ ₹120/mo extra. Pushes aws-budget.md total from
-#     ₹1,022 to ~₹1,142. Operator MUST acknowledge before terraform apply.
+#   - Pre-PR (historical, original alarm PR):  6 alarms (alarms.tf=5,
+#     telegram-webhook-lambda.tf=1). 0 custom metrics.
+#   - Post-PR (historical): 18 alarms, 12 custom metrics.
+#     Overage then: 8 alarms × $0.10 = $0.80/mo + 2 custom metrics × $0.30
+#     = $0.60/mo ≈ ₹120/mo extra.
+#   - Current (2026-07-06): 20 app alarms, 24 selected custom metrics.
+#     Overage now: alarms ≈ $1.50/mo + metrics (24 − 10 free) × $0.30 =
+#     $4.20/mo ⇒ ~$5.70/mo ≈ ₹485/mo total. Operator MUST acknowledge
+#     before terraform apply.
 
 locals {
   # All alarms publish to the same SNS topic. Single source of truth so
@@ -581,7 +587,7 @@ resource "aws_cloudwatch_metric_alarm" "mem_used_high" {
 # ---------------------------------------------------------------------------
 
 output "app_cloudwatch_alarms" {
-  description = "20 application-level alarms (18 Prometheus-via-CW-agent + 1 disk-used + 1 mem-used Metrics-Insights). Cost note (2026-07-06 groww feed-down alerting adds 2 alarms + 3 selected metrics ≈ +$1.10/mo): overage above the 10 free-tier alarms ≈ $1.50/mo + 18 custom metrics ≈ $1.65/mo ≈ ₹270/mo — well inside the $55 budget cap."
+  description = "20 application-level alarms (18 Prometheus-via-CW-agent + 1 disk-used + 1 mem-used Metrics-Insights). Cost note (2026-07-06 groww feed-down alerting adds 2 alarms + 3 selected metrics ≈ +$1.10/mo): overage above the 10 free-tier alarms ≈ $1.50/mo + 24 selected custom metrics ≈ $4.20/mo overage above the 10 free-tier metrics (≈ $7.20/mo absolute at ~$0.30 each; count pinned by cloudwatch_app_alarms_wiring.rs) ≈ $5.70/mo ≈ ₹485/mo total — well inside the $55 budget cap."
   value = [
     aws_cloudwatch_metric_alarm.disk_used_high.alarm_name,
     aws_cloudwatch_metric_alarm.mem_used_high.alarm_name,
