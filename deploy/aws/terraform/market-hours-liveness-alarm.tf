@@ -60,6 +60,38 @@
 #   weekend stop can never page. Reuses the boot-heartbeat inline-Lambda pattern,
 #   shifted to the market-hours window.
 #
+#   WEEKDAY NSE HOLIDAYS (2026-07-07 review fix): the open cron is holiday-blind
+#   (plain MON-FRI), but holiday-gate.sh SELF-STOPS the box on a definitive
+#   NSE-holiday verdict at boot (~08:32 IST) — so a blind 09:20 enable + OK
+#   reset would drive every breaching-on-missing member (this alarm +
+#   app-log-ingestion-silent) OK→ALARM against an intentionally-stopped box:
+#   a false page every weekday holiday. The gate Lambda's open mode therefore
+#   verifies the tv-app instance is up (ec2:DescribeInstances) before enabling,
+#   and FAILS OPEN on any EC2 API error so a real trading day never loses the
+#   page. Ratchet: crates/app/tests/cloudwatch_agent_glob_guard.rs
+#   (test_gate_lambda_open_is_holiday_safe).
+#
+#   ROUND-3 HARDENING (2026-07-07): the single 09:20 instance-state sample
+#   alone was RACY — the box did NOT stay stopped on holidays. Two
+#   holiday-blind self-healers kept restarting it all day (start-watchdog
+#   mode=check @ 08:45 IST self-start; aws-autopilot start-instances every
+#   15 min inside its 08:30-16:30 IST up-window, incl. the 03:45 UTC ≈ 09:15
+#   IST slot + GH cron jitter), and holiday-gate.sh re-stopped it ~2-3 min
+#   after each boot — 1-3 min up-bursts that can bracket the 09:20 sample and
+#   restore the false page. Fix: holiday-gate.sh now stamps today's IST date
+#   into the /tickvault/<env>/holiday-stop-date SSM param BEFORE the stop;
+#   (a) BOTH restarters consult it and skip the self-start (the war ends at
+#   the source — the box now genuinely stays stopped), and (b) this gate
+#   Lambda's open mode checks the marker FIRST — marker == today is
+#   authoritative for "intentionally stopped today" and cannot be raced by a
+#   transiently-up box, making the instance-state sample a second line for
+#   the marker-less manual-stop case. FAIL-OPEN on any SSM error (missing/
+#   stale marker = trading day). Honest residual: if the marker put itself
+#   fails AND a restarter races the 09:20 sample, the false page can still
+#   occur — bounded to that double-failure, vs. every raced holiday before.
+#   Ratchet: test_gate_lambda_open_checks_holiday_marker_first +
+#   test_holiday_stop_marker_chain_is_wired (cloudwatch_agent_glob_guard.rs).
+#
 # Cost: 1 alarm (score metric already scraped, so 0 NEW custom metrics) + 1 tiny
 # Lambda at 2 invokes/weekday (~44/mo) — well within the Lambda free tier (₹0).
 # Alarm count 23 → 24 (app-alarms.tf output note); overage above the 10 free-tier
@@ -114,19 +146,79 @@ data "archive_file" "tv_market_hours_liveness_gate_zip" {
   source {
     content  = <<-PYEOF
 import os, boto3
+from datetime import datetime, timedelta, timezone
 
 cw = boto3.client('cloudwatch')
+ec2 = boto3.client('ec2')
+ssm = boto3.client('ssm')
 
 ALARM_NAMES = [n.strip() for n in os.environ['ALARM_NAMES'].split(',') if n.strip()]
+INSTANCE_ID = os.environ['EC2_INSTANCE_ID']
+HOLIDAY_STOP_PARAM = os.environ['HOLIDAY_STOP_PARAM']
+IST = timedelta(hours=5, minutes=30)
 
-# mode="open"  (09:20 IST) -> enable alarm actions for the market-hours window.
+# mode="open"  (09:20 IST) -> enable alarm actions for the market-hours window,
+#                             but ONLY if the tv-app box is actually up.
 # mode="close" (15:35 IST) -> disable them again so the intentional off-hours
 #                             state (metric missing on the nightly/weekend
 #                             stop, or legitimately-zero score/seals while the
 #                             box idles outside market hours) never pages.
+#
+# WEEKDAY-NSE-HOLIDAY SAFETY (2026-07-07 review fix): the open cron is a plain
+# MON-FRI schedule with no NSE-holiday awareness, and on weekday NSE holidays
+# the box SELF-STOPS at boot (deploy/aws/holiday-gate.sh, ~08:32 IST). Enabling
+# the breaching-on-missing members of ALARM_NAMES (market-hours-liveness,
+# app-log-ingestion-silent) against an intentionally-stopped box would
+# false-page every weekday holiday (~09:25 / ~09:35 IST). So "open" first asks
+# EC2 whether the instance is up; a not-up box (holiday self-stop or operator
+# manual stop) keeps its actions DISABLED and skips the OK reset.
+# FAIL-OPEN: any DescribeInstances error enables as before — a real trading
+# day must never lose the liveness page (mirror of holiday-gate.sh's
+# fail-open philosophy, pointed the other way).
+def holiday_stop_is_today():
+    # ROUND-3 hardening (2026-07-07): deploy/aws/holiday-gate.sh stamps
+    # today's IST date into HOLIDAY_STOP_PARAM right BEFORE it self-stops the
+    # box on a weekday NSE holiday. Marker == today is AUTHORITATIVE for
+    # "intentionally stopped today" — unlike the single instance-state sample
+    # below, it cannot be raced by a holiday-blind restarter briefly bringing
+    # the box up around 09:20 IST (the restart-war window). Stale markers
+    # (a previous holiday's date) never match today. FAIL-OPEN: any SSM error
+    # / missing param = not a holiday — a real trading day must never lose
+    # the liveness page.
+    try:
+        raw = (ssm.get_parameter(Name=HOLIDAY_STOP_PARAM)['Parameter']['Value'] or '').strip()
+        today_ist = (datetime.now(timezone.utc) + IST).strftime('%Y-%m-%d')
+        return raw == today_ist
+    except Exception as e:
+        print(f"holiday-stop marker unavailable ({e}) -- fail-open, not a holiday")
+        return False
+
+def instance_is_up():
+    try:
+        r = ec2.describe_instances(InstanceIds=[INSTANCE_ID])
+        state = r['Reservations'][0]['Instances'][0]['State']['Name']
+        # 'pending' counts as up: a late trading-day start must still arm the
+        # window (the OK reset + 5-15 min evaluation absorb the boot).
+        return state in ('running', 'pending'), state
+    except Exception as e:
+        print(f"describe_instances failed ({e}) -- fail-open, treating as up")
+        return True, 'unknown'
+
 def handler(event, context):
     mode = (event or {}).get('mode', 'close')
     if mode == 'open':
+        # Marker check FIRST — race-proof (round 3); instance state second —
+        # covers the marker-less manual-stop case (round 1).
+        if holiday_stop_is_today():
+            print(f"holiday-stop marker == today (NSE holiday self-stop); "
+                  f"leaving actions disabled for {ALARM_NAMES}")
+            return {'mode': mode, 'enabled': False, 'holiday_stop': True}
+        up, state = instance_is_up()
+        if not up:
+            print(f"instance {INSTANCE_ID} state={state} -- intentional stop "
+                  f"(NSE holiday self-stop / manual); leaving actions disabled "
+                  f"for {ALARM_NAMES}")
+            return {'mode': mode, 'enabled': False, 'instance_state': state}
         cw.enable_alarm_actions(AlarmNames=ALARM_NAMES)
         # Reset to OK on open so a stale ALARM from a prior window does not
         # immediately re-fire on the first enabled evaluation.
@@ -173,6 +265,28 @@ resource "aws_iam_role_policy" "tv_market_hours_liveness_gate" {
         Resource = "*"
       },
       {
+        # Weekday-NSE-holiday safety (2026-07-07): the open path checks the
+        # tv-app instance state before enabling the breaching-on-missing
+        # alarms (holiday-gate.sh self-stops the box on holidays, so a blind
+        # MON-FRI enable would false-page). DescribeInstances has no
+        # resource-level scoping in IAM (AWS limitation), so "*" is required;
+        # the Lambda only ever reads EC2_INSTANCE_ID. Same pattern as
+        # start-watchdog-lambda.tf.
+        Effect   = "Allow"
+        Action   = ["ec2:DescribeInstances"]
+        Resource = "*"
+      },
+      {
+        # Round-3 holiday-race hardening (2026-07-07): the open path reads
+        # the /tickvault/<env>/holiday-stop-date marker holiday-gate.sh
+        # stamps before its self-stop — marker == today is race-proof
+        # (the single instance-state sample can be bracketed by a
+        # restart-war up-burst). Read-only, scoped to that one parameter.
+        Effect   = "Allow"
+        Action   = ["ssm:GetParameter"]
+        Resource = "arn:aws:ssm:${var.aws_region}:*:parameter/tickvault/${var.environment}/holiday-stop-date"
+      },
+      {
         Effect   = "Allow"
         Action   = ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"]
         Resource = "arn:aws:logs:${var.aws_region}:*:*"
@@ -194,12 +308,26 @@ resource "aws_lambda_function" "tv_market_hours_liveness_gate" {
     variables = {
       # All market-hours-gated alarms (comma-separated). 2026-07-03: the two
       # app-alarms.tf value-based off-hours false-pagers joined the liveness
-      # alarm under the same 09:20-15:35 IST Mon-Fri window.
+      # alarm under the same 09:20-15:35 IST Mon-Fri window. 2026-07-07: the
+      # app-log-ingestion-silent alarm (log-retention.tf) joined — zero log
+      # ingestion is by design while the box is intentionally stopped, so it
+      # needs the same window gate to never false-page off-hours.
       ALARM_NAMES = join(",", [
         aws_cloudwatch_metric_alarm.market_hours_liveness_missing.alarm_name,
         aws_cloudwatch_metric_alarm.realtime_guarantee_critical.alarm_name,
         aws_cloudwatch_metric_alarm.aggregator_no_seals.alarm_name,
+        aws_cloudwatch_metric_alarm.app_log_ingestion_silent.alarm_name,
       ])
+      # Weekday-NSE-holiday safety: the open path skips enabling when this
+      # instance is not up (holiday-gate.sh self-stop). Referencing
+      # aws_instance.tv_app.id from a Lambda env is cycle-free — the proven
+      # pattern from start-watchdog-lambda.tf (the cycle concern in main.tf
+      # applies only to the instance's OWN role policy).
+      EC2_INSTANCE_ID = aws_instance.tv_app.id
+      # Round-3 holiday-race hardening: the intentional-stop marker
+      # holiday-gate.sh writes before its self-stop. Checked FIRST on open —
+      # cannot be raced by a restart-war up-burst at the 09:20 sample.
+      HOLIDAY_STOP_PARAM = "/tickvault/${var.environment}/holiday-stop-date"
     }
   }
 }
