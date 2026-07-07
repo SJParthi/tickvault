@@ -13,6 +13,7 @@
         obs obs-verify obs-restart obs-open \
         logs app-pid \
         audit coverage bench geiger typos quality doc bootstrap scoped-check full-qa parity-soak \
+        lambda-test \
         dispatch dispatch-readonly dispatch-status dispatch-logs dispatch-check dispatch-audit \
         cross-verify-show cross-verify-now prev-day-show \
 
@@ -118,6 +119,12 @@ test: ## Run all tests
 
 scoped-check: ## Run tests ONLY for crates touched by current diff (see .claude/rules/project/testing-scope.md)
 	@bash .claude/hooks/scoped-test-runner.sh
+
+lambda-test: ## Run telegram-webhook Lambda unit tests (pure formatters, no AWS creds)
+	@echo "🧪 Running telegram-webhook Lambda unit tests..."
+	python3 -m unittest discover -s deploy/aws/lambda/telegram-webhook -p 'test_*.py' -v
+	@echo ""
+	@echo "  ✅ Lambda tests passed"
 
 parity-soak: ## Run the 29-tf parity harness framework validation (Phase 3 commit 5)
 	@echo "🔬 Running parity harness framework validation..."

@@ -458,6 +458,15 @@ jobs:
         shell: bash
         run: bash .claude/hooks/boot-symmetry-guard.sh
 
+      # 2026-07-07 Telegram UX overhaul (judge final contract, Module 5):
+      # the telegram-webhook Lambda's house-style formatters are unit-tested
+      # server-side so a Lambda regression cannot ship silently. Added to
+      # the EXISTING Repo Guards job on purpose — no new job, the All Green
+      # `needs:` list is unchanged.
+      - name: Telegram Lambda house-style unit tests
+        shell: bash
+        run: make lambda-test
+
   # -------------------------------------------------------------------------
   # All Green — the single merge choke point (merge-gate hardening 2026-07-04).
   #

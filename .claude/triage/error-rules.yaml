@@ -1012,6 +1012,22 @@ rules:
       Coalescer state inconsistency self-recovers on next drain.
       Informational — operator action only required if recurring.
 
+  - name: telegram-03-episode-degraded-silence
+    match:
+      code: TELEGRAM-03
+    action: silence
+    runbook_path: .claude/rules/project/wave-3-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 3600
+    justification: >-
+      TELEGRAM-03 = episode live-edit machinery degraded (snapshot store
+      write failed, corrupt rehydrate, or edit-fallback storm). Delivery
+      itself is never at risk — the duplicate-over-drop ladder terminates
+      at TELEGRAM-01 loudness, so only the one-bubble-per-incident UX
+      degrades. Severity::Low, auto-triage-safe. Silence with a 1h
+      cooldown; a sustained storm re-fires the signature and TELEGRAM-01
+      escalates if delivery ever actually drops.
+
   - name: selftest-01-passed-silence
     match:
       code: SELFTEST-01

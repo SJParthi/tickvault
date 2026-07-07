@@ -34,10 +34,18 @@ static MUHURAT_ACTIVE: OnceLock<bool> = OnceLock::new();
 /// [`current`] then returns `false` (today's behaviour: no Muhurat widening).
 // TEST-EXEMPT: covered by tests::current_before_init_is_false_then_reflects_init.
 pub fn init_muhurat_session(active: bool) {
-    // First call wins; a second call returns Err(rejected) which we
-    // intentionally discard (boot runs once). `let _` consumes the
-    // #[must_use] Result (a Copy `Result<(), bool>`, so `drop` would no-op).
-    let _ = MUHURAT_ACTIVE.set(active);
+    // First call wins; a second call returns Err(rejected) — intentional
+    // idempotency (boot runs once), consumed via `is_err()` so the
+    // #[must_use] `Result<(), bool>` is handled explicitly (the Copy type
+    // makes `drop(..)` a `dropping_copy_types` lint; `let _` a
+    // `let_underscore_must_use` lint). The ignored repeat is logged so it
+    // is never silent.
+    if MUHURAT_ACTIVE.set(active).is_err() {
+        tracing::debug!(
+            rejected_value = active,
+            "muhurat init called more than once; first boot value kept"
+        );
+    }
 }
 
 /// The current Muhurat-session flag. Returns `false` if [`init_muhurat_session`]
