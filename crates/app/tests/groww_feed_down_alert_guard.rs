@@ -88,6 +88,19 @@ fn test_feed_disable_falling_edge_emits_feed_down() {
             "groww_bridge.rs: the feed-disable FeedDown emit #{n} must be gated by the \
              per-episode try_announce_feed_down latch (audit Rule 4 — once per episode)"
         );
+        // Regression: 2026-07-06 — the severity input must stay CALENDAR-aware
+        // (is_trading_session_now), never the clock-only helper: the disable
+        // arm computes `is_within_market_hours_ist()` 30 lines above for the
+        // audit-row kind, and a "unify the two market checks" cleanup would
+        // silently restore the 2026-05-09 Saturday/holiday false-page class.
+        assert!(
+            region
+                .contains("market_open: tickvault_common::market_hours::is_trading_session_now()"),
+            "groww_bridge.rs: the feed-disable FeedDown emit #{n} must pass the \
+             calendar-aware is_trading_session_now() as market_open — the clock-only \
+             is_within_market_hours_ist() pages High + SNS on Saturday manual runs \
+             and NSE weekday holidays (fixed 2026-07-06):\n{region}"
+        );
     }
 }
 
@@ -111,6 +124,15 @@ fn test_bridge_death_falling_edge_emits_feed_down() {
             region.contains("try_announce_feed_down"),
             "groww_bridge.rs: the bridge-death FeedDown emit #{n} must be gated by the \
              per-episode try_announce_feed_down latch"
+        );
+        // Regression: 2026-07-06 — calendar-aware severity input (see the
+        // feed-disable twin above for the full rationale).
+        assert!(
+            region
+                .contains("market_open: tickvault_common::market_hours::is_trading_session_now()"),
+            "groww_bridge.rs: the bridge-death FeedDown emit #{n} must pass the \
+             calendar-aware is_trading_session_now() as market_open (Saturday/holiday \
+             false-page class, fixed 2026-07-06):\n{region}"
         );
     }
 }
@@ -198,17 +220,67 @@ fn test_status_file_evidence_is_freshness_gated() {
             "groww_bridge.rs: status-file read #{n} must gate on groww_status_is_live \
              (a stale record must be treated exactly like an absent file):\n{region}"
         );
+        // 2026-07-06 boot-deferral fix: the one-shot `subscribed` record is
+        // fresh for only 120s, so freshness must LATCH per episode — without
+        // the latch, a >120s docker/notifier boot chain permanently lost the
+        // deferred boot-connect ping and left the gauge 0 on tickless windows.
+        assert!(
+            region.contains("fresh_status_seen_this_episode"),
+            "groww_bridge.rs: status-file read #{n} must latch freshness per episode \
+             (fresh_status_seen_this_episode) — requiring the one-shot `subscribed` \
+             record to STILL be fresh at announce time silently breaks the \
+             'delayed, never lost' boot-connect deferral:\n{region}"
+        );
     }
-    // The disable arm must advance the live floor so a post-re-enable read
-    // can never accept a pre-disable fossil as fresh.
+    // The disable arm must advance the live floor + reset the episode latch
+    // so a post-re-enable read can never accept a pre-disable fossil as fresh.
     let disable_windows = marker_windows(prod, "\"feed_disabled\"", 12, 60);
     assert!(!disable_windows.is_empty());
     for (n, region) in disable_windows.iter().enumerate() {
         assert!(
-            region.contains("status_live_floor_ist_nanos = receipt_ist_nanos()"),
-            "groww_bridge.rs: the disable arm #{n} must advance the stale-status \
-             live floor (status_live_floor_ist_nanos = receipt_ist_nanos()) so a \
-             re-enable can never latch off the pre-disable frozen status file"
+            region.contains("live_floor_ist_nanos = receipt_ist_nanos()"),
+            "groww_bridge.rs: the disable arm #{n} must advance the live-evidence \
+             floor (live_floor_ist_nanos = receipt_ist_nanos()) so a re-enable can \
+             never latch off the pre-disable frozen status file or the pre-disable \
+             NDJSON backlog"
+        );
+        assert!(
+            region.contains("fresh_status_seen_this_episode = false"),
+            "groww_bridge.rs: the disable arm #{n} must reset the per-episode \
+             status-freshness latch (fresh_status_seen_this_episode = false) — \
+             otherwise the pre-disable episode's proof leaks across the re-enable"
+        );
+    }
+}
+
+#[test]
+fn test_tick_channel_streaming_latch_is_freshness_gated() {
+    // 2026-07-06 replayed-backlog false-recovery fix: the STATUS file is not
+    // the only streaming-evidence channel — `drain_new_data` returning true
+    // for ANY validated line (including the ≤2s pre-disable NDJSON backlog
+    // replayed on the first re-enable wake, and a respawned bridge's byte-0
+    // re-tail) used to latch `streaming_observed` un-gated: false
+    // FeedRecovered ("Prices are flowing") before the relaunched sidecar had
+    // even authenticated, DOWN episode consumed, tv_groww_ws_active pinned 1
+    // all session. The latch (and ONLY the latch — persist/fold stay
+    // unconditional, zero loss) must gate on the drained lines' per-message
+    // capture stamps being at/after the same live floor the status channel
+    // uses.
+    let src = read_repo_file("src/groww_bridge.rs");
+    let prod = production_region(&src);
+    let windows = marker_windows(prod, "state.drain_new_data(&tick_file_path", 2, 25);
+    assert!(
+        !windows.is_empty(),
+        "groww_bridge.rs: expected the run-loop drain_new_data call in the \
+         production region"
+    );
+    for (n, region) in windows.iter().enumerate() {
+        assert!(
+            region.contains("wake_had_fresh_capture(live_floor_ist_nanos)"),
+            "groww_bridge.rs: run-loop drain site #{n} must gate the tick-channel \
+             streaming latch on wake_had_fresh_capture(live_floor_ist_nanos) — an \
+             un-gated `parsed_a_tick => streaming_observed` resurrects the \
+             replayed-backlog false-recovery class:\n{region}"
         );
     }
 }
