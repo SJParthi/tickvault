@@ -65,7 +65,18 @@ boot-connect rising edge at ~2374). Fix (crates: **tickvault-core** +
    inside the existing `audited_connected` gate next to the `"feed_disabled"`
    audit row) and (b) the bridge-death falling edge in
    `supervise_groww_bridge_loop` (inside the existing `audited_connected.swap`
-   gate next to the `"bridge_died"` audit row). Both read the SAME lazily-filled
+   gate next to the `"bridge_died"` audit row). PANIC HONESTY on (b)
+   (tick-flush-worker-error-codes.md §1 house standard): the release profile
+   sets `panic = "abort"`, so a bridge panic in the production binary aborts
+   the WHOLE PROCESS — the supervisor's JoinError panic arm, the
+   `"bridge_died"` audit row, the gauge→0 write, and this FeedDown page are
+   reachable for non-panic exits / unwind (dev/test) builds ONLY. For a
+   release panic the gauge goes MISSING (notBreaching → groww-ws-inactive
+   stays silent), and visibility + recovery are the external process restart
+   + the boot/StartupComplete Telegram chain — no in-process panic
+   self-healing is claimed for release builds. (The operator-disable vector
+   (a), the FEED-STALL-01 stall-restart storm alarm, and the loop-published
+   gauges are all release-reachable and unaffected.) Both read the SAME lazily-filled
    `notifier_slot` the boot-connect arm reads. Fail-open on an unfilled slot at
    a falling edge: audit row still written, latch still set, page skipped
    (never blocks the disable/respawn path; bounded to boot-ordering).
@@ -164,7 +175,10 @@ boot-connect rising edge at ~2374). Fix (crates: **tickvault-core** +
   emits no typed event; FEED-STALL-01 stays `warn!`/`error!` per its runbook);
   the storm signal pages via the new CloudWatch alarm on the counter instead.
 - Repeated bridge deaths within one episode: latch fires FeedDown once;
-  `down_secs` spans the whole episode (first-down-wins CAS).
+  `down_secs` spans the whole episode (first-down-wins CAS). Applies to
+  non-panic exits / unwind builds only — a release-build panic aborts the
+  process (see Design item 2 PANIC HONESTY), so "repeated deaths" cannot
+  occur in-process in prod for the panic class.
 - Box auto-stop 16:30 IST / weekends / deploy gap: missing metric +
   `notBreaching` = silent (the 2026-06-02 stuck-FIRING fix rationale).
 - Feed disabled while never connected: no audit row today, and no FeedDown
@@ -197,6 +211,14 @@ boot-connect rising edge at ~2374). Fix (crates: **tickvault-core** +
   floored (`groww_status_is_live` / `wake_had_fresh_capture`) so fossils
   persist+fold but never latch streaming, fire FeedRecovered, or pin the
   gauge; a cross-language epoch ratchet pins the stamp convention.
+- Release-build bridge panic (PANIC HONESTY, tick-flush-worker §1 pattern):
+  `panic = "abort"` + `overflow-checks = true` in the release profile mean a
+  panic anywhere in the bridge task (e.g. a financial-math overflow trip)
+  aborts the whole process — NO FeedDown page, NO gauge→0 (the metric goes
+  MISSING, which `notBreaching` keeps silent), and the supervisor never
+  respawns. Coverage for that class is the external process restart + the
+  boot/StartupComplete Telegram chain; the bridge-death FeedDown vector is
+  honest coverage for non-panic exits and unwind (dev/test) builds only.
 - Latch stuck true after a lost rising edge (process restart mid-episode):
   latches are per-process — a restart resets them; worst case one duplicate
   FeedDown after restart (idempotent for the operator, no false-OK).

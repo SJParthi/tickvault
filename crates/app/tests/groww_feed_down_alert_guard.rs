@@ -10,7 +10,13 @@
 //! typed Telegram surface). This guard fails the build if:
 //!
 //!  1. the feed-disable falling edge stops emitting `FeedDown`,
-//!  2. the bridge-death falling edge stops emitting `FeedDown`,
+//!  2. the bridge-death falling edge stops emitting `FeedDown`
+//!     (PANIC HONESTY, tick-flush-worker-error-codes.md §1: this vector is
+//!     reachable for non-panic exits / UNWIND (dev/test) builds ONLY — the
+//!     release profile's `panic = "abort"` turns a bridge panic into a
+//!     whole-process abort: no FeedDown page, gauge goes MISSING not 0
+//!     (notBreaching → groww-ws-inactive stays silent); that class pages
+//!     via the process-restart/boot Telegram chain, not this emit),
 //!  3. the streaming rising edge stops emitting the honest `FeedRecovered`
 //!     (recovery claimed on ticks, never socket-connect),
 //!  4. the per-episode `down_announced` latch usage disappears (page spam
@@ -104,6 +110,13 @@ fn test_feed_disable_falling_edge_emits_feed_down() {
     }
 }
 
+/// Pins the bridge-death `FeedDown` emit shape. PANIC HONESTY caveat
+/// (tick-flush-worker-error-codes.md §1 house standard): this falling edge
+/// is NOT release-build panic coverage — `panic = "abort"` in the release
+/// profile aborts the whole process before the supervisor's JoinError arm
+/// can engage, so the emit is reachable only for non-panic exits / unwind
+/// (dev/test) builds. The guard pins the emit's SHAPE (latch gating +
+/// calendar-aware severity), not a claim that a prod panic pages here.
 #[test]
 fn test_bridge_death_falling_edge_emits_feed_down() {
     let src = read_repo_file("src/groww_bridge.rs");
