@@ -288,9 +288,13 @@ def lambda_handler(event, _context):
     # NOT honor request `Connection: close` on the / 301 (no close after a
     # 20s recv gap), disproving the r2 theory that the server would EOF the
     # socket once the body was sent. The actual fixes are (1) the
-    # GET / -> /index.html rewrite above (never elicit the only
-    # delimiter-less response the server produces) and (2) the
-    # _NoFollowRedirect opener + body-less 3xx relay.
+    # GET / -> /index.html rewrite above (never elicit the / 301 — the only
+    # delimiter-less response OBSERVED in the 2026-07-06 probe set: /,
+    # /index.html, one /assets/ file, /exec, HEAD /; no claim is made about
+    # unprobed paths) and (2) the _NoFollowRedirect opener + body-less 3xx
+    # relay (covers any FUTURE unframed 3xx class-wide; an unframed NON-3xx
+    # on an unprobed path would still be a bounded 12s read -> honest 504,
+    # never a silent hang).
     # `Accept-Encoding: identity` still guarantees Content-Length-framed
     # uncompressed bodies on framed paths, under the MAX_BODY_BYTES cap.
     req.add_header("Accept-Encoding", "identity")

@@ -116,7 +116,7 @@ resource "aws_lambda_function" "questdb_console_proxy" {
   handler          = "handler.lambda_handler"
   filename         = data.archive_file.questdb_console_proxy[0].output_path
   source_code_hash = data.archive_file.questdb_console_proxy[0].output_base64sha256
-  timeout          = 26 # > the back handler's 12s urllib socket timeout (worst case ~2 socket ops); < the front's 29s
+  timeout          = 26 # aggregate backstop: the handler's 12s _TIMEOUT_SECS is PER socket op (connect + EACH recv — _read_capped can issue up to ~16 sequential recvs), so a dribbling upstream is bounded by THIS Lambda timeout, not by 12s; < the front's 29s
   memory_size      = 256
 
   vpc_config {

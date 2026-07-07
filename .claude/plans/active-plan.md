@@ -21,10 +21,10 @@
 - [x] FILE 4 — FRONT test suite: 1 new test (test_relay_forwards_location_on_3xx — FAILS on r2 because the front `_relay` header tuple drops `location`). No existing test modified; the 504 `upstream_timeout` mapping test stays as-is
   - Files: deploy/aws/lambda/questdb-console-front/test_handler.py
   - Tests: N/A-for-crates-grep (test_relay_forwards_location_on_3xx)
-- [x] FILE 5 — HARD deploy gate in terraform-apply.yml: new step "Deploy gate: console shell GET / must return 200 within 5s" inserted BEFORE "Publish QuestDB console URL to Telegram" (gate first, announce after). 3 attempts each hard-capped at 5s; body must contain the console shell HTML; 503 forgiven ONLY for a verifiably not-running box (terraform `instance_id` output → ec2 describe-instances); unknown state FAILS CLOSED. Secret hygiene: SSM read + ::add-mask:: + header-FILE (umask 077 mktemp), token never in argv
+- [x] FILE 5 — HARD deploy gate in terraform-apply.yml: new step "Deploy gate: console shell GET / must return 200 within 5s" inserted BEFORE "Publish QuestDB console URL to Telegram" (gate first, announce after). 3 attempts each hard-capped at 5s; body must contain the console shell HTML; 000/504/503 forgiven ONLY for a verifiably not-running box (terraform `instance_id` output → ec2 describe-instances; fixer round 1 2026-07-06: a STOPPED box manifests as CODE=000 through this gate — its ENI drops packets with no RST, so the back lambda's connect blocks the full 12s `_TIMEOUT_SECS` → upstream_timeout → front 504 at ~12s while the gate curl caps at 5s; a fast 503 needs a REFUSAL = box running with QuestDB down); unknown state FAILS CLOSED; a transient `terraform output questdb_console_url` failure also FAILS CLOSED (only the null/not-found console-disabled shape skips). Secret hygiene: SSM read + ::add-mask:: + header-FILE (umask 077 mktemp), token never in argv
   - Files: .github/workflows/terraform-apply.yml
   - Tests: N/A-for-crates-grep (the workflow gate itself IS the test; YAML validated via python3 yaml.safe_load; pre-fix bytes physically cannot pass — GET / needs ~12s while the per-attempt cap is 5s)
-- [x] FILE 6 — box-local canary in deploy-aws.yml: two SSM command-array elements after the QUESTDB-UP loop, before the TRADING APP FIRST block — NON-FATAL loud WARN probing the rewrite TARGET `/index.html` (never bare `/`, which would hang the SSM shell) so a QuestDB image bump that breaks the shell is caught on the deploy that ships it. Non-fatal is mandated by deploy-aws.yml's own TRADING-APP-FIRST charter (a broken observability component must never block the trading deploy)
+- [x] FILE 6 — box-local canary in deploy-aws.yml: two SSM command-array elements after the QUESTDB-UP loop, before the TRADING APP FIRST block — NON-FATAL loud WARN probing the rewrite TARGET `/index.html` (never bare `/`, which would hang the SSM shell) so a QuestDB image bump that breaks the shell is surfaced LOUDLY on the deploy that ships it — fixer round 1 (2026-07-06): the Fetch step now captures the SSM stdout to a file and greps for the canary WARN, emitting a job-level `::warning::` annotation + a `$GITHUB_STEP_SUMMARY` line (and a separate UNKNOWN warning when neither the WARN nor `QDB-SHELL-CANARY-OK` marker is present, e.g. SSM 24,000-char truncation). Non-fatal is mandated by deploy-aws.yml's own TRADING-APP-FIRST charter (a broken observability component must never block the trading deploy)
   - Files: .github/workflows/deploy-aws.yml
   - Tests: N/A-for-crates-grep (echoes QDB-SHELL-CANARY-OK or a WARN line in the SSM output the workflow already surfaces; YAML validated)
 - [x] FILE 7 — terraform comment truth + deploy trigger: questdb-console.tf back-lambda `timeout = 26` comment corrected (the back handler `_TIMEOUT_SECS` is 12s, not the stale "25s"). Zero infra diff, but LOAD-BEARING: terraform-apply.yml's push path filter covers only `deploy/aws/terraform/**` + the workflow file, so this touch makes the r3 lambdas deploy on the merge push (archive_file source_code_hash → plan exit 2 → apply) instead of waiting for the scheduled drift-apply
@@ -85,24 +85,37 @@ so the pre-fix behavior (504 after ~12s) can physically never pass.
   test_redirect_relayed_bodyless_never_reads_body (a bomb-fp asserts the body
   is NEVER read).
 - **Box auto-stopped during the smoke gate** — the gate verifies the EC2 state
-  via the terraform `instance_id` output; a 503 with the box verifiably
+  via the terraform `instance_id` output; 000/504/503 with the box verifiably
   stopped/stopping/pending SKIPS LOUDLY (auto-stop window is the console
-  working correctly); a 503 with the box RUNNING or an UNKNOWN state FAILS
-  CLOSED (audit Rule 11: no false-OK).
+  working correctly — a stopped box shows as 000 through the 5s-capped curl,
+  never a fast 503, because its ENI drops packets and the back lambda's
+  connect blocks the full 12s socket timeout); any of those codes with the
+  box RUNNING or an UNKNOWN state FAILS CLOSED (audit Rule 11: no false-OK).
 - **Lambda cold start vs the 5s budget** — 3 attempts with 3s sleeps absorb
   front + VPC-back cold starts; EACH attempt stays capped at 5s so the
   per-request contract holds.
-- **Future QuestDB renames `/index.html`** — the FILE 5 gate FATALs the deploy
-  that ships it; the FILE 6 box canary WARNs same-day on the box deploy lane.
+- **Future QuestDB renames `/index.html`** — HONEST ENVELOPE (fixer round 1,
+  2026-07-06): the deploy lane that SHIPS a QuestDB image bump is
+  deploy-aws.yml (`deploy/docker/**`), which does NOT trigger
+  terraform-apply.yml (path-filtered to `deploy/aws/terraform/**` + its own
+  file) and produces zero terraform drift — so the FILE 5 hard gate does NOT
+  run on that deploy; it FATALs on the NEXT terraform-drift apply (which can
+  be days later). Same-day protection on the shipping lane is the FILE 6 box
+  canary, now surfaced as a job-level `::warning::` + step-summary line by
+  the deploy-aws Fetch step (non-fatal per TRADING-APP-FIRST — a console
+  fault never blocks the trading deploy).
 
 ## Failure Modes
 
 - **Genuinely slow box** — still an honest 504 (`upstream_timeout` mapping
   UNCHANGED — back handler timeout arms + the front's 504 mapping) — and
   post-fix that 504 finally MEANS slow, not "unframed 301".
-- **Dead box** — honest 503 (no static shell exists that could fake a 200 on a
-  dead box); the smoke gate independently verifies box state before accepting
-  a 503.
+- **Dead box** — no static shell exists that could fake a 200 on a dead box.
+  Precise codes (fixer round 1, 2026-07-06): a STOPPED box drops packets (no
+  RST), so the console answers 504 `upstream_timeout` after the back lambda's
+  12s connect timeout — the front's 503 `box_unreachable` needs a connection
+  REFUSAL (box running, QuestDB down). The smoke gate independently verifies
+  the EC2 state before accepting ANY of 000/504/503 as the auto-stop window.
 - **Unframed NON-3xx on a future path** — bounded 12s → honest 504, never a
   silent hang; read-until-idle was explicitly rejected in the repro design
   notes (it would turn every load into a deliberate multi-second stall).
@@ -110,7 +123,10 @@ so the pre-fix behavior (504 after ~12s) can physically never pass.
   closed (the `aws ssm get-parameter` failure aborts under `set -euo
   pipefail`; unknown EC2 state is an explicit FATAL arm).
 - **Console disabled in terraform** — the gate skips loudly ("nothing deployed
-  to gate"), mirroring the publish step's own disabled arm.
+  to gate"), mirroring the publish step's own disabled arm. Fixer round 1
+  (2026-07-06): ONLY the known disabled shape (terraform output null / not
+  found) skips; any other `terraform output` failure (state lock, backend
+  hiccup) FAILS CLOSED instead of masquerading as disabled (audit Rule 11).
 
 ## Test Plan
 

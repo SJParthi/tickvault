@@ -399,18 +399,42 @@ jobs:
         # '/' -> '/index.html'. This gate asserts the fixed contract
         # END-TO-END (API-GW -> front device-key auth -> back VPC relay ->
         # box:9000): GET / must be HTTP 200 within 5 seconds. HARD FAIL on
-        # any other outcome, with ONE honest exception: a 503 while the EC2
-        # box is VERIFIABLY not running (auto-stop window) is the console
-        # working correctly — that case SKIPS LOUDLY. A 503 with the box
-        # RUNNING, or an unknown box state, still FAILS (audit Rule 11: no
-        # false-OK). 3 attempts absorb front+VPC-back lambda cold start;
+        # any other outcome, with ONE honest exception: 000/504/503 while
+        # the EC2 box is VERIFIABLY not running (auto-stop window) is the
+        # console working correctly — that case SKIPS LOUDLY. NOTE (fixer
+        # round 1, 2026-07-06): a STOPPED box manifests as CODE=000 here,
+        # never a fast 503 — the stopped instance keeps its ENI/private IP
+        # and silently DROPS packets (no RST), so the back lambda's connect
+        # blocks its full 12s socket timeout (proxy handler.py
+        # _TIMEOUT_SECS=12 -> upstream_timeout -> front 504 at ~12s) while
+        # this gate's curl is capped at 5s. A fast 503 needs a connection
+        # REFUSAL = box RUNNING with QuestDB down. Any of 000/504/503 with
+        # the box RUNNING, or an unknown box state, still FAILS (audit
+        # Rule 11: no false-OK). 3 attempts absorb front+VPC-back cold start;
         # EACH attempt is hard-capped at 5s, so the pre-fix behavior (504
         # after ~12s) can physically never pass. GET not HEAD: HEAD / is 405
         # (repro §8). Secret hygiene: SSM read + ::add-mask:: + header-FILE
         # (umask 077 mktemp) — the bearer never appears in argv or logs.
         run: |
           set -euo pipefail
-          QURL=$(terraform -chdir=${{ env.TF_DIR }} output -raw questdb_console_url 2>/dev/null || echo "")
+          # Console-disabled skip vs transient output-read failure (fixer
+          # round 1, 2026-07-06 — audit Rule 11): only the KNOWN disabled
+          # shape (output is null / not found — enable_questdb_console=false)
+          # may skip. Any OTHER terraform-output failure (state lock, backend
+          # hiccup, creds) FAILS CLOSED instead of masquerading as disabled.
+          set +e
+          QURL=$(terraform -chdir=${{ env.TF_DIR }} output -raw questdb_console_url 2>/tmp/qurl-err.txt)
+          QURL_RC=$?
+          set -e
+          if [ "$QURL_RC" -ne 0 ]; then
+            if grep -qiE 'is null|not found|no outputs found|unsupported value for raw output' /tmp/qurl-err.txt; then
+              echo "questdb console disabled — shell smoke gate SKIPPED (nothing deployed to gate)"
+              exit 0
+            fi
+            echo "FATAL: terraform output questdb_console_url failed for a NON-disabled reason — failing closed. terraform stderr:"
+            cat /tmp/qurl-err.txt || true
+            exit 1
+          fi
           if [ -z "$QURL" ] || [ "$QURL" = "null" ]; then
             echo "questdb console disabled — shell smoke gate SKIPPED (nothing deployed to gate)"
             exit 0
@@ -443,18 +467,31 @@ jobs:
             STATE=$(aws ec2 describe-instances --instance-ids "$IID" --region ${{ env.AWS_REGION }} \
               --query 'Reservations[0].Instances[0].State.Name' --output text 2>/dev/null || echo unknown)
           fi
-          if [ "$CODE" = "503" ]; then
-            case "$STATE" in
-              stopped|stopping|pending)
-                echo "⚠ SKIP (loud): box is ${STATE} (auto-stop window, 08:30–16:30 IST schedule) — console honestly reports 503 offline; shell smoke re-runs on the next in-window apply" | tee -a "$GITHUB_STEP_SUMMARY"
-                exit 0 ;;
-              running)
-                echo "FATAL: console 503 'offline' while the box IS running — SG/bind/back-lambda regression"; exit 1 ;;
-              *)
-                echo "FATAL: console 503 and box state could not be verified (state='${STATE}') — failing closed"; exit 1 ;;
-            esac
-          fi
-          echo "FATAL: console shell GET / returned '${CODE}' (box state: ${STATE}; 000=timeout>5s; 504=the shell-hang class) — deploy gate FAILED. Body head:"
+          # Stopped-box reachability truth (fixer round 1, 2026-07-06): the
+          # loud auto-stop-window skip must cover 000 and 504 as well as 503.
+          # A stopped box CANNOT produce a fast 503 through this stack — its
+          # ENI keeps the private IP and DROPS packets (no RST), so the back
+          # lambda's connect blocks the full 12s _TIMEOUT_SECS and maps to
+          # upstream_timeout (front 504 ~12s), while this curl caps at 5s ->
+          # CODE=000 on every attempt. 'pending' = box still BOOTING (QuestDB
+          # not up yet — also expected 000). Without this arm, every
+          # off-window apply (nights/weekends/the 17:05 IST post-stop drift
+          # retry) would hard-fail AFTER a successful terraform apply. All
+          # three codes with the box RUNNING, or an unverifiable state, still
+          # FAIL CLOSED.
+          case "$CODE" in
+            000|503|504)
+              case "$STATE" in
+                stopped|stopping|pending)
+                  echo "⚠ SKIP (loud): console GET / -> '${CODE}' with the box ${STATE} (auto-stop window, 08:30–16:30 IST schedule) — a not-running box cannot serve the shell (stopped box = 5s curl timeout = 000, never a fast 503); shell smoke re-runs on the next in-window apply" | tee -a "$GITHUB_STEP_SUMMARY"
+                  exit 0 ;;
+                running)
+                  echo "FATAL: console GET / -> '${CODE}' while the box IS running (503 = SG/bind/back-lambda regression; 000/504 = the shell-hang class)"; exit 1 ;;
+                *)
+                  echo "FATAL: console GET / -> '${CODE}' and box state could not be verified (state='${STATE}') — failing closed"; exit 1 ;;
+              esac ;;
+          esac
+          echo "FATAL: console shell GET / returned '${CODE}' (box state: ${STATE}) — deploy gate FAILED. Body head:"
           head -c 300 /tmp/qdb-shell.body || true
           exit 1
 

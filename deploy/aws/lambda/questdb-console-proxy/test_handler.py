@@ -19,6 +19,7 @@ import socket
 import sys
 import unittest
 import urllib.error
+import urllib.request
 from pathlib import Path
 from unittest import mock
 
@@ -327,11 +328,25 @@ class Relay(WithBase):
         # The belt layer: redirect_request returns None (no fp.read() drain;
         # every 3xx surfaces as HTTPError) and the opener is installed
         # module-wide so plain urllib.request.urlopen uses it.
+        # Fixer round 1 (2026-07-06): assert the LIVE installed opener object,
+        # not handler.py source text — a source grep ('install_opener' in src)
+        # stays green if the install_opener() call is moved into dead code
+        # (demonstrated in adversarial review), leaving the belt inert while
+        # every other test mock.patches urlopen and bypasses the opener chain.
+        # urllib.request._opener is the exact module global that urlopen()
+        # consults when no explicit opener is passed (CPython stdlib).
         self.assertIsNone(
             handler._NoFollowRedirect().redirect_request(None, None, 301, "Moved", {}, "/index.html")
         )
-        src = (Path(__file__).resolve().parent / "handler.py").read_text()
-        self.assertIn("install_opener", src)
+        live_opener = getattr(urllib.request, "_opener", None)
+        self.assertIsNotNone(
+            live_opener,
+            "no global opener installed — importing handler must call urllib.request.install_opener(...)",
+        )
+        self.assertTrue(
+            any(isinstance(h, handler._NoFollowRedirect) for h in live_opener.handlers),
+            "_NoFollowRedirect is NOT in the LIVE installed opener chain — the L2 belt layer is inert",
+        )
 
     def test_disproven_r2_close_claim_removed(self) -> None:
         # Source ratchet: the factually-wrong r2 claim (that QuestDB

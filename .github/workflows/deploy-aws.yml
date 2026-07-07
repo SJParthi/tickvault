@@ -610,7 +610,7 @@ jobs:
               "if [ -f repo/deploy/docker/docker-compose.yml ]; then export TV_QUESTDB_PG_USER=$(aws ssm get-parameter --region ap-south-1 --name /tickvault/prod/questdb/pg-user --with-decryption --output text --query Parameter.Value 2>/dev/null || echo admin); export TV_QUESTDB_PG_PASSWORD=$(aws ssm get-parameter --region ap-south-1 --name /tickvault/prod/questdb/pg-password --with-decryption --output text --query Parameter.Value 2>/dev/null || echo quest); (cd repo/deploy/docker && TV_QUESTDB_PG_USER=\"$TV_QUESTDB_PG_USER\" TV_QUESTDB_PG_PASSWORD=\"$TV_QUESTDB_PG_PASSWORD\" docker compose up -d) || (echo FATAL: docker compose up failed; exit 1); else echo FATAL: docker-compose.yml missing from repo/deploy/docker; exit 1; fi",
               "# Verify QuestDB is actually listening on 9000 (HTTP) within 30s",
               "for i in 1 2 3 4 5 6; do if curl -fsS http://127.0.0.1:9000/exec?query=SELECT%201 >/dev/null 2>&1; then echo QUESTDB-UP; break; fi; sleep 5; if [ $i -eq 6 ]; then echo FATAL: QuestDB not responding on :9000 after 30s; docker compose -f repo/deploy/docker/docker-compose.yml ps; exit 1; fi; done",
-              "# 2026-07-06 console-shell canary (NON-FATAL per the TRADING APP FIRST rule below): the console back lambda rewrites GET / -> /index.html because QuestDB answers / with an unframed keep-alive 301 that never closes the socket (read-until-EOF hangs; never probe bare / here — it would hang this shell too). Assert the rewrite TARGET serves framed-fast on every box deploy so a QuestDB image bump that breaks the shell is caught on the deploy that ships it; the HARD console gate lives in terraform-apply.yml.",
+              "# 2026-07-06 console-shell canary (NON-FATAL per the TRADING APP FIRST rule below): the console back lambda rewrites GET / -> /index.html because QuestDB answers / with an unframed keep-alive 301 that never closes the socket (read-until-EOF hangs; never probe bare / here — it would hang this shell too). Assert the rewrite TARGET serves framed-fast on every box deploy so a QuestDB image bump that breaks the shell is surfaced LOUDLY on the deploy that ships it (the Fetch step below greps this WARN out of the SSM output and emits a job ::warning:: + step-summary line). Honest envelope: this lane never HARD-fails on the console; the HARD gate lives in terraform-apply.yml, which this deploy/docker lane does NOT trigger (path-filtered) and whose scheduled slots only reach the gate on terraform drift.",
               "curl -fsS --max-time 5 -o /dev/null http://127.0.0.1:9000/index.html && echo QDB-SHELL-CANARY-OK || echo WARN: QuestDB /index.html not served within 5s - console shell rewrite target may be broken - trading app unaffected",
               "# === TRADING APP FIRST ===",
               "# The trading app is the deploy. Start + verify it BEFORE touching the",
@@ -713,13 +713,32 @@ jobs:
             --region ${{ vars.AWS_REGION || 'ap-south-1' }} \
             --command-id ${{ steps.ssm.outputs.command_id }} \
             --instance-id ${{ secrets.EC2_INSTANCE_ID }} \
-            --query 'StandardOutputContent' --output text || true
+            --query 'StandardOutputContent' --output text > /tmp/ssm-stdout.txt || true
+          cat /tmp/ssm-stdout.txt || true
           echo "----- STDERR (on-box) -----"
           aws ssm get-command-invocation \
             --region ${{ vars.AWS_REGION || 'ap-south-1' }} \
             --command-id ${{ steps.ssm.outputs.command_id }} \
             --instance-id ${{ secrets.EC2_INSTANCE_ID }} \
             --query 'StandardErrorContent' --output text || true
+          # B4 r3 console-shell canary surfacing (fixer round 1, 2026-07-06):
+          # deploy-aws is the ONLY lane that ships QuestDB image bumps
+          # (deploy/docker/** does not trigger terraform-apply.yml, whose hard
+          # console gate is path-filtered to deploy/aws/terraform/** and only
+          # reached by scheduled runs on terraform drift). The box-local
+          # canary WARN above is one line inside SSM output — invisible on a
+          # green deploy (audit Rule 11: a non-paging WARN is a weak signal).
+          # Surface it as a job-level ::warning:: annotation + step summary so
+          # a QuestDB bump that breaks the console shell is LOUD on the deploy
+          # that ships it. Still NON-FATAL: TRADING APP FIRST — a console-only
+          # fault never blocks the trading deploy.
+          if grep -q "WARN: QuestDB /index.html not served" /tmp/ssm-stdout.txt; then
+            echo "::warning::QuestDB console-shell canary FAILED on the box — /index.html not served within 5s; the console back-lambda rewrite target may be broken (trading app unaffected). The HARD console gate only runs on the next terraform-drift apply — investigate now."
+            echo "⚠ QuestDB console-shell canary FAILED (/index.html not served on-box within 5s) — console may be broken until fixed; trading app unaffected" >> "$GITHUB_STEP_SUMMARY"
+          elif ! grep -q "QDB-SHELL-CANARY-OK" /tmp/ssm-stdout.txt; then
+            echo "::warning::QuestDB console-shell canary verdict NOT FOUND in the SSM output (deploy failed before the canary, or SSM's 24,000-char output truncation) — canary verdict UNKNOWN for this deploy."
+            echo "⚠ QuestDB console-shell canary verdict UNKNOWN (marker absent from SSM output)" >> "$GITHUB_STEP_SUMMARY"
+          fi
           if [ "${STATUS}" != "Success" ]; then
             echo "::error::SSM command on the box failed with status=${STATUS} — see STDOUT/STDERR above for the on-box reason."
             exit 1
