@@ -1,281 +1,176 @@
-# Implementation Plan: Dhan token self-heal — forced mid-session re-mint + honest token-health gauges + one HIGH event
+# Implementation Plan: QuestDB console shell-hang fix (B4 r3) + deploy-gate smoke
 
 **Status:** VERIFIED
 **Date:** 2026-07-06
-**Approved by:** Parthiban (operator directive 2026-07-06)
-
-> Crates changed: **tickvault-core** (`crates/core/src/auth/*`, `crates/core/src/notification/events.rs`),
-> **tickvault-common** (`crates/common/src/error_code.rs`, `crates/common/src/constants.rs`),
-> **tickvault-app** (`crates/app/src/main.rs`).
-> A `crates/common/` change escalates the local test scope to `cargo test --workspace`
-> per `.claude/rules/project/testing-scope.md`.
->
-> Guarantee matrices: this plan carries + cross-references the 15-row + 7-row matrix in
-> `.claude/rules/project/per-wave-guarantee-matrix.md` and the GUARANTEE CHECK in
-> `.claude/rules/project/zero-loss-guarantee-charter.md` §3. Full synthesized contract:
-> scratchpad `token-selfheal-design.md`.
->
-> Out of scope (operator lock): `crates/core/src/websocket/order_update_connection.rs` (separate PR)
-> and ALL terraform / CloudWatch wiring — NOT touched.
-
-## Design
-
-On sustained mid-session token-invalid detection — **2 consecutive REAL `/v2/profile` auth
-failures** observed by the existing 900s market-hours-gated mid-session profile watchdog
-(`crates/core/src/auth/mid_session_watchdog.rs`) — trigger exactly **ONE forced token re-mint
-per failing episode** through the EXISTING `TokenManager::force_renewal()` machinery
-(`crates/core/src/auth/token_manager.rs:1200` → `renew_with_fallback` = GET `/v2/RenewToken`
-then fallback POST `generateAccessToken`). No fork of TokenManager; no new mint engine.
-
-Lock-before-mint is operator law: the re-mint is refused **fail-closed** when the dual-instance
-lock is not held. A new O(1) read-only accessor `TokenManager::dual_instance_lock_held(&self)
--> Option<bool>` (delegating to the existing private `instance_lock_held` field @ `:114`) feeds
-a **pure** decision fn `decide_remint(...)` so the refusal is decided BEFORE any network call
-(zero external side effects). Defense-in-depth: `acquire_token`'s own
-`mint_refused_by_instance_lock` tripwire (`token_manager.rs:701/:1304`) still refuses inside
-`force_renewal`, classified PERMANENT so the loop fails fast. The ~125s Dhan mint cooldown
-(`DHAN_TOKEN_GENERATION_COOLDOWN_SECS = 125`) is honored by a pure `cooldown_elapsed` input
-plus the once-per-episode latch; DH-901 law (rotate → retry ONCE → HALT) stays intact — the
-BOOT-path HALT is untouched, and the mid-session path substitutes the pre-existing CRITICAL
-`MidSessionProfileInvalidated` page for HALT because a mid-session process HALT would drop the
-live WS feed (the watchdog's standing contract, docstring `:35-43`).
-
-Two honest gauges are published by a 15s poller (new module
-`crates/core/src/auth/token_health_gauge.rs`), eliminating the past-local-expiry false-OK
-(the two pre-existing renewal-loop snapshot writes at `:929`/`:959` REMAIN — three writers
-total for `tv_token_remaining_seconds`, honestly documented in the module header; the poller
-overwrites within one 15s cadence so no false-OK results):
-- `tv_token_remaining_seconds` = LIVE `expiry_ts − now` via the existing O(1) arc-swap
-  `TokenManager::seconds_until_expiry()` (`:1104`), REPLACING the frozen mint-time constant
-  (today emitted only twice per ~23h renewal loop at `:929`/`:959`, which stay as harmless
-  augment).
-- `tv_token_valid` = AND-composed `token_valid_gauge(has_token, locally_valid, profile_valid)`:
-  1.0 iff a token is loaded AND not past local expiry AND the watchdog's last `/v2/profile`
-  check did not fail (shared `Arc<AtomicBool>`). 0.0 on DH-901/DH-906 (profile) OR past local
-  expiry (poller) OR no token. This satisfies the operator scope ("1.0 on `/v2/profile`
-  success, 0.0 on DH-901/DH-906") and additionally never shows a stale 1.0 on a
-  killed-but-not-yet-expired or locally-expired token (audit Rule 11 — no false-OK).
-
-One typed HIGH `NotificationEvent::TokenForcedRemintTriggered { consecutive_checks, check_interval_secs }`
-fires edge-triggered ONCE per episode (guaranteed by the `remint_attempted_this_episode` latch),
-inherently market-hours-aware (the whole watchdog loop is gated). Telegram text follows the 10
-plain-English commandments and NEVER contains the JWT. A new `ErrorCode::AuthGap05ForcedRemintTriggered`
-(`code_str "AUTH-GAP-05"`, `Severity::High`) is added with a runbook mention in
-`.claude/rules/project/wave-4-error-codes.md` (required by `error_code_rule_file_crossref.rs` +
-`error_code_tag_guard.rs`).
-
-**Lane ownership (fixer round 1, 2026-07-06 — AG5-R1-1/SEC-R1-1/SEC-R1-2/CPLX-1/EDGE-1):** the
-gauge poller AND the (now remint-capable) mid-session watchdog are LANE-OWNED — their
-`JoinHandle`s ride in `DhanLaneRunHandles` (`token_health_gauge_handle` /
-`mid_session_watchdog_handle`), are aborted by both `teardown_dhan_lane_tasks` step 0 and the
-H8 `Drop` floor, and teardown publishes the honest lane-off gauge state
-(`tv_token_remaining_seconds = 0.0`, `tv_token_valid = 0.0`) mirroring the /health token-block
-reset. This closes: (a) the false-OK `tv_token_valid = 1.0` for up to ~24h after a deliberate
-runtime Dhan disable; (b) duplicate last-writer-wins pollers after disable→enable; (c) the
-leaked watchdog's dead-token `/v2/profile` traffic + false RESILIENCE-01 pages per lane cycle;
-(d) the C4 lane-TokenManager-ownership violation. **Fast-arm coverage (EDGE-2):** the FAST
-crash-recovery boot arm ALSO spawns the gauge poller (inert `profile_valid = true` — no
-watchdog on that arm; local-expiry gate keeps the composite honest), threaded through
-`run_shutdown_fast` into `DhanLaneRunHandles`.
-
-**Status-aware classification (fixer round 1 — AG5-R1-3/EDGE-3/SEC-R1-3):** `cycle_outcome`
-is a 4-way classifier: `Ok` / `RealAuthFail` (HTTP 401/403 parsed from the FIXED
-`profile request HTTP {status}` wrapper prefix, dataPlan inactive, token expiry) /
-`RestSurfaceDegraded` (HTTP 400/429/5xx/WAF + 200-with-unparseable-body — keeps the
-pre-existing CRITICAL page but NEVER walks the re-mint counter: a pure REST outage like the
-2026-06-10 all-400s day must never destroy the token the healthy live WS is riding) /
-`Transient` (send-leg network blip). All wrapper matching is PREFIX-anchored on the
-Display-prefix-stripped reason core — never a `contains` scan over text that concatenates the
-server response body (SEC-R1-3: a hostile 401 body could otherwise forge the send-leg wrapper
-+ a transient needle and silently disable both the page and the self-heal).
-
-## Edge Cases
-
-- **Below threshold (1 real failure):** `decide_remint` → `Wait`. No mint, no event. A single
-  Dhan-side blip never mints (ping-pong avoidance).
-- **Transient network blip between two real failures:** `cycle_outcome` = `Transient` → counter
-  unchanged, `profile_valid` unchanged, `tv_token_valid` never falsely 0.0, no re-mint. A
-  DNS/reset/timeout flap is not evidence either way.
-- **Already re-minted this episode:** `decide_remint` → `AlreadyAttempted` (DH-901 retry-once).
-  No second mint until a clean `Ok` resets the episode.
-- **Dual-instance lock lost mid-session (peer took the SSM lock):** `lock_held == Some(false)` →
-  `RefuseLockLost` — NEVER calls `force_renewal` (zero external side effects); emits
-  RESILIENCE-01-tagged error + `refused_lock_lost` counter; latch set to avoid per-cycle
-  re-eval. The peer's active token is never destroyed. `RefuseLockLost` is checked BEFORE
-  cooldown so the safety refusal can never be masked by a cooldown hold (pinned by a test).
-- **Fast-boot crash-recovery arm (`instance_lock_held = None`):** `dual_instance_lock_held()` →
-  `None` → treated as held (tripwire disarmed) — exactly as strong as the existing
-  `acquire_token` gate on that arm (documented residual per dual-instance-lock §3, unchanged).
-- **Dhan ~125s mint cooldown:** normally moot (900s cadence) but `cooldown_elapsed` hard-stops
-  any sub-125s re-mint; `HoldCooldown` counter increments.
-- **Off-hours / non-trading day:** whole loop `continue`s → no re-mint, no event; `tv_token_valid`
-  stays honest via the poller's local-expiry gate (goes 0.0 if the token locally expires even
-  with no profile check).
-- **Boot before first watchdog cycle:** `profile_valid` seeds `true`; the poller's local-expiry
-  gate still forces 0.0 for an absent/expired token — no false 1.0.
-
-## Failure Modes
-
-- **Re-mint does not restore validity (dead dataPlan / suspended account / wrong SSM TOTP):**
-  `force_renewal` returns Err or the next cycle is still invalid → `remint_attempted_this_episode`
-  blocks a second mint (retry-once); the existing CRITICAL `MidSessionProfileInvalidated` keeps
-  paging; the 23h `renewal_loop` 5-cycle circuit breaker still governs the background path. No
-  mid-session HALT.
-- **Stale-true lock flag race:** watchdog reads `Some(true)` but the heartbeat is flipping it
-  false → `acquire_token`'s internal `mint_refused_by_instance_lock` tripwire refuses inside
-  `force_renewal` (permanent) → classified permanent → no retry → `refused_lock_lost` counter.
-- **RenewToken succeeds but Dhan still rejects next cycle (propagation lag):** counter keeps
-  climbing but the episode latch prevents a mint storm; a clean `Ok` resets.
-- **Poller panic:** the `tokio::spawn` wrapper is TEST-EXEMPT; a panic loses only the live
-  gauge, not the token or the feed. The frozen renewal-loop emits at `:929/:959` remain as a
-  coarse fallback.
-- **JWT leak:** impossible by construction — event fields are `u32`/`u64` only; all `error!`/
-  `info!` carry counts, never the token; `Secret<String>` preserved.
-
-## Test Plan
-
-Pure decision fns (unit, no I/O — the tested heart):
-- `decide_remint`: below threshold → `Wait`; threshold+latch → `AlreadyAttempted`;
-  threshold+`lock=Some(false)` → `RefuseLockLost` EVEN WHEN `cooldown_elapsed=false` (lock beats
-  cooldown); threshold+lock ok+`!cooldown_elapsed` → `HoldCooldown`; threshold+lock ok+cooldown
-  ok → `Trigger`; `lock=None` treated as held → `Trigger`.
-- `cycle_outcome`: `Ok(())` → `Ok`; transient wrapper (dns/reset/timeout, reuse
-  `is_transient_network_failure` strings) → `Transient`; real HTTP 401/403/dataPlan-Inactive →
-  `RealAuthFail`; HTTP 400/429/5xx + parse error → `RestSurfaceDegraded` (pages, never mints);
-  hostile-401-body forging send-leg wrapper + transient needle → still `RealAuthFail`
-  (SEC-R1-3 prefix-anchoring regression test).
-- `next_consecutive_failures`: `Ok`→0, `RealAuthFail`→prev+1 (saturating),
-  `Transient`/`RestSurfaceDegraded`→unchanged; properties: a transient between two real
-  failures still reaches 2; two 503 cycles never reach the re-mint threshold.
-- `token_valid_gauge`: full 8-row truth table — 1.0 iff all three true, else 0.0.
-- `dual_instance_lock_held`: constructor with lock flag `Some(true)`→`Some(true)`,
-  `Some(false)`→`Some(false)`, `None`→`None`.
-
-Event/error-code:
-- `TokenForcedRemintTriggered`: `severity()==High`; `event_kind()=="TokenForcedRemintTriggered"`;
-  `feed_badge()` leads with Dhan; formatter contains "AUTH-GAP-05" + the consecutive count +
-  a leading status word; contains NO `eyJ`/JWT/file-path substring (10-commandments assertion).
-- `AuthGap05ForcedRemintTriggered`: unique `code_str`, `from_str` roundtrip, `Severity::High`,
-  non-empty `runbook_path` resolving on disk (covered by existing `error_code.rs` meta-tests +
-  cross-ref guard once the rule-file section lands).
-
-Ratchets (source-scan, `crates/core/src/auth/secret_manager.rs` tests module):
-- `test_mid_session_remint_trigger_call_site_exists`: the PRODUCTION region of
-  `mid_session_watchdog.rs` (split at `#[cfg(test)]` — COV-1: a whole-file scan is vacuous
-  against the fn definition + test literals) contains `force_renewal(` AND `match decide_remint(`.
-- `test_token_health_gauge_poller_wired_into_main`: `crates/app/src/main.rs` contains
-  `spawn_token_health_gauge_poller(`.
-
-Integration (pure-driven, no network): `Ok` resets counter+latch+`profile_valid=true`;
-real-fail increments+`profile_valid=false`; transient leaves all unchanged; existing
-transient/edge watchdog tests stay green after `classify_check_result` delegates to `cycle_outcome`.
-
-## Rollback
-
-Additive + config-free: the re-mint arm is reached only on `decide_remint == Trigger`. No
-QuestDB table, no DEDUP key, no boot-gate, no terraform, no migration is touched, so a straight
-`git revert` of the single PR fully restores the prior state. Short of a revert, the behavior is
-inert outside market hours and below the 2-consecutive threshold; removing the poller spawn line
-in `crates/app/src/main.rs` reverts to the frozen-gauge behavior with zero data-model impact.
-The new gauges auto-register on first emit (no `observability.rs` change) and are locally
-scrapeable only — nothing downstream depends on them yet.
-
-## Observability
-
-- Gauge `tv_token_remaining_seconds` (LIVE, 15s) — makes the existing token-expiry
-  CloudWatch/alerts rules actionable against a killed token (terraform unchanged).
-- Gauge `tv_token_valid` (0/1, AND-composed) — honest killed-token signal; NO false-OK.
-- Counter `tv_token_forced_remint_total{outcome=triggered|ok|failed|refused_lock_lost|cooldown}`.
-- `error!(code = ErrorCode::AuthGap05ForcedRemintTriggered.code_str(), consecutive = ...)` on
-  Trigger; `info!` on success; `error!(code = Resilience01DualInstanceDetected.code_str())` on
-  RefuseLockLost — all counts only, never the JWT.
-- ONE HIGH `NotificationEvent::TokenForcedRemintTriggered` per episode → Telegram (Dhan badge,
-  plain English). Existing CRITICAL `MidSessionProfileInvalidated` edge unchanged.
-- Runbook: `.claude/rules/project/wave-4-error-codes.md` §AUTH-GAP-05.
+**Approved by:** Parthiban (operator directive 2026-07-06 — console shell-hang fix scope grant)
+**Branch:** `claude/festive-bell-hm8w4d`
+**Changed crates:** NONE (zero Rust — deploy/aws/lambda Python + workflows + one terraform comment only)
+**Evidence base:** `scratchpad/repro-evidence.md` (QuestDB 9.3.5 framing repro, 2026-07-06 — §9a/§9c/§10 cited throughout)
 
 ## Plan Items
 
-- [x] Add live single-writer token-health gauge poller (`tv_token_remaining_seconds` LIVE +
-      `tv_token_valid` AND-composed) + pure `token_valid_gauge` fn
-      — impl: `crates/core/src/auth/token_health_gauge.rs::token_valid_gauge` (:81) +
-      `spawn_token_health_gauge_poller`; exported via `crates/core/src/auth/mod.rs`
-  - Files: crates/core/src/auth/token_health_gauge.rs, crates/core/src/auth/mod.rs
-  - Tests: test_token_valid_gauge_truth_table, test_seconds_until_expiry_fail_closed_zero_without_token, test_poll_cadence_constant_is_sane
-- [x] Add O(1) `TokenManager::dual_instance_lock_held(&self) -> Option<bool>` accessor (reuse
-      existing `instance_lock_held` field; do NOT fork mint/renew)
-      — impl: `crates/core/src/auth/token_manager.rs::dual_instance_lock_held`
-  - Files: crates/core/src/auth/token_manager.rs
-  - Tests: test_dual_instance_lock_held_mirrors_constructor_flag
-- [x] Add pure decision fns + counter/latch fields to the mid-session watchdog and wire the
-      forced re-mint via existing `force_renewal()` (lock-before-mint, retry-once, cooldown)
-      — impl: `crates/core/src/auth/mid_session_watchdog.rs::{decide_remint, cycle_outcome,
-      next_consecutive_failures, apply_remint_decision}` + the `force_renewal(` call site
-  - Files: crates/core/src/auth/mid_session_watchdog.rs
-  - Tests: decide_remint_below_threshold_waits, decide_remint_latch_blocks_second_attempt, decide_remint_lock_lost_beats_cooldown, decide_remint_holds_inside_cooldown_when_lock_held, decide_remint_triggers_at_threshold_with_lock_and_cooldown_ok, next_consecutive_failures_ok_resets_to_zero
-- [x] Add ONE HIGH `NotificationEvent::TokenForcedRemintTriggered` (4 match arms: formatter,
-      event_kind, severity High, feed_badge Dhan)
-      — impl: `crates/core/src/notification/events.rs::TokenForcedRemintTriggered` (:566, 4 arms)
-  - Files: crates/core/src/notification/events.rs
-  - Tests: test_token_forced_remint_triggered_event
-- [x] Add `ErrorCode::AuthGap05ForcedRemintTriggered` + rule-file runbook section
-      — impl: `crates/common/src/error_code.rs::AuthGap05ForcedRemintTriggered` (:297,
-      code_str "AUTH-GAP-05") + `.claude/rules/project/wave-4-error-codes.md` §AUTH-GAP-05
-  - Files: crates/common/src/error_code.rs, .claude/rules/project/wave-4-error-codes.md
-  - Tests: existing error_code meta-tests + crossref + tag_guard (tickvault-common suite)
-- [x] Add named constants (poll cadence, consecutive threshold); reuse DHAN_TOKEN_GENERATION_COOLDOWN_SECS
-      — impl: `CONSECUTIVE_INVALID_REMINT_THRESHOLD` (mid_session_watchdog.rs:87) +
-      `TOKEN_HEALTH_GAUGE_POLL_SECS` (token_health_gauge.rs:74); cooldown constant reused from
-      crates/common/src/constants.rs (no change needed there)
-  - Files: crates/core/src/auth/mid_session_watchdog.rs, crates/core/src/auth/token_health_gauge.rs
-  - Tests: remint_threshold_constant_is_sane, test_poll_cadence_constant_is_sane
-- [x] Wire poller + extended watchdog signature into boot; seed tv_token_valid at Step 6
-      — impl: `crates/app/src/main.rs` `spawn_token_health_gauge_poller(` call sites (slow lane +
-      FAST crash-recovery arm) + extended `spawn_mid_session_profile_watchdog` wiring
-  - Files: crates/app/src/main.rs
-  - Tests: (covered by ratchets below)
-- [x] Fixer round 1: lane-own the gauge poller + mid-session watchdog (DhanLaneRunHandles
-      fields, teardown step-0 abort + honest 0/0.0 gauge reset, H8 Drop abort); spawn the
-      gauge poller on the FAST crash-recovery arm; 4-way status-aware `cycle_outcome`
-      (`RestSurfaceDegraded` never escalates to a mint); prefix-anchored transient classifier;
-      de-vacuate the decide_remint ratchet (production-region scan)
-      — impl: `crates/app/src/main.rs::DhanLaneRunHandles::{token_health_gauge_handle,
-      mid_session_watchdog_handle}` + `teardown_dhan_lane_tasks` step-0 abort;
-      `mid_session_watchdog.rs::CycleOutcome::RestSurfaceDegraded`
-  - Files: crates/app/src/main.rs, crates/core/src/auth/mid_session_watchdog.rs,
-    crates/core/src/auth/token_health_gauge.rs, crates/core/src/auth/secret_manager.rs
-  - Tests: cycle_outcome_http_5xx_is_rest_surface_degraded, cycle_outcome_http_400_and_429_are_rest_surface_degraded, cycle_outcome_hostile_401_body_with_transient_needles_is_real_auth_fail, hostile_body_embedding_send_leg_wrapper_is_not_transient, rest_outage_two_cycles_never_reaches_remint_threshold, apply_cycle_outcome_rest_degraded_leaves_state_and_flag_untouched, dhan_lane_run_handles_drop_aborts_handles
-- [x] Source-scan ratchets: re-mint call site exists + poller wired into main
-      — impl: `crates/core/src/auth/secret_manager.rs` tests module (production-region scan)
-  - Files: crates/core/src/auth/secret_manager.rs
-  - Tests: test_mid_session_remint_trigger_call_site_exists, test_token_health_gauge_poller_wired_into_main
-- [x] Re-applied continuation-review fixes (2026-07-08, adjudicated findings — disk-rollback
-      recovery). F4: market-open one-shots (09:14/09:15:30/09:16) once-per-process latched
-      (`MARKET_OPEN_ONE_SHOTS_SPAWNED`) + fire-time dhan-enabled gates
-      (`market_open_fire_gate_dhan_enabled`) + FirstSeenSet midnight-reset latch
-      (`FIRST_SEEN_RESET_SPAWNED`). F5: runtime IP monitor lane-owned (mem::forget removed;
-      guard-wrapped, defused into `DhanLaneRunHandles.ip_monitor_handle/_shutdown`, stopped by
-      teardown/Drop). F12: needle-miss SEND-LEG profile failures classify RestSurfaceDegraded
-      (never walk the mint counter). F13: slow-boot heartbeat watchdog lane-owned
-      (`heartbeat_watchdog_handle`). F14: teardown bounded-joins the pool watchdog then publishes
-      honest lane-off `/health` ws count 0 + feed-health Dhan disconnected (Drop mirrors);
-      teardown budget const updated (4 joins, 42s ≤ 45s). F15: `/health token_valid` honors the
-      profile-truth flag via pure `token_health_writer_valid`. F8: ONE shared comment-aware
-      production-region helper (`tickvault_common::source_scan`) used by all region ratchets
-      (covers inline #[cfg(test)] attrs, doc-comment mentions, AND main.rs's trailing production
-      code after `mod tests`). F9/F17: comment-stripped teardown abort→join→reset ordering
-      ratchet. F10: InstanceLockHeartbeatGuard defuse semantics behaviourally tested. F19:
-      cancel-cleanup comments enumerate the REAL residual detached tasks.
-  - Files: crates/common/src/source_scan.rs, crates/common/src/lib.rs,
-    crates/core/src/auth/mid_session_watchdog.rs, crates/core/src/auth/secret_manager.rs,
-    crates/app/src/main.rs, crates/api/tests/token_headroom_wired_guard.rs,
-    .claude/rules/project/wave-4-error-codes.md
-  - Tests: test_market_open_one_shots_latched_and_gated,
-    test_ip_monitor_and_heartbeat_watchdog_are_lane_owned,
-    cycle_outcome_send_leg_without_transient_needle_is_rest_surface_degraded,
-    send_leg_needle_miss_two_cycles_never_reach_remint_threshold,
-    instance_lock_heartbeat_guard_defuse_and_drop_semantics,
-    test_token_health_writer_valid_honors_profile_truth,
-    test_market_open_fire_gate_reads_dhan_flag,
-    ratchet_teardown_abort_join_reset_ordering_comment_stripped,
-    production_region_keeps_trailing_code_after_mod_tests,
-    strips_line_and_doc_comments_but_keeps_strings
+- [x] FILE 1 — BACK lambda fix: L1 rewrite `GET /` → `GET /index.html` (after `_gate`, before URL build), L2 `_NoFollowRedirect` opener + body-less 3xx relay in the `HTTPError` arm, `location` added to the success-path header tuple, r2 comment block rewritten (the disproven "closes the socket AFTER the body" claim removed), build marker → `b4-qdb-console-2026-07-06-r3`
+  - Files: deploy/aws/lambda/questdb-console-proxy/handler.py
+  - Tests: N/A-for-crates-grep (Python unittest in FILE 3; run via python3 -m unittest test_handler -v)
+- [x] FILE 2 — FRONT lambda: build marker parity → `b4-qdb-console-2026-07-06-r3`; `location` added to the `_relay` forwarded-header tuple so a defense-in-depth relayed 3xx reaches the browser. Device-key auth, `/exec` handling, SQL gates, error mapping (incl. the 504 `upstream_timeout` text) byte-untouched
+  - Files: deploy/aws/lambda/questdb-console-front/handler.py
+  - Tests: N/A-for-crates-grep (Python unittest in FILE 4)
+- [x] FILE 3 — BACK test suite: 8 new tests + 1 updated (test_root_get_is_rewritten_to_index_html; test_root_rewrite_preserves_whitelisted_query; test_head_root_not_rewritten; test_non_root_paths_not_rewritten; test_root_rewrite_kills_the_unframed_301_timeout_class; test_redirect_relayed_bodyless_never_reads_body; test_no_follow_redirect_opener_installed; test_disproven_r2_close_claim_removed; updated test_shell_get_forces_identity_and_connection_close)
+  - Files: deploy/aws/lambda/questdb-console-proxy/test_handler.py
+  - Tests: N/A-for-crates-grep (the 9 Python tests named in this item's description; non-vacuity proven by running tests 1 + 6 against patched-out r2 bytes — they FAIL)
+- [x] FILE 4 — FRONT test suite: 1 new test (test_relay_forwards_location_on_3xx — FAILS on r2 because the front `_relay` header tuple drops `location`). No existing test modified; the 504 `upstream_timeout` mapping test stays as-is
+  - Files: deploy/aws/lambda/questdb-console-front/test_handler.py
+  - Tests: N/A-for-crates-grep (test_relay_forwards_location_on_3xx)
+- [x] FILE 5 — HARD deploy gate in terraform-apply.yml: new step "Deploy gate: console shell GET / must return 200 within 5s" inserted BEFORE "Publish QuestDB console URL to Telegram" (gate first, announce after). 3 attempts each hard-capped at 5s; body must contain the console shell HTML; 503 forgiven ONLY for a verifiably not-running box (terraform `instance_id` output → ec2 describe-instances); unknown state FAILS CLOSED. Secret hygiene: SSM read + ::add-mask:: + header-FILE (umask 077 mktemp), token never in argv
+  - Files: .github/workflows/terraform-apply.yml
+  - Tests: N/A-for-crates-grep (the workflow gate itself IS the test; YAML validated via python3 yaml.safe_load; pre-fix bytes physically cannot pass — GET / needs ~12s while the per-attempt cap is 5s)
+- [x] FILE 6 — box-local canary in deploy-aws.yml: two SSM command-array elements after the QUESTDB-UP loop, before the TRADING APP FIRST block — NON-FATAL loud WARN probing the rewrite TARGET `/index.html` (never bare `/`, which would hang the SSM shell) so a QuestDB image bump that breaks the shell is caught on the deploy that ships it. Non-fatal is mandated by deploy-aws.yml's own TRADING-APP-FIRST charter (a broken observability component must never block the trading deploy)
+  - Files: .github/workflows/deploy-aws.yml
+  - Tests: N/A-for-crates-grep (echoes QDB-SHELL-CANARY-OK or a WARN line in the SSM output the workflow already surfaces; YAML validated)
+- [x] FILE 7 — terraform comment truth + deploy trigger: questdb-console.tf back-lambda `timeout = 26` comment corrected (the back handler `_TIMEOUT_SECS` is 12s, not the stale "25s"). Zero infra diff, but LOAD-BEARING: terraform-apply.yml's push path filter covers only `deploy/aws/terraform/**` + the workflow file, so this touch makes the r3 lambdas deploy on the merge push (archive_file source_code_hash → plan exit 2 → apply) instead of waiting for the scheduled drift-apply
+  - Files: deploy/aws/terraform/questdb-console.tf
+  - Tests: N/A-for-crates-grep (terraform fmt -check stays clean; comment-only)
+
+## Design
+
+**Root cause (Verified — scratchpad/repro-evidence.md):** QuestDB 9.3.5 answers
+`GET /` with an UNFRAMED keep-alive 301 → `/index.html` — raw bytes (§10):
+`b'HTTP/1.1 301 Moved Permanently\r\nServer: questDB/1.0\r\n...Location: /index.html\r\n\r\n\r\n'`
+— NO Content-Length, NO Transfer-Encoding, NO Connection header — and NEVER
+closes the socket even under request `Connection: close` ("recv TIMED OUT after
+20.017s gap — server NEVER closed the socket"). urllib's default
+`HTTPRedirectHandler` drains that unframed body with `fp.read()` BEFORE
+following, so the back lambda's `urlopen` itself blocks until
+`_TIMEOUT_SECS=12` (§9a: TimeoutError at t+12.024s) → `upstream_timeout` →
+front 504. The deployed r2 fix's premise ("QuestDB closes the socket AFTER the
+body") is disproven verbatim. `/index.html` is Content-Length-framed (765 B):
+the byte-identical relay returns 200 in 0.004s (§9c). `/exec` is chunked (§1)
+— untouched and unaffected. GET / had NEVER returned 200 in the console's
+lifetime.
+
+**Two independent layers, each individually sufficient:**
+
+- **L1 (primary):** the back lambda rewrites `GET /` → `GET /index.html` AFTER
+  gating, BEFORE the URL build — the unframed 301 is never elicited. GET-only:
+  `HEAD /` stays on its proven framed-405 path (§8); `HEAD /index.html` is
+  live-unverified, deliberately unchanged. Placement after `_gate` is
+  deliberate: both "/" and "/index.html" are whitelisted static
+  (`_classify_path`), the rewrite target is a constant, and the rewrite can
+  never widen the whitelist. The browser URL stays "/"; the shell's RELATIVE
+  asset refs resolve identically, and `/index.html` itself carries the
+  per-release hashed asset refs so nothing drifts on a QuestDB upgrade.
+- **L2 (belt, class-wide):** a `_NoFollowRedirect` opener
+  (`redirect_request` returns None — CPython's `http_error_30x` then raises
+  `HTTPError` WITHOUT the `fp.read()` drain) + a body-less 3xx relay arm — if
+  ANY whitelisted path (`/chk`, `/settings`, future assets) ever 3xxs unframed
+  in a future QuestDB, it relays instantly (status + Location, body never
+  read) instead of hanging. The front forwards `location` and the browser
+  follows. `install_opener` keeps the call site as plain
+  `urllib.request.urlopen`, so every existing `mock.patch("urllib.request.urlopen")`
+  test passes unchanged.
+
+**Gate-before-announce:** the FILE 5 hard gate runs immediately BEFORE the
+"Publish QuestDB console URL to Telegram" step, so a broken console is never
+announced as live. Each of its 3 attempts is hard-capped at 5s (`--max-time 5`),
+so the pre-fix behavior (504 after ~12s) can physically never pass.
+
+## Edge Cases
+
+- **Query string on `/`** — preserved by the rewrite (`?v=1` →
+  `/index.html?v=1`); pinned by test_root_rewrite_preserves_whitelisted_query.
+- **`HEAD /`** — NOT rewritten (rewrite is GET-gated); QuestDB answers a FRAMED
+  chunked 405 in 1.2ms (§8); pinned by test_head_root_not_rewritten.
+- **3xx on non-`/` paths** (`/chk`, `/settings`, future assets) — relayed
+  body-less in ~ms via L2 instead of a 12s hang; pinned by
+  test_redirect_relayed_bodyless_never_reads_body (a bomb-fp asserts the body
+  is NEVER read).
+- **Box auto-stopped during the smoke gate** — the gate verifies the EC2 state
+  via the terraform `instance_id` output; a 503 with the box verifiably
+  stopped/stopping/pending SKIPS LOUDLY (auto-stop window is the console
+  working correctly); a 503 with the box RUNNING or an UNKNOWN state FAILS
+  CLOSED (audit Rule 11: no false-OK).
+- **Lambda cold start vs the 5s budget** — 3 attempts with 3s sleeps absorb
+  front + VPC-back cold starts; EACH attempt stays capped at 5s so the
+  per-request contract holds.
+- **Future QuestDB renames `/index.html`** — the FILE 5 gate FATALs the deploy
+  that ships it; the FILE 6 box canary WARNs same-day on the box deploy lane.
+
+## Failure Modes
+
+- **Genuinely slow box** — still an honest 504 (`upstream_timeout` mapping
+  UNCHANGED — back handler timeout arms + the front's 504 mapping) — and
+  post-fix that 504 finally MEANS slow, not "unframed 301".
+- **Dead box** — honest 503 (no static shell exists that could fake a 200 on a
+  dead box); the smoke gate independently verifies box state before accepting
+  a 503.
+- **Unframed NON-3xx on a future path** — bounded 12s → honest 504, never a
+  silent hang; read-until-idle was explicitly rejected in the repro design
+  notes (it would turn every load into a deliberate multi-second stall).
+- **Smoke gate cannot read the SSM secret / cannot resolve box state** — fails
+  closed (the `aws ssm get-parameter` failure aborts under `set -euo
+  pipefail`; unknown EC2 state is an explicit FATAL arm).
+- **Console disabled in terraform** — the gate skips loudly ("nothing deployed
+  to gate"), mirroring the publish step's own disabled arm.
+
+## Test Plan
+
+- `cd deploy/aws/lambda/questdb-console-proxy && python3 -m unittest test_handler -v`
+  — all pass incl. the 8 new tests; the `OK` line is pasted in the PR body
+  (charter §4 evidence discipline).
+- `cd deploy/aws/lambda/questdb-console-front && python3 -m unittest test_handler -v`
+  — all pass incl. test_relay_forwards_location_on_3xx.
+- **Non-vacuity:** tests 1 (test_root_get_is_rewritten_to_index_html) and 6
+  (test_redirect_relayed_bodyless_never_reads_body) are re-run against
+  patched-out r2 handler bytes and FAIL there (evidence pasted in the PR
+  body). Test 5 (test_root_rewrite_kills_the_unframed_301_timeout_class)
+  behaviorally reproduces the prod 504 on r2 bytes.
+- **FILE 5 gate red-on-pre-fix / green-post-fix:** pre-fix GET / = 504 after
+  ~12s can never pass `--max-time 5`; post-fix §9c measured 4ms box-side.
+- Workflow YAML: `python3 -c "import yaml; yaml.safe_load(...)"` on both
+  edited workflows. `terraform -chdir=deploy/aws/terraform fmt -check` stays
+  clean (comment-only change).
+
+## Rollback
+
+A single `git revert` of the squash commit restores today's exact state: the
+handler rewrite + opener + comments, both build markers, the tests, both
+workflow steps, the TF comment, and this plan. No terraform resources/state,
+no schema, no secrets change; the next terraform-apply repackages the reverted
+bytes via `source_code_hash`. Honest note: a revert re-opens the incident and
+the FILE 5 gate then goes red on the next apply — that is the desired ratchet;
+a conscious revert must pair with removing (or accepting) the red gate.
+
+## Observability
+
+- The front's existing structured `_log` lines now show `outcome=ok status=200`
+  for path "/" (previously `back_error status=504`).
+- The smoke-gate verdict lands in the Actions log AND `GITHUB_STEP_SUMMARY`
+  (✅ pass / ⚠ loud skip / FATAL with the observed code + body head — the body
+  head is audit-safe: front error JSON / login HTML; the token is masked +
+  header-file, never argv).
+- The box canary echoes `QDB-SHELL-CANARY-OK` / a WARN line in the SSM command
+  output the deploy workflow already surfaces.
+- Build marker `b4-qdb-console-2026-07-06-r3` in BOTH lambdas proves the
+  deployed bytes (existing proof-3 ratchet: test_build_marker_present).
+
+## Per-Item Guarantee Matrix
+
+Cross-reference: `.claude/rules/project/per-wave-guarantee-matrix.md` (the
+15-row + 7-row matrices apply per that rule; rows below state how each lands
+for THIS zero-Rust deploy-layer change, with honest N/A where the dimension is
+Rust-only):
+
+| Dimension | This plan |
+|---|---|
+| 100% code coverage (llvm-cov ratchet) | N/A — Python lambda, no llvm-cov surface; covered by the 9 new/updated unit tests + 2 workflow gates |
+| DHAT / Criterion / hot-path | N/A — cold-path observability lambda, zero Rust, zero hot-path code |
+| Audit table + DEDUP keys | N/A — no SEBI-relevant event, no DB write; forensic record = Actions log + step summary + the front's structured `_log` |
+| 100% logging | front `_log` structured JSON per request (unchanged, now shows ok/200 on "/") |
+| 100% alerting | the FILE 5 deploy gate IS the alert — a red workflow on any shell regression; FILE 6 WARNs on the box lane |
+| 100% security | secret hygiene: `::add-mask::` + header-FILE (umask 077 mktemp) + trap rm; device-key auth byte-untouched; SQL gates byte-untouched |
+| 100% scenarios | the behavior matrix in the PR body (GET /, HEAD /, assets, /exec, box stopped, box slow, future unframed 3xx/non-3xx) — each row evidence-cited |
+| 100% code review | adversarial pass on the diff before the PR opens |
+| Zero ticks lost / WS / QuestDB resilience rows | N/A impact — nothing in the tick path, WS path, or QuestDB write path is touched; the console is a read-only observability surface |
+
+Archive this plan to `.claude/plans/archive/2026-07-06-console-shell-hang-fix.md`
+after push per `plan-enforcement.md`.
