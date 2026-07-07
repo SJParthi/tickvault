@@ -75,10 +75,19 @@ zero app log events reach `/tickvault/prod/app` — app healthy, shipper dead-ta
   15-min alarm window.
 - **First boot:** agent starts before the app creates `machine/` — pre-creating the dir in the
   user-data mkdir removes the agent scan-error window.
-- **Nightly 16:30 IST stop / weekends / NSE holidays:** box off ⇒ metric missing ⇒ alarm state ALARM,
-  but `actions_enabled=false` outside the 09:20–15:35 gate window and the gate's open-time OK reset
-  mean it can never page out of window. Weekday NSE holidays: box runs, and the unconditional
-  once-per-60s seal-writer progress line guarantees ≥1 event/min — no false page.
+- **Nightly 16:30 IST stop / weekends:** box off ⇒ metric missing ⇒ alarm state ALARM, but
+  `actions_enabled=false` outside the 09:20–15:35 gate window and the gate's open-time OK reset
+  mean it can never page out of window.
+- **Weekday NSE holidays (round-1 review fix — the original premise here was FALSE):** the box does
+  NOT run on weekday NSE holidays — `deploy/aws/holiday-gate.sh` self-stops the instance at boot
+  (~08:32 IST) on a definitive holiday verdict, while the gate Lambda's open cron is a holiday-blind
+  plain MON-FRI schedule. A blind 09:20 enable + OK reset would therefore drive both
+  breaching-on-missing gated alarms (`market_hours_liveness_missing` ~09:25,
+  `app_log_ingestion_silent` ~09:35) OK→ALARM against an intentionally-stopped box every weekday
+  holiday. Fix: the gate Lambda's `open` mode now verifies the tv-app instance is up
+  (`ec2:DescribeInstances`, `EC2_INSTANCE_ID` env — the cycle-free start-watchdog pattern) before
+  enabling; not-up ⇒ actions stay disabled, no OK reset. FAIL-OPEN on any EC2 API error so a real
+  trading day never loses the liveness page. Ratchet: `test_gate_lambda_open_is_holiday_safe`.
 - **Mid-day deploy:** fetch-config agent restart (~1-2 min) + app restart/WAL replay are inside the
   15-min window.
 - **Pre-auth boot window:** gauge skip-on-None preserved — never emits 0 (would false-fire
@@ -96,6 +105,14 @@ zero app log events reach `/tickvault/prod/app` — app healthy, shipper dead-ta
 - **Gate Lambda EventBridge state drift (#1404 class):** alarm actions stay disabled silently — same
   blast radius as the 3 existing gated alarms; the deploy smoke check is the independent second
   detector (residual risk accepted, documented).
+- **Operator manual holiday run (`ALLOW_HOLIDAY_RUN` marker):** if the box was stopped at 09:20 the
+  gated alarms stay disabled for that day even after a later manual start — accepted (manual runs
+  are off-schedule by definition; the deploy LOG-INGESTION-SMOKE step still covers deploys).
+- **Boot-heartbeat gate shares the holiday false-page class (pre-existing, DOCUMENTED residual):**
+  `boot-heartbeat-alarm.tf` has its own separate holiday-blind gate Lambda (08:50–09:10 IST window,
+  `tv_boot_completed` breaching-on-missing) — on a weekday NSE holiday it would false-page ~08:55.
+  Out of this PR's scope (separate Lambda, not touched by this diff); follow-up: apply the same
+  instance-up check there.
 - **Mid-window terraform apply:** ALARM_NAMES env change redeploys the gate Lambda; the new alarm's
   actions stay disabled until the next 09:20 open (bounded one-session lag; smoke check covers it).
 - **AWS/Logs vended-metric publish lag (1-5 min observed):** absorbed by period 300 × 3; do not

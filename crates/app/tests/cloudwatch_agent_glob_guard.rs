@@ -23,6 +23,13 @@
 //!     market-hours gate Lambda's ALARM_NAMES join.
 //!  6. The deploy workflow loses the LOG-INGESTION-SMOKE step (or oidc.tf
 //!     loses the `logs:FilterLogEvents` grant it needs).
+//!  7. The market-hours gate Lambda loses its weekday-NSE-holiday safety
+//!     (2026-07-07 round-1 review fix): holiday-gate.sh SELF-STOPS the box
+//!     on weekday NSE holidays while the gate's open cron is holiday-blind
+//!     MON-FRI — a blind 09:20 enable + OK reset would false-page both
+//!     breaching-on-missing gated alarms (~09:25 / ~09:35 IST) every
+//!     weekday holiday. The open path must verify the instance is up
+//!     (ec2:DescribeInstances, fail-open) before enabling.
 
 #![cfg(test)]
 
@@ -300,6 +307,70 @@ fn test_alarm_is_gated_by_market_hours_lambda() {
          gate Lambda's ALARM_NAMES join. With treat_missing_data=breaching and \
          actions permanently disabled (never re-enabled at 09:20 IST), the alarm \
          can NEVER page — it exists but is dead. Join body was:\n{join_body}"
+    );
+}
+
+/// Round-1 review fix (2026-07-07): the gate Lambda's OPEN mode must be
+/// weekday-NSE-holiday safe. `deploy/aws/holiday-gate.sh` self-stops the box
+/// at boot on a definitive holiday verdict, while the gate's open cron is a
+/// holiday-blind plain MON-FRI schedule — so a blind enable + OK reset at
+/// 09:20 IST would drive both breaching-on-missing gated alarms
+/// (`market_hours_liveness_missing` ~09:25, `app_log_ingestion_silent`
+/// ~09:35) into a false SNS/Telegram page on EVERY weekday NSE holiday.
+/// The open path must first verify the tv-app instance is up, and must
+/// fail OPEN on an EC2 API error so a real trading day never loses the page.
+#[test]
+fn test_gate_lambda_open_is_holiday_safe() {
+    let tf = read("deploy/aws/terraform/market-hours-liveness-alarm.tf");
+    let norm = normalized(&tf);
+    for (pin, why) in [
+        (
+            "EC2_INSTANCE_ID = aws_instance.tv_app.id",
+            "the gate Lambda must know WHICH instance to check — the cycle-free \
+             env-var pattern proven by start-watchdog-lambda.tf",
+        ),
+        (
+            "ec2.describe_instances(InstanceIds=[INSTANCE_ID])",
+            "the open path must ask EC2 whether the box is up before enabling \
+             the breaching-on-missing alarms (holiday self-stop = box OFF)",
+        ),
+        (
+            "fail-open, treating as up",
+            "an EC2 API error must NEVER suppress the trading-day liveness page \
+             — the check fails open, exactly mirroring holiday-gate.sh",
+        ),
+        (
+            "leaving actions disabled",
+            "a not-up box (NSE holiday self-stop / operator manual stop) must \
+             skip BOTH the enable and the OK reset",
+        ),
+        (
+            "\"ec2:DescribeInstances\"",
+            "the gate role must carry the DescribeInstances grant or the check \
+             throws AccessDenied every open (and fail-open would blindly enable, \
+             silently restoring the holiday false-page)",
+        ),
+    ] {
+        assert!(
+            norm.contains(pin),
+            "market-hours-liveness-alarm.tf lost the holiday-safety pin `{pin}` — {why}. \
+             Regressing this restores the weekday-NSE-holiday false page \
+             (box self-stopped by holiday-gate.sh + holiday-blind MON-FRI open cron \
+             + treat_missing_data=breaching)."
+        );
+    }
+    // The enable call must come AFTER the instance-up guard in the Lambda
+    // source (source-order scan, house pattern).
+    let guard_pos = tf
+        .find("if not up:")
+        .expect("gate Lambda must carry the `if not up:` holiday guard arm"); // APPROVED: test
+    let enable_pos = tf
+        .find("cw.enable_alarm_actions(AlarmNames=ALARM_NAMES)")
+        .expect("gate Lambda must still enable alarm actions on open"); // APPROVED: test
+    assert!(
+        guard_pos < enable_pos,
+        "the instance-up guard must run BEFORE enable_alarm_actions — enabling \
+         first re-opens the holiday false-page window"
     );
 }
 

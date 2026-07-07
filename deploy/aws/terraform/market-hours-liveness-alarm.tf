@@ -60,6 +60,17 @@
 #   weekend stop can never page. Reuses the boot-heartbeat inline-Lambda pattern,
 #   shifted to the market-hours window.
 #
+#   WEEKDAY NSE HOLIDAYS (2026-07-07 review fix): the open cron is holiday-blind
+#   (plain MON-FRI), but holiday-gate.sh SELF-STOPS the box on a definitive
+#   NSE-holiday verdict at boot (~08:32 IST) — so a blind 09:20 enable + OK
+#   reset would drive every breaching-on-missing member (this alarm +
+#   app-log-ingestion-silent) OK→ALARM against an intentionally-stopped box:
+#   a false page every weekday holiday. The gate Lambda's open mode therefore
+#   verifies the tv-app instance is up (ec2:DescribeInstances) before enabling,
+#   and FAILS OPEN on any EC2 API error so a real trading day never loses the
+#   page. Ratchet: crates/app/tests/cloudwatch_agent_glob_guard.rs
+#   (test_gate_lambda_open_is_holiday_safe).
+#
 # Cost: 1 alarm (score metric already scraped, so 0 NEW custom metrics) + 1 tiny
 # Lambda at 2 invokes/weekday (~44/mo) — well within the Lambda free tier (₹0).
 # Alarm count 23 → 24 (app-alarms.tf output note); overage above the 10 free-tier
@@ -116,17 +127,49 @@ data "archive_file" "tv_market_hours_liveness_gate_zip" {
 import os, boto3
 
 cw = boto3.client('cloudwatch')
+ec2 = boto3.client('ec2')
 
 ALARM_NAMES = [n.strip() for n in os.environ['ALARM_NAMES'].split(',') if n.strip()]
+INSTANCE_ID = os.environ['EC2_INSTANCE_ID']
 
-# mode="open"  (09:20 IST) -> enable alarm actions for the market-hours window.
+# mode="open"  (09:20 IST) -> enable alarm actions for the market-hours window,
+#                             but ONLY if the tv-app box is actually up.
 # mode="close" (15:35 IST) -> disable them again so the intentional off-hours
 #                             state (metric missing on the nightly/weekend
 #                             stop, or legitimately-zero score/seals while the
 #                             box idles outside market hours) never pages.
+#
+# WEEKDAY-NSE-HOLIDAY SAFETY (2026-07-07 review fix): the open cron is a plain
+# MON-FRI schedule with no NSE-holiday awareness, and on weekday NSE holidays
+# the box SELF-STOPS at boot (deploy/aws/holiday-gate.sh, ~08:32 IST). Enabling
+# the breaching-on-missing members of ALARM_NAMES (market-hours-liveness,
+# app-log-ingestion-silent) against an intentionally-stopped box would
+# false-page every weekday holiday (~09:25 / ~09:35 IST). So "open" first asks
+# EC2 whether the instance is up; a not-up box (holiday self-stop or operator
+# manual stop) keeps its actions DISABLED and skips the OK reset.
+# FAIL-OPEN: any DescribeInstances error enables as before — a real trading
+# day must never lose the liveness page (mirror of holiday-gate.sh's
+# fail-open philosophy, pointed the other way).
+def instance_is_up():
+    try:
+        r = ec2.describe_instances(InstanceIds=[INSTANCE_ID])
+        state = r['Reservations'][0]['Instances'][0]['State']['Name']
+        # 'pending' counts as up: a late trading-day start must still arm the
+        # window (the OK reset + 5-15 min evaluation absorb the boot).
+        return state in ('running', 'pending'), state
+    except Exception as e:
+        print(f"describe_instances failed ({e}) -- fail-open, treating as up")
+        return True, 'unknown'
+
 def handler(event, context):
     mode = (event or {}).get('mode', 'close')
     if mode == 'open':
+        up, state = instance_is_up()
+        if not up:
+            print(f"instance {INSTANCE_ID} state={state} -- intentional stop "
+                  f"(NSE holiday self-stop / manual); leaving actions disabled "
+                  f"for {ALARM_NAMES}")
+            return {'mode': mode, 'enabled': False, 'instance_state': state}
         cw.enable_alarm_actions(AlarmNames=ALARM_NAMES)
         # Reset to OK on open so a stale ALARM from a prior window does not
         # immediately re-fire on the first enabled evaluation.
@@ -173,6 +216,18 @@ resource "aws_iam_role_policy" "tv_market_hours_liveness_gate" {
         Resource = "*"
       },
       {
+        # Weekday-NSE-holiday safety (2026-07-07): the open path checks the
+        # tv-app instance state before enabling the breaching-on-missing
+        # alarms (holiday-gate.sh self-stops the box on holidays, so a blind
+        # MON-FRI enable would false-page). DescribeInstances has no
+        # resource-level scoping in IAM (AWS limitation), so "*" is required;
+        # the Lambda only ever reads EC2_INSTANCE_ID. Same pattern as
+        # start-watchdog-lambda.tf.
+        Effect   = "Allow"
+        Action   = ["ec2:DescribeInstances"]
+        Resource = "*"
+      },
+      {
         Effect   = "Allow"
         Action   = ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"]
         Resource = "arn:aws:logs:${var.aws_region}:*:*"
@@ -204,6 +259,12 @@ resource "aws_lambda_function" "tv_market_hours_liveness_gate" {
         aws_cloudwatch_metric_alarm.aggregator_no_seals.alarm_name,
         aws_cloudwatch_metric_alarm.app_log_ingestion_silent.alarm_name,
       ])
+      # Weekday-NSE-holiday safety: the open path skips enabling when this
+      # instance is not up (holiday-gate.sh self-stop). Referencing
+      # aws_instance.tv_app.id from a Lambda env is cycle-free — the proven
+      # pattern from start-watchdog-lambda.tf (the cycle concern in main.tf
+      # applies only to the instance's OWN role policy).
+      EC2_INSTANCE_ID = aws_instance.tv_app.id
     }
   }
 }
