@@ -741,6 +741,50 @@ pub enum NotificationEvent {
         market_open: bool,
     },
 
+    /// A market-data feed went DOWN (operator directive 2026-07-06 — Groww
+    /// feed-down alerting parity with the Dhan main feed). Fired on the
+    /// feed's lifecycle FALLING edge (runtime disable / internal bridge
+    /// death), exactly ONCE per DOWN episode (edge-latched via
+    /// `GrowwAuditLatches::down_announced`, re-armed only when the feed is
+    /// STREAMING again). Never claims upstream tick counts — it only states
+    /// that prices from this feed will not flow until recovery. Severity is
+    /// field-driven: High in-market (pages + SNS), Low off-hours (60s
+    /// coalesced — the 2026-04-22 pre-market-spam precedent class).
+    FeedDown {
+        /// Feed display name (e.g. "Groww").
+        feed: String,
+        /// Fixed plain-English cause (never raw child text / URLs).
+        reason: String,
+        /// Whether the market was open at the falling edge — drives severity
+        /// (High in-market, Low off-hours) and the message register.
+        market_open: bool,
+        /// `true` when the feed was DELIBERATELY switched off (the runtime
+        /// feed toggle) — the body then says it stays OFF until re-enabled
+        /// from the feeds page. `false` for involuntary falling edges
+        /// (bridge death / internal restart) where the auto-retry trailer is
+        /// honest. Without this split the operator-disable page falsely
+        /// claimed "the system keeps retrying automatically" — a disabled
+        /// feed is NEVER retried, so the message actively delayed the one
+        /// action (re-enable) that fixes it (2026-07-06 fix, Telegram
+        /// commandment 7 + audit Rule 11).
+        operator_initiated: bool,
+    },
+
+    /// A previously-DOWN market-data feed is STREAMING again (operator
+    /// directive 2026-07-06). Fired exactly ONCE per DOWN episode, on the
+    /// STREAMING rising edge (a real tick / the feed's own streaming
+    /// status) — never on mere socket-connect, preserving the
+    /// connected ≠ streaming honesty split (`FeedConnectedAwaitingTicks`
+    /// keeps announcing socket-connect separately with "awaiting first
+    /// tick"). Severity::Medium — mirrors `WebSocketReconnected`.
+    FeedRecovered {
+        /// Feed display name (e.g. "Groww").
+        feed: String,
+        /// Total downtime of the episode in seconds (first-down-wins, so it
+        /// spans intermediate retry failures).
+        down_secs: u64,
+    },
+
     /// Instrument build failed — includes manual trigger URL for retry.
     InstrumentBuildFailed {
         /// Error description.
@@ -1329,9 +1373,9 @@ impl NotificationEvent {
             // ── Feed-generic: badge follows the `feed` field ──
             Self::FeedAuthOk { feed }
             | Self::FeedInstrumentsLoaded { feed, .. }
-            | Self::FeedConnectedAwaitingTicks { feed, .. } => {
-                feed_badge_for_name(feed).map(|b| b.badge())
-            }
+            | Self::FeedConnectedAwaitingTicks { feed, .. }
+            | Self::FeedDown { feed, .. }
+            | Self::FeedRecovered { feed, .. } => feed_badge_for_name(feed).map(|b| b.badge()),
             _ => None,
         }
     }
@@ -1853,6 +1897,58 @@ impl NotificationEvent {
                     sub = format_with_commas(*subscribed as usize),
                 )
             }
+            Self::FeedDown {
+                feed,
+                reason,
+                market_open,
+                operator_initiated,
+            } => {
+                // `reason` is a fixed plain-English literal at every emit
+                // site (never raw child text / URLs), but html_escape it
+                // anyway for defense-in-depth, consistent with every String
+                // arm. The trailer BRANCHES on `operator_initiated`
+                // (2026-07-06 fix): a deliberately switched-off feed is
+                // NEVER retried, so the auto-retry reassurance would be a
+                // false signal that delays the one action (re-enable) that
+                // fixes it — the operator-disable form names that action
+                // instead (Telegram commandment 7). The involuntary form
+                // keeps the hostile-review-passed GrowwSidecarRejected
+                // honesty wording: state what will NOT flow + that retry is
+                // automatic.
+                let feed_name = html_escape(feed);
+                let reason = html_escape(reason);
+                match (*market_open, *operator_initiated) {
+                    (true, true) => format!(
+                        "🆘 <b>{feed_name} feed is DOWN</b>\n{reason}\n\n\
+                         Prices from {feed_name} will not flow while it is switched off. \
+                         It stays OFF until you re-enable it from the feeds page."
+                    ),
+                    (true, false) => format!(
+                        "🆘 <b>{feed_name} feed is DOWN</b>\n{reason}\n\n\
+                         Prices from {feed_name} will not flow until it recovers. \
+                         The system keeps retrying automatically — no restart needed."
+                    ),
+                    (false, true) => format!(
+                        "⚠️ <b>{feed_name} feed is down [off-hours]</b>\n{reason}\n\
+                         It stays off until you re-enable it from the feeds page — \
+                         idle is normal until then."
+                    ),
+                    (false, false) => format!(
+                        "⚠️ <b>{feed_name} feed is down [off-hours]</b>\n{reason}\n\
+                         Reconnect is automatic — idle is normal until market open."
+                    ),
+                }
+            }
+            Self::FeedRecovered { feed, down_secs } => {
+                // Honest recovery: fired ONLY on the streaming rising edge
+                // (real ticks), so "prices are flowing" is never a false-OK
+                // claim (connected ≠ streaming split preserved).
+                format!(
+                    "✅ <b>{feed_name} feed streaming again</b> — down {down_secs}s. \
+                     Prices are flowing.",
+                    feed_name = html_escape(feed),
+                )
+            }
             Self::InstrumentBuildFailed {
                 reason,
                 manual_trigger_url,
@@ -2263,6 +2359,8 @@ impl NotificationEvent {
             Self::FeedInstrumentsLoaded { .. } => "FeedInstrumentsLoaded",
             Self::FeedAuthOk { .. } => "FeedAuthOk",
             Self::FeedConnectedAwaitingTicks { .. } => "FeedConnectedAwaitingTicks",
+            Self::FeedDown { .. } => "FeedDown",
+            Self::FeedRecovered { .. } => "FeedRecovered",
             Self::InstrumentBuildFailed { .. } => "InstrumentBuildFailed",
             Self::IpVerificationFailed { .. } => "IpVerificationFailed",
             Self::IpVerificationSuccess { .. } => "IpVerificationSuccess",
@@ -2437,6 +2535,22 @@ impl NotificationEvent {
             // `dispatch_policy()`.
             Self::FeedAuthOk { .. } => Severity::Low,
             Self::FeedConnectedAwaitingTicks { .. } => Severity::Low,
+            // 2026-07-06 Groww feed-down alerting: field-driven severity
+            // (CrossVerify1mSummary precedent) — one variant carries the
+            // in-market/off-hours split the Dhan WebSocketDisconnected /
+            // ...OffHours pair encodes with two variants. High pages
+            // Telegram + SNS mid-session; Low coalesces 60s off-hours
+            // (the 2026-04-22 pre-market TCP-reset spam precedent class).
+            Self::FeedDown { market_open, .. } => {
+                if *market_open {
+                    Severity::High
+                } else {
+                    Severity::Low
+                }
+            }
+            // Mirrors WebSocketReconnected (Medium) — a recovery is
+            // operator-visible but never pages SNS.
+            Self::FeedRecovered { .. } => Severity::Medium,
             Self::BootHealthCheck { .. } => Severity::Low,
             Self::OrphanPositionDetected { .. } => Severity::Critical,
             Self::OrphanPositionsClean => Severity::Info,
@@ -2712,6 +2826,186 @@ mod tests {
             msg.contains("&lt;script&gt;"),
             "expected escaped form: {msg}"
         );
+    }
+
+    #[test]
+    fn test_feed_down_in_market_is_high_severity() {
+        // Regression pin (2026-07-06 Groww feed-down alerting): a mid-session
+        // feed-DOWN must PAGE (High → Telegram + SNS) — the incident class is
+        // "Groww died at 10:31 IST, operator learned hours later".
+        let ev = NotificationEvent::FeedDown {
+            feed: "Groww".to_string(),
+            reason: "feed switched off by the operator".to_string(),
+            market_open: true,
+            operator_initiated: true,
+        };
+        assert_eq!(ev.severity(), Severity::High);
+    }
+
+    #[test]
+    fn test_feed_down_off_hours_is_low_severity() {
+        // Regression pin: off-hours feed-down must be Low (60s coalesced) —
+        // the 2026-04-22 pre-market Telegram-spam precedent class
+        // (WebSocketDisconnectedOffHours). The split is field-driven, not a
+        // second variant.
+        let ev = NotificationEvent::FeedDown {
+            feed: "Groww".to_string(),
+            reason: "feed switched off by the operator".to_string(),
+            market_open: false,
+            operator_initiated: true,
+        };
+        assert_eq!(ev.severity(), Severity::Low);
+    }
+
+    #[test]
+    fn test_feed_recovered_is_medium_severity() {
+        // Mirrors WebSocketReconnected (Medium): recovery is visible
+        // immediately but never pages SNS.
+        let ev = NotificationEvent::FeedRecovered {
+            feed: "Groww".to_string(),
+            down_secs: 154,
+        };
+        assert_eq!(ev.severity(), Severity::Medium);
+    }
+
+    #[test]
+    fn test_feed_down_renders_reason_and_topic_and_severity() {
+        // 10-commandments pin (pattern: GrowwSidecarRejected test above).
+        let ev = NotificationEvent::FeedDown {
+            feed: "Groww".to_string(),
+            reason: "internal restart — recovering automatically".to_string(),
+            market_open: true,
+            operator_initiated: false,
+        };
+        let msg = ev.to_message();
+        assert!(
+            msg.contains("internal restart — recovering automatically"),
+            "reason missing from message: {msg}"
+        );
+        // Status emoji at the start of the body (commandments 5/10) + the
+        // honest no-flow + auto-retry trailer.
+        assert!(msg.contains("🆘"), "severity emoji missing: {msg}");
+        assert!(msg.contains("Groww"), "feed name missing: {msg}");
+        assert!(
+            msg.contains("will not flow until it recovers"),
+            "honest no-flow claim missing: {msg}"
+        );
+        assert!(
+            msg.contains("retrying automatically"),
+            "auto-retry reassurance missing: {msg}"
+        );
+        // No library names / file paths (10 commandments).
+        assert!(!msg.contains(".rs"), "file path leaked: {msg}");
+        assert!(!msg.contains("mpsc"), "lib jargon leaked: {msg}");
+        assert_eq!(ev.topic(), "FeedDown");
+        assert_eq!(ev.severity(), Severity::High);
+        // Off-hours body flips register: soft warning, idle-is-normal.
+        let off = NotificationEvent::FeedDown {
+            feed: "Groww".to_string(),
+            reason: "feed switched off by the operator".to_string(),
+            market_open: false,
+            operator_initiated: true,
+        };
+        let off_msg = off.to_message();
+        assert!(
+            off_msg.contains("off-hours") && off_msg.contains("idle is normal"),
+            "off-hours body must say off-hours + idle is normal: {off_msg}"
+        );
+    }
+
+    #[test]
+    fn test_feed_down_operator_disable_body_names_the_action_not_auto_retry() {
+        // Regression pin (2026-07-06 fix): a DELIBERATE runtime disable is
+        // never retried by the system — the body must name the ONE action
+        // that fixes it (re-enable from the feeds page) and must NOT claim
+        // automatic retry/reconnect (Telegram commandment 7; a false
+        // auto-retry promise actively delays recovery — audit Rule 11).
+        let ev = NotificationEvent::FeedDown {
+            feed: "Groww".to_string(),
+            reason: "feed switched off by the operator".to_string(),
+            market_open: true,
+            operator_initiated: true,
+        };
+        let msg = ev.to_message();
+        assert!(
+            msg.contains("re-enable it from the feeds page"),
+            "operator-disable body must name the re-enable action: {msg}"
+        );
+        assert!(
+            !msg.contains("retrying automatically") && !msg.contains("Reconnect is automatic"),
+            "operator-disable body must NOT claim automatic retry: {msg}"
+        );
+        // Off-hours form of the same deliberate disable: same rule.
+        let off = NotificationEvent::FeedDown {
+            feed: "Groww".to_string(),
+            reason: "feed switched off by the operator".to_string(),
+            market_open: false,
+            operator_initiated: true,
+        };
+        let off_msg = off.to_message();
+        assert!(
+            off_msg.contains("re-enable it from the feeds page"),
+            "off-hours operator-disable body must name the re-enable action: {off_msg}"
+        );
+        assert!(
+            !off_msg.contains("Reconnect is automatic"),
+            "off-hours operator-disable body must NOT claim automatic reconnect: {off_msg}"
+        );
+    }
+
+    #[test]
+    fn test_feed_down_html_escapes_reason() {
+        // Defense-in-depth: reasons are fixed literals at every emit site,
+        // but any angle brackets are escaped at the render boundary
+        // (consistent with every other String arm).
+        let ev = NotificationEvent::FeedDown {
+            feed: "Groww".to_string(),
+            reason: "<script>".to_string(),
+            market_open: true,
+            operator_initiated: false,
+        };
+        let msg = ev.to_message();
+        assert!(!msg.contains("<script>"), "raw HTML not escaped: {msg}");
+        assert!(
+            msg.contains("&lt;script&gt;"),
+            "expected escaped form: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_feed_recovered_renders_down_secs_and_topic() {
+        let ev = NotificationEvent::FeedRecovered {
+            feed: "Groww".to_string(),
+            down_secs: 154,
+        };
+        let msg = ev.to_message();
+        assert!(msg.contains("✅"), "recovery emoji missing: {msg}");
+        assert!(
+            msg.contains("streaming again"),
+            "recovery must claim STREAMING (ticks), not just socket-connect: {msg}"
+        );
+        assert!(msg.contains("154"), "down duration missing: {msg}");
+        assert!(msg.contains("Groww"), "feed name missing: {msg}");
+        assert_eq!(ev.topic(), "FeedRecovered");
+    }
+
+    #[test]
+    fn test_feed_down_and_recovered_resolve_groww_badge() {
+        // Both variants must resolve the 🟢 GROWW badge via the feed-generic
+        // arm — falling to `_ => None` would violate the 2026-07-05
+        // "uniquely seen" per-feed badge directive.
+        let down = NotificationEvent::FeedDown {
+            feed: "Groww".to_string(),
+            reason: "x".to_string(),
+            market_open: true,
+            operator_initiated: false,
+        };
+        let rec = NotificationEvent::FeedRecovered {
+            feed: "Groww".to_string(),
+            down_secs: 1,
+        };
+        assert_eq!(down.feed_badge(), Some("🟢 GROWW"));
+        assert_eq!(rec.feed_badge(), Some("🟢 GROWW"));
     }
 
     #[test]
