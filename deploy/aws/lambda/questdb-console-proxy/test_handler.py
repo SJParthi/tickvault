@@ -217,8 +217,10 @@ class Relay(WithBase):
         # QuestDB 9.3.5 IGNORES request `Connection: close` on the / 301 and
         # never closes the socket. The actual fix is the GET / -> /index.html
         # rewrite (asserted below) + the _NoFollowRedirect body-less 3xx
-        # relay. `Accept-Encoding: identity` still keeps framed paths
-        # Content-Length'd (uncompressed) under the relay cap.
+        # relay. `Accept-Encoding: identity` keeps the OBSERVED static
+        # paths Content-Length'd/uncompressed (§6b) and is retained as
+        # hygiene; /exec stays chunked (§1) regardless — no causal claim
+        # (§6a shows /index.html framed even without the header).
         resp = FakeResp([b"<!doctype html><html></html>"])
         with mock.patch("urllib.request.urlopen", return_value=resp) as up:
             r = handler.lambda_handler(

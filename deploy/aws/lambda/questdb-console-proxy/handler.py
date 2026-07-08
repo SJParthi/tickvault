@@ -317,8 +317,12 @@ def lambda_handler(event, _context):
     # FunctionError -> dishonest front offline-503 — proven by execution, see
     # the guard's comment and
     # test_unframed_non_3xx_body_timeout_maps_to_upstream_timeout).
-    # `Accept-Encoding: identity` still guarantees Content-Length-framed
-    # uncompressed bodies on framed paths, under the MAX_BODY_BYTES cap.
+    # `Accept-Encoding: identity` keeps the OBSERVED static paths
+    # Content-Length'd/uncompressed (repro-evidence.md §6b) and is retained
+    # as hygiene; /exec stays chunked (§1) regardless. No causal claim —
+    # §6a shows /index.html framed even WITHOUT the header, and no probe
+    # tested a static path with `Accept-Encoding: gzip`. Body size is
+    # bounded by the MAX_BODY_BYTES cap either way.
     req.add_header("Accept-Encoding", "identity")
     req.add_header("Connection", "close")
 
