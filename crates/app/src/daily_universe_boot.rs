@@ -219,12 +219,26 @@ where
     };
 
     // §36 (2026-07-08): the IST trading date drives the nearest-expiry
-    // FUTIDX selection inside the universe build. Derived from the SAME
-    // `today_ist_nanos` (IST midnight as UTC-interpreted nanos) the
-    // lifecycle reconcile uses, so selection + persistence agree on the date.
-    let today_ist = chrono::DateTime::from_timestamp_nanos(today_ist_nanos).date_naive();
+    // FUTIDX selection inside the universe build. Hostile-review round 2
+    // (2026-07-08, F5): re-derived from the LIVE wall clock PER BUILD
+    // ATTEMPT — a boot stuck in the §4 infinite-retry loop across IST
+    // midnight (retry backoff caps at 300s, reachable on a long outage)
+    // must select FUTIDX with the NEW date, never the frozen boot-entry
+    // date (on the T-0→T+1 expiry crossing the frozen date kept the
+    // just-expired contract for the whole next session). The lifecycle
+    // reconcile keeps stamping the boot-entry `today_ist_nanos` (its
+    // pre-existing per-boot property); the frozen date is retained ONLY as
+    // the fallback if the IST offset constant were ever invalid.
+    let fallback_today_ist = chrono::DateTime::from_timestamp_nanos(today_ist_nanos).date_naive();
+    let today_ist_fn = move || match chrono::FixedOffset::east_opt(
+        tickvault_common::constants::IST_UTC_OFFSET_SECONDS,
+    ) {
+        Some(offset) => chrono::Utc::now().with_timezone(&offset).date_naive(),
+        None => fallback_today_ist,
+    };
     let (outcome, universe) =
-        run_daily_universe_fetch_runner(wrapped, max_attempts, ntm_map.as_ref(), today_ist).await;
+        run_daily_universe_fetch_runner(wrapped, max_attempts, ntm_map.as_ref(), today_ist_fn)
+            .await;
 
     let Some(universe) = universe else {
         anyhow::bail!(

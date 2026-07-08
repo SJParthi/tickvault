@@ -330,8 +330,22 @@ pub fn build_groww_lifecycle_rows<'a>(
                 },
                 symbol_name,
                 display_name: symbol_name,
+                // Hostile-review round 2 (2026-07-08): no NUMERIC underlying
+                // id exists in the Groww id space for an index future (the
+                // underlying index token may be a NAME, and Dhan's
+                // derivatives-domain underlying SIDs do not apply here) —
+                // 0 is the honest value; the queryable identity is the
+                // canonical `underlying_symbol` below.
                 underlying_security_id: 0,
-                underlying_symbol: "",
+                // §36 FUTIDX rows carry the EXACT-match canonical threaded
+                // from `GrowwIndexFuture.canonical` via
+                // `WatchEntry.underlying_symbol` (SEBI forensic completeness
+                // — mirror of the Dhan-side lifecycle FUTIDX rows).
+                underlying_symbol: if is_fno_future {
+                    e.underlying_symbol.as_deref().unwrap_or("")
+                } else {
+                    ""
+                },
                 lot_size: 0,
                 tick_size: 0.0,
                 expiry_date_nanos: if is_fno_future {
@@ -1342,6 +1356,7 @@ mod tests {
                     symbol_name: Some("NSE-NIFTY-30Jul26-FUT".to_owned()),
                     index_name: None,
                     expiry_date: Some("2026-07-30".to_owned()),
+                    underlying_symbol: Some("NIFTY".to_owned()),
                 },
                 WatchEntry {
                     exchange: "NSE".to_owned(),
@@ -1353,6 +1368,7 @@ mod tests {
                     symbol_name: Some("RELIANCE".to_owned()),
                     index_name: None,
                     expiry_date: None,
+                    underlying_symbol: None,
                 },
             ],
             resolved_stocks: 1,
@@ -1365,9 +1381,17 @@ mod tests {
         assert_eq!(fut.instrument_type, "FUTIDX");
         assert_eq!(fut.exchange_segment, "NSE_FNO");
         assert!(fut.expiry_date_nanos > 0, "expiry stamped");
+        // Hostile-review round 2 (2026-07-08): the FUTIDX master row must
+        // carry the queryable canonical underlying (SEBI forensic
+        // completeness — mirror of the Dhan-side lifecycle FUTIDX rows).
+        assert_eq!(fut.underlying_symbol, "NIFTY");
+        // No numeric underlying id exists in the Groww id space — 0 is the
+        // honest documented value.
+        assert_eq!(fut.underlying_security_id, 0);
         let stock = rows.iter().find(|r| r.security_id == 2885).expect("eq");
         assert_eq!(stock.instrument_type, "EQUITY");
         assert_eq!(stock.expiry_date_nanos, 0);
+        assert_eq!(stock.underlying_symbol, "", "non-future rows unchanged");
     }
     use crate::feed::groww::instruments::{GrowwWatchSet, WatchEntry, WatchKind};
 
@@ -1384,6 +1408,7 @@ mod tests {
             symbol_name: Some(symbol.to_string()),
             index_name: None,
             expiry_date: None,
+            underlying_symbol: None,
         }
     }
 
@@ -1398,6 +1423,7 @@ mod tests {
             symbol_name: None,
             index_name: Some(format!("{exchange}-{name}")),
             expiry_date: None,
+            underlying_symbol: None,
         }
     }
 
@@ -1412,6 +1438,7 @@ mod tests {
             symbol_name: Some("X".to_string()),
             index_name: None,
             expiry_date: None,
+            underlying_symbol: None,
         }
     }
 

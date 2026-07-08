@@ -239,14 +239,29 @@ pub fn select_index_future_contracts(
             .filter(|(d, _)| *d == chosen_expiry)
             .map(|(_, r)| *r)
             .collect();
-        if at_chosen.len() > 1 {
+        // Hostile-review round 2 (2026-07-08): collapse vendor-glitch
+        // EXACT-duplicate CSV lines (SAME `SECURITY_ID` at the chosen expiry)
+        // first-row-wins — the index_extractor.rs precedent — BEFORE the
+        // ambiguity count. There is nothing to guess when both rows carry the
+        // SAME id; only TRULY-DISTINCT SecurityIds at the same expiry stay
+        // fail-closed as `AmbiguousDuplicateExpiry`. Same-segment set by
+        // construction (all rows already filtered to `entry.dhan_segment`),
+        // so the id-only key is I-P1-11-safe here. O(n²) over the tiny
+        // same-expiry candidate set; cold path, once per boot.
+        let mut distinct: Vec<&CsvRow> = Vec::with_capacity(at_chosen.len());
+        for r in &at_chosen {
+            if !distinct.iter().any(|d| d.security_id == r.security_id) {
+                distinct.push(r);
+            }
+        }
+        if distinct.len() > 1 {
             selection.misses.push(IndexFutureMiss {
                 canonical: entry.canonical,
                 reason: IndexFutureMissReason::AmbiguousDuplicateExpiry,
             });
             continue;
         }
-        selection.chosen.push(at_chosen[0].clone());
+        selection.chosen.push(distinct[0].clone());
     }
     debug_assert!(selection.chosen.len() <= MAX_INDEX_FUTURE_TARGETS);
     selection
@@ -361,6 +376,67 @@ fn record_selection_in(
     }
     let verdict = compare_index_future_selections(dhan, groww);
     RecordOutcome::Verdict(verdict)
+}
+
+/// §36 hostile-review round 2 (2026-07-08, F4): derive the Dhan-side
+/// [`FeedFutureSelection`] list from a BUILT universe's `IndexFuture`
+/// targets. Pure + testable; shared by the cold orchestrator (Step 3d) and
+/// the §29 warm-snapshot boot path so BOTH boot paths produce the identical
+/// parity entry + boot-evidence lines (previously the warm path emitted
+/// neither until the background reconcile ran — and never, if it failed).
+pub fn dhan_selections_from_universe(
+    universe: &crate::instrument::daily_universe::DailyUniverse,
+) -> Vec<FeedFutureSelection> {
+    use crate::instrument::daily_universe::InstrumentRole;
+    let mut out = Vec::with_capacity(MAX_INDEX_FUTURE_TARGETS);
+    for target in &universe.subscription_targets {
+        if target.role != InstrumentRole::IndexFuture {
+            continue;
+        }
+        let row = &target.csv_row;
+        let Ok(expiry) = NaiveDate::parse_from_str(row.expiry_date.trim(), "%Y-%m-%d") else {
+            continue;
+        };
+        let canonical_owned = canonicalize_index_symbol(&row.underlying_symbol);
+        if let Some(entry) = INDEX_FUTURES_UNDERLYINGS
+            .iter()
+            .find(|u| u.canonical == canonical_owned)
+        {
+            out.push(FeedFutureSelection {
+                canonical: entry.canonical,
+                expiry,
+                native_id: row.security_id.clone(),
+                segment: row.segment.clone(),
+            });
+        }
+    }
+    out
+}
+
+/// Emits the per-contract machine-readable boot-evidence `info!` lines and
+/// records the Dhan parity entry from a built universe (cold + warm boot
+/// paths — see [`dhan_selections_from_universe`]).
+// Thin recording wrapper — the global-recorder side effect is deliberately
+// NOT asserted from tests (see the recorder-test honesty note above
+// `record_selection_in`); the pure derivation + the recorder core are tested.
+// TEST-EXEMPT: thin wrapper over dhan_selections_from_universe (tested) + record_index_future_selection (tested)
+pub fn record_dhan_selection_from_universe(
+    universe: &crate::instrument::daily_universe::DailyUniverse,
+    trading_date_ist: NaiveDate,
+) {
+    let sels = dhan_selections_from_universe(universe);
+    for sel in &sels {
+        // The boot evidence line (machine-readable) — one per chosen contract.
+        info!(
+            feed = "dhan",
+            underlying = sel.canonical,
+            expiry = %sel.expiry,
+            native_id = %sel.native_id,
+            segment = %sel.segment,
+            "index-futures selection"
+        );
+    }
+    record_index_future_selection("dhan", trading_date_ist, sels);
 }
 
 /// Record one feed's index-future selection for one IST trading date (cold
@@ -599,6 +675,40 @@ mod tests {
                 reason: IndexFutureMissReason::AmbiguousDuplicateExpiry,
             }]
         );
+    }
+
+    /// Hostile-review round 2 (2026-07-08, F4): the warm/cold-shared
+    /// derivation is empty on a futures-less universe and skips targets
+    /// whose expiry is unparsable — never panics, never invents a selection.
+    #[test]
+    fn test_dhan_selections_from_universe_empty_without_future_targets() {
+        use crate::instrument::daily_universe::DailyUniverse;
+        let universe = DailyUniverse {
+            subscription_targets: vec![],
+            fno_contracts: vec![],
+        };
+        assert!(dhan_selections_from_universe(&universe).is_empty());
+    }
+
+    /// Hostile-review round 2 (2026-07-08): a vendor-glitch EXACT-duplicate
+    /// CSV line (SAME SECURITY_ID at the chosen expiry) collapses
+    /// first-row-wins and the mandated future is KEPT — only truly-distinct
+    /// SIDs at the same expiry stay fail-closed (previous test above).
+    #[test]
+    fn test_select_dedups_exact_duplicate_security_id_before_ambiguity() {
+        let mut rows = four_rows("2026-07-30");
+        // Exact-duplicate NIFTY line: SAME SID, SAME expiry (vendor glitch).
+        rows.push(futidx_row("NIFTY", "NSE_FNO", "35001", "2026-07-30"));
+        let sel = select_index_future_contracts(&rows, d("2026-07-08"));
+        assert_eq!(sel.misses, vec![], "duplicate SID is not ambiguity");
+        assert_eq!(sel.chosen.len(), 4, "NIFTY kept via first-row-wins");
+        let nifty: Vec<&CsvRow> = sel
+            .chosen
+            .iter()
+            .filter(|r| r.underlying_symbol == "NIFTY")
+            .collect();
+        assert_eq!(nifty.len(), 1);
+        assert_eq!(nifty[0].security_id, "35001");
     }
 
     #[test]
