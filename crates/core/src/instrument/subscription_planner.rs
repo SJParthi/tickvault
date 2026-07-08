@@ -774,17 +774,6 @@ pub fn build_subscription_plan(
     SubscriptionPlan { registry, summary }
 }
 
-/// Builds a subscription plan from a daily-universe (~250 SIDs) per the
-/// 2026-05-27 `DailyUniverse` scope. Every SID subscribes in **Quote mode**
-/// (§8 — the 50-byte packet carries day OHLC at fixed offsets). Only IDX_I
-/// indices and NSE_EQ F&O-underlying spots are subscribed — NO derivative
-/// contracts. Dedup is the composite `(security_id, exchange_segment)` key
-/// (I-P1-11). Cold path — called once at boot.
-///
-/// The instrument segment is derived from the target ROLE, which is
-/// authoritative per rule §2 (indices → IDX_I; F&O underlyings resolve to
-/// their NSE_EQ spot row). Rows whose `security_id` is not a valid `u64`
-/// are skipped + counted — never panics on malformed CSV-derived data.
 /// §36 (2026-07-08): map an IndexFuture target's CSV segment string to the
 /// WebSocket `ExchangeSegment`. FUTIDX segment CANNOT be derived from the
 /// role alone (SENSEX = BSE_FNO, the NSE three = NSE_FNO), so it comes from
@@ -799,6 +788,19 @@ fn futidx_segment_from_csv(csv_segment: &str) -> Option<ExchangeSegment> {
     }
 }
 
+/// Builds a subscription plan from a daily-universe (~250 SIDs) per the
+/// 2026-05-27 `DailyUniverse` scope. Every SID subscribes in **Quote mode**
+/// (§8 — the 50-byte packet carries day OHLC at fixed offsets). IDX_I
+/// indices, NSE_EQ F&O-underlying/NTM spots, and (§36, 2026-07-08) the ≤4
+/// nearest-expiry FUTIDX contracts are subscribed — never any other
+/// derivative. Dedup is the composite `(security_id, exchange_segment)` key
+/// (I-P1-11). Cold path — called once at boot.
+///
+/// The instrument segment is derived from the target ROLE, which is
+/// authoritative per rule §2 (indices → IDX_I; F&O underlyings resolve to
+/// their NSE_EQ spot row; IndexFuture → [`futidx_segment_from_csv`]). Rows
+/// whose `security_id` is not a valid `u64` are skipped + counted — never
+/// panics on malformed CSV-derived data.
 #[cfg(feature = "daily_universe_fetcher")]
 pub fn build_subscription_plan_from_daily_universe(universe: &DailyUniverse) -> SubscriptionPlan {
     // §8: the daily universe subscribes every SID in Quote mode.
