@@ -76,7 +76,7 @@
 //!   silent censoring of live lag (Rule 11).
 //!
 //! Every exclusion increments `tv_dhan_lag_samples_excluded_total`
-//! (CloudWatch-exported — it is in the 23-name EMF allowlist, ~$0.30/mo —
+//! (CloudWatch-exported — it is in the 26-name EMF allowlist, ~$0.30/mo —
 //! visible, never silent).
 //!
 //! # Publish gating (audit Rules 3 + 11)
@@ -324,7 +324,7 @@ pub fn record_dhan_tick(received_at_utc_nanos: i64, capture_seq_nanos: i64, exch
     match global_ring().observe(received_at_utc_nanos, capture_seq_nanos, exchange_ts_secs) {
         LagRecordOutcome::ExcludedReplay => {
             // Rule 11: exclusions are VISIBLE, never silent censoring. The
-            // counter is CloudWatch-exported (23-name EMF allowlist in
+            // counter is CloudWatch-exported (26-name EMF allowlist in
             // cloudwatch-agent.json + user-data.sh.tftpl, ~$0.30/mo).
             metrics::counter!("tv_dhan_lag_samples_excluded_total").increment(1);
         }
@@ -682,6 +682,41 @@ mod tests {
         let mut scratch = Vec::with_capacity(RING_SLOTS);
         ring.snapshot_window_into(T0_UTC_NANOS, &mut scratch);
         assert_eq!(scratch.as_slice(), &[3 * NANOS_PER_SEC as u64]);
+    }
+
+    #[test]
+    fn test_record_dhan_tick_producer_sites_wired_into_tick_processor() {
+        // Round-3 fix (2026-07-08, review finding 2): the lag pipeline has
+        // TWO wiring halves — the PUBLISHER (main.rs, pinned by the
+        // secret_manager.rs 2-call-site ratchet) and the PRODUCER (the two
+        // `record_dhan_tick` calls at the Dhan Ticker/Quote + Full persist
+        // sites in tick_processor.rs). The producer half had NO pin: a
+        // future tick_processor refactor dropping either call keeps every
+        // existing guard green (the gauge! emit lives in this module;
+        // pub-fn-wiring is satisfied by the dhat/bench call sites) while the
+        // ring starves below MIN_LAG_SAMPLES, the publisher publishes
+        // NOTHING, and the lag alarm reads notBreaching forever — the exact
+        // silent dark-gauge class of the 2026-07-06 incident. Exactly 2
+        // non-comment producer call sites, one per Dhan persist path.
+        let tick_processor = include_str!("tick_processor.rs");
+        let producer_call_sites = tick_processor
+            .lines()
+            .filter(|l| {
+                let t = l.trim_start();
+                !t.starts_with("//")
+                    && !t.starts_with("///")
+                    && t.contains("feed_lag_monitor::record_dhan_tick(")
+            })
+            .count();
+        assert_eq!(
+            producer_call_sites, 2,
+            "tick_processor.rs must call `feed_lag_monitor::record_dhan_tick(` at \
+             EXACTLY 2 non-comment sites (the Ticker/Quote persist arm + the \
+             Full-packet persist arm); found {producer_call_sites}. Dropping a \
+             producer site silently starves the lag ring below MIN_LAG_SAMPLES — \
+             the publisher then publishes nothing and the lag alarm reads \
+             notBreaching on missing data (the 2026-07-06 dark-gauge class)."
+        );
     }
 
     #[test]

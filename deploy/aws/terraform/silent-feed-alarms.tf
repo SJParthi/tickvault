@@ -5,7 +5,9 @@
 # independent signals and ZERO pages:
 #   1. exchange->receive lag p99 46s / max 199s (no metric existed for it)
 #   2. 29-67 of 776 instruments silent EVERY minute (old tick-gap alarm
-#      threshold 100 never crossed — retuned to 25 in app-alarms.tf #5)
+#      threshold 100 never crossed — retuned to 40 PROVISIONAL in
+#      app-alarms.tf #5; sits above the documented ~33 always-silent
+#      healthy floor, round-3 correction 2026-07-08)
 #   3. 125 SLO score crossings in the 0.94-0.97 band (in-app SLO-02 is
 #      Telegram-suppressed/log-only since 2026-05-11; the CW
 #      realtime-guarantee alarm only fires < 0.80 — a dead band this file's
@@ -61,11 +63,14 @@
 # latches whenever >= 60% of sampled minutes breach, while a 2-3 min
 # single-reconnect dip (<= 3 breaching points) still cannot reach 9. A
 # strict 15/15 remains rejected (would likely never latch on an oscillating
-# signal). Honest coverage split: minutes in the 26-38-silent sub-band are
-# paged INDEPENDENTLY by the retuned tick-gap alarm (threshold 25, 10-of-12,
-# app-alarms.tf) — this alarm's UNIQUE coverage is >= 39-silent freshness
-# degradation plus every OTHER-dimension partial degradation (WS pool
-# fraction, QuestDB, token, spill, Phase 2) inside the 0.80-0.95 dead band.
+# signal). Honest coverage split (round-3 correction 2026-07-08, review
+# finding 4): the 26-38-silent sub-band is NOT count-detectable — it
+# overlaps the documented ~33 always-silent healthy floor (main.rs D2 note,
+# 2026-07-03), which is also why the tick-gap alarm was re-raised from 25
+# to 40 PROVISIONAL; the lag-p99 alarm owns that marginal band — this
+# alarm's UNIQUE coverage is >= 39-silent freshness degradation plus every
+# OTHER-dimension partial degradation (WS pool fraction, QuestDB, token,
+# spill, Phase 2) inside the 0.80-0.95 dead band.
 # M=9 is threshold-adjacent and PROVISIONAL: observe one trading week and
 # ratchet with a dated note if healthy-day windows approach 9 breaching
 # minutes.
@@ -207,7 +212,7 @@ resource "aws_cloudwatch_metric_alarm" "dhan_exchange_lag_p99_high" {
 }
 
 output "silent_feed_cloudwatch_alarms" {
-  description = "3 silent-feed degradation alarms (2026-07-06 incident hardening): SLO 0.80-0.95 dead-band (9-of-15 min, PROVISIONAL), per-feed BOUNDARY-01 catch-up storm (dhan, PROVISIONAL 2000/5m x2), Dhan exchange->receive lag p99 > 10s x10min. All market-hours-gated via the window-gate Lambda; the retuned tick-gap alarm (threshold 100 -> 25, 10-of-12) stays in app-alarms.tf."
+  description = "3 silent-feed degradation alarms (2026-07-06 incident hardening): SLO 0.80-0.95 dead-band (9-of-15 min, PROVISIONAL), per-feed BOUNDARY-01 catch-up storm (dhan, PROVISIONAL 2000/5m x2), Dhan exchange->receive lag p99 > 10s x10min. All market-hours-gated via the window-gate Lambda; the retuned tick-gap alarm (threshold 100 -> 40 PROVISIONAL, 10-of-12) stays in app-alarms.tf."
   value = [
     aws_cloudwatch_metric_alarm.realtime_guarantee_degraded.alarm_name,
     aws_cloudwatch_metric_alarm.boundary_catchup_storm_dhan.alarm_name,

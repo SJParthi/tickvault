@@ -14,7 +14,9 @@ The 2026-07-06 incident (Dhan feed degraded ALL day — lag p99 46s/max 199s,
 29-67 of 776 instruments silent every minute, 125 SLO crossings in the
 0.94-0.95 band, 9k-11.5k BOUNDARY-01 catch-up seals/10min — with ZERO pages)
 added, per `deploy/aws/terraform/silent-feed-alarms.tf` +
-`deploy/aws/terraform/app-alarms.tf` (tick-gap retune 100 → 25):
+`deploy/aws/terraform/app-alarms.tf` (tick-gap retune 100 → 40 PROVISIONAL —
+round-3 correction 2026-07-08: 25 sat below the documented ~33 always-silent
+healthy floor and would have paged every healthy day):
 
 - **+4 custom-metric series ≈ $1.20/mo:** 2× `tv_boundary_catchup_total`
   under `[host, feed]` (dhan + groww, second EMF declaration), 1×

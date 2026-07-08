@@ -54,7 +54,7 @@
 //!     dwell ≥60 s AND pre-live-boundary capture — live rows delayed >60 s
 //!     in-pipeline by a consumer stall are KEPT; round-2 fix 2026-07-07)
 //!     (visible, never silent censoring — Rule 11). **CloudWatch-exported**:
-//!     it is in the 23-name host-only EMF allowlist of
+//!     it is in the 26-name host-only EMF allowlist of
 //!     `deploy/aws/cloudwatch-agent.json` + `user-data.sh.tftpl`
 //!     (~$0.30/mo, billed in silent-feed-alarms.tf / aws-budget.md) and is
 //!     pinned there by the EMF name-count ratchet.
