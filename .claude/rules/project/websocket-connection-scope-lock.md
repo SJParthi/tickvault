@@ -8,6 +8,17 @@
 >
 > **⚠ 2026-07-04 OPERATOR UPDATE — FEED TOGGLE BEARER-GATED IN ALL MODES:** the mutating `POST /api/feeds/{feed}` now requires **bearer auth REGARDLESS of trading mode** — the 2026-06-23 (PR-E lineage, AskUserQuestion "tokenless toggle in dev") carve-out that made the toggle PUBLIC when `feed_toggle_public = true` (dry-run/sandbox) is **RETIRED**. Operator verbatim 2026-07-04: *"whicghever is recommended go ahea dudde okay?"* — given in direct response to the recommendation to bearer-gate the publicly-funnelled tokenless feed toggle (the 3001 Tailscale funnel made the tokenless dry-run toggle a feed-disable DoS surface on the public internet; adversarial re-review 2026-07-04, HIGH). Effect: `crates/api/src/lib.rs::build_router_with_auth` places `POST /api/feeds/{feed}` in the bearer-protected router **UNCONDITIONALLY**; the `feed_toggle_public` parameter is accepted-but-ignored (kept only to avoid an 11-call-site signature cascade — it changes NOTHING). Localhost dry-run toggling now uses the SAME token as live mode: fetch it via `aws ssm get-parameter --name /tickvault/<env>/api/bearer-token --with-decryption --query Parameter.Value --output text` and paste it into the `/feeds` page token field (the page already sends `Authorization: Bearer <token>` from sessionStorage — no UI change needed), or curl with the 0600 header-file pattern consistent with `scripts/tv-tunnel/doctor.sh`: `HDR="$(umask 077 && mktemp)"; printf 'Authorization: Bearer %s\n' "$TOK" >"$HDR"; curl -H @"$HDR" -X POST http://localhost:3001/api/feeds/groww -H 'content-type: application/json' -d '{"enabled":true}'; rm -f "$HDR"` (header FILE, never argv — no `ps`/cmdline leak). The read-only `GET /api/feeds` + `GET /api/feeds/health` stay PUBLIC (2026-06-23 "public read, authed toggle" — the READ half of that ruling is unchanged); the Dhan-disable safety gate (`can_disable_dhan`) is unchanged. Ratchets: `crates/api/src/lib.rs` tests `test_feeds_post_requires_auth_401_without_token_in_both_modes` + `test_feeds_post_with_valid_token_not_401_in_both_modes`.
 >
+> **⚠ FUTIDX-4 EXTENSION 2026-07-08 by
+> [`daily-universe-scope-expansion-2026-05-27.md`](./daily-universe-scope-expansion-2026-05-27.md) §36:**
+> the single main-feed conn additionally subscribes 4 index-futures contracts
+> (NIFTY/BANKNIFTY/MIDCPNIFTY = NSE_FNO, SENSEX = BSE_FNO; nearest expiry only; NEVER rolls;
+> Quote mode). The 2-WebSocket lock is UNCHANGED. The "Index F&O full-chain" ban below still
+> holds — this is 4 single contracts, never a chain. `should_subscribe_index_derivatives`
+> remains `false` FOREVER (the FUTIDX path is the DailyUniverse `IndexFuture` role, not that
+> legacy gate). OPTIDX/FUTSTK/OPTSTK remain forbidden. Operator verbatim 2026-07-08: *"for both
+> dhan and groww we need to add futures and those also should be subscribed along with this,
+> especially only for nifty banknifty and sensex nifty midcap."*
+>
 > **Authority:** CLAUDE.md > `operator-charter-forever.md` §I > this file > defaults.
 > **Scope:** PERMANENT. Every Phase. Every PR. Every future Claude/Cowork session.
 > **Operator-locked:** 2026-05-15 (verbatim quote below).
@@ -55,9 +66,9 @@ And the immediate follow-up:
 | Any 2nd/3rd/4th/5th main-feed conn | 4 SIDs fit comfortably on 1 conn (Dhan cap = 5,000/conn); more conns waste token+IP budget. `effective_main_feed_pool_size` returns constant 1. |
 | Any new WebSocket endpoint Dhan introduces in future | Not in scope without operator explicit re-approval |
 | NSE_EQ / BSE_EQ subscriptions (including F&O underlying cash equities) | AWS-lifecycle PR #7 dropped the 218 NSE_EQ universe; `SubscriptionScope::Indices4Only` has no path to emit them. |
-| BSE F&O / commodity / currency feeds | Same |
-| Stock F&O derivative subscriptions on the main-feed conn | Phase 2 dispatcher chain deleted in PR #5 (#708). Planner returns `false` from `should_subscribe_stock_derivatives` unconditionally. |
-| Index F&O full-chain derivative subscriptions | Same — planner returns `false` from `should_subscribe_index_derivatives` unconditionally. |
+| BSE F&O / commodity / currency feeds (except the 2026-07-08 §36 FUTIDX-4 grant — the single BSE_FNO SENSEX nearest-expiry FUTURE on the existing main-feed conn; commodity/currency stay banned — see banner) | Same |
+| Stock F&O derivative subscriptions on the main-feed conn — NO carve-out: §36 grants INDEX futures only; FUTSTK/OPTSTK stay master-only forever | Phase 2 dispatcher chain deleted in PR #5 (#708). Planner returns `false` from `should_subscribe_stock_derivatives` unconditionally. |
+| Index F&O full-chain derivative subscriptions (except the 2026-07-08 §36 FUTIDX-4 grant — 4 single nearest-expiry contracts, never a chain — see banner) | Same — planner returns `false` from `should_subscribe_index_derivatives` unconditionally. |
 | Display-only indices beyond INDIA VIX (sectoral, INDIA VOL, etc.) | `is_display_index_allowed_under_scope` returns `true` only for SID 21 (INDIA VIX). |
 
 ---
@@ -88,6 +99,7 @@ The 2026-05-13 disconnect storm (09:16-09:29 IST) showed that 500ms first-reconn
 | Source-scan ratchet `crates/core/tests/indices4only_scope_lock_guard.rs` (3 tests) | Blocks reappearance of retired `SubscriptionScope` variants OR retired `subscribe_*` flags anywhere in `crates/` |
 | Test: `test_subscription_scope_has_exactly_one_variant` (`config.rs`) | Match expression in the test must remain exhaustive over the single variant — adding a variant fails the build |
 | Test: `test_effective_main_feed_pool_size_is_always_one_under_indices4only` | Pool size is constant 1, no exceptions |
+| `daily_universe_scope_guard.rs::futidx_scope_*` (4 tests, §36 2026-07-08) | FUTIDX grant pinned to exactly 4 underlyings + nearest expiry + never-roll + legacy gate still `false` |
 | Test: `test_first_reconnect_attempt_is_zero_ms_instant` (order_update_connection.rs) | Order-update first retry is 0ms |
 | Depth / Phase 2 / movers / greeks modules: deleted in PRs #2-#6b | No code path exists to spawn them; module-level deletion is the strongest guard |
 
@@ -99,8 +111,8 @@ The 2026-05-13 disconnect storm (09:16-09:29 IST) showed that 500ms first-reconn
 - Re-introduces any of the 3 deleted `subscribe_*` config flags (`subscribe_index_derivatives`, `subscribe_stock_derivatives`, `subscribe_display_indices`).
 - Adds a `spawn_twenty_depth_connection` or `spawn_two_hundred_depth_connection` call site (the modules are deleted; re-creating them would require restoring whole subtrees).
 - Adds a new WebSocket type / endpoint without operator explicit re-approval recorded in this file or charter §I.
-- Subscribes to derivative contracts on the main-feed conn (stock F&O, index F&O full chain).
-- Subscribes to NSE_EQ / BSE_EQ / NSE_FNO / BSE_FNO / NSE_CURRENCY / MCX_COMM SIDs.
+- Subscribes to derivative contracts on the main-feed conn (stock F&O, index F&O full chain) — except the 2026-07-08 §36 FUTIDX-4 grant (see banner).
+- Subscribes to NSE_EQ / BSE_EQ / NSE_FNO / BSE_FNO / NSE_CURRENCY / MCX_COMM SIDs — except the 2026-07-08 §36 FUTIDX-4 grant (4 nearest-expiry FUTIDX: NSE_FNO ×3 + BSE_FNO SENSEX; see banner).
 - Changes `effective_main_feed_pool_size(_, _)` to return anything other than `PHASE_0_MAIN_FEED_CONNECTION_COUNT = 1`.
 
 **Any such PR MUST be rejected in review even if operator explicitly approves verbally** — the operator must update this rule file FIRST, with a dated quote, and only then can the PR land. This prevents accidental scope creep through casual approvals.

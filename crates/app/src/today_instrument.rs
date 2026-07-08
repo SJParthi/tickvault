@@ -100,6 +100,17 @@ fn csv_row_to_today_instrument(row: &CsvRow) -> TodayInstrument {
 /// then F&O contracts.
 #[must_use]
 pub fn extract_today_instruments(universe: &DailyUniverse) -> Vec<TodayInstrument> {
+    // §36 (2026-07-08) dedup: a FUTIDX row promoted into
+    // `subscription_targets` (Pass 5) ALSO stays in `fno_contracts` (master
+    // path untouched). Dedup on the composite (security_id, segment) key
+    // (I-P1-11), preferring the subscription-target row, so the lifecycle
+    // audit diff stays single-emit (the QuestDB UPSERT was already
+    // idempotent on the DEDUP key — this keeps the in-process set clean).
+    let target_keys: std::collections::HashSet<(&str, &str)> = universe
+        .subscription_targets
+        .iter()
+        .map(|t| (t.csv_row.security_id.as_str(), t.csv_row.segment.as_str()))
+        .collect();
     universe
         .subscription_targets
         .iter()
@@ -108,6 +119,9 @@ pub fn extract_today_instruments(universe: &DailyUniverse) -> Vec<TodayInstrumen
             universe
                 .fno_contracts
                 .iter()
+                .filter(|row| {
+                    !target_keys.contains(&(row.security_id.as_str(), row.segment.as_str()))
+                })
                 .map(csv_row_to_today_instrument),
         )
         .collect()
@@ -304,5 +318,38 @@ mod tests {
             1,
             "envelope counts subscription only"
         );
+    }
+
+    #[test]
+    fn test_extract_today_instruments_dedups_futidx_between_targets_and_contracts() {
+        // §36: a FUTIDX row present as BOTH a subscription target (Pass 5)
+        // and an fno_contracts master row yields ONE lifecycle entry.
+        let fut_row = CsvRow {
+            security_id: "35001".to_string(),
+            exch_id: "NSE".to_string(),
+            segment: "NSE_FNO".to_string(),
+            instrument: "FUTIDX".to_string(),
+            symbol_name: "NIFTY-Jul2026-FUT".to_string(),
+            underlying_security_id: "26000".to_string(),
+            underlying_symbol: "NIFTY".to_string(),
+            expiry_date: "2026-07-30".to_string(),
+            ..CsvRow::default()
+        };
+        let universe = DailyUniverse {
+            subscription_targets: vec![SubscriptionTarget {
+                role: InstrumentRole::IndexFuture,
+                is_fno_underlying: false,
+                is_index_constituent: false,
+                csv_row: fut_row.clone(),
+            }],
+            fno_contracts: vec![fut_row.clone(), detailed_row()],
+        };
+        let out = extract_today_instruments(&universe);
+        assert_eq!(out.len(), 2, "duplicate FUTIDX folded once; OPTSTK kept");
+        let fut_count = out
+            .iter()
+            .filter(|t| t.security_id == 35001 && t.exchange_segment == "NSE_FNO")
+            .count();
+        assert_eq!(fut_count, 1, "single lifecycle entry for the future");
     }
 }

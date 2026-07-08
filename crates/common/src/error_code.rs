@@ -836,6 +836,22 @@ pub enum ErrorCode {
     /// only — the production capture chain is untouched. Severity::Medium,
     /// auto-triage-safe.
     GrowwNative04WriterFailed,
+    /// FUTIDX-01 (§36 2026-07-08) — the nearest-expiry index-future selection
+    /// degraded for ≥1 of the 4 authorized underlyings on one feed (no FUT
+    /// rows / all expiries past / ambiguous duplicate expiry / unparsable
+    /// expiry). That feed runs WITHOUT that future for the day — degrade,
+    /// never HALT; the spot universe is unaffected. Severity::High,
+    /// auto-triage-safe (the degrade already happened; operator inspects the
+    /// day's master CSV + the alias-drift evidence payload at leisure).
+    Futidx01SelectionDegraded,
+    /// FUTIDX-02 (§36 2026-07-08) — the boot-time cross-feed comparator found
+    /// the Dhan and Groww builds chose DIFFERENT expiry dates (or one-sided
+    /// presence) for an index-future underlying. Both feeds STAY LIVE
+    /// (visibility, never a halt); cross-feed rows for that underlying are
+    /// not comparable that day. One vendor's master is stale/divergent —
+    /// operator compares the two masters' FUT rows and records a dated note.
+    /// Severity::High.
+    Futidx02CrossFeedExpiryMismatch,
 }
 
 impl ErrorCode {
@@ -1011,6 +1027,8 @@ impl ErrorCode {
             Self::GrowwNative02AuthFailed => "GROWW-NATIVE-02",
             Self::GrowwNative03DecodeFailed => "GROWW-NATIVE-03",
             Self::GrowwNative04WriterFailed => "GROWW-NATIVE-04",
+            Self::Futidx01SelectionDegraded => "FUTIDX-01",
+            Self::Futidx02CrossFeedExpiryMismatch => "FUTIDX-02",
         }
     }
 
@@ -1152,6 +1170,12 @@ impl ErrorCode {
             // server-side cap).
             | Self::GrowwScale01RollbackFired
             | Self::GrowwScale02GlobalHalve => Severity::High,
+            // FUTIDX-01/02 (§36 2026-07-08) — per-underlying selection degrade
+            // / cross-feed expiry divergence. Loud (Telegram High), never a
+            // halt; the spot universe + both live feeds are unaffected.
+            Self::Futidx01SelectionDegraded | Self::Futidx02CrossFeedExpiryMismatch => {
+                Severity::High
+            }
             // Medium: data pipeline correctness
             // PR #6b (2026-05-19): I-P0-01/02/04/05 retired with their modules.
             Self::InstrumentP1CrossSegmentCollision
@@ -1429,6 +1453,9 @@ impl ErrorCode {
             | Self::GrowwNative04WriterFailed => {
                 ".claude/rules/project/groww-native-rust-error-codes.md"
             }
+            Self::Futidx01SelectionDegraded | Self::Futidx02CrossFeedExpiryMismatch => {
+                ".claude/rules/project/futidx-4-error-codes.md"
+            }
         }
     }
 
@@ -1437,8 +1464,19 @@ impl ErrorCode {
     /// daemon will log a summary and stop.
     ///
     /// Conservative default: Critical errors are NEVER auto-actioned.
+    ///
+    /// Severity-independent overrides (design contracts pinning MANUAL
+    /// triage on a non-Critical code):
+    /// - `FUTIDX-02` (hostile-review round 3, 2026-07-08): a cross-feed
+    ///   data-comparability verdict must never be auto-actioned — the
+    ///   operator judges WHICH vendor master is stale (design contract
+    ///   `is_auto_triage_safe() == false`; previously drifted to the
+    ///   blanket severity derivation and papered over in runbook prose).
     #[must_use]
     pub const fn is_auto_triage_safe(self) -> bool {
+        if matches!(self, Self::Futidx02CrossFeedExpiryMismatch) {
+            return false;
+        }
         !matches!(self.severity(), Severity::Critical)
     }
 
@@ -1606,6 +1644,8 @@ impl ErrorCode {
             Self::GrowwNative02AuthFailed,
             Self::GrowwNative03DecodeFailed,
             Self::GrowwNative04WriterFailed,
+            Self::Futidx01SelectionDegraded,
+            Self::Futidx02CrossFeedExpiryMismatch,
         ]
     }
 }
@@ -1926,7 +1966,10 @@ mod tests {
         // AUTH-GAP-05 (sustained mid-session token-invalid — forced re-mint
         // triggered via the existing renewal machinery; lock-before-mint +
         // ~125s cooldown + retry-once latch honored).
-        assert_eq!(ErrorCode::all().len(), 132);
+        // 2026-07-08 (§36 FUTIDX-4): bumped 132 -> 134 for FUTIDX-01
+        // (per-underlying nearest-expiry selection degraded, per feed) +
+        // FUTIDX-02 (cross-feed expiry mismatch) — both Severity::High.
+        assert_eq!(ErrorCode::all().len(), 134);
     }
 
     #[test]
@@ -1970,6 +2013,33 @@ mod tests {
             "GROWW-SCALE-05 runbook missing on disk: {shown}"
         );
         assert!(ErrorCode::all().contains(&code));
+    }
+
+    #[test]
+    fn test_futidx_codes_contract() {
+        // §36 FUTIDX-4 (hostile-review round 3, 2026-07-08).
+        let f1 = ErrorCode::Futidx01SelectionDegraded;
+        assert_eq!(f1.code_str(), "FUTIDX-01");
+        assert_eq!("FUTIDX-01".parse::<ErrorCode>(), Ok(f1));
+        assert_eq!(f1.severity(), Severity::High);
+        // Per-feed degrade self-heals next boot — auto-triage may inspect.
+        assert!(f1.is_auto_triage_safe());
+
+        let f2 = ErrorCode::Futidx02CrossFeedExpiryMismatch;
+        assert_eq!(f2.code_str(), "FUTIDX-02");
+        assert_eq!("FUTIDX-02".parse::<ErrorCode>(), Ok(f2));
+        assert_eq!(f2.severity(), Severity::High);
+        // Design contract (futidx-4-error-codes.md §2 + the R3-4 record in
+        // .claude/plans/active-plan-futidx-4.md — the in-repo authority;
+        // round 4 replaced a dangling scratchpad "FINAL.md" citation that
+        // never landed in the tree): a cross-feed comparability
+        // verdict is NEVER auto-actioned despite being non-Critical — the
+        // severity-independent override arm, not the blanket derivation.
+        assert!(!f2.is_auto_triage_safe());
+        assert_eq!(
+            f2.runbook_path(),
+            ".claude/rules/project/futidx-4-error-codes.md"
+        );
     }
 
     #[test]
@@ -2107,7 +2177,9 @@ mod tests {
                 // Wave-4-E1 / BP-07 (2026-07-01): OOM-kill monitor.
                 || s.starts_with("PROC-")
                 // C2 (2026-07-03): panic-free reqwest client construction.
-                || s.starts_with("HTTP-CLIENT-");
+                || s.starts_with("HTTP-CLIENT-")
+                // §36 (2026-07-08): FUTIDX-4 nearest-expiry index futures.
+                || s.starts_with("FUTIDX-");
             assert!(has_known_prefix, "unexpected code prefix: {s}");
         }
     }
