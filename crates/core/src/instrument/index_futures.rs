@@ -701,7 +701,7 @@ mod tests {
     }
 
     #[test]
-    fn test_cross_feed_parity_ok_on_identical_pairs() {
+    fn test_compare_index_future_selections_ok_on_identical_pairs() {
         let dhan = vec![
             feed_sel("NIFTY", "2026-07-30", "35001"),
             feed_sel("BANKNIFTY", "2026-07-30", "35002"),
@@ -738,7 +738,7 @@ mod tests {
     }
 
     #[test]
-    fn test_record_selection_verdict_fires_only_when_both_feeds_present() {
+    fn test_record_index_future_selection_fires_verdict_only_when_both_feeds() {
         // Exercises the recorder core + the pub wrapper
         // (record_index_future_selection) end-to-end on the global store.
         let local = Mutex::new(HashMap::new());
