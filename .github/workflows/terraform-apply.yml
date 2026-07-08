@@ -403,9 +403,22 @@ jobs:
         # any other outcome, with ONE honest exception: 000 while the EC2
         # box is VERIFIABLY not running (auto-stop window) is the console
         # working correctly — that case SKIPS LOUDLY. Fixer round 11
-        # (2026-07-08): the not-running skip is 000-ONLY — a fast 503/504
-        # with the box not running at both samples is unambiguously a
-        # console-LAMBDA-layer fault (see the arm below) and FAILS. (Each
+        # (2026-07-08), NARROWED fixer round 12 (2026-07-08): the
+        # not-running skip is 000-ONLY, and a fast 503/504 there FAILS as a
+        # console-LAMBDA-layer fault only where that diagnosis is SOUND — a
+        # fast 504 (any not-running state: a 504 inside the 5s cap cannot
+        # be the back lambda's 12s upstream_timeout), or a fast 503 with
+        # BOTH samples stopped/pending (no live kernel behind the ENI, so
+        # no RST is possible). Round 11 over-reached on two inputs the arm
+        # also covered: EC2 'stopping' (the guest OS stays alive mid-
+        # shutdown — docker stops QuestDB first and the still-alive kernel
+        # RSTs :9000 -> back box_unreachable -> the front's fast 503 inside
+        # the cap: the routine 16:30 IST auto-stop window) now SKIPS
+        # LOUDLY with the same honest ambiguity as the mid-grace-stop arm;
+        # and STATE_PRE=unknown (pre-sample describe-instances failure —
+        # the box may have been RUNNING during the probes) still FAILS
+        # CLOSED but with an honest AMBIGUOUS message, never a 'both
+        # samples'/'unambiguous' claim its precondition cannot back. (Each
         # of 000/503/504 on a RUNNING box gets ONE 90s grace re-probe
         # before FATAL — box OS boot / QuestDB start/restart windows; see
         # the running arm below — but a pass there still requires a genuine
@@ -423,7 +436,11 @@ jobs:
         # blocks its full 12s socket timeout (proxy handler.py
         # _TIMEOUT_SECS=12 -> upstream_timeout -> front 504 at ~12s) while
         # this gate's curl is capped at 5s. A fast 503 needs a connection
-        # REFUSAL = box RUNNING with QuestDB down. Any of 000/504/503 with
+        # REFUSAL = a LIVE KERNEL with QuestDB down: box RUNNING, or the
+        # still-alive OS of a 'stopping' box mid-shutdown (round-12
+        # correction — 'stopping' is not-running to EC2 but its guest OS
+        # keeps RSTing :9000 for tens of seconds after docker stops the
+        # QuestDB container). Any of 000/504/503 with
         # the box RUNNING, or an unknown box state, still FAILS (audit
         # Rule 11: no false-OK). 3 attempts absorb front+VPC-back cold start;
         # EACH attempt is hard-capped at 5s, so the pre-fix behavior (504
@@ -513,9 +530,14 @@ jobs:
           # retry) would hard-fail AFTER a successful terraform apply. The
           # outer case still routes all three codes to the state dispatch:
           # not-running + 000 -> loud skip; not-running + fast 503/504 ->
-          # FATAL (round 11 — by the physics above that code can only come
-          # from the console LAMBDA layer, which is probeable regardless of
-          # box state); any code with the box RUNNING FAILs CLOSED only
+          # FATAL where the lambda-layer physics is sound (round 11,
+          # NARROWED round 12: fast 504 always; fast 503 only with BOTH
+          # samples stopped/pending — a 'stopping' box's still-alive
+          # shutdown kernel CAN mint a fast 503 by RSTing :9000, so that
+          # case skips loudly; a fast code with STATE_PRE=unknown fails
+          # closed with an honest AMBIGUOUS message, the 'both samples'
+          # premise being unverified); any code with the box RUNNING FAILs
+          # CLOSED only
           # after the ONE 90s grace re-probe in the running arm below; an
           # unverifiable state FAILs CLOSED immediately.
           case "$CODE" in
@@ -540,38 +562,72 @@ jobs:
                     echo "FATAL: console GET / -> '${CODE}' and the box transitioned running->${STATE} ACROSS the probe window (pre-probe sample: running) — the failed probes were made while the box WAS running, so this may be a genuine shell regression caught just before the 16:30 IST auto-stop. Failing closed (audit Rule 11: no false-OK); the box is no longer probeable — verify on the next in-window apply."
                     exit 1
                   fi
-                  # Fixer round 11 (2026-07-08): the not-running skip is
-                  # 000-ONLY. By this gate's own physics (the round-1
-                  # comment above and the skip message itself), the ONLY
-                  # code a genuinely not-running box can produce through
-                  # the 5s-capped curl is 000 — the stopped/booting ENI
-                  # blackholes SYNs, the back lambda blocks its full 12s
-                  # _TIMEOUT_SECS, and the front's 504 lands at ~12s, past
-                  # the cap. A FAST 503/504 observed with the box
-                  # not-running at BOTH samples is therefore unambiguously
-                  # a console-LAMBDA-layer fault — the front maps
+                  # Fixer round 11 (2026-07-08), NARROWED fixer round 12
+                  # (2026-07-08): the not-running skip is 000-ONLY, but
+                  # round 11's "any fast 503/504 here is unambiguously a
+                  # console-LAMBDA-layer fault" over-reached on two inputs
+                  # this arm covers:
+                  #   (1) EC2 'stopping': the guest OS stays alive for tens
+                  #       of seconds mid-shutdown — docker stops the QuestDB
+                  #       container first, and the still-alive kernel RSTs
+                  #       the back lambda's connect to :9000 (back
+                  #       handler.py ConnectionRefusedError ->
+                  #       box_unreachable -> the front's FAST 503) well
+                  #       inside the 5s curl cap. That is the routine 16:30
+                  #       IST auto-stop window (the 10:50 UTC slot can land
+                  #       this arm at ~16:27-16:31 IST per the round-6
+                  #       grace-arm comment) or any operator manual stop —
+                  #       the same shutdown physics the mid-grace-stop skip
+                  #       below already treats as genuinely ambiguous. A
+                  #       fast 503 with a 'stopping' sample therefore SKIPS
+                  #       LOUDLY (round 11 false-FATALed it with a
+                  #       factually wrong ENI-drops-SYNs claim; executed
+                  #       proof: codes '503 503 503' + states 'stopping
+                  #       stopping' through the extracted gate script hit
+                  #       the round-11 FATAL).
+                  #   (2) STATE_PRE=unknown: the pre-probe
+                  #       describe-instances call failed, so "not running
+                  #       at BOTH samples" is UNVERIFIED — the box may have
+                  #       been RUNNING during the probes (a running box
+                  #       with QuestDB down is connection-REFUSED -> the
+                  #       same fast 503) and auto-stopped before the post-
+                  #       sample. Still FAILS CLOSED (a lambda-layer fault
+                  #       is a live candidate and the box is no longer
+                  #       probeable), but with an honest AMBIGUOUS message
+                  #       — round 11 printed 'at both samples (pre-probe
+                  #       sample: unknown)', self-contradictory on its
+                  #       face, and asserted an unambiguous diagnosis its
+                  #       precondition could not back.
+                  # The lambda-layer FATAL remains where its physics IS
+                  # sound: a fast 504 with any not-running state (a 504
+                  # inside the 5s cap cannot be the back lambda's 12s
+                  # upstream_timeout on ANY box state), and a fast 503 with
+                  # BOTH samples stopped/pending (no live kernel behind the
+                  # ENI — SYNs blackhole, no RST possible; the front maps
                   # back_not_configured / back_invoke_failed /
-                  # back_function_error to a fast 503, i.e. exactly the
-                  # regression classes a terraform apply itself ships
-                  # (BACK_FN_ARN/env wiring, lambda permission, a
-                  # back-lambda crash-on-init) — and the lambda layer is
-                  # fully probeable regardless of box state. The old arm
-                  # converted that code into the exit-0 skip whose own
-                  # message asserts the code is impossible, laundering
-                  # lambda-layer regressions on every off-window apply
-                  # (the gate's DOMINANT regime: night push merges apply
-                  # with the box stopped). HONEST COST (disclosed): a
-                  # transient lambda-invoke throttle producing a fast 503
-                  # now red-fails an off-hours apply — strictly narrower
-                  # than the false-OK it replaces. Distinct from the
-                  # MID-GRACE 503 skip below, which remains accepted: there
-                  # the box WAS running pre-grace, making the 503 genuinely
-                  # ambiguous and un-probeable post-stop. Pinned by
-                  # gate-matrix-r7.sh scenarios P (stopped+503 -> FATAL) +
-                  # Q (stopped+504 -> FATAL) alongside E (stopped+000 ->
-                  # skip).
+                  # back_function_error to exactly this fast 503, the
+                  # regression classes a terraform apply itself ships).
+                  # HONEST COST (disclosed, round 11): a transient
+                  # lambda-invoke throttle producing a fast 503 with the
+                  # box stopped at both samples still red-fails an
+                  # off-hours apply — strictly narrower than the false-OK
+                  # it replaced. Distinct from the MID-GRACE 503 skip
+                  # below, which remains accepted: there the box WAS
+                  # running pre-grace. Pinned by gate-matrix-r7.sh
+                  # scenarios P (stopped+503 -> FATAL) + Q (stopped+504 ->
+                  # FATAL) + R (stopping+503 -> loud skip) + S
+                  # (unknown-pre+503 -> ambiguous FATAL) + T (stopping+504
+                  # -> still FATAL) alongside E (stopped+000 -> skip).
                   if [ "$CODE" != "000" ]; then
-                    echo "FATAL: console GET / -> fast '${CODE}' with the box ${STATE} at both samples (pre-probe sample: ${STATE_PRE}) — a not-running box cannot produce a fast ${CODE} through the 5s-capped curl (its ENI drops SYNs, the back lambda blocks its full 12s timeout, and the 504 lands past the cap = curl 000), so this is a console-lambda-layer fault (front/back wiring, lambda permission, or a back-lambda crash — the front maps back_not_configured/back_invoke_failed/back_function_error to the same fast 503), fully probeable regardless of box state. Failing closed (audit Rule 11: no false-OK)."
+                    if [ "$CODE" = "503" ] && { [ "$STATE" = "stopping" ] || [ "$STATE_PRE" = "stopping" ]; }; then
+                      echo "⚠ SKIP (loud): console GET / -> fast '503' with a 'stopping' box sample (pre-probe: ${STATE_PRE}, post-probe: ${STATE}) — during EC2 'stopping' the guest OS is still alive mid-shutdown: docker stops the QuestDB container first and the live kernel REFUSES :9000 (RST) -> back box_unreachable -> the front's fast 503 inside the 5s cap, so this 503 is consistent with the benign stop transition OR a back-lambda fault (indistinguishable once the box is down — the same ambiguity as the mid-grace-stop skip); shell smoke re-runs on the next in-window apply" | tee -a "$GITHUB_STEP_SUMMARY"
+                      exit 0
+                    fi
+                    if [ "$STATE_PRE" = "unknown" ]; then
+                      echo "FATAL (ambiguous): console GET / -> fast '${CODE}' with pre-probe box state UNKNOWN (describe-instances failed; 'not running at both samples' is UNVERIFIED) and post-probe state '${STATE}' — the box may have been RUNNING during the probes, so this is EITHER a console-lambda-layer fault OR (for a fast 503) a then-running box with QuestDB down (connection refusal -> back box_unreachable -> the front's same fast 503) that stopped before the post-sample — unresolvable now that the box is not running. Failing closed (audit Rule 11: no false-OK); verify on the next in-window apply."
+                      exit 1
+                    fi
+                    echo "FATAL: console GET / -> fast '${CODE}' with the box not running at both samples (pre-probe: ${STATE_PRE}, post-probe: ${STATE}) — a stopped/pending box cannot produce a fast 503 through the 5s-capped curl (no live kernel behind the ENI: SYNs blackhole with no RST, the back lambda blocks its full 12s timeout, and the 504 lands past the cap = curl 000), and a fast 504 inside the 5s cap cannot be the back lambda's 12s upstream_timeout on ANY box state — so this is a console-lambda-layer fault (front/back wiring, lambda permission, or a back-lambda crash — the front maps back_not_configured/back_invoke_failed/back_function_error to the same fast 503), fully probeable regardless of box state. Failing closed (audit Rule 11: no false-OK)."
                     exit 1
                   fi
                   # Fixer round 8 (2026-07-07): name the window honestly.

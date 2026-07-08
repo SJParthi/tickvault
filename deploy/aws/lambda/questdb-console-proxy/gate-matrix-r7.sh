@@ -49,6 +49,17 @@
 # both samples is a console-lambda-layer fault -> FATAL (previously exit-0
 # skip; scenario E remains the stopped+000 skip pin).
 #
+# Round-12 changes (2026-07-08): the round-11 fast-503/504 FATAL was
+# NARROWED — its physics is sound only for a fast 504 (any not-running
+# state) or a fast 503 with BOTH samples stopped/pending; during EC2
+# 'stopping' the still-alive shutdown kernel RSTs :9000 and mints a REAL
+# fast 503 (the 16:30 IST auto-stop window — round 11 false-FATALed it),
+# and with STATE_PRE=unknown the 'both samples' premise is unverified.
+# New scenarios: R (stopping+503 -> loud ambiguous skip), S
+# (unknown-pre+503 -> fail-closed with the honest AMBIGUOUS message, never
+# the 'both samples'/'unambiguous' claim), T (stopping+504 -> still FATAL,
+# pinning the narrowing boundary).
+#
 # Run from anywhere:  bash deploy/aws/lambda/questdb-console-proxy/gate-matrix-r7.sh
 # Stubs terraform/aws/curl/sleep on PATH and drives (curl-code sequence,
 # ec2-state sequence) scenarios end-to-end through the REAL gate script.
@@ -224,6 +235,22 @@ run_case O_pre_unknown_stopped_000_skip "000 000 000" "unknown stopped" "" 0 "pr
 #    old arm laundered into an exit-0 skip on every off-window apply).
 run_case P_stopped_503_lambda_layer_fatal "503 503 503" "stopped stopped" "" 1 "console-lambda-layer fault"
 run_case Q_stopped_504_lambda_layer_fatal "504 504 504" "stopped stopped" "" 1 "console-lambda-layer fault"
+# R. fast 503 with a 'stopping' sample at both probes -> LOUD SKIP (round 12:
+#    during EC2 'stopping' the guest OS is still alive mid-shutdown — docker
+#    stops QuestDB first and the live kernel RSTs :9000 -> back
+#    box_unreachable -> the front's fast 503 inside the 5s cap; the round-11
+#    FATAL over-reached here with a factually wrong ENI-drops-SYNs claim)
+run_case R_stopping_503_rst_window_skip "503 503 503" "stopping stopping" "" 0 "consistent with the benign stop transition OR a back-lambda fault"
+# S. STATE_PRE=unknown + post-sample stopped + fast 503 -> FATAL with the
+#    honest AMBIGUOUS message (round 12: the pre sample failed, so 'not
+#    running at both samples' is unverified — the box may have been running
+#    during the probes; never the round-11 'at both samples'/'unambiguous
+#    lambda-layer' claim). Scenario O pins unknown-pre only for CODE=000.
+run_case S_pre_unknown_503_ambiguous_fatal "503 503 503" "unknown stopped" "" 1 "EITHER a console-lambda-layer fault OR (for a fast 503) a then-running box"
+# T. fast 504 with a 'stopping' sample -> still FATAL (a 504 inside the 5s
+#    cap cannot be the back lambda's 12s upstream_timeout on ANY box state —
+#    the round-12 narrowing exempts only the 503 branch)
+run_case T_stopping_504_still_fatal "504 504 504" "stopping stopping" "" 1 "console-lambda-layer fault"
 
 echo "---"
 if [ "$FAILS" -ne 0 ]; then
