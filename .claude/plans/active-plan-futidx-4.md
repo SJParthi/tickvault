@@ -1,6 +1,6 @@
 # Implementation Plan: FUTIDX-4 nearest-expiry subscription (Dhan Quote + Groww watch set)
 
-**Status:** APPROVED
+**Status:** VERIFIED
 **Date:** 2026-07-08
 **Approved by:** Parthiban (operator) — dated verbatim quote in daily-universe-scope-expansion §36 (2026-07-08): "for both dhan and groww we need to add futures and those also should be subscribed along with this, especially only for nifty banknifty and sensex nifty midcap."
 
