@@ -322,6 +322,10 @@ resource "aws_lambda_function" "tv_market_hours_liveness_gate" {
         aws_cloudwatch_metric_alarm.aggregator_no_seals.alarm_name,
         aws_cloudwatch_metric_alarm.order_update_reconnect_storm.alarm_name, # 2026-07-06 flapper alarm
         aws_cloudwatch_metric_alarm.app_log_ingestion_silent.alarm_name,
+        aws_cloudwatch_metric_alarm.tick_gap_instruments_silent.alarm_name,
+        aws_cloudwatch_metric_alarm.realtime_guarantee_degraded.alarm_name,
+        aws_cloudwatch_metric_alarm.boundary_catchup_storm_dhan.alarm_name,
+        aws_cloudwatch_metric_alarm.dhan_exchange_lag_p99_high.alarm_name,
       ])
       # Weekday-NSE-holiday safety: the open path skips enabling when this
       # instance is not up (holiday-gate.sh self-stop). Referencing
