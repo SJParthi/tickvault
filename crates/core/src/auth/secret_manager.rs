@@ -1362,6 +1362,82 @@ mod tests {
         );
     }
 
+    /// Silent-feed hardening Item 4 (2026-07-06 incident): the Dhan
+    /// exchange-lag p99 publisher MUST be spawned via its supervisor
+    /// (respawn + counter — WS-GAP-05 / SLO-03 pattern). A bare
+    /// `tokio::spawn` would regress the exact silent-task-death class the
+    /// SLO-03 incident proved: the `tv_dhan_exchange_lag_p99_seconds`
+    /// stream stops with no error!, no counter, no respawn, and the lag
+    /// alarm false-OKs on missing data (`notBreaching`).
+    #[test]
+    fn test_feed_lag_publisher_supervisor_is_wired_into_main() {
+        let main_rs = std::fs::read_to_string("../app/src/main.rs")
+            .or_else(|_| std::fs::read_to_string("crates/app/src/main.rs"))
+            .expect("main.rs must be readable");
+        assert!(
+            main_rs.contains("spawn_supervised_feed_lag_publisher("),
+            "main.rs MUST spawn the Dhan exchange-lag publisher via \
+             `spawn_supervised_feed_lag_publisher` (silent-feed hardening \
+             Item 4). A bare tokio::spawn regresses the SLO-03 \
+             silent-death class for the lag gauge."
+        );
+        // Round-1 fix (2026-07-07, findings 1/6/9): the supervisor MUST be
+        // spawned from BOTH boot arms — the FAST crash-recovery arm
+        // (which `return run_shutdown_fast(...)`s before `start_dhan_lane`
+        // is ever reached) AND the slow lane (`start_dhan_lane`). One-site
+        // wiring left the lag gauge dark for the whole session after any
+        // mid-market crash restart (WS-GAP-09 exit(2) → systemd restart)
+        // while the lag alarm silently read notBreaching on missing data.
+        // Exactly 2 non-comment, non-definition call sites, each behind the
+        // once-per-process guard.
+        let supervisor_call_sites = main_rs
+            .lines()
+            .filter(|l| {
+                let t = l.trim_start();
+                !t.starts_with("//")
+                    && !t.starts_with("///")
+                    && !t.contains("fn spawn_supervised_feed_lag_publisher")
+                    && t.contains("spawn_supervised_feed_lag_publisher(")
+            })
+            .count();
+        assert_eq!(
+            supervisor_call_sites, 2,
+            "spawn_supervised_feed_lag_publisher must have EXACTLY 2 call \
+             sites in main.rs (fast crash-recovery arm + start_dhan_lane); \
+             found {supervisor_call_sites}. Removing the fast-boot spawn \
+             silently darkens the lag alarm for every mid-market crash \
+             restart session (notBreaching on missing data)."
+        );
+        let guarded_sites = main_rs
+            .matches("FEED_LAG_PUBLISHER_SUPERVISOR_SPAWNED.swap(true")
+            .count();
+        assert_eq!(
+            guarded_sites, 2,
+            "both feed-lag publisher spawn sites must sit behind the \
+             once-per-process FEED_LAG_PUBLISHER_SUPERVISOR_SPAWNED guard \
+             (found {guarded_sites} guarded sites; expected 2)"
+        );
+        // The supervisor must be the ONLY spawn path for the publisher
+        // loop: exactly one non-comment call site of the inner loop fn
+        // (inside the supervisor), so nobody re-introduces a second,
+        // unsupervised spawn.
+        let inner_call_sites = main_rs
+            .lines()
+            .filter(|l| {
+                let t = l.trim_start();
+                !t.starts_with("//")
+                    && !t.starts_with("///")
+                    && t.contains("run_dhan_lag_publisher(")
+            })
+            .count();
+        assert_eq!(
+            inner_call_sites, 1,
+            "run_dhan_lag_publisher must be called ONLY from the feed-lag \
+             supervisor loop (found {inner_call_sites} non-comment mentions; \
+             expected exactly 1: the supervisor call site)"
+        );
+    }
+
     /// Session-B fix #1 (operator go 2026-07-04): the Groww scale-FLEET
     /// spawn in `main.rs` MUST be gated by the fleet dual-instance SSM lock
     /// (`acquire_groww_scale_fleet_lock`). A scale-test boot runs

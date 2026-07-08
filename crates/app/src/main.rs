@@ -1961,6 +1961,25 @@ async fn main() -> Result<()> {
                 .await;
             });
             info!("FAST BOOT COMPLETE — tick processor started, ticks flowing (in-memory)");
+            // Silent-feed hardening Item 4 (2026-07-07 round-1 fix): spawn
+            // the Dhan exchange-lag p99 publisher on the FAST crash-recovery
+            // arm too. This arm `return run_shutdown_fast(...)`s and never
+            // reaches `start_dhan_lane`, so without this spawn a mid-market
+            // crash restart (the WS-GAP-09 exit(2) → systemd restart class)
+            // left `tv_dhan_exchange_lag_p99_seconds` unpublished for the
+            // rest of the session while the ring kept being written — and
+            // the lag alarm treats missing data as notBreaching, so the
+            // darkness was silent (exactly the 2026-07-06 incident class).
+            // Same once-per-process guard as the slow-lane site below.
+            if FEED_LAG_PUBLISHER_SUPERVISOR_SPAWNED.swap(true, std::sync::atomic::Ordering::SeqCst)
+            {
+                info!(
+                    "feed-lag publisher supervisor already running — skipping duplicate spawn \
+                     (fast boot)"
+                );
+            } else {
+                let _feed_lag_publisher_supervisor = spawn_supervised_feed_lag_publisher();
+            }
             // Phase 2.12 (hostile L1 fix): emit a boot-mode gauge so
             // operators can chart fast/slow boot history. Fast boot
             // intentionally passes None for tick_enricher (recovery
@@ -4187,7 +4206,7 @@ const fn damp_questdb_exit_signal(consecutive_failures: u32, threshold: u32) -> 
     consecutive_failures < threshold
 }
 
-#[allow(clippy::too_many_arguments)] // APPROVED: watchdog orchestration requires the full shared-infra handle set (pool + shutdown + notifier + health + feed-health + lane-halt + dhan-flag + token + questdb)
+#[allow(clippy::too_many_arguments)] // APPROVED: boot-wiring spawn fn threads shared handles; a struct would just relocate the arity.
 fn spawn_pool_watchdog_task(
     pool: std::sync::Arc<WebSocketConnectionPool>,
     shutdown_notify: std::sync::Arc<tokio::sync::Notify>,
@@ -7850,9 +7869,12 @@ async fn start_dhan_lane(
             // token, spill remain genuine off-hours signals.
             //
             // Audit-findings Rule 4 (edge-trigger): sustained-degraded
-            // ticks do NOT spam Telegram. The Prometheus alert
-            // `tv-realtime-score-degraded` (5m sustained < 0.95) is
-            // the sustained-condition channel.
+            // ticks do NOT spam Telegram. The sustained-condition channel
+            // is the CloudWatch alarm `tv-prod-realtime-guarantee-degraded`
+            // (< 0.95, 9-of-15 × 60s, window-gated — silent-feed
+            // hardening Item 2, 2026-07-06 incident; the previously cited
+            // Prometheus alert `tv-realtime-score-degraded` was retired
+            // with the CloudWatch-only migration #O3).
             //
             // Gated on `config.features.realtime_guarantee_score`.
             if config.features.realtime_guarantee_score {
@@ -7891,6 +7913,27 @@ async fn start_dhan_lane(
                         ),
                     );
                 }
+            }
+
+            // Silent-feed hardening Item 4 (2026-07-06 incident): the Dhan
+            // exchange→receive lag p99 publisher. Every 10s it snapshots the
+            // trailing-60s lag window recorded by the tick processor's
+            // persist sites and publishes `tv_dhan_exchange_lag_p99_seconds`
+            // — ONLY in-session (Rule 3) and ONLY with ≥50 samples (Rule 11:
+            // a thin/empty window publishes NOTHING; 0 would read as
+            // "perfect lag"). Supervised (WS-GAP-05 / SLO-03 respawn
+            // pattern) and once-per-process — a D2b lane restart re-runs
+            // `start_dhan_lane`, and a duplicate supervisor would leak
+            // forever (same per-lane-leak class as the SLO publisher guard
+            // above).
+            if FEED_LAG_PUBLISHER_SUPERVISOR_SPAWNED.swap(true, std::sync::atomic::Ordering::SeqCst)
+            {
+                info!(
+                    "feed-lag publisher supervisor already running — skipping duplicate spawn \
+                     (lane restart)"
+                );
+            } else {
+                let _feed_lag_publisher_supervisor = spawn_supervised_feed_lag_publisher();
             }
         }
     }
@@ -10059,6 +10102,15 @@ fn compute_tick_freshness(silent_count: usize, universe_size: usize) -> f64 {
 static SLO_PUBLISHER_SUPERVISOR_SPAWNED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+/// Once-per-process spawn guard for the Dhan exchange-lag publisher
+/// supervisor (silent-feed hardening Item 4, 2026-07-06 incident). Same
+/// per-lane-leak rationale as [`SLO_PUBLISHER_SUPERVISOR_SPAWNED`]: D2b lane
+/// restarts re-run `start_dhan_lane`, and each re-invocation would otherwise
+/// leak a fresh never-aborted supervisor. The publisher reads the
+/// process-global lag ring, so it stays correct across lane restarts.
+static FEED_LAG_PUBLISHER_SUPERVISOR_SPAWNED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// Bounded backoff between SLO publisher respawns (SLO-03). Mirrors the
 /// OOM-monitor / disk-watcher supervisor cadence: long enough to avoid a hot
 /// respawn loop, short enough that the `tv_realtime_guarantee_score` stream
@@ -10517,6 +10569,59 @@ fn spawn_supervised_slo_publisher(
             metrics::counter!("tv_slo_publisher_respawn_total", "reason" => reason).increment(1);
             tokio::time::sleep(std::time::Duration::from_secs(
                 SLO_PUBLISHER_RESPAWN_BACKOFF_SECS,
+            ))
+            .await;
+        }
+    })
+}
+
+/// Bounded backoff between Dhan exchange-lag publisher respawns (silent-feed
+/// hardening Item 4). Mirrors [`SLO_PUBLISHER_RESPAWN_BACKOFF_SECS`]: long
+/// enough to avoid a hot respawn loop, short enough that the
+/// `tv_dhan_exchange_lag_p99_seconds` stream resumes well inside one alarm
+/// evaluation period (the lag alarm needs 10 consecutive breaching minutes).
+const FEED_LAG_PUBLISHER_RESPAWN_BACKOFF_SECS: u64 = 5;
+
+/// Silent-feed hardening Item 4 — supervise the Dhan exchange-lag p99
+/// publisher (`tickvault_core::pipeline::feed_lag_monitor::run_dhan_lag_publisher`).
+///
+/// The publisher runs an infinite loop, so its `JoinHandle` resolves ONLY on
+/// a fatal event (panic or external cancel). This supervisor mirrors the
+/// SLO-03 / WS-GAP-05 / DISK-WATCHER-01 pattern: on every publisher death it
+/// logs `error!`, increments `tv_feed_lag_publisher_respawn_total{reason}`,
+/// backs off [`FEED_LAG_PUBLISHER_RESPAWN_BACKOFF_SECS`], and respawns so
+/// the lag gauge stream can never vanish silently. A dead-forever publisher
+/// degrades to missing data → `notBreaching` on the lag alarm (feed-dead
+/// stays owned by the silent-instruments + WS alarms).
+///
+/// No dedicated `ErrorCode` (least-new-surface, documented decision): the
+/// tag-guard requires a `code =` field only when the message mentions a
+/// tracked code, and the respawn counter + supervisor `error!` are the
+/// operator-visible signals — exactly the pre-SLO-03 DISK-WATCHER template
+/// without minting a new taxonomy entry for a brand-new observability-only
+/// task.
+// TEST-EXEMPT: cold-path supervisor spawn wrapper — exit classification is
+// the unit-tested `disk_health_watcher::classify_join_exit`; the boot wiring
+// is pinned by `test_feed_lag_publisher_supervisor_is_wired_into_main`.
+// O(1) EXEMPT: cold-path supervisor — one task per session, fires only on publisher death.
+#[must_use]
+fn spawn_supervised_feed_lag_publisher() -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            let handle =
+                tokio::spawn(tickvault_core::pipeline::feed_lag_monitor::run_dhan_lag_publisher());
+            let join_result = handle.await;
+            let reason = tickvault_storage::disk_health_watcher::classify_join_exit(&join_result);
+            error!(
+                reason,
+                backoff_secs = FEED_LAG_PUBLISHER_RESPAWN_BACKOFF_SECS,
+                "dhan exchange-lag publisher task exited — respawning so the \
+                 tv_dhan_exchange_lag_p99_seconds stream cannot vanish silently"
+            );
+            metrics::counter!("tv_feed_lag_publisher_respawn_total", "reason" => reason)
+                .increment(1);
+            tokio::time::sleep(std::time::Duration::from_secs(
+                FEED_LAG_PUBLISHER_RESPAWN_BACKOFF_SECS,
             ))
             .await;
         }
