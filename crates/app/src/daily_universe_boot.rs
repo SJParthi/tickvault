@@ -88,6 +88,15 @@ pub struct DailyUniverseBootOutcome {
     pub download_ms: u64,
     /// Wall-clock of the lifecycle reconcile phase (QuestDB write), ms.
     pub reconcile_ms: u64,
+    /// Hostile-review round 4 (2026-07-08): the IST trading date
+    /// (`YYYY-MM-DD`) the SUCCESSFUL build attempt actually selected under —
+    /// the LAST date the per-attempt `today_ist_fn` derived (R2-2). A cold
+    /// build whose §4 retry loop crosses IST midnight builds for D+1 while
+    /// the caller's boot-entry date is still D; snapshot writers MUST stamp
+    /// THIS date so the plan-snapshot filename + `trading_date_ist` match
+    /// the FUTIDX selection date (never an internally-inconsistent D-labeled
+    /// artifact carrying the D+1 front month).
+    pub build_trading_date_ist: String,
 }
 
 /// Lowercase-hex SHA-256 of the CSV bytes — the `source_csv_sha256`
@@ -230,12 +239,19 @@ where
     // pre-existing per-boot property); the frozen date is retained ONLY as
     // the fallback if the IST offset constant were ever invalid.
     let fallback_today_ist = chrono::DateTime::from_timestamp_nanos(today_ist_nanos).date_naive();
-    let today_ist_fn = move || match chrono::FixedOffset::east_opt(
+    let live_today_ist_fn = move || match chrono::FixedOffset::east_opt(
         tickvault_common::constants::IST_UTC_OFFSET_SECONDS,
     ) {
         Some(offset) => chrono::Utc::now().with_timezone(&offset).date_naive(),
         None => fallback_today_ist,
     };
+    // Hostile-review round 4 (2026-07-08): capture the LAST date the
+    // per-attempt closure derived — on success that is the date the built
+    // universe's FUTIDX selection actually used (fetch→build are sequential
+    // per attempt; success returns immediately — the same argument as the
+    // provenance capture above). Surfaced as `build_trading_date_ist` so
+    // snapshot writers stamp the SELECTION date, not the frozen entry date.
+    let (today_ist_fn, build_date_capture) = recording_date_fn(live_today_ist_fn);
     let (outcome, universe) =
         run_daily_universe_fetch_runner(wrapped, max_attempts, ntm_map.as_ref(), today_ist_fn)
             .await;
@@ -340,7 +356,14 @@ where
         dry_run,
         "daily-universe boot complete (per-phase: download→build→reconcile)"
     );
-    let elapsed_ms = u64::try_from(boot_timer.elapsed().as_millis()).unwrap_or(u64::MAX);
+    // Round 4: the date the SUCCESSFUL build selected under. The build
+    // always invokes the date fn, so `None` is unreachable in practice —
+    // the boot-entry fallback is purely defensive.
+    let build_trading_date = match build_date_capture.lock() {
+        Ok(guard) => *guard,
+        Err(poisoned) => *poisoned.into_inner(),
+    }
+    .unwrap_or(fallback_today_ist);
     let outcome = DailyUniverseBootOutcome {
         attempts_used,
         universe_size,
@@ -350,8 +373,37 @@ where
         elapsed_ms,
         download_ms,
         reconcile_ms,
+        build_trading_date_ist: build_trading_date.format("%Y-%m-%d").to_string(),
     };
     Ok((outcome, universe))
+}
+
+/// Wrap a date-deriving closure so every invocation records the derived
+/// date into the returned shared slot — the LAST recorded value is the date
+/// the SUCCESSFUL build attempt used (round 4; mirror of the provenance
+/// capture wrapper in [`run_daily_universe_boot`]). PURE apart from the
+/// slot write; testable without a live build.
+fn recording_date_fn<F>(
+    inner: F,
+) -> (
+    impl Fn() -> chrono::NaiveDate,
+    Arc<Mutex<Option<chrono::NaiveDate>>>,
+)
+where
+    F: Fn() -> chrono::NaiveDate,
+{
+    let slot: Arc<Mutex<Option<chrono::NaiveDate>>> = Arc::new(Mutex::new(None));
+    let slot_for_closure = Arc::clone(&slot);
+    let wrapped = move || {
+        let d = inner();
+        // Poison only signals a prior panic; the slot write is still valid.
+        match slot_for_closure.lock() {
+            Ok(mut guard) => *guard = Some(d),
+            Err(poisoned) => *poisoned.into_inner() = Some(d),
+        }
+        d
+    };
+    (wrapped, slot)
 }
 
 #[cfg(test)]
@@ -486,6 +538,84 @@ mod tests {
         assert!(
             ensure_reconcile_fully_applied(&reconcile_with(0, 2)).is_err(),
             "a missing-detail skip means lifecycle rows did not fully land"
+        );
+    }
+
+    // ---- recording_date_fn (round 4: snapshot stamps the SELECTION date) ----
+
+    #[test]
+    fn test_recording_date_fn_captures_last_derived_date() {
+        use std::cell::Cell;
+        let calls = Cell::new(0_u32);
+        let dates = [
+            chrono::NaiveDate::from_ymd_opt(2026, 7, 8).expect("date"),
+            chrono::NaiveDate::from_ymd_opt(2026, 7, 9).expect("date"),
+        ];
+        let inner = || {
+            let d = dates[calls.get() as usize];
+            calls.set(calls.get() + 1);
+            d
+        };
+        let (wrapped, slot) = recording_date_fn(inner);
+        assert!(
+            slot.lock().expect("slot").is_none(),
+            "nothing recorded before the first derivation"
+        );
+        // Attempt 1 derives day D; attempt 2 (midnight crossed) derives D+1.
+        assert_eq!(wrapped(), dates[0]);
+        assert_eq!(*slot.lock().expect("slot"), Some(dates[0]));
+        assert_eq!(wrapped(), dates[1]);
+        assert_eq!(
+            *slot.lock().expect("slot"),
+            Some(dates[1]),
+            "the LAST derived date wins — the successful build's selection date"
+        );
+    }
+
+    /// Round 4 source-order ratchet (main.rs scan, style of
+    /// `ratchet_main_rs_uses_bounded_reinject_helper`): BOTH plan-snapshot
+    /// write sites must stamp the boot outcome's `build_trading_date_ist`
+    /// (the date the successful build's FUTIDX selection actually used) —
+    /// never the `today_date` string frozen at `load_daily_universe_plan`
+    /// entry. A midnight-crossing cold build otherwise writes a D-labeled
+    /// snapshot carrying the D+1 selection (internally inconsistent
+    /// forensic artifact).
+    #[test]
+    fn ratchet_main_rs_snapshot_writes_stamp_the_build_date() {
+        let src: String = include_str!("main.rs")
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        // Needles split via concat! so this test's own source never
+        // satisfies the scan vacuously.
+        // No closing paren in the needles — rustfmt may add a trailing comma
+        // when it breaks the call across lines.
+        let slow_path = concat!(
+            "write_plan_snapshot(&daily_universe,",
+            "&outcome.build_trading_date_ist"
+        );
+        let warm_bg = concat!(
+            "write_plan_snapshot(&fresh_universe,",
+            "&fresh_outcome.build_trading_date_ist"
+        );
+        let frozen_slow = concat!("write_plan_snapshot(&daily_universe,", "&today_date)");
+        let frozen_bg = concat!("date_", "for_bg");
+        assert!(
+            src.contains(slow_path),
+            "slow-path snapshot write must stamp outcome.build_trading_date_ist"
+        );
+        assert!(
+            src.contains(warm_bg),
+            "warm-path background-reconcile snapshot write must stamp \
+             fresh_outcome.build_trading_date_ist"
+        );
+        assert!(
+            !src.contains(frozen_slow),
+            "slow-path snapshot write must not use the frozen boot-entry today_date"
+        );
+        assert!(
+            !src.contains(frozen_bg),
+            "the frozen date_for_bg clone must not be reintroduced"
         );
     }
 
