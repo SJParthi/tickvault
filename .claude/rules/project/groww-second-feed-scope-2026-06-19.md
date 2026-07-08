@@ -458,3 +458,43 @@ Always loaded. Reinforced on any session editing
 the `[feeds] groww_native_shadow` key, or any file containing
 `groww_native_shadow` / `rust-live-ticks.ndjson` / `GROWW_SOCKET_TOKEN_URL`.
 
+
+---
+
+# §36 — FUTIDX-4 in the Groww watch set (operator authorization 2026-07-08)
+
+> **Cross-link:** the Dhan-side grant is `daily-universe-scope-expansion-2026-05-27.md` §36
+> (same section number deliberately, cross-linked both ways).
+
+## §36.0 The verbatim operator demand (preserve exactly, do not paraphrase)
+
+**Quote (2026-07-08):**
+> "for both dhan and groww we need to add futures and those also should be subscribed along with this, especially only for nifty banknifty and sensex nifty midcap."
+
+## §36.1 The grant
+
+The Groww watch set gains at most 4 entries
+`{exchange: NSE×3 / BSE×1, segment: "FNO", exchange_token: <numeric>, kind: ltp}` for the SAME 4
+nearest-expiry index futures the Dhan side subscribes (NIFTY, BANKNIFTY, MIDCPNIFTY on NSE;
+SENSEX on BSE). Expiry resolution comes ONLY from the static Groww master CSV
+(`GROWW_INSTRUMENT_CSV_URL` — the `no-rest-except-live-feed-2026-06-27.md` §3 KEEP class);
+§33 LIVE-FEED-ONLY is untouched (NO Groww historical call ever). ONE Groww connection unchanged
+(`groww-scale-aws-lockout-2026-07-06.md` untouched). Rows land in the SAME shared tables tagged
+`feed='groww'` with feed-in-key DEDUP. Both feeds select the expiry via ONE shared pure function
+(`crates/core/src/instrument/index_futures.rs::select_index_future_expiry` — nearest = first
+expiry >= today, NEVER rolls); missing FUT rows degrade per-underlying (FUTIDX-01, feed=groww),
+never fail the watch build; cross-feed expiry divergence pages FUTIDX-02.
+
+## §36.2 Honest notes
+
+Groww LTP carries only `{ltp, tsInMillis}` — no volume/OI for futures (`cum_volume` stays 0). A
+Groww future's `security_id` is the Groww exchange_token — a DIFFERENT id space from Dhan's
+FUTIDX SID for the same contract (cross-feed comparison maps by contract = underlying+expiry,
+never by id). Live Groww FNO `subscribe_ltp` delivery is UNVERIFIED-LIVE — the first enabled
+session is the probe; the feed-stall watchdog + FUTIDX-01 payloads make silence loud.
+
+## §36.3 REJECT list (Groww side)
+
+OPTIDX/CE/PE entries in the watch set; >4 futures; >1 expiry per underlying; any new Groww
+connection; any Groww historical fetch (§33); resolving expiry from anything but the static
+master CSV. This file must be edited FIRST with a fresh dated quote for any of the above.

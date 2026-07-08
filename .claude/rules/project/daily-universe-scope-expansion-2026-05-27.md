@@ -79,12 +79,12 @@ This product, starting from the date of this lock, opens exactly TWO WebSocket c
 
 | WebSocket | Count | Endpoint | Allowed instruments | Mode |
 |---|---|---|---|---|
-| **Main feed** | **1** | `wss://api-feed.dhan.co?version=2&token=<JWT>&clientId=<ID>&authType=2` | Daily-fetched universe (~250 SIDs): all `IDX_I` rows where `EXCH_ID IN (NSE, BSE)` AND `INSTRUMENT == INDEX` (~30) + every unique `UNDERLYING_SECURITY_ID` referenced by `FUTIDX/OPTIDX/FUTSTK/OPTSTK` rows, resolved to its NSE_EQ row (~218) | **Quote (request code 17)** — 50-byte packets, gives day OHLC at fixed byte offsets |
+| **Main feed** | **1** | `wss://api-feed.dhan.co?version=2&token=<JWT>&clientId=<ID>&authType=2` | Daily-fetched universe (~250 SIDs): all `IDX_I` rows where `EXCH_ID IN (NSE, BSE)` AND `INSTRUMENT == INDEX` (~30) + every unique `UNDERLYING_SECURITY_ID` referenced by `FUTIDX/OPTIDX/FUTSTK/OPTSTK` rows, resolved to its NSE_EQ row (~218) + 4 FUTIDX nearest-expiry contracts (NIFTY/BANKNIFTY/MIDCPNIFTY = NSE_FNO, SENSEX = BSE_FNO) per §36 (2026-07-08) | **Quote (request code 17)** — 50-byte packets, gives day OHLC at fixed byte offsets |
 | **Order update** | **1** | `wss://api-order-update.dhan.co` | Receives order events for orders WE place; filter `Source=P` | JSON, MsgCode 42 auth |
 
 **Total live WebSocket connections to Dhan: 2** (UNCHANGED from prior lock).
 
-**Universe size envelope (mechanical bound):** `MAX_DAILY_UNIVERSE_SIZE = 1200` (raised from 400 per §31, NTM expansion 2026-06-06). Boot HALTS if computed universe is outside `[100, 1200]`. Fits comfortably on 1 main-feed connection (Dhan cap = 5,000 SIDs/conn).
+**Universe size envelope (mechanical bound):** `MAX_DAILY_UNIVERSE_SIZE = 1200` (raised from 400 per §31, NTM expansion 2026-06-06). Boot HALTS if computed universe is outside `[100, 1200]`. Fits comfortably on 1 main-feed connection (Dhan cap = 5,000 SIDs/conn). The §36 FUTIDX-4 grant (2026-07-08) adds exactly 4 SIDs to the subscription set — still inside `[100, 1200]`.
 
 **Subscription dispatch:** 250 SIDs sent in 3 JSON batches (Dhan cap = 100 SIDs/message), sequential with `SubscribeRxGuard` (PR #337) preserving subscription state across reconnects.
 
@@ -135,7 +135,7 @@ Per operator Quote 4: "for future or options it should be just marked as expired
 **Quote 5 (2026-05-29, applicable-F&O master — supersedes the §10-step-4 "indices + underlyings only" scope for the lifecycle table):**
 > "I asked you to pull ALL the FNO in instruments … only fno for our applicable fno instruments right dude … if yes go ahead"
 
-**MASTER vs SUBSCRIPTION (locked 2026-05-29):** `instrument_lifecycle` is the **full applicable-F&O master** — it stores, in addition to the indices + F&O underlying spots, **every applicable F&O contract**: the `FUTSTK`/`OPTSTK` rows whose `UNDERLYING_SECURITY_ID` resolves to one of our tracked NSE_EQ underlyings, plus the `FUTIDX`/`OPTIDX` rows for our tracked indices. Currency F&O (`FUTCUR`/`OPTCUR`), commodity F&O (`FUTCOM`/`OPTFUT`), and non-F&O equities NOT in our underlying set are EXCLUDED. These contract rows carry `lifecycle_state` transitions (`active` → `expired_contract`) and are NEVER deleted (SEBI §25 point-in-time). **This is the master/audit table ONLY — it does NOT change the WebSocket subscription**, which remains the 331-SID indices+spots set per §2 + the 2-WebSocket lock. The `MAX_DAILY_UNIVERSE_SIZE = 1200` envelope in §2 bounds the *subscription* set, NOT the lifecycle master (which legitimately holds ~219K applicable-F&O rows).
+**MASTER vs SUBSCRIPTION (locked 2026-05-29):** `instrument_lifecycle` is the **full applicable-F&O master** — it stores, in addition to the indices + F&O underlying spots, **every applicable F&O contract**: the `FUTSTK`/`OPTSTK` rows whose `UNDERLYING_SECURITY_ID` resolves to one of our tracked NSE_EQ underlyings, plus the `FUTIDX`/`OPTIDX` rows for our tracked indices. Currency F&O (`FUTCUR`/`OPTCUR`), commodity F&O (`FUTCOM`/`OPTFUT`), and non-F&O equities NOT in our underlying set are EXCLUDED. These contract rows carry `lifecycle_state` transitions (`active` → `expired_contract`) and are NEVER deleted (SEBI §25 point-in-time). **This is the master/audit table ONLY — it does NOT change the WebSocket subscription**, which remains the 331-SID indices+spots set per §2 **plus the 4 §36 FUTIDX nearest-expiry contracts (2026-07-08)** + the 2-WebSocket lock. The `MAX_DAILY_UNIVERSE_SIZE = 1200` envelope in §2 bounds the *subscription* set, NOT the lifecycle master (which legitimately holds ~219K applicable-F&O rows).
 
 | Column | Type | Purpose |
 |---|---|---|
@@ -304,7 +304,9 @@ AWS list rates. Budget alarm ceiling = $35/mo pre-GST. Operator approved
 
 ## §8. Subscription mode — Quote for every SID (LOCKED per operator Quote 2)
 
-Every SID in the daily universe — indices AND F&O underlyings — subscribes in **Quote mode**:
+Every SID in the daily universe — indices, F&O underlyings, **and the 4 §36 FUTIDX contracts (2026-07-08)** — subscribes in **Quote mode**:
+
+> §36 note (2026-07-08): in Quote mode, derivative OI is NOT inline (inline OI bytes 34-37 exist only in the Full packet) — OI arrives as the separate 12-byte code-5 packet (live-market-feed.md rule 9), which the tick processor currently counts-and-drops.
 
 - Feed Request Code: `17` (Subscribe — Quote Packet)
 - Response Code: `4` (Quote Packet)
@@ -348,11 +350,11 @@ The new `instrument_lifecycle` orchestrator slots between existing Step 6 (auth)
               1. Read yesterday's active set from `instrument_lifecycle` (cold-path bootstrap)
               2. GET Dhan Detailed CSV with L1-L7 defense layers (§9)
               3. Validate + parse + SHA-256
-              4. Extract (a) indices (filter §2) + unique F&O underlyings (group by UNDERLYING_SECURITY_ID) → the 331-SID SUBSCRIPTION set; AND (b) the applicable F&O CONTRACTS (FUTSTK/OPTSTK for resolved underlyings + FUTIDX/OPTIDX for tracked indices; currency/commodity excluded) → MASTER-only set per §5
+              4. Extract (a) indices (filter §2) + unique F&O underlyings (group by UNDERLYING_SECURITY_ID) → the 331-SID SUBSCRIPTION set (+ the 4 §36 FUTIDX nearest-expiry rows, 2026-07-08); AND (b) the applicable F&O CONTRACTS (FUTSTK/OPTSTK for resolved underlyings + FUTIDX/OPTIDX for tracked indices; currency/commodity excluded) → MASTER-only set per §5
               5. Compute delta vs yesterday — emit added / expired / renamed transitions (over the full master set incl. contracts)
               6. UPSERT `instrument_lifecycle` (subscription set + applicable-F&O contracts per §5) + INSERT `instrument_lifecycle_audit`
               7. INSERT `instrument_fetch_audit` outcome row
-              8. Build `Arc<DailyUniverse>` for the WS subscription dispatcher — dispatcher reads `subscription_targets` ONLY (331), NEVER the contracts (2-WS lock)
+              8. Build `Arc<DailyUniverse>` for the WS subscription dispatcher — dispatcher reads `subscription_targets` ONLY (331), NEVER the contracts (2-WS lock) — the 4 §36 nearest-expiry FUTIDX rows are promoted INTO `subscription_targets` at build time (2026-07-08), so the dispatcher contract itself is unchanged
               9. Bust rkyv binary cache; rebuild for tomorrow's warm boot
               [Infinite retry on any L1-L4 failure per §4]
 08:34      Step 7: Spawn 1 main-feed WebSocket; subscribe Quote mode in 3 batches
@@ -384,6 +386,7 @@ The new `instrument_lifecycle` orchestrator slots between existing Step 6 (auth)
 | Per-row CSV schema validation | Reject CSV if >0.1% rows fail mandatory-field check | `crates/core/src/instrument/csv_parser.rs` (Sub-PR #4) |
 | Lifecycle reconciler test coverage | Idempotent UPSERT + state-flip + dangling-reference rejection | `crates/storage/tests/instrument_lifecycle_*.rs` (Sub-PR #9) |
 | RAM-first hot path (UNCHANGED) | banned-pattern scanner blocks SELECT in indicator/strategy/risk paths | already shipped |
+| `INDEX_FUTURES_UNDERLYINGS` const (len 4) + never-roll selector | §36 FUTIDX-4 scope pinned in code + rule text | `crates/storage/tests/daily_universe_scope_guard.rs::{futidx_scope_pinned_to_4_underlyings_nearest_expiry, futidx_scope_rule_file_pins_forbidden_remainder, futidx_scope_never_roll_source_pin, futidx_scope_legacy_gate_still_false}` (§36, 2026-07-08) |
 
 ---
 
@@ -395,7 +398,7 @@ The new `instrument_lifecycle` orchestrator slots between existing Step 6 (auth)
 - Adds a give-up condition to the fetch retry loop (any code path returning Err without retry)
 - Changes the subscription mode for ANY universe SID from Quote to Ticker or Full without a dated operator quote
 - Adds a 2nd main-feed connection or any new WS endpoint
-- Subscribes the daily universe to derivative contracts (FUTIDX/OPTIDX/FUTSTK/OPTSTK) — only the UNDERLYING_SECURITY_ID spot rows are subscribed
+- Subscribes the daily universe to derivative contracts **beyond the §36 grant** (OPTIDX/FUTSTK/OPTSTK always; FUTIDX beyond the 4 named underlyings or beyond the single nearest expiry) — otherwise only the UNDERLYING_SECURITY_ID spot rows are subscribed (§36, 2026-07-08)
 - DELETES rows from `instrument_lifecycle` (lifecycle_state transitions are the ONLY allowed mutation; no DELETE statements)
 - Changes `effective_main_feed_pool_size` to anything other than 1
 - Modifies instance type from r8g.large without the 4-file update protocol in §7 Mechanical Rule 1
@@ -979,3 +982,83 @@ NTM union without re-confirming against this section.
 time and the two CSVs may format them differently; the 12-char ISIN (`INE…`) is the
 immutable security identity, so it is the only join key that cannot silently map to
 the wrong/old security. The symbol+series cross-check catches the rare bad-ISIN row.
+
+---
+
+# §36 — Index futures (FUTIDX) for exactly 4 underlyings, nearest expiry, BOTH feeds (operator authorization 2026-07-08)
+
+## §36.0 The verbatim operator demand (preserve exactly, do not paraphrase)
+
+**Quote (2026-07-08):**
+> "for both dhan and groww we need to add futures and those also should be subscribed along with this, especially only for nifty banknifty and sensex nifty midcap."
+
+("nifty midcap" = NIFTY MIDCAP SELECT = the MIDCPNIFTY index-futures underlying; the Dhan master's
+"NIFTY MIDCAP SELECT" literal canonicalizes to `MIDCPNIFTY` via `INDEX_SYMBOL_ALIASES`.)
+
+## §36.1 The grant — one paragraph
+
+The daily-universe SUBSCRIPTION set additionally carries exactly FOUR index-futures contracts:
+the NEAREST-expiry FUTIDX for NIFTY, BANKNIFTY, MIDCPNIFTY (NSE_FNO, ExchangeSegment 2) and
+SENSEX (BSE_FNO, ExchangeSegment 8), selected fresh every morning from the same Detailed CSV
+(`SM_EXPIRY_DATE`, never guessed/hardcoded), subscribed in **Quote mode (request code 17)** on
+the EXISTING single main-feed connection. Nearest = first expiry >= today; index futures NEVER
+roll — on expiry day the expiring contract stays subscribed through the 15:30 close (preserves
+`test_index_expiry_never_rolls_via_planner`); the next trading day's build advances
+automatically. Selection is a pure function of (CSV, IST trading date) evaluated once at build
+time; NO intraday resubscribe ever. The Groww watch set gains the SAME 4 logical contracts
+(same underlying + same expiry date; Groww exchange_tokens, kind=ltp, segment=FNO) on the
+EXISTING single Groww connection — see groww-second-feed-scope-2026-06-19.md §36. Both feeds
+select via ONE shared pure function; a boot-time comparator pages FUTIDX-02 if they ever choose
+different expiry dates.
+
+## §36.2 What stays FORBIDDEN (unchanged REJECT set)
+
+OPTIDX, FUTSTK, OPTSTK subscriptions (master-only forever, §5 unchanged); any FUTIDX beyond the
+4 named underlyings (FINNIFTY, BANKEX, NIFTYNXT50, ... = REJECT); any expiry beyond the single
+nearest; any mode other than Quote for these SIDs; any early/intraday rollover (NO intraday
+resubscribe); any new WebSocket; any order placement on these contracts (dry_run + OMS
+untouched). This file must be edited FIRST with a fresh dated quote for any of the above.
+
+## §36.3 Prev-close / OI honest note
+
+Quote-mode NSE_FNO/BSE_FNO prev-close = Quote packet bytes 38-41 (Ticket #5525125,
+`dhan_locked_facts.rs`; ratcheted by the new NSE_FNO/BSE_FNO Quote routing parser tests). OI
+arrives as the separate code-5 packet and is NOT captured today — `ticks.oi = 0` for these 4
+SIDs. The 4 futures are excluded from the prev-day REST fetch and the 15:31 cross-verify
+(Dhan-historical FUTIDX support + expiryCode convention UNVERIFIED-LIVE per annexure rule 8) —
+`*_pct_from_prev_day` columns read 0, fail-soft.
+
+## §36.4 Honest envelope (mandatory §13 wording)
+
+100% inside the tested envelope, with ratcheted regression coverage: exactly 4 contracts pinned
+by `INDEX_FUTURES_UNDERLYINGS` (arity ratcheted in code AND rule text); nearest-expiry
+never-roll pinned by boundary tests at T-1 / T-0 / T+1 / all-past + proptest; Quote mode per the
+ratcheted §8 lock; both boot paths proven identical by the extended snapshot plan-identity
+ratchet; per-underlying degrade is loud (FUTIDX-01, High) and cross-feed expiry divergence pages
+FUTIDX-02 — never silently absorbed. Bandwidth delta: Dhan +4 Quote SIDs ~ 4 x 50 B x ~4 pkts/s
+~ 0.8 KB/s + ~48 B/s code-5 packets (<0.4% of the §8 envelope); Groww +4 LTP subs (~771 of the
+1000 cap); RAM +4 SIDs x 21 TF cells ~ 13 MB against ~7.8 GB r8g.large headroom; no
+buffer/channel constant changes; no cost impact (no instance/schedule/storage change — §15
+step 5 N/A). NOT claimed: futures OI capture; prev-day pct coverage for futures; Dhan live
+Quote cadence/field population for NSE_FNO and especially BSE_FNO FUTIDX (UNVERIFIED-LIVE —
+first session is the probe; tick-gap detector pages within 30s if silent); Groww live FNO
+subscribe_ltp delivery (UNVERIFIED-LIVE); cross-feed row comparability when vendor masters
+disagree on the front contract (DETECTED via FUTIDX-02, not prevented).
+
+## §36.5 Mechanical guards added
+
+`daily_universe_scope_guard.rs::{futidx_scope_pinned_to_4_underlyings_nearest_expiry,
+futidx_scope_rule_file_pins_forbidden_remainder, futidx_scope_never_roll_source_pin,
+futidx_scope_legacy_gate_still_false}`; the selector boundary + proptest suite in
+`index_futures.rs`; planner/snapshot/Groww ratchets per
+`.claude/plans/active-plan-futidx-4.md`.
+
+## §36.6 Auto-driver explanation
+
+> Sir, the juice shop already watches the live price of 4 fruit BASKETS. From today the same
+> ONE phone line also hears the price of the 4 "next-delivery basket coupons" (futures) —
+> exactly one coupon per basket, always the soonest delivery date, and on the coupon's last day
+> we keep listening to THAT coupon until closing time; tomorrow morning the list-maker picks
+> the next coupon automatically. Both of our two suppliers (Dhan and Groww) pick the coupon
+> with the same rule, and an inspector rings a bell if they ever disagree. No new phone lines.
+> No option coupons. No 5th basket.

@@ -100,6 +100,7 @@ prev-close routing matrix from `live-market-feed.md`:
 | NSE_EQ | Quote OR Full | bytes 38-41 (Quote) / 50-53 (Full) of the packet |
 | NSE_FNO | Full | bytes 50-53 of the Full packet |
 | BSE_FNO | Full | bytes 50-53 of the Full packet |
+| NSE_FNO/BSE_FNO §36 FUTIDX-4 (Quote) — 2026-07-08 | Quote | bytes 38-41 (Ticket #5525125, `dhan_locked_facts.rs`; OI via separate code-5 packet, currently uncaptured; the Full requirement served the deleted OI/depth consumers and its test is retired `#[cfg(any())]`, PR #7b) |
 
 If any subscribed instrument has a `(segment, feed_mode)` pair outside the
 allowed cell of this matrix, PREVCLOSE-03 fires Severity::Critical and the

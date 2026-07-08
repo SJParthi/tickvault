@@ -1,0 +1,113 @@
+# Implementation Plan: FUTIDX-4 nearest-expiry subscription (Dhan Quote + Groww watch set)
+
+**Status:** APPROVED
+**Date:** 2026-07-08
+**Approved by:** Parthiban (operator) — dated verbatim quote in daily-universe-scope-expansion §36 (2026-07-08): "for both dhan and groww we need to add futures and those also should be subscribed along with this, especially only for nifty banknifty and sensex nifty midcap."
+
+## Plan Items
+
+- [ ] Item 1 — Shared selection module (constant + boundary fn + selector + parity comparator)
+  - Files: crates/core/src/instrument/index_futures.rs (NEW), crates/core/src/instrument/mod.rs
+  - Tests: test_index_futures_underlyings_pinned_exactly_four, test_select_index_future_expiry_picks_first_at_or_after_today, test_select_index_future_expiry_keeps_expiring_contract_on_t_zero, test_select_index_future_expiry_advances_day_after_expiry, test_select_index_future_expiry_none_when_all_past, test_index_future_selection_never_rolls_unlike_stocks, test_select_index_future_contracts_excludes_optidx_futstk_optstk, test_select_index_future_contracts_excludes_fifth_underlying, test_select_index_future_contracts_fails_closed_on_duplicate_expiry, test_select_index_future_contracts_sensex_from_bse_fno_only, test_select_index_future_contracts_canonicalizes_midcpnifty_alias, test_select_index_future_contracts_missing_underlying_degrades, test_select_index_future_contracts_skips_unparsable_expiry_counted, arbitrary_contract_sets_never_select_beyond_allowlist, test_cross_feed_parity_ok_on_identical_pairs, test_cross_feed_parity_flags_expiry_mismatch, test_cross_feed_parity_flags_one_sided_underlying
+- [ ] Item 2 — InstrumentRole::IndexFuture + universe Pass 5 + orchestrator wiring + error codes
+  - Files: crates/core/src/instrument/daily_universe.rs, crates/core/src/instrument/daily_universe_orchestrator.rs, crates/common/src/error_code.rs, crates/app/src/daily_universe_boot.rs, crates/app/src/main.rs
+  - Tests: test_build_daily_universe_pass5_promotes_futidx_targets, test_count_by_role_includes_index_future, test_daily_universe_spot_only_when_no_future_rows
+- [ ] Item 3 — Planner IndexFuture arm (segment from csv_row, Quote, IndexDerivative)
+  - Files: crates/core/src/instrument/subscription_planner.rs
+  - Tests: test_daily_universe_plan_index_future_targets_quote_mode_fno_segments, test_daily_universe_plan_futidx_capped_at_4, test_daily_universe_plan_index_future_unknown_segment_skipped, test_daily_universe_plan_futures_dedup_composite_key
+- [ ] Item 4 — Snapshot format v2 (role label + optional segment/expiry fields + format gate)
+  - Files: crates/core/src/instrument/instrument_snapshot.rs
+  - Tests: test_parse_role_round_trips_index_future, test_snapshot_roundtrip_preserves_index_future_segment_and_expiry, test_snapshot_index_future_missing_segment_fails_closed, test_snapshot_format_v1_rejected_forces_cold_build_once, test_snapshot_format_v2_zero_futures_accepted_no_rebuild_loop, test_old_snapshot_without_new_fields_parses_with_empty_defaults
+- [ ] Item 5 — REST-loop skips + lifecycle dedup + canary hardening
+  - Files: crates/app/src/prev_day_ohlcv_boot.rs, crates/app/src/main.rs, crates/app/src/today_instrument.rs, crates/core/src/pipeline/tick_processor.rs
+  - Tests: test_instrument_type_for_role_none_for_index_future, test_cross_verify_targets_exclude_index_future_role, test_extract_today_instruments_dedups_futidx_between_targets_and_contracts, test_canary_gauges_ignore_non_idx_i_segments
+- [ ] Item 6 — Ratchets: scope-guard pins + Quote+FNO parser routing tests
+  - Files: crates/storage/tests/daily_universe_scope_guard.rs, crates/core/tests/prev_close_routing_5525125_guard.rs
+  - Tests: futidx_scope_pinned_to_4_underlyings_nearest_expiry, futidx_scope_rule_file_pins_forbidden_remainder, futidx_scope_never_roll_source_pin, futidx_scope_legacy_gate_still_false, test_prev_close_routing_nse_fno_from_quote_close_field_bytes_38_to_41, test_prev_close_routing_bse_fno_from_quote_close_field_bytes_38_to_41
+- [ ] Item 7 — Groww: master-row fields + FUT extractor + watch-set fold + master labeling + parity record
+  - Files: crates/core/src/feed/groww/instruments.rs, crates/core/src/feed/groww/shared_master_writer.rs, crates/app/src/groww_activation.rs
+  - Tests: test_groww_row_parses_underlying_and_expiry_columns, test_groww_row_missing_new_headers_degrades_not_fails_master, test_extract_index_future_entries_picks_nearest_expiry_four_underlyings, test_extract_index_future_entries_sensex_on_bse_others_nse, test_extract_index_future_entries_uses_underlying_symbol_not_trading_symbol, test_extract_index_future_entries_missing_underlying_degrades, test_extract_index_future_entries_ambiguous_duplicate_fails_closed, test_extract_index_future_entries_never_rolls_on_expiry_day, test_watch_set_includes_exactly_4_fno_futures, test_watch_file_roundtrip_with_fno_entries, test_master_writer_labels_fno_ltp_entries_futidx
+
+## Design
+
+Quote-mode resolution (retired Full ratchet + locked fact #5525125 + §8 lock); new
+`InstrumentRole::IndexFuture` promoted into `subscription_targets` at build time (dispatcher
+contract literally unchanged — reads `DailyUniverse::subscription_targets` only); ONE shared
+pure never-roll expiry function in `crates/core/src/instrument/index_futures.rs`
+(`select_index_future_expiry` — nearest = first expiry >= today, NO calendar parameter so
+accidental stock-style T-0 roll activation is unrepresentable) used by BOTH the Dhan
+orchestrator (`daily_universe_orchestrator.rs`) and the Groww watch builder
+(`crates/core/src/feed/groww/instruments.rs`); snapshot format v2 with fail-closed gates
+(format gate keyed on FORMAT, never futures count); per-underlying degrade + FUTIDX-01/02
+paging. Crates touched: core, common (error_code only), app, storage (tests only).
+`should_subscribe_index_derivatives` stays `false` forever; no identifier contains the
+`subscribe_index_derivatives` substring outside the allowlisted files.
+
+## Edge Cases
+
+Expiry day T-0 (KEEP expiring contract through close; never roll); T+1 auto-advance; all
+expiries past (degrade + FUTIDX-01 page); duplicate same-expiry rows (fail-closed per
+underlying); MIDCPNIFTY alias ("NIFTY MIDCAP SELECT" canonicalization via
+`INDEX_SYMBOL_ALIASES`; Groww symbol drift → evidence in the FUTIDX-01 payload); SENSEX =
+BSE_FNO not NSE_FNO (cross-exchange listing skipped); unparsable SM_EXPIRY_DATE (skip +
+`BadExpiryFormat`); FUTIDX SID numerically colliding with a spot SID (composite
+`(sid, segment)` keys, I-P1-11); deploy-day old-format same-day snapshot (format gate →
+exactly one cold build); rollback day (old binary reads v2 snapshot → unknown role fails
+closed → cold build); Groww master missing underlying_symbol/expiry_date columns (futures
+degrade; cash/index build untouched); Groww FUT rows ISIN-less (ISIN path deliberately
+unused); watch-set cap 1000 with +4; boot spanning IST midnight (both builders re-run for
+the new date).
+
+## Failure Modes
+
+FUTIDX-01 selection degraded (per feed, per underlying — subscribe the resolved subset, page
+High, never HALT); FUTIDX-02 cross-feed expiry mismatch (page High, both feeds stay live);
+snapshot v1 reject (one deterministic cold build, self-heals); Dhan silent no-frames on a
+FUTIDX SID (tick-gap detector auto-seeded from plan.registry pages WS-GAP-06 within 30s);
+Groww FNO subscribe rejected (existing sidecar reject logging + FEED-STALL chain); code-5 OI
+packets counted-and-dropped (documented non-goal, not a failure); REST loops never touch
+FUTIDX (skip arms + counters `tv_prev_day_futidx_skipped_total` /
+`tv_cross_verify_futidx_skipped_total`).
+
+## Test Plan
+
+All tests named per Plan Item above. Scoped runs: `cargo test -p tickvault-core -p
+tickvault-app -p tickvault-storage`; crates/common (`error_code.rs`) touched → workspace-wide
+`cargo test --workspace` escalation per testing-scope.md. Selector boundary tests at
+T-1 / T-0 / T+1 / all-past + a proptest over arbitrary contract soups; snapshot cross-version
+matrix (4 cases); Quote+FNO prev-close routing parser ratchets; scope-guard rule-file pins.
+Pre-push battery + Repo Guards + All Green. First-live-session verification checklist per the
+design spec (record dated Verified notes for the live Unknowns: BSE_FNO Quote field
+population, Groww FNO streaming, MIDCPNIFTY symbol literals).
+
+## Rollback
+
+`git revert` of the code commits restores byte-identical spot-only behavior (no schema
+change, no config-default change, no new config flag — deliberate; pinned by
+`test_daily_universe_spot_only_when_no_future_rows`). An old binary reading a v2 snapshot
+fails closed to a cold build (`test_to_universe_fails_closed_on_unknown_role` stays green).
+The §36 rule-file grant remains as a dormant historical authorization (grant != obligation).
+
+## Observability
+
+Counters: `tv_index_futures_selection_missing_total{feed,underlying}`,
+`tv_index_futures_parity_mismatch_total`, `tv_prev_day_futidx_skipped_total`,
+`tv_cross_verify_futidx_skipped_total`; gauge `tv_index_futures_selected{feed}` (0-4); coded
+`error!(code = "FUTIDX-01"/"FUTIDX-02")` → 5-sink chain + Telegram High (runbook
+`.claude/rules/project/futidx-4-error-codes.md`); one structured `info!` per feed per boot:
+`index-futures selection feed=<f> underlying=<U> expiry=<date> native_id=<id> segment=<seg>`
+(the machine-readable evidence table) + the parity OK/mismatch verdict line; existing per-SID
+telemetry inherited automatically (tick-gap seeding, registry gauges, candle DEDUP rows,
+ws_event_audit).
+
+## Guarantee matrices
+
+See per-wave-guarantee-matrix.md — all 15 + 7 rows apply to every item in this plan.
+100% inside the tested envelope, with ratcheted regression coverage: exactly 4 contracts
+pinned by `INDEX_FUTURES_UNDERLYINGS` (arity ratcheted in code AND rule text);
+nearest-expiry never-roll pinned by boundary tests at T-1 / T-0 / T+1 / all-past + proptest;
+Quote mode per the ratcheted §8 lock; both boot paths proven identical by the extended
+snapshot plan-identity ratchet; per-underlying degrade is loud (FUTIDX-01, High) and
+cross-feed expiry divergence pages FUTIDX-02 — never silently absorbed. NOT claimed: futures
+OI capture; prev-day pct coverage for futures; Dhan live Quote cadence for NSE_FNO/BSE_FNO
+FUTIDX (UNVERIFIED-LIVE); Groww live FNO subscribe_ltp delivery (UNVERIFIED-LIVE).
