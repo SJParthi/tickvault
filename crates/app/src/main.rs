@@ -1705,12 +1705,23 @@ async fn main() -> Result<()> {
         };
         // Wave 3-B Item 11: opt-in Telegram bucket-coalescer based on the
         // `features.telegram_bucket_coalescer` flag. Defaults to `true`.
+        // 2026-07-07 UX overhaul: the in-market LOW/MEDIUM digest window
+        // comes from `[notification] digest_window_secs` (clamped [60,3600]);
+        // the coalescer drain loop also owns the episode stability ticker.
         let fast_notifier = if config.features.telegram_bucket_coalescer {
             NotificationService::enable_coalescer(
                 fast_notifier,
-                tickvault_core::notification::CoalescerConfig::default(),
+                tickvault_core::notification::CoalescerConfig {
+                    market_hours_window: std::time::Duration::from_secs(
+                        config.notification.digest_window_secs_clamped(),
+                    ),
+                    ..Default::default()
+                },
             )
         } else {
+            // No drain loop → the episode green-close promotion needs its
+            // own tiny ticker (no-op when episode_mode is off / NoOp mode).
+            NotificationService::spawn_episode_ticker(&fast_notifier);
             fast_notifier
         };
         // Fill the Groww sidecar supervisor's deferred Telegram slot now that the
@@ -4195,7 +4206,7 @@ const fn damp_questdb_exit_signal(consecutive_failures: u32, threshold: u32) -> 
     consecutive_failures < threshold
 }
 
-#[allow(clippy::too_many_arguments)] // APPROVED: boot-wiring spawn fn threads shared handles; a struct would just relocate the arity.
+#[allow(clippy::too_many_arguments)] // APPROVED: watchdog orchestration requires the full shared-infra handle set (pool + shutdown + notifier + health + feed-health + lane-halt + dhan-flag + token + questdb)
 fn spawn_pool_watchdog_task(
     pool: std::sync::Arc<WebSocketConnectionPool>,
     shutdown_notify: std::sync::Arc<tokio::sync::Notify>,
@@ -5422,12 +5433,22 @@ async fn build_shared_infra(
         }
     };
     // Wave 3-B Item 11: opt-in Telegram bucket-coalescer (defaults to `true`).
+    // 2026-07-07 UX overhaul: digest window from config; the drain loop
+    // also owns the episode stability ticker (green-close promotion).
     let notifier = if config.features.telegram_bucket_coalescer {
         NotificationService::enable_coalescer(
             notifier,
-            tickvault_core::notification::CoalescerConfig::default(),
+            tickvault_core::notification::CoalescerConfig {
+                market_hours_window: std::time::Duration::from_secs(
+                    config.notification.digest_window_secs_clamped(),
+                ),
+                ..Default::default()
+            },
         )
     } else {
+        // No drain loop → the episode green-close promotion needs its own
+        // tiny ticker (no-op when episode_mode is off / NoOp mode).
+        NotificationService::spawn_episode_ticker(&notifier);
         notifier
     };
 
@@ -8007,7 +8028,6 @@ async fn start_dhan_lane(
         let token = token_manager.token_handle();
         let sender = order_update_sender.clone();
         let cal = trading_calendar.clone();
-        let ou_notifier = notifier.clone();
         let ou_connect_notifier = notifier.clone();
         let ou_health = health_status.clone();
         let ou_wal_spill = ws_frame_spill.clone();
@@ -8052,10 +8072,19 @@ async fn start_dhan_lane(
                 ou_dhan_flag,
             )
             .await;
-            // If run_order_update_connection returns, connection terminated
-            ou_notifier.notify(NotificationEvent::OrderUpdateDisconnected {
-                reason: "connection task exited".to_string(),
-            });
+            // Defensive only: run_order_update_connection is an infinite
+            // never-give-up loop (WS-GAP-04) and structurally cannot return —
+            // the OrderUpdateDisconnected notify that used to live here was
+            // DEAD CODE (2026-07-06 incident: 39+ in-market failures, zero
+            // HIGH pages). The reachable [HIGH] page now fires INSIDE the
+            // reconnect loop (WS-GAP-10). If this line ever executes, a
+            // future refactor broke the loop contract — surface it loudly,
+            // never silently.
+            error!(
+                code = tickvault_common::error_code::ErrorCode::WsGap10OrderUpdateOutage.code_str(),
+                reason = "task_exited_unreachable",
+                "order update WebSocket task exited — unreachable by design; investigate immediately"
+            );
             ou_health.set_order_update_connected(false);
         })
     };
@@ -9901,6 +9930,11 @@ async fn run_process_runloop(
     if let Some(fleet_lock) = groww_scale_fleet_lock {
         fleet_lock.release_on_shutdown().await;
     }
+
+    // 5c. Telegram UX overhaul (2026-07-07): flush pending coalesced
+    // summaries + write the final episode snapshot (bounded 10s inside
+    // shutdown_flush — a black-holed Telegram can never hang exit).
+    notifier.shutdown_flush().await;
 
     // 6. Stop API server (PROCESS-shared).
     if let Some(handle) = api_handle {

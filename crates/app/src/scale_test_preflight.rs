@@ -102,11 +102,10 @@ fn check_shards_dir_writable(shards_root: &Path) -> PreflightOutcome {
     let probe = shards_root.join(".preflight-write-probe");
     match std::fs::write(&probe, b"ok") {
         Ok(()) => {
-            // Best-effort probe-file cleanup — a leftover probe is harmless
-            // (overwritten by the next preflight run) but the discard is
-            // surfaced at debug so it is never fully silent.
+            // Best-effort probe cleanup — a leftover probe file is harmless
+            // and must never fail the preflight; log at debug for forensics.
             if let Err(e) = std::fs::remove_file(&probe) {
-                tracing::debug!(error = %e, "preflight write-probe cleanup failed");
+                tracing::debug!(error = %e, "preflight write-probe cleanup failed (best-effort)");
             }
             PreflightOutcome::Pass(format!("{} writable", shards_root.display()))
         }
