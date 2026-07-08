@@ -42,6 +42,7 @@ valid nearest-expiry contracts. Reasons (the `reason` payload field):
 | `AllExpiriesPast` | every parsed expiry < today (data anomaly — stale master) |
 | `AmbiguousDuplicateExpiry` | ≥2 rows share the chosen (underlying, expiry) — fail-closed, never guess a SID/token |
 | `BadExpiryFormat` | every candidate row's expiry was unparsable (skipped + counted) |
+| `BadNativeToken` | (Groww only, 2026-07-08 hostile-review round 1) every candidate row's `exchange_token` was non-numeric with otherwise-valid expiries — the id-space triage arm, distinct from `BadExpiryFormat` |
 
 **Consequence:** that feed runs WITHOUT that future for the day — degrade, never HALT; the
 spot universe is unaffected. Payload: `feed`, `underlying`, `reason`, `candidates_seen`
@@ -71,6 +72,16 @@ never auto-actioned, and the operator must decide which vendor master is stale.
 single-feed runs never fire it) found `expiry(dhan, U) != expiry(groww, U)` or one-sided
 presence for an underlying U (`ErrorCode::Futidx02CrossFeedExpiryMismatch`).
 
+**Same-trading-date gate (2026-07-08 hostile-review round 1):** each recorded selection
+carries its IST trading date; the comparator fires ONLY when both feeds recorded for the
+SAME date. A cross-date pair (e.g. a Groww re-activation the day AFTER a Dhan boot, across
+an expiry boundary) is REFUSED — one coalesced `info!` line, the stale (older-dated)
+feed's entry is evicted so a fresh same-date record re-pairs — never a false FUTIDX-02.
+**Canonical provenance:** both feeds record the EXACT-match canonical from their selector
+(`canonicalize_index_symbol` equality); substring re-derivation from symbol strings is
+FORBIDDEN (pre-fix `"BANKNIFTY…".contains("NIFTY")` mislabeled BANKNIFTY/MIDCPNIFTY as
+NIFTY → 2 false FUTIDX-02 pages every dual-feed boot).
+
 **Consequence:** BOTH feeds STAY LIVE (visibility, never a halt); cross-feed rows for U are
 not comparable that day. Counter: `tv_index_futures_parity_mismatch_total`.
 
@@ -88,6 +99,13 @@ not comparable that day. Counter: `tv_index_futures_parity_mismatch_total`.
   annexure rule 8); `*_pct_from_prev_day` columns read 0, fail-soft PREVDAY-01 semantics.
 - `tv_cross_verify_futidx_skipped_total` — the 15:31 IST 1m cross-verify stays spot-only by
   construction; futures are skipped + counted.
+- `tv_index_futures_cap_dropped_total{feed="groww"}` — (2026-07-08 hostile-review round 1)
+  the §36 futures are CAP-PRIORITY in the Groww live-subscribe set (prepended before the
+  prefix truncate), and `tv_index_futures_selected{feed="groww"}` is set from the POST-cap
+  live set (honest — never reports 4 while 0 survived). If a sub-4 operator cap override
+  ever drops a mandated future, this counter + a FUTIDX-01-coded `error!` fire — never a
+  silent drop. The prev-day coverage denominator also EXCLUDES the always-skipped futures
+  (a perfect day reads 100% again).
 - Honest consequence: `ticks.oi = 0` for the 4 futures (Quote mode; the separate code-5 OI
   packet is counted-and-dropped by the tick processor today — a future dated-quote feature).
 - Boot evidence lines: one structured `info!` per feed per boot —
