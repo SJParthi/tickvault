@@ -7037,7 +7037,21 @@ async fn start_dhan_lane(
                 });
                 // Capture the expected universe size BEFORE the Arc moves into
                 // the fetch, so the post-fetch coverage verification can compare.
-                let pd_expected = pd_universe.subscription_targets.len();
+                // §36 (hostile-review round 1, 2026-07-08): the ≤4 IndexFuture
+                // targets are unconditionally SKIPPED by the prev-day loop
+                // (`instrument_type_for_role` → None — Dhan-historical FUTIDX
+                // UNVERIFIED-LIVE), so they must NOT sit in the coverage
+                // DENOMINATOR — pre-fix a perfect day could never read 100%
+                // and the spot pct was permanently diluted. Same role filter
+                // the 15:31 cross-verify target build uses.
+                let pd_expected = pd_universe
+                    .subscription_targets
+                    .iter()
+                    .filter(|t| {
+                        tickvault_app::prev_day_ohlcv_boot::instrument_type_for_role(t.role)
+                            .is_some()
+                    })
+                    .count();
                 let pd_token = std::sync::Arc::clone(&token_handle);
                 let pd_qcfg = config.questdb.clone();
                 let pd_base = config.dhan.rest_api_base_url.clone();
