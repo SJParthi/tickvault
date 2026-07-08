@@ -1,6 +1,6 @@
 # Implementation Plan: Market-open confirmations bypass the in-market digest
 
-**Status:** APPROVED
+**Status:** VERIFIED
 **Date:** 2026-07-08
 **Approved by:** Parthiban (operator directive 2026-07-08 — verbatim complaint
 "why every telegram notification is very late" + standing merge instruction)
@@ -90,11 +90,11 @@ data migration; no coalescer change.
 
 ## Plan Items
 
-- [ ] Add the 3 variants to the `DispatchPolicy::Immediate` arm of
+- [x] Add the 3 variants to the `DispatchPolicy::Immediate` arm of
       `dispatch_policy()`
   - Files: crates/core/src/notification/events.rs
   - Tests: test_market_open_confirmations_are_immediate_info
-- [ ] Inline ratchet test covering all 3 variants (Immediate + Info)
+- [x] Inline ratchet test covering all 3 variants (Immediate + Info)
   - Files: crates/core/src/notification/events.rs
   - Tests: test_market_open_confirmations_are_immediate_info
 
