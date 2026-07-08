@@ -1951,10 +1951,11 @@ mod tests {
         // bumped 130 -> 131 for TELEGRAM-03 (episode machinery degraded:
         // store_write_failed / rehydrate_corrupt / edit_fallback_storm —
         // delivery unaffected, UX-only degrade, Severity::Low).
-        // 2026-07-08 (§36 FUTIDX-4): bumped 131 -> 133 for FUTIDX-01
-        // (per-underlying nearest-expiry selection degraded, per feed) +
-        // FUTIDX-02 (cross-feed expiry mismatch) — both Severity::High.
-        assert_eq!(ErrorCode::all().len(), 133);
+        // 2026-07-06 (AUTH-GAP-05 token self-heal): bumped 131 -> 132 for
+        // AUTH-GAP-05 (sustained mid-session token-invalid — forced re-mint
+        // triggered via the existing renewal machinery; lock-before-mint +
+        // ~125s cooldown + retry-once latch honored).
+        assert_eq!(ErrorCode::all().len(), 132);
     }
 
     #[test]
