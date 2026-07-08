@@ -43,6 +43,7 @@ valid nearest-expiry contracts. Reasons (the `reason` payload field):
 | `AmbiguousDuplicateExpiry` | ≥2 TRULY-DISTINCT ids share the chosen (underlying, expiry) — fail-closed, never guess a SID/token. Hostile-review round 2 (2026-07-08): vendor-glitch EXACT-duplicate lines (same `SECURITY_ID` / same `exchange_token`) collapse first-row-wins (index_extractor precedent) BEFORE this count — a duplicated line no longer drops the mandated future |
 | `BadExpiryFormat` | every candidate row's expiry was unparsable (skipped + counted) |
 | `BadNativeToken` | (Groww only, 2026-07-08 hostile-review round 1) every candidate row's `exchange_token` was non-numeric with otherwise-valid expiries — the id-space triage arm, distinct from `BadExpiryFormat` |
+| `SameExpiryCandidateFlood` | (2026-07-08 hostile-review round 3, both feeds) more than `FUTIDX_SAME_EXPIRY_CANDIDATE_CAP` (16) rows matched the chosen (underlying, expiry) — corrupt/flooded vendor master; fail-closed degrade, INSTR-FETCH-04 envelope discipline. The exact-duplicate dedup below the cap is HashSet-based O(n) (round 3 — was an O(n²) scan on unbounded untrusted rows) |
 
 **Consequence:** that feed runs WITHOUT that future for the day — degrade, never HALT; the
 spot universe is unaffected. Payload: `feed`, `underlying`, `reason`, `candidates_seen`
@@ -71,9 +72,13 @@ the distinct-key count).
 
 ## §2. FUTIDX-02 — cross-feed expiry mismatch
 
-**Severity:** High. **Auto-triage safe:** Yes at the enum level (`is_auto_triage_safe` is
-derived `!Critical`); operator guidance is MANUAL triage — a data-comparability signal is
-never auto-actioned, and the operator must decide which vendor master is stale.
+**Severity:** High. **Auto-triage safe:** **No** — hostile-review round 3 (2026-07-08)
+reconciled the enum to the design contract (FINAL.md D0.5/T3.4): `is_auto_triage_safe()`
+now carries a severity-independent override arm returning `false` for FUTIDX-02, so ANY
+consumer of the documented API gets the correct answer (previously the blanket `!Critical`
+derivation reported `true` and the drift was papered over here in prose). A
+data-comparability signal is never auto-actioned — the operator decides which vendor
+master is stale. Pinned by `test_futidx_codes_contract`.
 
 **Trigger:** the boot-time comparator (`compare_index_future_selections`, fired from
 `record_index_future_selection` once BOTH feeds have recorded — order-independent;
