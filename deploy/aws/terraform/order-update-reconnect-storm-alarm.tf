@@ -36,14 +36,18 @@
 # ≤3 per 15 min, below threshold. Honest detection floor: flap cycles slower
 # than ~180s (≤5 reconnects/15 min) do NOT page — that slow-flap band is a
 # stated residual (the durable-down alarm owns full outages; nothing owns
-# 3-min+ cycles today). Aligned-window semantics (round-8; mirrors the
-# feed-stall-restart-alarm.tf clause): CloudWatch evaluates aligned TUMBLING
-# 900s windows, not a sliding window — a short burst of >5 cycles that
-# STRADDLES a window boundary (≤5 on each side, e.g. 4+4 over ~12 min) pages
-# one window later, or not at all if the flap stops at the boundary; a
-# SUSTAINED flap keeps accumulating and always pages (the 2026-07-06
-# all-session incident shape is unaffected — stated residual, not a tuning
-# defect). Counter reset on app restart is absorbed by the
+# 3-min+ cycles today). Aligned-window semantics (round-10 correction of the
+# round-8 clause; mirrors the feed-stall-restart-alarm.tf clause): CloudWatch
+# evaluates aligned TUMBLING 900s windows, not a sliding window — a burst that
+# STOPS after straddling a window boundary with ≤5 cycles on each side (e.g.
+# 4+4-then-stop over ~12 min) pages NEVER (the round-8 "pages one window
+# later" example was wrong: neither aligned window ever exceeds 5). The
+# honest miss set is therefore up to 2x the threshold — as many as 10
+# reconnects inside a SLIDING 15-min span (≤5/≤5 across the boundary) —
+# without a page; only a flap that KEEPS GOING faster than the ~180s floor is
+# guaranteed to accumulate >5 inside some aligned window and page (the
+# 2026-07-06 all-session incident shape is unaffected — stated residual, not
+# a tuning defect). Counter reset on app restart is absorbed by the
 # agent's delta calculation (first post-restart sample dropped — up to one
 # scrape-interval of reconnect increments lost: every attempt between the
 # task restart and the first post-restart 60s scrape, ~8 worst-case under
@@ -91,7 +95,7 @@ resource "aws_cloudwatch_log_metric_filter" "order_update_reconnections_fallback
 
 resource "aws_cloudwatch_metric_alarm" "order_update_reconnect_storm" {
   alarm_name          = "tv-${var.environment}-order-update-reconnect-storm"
-  alarm_description   = "Order-update WebSocket is FLAPPING: more than 5 reconnect attempts in 15 minutes during market hours (Sum of the agent's per-scrape counter deltas; catches flap cycles faster than ~3 min, incl. the ~90s 2026-07-06 incident cadence — the counter increments once per cycle). Aligned tumbling window, not sliding: a >5-cycle burst straddling the 900s boundary (<=5 per side) pages one window later or, if the flap stops at the boundary, not at all; a SUSTAINED flap always pages. The durable-down alarm (order-update-ws-inactive, Minimum<1 over 2x60s) cannot see a socket that reconnects within each minute (2026-07-06 incident class). Fill confirmations may arrive late or duplicated. Check the errors stream for order-update disconnect reasons; cross-check Dhan status + tv_token_remaining_seconds. Runbook: .claude/rules/project/wave-2-error-codes.md (WS-GAP family) + docs/dhan-ref/10-live-order-update-websocket.md"
+  alarm_description   = "Order-update WebSocket is FLAPPING: more than 5 reconnect attempts in one ALIGNED 15-min window during market hours (Sum of the agent's per-scrape counter deltas; the counter increments once per cycle - catches flap cycles faster than ~3 min, incl. the ~90s 2026-07-06 incident cadence). Tumbling windows, not sliding: a burst that stops after straddling the boundary at <=5 per side (e.g. 4+4-then-stop) never pages - up to 10 reconnects in a sliding 15-min span can go unpaged; only a flap sustaining faster than the ~3-min floor always pages. The durable-down alarm (order-update-ws-inactive, Minimum<1 over 2x60s) cannot see a socket that reconnects within each minute. Fill confirmations may arrive late or duplicated. Check the errors stream for order-update disconnect reasons; cross-check Dhan status + tv_token_remaining_seconds. Runbook: .claude/rules/project/wave-2-error-codes.md (WS-GAP family) + docs/dhan-ref/10-live-order-update-websocket.md"
   comparison_operator = "GreaterThanThreshold"
   threshold           = 5
   evaluation_periods  = 1
@@ -101,8 +105,10 @@ resource "aws_cloudwatch_metric_alarm" "order_update_reconnect_storm" {
   # cycle, so a 5-min window mathematically cannot exceed 5 for any cycle
   # >= 60s — see the TUNING header block. Sum over the window = reconnects in
   # the window (the agent ships per-scrape counter deltas — see COUNTER SHAPE
-  # header; boundary-straddling >5 bursts page one window later or, if the
-  # flap stops at the boundary, not at all — tumbling windows, not sliding).
+  # header; a burst that stops after straddling the boundary at ≤5 per side
+  # never pages — honest miss set up to 10 reconnects in a sliding 15-min
+  # span; only a flap sustaining faster than the ~180s floor always pages —
+  # tumbling windows, not sliding; round-10).
   period             = 900
   statistic          = "Sum"
   dimensions         = local.app_dimensions # { host = "tickvault-prod" }

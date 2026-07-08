@@ -60,15 +60,19 @@
 # market_open, so the counter can only increment 09:00-15:30 IST — there is
 # no post-close churn to suppress (unlike the order-update reconnect loop).
 #
-# TUNING (honest, aligned-window semantics): Sum >= 3 per ONE 900s period.
-# CloudWatch evaluates aligned tumbling 15-min windows, not a sliding window:
-# a burst of exactly 3 restarts straddling a window boundary (2+1) pages one
-# window later — or not at all if the flap stops at exactly 3. A SUSTAINED
-# flap keeps accumulating and always pages. Detection floor: flap cycles
-# slower than ~5 min (<3 restarts per 15-min window) do NOT page — stated
-# residual; a single self-heal restart never pages (the runbook's own
-# operator-action bound). Fast flaps (<~50s cycle) additionally trip the
-# errcode-feed-stall-01 storm-escalation tripwire within ~5 min.
+# TUNING (honest, aligned-window semantics — round-10 correction of the
+# straddle example): Sum >= 3 per ONE 900s period. CloudWatch evaluates
+# aligned tumbling 15-min windows, not a sliding window: a burst that STOPS
+# after straddling a window boundary at 2+1 pages NEVER (the earlier "pages
+# one window later" example was wrong — neither aligned window ever reaches
+# 3). The honest miss set is up to 4 restarts inside a SLIDING 15-min span
+# (2/2 across the boundary) — without a page; only a flap that KEEPS GOING
+# faster than the stated floor is guaranteed to land >=3 inside some aligned
+# window and page. Detection floor: flap cycles slower than ~5 min (<3
+# restarts per 15-min window) do NOT page — stated residual; a single
+# self-heal restart never pages (the runbook's own operator-action bound).
+# Fast flaps (<~50s cycle) additionally trip the errcode-feed-stall-01
+# storm-escalation tripwire within ~5 min.
 #
 # Future EMF-allowlisting: if the counter is ever added to the EMF
 # metric_selectors allowlist, REMOVE this log metric filter in the same PR
@@ -111,8 +115,10 @@ resource "aws_cloudwatch_metric_alarm" "feed_stall_restarts" {
   metric_name         = "tv_feed_sidecar_stall_restart_total"
   namespace           = local.app_namespace
   # 900s aligned window: Sum of per-scrape deltas = restarts in the window
-  # (see COUNTER SHAPE + TUNING header blocks; boundary-straddling 2+1 bursts
-  # page one window later or, if the flap stops at exactly 3, not at all).
+  # (see COUNTER SHAPE + TUNING header blocks; a burst that stops after
+  # straddling the boundary at 2+1 never pages — up to 4 restarts in a
+  # sliding 15-min span can go unpaged; only a flap sustaining faster than
+  # the stated floor always pages — round-10).
   period             = 900
   statistic          = "Sum"
   dimensions         = local.app_dimensions # { host = "tickvault-prod" }

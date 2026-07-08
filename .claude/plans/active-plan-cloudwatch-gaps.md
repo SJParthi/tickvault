@@ -34,9 +34,12 @@ zero hot-path code) + one TEST-file addition in `crates/common/tests/`
 > the envelope, stated in the handler), catching an UNLOGGED DH-906 reject
 > (term-filter tripwire only; Rust emit-site is a flagged follow-up), paging
 > a Groww stall-flap SLOWER than ~1 restart per 5 min (<3 counter increments
-> per aligned 900s window = the restart pager's floor; boundary-straddling
-> 2+1 bursts page one window later or, if the flap stops at exactly 3, not
-> at all — CloudWatch windows are aligned/tumbling, not sliding; the counter
+> per aligned 900s window = the restart pager's floor; a burst that stops
+> after straddling the aligned 900s boundary at 2+1 pages NEVER — up to 4
+> restarts (2 per side) inside a SLIDING 15-min span can go unpaged; only a
+> flap sustaining faster than the stated floor always pages — CloudWatch
+> windows are aligned/tumbling, not sliding (round-10 correction of the
+> earlier "pages one window later" example); the counter
 > is pre-registered at 0 in main.rs immediately AFTER the metrics recorder
 > installs at boot — round-5 fix; the round-4 supervisor-spawn registration
 > was VOID (the supervisor is spawned pre-install, so its handle resolved to
@@ -47,13 +50,16 @@ zero hot-path code) + one TEST-file addition in `crates/common/tests/`
 > the pre-install boot window would be uncounted — physically implausible), or
 > paging an order-update flap SLOWER than ~1 cycle per 3 min (>5
 > once-per-cycle increments per 900s window = the detection floor; the
-> 3-min+ slow-flap band is a stated residual; boundary-straddling >5-cycle
-> bursts — ≤5 per side of the aligned 900s boundary, e.g. 4+4 over ~12 min —
-> page one window later or, if the flap stops at the boundary, not at all;
-> tumbling windows, not sliding — round-8, mirrors the feed-stall clause; a
-> SUSTAINED flap always pages, so the 2026-07-06 all-session shape is
-> unaffected; an app restart costs at most
-> the agent's dropped first post-restart counter sample — restarts are owned
+> 3-min+ slow-flap band is a stated residual; a burst that stops after
+> straddling the aligned 900s boundary at ≤5 per side (e.g. 4+4-then-stop
+> over ~12 min) pages NEVER — up to 10 reconnects inside a SLIDING 15-min
+> span can go unpaged; tumbling windows, not sliding — round-10 correction
+> of the round-8 "pages one window later" example; only a flap sustaining
+> faster than the ~180s floor always pages, so the 2026-07-06 all-session
+> shape is unaffected; an app restart costs at most
+> the agent's dropped first post-restart counter sample (~8 increments
+> worst-case = one scrape-interval under the reconnect backoff ladder) —
+> restarts are owned
 > by the liveness alarms). Claiming more than this envelope = REJECT in
 > review.
 
@@ -124,9 +130,11 @@ flapper invisible) is the proof.
   implausible. NO market-hours gate needed:
   `should_restart_on_stall` requires market_open, so the counter cannot
   increment off-hours. Honest floor: flap cycles slower than ~5 min (<3
-  restarts per aligned 15-min window) do not page — stated residual;
-  boundary-straddling 2+1 bursts page one window later (tumbling windows,
-  not sliding). Fast flaps (<~50s cycle) also trip the P2 storm tripwire.
+  restarts per aligned 15-min window) do not page — stated residual; a
+  burst that stops after straddling the boundary at 2+1 never pages — up to
+  4 restarts in a sliding 15-min span can go unpaged (tumbling windows, not
+  sliding; round-10 correction of the "one window later" example). Fast
+  flaps (<~50s cycle) also trip the P2 storm tripwire.
 - **P3 reconnect-storm** (`order-update-reconnect-storm-alarm.tf`): the counter
   `tv_order_update_reconnections_total` (order_update_connection.rs:86/:254) is
   NOT in the 21-name EMF allowlist (ratcheted pin preserved) — extracted via a
@@ -142,10 +150,11 @@ flapper invisible) is the proof.
   exceed 5 for any cycle ≥ 60s; over 900s the documented ~90s incident
   cadence yields ~10 ≫ 5 while the ≤3-attempt close churn stays ≤3. Honest
   detection floor: cycles slower than ~180s do not page — stated residual.
-  Aligned tumbling windows, not sliding (round-8, mirrors the feed-stall
-  clause): a >5-cycle burst straddling the 900s boundary (≤5 per side) pages
-  one window later or, if the flap stops at the boundary, not at all; a
-  SUSTAINED flap always pages.
+  Aligned tumbling windows, not sliding (round-10 correction, mirrors the
+  feed-stall clause): a burst that stops after straddling the 900s boundary
+  at ≤5 per side pages NEVER — up to 10 reconnects in a sliding 15-min span
+  can go unpaged; only a flap sustaining faster than the ~180s floor always
+  pages.
   Honest residual: the delta shape is not live-verified from the sandbox —
   the post-apply runbook checks one /metrics event; if it proved cumulative,
   Sum overcounts and pages too EAGERLY, never silently misses).
@@ -179,9 +188,12 @@ flapper invisible) is the proof.
 
 - Counter reset on app restart → absorbed by the CW agent's per-scrape delta
   calculation (the first post-restart sample is dropped) — no negative or
-  latched artifact; already-shipped in-window deltas still count, so a storm
-  loses at most ONE increment to a mid-window restart (restarts themselves
-  are owned by the liveness alarms; round-2 review fix — the earlier
+  latched artifact; already-shipped in-window deltas still count, and a
+  mid-window restart loses up to one scrape-interval of increments — every
+  attempt between the task restart and the first post-restart 60s scrape,
+  ~8 worst-case under the 0ms/0.5s/1s/2s/4s/8s/16s/32s backoff ladder
+  (round-10 de-stale of the round-2-era "at most ONE increment" claim;
+  restarts themselves are owned by the liveness alarms; the earlier
   "negative DIFF datapoint" wording described the retired cumulative model).
 - First evening after merge: the CW agent's new machine/ collect entries have
   no saved state and default to `from_beginning=true`, so the newest matching
@@ -210,10 +222,12 @@ flapper invisible) is the proof.
 - Order-update flap SLOWER than ~1 cycle per 3 min (≤5 once-per-cycle
   increments per 900s window) never breaches `>5` → stated residual; the
   durable-down alarm owns full outages, nothing owns the 3-min+ slow-flap
-  band today (round-1 review honesty). Boundary-straddling >5-cycle bursts
-  (≤5 per side of the aligned 900s tumbling window) page one window later
-  or, if the flap stops at the boundary, not at all — a SUSTAINED flap
-  always pages (round-8; same clause the feed-stall pager already carried).
+  band today (round-1 review honesty). A burst that stops after straddling
+  the aligned 900s tumbling boundary at ≤5 per side (e.g. 4+4-then-stop)
+  never pages — up to 10 reconnects in a sliding 15-min span can go
+  unpaged; only a flap sustaining faster than the ~180s floor always pages
+  (round-10 correction of the round-8 "pages one window later" example;
+  same corrected clause the feed-stall pager carries).
 - Budget stop colliding with the holiday heuristic: the hourly
   hard-stop-guard's in-window breach_stop (its cron ticks at exactly 08:30
   IST) or the SNS budget-killswitch or a manual portal stop between
