@@ -405,9 +405,9 @@ fn compute_publish_value(in_session: bool, window: &mut [u64]) -> Option<f64> {
 /// the loop itself is a scheduler wrapper. The trailing-window snapshot +
 /// p99 are honestly **O(N-window), N ≤ 32,768** per tick of this COLD task —
 /// never claimed O(1).
-// TEST-EXEMPT: infinite tokio scheduler loop — every decision is a
-// unit-tested pure fn above; supervision + boot wiring are pinned by
-// `test_feed_lag_publisher_supervisor_is_wired_into_main` (secret_manager.rs).
+// (supervision + boot wiring are pinned by
+// `test_feed_lag_publisher_supervisor_is_wired_into_main` in secret_manager.rs)
+// TEST-EXEMPT: infinite tokio scheduler loop — every decision is a unit-tested pure fn above.
 pub async fn run_dhan_lag_publisher() {
     let mut scratch: Vec<u64> = Vec::with_capacity(RING_SLOTS);
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(PUBLISH_INTERVAL_SECS));
@@ -552,7 +552,7 @@ mod tests {
     }
 
     #[test]
-    fn test_p99_on_known_distribution() {
+    fn test_compute_window_p99_ns_on_known_distribution() {
         // 100 samples of 1..=100 seconds: p99 rank = ceil(0.99·100) = 99 →
         // 0-based idx 98 → value 99 s.
         let mut window: Vec<u64> = (1..=100u64).map(|s| s * NANOS_PER_SEC as u64).collect();
