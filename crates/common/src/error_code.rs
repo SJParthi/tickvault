@@ -297,6 +297,15 @@ pub enum ErrorCode {
     /// reconcile. Severity::Critical — auth is dead until the secret is
     /// fixed. AUTH-P11 (audit 2026-07-01).
     AuthGap04TotpRotatedExternally,
+    /// AUTH-GAP-05: sustained mid-session token-invalid — the mid-session
+    /// profile watchdog observed the consecutive-REAL-`/v2/profile`-failure
+    /// threshold during market hours and forced exactly ONE token re-mint
+    /// per failing episode via the existing renewal machinery
+    /// (lock-before-mint honored fail-closed; ~125s Dhan mint cooldown
+    /// honored; retry-once latch). Severity::High — the re-mint IS the
+    /// self-remediation; the standing CRITICAL profile page covers the
+    /// unrecovered case. (2026-07-06.)
+    AuthGap05ForcedRemintTriggered,
     /// BOOT-01: slow-boot QuestDB readiness deadline approaching (>30s).
     Boot01QuestDbSlow,
     /// BOOT-02: boot deadline exceeded (>60s) — HALTING.
@@ -894,6 +903,7 @@ impl ErrorCode {
             Self::Proc01OomKillDetected => "PROC-01",
             Self::AuthGap03TokenForceRenewedOnWake => "AUTH-GAP-03",
             Self::AuthGap04TotpRotatedExternally => "AUTH-GAP-04",
+            Self::AuthGap05ForcedRemintTriggered => "AUTH-GAP-05",
             Self::Boot01QuestDbSlow => "BOOT-01",
             Self::Boot02DeadlineExceeded => "BOOT-02",
             Self::Boot03ClockSkewExceeded => "BOOT-03",
@@ -1130,6 +1140,11 @@ impl ErrorCode {
             // host is under TLS/resolver/fd pressure; the site already
             // degraded gracefully, but the operator must see it (High).
             | Self::HttpClient01BuildFailed
+            // AUTH-GAP-05 (2026-07-06) — sustained mid-session token-invalid
+            // forced a re-mint. High: the re-mint IS the self-remediation
+            // (auto-triage safe); the existing CRITICAL profile page covers
+            // the unrecovered case.
+            | Self::AuthGap05ForcedRemintTriggered
             // GROWW-SCALE-01/02 (§34 2026-07-03) — the auto-scale ladder
             // rolled back a failed rung / halved on fleet-wide failure. The
             // auto-correction already applied; the operator must see every
@@ -1329,6 +1344,9 @@ impl ErrorCode {
             // AUTH-P11 (2026-07-01) — TOTP secret rotated externally (promotes
             // the RESERVED AUTH-GAP-04 stub in wave-4-error-codes.md).
             | Self::AuthGap04TotpRotatedExternally
+            // AUTH-GAP-05 (2026-07-06) — sustained mid-session token-invalid:
+            // forced re-mint triggered (runbook §AUTH-GAP-05).
+            | Self::AuthGap05ForcedRemintTriggered
             // BP-08 (2026-07-01) — fd / RSS / spill-free early-warning monitors
             // (promotes the RESERVED RESOURCE-01/02/03 stubs).
             | Self::Resource01FdCountHigh
@@ -1503,6 +1521,7 @@ impl ErrorCode {
             Self::Proc01OomKillDetected,
             Self::AuthGap03TokenForceRenewedOnWake,
             Self::AuthGap04TotpRotatedExternally,
+            Self::AuthGap05ForcedRemintTriggered,
             Self::Boot01QuestDbSlow,
             Self::Boot02DeadlineExceeded,
             Self::Boot03ClockSkewExceeded,
@@ -1903,7 +1922,11 @@ mod tests {
         // bumped 130 -> 131 for TELEGRAM-03 (episode machinery degraded:
         // store_write_failed / rehydrate_corrupt / edit_fallback_storm —
         // delivery unaffected, UX-only degrade, Severity::Low).
-        assert_eq!(ErrorCode::all().len(), 131);
+        // 2026-07-06 (AUTH-GAP-05 token self-heal): bumped 131 -> 132 for
+        // AUTH-GAP-05 (sustained mid-session token-invalid — forced re-mint
+        // triggered via the existing renewal machinery; lock-before-mint +
+        // ~125s cooldown + retry-once latch honored).
+        assert_eq!(ErrorCode::all().len(), 132);
     }
 
     #[test]
