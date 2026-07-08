@@ -5,8 +5,17 @@
 //! 32,768-slot atomic arrays, allocated OUTSIDE the profiler window below),
 //! every `record_dhan_tick` call is two relaxed atomic stores + one relaxed
 //! head bump — ZERO heap allocation. A regression that adds `.clone()`,
-//! `format!()`, `Vec::new()`, or a per-call `Key` allocation in the metrics
-//! macro path would blow the budget immediately across 10K calls.
+//! `format!()`, or `Vec::new()` to the admitted path would blow the budget
+//! immediately across 10K calls.
+//!
+//! HONEST COVERAGE (round-1 fix, finding 8): the profiled loop feeds only
+//! fresh-capture non-negative samples, i.e. the steady-state
+//! `Admitted { clamped: false }` arm — the ONLY `record_dhan_tick` arm with
+//! NO metrics call. The `ExcludedReplay` and `Admitted { clamped: true }`
+//! arms each call `metrics::counter!` per event and are NOT inside the
+//! profiler window, so a per-call allocation introduced THERE (e.g. a
+//! future labeled counter Key) is NOT caught by this ratchet — those arms
+//! fire only on replay drains / clock skew, not on the steady-state path.
 //!
 //! Budget: ≤ 1 KiB / ≤ 8 blocks across 10,000 calls — small enough to catch
 //! any per-call allocation (even 1 byte/call = 10 KB), with headroom for
@@ -25,8 +34,9 @@ const NANOS_PER_SEC: i64 = 1_000_000_000;
 
 #[test]
 fn record_dhan_tick_hot_path_zero_allocation() {
-    // 2026-07-06 ~10:00 IST as UTC nanos.
-    let t0_utc_secs: i64 = 1_782_950_400 + 4 * 3600 + 1800;
+    // 2026-07-06 ~10:00 IST as UTC nanos (2026-07-06 00:00 UTC =
+    // 1_783_296_000 epoch secs; verified `date -u -d @1783296000`).
+    let t0_utc_secs: i64 = 1_783_296_000 + 4 * 3600 + 1800;
     let t0_utc_nanos: i64 = t0_utc_secs * NANOS_PER_SEC;
     let exchange_ist_secs: u32 = u32::try_from(t0_utc_secs + 19_800).unwrap_or(u32::MAX);
 

@@ -468,7 +468,10 @@ class Latency(unittest.TestCase):
         self.assertEqual(feed, "dhan")
         self.assertEqual(row["rows"], 0)
         self.assertEqual(row["neg_clamped"], 0)
-        self.assertEqual(row["replay_excluded"], 0)
+        # Empty replay cell → None (n/a), never a fake verified-0
+        # (finding 10: the excluder is dhan-only; non-dhan feeds emit a
+        # NULL leg, and a degraded dhan tail is "unknown", not "0").
+        self.assertIsNone(row["replay_excluded"])
         for col in handler._PCTL_COLS:
             self.assertIsNone(row[col])
         # Mixed null/NaN spellings are handled per cell.
@@ -478,7 +481,14 @@ class Latency(unittest.TestCase):
         self.assertIsNone(row["p95_ms"])
         self.assertEqual(row["p99_ms"], 5.0)
         self.assertEqual(row["max_ms"], 9.0)
+        self.assertIsNone(row["replay_excluded"])
+        # An explicit 0 stays 0 (a dhan window with genuinely nothing
+        # excluded is a real measurement, distinct from n/a).
+        _, row = handler._parse_pctl_row("dhan,100,0,1,1,1,1,1,0")
         self.assertEqual(row["replay_excluded"], 0)
+        # groww: NULL leg by construction → None → the page renders "—".
+        _, row = handler._parse_pctl_row("groww,100,0,1,1,1,1,1,null")
+        self.assertIsNone(row["replay_excluded"])
 
     def test_parse_pctl_row_rejects_malformed_and_bad_tokens(self) -> None:
         # A failed on-box query leaves an empty tail → skipped, not fabricated.
@@ -596,10 +606,13 @@ class Latency(unittest.TestCase):
             "dateadd('m', 330, now()))",
             joined,
         )
-        # EXACT replay excluder: capture_seq (UTC wall nanos, preserved
-        # through WAL re-injection) → µs → +19,800,000,000 µs IST alignment;
-        # admitted rows have receipt−capture < 60s, the excluded complement
-        # is COUNTED (Rule-11 companion) in the same statement.
+        # EXACT replay excluder — DHAN ONLY (finding 10): capture_seq is a
+        # UTC-wall-nanos receipt stamp only for dhan (groww capture_seq is
+        # exchange-ts-seeded, so the predicate would censor genuine groww
+        # lag >60s and exclude nothing replayed). The shell branches per
+        # feed: dhan gets the excluder + counted complement; every other
+        # feed gets NO excluder and a NULL replay_excluded leg (n/a).
+        self.assertIn('if [ "$f" = dhan ]; then', joined)
         self.assertIn(
             "cast(capture_seq / 1000 + 19800000000 as timestamp)", joined
         )
@@ -614,6 +627,21 @@ class Latency(unittest.TestCase):
             "cast(capture_seq / 1000 + 19800000000 as timestamp))",
             joined,
         )
+        self.assertIn(
+            "cast(null as long) replay_excluded from long_sequence(1)", joined
+        )
+        # The non-dhan SQL variant must carry NO capture-based predicate.
+        plain = handler._pctl_feed_sql(replay_excluder=False)
+        self.assertNotIn("capture_seq", plain)
+        # Sample bound ordered by the population's own key (finding 2):
+        # receive time, never exchange-ts (which would evict the
+        # most-lagged rows first when the 50K cap binds).
+        for sql in (plain, handler._pctl_feed_sql(replay_excluder=True)):
+            self.assertIn(
+                f"order by received_at desc limit {handler._PCTL_SAMPLE_CAP}",
+                sql,
+            )
+            self.assertNotIn("order by ts desc", sql)
         # Feed tokens from the DB are allowlist-validated BEFORE they are
         # interpolated into the per-feed SQL, and the loop is capped.
         self.assertIn(handler._PCTL_FEED_TOKEN_RE, joined)

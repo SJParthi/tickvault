@@ -1950,6 +1950,25 @@ async fn main() -> Result<()> {
                 .await;
             });
             info!("FAST BOOT COMPLETE — tick processor started, ticks flowing (in-memory)");
+            // Silent-feed hardening Item 4 (2026-07-07 round-1 fix): spawn
+            // the Dhan exchange-lag p99 publisher on the FAST crash-recovery
+            // arm too. This arm `return run_shutdown_fast(...)`s and never
+            // reaches `start_dhan_lane`, so without this spawn a mid-market
+            // crash restart (the WS-GAP-09 exit(2) → systemd restart class)
+            // left `tv_dhan_exchange_lag_p99_seconds` unpublished for the
+            // rest of the session while the ring kept being written — and
+            // the lag alarm treats missing data as notBreaching, so the
+            // darkness was silent (exactly the 2026-07-06 incident class).
+            // Same once-per-process guard as the slow-lane site below.
+            if FEED_LAG_PUBLISHER_SUPERVISOR_SPAWNED.swap(true, std::sync::atomic::Ordering::SeqCst)
+            {
+                info!(
+                    "feed-lag publisher supervisor already running — skipping duplicate spawn \
+                     (fast boot)"
+                );
+            } else {
+                let _feed_lag_publisher_supervisor = spawn_supervised_feed_lag_publisher();
+            }
             // Phase 2.12 (hostile L1 fix): emit a boot-mode gauge so
             // operators can chart fast/slow boot history. Fast boot
             // intentionally passes None for tick_enricher (recovery

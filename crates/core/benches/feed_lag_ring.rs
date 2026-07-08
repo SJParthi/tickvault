@@ -22,9 +22,13 @@ const NANOS_PER_SEC: i64 = 1_000_000_000;
 
 /// Steady-state hot-path ring write on the process-global ring (the exact
 /// production entry point: dwell check + clock alignment + two relaxed
-/// stores + head bump).
+/// stores + head bump). HONEST COVERAGE: like the DHAT ratchet, this
+/// measures the `Admitted { clamped: false }` steady-state arm only — the
+/// metrics-emitting `ExcludedReplay` / clamped arms are not in the loop.
 fn bench_record_dhan_tick(c: &mut Criterion) {
-    let t0_utc_secs: i64 = 1_782_950_400 + 4 * 3600 + 1800;
+    // 2026-07-06 ~10:00 IST as UTC nanos (2026-07-06 00:00 UTC =
+    // 1_783_296_000 epoch secs).
+    let t0_utc_secs: i64 = 1_783_296_000 + 4 * 3600 + 1800;
     let t0_utc_nanos: i64 = t0_utc_secs * NANOS_PER_SEC;
     let exchange_ist_secs: u32 = u32::try_from(t0_utc_secs + 19_800).unwrap_or(u32::MAX);
 

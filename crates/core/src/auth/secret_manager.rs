@@ -1381,6 +1381,42 @@ mod tests {
              Item 4). A bare tokio::spawn regresses the SLO-03 \
              silent-death class for the lag gauge."
         );
+        // Round-1 fix (2026-07-07, findings 1/6/9): the supervisor MUST be
+        // spawned from BOTH boot arms — the FAST crash-recovery arm
+        // (which `return run_shutdown_fast(...)`s before `start_dhan_lane`
+        // is ever reached) AND the slow lane (`start_dhan_lane`). One-site
+        // wiring left the lag gauge dark for the whole session after any
+        // mid-market crash restart (WS-GAP-09 exit(2) → systemd restart)
+        // while the lag alarm silently read notBreaching on missing data.
+        // Exactly 2 non-comment, non-definition call sites, each behind the
+        // once-per-process guard.
+        let supervisor_call_sites = main_rs
+            .lines()
+            .filter(|l| {
+                let t = l.trim_start();
+                !t.starts_with("//")
+                    && !t.starts_with("///")
+                    && !t.contains("fn spawn_supervised_feed_lag_publisher")
+                    && t.contains("spawn_supervised_feed_lag_publisher(")
+            })
+            .count();
+        assert_eq!(
+            supervisor_call_sites, 2,
+            "spawn_supervised_feed_lag_publisher must have EXACTLY 2 call \
+             sites in main.rs (fast crash-recovery arm + start_dhan_lane); \
+             found {supervisor_call_sites}. Removing the fast-boot spawn \
+             silently darkens the lag alarm for every mid-market crash \
+             restart session (notBreaching on missing data)."
+        );
+        let guarded_sites = main_rs
+            .matches("FEED_LAG_PUBLISHER_SUPERVISOR_SPAWNED.swap(true")
+            .count();
+        assert_eq!(
+            guarded_sites, 2,
+            "both feed-lag publisher spawn sites must sit behind the \
+             once-per-process FEED_LAG_PUBLISHER_SUPERVISOR_SPAWNED guard \
+             (found {guarded_sites} guarded sites; expected 2)"
+        );
         // The supervisor must be the ONLY spawn path for the publisher
         // loop: exactly one non-comment call site of the inner loop fn
         // (inside the supervisor), so nobody re-introduces a second,

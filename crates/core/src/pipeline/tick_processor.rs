@@ -1393,8 +1393,14 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
                 // re-injection, while received_at is re-stamped at dequeue),
                 // so genuinely-lagged live ticks are KEPT — no Rule-11
                 // censoring of the measured signal. Sits AFTER every gate
-                // (valid/today/in-window/dedup) so only in-session live Dhan
-                // data feeds the lag window.
+                // (valid/today/in-window/dedup). Honest caveat: §30
+                // window-exempt always-on SIDs (GIFT Nifty) bypass the
+                // window gates above, so their OFF-session live ticks ARE
+                // recorded into the ring — the publisher's session gate
+                // (feed_lag_monitor::is_in_session_ist, regular + Muhurat
+                // windows) keeps those samples from being PUBLISHED
+                // off-session; the first in-session minute can include up
+                // to 60s of pre-window always-on samples.
                 super::feed_lag_monitor::record_dhan_tick(
                     tick.received_at_nanos,
                     capture_seq,

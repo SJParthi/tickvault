@@ -37,10 +37,10 @@
   - Tests: test_emf_metric_selectors_name_count_is_twenty_three, test_reference_cloudwatch_agent_json_matches_deployed_emf_declaration, test_boundary_catchup_alarm_uses_per_feed_dimensions
   - Impl: second [["host","feed"]] emf metric_declaration in cloudwatch-agent.json + user-data.sh.tftpl (byte-identical); silent-feed-alarms.tf `boundary_catchup_storm_dhan` (explicit {host,feed=dhan} dims, Sum/300s, PROVISIONAL 2000, 2-of-2); ratchets: EMF pin 21->23, alarm-count 17->20 (scan extended to silent-feed-alarms.tf), test_second_emf_declaration_publishes_boundary_catchup_per_feed; aws-budget.md dated cost note
 
-- [x] Item 4 — THE ONLY RUST ITEM: new gauge `tv_dhan_exchange_lag_p99_seconds` (unlabeled, dhan-only NAME — sidesteps the host-only EMF dimension label-folding trap; a future Groww gauge gets its own name). HOT PATH (tick_processor.rs dhan persist site, `received_at_nanos` + `capture_seq` in scope — verify at impl time): `lag_ns = received_at_nanos.saturating_sub(exchange_ts × 1e9)`, clamp negatives to 0 (count clamps), write into a preallocated single-writer 32,768-slot ring with relaxed atomic head (~65s headroom at 500 ticks/s) — O(1), zero-alloc, DHAT + Criterion ratcheted + benchmark-budgets entry. REPLAY EXCLUSION discriminator: admit only if `received_at_nanos − capture_seq < REPLAY_EXCLUDE_DWELL_NANOS = 60_000_000_000` (named constant) — capture_seq is stamped once at the original WS-read instant and PRESERVED through WAL re-injection while received_at is RE-stamped at dequeue, so a replayed row shows receipt−capture = downtime (≥minutes, excluded EXACTLY) while genuinely-lagged live rows (the incident's real 46s/199s) have FRESH capture instants and are KEPT — no Rule-11 censoring of the measured signal. Every exclusion increments `tv_dhan_lag_samples_excluded_total` (/metrics-only; visible, never silent). PUBLISHER: supervised 10s cold task (WS-GAP-05/SLO-03 respawn pattern) in NEW module `crates/core/src/pipeline/feed_lag_monitor.rs`, spawned in `start_dhan_lane` next to the SLO publisher: snapshot trailing-60s window into preallocated scratch, p99 via `select_nth_unstable` — honestly labeled **O(N-window)**, N≤32,768, off the tick thread (NEVER claimed O(1)). Publish ONLY when (a) inside the trading session (Rule 3 — prevents the stale-gauge-after-close artifact) AND (b) window holds ≥ `MIN_LAG_SAMPLES = 50` (empty/thin window publishes NOTHING — 0 = "perfect lag" is a Rule-11 false-OK; feed-dead is owned by the silent-instruments + WS alarms via notBreaching). QUANTIZATION HONESTY (module doc + alarm_description + metrics catalog + portal caveat): Dhan LTT is u32 whole IST SECONDS → ≥1s floor; healthy p99 reads ~1–2s and can never read 0; sub-second wire lag UNMEASURABLE for feed=dhan; alarm threshold sits 10× above the floor. EXPORT: add the gauge to both allowlist regexes (+$0.30/mo, part of the 21→23 pin bump). ALARM (`silent-feed-alarms.tf`): `dhan_exchange_lag_p99_high` — `GreaterThanThreshold` 10 (seconds), period=60, statistic=Maximum, strict 10-of-10 (safe HERE unlike items 1/2: the metric is itself a trailing-60s p99 recomputed every 10s, so a one-burst transient decays out within ~60s and cannot hold 10 consecutive breaching minutes; incident all-day p99 46s pages at minute 10), `notBreaching`, `actions_enabled=false` + gate.
+- [x] Item 4 — THE ONLY RUST ITEM: new gauge `tv_dhan_exchange_lag_p99_seconds` (unlabeled, dhan-only NAME — sidesteps the host-only EMF dimension label-folding trap; a future Groww gauge gets its own name). HOT PATH (tick_processor.rs dhan persist site, `received_at_nanos` + `capture_seq` in scope — verify at impl time): `lag_ns = received_at_nanos.saturating_sub(exchange_ts × 1e9)`, clamp negatives to 0 (count clamps), write into a preallocated single-writer 32,768-slot ring with relaxed atomic head (~65s headroom at 500 ticks/s) — O(1), zero-alloc, DHAT + Criterion ratcheted + benchmark-budgets entry. REPLAY EXCLUSION discriminator: admit only if `received_at_nanos − capture_seq < REPLAY_EXCLUDE_DWELL_NANOS = 60_000_000_000` (named constant) — capture_seq is stamped once at the original WS-read instant and PRESERVED through WAL re-injection while received_at is RE-stamped at dequeue, so a replayed row shows receipt−capture = downtime (≥minutes, excluded EXACTLY) while genuinely-lagged live rows (the incident's real 46s/199s) have FRESH capture instants and are KEPT — no Rule-11 censoring of the measured signal. Every exclusion increments `tv_dhan_lag_samples_excluded_total` (CloudWatch-exported — in the 23-name EMF allowlist, ~$0.30/mo; visible, never silent. Round-1 correction: earlier drafts said "/metrics-only" — the shipped allowlists + cost notes + EMF ratchet export it, and the docs now match the deploy). PUBLISHER: supervised 10s cold task (WS-GAP-05/SLO-03 respawn pattern) in NEW module `crates/core/src/pipeline/feed_lag_monitor.rs`, spawned ONCE per process from BOTH boot arms (round-1 fix, findings 1/6/9: the FAST crash-recovery arm returns via `run_shutdown_fast` and never reaches `start_dhan_lane` — lane-only wiring left the gauge silently dark after any mid-market crash restart; both sites share the once-per-process guard, pinned by the 2-call-site ratchet): snapshot trailing-60s window into preallocated scratch, p99 via `select_nth_unstable` — honestly labeled **O(N-window)**, N≤32,768, off the tick thread (NEVER claimed O(1)). Publish ONLY when (a) inside a trading-session window — the regular [09:00,15:30) IST persist window OR the Muhurat [18:00,19:30) window when the boot flag is set (round-1 fix, finding 5: mirrors the persist sites' `is_within_persist_window(_, muhurat_active)`; Muhurat coverage is gauge-visibility only — the CW window-gate Lambda still enables actions 09:20–15:35 only; §30 window-exempt always-on SIDs can put off-session samples in the RING, the gate only controls PUBLISHING) — (Rule 3, prevents the stale-gauge-after-close artifact) AND (b) window holds ≥ `MIN_LAG_SAMPLES = 50` (empty/thin window publishes NOTHING — 0 = "perfect lag" is a Rule-11 false-OK; feed-dead is owned by the silent-instruments + WS alarms via notBreaching). QUANTIZATION HONESTY (module doc + alarm_description + metrics catalog + portal caveat): Dhan LTT is u32 whole IST SECONDS → ≥1s floor; healthy p99 reads ~1–2s and can never read 0; sub-second wire lag UNMEASURABLE for feed=dhan; alarm threshold sits 10× above the floor. EXPORT: add the gauge to both allowlist regexes (+$0.30/mo, part of the 21→23 pin bump). ALARM (`silent-feed-alarms.tf`): `dhan_exchange_lag_p99_high` — `GreaterThanThreshold` 10 (seconds), period=60, statistic=Maximum, strict 10-of-10 (safe HERE unlike items 1/2: the metric is itself a trailing-60s p99 recomputed every 10s, so a one-burst transient decays out within ~60s and cannot hold 10 consecutive breaching minutes; incident all-day p99 46s pages at minute 10), `notBreaching`, `actions_enabled=false` + gate.
   - Files: crates/core/src/pipeline/feed_lag_monitor.rs, crates/core/src/pipeline/tick_processor.rs, crates/core/src/pipeline/mod.rs, crates/app/src/main.rs, deploy/aws/cloudwatch-agent.json, deploy/aws/terraform/user-data.sh.tftpl, deploy/aws/terraform/silent-feed-alarms.tf, deploy/aws/terraform/market-hours-liveness-alarm.tf, quality/benchmark-budgets.toml, crates/core/tests/dhat_feed_lag_ring.rs
   - Tests: test_replay_dwell_boundary_excludes_at_exactly_60s, test_thin_window_publishes_nothing, test_p99_on_known_distribution, test_ring_wraparound, test_negative_lag_clamped, test_out_of_session_publishes_nothing
-  - Impl: crates/core/src/pipeline/feed_lag_monitor.rs (32,768-slot single-writer ring, strict-< 60s replay dwell, IST clock alignment, p99 via select_nth_unstable labeled O(N-window)); tick_processor.rs record_dhan_tick at BOTH Dhan persist sites; main.rs spawn_supervised_feed_lag_publisher in start_dhan_lane; silent-feed-alarms.tf `dhan_exchange_lag_p99_high` (>10s, 10-of-10); dhat_feed_lag_ring.rs + benches/feed_lag_ring.rs + benchmark-budgets.toml entries; secret_manager.rs wiring ratchet; metrics_catalog.rs doc registration
+  - Impl: crates/core/src/pipeline/feed_lag_monitor.rs (32,768-slot single-writer ring, strict-< 60s replay dwell, IST clock alignment, p99 via select_nth_unstable labeled O(N-window), Muhurat-aware session gate); tick_processor.rs record_dhan_tick at BOTH Dhan persist sites; main.rs spawn_supervised_feed_lag_publisher at BOTH boot arms (fast crash-recovery + start_dhan_lane, once-per-process guard); silent-feed-alarms.tf `dhan_exchange_lag_p99_high` (>10s, 10-of-10); dhat_feed_lag_ring.rs + benches/feed_lag_ring.rs + benchmark-budgets.toml entries; secret_manager.rs wiring ratchet (2-call-site pin); metrics_catalog.rs doc registration
 
 - [x] Item 5 — Rewrite `_pctl_feed_sql` + the feed-discovery query in the operator-portal Lambda with the two-layer predicate + IST-now correction. VERIFIED LATENT BUG folded in: `ts` and `received_at` are stored IST-SHIFTED while QuestDB `now()` is UTC → the current `ts > dateadd('m',-10,now())` is really a ~5h40m window (root cause of the all-day replay conflation), AND an exchange-time window LAG-CENSORS (any row whose lag exceeds the window has ts outside it — the panel structurally cannot show lag above its own window, Rule-11 false-OK). All predicates use `IST_now := dateadd('m', 330, now())`, population defined by RECEIVE time. Exact new inner WHERE (per feed $f): `feed = '$f' AND received_at != null AND ts > dateadd('h', -6, IST_now) AND received_at >= dateadd('s', -120, IST_now) AND received_at < dateadd('s', 60, cast(capture_seq / 1000 + 19800000000 as timestamp))`. Roles: (1) K=120s receive-recency — honest population "rows received in the last 2 minutes" (6K–60K rows at incident rates → stable p99); (2) EXACT replay excluder (capture_seq nanos → micros → +19800000000µs IST alignment): frame-WAL re-injection re-stamps received_at but preserves capture_seq, so replayed rows show receipt−capture = downtime and are excluded EVEN INSIDE the drain window; genuinely-lagged live rows (46s/199s) pass; groww never excluded by construction (sidecar capture_ns predates bridge capture_seq → receipt−capture ≤ 0); TVW2 spill-drain rows preserve original received_at (correctly kept); (3) 6h ts bound = partition-pruning ONLY (`ticks` is PARTITION BY HOUR on ts; received_at is not the designated timestamp — without it, full-table scan); the implied >6h-lag ceiling is documented. Rule-11 additions: (a) companion cheap count of the excluded complement per feed, rendered in the panel ("N replay-restamped rows excluded"); (b) rows==0 renders "no rows received in last 120s" — never zero-valued percentiles; (c) extend the existing whole-second caveat block with the 6h ceiling + replay-exclusion + ≥1s Dhan LTT floor. Keep `received_at != null` (Groww NULL receipt legitimate) and `ORDER BY ts DESC LIMIT 50000`. Feed-discovery query gets the same IST fix with the 6h window. Live verification best-effort, non-blocking: `select now()` should confirm UTC; if the box returns IST, drop the `dateadd('m',330)` terms — nothing else changes; default: ship WITH the +330m shift.
   - Files: deploy/aws/lambda/operator-control/handler.py
@@ -118,8 +118,17 @@ Total cost ~$1.20/mo — dated header comment + aws-budget.md note.
    never a negative sample.
 5. **Groww rows at the dhan site:** the ring write is wired at the DHAN
    persist site only; the dhan-only metric NAME prevents label folding even
-   if routing ever changed — and the Item 5 SQL excluder is a no-op for
-   groww by construction (receipt−capture ≤ 0).
+   if routing ever changed. Item 5 SQL excluder for groww (round-1
+   correction, finding 10 — the earlier "no-op by construction,
+   receipt−capture ≤ 0" rationale was FALSE): groww `capture_seq` is
+   seeded from the tick's EXCHANGE timestamp in IST nanos
+   (`groww_bridge.rs` `next_capture_seq(ts_ist_nanos)` — replay-stable,
+   NOT a receipt stamp), so receipt−capture equals the positive lag. The
+   dhan discriminator would censor genuine groww lag >60s and would NOT
+   exclude replay-restamped groww rows — so the excluder is FEED-AWARE
+   (applied to `feed='dhan'` only); groww's "replay rows excluded" renders
+   "—" (n/a, documented limitation — replay-restamped groww rows are not
+   distinguishable via capture_seq), never a fake verified-0.
 6. **Thin window (pre-open trickle, holiday, feed warming up):** <50 samples
    in the trailing 60s → publish NOTHING (never 0 = "perfect lag");
    notBreaching keeps the alarm quiet; feed-dead ownership stays with the
@@ -159,6 +168,13 @@ Total cost ~$1.20/mo — dated header comment + aws-budget.md note.
    pattern) with a respawn counter; a flapping publisher is visible, and a
    dead-forever publisher leaves the gauge UNSET → missing data →
    notBreaching (silent-instruments + WS alarms still own feed-dead).
+   **Never-spawned case (round-1 fix, findings 1/6/9):** the supervisor is
+   spawned from BOTH boot arms (fast crash-recovery + start_dhan_lane)
+   behind a once-per-process guard, and the secret_manager.rs ratchet pins
+   exactly 2 guarded call sites — removing either boot-path spawn fails
+   the build (a lane-only spawn left the gauge dark for the whole session
+   after a mid-market crash restart, silently, because the lag alarm is
+   notBreaching on missing data).
 3. **Ring writer starved / tick thread stalls:** no new samples → thin
    window → publisher publishes nothing (never stale-republishes) — the
    stall itself is owned by the existing tick-gap/WS alarms.
@@ -220,10 +236,11 @@ Total cost ~$1.20/mo — dated header comment + aws-budget.md note.
   `silent-feed-alarms.tf` are deleted wholesale (new file, no shared state);
   Item 1 reverts in place to threshold 100 (same resource address, no state
   surgery); the gate-Lambda ALARM_NAMES join reverts with the same apply.
-- **Rust:** the ring write + publisher are behind the dhan lane
-  (`start_dhan_lane`) — reverting the commit removes the gauge; the metric
-  simply stops being published (missing data = notBreaching, no false page
-  during rollback).
+- **Rust:** reverting the commit removes the ring write (both Dhan persist
+  sites in `run_tick_processor` — which runs on BOTH boot arms, fast and
+  slow) and the publisher spawns (both boot arms, once-per-process guard);
+  the metric simply stops being published (missing data = notBreaching, no
+  false page during rollback).
 - **Portal SQL:** single-function revert of `_pctl_feed_sql` (+ the
   feed-discovery query) in handler.py restores the previous behavior
   verbatim.
@@ -233,10 +250,12 @@ Total cost ~$1.20/mo — dated header comment + aws-budget.md note.
 ## Observability
 
 - **New metrics:** `tv_dhan_exchange_lag_p99_seconds` (gauge, in-session
-  only, ≥50-sample gate), `tv_dhan_lag_samples_excluded_total`
-  (/metrics-only exclusion visibility — never silent censoring), publisher
-  respawn counter (WS-GAP-05-pattern `{reason}` labels), per-feed
-  `tv_boundary_catchup_total` CW series (host,feed dims).
+  only — regular + Muhurat windows — ≥50-sample gate),
+  `tv_dhan_lag_samples_excluded_total` (exclusion visibility — never
+  silent censoring; CloudWatch-exported, part of the 23-name EMF
+  allowlist), `tv_dhan_lag_negative_clamped_total` (/metrics-only),
+  publisher respawn counter (WS-GAP-05-pattern `{reason}` labels),
+  per-feed `tv_boundary_catchup_total` CW series (host,feed dims).
 - **New/retuned alarms (4):** `tick_gap_instruments_silent` (retuned 25,
   10-of-12), `realtime_guarantee_degraded` (<0.95, 12-of-15),
   `boundary_catchup_storm_dhan` (Sum/5m >2000 PROVISIONAL, 2-of-2),
@@ -261,7 +280,7 @@ Total cost ~$1.20/mo — dated header comment + aws-budget.md note.
 | 100% code checks | banned-pattern + pub-fn-test + pub-fn-wiring + plan-verify + secret-scan + pre-commit gates | pre-push mandatory | all gates green before PR |
 | 100% code performance | DHAT zero-alloc on the ring write + Criterion + benchmark-budgets entry; publisher honestly O(N-window) COLD | `scripts/bench-gate.sh` | Item 4 is the only hot-path item |
 | 100% monitoring | the deliverable IS monitoring: 1 new gauge + 1 exclusion counter + 1 respawn counter + per-feed CW series + 4 alarms | CW console + `/metrics` | Observability section |
-| 100% logging | publisher respawn logs `error!` with an ErrorCode `code =` field (WS-GAP-05 pattern); no new silent path | errors.jsonl | Item 4 |
+| 100% logging | publisher respawn logs `error!` + respawn counter (WS-GAP-05 supervisor pattern); deliberately NO new ErrorCode / `code =` field (least-new-surface decision documented at the supervisor doc comment — the tag-guard requires `code =` only when the message mentions a tracked code, which this one does not); no new silent path | errors.jsonl | Item 4 |
 | 100% alerting | 4 window-gated CW alarms → SNS → Telegram; notBreaching + M-of-N semantics documented per alarm | gate-Lambda ALARM_NAMES pin | Items 1–4 |
 | 100% security | no secrets, no new inputs, no unsafe; Lambda SQL interpolates only a fixed internal feed-name set (no user input) | secret-scan + cargo audit | all items |
 | 100% security hardening | no new attack surface (no new endpoints, no new deps) | post-deploy IP verify unchanged | N/A — observability-only change |

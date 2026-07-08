@@ -17,9 +17,12 @@
 //! p99 remains a valid sample-based estimate of the window).
 //!
 //! **Cold path (honestly O(N), NEVER O(1)):** a supervised 10 s publisher
-//! task ([`run_dhan_lag_publisher`], spawned from `start_dhan_lane` in
-//! `main.rs` next to the SLO publisher) snapshots the trailing-60s window
-//! into a preallocated scratch buffer and computes p99 via
+//! task ([`run_dhan_lag_publisher`], spawned once per process from BOTH
+//! `main.rs` boot arms — the FAST crash-recovery arm AND `start_dhan_lane`
+//! (next to the SLO publisher); the fast arm never reaches
+//! `start_dhan_lane`, so lane-only wiring left the gauge dark for the whole
+//! session after any mid-market crash restart) snapshots the trailing-60s
+//! window into a preallocated scratch buffer and computes p99 via
 //! `select_nth_unstable` — **O(N-window), N ≤ 32,768** — off the tick thread.
 //!
 //! # Clock alignment (CRITICAL — see `data-integrity.md`)
@@ -40,22 +43,39 @@
 //! RE-stamped at dequeue — so a replayed row shows receipt−capture = downtime
 //! (≥ minutes, excluded EXACTLY), while a genuinely-lagged LIVE row (the
 //! incident's real 46s/199s) has a FRESH capture instant and is KEPT. Every
-//! exclusion increments `tv_dhan_lag_samples_excluded_total` (/metrics-only —
-//! visible, never silent).
+//! exclusion increments `tv_dhan_lag_samples_excluded_total` (CloudWatch-
+//! exported — it is in the 23-name EMF allowlist, ~$0.30/mo — visible,
+//! never silent).
 //!
 //! # Publish gating (audit Rules 3 + 11)
 //!
-//! The gauge is set ONLY when (a) the wall clock is inside the trading
-//! session persist window [09:00, 15:30) IST — Rule 3, prevents the
-//! stale-gauge-after-close artifact — AND (b) the trailing-60s window holds
-//! ≥ [`MIN_LAG_SAMPLES`] samples (an empty/thin window publishes NOTHING —
-//! `0` would read as "perfect lag", a Rule-11 false-OK; feed-dead detection
-//! is owned by the silent-instruments + WS alarms via `notBreaching`).
-//! Honest envelope: when publishing stops, the /metrics exporter keeps
-//! serving the LAST set value (the `metrics` facade cannot un-register a
-//! gauge) — the CloudWatch window-gate Lambda (09:20–15:35 IST) + the
-//! sibling feed-dead alarms own that tail, exactly as for the
-//! silent-instruments gauge.
+//! The gauge is set ONLY when (a) the wall clock is inside a trading
+//! session window — the regular [09:00, 15:30) IST persist window, OR the
+//! Muhurat [18:00, 19:30) IST window when today is a Muhurat session
+//! (boot-set flag, `tickvault_common::muhurat::current()`) — the SAME
+//! windows that gate the producing persist sites (Rule 3, prevents the
+//! stale-gauge-after-close artifact) — AND (b) the trailing-60s window
+//! holds ≥ [`MIN_LAG_SAMPLES`] samples (an empty/thin window publishes
+//! NOTHING — `0` would read as "perfect lag", a Rule-11 false-OK;
+//! feed-dead detection is owned by the silent-instruments + WS alarms via
+//! `notBreaching`).
+//!
+//! Honest envelope, three documented edges:
+//! - When publishing stops, the /metrics exporter keeps serving the LAST
+//!   set value (the `metrics` facade cannot un-register a gauge) — the
+//!   CloudWatch window-gate Lambda (09:20–15:35 IST) + the sibling
+//!   feed-dead alarms own that tail, exactly as for the silent-instruments
+//!   gauge.
+//! - §30 window-exempt always-on SIDs (GIFT Nifty) bypass the persist-site
+//!   window gates, so their OFF-session ticks are still recorded into the
+//!   ring (they are genuine live Dhan ticks). The publisher's session gate
+//!   keeps them from being PUBLISHED off-session; the only artifact is
+//!   that the first in-session publishes (09:00:00–09:01:00) can include
+//!   up to 60 s of pre-window always-on samples in the trailing window.
+//! - During a Muhurat session the gauge PUBLISHES (this gate follows the
+//!   persist sites) but the CloudWatch window-gate Lambda only enables
+//!   alarm actions 09:20–15:35 IST — Muhurat coverage is VISIBILITY-only
+//!   (gauge + portal), not paging. Documented gap, not hidden.
 //!
 //! # Quantization honesty (≥1 s floor)
 //!
@@ -75,8 +95,9 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 
 use tickvault_common::constants::{
-    IST_UTC_OFFSET_NANOS, IST_UTC_OFFSET_SECONDS_I64, SECONDS_PER_DAY,
-    TICK_PERSIST_END_SECS_OF_DAY_IST, TICK_PERSIST_START_SECS_OF_DAY_IST,
+    IST_UTC_OFFSET_NANOS, IST_UTC_OFFSET_SECONDS_I64, MUHURAT_PERSIST_END_SECS_OF_DAY_IST,
+    MUHURAT_PERSIST_START_SECS_OF_DAY_IST, SECONDS_PER_DAY, TICK_PERSIST_END_SECS_OF_DAY_IST,
+    TICK_PERSIST_START_SECS_OF_DAY_IST,
 };
 
 /// Ring capacity — ~65 s of headroom at the measured ~500 ticks/s Dhan rate.
@@ -235,8 +256,9 @@ fn global_ring() -> &'static FeedLagRing {
 pub fn record_dhan_tick(received_at_utc_nanos: i64, capture_seq_nanos: i64, exchange_ts_secs: u32) {
     match global_ring().observe(received_at_utc_nanos, capture_seq_nanos, exchange_ts_secs) {
         LagRecordOutcome::ExcludedReplay => {
-            // Rule 11: exclusions are VISIBLE (/metrics-only counter),
-            // never silent censoring.
+            // Rule 11: exclusions are VISIBLE, never silent censoring. The
+            // counter is CloudWatch-exported (23-name EMF allowlist in
+            // cloudwatch-agent.json + user-data.sh.tftpl, ~$0.30/mo).
             metrics::counter!("tv_dhan_lag_samples_excluded_total").increment(1);
         }
         LagRecordOutcome::Admitted { clamped: true } => {
@@ -268,10 +290,16 @@ pub fn compute_window_p99_ns(window: &mut [u64]) -> Option<u64> {
 }
 
 /// Rule 3 session gate: true iff the UTC wall clock falls inside the
-/// [09:00, 15:30) IST persist window — the same window that gates the
-/// producing persist sites, so the gauge can never be armed by data the
-/// pipeline itself refuses to persist.
-fn is_in_session_ist(now_utc_secs: i64) -> bool {
+/// regular [09:00, 15:30) IST persist window, or inside the Muhurat
+/// [18:00, 19:30) IST window when `muhurat_active` — the SAME windows that
+/// gate the producing persist sites (`is_within_persist_window(_,
+/// muhurat_active)` in tick_processor.rs), so the gauge cannot go dark
+/// during a Muhurat live session while the pipeline is persisting ticks.
+///
+/// Honest caveat (module doc): §30 window-exempt always-on SIDs bypass the
+/// persist-site window gates, so the RING can hold off-session samples —
+/// this gate only decides when the gauge is PUBLISHED.
+fn is_in_session_ist(now_utc_secs: i64, muhurat_active: bool) -> bool {
     let now_ist = now_utc_secs.saturating_add(IST_UTC_OFFSET_SECONDS_I64);
     let sec_of_day = now_ist.rem_euclid(i64::from(SECONDS_PER_DAY));
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
@@ -279,6 +307,10 @@ fn is_in_session_ist(now_utc_secs: i64) -> bool {
     let sec_of_day = sec_of_day as u32;
     // O(1) EXEMPT: Range::contains is two integer comparisons, not a Vec scan.
     (TICK_PERSIST_START_SECS_OF_DAY_IST..TICK_PERSIST_END_SECS_OF_DAY_IST).contains(&sec_of_day)
+        || (muhurat_active
+            && (MUHURAT_PERSIST_START_SECS_OF_DAY_IST..MUHURAT_PERSIST_END_SECS_OF_DAY_IST)
+                // O(1) EXEMPT: Range::contains — two integer comparisons, not a Vec scan.
+                .contains(&sec_of_day))
 }
 
 /// Pure publish decision: `Some(p99_seconds)` ONLY when in-session AND the
@@ -295,8 +327,9 @@ fn compute_publish_value(in_session: bool, window: &mut [u64]) -> Option<f64> {
     })
 }
 
-/// The supervised 10 s publisher loop — spawned from `start_dhan_lane` in
-/// `main.rs` (next to the SLO publisher) via
+/// The supervised 10 s publisher loop — spawned ONCE per process from BOTH
+/// `main.rs` boot arms (the FAST crash-recovery arm + `start_dhan_lane`,
+/// behind a shared once-per-process guard) via
 /// `spawn_supervised_feed_lag_publisher`, which respawns it on death
 /// (WS-GAP-05 / SLO-03 supervisor pattern) and counts respawns.
 ///
@@ -317,9 +350,11 @@ pub async fn run_dhan_lag_publisher() {
         let now = chrono::Utc::now();
         let now_utc_nanos = now.timestamp_nanos_opt().unwrap_or(0);
         global_ring().snapshot_window_into(now_utc_nanos, &mut scratch);
-        if let Some(p99_secs) =
-            compute_publish_value(is_in_session_ist(now.timestamp()), &mut scratch)
-        {
+        // Muhurat flag is boot-set-once (`init_muhurat_session`, main.rs)
+        // and read per publisher tick — the gate mirrors the persist sites'
+        // `is_within_persist_window(_, muhurat_active)` windows.
+        let in_session = is_in_session_ist(now.timestamp(), tickvault_common::muhurat::current());
+        if let Some(p99_secs) = compute_publish_value(in_session, &mut scratch) {
             // ≥1 s Dhan LTT quantization floor: a healthy value reads
             // ~1–2 s and can never read 0 (see module doc).
             metrics::gauge!("tv_dhan_exchange_lag_p99_seconds").set(p99_secs);
@@ -339,8 +374,9 @@ mod tests {
     const LIVE_DWELL_NANOS: i64 = 1_000_000;
 
     /// 2026-07-06 ~10:00 IST expressed as UTC nanos (04:30 UTC).
-    /// 2026-07-06 00:00 UTC = 1_782_950_400 epoch secs.
-    const T0_UTC_SECS: i64 = 1_782_950_400 + 4 * 3600 + 1800;
+    /// 2026-07-06 00:00 UTC = 1_783_296_000 epoch secs (verified:
+    /// `date -u -d @1783296000` = Mon Jul 6 00:00:00 UTC 2026).
+    const T0_UTC_SECS: i64 = 1_783_296_000 + 4 * 3600 + 1800;
     const T0_UTC_NANOS: i64 = T0_UTC_SECS * NANOS_PER_SEC;
 
     /// IST epoch seconds matching `T0_UTC_SECS` exactly (zero lag).
@@ -447,20 +483,48 @@ mod tests {
         let mut thick: Vec<u64> = vec![2 * NANOS_PER_SEC as u64; MIN_LAG_SAMPLES];
         assert_eq!(compute_publish_value(false, &mut thick), None);
 
-        // Session-window boundary checks on the pure gate. 2026-07-06 is a
-        // Monday; midnight UTC = 05:30 IST.
-        let ist_midnight_utc = 1_782_950_400 - IST_UTC_OFFSET_SECONDS_I64;
+        // Session-window boundary checks on the pure gate. 2026-07-06
+        // (epoch 1_783_296_000 UTC) is a Monday; UTC midnight = 05:30 IST.
+        let ist_midnight_utc = 1_783_296_000 - IST_UTC_OFFSET_SECONDS_I64;
         // 08:59:59 IST — out.
-        assert!(!is_in_session_ist(ist_midnight_utc + 9 * 3600 - 1));
+        assert!(!is_in_session_ist(ist_midnight_utc + 9 * 3600 - 1, false));
         // 09:00:00 IST — in (persist-window start).
-        assert!(is_in_session_ist(ist_midnight_utc + 9 * 3600));
+        assert!(is_in_session_ist(ist_midnight_utc + 9 * 3600, false));
         // 15:29:59 IST — in.
         assert!(is_in_session_ist(
-            ist_midnight_utc + 15 * 3600 + 30 * 60 - 1
+            ist_midnight_utc + 15 * 3600 + 30 * 60 - 1,
+            false
         ));
         // 15:30:00 IST — out (exclusive end; the 15:30→16:30 scrape tail is
         // the stale-gauge artifact the window-gate Lambda absorbs).
-        assert!(!is_in_session_ist(ist_midnight_utc + 15 * 3600 + 30 * 60));
+        assert!(!is_in_session_ist(
+            ist_midnight_utc + 15 * 3600 + 30 * 60,
+            false
+        ));
+    }
+
+    #[test]
+    fn test_muhurat_session_gate_mirrors_persist_window() {
+        // Round-1 fix (2026-07-07, finding 5): the publish gate must accept
+        // the Muhurat [18:00, 19:30) IST window when the boot flag is set —
+        // the SAME widening the persist sites apply — so the gauge cannot
+        // go dark during a Muhurat live session.
+        let ist_midnight_utc = 1_783_296_000 - IST_UTC_OFFSET_SECONDS_I64;
+        let muhurat_1830_ist = ist_midnight_utc + 18 * 3600 + 30 * 60;
+        // Inside the Muhurat window: gated OPEN only when muhurat_active.
+        assert!(is_in_session_ist(muhurat_1830_ist, true));
+        assert!(!is_in_session_ist(muhurat_1830_ist, false));
+        // Window edges: 18:00:00 in, 19:30:00 out (exclusive end).
+        assert!(is_in_session_ist(ist_midnight_utc + 18 * 3600, true));
+        assert!(!is_in_session_ist(
+            ist_midnight_utc + 19 * 3600 + 30 * 60,
+            true
+        ));
+        // muhurat_active must not widen anything OUTSIDE its own window
+        // (16:00 IST stays out either way).
+        assert!(!is_in_session_ist(ist_midnight_utc + 16 * 3600, true));
+        // ... and the regular session stays in regardless of the flag.
+        assert!(is_in_session_ist(ist_midnight_utc + 10 * 3600, true));
     }
 
     #[test]

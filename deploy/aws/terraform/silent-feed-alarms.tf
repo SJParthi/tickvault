@@ -146,8 +146,14 @@ resource "aws_cloudwatch_metric_alarm" "boundary_catchup_storm_dhan" {
 # p99 46s / max 199s all day, with no metric measuring it
 # (tv_wire_to_done_duration_ns is receive->done only). The
 # tv_dhan_exchange_lag_p99_seconds gauge is published by the supervised
-# feed-lag monitor (crates/core/src/pipeline/feed_lag_monitor.rs): trailing
-# 60s window, recomputed every 10s, in-session only (Rule 3), >= 50 samples
+# feed-lag monitor (crates/core/src/pipeline/feed_lag_monitor.rs), spawned
+# from BOTH boot arms (fast crash-recovery + start_dhan_lane — round-1 fix
+# 2026-07-07; lane-only wiring left this alarm silently notBreaching for
+# the whole session after any mid-market crash restart): trailing 60s
+# window, recomputed every 10s, in-session only (Rule 3 — the regular
+# [09:00,15:30) IST window plus the Muhurat [18:00,19:30) window when
+# active; NOTE the action gate below stays 09:20-15:35, so Muhurat
+# publication is gauge-visibility only, not paging), >= 50 samples
 # or nothing published (Rule 11 — an empty window must never read as
 # "perfect lag"; feed-dead is owned by the silent-instruments + WS alarms
 # via notBreaching). Unlabeled, dhan-only NAME — sidesteps the host-only EMF
