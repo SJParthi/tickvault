@@ -52,8 +52,12 @@ IST = timedelta(hours=5, minutes=30)
 #   1. the NSE-holiday gate (tickvault-holiday-gate.service) - the common case;
 #   2. the hourly hard-stop-guard's in-window budget breach_stop (its hourly
 #      cron's 03:00 UTC tick IS 08:30 IST; budget-guards.tf) and the
-#      SNS-driven budget-killswitch - BOTH publish their own page BEFORE
-#      stopping, so silence here never blinds the operator;
+#      SNS-driven budget-killswitch - BOTH page in the SAME invocation,
+#      AFTER stopping (stop-first is their deliberate spend-cap ordering),
+#      so the operator is normally paged by the stopper itself. Honest
+#      residual: if a stopper's post-stop publish fails, that page AND
+#      this heuristic are both silent for that window - the boot-heartbeat
+#      backstop below covers it;
 #   3. a manual portal stop - operator-initiated by definition.
 # EC2 never self-stops on app FAILURE, and the boot-heartbeat gate window
 # (08:50-09:10) is the backstop pager for anything this heuristic misreads.
