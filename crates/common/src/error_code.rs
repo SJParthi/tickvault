@@ -827,6 +827,22 @@ pub enum ErrorCode {
     /// only — the production capture chain is untouched. Severity::Medium,
     /// auto-triage-safe.
     GrowwNative04WriterFailed,
+    /// FUTIDX-01 (§36 2026-07-08) — the nearest-expiry index-future selection
+    /// degraded for ≥1 of the 4 authorized underlyings on one feed (no FUT
+    /// rows / all expiries past / ambiguous duplicate expiry / unparsable
+    /// expiry). That feed runs WITHOUT that future for the day — degrade,
+    /// never HALT; the spot universe is unaffected. Severity::High,
+    /// auto-triage-safe (the degrade already happened; operator inspects the
+    /// day's master CSV + the alias-drift evidence payload at leisure).
+    Futidx01SelectionDegraded,
+    /// FUTIDX-02 (§36 2026-07-08) — the boot-time cross-feed comparator found
+    /// the Dhan and Groww builds chose DIFFERENT expiry dates (or one-sided
+    /// presence) for an index-future underlying. Both feeds STAY LIVE
+    /// (visibility, never a halt); cross-feed rows for that underlying are
+    /// not comparable that day. One vendor's master is stale/divergent —
+    /// operator compares the two masters' FUT rows and records a dated note.
+    /// Severity::High.
+    Futidx02CrossFeedExpiryMismatch,
 }
 
 impl ErrorCode {
@@ -1001,6 +1017,8 @@ impl ErrorCode {
             Self::GrowwNative02AuthFailed => "GROWW-NATIVE-02",
             Self::GrowwNative03DecodeFailed => "GROWW-NATIVE-03",
             Self::GrowwNative04WriterFailed => "GROWW-NATIVE-04",
+            Self::Futidx01SelectionDegraded => "FUTIDX-01",
+            Self::Futidx02CrossFeedExpiryMismatch => "FUTIDX-02",
         }
     }
 
@@ -1137,6 +1155,12 @@ impl ErrorCode {
             // server-side cap).
             | Self::GrowwScale01RollbackFired
             | Self::GrowwScale02GlobalHalve => Severity::High,
+            // FUTIDX-01/02 (§36 2026-07-08) — per-underlying selection degrade
+            // / cross-feed expiry divergence. Loud (Telegram High), never a
+            // halt; the spot universe + both live feeds are unaffected.
+            Self::Futidx01SelectionDegraded | Self::Futidx02CrossFeedExpiryMismatch => {
+                Severity::High
+            }
             // Medium: data pipeline correctness
             // PR #6b (2026-05-19): I-P0-01/02/04/05 retired with their modules.
             Self::InstrumentP1CrossSegmentCollision
@@ -1411,6 +1435,9 @@ impl ErrorCode {
             | Self::GrowwNative04WriterFailed => {
                 ".claude/rules/project/groww-native-rust-error-codes.md"
             }
+            Self::Futidx01SelectionDegraded | Self::Futidx02CrossFeedExpiryMismatch => {
+                ".claude/rules/project/futidx-4-error-codes.md"
+            }
         }
     }
 
@@ -1587,6 +1614,8 @@ impl ErrorCode {
             Self::GrowwNative02AuthFailed,
             Self::GrowwNative03DecodeFailed,
             Self::GrowwNative04WriterFailed,
+            Self::Futidx01SelectionDegraded,
+            Self::Futidx02CrossFeedExpiryMismatch,
         ]
     }
 }
@@ -1903,7 +1932,10 @@ mod tests {
         // bumped 130 -> 131 for TELEGRAM-03 (episode machinery degraded:
         // store_write_failed / rehydrate_corrupt / edit_fallback_storm —
         // delivery unaffected, UX-only degrade, Severity::Low).
-        assert_eq!(ErrorCode::all().len(), 131);
+        // 2026-07-08 (§36 FUTIDX-4): bumped 131 -> 133 for FUTIDX-01
+        // (per-underlying nearest-expiry selection degraded, per feed) +
+        // FUTIDX-02 (cross-feed expiry mismatch) — both Severity::High.
+        assert_eq!(ErrorCode::all().len(), 133);
     }
 
     #[test]
@@ -2084,7 +2116,9 @@ mod tests {
                 // Wave-4-E1 / BP-07 (2026-07-01): OOM-kill monitor.
                 || s.starts_with("PROC-")
                 // C2 (2026-07-03): panic-free reqwest client construction.
-                || s.starts_with("HTTP-CLIENT-");
+                || s.starts_with("HTTP-CLIENT-")
+                // §36 (2026-07-08): FUTIDX-4 nearest-expiry index futures.
+                || s.starts_with("FUTIDX-");
             assert!(has_known_prefix, "unexpected code prefix: {s}");
         }
     }

@@ -108,12 +108,19 @@ pub fn previous_trading_day<F: Fn(NaiveDate) -> bool>(
 
 /// The Dhan `instrument` enum value for a subscription target's role.
 /// Index rows → `"INDEX"`, F&O-underlying spot rows → `"EQUITY"`.
+/// `None` = the role is EXCLUDED from the historical REST loops entirely
+/// (§36 2026-07-08: index futures — Dhan-historical FUTIDX support + the
+/// expiryCode convention are UNVERIFIED-LIVE per annexure rule 8; skipping
+/// is fail-soft PREVDAY-01 semantics, pct fields read 0, and adds no REST
+/// surface under the pending no-rest §2 scope).
 #[must_use]
-pub fn instrument_type_for_role(role: InstrumentRole) -> &'static str {
+pub fn instrument_type_for_role(role: InstrumentRole) -> Option<&'static str> {
     match role {
-        InstrumentRole::Index => "INDEX",
+        InstrumentRole::Index => Some("INDEX"),
         // Both equity roles are NSE_EQ EQUITY rows (§31 NTM constituents).
-        InstrumentRole::FnoUnderlying | InstrumentRole::IndexConstituent => "EQUITY",
+        InstrumentRole::FnoUnderlying | InstrumentRole::IndexConstituent => Some("EQUITY"),
+        // §36: futures are SKIPPED from both REST loops.
+        InstrumentRole::IndexFuture => None,
     }
 }
 
@@ -441,10 +448,17 @@ pub async fn run_prev_day_ohlcv_fetch(
     // `summary.skipped` — surfaced once as a coalesced summary after the loop
     // (NOT one log line per symbol). 2026-06-26: 774 of these were silent.
     let mut empty_bodies: usize = 0;
+    // §36 (2026-07-08): index-future targets are excluded from the prev-day
+    // REST loop (fail-soft; counted + one coalesced info! after the loop).
+    let mut futidx_skipped: usize = 0;
 
     for target in &universe.subscription_targets {
         let row = &target.csv_row;
-        let instrument = instrument_type_for_role(target.role);
+        let Some(instrument) = instrument_type_for_role(target.role) else {
+            futidx_skipped += 1;
+            metrics::counter!("tv_prev_day_futidx_skipped_total").increment(1);
+            continue;
+        };
         let body = historical_request_body(
             row.security_id.trim(),
             row.segment.trim(),
@@ -527,6 +541,13 @@ pub async fn run_prev_day_ohlcv_fetch(
     }
     // Coalesced empty-body summary (NOT one line per symbol). Only when there
     // was at least one Dhan 200-with-empty-body so a quiet run stays quiet.
+    if futidx_skipped > 0 {
+        tracing::info!(
+            futidx_skipped,
+            "prev-day OHLCV: index-future targets skipped (§36 — Dhan-historical FUTIDX \
+             support UNVERIFIED-LIVE; pct fields read 0, fail-soft)"
+        );
+    }
     if empty_bodies > 0 {
         tracing::debug!(
             empty_bodies,
@@ -610,11 +631,25 @@ mod tests {
 
     #[test]
     fn instrument_type_for_role_maps_role() {
-        assert_eq!(instrument_type_for_role(InstrumentRole::Index), "INDEX");
+        assert_eq!(
+            instrument_type_for_role(InstrumentRole::Index),
+            Some("INDEX")
+        );
         assert_eq!(
             instrument_type_for_role(InstrumentRole::FnoUnderlying),
-            "EQUITY"
+            Some("EQUITY")
         );
+        assert_eq!(
+            instrument_type_for_role(InstrumentRole::IndexConstituent),
+            Some("EQUITY")
+        );
+    }
+
+    #[test]
+    fn test_instrument_type_for_role_none_for_index_future() {
+        // §36: futures are excluded from the prev-day REST loop — the
+        // Option::None arm makes the exclusion type-driven at every caller.
+        assert_eq!(instrument_type_for_role(InstrumentRole::IndexFuture), None);
     }
 
     #[test]

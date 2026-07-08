@@ -51,6 +51,9 @@ use super::fno_underlying_extractor::{
     ExtractError, collect_applicable_fno_contracts, extract_fno_underlyings,
 };
 use super::index_extractor::{IndexExtractError, extract_indices};
+use super::index_futures::{
+    FeedFutureSelection, record_index_future_selection, select_index_future_contracts,
+};
 
 /// Errors that can occur during orchestration. Each variant wraps the
 /// underlying error from Sub-PRs #4-#7 and maps to ONE of the 4
@@ -215,6 +218,7 @@ pub fn resolve_ntm_rows(rows: &[CsvRow], ntm_map: &IndexConstituencyMap) -> Vec<
 pub fn build_universe_from_bytes(
     bytes: &[u8],
     ntm_map: Option<&IndexConstituencyMap>,
+    today_ist: chrono::NaiveDate,
 ) -> Result<DailyUniverse, OrchestratorError> {
     // Step 1: parse
     let rows = parse_detailed_csv(bytes)?;
@@ -256,6 +260,59 @@ pub fn build_universe_from_bytes(
     // master-only — they NEVER enter `subscription_targets`.
     let fno_contracts = collect_applicable_fno_contracts(&rows, &fno);
 
+    // Step 3d — §36 (2026-07-08): select the ≤4 nearest-expiry FUTIDX rows
+    // from the already-collected contracts. DEGRADE ONLY — never an
+    // orchestrator `Err` (the §4 fail-closed contract stays on the CSV, not
+    // on the futures overlay). Every miss pages FUTIDX-01 per underlying.
+    let futures_sel = select_index_future_contracts(&fno_contracts, today_ist);
+    for miss in &futures_sel.misses {
+        tracing::error!(
+            code = ErrorCode::Futidx01SelectionDegraded.code_str(),
+            feed = "dhan",
+            underlying = miss.canonical,
+            reason = ?miss.reason,
+            candidates_seen = ?futures_sel.fut_underlying_symbols_seen,
+            "index-future selection degraded — this feed runs WITHOUT that future today; \
+             spot universe unaffected"
+        );
+        metrics::counter!(
+            "tv_index_futures_selection_missing_total",
+            "feed" => "dhan",
+            "underlying" => miss.canonical
+        )
+        .increment(1);
+    }
+    metrics::gauge!("tv_index_futures_selected", "feed" => "dhan")
+        .set(futures_sel.chosen.len() as f64);
+    let mut dhan_feed_selection: Vec<FeedFutureSelection> = Vec::new();
+    for row in &futures_sel.chosen {
+        // The boot evidence line (machine-readable) — one per chosen contract.
+        tracing::info!(
+            feed = "dhan",
+            underlying = %row.underlying_symbol,
+            expiry = %row.expiry_date,
+            native_id = %row.security_id,
+            segment = %row.segment,
+            "index-futures selection"
+        );
+        if let Ok(expiry) = chrono::NaiveDate::parse_from_str(row.expiry_date.trim(), "%Y-%m-%d") {
+            let canonical =
+                super::index_extractor::canonicalize_index_symbol(&row.underlying_symbol);
+            if let Some(entry) = super::index_futures::INDEX_FUTURES_UNDERLYINGS
+                .iter()
+                .find(|u| u.canonical == canonical)
+            {
+                dhan_feed_selection.push(FeedFutureSelection {
+                    canonical: entry.canonical,
+                    expiry,
+                    native_id: row.security_id.clone(),
+                    segment: row.segment.clone(),
+                });
+            }
+        }
+    }
+    record_index_future_selection("dhan", dhan_feed_selection);
+
     // Step 3c: resolve + bridge the §31 NTM constituents (degrade-safe). When
     // `ntm_map` is None (source unavailable) or resolve fails, this is empty and
     // the universe is the indices + F&O-underlyings core set.
@@ -268,7 +325,7 @@ pub fn build_universe_from_bytes(
     // set per §2 + §22; fno_contracts are master-only and not bounded). An NTM
     // set that pushes the universe past MAX is an INSTR-FETCH-04 fail-closed
     // HALT (a data anomaly), NOT a degrade.
-    let universe = build_daily_universe(indices, fno, fno_contracts, ntm_rows)?;
+    let universe = build_daily_universe(indices, fno, fno_contracts, ntm_rows, futures_sel.chosen)?;
 
     Ok(universe)
 }
@@ -276,6 +333,10 @@ pub fn build_universe_from_bytes(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_today() -> chrono::NaiveDate {
+        chrono::NaiveDate::from_ymd_opt(2026, 7, 8).expect("valid date")
+    }
     use crate::instrument::index_extractor::NSE_INDEX_ALLOWLIST;
 
     /// Build a synthetic Detailed-CSV body with N stock-derivative rows
@@ -332,7 +393,7 @@ mod tests {
                 38000 + i
             ));
         }
-        let universe = build_universe_from_bytes(s.as_bytes(), None).expect("build");
+        let universe = build_universe_from_bytes(s.as_bytes(), None, test_today()).expect("build");
         // 30 NSE + 1 SENSEX + 100 underlyings = 131 instruments
         assert_eq!(universe.total_count(), 131);
     }
@@ -341,7 +402,7 @@ mod tests {
     fn maps_parse_error_to_instr_fetch_02() {
         // Empty CSV body — parser returns Empty error
         let bytes = b"SECURITY_ID,EXCH_ID,SEGMENT,INSTRUMENT,SYMBOL_NAME,UNDERLYING_SECURITY_ID";
-        let err = build_universe_from_bytes(bytes, None).unwrap_err();
+        let err = build_universe_from_bytes(bytes, None, test_today()).unwrap_err();
         assert_eq!(
             err.error_code(),
             ErrorCode::InstrFetch02SchemaValidationFailed
@@ -358,7 +419,7 @@ mod tests {
         s.push_str("2885,NSE,NSE_EQ,EQUITY,RELIANCE,\n");
         s.push_str("13,NSE,IDX_I,INDEX,NIFTY,\n");
         s.push_str("38000,NSE,NSE_FNO,FUTSTK,RELIANCEFUT,2885\n");
-        let err = build_universe_from_bytes(s.as_bytes(), None).unwrap_err();
+        let err = build_universe_from_bytes(s.as_bytes(), None, test_today()).unwrap_err();
         assert_eq!(
             err.error_code(),
             ErrorCode::InstrFetch02SchemaValidationFailed
@@ -383,7 +444,7 @@ mod tests {
                 38000 + i
             ));
         }
-        let err = build_universe_from_bytes(s.as_bytes(), None).unwrap_err();
+        let err = build_universe_from_bytes(s.as_bytes(), None, test_today()).unwrap_err();
         assert_eq!(err.error_code(), ErrorCode::InstrFetch03DanglingReferences);
         assert_eq!(err.stage(), "fno_underlying_extractor");
     }
@@ -393,7 +454,7 @@ mod tests {
         // Valid CSV but only 1 underlying + 1 NSE_I + 1 SENSEX = 3
         // instruments, below MIN=100 envelope.
         let bytes = synthetic_csv(1, 1);
-        let err = build_universe_from_bytes(&bytes, None).unwrap_err();
+        let err = build_universe_from_bytes(&bytes, None, test_today()).unwrap_err();
         assert_eq!(
             err.error_code(),
             ErrorCode::InstrFetch04UniverseSizeOutOfBounds
@@ -426,7 +487,7 @@ mod tests {
     fn stage_returns_stable_wire_format() {
         // The stage() values feed CloudWatch metric dimensions + audit
         // table columns; they MUST be stable across releases.
-        let parse_err = build_universe_from_bytes(b"SECURITY_ID", None).unwrap_err();
+        let parse_err = build_universe_from_bytes(b"SECURITY_ID", None, test_today()).unwrap_err();
         assert_eq!(parse_err.stage(), "csv_parser");
     }
 
@@ -452,8 +513,8 @@ mod tests {
         let bytes = s.as_bytes();
 
         // Two calls with identical bytes → identical total_count.
-        let u1 = build_universe_from_bytes(bytes, None).expect("build 1");
-        let u2 = build_universe_from_bytes(bytes, None).expect("build 2");
+        let u1 = build_universe_from_bytes(bytes, None, test_today()).expect("build 1");
+        let u2 = build_universe_from_bytes(bytes, None, test_today()).expect("build 2");
         assert_eq!(u1.total_count(), u2.total_count());
     }
 
@@ -468,7 +529,7 @@ mod tests {
         bytes.push(0xC9);
         bytes.push(0x6E);
         bytes.extend_from_slice(b",\n");
-        let err = build_universe_from_bytes(&bytes, None).unwrap_err();
+        let err = build_universe_from_bytes(&bytes, None, test_today()).unwrap_err();
         assert_eq!(
             err.error_code(),
             ErrorCode::InstrFetch02SchemaValidationFailed
@@ -558,7 +619,8 @@ mod tests {
         }
         // NTM references STK0 (symbol fallback — synthetic CSV has no ISIN).
         let map = ntm_map(&[("STK0", "")]);
-        let universe = build_universe_from_bytes(s.as_bytes(), Some(&map)).expect("build with ntm");
+        let universe = build_universe_from_bytes(s.as_bytes(), Some(&map), test_today())
+            .expect("build with ntm");
         // STK0 is an F&O underlying AND now an NTM constituent → both flags, no dup.
         assert_eq!(universe.index_constituent_count(), 1);
         let both = universe
@@ -571,7 +633,8 @@ mod tests {
 
     #[test]
     fn orchestrator_error_display_includes_underlying_message() {
-        let err = build_universe_from_bytes(b"SECURITY_ID,EXCH_ID,SEGMENT", None).unwrap_err();
+        let err = build_universe_from_bytes(b"SECURITY_ID,EXCH_ID,SEGMENT", None, test_today())
+            .unwrap_err();
         let msg = format!("{err}");
         // The Display impl should include either "CSV parse failed" or
         // the underlying error message (depending on which layer fails

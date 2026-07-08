@@ -67,6 +67,15 @@ pub const CACHE_BASE_DIR: &str = "data/instrument-cache";
 /// File name prefix. The full name is `plan-snapshot-YYYY-MM-DD.json`.
 const SNAPSHOT_PREFIX: &str = "plan-snapshot-";
 
+/// Snapshot format version (§36 2026-07-08). Format 2 = carries the
+/// `index_future` role + the optional segment/expiry/underlying fields.
+/// The loader REJECTS `format < PLAN_SNAPSHOT_FORMAT_CURRENT` → one
+/// deterministic cold build on deploy day (instead of a silent futures-less
+/// warm boot). The gate is keyed on FORMAT, never on futures COUNT — a
+/// legitimately degraded zero-futures day writes a format-2 snapshot that
+/// warm boots ACCEPT (no cold-rebuild loop).
+pub const PLAN_SNAPSHOT_FORMAT_CURRENT: u32 = 2;
+
 /// One subscription target, reduced to exactly the fields the plan-builder
 /// consumes. `role` is the stable wire-format label from
 /// [`InstrumentRole::as_str`] so the JSON is self-describing.
@@ -87,6 +96,18 @@ pub struct SnapshotTarget {
     /// Lossless membership flag (§31.1(6)). See `is_fno_underlying`.
     #[serde(default)]
     pub is_index_constituent: bool,
+    /// §36 (2026-07-08): CSV segment for `index_future` targets ONLY
+    /// (`"NSE_FNO"` / `"BSE_FNO"`) — segment is NOT derivable from that role
+    /// (SENSEX is BSE_FNO). `None` (and skipped on write) for the 3 spot
+    /// roles, so their entries stay byte-stable across versions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub segment: Option<String>,
+    /// §36: `YYYY-MM-DD` expiry for `index_future` targets ONLY.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expiry_date: Option<String>,
+    /// §36: underlying symbol for `index_future` targets ONLY.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub underlying_symbol: Option<String>,
 }
 
 /// The on-disk snapshot. Keyed by the IST trading date so a stale (previous-
@@ -95,7 +116,12 @@ pub struct SnapshotTarget {
 pub struct PlanSnapshot {
     /// `YYYY-MM-DD` IST trading date this snapshot was built for.
     pub trading_date_ist: String,
-    /// The ~331 subscription targets (indices + F&O underlyings).
+    /// Snapshot format version (§36). `#[serde(default)]` = 0 for snapshots
+    /// written by pre-§36 code, which the loader rejects → cold build.
+    #[serde(default)]
+    pub format: u32,
+    /// The ~331 subscription targets (indices + F&O underlyings + the ≤4
+    /// §36 index futures).
     pub targets: Vec<SnapshotTarget>,
 }
 
@@ -161,11 +187,25 @@ pub fn to_universe(snapshot: &PlanSnapshot) -> Option<DailyUniverse> {
         Vec::with_capacity(snapshot.targets.len());
     for t in &snapshot.targets {
         let role = parse_role(&t.role)?;
-        let csv_row = CsvRow {
+        let mut csv_row = CsvRow {
             security_id: t.security_id.clone(),
             symbol_name: t.symbol_name.clone(),
             ..CsvRow::default()
         };
+        if role == InstrumentRole::IndexFuture {
+            // §36: an index-future target MUST carry a known FNO segment —
+            // fail-closed otherwise (same doctrine as an unknown role): the
+            // planner would otherwise mis-subscribe or silently drop it.
+            let segment = t.segment.as_deref()?;
+            if segment != "NSE_FNO" && segment != "BSE_FNO" {
+                return None;
+            }
+            csv_row.segment = segment.to_string();
+            csv_row.exch_id = if segment == "BSE_FNO" { "BSE" } else { "NSE" }.to_string();
+            csv_row.instrument = "FUTIDX".to_string();
+            csv_row.expiry_date = t.expiry_date.clone().unwrap_or_default();
+            csv_row.underlying_symbol = t.underlying_symbol.clone().unwrap_or_default();
+        }
         // Derive the membership flags from `role` when the snapshot left them
         // at the serde default (`false`) — a snapshot written by pre-Sub-PR-#5
         // code carries no flag fields, so without this an `fno_underlying` row
@@ -193,6 +233,7 @@ fn parse_role(label: &str) -> Option<InstrumentRole> {
         "index" => Some(InstrumentRole::Index),
         "fno_underlying" => Some(InstrumentRole::FnoUnderlying),
         "index_constituent" => Some(InstrumentRole::IndexConstituent),
+        "index_future" => Some(InstrumentRole::IndexFuture),
         _ => None,
     }
 }
@@ -203,16 +244,25 @@ pub fn snapshot_from_universe(universe: &DailyUniverse, trading_date_ist: &str) 
     let targets = universe
         .subscription_targets
         .iter()
-        .map(|t| SnapshotTarget {
-            role: t.role.as_str().to_string(),
-            security_id: t.csv_row.security_id.clone(),
-            symbol_name: t.csv_row.symbol_name.clone(),
-            is_fno_underlying: t.is_fno_underlying,
-            is_index_constituent: t.is_index_constituent,
+        .map(|t| {
+            let is_future = t.role == InstrumentRole::IndexFuture;
+            SnapshotTarget {
+                role: t.role.as_str().to_string(),
+                security_id: t.csv_row.security_id.clone(),
+                symbol_name: t.csv_row.symbol_name.clone(),
+                is_fno_underlying: t.is_fno_underlying,
+                is_index_constituent: t.is_index_constituent,
+                // §36: written ONLY for index_future targets — existing-role
+                // entries stay byte-stable.
+                segment: is_future.then(|| t.csv_row.segment.clone()),
+                expiry_date: is_future.then(|| t.csv_row.expiry_date.clone()),
+                underlying_symbol: is_future.then(|| t.csv_row.underlying_symbol.clone()),
+            }
         })
         .collect();
     PlanSnapshot {
         trading_date_ist: trading_date_ist.to_string(),
+        format: PLAN_SNAPSHOT_FORMAT_CURRENT,
         targets,
     }
 }
@@ -292,6 +342,21 @@ pub fn load_plan_snapshot_for_today(trading_date_ist: &str) -> Option<DailyUnive
         );
         return None;
     }
+    // §36 (2026-07-08) format gate: a snapshot written by pre-§36 code
+    // (format 0) parses fine but silently LACKS the index-future targets —
+    // rejecting it forces exactly ONE deterministic cold build on deploy
+    // day, after which a format-2 snapshot is written. Keyed on FORMAT,
+    // never on futures count (a degraded zero-futures format-2 day is
+    // accepted — no rebuild loop).
+    if snapshot.format < PLAN_SNAPSHOT_FORMAT_CURRENT {
+        warn!(
+            format = snapshot.format,
+            required = PLAN_SNAPSHOT_FORMAT_CURRENT,
+            date = trading_date_ist,
+            "plan snapshot format too old (pre-§36) — one-time cold build"
+        );
+        return None;
+    }
     let universe = to_universe(&snapshot)?;
     // Zero-tick-loss guard (2026-06-02): a same-day snapshot that is empty or
     // implausibly small (corruption, truncated/partial write, manual edit) must
@@ -333,6 +398,29 @@ mod tests {
             csv_row: CsvRow {
                 security_id: sid.to_string(),
                 symbol_name: sym.to_string(),
+                ..CsvRow::default()
+            },
+        }
+    }
+
+    fn target_future(
+        sid: &str,
+        underlying: &str,
+        segment: &str,
+        expiry: &str,
+    ) -> SubscriptionTarget {
+        SubscriptionTarget {
+            role: InstrumentRole::IndexFuture,
+            is_fno_underlying: false,
+            is_index_constituent: false,
+            csv_row: CsvRow {
+                security_id: sid.to_string(),
+                exch_id: if segment == "BSE_FNO" { "BSE" } else { "NSE" }.to_string(),
+                segment: segment.to_string(),
+                instrument: "FUTIDX".to_string(),
+                symbol_name: format!("{underlying}-Jul2026-FUT"),
+                underlying_symbol: underlying.to_string(),
+                expiry_date: expiry.to_string(),
                 ..CsvRow::default()
             },
         }
@@ -433,12 +521,16 @@ mod tests {
     fn test_to_universe_fails_closed_on_unknown_role() {
         let snap = PlanSnapshot {
             trading_date_ist: "2026-05-29".to_string(),
+            format: PLAN_SNAPSHOT_FORMAT_CURRENT,
             targets: vec![SnapshotTarget {
                 role: "depth_underlying".to_string(), // not a known role
                 security_id: "13".to_string(),
                 symbol_name: "NIFTY".to_string(),
                 is_fno_underlying: false,
                 is_index_constituent: false,
+                segment: None,
+                expiry_date: None,
+                underlying_symbol: None,
             }],
         };
         assert!(
@@ -582,6 +674,7 @@ mod tests {
         std::fs::create_dir_all(CACHE_BASE_DIR).expect("mkdir");
         let stale = PlanSnapshot {
             trading_date_ist: "2099-03-03".to_string(), // different from file name
+            format: PLAN_SNAPSHOT_FORMAT_CURRENT,
             targets: vec![],
         };
         std::fs::write(&path, serde_json::to_vec(&stale).unwrap()).expect("write");
@@ -624,6 +717,11 @@ mod tests {
             target(InstrumentRole::FnoUnderlying, "2885", "RELIANCE"),
             target(InstrumentRole::FnoUnderlying, "1333", "HDFCBANK"),
             target(InstrumentRole::FnoUnderlying, "11536", "TCS"),
+            // §36: the 4 nearest-expiry index futures ride the same snapshot.
+            target_future("35001", "NIFTY", "NSE_FNO", "2026-07-30"),
+            target_future("35002", "BANKNIFTY", "NSE_FNO", "2026-07-30"),
+            target_future("35003", "MIDCPNIFTY", "NSE_FNO", "2026-07-28"),
+            target_future("45001", "SENSEX", "BSE_FNO", "2026-07-31"),
         ];
         // Pad to >= MIN_DAILY_UNIVERSE_SIZE so the snapshot passes the
         // zero-tick-loss size guard (2026-06-02). Plan-A and Plan-B both build
@@ -664,6 +762,11 @@ mod tests {
             plan_a.summary.stock_equities, plan_b.summary.stock_equities,
             "stock-count drift"
         );
+        assert_eq!(
+            plan_a.summary.index_derivatives, plan_b.summary.index_derivatives,
+            "index-future-count drift (§36 boot symmetry)"
+        );
+        assert_eq!(plan_a.summary.index_derivatives, 4, "all 4 futures planned");
         assert_eq!(
             plan_a.summary.feed_mode, plan_b.summary.feed_mode,
             "feed-mode drift"
@@ -707,10 +810,20 @@ mod tests {
 
         const INDEX_COUNT: usize = 3;
         const UNDERLYING_COUNT: usize = 328; // 3 + 328 = 331, the live size
-        let mut targets = Vec::with_capacity(INDEX_COUNT + UNDERLYING_COUNT);
+        const FUTURE_COUNT: usize = 4; // §36 FUTIDX-4
+        let mut targets = Vec::with_capacity(INDEX_COUNT + UNDERLYING_COUNT + FUTURE_COUNT);
         targets.push(target(InstrumentRole::Index, "13", "NIFTY"));
         targets.push(target(InstrumentRole::Index, "25", "BANKNIFTY"));
         targets.push(target(InstrumentRole::Index, "51", "SENSEX"));
+        targets.push(target_future("35001", "NIFTY", "NSE_FNO", "2026-07-30"));
+        targets.push(target_future("35002", "BANKNIFTY", "NSE_FNO", "2026-07-30"));
+        targets.push(target_future(
+            "35003",
+            "MIDCPNIFTY",
+            "NSE_FNO",
+            "2026-07-28",
+        ));
+        targets.push(target_future("45001", "SENSEX", "BSE_FNO", "2026-07-31"));
         for i in 0..UNDERLYING_COUNT {
             // 10000+ keeps ids well clear of the 3 index ids above; all unique.
             let sid = (10_000 + i).to_string();
@@ -721,7 +834,7 @@ mod tests {
             subscription_targets: targets,
             fno_contracts: vec![],
         };
-        let expected = INDEX_COUNT + UNDERLYING_COUNT;
+        let expected = INDEX_COUNT + UNDERLYING_COUNT + FUTURE_COUNT;
 
         let date = "2099-08-09";
         let path = snapshot_path_for(date).expect("valid date");
@@ -771,5 +884,120 @@ mod tests {
         );
 
         let _ = std::fs::remove_file(&tmp_path);
+    }
+
+    // ----- §36 (2026-07-08): format-v2 + index_future role -----
+
+    #[test]
+    fn test_parse_role_round_trips_index_future() {
+        assert_eq!(
+            parse_role(InstrumentRole::IndexFuture.as_str()),
+            Some(InstrumentRole::IndexFuture),
+            "as_str/parse_role inverse for the new label"
+        );
+    }
+
+    #[test]
+    fn test_snapshot_roundtrip_preserves_index_future_segment_and_expiry() {
+        let universe = DailyUniverse {
+            subscription_targets: vec![
+                target(InstrumentRole::Index, "13", "NIFTY"),
+                target_future("45001", "SENSEX", "BSE_FNO", "2026-07-31"),
+            ],
+            fno_contracts: Vec::new(),
+        };
+        let snap = snapshot_from_universe(&universe, "2026-07-08");
+        assert_eq!(snap.format, PLAN_SNAPSHOT_FORMAT_CURRENT);
+        // Spot entries stay byte-stable: no §36 fields serialized.
+        let json = serde_json::to_string(&snap).expect("serialize");
+        let back: PlanSnapshot = serde_json::from_str(&json).expect("deserialize");
+        let rebuilt = to_universe(&back).expect("round-trip");
+        let fut = &rebuilt.subscription_targets[1];
+        assert_eq!(fut.role, InstrumentRole::IndexFuture);
+        assert_eq!(fut.csv_row.segment, "BSE_FNO");
+        assert_eq!(fut.csv_row.exch_id, "BSE");
+        assert_eq!(fut.csv_row.instrument, "FUTIDX");
+        assert_eq!(fut.csv_row.expiry_date, "2026-07-31");
+        assert_eq!(fut.csv_row.underlying_symbol, "SENSEX");
+        // The spot entry carries NO §36 fields on the wire.
+        assert!(!json.contains("\"segment\":null"));
+    }
+
+    #[test]
+    fn test_snapshot_index_future_missing_segment_fails_closed() {
+        let snap = PlanSnapshot {
+            trading_date_ist: "2026-07-08".to_string(),
+            format: PLAN_SNAPSHOT_FORMAT_CURRENT,
+            targets: vec![SnapshotTarget {
+                role: "index_future".to_string(),
+                security_id: "35001".to_string(),
+                symbol_name: "NIFTY-Jul2026-FUT".to_string(),
+                is_fno_underlying: false,
+                is_index_constituent: false,
+                segment: None, // hand-edited / corrupt entry
+                expiry_date: Some("2026-07-30".to_string()),
+                underlying_symbol: Some("NIFTY".to_string()),
+            }],
+        };
+        assert!(
+            to_universe(&snap).is_none(),
+            "index_future without a segment must fail closed → cold build"
+        );
+        // Unknown segment value also fails closed.
+        let mut snap2 = snap;
+        snap2.targets[0].segment = Some("MCX_COMM".to_string());
+        assert!(to_universe(&snap2).is_none());
+    }
+
+    #[test]
+    fn test_snapshot_format_v1_rejected_forces_cold_build_once() {
+        // A pre-§36 snapshot (no `format` field ⇒ serde default 0) parses
+        // fine but is REJECTED by the loader — one deterministic cold build.
+        let date = "2099-07-11";
+        let path = snapshot_path_for(date).expect("valid date");
+        std::fs::create_dir_all(CACHE_BASE_DIR).expect("mkdir");
+        let mut legacy = snapshot_from_universe(&large_sample_universe(), date);
+        legacy.format = 0; // simulate the old writer
+        std::fs::write(&path, serde_json::to_vec(&legacy).unwrap()).expect("write");
+        assert!(
+            load_plan_snapshot_for_today(date).is_none(),
+            "format < PLAN_SNAPSHOT_FORMAT_CURRENT must be rejected (deploy-day cold build)"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_snapshot_format_v2_zero_futures_accepted_no_rebuild_loop() {
+        // The gate is keyed on FORMAT, never futures COUNT: a legitimately
+        // degraded zero-futures day writes a format-2 snapshot that warm
+        // boots ACCEPT — no cold-rebuild loop.
+        let date = "2099-07-12";
+        let path = snapshot_path_for(date).expect("valid date");
+        let _ = std::fs::remove_file(&path);
+        // large_sample_universe() has ZERO index futures.
+        write_plan_snapshot(&large_sample_universe(), date).expect("write ok");
+        let loaded = load_plan_snapshot_for_today(date);
+        assert!(loaded.is_some(), "format-2 zero-futures snapshot accepted");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_old_snapshot_without_new_fields_parses_with_empty_defaults() {
+        // serde-default tolerance: an entry without the 3 §36 fields (any of
+        // the 3 old roles) deserializes with None — parse never fails.
+        let legacy = r#"{
+            "trading_date_ist": "2026-07-08",
+            "targets": [
+                { "role": "index", "security_id": "13", "symbol_name": "NIFTY" }
+            ]
+        }"#;
+        let snap: PlanSnapshot = serde_json::from_str(legacy).expect("legacy parses");
+        assert_eq!(snap.format, 0, "missing format field defaults to 0");
+        assert!(snap.targets[0].segment.is_none());
+        assert!(snap.targets[0].expiry_date.is_none());
+        assert!(snap.targets[0].underlying_symbol.is_none());
+        // The old-role entry still converts (the format gate lives in the
+        // LOADER, not in to_universe).
+        assert!(to_universe(&snap).is_some());
     }
 }
