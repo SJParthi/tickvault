@@ -860,7 +860,38 @@ async fn main() -> Result<()> {
                 // ALARM until the next non-zero sub-threshold count happened
                 // to be written. The zero-skip below now guards ONLY the
                 // WS-GAP-06 error emission + summary counter.
-                metrics::gauge!("tv_tick_gap_instruments_silent").set(total_silent as f64);
+                //
+                // Round-4 fix (2026-07-08, final-review findings 1/2/4): pin
+                // the gauge to 0.0 during the NSE pre-open/auction window
+                // [09:00, 09:15) IST — the exact mirror of the round-3 SLO
+                // tick_freshness pre-open pin
+                // (SLO_TICK_FRESHNESS_SESSION_OPEN_SECS_OF_DAY_IST below).
+                // The session gate above admits [09:00, 15:30), so during
+                // the 09:08-09:15 matching/buffer freeze the boot-seeded
+                // ~775 SIDs are LEGITIMATELY silent and the genuine count
+                // (hundreds, far above the retuned alarm threshold 40)
+                // would be written for ~6-7 consecutive 60s CW datapoints.
+                // The window-gate Lambda's forced-OK at 09:20 does NOT
+                // purge datapoints, and the retuned alarm's 10-of-12
+                // lookback (12 min — the LONGEST of any gated alarm)
+                // reaches back to ~09:08 at its first gated evaluations:
+                // ~7 guaranteed pre-open breaching datapoints would need
+                // only ~3 open-ramp minutes > 40 (slow starters over the
+                // documented ~33 always-silent floor) to false-page at
+                // ~09:21 on ordinary days. Pre-open silence is not
+                // degradation; genuine counts start at the 09:15:00
+                // continuous-session open. The WS-GAP-06 error emission
+                // below is deliberately UNCHANGED (pre-existing behavior;
+                // it is a coalesced log, not an alarm datapoint).
+                const TICK_GAP_GAUGE_SESSION_OPEN_SECS_OF_DAY_IST: u32 = 9 * 3600 + 15 * 60;
+                let gauge_silent = if tickvault_common::market_hours::now_ist_secs_of_day()
+                    < TICK_GAP_GAUGE_SESSION_OPEN_SECS_OF_DAY_IST
+                {
+                    0.0
+                } else {
+                    total_silent as f64
+                };
+                metrics::gauge!("tv_tick_gap_instruments_silent").set(gauge_silent);
                 if total_silent == 0 {
                     continue;
                 }
