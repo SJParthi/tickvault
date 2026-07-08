@@ -838,9 +838,6 @@ async fn main() -> Result<()> {
                     now,
                     tickvault_core::pipeline::tick_gap_detector::TICK_GAP_TOP_N_DEFAULT,
                 );
-                if total_silent == 0 {
-                    continue;
-                }
                 // Wave-Holiday-Gate (2026-05-09): suppress WS-GAP-06
                 // emission on Saturday/Sunday boots (and outside
                 // market hours). NSE doesn't stream on weekends, so
@@ -851,8 +848,54 @@ async fn main() -> Result<()> {
                 if !tickvault_common::market_hours::is_within_trading_session_ist() {
                     continue;
                 }
+                // Round-3 fix (2026-07-08, review finding 6): the gauge is
+                // written UNCONDITIONALLY every in-session scan — INCLUDING
+                // total_silent == 0. The previous zero-skip sat BEFORE this
+                // write, so a fully-recovered silence spike froze the gauge
+                // at its last breaching value (the /metrics exporter keeps
+                // re-serving the last set value): a ~90s full-feed outage
+                // wrote 776 once, the reconnect restored every SID, and the
+                // frozen 776 then accumulated the retuned alarm's 10-of-12
+                // ~10 minutes AFTER complete recovery — a false page held in
+                // ALARM until the next non-zero sub-threshold count happened
+                // to be written. The zero-skip below now guards ONLY the
+                // WS-GAP-06 error emission + summary counter.
+                //
+                // Round-4 fix (2026-07-08, final-review findings 1/2/4): pin
+                // the gauge to 0.0 during the NSE pre-open/auction window
+                // [09:00, 09:15) IST — the exact mirror of the round-3 SLO
+                // tick_freshness pre-open pin
+                // (SLO_TICK_FRESHNESS_SESSION_OPEN_SECS_OF_DAY_IST below).
+                // The session gate above admits [09:00, 15:30), so during
+                // the 09:08-09:15 matching/buffer freeze the boot-seeded
+                // ~775 SIDs are LEGITIMATELY silent and the genuine count
+                // (hundreds, far above the retuned alarm threshold 40)
+                // would be written for ~6-7 consecutive 60s CW datapoints.
+                // The window-gate Lambda's forced-OK at 09:20 does NOT
+                // purge datapoints, and the retuned alarm's 10-of-12
+                // lookback (12 min — the LONGEST of any gated alarm)
+                // reaches back to ~09:08 at its first gated evaluations:
+                // ~7 guaranteed pre-open breaching datapoints would need
+                // only ~3 open-ramp minutes > 40 (slow starters over the
+                // documented ~33 always-silent floor) to false-page at
+                // ~09:21 on ordinary days. Pre-open silence is not
+                // degradation; genuine counts start at the 09:15:00
+                // continuous-session open. The WS-GAP-06 error emission
+                // below is deliberately UNCHANGED (pre-existing behavior;
+                // it is a coalesced log, not an alarm datapoint).
+                const TICK_GAP_GAUGE_SESSION_OPEN_SECS_OF_DAY_IST: u32 = 9 * 3600 + 15 * 60;
+                let gauge_silent = if tickvault_common::market_hours::now_ist_secs_of_day()
+                    < TICK_GAP_GAUGE_SESSION_OPEN_SECS_OF_DAY_IST
+                {
+                    0.0
+                } else {
+                    total_silent as f64
+                };
+                metrics::gauge!("tv_tick_gap_instruments_silent").set(gauge_silent);
+                if total_silent == 0 {
+                    continue;
+                }
                 metrics::counter!("tv_tick_gap_summary_total").increment(1);
-                metrics::gauge!("tv_tick_gap_instruments_silent").set(total_silent as f64);
                 let top: Vec<(u64, &'static str, u64)> = gaps
                     .iter()
                     .take(10)
@@ -1988,6 +2031,25 @@ async fn main() -> Result<()> {
                 .await;
             });
             info!("FAST BOOT COMPLETE — tick processor started, ticks flowing (in-memory)");
+            // Silent-feed hardening Item 4 (2026-07-07 round-1 fix): spawn
+            // the Dhan exchange-lag p99 publisher on the FAST crash-recovery
+            // arm too. This arm `return run_shutdown_fast(...)`s and never
+            // reaches `start_dhan_lane`, so without this spawn a mid-market
+            // crash restart (the WS-GAP-09 exit(2) → systemd restart class)
+            // left `tv_dhan_exchange_lag_p99_seconds` unpublished for the
+            // rest of the session while the ring kept being written — and
+            // the lag alarm treats missing data as notBreaching, so the
+            // darkness was silent (exactly the 2026-07-06 incident class).
+            // Same once-per-process guard as the slow-lane site below.
+            if FEED_LAG_PUBLISHER_SUPERVISOR_SPAWNED.swap(true, std::sync::atomic::Ordering::SeqCst)
+            {
+                info!(
+                    "feed-lag publisher supervisor already running — skipping duplicate spawn \
+                     (fast boot)"
+                );
+            } else {
+                let _feed_lag_publisher_supervisor = spawn_supervised_feed_lag_publisher();
+            }
             // Phase 2.12 (hostile L1 fix): emit a boot-mode gauge so
             // operators can chart fast/slow boot history. Fast boot
             // intentionally passes None for tick_enricher (recovery
@@ -8156,9 +8218,12 @@ async fn start_dhan_lane(
             // token, spill remain genuine off-hours signals.
             //
             // Audit-findings Rule 4 (edge-trigger): sustained-degraded
-            // ticks do NOT spam Telegram. The Prometheus alert
-            // `tv-realtime-score-degraded` (5m sustained < 0.95) is
-            // the sustained-condition channel.
+            // ticks do NOT spam Telegram. The sustained-condition channel
+            // is the CloudWatch alarm `tv-prod-realtime-guarantee-degraded`
+            // (< 0.95, 9-of-15 × 60s, window-gated — silent-feed
+            // hardening Item 2, 2026-07-06 incident; the previously cited
+            // Prometheus alert `tv-realtime-score-degraded` was retired
+            // with the CloudWatch-only migration #O3).
             //
             // Gated on `config.features.realtime_guarantee_score`.
             if config.features.realtime_guarantee_score {
@@ -8197,6 +8262,27 @@ async fn start_dhan_lane(
                         ),
                     );
                 }
+            }
+
+            // Silent-feed hardening Item 4 (2026-07-06 incident): the Dhan
+            // exchange→receive lag p99 publisher. Every 10s it snapshots the
+            // trailing-60s lag window recorded by the tick processor's
+            // persist sites and publishes `tv_dhan_exchange_lag_p99_seconds`
+            // — ONLY in-session (Rule 3) and ONLY with ≥50 samples (Rule 11:
+            // a thin/empty window publishes NOTHING; 0 would read as
+            // "perfect lag"). Supervised (WS-GAP-05 / SLO-03 respawn
+            // pattern) and once-per-process — a D2b lane restart re-runs
+            // `start_dhan_lane`, and a duplicate supervisor would leak
+            // forever (same per-lane-leak class as the SLO publisher guard
+            // above).
+            if FEED_LAG_PUBLISHER_SUPERVISOR_SPAWNED.swap(true, std::sync::atomic::Ordering::SeqCst)
+            {
+                info!(
+                    "feed-lag publisher supervisor already running — skipping duplicate spawn \
+                     (lane restart)"
+                );
+            } else {
+                let _feed_lag_publisher_supervisor = spawn_supervised_feed_lag_publisher();
             }
         }
     }
@@ -11222,6 +11308,15 @@ fn compute_tick_freshness(silent_count: usize, universe_size: usize) -> f64 {
 static SLO_PUBLISHER_SUPERVISOR_SPAWNED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+/// Once-per-process spawn guard for the Dhan exchange-lag publisher
+/// supervisor (silent-feed hardening Item 4, 2026-07-06 incident). Same
+/// per-lane-leak rationale as [`SLO_PUBLISHER_SUPERVISOR_SPAWNED`]: D2b lane
+/// restarts re-run `start_dhan_lane`, and each re-invocation would otherwise
+/// leak a fresh never-aborted supervisor. The publisher reads the
+/// process-global lag ring, so it stays correct across lane restarts.
+static FEED_LAG_PUBLISHER_SUPERVISOR_SPAWNED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// F4 (2026-07-08): once-per-process spawn latch for the three market-open
 /// ONE-SHOT schedulers (09:14 readiness / 09:15:30 streaming heartbeat /
 /// 09:16 self-test). They are detached one-shots by design (self-exit after
@@ -11465,7 +11560,29 @@ fn spawn_slo_publisher_task(
             // pinned 1.0. Pure math + rationale in
             // `compute_tick_freshness` (unit-tested).
             const SLO_TICK_FRESHNESS_EXCLUDED_SIDS: &[u64] = &[21]; // INDIA VIX
-            let tick_freshness = if !in_market {
+            // Round-3 fix (2026-07-08, review finding 5): pin
+            // tick_freshness to 1.0 during the NSE pre-open /
+            // auction window [09:00, 09:15) IST, mirroring the
+            // off-hours pin. Continuous trading has not started —
+            // the boot-seeded ~775 SIDs are LEGITIMATELY silent
+            // (esp. the 09:08-09:15 matching/buffer freeze), so
+            // genuine freshness math drives the score far below
+            // 0.95 for ~7-10 consecutive pre-open minutes. The
+            // window-gate Lambda enables alarm actions at 09:20
+            // and forces OK — but forcing OK does NOT purge
+            // datapoints, so the new degraded alarm's 9-of-15
+            // lookback at ~09:21 would hold >= 9 breaching
+            // PRE-OPEN datapoints and false-page at open on
+            // ordinary days (every previously-gated alarm has a
+            // lookback <= 5 min, which is why the 2-of-2 critical
+            // sibling never paged at open). Pre-open silence is
+            // not degradation — same rationale class as the
+            // off-hours pin; genuine computation starts at the
+            // 09:15:00 continuous-session open.
+            const SLO_TICK_FRESHNESS_SESSION_OPEN_SECS_OF_DAY_IST: u32 = 9 * 3600 + 15 * 60;
+            let tick_freshness = if !in_market
+                || secs_of_day < SLO_TICK_FRESHNESS_SESSION_OPEN_SECS_OF_DAY_IST
+            {
                 1.0
             } else {
                 tickvault_core::pipeline::tick_gap_detector::global_tick_gap_detector()
@@ -11708,6 +11825,59 @@ fn spawn_supervised_slo_publisher(
             metrics::counter!("tv_slo_publisher_respawn_total", "reason" => reason).increment(1);
             tokio::time::sleep(std::time::Duration::from_secs(
                 SLO_PUBLISHER_RESPAWN_BACKOFF_SECS,
+            ))
+            .await;
+        }
+    })
+}
+
+/// Bounded backoff between Dhan exchange-lag publisher respawns (silent-feed
+/// hardening Item 4). Mirrors [`SLO_PUBLISHER_RESPAWN_BACKOFF_SECS`]: long
+/// enough to avoid a hot respawn loop, short enough that the
+/// `tv_dhan_exchange_lag_p99_seconds` stream resumes well inside one alarm
+/// evaluation period (the lag alarm needs 10 consecutive breaching minutes).
+const FEED_LAG_PUBLISHER_RESPAWN_BACKOFF_SECS: u64 = 5;
+
+/// Silent-feed hardening Item 4 — supervise the Dhan exchange-lag p99
+/// publisher (`tickvault_core::pipeline::feed_lag_monitor::run_dhan_lag_publisher`).
+///
+/// The publisher runs an infinite loop, so its `JoinHandle` resolves ONLY on
+/// a fatal event (panic or external cancel). This supervisor mirrors the
+/// SLO-03 / WS-GAP-05 / DISK-WATCHER-01 pattern: on every publisher death it
+/// logs `error!`, increments `tv_feed_lag_publisher_respawn_total{reason}`,
+/// backs off [`FEED_LAG_PUBLISHER_RESPAWN_BACKOFF_SECS`], and respawns so
+/// the lag gauge stream can never vanish silently. A dead-forever publisher
+/// degrades to missing data → `notBreaching` on the lag alarm (feed-dead
+/// stays owned by the silent-instruments + WS alarms).
+///
+/// No dedicated `ErrorCode` (least-new-surface, documented decision): the
+/// tag-guard requires a `code =` field only when the message mentions a
+/// tracked code, and the respawn counter + supervisor `error!` are the
+/// operator-visible signals — exactly the pre-SLO-03 DISK-WATCHER template
+/// without minting a new taxonomy entry for a brand-new observability-only
+/// task.
+// TEST-EXEMPT: cold-path supervisor spawn wrapper — exit classification is
+// the unit-tested `disk_health_watcher::classify_join_exit`; the boot wiring
+// is pinned by `test_feed_lag_publisher_supervisor_is_wired_into_main`.
+// O(1) EXEMPT: cold-path supervisor — one task per session, fires only on publisher death.
+#[must_use]
+fn spawn_supervised_feed_lag_publisher() -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            let handle =
+                tokio::spawn(tickvault_core::pipeline::feed_lag_monitor::run_dhan_lag_publisher());
+            let join_result = handle.await;
+            let reason = tickvault_storage::disk_health_watcher::classify_join_exit(&join_result);
+            error!(
+                reason,
+                backoff_secs = FEED_LAG_PUBLISHER_RESPAWN_BACKOFF_SECS,
+                "dhan exchange-lag publisher task exited — respawning so the \
+                 tv_dhan_exchange_lag_p99_seconds stream cannot vanish silently"
+            );
+            metrics::counter!("tv_feed_lag_publisher_respawn_total", "reason" => reason)
+                .increment(1);
+            tokio::time::sleep(std::time::Duration::from_secs(
+                FEED_LAG_PUBLISHER_RESPAWN_BACKOFF_SECS,
             ))
             .await;
         }

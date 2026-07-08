@@ -447,7 +447,7 @@ class Latency(unittest.TestCase):
 
     def test_parse_pctl_row_converts_micros_to_ms(self) -> None:
         feed, row = handler._parse_pctl_row(
-            "groww,48213,3,1500.0,42000.5,90000,250000,1817000"
+            "groww,48213,3,1500.0,42000.5,90000,250000,1817000,12"
         )
         self.assertEqual(feed, "groww")
         self.assertEqual(row["rows"], 48213)
@@ -457,36 +457,56 @@ class Latency(unittest.TestCase):
         self.assertEqual(row["p95_ms"], 90.0)
         self.assertEqual(row["p99_ms"], 250.0)
         self.assertEqual(row["max_ms"], 1817.0)
+        # Rule-11 companion: the replay-excluded count is a COUNT (not µs).
+        self.assertEqual(row["replay_excluded"], 12)
 
     def test_parse_pctl_row_zero_rows_and_nulls_degrade_to_none(self) -> None:
-        # Feed present in the window's DISTINCT but with no receive-stamped
-        # rows: count 0, aggregates null → None cells, never fake zeros.
-        feed, row = handler._parse_pctl_row("dhan,0,,,,,,")
+        # Feed present in the prune window's DISTINCT but with no rows
+        # RECEIVED in the last 120s: count 0, aggregates null → None cells,
+        # never fake zeros ("no rows received" is rendered, not 0-lag).
+        feed, row = handler._parse_pctl_row("dhan,0,,,,,,,")
         self.assertEqual(feed, "dhan")
         self.assertEqual(row["rows"], 0)
         self.assertEqual(row["neg_clamped"], 0)
+        # Empty replay cell → None (n/a), never a fake verified-0
+        # (finding 10: the excluder is dhan-only; non-dhan feeds emit a
+        # NULL leg, and a degraded dhan tail is "unknown", not "0").
+        self.assertIsNone(row["replay_excluded"])
         for col in handler._PCTL_COLS:
             self.assertIsNone(row[col])
         # Mixed null/NaN spellings are handled per cell.
-        _, row = handler._parse_pctl_row("dhan,100,0,null,NaN,,5000,9000")
+        _, row = handler._parse_pctl_row("dhan,100,0,null,NaN,,5000,9000,null")
         self.assertIsNone(row["p50_ms"])
         self.assertIsNone(row["p90_ms"])
         self.assertIsNone(row["p95_ms"])
         self.assertEqual(row["p99_ms"], 5.0)
         self.assertEqual(row["max_ms"], 9.0)
+        self.assertIsNone(row["replay_excluded"])
+        # An explicit 0 stays 0 (a dhan window with genuinely nothing
+        # excluded is a real measurement, distinct from n/a).
+        _, row = handler._parse_pctl_row("dhan,100,0,1,1,1,1,1,0")
+        self.assertEqual(row["replay_excluded"], 0)
+        # groww: NULL leg by construction → None → the page renders "—".
+        _, row = handler._parse_pctl_row("groww,100,0,1,1,1,1,1,null")
+        self.assertIsNone(row["replay_excluded"])
 
     def test_parse_pctl_row_rejects_malformed_and_bad_tokens(self) -> None:
         # A failed on-box query leaves an empty tail → skipped, not fabricated.
         self.assertEqual(handler._parse_pctl_row("dhan,"), (None, None))
         self.assertEqual(handler._parse_pctl_row(""), (None, None))
+        # Pre-2026-07-07 8-field shape (no replay_excluded column) → rejected
+        # rather than misparsed against the new 9-field contract.
+        self.assertEqual(
+            handler._parse_pctl_row("dhan,1,0,1,1,1,1,1"), (None, None)
+        )
         # Feed token outside the [a-z0-9_-]{1,32} allowlist → rejected
         # (defense in depth — mirrors the shell-side grep allowlist).
         self.assertEqual(
-            handler._parse_pctl_row("Feed$;drop,1,0,1,1,1,1,1"), (None, None)
+            handler._parse_pctl_row("Feed$;drop,1,0,1,1,1,1,1,0"), (None, None)
         )
         # Non-numeric row count → rejected.
         self.assertEqual(
-            handler._parse_pctl_row("dhan,abc,0,1,1,1,1,1"), (None, None)
+            handler._parse_pctl_row("dhan,abc,0,1,1,1,1,1,0"), (None, None)
         )
 
     def test_percentile_winners_lower_is_better_strict(self) -> None:
@@ -522,8 +542,8 @@ class Latency(unittest.TestCase):
     def test_parse_latency_percentile_block(self) -> None:
         stdout = (
             "T0=100.0\n"
-            "PCTL_ROW=dhan,50000,0,500000,800000,900000,990000,1200000\n"
-            "PCTL_ROW=groww,48213,3,1500,42000,90000,250000,1817000\n"
+            "PCTL_ROW=dhan,50000,0,500000,800000,900000,990000,1200000,3117\n"
+            "PCTL_ROW=groww,48213,3,1500,42000,90000,250000,1817000,0\n"
             "PCTL_ROW=badline\n"
             "QDB=0.0021\n"
             "T1=110.0\n"
@@ -532,10 +552,18 @@ class Latency(unittest.TestCase):
         self.assertEqual(set(out["percentiles"]), {"dhan", "groww"})
         self.assertEqual(out["percentiles"]["groww"]["p50_ms"], 1.5)
         self.assertEqual(out["percentiles"]["dhan"]["p50_ms"], 500.0)
+        # Rule-11 companion count surfaces per feed (rendered on the page).
+        self.assertEqual(out["percentiles"]["dhan"]["replay_excluded"], 3117)
+        self.assertEqual(out["percentiles"]["groww"]["replay_excluded"], 0)
         self.assertEqual(out["percentile_winners"]["p50_ms"], "groww")
         # dhan's max (1200ms) is lower than groww's (1817ms) — lower wins.
         self.assertEqual(out["percentile_winners"]["max_ms"], "dhan")
-        self.assertEqual(out["percentile_window_mins"], handler._PCTL_WINDOW_MINS)
+        self.assertEqual(
+            out["percentile_recv_window_secs"], handler._PCTL_RECV_WINDOW_SECS
+        )
+        self.assertEqual(
+            out["percentile_ts_prune_hours"], handler._PCTL_TS_PRUNE_HOURS
+        )
         self.assertEqual(out["percentile_sample_cap"], handler._PCTL_SAMPLE_CAP)
         # PCTL_ROW lines are intercepted BEFORE the generic K=V branch — the
         # ordinary fields still parse and nothing leaks into them.
@@ -557,6 +585,63 @@ class Latency(unittest.TestCase):
         self.assertIn("received_at != null", joined)
         # approx_percentile requires non-negative input → clamp, counted.
         self.assertIn("case when received_at - ts < 0 then 0", joined)
+        # IST timebase fix (2026-07-07): ts/received_at are stored
+        # IST-SHIFTED while QuestDB now() is UTC — every window predicate
+        # compares against IST_now = dateadd('m', 330, now()), never bare
+        # now(). (The old `ts > dateadd('m', -10, now())` was a ~5h40m
+        # window — the 2026-07-06 replay-conflation root cause.)
+        self.assertIn("dateadd('m', 330, now())", joined)
+        self.assertNotIn("dateadd('m', -10, now())", joined)  # the old bug
+        # Population = RECEIVE time (K=120s) — an exchange-time window would
+        # lag-censor (Rule-11): rows lagged beyond the window would vanish.
+        self.assertIn(
+            f"received_at >= dateadd('s', -{handler._PCTL_RECV_WINDOW_SECS}, "
+            "dateadd('m', 330, now()))",
+            joined,
+        )
+        # 6h ts bound = partition pruning ONLY (ticks is PARTITION BY HOUR
+        # on ts; received_at is not the designated timestamp).
+        self.assertIn(
+            f"ts > dateadd('h', -{handler._PCTL_TS_PRUNE_HOURS}, "
+            "dateadd('m', 330, now()))",
+            joined,
+        )
+        # EXACT replay excluder — DHAN ONLY (finding 10): capture_seq is a
+        # UTC-wall-nanos receipt stamp only for dhan (groww capture_seq is
+        # exchange-ts-seeded, so the predicate would censor genuine groww
+        # lag >60s and exclude nothing replayed). The shell branches per
+        # feed: dhan gets the excluder + counted complement; every other
+        # feed gets NO excluder and a NULL replay_excluded leg (n/a).
+        self.assertIn('if [ "$f" = dhan ]; then', joined)
+        self.assertIn(
+            "cast(capture_seq / 1000 + 19800000000 as timestamp)", joined
+        )
+        self.assertIn(
+            f"received_at < dateadd('s', {handler._PCTL_REPLAY_DWELL_SECS}, "
+            "cast(capture_seq / 1000 + 19800000000 as timestamp))",
+            joined,
+        )
+        self.assertIn("count() replay_excluded", joined)
+        self.assertIn(
+            f"received_at >= dateadd('s', {handler._PCTL_REPLAY_DWELL_SECS}, "
+            "cast(capture_seq / 1000 + 19800000000 as timestamp))",
+            joined,
+        )
+        self.assertIn(
+            "cast(null as long) replay_excluded from long_sequence(1)", joined
+        )
+        # The non-dhan SQL variant must carry NO capture-based predicate.
+        plain = handler._pctl_feed_sql(replay_excluder=False)
+        self.assertNotIn("capture_seq", plain)
+        # Sample bound ordered by the population's own key (finding 2):
+        # receive time, never exchange-ts (which would evict the
+        # most-lagged rows first when the 50K cap binds).
+        for sql in (plain, handler._pctl_feed_sql(replay_excluder=True)):
+            self.assertIn(
+                f"order by received_at desc limit {handler._PCTL_SAMPLE_CAP}",
+                sql,
+            )
+            self.assertNotIn("order by ts desc", sql)
         # Feed tokens from the DB are allowlist-validated BEFORE they are
         # interpolated into the per-feed SQL, and the loop is capped.
         self.assertIn(handler._PCTL_FEED_TOKEN_RE, joined)
