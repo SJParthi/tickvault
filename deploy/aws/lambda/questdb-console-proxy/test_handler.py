@@ -212,7 +212,8 @@ class Relay(WithBase):
     def test_shell_get_forces_identity_and_connection_close(self) -> None:
         # B4 r3 (honest wording — the r2 premise is DISPROVEN): these two
         # headers are RETAINED hygiene, NOT the shell fix. The 2026-07-06
-        # raw-socket probe (repro-evidence.md §3/§10, this directory) proved
+        # raw-socket probe (repro-evidence.md §3/§10, in
+        # docs/incidents/2026-07-06-questdb-console-shell-hang/) proved
         # QuestDB 9.3.5 IGNORES request `Connection: close` on the / 301 and
         # never closes the socket. The actual fix is the GET / -> /index.html
         # rewrite (asserted below) + the _NoFollowRedirect body-less 3xx

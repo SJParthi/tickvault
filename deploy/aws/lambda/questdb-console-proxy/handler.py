@@ -40,8 +40,8 @@ QDB_CONSOLE_BUILD = "b4-qdb-console-2026-07-06-r3"
 
 
 class _NoFollowRedirect(urllib.request.HTTPRedirectHandler):
-    """B4 r3 shell-hang fix, belt layer (2026-07-06, evidence:
-    repro-evidence.md §9a/§10, committed alongside this handler).
+    """B4 r3 shell-hang fix, belt layer (2026-07-06, evidence: §9a/§10 of
+    docs/incidents/2026-07-06-questdb-console-shell-hang/repro-evidence.md).
     QuestDB 9.3.5 answers GET / with an
     UNFRAMED keep-alive 301 (no Content-Length, no Transfer-Encoding, no
     Connection header) and NEVER closes the socket — even under request
@@ -264,23 +264,24 @@ def lambda_handler(event, _context):
     if denied:
         return {"err": denied}
 
-    # B4 r3 shell-load fix (2026-07-06, evidence: repro-evidence.md — committed
-    # alongside this handler).
+    # B4 r3 shell-load fix (2026-07-06, evidence:
+    # docs/incidents/2026-07-06-questdb-console-shell-hang/repro-evidence.md).
     # QuestDB 9.3.5 does NOT serve the console shell at "/": it answers an
     # UNFRAMED keep-alive 301 -> /index.html and never closes the socket, so
     # any read-until-EOF relay hangs until its socket timeout (GET / had
     # NEVER returned 200 through this console). Never elicit the 301: fetch
     # the framed shell directly. /index.html is 200 + Content-Length: 765 in
-    # ~4ms through this exact relay code and itself carries the per-release
-    # hashed asset refs (assets/index-<hash>.js), so the ASSET-HASH refs
-    # never drift on a QuestDB upgrade. The /index.html LOCATION itself IS a
+    # ~4ms through this exact relay code, and the per-release hashed asset
+    # refs (assets/index-<hash>.js) come from the shell itself, so they track
+    # whatever QuestDB version is deployed. The /index.html LOCATION is a
     # drift surface (a future QuestDB renaming it breaks this rewrite
-    # target) — guarded by the deploy-aws box canary (same-day WARN on the
-    # image-bump lane) + the terraform-apply hard gate (FATAL on the next
-    # drift apply). GET-only on purpose: HEAD / keeps relaying verbatim
-    # (QuestDB answers a FRAMED chunked 405 in 1.2ms; HEAD /index.html is
-    # live-unverified — don't change untested behavior). The browser URL
-    # stays "/"; the shell's RELATIVE asset refs resolve identically.
+    # target) — caught by deploy-aws.yml's box-local hard canary at the next
+    # box deploy (not same-instant) and by the terraform-apply console smoke
+    # gate on the next in-window apply. GET-only on purpose: HEAD / keeps
+    # relaying verbatim (QuestDB answers a FRAMED chunked 405 in 1.2ms;
+    # HEAD /index.html is live-unverified — don't change untested behavior).
+    # The browser URL stays "/"; the shell's RELATIVE asset refs resolve
+    # identically.
     if method == "GET" and path == "/":
         path = "/index.html"
 
@@ -294,7 +295,8 @@ def lambda_handler(event, _context):
             req.add_header(k, str(v))
     # B4 r3 header hygiene (2026-07-06). These two headers are RETAINED as
     # defense-in-depth ONLY — they are NOT the shell fix. Raw-socket proof
-    # 2026-07-06 (repro-evidence.md §3/§10, this directory): QuestDB 9.3.5 does
+    # 2026-07-06 (repro-evidence.md §3/§10, in
+    # docs/incidents/2026-07-06-questdb-console-shell-hang/): QuestDB 9.3.5 does
     # NOT honor request `Connection: close` on the / 301 (no close after a
     # 20s recv gap), disproving the r2 theory that the server would EOF the
     # socket once the body was sent. The actual fixes are (1) the

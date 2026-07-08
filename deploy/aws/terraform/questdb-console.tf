@@ -67,19 +67,15 @@ data "archive_file" "questdb_console_front" {
   type        = "zip"
   source_dir  = "${path.module}/../lambda/questdb-console-front"
   output_path = "${path.module}/.build/questdb-console-front.zip"
-  # Ship handler.py only — not test/docs. "**/__pycache__/**" (fixer round 11,
-  # 2026-07-08): the plan-mandated unit-test command runs inside this exact
-  # source_dir and GENERATES gitignored __pycache__/*.pyc there, so any
-  # NON-CI apply from a working tree where the tests ever ran (archive_file
-  # packages the LIVE directory, not the git index) would ship interpreter
-  # bytecode in the prod zip AND drift output_base64sha256 — the two failure
-  # classes the back block's comment below exists to prevent. Bytecode names
-  # are interpreter-version-dependent (handler.cpython-<NN>.pyc), so a
-  # literal filename cannot pin them; the doublestar glob is legal per the
-  # round-10 provider-docs note below. HONEST ENVELOPE: an operator apply
-  # with a stale pre-glob archive provider cached locally would not match the
-  # glob and would ship the bytecode exactly as before this fix — no worse
-  # than the status quo; CI pulls the latest provider, which supports globs.
+  # Ship handler.py only — not tests/docs. "**/__pycache__/**": the unit
+  # tests run inside this source_dir and generate gitignored interpreter
+  # bytecode there (archive_file packages the LIVE directory, not the git
+  # index); bytecode filenames are interpreter-version-dependent
+  # (handler.cpython-<NN>.pyc), so only a glob can pin them — legal, the
+  # hashicorp/archive provider documents doublestar glob excludes. HONEST
+  # ENVELOPE: a stale pre-glob archive provider cached for a local apply
+  # would not match the glob — no worse than the prior status quo; CI pulls
+  # the latest provider.
   excludes = ["test_handler.py", "README.md", "**/__pycache__/**"]
 }
 
@@ -88,35 +84,13 @@ data "archive_file" "questdb_console_proxy" {
   type        = "zip"
   source_dir  = "${path.module}/../lambda/questdb-console-proxy"
   output_path = "${path.module}/.build/questdb-console-proxy.zip"
-  # Ship handler.py ONLY. Fixer round 10 (2026-07-07) truth-correction: the
-  # round-8 claim here ("excludes are EXACT relative paths, no globs") was
-  # WRONG for the provider CI actually resolves — versions.tf pins only
-  # hashicorp/aws and no .terraform.lock.hcl is tracked, so `terraform init`
-  # pulls the LATEST hashicorp/archive provider, whose archive_file docs
-  # state excludes "Supports glob file matching patterns including
-  # doublestar/globstar (**) patterns". The entries below are LITERAL
-  # filenames, kept deliberately (they still match as exact names under glob
-  # semantics; zero packaging diff) so the zip contents stay hand-reviewable
-  # — but the POLICY stands on that choice, not on a no-globs limitation:
-  # every non-handler file committed into this source_dir MUST be added here
-  # (or the list switched to globs like "*.md"/"*.sh"). Fixer round 8
-  # (2026-07-07): the round-7 commit of repro-evidence.md (and round 8's
-  # gate-matrix-r7.sh) would otherwise ship inside the prod back-lambda zip,
-  # and any future edit to those docs/harness files would drift
-  # output_base64sha256 into a lambda redeploy from a non-code change.
-  # Fixer round 11 (2026-07-08): "**/__pycache__/**" added — the "ship
-  # handler.py ONLY" contract covered only COMMITTED files, but the
-  # plan-mandated `python3 -m unittest test_handler -v` run inside this
-  # source_dir GENERATES gitignored __pycache__/*.pyc (invisible to `git
-  # status`/review), so any NON-CI apply from a tree where the tests ever
-  # ran shipped bytecode in the prod zip AND drifted output_base64sha256 —
-  # exactly the two failure classes this comment exists to prevent (the CI
-  # apply path is a fresh checkout and was unaffected). Bytecode names are
-  # interpreter-version-dependent, so only a glob can pin them. HONEST
-  # ENVELOPE: a stale pre-glob archive provider cached for a local apply
-  # would not match the glob — no worse than the status quo; CI pulls the
-  # latest provider, which supports doublestar globs per the note above.
-  excludes = ["test_handler.py", "README.md", "repro-evidence.md", "gate-matrix-r7.sh", "**/__pycache__/**"]
+  # Ship handler.py only — same excludes rationale as the front block above.
+  # Incident evidence + the deploy-gate harness deliberately live OUTSIDE
+  # this packaging dir (docs/incidents/2026-07-06-questdb-console-shell-hang/
+  # and scripts/questdb-console-gate-matrix.sh) precisely so this list needs
+  # no special-casing; every non-handler file committed into this source_dir
+  # MUST be added here.
+  excludes = ["test_handler.py", "README.md", "**/__pycache__/**"]
 }
 
 # ─────────────────────────────────────────────────────────────────────────────

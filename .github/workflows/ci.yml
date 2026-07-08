@@ -467,35 +467,20 @@ jobs:
         shell: bash
         run: make lambda-test
 
-      # 2026-07-06 (console shell-hang fix, fixer round 4): before this step
-      # the QuestDB console lambda Python suites ran in NO CI lane — a PR
-      # reverting the B4 r3 handler fix (e.g. removing the _NoFollowRedirect
-      # opener or re-adding a body read in the 3xx arm) merged with every
-      # check green; only the terraform-apply.yml runtime deploy gate would
-      # catch it, and only on the next drift-apply. Both suites are
-      # stdlib-only (no boto3, no pip installs) and complete in <1s, so they
-      # run unconditionally inside this already-All-Green-gated job (a step
-      # in an existing needed job, NOT a new job — merge-gate-lock §5 forbids
-      # a PR-relevant job outside all-green's needs list).
-      #
-      # 2026-07-07 (fixer round 9): the step ALSO runs the FILE 5 deploy-gate
-      # behavioral matrix (gate-matrix-r7.sh, 18 scenarios since fixer
-      # round 11 — N pins the initial-probe 200-wrong-body FATAL, O the
-      # STATE_PRE=unknown loud-skip, P/Q the stopped+fast-503/504 FATAL;
-      # 14 in round 10 with scenario M, 13 through round 9 — ~1-2s, bash +
-      # python3 + PyYAML — preinstalled on ubuntu-latest). Before this, the
-      # harness ran in NO CI lane, so every "pinned by gate-matrix-r7.sh"
-      # comment was a manual-run-only claim (the same unenforced-pin class
-      # round 4 fixed for the unittest suites). The harness self-extracts the
-      # gate step from terraform-apply.yml and fails loudly ("gate step not
-      # found") if the step is deleted or renamed — since fixer round 11 that
-      # is a true single-message ABORT (previously the extractor error was
-      # buried under 14 misleading FAIL rows against an empty script; the
-      # exit code was already non-zero, so the merge ratchet always held) —
-      # closing that half of the gate-existence ratchet gap disclosed in the
-      # plan's alerting row.
-      # Honest residual: a `continue-on-error:` added to the gate step is NOT
-      # caught (the harness executes the step's script, not its YAML attrs).
+      # QuestDB console lambda suites + deploy-gate scenario harness
+      # (2026-07-06 shell-hang fix; simplified in the 2026-07-08 closure
+      # pass). Before this step the console lambda Python suites ran in NO CI
+      # lane — a PR reverting the B4 r3 handler fix merged with every check
+      # green. Both suites are stdlib-only (<1s) and run unconditionally
+      # inside this already-All-Green-gated job (a step in an existing needed
+      # job, NOT a new job — merge-gate-lock §5 forbids a PR-relevant job
+      # outside all-green's needs list). The harness self-extracts the
+      # console smoke-gate step from terraform-apply.yml and drives its
+      # decision tree end-to-end through stubbed terraform/aws/curl/sleep;
+      # it ABORTS loudly if the gate step is deleted or renamed. Honest
+      # residual: a `continue-on-error:` added to the gate step is NOT
+      # caught (the harness executes the step's script, not its YAML
+      # attributes), and nothing ratchets this ci.yml step's own existence.
       - name: QuestDB console lambda unit tests (back + front)
         shell: bash
         run: |
@@ -504,8 +489,8 @@ jobs:
             echo "== ${d} =="
             (cd "$d" && python3 -m unittest test_handler -v)
           done
-          echo "== gate-matrix-r7.sh (terraform-apply.yml console deploy-gate scenarios) =="
-          bash deploy/aws/lambda/questdb-console-proxy/gate-matrix-r7.sh
+          echo "== questdb-console-gate-matrix.sh (terraform-apply.yml console smoke-gate scenarios) =="
+          bash scripts/questdb-console-gate-matrix.sh
 
   # -------------------------------------------------------------------------
   # All Green — the single merge choke point (merge-gate hardening 2026-07-04).

@@ -1,13 +1,23 @@
 # QuestDB 9.3.5 GET / framing repro — evidence (2026-07-06)
 
+> **Closure amendment (2026-07-08 — location + probe scripts; no transcript
+> byte changed):** this file was RELOCATED from
+> `deploy/aws/lambda/questdb-console-proxy/` to this incidents directory so
+> that no evidence/harness file lives inside a lambda `archive_file`
+> packaging directory (the terraform excludes no longer need to special-case
+> it). The two probe scripts §9/§10 invoke are now committed alongside as
+> `repro_backlambda.py` and `raw_socket_probe.py` — both are RECONSTRUCTIONS
+> (labelled as such in their docstrings) of the session-ephemeral 2026-07-06
+> originals, rebuilt from §10's printed request bytes and §11 conclusion 5;
+> the frozen OUTPUT blocks below remain the raw evidence.
+>
 > **Provenance (fixer round 7, 2026-07-06):** this file was produced in the
-> 2026-07-06 repro session's local scratchpad and is committed here VERBATIM
+> 2026-07-06 repro session's local scratchpad and is committed VERBATIM
 > (content unchanged below this note) because the handler/test/workflow/plan
 > comments cite it as load-bearing evidence — a session-ephemeral scratchpad
 > path would be a dangling reference for every future reader of HEAD
-> (zero-loss-guarantee-charter §4 evidence discipline). It lives alongside
-> `handler.py` because every citation is from this lambda pair. This is a
-> frozen evidence artifact, NOT documentation to keep updated.
+> (zero-loss-guarantee-charter §4 evidence discipline). This is a frozen
+> evidence artifact, NOT documentation to keep updated.
 >
 > **Round-8 amendment (2026-07-07, the ONLY change below this note since the
 > round-7 freeze):** the §5 "stray body bytes" section was frozen with an

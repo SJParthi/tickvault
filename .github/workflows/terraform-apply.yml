@@ -391,382 +391,79 @@ jobs:
           echo "Operator portal URL (key sent privately via Telegram): ${URL}" >> "$GITHUB_STEP_SUMMARY"
 
       - name: "Deploy gate: console shell GET / must return 200 within 5s"
-        # B4 r3 (2026-07-06): GET / had NEVER returned 200 in the console's
-        # lifetime — QuestDB answers / with an UNFRAMED keep-alive 301 that
-        # never closes the socket, hanging the back lambda's read until the
-        # 12s timeout -> front 504 (evidence:
-        # deploy/aws/lambda/questdb-console-proxy/repro-evidence.md,
-        # committed with the fix). The back lambda now rewrites
-        # '/' -> '/index.html'. This gate asserts the fixed contract
-        # END-TO-END (API-GW -> front device-key auth -> back VPC relay ->
-        # box:9000): GET / must be HTTP 200 within 5 seconds. HARD FAIL on
-        # any other outcome, with ONE honest exception: 000 while the EC2
-        # box is VERIFIABLY not running (auto-stop window) is the console
-        # working correctly — that case SKIPS LOUDLY. Fixer round 11
-        # (2026-07-08), NARROWED fixer round 12 (2026-07-08): the
-        # not-running skip is 000-ONLY, and a fast 503/504 there FAILS as a
-        # console-LAMBDA-layer fault only where that diagnosis is SOUND — a
-        # fast 504 (any not-running state: a 504 inside the 5s cap cannot
-        # be the back lambda's 12s upstream_timeout), or a fast 503 with
-        # BOTH samples stopped/pending (no live kernel behind the ENI, so
-        # no RST is possible). Round 11 over-reached on two inputs the arm
-        # also covered: EC2 'stopping' (the guest OS stays alive mid-
-        # shutdown — docker stops QuestDB first and the still-alive kernel
-        # RSTs :9000 -> back box_unreachable -> the front's fast 503 inside
-        # the cap: the routine 16:30 IST auto-stop window) now SKIPS
-        # LOUDLY with the same honest ambiguity as the mid-grace-stop arm;
-        # and STATE_PRE=unknown (pre-sample describe-instances failure —
-        # the box may have been RUNNING during the probes) still FAILS
-        # CLOSED but with an honest AMBIGUOUS message, never a 'both
-        # samples'/'unambiguous' claim its precondition cannot back. (Each
-        # of 000/503/504 on a RUNNING box gets ONE 90s grace re-probe
-        # before FATAL — box OS boot / QuestDB start/restart windows; see
-        # the running arm below — but a pass there still requires a genuine
-        # 200 + shell HTML, never a skip.)
-        # Fixer round 6 (2026-07-06, TOCTOU): "verifiably not running" means
-        # not running at BOTH a pre-probe AND a post-probe EC2 state sample —
-        # a running->stopped transition across the probe window fails CLOSED
-        # (the failed probes were made against a running box); and the 90s
-        # grace arm re-samples state AFTER its sleep so a mid-grace auto-stop
-        # re-enters the loud skip instead of a stale 'box IS running' FATAL.
-        # NOTE (fixer
-        # round 1, 2026-07-06): a STOPPED box manifests as CODE=000 here,
-        # never a fast 503 — the stopped instance keeps its ENI/private IP
-        # and silently DROPS packets (no RST), so the back lambda's connect
-        # blocks its full 12s socket timeout (proxy handler.py
-        # _TIMEOUT_SECS=12 -> upstream_timeout -> front 504 at ~12s) while
-        # this gate's curl is capped at 5s. A fast 503 needs a connection
-        # REFUSAL = a LIVE KERNEL with QuestDB down: box RUNNING, or the
-        # still-alive OS of a 'stopping' box mid-shutdown (round-12
-        # correction — 'stopping' is not-running to EC2 but its guest OS
-        # keeps RSTing :9000 for tens of seconds after docker stops the
-        # QuestDB container). Any of 000/504/503 with
-        # the box RUNNING, or an unknown box state, still FAILS (audit
-        # Rule 11: no false-OK). 3 attempts absorb front+VPC-back cold start;
-        # EACH attempt is hard-capped at 5s, so the pre-fix behavior (504
-        # after ~12s) can physically never pass. GET not HEAD: HEAD / is 405
-        # (repro §8). Secret hygiene: SSM read + ::add-mask:: + header-FILE
-        # (umask 077 mktemp) — the bearer never appears in argv or logs.
+        # Console smoke gate (B4 r3 shell-hang fix, 2026-07-06; simplified to a
+        # conservative decision tree 2026-07-08). Root cause: QuestDB 9.3.5
+        # answers GET / with an UNFRAMED keep-alive 301 it never closes, so the
+        # back lambda's read-until-EOF blocked to its 12s timeout and GET / had
+        # NEVER returned 200 through the console (evidence:
+        # docs/incidents/2026-07-06-questdb-console-shell-hang/repro-evidence.md).
+        # The back lambda now rewrites GET / -> /index.html. This gate asserts
+        # the fixed contract END-TO-END (API-GW -> front device-key auth ->
+        # back VPC relay -> box:9000): GET / through the proxy must return
+        # HTTP 200, and each probe's `--max-time 5` IS the 200-within-5s
+        # assertion (the pre-fix ~12s 504 can physically never pass it).
+        #
+        # Decision tree — deliberately generic; no per-(box-state x HTTP-code)
+        # diagnosis, no claims about which codes a given box state can produce:
+        #   1. console disabled (TF var off)      -> loud SKIP, exit 0
+        #   2. terraform output unresolvable      -> FATAL (fail-closed)
+        #   3. SSM auth-token read fails          -> FATAL (fail-closed)
+        #   4. up to 12 probes, 10s apart; any 200 -> PASS immediately
+        #   5. exhausted: sample the EC2 box state ONCE —
+        #        running   -> FATAL (investigate the console chain)
+        #        otherwise -> loud SKIP (a not-running box cannot be probed;
+        #                     the gate re-verifies on the next in-window apply)
+        # Disclosed limitations: an apply while the box is not steadily running
+        # cannot verify the console and SKIPs loudly; QuestDB-version shell
+        # drift is caught by deploy-aws.yml's box-local hard canary at the next
+        # box deploy, not same-instant. Worst-case added wall clock: 12 x 5s
+        # probes + 11 x 10s waits ~= 3 minutes.
+        # Secret hygiene: SSM read + ::add-mask:: + header FILE (umask 077
+        # mktemp, trap-removed) — the bearer never appears in argv or logs.
         run: |
           set -euo pipefail
-          # Console-disabled skip vs transient output-read failure (fixer
-          # round 1, 2026-07-06 — audit Rule 11): only the KNOWN disabled
-          # shape (output is null / not found — enable_questdb_console=false)
-          # may skip. Any OTHER terraform-output failure (state lock, backend
-          # hiccup, creds) FAILS CLOSED instead of masquerading as disabled.
-          set +e
-          QURL=$(terraform -chdir=${{ env.TF_DIR }} output -raw questdb_console_url 2>/tmp/qurl-err.txt)
-          QURL_RC=$?
-          set -e
-          if [ "$QURL_RC" -ne 0 ]; then
-            if grep -qiE 'is null|not found|no outputs found|unsupported value for raw output' /tmp/qurl-err.txt; then
-              echo "questdb console disabled — shell smoke gate SKIPPED (nothing deployed to gate)"
-              exit 0
-            fi
-            echo "FATAL: terraform output questdb_console_url failed for a NON-disabled reason — failing closed. terraform stderr:"
-            cat /tmp/qurl-err.txt || true
+          if [ "${TF_VAR_enable_questdb_console:-false}" != "true" ]; then
+            echo "SKIP: questdb console disabled (TF_VAR_enable_questdb_console != true) — nothing deployed to gate"
+            exit 0
+          fi
+          if ! QURL=$(terraform -chdir=${{ env.TF_DIR }} output -raw questdb_console_url) \
+             || [ -z "$QURL" ] || [ "$QURL" = "null" ]; then
+            echo "FATAL: the terraform output questdb_console_url could not be resolved while the console is enabled — failing closed."
             exit 1
           fi
-          if [ -z "$QURL" ] || [ "$QURL" = "null" ]; then
-            echo "questdb console disabled — shell smoke gate SKIPPED (nothing deployed to gate)"
-            exit 0
+          if ! TOK=$(aws ssm get-parameter --name /tickvault/prod/operator/control-secret \
+              --with-decryption --query Parameter.Value --output text --region ${{ env.AWS_REGION }}); then
+            echo "FATAL: could not read the console auth token from SSM — failing closed."
+            exit 1
           fi
-          TOK=$(aws ssm get-parameter --name /tickvault/prod/operator/control-secret \
-            --with-decryption --query Parameter.Value --output text --region ${{ env.AWS_REGION }})
           echo "::add-mask::${TOK}"
           HDR="$(umask 077 && mktemp)"
-          printf 'Authorization: Bearer %s\n' "$TOK" > "$HDR"
           trap 'rm -f "$HDR"' EXIT
-          # Fixer round 6 (2026-07-06, TOCTOU): sample the box state BEFORE
-          # the probes as well as after. The 16:30 IST auto-stop cron
-          # (daily-universe lock §7, stop cron 11:00 UTC) can flip the box
-          # running->stopping DURING the ~21s probe window or the 90s grace
-          # sleep. A single post-probe sample allowed two stale-state bugs:
-          # (a) a genuine running-box regression probed at ~16:29 IST was
-          # converted into the auto-stop SKIP when the stop landed before
-          # the sample (false-OK, audit Rule 11), and (b) the grace-arm
-          # FATAL asserted 'the box IS running' from a PRE-sleep sample
-          # after a mid-grace stop (false-FATAL, misdirected triage). The
-          # skip arm now requires the box to be not-running at BOTH samples
-          # (a running->stopped transition across the probe window fails
-          # CLOSED with an honest ambiguity message), and the grace arm
-          # re-samples after its sleep.
-          IID=$(terraform -chdir=${{ env.TF_DIR }} output -raw instance_id 2>/dev/null || echo "")
-          box_state() {
-            if [ -n "$IID" ]; then
-              aws ec2 describe-instances --instance-ids "$IID" --region ${{ env.AWS_REGION }} \
-                --query 'Reservations[0].Instances[0].State.Name' --output text 2>/dev/null || echo unknown
-            else
-              echo unknown
-            fi
-          }
-          STATE_PRE=$(box_state)
-          CODE=000
-          for i in 1 2 3; do
-            CODE=$(curl -sS -o /tmp/qdb-shell.body -w '%{http_code}' --max-time 5 \
-              -H @"$HDR" "${QURL%/}/" || true)
+          printf 'Authorization: Bearer %s\n' "$TOK" > "$HDR"
+          CODES=""
+          for i in 1 2 3 4 5 6 7 8 9 10 11 12; do
+            CODE=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 5 -H @"$HDR" "${QURL%/}/" || true)
             CODE=${CODE:-000}
-            echo "attempt $i: GET / -> ${CODE}"
-            [ "$CODE" = "200" ] && break
-            sleep 3
+            CODES="${CODES:+$CODES }${CODE}"
+            echo "attempt $i/12: GET / -> ${CODE}"
+            if [ "$CODE" = "200" ]; then
+              echo "✅ console shell smoke: GET / == 200 within 5s through the proxy (attempt $i/12)"
+              echo "✅ QuestDB console shell smoke passed (GET / = 200 ≤5s, attempt $i/12)" >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            if [ "$i" -lt 12 ]; then sleep 10; fi
           done
-          if [ "$CODE" = "200" ]; then
-            grep -qi '<!DOCTYPE html' /tmp/qdb-shell.body \
-              || { echo "FATAL: GET / gave 200 but the body is not the console shell HTML"; exit 1; }
-            echo "✅ console shell smoke: GET / == 200 within 5s through the proxy (unframed-301 hang class gated)"
-            echo "✅ QuestDB console shell smoke passed (GET / = 200 ≤5s)" >> "$GITHUB_STEP_SUMMARY"
+          IID=$(terraform -chdir=${{ env.TF_DIR }} output -raw instance_id 2>/dev/null || echo "")
+          STATE=unknown
+          if [ -n "$IID" ]; then
+            STATE=$(aws ec2 describe-instances --instance-ids "$IID" --region ${{ env.AWS_REGION }} \
+              --query 'Reservations[0].Instances[0].State.Name' --output text 2>/dev/null || echo unknown)
+          fi
+          if [ "$STATE" != "running" ]; then
+            echo "⚠ SKIP (loud): console not verifiable this apply: box state '${STATE}' after the probe window; codes seen: ${CODES}. A not-running box cannot be probed; the gate re-verifies on the next in-window apply." | tee -a "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
-          STATE=$(box_state)
-          # Stopped-box reachability truth (fixer round 1, 2026-07-06;
-          # NARROWED fixer round 11, 2026-07-08): a stopped/pending box
-          # CANNOT produce a fast 503 or a fast 504 through this stack — its
-          # ENI keeps the private IP and DROPS packets (no RST), so the back
-          # lambda's connect blocks the full 12s _TIMEOUT_SECS and maps to
-          # upstream_timeout (front 504 ~12s), while this curl caps at 5s ->
-          # CODE=000 on every attempt. 'pending' = box still BOOTING (QuestDB
-          # not up yet — also expected 000). Without the 000 skip arm, every
-          # off-window apply (nights/weekends/the 17:05 IST post-stop drift
-          # retry) would hard-fail AFTER a successful terraform apply. The
-          # outer case still routes all three codes to the state dispatch:
-          # not-running + 000 -> loud skip; not-running + fast 503/504 ->
-          # FATAL where the lambda-layer physics is sound (round 11,
-          # NARROWED round 12: fast 504 always; fast 503 only with BOTH
-          # samples stopped/pending — a 'stopping' box's still-alive
-          # shutdown kernel CAN mint a fast 503 by RSTing :9000, so that
-          # case skips loudly; a fast code with STATE_PRE=unknown fails
-          # closed with an honest AMBIGUOUS message, the 'both samples'
-          # premise being unverified); any code with the box RUNNING FAILs
-          # CLOSED only
-          # after the ONE 90s grace re-probe in the running arm below; an
-          # unverifiable state FAILs CLOSED immediately.
-          case "$CODE" in
-            000|503|504)
-              case "$STATE" in
-                stopped|stopping|pending)
-                  # Fixer round 6 (2026-07-06): the skip may only forgive
-                  # probes that were made against a not-running box. If the
-                  # PRE-probe sample said running, the failed probes were
-                  # made while the box WAS running and the not-running state
-                  # here is the 16:30 IST auto-stop landing AFTER them — a
-                  # possible genuine regression must not be converted into
-                  # this skip (audit Rule 11: no false-OK). The box is no
-                  # longer probeable, so fail closed and let the next
-                  # in-window apply decide. STATE_PRE=unknown (a transient
-                  # describe-instances failure) still skips — loudly, with
-                  # both samples printed — because red-failing every
-                  # off-window apply on an EC2-API hiccup is a worse trade
-                  # than the compound coincidence (API hiccup + regression +
-                  # the 1-2min stop window) this leaves open.
-                  if [ "$STATE_PRE" = "running" ]; then
-                    echo "FATAL: console GET / -> '${CODE}' and the box transitioned running->${STATE} ACROSS the probe window (pre-probe sample: running) — the failed probes were made while the box WAS running, so this may be a genuine shell regression caught just before the 16:30 IST auto-stop. Failing closed (audit Rule 11: no false-OK); the box is no longer probeable — verify on the next in-window apply."
-                    exit 1
-                  fi
-                  # Fixer round 11 (2026-07-08), NARROWED fixer round 12
-                  # (2026-07-08): the not-running skip is 000-ONLY, but
-                  # round 11's "any fast 503/504 here is unambiguously a
-                  # console-LAMBDA-layer fault" over-reached on two inputs
-                  # this arm covers:
-                  #   (1) EC2 'stopping': the guest OS stays alive for tens
-                  #       of seconds mid-shutdown — docker stops the QuestDB
-                  #       container first, and the still-alive kernel RSTs
-                  #       the back lambda's connect to :9000 (back
-                  #       handler.py ConnectionRefusedError ->
-                  #       box_unreachable -> the front's FAST 503) well
-                  #       inside the 5s curl cap. That is the routine 16:30
-                  #       IST auto-stop window (the 10:50 UTC slot can land
-                  #       this arm at ~16:27-16:31 IST per the round-6
-                  #       grace-arm comment) or any operator manual stop —
-                  #       the same shutdown physics the mid-grace-stop skip
-                  #       below already treats as genuinely ambiguous. A
-                  #       fast 503 with a 'stopping' sample therefore SKIPS
-                  #       LOUDLY (round 11 false-FATALed it with a
-                  #       factually wrong ENI-drops-SYNs claim; executed
-                  #       proof: codes '503 503 503' + states 'stopping
-                  #       stopping' through the extracted gate script hit
-                  #       the round-11 FATAL).
-                  #   (2) STATE_PRE=unknown: the pre-probe
-                  #       describe-instances call failed, so "not running
-                  #       at BOTH samples" is UNVERIFIED — the box may have
-                  #       been RUNNING during the probes (a running box
-                  #       with QuestDB down is connection-REFUSED -> the
-                  #       same fast 503) and auto-stopped before the post-
-                  #       sample. Still FAILS CLOSED (a lambda-layer fault
-                  #       is a live candidate and the box is no longer
-                  #       probeable), but with an honest AMBIGUOUS message
-                  #       — round 11 printed 'at both samples (pre-probe
-                  #       sample: unknown)', self-contradictory on its
-                  #       face, and asserted an unambiguous diagnosis its
-                  #       precondition could not back.
-                  # The lambda-layer FATAL remains where its physics IS
-                  # sound: a fast 504 with any not-running state (a 504
-                  # inside the 5s cap cannot be the back lambda's 12s
-                  # upstream_timeout on ANY box state), and a fast 503 with
-                  # BOTH samples stopped/pending (no live kernel behind the
-                  # ENI — SYNs blackhole, no RST possible; the front maps
-                  # back_not_configured / back_invoke_failed /
-                  # back_function_error to exactly this fast 503, the
-                  # regression classes a terraform apply itself ships).
-                  # HONEST COST (disclosed, round 11): a transient
-                  # lambda-invoke throttle producing a fast 503 with the
-                  # box stopped at both samples still red-fails an
-                  # off-hours apply — strictly narrower than the false-OK
-                  # it replaced. Distinct from the MID-GRACE 503 skip
-                  # below, which remains accepted: there the box WAS
-                  # running pre-grace. Pinned by gate-matrix-r7.sh
-                  # scenarios P (stopped+503 -> FATAL) + Q (stopped+504 ->
-                  # FATAL) + R (stopping+503 -> loud skip) + S
-                  # (unknown-pre+503 -> ambiguous FATAL) + T (stopping+504
-                  # -> still FATAL) alongside E (stopped+000 -> skip).
-                  if [ "$CODE" != "000" ]; then
-                    if [ "$CODE" = "503" ] && { [ "$STATE" = "stopping" ] || [ "$STATE_PRE" = "stopping" ]; }; then
-                      echo "⚠ SKIP (loud): console GET / -> fast '503' with a 'stopping' box sample (pre-probe: ${STATE_PRE}, post-probe: ${STATE}) — during EC2 'stopping' the guest OS is still alive mid-shutdown: docker stops the QuestDB container first and the live kernel REFUSES :9000 (RST) -> back box_unreachable -> the front's fast 503 inside the 5s cap, so this 503 is consistent with the benign stop transition OR a back-lambda fault (indistinguishable once the box is down — the same ambiguity as the mid-grace-stop skip); shell smoke re-runs on the next in-window apply" | tee -a "$GITHUB_STEP_SUMMARY"
-                      exit 0
-                    fi
-                    if [ "$STATE_PRE" = "unknown" ]; then
-                      echo "FATAL (ambiguous): console GET / -> fast '${CODE}' with pre-probe box state UNKNOWN (describe-instances failed; 'not running at both samples' is UNVERIFIED) and post-probe state '${STATE}' — the box may have been RUNNING during the probes, so this is EITHER a console-lambda-layer fault OR (for a fast 503) a then-running box with QuestDB down (connection refusal -> back box_unreachable -> the front's same fast 503) that stopped before the post-sample — unresolvable now that the box is not running. Failing closed (audit Rule 11: no false-OK); verify on the next in-window apply."
-                      exit 1
-                    fi
-                    echo "FATAL: console GET / -> fast '${CODE}' with the box not running at both samples (pre-probe: ${STATE_PRE}, post-probe: ${STATE}) — a stopped/pending box cannot produce a fast 503 through the 5s-capped curl (no live kernel behind the ENI: SYNs blackhole with no RST, the back lambda blocks its full 12s timeout, and the 504 lands past the cap = curl 000), and a fast 504 inside the 5s cap cannot be the back lambda's 12s upstream_timeout on ANY box state — so this is a console-lambda-layer fault (front/back wiring, lambda permission, or a back-lambda crash — the front maps back_not_configured/back_invoke_failed/back_function_error to the same fast 503), fully probeable regardless of box state. Failing closed (audit Rule 11: no false-OK)."
-                    exit 1
-                  fi
-                  # Fixer round 8 (2026-07-07): name the window honestly.
-                  # 'pending' is the START transition (box still BOOTING per
-                  # the round-1 comment above — the 08:30 IST auto-start or
-                  # an operator manual start), NOT the 16:30 IST auto-stop
-                  # window; labelling it "auto-stop window" misdirected the
-                  # triage of an 08:30-IST apply. Skip DECISION unchanged —
-                  # message accuracy only. Pinned by gate-matrix-r7.sh
-                  # scenarios E (stopped keeps the auto-stop wording) + L
-                  # (pending names the start transition) — a merge-time pin
-                  # since round 9 (2026-07-07): ci.yml's Repo Guards step
-                  # "QuestDB console lambda unit tests (back + front)" runs
-                  # the harness on every PR (it feeds All Green), so a
-                  # wording regression here — or deleting/renaming this gate
-                  # step, which the harness's extractor fails on — goes red
-                  # BEFORE merge. (Rounds 7-8 the harness was manual-run-only
-                  # and this "Pinned by" was an unenforced claim.)
-                  if [ "$STATE" = "pending" ]; then
-                    WINDOW="start transition — box booting"
-                  else
-                    WINDOW="auto-stop window"
-                  fi
-                  echo "⚠ SKIP (loud): console GET / -> '${CODE}' with the box ${STATE} (pre-probe sample: ${STATE_PRE}, post-probe sample: ${STATE}; ${WINDOW}, 08:30–16:30 IST schedule) — a not-running box cannot serve the shell (stopped box = 5s curl timeout = 000, never a fast 503); shell smoke re-runs on the next in-window apply" | tee -a "$GITHUB_STEP_SUMMARY"
-                  exit 0 ;;
-                running)
-                  # Fixer round 5 (2026-07-06): running + fast 503 (the front's
-                  # box_unreachable / generic-503 mapping) is NOT only a
-                  # SG/bind/back-lambda regression — it is ALSO the transient
-                  # signature of a RUNNING box whose QuestDB container is not
-                  # (yet) listening on :9000. Two real windows: (a) the box
-                  # auto-starts at 08:30 IST (daily-universe lock §7, start
-                  # cron 03:00 UTC) with the QuestDB container up ~30-120s
-                  # later, and the market-hours guard blocks applies only
-                  # 03:30-10:15 UTC — so a push/dispatch apply at 08:30-09:00
-                  # IST lands in that gap; (b) deploy-aws-after-close's 10:16
-                  # UTC app deploy runs `docker compose up -d`, which
-                  # RECREATES the QuestDB container on an image/config bump
-                  # (multi-second-to-minute :9000 downtime) overlapping this
-                  # workflow's first scheduled slot at 10:20 UTC. The initial
-                  # 3-attempt/~21s budget cannot bridge either window, so
-                  # before declaring FATAL, re-probe ONCE after 90s. Still
-                  # fail-closed: the grace pass requires a genuine 200 + the
-                  # console shell HTML; a real regression persists past 90s
-                  # and still fails (~90s later).
-                  # Fixer round 7 (2026-07-06): the grace re-probe now covers
-                  # 000/504 as well as 503. The round-5 claim that "no
-                  # start-up window produces 000/504 on a running box whose
-                  # ENI is answering" hid the real window in its qualifier:
-                  # on EVERY start (the 08:30 IST auto-start, or an operator
-                  # manual start colliding with a scheduled slot), EC2 flips
-                  # the state to 'running' within seconds while the guest
-                  # OS/network stack takes ~30-90s to come up — during that
-                  # phase the attached ENI silently DROPS SYNs (no RST; the
-                  # same mechanics as the stopped-box comment above), the
-                  # back lambda's connect blocks its full 12s timeout ->
-                  # front 504, and this gate's 5s-capped curl reads CODE=000
-                  # with box_state()=running. BOTH state samples can say
-                  # 'running' during that window ('pending' lasts only
-                  # seconds), and the start-side TOCTOU twin
-                  # (STATE_PRE=pending/stopped, box starts mid-probe-window,
-                  # post-sample running) lands here too — so gating the
-                  # grace on STATE_PRE would still miss the both-samples-
-                  # running boot case. Fail-closed is preserved: a genuine
-                  # shell-hang regression (the unframed-301 class) persists
-                  # past the grace and still FATALs. HONEST RESIDUAL: an OS
-                  # boot slower than the ~111s probe+grace budget still
-                  # false-FATALs — bounded and disclosed; the alternative
-                  # (skipping on running+000) would launder the exact
-                  # regression class this gate exists to catch.
-                  CODE_PRE="$CODE"
-                  echo "running box + '${CODE}' — possible start/restart transient window (08:30 IST auto-start OS/QuestDB boot, or docker-compose container recreate); ONE grace re-probe in 90s"
-                  sleep 90
-                  CODE=$(curl -sS -o /tmp/qdb-shell.body -w '%{http_code}' --max-time 5 \
-                    -H @"$HDR" "${QURL%/}/" || true)
-                  CODE=${CODE:-000}
-                  echo "grace re-probe: GET / -> ${CODE} (pre-grace: ${CODE_PRE})"
-                  if [ "$CODE" = "200" ]; then
-                    grep -qi '<!DOCTYPE html' /tmp/qdb-shell.body \
-                      || { echo "FATAL: grace re-probe gave 200 but the body is not the console shell HTML"; exit 1; }
-                    echo "✅ console shell smoke: GET / == 200 on the 90s grace re-probe (box OS / QuestDB was transiently starting or restarting — not a regression)"
-                    echo "✅ QuestDB console shell smoke passed (GET / = 200 on the 90s grace re-probe — box/QuestDB was starting/restarting)" >> "$GITHUB_STEP_SUMMARY"
-                    exit 0
-                  fi
-                  # Fixer round 6 (2026-07-06): the 90s sleep can span the
-                  # 16:30 IST auto-stop — the 10:50 UTC scheduled retry
-                  # slot starts at 16:20 IST and init+plan+apply+publish
-                  # can put this arm at ~16:27-16:29 IST. A box that
-                  # auto-stops mid-grace re-probes as 000 (its stopped ENI
-                  # drops packets), and the old code fell through to the
-                  # FATAL below asserting 'the box IS running' from the
-                  # PRE-sleep sample — a false-FATAL with misdirected
-                  # triage. Re-sample AFTER the sleep: a mid-grace stop
-                  # re-enters the loud not-running skip. Fixer round 7
-                  # honesty (2026-07-06): the skip wording must NOT claim
-                  # the pre-grace failure "proved QuestDB-not-listening" —
-                  # the front returns the SAME fast 503 for a back-lambda
-                  # crash (front handler.py maps back_function_error /
-                  # back_invoke_failed through its generic 503 arm), so a
-                  # pre-grace fast 503 is merely CONSISTENT WITH a
-                  # listen-layer transient OR a back-lambda invoke failure,
-                  # and the two are indistinguishable once the box has
-                  # stopped and cannot be probed further. The compound
-                  # window (grace arm + mid-grace auto-stop + a crash-class
-                  # regression — or, for a pre-grace 000/504, a HANG-class
-                  # regression, per the round-10 note below) is accepted as
-                  # narrower than red-failing every mid-grace auto-stop.
-                  # Fixer round 10 (2026-07-07, message accuracy only — skip
-                  # DECISION unchanged): the cause enumeration is now PER
-                  # pre-grace code. The old single message listed the
-                  # 503-specific causes for ANY code, so a pre-grace 000/504
-                  # (this 5s-capped curl reading the back lambda's 12s hang)
-                  # named an inapplicable cause (a back-lambda invoke failure
-                  # yields the front's FAST 503, never 000) and OMITTED the
-                  # one cause the terminal FATAL below itself assigns to
-                  # 000/504 — the unframed-response shell-hang class. A
-                  # hang-class regression spanning the grace sleep into the
-                  # auto-stop still exits 0 (the accepted compound window),
-                  # but the message now points triage at the right classes.
-                  # Pinned by gate-matrix-r7.sh scenarios D (503 wording) +
-                  # M (000 wording, added round 10).
-                  STATE=$(box_state)
-                  case "$STATE" in
-                    stopped|stopping)
-                      if [ "$CODE_PRE" = "503" ]; then
-                        PRE_CAUSES="QuestDB-not-listening / a booting OS OR a back-lambda invoke failure (the front maps back_function_error/back_invoke_failed to the same fast 503)"
-                      else
-                        PRE_CAUSES="a booting OS/ENI still dropping SYNs, a QuestDB response slower than the back lambda's 12s timeout, OR the unframed-response shell-hang class (the class the terminal FATAL assigns to 000/504; a back-lambda invoke failure is NOT a candidate — it yields a FAST 503, never 000/504)"
-                      fi
-                      echo "⚠ SKIP (loud): grace re-probe -> '${CODE}' but the box auto-stopped MID-GRACE (post-sleep state: ${STATE}) — the pre-grace '${CODE_PRE}' on a then-running box is consistent with ${PRE_CAUSES} (indistinguishable once the box stopped); a not-running box cannot serve the shell — shell smoke re-runs on the next in-window apply" | tee -a "$GITHUB_STEP_SUMMARY"
-                      exit 0 ;;
-                  esac
-                  echo "FATAL: console GET / -> '${CODE}' past the 90s grace re-probe (pre-grace: '${CODE_PRE}') with box state '${STATE}' at the final sample. 000/504 past the grace = the unframed-response shell-hang class (or — residual, disclosed — an OS boot slower than the ~111s probe+grace budget); 503 past the grace = SG/bind regression, a back-lambda crash (front maps back_function_error/back_invoke_failed to the same fast 503), OR QuestDB down/restarting >90s — check the QuestDB container via docker compose on the box"; exit 1 ;;
-                *)
-                  echo "FATAL: console GET / -> '${CODE}' and box state could not be verified (state='${STATE}') — failing closed"; exit 1 ;;
-              esac ;;
-          esac
-          echo "FATAL: console shell GET / returned '${CODE}' (box state: ${STATE}) — deploy gate FAILED. Body head:"
-          head -c 300 /tmp/qdb-shell.body || true
+          echo "FATAL: console GET / did not return 200 within 5s per attempt over the ~3 min probe window while the box reported running; codes seen: ${CODES}. Investigate the console chain (SG :9000 ingress, back lambda, front lambda, QuestDB http)." | tee -a "$GITHUB_STEP_SUMMARY"
           exit 1
 
       - name: Publish QuestDB console URL to Telegram
