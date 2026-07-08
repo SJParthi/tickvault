@@ -432,6 +432,19 @@ fn index_futures_rs_body() -> String {
     std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {} failed: {e}", path.display()))
 }
 
+/// PRODUCTION region only — split at the first `#[cfg(test)]` (the house
+/// AGGREGATOR-SEAL-01 2026-07-06 precedent: a whole-file scan is satisfiable
+/// by test-fixture literals, making the membership pin vacuous — hostile-
+/// review round 3, 2026-07-08). Fails loudly if the marker ever disappears
+/// (a marker-less file would silently regress to the whole-file scan).
+fn index_futures_rs_production_region() -> String {
+    let body = index_futures_rs_body();
+    let Some((prod, _tests)) = body.split_once("#[cfg(test)]") else {
+        panic!("index_futures.rs must carry a #[cfg(test)] marker — production-region split");
+    };
+    prod.to_string()
+}
+
 #[test]
 fn futidx_scope_pinned_to_4_underlyings_nearest_expiry() {
     let body = rule_file_body();
@@ -450,7 +463,12 @@ fn futidx_scope_pinned_to_4_underlyings_nearest_expiry() {
             "rule file §36 must pin the FUTIDX-4 contract phrase: {phrase:?}"
         );
     }
-    let src = index_futures_rs_body();
+    // Hostile-review round 3 (2026-07-08): membership pins scan the
+    // PRODUCTION region ONLY — the whole-file scan was satisfiable by
+    // test-fixture literals (four_rows()/proptest lists carry the same
+    // quoted canonicals PLUS "FINNIFTY"), so a membership swap in the
+    // production const kept this ratchet green.
+    let src = index_futures_rs_production_region();
     assert!(
         src.contains("[IndexFutureUnderlying; 4]"),
         "INDEX_FUTURES_UNDERLYINGS must be an arity-4 array — a 5th underlying needs a rule edit"
@@ -462,9 +480,17 @@ fn futidx_scope_pinned_to_4_underlyings_nearest_expiry() {
     for canonical in ["\"NIFTY\"", "\"BANKNIFTY\"", "\"MIDCPNIFTY\"", "\"SENSEX\""] {
         assert!(
             src.contains(canonical),
-            "index_futures.rs must carry the canonical literal {canonical}"
+            "index_futures.rs PRODUCTION region must carry the canonical literal {canonical}"
         );
     }
+    // Non-vacuity self-test: the production region must EXCLUDE the
+    // test-only literals (FINNIFTY/BANKEX live in fixtures + the §36.2
+    // REJECT doc only) — proves the split actually removed the test region
+    // and the membership pin bites on the production const.
+    assert!(
+        !src.contains("\"FINNIFTY\""),
+        "production region must not carry \"FINNIFTY\" — the split is vacuous if it does"
+    );
 }
 
 #[test]
