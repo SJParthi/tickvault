@@ -27,9 +27,16 @@ fn read(rel: &str) -> String {
     fs::read_to_string(&p).unwrap_or_else(|e| panic!("read {}: {e}", p.display())) // APPROVED: test
 }
 
-/// Pull every `metric_name = "tv_..."` literal out of `app-alarms.tf`.
+/// Pull every `metric_name = "tv_..."` literal out of the app-level alarm
+/// terraform files. 2026-07-06 (silent-feed incident hardening): scope
+/// EXTENDED from app-alarms.tf alone to ALSO cover silent-feed-alarms.tf —
+/// the 3 new alarms (SLO degraded dead-band, per-feed BOUNDARY-01 catch-up
+/// storm, Dhan exchange-lag p99) live there for PR-conflict isolation and
+/// must pass the same emit-site + EMF-filter drift checks.
 fn alarm_metric_names() -> Vec<String> {
-    let tf = read("deploy/aws/terraform/app-alarms.tf");
+    let mut tf = read("deploy/aws/terraform/app-alarms.tf");
+    tf.push('\n');
+    tf.push_str(&read("deploy/aws/terraform/silent-feed-alarms.tf"));
     let mut out = Vec::new();
     for line in tf.lines() {
         let trimmed = line.trim();
@@ -149,6 +156,10 @@ fn emf_regex_body<'a>(body: &'a str, key: &str) -> Option<&'a str> {
 
 /// The set of `tv_*` names inside an EMF anchored-regex alternation body
 /// (`a|b|c`), sorted + de-duplicated for order-independent comparison.
+/// NOTE: this parses only the FIRST `metric_selectors` occurrence — i.e. the
+/// MAIN host-only declaration. Use `emf_all_declared_names` for the union
+/// across ALL declarations (the 2026-07-06 per-feed second declaration has
+/// a single-name `^tv_boundary_catchup_total$` selector with no `(...)`).
 fn emf_declared_names(body: &str, key: &str) -> Vec<String> {
     let mut names: Vec<String> = emf_regex_body(body, key)
         .unwrap_or_default()
@@ -156,6 +167,38 @@ fn emf_declared_names(body: &str, key: &str) -> Vec<String> {
         .map(|s| s.trim().to_string())
         .filter(|s| s.starts_with("tv_"))
         .collect();
+    names.sort();
+    names.dedup();
+    names
+}
+
+/// The union of `tv_*` names across EVERY `metric_selectors` entry in an
+/// agent config body — handles BOTH the anchored alternation form
+/// (`^(a|b|c)$`, the main host-only declaration) and the single-name form
+/// (`^tv_boundary_catchup_total$`, the 2026-07-06 per-feed declaration).
+fn emf_all_declared_names(body: &str) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    let mut rest = body;
+    while let Some(idx) = rest.find("\"metric_selectors\":") {
+        rest = &rest[idx + "\"metric_selectors\":".len()..];
+        let Some(open) = rest.find("[\"") else { break };
+        let after = &rest[open + 2..];
+        let Some(close) = after.find('"') else { break };
+        let regex = &after[..close];
+        // Strip the anchors: `^(...)$` (alternation) or `^...$` (single name).
+        let inner = regex
+            .trim_start_matches("^(")
+            .trim_start_matches('^')
+            .trim_end_matches(")$")
+            .trim_end_matches('$');
+        for n in inner.split('|') {
+            let n = n.trim();
+            if n.starts_with("tv_") {
+                names.push(n.to_string());
+            }
+        }
+        rest = &after[close..];
+    }
     names.sort();
     names.dedup();
     names
@@ -200,30 +243,79 @@ fn test_deployed_emf_source_labels_match_a_real_series_label() {
 }
 
 #[test]
-fn test_emf_metric_selectors_name_count_is_twenty_one() {
-    // Pin the EMF publish list: 19 alarm-backing signals + 2 memory-measurement
-    // gauges added 2026-07-02 for the 2K-universe RAM measurement
-    // (tv_process_rss_bytes — crates/storage/src/resource_monitor.rs;
+fn test_emf_metric_selectors_name_count_is_twenty_three() {
+    // Pin the MAIN (host-only) EMF publish list: 19 alarm-backing signals
+    // + 2 memory-measurement gauges added 2026-07-02 for the 2K-universe RAM
+    // measurement (tv_process_rss_bytes — crates/storage/src/resource_monitor.rs;
     // tv_subsystem_memory_estimated_bytes — crates/app/src/metrics_catalog.rs
-    // SUBSYSTEM_MEMORY_GAUGE_NAME). Cost note: each custom metric is ~$0.30/mo.
+    // SUBSYSTEM_MEMORY_GAUGE_NAME)
+    // + 2 silent-feed lag signals added 2026-07-06 (incident hardening):
+    // tv_dhan_exchange_lag_p99_seconds (feed_lag_monitor gauge, alarmed in
+    // silent-feed-alarms.tf) + tv_dhan_lag_samples_excluded_total (the
+    // WAL-replay exclusion visibility counter — Rule 11: exclusions must be
+    // visible, never silent). tv_boundary_catchup_total is NOT in this list —
+    // it publishes ONLY via the SECOND [host,feed] declaration (host-only
+    // folding would mask a Dhan storm under the Groww baseline).
+    // Cost note: each custom metric series is ~$0.30/mo.
     // If you intentionally add/remove a name, update BOTH configs + this pin.
     let user_data = read("deploy/aws/terraform/user-data.sh.tftpl");
     let names = emf_declared_names(&user_data, "metric_selectors");
     assert_eq!(
         names.len(),
-        21,
-        "Z+ L2 VERIFY ratchet: expected exactly 21 names in the EMF metric_selectors \
-         list; found {}: {names:?}",
+        23,
+        "Z+ L2 VERIFY ratchet: expected exactly 23 names in the MAIN EMF \
+         metric_selectors list; found {}: {names:?}",
         names.len()
     );
     for required in [
         "tv_process_rss_bytes",
         "tv_subsystem_memory_estimated_bytes",
+        "tv_dhan_exchange_lag_p99_seconds",
+        "tv_dhan_lag_samples_excluded_total",
     ] {
         assert!(
             names.iter().any(|n| n == required),
-            "Z+ L2 VERIFY ratchet: {required} must be in the EMF metric_selectors list \
-             (2K-universe memory measurement reads it as a real CloudWatch metric)."
+            "Z+ L2 VERIFY ratchet: {required} must be in the MAIN EMF metric_selectors \
+             list (2K-universe memory measurement + 2026-07-06 silent-feed lag signals \
+             read them as real CloudWatch metrics)."
+        );
+    }
+}
+
+#[test]
+fn test_second_emf_declaration_publishes_boundary_catchup_per_feed() {
+    // 2026-07-06 (silent-feed incident hardening): tv_boundary_catchup_total
+    // MUST be published under dimensions [host, feed] via a SECOND
+    // metric_declaration in BOTH agent configs. Per-feed is Rule-11-mandatory:
+    // Groww's 60s catch-up lateness margin makes catch-up sealing its ROUTINE
+    // steady-state path for quiet SIDs — a host-only folded series would
+    // either mask a Dhan storm under the Groww baseline or page on healthy
+    // Groww behaviour. The boundary_catchup_storm_dhan alarm
+    // (silent-feed-alarms.tf) keys on { host, feed = "dhan" }.
+    for rel in [
+        "deploy/aws/terraform/user-data.sh.tftpl",
+        "deploy/aws/cloudwatch-agent.json",
+    ] {
+        let body = read(rel);
+        assert!(
+            body.contains("\"dimensions\": [[\"host\", \"feed\"]]"),
+            "Z+ L2 VERIFY ratchet: {rel} must carry the SECOND metric_declaration with \
+             dimensions [[\"host\", \"feed\"]] — the per-feed BOUNDARY-01 export."
+        );
+        assert!(
+            body.contains("\"metric_selectors\": [\"^tv_boundary_catchup_total$\"]"),
+            "Z+ L2 VERIFY ratchet: {rel} must select ^tv_boundary_catchup_total$ in the \
+             per-feed declaration — without it the boundary-catchup-storm-dhan alarm \
+             evaluates against a permanently-empty metric."
+        );
+        // The per-feed declaration must NOT fold the metric host-only too:
+        // publishing BOTH a host-only and a [host,feed] series would double
+        // the cost and re-introduce the masked/folded series.
+        let main_names = emf_declared_names(&body, "metric_selectors");
+        assert!(
+            !main_names.iter().any(|n| n == "tv_boundary_catchup_total"),
+            "Z+ L2 VERIFY ratchet: {rel} must NOT list tv_boundary_catchup_total in the \
+             MAIN host-only declaration — it publishes ONLY under [host, feed]."
         );
     }
 }
@@ -273,8 +365,11 @@ fn test_deployed_emf_declaration_is_superset_of_every_alarm_metric() {
     // declaration, or the agent never publishes it and the alarm evaluates
     // against a permanently-empty metric (treat_missing_data=breaching pages
     // forever). This is the name-set superset check the restore fix pins.
+    // 2026-07-06: union across ALL metric_declaration entries — the per-feed
+    // [host,feed] second declaration carries tv_boundary_catchup_total, which
+    // backs the boundary-catchup-storm-dhan alarm.
     let user_data = read("deploy/aws/terraform/user-data.sh.tftpl");
-    let declared = emf_declared_names(&user_data, "metric_selectors");
+    let declared = emf_all_declared_names(&user_data);
     let alarms = alarm_metric_names();
     let missing: Vec<&String> = alarms.iter().filter(|a| !declared.contains(a)).collect();
     assert!(
@@ -316,6 +411,25 @@ fn test_reference_cloudwatch_agent_json_matches_deployed_emf_declaration() {
             .filter(|n| !deployed_names.contains(n))
             .collect::<Vec<_>>(),
     );
+    // 2026-07-06: the SECOND (per-feed) declaration must not drift either —
+    // compare the union across ALL declarations in both files.
+    let deployed_all = emf_all_declared_names(&user_data);
+    let reference_all = emf_all_declared_names(&reference);
+    assert_eq!(
+        deployed_all, reference_all,
+        "Z+ L3 RECONCILE drift-guard: the UNION of EMF-declared names (all \
+         metric_declaration entries, incl. the 2026-07-06 per-feed \
+         tv_boundary_catchup_total declaration) has drifted between the deployed \
+         user-data.sh.tftpl and the reference cloudwatch-agent.json."
+    );
+    assert!(
+        deployed_all
+            .iter()
+            .any(|n| n == "tv_boundary_catchup_total"),
+        "Z+ L3 RECONCILE drift-guard: tv_boundary_catchup_total must be declared \
+         (per-feed second declaration) — emf_all_declared_names parser broken or \
+         the declaration was deleted."
+    );
 }
 
 #[test]
@@ -336,8 +450,199 @@ fn test_emf_metric_namespace_is_tickvault_prod_in_both_configs() {
     }
 }
 
+/// Extract the body of a single `resource "aws_cloudwatch_metric_alarm" "<name>"`
+/// block from a terraform file body (brace-balanced scan from the header line).
+fn alarm_resource_block(body: &str, resource_name: &str) -> String {
+    let header = format!("resource \"aws_cloudwatch_metric_alarm\" \"{resource_name}\"");
+    let start = body
+        .find(&header)
+        .unwrap_or_else(|| panic!("resource block {resource_name} not found")); // APPROVED: test
+    let rest = &body[start..];
+    let open = rest.find('{').expect("resource block has an opening brace"); // APPROVED: test
+    let mut depth = 0usize;
+    for (i, ch) in rest[open..].char_indices() {
+        match ch {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return rest[..open + i + 1].to_string();
+                }
+            }
+            _ => {}
+        }
+    }
+    panic!("unbalanced braces in resource block {resource_name}"); // APPROVED: test
+}
+
+/// True iff `attr = value` (any whitespace around `=`) appears in the block.
+fn block_has_attr(block: &str, attr: &str, value: &str) -> bool {
+    block.lines().any(|l| {
+        let t = l.trim();
+        t.strip_prefix(attr)
+            .map(|rest| {
+                let rest = rest.trim_start();
+                rest.starts_with('=') && rest[1..].trim() == value
+            })
+            .unwrap_or(false)
+    })
+}
+
 #[test]
-fn test_app_alarms_count_is_thirteen() {
+fn test_tick_gap_silent_alarm_threshold_is_twenty_five() {
+    // 2026-07-06 incident pin: 29-67 of 776 instruments were silent EVERY
+    // minute while the old threshold=100 never crossed — zero pages all day.
+    // Threshold 25 (fires at >= 26) + 10-of-12 M-of-N at 60s/Maximum pages
+    // within 10-12 minutes on an incident replay while a 1-3 min reconnect
+    // blip cannot reach 10 breaching minutes. Regressing ANY of these values
+    // silently reproduces the miss.
+    let tf = read("deploy/aws/terraform/app-alarms.tf");
+    let block = alarm_resource_block(&tf, "tick_gap_instruments_silent");
+    assert!(
+        block_has_attr(&block, "threshold", "25"),
+        "tick_gap_instruments_silent threshold must be 25 (2026-07-06 retune):\n{block}"
+    );
+    assert!(
+        block_has_attr(&block, "comparison_operator", "\"GreaterThanThreshold\""),
+        "tick_gap_instruments_silent must use GreaterThanThreshold (fires at >= 26)"
+    );
+    assert!(
+        block_has_attr(&block, "evaluation_periods", "12")
+            && block_has_attr(&block, "datapoints_to_alarm", "10"),
+        "tick_gap_instruments_silent must latch M-of-N 10-of-12 (not strict-consecutive; \
+         the incident flapped 24/26/24 and one clean scrape must not erase 9 min of evidence)"
+    );
+    assert!(
+        block_has_attr(&block, "period", "60")
+            && block_has_attr(&block, "statistic", "\"Maximum\""),
+        "tick_gap_instruments_silent must evaluate period=60/Maximum (1 datapoint per 60s scrape)"
+    );
+    assert!(
+        block_has_attr(&block, "treat_missing_data", "\"notBreaching\""),
+        "tick_gap_instruments_silent must be notBreaching (nightly box stop)"
+    );
+}
+
+#[test]
+fn test_tick_gap_silent_alarm_is_window_gated() {
+    // Rule 3 (market-hours gate, MANDATORY): the silent-instruments gauge is
+    // written only in-session, so the LAST in-session value keeps being
+    // re-scraped 15:30->16:30 IST — a stale post-close value must never page.
+    // actions_enabled=false + the window-gate Lambda ALARM_NAMES entry is the
+    // enforcement pair; losing EITHER half re-opens the off-hours false-page.
+    let tf = read("deploy/aws/terraform/app-alarms.tf");
+    let block = alarm_resource_block(&tf, "tick_gap_instruments_silent");
+    assert!(
+        block_has_attr(&block, "actions_enabled", "false"),
+        "tick_gap_instruments_silent must ship actions_enabled=false (gate Lambda owns the window)"
+    );
+    let gate = read("deploy/aws/terraform/market-hours-liveness-alarm.tf");
+    assert!(
+        gate.contains("aws_cloudwatch_metric_alarm.tick_gap_instruments_silent.alarm_name"),
+        "tick_gap_instruments_silent must be in the window-gate Lambda ALARM_NAMES join \
+         (market-hours-liveness-alarm.tf) — without it the alarm stays actions-disabled forever"
+    );
+}
+
+#[test]
+fn test_realtime_guarantee_degraded_alarm_threshold_matches_slo_warn() {
+    // The degraded alarm's 0.95 threshold MUST equal SLO_WARN_THRESHOLD in
+    // crates/core/src/instrument/slo_score.rs — score == 0.95 is Healthy in
+    // Rust, and LessThanThreshold keeps it correctly non-breaching. If the
+    // Rust constant ever moves, this pin forces the alarm to move with it.
+    let slo = read("crates/core/src/instrument/slo_score.rs");
+    assert!(
+        slo.contains("pub const SLO_WARN_THRESHOLD: f64 = 0.95;"),
+        "SLO_WARN_THRESHOLD moved from 0.95 — update the realtime_guarantee_degraded \
+         alarm threshold in silent-feed-alarms.tf IN THE SAME PR, then update this pin"
+    );
+    let tf = read("deploy/aws/terraform/silent-feed-alarms.tf");
+    let block = alarm_resource_block(&tf, "realtime_guarantee_degraded");
+    assert!(
+        block_has_attr(&block, "threshold", "0.95"),
+        "realtime_guarantee_degraded threshold must equal SLO_WARN_THRESHOLD (0.95)"
+    );
+    assert!(
+        block_has_attr(&block, "comparison_operator", "\"LessThanThreshold\""),
+        "realtime_guarantee_degraded must use LessThanThreshold (score == 0.95 is Healthy)"
+    );
+    assert!(
+        block_has_attr(&block, "evaluation_periods", "15")
+            && block_has_attr(&block, "datapoints_to_alarm", "12"),
+        "realtime_guarantee_degraded must latch 12-of-15 — the incident OSCILLATED with 125 \
+         crossings of 0.95; strict 15/15 would never latch (Rule-11 false-OK reproduction)"
+    );
+    // Medium tier: the name/description must never carry a "critical" token —
+    // the < 0.80 sibling alarm owns that word.
+    for needle in ["alarm_name", "alarm_description"] {
+        let line = block
+            .lines()
+            .find(|l| l.trim_start().starts_with(needle))
+            .unwrap_or_else(|| panic!("{needle} missing from realtime_guarantee_degraded")); // APPROVED: test
+        assert!(
+            !line.to_lowercase().contains("critical"),
+            "realtime_guarantee_degraded {needle} must NOT contain a 'critical' token \
+             (Medium tier; the < 0.80 sibling owns Critical): {line}"
+        );
+    }
+}
+
+#[test]
+fn test_silent_feed_alarms_are_window_gated() {
+    // All 3 silent-feed alarms follow the house market-hours-gate pattern
+    // (Rule 3): actions_enabled=false + appended to the window-gate Lambda
+    // ALARM_NAMES (09:20-15:35 IST Mon-Fri). The SLO publisher runs 24/7
+    // with off-hours dimension dips; the lag gauge + tick-gap gauge go stale
+    // after close — every one of them false-pages without the gate.
+    let tf = read("deploy/aws/terraform/silent-feed-alarms.tf");
+    let gate = read("deploy/aws/terraform/market-hours-liveness-alarm.tf");
+    for name in [
+        "realtime_guarantee_degraded",
+        "boundary_catchup_storm_dhan",
+        "dhan_exchange_lag_p99_high",
+    ] {
+        let block = alarm_resource_block(&tf, name);
+        assert!(
+            block_has_attr(&block, "actions_enabled", "false"),
+            "{name} must ship actions_enabled=false (gate Lambda owns the window)"
+        );
+        assert!(
+            gate.contains(&format!("aws_cloudwatch_metric_alarm.{name}.alarm_name")),
+            "{name} must be in the window-gate Lambda ALARM_NAMES join \
+             (market-hours-liveness-alarm.tf)"
+        );
+    }
+}
+
+#[test]
+fn test_boundary_catchup_alarm_uses_per_feed_dimensions() {
+    // Rule-11 pin: the catch-up storm alarm must key on the EXPLICIT
+    // { host, feed = "dhan" } dimensions map — NOT local.app_dimensions
+    // (host-only). Groww's 60s catch-up margin makes catch-up sealing its
+    // ROUTINE steady state; a host-only series either masks a Dhan storm
+    // under the Groww baseline or pages on healthy Groww behaviour.
+    let tf = read("deploy/aws/terraform/silent-feed-alarms.tf");
+    let block = alarm_resource_block(&tf, "boundary_catchup_storm_dhan");
+    assert!(
+        block_has_attr(&block, "host", "\"tickvault-prod\"")
+            && block_has_attr(&block, "feed", "\"dhan\""),
+        "boundary_catchup_storm_dhan must carry the explicit {{ host, feed = dhan }} \
+         dimensions map:\n{block}"
+    );
+    assert!(
+        !block.contains("local.app_dimensions"),
+        "boundary_catchup_storm_dhan must NOT use local.app_dimensions (host-only folding \
+         masks a Dhan storm under the Groww catch-up baseline)"
+    );
+    assert!(
+        block_has_attr(&block, "statistic", "\"Sum\"") && block_has_attr(&block, "period", "300"),
+        "boundary_catchup_storm_dhan must evaluate Sum/300s — the CW agent ships counters \
+         as per-scrape DELTAS, so Sum over 5m IS increase(5m) (Rule 12)"
+    );
+}
+
+#[test]
+fn test_app_alarms_count_is_twenty() {
     // Pin the count so future PRs that delete an alarm without updating
     // the rule files / PR body fail this guard. Cost note (aws-budget.md)
     // depends on this number — keeping the budget honest means keeping
@@ -361,11 +666,23 @@ fn test_app_alarms_count_is_thirteen() {
     // tick at/after 15:30 IST, without threading a notifier into the per-tick
     // hot path. Cost: +1 custom metric (~$0.30/mo) + 1 alarm (~$0.10/mo),
     // negligible within the ~₹2,058/mo envelope.
+    // 20 (was 17) since 2026-07-06 (silent-feed incident hardening — the Dhan
+    // feed degraded all day with 4 independent signals and zero pages): scope
+    // now ALSO covers silent-feed-alarms.tf, which adds
+    // `tv_realtime_guarantee_score` (degraded 0.80-0.95 dead-band, 12-of-15),
+    // `tv_boundary_catchup_total` (per-feed dhan catch-up storm, PROVISIONAL
+    // 2000/5m x2) and `tv_dhan_exchange_lag_p99_seconds` (exchange->receive
+    // lag p99 > 10s x10). Note: the score name appears TWICE in the count
+    // (critical + degraded alarms watch the same metric). Cost: +4 custom
+    // metric series (~$1.20/mo) + 3 alarms (~$0.30/mo) — dated note in
+    // aws-budget.md.
     let count = alarm_metric_names().len();
     assert_eq!(
-        count, 17,
-        "Z+ L2 VERIFY ratchet: expected exactly 17 app-level CloudWatch alarms \
-         (one per critical app signal). Found {count}. If you intentionally added \
+        count, 20,
+        "Z+ L2 VERIFY ratchet: expected exactly 20 app-level CloudWatch alarm \
+         metric_name entries across app-alarms.tf + silent-feed-alarms.tf \
+         (one per critical app signal; tv_realtime_guarantee_score counts twice — \
+         critical + degraded). Found {count}. If you intentionally added \
          or removed one, update aws-budget.md custom-metric cost line AND this guard."
     );
 }

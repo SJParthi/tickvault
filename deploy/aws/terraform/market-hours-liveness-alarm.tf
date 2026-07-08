@@ -195,10 +195,18 @@ resource "aws_lambda_function" "tv_market_hours_liveness_gate" {
       # All market-hours-gated alarms (comma-separated). 2026-07-03: the two
       # app-alarms.tf value-based off-hours false-pagers joined the liveness
       # alarm under the same 09:20-15:35 IST Mon-Fri window.
+      # 2026-07-06 (silent-feed incident hardening): the retuned tick-gap
+      # alarm (its gauge is only written in-session, so the last value goes
+      # stale post-close) + the 3 new silent-feed alarms
+      # (silent-feed-alarms.tf) joined the same window.
       ALARM_NAMES = join(",", [
         aws_cloudwatch_metric_alarm.market_hours_liveness_missing.alarm_name,
         aws_cloudwatch_metric_alarm.realtime_guarantee_critical.alarm_name,
         aws_cloudwatch_metric_alarm.aggregator_no_seals.alarm_name,
+        aws_cloudwatch_metric_alarm.tick_gap_instruments_silent.alarm_name,
+        aws_cloudwatch_metric_alarm.realtime_guarantee_degraded.alarm_name,
+        aws_cloudwatch_metric_alarm.boundary_catchup_storm_dhan.alarm_name,
+        aws_cloudwatch_metric_alarm.dhan_exchange_lag_p99_high.alarm_name,
       ])
     }
   }

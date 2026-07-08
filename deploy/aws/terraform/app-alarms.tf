@@ -129,21 +129,45 @@ resource "aws_cloudwatch_metric_alarm" "questdb_disconnected" {
 
 # ---------------------------------------------------------------------------
 # 5. Many instruments silent — partial feed degradation
+#
+# RETUNED 2026-07-06 (silent-feed incident): Dhan degraded ALL day — 29-67 of
+# 776 instruments silent EVERY minute — and the old threshold=100 never
+# crossed, so zero pages. New tuning:
+#   - threshold 25 (fires at >=26). ABSOLUTE, not %-of-universe: no
+#     universe-size denominator exists in CW (tv_universe_size is kind-labeled
+#     and folds under the host-only EMF dimensions), and the universe is
+#     envelope-locked [100, 1200], so 25 = 3.2% of today's ~776 / 2.1% at the
+#     1200 cap. DATED REVISIT: re-tune if the universe re-scopes toward the
+#     1200 cap.
+#   - M-of-N 10-of-12 at period=60/Maximum (1 datapoint per 60s agent scrape):
+#     a value flapping 24/26/24 neither pages nor lets one clean scrape erase
+#     9 minutes of evidence; a 1-3 min reconnect blip cannot reach 10 breaching
+#     minutes. Incident floor 29 every minute -> pages within 10-12 min.
+#   - MARKET-HOURS GATE (audit-findings Rule 3, MANDATORY): the gauge is set
+#     only in-session (main.rs tick-gap scan gates on
+#     is_within_trading_session_ist), so the LAST in-session value keeps being
+#     re-scraped 15:30->16:30 IST — a stale post-close value must never page.
+#     Actions OFF by default; the shared market-hours gate Lambda
+#     (market-hours-liveness-alarm.tf) enables them 09:20-15:35 IST Mon-Fri.
 # ---------------------------------------------------------------------------
 resource "aws_cloudwatch_metric_alarm" "tick_gap_instruments_silent" {
   alarm_name          = "tv-${var.environment}-tick-gap-instruments-silent"
-  alarm_description   = "> 100 instruments have been silent for the tick-gap threshold (30s default). Likely a slow socket or Dhan segment outage. See WS-GAP-06 runbook."
+  alarm_description   = "> 25 instruments silent (tick-gap threshold, 30s default) sustained >=10 of 12 min in-market. Partial feed degradation — slow socket or Dhan segment outage. Actions gated to 09:20-15:35 IST Mon-Fri by the market-hours gate Lambda (the gauge is only written in-session, so its last value goes stale post-close). See WS-GAP-06 runbook."
   comparison_operator = "GreaterThanThreshold"
-  evaluation_periods  = 2
+  evaluation_periods  = 12
+  datapoints_to_alarm = 10
   metric_name         = "tv_tick_gap_instruments_silent"
   namespace           = local.app_namespace
   period              = 60
   statistic           = "Maximum"
-  threshold           = 100
+  threshold           = 25
   treat_missing_data  = "notBreaching"
   dimensions          = local.app_dimensions
-  alarm_actions       = local.app_alarm_actions
-  ok_actions          = local.app_alarm_ok
+  # Actions OFF by default; the market-hours gate Lambda flips them ON
+  # 09:20-15:35 IST Mon-Fri (market-hours-liveness-alarm.tf).
+  actions_enabled = false
+  alarm_actions   = local.app_alarm_actions
+  ok_actions      = local.app_alarm_ok
 }
 
 # ---------------------------------------------------------------------------
@@ -494,7 +518,7 @@ resource "aws_cloudwatch_metric_alarm" "mem_used_high" {
 # ---------------------------------------------------------------------------
 
 output "app_cloudwatch_alarms" {
-  description = "17 application-level alarms (15 Prometheus-via-CW-agent + 1 disk-used + 1 mem-used Metrics-Insights). Cost note: total alarms 6 → 23; overage above the 10 free-tier alarms ≈ $1.30/mo + 15 custom metrics ≈ $0.75/mo ≈ ₹175/mo — well inside the $55 budget cap."
+  description = "17 application-level alarms in THIS file (15 Prometheus-via-CW-agent + 1 disk-used + 1 mem-used Metrics-Insights); 3 more silent-feed alarms live in silent-feed-alarms.tf (2026-07-06 incident hardening). tick-gap-instruments-silent was RETUNED 2026-07-06 (threshold 100 -> 25, 10-of-12 min, market-hours-gated). Cost note: total alarms 6 → 23 → 27 (incl. market-hours-liveness + 3 silent-feed); overage above the 10 free-tier alarms ≈ $1.70/mo + custom metrics ≈ $1.95/mo (15 → +4 series 2026-07-06) ≈ ₹310/mo — well inside the $55 budget cap."
   value = [
     aws_cloudwatch_metric_alarm.disk_used_high.alarm_name,
     aws_cloudwatch_metric_alarm.mem_used_high.alarm_name,
