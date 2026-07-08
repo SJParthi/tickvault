@@ -799,7 +799,8 @@ fn test_tick_gap_silent_alarm_threshold_is_forty() {
         block_has_attr(&block, "evaluation_periods", "12")
             && block_has_attr(&block, "datapoints_to_alarm", "10"),
         "tick_gap_instruments_silent must latch M-of-N 10-of-12 (not strict-consecutive; \
-         the incident flapped 24/26/24 and one clean scrape must not erase 9 min of evidence)"
+         a threshold-adjacent value flapping 39/41/39 must neither page nor let one clean \
+         scrape erase 9 min of evidence — the incident band was 29-67 silent/min)"
     );
     assert!(
         block_has_attr(&block, "period", "60")
