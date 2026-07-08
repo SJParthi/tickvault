@@ -44,6 +44,7 @@ pub mod phase;
 pub mod price_precision;
 pub mod sanitize;
 pub mod segment;
+pub mod source_scan;
 pub mod tick_types;
 pub mod trading_calendar;
 pub mod types;
