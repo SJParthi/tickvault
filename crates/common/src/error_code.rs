@@ -1464,8 +1464,19 @@ impl ErrorCode {
     /// daemon will log a summary and stop.
     ///
     /// Conservative default: Critical errors are NEVER auto-actioned.
+    ///
+    /// Severity-independent overrides (design contracts pinning MANUAL
+    /// triage on a non-Critical code):
+    /// - `FUTIDX-02` (hostile-review round 3, 2026-07-08): a cross-feed
+    ///   data-comparability verdict must never be auto-actioned — the
+    ///   operator judges WHICH vendor master is stale (design contract
+    ///   `is_auto_triage_safe() == false`; previously drifted to the
+    ///   blanket severity derivation and papered over in runbook prose).
     #[must_use]
     pub const fn is_auto_triage_safe(self) -> bool {
+        if matches!(self, Self::Futidx02CrossFeedExpiryMismatch) {
+            return false;
+        }
         !matches!(self.severity(), Severity::Critical)
     }
 
@@ -2002,6 +2013,30 @@ mod tests {
             "GROWW-SCALE-05 runbook missing on disk: {shown}"
         );
         assert!(ErrorCode::all().contains(&code));
+    }
+
+    #[test]
+    fn test_futidx_codes_contract() {
+        // §36 FUTIDX-4 (hostile-review round 3, 2026-07-08).
+        let f1 = ErrorCode::Futidx01SelectionDegraded;
+        assert_eq!(f1.code_str(), "FUTIDX-01");
+        assert_eq!("FUTIDX-01".parse::<ErrorCode>(), Ok(f1));
+        assert_eq!(f1.severity(), Severity::High);
+        // Per-feed degrade self-heals next boot — auto-triage may inspect.
+        assert!(f1.is_auto_triage_safe());
+
+        let f2 = ErrorCode::Futidx02CrossFeedExpiryMismatch;
+        assert_eq!(f2.code_str(), "FUTIDX-02");
+        assert_eq!("FUTIDX-02".parse::<ErrorCode>(), Ok(f2));
+        assert_eq!(f2.severity(), Severity::High);
+        // Design contract (FINAL.md D0.5/T3.4): a cross-feed comparability
+        // verdict is NEVER auto-actioned despite being non-Critical — the
+        // severity-independent override arm, not the blanket derivation.
+        assert!(!f2.is_auto_triage_safe());
+        assert_eq!(
+            f2.runbook_path(),
+            ".claude/rules/project/futidx-4-error-codes.md"
+        );
     }
 
     #[test]
