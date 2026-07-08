@@ -252,7 +252,7 @@ For every plan item / new feature / Telegram message / docs:
 | Depth-200 (`full-depth-api.dhan.co/?token=...`) | Same |
 | Any 2nd/3rd/4th/5th main-feed conn | 4 SIDs fit on 1 conn (Dhan cap = 5,000/conn). More conns = wasted token + IP budget |
 | Any new WS endpoint Dhan ships in future | Not in scope without operator re-approval |
-| NSE_EQ / NSE_FNO / BSE_FNO / MCX / currency subscriptions | Compile-time impossible — `SubscriptionScope` is a single-variant enum |
+| NSE_EQ / NSE_FNO / BSE_FNO / MCX / currency subscriptions — **except the 4 §36 FUTIDX contracts** (NSE_FNO ×3: NIFTY/BANKNIFTY/MIDCPNIFTY + BSE_FNO ×1: SENSEX future; operator quote 2026-07-08 in the banner above) | `SubscriptionScope` stays a single-variant enum; the ONLY runtime path that can emit an NSE_FNO/BSE_FNO subscription is the `IndexFuture` role (arity-4-ratcheted by `daily_universe_scope_guard.rs`) — everything else in this row remains impossible (hostile-review round 2, 2026-07-08: the pre-§36 "compile-time impossible" blanket rationale was stale for those two segments and is corrected here inline, matching the banner) |
 
 **Reconnect parity (both allowed WS types):**
 

@@ -149,3 +149,54 @@ Scope addendum (Status stays VERIFIED; fixes landed post-plan as review remediat
       test_record_selection_mismatch_verdict_through_recorder.
 - [x] R1-J (LOW): plan-builder doc block displaced onto the private segment helper.
       Fixed: doc reattached to `build_subscription_plan_from_daily_universe`.
+
+## Hostile-review round 2 (2026-07-08) — 7 confirmed findings, all fixed
+
+- [x] R2-1 (MEDIUM): exact-duplicate CSV/master lines (same SECURITY_ID /
+      exchange_token) counted as AmbiguousDuplicateExpiry → mandated future
+      dropped for the day. Fixed: first-row-wins identity dedup BEFORE the
+      ambiguity count on BOTH feeds; truly-distinct ids stay fail-closed.
+      - Files: crates/core/src/instrument/index_futures.rs,
+        crates/core/src/feed/groww/instruments.rs
+      - Tests: test_select_dedups_exact_duplicate_security_id_before_ambiguity,
+        test_extract_dedups_exact_duplicate_token_before_ambiguity
+- [x] R2-2 (MEDIUM): plan edge-case claim "boot spanning IST midnight → both
+      builders re-run for the new date" was not delivered (date frozen at boot
+      entry across the §4 retry loop → stale T-0 selection after midnight).
+      Fixed: `run_daily_universe_fetch_runner` takes a date CLOSURE re-derived
+      per build attempt; boot passes the live IST wall clock.
+      - Files: crates/core/src/instrument/instr_fetch_runner.rs,
+        crates/app/src/daily_universe_boot.rs
+      - Tests: runner_rederives_trading_date_per_build_attempt
+- [x] R2-3 (LOW): feed='groww' FUTIDX lifecycle rows had empty
+      underlying_symbol. Fixed: canonical threaded via
+      WatchEntry.underlying_symbol into the master-row writer;
+      underlying_security_id stays 0 (documented — no numeric id exists).
+      - Files: crates/core/src/feed/groww/{instruments,shared_master_writer}.rs
+      - Tests: test_master_writer_labels_fno_ltp_entries_futidx (extended),
+        test_extract_dedups_exact_duplicate_token_before_ambiguity (thread assert)
+- [x] R2-4 (LOW): Dhan gauge pre-plan + planner-stage drops only warn!.
+      Fixed: gauge moved to the plan builder (POST-PLAN IndexDerivative
+      count) + FUTIDX-01 error on any planner-stage future drop.
+      - Files: crates/core/src/instrument/subscription_planner.rs,
+        daily_universe_orchestrator.rs (pre-plan gauge removed)
+      - Tests: test_plan_futidx_planner_drop_is_counted_post_plan
+- [x] R2-5 (LOW): Groww cap-drop FUTIDX-01 misattributed an intra-futures
+      dedup collapse to a cap override. Fixed: expected = distinct
+      (exchange, token, segment) count; the collapse is its own loud
+      FUTIDX-01 cause + tv_index_futures_dedup_dropped_total.
+      - Tests: test_distinct_future_key_count_folds_duplicate_tokens
+- [x] R2-6 (LOW): warm-boot day had no Dhan parity record / gauge / evidence
+      until the background reconcile (never, if it failed). Fixed: shared
+      `record_dhan_selection_from_universe` called from BOTH orchestrator
+      Step 3d (post-build) and the main.rs warm-snapshot path; gauge covered
+      by R2-4 (the warm path calls the same plan builder).
+      - Files: index_futures.rs (helper), daily_universe_orchestrator.rs,
+        crates/app/src/main.rs
+      - Tests: builds_universe_with_futidx_rows_selects_index_futures (extended
+        with dhan_selections_from_universe derivation asserts)
+- [x] R2-7 (LOW): charter §I banner claimed the forbidden row was carved down
+      while the row text + stale "compile-time impossible" rationale were
+      unchanged. Fixed: row edited inline with the carve-out + corrected
+      rationale.
+      - Files: .claude/rules/project/operator-charter-forever.md
