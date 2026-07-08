@@ -241,12 +241,14 @@ flapper invisible) is the proof.
   INSUFFICIENT_DATA→OK on its first evaluation; CloudWatch invokes ok_actions
   on ANY transition into OK, and the telegram-webhook Lambda formats every OK
   as a green ✅ message (it reads only NewStateValue — no OldStateValue
-  filter). Expect up to ~7 one-time "recovered" messages the apply evening
-  for conditions that were never in alarm: the 4 `ok_recovery = true` errcode
-  alarms (dh-901, auth-gap-04, ws-gap-07, feed-stall-01) + feed-stall-restarts
-  + readiness-lambda-errors + market-hours-gate-errors (round-13; the
-  reconnect-storm alarm is exempt —
-  `actions_enabled = false` until the market-hours gate arms it). Creation
+  filter). Expect up to ~5 one-time "recovered" messages the apply evening
+  for conditions that were never in alarm (canonical count, round-14): the
+  4 `ok_recovery = true` errcode alarms (dh-901, auth-gap-04, ws-gap-07,
+  feed-stall-01) + feed-stall-restarts. Exempt: the reconnect-storm alarm
+  (`actions_enabled = false` until the market-hours gate arms it) and BOTH
+  AWS/Lambda Errors watchman alarms — readiness-errors +
+  market-hours-gate-errors — via `ok_actions = []` (round-14: their Lambdas
+  run 1-2x/day, so a post-ALARM auto-OK is aged-out, never a fix). Creation
   settling, not recoveries; house precedent (every prior alarm PR did the
   same). An OldStateValue == INSUFFICIENT_DATA suppression branch in the
   telegram-webhook Lambda is a flagged follow-up (benefits all future alarm
@@ -347,7 +349,7 @@ flapper invisible) is the proof.
 - Post-apply (PR-body runbook): `describe-log-streams` freshness check on
   `/tickvault/prod/app` (expect up to a few one-time backfill errcode pages
   within ~10 min of the agent-config deploy — from_beginning replay of
-  today's already-logged errors, see Edge Cases; ALSO expect up to ~7
+  today's already-logged errors, see Edge Cases; ALSO expect up to ~5
   one-time green ✅ "OK" messages the apply evening — new-alarm
   INSUFFICIENT_DATA→OK creation settling, not recoveries, see Edge Cases;
   wait for those to settle
@@ -393,7 +395,14 @@ flapper invisible) is the proof.
   it is not fixed by the episode aging out) and dh-906 (a discrete per-order
   reject). For these the auto-OK ~15 min after the datapoint ages out would
   be a Rule-11 false "recovered" page (the webhook Lambda forwards OK states
-  as a green message), so their OK pages are suppressed. auth-gap-04 keeps
+  as a green message), so their OK pages are suppressed. Also suppressed
+  (round-14, `ok_actions = []`): BOTH AWS/Lambda Errors watchman alarms —
+  readiness-errors + market-hours-gate-errors — their Lambdas run 1-2x/day,
+  so the post-ALARM auto-OK (notBreaching on missing data) is always
+  aged-out, never a fix; for the gate watchman the green additionally
+  invited skipping the manual re-arm of the 4 gated alarms (incl. the leg-3
+  reconnect-storm pager) — its description now says re-arm manually
+  REGARDLESS. auth-gap-04 keeps
   ok_actions ON with a stated residual: it repeat-emits per failing boot
   cycle under systemd Restart=always, so OK ≈ stopped firing — unless
   StartLimitBurst (8/600s) halted the unit, in which case the OK is
@@ -474,4 +483,4 @@ table); the honest-100% envelope wording is in the header block above.
 | 15 | Groww stall-flap slower than ~1 restart / 7.5 min | NEVER paged — stated residual (span-derived never-page floor, round-12: 3 restarts span 2 gaps > 900s at cycles > ~450s; the ~5-7.5 min band pages eventually via phase drift of a sustained flap; tumbling not sliding) |
 | 16 | First stall episode of the day (3 restarts, fresh app session) | `tv-prod-feed-stall-restarts` pages — the post-recorder-install counter registration in main.rs makes the agent's dropped first sample the 0 baseline, so all 3 restarts count (round-5; the round-4 supervisor-spawn registration raced the install and was a no-op — previously Sum=2 → silent) |
 | 17 | WS-REINJECT-01 / PROC-01 / DH-906 fires once, episode ages out ~15 min later | NO green "recovered" OK page (ok_recovery=false, round-4) — the condition persists (staged WAL / memory pressure / rejected order); only genuine repeat-emitters send OK-on-silence |
-| 18 | Market-hours gate Lambda errors at the 09:20 IST open (the ONLY arming path for the leg-3 reconnect-storm pager + the other 3 gated alarms) | `tv-prod-market-hours-gate-errors` pages (AWS/Lambda Errors, Sum ≥ 1/300s — round-13); before it, a gate failure silently left all 4 gated alarms disarmed for the session; residual: a rule that never INVOKES the Lambda produces no Errors datapoint — state="ENABLED" pins + the liveness alarms are the backstop |
+| 18 | Market-hours gate Lambda errors at the 09:20 IST open (the ONLY arming path for the leg-3 reconnect-storm pager + the other 3 gated alarms) | `tv-prod-market-hours-gate-errors` pages (AWS/Lambda Errors, Sum ≥ 1/300s — round-13); before it, a gate failure silently left all 4 gated alarms disarmed for the session; NO green OK ever follows (`ok_actions = []`, round-14 — the Lambda runs 2x/day, so an auto-OK is aged-out, never a fix): manually re-arm the gated alarms regardless; residual: a rule that never INVOKES the Lambda produces no Errors datapoint — state="ENABLED" pins + the liveness alarms are the backstop |

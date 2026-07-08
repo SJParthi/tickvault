@@ -224,7 +224,7 @@ resource "aws_cloudwatch_log_group" "tv_market_hours_liveness_gate" {
 # ---------------------------------------------------------------------------
 resource "aws_cloudwatch_metric_alarm" "market_hours_gate_lambda_errors" {
   alarm_name          = "tv-${var.environment}-market-hours-gate-errors"
-  alarm_description   = "The market-hours gate Lambda FAILED - its 09:20 IST open invocation is the ONLY path that arms the 4 gated alarms (market-hours-liveness-missing, realtime-guarantee-critical, aggregator-no-seals, order-update-reconnect-storm). A failed open leaves all 4 disarmed for the session (the 2026-07-06 leg-3 zero-page class); a failed close leaves them armed overnight (false-page risk). Manually enable_alarm_actions / disable_alarm_actions as appropriate after reading the gate Lambda's log group."
+  alarm_description   = "The market-hours gate Lambda FAILED - its 09:20 IST open invocation is the ONLY path that arms the 4 gated alarms (market-hours-liveness-missing, realtime-guarantee-critical, aggregator-no-seals, order-update-reconnect-storm). A failed open leaves all 4 disarmed for the session (the 2026-07-06 leg-3 zero-page class); a failed close leaves them armed overnight (false-page risk). NO green OK page ever follows this alarm (ok_actions suppressed - the Lambda runs 2x/day, so an auto-OK is aged-out, never a fix): manually re-arm/verify the 4 gated alarms (enable_alarm_actions / disable_alarm_actions) REGARDLESS, after reading the gate Lambda's log group."
   comparison_operator = "GreaterThanOrEqualToThreshold"
   evaluation_periods  = 1
   metric_name         = "Errors"
@@ -237,10 +237,13 @@ resource "aws_cloudwatch_metric_alarm" "market_hours_gate_lambda_errors" {
     FunctionName = aws_lambda_function.tv_market_hours_liveness_gate.function_name
   }
   alarm_actions = [aws_sns_topic.tv_alerts.arn]
-  # Expect ONE one-time green OK page the apply evening: new-alarm
-  # INSUFFICIENT_DATA -> OK creation settling, not a recovery (round-8;
-  # full rationale in error-code-alarms.tf's ok_actions comment).
-  ok_actions = [aws_sns_topic.tv_alerts.arn]
+  # NO ok_actions (round-14): this Lambda runs 2x/day (09:20 open / 15:35
+  # close), so the post-ALARM auto-OK is always AGED-OUT, never a fix — a
+  # recurring Rule-11 false-recovery green per failure episode. Worse, for
+  # THIS watchman the green also invited skipping the manual re-arm of the
+  # 4 gated alarms (incl. the leg-3 reconnect-storm pager) — the
+  # description above says: re-arm manually REGARDLESS.
+  ok_actions = []
 }
 
 # Open the liveness window at 09:20 IST (03:50 UTC) Mon-Fri — 5 min after the

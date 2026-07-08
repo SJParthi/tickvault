@@ -174,8 +174,12 @@ resource "aws_cloudwatch_metric_alarm" "market_open_readiness_lambda_errors" {
     FunctionName = aws_lambda_function.market_open_readiness.function_name
   }
   alarm_actions = [aws_sns_topic.tv_alerts.arn]
-  # Expect ONE one-time green OK page the apply evening: new-alarm
-  # INSUFFICIENT_DATA -> OK creation settling, not a recovery (round-8;
-  # full rationale in error-code-alarms.tf's ok_actions comment).
-  ok_actions = [aws_sns_topic.tv_alerts.arn]
+  # NO ok_actions (round-14): this Lambda runs 1-2x/day (the 08:45 cron +
+  # occasional drills), so the post-ALARM auto-OK only means the single
+  # Errors datapoint AGED OUT of the lookback — never that anything was
+  # fixed. The telegram-webhook Lambda forwards every OK as a green
+  # "recovered" page, so a symmetric ok_actions here produced a recurring
+  # Rule-11 false-recovery green per failure episode. Recovery signal = the
+  # NEXT scheduled run succeeding (verdict visible in the Lambda log group).
+  ok_actions = []
 }
