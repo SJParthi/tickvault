@@ -88,8 +88,9 @@ pub const INDEX_FUTURES_UNDERLYINGS: [IndexFutureUnderlying; 4] = [
 pub const MAX_INDEX_FUTURE_TARGETS: usize = 4;
 
 /// Bound on the distinct `underlying_symbol` evidence values carried in a
-/// [`IndexFutureSelection`] (the FUTIDX-01 alias-drift payload).
-const MAX_UNDERLYING_SYMBOLS_EVIDENCE: usize = 20;
+/// [`IndexFutureSelection`] (the FUTIDX-01 alias-drift payload). `pub` so
+/// the Groww-side evidence collector shares the SAME bound (no divergence).
+pub const MAX_UNDERLYING_SYMBOLS_EVIDENCE: usize = 20;
 
 /// THE shared boundary rule — both feeds call exactly this.
 ///
@@ -120,6 +121,12 @@ pub enum IndexFutureMissReason {
     AmbiguousDuplicateExpiry,
     /// Every candidate row's expiry was unparsable (skipped + counted).
     BadExpiryFormat,
+    /// Every candidate row's native id (Groww `exchange_token`) was
+    /// non-numeric (skipped + counted). Groww-side only — the Dhan
+    /// `security_id` is kept as a string and never numerically gated.
+    /// Distinct from [`Self::BadExpiryFormat`] so the operator triages the
+    /// id-space arm, not the expiry arm (hostile-review round 1, 2026-07-08).
+    BadNativeToken,
 }
 
 /// One degraded underlying (FUTIDX-01 unit).
@@ -297,40 +304,91 @@ pub fn compare_index_future_selections(
     mismatches
 }
 
-/// Backing store for the per-boot cross-feed parity recorder.
-static SELECTIONS: OnceLock<Mutex<HashMap<&'static str, Vec<FeedFutureSelection>>>> =
-    OnceLock::new();
+/// Backing store for the per-boot cross-feed parity recorder. Each feed's
+/// entry carries the IST TRADING DATE it was recorded for — the comparator
+/// refuses to compare selections from DIFFERENT trading dates (a Groww
+/// re-activation on day D+1 must never page FUTIDX-02 against a stale day-D
+/// Dhan selection across an expiry boundary; hostile-review round 1,
+/// 2026-07-08).
+type DatedSelections = HashMap<&'static str, (NaiveDate, Vec<FeedFutureSelection>)>;
+
+static SELECTIONS: OnceLock<Mutex<DatedSelections>> = OnceLock::new();
+
+/// Outcome of one recorder insertion (testable, no I/O).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RecordOutcome {
+    /// Only one feed has recorded so far — no verdict possible.
+    SingleFeed,
+    /// Both feeds present but for DIFFERENT trading dates — comparison
+    /// refused; the STALE (older-dated) feed's entry was evicted so a fresh
+    /// same-date record can pair later.
+    CrossDateSkipped { evicted_feed: &'static str },
+    /// Both feeds present for the SAME trading date — comparator verdict
+    /// (empty = parity OK).
+    Verdict(Vec<ParityMismatch>),
+}
 
 /// Testable core of [`record_index_future_selection`]: insert one feed's
-/// selection; when the OTHER feed's entry exists, return the comparator
-/// verdict (`Some(mismatches)` — possibly empty = parity OK). `None` =
-/// single-feed so far, no verdict yet.
+/// dated selection; compare ONLY when the other feed's entry exists for the
+/// SAME trading date.
 fn record_selection_in(
-    map: &Mutex<HashMap<&'static str, Vec<FeedFutureSelection>>>,
+    map: &Mutex<DatedSelections>,
     feed: &'static str,
+    trading_date_ist: NaiveDate,
     sel: Vec<FeedFutureSelection>,
-) -> Option<Vec<ParityMismatch>> {
+) -> RecordOutcome {
     let mut guard = match map.lock() {
         Ok(g) => g,
         // Poison only signals a prior panic; the data is still valid.
         Err(poisoned) => poisoned.into_inner(),
     };
-    guard.insert(feed, sel);
-    let (Some(dhan), Some(groww)) = (guard.get("dhan"), guard.get("groww")) else {
-        return None;
+    guard.insert(feed, (trading_date_ist, sel));
+    let (Some((dhan_date, dhan)), Some((groww_date, groww))) =
+        (guard.get("dhan"), guard.get("groww"))
+    else {
+        return RecordOutcome::SingleFeed;
     };
-    Some(compare_index_future_selections(dhan, groww))
+    if dhan_date != groww_date {
+        // Cross-date: never a parity question. Evict the OLDER entry so a
+        // later same-date record from that feed can pair cleanly.
+        let evicted_feed = if dhan_date < groww_date {
+            "dhan"
+        } else {
+            "groww"
+        };
+        guard.remove(evicted_feed);
+        return RecordOutcome::CrossDateSkipped { evicted_feed };
+    }
+    let verdict = compare_index_future_selections(dhan, groww);
+    RecordOutcome::Verdict(verdict)
 }
 
-/// Record one feed's index-future selection (cold path, once per feed per
-/// boot/activation). Order-independent: the comparator fires the moment BOTH
-/// feeds have recorded; single-feed runs never fire it. Parity OK → one
-/// `info!` verdict line; mismatch → one `error!(code = "FUTIDX-02")` per
-/// underlying + `tv_index_futures_parity_mismatch_total`.
-pub fn record_index_future_selection(feed: &'static str, sel: Vec<FeedFutureSelection>) {
+/// Record one feed's index-future selection for one IST trading date (cold
+/// path, once per feed per boot/activation). Order-independent: the
+/// comparator fires the moment BOTH feeds have recorded FOR THE SAME
+/// TRADING DATE; single-feed runs and cross-date pairs never fire it.
+/// Parity OK → one `info!` verdict line; mismatch → one
+/// `error!(code = "FUTIDX-02")` per underlying +
+/// `tv_index_futures_parity_mismatch_total`.
+pub fn record_index_future_selection(
+    feed: &'static str,
+    trading_date_ist: NaiveDate,
+    sel: Vec<FeedFutureSelection>,
+) {
     let map = SELECTIONS.get_or_init(|| Mutex::new(HashMap::new()));
-    let Some(mismatches) = record_selection_in(map, feed, sel) else {
-        return;
+    let mismatches = match record_selection_in(map, feed, trading_date_ist, sel) {
+        RecordOutcome::SingleFeed => return,
+        RecordOutcome::CrossDateSkipped { evicted_feed } => {
+            info!(
+                feed,
+                evicted_feed,
+                trading_date_ist = %trading_date_ist,
+                "index-futures parity: cross-date selections — comparison refused, stale \
+                 feed entry evicted (a fresh same-date record will re-pair)"
+            );
+            return;
+        }
+        RecordOutcome::Verdict(m) => m,
     };
     if mismatches.is_empty() {
         info!(
@@ -742,19 +800,96 @@ mod tests {
         // Exercises the recorder core + the pub wrapper
         // (record_index_future_selection) end-to-end on the global store.
         let local = Mutex::new(HashMap::new());
+        let day = d("2026-07-08");
         let dhan = vec![feed_sel("NIFTY", "2026-07-30", "35001")];
-        assert!(
-            record_selection_in(&local, "dhan", dhan.clone()).is_none(),
+        assert_eq!(
+            record_selection_in(&local, "dhan", day, dhan.clone()),
+            RecordOutcome::SingleFeed,
             "single feed → no verdict"
         );
         let groww = vec![feed_sel("NIFTY", "2026-07-30", "99001")];
-        let verdict = record_selection_in(&local, "groww", groww.clone())
-            .expect("both feeds present → verdict");
+        let RecordOutcome::Verdict(verdict) =
+            record_selection_in(&local, "groww", day, groww.clone())
+        else {
+            panic!("both feeds same date → verdict");
+        };
         assert!(verdict.is_empty(), "identical pairs → parity OK");
 
         // The pub wrapper runs the same core against the process-global
-        // store; this is the ONLY test touching the global (no interference).
-        record_index_future_selection("dhan", dhan);
-        record_index_future_selection("groww", groww);
+        // store. HONEST NOTE (hostile-review round 1, 2026-07-08): other
+        // tests ALSO write the global via the production entry points
+        // (`build_universe_from_bytes` records "dhan",
+        // `build_groww_watch_from_csvs` records "groww"), so global-store
+        // emissions here are test-log noise only — no assertion in this
+        // suite reads the global verdict, and none may (order-flaky).
+        record_index_future_selection("dhan", day, dhan);
+        record_index_future_selection("groww", day, groww);
+    }
+
+    #[test]
+    fn test_record_selection_cross_date_refuses_compare_and_evicts_stale() {
+        // Day-D Dhan vs day-D+1 Groww (the expiry-boundary re-activation
+        // case) → NO verdict, the OLDER (dhan) entry evicted.
+        let local = Mutex::new(HashMap::new());
+        let dhan = vec![feed_sel("NIFTY", "2026-07-30", "35001")];
+        assert_eq!(
+            record_selection_in(&local, "dhan", d("2026-07-08"), dhan),
+            RecordOutcome::SingleFeed
+        );
+        // Next-day Groww selects the NEXT contract — a real vendor master
+        // would NOT be divergent; pre-fix this paged a false FUTIDX-02.
+        let groww = vec![feed_sel("NIFTY", "2026-08-27", "99001")];
+        assert_eq!(
+            record_selection_in(&local, "groww", d("2026-07-09"), groww.clone()),
+            RecordOutcome::CrossDateSkipped {
+                evicted_feed: "dhan"
+            },
+            "cross-date → refused + stale dhan evicted"
+        );
+        // A fresh SAME-date Dhan record now pairs cleanly.
+        let dhan2 = vec![feed_sel("NIFTY", "2026-08-27", "35002")];
+        let RecordOutcome::Verdict(verdict) =
+            record_selection_in(&local, "dhan", d("2026-07-09"), dhan2)
+        else {
+            panic!("same-date re-pair → verdict");
+        };
+        assert!(verdict.is_empty(), "re-paired same-date selections match");
+    }
+
+    #[test]
+    fn test_record_selection_mismatch_verdict_through_recorder() {
+        // Drives the MISMATCH arm through the recorder core (hostile-review
+        // round 1 coverage gap): same date, differing expiries → non-empty
+        // verdict naming the underlying.
+        let local = Mutex::new(HashMap::new());
+        let day = d("2026-07-08");
+        let dhan = vec![feed_sel("NIFTY", "2026-07-30", "35001")];
+        assert_eq!(
+            record_selection_in(&local, "dhan", day, dhan),
+            RecordOutcome::SingleFeed
+        );
+        let groww = vec![feed_sel("NIFTY", "2026-08-27", "99001")];
+        let RecordOutcome::Verdict(verdict) = record_selection_in(&local, "groww", day, groww)
+        else {
+            panic!("both feeds same date → verdict");
+        };
+        assert_eq!(verdict.len(), 1);
+        assert_eq!(verdict[0].canonical, "NIFTY");
+        assert_eq!(verdict[0].dhan_expiry, Some(d("2026-07-30")));
+        assert_eq!(verdict[0].groww_expiry, Some(d("2026-08-27")));
+
+        // And the same mismatch THROUGH the pub recorder (executes the
+        // error!(FUTIDX-02) emit loop — log/counter noise is expected and
+        // harmless in tests; no assertion reads the global store).
+        record_index_future_selection(
+            "dhan",
+            day,
+            vec![feed_sel("BANKNIFTY", "2026-07-30", "35002")],
+        );
+        record_index_future_selection(
+            "groww",
+            day,
+            vec![feed_sel("BANKNIFTY", "2026-08-27", "99002")],
+        );
     }
 }

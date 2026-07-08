@@ -422,13 +422,20 @@ fn extract_index_entries(rows: &[GrowwInstrumentRow]) -> Vec<WatchEntry> {
 ///
 /// Misses are returned; the caller pages FUTIDX-01 (feed=groww) — degrade,
 /// the watch build stays valid. Cold path, once per activation.
+///
+/// Each chosen future is returned as a [`GrowwIndexFuture`] carrying the
+/// EXACT-MATCH canonical from step 2 — the parity recorder consumes THAT
+/// canonical directly; re-deriving it from `symbol_name` substrings is
+/// FORBIDDEN (hostile-review round 1, 2026-07-08: `"BANKNIFTY…".contains
+/// ("NIFTY")` mislabeled BANKNIFTY/MIDCPNIFTY as NIFTY → false FUTIDX-02
+/// pages every dual-feed boot).
 #[cfg(feature = "daily_universe_fetcher")]
 #[must_use]
 pub fn extract_index_future_entries(
     rows: &[GrowwInstrumentRow],
     today_ist: chrono::NaiveDate,
 ) -> (
-    Vec<WatchEntry>,
+    Vec<GrowwIndexFuture>,
     Vec<crate::instrument::index_futures::IndexFutureMiss>,
 ) {
     use crate::instrument::index_extractor::canonicalize_index_symbol;
@@ -437,12 +444,16 @@ pub fn extract_index_future_entries(
         select_index_future_expiry,
     };
 
-    let mut entries: Vec<WatchEntry> = Vec::new();
+    let mut entries: Vec<GrowwIndexFuture> = Vec::new();
     let mut misses: Vec<IndexFutureMiss> = Vec::new();
 
     for target in &INDEX_FUTURES_UNDERLYINGS {
         let mut candidates: Vec<(chrono::NaiveDate, &GrowwInstrumentRow)> = Vec::new();
-        let mut saw_unusable_candidate = false;
+        // Distinct flags so the FUTIDX-01 reason names the RIGHT arm
+        // (hostile-review round 1: token-invalid rows were misreported as
+        // BadExpiryFormat, sending the operator down the wrong triage arm).
+        let mut saw_bad_token = false;
+        let mut saw_bad_expiry = false;
         for r in rows {
             if r.instrument_type != "FUT" || r.segment != "FNO" || r.exchange != target.exch_id {
                 continue;
@@ -453,19 +464,21 @@ pub fn extract_index_future_entries(
             // Numeric token required (the sidecar's ltp path skips
             // non-numeric tokens; fail here loudly instead of silently there).
             if r.exchange_token.parse::<i64>().is_err() {
-                saw_unusable_candidate = true;
+                saw_bad_token = true;
                 continue;
             }
             match chrono::NaiveDate::parse_from_str(r.expiry_date.trim(), "%Y-%m-%d") {
                 Ok(d) => candidates.push((d, r)),
-                Err(_) => saw_unusable_candidate = true,
+                Err(_) => saw_bad_expiry = true,
             }
         }
         if candidates.is_empty() {
             misses.push(IndexFutureMiss {
                 canonical: target.canonical,
-                reason: if saw_unusable_candidate {
+                reason: if saw_bad_expiry {
                     IndexFutureMissReason::BadExpiryFormat
+                } else if saw_bad_token {
+                    IndexFutureMissReason::BadNativeToken
                 } else {
                     IndexFutureMissReason::NoFutRows
                 },
@@ -495,19 +508,65 @@ pub fn extract_index_future_entries(
         }
         let r = at_chosen[0];
         let security_id = r.exchange_token.parse::<i64>().unwrap_or(0);
-        entries.push(WatchEntry {
-            exchange: r.exchange.clone(),
-            segment: "FNO".to_string(),
-            exchange_token: r.exchange_token.clone(),
-            kind: WatchKind::Ltp,
-            security_id,
-            isin: None, // FUT rows are ISIN-less by design
-            symbol_name: Some(r.groww_symbol.clone()),
-            index_name: None,
-            expiry_date: Some(chosen.format("%Y-%m-%d").to_string()),
+        entries.push(GrowwIndexFuture {
+            entry: WatchEntry {
+                exchange: r.exchange.clone(),
+                segment: "FNO".to_string(),
+                exchange_token: r.exchange_token.clone(),
+                kind: WatchKind::Ltp,
+                security_id,
+                isin: None, // FUT rows are ISIN-less by design
+                symbol_name: Some(r.groww_symbol.clone()),
+                index_name: None,
+                expiry_date: Some(chosen.format("%Y-%m-%d").to_string()),
+            },
+            canonical: target.canonical,
+            expiry: chosen,
         });
     }
     (entries, misses)
+}
+
+/// One chosen Groww index future: the watch entry PLUS the exact-match
+/// canonical + parsed expiry it was selected under. The parity recorder
+/// consumes `canonical`/`expiry` verbatim — never re-derived from symbol
+/// strings (§36; hostile-review round 1, 2026-07-08).
+#[cfg(feature = "daily_universe_fetcher")]
+#[derive(Debug, Clone)]
+pub struct GrowwIndexFuture {
+    /// The live-subscription watch entry (segment `FNO`, kind `Ltp`).
+    pub entry: WatchEntry,
+    /// The [`crate::instrument::index_futures::INDEX_FUTURES_UNDERLYINGS`]
+    /// canonical this row EXACT-matched on (`canonicalize_index_symbol`).
+    pub canonical: &'static str,
+    /// The chosen expiry (parity unit alongside `canonical`).
+    pub expiry: chrono::NaiveDate,
+}
+
+/// Bounded alias-drift evidence for the Groww FUTIDX-01 payload: distinct
+/// `underlying_symbol` literals among `FUT`/`FNO` rows (any exchange),
+/// capped at [`crate::instrument::index_futures::MAX_UNDERLYING_SYMBOLS_EVIDENCE`]
+/// — the Groww mirror of the Dhan `fut_underlying_symbols_seen` evidence the
+/// FUTIDX-01 runbook promises on BOTH feeds (hostile-review round 1,
+/// 2026-07-08: the Groww emit carried no evidence exactly where symbol
+/// drift is most likely). Cold path, once per degraded activation.
+#[cfg(feature = "daily_universe_fetcher")]
+#[must_use]
+pub fn collect_fut_underlying_symbols_seen(rows: &[GrowwInstrumentRow]) -> Vec<String> {
+    use crate::instrument::index_futures::MAX_UNDERLYING_SYMBOLS_EVIDENCE;
+    let mut seen: Vec<String> = Vec::new();
+    for r in rows {
+        if r.instrument_type != "FUT" || r.segment != "FNO" {
+            continue;
+        }
+        if seen.len() >= MAX_UNDERLYING_SYMBOLS_EVIDENCE {
+            break;
+        }
+        if !seen.iter().any(|s| s == &r.underlying_symbol) {
+            seen.push(r.underlying_symbol.clone());
+        }
+    }
+    seen
 }
 
 /// Cross-checks the resolved Groww NSE index set against Dhan's
@@ -604,9 +663,10 @@ fn resolve_stock_entries(
 /// Assembles the final watch set: enforces the 2% NTM tolerance, dedups by
 /// `(exchange_token, segment)` (I-P1-11 analogue), checks the `[100,1200]`
 /// envelope on the TRUE resolved size, then applies the optional deterministic
-/// `max_subscribe` first-run cap (indices first — small + high value — then
-/// stocks by token ascending). `max_subscribe` is also clamped to the Groww
-/// 1000-subscription hard cap.
+/// `max_subscribe` first-run cap. Cap-priority order: §36 futures FIRST
+/// (≤4, operator-mandated — must survive the prefix truncate), then indices
+/// (small + high value), then stocks by token ascending. `max_subscribe` is
+/// also clamped to the Groww 1000-subscription hard cap.
 fn assemble_watch_set(
     index_entries: Vec<WatchEntry>,
     stock_entries: Vec<WatchEntry>,
@@ -632,18 +692,21 @@ fn assemble_watch_set(
     // Dedup by (exchange, exchange_token, segment): a stock can appear in both the
     // index and stock lists only by error, and an F&O-underlying may duplicate a
     // constituent. `exchange` is in the key so the BSE SENSEX token `"1"` can never
-    // collide with an NSE stock whose numeric token is also `"1"`. Indices first so
-    // an index token wins its slot deterministically.
+    // collide with an NSE stock whose numeric token is also `"1"`. Indices before
+    // stocks so an index token wins its slot deterministically.
     let mut seen: std::collections::HashSet<(String, String, String)> =
         std::collections::HashSet::new();
     let mut deduped: Vec<WatchEntry> = Vec::new();
-    // §36: futures append AFTER indices + stocks, BEFORE the dedup + the
-    // envelope + the 1000-cap checks. The dedup key includes `segment`, so a
-    // CASH token numerically equal to an FNO token never collides.
-    for entry in index_entries
+    // §36: the ≤4 operator-mandated futures are PREPENDED (cap-priority) —
+    // the live-subscribe cap below is a prefix truncate, so futures must
+    // never be the first rows dropped under universe growth (hostile-review
+    // round 1, 2026-07-08: appended-last futures were silently truncated
+    // first while the gauge still reported 4). The dedup key includes
+    // `segment`, so an FNO future can never steal a CASH/index slot.
+    for entry in future_entries
         .into_iter()
+        .chain(index_entries)
         .chain(stock_entries)
-        .chain(future_entries)
     {
         let key = (
             entry.exchange.clone(),
@@ -673,7 +736,8 @@ fn assemble_watch_set(
     let master_entries = deduped.clone();
 
     // Deterministic cap: clamp to min(max_subscribe, 1000). `deduped` is already
-    // indices-first then token-asc, so a prefix take is deterministic.
+    // futures-first, then indices, then stocks token-asc, so a prefix take is
+    // deterministic AND cap-prioritizes the §36 futures.
     let cap = max_subscribe
         .unwrap_or(GROWW_MAX_SUBSCRIPTIONS)
         .min(GROWW_MAX_SUBSCRIPTIONS);
@@ -803,78 +867,100 @@ fn build_groww_watch_from_csvs(
     #[cfg(feature = "daily_universe_fetcher")]
     let future_entries = {
         use tickvault_common::error_code::ErrorCode;
-        let (future_entries, misses) = extract_index_future_entries(&rows, today_ist);
-        for miss in &misses {
-            tracing::error!(
-                code = ErrorCode::Futidx01SelectionDegraded.code_str(),
-                feed = "groww",
-                underlying = miss.canonical,
-                reason = ?miss.reason,
-                "index-future selection degraded — the Groww watch set runs WITHOUT that \
-                 future today; cash/index build unaffected"
-            );
-            metrics::counter!(
-                "tv_index_futures_selection_missing_total",
-                "feed" => "groww",
-                "underlying" => miss.canonical
-            )
-            .increment(1);
-        }
-        metrics::gauge!("tv_index_futures_selected", "feed" => "groww")
-            .set(future_entries.len() as f64);
-        let mut groww_selection: Vec<crate::instrument::index_futures::FeedFutureSelection> =
-            Vec::new();
-        for e in &future_entries {
-            let Some(expiry_str) = e.expiry_date.as_deref() else {
-                continue;
-            };
-            let Ok(expiry) = chrono::NaiveDate::parse_from_str(expiry_str, "%Y-%m-%d") else {
-                continue;
-            };
-            info!(
-                feed = "groww",
-                underlying = e.symbol_name.as_deref().unwrap_or(""),
-                expiry = expiry_str,
-                native_id = %e.exchange_token,
-                segment = %e.segment,
-                "index-futures selection"
-            );
-            // Recover the canonical from the entry's exchange + expiry pairing
-            // via the pinned allowlist (groww_symbol is provenance, not the key).
-            if let Some(entry) = crate::instrument::index_futures::INDEX_FUTURES_UNDERLYINGS
-                .iter()
-                .find(|u| {
-                    u.exch_id == e.exchange
-                        && e.symbol_name
-                            .as_deref()
-                            .is_some_and(|s| s.contains(u.canonical))
-                })
-            {
-                groww_selection.push(crate::instrument::index_futures::FeedFutureSelection {
-                    canonical: entry.canonical,
-                    expiry,
-                    native_id: e.exchange_token.clone(),
-                    segment: e.segment.clone(),
-                });
+        let (futures, misses) = extract_index_future_entries(&rows, today_ist);
+        if !misses.is_empty() {
+            // Alias-drift evidence (bounded) — the FUTIDX-01 runbook promises
+            // `candidates_seen` on BOTH feeds; collected only on the degrade
+            // path (cold, once per degraded activation).
+            let candidates_seen = collect_fut_underlying_symbols_seen(&rows);
+            for miss in &misses {
+                tracing::error!(
+                    code = ErrorCode::Futidx01SelectionDegraded.code_str(),
+                    feed = "groww",
+                    underlying = miss.canonical,
+                    reason = ?miss.reason,
+                    candidates_seen = ?candidates_seen,
+                    "index-future selection degraded — the Groww watch set runs WITHOUT that \
+                     future today; cash/index build unaffected"
+                );
+                metrics::counter!(
+                    "tv_index_futures_selection_missing_total",
+                    "feed" => "groww",
+                    "underlying" => miss.canonical
+                )
+                .increment(1);
             }
         }
-        crate::instrument::index_futures::record_index_future_selection("groww", groww_selection);
-        future_entries
+        // Parity recording: the canonical + expiry come VERBATIM from the
+        // exact-match extraction — never re-derived from symbol substrings
+        // ("BANKNIFTY".contains("NIFTY") mislabeled 2 of 4 pre-fix).
+        let mut groww_selection: Vec<crate::instrument::index_futures::FeedFutureSelection> =
+            Vec::new();
+        for f in &futures {
+            info!(
+                feed = "groww",
+                underlying = f.canonical,
+                expiry = %f.expiry,
+                native_id = %f.entry.exchange_token,
+                segment = %f.entry.segment,
+                "index-futures selection"
+            );
+            groww_selection.push(crate::instrument::index_futures::FeedFutureSelection {
+                canonical: f.canonical,
+                expiry: f.expiry,
+                native_id: f.entry.exchange_token.clone(),
+                segment: f.entry.segment.clone(),
+            });
+        }
+        crate::instrument::index_futures::record_index_future_selection(
+            "groww",
+            today_ist,
+            groww_selection,
+        );
+        futures.into_iter().map(|f| f.entry).collect::<Vec<_>>()
     };
     #[cfg(not(feature = "daily_universe_fetcher"))]
     let future_entries = {
         let _ = today_ist; // futures require the shared selector (feature-gated)
-        Vec::new()
+        Vec::<WatchEntry>::new()
     };
 
-    assemble_watch_set(
+    let expected_futures = future_entries.len();
+    let set = assemble_watch_set(
         index_entries,
         stock_entries,
         future_entries,
         unresolved,
         ntm_total,
         max_subscribe,
-    )
+    )?;
+    // §36 observability is POST-cap and honest: the gauge reports what is
+    // actually in the LIVE subscribe set, and any operator-mandated future
+    // dropped by a sub-4 cap (env override) is LOUD, never silent
+    // (hostile-review round 1, 2026-07-08: the gauge was set pre-cap and
+    // could report 4 while 0 survived the truncate).
+    #[cfg(feature = "daily_universe_fetcher")]
+    {
+        use tickvault_common::error_code::ErrorCode;
+        let live_futures = set.entries.iter().filter(|e| e.segment == "FNO").count();
+        metrics::gauge!("tv_index_futures_selected", "feed" => "groww").set(live_futures as f64);
+        if live_futures < expected_futures {
+            tracing::error!(
+                code = ErrorCode::Futidx01SelectionDegraded.code_str(),
+                feed = "groww",
+                expected = expected_futures,
+                live = live_futures,
+                "index-future(s) dropped from the LIVE subscribe set by the subscription cap — \
+                 the §36 futures are cap-priority (prepended), so this fires only under a \
+                 sub-4 operator cap override; master tables still carry the full selection"
+            );
+            metrics::counter!("tv_index_futures_cap_dropped_total", "feed" => "groww")
+                .increment((expected_futures - live_futures) as u64);
+        }
+    }
+    #[cfg(not(feature = "daily_universe_fetcher"))]
+    let _ = expected_futures;
+    Ok(set)
 }
 
 /// On-disk watch-file shape the Python sidecar reads.
@@ -1517,6 +1603,43 @@ mod tests {
         );
     }
 
+    fn future_entry(token: &str) -> WatchEntry {
+        WatchEntry {
+            exchange: "NSE".to_string(),
+            segment: "FNO".to_string(),
+            exchange_token: token.to_string(),
+            kind: WatchKind::Ltp,
+            security_id: token.parse::<i64>().unwrap_or(0),
+            isin: None,
+            symbol_name: Some(format!("NSE-FUT-{token}")),
+            index_name: None,
+            expiry_date: Some("2026-07-30".to_string()),
+        }
+    }
+
+    #[test]
+    fn test_assemble_cap_pressure_keeps_all_futures_in_live_set() {
+        // Hostile-review round 1 (2026-07-08) regression: universe ≥ the
+        // 1000 hard cap → the §36 futures MUST survive the prefix truncate
+        // (pre-fix they were appended LAST and silently dropped FIRST while
+        // the pre-cap gauge still reported 4).
+        let stocks: Vec<WatchEntry> = (0..1100).map(|i| stock_entry(&format!("{i:05}"))).collect();
+        let futures: Vec<WatchEntry> = vec![
+            future_entry("61001"),
+            future_entry("61002"),
+            future_entry("61003"),
+            future_entry("71001"),
+        ];
+        let set = assemble_watch_set(vec![], stocks, futures, vec![], 1100, None).unwrap();
+        assert_eq!(set.entries.len(), GROWW_MAX_SUBSCRIPTIONS, "hard cap");
+        let live_futures = set.entries.iter().filter(|e| e.segment == "FNO").count();
+        assert_eq!(live_futures, 4, "all 4 §36 futures survive cap pressure");
+        // Cap-priority: the futures are the deterministic PREFIX.
+        assert!(set.entries[..4].iter().all(|e| e.segment == "FNO"));
+        // Master carries the full pre-cap universe (1104).
+        assert_eq!(set.master_entries.len(), 1104);
+    }
+
     #[test]
     fn test_assemble_master_entries_full_when_capped() {
         // Decoupling proof: a small explicit cap shrinks the live `entries` but
@@ -1939,6 +2062,67 @@ mod tests {
 
     #[cfg(feature = "daily_universe_fetcher")]
     #[test]
+    fn test_extract_index_future_entries_records_exact_canonicals() {
+        // Hostile-review round 1 (2026-07-08) regression: the parity
+        // canonical must come from the EXACT match, never a symbol-substring
+        // re-derivation ("NSE-BANKNIFTY-…" contains "NIFTY" → BANKNIFTY and
+        // MIDCPNIFTY were mislabeled NIFTY → false FUTIDX-02 pages). The
+        // recorded canonicals from a full 4-underlying fixture must be
+        // EXACTLY the 4 pinned underlyings, each once.
+        let csv = format!("{HEADER}\n{}", fut_rows_all_four("2026-07-30"));
+        let rows = parse_groww_master(&csv).expect("parse");
+        let (entries, misses) = extract_index_future_entries(&rows, groww_test_today());
+        assert!(misses.is_empty(), "misses: {misses:?}");
+        let canonicals: Vec<&str> = entries.iter().map(|f| f.canonical).collect();
+        assert_eq!(
+            canonicals,
+            vec!["NIFTY", "BANKNIFTY", "MIDCPNIFTY", "SENSEX"],
+            "exact-match canonicals — BANKNIFTY/MIDCPNIFTY must NOT collapse into NIFTY"
+        );
+        // The carried expiry is the parsed chosen expiry (parity unit).
+        assert!(
+            entries
+                .iter()
+                .all(|f| f.expiry.format("%Y-%m-%d").to_string() == "2026-07-30")
+        );
+    }
+
+    #[cfg(feature = "daily_universe_fetcher")]
+    #[test]
+    fn test_extract_index_future_entries_bad_token_reason_is_bad_native_token() {
+        // Hostile-review round 1: all candidates token-invalid with VALID
+        // expiries must report BadNativeToken, not BadExpiryFormat.
+        let row = "NSE,NOTANUMBER,NIFTY26JULFUT,NSE-NIFTY-30Jul26-FUT,,FUT,FNO,,,NIFTY,26000,2026-07-30,-0.01,75,0.05,1800,0,1,1,NIFTY26JULFUT,0";
+        let csv = format!("{HEADER}\n{row}\n");
+        let rows = parse_groww_master(&csv).expect("parse");
+        let (entries, misses) = extract_index_future_entries(&rows, groww_test_today());
+        assert!(entries.is_empty());
+        assert!(misses.iter().any(|m| {
+            m.canonical == "NIFTY"
+                && m.reason
+                    == crate::instrument::index_futures::IndexFutureMissReason::BadNativeToken
+        }));
+    }
+
+    #[cfg(feature = "daily_universe_fetcher")]
+    #[test]
+    fn test_collect_fut_underlying_symbols_seen_bounded_distinct() {
+        // The Groww FUTIDX-01 evidence mirror: distinct FUT/FNO
+        // underlying_symbol literals, deduped, non-FUT rows excluded.
+        let csv = format!(
+            "{HEADER}\n{}\n{}\n{}\n{}\n",
+            fut_row("NSE", "61001", "NIFTY", "2026-07-30"),
+            fut_row("NSE", "62001", "NIFTY", "2026-08-27"),
+            fut_row("NSE", "61003", "MIDCPNIFTY", "2026-07-30"),
+            eq_row("2885", "INE002A01018"),
+        );
+        let rows = parse_groww_master(&csv).expect("parse");
+        let seen = collect_fut_underlying_symbols_seen(&rows);
+        assert_eq!(seen, vec!["NIFTY".to_string(), "MIDCPNIFTY".to_string()]);
+    }
+
+    #[cfg(feature = "daily_universe_fetcher")]
+    #[test]
     fn test_extract_index_future_entries_picks_nearest_expiry_four_underlyings() {
         // 2 expiries per underlying → 4 entries, kind=ltp, segment=FNO,
         // numeric tokens, NEAREST chosen.
@@ -1957,7 +2141,8 @@ mod tests {
         let (entries, misses) = extract_index_future_entries(&rows, groww_test_today());
         assert!(misses.is_empty(), "misses: {misses:?}");
         assert_eq!(entries.len(), 4);
-        for e in &entries {
+        for f in &entries {
+            let e = &f.entry;
             assert_eq!(e.kind, WatchKind::Ltp);
             assert_eq!(e.segment, "FNO");
             assert!(e.exchange_token.parse::<i64>().is_ok(), "numeric token");
@@ -1977,22 +2162,15 @@ mod tests {
         let rows = parse_groww_master(&csv).expect("parse");
         let (entries, misses) = extract_index_future_entries(&rows, groww_test_today());
         assert!(misses.is_empty());
-        let sensex: Vec<&WatchEntry> = entries
-            .iter()
-            .filter(|e| {
-                e.symbol_name
-                    .as_deref()
-                    .is_some_and(|s| s.contains("SENSEX"))
-            })
-            .collect();
+        let sensex: Vec<&GrowwIndexFuture> =
+            entries.iter().filter(|f| f.canonical == "SENSEX").collect();
         assert_eq!(sensex.len(), 1);
-        assert_eq!(sensex[0].exchange, "BSE", "SENSEX future is BSE-only");
+        assert_eq!(sensex[0].entry.exchange, "BSE", "SENSEX future is BSE-only");
         assert!(
-            entries.iter().filter(|e| e.exchange == "NSE").all(|e| !e
-                .symbol_name
-                .as_deref()
-                .unwrap_or("")
-                .contains("SENSEX")),
+            entries
+                .iter()
+                .filter(|f| f.entry.exchange == "NSE")
+                .all(|f| f.canonical != "SENSEX"),
             "cross-exchange SENSEX listing skipped"
         );
     }
@@ -2010,7 +2188,11 @@ mod tests {
         let rows = parse_groww_master(&csv).expect("parse");
         let (entries, _misses) = extract_index_future_entries(&rows, groww_test_today());
         assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].exchange_token, "90002", "underlying NIFTY wins");
+        assert_eq!(
+            entries[0].entry.exchange_token, "90002",
+            "underlying NIFTY wins"
+        );
+        assert_eq!(entries[0].canonical, "NIFTY");
     }
 
     #[cfg(feature = "daily_universe_fetcher")]
@@ -2067,8 +2249,11 @@ mod tests {
         assert_eq!(misses.len(), 3);
         assert!(misses.iter().all(|m| m.canonical != "NIFTY"));
         assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].exchange_token, "61001", "T-0 keeps expiring");
-        assert_eq!(entries[0].expiry_date.as_deref(), Some("2026-07-30"));
+        assert_eq!(
+            entries[0].entry.exchange_token, "61001",
+            "T-0 keeps expiring"
+        );
+        assert_eq!(entries[0].entry.expiry_date.as_deref(), Some("2026-07-30"));
     }
 
     #[cfg(feature = "daily_universe_fetcher")]

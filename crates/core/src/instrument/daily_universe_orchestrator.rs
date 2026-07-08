@@ -311,7 +311,7 @@ pub fn build_universe_from_bytes(
             }
         }
     }
-    record_index_future_selection("dhan", dhan_feed_selection);
+    record_index_future_selection("dhan", today_ist, dhan_feed_selection);
 
     // Step 3c: resolve + bridge the §31 NTM constituents (degrade-safe). When
     // `ntm_map` is None (source unavailable) or resolve fails, this is empty and
@@ -396,6 +396,56 @@ mod tests {
         let universe = build_universe_from_bytes(s.as_bytes(), None, test_today()).expect("build");
         // 30 NSE + 1 SENSEX + 100 underlyings = 131 instruments
         assert_eq!(universe.total_count(), 131);
+    }
+
+    #[test]
+    fn builds_universe_with_futidx_rows_selects_index_futures() {
+        // Hostile-review round 1 (2026-07-08) coverage gap: every prior
+        // orchestrator fixture carried FUTSTK rows only, so the Step-3d
+        // chosen-contract loop (boot-evidence info! + exact-canonical
+        // FeedFutureSelection build + record_index_future_selection("dhan"))
+        // never executed under test. This fixture drives it end-to-end.
+        let mut s = String::from(
+            "SECURITY_ID,EXCH_ID,SEGMENT,INSTRUMENT,SYMBOL_NAME,UNDERLYING_SECURITY_ID,\
+             UNDERLYING_SYMBOL,SM_EXPIRY_DATE\n",
+        );
+        for i in 0..100 {
+            s.push_str(&format!("28{i:04},NSE,NSE_EQ,EQUITY,STK{i},,,\n"));
+        }
+        for i in 0..30 {
+            let sym = NSE_INDEX_ALLOWLIST[i % NSE_INDEX_ALLOWLIST.len()];
+            s.push_str(&format!("{},NSE,IDX_I,INDEX,{sym},,,\n", 1000 + i));
+        }
+        s.push_str("51,BSE,IDX_I,INDEX,SENSEX,,,\n");
+        for i in 0..100 {
+            s.push_str(&format!(
+                "{},NSE,NSE_FNO,FUTSTK,STK{i}FUT,28{i:04},STK{i},2026-08-27\n",
+                38000 + i
+            ));
+        }
+        // The §36 FUTIDX rows — 3 NSE_FNO + 1 BSE_FNO, nearest expiry.
+        s.push_str("61001,NSE,NSE_FNO,FUTIDX,NIFTY26JULFUT,26000,NIFTY,2026-07-30\n");
+        s.push_str("61002,NSE,NSE_FNO,FUTIDX,BANKNIFTY26JULFUT,26009,BANKNIFTY,2026-07-30\n");
+        s.push_str("61003,NSE,NSE_FNO,FUTIDX,MIDCPNIFTY26JULFUT,26074,MIDCPNIFTY,2026-07-30\n");
+        s.push_str("71001,BSE,BSE_FNO,FUTIDX,SENSEX26JULFUT,1,SENSEX,2026-07-30\n");
+        let universe = build_universe_from_bytes(s.as_bytes(), None, test_today()).expect("build");
+        use crate::instrument::daily_universe::InstrumentRole;
+        assert_eq!(
+            universe.count_by_role(InstrumentRole::IndexFuture),
+            4,
+            "all 4 §36 FUTIDX contracts enter the subscription targets"
+        );
+        // 30 NSE + 1 SENSEX + 100 underlyings + 4 futures.
+        assert_eq!(universe.total_count(), 135);
+        // The chosen rows are the exact FUTIDX SIDs (nearest expiry).
+        let mut futidx_sids: Vec<&str> = universe
+            .subscription_targets
+            .iter()
+            .filter(|t| t.role == InstrumentRole::IndexFuture)
+            .map(|t| t.csv_row.security_id.as_str())
+            .collect();
+        futidx_sids.sort_unstable();
+        assert_eq!(futidx_sids, vec!["61001", "61002", "61003", "71001"]);
     }
 
     #[test]
