@@ -222,6 +222,17 @@ pub enum ErrorCode {
     /// (`reason="bare_dhan_reset"`) and the ceiling-exceeded fallback
     /// (`reason="ceiling_exceeded"`). Severity::Low.
     WsGap09WatchdogReconnectInPlace,
+    /// WS-GAP-10: the order-update WebSocket is in an in-market outage.
+    /// Tags three events (see `reason` field): `in_market_outage` — the
+    /// once-per-episode \[HIGH\] `OrderUpdateDisconnected` page fired from
+    /// INSIDE the never-give-up reconnect loop when consecutive in-market
+    /// failures reach 3 (the old task-exit emit in main.rs was dead code
+    /// since the WS-GAP-04 rewrite; verified live 2026-07-06: 39+ in-market
+    /// failures, zero HIGH pages); `threshold_streak` — the every-10th-failure
+    /// persist error; `task_exited_unreachable` — the defensive log at the
+    /// main.rs spawn site. Latch re-arms ONLY after a reconnect survives the
+    /// 60s stability window. Severity::High.
+    WsGap10OrderUpdateOutage,
     /// DISK-WATCHER-01: the spill disk-health watcher task exited
     /// (panic/cancel) and the supervisor respawned it so free-space
     /// monitoring — the early-warning for the "disk full + QuestDB down"
@@ -342,6 +353,12 @@ pub enum ErrorCode {
     /// TELEGRAM-02: coalescer state inconsistency (drain failed mid-window;
     /// next drain self-recovers). Informational.
     Telegram02CoalescerStateInconsistency,
+    /// TELEGRAM-03: episode live-edit machinery degraded (2026-07-07 UX
+    /// overhaul) — snapshot store write failed, rehydrate hit corrupt JSON,
+    /// or the edit-fallback ladder is storming. Delivery itself is
+    /// unaffected (duplicate-over-drop ladder terminates at TELEGRAM-01);
+    /// only the one-bubble-per-incident UX degrades.
+    Telegram03EpisodeDegraded,
 
     // -----------------------------------------------------------------------
     // Dhan Trading API (DH-9xx)
@@ -868,6 +885,7 @@ impl ErrorCode {
             Self::WsGap07LiveChannelClosed => "WS-GAP-07",
             Self::WsGap08RateLimitCooldown => "WS-GAP-08",
             Self::WsGap09WatchdogReconnectInPlace => "WS-GAP-09",
+            Self::WsGap10OrderUpdateOutage => "WS-GAP-10",
             Self::DiskWatcher01Respawned => "DISK-WATCHER-01",
             Self::WsSpill01WriterRespawn => "WS-SPILL-01",
             Self::WsSpill02FrameDropped => "WS-SPILL-02",
@@ -891,6 +909,7 @@ impl ErrorCode {
             // Wave 3 — Telegram dispatcher (Item 11)
             Self::Telegram01Dropped => "TELEGRAM-01",
             Self::Telegram02CoalescerStateInconsistency => "TELEGRAM-02",
+            Self::Telegram03EpisodeDegraded => "TELEGRAM-03",
             // Wave 3-C — market-open self-test (Item 12)
             Self::Selftest01Passed => "SELFTEST-01",
             Self::Selftest02Failed => "SELFTEST-02",
@@ -1076,6 +1095,9 @@ impl ErrorCode {
             | Self::RestCanary01ProbeFailed
             // WS-GAP-07 — live frame channel closed (tick consumer died)
             | Self::WsGap07LiveChannelClosed
+            // WS-GAP-10 — order confirmations feed down in-market; the loop
+            // self-retries but the operator must see it (2026-07-06 incident)
+            | Self::WsGap10OrderUpdateOutage
             // WS-SPILL-01 — WAL writer respawned (flapping writer = disk dying)
             | Self::WsSpill01WriterRespawn
             // WS-REINJECT-01 — boot WAL re-injection aborted (consumer dead/
@@ -1185,7 +1207,10 @@ impl ErrorCode {
             | Self::WsGap09WatchdogReconnectInPlace
             | Self::DiskWatcher01Respawned
             | Self::AuthGap03TokenForceRenewedOnWake
-            | Self::Telegram02CoalescerStateInconsistency => Severity::Low,
+            | Self::Telegram02CoalescerStateInconsistency
+            // TELEGRAM-03 (2026-07-07): episode UX degradation only — the
+            // never-drop delivery ladder is untouched, so Low.
+            | Self::Telegram03EpisodeDegraded => Severity::Low,
         }
     }
 
@@ -1244,6 +1269,7 @@ impl ErrorCode {
             | Self::WsGap07LiveChannelClosed
             | Self::WsGap08RateLimitCooldown
             | Self::WsGap09WatchdogReconnectInPlace
+            | Self::WsGap10OrderUpdateOutage
             | Self::DiskWatcher01Respawned
             | Self::AuthGap03TokenForceRenewedOnWake
             | Self::Boot01QuestDbSlow
@@ -1259,9 +1285,9 @@ impl ErrorCode {
                 ".claude/rules/project/ws-event-audit-error-codes.md"
             }
             Self::Boot03ClockSkewExceeded => ".claude/rules/project/wave-2-c-error-codes.md",
-            Self::Telegram01Dropped | Self::Telegram02CoalescerStateInconsistency => {
-                ".claude/rules/project/wave-3-error-codes.md"
-            }
+            Self::Telegram01Dropped
+            | Self::Telegram02CoalescerStateInconsistency
+            | Self::Telegram03EpisodeDegraded => ".claude/rules/project/wave-3-error-codes.md",
             Self::Selftest01Passed | Self::Selftest02Failed => {
                 ".claude/rules/project/wave-3-c-error-codes.md"
             }
@@ -1468,6 +1494,7 @@ impl ErrorCode {
             Self::WsGap07LiveChannelClosed,
             Self::WsGap08RateLimitCooldown,
             Self::WsGap09WatchdogReconnectInPlace,
+            Self::WsGap10OrderUpdateOutage,
             Self::DiskWatcher01Respawned,
             Self::WsSpill01WriterRespawn,
             Self::WsSpill02FrameDropped,
@@ -1490,6 +1517,7 @@ impl ErrorCode {
             Self::StorageGap04S3ArchiveFailed,
             Self::Telegram01Dropped,
             Self::Telegram02CoalescerStateInconsistency,
+            Self::Telegram03EpisodeDegraded,
             Self::Selftest01Passed,
             Self::Selftest02Failed,
             Self::Slo01Healthy,
@@ -1868,7 +1896,30 @@ mod tests {
         // bumped 128 -> 129 for GROWW-SCALE-05 (dual scale-fleet instance
         // detected / SSM lock unprovable — fleet spawn refused fail-closed,
         // single-connection fallback).
-        assert_eq!(ErrorCode::all().len(), 129);
+        // 2026-07-06 (order-update outage paging PR-1): bumped 129 -> 130 for
+        // WS-GAP-10 (order-update in-market outage — the reachable in-loop
+        // [HIGH] page; the old task-exit emit was dead code since WS-GAP-04).
+        // 2026-07-07 (Telegram UX overhaul — episode live-edit coalescing):
+        // bumped 130 -> 131 for TELEGRAM-03 (episode machinery degraded:
+        // store_write_failed / rehydrate_corrupt / edit_fallback_storm —
+        // delivery unaffected, UX-only degrade, Severity::Low).
+        assert_eq!(ErrorCode::all().len(), 131);
+    }
+
+    #[test]
+    fn test_telegram_03_episode_degraded_contract() {
+        // Telegram UX overhaul (2026-07-07): episode live-edit machinery
+        // degrade signal. Low + auto-triage-safe — delivery is never at
+        // risk (the fallback ladder terminates at TELEGRAM-01 loudness).
+        let code = ErrorCode::Telegram03EpisodeDegraded;
+        assert_eq!(code.code_str(), "TELEGRAM-03");
+        assert_eq!("TELEGRAM-03".parse::<ErrorCode>(), Ok(code));
+        assert_eq!(code.severity(), Severity::Low);
+        assert!(code.is_auto_triage_safe());
+        assert_eq!(
+            code.runbook_path(),
+            ".claude/rules/project/wave-3-error-codes.md"
+        );
     }
 
     #[test]

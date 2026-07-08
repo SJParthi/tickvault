@@ -176,9 +176,11 @@ summary file and drives the above flow.
 > (`deploy/aws/cloudwatch-agent.json` + `user-data.sh.tftpl`) — its old
 > top-level globs do not descend into `machine/`, so BOTH `/tickvault/prod/app`
 > log streams went dead and every log metric filter on that group was DOA.
-> Fixed 2026-07-06: the agent now tails `data/logs/machine/errors.jsonl.*` +
-> `data/logs/machine/app.*` (legacy globs kept as `-legacy` streams for a grace
-> window), ratcheted by
+> Fixed 2026-07-06: the agent now tails `data/logs/machine/errors.jsonl.2*` +
+> `data/logs/machine/app.2*` (date-stamped rotations ONLY — excludes the bare
+> `errors.jsonl` compat symlink + the 0-byte `app.log` placeholder; the exact
+> collect_list is pinned by `crates/app/tests/cloudwatch_agent_glob_guard.rs`
+> from #1438, so no legacy top-level globs are allowed), ratcheted by
 > `crates/common/tests/cloudwatch_app_alarms_wiring.rs::test_cw_agent_collects_machine_log_paths`.
 
 | Path | Purpose | Writer |

@@ -98,6 +98,16 @@ CURFEW_START_GRACE_MINUTES = 45
 # A naive timestamp is interpreted as IST. Missing/expired/garbage = no
 # override (budget protection wins).
 KEEP_ALIVE_PARAM = os.environ.get("KEEP_ALIVE_PARAM", "/tickvault/prod/keep-alive-until")
+# NSE-holiday intentional-stop marker (2026-07-07 round-3 review fix):
+# deploy/aws/holiday-gate.sh stamps today's IST date (YYYY-MM-DD) into this
+# param right before it self-stops the box on a weekday NSE holiday. The
+# 08:45 IST check consults it so a holiday self-stop is never "healed" by a
+# self-start (which both false-paged a Critical "auto-start FAILED" every
+# holiday AND joined the restart war that can race the 09:20 IST
+# market-hours alarm-gate sample).
+HOLIDAY_STOP_PARAM = os.environ.get(
+    "HOLIDAY_STOP_PARAM", "/tickvault/prod/holiday-stop-date"
+)
 
 
 def _is_within_operating_hours(now_utc: datetime) -> bool:
@@ -129,6 +139,24 @@ def _read_keep_alive_until(ssm_client: Any) -> datetime | None:
     except Exception as exc:  # noqa: BLE001 — guard must never crash
         logger.info("keep-alive param unavailable/unparseable (%s) — no override", exc)
         return None
+
+
+def _holiday_stop_is_today(now_utc: datetime) -> bool:
+    """True iff holiday-gate.sh stamped TODAY's IST date into the marker.
+
+    A stale marker (a previous holiday's date) never matches today, so no
+    cleanup is needed. Never raises — any error (missing param, AccessDenied,
+    garbage value) is FAIL-OPEN False: the self-heal start proceeds exactly
+    as before, so a real trading day can never lose the 08:45 rescue.
+    """
+    try:
+        resp = boto3.client("ssm").get_parameter(Name=HOLIDAY_STOP_PARAM)
+        raw = (resp.get("Parameter", {}).get("Value") or "").strip()
+        today_ist = (now_utc + IST_OFFSET).strftime("%Y-%m-%d")
+        return raw == today_ist
+    except Exception as exc:  # noqa: BLE001 — watchdog must never crash
+        logger.info("holiday-stop marker unavailable (%s) — treating as trading day", exc)
+        return False
 
 
 def _now() -> datetime:
@@ -423,7 +451,31 @@ def lambda_handler(event: dict[str, Any], _context: Any = None) -> dict[str, Any
         logger.info("check OK — instance is running; staying silent")
         return {"mode": "check", "state": state, "alerted": False, "self_started": False}
 
-    # Box is NOT running at 08:45 IST — fix first, page second.
+    # Box is NOT running at 08:45 IST.
+    # NSE-holiday intentional stop (2026-07-07 round-3 review fix): on weekday
+    # NSE holidays the 08:30 EventBridge start still fires and
+    # deploy/aws/holiday-gate.sh self-stops the box (~08:32 IST) after
+    # stamping today's IST date into HOLIDAY_STOP_PARAM. "Healing" that stop
+    # here (the pre-fix behaviour) false-paged a Critical "auto-start FAILED"
+    # every holiday AND joined the all-day restart war that can race the
+    # 09:20 IST market-hours alarm-gate sample. Marker == today -> the stop
+    # is intentional: stay silent, do NOT self-start. FAIL-OPEN: a missing/
+    # stale/unreadable marker keeps the self-heal exactly as before.
+    if _holiday_stop_is_today(_now()):
+        logger.info(
+            "check — box is '%s' but the holiday-stop marker is TODAY "
+            "(NSE-holiday self-stop by holiday-gate.sh); staying silent",
+            state,
+        )
+        return {
+            "mode": "check",
+            "state": state,
+            "alerted": False,
+            "self_started": False,
+            "skipped": "holiday_stop",
+        }
+
+    # Fix first, page second.
     self_started = _try_self_start(ec2_client, EC2_INSTANCE_ID)
     if self_started:
         _publish(

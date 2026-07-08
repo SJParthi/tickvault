@@ -70,11 +70,20 @@ resource "aws_iam_role_policy" "start_watchdog" {
       {
         # Curfew guard keep-alive override (2026-07-03 operator directive):
         # the hourly curfew_check reads /tickvault/<env>/keep-alive-until to
-        # decide whether an out-of-hours running box is deliberate. Read-only,
-        # scoped to that single parameter.
-        Effect   = "Allow"
-        Action   = ["ssm:GetParameter"]
-        Resource = "arn:aws:ssm:${var.aws_region}:${data.aws_caller_identity.current.account_id}:parameter/tickvault/${var.environment}/keep-alive-until"
+        # decide whether an out-of-hours running box is deliberate.
+        # NSE-holiday intentional-stop marker (2026-07-07 round-3 review
+        # fix): the 08:45 check reads /tickvault/<env>/holiday-stop-date
+        # (stamped by deploy/aws/holiday-gate.sh before its holiday
+        # self-stop) so it never "heals" an intentional holiday stop — that
+        # self-start both false-paged every holiday and fed the restart war
+        # racing the 09:20 IST alarm-gate sample. Read-only, scoped to
+        # exactly these two parameters.
+        Effect = "Allow"
+        Action = ["ssm:GetParameter"]
+        Resource = [
+          "arn:aws:ssm:${var.aws_region}:${data.aws_caller_identity.current.account_id}:parameter/tickvault/${var.environment}/keep-alive-until",
+          "arn:aws:ssm:${var.aws_region}:${data.aws_caller_identity.current.account_id}:parameter/tickvault/${var.environment}/holiday-stop-date",
+        ]
       },
       {
         Effect = "Allow"
@@ -122,6 +131,10 @@ resource "aws_lambda_function" "start_watchdog" {
       # Curfew keep-alive override param (ISO timestamp; operator/portal sets
       # it to run the box out of hours without the curfew guard stopping it).
       KEEP_ALIVE_PARAM = "/tickvault/${var.environment}/keep-alive-until"
+      # NSE-holiday intentional-stop marker (2026-07-07 round-3 review fix):
+      # holiday-gate.sh stamps today's IST date here before its self-stop;
+      # the 08:45 check skips the self-start + Critical page when it matches.
+      HOLIDAY_STOP_PARAM = "/tickvault/${var.environment}/holiday-stop-date"
     }
   }
 
