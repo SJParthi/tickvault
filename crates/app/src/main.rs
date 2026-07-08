@@ -3204,13 +3204,18 @@ async fn load_daily_universe_plan(
         // from the snapshot, and lifecycle for TODAY was already written by the
         // earlier boot that produced the snapshot.
         let questdb = config.questdb.clone();
-        let date_for_bg = today_date.clone();
         tokio::spawn(async move {
             match cold_build_daily_universe(&questdb, false).await {
-                Ok((_outcome, fresh_universe)) => {
-                    if let Err(e) =
-                        instrument_snapshot::write_plan_snapshot(&fresh_universe, &date_for_bg)
-                    {
+                Ok((fresh_outcome, fresh_universe)) => {
+                    // Hostile-review round 4 (2026-07-08): stamp the date the
+                    // rebuild's FUTIDX selection ACTUALLY used (the runner
+                    // re-derives it per attempt, R2-2) — never the boot-entry
+                    // `today_date`, which is stale if the reconcile's §4
+                    // retry loop crossed IST midnight.
+                    if let Err(e) = instrument_snapshot::write_plan_snapshot(
+                        &fresh_universe,
+                        &fresh_outcome.build_trading_date_ist,
+                    ) {
                         warn!(error = %e, "background reconcile: snapshot refresh write failed");
                     } else {
                         info!(
@@ -3241,11 +3246,18 @@ async fn load_daily_universe_plan(
 
     // Persist the snapshot so a same-day crash takes the fast path above.
     // Best-effort: a failed cache write is degraded-not-broken (next boot
-    // cold-builds again).
-    if let Err(e) = instrument_snapshot::write_plan_snapshot(&daily_universe, &today_date) {
+    // cold-builds again). Hostile-review round 4 (2026-07-08): stamp the
+    // date the successful build's FUTIDX selection ACTUALLY used
+    // (`outcome.build_trading_date_ist` — re-derived per attempt, R2-2),
+    // never the `today_date` frozen at fn entry: a §4 retry loop crossing
+    // IST midnight builds for D+1, and a D-labeled snapshot carrying the
+    // D+1 front month is an internally-inconsistent forensic artifact.
+    if let Err(e) =
+        instrument_snapshot::write_plan_snapshot(&daily_universe, &outcome.build_trading_date_ist)
+    {
         warn!(
             error = %e,
-            date = %today_date,
+            date = %outcome.build_trading_date_ist,
             "plan snapshot write failed — same-day crash will cold-build"
         );
     }
