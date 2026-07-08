@@ -758,6 +758,46 @@ fn test_tick_gap_silent_alarm_is_window_gated() {
 }
 
 #[test]
+fn test_tick_gap_silent_gauge_producer_pins_pre_open_to_zero() {
+    // Round-4 fix pin (2026-07-08, final-review findings 1/2/4): the
+    // tick-gap gauge producer in main.rs MUST pin the gauge to 0.0 during
+    // the NSE pre-open/auction window [09:00, 09:15) IST — the mirror of
+    // the round-3 SLO tick_freshness pre-open pin. Without it, the
+    // 09:08-09:15 matching/buffer freeze writes ~6-7 guaranteed breaching
+    // datapoints (boot-seeded ~775 SIDs silent, far above threshold 40)
+    // into the retuned alarm's 10-of-12 / 12-min lookback — the gate
+    // Lambda's forced-OK at 09:20 does NOT purge datapoints, so ~3
+    // open-ramp minutes > 40 would false-page at ~09:21 on ordinary days.
+    // This scan matches CODE only (comments stripped) so a comment mention
+    // can never satisfy it, and it asserts the UNPINNED raw write form is
+    // absent so the pin cannot be silently bypassed.
+    let body = fs::read_to_string(workspace_root().join("crates/app/src/main.rs"))
+        .expect("read crates/app/src/main.rs"); // APPROVED: test
+    let code_only = strip_line_comments(&body);
+    let compact: String = code_only.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(
+        compact.contains("constTICK_GAP_GAUGE_SESSION_OPEN_SECS_OF_DAY_IST:u32=9*3600+15*60"),
+        "main.rs must define TICK_GAP_GAUGE_SESSION_OPEN_SECS_OF_DAY_IST = 09:15:00 IST \
+         (the continuous-session open — the pre-open pin boundary)"
+    );
+    assert!(
+        compact.contains("now_ist_secs_of_day()<TICK_GAP_GAUGE_SESSION_OPEN_SECS_OF_DAY_IST"),
+        "main.rs must gate the tick-gap gauge value on now_ist_secs_of_day() < \
+         TICK_GAP_GAUGE_SESSION_OPEN_SECS_OF_DAY_IST (pre-open pin to 0.0)"
+    );
+    assert!(
+        compact.contains("gauge!(\"tv_tick_gap_instruments_silent\").set(gauge_silent)"),
+        "the tv_tick_gap_instruments_silent gauge write must use the pre-open-pinned \
+         gauge_silent value"
+    );
+    assert!(
+        !compact.contains("gauge!(\"tv_tick_gap_instruments_silent\").set(total_silent"),
+        "the tv_tick_gap_instruments_silent gauge must NOT be written from the raw \
+         total_silent count — that bypasses the [09:00, 09:15) IST pre-open pin"
+    );
+}
+
+#[test]
 fn test_realtime_guarantee_degraded_alarm_threshold_matches_slo_warn() {
     // The degraded alarm's 0.95 threshold MUST equal SLO_WARN_THRESHOLD in
     // crates/core/src/instrument/slo_score.rs — score == 0.95 is Healthy in

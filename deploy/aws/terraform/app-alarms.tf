@@ -214,6 +214,19 @@ resource "aws_cloudwatch_metric_alarm" "questdb_disconnected" {
 #     a value flapping 39/41/39 neither pages nor lets one clean scrape erase
 #     9 minutes of evidence; a 1-3 min reconnect blip cannot reach 10 breaching
 #     minutes.
+#   - PRE-OPEN PIN (round-4 correction 2026-07-08, final-review findings
+#     1/2/4): the producer (main.rs tick-gap scan) pins the gauge to 0 during
+#     the NSE pre-open/auction window [09:00, 09:15) IST — the 09:08-09:15
+#     matching/buffer freeze makes the boot-seeded ~775 SIDs legitimately
+#     silent (values in the hundreds >> 40), and this alarm's 12-min lookback
+#     (the LONGEST of any gated alarm) at the 09:20 gate-open would otherwise
+#     hold ~7 guaranteed breaching pre-open datapoints (the gate Lambda's
+#     forced-OK does NOT purge datapoints) -> only ~3 open-ramp minutes > 40
+#     needed for a near-daily false page at ~09:21. Exact mirror of the SLO
+#     tick_freshness pre-open pin; ratcheted by
+#     test_tick_gap_silent_gauge_producer_pins_pre_open_to_zero. The mandated
+#     soak week additionally checks the 09:20-09:25 transition band, not just
+#     the steady-state distribution.
 #   - MARKET-HOURS GATE (audit-findings Rule 3, MANDATORY): the gauge is set
 #     only in-session (main.rs tick-gap scan gates on
 #     is_within_trading_session_ist), so the LAST in-session value keeps being
