@@ -78,6 +78,9 @@ mid-market (audit Rule 5 — drain failures must be `error!`).
 3. The pool supervisor (WS-GAP-05) respawns the *connection* task, but it
    cannot resurrect a dead *consumer*. If the consumer is gone, restart the
    app — boot re-creates the channel + consumer.
+4. 2026-07-06: WS-GAP-07 now pages via its `tv-<env>-errcode-ws-gap-07`
+   log-filter alarm (`deploy/aws/terraform/error-code-alarms.tf`); the 5-sink
+   "error!→Telegram" premise was stale post-CloudWatch-migration.
 
 **Source:** `crates/core/src/websocket/connection.rs` (the
 `TrySendError::Closed` arm of the live-feed `try_send`).

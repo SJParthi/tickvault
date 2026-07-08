@@ -12,7 +12,7 @@
 ## The one-line architecture
 
 ```
-error! → tracing → [5 sinks] → Telegram + AWS SNS
+error! → tracing → [4 local sinks + CloudWatch Logs] → (alarmed codes) metric-filter alarm → SNS → Telegram
                                 ↓
                          Claude auto-triage
                                 ↓
@@ -27,11 +27,32 @@ error! → tracing → [5 sinks] → Telegram + AWS SNS
 | 2 | `data/logs/app.YYYY-MM-DD.log` | disk | full app log, daily rotation | `LOG_MAX_FILES` |
 | 3 | `data/logs/errors.log` | disk | WARN+ only, single file, grep-friendly | single file |
 | 4 | `data/logs/errors.jsonl.YYYY-MM-DD-HH` | disk | **ERROR-only, JSONL, hourly rotation** | 48h (auto-swept) |
-| 5 | Telegram + AWS SNS SMS | network | operator / Claude triage | Alertmanager dedup |
+| 5 | CloudWatch Logs → metric-filter alarms → SNS → Telegram | AWS | operator paging for filtered High/Critical codes | 14d logs; one page per ALARM episode |
 
 Sink 4 is the one future Claude Code sessions and any log-ingestion MCP tail.
 `cat data/logs/errors.jsonl.$(date -u +%Y-%m-%d-%H) | jq` = one pipe, every
 structured ERROR event in the last hour.
+
+### Which codes page (2026-07-06)
+
+**The canonical routing:** `error!` → errors.jsonl (`data/logs/machine/`) →
+CloudWatch Logs `/tickvault/prod/app` (CW agent) → log metric filter →
+`tv_errcode_*` metric → CloudWatch alarm (≤5 min) → SNS `tv-prod-alerts` →
+Telegram webhook Lambda. An `error!` ALONE does not reach Telegram; only codes
+with a filter+alarm (or paths that also call `NotificationService::notify`)
+page. The Loki→Alertmanager→Telegram path was retired in the CloudWatch-only
+migration (#O1/#O2/#O3) — the 2026-07-06 zero-page incident is why this list
+now exists (`deploy/aws/terraform/error-code-alarms.tf`).
+
+Filtered+alarmed codes (each = one `error_code_alerts` map entry):
+REST-CANARY-01, DH-901, DH-906 (term-match tripwire — no coded emit site
+exists yet), AUTH-GAP-04, WS-GAP-07, FEED-STALL-01 (ERROR lines = the
+sidecar's own >5-restarts-per-5-min STORM escalation ONLY; per-restart lines
+are warn!-level and invisible here — the ≥3-restarts-per-15-min restart pager
+is the separate `tv_feed_sidecar_stall_restart_total` counter alarm,
+`feed-stall-restart-alarm.tf`; round-3 correction 2026-07-06),
+WS-REINJECT-01, PROC-01. **Everything else is log-sink-only** unless it has
+its own metric alarm (app-alarms.tf) or a typed `NotificationEvent`.
 
 ## The ErrorCode taxonomy (53 variants, 100% rule-synced)
 
@@ -149,6 +170,16 @@ summary file and drives the above flow.
 > file moves). The app-log sweeper skips every `*.log` name so it can never
 > delete the human daily log. Machine-dir ratchet:
 > `crates/app/src/observability.rs::test_all_machine_sink_dirs_live_under_machine_subdir`.
+>
+> **2026-07-06 correction — the AWS shipping consumer was MISSED:** the
+> 2026-07-05 consumer sweep did NOT update the CloudWatch agent's collect_list
+> (`deploy/aws/cloudwatch-agent.json` + `user-data.sh.tftpl`) — its old
+> top-level globs do not descend into `machine/`, so BOTH `/tickvault/prod/app`
+> log streams went dead and every log metric filter on that group was DOA.
+> Fixed 2026-07-06: the agent now tails `data/logs/machine/errors.jsonl.*` +
+> `data/logs/machine/app.*` (legacy globs kept as `-legacy` streams for a grace
+> window), ratcheted by
+> `crates/common/tests/cloudwatch_app_alarms_wiring.rs::test_cw_agent_collects_machine_log_paths`.
 
 | Path | Purpose | Writer |
 |------|---------|--------|
