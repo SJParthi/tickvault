@@ -1955,7 +1955,10 @@ mod tests {
         // AUTH-GAP-05 (sustained mid-session token-invalid — forced re-mint
         // triggered via the existing renewal machinery; lock-before-mint +
         // ~125s cooldown + retry-once latch honored).
-        assert_eq!(ErrorCode::all().len(), 132);
+        // 2026-07-08 (§36 FUTIDX-4): bumped 132 -> 134 for FUTIDX-01
+        // (per-underlying nearest-expiry selection degraded, per feed) +
+        // FUTIDX-02 (cross-feed expiry mismatch) — both Severity::High.
+        assert_eq!(ErrorCode::all().len(), 134);
     }
 
     #[test]
