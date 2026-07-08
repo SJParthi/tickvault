@@ -1,108 +1,119 @@
-# Implementation Plan: Dhan token self-heal — forced mid-session re-mint + honest token-health gauges + one HIGH event
+# Implementation Plan: Market-open confirmations bypass the in-market digest
 
 **Status:** VERIFIED
-**Date:** 2026-07-06
-**Approved by:** Parthiban (operator directive 2026-07-06)
-**Changed crates:** core (`crates/core`), app (`crates/app`), common (test ratchets in `crates/common`) — plus terraform (`deploy/aws/terraform/`) and the operator-portal Lambda (`deploy/aws/lambda/operator-control/handler.py`).
+**Date:** 2026-07-08
+**Approved by:** Parthiban (operator directive 2026-07-08 — verbatim complaint
+"why every telegram notification is very late" + standing merge instruction)
+**Changed crates:** core (crates/core — single file
+`crates/core/src/notification/events.rs` + its inline tests)
 
-> **Incident context (2026-07-06):** the Dhan feed degraded ALL day and the
-> operator received ZERO pages, despite FOUR independent signals firing
-> internally: (1) exchange→receive lag p99 46s / max 199s all session;
-> (2) 29–67 of 776 subscribed instruments silent EVERY minute — the
-> tick-gap alarm threshold of 100 was never crossed; (3) 125 SLO score
-> crossings in the 0.94–0.97 band — SLO-02 has been Telegram-suppressed
-> (log-only) since 2026-05-11 and the <0.80 Critical tier is mathematically
-> unreachable for feed degradation (tick_freshness alone bottoms at
-> 1−67/776 ≈ 0.914); (4) BOUNDARY-01 catch-up sealing ran at 9k–11.5k
-> seals/10min (coalesced warn!, no page). A fifth defect compounded the
-> blindness: the operator-portal lag SQL used `now()` (UTC) against
-> IST-shifted `ts`, producing a ~5h40m window that conflated WAL-replay
-> rows with live rows, AND its exchange-time window structurally
-> lag-censored the very lag it was meant to show (Rule-11 false-OK).
+## Design
+
+PR #1439 introduced the in-market digest lane (`DispatchLane::Digest`,
+900s window — `crates/core/src/notification/coalescer.rs:74`
+`DEFAULT_DIGEST_WINDOW_SECS`, `config/base.toml` `digest_window_secs = 900`)
+that batches Low/Medium/Info chatter during market hours. Verified incident
+2026-07-08 morning: the digest also swept the three once-per-trading-day
+market-open confirmations, so the operator received "READY for market open
+@ 09:14" at 09:28, "Streaming live @ 09:15:30" at 09:30, and "self-test
+PASSED @ 09:16" at 09:30. These are time-critical at the open and must be
+instant.
+
+Fix: in `crates/core/src/notification/events.rs`,
+`NotificationEvent::dispatch_policy()` already carries a
+`DispatchPolicy::Immediate` arm for exactly this once-per-day
+must-arrive-now class (AuthenticationSuccess, WebSocketPoolOnline,
+OrderUpdateConnected, CrossVerify1mSummary, ...). Add the three variants:
+
+- `Self::MarketOpenReadinessConfirmation { .. }`
+- `Self::MarketOpenStreamingConfirmation { .. }`
+- `Self::SelfTestPassed { .. }`
+
+`DispatchPolicy::Immediate` wins over severity in `classify_dispatch`
+(`crates/core/src/notification/coalescer.rs:146-148`), so no severity
+change is needed — the three stay `Severity::Info` (color decoupled from
+routing, the established 2026-05-09 pattern).
+
+## Edge Cases
+
+- `SelfTestDegraded` / `SelfTestCritical` are deliberately NOT added —
+  they are Severity::High / Critical already, which routes immediate via
+  the severity fallback in `classify_dispatch`.
+- `MarketOpenStreamingFailed` is Severity::High → already immediate;
+  untouched.
+- The three variants stay Severity::Info so their existing tag/color and
+  Telegram wording are unchanged — only routing changes.
+- Off-market emission: these events fire only at 09:14 / 09:15:30 / 09:16
+  IST on trading days (their emitters are edge-triggered once per day),
+  so the Immediate policy adds no new spam surface.
+
+## Failure Modes
+
+- Regression risk: a future edit removes a variant from the Immediate arm
+  → the new inline ratchet test asserting
+  `dispatch_policy() == DispatchPolicy::Immediate` for each of the three
+  variants fails the build.
+- Wrong-shape risk: matching a struct variant without `{ .. }` does not
+  compile — the compiler enforces the exact variant shape.
+- No runtime failure path: `dispatch_policy()` is a pure total match over
+  `&self`; adding arms cannot panic, allocate, or change any other arm.
+
+## Test Plan
+
+- Extend the existing dispatch-policy test coverage in the inline
+  `#[cfg(test)]` module of `crates/core/src/notification/events.rs`:
+  `test_market_open_confirmations_are_immediate_info` constructs minimal
+  instances of all three variants and asserts
+  `dispatch_policy() == DispatchPolicy::Immediate` AND
+  `severity() == Severity::Info` (severity unchanged), following the
+  existing `test_per_ws_connect_events_are_immediate_low` style.
+- Gates: `cargo fmt --check`;
+  `cargo clippy -p tickvault-core --no-deps -- -D warnings`;
+  `cargo test -p tickvault-core --lib notification`.
+
+## Rollback
+
+Single-commit change to one file — `git revert` of the commit restores the
+pre-fix routing (the three confirmations coalesce into the 900s digest
+again). No schema, config, wire-format, or Telegram-wording change; no
+data migration; no coalescer change.
+
+## Observability
+
+- The change itself IS an observability fix: the three once-per-day
+  operator pings in crates/core now arrive at their emission instants
+  (09:14 / 09:15:30 / 09:16 IST) instead of up to ~15 minutes late inside
+  the in-market digest.
+- No new counters/logs needed: the coalescer's existing dispatch metrics
+  and the events' existing rendering are untouched; the new inline
+  ratchet test pins the routing so a silent regression fails the build.
 
 ## Plan Items
 
-- [x] Add live single-writer token-health gauge poller (`tv_token_remaining_seconds` LIVE +
-      `tv_token_valid` AND-composed) + pure `token_valid_gauge` fn
-      — impl: `crates/core/src/auth/token_health_gauge.rs::token_valid_gauge` (:81) +
-      `spawn_token_health_gauge_poller`; exported via `crates/core/src/auth/mod.rs`
-  - Files: crates/core/src/auth/token_health_gauge.rs, crates/core/src/auth/mod.rs
-  - Tests: test_token_valid_gauge_truth_table, test_seconds_until_expiry_fail_closed_zero_without_token, test_poll_cadence_constant_is_sane
-- [x] Add O(1) `TokenManager::dual_instance_lock_held(&self) -> Option<bool>` accessor (reuse
-      existing `instance_lock_held` field; do NOT fork mint/renew)
-      — impl: `crates/core/src/auth/token_manager.rs::dual_instance_lock_held`
-  - Files: crates/core/src/auth/token_manager.rs
-  - Tests: test_dual_instance_lock_held_mirrors_constructor_flag
-- [x] Add pure decision fns + counter/latch fields to the mid-session watchdog and wire the
-      forced re-mint via existing `force_renewal()` (lock-before-mint, retry-once, cooldown)
-      — impl: `crates/core/src/auth/mid_session_watchdog.rs::{decide_remint, cycle_outcome,
-      next_consecutive_failures, apply_remint_decision}` + the `force_renewal(` call site
-  - Files: crates/core/src/auth/mid_session_watchdog.rs
-  - Tests: decide_remint_below_threshold_waits, decide_remint_latch_blocks_second_attempt, decide_remint_lock_lost_beats_cooldown, decide_remint_holds_inside_cooldown_when_lock_held, decide_remint_triggers_at_threshold_with_lock_and_cooldown_ok, next_consecutive_failures_ok_resets_to_zero
-- [x] Add ONE HIGH `NotificationEvent::TokenForcedRemintTriggered` (4 match arms: formatter,
-      event_kind, severity High, feed_badge Dhan)
-      — impl: `crates/core/src/notification/events.rs::TokenForcedRemintTriggered` (:566, 4 arms)
+- [x] Add the 3 variants to the `DispatchPolicy::Immediate` arm of
+      `dispatch_policy()`
   - Files: crates/core/src/notification/events.rs
-  - Tests: test_token_forced_remint_triggered_event
-- [x] Add `ErrorCode::AuthGap05ForcedRemintTriggered` + rule-file runbook section
-      — impl: `crates/common/src/error_code.rs::AuthGap05ForcedRemintTriggered` (:297,
-      code_str "AUTH-GAP-05") + `.claude/rules/project/wave-4-error-codes.md` §AUTH-GAP-05
-  - Files: crates/common/src/error_code.rs, .claude/rules/project/wave-4-error-codes.md
-  - Tests: existing error_code meta-tests + crossref + tag_guard (tickvault-common suite)
-- [x] Add named constants (poll cadence, consecutive threshold); reuse DHAN_TOKEN_GENERATION_COOLDOWN_SECS
-      — impl: `CONSECUTIVE_INVALID_REMINT_THRESHOLD` (mid_session_watchdog.rs:87) +
-      `TOKEN_HEALTH_GAUGE_POLL_SECS` (token_health_gauge.rs:74); cooldown constant reused from
-      crates/common/src/constants.rs (no change needed there)
-  - Files: crates/core/src/auth/mid_session_watchdog.rs, crates/core/src/auth/token_health_gauge.rs
-  - Tests: remint_threshold_constant_is_sane, test_poll_cadence_constant_is_sane
-- [x] Wire poller + extended watchdog signature into boot; seed tv_token_valid at Step 6
-      — impl: `crates/app/src/main.rs` `spawn_token_health_gauge_poller(` call sites (slow lane +
-      FAST crash-recovery arm) + extended `spawn_mid_session_profile_watchdog` wiring
-  - Files: crates/app/src/main.rs
-  - Tests: (covered by ratchets below)
-- [x] Fixer round 1: lane-own the gauge poller + mid-session watchdog (DhanLaneRunHandles
-      fields, teardown step-0 abort + honest 0/0.0 gauge reset, H8 Drop abort); spawn the
-      gauge poller on the FAST crash-recovery arm; 4-way status-aware `cycle_outcome`
-      (`RestSurfaceDegraded` never escalates to a mint); prefix-anchored transient classifier;
-      de-vacuate the decide_remint ratchet (production-region scan)
-      — impl: `crates/app/src/main.rs::DhanLaneRunHandles::{token_health_gauge_handle,
-      mid_session_watchdog_handle}` + `teardown_dhan_lane_tasks` step-0 abort;
-      `mid_session_watchdog.rs::CycleOutcome::RestSurfaceDegraded`
-  - Files: crates/app/src/main.rs, crates/core/src/auth/mid_session_watchdog.rs,
-    crates/core/src/auth/token_health_gauge.rs, crates/core/src/auth/secret_manager.rs
-  - Tests: cycle_outcome_http_5xx_is_rest_surface_degraded, cycle_outcome_http_400_and_429_are_rest_surface_degraded, cycle_outcome_hostile_401_body_with_transient_needles_is_real_auth_fail, hostile_body_embedding_send_leg_wrapper_is_not_transient, rest_outage_two_cycles_never_reaches_remint_threshold, apply_cycle_outcome_rest_degraded_leaves_state_and_flag_untouched, dhan_lane_run_handles_drop_aborts_handles
-- [x] Source-scan ratchets: re-mint call site exists + poller wired into main
-      — impl: `crates/core/src/auth/secret_manager.rs` tests module (production-region scan)
-  - Files: crates/core/src/auth/secret_manager.rs
-  - Tests: test_mid_session_remint_trigger_call_site_exists, test_token_health_gauge_poller_wired_into_main
-- [x] Re-applied continuation-review fixes (2026-07-08, adjudicated findings — disk-rollback
-      recovery). F4: market-open one-shots (09:14/09:15:30/09:16) once-per-process latched
-      (`MARKET_OPEN_ONE_SHOTS_SPAWNED`) + fire-time dhan-enabled gates
-      (`market_open_fire_gate_dhan_enabled`) + FirstSeenSet midnight-reset latch
-      (`FIRST_SEEN_RESET_SPAWNED`). F5: runtime IP monitor lane-owned (mem::forget removed;
-      guard-wrapped, defused into `DhanLaneRunHandles.ip_monitor_handle/_shutdown`, stopped by
-      teardown/Drop). F12: needle-miss SEND-LEG profile failures classify RestSurfaceDegraded
-      (never walk the mint counter). F13: slow-boot heartbeat watchdog lane-owned
-      (`heartbeat_watchdog_handle`). F14: teardown bounded-joins the pool watchdog then publishes
-      honest lane-off `/health` ws count 0 + feed-health Dhan disconnected (Drop mirrors);
-      teardown budget const updated (4 joins, 42s ≤ 45s). F15: `/health token_valid` honors the
-      profile-truth flag via pure `token_health_writer_valid`. F8: ONE shared comment-aware
-      production-region helper (`tickvault_common::source_scan`) used by all region ratchets
-      (covers inline #[cfg(test)] attrs, doc-comment mentions, AND main.rs's trailing production
-      code after `mod tests`). F9/F17: comment-stripped teardown abort→join→reset ordering
-      ratchet. F10: InstanceLockHeartbeatGuard defuse semantics behaviourally tested. F19:
-      cancel-cleanup comments enumerate the REAL residual detached tasks.
-  - Files: crates/common/src/source_scan.rs, crates/common/src/lib.rs,
-    crates/core/src/auth/mid_session_watchdog.rs, crates/core/src/auth/secret_manager.rs,
-    crates/app/src/main.rs, crates/api/tests/token_headroom_wired_guard.rs,
-    .claude/rules/project/wave-4-error-codes.md
-  - Tests: test_market_open_one_shots_latched_and_gated,
-    test_ip_monitor_and_heartbeat_watchdog_are_lane_owned,
-    cycle_outcome_send_leg_without_transient_needle_is_rest_surface_degraded,
-    send_leg_needle_miss_two_cycles_never_reach_remint_threshold,
-    instance_lock_heartbeat_guard_defuse_and_drop_semantics,
-    test_token_health_writer_valid_honors_profile_truth,
-    test_market_open_fire_gate_reads_dhan_flag,
-    ratchet_teardown_abort_join_reset_ordering_comment_stripped,
-    production_region_keeps_trailing_code_after_mod_tests,
-    strips_line_and_doc_comments_but_keeps_strings
+  - Tests: test_market_open_confirmations_are_immediate_info
+- [x] Inline ratchet test covering all 3 variants (Immediate + Info)
+  - Files: crates/core/src/notification/events.rs
+  - Tests: test_market_open_confirmations_are_immediate_info
+
+## Scenarios
+
+| # | Scenario | Expected |
+|---|----------|----------|
+| 1 | MarketOpenReadinessConfirmation emitted at 09:14 IST in-market | Delivered instantly (Immediate), stays [INFO] |
+| 2 | MarketOpenStreamingConfirmation emitted at 09:15:30 IST | Delivered instantly, stays [INFO] |
+| 3 | SelfTestPassed emitted at 09:16 IST | Delivered instantly, stays [INFO] |
+| 4 | SelfTestDegraded / SelfTestCritical | Unchanged — High/Critical severity already routes immediate |
+| 5 | Low/Medium in-market chatter | Unchanged — still digest-batched (900s window) |
+
+## Per-Item Guarantee Matrix
+
+Cross-reference: `.claude/rules/project/per-wave-guarantee-matrix.md`
+(the 15-row + 7-row matrices apply as cross-referenced per that file's
+"or cross-reference it" clause). This is a single-file, cold-path routing
+fix — no hot path (no DHAT/bench delta), no new table, no new pub fn, no
+new failure mode, no security surface; the inline ratchet test
+`test_market_open_confirmations_are_immediate_info` is the extreme-check
+row's build-failing artefact.
