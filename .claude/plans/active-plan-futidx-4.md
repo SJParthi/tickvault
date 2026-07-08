@@ -200,3 +200,50 @@ Scope addendum (Status stays VERIFIED; fixes landed post-plan as review remediat
       unchanged. Fixed: row edited inline with the carve-out + corrected
       rationale.
       - Files: .claude/rules/project/operator-charter-forever.md
+
+## Hostile-review round 3 (2026-07-08) — 7 confirmed findings, all fixed
+
+- [x] R3-1 (MEDIUM): unbounded O(n²) same-expiry dedup on untrusted CSV rows,
+      both selectors. Fixed: HashSet O(n) dedup (I-P1-11 single-segment
+      justification comments) + hard envelope cap
+      `FUTIDX_SAME_EXPIRY_CANDIDATE_CAP = 16` with fail-closed
+      `SameExpiryCandidateFlood` degrade above it (both feeds).
+      - Files: index_futures.rs, feed/groww/instruments.rs
+      - Tests: test_select_flood_beyond_cap_degrades_fail_closed,
+        test_select_dedup_at_cap_scale_same_sid_still_chosen,
+        test_extract_flood_beyond_cap_degrades_fail_closed
+- [x] R3-2 (MEDIUM): Groww watch date frozen across the pull-until-success
+      loop (Edge Cases claim untrue on the Groww side). Fixed: per-attempt
+      today_ist_date() inside the loop (build + watch-file name + persist
+      date), entry-time value kept only as the validity probe/fallback —
+      the Edge Cases claim "both builders re-run for the new date" is now
+      TRUE on both sides (Dhan via R2-2's date closure, Groww via this).
+      - Files: crates/app/src/groww_activation.rs
+      - Tests: ratchet_watch_date_rederived_per_attempt_inside_loop
+- [x] R3-3 (LOW): snapshot to_universe IndexFuture arm silently defaulted
+      missing expiry/underlying while segment failed closed → subscribed
+      future invisible to the parity recorder (false one-sided FUTIDX-02).
+      Fixed: expiry + underlying fail closed (None/empty → whole snapshot
+      None → cold rebuild).
+      - Files: crates/core/src/instrument/instrument_snapshot.rs
+      - Tests: test_snapshot_index_future_missing_expiry_or_underlying_fails_closed
+- [x] R3-4 (LOW): FUTIDX-02 shipped auto-triage-safe=true against the design
+      contract. Fixed: severity-independent override arm in
+      is_auto_triage_safe (false for FUTIDX-02); runbook prose de-drifted.
+      - Files: crates/common/src/error_code.rs
+      - Tests: test_futidx_codes_contract
+- [x] R3-5 (LOW): /feeds subscribed counts excluded the 4 futures while the
+      FeedInstrumentsLoaded Telegram included them (off-by-4). Fixed: the
+      non-index bucket is entries.len() - indices (mirror of the Dhan call).
+      - Files: crates/app/src/groww_activation.rs
+- [x] R3-6 (MEDIUM): scope-guard FUTIDX membership pin satisfiable by
+      test-region literals (vacuous whole-file scan). Fixed: production-
+      region split at #[cfg(test)] + non-vacuity self-assert (prod region
+      must exclude "FINNIFTY").
+      - Files: crates/storage/tests/daily_universe_scope_guard.rs
+- [x] R3-7 (LOW): wave-5 PREVCLOSE-03 matrix kept contradictory unmarked
+      NSE_FNO|Full / BSE_FNO|Full rows beside the §36 Quote row. Fixed:
+      stale rows marked inline (superseded 2026-07-08), Quote row marked
+      authoritative — no future runtime-assertion implementer can honor the
+      stale cells.
+      - Files: .claude/rules/project/wave-5-error-codes.md
