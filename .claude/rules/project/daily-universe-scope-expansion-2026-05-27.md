@@ -1001,8 +1001,8 @@ The daily-universe SUBSCRIPTION set additionally carries exactly FOUR index-futu
 the NEAREST-expiry FUTIDX for NIFTY, BANKNIFTY, MIDCPNIFTY (NSE_FNO, ExchangeSegment 2) and
 SENSEX (BSE_FNO, ExchangeSegment 8), selected fresh every morning from the same Detailed CSV
 (`SM_EXPIRY_DATE`, never guessed/hardcoded), subscribed in **Quote mode (request code 17)** on
-the EXISTING single main-feed connection. Nearest = first expiry >= today; index futures NEVER
-roll — on expiry day the expiring contract stays subscribed through the 15:30 close (preserves
+the EXISTING single main-feed connection. Nearest = first expiry >= today; index futures
+NEVER roll — on expiry day the expiring contract stays subscribed through the 15:30 close (preserves
 `test_index_expiry_never_rolls_via_planner`); the next trading day's build advances
 automatically. Selection is a pure function of (CSV, IST trading date) evaluated once at build
 time; NO intraday resubscribe ever. The Groww watch set gains the SAME 4 logical contracts

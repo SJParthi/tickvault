@@ -62,8 +62,9 @@ Gauge: `tv_index_futures_selected{feed}` (0-4).
 
 ## §2. FUTIDX-02 — cross-feed expiry mismatch
 
-**Severity:** High. **Auto-triage safe:** No (data-comparability signal; operator must decide
-which vendor master is stale).
+**Severity:** High. **Auto-triage safe:** Yes at the enum level (`is_auto_triage_safe` is
+derived `!Critical`); operator guidance is MANUAL triage — a data-comparability signal is
+never auto-actioned, and the operator must decide which vendor master is stale.
 
 **Trigger:** the boot-time comparator (`compare_index_future_selections`, fired from
 `record_index_future_selection` once BOTH feeds have recorded — order-independent;

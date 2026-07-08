@@ -6,25 +6,25 @@
 
 ## Plan Items
 
-- [ ] Item 1 — Shared selection module (constant + boundary fn + selector + parity comparator)
+- [x] Item 1 — Shared selection module (constant + boundary fn + selector + parity comparator)
   - Files: crates/core/src/instrument/index_futures.rs (NEW), crates/core/src/instrument/mod.rs
   - Tests: test_index_futures_underlyings_pinned_exactly_four, test_select_index_future_expiry_picks_first_at_or_after_today, test_select_index_future_expiry_keeps_expiring_contract_on_t_zero, test_select_index_future_expiry_advances_day_after_expiry, test_select_index_future_expiry_none_when_all_past, test_index_future_selection_never_rolls_unlike_stocks, test_select_index_future_contracts_excludes_optidx_futstk_optstk, test_select_index_future_contracts_excludes_fifth_underlying, test_select_index_future_contracts_fails_closed_on_duplicate_expiry, test_select_index_future_contracts_sensex_from_bse_fno_only, test_select_index_future_contracts_canonicalizes_midcpnifty_alias, test_select_index_future_contracts_missing_underlying_degrades, test_select_index_future_contracts_skips_unparsable_expiry_counted, arbitrary_contract_sets_never_select_beyond_allowlist, test_cross_feed_parity_ok_on_identical_pairs, test_cross_feed_parity_flags_expiry_mismatch, test_cross_feed_parity_flags_one_sided_underlying
-- [ ] Item 2 — InstrumentRole::IndexFuture + universe Pass 5 + orchestrator wiring + error codes
+- [x] Item 2 — InstrumentRole::IndexFuture + universe Pass 5 + orchestrator wiring + error codes
   - Files: crates/core/src/instrument/daily_universe.rs, crates/core/src/instrument/daily_universe_orchestrator.rs, crates/common/src/error_code.rs, crates/app/src/daily_universe_boot.rs, crates/app/src/main.rs
   - Tests: test_build_daily_universe_pass5_promotes_futidx_targets, test_count_by_role_includes_index_future, test_daily_universe_spot_only_when_no_future_rows
-- [ ] Item 3 — Planner IndexFuture arm (segment from csv_row, Quote, IndexDerivative)
+- [x] Item 3 — Planner IndexFuture arm (segment from csv_row, Quote, IndexDerivative)
   - Files: crates/core/src/instrument/subscription_planner.rs
   - Tests: test_daily_universe_plan_index_future_targets_quote_mode_fno_segments, test_daily_universe_plan_futidx_capped_at_4, test_daily_universe_plan_index_future_unknown_segment_skipped, test_daily_universe_plan_futures_dedup_composite_key
-- [ ] Item 4 — Snapshot format v2 (role label + optional segment/expiry fields + format gate)
+- [x] Item 4 — Snapshot format v2 (role label + optional segment/expiry fields + format gate)
   - Files: crates/core/src/instrument/instrument_snapshot.rs
   - Tests: test_parse_role_round_trips_index_future, test_snapshot_roundtrip_preserves_index_future_segment_and_expiry, test_snapshot_index_future_missing_segment_fails_closed, test_snapshot_format_v1_rejected_forces_cold_build_once, test_snapshot_format_v2_zero_futures_accepted_no_rebuild_loop, test_old_snapshot_without_new_fields_parses_with_empty_defaults
-- [ ] Item 5 — REST-loop skips + lifecycle dedup + canary hardening
+- [x] Item 5 — REST-loop skips + lifecycle dedup + canary hardening
   - Files: crates/app/src/prev_day_ohlcv_boot.rs, crates/app/src/main.rs, crates/app/src/today_instrument.rs, crates/core/src/pipeline/tick_processor.rs
   - Tests: test_instrument_type_for_role_none_for_index_future, test_cross_verify_targets_exclude_index_future_role, test_extract_today_instruments_dedups_futidx_between_targets_and_contracts, test_canary_gauges_ignore_non_idx_i_segments
-- [ ] Item 6 — Ratchets: scope-guard pins + Quote+FNO parser routing tests
+- [x] Item 6 — Ratchets: scope-guard pins + Quote+FNO parser routing tests
   - Files: crates/storage/tests/daily_universe_scope_guard.rs, crates/core/tests/prev_close_routing_5525125_guard.rs
   - Tests: futidx_scope_pinned_to_4_underlyings_nearest_expiry, futidx_scope_rule_file_pins_forbidden_remainder, futidx_scope_never_roll_source_pin, futidx_scope_legacy_gate_still_false, test_prev_close_routing_nse_fno_from_quote_close_field_bytes_38_to_41, test_prev_close_routing_bse_fno_from_quote_close_field_bytes_38_to_41
-- [ ] Item 7 — Groww: master-row fields + FUT extractor + watch-set fold + master labeling + parity record
+- [x] Item 7 — Groww: master-row fields + FUT extractor + watch-set fold + master labeling + parity record
   - Files: crates/core/src/feed/groww/instruments.rs, crates/core/src/feed/groww/shared_master_writer.rs, crates/app/src/groww_activation.rs
   - Tests: test_groww_row_parses_underlying_and_expiry_columns, test_groww_row_missing_new_headers_degrades_not_fails_master, test_extract_index_future_entries_picks_nearest_expiry_four_underlyings, test_extract_index_future_entries_sensex_on_bse_others_nse, test_extract_index_future_entries_uses_underlying_symbol_not_trading_symbol, test_extract_index_future_entries_missing_underlying_degrades, test_extract_index_future_entries_ambiguous_duplicate_fails_closed, test_extract_index_future_entries_never_rolls_on_expiry_day, test_watch_set_includes_exactly_4_fno_futures, test_watch_file_roundtrip_with_fno_entries, test_master_writer_labels_fno_ltp_entries_futidx
 
