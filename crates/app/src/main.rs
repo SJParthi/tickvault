@@ -1116,6 +1116,33 @@ async fn main() -> Result<()> {
     // because handles created pre-install resolve to a no-op counter.
     tickvault_core::parser::prewarm_dispatcher_counters();
 
+    // Pre-register the Groww sidecar stall-restart counter at 0 — HERE,
+    // immediately after the recorder installs (round-5 review fix,
+    // 2026-07-06). The round-4 attempt registered it at the TOP of
+    // `run_groww_sidecar_supervisor`, but that supervisor is spawned much
+    // earlier in this fn (before the STAGE-C WAL replay, well before this
+    // Step 2 install), so its `counter!` handle resolved to the no-op
+    // recorder and NO registration happened — the series was still lazily
+    // born at the first real restart, whose sample the CW agent's delta
+    // pipeline drops as its baseline (feed-stall-restart-alarm.tf
+    // FIRST-SAMPLE BASELINE): restart #1 of every app session was lost and
+    // the tv-<env>-feed-stall-restarts pager's effective first-episode
+    // threshold was 4, not 3. Registering post-install makes the series
+    // DENSE from boot (a 0-delta /metrics event per 60s scrape), so the
+    // dropped first sample is the harmless 0 baseline and the pager
+    // genuinely sees every restart, including the session's first.
+    // Honest residual: a stall-restart landing in the pre-install boot
+    // window (between the supervisor spawn and this line) would increment a
+    // no-op handle and go uncounted — physically implausible (it needs a
+    // sidecar launch + a recorded tick + >30s feed silence inside the boot
+    // prefix). Ratchet (source-order scan of this file):
+    // groww_sidecar_supervisor::tests::test_stall_restart_counter_is_preregistered_after_recorder_install.
+    metrics::counter!(
+        "tv_feed_sidecar_stall_restart_total",
+        "feed" => tickvault_common::feed::Feed::Groww.as_str(),
+    )
+    .increment(0);
+
     // L18 (revised) + L121-L130 (Wave-5 in-memory-store plan §AA):
     // register the per-subsystem memory gauges, the sampler heartbeat,
     // and the market-hours-active quiet-hours gate. The sampler task

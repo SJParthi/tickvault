@@ -1157,6 +1157,29 @@ pub async fn run_groww_sidecar_supervisor(
     notifier: Arc<arc_swap::ArcSwapOption<NotificationService>>,
 ) {
     let mut consecutive_failures: u32 = 0;
+    // DEFENSIVE (best-effort) stall-restart counter registration. The
+    // AUTHORITATIVE pre-registration lives in main.rs, immediately after
+    // `observability::init_metrics` (boot Step 2) — round-5 review fix,
+    // 2026-07-06. This supervisor is spawned BEFORE that recorder install
+    // on the normal boot path, so THIS `counter!` handle resolves to the
+    // no-op recorder there and registers nothing (the round-4 fix that
+    // placed the sole registration here was therefore void — the
+    // order_update_connection.rs task-start analogy did not transfer,
+    // because that task starts post-auth, long after the install). Kept
+    // as a harmless idempotent no-op that also covers any spawn context
+    // where a recorder is already installed (tests / future callers).
+    // Why registration matters at all: the CloudWatch agent's prometheus
+    // pipeline drops each counter series' FIRST observed sample as its
+    // delta baseline; a lazily-born series (first sample = 1, AT the first
+    // restart) loses restart #1 of every app session — silently raising
+    // the tv-<env>-feed-stall-restarts pager's effective first-episode
+    // threshold from 3 to 4 (feed-stall-restart-alarm.tf). increment(0)
+    // forces registration without an unused #[must_use] handle.
+    metrics::counter!(
+        "tv_feed_sidecar_stall_restart_total",
+        "feed" => Feed::Groww.as_str(),
+    )
+    .increment(0);
     // Sliding-window tracker that bounds a flapping (reconnect→re-drop) socket so
     // rapid stall-restarts escalate + hit the backoff ceiling instead of a tight
     // kill loop. Persists across child launches for the supervisor's lifetime.
@@ -1845,6 +1868,69 @@ mod tests {
                 && src.contains("supervise_child(")
                 && src.contains("sidecar_restart_backoff(consecutive_failures)"),
             "the relaunch must flow through the existing run_groww_sidecar_supervisor backoff loop"
+        );
+    }
+
+    #[test]
+    fn test_stall_restart_counter_is_preregistered_after_recorder_install() {
+        // RATCHET (round-5 review fix, 2026-07-06 — supersedes the round-4
+        // `..._before_supervise_loop` scan, which was VACUOUS: it pinned
+        // source order WITHIN this file, but this supervisor is spawned in
+        // main.rs BEFORE `observability::init_metrics` installs the
+        // Prometheus recorder, so a registration here resolves to the no-op
+        // recorder and registers nothing). The CW agent's prometheus
+        // pipeline drops each counter series' FIRST sample as the delta
+        // baseline, so a lazily-born tv_feed_sidecar_stall_restart_total
+        // (first sample = 1, at the first restart) loses restart #1 of
+        // every app session — the tv-<env>-feed-stall-restarts pager's
+        // effective first-episode threshold silently becomes 4 instead of 3
+        // on a box that restarts daily. The registration that actually
+        // takes effect therefore MUST live in main.rs AFTER the
+        // init_metrics call. Source-order scan of main.rs (house pattern).
+        let main_src = include_str!("main.rs");
+        let install = main_src
+            .find("observability::init_metrics(")
+            .expect("the metrics recorder install site must exist in main.rs");
+        let reg = main_src
+            .find("\"tv_feed_sidecar_stall_restart_total\"")
+            .expect(
+                "main.rs must pre-register tv_feed_sidecar_stall_restart_total post-install \
+                 (the boot-time registration the feed-stall-restarts pager depends on)",
+            );
+        assert!(
+            install < reg,
+            "the stall-restart counter registration in main.rs must come AFTER \
+             observability::init_metrics — a pre-install registration resolves to the \
+             no-op recorder and the pager silently loses restart #1 of every session"
+        );
+        // The per-restart increment (the real signal) must still exist here —
+        // distinguishably from the defensive `.increment(0)` registration at
+        // supervisor start. Round-6 review fix: the round-5 `>= 1` count was
+        // VACUOUS — the defensive registration alone satisfied it, so deleting
+        // the per-restart `.increment(1)` (the ONLY site that ever moves the
+        // counter, hence the tv-<env>-feed-stall-restarts pager's only signal)
+        // kept the build green. Require BOTH quoted sites AND that at least
+        // one metric-name occurrence is followed by `.increment(1)` within the
+        // same counter! expression. (The escaped `\"tv_feed...\"` literals in
+        // THIS test do not match the quoted needle — the backslash breaks the
+        // substring — so the occurrences are exactly the two code sites.)
+        let src = include_str!("groww_sidecar_supervisor.rs");
+        let needle = "\"tv_feed_sidecar_stall_restart_total\"";
+        let sites: Vec<usize> = src.match_indices(needle).map(|(i, _)| i).collect();
+        assert!(
+            sites.len() >= 2,
+            "expected BOTH the defensive registration and the per-restart increment \
+             of tv_feed_sidecar_stall_restart_total in the supervisor"
+        );
+        let has_per_restart_increment = sites.iter().any(|&i| {
+            let window_end = (i + 200).min(src.len());
+            src[i..window_end].contains(".increment(1)")
+        });
+        assert!(
+            has_per_restart_increment,
+            "expected at least one tv_feed_sidecar_stall_restart_total site to call \
+             .increment(1) — the per-restart signal the tv-<env>-feed-stall-restarts \
+             pager depends on; deleting it blinds the pager entirely"
         );
     }
 

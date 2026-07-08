@@ -45,8 +45,10 @@ storm**. The drop was logged `error!` with a raw counter but NO typed
    scheduled — a 1M+ replay cannot monopolize the runtime.
 3. Bounds each send with `WAL_REINJECT_SEND_TIMEOUT_SECS` (30s). Only a
    truly dead (channel closed) or wedged (zero progress for 30s) consumer
-   aborts the run — and then the remaining frames are counted, typed-paged
-   (WS-REINJECT-01), and left staged in the WAL for next boot.
+   aborts the run — and then the remaining frames are counted and typed
+   (WS-REINJECT-01) — pages via the `tv-<env>-errcode-ws-reinject-01`
+   log-filter alarm as of 2026-07-06 (previously `error!`-only; did NOT
+   page) — and left staged in the WAL for next boot.
 4. A fully delivered replay returns `clean = true`, which finally lets
    `confirm_replayed()` archive the WAL segments — **breaking the
    re-replay-grows-forever loop**.
