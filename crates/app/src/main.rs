@@ -838,9 +838,6 @@ async fn main() -> Result<()> {
                     now,
                     tickvault_core::pipeline::tick_gap_detector::TICK_GAP_TOP_N_DEFAULT,
                 );
-                if total_silent == 0 {
-                    continue;
-                }
                 // Wave-Holiday-Gate (2026-05-09): suppress WS-GAP-06
                 // emission on Saturday/Sunday boots (and outside
                 // market hours). NSE doesn't stream on weekends, so
@@ -851,8 +848,23 @@ async fn main() -> Result<()> {
                 if !tickvault_common::market_hours::is_within_trading_session_ist() {
                     continue;
                 }
-                metrics::counter!("tv_tick_gap_summary_total").increment(1);
+                // Round-3 fix (2026-07-08, review finding 6): the gauge is
+                // written UNCONDITIONALLY every in-session scan — INCLUDING
+                // total_silent == 0. The previous zero-skip sat BEFORE this
+                // write, so a fully-recovered silence spike froze the gauge
+                // at its last breaching value (the /metrics exporter keeps
+                // re-serving the last set value): a ~90s full-feed outage
+                // wrote 776 once, the reconnect restored every SID, and the
+                // frozen 776 then accumulated the retuned alarm's 10-of-12
+                // ~10 minutes AFTER complete recovery — a false page held in
+                // ALARM until the next non-zero sub-threshold count happened
+                // to be written. The zero-skip below now guards ONLY the
+                // WS-GAP-06 error emission + summary counter.
                 metrics::gauge!("tv_tick_gap_instruments_silent").set(total_silent as f64);
+                if total_silent == 0 {
+                    continue;
+                }
+                metrics::counter!("tv_tick_gap_summary_total").increment(1);
                 let top: Vec<(u64, &'static str, u64)> = gaps
                     .iter()
                     .take(10)
@@ -11490,7 +11502,29 @@ fn spawn_slo_publisher_task(
             // pinned 1.0. Pure math + rationale in
             // `compute_tick_freshness` (unit-tested).
             const SLO_TICK_FRESHNESS_EXCLUDED_SIDS: &[u64] = &[21]; // INDIA VIX
-            let tick_freshness = if !in_market {
+            // Round-3 fix (2026-07-08, review finding 5): pin
+            // tick_freshness to 1.0 during the NSE pre-open /
+            // auction window [09:00, 09:15) IST, mirroring the
+            // off-hours pin. Continuous trading has not started —
+            // the boot-seeded ~775 SIDs are LEGITIMATELY silent
+            // (esp. the 09:08-09:15 matching/buffer freeze), so
+            // genuine freshness math drives the score far below
+            // 0.95 for ~7-10 consecutive pre-open minutes. The
+            // window-gate Lambda enables alarm actions at 09:20
+            // and forces OK — but forcing OK does NOT purge
+            // datapoints, so the new degraded alarm's 9-of-15
+            // lookback at ~09:21 would hold >= 9 breaching
+            // PRE-OPEN datapoints and false-page at open on
+            // ordinary days (every previously-gated alarm has a
+            // lookback <= 5 min, which is why the 2-of-2 critical
+            // sibling never paged at open). Pre-open silence is
+            // not degradation — same rationale class as the
+            // off-hours pin; genuine computation starts at the
+            // 09:15:00 continuous-session open.
+            const SLO_TICK_FRESHNESS_SESSION_OPEN_SECS_OF_DAY_IST: u32 = 9 * 3600 + 15 * 60;
+            let tick_freshness = if !in_market
+                || secs_of_day < SLO_TICK_FRESHNESS_SESSION_OPEN_SECS_OF_DAY_IST
+            {
                 1.0
             } else {
                 tickvault_core::pipeline::tick_gap_detector::global_tick_gap_detector()

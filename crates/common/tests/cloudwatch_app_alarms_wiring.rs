@@ -688,22 +688,32 @@ fn test_cw_agent_collects_machine_log_paths() {
 }
 
 #[test]
-fn test_tick_gap_silent_alarm_threshold_is_twenty_five() {
+fn test_tick_gap_silent_alarm_threshold_is_forty() {
     // 2026-07-06 incident pin: 29-67 of 776 instruments were silent EVERY
     // minute while the old threshold=100 never crossed — zero pages all day.
-    // Threshold 25 (fires at >= 26) + 10-of-12 M-of-N at 60s/Maximum pages
-    // within 10-12 minutes on an incident replay while a 1-3 min reconnect
-    // blip cannot reach 10 breaching minutes. Regressing ANY of these values
-    // silently reproduces the miss.
+    // Round-3 correction 2026-07-08 (review finding 4): the first retune
+    // shipped 25, BELOW the documented ~33 always-silent healthy floor
+    // (main.rs D2 note 2026-07-03 — the gauge is set from the same scan
+    // with no always-silent exclusion), so 25 would have breached every
+    // healthy in-session minute and paged daily. 40 (fires at >= 41,
+    // PROVISIONAL, one-trading-week soak mandated) clears the floor with
+    // margin and aligns with the SLO-degraded alarm's >= 39-silent
+    // freshness breach point; the 29-40 marginal band is owned by the
+    // SLO-degraded + lag-p99 alarms. 10-of-12 M-of-N at 60s/Maximum pages
+    // on the sustained upper band while a 1-3 min reconnect blip cannot
+    // reach 10 breaching minutes. Regressing ANY of these values either
+    // reproduces the zero-page miss (raise) or the daily-false-page
+    // inversion (lower below the floor).
     let tf = read("deploy/aws/terraform/app-alarms.tf");
     let block = alarm_resource_block(&tf, "tick_gap_instruments_silent");
     assert!(
-        block_has_attr(&block, "threshold", "25"),
-        "tick_gap_instruments_silent threshold must be 25 (2026-07-06 retune):\n{block}"
+        block_has_attr(&block, "threshold", "40"),
+        "tick_gap_instruments_silent threshold must be 40 (2026-07-08 round-3 \
+         retune — above the ~33 always-silent healthy floor):\n{block}"
     );
     assert!(
         block_has_attr(&block, "comparison_operator", "\"GreaterThanThreshold\""),
-        "tick_gap_instruments_silent must use GreaterThanThreshold (fires at >= 26)"
+        "tick_gap_instruments_silent must use GreaterThanThreshold (fires at >= 41)"
     );
     assert!(
         block_has_attr(&block, "evaluation_periods", "12")
