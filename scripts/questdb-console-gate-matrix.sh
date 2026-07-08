@@ -148,7 +148,7 @@ run_case D_200_first_try true ok ok "200" running 0 "GET / == 200 within 5s thro
 # E. 200 after failed probes -> PASS
 run_case E_200_after_retries true ok ok "503 000 200" running 0 "(attempt 3/12)"
 # F. probes exhausted + box running -> FATAL, codes listed
-run_case F_exhausted_running_fatal true ok ok "503" running 1 "while the box reported running"
+run_case F_exhausted_running_fatal true ok ok "503" running 1 "the box reported running when sampled after it"
 # G. probes exhausted + box stopped -> loud SKIP naming the state + codes
 run_case G_exhausted_stopped_skip true ok ok "000" stopped 0 "box state 'stopped' after the probe window"
 # H. probes exhausted + box stopping -> loud SKIP (no per-code diagnosis)

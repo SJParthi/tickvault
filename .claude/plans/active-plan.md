@@ -94,9 +94,11 @@ console's lifetime.
   through the WHOLE proxy chain, with the conservative decision tree in the
   item description. It runs immediately BEFORE the "Publish QuestDB console
   URL to Telegram" step; on a PASS the console is verified before the
-  announce; on any exit-0 SKIP (disabled, box not running) the publish still
-  runs and the URL is announced UNVERIFIED, with the skip reason in the run
-  log/step summary — an accepted, disclosed window (see Known limitations).
+  announce; on a box-not-running exit-0 SKIP the publish still runs and the
+  URL is announced UNVERIFIED, with the skip reason in the run log/step
+  summary — an accepted, disclosed window (see Known limitations); on a
+  disabled-console exit-0 SKIP no URL exists and the publish step exits
+  without announcing anything (skip reason in the run log only).
 - The FILE 6 deploy-aws box-local HARD canary fails the box deploy that
   ships a QuestDB image whose /index.html no longer serves as a complete
   200 within 5s.

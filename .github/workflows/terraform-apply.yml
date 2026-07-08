@@ -463,7 +463,7 @@ jobs:
             echo "⚠ SKIP (loud): console not verifiable this apply: box state '${STATE}' after the probe window; codes seen: ${CODES}. A not-running box cannot be probed; the gate re-verifies on the next in-window apply." | tee -a "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
-          echo "FATAL: console GET / did not return 200 within 5s per attempt over the ~3 min probe window while the box reported running; codes seen: ${CODES}. Investigate the console chain (SG :9000 ingress, back lambda, front lambda, QuestDB http)." | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "FATAL: console GET / did not return 200 within 5s per attempt over the ~3 min probe window and the box reported running when sampled after it; codes seen: ${CODES}. Investigate the console chain (SG :9000 ingress, back lambda, front lambda, QuestDB http)." | tee -a "$GITHUB_STEP_SUMMARY"
           exit 1
 
       - name: Publish QuestDB console URL to Telegram
