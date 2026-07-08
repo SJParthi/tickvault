@@ -3133,6 +3133,16 @@ async fn load_daily_universe_plan(
     let warm_timer = std::time::Instant::now();
     if let Some(universe) = instrument_snapshot::load_plan_snapshot_for_today(&today_date) {
         let plan = build_subscription_plan_from_daily_universe(&universe);
+        // §36 hostile-review round 2 (2026-07-08, F4): the warm-snapshot path
+        // emits the SAME per-contract boot-evidence lines + Dhan parity entry
+        // the cold orchestrator does — previously both were deferred to the
+        // background reconcile (and silently never happened if it failed),
+        // so a Groww activation recorded single-feed and the FUTIDX-02
+        // comparator never ran for the whole warm-boot trading day.
+        tickvault_core::instrument::index_futures::record_dhan_selection_from_universe(
+            &universe,
+            now_ist.date_naive(),
+        );
         let elapsed_ms = u64::try_from(warm_timer.elapsed().as_millis()).unwrap_or(u64::MAX);
         info!(
             universe_size = universe.total_count(),
