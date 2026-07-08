@@ -1073,6 +1073,33 @@ async fn main() -> Result<()> {
     // because handles created pre-install resolve to a no-op counter.
     tickvault_core::parser::prewarm_dispatcher_counters();
 
+    // Pre-register the Groww sidecar stall-restart counter at 0 — HERE,
+    // immediately after the recorder installs (round-5 review fix,
+    // 2026-07-06). The round-4 attempt registered it at the TOP of
+    // `run_groww_sidecar_supervisor`, but that supervisor is spawned much
+    // earlier in this fn (before the STAGE-C WAL replay, well before this
+    // Step 2 install), so its `counter!` handle resolved to the no-op
+    // recorder and NO registration happened — the series was still lazily
+    // born at the first real restart, whose sample the CW agent's delta
+    // pipeline drops as its baseline (feed-stall-restart-alarm.tf
+    // FIRST-SAMPLE BASELINE): restart #1 of every app session was lost and
+    // the tv-<env>-feed-stall-restarts pager's effective first-episode
+    // threshold was 4, not 3. Registering post-install makes the series
+    // DENSE from boot (a 0-delta /metrics event per 60s scrape), so the
+    // dropped first sample is the harmless 0 baseline and the pager
+    // genuinely sees every restart, including the session's first.
+    // Honest residual: a stall-restart landing in the pre-install boot
+    // window (between the supervisor spawn and this line) would increment a
+    // no-op handle and go uncounted — physically implausible (it needs a
+    // sidecar launch + a recorded tick + >30s feed silence inside the boot
+    // prefix). Ratchet (source-order scan of this file):
+    // groww_sidecar_supervisor::tests::test_stall_restart_counter_is_preregistered_after_recorder_install.
+    metrics::counter!(
+        "tv_feed_sidecar_stall_restart_total",
+        "feed" => tickvault_common::feed::Feed::Groww.as_str(),
+    )
+    .increment(0);
+
     // L18 (revised) + L121-L130 (Wave-5 in-memory-store plan §AA):
     // register the per-subsystem memory gauges, the sampler heartbeat,
     // and the market-hours-active quiet-hours gate. The sampler task
@@ -1705,12 +1732,23 @@ async fn main() -> Result<()> {
         };
         // Wave 3-B Item 11: opt-in Telegram bucket-coalescer based on the
         // `features.telegram_bucket_coalescer` flag. Defaults to `true`.
+        // 2026-07-07 UX overhaul: the in-market LOW/MEDIUM digest window
+        // comes from `[notification] digest_window_secs` (clamped [60,3600]);
+        // the coalescer drain loop also owns the episode stability ticker.
         let fast_notifier = if config.features.telegram_bucket_coalescer {
             NotificationService::enable_coalescer(
                 fast_notifier,
-                tickvault_core::notification::CoalescerConfig::default(),
+                tickvault_core::notification::CoalescerConfig {
+                    market_hours_window: std::time::Duration::from_secs(
+                        config.notification.digest_window_secs_clamped(),
+                    ),
+                    ..Default::default()
+                },
             )
         } else {
+            // No drain loop → the episode green-close promotion needs its
+            // own tiny ticker (no-op when episode_mode is off / NoOp mode).
+            NotificationService::spawn_episode_ticker(&fast_notifier);
             fast_notifier
         };
         // Fill the Groww sidecar supervisor's deferred Telegram slot now that the
@@ -4207,7 +4245,7 @@ const fn damp_questdb_exit_signal(consecutive_failures: u32, threshold: u32) -> 
     consecutive_failures < threshold
 }
 
-#[allow(clippy::too_many_arguments)] // APPROVED: each arg is a distinct, named watchdog input (health + gates + configs)
+#[allow(clippy::too_many_arguments)] // APPROVED: watchdog orchestration requires the full shared-infra handle set (pool + shutdown + notifier + health + feed-health + lane-halt + dhan-flag + token + questdb)
 fn spawn_pool_watchdog_task(
     pool: std::sync::Arc<WebSocketConnectionPool>,
     shutdown_notify: std::sync::Arc<tokio::sync::Notify>,
@@ -5449,12 +5487,22 @@ async fn build_shared_infra(
         }
     };
     // Wave 3-B Item 11: opt-in Telegram bucket-coalescer (defaults to `true`).
+    // 2026-07-07 UX overhaul: digest window from config; the drain loop
+    // also owns the episode stability ticker (green-close promotion).
     let notifier = if config.features.telegram_bucket_coalescer {
         NotificationService::enable_coalescer(
             notifier,
-            tickvault_core::notification::CoalescerConfig::default(),
+            tickvault_core::notification::CoalescerConfig {
+                market_hours_window: std::time::Duration::from_secs(
+                    config.notification.digest_window_secs_clamped(),
+                ),
+                ..Default::default()
+            },
         )
     } else {
+        // No drain loop → the episode green-close promotion needs its own
+        // tiny ticker (no-op when episode_mode is off / NoOp mode).
+        NotificationService::spawn_episode_ticker(&notifier);
         notifier
     };
 
@@ -8225,7 +8273,6 @@ async fn start_dhan_lane(
         let token = token_manager.token_handle();
         let sender = order_update_sender.clone();
         let cal = trading_calendar.clone();
-        let ou_notifier = notifier.clone();
         let ou_connect_notifier = notifier.clone();
         let ou_health = health_status.clone();
         let ou_wal_spill = ws_frame_spill.clone();
@@ -8282,10 +8329,19 @@ async fn start_dhan_lane(
                 ou_dhan_flag,
             )
             .await;
-            // If run_order_update_connection returns, connection terminated
-            ou_notifier.notify(NotificationEvent::OrderUpdateDisconnected {
-                reason: "connection task exited".to_string(),
-            });
+            // Defensive only: run_order_update_connection is an infinite
+            // never-give-up loop (WS-GAP-04) and structurally cannot return —
+            // the OrderUpdateDisconnected notify that used to live here was
+            // DEAD CODE (2026-07-06 incident: 39+ in-market failures, zero
+            // HIGH pages). The reachable [HIGH] page now fires INSIDE the
+            // reconnect loop (WS-GAP-10). If this line ever executes, a
+            // future refactor broke the loop contract — surface it loudly,
+            // never silently.
+            error!(
+                code = tickvault_common::error_code::ErrorCode::WsGap10OrderUpdateOutage.code_str(),
+                reason = "task_exited_unreachable",
+                "order update WebSocket task exited — unreachable by design; investigate immediately"
+            );
             ou_health.set_order_update_connected(false);
         });
         (ou_connection_handle, auth_listener_handle)
@@ -10936,6 +10992,11 @@ async fn run_process_runloop(
     if let Some(fleet_lock) = groww_scale_fleet_lock {
         fleet_lock.release_on_shutdown().await;
     }
+
+    // 5c. Telegram UX overhaul (2026-07-07): flush pending coalesced
+    // summaries + write the final episode snapshot (bounded 10s inside
+    // shutdown_flush — a black-holed Telegram can never hang exit).
+    notifier.shutdown_flush().await;
 
     // 6. Stop API server (PROCESS-shared).
     if let Some(handle) = api_handle {

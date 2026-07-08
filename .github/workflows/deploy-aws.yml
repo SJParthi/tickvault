@@ -51,6 +51,12 @@ on:
       - 'deploy/docker/**'
       # Config TOML (loaded by app at boot)
       - 'config/**'
+      # CloudWatch agent + prometheus scrape configs (2026-07-06): the deploy's
+      # OBSERVABILITY-LAST block copies these to the box + fetch-configs the
+      # agent on every deploy — an agent-config-only change (e.g. the machine/
+      # log-path fix) must self-deploy instead of waiting for the next Rust push.
+      - 'deploy/aws/cloudwatch-agent.json'
+      - 'deploy/aws/prometheus.yaml'
       # The deploy workflow ITSELF (so a PR that fixes the deploy
       # auto-redeploys without the operator clicking "Run workflow").
       # Charter: "everything completely comprehensively fully automated".
@@ -637,7 +643,7 @@ jobs:
               "sleep 8",
               "echo === CWAGENT STATUS ===; sudo /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a status || true",
               "echo === CWAGENT OWN LOG tail40 ===; sudo tail -n 40 /opt/aws/amazon-cloudwatch-agent/logs/amazon-cloudwatch-agent.log 2>/dev/null || true",
-              "echo === APP LOG DIR ===; ls -la /opt/tickvault/data/logs/ 2>/dev/null | head -20 || true",
+              "echo === APP LOG DIR ===; ls -la /opt/tickvault/data/logs/ 2>/dev/null | head -20 || true; ls -la /opt/tickvault/data/logs/machine/ 2>/dev/null | head -20 || true",
               "echo DEPLOY OK"
             ]' \
             --query 'Command.CommandId' --output text)
@@ -887,6 +893,61 @@ jobs:
             exit 1
           fi
           echo "DEPLOY VERIFIED: tickvault reached readiness (systemd active, or a healthy slow WAL-replay boot with no crash)"
+
+      - name: Verify log ingestion (LOG-INGESTION-SMOKE, non-fatal)
+        # Incident 2026-07-06 17:19 IST: the app moved its machine logs to
+        # data/logs/machine/ while the on-box CloudWatch agent kept tailing the
+        # old top-level globs — the app stayed healthy, the log SHIPPER went
+        # silently dead, and /tickvault/prod/app ingested nothing for a whole
+        # session with zero signal. This step is the per-deploy detector: it
+        # proves fresh app log events actually reach CloudWatch AFTER the
+        # restarted agent picked up the NEW config this deploy shipped.
+        #
+        # NON-FATAL by design (2026-06-09 doctrine: a broken OBSERVABILITY
+        # surface must never fail, roll back, or auto-stop a verified-healthy
+        # TRADING app). On timeout: ::warning:: + an SNS page so the operator
+        # knows the shipper needs a look — then exit 0. The market-hours
+        # tv-<env>-app-log-ingestion-silent alarm (log-retention.tf) is the
+        # continuous in-session counterpart to this one-shot deploy check.
+        # IAM: logs:FilterLogEvents on the app log group ARN (oidc.tf).
+        if: env.DEPLOY_SKIP_REASON == ''
+        run: |
+          set +e
+          REGION="${{ vars.AWS_REGION || 'ap-south-1' }}"
+          IID="${{ secrets.EC2_INSTANCE_ID }}"
+          # START_MS captured HERE, in-step, AFTER readiness — any event found
+          # below was ingested after the agent restart with the new config, so
+          # a success proves the NEW globs ship (not a leftover from the old
+          # config). Self-contained: no cross-step env plumbing.
+          START_MS=$(date +%s%3N)
+          echo "LOG-INGESTION-SMOKE: polling /tickvault/prod/app stream ${IID}/app for events newer than ${START_MS} (12 polls x 25s = ~5 min budget)"
+          FOUND=0
+          for i in $(seq 1 12); do
+            sleep 25
+            COUNT=$(aws logs filter-log-events \
+              --region "$REGION" \
+              --log-group-name /tickvault/prod/app \
+              --log-stream-names "${IID}/app" \
+              --start-time "$START_MS" \
+              --limit 1 \
+              --query 'length(events)' --output text 2>/dev/null || echo 0)
+            echo "poll $i/12: fresh events seen = ${COUNT:-0}"
+            if [ "${COUNT:-0}" != "0" ] && [ "${COUNT:-0}" != "None" ]; then FOUND=1; break; fi
+          done
+          if [ "$FOUND" -eq 1 ]; then
+            echo "LOG-INGESTION-SMOKE OK: fresh app log events reached CloudWatch group /tickvault/prod/app (~$((i * 25))s after readiness) — the log shipper is alive on the new config."
+            exit 0
+          fi
+          echo "::warning::LOG-INGESTION-SMOKE: no fresh app log events in /tickvault/prod/app stream ${IID}/app within ~5 min of readiness — the CloudWatch agent is likely not shipping (glob/config mismatch or dead agent). The deploy itself is VERIFIED HEALTHY; NOT rolling back. Check the on-box === CWAGENT STATUS === / === APP LOG DIR === dumps above."
+          SHORT_SHA="${GITHUB_SHA:0:7}"
+          IST_TIME="$(TZ='Asia/Kolkata' date +'%I:%M %p IST')"
+          aws sns publish \
+            --region "$REGION" \
+            --topic-arn arn:aws:sns:${REGION}:${{ steps.acct.outputs.id }}:tv-prod-alerts \
+            --subject "⚠️ tickvault deployed but its logs are NOT reaching CloudWatch" \
+            --message "⚠️ New code went LIVE at ${IST_TIME} (version ${SHORT_SHA}) and the app is running fine — but its logs are NOT arriving in CloudWatch. Same signature as the 06 Jul incident: the log shipper on the box looks dead. Trading is unaffected. What you need to do RIGHT NOW: 1. Open the box (SSM session). 2. Check the CloudWatch agent status. 3. Restart the agent if it is stopped or misconfigured. Run: ${{ github.run_id }}" \
+          || echo "::warning::LOG-INGESTION-SMOKE: the SNS page also failed — operator must rely on this run log + the market-hours ingestion-silent alarm."
+          exit 0
 
       - name: Record deployed binary git SHA to SSM (B9 deploy provenance)
         # Runs ONLY after the swap is verified healthy (same gate as the

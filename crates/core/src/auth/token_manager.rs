@@ -37,6 +37,18 @@ use crate::notification::events::NotificationEvent;
 use crate::notification::service::NotificationService;
 
 // ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+
+/// Cadence of the `tv_token_remaining_seconds` live-countdown emitter
+/// (`token_gauge_loop`). The scheduled `renewal_loop` only touches the
+/// gauge at its own wakeups (once per ~23h sleep + after each renewal),
+/// so between renewals the CloudWatch countdown panel froze at the last
+/// emitted value. A 30s re-emit keeps the countdown live at negligible
+/// cost (one O(1) arc-swap load + one gauge set per tick — cold path).
+const TOKEN_GAUGE_INTERVAL_SECS: u64 = 30;
+
+// ---------------------------------------------------------------------------
 // Token Handle (shared with downstream consumers)
 // ---------------------------------------------------------------------------
 
@@ -557,11 +569,22 @@ impl TokenManager {
     /// Sleeps until the refresh window (token_validity - refresh_before_expiry),
     /// then renews the token. Retries with exponential backoff on failure.
     /// Runs indefinitely until the task is cancelled.
+    ///
+    /// Also drives the `tv_token_remaining_seconds` live-countdown
+    /// emitter (`token_gauge_loop`, 30s cadence) inside the SAME task
+    /// via `select!`, so the gauge's lifecycle stays coupled to the
+    /// lane-owned renewal task: aborting the returned handle — or the
+    /// renewal loop halting at its circuit breaker — stops the countdown
+    /// too (C4 — no orphan emitter after a Dhan-lane disable).
     #[instrument(skip_all)]
     pub fn spawn_renewal_task(self: &Arc<Self>) -> tokio::task::JoinHandle<()> {
         let manager = Arc::clone(self);
+        let gauge_manager = Arc::clone(self);
         tokio::spawn(async move {
-            manager.renewal_loop().await;
+            tokio::select! {
+                () = manager.renewal_loop() => {}
+                () = gauge_manager.token_gauge_loop() => {}
+            }
         })
     }
 
@@ -1135,6 +1158,51 @@ impl TokenManager {
                 ))
                 .await;
             }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Private — Live Token Countdown Gauge
+    // -----------------------------------------------------------------------
+
+    /// Emits the `tv_token_remaining_seconds` gauge from the current
+    /// arc-swap token state.
+    ///
+    /// Same computation as the two `renewal_loop` emit sites
+    /// (`time_until_refresh(0)` = seconds until token expiry). Returns
+    /// the emitted value for testability, or `None` when no token is
+    /// loaded yet — in that case the gauge is deliberately NOT set: a 0
+    /// during the pre-auth boot window would falsely trip the
+    /// TokenExpiryCritical (<10min) alert before the first mint lands.
+    fn emit_token_remaining_gauge(&self) -> Option<u64> {
+        let guard = self.token.load();
+        let state = guard.as_ref().as_ref()?;
+        let remaining = state.time_until_refresh(0).as_secs();
+        metrics::gauge!("tv_token_remaining_seconds").set(remaining as f64);
+        Some(remaining)
+    }
+
+    /// Periodic live-countdown emitter for `tv_token_remaining_seconds`.
+    ///
+    /// Re-emits the gauge every [`TOKEN_GAUGE_INTERVAL_SECS`] (30s) so
+    /// the operator sees a live countdown between renewals instead of a
+    /// flat line frozen at the last `renewal_loop` wakeup. Cold path —
+    /// one O(1) arc-swap load + one gauge set per tick; the renewal
+    /// timing and the two in-loop emit sites are untouched.
+    ///
+    /// Runs forever; `spawn_renewal_task` drives it inside the SAME
+    /// task as `renewal_loop` via `select!`, so it dies with the
+    /// renewal loop (circuit-breaker halt or lane-teardown abort) — no
+    /// orphan emitter keeps stamping the gauge after a Dhan-lane
+    /// disable (C4 coupling).
+    async fn token_gauge_loop(self: Arc<Self>) {
+        let mut interval = tokio::time::interval(Duration::from_secs(TOKEN_GAUGE_INTERVAL_SECS));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            interval.tick().await;
+            // Skip-on-None handled inside the helper; the returned
+            // value exists for the unit tests.
+            let _emitted = self.emit_token_remaining_gauge();
         }
     }
 
@@ -2245,6 +2313,84 @@ mod tests {
         assert!(
             result.unwrap_err().is_cancelled(),
             "task should be cancelled, not panicked"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // token gauge — live tv_token_remaining_seconds countdown emitter
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_emit_token_remaining_gauge_computes_remaining_seconds() {
+        // expires_in=86400 → the countdown helper must report ~24h,
+        // mirroring the renewal_loop emit sites (time_until_refresh(0)).
+        let data = DhanAuthResponseData {
+            access_token: "gauge-jwt".to_string(),
+            token_type: "Bearer".to_string(),
+            expires_in: 86_400,
+        };
+        let manager = make_test_manager(Some(TokenState::from_response(&data)));
+        let remaining = manager
+            .emit_token_remaining_gauge()
+            .expect("token loaded so the gauge must emit");
+        assert!(
+            (86_395..=86_400).contains(&remaining),
+            "remaining seconds must be ~expires_in (24h), got {remaining}"
+        );
+    }
+
+    #[test]
+    fn test_emit_token_remaining_gauge_skips_when_no_token() {
+        // Pre-auth boot window: no token loaded → the emitter must SKIP
+        // (never set 0 — that would falsely trip TokenExpiryCritical).
+        let manager = make_test_manager(None);
+        assert!(
+            manager.emit_token_remaining_gauge().is_none(),
+            "no token loaded must skip the gauge emit, not set 0"
+        );
+    }
+
+    #[test]
+    fn test_emit_token_remaining_gauge_saturates_to_zero_for_expired_token() {
+        // expires_in=0 → time_until_refresh(0) saturates to ZERO; the
+        // gauge emits 0 (a genuinely expired token IS a countdown of 0).
+        let data = DhanAuthResponseData {
+            access_token: "expired-gauge-jwt".to_string(),
+            token_type: "Bearer".to_string(),
+            expires_in: 0,
+        };
+        let manager = make_test_manager(Some(TokenState::from_response(&data)));
+        assert_eq!(
+            manager.emit_token_remaining_gauge(),
+            Some(0),
+            "expired token must emit a saturated 0, not skip"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_token_gauge_loop_ticks_forever_and_is_cancel_safe() {
+        let data = DhanAuthResponseData {
+            access_token: "gauge-loop-jwt".to_string(),
+            token_type: "Bearer".to_string(),
+            expires_in: 86_400,
+        };
+        let manager = make_test_manager(Some(TokenState::from_response(&data)));
+        let handle = tokio::spawn(Arc::clone(&manager).token_gauge_loop());
+        // Advance paused time across several 30s intervals — the
+        // emitter must keep running (never return on its own).
+        tokio::time::advance(Duration::from_secs(TOKEN_GAUGE_INTERVAL_SECS * 3)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            !handle.is_finished(),
+            "token_gauge_loop must run until cancelled"
+        );
+        handle.abort();
+        let result = handle.await;
+        assert!(
+            result
+                .expect_err("aborted task returns JoinError")
+                .is_cancelled(),
+            "gauge loop must cancel cleanly, not panic"
         );
     }
 
@@ -3665,5 +3811,35 @@ mod tests {
             "token_manager.rs renewal_loop success path MUST notify \
              NotificationEvent::TokenRenewed. See Phase 0 Item 17."
         );
+    }
+
+    /// B9 log-shipping restore plan (2026-07-07) — the live
+    /// `tv_token_remaining_seconds` countdown emitter must stay wired
+    /// into `spawn_renewal_task` in the SAME task as `renewal_loop`
+    /// (fused via `select!`), so aborting the lane-owned renewal handle
+    /// also stops the countdown (C4 — no orphan emitter keeps stamping
+    /// the gauge after a Dhan-lane disable), and the cadence stays 30s.
+    #[test]
+    fn test_token_gauge_countdown_is_spawned_with_renewal_loop() {
+        assert_eq!(
+            TOKEN_GAUGE_INTERVAL_SECS, 30,
+            "live countdown cadence must remain 30s (plan-approved)"
+        );
+        let source = include_str!("token_manager.rs");
+        let start = source
+            .find("pub fn spawn_renewal_task")
+            .expect("spawn_renewal_task must exist in token_manager.rs");
+        let end = source[start..]
+            .find("Public — User Profile")
+            .map_or(source.len(), |offset| start + offset);
+        let body = &source[start..end];
+        for marker in ["tokio::select!", "renewal_loop()", "token_gauge_loop()"] {
+            assert!(
+                body.contains(marker),
+                "spawn_renewal_task must fuse renewal_loop + token_gauge_loop \
+                 into one select!-driven task (C4 lifecycle coupling); \
+                 missing marker: {marker}"
+            );
+        }
     }
 }

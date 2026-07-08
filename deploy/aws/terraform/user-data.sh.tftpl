@@ -122,7 +122,7 @@ cat > /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json <<CWCFG
               "source_labels": ["host"],
               "label_matcher": "^tickvault-prod$",
               "dimensions": [["host"]],
-              "metric_selectors": ["^(tv_websocket_pool_all_dead|tv_websocket_failed_connections_count|tv_order_update_ws_active|tv_questdb_disconnected_seconds|tv_tick_gap_instruments_silent|tv_token_remaining_seconds|tv_spill_dropped_total|tv_dlq_ticks_total|tv_ticks_dropped_total|tv_aggregator_seals_emitted_total|tv_aggregator_close_pct_nonzero_total|tv_orders_rejected_total|tv_realtime_guarantee_score|tv_boot_completed|tv_clock_skew_seconds|tv_ws_frame_dropped_no_wal_total|tv_ws_reconnect_gap_seconds_total|tv_disk_watcher_respawn_total|tv_late_tick_after_boundary_total|tv_process_rss_bytes|tv_subsystem_memory_estimated_bytes)$"]
+              "metric_selectors": ["^(tv_websocket_pool_all_dead|tv_websocket_failed_connections_count|tv_order_update_ws_active|tv_questdb_disconnected_seconds|tv_tick_gap_instruments_silent|tv_token_remaining_seconds|tv_spill_dropped_total|tv_dlq_ticks_total|tv_ticks_dropped_total|tv_aggregator_seals_emitted_total|tv_aggregator_close_pct_nonzero_total|tv_orders_rejected_total|tv_realtime_guarantee_score|tv_boot_completed|tv_clock_skew_seconds|tv_ws_frame_dropped_no_wal_total|tv_ws_reconnect_gap_seconds_total|tv_disk_watcher_respawn_total|tv_late_tick_after_boundary_total|tv_process_rss_bytes|tv_subsystem_memory_estimated_bytes|tv_groww_ws_active|tv_feed_last_tick_age_seconds|tv_feed_sidecar_stall_restart_total)$"]
             }
           ]
         }
@@ -137,13 +137,13 @@ cat > /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json <<CWCFG
             "log_stream_name": "{instance_id}"
           },
           {
-            "file_path": "/opt/tickvault/data/logs/errors.jsonl*",
+            "file_path": "/opt/tickvault/data/logs/machine/errors.jsonl.2*",
             "log_group_name": "/tickvault/$${ENVIRONMENT}/app",
             "log_stream_name": "{instance_id}/errors-jsonl",
             "timezone": "UTC"
           },
           {
-            "file_path": "/opt/tickvault/data/logs/app.*.log",
+            "file_path": "/opt/tickvault/data/logs/machine/app.2*",
             "log_group_name": "/tickvault/$${ENVIRONMENT}/app",
             "log_stream_name": "{instance_id}/app",
             "timezone": "UTC"
@@ -163,10 +163,13 @@ CWCFG
     -c file:/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json
 
 # ---- Step 4: Create application directories ----
-# NOTE: the app writes its logs to data/logs (WorkingDirectory=/opt/tickvault +
-# ReadWritePaths=/opt/tickvault/data), which is where the CloudWatch agent now
-# tails app.*.log + errors.jsonl from (NOT the old /opt/tickvault/logs).
-mkdir -p /opt/tickvault/{config,data/spill,data/logs,bin}
+# NOTE: the app writes its MACHINE logs to data/logs/machine/ (2026-07-05
+# "one human log file" reorg — the data/logs TOP level holds only the
+# launcher-owned human log + symlink; WorkingDirectory=/opt/tickvault +
+# ReadWritePaths=/opt/tickvault/data). The CloudWatch agent tails
+# machine/app.2* + machine/errors.jsonl.2* from there (NOT the old
+# /opt/tickvault/logs, NOT the top-level data/logs).
+mkdir -p /opt/tickvault/{config,data/spill,data/logs/machine,bin}
 chown -R ec2-user:ec2-user /opt/tickvault
 
 # ---- Step 5: Clone the repo (shallow, main branch) ----

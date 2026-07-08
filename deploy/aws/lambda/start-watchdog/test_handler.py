@@ -199,6 +199,69 @@ def test_check_describe_error_treated_as_not_running(monkeypatch) -> None:
     assert out["state"] == "unknown"
 
 
+# ---------------------------------------------------------------------------
+# NSE-holiday intentional-stop marker (2026-07-07 round-3 review fix):
+# holiday-gate.sh self-stops the box at ~08:32 IST on weekday NSE holidays
+# after stamping today's IST date into HOLIDAY_STOP_PARAM. The 08:45 check
+# must NOT "heal" that stop — the pre-fix self-start false-paged a Critical
+# "auto-start FAILED" every holiday AND fed the all-day restart war that can
+# race the 09:20 IST market-hours alarm-gate sample.
+# ---------------------------------------------------------------------------
+
+
+def _wire_check_with_ssm(monkeypatch, sns, ec2, ssm, now=IN_WINDOW_NOW) -> None:
+    def _client(svc: str):
+        if svc == "ec2":
+            return ec2
+        if svc == "ssm":
+            return ssm
+        return sns
+
+    monkeypatch.setattr(handler.boto3, "client", _client)
+    monkeypatch.setattr(handler, "_now", lambda: now)
+
+
+def test_check_stopped_holiday_marker_today_stays_silent_no_start(monkeypatch) -> None:
+    """Marker == today's IST date → intentional holiday stop: no self-start,
+    no Critical page. IN_WINDOW_NOW is 2026-06-10 03:15 UTC = 08:45 IST."""
+    sns = _FakeSns()
+    ec2 = _FakeEc2("stopped")
+    ssm = _FakeSsm(value="2026-06-10")
+    _wire_check_with_ssm(monkeypatch, sns, ec2, ssm)
+    out = handler.lambda_handler({"mode": "check"})
+    assert out["alerted"] is False
+    assert out["self_started"] is False
+    assert out["skipped"] == "holiday_stop"
+    assert ec2.start_calls == []  # the restart war never begins
+    assert sns.published == []  # no false Critical page on a holiday
+
+
+def test_check_stopped_stale_holiday_marker_still_self_starts(monkeypatch) -> None:
+    """A previous holiday's marker never matches today → normal self-heal."""
+    sns = _FakeSns()
+    ec2 = _FakeEc2("stopped")
+    ssm = _FakeSsm(value="2026-06-09")  # yesterday's holiday
+    _wire_check_with_ssm(monkeypatch, sns, ec2, ssm)
+    out = handler.lambda_handler({"mode": "check"})
+    assert out["alerted"] is True
+    assert out["self_started"] is True
+    assert ec2.start_calls == [["i-0test"]]
+
+
+def test_check_stopped_marker_read_error_still_self_starts(monkeypatch) -> None:
+    """FAIL-OPEN: an unreadable marker (missing param / AccessDenied) must
+    never suppress the trading-day 08:45 rescue."""
+    sns = _FakeSns()
+    ec2 = _FakeEc2("stopped")
+    ssm = _FakeSsm(raises=True)
+    _wire_check_with_ssm(monkeypatch, sns, ec2, ssm)
+    out = handler.lambda_handler({"mode": "check"})
+    assert out["alerted"] is True
+    assert out["self_started"] is True
+    assert ec2.start_calls == [["i-0test"]]
+    assert "started the box itself" in sns.published[0]["subject"]
+
+
 # Stop-check window: 16:45 IST = 11:15 UTC; the stop trigger is 11:00 UTC.
 STOP_CHECK_NOW = datetime(2026, 6, 10, 11, 15, tzinfo=timezone.utc)
 MORNING_LAUNCH = datetime(2026, 6, 10, 3, 13, tzinfo=timezone.utc)  # since morning
