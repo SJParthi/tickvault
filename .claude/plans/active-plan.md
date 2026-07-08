@@ -189,15 +189,17 @@ console's lifetime.
 ## Test Plan
 
 - `cd deploy/aws/lambda/questdb-console-proxy && python3 -m unittest test_handler -v`
-  — 31 tests, OK (verbatim output in the closure commit evidence).
+  — 31 tests, OK (counts recorded in the closure commit message;
+  re-runnable via the command above).
 - `cd deploy/aws/lambda/questdb-console-front && python3 -m unittest test_handler -v`
   — 61 tests, OK.
 - `bash scripts/questdb-console-gate-matrix.sh` — 9 scenarios, one per gate
   decision-tree arm (disabled-skip; tf-output-failure FATAL; ssm-failure
   FATAL; 200-first-try PASS; 200-after-retries PASS; exhausted+running
   FATAL; exhausted+stopped SKIP; exhausted+stopping SKIP; missing-gate-step
-  extraction ABORT) — "gate-matrix: all 9 scenarios green" (verbatim
-  per-scenario table in the closure commit evidence). The harness ABORTS
+  extraction ABORT) — "gate-matrix: all 9 scenarios green" (counts recorded
+  in the closure commit message; re-runnable via the command above). The
+  harness ABORTS
   with one clear error if the gate step cannot be extracted and trap-cleans
   its mktemp work tree.
 - **Non-vacuity (from the fix sessions):** the rewrite/3xx handler tests
