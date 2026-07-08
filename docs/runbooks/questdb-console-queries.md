@@ -9,15 +9,17 @@
 > `.claude/rules/project/security-id-uniqueness.md` (I-P1-11),
 > `.claude/rules/project/data-integrity.md` (feed-in-key).
 > **Code:** `crates/storage/src/console_views.rs::ensure_named_views`,
-> wired in BOTH boot paths of `crates/app/src/main.rs` (after the
-> base-table ensure join).
+> wired in BOTH Dhan boot paths of `crates/app/src/main.rs` (after the
+> base-table ensure join) AND in the Groww activation
+> (`crates/app/src/groww_activation.rs::activate_groww_lane`) so
+> Groww-only boots (`feeds.dhan_enabled = false`) create them too.
 
 ## TL;DR
 
 | Question | Answer |
 |---|---|
 | What are they? | Two plain (non-materialized) QuestDB views — `ticks_named` and `candles_named` — that LEFT JOIN the raw `ticks` / `candles_1m` tables against the `instrument_lifecycle` master so every row carries `symbol_name`, `display_name`, `instrument_type`. |
-| When are they created? | At every boot, idempotently (`CREATE VIEW IF NOT EXISTS`), right after the base tables are ensured. Fail-soft — a failure retries next boot. |
+| When are they created? | At every feed-enabled boot (either feed): the Dhan lane creates them right after the base-table ensure join, and the Groww activation creates them after its own base-table ensures — so a Groww-only boot (`feeds.dhan_enabled = false`) is covered too. `CREATE OR REPLACE VIEW` — every boot **converges** the deployed definition to the code (a definition change self-heals, no manual step). Fail-soft — a failure retries next boot. A boot with BOTH feeds disabled creates nothing (nothing streams in that mode). |
 | Where do I see them? | `make questdb` → `localhost:9000` — the console sidebar lists views alongside tables (`table_type = 'V'`). |
 | Candle scope? | **1-minute ONLY** (`candles_1m` base). Other timeframes: query the `candles_<tf>` base tables directly. |
 | NULL `symbol_name`? | **A diagnostic, not a bug** — the streaming instrument is absent from the lifecycle master (fresh DB, pre-reconcile boot, or genuinely unmapped). The row is kept, never dropped. |
@@ -102,8 +104,8 @@ c.open_pct, c.open_gap_pct`.
 | List views | `SELECT * FROM views();` (or `SHOW TABLES` / `tables()` — views carry `table_type = 'V'`) |
 | View status | `SELECT view_name, view_status FROM views();` |
 | Show a view's DDL | `SHOW CREATE VIEW ticks_named;` |
-| **Change a view's definition** | `CREATE VIEW IF NOT EXISTS` is deliberately NOT drop-and-recreate — a definition change requires a one-time manual `DROP VIEW ticks_named;` (and/or `candles_named`) then a reboot; the next boot recreates it from the new code. |
-| Rollback (remove entirely) | `DROP VIEW IF EXISTS ticks_named; DROP VIEW IF EXISTS candles_named;` + revert the two `ensure_named_views` call sites. Views are stateless — zero data risk. |
+| **Change a view's definition** | Nothing to do — the DDL is `CREATE OR REPLACE VIEW` (probe-Verified on the pinned QuestDB 9.3.5), so the next boot after a deploy **converges** the deployed definition to the code automatically. No manual `DROP VIEW` (consistent with `aws-budget.md` rule 8: no manual configuration on AWS). |
+| Rollback (remove entirely) | `DROP VIEW IF EXISTS ticks_named; DROP VIEW IF EXISTS candles_named;` + revert the three `ensure_named_views` call sites (two Dhan paths in `main.rs` + the Groww activation). Views are stateless — zero data risk. |
 
 ## Failure modes
 

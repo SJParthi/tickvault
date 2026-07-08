@@ -31,6 +31,28 @@
 //!   NULL `symbol_name` row — itself a diagnostic (audit Rule 11: a
 //!   vanishing row would be a false-OK), never a dropped row.
 //!
+//! ## Idempotency + convergence
+//!
+//! The DDL is `CREATE OR REPLACE VIEW` (probe-Verified on the pinned
+//! QuestDB 9.3.5): every boot CONVERGES the deployed definition to the
+//! code, so a future definition change self-heals on the next boot with
+//! zero manual prod steps (`aws-budget.md` rule 8). `IF NOT EXISTS`
+//! would 2xx-no-op on a changed definition — a stale-definition
+//! false-OK (audit Rule 11) — and is ratchet-banned.
+//!
+//! ## Call sites (every feed-enabled boot mode)
+//!
+//! 1. `crates/app/src/main.rs` FAST crash-recovery arm (Dhan)
+//! 2. `crates/app/src/main.rs::start_dhan_lane` slow arm (Dhan,
+//!    incl. the D2b runtime cold-start)
+//! 3. `crates/app/src/groww_activation.rs::activate_groww_lane` — so a
+//!    Groww-only boot (`feeds.dhan_enabled = false`, the scale-test /
+//!    groww-only lab mode) creates the views too. Double execution on
+//!    dual-feed boots is harmless (convergent DDL).
+//!
+//! A boot with BOTH feeds disabled ensures no base tables and creates
+//! no views — nothing streams in that mode, so there is nothing to name.
+//!
 //! Runbook: `docs/runbooks/questdb-console-queries.md`.
 
 use std::time::Duration;
@@ -76,7 +98,7 @@ fn lifecycle_dim_subquery() -> String {
 pub fn ticks_named_view_ddl() -> String {
     let dim = lifecycle_dim_subquery();
     format!(
-        "CREATE VIEW IF NOT EXISTS {VIEW_TICKS_NAMED} AS \
+        "CREATE OR REPLACE VIEW {VIEW_TICKS_NAMED} AS \
          SELECT t.ts, il.symbol_name, il.display_name, il.instrument_type, \
          t.ltp, t.open, t.high, t.low, t.close, t.volume, t.oi, t.avg_price, \
          t.last_trade_qty, t.total_buy_qty, t.total_sell_qty, \
@@ -95,7 +117,7 @@ pub fn ticks_named_view_ddl() -> String {
 pub fn candles_named_view_ddl() -> String {
     let dim = lifecycle_dim_subquery();
     format!(
-        "CREATE VIEW IF NOT EXISTS {VIEW_CANDLES_NAMED} AS \
+        "CREATE OR REPLACE VIEW {VIEW_CANDLES_NAMED} AS \
          SELECT c.ts, il.symbol_name, il.display_name, il.instrument_type, \
          c.open, c.high, c.low, c.close, c.volume, c.oi, c.tick_count, \
          c.feed, c.segment, c.security_id, \
@@ -131,13 +153,16 @@ async fn run_view_ddl(client: &Client, base_url: &str, view: &str, ddl: &str) {
     }
 }
 
-/// Idempotently create the `ticks_named` + `candles_named` analyst
-/// console views. Fail-soft: never `Result`, never panic — a failure
-/// logs and the next boot re-runs (house `ensure_*` norm).
+/// Idempotently create-or-converge the `ticks_named` + `candles_named`
+/// analyst console views (`CREATE OR REPLACE VIEW` — every boot converges
+/// the deployed definition to the code). Fail-soft: never `Result`, never
+/// panic — a failure logs and the next boot re-runs (house `ensure_*` norm).
 ///
-/// Call ONLY after the base-table ensure join (`ensure_tick_table_dedup_keys`
-/// + `ensure_shadow_candle_tables`) has completed, so `ticks` +
-/// `candles_1m` exist before CREATE VIEW validates its column references.
+/// Call ONLY after the base-table ensures (`ensure_tick_table_dedup_keys`
+/// + `ensure_shadow_candle_tables`, or the Groww delegating wrappers) have
+/// completed, so `ticks` + `candles_1m` exist before CREATE VIEW validates
+/// its column references. Safe to call from multiple feed lanes — the DDL
+/// is convergent, so double execution on dual-feed boots is harmless.
 // TEST-EXEMPT: requires a running QuestDB; the DDL strings are ratcheted by the pure-builder unit tests below; exercised by boot integration + `make doctor`.
 pub async fn ensure_named_views(questdb_config: &QuestDbConfig) {
     // FEATURE-GATE FIX: the lifecycle dimension table must exist before
@@ -246,13 +271,26 @@ mod tests {
     }
 
     #[test]
-    fn test_both_ddls_use_create_view_if_not_exists() {
-        // Bare CREATE VIEW is NOT idempotent on QuestDB ("view already
-        // exists") — dropping IF NOT EXISTS is a boot-regression class.
+    fn test_both_ddls_use_create_or_replace_view() {
+        // CONVERGENT idempotency (review round 1 fix): bare CREATE VIEW is
+        // NOT idempotent on QuestDB ("view already exists" on re-boot), and
+        // `CREATE VIEW IF NOT EXISTS` no-ops with 2xx when the definition
+        // CHANGED — a future DDL edit would deploy green while every
+        // already-provisioned DB silently kept the OLD definition forever
+        // (audit Rule 11 false-OK class; the "ready" info! would lie).
+        // `CREATE OR REPLACE VIEW` (probe-Verified on the pinned QuestDB
+        // 9.3.5: ddl OK + definition actually replaced) converges the
+        // deployed definition to the code on EVERY boot — the house
+        // every-boot self-heal pattern. Regressing to either weaker form
+        // is a stale-definition / boot-error regression class.
         for (name, ddl) in both_ddls() {
             assert!(
-                ddl.starts_with("CREATE VIEW IF NOT EXISTS "),
-                "{name} DDL must start with CREATE VIEW IF NOT EXISTS: {ddl}"
+                ddl.starts_with("CREATE OR REPLACE VIEW "),
+                "{name} DDL must start with CREATE OR REPLACE VIEW: {ddl}"
+            );
+            assert!(
+                !ddl.contains("IF NOT EXISTS"),
+                "{name} DDL must not use IF NOT EXISTS (stale-definition false-OK): {ddl}"
             );
         }
     }
