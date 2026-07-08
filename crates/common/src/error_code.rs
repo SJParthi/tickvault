@@ -2029,7 +2029,10 @@ mod tests {
         assert_eq!(f2.code_str(), "FUTIDX-02");
         assert_eq!("FUTIDX-02".parse::<ErrorCode>(), Ok(f2));
         assert_eq!(f2.severity(), Severity::High);
-        // Design contract (FINAL.md D0.5/T3.4): a cross-feed comparability
+        // Design contract (futidx-4-error-codes.md §2 + the R3-4 record in
+        // .claude/plans/active-plan-futidx-4.md — the in-repo authority;
+        // round 4 replaced a dangling scratchpad "FINAL.md" citation that
+        // never landed in the tree): a cross-feed comparability
         // verdict is NEVER auto-actioned despite being non-Critical — the
         // severity-independent override arm, not the blanket derivation.
         assert!(!f2.is_auto_triage_safe());
