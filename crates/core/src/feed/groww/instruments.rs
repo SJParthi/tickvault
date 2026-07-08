@@ -106,6 +106,16 @@ pub struct WatchEntry {
     /// native watch reader ignores unknown fields — additive JSON.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expiry_date: Option<String>,
+    /// COLD-PATH provenance (§36 hostile-review round 2, 2026-07-08) — the
+    /// EXACT-match canonical underlying (`NIFTY`/`BANKNIFTY`/`MIDCPNIFTY`/
+    /// `SENSEX`) for the 4 index-future entries, threaded from
+    /// `GrowwIndexFuture.canonical` so the `feed='groww'` FUTIDX master rows
+    /// carry a queryable `underlying_symbol` (SEBI forensic completeness —
+    /// mirror of the Dhan-side lifecycle rows). `None` (and skipped on
+    /// write) for everything else; the sidecar/native watch readers ignore
+    /// unknown fields — additive JSON.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub underlying_symbol: Option<String>,
 }
 
 /// The assembled Groww watch set + resolution provenance for observability.
@@ -396,6 +406,7 @@ fn extract_index_entries(rows: &[GrowwInstrumentRow]) -> Vec<WatchEntry> {
             symbol_name: (!r.name.is_empty()).then(|| r.name.clone()),
             index_name: Some(r.groww_symbol.clone()),
             expiry_date: None,
+            underlying_symbol: None,
         })
         .collect();
     entries.sort_by(|a, b| a.exchange_token.cmp(&b.exchange_token));
@@ -499,14 +510,28 @@ pub fn extract_index_future_entries(
             .filter(|(d, _)| *d == chosen)
             .map(|(_, r)| *r)
             .collect();
-        if at_chosen.len() > 1 {
+        // Hostile-review round 2 (2026-07-08): collapse vendor-glitch
+        // EXACT-duplicate master lines (SAME `exchange_token` at the chosen
+        // expiry) first-row-wins BEFORE the ambiguity count — mirror of the
+        // Dhan-side SECURITY_ID dedup in `select_index_future_contracts`.
+        // Only TRULY-DISTINCT tokens at the same expiry stay fail-closed.
+        let mut distinct: Vec<&GrowwInstrumentRow> = Vec::with_capacity(at_chosen.len());
+        for row in &at_chosen {
+            if !distinct
+                .iter()
+                .any(|d| d.exchange_token == row.exchange_token)
+            {
+                distinct.push(row);
+            }
+        }
+        if distinct.len() > 1 {
             misses.push(IndexFutureMiss {
                 canonical: target.canonical,
                 reason: IndexFutureMissReason::AmbiguousDuplicateExpiry,
             });
             continue;
         }
-        let r = at_chosen[0];
+        let r = distinct[0];
         let security_id = r.exchange_token.parse::<i64>().unwrap_or(0);
         entries.push(GrowwIndexFuture {
             entry: WatchEntry {
@@ -519,6 +544,7 @@ pub fn extract_index_future_entries(
                 symbol_name: Some(r.groww_symbol.clone()),
                 index_name: None,
                 expiry_date: Some(chosen.format("%Y-%m-%d").to_string()),
+                underlying_symbol: Some(target.canonical.to_string()),
             },
             canonical: target.canonical,
             expiry: chosen,
@@ -651,6 +677,7 @@ fn resolve_stock_entries(
                 symbol_name: Some(symbol.clone()),
                 index_name: None,
                 expiry_date: None,
+                underlying_symbol: None,
             }),
             None => unresolved.push(symbol.clone()),
         }
@@ -925,7 +952,30 @@ fn build_groww_watch_from_csvs(
         Vec::<WatchEntry>::new()
     };
 
-    let expected_futures = future_entries.len();
+    // Hostile-review round 2 (2026-07-08): `expected` is the DISTINCT
+    // (exchange, exchange_token, segment) count — the SAME key
+    // `assemble_watch_set`'s dedup uses — so an intra-futures dedup collapse
+    // (duplicate exchange_token across underlyings = vendor master
+    // corruption) is never misattributed to an operator cap override. The
+    // collapse itself is loudly reported as its own FUTIDX-01 cause here.
+    let raw_futures = future_entries.len();
+    let expected_futures = distinct_future_key_count(&future_entries);
+    #[cfg(feature = "daily_universe_fetcher")]
+    if expected_futures < raw_futures {
+        tracing::error!(
+            code = tickvault_common::error_code::ErrorCode::Futidx01SelectionDegraded.code_str(),
+            feed = "groww",
+            raw = raw_futures,
+            distinct = expected_futures,
+            "duplicate exchange_token among the selected index futures collapsed by the \
+             watch-set dedup — vendor master id-space corruption; the folded contract is \
+             NOT subscribed"
+        );
+        metrics::counter!("tv_index_futures_dedup_dropped_total", "feed" => "groww")
+            .increment((raw_futures - expected_futures) as u64);
+    }
+    #[cfg(not(feature = "daily_universe_fetcher"))]
+    let _ = raw_futures;
     let set = assemble_watch_set(
         index_entries,
         stock_entries,
@@ -961,6 +1011,25 @@ fn build_groww_watch_from_csvs(
     #[cfg(not(feature = "daily_universe_fetcher"))]
     let _ = expected_futures;
     Ok(set)
+}
+
+/// Distinct-(exchange, token, segment) count over the selected future
+/// entries — the SAME composite key `assemble_watch_set` dedups on, so the
+/// cap-drop check's `expected` can never be inflated by an exact-duplicate
+/// token (hostile-review round 2, 2026-07-08). O(n²) over ≤4 entries.
+fn distinct_future_key_count(entries: &[WatchEntry]) -> usize {
+    let mut distinct: Vec<(&str, &str, &str)> = Vec::with_capacity(entries.len());
+    for e in entries {
+        let key = (
+            e.exchange.as_str(),
+            e.exchange_token.as_str(),
+            e.segment.as_str(),
+        );
+        if !distinct.contains(&key) {
+            distinct.push(key);
+        }
+    }
+    distinct.len()
 }
 
 /// On-disk watch-file shape the Python sidecar reads.
@@ -1223,6 +1292,7 @@ mod tests {
                 symbol_name: Some("RELIANCE".to_owned()),
                 index_name: None,
                 expiry_date: None,
+                underlying_symbol: None,
             },
             WatchEntry {
                 exchange: "NSE".to_owned(),
@@ -1234,6 +1304,7 @@ mod tests {
                 symbol_name: None,
                 index_name: Some("NSE-NIFTY".to_owned()),
                 expiry_date: None,
+                underlying_symbol: None,
             },
         ];
         write_watch_entries_file(&path, &entries, "2026-07-03").expect("write shard watch file");
@@ -1522,6 +1593,7 @@ mod tests {
             symbol_name: Some(format!("SYM{token}")),
             index_name: None,
             expiry_date: None,
+            underlying_symbol: None,
         }
     }
     fn index_entry(name: &str) -> WatchEntry {
@@ -1535,6 +1607,7 @@ mod tests {
             symbol_name: None,
             index_name: Some(format!("NSE-{name}")),
             expiry_date: None,
+            underlying_symbol: None,
         }
     }
 
@@ -1614,6 +1687,7 @@ mod tests {
             symbol_name: Some(format!("NSE-FUT-{token}")),
             index_name: None,
             expiry_date: Some("2026-07-30".to_string()),
+            underlying_symbol: None,
         }
     }
 
@@ -1638,6 +1712,26 @@ mod tests {
         assert!(set.entries[..4].iter().all(|e| e.segment == "FNO"));
         // Master carries the full pre-cap universe (1104).
         assert_eq!(set.master_entries.len(), 1104);
+    }
+
+    /// Hostile-review round 2 (2026-07-08, F3): `expected_futures` for the
+    /// cap-drop attribution is the DISTINCT (exchange, token, segment) count
+    /// — an intra-futures duplicate-token collapse must never be blamed on
+    /// an operator cap override.
+    #[test]
+    fn test_distinct_future_key_count_folds_duplicate_tokens() {
+        let futures = vec![
+            future_entry("61001"),
+            future_entry("61001"), // duplicate token — vendor corruption
+            future_entry("61002"),
+        ];
+        assert_eq!(distinct_future_key_count(&futures), 2);
+        // And the assembled live set holds exactly the 2 distinct futures —
+        // matching `expected`, so the cap-drop arm does NOT fire for this.
+        let stocks: Vec<WatchEntry> = (0..100).map(|i| stock_entry(&format!("{i:04}"))).collect();
+        let set = assemble_watch_set(vec![], stocks, futures, vec![], 100, None).unwrap();
+        let live_futures = set.entries.iter().filter(|e| e.segment == "FNO").count();
+        assert_eq!(live_futures, 2);
     }
 
     #[test]
@@ -2230,6 +2324,31 @@ mod tests {
                 && m.reason
                     == crate::instrument::index_futures::IndexFutureMissReason::AmbiguousDuplicateExpiry
         }));
+    }
+
+    /// Hostile-review round 2 (2026-07-08): a vendor-glitch EXACT-duplicate
+    /// master line (SAME exchange_token at the chosen expiry) collapses
+    /// first-row-wins — never classified ambiguous; only truly-distinct
+    /// tokens at the same expiry stay fail-closed (previous test above).
+    #[cfg(feature = "daily_universe_fetcher")]
+    #[test]
+    fn test_extract_dedups_exact_duplicate_token_before_ambiguity() {
+        let csv = format!(
+            "{HEADER}\n{}{}\n",
+            fut_rows_all_four("2026-07-30"),
+            // Exact-duplicate NIFTY line: SAME token, SAME expiry.
+            fut_row("NSE", "61001", "NIFTY", "2026-07-30"),
+        );
+        let rows = parse_groww_master(&csv).expect("parse");
+        let (entries, misses) = extract_index_future_entries(&rows, groww_test_today());
+        assert_eq!(misses, vec![], "duplicate token is not ambiguity");
+        assert_eq!(entries.len(), 4, "NIFTY kept via first-row-wins");
+        let nifty: Vec<_> = entries.iter().filter(|f| f.canonical == "NIFTY").collect();
+        assert_eq!(nifty.len(), 1);
+        assert_eq!(nifty[0].entry.exchange_token, "61001");
+        // F0 (round 2): the canonical is threaded into the watch entry so the
+        // feed='groww' FUTIDX master rows carry a queryable underlying.
+        assert_eq!(nifty[0].entry.underlying_symbol.as_deref(), Some("NIFTY"));
     }
 
     #[cfg(feature = "daily_universe_fetcher")]

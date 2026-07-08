@@ -182,6 +182,7 @@ mod tests {
             symbol_name: None,
             index_name: None,
             expiry_date: None,
+            underlying_symbol: None,
         }
     }
 

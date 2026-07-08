@@ -813,6 +813,16 @@ pub fn build_subscription_plan_from_daily_universe(universe: &DailyUniverse) -> 
         HashSet::with_capacity(universe.subscription_targets.len());
     let mut skipped_unparsable_sid: usize = 0;
     let mut skipped_futidx_bad_segment: usize = 0;
+    // §36 hostile-review round 2 (2026-07-08): count the IndexFuture targets
+    // the universe HANDED the planner, so the post-plan honesty check below
+    // can page FUTIDX-01 on ANY planner-stage drop of a chosen future
+    // (unparsable SID / unknown segment / composite-key dedup) — the Dhan
+    // mirror of the Groww post-cap gauge fix (round 1, R1-B).
+    let expected_futures = universe
+        .subscription_targets
+        .iter()
+        .filter(|t| t.role == InstrumentRole::IndexFuture)
+        .count();
 
     for target in &universe.subscription_targets {
         let Ok(security_id) = target.csv_row.security_id.parse::<u64>() else {
@@ -901,6 +911,28 @@ pub fn build_subscription_plan_from_daily_universe(universe: &DailyUniverse) -> 
     metrics::gauge!("tv_instrument_registry_cross_segment_collisions")
         .set(registry.cross_segment_collisions() as f64);
     metrics::gauge!("tv_instrument_registry_total_entries").set(registry.len() as f64);
+
+    // §36 hostile-review round 2 (2026-07-08): the Dhan futures gauge is
+    // POST-PLAN and honest — it reports what is actually IN the plan, and a
+    // planner-stage drop of a chosen future is LOUD (FUTIDX-01), mirroring
+    // the Groww post-cap fix. IndexDerivative is populated ONLY by the
+    // IndexFuture role in the DailyUniverse plan, so the category count IS
+    // the planned-futures count.
+    let planned_futures = registry.category_count(SubscriptionCategory::IndexDerivative);
+    metrics::gauge!("tv_index_futures_selected", "feed" => "dhan").set(planned_futures as f64);
+    if planned_futures < expected_futures {
+        tracing::error!(
+            code = tickvault_common::error_code::ErrorCode::Futidx01SelectionDegraded.code_str(),
+            feed = "dhan",
+            expected = expected_futures,
+            planned = planned_futures,
+            skipped_unparsable_sid,
+            skipped_futidx_bad_segment,
+            "index-future(s) dropped at the PLAN stage (unparsable SID / unknown segment / \
+             composite-key dedup) — the gauge reports the POST-PLAN count; subscription \
+             proceeds without them"
+        );
+    }
 
     let total = registry.len();
     let exceeds_capacity = total > MAX_TOTAL_SUBSCRIPTIONS;
@@ -4999,6 +5031,38 @@ mod daily_universe_plan_tests {
         assert_eq!(plan.summary.stock_equities, 1, "1 NSE_EQ underlying");
         // §8: every daily-universe SID subscribes in Quote mode.
         assert_eq!(plan.summary.feed_mode, FeedMode::Quote);
+    }
+
+    /// Hostile-review round 2 (2026-07-08, F2 — Dhan mirror of the Groww
+    /// post-cap fix): a planner-stage drop of a chosen IndexFuture target
+    /// (unknown segment here; unparsable SID is the sibling arm) leaves the
+    /// POST-PLAN IndexDerivative count BELOW the handed-in future count —
+    /// the honesty gap the post-plan gauge + FUTIDX-01 error now cover.
+    #[test]
+    fn test_plan_futidx_planner_drop_is_counted_post_plan() {
+        let mut good = daily_target(InstrumentRole::IndexFuture, "35001", "NSE_FNO", "NIFTY-FUT");
+        good.csv_row.underlying_symbol = "NIFTY".to_string();
+        good.csv_row.expiry_date = "2026-07-30".to_string();
+        let mut bad = daily_target(
+            InstrumentRole::IndexFuture,
+            "45001",
+            "MCX_COMM", // unknown FUTIDX segment → fail-closed planner skip
+            "SENSEX-FUT",
+        );
+        bad.csv_row.underlying_symbol = "SENSEX".to_string();
+        bad.csv_row.expiry_date = "2026-07-30".to_string();
+        let universe = DailyUniverse {
+            subscription_targets: vec![good, bad],
+            fno_contracts: vec![],
+        };
+        let plan = build_subscription_plan_from_daily_universe(&universe);
+        // 2 futures handed in, 1 survives the plan — the post-plan gauge
+        // reports 1 (not 2) and the FUTIDX-01 planner-drop error fires.
+        assert_eq!(
+            plan.summary.index_derivatives, 1,
+            "post-plan count is honest"
+        );
+        assert_eq!(plan.summary.total, 1);
     }
 
     #[test]

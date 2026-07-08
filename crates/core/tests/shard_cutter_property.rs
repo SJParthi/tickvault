@@ -38,6 +38,7 @@ fn make_entry(exchange: &str, segment: &str, security_id: i64) -> WatchEntry {
         symbol_name: None,
         index_name: None,
         expiry_date: None,
+        underlying_symbol: None,
     }
 }
 

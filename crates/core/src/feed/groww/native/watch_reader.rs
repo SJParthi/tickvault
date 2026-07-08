@@ -238,6 +238,7 @@ mod tests {
                     symbol_name: Some("TEST".to_owned()),
                     index_name: None,
                     expiry_date: None,
+                    underlying_symbol: None,
                 },
                 WatchEntry {
                     exchange: "BSE".to_owned(),
@@ -249,6 +250,7 @@ mod tests {
                     symbol_name: None,
                     index_name: Some("BSE-SENSEX".to_owned()),
                     expiry_date: None,
+                    underlying_symbol: None,
                 },
             ],
             master_entries: vec![],
@@ -291,6 +293,7 @@ mod tests {
                     symbol_name: Some("NSE-NIFTY-30Jul26-FUT".to_owned()),
                     index_name: None,
                     expiry_date: Some("2026-07-30".to_owned()),
+                    underlying_symbol: None,
                 },
                 WatchEntry {
                     exchange: "BSE".to_owned(),
@@ -302,6 +305,7 @@ mod tests {
                     symbol_name: Some("BSE-SENSEX-31Jul26-FUT".to_owned()),
                     index_name: None,
                     expiry_date: Some("2026-07-31".to_owned()),
+                    underlying_symbol: None,
                 },
                 // Old-shape stock entry: expiry_date None → field absent on wire.
                 WatchEntry {
@@ -314,6 +318,7 @@ mod tests {
                     symbol_name: Some("RELIANCE".to_owned()),
                     index_name: None,
                     expiry_date: None,
+                    underlying_symbol: None,
                 },
             ],
             master_entries: vec![],

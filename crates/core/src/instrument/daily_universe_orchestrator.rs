@@ -51,9 +51,7 @@ use super::fno_underlying_extractor::{
     ExtractError, collect_applicable_fno_contracts, extract_fno_underlyings,
 };
 use super::index_extractor::{IndexExtractError, extract_indices};
-use super::index_futures::{
-    FeedFutureSelection, record_index_future_selection, select_index_future_contracts,
-};
+use super::index_futures::select_index_future_contracts;
 
 /// Errors that can occur during orchestration. Each variant wraps the
 /// underlying error from Sub-PRs #4-#7 and maps to ONE of the 4
@@ -282,36 +280,13 @@ pub fn build_universe_from_bytes(
         )
         .increment(1);
     }
-    metrics::gauge!("tv_index_futures_selected", "feed" => "dhan")
-        .set(futures_sel.chosen.len() as f64);
-    let mut dhan_feed_selection: Vec<FeedFutureSelection> = Vec::new();
-    for row in &futures_sel.chosen {
-        // The boot evidence line (machine-readable) — one per chosen contract.
-        tracing::info!(
-            feed = "dhan",
-            underlying = %row.underlying_symbol,
-            expiry = %row.expiry_date,
-            native_id = %row.security_id,
-            segment = %row.segment,
-            "index-futures selection"
-        );
-        if let Ok(expiry) = chrono::NaiveDate::parse_from_str(row.expiry_date.trim(), "%Y-%m-%d") {
-            let canonical =
-                super::index_extractor::canonicalize_index_symbol(&row.underlying_symbol);
-            if let Some(entry) = super::index_futures::INDEX_FUTURES_UNDERLYINGS
-                .iter()
-                .find(|u| u.canonical == canonical)
-            {
-                dhan_feed_selection.push(FeedFutureSelection {
-                    canonical: entry.canonical,
-                    expiry,
-                    native_id: row.security_id.clone(),
-                    segment: row.segment.clone(),
-                });
-            }
-        }
-    }
-    record_index_future_selection("dhan", today_ist, dhan_feed_selection);
+    // Hostile-review round 2 (2026-07-08): the Dhan gauge moved to the plan
+    // builder (POST-PLAN honesty, `subscription_planner.rs`), and the
+    // boot-evidence lines + parity recording moved to the shared
+    // `record_dhan_selection_from_universe` helper called AFTER the universe
+    // is built (below) — so the §29 warm-snapshot boot path emits the
+    // IDENTICAL evidence + parity entry from `main.rs` without waiting on
+    // the background reconcile.
 
     // Step 3c: resolve + bridge the §31 NTM constituents (degrade-safe). When
     // `ntm_map` is None (source unavailable) or resolve fails, this is empty and
@@ -326,6 +301,11 @@ pub fn build_universe_from_bytes(
     // set that pushes the universe past MAX is an INSTR-FETCH-04 fail-closed
     // HALT (a data anomaly), NOT a degrade.
     let universe = build_daily_universe(indices, fno, fno_contracts, ntm_rows, futures_sel.chosen)?;
+
+    // §36 boot evidence + cross-feed parity recording — from the BUILT
+    // universe (the same source the warm-snapshot path replays), so cold and
+    // warm boots are provably identical here.
+    super::index_futures::record_dhan_selection_from_universe(&universe, today_ist);
 
     Ok(universe)
 }
@@ -446,6 +426,29 @@ mod tests {
             .collect();
         futidx_sids.sort_unstable();
         assert_eq!(futidx_sids, vec!["61001", "61002", "61003", "71001"]);
+
+        // Hostile-review round 2 (2026-07-08, F4): the shared warm/cold
+        // recording helper derives the SAME 4 exact-canonical selections from
+        // the BUILT universe — this is what the §29 warm-snapshot boot path
+        // replays, so warm parity/evidence provably match the cold path.
+        let sels = super::super::index_futures::dhan_selections_from_universe(&universe);
+        let mut canonicals: Vec<&str> = sels.iter().map(|s| s.canonical).collect();
+        canonicals.sort_unstable();
+        assert_eq!(
+            canonicals,
+            vec!["BANKNIFTY", "MIDCPNIFTY", "NIFTY", "SENSEX"]
+        );
+        assert!(
+            sels.iter()
+                .all(|s| s.expiry == chrono::NaiveDate::from_ymd_opt(2026, 7, 30).expect("d")),
+            "expiry carried verbatim from the built universe"
+        );
+        let sensex = sels
+            .iter()
+            .find(|s| s.canonical == "SENSEX")
+            .expect("sensex");
+        assert_eq!(sensex.segment, "BSE_FNO");
+        assert_eq!(sensex.native_id, "71001");
     }
 
     #[test]
