@@ -5720,7 +5720,21 @@ async fn start_dhan_lane(
     // Live mode: MUST verify IP before any Dhan API call.
     // Paper mode: skip (no Dhan API calls at all).
     let trading_mode = config.strategy.mode;
-    if trading_mode.is_live() {
+    // F5 (2026-07-08): the runtime IP monitor is LANE-OWNED, never a detached
+    // per-lane-cycle spawn. The previous `std::mem::forget(ip_monitor_shutdown_tx)`
+    // + dropped JoinHandle leaked one immortal monitor per D2b lane cold-start
+    // cycle, each pinned to ITS boot's verified-IP baseline — after a
+    // legitimate IP change + lane restart the zombie's STALE baseline fired
+    // false CRITICAL GAP-NET-01 pages every poll and, in live mode, could
+    // HALT the whole process. The handle rides in a `PreLaneAbortGuard`
+    // across the pre-`DhanLaneRunHandles` awaits (this is the EARLIEST lane
+    // spawn — every subsequent await sits in its window), then defuses into
+    // the lane struct; the watch Sender rides alongside so teardown can drop
+    // it (the monitor's `changed()` select arm exits on a closed channel).
+    let (ip_monitor_guard, ip_monitor_shutdown): (
+        PreLaneAbortGuard<()>,
+        Option<tokio::sync::watch::Sender<bool>>,
+    ) = if trading_mode.is_live() {
         info!("verifying public IP against SSM static IP");
         match ip_verifier::verify_public_ip().await {
             Ok(result) => {
@@ -5745,21 +5759,24 @@ async fn start_dhan_lane(
                         verified_ip,
                         config.strategy.dry_run,
                     );
-                // Mirror the seal-writer lifetime pattern: hold the watch
-                // sender for the process lifetime so the monitor's
-                // `.changed().await` never wakes on a disconnected channel.
+                // F5: the sender is KEPT (lane-owned) — while the lane lives
+                // the channel stays open; teardown/Drop drop it, and the
+                // monitor's `changed()` arm exits on the closed channel.
                 let (ip_monitor_shutdown_tx, ip_monitor_shutdown_rx) =
                     tokio::sync::watch::channel(false);
-                std::mem::forget(ip_monitor_shutdown_tx);
-                let (_ip_mismatch_rx, _ip_monitor_handle) =
+                let (_ip_mismatch_rx, ip_monitor_handle) =
                     tickvault_core::network::ip_monitor::spawn_ip_monitor(
                         ip_monitor_config,
                         ip_monitor_shutdown_rx,
                     );
                 info!(
                     halt_on_mismatch = !config.strategy.dry_run,
-                    "GAP-NET-01 (AUTH-P12): runtime IP monitor spawned"
+                    "GAP-NET-01 (AUTH-P12): runtime IP monitor spawned (lane-owned)"
                 );
+                (
+                    PreLaneAbortGuard::new(vec![ip_monitor_handle]),
+                    Some(ip_monitor_shutdown_tx),
+                )
             }
             Err(err) => {
                 // GAP-NET-01: static-IP verification rejected boot.
@@ -5783,7 +5800,8 @@ async fn start_dhan_lane(
             "IP verification skipped — not required for {} mode",
             trading_mode.as_str()
         );
-    }
+        (PreLaneAbortGuard::new(Vec::new()), None)
+    };
 
     // -----------------------------------------------------------------------
     // Step 6a-prime: Dual-instance SSM lock (Phase 0 Item 19) — LOCK BEFORE MINT
@@ -6466,8 +6484,19 @@ async fn start_dhan_lane(
     // hot-path enqueues to QuestDB via ILP). Plus the IST-midnight
     // reset task that flips first_seen back to empty at IST 00:00.
     let first_seen = tickvault_core::pipeline::first_seen_set::init_global();
-    let _first_seen_reset_handle =
-        tickvault_core::pipeline::first_seen_set::spawn_ist_midnight_reset_task(first_seen);
+    // F4/F13 (2026-07-08): once-per-process latch. The reset task is an
+    // INFINITE loop driving the PROCESS-GLOBAL FirstSeenSet singleton — a
+    // per-lane-cycle spawn leaked one immortal loop per D2b Dhan
+    // enable/disable cycle (N copies all resetting the same singleton at
+    // IST midnight). First lane start wins; later cold-starts skip.
+    if FIRST_SEEN_RESET_SPAWNED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        info!(
+            "first-seen IST-midnight reset task already running — skipping duplicate spawn (lane restart)"
+        );
+    } else {
+        let _first_seen_reset_handle =
+            tickvault_core::pipeline::first_seen_set::spawn_ist_midnight_reset_task(first_seen);
+    }
 
     // Wave 1 Item 0.b part 2 — async tick spill drain. Adds an mpsc(8192)
     // layer in front of the existing sync BufWriter spill so the hot path
@@ -6856,11 +6885,19 @@ async fn start_dhan_lane(
     // S12 wiring: heartbeat watchdog (slow boot).
     // Same responsibilities as the fast-boot watchdog above. Spawned
     // after token_handle + tick_broadcast_sender are both available.
-    // Runs until the process exits. (LANE — depends on the lane-built token_handle.)
-    let _slow_heartbeat_handle = spawn_heartbeat_watchdog(
+    // F13 (2026-07-08): LANE-OWNED — the previous dropped `let _ = …`
+    // binding detached an INFINITE 30s loop pinning the dead lane's
+    // token_handle (arc-swap): after a runtime Dhan disable it fired a
+    // false AUTH-GAP-01 "token handle is None" ERROR every 30s forever,
+    // and each D2b cold-start cycle leaked another copy. Guard-wrapped
+    // across the pre-lane awaits (WAL reinject + connected-alerts), then
+    // defused into `DhanLaneRunHandles.heartbeat_watchdog_handle` so
+    // teardown/Drop abort it. (The FAST arm's twin stays a plain spawn —
+    // main() is never supervisor-aborted, process-lifetime by design.)
+    let heartbeat_watchdog_guard = PreLaneAbortGuard::new(vec![spawn_heartbeat_watchdog(
         std::sync::Arc::clone(&token_handle),
         tick_broadcast_sender.clone(),
-    );
+    )]);
 
     // In-market gap-backfill is DISABLED by user policy. Historical
     // candle data must NOT be injected into the live `ticks` table.
@@ -7604,6 +7641,29 @@ async fn start_dhan_lane(
             // (09:14 / 09:15:30) stay here — they are feed-readiness, not
             // process-global.
 
+            // F4 (2026-07-08): the three market-open ONE-SHOT schedulers
+            // below (09:14 readiness / 09:15:30 streaming heartbeat / 09:16
+            // self-test) are detached-by-design one-shots (self-exit after
+            // firing), so they get the SLO-supervisor treatment for lane
+            // restarts: (a) a ONCE-PER-PROCESS spawn latch — N D2b
+            // enable/disable cycles before the bell previously accumulated N
+            // pending copies, each firing its own verdict (N duplicate
+            // Telegrams, N SELFTEST rows); and (b) a FIRE-TIME dhan-enabled
+            // gate inside each task — a pending one-shot outliving a
+            // deliberate runtime Dhan disable previously read the dead
+            // pool's frozen 0-connection state and fired FALSE
+            // MarketOpenStreamingFailed (High) / SELFTEST-02 (Critical)
+            // pages at the bell. Ratchet:
+            // secret_manager.rs::test_market_open_one_shots_latched_and_gated.
+            let market_open_one_shots_first_spawn =
+                !MARKET_OPEN_ONE_SHOTS_SPAWNED.swap(true, std::sync::atomic::Ordering::SeqCst);
+            if !market_open_one_shots_first_spawn {
+                info!(
+                    "market-open one-shot schedulers already spawned this process — \
+                     skipping duplicates (lane restart)"
+                );
+            }
+
             // Audit Finding #5 (2026-05-03): Pre-market positive readiness
             // ping at 09:14:00 IST — exactly 60s before the NSE opening bell.
             // Closes the false-OK gap from audit-findings-2026-04-17.md
@@ -7613,7 +7673,8 @@ async fn start_dhan_lane(
             //
             // Audit-findings Rule 3: market-hours-aware. Trading day check +
             // late-start past 09:14:00 → skip silently.
-            {
+            if market_open_one_shots_first_spawn {
+                let readiness_dhan_flag = feed_runtime.dhan_flag();
                 let readiness_notifier = notifier.clone();
                 let readiness_health = health_status.clone();
                 let readiness_calendar = std::sync::Arc::clone(&trading_calendar);
@@ -7658,6 +7719,13 @@ async fn start_dhan_lane(
                     );
                     tokio::time::sleep(std::time::Duration::from_secs(secs_until)).await;
 
+                    // F4: fire-time gate — a deliberately-disabled Dhan lane
+                    // must not emit a readiness verdict off dead state.
+                    if !market_open_fire_gate_dhan_enabled(&readiness_dhan_flag) {
+                        info!("market-open readiness: skipping (Dhan disabled at fire time)");
+                        return;
+                    }
+
                     let main_active = readiness_health.websocket_connections() as usize;
                     let oms = readiness_health.order_update_connected();
                     let token_secs = readiness_health.token_remaining_secs();
@@ -7688,7 +7756,11 @@ async fn start_dhan_lane(
             //
             // Audit-findings Rule 3: market-hours-aware. Trading day check +
             // post-market skip + late-start past 09:15:30 → skip silently.
-            {
+            //
+            // F4 (2026-07-08): once-per-process latch + fire-time
+            // dhan-enabled gate — see the latch comment above.
+            if market_open_one_shots_first_spawn {
+                let heartbeat_dhan_flag = feed_runtime.dhan_flag();
                 let heartbeat_notifier = notifier.clone();
                 let heartbeat_health = health_status.clone();
                 let heartbeat_calendar = std::sync::Arc::clone(&trading_calendar);
@@ -7734,6 +7806,15 @@ async fn start_dhan_lane(
                         "market-open heartbeat: sleeping until 09:15:30 IST"
                     );
                     tokio::time::sleep(std::time::Duration::from_secs(secs_until)).await;
+
+                    // F4: fire-time gate — a pending one-shot outliving a
+                    // deliberate runtime Dhan disable would otherwise read
+                    // the dead pool's frozen 0 connections and fire a FALSE
+                    // High MarketOpenStreamingFailed page at the bell.
+                    if !market_open_fire_gate_dhan_enabled(&heartbeat_dhan_flag) {
+                        info!("market-open heartbeat: skipping (Dhan disabled at fire time)");
+                        return;
+                    }
 
                     let main_active = heartbeat_health.websocket_connections() as usize;
                     let oms = heartbeat_health.order_update_connected();
@@ -7797,7 +7878,13 @@ async fn start_dhan_lane(
             // (Wave-2-D Item 9). DEDUP key `(trading_date_ist, check_name)`.
             //
             // Gated on `config.features.market_open_self_test`.
-            if config.features.market_open_self_test {
+            //
+            // F4 (2026-07-08): once-per-process latch + fire-time
+            // dhan-enabled gate — a duplicate/stale one-shot previously
+            // fired N verdicts (or a FALSE Critical SELFTEST-02 off a
+            // deliberately-disabled lane's dead state) at 09:16.
+            if market_open_one_shots_first_spawn && config.features.market_open_self_test {
+                let st_dhan_flag = feed_runtime.dhan_flag();
                 let st_notifier = notifier.clone();
                 let st_health = health_status.clone();
                 let st_calendar = std::sync::Arc::clone(&trading_calendar);
@@ -7837,6 +7924,14 @@ async fn start_dhan_lane(
                         "market-open self-test: sleeping until 09:16:00 IST"
                     );
                     tokio::time::sleep(std::time::Duration::from_secs(secs_until)).await;
+
+                    // F4: fire-time gate — a deliberately-disabled Dhan lane
+                    // must not fire a FALSE Critical SELFTEST-02 verdict off
+                    // its dead pool/pipeline state.
+                    if !market_open_fire_gate_dhan_enabled(&st_dhan_flag) {
+                        info!("market-open self-test: skipping (Dhan disabled at fire time)");
+                        return;
+                    }
 
                     // #T2b (2026-05-20): the selftest_audit DB pre-check
                     // was removed with the table. The scheduler fires
@@ -8284,20 +8379,36 @@ async fn start_dhan_lane(
     let renewal_handle = token_manager.spawn_renewal_task();
     info!("token renewal task started");
 
+    // AUTH-GAP-05 (2026-07-06): shared profile-truth flag — written by the
+    // mid-session watchdog every in-session cycle (false on a REAL
+    // /v2/profile auth failure, true on a clean check), read by the
+    // token-health gauge poller AND (F15, 2026-07-08) the /health
+    // token-block writer for their AND-composed validity. Seeds true; the
+    // local-expiry gate in both consumers still forces invalid for an
+    // absent/expired token, so no false valid before the first cycle.
+    // Declared BEFORE the writer spawn below so both consumers share ONE flag.
+    let token_profile_valid = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+
     // -----------------------------------------------------------------------
     // Step 12′: B3 round-2 — dedicated token-health writer (UNCONDITIONAL,
     // NOT behind `realtime_guarantee_score` or any other feature flag). Its
     // JoinHandle is registered in `DhanLaneRunHandles` below so a runtime
     // Dhan disable aborts it instead of leaving an orphan writer reporting
     // the dead boot manager's `token_valid=true` for up to 24h.
+    // F15 (2026-07-08): the writer now honors the SAME profile-truth flag as
+    // the gauge poller — previously `/health token_valid` derived from local
+    // expiry only, so a Dhan-KILLED (but locally-unexpired) token read
+    // `valid` on /health for up to ~24h while `tv_token_valid` honestly
+    // read 0.0 — a split-brain false-OK (audit Rule 11).
     // -----------------------------------------------------------------------
     let token_health_handle = spawn_token_health_writer(
         std::sync::Arc::clone(&health_status),
         std::sync::Arc::clone(&feed_runtime),
+        std::sync::Arc::clone(&token_profile_valid),
     );
     info!(
         interval_secs = TOKEN_HEALTH_WRITER_INTERVAL_SECS,
-        "token-health writer started (unconditional; lane-owned)"
+        "token-health writer started (unconditional; lane-owned; profile-truth aware)"
     );
 
     // -----------------------------------------------------------------------
@@ -8309,13 +8420,6 @@ async fn start_dhan_lane(
     // NotificationEvent::MidSessionProfileInvalidated. Does NOT HALT —
     // dropping the live WS feed mid-session costs more than the
     // silent-failure risk we're monitoring.
-    // AUTH-GAP-05 (2026-07-06): shared profile-truth flag — written by the
-    // mid-session watchdog every in-session cycle (false on a REAL
-    // /v2/profile auth failure, true on a clean check), read by the
-    // token-health gauge poller for the AND-composed `tv_token_valid`.
-    // Seeds true; the poller's local-expiry gate still forces 0.0 for an
-    // absent/expired token, so no false 1.0 before the first cycle.
-    let token_profile_valid = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
     // Lane-owned (AG5-R1 fix, 2026-07-06): registered in `DhanLaneRunHandles`
     // below so a runtime Dhan disable aborts it. An unregistered spawn would
     // survive the lane teardown holding the DEAD lane's `Arc<TokenManager>`
@@ -8620,9 +8724,28 @@ async fn start_dhan_lane(
     // pre-construction window is covered by `PreLaneAbortGuard` (abort-on-drop);
     // the guards are DEFUSED here by handing the raw handles into this
     // struct's H8 Drop floor. Same for the pool watchdog (R8-EDGE-2 /
-    // SEC-C2-1) and — via the notify-on-drop `InstanceLockHeartbeatGuard`,
+    // SEC-C2-1), the runtime IP monitor + 30s heartbeat watchdog (F5/F13,
+    // 2026-07-08) and — via the notify-on-drop `InstanceLockHeartbeatGuard`,
     // defused just below — the dual-instance lock heartbeat (R8-EDGE-1 /
     // R8-CPLX-1).
+    //
+    // F19 HONESTY (2026-07-08) — the coverage above is NOT "every task this
+    // fn spawns". The REAL residual detached spawns in `start_dhan_lane`,
+    // enumerated with why each is acceptable:
+    //   * the 16:00 IST daily-reset + 15:30 IST market-close signal timers —
+    //     one-shot sleep→notify tasks that self-exit at their trigger; a
+    //     duplicate per lane cycle fires a redundant notify on an
+    //     attempt-private Notify (harmless, self-collecting same day);
+    //   * the ws_event_audit consumer (`spawn_ws_event_audit_consumer`) —
+    //     KNOWN residual: one cold-path ILP consumer leaks per lane cycle
+    //     (bounded by operator toggle frequency; tracked follow-up);
+    //   * the one-shot prev-day OHLCV fetch — self-exits after its bounded
+    //     fail-soft fetch pass;
+    //   * process-LATCHED families (spawned at most once per process):
+    //     post-market tasks (POST_MARKET_TASKS_SPAWNED), the market-open
+    //     one-shots (MARKET_OPEN_ONE_SHOTS_SPAWNED + fire-time dhan gate),
+    //     the SLO supervisor (SLO_PUBLISHER_SUPERVISOR_SPAWNED), and the
+    //     FirstSeenSet midnight reset (FIRST_SEEN_RESET_SPAWNED).
     let (instance_lock_handle, instance_lock_shutdown_chain) = instance_lock_guard.into_parts();
     let lane = DhanLaneRunHandles {
         ws_handles: ws_handles_guard.into_inner(),
@@ -8665,7 +8788,21 @@ async fn start_dhan_lane(
         // into the H8 floor — teardown/Drop abort it (the notify stop signal
         // alone is Rule-16 lost-wake prone against its ≤2s probe await).
         pool_watchdog_handle: pool_watchdog_guard.into_inner().pop(),
+        // F5 (2026-07-08): defuse the Step 5.5 IP-monitor guard into the H8
+        // floor + carry its watch shutdown Sender so teardown/Drop close the
+        // channel (graceful stop) and abort the handle (floor) — a zombie
+        // monitor's stale IP baseline pages false CRITICAL GAP-NET-01 (and
+        // can HALT in live mode) after a legitimate IP change + lane restart.
+        ip_monitor_handle: ip_monitor_guard.into_inner().pop(),
+        ip_monitor_shutdown,
+        // F13 (2026-07-08): defuse the heartbeat-watchdog guard — a detached
+        // copy is an immortal 30s loop firing false AUTH-GAP-01 pages off
+        // the dead lane's token_handle after a runtime disable.
+        heartbeat_watchdog_handle: heartbeat_watchdog_guard.into_inner().pop(),
         health: Some(std::sync::Arc::clone(&health_status)),
+        // F14 (2026-07-08): held so teardown/Drop publish the honest
+        // lane-off Dhan-connected=false after aborting the pool watchdog.
+        feed_health: Some(std::sync::Arc::clone(&feed_health)),
         ws_pool_arc,
         shutdown_notify,
         // H7: `Some` only for a runtime lane — the parked task watches this for
@@ -9026,10 +9163,40 @@ struct DhanLaneRunHandles {
     /// from the dead pool's frozen states. Pre-construction coverage is a
     /// `PreLaneAbortGuard` at the spawn site, defused here.
     pool_watchdog_handle: Option<tokio::task::JoinHandle<()>>,
+    /// F5 (2026-07-08): the runtime IP monitor (GAP-NET-01 / AUTH-P12).
+    /// Lane-owned — a detached copy per D2b lane cold-start cycle kept ITS
+    /// boot's verified-IP baseline forever: after a legitimate IP change +
+    /// lane restart the zombie's stale baseline fired false CRITICAL
+    /// GAP-NET-01 pages and (live mode) could HALT the whole process.
+    /// Pre-construction coverage is a `PreLaneAbortGuard` at the Step 5.5
+    /// spawn site, defused here. `None` outside live mode and on the FAST
+    /// crash-recovery boot arm.
+    ip_monitor_handle: Option<tokio::task::JoinHandle<()>>,
+    /// F5: the monitor's watch shutdown Sender — the previous
+    /// `std::mem::forget` pinned the channel open for the process lifetime.
+    /// Held here so the channel stays open while the lane lives; teardown /
+    /// Drop DROP it, and the monitor's `changed()` select arm exits on the
+    /// closed channel (graceful stop; the handle abort above is the floor).
+    ip_monitor_shutdown: Option<tokio::sync::watch::Sender<bool>>,
+    /// F13 (2026-07-08): the 30s liveness heartbeat watchdog
+    /// (`spawn_heartbeat_watchdog`, slow boot). Lane-owned — an INFINITE
+    /// loop pinning the dead lane's arc-swap token_handle; a detached copy
+    /// fired a false AUTH-GAP-01 "token handle is None" ERROR every 30s
+    /// forever after a runtime Dhan disable, one more copy per lane cycle.
+    /// Pre-construction coverage is a `PreLaneAbortGuard` at the spawn
+    /// site, defused here. `None` on the FAST arm (its twin is
+    /// process-lifetime by design).
+    heartbeat_watchdog_handle: Option<tokio::task::JoinHandle<()>>,
     /// Shared health registry — held so teardown/Drop can reset the token
     /// block to the honest deliberate-lane-off state (0 / false). `None`
     /// only on the FAST crash-recovery boot arm (no writer to reset for).
     health: Option<SharedHealthStatus>,
+    /// F14 (2026-07-08): the shared per-feed health registry — held so
+    /// teardown/Drop can publish the honest lane-off Dhan-connected state
+    /// (false) after aborting the pool watchdog (its sole writer);
+    /// otherwise `/api/feeds/health` freezes at the last live value after
+    /// a deliberate runtime disable. `None` only on the FAST arm.
+    feed_health: Option<std::sync::Arc<tickvault_common::feed_health::FeedHealthRegistry>>,
     // S4-T1b: shared pool handle + shutdown notifier. `ws_pool_arc` is None
     // when no WebSocket pool was spawned. `shutdown_notify` is fired before
     // the abort loop so the pool watchdog stops polling (no false-positive
@@ -9146,6 +9313,18 @@ impl Drop for DhanLaneRunHandles {
         if let Some(handle) = self.pool_watchdog_handle.as_ref() {
             handle.abort();
         }
+        // F5: abort the runtime IP monitor (its watch Sender drops with the
+        // struct, closing the channel — belt and braces). A survivor's stale
+        // IP baseline pages false CRITICAL GAP-NET-01 (and can HALT in live
+        // mode) after a legitimate IP change + lane restart.
+        if let Some(handle) = self.ip_monitor_handle.as_ref() {
+            handle.abort();
+        }
+        // F13: abort the 30s heartbeat watchdog — a survivor pins the dead
+        // lane's token_handle and fires false AUTH-GAP-01 pages forever.
+        if let Some(handle) = self.heartbeat_watchdog_handle.as_ref() {
+            handle.abort();
+        }
         // BUG-1: implicit teardown — signal the instance-lock heartbeat's
         // release (permit-based `notify_one`, sync + non-blocking, Drop-safe)
         // but do NOT abort its JoinHandle: aborting would kill the in-flight
@@ -9171,6 +9350,17 @@ impl Drop for DhanLaneRunHandles {
         if let Some(health) = self.health.as_ref() {
             health.set_token_remaining_secs(0);
             health.set_token_valid(false);
+            // F14 (2026-07-08): honest lane-off WS state — the just-aborted
+            // pool watchdog was the SOLE writer of this counter, so without
+            // this reset /health freezes at the last live value after a
+            // deliberate runtime disable. Sync atomic store — Drop-safe;
+            // idempotent after `teardown_dhan_lane_tasks`.
+            health.set_websocket_connections(0);
+        }
+        // F14: same honesty reset for the /api/feeds/health Dhan-connected
+        // slot (the pool watchdog was its sole writer too).
+        if let Some(feed_health) = self.feed_health.as_ref() {
+            feed_health.set_connected(tickvault_common::feed::Feed::Dhan, false);
         }
         // AG5-R1: honest lane-off gauge state — mirrors the /health reset
         // above on the Prometheus surface. Sync gauge stores — Drop-safe;
@@ -9413,6 +9603,46 @@ async fn teardown_dhan_lane_tasks(mut lane: DhanLaneRunHandles) {
     // in-flight release side-effect (its probe is a read-only SELECT 1).
     if let Some(handle) = lane.pool_watchdog_handle.take() {
         handle.abort();
+        // F14 (2026-07-08): bounded join BEFORE the honest lane-off reset
+        // below — the watchdog's tick body has awaits (its ≤2s QuestDB
+        // probe), so an in-flight iteration past its await point could
+        // otherwise complete its synchronous `set_websocket_connections` /
+        // `set_connected(Dhan, …)` stores AFTER the reset and freeze the
+        // OFF lane's surfaces at stale live values (same AG5-R2-3 race
+        // class as the gauge poller). Joining an aborted handle returns
+        // ~immediately (`JoinError::Cancelled`).
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(LANE_HEALTH_TASK_JOIN_TIMEOUT_SECS),
+            handle,
+        )
+        .await;
+    }
+    // F14: honest lane-off surfaces — the just-joined pool watchdog was the
+    // SOLE writer of both; without these resets /health's websocket count
+    // and /api/feeds/health's Dhan-connected flag freeze at the last live
+    // values after a deliberate runtime disable (false-OK, audit Rule 11).
+    if let Some(health) = lane.health.as_ref() {
+        health.set_websocket_connections(0);
+    }
+    if let Some(feed_health) = lane.feed_health.as_ref() {
+        feed_health.set_connected(tickvault_common::feed::Feed::Dhan, false);
+    }
+    // F5 (2026-07-08): stop the runtime IP monitor — drop its watch Sender
+    // (the monitor's `changed()` select arm exits on the closed channel),
+    // then abort the handle as the floor. A survivor's stale IP baseline
+    // fires false CRITICAL GAP-NET-01 pages (and can HALT in live mode)
+    // after a legitimate IP change + lane restart.
+    if let Some(shutdown_tx) = lane.ip_monitor_shutdown.take() {
+        drop(shutdown_tx);
+    }
+    if let Some(handle) = lane.ip_monitor_handle.take() {
+        handle.abort();
+    }
+    // F13 (2026-07-08): stop the 30s heartbeat watchdog — an immortal loop
+    // pinning the dead lane's token_handle that would fire a false
+    // AUTH-GAP-01 "token handle is None" ERROR every 30s forever.
+    if let Some(handle) = lane.heartbeat_watchdog_handle.take() {
+        handle.abort();
     }
     if let Some(pool) = lane.ws_pool_arc.clone() {
         let signalled = pool.request_graceful_shutdown();
@@ -9613,8 +9843,10 @@ const DHAN_LANE_TEARDOWN_DRAIN_TIMEOUT_SECS: u64 = 45;
 /// kept in sync when a new bounded await is added there (the const assert
 /// below fails the build if the outer budget no longer covers it).
 const DHAN_LANE_TEARDOWN_INTERNAL_WORST_CASE_SECS: u64 =
-    // step 0/1: token-health writer + gauge poller + renewal loop joins
-    3 * LANE_HEALTH_TASK_JOIN_TIMEOUT_SECS
+    // step 0/1: token-health writer + gauge poller + renewal loop joins,
+    // + (F14, 2026-07-08) the step-3 pool-watchdog join before the honest
+    // websocket/feed-health lane-off reset
+    4 * LANE_HEALTH_TASK_JOIN_TIMEOUT_SECS
     // step 3: graceful WS RequestCode-12 drain sleep
     + WS_GRACEFUL_DRAIN_SLEEP_SECS
     // step 3b: bounded supervise_pool drain
@@ -9799,13 +10031,16 @@ const TOKEN_HEALTH_WRITER_INTERVAL_SECS: u64 = 10;
 ///
 /// Two lock-free atomic stores every 10s on a cold-path task — not the tick
 /// hot path. `secs == 0` means no token / expired (per `seconds_until_expiry`),
-/// so `> 0` is the honest validity signal.
+/// so `> 0` is the honest local-validity leg; F15 ANDs in the profile-truth
+/// flag so a Dhan-KILLED token cannot read valid on /health.
 // TEST-EXEMPT: infinite 10s interval loop over live token-manager state; the
 // wiring (both setter calls, unconditional spawn site, teardown abort+reset)
-// is pinned by crates/api/tests/token_headroom_wired_guard.rs.
+// is pinned by crates/api/tests/token_headroom_wired_guard.rs and the pure
+// derivation by `test_token_health_writer_valid_honors_profile_truth`.
 fn spawn_token_health_writer(
     health: SharedHealthStatus,
     feed_runtime: std::sync::Arc<tickvault_api::feed_state::FeedRuntimeState>,
+    profile_valid: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(
@@ -9814,10 +10049,22 @@ fn spawn_token_health_writer(
         loop {
             interval.tick().await;
             let secs = gauge_token_headroom_secs(&feed_runtime);
+            let profile_ok = profile_valid.load(std::sync::atomic::Ordering::Acquire);
             health.set_token_remaining_secs(secs);
-            health.set_token_valid(secs > 0);
+            health.set_token_valid(token_health_writer_valid(secs, profile_ok));
         }
     })
+}
+
+/// F15 (2026-07-08). Pure. The /health `token_valid` derivation — mirrors
+/// the `tv_token_valid` gauge's AND composition (`token_health_gauge.rs`):
+/// valid iff the token has local headroom (`secs > 0` — strictly greater,
+/// fail-closed at the expiry instant) AND the mid-session watchdog's last
+/// `/v2/profile` check did not REALLY fail. Previously `/health` used
+/// `secs > 0` alone, so a Dhan-KILLED but locally-unexpired token read
+/// valid there for up to ~24h while `tv_token_valid` honestly read 0.0.
+fn token_health_writer_valid(secs: u64, profile_valid: bool) -> bool {
+    secs > 0 && profile_valid
 }
 
 /// Stable static label for the lane state (no allocation on the metric path).
@@ -10763,7 +11010,17 @@ async fn run_shutdown_fast(
             // R8-EDGE-2 / SEC-C2-1: the FAST arm's pool watchdog rides in so
             // the runloop teardown / H8 Drop floor aborts it.
             pool_watchdog_handle,
+            // F5/F13: the FAST arm spawns neither the runtime IP monitor
+            // (Step 5.5 is slow-lane only) nor a lane-owned heartbeat
+            // watchdog (its twin is process-lifetime by design) — nothing
+            // to lane-own here.
+            ip_monitor_handle: None,
+            ip_monitor_shutdown: None,
+            heartbeat_watchdog_handle: None,
             health: None,
+            // F14: no health registry on the FAST arm ⇒ no per-feed
+            // registry to reset either (process exits with the runloop).
+            feed_health: None,
             ws_pool_arc,
             shutdown_notify,
             // H7: BOOT-ON (FAST-boot) handles are not parked — the watchdog
@@ -10885,6 +11142,34 @@ fn compute_tick_freshness(silent_count: usize, universe_size: usize) -> f64 {
 /// restarts.
 static SLO_PUBLISHER_SUPERVISOR_SPAWNED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
+
+/// F4 (2026-07-08): once-per-process spawn latch for the three market-open
+/// ONE-SHOT schedulers (09:14 readiness / 09:15:30 streaming heartbeat /
+/// 09:16 self-test). They are detached one-shots by design (self-exit after
+/// firing), so lane ownership is the wrong tool — but a per-lane-cycle
+/// spawn accumulated N pending copies across D2b Dhan enable/disable cycles
+/// before the bell (N duplicate verdict Telegrams per trigger). First
+/// `start_dhan_lane` invocation wins; later cold-starts log INFO and skip.
+/// The companion FIRE-TIME gate ([`market_open_fire_gate_dhan_enabled`])
+/// covers the disable-after-spawn case.
+static MARKET_OPEN_ONE_SHOTS_SPAWNED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// F4/F13 (2026-07-08): once-per-process spawn latch for the FirstSeenSet
+/// IST-midnight reset task — an INFINITE loop over the PROCESS-GLOBAL
+/// singleton that a per-lane-cycle spawn leaked once per D2b cold-start.
+static FIRST_SEEN_RESET_SPAWNED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// F4 (2026-07-08): fire-time gate for the market-open one-shot schedulers —
+/// reads the SAME `FeedRuntimeState::dhan` atomic the WS read loop and the
+/// pool watchdog consult. A pending one-shot that outlives a deliberate
+/// runtime Dhan disable must NOT fire a verdict off the dead lane's frozen
+/// health state (FALSE High MarketOpenStreamingFailed / FALSE Critical
+/// SELFTEST-02 at the bell). O(1) relaxed load on a cold once-a-day path.
+fn market_open_fire_gate_dhan_enabled(dhan_enabled: &std::sync::atomic::AtomicBool) -> bool {
+    dhan_enabled.load(std::sync::atomic::Ordering::Relaxed)
+}
 
 /// Bounded backoff between SLO publisher respawns (SLO-03). Mirrors the
 /// OOM-monitor / disk-watcher supervisor cadence: long enough to avoid a hot
@@ -12373,7 +12658,7 @@ mod tests {
         // bumps the disable-aborted counter + stays Running.
         let src = include_str!("main.rs");
         assert!(
-            src.contains("if !ctx.feed_runtime.can_disable_dhan() {"),
+            src.contains("if !ctx.feed_runtime.can_disable_dhan() \u{7b}"),
             "H5: the runtime Stop must re-assert can_disable_dhan() before teardown"
         );
         assert!(
@@ -12611,7 +12896,11 @@ mod tests {
             midnight_rollover_handle: None,
             prev_oi_refresh_handle: None,
             pool_watchdog_handle: None,
+            ip_monitor_handle: None,
+            ip_monitor_shutdown: None,
+            heartbeat_watchdog_handle: None,
             health: None,
+            feed_health: None,
             ws_pool_arc: None,
             shutdown_notify: std::sync::Arc::new(tokio::sync::Notify::new()),
             lane_halt_notify: None,
@@ -12647,7 +12936,10 @@ mod tests {
             .find("async fn teardown_dhan_lane_tasks(")
             .expect("teardown_dhan_lane_tasks must exist");
         let teardown_end = src[teardown_start..]
-            .find("\n}\n")
+            // \u{7d} is a brace-balanced escape for the closing-brace char: the
+            // banned-pattern hook counts raw braces (incl. string literals) to
+            // skip the test module; a bare closing brace in a literal derails it.
+            .find("\n\u{7d}\n")
             .map(|o| teardown_start + o)
             .expect("teardown_dhan_lane_tasks must have a body end");
         let body = &src[teardown_start..teardown_end];
@@ -12698,11 +12990,11 @@ mod tests {
         let src = include_str!("main.rs");
         // The early feeds block (seeding the FSM) must NOT mark the flags.
         let feeds_block_start = src
-            .find("if feeds.dhan_enabled {")
+            .find("if feeds.dhan_enabled \u{7b}")
             .expect("the early dhan_enabled boot block must exist");
         let feeds_block_end = feeds_block_start
             + src[feeds_block_start..]
-                .find("\n    }\n")
+                .find("\n    \u{7d}\n")
                 .expect("the early dhan_enabled boot block must close");
         let feeds_block = &src[feeds_block_start..feeds_block_end];
         assert!(
@@ -12784,7 +13076,10 @@ mod tests {
             .find("fn gauge_token_headroom_secs(")
             .expect("gauge_token_headroom_secs must exist");
         let helper_end = src[helper_start..]
-            .find("\n}\n")
+            // \u{7d} is a brace-balanced escape for the closing-brace char: the
+            // banned-pattern hook counts raw braces (incl. string literals) to
+            // skip the test module; a bare closing brace in a literal derails it.
+            .find("\n\u{7d}\n")
             .map(|rel| helper_start + rel)
             .expect("gauge_token_headroom_secs must have a body");
         let helper = &src[helper_start..helper_end];
@@ -12801,11 +13096,13 @@ mod tests {
 
         // The global OnceLock must be read ONLY inside the helper's fallback —
         // never again in the closure bodies (which would re-introduce the bug).
-        // Scope the count to the PRODUCTION region (before `#[cfg(test)]`) so this
-        // test's own string literals do not inflate it.
-        let prod_region = &src[..src
-            .find("#[cfg(test)]")
-            .expect("main.rs must have a #[cfg(test)] module")];
+        // Scope the count to the PRODUCTION region via the shared
+        // `source_scan::production_region` helper (F8, 2026-07-08): unlike
+        // the old before-first-`#[cfg(test)]` prefix, it also covers the
+        // production code AFTER the test module, so a direct global read
+        // landing there can no longer hide from this exactly-once count.
+        let prod_region = tickvault_common::source_scan::production_region(src)
+            .expect("main.rs must have a #[cfg(test)]-gated mod tests module");
         let direct_global_reads = prod_region.matches("global_token_manager()").count();
         assert_eq!(
             direct_global_reads, 1,
@@ -12886,6 +13183,171 @@ mod tests {
         assert_eq!(
             paired, marker_count,
             "every lane-Off marker must be positionally paired with a clear"
+        );
+    }
+
+    /// F10 / F2 (2026-07-08): behavioural pin of the
+    /// `InstanceLockHeartbeatGuard` defuse semantics. `into_parts()` must
+    /// TAKE (not clone) the shutdown Notify out of the guard — a
+    /// `.take()`→`.clone()` mutation would leave the husk armed, so its
+    /// Drop right after the lane construction would `notify_one()` the
+    /// heartbeat's shutdown and RELEASE the SSM dual-instance lock while
+    /// the lane is RUNNING (a peer could then acquire it → real
+    /// dual-session). Conversely, a drop WITHOUT defuse (cancel-mid-Starting
+    /// / Err return) MUST notify so the zombie heartbeat releases.
+    #[tokio::test]
+    async fn instance_lock_heartbeat_guard_defuse_and_drop_semantics() {
+        use std::time::Duration;
+        // (a) Drop WITHOUT defuse → the shutdown gets a stored permit.
+        let shutdown = std::sync::Arc::new(tokio::sync::Notify::new());
+        let handle = tokio::spawn(async {});
+        let guard =
+            super::InstanceLockHeartbeatGuard::new(handle, std::sync::Arc::clone(&shutdown));
+        drop(guard);
+        tokio::time::timeout(Duration::from_millis(200), shutdown.notified())
+            .await
+            .expect(
+                "dropping an un-defused guard must notify_one() the heartbeat \
+                 shutdown (permit-storing graceful SSM release — R8-EDGE-1)",
+            );
+
+        // (b) into_parts() DEFUSES: the husk's Drop must NOT notify.
+        let shutdown2 = std::sync::Arc::new(tokio::sync::Notify::new());
+        let handle2 = tokio::spawn(async {});
+        let guard2 =
+            super::InstanceLockHeartbeatGuard::new(handle2, std::sync::Arc::clone(&shutdown2));
+        let (h, n) = guard2.into_parts(); // husk drops here
+        assert!(
+            h.is_some() && n.is_some(),
+            "into_parts must hand out BOTH the heartbeat handle and its \
+             shutdown Notify for the lane struct's BUG-1 fields"
+        );
+        let stray_permit =
+            tokio::time::timeout(Duration::from_millis(100), shutdown2.notified()).await;
+        assert!(
+            stray_permit.is_err(),
+            "into_parts (defuse) must NOT notify the heartbeat shutdown — a \
+             clone-instead-of-take mutation in into_parts would release the \
+             SSM dual-instance lock while the lane is RUNNING (F10)"
+        );
+        if let Some(h) = h {
+            h.abort();
+        }
+    }
+
+    /// F15 (2026-07-08): the /health token_valid derivation must honor the
+    /// profile-truth flag — a Dhan-KILLED (profile-invalid) but
+    /// locally-unexpired token must read INVALID on /health, mirroring
+    /// tv_token_valid. Kills the `secs > 0`-only regression.
+    #[test]
+    fn test_token_health_writer_valid_honors_profile_truth() {
+        assert!(super::token_health_writer_valid(86_400, true));
+        assert!(
+            !super::token_health_writer_valid(86_400, false),
+            "a Dhan-KILLED token (profile flag false) with local headroom \
+             must read INVALID on /health (F15)"
+        );
+        assert!(
+            !super::token_health_writer_valid(0, true),
+            "the expiry instant is invalid — strictly-greater, fail-closed"
+        );
+        assert!(!super::token_health_writer_valid(0, false));
+        assert!(super::token_health_writer_valid(1, true));
+    }
+
+    /// F4 (2026-07-08): the market-open fire-time gate reads the live Dhan
+    /// flag — never a constant.
+    #[test]
+    fn test_market_open_fire_gate_reads_dhan_flag() {
+        let flag = std::sync::atomic::AtomicBool::new(true);
+        assert!(super::market_open_fire_gate_dhan_enabled(&flag));
+        flag.store(false, std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            !super::market_open_fire_gate_dhan_enabled(&flag),
+            "a disabled Dhan flag must gate the one-shot verdict off (F4)"
+        );
+    }
+
+    /// F17 + F9 (2026-07-08): COMMENT-STRIPPED source-order ratchet for the
+    /// teardown's abort → bounded-join → honest-reset chain. The teardown
+    /// body carries doc/comment mentions of the join-timeout const, so a
+    /// raw `contains`/count scan was satisfiable by comments alone —
+    /// reverting any bounded join to a plain abort stayed green. Stripping
+    /// comments first (shared `source_scan` helper) makes each count a CODE
+    /// count.
+    #[test]
+    fn ratchet_teardown_abort_join_reset_ordering_comment_stripped() {
+        let src = include_str!("main.rs");
+        let stripped = tickvault_common::source_scan::strip_rust_comments(src);
+        let fn_start = stripped
+            .find("async fn teardown_dhan_lane_tasks(")
+            .expect("teardown_dhan_lane_tasks must exist");
+        let fn_end = stripped[fn_start..]
+            // \u{7d} is a brace-balanced escape for the closing-brace char: the
+            // banned-pattern hook counts raw braces (incl. string literals) to
+            // skip the test module; a bare closing brace in a literal derails it.
+            .find("\n\u{7d}\n")
+            .map(|o| fn_start + o)
+            .expect("teardown_dhan_lane_tasks must have a body end");
+        let flat: String = stripped[fn_start..fn_end]
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        // (a) exactly FOUR bounded joins on the shared 5s bound, in CODE
+        // (comments stripped): token-health writer, gauge poller, renewal
+        // loop (AG5-R2-3 / R3-1), pool watchdog (F14).
+        let join_needle = "from_secs(LANE_HEALTH_TASK_JOIN_TIMEOUT_SECS)";
+        let join_offsets: Vec<usize> = {
+            let mut offs = Vec::new();
+            let mut from = 0usize;
+            while let Some(rel) = flat[from..].find(join_needle) {
+                offs.push(from + rel);
+                from += rel + join_needle.len();
+            }
+            offs
+        };
+        assert_eq!(
+            join_offsets.len(),
+            4,
+            "teardown_dhan_lane_tasks must bound-join exactly 4 handles on \
+             LANE_HEALTH_TASK_JOIN_TIMEOUT_SECS (token-health writer, gauge \
+             poller, renewal loop, pool watchdog) — a comment mention can \
+             no longer stand in for a reverted join (F9/F17); found {}",
+            join_offsets.len()
+        );
+        // (b) ordering: the three token-side joins precede the honest
+        // 0/0.0 gauge reset; the pool-watchdog join follows it but precedes
+        // the honest websocket/feed-health reset.
+        let gauge_reset = flat
+            .find("gauge!(\"tv_token_remaining_seconds\").set(0.0)")
+            .expect("teardown must publish the honest 0.0 gauge reset");
+        assert!(
+            join_offsets[2] < gauge_reset,
+            "all three token-side bounded joins must PRECEDE the honest \
+             gauge reset — a late writer iteration could otherwise \
+             republish stale values after it (AG5-R2-3/R3-1)"
+        );
+        assert!(
+            join_offsets[3] > gauge_reset,
+            "the 4th bounded join is the step-3 pool-watchdog join and \
+             belongs AFTER the token-block reset (teardown step order)"
+        );
+        let ws_reset = flat
+            .find("health.set_websocket_connections(0)")
+            .expect("teardown must publish the honest lane-off ws count (F14)");
+        assert!(
+            join_offsets[3] < ws_reset,
+            "the pool-watchdog bounded join must PRECEDE the honest \
+             websocket/feed-health reset — an in-flight watchdog tick could \
+             otherwise rewrite the surfaces after the reset (F14)"
+        );
+        // (c) budget honesty (F16): the compile-time worst-case sum counts
+        // FOUR joins.
+        assert!(
+            super::DHAN_LANE_TEARDOWN_INTERNAL_WORST_CASE_SECS
+                >= 4 * super::LANE_HEALTH_TASK_JOIN_TIMEOUT_SECS,
+            "the teardown internal worst-case sum must account for all 4 \
+             bounded joins (F14/F16)"
         );
     }
 }

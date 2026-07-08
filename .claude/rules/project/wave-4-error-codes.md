@@ -216,7 +216,15 @@ self-remediation; the operator inspects, never manually re-mints first).
 (`crates/core/src/auth/mid_session_watchdog.rs`) observed
 `CONSECUTIVE_INVALID_REMINT_THRESHOLD` (= 2) consecutive REAL `/v2/profile`
 auth failures (~30 min of a Dhan-rejected token; transient network blips
-neither escalate nor clear the counter). The pure `decide_remint` core then
+neither escalate nor clear the counter). **Classification update (F12,
+2026-07-08):** a SEND-LEG failure (the request never got a response) whose
+error text matches NO known transient needle now classifies
+`RestSurfaceDegraded` — it pages via the pre-existing rising-edge CRITICAL
+but NEVER walks the counter toward the destructive mint (previously it fell
+through to `RealAuthFail`, so two novel reqwest/proxy wordings ~30 min
+apart could mint against a healthy token). Only status-proven 401/403,
+dataPlan/segment invalidation, token expiry, and unknown NON-send-leg
+shapes count as REAL. The pure `decide_remint` core then
 fires exactly ONE forced re-mint per failing episode through the EXISTING
 `TokenManager::force_renewal()` machinery (RenewToken-then-fallback-
 generateAccessToken), honoring:

@@ -1418,19 +1418,18 @@ mod tests {
         // the 2026-07-06 AGGREGATOR-SEAL-01 ratchet hardening closed —
         // wave-6-error-codes.md §1(c)).
         //
-        // R7-CPLX-1 fix (2026-07-07): split at the test MODULE (`mod tests`),
-        // not the first raw `#[cfg(test)]` occurrence — mid_session_watchdog.rs
-        // carries item-level `#[cfg(test)]` attributes on test-only wrappers
-        // (e.g. `classify_check_result`) BEFORE the real test module, so the
-        // old split truncated the scanned "production region" to ~1/3 of the
-        // file, excluding the production classifiers + decision core
-        // (`classify_cycle` / `decide_remint` / `apply_remint_decision`).
-        let tests_mod_off = watchdog.find("\nmod tests {").expect(
-            "mid_session_watchdog.rs must contain a top-level `mod tests` \
-             module — without it this production-region split is scanning \
-             the whole file (vacuous)",
+        // R7-CPLX-1 fix (2026-07-07) + F8 hardening (2026-07-08): split via
+        // the SHARED `source_scan::production_region` helper — robust to the
+        // item-level `#[cfg(test)]` attributes on test-only wrappers (e.g.
+        // `classify_check_result`) BEFORE the real test module (the old
+        // first-literal split truncated the scanned region to ~1/3 of the
+        // file, excluding the production classifiers + decision core), AND
+        // to any production code that may ever land AFTER the test module.
+        let production = tickvault_common::source_scan::production_region(&watchdog).expect(
+            "mid_session_watchdog.rs must contain a #[cfg(test)]-gated \
+             top-level `mod tests` module — without it this \
+             production-region split is scanning the whole file (vacuous)",
         );
-        let production = &watchdog[..tests_mod_off];
         // Split-boundary self-checks: the region must extend past the inline
         // #[cfg(test)] items to the LAST production fns (the decision core).
         for tail_fn in ["fn decide_remint(", "fn apply_remint_decision("] {
@@ -1480,15 +1479,13 @@ mod tests {
              `apply_remint_decision` — re-calling decide_remint would let \
              the latch and the action diverge."
         );
-        // Non-vacuity self-check (R7-CPLX-1): the `mod tests` block we split
-        // at must itself be #[cfg(test)]-gated (attribute within the few
-        // lines immediately above the split point) — i.e. the boundary
-        // really is the production|tests seam.
-        let preamble_start = tests_mod_off.saturating_sub(300);
+        // Non-vacuity self-check (R7-CPLX-1 / F8): the shared helper only
+        // returns Some when it found a #[cfg(test)]-gated `mod tests` block
+        // to excise; assert the excision actually happened.
         assert!(
-            watchdog[preamble_start..tests_mod_off].contains("#[cfg(test)]"),
-            "the `mod tests` block in mid_session_watchdog.rs must be gated \
-             by a #[cfg(test)] attribute immediately above it — the \
+            !production.contains("\nmod tests {"),
+            "mid_session_watchdog.rs production region must have its \
+             #[cfg(test)] mod tests block excised (blanked) — the \
              production-region split boundary is no longer the test module"
         );
     }
@@ -1667,9 +1664,10 @@ mod tests {
         // asserted the split boundary is the #[cfg(test)]-gated `mod tests`
         // seam (R7-CPLX-1 idiom hardening).
         assert!(
-            production.len() < main_rs.len(),
-            "main.rs production region must be a strict prefix of the file — \
-             the split found no test module (vacuous whole-file scan)"
+            !production.contains("\nmod tests {"),
+            "main.rs production region must have its #[cfg(test)] mod tests \
+             block excised (blanked) — the split found no test module \
+             (vacuous whole-file scan)"
         );
     }
 
@@ -1746,9 +1744,10 @@ mod tests {
              gauge poller + token sweep (COV-R4-1)"
         );
         assert!(
-            production.len() < main_rs.len(),
-            "main.rs production region must be a strict prefix of the file — \
-             the split found no test module (vacuous whole-file scan)"
+            !production.contains("\nmod tests {"),
+            "main.rs production region must have its #[cfg(test)] mod tests \
+             block excised (blanked) — the split found no test module \
+             (vacuous whole-file scan)"
         );
     }
 
@@ -1763,19 +1762,21 @@ mod tests {
     /// `mod tests` block is robust to inline #[cfg(test)] items appended to
     /// the production body; the preamble check asserts the block we split at
     /// really is the #[cfg(test)]-gated test module.
-    fn main_rs_production_region(main_rs: &str) -> &str {
-        let tests_mod_off = main_rs.find("\nmod tests {").expect(
-            "main.rs must contain a top-level `mod tests` module — without \
-             it these production-region splits scan the whole file (vacuous)",
-        );
-        let preamble_start = tests_mod_off.saturating_sub(300);
-        assert!(
-            main_rs[preamble_start..tests_mod_off].contains("#[cfg(test)]"),
-            "the `mod tests` block in main.rs must be gated by a #[cfg(test)] \
-             attribute immediately above it — the production-region split \
-             boundary is no longer the test module"
-        );
-        &main_rs[..tests_mod_off]
+    /// F8 hardening (2026-07-08): delegates to the SHARED
+    /// `tickvault_common::source_scan::production_region` — which (a) splits
+    /// at the #[cfg(test)]-gated `mod tests` MODULE via CODE-classified brace
+    /// matching (a string/comment mention of the seam cannot derail it), and
+    /// (b) KEEPS the ~460 lines of production code AFTER main.rs's test
+    /// module (`spawn_post_market_tasks`, `spawn_daily_tick_conservation_task`,
+    /// …) that the old prefix-only split was blind to. The excised test
+    /// module is blanked with spaces (newlines kept) so byte-order
+    /// assertions against the region stay meaningful.
+    fn main_rs_production_region(main_rs: &str) -> String {
+        tickvault_common::source_scan::production_region(main_rs).expect(
+            "main.rs must contain a #[cfg(test)]-gated top-level `mod tests` \
+             module — without it these production-region splits would scan \
+             the whole file (vacuous)",
+        )
     }
 
     /// COV-R7-1 / R7-EDGE-1 (2026-07-07): source-order ratchet for the
@@ -2085,6 +2086,164 @@ mod tests {
             "InstanceLockHeartbeatGuard::drop must NEVER abort() the \
              heartbeat handle — an abort kills the in-flight SSM \
              DeleteParameter release (the BUG-1 contract)"
+        );
+    }
+
+    /// Whitespace-collapsed view for formatting-proof code-needle counts.
+    fn no_ws(s: &str) -> String {
+        s.chars().filter(|c| !c.is_whitespace()).collect()
+    }
+
+    /// F4 (2026-07-08): the three market-open ONE-SHOT schedulers (09:14
+    /// readiness / 09:15:30 streaming heartbeat / 09:16 self-test) MUST be
+    /// (a) once-per-process latched (a per-lane-cycle spawn accumulates N
+    /// pending copies across D2b enable/disable cycles → N duplicate
+    /// verdicts per trigger) and (b) fire-time gated on the live Dhan flag
+    /// (a pending one-shot outliving a deliberate runtime disable fires
+    /// FALSE High MarketOpenStreamingFailed / Critical SELFTEST-02 pages
+    /// off the dead pool's frozen state). Also pins the FirstSeenSet
+    /// midnight-reset once-per-process latch (F13 — an infinite loop over a
+    /// process-global singleton).
+    ///
+    /// COMMENT-STRIPPED (F9 class): a comment mention of any needle can
+    /// never satisfy these counts — the previous latch/gate fixes were
+    /// reverted-silently-green precisely because nothing ratcheted them.
+    #[test]
+    fn test_market_open_one_shots_latched_and_gated() {
+        let main_rs = std::fs::read_to_string("../app/src/main.rs")
+            .or_else(|_| std::fs::read_to_string("crates/app/src/main.rs"))
+            .expect("main.rs must be readable");
+        let production_raw = main_rs_production_region(&main_rs);
+        let production = tickvault_common::source_scan::strip_rust_comments(&production_raw);
+        let flat = no_ws(&production);
+        // (a) exactly ONE latch swap site for the market-open one-shots…
+        assert_eq!(
+            flat.matches("MARKET_OPEN_ONE_SHOTS_SPAWNED.swap(true")
+                .count(),
+            1,
+            "main.rs (production region, comment-stripped) must consult the \
+             MARKET_OPEN_ONE_SHOTS_SPAWNED once-per-process latch exactly \
+             once — removing it re-opens the N-duplicate-verdicts leak (F4)"
+        );
+        // …and one for the FirstSeenSet midnight reset.
+        assert_eq!(
+            flat.matches("FIRST_SEEN_RESET_SPAWNED.swap(true").count(),
+            1,
+            "main.rs (production region, comment-stripped) must consult the \
+             FIRST_SEEN_RESET_SPAWNED once-per-process latch exactly once — \
+             removing it leaks one immortal midnight-reset loop per lane \
+             cycle (F4/F13)"
+        );
+        // (b) all THREE one-shot spawn blocks are latch-guarded (the negated
+        // `if !…` info-log arm does not match this needle).
+        assert!(
+            flat.matches("ifmarket_open_one_shots_first_spawn").count() >= 3,
+            "all three market-open one-shot spawn blocks must be guarded by \
+             `if market_open_one_shots_first_spawn` (F4)"
+        );
+        // (c) all THREE tasks re-check the Dhan flag AT FIRE TIME through
+        // the shared pure gate (call-shaped needle — the fn definition has
+        // a different shape).
+        assert_eq!(
+            flat.matches("!market_open_fire_gate_dhan_enabled(&")
+                .count(),
+            3,
+            "each of the three market-open one-shots must consult \
+             market_open_fire_gate_dhan_enabled(&…) after its sleep — a \
+             pending one-shot outliving a runtime Dhan disable must not \
+             fire a verdict off dead state (F4)"
+        );
+        // (d) the gate actually reads the atomic (not a hardcoded true).
+        let gate_off = production
+            .find("fn market_open_fire_gate_dhan_enabled(")
+            .expect("the fire-time gate fn must exist in main.rs");
+        assert!(
+            production[gate_off..gate_off + 400].contains("dhan_enabled.load("),
+            "market_open_fire_gate_dhan_enabled must load the shared Dhan \
+             atomic — a constant-true stub silently disables the gate (F4)"
+        );
+    }
+
+    /// F5 / F13 / F14 (2026-07-08): the runtime IP monitor + the 30s
+    /// heartbeat watchdog are LANE-OWNED (guard-wrapped across the
+    /// pre-lane awaits, defused into DhanLaneRunHandles, taken + stopped by
+    /// teardown, aborted by the H8 Drop floor), and the teardown publishes
+    /// the honest lane-off /health + feed-health surfaces after bounded-
+    /// joining the pool watchdog (their sole writer). COMMENT-STRIPPED so
+    /// comment mentions can never satisfy the scan.
+    #[test]
+    fn test_ip_monitor_and_heartbeat_watchdog_are_lane_owned() {
+        let main_rs = std::fs::read_to_string("../app/src/main.rs")
+            .or_else(|_| std::fs::read_to_string("crates/app/src/main.rs"))
+            .expect("main.rs must be readable");
+        let production_raw = main_rs_production_region(&main_rs);
+        let production = tickvault_common::source_scan::strip_rust_comments(&production_raw);
+        let flat = no_ws(&production);
+        // The zombie-maker must never come back: the watch Sender is HELD
+        // (lane-owned), never mem::forget-pinned for the process lifetime.
+        assert!(
+            !flat.contains("mem::forget(ip_monitor_shutdown_tx)"),
+            "main.rs must NOT mem::forget the IP monitor's shutdown Sender — \
+             that pinned a zombie monitor (stale IP baseline → false CRITICAL \
+             GAP-NET-01 / live-mode HALT) per lane cycle (F5)"
+        );
+        // Guard wraps at the spawn sites…
+        assert!(
+            flat.contains("PreLaneAbortGuard::new(vec![ip_monitor_handle])"),
+            "the IP monitor handle must ride a PreLaneAbortGuard across the \
+             pre-lane awaits (F5)"
+        );
+        assert!(
+            flat.contains("PreLaneAbortGuard::new(vec![spawn_heartbeat_watchdog("),
+            "the slow-boot heartbeat watchdog must ride a PreLaneAbortGuard \
+             — a dropped bare handle detaches an immortal 30s loop firing \
+             false AUTH-GAP-01 pages off the dead lane's token_handle (F13)"
+        );
+        // …defused into the lane struct…
+        assert!(
+            flat.contains("ip_monitor_handle:ip_monitor_guard.into_inner().pop()"),
+            "the lane construction must defuse the IP-monitor guard into \
+             DhanLaneRunHandles.ip_monitor_handle (F5)"
+        );
+        assert!(
+            flat.contains("heartbeat_watchdog_handle:heartbeat_watchdog_guard.into_inner().pop()"),
+            "the lane construction must defuse the heartbeat-watchdog guard \
+             into DhanLaneRunHandles.heartbeat_watchdog_handle (F13)"
+        );
+        // …stopped by teardown (Sender dropped + handles aborted)…
+        for needle in [
+            "lane.ip_monitor_shutdown.take()",
+            "lane.ip_monitor_handle.take()",
+            "lane.heartbeat_watchdog_handle.take()",
+        ] {
+            assert!(
+                flat.contains(needle),
+                "teardown_dhan_lane_tasks must take + stop `{needle}` (F5/F13)"
+            );
+        }
+        // …and floored by the H8 Drop impl.
+        for needle in [
+            "self.ip_monitor_handle.as_ref()",
+            "self.heartbeat_watchdog_handle.as_ref()",
+        ] {
+            assert!(
+                flat.contains(needle),
+                "DhanLaneRunHandles::drop must abort `{needle}` (F5/F13)"
+            );
+        }
+        // F14: after bounded-joining the pool watchdog, teardown publishes
+        // the honest lane-off surfaces its death would otherwise freeze.
+        assert!(
+            flat.contains("health.set_websocket_connections(0)"),
+            "teardown must reset /health websocket_connections to 0 after \
+             aborting its sole writer (the pool watchdog) — otherwise the \
+             count freezes at the last live value after a deliberate \
+             runtime disable (F14)"
+        );
+        assert!(
+            flat.contains("feed_health.set_connected(tickvault_common::feed::Feed::Dhan,false)"),
+            "teardown must reset the feed-health Dhan-connected slot to \
+             false after aborting its sole writer (F14)"
         );
     }
 }

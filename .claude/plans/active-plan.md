@@ -248,3 +248,34 @@ scrapeable only — nothing downstream depends on them yet.
       — impl: `crates/core/src/auth/secret_manager.rs` tests module (production-region scan)
   - Files: crates/core/src/auth/secret_manager.rs
   - Tests: test_mid_session_remint_trigger_call_site_exists, test_token_health_gauge_poller_wired_into_main
+- [x] Re-applied continuation-review fixes (2026-07-08, adjudicated findings — disk-rollback
+      recovery). F4: market-open one-shots (09:14/09:15:30/09:16) once-per-process latched
+      (`MARKET_OPEN_ONE_SHOTS_SPAWNED`) + fire-time dhan-enabled gates
+      (`market_open_fire_gate_dhan_enabled`) + FirstSeenSet midnight-reset latch
+      (`FIRST_SEEN_RESET_SPAWNED`). F5: runtime IP monitor lane-owned (mem::forget removed;
+      guard-wrapped, defused into `DhanLaneRunHandles.ip_monitor_handle/_shutdown`, stopped by
+      teardown/Drop). F12: needle-miss SEND-LEG profile failures classify RestSurfaceDegraded
+      (never walk the mint counter). F13: slow-boot heartbeat watchdog lane-owned
+      (`heartbeat_watchdog_handle`). F14: teardown bounded-joins the pool watchdog then publishes
+      honest lane-off `/health` ws count 0 + feed-health Dhan disconnected (Drop mirrors);
+      teardown budget const updated (4 joins, 42s ≤ 45s). F15: `/health token_valid` honors the
+      profile-truth flag via pure `token_health_writer_valid`. F8: ONE shared comment-aware
+      production-region helper (`tickvault_common::source_scan`) used by all region ratchets
+      (covers inline #[cfg(test)] attrs, doc-comment mentions, AND main.rs's trailing production
+      code after `mod tests`). F9/F17: comment-stripped teardown abort→join→reset ordering
+      ratchet. F10: InstanceLockHeartbeatGuard defuse semantics behaviourally tested. F19:
+      cancel-cleanup comments enumerate the REAL residual detached tasks.
+  - Files: crates/common/src/source_scan.rs, crates/common/src/lib.rs,
+    crates/core/src/auth/mid_session_watchdog.rs, crates/core/src/auth/secret_manager.rs,
+    crates/app/src/main.rs, crates/api/tests/token_headroom_wired_guard.rs,
+    .claude/rules/project/wave-4-error-codes.md
+  - Tests: test_market_open_one_shots_latched_and_gated,
+    test_ip_monitor_and_heartbeat_watchdog_are_lane_owned,
+    cycle_outcome_send_leg_without_transient_needle_is_rest_surface_degraded,
+    send_leg_needle_miss_two_cycles_never_reach_remint_threshold,
+    instance_lock_heartbeat_guard_defuse_and_drop_semantics,
+    test_token_health_writer_valid_honors_profile_truth,
+    test_market_open_fire_gate_reads_dhan_flag,
+    ratchet_teardown_abort_join_reset_ordering_comment_stripped,
+    production_region_keeps_trailing_code_after_mod_tests,
+    strips_line_and_doc_comments_but_keeps_strings
