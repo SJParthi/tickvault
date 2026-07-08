@@ -1,9 +1,11 @@
 # App-level CloudWatch alarms — Z+ L2 VERIFY layer.
 #
 # The 5 alarms in alarms.tf cover infrastructure (EC2 status, CPU, EBS,
-# network). These 12 alarms cover application signals: WebSocket health,
-# QuestDB connectivity, token lifecycle, tick freshness, order rejection,
-# aggregator liveness, backpressure, clock drift, composite SLO score.
+# network). The 21 alarms in THIS file cover application signals: WebSocket
+# health, QuestDB connectivity, token lifecycle, tick freshness, order
+# rejection, aggregator liveness, backpressure, clock drift, composite SLO
+# score. 3 more silent-feed alarms live in silent-feed-alarms.tf
+# (2026-07-06 incident hardening).
 #
 # Charter authority: operator-charter-forever.md §C row "100% monitoring"
 # + §F "Severity::Critical → Telegram". Without these the operator only
@@ -21,10 +23,11 @@
 #                         -> Operator's phone
 #
 # Filter is configured in user-data.sh.tftpl::amazon-cloudwatch-agent.json
-# emf_processor block — keeps custom-metric cost capped (24 selected
-# metrics × ~$0.30 = $7.20/mo ≈ ₹612/mo absolute, $4.20/mo above the
-# 10-free-metric tier — vs. ~₹4500/mo for an unfiltered 150-metric scrape;
-# the 24-name count is pinned by cloudwatch_app_alarms_wiring.rs).
+# emf_processor block — keeps custom-metric cost capped (28 selected
+# series × ~$0.30 ≈ $8.40/mo absolute, $5.40/mo above the 10-free-metric
+# tier — vs. ~₹4500/mo for an unfiltered 150-metric scrape; the 26-name
+# MAIN EMF list is pinned by cloudwatch_app_alarms_wiring.rs, and the two
+# [host,feed] boundary-catchup declarations bring the series count to 28).
 # 2026-07-06 groww feed-down alerting: +3 selected metrics
 # (tv_groww_ws_active, tv_feed_last_tick_age_seconds,
 # tv_feed_sidecar_stall_restart_total) ≈ +$0.90/mo, +2 alarms ≈ +$0.20/mo.
@@ -36,10 +39,12 @@
 #   - Post-PR (historical): 18 alarms, 12 custom metrics.
 #     Overage then: 8 alarms × $0.10 = $0.80/mo + 2 custom metrics × $0.30
 #     = $0.60/mo ≈ ₹120/mo extra.
-#   - Current (2026-07-06): 20 app alarms, 24 selected custom metrics.
-#     Overage now: alarms ≈ $1.50/mo + metrics (24 − 10 free) × $0.30 =
-#     $4.20/mo ⇒ ~$5.70/mo ≈ ₹485/mo total. Operator MUST acknowledge
-#     before terraform apply.
+#   - Current (2026-07-08, silent-feed hardening): 21 app alarms in THIS
+#     file + 3 in silent-feed-alarms.tf; 28 selected custom-metric series.
+#     Overage now: alarms ≈ $1.80/mo + metrics (28 − 10 free) × $0.30 =
+#     $5.40/mo ⇒ ~$7.20/mo ≈ ₹610/mo total (matches the
+#     app_cloudwatch_alarms output below + aws-budget.md's 2026-07-06
+#     note). Operator MUST acknowledge before terraform apply.
 
 locals {
   # All alarms publish to the same SNS topic. Single source of truth so

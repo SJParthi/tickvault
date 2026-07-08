@@ -363,8 +363,9 @@ Total cost ~$1.20/mo — dated header comment + aws-budget.md note.
    exported per-feed Sum(5m) distribution; ratchet with a dated note if the
    healthy floor approaches 2000.
 4. **M-of-N deviation from literal "sustained N×M" wording** — Deliberate:
-   strict-consecutive evaluation on the oscillating incident data (125
-   crossings, 24/26/24 flapping) would never latch and reproduces the miss
+   strict-consecutive evaluation on oscillating data (the incident logged
+   125 SLO-band crossings, band 29-67 silent/min; a threshold-adjacent
+   value flapping 39/41/39) would never latch and reproduces the miss
    (Rule-11 false-OK). 10-of-12 / 9-of-15 are the honest latches (9-of-15
    is the round-2 correction: freshness-only breach needs ≥39 of 776
    silent, so incident minutes at 29–38 silent sample Healthy and a
