@@ -413,7 +413,11 @@ const AUTH_FAILED_DISPLAY_PREFIX: &str = "Dhan authentication failed: ";
 
 /// Pure. Strips the optional [`AUTH_FAILED_DISPLAY_PREFIX`] so wrapper
 /// matching is prefix-anchored on the underlying reason.
-fn reason_core(reason: &str) -> &str {
+///
+/// `pub(crate)` since 2026-07-08: the AUTH-GAP-06 fast-boot cached-token
+/// classifier (`crate::auth::fast_boot_validation`) reuses this exact
+/// prefix-anchoring primitive so both classifiers share one definition.
+pub(crate) fn reason_core(reason: &str) -> &str {
     reason
         .strip_prefix(AUTH_FAILED_DISPLAY_PREFIX)
         .unwrap_or(reason)
@@ -438,7 +442,12 @@ fn is_inflight_lock_refusal(rendered_error: &str) -> bool {
 /// the [`HTTP_RESPONSE_WRAPPER`] prefix. SEC-R1-3: the status token is
 /// produced by OUR `format!` before any server body is appended, so it is
 /// the only part of the string an upstream cannot forge.
-fn http_response_status(core: &str) -> Option<u16> {
+///
+/// `pub(crate)` since 2026-07-08: reused by the AUTH-GAP-06 fast-boot
+/// cached-token classifier (`crate::auth::fast_boot_validation`) — the
+/// 401/403-vs-everything-else split must parse the status from the SAME
+/// fixed, unforgeable position in both classifiers.
+pub(crate) fn http_response_status(core: &str) -> Option<u16> {
     let rest = core.strip_prefix(HTTP_RESPONSE_WRAPPER)?;
     let digits: &str = rest
         .find(|c: char| !c.is_ascii_digit())
@@ -1223,6 +1232,27 @@ mod tests {
             classify_failure_reason(reason),
             CycleOutcome::Transient,
             "Display-prefixed send-leg transient must classify Transient"
+        );
+    }
+
+    /// AUTH-GAP-06 (2026-07-08): `reason_core` became pub(crate) for the
+    /// fast-boot cached-token classifier — pin its prefix-stripping
+    /// contract directly.
+    #[test]
+    fn reason_core_strips_optional_display_prefix() {
+        assert_eq!(
+            reason_core("Dhan authentication failed: profile request HTTP 401"),
+            "profile request HTTP 401"
+        );
+        // No prefix → returned unchanged.
+        assert_eq!(
+            reason_core("profile request HTTP 401"),
+            "profile request HTTP 401"
+        );
+        // Prefix embedded mid-string is NOT stripped (prefix-anchored).
+        assert_eq!(
+            reason_core("x Dhan authentication failed: y"),
+            "x Dhan authentication failed: y"
         );
     }
 

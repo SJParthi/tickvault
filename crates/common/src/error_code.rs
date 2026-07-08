@@ -306,6 +306,19 @@ pub enum ErrorCode {
     /// self-remediation; the standing CRITICAL profile page covers the
     /// unrecovered case. (2026-07-06.)
     AuthGap05ForcedRemintTriggered,
+    /// AUTH-GAP-06: fast-boot cached-token validation (2026-07-08 —
+    /// third morning cached-token outage, 08:32–09:06 IST on 2026-07-07).
+    /// The FAST crash-recovery boot arm validates the CACHED Dhan JWT with
+    /// ONE `GET /v2/profile` BEFORE any WebSocket spawn. A prefix-anchored
+    /// 401/403 rejection forces a re-mint through the existing TokenManager
+    /// machinery (RESILIENCE-03 in-flight tripwire preserved; the fast arm
+    /// passes `None` for the dual-instance lock flag — the documented §3
+    /// residual of `dual-instance-lock-2026-07-04.md`, unchanged). Any
+    /// other failure shape (transient network, REST-surface 400/429/5xx,
+    /// parse) proceeds with the cached token after ONE bounded retry —
+    /// loudly, never blocking boot. Severity::High — the re-mint /
+    /// degraded-proceed is the self-remediation; the operator must see it.
+    AuthGap06FastBootCachedTokenValidation,
     /// BOOT-01: slow-boot QuestDB readiness deadline approaching (>30s).
     Boot01QuestDbSlow,
     /// BOOT-02: boot deadline exceeded (>60s) — HALTING.
@@ -920,6 +933,7 @@ impl ErrorCode {
             Self::AuthGap03TokenForceRenewedOnWake => "AUTH-GAP-03",
             Self::AuthGap04TotpRotatedExternally => "AUTH-GAP-04",
             Self::AuthGap05ForcedRemintTriggered => "AUTH-GAP-05",
+            Self::AuthGap06FastBootCachedTokenValidation => "AUTH-GAP-06",
             Self::Boot01QuestDbSlow => "BOOT-01",
             Self::Boot02DeadlineExceeded => "BOOT-02",
             Self::Boot03ClockSkewExceeded => "BOOT-03",
@@ -1163,6 +1177,13 @@ impl ErrorCode {
             // (auto-triage safe); the existing CRITICAL profile page covers
             // the unrecovered case.
             | Self::AuthGap05ForcedRemintTriggered
+            // AUTH-GAP-06 (2026-07-08) — fast-boot cached-token validation:
+            // a Dhan-rejected cached token was re-minted before any WS
+            // spawn, or the validation degraded and boot proceeded loudly
+            // with the cached token. High: the action already self-applied;
+            // the operator must see every occurrence (a repeat every boot
+            // means the cache/mint chain is broken).
+            | Self::AuthGap06FastBootCachedTokenValidation
             // GROWW-SCALE-01/02 (§34 2026-07-03) — the auto-scale ladder
             // rolled back a failed rung / halved on fleet-wide failure. The
             // auto-correction already applied; the operator must see every
@@ -1371,6 +1392,9 @@ impl ErrorCode {
             // AUTH-GAP-05 (2026-07-06) — sustained mid-session token-invalid:
             // forced re-mint triggered (runbook §AUTH-GAP-05).
             | Self::AuthGap05ForcedRemintTriggered
+            // AUTH-GAP-06 (2026-07-08) — fast-boot cached-token validation
+            // (runbook §AUTH-GAP-06).
+            | Self::AuthGap06FastBootCachedTokenValidation
             // BP-08 (2026-07-01) — fd / RSS / spill-free early-warning monitors
             // (promotes the RESERVED RESOURCE-01/02/03 stubs).
             | Self::Resource01FdCountHigh
@@ -1560,6 +1584,7 @@ impl ErrorCode {
             Self::AuthGap03TokenForceRenewedOnWake,
             Self::AuthGap04TotpRotatedExternally,
             Self::AuthGap05ForcedRemintTriggered,
+            Self::AuthGap06FastBootCachedTokenValidation,
             Self::Boot01QuestDbSlow,
             Self::Boot02DeadlineExceeded,
             Self::Boot03ClockSkewExceeded,
@@ -1966,10 +1991,12 @@ mod tests {
         // AUTH-GAP-05 (sustained mid-session token-invalid — forced re-mint
         // triggered via the existing renewal machinery; lock-before-mint +
         // ~125s cooldown + retry-once latch honored).
-        // 2026-07-08 (§36 FUTIDX-4): bumped 132 -> 134 for FUTIDX-01
-        // (per-underlying nearest-expiry selection degraded, per feed) +
-        // FUTIDX-02 (cross-feed expiry mismatch) — both Severity::High.
-        assert_eq!(ErrorCode::all().len(), 134);
+        // 2026-07-08 (AUTH-GAP-06 fast-boot cached-token validation):
+        // bumped 132 -> 133 — one GET /v2/profile validates the cached JWT
+        // before any WebSocket spawn on the fast crash-recovery arm; a
+        // prefix-anchored 401/403 forces a re-mint via the existing
+        // TokenManager machinery (2026-07-07 third morning outage).
+        assert_eq!(ErrorCode::all().len(), 133);
     }
 
     #[test]
