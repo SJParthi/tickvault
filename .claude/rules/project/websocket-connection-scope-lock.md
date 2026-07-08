@@ -66,8 +66,8 @@ And the immediate follow-up:
 | Any 2nd/3rd/4th/5th main-feed conn | 4 SIDs fit comfortably on 1 conn (Dhan cap = 5,000/conn); more conns waste token+IP budget. `effective_main_feed_pool_size` returns constant 1. |
 | Any new WebSocket endpoint Dhan introduces in future | Not in scope without operator explicit re-approval |
 | NSE_EQ / BSE_EQ subscriptions (including F&O underlying cash equities) | AWS-lifecycle PR #7 dropped the 218 NSE_EQ universe; `SubscriptionScope::Indices4Only` has no path to emit them. |
-| BSE F&O / commodity / currency feeds | Same |
-| Stock F&O derivative subscriptions on the main-feed conn (except the 2026-07-08 §36 FUTIDX-4 grant — see banner) | Phase 2 dispatcher chain deleted in PR #5 (#708). Planner returns `false` from `should_subscribe_stock_derivatives` unconditionally. |
+| BSE F&O / commodity / currency feeds (except the 2026-07-08 §36 FUTIDX-4 grant — the single BSE_FNO SENSEX nearest-expiry FUTURE on the existing main-feed conn; commodity/currency stay banned — see banner) | Same |
+| Stock F&O derivative subscriptions on the main-feed conn — NO carve-out: §36 grants INDEX futures only; FUTSTK/OPTSTK stay master-only forever | Phase 2 dispatcher chain deleted in PR #5 (#708). Planner returns `false` from `should_subscribe_stock_derivatives` unconditionally. |
 | Index F&O full-chain derivative subscriptions (except the 2026-07-08 §36 FUTIDX-4 grant — 4 single nearest-expiry contracts, never a chain — see banner) | Same — planner returns `false` from `should_subscribe_index_derivatives` unconditionally. |
 | Display-only indices beyond INDIA VIX (sectoral, INDIA VOL, etc.) | `is_display_index_allowed_under_scope` returns `true` only for SID 21 (INDIA VIX). |
 

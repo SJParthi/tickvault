@@ -111,3 +111,41 @@ snapshot plan-identity ratchet; per-underlying degrade is loud (FUTIDX-01, High)
 cross-feed expiry divergence pages FUTIDX-02 — never silently absorbed. NOT claimed: futures
 OI capture; prev-day pct coverage for futures; Dhan live Quote cadence for NSE_FNO/BSE_FNO
 FUTIDX (UNVERIFIED-LIVE); Groww live FNO subscribe_ltp delivery (UNVERIFIED-LIVE).
+
+## Hostile-review round 1 (2026-07-08) — 13 confirmed findings, all fixed
+
+Scope addendum (Status stays VERIFIED; fixes landed post-plan as review remediation):
+
+- [x] R1-A (HIGH, 4 duplicate reports): Groww parity canonical was re-derived via
+      first-match SUBSTRING (`symbol_name.contains(canonical)`) — BANKNIFTY/MIDCPNIFTY
+      collapsed into NIFTY → false FUTIDX-02 every dual-feed boot. Fixed: `GrowwIndexFuture`
+      carries the EXACT-match canonical + expiry out of `extract_index_future_entries`;
+      the recorder consumes it verbatim.
+      - Files: crates/core/src/feed/groww/instruments.rs
+      - Tests: test_extract_index_future_entries_records_exact_canonicals
+- [x] R1-B (MEDIUM): §36 futures appended LAST before the 1000-cap prefix truncate +
+      pre-cap gauge. Fixed: futures PREPENDED (cap-priority), gauge set from the POST-cap
+      live set, loud `tv_index_futures_cap_dropped_total` + FUTIDX-01 error on any drop.
+      - Files: crates/core/src/feed/groww/instruments.rs
+      - Tests: test_assemble_cap_pressure_keeps_all_futures_in_live_set
+- [x] R1-C (MEDIUM): parity recorder compared across trading dates. Fixed: date-keyed
+      store; cross-date pair refused + stale entry evicted.
+      - Files: crates/core/src/instrument/index_futures.rs, daily_universe_orchestrator.rs,
+        feed/groww/instruments.rs
+      - Tests: test_record_selection_cross_date_refuses_compare_and_evicts_stale
+- [x] R1-D (LOW): non-numeric Groww token misreported as BadExpiryFormat. Fixed: new
+      `IndexFutureMissReason::BadNativeToken`.
+      - Tests: test_extract_index_future_entries_bad_token_reason_is_bad_native_token
+- [x] R1-E (LOW): Groww FUTIDX-01 lacked the runbook-promised `candidates_seen` evidence.
+      Fixed: `collect_fut_underlying_symbols_seen` (shared bound) + payload field.
+      - Tests: test_collect_fut_underlying_symbols_seen_bounded_distinct
+- [x] R1-F (LOW): false "ONLY test touching the global" comment. Fixed: honest comment.
+- [x] R1-G (LOW): prev-day coverage denominator counted the always-skipped futures.
+      Fixed: role-filtered `pd_expected` in main.rs (mirror of the 15:31 cross-verify).
+- [x] R1-H (MEDIUM): scope-lock forbidden table carve-out on the WRONG row. Fixed:
+      carve-out moved Stock-F&O → BSE-F&O row.
+- [x] R1-I (LOW): Dhan Step-3d recording block + mismatch arm untested. Fixed:
+      builds_universe_with_futidx_rows_selects_index_futures +
+      test_record_selection_mismatch_verdict_through_recorder.
+- [x] R1-J (LOW): plan-builder doc block displaced onto the private segment helper.
+      Fixed: doc reattached to `build_subscription_plan_from_daily_universe`.
