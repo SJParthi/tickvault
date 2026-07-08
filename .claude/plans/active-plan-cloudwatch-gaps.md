@@ -432,7 +432,7 @@ flapper invisible) is the proof.
   cost delta (round-13 recompute; worst-case corrected round-8): +12 alarms
   × $0.10 = $1.20, + 2 DENSE
   /metrics-derived custom metrics × $0.30 × 270/730 uptime-hrs ≈ $0.22, +
-  sparse `tv_errcode_*` $0.05-0.40 ⇒ ≈ **+$1.5-1.8/mo (~₹130-160 incl 18%
+  sparse `tv_errcode_*` $0.05-0.40 ⇒ ≈ **+$1.5-1.8/mo (~₹150-180 incl 18%
   GST; worst realistic ≈ +$2.3/mo, ~₹230 incl 18% GST — the sum of the
   worst components: $1.20 alarms + $0.22 dense + $0.89 sparse worst-case,
   a code firing every running hour = 8 × $0.30 × 270/730; the round-5
