@@ -21,9 +21,18 @@
 //! any per-call allocation (even 1 byte/call = 10 KB), with headroom for
 //! incidental one-time runtime bookkeeping.
 //!
-//! Run: `cargo test -p tickvault-core --features dhat --test dhat_feed_lag_ring`
-
-#![cfg(feature = "dhat")]
+//! CI ENFORCEMENT (round-3 fix, 2026-07-07): this file is deliberately
+//! UN-gated (no `#![cfg(feature = "dhat")]`) — the same house pattern as
+//! `dhat_ws_reader_zero_alloc.rs` / `dhat_allocation.rs` — so the normal
+//! Test (core) nextest lane in ci.yml compiles AND runs it on every PR
+//! (a feature-gated variant was CI-inert: no merge gate enables
+//! `--features dhat`, so it passed vacuously). The Coverage & Perf lane
+//! skips it BY TEST NAME (`-- --skip dhat_` — hence the `dhat_` fn-name
+//! prefix below): llvm-cov instrumentation itself allocates, which would
+//! blow the exact budget (the documented DHAT-vs-coverage
+//! incompatibility, ci.yml Coverage step comment).
+//!
+//! Run: `cargo test -p tickvault-core --test dhat_feed_lag_ring`
 
 #[global_allocator]
 static ALLOC: dhat::Alloc = dhat::Alloc;
@@ -33,7 +42,7 @@ use tickvault_core::pipeline::feed_lag_monitor::record_dhan_tick;
 const NANOS_PER_SEC: i64 = 1_000_000_000;
 
 #[test]
-fn record_dhan_tick_hot_path_zero_allocation() {
+fn dhat_record_dhan_tick_hot_path_zero_allocation() {
     // 2026-07-06 ~10:00 IST as UTC nanos (2026-07-06 00:00 UTC =
     // 1_783_296_000 epoch secs; verified `date -u -d @1783296000`).
     let t0_utc_secs: i64 = 1_783_296_000 + 4 * 3600 + 1800;
@@ -45,7 +54,10 @@ fn record_dhan_tick_hot_path_zero_allocation() {
     // pattern as dhat_tick_gap_detector's pre-seed).
     record_dhan_tick(t0_utc_nanos, t0_utc_nanos - 1_000_000, exchange_ist_secs);
 
-    let _profiler = dhat::Profiler::new_heap();
+    // Testing-mode profiler (house pattern — dhat_ws_reader_zero_alloc.rs):
+    // suppresses the dhat-heap.json side-effect file now that this test
+    // runs in the normal Test (core) CI lane on every PR.
+    let _profiler = dhat::Profiler::builder().testing().build();
     let stats_before = dhat::HeapStats::get();
 
     for i in 0..10_000_i64 {
