@@ -459,6 +459,18 @@ async fn activate_groww_lane(
     )
     .await;
 
+    // Human-readable analyst console views (ticks_named / candles_named) —
+    // review round 1 fix: WITHOUT this call site a Groww-only boot
+    // (`feeds.dhan_enabled = false`, the documented scale-test / groww-only
+    // lab mode) never created the views (both main.rs call sites are
+    // Dhan-gated), so `SELECT * FROM ticks_named` failed with "table does
+    // not exist" while ticks/candles_1m filled with feed='groww' rows.
+    // Sequential AFTER the base-table ensures above so `ticks` +
+    // `candles_1m` exist before CREATE VIEW validates its column
+    // references. Fail-soft + convergent (CREATE OR REPLACE VIEW) — double
+    // execution on a dual-feed boot is harmless.
+    tickvault_storage::console_views::ensure_named_views(&questdb).await;
+
     // Auth smoke-check (diagnostic; inline so a disable aborts it). A failure is
     // logged but does NOT abort activation — the watch-list build + sidecar may
     // still succeed if the token recovers; the smoke-check is an early warning.
