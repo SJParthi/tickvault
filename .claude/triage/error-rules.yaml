@@ -1314,6 +1314,25 @@ rules:
       paired Telegram event — never manually re-mints first.
       Severity::High — pages with a 5-min cooldown, does not auto-fix.
 
+  - name: auth-gap-06-fast-boot-cached-token-validation-escalate
+    match:
+      code: AUTH-GAP-06
+    action: escalate
+    runbook_path: .claude/rules/project/wave-4-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 300
+    justification: >-
+      AUTH-GAP-06 = the FAST crash-recovery boot arm validated the
+      CACHED Dhan JWT with one /v2/profile call BEFORE any WebSocket
+      spawn. Either a Dhan 401/403 reject forced a re-mint through the
+      existing TokenManager machinery, or the validation degraded
+      (transient network / REST-surface error) and boot proceeded
+      loudly with the cached token after one bounded retry. The
+      re-mint / degraded-proceed IS the self-remediation; the operator
+      inspects — a repeat on every boot means the cache/mint chain is
+      broken. Severity::High — pages with a 5-min cooldown, does not
+      auto-fix.
+
   - name: resource-01-fd-count-high-escalate
     match:
       code: RESOURCE-01
