@@ -470,8 +470,8 @@ jobs:
       # QuestDB console lambda suites + deploy-gate scenario harness
       # (2026-07-06 shell-hang fix; simplified in the 2026-07-08 closure
       # pass). Before this step the console lambda Python suites ran in NO CI
-      # lane — a PR reverting the B4 r3 handler fix merged with every check
-      # green. Both suites are stdlib-only (<1s) and run unconditionally
+      # lane — a PR reverting the B4 r3 handler fix would merge with every
+      # check green. Both suites are stdlib-only (<1s) and run unconditionally
       # inside this already-All-Green-gated job (a step in an existing needed
       # job, NOT a new job — merge-gate-lock §5 forbids a PR-relevant job
       # outside all-green's needs list). The harness self-extracts the

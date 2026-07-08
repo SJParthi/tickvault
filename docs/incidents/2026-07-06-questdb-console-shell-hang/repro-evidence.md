@@ -11,6 +11,16 @@
 > originals, rebuilt from §10's printed request bytes and §11 conclusion 5;
 > the frozen OUTPUT blocks below remain the raw evidence.
 >
+> **Closure round-1 correction (2026-07-08):** the relocation commit itself
+> LF-normalized the 57 CRLF header line endings inside the §1–§8 transcript
+> blocks — transiently falsifying the "no transcript byte changed" claim
+> directly above and the round-9/10 CRLF-preservation notes below. The
+> bytes were byte-restored from the pre-relocation blob (`73e0fdc`) in this
+> closure round: everything from the first `##` section header down is
+> again byte-identical to that blob (verified by python byte-diff;
+> `grep -c $'\r'` on this file = 57). The three preservation claims hold
+> at HEAD.
+>
 > **Provenance (fixer round 7, 2026-07-06):** this file was produced in the
 > 2026-07-06 repro session's local scratchpad and is committed VERBATIM
 > (content unchanged below this note) because the handler/test/workflow/plan
