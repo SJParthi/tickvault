@@ -67,7 +67,20 @@ data "archive_file" "questdb_console_front" {
   type        = "zip"
   source_dir  = "${path.module}/../lambda/questdb-console-front"
   output_path = "${path.module}/.build/questdb-console-front.zip"
-  excludes    = ["test_handler.py", "README.md"] # ship handler.py only — not test/docs
+  # Ship handler.py only — not test/docs. "**/__pycache__/**" (fixer round 11,
+  # 2026-07-08): the plan-mandated unit-test command runs inside this exact
+  # source_dir and GENERATES gitignored __pycache__/*.pyc there, so any
+  # NON-CI apply from a working tree where the tests ever ran (archive_file
+  # packages the LIVE directory, not the git index) would ship interpreter
+  # bytecode in the prod zip AND drift output_base64sha256 — the two failure
+  # classes the back block's comment below exists to prevent. Bytecode names
+  # are interpreter-version-dependent (handler.cpython-<NN>.pyc), so a
+  # literal filename cannot pin them; the doublestar glob is legal per the
+  # round-10 provider-docs note below. HONEST ENVELOPE: an operator apply
+  # with a stale pre-glob archive provider cached locally would not match the
+  # glob and would ship the bytecode exactly as before this fix — no worse
+  # than the status quo; CI pulls the latest provider, which supports globs.
+  excludes = ["test_handler.py", "README.md", "**/__pycache__/**"]
 }
 
 data "archive_file" "questdb_console_proxy" {
@@ -91,7 +104,19 @@ data "archive_file" "questdb_console_proxy" {
   # gate-matrix-r7.sh) would otherwise ship inside the prod back-lambda zip,
   # and any future edit to those docs/harness files would drift
   # output_base64sha256 into a lambda redeploy from a non-code change.
-  excludes = ["test_handler.py", "README.md", "repro-evidence.md", "gate-matrix-r7.sh"]
+  # Fixer round 11 (2026-07-08): "**/__pycache__/**" added — the "ship
+  # handler.py ONLY" contract covered only COMMITTED files, but the
+  # plan-mandated `python3 -m unittest test_handler -v` run inside this
+  # source_dir GENERATES gitignored __pycache__/*.pyc (invisible to `git
+  # status`/review), so any NON-CI apply from a tree where the tests ever
+  # ran shipped bytecode in the prod zip AND drifted output_base64sha256 —
+  # exactly the two failure classes this comment exists to prevent (the CI
+  # apply path is a fresh checkout and was unaffected). Bytecode names are
+  # interpreter-version-dependent, so only a glob can pin them. HONEST
+  # ENVELOPE: a stale pre-glob archive provider cached for a local apply
+  # would not match the glob — no worse than the status quo; CI pulls the
+  # latest provider, which supports doublestar globs per the note above.
+  excludes = ["test_handler.py", "README.md", "repro-evidence.md", "gate-matrix-r7.sh", "**/__pycache__/**"]
 }
 
 # ─────────────────────────────────────────────────────────────────────────────

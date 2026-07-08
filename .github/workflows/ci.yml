@@ -479,16 +479,21 @@ jobs:
       # a PR-relevant job outside all-green's needs list).
       #
       # 2026-07-07 (fixer round 9): the step ALSO runs the FILE 5 deploy-gate
-      # behavioral matrix (gate-matrix-r7.sh, 14 scenarios since fixer
-      # round 10 — scenario M pins the 000-pre-grace mid-grace-stop skip
-      # wording; 13 through round 9 — ~1-2s, bash +
+      # behavioral matrix (gate-matrix-r7.sh, 18 scenarios since fixer
+      # round 11 — N pins the initial-probe 200-wrong-body FATAL, O the
+      # STATE_PRE=unknown loud-skip, P/Q the stopped+fast-503/504 FATAL;
+      # 14 in round 10 with scenario M, 13 through round 9 — ~1-2s, bash +
       # python3 + PyYAML — preinstalled on ubuntu-latest). Before this, the
       # harness ran in NO CI lane, so every "pinned by gate-matrix-r7.sh"
       # comment was a manual-run-only claim (the same unenforced-pin class
       # round 4 fixed for the unittest suites). The harness self-extracts the
       # gate step from terraform-apply.yml and fails loudly ("gate step not
-      # found") if the step is deleted or renamed — closing that half of the
-      # gate-existence ratchet gap disclosed in the plan's alerting row.
+      # found") if the step is deleted or renamed — since fixer round 11 that
+      # is a true single-message ABORT (previously the extractor error was
+      # buried under 14 misleading FAIL rows against an empty script; the
+      # exit code was already non-zero, so the merge ratchet always held) —
+      # closing that half of the gate-existence ratchet gap disclosed in the
+      # plan's alerting row.
       # Honest residual: a `continue-on-error:` added to the gate step is NOT
       # caught (the harness executes the step's script, not its YAML attrs).
       - name: QuestDB console lambda unit tests (back + front)

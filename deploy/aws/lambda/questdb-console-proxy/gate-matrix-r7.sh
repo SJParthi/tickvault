@@ -33,6 +33,22 @@
 # variant); (d) the scenario count in the green line is computed, not
 # hardcoded.
 #
+# Round-11 changes (2026-07-08): (a) an extraction FAILURE now ABORTS with
+# the single loud message instead of running all scenarios against an empty
+# $GATE_SRC — under `set -u` alone a python non-zero exit did NOT stop the
+# harness, so a deleted/renamed gate step produced one stderr line buried
+# under 14 misleading "FAIL(rc=0 want=1)" rows (exit code was already
+# non-zero, so the merge ratchet held; triage honesty only — this makes the
+# ci.yml "fails loudly ('gate step not found')" claim actually true);
+# (b) scenario N pins the INITIAL-probe 200-wrong-body FATAL (proven
+# zero-coverage in round 11: deleting that body check left all 14 scenarios
+# green — scenario J pins only the GRACE-arm twin); (c) scenario O pins the
+# STATE_PRE=unknown loud-skip policy (proven zero-coverage: flipping the
+# documented unknown-pre skip into a FATAL left all 14 green); (d) scenarios
+# P + Q pin the round-11 gate change: a fast 503/504 with the box stopped at
+# both samples is a console-lambda-layer fault -> FATAL (previously exit-0
+# skip; scenario E remains the stopped+000 skip pin).
+#
 # Run from anywhere:  bash deploy/aws/lambda/questdb-console-proxy/gate-matrix-r7.sh
 # Stubs terraform/aws/curl/sleep on PATH and drives (curl-code sequence,
 # ec2-state sequence) scenarios end-to-end through the REAL gate script.
@@ -45,7 +61,11 @@ WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
 GATE_SRC="$WORK/gate-step.sh"
 
-python3 - "$WORKFLOW" > "$GATE_SRC" <<'PY'
+# Round-11 (2026-07-08): abort on extraction failure. Under `set -u` alone,
+# a python SystemExit("gate step not found ...") did NOT stop the harness —
+# $GATE_SRC stayed EMPTY, every scenario ran `bash` on the empty file (rc=0)
+# and printed misleading FAIL rows against a script that was never there.
+if ! python3 - "$WORKFLOW" > "$GATE_SRC" <<'PY'
 import sys
 import yaml
 
@@ -63,6 +83,14 @@ for job in doc["jobs"].values():
             raise SystemExit(0)
 raise SystemExit("gate step not found in terraform-apply.yml")
 PY
+then
+  echo "gate-matrix: ABORT — gate-step extraction failed (see the extractor error above); not running scenarios against an empty script" >&2
+  exit 1
+fi
+if [ ! -s "$GATE_SRC" ]; then
+  echo "gate-matrix: ABORT — extracted gate script is empty; not running scenarios against it" >&2
+  exit 1
+fi
 
 FAILS=0
 TOTAL=0
@@ -177,6 +205,25 @@ run_case L_pending_both_start_wording "000 000 000" "pending pending" "" 0 "star
 #    name a back-lambda invoke failure (that yields a FAST 503, never 000) —
 #    round-10 message-accuracy fix; scenario D pins only the 503 variant
 run_case M_midgrace_stop_skip_000_hangclass "000 000 000 000" "running running stopped" "" 0 "a booting OS/ENI still dropping SYNs"
+# N. INITIAL probe gives 200 but the body is NOT the shell HTML -> FATAL.
+#    Round-11 pin: this PROBE fail-closed arm had ZERO coverage (proven by
+#    mutation — deleting the check left all prior scenarios green; scenario J
+#    pins only the grace-arm twin). The grep uses the initial arm's DISTINCT
+#    prefix so the grace twin cannot satisfy it.
+run_case N_initial_200_wrong_body "200" "running" "not the shell" 1 "GET / gave 200 but the body is not the console shell HTML"
+# O. STATE_PRE=unknown (transient describe-instances failure) + post-sample
+#    stopped + 000 -> LOUD SKIP, both samples printed (the documented round-6
+#    policy). Round-11 pin: proven zero-coverage — mutating the skip's
+#    STATE_PRE condition to also FATAL on 'unknown' left all prior scenarios
+#    green.
+run_case O_pre_unknown_stopped_000_skip "000 000 000" "unknown stopped" "" 0 "pre-probe sample: unknown, post-probe sample: stopped"
+# P/Q. fast 503/504 with the box stopped at BOTH samples -> FATAL naming the
+#    console-lambda-layer fault class (round-11 gate change: a not-running
+#    box can only produce 000 through the 5s-capped curl, so a fast 503/504
+#    there is a front/back wiring / lambda-permission / back-crash class the
+#    old arm laundered into an exit-0 skip on every off-window apply).
+run_case P_stopped_503_lambda_layer_fatal "503 503 503" "stopped stopped" "" 1 "console-lambda-layer fault"
+run_case Q_stopped_504_lambda_layer_fatal "504 504 504" "stopped stopped" "" 1 "console-lambda-layer fault"
 
 echo "---"
 if [ "$FAILS" -ne 0 ]; then
