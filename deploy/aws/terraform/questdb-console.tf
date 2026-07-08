@@ -67,7 +67,16 @@ data "archive_file" "questdb_console_front" {
   type        = "zip"
   source_dir  = "${path.module}/../lambda/questdb-console-front"
   output_path = "${path.module}/.build/questdb-console-front.zip"
-  excludes    = ["test_handler.py", "README.md"] # ship handler.py only — not test/docs
+  # Ship handler.py only — not tests/docs. "**/__pycache__/**": the unit
+  # tests run inside this source_dir and generate gitignored interpreter
+  # bytecode there (archive_file packages the LIVE directory, not the git
+  # index); bytecode filenames are interpreter-version-dependent
+  # (handler.cpython-<NN>.pyc), so only a glob can pin them — legal, the
+  # hashicorp/archive provider documents doublestar glob excludes. HONEST
+  # ENVELOPE: a stale pre-glob archive provider cached for a local apply
+  # would not match the glob — no worse than the prior status quo; CI pulls
+  # the latest provider.
+  excludes = ["test_handler.py", "README.md", "**/__pycache__/**"]
 }
 
 data "archive_file" "questdb_console_proxy" {
@@ -75,7 +84,13 @@ data "archive_file" "questdb_console_proxy" {
   type        = "zip"
   source_dir  = "${path.module}/../lambda/questdb-console-proxy"
   output_path = "${path.module}/.build/questdb-console-proxy.zip"
-  excludes    = ["test_handler.py", "README.md"]
+  # Ship handler.py only — same excludes rationale as the front block above.
+  # Incident evidence + the deploy-gate harness deliberately live OUTSIDE
+  # this packaging dir (docs/incidents/2026-07-06-questdb-console-shell-hang/
+  # and scripts/questdb-console-gate-matrix.sh) precisely so this list needs
+  # no special-casing; every non-handler file committed into this source_dir
+  # MUST be added here.
+  excludes = ["test_handler.py", "README.md", "**/__pycache__/**"]
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -116,7 +131,7 @@ resource "aws_lambda_function" "questdb_console_proxy" {
   handler          = "handler.lambda_handler"
   filename         = data.archive_file.questdb_console_proxy[0].output_path
   source_code_hash = data.archive_file.questdb_console_proxy[0].output_base64sha256
-  timeout          = 26 # > the handler's 25s urllib timeout; < the front's 29s
+  timeout          = 26 # aggregate backstop: the handler's 12s _TIMEOUT_SECS is PER socket op (connect + EACH recv — _read_capped issues up to ~16 sequential capped read() calls, each of which may span MANY recvs, every recv resetting the 12s timer, so under a dribble the recv count is unbounded), so a dribbling upstream is bounded by THIS Lambda timeout, not by 12s; < the front's 29s
   memory_size      = 256
 
   vpc_config {

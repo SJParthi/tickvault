@@ -44,7 +44,7 @@ import time
 import urllib.parse
 
 # Deployed-bytes proof marker (proof-3 ratchet: test_build_marker_present).
-QDB_CONSOLE_BUILD = "b4-qdb-console-2026-07-03-r2"
+QDB_CONSOLE_BUILD = "b4-qdb-console-2026-07-06-r3"
 
 REGION = os.environ.get("AWS_REGION", "ap-south-1")
 BACK_FN_ARN = os.environ.get("BACK_FN_ARN", "")
@@ -528,7 +528,7 @@ def _relay(method: str, path: str, raw_query: str, headers: dict) -> dict:
     if err:
         return _json_resp(503, {"error": _OFFLINE_MSG})
     resp_headers = {"cache-control": "no-store"}
-    for k in ("content-type", "content-encoding", "cache-control"):
+    for k in ("content-type", "content-encoding", "cache-control", "location"):
         v = (back.get("headers") or {}).get(k)
         if v:
             resp_headers[k] = v

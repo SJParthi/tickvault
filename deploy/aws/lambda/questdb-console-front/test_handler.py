@@ -564,6 +564,21 @@ class RelayPlumbing(WithSecret):
         r = handler.lambda_handler(_event("GET", "/", headers=_bearer()), None)
         self.assertEqual(r["statusCode"], 502)
 
+    def test_relay_forwards_location_on_3xx(self) -> None:
+        # B4 r3 defense-in-depth: the back relays a 3xx BODY-LESS (status +
+        # Location) — the front must forward `location` so the browser can
+        # follow to /index.html. FAILS on r2 bytes (the _relay header tuple
+        # dropped `location`).
+        handler._invoke_back = lambda _p: {  # type: ignore[assignment]
+            "status": 301,
+            "headers": {"location": "/index.html"},
+            "body_b64": "",
+        }
+        resp = handler.lambda_handler(_event("GET", "/", headers=_bearer()), None)
+        self.assertEqual(resp["statusCode"], 301)
+        self.assertEqual(resp["headers"]["location"], "/index.html")
+        self.assertIs(resp["isBase64Encoded"], True)
+
     def test_back_status_relayed(self) -> None:
         def fake_back(_payload: dict) -> dict:
             return {"status": 400, "headers": {"content-type": "application/json"},
