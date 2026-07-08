@@ -592,15 +592,99 @@ _FEED_PROBE_MAX_SECS = 2
 # NON-NEGATIVE input, hence the CASE clamp below; clamped rows are counted
 # and shown honestly on the page).
 #
+# REWRITTEN 2026-07-07 (silent-feed hardening item 5 — the 2026-07-06 Dhan
+# degradation exposed two verified defects in the old predicate
+# `ts > dateadd('m', -10, now())`):
+#
+# 1. TIMEBASE BUG (verified latent): `ts` (= Dhan LTT, already IST epoch
+#    seconds, stored directly per data-integrity.md — tick_persistence.rs
+#    build_tick_row_seq) and `received_at` (= Utc::now() +
+#    IST_UTC_OFFSET_NANOS) are stored IST-SHIFTED, while QuestDB's now() is
+#    UTC. Comparing the IST-shifted column against the UTC clock made the
+#    "10-minute" window really ~5h40m — the root cause of the all-day
+#    WAL-replay row conflation in the panel on 2026-07-06. Every predicate
+#    now uses IST_now := dateadd('m', 330, now()) (_pctl_ist_now()).
+#
+# 2. LAG CENSORING (Rule-11 false-OK): an EXCHANGE-time (ts) window
+#    structurally cannot show lag above its own width — any row whose lag
+#    exceeds the window has ts OUTSIDE it. The population is now defined by
+#    RECEIVE time. The two-layer predicate, per feed:
+#      (a) received_at >= IST_now − _PCTL_RECV_WINDOW_SECS (120 s) — the
+#          honest population "rows RECEIVED in the last 2 minutes"
+#          (6K-60K rows at incident tick rates → a stable p99);
+#      (b) received_at < capture_instant + _PCTL_REPLAY_DWELL_SECS (60 s) —
+#          the EXACT replay excluder, applied to feed='dhan' ONLY (round-1
+#          fix 2026-07-07, finding 10). capture_instant := capture_seq
+#          (for dhan: ≈ UTC wall NANOS, stamped ONCE at the original
+#          WS-read instant by ws_frame_spill::next_frame_seq and PRESERVED
+#          through WAL re-injection / spill drains) → ÷1000 to µs →
+#          +19,800,000,000 µs to IST-align with received_at. Frame-WAL
+#          re-injection RE-stamps received_at at dequeue but keeps
+#          capture_seq, so a replayed dhan row shows receipt−capture =
+#          downtime (≥ minutes) and is excluded EVEN INSIDE a live drain
+#          window, while a genuinely-lagged LIVE row (the incident's real
+#          46 s / 199 s) carries a FRESH capture instant and is KEPT — the
+#          panel never censors the very signal it measures. TVW2
+#          spill-drain rows preserve their ORIGINAL received_at (correctly
+#          kept). Excluded rows are COUNTED for dhan (replay_excluded) and
+#          rendered on the page — visible, not silent.
+#          HONEST LIMIT (round-2 fix 2026-07-07, finding 3): SQL has no
+#          process-boundary column, so a LIVE dhan row that dwelt ≥ 60 s
+#          between its WS-read and dequeue (a severe consumer stall — the
+#          frame channel holds ~4 min of frames at ~500 ticks/s, and an
+#          ILP stall can block the consumer that long) is INDISTINGUISHABLE
+#          here from a replay-restamped row: it is excluded from the panel
+#          sample and counted in the SAME column. The in-app lag gauge
+#          (feed_lag_monitor) KEEPS such rows via its process-live-boundary
+#          discriminator, so the CloudWatch lag ALARM still sees
+#          stall-induced lag; only this panel's sample drops them. The
+#          column is therefore labeled "replay/stall rows excluded" —
+#          never plain "replay rows" (that would misattribute live stalls).
+#          WHY NOT groww (honest limitation, was previously misdocumented
+#          as "receipt−capture ≤ 0"): groww's capture_seq is seeded from
+#          the tick's EXCHANGE timestamp in IST nanos (groww_bridge.rs
+#          next_capture_seq(ts_ist_nanos) — replay-STABLE, NOT a receipt
+#          stamp), so receipt−capture equals the positive LAG itself.
+#          Applying the dhan discriminator to groww would (i) censor any
+#          genuine groww lag > 60 s — the exact Rule-11 censoring this
+#          rewrite removes — and (ii) NOT exclude replay-restamped groww
+#          rows anyway. Therefore groww (and any non-dhan feed) gets NO
+#          capture-based excluder and its replay_excluded renders "—"
+#          (n/a): replay-restamped groww rows are NOT distinguishable via
+#          capture_seq — a documented limitation, never a fake 0.
+#      (c) ts > IST_now − _PCTL_TS_PRUNE_HOURS (6 h) — PARTITION PRUNING
+#          ONLY (`ticks` is PARTITION BY HOUR on ts; received_at is NOT the
+#          designated timestamp, so without this bound every query is a
+#          full-table scan). Implied honest ceiling, documented on the page:
+#          a live row lagged MORE than 6 h falls outside the prune window
+#          and is invisible to this panel.
+#
 # Complexity (honest): the Lambda side is O(feeds ≤ cap) fixed-width CSV
-# lines — effectively O(1). Each QuestDB aggregate is LIMIT-bounded to the
-# latest _PCTL_SAMPLE_CAP receive-stamped rows per feed inside the 10-min
-# interval scan (ORDER BY ts DESC on the designated timestamp = backward
-# scan that stops at the cap) — a BOUNDED SAMPLE, honestly O(window rows)
-# inside QuestDB per feed, never an unbounded table scan. Feed discovery is
-# one interval-scanned DISTINCT over the same 10-min window. NO feed name
+# lines — effectively O(1). The percentile aggregate is LIMIT-bounded to
+# the ≤_PCTL_SAMPLE_CAP NEWEST-RECEIVED rows — ORDER BY received_at DESC
+# (round-1 fix 2026-07-07, finding 2): the population is DEFINED by receive
+# time, and truncating by exchange-ts (the old ORDER BY ts DESC) evicted
+# precisely the MOST-LAGGED rows first whenever the cap bound (~60K dhan
+# rows/120 s at the measured ~500 ticks/s vs the 50K cap — i.e. in ORDINARY
+# operation), which could wipe the p99 tail during a mixed-lag incident —
+# a softer reinstatement of the very censoring this rewrite removes.
+# Ordering by received_at makes the truncation lag-NEUTRAL, and a capped
+# sample is FLAGGED on the page (rows == cap → "sample capped" note).
+# Cost honesty: received_at is NOT the designated timestamp, so this is an
+# O(population-rows) sort inside the 6h-pruned partitions (not a
+# stop-at-cap backward scan) — bounded by the per-curl --max-time; a
+# timeout degrades that feed's row honestly. The companion replay_excluded
+# COUNT (dhan only) is a vectorized filter over the same 6h-pruned
+# partitions (O(pruned rows) — cheap columnar count, same bound).
+# Feed discovery is one DISTINCT over the same 6h prune window (a feed
+# whose ONLY recent rows carry ts older than 6 h — a >6h-old replay with
+# nothing live — is not discovered; documented, not hidden). NO feed name
 # is hardcoded — any future feed in `ticks` gets its row automatically.
-_PCTL_WINDOW_MINS = 10
+_PCTL_RECV_WINDOW_SECS = 120  # K — receive-recency population window
+_PCTL_TS_PRUNE_HOURS = 6  # partition prune on designated ts (HOUR partitions)
+_PCTL_REPLAY_DWELL_SECS = 60  # receipt−capture dwell ≥ this ⇒ replay-restamped
+_PCTL_IST_OFFSET_MINS = 330  # QuestDB now() is UTC; ts/received_at are IST-shifted
+_PCTL_IST_OFFSET_MICROS = 19_800_000_000  # +05:30 in µs — IST-aligns capture_seq
 _PCTL_SAMPLE_CAP = 50_000
 _PCTL_MAX_FEEDS = 6  # loop bound — keeps the parallel query fan-out finite
 _PCTL_QUERY_MAX_SECS = 3
@@ -611,32 +695,100 @@ _PCTL_QUANTILES = (("p50", "0.5"), ("p90", "0.9"), ("p95", "0.95"), ("p99", "0.9
 _PCTL_FEED_TOKEN_RE = "^[a-z0-9_-]{1,32}$"
 
 
-def _pctl_feeds_sql() -> str:
-    """Feed-discovery SQL: every feed with ticks in the window (pure)."""
+def _pctl_ist_now() -> str:
+    """QuestDB expression for the IST-shifted wall clock (pure).
+
+    `ts` and `received_at` are stored IST-SHIFTED (see the timebase note in
+    the block comment above) while QuestDB now() is UTC — every window
+    predicate must compare against IST_now, never bare now()."""
+    return f"dateadd('m', {_PCTL_IST_OFFSET_MINS}, now())"
+
+
+def _pctl_population_where() -> str:
+    """Shared per-feed population predicate, `$f` shell placeholder (pure).
+
+    Predicate roles (see block comment): receive-stamped rows only, the 6h
+    ts PARTITION PRUNE (performance bound, not the population), and the
+    120s RECEIVE-recency window that defines the honest population. The
+    replay excluder is appended by the caller in admitted/excluded form."""
+    ist = _pctl_ist_now()
     return (
-        "select distinct feed from ticks "
-        f"where ts > dateadd('m', -{_PCTL_WINDOW_MINS}, now())"
+        "feed = '$f' and received_at != null "
+        f"and ts > dateadd('h', -{_PCTL_TS_PRUNE_HOURS}, {ist}) "
+        f"and received_at >= dateadd('s', -{_PCTL_RECV_WINDOW_SECS}, {ist})"
     )
 
 
-def _pctl_feed_sql() -> str:
+def _pctl_capture_instant() -> str:
+    """QuestDB expression: the row's ORIGINAL capture instant, IST µs (pure).
+
+    VALID FOR feed='dhan' ONLY: dhan capture_seq ≈ UTC wall NANOS stamped
+    once at the WS-read instant and preserved through WAL re-injection
+    (data-integrity.md TICK-SEQ-01): ÷1000 → µs, +19,800,000,000 µs → IST
+    alignment with received_at. groww capture_seq is EXCHANGE-ts-seeded
+    (IST nanos, groww_bridge.rs), NOT a receipt stamp — never apply this
+    expression to a non-dhan feed (see the block comment, finding 10)."""
+    return f"cast(capture_seq / 1000 + {_PCTL_IST_OFFSET_MICROS} as timestamp)"
+
+
+def _pctl_feeds_sql() -> str:
+    """Feed-discovery SQL: every feed with ticks in the prune window (pure).
+
+    Same IST-timebase fix as the per-feed query, over the same 6h ts
+    partition-prune window (the per-feed query then decides honestly
+    whether anything was RECEIVED in the last 120 s)."""
+    return (
+        "select distinct feed from ticks "
+        f"where ts > dateadd('h', -{_PCTL_TS_PRUNE_HOURS}, {_pctl_ist_now()})"
+    )
+
+
+def _pctl_feed_sql(replay_excluder: bool) -> str:
     """Per-feed lag-percentile SQL with a `$f` shell placeholder (pure).
 
-    One statement per feed: count + clamped-negative count + p50/p90/p95/p99
-    (approx, 3 sig figs) + max, over the latest ≤_PCTL_SAMPLE_CAP rows that
-    carry a receive stamp (`received_at != null`) in the last
-    _PCTL_WINDOW_MINS minutes. Lag unit inside SQL = microseconds (direct
-    QuestDB timestamp subtraction); the Lambda converts to ms."""
+    One statement per feed, TWO one-row legs cross-joined into one CSV line:
+      a) ADMITTED leg — count + clamped-negative count + p50/p90/p95/p99
+         (approx, 3 sig figs) + max over the ≤_PCTL_SAMPLE_CAP
+         NEWEST-RECEIVED rows in the last _PCTL_RECV_WINDOW_SECS
+         (`order by received_at desc` — the population's own key; ordering
+         by exchange-ts would evict the MOST-lagged rows first when the
+         cap binds — finding 2). With `replay_excluder` (feed='dhan' only)
+         the leg additionally requires receipt−capture <
+         _PCTL_REPLAY_DWELL_SECS;
+      b) EXCLUDED leg — with `replay_excluder`: the Rule-11 companion
+         count of rows in the SAME population that FAILED the excluder
+         (rendered as "replay/stall rows excluded" — replay-restamped rows
+         PLUS any live rows delayed ≥60 s in-pipeline by a consumer stall,
+         which SQL cannot tell apart; see the HONEST LIMIT note in the
+         block comment); without it: a NULL literal → the parser carries
+         None → the page renders "—" (n/a — such rows are not
+         distinguishable via capture_seq for non-dhan feeds; never a fake
+         verified-0).
+    Lag unit inside SQL = microseconds (direct QuestDB timestamp
+    subtraction); the Lambda converts to ms."""
     pctls = ", ".join(
         f"approx_percentile(lag_us, {q}, 3) {name}" for name, q in _PCTL_QUANTILES
     )
+    where = _pctl_population_where()
+    replay_cut = (
+        f"dateadd('s', {_PCTL_REPLAY_DWELL_SECS}, {_pctl_capture_instant()})"
+    )
+    admit_extra = f"and received_at < {replay_cut} " if replay_excluder else ""
+    excluded_leg = (
+        f"select count() replay_excluded from ticks where {where} "
+        f"and received_at >= {replay_cut}"
+        if replay_excluder
+        else "select cast(null as long) replay_excluded from long_sequence(1)"
+    )
     return (
+        "select * from ("
         f"select count() rows, sum(neg) negs, {pctls}, max(lag_us) pmax from ("
         "select case when received_at - ts < 0 then 0 else received_at - ts end lag_us, "
         "case when received_at - ts < 0 then 1 else 0 end neg "
-        "from ticks where feed = '$f' and received_at != null "
-        f"and ts > dateadd('m', -{_PCTL_WINDOW_MINS}, now()) "
-        f"order by ts desc limit {_PCTL_SAMPLE_CAP})"
+        f"from ticks where {where} "
+        f"{admit_extra}"
+        f"order by received_at desc limit {_PCTL_SAMPLE_CAP})"
+        f") a cross join ({excluded_leg}) b"
     )
 
 
@@ -657,8 +809,15 @@ def _pctl_commands() -> list[str]:
         "| tail -n +2 | tr -d '\"\\r' "
         f"| grep -E '{_PCTL_FEED_TOKEN_RE}' | head -{_PCTL_MAX_FEEDS}); "
         "for f in $PCTL_FEEDS; do "
+        # Feed-aware replay excluder (finding 10): the capture_seq dwell
+        # discriminator is valid for dhan ONLY — groww capture_seq is
+        # exchange-ts-seeded, so the dhan predicate would censor genuine
+        # groww lag >60s AND fail to exclude replay-restamped groww rows.
+        'if [ "$f" = dhan ]; then '
+        f'TVPQ="{_pctl_feed_sql(replay_excluder=True)}"; '
+        f'else TVPQ="{_pctl_feed_sql(replay_excluder=False)}"; fi; '
         f"( curl -fsS --max-time {_PCTL_QUERY_MAX_SECS} -G '" + exp + "' "
-        f'--data-urlencode "query={_pctl_feed_sql()}" 2>/dev/null '
+        '--data-urlencode "query=$TVPQ" 2>/dev/null '
         "| tail -n +2 | head -1 | tr -d '\"\\r' > /tmp/tv-pctl-$f.txt ) & "
         "done; wait; "
         "for f in $PCTL_FEEDS; do "
@@ -873,14 +1032,18 @@ _PCTL_COLS = ("p50_ms", "p90_ms", "p95_ms", "p99_ms", "max_ms")
 
 
 def _parse_pctl_row(raw: str) -> tuple:
-    """Parse one `<feed>,<rows>,<negs>,<p50>,<p90>,<p95>,<p99>,<max>` CSV
-    line (lag values in MICROSECONDS from QuestDB) into `(feed, dict)`, or
-    `(None, None)` for anything malformed — a failed on-box query yields an
-    empty tail after the feed name and is skipped, never fabricated. Pure."""
+    """Parse one `<feed>,<rows>,<negs>,<p50>,<p90>,<p95>,<p99>,<max>,
+    <replay_excluded>` CSV line (lag values in MICROSECONDS from QuestDB;
+    replay_excluded = the Rule-11 companion count of replay-restamped OR
+    ≥60s-pipeline-stalled rows excluded from the sample — SQL cannot tell
+    the two apart; see the _pctl_feed_sql HONEST LIMIT note) into
+    `(feed, dict)`, or `(None, None)` for anything malformed — a failed
+    on-box query yields an empty tail after the feed name and is skipped,
+    never fabricated. Pure."""
     import re  # noqa: PLC0415
 
     parts = raw.split(",")
-    if len(parts) != 8:
+    if len(parts) != 9:
         return (None, None)
     feed = parts[0].strip()
     if not re.fullmatch(r"[a-z0-9_-]{1,32}", feed):
@@ -904,6 +1067,15 @@ def _parse_pctl_row(raw: str) -> tuple:
         n = _num(val)
         # µs → ms, 2 decimals (sub-ms resolution matters for the groww share).
         out[key] = round(n / 1000.0, 2) if n is not None else None
+    # Rule-11 companion: replay-restamped (or ≥60s pipeline-stalled) rows
+    # excluded from the sample — rendered on the page, never a silent
+    # drop. Count, not microseconds.
+    # None (empty/null cell) = NOT APPLICABLE: the replay excluder is
+    # dhan-only (finding 10 — groww capture_seq is exchange-ts-seeded, not
+    # a receipt stamp), so non-dhan feeds emit a NULL leg and render "—"
+    # instead of a false verified-0.
+    excl = _num(parts[8])
+    out["replay_excluded"] = None if excl is None else max(int(excl), 0)
     return (feed, out)
 
 
@@ -1134,13 +1306,15 @@ def _parse_latency(stdout: str) -> dict:
         "feeds": feed_rows,
         "feeds_error": "" if feed_rows else (err_t1 or err_t0 or ""),
         "winners": _feed_comparison_winners(feed_rows),
-        # Per-feed exchange→received lag percentile grid (2026-07-03).
-        # Empty dict = the box returned no PCTL rows (QuestDB down, no
-        # receive-stamped rows in the window, or query failed) — the page
-        # says so honestly instead of showing fake numbers.
+        # Per-feed exchange→received lag percentile grid (2026-07-03;
+        # receive-time population + replay exclusion 2026-07-07).
+        # Empty dict = the box returned no PCTL rows (QuestDB down, no rows
+        # received in the window, or query failed) — the page says so
+        # honestly instead of showing fake numbers.
         "percentiles": pctl_map,
         "percentile_winners": _percentile_winners(pctl_map),
-        "percentile_window_mins": _PCTL_WINDOW_MINS,
+        "percentile_recv_window_secs": _PCTL_RECV_WINDOW_SECS,
+        "percentile_ts_prune_hours": _PCTL_TS_PRUNE_HOURS,
         "percentile_sample_cap": _PCTL_SAMPLE_CAP,
         "questdb_ms": sec_to_ms(fields.get("QDB", "")),
         "clock_skew_ms": sec_to_ms(fields.get("SKEW", "")),
@@ -2382,14 +2556,27 @@ def _console_html() -> str:
         <div class="row" style="margin-bottom:12px"><button class="b-blu" onclick="loadLatency()">⚡ Measure now</button></div>
         <div id="latfeeds" style="overflow:auto"></div>
         <div class="muted" id="latload" style="margin-top:8px"></div>
-        <div class="lbl" style="margin-top:14px">exchange → received lag percentiles, per feed (last 10 min)</div>
+        <div class="lbl" style="margin-top:14px">exchange → received lag percentiles, per feed (rows received in the last 120 s)</div>
         <div id="latpctl" style="overflow:auto"></div>
         <div class="muted" id="latpctlnote" style="margin-top:8px"></div>
         <div class="muted" style="margin-top:6px">Lag = exchange timestamp → our receive stamp, per stored tick.
           Method (honest): approximate percentiles (3-significant-figure histogram, computed inside the database)
-          over the latest ≤50,000 receive-stamped rows per feed in the last 10 minutes — a bounded sample, not the
-          full tape; negative lags are clamped to 0 and counted. dhan caveat: dhan exchange timestamps tick in
-          WHOLE SECONDS, so its lag values carry up to ~1s quantization — never read them as millisecond-precise.
+          over the ≤50,000 NEWEST-RECEIVED rows in the last 120 seconds per feed — the population is defined by
+          RECEIVE time (an exchange-time window would structurally hide any lag larger than itself), and the
+          sample bound is ordered by receive time too (ordering by exchange time would evict the most-lagged
+          rows first when the cap binds; a capped sample is flagged below); negative lags
+          are clamped to 0 and counted. Replay honesty (dhan only): dhan rows whose receive stamp lands ≥60 s after
+          the row's original capture instant are EXCLUDED from the sample and counted in the "replay/stall rows
+          excluded" column — that catches restart / WAL-replay re-stamped rows, and can ALSO catch live rows that
+          spent over a minute queued inside the app during a severe pipeline stall (this page cannot tell the two
+          apart; the in-app lag alarm still sees such stall-induced lag). Genuinely lagged LIVE ticks with a fresh
+          capture instant are KEPT. For groww (and any non-dhan feed) that column reads "—": groww's capture sequence is seeded
+          from the exchange timestamp, not a receipt stamp, so replay-restamped groww rows cannot be told apart
+          this way — a documented limitation, never a fake zero.
+          Ceiling: the query scans only the last 6 hours of tick partitions (a performance bound), so a live lag
+          larger than 6 h cannot appear here. dhan caveat: dhan exchange timestamps (LTT) tick in WHOLE SECONDS —
+          a ≥1 s resolution floor, so dhan lag values carry up to ~1 s quantization and can never honestly read 0;
+          never read them as millisecond-precise.
           groww rows carry receive-stamps; after the next deploy the stamp = capture-at-NIC (capture_ns).
           Lower is better; best per column is <span class="ok">green</span>. Auto-extends to any future feed
           (the feed list comes from the database, never hardcoded).</div>
@@ -2747,21 +2934,34 @@ async function loadLatency(){ $('latnet').dataset.loaded='1'; $('latnet').innerH
   // so a future feed #3 gets its row with zero portal changes. Best (lowest)
   // value per column = server-computed j.percentile_winners, green.
   const p=j.percentiles||{}; const pw=j.percentile_winners||{}; const pf=Object.keys(p).sort();
+  const recvWin=(j.percentile_recv_window_secs||120);
   if(pf.length){
-    const pcols=[['p50_ms','p50'],['p90_ms','p90'],['p95_ms','p95'],['p99_ms','p99'],['max_ms','max'],['rows','rows in window']];
+    const pcols=[['p50_ms','p50'],['p90_ms','p90'],['p95_ms','p95'],['p99_ms','p99'],['max_ms','max'],['rows','rows in window'],['replay_excluded','replay/stall rows excluded']];
     let ph='<table><tr><th>feed</th>'+pcols.map(c=>'<th>'+c[1]+'</th>').join('')+'</tr>';
     pf.forEach(f=>{ const r=p[f]; ph+='<tr><td><b>'+esc(String(f))+'</b></td>';
       pcols.forEach(c=>{ const k=c[0]; const v=r[k]; let txt;
-        if(k==='rows') txt=(v==null)?'—':Number(v).toLocaleString();
-        else txt=(r.rows>0)?fmtLagMs(v):'no receive-stamped rows';
+        if(k==='rows'||k==='replay_excluded') txt=(v==null)?'—':Number(v).toLocaleString();
+        else txt=(r.rows>0)?fmtLagMs(v):('no rows received in last '+recvWin+' s');
         ph+='<td class="'+(pw[k]===f?'win':'')+'">'+esc(String(txt))+'</td>'; });
       ph+='</tr>'; });
     $('latpctl').innerHTML=ph+'</table>';
+    // Rule-11 companions: what was clamped / excluded / truncated is SHOWN,
+    // never silent.
+    const notes=[];
+    const excl=pf.filter(f=>p[f].replay_excluded>0).map(f=>f+': '+Number(p[f].replay_excluded).toLocaleString());
+    if(excl.length) notes.push('replay-restamped (or >60s pipeline-stalled) rows excluded from this sample ("—" = not measurable for that feed; see the notes below the table) — '+excl.join(' · '));
+    // Sample-cap honesty (finding 2): rows == cap means the newest-received
+    // truncation bound — the percentiles cover only the newest cap rows of
+    // the 120s window (lag-neutral ordering, but still a truncated sample).
+    const pcap=(j.percentile_sample_cap||50000);
+    const capped=pf.filter(f=>p[f].rows>=pcap);
+    if(capped.length) notes.push('sample capped at '+Number(pcap).toLocaleString()+' newest-received rows — '+capped.join(' · '));
     const clamped=pf.filter(f=>p[f].neg_clamped>0).map(f=>f+': '+Number(p[f].neg_clamped).toLocaleString());
-    $('latpctlnote').textContent=clamped.length?('negative lags clamped to 0 in this sample — '+clamped.join(' · ')):'';
+    if(clamped.length) notes.push('negative lags clamped to 0 in this sample — '+clamped.join(' · '));
+    $('latpctlnote').textContent=notes.join('  |  ');
   } else {
-    $('latpctl').innerHTML='<span class="warn">no lag-percentile data — no receive-stamped rows in the last '
-      +(j.percentile_window_mins||10)+' min (market closed?) or the database query failed on the box</span>';
+    $('latpctl').innerHTML='<span class="warn">no lag-percentile data — no rows received in the last '
+      +recvWin+' s (market closed?) or the database query failed on the box</span>';
   }
   const feeds=Array.isArray(j.feeds)?j.feeds:[]; const w=j.winners||{};
   if(feeds.length){

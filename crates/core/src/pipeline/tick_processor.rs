@@ -159,6 +159,7 @@ const IDLE_FLUSH_DRAIN_INTERVAL: std::time::Duration = std::time::Duration::from
 fn is_within_persist_window(exchange_timestamp: u32, muhurat_active: bool) -> bool {
     // exchange_timestamp is already IST epoch seconds — no offset needed.
     let ist_secs_of_day = exchange_timestamp % SECONDS_PER_DAY;
+    // O(1) EXEMPT: begin — Range::contains is two integer comparisons, not a Vec scan.
     if (TICK_PERSIST_START_SECS_OF_DAY_IST..TICK_PERSIST_END_SECS_OF_DAY_IST)
         // O(1) EXEMPT: Range::contains — two-comparison O(1) bounds check (scanner heuristic misreads it as Vec::contains).
         .contains(&ist_secs_of_day)
@@ -169,6 +170,7 @@ fn is_within_persist_window(exchange_timestamp: u32, muhurat_active: bool) -> bo
         && (MUHURAT_PERSIST_START_SECS_OF_DAY_IST..MUHURAT_PERSIST_END_SECS_OF_DAY_IST)
             // O(1) EXEMPT: Range::contains — O(1) bounds check.
             .contains(&ist_secs_of_day)
+    // O(1) EXEMPT: end
 }
 
 /// Returns `true` if the exchange timestamp's IST day matches today.
@@ -473,6 +475,7 @@ fn is_wall_clock_within_persist_window(received_at_nanos: i64, muhurat_active: b
         && (MUHURAT_PERSIST_START_SECS_OF_DAY_IST..MUHURAT_PERSIST_END_SECS_OF_DAY_IST)
             // O(1) EXEMPT: Range::contains — O(1) bounds check.
             .contains(&wall_clock_ist_secs_of_day)
+    // O(1) EXEMPT: end
 }
 
 /// Selects the depth timestamp: exchange_timestamp if valid, else wall-clock.
@@ -564,6 +567,9 @@ impl TickDedupRing {
     /// # Panics (debug only)
     /// Debug-asserts that `power` is in [8, 24].
     fn new(power: u32) -> Self {
+        // O(1) EXEMPT: begin — one-time boot construction (never per-tick); the
+        // debug_assert Range::contains is two integer comparisons, and the vec!
+        // is the ring's single preallocation.
         debug_assert!(
             // O(1) EXEMPT: RangeInclusive::contains inside a boot-time constructor debug_assert.
             (8..=24).contains(&power),
@@ -575,6 +581,7 @@ impl TickDedupRing {
             slots: vec![u64::MAX; size].into_boxed_slice(),
             mask: size.wrapping_sub(1),
         }
+        // O(1) EXEMPT: end
     }
 
     /// Returns `true` ONLY for a true byte-identical double-delivery of the same
@@ -1356,6 +1363,34 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
                     canary_gauges[idx].set(received_at_nanos.saturating_div(1_000_000_000) as f64);
                 }
 
+                // Silent-feed hardening Item 4 (2026-07-06 incident): observe
+                // the exchange→receive lag for this LIVE Dhan tick. O(1),
+                // zero-alloc (two relaxed atomic stores into a preallocated
+                // ring). The TWO-condition replay discriminator (round-2 fix
+                // 2026-07-07, finding 3: receipt−capture dwell ≥60s AND
+                // capture instant BEFORE the process live boundary) excludes
+                // boot-time WAL-replayed rows EXACTLY (capture_seq is stamped
+                // at the ORIGINAL WS-read instant and preserved through
+                // re-injection, while received_at is re-stamped at dequeue)
+                // while KEEPING genuinely-lagged live ticks — INCLUDING live
+                // rows delayed >60s in the frame channel by a consumer stall,
+                // which the dwell alone misclassified as replay (starving the
+                // window into a stale-healthy gauge) — no Rule-11 censoring
+                // of the measured signal. Sits AFTER every gate
+                // (valid/today/in-window/dedup). Honest caveat: §30
+                // window-exempt always-on SIDs (GIFT Nifty) bypass the
+                // window gates above, so their OFF-session live ticks ARE
+                // recorded into the ring — the publisher's session gate
+                // (feed_lag_monitor::is_in_session_ist, regular + Muhurat
+                // windows) keeps those samples from being PUBLISHED
+                // off-session; the first in-session minute can include up
+                // to 60s of pre-window always-on samples.
+                super::feed_lag_monitor::record_dhan_tick(
+                    tick.received_at_nanos,
+                    capture_seq,
+                    tick.exchange_timestamp,
+                );
+
                 // C2 (feed convergence): the ordered enrich → persist →
                 // aggregate-handoff per-tick consumer sequence is the ONE
                 // shared `consume_feed_tick` core (`super::feed_consumer`) —
@@ -1635,6 +1670,17 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
                     if let Some(ref mut enricher) = greeks_enricher {
                         enricher.enrich(&mut tick);
                     }
+
+                    // Silent-feed hardening Item 4: exchange→receive lag
+                    // observation for the Full-packet arm — mirrors the
+                    // Ticker/Quote persist site above so both Dhan persist
+                    // paths feed the SAME lag window (uniform hot-path
+                    // semantics across packet types). O(1), zero-alloc.
+                    super::feed_lag_monitor::record_dhan_tick(
+                        tick.received_at_nanos,
+                        capture_seq,
+                        tick.exchange_timestamp,
+                    );
 
                     // Persist tick to QuestDB — ingestion gate above already verified
                     // [09:00, 15:30) IST and today's date.
