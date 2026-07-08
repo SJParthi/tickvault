@@ -11314,6 +11314,15 @@ fn compute_tick_freshness(silent_count: usize, universe_size: usize) -> f64 {
 static SLO_PUBLISHER_SUPERVISOR_SPAWNED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+/// Once-per-process spawn guard for the Dhan exchange-lag publisher
+/// supervisor (silent-feed hardening Item 4, 2026-07-06 incident). Same
+/// per-lane-leak rationale as [`SLO_PUBLISHER_SUPERVISOR_SPAWNED`]: D2b lane
+/// restarts re-run `start_dhan_lane`, and each re-invocation would otherwise
+/// leak a fresh never-aborted supervisor. The publisher reads the
+/// process-global lag ring, so it stays correct across lane restarts.
+static FEED_LAG_PUBLISHER_SUPERVISOR_SPAWNED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// F4 (2026-07-08): once-per-process spawn latch for the three market-open
 /// ONE-SHOT schedulers (09:14 readiness / 09:15:30 streaming heartbeat /
 /// 09:16 self-test). They are detached one-shots by design (self-exit after
