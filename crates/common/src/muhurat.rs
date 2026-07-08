@@ -35,9 +35,10 @@ static MUHURAT_ACTIVE: OnceLock<bool> = OnceLock::new();
 // TEST-EXEMPT: covered by tests::current_before_init_is_false_then_reflects_init.
 pub fn init_muhurat_session(active: bool) {
     // First call wins; a second call returns Err(rejected) which we
-    // intentionally discard (boot runs once). `let _` consumes the
-    // #[must_use] Result (a Copy `Result<(), bool>`, so `drop` would no-op).
-    let _ = MUHURAT_ACTIVE.set(active);
+    // intentionally discard (boot runs once). `.ok()` consumes the
+    // #[must_use] Result explicitly (idempotent set — a rejected second
+    // call is the documented no-op, not an error to surface).
+    MUHURAT_ACTIVE.set(active).ok();
 }
 
 /// The current Muhurat-session flag. Returns `false` if [`init_muhurat_session`]
