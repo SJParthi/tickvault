@@ -331,6 +331,9 @@ async fn candle_table_has_int_security_id(client: &Client, base_url: &str, table
 /// `candles_<sfx>_shadow` tables. These names are decoupled from
 /// `TfIndex::table_name()` on purpose — they are *legacy* objects that no
 /// longer correspond to any live timeframe enum.
+///
+/// NOTE: any future `candles_*` prefix sweep MUST exclude `*_named` views
+/// (`console_views::VIEW_TICKS_NAMED` / `VIEW_CANDLES_NAMED`).
 const LEGACY_CANDLE_TF_SUFFIXES: [&str; 9] =
     ["1m", "5m", "15m", "30m", "1h", "2h", "3h", "4h", "1d"];
 
