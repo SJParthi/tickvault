@@ -33,8 +33,13 @@ zero hot-path code) + one TEST-file addition in `crates/common/tests/`
 > codes (log-sink-only), paging through a total SNS/Telegram outage (outside
 > the envelope, stated in the handler), catching an UNLOGGED DH-906 reject
 > (term-filter tripwire only; Rust emit-site is a flagged follow-up), paging
-> a Groww stall-flap SLOWER than ~1 restart per 5 min (<3 counter increments
-> per aligned 900s window = the restart pager's floor; a burst that stops
+> a Groww stall-flap SLOWER than ~1 restart per 7.5 min (span math,
+> round-12: 3 restarts span 2 gaps, so only cycles > ~450s can NEVER fit 3
+> inside one aligned 900s window — the restart pager's true never-page
+> floor; cycles faster than ~5 min page promptly; the ~5-7.5 min band pages
+> EVENTUALLY via phase drift of a sustained flap — the earlier "~5 min
+> floor" used 900/3 average-rate math where the per-window bound needs span
+> math; a burst that stops
 > after straddling the aligned 900s boundary at 2+1 pages NEVER — up to 4
 > restarts (2 per side) inside a SLIDING 15-min span can go unpaged; only a
 > flap sustaining faster than the stated floor always pages — CloudWatch
@@ -129,8 +134,11 @@ flapper invisible) is the proof.
   boot window (supervisor spawn → Step 2) is uncounted — physically
   implausible. NO market-hours gate needed:
   `should_restart_on_stall` requires market_open, so the counter cannot
-  increment off-hours. Honest floor: flap cycles slower than ~5 min (<3
-  restarts per aligned 15-min window) do not page — stated residual; a
+  increment off-hours. Honest floor (span math, round-12): cycles faster
+  than ~5 min page promptly; the ~5-7.5 min band pages eventually via phase
+  drift of a sustained flap; only cycles slower than ~7.5 min (>450s — 3
+  restarts span 2 gaps that no longer fit one aligned 900s window) never
+  page — stated residual; a
   burst that stops after straddling the boundary at 2+1 never pages — up to
   4 restarts in a sliding 15-min span can go unpaged (tumbling windows, not
   sliding; round-10 correction of the "one window later" example). Fast

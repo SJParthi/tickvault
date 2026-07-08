@@ -68,8 +68,15 @@
 # 3). The honest miss set is up to 4 restarts inside a SLIDING 15-min span
 # (2/2 across the boundary) — without a page; only a flap that KEEPS GOING
 # faster than the stated floor is guaranteed to land >=3 inside some aligned
-# window and page. Detection floor: flap cycles slower than ~5 min (<3
-# restarts per 15-min window) do NOT page — stated residual; a single
+# window and page. Detection floor (span math, round-12 — the earlier
+# "~5 min" figure used average-rate math, 900/3 = 300s, where the per-window
+# bound needs SPAN math: 3 restarts span 2 gaps, so 3 fit inside one 900s
+# window only when the cycle is <= ~450s): three bands — cycles FASTER than
+# ~5 min page promptly (every aligned window holds >=3); cycles in the
+# ~5-7.5 min band page EVENTUALLY (a sustained flap's phase drifts across
+# window boundaries until some window holds 3); only cycles SLOWER than
+# ~7.5 min (>450s — 2 gaps no longer fit in 900s) can NEVER fit 3 inside one
+# aligned window — the true never-page floor, stated residual; a single
 # self-heal restart never pages (the runbook's own operator-action bound).
 # Fast flaps (<~50s cycle) additionally trip the errcode-feed-stall-01
 # storm-escalation tripwire within ~5 min.
@@ -108,7 +115,7 @@ resource "aws_cloudwatch_log_metric_filter" "feed_stall_restarts_fallback" {
 
 resource "aws_cloudwatch_metric_alarm" "feed_stall_restarts" {
   alarm_name          = "tv-${var.environment}-feed-stall-restarts"
-  alarm_description   = "FEED-STALL-01 flap: >=3 Groww sidecar stall-restarts within one 15-min window (Sum of the agent's per-scrape deltas of tv_feed_sidecar_stall_restart_total - the counter increments once per restart, warn!- and error!-level alike, and is pre-registered at 0 at boot right after the metrics recorder installs so the delta pipeline's dropped first sample is the 0 baseline, not restart #1 - THIS pager therefore sees every restart incl. the session's first; the errcode-feed-stall-01 alarm sees only the sidecar's own >5-per-5-min STORM escalation ERROR lines). A single self-heal restart never pages. Honest floor: flap cycles slower than ~5 min (<3 restarts per aligned 15-min window) do not page - stated residual. The provider keeps closing the socket - check credential/entitlement. Runbook: .claude/rules/project/feed-stall-watchdog-error-codes.md"
+  alarm_description   = "FEED-STALL-01 flap: >=3 Groww sidecar stall-restarts within one 15-min window (Sum of the agent's per-scrape deltas of tv_feed_sidecar_stall_restart_total - the counter increments once per restart, warn!- and error!-level alike, and is pre-registered at 0 at boot right after the metrics recorder installs so the dropped first delta sample is the 0 baseline, not restart #1 - THIS pager sees every restart incl. the session's first; the errcode-feed-stall-01 alarm sees only the sidecar's own >5-per-5-min STORM escalation ERROR lines). A single self-heal restart never pages. Honest floor (span math): 3 restarts span 2 gaps, so cycles faster than ~5 min page promptly, the ~5-7.5 min band pages eventually via phase drift of a sustained flap, and only cycles slower than ~7.5 min (>450s - 2 gaps no longer fit one aligned 900s window) never page - stated residual. The provider keeps closing the socket - check credential/entitlement. Runbook: .claude/rules/project/feed-stall-watchdog-error-codes.md"
   comparison_operator = "GreaterThanOrEqualToThreshold"
   threshold           = 3
   evaluation_periods  = 1

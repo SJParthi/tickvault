@@ -86,8 +86,11 @@ restarts:
    harmless 0, NOT restart #1 of the session; without a post-install
    registration the first restart of every app session was uncounted and the
    effective first-episode threshold was 4), Sum ≥ 3 per aligned 15-min window
-   → SNS → Telegram. Honest floor: flap cycles slower than ~5 min (<3
-   restarts/15 min) do not page — stated residual.
+   → SNS → Telegram. Honest floor (span math, round-12): 3 restarts span 2
+   gaps, so cycles faster than ~5 min page promptly, the ~5-7.5 min band
+   pages eventually via phase drift of a sustained flap, and only cycles
+   slower than ~7.5 min (>450s) can never fit 3 inside one aligned 900s
+   window — stated residual.
 2. **`tv-<env>-errcode-feed-stall-01`** (`error-code-alarms.tf`) — the
    storm-escalation tripwire: ONE storm-arm ERROR line pages (Sum ≥ 1 per
    5 min; the Rust detector already debounces at >5 restarts/5 min). It
