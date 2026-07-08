@@ -266,10 +266,13 @@ flapper invisible) is the proof.
   hard-stop-guard's in-window breach_stop (its cron ticks at exactly 08:30
   IST) or the SNS budget-killswitch or a manual portal stop between
   08:25-08:45 IST also matches the launch-today-≥-08:25-then-stopped shape →
-  HOLIDAY_SILENT. Not blind: every one of those stop paths publishes its OWN
-  page before/while stopping, and the boot-heartbeat gate window (08:50-09:10)
-  is the backstop — documented in the handler comment (round-1 review fix; the
-  earlier "only the holiday gate stops at that hour" premise was false).
+  HOLIDAY_SILENT. Normally not blind: every one of those stop paths pages in
+  the SAME invocation, AFTER stopping (stop-first is the stoppers' deliberate
+  spend-cap ordering). Honest residual: a stopper whose post-stop publish
+  fails is silent AND this heuristic is silent — the boot-heartbeat gate
+  window (08:50-09:10) is the backstop for that residual — documented in the
+  handler comment (round-1 review fix; the earlier "only the holiday gate
+  stops at that hour" premise was false).
 - The originally-specced "evening stopped-box invoke drill" can NEVER produce
   the expected page: on a normal trading evening LaunchTime = today's 08:30
   auto-start (LaunchTime updates on every start), so a stopped box classifies
@@ -475,7 +478,7 @@ table); the honest-100% envelope wording is in the header block above.
 | 7 | DH-901 repeats every 15 min | 1 🆘 page + 1 🟢 OK per episode (eval 3/dta 1) |
 | 8 | Future session moves the log sinks again (code-side const move OR config-side glob edit) | test_cw_agent_collects_machine_log_paths fails the build — it derives the expected globs from the observability.rs sink constants and checks both agent configs (round-2 cross-coupling) |
 | 9 | Operator invokes the readiness Lambda with `{"mode":"drill"}` (any time, any EC2 state) | 🧪 test page through the real SNS→Telegram path — the end-to-end proof for leg 2 |
-| 10 | Budget breach_stop / killswitch / portal stop lands 08:25-08:45 IST | readiness classifies HOLIDAY_SILENT, but the stopping path itself already paged (breach_stop/killswitch publish before stopping); boot-heartbeat gate window is the backstop |
+| 10 | Budget breach_stop / killswitch / portal stop lands 08:25-08:45 IST | readiness classifies HOLIDAY_SILENT, but the stopping path itself normally pages (breach_stop/killswitch page in the same invocation, AFTER stopping — stop-first spend-cap ordering; a failed post-stop publish is the stated residual); boot-heartbeat gate window is the backstop |
 | 11 | Order-update WS flaps slower than ~1 cycle / 3 min | NOT paged — stated residual (detection floor >5 per 15 min); durable-down alarm owns full outages |
 | 12 | Groww sidecar stall-flaps at a ~90s-300s cycle (warn!-level restarts, no storm escalation) | `tv-prod-feed-stall-restarts` counter alarm pages (Sum ≥ 3 restarts per 15-min window) — round-3 fix; the errcode alarm alone could NEVER see this band (zero ERROR lines) |
 | 13 | Groww sidecar stall-flaps at a <=~60s cycle (>5 restarts / 5 min — span math, round-13: 6 restarts span 5 gaps ≤ 300s) | BOTH page: the sidecar's storm-escalation ERROR line trips errcode-feed-stall-01 within ~5 min (anchored-reset detector window — a straddling burst can defer the escalation by up to ~one extra 300s window) AND the counter alarm trips within the 15-min window |
