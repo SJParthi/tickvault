@@ -54,6 +54,11 @@ pub mod index_extractor;
 #[cfg(feature = "daily_universe_fetcher")]
 pub mod daily_universe;
 
+// §36 (2026-07-08): nearest-expiry FUTIDX-4 selection — the ONE shared pure
+// selector both the Dhan orchestrator and the Groww watch builder call.
+#[cfg(feature = "daily_universe_fetcher")]
+pub mod index_futures;
+
 // Sub-PR #10 of 2026-05-27 daily-universe expansion: chain the
 // CSV parser + extractors + universe builder into a single pure
 // function. Maps each underlying error to the right INSTR-FETCH-*

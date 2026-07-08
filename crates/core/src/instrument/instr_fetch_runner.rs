@@ -78,6 +78,7 @@ pub async fn run_daily_universe_fetch_runner<Fetch, FetchFut>(
     fetch_fn: Fetch,
     max_attempts: Option<u32>,
     ntm_map: Option<&IndexConstituencyMap>,
+    today_ist: chrono::NaiveDate,
 ) -> (LoopOutcome, Option<DailyUniverse>)
 where
     Fetch: FnMut(u32) -> FetchFut,
@@ -92,7 +93,7 @@ where
         // §31 NTM (Sub-PR #10b): `ntm_map` is the best-effort niftyindices
         // constituency fetched once by the boot caller; `None` means the source
         // degraded (caller already emitted NTM-CONSTITUENCY-01) → core universe.
-        build_universe_from_bytes(bytes, ntm_map).inspect_err(|e| {
+        build_universe_from_bytes(bytes, ntm_map, today_ist).inspect_err(|e| {
             let code = e.error_code().code_str();
             warn!(
                 code = code,
@@ -246,7 +247,13 @@ mod tests {
             let next = outcomes.borrow_mut().remove(0);
             async move { next }
         };
-        let (outcome, universe) = run_daily_universe_fetch_runner(fetch, Some(1), None).await;
+        let (outcome, universe) = run_daily_universe_fetch_runner(
+            fetch,
+            Some(1),
+            None,
+            chrono::NaiveDate::from_ymd_opt(2026, 7, 8).expect("date"),
+        )
+        .await;
         assert_eq!(outcome, LoopOutcome::Exhausted { attempts_used: 1 });
         assert!(universe.is_none());
     }
@@ -264,7 +271,13 @@ mod tests {
             let next = outcomes.borrow_mut().remove(0);
             async move { next }
         };
-        let (outcome, universe) = run_daily_universe_fetch_runner(fetch, Some(1), None).await;
+        let (outcome, universe) = run_daily_universe_fetch_runner(
+            fetch,
+            Some(1),
+            None,
+            chrono::NaiveDate::from_ymd_opt(2026, 7, 8).expect("date"),
+        )
+        .await;
         assert_eq!(outcome, LoopOutcome::Exhausted { attempts_used: 1 });
         assert!(universe.is_none());
     }
@@ -280,7 +293,13 @@ mod tests {
             let next = outcomes.borrow_mut().pop();
             async move { next.unwrap_or(Err(CsvDownloadError::BodyTooLarge)) }
         };
-        let (outcome, universe) = run_daily_universe_fetch_runner(fetch, Some(0), None).await;
+        let (outcome, universe) = run_daily_universe_fetch_runner(
+            fetch,
+            Some(0),
+            None,
+            chrono::NaiveDate::from_ymd_opt(2026, 7, 8).expect("date"),
+        )
+        .await;
         assert_eq!(outcome, LoopOutcome::Exhausted { attempts_used: 0 });
         assert!(universe.is_none());
         assert!(!fetch_called, "max_attempts=0 must not invoke fetcher");

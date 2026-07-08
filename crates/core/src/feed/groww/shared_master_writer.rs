@@ -33,6 +33,23 @@ use tickvault_common::sanitize::sanitize_audit_string;
 
 use super::instruments::{GrowwWatchSet, WatchEntry, WatchKind};
 
+/// §36 (2026-07-08): `YYYY-MM-DD` → IST-midnight nanos for the FUTIDX master
+/// rows (0 sentinel on empty/unparsable — same semantics as the Dhan-side
+/// `expiry_date_to_ist_nanos`). Cold path, once per daily master build.
+fn expiry_str_to_ist_midnight_nanos(expiry: &str) -> i64 {
+    let trimmed = expiry.trim();
+    if trimmed.is_empty() {
+        return 0;
+    }
+    let Ok(date) = chrono::NaiveDate::parse_from_str(trimmed, "%Y-%m-%d") else {
+        return 0;
+    };
+    let Some(midnight) = date.and_hms_opt(0, 0, 0) else {
+        return 0;
+    };
+    midnight.and_utc().timestamp_nanos_opt().unwrap_or(0)
+}
+
 // `Feed` / `ErrorCode` / the `error!`+`info!` macros are only used by the feature-gated
 // builders + persist impl (the shared master tables exist only under `daily_universe_fetcher`).
 #[cfg(feature = "daily_universe_fetcher")]
@@ -294,20 +311,34 @@ pub fn build_groww_lifecycle_rows<'a>(
                 e.symbol_name.as_deref().unwrap_or(&e.exchange_token)
             };
             let exchange_segment = groww_segment_label(e);
+            // §36 (2026-07-08): an Ltp entry on segment FNO is one of the 4
+            // index futures — label it FUTIDX (not EQUITY) and stamp its
+            // expiry so the feed='groww' master rows are not mislabeled.
+            let is_fno_future = !is_index && e.segment.eq_ignore_ascii_case("FNO");
             InstrumentLifecycleRow {
                 last_update_ts_nanos,
                 security_id: e.security_id,
                 exchange_segment,
                 // Groww exchange (`NSE`/`BSE`) — exchange_id is an optional SYMBOL.
                 exchange_id: e.exchange.as_str(),
-                instrument_type: if is_index { "INDEX" } else { "EQUITY" },
+                instrument_type: if is_index {
+                    "INDEX"
+                } else if is_fno_future {
+                    "FUTIDX"
+                } else {
+                    "EQUITY"
+                },
                 symbol_name,
                 display_name: symbol_name,
                 underlying_security_id: 0,
                 underlying_symbol: "",
                 lot_size: 0,
                 tick_size: 0.0,
-                expiry_date_nanos: 0,
+                expiry_date_nanos: if is_fno_future {
+                    expiry_str_to_ist_midnight_nanos(e.expiry_date.as_deref().unwrap_or(""))
+                } else {
+                    0
+                },
                 strike_price: 0.0,
                 option_type: "",
                 lifecycle_state: LifecycleState::Active,
@@ -1290,6 +1321,54 @@ pub async fn persist_groww_instruments(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "daily_universe_fetcher")]
+    #[test]
+    fn test_master_writer_labels_fno_ltp_entries_futidx() {
+        // §36 (2026-07-08): an FNO Ltp entry (index future) must be labeled
+        // FUTIDX (not EQUITY) in the feed='groww' master rows, with its
+        // expiry stamped; CASH stocks stay EQUITY; indices stay INDEX.
+        use super::super::instruments::{GrowwWatchSet, WatchEntry, WatchKind};
+        let set = GrowwWatchSet {
+            entries: vec![],
+            master_entries: vec![
+                WatchEntry {
+                    exchange: "NSE".to_owned(),
+                    segment: "FNO".to_owned(),
+                    exchange_token: "61001".to_owned(),
+                    kind: WatchKind::Ltp,
+                    security_id: 61001,
+                    isin: None,
+                    symbol_name: Some("NSE-NIFTY-30Jul26-FUT".to_owned()),
+                    index_name: None,
+                    expiry_date: Some("2026-07-30".to_owned()),
+                },
+                WatchEntry {
+                    exchange: "NSE".to_owned(),
+                    segment: "CASH".to_owned(),
+                    exchange_token: "2885".to_owned(),
+                    kind: WatchKind::Ltp,
+                    security_id: 2885,
+                    isin: Some("INE002A01018".to_owned()),
+                    symbol_name: Some("RELIANCE".to_owned()),
+                    index_name: None,
+                    expiry_date: None,
+                },
+            ],
+            resolved_stocks: 1,
+            unresolved_stocks: vec![],
+            indices: 0,
+        };
+        let rows = build_groww_lifecycle_rows(&set, &std::collections::HashMap::new(), 1, 1, false);
+        assert_eq!(rows.len(), 2);
+        let fut = rows.iter().find(|r| r.security_id == 61001).expect("fut");
+        assert_eq!(fut.instrument_type, "FUTIDX");
+        assert_eq!(fut.exchange_segment, "NSE_FNO");
+        assert!(fut.expiry_date_nanos > 0, "expiry stamped");
+        let stock = rows.iter().find(|r| r.security_id == 2885).expect("eq");
+        assert_eq!(stock.instrument_type, "EQUITY");
+        assert_eq!(stock.expiry_date_nanos, 0);
+    }
     use crate::feed::groww::instruments::{GrowwWatchSet, WatchEntry, WatchKind};
 
     // Used only by the feature-gated row-builder tests below.
@@ -1304,6 +1383,7 @@ mod tests {
             isin: Some(isin.to_string()),
             symbol_name: Some(symbol.to_string()),
             index_name: None,
+            expiry_date: None,
         }
     }
 
@@ -1317,6 +1397,7 @@ mod tests {
             isin: None,
             symbol_name: None,
             index_name: Some(format!("{exchange}-{name}")),
+            expiry_date: None,
         }
     }
 
@@ -1330,6 +1411,7 @@ mod tests {
             isin: Some("INE000000001".to_string()),
             symbol_name: Some("X".to_string()),
             index_name: None,
+            expiry_date: None,
         }
     }
 

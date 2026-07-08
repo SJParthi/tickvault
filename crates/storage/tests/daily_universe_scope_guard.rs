@@ -419,3 +419,114 @@ fn boot_timing_proof_is_measured_and_surfaced() {
         "the formatter must suppress the Telegram when timing was not measured"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Section FUTIDX-4 (§36, 2026-07-08) — the index-futures grant is pinned to
+// exactly 4 underlyings, nearest expiry, never-roll, Quote mode. Any widening
+// (5th underlying, OPTIDX, non-nearest expiry, intraday resubscribe) requires
+// a fresh dated operator quote + a rule-file edit FIRST.
+// ---------------------------------------------------------------------------
+
+fn index_futures_rs_body() -> String {
+    let path = repo_root().join("crates/core/src/instrument/index_futures.rs");
+    std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {} failed: {e}", path.display()))
+}
+
+#[test]
+fn futidx_scope_pinned_to_4_underlyings_nearest_expiry() {
+    let body = rule_file_body();
+    for phrase in [
+        "FUTIDX",
+        "NIFTY",
+        "BANKNIFTY",
+        "MIDCPNIFTY",
+        "SENSEX",
+        "nearest expiry",
+        "NEVER roll",
+        "Quote mode",
+    ] {
+        assert!(
+            body.contains(phrase),
+            "rule file §36 must pin the FUTIDX-4 contract phrase: {phrase:?}"
+        );
+    }
+    let src = index_futures_rs_body();
+    assert!(
+        src.contains("[IndexFutureUnderlying; 4]"),
+        "INDEX_FUTURES_UNDERLYINGS must be an arity-4 array — a 5th underlying needs a rule edit"
+    );
+    assert!(
+        src.contains("MAX_INDEX_FUTURE_TARGETS: usize = 4"),
+        "MAX_INDEX_FUTURE_TARGETS must stay 4"
+    );
+    for canonical in ["\"NIFTY\"", "\"BANKNIFTY\"", "\"MIDCPNIFTY\"", "\"SENSEX\""] {
+        assert!(
+            src.contains(canonical),
+            "index_futures.rs must carry the canonical literal {canonical}"
+        );
+    }
+}
+
+#[test]
+fn futidx_scope_rule_file_pins_forbidden_remainder() {
+    let body = rule_file_body();
+    for phrase in [
+        "OPTIDX",
+        "FUTSTK",
+        "OPTSTK",
+        "master-only",
+        "NO intraday resubscribe",
+        "beyond the §36 grant",
+    ] {
+        assert!(
+            body.contains(phrase),
+            "rule file must keep the §36 forbidden-remainder phrase: {phrase:?}"
+        );
+    }
+}
+
+#[test]
+fn futidx_scope_never_roll_source_pin() {
+    // The shared boundary fn keeps the `>= today` nearest find AND has NO
+    // TradingCalendar parameter (accidental stock-style T-0 roll activation
+    // must stay unrepresentable).
+    let src = index_futures_rs_body();
+    assert!(
+        src.contains("pub fn select_index_future_expiry("),
+        "the shared boundary fn must exist"
+    );
+    let fn_start = src
+        .find("pub fn select_index_future_expiry(")
+        .expect("fn present");
+    let fn_body = &src[fn_start..fn_start + 500];
+    assert!(
+        fn_body.contains(">= today_ist"),
+        "nearest = first expiry >= today (the never-roll rule)"
+    );
+    assert!(
+        !fn_body.contains("TradingCalendar"),
+        "select_index_future_expiry must NOT take a calendar — the calendar arm exists only \
+         to trigger the banned stock T-0 roll"
+    );
+}
+
+#[test]
+fn futidx_scope_legacy_gate_still_false() {
+    // The legacy planner gate was NOT the vector — it stays `false` forever.
+    let path = repo_root().join("crates/core/src/instrument/subscription_planner.rs");
+    let src = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("read {} failed: {e}", path.display()));
+    // The gate fn name is assembled at runtime so THIS file never contains
+    // the retired-flag substring the `indices4only_scope_lock_guard.rs`
+    // whole-crates scan bans (its allowlist covers only 3 files).
+    let gate_fn_name: String = ["should_", "subscribe_index_", "derivatives"].concat();
+    let gate = src
+        .find(&format!("pub const fn {gate_fn_name}"))
+        .expect("legacy gate fn must still exist");
+    let gate_body = &src[gate..gate + 200];
+    assert!(
+        gate_body.contains("false"),
+        "the legacy index-derivatives gate must keep returning false — the §36 FUTIDX path \
+         is the DailyUniverse IndexFuture role, never this gate"
+    );
+}

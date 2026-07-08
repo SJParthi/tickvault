@@ -13809,14 +13809,22 @@ fn spawn_post_market_tasks(
             .subscription_targets
             .iter()
             .filter_map(|t| {
+                // §36 (2026-07-08): the 15:31 cross-verify stays SPOT-ONLY by
+                // construction — `instrument_type_for_role` returns None for
+                // IndexFuture targets (Dhan-historical FUTIDX UNVERIFIED-LIVE),
+                // so futures never enter the target list; counted, not silent.
+                let Some(instrument) =
+                    tickvault_app::prev_day_ohlcv_boot::instrument_type_for_role(t.role)
+                else {
+                    metrics::counter!("tv_cross_verify_futidx_skipped_total").increment(1);
+                    return None;
+                };
                 t.csv_row.security_id.trim().parse::<i64>().ok().map(|sid| {
                     tickvault_app::cross_verify_1m_boot::CrossVerifyTarget {
                         security_id: sid,
                         segment: t.csv_row.segment.trim().to_string(),
                         symbol: t.csv_row.symbol_name.trim().to_string(),
-                        instrument: tickvault_app::prev_day_ohlcv_boot::instrument_type_for_role(
-                            t.role,
-                        ),
+                        instrument,
                     }
                 })
             })

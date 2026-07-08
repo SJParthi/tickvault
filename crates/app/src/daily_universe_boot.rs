@@ -218,8 +218,13 @@ where
         }
     };
 
+    // §36 (2026-07-08): the IST trading date drives the nearest-expiry
+    // FUTIDX selection inside the universe build. Derived from the SAME
+    // `today_ist_nanos` (IST midnight as UTC-interpreted nanos) the
+    // lifecycle reconcile uses, so selection + persistence agree on the date.
+    let today_ist = chrono::DateTime::from_timestamp_nanos(today_ist_nanos).date_naive();
     let (outcome, universe) =
-        run_daily_universe_fetch_runner(wrapped, max_attempts, ntm_map.as_ref()).await;
+        run_daily_universe_fetch_runner(wrapped, max_attempts, ntm_map.as_ref(), today_ist).await;
 
     let Some(universe) = universe else {
         anyhow::bail!(

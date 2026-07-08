@@ -554,11 +554,19 @@ async fn activate_groww_lane(
                 if let Some(slot) = &scale_entries_slot {
                     slot.store(Some(std::sync::Arc::new(set.entries.clone())));
                 }
+                // §36 (2026-07-08): the ≤4 nearest-expiry index futures are
+                // the FNO entries of the assembled set.
+                let index_futures = set
+                    .entries
+                    .iter()
+                    .filter(|e| e.segment.eq_ignore_ascii_case("FNO"))
+                    .count();
                 info!(
                     entries = set.entries.len(),
                     master_entries = set.master_entries.len(),
                     indices = set.indices,
                     resolved_stocks = set.resolved_stocks,
+                    index_futures,
                     unresolved = set.unresolved_stocks.len(),
                     "[feeds] Groww watch-list ready"
                 );

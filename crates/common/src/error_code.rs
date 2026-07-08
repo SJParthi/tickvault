@@ -836,6 +836,22 @@ pub enum ErrorCode {
     /// only — the production capture chain is untouched. Severity::Medium,
     /// auto-triage-safe.
     GrowwNative04WriterFailed,
+    /// FUTIDX-01 (§36 2026-07-08) — the nearest-expiry index-future selection
+    /// degraded for ≥1 of the 4 authorized underlyings on one feed (no FUT
+    /// rows / all expiries past / ambiguous duplicate expiry / unparsable
+    /// expiry). That feed runs WITHOUT that future for the day — degrade,
+    /// never HALT; the spot universe is unaffected. Severity::High,
+    /// auto-triage-safe (the degrade already happened; operator inspects the
+    /// day's master CSV + the alias-drift evidence payload at leisure).
+    Futidx01SelectionDegraded,
+    /// FUTIDX-02 (§36 2026-07-08) — the boot-time cross-feed comparator found
+    /// the Dhan and Groww builds chose DIFFERENT expiry dates (or one-sided
+    /// presence) for an index-future underlying. Both feeds STAY LIVE
+    /// (visibility, never a halt); cross-feed rows for that underlying are
+    /// not comparable that day. One vendor's master is stale/divergent —
+    /// operator compares the two masters' FUT rows and records a dated note.
+    /// Severity::High.
+    Futidx02CrossFeedExpiryMismatch,
 }
 
 impl ErrorCode {
@@ -1011,6 +1027,8 @@ impl ErrorCode {
             Self::GrowwNative02AuthFailed => "GROWW-NATIVE-02",
             Self::GrowwNative03DecodeFailed => "GROWW-NATIVE-03",
             Self::GrowwNative04WriterFailed => "GROWW-NATIVE-04",
+            Self::Futidx01SelectionDegraded => "FUTIDX-01",
+            Self::Futidx02CrossFeedExpiryMismatch => "FUTIDX-02",
         }
     }
 
@@ -1152,6 +1170,12 @@ impl ErrorCode {
             // server-side cap).
             | Self::GrowwScale01RollbackFired
             | Self::GrowwScale02GlobalHalve => Severity::High,
+            // FUTIDX-01/02 (§36 2026-07-08) — per-underlying selection degrade
+            // / cross-feed expiry divergence. Loud (Telegram High), never a
+            // halt; the spot universe + both live feeds are unaffected.
+            Self::Futidx01SelectionDegraded | Self::Futidx02CrossFeedExpiryMismatch => {
+                Severity::High
+            }
             // Medium: data pipeline correctness
             // PR #6b (2026-05-19): I-P0-01/02/04/05 retired with their modules.
             Self::InstrumentP1CrossSegmentCollision
@@ -1429,6 +1453,9 @@ impl ErrorCode {
             | Self::GrowwNative04WriterFailed => {
                 ".claude/rules/project/groww-native-rust-error-codes.md"
             }
+            Self::Futidx01SelectionDegraded | Self::Futidx02CrossFeedExpiryMismatch => {
+                ".claude/rules/project/futidx-4-error-codes.md"
+            }
         }
     }
 
@@ -1606,6 +1633,8 @@ impl ErrorCode {
             Self::GrowwNative02AuthFailed,
             Self::GrowwNative03DecodeFailed,
             Self::GrowwNative04WriterFailed,
+            Self::Futidx01SelectionDegraded,
+            Self::Futidx02CrossFeedExpiryMismatch,
         ]
     }
 }
@@ -1915,11 +1944,33 @@ mod tests {
         // bumped 128 -> 129 for GROWW-SCALE-05 (dual scale-fleet instance
         // detected / SSM lock unprovable — fleet spawn refused fail-closed,
         // single-connection fallback).
-        // 2026-07-06 (AUTH-GAP-05 token self-heal): bumped 129 -> 130 for
-        // AUTH-GAP-05 (sustained mid-session token-invalid — forced re-mint
-        // triggered via the existing renewal machinery; lock-before-mint +
-        // ~125s cooldown + retry-once latch honored).
-        assert_eq!(ErrorCode::all().len(), 130);
+        // 2026-07-06 (order-update outage paging PR-1): bumped 129 -> 130 for
+        // WS-GAP-10 (order-update in-market outage — the reachable in-loop
+        // [HIGH] page; the old task-exit emit was dead code since WS-GAP-04).
+        // 2026-07-07 (Telegram UX overhaul — episode live-edit coalescing):
+        // bumped 130 -> 131 for TELEGRAM-03 (episode machinery degraded:
+        // store_write_failed / rehydrate_corrupt / edit_fallback_storm —
+        // delivery unaffected, UX-only degrade, Severity::Low).
+        // 2026-07-08 (§36 FUTIDX-4): bumped 131 -> 133 for FUTIDX-01
+        // (per-underlying nearest-expiry selection degraded, per feed) +
+        // FUTIDX-02 (cross-feed expiry mismatch) — both Severity::High.
+        assert_eq!(ErrorCode::all().len(), 133);
+    }
+
+    #[test]
+    fn test_telegram_03_episode_degraded_contract() {
+        // Telegram UX overhaul (2026-07-07): episode live-edit machinery
+        // degrade signal. Low + auto-triage-safe — delivery is never at
+        // risk (the fallback ladder terminates at TELEGRAM-01 loudness).
+        let code = ErrorCode::Telegram03EpisodeDegraded;
+        assert_eq!(code.code_str(), "TELEGRAM-03");
+        assert_eq!("TELEGRAM-03".parse::<ErrorCode>(), Ok(code));
+        assert_eq!(code.severity(), Severity::Low);
+        assert!(code.is_auto_triage_safe());
+        assert_eq!(
+            code.runbook_path(),
+            ".claude/rules/project/wave-3-error-codes.md"
+        );
     }
 
     #[test]
@@ -2084,7 +2135,9 @@ mod tests {
                 // Wave-4-E1 / BP-07 (2026-07-01): OOM-kill monitor.
                 || s.starts_with("PROC-")
                 // C2 (2026-07-03): panic-free reqwest client construction.
-                || s.starts_with("HTTP-CLIENT-");
+                || s.starts_with("HTTP-CLIENT-")
+                // §36 (2026-07-08): FUTIDX-4 nearest-expiry index futures.
+                || s.starts_with("FUTIDX-");
             assert!(has_known_prefix, "unexpected code prefix: {s}");
         }
     }
