@@ -430,6 +430,11 @@ async fn activate_groww_lane(
 
     // Compute the watch date NOW (activation time), not at boot — an overnight
     // re-enable must use today's date, never the boot-day's stale date.
+    // Hostile-review round 3 (2026-07-08): this entry-time value is ONLY the
+    // fail-fast validity probe below — the pull-until-success loop re-derives
+    // the date PER ATTEMPT (mirror of the Dhan `today_ist_fn` R2 fix), so an
+    // activation straddling IST midnight (T-0→T+1 expiry crossing) builds
+    // and names the watch file with the NEW date, never a frozen stale one.
     let watch_date = today_ist_date();
 
     // Fail-closed date guard (defense-in-depth, operator "cover all worst cases").
@@ -541,9 +546,24 @@ async fn activate_groww_lane(
     let mut attempt: u32 = 0;
     loop {
         attempt = attempt.saturating_add(1);
+        // Hostile-review round 3 (2026-07-08): the trading date is re-derived
+        // PER ATTEMPT — a retry loop that crosses IST midnight must select
+        // FUTIDX (and name the watch file) with the NEW date, never keep the
+        // just-expired front month for the whole next session. The entry-time
+        // validity probe above already bailed on a permanently-broken clock;
+        // a per-attempt invalid date falls back to the (validated) entry
+        // value so the loop never spins on a transient clock glitch.
+        let attempt_watch_date = {
+            let d = today_ist_date();
+            if tickvault_core::instrument::instrument_snapshot::is_valid_trading_date(&d) {
+                d
+            } else {
+                watch_date.clone()
+            }
+        };
         match tickvault_core::feed::groww::instruments::build_and_write_groww_watch(
             &cache_dir,
-            &watch_date,
+            &attempt_watch_date,
             max_subscribe,
         )
         .await
@@ -577,9 +597,15 @@ async fn activate_groww_lane(
                 // /feeds page show REAL Groww counts instead of unknown until
                 // the sidecar's first status report. Idempotent overwrite: the
                 // bridge's later sidecar-status set stays authoritative.
+                // Hostile-review round 3 (2026-07-08): the non-index bucket is
+                // the LIVE set minus indices (mirror of the Dhan call in
+                // main.rs: `stocks = total - indices`) so it INCLUDES the ≤4
+                // §36 futures — the /feeds page and the FeedInstrumentsLoaded
+                // Telegram (`subscribed = entries.len()`) now agree
+                // (subscribed == stocks_bucket + indices, no off-by-4).
                 feed_health.set_subscribed(
                     Feed::Groww,
-                    set.resolved_stocks as u64,
+                    set.entries.len().saturating_sub(set.indices) as u64,
                     set.indices as u64,
                 );
                 // 2026-07-03 Telegram feed parity (operator: "whatever we
@@ -610,7 +636,9 @@ async fn activate_groww_lane(
                 // master write). The Groww lane has no dry-run universe, so
                 // `dry_run=false`.
                 let persist_questdb = questdb.clone();
-                let persist_date = watch_date.clone();
+                // Round 3: persist under the date the set was BUILT for
+                // (the per-attempt date), not the activation-entry date.
+                let persist_date = attempt_watch_date.clone();
                 tokio::spawn(async move {
                     tickvault_core::feed::groww::shared_master_writer::persist_groww_instruments(
                         &persist_questdb,
@@ -901,6 +929,41 @@ mod tests {
         assert!(!is_dead_activation(false, true, false));
         assert!(!is_dead_activation(false, true, true));
         assert!(!is_dead_activation(false, false, false));
+    }
+
+    /// Hostile-review round 3 (2026-07-08) ratchet (source-order scan,
+    /// mirror of `runner_rederives_trading_date_per_build_attempt` on the
+    /// Dhan side): the watch TRADING DATE must be re-derived INSIDE the
+    /// pull-until-success loop (per attempt, before the build call) — a
+    /// frozen entry-time date selects the just-expired contract when the
+    /// retry loop crosses IST midnight on the T-0→T+1 expiry boundary.
+    #[test]
+    fn ratchet_watch_date_rederived_per_attempt_inside_loop() {
+        let src: String = include_str!("groww_activation.rs")
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        // Needles split via concat! so this test's own source never
+        // satisfies the scan vacuously.
+        let loop_marker = concat!("attempt=attempt.", "saturating_add(1);");
+        let derive_marker = concat!("letattempt_watch_date", "=");
+        let build_marker = concat!("build_and_write_", "groww_watch(");
+        let loop_pos = src.find(loop_marker).expect("loop head present");
+        let derive_pos = src
+            .find(derive_marker)
+            .expect("per-attempt date derivation present");
+        let build_pos = src.find(build_marker).expect("build call present");
+        assert!(
+            loop_pos < derive_pos && derive_pos < build_pos,
+            "the watch date must be derived PER ATTEMPT: loop head -> date \
+             derivation -> build call, in source order"
+        );
+        // And the build must consume the per-attempt date, not the frozen one.
+        let consume = concat!("&attempt_", "watch_date,");
+        assert!(
+            src.contains(consume),
+            "build_and_write_groww_watch must take the per-attempt date"
+        );
     }
 
     /// FIX 13c ratchet (source-scan, groww_bridge pattern): the watch-set
