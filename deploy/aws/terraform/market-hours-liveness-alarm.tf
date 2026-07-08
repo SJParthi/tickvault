@@ -210,6 +210,39 @@ resource "aws_cloudwatch_log_group" "tv_market_hours_liveness_gate" {
   retention_in_days = 14
 }
 
+# ---------------------------------------------------------------------------
+# Watch the watchman (round-13, 2026-07-06): the gate Lambda's 09:20 IST open
+# invocation is the ONLY path that arms the 4 gated alarms (incl. the leg-3
+# order-update reconnect-storm pager). A gate failure previously re-opened
+# the 2026-07-06 zero-page gap SILENTLY — the gated alarms simply stayed
+# disarmed all session with nothing watching the gate itself. Same shape as
+# the readiness watchman (market-open-readiness-lambda.tf): AWS/Lambda
+# Errors, Sum >= 1 per 300s, notBreaching. Residual: a rule that never
+# INVOKES the Lambda (scheduler drop / disabled rule) produces no Errors
+# datapoint at all (notBreaching -> silent) — the explicit state = "ENABLED"
+# pins + the liveness alarms are the backstop.
+# ---------------------------------------------------------------------------
+resource "aws_cloudwatch_metric_alarm" "market_hours_gate_lambda_errors" {
+  alarm_name          = "tv-${var.environment}-market-hours-gate-errors"
+  alarm_description   = "The market-hours gate Lambda FAILED - its 09:20 IST open invocation is the ONLY path that arms the 4 gated alarms (market-hours-liveness-missing, realtime-guarantee-critical, aggregator-no-seals, order-update-reconnect-storm). A failed open leaves all 4 disarmed for the session (the 2026-07-06 leg-3 zero-page class); a failed close leaves them armed overnight (false-page risk). Manually enable_alarm_actions / disable_alarm_actions as appropriate after reading the gate Lambda's log group."
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  evaluation_periods  = 1
+  metric_name         = "Errors"
+  namespace           = "AWS/Lambda"
+  period              = 300
+  statistic           = "Sum"
+  threshold           = 1
+  treat_missing_data  = "notBreaching"
+  dimensions = {
+    FunctionName = aws_lambda_function.tv_market_hours_liveness_gate.function_name
+  }
+  alarm_actions = [aws_sns_topic.tv_alerts.arn]
+  # Expect ONE one-time green OK page the apply evening: new-alarm
+  # INSUFFICIENT_DATA -> OK creation settling, not a recovery (round-8;
+  # full rationale in error-code-alarms.tf's ok_actions comment).
+  ok_actions = [aws_sns_topic.tv_alerts.arn]
+}
+
 # Open the liveness window at 09:20 IST (03:50 UTC) Mon-Fri — 5 min after the
 # 09:15 IST market open, giving the post-boot SLO loop time to publish its first
 # tv_realtime_guarantee_score sample on a healthy session.

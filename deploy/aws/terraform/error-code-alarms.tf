@@ -11,10 +11,10 @@
 #   metric -> alarm (<=5 min) -> SNS tv-alerts -> Telegram webhook Lambda.
 #
 # HONEST ALARM COUNT: this file takes the REAL total from 33 -> 41 alarms
-# (44 with the reconnect-storm + feed-stall-restarts + readiness-lambda-errors
-# alarms landing in the same PR). Overage above the 10 free-tier alarms moves
-# $2.30 -> $3.40/mo. The rule-file "10 alarms free tier" claims were already
-# stale pre-PR.
+# (45 with the reconnect-storm + feed-stall-restarts + readiness-lambda-errors
+# + market-hours-gate-errors alarms landing in the same PR). Overage above the
+# 10 free-tier alarms moves $2.30 -> $3.50/mo. The rule-file "10 alarms free
+# tier" claims were already stale pre-PR.
 #
 # DIMENSIONLESS BY DESIGN: errors.jsonl events carry NO `host` field (the host
 # label is added by the Prometheus scrape, not the tracing layer), and metric
@@ -120,14 +120,20 @@ locals {
     }
     # FEED-STALL-01 (round-3 review fix, 2026-07-06): the ONLY ERROR-level
     # FEED-STALL-01 emission is the sidecar's own STORM escalation — the 6th+
-    # rapid restart inside a 300s sliding window (>STALL_RESTART_STORM_MAX=5,
-    # groww_sidecar_supervisor.rs). Per-restart emissions are warn!-level and
-    # NEVER reach the ERROR-only errors.jsonl sink, so this filter counts
+    # rapid restart inside a 300s ANCHORED-RESET window
+    # (>STALL_RESTART_STORM_MAX=5, groww_sidecar_supervisor.rs — the window
+    # start resets when it elapses; round-13 correction: NOT a sliding
+    # window, so a burst straddling the anchor can defer the escalation by
+    # up to ~one extra 300s window). Per-restart emissions are warn!-level
+    # and NEVER reach the ERROR-only errors.jsonl sink, so this filter counts
     # storm-escalation LINES, not restarts. The earlier "Sum >= 3 restarts per
     # 15 min" tuning could therefore never see 3-5 restarts/15 min (zero ERROR
     # lines) — a Rule-11 false-OK envelope. Retuned: ONE storm line pages
     # (threshold 1 per 300s; the Rust detector already debounces at >5
-    # restarts/5 min, so a single self-heal restart still never pages). The
+    # restarts/5 min, so a single self-heal restart still never pages).
+    # Tripwire floor (span math, round-13 — the earlier "~50s" used 300/6
+    # average-rate math): 6 restarts span 5 gaps <= the 300s window, so
+    # cycles <= ~60s can escalate. The
     # ">=3 restarts per 15 min" pager — counting EVERY restart, warn! + error!
     # alike — is the separate tv-<env>-feed-stall-restarts counter alarm
     # (feed-stall-restart-alarm.tf).
@@ -138,7 +144,7 @@ locals {
       eval        = 3
       dta         = 1
       ok_recovery = true
-      desc        = "FEED-STALL-01 STORM escalation: the Groww sidecar's own storm detector fired (>5 stall-restarts within a 5-min sliding window - the 6th+ rapid restart emits the only ERROR-level FEED-STALL-01 line; per-restart emissions are warn!-level and invisible to this filter). The provider keeps closing the socket faster than ~50s/cycle. A single self-heal restart never pages. The >=3-restarts-per-15-min pager (all restart cadences) is tv-<env>-feed-stall-restarts (feed-stall-restart-alarm.tf). Check credential/entitlement. Runbook: .claude/rules/project/feed-stall-watchdog-error-codes.md"
+      desc        = "FEED-STALL-01 STORM escalation: the Groww sidecar's own storm detector fired (>5 stall-restarts within a 5-min ANCHORED-reset window - the 6th+ rapid restart emits the only ERROR-level FEED-STALL-01 line; per-restart emissions are warn!-level and invisible to this filter). The provider keeps closing the socket at <=~60s/cycle (span math: 6 restarts span 5 gaps <= 300s; anchored-reset, not sliding - a burst straddling the anchor can defer the escalation by up to ~one extra 300s window). A single self-heal restart never pages. The >=3-restarts-per-15-min pager (all restart cadences) is tv-<env>-feed-stall-restarts (feed-stall-restart-alarm.tf). Check credential/entitlement. Runbook: .claude/rules/project/feed-stall-watchdog-error-codes.md"
     }
     "ws-reinject-01" = {
       pattern     = "{ $.code = \"WS-REINJECT-01\" && $.level = \"ERROR\" }"
@@ -205,10 +211,11 @@ resource "aws_cloudwatch_metric_alarm" "error_code" {
   # INSUFFICIENT_DATA -> OK on its first evaluation. CloudWatch invokes
   # ok_actions on ANY transition into OK, and the telegram-webhook Lambda
   # formats every OK as a green message (it reads only NewStateValue - no
-  # OldStateValue filter). Expect up to ~6 one-time green "recovered" pages
+  # OldStateValue filter). Expect up to ~7 one-time green "recovered" pages
   # the apply evening: the 4 ok_recovery=true codes here (dh-901,
   # auth-gap-04, ws-gap-07, feed-stall-01) + feed-stall-restarts +
-  # readiness-lambda-errors (the reconnect-storm alarm is exempt via
+  # readiness-lambda-errors + market-hours-gate-errors (round-13; the
+  # reconnect-storm alarm is exempt via
   # actions_enabled=false). Creation settling, NOT recoveries. Flagged
   # follow-up (not this PR): an OldStateValue == INSUFFICIENT_DATA
   # suppression branch in the telegram-webhook Lambda - benefits every

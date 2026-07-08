@@ -5,9 +5,10 @@
 # log-filter alarm (error-code-alarms.tf) can only see ERROR-level
 # FEED-STALL-01 lines — and in groww_sidecar_supervisor.rs the PER-RESTART
 # emission is warn! (invisible to the ERROR-only errors.jsonl sink); only the
-# sidecar's own STORM escalation (>5 restarts within a 300s sliding window,
-# i.e. the 6th+ rapid restart) is error!. So the errcode alarm's real paging
-# floor is a <~50s flap cycle. Flap cycles between ~50s and ~5 min (e.g. the
+# sidecar's own STORM escalation (>5 restarts within a 300s anchored-reset
+# window, i.e. the 6th+ rapid restart) is error!. So the errcode alarm's real
+# paging floor is a <=~60s flap cycle (span math, round-13: 6 restarts span 5
+# gaps <= 300s). Flap cycles between ~60s and ~5 min (e.g. the
 # ~90s stall-flap analog of the 2026-07-06 order-update incident cadence)
 # produced ZERO ERROR lines and therefore ZERO pages, while the docs claimed
 # ">=3 stall-restarts in 15 min pages".
@@ -78,8 +79,11 @@
 # ~7.5 min (>450s — 2 gaps no longer fit in 900s) can NEVER fit 3 inside one
 # aligned window — the true never-page floor, stated residual; a single
 # self-heal restart never pages (the runbook's own operator-action bound).
-# Fast flaps (<~50s cycle) additionally trip the errcode-feed-stall-01
-# storm-escalation tripwire within ~5 min.
+# Fast flaps (<=~60s cycle — span math, 6 restarts span 5 gaps <= the 300s
+# window; the Rust detector's window is ANCHORED-reset, not sliding, so a
+# burst straddling the anchor can defer the escalation by up to ~one extra
+# 300s window) additionally trip the errcode-feed-stall-01 storm-escalation
+# tripwire.
 #
 # Future EMF-allowlisting: if the counter is ever added to the EMF
 # metric_selectors allowlist, REMOVE this log metric filter in the same PR

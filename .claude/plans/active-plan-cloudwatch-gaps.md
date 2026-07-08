@@ -24,8 +24,12 @@ zero hot-path code) + one TEST-file addition in `crates/common/tests/`
 > Telegram (FEED-STALL-01: the only ERROR-level emission is the sidecar's own
 > >5-restarts-per-5-min STORM escalation — per-restart emissions are
 > warn!-level and never reach the ERROR-only errors.jsonl sink, so the errcode
-> alarm pages within ~5 min of the 6th rapid restart, i.e. flap cycles faster
-> than ~50s; the ≥3-restarts-per-15-min band, all cadences, is covered by the
+> alarm pages within ~5 min of the 6th rapid restart, i.e. flap cycles of
+> ~60s or faster (span math, round-13: 6 restarts span 5 gaps ≤ the 300s
+> window — the earlier "~50s" used 300/6 average-rate math; the Rust
+> detector's window is ANCHORED-reset, not sliding, so a burst straddling
+> the anchor can defer the escalation by up to ~one extra 300s window);
+> the ≥3-restarts-per-15-min band, all cadences, is covered by the
 > separate `tv-<env>-feed-stall-restarts` counter alarm — round-3 review fix;
 > the round-2 "≥3 restarts per 15-min window / first page ≈ 15-17 min" claim
 > was FALSE against the errors.jsonl route because 3-5 warn!-level restarts
@@ -65,7 +69,13 @@ zero hot-path code) + one TEST-file addition in `crates/common/tests/`
 > the agent's dropped first post-restart counter sample (~8 increments
 > worst-case = one scrape-interval under the reconnect backoff ladder) —
 > restarts are owned
-> by the liveness alarms). Claiming more than this envelope = REJECT in
+> by the liveness alarms; and the leg-3 reconnect-storm alarm pages only if
+> the market-hours gate Lambda's 09:20 IST open invocation ARMED it — a
+> gate-Lambda error now pages via `tv-<env>-market-hours-gate-errors`
+> (round-13); residual: a rule that never INVOKES the Lambda — scheduler
+> drop / disabled rule — yields no Errors datapoint at all (notBreaching →
+> silent); the explicit state="ENABLED" pins + the liveness alarms are the
+> backstop). Claiming more than this envelope = REJECT in
 > review.
 
 ## Design
@@ -105,7 +115,10 @@ flapper invisible) is the proof.
   eval 3 / dta 1 anti-flap (identical first-page latency; 1 page + 1 OK per
   repeating-error episode); FEED-STALL-01 is Sum ≥ 1 per 300s (round-3 review
   fix: the ONLY ERROR-level FEED-STALL-01 emission is the sidecar's own storm
-  escalation — the 6th+ rapid restart within a 300s sliding window; per-restart
+  escalation — the 6th+ rapid restart within a 300s ANCHORED-reset window
+  (round-13: the window start resets when it elapses, NOT sliding — a burst
+  straddling the anchor can defer the escalation by up to ~one extra 300s
+  window); per-restart
   emissions are warn!-level and invisible to the ERROR-only errors.jsonl route,
   so the round-2 "Sum ≥ 3 restarts per 900s" tuning could never see 3-5
   restarts/15 min. One storm line = page; a single self-heal restart still
@@ -142,7 +155,10 @@ flapper invisible) is the proof.
   burst that stops after straddling the boundary at 2+1 never pages — up to
   4 restarts in a sliding 15-min span can go unpaged (tumbling windows, not
   sliding; round-10 correction of the "one window later" example). Fast
-  flaps (<~50s cycle) also trip the P2 storm tripwire.
+  flaps (<=~60s cycle — span math, round-13: 6 restarts span 5 gaps ≤ the
+  300s window; anchored-reset detector window, a straddling burst can defer
+  the escalation by up to ~one extra 300s window) also trip the P2 storm
+  tripwire.
 - **P3 reconnect-storm** (`order-update-reconnect-storm-alarm.tf`): the counter
   `tv_order_update_reconnections_total` (order_update_connection.rs:86/:254) is
   NOT in the 21-name EMF allowlist (ratcheted pin preserved) — extracted via a
@@ -171,7 +187,14 @@ flapper invisible) is the proof.
   precedent): 15:30-close churn (≤3 attempts before dormant sleep) stays silent,
   and the gate's open-time set_alarm_state(OK) immunizes against latched state.
   Counter reset on restart → absorbed by the agent's delta calculation (first
-  post-restart sample dropped) → cannot false-page.
+  post-restart sample dropped) → cannot false-page. Arming dependence
+  (round-13): the gate Lambda's 09:20 IST open invocation is the ONLY arming
+  path for this alarm — a gate failure silently re-opened the leg-3
+  zero-page gap, so the gate Lambda is now watched by its own AWS/Lambda
+  Errors alarm `tv-<env>-market-hours-gate-errors` (Sum ≥ 1/300s, the same
+  watchman shape as readiness-lambda-errors); residual: a rule that never
+  INVOKES the Lambda yields no Errors datapoint at all — the explicit
+  state="ENABLED" pins + the liveness alarms are the backstop.
 - **P4 readiness pager** (`market-open-readiness-lambda.tf` + handler): a
   STATE-check Lambda at 08:45 IST (cron(15 3 ? * MON-FRI *)) evaluating raw
   reality (EC2 state + `tv_boot_completed` presence in the last 10 min) and
@@ -218,10 +241,11 @@ flapper invisible) is the proof.
   INSUFFICIENT_DATA→OK on its first evaluation; CloudWatch invokes ok_actions
   on ANY transition into OK, and the telegram-webhook Lambda formats every OK
   as a green ✅ message (it reads only NewStateValue — no OldStateValue
-  filter). Expect up to ~6 one-time "recovered" messages the apply evening
+  filter). Expect up to ~7 one-time "recovered" messages the apply evening
   for conditions that were never in alarm: the 4 `ok_recovery = true` errcode
   alarms (dh-901, auth-gap-04, ws-gap-07, feed-stall-01) + feed-stall-restarts
-  + readiness-lambda-errors (the reconnect-storm alarm is exempt —
+  + readiness-lambda-errors + market-hours-gate-errors (round-13; the
+  reconnect-storm alarm is exempt —
   `actions_enabled = false` until the market-hours gate arms it). Creation
   settling, not recoveries; house precedent (every prior alarm PR did the
   same). An OldStateValue == INSUFFICIENT_DATA suppression branch in the
@@ -289,6 +313,14 @@ flapper invisible) is the proof.
   (08:50-09:10) is the backstop pager.
 - An UNLOGGED DH-906 reject is invisible → flagged Rust emit-site follow-up;
   dormant while dry_run=true (no live orders).
+- Market-hours gate Lambda fails at the 09:20 IST open (the ONLY arming path
+  for the leg-3 reconnect-storm alarm + the other 3 gated alarms) →
+  `tv-<env>-market-hours-gate-errors` pages (AWS/Lambda Errors, Sum ≥ 1/300s
+  — the same watchman shape as readiness-lambda-errors; round-13). Before
+  this alarm a gate failure silently re-opened the 2026-07-06 zero-page gap.
+  Residual: a rule that never INVOKES the Lambda (scheduler drop / disabled
+  rule) produces no Errors datapoint — the explicit state="ENABLED" pins +
+  the liveness alarms are the backstop.
 - A future sink-path move re-blinding the filters → the
   `test_cw_agent_collects_machine_log_paths` ratchet fails the build for
   BOTH vectors (round-2 review fix): it derives the expected globs from the
@@ -315,7 +347,7 @@ flapper invisible) is the proof.
 - Post-apply (PR-body runbook): `describe-log-streams` freshness check on
   `/tickvault/prod/app` (expect up to a few one-time backfill errcode pages
   within ~10 min of the agent-config deploy — from_beginning replay of
-  today's already-logged errors, see Edge Cases; ALSO expect up to ~6
+  today's already-logged errors, see Edge Cases; ALSO expect up to ~7
   one-time green ✅ "OK" messages the apply evening — new-alarm
   INSUFFICIENT_DATA→OK creation settling, not recoveries, see Edge Cases;
   wait for those to settle
@@ -350,8 +382,8 @@ flapper invisible) is the proof.
 
 ## Observability
 
-- 11 new alarms (8 errcode + 1 reconnect-storm + 1 feed-stall-restarts +
-  1 readiness-lambda-errors) →
+- 12 new alarms (8 errcode + 1 reconnect-storm + 1 feed-stall-restarts +
+  1 readiness-lambda-errors + 1 market-hours-gate-errors, round-13) →
   tv_alerts → Telegram; ok_actions symmetric for repeat-emitters (the OK is
   the "recovered" message the operator wanted on 2026-07-06) — EXCEPT the
   one-shot/discrete emitters (`ok_recovery = false`, round-1 fix widened in
@@ -382,16 +414,18 @@ flapper invisible) is the proof.
   agent configs carry them — the next sink move (code-side OR config-side)
   fails the build instead of silently re-blinding every filter (round-2
   review fix: literal-only pinning missed the code-side vector).
-- Alarm-count honesty: 33 → 44 (verified real count — 33 alarm resources
-  across 11 .tf files pre-PR; 44 alarms from 37 resource blocks across 15
+- Alarm-count honesty: 33 → 45 (verified real count — 33 alarm resources
+  across 11 .tf files pre-PR; 45 alarms from 38 resource blocks across 15
   .tf files post-PR, the errcode block being a for_each over 8 codes; the
-  rule-file "10 free tier" claims were already stale pre-PR). Realistic
-  cost delta (round-5 recompute; worst-case corrected round-8): +11 alarms
-  × $0.10 = $1.10, + 2 DENSE
+  market-hours-gate-errors watchman joined round-13; the rule-file "10 free
+  tier" claims were already stale pre-PR; overage above the 10 free-tier
+  alarms moves $2.30 → $3.50/mo). Realistic
+  cost delta (round-13 recompute; worst-case corrected round-8): +12 alarms
+  × $0.10 = $1.20, + 2 DENSE
   /metrics-derived custom metrics × $0.30 × 270/730 uptime-hrs ≈ $0.22, +
-  sparse `tv_errcode_*` $0.05-0.40 ⇒ ≈ **+$1.4-1.7/mo (~₹135-175 incl 18%
-  GST; worst realistic ≈ +$2.2/mo, ~₹220 incl 18% GST — the sum of the
-  worst components: $1.10 alarms + $0.22 dense + $0.89 sparse worst-case,
+  sparse `tv_errcode_*` $0.05-0.40 ⇒ ≈ **+$1.5-1.8/mo (~₹130-160 incl 18%
+  GST; worst realistic ≈ +$2.3/mo, ~₹230 incl 18% GST — the sum of the
+  worst components: $1.20 alarms + $0.22 dense + $0.89 sparse worst-case,
   a code firing every running hour = 8 × $0.30 × 270/730; the round-5
   "≈ +$2.0" label sat below its own component arithmetic)** — the earlier
   "+$1.2-1.5 (~₹105-130
@@ -435,8 +469,9 @@ table); the honest-100% envelope wording is in the header block above.
 | 10 | Budget breach_stop / killswitch / portal stop lands 08:25-08:45 IST | readiness classifies HOLIDAY_SILENT, but the stopping path itself already paged (breach_stop/killswitch publish before stopping); boot-heartbeat gate window is the backstop |
 | 11 | Order-update WS flaps slower than ~1 cycle / 3 min | NOT paged — stated residual (detection floor >5 per 15 min); durable-down alarm owns full outages |
 | 12 | Groww sidecar stall-flaps at a ~90s-300s cycle (warn!-level restarts, no storm escalation) | `tv-prod-feed-stall-restarts` counter alarm pages (Sum ≥ 3 restarts per 15-min window) — round-3 fix; the errcode alarm alone could NEVER see this band (zero ERROR lines) |
-| 13 | Groww sidecar stall-flaps at a <~50s cycle (>5 restarts / 5 min) | BOTH page: the sidecar's storm-escalation ERROR line trips errcode-feed-stall-01 within ~5 min AND the counter alarm trips within the 15-min window |
+| 13 | Groww sidecar stall-flaps at a <=~60s cycle (>5 restarts / 5 min — span math, round-13: 6 restarts span 5 gaps ≤ 300s) | BOTH page: the sidecar's storm-escalation ERROR line trips errcode-feed-stall-01 within ~5 min (anchored-reset detector window — a straddling burst can defer the escalation by up to ~one extra 300s window) AND the counter alarm trips within the 15-min window |
 | 14 | Single Groww stall-restart that recovers | NO page on either route (self-heal by design; 1 < threshold 3, warn!-level line matches no filter) |
-| 15 | Groww stall-flap slower than ~1 restart / 5 min | NOT paged — stated residual (restart-pager floor <3 per aligned 15-min window; tumbling not sliding) |
+| 15 | Groww stall-flap slower than ~1 restart / 7.5 min | NEVER paged — stated residual (span-derived never-page floor, round-12: 3 restarts span 2 gaps > 900s at cycles > ~450s; the ~5-7.5 min band pages eventually via phase drift of a sustained flap; tumbling not sliding) |
 | 16 | First stall episode of the day (3 restarts, fresh app session) | `tv-prod-feed-stall-restarts` pages — the post-recorder-install counter registration in main.rs makes the agent's dropped first sample the 0 baseline, so all 3 restarts count (round-5; the round-4 supervisor-spawn registration raced the install and was a no-op — previously Sum=2 → silent) |
 | 17 | WS-REINJECT-01 / PROC-01 / DH-906 fires once, episode ages out ~15 min later | NO green "recovered" OK page (ok_recovery=false, round-4) — the condition persists (staged WAL / memory pressure / rejected order); only genuine repeat-emitters send OK-on-silence |
+| 18 | Market-hours gate Lambda errors at the 09:20 IST open (the ONLY arming path for the leg-3 reconnect-storm pager + the other 3 gated alarms) | `tv-prod-market-hours-gate-errors` pages (AWS/Lambda Errors, Sum ≥ 1/300s — round-13); before it, a gate failure silently left all 4 gated alarms disarmed for the session; residual: a rule that never INVOKES the Lambda produces no Errors datapoint — state="ENABLED" pins + the liveness alarms are the backstop |

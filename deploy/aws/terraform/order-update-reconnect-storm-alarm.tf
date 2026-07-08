@@ -121,6 +121,15 @@ resource "aws_cloudwatch_metric_alarm" "order_update_reconnect_storm" {
   # incident class. Terraform re-asserting actions_enabled=false on apply is
   # harmless: applies are banned 09:00-15:45 IST and post-close applies
   # coincide with the gate-disabled window (existing 4-alarm precedent).
+  #
+  # ARMING DEPENDENCE (round-13, 2026-07-06): the gate Lambda's 09:20 IST
+  # open invocation is the ONLY arming path for this alarm — a gate failure
+  # would silently re-open the 2026-07-06 leg-3 zero-page gap. The gate
+  # Lambda therefore has its own AWS/Lambda Errors watchman
+  # (tv-<env>-market-hours-gate-errors, market-hours-liveness-alarm.tf).
+  # Residual: a rule that never INVOKES the Lambda (scheduler drop /
+  # disabled rule) yields no Errors datapoint at all — the explicit
+  # state = "ENABLED" pins + the liveness alarms are the backstop.
   actions_enabled = false
   alarm_actions   = local.app_alarm_actions
   ok_actions      = local.app_alarm_ok
