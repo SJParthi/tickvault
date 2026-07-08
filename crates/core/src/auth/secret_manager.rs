@@ -1021,7 +1021,10 @@ mod tests {
 
         let calls_spawn_heartbeat = main_rs.contains("spawn_instance_lock_heartbeat");
         let declares_chain = main_rs.contains("instance_lock_shutdown_chain");
-        let bridges_chain = main_rs.contains("instance_lock_shutdown_chain.clone()");
+        // R8-EDGE-1 (2026-07-07): the shutdown Notify now rides in the
+        // notify-on-drop `InstanceLockHeartbeatGuard`; the Item 19f bridge
+        // clones it via the guard's accessor instead of a bare local.
+        let bridges_chain = main_rs.contains("instance_lock_guard.shutdown_handle()");
         let threads_chain_into_lane =
             main_rs.contains("instance_lock_shutdown: instance_lock_shutdown_chain");
         let awaits_release = main_rs.contains("INSTANCE_LOCK_RELEASE_TIMEOUT_SECS");
@@ -1037,10 +1040,10 @@ mod tests {
             );
             assert!(
                 bridges_chain,
-                "main.rs declares `instance_lock_shutdown_chain` but does not \
-                 `.clone()` it into the bridge task at the point `shutdown_notify` \
-                 is constructed; the heartbeat would never observe the broader \
-                 shutdown signal."
+                "main.rs must bridge the heartbeat's shutdown Notify \
+                 (`instance_lock_guard.shutdown_handle()`) into the bridge task \
+                 at the point `shutdown_notify` is constructed; the heartbeat \
+                 would never observe the broader shutdown signal."
             );
             assert!(
                 threads_chain_into_lane && awaits_release,
@@ -1471,6 +1474,693 @@ mod tests {
             "the fleet dual-instance lock must be acquired BEFORE \
              spawn_groww_scale_fleet in main.rs source order \
              (lock at byte {lock_idx}, fleet spawn at byte {fleet_idx})"
+        );
+    }
+
+    /// AUTH-GAP-05 (2026-07-06): the mid-session watchdog MUST carry the
+    /// forced re-mint trigger — the pure `decide_remint` decision core AND
+    /// the `force_renewal` call site. Removing either silently regresses
+    /// the token self-heal: a Dhan-killed token would page CRITICAL every
+    /// 15 minutes with NO automatic re-mint until the 23h renewal loop.
+    #[test]
+    fn test_mid_session_remint_trigger_call_site_exists() {
+        let watchdog = std::fs::read_to_string("src/auth/mid_session_watchdog.rs")
+            .or_else(|_| std::fs::read_to_string("crates/core/src/auth/mid_session_watchdog.rs"))
+            .expect("mid_session_watchdog.rs must be readable");
+        // COV-1 fix (2026-07-06): scan the PRODUCTION region only — a
+        // whole-file scan is vacuous because `decide_remint(` also appears
+        // in ~20 test-module call literals, so deleting the production
+        // routing would leave the assertion green (the same false-OK class
+        // the 2026-07-06 AGGREGATOR-SEAL-01 ratchet hardening closed —
+        // wave-6-error-codes.md §1(c)).
+        //
+        // R7-CPLX-1 fix (2026-07-07): split at the test MODULE (`mod tests`),
+        // not the first raw `#[cfg(test)]` occurrence — mid_session_watchdog.rs
+        // carries item-level `#[cfg(test)]` attributes on test-only wrappers
+        // (e.g. `classify_check_result`) BEFORE the real test module, so the
+        // old split truncated the scanned "production region" to ~1/3 of the
+        // file, excluding the production classifiers + decision core
+        // (`classify_cycle` / `decide_remint` / `apply_remint_decision`).
+        let tests_mod_off = watchdog.find("\nmod tests {").expect(
+            "mid_session_watchdog.rs must contain a top-level `mod tests` \
+             module — without it this production-region split is scanning \
+             the whole file (vacuous)",
+        );
+        let production = &watchdog[..tests_mod_off];
+        // Split-boundary self-checks: the region must extend past the inline
+        // #[cfg(test)] items to the LAST production fns (the decision core).
+        for tail_fn in ["fn decide_remint(", "fn apply_remint_decision("] {
+            assert!(
+                production.contains(tail_fn),
+                "mid_session_watchdog.rs production region (everything before \
+                 `mod tests`) must include the tail production item \
+                 `{tail_fn}` — the split boundary no longer follows the last \
+                 production fn (R7-CPLX-1)"
+            );
+        }
+        assert!(
+            production.contains("force_renewal("),
+            "mid_session_watchdog.rs (production region) MUST call \
+             `force_renewal` — the AUTH-GAP-05 forced re-mint trigger \
+             reuses the EXISTING TokenManager renewal machinery (never a \
+             fork)."
+        );
+        // COV-R6-1 (2026-07-07): the loop binds the decision once
+        // (`let decision = decide_remint(`), applies the retry-once episode
+        // latch + cooldown stamp through the pure `apply_remint_decision`,
+        // and only then matches on the decision — the previous
+        // `match decide_remint(` shape carried the latch as two untested
+        // loop-body assignments whose deletion left every test green while
+        // the watchdog re-minted (or re-paged RESILIENCE-01) every 900s.
+        assert!(
+            production.contains("let decision = decide_remint("),
+            "mid_session_watchdog.rs (production region) MUST route the \
+             re-mint through the pure `decide_remint` decision fn \
+             (`let decision = decide_remint(` — threshold -> latch -> \
+             lock-fail-closed -> cooldown ordering, AUTH-GAP-05)."
+        );
+        assert!(
+            production.contains("apply_remint_decision(&mut state, &mut last_remint_at, decision)"),
+            "mid_session_watchdog.rs (production region) MUST apply the \
+             retry-once episode latch + cooldown stamp via the pure \
+             `apply_remint_decision(&mut state, &mut last_remint_at, \
+             decision)` call (COV-R6-1) — without it a sustained dead-token \
+             episode re-mints (one HIGH Telegram + one generateAccessToken \
+             attempt) OR re-pages RESILIENCE-01 every 900s cycle, violating \
+             the operator-locked once-per-episode bound."
+        );
+        assert!(
+            production.contains("match decision {"),
+            "mid_session_watchdog.rs (production region) MUST act on the \
+             SAME bound decision (`match decision {{`) that was passed to \
+             `apply_remint_decision` — re-calling decide_remint would let \
+             the latch and the action diverge."
+        );
+        // Non-vacuity self-check (R7-CPLX-1): the `mod tests` block we split
+        // at must itself be #[cfg(test)]-gated (attribute within the few
+        // lines immediately above the split point) — i.e. the boundary
+        // really is the production|tests seam.
+        let preamble_start = tests_mod_off.saturating_sub(300);
+        assert!(
+            watchdog[preamble_start..tests_mod_off].contains("#[cfg(test)]"),
+            "the `mod tests` block in mid_session_watchdog.rs must be gated \
+             by a #[cfg(test)] attribute immediately above it — the \
+             production-region split boundary is no longer the test module"
+        );
+    }
+
+    /// AUTH-GAP-05 (2026-07-06): `main.rs` MUST spawn the live token-health
+    /// gauge poller. Without it, `tv_token_remaining_seconds` regresses to
+    /// the frozen mint-time snapshot (stale ~86,395 for up to 23h after a
+    /// killed token) and the honest AND-composed `tv_token_valid` gauge
+    /// never exists — a false-OK class regression (audit Rule 11).
+    ///
+    /// COV-R2-1 hardening (2026-07-06): the design deliberately has TWO
+    /// production spawn sites — the SLOW lane (`start_dhan_lane`) AND the
+    /// FAST crash-recovery boot arm (EDGE-2) — so the scan (a) covers the
+    /// PRODUCTION region only (a future main.rs test mentioning the fn
+    /// would otherwise make a whole-file `contains` fully vacuous), (b)
+    /// requires BOTH sites (a single `contains` stayed green when either
+    /// one was deleted — in particular the fast-arm spawn, silently
+    /// re-opening the round-1 "single spawn site in the SLOW lane only"
+    /// finding), (c) pins the SLOW lane's AG5-R1 LANE-OWNERSHIP
+    /// registration (`token_health_gauge_handle: Some(` +
+    /// `mid_session_watchdog_handle: Some(`) — a revert to a detached
+    /// `let _ = tokio::spawn` would keep the spawn count green while
+    /// restoring the round-1 leaked-poller false-tv_token_valid=1.0
+    /// finding — and (d) (COV-R3-1, 2026-07-06) pins the FAST arm's
+    /// lane-ownership BINDING (`let token_health_gauge_handle =
+    /// token_manager.as_ref().map(`): the fast arm registers its handle
+    /// positionally via `run_shutdown_fast` shorthand field init (never
+    /// the `: Some(` text), so without this assertion a regression that
+    /// keeps the fast-arm spawn call but discards the handle
+    /// (`let _ = token_manager.as_ref().map(...)` + passing `None`) stayed
+    /// green on (a)-(c) while re-opening the leaked-poller class on the
+    /// fast arm.
+    #[test]
+    fn test_token_health_gauge_poller_wired_into_main() {
+        let main_rs = std::fs::read_to_string("../app/src/main.rs")
+            .or_else(|_| std::fs::read_to_string("crates/app/src/main.rs"))
+            .expect("main.rs must be readable");
+        // R7-CPLX-1 idiom hardening (2026-07-07): split at the test MODULE
+        // (`mod tests`), not the first raw `#[cfg(test)]` occurrence — an
+        // inline item-level #[cfg(test)] attribute (or a doc-comment
+        // mention) added earlier in main.rs would silently truncate the
+        // scanned "production region" (the token_manager.rs false-OK class).
+        let production = main_rs_production_region(&main_rs);
+        let spawn_count = production
+            .matches("spawn_token_health_gauge_poller(")
+            .count();
+        assert!(
+            spawn_count >= 2,
+            "main.rs (production region) MUST spawn the live token-health \
+             gauge poller at BOTH boot arms — the slow lane \
+             (start_dhan_lane) AND the FAST crash-recovery arm (EDGE-2). \
+             Found {spawn_count} spawn site(s); removing either re-opens \
+             the round-1 single-spawn-site gap (AUTH-GAP-05)."
+        );
+        assert!(
+            production.contains("token_health_gauge_handle: Some("),
+            "main.rs (production region) MUST register the slow lane's \
+             gauge-poller handle lane-owned \
+             (`token_health_gauge_handle: Some(`) in DhanLaneRunHandles — \
+             a detached spawn survives the lane teardown and publishes \
+             tv_token_valid=1.0 for up to ~24h while Dhan is deliberately \
+             OFF (AG5-R1, audit Rule 11)."
+        );
+        assert!(
+            production.contains("mid_session_watchdog_handle: Some("),
+            "main.rs (production region) MUST register the mid-session \
+             watchdog handle lane-owned \
+             (`mid_session_watchdog_handle: Some(`) in DhanLaneRunHandles — \
+             a leaked watchdog keeps hitting /v2/profile with the dead \
+             lane's token and fires false RESILIENCE-01 pages (AG5-R1)."
+        );
+        // COV-R3-1: the FAST arm's handle registration is positional
+        // (shorthand field init into `run_shutdown_fast`), so the `Some(`
+        // pins above cover the SLOW lane only. Pin the fast-arm BINDING —
+        // a `let _ = token_manager.as_ref().map(...)` regression (spawn
+        // kept, handle discarded, `None` passed into run_shutdown_fast)
+        // would otherwise stay green while leaking a non-lane-owned poller
+        // publishing tv_token_valid=1.0 from a torn-down lane's
+        // TokenManager.
+        assert!(
+            production.contains("let token_health_gauge_handle = token_manager.as_ref().map("),
+            "main.rs (production region) MUST bind the FAST crash-recovery \
+             arm's gauge-poller handle \
+             (`let token_health_gauge_handle = token_manager.as_ref().map(`) \
+             so it rides into DhanLaneRunHandles via run_shutdown_fast — \
+             discarding the handle detaches the fast-arm poller from lane \
+             ownership (COV-R3-1, AG5-R1 class)."
+        );
+        // SEC-R4-1 / R4-CPLX-1/2 (2026-07-06): the last two detached spawns
+        // in start_dhan_lane — the MINT-CAPABLE 4h token sweep
+        // (force_renewal_if_stale → acquire_token fallback) and the 5-min
+        // periodic health check — are lane-owned now. Pin the registrations:
+        // a revert to a bare `tokio::spawn` (handle discarded) leaks one
+        // immortal copy per D2b lane cold-start cycle; the leaked sweep
+        // keeps a deliberately-disabled lane's JWT alive via RenewToken and
+        // fires a false RESILIENCE-03 "peer owns the session" Critical page
+        // every 4h after a lane stop/restart.
+        assert!(
+            production.contains("token_sweep_handle: Some("),
+            "main.rs (production region) MUST register the 4h token-sweep \
+             handle lane-owned (`token_sweep_handle: Some(`) in \
+             DhanLaneRunHandles — a detached mint-capable sweep survives \
+             the lane teardown and fires false RESILIENCE-03 pages \
+             (SEC-R4-1 / R4-CPLX-1)."
+        );
+        assert!(
+            production.contains("periodic_health_handle: Some("),
+            "main.rs (production region) MUST register the periodic \
+             health-check handle lane-owned \
+             (`periodic_health_handle: Some(`) in DhanLaneRunHandles — a \
+             detached copy per lane cold-start cycle multiplies alert \
+             traffic with independent cooldown state (R4-CPLX-2)."
+        );
+        // COV-C4-1 (2026-07-07): the R8-EDGE-2 pool-watchdog lane-ownership
+        // has TWO production halves and only the SLOW one was ratcheted
+        // (test_pre_lane_abort_guard_covers_early_spawn_windows scopes its
+        // needles to start_dhan_lane's body). Pin the FAST crash-recovery
+        // arm's BINDING + its ride into run_shutdown_fast — a regression
+        // that keeps the fast-arm spawn but discards the handle
+        // (`let _ = spawn_pool_watchdog_task(...)` + passing `None`)
+        // compiles silently (main.rs lacks the lib.rs deny(unused_must_use)
+        // blanket, and `let _ =` defeats must_use anyway) and would re-open
+        // the leaked-watchdog class on a fast-boot process: an immortal
+        // stale writer of the shared /health + feed-health Dhan slots and a
+        // possible false CRITICAL WebSocketPoolHalt after a runtime Dhan
+        // disable.
+        assert!(
+            production.contains("let fast_pool_watchdog_handle = spawn_pool_watchdog_task("),
+            "main.rs (production region) MUST bind the FAST crash-recovery \
+             arm's pool-watchdog handle \
+             (`let fast_pool_watchdog_handle = spawn_pool_watchdog_task(`) — \
+             discarding it detaches the watchdog from lane ownership \
+             (COV-C4-1, R8-EDGE-2 class)."
+        );
+        assert!(
+            production.contains("(handles, Some(pool_arc), Some(fast_pool_watchdog_handle))"),
+            "main.rs (production region) MUST thread the FAST arm's \
+             pool-watchdog handle out of the pool-spawn block \
+             (`Some(fast_pool_watchdog_handle)`) so it rides into \
+             run_shutdown_fast → DhanLaneRunHandles (COV-C4-1)."
+        );
+        // R9-EDGE-1/2 + R10-CPLX-1 + COV-C4-2 (2026-07-07): pin the three
+        // remaining formerly-detached start_dhan_lane spawns' lane-ownership
+        // registrations — a revert to `let _ =` / anonymous `tokio::spawn`
+        // leaks one immortal midnight-rollover loop (+ a potentially
+        // immortal 5-min prev_oi QuestDB poller + a forever-parked
+        // OrderUpdateAuthenticated listener on its attempt-private Notify)
+        // per D2b lane cold-start cycle.
+        assert!(
+            production.contains("order_update_auth_listener_handle: Some("),
+            "main.rs (production region) MUST register the \
+             OrderUpdateAuthenticated listener handle lane-owned \
+             (`order_update_auth_listener_handle: Some(`) in \
+             DhanLaneRunHandles — a detached listener parks FOREVER on the \
+             attempt-private auth Notify once the order-update task is \
+             aborted (R9-EDGE-1 / R10-CPLX-1)."
+        );
+        assert!(
+            production
+                .contains("midnight_rollover_handle: midnight_rollover_guard.into_inner().pop()"),
+            "main.rs (production region) MUST defuse the midnight-rollover \
+             PreLaneAbortGuard into DhanLaneRunHandles \
+             (`midnight_rollover_handle: midnight_rollover_guard.into_inner().pop()`) \
+             — a detached rollover loop is IMMORTAL, one leaked copy per \
+             lane cycle (R9-EDGE-2 / COV-C4-2)."
+        );
+        assert!(
+            production.contains("prev_oi_refresh_handle: prev_oi_refresh_guard.into_inner().pop()"),
+            "main.rs (production region) MUST defuse the prev_oi-refresh \
+             PreLaneAbortGuard into DhanLaneRunHandles \
+             (`prev_oi_refresh_handle: prev_oi_refresh_guard.into_inner().pop()`) \
+             — a detached poller may never self-exit while candles_1d stays \
+             empty (R9-EDGE-2 / COV-C4-2)."
+        );
+        // Non-vacuity self-check: `main_rs_production_region` already
+        // asserted the split boundary is the #[cfg(test)]-gated `mod tests`
+        // seam (R7-CPLX-1 idiom hardening).
+        assert!(
+            production.len() < main_rs.len(),
+            "main.rs production region must be a strict prefix of the file — \
+             the split found no test module (vacuous whole-file scan)"
+        );
+    }
+
+    /// COV-R4-1 (2026-07-06): source-order ratchet for the AG5-R3-1
+    /// early-construction fix — `let lane = DhanLaneRunHandles {` MUST be
+    /// constructed inside `start_dhan_lane` BEFORE the first post-spawn
+    /// top-level `.await` (`emit_boot_completed_when_feed_live`, which can
+    /// park for the full liveness wait and is `.abort()`ed by the D2b
+    /// supervisor on a disable-during-Starting). The wiring ratchet above
+    /// asserts only position-independent `contains` needles, so a refactor
+    /// moving the construction back BELOW that await (its pre-fix position)
+    /// would stay green there while fully re-opening the round-3 leak: a
+    /// lane cancelled mid-Starting detaches the remint-capable watchdog +
+    /// gauge poller + token sweep before they reach the H8 Drop floor.
+    /// House pattern: the byte-offset source-order scan of
+    /// `ratchet_tick_processor_spawns_before_reinject_await`
+    /// (crates/app/src/wal_reinject.rs).
+    #[test]
+    fn test_lane_handles_constructed_before_boot_completed_await() {
+        let main_rs = std::fs::read_to_string("../app/src/main.rs")
+            .or_else(|_| std::fs::read_to_string("crates/app/src/main.rs"))
+            .expect("main.rs must be readable");
+        // R7-CPLX-1 idiom hardening (2026-07-07): test-MODULE split, not
+        // first-#[cfg(test)]-occurrence split (see main_rs_production_region).
+        let production = main_rs_production_region(&main_rs);
+        let start_lane_off = production
+            .find("async fn start_dhan_lane(")
+            .expect("start_dhan_lane must exist in main.rs production region");
+        // COV-C2-1 fix (2026-07-07): CODE-SHAPED needle — the leading newline
+        // + exact 4-space statement indentation cannot be satisfied by a
+        // `// …` comment mention of the construction. The old bare
+        // `find("let lane = DhanLaneRunHandles {")` anchored on the
+        // R7-EDGE-1 doc COMMENT at the processor-guard site (which quotes
+        // that text verbatim ~1,200 lines BEFORE the real construction),
+        // making both assertions position-independent/vacuous: renaming the
+        // binding or moving the construction back BELOW the
+        // emit_boot_completed await — the exact regression this test exists
+        // to catch — stayed green. Uniqueness is asserted so a second match
+        // can never silently re-introduce the ambiguity. (Sibling
+        // discipline: test_pre_lane_abort_guard_covers_early_spawn_windows
+        // already uses code-shaped needles for the same reason.)
+        let lane_needle = "\n    let lane = DhanLaneRunHandles {";
+        let mut lane_matches = production.match_indices(lane_needle);
+        let lane_off = lane_matches
+            .next()
+            .expect(
+                "start_dhan_lane must construct `let lane = DhanLaneRunHandles {` \
+                 as a top-level statement (the AG5-R3-1 early construction)",
+            )
+            .0;
+        assert!(
+            lane_matches.next().is_none(),
+            "the `let lane = DhanLaneRunHandles {{` construction statement must \
+             be UNIQUE in the production region — a second occurrence makes \
+             this source-order anchor ambiguous (COV-C2-1)"
+        );
+        assert!(
+            lane_off > start_lane_off,
+            "the `let lane = DhanLaneRunHandles` early construction must live \
+             INSIDE start_dhan_lane (found at byte {lane_off}, before the fn \
+             at byte {start_lane_off})"
+        );
+        // The construction must PRECEDE the emit_boot_completed await: an
+        // `emit_boot_completed_when_feed_live(` call must still occur AFTER
+        // it in source order. If the construction is moved back below that
+        // await (the pre-AG5-R3-1 position at the end of start_dhan_lane),
+        // no later call exists in the production region and this fails.
+        assert!(
+            production[lane_off..].contains("emit_boot_completed_when_feed_live("),
+            "AG5-R3-1 ordering regression: `let lane = DhanLaneRunHandles` \
+             must be constructed BEFORE start_dhan_lane's \
+             `emit_boot_completed_when_feed_live(...).await` — a cancelled \
+             cold-start would otherwise DETACH the remint-capable watchdog + \
+             gauge poller + token sweep (COV-R4-1)"
+        );
+        assert!(
+            production.len() < main_rs.len(),
+            "main.rs production region must be a strict prefix of the file — \
+             the split found no test module (vacuous whole-file scan)"
+        );
+    }
+
+    /// R7-CPLX-1 idiom hardening (2026-07-07): shared production-region
+    /// splitter for the main.rs source scans above. The old
+    /// `.split("#[cfg(test)]").next()` idiom truncated the scanned region at
+    /// the FIRST raw occurrence of that literal — which in token_manager.rs
+    /// was a doc-comment mention + item-level attributes on test-only
+    /// constructors ~100 lines BEFORE the real test module, silently
+    /// excluding genuine production code from the scan (a false-OK direction
+    /// hole for exactly-once assertions). Splitting at the top-level
+    /// `mod tests` block is robust to inline #[cfg(test)] items appended to
+    /// the production body; the preamble check asserts the block we split at
+    /// really is the #[cfg(test)]-gated test module.
+    fn main_rs_production_region(main_rs: &str) -> &str {
+        let tests_mod_off = main_rs.find("\nmod tests {").expect(
+            "main.rs must contain a top-level `mod tests` module — without \
+             it these production-region splits scan the whole file (vacuous)",
+        );
+        let preamble_start = tests_mod_off.saturating_sub(300);
+        assert!(
+            main_rs[preamble_start..tests_mod_off].contains("#[cfg(test)]"),
+            "the `mod tests` block in main.rs must be gated by a #[cfg(test)] \
+             attribute immediately above it — the production-region split \
+             boundary is no longer the test module"
+        );
+        &main_rs[..tests_mod_off]
+    }
+
+    /// COV-R7-1 / R7-EDGE-1 (2026-07-07): source-order ratchet for the
+    /// pre-`DhanLaneRunHandles` abort-on-drop guards inside
+    /// `start_dhan_lane`. The COV-R4-1 ordering ratchet above pins only
+    /// construction-before-`emit_boot_completed_when_feed_live`; it cannot
+    /// see the EARLIER detach windows — the tick processor is spawned before
+    /// the slow-boot STAGE-C.2b WAL re-injection await (unbounded total by
+    /// design on a WAL backlog) and the main-feed WS pool handles are bound
+    /// before the ≤30s `emit_websocket_connected_alerts` health-poll await.
+    /// A D2b supervisor `.abort()` parked on either await previously dropped
+    /// the BARE handles, DETACHING the pool + processor: on the next runtime
+    /// re-enable the detached dormant pool reconnected alongside the fresh
+    /// lane's pool (2 live Dhan main-feed connections — a
+    /// websocket-connection-scope-lock violation) and the detached processor
+    /// persisted the duplicate stream (capture_seq is IN the `ticks` DEDUP
+    /// key, so duplicate rows are NOT collapsed). This ratchet pins:
+    /// (a) the processor guard wrap BEFORE the slow-boot
+    ///     `reinject_wal_frames(` await,
+    /// (b) the WS-handles guard wrap BETWEEN `spawn_websocket_connections(`
+    ///     and `emit_websocket_connected_alerts(`,
+    /// (c) both guards DEFUSED into the lane struct's H8 floor, and
+    /// (d) the guard type's abort-on-Drop impl.
+    #[test]
+    fn test_pre_lane_abort_guard_covers_early_spawn_windows() {
+        let main_rs = std::fs::read_to_string("../app/src/main.rs")
+            .or_else(|_| std::fs::read_to_string("crates/app/src/main.rs"))
+            .expect("main.rs must be readable");
+        let production = main_rs_production_region(&main_rs);
+        // Scope every byte-offset check to start_dhan_lane's body (the fast
+        // crash-recovery boot arm in main() has its own reinject/emit sites
+        // that are NOT supervisor-abortable).
+        let start_lane_off = production
+            .find("async fn start_dhan_lane(")
+            .expect("start_dhan_lane must exist in main.rs production region");
+        let lane_body = &production[start_lane_off..];
+        // (a) processor guard wrap precedes the slow-boot reinject await.
+        let processor_guard_off = lane_body
+            .find("let processor_guard = PreLaneAbortGuard::new(processor_handle")
+            .expect(
+                "start_dhan_lane must wrap the tick-processor handle in \
+                 PreLaneAbortGuard (R7-EDGE-1 / COV-R7-1) — a bare handle \
+                 across the WAL-reinject await detaches the processor on a \
+                 cancel-mid-Starting",
+            );
+        let reinject_off = lane_body
+            .find("reinject_wal_frames(")
+            .expect("start_dhan_lane must contain the slow-boot WAL reinject await");
+        assert!(
+            processor_guard_off < reinject_off,
+            "the PreLaneAbortGuard wrap of processor_handle (byte \
+             {processor_guard_off}) must PRECEDE the slow-boot \
+             reinject_wal_frames await (byte {reinject_off}) in \
+             start_dhan_lane — otherwise the detach window re-opens \
+             (COV-R7-1)"
+        );
+        // (b) WS-handles guard wrap sits between the pool spawn and the
+        //     connected-alerts health-poll await. Code-shaped needles
+        //     (`let handles = …` / the call-plus-first-arg text) are used so
+        //     COMMENT mentions of the fn names can never satisfy the scan.
+        let ws_spawn_off = lane_body
+            .find("let handles = spawn_websocket_connections(")
+            .expect("start_dhan_lane must bind the main-feed WS pool handles");
+        let ws_guard_off = lane_body
+            .find("let handles_guard = PreLaneAbortGuard::new(handles);")
+            .expect(
+                "start_dhan_lane must wrap the just-spawned WS pool handles \
+                 in PreLaneAbortGuard (R7-EDGE-1) — a bare Vec<JoinHandle> \
+                 across the emit_websocket_connected_alerts await detaches \
+                 the pool on a cancel-mid-Starting",
+            );
+        assert!(
+            ws_spawn_off < ws_guard_off,
+            "the PreLaneAbortGuard wrap of the WS pool handles (byte \
+             {ws_guard_off}) must FOLLOW the spawn_websocket_connections \
+             binding (byte {ws_spawn_off}) in start_dhan_lane (R7-EDGE-1)"
+        );
+        // The real emit call (not a comment mention) must occur AFTER the
+        // guard wrap — i.e. the ≤30s health-poll await is covered.
+        assert!(
+            lane_body[ws_guard_off..].contains("emit_websocket_connected_alerts(\n"),
+            "start_dhan_lane must call emit_websocket_connected_alerts AFTER \
+             the PreLaneAbortGuard wrap of the WS pool handles — the ≤30s \
+             health-poll await must sit inside the guard's coverage window \
+             (R7-EDGE-1)"
+        );
+        // (b2) R8-EDGE-2 / SEC-C2-1 (2026-07-07): the pool WATCHDOG is
+        //      spawned in the same pre-construction window (before the ≤30s
+        //      connected-alerts await) and its only in-loop exit is a
+        //      `shutdown_notify` nothing can fire before the lane struct
+        //      exists — so it must be bound + guard-wrapped too. A leaked
+        //      watchdog writes the PROCESS-SHARED /health + feed-health Dhan
+        //      slots every 5s from the DEAD pool and fires false
+        //      WebSocketPoolDegraded / CRITICAL WebSocketPoolHalt pages
+        //      after a runtime re-enable.
+        let watchdog_spawn_off = lane_body
+            .find("let dhan_pool_watchdog_handle = spawn_pool_watchdog_task(")
+            .expect(
+                "start_dhan_lane must BIND the pool-watchdog JoinHandle \
+                 (`let dhan_pool_watchdog_handle = spawn_pool_watchdog_task(`) \
+                 — a fire-and-forget spawn leaks the watchdog on a \
+                 cancel-mid-Starting (R8-EDGE-2 / SEC-C2-1)",
+            );
+        let watchdog_guard_off = lane_body
+            .find("let pool_watchdog_guard = PreLaneAbortGuard::new(vec![dhan_pool_watchdog_handle]);")
+            .expect(
+                "start_dhan_lane must wrap the pool-watchdog handle in \
+                 PreLaneAbortGuard (R8-EDGE-2 / SEC-C2-1) — a bare handle \
+                 across the emit_websocket_connected_alerts await detaches \
+                 the watchdog on a cancel-mid-Starting",
+            );
+        assert!(
+            watchdog_spawn_off < watchdog_guard_off,
+            "the PreLaneAbortGuard wrap of the pool-watchdog handle (byte \
+             {watchdog_guard_off}) must FOLLOW its spawn binding (byte \
+             {watchdog_spawn_off}) in start_dhan_lane (R8-EDGE-2)"
+        );
+        assert!(
+            lane_body[watchdog_guard_off..].contains("emit_websocket_connected_alerts(\n"),
+            "start_dhan_lane must call emit_websocket_connected_alerts AFTER \
+             the PreLaneAbortGuard wrap of the pool-watchdog handle — the \
+             ≤30s health-poll await must sit inside the guard's coverage \
+             window (R8-EDGE-2 / SEC-C2-1)"
+        );
+        // (c) all three guards are defused into the lane struct's H8 floor.
+        assert!(
+            lane_body.contains("ws_handles: ws_handles_guard.into_inner()"),
+            "the lane construction must defuse the WS guard into \
+             DhanLaneRunHandles.ws_handles (R7-EDGE-1)"
+        );
+        assert!(
+            lane_body.contains("processor_handle: processor_guard.into_inner().pop()"),
+            "the lane construction must defuse the processor guard into \
+             DhanLaneRunHandles.processor_handle (COV-R7-1)"
+        );
+        assert!(
+            lane_body.contains("pool_watchdog_handle: pool_watchdog_guard.into_inner().pop()"),
+            "the lane construction must defuse the pool-watchdog guard into \
+             DhanLaneRunHandles.pool_watchdog_handle (R8-EDGE-2 / SEC-C2-1)"
+        );
+        // (d) the guard type aborts on Drop (not merely drops the handles).
+        let guard_impl_off = production
+            .find("impl<T> Drop for PreLaneAbortGuard<T>")
+            .expect("PreLaneAbortGuard must implement Drop (abort-on-drop floor)");
+        assert!(
+            production[guard_impl_off..]
+                .lines()
+                .take(8)
+                .any(|line| line.contains("handle.abort()")),
+            "PreLaneAbortGuard's Drop impl must abort() the wrapped handles — \
+             dropping them bare would detach the tasks (the exact leak the \
+             guard exists to close)"
+        );
+        // (e) lane-teardown floor for the watchdog: teardown + the H8 Drop
+        //     must abort() it — the notify_waiters() stop signal alone is
+        //     Rule-16 lost-wake prone (the watchdog's tick body awaits a ≤2s
+        //     QuestDB probe).
+        assert!(
+            production.contains("if let Some(handle) = lane.pool_watchdog_handle.take() {"),
+            "teardown_dhan_lane_tasks must take + abort the pool-watchdog \
+             handle directly (R8-EDGE-2 / SEC-C2-1 — notify alone is Rule-16 \
+             lost-wake prone)"
+        );
+        assert!(
+            production.contains("if let Some(handle) = self.pool_watchdog_handle.as_ref() {"),
+            "DhanLaneRunHandles::drop must abort the pool-watchdog handle \
+             (R8-EDGE-2 / SEC-C2-1)"
+        );
+        // (f) SEC-C3-1 / R9-CPLX-1 / COV-R8-2 (2026-07-07): the Item 19f
+        //     heartbeat-shutdown BRIDGE task parks on the PER-ATTEMPT
+        //     shutdown_notify, whose only notify_waiters() lives in
+        //     teardown — which never runs when the lane struct is never
+        //     constructed. A detached bridge therefore leaks one immortal
+        //     parked task + two Arc<Notify> per cancelled/failed cold-start
+        //     attempt. It must be guard-wrapped at the spawn site, defused
+        //     into the lane struct, and aborted by teardown + the H8 Drop
+        //     (abort is safe: teardown/Drop deliver its only pending
+        //     action, the heartbeat notify_one, directly).
+        let bridge_guard_off = lane_body
+            .find("PreLaneAbortGuard::new(heartbeat_bridge_handle.into_iter().collect::<Vec<_>>())")
+            .expect(
+                "start_dhan_lane must wrap the Item 19f heartbeat-shutdown \
+                 bridge JoinHandle in PreLaneAbortGuard (SEC-C3-1 / \
+                 R9-CPLX-1 / COV-R8-2) — a bare tokio::spawn detaches the \
+                 bridge, which parks forever on the attempt-private \
+                 shutdown_notify after a cancel-mid-Starting",
+            );
+        assert!(
+            lane_body[bridge_guard_off..].contains("emit_websocket_connected_alerts(\n"),
+            "the Item 19f bridge guard wrap must PRECEDE the \
+             emit_websocket_connected_alerts await — the bridge is spawned \
+             in the pre-lane window and must be covered across every \
+             subsequent supervisor-abortable await (SEC-C3-1)"
+        );
+        assert!(
+            lane_body
+                .contains("heartbeat_bridge_handle: heartbeat_bridge_guard.into_inner().pop()"),
+            "the lane construction must defuse the Item 19f bridge guard \
+             into DhanLaneRunHandles.heartbeat_bridge_handle (SEC-C3-1 / \
+             COV-R8-2)"
+        );
+        assert!(
+            production.contains("if let Some(handle) = lane.heartbeat_bridge_handle.take() {"),
+            "teardown_dhan_lane_tasks must take + abort the Item 19f bridge \
+             handle — a survivor parks forever on the dead lane's \
+             attempt-private shutdown_notify (SEC-C3-1 / R9-CPLX-1)"
+        );
+        assert!(
+            production.contains("if let Some(handle) = self.heartbeat_bridge_handle.as_ref() {"),
+            "DhanLaneRunHandles::drop must abort the Item 19f bridge handle \
+             (SEC-C3-1 / COV-R8-2)"
+        );
+    }
+
+    /// R8-EDGE-1 / R8-CPLX-1 (2026-07-07): the dual-instance SSM lock
+    /// heartbeat is spawned at Step 6a-prime — ~2,500 lines before the lane
+    /// struct that owns it — and its only exits are its own shutdown Notify
+    /// or a foreign takeover that never happens (the next acquire REFUSES
+    /// instead of overwriting). On the D2b runtime path, a supervisor
+    /// `.abort()` on ANY intermediate await (Step 6 auth, IP gate, QuestDB
+    /// DDL, the §4 infinite-retry universe fetch, WAL reinject, WS spawn) —
+    /// or any ordinary `return Err(StartLaneError::…)` after the spawn —
+    /// previously DETACHED the still-renewing heartbeat: the zombie renewed
+    /// the SSM lock every 30s forever, the 90s TTL never cleared it, and
+    /// every retry / re-enable failed AlreadyHeld → a RESILIENCE-01 Critical
+    /// page per bounded-backoff retry + a PERMANENTLY wedged Dhan lane until
+    /// full process restart. This ratchet pins the notify-on-drop guard:
+    /// (a) the heartbeat rides in `InstanceLockHeartbeatGuard` (code-shaped
+    ///     binding needle),
+    /// (b) the guard's Drop fires `notify_one()` (graceful SSM release) and
+    ///     NEVER `abort()`s (BUG-1: an abort would kill the in-flight
+    ///     DeleteParameter),
+    /// (c) the guard is defused into the lane struct's BUG-1 fields via
+    ///     `into_parts()` at the construction site.
+    #[test]
+    fn test_instance_lock_heartbeat_guard_covers_pre_lane_window() {
+        let main_rs = std::fs::read_to_string("../app/src/main.rs")
+            .or_else(|_| std::fs::read_to_string("crates/app/src/main.rs"))
+            .expect("main.rs must be readable");
+        let production = main_rs_production_region(&main_rs);
+        let start_lane_off = production
+            .find("async fn start_dhan_lane(")
+            .expect("start_dhan_lane must exist in main.rs production region");
+        let lane_body = &production[start_lane_off..];
+        // (a) the guard binding wraps the heartbeat spawn (code-shaped
+        //     needles — comments cannot satisfy them).
+        let guard_binding_off = lane_body
+            .find("let instance_lock_guard: InstanceLockHeartbeatGuard = {")
+            .expect(
+                "start_dhan_lane must hold the instance-lock heartbeat in \
+                 InstanceLockHeartbeatGuard (R8-EDGE-1 / R8-CPLX-1) — bare \
+                 locals detach the still-renewing heartbeat on a \
+                 cancel-mid-Starting or an Err return, permanently wedging \
+                 the lane with AlreadyHeld/RESILIENCE-01",
+            );
+        let guard_ctor_off = lane_body
+            .find("InstanceLockHeartbeatGuard::new(heartbeat_handle, heartbeat_shutdown_for_chain)")
+            .expect(
+                "the Step 6a-prime block must construct the guard from the \
+                 spawned heartbeat handle + its shutdown Notify (R8-EDGE-1)",
+            );
+        assert!(
+            guard_binding_off < guard_ctor_off,
+            "the guard binding (byte {guard_binding_off}) must precede its \
+             constructor (byte {guard_ctor_off}) — i.e. the guard is created \
+             AT the spawn site, before any supervisor-abortable await"
+        );
+        // (c) defused into the lane struct BEFORE the construction statement
+        //     (source order: into_parts precedes the code-shaped lane needle).
+        let into_parts_off = lane_body
+            .find(
+                "let (instance_lock_handle, instance_lock_shutdown_chain) = \
+                 instance_lock_guard.into_parts();",
+            )
+            .expect(
+                "the lane construction site must defuse the heartbeat guard \
+                 via into_parts() so the BUG-1 teardown bound-await still \
+                 owns the release (R8-EDGE-1)",
+            );
+        let lane_ctor_off = lane_body
+            .find("\n    let lane = DhanLaneRunHandles {")
+            .expect("the AG5-R3-1 early lane construction must exist");
+        assert!(
+            into_parts_off < lane_ctor_off,
+            "into_parts() (byte {into_parts_off}) must precede the lane \
+             construction (byte {lane_ctor_off}) so the heartbeat fields ride \
+             into DhanLaneRunHandles"
+        );
+        // (b) the guard's Drop notify-releases and never aborts.
+        let drop_impl_off = production
+            .find("impl Drop for InstanceLockHeartbeatGuard")
+            .expect("InstanceLockHeartbeatGuard must implement Drop (notify-on-drop floor)");
+        let drop_impl_end = production[drop_impl_off..]
+            .find("\n}\n")
+            .map(|o| drop_impl_off + o)
+            .expect("InstanceLockHeartbeatGuard Drop impl must have a body end");
+        let drop_body = &production[drop_impl_off..drop_impl_end];
+        assert!(
+            drop_body.contains("shutdown.notify_one()"),
+            "InstanceLockHeartbeatGuard::drop must notify_one() the \
+             heartbeat's shutdown (permit-storing graceful SSM release) — \
+             without it a cancelled/failed cold-start leaves a zombie \
+             renewer that wedges every re-acquire (R8-EDGE-1 / R8-CPLX-1)"
+        );
+        assert!(
+            !drop_body.contains(".abort()"),
+            "InstanceLockHeartbeatGuard::drop must NEVER abort() the \
+             heartbeat handle — an abort kills the in-flight SSM \
+             DeleteParameter release (the BUG-1 contract)"
         );
     }
 }

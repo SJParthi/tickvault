@@ -558,6 +558,19 @@ pub enum NotificationEvent {
         threshold_secs: i64,
     },
 
+    /// AUTH-GAP-05 (2026-07-06) — the mid-session profile watchdog forced
+    /// a token re-mint after N consecutive REAL Dhan token rejections
+    /// during market hours. Severity::High; edge-triggered exactly once
+    /// per failing episode (the watchdog's retry-once latch). Fields are
+    /// label-only counts — never the JWT or any user data.
+    TokenForcedRemintTriggered {
+        /// Consecutive REAL `/v2/profile` auth failures observed.
+        consecutive_checks: u32,
+        /// The watchdog cadence (seconds) — used to render the human
+        /// "about N minutes" duration in the Telegram body.
+        check_interval_secs: u64,
+    },
+
     /// Order update WebSocket connected.
     OrderUpdateConnected,
 
@@ -1359,6 +1372,7 @@ impl NotificationEvent {
             | Self::WebSocketSleepEntered { .. }
             | Self::WebSocketSleepResumed { .. }
             | Self::WebSocketTokenForceRenewedOnWake { .. }
+            | Self::TokenForcedRemintTriggered { .. }
             | Self::WebSocketReconnectionExhausted { .. }
             // ── Dhan-scoped: order-update WebSocket ──
             | Self::OrderUpdateConnected
@@ -1803,6 +1817,23 @@ impl NotificationEvent {
                 format!(
                     "<b>AUTH-GAP-03 {feed} feed (slot {}) wake-time token renewed</b>\nRemaining before renewal: {remaining_secs_before}s (threshold {threshold_secs}s)",
                     connection_index.saturating_add(1)
+                )
+            }
+            Self::TokenForcedRemintTriggered {
+                consecutive_checks,
+                check_interval_secs,
+            } => {
+                // Plain English per the 10 Telegram commandments: status
+                // emoji first, specific numbers, one decision, no library
+                // names / file paths / token material.
+                let minutes =
+                    u64::from(*consecutive_checks).saturating_mul(*check_interval_secs) / 60;
+                format!(
+                    "⚠️ <b>AUTH-GAP-05: broker login looks invalid — auto re-login started</b>\n\
+                     The broker rejected our login check {consecutive_checks} times in a row \
+                     (about {minutes} minutes). We are fetching a fresh login automatically.\n\
+                     If it clears you'll hear nothing more; if it fails again you'll get a red \
+                     alert — keep only ONE copy of the app running and restart it."
                 )
             }
             Self::OrderUpdateConnected => "<b>Order Update WS connected</b>".to_string(),
@@ -2348,6 +2379,7 @@ impl NotificationEvent {
             Self::WebSocketSleepEntered { .. } => "WebSocketSleepEntered",
             Self::WebSocketSleepResumed { .. } => "WebSocketSleepResumed",
             Self::WebSocketTokenForceRenewedOnWake { .. } => "WebSocketTokenForceRenewedOnWake",
+            Self::TokenForcedRemintTriggered { .. } => "TokenForcedRemintTriggered",
             Self::OrderUpdateConnected => "OrderUpdateConnected",
             Self::OrderUpdateAuthenticated => "OrderUpdateAuthenticated",
             Self::OrderUpdateDisconnected { .. } => "OrderUpdateDisconnected",
@@ -2480,6 +2512,11 @@ impl NotificationEvent {
                 Severity::Low
             }
             Self::WebSocketTokenForceRenewedOnWake { .. } => Severity::Low,
+            // AUTH-GAP-05 (2026-07-06): the forced re-mint IS the
+            // self-remediation, but the operator must see every trigger —
+            // High (pages Telegram), not Critical (the standing
+            // MidSessionProfileInvalidated page covers the unrecovered case).
+            Self::TokenForcedRemintTriggered { .. } => Severity::High,
             // Routine zero-disconnect drift swap — green by design. Prior
             // `Custom` routing made every 60s drift fire [HIGH] amber; see
             // Fix #9 in .claude/plans/active-plan.md and .claude/rules/project/
@@ -5759,6 +5796,41 @@ mod tests {
         assert!(
             silent.contains("zero live ticks") && silent.contains("120"),
             "got: {silent}"
+        );
+    }
+
+    /// AUTH-GAP-05 (2026-07-06) — the ONE HIGH forced-re-mint event:
+    /// severity / event_kind / Dhan badge / 10-commandments body (status
+    /// emoji, code id, specific numbers, NO token material, NO file paths).
+    #[test]
+    fn test_token_forced_remint_triggered_event() {
+        let ev = NotificationEvent::TokenForcedRemintTriggered {
+            consecutive_checks: 2,
+            check_interval_secs: 900,
+        };
+        assert_eq!(ev.severity(), Severity::High);
+        assert_eq!(ev.topic(), "TokenForcedRemintTriggered");
+        assert_eq!(
+            ev.feed_badge(),
+            Some(super::super::feed_badge::FeedBadge::Dhan.badge()),
+            "forced re-mint is Dhan-scoped — must lead with the Dhan badge"
+        );
+        let msg = ev.to_message();
+        assert!(msg.contains("AUTH-GAP-05"), "got: {msg}");
+        assert!(msg.contains("⚠️"), "status emoji missing: {msg}");
+        assert!(
+            msg.contains("2 times") && msg.contains("30 minutes"),
+            "specific numbers missing (2 checks × 900s = 30 min): {msg}"
+        );
+        // 10-commandments: never the JWT, never a file path or lib name.
+        assert!(
+            !msg.contains("eyJ"),
+            "JWT material must never appear: {msg}"
+        );
+        assert!(!msg.contains(".rs"), "file paths must never appear: {msg}");
+        assert!(
+            !msg.contains("force_renewal") && !msg.contains("arc-swap"),
+            "library/function names must never appear: {msg}"
         );
     }
 }
