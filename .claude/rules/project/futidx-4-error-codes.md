@@ -40,7 +40,7 @@ valid nearest-expiry contracts. Reasons (the `reason` payload field):
 |---|---|
 | `NoFutRows` | the master carried no FUTIDX/FUT rows for the underlying on its expected exchange/segment |
 | `AllExpiriesPast` | every parsed expiry < today (data anomaly — stale master) |
-| `AmbiguousDuplicateExpiry` | ≥2 rows share the chosen (underlying, expiry) — fail-closed, never guess a SID/token |
+| `AmbiguousDuplicateExpiry` | ≥2 TRULY-DISTINCT ids share the chosen (underlying, expiry) — fail-closed, never guess a SID/token. Hostile-review round 2 (2026-07-08): vendor-glitch EXACT-duplicate lines (same `SECURITY_ID` / same `exchange_token`) collapse first-row-wins (index_extractor precedent) BEFORE this count — a duplicated line no longer drops the mandated future |
 | `BadExpiryFormat` | every candidate row's expiry was unparsable (skipped + counted) |
 | `BadNativeToken` | (Groww only, 2026-07-08 hostile-review round 1) every candidate row's `exchange_token` was non-numeric with otherwise-valid expiries — the id-space triage arm, distinct from `BadExpiryFormat` |
 
@@ -49,7 +49,15 @@ spot universe is unaffected. Payload: `feed`, `underlying`, `reason`, `candidate
 (distinct `underlying_symbol` values seen among FUT rows, bounded — so an alias can be
 extended with evidence, never guessed). Counter:
 `tv_index_futures_selection_missing_total{feed, underlying}` (static labels, 2×4 bounded).
-Gauge: `tv_index_futures_selected{feed}` (0-4).
+Gauge: `tv_index_futures_selected{feed}` (0-4). Hostile-review round 2 (2026-07-08): the
+gauge is POST-truth on BOTH feeds — `feed="dhan"` is set by the PLAN builder from the
+post-plan `IndexDerivative` count (a planner-stage drop — unparsable SID / unknown segment /
+composite-key dedup — fires a FUTIDX-01-coded `error!`, mirroring the Groww post-cap fix),
+and `feed="groww"` is set from the POST-cap live set. FUTIDX-01 additional causes:
+`tv_index_futures_dedup_dropped_total{feed="groww"}` — an intra-futures duplicate
+`exchange_token` collapsed by the watch-set dedup (vendor id-space corruption) is its own
+loud cause and is NEVER misattributed to a cap override (`expected` for the cap check is
+the distinct-key count).
 
 **Triage:**
 1. `mcp__tickvault-logs__tail_errors` — find `FUTIDX-01`; read `feed`, `underlying`, `reason`.
@@ -108,6 +116,17 @@ not comparable that day. Counter: `tv_index_futures_parity_mismatch_total`.
   (a perfect day reads 100% again).
 - Honest consequence: `ticks.oi = 0` for the 4 futures (Quote mode; the separate code-5 OI
   packet is counted-and-dropped by the tick processor today — a future dated-quote feature).
+- Warm-boot parity (hostile-review round 2, 2026-07-08): the §29 warm-snapshot boot path
+  emits the SAME boot-evidence lines + Dhan parity entry via
+  `record_dhan_selection_from_universe` (shared with orchestrator Step 3d) — previously
+  deferred to the background reconcile and silently absent if it failed, so FUTIDX-02
+  never ran on a warm-boot day.
+- Midnight-spanning boot (round 2, F5): the §4 retry loop re-derives the IST trading date
+  PER BUILD ATTEMPT (`run_daily_universe_fetch_runner` takes a date closure) — a boot
+  crossing IST midnight (esp. the T-0→T+1 expiry crossing) selects with the NEW date,
+  never the frozen boot-entry date. The `feed='groww'` FUTIDX lifecycle rows also now
+  carry the canonical `underlying_symbol` (threaded via `WatchEntry.underlying_symbol`;
+  `underlying_security_id` stays 0 — no numeric underlying id exists in the Groww space).
 - Boot evidence lines: one structured `info!` per feed per boot —
   `index-futures selection feed=<f> underlying=<U> expiry=<date> native_id=<id> segment=<seg>`
   — plus the parity OK/mismatch verdict line.
