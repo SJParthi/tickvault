@@ -32,10 +32,12 @@
 //!   2. a partial `run_lifecycle_feed_self_heal` boot where the
 //!      NULL→'dhan' backfill step fails but `DEDUP ENABLE` succeeds —
 //!      the NEXT boot's backfill mints same-key duplicates.
-//!   Detector (copy-paste form in the runbook):
-//!   `SELECT security_id, exchange_segment, feed, count() FROM
-//!   instrument_lifecycle GROUP BY security_id, exchange_segment, feed
-//!   HAVING count() > 1;`
+//!   Detector (copy-paste form in the runbook; QuestDB does not
+//!   support standard SQL HAVING, so this is the documented
+//!   subquery + WHERE equivalent):
+//!   `SELECT * FROM (SELECT security_id, exchange_segment, feed,
+//!   count() AS n FROM instrument_lifecycle GROUP BY security_id,
+//!   exchange_segment, feed) WHERE n > 1;`
 //!   Deliberately NO `LATEST ON` collapse in the view: it is un-probed
 //!   QuestDB-9.3.5-inside-a-VIEW territory (evidence discipline —
 //!   zero-loss charter §4), and silently collapsing would HIDE the
@@ -429,18 +431,24 @@ mod tests {
         // window / partial feed self-heal N-fold-multiply view output,
         // and DEDUP ENABLE does not retro-collapse them. This ratchet pins (a) the honest-envelope
         // wording + the operator detector query in the runbook, and
-        // (b) that neither the runbook nor this module regresses to the
-        // unconditional claim.
+        // (b) that neither the runbook, this module, nor the plan record
+        // regresses to the unconditional claim.
+        //
+        // Review round 3 (MEDIUM): QuestDB does not support standard SQL
+        // HAVING (questdb.com/docs/concepts/sql-extensions), so the
+        // detector is pinned in the documented subquery + WHERE form and
+        // the broken HAVING form is banned from the runbook.
         let runbook_path = concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/../../docs/runbooks/questdb-console-queries.md"
         );
         let runbook = std::fs::read_to_string(runbook_path)
             .unwrap_or_else(|e| panic!("runbook must exist at {runbook_path}: {e}"));
-        // Detector query is copy-paste present.
+        // Detector query is copy-paste present, in QuestDB's subquery form.
         for fragment in [
             "GROUP BY security_id, exchange_segment, feed",
-            "HAVING count() > 1",
+            ") WHERE n > 1",
+            "count() AS n",
             "FROM instrument_lifecycle",
         ] {
             assert!(
@@ -448,6 +456,14 @@ mod tests {
                 "runbook must carry the duplicate-dim detector fragment {fragment:?}"
             );
         }
+        // The HAVING form errors verbatim on QuestDB — the copy-paste
+        // detector must never regress to it (mentioning the keyword in
+        // prose to explain the limitation is fine; the executable
+        // `HAVING count()` fragment is what is banned).
+        assert!(
+            !runbook.contains("HAVING count()"),
+            "runbook regressed to the QuestDB-unsupported HAVING detector form"
+        );
         // Honest envelope named; unconditional claim banned. The banned
         // phrase is built dynamically so this test's own source never
         // matches the scan.
@@ -472,6 +488,46 @@ mod tests {
             !module_norm.contains(&banned),
             "console_views.rs regressed to the unconditional '{banned}' claim"
         );
+        // Review round 3: the operator-approved plan record (active now,
+        // archived after merge per plan-enforcement.md) is a PR-facing
+        // surface too — it must carry the conditional envelope and never
+        // regress to the unconditional claim.
+        let plans_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../.claude/plans");
+        let mut plan_paths: Vec<std::path::PathBuf> = Vec::new();
+        let active = std::path::Path::new(plans_dir).join("active-plan-questdb-named-views.md");
+        if active.is_file() {
+            plan_paths.push(active);
+        }
+        if let Ok(entries) = std::fs::read_dir(std::path::Path::new(plans_dir).join("archive")) {
+            for entry in entries.flatten() {
+                if entry
+                    .file_name()
+                    .to_string_lossy()
+                    .contains("questdb-named-views")
+                {
+                    plan_paths.push(entry.path());
+                }
+            }
+        }
+        assert!(
+            !plan_paths.is_empty(),
+            "the questdb-named-views plan must exist (active or archived) so its wording stays scanned"
+        );
+        for path in plan_paths {
+            let plan = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("plan {} unreadable: {e}", path.display()));
+            let plan_norm = normalize(&plan);
+            assert!(
+                !plan_norm.contains(&banned),
+                "plan {} regressed to the unconditional '{banned}' claim",
+                path.display()
+            );
+            assert!(
+                plan_norm.contains("while dedup is live"),
+                "plan {} must state the WHILE-DEDUP-is-live honest envelope",
+                path.display()
+            );
+        }
     }
 
     /// Pins the hardcoded lifecycle-table mirror against the gated

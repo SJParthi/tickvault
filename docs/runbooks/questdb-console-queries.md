@@ -49,11 +49,14 @@ SELECT ts, feed, close, volume FROM candles_named
 WHERE symbol_name = 'NIFTY' ORDER BY ts DESC LIMIT 20;
 
 -- DETECTOR: duplicate lifecycle dimension rows (any hit = the views
--- N-fold-multiply that instrument's rows; see "Failure modes" below)
-SELECT security_id, exchange_segment, feed, count()
-FROM instrument_lifecycle
-GROUP BY security_id, exchange_segment, feed
-HAVING count() > 1;
+-- N-fold-multiply that instrument's rows; see "Failure modes" below).
+-- QuestDB does not support standard SQL HAVING — this is the
+-- documented subquery + WHERE equivalent.
+SELECT * FROM (
+    SELECT security_id, exchange_segment, feed, count() AS n
+    FROM instrument_lifecycle
+    GROUP BY security_id, exchange_segment, feed
+) WHERE n > 1;
 ```
 
 ## What the views are (and are not)

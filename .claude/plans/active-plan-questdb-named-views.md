@@ -47,10 +47,20 @@ where both Dhan-gated sites were unreachable. `ticks` + `candles_1m`
 exist before CREATE VIEW validates its column references at every site;
 double execution on dual-feed boots is harmless (convergent DDL).
 
-Join correctness: the lifecycle master's designated `ts` is a pinned
-epoch-0 constant, so DEDUP collapses to exactly ONE row per
-`(security_id, exchange_segment, feed)` — the join can never multiply
-rows; no LATEST ON needed.
+Join correctness — HONEST ENVELOPE (review round 2, corrected here in
+review round 3): the lifecycle master's designated `ts` is a pinned
+epoch-0 constant, so **WHILE its DEDUP is live** the master collapses
+to exactly ONE row per `(security_id, exchange_segment, feed)` and the
+join cannot multiply rows in that state. That precondition is
+CONDITIONAL — two documented degraded windows (the lifecycle
+HTTP-CLIENT-01 auto-create window and a partial feed self-heal boot)
+leave persistent same-key duplicates that a later `DEDUP ENABLE` does
+NOT retro-collapse; with N lifecycle rows for one key, every matching
+view row appears exactly N times. Deliberately NO `LATEST ON` collapse
+(un-probed inside a VIEW on 9.3.5; silently collapsing would hide the
+master-table corruption) — the runbook ships the operator detector
+query (QuestDB subquery + WHERE form; QuestDB does not support HAVING)
+instead.
 
 **O-honesty:** the views are cold-path analyst tooling — O(join) at
 SELECT time, **honestly O(N)**, never claimed O(1). Zero hot-path
@@ -113,8 +123,8 @@ RAM-first SELECT ban is untouched; boot cost is a handful of idempotent
 
 ## Test Plan
 
-The 9 pure DDL-string ratchets in `console_views.rs::tests` (the 7 below
-plus the per-builder single-statement pins
+The 10 ratchets in `console_views.rs::tests` (the 8 below plus the
+per-builder single-statement pins
 `test_ticks_named_view_ddl_is_single_terminated_statement` +
 `test_candles_named_view_ddl_is_single_terminated_statement`):
 1. `test_view_name_constants_stable`
@@ -127,7 +137,13 @@ plus the per-builder single-statement pins
    index < `) il` index)
 5. `test_ddls_never_select_star`
 6. `test_ddls_select_identity_columns_first_from_correct_bases`
-7. `#[cfg(feature = "daily_universe_fetcher")]
+7. `test_duplicate_dim_honest_envelope_ratchet` (review rounds 2+3:
+   pins the runbook detector query in QuestDB's subquery + WHERE form,
+   bans the QuestDB-unsupported `HAVING count()` detector form, and
+   scans the runbook + module + this plan — active or archived — for
+   the banned unconditional join-safety phrase; requires the
+   WHILE-DEDUP-is-live envelope wording in runbook + plan)
+8. `#[cfg(feature = "daily_universe_fetcher")]
    test_lifecycle_dim_matches_persistence_const`
 
 Plus: `cargo test -p tickvault-storage` (default features) AND
@@ -136,7 +152,12 @@ Plus: `cargo test -p tickvault-storage` (default features) AND
 `cargo check -p tickvault-app`. One live smoke via `make questdb` /
 `mcp questdb_sql` before merge — the multi-key `ON a=b AND c=d` view
 form is probe-class-Verified for JOINs generally but this exact
-statement is Assumed until smoked.
+statement is Assumed until smoked. The smoke must ALSO execute the
+runbook's duplicate-dim DETECTOR query (review round 3: it is
+docs-Verified against QuestDB's documentation — HAVING unsupported,
+subquery + WHERE is the documented equivalent — but Assumed pending
+that run; QuestDB was unreachable, connection refused, from the
+review-round-3 session).
 
 ## Rollback
 
@@ -197,6 +218,28 @@ the deployed definition on the next boot (documented in the runbook).
     crates/app/src/groww_activation.rs, crates/app/src/main.rs,
     docs/runbooks/questdb-console-queries.md
   - Tests: test_both_ddls_use_create_or_replace_view
+- [x] Review round 2 fixes: honest duplicate-dim envelope — module doc
+      rewritten to the conditional WHILE-DEDUP-is-live wording (the two
+      degraded windows: lifecycle HTTP-CLIENT-01 auto-create +
+      partial feed self-heal), runbook duplicate-dim section +
+      failure-mode row + operator detector query, new build-failing
+      honest-envelope ratchet
+  - Files: crates/storage/src/console_views.rs,
+    docs/runbooks/questdb-console-queries.md
+  - Tests: test_duplicate_dim_honest_envelope_ratchet
+- [x] Review round 3 fixes: detector query rewritten to QuestDB's
+      documented subquery + WHERE form at all three sites (QuestDB does
+      not support standard SQL HAVING — the shipped detector would have
+      errored verbatim in the console); plan Design + Honest-100%
+      wording corrected to the conditional envelope; ratchet extended
+      to pin the new detector fragments, ban the broken
+      `HAVING count()` form, and scan this plan (active or archived)
+      for the banned unconditional phrase; Test Plan / ratchet counts
+      corrected (10 tests, one feature-gated)
+  - Files: crates/storage/src/console_views.rs,
+    docs/runbooks/questdb-console-queries.md,
+    .claude/plans/active-plan-questdb-named-views.md
+  - Tests: test_duplicate_dim_honest_envelope_ratchet
 
 ## Scenarios
 
@@ -217,10 +260,17 @@ the deployed definition on the next boot (documented in the runbook).
 convergent `CREATE OR REPLACE VIEW` (probe-Verified on QuestDB 9.3.5 —
 ddl OK + definition actually replaced; empty-table-safe), every
 feed-enabled boot mode wired (two Dhan paths + the Groww activation),
-LEFT-join over the pinned-ts single-row lifecycle master (join can
-never multiply rows), fail-soft HTTP-CLIENT-01 degrade with next-boot
-self-heal, 7 build-failing DDL ratchets. NOT claimed:
+LEFT-join over the pinned-ts lifecycle master (exactly ONE dimension
+row per key WHILE DEDUP is live; the two documented degraded windows —
+the lifecycle HTTP-CLIENT-01 auto-create window and a partial feed
+self-heal — N-fold-multiply view rows; detector query in the runbook),
+fail-soft HTTP-CLIENT-01 degrade with next-boot self-heal, 10
+build-failing ratchets (one feature-gated). NOT claimed:
 O(1) — the views are O(join) cold-path console tooling (honestly O(N)
 at SELECT time, zero hot-path impact); NOT claimed: exact-statement
 server acceptance until the pre-merge live smoke against `make questdb`
-passes (the multi-key ON view form is Assumed pending that one run).
+passes (the multi-key ON view form is Assumed pending that one run, and
+the duplicate-dim DETECTOR query is docs-Verified against QuestDB's own
+documentation — HAVING unsupported, subquery + WHERE is the documented
+form — but Assumed pending the same live smoke; QuestDB was unreachable
+from the review-round-3 session).
