@@ -2301,6 +2301,16 @@ async fn main() -> Result<()> {
                     // + `calendar_persistence` retired.
                 );
 
+                // Human-readable analyst console views (ticks_named /
+                // candles_named). Sequential AFTER the base-table ensure
+                // join so `ticks` + `candles_1m` exist before CREATE VIEW
+                // validates its column references. Fail-soft + convergent
+                // (CREATE OR REPLACE VIEW — every boot converges the
+                // deployed definition to the code); a failure retries next
+                // boot. Groww-only boots get their own call site in
+                // `groww_activation.rs::activate_groww_lane`.
+                tickvault_storage::console_views::ensure_named_views(&config.questdb).await;
+
                 info!("QuestDB DDL complete (background)");
             },
             // SSM validation + TokenManager for renewal
@@ -6568,6 +6578,14 @@ async fn start_dhan_lane(
         // CREATE TABLE IF NOT EXISTS — safe to call on every boot.
         tickvault_storage::shadow_persistence::ensure_shadow_candle_tables(&config.questdb),
     );
+
+    // Human-readable analyst console views (ticks_named / candles_named).
+    // Sequential AFTER the base-table ensure join so `ticks` + `candles_1m`
+    // exist before CREATE VIEW validates its column references. Fail-soft +
+    // convergent (CREATE OR REPLACE VIEW — every boot converges the deployed
+    // definition to the code); a failure retries next boot. Groww-only boots
+    // get their own call site in `groww_activation.rs::activate_groww_lane`.
+    tickvault_storage::console_views::ensure_named_views(&config.questdb).await;
 
     // D2 Stage 2: the seal-writer (item 1.4b) is now spawned ONCE in the hoisted
     // `build_shared_infra` prefix (via `spawn_seal_writer_loop`) so it runs for

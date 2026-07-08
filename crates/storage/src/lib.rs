@@ -79,6 +79,13 @@ mod global_qcfg_tests {
 }
 
 pub mod boot_probe;
+// Human-readable analyst console views (`ticks_named` / `candles_named`) —
+// plain QuestDB views LEFT-joining ticks/candles_1m against the
+// instrument_lifecycle master. Cold-path console tooling only (O(join) at
+// SELECT time, honestly O(N); zero hot-path impact). NOT feature-gated:
+// the DDL builders compile feature-free; the lifecycle-ensure call inside
+// is `#[cfg(feature = "daily_universe_fetcher")]`-gated.
+pub mod console_views;
 // C2 (2026-07-03): HTTP-CLIENT-01 — panic-free reqwest client construction.
 // Shared OnceLock probe client for the repeating QuestDB readiness probes
 // (boot + every-5s pool watchdog + every-10s SLO scheduler); typed
