@@ -455,7 +455,15 @@ fn http_response_status(core: &str) -> Option<u16> {
 ///    (400/429/5xx/WAF) = REST surface degraded, token NOT implicated →
 ///    [`CycleOutcome::RestSurfaceDegraded`].
 /// 2. Parse-error wrapper (200 with garbage body) → RestSurfaceDegraded.
-/// 3. Send-leg wrapper + a known transient needle → Transient.
+/// 3. Send-leg wrapper + a known transient needle → Transient; send-leg
+///    wrapper WITHOUT a known needle → RestSurfaceDegraded (F12,
+///    2026-07-08): a send-leg failure means NO response was ever received,
+///    so it can never be evidence the TOKEN is bad — it must page (via the
+///    rising-edge CRITICAL) but never walk the counter toward a
+///    DESTRUCTIVE mint. Previously an unrecognized send-leg error string
+///    (a new reqwest wording, a proxy-injected message) fell through to
+///    RealAuthFail and two such cycles minted — destroying a possibly
+///    healthy token over a pure network-layer novelty.
 /// 4. Anything else (dataPlan inactive, activeSegment missing, token
 ///    expiry, unknown shapes) → RealAuthFail — fail-safe default: page AND
 ///    count toward the re-mint threshold.
@@ -471,8 +479,16 @@ fn classify_failure_reason(reason: &str) -> CycleOutcome {
     if core.starts_with(PARSE_ERROR_WRAPPER) {
         return CycleOutcome::RestSurfaceDegraded;
     }
-    if is_transient_network_failure(core) {
-        return CycleOutcome::Transient;
+    if core.starts_with(SEND_LEG_WRAPPER) {
+        // The send-leg wrapper proves the request never got a response —
+        // network-side by construction (a real HTTP response uses the
+        // HTTP-response wrapper). Known-transient needles stay Transient
+        // (no page); an UNKNOWN send-leg remainder pages but never mints.
+        return if is_transient_network_failure(core) {
+            CycleOutcome::Transient
+        } else {
+            CycleOutcome::RestSurfaceDegraded
+        };
     }
     CycleOutcome::RealAuthFail
 }
@@ -1153,6 +1169,49 @@ mod tests {
         assert!(!is_transient_network_failure(reason));
     }
 
+    /// F12 (2026-07-08): a send-leg failure whose remainder matches NO
+    /// known transient needle (a new reqwest wording, a proxy-injected
+    /// message) is still a NETWORK-side failure by construction — no
+    /// response was ever received, so it cannot implicate the token. It
+    /// must classify RestSurfaceDegraded (pages via the rising-edge
+    /// CRITICAL, never walks the counter toward a destructive mint).
+    /// Previously this branch fell through to RealAuthFail, so two novel
+    /// send-leg wordings ~30 min apart minted against a healthy token.
+    #[test]
+    fn cycle_outcome_send_leg_without_transient_needle_is_rest_surface_degraded() {
+        let r: Result<(), tickvault_common::error::ApplicationError> = Err(
+            tickvault_common::error::ApplicationError::AuthenticationFailed {
+                reason: "profile request failed: some brand-new reqwest wording \
+                         this classifier has never seen"
+                    .to_string(),
+            },
+        );
+        assert_eq!(cycle_outcome(&r), CycleOutcome::RestSurfaceDegraded);
+        // And it never walks the re-mint counter (the toward-mint direction).
+        assert_eq!(
+            next_consecutive_failures(1, CycleOutcome::RestSurfaceDegraded),
+            1,
+            "a needle-miss send-leg failure must never escalate toward a mint"
+        );
+    }
+
+    /// F12 companion: two needle-miss send-leg cycles never reach the
+    /// re-mint threshold (the exact regression the reclassification closes).
+    #[test]
+    fn send_leg_needle_miss_two_cycles_never_reach_remint_threshold() {
+        let mut consecutive = 0u32;
+        for _ in 0..2 {
+            let outcome =
+                classify_failure_reason("profile request failed: unknown transport oddity");
+            consecutive = next_consecutive_failures(consecutive, outcome);
+        }
+        assert!(
+            consecutive < CONSECUTIVE_INVALID_REMINT_THRESHOLD,
+            "two novel send-leg failures must stay below the mint threshold \
+             (got {consecutive})"
+        );
+    }
+
     /// The Display prefix (`Dhan authentication failed: `) must not defeat
     /// the prefix anchoring in either direction.
     #[test]
@@ -1483,21 +1542,22 @@ mod tests {
         let token_manager_src = std::fs::read_to_string("src/auth/token_manager.rs")
             .or_else(|_| std::fs::read_to_string("crates/core/src/auth/token_manager.rs"))
             .expect("token_manager.rs must be readable");
-        // R7-CPLX-1 / COV-R7-2 fix (2026-07-07): split at the test MODULE,
-        // not the first raw `#[cfg(test)]` occurrence — token_manager.rs
-        // carries a doc-comment mention + item-level `#[cfg(test)]`
-        // attributes on the test-only constructors BEFORE the real
-        // `mod tests`, so the old split silently EXCLUDED the entire
-        // "Error Classification" production tail (~100 lines, incl.
-        // `is_permanent_auth_error` / `mint_refused_by_instance_lock`) from
-        // this exactly-once duplicate-literal scan — a false-OK direction
-        // hole (a duplicate wrapper literal added there stayed uncounted).
-        let tests_mod_off = token_manager_src.find("\nmod tests {").expect(
-            "token_manager.rs must contain a top-level `mod tests` module — \
-             without it this production-region split is scanning the whole \
-             file (vacuous)",
-        );
-        let production = &token_manager_src[..tests_mod_off];
+        // R7-CPLX-1 / COV-R7-2 fix (2026-07-07) + F8 hardening (2026-07-08):
+        // split via the SHARED `source_scan::production_region` helper —
+        // token_manager.rs carries a doc-comment mention + item-level
+        // `#[cfg(test)]` attributes on the test-only constructors BEFORE the
+        // real `mod tests`, so the old first-literal split silently EXCLUDED
+        // the entire "Error Classification" production tail (~100 lines,
+        // incl. `is_permanent_auth_error` / `mint_refused_by_instance_lock`)
+        // from this exactly-once duplicate-literal scan — a false-OK
+        // direction hole. The helper also keeps any production code that may
+        // ever land AFTER the test module in scope.
+        let production = tickvault_common::source_scan::production_region(&token_manager_src)
+            .expect(
+                "token_manager.rs must contain a #[cfg(test)]-gated top-level \
+                 `mod tests` module — without it this production-region split \
+                 is scanning the whole file (vacuous)",
+            );
         // Split-boundary self-checks: the scanned production region must
         // extend PAST the inline #[cfg(test)] constructor attributes to the
         // LAST production items (the Error Classification tail). If any of
@@ -1543,16 +1603,14 @@ mod tests {
                  at its format! producer site(s)"
             );
         }
-        // Non-vacuity: the `mod tests` block we split at must itself be
-        // #[cfg(test)]-gated (attribute within the few lines immediately
-        // above the split point) — i.e. the boundary really is the
-        // production|tests seam, not some other `mod tests` text.
-        let preamble_start = tests_mod_off.saturating_sub(300);
+        // Non-vacuity (F8): the shared helper only returns Some when it
+        // found a #[cfg(test)]-gated `mod tests` block; assert the excision
+        // actually happened so the scan region is production-only.
         assert!(
-            token_manager_src[preamble_start..tests_mod_off].contains("#[cfg(test)]"),
-            "the `mod tests` block in token_manager.rs must be gated by a \
-             #[cfg(test)] attribute immediately above it — the \
-             production-region split boundary is no longer the test module"
+            !production.contains("\nmod tests {"),
+            "token_manager.rs production region must have its #[cfg(test)] \
+             mod tests block excised (blanked) — the production-region split \
+             boundary is no longer the test module"
         );
     }
 
