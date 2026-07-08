@@ -113,7 +113,9 @@ against a boot-time baseline (captured on the FIRST successful read, so a
 pre-existing lifetime OOM count never fires a spurious page). A positive delta
 means one or more processes in this cgroup — tickvault itself OR a sidecar —
 were killed by the kernel OOM killer. The monitor emits
-`error!(code = "PROC-01", …)` (Telegram Critical) and increments
+`error!(code = "PROC-01", …)` — pages via the `tv-<env>-errcode-proc-01`
+log-filter alarm → SNS → Telegram since 2026-07-06 (the `error!` alone never
+routed to Telegram post-CloudWatch-migration) — and increments
 `tv_oom_kills_total` by the delta, then advances the baseline so the same
 kills are not re-reported.
 
@@ -189,9 +191,12 @@ exhausted `TOTP_MAX_RETRIES` (each retry waits a fresh 30s window). A
 genuinely wrong secret — the classic cause is the operator regenerating
 the 2FA/TOTP seed via the dhan.co web UI without updating the SSM param —
 never produces a valid code, so the loop terminates. That terminal branch
-now fires a distinctly-typed `error!(code = "AUTH-GAP-04", …)` (Telegram
-Critical) instead of a generic `AuthenticationFailed`, pointing the
-operator at the exact SSM parameter to reconcile.
+now fires a distinctly-typed `error!(code = "AUTH-GAP-04", …)` — pages via
+the `tv-<env>-errcode-auth-gap-04` log-filter alarm → SNS → Telegram since
+2026-07-06 (the `error!` alone never routed to Telegram
+post-CloudWatch-migration); the site separately fires the generic
+`AuthenticationFailed` NotificationEvent (not typed as AUTH-GAP-04) — pointing
+the operator at the exact SSM parameter to reconcile.
 
 **Triage:**
 1. `mcp__tickvault-logs__tail_errors` — read the `AUTH-GAP-04` payload

@@ -66,6 +66,42 @@ gives up during market hours — it keeps retrying at the ceiling. A persistent
 storm means the provider keeps closing the socket (entitlement / auth reject) —
 operator must check the credential / entitlement.
 
+**2026-07-06 (corrected in round-3 review):** two pagers now exist, and the
+emit LEVELS matter — the PER-RESTART emission is `warn!`
+(`groww_sidecar_supervisor.rs`, the non-storm arm); only the STORM escalation
+(the 6th+ rapid restart, `>STALL_RESTART_STORM_MAX=5` within 300s) is
+`error!`. The ERROR-only errors.jsonl sink therefore never carries individual
+restarts:
+
+1. **`tv-<env>-feed-stall-restarts`** (`feed-stall-restart-alarm.tf`) — the
+   restart pager: a log metric filter on `/tickvault/<env>/metrics` extracts
+   the per-scrape deltas of `tv_feed_sidecar_stall_restart_total` (increments
+   once per restart, warn! + error! alike; pre-registered at 0 in main.rs
+   immediately AFTER the metrics recorder installs at boot — round-5 fix
+   2026-07-06, ratcheted by
+   `test_stall_restart_counter_is_preregistered_after_recorder_install`; the
+   round-4 supervisor-spawn registration was VOID because the supervisor is
+   spawned before the recorder installs, so its handle resolved to the no-op
+   recorder — so the CW agent's dropped-first-sample delta baseline is the
+   harmless 0, NOT restart #1 of the session; without a post-install
+   registration the first restart of every app session was uncounted and the
+   effective first-episode threshold was 4), Sum ≥ 3 per aligned 15-min window
+   → SNS → Telegram. Honest floor (span math, round-12): 3 restarts span 2
+   gaps, so cycles faster than ~5 min page promptly, the ~5-7.5 min band
+   pages eventually via phase drift of a sustained flap, and only cycles
+   slower than ~7.5 min (>450s) can never fit 3 inside one aligned 900s
+   window — stated residual.
+2. **`tv-<env>-errcode-feed-stall-01`** (`error-code-alarms.tf`) — the
+   storm-escalation tripwire: ONE storm-arm ERROR line pages (Sum ≥ 1 per
+   5 min; the Rust detector already debounces at >5 restarts/5 min). It
+   canNOT see 3-5 restarts/15 min — those lines are warn!-level; that band is
+   pager #1's job.
+
+A single benign self-heal restart never pages on either route (this section's
+own operator-action bound). Before 2026-07-06 even the storm `error!` reached
+only the log sinks — the error!→Telegram route was severed by the
+CloudWatch-only migration.
+
 **Triage:**
 1. `mcp__tickvault-logs__tail_errors` — find `FEED-STALL-01`; the payload carries
    `feed` + (on the storm escalation) `rapid_restarts`.
