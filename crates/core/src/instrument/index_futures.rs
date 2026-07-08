@@ -127,7 +127,23 @@ pub enum IndexFutureMissReason {
     /// Distinct from [`Self::BadExpiryFormat`] so the operator triages the
     /// id-space arm, not the expiry arm (hostile-review round 1, 2026-07-08).
     BadNativeToken,
+    /// More than [`FUTIDX_SAME_EXPIRY_CANDIDATE_CAP`] rows matched the chosen
+    /// (underlying, expiry) — a corrupt/flooded vendor master (hostile-review
+    /// round 3, 2026-07-08: INSTR-FETCH-04-style envelope discipline; the
+    /// dedup pass is O(n) but a flood this size is untrustworthy data, so the
+    /// underlying degrades fail-closed instead of being guessed from a
+    /// corrupt set).
+    SameExpiryCandidateFlood,
 }
+
+/// Hard sanity cap on same-(underlying, expiry) FUTIDX candidate rows —
+/// a legitimate master carries EXACTLY ONE row per (underlying, expiry)
+/// (plus at most a handful of vendor-glitch duplicates); anything beyond
+/// this is a corrupt/flooded file and the underlying degrades fail-closed
+/// with [`IndexFutureMissReason::SameExpiryCandidateFlood`]. Shared by the
+/// Dhan selector and the Groww extractor (hostile-review round 3,
+/// 2026-07-08).
+pub const FUTIDX_SAME_EXPIRY_CANDIDATE_CAP: usize = 16;
 
 /// One degraded underlying (FUTIDX-01 unit).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -239,18 +255,33 @@ pub fn select_index_future_contracts(
             .filter(|(d, _)| *d == chosen_expiry)
             .map(|(_, r)| *r)
             .collect();
+        // Hostile-review round 3 (2026-07-08): envelope cap FIRST — the
+        // same-(underlying, expiry) candidate set comes from an untrusted
+        // public CSV with no per-underlying bound upstream; a flood beyond
+        // the cap is corrupt data and degrades fail-closed (INSTR-FETCH-04
+        // discipline), never processed.
+        if at_chosen.len() > FUTIDX_SAME_EXPIRY_CANDIDATE_CAP {
+            selection.misses.push(IndexFutureMiss {
+                canonical: entry.canonical,
+                reason: IndexFutureMissReason::SameExpiryCandidateFlood,
+            });
+            continue;
+        }
         // Hostile-review round 2 (2026-07-08): collapse vendor-glitch
         // EXACT-duplicate CSV lines (SAME `SECURITY_ID` at the chosen expiry)
         // first-row-wins — the index_extractor.rs precedent — BEFORE the
         // ambiguity count. There is nothing to guess when both rows carry the
         // SAME id; only TRULY-DISTINCT SecurityIds at the same expiry stay
-        // fail-closed as `AmbiguousDuplicateExpiry`. Same-segment set by
-        // construction (all rows already filtered to `entry.dhan_segment`),
-        // so the id-only key is I-P1-11-safe here. O(n²) over the tiny
-        // same-expiry candidate set; cold path, once per boot.
+        // fail-closed as `AmbiguousDuplicateExpiry`. Round 3: HashSet-based
+        // O(n) dedup (was an O(n²) scan) — the set is keyed on the bare
+        // `security_id` string, which is I-P1-11-SAFE HERE because every row
+        // in `at_chosen` was already filtered to the SINGLE segment
+        // `entry.dhan_segment` (single-segment by construction).
+        let mut seen_ids: std::collections::HashSet<&str> =
+            std::collections::HashSet::with_capacity(at_chosen.len());
         let mut distinct: Vec<&CsvRow> = Vec::with_capacity(at_chosen.len());
         for r in &at_chosen {
-            if !distinct.iter().any(|d| d.security_id == r.security_id) {
+            if seen_ids.insert(r.security_id.as_str()) {
                 distinct.push(r);
             }
         }
@@ -709,6 +740,48 @@ mod tests {
             .collect();
         assert_eq!(nifty.len(), 1);
         assert_eq!(nifty[0].security_id, "35001");
+    }
+
+    /// Hostile-review round 3 (2026-07-08): a same-(underlying, expiry)
+    /// candidate FLOOD beyond the envelope cap degrades fail-closed with its
+    /// own reason — corrupt vendor data is never processed (INSTR-FETCH-04
+    /// discipline; also bounds the dedup pass).
+    #[test]
+    fn test_select_flood_beyond_cap_degrades_fail_closed() {
+        let mut rows = four_rows("2026-07-30");
+        for i in 0..=FUTIDX_SAME_EXPIRY_CANDIDATE_CAP {
+            rows.push(futidx_row(
+                "NIFTY",
+                "NSE_FNO",
+                &format!("9{i:04}"),
+                "2026-07-30",
+            ));
+        }
+        let sel = select_index_future_contracts(&rows, d("2026-07-08"));
+        assert_eq!(sel.chosen.len(), 3, "NIFTY dropped fail-closed");
+        assert!(sel.chosen.iter().all(|r| r.underlying_symbol != "NIFTY"));
+        assert_eq!(
+            sel.misses,
+            vec![IndexFutureMiss {
+                canonical: "NIFTY",
+                reason: IndexFutureMissReason::SameExpiryCandidateFlood,
+            }]
+        );
+    }
+
+    /// Round 3: the exact-duplicate dedup is O(n) (HashSet) and holds AT the
+    /// cap boundary — cap-many copies of the SAME SID collapse to one chosen
+    /// row (no ambiguity, no flood).
+    #[test]
+    fn test_select_dedup_at_cap_scale_same_sid_still_chosen() {
+        let mut rows = four_rows("2026-07-30");
+        // cap-1 EXTRA copies of the NIFTY row (total NIFTY rows == cap).
+        for _ in 0..(FUTIDX_SAME_EXPIRY_CANDIDATE_CAP - 1) {
+            rows.push(futidx_row("NIFTY", "NSE_FNO", "35001", "2026-07-30"));
+        }
+        let sel = select_index_future_contracts(&rows, d("2026-07-08"));
+        assert_eq!(sel.misses, vec![], "same-SID copies are never a miss");
+        assert_eq!(sel.chosen.len(), 4);
     }
 
     #[test]

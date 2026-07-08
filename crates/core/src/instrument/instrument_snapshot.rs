@@ -203,8 +203,19 @@ pub fn to_universe(snapshot: &PlanSnapshot) -> Option<DailyUniverse> {
             csv_row.segment = segment.to_string();
             csv_row.exch_id = if segment == "BSE_FNO" { "BSE" } else { "NSE" }.to_string();
             csv_row.instrument = "FUTIDX".to_string();
-            csv_row.expiry_date = t.expiry_date.clone().unwrap_or_default();
-            csv_row.underlying_symbol = t.underlying_symbol.clone().unwrap_or_default();
+            // Hostile-review round 3 (2026-07-08): expiry + underlying are
+            // fail-closed like segment — a corrupt/hand-edited snapshot with
+            // either missing previously produced a SUBSCRIBED future that
+            // was INVISIBLE to the parity recorder (empty expiry → the
+            // `dhan_selections_from_universe` parse skips it → a false
+            // one-sided FUTIDX-02 page). Whole-snapshot `None` → cold
+            // rebuild, same doctrine as an unknown role/segment.
+            csv_row.expiry_date = t.expiry_date.clone()?;
+            csv_row.underlying_symbol = t.underlying_symbol.clone()?;
+            if csv_row.expiry_date.trim().is_empty() || csv_row.underlying_symbol.trim().is_empty()
+            {
+                return None;
+            }
         }
         // Derive the membership flags from `role` when the snapshot left them
         // at the serde default (`false`) — a snapshot written by pre-Sub-PR-#5
@@ -921,6 +932,48 @@ mod tests {
         assert_eq!(fut.csv_row.underlying_symbol, "SENSEX");
         // The spot entry carries NO §36 fields on the wire.
         assert!(!json.contains("\"segment\":null"));
+    }
+
+    /// Hostile-review round 3 (2026-07-08): expiry + underlying are
+    /// fail-closed like segment — a corrupt snapshot future with either
+    /// missing/empty previously subscribed INVISIBLY to the parity recorder
+    /// (empty expiry never parses → the Dhan parity entry omits a live
+    /// underlying → false one-sided FUTIDX-02).
+    #[test]
+    fn test_snapshot_index_future_missing_expiry_or_underlying_fails_closed() {
+        let base = SnapshotTarget {
+            role: "index_future".to_string(),
+            security_id: "35001".to_string(),
+            symbol_name: "NIFTY-Jul2026-FUT".to_string(),
+            is_fno_underlying: false,
+            is_index_constituent: false,
+            segment: Some("NSE_FNO".to_string()),
+            expiry_date: Some("2026-07-30".to_string()),
+            underlying_symbol: Some("NIFTY".to_string()),
+        };
+        let snap_for = |t: SnapshotTarget| PlanSnapshot {
+            trading_date_ist: "2026-07-08".to_string(),
+            format: PLAN_SNAPSHOT_FORMAT_CURRENT,
+            targets: vec![t],
+        };
+        // Control: the intact entry converts.
+        assert!(to_universe(&snap_for(base.clone())).is_some());
+        // Missing expiry → whole snapshot fails closed.
+        let mut t = base.clone();
+        t.expiry_date = None;
+        assert!(to_universe(&snap_for(t)).is_none());
+        // Empty-string expiry → fails closed.
+        let mut t = base.clone();
+        t.expiry_date = Some(String::new());
+        assert!(to_universe(&snap_for(t)).is_none());
+        // Missing underlying → fails closed.
+        let mut t = base.clone();
+        t.underlying_symbol = None;
+        assert!(to_universe(&snap_for(t)).is_none());
+        // Whitespace-only underlying → fails closed.
+        let mut t = base;
+        t.underlying_symbol = Some("  ".to_string());
+        assert!(to_universe(&snap_for(t)).is_none());
     }
 
     #[test]

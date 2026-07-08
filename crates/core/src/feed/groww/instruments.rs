@@ -510,17 +510,30 @@ pub fn extract_index_future_entries(
             .filter(|(d, _)| *d == chosen)
             .map(|(_, r)| *r)
             .collect();
+        // Hostile-review round 3 (2026-07-08): envelope cap FIRST — mirror of
+        // the Dhan selector; a same-(underlying, expiry) candidate flood
+        // beyond the cap is corrupt vendor data and degrades fail-closed.
+        if at_chosen.len() > crate::instrument::index_futures::FUTIDX_SAME_EXPIRY_CANDIDATE_CAP {
+            misses.push(IndexFutureMiss {
+                canonical: target.canonical,
+                reason: IndexFutureMissReason::SameExpiryCandidateFlood,
+            });
+            continue;
+        }
         // Hostile-review round 2 (2026-07-08): collapse vendor-glitch
         // EXACT-duplicate master lines (SAME `exchange_token` at the chosen
         // expiry) first-row-wins BEFORE the ambiguity count — mirror of the
         // Dhan-side SECURITY_ID dedup in `select_index_future_contracts`.
         // Only TRULY-DISTINCT tokens at the same expiry stay fail-closed.
+        // Round 3: HashSet-based O(n) dedup (was an O(n²) scan) — keyed on
+        // the bare `exchange_token`, I-P1-11-SAFE HERE because every row in
+        // `at_chosen` is FNO-segment FUT for ONE underlying/exchange by
+        // construction (single-segment set).
+        let mut seen_tokens: std::collections::HashSet<&str> =
+            std::collections::HashSet::with_capacity(at_chosen.len());
         let mut distinct: Vec<&GrowwInstrumentRow> = Vec::with_capacity(at_chosen.len());
         for row in &at_chosen {
-            if !distinct
-                .iter()
-                .any(|d| d.exchange_token == row.exchange_token)
-            {
+            if seen_tokens.insert(row.exchange_token.as_str()) {
                 distinct.push(row);
             }
         }
@@ -2349,6 +2362,30 @@ mod tests {
         // F0 (round 2): the canonical is threaded into the watch entry so the
         // feed='groww' FUTIDX master rows carry a queryable underlying.
         assert_eq!(nifty[0].entry.underlying_symbol.as_deref(), Some("NIFTY"));
+    }
+
+    /// Hostile-review round 3 (2026-07-08): mirror of the Dhan flood cap —
+    /// a same-(underlying, expiry) candidate flood beyond
+    /// `FUTIDX_SAME_EXPIRY_CANDIDATE_CAP` degrades fail-closed with its own
+    /// reason; corrupt vendor data is never processed.
+    #[cfg(feature = "daily_universe_fetcher")]
+    #[test]
+    fn test_extract_flood_beyond_cap_degrades_fail_closed() {
+        use crate::instrument::index_futures::FUTIDX_SAME_EXPIRY_CANDIDATE_CAP;
+        let mut csv = format!("{HEADER}\n{}", fut_rows_all_four("2026-07-30"));
+        for i in 0..=FUTIDX_SAME_EXPIRY_CANDIDATE_CAP {
+            csv.push_str(&fut_row("NSE", &format!("9{i:04}"), "NIFTY", "2026-07-30"));
+            csv.push('\n');
+        }
+        let rows = parse_groww_master(&csv).expect("parse");
+        let (entries, misses) = extract_index_future_entries(&rows, groww_test_today());
+        assert_eq!(entries.len(), 3, "NIFTY dropped fail-closed");
+        assert!(entries.iter().all(|f| f.canonical != "NIFTY"));
+        assert!(misses.iter().any(|m| {
+            m.canonical == "NIFTY"
+                && m.reason
+                    == crate::instrument::index_futures::IndexFutureMissReason::SameExpiryCandidateFlood
+        }));
     }
 
     #[cfg(feature = "daily_universe_fetcher")]
