@@ -93,12 +93,15 @@ flapper invisible) is the proof.
 
 - **P1 log-shipping fix:** the 2026-07-05 machine/ move (`observability.rs:44,51`;
   hourly app log too, `main.rs:1217`) killed BOTH `/tickvault/prod/app` streams —
-  the CW-agent globs point at the old top level. Fix: 5-entry collect_list in
-  BOTH `deploy/aws/cloudwatch-agent.json` and `user-data.sh.tftpl` — machine/
-  paths with the dotted glob `machine/errors.jsonl.*` (excludes the bare
-  `errors.jsonl` compat symlink, observability.rs:178) + legacy globs under
-  distinct `-legacy` stream names (grace window; removed after one confirmed
-  trading day). Delivery: deploy-aws.yml:631-633 copies + fetch-configs the repo
+  the CW-agent globs point at the old top level. Fix (converged 2026-07-08 on
+  the form main landed in #1438, pinned by
+  `crates/app/tests/cloudwatch_agent_glob_guard.rs`): the collect_list in BOTH
+  `deploy/aws/cloudwatch-agent.json` and `user-data.sh.tftpl` carries EXACTLY
+  the two machine/ globs in date-stamped form — `machine/errors.jsonl.2*` +
+  `machine/app.2*` (excludes the bare `errors.jsonl` compat symlink,
+  observability.rs:178, AND the 0-byte `app.log` placeholder). The originally
+  planned `-legacy` grace-window streams were DROPPED — main's glob guard
+  forbids top-level data/logs globs. Delivery: deploy-aws.yml:631-633 copies + fetch-configs the repo
   agent JSON on every deploy; the E3 paths edit makes agent-config-only changes
   self-deploying AND makes THIS PR self-trigger a deploy on merge. The
   user-data.sh.tftpl mirror is provably inert for the running box
@@ -292,12 +295,15 @@ flapper invisible) is the proof.
   09:20-15:35 gate window.
 - Repeating DH-901 every 15 min (the 2026-07-06 shape): eval 3 / dta 1 holds
   ALARM across ≤15-min gaps → 1 page + 1 OK per episode instead of ~32.
-- Rollback of the machine/ move itself → the `-legacy` globs still ship the
-  old paths (no blind window in either direction during the grace period).
-- The bare `errors.jsonl` compat symlink → excluded by the dotted glob so the
-  agent's newest-file tailing cannot flap between symlink and hourly file.
-- `machine/app.*` also matches the 0-byte `app.log` Alloy placeholder —
-  harmless (agent tails newest mtime).
+- Rollback of the machine/ move itself → a config-side glob follow-up would be
+  needed (the `-legacy` grace streams were dropped per main's #1438 glob guard,
+  which forbids top-level data/logs globs; the guard fails the build if the
+  Rust sink dir and the agent globs ever diverge, so the blind window is
+  build-blocked, not silent).
+- The bare `errors.jsonl` compat symlink → excluded by the date-stamped
+  `.2*` glob so the agent's newest-file tailing cannot flap between symlink
+  and hourly file.
+- The 0-byte `app.log` Alloy placeholder → also excluded by `app.2*`.
 - Launch-time boundary: exactly 08:25 IST → holiday-eligible; 08:24 → not
   (pinned by a unit test).
 

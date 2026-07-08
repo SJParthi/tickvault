@@ -2696,6 +2696,19 @@ impl NotificationEvent {
             // that re-renders the body — Severity::Info would otherwise be
             // batched by the default routing.
             Self::CrossVerify1mSummary { .. } => DispatchPolicy::Immediate,
+            // 2026-07-08 (verified incident, operator complaint "why every
+            // telegram notification is very late"): PR #1439's in-market
+            // digest (900s window) swept the three once-per-trading-day
+            // market-open confirmations — "READY for market open @ 09:14"
+            // arrived at 09:28, "Streaming live @ 09:15:30" at 09:30,
+            // "self-test PASSED @ 09:16" at 09:30. Time-critical at the
+            // open; ship instantly. Severity stays Info — Immediate wins
+            // over severity in `classify_dispatch`, so color is untouched.
+            // (SelfTestDegraded/SelfTestCritical are High/Critical and
+            // already route immediate via the severity fallback.)
+            Self::MarketOpenReadinessConfirmation { .. }
+            | Self::MarketOpenStreamingConfirmation { .. }
+            | Self::SelfTestPassed { .. } => DispatchPolicy::Immediate,
             _ => DispatchPolicy::Default,
         }
     }
@@ -4138,6 +4151,49 @@ mod tests {
             assert!(
                 event.severity().tag().contains("[LOW]"),
                 "tag drift detected for {}",
+                event.topic()
+            );
+        }
+    }
+
+    /// 2026-07-08 ratchet (verified incident, operator complaint "why every
+    /// telegram notification is very late"): PR #1439's in-market digest
+    /// (900s window) swept the three once-per-trading-day market-open
+    /// confirmations — READY @ 09:14 delivered at 09:28, Streaming live
+    /// @ 09:15:30 at 09:30, self-test PASSED @ 09:16 at 09:30. These are
+    /// time-critical at the open: each MUST request `DispatchPolicy::
+    /// Immediate` (bypassing the digest via `classify_dispatch`) while
+    /// KEEPING `Severity::Info` (color decoupled from routing). Blocks
+    /// regression to the digest-swept pattern.
+    #[test]
+    fn test_market_open_confirmations_are_immediate_info() {
+        let events = [
+            NotificationEvent::MarketOpenReadinessConfirmation {
+                main_feed_active: 1,
+                main_feed_total: 1,
+                order_update_active: true,
+                token_remaining_secs: 20 * 3600,
+            },
+            NotificationEvent::MarketOpenStreamingConfirmation {
+                main_feed_active: 1,
+                main_feed_total: 1,
+                order_update_active: true,
+            },
+            NotificationEvent::SelfTestPassed { checks_passed: 7 },
+        ];
+        for event in events {
+            assert_eq!(
+                event.dispatch_policy(),
+                DispatchPolicy::Immediate,
+                "{} must request immediate dispatch (verified incident 2026-07-08 — \
+                 the in-market digest delayed the market-open confirmations ~15m)",
+                event.topic()
+            );
+            assert_eq!(
+                event.severity(),
+                Severity::Info,
+                "{} must stay Info — Immediate wins over severity in \
+                 classify_dispatch, so no severity bump is needed",
                 event.topic()
             );
         }

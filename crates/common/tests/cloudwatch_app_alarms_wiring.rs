@@ -660,8 +660,11 @@ fn test_cw_agent_collects_machine_log_paths() {
     // configs untouched) fail this build until the two move in lockstep.
     let errors_dir = observability_dir_const("ERRORS_JSONL_DIR");
     let app_dir = observability_dir_const("MACHINE_LOGS_DIR");
-    let errors_glob = format!("/opt/tickvault/{errors_dir}/errors.jsonl.*");
-    let app_glob = format!("/opt/tickvault/{app_dir}/app.*");
+    // `.2*` (date-stamped rotations only) matches the form main landed in
+    // PR #1438 — it excludes the bare errors.jsonl compat symlink AND the
+    // 0-byte machine/app.log placeholder, tailing only real rotated files.
+    let errors_glob = format!("/opt/tickvault/{errors_dir}/errors.jsonl.2*");
+    let app_glob = format!("/opt/tickvault/{app_dir}/app.2*");
     for rel in [
         "deploy/aws/terraform/user-data.sh.tftpl",
         "deploy/aws/cloudwatch-agent.json",
@@ -671,7 +674,8 @@ fn test_cw_agent_collects_machine_log_paths() {
             body.contains(&errors_glob),
             "Z+ L2 VERIFY ratchet: {rel} must tail the ERROR JSONL glob \
              {errors_glob} (derived from observability.rs::ERRORS_JSONL_DIR; \
-             dotted, so the bare errors.jsonl compat symlink is excluded). \
+             dotted + date-stamped, so the bare errors.jsonl compat symlink \
+             is excluded). \
              Without it every error-code log metric filter on \
              /tickvault/prod/app is DOA. If the Rust sink dir moved, move the \
              agent-config globs in the SAME PR."
