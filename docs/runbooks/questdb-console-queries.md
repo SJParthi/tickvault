@@ -47,6 +47,13 @@ WHERE symbol_name IS NULL;
 -- Per-feed comparison for the same instrument (Dhan vs Groww rows coexist)
 SELECT ts, feed, close, volume FROM candles_named
 WHERE symbol_name = 'NIFTY' ORDER BY ts DESC LIMIT 20;
+
+-- DETECTOR: duplicate lifecycle dimension rows (any hit = the views
+-- N-fold-multiply that instrument's rows; see "Failure modes" below)
+SELECT security_id, exchange_segment, feed, count()
+FROM instrument_lifecycle
+GROUP BY security_id, exchange_segment, feed
+HAVING count() > 1;
 ```
 
 ## What the views are (and are not)
@@ -56,9 +63,20 @@ WHERE symbol_name = 'NIFTY' ORDER BY ts DESC LIMIT 20;
   `ticks` / `candles_1m` LEFT-joined against a dimension subquery of
   `instrument_lifecycle` filtered `dry_run = false` (dry-run rows are
   isolated per the daily-universe lock §27).
-- **The join can never multiply rows:** the lifecycle master pins its
-  designated `ts` to a constant (epoch 0), so DEDUP collapses it to
-  exactly ONE row per `(security_id, exchange_segment, feed)`.
+- **Duplicate-safety honest envelope — one dimension row per key WHILE
+  DEDUP is live:** the lifecycle master pins its designated `ts` to a
+  constant (epoch 0), so its DEDUP collapses it to exactly ONE row per
+  `(security_id, exchange_segment, feed)` and the join cannot multiply
+  rows **in that state**. Two documented degraded windows break the
+  precondition with persistent duplicates that a later `DEDUP ENABLE`
+  does NOT retro-collapse (it applies to future writes only): (1) the
+  lifecycle HTTP-CLIENT-01 auto-create window (`lifecycle_ensure` site
+  — table ILP-created WITHOUT dedup keys, reconcile UPSERTs append
+  duplicate sets), and (2) a partial feed self-heal boot (NULL→'dhan'
+  backfill failed, `DEDUP ENABLE` succeeded — the next boot's backfill
+  mints same-key duplicates). With N lifecycle rows for one key, every
+  matching view row appears exactly N times. Run the detector below if
+  counts look inflated.
 - **`feed` is in the join predicate** — a Dhan and a Groww row for the
   same instrument stay distinct, and Groww's bit-62 synthetic index
   ids resolve only under `feed = 'groww'`.
@@ -114,3 +132,4 @@ c.open_pct, c.open_gap_pct`.
 | `named view DDL non-2xx` warn at boot | QuestDB rejected the statement (e.g. base table missing on a degraded boot) | None — retries next boot; use the fallback SQL meanwhile |
 | HTTP-CLIENT-01 with site `named_views_ensure` | reqwest client build failed (fd/TLS/resolver pressure) | Follow `.claude/rules/project/http-client-error-codes.md` triage; views self-heal next boot |
 | NULL `symbol_name` on live instruments | Lifecycle master empty/partial (fresh DB, pre-reconcile) | Expected pre-reconcile; sustained NULLs = check the daily-universe orchestrator (INSTR-FETCH-*) |
+| View counts exactly N× inflated per instrument (e.g. every NIFTY minute appears twice) | Duplicate `instrument_lifecycle` rows for one `(security_id, exchange_segment, feed)` key — the HTTP-CLIENT-01 auto-create window or a partial feed self-heal left pre-DEDUP duplicates that `DEDUP ENABLE` never retro-collapses | Run the detector query above to confirm + name the keys. Base tables (`ticks`, `candles_1m`) are UNAFFECTED — the multiplication is join-side only. Remediation = the manual dedup sweep already named by `http-client-error-codes.md` §1 — an explicit operator decision (lifecycle rows are never auto-deleted, daily-universe lock §5) |

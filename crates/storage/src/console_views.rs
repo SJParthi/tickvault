@@ -14,12 +14,35 @@
 //!
 //! ## Join correctness
 //!
-//! * The lifecycle master's designated `ts` is a PINNED epoch-0
-//!   constant (`lifecycle_designated_ts_nanos() -> 0`, I-P1-08), so
-//!   its DEDUP key `(ts, security_id, exchange_segment, feed)`
-//!   collapses to exactly ONE row per `(security_id,
-//!   exchange_segment, feed)` — the join can NEVER multiply rows; no
-//!   `LATEST ON` is needed.
+//! * **Duplicate-safety HONEST ENVELOPE (review round 2):** the
+//!   lifecycle master's designated `ts` is a PINNED epoch-0 constant
+//!   (`lifecycle_designated_ts_nanos() -> 0`, I-P1-08), so **while its
+//!   DEDUP is live** the key `(ts, security_id, exchange_segment,
+//!   feed)` collapses to exactly ONE row per `(security_id,
+//!   exchange_segment, feed)` and the join cannot multiply rows. That
+//!   precondition is CONDITIONAL — two already-documented degraded
+//!   windows leave PERSISTENT same-key duplicates that QuestDB's later
+//!   `DEDUP ENABLE` does NOT retro-collapse (it applies to future
+//!   writes only), and then every joined fact row is N-fold
+//!   multiplied in the views:
+//!   1. the lifecycle HTTP-CLIENT-01 degrade arm (`lifecycle_ensure`
+//!      site, `instrument_lifecycle_persistence.rs`) — the table is
+//!      ILP-auto-created WITHOUT dedup keys and every reconcile
+//!      UPSERT in that window appends full duplicate row sets;
+//!   2. a partial `run_lifecycle_feed_self_heal` boot where the
+//!      NULL→'dhan' backfill step fails but `DEDUP ENABLE` succeeds —
+//!      the NEXT boot's backfill mints same-key duplicates.
+//!   Detector (copy-paste form in the runbook):
+//!   `SELECT security_id, exchange_segment, feed, count() FROM
+//!   instrument_lifecycle GROUP BY security_id, exchange_segment, feed
+//!   HAVING count() > 1;`
+//!   Deliberately NO `LATEST ON` collapse in the view: it is un-probed
+//!   QuestDB-9.3.5-inside-a-VIEW territory (evidence discipline —
+//!   zero-loss charter §4), and silently collapsing would HIDE the
+//!   master-table corruption the detector exists to surface (audit
+//!   Rule 11: the duplicates are the bug; remediation is the manual
+//!   dedup sweep already named by `http-client-error-codes.md` §1,
+//!   an operator decision under the lifecycle no-DELETE lock).
 //! * Join predicate is the I-P1-11 composite `(security_id, segment)`
 //!   PLUS `feed` (feed-in-key everywhere, operator 2026-06-28): a
 //!   Dhan row and a Groww row for the same instrument coexist by
@@ -395,6 +418,59 @@ mod tests {
         assert!(
             candles.contains("FROM candles_1m c"),
             "candles_named must read FROM candles_1m: {candles}"
+        );
+    }
+
+    #[test]
+    fn test_duplicate_dim_honest_envelope_ratchet() {
+        // Review round 2 (LOW): the original unconditional join-safety
+        // claim held ONLY while lifecycle DEDUP was live — duplicate
+        // lifecycle rows from the documented HTTP-CLIENT-01 auto-create
+        // window / partial feed self-heal N-fold-multiply view output,
+        // and DEDUP ENABLE does not retro-collapse them. This ratchet pins (a) the honest-envelope
+        // wording + the operator detector query in the runbook, and
+        // (b) that neither the runbook nor this module regresses to the
+        // unconditional claim.
+        let runbook_path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../docs/runbooks/questdb-console-queries.md"
+        );
+        let runbook = std::fs::read_to_string(runbook_path)
+            .unwrap_or_else(|e| panic!("runbook must exist at {runbook_path}: {e}"));
+        // Detector query is copy-paste present.
+        for fragment in [
+            "GROUP BY security_id, exchange_segment, feed",
+            "HAVING count() > 1",
+            "FROM instrument_lifecycle",
+        ] {
+            assert!(
+                runbook.contains(fragment),
+                "runbook must carry the duplicate-dim detector fragment {fragment:?}"
+            );
+        }
+        // Honest envelope named; unconditional claim banned. The banned
+        // phrase is built dynamically so this test's own source never
+        // matches the scan.
+        let banned = format!("{} {}", "never", "multiply");
+        let normalize = |s: &str| {
+            s.to_lowercase()
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        let runbook_norm = normalize(&runbook);
+        assert!(
+            runbook_norm.contains("while dedup is live"),
+            "runbook must state the WHILE-DEDUP-is-live honest envelope"
+        );
+        assert!(
+            !runbook_norm.contains(&banned),
+            "runbook regressed to the unconditional '{banned}' claim"
+        );
+        let module_norm = normalize(include_str!("console_views.rs"));
+        assert!(
+            !module_norm.contains(&banned),
+            "console_views.rs regressed to the unconditional '{banned}' claim"
         );
     }
 
