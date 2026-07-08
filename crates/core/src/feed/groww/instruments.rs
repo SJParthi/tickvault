@@ -904,16 +904,73 @@ fn build_groww_watch_from_csvs(
     // a miss pages FUTIDX-01 (feed=groww) and the watch build stays valid.
     // Feature-gated because the shared selector lives with the Dhan
     // instrument modules; the feature is default-ON in the app crate.
+    //
+    // Hostile-review round 4 (2026-07-08): this block EXTRACTS only — every
+    // §36 emission (FUTIDX-01 errors + counters, boot-evidence lines, the
+    // parity recording, the dedup-collapse error) is DEFERRED until AFTER
+    // `assemble_watch_set` succeeds below, mirroring the Dhan Step-3d
+    // post-build ordering. Pre-assemble emission meant a day where assemble
+    // persistently fails (NtmDanglingExceeded — live precedent 2026-06-08 —
+    // or UniverseSizeOutOfBounds) had the ≤300s activation pull-until-success
+    // retry re-record the Groww parity entry FOREVER: a genuine cross-feed
+    // divergence re-paged FUTIDX-02 every retry (non-edge-triggered, audit
+    // Rule 4 violation), and the matching case logged "parity OK" all day
+    // for a feed that subscribed NOTHING (false-OK, audit Rule 11).
     #[cfg(feature = "daily_universe_fetcher")]
-    let future_entries = {
-        use tickvault_common::error_code::ErrorCode;
+    let (future_entries, future_misses, groww_selection) = {
         let (futures, misses) = extract_index_future_entries(&rows, today_ist);
-        if !misses.is_empty() {
+        // Parity units: the canonical + expiry come VERBATIM from the
+        // exact-match extraction — never re-derived from symbol substrings
+        // ("BANKNIFTY".contains("NIFTY") mislabeled 2 of 4 pre-fix).
+        let mut groww_selection: Vec<crate::instrument::index_futures::FeedFutureSelection> =
+            Vec::with_capacity(futures.len());
+        for f in &futures {
+            groww_selection.push(crate::instrument::index_futures::FeedFutureSelection {
+                canonical: f.canonical,
+                expiry: f.expiry,
+                native_id: f.entry.exchange_token.clone(),
+                segment: f.entry.segment.clone(),
+            });
+        }
+        let entries = futures.into_iter().map(|f| f.entry).collect::<Vec<_>>();
+        (entries, misses, groww_selection)
+    };
+    #[cfg(not(feature = "daily_universe_fetcher"))]
+    let future_entries = {
+        let _ = today_ist; // futures require the shared selector (feature-gated)
+        Vec::<WatchEntry>::new()
+    };
+
+    // Hostile-review round 2 (2026-07-08): `expected` is the DISTINCT
+    // (exchange, exchange_token, segment) count — the SAME key
+    // `assemble_watch_set`'s dedup uses — so an intra-futures dedup collapse
+    // (duplicate exchange_token across underlyings = vendor master
+    // corruption) is never misattributed to an operator cap override. The
+    // collapse itself is loudly reported as its own FUTIDX-01 cause below
+    // (post-assemble, round 4).
+    let raw_futures = future_entries.len();
+    let expected_futures = distinct_future_key_count(&future_entries);
+    let set = assemble_watch_set(
+        index_entries,
+        stock_entries,
+        future_entries,
+        unresolved,
+        ntm_total,
+        max_subscribe,
+    )?;
+    // §36 emissions — POST-assemble-success ONLY (round 4, see the block
+    // comment above): a failed build attempt records/emits NOTHING, so the
+    // activation retry loop can never spam FUTIDX-02 or log a false
+    // "parity OK" for a feed that subscribed nothing.
+    #[cfg(feature = "daily_universe_fetcher")]
+    {
+        use tickvault_common::error_code::ErrorCode;
+        if !future_misses.is_empty() {
             // Alias-drift evidence (bounded) — the FUTIDX-01 runbook promises
             // `candidates_seen` on BOTH feeds; collected only on the degrade
             // path (cold, once per degraded activation).
             let candidates_seen = collect_fut_underlying_symbols_seen(&rows);
-            for miss in &misses {
+            for miss in &future_misses {
                 tracing::error!(
                     code = ErrorCode::Futidx01SelectionDegraded.code_str(),
                     feed = "groww",
@@ -931,80 +988,40 @@ fn build_groww_watch_from_csvs(
                 .increment(1);
             }
         }
-        // Parity recording: the canonical + expiry come VERBATIM from the
-        // exact-match extraction — never re-derived from symbol substrings
-        // ("BANKNIFTY".contains("NIFTY") mislabeled 2 of 4 pre-fix).
-        let mut groww_selection: Vec<crate::instrument::index_futures::FeedFutureSelection> =
-            Vec::new();
-        for f in &futures {
+        // Boot-evidence lines + parity recording (one per SUCCESSFUL build).
+        for sel in &groww_selection {
             info!(
                 feed = "groww",
-                underlying = f.canonical,
-                expiry = %f.expiry,
-                native_id = %f.entry.exchange_token,
-                segment = %f.entry.segment,
+                underlying = sel.canonical,
+                expiry = %sel.expiry,
+                native_id = %sel.native_id,
+                segment = %sel.segment,
                 "index-futures selection"
             );
-            groww_selection.push(crate::instrument::index_futures::FeedFutureSelection {
-                canonical: f.canonical,
-                expiry: f.expiry,
-                native_id: f.entry.exchange_token.clone(),
-                segment: f.entry.segment.clone(),
-            });
         }
         crate::instrument::index_futures::record_index_future_selection(
             "groww",
             today_ist,
             groww_selection,
         );
-        futures.into_iter().map(|f| f.entry).collect::<Vec<_>>()
-    };
-    #[cfg(not(feature = "daily_universe_fetcher"))]
-    let future_entries = {
-        let _ = today_ist; // futures require the shared selector (feature-gated)
-        Vec::<WatchEntry>::new()
-    };
-
-    // Hostile-review round 2 (2026-07-08): `expected` is the DISTINCT
-    // (exchange, exchange_token, segment) count — the SAME key
-    // `assemble_watch_set`'s dedup uses — so an intra-futures dedup collapse
-    // (duplicate exchange_token across underlyings = vendor master
-    // corruption) is never misattributed to an operator cap override. The
-    // collapse itself is loudly reported as its own FUTIDX-01 cause here.
-    let raw_futures = future_entries.len();
-    let expected_futures = distinct_future_key_count(&future_entries);
-    #[cfg(feature = "daily_universe_fetcher")]
-    if expected_futures < raw_futures {
-        tracing::error!(
-            code = tickvault_common::error_code::ErrorCode::Futidx01SelectionDegraded.code_str(),
-            feed = "groww",
-            raw = raw_futures,
-            distinct = expected_futures,
-            "duplicate exchange_token among the selected index futures collapsed by the \
-             watch-set dedup — vendor master id-space corruption; the folded contract is \
-             NOT subscribed"
-        );
-        metrics::counter!("tv_index_futures_dedup_dropped_total", "feed" => "groww")
-            .increment((raw_futures - expected_futures) as u64);
-    }
-    #[cfg(not(feature = "daily_universe_fetcher"))]
-    let _ = raw_futures;
-    let set = assemble_watch_set(
-        index_entries,
-        stock_entries,
-        future_entries,
-        unresolved,
-        ntm_total,
-        max_subscribe,
-    )?;
-    // §36 observability is POST-cap and honest: the gauge reports what is
-    // actually in the LIVE subscribe set, and any operator-mandated future
-    // dropped by a sub-4 cap (env override) is LOUD, never silent
-    // (hostile-review round 1, 2026-07-08: the gauge was set pre-cap and
-    // could report 4 while 0 survived the truncate).
-    #[cfg(feature = "daily_universe_fetcher")]
-    {
-        use tickvault_common::error_code::ErrorCode;
+        if expected_futures < raw_futures {
+            tracing::error!(
+                code = ErrorCode::Futidx01SelectionDegraded.code_str(),
+                feed = "groww",
+                raw = raw_futures,
+                distinct = expected_futures,
+                "duplicate exchange_token among the selected index futures collapsed by the \
+                 watch-set dedup — vendor master id-space corruption; the folded contract is \
+                 NOT subscribed"
+            );
+            metrics::counter!("tv_index_futures_dedup_dropped_total", "feed" => "groww")
+                .increment((raw_futures - expected_futures) as u64);
+        }
+        // §36 observability is POST-cap and honest: the gauge reports what is
+        // actually in the LIVE subscribe set, and any operator-mandated future
+        // dropped by a sub-4 cap (env override) is LOUD, never silent
+        // (hostile-review round 1, 2026-07-08: the gauge was set pre-cap and
+        // could report 4 while 0 survived the truncate).
         let live_futures = set.entries.iter().filter(|e| e.segment == "FNO").count();
         metrics::gauge!("tv_index_futures_selected", "feed" => "groww").set(live_futures as f64);
         if live_futures < expected_futures {
@@ -1022,7 +1039,7 @@ fn build_groww_watch_from_csvs(
         }
     }
     #[cfg(not(feature = "daily_universe_fetcher"))]
-    let _ = expected_futures;
+    let _ = (raw_futures, expected_futures);
     Ok(set)
 }
 
@@ -2446,5 +2463,50 @@ mod tests {
         assert_eq!(set.entries.len(), 126);
         assert_eq!(set.resolved_stocks, 121);
         assert_eq!(set.indices, 1);
+    }
+
+    /// Hostile-review round 4 (2026-07-08) source-order ratchet: EVERY §36
+    /// emission (FUTIDX-01 miss errors, boot-evidence lines, the parity
+    /// recording) must run AFTER `assemble_watch_set` succeeds — mirroring
+    /// the Dhan Step-3d post-build ordering. Pre-assemble recording let the
+    /// ≤300s activation pull-until-success retry re-fire the FUTIDX-02
+    /// comparator forever on a persistently-failing assemble day
+    /// (NtmDanglingExceeded / UniverseSizeOutOfBounds) and log "parity OK"
+    /// while Groww subscribed NOTHING. Style of
+    /// `ratchet_watch_date_rederived_per_attempt_inside_loop`.
+    #[test]
+    fn ratchet_groww_futidx_emissions_run_after_assemble_watch_set() {
+        let src: String = include_str!("instruments.rs")
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        // Needles split via concat! so this test's own source never
+        // satisfies the scan vacuously.
+        let extract_marker = concat!("extract_index_future_entries(&rows,", "today_ist)");
+        let assemble_marker = concat!("letset=assemble_", "watch_set(");
+        let record_marker = concat!("record_index_future_", "selection(\"groww\",");
+        let miss_emit_marker = concat!("underlying=miss.", "canonical,");
+        let extract_pos = src.find(extract_marker).expect("extraction present");
+        let assemble_pos = src.find(assemble_marker).expect("assemble call present");
+        let record_pos = src
+            .find(record_marker)
+            .expect("groww parity record present");
+        let miss_pos = src
+            .find(miss_emit_marker)
+            .expect("FUTIDX-01 miss emit present");
+        assert!(
+            extract_pos < assemble_pos,
+            "extraction must precede assemble (its entries feed the set)"
+        );
+        assert!(
+            assemble_pos < record_pos,
+            "the Groww parity recording must run AFTER assemble_watch_set succeeds — \
+             a failing assemble day must never re-record per retry attempt"
+        );
+        assert!(
+            assemble_pos < miss_pos,
+            "the FUTIDX-01 miss emissions must run AFTER assemble_watch_set succeeds — \
+             a failing assemble day must never re-page per retry attempt"
+        );
     }
 }
