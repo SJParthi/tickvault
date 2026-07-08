@@ -73,7 +73,10 @@ the distinct-key count).
 ## §2. FUTIDX-02 — cross-feed expiry mismatch
 
 **Severity:** High. **Auto-triage safe:** **No** — hostile-review round 3 (2026-07-08)
-reconciled the enum to the design contract (FINAL.md D0.5/T3.4): `is_auto_triage_safe()`
+reconciled the enum to the design contract (THIS section + the R3-4 record in
+`.claude/plans/active-plan-futidx-4.md` — the in-repo authority; round 4 (2026-07-08)
+replaced a dangling scratchpad "FINAL.md D0.5/T3.4" citation that never landed in the
+tree): `is_auto_triage_safe()`
 now carries a severity-independent override arm returning `false` for FUTIDX-02, so ANY
 consumer of the documented API gets the correct answer (previously the blanket `!Critical`
 derivation reported `true` and the drift was papered over here in prose). A
@@ -94,6 +97,21 @@ feed's entry is evicted so a fresh same-date record re-pairs — never a false F
 (`canonicalize_index_symbol` equality); substring re-derivation from symbol strings is
 FORBIDDEN (pre-fix `"BANKNIFTY…".contains("NIFTY")` mislabeled BANKNIFTY/MIDCPNIFTY as
 NIFTY → 2 false FUTIDX-02 pages every dual-feed boot).
+**Round-4 hardening (2026-07-08):** (a) the Groww side records its parity entry (and its
+FUTIDX-01 miss emissions) ONLY AFTER `assemble_watch_set` succeeds — mirror of the Dhan
+Step-3d post-build ordering — so a day where the watch build persistently fails
+(NtmDanglingExceeded / UniverseSizeOutOfBounds) never re-fires the FUTIDX-02 comparator
+per ≤300s retry attempt (edge discipline, audit Rule 4) and never logs "parity OK" for a
+feed that subscribed nothing (audit Rule 11). (b) The §29 warm-snapshot loader's
+IndexFuture arm fail-closes on a NON-PARSEABLE expiry or NON-CANONICAL underlying (not
+merely None/empty — the same two gates `dhan_selections_from_universe` applies), dedups
+exact-duplicate future entries first-entry-wins, and fail-closes on two DISTINCT SIDs for
+one underlying — a corrupt snapshot can no longer produce a subscribed-but-parity-
+invisible future (false one-sided FUTIDX-02) or a spurious planner-drop FUTIDX-01.
+(c) Plan-snapshot writes stamp the boot outcome's `build_trading_date_ist` (the date the
+successful build's FUTIDX selection actually used, re-derived per §4 retry attempt) —
+never the frozen boot-entry date, so a midnight-crossing cold build cannot write a
+D-labeled snapshot carrying the D+1 front month.
 
 **Consequence:** BOTH feeds STAY LIVE (visibility, never a halt); cross-feed rows for U are
 not comparable that day. Counter: `tv_index_futures_parity_mismatch_total`.

@@ -247,3 +247,58 @@ Scope addendum (Status stays VERIFIED; fixes landed post-plan as review remediat
       authoritative — no future runtime-assertion implementer can honor the
       stale cells.
       - Files: .claude/rules/project/wave-5-error-codes.md
+
+## Hostile-review round 4 (2026-07-08) — 4 confirmed findings, all fixed
+
+- [x] R4-1 (MEDIUM): snapshot v2 fail-closed arm validated only Some+non-empty
+      — a non-empty UNPARSABLE expiry ("30-07-2026") or NON-CANONICAL
+      underlying ("NIFT") still passed `to_universe`, got SUBSCRIBED by the
+      planner but SKIPPED by `dhan_selections_from_universe` → the exact
+      false one-sided FUTIDX-02 the R3-3 fix claimed closed. Fixed: the
+      expiry must PARSE (%Y-%m-%d) AND the underlying must canonicalize to a
+      §36 `INDEX_FUTURES_UNDERLYINGS` entry (the SAME two gates the parity
+      derivation applies), else whole-snapshot None → cold rebuild. Secondary
+      hole closed in the same arm: exact-duplicate future entries are deduped
+      first-entry-wins (previously fired a spurious planner-drop FUTIDX-01
+      via the planner's composite-key dedup); two DISTINCT SIDs for one
+      canonical underlying fail closed.
+      - Files: crates/core/src/instrument/instrument_snapshot.rs
+      - Tests: test_snapshot_index_future_unparsable_expiry_or_noncanonical_underlying_fails_closed,
+        test_snapshot_index_future_duplicate_entries_deduped_or_fail_closed
+- [x] R4-2 (MEDIUM): Groww parity recording + FUTIDX-01/gauge emissions ran
+      BEFORE `assemble_watch_set`, which can still fail (NtmDanglingExceeded
+      — live precedent 2026-06-08 — or UniverseSizeOutOfBounds). On such a
+      day the ≤300s activation pull-until-success retry re-recorded the
+      Groww selection per attempt: a genuine cross-feed divergence re-paged
+      FUTIDX-02 every retry all day (non-edge-triggered, audit Rule 4), and
+      the matching case logged "parity OK" while Groww subscribed NOTHING
+      (false-OK, audit Rule 11). Fixed: the §36 block now EXTRACTS only;
+      every emission (miss errors + counters, boot-evidence lines, parity
+      recording, dedup-collapse error, post-cap gauge/cap-drop) moved AFTER
+      `assemble_watch_set` succeeds — mirror of the Dhan Step-3d post-build
+      ordering.
+      - Files: crates/core/src/feed/groww/instruments.rs
+      - Tests: ratchet_groww_futidx_emissions_run_after_assemble_watch_set
+- [x] R4-3 (LOW): both plan-snapshot write sites stamped the `today_date`
+      frozen at `load_daily_universe_plan` entry while the universe was
+      built with the per-attempt re-derived date (R2-2) — a midnight-
+      crossing cold build / background reconcile wrote a D-labeled snapshot
+      whose IndexFuture targets were selected for D+1 (internally
+      inconsistent forensic artifact; the date-keyed loader already
+      prevented any wrong SERVE). Fixed: `DailyUniverseBootOutcome` gains
+      `build_trading_date_ist` (captured from the LAST per-attempt date
+      derivation via `recording_date_fn` — the provenance-capture pattern);
+      both the slow-path write and the warm-path background-reconcile write
+      stamp it.
+      - Files: crates/app/src/daily_universe_boot.rs, crates/app/src/main.rs
+      - Tests: test_recording_date_fn_captures_last_derived_date,
+        ratchet_main_rs_snapshot_writes_stamp_the_build_date
+- [x] R4-4 (LOW): the R3-4 auto-triage override was justified in two
+      permanent artifacts by a citation to "FINAL.md D0.5/T3.4" — a
+      scratchpad-phase design doc that never landed in the tree (dangling
+      provenance; unverifiable under engineering-execution-standard §2).
+      Fixed: both citations now point at the in-repo authority
+      (futidx-4-error-codes.md §2 + this R3-4 record), with a dated note
+      that the FINAL.md pointer was replaced.
+      - Files: .claude/rules/project/futidx-4-error-codes.md,
+        crates/common/src/error_code.rs
