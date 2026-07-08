@@ -205,6 +205,84 @@ operator at the exact SSM parameter to reconcile.
 **Source:** `crates/common/src/error_code.rs::AuthGap04TotpRotatedExternally`,
 `crates/core/src/auth/token_manager.rs` (the TOTP-exhaustion terminal branch).
 
+## AUTH-GAP-05 — sustained mid-session token-invalid: forced re-mint triggered (live 2026-07-06)
+
+**Status (2026-07-06):** LIVE — defined as
+`ErrorCode::AuthGap05ForcedRemintTriggered` with `code_str() == "AUTH-GAP-05"`.
+Severity::High. Auto-triage safe: YES (the forced re-mint IS the
+self-remediation; the operator inspects, never manually re-mints first).
+
+**Trigger:** the 900s market-hours-gated mid-session profile watchdog
+(`crates/core/src/auth/mid_session_watchdog.rs`) observed
+`CONSECUTIVE_INVALID_REMINT_THRESHOLD` (= 2) consecutive REAL `/v2/profile`
+auth failures (~30 min of a Dhan-rejected token; transient network blips
+neither escalate nor clear the counter). The pure `decide_remint` core then
+fires exactly ONE forced re-mint per failing episode through the EXISTING
+`TokenManager::force_renewal()` machinery (RenewToken-then-fallback-
+generateAccessToken), honoring:
+
+- **Lock-before-mint (RESILIENCE-03), fail-closed:** when
+  `TokenManager::dual_instance_lock_held()` reads `Some(false)` the mint is
+  REFUSED with ZERO external side effects — a peer owns the Dhan session and
+  its active token is never destroyed. The refusal is checked BEFORE the
+  cooldown so a cooldown hold can never mask the safety refusal. The
+  `error!` on this arm is tagged `RESILIENCE-01`.
+- **~125s Dhan mint cooldown** (`DHAN_TOKEN_GENERATION_COOLDOWN_SECS`) via
+  the pure `cooldown_elapsed` input — structurally moot at the 900s cadence,
+  hard-stopped anyway. **HONEST SCOPE (AG5-R2-1, 2026-07-06):** this
+  cooldown gates ONLY the watchdog's own mints — `acquire_token` has NO
+  mint-cooldown gate (the 125s cooldown in `token_manager.rs` lives solely
+  in the boot-time `initialize` TOTP retry loop), so an uncoordinated
+  concurrent caller (the ~23h renewal loop's failure retries, the
+  AUTH-GAP-03 ws-wake force renewal, and — SEC-R4-1, 2026-07-06 — the
+  lane-owned 4h token sweep's `force_renewal_if_stale` backstop in
+  `start_dhan_lane`) can still issue a second
+  `generateAccessToken` inside Dhan's ~125s window during the same
+  dead-token episode. Bounded + self-correcting (Dhan rejects/rate-limits
+  the second mint; the loops keep retrying). Moving the cooldown stamp into
+  `TokenManager` so ALL `renew_with_fallback` callers share one gate is a
+  flagged follow-up. The sweep itself is LANE-OWNED since SEC-R4-1
+  (registered in `DhanLaneRunHandles`, aborted on teardown/Drop) — a
+  detached copy previously survived every runtime Dhan disable, kept the
+  dead lane's JWT alive via RenewToken, and fired a false RESILIENCE-03
+  "peer owns the session" Critical page every 4h after a lane
+  stop/restart.
+- **Retry-once latch** (`remint_attempted_this_episode`) — at most one mint
+  (and one HIGH `TokenForcedRemintTriggered` Telegram) per failing episode;
+  a clean check re-arms.
+
+**Escalation / NO mid-session HALT:** a failed or non-restoring re-mint is
+covered by the pre-existing CRITICAL `MidSessionProfileInvalidated` page +
+the 23h renewal-loop circuit breaker. The BOOT-path DH-901
+rotate→retry-once→HALT law is untouched — a mid-session HALT would drop the
+live WS feed.
+
+**Triage:**
+1. `mcp__tickvault-logs__tail_errors` — find `AUTH-GAP-05`; the payload
+   carries `consecutive` (trigger) or `permanent` (failure classification).
+2. `tv_token_forced_remint_total{outcome}` —
+   `triggered`/`ok` = self-heal working; `failed` = the re-mint itself
+   errored (check Dhan status + SSM TOTP secret, cross-check AUTH-GAP-04);
+   `refused_lock_lost` = the PRE-mint gate refused — a peer holds the
+   dual-instance lock (see RESILIENCE-03 in
+   `dual-instance-lock-2026-07-04.md` — decide which host owns the
+   session); `refused_lock_lost_inflight` (SEC-R2-2, 2026-07-06) = the
+   in-flight RESILIENCE-03 tripwire INSIDE `force_renewal` refused (the
+   lock was lost between the watchdog's gate and the mint) — same
+   peer-ownership triage, distinct series so an in-flight refusal never
+   conflates with the pre-gate one; classified prefix-anchored on our own
+   refusal literal, never on server-controlled body text; `cooldown` = a
+   sub-125s re-trigger was held.
+3. Gauges `tv_token_valid` (0/1 AND-composed, live 15s poller in
+   `crates/core/src/auth/token_health_gauge.rs`) and
+   `tv_token_remaining_seconds` (now LIVE, no longer frozen at mint time)
+   show whether the re-mint restored validity within one poll/cycle.
+
+**Source:** `crates/common/src/error_code.rs::AuthGap05ForcedRemintTriggered`,
+`crates/core/src/auth/mid_session_watchdog.rs` (`decide_remint` + the
+Trigger/RefuseLockLost arms), `crates/core/src/auth/token_health_gauge.rs`
+(the honest gauges), `crates/core/src/auth/token_manager.rs::dual_instance_lock_held`.
+
 ## DH-911 — Dhan API silent black-hole (Wave-4-E2)
 
 **Reserved.** Severity::High. Triage: subscribe accepted (no error

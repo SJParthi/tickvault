@@ -1265,6 +1265,22 @@ rules:
       Operator verifies /tickvault/<env>/dhan/totp-secret vs dhan.co and
       re-registers the TOTP. Never auto-actioned.
 
+  - name: auth-gap-05-forced-remint-triggered-escalate
+    match:
+      code: AUTH-GAP-05
+    action: escalate
+    runbook_path: .claude/rules/project/wave-4-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 300
+    justification: >-
+      AUTH-GAP-05 = the mid-session profile watchdog observed 2
+      consecutive REAL /v2/profile auth failures and fired exactly ONE
+      forced token re-mint for the episode (lock-before-mint, cooldown,
+      retry-once latch). The re-mint IS the self-remediation; the
+      operator inspects tv_token_forced_remint_total{outcome} and the
+      paired Telegram event — never manually re-mints first.
+      Severity::High — pages with a 5-min cooldown, does not auto-fix.
+
   - name: resource-01-fd-count-high-escalate
     match:
       code: RESOURCE-01

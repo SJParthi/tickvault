@@ -102,7 +102,8 @@ fn check_shards_dir_writable(shards_root: &Path) -> PreflightOutcome {
     let probe = shards_root.join(".preflight-write-probe");
     match std::fs::write(&probe, b"ok") {
         Ok(()) => {
-            let _ = std::fs::remove_file(&probe);
+            // Best-effort probe cleanup — a leftover probe file is harmless.
+            drop(std::fs::remove_file(&probe));
             PreflightOutcome::Pass(format!("{} writable", shards_root.display()))
         }
         Err(e) => PreflightOutcome::Fail(format!("shards dir not writable: {e}")),
