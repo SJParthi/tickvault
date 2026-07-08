@@ -7850,7 +7850,7 @@ async fn start_dhan_lane(
             // Audit-findings Rule 4 (edge-trigger): sustained-degraded
             // ticks do NOT spam Telegram. The sustained-condition channel
             // is the CloudWatch alarm `tv-prod-realtime-guarantee-degraded`
-            // (< 0.95, 12-of-15 × 60s, window-gated — silent-feed
+            // (< 0.95, 9-of-15 × 60s, window-gated — silent-feed
             // hardening Item 2, 2026-07-06 incident; the previously cited
             // Prometheus alert `tv-realtime-score-degraded` was retired
             // with the CloudWatch-only migration #O3).

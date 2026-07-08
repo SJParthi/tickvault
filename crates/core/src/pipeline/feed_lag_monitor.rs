@@ -33,19 +33,51 @@
 //! `received_at` column) before subtracting. Comparing UTC-vs-IST raw would
 //! clamp every sample to 0 — a permanent "perfect lag" Rule-11 false-OK.
 //!
-//! # WAL-replay exclusion (exact discriminator, no Rule-11 censoring)
+//! # WAL-replay exclusion (two-condition discriminator, no Rule-11 censoring)
 //!
-//! A sample is admitted ONLY if
-//! `received_at_nanos − capture_seq < REPLAY_EXCLUDE_DWELL_NANOS (60 s)`.
-//! `capture_seq` is stamped ONCE at the original WS-read instant
-//! (`ws_frame_spill::next_frame_seq` = `max(prev+1, wall_nanos)` ≈ UTC wall
-//! nanos) and PRESERVED through WAL re-injection, while `received_at` is
-//! RE-stamped at dequeue — so a replayed row shows receipt−capture = downtime
-//! (≥ minutes, excluded EXACTLY), while a genuinely-lagged LIVE row (the
-//! incident's real 46s/199s) has a FRESH capture instant and is KEPT. Every
-//! exclusion increments `tv_dhan_lag_samples_excluded_total` (CloudWatch-
-//! exported — it is in the 23-name EMF allowlist, ~$0.30/mo — visible,
-//! never silent).
+//! A sample is EXCLUDED only when BOTH hold (round-2 fix 2026-07-07,
+//! finding 3 — the first cut used the dwell alone):
+//!
+//! 1. **Dwell:** `received_at_nanos − capture_seq ≥ REPLAY_EXCLUDE_DWELL_NANOS
+//!    (60 s)`. `capture_seq` is stamped ONCE at the original WS-read instant
+//!    (`ws_frame_spill::next_frame_seq` = `max(prev+1, wall_nanos)` ≈ UTC wall
+//!    nanos) and PRESERVED through WAL re-injection, while `received_at` is
+//!    RE-stamped at dequeue — a replayed row shows receipt−capture = downtime.
+//! 2. **Pre-boundary capture:** `capture_seq < live_boundary`, where the
+//!    boundary is stamped ONCE at ring init (first observation in this
+//!    process). A boot-time WAL-replayed row was captured by a PREVIOUS
+//!    process, so its capture instant always predates the boundary; every
+//!    LIVE row is captured after the WS pool spawns, which is after the
+//!    reinject completes, which is after the tick processor (and hence the
+//!    ring) starts — so live captures always postdate the boundary.
+//!
+//! **Why the dwell alone was WRONG (the round-2 finding):** `received_at` is
+//! stamped at DEQUEUE from the frame channel, so receipt−capture measures
+//! in-channel dwell for LIVE frames too. The frame channel holds
+//! `FRAME_CHANNEL_CAPACITY = 131,072` frames (~4 min at the measured ~500
+//! ticks/s) and an ILP/QuestDB stall can hold the consumer >60 s behind the
+//! WS read loop — under the dwell-only rule EVERY live tick then classified
+//! as replay, the window starved below [`MIN_LAG_SAMPLES`], the publisher
+//! went silent, and the /metrics exporter kept re-serving the LAST (healthy,
+//! pre-stall) gauge value: the lag alarm read OK through exactly the
+//! exchange→receive lag class it was built for. With condition 2 those
+//! stall-delayed LIVE rows are KEPT (fresh, post-boundary capture instants)
+//! and the incident's real 46s/199s lag stays measurable.
+//!
+//! Honest residuals (documented, bounded):
+//! - A RUNTIME Dhan-lane cold start (D2b) re-injects WAL frames captured
+//!   earlier in the SAME process → post-boundary capture → ADMITTED. Bounded
+//!   transient: the drain finishes in ≲ minutes and the trailing-60s window
+//!   flushes it within a further 60 s — strict 10-of-10 on the alarm cannot
+//!   latch on it (and those rows honestly ARE data arriving now with old
+//!   exchange stamps).
+//! - Fail-open: if the boundary clock read fails (boundary = 0), NOTHING is
+//!   ever excluded — transient replay contamination is preferred over
+//!   silent censoring of live lag (Rule 11).
+//!
+//! Every exclusion increments `tv_dhan_lag_samples_excluded_total`
+//! (CloudWatch-exported — it is in the 23-name EMF allowlist, ~$0.30/mo —
+//! visible, never silent).
 //!
 //! # Publish gating (audit Rules 3 + 11)
 //!
@@ -105,13 +137,15 @@ use tickvault_common::constants::{
 /// (oldest samples overwritten; the p99 stays a valid sample estimate).
 const RING_SLOTS: usize = 32_768;
 
-/// WAL-replay exclusion dwell: a tick whose `received_at − capture_seq`
-/// is ≥ this is a re-injected (replayed) row, not a live one. 60 s is far
-/// above any live-path dequeue dwell (the frame channel drains in
-/// milliseconds; even the incident's worst LIVE lag was 199 s of
-/// exchange→receive wire lag with a FRESH capture instant) and far below
-/// any real WAL-replay downtime (≥ minutes). Strict `<`: a row dwelling
-/// exactly 60.000000000 s is EXCLUDED.
+/// WAL-replay exclusion dwell — ONE of the TWO exclusion conditions (the
+/// other is the pre-boundary capture check; see the module doc). A tick
+/// whose `received_at − capture_seq` is ≥ this dwelt ≥ 60 s between its
+/// original WS-read instant and this dequeue. The dwell ALONE is NOT a
+/// replay discriminator: a >60 s consumer stall gives LIVE frames the same
+/// signature (round-2 fix 2026-07-07, finding 3), so exclusion additionally
+/// requires the capture instant to predate the process live boundary.
+/// Strict `<` on the admit side: a pre-boundary row dwelling exactly
+/// 60.000000000 s is EXCLUDED.
 const REPLAY_EXCLUDE_DWELL_NANOS: i64 = 60_000_000_000;
 
 /// Trailing window the publisher aggregates over. Same magnitude as the
@@ -136,8 +170,10 @@ enum LagRecordOutcome {
     /// (host clock behind Dhan's whole-second stamp / ≤2 s BOOT-03 skew)
     /// and was clamped to 0.
     Admitted { clamped: bool },
-    /// Sample excluded by the WAL-replay dwell discriminator — the row's
-    /// receipt−capture gap says it was re-injected, not live.
+    /// Sample excluded by the two-condition WAL-replay discriminator —
+    /// the row dwelt ≥ 60 s between capture and dequeue AND its capture
+    /// instant predates this process's live boundary (i.e. it was captured
+    /// by a previous process and re-injected, not live).
     ExcludedReplay,
 }
 
@@ -156,13 +192,21 @@ struct FeedLagRing {
     recv_utc_nanos: Box<[AtomicI64]>,
     /// Monotonic slot counter (relaxed; single writer).
     head: AtomicU64,
+    /// Live-boundary instant (UTC nanos), stamped ONCE at ring init: a
+    /// capture instant BEFORE this boundary belongs to a previous process
+    /// (boot-time WAL replay); a capture AT/AFTER it is a live frame of
+    /// this process — even one that dwelt >60 s in the frame channel
+    /// during a consumer stall (round-2 fix 2026-07-07, finding 3).
+    /// `0` = boundary unavailable → fail-open, nothing is ever excluded.
+    live_boundary_utc_nanos: i64,
 }
 
 impl FeedLagRing {
     /// Allocates the two 32,768-slot arrays ONCE (cold path — first use at
     /// boot via the `OnceLock` global). The hot-path `observe` allocates
-    /// nothing.
-    fn new() -> Self {
+    /// nothing. `live_boundary_utc_nanos` = the process live boundary for
+    /// the replay discriminator (see the module doc; `0` = fail-open).
+    fn new(live_boundary_utc_nanos: i64) -> Self {
         let mut lag = Vec::with_capacity(RING_SLOTS);
         let mut recv = Vec::with_capacity(RING_SLOTS);
         for _ in 0..RING_SLOTS {
@@ -173,6 +217,7 @@ impl FeedLagRing {
             lag_ns: lag.into_boxed_slice(),
             recv_utc_nanos: recv.into_boxed_slice(),
             head: AtomicU64::new(0),
+            live_boundary_utc_nanos,
         }
     }
 
@@ -185,9 +230,18 @@ impl FeedLagRing {
         capture_seq_nanos: i64,
         exchange_ts_secs: u32,
     ) -> LagRecordOutcome {
-        // WAL-replay dwell discriminator (strict `<`: exactly 60 s is
-        // EXCLUDED — pinned by test_replay_dwell_boundary_excludes_at_exactly_60s).
-        if received_at_utc_nanos.saturating_sub(capture_seq_nanos) >= REPLAY_EXCLUDE_DWELL_NANOS {
+        // Two-condition WAL-replay discriminator (round-2 fix 2026-07-07,
+        // finding 3): exclude ONLY a row that (a) was captured BEFORE this
+        // process's live boundary (i.e. by a previous process — what
+        // boot-time WAL re-injection replays) AND (b) dwelt ≥ 60 s between
+        // capture and dequeue (strict `<` on the admit side: exactly 60 s
+        // is EXCLUDED — pinned by
+        // test_replay_dwell_boundary_excludes_at_exactly_60s). A LIVE row
+        // delayed >60 s in the frame channel by a consumer stall has a
+        // post-boundary capture instant and is KEPT — never censored.
+        if capture_seq_nanos < self.live_boundary_utc_nanos
+            && received_at_utc_nanos.saturating_sub(capture_seq_nanos) >= REPLAY_EXCLUDE_DWELL_NANOS
+        {
             return LagRecordOutcome::ExcludedReplay;
         }
         // Clock alignment: receive instant UTC→IST so both operands are IST
@@ -242,7 +296,20 @@ impl FeedLagRing {
 static DHAN_LAG_RING: OnceLock<FeedLagRing> = OnceLock::new();
 
 fn global_ring() -> &'static FeedLagRing {
-    DHAN_LAG_RING.get_or_init(FeedLagRing::new)
+    DHAN_LAG_RING.get_or_init(|| {
+        // Live-boundary stamp (cold, once per process). The tick processor
+        // spawns BEFORE the WAL reinject await and the WS pool spawns
+        // AFTER it (ratcheted in wal_reinject.rs), so this init runs no
+        // later than the first observed frame: boot-replayed frames
+        // (captured by a previous process) always predate the boundary,
+        // and live frames (captured after the WS pool spawns) always
+        // postdate it. A frame captured in the tiny gap before the stamp
+        // has millisecond dwell, so the dwell condition never excludes it.
+        // `unwrap_or(0)` = fail-open: no boundary → no exclusion, ever
+        // (Rule 11 — prefer transient replay contamination over censoring).
+        let live_boundary = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+        FeedLagRing::new(live_boundary)
+    })
 }
 
 /// Hot-path entry point — called from the two Dhan persist sites in
@@ -384,17 +451,25 @@ mod tests {
     // APPROVED: test constant, value ≈ 1.78e9 fits u32
     const T0_EXCHANGE_IST_SECS: u32 = (T0_UTC_SECS + IST_UTC_OFFSET_SECONDS_I64) as u32;
 
+    /// Live-boundary for tests where the "process" started an hour before
+    /// `T0` — every capture instant near `T0` is post-boundary (live).
+    const BOOT_HOUR_BEFORE_T0: i64 = T0_UTC_NANOS - 3_600 * NANOS_PER_SEC;
+
     #[test]
     fn test_replay_dwell_boundary_excludes_at_exactly_60s() {
-        let ring = FeedLagRing::new();
-        // receipt − capture == EXACTLY 60 s → EXCLUDED (strict `<`).
+        // Boundary 30 s before T0: a capture 60 s before T0 is PRE-boundary
+        // (a previous process's frame — the boot-replay class).
+        let ring = FeedLagRing::new(T0_UTC_NANOS - 30 * NANOS_PER_SEC);
+        // Pre-boundary capture + receipt − capture == EXACTLY 60 s → EXCLUDED
+        // (strict `<` on the admit side).
         let capture = T0_UTC_NANOS - REPLAY_EXCLUDE_DWELL_NANOS;
         assert_eq!(
             ring.observe(T0_UTC_NANOS, capture, T0_EXCHANGE_IST_SECS),
             LagRecordOutcome::ExcludedReplay,
-            "a row dwelling exactly 60.000000000s must be EXCLUDED"
+            "a pre-boundary row dwelling exactly 60.000000000s must be EXCLUDED"
         );
-        // One nano under the dwell → ADMITTED.
+        // One nano under the dwell → ADMITTED even though pre-boundary
+        // (BOTH conditions are required to exclude).
         assert_eq!(
             ring.observe(T0_UTC_NANOS, capture + 1, T0_EXCHANGE_IST_SECS),
             LagRecordOutcome::Admitted { clamped: false },
@@ -407,10 +482,45 @@ mod tests {
     }
 
     #[test]
+    fn test_live_stall_dwell_over_60s_post_boundary_capture_is_kept() {
+        // Round-2 fix (2026-07-07, finding 3): a LIVE tick that dwelt 90 s
+        // in the frame channel (ILP-stalled consumer) has receipt−capture
+        // ≥ 60 s — the dwell-only rule misclassified it as replay, starving
+        // the window and freezing the gauge at the last healthy value. Its
+        // capture instant POSTDATES the process live boundary, so it must
+        // be KEPT with its true lag.
+        let ring = FeedLagRing::new(BOOT_HOUR_BEFORE_T0);
+        let capture = T0_UTC_NANOS - 90 * NANOS_PER_SEC; // post-boundary
+        let exchange_secs = T0_EXCHANGE_IST_SECS - 95; // 95 s wire+dwell lag
+        assert_eq!(
+            ring.observe(T0_UTC_NANOS, capture, exchange_secs),
+            LagRecordOutcome::Admitted { clamped: false },
+            "a live >60s-dwell row with a post-boundary capture must be KEPT"
+        );
+        let mut scratch = Vec::with_capacity(RING_SLOTS);
+        ring.snapshot_window_into(T0_UTC_NANOS, &mut scratch);
+        assert_eq!(scratch.as_slice(), &[95 * NANOS_PER_SEC as u64]);
+    }
+
+    #[test]
+    fn test_zero_boundary_fails_open_never_excludes() {
+        // Fail-open contract: boundary 0 (clock read failed at init) →
+        // NOTHING is excluded, even a minutes-dwelling row — transient
+        // replay contamination over silent censoring (Rule 11).
+        let ring = FeedLagRing::new(0);
+        let capture = T0_UTC_NANOS - 10 * REPLAY_EXCLUDE_DWELL_NANOS;
+        assert_eq!(
+            ring.observe(T0_UTC_NANOS, capture, T0_EXCHANGE_IST_SECS),
+            LagRecordOutcome::Admitted { clamped: false },
+            "boundary 0 must fail OPEN (admit), never censor"
+        );
+    }
+
+    #[test]
     fn test_genuine_lag_kept_with_fresh_capture_instant() {
         // The incident's real 46s exchange→receive lag: exchange stamp 46s
         // in the past, but capture instant FRESH (live socket read) → KEPT.
-        let ring = FeedLagRing::new();
+        let ring = FeedLagRing::new(BOOT_HOUR_BEFORE_T0);
         let exchange_secs = T0_EXCHANGE_IST_SECS - 46;
         assert_eq!(
             ring.observe(T0_UTC_NANOS, T0_UTC_NANOS - LIVE_DWELL_NANOS, exchange_secs),
@@ -426,7 +536,7 @@ mod tests {
         // Exchange stamp 2s AHEAD of the (IST-aligned) receive instant —
         // BOOT-03-class host skew. Clamped to 0, counted, never negative,
         // never a panic.
-        let ring = FeedLagRing::new();
+        let ring = FeedLagRing::new(BOOT_HOUR_BEFORE_T0);
         let exchange_ahead_secs = T0_EXCHANGE_IST_SECS + 2;
         assert_eq!(
             ring.observe(
@@ -529,7 +639,7 @@ mod tests {
 
     #[test]
     fn test_ring_wraparound() {
-        let ring = FeedLagRing::new();
+        let ring = FeedLagRing::new(BOOT_HOUR_BEFORE_T0);
         // RING_SLOTS + 100 admitted samples: the first 100 are overwritten.
         // Give the overwriting generation a distinct lag value (2 s vs 1 s).
         let total = RING_SLOTS + 100;
@@ -556,7 +666,7 @@ mod tests {
 
     #[test]
     fn test_snapshot_window_filters_stale_receives() {
-        let ring = FeedLagRing::new();
+        let ring = FeedLagRing::new(BOOT_HOUR_BEFORE_T0);
         // One sample received 61 s before "now" → outside the trailing-60s
         // window → filtered; one fresh sample survives.
         let stale_recv = T0_UTC_NANOS - LAG_WINDOW_NANOS - NANOS_PER_SEC;

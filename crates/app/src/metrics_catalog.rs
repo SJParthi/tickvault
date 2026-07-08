@@ -50,7 +50,9 @@
 //!     feed=dhan.** The dhan-only NAME (no `feed` label) sidesteps the
 //!     CloudWatch EMF host-only dimension label-folding trap.
 //!   * `tv_dhan_lag_samples_excluded_total` — counter of WAL-replay
-//!     samples excluded by the receipt−capture dwell discriminator
+//!     samples excluded by the two-condition discriminator (receipt−capture
+//!     dwell ≥60 s AND pre-live-boundary capture — live rows delayed >60 s
+//!     in-pipeline by a consumer stall are KEPT; round-2 fix 2026-07-07)
 //!     (visible, never silent censoring — Rule 11). **CloudWatch-exported**:
 //!     it is in the 23-name host-only EMF allowlist of
 //!     `deploy/aws/cloudwatch-agent.json` + `user-data.sh.tftpl`

@@ -1387,12 +1387,17 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
                 // Silent-feed hardening Item 4 (2026-07-06 incident): observe
                 // the exchange→receive lag for this LIVE Dhan tick. O(1),
                 // zero-alloc (two relaxed atomic stores into a preallocated
-                // ring). The received_at−capture_seq dwell discriminator
-                // excludes WAL-replayed rows EXACTLY (capture_seq is stamped
+                // ring). The TWO-condition replay discriminator (round-2 fix
+                // 2026-07-07, finding 3: receipt−capture dwell ≥60s AND
+                // capture instant BEFORE the process live boundary) excludes
+                // boot-time WAL-replayed rows EXACTLY (capture_seq is stamped
                 // at the ORIGINAL WS-read instant and preserved through
-                // re-injection, while received_at is re-stamped at dequeue),
-                // so genuinely-lagged live ticks are KEPT — no Rule-11
-                // censoring of the measured signal. Sits AFTER every gate
+                // re-injection, while received_at is re-stamped at dequeue)
+                // while KEEPING genuinely-lagged live ticks — INCLUDING live
+                // rows delayed >60s in the frame channel by a consumer stall,
+                // which the dwell alone misclassified as replay (starving the
+                // window into a stale-healthy gauge) — no Rule-11 censoring
+                // of the measured signal. Sits AFTER every gate
                 // (valid/today/in-window/dedup). Honest caveat: §30
                 // window-exempt always-on SIDs (GIFT Nifty) bypass the
                 // window gates above, so their OFF-session live ticks ARE

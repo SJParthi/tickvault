@@ -42,12 +42,12 @@ fn alarm_metric_names() -> Vec<String> {
         let trimmed = line.trim();
         if let Some(rest) = trimmed.strip_prefix("metric_name") {
             // Form: metric_name = "tv_..."
-            if let Some(start) = rest.find('"') {
-                if let Some(end) = rest[start + 1..].find('"') {
-                    let name = &rest[start + 1..start + 1 + end];
-                    if name.starts_with("tv_") {
-                        out.push(name.to_string());
-                    }
+            if let Some(start) = rest.find('"')
+                && let Some(end) = rest[start + 1..].find('"')
+            {
+                let name = &rest[start + 1..start + 1 + end];
+                if name.starts_with("tv_") {
+                    out.push(name.to_string());
                 }
             }
         }
@@ -282,6 +282,49 @@ fn test_emf_metric_selectors_name_count_is_twenty_three() {
     }
 }
 
+/// Split an agent-config body into its individual `metric_declaration`
+/// array objects (brace-balanced scan from the array opener).
+///
+/// Round-2 hardening (2026-07-07, finding 2): the per-feed ratchet
+/// previously used three INDEPENDENT whole-file substring checks — a
+/// multi-declaration reshuffle that kept a `[host,feed]` declaration for a
+/// DIFFERENT selector while moving `^tv_boundary_catchup_total$` into a new
+/// host-only declaration would have passed every check while the
+/// boundary_catchup_storm_dhan alarm (dimensions { host, feed = "dhan" })
+/// evaluated against a permanently-empty series. This parser lets the test
+/// bind selector and dimensions WITHIN one declaration object.
+fn emf_declaration_objects(body: &str) -> Vec<String> {
+    let marker = "\"metric_declaration\": [";
+    let mut out = Vec::new();
+    let Some(idx) = body.find(marker) else {
+        return out;
+    };
+    let rest = &body[idx + marker.len()..];
+    let mut depth = 0usize;
+    let mut start = None;
+    for (i, ch) in rest.char_indices() {
+        match ch {
+            '{' => {
+                if depth == 0 {
+                    start = Some(i);
+                }
+                depth += 1;
+            }
+            '}' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0
+                    && let Some(s) = start.take()
+                {
+                    out.push(rest[s..=i].to_string());
+                }
+            }
+            ']' if depth == 0 => break, // end of the metric_declaration array
+            _ => {}
+        }
+    }
+    out
+}
+
 #[test]
 fn test_second_emf_declaration_publishes_boundary_catchup_per_feed() {
     // 2026-07-06 (silent-feed incident hardening): tv_boundary_catchup_total
@@ -316,6 +359,40 @@ fn test_second_emf_declaration_publishes_boundary_catchup_per_feed() {
             !main_names.iter().any(|n| n == "tv_boundary_catchup_total"),
             "Z+ L2 VERIFY ratchet: {rel} must NOT list tv_boundary_catchup_total in the \
              MAIN host-only declaration — it publishes ONLY under [host, feed]."
+        );
+        // Round-2 hardening (2026-07-07, finding 2): bind selector ↔
+        // dimensions WITHIN a single declaration object. The three checks
+        // above are independent whole-file substrings — a reshuffle that
+        // kept a [host,feed] declaration for a DIFFERENT selector while
+        // moving the boundary-catchup selector into a host-only declaration
+        // (outside the main alternation) would pass them all while the
+        // per-feed alarm watched a permanently-empty series.
+        let decls = emf_declaration_objects(&body);
+        assert!(
+            decls.len() >= 2,
+            "parser self-check: expected >= 2 metric_declaration objects in {rel}, found {} — \
+             emf_declaration_objects broken or the array collapsed",
+            decls.len()
+        );
+        let catchup: Vec<&String> = decls
+            .iter()
+            .filter(|d| d.contains("tv_boundary_catchup_total"))
+            .collect();
+        assert_eq!(
+            catchup.len(),
+            1,
+            "Z+ L2 VERIFY ratchet: {rel} must have EXACTLY ONE metric_declaration selecting \
+             tv_boundary_catchup_total (found {}) — a second declaration (e.g. host-only) \
+             would double-publish or fold the per-feed series",
+            catchup.len()
+        );
+        assert!(
+            catchup[0].contains("\"dimensions\": [[\"host\", \"feed\"]]")
+                && catchup[0].contains("\"metric_selectors\": [\"^tv_boundary_catchup_total$\"]"),
+            "Z+ L2 VERIFY ratchet: {rel} — the declaration selecting tv_boundary_catchup_total \
+             must ITSELF carry dimensions [[\"host\", \"feed\"]] + the anchored single-name \
+             selector (the boundary_catchup_storm_dhan alarm keys on {{ host, feed = dhan }}):\n{}",
+            catchup[0]
         );
     }
 }
@@ -568,9 +645,13 @@ fn test_realtime_guarantee_degraded_alarm_threshold_matches_slo_warn() {
     );
     assert!(
         block_has_attr(&block, "evaluation_periods", "15")
-            && block_has_attr(&block, "datapoints_to_alarm", "12"),
-        "realtime_guarantee_degraded must latch 12-of-15 — the incident OSCILLATED with 125 \
-         crossings of 0.95; strict 15/15 would never latch (Rule-11 false-OK reproduction)"
+            && block_has_attr(&block, "datapoints_to_alarm", "9"),
+        "realtime_guarantee_degraded must latch 9-of-15 (round-2 correction 2026-07-07: with \
+         universe 776, tick_freshness breaches < 0.95 only at >= 39 silent, so the incident's \
+         29-38-silent minutes SAMPLE Healthy on the once-per-60s point scrape — 12-of-15 could \
+         fail to latch on the very incident it closes; strict 15/15 would never latch on the \
+         125-crossing oscillation. 9-of-15 is the honest latch; a 2-3 min reconnect dip still \
+         cannot reach 9 breaching points)"
     );
     // Medium tier: the name/description must never carry a "critical" token —
     // the < 0.80 sibling alarm owns that word.
@@ -669,7 +750,7 @@ fn test_app_alarms_count_is_twenty() {
     // 20 (was 17) since 2026-07-06 (silent-feed incident hardening — the Dhan
     // feed degraded all day with 4 independent signals and zero pages): scope
     // now ALSO covers silent-feed-alarms.tf, which adds
-    // `tv_realtime_guarantee_score` (degraded 0.80-0.95 dead-band, 12-of-15),
+    // `tv_realtime_guarantee_score` (degraded 0.80-0.95 dead-band, 9-of-15),
     // `tv_boundary_catchup_total` (per-feed dhan catch-up storm, PROVISIONAL
     // 2000/5m x2) and `tv_dhan_exchange_lag_p99_seconds` (exchange->receive
     // lag p99 > 10s x10). Note: the score name appears TWICE in the count

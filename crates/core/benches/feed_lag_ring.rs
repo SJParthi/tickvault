@@ -21,8 +21,9 @@ use tickvault_core::pipeline::feed_lag_monitor::{compute_window_p99_ns, record_d
 const NANOS_PER_SEC: i64 = 1_000_000_000;
 
 /// Steady-state hot-path ring write on the process-global ring (the exact
-/// production entry point: dwell check + clock alignment + two relaxed
-/// stores + head bump). HONEST COVERAGE: like the DHAT ratchet, this
+/// production entry point: two-condition replay check (boundary + dwell) +
+/// clock alignment + two relaxed stores + head bump). HONEST COVERAGE:
+/// like the DHAT ratchet, this
 /// measures the `Admitted { clamped: false }` steady-state arm only — the
 /// metrics-emitting `ExcludedReplay` / clamped arms are not in the loop.
 fn bench_record_dhan_tick(c: &mut Criterion) {

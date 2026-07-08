@@ -48,11 +48,27 @@
 # CW agent scrapes once per 60s -> 1 datapoint/period today (Min == Max);
 # Minimum is future-proof and mirrors the sibling < 0.80 alarm.
 #
-# M-of-N 12-of-15: the incident OSCILLATED with 125 crossings of 0.95 — a
-# strict 15/15 would likely never latch and reproduce the miss (Rule-11
-# false-OK). 12/15 demands >= 80% of a quarter-hour degraded; the incident's
-# tick_freshness 0.914-0.963 satisfies it, while a 2-3 min single-reconnect
-# dip cannot.
+# M-of-N 9-of-15 (round-2 correction 2026-07-07 — the first cut shipped
+# 12-of-15 justified by "the incident's tick_freshness 0.914-0.963 satisfies
+# it"; that claim was WRONG): with universe 776, tick_freshness breaches
+# < 0.95 only at >= 39 silent instruments (1 - 38/776 ≈ 0.9510 samples
+# Healthy), while the incident band was 29-67 silent EVERY minute — the band
+# STRADDLES the threshold, and the CW agent point-samples the oscillating
+# 10s-cadence gauge ONCE per 60s period (125 crossings that day). Any
+# 15-min window with > 3 minutes sampled in the 29-38-silent sub-band could
+# never accumulate 12 breaching datapoints — 12/15 could reproduce the
+# exact zero-page miss on the marginal band (Rule-11 false-OK). 9/15 (60%)
+# latches whenever >= 60% of sampled minutes breach, while a 2-3 min
+# single-reconnect dip (<= 3 breaching points) still cannot reach 9. A
+# strict 15/15 remains rejected (would likely never latch on an oscillating
+# signal). Honest coverage split: minutes in the 26-38-silent sub-band are
+# paged INDEPENDENTLY by the retuned tick-gap alarm (threshold 25, 10-of-12,
+# app-alarms.tf) — this alarm's UNIQUE coverage is >= 39-silent freshness
+# degradation plus every OTHER-dimension partial degradation (WS pool
+# fraction, QuestDB, token, spill, Phase 2) inside the 0.80-0.95 dead band.
+# M=9 is threshold-adjacent and PROVISIONAL: observe one trading week and
+# ratchet with a dated note if healthy-day windows approach 9 breaching
+# minutes.
 #
 # Metric is ALREADY CW-exported (cloudwatch-agent.json emf allowlist + the
 # log-metric-filter fallback in metrics-log-metric-filters.tf): ZERO Rust,
@@ -65,10 +81,10 @@
 # ---------------------------------------------------------------------------
 resource "aws_cloudwatch_metric_alarm" "realtime_guarantee_degraded" {
   alarm_name          = "tv-${var.environment}-realtime-guarantee-degraded"
-  alarm_description   = "Composite real-time guarantee score degraded (Medium) — < 0.95 for >= 12 of the last 15 in-market minutes. At least one dimension (WS, QuestDB, tick freshness, token, spill, Phase 2) is persistently degraded but above the 0.80 sibling alarm's floor (the exact dead band of the 2026-07-06 all-day silent-feed incident). Actions gated to 09:20-15:35 IST Mon-Fri by the market-hours gate Lambda. See SLO-02 runbook."
+  alarm_description   = "Composite real-time guarantee score degraded (Medium) — < 0.95 for >= 9 of the last 15 in-market minutes (M=9 PROVISIONAL, 2026-07-07: freshness-only breach needs >= 39 of 776 silent, so the incident's 29-38-silent minutes sample Healthy — a stricter latch could miss the marginal band; observe one trading week + ratchet with a dated note). At least one dimension (WS, QuestDB, tick freshness, token, spill, Phase 2) is persistently degraded but above the 0.80 sibling alarm's floor (the exact dead band of the 2026-07-06 all-day silent-feed incident). Actions gated to 09:20-15:35 IST Mon-Fri by the market-hours gate Lambda. See SLO-02 runbook."
   comparison_operator = "LessThanThreshold"
   evaluation_periods  = 15
-  datapoints_to_alarm = 12
+  datapoints_to_alarm = 9
   metric_name         = "tv_realtime_guarantee_score"
   namespace           = local.app_namespace
   period              = 60
@@ -172,7 +188,7 @@ resource "aws_cloudwatch_metric_alarm" "boundary_catchup_storm_dhan" {
 # ---------------------------------------------------------------------------
 resource "aws_cloudwatch_metric_alarm" "dhan_exchange_lag_p99_high" {
   alarm_name          = "tv-${var.environment}-dhan-exchange-lag-p99-high"
-  alarm_description   = "Dhan exchange->receive lag p99 > 10s for 10 consecutive in-market minutes (2026-07-06 incident signal: p99 46s / max 199s all day). Trailing-60s p99, WAL-replay rows excluded, >= 50 samples required. NOTE: Dhan LTT is whole IST seconds -> >= 1s measurement floor (healthy p99 ~1-2s, never 0); the 10s threshold sits 10x above the floor. Actions gated to 09:20-15:35 IST Mon-Fri. See WS-GAP-06 runbook + feed_lag_monitor module docs."
+  alarm_description   = "Dhan exchange->receive lag p99 > 10s for 10 consecutive in-market minutes (2026-07-06 incident signal: p99 46s / max 199s all day). Trailing-60s p99; boot-time WAL-replay rows excluded via the two-condition discriminator (>=60s receipt-capture dwell AND pre-boot capture instant — live rows delayed >60s in-pipeline by a consumer stall are KEPT, round-2 fix 2026-07-07); >= 50 samples required. NOTE: Dhan LTT is whole IST seconds -> >= 1s measurement floor (healthy p99 ~1-2s, never 0); the 10s threshold sits 10x above the floor. Actions gated to 09:20-15:35 IST Mon-Fri. See WS-GAP-06 runbook + feed_lag_monitor module docs."
   comparison_operator = "GreaterThanThreshold"
   evaluation_periods  = 10
   datapoints_to_alarm = 10
@@ -191,7 +207,7 @@ resource "aws_cloudwatch_metric_alarm" "dhan_exchange_lag_p99_high" {
 }
 
 output "silent_feed_cloudwatch_alarms" {
-  description = "3 silent-feed degradation alarms (2026-07-06 incident hardening): SLO 0.80-0.95 dead-band (12-of-15 min), per-feed BOUNDARY-01 catch-up storm (dhan, PROVISIONAL 2000/5m x2), Dhan exchange->receive lag p99 > 10s x10min. All market-hours-gated via the window-gate Lambda; the retuned tick-gap alarm (threshold 100 -> 25, 10-of-12) stays in app-alarms.tf."
+  description = "3 silent-feed degradation alarms (2026-07-06 incident hardening): SLO 0.80-0.95 dead-band (9-of-15 min, PROVISIONAL), per-feed BOUNDARY-01 catch-up storm (dhan, PROVISIONAL 2000/5m x2), Dhan exchange->receive lag p99 > 10s x10min. All market-hours-gated via the window-gate Lambda; the retuned tick-gap alarm (threshold 100 -> 25, 10-of-12) stays in app-alarms.tf."
   value = [
     aws_cloudwatch_metric_alarm.realtime_guarantee_degraded.alarm_name,
     aws_cloudwatch_metric_alarm.boundary_catchup_storm_dhan.alarm_name,
