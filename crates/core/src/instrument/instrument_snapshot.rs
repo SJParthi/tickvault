@@ -183,8 +183,19 @@ pub fn snapshot_path_for(date: &str) -> Option<PathBuf> {
 /// reconcile, never subscribed.
 #[must_use]
 pub fn to_universe(snapshot: &PlanSnapshot) -> Option<DailyUniverse> {
+    use crate::instrument::index_extractor::canonicalize_index_symbol;
+    use crate::instrument::index_futures::INDEX_FUTURES_UNDERLYINGS;
+
     let mut subscription_targets: Vec<SubscriptionTarget> =
         Vec::with_capacity(snapshot.targets.len());
+    // §36 hostile-review round 4 (2026-07-08): per-future dedup state —
+    // exact-duplicate entries (same composite (security_id, segment)) are
+    // collapsed first-entry-wins so a corrupt snapshot can't fire a spurious
+    // planner-drop FUTIDX-01; a SECOND DISTINCT SID for the same canonical
+    // underlying is fail-closed (the writer only ever emits one contract per
+    // underlying — two is corruption; mirrors AmbiguousDuplicateExpiry).
+    let mut seen_future_keys: Vec<(String, String)> = Vec::new();
+    let mut seen_future_canonicals: Vec<String> = Vec::new();
     for t in &snapshot.targets {
         let role = parse_role(&t.role)?;
         let mut csv_row = CsvRow {
@@ -216,6 +227,37 @@ pub fn to_universe(snapshot: &PlanSnapshot) -> Option<DailyUniverse> {
             {
                 return None;
             }
+            // Hostile-review round 4 (2026-07-08): non-empty is NOT enough —
+            // the exact threat the r3 arm claims to close (subscribed but
+            // parity-invisible → false one-sided FUTIDX-02) reproduces with a
+            // NON-empty UNPARSABLE expiry ("30-07-2026") or a NON-canonical
+            // underlying ("NIFT"): the planner subscribes such a target while
+            // `dhan_selections_from_universe` silently skips it. So the
+            // expiry MUST parse (`%Y-%m-%d`) and the underlying MUST
+            // canonicalize to a §36 entry — the SAME two gates the parity
+            // derivation applies — else the whole snapshot fails closed.
+            if chrono::NaiveDate::parse_from_str(csv_row.expiry_date.trim(), "%Y-%m-%d").is_err() {
+                return None;
+            }
+            let canonical = canonicalize_index_symbol(&csv_row.underlying_symbol);
+            if !INDEX_FUTURES_UNDERLYINGS
+                .iter()
+                .any(|u| u.canonical == canonical)
+            {
+                return None;
+            }
+            // Round 4 dedup (see the state comment above): exact composite
+            // duplicate → skip (never a spurious planner-drop FUTIDX-01);
+            // distinct SID for an already-seen canonical → fail closed.
+            let key = (csv_row.security_id.clone(), csv_row.segment.clone());
+            if seen_future_keys.contains(&key) {
+                continue;
+            }
+            if seen_future_canonicals.contains(&canonical) {
+                return None;
+            }
+            seen_future_keys.push(key);
+            seen_future_canonicals.push(canonical);
         }
         // Derive the membership flags from `role` when the snapshot left them
         // at the serde default (`false`) — a snapshot written by pre-Sub-PR-#5
@@ -974,6 +1016,106 @@ mod tests {
         let mut t = base;
         t.underlying_symbol = Some("  ".to_string());
         assert!(to_universe(&snap_for(t)).is_none());
+    }
+
+    /// Hostile-review round 4 (2026-07-08): non-empty is NOT enough — a
+    /// NON-empty UNPARSABLE expiry ("30-07-2026") or a NON-canonical
+    /// underlying ("NIFT") previously passed the r3 arm, got SUBSCRIBED by
+    /// the planner, but was SKIPPED by `dhan_selections_from_universe` —
+    /// reproducing the exact false one-sided FUTIDX-02 the r3 fix claims to
+    /// close. The expiry must PARSE (%Y-%m-%d) and the underlying must
+    /// CANONICALIZE to a §36 entry, else the whole snapshot fails closed.
+    #[test]
+    fn test_snapshot_index_future_unparsable_expiry_or_noncanonical_underlying_fails_closed() {
+        let base = SnapshotTarget {
+            role: "index_future".to_string(),
+            security_id: "35001".to_string(),
+            symbol_name: "NIFTY-Jul2026-FUT".to_string(),
+            is_fno_underlying: false,
+            is_index_constituent: false,
+            segment: Some("NSE_FNO".to_string()),
+            expiry_date: Some("2026-07-30".to_string()),
+            underlying_symbol: Some("NIFTY".to_string()),
+        };
+        let snap_for = |t: SnapshotTarget| PlanSnapshot {
+            trading_date_ist: "2026-07-08".to_string(),
+            format: PLAN_SNAPSHOT_FORMAT_CURRENT,
+            targets: vec![t],
+        };
+        // Control: the intact entry converts.
+        assert!(to_universe(&snap_for(base.clone())).is_some());
+        // Non-empty but UNPARSABLE expiry (DD-MM-YYYY) → fails closed.
+        let mut t = base.clone();
+        t.expiry_date = Some("30-07-2026".to_string());
+        assert!(
+            to_universe(&snap_for(t)).is_none(),
+            "unparsable expiry must fail the whole snapshot closed"
+        );
+        // Garbage expiry → fails closed.
+        let mut t = base.clone();
+        t.expiry_date = Some("garbage".to_string());
+        assert!(to_universe(&snap_for(t)).is_none());
+        // Non-canonical underlying ("NIFT") → fails closed.
+        let mut t = base.clone();
+        t.underlying_symbol = Some("NIFT".to_string());
+        assert!(
+            to_universe(&snap_for(t)).is_none(),
+            "non-canonical underlying must fail the whole snapshot closed"
+        );
+        // A 5th (non-§36) real index → fails closed too.
+        let mut t = base.clone();
+        t.underlying_symbol = Some("FINNIFTY".to_string());
+        assert!(to_universe(&snap_for(t)).is_none());
+        // An ALIAS that canonicalizes to a §36 entry is accepted.
+        let mut t = base;
+        t.underlying_symbol = Some("NIFTY MIDCAP SELECT".to_string());
+        assert!(
+            to_universe(&snap_for(t)).is_some(),
+            "alias canonicalizing to MIDCPNIFTY is a valid §36 underlying"
+        );
+    }
+
+    /// Hostile-review round 4 (2026-07-08): duplicate IndexFuture entries in
+    /// a corrupt snapshot. EXACT duplicates (same SID + segment) are DEDUPED
+    /// first-entry-wins — previously they reached the planner, whose
+    /// composite-key dedup collapsed them and fired a spurious planner-drop
+    /// FUTIDX-01. A DISTINCT SID for an already-seen canonical underlying is
+    /// fail-closed (the writer only ever emits one contract per underlying).
+    #[test]
+    fn test_snapshot_index_future_duplicate_entries_deduped_or_fail_closed() {
+        let fut = |sid: &str| SnapshotTarget {
+            role: "index_future".to_string(),
+            security_id: sid.to_string(),
+            symbol_name: "NIFTY-Jul2026-FUT".to_string(),
+            is_fno_underlying: false,
+            is_index_constituent: false,
+            segment: Some("NSE_FNO".to_string()),
+            expiry_date: Some("2026-07-30".to_string()),
+            underlying_symbol: Some("NIFTY".to_string()),
+        };
+        // EXACT duplicate (same SID) → deduped to ONE target, snapshot OK.
+        let snap = PlanSnapshot {
+            trading_date_ist: "2026-07-08".to_string(),
+            format: PLAN_SNAPSHOT_FORMAT_CURRENT,
+            targets: vec![fut("35001"), fut("35001")],
+        };
+        let uni = to_universe(&snap).expect("exact duplicate is deduped, not fatal");
+        assert_eq!(
+            uni.subscription_targets.len(),
+            1,
+            "exact-duplicate future entries collapse first-entry-wins"
+        );
+        assert_eq!(uni.subscription_targets[0].csv_row.security_id, "35001");
+        // DISTINCT SID for the SAME canonical underlying → fail closed.
+        let snap2 = PlanSnapshot {
+            trading_date_ist: "2026-07-08".to_string(),
+            format: PLAN_SNAPSHOT_FORMAT_CURRENT,
+            targets: vec![fut("35001"), fut("35099")],
+        };
+        assert!(
+            to_universe(&snap2).is_none(),
+            "two DISTINCT SIDs for one underlying is corruption — fail closed"
+        );
     }
 
     #[test]
