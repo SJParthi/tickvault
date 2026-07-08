@@ -1,9 +1,11 @@
 # App-level CloudWatch alarms — Z+ L2 VERIFY layer.
 #
 # The 5 alarms in alarms.tf cover infrastructure (EC2 status, CPU, EBS,
-# network). These 12 alarms cover application signals: WebSocket health,
-# QuestDB connectivity, token lifecycle, tick freshness, order rejection,
-# aggregator liveness, backpressure, clock drift, composite SLO score.
+# network). The 21 alarms in THIS file cover application signals: WebSocket
+# health, QuestDB connectivity, token lifecycle, tick freshness, order
+# rejection, aggregator liveness, backpressure, clock drift, composite SLO
+# score. 3 more silent-feed alarms live in silent-feed-alarms.tf
+# (2026-07-06 incident hardening).
 #
 # Charter authority: operator-charter-forever.md §C row "100% monitoring"
 # + §F "Severity::Critical → Telegram". Without these the operator only
@@ -21,10 +23,11 @@
 #                         -> Operator's phone
 #
 # Filter is configured in user-data.sh.tftpl::amazon-cloudwatch-agent.json
-# emf_processor block — keeps custom-metric cost capped (24 selected
-# metrics × ~$0.30 = $7.20/mo ≈ ₹612/mo absolute, $4.20/mo above the
-# 10-free-metric tier — vs. ~₹4500/mo for an unfiltered 150-metric scrape;
-# the 24-name count is pinned by cloudwatch_app_alarms_wiring.rs).
+# emf_processor block — keeps custom-metric cost capped (28 selected
+# series × ~$0.30 ≈ $8.40/mo absolute, $5.40/mo above the 10-free-metric
+# tier — vs. ~₹4500/mo for an unfiltered 150-metric scrape; the 26-name
+# MAIN EMF list is pinned by cloudwatch_app_alarms_wiring.rs, and the two
+# [host,feed] boundary-catchup declarations bring the series count to 28).
 # 2026-07-06 groww feed-down alerting: +3 selected metrics
 # (tv_groww_ws_active, tv_feed_last_tick_age_seconds,
 # tv_feed_sidecar_stall_restart_total) ≈ +$0.90/mo, +2 alarms ≈ +$0.20/mo.
@@ -36,10 +39,12 @@
 #   - Post-PR (historical): 18 alarms, 12 custom metrics.
 #     Overage then: 8 alarms × $0.10 = $0.80/mo + 2 custom metrics × $0.30
 #     = $0.60/mo ≈ ₹120/mo extra.
-#   - Current (2026-07-06): 20 app alarms, 24 selected custom metrics.
-#     Overage now: alarms ≈ $1.50/mo + metrics (24 − 10 free) × $0.30 =
-#     $4.20/mo ⇒ ~$5.70/mo ≈ ₹485/mo total. Operator MUST acknowledge
-#     before terraform apply.
+#   - Current (2026-07-08, silent-feed hardening): 21 app alarms in THIS
+#     file + 3 in silent-feed-alarms.tf; 28 selected custom-metric series.
+#     Overage now: alarms ≈ $1.80/mo + metrics (28 − 10 free) × $0.30 =
+#     $5.40/mo ⇒ ~$7.20/mo ≈ ₹610/mo total (matches the
+#     app_cloudwatch_alarms output below + aws-budget.md's 2026-07-06
+#     note). Operator MUST acknowledge before terraform apply.
 
 locals {
   # All alarms publish to the same SNS topic. Single source of truth so
@@ -183,21 +188,75 @@ resource "aws_cloudwatch_metric_alarm" "questdb_disconnected" {
 
 # ---------------------------------------------------------------------------
 # 5. Many instruments silent — partial feed degradation
+#
+# RETUNED 2026-07-06 (silent-feed incident): Dhan degraded ALL day — 29-67 of
+# 776 instruments silent EVERY minute — and the old threshold=100 never
+# crossed, so zero pages. New tuning:
+#   - threshold 40 (fires at >=41), PROVISIONAL. Round-3 correction
+#     2026-07-08 (review finding 4): the first retune shipped 25, BELOW the
+#     codebase's own documented healthy always-silent floor — main.rs's
+#     2026-07-03 D2 note (live-verified) records "~33 illiquid/suspended
+#     SIDs are ALWAYS silent" under the ~775-SID DailyUniverse (NT-15 boot
+#     seeding makes every subscribed SID a tick-gap map key), and this gauge
+#     is set from the SAME scan with NO always-silent exclusion — so 25
+#     would have breached EVERY healthy in-session minute, latched within
+#     ~10-12 min of the 09:20 gate-open, and paged daily (alert-fatigue
+#     inversion of the zero-page incident). 40 clears the ~33 floor with
+#     margin and aligns with the sibling SLO-degraded alarm (freshness
+#     breaches <0.95 at >=39 silent of 776). HONEST COVERAGE LIMIT: the
+#     incident's 29-40-silent minutes are indistinguishable from the
+#     documented healthy floor by count alone — that marginal band is owned
+#     by the SLO-degraded (>=39-silent freshness) + lag-p99 alarms; this
+#     alarm pages on the sustained upper band (>40). PROVISIONAL + one
+#     trading-week soak of the in-session gauge distribution mandated
+#     (mirrors the boundary-storm 2000 soak); ratchet with a dated note.
+#     ABSOLUTE, not %-of-universe: no universe-size denominator exists in CW
+#     (tv_universe_size is kind-labeled and folds under the host-only EMF
+#     dimensions), and the universe is envelope-locked [100, 1200], so
+#     40 = 5.2% of today's ~776 / 3.3% at the 1200 cap. DATED REVISIT:
+#     re-tune if the universe re-scopes toward the 1200 cap.
+#   - M-of-N 10-of-12 at period=60/Maximum (1 datapoint per 60s agent scrape):
+#     a value flapping 39/41/39 neither pages nor lets one clean scrape erase
+#     9 minutes of evidence; a 1-3 min reconnect blip cannot reach 10 breaching
+#     minutes.
+#   - PRE-OPEN PIN (round-4 correction 2026-07-08, final-review findings
+#     1/2/4): the producer (main.rs tick-gap scan) pins the gauge to 0 during
+#     the NSE pre-open/auction window [09:00, 09:15) IST — the 09:08-09:15
+#     matching/buffer freeze makes the boot-seeded ~775 SIDs legitimately
+#     silent (values in the hundreds >> 40), and this alarm's 12-min lookback
+#     (the LONGEST of any gated alarm) at the 09:20 gate-open would otherwise
+#     hold ~7 guaranteed breaching pre-open datapoints (the gate Lambda's
+#     forced-OK does NOT purge datapoints) -> only ~3 open-ramp minutes > 40
+#     needed for a near-daily false page at ~09:21. Exact mirror of the SLO
+#     tick_freshness pre-open pin; ratcheted by
+#     test_tick_gap_silent_gauge_producer_pins_pre_open_to_zero. The mandated
+#     soak week additionally checks the 09:20-09:25 transition band, not just
+#     the steady-state distribution.
+#   - MARKET-HOURS GATE (audit-findings Rule 3, MANDATORY): the gauge is set
+#     only in-session (main.rs tick-gap scan gates on
+#     is_within_trading_session_ist), so the LAST in-session value keeps being
+#     re-scraped 15:30->16:30 IST — a stale post-close value must never page.
+#     Actions OFF by default; the shared market-hours gate Lambda
+#     (market-hours-liveness-alarm.tf) enables them 09:20-15:35 IST Mon-Fri.
 # ---------------------------------------------------------------------------
 resource "aws_cloudwatch_metric_alarm" "tick_gap_instruments_silent" {
   alarm_name          = "tv-${var.environment}-tick-gap-instruments-silent"
-  alarm_description   = "> 100 instruments have been silent for the tick-gap threshold (30s default). Likely a slow socket or Dhan segment outage. See WS-GAP-06 runbook."
+  alarm_description   = "> 40 instruments silent (tick-gap threshold, 30s default) sustained >=10 of 12 min in-market. Partial feed degradation — slow socket or Dhan segment outage. Threshold 40 is PROVISIONAL (2026-07-08: sits above the documented ~33 always-silent healthy floor — main.rs D2 note — with margin; observe one trading week of the in-session gauge distribution + ratchet with a dated note; the 29-40 marginal band is owned by the SLO-degraded + lag-p99 alarms). Actions gated to 09:20-15:35 IST Mon-Fri by the market-hours gate Lambda (the gauge is written in-session only, so its last value goes stale post-close). See WS-GAP-06 runbook."
   comparison_operator = "GreaterThanThreshold"
-  evaluation_periods  = 2
+  evaluation_periods  = 12
+  datapoints_to_alarm = 10
   metric_name         = "tv_tick_gap_instruments_silent"
   namespace           = local.app_namespace
   period              = 60
   statistic           = "Maximum"
-  threshold           = 100
+  threshold           = 40
   treat_missing_data  = "notBreaching"
   dimensions          = local.app_dimensions
-  alarm_actions       = local.app_alarm_actions
-  ok_actions          = local.app_alarm_ok
+  # Actions OFF by default; the market-hours gate Lambda flips them ON
+  # 09:20-15:35 IST Mon-Fri (market-hours-liveness-alarm.tf).
+  actions_enabled = false
+  alarm_actions   = local.app_alarm_actions
+  ok_actions      = local.app_alarm_ok
 }
 
 # ---------------------------------------------------------------------------
@@ -587,7 +646,7 @@ resource "aws_cloudwatch_metric_alarm" "mem_used_high" {
 # ---------------------------------------------------------------------------
 
 output "app_cloudwatch_alarms" {
-  description = "20 application-level alarms (18 Prometheus-via-CW-agent + 1 disk-used + 1 mem-used Metrics-Insights). Cost note (2026-07-06 groww feed-down alerting adds 2 alarms + 3 selected metrics ≈ +$1.10/mo): overage above the 10 free-tier alarms ≈ $1.50/mo + 24 selected custom metrics ≈ $4.20/mo overage above the 10 free-tier metrics (≈ $7.20/mo absolute at ~$0.30 each; count pinned by cloudwatch_app_alarms_wiring.rs) ≈ $5.70/mo ≈ ₹485/mo total — well inside the $55 budget cap."
+  description = "21 application-level alarms in THIS file (19 Prometheus-via-CW-agent incl. #1437's 2 groww alarms + 1 disk-used + 1 mem-used Metrics-Insights); 3 more silent-feed alarms live in silent-feed-alarms.tf (2026-07-06 incident hardening). tick-gap-instruments-silent was RETUNED 2026-07-06 (threshold 100 -> 40 PROVISIONAL, 10-of-12 min, market-hours-gated). Cost note (2026-07-06 groww feed-down alerting adds 2 alarms + 3 selected metrics; silent-feed hardening adds 3 alarms + 4 selected series): overage above the 10 free-tier alarms ≈ $1.80/mo + 28 selected custom-metric series ≈ $5.40/mo overage above the 10 free-tier metrics (≈ $8.40/mo absolute at ~$0.30 each; EMF name count pinned by cloudwatch_app_alarms_wiring.rs) ≈ $7.20/mo ≈ ₹610/mo total — well inside the $55 budget cap."
   value = [
     aws_cloudwatch_metric_alarm.disk_used_high.alarm_name,
     aws_cloudwatch_metric_alarm.mem_used_high.alarm_name,
