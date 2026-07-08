@@ -61,6 +61,7 @@ The site logs `error!(code = "HTTP-CLIENT-01", ...)`, increments
 | `lifecycle_ensure` / `lifecycle_audit_ensure` | lifecycle DDL skipped this boot (idempotent) |
 | `ticks_ensure_dedup` | ticks-table DDL skipped this boot (idempotent; ring/spill absorbs ILP errors) |
 | `tick_gap_check` | one best-effort post-recovery gap check skipped |
+| `named_views_ensure` | analyst console views (ticks_named/candles_named) DDL skipped this boot (idempotent — next boot re-runs; read-only projections, no data path affected, no duplicate-row window) |
 
 **Triage:**
 1. `tv_http_client_build_failed_total{site}` — which site(s) and at what rate.
