@@ -2192,3 +2192,44 @@ rules:
       already retried; a shadow-only data gap that the parity comparer
       reports honestly. Disk-full class root causes page via the existing
       disk watchers (DISK-WATCHER-01 / RESOURCE-03).
+
+  # FUTIDX-01 (§36 2026-07-08) = the nearest-expiry index-future selection
+  # degraded for >=1 of the 4 authorized underlyings on one feed (no FUT rows /
+  # all expiries past / ambiguous duplicate expiry / unparsable expiry). The
+  # degrade already happened — that feed runs WITHOUT that future for the day;
+  # the spot universe is unaffected and boot never HALTs. Escalate with a
+  # cooldown: the operator must see it (a vendor-master regression or an
+  # INDEX_SYMBOL_ALIASES drift, esp. MIDCPNIFTY) but a repeated per-underlying
+  # emit inside one build pages once.
+  - name: futidx-01-selection-degraded-escalate
+    match:
+      code: FUTIDX-01
+    action: escalate
+    runbook_path: .claude/rules/project/futidx-4-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 300
+    justification: >-
+      FUTIDX-01 = per-underlying index-future selection degrade (per feed).
+      Already self-limited (feed runs on the resolved subset; next day's build
+      re-selects from a fresh master). Operator inspects the day's master CSV
+      + the candidates_seen alias-drift evidence per the runbook — never
+      auto-fixed (a guessed SID/token is worse than a missing future).
+
+  # FUTIDX-02 (§36 2026-07-08) = the boot-time cross-feed comparator found the
+  # Dhan and Groww builds chose DIFFERENT expiry dates (or one-sided presence)
+  # for an index-future underlying. Both feeds STAY LIVE; cross-feed rows for
+  # that underlying are not comparable that day. Escalate: one vendor's master
+  # is stale/divergent and the operator must record a dated note — never
+  # auto-actioned (hand-patching either selection is banned by the runbook).
+  - name: futidx-02-cross-feed-expiry-mismatch-escalate
+    match:
+      code: FUTIDX-02
+    action: escalate
+    runbook_path: .claude/rules/project/futidx-4-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 300
+    justification: >-
+      FUTIDX-02 = cross-feed index-future expiry divergence — a
+      data-comparability signal requiring an operator verdict on which vendor
+      master is stale. Both feeds stay live; both re-select from fresh masters
+      at the next build, so there is nothing safe to auto-fix.

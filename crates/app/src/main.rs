@@ -3276,6 +3276,16 @@ async fn load_daily_universe_plan(
     let warm_timer = std::time::Instant::now();
     if let Some(universe) = instrument_snapshot::load_plan_snapshot_for_today(&today_date) {
         let plan = build_subscription_plan_from_daily_universe(&universe);
+        // §36 hostile-review round 2 (2026-07-08, F4): the warm-snapshot path
+        // emits the SAME per-contract boot-evidence lines + Dhan parity entry
+        // the cold orchestrator does — previously both were deferred to the
+        // background reconcile (and silently never happened if it failed),
+        // so a Groww activation recorded single-feed and the FUTIDX-02
+        // comparator never ran for the whole warm-boot trading day.
+        tickvault_core::instrument::index_futures::record_dhan_selection_from_universe(
+            &universe,
+            now_ist.date_naive(),
+        );
         let elapsed_ms = u64::try_from(warm_timer.elapsed().as_millis()).unwrap_or(u64::MAX);
         info!(
             universe_size = universe.total_count(),
@@ -3296,13 +3306,18 @@ async fn load_daily_universe_plan(
         // from the snapshot, and lifecycle for TODAY was already written by the
         // earlier boot that produced the snapshot.
         let questdb = config.questdb.clone();
-        let date_for_bg = today_date.clone();
         tokio::spawn(async move {
             match cold_build_daily_universe(&questdb, false).await {
-                Ok((_outcome, fresh_universe)) => {
-                    if let Err(e) =
-                        instrument_snapshot::write_plan_snapshot(&fresh_universe, &date_for_bg)
-                    {
+                Ok((fresh_outcome, fresh_universe)) => {
+                    // Hostile-review round 4 (2026-07-08): stamp the date the
+                    // rebuild's FUTIDX selection ACTUALLY used (the runner
+                    // re-derives it per attempt, R2-2) — never the boot-entry
+                    // `today_date`, which is stale if the reconcile's §4
+                    // retry loop crossed IST midnight.
+                    if let Err(e) = instrument_snapshot::write_plan_snapshot(
+                        &fresh_universe,
+                        &fresh_outcome.build_trading_date_ist,
+                    ) {
                         warn!(error = %e, "background reconcile: snapshot refresh write failed");
                     } else {
                         info!(
@@ -3333,11 +3348,18 @@ async fn load_daily_universe_plan(
 
     // Persist the snapshot so a same-day crash takes the fast path above.
     // Best-effort: a failed cache write is degraded-not-broken (next boot
-    // cold-builds again).
-    if let Err(e) = instrument_snapshot::write_plan_snapshot(&daily_universe, &today_date) {
+    // cold-builds again). Hostile-review round 4 (2026-07-08): stamp the
+    // date the successful build's FUTIDX selection ACTUALLY used
+    // (`outcome.build_trading_date_ist` — re-derived per attempt, R2-2),
+    // never the `today_date` frozen at fn entry: a §4 retry loop crossing
+    // IST midnight builds for D+1, and a D-labeled snapshot carrying the
+    // D+1 front month is an internally-inconsistent forensic artifact.
+    if let Err(e) =
+        instrument_snapshot::write_plan_snapshot(&daily_universe, &outcome.build_trading_date_ist)
+    {
         warn!(
             error = %e,
-            date = %today_date,
+            date = %outcome.build_trading_date_ist,
             "plan snapshot write failed — same-day crash will cold-build"
         );
     }
@@ -7095,7 +7117,21 @@ async fn start_dhan_lane(
                 });
                 // Capture the expected universe size BEFORE the Arc moves into
                 // the fetch, so the post-fetch coverage verification can compare.
-                let pd_expected = pd_universe.subscription_targets.len();
+                // §36 (hostile-review round 1, 2026-07-08): the ≤4 IndexFuture
+                // targets are unconditionally SKIPPED by the prev-day loop
+                // (`instrument_type_for_role` → None — Dhan-historical FUTIDX
+                // UNVERIFIED-LIVE), so they must NOT sit in the coverage
+                // DENOMINATOR — pre-fix a perfect day could never read 100%
+                // and the spot pct was permanently diluted. Same role filter
+                // the 15:31 cross-verify target build uses.
+                let pd_expected = pd_universe
+                    .subscription_targets
+                    .iter()
+                    .filter(|t| {
+                        tickvault_app::prev_day_ohlcv_boot::instrument_type_for_role(t.role)
+                            .is_some()
+                    })
+                    .count();
                 let pd_token = std::sync::Arc::clone(&token_handle);
                 let pd_qcfg = config.questdb.clone();
                 let pd_base = config.dhan.rest_api_base_url.clone();
@@ -13876,14 +13912,22 @@ fn spawn_post_market_tasks(
             .subscription_targets
             .iter()
             .filter_map(|t| {
+                // §36 (2026-07-08): the 15:31 cross-verify stays SPOT-ONLY by
+                // construction — `instrument_type_for_role` returns None for
+                // IndexFuture targets (Dhan-historical FUTIDX UNVERIFIED-LIVE),
+                // so futures never enter the target list; counted, not silent.
+                let Some(instrument) =
+                    tickvault_app::prev_day_ohlcv_boot::instrument_type_for_role(t.role)
+                else {
+                    metrics::counter!("tv_cross_verify_futidx_skipped_total").increment(1);
+                    return None;
+                };
                 t.csv_row.security_id.trim().parse::<i64>().ok().map(|sid| {
                     tickvault_app::cross_verify_1m_boot::CrossVerifyTarget {
                         security_id: sid,
                         segment: t.csv_row.segment.trim().to_string(),
                         symbol: t.csv_row.symbol_name.trim().to_string(),
-                        instrument: tickvault_app::prev_day_ohlcv_boot::instrument_type_for_role(
-                            t.role,
-                        ),
+                        instrument,
                     }
                 })
             })
