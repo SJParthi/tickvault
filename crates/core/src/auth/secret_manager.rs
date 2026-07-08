@@ -1362,6 +1362,46 @@ mod tests {
         );
     }
 
+    /// Silent-feed hardening Item 4 (2026-07-06 incident): the Dhan
+    /// exchange-lag p99 publisher MUST be spawned via its supervisor
+    /// (respawn + counter — WS-GAP-05 / SLO-03 pattern). A bare
+    /// `tokio::spawn` would regress the exact silent-task-death class the
+    /// SLO-03 incident proved: the `tv_dhan_exchange_lag_p99_seconds`
+    /// stream stops with no error!, no counter, no respawn, and the lag
+    /// alarm false-OKs on missing data (`notBreaching`).
+    #[test]
+    fn test_feed_lag_publisher_supervisor_is_wired_into_main() {
+        let main_rs = std::fs::read_to_string("../app/src/main.rs")
+            .or_else(|_| std::fs::read_to_string("crates/app/src/main.rs"))
+            .expect("main.rs must be readable");
+        assert!(
+            main_rs.contains("spawn_supervised_feed_lag_publisher("),
+            "main.rs MUST spawn the Dhan exchange-lag publisher via \
+             `spawn_supervised_feed_lag_publisher` (silent-feed hardening \
+             Item 4). A bare tokio::spawn regresses the SLO-03 \
+             silent-death class for the lag gauge."
+        );
+        // The supervisor must be the ONLY spawn path for the publisher
+        // loop: exactly one non-comment call site of the inner loop fn
+        // (inside the supervisor), so nobody re-introduces a second,
+        // unsupervised spawn.
+        let inner_call_sites = main_rs
+            .lines()
+            .filter(|l| {
+                let t = l.trim_start();
+                !t.starts_with("//")
+                    && !t.starts_with("///")
+                    && t.contains("run_dhan_lag_publisher(")
+            })
+            .count();
+        assert_eq!(
+            inner_call_sites, 1,
+            "run_dhan_lag_publisher must be called ONLY from the feed-lag \
+             supervisor loop (found {inner_call_sites} non-comment mentions; \
+             expected exactly 1: the supervisor call site)"
+        );
+    }
+
     /// Session-B fix #1 (operator go 2026-07-04): the Groww scale-FLEET
     /// spawn in `main.rs` MUST be gated by the fleet dual-instance SSM lock
     /// (`acquire_groww_scale_fleet_lock`). A scale-test boot runs

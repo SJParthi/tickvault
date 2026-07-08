@@ -63,6 +63,7 @@ const INDEX_PREV_CLOSE_CACHE_PATH: &str = "data/instrument-cache/index-prev-clos
 /// assumes the directory exists and only writes the file atomically.
 // HOT-PATH-EXEMPT: boot-only init, runs once before tick processor starts.
 pub fn init_prev_close_cache_dir() -> std::io::Result<()> {
+    // O(1) EXEMPT: boot-only init — runs once from main.rs Step 6b, never per-tick.
     std::fs::create_dir_all(INDEX_PREV_CLOSE_CACHE_DIR)
 }
 
@@ -143,6 +144,7 @@ const IDLE_FLUSH_DRAIN_INTERVAL: std::time::Duration = std::time::Duration::from
 fn is_within_persist_window(exchange_timestamp: u32, muhurat_active: bool) -> bool {
     // exchange_timestamp is already IST epoch seconds — no offset needed.
     let ist_secs_of_day = exchange_timestamp % SECONDS_PER_DAY;
+    // O(1) EXEMPT: begin — Range::contains is two integer comparisons, not a Vec scan.
     if (TICK_PERSIST_START_SECS_OF_DAY_IST..TICK_PERSIST_END_SECS_OF_DAY_IST)
         .contains(&ist_secs_of_day)
     {
@@ -151,6 +153,7 @@ fn is_within_persist_window(exchange_timestamp: u32, muhurat_active: bool) -> bo
     muhurat_active
         && (MUHURAT_PERSIST_START_SECS_OF_DAY_IST..MUHURAT_PERSIST_END_SECS_OF_DAY_IST)
             .contains(&ist_secs_of_day)
+    // O(1) EXEMPT: end
 }
 
 /// Returns `true` if the exchange timestamp's IST day matches today.
@@ -445,6 +448,7 @@ fn is_wall_clock_within_persist_window(received_at_nanos: i64, muhurat_active: b
     // wrongly rejected.
     let grace_upper_bound =
         TICK_PERSIST_END_SECS_OF_DAY_IST.saturating_add(WS_GRACE_AFTER_CLOSE_SECS_U32);
+    // O(1) EXEMPT: begin — Range::contains is two integer comparisons, not a Vec scan.
     if (TICK_PERSIST_START_SECS_OF_DAY_IST..grace_upper_bound).contains(&wall_clock_ist_secs_of_day)
     {
         return true;
@@ -453,6 +457,7 @@ fn is_wall_clock_within_persist_window(received_at_nanos: i64, muhurat_active: b
     muhurat_active
         && (MUHURAT_PERSIST_START_SECS_OF_DAY_IST..MUHURAT_PERSIST_END_SECS_OF_DAY_IST)
             .contains(&wall_clock_ist_secs_of_day)
+    // O(1) EXEMPT: end
 }
 
 /// Selects the depth timestamp: exchange_timestamp if valid, else wall-clock.
@@ -544,6 +549,9 @@ impl TickDedupRing {
     /// # Panics (debug only)
     /// Debug-asserts that `power` is in [8, 24].
     fn new(power: u32) -> Self {
+        // O(1) EXEMPT: begin — one-time boot construction (never per-tick); the
+        // debug_assert Range::contains is two integer comparisons, and the vec!
+        // is the ring's single preallocation.
         debug_assert!(
             (8..=24).contains(&power),
             "dedup ring buffer power out of range"
@@ -553,6 +561,7 @@ impl TickDedupRing {
             slots: vec![u64::MAX; size].into_boxed_slice(),
             mask: size.wrapping_sub(1),
         }
+        // O(1) EXEMPT: end
     }
 
     /// Returns `true` ONLY for a true byte-identical double-delivery of the same
@@ -1375,6 +1384,23 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
                     (enriched.volume_is_first_seen, flags, life)
                 });
 
+                // Silent-feed hardening Item 4 (2026-07-06 incident): observe
+                // the exchange→receive lag for this LIVE Dhan tick. O(1),
+                // zero-alloc (two relaxed atomic stores into a preallocated
+                // ring). The received_at−capture_seq dwell discriminator
+                // excludes WAL-replayed rows EXACTLY (capture_seq is stamped
+                // at the ORIGINAL WS-read instant and preserved through
+                // re-injection, while received_at is re-stamped at dequeue),
+                // so genuinely-lagged live ticks are KEPT — no Rule-11
+                // censoring of the measured signal. Sits AFTER every gate
+                // (valid/today/in-window/dedup) so only in-session live Dhan
+                // data feeds the lag window.
+                super::feed_lag_monitor::record_dhan_tick(
+                    tick.received_at_nanos,
+                    capture_seq,
+                    tick.exchange_timestamp,
+                );
+
                 // Persist tick to QuestDB — ingestion gate above already verified
                 // [09:00, 15:30) IST and today's date. This block only handles
                 // QuestDB write errors (connection down, buffer full, etc.).
@@ -1579,6 +1605,17 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
                         enricher.enrich(&mut tick);
                     }
 
+                    // Silent-feed hardening Item 4: exchange→receive lag
+                    // observation for the Full-packet arm — mirrors the
+                    // Ticker/Quote persist site above so both Dhan persist
+                    // paths feed the SAME lag window (uniform hot-path
+                    // semantics across packet types). O(1), zero-alloc.
+                    super::feed_lag_monitor::record_dhan_tick(
+                        tick.received_at_nanos,
+                        capture_seq,
+                        tick.exchange_timestamp,
+                    );
+
                     // Persist tick to QuestDB — ingestion gate above already verified
                     // [09:00, 15:30) IST and today's date.
                     //
@@ -1777,7 +1814,7 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
                     // IDX_I segment
                     index_prev_close_cache.insert(security_id, previous_close);
                     //
-                    // Wave 1 Item 0.a — sync `std::fs::write` + rename moved to
+                    // Wave 1 Item 0.a — the sync file write + rename moved to
                     // a dedicated writer task fed by a bounded
                     // `tokio::sync::mpsc::channel(64)`; the hot path enqueues
                     // a `bytes::Bytes` payload via `try_enqueue_global`. Drop
