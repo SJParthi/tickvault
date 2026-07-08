@@ -224,9 +224,14 @@ handler rewrite + opener + comments, both build markers, the tests, the
 workflow steps, the TF excludes/comment, the evidence relocation, and this
 plan. No terraform resources/state, no schema, no secrets change; the next
 terraform-apply repackages the reverted bytes via `source_code_hash`. Honest
-note: a revert re-opens the incident and the FILE 5 gate then goes red on
-the next in-window apply — that is the desired ratchet; a conscious revert
-must pair with removing (or accepting) the red gate.
+note: a revert re-opens the incident, and what catches it depends on the
+revert's scope. A FULL revert of the squash commit removes the FILE 5 gate
+and the ci.yml harness wiring along with the handler fix, so NO ratchet
+fires — the re-opened 504 stays undetected until manual observation or a
+future re-add of the gate. A handler-only (partial) revert leaves the FILE 5
+gate in place, which then goes red on the next in-window apply — that is
+the ratchet; such a conscious revert must pair with removing (or accepting)
+the red gate.
 
 ## Observability
 
