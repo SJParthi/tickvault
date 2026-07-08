@@ -611,7 +611,7 @@ resource "aws_cloudwatch_metric_alarm" "mem_used_high" {
 # ---------------------------------------------------------------------------
 
 output "app_cloudwatch_alarms" {
-  description = "17 application-level alarms in THIS file (15 Prometheus-via-CW-agent + 1 disk-used + 1 mem-used Metrics-Insights); 3 more silent-feed alarms live in silent-feed-alarms.tf (2026-07-06 incident hardening). tick-gap-instruments-silent was RETUNED 2026-07-06 (threshold 100 -> 25, 10-of-12 min, market-hours-gated). Cost note: total alarms 6 → 23 → 27 (incl. market-hours-liveness + 3 silent-feed); overage above the 10 free-tier alarms ≈ $1.70/mo + custom metrics ≈ $1.95/mo (15 → +4 series 2026-07-06) ≈ ₹310/mo — well inside the $55 budget cap."
+  description = "20 application-level alarms in THIS file (18 Prometheus-via-CW-agent + 1 disk-used + 1 mem-used Metrics-Insights); 3 more silent-feed alarms live in silent-feed-alarms.tf (2026-07-06 incident hardening). tick-gap-instruments-silent was RETUNED 2026-07-06 (threshold 100 -> 25, 10-of-12 min, market-hours-gated). Cost note (2026-07-06 groww feed-down alerting adds 2 alarms + 3 selected metrics; silent-feed hardening adds 3 alarms + 4 selected series): overage above the 10 free-tier alarms ≈ $1.80/mo + 28 selected custom-metric series ≈ $5.40/mo overage above the 10 free-tier metrics (≈ $8.40/mo absolute at ~$0.30 each; EMF name count pinned by cloudwatch_app_alarms_wiring.rs) ≈ $7.20/mo ≈ ₹610/mo total — well inside the $55 budget cap."
   value = [
     aws_cloudwatch_metric_alarm.disk_used_high.alarm_name,
     aws_cloudwatch_metric_alarm.mem_used_high.alarm_name,

@@ -322,7 +322,7 @@ fn test_deployed_emf_source_labels_match_a_real_series_label() {
 }
 
 #[test]
-fn test_emf_metric_selectors_name_count_is_twenty_three() {
+fn test_emf_metric_selectors_name_count_is_twenty_six() {
     // Pin the MAIN (host-only) EMF publish list: 19 alarm-backing signals
     // + 2 memory-measurement gauges added 2026-07-02 for the 2K-universe RAM
     // measurement (tv_process_rss_bytes — crates/storage/src/resource_monitor.rs;
@@ -349,9 +349,10 @@ fn test_emf_metric_selectors_name_count_is_twenty_three() {
     let names = emf_declared_names(&user_data, "metric_selectors");
     assert_eq!(
         names.len(),
-        23,
-        "Z+ L2 VERIFY ratchet: expected exactly 23 names in the MAIN EMF \
-         metric_selectors list; found {}: {names:?}",
+        26,
+        "Z+ L2 VERIFY ratchet: expected exactly 26 names in the MAIN EMF \
+         metric_selectors list (24 post-#1437 groww feed-down alerting + 2 \
+         silent-feed lag names 2026-07-06); found {}: {names:?}",
         names.len()
     );
     for required in [
@@ -844,7 +845,7 @@ fn test_boundary_catchup_alarm_uses_per_feed_dimensions() {
 }
 
 #[test]
-fn test_app_alarms_count_is_twenty() {
+fn test_app_alarms_count_is_twenty_two() {
     // Pin the count so future PRs that delete an alarm without updating
     // the rule files / PR body fail this guard. Cost note (aws-budget.md)
     // depends on this number — keeping the budget honest means keeping
@@ -868,7 +869,15 @@ fn test_app_alarms_count_is_twenty() {
     // tick at/after 15:30 IST, without threading a notifier into the per-tick
     // hot path. Cost: +1 custom metric (~$0.30/mo) + 1 alarm (~$0.10/mo),
     // negligible within the ~₹2,058/mo envelope.
-    // 20 (was 17) since 2026-07-06 (silent-feed incident hardening — the Dhan
+    // 19 (was 17) since 2026-07-06 (Groww feed-down alerting, operator
+    // directive, #1437): added `tv_groww_ws_active` (alarm
+    // tv-<env>-groww-ws-inactive — Groww WS lost after being up this
+    // session) + `tv_feed_sidecar_stall_restart_total` (alarm
+    // tv-<env>-groww-stall-restart-storm — 3+ FEED-STALL-01 silent-feed
+    // kills within an hour = provider-side reject). Cost: +2 alarms
+    // (~$0.20/mo) + 3 custom metrics (~$0.90/mo incl. the un-alarmed
+    // tv_feed_last_tick_age_seconds), per the app-alarms.tf header note.
+    // 22 (was 19) since 2026-07-06 (silent-feed incident hardening — the Dhan
     // feed degraded all day with 4 independent signals and zero pages): scope
     // now ALSO covers silent-feed-alarms.tf, which adds
     // `tv_realtime_guarantee_score` (degraded 0.80-0.95 dead-band, 9-of-15),
@@ -880,8 +889,8 @@ fn test_app_alarms_count_is_twenty() {
     // aws-budget.md.
     let count = alarm_metric_names().len();
     assert_eq!(
-        count, 20,
-        "Z+ L2 VERIFY ratchet: expected exactly 20 app-level CloudWatch alarm \
+        count, 22,
+        "Z+ L2 VERIFY ratchet: expected exactly 22 app-level CloudWatch alarm \
          metric_name entries across app-alarms.tf + silent-feed-alarms.tf \
          (one per critical app signal; tv_realtime_guarantee_score counts twice — \
          critical + degraded). Found {count}. If you intentionally added \

@@ -63,7 +63,7 @@ const INDEX_PREV_CLOSE_CACHE_PATH: &str = "data/instrument-cache/index-prev-clos
 /// assumes the directory exists and only writes the file atomically.
 // HOT-PATH-EXEMPT: boot-only init, runs once before tick processor starts.
 pub fn init_prev_close_cache_dir() -> std::io::Result<()> {
-    // O(1) EXEMPT: boot-only init — runs once from main.rs Step 6b, never per-tick.
+    // O(1) EXEMPT: boot-only init — called once from main.rs Step 6b, never on the tick path.
     std::fs::create_dir_all(INDEX_PREV_CLOSE_CACHE_DIR)
 }
 
@@ -450,7 +450,7 @@ fn is_wall_clock_within_persist_window(received_at_nanos: i64, muhurat_active: b
     // wrongly rejected.
     let grace_upper_bound =
         TICK_PERSIST_END_SECS_OF_DAY_IST.saturating_add(WS_GRACE_AFTER_CLOSE_SECS_U32);
-    // O(1) EXEMPT: begin — Range::contains is two integer comparisons, not a Vec scan.
+    // O(1) EXEMPT: Range::contains — two-comparison O(1) bounds check (scanner heuristic misreads it as Vec::contains).
     if (TICK_PERSIST_START_SECS_OF_DAY_IST..grace_upper_bound).contains(&wall_clock_ist_secs_of_day)
     {
         return true;
@@ -1350,45 +1350,6 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
                     }
                 }
 
-                // O(1) inline Greeks enrichment: compute IV + delta/gamma/theta/vega
-                // for F&O option ticks, update underlying LTP cache for index/equity.
-                // Runs BEFORE persistence so Greeks values are stored in QuestDB.
-                if let Some(ref mut enricher) = greeks_enricher {
-                    enricher.enrich(&mut tick);
-                }
-
-                // 29-tf engine Phase 2.7 (hostile bug-hunt CRITICAL C2 fix):
-                // run the lifecycle enricher ONCE per tick BEFORE both the
-                // VOLUME-MONO-01 guard and the persistence branch. The
-                // enricher's `volume_is_first_seen` + `phase` flags must
-                // suppress the monotonicity check when (a) it's the first
-                // tick of the day for this instrument or (b) phase != OPEN.
-                // Without this gate, IST midnight rollover fires ~24,300
-                // false VOLUME-MONO-01 alerts at 09:15 IST every trading
-                // day (per L13).
-                let lifecycle_for_tick: Option<(
-                    bool,
-                    super::tick_enricher::EnrichedTickFlags,
-                    TickLifecycle,
-                )> = tick_enricher.as_ref().map(|enricher| {
-                    // Phase 2.10 M1 fix: per-tick exchange_timestamp drives
-                    // phase classification (not wall-clock arrival).
-                    let tick_secs_of_day = tick.exchange_timestamp % 86_400;
-                    let enriched = enricher.enrich_tick(&tick, tick_secs_of_day);
-                    let life = TickLifecycle {
-                        volume_delta: enriched.volume_delta,
-                        prev_day_close: enriched.prev_day_close,
-                        prev_day_oi: enriched.prev_day_oi,
-                        phase: enriched.phase as u8,
-                    };
-                    let flags = super::tick_enricher::EnrichedTickFlags {
-                        volume_is_first_seen: enriched.volume_is_first_seen,
-                        volume_is_regression: enriched.volume_is_regression,
-                        phase: enriched.phase,
-                    };
-                    (enriched.volume_is_first_seen, flags, life)
-                });
-
                 // Silent-feed hardening Item 4 (2026-07-06 incident): observe
                 // the exchange→receive lag for this LIVE Dhan tick. O(1),
                 // zero-alloc (two relaxed atomic stores into a preallocated
@@ -1417,19 +1378,32 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
                     tick.exchange_timestamp,
                 );
 
-                // Persist tick to QuestDB — ingestion gate above already verified
-                // [09:00, 15:30) IST and today's date. This block only handles
-                // QuestDB write errors (connection down, buffer full, etc.).
-                if let Some(ref mut writer) = tick_writer {
-                    let result = if let Some((_, _, life)) = lifecycle_for_tick {
-                        writer.append_tick_enriched_with_seq(&tick, life, capture_seq)
-                    } else {
-                        writer.append_tick_with_seq(&tick, capture_seq)
-                    };
-                    match result {
-                        Ok(()) => {
-                            m_ticks_persisted.increment(1);
-                            ticks_persisted = ticks_persisted.saturating_add(1);
+                // C2 (feed convergence): the ordered enrich → persist →
+                // aggregate-handoff per-tick consumer sequence is the ONE
+                // shared `consume_feed_tick` core (`super::feed_consumer`) —
+                // the same core the Groww bridge delegates to. Dhan's
+                // aggregate handoff is the tick broadcast: Engine B (the
+                // multi-TF aggregator) subscribes to it off this hot path
+                // (#T1b). Monomorphized closures — inlines to the exact
+                // pre-C2 straight-line code (DHAT + bench-gated).
+                //
+                // The lifecycle result crosses from the enrich stage to the
+                // persist stage (and to the VOLUME-MONO-01 gate below) via a
+                // zero-alloc `Cell` of Copy data — two closures cannot share
+                // a `&mut` local, and the tuple is `Copy` end-to-end.
+                let lifecycle_cell: std::cell::Cell<
+                    Option<(bool, super::tick_enricher::EnrichedTickFlags, TickLifecycle)>,
+                > = std::cell::Cell::new(None);
+                super::feed_consumer::consume_feed_tick(
+                    tickvault_common::feed::Feed::Dhan,
+                    &mut tick,
+                    |t| {
+                        // O(1) inline Greeks enrichment: compute IV +
+                        // delta/gamma/theta/vega for F&O option ticks, update
+                        // underlying LTP cache for index/equity. Runs BEFORE
+                        // persistence so Greeks values are stored in QuestDB.
+                        if let Some(ref mut enricher) = greeks_enricher {
+                            enricher.enrich(t);
                         }
 
                         // 29-tf engine Phase 2.7 (hostile bug-hunt CRITICAL C2 fix):
@@ -1893,7 +1867,7 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
                     // IDX_I segment
                     index_prev_close_cache.insert(security_id, previous_close);
                     //
-                    // Wave 1 Item 0.a — the sync file write + rename moved to
+                    // Wave 1 Item 0.a — sync file write (`fs::write`) + rename moved to
                     // a dedicated writer task fed by a bounded
                     // `tokio::sync::mpsc::channel(64)`; the hot path enqueues
                     // a `bytes::Bytes` payload via `try_enqueue_global`. Drop
