@@ -72,7 +72,7 @@
 # TWICE — halving the effective storm threshold to ~2.5 cycles/15 min
 # (over-pages; fail-loud, never a silent miss). The tv_boot_completed
 # dual-publish precedent is harmless ONLY for its Maximum-stat consumers
-# (market-hours-liveness-alarm.tf + the readiness Lambda) — idempotence under
+# (boot-heartbeat-alarm.tf + the readiness Lambda) — idempotence under
 # duplicate datapoints does not transfer to Sum.
 # =============================================================================
 
