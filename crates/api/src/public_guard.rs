@@ -48,16 +48,18 @@ pub const PUBLIC_API_BURST: u32 = 10;
 /// every 1/[`PUBLIC_API_RATE_PER_SEC`] s, so 1s always restores budget).
 const RETRY_AFTER_SECS: &str = "1";
 
-// HONEST RESIDUAL (adversarial review 2026-07-09, flagged follow-up):
-// `GET /api/board/data` is a THIRD public QuestDB-backed endpoint (3 count
-// queries per hit, polled every ~3s by the /board page) that stays OUTSIDE
-// this limiter per the operator's locked scope for this change ("/api/stats
-// + /api/quote ONLY — do not expand"). It needs its OWN budget/cache design
-// (a shared 5/s cell would let an attacker starve the board's 3s poll).
-// Until that follow-up lands, the DB-load hardening covers two of the three
-// public DB-backed routes.
+// RESIDUAL CLOSED (2026-07-09 follow-up, coordinator-approved): the #1458
+// review flagged `GET /api/board/data` (3 QuestDB queries/hit, /board polls
+// every ~3s) as the remaining unlimited public DB-backed route. It now rides
+// the SAME shared cell + a 2s TTL cache slot. Budget math (verified against
+// board_page.rs/dashboard_page.rs): one /board tab (1 req/3s = 0.33/s) + one
+// /dashboard tab (1 req/5s = 0.2/s) = ~0.53 req/s vs the 5 req/s sustained
+// budget (~11%); even 5 tabs of each = ~2.7 req/s — no legit starvation. All
+// three public DB-backed routes are now covered; the /board + /dashboard
+// HTML shells stay unlimited (static, no DB).
 
-/// GCRA-based limiter shared by `/api/stats` + `/api/quote/{security_id}`.
+/// GCRA-based limiter shared by `/api/stats` + `/api/quote/{security_id}`
+/// + `/api/board/data` (2026-07-09 follow-up).
 ///
 /// Cold path — one atomic GCRA check per public API request; never on the
 /// tick hot path.
@@ -103,7 +105,7 @@ impl Default for PublicEndpointLimiter {
 
 /// Maps a request path to a STATIC endpoint label for the
 /// `tv_api_rate_limited_total{endpoint}` counter. Total function —
-/// attacker-controlled paths can only ever produce one of three fixed
+/// attacker-controlled paths can only ever produce one of four fixed
 /// `&'static str` values (no per-request label allocation, no cardinality
 /// explosion).
 fn endpoint_label(path: &str) -> &'static str {
@@ -111,6 +113,8 @@ fn endpoint_label(path: &str) -> &'static str {
         "stats"
     } else if path.starts_with("/api/quote") {
         "quote"
+    } else if path.starts_with("/api/board") {
+        "board"
     } else {
         "other"
     }
@@ -190,6 +194,8 @@ mod tests {
     fn test_endpoint_label_is_static_and_total() {
         assert_eq!(endpoint_label("/api/stats"), "stats");
         assert_eq!(endpoint_label("/api/quote/12345"), "quote");
+        // 2026-07-09 follow-up: the board snapshot route is limited too.
+        assert_eq!(endpoint_label("/api/board/data"), "board");
         // Attacker-shaped garbage maps to the fixed "other" label — never
         // an attacker-controlled label value.
         assert_eq!(endpoint_label("/api/quote"), "quote");

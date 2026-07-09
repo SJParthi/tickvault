@@ -16,6 +16,15 @@ const STATS_CACHE_TTL_SECS: u64 = 5;
 /// honestly becomes "latest tick, ≤1s old" — documented envelope change.
 const QUOTE_CACHE_TTL_SECS: u64 = 1;
 
+/// TTL for the cached `/api/board/data` response body (2026-07-09
+/// follow-up — closes the #1458 HIGH residual). The `/board` page polls
+/// every ~3s, so a 2s TTL keeps a single tab's data fresh (poll interval
+/// exceeds the TTL). Attack cost: one 3-query QuestDB pass per 2s in the
+/// healthy regime; with QuestDB black-holed (computes ~3s > TTL, no
+/// single-flight) the honest bound is the LIMITER — ≤5 computes/s (see the
+/// `board_data` handler docs).
+const BOARD_CACHE_TTL_SECS: u64 = 2;
+
 use tickvault_common::config::{DhanConfig, InstrumentConfig, QuestDbConfig};
 use tickvault_common::feed_health::FeedHealthRegistry;
 
@@ -288,6 +297,9 @@ struct AppStateInner {
     /// hard entry cap; the handler caches ONLY 200 responses so garbage
     /// attacker-chosen security_ids can never grow the map.
     quote_cache: crate::response_cache::BoundedTtlCache,
+    /// TTL cache for the `/api/board/data` response body (2026-07-09
+    /// follow-up). Single slot, 2s TTL — see [`BOARD_CACHE_TTL_SECS`].
+    board_cache: crate::response_cache::SingleSlotTtlCache,
 }
 
 impl SharedAppState {
@@ -367,6 +379,9 @@ impl SharedAppState {
                     std::time::Duration::from_secs(QUOTE_CACHE_TTL_SECS),
                     crate::response_cache::QUOTE_CACHE_MAX_ENTRIES,
                 ),
+                board_cache: crate::response_cache::SingleSlotTtlCache::new(
+                    std::time::Duration::from_secs(BOARD_CACHE_TTL_SECS),
+                ),
             }),
         }
     }
@@ -426,6 +441,13 @@ impl SharedAppState {
     // TEST-EXEMPT: trivial accessor; exercised by quote-handler cache tests.
     pub fn quote_cache(&self) -> &crate::response_cache::BoundedTtlCache {
         &self.inner.quote_cache
+    }
+
+    /// Returns the `/api/board/data` TTL response cache (2026-07-09
+    /// follow-up — closes the #1458 HIGH residual).
+    // TEST-EXEMPT: trivial accessor; exercised by the board-handler cache test.
+    pub fn board_cache(&self) -> &crate::response_cache::SingleSlotTtlCache {
+        &self.inner.board_cache
     }
 }
 
