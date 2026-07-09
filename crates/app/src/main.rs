@@ -1798,6 +1798,9 @@ async fn main() -> Result<()> {
         // notifier exists: a subsequent sidecar reject diagnostic can page the
         // operator. Stored once; the supervisor resolves it lazily per child.
         groww_sidecar_notifier_slot.store(Some(std::sync::Arc::clone(&fast_notifier)));
+        // Boot bubble (2026-07-09): declare which feed lines the checklist
+        // shows as pending from its first page.
+        fast_notifier.set_boot_expectations(config.feeds.dhan_enabled, config.feeds.groww_enabled);
         match ip_result {
             Ok(result) => {
                 if fast_trading_mode.is_live() {
@@ -5639,6 +5642,9 @@ async fn build_shared_infra(
         NotificationService::spawn_episode_ticker(&notifier);
         notifier
     };
+    // Boot bubble (2026-07-09): declare which feed lines the checklist
+    // shows as pending from its first page.
+    notifier.set_boot_expectations(config.feeds.dhan_enabled, config.feeds.groww_enabled);
 
     // --- Health registry (drives /health + /api/feeds/health) ---
     let health_status: SharedHealthStatus = std::sync::Arc::new(SystemHealthStatus::new());
@@ -6932,18 +6938,18 @@ async fn start_dhan_lane(
         );
     }
 
-    // Boot-timing proof Telegram (DailyUniverse scope only — sentinel-guarded
-    // so Indices4Only emits nothing). Reads the wall-clock stashed by
-    // `load_daily_universe_plan`; gives the operator REAL daily evidence the
-    // O(1) warm path is working: warm-skip boots are sub-second regardless of
-    // the applicable-F&O master size; a full rebuild is the batched-seconds
-    // cold path.
+    // Boot-timing proof (DailyUniverse scope only — sentinel-guarded so
+    // Indices4Only emits nothing). Reads the wall-clock stashed by
+    // `load_daily_universe_plan`; REAL daily evidence the O(1) warm path is
+    // working. DEMOTED 2026-07-09 (operator escalation — Telegram noise N3):
+    // the standalone Telegram essay is now a structured log line; the
+    // operator-facing count lives on the boot bubble's Instruments line.
     if let Some(message) = format_instrument_load_telegram(
         INSTRUMENT_LOAD_ELAPSED_MS.load(std::sync::atomic::Ordering::Relaxed),
         INSTRUMENT_LOAD_WARM_SKIPPED.load(std::sync::atomic::Ordering::Relaxed),
         INSTRUMENT_LOAD_TOTAL_ROWS.load(std::sync::atomic::Ordering::Relaxed),
     ) {
-        notifier.notify(NotificationEvent::Custom { message });
+        info!(target: "boot", %message, "instrument load timing (demoted from Telegram 2026-07-09)");
     }
 
     // Only persist for CachedPlan (not yet persisted). FreshBuild already
