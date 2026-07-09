@@ -129,6 +129,25 @@ def binary_mismatch_value(binary_sha: str | None, desired_sha: str | None) -> fl
     return 0.0 if b == d else 1.0
 
 
+def binary_is_stale(binary_sha: str | None, desired_sha: str | None) -> bool:
+    """Return True iff the ON-BOX running binary is provably older than main HEAD.
+
+    This is the GROUND-TRUTH staleness signal for the box-start (instance-start)
+    firing: `binary_sha` is the SSM /tickvault/<env>/deploy/binary-git-sha param,
+    which deploy-aws.yml writes ONLY after a verified-healthy binary swap. Unlike
+    the GitHub "last successful deploy-aws run" head_sha (see `is_stale`), a green
+    off-hours NO-OP skip run or a market-hours-blocked run can NEVER advance this
+    param — so a box that auto-started on the previous binary is caught here even
+    when a misleading skip run makes the GitHub signal look "deployed" (the exact
+    2026-07-09 boot-critical-fix outage class).
+
+    No-false-OK: reuses `binary_mismatch_value`, which returns None when EITHER
+    sha is unknown/empty/"unknown" — so an SSM/GitHub blip is treated as "not
+    stale" and never triggers a spurious redeploy.
+    """
+    return binary_mismatch_value(binary_sha, desired_sha) == 1.0
+
+
 # --------------------------------------------------------------------------- #
 # IO helpers
 # --------------------------------------------------------------------------- #
@@ -237,13 +256,17 @@ def _binary_sha() -> str | None:
         return None
 
 
-def _publish_binary_mismatch_metric(desired_sha: str | None) -> None:
+def _publish_binary_mismatch_metric(binary_sha: str | None, desired_sha: str | None) -> None:
     """B9 deploy provenance: publish tv_binary_main_sha_mismatch so the
     tv-<env>-binary-sha-stale alarm (Minimum >= 1 over 24h) can detect a
     running binary that lags main HEAD for a full day. Wrapped so the
-    watchdog's core stale-deploy dispatch job NEVER breaks on metric IO."""
+    watchdog's core stale-deploy dispatch job NEVER breaks on metric IO.
+
+    `binary_sha` is passed in (read ONCE per fire in the handler) so the
+    metric and the box-binary staleness dispatch decision share the same value.
+    """
     try:
-        value = binary_mismatch_value(_binary_sha(), desired_sha)
+        value = binary_mismatch_value(binary_sha, desired_sha)
         if value is None:
             logger.info("binary/main mismatch metric skipped — a sha is unknown")
             return
@@ -286,35 +309,85 @@ def lambda_handler(event: dict[str, Any], _context: Any = None) -> dict[str, Any
     """Entry point. Idempotent — safe to run on every 5-minutes-after schedule."""
     window = (event or {}).get("window", "unknown")
     desired = _desired_sha()
+    # Read the on-box binary provenance sha ONCE per fire — used BOTH for the
+    # 24h mismatch metric and the ground-truth box-binary staleness check below.
+    binary = _binary_sha()
     # B9 deploy provenance: sample binary-vs-main drift on every fire (the
     # 24h alarm needs samples; a None value is silently skipped).
-    _publish_binary_mismatch_metric(desired)
+    _publish_binary_mismatch_metric(binary, desired)
     deployed = _deployed_sha()
-    stale = is_stale(desired, deployed)
+
+    # Two INDEPENDENT staleness signals, OR-ed so we never REDUCE detection:
+    #   * github_stale — main HEAD != head_sha of the last SUCCESSFUL deploy-aws
+    #     run. Best-effort: a green off-hours no-op SKIP run (box down) concludes
+    #     `success` with head_sha = the merged commit, so this signal can be
+    #     FOOLED into "deployed" while the box actually booted stale. It also
+    #     became less reliable now that the post-merge catch-up dispatcher can
+    #     create such skip runs for bot merges (postmerge-catchup.yml).
+    #   * binary_stale — the ON-BOX running binary's provenance sha != main HEAD.
+    #     GROUND TRUTH: the SSM param only advances on a verified swap, so a skip
+    #     run can never fool it. This is the deterministic box-start catch for a
+    #     "auto-started on the previous binary" boot (2026-07-09 outage class).
+    github_stale = is_stale(desired, deployed)
+    binary_stale = binary_is_stale(binary, desired)
+    stale = github_stale or binary_stale
     logger.info(
-        "deploy-watchdog window=%s desired=%s deployed=%s stale=%s",
+        "deploy-watchdog window=%s desired=%s deployed=%s binary=%s "
+        "github_stale=%s binary_stale=%s stale=%s",
         window,
         (desired or "")[:8],
         (deployed or "")[:8],
+        (binary or "")[:8],
+        github_stale,
+        binary_stale,
         stale,
     )
 
     if not stale:
         # Healthy OR uncertain — stay silent (no spam, no spurious deploy).
-        return {"window": window, "stale": False, "dispatched": False}
+        return {
+            "window": window,
+            "stale": False,
+            "github_stale": github_stale,
+            "binary_stale": binary_stale,
+            "dispatched": False,
+        }
 
     dispatched = _dispatch_deploy()
-    _publish(
-        "Deploy watchdog: GitHub cron missed — redeploy triggered",
-        (
+    # Name the box-binary case explicitly so the operator knows the box is
+    # RUNNING old code right now (vs. just a late deploy pipeline).
+    if binary_stale:
+        subject = "Deploy watchdog: box booted on STALE code — redeploy triggered"
+        detail = (
+            f"⚠️ The box is RUNNING an old build: its binary is {(binary or '')[:8]} but "
+            f"main is at {(desired or '')[:8]}"
+        )
+    else:
+        subject = "Deploy watchdog: GitHub cron missed — redeploy triggered"
+        detail = (
             f"⚠️ The {window} auto-deploy did not land: main is at {(desired or '')[:8]} but "
-            f"the last successful deploy was {(deployed or '')[:8]}. The AWS watchdog "
+            f"the last successful deploy was {(deployed or '')[:8]}"
+        )
+    _publish(
+        subject,
+        (
+            f"{detail}. The AWS watchdog "
             f"{'TRIGGERED' if dispatched else 'FAILED to trigger'} the redeploy "
             f"({GH_DISPATCH_WORKFLOW}). It is idempotent + market-hours-guarded, so it is safe. "
             f"{'No action needed — confirm the deploy run goes green.' if dispatched else 'ACTION: dispatch the deploy manually.'}"
         ),
     )
     logger.warning(
-        "stale deploy detected (window=%s) — dispatched=%s", window, dispatched
+        "stale deploy detected (window=%s github_stale=%s binary_stale=%s) — dispatched=%s",
+        window,
+        github_stale,
+        binary_stale,
+        dispatched,
     )
-    return {"window": window, "stale": True, "dispatched": dispatched}
+    return {
+        "window": window,
+        "stale": True,
+        "github_stale": github_stale,
+        "binary_stale": binary_stale,
+        "dispatched": dispatched,
+    }
