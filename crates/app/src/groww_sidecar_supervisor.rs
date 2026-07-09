@@ -343,6 +343,56 @@ pub const GROWW_SIDECAR_REQUIREMENTS_DEFAULT: &str = "scripts/groww-sidecar/requ
 /// feed (no first tick yet) is never killed by this watchdog.
 pub const FEED_STALL_RESTART_SECS: u64 = 30;
 
+/// Never-streamed-first-tick restart threshold (seconds) — the 2026-07-09
+/// reject-loop hardening. [`should_restart_on_stall`] deliberately refuses to
+/// fire when NO first tick was ever recorded this session (`age == None`), so a
+/// sidecar that is alive + connected + subscribed but NEVER streams (the
+/// all-day 09:22/14:17 IST `SidecarLineClass::Error` loop) was NEVER restarted
+/// by the watchdog. This arm closes that hole: once the feed has been inside
+/// the EXCHANGE session ([09:15, 15:30) IST on a trading day) with no first
+/// tick for longer than this, the child is killed + relaunched exactly like a
+/// stall restart. 300s (the upper end of the 3–5 min band) means the earliest
+/// possible fire is 09:20:05 IST — safely past any slow session start, and far
+/// above the sidecar's own auth+connect+subscribe worst path.
+pub const FEED_NEVER_STREAMED_RESTART_SECS: u64 = 300;
+
+/// Bounded length (chars) of the sanitized sidecar-line SIGNATURE captured
+/// into the FEED-REJECT-01 coded error stream. Long enough for the sidecar's
+/// `groww sidecar error [<phase>]: <Type>: <detail>` prefix + the identifying
+/// cause text; short enough that errors.jsonl / CloudWatch rows stay compact.
+pub const SIDECAR_LINE_SIGNATURE_MAX_CHARS: usize = 160;
+
+/// Cross-child cooldown (seconds) on the SINGLE-CONN GrowwSidecarRejected
+/// Telegram page (2026-07-09 hostile-review HIGH fix). The per-child `alerted`
+/// latch bounds pages to one per CHILD — but the never-streamed arm relaunches
+/// a persistently-rejected child every ~5 minutes, and each fresh child gets a
+/// fresh latch, so a reject day would page ~12×/hour (~70 HIGH pages/session:
+/// pager fatigue, audit Rule 4). The page gate (a supervisor-lifetime
+/// last-page timestamp shared across children) bounds the SAME-condition page
+/// to at most one per this window; every suppressed episode still fires its
+/// per-line `error!` forwards, its FEED-REJECT-01 signature, and its
+/// feed-health marking — only the Telegram fan-out is cooled down. The
+/// ≥3-per-15-min restart-counter pager independently covers "it keeps
+/// failing".
+pub const GROWW_REJECT_PAGE_COOLDOWN_SECS: u64 = 1800;
+
+/// Pure page-cooldown decision for the reject Telegram (2026-07-09 HIGH fix).
+/// `last_page_epoch_secs == 0` means no page has fired this supervisor
+/// lifetime → page (rising edge is never delayed). Otherwise page only when
+/// the cooldown has fully elapsed. Backward clock steps saturate to 0 elapsed
+/// → suppressed (safe: at worst one delayed page, never a storm). O(1).
+#[must_use]
+pub fn should_page_reject(
+    now_epoch_secs: u64,
+    last_page_epoch_secs: u64,
+    cooldown_secs: u64,
+) -> bool {
+    if last_page_epoch_secs == 0 {
+        return true;
+    }
+    now_epoch_secs.saturating_sub(last_page_epoch_secs) >= cooldown_secs
+}
+
 /// Stall-watchdog poll cadence (seconds). Cheap: one relaxed atomic load per tick.
 pub const STALL_WATCHDOG_POLL_SECS: u64 = 1;
 
@@ -526,6 +576,62 @@ pub fn should_restart_on_stall(
         None => false,
         Some(age) => age > threshold_secs,
     }
+}
+
+/// FEED-AGNOSTIC never-streamed-first-tick restart decision (the 2026-07-09
+/// reject-loop hardening; companion of [`should_restart_on_stall`], which owns
+/// the `age == Some(_)` half of the space — this arm owns `age == None`).
+///
+/// Returns `true` ONLY when the feed is enabled, the caller-computed
+/// exchange-session gate is open (`g1_exchange_gate_accepts` [09:15, 15:30)
+/// IST AND `is_trading_session_now()` — weekday + NSE-holiday aware; the plain
+/// time-of-day [09:00, 15:30) gate the stall arm uses would restart-loop every
+/// Saturday), a never-streamed silence window is being TRACKED
+/// (`silent_session_secs == None` means the caller has not armed a window —
+/// fail-closed), and the continuous in-session no-first-tick silence STRICTLY
+/// exceeds `threshold_secs`. Pure + O(1), no feed-specific branch.
+#[must_use]
+pub fn should_restart_on_never_streamed(
+    silent_session_secs: Option<u64>,
+    in_exchange_session: bool,
+    enabled: bool,
+    threshold_secs: u64,
+) -> bool {
+    if !enabled || !in_exchange_session {
+        return false;
+    }
+    match silent_session_secs {
+        None => false,
+        Some(silent) => silent > threshold_secs,
+    }
+}
+
+/// Bounded, secret-redacted SIGNATURE of one sidecar diagnostic line for the
+/// FEED-REJECT-01 coded error stream. Pipeline: the existing
+/// [`tickvault_common::sanitize::capture_rest_error_body`] choke point
+/// (control-char strip → URL/credential-param redaction → JWT-shape redaction
+/// → credential-JSON-field redaction → 300-char cap) then a UTF-8-safe
+/// truncation to [`SIDECAR_LINE_SIGNATURE_MAX_CHARS`]. The sidecar already
+/// redacts its own secrets before printing; this is defense-in-depth so no
+/// token shape can ever ride the signature into errors.jsonl / CloudWatch.
+/// Pure, cold path (once per reject episode).
+/// Post-review hardening (2026-07-09 security pass, LOW): ALSO strips Unicode
+/// BiDi overrides/isolates + zero-widths + BOM — `char::is_control()` covers
+/// only Cc, not the Cf format chars `sanitize_audit_string` strips for the
+/// same terminal-spoofing reason — so a hostile diagnostic can never visually
+/// reorder/hide adjacent text when an operator tails the raw errors.jsonl.
+#[must_use]
+pub fn sidecar_line_signature(line: &str) -> String {
+    tickvault_common::sanitize::capture_rest_error_body(line)
+        .chars()
+        .filter(|c| {
+            !matches!(
+                c,
+                '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}' | '\u{200b}'..='\u{200f}' | '\u{feff}'
+            )
+        })
+        .take(SIDECAR_LINE_SIGNATURE_MAX_CHARS)
+        .collect()
 }
 
 /// Outcome of a supervised feed-supervisor task, used by [`should_respawn_supervisor`].
@@ -821,6 +927,8 @@ async fn ensure_python_env(opts: &GrowwSidecarOptions) -> anyhow::Result<()> {
 /// ONE typed Telegram event with a FIXED per-class reason (never the raw child
 /// text). The task ends naturally when the pipe closes (child exit). Non-blocking,
 /// cold-path. `pipe_name` is only a tracing label.
+// APPROVED: drain wiring — every arg is a distinct shared latch/gate resource
+#[allow(clippy::too_many_arguments)]
 fn spawn_pipe_drain<R>(
     pipe: R,
     pipe_name: &'static str,
@@ -832,6 +940,15 @@ fn spawn_pipe_drain<R>(
     // summary per 60s per direction across ALL connections); `None`
     // (single-conn path) keeps today's per-child semantics byte-identical.
     conn_id: Option<usize>,
+    // FEED-REJECT-01 per-child once latch (2026-07-09 review fix): shared by
+    // the two drains, re-armed ONLY on a streaming recovery — deliberately
+    // NOT by the fleet Suppress re-arm of `alerted`, so the coded signature
+    // emit can never become per-line spam on the fleet path.
+    detail_logged: Arc<std::sync::atomic::AtomicBool>,
+    // Cross-child single-conn page cooldown gate (2026-07-09 HIGH fix):
+    // supervisor-lifetime epoch-seconds of the last GrowwSidecarRejected
+    // page. See [`GROWW_REJECT_PAGE_COOLDOWN_SECS`].
+    reject_page_gate: Arc<std::sync::atomic::AtomicU64>,
 ) -> tokio::task::JoinHandle<()>
 where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
@@ -892,6 +1009,11 @@ where
             if class.clears_auth_rejected() {
                 feed_health.clear_auth_rejected(Feed::Groww);
                 alerted.store(false, std::sync::atomic::Ordering::Relaxed);
+                // Re-arm the FEED-REJECT-01 detail latch on the SAME recovery
+                // edge (and ONLY here — never on the fleet Suppress re-arm),
+                // so a NEW reject episode after a genuine recovery logs a
+                // fresh cause signature.
+                detail_logged.store(false, std::sync::atomic::Ordering::Relaxed);
                 // Fleet bookkeeping (exam-fix 2026-07-06): a streaming
                 // recovery clears this connection from the fleet reject set
                 // WITHOUT consuming the Connected direction's window (the
@@ -908,6 +1030,26 @@ where
                 // Edge-trigger: fire the operator-facing side-effects ONCE per
                 // running child, even if the same error prints 100×.
                 if !alerted.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    // FEED-REJECT-01 (2026-07-09 reject-loop hardening): capture
+                    // a BOUNDED, secret-redacted signature of the triggering
+                    // line into the CODED error stream so errors.jsonl /
+                    // CloudWatch can answer "WHY does the feed loop?" — the
+                    // Telegram wording stays the FIXED per-class reason (10
+                    // commandments; raw child text never reaches Telegram).
+                    // Bounded by its OWN per-child latch (review fix: the fleet
+                    // Suppress arm re-arms `alerted`, which would have made
+                    // this emit per-line on the fleet path) — once per child
+                    // episode, re-armed only by a streaming recovery.
+                    if !detail_logged.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                        error!(
+                            code = ErrorCode::FeedReject01SidecarErrorDetail.code_str(),
+                            feed = Feed::Groww.as_str(),
+                            class = ?class,
+                            signature = %sidecar_line_signature(&line),
+                            "[feeds] FEED-REJECT-01: sidecar reject/error episode opened — \
+                             bounded cause signature captured (Telegram wording unchanged)"
+                        );
+                    }
                     // Latch the actionable auth-rejected RED ONLY for a CONFIRMED
                     // auth / entitlement reject — NOT for the generic transient
                     // `Error` class. `Error` keeps its `error!` log + this Telegram
@@ -932,10 +1074,46 @@ where
                         };
                         match global_fleet_alert_decision(conn_id, FleetAlertKind::Reject) {
                             FleetAlertDecision::Passthrough => {
-                                notifier.notify(NotificationEvent::GrowwSidecarRejected {
-                                    reason: reason.to_string(),
-                                    fleet_summary: false,
-                                });
+                                // Cross-child page cooldown (2026-07-09
+                                // hostile-review HIGH fix): the never-streamed
+                                // arm relaunches a persistently-rejected child
+                                // every ~5 min, and each fresh child re-fires
+                                // this once-per-child page — ~12 HIGH pages/hr
+                                // without a cross-child bound. Page at most
+                                // once per GROWW_REJECT_PAGE_COOLDOWN_SECS per
+                                // supervisor; suppressed episodes keep their
+                                // error! forwards + FEED-REJECT-01 signature +
+                                // feed-health marking, and the ≥3-per-15-min
+                                // restart pager independently covers "it keeps
+                                // failing". CAS so the two drains never
+                                // double-page the same window.
+                                let now_secs =
+                                    u64::try_from(chrono::Utc::now().timestamp()).unwrap_or(0);
+                                let last =
+                                    reject_page_gate.load(std::sync::atomic::Ordering::Relaxed);
+                                if should_page_reject(
+                                    now_secs,
+                                    last,
+                                    GROWW_REJECT_PAGE_COOLDOWN_SECS,
+                                ) && reject_page_gate
+                                    .compare_exchange(
+                                        last,
+                                        now_secs.max(1),
+                                        std::sync::atomic::Ordering::Relaxed,
+                                        std::sync::atomic::Ordering::Relaxed,
+                                    )
+                                    .is_ok()
+                                {
+                                    notifier.notify(NotificationEvent::GrowwSidecarRejected {
+                                        reason: reason.to_string(),
+                                        fleet_summary: false,
+                                    });
+                                } else {
+                                    metrics::counter!(
+                                        "tv_groww_reject_page_cooldown_suppressed_total",
+                                    )
+                                    .increment(1);
+                                }
                             }
                             FleetAlertDecision::EmitSummary {
                                 affected,
@@ -1019,9 +1197,16 @@ async fn supervise_child(
     // §34 fleet identity (exam-fix 2026-07-06) — forwarded to the pipe
     // drains so fleet children route Telegram through the fleet coalescer.
     conn_id: Option<usize>,
+    // Cross-child page cooldown gate (2026-07-09 HIGH fix) — supervisor
+    // lifetime, so a fresh child's fresh `alerted` latch can no longer page
+    // every ~5-min never-streamed relaunch.
+    reject_page_gate: &Arc<std::sync::atomic::AtomicU64>,
 ) -> SuperviseOutcome {
     // One latch per running child so the alert fires at most once per instance.
     let alerted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // FEED-REJECT-01 detail latch — per child, shared by both drains, re-armed
+    // only by a streaming recovery (never by the fleet Suppress re-arm).
+    let detail_logged = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let mut drains: Vec<tokio::task::JoinHandle<()>> = Vec::new();
     if let Some(stdout) = child.stdout.take() {
         drains.push(spawn_pipe_drain(
@@ -1031,6 +1216,8 @@ async fn supervise_child(
             notifier.clone(),
             Arc::clone(&alerted),
             conn_id,
+            Arc::clone(&detail_logged),
+            Arc::clone(reject_page_gate),
         ));
     }
     if let Some(stderr) = child.stderr.take() {
@@ -1041,6 +1228,8 @@ async fn supervise_child(
             notifier.clone(),
             Arc::clone(&alerted),
             conn_id,
+            Arc::clone(&detail_logged),
+            Arc::clone(reject_page_gate),
         ));
     }
     let abort_drains = || {
@@ -1048,6 +1237,15 @@ async fn supervise_child(
             h.abort();
         }
     };
+    // Never-streamed-first-tick window (2026-07-09 reject-loop hardening):
+    // IST epoch-seconds instant at which we FIRST observed (exchange session
+    // open + feed enabled + no first tick ever recorded this session). Cleared
+    // the moment a first tick arrives (the stall arm owns liveness from then
+    // on) or the session gate closes (pre-open / weekend / holiday time can
+    // never count toward the threshold). Per-child by construction — a fresh
+    // relaunched child gets the full threshold again, bounding the restart
+    // cadence for a never-streaming feed to ~one per threshold window.
+    let mut never_streamed_open_since: Option<u64> = None;
     loop {
         tokio::select! {
             exit = child.wait() => {
@@ -1131,6 +1329,107 @@ async fn supervise_child(
                         SuperviseOutcome::StallRestart
                     };
                 }
+                // NEVER-STREAMED arm (2026-07-09 reject-loop hardening). The
+                // stall arm above requires a KNOWN last-tick, so a sidecar that
+                // is alive + connected + subscribed but has NEVER streamed a
+                // first tick this session (the all-day 09:22/14:17 IST
+                // Error-class reject loop) was never restarted. Track the
+                // continuous (exchange-session-open ∧ enabled ∧ no-first-tick)
+                // window and kill + relaunch past the threshold — same
+                // relaunch path, same storm bound, distinct attribution
+                // counter. Gated on the [09:15, 15:30) EXCHANGE session AND
+                // the trading-day calendar (NOT the plain time-of-day
+                // market-hours gate the stall arm uses — that one is true on a
+                // Saturday 10:00 IST and would restart-loop every weekend).
+                if age.is_some() {
+                    // First tick arrived this session — the stall arm owns
+                    // liveness from here on; this arm disarms permanently
+                    // (age can never return to None within this APP PROCESS —
+                    // feed_health's last-tick stamp never resets in-process, so
+                    // on day 2 of a long-running process this arm is dormant
+                    // and the classic stall arm owns everything: no coverage
+                    // hole, documented review LOW).
+                    never_streamed_open_since = None;
+                } else {
+                    let now_nanos = now_ist_nanos();
+                    let nanos_of_day = now_nanos.rem_euclid(
+                        i64::from(tickvault_common::constants::SECONDS_PER_DAY) * 1_000_000_000,
+                    );
+                    // NOTE (review LOW): `g1_exchange_gate_accepts` is used
+                    // here as a pure [09:15, 15:30) WALL-CLOCK window
+                    // predicate for a supervision gate — NOT as a
+                    // tick-persistence gate; the G1-vs-G2 doctrine in
+                    // constants.rs (exchange-ts vs receipt-clock + grace)
+                    // governs tick WRITE decisions, which this arm never
+                    // touches. No grace tail is wanted here: a restart at
+                    // 15:30:00 would be pointless churn.
+                    let in_exchange_session =
+                        tickvault_common::constants::g1_exchange_gate_accepts(nanos_of_day)
+                            && tickvault_common::market_hours::is_trading_session_now();
+                    if !(in_exchange_session && enabled) {
+                        never_streamed_open_since = None;
+                    } else {
+                        // APPROVED: IST epoch nanos are always positive; max(0) guards the cast
+                        #[allow(clippy::cast_sign_loss)]
+                        let now_secs = (now_nanos / 1_000_000_000).max(0) as u64;
+                        let since = *never_streamed_open_since.get_or_insert(now_secs);
+                        let silent_secs = now_secs.saturating_sub(since);
+                        if should_restart_on_never_streamed(
+                            Some(silent_secs),
+                            in_exchange_session,
+                            enabled,
+                            FEED_NEVER_STREAMED_RESTART_SECS,
+                        ) {
+                            let is_storm = storm.record_and_is_storm(now_secs);
+                            if is_storm {
+                                error!(
+                                    code = ErrorCode::FeedStall01SidecarRestarted.code_str(),
+                                    feed = feed.as_str(),
+                                    silent_session_secs = silent_secs,
+                                    reason = "never_streamed",
+                                    rapid_restarts = storm.count_in_window(),
+                                    "[feeds] sidecar NEVER-STREAMED RESTART STORM — connected but \
+                                     no first tick this session and flapping; applying backoff \
+                                     ceiling (still retrying, never giving up in market hours)"
+                                );
+                            } else {
+                                warn!(
+                                    code = ErrorCode::FeedStall01SidecarRestarted.code_str(),
+                                    feed = feed.as_str(),
+                                    silent_session_secs = silent_secs,
+                                    reason = "never_streamed",
+                                    "[feeds] sidecar alive + subscribed but NEVER streamed a first \
+                                     tick this session during exchange hours — killing + \
+                                     relaunching (re-auth + re-subscribe)"
+                                );
+                            }
+                            // Route into the SAME pre-registered counter the
+                            // ≥3-per-15-min restart pager reads (a persistent
+                            // never-streamed loop MUST page) + a distinct
+                            // attribution counter for the split.
+                            metrics::counter!(
+                                "tv_feed_sidecar_stall_restart_total",
+                                "feed" => feed.as_str(),
+                            )
+                            .increment(1);
+                            metrics::counter!(
+                                "tv_feed_sidecar_never_streamed_restart_total",
+                                "feed" => feed.as_str(),
+                            )
+                            .increment(1);
+                            if let Err(err) = child.start_kill() {
+                                warn!(error = %err, feed = feed.as_str(), "[feeds] sidecar never-streamed-kill signal failed (already exiting?)");
+                            }
+                            let _status = child.wait().await;
+                            abort_drains();
+                            return if is_storm {
+                                SuperviseOutcome::Exited
+                            } else {
+                                SuperviseOutcome::StallRestart
+                            };
+                        }
+                    }
+                }
             }
         }
     }
@@ -1184,6 +1483,10 @@ pub async fn run_groww_sidecar_supervisor(
     // rapid stall-restarts escalate + hit the backoff ceiling instead of a tight
     // kill loop. Persists across child launches for the supervisor's lifetime.
     let mut storm = StallRestartStorm::default();
+    // Cross-child reject-page cooldown gate (2026-07-09 HIGH fix): epoch secs
+    // of the last GrowwSidecarRejected Telegram page, shared across every
+    // child this supervisor launches. 0 = never paged.
+    let reject_page_gate = Arc::new(std::sync::atomic::AtomicU64::new(0));
     loop {
         if !feed_runtime.is_enabled(Feed::Groww) {
             sleep(SIDECAR_DISABLE_POLL).await;
@@ -1316,6 +1619,7 @@ pub async fn run_groww_sidecar_supervisor(
             now_ist_nanos_wall,
             &mut storm,
             opts.conn_id,
+            &reject_page_gate,
         )
         .await;
         match outcome {
@@ -2591,5 +2895,254 @@ mod tests {
         assert_eq!(fleet_reconcile_actions(5, 2), FleetAction::KillNewestTo(2));
         assert_eq!(fleet_reconcile_actions(2, 2), FleetAction::Steady);
         assert_eq!(fleet_reconcile_actions(0, 0), FleetAction::Steady);
+    }
+
+    // ── 2026-07-09 reject-loop hardening: never-streamed restart arm ─────────
+
+    #[test]
+    fn test_should_restart_on_never_streamed_fires_past_threshold_in_session() {
+        // In the exchange session, feed enabled, no first tick ever, silence
+        // past the threshold → restart (today's all-day reject-loop case).
+        assert!(should_restart_on_never_streamed(
+            Some(FEED_NEVER_STREAMED_RESTART_SECS + 1),
+            true,
+            true,
+            FEED_NEVER_STREAMED_RESTART_SECS
+        ));
+    }
+
+    #[test]
+    fn test_should_restart_on_never_streamed_boundary_and_gates() {
+        // Strict `>`: exactly AT the threshold must NOT fire.
+        assert!(!should_restart_on_never_streamed(
+            Some(FEED_NEVER_STREAMED_RESTART_SECS),
+            true,
+            true,
+            FEED_NEVER_STREAMED_RESTART_SECS
+        ));
+        // Out of the exchange session (pre-open / weekend / holiday) → never.
+        assert!(!should_restart_on_never_streamed(
+            Some(FEED_NEVER_STREAMED_RESTART_SECS + 100),
+            false,
+            true,
+            FEED_NEVER_STREAMED_RESTART_SECS
+        ));
+        // Feed disabled → the toggle wins; never restart.
+        assert!(!should_restart_on_never_streamed(
+            Some(FEED_NEVER_STREAMED_RESTART_SECS + 100),
+            true,
+            false,
+            FEED_NEVER_STREAMED_RESTART_SECS
+        ));
+        // No tracked window (caller has not armed one) → fail-closed.
+        assert!(!should_restart_on_never_streamed(
+            None,
+            true,
+            true,
+            FEED_NEVER_STREAMED_RESTART_SECS
+        ));
+        // Zero silence (window just armed) → never.
+        assert!(!should_restart_on_never_streamed(
+            Some(0),
+            true,
+            true,
+            FEED_NEVER_STREAMED_RESTART_SECS
+        ));
+    }
+
+    #[test]
+    fn test_never_streamed_constants_sane() {
+        // The never-streamed threshold MUST be far above the stall threshold
+        // (the arms own disjoint halves of the age space, but the
+        // never-streamed case includes the sidecar's own auth+connect+
+        // subscribe worst path) and inside the operator-approved 3–5 min
+        // band. Earliest possible fire = 09:15:00 + threshold — must stay
+        // clear of a slow session start.
+        assert!(FEED_NEVER_STREAMED_RESTART_SECS > FEED_STALL_RESTART_SECS);
+        assert!((180..=600).contains(&FEED_NEVER_STREAMED_RESTART_SECS));
+        // The signature bound is compact but big enough for the sidecar's
+        // `groww sidecar error [<phase>]: <Type>: <detail>` prefix.
+        assert!((80..=300).contains(&SIDECAR_LINE_SIGNATURE_MAX_CHARS));
+    }
+
+    #[test]
+    fn test_never_streamed_arm_is_wired_into_supervise_child() {
+        // SEAM GUARD (house pattern of test_stall_restart_reuses_existing_
+        // relaunch_path): the never-streamed arm must (a) consult the pure
+        // decision fn, (b) gate on the [09:15, 15:30) exchange session AND
+        // the trading-day calendar (NOT the plain time-of-day gate — that
+        // one is true on a Saturday 10:00 IST), (c) route into the SAME
+        // pre-registered stall-restart counter the ≥3-per-15-min pager
+        // reads, PLUS the distinct attribution counter, and (d) return
+        // through the existing SuperviseOutcome relaunch seam.
+        let src = include_str!("groww_sidecar_supervisor.rs");
+        assert!(
+            src.contains("should_restart_on_never_streamed("),
+            "supervise_child must consult the pure never-streamed decision"
+        );
+        assert!(
+            src.contains("g1_exchange_gate_accepts") && src.contains("is_trading_session_now()"),
+            "the never-streamed arm must gate on the exchange session + trading-day calendar"
+        );
+        assert!(
+            src.contains("\"tv_feed_sidecar_never_streamed_restart_total\""),
+            "the never-streamed arm must increment its attribution counter"
+        );
+        let needle = "\"tv_feed_sidecar_never_streamed_restart_total\"";
+        let has_increment = src.match_indices(needle).any(|(i, _)| {
+            let window_end = (i + 200).min(src.len());
+            src[i..window_end].contains(".increment(1)")
+        });
+        assert!(
+            has_increment,
+            "the attribution counter must have a real .increment(1) site"
+        );
+        assert!(
+            src.contains("reason = \"never_streamed\""),
+            "the FEED-STALL-01 warn/error lines must carry the never_streamed reason"
+        );
+    }
+
+    #[test]
+    fn test_never_streamed_counter_is_preregistered_in_main() {
+        // Mirror of test_stall_restart_counter_is_preregistered_after_
+        // recorder_install for the attribution counter: registration must
+        // live in main.rs AFTER the metrics recorder install (a pre-install
+        // registration resolves to the no-op recorder).
+        let main_src = include_str!("main.rs");
+        let install = main_src
+            .find("observability::init_metrics(")
+            .expect("the metrics recorder install site must exist in main.rs");
+        let reg = main_src
+            .find("\"tv_feed_sidecar_never_streamed_restart_total\"")
+            .expect("main.rs must pre-register tv_feed_sidecar_never_streamed_restart_total");
+        assert!(
+            install < reg,
+            "the never-streamed counter registration must come AFTER init_metrics"
+        );
+    }
+
+    // ── 2026-07-09 hostile-review HIGH fix: cross-child page cooldown ────────
+
+    #[test]
+    fn test_should_page_reject_rising_edge_and_cooldown() {
+        // Never paged this supervisor lifetime → page immediately (rising edge).
+        assert!(should_page_reject(
+            1_000,
+            0,
+            GROWW_REJECT_PAGE_COOLDOWN_SECS
+        ));
+        // Inside the cooldown → suppressed (the ~5-min never-streamed relaunch
+        // cadence can no longer produce ~12 HIGH pages/hour).
+        assert!(!should_page_reject(
+            1_000 + GROWW_REJECT_PAGE_COOLDOWN_SECS - 1,
+            1_000,
+            GROWW_REJECT_PAGE_COOLDOWN_SECS
+        ));
+        // Cooldown fully elapsed → page again (a persisting condition still
+        // reaches the operator at a bounded cadence).
+        assert!(should_page_reject(
+            1_000 + GROWW_REJECT_PAGE_COOLDOWN_SECS,
+            1_000,
+            GROWW_REJECT_PAGE_COOLDOWN_SECS
+        ));
+        // Backward clock step → elapsed saturates to 0 → suppressed, never a
+        // panic or a storm.
+        assert!(!should_page_reject(
+            500,
+            1_000,
+            GROWW_REJECT_PAGE_COOLDOWN_SECS
+        ));
+        // Cooldown bound sanity: strictly above the never-streamed cadence so
+        // the fix actually bounds the storm, and at most one page per 30 min.
+        assert!(GROWW_REJECT_PAGE_COOLDOWN_SECS > FEED_NEVER_STREAMED_RESTART_SECS);
+        assert!(GROWW_REJECT_PAGE_COOLDOWN_SECS <= 3_600);
+    }
+
+    #[test]
+    fn test_reject_page_cooldown_is_wired_into_passthrough_arm() {
+        // SEAM GUARD: the single-conn Passthrough Telegram fan-out must be
+        // gated by should_page_reject on the supervisor-lifetime gate (the
+        // 2026-07-09 HIGH page-storm fix), with the suppression counted; and
+        // the FEED-REJECT-01 emit must be bounded by its OWN detail latch
+        // (never the fleet-Suppress-re-armed `alerted` latch).
+        let src = include_str!("groww_sidecar_supervisor.rs");
+        assert!(
+            src.contains("should_page_reject(") && src.contains("reject_page_gate"),
+            "the Passthrough page must consult the cross-child cooldown gate"
+        );
+        assert!(
+            src.contains("\"tv_groww_reject_page_cooldown_suppressed_total\""),
+            "a suppressed page must be counted (never silent)"
+        );
+        assert!(
+            src.contains("detail_logged.swap(true"),
+            "the FEED-REJECT-01 emit must be bounded by its own per-child latch"
+        );
+    }
+
+    // ── 2026-07-09 reject-loop hardening: FEED-REJECT-01 cause signature ─────
+
+    #[test]
+    fn test_sidecar_line_signature_caps_redacts_and_strips() {
+        // (a) Length cap: a long line truncates to the bound, UTF-8-safe.
+        let long_line = format!(
+            "groww sidecar error [consume]: TimeoutError: {} — reconnecting",
+            "é".repeat(400)
+        );
+        let sig = sidecar_line_signature(&long_line);
+        assert!(sig.chars().count() <= SIDECAR_LINE_SIGNATURE_MAX_CHARS);
+        assert!(sig.starts_with("groww sidecar error [consume]: TimeoutError:"));
+
+        // (b) JWT-shape redaction: a token that somehow survived the
+        // sidecar's own redaction can never ride the signature.
+        let jwt_line = "groww sidecar error [feed-connect]: ConnectError: bearer \
+             eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJncm93dyJ9.abcdefghijklmnop — reconnecting in 5s";
+        let sig = sidecar_line_signature(jwt_line);
+        assert!(!sig.contains("eyJhbGciOiJIUzI1NiJ9"), "{sig}");
+        assert!(sig.contains("[REDACTED-JWT]"), "{sig}");
+
+        // (c) Control-char strip: no newline injection into the one-line
+        // log field (defense-in-depth — next_line() already splits).
+        let ctl_line = "groww sidecar error [subscribe]: X\u{0}Y\rZ";
+        let sig = sidecar_line_signature(ctl_line);
+        assert!(!sig.chars().any(char::is_control), "{sig}");
+
+        // (c2) BiDi/zero-width strip (2026-07-09 security pass, LOW):
+        // Cf-category format chars are NOT char::is_control — strip them so
+        // a hostile diagnostic can't visually reorder terminal output.
+        let bidi_line = "groww sidecar error [consume]: A\u{202e}B\u{2066}C\u{200b}D\u{feff}E";
+        let sig = sidecar_line_signature(bidi_line);
+        assert!(
+            !sig.chars().any(|c| matches!(
+                c,
+                '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}' | '\u{200b}'..='\u{200f}' | '\u{feff}'
+            )),
+            "{sig}"
+        );
+        assert!(sig.ends_with("ABCDE"), "{sig}");
+
+        // (d) A clean short line passes through recognizably.
+        let clean = "groww sidecar error [auth]: RuntimeError: SSM parameter holds no usable token";
+        assert_eq!(sidecar_line_signature(clean), clean);
+    }
+
+    #[test]
+    fn test_feed_reject_emit_is_wired_into_alert_edge() {
+        // SEAM GUARD: the FEED-REJECT-01 coded emit (the bounded cause
+        // signature) must live inside the once-per-child alert edge in
+        // spawn_pipe_drain — carrying the code field (tag-guard law), the
+        // class, and the sanitized signature. Deleting it re-blinds the
+        // coded stream to WHY a reject loop repeats (the 2026-07-09
+        // incident class).
+        let src = include_str!("groww_sidecar_supervisor.rs");
+        assert!(
+            src.contains("ErrorCode::FeedReject01SidecarErrorDetail.code_str()"),
+            "spawn_pipe_drain must emit the FEED-REJECT-01 coded error"
+        );
+        assert!(
+            src.contains("signature = %sidecar_line_signature(&line)"),
+            "the FEED-REJECT-01 emit must carry the bounded sanitized signature"
+        );
     }
 }

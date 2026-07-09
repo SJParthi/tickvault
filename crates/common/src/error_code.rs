@@ -751,6 +751,17 @@ pub enum ErrorCode {
     /// resumes on respawn. Severity::High (a supervisor that keeps dying points at
     /// a real bug), auto-triage-safe (the respawn already self-healed).
     FeedSupervisor01Respawned,
+    /// FEED-REJECT-01 (2026-07-09) — a live-feed sidecar opened an
+    /// operator-actionable reject/error episode (the once-per-child alert edge
+    /// that fires the fixed-wording Telegram), and the supervisor captured a
+    /// BOUNDED (≤160 chars), secret-redacted SIGNATURE of the triggering
+    /// sidecar diagnostic line into the coded error stream. Closes the
+    /// 2026-07-09 all-day reject-loop blindness: the Telegram wording is fixed
+    /// per class (10-commandments correct), so without this code the operator
+    /// (and triage) could not query errors.jsonl / CloudWatch for WHY the loop
+    /// repeats. Severity::High, auto-triage-safe (visibility only — the
+    /// restart/backoff machinery already owns recovery).
+    FeedReject01SidecarErrorDetail,
     /// HTTP-CLIENT-01 (C2 2026-07-03) — `reqwest::ClientBuilder::build()`
     /// failed (TLS backend init / resolver init / fd exhaustion). Previously
     /// 8 storage sites fell back to `Client::new()`, which PANICS on the
@@ -1028,6 +1039,8 @@ impl ErrorCode {
             Self::GrowwMaster01PersistFailed => "GROWW-MASTER-01",
             Self::FeedStall01SidecarRestarted => "FEED-STALL-01",
             Self::FeedSupervisor01Respawned => "FEED-SUPERVISOR-01",
+            // 2026-07-09: bounded sidecar reject-cause signature surfacing
+            Self::FeedReject01SidecarErrorDetail => "FEED-REJECT-01",
             // C2 (2026-07-03): panic-free reqwest client construction
             Self::HttpClient01BuildFailed => "HTTP-CLIENT-01",
             // §34 (2026-07-03): Groww multi-connection auto-scale ladder
@@ -1163,6 +1176,11 @@ impl ErrorCode {
             // persistent provider-side reject).
             | Self::FeedStall01SidecarRestarted
             | Self::FeedSupervisor01Respawned
+            // FEED-REJECT-01 (2026-07-09) — a sidecar reject/error episode
+            // opened; the coded line carries the bounded cause signature the
+            // operator needs to triage a recurring reject loop. High: it
+            // accompanies the HIGH GrowwSidecarRejected Telegram page.
+            | Self::FeedReject01SidecarErrorDetail
             // BP-08 (2026-07-01) — fd / RSS / spill-free early-warning
             // monitors: page at 80% so the operator acts before exhaustion.
             | Self::Resource01FdCountHigh
@@ -1455,7 +1473,9 @@ impl ErrorCode {
                 ".claude/rules/project/groww-shared-master-error-codes.md"
             }
             // 2026-06-30: feed-agnostic sidecar stall-watchdog + supervisor respawn
-            Self::FeedStall01SidecarRestarted | Self::FeedSupervisor01Respawned => {
+            Self::FeedStall01SidecarRestarted
+            | Self::FeedSupervisor01Respawned
+            | Self::FeedReject01SidecarErrorDetail => {
                 ".claude/rules/project/feed-stall-watchdog-error-codes.md"
             }
             // C2 (2026-07-03): panic-free reqwest client construction
@@ -1655,6 +1675,7 @@ impl ErrorCode {
             // 2026-06-30: feed-agnostic sidecar stall-watchdog + supervisor respawn
             Self::FeedStall01SidecarRestarted,
             Self::FeedSupervisor01Respawned,
+            Self::FeedReject01SidecarErrorDetail,
             // C2 (2026-07-03): panic-free reqwest client construction
             Self::HttpClient01BuildFailed,
             // §34 (2026-07-03): Groww multi-connection auto-scale ladder
@@ -1999,7 +2020,11 @@ mod tests {
         // before any WebSocket spawn on the fast crash-recovery arm; a
         // prefix-anchored 401/403 forces a re-mint via the existing
         // TokenManager machinery (2026-07-07 third morning outage).
-        assert_eq!(ErrorCode::all().len(), 135);
+        // 2026-07-09 (Groww reject-loop hardening): bumped 135 -> 136 for
+        // FEED-REJECT-01 — bounded, secret-redacted sidecar reject-cause
+        // signature surfaced at the once-per-child alert edge (the all-day
+        // 09:22/14:17 IST reject loop was invisible in the coded stream).
+        assert_eq!(ErrorCode::all().len(), 136);
     }
 
     #[test]
@@ -2204,6 +2229,8 @@ mod tests {
                 // 2026-06-30: feed-agnostic sidecar stall-watchdog + respawn
                 || s.starts_with("FEED-STALL-")
                 || s.starts_with("FEED-SUPERVISOR-")
+                // 2026-07-09: bounded sidecar reject-cause signature surfacing
+                || s.starts_with("FEED-REJECT-")
                 // Wave-4-E1 / BP-07 (2026-07-01): OOM-kill monitor.
                 || s.starts_with("PROC-")
                 // C2 (2026-07-03): panic-free reqwest client construction.
