@@ -81,3 +81,29 @@ def test_binary_mismatch_none_when_desired_unknown() -> None:
     assert handler.binary_mismatch_value("deadbee", None) is None
     assert handler.binary_mismatch_value("deadbee", "") is None
     assert handler.binary_mismatch_value("deadbee", "unknown") is None
+
+
+# --------------------------------------------------------------------------- #
+# binary_is_stale (pure) — the ground-truth box-start dispatch signal
+# --------------------------------------------------------------------------- #
+
+
+def test_binary_is_stale_true_when_box_binary_differs_from_main() -> None:
+    # The exact 2026-07-09 case: box booted on the previous binary.
+    assert handler.binary_is_stale("aaaaaaa" + "0" * 33, "bbbbbbb" + "0" * 33) is True
+
+
+def test_binary_is_stale_false_when_in_sync_short_vs_full() -> None:
+    full = "deadbeefcafe0123456789abcdef012345678901"
+    assert handler.binary_is_stale(full, "deadbee") is False
+    assert handler.binary_is_stale(full, full) is False
+
+
+def test_binary_is_stale_false_on_uncertainty_no_spurious_deploy() -> None:
+    # Never dispatch on uncertainty — an SSM/GitHub blip must not force a redeploy.
+    assert handler.binary_is_stale(None, "deadbee") is False
+    assert handler.binary_is_stale("", "deadbee") is False
+    assert handler.binary_is_stale("unknown", "deadbee") is False
+    assert handler.binary_is_stale("deadbee", None) is False
+    assert handler.binary_is_stale("deadbee", "") is False
+    assert handler.binary_is_stale("deadbee", "unknown") is False

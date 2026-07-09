@@ -8,6 +8,28 @@
 > **Ground truth:** `docs/architecture/aws-indices-only-locked-architecture.md` §5 (instance lock 2026-05-18) and the 2026-05-20 CloudWatch-only decision below.
 > **Scope:** Any file touching AWS deployment, infrastructure, Docker config, or cost-impacting changes.
 
+## COST NOTE 2026-07-06 — Silent-feed alerting hardening (+~$1.50/mo)
+
+The 2026-07-06 incident (Dhan feed degraded ALL day — lag p99 46s/max 199s,
+29-67 of 776 instruments silent every minute, 125 SLO crossings in the
+0.94-0.95 band, 9k-11.5k BOUNDARY-01 catch-up seals/10min — with ZERO pages)
+added, per `deploy/aws/terraform/silent-feed-alarms.tf` +
+`deploy/aws/terraform/app-alarms.tf` (tick-gap retune 100 → 40 PROVISIONAL —
+round-3 correction 2026-07-08: 25 sat below the documented ~33 always-silent
+healthy floor and would have paged every healthy day):
+
+- **+4 custom-metric series ≈ $1.20/mo:** 2× `tv_boundary_catchup_total`
+  under `[host, feed]` (dhan + groww, second EMF declaration), 1×
+  `tv_dhan_exchange_lag_p99_seconds`, 1× `tv_dhan_lag_samples_excluded_total`.
+- **+3 alarms ≈ $0.30/mo:** realtime-guarantee-degraded (0.80-0.95 dead-band),
+  boundary-catchup-storm-dhan (PROVISIONAL 2000/5m ×2 — re-ratchet after one
+  observed trading week), dhan-exchange-lag-p99-high (>10s ×10min). All
+  market-hours-gated (09:20-15:35 IST window Lambda), all
+  `treat_missing_data = notBreaching`.
+
+Total **≈ $1.50/mo pre-GST (~₹150/mo incl. 18% GST at ₹85/$)** — inside the
+$35/mo pre-GST budget alarm ceiling and the ~₹2,919/mo envelope.
+
 ## OPERATOR DECISION 2026-05-20 — Observability stack → CloudWatch-only
 
 > **Operator (Parthiban), 2026-05-20:** "except questdb app and cloud

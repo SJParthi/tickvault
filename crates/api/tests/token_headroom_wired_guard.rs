@@ -93,10 +93,21 @@ fn test_token_health_writer_is_dedicated_and_unconditional() {
          GET /health token headroom re-ghosts to a permanent 0.0h"
     );
     assert!(
-        fn_body.contains("health.set_token_valid(secs > 0)"),
-        "round-2 regression: spawn_token_health_writer no longer writes \
-         `set_token_valid` — /health + overall_status() read 'invalid'/\
-         'degraded' forever regardless of the real JWT state"
+        fn_body.contains("health.set_token_valid(token_health_writer_valid(secs, profile_ok))"),
+        "round-2/F15 regression: spawn_token_health_writer no longer writes \
+         `set_token_valid` via the pure profile-truth-aware derivation — \
+         either /health reads 'invalid'/'degraded' forever, or (the F15 \
+         split-brain) a Dhan-KILLED but locally-unexpired token reads \
+         valid on /health while tv_token_valid honestly reads 0.0"
+    );
+    // F15 (2026-07-08): the pure derivation ANDs local headroom with the
+    // mid-session watchdog's profile-truth flag (mirror of tv_token_valid).
+    let valid_fn = block_between(&src, "fn token_health_writer_valid(", "\n}");
+    assert!(
+        valid_fn.contains("secs > 0 && profile_valid"),
+        "F15 regression: token_health_writer_valid must AND local headroom \
+         (`secs > 0`, strictly-greater fail-closed) with the profile-truth \
+         flag — dropping either leg re-opens a token-validity false-OK"
     );
     assert!(
         fn_body.contains("gauge_token_headroom_secs(&feed_runtime)"),
@@ -166,7 +177,7 @@ fn test_self_test_recent_tick_uses_feed_level_freshest_age() {
     let src = read_app_main_src();
     let self_test_block = block_between(
         &src,
-        "if config.features.market_open_self_test {",
+        "if market_open_one_shots_first_spawn && config.features.market_open_self_test {",
         "config.features.realtime_guarantee_score",
     );
 

@@ -297,6 +297,28 @@ pub enum ErrorCode {
     /// reconcile. Severity::Critical — auth is dead until the secret is
     /// fixed. AUTH-P11 (audit 2026-07-01).
     AuthGap04TotpRotatedExternally,
+    /// AUTH-GAP-05: sustained mid-session token-invalid — the mid-session
+    /// profile watchdog observed the consecutive-REAL-`/v2/profile`-failure
+    /// threshold during market hours and forced exactly ONE token re-mint
+    /// per failing episode via the existing renewal machinery
+    /// (lock-before-mint honored fail-closed; ~125s Dhan mint cooldown
+    /// honored; retry-once latch). Severity::High — the re-mint IS the
+    /// self-remediation; the standing CRITICAL profile page covers the
+    /// unrecovered case. (2026-07-06.)
+    AuthGap05ForcedRemintTriggered,
+    /// AUTH-GAP-06: fast-boot cached-token validation (2026-07-08 —
+    /// third morning cached-token outage, 08:32–09:06 IST on 2026-07-07).
+    /// The FAST crash-recovery boot arm validates the CACHED Dhan JWT with
+    /// ONE `GET /v2/profile` BEFORE any WebSocket spawn. A prefix-anchored
+    /// 401/403 rejection forces a re-mint through the existing TokenManager
+    /// machinery (RESILIENCE-03 in-flight tripwire preserved; the fast arm
+    /// passes `None` for the dual-instance lock flag — the documented §3
+    /// residual of `dual-instance-lock-2026-07-04.md`, unchanged). Any
+    /// other failure shape (transient network, REST-surface 400/429/5xx,
+    /// parse) proceeds with the cached token after ONE bounded retry —
+    /// loudly, never blocking boot. Severity::High — the re-mint /
+    /// degraded-proceed is the self-remediation; the operator must see it.
+    AuthGap06FastBootCachedTokenValidation,
     /// BOOT-01: slow-boot QuestDB readiness deadline approaching (>30s).
     Boot01QuestDbSlow,
     /// BOOT-02: boot deadline exceeded (>60s) — HALTING.
@@ -827,6 +849,22 @@ pub enum ErrorCode {
     /// only — the production capture chain is untouched. Severity::Medium,
     /// auto-triage-safe.
     GrowwNative04WriterFailed,
+    /// FUTIDX-01 (§36 2026-07-08) — the nearest-expiry index-future selection
+    /// degraded for ≥1 of the 4 authorized underlyings on one feed (no FUT
+    /// rows / all expiries past / ambiguous duplicate expiry / unparsable
+    /// expiry). That feed runs WITHOUT that future for the day — degrade,
+    /// never HALT; the spot universe is unaffected. Severity::High,
+    /// auto-triage-safe (the degrade already happened; operator inspects the
+    /// day's master CSV + the alias-drift evidence payload at leisure).
+    Futidx01SelectionDegraded,
+    /// FUTIDX-02 (§36 2026-07-08) — the boot-time cross-feed comparator found
+    /// the Dhan and Groww builds chose DIFFERENT expiry dates (or one-sided
+    /// presence) for an index-future underlying. Both feeds STAY LIVE
+    /// (visibility, never a halt); cross-feed rows for that underlying are
+    /// not comparable that day. One vendor's master is stale/divergent —
+    /// operator compares the two masters' FUT rows and records a dated note.
+    /// Severity::High.
+    Futidx02CrossFeedExpiryMismatch,
 }
 
 impl ErrorCode {
@@ -894,6 +932,8 @@ impl ErrorCode {
             Self::Proc01OomKillDetected => "PROC-01",
             Self::AuthGap03TokenForceRenewedOnWake => "AUTH-GAP-03",
             Self::AuthGap04TotpRotatedExternally => "AUTH-GAP-04",
+            Self::AuthGap05ForcedRemintTriggered => "AUTH-GAP-05",
+            Self::AuthGap06FastBootCachedTokenValidation => "AUTH-GAP-06",
             Self::Boot01QuestDbSlow => "BOOT-01",
             Self::Boot02DeadlineExceeded => "BOOT-02",
             Self::Boot03ClockSkewExceeded => "BOOT-03",
@@ -1001,6 +1041,8 @@ impl ErrorCode {
             Self::GrowwNative02AuthFailed => "GROWW-NATIVE-02",
             Self::GrowwNative03DecodeFailed => "GROWW-NATIVE-03",
             Self::GrowwNative04WriterFailed => "GROWW-NATIVE-04",
+            Self::Futidx01SelectionDegraded => "FUTIDX-01",
+            Self::Futidx02CrossFeedExpiryMismatch => "FUTIDX-02",
         }
     }
 
@@ -1130,6 +1172,18 @@ impl ErrorCode {
             // host is under TLS/resolver/fd pressure; the site already
             // degraded gracefully, but the operator must see it (High).
             | Self::HttpClient01BuildFailed
+            // AUTH-GAP-05 (2026-07-06) — sustained mid-session token-invalid
+            // forced a re-mint. High: the re-mint IS the self-remediation
+            // (auto-triage safe); the existing CRITICAL profile page covers
+            // the unrecovered case.
+            | Self::AuthGap05ForcedRemintTriggered
+            // AUTH-GAP-06 (2026-07-08) — fast-boot cached-token validation:
+            // a Dhan-rejected cached token was re-minted before any WS
+            // spawn, or the validation degraded and boot proceeded loudly
+            // with the cached token. High: the action already self-applied;
+            // the operator must see every occurrence (a repeat every boot
+            // means the cache/mint chain is broken).
+            | Self::AuthGap06FastBootCachedTokenValidation
             // GROWW-SCALE-01/02 (§34 2026-07-03) — the auto-scale ladder
             // rolled back a failed rung / halved on fleet-wide failure. The
             // auto-correction already applied; the operator must see every
@@ -1137,6 +1191,12 @@ impl ErrorCode {
             // server-side cap).
             | Self::GrowwScale01RollbackFired
             | Self::GrowwScale02GlobalHalve => Severity::High,
+            // FUTIDX-01/02 (§36 2026-07-08) — per-underlying selection degrade
+            // / cross-feed expiry divergence. Loud (Telegram High), never a
+            // halt; the spot universe + both live feeds are unaffected.
+            Self::Futidx01SelectionDegraded | Self::Futidx02CrossFeedExpiryMismatch => {
+                Severity::High
+            }
             // Medium: data pipeline correctness
             // PR #6b (2026-05-19): I-P0-01/02/04/05 retired with their modules.
             Self::InstrumentP1CrossSegmentCollision
@@ -1329,6 +1389,12 @@ impl ErrorCode {
             // AUTH-P11 (2026-07-01) — TOTP secret rotated externally (promotes
             // the RESERVED AUTH-GAP-04 stub in wave-4-error-codes.md).
             | Self::AuthGap04TotpRotatedExternally
+            // AUTH-GAP-05 (2026-07-06) — sustained mid-session token-invalid:
+            // forced re-mint triggered (runbook §AUTH-GAP-05).
+            | Self::AuthGap05ForcedRemintTriggered
+            // AUTH-GAP-06 (2026-07-08) — fast-boot cached-token validation
+            // (runbook §AUTH-GAP-06).
+            | Self::AuthGap06FastBootCachedTokenValidation
             // BP-08 (2026-07-01) — fd / RSS / spill-free early-warning monitors
             // (promotes the RESERVED RESOURCE-01/02/03 stubs).
             | Self::Resource01FdCountHigh
@@ -1411,6 +1477,9 @@ impl ErrorCode {
             | Self::GrowwNative04WriterFailed => {
                 ".claude/rules/project/groww-native-rust-error-codes.md"
             }
+            Self::Futidx01SelectionDegraded | Self::Futidx02CrossFeedExpiryMismatch => {
+                ".claude/rules/project/futidx-4-error-codes.md"
+            }
         }
     }
 
@@ -1419,8 +1488,19 @@ impl ErrorCode {
     /// daemon will log a summary and stop.
     ///
     /// Conservative default: Critical errors are NEVER auto-actioned.
+    ///
+    /// Severity-independent overrides (design contracts pinning MANUAL
+    /// triage on a non-Critical code):
+    /// - `FUTIDX-02` (hostile-review round 3, 2026-07-08): a cross-feed
+    ///   data-comparability verdict must never be auto-actioned — the
+    ///   operator judges WHICH vendor master is stale (design contract
+    ///   `is_auto_triage_safe() == false`; previously drifted to the
+    ///   blanket severity derivation and papered over in runbook prose).
     #[must_use]
     pub const fn is_auto_triage_safe(self) -> bool {
+        if matches!(self, Self::Futidx02CrossFeedExpiryMismatch) {
+            return false;
+        }
         !matches!(self.severity(), Severity::Critical)
     }
 
@@ -1503,6 +1583,8 @@ impl ErrorCode {
             Self::Proc01OomKillDetected,
             Self::AuthGap03TokenForceRenewedOnWake,
             Self::AuthGap04TotpRotatedExternally,
+            Self::AuthGap05ForcedRemintTriggered,
+            Self::AuthGap06FastBootCachedTokenValidation,
             Self::Boot01QuestDbSlow,
             Self::Boot02DeadlineExceeded,
             Self::Boot03ClockSkewExceeded,
@@ -1587,6 +1669,8 @@ impl ErrorCode {
             Self::GrowwNative02AuthFailed,
             Self::GrowwNative03DecodeFailed,
             Self::GrowwNative04WriterFailed,
+            Self::Futidx01SelectionDegraded,
+            Self::Futidx02CrossFeedExpiryMismatch,
         ]
     }
 }
@@ -1903,7 +1987,19 @@ mod tests {
         // bumped 130 -> 131 for TELEGRAM-03 (episode machinery degraded:
         // store_write_failed / rehydrate_corrupt / edit_fallback_storm —
         // delivery unaffected, UX-only degrade, Severity::Low).
-        assert_eq!(ErrorCode::all().len(), 131);
+        // 2026-07-06 (AUTH-GAP-05 token self-heal): bumped 131 -> 132 for
+        // AUTH-GAP-05 (sustained mid-session token-invalid — forced re-mint
+        // triggered via the existing renewal machinery; lock-before-mint +
+        // ~125s cooldown + retry-once latch honored).
+        // 2026-07-08 (§36 FUTIDX-4): bumped 132 -> 134 for FUTIDX-01
+        // (per-underlying nearest-expiry selection degraded, per feed) +
+        // FUTIDX-02 (cross-feed expiry mismatch) — both Severity::High.
+        // 2026-07-08 (AUTH-GAP-06 fast-boot cached-token validation):
+        // bumped 134 -> 135 — one GET /v2/profile validates the cached JWT
+        // before any WebSocket spawn on the fast crash-recovery arm; a
+        // prefix-anchored 401/403 forces a re-mint via the existing
+        // TokenManager machinery (2026-07-07 third morning outage).
+        assert_eq!(ErrorCode::all().len(), 135);
     }
 
     #[test]
@@ -1947,6 +2043,33 @@ mod tests {
             "GROWW-SCALE-05 runbook missing on disk: {shown}"
         );
         assert!(ErrorCode::all().contains(&code));
+    }
+
+    #[test]
+    fn test_futidx_codes_contract() {
+        // §36 FUTIDX-4 (hostile-review round 3, 2026-07-08).
+        let f1 = ErrorCode::Futidx01SelectionDegraded;
+        assert_eq!(f1.code_str(), "FUTIDX-01");
+        assert_eq!("FUTIDX-01".parse::<ErrorCode>(), Ok(f1));
+        assert_eq!(f1.severity(), Severity::High);
+        // Per-feed degrade self-heals next boot — auto-triage may inspect.
+        assert!(f1.is_auto_triage_safe());
+
+        let f2 = ErrorCode::Futidx02CrossFeedExpiryMismatch;
+        assert_eq!(f2.code_str(), "FUTIDX-02");
+        assert_eq!("FUTIDX-02".parse::<ErrorCode>(), Ok(f2));
+        assert_eq!(f2.severity(), Severity::High);
+        // Design contract (futidx-4-error-codes.md §2 + the R3-4 record in
+        // .claude/plans/active-plan-futidx-4.md — the in-repo authority;
+        // round 4 replaced a dangling scratchpad "FINAL.md" citation that
+        // never landed in the tree): a cross-feed comparability
+        // verdict is NEVER auto-actioned despite being non-Critical — the
+        // severity-independent override arm, not the blanket derivation.
+        assert!(!f2.is_auto_triage_safe());
+        assert_eq!(
+            f2.runbook_path(),
+            ".claude/rules/project/futidx-4-error-codes.md"
+        );
     }
 
     #[test]
@@ -2084,7 +2207,9 @@ mod tests {
                 // Wave-4-E1 / BP-07 (2026-07-01): OOM-kill monitor.
                 || s.starts_with("PROC-")
                 // C2 (2026-07-03): panic-free reqwest client construction.
-                || s.starts_with("HTTP-CLIENT-");
+                || s.starts_with("HTTP-CLIENT-")
+                // §36 (2026-07-08): FUTIDX-4 nearest-expiry index futures.
+                || s.starts_with("FUTIDX-");
             assert!(has_known_prefix, "unexpected code prefix: {s}");
         }
     }

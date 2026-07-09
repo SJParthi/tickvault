@@ -95,6 +95,21 @@ pub fn init_prev_close_cache_dir() -> std::io::Result<()> {
 /// instrument master at boot.
 const CANARY_UNDERLYINGS: &[(u64, &str)] = &[(13, "NIFTY"), (25, "BANKNIFTY"), (51, "SENSEX")];
 
+/// §36 hardening (2026-07-08): the canary gauges track the 3 IDX_I SPOT
+/// indices — a NSE_FNO/BSE_FNO tick whose SID numerically collides with a
+/// spot SID (I-P1-11 class) must NOT bump the spot freshness gauge. One
+/// extra u8 equality compare — zero-alloc, O(1) (bounded 3-element scan),
+/// hot-path safe.
+#[inline]
+fn canary_index_for(security_id: u64, exchange_segment_code: u8) -> Option<usize> {
+    if exchange_segment_code != 0 {
+        return None;
+    }
+    CANARY_UNDERLYINGS
+        .iter()
+        .position(|(sid, _)| *sid == security_id)
+}
+
 /// B6 adversarial round 1 (HIGH-3): idle-drain cadence for the tick loop.
 ///
 /// `flush_if_needed` (which drains worker-failed flush batches into the
@@ -144,6 +159,7 @@ const IDLE_FLUSH_DRAIN_INTERVAL: std::time::Duration = std::time::Duration::from
 fn is_within_persist_window(exchange_timestamp: u32, muhurat_active: bool) -> bool {
     // exchange_timestamp is already IST epoch seconds — no offset needed.
     let ist_secs_of_day = exchange_timestamp % SECONDS_PER_DAY;
+    // O(1) EXEMPT: begin — Range::contains is two integer comparisons, not a Vec scan.
     if (TICK_PERSIST_START_SECS_OF_DAY_IST..TICK_PERSIST_END_SECS_OF_DAY_IST)
         // O(1) EXEMPT: Range::contains — two-comparison O(1) bounds check (scanner heuristic misreads it as Vec::contains).
         .contains(&ist_secs_of_day)
@@ -154,6 +170,7 @@ fn is_within_persist_window(exchange_timestamp: u32, muhurat_active: bool) -> bo
         && (MUHURAT_PERSIST_START_SECS_OF_DAY_IST..MUHURAT_PERSIST_END_SECS_OF_DAY_IST)
             // O(1) EXEMPT: Range::contains — O(1) bounds check.
             .contains(&ist_secs_of_day)
+    // O(1) EXEMPT: end
 }
 
 /// Returns `true` if the exchange timestamp's IST day matches today.
@@ -458,6 +475,7 @@ fn is_wall_clock_within_persist_window(received_at_nanos: i64, muhurat_active: b
         && (MUHURAT_PERSIST_START_SECS_OF_DAY_IST..MUHURAT_PERSIST_END_SECS_OF_DAY_IST)
             // O(1) EXEMPT: Range::contains — O(1) bounds check.
             .contains(&wall_clock_ist_secs_of_day)
+    // O(1) EXEMPT: end
 }
 
 /// Selects the depth timestamp: exchange_timestamp if valid, else wall-clock.
@@ -549,6 +567,9 @@ impl TickDedupRing {
     /// # Panics (debug only)
     /// Debug-asserts that `power` is in [8, 24].
     fn new(power: u32) -> Self {
+        // O(1) EXEMPT: begin — one-time boot construction (never per-tick); the
+        // debug_assert Range::contains is two integer comparisons, and the vec!
+        // is the ring's single preallocation.
         debug_assert!(
             // O(1) EXEMPT: RangeInclusive::contains inside a boot-time constructor debug_assert.
             (8..=24).contains(&power),
@@ -560,6 +581,7 @@ impl TickDedupRing {
             slots: vec![u64::MAX; size].into_boxed_slice(),
             mask: size.wrapping_sub(1),
         }
+        // O(1) EXEMPT: end
     }
 
     /// Returns `true` ONLY for a true byte-identical double-delivery of the same
@@ -1333,15 +1355,41 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
                 // `Utc::now()` (~59 ns measured) — index ticks hit this
                 // branch on every frame and the probe granularity is
                 // seconds.
-                for (idx, (sid, _name)) in CANARY_UNDERLYINGS.iter().enumerate() {
-                    if *sid == tick.security_id {
-                        #[allow(clippy::cast_precision_loss)]
-                        // APPROVED: epoch seconds (~1.7e9) are exactly representable in f64
-                        canary_gauges[idx]
-                            .set(received_at_nanos.saturating_div(1_000_000_000) as f64);
-                        break;
-                    }
+                // §36 (2026-07-08): segment-gated — only IDX_I ticks bump
+                // the canaries (an NSE_FNO FUTIDX sid collision must not).
+                if let Some(idx) = canary_index_for(tick.security_id, tick.exchange_segment_code) {
+                    #[allow(clippy::cast_precision_loss)]
+                    // APPROVED: epoch seconds (~1.7e9) are exactly representable in f64
+                    canary_gauges[idx].set(received_at_nanos.saturating_div(1_000_000_000) as f64);
                 }
+
+                // Silent-feed hardening Item 4 (2026-07-06 incident): observe
+                // the exchange→receive lag for this LIVE Dhan tick. O(1),
+                // zero-alloc (two relaxed atomic stores into a preallocated
+                // ring). The TWO-condition replay discriminator (round-2 fix
+                // 2026-07-07, finding 3: receipt−capture dwell ≥60s AND
+                // capture instant BEFORE the process live boundary) excludes
+                // boot-time WAL-replayed rows EXACTLY (capture_seq is stamped
+                // at the ORIGINAL WS-read instant and preserved through
+                // re-injection, while received_at is re-stamped at dequeue)
+                // while KEEPING genuinely-lagged live ticks — INCLUDING live
+                // rows delayed >60s in the frame channel by a consumer stall,
+                // which the dwell alone misclassified as replay (starving the
+                // window into a stale-healthy gauge) — no Rule-11 censoring
+                // of the measured signal. Sits AFTER every gate
+                // (valid/today/in-window/dedup). Honest caveat: §30
+                // window-exempt always-on SIDs (GIFT Nifty) bypass the
+                // window gates above, so their OFF-session live ticks ARE
+                // recorded into the ring — the publisher's session gate
+                // (feed_lag_monitor::is_in_session_ist, regular + Muhurat
+                // windows) keeps those samples from being PUBLISHED
+                // off-session; the first in-session minute can include up
+                // to 60s of pre-window always-on samples.
+                super::feed_lag_monitor::record_dhan_tick(
+                    tick.received_at_nanos,
+                    capture_seq,
+                    tick.exchange_timestamp,
+                );
 
                 // C2 (feed convergence): the ordered enrich → persist →
                 // aggregate-handoff per-tick consumer sequence is the ONE
@@ -1622,6 +1670,17 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
                     if let Some(ref mut enricher) = greeks_enricher {
                         enricher.enrich(&mut tick);
                     }
+
+                    // Silent-feed hardening Item 4: exchange→receive lag
+                    // observation for the Full-packet arm — mirrors the
+                    // Ticker/Quote persist site above so both Dhan persist
+                    // paths feed the SAME lag window (uniform hot-path
+                    // semantics across packet types). O(1), zero-alloc.
+                    super::feed_lag_monitor::record_dhan_tick(
+                        tick.received_at_nanos,
+                        capture_seq,
+                        tick.exchange_timestamp,
+                    );
 
                     // Persist tick to QuestDB — ingestion gate above already verified
                     // [09:00, 15:30) IST and today's date.
@@ -5345,6 +5404,30 @@ mod tests {
     // -----------------------------------------------------------------------
     // Channel backpressure metric (M6)
     // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_canary_gauges_ignore_non_idx_i_segments() {
+        // §36 (2026-07-08): an NSE_FNO tick with sid 13 must NOT bump the
+        // NIFTY canary (I-P1-11 sid collision); the IDX_I tick must.
+        assert_eq!(
+            super::canary_index_for(13, 2),
+            None,
+            "NSE_FNO sid 13 ignored"
+        );
+        assert_eq!(
+            super::canary_index_for(13, 8),
+            None,
+            "BSE_FNO sid 13 ignored"
+        );
+        assert_eq!(super::canary_index_for(13, 0), Some(0), "IDX_I NIFTY bumps");
+        assert_eq!(super::canary_index_for(25, 0), Some(1));
+        assert_eq!(super::canary_index_for(51, 0), Some(2));
+        assert_eq!(
+            super::canary_index_for(9999, 0),
+            None,
+            "non-canary sid ignored"
+        );
+    }
 
     #[test]
     fn test_channel_occupancy_metric() {

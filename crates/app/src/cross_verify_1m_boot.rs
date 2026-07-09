@@ -881,6 +881,28 @@ pub const fn default_csv_dir() -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn test_cross_verify_targets_exclude_index_future_role() {
+        // §36 (2026-07-08): the main.rs 15:31 target build keeps ONLY roles
+        // for which `instrument_type_for_role` returns Some — the IndexFuture
+        // None arm therefore excludes futures from cross-verify by
+        // construction (spot-only; CROSS-VERIFY-1M-02 math untouched).
+        use crate::prev_day_ohlcv_boot::instrument_type_for_role;
+        use tickvault_core::instrument::daily_universe::InstrumentRole;
+        let roles = [
+            InstrumentRole::Index,
+            InstrumentRole::FnoUnderlying,
+            InstrumentRole::IndexConstituent,
+            InstrumentRole::IndexFuture,
+        ];
+        let kept: Vec<&'static str> = roles
+            .iter()
+            .filter_map(|r| instrument_type_for_role(*r))
+            .collect();
+        assert_eq!(kept, vec!["INDEX", "EQUITY", "EQUITY"]);
+        assert!(instrument_type_for_role(InstrumentRole::IndexFuture).is_none());
+    }
+
     use super::*;
 
     fn mc(minute_ts: i64, o: f64, h: f64, l: f64, c: f64, v: i64) -> MinuteCandle {

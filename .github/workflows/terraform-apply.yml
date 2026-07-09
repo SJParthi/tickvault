@@ -390,6 +390,82 @@ jobs:
           echo "✅ Published the ready-made portal link to Telegram (key NOT shown here)."
           echo "Operator portal URL (key sent privately via Telegram): ${URL}" >> "$GITHUB_STEP_SUMMARY"
 
+      - name: "Deploy gate: console shell GET / must return 200 within 5s"
+        # Console smoke gate (B4 r3 shell-hang fix, 2026-07-06; simplified to a
+        # conservative decision tree 2026-07-08). Root cause: QuestDB 9.3.5
+        # answers GET / with an UNFRAMED keep-alive 301 it never closes, so the
+        # back lambda's read-until-EOF blocked to its 12s timeout and GET / had
+        # NEVER returned 200 through the console (evidence:
+        # docs/incidents/2026-07-06-questdb-console-shell-hang/repro-evidence.md).
+        # The back lambda now rewrites GET / -> /index.html. This gate asserts
+        # the fixed contract END-TO-END (API-GW -> front device-key auth ->
+        # back VPC relay -> box:9000): GET / through the proxy must return
+        # HTTP 200, and each probe's `--max-time 5` IS the 200-within-5s
+        # assertion (the pre-fix ~12s 504 can physically never pass it).
+        #
+        # Decision tree — deliberately generic; no per-(box-state x HTTP-code)
+        # diagnosis, no claims about which codes a given box state can produce:
+        #   1. console disabled (TF var off)      -> loud SKIP, exit 0
+        #   2. terraform output unresolvable      -> FATAL (fail-closed)
+        #   3. SSM auth-token read fails          -> FATAL (fail-closed)
+        #   4. up to 12 probes, 10s apart; any 200 -> PASS immediately
+        #   5. exhausted: sample the EC2 box state ONCE —
+        #        running   -> FATAL (investigate the console chain)
+        #        otherwise -> loud SKIP (a not-running box cannot be probed;
+        #                     the gate re-verifies on the next in-window apply)
+        # Disclosed limitations: an apply while the box is not steadily running
+        # cannot verify the console and SKIPs loudly; QuestDB-version shell
+        # drift is caught by deploy-aws.yml's box-local hard canary at the next
+        # box deploy, not same-instant. Worst-case added wall clock: 12 x 5s
+        # probes + 11 x 10s waits ~= 3 minutes.
+        # Secret hygiene: SSM read + ::add-mask:: + header FILE (umask 077
+        # mktemp, trap-removed) — the bearer never appears in argv or logs.
+        run: |
+          set -euo pipefail
+          if [ "${TF_VAR_enable_questdb_console:-false}" != "true" ]; then
+            echo "SKIP: questdb console disabled (TF_VAR_enable_questdb_console != true) — nothing deployed to gate"
+            exit 0
+          fi
+          if ! QURL=$(terraform -chdir=${{ env.TF_DIR }} output -raw questdb_console_url) \
+             || [ -z "$QURL" ] || [ "$QURL" = "null" ]; then
+            echo "FATAL: the terraform output questdb_console_url could not be resolved while the console is enabled — failing closed."
+            exit 1
+          fi
+          if ! TOK=$(aws ssm get-parameter --name /tickvault/prod/operator/control-secret \
+              --with-decryption --query Parameter.Value --output text --region ${{ env.AWS_REGION }}); then
+            echo "FATAL: could not read the console auth token from SSM — failing closed."
+            exit 1
+          fi
+          echo "::add-mask::${TOK}"
+          HDR="$(umask 077 && mktemp)"
+          trap 'rm -f "$HDR"' EXIT
+          printf 'Authorization: Bearer %s\n' "$TOK" > "$HDR"
+          CODES=""
+          for i in 1 2 3 4 5 6 7 8 9 10 11 12; do
+            CODE=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 5 -H @"$HDR" "${QURL%/}/" || true)
+            CODE=${CODE:-000}
+            CODES="${CODES:+$CODES }${CODE}"
+            echo "attempt $i/12: GET / -> ${CODE}"
+            if [ "$CODE" = "200" ]; then
+              echo "✅ console shell smoke: GET / == 200 within 5s through the proxy (attempt $i/12)"
+              echo "✅ QuestDB console shell smoke passed (GET / = 200 ≤5s, attempt $i/12)" >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            if [ "$i" -lt 12 ]; then sleep 10; fi
+          done
+          IID=$(terraform -chdir=${{ env.TF_DIR }} output -raw instance_id 2>/dev/null || echo "")
+          STATE=unknown
+          if [ -n "$IID" ]; then
+            STATE=$(aws ec2 describe-instances --instance-ids "$IID" --region ${{ env.AWS_REGION }} \
+              --query 'Reservations[0].Instances[0].State.Name' --output text 2>/dev/null || echo unknown)
+          fi
+          if [ "$STATE" != "running" ]; then
+            echo "⚠ SKIP (loud): console not verifiable this apply: box state '${STATE}' after the probe window; codes seen: ${CODES}. A not-running box cannot be probed; the gate re-verifies on the next in-window apply." | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          echo "FATAL: console GET / did not return 200 within 5s per attempt over the ~3 min probe window and the box reported running when sampled after it; codes seen: ${CODES}. Investigate the console chain (SG :9000 ingress, back lambda, front lambda, QuestDB http)." | tee -a "$GITHUB_STEP_SUMMARY"
+          exit 1
+
       - name: Publish QuestDB console URL to Telegram
         # B4: mirrors the portal-link publish above. No key is minted here —
         # the console reuses the SAME control-secret; the one-click 90s link
