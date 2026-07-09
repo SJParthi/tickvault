@@ -171,8 +171,10 @@ const BOOT_COMPLETED_METRIC: &str = "tv_boot_completed";
 /// The boot-heartbeat alarm (`deploy/aws/terraform/boot-heartbeat-alarm.tf`,
 /// repointed off the `tv_realtime_guarantee_score` PROXY — the PR #1278
 /// follow-up flagged in `daily-universe-scope-expansion-2026-05-27.md` §19
-/// "EC2 cron heartbeat") pages when this metric is MISSING in the 08:50–09:10
-/// IST boot window.
+/// "EC2 cron heartbeat") pages when this metric is MISSING in the 08:50–09:20
+/// IST boot window (close widened from 09:10 on 2026-07-09 so the boot window
+/// hands over to the 09:20 market-hours liveness window with no alarm seam
+/// spanning the 09:15 market open).
 ///
 /// Called from BOTH boot-completion points (fast-boot crash-recovery + slow-boot
 /// normal), each reached ONLY after every boot gate has passed — a halt uses
