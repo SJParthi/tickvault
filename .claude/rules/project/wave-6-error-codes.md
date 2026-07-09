@@ -34,6 +34,52 @@ unwritable — by definition catastrophic.
 
 **Source:** `crates/storage/src/shadow_persistence.rs::ShadowCandleWriter::handle_drop`.
 
+### 2026-07-09 Update — AGGREGATOR-DROP-01 now PAGES (dual route)
+
+The 2026-07-09 audit confirmed this Severity::Critical code paged NOBODY
+post-CloudWatch-migration: no `error_code_alerts` entry existed and the
+companion counter never reached CloudWatch. Both routes are now live:
+
+1. **errcode log-filter alarm** (`tv-<env>-errcode-aggregator-drop-01`,
+   `deploy/aws/terraform/error-code-alarms.tf`): the emit site —
+   `crates/storage/src/seal_writer_loop.rs::record_cycle_observability`,
+   `error!(code = ErrorCode::AggregatorDrop01.code_str(), dropped = N)` per
+   drain cycle with a non-zero truly-dropped count — flows
+   errors.jsonl → CW Logs `/tickvault/<env>/app` → filter
+   `{ $.code = "AGGREGATOR-DROP-01" && $.level = "ERROR" }` →
+   `tv_errcode_aggregator_drop_01` → alarm (≤5 min) → SNS → Telegram.
+   `ok_recovery = false`: the loss is PERMANENT — an auto-OK ~15 min after
+   the episode ages out can never mean the candles came back (Rule-11).
+2. **counter-side pager** (`tv-<env>-seal-writer-dropped`,
+   `deploy/aws/terraform/seal-drop-alarm.tf`, the
+   `feed-stall-restart-alarm.tf` house pattern): a log metric filter on
+   `/tickvault/<env>/metrics` extracts the per-scrape deltas of
+   `tv_seal_writer_drain_total{kind="dropped"}` into the DERIVED
+   `tv_seal_writer_drain_dropped_total` [host] metric (kind-sliced so the
+   busy submitted/flushed series never inflate the Sum; distinct name so a
+   future unfiltered extraction can never double-count), alarmed at
+   Sum ≥ 1 per aligned 300s window, always armed (a drop at the
+   IST-midnight force-seal burst is equally permanent), no ok_actions.
+   Redundancy rationale: a drop still pages if the errors.jsonl shipping
+   leg is degraded (the 2026-07-06 collect_list incident class).
+   **First-sample baseline (the feed-stall round-5 lesson):** the CW
+   agent's delta pipeline drops each counter series' first sample as its
+   baseline; since `kind="dropped"` increments only on a real drop, a
+   lazily-born series would lose the session's FIRST drop entirely — so
+   main.rs pre-registers the dropped series at 0 immediately after the
+   metrics recorder installs (boot Step 2, next to the stall-restart
+   registration), making it dense from boot.
+
+Lockstep ratchet: `crates/app/tests/seal_drop_paging_wiring_guard.rs`
+(4 tests — post-install registration order, emit-site stub-guard, both
+terraform shapes built from the real `code_str()` / metric literals).
+Honest envelope: paging latency ≤ ~5 min on either route; a drop inside the
+pre-install boot window increments a no-op counter handle (route 2 blind;
+physically implausible — ring+spill+DLQ must all fail on live seal traffic
+inside the boot prefix) but route 1 still sees its ERROR line; the delta
+counter shape is not live-verified from the sandbox — if it ever proved
+cumulative, Sum over-pages (fail-loud, never a silent miss).
+
 ### 2026-05-11 Update — 4-alert drop-class family is now live
 
 Per Wave 6 Sub-PR #1 items 1.4j/l/n/o (merged #584/#587/#589/#590) the
