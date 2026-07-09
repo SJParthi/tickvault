@@ -348,8 +348,49 @@ jobs:
     name: "Coverage & Perf"
     needs: build-and-verify
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    # 45 → 60 min (2026-07-09): headroom for the targeted llvm-cov retry
+    # below — a cold-cache run + one retry must not die to the job timeout.
+    timeout-minutes: 60
     steps:
+      # FLAKE HARDENING 2026-07-09 — this job failed 4+ PRs in ~24h with two
+      # recurring signatures:
+      #   (a) RUNNER DISK EXHAUSTION — PR #1442 ended with ~56 MB free;
+      #       PR #1455 died with "No space left on device" +
+      #       "error: linking with 'cc' failed". The llvm-cov instrumented
+      #       build of the full workspace (+ profraw files) is the largest
+      #       target dir in this workflow and the stock ubuntu-latest image
+      #       ships ~30 GB of preinstalled toolchains we never use.
+      #   (b) llvm-cov EXIT 101 WITH NO REAL TEST FAILURE — PR #1454's run
+      #       aborted exit 101 without a failing test in the log (transient
+      #       runner/instrumentation flake class). Also observed on the
+      #       #1453 post-merge main run (29027978259, Coverage & Perf red,
+      #       log content already expired — HTTP 404).
+      # Mitigations: the disk pre-clean step below (signature a) and the
+      # retry-exactly-once wrapper around the llvm-cov invocation
+      # (signature b). A SECOND consecutive llvm-cov failure is a real red —
+      # there is no continue-on-error anywhere in this job, and the
+      # threshold-enforcement step is untouched.
+      - name: Free runner disk space (flake signature a — see comment above)
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "=== df -h BEFORE cleanup ==="
+          df -h /
+          # Well-known GH-hosted-runner cleanup recipe: drop preinstalled
+          # toolchains this job never uses (~25-30 GB reclaimed).
+          # NOT deleted: /opt/hostedtoolcache python/node (system tools other
+          # steps could resolve to) — CodeQL is the only safe-to-drop entry.
+          sudo rm -rf /usr/share/dotnet \
+                      /usr/local/lib/android \
+                      /opt/ghc \
+                      /usr/local/share/boost \
+                      /opt/hostedtoolcache/CodeQL || true
+          if command -v docker >/dev/null 2>&1; then
+            sudo docker system prune -af >/dev/null 2>&1 || true
+          fi
+          echo "=== df -h AFTER cleanup ==="
+          df -h /
+
       - name: Checkout
         uses: actions/checkout@v7.0.0
 
@@ -369,7 +410,9 @@ jobs:
         run: cargo install --locked cargo-llvm-cov
 
       - name: Run coverage (workspace, JSON output)
+        shell: bash
         run: |
+          set -euo pipefail
           cargo llvm-cov clean --workspace
           # DHAT zero-alloc tests (dhat_instrument_registry / dhat_token_handle /
           # dhat_tick_persistence) assert EXACT heap-allocation counts. Under
@@ -377,8 +420,10 @@ jobs:
           # those assertions fail (exit 101) and abort the whole coverage run —
           # this is why "Coverage & Perf" was RED on main for days and never
           # produced coverage.json. DHAT-vs-coverage is a known incompatibility.
-          # Skip the dhat_* tests HERE only; they STILL run + enforce zero-alloc
-          # in the normal Test (core)/Test (storage) jobs, so the guarantee holds.
+          # Skip the dhat_* tests HERE only; every dhat_* target (incl. the
+          # `--features dhat` cfg-gated core ones) runs + enforces its
+          # allocation ratchet in the dedicated "DHAT Zero-Alloc" job (added
+          # 2026-07-09, in All Green's needs), so the guarantee holds.
           #
           # cargo-llvm-cov does NOT create parent directories for
           # --output-path: once the api env-race was fixed (#1072) and the
@@ -388,9 +433,24 @@ jobs:
           # failure had masked this second bug for days. Create the dir
           # AFTER `clean` (which removes coverage artifacts).
           mkdir -p target/llvm-cov
-          cargo llvm-cov --workspace --no-fail-fast --json \
-            --output-path target/llvm-cov/coverage.json \
-            -- --skip dhat_
+          run_cov() {
+            cargo llvm-cov --workspace --no-fail-fast --json \
+              --output-path target/llvm-cov/coverage.json \
+              -- --skip dhat_
+          }
+          # Targeted retry (flake signature b — see the dated comment at the
+          # top of this job): exactly ONE retry, only after wiping profraw
+          # residue from the failed attempt (compiled artifacts are kept, so
+          # the retry is mostly a re-run of the test phase). A genuinely
+          # failing test fails BOTH attempts → the job is red; the coverage
+          # THRESHOLD step below is untouched and never retried.
+          if ! run_cov; then
+            echo "::warning::cargo llvm-cov failed (attempt 1/2) — retrying once after profraw clean (exit-101 flake class, see #1454). A second failure is a real red."
+            cargo llvm-cov clean --workspace --profraw-only \
+              || cargo llvm-cov clean --workspace
+            mkdir -p target/llvm-cov
+            run_cov
+          fi
 
       - name: Enforce per-crate coverage thresholds
         run: bash scripts/coverage-gate.sh target/llvm-cov/coverage.json
@@ -493,6 +553,165 @@ jobs:
           bash scripts/questdb-console-gate-matrix.sh
 
   # -------------------------------------------------------------------------
+  # DHAT Zero-Alloc — dedicated lane for the hot-path allocation ratchets
+  # (added 2026-07-09, PR #4 of the audit-fix sequence).
+  #
+  # WHY: the 15 crates/*/tests/dhat_*.rs targets previously ran in NO
+  # complete CI lane. The feature-UNGATED ones ran inside Test (core/
+  # storage/trading), but the three `#![cfg(feature = "dhat")]`-gated core
+  # targets (dhat_prev_close_writer / dhat_telegram_dispatcher /
+  # dhat_tick_gap_detector) compiled to EMPTY binaries there (Test (core)
+  # enables only daily_universe_fetcher) and the Coverage & Perf job
+  # explicitly `--skip dhat_` (DHAT-vs-llvm-cov incompatibility). Proven
+  # rot: dhat_tick_gap_detector.rs failed to compile for ~2 weeks
+  # (u32→u64 SecurityId-widening fallout, E0308 ×4) and nothing went red.
+  # This lane compiles + runs EVERY dhat target with the right features,
+  # on pull_request AND push/workflow_dispatch (no `if:` — it must never
+  # skip, so All Green's 'skipped'=failure rule needs no exception for
+  # it), and feeds the All Green fan-in.
+  #
+  # EXPLICIT TARGET LIST + two-sided drift guard: targets are listed
+  # explicitly so a broken glob can never silently run nothing. Side 1 —
+  # the drift-check step globs crates/*/tests/dhat_*.rs and FAILS if the
+  # filesystem disagrees with the list below (a new/renamed file must be
+  # added to the list). Side 2 — each cargo test step asserts the EXECUTED
+  # target count ("Running tests/dhat_" lines) equals its expected count
+  # (9 core / 3 storage / 3 trading), so a `--test` flag dropped from a
+  # run step (while the file + list entry survive) fails loudly instead of
+  # silently un-gating that target (2026-07-09 adversarial-review HIGH).
+  #
+  # Budgets in these tests are RATCHETS — weakening a byte/block budget to
+  # make this lane green is a merge-gate-lock §5-class REJECT.
+  # -------------------------------------------------------------------------
+  dhat-zero-alloc:
+    name: "DHAT Zero-Alloc"
+    runs-on: ubuntu-latest
+    # 45 min: a fully cold cache debug-builds core(+dhat feature) + storage
+    # + trading + deps on a 2-core runner — matched to the Test jobs' budget
+    # (2026-07-09 adversarial-review MEDIUM; 30 was unproven cold).
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7.0.0
+
+      - name: DHAT target drift check (no silent drops)
+        shell: bash
+        run: |
+          set -euo pipefail
+          actual=$(ls crates/*/tests/dhat_*.rs | LC_ALL=C sort)
+          expected=$(LC_ALL=C sort <<'EOF'
+          crates/core/tests/dhat_allocation.rs
+          crates/core/tests/dhat_feed_consumer.rs
+          crates/core/tests/dhat_feed_lag_ring.rs
+          crates/core/tests/dhat_instrument_registry.rs
+          crates/core/tests/dhat_prev_close_writer.rs
+          crates/core/tests/dhat_telegram_dispatcher.rs
+          crates/core/tests/dhat_tick_gap_detector.rs
+          crates/core/tests/dhat_token_handle.rs
+          crates/core/tests/dhat_ws_reader_zero_alloc.rs
+          crates/storage/tests/dhat_tick_flush_offload.rs
+          crates/storage/tests/dhat_tick_persistence.rs
+          crates/storage/tests/dhat_tick_row_builder.rs
+          crates/trading/tests/dhat_bar_cache_lookup.rs
+          crates/trading/tests/dhat_multi_tf_consume_tick.rs
+          crates/trading/tests/dhat_risk_engine.rs
+          EOF
+          )
+          # Defensive de-indent: YAML block scalars normally de-dent the
+          # heredoc to column 0, but a future re-indent of this step must
+          # not silently break the comparison.
+          expected=$(echo "$expected" | sed 's/^[[:space:]]*//' | grep -v '^$')
+          if ! diff <(echo "$expected") <(echo "$actual"); then
+            echo "::error::crates/*/tests/dhat_*.rs on disk disagrees with the explicit DHAT lane target list in ci.yml (dhat-zero-alloc job). A new/renamed dhat test MUST be added to BOTH the drift list and the matching cargo test step below, or it would silently run in no CI lane."
+            exit 1
+          fi
+          echo "DHAT target list matches the filesystem ($(echo "$actual" | wc -l) targets)."
+
+      - name: Install Rust toolchain 1.95.0
+        uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88 # SHA-pinned (was @stable, supply-chain hardening 2026-04-25)
+        with:
+          toolchain: '1.95.0'
+
+      - name: Cache cargo registry + build
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ci-dhat-zero-alloc
+          cache-on-failure: true
+
+      # NOTE: plain `cargo test` (not nextest) is deliberate — every dhat
+      # target holds exactly ONE #[test] (dhat allows one Profiler per
+      # process), so there is no intra-binary parallelism to manage, and the
+      # guards below need the classic harness output. Two false-OK guards
+      # per step (audit Rule 11): (1) the tee'd "running 0 tests" scan — if
+      # the `--features dhat` flag is ever dropped, the three cfg-gated core
+      # targets compile to EMPTY binaries and would pass vacuously; (2) the
+      # executed-target count assertion — a `--test` flag dropped from the
+      # step (file + drift-list entry intact) would silently un-gate that
+      # target. Both become hard failures.
+      - name: DHAT (core, --features dhat)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p tickvault-core --features dhat \
+            --test dhat_allocation \
+            --test dhat_feed_consumer \
+            --test dhat_feed_lag_ring \
+            --test dhat_instrument_registry \
+            --test dhat_prev_close_writer \
+            --test dhat_telegram_dispatcher \
+            --test dhat_tick_gap_detector \
+            --test dhat_token_handle \
+            --test dhat_ws_reader_zero_alloc \
+            2>&1 | tee /tmp/dhat-core.log
+          if grep -q 'running 0 tests' /tmp/dhat-core.log; then
+            echo "::error::a core dhat target ran ZERO tests — vacuous green (--features dhat missing, or the cfg gate excluded the test). Rule 11: no false-OK."
+            exit 1
+          fi
+          ran=$(grep -c 'Running tests/dhat_' /tmp/dhat-core.log || true)
+          if [ "$ran" -ne 9 ]; then
+            echo "::error::core DHAT step executed $ran targets, expected 9 — a --test flag was dropped from this step (drift list vs run step mismatch)."
+            exit 1
+          fi
+
+      - name: DHAT (storage)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p tickvault-storage \
+            --test dhat_tick_flush_offload \
+            --test dhat_tick_persistence \
+            --test dhat_tick_row_builder \
+            2>&1 | tee /tmp/dhat-storage.log
+          if grep -q 'running 0 tests' /tmp/dhat-storage.log; then
+            echo "::error::a storage dhat target ran ZERO tests — vacuous green. Rule 11: no false-OK."
+            exit 1
+          fi
+          ran=$(grep -c 'Running tests/dhat_' /tmp/dhat-storage.log || true)
+          if [ "$ran" -ne 3 ]; then
+            echo "::error::storage DHAT step executed $ran targets, expected 3 — a --test flag was dropped from this step."
+            exit 1
+          fi
+
+      - name: DHAT (trading)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p tickvault-trading \
+            --test dhat_bar_cache_lookup \
+            --test dhat_multi_tf_consume_tick \
+            --test dhat_risk_engine \
+            2>&1 | tee /tmp/dhat-trading.log
+          if grep -q 'running 0 tests' /tmp/dhat-trading.log; then
+            echo "::error::a trading dhat target ran ZERO tests — vacuous green. Rule 11: no false-OK."
+            exit 1
+          fi
+          ran=$(grep -c 'Running tests/dhat_' /tmp/dhat-trading.log || true)
+          if [ "$ran" -ne 3 ]; then
+            echo "::error::trading DHAT step executed $ran targets, expected 3 — a --test flag was dropped from this step."
+            exit 1
+          fi
+
+  # -------------------------------------------------------------------------
   # All Green — the single merge choke point (merge-gate hardening 2026-07-04).
   #
   # WHY: on 2026-07-03 three PRs (#1387, #1388, #1382) merged seconds BEFORE
@@ -532,6 +751,7 @@ jobs:
       - security-and-audit
       - coverage-and-perf
       - repo-guards
+      - dhat-zero-alloc
     if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
