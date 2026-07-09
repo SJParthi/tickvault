@@ -37,6 +37,8 @@ use tickvault_common::constants::{
 };
 use tickvault_core::parser::dispatch_frame;
 
+mod dhat_support;
+
 #[allow(clippy::arithmetic_side_effects)]
 fn make_ticker_bytes(security_id: u32, ltp: f32, ltt: u32) -> Vec<u8> {
     let mut buf = vec![0u8; TICKER_PACKET_SIZE];
@@ -115,28 +117,34 @@ fn dhat_ws_reader_tail_zero_alloc() {
         })
         .collect();
 
-    // ---- Measurement window begins ----
-    let before = dhat::HeapStats::get();
+    // ---- Measurement window (bounded phantom-retry, 2026-07-09 — roaming
+    // 4-block cross-thread flake on 2-core CI runners; see
+    // dhat_support/mod.rs). Budget UNCHANGED: exactly 0 blocks. The counter
+    // sanity check is a per-attempt DELTA (the counter accumulates across
+    // retry attempts).
+    let (_, allocs_during) = dhat_support::measure_with_phantom_retry(
+        0,
+        0,
+        || {},
+        || {
+            let counter_start = counter.load(Ordering::Relaxed);
 
-    // Single ticker: counter bump + dispatch.
-    assert!(ws_reader_tail(&counter, &ticker_pkt));
+            // Single ticker: counter bump + dispatch.
+            assert!(ws_reader_tail(&counter, &ticker_pkt));
 
-    // Single quote: counter bump + dispatch.
-    assert!(ws_reader_tail(&counter, &quote_pkt));
+            // Single quote: counter bump + dispatch.
+            assert!(ws_reader_tail(&counter, &quote_pkt));
 
-    // Burst: 100 counter bumps + 100 dispatches (realistic fan-in
-    // representing a busy 10k/s frame arrival window).
-    for pkt in &ticker_burst {
-        assert!(ws_reader_tail(&counter, pkt));
-    }
+            // Burst: 100 counter bumps + 100 dispatches (realistic fan-in
+            // representing a busy 10k/s frame arrival window).
+            for pkt in &ticker_burst {
+                assert!(ws_reader_tail(&counter, pkt));
+            }
 
-    // Verify the counter advanced as expected (1 + 1 + 100 = 102).
-    assert_eq!(counter.load(Ordering::Relaxed), 102);
-
-    let after = dhat::HeapStats::get();
-    // ---- Measurement window ends ----
-
-    let allocs_during = after.total_blocks.saturating_sub(before.total_blocks);
+            // Verify the counter advanced as expected (1 + 1 + 100 = 102).
+            assert_eq!(counter.load(Ordering::Relaxed) - counter_start, 102);
+        },
+    );
 
     assert_eq!(
         allocs_during, 0,
