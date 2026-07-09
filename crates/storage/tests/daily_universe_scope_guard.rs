@@ -404,10 +404,14 @@ fn boot_timing_proof_is_measured_and_surfaced() {
             && main.contains("tv_instrument_load_total_rows"),
         "main.rs must emit the 3 boot-timing Prometheus gauges"
     );
+    // 2026-07-09 (operator escalation — Telegram noise N3): the standalone
+    // boot-timing Telegram essay was DEMOTED to a structured log line; the
+    // operator-facing instrument count lives on the boot bubble's
+    // Instruments line. The pure formatter + its sentinel guard stay.
     assert!(
         main.contains("fn format_instrument_load_telegram")
-            && main.contains("NotificationEvent::Custom { message }"),
-        "main.rs must emit a boot-timing Telegram line via the pure formatter"
+            && main.contains("demoted from Telegram 2026-07-09"),
+        "main.rs must log the boot-timing line via the pure formatter (demoted, log-only)"
     );
     assert!(
         main.contains("O(1) warm-path proof"),

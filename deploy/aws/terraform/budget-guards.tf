@@ -274,6 +274,19 @@ resource "aws_iam_role_policy" "tv_hard_stop_guard" {
         Resource = aws_sns_topic.tv_alerts.arn
       },
       {
+        # 2026-07-09 (Telegram noise N2 — change-only running pings): the
+        # hourly in-window ping now fires only on a CHANGE (spend bucket /
+        # month rollover / cost-check edge). State = ONE SSM String param.
+        # Least privilege — scoped to that single parameter ARN (the
+        # events:DisableRule idiom above); created lazily by
+        # PutParameter(Overwrite=true), no seed resource needed. NOT under
+        # the banned /tickvault/*/groww/* namespace.
+        Sid      = "ChangeOnlyBudgetPingState"
+        Effect   = "Allow"
+        Action   = ["ssm:GetParameter", "ssm:PutParameter"]
+        Resource = "arn:aws:ssm:${var.aws_region}:${data.aws_caller_identity.current.account_id}:parameter/tickvault/${var.environment}/budget-guard/ping-state"
+      },
+      {
         Effect   = "Allow"
         Action   = ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"]
         Resource = "*"
@@ -300,6 +313,9 @@ resource "aws_lambda_function" "tv_hard_stop_guard" {
       # KEEP IN SYNC with budget.tf limit_amount ("55") + the digest's
       # BUDGET_USD above — all three MUST agree on the kill line.
       BUDGET_KILL_USD = "55"
+      # 2026-07-09: change-only ping state (matches the IAM statement's
+      # single-parameter scope above).
+      PING_STATE_PARAM = "/tickvault/${var.environment}/budget-guard/ping-state"
     }
   }
 }
@@ -312,9 +328,11 @@ resource "aws_cloudwatch_log_group" "tv_hard_stop_guard" {
 # Run HOURLY, every day (2026-06-30 — was once-daily 17:00 IST). The Lambda is
 # window-aware: OUTSIDE the Mon-Fri 08:30-16:30 IST up-window it force-stops a
 # running box (so a missed 16:30 stop or a manual start can NEVER bill a full
-# overnight/weekend); INSIDE the window it sends an hourly "box still running —
-# Xh, ~$Y MTD" cost ping, UNLESS MTD spend has crossed the $55 kill line — then
-# it stops the box + disables the morning start cron (GAP 1, 2026-07-03).
+# overnight/weekend); INSIDE the window it checks the budget hourly but PINGS
+# ONLY ON CHANGE (spend crossed a 10% bucket / month rollover / cost-check
+# edge — 2026-07-09 Telegram noise N2; the 17:30 IST daily digest above stays
+# the end-of-day summary), UNLESS MTD spend has crossed the $55 kill line —
+# then it stops the box + disables the morning start cron (GAP 1, 2026-07-03).
 # Hourly = the box can over-run the budget by at most ~1 EC2-hour (~$0.064)
 # before this catches it, plus the native AWS Budget Action (budget.tf) stops
 # at 90%/100% spend regardless (but only ONCE per month-crossing — this Lambda
@@ -322,7 +340,7 @@ resource "aws_cloudwatch_log_group" "tv_hard_stop_guard" {
 # 1 invocation/hour is well within the Lambda free tier (1M/mo).
 resource "aws_cloudwatch_event_rule" "tv_hard_stop_guard" {
   name                = "tv-prod-hard-stop-guard"
-  description         = "Hourly out-of-window force-stop + in-window running cost ping — budget never-cross safety net"
+  description         = "Hourly out-of-window force-stop + in-window change-only budget ping — budget never-cross safety net"
   schedule_expression = "cron(0 * * * ? *)"
 }
 
