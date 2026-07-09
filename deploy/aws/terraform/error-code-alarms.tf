@@ -5,7 +5,8 @@
 #   The CloudWatch-only migration (#O1/#O2/#O3) retired the
 #   Loki -> Alertmanager -> Telegram route with NO replacement, so an `error!`
 #   reached only the log sinks. On 2026-07-06 the 12:00 IST REST-CANARY-01
-#   probe failure produced ZERO pages. These 8 log metric filters + alarms on
+#   probe failure produced ZERO pages. These 9 log metric filters + alarms
+#   (8 on 2026-07-06; +AGGREGATOR-DROP-01 on 2026-07-09) on
 #   the /tickvault/<env>/app log group (the errors.jsonl stream) restore the
 #   route: error! -> errors.jsonl -> CloudWatch Logs -> filter -> tv_errcode_*
 #   metric -> alarm (<=5 min) -> SNS tv-alerts -> Telegram webhook Lambda.
@@ -14,7 +15,9 @@
 # (45 with the reconnect-storm + feed-stall-restarts + readiness-lambda-errors
 # + market-hours-gate-errors alarms landing in the same PR). Overage above the
 # 10 free-tier alarms moves $2.30 -> $3.50/mo. The rule-file "10 alarms free
-# tier" claims were already stale pre-PR.
+# tier" claims were already stale pre-PR. (2026-07-09: +2 more alarms —
+# errcode-aggregator-drop-01 here + seal-writer-dropped in seal-drop-alarm.tf,
+# ~+$0.20/mo.)
 #
 # DIMENSIONLESS BY DESIGN: errors.jsonl events carry NO `host` field (the host
 # label is added by the Prometheus scrape, not the tracing layer), and metric
@@ -28,6 +31,11 @@
 # is correct and near-free.
 #
 # ADDING A FUTURE PAGED CODE = ONE map entry below (filter + alarm generated).
+#
+# 2026-07-09 UPDATE: +1 entry (AGGREGATOR-DROP-01) -> 9 filters + 9 alarms.
+# The 2026-07-09 audit confirmed the Severity::Critical sealed-candle-drop
+# code (the ONLY silent-data-loss path for sealed candles) paged nobody.
+# Companion counter-side pager: seal-drop-alarm.tf.
 # =============================================================================
 
 locals {
@@ -164,6 +172,28 @@ locals {
       ok_recovery = false # round-4: discrete OOM-kill event - auto-OK means the episode aged out, not that the memory pressure is resolved (Rule-11 false-recovery)
       desc        = "PROC-01: kernel OOM kill detected in this cgroup (Severity Critical). NO recovered/OK page: an OOM kill is a discrete event, so the auto-OK ~15 min later only means the episode aged out - the leak/pressure behind it is not thereby fixed; watch tv_process_rss_bytes + host memory alarms for the real recovery. Runbook: .claude/rules/project/wave-4-error-codes.md"
     }
+    # AGGREGATOR-DROP-01 (added 2026-07-09 — audit finding): the ONLY
+    # silent-data-loss path for a sealed candle (ring + spill + DLQ all
+    # failed), Severity::Critical, previously paged NOBODY. Emit site:
+    # crates/storage/src/seal_writer_loop.rs::record_cycle_observability —
+    # error!(code = ErrorCode::AggregatorDrop01.code_str(), dropped = N)
+    # fires once per drain cycle with a non-zero truly-dropped count, so a
+    # persistent catastrophic host state repeat-emits per cycle and
+    # eval-3/dta-1 holds ALARM across <=15-min gaps. ok_recovery = false:
+    # a drop is a discrete PERMANENT data-loss event (the dropped seals are
+    # gone from the durable chain) — the auto-OK ~15 min after the episode
+    # ages out can never mean "the candles came back" (Rule-11
+    # false-recovery; the PROC-01 precedent). The counter-side pager on
+    # tv_seal_writer_drain_total{kind="dropped"} lives in seal-drop-alarm.tf.
+    "aggregator-drop-01" = {
+      pattern     = "{ $.code = \"AGGREGATOR-DROP-01\" && $.level = \"ERROR\" }"
+      period      = 300
+      threshold   = 1
+      eval        = 3
+      dta         = 1
+      ok_recovery = false # 2026-07-09: discrete permanent data loss - the dropped sealed candles do not come back when the episode ages out (Rule-11 false-recovery; PROC-01 precedent)
+      desc        = "AGGREGATOR-DROP-01: sealed candle(s) DROPPED after ring + spill + DLQ ALL failed (Severity Critical - the only silent-data-loss path for sealed candles; by definition the host is out of memory AND out of disk AND data/dlq/ is unwritable). NO recovered/OK page: the loss is permanent - the auto-OK ~15 min later only means the episode aged out. Triage: docker/host state, df -h /data, ls -la data/spill/ data/dlq/; if the host is healthy and dirs writable, restart the app. Counter-side pager: tv-<env>-seal-writer-dropped (seal-drop-alarm.tf). Runbook: .claude/rules/project/wave-6-error-codes.md"
+    }
   }
 }
 
@@ -199,7 +229,8 @@ resource "aws_cloudwatch_metric_alarm" "error_code" {
   treat_missing_data  = "notBreaching"
   # deliberately NO dimensions (see filter comment)
   alarm_actions = local.app_alarm_actions
-  # ok_recovery = false (rest-canary-01, ws-reinject-01, proc-01, dh-906 -
+  # ok_recovery = false (rest-canary-01, ws-reinject-01, proc-01, dh-906,
+  # aggregator-drop-01 [2026-07-09] -
   # the one-shot/discrete emitters) suppresses the OK page: their auto-OK
   # ~15 min after the datapoint ages out would be a Rule-11 false
   # "recovered" message while the condition persists (see the locals
