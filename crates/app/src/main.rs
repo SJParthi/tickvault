@@ -1142,6 +1142,17 @@ async fn main() -> Result<()> {
         "feed" => tickvault_common::feed::Feed::Groww.as_str(),
     )
     .increment(0);
+    // Never-streamed attribution counter (2026-07-09 reject-loop hardening):
+    // same delta-baseline rationale as the counter above — pre-register so
+    // the CW agent's dropped-first-sample can never eat the session's first
+    // never-streamed restart from the attribution split. The pager math is
+    // unaffected (never-streamed restarts ALSO increment the stall counter
+    // above, which the tv-<env>-feed-stall-restarts alarm reads).
+    metrics::counter!(
+        "tv_feed_sidecar_never_streamed_restart_total",
+        "feed" => tickvault_common::feed::Feed::Groww.as_str(),
+    )
+    .increment(0);
 
     // L18 (revised) + L121-L130 (Wave-5 in-memory-store plan §AA):
     // register the per-subsystem memory gauges, the sampler heartbeat,
