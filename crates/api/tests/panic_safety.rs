@@ -130,16 +130,26 @@ fn no_panic_health_response_serialization() {
 // Must NOT panic: /api/stats with unreachable QuestDB
 // ---------------------------------------------------------------------------
 
+/// Reads the JSON body of a stats response (2026-07-09 hardening changed
+/// `get_stats` to return a `Response` so the TTL cache can serve
+/// pre-serialized bodies).
+async fn stats_body_json(response: axum::response::Response) -> serde_json::Value {
+    let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+        .await
+        .expect("stats body readable");
+    serde_json::from_slice(&bytes).expect("stats body is JSON")
+}
+
 #[tokio::test]
 async fn no_panic_stats_unreachable_questdb() {
     let state = make_test_state(test_questdb_config_unreachable());
-    let Json(result) = get_stats(State(state)).await;
-    assert!(!result.questdb_reachable);
-    assert_eq!(result.tables, 0);
-    assert_eq!(result.underlyings, 0);
-    assert_eq!(result.derivatives, 0);
-    assert_eq!(result.subscribed_indices, 0);
-    assert_eq!(result.ticks, 0);
+    let result = stats_body_json(get_stats(State(state)).await).await;
+    assert_eq!(result["questdb_reachable"], serde_json::json!(false));
+    assert_eq!(result["tables"], serde_json::json!(0));
+    assert_eq!(result["underlyings"], serde_json::json!(0));
+    assert_eq!(result["derivatives"], serde_json::json!(0));
+    assert_eq!(result["subscribed_indices"], serde_json::json!(0));
+    assert_eq!(result["ticks"], serde_json::json!(0));
 }
 
 #[tokio::test]
@@ -151,9 +161,9 @@ async fn no_panic_stats_with_zero_port() {
         ilp_port: 0,
     };
     let state = make_test_state(config);
-    let Json(result) = get_stats(State(state)).await;
+    let result = stats_body_json(get_stats(State(state)).await).await;
     // Port 0 is invalid — should not panic, just fail gracefully
-    assert!(!result.questdb_reachable);
+    assert_eq!(result["questdb_reachable"], serde_json::json!(false));
 }
 
 // ---------------------------------------------------------------------------

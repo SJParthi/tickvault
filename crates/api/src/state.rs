@@ -6,6 +6,16 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 /// Timeout for QuestDB HTTP queries from API handlers (seconds).
 const QUESTDB_HTTP_CLIENT_TIMEOUT_SECS: u64 = 10;
 
+/// TTL for the cached `/api/stats` response body (2026-07-09 audit
+/// hardening). The `/dashboard` page polls every ~5s, so a 5s TTL means at
+/// most one 5-query QuestDB pass per poll interval regardless of how many
+/// internet clients hammer the endpoint.
+const STATS_CACHE_TTL_SECS: u64 = 5;
+
+/// TTL for cached `/api/quote/{security_id}` 200 bodies. "Latest tick"
+/// honestly becomes "latest tick, ≤1s old" — documented envelope change.
+const QUOTE_CACHE_TTL_SECS: u64 = 1;
+
 use tickvault_common::config::{DhanConfig, InstrumentConfig, QuestDbConfig};
 use tickvault_common::feed_health::FeedHealthRegistry;
 
@@ -271,6 +281,13 @@ struct AppStateInner {
     /// truthful live verdict. Lock-free O(1). The 4/5-arg constructors create a
     /// fresh empty registry (tests); production injects the boot-shared one.
     feed_health: Arc<FeedHealthRegistry>,
+    /// TTL cache for the `/api/stats` response body (2026-07-09 audit
+    /// hardening — public-funnel DoS/DB-load surface). Single slot, 5s TTL.
+    stats_cache: crate::response_cache::SingleSlotTtlCache,
+    /// TTL cache for `/api/quote/{security_id}` 200 bodies. Per-SID, 1s TTL,
+    /// hard entry cap; the handler caches ONLY 200 responses so garbage
+    /// attacker-chosen security_ids can never grow the map.
+    quote_cache: crate::response_cache::BoundedTtlCache,
 }
 
 impl SharedAppState {
@@ -343,6 +360,13 @@ impl SharedAppState {
                 questdb_http_client,
                 feed_runtime,
                 feed_health,
+                stats_cache: crate::response_cache::SingleSlotTtlCache::new(
+                    std::time::Duration::from_secs(STATS_CACHE_TTL_SECS),
+                ),
+                quote_cache: crate::response_cache::BoundedTtlCache::new(
+                    std::time::Duration::from_secs(QUOTE_CACHE_TTL_SECS),
+                    crate::response_cache::QUOTE_CACHE_MAX_ENTRIES,
+                ),
             }),
         }
     }
@@ -389,6 +413,19 @@ impl SharedAppState {
     /// `GET /api/feeds/health` reads it for the truthful per-feed verdict).
     pub fn feed_health(&self) -> &Arc<FeedHealthRegistry> {
         &self.inner.feed_health
+    }
+
+    /// Returns the `/api/stats` TTL response cache (2026-07-09 hardening).
+    // TEST-EXEMPT: trivial accessor; exercised by stats-handler cache tests.
+    pub fn stats_cache(&self) -> &crate::response_cache::SingleSlotTtlCache {
+        &self.inner.stats_cache
+    }
+
+    /// Returns the `/api/quote/{security_id}` TTL response cache
+    /// (2026-07-09 hardening; only-200 bodies, bounded).
+    // TEST-EXEMPT: trivial accessor; exercised by quote-handler cache tests.
+    pub fn quote_cache(&self) -> &crate::response_cache::BoundedTtlCache {
+        &self.inner.quote_cache
     }
 }
 
