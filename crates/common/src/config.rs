@@ -1022,6 +1022,13 @@ pub struct NotificationConfig {
     /// coalescing behavior.
     #[serde(default = "default_notification_digest_window_secs")]
     pub digest_window_secs: u64,
+    /// Boot bubble (2026-07-09 operator escalation) kill switch: ONE
+    /// consolidated, live-edited boot checklist bubble per boot. `false`
+    /// routes the boot milestones back through their unchanged legacy
+    /// immediate dispatch (per-event spray) WITHOUT touching the
+    /// `episode_mode` WS-episode machinery.
+    #[serde(default = "default_notification_boot_bubble")]
+    pub boot_bubble: bool,
 }
 
 /// Lower clamp bound for `[notification] digest_window_secs` (== the legacy
@@ -1033,6 +1040,10 @@ pub const NOTIFICATION_DIGEST_WINDOW_MIN_SECS: u64 = 60;
 pub const NOTIFICATION_DIGEST_WINDOW_MAX_SECS: u64 = 3600;
 
 fn default_notification_episode_mode() -> bool {
+    true
+}
+
+fn default_notification_boot_bubble() -> bool {
     true
 }
 
@@ -1063,6 +1074,7 @@ impl Default for NotificationConfig {
             sns_enabled: false,
             episode_mode: default_notification_episode_mode(),
             digest_window_secs: default_notification_digest_window_secs(),
+            boot_bubble: default_notification_boot_bubble(),
         }
     }
 }
@@ -2809,6 +2821,8 @@ mod tests {
         // Telegram UX Overhaul (2026-07-07) kill switches.
         assert!(config.episode_mode, "episode mode ships ON by default");
         assert_eq!(config.digest_window_secs, 900);
+        // Boot bubble (2026-07-09) ships ON by default.
+        assert!(config.boot_bubble, "boot bubble ships ON by default");
     }
 
     #[test]
@@ -2849,6 +2863,10 @@ mod tests {
             toml::from_str(toml_str).expect("legacy notification TOML must parse");
         assert!(config.episode_mode);
         assert_eq!(config.digest_window_secs, 900);
+        assert!(
+            config.boot_bubble,
+            "legacy TOML defaults the boot bubble ON"
+        );
     }
 
     // --- Wave-5 §K-L6/L7/L8 (PR #504c) ratchets -----------------------
