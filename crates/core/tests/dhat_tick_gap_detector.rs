@@ -53,7 +53,10 @@ fn record_tick_hot_path_bounded_allocation() {
     // Pre-seed BEFORE the profiler window so the initial papaya bucket
     // allocations don't count against the hot path.
     let fixed_now = Instant::now();
-    for id in 0..100_u32 {
+    // u64 per the 2026-06-29 SecurityId u32→u64 widening
+    // (active-plan-groww-security-id-u64.md) — mechanical type fix only;
+    // allocation budgets below are UNCHANGED ratchets.
+    for id in 0..100_u64 {
         detector.record_tick(id, ExchangeSegment::IdxI, fixed_now);
         detector.record_tick(id, ExchangeSegment::NseFno, fixed_now);
     }
@@ -63,7 +66,7 @@ fn record_tick_hot_path_bounded_allocation() {
     let stats_before = dhat::HeapStats::get();
 
     for round in 1..=250_u32 {
-        for id in 0..100_u32 {
+        for id in 0..100_u64 {
             detector.record_tick(id, ExchangeSegment::IdxI, fixed_now);
             detector.record_tick(id, ExchangeSegment::NseFno, fixed_now);
         }
