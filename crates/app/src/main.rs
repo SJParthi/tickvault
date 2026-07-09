@@ -1153,6 +1153,25 @@ async fn main() -> Result<()> {
         "feed" => tickvault_common::feed::Feed::Groww.as_str(),
     )
     .increment(0);
+    // Seal-writer TRUE-DROP counter (2026-07-09 candle-drop paging PR):
+    // same delta-baseline rationale as the two registrations above — the CW
+    // agent's prometheus pipeline drops each counter series' FIRST sample
+    // as its baseline, and tv_seal_writer_drain_total{kind="dropped"}
+    // increments ONLY when sealed candles are truly dropped (ring + spill +
+    // DLQ all failed — AGGREGATOR-DROP-01, the only silent-data-loss path
+    // for sealed candles). Without this post-install registration the
+    // series is born AT the first drop and the dropped baseline sample IS
+    // the drop — a single-episode drop (the dominant shape) would produce
+    // ZERO datapoints and the tv-<env>-seal-writer-dropped counter alarm
+    // (deploy/aws/terraform/seal-drop-alarm.tf) would be dead on arrival.
+    // Registering at 0 here makes the series DENSE from boot (a 0-delta
+    // /metrics event per 60s scrape), so the dropped first sample is the
+    // harmless 0 baseline and the pager genuinely sees the session's first
+    // drop. The other 5 `kind` values are busy/self-baselining and feed no
+    // alarm — only "dropped" needs the honest baseline. Ratchet
+    // (source-order scan of this file):
+    // crates/app/tests/seal_drop_paging_wiring_guard.rs.
+    metrics::counter!("tv_seal_writer_drain_total", "kind" => "dropped").increment(0);
 
     // L18 (revised) + L121-L130 (Wave-5 in-memory-store plan §AA):
     // register the per-subsystem memory gauges, the sampler heartbeat,

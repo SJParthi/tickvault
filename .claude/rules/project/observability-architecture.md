@@ -51,8 +51,16 @@ sidecar's own >5-restarts-per-5-min STORM escalation ONLY; per-restart lines
 are warn!-level and invisible here — the ≥3-restarts-per-15-min restart pager
 is the separate `tv_feed_sidecar_stall_restart_total` counter alarm,
 `feed-stall-restart-alarm.tf`; round-3 correction 2026-07-06),
-WS-REINJECT-01, PROC-01. **Everything else is log-sink-only** unless it has
-its own metric alarm (app-alarms.tf) or a typed `NotificationEvent`.
+WS-REINJECT-01, PROC-01, **AGGREGATOR-DROP-01 (added 2026-07-09** — the
+audit found the Severity::Critical sealed-candle-drop code, the ONLY
+silent-data-loss path for sealed candles, paged nobody; it also gains a
+redundant counter-side pager on `tv_seal_writer_drain_total{kind="dropped"}`
+— `tv-<env>-seal-writer-dropped`, `seal-drop-alarm.tf`, with the dropped
+series pre-registered at 0 post-recorder-install in main.rs per the
+feed-stall round-5 first-sample-baseline lesson; lockstep ratchet
+`crates/app/tests/seal_drop_paging_wiring_guard.rs`**)**. **Everything else
+is log-sink-only** unless it has its own metric alarm (app-alarms.tf) or a
+typed `NotificationEvent`.
 
 ## The ErrorCode taxonomy (53 variants, 100% rule-synced)
 
