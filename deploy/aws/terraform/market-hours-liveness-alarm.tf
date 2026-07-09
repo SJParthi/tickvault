@@ -14,7 +14,9 @@
 #         `failed`, metrics go MISSING) — but a wedged/HUNG app (alive PID, no
 #         work) still publishes nothing new and needs an alarm to page.
 #     (b) The ONLY "breaching on missing" app alarm is boot-heartbeat, and its
-#         actions are gated to 08:50–09:10 IST (boot-heartbeat-alarm.tf). EVERY
+#         actions are gated to 08:50–09:20 IST (boot-heartbeat-alarm.tf;
+#         2026-07-09 — the close moved 09:10→09:20 so the boot window hands
+#         over to THIS window with no [09:10, 09:20) seam over the open). EVERY
 #         other alarm in app-alarms.tf is treat_missing_data="notBreaching" (so
 #         they never stale-fire while the box is intentionally stopped) — which
 #         means a post-09:10 wedge/crash-loop NEVER pages: the metric just goes
@@ -436,6 +438,6 @@ resource "aws_lambda_permission" "tv_market_hours_liveness_close" {
 }
 
 output "market_hours_liveness_alarm_name" {
-  description = "Market-hours liveness alarm (pages on a wedged/crash-looped/dead app in the 09:20-15:35 IST window). Signal: the tv_realtime_guarantee_score gauge MISSING (treat_missing_data=breaching) — emitted every 10s by the SLO loop in crates/app/src/main.rs, in the CW-agent filter (user-data.sh.tftpl). Closes the post-09:10 IST no-page gap the boot-heartbeat window leaves open. The same gate Lambda also window-gates realtime-guarantee-critical + aggregator-no-seals (2026-07-03 5 AM false-SOS fix)."
+  description = "Market-hours liveness alarm (pages on a wedged/crash-looped/dead app in the 09:20-15:35 IST window). Signal: the tv_realtime_guarantee_score gauge MISSING (treat_missing_data=breaching) — emitted every 10s by the SLO loop in crates/app/src/main.rs, in the CW-agent filter (user-data.sh.tftpl). Takes over from the boot-heartbeat window at exactly 09:20 IST (2026-07-09 — the boot window close moved 09:10→09:20, so there is no seam over the 09:15 market open). The same gate Lambda also window-gates realtime-guarantee-critical + aggregator-no-seals (2026-07-03 5 AM false-SOS fix)."
   value       = aws_cloudwatch_metric_alarm.market_hours_liveness_missing.alarm_name
 }

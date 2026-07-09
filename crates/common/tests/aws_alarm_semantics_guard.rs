@@ -143,6 +143,72 @@ fn test_eventbridge_dlq_retention_is_bounded_drain_after_inspect() {
 }
 
 #[test]
+fn test_boot_heartbeat_window_hands_over_to_market_hours_window() {
+    // 2026-07-09 SEAM CLOSURE ratchet: the boot-heartbeat window originally
+    // closed at 09:10 IST (cron(40 3)) while the market-hours liveness window
+    // only opens at 09:20 IST (cron(50 3)) AND resets its alarms OK on open
+    // (5-period evaluation → first possible page ~09:25-09:26). A process
+    // death anywhere in [09:10, 09:20) IST — exactly spanning the 09:15
+    // market open — paged nobody inside the seam and at best ~09:25 (up to
+    // ~15 min blind over the highest-value window of the day). The fix moved
+    // the boot-window close to 09:20 IST so coverage hands over at the exact
+    // minute the market-hours window opens. This pin forces any future move
+    // of EITHER cron to re-derive the handover in the same PR.
+    let boot = read("deploy/aws/terraform/boot-heartbeat-alarm.tf");
+    let market = read("deploy/aws/terraform/market-hours-liveness-alarm.tf");
+
+    let boot_open = tf_resource_block(&boot, "aws_cloudwatch_event_rule", "tv_boot_heartbeat_open");
+    let boot_close = tf_resource_block(
+        &boot,
+        "aws_cloudwatch_event_rule",
+        "tv_boot_heartbeat_close",
+    );
+    let market_open = tf_resource_block(
+        &market,
+        "aws_cloudwatch_event_rule",
+        "tv_market_hours_liveness_open",
+    );
+
+    // Pin the FULL `schedule_expression = "..."` attribute line (not a bare
+    // cron substring), so an in-block comment or description mentioning the
+    // cron can never vacuously satisfy the pin while the schedule regresses.
+    assert!(
+        boot_open.contains("schedule_expression = \"cron(20 3 ? * MON-FRI *)\""),
+        "boot-heartbeat OPEN must stay 08:50 IST (schedule_expression = \
+         cron(20 3 ? * MON-FRI *)) — 10 min after the 08:40 IST soft boot \
+         deadline (§10)."
+    );
+    assert!(
+        boot_close.contains("schedule_expression = \"cron(50 3 ? * MON-FRI *)\""),
+        "boot-heartbeat CLOSE must stay 09:20 IST (schedule_expression = \
+         cron(50 3 ? * MON-FRI *)) — the exact minute the market-hours liveness \
+         window opens. Moving it earlier re-opens the [close, 09:20) no-page \
+         seam spanning the 09:15 market open (2026-07-09 audit finding); moving \
+         it later widens the double-page overlap with the market-hours window."
+    );
+    assert!(
+        !boot_close.contains("cron(40 3"),
+        "regression pin: the boot-heartbeat close must NOT regress to 09:10 \
+         IST (cron(40 3)) — that re-opens the 09:10-09:20 IST blind hole."
+    );
+    assert!(
+        boot_close.contains("state = \"ENABLED\""),
+        "the boot-heartbeat close rule must pin state = \"ENABLED\" — with the \
+         attribute absent the AWS provider stops MANAGING rule state (the #1404 \
+         lesson), and a once-disabled close rule leaves the breaching-on-missing \
+         alarm's actions armed past 09:20 → the intentional 16:30 IST stop \
+         false-pages nightly."
+    );
+    assert!(
+        market_open.contains("schedule_expression = \"cron(50 3 ? * MON-FRI *)\""),
+        "market-hours liveness OPEN must stay 09:20 IST (schedule_expression = \
+         cron(50 3 ? * MON-FRI *)); if it moves, the boot-heartbeat close \
+         (currently the same minute) must move WITH it in the same PR or the \
+         seam re-opens."
+    );
+}
+
+#[test]
 fn test_boot_heartbeat_alarm_contract_unchanged() {
     let tf = read("deploy/aws/terraform/boot-heartbeat-alarm.tf");
     let block = tf_resource_block(&tf, "aws_cloudwatch_metric_alarm", "boot_heartbeat_missing");
