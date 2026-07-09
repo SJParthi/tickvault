@@ -89,6 +89,19 @@ pub const EPISODE_EDIT_FAILURES_FALLBACK_THRESHOLD: u8 = 2;
 /// SNS-SMS leg).
 pub const EPISODE_DOWN_STALE_EXPIRE_SECS: u64 = 1800;
 
+/// Boot-bubble render ceiling — characters (2026-07-09 operator escalation:
+/// ONE consolidated boot bubble per boot). Larger than the WS steady ceiling
+/// because the checklist carries one line per boot component, still far
+/// below one Telegram chunk.
+pub const BOOT_BUBBLE_MAX_CHARS: usize = 1200;
+
+/// Seconds after `BootMilestone::Complete` before the boot bubble retires
+/// SILENTLY (registry state + checklist cleared, NO edit). Late stragglers
+/// inside the window still fold into the completed bubble; a mapped event
+/// AFTER retirement (mid-day lane cold start / feed re-enable) opens a
+/// fresh mini-checklist bubble instead of editing the morning's message.
+pub const BOOT_BUBBLE_RETIRE_SECS: u64 = 900;
+
 const MS_PER_SEC: u64 = 1000;
 
 // ---------------------------------------------------------------------------
@@ -105,6 +118,11 @@ pub enum EpisodeFamily {
     MainFeedWs,
     /// Dhan order-update WebSocket lifecycle.
     OrderUpdateWs,
+    /// The consolidated boot bubble (2026-07-09 operator escalation — the
+    /// ~8-message boot spray folds into ONE live-edited checklist bubble).
+    /// Single fixed key ([`BOOT_EPISODE_KEY`]); excluded from the tick
+    /// promote/expire scans and from the cross-restart snapshot.
+    Boot,
 }
 
 impl EpisodeFamily {
@@ -114,6 +132,7 @@ impl EpisodeFamily {
     pub const fn badge(self) -> &'static str {
         match self {
             Self::MainFeedWs | Self::OrderUpdateWs => "\u{1f537} DHAN", // 🔷
+            Self::Boot => "\u{1f680}",                                  // 🚀
         }
     }
 
@@ -123,6 +142,7 @@ impl EpisodeFamily {
         match self {
             Self::MainFeedWs => "Live price feed",
             Self::OrderUpdateWs => "Order confirmations feed",
+            Self::Boot => "System boot",
         }
     }
 
@@ -132,6 +152,7 @@ impl EpisodeFamily {
         match self {
             Self::MainFeedWs => "main_feed_ws",
             Self::OrderUpdateWs => "order_update_ws",
+            Self::Boot => "boot",
         }
     }
 
@@ -142,6 +163,7 @@ impl EpisodeFamily {
         match label {
             "main_feed_ws" => Some(Self::MainFeedWs),
             "order_update_ws" => Some(Self::OrderUpdateWs),
+            "boot" => Some(Self::Boot),
             _ => None,
         }
     }
@@ -152,6 +174,30 @@ impl EpisodeFamily {
 pub struct EpisodeKey {
     pub family: EpisodeFamily,
     pub conn: u8,
+}
+
+/// The single fixed key for the consolidated boot bubble.
+pub const BOOT_EPISODE_KEY: EpisodeKey = EpisodeKey {
+    family: EpisodeFamily::Boot,
+    conn: 0,
+};
+
+/// Per-family episode timing knobs.
+///
+/// - WS families keep the pinned [`EpisodeConfig::default`] values
+///   (ratcheted by `episode_edit_wiring_guard.rs`).
+/// - `Boot` runs a ZERO edit throttle: milestones are bounded (≤ ~12 per
+///   process), the fnv1a hash-skip kills identical re-renders, and the
+///   operator must see each component flip ✅ promptly.
+#[must_use]
+pub fn episode_config_for(family: EpisodeFamily) -> EpisodeConfig {
+    match family {
+        EpisodeFamily::MainFeedWs | EpisodeFamily::OrderUpdateWs => EpisodeConfig::default(),
+        EpisodeFamily::Boot => EpisodeConfig {
+            edit_min_interval_secs: 0,
+            ..EpisodeConfig::default()
+        },
+    }
 }
 
 /// The role an incoming event plays inside an episode.
@@ -281,6 +327,174 @@ impl Default for EpisodeConfig {
             reopen_secs: EPISODE_REOPEN_SECS,
             down_stale_expire_secs: EPISODE_DOWN_STALE_EXPIRE_SECS,
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Boot bubble (2026-07-09) — milestones + checklist + render
+// ---------------------------------------------------------------------------
+
+/// State of the Dhan price-feed line on the boot checklist.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BootDhanFeed {
+    /// The main-feed pool reached Connected.
+    Online {
+        connected: u32,
+        total: u32,
+        /// Age (secs) of the freshest REAL tick, `None` = no real tick yet
+        /// (the render keeps the honest "no real prices yet" caveat).
+        last_real_tick_age_secs: Option<u32>,
+    },
+    /// Off-hours boot — connections deliberately wait for market open.
+    DeferredOffHours,
+}
+
+/// One typed boot milestone folded into the [`BootChecklist`].
+///
+/// All variants are `Copy` (the `&'static str` mode rides `StartupComplete`'s
+/// existing static label) so the per-event extraction never allocates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BootMilestone {
+    /// Infrastructure services health check completed.
+    Services { healthy: u32, total: u32 },
+    /// Dhan JWT acquired.
+    DhanAuth,
+    /// Instrument universe loaded (`count` = contracts + underlyings).
+    Instruments { count: u32 },
+    /// Dhan main-feed pool online.
+    DhanFeedOnline {
+        connected: u32,
+        total: u32,
+        last_real_tick_age_secs: Option<u32>,
+    },
+    /// Dhan main-feed deferred until the next market open (off-hours boot).
+    DhanFeedDeferredOffHours,
+    /// Order-update WebSocket task connected.
+    OrderUpdateConnected,
+    /// Order-update WebSocket auth handshake confirmed by the server.
+    OrderUpdateAuthenticated,
+    /// Groww feed token read + accepted.
+    GrowwAuth,
+    /// Groww feed instrument set resolved.
+    GrowwInstruments { subscribed: u32 },
+    /// Groww socket connected + subscribed (awaiting first tick).
+    GrowwConnected { market_open: bool },
+    /// Boot finished (`StartupComplete`).
+    Complete { mode: &'static str },
+}
+
+/// The one-per-boot live checklist behind the consolidated boot bubble.
+///
+/// Every slot is an `Option` so [`Self::fold`] is idempotent AND
+/// commutative — duplicate or out-of-order milestones (boot emits from
+/// several spawned tasks) converge to the same render.
+#[derive(Debug, Clone, Default)]
+pub struct BootChecklist {
+    /// Epoch ms of the first observed milestone (or the flavor init).
+    pub started_at_ms: u64,
+    /// Epoch ms of `Complete` (first one wins).
+    pub complete_at_ms: Option<u64>,
+    /// Run mode carried by `Complete` (e.g. "sandbox" / "LIVE").
+    pub mode: Option<&'static str>,
+    /// `true` iff the on-disk previous-boot sha and the built-in sha are
+    /// BOTH valid lowercase hex AND differ (never claimed on `unknown`).
+    pub new_code: bool,
+    /// Short build sha for the header; empty/`unknown` renders plainly.
+    pub build_sha_short: String,
+    /// Which feed lines to show as ⏳-pending from the first page:
+    /// `(dhan_enabled, groww_enabled)`. `None` = lazy mode (only lines
+    /// with data render).
+    pub expectations: Option<(bool, bool)>,
+    pub services: Option<(u32, u32)>,
+    pub dhan_auth: bool,
+    pub instruments: Option<u32>,
+    pub dhan_feed: Option<BootDhanFeed>,
+    pub order_update_connected: bool,
+    pub order_update_authenticated: bool,
+    pub groww_auth: bool,
+    pub groww_instruments: Option<u32>,
+    /// `Some(market_open)` once the Groww socket connected + subscribed.
+    pub groww_connected: Option<bool>,
+    /// A render is pending delivery (set on fold; cleared by the shell on
+    /// a successfully-applied send/edit or a byte-identical hash-skip).
+    /// The drain ticker re-drives a dirty checklist so a failed FINAL
+    /// edit (no further milestone will ever arrive) is retried ≤10s.
+    pub dirty: bool,
+    /// `true` when this checklist opened AFTER a completed boot bubble
+    /// already retired in this process — i.e. a mid-day feed/component
+    /// restart, NOT a system boot (hostile-review fix 2026-07-09). A mini
+    /// checklist renders a neutral "Feed update" header (never "tickvault
+    /// starting"), no "Boot finishing…" footer, and retires on an idle
+    /// window instead of requiring `Complete` (which never re-fires).
+    pub mini: bool,
+    /// Epoch ms of the most recent fold — drives the mini idle retirement.
+    pub last_fold_ms: u64,
+}
+
+impl BootChecklist {
+    /// Fresh checklist anchored at `now_ms`.
+    #[must_use]
+    pub fn new(now_ms: u64, new_code: bool, build_sha_short: String) -> Self {
+        Self {
+            started_at_ms: now_ms,
+            last_fold_ms: now_ms,
+            new_code,
+            build_sha_short,
+            ..Self::default()
+        }
+    }
+
+    /// Folds one milestone in. Idempotent (re-folding the same milestone
+    /// is a no-op beyond `dirty`) and commutative (independent slots).
+    pub fn fold(&mut self, milestone: BootMilestone, now_ms: u64) {
+        match milestone {
+            BootMilestone::Services { healthy, total } => {
+                self.services = Some((healthy, total));
+            }
+            BootMilestone::DhanAuth => self.dhan_auth = true,
+            BootMilestone::Instruments { count } => self.instruments = Some(count),
+            BootMilestone::DhanFeedOnline {
+                connected,
+                total,
+                last_real_tick_age_secs,
+            } => {
+                self.dhan_feed = Some(BootDhanFeed::Online {
+                    connected,
+                    total,
+                    last_real_tick_age_secs,
+                });
+            }
+            BootMilestone::DhanFeedDeferredOffHours => {
+                self.dhan_feed = Some(BootDhanFeed::DeferredOffHours);
+            }
+            BootMilestone::OrderUpdateConnected => self.order_update_connected = true,
+            BootMilestone::OrderUpdateAuthenticated => {
+                self.order_update_connected = true;
+                self.order_update_authenticated = true;
+            }
+            BootMilestone::GrowwAuth => self.groww_auth = true,
+            BootMilestone::GrowwInstruments { subscribed } => {
+                self.groww_instruments = Some(subscribed);
+            }
+            BootMilestone::GrowwConnected { market_open } => {
+                self.groww_connected = Some(market_open);
+            }
+            BootMilestone::Complete { mode } => {
+                // First Complete wins (idempotence under duplicates).
+                if self.complete_at_ms.is_none() {
+                    self.complete_at_ms = Some(now_ms);
+                }
+                self.mode.get_or_insert(mode);
+            }
+        }
+        self.dirty = true;
+        self.last_fold_ms = self.last_fold_ms.max(now_ms);
+    }
+
+    /// `true` once `Complete` folded in.
+    #[must_use]
+    pub fn is_complete(&self) -> bool {
+        self.complete_at_ms.is_some()
     }
 }
 
@@ -445,6 +659,16 @@ pub struct EpisodeTickOutcome {
 pub struct EpisodeRegistry {
     inner: Mutex<HashMap<EpisodeKey, EpisodeState>>,
     tombstones: Mutex<HashMap<EpisodeKey, ClosedTombstone>>,
+    /// The one-per-boot checklist behind the consolidated boot bubble
+    /// (2026-07-09). LOCK ORDER: never held together with `inner` /
+    /// `tombstones` — every method takes one lock at a time.
+    boot: Mutex<Option<BootChecklist>>,
+    /// Latched `true` once a COMPLETED boot bubble retired in this
+    /// process. Any boot-keyed milestone arriving after that is a mid-day
+    /// feed/component restart — the fresh checklist it opens is a MINI
+    /// bubble (neutral header, idle retirement), never a false
+    /// "tickvault starting" claim (hostile-review fix 2026-07-09).
+    boot_completed_retired: std::sync::atomic::AtomicBool,
 }
 
 impl EpisodeRegistry {
@@ -467,6 +691,142 @@ impl EpisodeRegistry {
             Ok(g) => g,
             Err(poisoned) => poisoned.into_inner(),
         }
+    }
+
+    fn lock_boot(&self) -> std::sync::MutexGuard<'_, Option<BootChecklist>> {
+        match self.boot.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+
+    // -- Boot bubble (2026-07-09) -------------------------------------------
+
+    /// Fresh checklist honoring the completed-boot latch: created AFTER a
+    /// completed boot bubble retired ⇒ a MINI (feed-update) checklist.
+    fn fresh_boot_checklist(&self, now_ms: u64) -> BootChecklist {
+        let mut cl = BootChecklist::new(now_ms, false, String::new());
+        cl.mini = self
+            .boot_completed_retired
+            .load(std::sync::atomic::Ordering::Relaxed);
+        cl
+    }
+
+    /// Sets the deploy-flavor fields (creates the checklist when absent so
+    /// the flavor is never lost to milestone-vs-init ordering).
+    pub fn set_boot_flavor(&self, new_code: bool, build_sha_short: &str, now_ms: u64) {
+        let mut boot = self.lock_boot();
+        let cl = boot.get_or_insert_with(|| self.fresh_boot_checklist(now_ms));
+        cl.new_code = new_code;
+        cl.build_sha_short = build_sha_short.to_string();
+    }
+
+    /// Declares which feed lines the checklist shows as ⏳-pending from the
+    /// first page (`None` until called → lazy render of data-only lines).
+    pub fn set_boot_expectations(&self, dhan: bool, groww: bool, now_ms: u64) {
+        let mut boot = self.lock_boot();
+        let cl = boot.get_or_insert_with(|| self.fresh_boot_checklist(now_ms));
+        cl.expectations = Some((dhan, groww));
+    }
+
+    /// Folds one boot milestone into the checklist, then runs the SAME
+    /// pure FSM (role `Open`, severity fixed Low) for the message-id /
+    /// fallback mechanics. Returns the decision + a post-fold snapshot.
+    #[must_use]
+    pub fn apply_boot_milestone(
+        &self,
+        milestone: BootMilestone,
+        now_ms: u64,
+        cfg: &EpisodeConfig,
+    ) -> (EpisodeDecision, BootChecklist) {
+        let checklist = {
+            let mut boot = self.lock_boot();
+            let cl = boot.get_or_insert_with(|| self.fresh_boot_checklist(now_ms));
+            cl.fold(milestone, now_ms);
+            cl.clone()
+        };
+        let decision = self.apply_event(
+            BOOT_EPISODE_KEY,
+            EpisodeRole::Open,
+            Severity::Low,
+            0,
+            now_ms,
+            cfg,
+        );
+        (decision, checklist)
+    }
+
+    /// Post-fold checklist snapshot (`None` when no boot bubble is live).
+    #[must_use]
+    pub fn boot_checklist(&self) -> Option<BootChecklist> {
+        self.lock_boot().clone()
+    }
+
+    /// Clears the pending-delivery flag after a successfully-applied
+    /// send/edit (or a byte-identical hash-skip).
+    pub fn mark_boot_delivered(&self) {
+        if let Some(cl) = self.lock_boot().as_mut() {
+            cl.dirty = false;
+        }
+    }
+
+    /// Ticker re-drive probe: a dirty checklist plus the current bubble
+    /// message id (`None` id = the first page never landed → fresh send).
+    #[must_use]
+    pub fn boot_redrive_candidate(&self) -> Option<(BootChecklist, Option<i64>)> {
+        let checklist = {
+            let boot = self.lock_boot();
+            match boot.as_ref() {
+                Some(cl) if cl.dirty => cl.clone(),
+                _ => return None,
+            }
+        };
+        let message_id = self
+            .lock_inner()
+            .get(&BOOT_EPISODE_KEY)
+            .and_then(|st| st.message_id);
+        Some((checklist, message_id))
+    }
+
+    /// Silently retires a fully-delivered boot bubble (no edit, no
+    /// tombstone). Returns `true` when retirement happened.
+    ///
+    /// - The one-per-boot MAIN bubble retires [`BOOT_BUBBLE_RETIRE_SECS`]
+    ///   after `Complete`; an incomplete boot never retires in-process —
+    ///   the bubble honestly keeps showing ⏳ while the untouched
+    ///   CRITICAL/HIGH failure pages own loudness. Retiring it latches
+    ///   `boot_completed_retired`, so later boot-keyed events open MINI
+    ///   (feed-update) bubbles.
+    /// - A MINI bubble never sees `Complete` (`StartupComplete` fires
+    ///   once per process), so it retires after the SAME window of
+    ///   delivered idleness since its last fold (hostile-review fix
+    ///   2026-07-09 — no permanently-stuck mid-day bubble).
+    #[must_use]
+    pub fn retire_boot(&self, now_ms: u64) -> bool {
+        let window_ms = BOOT_BUBBLE_RETIRE_SECS.saturating_mul(MS_PER_SEC);
+        let (retire, completed) = {
+            let boot = self.lock_boot();
+            match boot.as_ref() {
+                Some(cl) if !cl.dirty => {
+                    let complete_elapsed = cl
+                        .complete_at_ms
+                        .is_some_and(|t| now_ms.saturating_sub(t) >= window_ms);
+                    let mini_idle = cl.mini && now_ms.saturating_sub(cl.last_fold_ms) >= window_ms;
+                    (complete_elapsed || mini_idle, cl.is_complete())
+                }
+                _ => (false, false),
+            }
+        };
+        if retire {
+            if completed {
+                self.boot_completed_retired
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            *self.lock_boot() = None;
+            let _ = self.lock_inner().remove(&BOOT_EPISODE_KEY);
+            let _ = self.lock_tombstones().remove(&BOOT_EPISODE_KEY);
+        }
+        retire
     }
 
     /// Applies one incoming event: runs the pure FSM against the current
@@ -629,7 +989,10 @@ impl EpisodeRegistry {
         let closed_keys: Vec<EpisodeKey> = inner
             .iter()
             .filter(|(_, st)| {
-                st.phase == EpisodePhase::Recovering
+                // Boot bubbles never green-promote (they close via the
+                // checklist's Complete render + silent retire_boot).
+                st.key.family != EpisodeFamily::Boot
+                    && st.phase == EpisodePhase::Recovering
                     && now_ms.saturating_sub(st.last_event_ms) >= stability_ms
             })
             .map(|(k, _)| *k)
@@ -659,7 +1022,10 @@ impl EpisodeRegistry {
         let expired_keys: Vec<EpisodeKey> = inner
             .iter()
             .filter(|(_, st)| {
-                st.phase == EpisodePhase::Down
+                // Boot bubbles never stale-expire — a hung boot keeps
+                // honestly showing ⏳ (retire_boot owns the happy path).
+                st.key.family != EpisodeFamily::Boot
+                    && st.phase == EpisodePhase::Down
                     && now_ms.saturating_sub(st.last_event_ms) >= stale_ms
             })
             .map(|(k, _)| *k)
@@ -860,6 +1226,159 @@ pub fn render_episode_recovered(state: &EpisodeState, ctx: &EpisodeRenderCtx) ->
     )
 }
 
+/// Renders the consolidated boot bubble (2026-07-09) — a fixed-template
+/// checklist that the shell live-edits in place as milestones fold in.
+///
+/// Commandments hold: plain English, IST 12-hour times, emoji status, no
+/// library names, no file paths. The `Build:` short-sha is the conscious
+/// B9 operator-approved override of the no-version-numbers rule. Ceiling:
+/// [`BOOT_BUBBLE_MAX_CHARS`] via the newline-boundary truncation.
+#[must_use]
+pub fn render_boot_checklist(cl: &BootChecklist, _ctx: &EpisodeRenderCtx) -> String {
+    let sha_ok = !cl.build_sha_short.is_empty() && cl.build_sha_short != "unknown";
+    // Never a false "NEW CODE" claim without a valid sha pair upstream.
+    let new_code = cl.new_code && sha_ok;
+    let build = if sha_ok {
+        if new_code && cl.is_complete() {
+            format!(" (build {}, new code)", cl.build_sha_short)
+        } else {
+            format!(" (build {})", cl.build_sha_short)
+        }
+    } else {
+        String::new()
+    };
+    let header = match cl.complete_at_ms {
+        Some(done_ms) => {
+            // The literal phrase "tickvault started" is load-bearing — the
+            // operator's morning-readiness instructions reference it.
+            format!(
+                "<b>\u{2705} tickvault started — boot complete {when}{build}</b>",
+                when = format_ist_12h(done_ms),
+            )
+        }
+        None if cl.mini => {
+            // Mid-day feed/component restart AFTER a completed boot
+            // retired (hostile-review fix 2026-07-09): the system is NOT
+            // starting — claiming "tickvault starting" here would be a
+            // false signal. Neutral header, timestamped to the latest
+            // update; retires on the idle window (see `retire_boot`).
+            format!(
+                "<b>\u{1f504} Feed update {when}</b>",
+                when = format_ist_12h(cl.last_fold_ms),
+            )
+        }
+        None => {
+            let deploy = if new_code {
+                " — NEW CODE deployed"
+            } else {
+                ""
+            };
+            format!("<b>\u{1f680} tickvault starting{deploy}{build}</b>")
+        }
+    };
+
+    let (expect_dhan, expect_groww) = cl.expectations.unwrap_or((false, false));
+    let mut lines: Vec<String> = Vec::new();
+    let started = format_ist_12h(cl.started_at_ms);
+    if !cl.mini {
+        match cl.services {
+            Some((healthy, total)) => {
+                lines.push(format!(
+                    "\u{2705} Started {started} — services {healthy} of {total}"
+                ));
+            }
+            None => lines.push(format!("\u{2705} Started {started}")),
+        }
+    }
+    if cl.dhan_auth {
+        lines.push("\u{2705} Dhan login".to_string());
+    } else if expect_dhan {
+        lines.push("\u{23f3} Dhan login".to_string());
+    }
+    match cl.instruments {
+        Some(count) => lines.push(format!("\u{2705} Instruments — {count} tracked")),
+        None if expect_dhan => lines.push("\u{23f3} Instruments".to_string()),
+        None => {}
+    }
+    match cl.dhan_feed {
+        Some(BootDhanFeed::Online {
+            connected,
+            total,
+            last_real_tick_age_secs,
+        }) => {
+            // No-false-OK: connected without a REAL price keeps the caveat.
+            let tail = match last_real_tick_age_secs {
+                Some(age) => format!(", last real price {age}s ago"),
+                None => ", \u{26a0}\u{fe0f} no real prices yet".to_string(),
+            };
+            lines.push(format!(
+                "\u{2705} Dhan price feed — {connected} of {total} connections{tail}"
+            ));
+        }
+        Some(BootDhanFeed::DeferredOffHours) => {
+            lines.push("\u{1f319} Dhan price feed — waiting for market open".to_string());
+        }
+        None if expect_dhan => lines.push("\u{23f3} Dhan price feed".to_string()),
+        None => {}
+    }
+    if cl.order_update_authenticated {
+        lines.push("\u{2705} Order confirmations — connected and confirmed".to_string());
+    } else if cl.order_update_connected {
+        lines.push("\u{2705} Order confirmations — connected".to_string());
+    } else if expect_dhan {
+        lines.push("\u{23f3} Order confirmations".to_string());
+    }
+    let groww_has_data =
+        cl.groww_auth || cl.groww_instruments.is_some() || cl.groww_connected.is_some();
+    if groww_has_data {
+        let mut parts: Vec<String> = Vec::new();
+        if cl.groww_auth {
+            parts.push("signed in".to_string());
+        }
+        if let Some(subscribed) = cl.groww_instruments {
+            parts.push(format!("{subscribed} instruments"));
+        }
+        if let Some(market_open) = cl.groww_connected {
+            parts.push(if market_open {
+                "connected — waiting for first price".to_string()
+            } else {
+                "connected (market closed — quiet is normal)".to_string()
+            });
+        }
+        lines.push(format!("\u{2705} Groww feed — {}", parts.join(" · ")));
+    } else if expect_groww {
+        lines.push("\u{23f3} Groww feed".to_string());
+    }
+    match cl.complete_at_ms {
+        Some(done_ms) => {
+            let took_secs = done_ms
+                .saturating_sub(cl.started_at_ms)
+                .checked_div(MS_PER_SEC)
+                .unwrap_or(0);
+            let mode_part = cl
+                .mode
+                .map_or_else(String::new, |m| format!("Mode: {m} \u{b7} "));
+            lines.push(format!(
+                "{mode_part}Boot took {took}. You're good to go.",
+                took = format_duration_human(took_secs),
+            ));
+        }
+        None if cl.mini => {
+            // No "Boot finishing…" promise on a mini bubble — nothing is
+            // finishing (`StartupComplete` never re-fires mid-process),
+            // so the footer would be a broken promise. The component
+            // lines above ARE the whole message.
+        }
+        None => {
+            lines.push("\u{23f3} Boot finishing\u{2026}".to_string());
+            lines.push(String::new());
+            lines.push("This message updates itself as each part comes up.".to_string());
+        }
+    }
+    let text = format!("{header}\n\n{}", lines.join("\n"));
+    truncate_at_newline_boundary(&text, BOOT_BUBBLE_MAX_CHARS)
+}
+
 // ---------------------------------------------------------------------------
 // Snapshot codec (pure; fail-open)
 // ---------------------------------------------------------------------------
@@ -876,10 +1395,15 @@ pub mod episode_snapshot {
     };
 
     /// Encodes live episode states to the snapshot JSON string.
+    ///
+    /// The `Boot` family is FILTERED OUT (2026-07-09): a new process must
+    /// never rehydrate + edit the previous process's boot bubble — every
+    /// boot opens its own fresh checklist bubble.
     #[must_use]
     pub fn encode(entries: &[EpisodeState]) -> String {
         let items: Vec<serde_json::Value> = entries
             .iter()
+            .filter(|st| st.key.family != EpisodeFamily::Boot)
             .map(|st| {
                 serde_json::json!({
                     "family": st.key.family.snapshot_label(),
@@ -919,6 +1443,11 @@ pub mod episode_snapshot {
             else {
                 continue;
             };
+            // Belt-and-braces: even a hand-written "boot" entry is dropped
+            // (encode already filters the family out).
+            if family == EpisodeFamily::Boot {
+                continue;
+            }
             let Some(conn) = item
                 .get("conn")
                 .and_then(serde_json::Value::as_u64)
@@ -1823,7 +2352,11 @@ mod tests {
 
     #[test]
     fn test_from_snapshot_label_family_phase_roundtrip_unknown_none() {
-        for family in [EpisodeFamily::MainFeedWs, EpisodeFamily::OrderUpdateWs] {
+        for family in [
+            EpisodeFamily::MainFeedWs,
+            EpisodeFamily::OrderUpdateWs,
+            EpisodeFamily::Boot,
+        ] {
             assert_eq!(
                 EpisodeFamily::from_snapshot_label(family.snapshot_label()),
                 Some(family)
@@ -1894,5 +2427,420 @@ mod tests {
         for banned in ["rkyv", "papaya", "mpsc", ".rs", "data/", "editMessageText"] {
             assert!(!line.contains(banned), "banned {banned:?} in {line:?}");
         }
+    }
+
+    // -- Boot bubble (2026-07-09) -------------------------------------------
+
+    fn full_checklist(now: u64) -> BootChecklist {
+        let mut cl = BootChecklist::new(now, true, "a1b2c3d".to_string());
+        cl.expectations = Some((true, true));
+        cl.fold(
+            BootMilestone::Services {
+                healthy: 3,
+                total: 3,
+            },
+            now,
+        );
+        cl.fold(BootMilestone::DhanAuth, now + 1000);
+        cl.fold(BootMilestone::Instruments { count: 1046 }, now + 2000);
+        cl.fold(
+            BootMilestone::DhanFeedOnline {
+                connected: 1,
+                total: 1,
+                last_real_tick_age_secs: Some(2),
+            },
+            now + 3000,
+        );
+        cl.fold(BootMilestone::OrderUpdateConnected, now + 4000);
+        cl.fold(BootMilestone::OrderUpdateAuthenticated, now + 4500);
+        cl.fold(BootMilestone::GrowwAuth, now + 5000);
+        cl.fold(
+            BootMilestone::GrowwInstruments { subscribed: 768 },
+            now + 5500,
+        );
+        cl.fold(
+            BootMilestone::GrowwConnected { market_open: true },
+            now + 6000,
+        );
+        cl
+    }
+
+    #[test]
+    fn test_boot_checklist_fold_idempotent_and_order_free() {
+        // Same milestones, shuffled order + duplicates → identical render.
+        let now = NOW;
+        let milestones = [
+            BootMilestone::DhanAuth,
+            BootMilestone::Instruments { count: 1046 },
+            BootMilestone::OrderUpdateAuthenticated,
+            BootMilestone::GrowwAuth,
+            BootMilestone::Services {
+                healthy: 3,
+                total: 3,
+            },
+        ];
+        let mut forward = BootChecklist::new(now, false, "a1b2c3d".to_string());
+        for m in milestones {
+            forward.fold(m, now + 1000);
+            forward.fold(m, now + 2000); // duplicate — idempotent
+        }
+        let mut reversed = BootChecklist::new(now, false, "a1b2c3d".to_string());
+        for m in milestones.iter().rev() {
+            reversed.fold(*m, now + 3000);
+        }
+        let ctx = EpisodeRenderCtx { now_ms: now + 9000 };
+        assert_eq!(
+            render_boot_checklist(&forward, &ctx),
+            render_boot_checklist(&reversed, &ctx),
+            "fold must be idempotent + commutative"
+        );
+        assert!(forward.dirty, "fold marks a pending render");
+        // Complete: first fold wins (duplicate keeps the original instant).
+        forward.fold(BootMilestone::Complete { mode: "sandbox" }, now + 10_000);
+        forward.fold(BootMilestone::Complete { mode: "LIVE" }, now + 20_000);
+        assert_eq!(forward.complete_at_ms, Some(now + 10_000));
+        assert_eq!(forward.mode, Some("sandbox"));
+        assert!(forward.is_complete());
+    }
+
+    #[test]
+    fn test_render_boot_checklist_first_mid_final_under_ceiling() {
+        let now = NOW;
+        let ctx = EpisodeRenderCtx { now_ms: now };
+        // First page: only Services folded, expectations set → ⏳ lines.
+        let mut first = BootChecklist::new(now, true, "a1b2c3d".to_string());
+        first.expectations = Some((true, true));
+        first.fold(
+            BootMilestone::Services {
+                healthy: 3,
+                total: 3,
+            },
+            now,
+        );
+        let page = render_boot_checklist(&first, &ctx);
+        assert!(page.contains("tickvault starting — NEW CODE deployed"));
+        assert!(page.contains("(build a1b2c3d)"));
+        assert!(page.contains("\u{23f3} Dhan login"));
+        assert!(page.contains("\u{23f3} Groww feed"));
+        assert!(page.contains("Boot finishing"));
+        assert!(page.contains("updates itself"));
+        // Mid-boot: some ✅, some ⏳, fixed template order (Dhan login
+        // before Instruments before the feed lines, regardless of arrival).
+        let mid = full_checklist(now);
+        let mid_render = render_boot_checklist(&mid, &ctx);
+        let login_idx = mid_render.find("Dhan login").expect("login line");
+        let instr_idx = mid_render
+            .find("Instruments — 1046 tracked")
+            .expect("instr line");
+        let feed_idx = mid_render.find("Dhan price feed").expect("feed line");
+        assert!(login_idx < instr_idx && instr_idx < feed_idx, "fixed order");
+        assert!(mid_render.contains("last real price 2s ago"));
+        assert!(mid_render.contains("Order confirmations — connected and confirmed"));
+        assert!(mid_render.contains("Groww feed — signed in \u{b7} 768 instruments"));
+        // Final: Complete folds in → checklist header + footer.
+        let mut done = full_checklist(now);
+        done.fold(BootMilestone::Complete { mode: "sandbox" }, now + 94_000);
+        let final_render = render_boot_checklist(&done, &ctx);
+        assert!(final_render.contains("(build a1b2c3d, new code)"));
+        assert!(final_render.contains("Mode: sandbox"));
+        assert!(final_render.contains("Boot took 1m 34s"));
+        assert!(final_render.contains("You're good to go."));
+        assert!(!final_render.contains("Boot finishing"));
+        // Ceiling + commandments on every phase.
+        for r in [&page, &mid_render, &final_render] {
+            assert!(
+                r.chars().count() <= BOOT_BUBBLE_MAX_CHARS,
+                "boot render exceeded {BOOT_BUBBLE_MAX_CHARS} chars"
+            );
+            for banned in ["rkyv", "papaya", "mpsc", ".rs", "data/", "editMessageText"] {
+                assert!(!r.contains(banned), "banned {banned:?} in {r:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_render_boot_checklist_lazy_mode_without_expectations() {
+        // Expectations unset (milestone raced set_boot_expectations) —
+        // only data-carrying lines render, no phantom ⏳ component lines.
+        let now = NOW;
+        let mut cl = BootChecklist::new(now, false, "a1b2c3d".to_string());
+        cl.fold(BootMilestone::DhanAuth, now);
+        let r = render_boot_checklist(&cl, &EpisodeRenderCtx { now_ms: now });
+        assert!(r.contains("\u{2705} Dhan login"));
+        assert!(!r.contains("\u{23f3} Instruments"));
+        assert!(!r.contains("\u{23f3} Groww feed"));
+        assert!(r.contains("Boot finishing"), "generic pending line stays");
+        // No false "NEW CODE" flavor when new_code=false.
+        assert!(!r.contains("NEW CODE"));
+    }
+
+    #[test]
+    fn test_render_boot_checklist_honest_no_real_ticks_line() {
+        let now = NOW;
+        let mut cl = BootChecklist::new(now, false, "a1b2c3d".to_string());
+        cl.fold(
+            BootMilestone::DhanFeedOnline {
+                connected: 1,
+                total: 1,
+                last_real_tick_age_secs: None,
+            },
+            now,
+        );
+        let r = render_boot_checklist(&cl, &EpisodeRenderCtx { now_ms: now });
+        assert!(
+            r.contains("no real prices yet"),
+            "connected without a real price must keep the caveat: {r:?}"
+        );
+    }
+
+    #[test]
+    fn test_render_boot_checklist_deferred_off_hours_line() {
+        let now = NOW;
+        let mut cl = BootChecklist::new(now, false, "a1b2c3d".to_string());
+        cl.fold(BootMilestone::DhanFeedDeferredOffHours, now);
+        let r = render_boot_checklist(&cl, &EpisodeRenderCtx { now_ms: now });
+        assert!(
+            r.contains("\u{1f319} Dhan price feed — waiting for market open"),
+            "off-hours boot must show the honest deferred line: {r:?}"
+        );
+    }
+
+    #[test]
+    fn test_render_boot_checklist_keeps_tickvault_started_phrase() {
+        // The morning-readiness instructions grep for the literal phrase
+        // "tickvault started" — the completed header must carry it, and an
+        // unknown build sha must render plainly (never a false NEW CODE).
+        let now = NOW;
+        let mut cl = BootChecklist::new(now, true, "unknown".to_string());
+        cl.fold(BootMilestone::Complete { mode: "sandbox" }, now + 5000);
+        let r = render_boot_checklist(&cl, &EpisodeRenderCtx { now_ms: now });
+        assert!(r.contains("tickvault started"));
+        assert!(!r.contains("build"), "unknown sha renders plainly: {r:?}");
+        assert!(!r.contains("new code"));
+    }
+
+    #[test]
+    fn test_episode_config_for_boot_zero_throttle_ws_default() {
+        // Ratchet: Boot gets the 0s edit throttle; the WS families keep
+        // the pinned 2026-07-07 defaults untouched.
+        let boot = episode_config_for(EpisodeFamily::Boot);
+        assert_eq!(boot.edit_min_interval_secs, 0);
+        assert_eq!(boot.stability_secs, EPISODE_STABILITY_SECS);
+        for family in [EpisodeFamily::MainFeedWs, EpisodeFamily::OrderUpdateWs] {
+            let cfg = episode_config_for(family);
+            assert_eq!(cfg.edit_min_interval_secs, EPISODE_EDIT_MIN_INTERVAL_SECS);
+            assert_eq!(cfg.stability_secs, EPISODE_STABILITY_SECS);
+            assert_eq!(cfg.reopen_secs, EPISODE_REOPEN_SECS);
+            assert_eq!(cfg.down_stale_expire_secs, EPISODE_DOWN_STALE_EXPIRE_SECS);
+        }
+    }
+
+    #[test]
+    fn test_snapshot_excludes_boot_family() {
+        // A boot episode must never survive a restart via the snapshot —
+        // encode filters it; decode drops a hand-written "boot" entry.
+        let boot_state = EpisodeState::open(BOOT_EPISODE_KEY, Severity::Low, NOW);
+        let ws_state = live_state(Some(9));
+        let json = episode_snapshot::encode(&[boot_state, ws_state]);
+        assert!(
+            !json.contains("\"boot\""),
+            "encode must filter Boot: {json}"
+        );
+        let handwritten =
+            format!(r#"[{{"family":"boot","conn":0,"opened_at_ms":{NOW},"message_id":5}}]"#);
+        let decoded = episode_snapshot::decode(&handwritten, NOW + 1000, ist_date_of(NOW + 1000));
+        assert!(decoded.is_empty(), "decode must drop Boot entries");
+    }
+
+    #[test]
+    fn test_tick_never_closes_or_expires_boot_family() {
+        let reg = EpisodeRegistry::new();
+        let cfg = episode_config_for(EpisodeFamily::Boot);
+        let _ = reg.apply_boot_milestone(BootMilestone::DhanAuth, NOW, &cfg);
+        reg.record_sent(BOOT_EPISODE_KEY, Some(42), NOW);
+        // Way past both the stability and stale-expire windows.
+        let far = NOW + (EPISODE_DOWN_STALE_EXPIRE_SECS + 3600) * 1000;
+        let outcome = reg.tick(far, &EpisodeConfig::default());
+        assert!(outcome.closed.is_empty(), "Boot never green-promotes");
+        assert!(outcome.expired.is_empty(), "Boot never stale-expires");
+        assert_eq!(reg.live_count(), 1, "the boot bubble stays live");
+    }
+
+    #[test]
+    fn test_retire_boot_only_after_complete_plus_window() {
+        let reg = EpisodeRegistry::new();
+        let cfg = episode_config_for(EpisodeFamily::Boot);
+        let _ = reg.apply_boot_milestone(BootMilestone::DhanAuth, NOW, &cfg);
+        reg.record_sent(BOOT_EPISODE_KEY, Some(42), NOW);
+        reg.mark_boot_delivered();
+        // Incomplete boot never retires — even hours later.
+        assert!(!reg.retire_boot(NOW + 7200 * 1000));
+        assert_eq!(reg.live_count(), 1);
+        // Complete + delivered, inside the window: still live.
+        let (_, _) = reg.apply_boot_milestone(
+            BootMilestone::Complete { mode: "sandbox" },
+            NOW + 10_000,
+            &cfg,
+        );
+        reg.mark_boot_delivered();
+        assert!(!reg.retire_boot(NOW + 10_000 + BOOT_BUBBLE_RETIRE_SECS * 1000 - 1));
+        assert_eq!(reg.live_count(), 1);
+        // Past the window: retires silently (state + checklist cleared).
+        assert!(reg.retire_boot(NOW + 10_000 + BOOT_BUBBLE_RETIRE_SECS * 1000));
+        assert_eq!(reg.live_count(), 0);
+        assert!(reg.boot_checklist().is_none());
+        // A post-retire milestone opens a FRESH mini bubble.
+        let (decision, cl) = reg.apply_boot_milestone(
+            BootMilestone::GrowwConnected { market_open: true },
+            NOW + 20_000 + BOOT_BUBBLE_RETIRE_SECS * 1000,
+            &cfg,
+        );
+        assert_eq!(decision.action, EpisodeAction::SendFirstPage);
+        assert!(!cl.is_complete(), "fresh checklist, not the retired one");
+        assert!(cl.mini, "post-retire checklist is a MINI (feed update)");
+        // A dirty (undelivered) completed checklist must NOT retire.
+        let reg2 = EpisodeRegistry::new();
+        let _ = reg2.apply_boot_milestone(BootMilestone::Complete { mode: "LIVE" }, NOW, &cfg);
+        assert!(
+            !reg2.retire_boot(NOW + (BOOT_BUBBLE_RETIRE_SECS + 60) * 1000),
+            "dirty checklist stays for the ticker re-drive"
+        );
+    }
+
+    #[test]
+    fn test_post_retire_boot_event_opens_fresh_mini_bubble() {
+        // Hostile-review fix 2026-07-09: a mid-day feed reconnect / lane
+        // cold-start re-firing boot-keyed events AFTER the morning bubble
+        // retired must render an honest "Feed update" mini bubble — never
+        // a false "tickvault starting" that can neither complete nor
+        // retire.
+        let reg = EpisodeRegistry::new();
+        let cfg = episode_config_for(EpisodeFamily::Boot);
+        let _ = reg.apply_boot_milestone(BootMilestone::Complete { mode: "sandbox" }, NOW, &cfg);
+        reg.mark_boot_delivered();
+        assert!(reg.retire_boot(NOW + BOOT_BUBBLE_RETIRE_SECS * 1000));
+        // A Groww reconnect edge 3 hours later.
+        let mid_day = NOW + 3 * 3600 * 1000;
+        let (_, cl) = reg.apply_boot_milestone(
+            BootMilestone::GrowwConnected { market_open: true },
+            mid_day,
+            &cfg,
+        );
+        assert!(cl.mini);
+        let r = render_boot_checklist(&cl, &EpisodeRenderCtx { now_ms: mid_day });
+        assert!(r.contains("\u{1f504} Feed update"), "neutral header: {r:?}");
+        assert!(r.contains("Groww feed"), "component line renders: {r:?}");
+        assert!(!r.contains("tickvault starting"), "no false boot claim");
+        assert!(!r.contains("Boot finishing"), "no broken promise footer");
+        assert!(!r.contains("updates itself"), "no broken promise footer");
+        assert!(!r.contains("Started"), "no phantom system start line");
+        // A second component event inside the window folds into the SAME
+        // mini bubble (anti-spam for a restart burst).
+        reg.record_sent(BOOT_EPISODE_KEY, Some(88), mid_day);
+        reg.mark_boot_delivered();
+        let (d2, cl2) = reg.apply_boot_milestone(BootMilestone::DhanAuth, mid_day + 60_000, &cfg);
+        assert_eq!(
+            d2.action,
+            EpisodeAction::Edit {
+                message_id: 88,
+                close: false
+            }
+        );
+        assert!(cl2.mini && cl2.groww_connected.is_some() && cl2.dhan_auth);
+        reg.mark_boot_delivered();
+        // The mini bubble retires on the idle window despite never seeing
+        // `Complete` — no permanently-stuck bubble.
+        assert!(!reg.retire_boot(mid_day + 60_000 + BOOT_BUBBLE_RETIRE_SECS * 1000 - 1));
+        assert!(reg.retire_boot(mid_day + 60_000 + BOOT_BUBBLE_RETIRE_SECS * 1000));
+        assert!(reg.boot_checklist().is_none());
+        assert_eq!(reg.live_count(), 0);
+    }
+
+    #[test]
+    fn test_is_complete_only_after_complete_fold() {
+        let mut cl = BootChecklist::new(NOW, false, "a1b2c3d".to_string());
+        assert!(!cl.is_complete());
+        cl.fold(BootMilestone::DhanAuth, NOW + 100);
+        assert!(!cl.is_complete(), "component milestones never complete");
+        cl.fold(BootMilestone::Complete { mode: "sandbox" }, NOW + 200);
+        assert!(cl.is_complete());
+    }
+
+    #[test]
+    fn test_set_boot_flavor_creates_and_updates_checklist() {
+        let reg = EpisodeRegistry::new();
+        // Creates the checklist when absent (flavor never lost to
+        // milestone-vs-init ordering)…
+        reg.set_boot_flavor(true, "a1b2c3d", NOW);
+        let cl = reg.boot_checklist().expect("flavor creates the checklist");
+        assert!(cl.new_code);
+        assert_eq!(cl.build_sha_short, "a1b2c3d");
+        assert!(!cl.mini, "boot-time flavor init is the MAIN bubble");
+        // …and updates an existing one in place.
+        reg.set_boot_flavor(false, "unknown", NOW + 100);
+        let cl2 = reg.boot_checklist().expect("checklist still live");
+        assert!(!cl2.new_code);
+        assert_eq!(cl2.build_sha_short, "unknown");
+    }
+
+    #[test]
+    fn test_mark_boot_delivered_and_boot_redrive_candidate_dirty_flow() {
+        let reg = EpisodeRegistry::new();
+        let cfg = episode_config_for(EpisodeFamily::Boot);
+        assert!(
+            reg.boot_redrive_candidate().is_none(),
+            "no checklist = no candidate"
+        );
+        let _ = reg.apply_boot_milestone(BootMilestone::DhanAuth, NOW, &cfg);
+        let (cl, id) = reg
+            .boot_redrive_candidate()
+            .expect("undelivered fold is a candidate");
+        assert!(cl.dirty);
+        assert_eq!(id, None, "first page never landed → fresh send");
+        reg.record_sent(BOOT_EPISODE_KEY, Some(7), NOW);
+        let (_, id2) = reg.boot_redrive_candidate().expect("still dirty");
+        assert_eq!(id2, Some(7), "message id rides the candidate");
+        reg.mark_boot_delivered();
+        assert!(
+            reg.boot_redrive_candidate().is_none(),
+            "mark_boot_delivered clears the dirty flag"
+        );
+    }
+
+    #[test]
+    fn test_apply_boot_milestone_registry_flow_and_redrive_bookkeeping() {
+        // First milestone opens (SendFirstPage); once the id is recorded,
+        // later milestones edit the SAME bubble; boot_redrive_candidate +
+        // mark_boot_delivered manage the dirty flag; set_boot_flavor +
+        // set_boot_expectations survive any call order.
+        let reg = EpisodeRegistry::new();
+        let cfg = episode_config_for(EpisodeFamily::Boot);
+        reg.set_boot_flavor(true, "a1b2c3d", NOW);
+        reg.set_boot_expectations(true, true, NOW);
+        let (d1, cl1) = reg.apply_boot_milestone(BootMilestone::DhanAuth, NOW + 100, &cfg);
+        assert_eq!(d1.action, EpisodeAction::SendFirstPage);
+        assert!(cl1.new_code && cl1.build_sha_short == "a1b2c3d");
+        assert_eq!(cl1.expectations, Some((true, true)));
+        assert!(cl1.dirty);
+        reg.record_sent(BOOT_EPISODE_KEY, Some(64), NOW + 100);
+        reg.mark_boot_delivered();
+        assert!(reg.boot_redrive_candidate().is_none(), "delivered = clean");
+        let (d2, _) =
+            reg.apply_boot_milestone(BootMilestone::Instruments { count: 4 }, NOW + 200, &cfg);
+        assert_eq!(
+            d2.action,
+            EpisodeAction::Edit {
+                message_id: 64,
+                close: false
+            },
+            "boot throttle is 0 — the very next milestone edits in place"
+        );
+        let (cl, id) = reg
+            .boot_redrive_candidate()
+            .expect("undelivered fold is a re-drive candidate");
+        assert_eq!(id, Some(64));
+        assert_eq!(cl.instruments, Some(4));
+        reg.mark_boot_delivered();
+        assert!(reg.boot_redrive_candidate().is_none());
     }
 }

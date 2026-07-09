@@ -53,8 +53,10 @@ fn region<'a>(src: &'a str, start: &str, end: &str) -> &'a str {
 fn guard_a_notify_consults_episode_key_before_coalescer() {
     let src = service_src();
     let notify_region = region(&src, "pub fn notify(", "pub fn is_active(");
+    // 2026-07-09 boot bubble: the gate grew a boot_bubble refinement and
+    // rustfmt splits the receiver — scan for the method call itself.
     let episode_idx = notify_region
-        .find("event.episode_key()")
+        .find(".episode_key()")
         .expect("notify() must consult episode_key()");
     let coalescer_idx = notify_region
         .find("self.coalescer.as_ref()")
@@ -69,6 +71,13 @@ fn guard_a_notify_consults_episode_key_before_coalescer() {
     assert!(
         between.contains("return;"),
         "the episode lane in notify() must return before the coalescer branch"
+    );
+    // Boot bubble (2026-07-09): the gate lets the Boot family through ONLY
+    // while boot_bubble is on — the rollback path must stay legacy while
+    // the WS families keep the episode lane unconditionally.
+    assert!(
+        between.contains("EpisodeFamily::Boot || self.boot_bubble"),
+        "notify() must gate the Boot family on the boot_bubble kill switch"
     );
 }
 
@@ -144,12 +153,16 @@ fn guard_c_edit_transport_blessed_callers_only() {
     let prod = region(&src, "//! Notification service", "#[cfg(test)]");
     // Occurrences: 1 definition + 1 call in dispatch_episode_event (live
     // edits) + 1 call in run_episode_tick (the green close edit — no event
-    // triggers it, so it cannot live inside dispatch_episode_event).
+    // triggers it, so it cannot live inside dispatch_episode_event)
+    // + 2026-07-09 boot bubble: 1 call in dispatch_boot_episode_event
+    // (checklist live edits) + 1 call in run_boot_tick (the dirty
+    // re-drive inside the drain ticker).
     assert_eq!(
         prod.matches("edit_telegram_message_with_retry(").count(),
-        3,
+        5,
         "edit transport call sites drifted — blessed callers are \
-         dispatch_episode_event + run_episode_tick only"
+         dispatch_episode_event + run_episode_tick + \
+         dispatch_boot_episode_event + run_boot_tick only"
     );
     let dispatch = region(
         prod,
@@ -160,6 +173,22 @@ fn guard_c_edit_transport_blessed_callers_only() {
         dispatch.contains("edit_telegram_message_with_retry("),
         "dispatch_episode_event must own the live-edit call"
     );
+    let boot_dispatch = region(
+        prod,
+        "async fn dispatch_boot_episode_event",
+        "const fn key_boot(",
+    );
+    assert!(
+        boot_dispatch.contains("edit_telegram_message_with_retry("),
+        "dispatch_boot_episode_event must own the boot live-edit call"
+    );
+    // The whole boot fold→render→send/edit body is serialized — two
+    // milestones racing the in-flight first send must never open a
+    // duplicate bubble (2026-07-09 correctness graft).
+    assert!(
+        boot_dispatch.contains("boot_dispatch_lock.lock().await"),
+        "dispatch_boot_episode_event must hold the boot serialization lock"
+    );
     let tick = region(
         prod,
         "pub(crate) async fn run_episode_tick",
@@ -168,6 +197,15 @@ fn guard_c_edit_transport_blessed_callers_only() {
     assert!(
         tick.contains("edit_telegram_message_with_retry("),
         "run_episode_tick must own the green-close edit call"
+    );
+    let boot_tick = region(prod, "async fn run_boot_tick", "async fn deliver_drained");
+    assert!(
+        boot_tick.contains("boot_lock.lock().await"),
+        "run_boot_tick must share the boot serialization lock"
+    );
+    assert!(
+        boot_tick.contains("retire_boot("),
+        "run_boot_tick must own the silent boot retirement"
     );
 }
 
@@ -187,6 +225,9 @@ fn guard_d_episode_constants_pinned() {
         // Hostile-review fix 2026-07-07: stale-Down expiry bound (the
         // restart edge — a rehydrated Down bubble must never live forever).
         "pub const EPISODE_DOWN_STALE_EXPIRE_SECS: u64 = 1800;",
+        // Boot bubble (2026-07-09): render ceiling + silent retire window.
+        "pub const BOOT_BUBBLE_MAX_CHARS: usize = 1200;",
+        "pub const BOOT_BUBBLE_RETIRE_SECS: u64 = 900;",
     ] {
         assert!(
             src.contains(pin),
@@ -226,6 +267,13 @@ fn guard_e_no_warn_in_episode_failure_arms() {
             "async fn deliver_drained",
         ),
         ("async fn deliver_drained", "// ---"),
+        // Boot bubble (2026-07-09) regions.
+        ("async fn dispatch_boot_episode_event", "const fn key_boot("),
+        ("async fn run_boot_tick", "async fn deliver_drained"),
+        (
+            "async fn init_boot_sha_flavor",
+            "async fn rehydrate_episodes",
+        ),
     ] {
         let r = region(&src, start, end);
         assert!(
