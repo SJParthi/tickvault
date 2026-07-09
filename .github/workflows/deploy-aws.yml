@@ -982,23 +982,13 @@ jobs:
             echo "::warning::refusing to record non-hex sha to /tickvault/prod/deploy/binary-git-sha (GITHUB_SHA failed the 40-lowercase-hex check; deploy itself is verified healthy)"
           fi
 
-      - name: Notify Telegram on success
-        # ANTI-FALSE-OK: an intentional off-hours skip now exits the deploy job
-        # GREEN (see the "Ensure instance running" step), so `success()` alone
-        # would fire a "✅ deployed" Telegram for a run that deployed NOTHING.
-        # Gate on DEPLOY_SKIP_REASON == '' so the skip stays silent — a real
-        # deploy (skip reason empty) still pages success as before.
-        if: success() && env.DEPLOY_SKIP_REASON == ''
-        run: |
-          # The SNS topic has a Telegram webhook subscription; publish a
-          # plain-English message so the operator sees the deploy land clearly.
-          SHORT_SHA="${GITHUB_SHA:0:7}"
-          IST_TIME="$(TZ='Asia/Kolkata' date +'%I:%M %p IST')"
-          aws sns publish \
-            --region ${{ vars.AWS_REGION || 'ap-south-1' }} \
-            --topic-arn arn:aws:sns:${{ vars.AWS_REGION || 'ap-south-1' }}:${{ steps.acct.outputs.id }}:tv-prod-alerts \
-            --subject "✅ tickvault deployed — new code is LIVE" \
-            --message "✅ New code is LIVE on AWS, deployed at ${IST_TIME} (version ${SHORT_SHA}). The app restarted on the latest code. Nothing for you to do."
+      # 2026-07-09 (operator escalation — Telegram noise N1): the standalone
+      # "✅ tickvault deployed — new code is LIVE" success publish is RETIRED.
+      # The consolidated boot bubble's header ("tickvault starting — NEW CODE
+      # deployed (build <sha>)") carries the deploy signal from the box itself
+      # the moment the new binary boots — one bubble instead of two messages.
+      # Every FAILURE-path publish below (and the log-shipping warning above)
+      # is retained unchanged.
 
       - name: Auto-stop tickvault service on deploy failure (kills Telegram spam)
         # Not on an intentional off-hours skip: the box is already stopped, so
