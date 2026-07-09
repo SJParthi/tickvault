@@ -27,13 +27,35 @@
 # in_progress, completed (incl. cancelled/failed) runs all count as "exists";
 # this dispatcher backfills MISSING runs, it never re-runs red ones.
 #
-# deploy-aws.yml deliberately NOT handled here: it already has its own
-# cron/dispatch redundancy (deploy-aws-after-close.yml fires it after market
-# close on weekdays), so a bot-merge-suppressed deploy self-heals via that
-# existing lane.
+# deploy-aws.yml IS now handled here too (added 2026-07-09 after a market-open
+# outage). It USED to be excluded on the theory that deploy-aws-after-close.yml
+# gives it its own cron/dispatch redundancy — but that lane depends on GitHub's
+# scheduler firing the 03:00/03:15 UTC (08:30/08:45 IST) morning crons, and
+# GitHub SILENTLY DROPS cron slots under load. On 2026-07-09 both morning slots
+# were dropped: #1449 (a boot-critical fast-boot fix) had bot-merged the night
+# before (GITHUB_TOKEN suppressed its push-triggered deploy-aws), so NO deploy-aws
+# run existed for main HEAD, the box auto-started 08:30 IST on the previous
+# binary and booted dead, and #1449's first deploy was still queued at 09:51 IST
+# — after recovery. This every-30-min, 7-days-a-week dispatcher is FAR less
+# scheduler-drop-fragile than 5 fixed daily crons: it guarantees a deploy-aws RUN
+# (hence the ARM build + a real, provenance-updating deploy once the box is up)
+# exists for every main HEAD within ~30 min of ANY merge, bot or human. The
+# existence check makes it self-terminating (one run per SHA) and it changes NO
+# deploy-aws behaviour — deploy-aws's OWN market-hours guard + off-hours box-state
+# skip still decide whether/when the swap happens; this dispatcher only TRIGGERS.
+# The box-start deploy-watchdog Lambda remains the deterministic backstop that
+# catches a stale-binary boot from the on-box provenance and pages + redeploys.
 #
-# Cost: one job, no checkout, 2 API reads + at most 2 dispatches per firing
-# (~30s on ubuntu-latest) — negligible against free-tier minutes.
+# HONEST ENVELOPE: cron/dispatch redundancy REDUCES but cannot ELIMINATE GitHub
+# scheduler risk — the scheduler is external and can drop any or all slots. This
+# moves the pre-open exposure from 2 fragile morning crons to 48 every-30-min
+# slots + overnight lead time; the box-start watchdog is the AWS-native
+# (scheduler-independent) deterministic catch.
+#
+# Cost: one job, no checkout, 3 API reads + at most 3 dispatches per firing
+# (~30s on ubuntu-latest) — negligible against free-tier minutes. Because the
+# check is head_sha-run-EXISTENCE (not deployed-state), each SHA triggers at most
+# ONE deploy-aws run ever — no overnight rebuild spam.
 name: Post-Merge Catch-up Dispatcher
 
 on:
@@ -72,14 +94,23 @@ jobs:
           echo "main HEAD = ${head_sha}"
 
           dispatched=0
-          for wf in ci.yml bench.yml; do
+          # deploy-aws.yml is included so a bot-merged (push-suppressed) commit
+          # still gets its ARM build + a real deploy run before the box's 08:30 IST
+          # start, independent of the scheduler-drop-fragile deploy-aws-after-close
+          # crons (2026-07-09 outage — see header). deploy-aws's OWN market-hours
+          # guard + off-hours box-state skip are unchanged; this only TRIGGERS.
+          for wf in ci.yml bench.yml deploy-aws.yml; do
             # Any run (any event: push, pull_request, workflow_dispatch,
-            # schedule; any status) for this exact SHA counts as covered.
+            # schedule; any status — queued/in_progress/success/failed/
+            # cancelled) for this exact SHA counts as covered. So a deploy-aws
+            # run that ends in a green off-hours no-op skip, or a market-hours
+            # guard block, still counts — this dispatcher backfills MISSING runs,
+            # it never re-runs (or re-builds) a SHA that already has one.
             count=$(gh api \
               "repos/${GH_REPO}/actions/workflows/${wf}/runs?head_sha=${head_sha}&per_page=1" \
               --jq .total_count)
             if [ "${count}" -eq 0 ]; then
-              echo "::warning::${wf} has ZERO runs for main HEAD ${head_sha} — a GITHUB_TOKEN bot merge suppressed the push trigger. Dispatching catch-up run on main."
+              echo "::warning::${wf} has ZERO runs for main HEAD ${head_sha} — a GITHUB_TOKEN bot merge (or a scheduler-dropped morning deploy cron) left it uncovered. Dispatching catch-up run on main."
               gh workflow run "${wf}" --ref main
               dispatched=$((dispatched + 1))
             else

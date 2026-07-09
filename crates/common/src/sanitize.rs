@@ -322,7 +322,17 @@ pub fn capture_rest_error_body(body: &str) -> String {
     // Non-JWT credential shapes (security review 2026-06-10, HIGH): a server
     // echoing an opaque (non-`eyJ`) credential inside a JSON field must
     // still be caught. Redact the VALUE of known credential field names.
-    for key in ["accessToken", "access_token", "refreshToken", "app_secret"] {
+    // `auth_token` added 2026-07-09 (Groww reject-loop hardening security
+    // review, LOW): the NATS CONNECT frame carries the credential under
+    // exactly this JSON key — belt-and-suspenders parity with the Python
+    // sidecar's own exact-value redaction.
+    for key in [
+        "accessToken",
+        "access_token",
+        "refreshToken",
+        "app_secret",
+        "auth_token",
+    ] {
         redacted = redact_json_string_field(&redacted, key);
     }
     redacted.chars().take(REST_BODY_CAPTURE_MAX_CHARS).collect()
