@@ -113,7 +113,9 @@ Two paging routes, both mirroring existing house patterns exactly:
 
 ## Test Plan
 
-- NEW `crates/app/tests/seal_drop_paging_wiring_guard.rs` (4 tests):
+- NEW `crates/app/tests/seal_drop_paging_wiring_guard.rs` (5 tests — the
+  5th is the HCL-comment-stripper anti-vacuity self-test added after the
+  hostile review found the `ok_actions=[]` needle comment-satisfiable):
   1. `test_seal_drop_counter_is_preregistered_after_recorder_install` —
      source-order scan of main.rs: `observability::init_metrics(` index <
      `"tv_seal_writer_drain_total"` index, and the registration window names

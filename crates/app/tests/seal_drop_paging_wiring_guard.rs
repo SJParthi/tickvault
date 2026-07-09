@@ -75,6 +75,62 @@ fn production_region(body: &str) -> &str {
     body.split("#[cfg(test)]").next().unwrap_or(body)
 }
 
+/// Strip `#`-comments from an HCL (terraform) body, STRING-AWARE: a `#`
+/// inside a double-quoted string (e.g. an alarm_description's "drop #1")
+/// is kept as code. Added after the 2026-07-09 hostile review found the
+/// `ok_actions=[]` needle was satisfiable by the tf file's own HEADER
+/// COMMENT — a later re-point of the real attribute to
+/// `local.app_alarm_ok` would have kept the guard green (the exact
+/// vacuous-guard false-OK class this test exists to prevent). Comments
+/// can never be terraform configuration, so they are removed before
+/// matching.
+fn strip_hcl_comments(body: &str) -> String {
+    let mut out = String::with_capacity(body.len());
+    for line in body.lines() {
+        let bytes = line.as_bytes();
+        let mut in_str = false;
+        let mut esc = false;
+        let mut cut = line.len();
+        for (i, &b) in bytes.iter().enumerate() {
+            if esc {
+                esc = false;
+                continue;
+            }
+            match b {
+                b'\\' if in_str => esc = true,
+                b'"' => in_str = !in_str,
+                b'#' if !in_str => {
+                    cut = i;
+                    break;
+                }
+                _ => {}
+            }
+        }
+        out.push_str(&line[..cut]);
+        out.push('\n');
+    }
+    out
+}
+
+#[test]
+fn test_strip_hcl_comments_keeps_strings_drops_comments() {
+    // Anti-vacuity self-test: the stripper must drop comment text (incl.
+    // a comment mentioning ok_actions = []) while keeping a `#` inside a
+    // quoted string intact.
+    let src = "# header ok_actions = [] comment\n\
+               alarm_description = \"not drop #1 - kept\"\n\
+               real_attr = 1 # trailing comment ok_actions = []\n";
+    let stripped = strip_hcl_comments(src);
+    assert!(
+        !compact(&stripped).contains("ok_actions=[]"),
+        "comment text survived HCL stripping: {stripped}"
+    );
+    assert!(
+        stripped.contains("not drop #1 - kept") && stripped.contains("real_attr = 1"),
+        "string or code text was wrongly removed: {stripped}"
+    );
+}
+
 /// Whitespace-compacted form so rustfmt / terraform-fmt re-wrapping and
 /// alignment can never hide a real site from a contiguous needle.
 fn compact(body: &str) -> String {
@@ -86,7 +142,11 @@ const DERIVED_METRIC: &str = "tv_seal_writer_drain_dropped_total";
 
 #[test]
 fn test_seal_drop_counter_is_preregistered_after_recorder_install() {
-    let main_src = strip_line_comments(&read_repo_file("src/main.rs"));
+    // Production region only (2026-07-09 hostile-review LOW fix): a future
+    // #[cfg(test)] block in main.rs mentioning the counter must never
+    // satisfy this scan.
+    let full = read_repo_file("src/main.rs");
+    let main_src = strip_line_comments(production_region(&full));
     let install = main_src
         .find("observability::init_metrics(")
         .expect("the metrics recorder install site must exist in main.rs"); // APPROVED: test
@@ -136,7 +196,11 @@ fn test_seal_writer_loop_still_emits_coded_error_and_dropped_counter() {
 
 #[test]
 fn test_errcode_alarm_map_contains_aggregator_drop_01() {
-    let tf = read_repo_file("../../deploy/aws/terraform/error-code-alarms.tf");
+    // HCL comments stripped (2026-07-09 hostile-review fix): tf comments
+    // mentioning the entry / ok_recovery can never satisfy the scan.
+    let tf = strip_hcl_comments(&read_repo_file(
+        "../../deploy/aws/terraform/error-code-alarms.tf",
+    ));
     // Build the filter needle from the REAL code string so a Rust-side
     // code_str rename breaks THIS test instead of silently blinding the
     // CloudWatch filter. Raw tf bytes carry literal backslash-quote
@@ -167,7 +231,13 @@ fn test_errcode_alarm_map_contains_aggregator_drop_01() {
 
 #[test]
 fn test_seal_drop_fallback_filter_matches_emitted_series_shape() {
-    let tf = read_repo_file("../../deploy/aws/terraform/seal-drop-alarm.tf");
+    // HCL comments stripped (2026-07-09 hostile-review MEDIUM fix): the tf
+    // header comment itself mentions `ok_actions = []` — without stripping,
+    // that comment satisfied the needle below even if the REAL attribute
+    // were re-pointed to local.app_alarm_ok (vacuous-guard class).
+    let tf = strip_hcl_comments(&read_repo_file(
+        "../../deploy/aws/terraform/seal-drop-alarm.tf",
+    ));
     // Filter pattern: real metric field + the dropped kind-slice (raw tf
     // bytes carry \"dropped\" as backslash-quote sequences).
     let pattern_needle = format!("{{ $.{DRAIN_COUNTER} = * && $.kind = \\\"dropped\\\" }}");

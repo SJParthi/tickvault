@@ -5,7 +5,8 @@
 #   The CloudWatch-only migration (#O1/#O2/#O3) retired the
 #   Loki -> Alertmanager -> Telegram route with NO replacement, so an `error!`
 #   reached only the log sinks. On 2026-07-06 the 12:00 IST REST-CANARY-01
-#   probe failure produced ZERO pages. These 8 log metric filters + alarms on
+#   probe failure produced ZERO pages. These 9 log metric filters + alarms
+#   (8 on 2026-07-06; +AGGREGATOR-DROP-01 on 2026-07-09) on
 #   the /tickvault/<env>/app log group (the errors.jsonl stream) restore the
 #   route: error! -> errors.jsonl -> CloudWatch Logs -> filter -> tv_errcode_*
 #   metric -> alarm (<=5 min) -> SNS tv-alerts -> Telegram webhook Lambda.
@@ -14,7 +15,9 @@
 # (45 with the reconnect-storm + feed-stall-restarts + readiness-lambda-errors
 # + market-hours-gate-errors alarms landing in the same PR). Overage above the
 # 10 free-tier alarms moves $2.30 -> $3.50/mo. The rule-file "10 alarms free
-# tier" claims were already stale pre-PR.
+# tier" claims were already stale pre-PR. (2026-07-09: +2 more alarms —
+# errcode-aggregator-drop-01 here + seal-writer-dropped in seal-drop-alarm.tf,
+# ~+$0.20/mo.)
 #
 # DIMENSIONLESS BY DESIGN: errors.jsonl events carry NO `host` field (the host
 # label is added by the Prometheus scrape, not the tracing layer), and metric

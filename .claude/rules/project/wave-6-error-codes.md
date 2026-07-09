@@ -71,8 +71,10 @@ companion counter never reached CloudWatch. Both routes are now live:
    registration), making it dense from boot.
 
 Lockstep ratchet: `crates/app/tests/seal_drop_paging_wiring_guard.rs`
-(4 tests — post-install registration order, emit-site stub-guard, both
-terraform shapes built from the real `code_str()` / metric literals).
+(5 tests — post-install registration order, emit-site stub-guard, both
+terraform shapes built from the real `code_str()` / metric literals, plus
+a string-aware HCL-comment-stripper self-test so tf comments can never
+satisfy the shape needles).
 Honest envelope: paging latency ≤ ~5 min on either route; a drop inside the
 pre-install boot window increments a no-op counter handle (route 2 blind;
 physically implausible — ring+spill+DLQ must all fail on live seal traffic
