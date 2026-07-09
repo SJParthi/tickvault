@@ -228,10 +228,8 @@ pub fn build_router_with_auth(
             "/board",
             axum::routing::get(handlers::board_page::board_page),
         )
-        .route(
-            "/api/board/data",
-            axum::routing::get(handlers::board::board_data),
-        )
+        // NOTE (2026-07-09 follow-up): `/api/board/data` moved DOWN to the
+        // rate-limited sub-router — the HTML shell above stays unlimited.
         .route(
             "/health",
             axum::routing::get(handlers::health::health_check),
@@ -254,19 +252,27 @@ pub fn build_router_with_auth(
             axum::routing::get(handlers::feeds::get_feeds_health),
         );
 
-    // 2026-07-09 audit hardening: the two unauthenticated QuestDB-backed
-    // endpoints live on their OWN sub-router behind a shared GCRA rate
-    // limiter (`route_layer` — structurally cannot wrap /api/feeds,
-    // /health, the debug routes, or the bearer-gated POST). Handler-level
-    // TTL caches (SharedAppState) are the second line; limit-first is the
-    // documented ordering. See `public_guard.rs` module docs for the
-    // global-not-per-IP rationale + budget analysis.
+    // 2026-07-09 audit hardening (+ same-day follow-up): the THREE
+    // unauthenticated QuestDB-backed endpoints live on their OWN sub-router
+    // behind a shared GCRA rate limiter (`route_layer` — structurally
+    // cannot wrap /api/feeds, /health, the HTML shells, the debug routes,
+    // or the bearer-gated POST). Handler-level TTL caches (SharedAppState)
+    // are the second line; limit-first is the documented ordering. See
+    // `public_guard.rs` module docs for the global-not-per-IP rationale +
+    // the budget analysis (one /board tab + one /dashboard tab ≈ 0.53 req/s
+    // vs the 5 req/s sustained budget).
     let public_limiter = Arc::new(PublicEndpointLimiter::new());
     let limited_public_routes: Router<SharedAppState> = Router::new()
         .route("/api/stats", axum::routing::get(handlers::stats::get_stats))
         .route(
             "/api/quote/{security_id}",
             axum::routing::get(handlers::quote::get_quote),
+        )
+        // 2026-07-09 follow-up (closes the #1458 HIGH residual): the board
+        // JSON snapshot (3 QuestDB queries/hit) is budgeted + 2s-cached.
+        .route(
+            "/api/board/data",
+            axum::routing::get(handlers::board::board_data),
         )
         .route_layer(axum::middleware::from_fn_with_state(
             public_limiter,
@@ -827,19 +833,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_board_data_shares_rate_limit_budget() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        // 2026-07-09 follow-up (closes the #1458 HIGH residual): the board
+        // JSON snapshot rides the SAME shared GCRA cell as stats + quote.
+        let router = build_router(auth_test_state(), &[], true);
+
+        // Exhaust the shared cell via stats (burst + margin; the first
+        // request populates the cache so the rest are fast cache hits —
+        // +8 margin per the adversarial-review llvm-cov headroom note)...
+        let burst = crate::public_guard::PUBLIC_API_BURST as usize;
+        let _ = fire_gets(&router, "/api/stats", burst + 8).await;
+
+        // ...then rapid board requests draw from the SAME budget → at least
+        // one must be 429 (same GCRA-replenishment de-flake loop as the
+        // quote budget test: 3 rapid requests can never ALL be replenished
+        // inside ~ms).
+        let mut saw_429 = false;
+        for _ in 0..3 {
+            let response = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/api/board/data")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            if response.status() == axum::http::StatusCode::TOO_MANY_REQUESTS {
+                saw_429 = true;
+                break;
+            }
+        }
+        assert!(
+            saw_429,
+            "board/data must share the public-endpoint budget (it protects the same DB)"
+        );
+    }
+
+    #[tokio::test]
     async fn test_feeds_and_health_not_rate_limited_after_burst() {
         // Locked contracts (websocket-connection-scope-lock.md 2026-07-04
         // banner + operator 2026-06-23 "public read, authed toggle"):
         // exhausting the public-endpoint limiter must NOT touch
         // GET /api/feeds, GET /api/feeds/health, or GET /health — they are
-        // structurally outside the rate-limited sub-router.
+        // structurally outside the rate-limited sub-router. The /board +
+        // /dashboard HTML shells (static, no DB) are pinned never-limited
+        // too (2026-07-09 follow-up: only the JSON data poll is budgeted).
         let router = build_router(auth_test_state(), &[], true);
 
         // Exhaust the limiter (burst + a margin).
         let burst = crate::public_guard::PUBLIC_API_BURST as usize;
         let _ = fire_gets(&router, "/api/stats", burst + 3).await;
 
-        for uri in ["/api/feeds", "/api/feeds/health", "/health"] {
+        for uri in [
+            "/api/feeds",
+            "/api/feeds/health",
+            "/health",
+            "/board",
+            "/dashboard",
+        ] {
             let statuses = fire_gets(&router, uri, 15).await;
             assert!(
                 statuses.iter().all(|s| *s == axum::http::StatusCode::OK),
