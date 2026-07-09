@@ -29,31 +29,10 @@
 # =============================================================================
 
 [advisories]
-ignore = [
-    # 2026-07-07 — RUSTSEC-2026-0204 (crossbeam-epoch 0.9.18, `fmt::Pointer`
-    # invalid pointer dereference for `Atomic`/`Shared` when the underlying
-    # pointer is invalid, e.g. `Atomic::null`). TRANSITIVE-ONLY: pulled via
-    # criterion → rayon → crossbeam-deque (dev/bench chain) and
-    # metrics-exporter-prometheus → metrics-util (internals). tickvault code
-    # never invokes `fmt` on `Atomic`/`Shared` — no direct crossbeam-epoch
-    # usage. Real fix = bump the lock to crossbeam-epoch >= 0.9.20, blocked
-    # on operator approval (`cargo update` is BANNED per CLAUDE.md); a
-    # follow-up maintenance sweep carries the targeted bump. Full reason
-    # mirrored in deny.toml.
-    "RUSTSEC-2026-0204",
-    # 2026-07-07 — RUSTSEC-2026-0185 (quinn-proto 0.11.14, remote memory
-    # exhaustion via unbounded out-of-order stream reassembly; high 7.5).
-    # AUDIT-ONLY IGNORE, deliberately ABSENT from deny.toml: quinn-proto is
-    # a PHANTOM lockfile entry — pulled only by reqwest's `http3` feature,
-    # which tickvault does NOT enable. `cargo tree -i quinn-proto` prints
-    # nothing (not in the resolved graph), so cargo-deny never sees it and
-    # emits `advisory-not-detected` if this ID is listed there. cargo-audit,
-    # however, scans the RAW Cargo.lock and flags it regardless of feature
-    # resolution — hence this entry lives ONLY here. Do NOT "clean up" this
-    # ignore based on cargo-deny output (that removal is exactly what broke
-    # the 2026-07-07 Security & Audit run). Remove only when the lockfile
-    # pins quinn-proto >= 0.11.15 (targeted bump, needs operator approval —
-    # `cargo update` is BANNED per CLAUDE.md) or reqwest drops the entry.
-    "RUSTSEC-2026-0185",
-]
+# 2026-07-09: RUSTSEC-2026-0204 (crossbeam-epoch) + RUSTSEC-2026-0185
+# (quinn-proto, audit-only) ignores REMOVED after the targeted lock bump to
+# crossbeam-epoch 0.9.20 + quinn-proto 0.11.15 (surgical Cargo.lock
+# version+checksum edit). Both advisories are resolved in Cargo.lock, so
+# cargo-audit no longer flags them and no ignore is required.
+ignore = []
 
