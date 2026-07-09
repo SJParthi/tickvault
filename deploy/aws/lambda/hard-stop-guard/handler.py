@@ -15,10 +15,21 @@ Behaviour (hourly EventBridge cron):
         Budget Actions fire only ONCE per month-crossing, so after a 100%
         kill the next morning's start cron would otherwise restart the box
         and run it daily, unkilled, for the rest of the month.
-      - Cost Explorer error (MTD unknown) -> FAIL-SAFE: never stop or
-        disable on missing data; keep the hourly "still running" ping and
-        say the budget check failed.
-      - Below budget -> hourly "still running" cost ping (unchanged).
+        Evaluated FIRST — the breach stop is NEVER gated on ping state.
+      - Otherwise (2026-07-09 operator escalation — Telegram noise N2):
+        the running ping fires only on CHANGE, never as an identical
+        hourly repeat. State = ONE SSM String param (PING_STATE_PARAM,
+        JSON {"month","bucket","outcome"}); ping reasons:
+          * ping_state_missing   — no/corrupt state (fail-open: one ping
+                                   beats a silent guard; also the first run)
+          * ping_new_month       — calendar month rolled over
+          * ping_cost_unknown_edge — Cost Explorer failed (rising edge
+                                   only; latched repeats stay silent)
+          * ping_cost_recovered  — the cost check recovered (falling edge)
+          * ping_bucket_changed  — spend crossed a 10%-of-stop-budget
+                                   bucket boundary (either direction)
+        The 17:30 IST daily digest (budget-guards.tf) remains the
+        end-of-day summary and is untouched.
 
 Environment variables (set by Terraform):
   INSTANCE_ID      — the tv-app EC2 instance
@@ -27,6 +38,8 @@ Environment variables (set by Terraform):
   BUDGET_KILL_USD  — the kill line (default 55). KEEP IN SYNC with
                      budget.tf limit_amount AND BUDGET_USD in the daily
                      digest (budget-guards.tf) — the three MUST agree.
+  PING_STATE_PARAM — SSM String param holding the change-only ping state
+                     (default /tickvault/prod/budget-guard/ping-state).
 
 No pip deps — boto3 is pre-installed in the AWS Lambda Python 3.12
 runtime. boto3 is lazily imported so unit tests run without AWS creds.
@@ -34,6 +47,7 @@ runtime. boto3 is lazily imported so unit tests run without AWS creds.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 from datetime import datetime, timedelta, timezone
@@ -50,6 +64,16 @@ START_RULE_NAME = os.environ.get("START_RULE_NAME", "")
 # identical basis to the AWS Budget (budget.tf limit_amount = "55") so this
 # guard and the native Budget Actions agree on "breached".
 BUDGET_KILL_USD = float(os.environ.get("BUDGET_KILL_USD", "55"))
+# Change-only ping state (2026-07-09) — ONE SSM String param, JSON
+# {"month": "YYYY-MM", "bucket": int, "outcome": str}. Created lazily by
+# PutParameter(Overwrite=True); NOT under the banned groww/* namespace.
+PING_STATE_PARAM = os.environ.get(
+    "PING_STATE_PARAM", "/tickvault/prod/budget-guard/ping-state"
+)
+# Spend buckets are 10%-of-stop-budget steps; bucket 8 (80%) starts the
+# "approaching stop-budget" subject flavor, bucket 9+ is the red flavor.
+BUCKET_PCT_STEP = 10
+APPROACH_BUCKET = 8
 
 
 def in_up_window(now_utc: datetime) -> bool:
@@ -104,6 +128,160 @@ def classify_in_window_action(mtd: float | None, budget_kill_usd: float) -> str:
     if mtd >= budget_kill_usd:
         return "breach_stop"
     return "below_budget"
+
+
+def spend_bucket(mtd: float | None, budget_kill_usd: float) -> int:
+    """Pure: which 10%-of-stop-budget bucket the MTD spend sits in.
+
+    Total — never raises: unknown/negative spend or a non-positive kill
+    line clamps to bucket 0; the percentage is capped so a runaway spend
+    cannot overflow anything.
+    """
+    try:
+        if mtd is None or mtd < 0 or budget_kill_usd <= 0:
+            return 0
+        pct = (mtd / budget_kill_usd) * 100.0
+        return int(min(pct, 999.0) // BUCKET_PCT_STEP)
+    except Exception:  # noqa: BLE001 — pure classifier must never raise
+        return 0
+
+
+def classify_ping_decision(
+    prev: Any,
+    action: str,
+    mtd: float | None,
+    budget_kill_usd: float,
+    month: str,
+) -> tuple[str, dict[str, Any]]:
+    """Pure change-only ping decision (2026-07-09 — Telegram noise N2).
+
+    Returns (reason, new_state). reason is one of:
+      ping_state_missing / ping_new_month / ping_cost_unknown_edge /
+      ping_cost_recovered / ping_bucket_changed / silent.
+    Fail-open by design: a missing or corrupt prev state PINGS (one ping
+    beats a silent guard). The breach stop never reaches this function —
+    the caller returns via _execute_breach_stop BEFORE any state read.
+    """
+    bucket = spend_bucket(mtd, budget_kill_usd)
+    new_state: dict[str, Any] = {"month": month, "bucket": bucket, "outcome": action}
+    # cost_unknown first: it has no trustworthy spend figure, so no other
+    # reason may render one; edge-latched so repeats stay silent.
+    if action == "cost_unknown":
+        if isinstance(prev, dict) and prev.get("outcome") == "cost_unknown":
+            return ("silent", new_state)
+        return ("ping_cost_unknown_edge", new_state)
+    if (
+        not isinstance(prev, dict)
+        or not isinstance(prev.get("month"), str)
+        or not isinstance(prev.get("bucket"), int)
+        or not isinstance(prev.get("outcome"), str)
+    ):
+        return ("ping_state_missing", new_state)
+    if prev["month"] != month:
+        return ("ping_new_month", new_state)
+    if prev["outcome"] == "cost_unknown":
+        return ("ping_cost_recovered", new_state)
+    if prev["bucket"] != bucket:
+        # Either direction — a mid-month credit/refund decrease is rare
+        # and genuinely informative.
+        return ("ping_bucket_changed", new_state)
+    return ("silent", new_state)
+
+
+def render_running_ping(
+    reason: str,
+    mtd: float | None,
+    bucket: int,
+    budget_kill_usd: float,
+    hrs_up: float,
+    instance_id: str,
+) -> tuple[str, str]:
+    """Pure: (subject, message) for a change-only running ping."""
+    if reason == "ping_cost_unknown_edge":
+        return (
+            "[BUDGET] cost check failed — box left running",
+            (
+                "🟡 Could not read this month's spend (fail-safe: box NOT "
+                "stopped, auto-start NOT disabled).\n"
+                f"_instance_: `{instance_id}` — up {hrs_up:.1f}h this boot.\n"
+                "Will report again when the cost check recovers.\n"
+            ),
+        )
+    mtd_val = mtd if mtd is not None else 0.0
+    pct = (mtd_val / budget_kill_usd) * 100.0 if budget_kill_usd > 0 else 0.0
+    spend_line = (
+        f"Month spend ~${mtd_val:.2f} of ${budget_kill_usd:.0f} "
+        f"stop-budget ({pct:.0f}%)."
+    )
+    if reason == "ping_cost_recovered":
+        return (
+            "[BUDGET] cost check recovered",
+            (
+                f"🟢 Cost check is working again. {spend_line}\n"
+                f"_instance_: `{instance_id}` — up {hrs_up:.1f}h this boot.\n"
+                "Next update only when spend crosses the next 10% step.\n"
+            ),
+        )
+    if reason == "ping_new_month":
+        subject = "[BUDGET] new month — spend counter reset"
+    elif reason == "ping_state_missing":
+        subject = "[BUDGET] box running — first spend status"
+    elif bucket > APPROACH_BUCKET:
+        subject = "[BUDGET] approaching stop-budget — 90% used"
+    elif bucket == APPROACH_BUCKET:
+        subject = "[BUDGET] approaching stop-budget — 80% used"
+    else:
+        subject = f"[BUDGET] spend crossed {bucket * BUCKET_PCT_STEP}% of stop-budget"
+    if bucket >= APPROACH_BUCKET:
+        tail = (
+            f"At ${budget_kill_usd:.0f} the box STOPS and the morning "
+            "auto-start is DISABLED. If this month's spend is expected, "
+            "raise the budget before it trips.\n"
+        )
+        emoji = "🔴" if bucket > APPROACH_BUCKET else "⚠️"
+    else:
+        tail = (
+            "Box is in the trading window and left running. Next update "
+            "only when spend crosses the next 10% step.\n"
+        )
+        emoji = "🟡"
+    return (
+        subject,
+        (
+            f"{emoji} {spend_line}\n"
+            f"_instance_: `{instance_id}` — up {hrs_up:.1f}h this boot.\n"
+            f"{tail}"
+        ),
+    )
+
+
+def load_ping_state(ssm_client: Any) -> dict[str, Any] | None:
+    """Best-effort SSM state read — ANY error returns None (fail-open:
+    the classifier then pings; one ping beats a silent guard)."""
+    try:
+        r = ssm_client.get_parameter(Name=PING_STATE_PARAM)
+        value = json.loads(r["Parameter"]["Value"])
+        return value if isinstance(value, dict) else None
+    except Exception as e:  # noqa: BLE001 — state read must never raise
+        logger.warning("ping-state read failed (fail-open to ping): %s", e)
+        return None
+
+
+def save_ping_state(ssm_client: Any, state: dict[str, Any]) -> bool:
+    """Best-effort SSM state write — a failed write is logged and the
+    handler still returns ok (worst case: one duplicate ping/hour until
+    the write lands — duplicate-over-silent)."""
+    try:
+        ssm_client.put_parameter(
+            Name=PING_STATE_PARAM,
+            Value=json.dumps(state),
+            Type="String",
+            Overwrite=True,
+        )
+        return True
+    except Exception as e:  # noqa: BLE001 — state write must never raise
+        logger.warning("ping-state write failed (next hour may re-ping): %s", e)
+        return False
 
 
 def _execute_breach_stop(
@@ -174,6 +352,7 @@ def lambda_handler(
     sns: Any = None,
     events_client: Any = None,
     ce_client: Any = None,
+    ssm_client: Any = None,
     now_utc: datetime | None = None,
 ) -> dict[str, Any]:
     """Entry point — hourly EventBridge cron.
@@ -208,28 +387,45 @@ def lambda_handler(
     if in_up_window(now):
         # Running DURING the trading window — expected. GAP 1 check first:
         # even in-window, a breached budget stops the box + kills the
-        # morning restart. Otherwise hourly "still running" cost ping.
+        # morning restart. The breach stop is evaluated BEFORE any ping
+        # state read — it can NEVER be gated on ping-state problems.
         usd = mtd_usd(ce_client)
         action = classify_in_window_action(usd, BUDGET_KILL_USD)
         if action == "breach_stop":
             return _execute_breach_stop(ec2, sns, events_client, usd, state)
 
+        # 2026-07-09 (operator escalation — Telegram noise N2): the running
+        # ping is CHANGE-ONLY — never an identical hourly repeat. The
+        # 17:30 IST daily digest remains the end-of-day summary.
+        if ssm_client is None:
+            import boto3  # noqa: PLC0415 — lazy so tests run without creds
+
+            ssm_client = boto3.client("ssm")
         launch = inst.get("LaunchTime")
         hrs_up = (now - launch).total_seconds() / 3600 if launch else 0.0
-        if action == "cost_unknown":
-            usd_str = "n/a (cost check failed — fail-safe: NOT disabling auto-start)"
-        else:
-            usd_str = f"~${usd:.2f}"
-        sns.publish(
-            TopicArn=ALERTS_TOPIC_ARN,
-            Subject="[BUDGET] box still running",
-            Message=(
-                "🟢 *Box running (in window)*\n"
-                f"_instance_: `{INSTANCE_ID}`\n"
-                f"_up_: {hrs_up:.1f}h this boot\n"
-                f"_MTD spend_: {usd_str} / ${BUDGET_KILL_USD:.0f} stop-budget\n"
-                "In the 08:30-16:30 IST trading window — left running.\n"
-            ),
+        prev = load_ping_state(ssm_client)
+        month = now.strftime("%Y-%m")
+        reason, new_state = classify_ping_decision(
+            prev, action, usd, BUDGET_KILL_USD, month
+        )
+        state_saved = True
+        if reason != "silent":
+            subject, message = render_running_ping(
+                reason, usd, new_state["bucket"], BUDGET_KILL_USD, hrs_up, INSTANCE_ID
+            )
+            sns.publish(
+                TopicArn=ALERTS_TOPIC_ARN,
+                Subject=subject[:99],
+                Message=message,
+            )
+            # Save only when something was said — a silent hour by
+            # construction leaves the state semantically unchanged.
+            state_saved = save_ping_state(ssm_client, new_state)
+        logger.info(
+            "in-window budget check: action=%s ping_reason=%s bucket=%s",
+            action,
+            reason,
+            new_state["bucket"],
         )
         return {
             "ok": True,
@@ -237,6 +433,8 @@ def lambda_handler(
             "in_window": True,
             "state": state,
             "budget_action": action,
+            "ping_reason": reason,
+            "state_saved": state_saved,
         }
 
     # Running OUTSIDE the up-window — force stop + alert (the legacy
