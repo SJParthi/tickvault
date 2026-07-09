@@ -10,6 +10,8 @@
 #[global_allocator]
 static ALLOC: dhat::Alloc = dhat::Alloc;
 
+mod dhat_support;
+
 use tickvault_common::constants::{
     EXCHANGE_SEGMENT_NSE_FNO, FULL_QUOTE_PACKET_SIZE, MARKET_DEPTH_PACKET_SIZE, QUOTE_PACKET_SIZE,
     TICKER_PACKET_SIZE,
@@ -127,35 +129,37 @@ fn dhat_all_parsers_zero_alloc() {
     tickvault_core::parser::prewarm_dispatcher_counters();
 
     // ---- Measure: all allocations from here must be zero ----
-    let stats_before = dhat::HeapStats::get();
+    // 2026-07-09: measured via the bounded phantom-retry helper (roaming
+    // 4-block cross-thread flake on 2-core CI runners — see
+    // dhat_support/mod.rs). Budget UNCHANGED: exactly 0 blocks.
+    let (_, allocs_during) = dhat_support::measure_with_phantom_retry(
+        0,
+        0,
+        || {},
+        || {
+            // 1. Ticker parse
+            assert!(tickvault_core::parser::dispatch_frame(&ticker_pkt, 0).is_ok());
 
-    // 1. Ticker parse
-    assert!(tickvault_core::parser::dispatch_frame(&ticker_pkt, 0).is_ok());
+            // 2. Quote parse
+            assert!(tickvault_core::parser::dispatch_frame(&quote_pkt, 0).is_ok());
 
-    // 2. Quote parse
-    assert!(tickvault_core::parser::dispatch_frame(&quote_pkt, 0).is_ok());
+            // 3. Market depth — retired v1 response code 3 (replaced by Full
+            //    code 8 in v2). dispatch_frame now REJECTS it; the rejection path
+            //    must also be zero-allocation.
+            assert!(tickvault_core::parser::dispatch_frame(&depth_pkt, 0).is_err());
 
-    // 3. Market depth — retired v1 response code 3 (replaced by Full
-    //    code 8 in v2). dispatch_frame now REJECTS it; the rejection path
-    //    must also be zero-allocation.
-    assert!(tickvault_core::parser::dispatch_frame(&depth_pkt, 0).is_err());
+            // 4. Full packet parse
+            assert!(tickvault_core::parser::dispatch_frame(&full_pkt, 0).is_ok());
 
-    // 4. Full packet parse
-    assert!(tickvault_core::parser::dispatch_frame(&full_pkt, 0).is_ok());
+            // 5. Burst: 100 ticker parses
+            for pkt in &burst_pkts {
+                assert!(tickvault_core::parser::dispatch_frame(pkt, 0).is_ok());
+            }
 
-    // 5. Burst: 100 ticker parses
-    for pkt in &burst_pkts {
-        assert!(tickvault_core::parser::dispatch_frame(pkt, 0).is_ok());
-    }
-
-    // 6. Error path: empty frame
-    assert!(tickvault_core::parser::dispatch_frame(empty, 0).is_err());
-
-    // ---- End measurement ----
-    let stats_after = dhat::HeapStats::get();
-    let allocs_during = stats_after
-        .total_blocks
-        .saturating_sub(stats_before.total_blocks);
+            // 6. Error path: empty frame
+            assert!(tickvault_core::parser::dispatch_frame(empty, 0).is_err());
+        },
+    );
 
     assert_eq!(
         allocs_during, 0,

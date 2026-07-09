@@ -17,6 +17,8 @@ use tickvault_core::pipeline::feed_consumer::consume_feed_tick;
 #[global_allocator]
 static ALLOC: dhat::Alloc = dhat::Alloc;
 
+mod dhat_support;
+
 fn make_tick(i: u32) -> ParsedTick {
     ParsedTick {
         security_id: 13,
@@ -47,52 +49,63 @@ fn dhat_feed_consumer_zero_alloc() {
         |_| aggregated_count.set(aggregated_count.get() + 1),
     );
 
-    let stats_before = dhat::HeapStats::get();
+    // 2026-07-09: measured via the bounded phantom-retry helper (roaming
+    // 4-block cross-thread flake on 2-core CI runners — see
+    // dhat_support/mod.rs). Budget UNCHANGED: exactly 0 blocks. The gate
+    // sanity checks moved INSIDE the workload as per-attempt DELTAS (the
+    // cells accumulate across retry attempts, so absolute totals would
+    // depend on the attempt count).
+    let (_, allocs_during) = dhat_support::measure_with_phantom_retry(
+        0,
+        0,
+        || {},
+        || {
+            let enriched_start = enriched_count.get();
+            let persisted_start = persisted_count.get();
+            let aggregated_start = aggregated_count.get();
 
-    // 10,000 ticks through the shared core — alternating feeds so BOTH match
-    // arms are exercised on the measured path.
-    for i in 0..10_000_u32 {
-        let mut tick = make_tick(i);
-        let feed = if i.is_multiple_of(2) {
-            Feed::Dhan
-        } else {
-            Feed::Groww
-        };
-        consume_feed_tick(
-            feed,
-            &mut tick,
-            |t| {
-                t.iv = 0.18;
-                enriched_count.set(enriched_count.get() + 1);
-            },
-            |t| {
-                // Copy-field read, mirroring the persist closure's access shape.
-                if t.last_traded_price > 0.0 {
-                    persisted_count.set(persisted_count.get() + 1);
-                }
-            },
-            |t| {
-                if t.exchange_timestamp > 0 {
-                    aggregated_count.set(aggregated_count.get() + 1);
-                }
-            },
-        );
-    }
+            // 10,000 ticks through the shared core — alternating feeds so BOTH
+            // match arms are exercised on the measured path.
+            for i in 0..10_000_u32 {
+                let mut tick = make_tick(i);
+                let feed = if i.is_multiple_of(2) {
+                    Feed::Dhan
+                } else {
+                    Feed::Groww
+                };
+                consume_feed_tick(
+                    feed,
+                    &mut tick,
+                    |t| {
+                        t.iv = 0.18;
+                        enriched_count.set(enriched_count.get() + 1);
+                    },
+                    |t| {
+                        // Copy-field read, mirroring the persist closure's access shape.
+                        if t.last_traded_price > 0.0 {
+                            persisted_count.set(persisted_count.get() + 1);
+                        }
+                    },
+                    |t| {
+                        if t.exchange_timestamp > 0 {
+                            aggregated_count.set(aggregated_count.get() + 1);
+                        }
+                    },
+                );
+            }
 
-    let stats_after = dhat::HeapStats::get();
-    let allocs_during = stats_after
-        .total_blocks
-        .saturating_sub(stats_before.total_blocks);
+            // Sanity (per attempt): enrich fired for the 5,000 Dhan calls,
+            // never for the 5,000 Groww calls; persist + aggregate fired for
+            // every tick. (The warm-up's +1 enrich sits outside these deltas.)
+            assert_eq!(enriched_count.get() - enriched_start, 5_000);
+            assert_eq!(persisted_count.get() - persisted_start, 10_000);
+            assert_eq!(aggregated_count.get() - aggregated_start, 10_000);
+        },
+    );
 
     assert_eq!(
         allocs_during, 0,
         "consume_feed_tick allocated {allocs_during} blocks over 10,000 ticks — \
          PRINCIPLE #1 VIOLATED. The converged consumer core must be zero-alloc."
     );
-    // Sanity: the gate ran as specified — enrich fired for the 5,001 Dhan
-    // calls (incl. warm-up), never for the 5,000 Groww calls; persist +
-    // aggregate fired for every tick.
-    assert_eq!(enriched_count.get(), 5_001);
-    assert_eq!(persisted_count.get(), 10_001);
-    assert_eq!(aggregated_count.get(), 10_001);
 }

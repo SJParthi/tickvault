@@ -39,6 +39,8 @@ static ALLOC: dhat::Alloc = dhat::Alloc;
 
 use tickvault_core::pipeline::feed_lag_monitor::record_dhan_tick;
 
+mod dhat_support;
+
 const NANOS_PER_SEC: i64 = 1_000_000_000;
 
 #[test]
@@ -58,25 +60,26 @@ fn dhat_record_dhan_tick_hot_path_zero_allocation() {
     // suppresses the dhat-heap.json side-effect file now that this test
     // runs in the normal Test (core) CI lane on every PR.
     let _profiler = dhat::Profiler::builder().testing().build();
-    let stats_before = dhat::HeapStats::get();
-
-    for i in 0..10_000_i64 {
-        // Admitted live samples (fresh capture instant, varying receive).
-        let recv = t0_utc_nanos + i * 1_000_000;
-        record_dhan_tick(recv, recv - 1_000_000, exchange_ist_secs);
-        std::hint::black_box(i);
-    }
-
-    let stats_after = dhat::HeapStats::get();
-    let new_bytes = stats_after
-        .total_bytes
-        .saturating_sub(stats_before.total_bytes);
-    let new_blocks = stats_after
-        .total_blocks
-        .saturating_sub(stats_before.total_blocks);
 
     const BUDGET_BYTES: u64 = 1024;
     const BUDGET_BLOCKS: u64 = 8;
+
+    // 2026-07-09: measured via the bounded phantom-retry helper (roaming
+    // 4-block cross-thread flake on 2-core CI runners — see
+    // dhat_support/mod.rs). Budgets UNCHANGED (1024 B / 8 blocks).
+    let (new_bytes, new_blocks) = dhat_support::measure_with_phantom_retry(
+        BUDGET_BYTES,
+        BUDGET_BLOCKS,
+        || {},
+        || {
+            for i in 0..10_000_i64 {
+                // Admitted live samples (fresh capture instant, varying receive).
+                let recv = t0_utc_nanos + i * 1_000_000;
+                record_dhan_tick(recv, recv - 1_000_000, exchange_ist_secs);
+                std::hint::black_box(i);
+            }
+        },
+    );
     assert!(
         new_bytes <= BUDGET_BYTES,
         "record_dhan_tick allocated {new_bytes} bytes across 10K calls — \

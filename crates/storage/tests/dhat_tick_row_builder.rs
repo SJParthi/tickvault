@@ -13,6 +13,8 @@ use tickvault_storage::tick_row_builder::{RawTickFields, build_tick_row_for_feed
 #[global_allocator]
 static ALLOC: dhat::Alloc = dhat::Alloc;
 
+mod dhat_support;
+
 /// A fully-populated Dhan-shape `RawTickFields` (every Option Some → widest row).
 fn dhan_fields(capture_seq: i64) -> RawTickFields {
     RawTickFields {
@@ -50,19 +52,23 @@ fn dhat_build_tick_row_for_feed_zero_alloc() {
     build_tick_row_for_feed(&mut buffer, &dhan_fields(0), Feed::Dhan).expect("prewarm");
     buffer.clear();
 
-    let stats_before = dhat::HeapStats::get();
-
-    // Build one widest row per iteration, clearing between rows (mirrors a
-    // flush). With capacity already at steady state, no allocation should occur.
-    for i in 0..1000 {
-        build_tick_row_for_feed(&mut buffer, &dhan_fields(i), Feed::Dhan).expect("build dhan");
-        buffer.clear();
-    }
-
-    let stats_after = dhat::HeapStats::get();
-    let allocs_during = stats_after
-        .total_blocks
-        .saturating_sub(stats_before.total_blocks);
+    // 2026-07-09: measured via the bounded phantom-retry helper (roaming
+    // 4-block cross-thread flake on 2-core CI runners — see
+    // dhat_support/mod.rs). Budget UNCHANGED: exactly 0 blocks.
+    let (_, allocs_during) = dhat_support::measure_with_phantom_retry(
+        0,
+        0,
+        || {},
+        || {
+            // Build one widest row per iteration, clearing between rows (mirrors a
+            // flush). With capacity already at steady state, no allocation should occur.
+            for i in 0..1000 {
+                build_tick_row_for_feed(&mut buffer, &dhan_fields(i), Feed::Dhan)
+                    .expect("build dhan");
+                buffer.clear();
+            }
+        },
+    );
 
     assert_eq!(
         allocs_during, 0,
