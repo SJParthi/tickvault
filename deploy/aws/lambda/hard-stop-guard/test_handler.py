@@ -343,12 +343,32 @@ class ChangeOnlyPingClassifier(unittest.TestCase):
         self.assertEqual(new_state["bucket"], 6)
 
     def test_bucket_decrease_pings(self) -> None:
-        # A mid-month credit/refund decrease is informative — ping.
+        # A >= 2-bucket mid-month credit/refund decrease is informative —
+        # ping (bucket 6 -> 3 here).
         prev = {"month": "2026-07", "bucket": 6, "outcome": "below_budget"}
         reason, _ = handler.classify_ping_decision(
             prev, "below_budget", 20.0, 55.0, "2026-07"
         )
         self.assertEqual(reason, "ping_bucket_changed")
+
+    def test_bucket_decrease_one_step_silent_hysteresis(self) -> None:
+        # Hostile-review fix 2026-07-09: spend sitting on a 10% boundary
+        # with Cost Explorer estimate jitter (revised DOWN one bucket, then
+        # back up) must not re-open hourly repeats. The 1-bucket dip is
+        # silent AND retains the stored bucket, so the flip back up is
+        # silent too.
+        prev = {"month": "2026-07", "bucket": 6, "outcome": "below_budget"}
+        # 32.9/55 = 59.8% -> bucket 5: one step down -> silent, bucket kept.
+        reason, new_state = handler.classify_ping_decision(
+            prev, "below_budget", 32.9, 55.0, "2026-07"
+        )
+        self.assertEqual(reason, "silent")
+        self.assertEqual(new_state["bucket"], 6, "stored bucket retained")
+        # Next hour the estimate flips back up to bucket 6 -> still silent.
+        reason2, _ = handler.classify_ping_decision(
+            new_state, "below_budget", 33.1, 55.0, "2026-07"
+        )
+        self.assertEqual(reason2, "silent")
 
     def test_month_rollover_pings_once(self) -> None:
         prev = {"month": "2026-07", "bucket": 9, "outcome": "below_budget"}

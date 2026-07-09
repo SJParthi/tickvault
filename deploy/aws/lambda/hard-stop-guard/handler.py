@@ -27,7 +27,12 @@ Behaviour (hourly EventBridge cron):
                                    only; latched repeats stay silent)
           * ping_cost_recovered  — the cost check recovered (falling edge)
           * ping_bucket_changed  — spend crossed a 10%-of-stop-budget
-                                   bucket boundary (either direction)
+                                   bucket boundary (any increase; a
+                                   DECREASE only when >= 2 buckets down —
+                                   Cost Explorer estimates are revised
+                                   both ways, so a 1-bucket dip at a
+                                   boundary is hysteresis-suppressed to
+                                   keep hourly flapping out of Telegram)
         The 17:30 IST daily digest (budget-guards.tf) remains the
         end-of-day summary and is untouched.
 
@@ -181,10 +186,21 @@ def classify_ping_decision(
         return ("ping_new_month", new_state)
     if prev["outcome"] == "cost_unknown":
         return ("ping_cost_recovered", new_state)
-    if prev["bucket"] != bucket:
-        # Either direction — a mid-month credit/refund decrease is rare
-        # and genuinely informative.
+    if bucket > prev["bucket"]:
         return ("ping_bucket_changed", new_state)
+    if prev["bucket"] - bucket >= 2:
+        # A >= 2-bucket decrease is a real mid-month credit/refund —
+        # rare and genuinely informative.
+        return ("ping_bucket_changed", new_state)
+    if bucket < prev["bucket"]:
+        # Hysteresis (hostile-review fix 2026-07-09): Cost Explorer
+        # UnblendedCost estimates are revised BOTH ways, so spend sitting
+        # on a 10% boundary can flip one bucket down and back up every
+        # hour — exactly the N2 hourly-repeat class. A 1-bucket dip stays
+        # SILENT and RETAINS the stored bucket, so the flip back up is
+        # silent too.
+        new_state["bucket"] = prev["bucket"]
+        return ("silent", new_state)
     return ("silent", new_state)
 
 
