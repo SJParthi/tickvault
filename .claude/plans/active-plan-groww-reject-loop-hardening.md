@@ -131,6 +131,33 @@ for real diff cost. Recorded as a conscious scope decision.
   JWT-shaped substrings redacted even if the sidecar's own redaction ever
   misses one.
 
+### Post-impl adversarial review outcomes (2026-07-09, folded in)
+
+- **HIGH (fixed):** page-storm amplification — the ~5-min never-streamed
+  relaunch cadence × a fresh per-child `alerted` latch would have paged the
+  GrowwSidecarRejected HIGH ~12×/hour. Fixed with a supervisor-lifetime
+  cross-child page cooldown (`GROWW_REJECT_PAGE_COOLDOWN_SECS = 1800`, pure
+  `should_page_reject`, CAS'd across the two drains) on the single-conn
+  Passthrough arm; suppressed pages counted by
+  `tv_groww_reject_page_cooldown_suppressed_total`; all other side-effects
+  (error! forwards, FEED-REJECT-01, feed-health) unchanged.
+- **MEDIUM (fixed):** the fleet Suppress re-arm of `alerted` would have made
+  the FEED-REJECT-01 emit per-line on the fleet path — it now has its OWN
+  per-child `detail_logged` latch, re-armed only on streaming recovery.
+- **MEDIUM (documented, runbook §1b):** the 300s relaunch resets the
+  sidecar's 600s "access token stale" escalation clock in-session; the
+  per-cycle `error [auth]` AuthRejected class + FEED-REJECT-01 signatures
+  carry the same diagnosis.
+- **MEDIUM (documented, runbook §1b):** +12 Groww sessions/hour churn is
+  marginal vs the sidecar's internal reconnect ladder (up to ~720/hour).
+- **Security LOWs (2 fixed, 1 flagged):** `auth_token` added to the
+  credential-field redaction keys in `capture_rest_error_body`;
+  BiDi/zero-width/BOM strip added to `sidecar_line_signature`; AWS
+  `x-amz-security-token` level-suppression-only protection on the Python
+  side is pre-existing and flagged as follow-up.
+- **LOWs (comments):** G1-gate-as-wall-clock-window note at the call site;
+  "session" = app process wording corrected.
+
 ## Failure Modes
 
 - **Sidecar that can never stream (entitlement/server-side)**: bounded ~5-min

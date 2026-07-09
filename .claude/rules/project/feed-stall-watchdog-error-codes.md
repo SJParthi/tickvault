@@ -164,10 +164,41 @@ signal) PLUS the NEW attribution counter
 `tv_feed_sidecar_never_streamed_restart_total{feed}` (pre-registered in
 main.rs next to the stall counter, same delta-baseline rationale).
 
-**Honest envelope:** the restart re-auths + re-subscribes; it cannot force
-Groww's server to send data. A server-side reject that persists shows up as
-the bounded restart cadence + the pager + the §1c FEED-REJECT-01 signatures —
-loud, never silent, never a tight kill loop.
+**Honest envelope (incl. the 2026-07-09 post-impl hostile-review outcomes):**
+the restart re-auths + re-subscribes; it cannot force Groww's server to send
+data. A server-side reject that persists shows up as the bounded restart
+cadence + the pager + the §1c FEED-REJECT-01 signatures — loud, never silent,
+never a tight kill loop. Known bounds, stated plainly:
+
+- **Page-storm bound (review HIGH, FIXED):** each relaunched child gets a
+  fresh `alerted` latch, so a persistent reject day would have paged the
+  `GrowwSidecarRejected` HIGH ~12×/hour. The single-conn Telegram fan-out is
+  now additionally gated by a supervisor-lifetime cross-child cooldown
+  (`GROWW_REJECT_PAGE_COOLDOWN_SECS` = 1800s, pure `should_page_reject`,
+  CAS'd so the two pipe drains never double-page): at most one reject page
+  per 30 min per supervisor; suppressed episodes keep their `error!`
+  forwards, FEED-REJECT-01 signature, and feed-health marking, and are
+  counted by `tv_groww_reject_page_cooldown_suppressed_total`. The
+  ≥3-per-15-min restart pager independently covers "it keeps failing".
+- **"This session" = this APP PROCESS:** `feed_health`'s last-tick stamp
+  never resets in-process, so on day 2 of a long-running process the arm is
+  dormant and the classic 30s stall arm owns everything (no coverage hole).
+  The arm's value is the boot/deploy-into-contention morning.
+- **Token-stale interplay (review MEDIUM, DOCUMENTED):** during an in-session
+  auth-stale episode the ~5-min relaunch resets the sidecar's 600s
+  `access token stale` escalation clock, so that specific minter-dead marker
+  may never print in-session. Compensating signals: every failed auth cycle
+  still prints `groww sidecar error [auth]: …` (AuthRejected class → the
+  specific "authentication rejected" Telegram wording + feed-health RED),
+  and the FEED-REJECT-01 signature carries the `error [auth]` prefix.
+  Restarting is harmless to the token itself (the sidecar only ever READS
+  SSM — never mints).
+- **Connection churn (review MEDIUM, DOCUMENTED):** ~12 extra Groww sessions
+  per hour from the relaunch cadence is marginal against the sidecar's own
+  in-process reconnect ladder (5s→300s backoff, up to ~720 fresh
+  connections/hour during a failure loop); if the shared account is in a
+  churn-penalty window, the dominant churn source is the internal ladder,
+  not this arm.
 
 ### §1c. FEED-REJECT-01 — bounded sidecar reject-cause signature (2026-07-09)
 
@@ -190,9 +221,12 @@ same latch that fires the `GrowwSidecarRejected` Telegram) now ALSO emits ONE
 through the existing `capture_rest_error_body` sanitize choke point
 (control-char strip → URL/credential-param redaction → JWT-shape redaction →
 credential-JSON-field redaction) then truncated to
-`SIDECAR_LINE_SIGNATURE_MAX_CHARS` (160 chars, UTF-8-safe). Bounded: ≤1 per
-child episode on the single-conn path; ≤1 per 60s fleet window per child on
-the fleet path (the Suppress re-arm). Telegram wording is UNCHANGED.
+`SIDECAR_LINE_SIGNATURE_MAX_CHARS` (160 chars, UTF-8-safe; BiDi/zero-width/BOM
+chars also stripped per the 2026-07-09 security review). Bounded by its OWN
+per-child `detail_logged` latch — once per child episode on EVERY path,
+re-armed only by a streaming recovery, deliberately NOT by the fleet
+Suppress re-arm of `alerted` (review MEDIUM fix: the re-arm would have made
+this emit per-line on the fleet path). Telegram wording is UNCHANGED.
 
 **Triage:**
 1. `mcp__tickvault-logs__tail_errors` — find `FEED-REJECT-01`; the
