@@ -667,7 +667,12 @@ jobs:
             echo "::error::a core dhat target ran ZERO tests — vacuous green (--features dhat missing, or the cfg gate excluded the test). Rule 11: no false-OK."
             exit 1
           fi
-          ran=$(grep -c 'Running tests/dhat_' /tmp/dhat-core.log || true)
+          # 'Running.*tests/dhat_' (not a literal space): the workflow-level
+          # CARGO_TERM_COLOR=always makes cargo emit an ANSI reset between
+          # "Running" and " tests/..." — a literal-space pattern counted 0 in
+          # CI while all 9 tests passed (first live run of this lane,
+          # 2026-07-09, job 86196056113).
+          ran=$(grep -c 'Running.*tests/dhat_' /tmp/dhat-core.log || true)
           if [ "$ran" -ne 9 ]; then
             echo "::error::core DHAT step executed $ran targets, expected 9 — a --test flag was dropped from this step (drift list vs run step mismatch)."
             exit 1
@@ -686,7 +691,7 @@ jobs:
             echo "::error::a storage dhat target ran ZERO tests — vacuous green. Rule 11: no false-OK."
             exit 1
           fi
-          ran=$(grep -c 'Running tests/dhat_' /tmp/dhat-storage.log || true)
+          ran=$(grep -c 'Running.*tests/dhat_' /tmp/dhat-storage.log || true)
           if [ "$ran" -ne 3 ]; then
             echo "::error::storage DHAT step executed $ran targets, expected 3 — a --test flag was dropped from this step."
             exit 1
@@ -705,7 +710,7 @@ jobs:
             echo "::error::a trading dhat target ran ZERO tests — vacuous green. Rule 11: no false-OK."
             exit 1
           fi
-          ran=$(grep -c 'Running tests/dhat_' /tmp/dhat-trading.log || true)
+          ran=$(grep -c 'Running.*tests/dhat_' /tmp/dhat-trading.log || true)
           if [ "$ran" -ne 3 ]; then
             echo "::error::trading DHAT step executed $ran targets, expected 3 — a --test flag was dropped from this step."
             exit 1
