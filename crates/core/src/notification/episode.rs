@@ -420,6 +420,15 @@ pub struct BootChecklist {
     /// The drain ticker re-drives a dirty checklist so a failed FINAL
     /// edit (no further milestone will ever arrive) is retried ≤10s.
     pub dirty: bool,
+    /// `true` when this checklist opened AFTER a completed boot bubble
+    /// already retired in this process — i.e. a mid-day feed/component
+    /// restart, NOT a system boot (hostile-review fix 2026-07-09). A mini
+    /// checklist renders a neutral "Feed update" header (never "tickvault
+    /// starting"), no "Boot finishing…" footer, and retires on an idle
+    /// window instead of requiring `Complete` (which never re-fires).
+    pub mini: bool,
+    /// Epoch ms of the most recent fold — drives the mini idle retirement.
+    pub last_fold_ms: u64,
 }
 
 impl BootChecklist {
@@ -428,6 +437,7 @@ impl BootChecklist {
     pub fn new(now_ms: u64, new_code: bool, build_sha_short: String) -> Self {
         Self {
             started_at_ms: now_ms,
+            last_fold_ms: now_ms,
             new_code,
             build_sha_short,
             ..Self::default()
@@ -478,6 +488,7 @@ impl BootChecklist {
             }
         }
         self.dirty = true;
+        self.last_fold_ms = self.last_fold_ms.max(now_ms);
     }
 
     /// `true` once `Complete` folded in.
@@ -652,6 +663,12 @@ pub struct EpisodeRegistry {
     /// (2026-07-09). LOCK ORDER: never held together with `inner` /
     /// `tombstones` — every method takes one lock at a time.
     boot: Mutex<Option<BootChecklist>>,
+    /// Latched `true` once a COMPLETED boot bubble retired in this
+    /// process. Any boot-keyed milestone arriving after that is a mid-day
+    /// feed/component restart — the fresh checklist it opens is a MINI
+    /// bubble (neutral header, idle retirement), never a false
+    /// "tickvault starting" claim (hostile-review fix 2026-07-09).
+    boot_completed_retired: std::sync::atomic::AtomicBool,
 }
 
 impl EpisodeRegistry {
@@ -685,11 +702,21 @@ impl EpisodeRegistry {
 
     // -- Boot bubble (2026-07-09) -------------------------------------------
 
+    /// Fresh checklist honoring the completed-boot latch: created AFTER a
+    /// completed boot bubble retired ⇒ a MINI (feed-update) checklist.
+    fn fresh_boot_checklist(&self, now_ms: u64) -> BootChecklist {
+        let mut cl = BootChecklist::new(now_ms, false, String::new());
+        cl.mini = self
+            .boot_completed_retired
+            .load(std::sync::atomic::Ordering::Relaxed);
+        cl
+    }
+
     /// Sets the deploy-flavor fields (creates the checklist when absent so
     /// the flavor is never lost to milestone-vs-init ordering).
     pub fn set_boot_flavor(&self, new_code: bool, build_sha_short: &str, now_ms: u64) {
         let mut boot = self.lock_boot();
-        let cl = boot.get_or_insert_with(|| BootChecklist::new(now_ms, false, String::new()));
+        let cl = boot.get_or_insert_with(|| self.fresh_boot_checklist(now_ms));
         cl.new_code = new_code;
         cl.build_sha_short = build_sha_short.to_string();
     }
@@ -698,7 +725,7 @@ impl EpisodeRegistry {
     /// first page (`None` until called → lazy render of data-only lines).
     pub fn set_boot_expectations(&self, dhan: bool, groww: bool, now_ms: u64) {
         let mut boot = self.lock_boot();
-        let cl = boot.get_or_insert_with(|| BootChecklist::new(now_ms, false, String::new()));
+        let cl = boot.get_or_insert_with(|| self.fresh_boot_checklist(now_ms));
         cl.expectations = Some((dhan, groww));
     }
 
@@ -714,7 +741,7 @@ impl EpisodeRegistry {
     ) -> (EpisodeDecision, BootChecklist) {
         let checklist = {
             let mut boot = self.lock_boot();
-            let cl = boot.get_or_insert_with(|| BootChecklist::new(now_ms, false, String::new()));
+            let cl = boot.get_or_insert_with(|| self.fresh_boot_checklist(now_ms));
             cl.fold(milestone, now_ms);
             cl.clone()
         };
@@ -761,24 +788,40 @@ impl EpisodeRegistry {
         Some((checklist, message_id))
     }
 
-    /// Silently retires a COMPLETED, fully-delivered boot bubble
-    /// [`BOOT_BUBBLE_RETIRE_SECS`] after `Complete` (no edit, no
-    /// tombstone). Returns `true` when retirement happened. An incomplete
-    /// boot never retires in-process — the bubble honestly keeps showing
-    /// ⏳ while the untouched CRITICAL/HIGH failure pages own loudness.
+    /// Silently retires a fully-delivered boot bubble (no edit, no
+    /// tombstone). Returns `true` when retirement happened.
+    ///
+    /// - The one-per-boot MAIN bubble retires [`BOOT_BUBBLE_RETIRE_SECS`]
+    ///   after `Complete`; an incomplete boot never retires in-process —
+    ///   the bubble honestly keeps showing ⏳ while the untouched
+    ///   CRITICAL/HIGH failure pages own loudness. Retiring it latches
+    ///   `boot_completed_retired`, so later boot-keyed events open MINI
+    ///   (feed-update) bubbles.
+    /// - A MINI bubble never sees `Complete` (`StartupComplete` fires
+    ///   once per process), so it retires after the SAME window of
+    ///   delivered idleness since its last fold (hostile-review fix
+    ///   2026-07-09 — no permanently-stuck mid-day bubble).
     #[must_use]
     pub fn retire_boot(&self, now_ms: u64) -> bool {
-        let retire = {
+        let window_ms = BOOT_BUBBLE_RETIRE_SECS.saturating_mul(MS_PER_SEC);
+        let (retire, completed) = {
             let boot = self.lock_boot();
-            boot.as_ref().is_some_and(|cl| {
-                !cl.dirty
-                    && cl.complete_at_ms.is_some_and(|t| {
-                        now_ms.saturating_sub(t)
-                            >= BOOT_BUBBLE_RETIRE_SECS.saturating_mul(MS_PER_SEC)
-                    })
-            })
+            match boot.as_ref() {
+                Some(cl) if !cl.dirty => {
+                    let complete_elapsed = cl
+                        .complete_at_ms
+                        .is_some_and(|t| now_ms.saturating_sub(t) >= window_ms);
+                    let mini_idle = cl.mini && now_ms.saturating_sub(cl.last_fold_ms) >= window_ms;
+                    (complete_elapsed || mini_idle, cl.is_complete())
+                }
+                _ => (false, false),
+            }
         };
         if retire {
+            if completed {
+                self.boot_completed_retired
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+            }
             *self.lock_boot() = None;
             let _ = self.lock_inner().remove(&BOOT_EPISODE_KEY);
             let _ = self.lock_tombstones().remove(&BOOT_EPISODE_KEY);
@@ -1213,6 +1256,17 @@ pub fn render_boot_checklist(cl: &BootChecklist, _ctx: &EpisodeRenderCtx) -> Str
                 when = format_ist_12h(done_ms),
             )
         }
+        None if cl.mini => {
+            // Mid-day feed/component restart AFTER a completed boot
+            // retired (hostile-review fix 2026-07-09): the system is NOT
+            // starting — claiming "tickvault starting" here would be a
+            // false signal. Neutral header, timestamped to the latest
+            // update; retires on the idle window (see `retire_boot`).
+            format!(
+                "<b>\u{1f504} Feed update {when}</b>",
+                when = format_ist_12h(cl.last_fold_ms),
+            )
+        }
         None => {
             let deploy = if new_code {
                 " — NEW CODE deployed"
@@ -1226,13 +1280,15 @@ pub fn render_boot_checklist(cl: &BootChecklist, _ctx: &EpisodeRenderCtx) -> Str
     let (expect_dhan, expect_groww) = cl.expectations.unwrap_or((false, false));
     let mut lines: Vec<String> = Vec::new();
     let started = format_ist_12h(cl.started_at_ms);
-    match cl.services {
-        Some((healthy, total)) => {
-            lines.push(format!(
-                "\u{2705} Started {started} — services {healthy} of {total}"
-            ));
+    if !cl.mini {
+        match cl.services {
+            Some((healthy, total)) => {
+                lines.push(format!(
+                    "\u{2705} Started {started} — services {healthy} of {total}"
+                ));
+            }
+            None => lines.push(format!("\u{2705} Started {started}")),
         }
-        None => lines.push(format!("\u{2705} Started {started}")),
     }
     if cl.dhan_auth {
         lines.push("\u{2705} Dhan login".to_string());
@@ -1306,6 +1362,12 @@ pub fn render_boot_checklist(cl: &BootChecklist, _ctx: &EpisodeRenderCtx) -> Str
                 "{mode_part}Boot took {took}. You're good to go.",
                 took = format_duration_human(took_secs),
             ));
+        }
+        None if cl.mini => {
+            // No "Boot finishing…" promise on a mini bubble — nothing is
+            // finishing (`StartupComplete` never re-fires mid-process),
+            // so the footer would be a broken promise. The component
+            // lines above ARE the whole message.
         }
         None => {
             lines.push("\u{23f3} Boot finishing\u{2026}".to_string());
@@ -2635,12 +2697,113 @@ mod tests {
         );
         assert_eq!(decision.action, EpisodeAction::SendFirstPage);
         assert!(!cl.is_complete(), "fresh checklist, not the retired one");
+        assert!(cl.mini, "post-retire checklist is a MINI (feed update)");
         // A dirty (undelivered) completed checklist must NOT retire.
         let reg2 = EpisodeRegistry::new();
         let _ = reg2.apply_boot_milestone(BootMilestone::Complete { mode: "LIVE" }, NOW, &cfg);
         assert!(
             !reg2.retire_boot(NOW + (BOOT_BUBBLE_RETIRE_SECS + 60) * 1000),
             "dirty checklist stays for the ticker re-drive"
+        );
+    }
+
+    #[test]
+    fn test_post_retire_boot_event_opens_fresh_mini_bubble() {
+        // Hostile-review fix 2026-07-09: a mid-day feed reconnect / lane
+        // cold-start re-firing boot-keyed events AFTER the morning bubble
+        // retired must render an honest "Feed update" mini bubble — never
+        // a false "tickvault starting" that can neither complete nor
+        // retire.
+        let reg = EpisodeRegistry::new();
+        let cfg = episode_config_for(EpisodeFamily::Boot);
+        let _ = reg.apply_boot_milestone(BootMilestone::Complete { mode: "sandbox" }, NOW, &cfg);
+        reg.mark_boot_delivered();
+        assert!(reg.retire_boot(NOW + BOOT_BUBBLE_RETIRE_SECS * 1000));
+        // A Groww reconnect edge 3 hours later.
+        let mid_day = NOW + 3 * 3600 * 1000;
+        let (_, cl) = reg.apply_boot_milestone(
+            BootMilestone::GrowwConnected { market_open: true },
+            mid_day,
+            &cfg,
+        );
+        assert!(cl.mini);
+        let r = render_boot_checklist(&cl, &EpisodeRenderCtx { now_ms: mid_day });
+        assert!(r.contains("\u{1f504} Feed update"), "neutral header: {r:?}");
+        assert!(r.contains("Groww feed"), "component line renders: {r:?}");
+        assert!(!r.contains("tickvault starting"), "no false boot claim");
+        assert!(!r.contains("Boot finishing"), "no broken promise footer");
+        assert!(!r.contains("updates itself"), "no broken promise footer");
+        assert!(!r.contains("Started"), "no phantom system start line");
+        // A second component event inside the window folds into the SAME
+        // mini bubble (anti-spam for a restart burst).
+        reg.record_sent(BOOT_EPISODE_KEY, Some(88), mid_day);
+        reg.mark_boot_delivered();
+        let (d2, cl2) = reg.apply_boot_milestone(BootMilestone::DhanAuth, mid_day + 60_000, &cfg);
+        assert_eq!(
+            d2.action,
+            EpisodeAction::Edit {
+                message_id: 88,
+                close: false
+            }
+        );
+        assert!(cl2.mini && cl2.groww_connected.is_some() && cl2.dhan_auth);
+        reg.mark_boot_delivered();
+        // The mini bubble retires on the idle window despite never seeing
+        // `Complete` — no permanently-stuck bubble.
+        assert!(!reg.retire_boot(mid_day + 60_000 + BOOT_BUBBLE_RETIRE_SECS * 1000 - 1));
+        assert!(reg.retire_boot(mid_day + 60_000 + BOOT_BUBBLE_RETIRE_SECS * 1000));
+        assert!(reg.boot_checklist().is_none());
+        assert_eq!(reg.live_count(), 0);
+    }
+
+    #[test]
+    fn test_is_complete_only_after_complete_fold() {
+        let mut cl = BootChecklist::new(NOW, false, "a1b2c3d".to_string());
+        assert!(!cl.is_complete());
+        cl.fold(BootMilestone::DhanAuth, NOW + 100);
+        assert!(!cl.is_complete(), "component milestones never complete");
+        cl.fold(BootMilestone::Complete { mode: "sandbox" }, NOW + 200);
+        assert!(cl.is_complete());
+    }
+
+    #[test]
+    fn test_set_boot_flavor_creates_and_updates_checklist() {
+        let reg = EpisodeRegistry::new();
+        // Creates the checklist when absent (flavor never lost to
+        // milestone-vs-init ordering)…
+        reg.set_boot_flavor(true, "a1b2c3d", NOW);
+        let cl = reg.boot_checklist().expect("flavor creates the checklist");
+        assert!(cl.new_code);
+        assert_eq!(cl.build_sha_short, "a1b2c3d");
+        assert!(!cl.mini, "boot-time flavor init is the MAIN bubble");
+        // …and updates an existing one in place.
+        reg.set_boot_flavor(false, "unknown", NOW + 100);
+        let cl2 = reg.boot_checklist().expect("checklist still live");
+        assert!(!cl2.new_code);
+        assert_eq!(cl2.build_sha_short, "unknown");
+    }
+
+    #[test]
+    fn test_mark_boot_delivered_and_boot_redrive_candidate_dirty_flow() {
+        let reg = EpisodeRegistry::new();
+        let cfg = episode_config_for(EpisodeFamily::Boot);
+        assert!(
+            reg.boot_redrive_candidate().is_none(),
+            "no checklist = no candidate"
+        );
+        let _ = reg.apply_boot_milestone(BootMilestone::DhanAuth, NOW, &cfg);
+        let (cl, id) = reg
+            .boot_redrive_candidate()
+            .expect("undelivered fold is a candidate");
+        assert!(cl.dirty);
+        assert_eq!(id, None, "first page never landed → fresh send");
+        reg.record_sent(BOOT_EPISODE_KEY, Some(7), NOW);
+        let (_, id2) = reg.boot_redrive_candidate().expect("still dirty");
+        assert_eq!(id2, Some(7), "message id rides the candidate");
+        reg.mark_boot_delivered();
+        assert!(
+            reg.boot_redrive_candidate().is_none(),
+            "mark_boot_delivered clears the dirty flag"
         );
     }
 

@@ -1551,7 +1551,17 @@ async fn init_boot_sha_flavor(episodes: &EpisodeRegistry) {
         return;
     }
     if let Err(err) = tokio::fs::write(path, current).await {
-        tracing::debug!(error = %err, "boot sha store write failed — next boot renders plain");
+        // Hostile-review fix 2026-07-09: a failed write would leave the
+        // PREVIOUS boot's sha on disk, so the NEXT restart of this same
+        // binary would falsely claim "NEW CODE deployed" again. Best-effort
+        // delete the stale sha so the next boot reads nothing → plain
+        // header (fail-open, never a false deploy claim).
+        let removed = tokio::fs::remove_file(path).await.is_ok();
+        tracing::debug!(
+            error = %err,
+            stale_sha_removed = removed,
+            "boot sha store write failed — stale sha cleared so the next boot renders plain (never a false NEW CODE claim)"
+        );
     }
 }
 
@@ -1724,12 +1734,41 @@ async fn run_boot_tick(
                     )
                     .increment(1);
                 }
-                EditOutcome::Fallback | EditOutcome::Transient => {
-                    // Bubble gone / edit ladder exhausted — fresh
-                    // full-checklist bubble (duplicate-over-drop).
+                EditOutcome::Transient
+                    if episodes.record_edit_failure(BOOT_EPISODE_KEY)
+                        < EPISODE_EDIT_FAILURES_FALLBACK_THRESHOLD =>
+                {
+                    // Transient edit failure below the ladder threshold
+                    // (hostile-review fix 2026-07-09): DEFER — a single
+                    // 429 must not spawn a duplicate bubble the milestone
+                    // path would have retried. The checklist stays dirty;
+                    // the next ~10s tick re-drives. NEVER silent.
                     metrics::counter!(
                         "tv_telegram_edit_fallback_total",
-                        "reason" => "not_found",
+                        "reason" => "transient_deferred",
+                    )
+                    .increment(1);
+                    error!(
+                        target: "notification",
+                        code = tickvault_common::error_code::ErrorCode::Telegram03EpisodeDegraded.code_str(),
+                        reason = "edit_transient_deferred",
+                        "TELEGRAM-03: boot bubble re-drive edit failed transiently — the next tick retries or falls back to a fresh bubble"
+                    );
+                }
+                outcome @ (EditOutcome::Fallback | EditOutcome::Transient) => {
+                    // Bubble gone (not_found) / transient ladder exhausted
+                    // — fresh full-checklist bubble (duplicate-over-drop),
+                    // with the honest per-cause metric reason so the
+                    // TELEGRAM-03 triage split (bubble-gone vs API-flaky)
+                    // stays trustworthy.
+                    let reason = if matches!(outcome, EditOutcome::Fallback) {
+                        "not_found"
+                    } else {
+                        "transient_exhausted"
+                    };
+                    metrics::counter!(
+                        "tv_telegram_edit_fallback_total",
+                        "reason" => reason,
                     )
                     .increment(1);
                     let (ok, msg_id) = send_telegram_chunk_with_retry_returning_id(
@@ -4427,7 +4466,14 @@ mod tests {
         let sends = log.lock().unwrap().iter().filter(|p| *p == "send").count();
         let edits = log.lock().unwrap().iter().filter(|p| *p == "edit").count();
         assert_eq!(sends, 1, "exactly ONE boot bubble first page");
-        assert_eq!(edits, 4, "every later milestone edits the SAME bubble");
+        // 4 edits when every fold changes the render; 3 is legal when
+        // OrderUpdateConnected folds AFTER OrderUpdateAuthenticated (its
+        // superset) — the byte-identical render hash-skips. The invariant
+        // is single-bubble, not a scheduling-order-dependent edit count.
+        assert!(
+            (3..=4).contains(&edits),
+            "every later milestone edits the SAME bubble (got {edits})"
+        );
         assert_eq!(service.episodes.live_count(), 1, "one live boot episode");
         let snap = service.episodes.snapshot();
         assert_eq!(snap[0].message_id, Some(777));

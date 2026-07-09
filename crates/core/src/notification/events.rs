@@ -3148,6 +3148,12 @@ mod tests {
                 main_feed_total: 1,
                 order_update_active: true,
             },
+            NotificationEvent::MarketOpenReadinessConfirmation {
+                main_feed_active: 1,
+                main_feed_total: 1,
+                order_update_active: true,
+                token_remaining_secs: 20_000,
+            },
         ] {
             assert!(
                 event.episode_key().is_none(),

@@ -952,8 +952,10 @@ jobs:
           exit 0
 
       - name: Record deployed binary git SHA to SSM (B9 deploy provenance)
-        # Runs ONLY after the swap is verified healthy (same gate as the
-        # success Telegram — an intentional off-hours skip writes nothing).
+        # Runs ONLY after the swap is verified healthy (the standalone
+        # success Telegram was retired 2026-07-09 — the app's boot bubble
+        # "NEW CODE deployed" header is the deploy-landed signal now; an
+        # intentional off-hours skip writes nothing).
         # Consumers: the operator-portal footer (binary <sha7>) and the
         # deploy-watchdog binary-vs-main mismatch metric + 24h stale alarm.
         # NON-FATAL by design: a provenance-recording failure must never

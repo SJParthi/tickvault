@@ -8,13 +8,13 @@
 
 - [x] PR-1a — `EpisodeFamily::Boot` + `BootMilestone` + `BootChecklist` + boot renders in the pure episode core
   - Files: crates/core/src/notification/episode.rs
-  - Tests: test_boot_checklist_fold_idempotent_and_order_free, test_render_boot_checklist_first_mid_final_under_ceiling, test_render_boot_checklist_lazy_mode_without_expectations, test_render_boot_checklist_honest_no_real_ticks_line, test_render_boot_checklist_keeps_tickvault_started_phrase, test_render_boot_checklist_deferred_off_hours_line, test_snapshot_excludes_boot_family, test_tick_never_closes_or_expires_boot_family, test_retire_boot_only_after_complete_plus_window, test_episode_config_for_boot_zero_throttle_ws_default
+  - Tests: test_boot_checklist_fold_idempotent_and_order_free, test_render_boot_checklist_first_mid_final_under_ceiling, test_render_boot_checklist_lazy_mode_without_expectations, test_render_boot_checklist_honest_no_real_ticks_line, test_render_boot_checklist_keeps_tickvault_started_phrase, test_render_boot_checklist_deferred_off_hours_line, test_snapshot_excludes_boot_family, test_tick_never_closes_or_expires_boot_family, test_retire_boot_only_after_complete_plus_window, test_episode_config_for_boot_zero_throttle_ws_default, test_post_retire_boot_event_opens_fresh_mini_bubble, test_is_complete_only_after_complete_fold, test_set_boot_flavor_creates_and_updates_checklist, test_mark_boot_delivered_and_boot_redrive_candidate_dirty_flow
 - [x] PR-1b — `episode_key()` boot arm (Groww-gated feed events), `boot_milestone()`, `OrderUpdateAuthenticated` Medium→Low
   - Files: crates/core/src/notification/events.rs
   - Tests: test_boot_milestone_mapping_all_variants, test_episode_key_boot_variants_map_to_boot_family, test_episode_key_non_groww_feed_is_none, test_boot_episode_key_only_success_milestones, test_order_update_authenticated_severity_is_low, test_episode_key_none_for_non_episode_variants (updated)
 - [x] PR-1c — boot dispatcher (serialized fold→render→send/edit), ticker re-drive + retire, sha flavor, expectations, `boot_bubble` gate
   - Files: crates/core/src/notification/service.rs
-  - Tests: test_dispatch_boot_serializes_concurrent_milestones_single_bubble, test_boot_first_milestone_sends_then_second_edits_same_id, test_boot_complete_final_render_contains_tickvault_started, test_boot_bubble_mode_off_is_legacy_byte_identical, test_boot_redrive_ticker_retries_failed_first_page, test_post_retire_boot_event_opens_fresh_mini_bubble, test_is_new_code_deploy_fail_open_and_unknown_sha
+  - Tests: test_dispatch_boot_serializes_concurrent_milestones_single_bubble, test_boot_first_milestone_sends_then_second_edits_same_id (asserts the completed render carries "tickvault started"), test_boot_bubble_mode_off_is_legacy_byte_identical, test_boot_redrive_ticker_retries_failed_first_page, test_is_new_code_deploy_fail_open_and_unknown_sha, test_init_boot_sha_flavor_never_panics_and_stamps_flavor
 - [x] PR-1d — `[notification] boot_bubble = true` config key
   - Files: crates/common/src/config.rs, config/base.toml
   - Tests: test_notification_config_defaults (extended), test_notification_legacy_toml_parses (extended)
@@ -29,10 +29,13 @@
   - Tests: guard_c/guard_d updated counts + new boot pins
 - [x] PR-2a — change-only budget running pings (state in SSM; breach stop never state-gated)
   - Files: deploy/aws/lambda/hard-stop-guard/handler.py, deploy/aws/lambda/hard-stop-guard/test_handler.py
-  - Tests: test_same_bucket_silent, test_bucket_increase_pings, test_bucket_decrease_pings, test_month_rollover_pings_once, test_cost_unknown_edge_latched, test_cost_recovered_pings, test_state_missing_pings_and_seeds, test_ssm_read_failure_fails_open_to_ping, test_ssm_write_failure_still_returns_ok, test_breach_stop_ignores_ping_state, test_approaching_wording_at_bucket_8_and_9
+  - Tests: test_same_bucket_silent, test_bucket_increase_pings, test_bucket_decrease_pings, test_bucket_decrease_one_step_silent_hysteresis, test_month_rollover_pings_once, test_cost_unknown_edge_latched, test_cost_recovered_pings, test_state_missing_pings_and_seeds, test_ssm_read_failure_fails_open_to_ping, test_ssm_write_failure_still_returns_ok, test_breach_stop_ignores_ping_state, test_approaching_wording_at_bucket_8_and_9
 - [x] PR-2b — hard-stop-guard IAM + env for the ping-state SSM param
   - Files: deploy/aws/terraform/budget-guards.tf
   - Tests: n/a (terraform; least-privilege single-ARN statement)
+- [x] PR-3 — 2026-07-09 hostile-review fixes: honest post-retire MINI "Feed update" bubble (neutral header, no "Boot finishing" promise, idle retirement — never a false "tickvault starting" from a mid-day feed/lane restart); name-visible tests for the 4 new registry pub fns (pub-fn ratchet back to baseline); run_boot_tick transient edit failures defer through the same 2-failure ladder as the milestone path (honest transient_deferred/transient_exhausted/not_found metric reasons); sha-store write failure clears the stale sha (never a repeated false "NEW CODE" claim); MarketOpenReadinessConfirmation added to the #1443 instant-lane pin; budget bucket-decrease hysteresis (1-bucket CE jitter silent, ≥2-bucket credit pings); comment truth-ups (boot_bubble requires episode_mode; deploy-provenance gate comment)
+  - Files: crates/core/src/notification/episode.rs, crates/core/src/notification/service.rs, crates/core/src/notification/events.rs, config/base.toml, .github/workflows/deploy-aws.yml, deploy/aws/lambda/hard-stop-guard/handler.py, deploy/aws/lambda/hard-stop-guard/test_handler.py
+  - Tests: test_post_retire_boot_event_opens_fresh_mini_bubble, test_is_complete_only_after_complete_fold, test_set_boot_flavor_creates_and_updates_checklist, test_mark_boot_delivered_and_boot_redrive_candidate_dirty_flow, test_bucket_decrease_one_step_silent_hysteresis
 
 ## Design
 

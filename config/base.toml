@@ -270,7 +270,9 @@ episode_mode = true
 digest_window_secs = 900
 # Boot bubble (2026-07-09): ONE consolidated live-edited boot checklist
 # bubble per boot. Set false to revert to the legacy per-event boot spray
-# (independent of episode_mode — WS episodes are untouched either way).
+# (WS episodes are untouched either way). Note: the bubble also requires
+# episode_mode = true — turning episode_mode off reverts BOTH the WS
+# episode bubbles AND the boot bubble to legacy dispatch.
 boot_bubble = true
 
 [observability]
