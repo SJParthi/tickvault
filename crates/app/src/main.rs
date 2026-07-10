@@ -2989,6 +2989,13 @@ async fn main() -> Result<()> {
     // truthful runtime feed flags. See `spawn_daily_tick_conservation_task`.
     spawn_daily_tick_conservation_task(&config, &trading_calendar, &feed_runtime);
 
+    // Dual-feed scoreboard (operator 2026-07-10) — PROCESS-GLOBAL like the
+    // conservation audit above: the boot-time process-death reconciler + the
+    // 15:45 IST daily Dhan-vs-Groww aggregation + Telegram scorecard. Gated
+    // on `[scoreboard] enabled` (the B12 rollback switch). See
+    // `spawn_feed_scoreboard_tasks`.
+    spawn_feed_scoreboard_tasks(&config, &trading_calendar, &notifier);
+
     // -----------------------------------------------------------------------
     // DayOhlcTracker boot wiring (post 2026-05-26 simplification; MOVED to
     // process-global scope 2026-07-01 to stop the per-lane cold-start leak).
@@ -14552,4 +14559,206 @@ fn spawn_daily_tick_conservation_task(
         }
     });
     info!("tick_conservation: daily per-feed WAL/NDJSON-vs-DB audit task spawned (process-global)");
+}
+
+/// Dual-feed scoreboard (operator directive 2026-07-10) — PROCESS-GLOBAL,
+/// spawned exactly once from `main()`'s prefix, gated on `[scoreboard]
+/// enabled` (the B12 rollback switch: `false` ⇒ nothing here spawns).
+///
+/// Two tasks:
+/// 1. Boot-time process-death reconciler — after a settle delay it
+///    synthesizes `process_death` episodes (blame `ours`, deterministic ts
+///    ⇒ DEDUP-idempotent) for connections that were "up" when the previous
+///    process died. See `feed_scoreboard_boot::reconcile_process_death_episodes`.
+/// 2. The daily aggregation at `[scoreboard] trigger_secs_of_day_ist`
+///    (default 15:45:00 IST) with the inner/outer supervisor idiom (the
+///    cross_verify_1m pattern): the inner task returns the summary; the
+///    outer watcher sends the `DualFeedDailyScorecard` Telegram on success
+///    and `DualFeedScorecardAborted` on Err/panic — the daily signal can
+///    never be silently dropped. Graceful-shutdown cancellation stays
+///    silent (normal teardown, not an abort).
+// TEST-EXEMPT: tokio::spawn wrapper over the unit-tested pure parts (decide_scoreboard_start / synthesize_process_death_episodes / SQL builders / parsers); spawn site pinned by test_feed_scoreboard_task_is_wired_into_main.
+fn spawn_feed_scoreboard_tasks(
+    config: &ApplicationConfig,
+    trading_calendar: &std::sync::Arc<TradingCalendar>,
+    notifier: &std::sync::Arc<NotificationService>,
+) {
+    if !config.scoreboard.enabled {
+        info!("feed_scoreboard: disabled by [scoreboard] config — nothing spawned");
+        return;
+    }
+    use tickvault_app::feed_scoreboard_boot::{
+        PROCESS_DEATH_RECONCILE_DELAY_SECS, ScoreboardStart, decide_scoreboard_start,
+        is_in_market_hours_secs, reconcile_process_death_episodes, run_feed_scoreboard,
+    };
+    use tickvault_common::constants::IST_UTC_OFFSET_SECONDS;
+
+    // ── Task 1: boot-time process-death reconciler ──
+    {
+        let pd_qcfg = config.questdb.clone();
+        tokio::spawn(async move {
+            use chrono::{FixedOffset, TimeZone, Timelike, Utc};
+            let Some(ist_offset) = FixedOffset::east_opt(IST_UTC_OFFSET_SECONDS) else {
+                return;
+            };
+            // Capture the boot instant BEFORE the settle sleep — the death
+            // gap is anchored to THIS boot.
+            let boot_ist = ist_offset.from_utc_datetime(&Utc::now().naive_utc());
+            let boot_secs_of_day = boot_ist.time().num_seconds_from_midnight();
+            let boot_ist_secs = Utc::now()
+                .timestamp()
+                .saturating_add(i64::from(IST_UTC_OFFSET_SECONDS));
+            let boot_ts_ist_nanos = boot_ist_secs.saturating_mul(1_000_000_000);
+            let boot_in_session = is_in_market_hours_secs(boot_secs_of_day);
+            // Let this boot's own `connected` audit rows land first (async
+            // audit writer + ILP flush).
+            tokio::time::sleep(std::time::Duration::from_secs(
+                PROCESS_DEATH_RECONCILE_DELAY_SECS,
+            ))
+            .await;
+            // APPROVED: epoch day number fits u64 trivially.
+            let target_ist_day = boot_ist_secs.max(0) as u64 / 86_400;
+            let trading_date_ist_nanos = i64::try_from(target_ist_day)
+                .unwrap_or(0)
+                .saturating_mul(86_400)
+                .saturating_mul(1_000_000_000);
+            reconcile_process_death_episodes(
+                &pd_qcfg,
+                target_ist_day,
+                trading_date_ist_nanos,
+                boot_ts_ist_nanos,
+                boot_in_session,
+            )
+            .await;
+        });
+    }
+
+    // ── Task 2: the daily aggregation + Telegram scorecard ──
+    let sb_qcfg = config.questdb.clone();
+    let sb_metrics_port = config.observability.metrics_port;
+    let sb_trigger = config.scoreboard.trigger_secs_of_day_ist;
+    let sb_calendar = std::sync::Arc::clone(trading_calendar);
+    let sb_telegram_enabled = config.scoreboard.telegram_enabled;
+    let sb_notifier = std::sync::Arc::clone(notifier);
+    let inner = tokio::spawn(async move {
+        use chrono::{FixedOffset, TimeZone, Timelike, Utc};
+        let Some(ist_offset) = FixedOffset::east_opt(IST_UTC_OFFSET_SECONDS) else {
+            return Err("IST offset construction failed".to_string());
+        };
+        let boot_ist = ist_offset.from_utc_datetime(&Utc::now().naive_utc());
+        let today_ist = boot_ist.date_naive();
+        let boot_secs_of_day = boot_ist.time().num_seconds_from_midnight();
+        let force_now = std::env::var("TICKVAULT_SCOREBOARD_NOW")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        let is_trading_day = sb_calendar.is_trading_day(today_ist);
+        match decide_scoreboard_start(boot_secs_of_day, is_trading_day, force_now, sb_trigger) {
+            ScoreboardStart::SkipNonTradingDay => {
+                info!("feed_scoreboard: skipping (non-trading day)");
+                return Ok(None);
+            }
+            ScoreboardStart::RunCatchUp => {
+                info!(
+                    now = %boot_ist.time(),
+                    "feed_scoreboard: late boot (past the trigger) — running the \
+                     day's scoreboard now as a catch-up (DEDUP-idempotent)"
+                );
+            }
+            ScoreboardStart::RunNow => {
+                info!(
+                    "feed_scoreboard: TICKVAULT_SCOREBOARD_NOW set — running \
+                     on-demand NOW (operator dry-run / backfill)"
+                );
+            }
+            ScoreboardStart::SleepThenRun(secs_until) => {
+                info!(
+                    secs_until,
+                    "feed_scoreboard: sleeping until the daily trigger"
+                );
+                tokio::time::sleep(std::time::Duration::from_secs(secs_until)).await;
+            }
+        }
+        // Recompute "today" AFTER the sleep (the trigger fires same-day, but
+        // a forced run near midnight must stamp the actual run day).
+        let run_ist = ist_offset.from_utc_datetime(&Utc::now().naive_utc());
+        let run_ist_secs = Utc::now()
+            .timestamp()
+            .saturating_add(i64::from(IST_UTC_OFFSET_SECONDS));
+        // APPROVED: epoch day number fits u64 trivially.
+        let target_ist_day = run_ist_secs.max(0) as u64 / 86_400;
+        let summary = run_feed_scoreboard(
+            &sb_qcfg,
+            sb_metrics_port,
+            target_ist_day,
+            run_ist.date_naive().format("%Y-%m-%d").to_string(),
+        )
+        .await?;
+        info!("PROOF: feed_scoreboard daily aggregation fired");
+        Ok(Some(summary))
+    });
+    tokio::spawn(async move {
+        let to_line = |name: &str,
+                       n: &tickvault_app::feed_scoreboard_boot::FeedDayNumbers|
+         -> tickvault_core::notification::events::FeedScoreLine {
+            tickvault_core::notification::events::FeedScoreLine {
+                name: name.to_string(),
+                ticks: n.ticks,
+                exclusive_minutes: n.unique_win_minutes,
+                lag_p50_ms: -1,
+                lag_p99_ms: -1,
+                drops_market: n.disconnects_market,
+                blame_broker: n.blame_broker,
+                blame_ours: n.blame_ours,
+                blame_unclear: n.blame_indeterminate,
+                stalls: n.stalls,
+                restarts: n.restarts,
+                streaming_minutes: n.streaming_minutes,
+            }
+        };
+        match inner.await {
+            Ok(Ok(Some(summary))) => {
+                if sb_telegram_enabled {
+                    sb_notifier.notify(NotificationEvent::DualFeedDailyScorecard {
+                        trading_date_ist: summary.trading_date_ist.clone(),
+                        dhan: to_line("Dhan", &summary.dhan),
+                        groww: to_line("Groww", &summary.groww),
+                        session_minutes: summary.session_minutes,
+                        partial_coverage: summary.partial_coverage,
+                        degraded: summary.degraded,
+                    });
+                } else {
+                    info!("feed_scoreboard: Telegram disabled — daily rows written only");
+                }
+            }
+            Ok(Ok(None)) => {} // non-trading day skip — nothing to send.
+            Ok(Err(reason)) => {
+                error!(
+                    code = tickvault_common::error_code::ErrorCode::Scoreboard01AggregationDegraded
+                        .code_str(),
+                    stage = "daily_run",
+                    %reason,
+                    "SCOREBOARD-01: the daily scoreboard run failed"
+                );
+                sb_notifier.notify(NotificationEvent::DualFeedScorecardAborted { detail: reason });
+            }
+            Err(join_err) if join_err.is_panic() => {
+                error!(
+                    code = tickvault_common::error_code::ErrorCode::Scoreboard01AggregationDegraded
+                        .code_str(),
+                    stage = "daily_panic",
+                    %join_err,
+                    "SCOREBOARD-01: the daily scoreboard task crashed"
+                );
+                sb_notifier.notify(NotificationEvent::DualFeedScorecardAborted {
+                    detail: format!("the scorecard task crashed: {join_err}"),
+                });
+            }
+            Err(_) => {
+                // Cancellation during graceful shutdown (16:30 IST auto-stop,
+                // `make stop`) — normal teardown, NOT an abort. No page.
+                info!("feed_scoreboard: task cancelled during shutdown");
+            }
+        }
+    });
+    info!("feed_scoreboard: process-death reconciler + daily scorecard tasks spawned");
 }
