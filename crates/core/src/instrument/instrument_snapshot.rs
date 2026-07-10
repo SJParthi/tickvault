@@ -777,7 +777,9 @@ mod tests {
             target(InstrumentRole::FnoUnderlying, "2885", "RELIANCE"),
             target(InstrumentRole::FnoUnderlying, "1333", "HDFCBANK"),
             target(InstrumentRole::FnoUnderlying, "11536", "TCS"),
-            // §36: the 4 nearest-expiry index futures ride the same snapshot.
+            // §36/§36.7: the index futures ride the same snapshot (this
+            // fixture keeps one month per underlying; multi-month coverage
+            // lives in the dedicated §36.7 tests).
             target_future("35001", "NIFTY", "NSE_FNO", "2026-07-30"),
             target_future("35002", "BANKNIFTY", "NSE_FNO", "2026-07-30"),
             target_future("35003", "MIDCPNIFTY", "NSE_FNO", "2026-07-28"),

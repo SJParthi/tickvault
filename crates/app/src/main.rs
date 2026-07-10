@@ -7167,8 +7167,9 @@ async fn start_dhan_lane(
                 });
                 // Capture the expected universe size BEFORE the Arc moves into
                 // the fetch, so the post-fetch coverage verification can compare.
-                // §36 (hostile-review round 1, 2026-07-08): the ≤4 IndexFuture
-                // targets are unconditionally SKIPPED by the prev-day loop
+                // §36 (hostile-review round 1, 2026-07-08; §36.7 all-months
+                // 2026-07-10): the IndexFuture targets (~12 under §36.7)
+                // are unconditionally SKIPPED by the prev-day loop
                 // (`instrument_type_for_role` → None — Dhan-historical FUTIDX
                 // UNVERIFIED-LIVE), so they must NOT sit in the coverage
                 // DENOMINATOR — pre-fix a perfect day could never read 100%

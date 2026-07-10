@@ -29,9 +29,10 @@ use tracing::{info, warn};
 /// Groww master instrument CSV (public static asset, no auth) — re-exported from
 /// `tickvault_common::constants` so the URL lives in the single constants source.
 ///
-/// §36 (2026-07-08): the watch set additionally carries the 4 nearest-expiry
-/// index futures (NIFTY/BANKNIFTY/MIDCPNIFTY on NSE, SENSEX on BSE; segment
-/// FNO, kind=ltp) — selected via the SAME shared never-roll expiry function
+/// §36 (2026-07-08) / §36.7 (2026-07-10): the watch set additionally carries
+/// ALL monthly-expiry index futures of the 4 underlyings
+/// (NIFTY/BANKNIFTY/MIDCPNIFTY on NSE, SENSEX on BSE; segment FNO, kind=ltp)
+/// — selected via the SAME shared never-roll expiry function
 /// the Dhan orchestrator uses (`crate::instrument::index_futures`).
 pub use tickvault_common::constants::GROWW_INSTRUMENT_CSV_URL;
 
@@ -1316,7 +1317,7 @@ pub async fn build_and_write_groww_watch(
     );
     info!("groww watch: downloading NIFTY-Total-Market constituent list");
     let ntm_csv = fetch_text_hardened(&client, &ntm_url).await?;
-    // §36: the SAME validated IST trading date drives the nearest-expiry
+    // §36/§36.7: the SAME validated IST trading date drives the all-months
     // futures selection (already strict-format-checked above).
     let today_ist = chrono::NaiveDate::parse_from_str(trading_date_ist, "%Y-%m-%d")
         .map_err(|e| WatchBuildError::WriteFailed(format!("trading_date parse: {e}")))?;

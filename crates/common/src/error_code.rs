@@ -2240,7 +2240,8 @@ mod tests {
                 || s.starts_with("PROC-")
                 // C2 (2026-07-03): panic-free reqwest client construction.
                 || s.starts_with("HTTP-CLIENT-")
-                // §36 (2026-07-08): FUTIDX-4 nearest-expiry index futures.
+                // §36 (2026-07-08; §36.7 all-months 2026-07-10): FUTIDX
+                // index futures.
                 || s.starts_with("FUTIDX-");
             assert!(has_known_prefix, "unexpected code prefix: {s}");
         }

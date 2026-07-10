@@ -586,8 +586,8 @@ async fn activate_groww_lane(
                 if let Some(slot) = &scale_entries_slot {
                     slot.store(Some(std::sync::Arc::new(set.entries.clone())));
                 }
-                // §36 (2026-07-08): the ≤4 nearest-expiry index futures are
-                // the FNO entries of the assembled set.
+                // §36/§36.7 (2026-07-10): the all-months index futures are
+                // the FNO entries of the assembled set (~12 typical).
                 let index_futures = set
                     .entries
                     .iter()
