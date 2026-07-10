@@ -2749,7 +2749,11 @@ async fn main() -> Result<()> {
         // cross_verify chains all retired. The runtime is now spot-only
         // NIFTY 50 strategy (no VWAP, no futures, no historical fetch).
 
-        notifier.notify(NotificationEvent::CustomStatus {
+        // FIX-5: this fast arm runs ONLY on a mid-market restart (cache present
+        // AND inside market hours — `should_fast_boot`), i.e. a crash/unexpected
+        // restart during the session. Operator-notable → deliver INSTANTLY, but
+        // Low severity so it never fires an SMS page.
+        notifier.notify(NotificationEvent::CustomStatusUrgent {
             message: "<b>Fast start</b>\nRestart recovery complete — prices are flowing and all \
                       services are ready."
                 .to_string(),
@@ -10765,8 +10769,11 @@ pub async fn run_dhan_lane_cold_start(ctx: std::sync::Arc<DhanLaneRuntimeContext
                     "[dhan-lane] runtime cold-start SUCCEEDED (Starting→Running) — main-feed \
                      pool live, ticks flowing; lane idling until disable"
                 );
-                ctx.notifier.notify(NotificationEvent::CustomStatus {
-                    message: "🟢 <b>Dhan feed started</b>\nThe live price feed is now connected \
+                // FIX-5: a feed on/off toggle is an operator action — ack it
+                // INSTANTLY (Immediate) but never SMS (Low). FIX-4: no hardcoded
+                // glyph — dispatch prepends the Low severity emoji.
+                ctx.notifier.notify(NotificationEvent::CustomStatusUrgent {
+                    message: "<b>Dhan feed started</b>\nThe live price feed is now connected \
                               and streaming."
                         .to_string(),
                 });
@@ -10965,8 +10972,11 @@ async fn park_running_dhan_lane(
         // fall back to the global instead of reading this stopped lane's manager.
         ctx.feed_runtime.clear_live_token_manager();
         info!("[dhan-lane] lane torn down (Stopping→Off) — ready to cold-start again on re-enable");
-        ctx.notifier.notify(NotificationEvent::CustomStatus {
-            message: "⚪ <b>Dhan feed stopped</b>\nThe live price feed is now disconnected."
+        // FIX-5/FIX-4: instant toggle ack (Immediate, Low, never SMS); no
+        // hardcoded glyph — dispatch prepends the Low severity emoji (a green
+        // ✅ on a STOP read wrong).
+        ctx.notifier.notify(NotificationEvent::CustomStatusUrgent {
+            message: "<b>Dhan feed stopped</b>\nThe live price feed is now disconnected."
                 .to_string(),
         });
         return;
