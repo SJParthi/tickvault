@@ -54,8 +54,9 @@ pub mod index_extractor;
 #[cfg(feature = "daily_universe_fetcher")]
 pub mod daily_universe;
 
-// §36 (2026-07-08): nearest-expiry FUTIDX-4 selection — the ONE shared pure
-// selector both the Dhan orchestrator and the Groww watch builder call.
+// §36 (2026-07-08) / §36.7 (2026-07-10): all-monthly-expiries FUTIDX
+// selection — the ONE shared pure selector both the Dhan orchestrator and
+// the Groww watch builder call.
 #[cfg(feature = "daily_universe_fetcher")]
 pub mod index_futures;
 

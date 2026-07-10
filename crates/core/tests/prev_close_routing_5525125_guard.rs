@@ -236,8 +236,8 @@ fn test_prev_close_routing_offsets_are_distinct_per_ticket_5525125() {
 /// — the "NSE_FNO → Full" row of the old PREVCLOSE-03 matrix served the
 /// deleted OI/depth consumers and its ratchet is retired `#[cfg(any())]`
 /// (PR #7b). The parser is segment-agnostic; this ratchet pins that a
-/// segment-byte-2 Quote packet routes the close correctly for the 4
-/// Quote-mode FUTIDX subscriptions.
+/// segment-byte-2 Quote packet routes the close correctly for the §36/§36.7
+/// Quote-mode FUTIDX subscriptions (all monthly serials since 2026-07-10).
 #[test]
 fn test_prev_close_routing_nse_fno_from_quote_close_field_bytes_38_to_41() {
     const NIFTY_FUT_PREV_CLOSE: f32 = 23_146.45;

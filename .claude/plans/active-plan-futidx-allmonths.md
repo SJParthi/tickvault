@@ -1,6 +1,6 @@
 # Implementation Plan: §36.7 FUTIDX all-months expansion (both feeds)
 
-**Status:** APPROVED
+**Status:** VERIFIED
 **Date:** 2026-07-10
 **Approved by:** Parthiban (operator) — verbatim directive 2026-07-10, relayed via the
 coordinator session: "instead of only one current month futures contracts just take all
@@ -134,7 +134,7 @@ flag, `dry_run` untouched, no WS connection change.
     .claude/rules/project/wave-5-error-codes.md, .claude/rules/dhan/instrument-master.md
   - Tests: futidx_scope_pinned_to_4_underlyings_nearest_expiry (pre-rename, green on
     commit 1), futidx_scope_rule_file_pins_forbidden_remainder
-- [ ] Item 2 — Shared selector core: plural selector + per-month degrade +
+- [x] Item 2 — Shared selector core: plural selector + per-month degrade +
   MonthlySerialFlood + set parity comparator + guard literal updates (one commit)
   - Files: crates/core/src/instrument/index_futures.rs,
     crates/storage/tests/daily_universe_scope_guard.rs, crates/common/src/error_code.rs
@@ -149,7 +149,7 @@ flag, `dry_run` untouched, no WS connection change.
     test_cross_feed_parity_multiple_months_identical_ok,
     futidx_scope_pinned_to_4_underlyings_all_monthly_expiries,
     futidx_scope_never_roll_source_pin, arbitrary_contract_sets_never_select_beyond_allowlist
-- [ ] Item 3 — Multi-month plumbing: orchestrator fixture, planner test, snapshot v3 +
+- [x] Item 3 — Multi-month plumbing: orchestrator fixture, planner test, snapshot v3 +
   R4 re-key, Groww per-expiry extractor loop + tests
   - Files: crates/core/src/instrument/daily_universe.rs,
     crates/core/src/instrument/daily_universe_orchestrator.rs,
@@ -167,12 +167,12 @@ flag, `dry_run` untouched, no WS connection change.
     test_watch_set_includes_every_monthly_fno_future,
     test_extract_monthly_serial_flood_degrades_whole_underlying,
     test_master_writer_labels_fno_ltp_entries_futidx (2nd month)
-- [ ] Item 4 — Far-month quiet-SID alarm gate (SLO freshness + silent gauge)
+- [x] Item 4 — Far-month quiet-SID alarm gate (SLO freshness + silent gauge)
   - Files: crates/app/src/main.rs, deploy/aws/terraform/app-alarms.tf (comment only)
   - Tests: test_far_month_future_sids_keeps_nearest_excludes_rest,
     test_far_month_future_sids_single_month_excludes_nothing,
     test_cw_agent (cloudwatch_app_alarms_wiring unchanged-green)
-- [ ] Item 5 — Final sweep: stale "≤4"/"nearest" comments, gates, workspace escalation
+- [x] Item 5 — Final sweep: stale "≤4"/"nearest" comments, gates, workspace escalation
   - Files: crates/app/src/main.rs (comments), crates/app/src/groww_activation.rs (comment),
     crates/core/tests/prev_close_routing_5525125_guard.rs (doc comment)
   - Tests: full scoped battery + hooks (plan-gate, per-item-guarantee-check,

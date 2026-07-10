@@ -508,6 +508,6 @@ original 4). Under §36.7 the live set is ~779 of the 1000 cap (~767 spots + ~12
 OPTIDX/CE/PE entries in the watch set; futures of a 5th underlying; any non-monthly-serial
 entry; >`MAX_MONTHLY_EXPIRIES_PER_UNDERLYING` (6) serials per underlying (fail-closed, never
 truncated); any new Groww connection; any Groww historical fetch (§33); resolving expiry from
-anything but the static master CSV. (The pre-2026-07-10 ">1 expiry per underlying" ban is
+anything but the static master CSV. (The pre-2026-07-10 single-expiry-per-underlying ban is
 REMOVED by this dated §36.7 edit.) This file must be edited FIRST with a fresh dated quote
 for any of the above.
