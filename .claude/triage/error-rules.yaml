@@ -2253,3 +2253,29 @@ rules:
       data-comparability signal requiring an operator verdict on which vendor
       master is stale. Both feeds stay live; both re-select from fresh masters
       at the next build, so there is nothing safe to auto-fix.
+
+  # SCOREBOARD-01 (dual-feed scoreboard PR-A, 2026-07-10) = the daily 15:45 IST
+  # Dhan-vs-Groww scoreboard aggregation degraded — a QuestDB /exec read failed
+  # (sentinels recorded, never fabricated zeros), an ILP row write was rejected,
+  # the boot-time process-death reconciliation could not read/write, or the
+  # same-day ws_event_audit drop counter shows the episode source under-counted.
+  # Best-effort forensic aggregate (AUDIT-WS-01 / GROWW-MASTER-01 class): the
+  # live feeds, tick capture and trading are NEVER affected, and the tables are
+  # DEDUP-idempotent so a TICKVAULT_SCOREBOARD_NOW re-run backfills the day.
+  # Escalate (not silence): a degraded daily scoreboard usually means QuestDB
+  # was down at 15:45 (the BOOT-01/02 condition) and the operator should re-run
+  # the backfill once QuestDB is healthy — the runbook names the exact steps.
+  - name: scoreboard-01-aggregation-degraded-escalate
+    match:
+      code: SCOREBOARD-01
+    action: escalate
+    runbook_path: .claude/rules/project/dual-feed-scoreboard-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 600
+    justification: >-
+      SCOREBOARD-01 = the daily dual-feed scoreboard aggregation was degraded.
+      Best-effort cold-path forensic aggregate — feeds/capture/trading are
+      unaffected and the DEDUP-idempotent re-run backfills; escalate so the
+      operator knows the day's row is partial/degraded and can re-run the
+      backfill after fixing the underlying QuestDB condition (cross-check
+      BOOT-01/02).
