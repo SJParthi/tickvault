@@ -148,6 +148,10 @@ pub mod lifecycle_reconcile_orchestrator;
 // Outer daily-universe boot orchestrator: §4 fetch-runner → reconcile →
 // terminal fetch-audit, capturing CSV SHA-256 provenance. Feature-gated
 // §21; the main.rs Step-6c task spawn is the final wiring PR.
+/// W2#7 (2026-07-10): supervised SSM re-read loop so the operator can
+/// rotate the API bearer token (/tickvault/<env>/api/bearer-token) without
+/// an app restart — closes audit row 13.
+pub mod api_token_rotation;
 #[cfg(feature = "daily_universe_fetcher")]
 pub mod daily_universe_boot;
 pub mod subsystem_memory;

@@ -2283,3 +2283,25 @@ rules:
       operator knows the day's row is partial/degraded and can re-run the
       backfill after fixing the underlying QuestDB condition (cross-check
       BOOT-01/02).
+
+  # WAL-SUSPEND-01 (W2 PR#6 2026-07-10, audit follow-up row 10) = a QuestDB
+  # table's WAL apply is SUSPENDED (post disk-full episode / apply error) —
+  # ILP keeps ACKing rows while they silently stop becoming visible/applied.
+  # Escalate: the recovery action `ALTER TABLE <t> RESUME WAL` is an OPERATOR
+  # decision — auto-resuming into a still-broken disk replays the failure
+  # (is_auto_triage_safe() == false severity-independent override).
+  - name: wal-suspend-01-table-suspended-escalate
+    match:
+      code: WAL-SUSPEND-01
+    action: escalate
+    runbook_path: .claude/rules/project/wal-suspension-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 300
+    justification: >-
+      WAL-SUSPEND-01 = per-table WAL-apply suspension (silent
+      data-visibility loss; the rows are durably in the table's WAL, so
+      staleness + disk growth, not permanent loss). Operator fixes the
+      underlying cause FIRST (df -h /data, QuestDB logs), then runs
+      ALTER TABLE <table> RESUME WAL in the QuestDB console — never
+      auto-executed. Recovery confirmed by the falling-edge log +
+      tv_questdb_wal_suspended_tables returning to 0.

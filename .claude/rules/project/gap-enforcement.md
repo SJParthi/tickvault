@@ -243,6 +243,38 @@ degraded (the 2026-07-06 collect_list class) this alarm is blind with it
 and the `warn!` lines in `/tickvault/<env>/app` are the fallback. Cost:
 +1 alarm + 1 derived metric ≈ $0.40/mo.
 
+### 2026-07-10 Update — token rotation without restart (wave-2 #7)
+
+The bearer token is no longer frozen at boot (audit row 13). The expected
+token lives behind a SHARED lock-free hot-swap holder inside
+`ApiAuthConfig` (`crates/api/src/middleware.rs` — the token_manager.rs
+arc-swap house pattern; every per-request clone shares the holder, so a
+swap is instantly visible). A SUPERVISED app-side loop
+(`crates/app/src/api_token_rotation.rs`, spawned from BOTH main.rs boot
+arms, gated on `enabled`) re-reads `/tickvault/<env>/api/bearer-token`
+every 300s (READ-ONLY SSM GetParameter — never a write) and swaps ONLY a
+non-empty, shape-valid, genuinely-new value
+(`ApiAuthConfig::rotate_bearer_token` — fail-open: an SSM outage or a
+mis-seeded empty value keeps the CURRENT token working, never locks the
+operator out, never becomes accept-all). A WELL-FORMED-but-mismatched
+bearer additionally hints ONE out-of-band re-read, hard-floored at 60s
+(`OOB_RELOAD_FLOOR_SECS`, CAS-gated) — attacker 401 spam is bounded to
+≤1 SSM read per minute; the missing/malformed-header arms never hint.
+Honest rotation window: operator updates SSM → live within ≤5 min (or
+~60s under active mismatched use); the OLD token dies at the swap instant
+(single-value semantics, no dual-accept window). Observability:
+`tv_api_token_reloads_total{outcome="ok"|"unchanged"|"failed"|"rejected"}`
+(pre-registered at 0, first-sample-baseline discipline) +
+`tv_api_token_reload_respawn_total{reason}`; routine cycles are `debug!`,
+an actual rotation is one `info!`, and ≥3 consecutive read failures (or a
+rejected SSM value) fire ONE edge-latched `warn!` per episode.
+Deliberately NO new ErrorCode and NO new alarm: a failing re-read leaves
+auth WORKING on the old token — degraded-not-broken (the 401-burst pager
+above covers the attack surface). Lockstep ratchet:
+`crates/app/tests/api_token_rotation_wiring_guard.rs` (both boot-arm
+spawns + enabled gate; loop reads SSM + rotates + counters + never writes
+SSM; exactly one middleware OOB hint site).
+
 ---
 
 # OMS (Order Management System) Gap Enforcement

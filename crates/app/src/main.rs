@@ -2734,6 +2734,18 @@ async fn main() -> Result<()> {
         );
         let api_auth_config_fast =
             tickvault_api::middleware::ApiAuthConfig::from_token(api_bearer_token_fast);
+        // W2#7 (2026-07-10): supervised SSM re-read loop — the operator can
+        // rotate /tickvault/<env>/api/bearer-token without a restart (live
+        // within ~5 min, or ~60s via the mismatched-bearer out-of-band
+        // hint). Gated on `enabled` — a disabled dev config gets no task.
+        // Fail-open on SSM outages: the current token keeps working.
+        // Ratchet: crates/app/tests/api_token_rotation_wiring_guard.rs.
+        if api_auth_config_fast.enabled {
+            let _api_token_reload_supervisor =
+                tickvault_app::api_token_rotation::spawn_supervised_api_token_reload(
+                    api_auth_config_fast.clone(),
+                );
+        }
         let router = tickvault_api::build_router_with_auth(
             api_state,
             &config.api.allowed_origins,
@@ -2997,6 +3009,22 @@ async fn main() -> Result<()> {
     let _disk_health_watcher_supervisor =
         tickvault_storage::disk_health_watcher::spawn_supervised_spill_disk_health_watcher(
             std::path::PathBuf::from("data/spill"),
+        );
+
+    // W2 PR#6 (WAL-SUSPEND-01, 2026-07-10, audit follow-up row 10):
+    // supervised per-table QuestDB WAL-suspension probe. Polls
+    // `wal_tables()` every 60s via the shared probe client; a table whose
+    // WAL apply is SUSPENDED (post disk-full / apply error) keeps ACKing
+    // ILP rows while they silently stop becoming visible — this probe is
+    // the ONLY signal (boot probe + questdb_health see reachability/
+    // connection, not per-table apply). Edge-latched error!(code =
+    // "WAL-SUSPEND-01") pages via the errcode filter chain; a merely-DOWN
+    // QuestDB never fires it (BOOT-01/02 own that). Always-on like its
+    // monitor siblings; supervised so a probe panic respawns instead of
+    // vanishing (mirrors DISK-WATCHER-01).
+    let _wal_suspension_watcher_supervisor =
+        tickvault_storage::wal_suspension_watcher::spawn_supervised_wal_suspension_watcher(
+            config.questdb.clone(),
         );
 
     // BP-07 (PROC-01, 2026-07-01): supervised OOM-kill monitor. Reads the
@@ -5818,6 +5846,16 @@ async fn build_shared_infra(
         .context("GAP-SEC-01: SSM fetch for API bearer token failed at /tickvault/<env>/api/bearer-token — store the token via `aws ssm put-parameter --name /tickvault/<env>/api/bearer-token --type SecureString`")?;
     info!("GAP-SEC-01: API bearer token loaded from SSM (/tickvault/<env>/api/bearer-token)");
     let api_auth_config = tickvault_api::middleware::ApiAuthConfig::from_token(api_bearer_token);
+    // W2#7 (2026-07-10): supervised SSM re-read loop (slow-boot mirror of
+    // the fast-arm spawn above) — token rotation without restart; fail-open
+    // on SSM outages. Ratchet:
+    // crates/app/tests/api_token_rotation_wiring_guard.rs.
+    if api_auth_config.enabled {
+        let _api_token_reload_supervisor =
+            tickvault_app::api_token_rotation::spawn_supervised_api_token_reload(
+                api_auth_config.clone(),
+            );
+    }
     let router = tickvault_api::build_router_with_auth(
         api_state,
         &config.api.allowed_origins,
