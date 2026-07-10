@@ -60,8 +60,9 @@ pub enum InstrumentRole {
     /// `is_index_constituent` — so these three primary classes stay mutually
     /// exclusive while the flags carry the lossless "and/or" membership.
     IndexConstituent,
-    /// §36 (2026-07-08): one of the 4 nearest-expiry FUTIDX contracts
-    /// (NIFTY/BANKNIFTY/MIDCPNIFTY = NSE_FNO, SENSEX = BSE_FNO) promoted
+    /// §36 (2026-07-08) / §36.7 (2026-07-10): one of the monthly-expiry
+    /// FUTIDX contracts of the 4 underlyings (NIFTY/BANKNIFTY/MIDCPNIFTY =
+    /// NSE_FNO, SENSEX = BSE_FNO; ALL monthly serials `>= today`) promoted
     /// into `subscription_targets` at build time. The planner derives the
     /// segment from `csv_row.segment` (NOT from the role — SENSEX is
     /// BSE_FNO). Selected once per trading date; NEVER rolls intraday.
@@ -356,13 +357,13 @@ pub fn build_daily_universe(
         }
     }
 
-    // Pass 5 — §36 (2026-07-08): promote the ≤4 nearest-expiry FUTIDX rows
+    // Pass 5 — §36/§36.7 (2026-07-10): promote the all-months FUTIDX rows
     // into `subscription_targets`. The chosen rows ALSO stay in
     // `fno_contracts` (master path untouched); dedup here is on the
     // composite `(security_id, segment)` key (I-P1-11) against everything
     // pushed so far AND within the futures set itself. Runs BEFORE the
-    // envelope check (+4 is trivially inside `[100, 1200]`). Empty input
-    // (spot-only rollback pin) ⇒ byte-identical prior behavior.
+    // envelope check (~+12, envelope ≤24 — trivially inside `[100, 1200]`).
+    // Empty input (spot-only rollback pin) ⇒ byte-identical prior behavior.
     if !index_futures.is_empty() {
         use std::collections::HashSet;
         let mut seen: HashSet<(String, String)> = subscription_targets

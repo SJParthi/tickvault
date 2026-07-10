@@ -85,6 +85,21 @@
 
 ---
 
+## Commit-body quoting rule — section signs (AM-r1 F9, binding 2026-07-10)
+
+Two PUSHED commit bodies (f71e31541 "$2", e45a31881 "$36.3") permanently garbled
+`§2` / `§36.3` citations because `git commit -m "..."` in a DOUBLE-quoted shell
+string expands `$2` / `$36` as positional parameters. In this repo, dated
+section citations in commit bodies ARE the authority chain — the garble is an
+unfixable-post-push provenance blemish (history rewrite / force-push banned).
+
+**The rule:** any commit message body containing `§N` (or any `$`-adjacent
+text) MUST be written via a SINGLE-quoted `-m '...'`, a heredoc, or
+`git commit -F <file>` — NEVER a double-quoted `-m "..."`. After committing,
+verify with `git log -1 --format=%B | grep -c '§'` when the body cites
+sections. (Corrected citations for the two garbled commits are recorded in
+`.claude/plans/active-plan-futidx-allmonths.md` AM-R1 F9.)
+
 ## When CI fails mid-loop
 
 The session stays subscribed. On each `<github-webhook-activity>` CI-fail event:

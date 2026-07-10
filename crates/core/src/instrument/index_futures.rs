@@ -1,28 +1,42 @@
-//! §36 (2026-07-08) — nearest-expiry index-futures selection, shared by BOTH
-//! feeds (Dhan daily-universe build + Groww watch-set build).
+//! §36 (2026-07-08) / §36.7 (2026-07-10) — all-monthly-expiries index-futures
+//! selection, shared by BOTH feeds (Dhan daily-universe build + Groww
+//! watch-set build).
 //!
-//! Operator verbatim quote (2026-07-08, recorded in
-//! `daily-universe-scope-expansion-2026-05-27.md` §36): "for both dhan and
-//! groww we need to add futures and those also should be subscribed along
-//! with this, especially only for nifty banknifty and sensex nifty midcap."
+//! Operator verbatim quotes (recorded in
+//! `daily-universe-scope-expansion-2026-05-27.md` §36/§36.7): 2026-07-08 —
+//! "for both dhan and groww we need to add futures and those also should be
+//! subscribed along with this, especially only for nifty banknifty and
+//! sensex nifty midcap."; 2026-07-10 — "instead of only one current month
+//! futures contracts just take all the futures of these indices — I mean
+//! take all available applicable months futures."
 //!
 //! ## The contract (LOCKED — rule file first)
 //!
 //! - Exactly FOUR underlyings, pinned by [`INDEX_FUTURES_UNDERLYINGS`]:
 //!   NIFTY / BANKNIFTY / MIDCPNIFTY (NSE_FNO) + SENSEX (BSE_FNO).
-//! - NEAREST expiry only: first expiry `>= today` ([`select_index_future_expiry`]).
-//! - Index futures NEVER roll — the T-0 expiring contract stays selected
-//!   through the 15:30 close (`subscription_planner.rs` "FUTIDX → NEVER roll"
-//!   lock + `test_index_expiry_never_rolls_via_planner`). The next trading
-//!   day's build advances automatically because `expiry < today` fails the
+//! - ALL monthly expiries `>= today` ([`select_index_future_expiries`],
+//!   §36.7) — whatever the vendor master lists, bounded per underlying by
+//!   [`MAX_MONTHLY_EXPIRIES_PER_UNDERLYING`]; the NEAREST expiry is the
+//!   first of each set ([`select_index_future_expiry`] delegates).
+//! - Index futures NEVER roll — the T-0 expiring month stays selected
+//!   through the 15:30 close ALONGSIDE the later months
+//!   (`subscription_planner.rs` "FUTIDX → NEVER roll" lock +
+//!   `test_index_expiry_never_rolls_via_planner`). The next trading day's
+//!   build advances automatically because `expiry < today` fails the
 //!   `>= today` filter. Deliberately NO `TradingCalendar` parameter — the
 //!   calendar arm exists only to trigger the STOCK T-0 roll, which is banned
 //!   for index futures; omitting the parameter makes accidental roll
 //!   activation unrepresentable.
-//! - Per-underlying DEGRADE, never a build failure: a miss is returned to the
-//!   caller, which pages `FUTIDX-01` and continues with the resolved subset.
+//! - DEGRADE, never a build failure: a zero-candidate / serial-flood miss
+//!   drops the whole underlying; a per-month flood/ambiguity miss drops ONLY
+//!   that month (§36.7 — the trading-relevant front month survives a corrupt
+//!   far-month row). The caller pages `FUTIDX-01` per miss and continues
+//!   with the resolved subset.
 //! - Cross-feed parity: both feeds record their selection here; the moment
-//!   BOTH are present, any expiry divergence pages `FUTIDX-02`.
+//!   BOTH are present, the per-underlying expiry SETS are compared — any
+//!   comparable-month divergence pages `FUTIDX-02`; a pure far-suffix depth
+//!   difference (vendor publication lag) is an `info!` + counter, never a
+//!   page (§36.7).
 //!
 //! COLD PATH — every function here runs once per feed per boot/activation.
 
@@ -59,7 +73,7 @@ pub struct IndexFutureUnderlying {
 
 /// §36: the ONLY four authorized index-futures underlyings. Adding a 5th
 /// requires a fresh dated operator quote + rule-file edit FIRST (ratcheted by
-/// `daily_universe_scope_guard.rs::futidx_scope_pinned_to_4_underlyings_nearest_expiry`).
+/// `daily_universe_scope_guard.rs::futidx_scope_pinned_to_4_underlyings_all_monthly_expiries`).
 pub const INDEX_FUTURES_UNDERLYINGS: [IndexFutureUnderlying; 4] = [
     IndexFutureUnderlying {
         canonical: "NIFTY",
@@ -83,30 +97,57 @@ pub const INDEX_FUTURES_UNDERLYINGS: [IndexFutureUnderlying; 4] = [
     },
 ];
 
-/// Hard cap on selected index-future targets — one nearest-expiry contract
-/// per authorized underlying, never more.
-pub const MAX_INDEX_FUTURE_TARGETS: usize = 4;
+/// §36.7 (2026-07-10): envelope bound on DISTINCT monthly future expiries per
+/// underlying — a legitimate master lists ~3 serials (near/next/far); beyond
+/// 6 is a corrupt/flooded file and the underlying degrades fail-closed with
+/// [`IndexFutureMissReason::MonthlySerialFlood`] (INSTR-FETCH-04 discipline —
+/// corrupt data is never truncated-and-trusted). Shared by BOTH feeds.
+pub const MAX_MONTHLY_EXPIRIES_PER_UNDERLYING: usize = 6;
+
+/// Envelope bound on total selected index-future targets (§36.7): 4
+/// underlyings × [`MAX_MONTHLY_EXPIRIES_PER_UNDERLYING`]. NOT an expected
+/// count — the expected count is vendor-controlled (typically ~12).
+pub const MAX_INDEX_FUTURE_TARGETS: usize =
+    INDEX_FUTURES_UNDERLYINGS.len() * MAX_MONTHLY_EXPIRIES_PER_UNDERLYING;
 
 /// Bound on the distinct `underlying_symbol` evidence values carried in a
 /// [`IndexFutureSelection`] (the FUTIDX-01 alias-drift payload). `pub` so
 /// the Groww-side evidence collector shares the SAME bound (no divergence).
 pub const MAX_UNDERLYING_SYMBOLS_EVIDENCE: usize = 20;
 
-/// THE shared boundary rule — both feeds call exactly this.
+/// §36.7: ALL monthly expiries `>= today`, ascending — THE shared boundary
+/// rule; both feeds call exactly this.
 ///
-/// Nearest = first expiry `>= today`. NEVER rolls (index futures trade to
+/// The expiring month stays through its final session (`>= today` keeps
+/// T-0) and falls out the next morning; NEVER rolls (index futures trade to
 /// expiry — contrast `select_stock_expiry_with_rollover`'s stock-only T-0
 /// roll). NO calendar parameter, deliberately: accidental roll activation is
 /// unrepresentable. `expiry_dates_sorted_asc` MUST be sorted ascending.
+#[must_use]
+pub fn select_index_future_expiries(
+    expiry_dates_sorted_asc: &[NaiveDate],
+    today_ist: NaiveDate,
+) -> Vec<NaiveDate> {
+    expiry_dates_sorted_asc
+        .iter()
+        .copied()
+        .filter(|d| *d >= today_ist)
+        .collect()
+}
+
+/// Nearest = first of [`select_index_future_expiries`]. Production consumer:
+/// the §36.7 D7 far-month alarm-gate exclusion (`far_month_future_sids` in
+/// `crates/app/src/main.rs`) identifies each underlying's nearest month
+/// through THIS fn (AM-r1 F6, 2026-07-10 — wired, not just documented).
+/// Delegates so the `>= today` rule has exactly ONE implementation.
 #[must_use]
 pub fn select_index_future_expiry(
     expiry_dates_sorted_asc: &[NaiveDate],
     today_ist: NaiveDate,
 ) -> Option<NaiveDate> {
-    expiry_dates_sorted_asc
-        .iter()
-        .copied()
-        .find(|d| *d >= today_ist)
+    select_index_future_expiries(expiry_dates_sorted_asc, today_ist)
+        .into_iter()
+        .next()
 }
 
 /// Why an authorized underlying resolved NO contract (FUTIDX-01 payload).
@@ -131,9 +172,16 @@ pub enum IndexFutureMissReason {
     /// (underlying, expiry) — a corrupt/flooded vendor master (hostile-review
     /// round 3, 2026-07-08: INSTR-FETCH-04-style envelope discipline; the
     /// dedup pass is O(n) but a flood this size is untrustworthy data, so the
-    /// underlying degrades fail-closed instead of being guessed from a
-    /// corrupt set).
+    /// month degrades fail-closed instead of being guessed from a corrupt
+    /// set). §36.7 (2026-07-10): per-(underlying, expiry) — drops ONLY that
+    /// month; other months of the underlying still subscribe.
     SameExpiryCandidateFlood,
+    /// §36.7 (2026-07-10): more than [`MAX_MONTHLY_EXPIRIES_PER_UNDERLYING`]
+    /// DISTINCT future expiries for one underlying — a corrupt/flooded
+    /// master (a legitimate one lists ~3 monthly serials). The WHOLE
+    /// underlying degrades fail-closed — corrupt data is never
+    /// truncated-and-trusted (INSTR-FETCH-04 discipline).
+    MonthlySerialFlood,
 }
 
 /// Hard sanity cap on same-(underlying, expiry) FUTIDX candidate rows —
@@ -145,20 +193,26 @@ pub enum IndexFutureMissReason {
 /// 2026-07-08).
 pub const FUTIDX_SAME_EXPIRY_CANDIDATE_CAP: usize = 16;
 
-/// One degraded underlying (FUTIDX-01 unit).
+/// One degraded (underlying[, month]) — the FUTIDX-01 unit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct IndexFutureMiss {
     pub canonical: &'static str,
     pub reason: IndexFutureMissReason,
+    /// §36.7: `Some(expiry)` = ONLY that month degraded (flood/ambiguity at
+    /// that expiry); `None` = the whole underlying (zero candidates /
+    /// all-past / serial flood).
+    pub expiry: Option<NaiveDate>,
 }
 
-/// Output of [`select_index_future_contracts`] — ≤4 chosen rows + the misses
-/// the caller pages, plus bounded alias-drift evidence.
+/// Output of [`select_index_future_contracts`] — the chosen rows (one per
+/// (underlying, monthly expiry `>= today`)) + the misses the caller pages,
+/// plus bounded alias-drift evidence.
 #[derive(Debug, Clone, Default)]
 pub struct IndexFutureSelection {
     /// The chosen FUTIDX rows (≤ [`MAX_INDEX_FUTURE_TARGETS`]).
     pub chosen: Vec<CsvRow>,
-    /// Per-underlying degrades — the caller emits `FUTIDX-01` per entry.
+    /// Per-(underlying[, month]) degrades — the caller emits `FUTIDX-01`
+    /// per entry.
     pub misses: Vec<IndexFutureMiss>,
     /// Distinct `underlying_symbol` literals seen among FUTIDX rows (bounded
     /// to [`MAX_UNDERLYING_SYMBOLS_EVIDENCE`]) — so an `INDEX_SYMBOL_ALIASES`
@@ -167,7 +221,9 @@ pub struct IndexFutureSelection {
 }
 
 /// Dhan-side selector. Pure, O(N) single pass over `fno_contracts`, cold
-/// path, once per boot. NEVER panics. NEVER returns > 4 rows.
+/// path, once per boot. NEVER panics. NEVER returns more than
+/// [`MAX_INDEX_FUTURE_TARGETS`] rows; one row per (underlying, monthly
+/// expiry `>= today`) — §36.7 (2026-07-10).
 ///
 /// Algorithm:
 /// 1. Keep rows where `instrument == "FUTIDX"` AND
@@ -177,9 +233,13 @@ pub struct IndexFutureSelection {
 ///    cross-exchange listings skipped).
 /// 2. Per underlying: parse `expiry_date` (`YYYY-MM-DD` from
 ///    `SM_EXPIRY_DATE`; unparsable → skip + `BadExpiryFormat` accounting),
-///    sort asc, pick via [`select_index_future_expiry`].
-/// 3. ≥2 rows at the chosen (underlying, expiry) → fail-closed miss
-///    (`AmbiguousDuplicateExpiry`).
+///    sort asc, dedup, pick ALL via [`select_index_future_expiries`]; more
+///    than [`MAX_MONTHLY_EXPIRIES_PER_UNDERLYING`] distinct future expiries
+///    → whole-underlying fail-closed miss (`MonthlySerialFlood`).
+/// 3. Per chosen (underlying, expiry): candidate-flood cap → exact-dup SID
+///    collapse → ≥2 TRULY-DISTINCT SIDs → fail-closed miss for THAT month
+///    only (`AmbiguousDuplicateExpiry` / `SameExpiryCandidateFlood` carry
+///    `expiry: Some(month)`); other months still process.
 #[must_use]
 pub fn select_index_future_contracts(
     fno_contracts: &[CsvRow],
@@ -238,61 +298,84 @@ pub fn select_index_future_contracts(
             selection.misses.push(IndexFutureMiss {
                 canonical: entry.canonical,
                 reason,
+                expiry: None,
             });
             continue;
         }
         candidates.sort_by_key(|(d, _)| *d);
-        let dates: Vec<NaiveDate> = candidates.iter().map(|(d, _)| *d).collect();
-        let Some(chosen_expiry) = select_index_future_expiry(&dates, today_ist) else {
+        // §36.7: the SERIAL count is distinct-keyed — duplicate rows at one
+        // expiry are handled per-month below, but the month-count envelope
+        // must see each expiry once.
+        let mut dates: Vec<NaiveDate> = candidates.iter().map(|(d, _)| *d).collect();
+        dates.dedup();
+        let expiries = select_index_future_expiries(&dates, today_ist);
+        if expiries.is_empty() {
             selection.misses.push(IndexFutureMiss {
                 canonical: entry.canonical,
                 reason: IndexFutureMissReason::AllExpiriesPast,
-            });
-            continue;
-        };
-        let at_chosen: Vec<&CsvRow> = candidates
-            .iter()
-            .filter(|(d, _)| *d == chosen_expiry)
-            .map(|(_, r)| *r)
-            .collect();
-        // Hostile-review round 3 (2026-07-08): envelope cap FIRST — the
-        // same-(underlying, expiry) candidate set comes from an untrusted
-        // public CSV with no per-underlying bound upstream; a flood beyond
-        // the cap is corrupt data and degrades fail-closed (INSTR-FETCH-04
-        // discipline), never processed.
-        if at_chosen.len() > FUTIDX_SAME_EXPIRY_CANDIDATE_CAP {
-            selection.misses.push(IndexFutureMiss {
-                canonical: entry.canonical,
-                reason: IndexFutureMissReason::SameExpiryCandidateFlood,
+                expiry: None,
             });
             continue;
         }
-        // Hostile-review round 2 (2026-07-08): collapse vendor-glitch
-        // EXACT-duplicate CSV lines (SAME `SECURITY_ID` at the chosen expiry)
-        // first-row-wins — the index_extractor.rs precedent — BEFORE the
-        // ambiguity count. There is nothing to guess when both rows carry the
-        // SAME id; only TRULY-DISTINCT SecurityIds at the same expiry stay
-        // fail-closed as `AmbiguousDuplicateExpiry`. Round 3: HashSet-based
-        // O(n) dedup (was an O(n²) scan) — the set is keyed on the bare
-        // `security_id` string, which is I-P1-11-SAFE HERE because every row
-        // in `at_chosen` was already filtered to the SINGLE segment
-        // `entry.dhan_segment` (single-segment by construction).
-        let mut seen_ids: std::collections::HashSet<&str> =
-            std::collections::HashSet::with_capacity(at_chosen.len());
-        let mut distinct: Vec<&CsvRow> = Vec::with_capacity(at_chosen.len());
-        for r in &at_chosen {
-            if seen_ids.insert(r.security_id.as_str()) {
-                distinct.push(r);
+        // §36.7 serial-flood envelope: more distinct future expiries than a
+        // legitimate master can list = corrupt/flooded file → the WHOLE
+        // underlying degrades fail-closed (never truncated-and-trusted).
+        if expiries.len() > MAX_MONTHLY_EXPIRIES_PER_UNDERLYING {
+            selection.misses.push(IndexFutureMiss {
+                canonical: entry.canonical,
+                reason: IndexFutureMissReason::MonthlySerialFlood,
+                expiry: None,
+            });
+            continue;
+        }
+        for chosen_expiry in expiries {
+            let at_chosen: Vec<&CsvRow> = candidates
+                .iter()
+                .filter(|(d, _)| *d == chosen_expiry)
+                .map(|(_, r)| *r)
+                .collect();
+            // Hostile-review round 3 (2026-07-08): envelope cap FIRST — the
+            // same-(underlying, expiry) candidate set comes from an untrusted
+            // public CSV with no per-underlying bound upstream; a flood beyond
+            // the cap is corrupt data and degrades fail-closed (INSTR-FETCH-04
+            // discipline), never processed. §36.7: per-MONTH — the other
+            // months of this underlying still process.
+            if at_chosen.len() > FUTIDX_SAME_EXPIRY_CANDIDATE_CAP {
+                selection.misses.push(IndexFutureMiss {
+                    canonical: entry.canonical,
+                    reason: IndexFutureMissReason::SameExpiryCandidateFlood,
+                    expiry: Some(chosen_expiry),
+                });
+                continue;
             }
+            // Hostile-review round 2 (2026-07-08): collapse vendor-glitch
+            // EXACT-duplicate CSV lines (SAME `SECURITY_ID` at the chosen expiry)
+            // first-row-wins — the index_extractor.rs precedent — BEFORE the
+            // ambiguity count. There is nothing to guess when both rows carry the
+            // SAME id; only TRULY-DISTINCT SecurityIds at the same expiry stay
+            // fail-closed as `AmbiguousDuplicateExpiry` (per-MONTH, §36.7).
+            // Round 3: HashSet-based O(n) dedup (was an O(n²) scan) — the set is
+            // keyed on the bare `security_id` string, which is I-P1-11-SAFE HERE
+            // because every row in `at_chosen` was already filtered to the SINGLE
+            // segment `entry.dhan_segment` (single-segment by construction).
+            let mut seen_ids: std::collections::HashSet<&str> =
+                std::collections::HashSet::with_capacity(at_chosen.len());
+            let mut distinct: Vec<&CsvRow> = Vec::with_capacity(at_chosen.len());
+            for r in &at_chosen {
+                if seen_ids.insert(r.security_id.as_str()) {
+                    distinct.push(r);
+                }
+            }
+            if distinct.len() > 1 {
+                selection.misses.push(IndexFutureMiss {
+                    canonical: entry.canonical,
+                    reason: IndexFutureMissReason::AmbiguousDuplicateExpiry,
+                    expiry: Some(chosen_expiry),
+                });
+                continue;
+            }
+            selection.chosen.push(distinct[0].clone());
         }
-        if distinct.len() > 1 {
-            selection.misses.push(IndexFutureMiss {
-                canonical: entry.canonical,
-                reason: IndexFutureMissReason::AmbiguousDuplicateExpiry,
-            });
-            continue;
-        }
-        selection.chosen.push(distinct[0].clone());
     }
     debug_assert!(selection.chosen.len() <= MAX_INDEX_FUTURE_TARGETS);
     selection
@@ -310,44 +393,110 @@ pub struct FeedFutureSelection {
     pub segment: String,
 }
 
-/// One cross-feed divergence (FUTIDX-02 unit). `None` = missing on that feed.
+/// §36.7: how a cross-feed expiry-SET mismatch is classified.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParityMismatchKind {
+    /// Comparable-month divergence (nearest differs, a hole, or a whole
+    /// underlying one-sided) — pages FUTIDX-02 (High).
+    Divergence,
+    /// Pure far-suffix depth difference (every one-sided month strictly
+    /// beyond the shorter feed's max) — info + counter, never a page:
+    /// vendors legitimately publish far serials at different times.
+    DepthOnly,
+}
+
+/// One cross-feed divergence (FUTIDX-02 / depth-note unit) — §36.7 expiry-SET
+/// semantics: the months present on only one feed, sorted ascending.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParityMismatch {
     pub canonical: &'static str,
-    pub dhan_expiry: Option<NaiveDate>,
-    pub groww_expiry: Option<NaiveDate>,
+    /// Months in Dhan's set but not Groww's (sorted asc).
+    pub dhan_only: Vec<NaiveDate>,
+    /// Months in Groww's set but not Dhan's (sorted asc).
+    pub groww_only: Vec<NaiveDate>,
+    pub kind: ParityMismatchKind,
 }
 
-/// Pure cross-feed comparator: for every underlying present on EITHER feed,
-/// flag differing expiries and one-sided presence. Empty result = parity OK.
+/// Pure cross-feed comparator (§36.7): for every underlying present on
+/// EITHER feed, compare the SORTED-DEDUP expiry SET of ALL selections with
+/// that canonical (fixes the pre-2026-07-10 `.find()` first-entry bug that
+/// would have compared one arbitrary month per feed). Empty result = parity
+/// OK. A one-sided set that is a strict FAR-SUFFIX of the other feed's
+/// non-empty set classifies [`ParityMismatchKind::DepthOnly`]; everything
+/// else (nearest divergence, a hole, a whole underlying one-sided) is
+/// [`ParityMismatchKind::Divergence`].
 #[must_use]
 pub fn compare_index_future_selections(
     dhan: &[FeedFutureSelection],
     groww: &[FeedFutureSelection],
 ) -> Vec<ParityMismatch> {
+    use std::collections::BTreeSet;
     let mut mismatches = Vec::new();
     for entry in &INDEX_FUTURES_UNDERLYINGS {
-        let d = dhan
+        let d_set: BTreeSet<NaiveDate> = dhan
             .iter()
-            .find(|s| s.canonical == entry.canonical)
-            .map(|s| s.expiry);
-        let g = groww
+            .filter(|s| s.canonical == entry.canonical)
+            .map(|s| s.expiry)
+            .collect();
+        let g_set: BTreeSet<NaiveDate> = groww
             .iter()
-            .find(|s| s.canonical == entry.canonical)
-            .map(|s| s.expiry);
-        match (d, g) {
-            // Absent on BOTH feeds → not a parity question (both degraded;
-            // each already paged FUTIDX-01 per-feed).
-            (None, None) => {}
-            (Some(de), Some(ge)) if de == ge => {}
-            _ => mismatches.push(ParityMismatch {
-                canonical: entry.canonical,
-                dhan_expiry: d,
-                groww_expiry: g,
-            }),
+            .filter(|s| s.canonical == entry.canonical)
+            .map(|s| s.expiry)
+            .collect();
+        // Absent on BOTH feeds → not a parity question (both degraded; each
+        // already paged FUTIDX-01 per-feed). Equal sets → parity OK.
+        if d_set == g_set {
+            continue;
         }
+        let dhan_only: Vec<NaiveDate> = d_set.difference(&g_set).copied().collect();
+        let groww_only: Vec<NaiveDate> = g_set.difference(&d_set).copied().collect();
+        // DepthOnly iff exactly one side has extra months, the OTHER feed's
+        // set is non-empty (a whole-underlying one-sided presence keeps the
+        // original Divergence semantics), and every one-sided month lies
+        // strictly beyond the shorter feed's max (a strict far-suffix —
+        // sorted BTreeSet difference, so `first()` is the minimum).
+        let kind = match (dhan_only.is_empty(), groww_only.is_empty()) {
+            (false, true) if !g_set.is_empty() => {
+                let min_one_sided = dhan_only.first().copied();
+                let other_max = g_set.iter().next_back().copied();
+                if min_one_sided > other_max {
+                    ParityMismatchKind::DepthOnly
+                } else {
+                    ParityMismatchKind::Divergence
+                }
+            }
+            (true, false) if !d_set.is_empty() => {
+                let min_one_sided = groww_only.first().copied();
+                let other_max = d_set.iter().next_back().copied();
+                if min_one_sided > other_max {
+                    ParityMismatchKind::DepthOnly
+                } else {
+                    ParityMismatchKind::Divergence
+                }
+            }
+            _ => ParityMismatchKind::Divergence,
+        };
+        mismatches.push(ParityMismatch {
+            canonical: entry.canonical,
+            dhan_only,
+            groww_only,
+            kind,
+        });
     }
     mismatches
+}
+
+/// Cold-path helper: render a sorted date list for the FUTIDX-02 / depth-note
+/// payloads (`"2026-08-27,2026-09-24"`; empty list → `"-"`).
+fn join_dates(dates: &[NaiveDate]) -> String {
+    if dates.is_empty() {
+        return "-".to_string();
+    }
+    dates
+        .iter()
+        .map(|d| d.format("%Y-%m-%d").to_string())
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 /// Backing store for the per-boot cross-feed parity recorder. Each feed's
@@ -500,20 +649,42 @@ pub fn record_index_future_selection(
     if mismatches.is_empty() {
         info!(
             feed,
-            "index-futures parity OK — both feeds selected identical (underlying, expiry) pairs"
+            "index-futures parity OK — both feeds selected identical per-underlying expiry sets"
         );
         return;
     }
     for m in &mismatches {
-        error!(
-            code = ErrorCode::Futidx02CrossFeedExpiryMismatch.code_str(),
-            underlying = m.canonical,
-            dhan_expiry = ?m.dhan_expiry,
-            groww_expiry = ?m.groww_expiry,
-            "index-futures cross-feed expiry mismatch — one vendor master is stale/divergent; \
-             both feeds STAY LIVE, cross-feed rows for this underlying are not comparable today"
-        );
-        metrics::counter!("tv_index_futures_parity_mismatch_total").increment(1);
+        match m.kind {
+            ParityMismatchKind::Divergence => {
+                error!(
+                    code = ErrorCode::Futidx02CrossFeedExpiryMismatch.code_str(),
+                    underlying = m.canonical,
+                    dhan_only = %join_dates(&m.dhan_only),
+                    groww_only = %join_dates(&m.groww_only),
+                    "index-futures cross-feed expiry-set mismatch — one vendor master is \
+                     stale/divergent; both feeds STAY LIVE, cross-feed rows for this \
+                     underlying are not comparable today"
+                );
+                metrics::counter!("tv_index_futures_parity_mismatch_total").increment(1);
+            }
+            ParityMismatchKind::DepthOnly => {
+                // §36.7: far-serial publication lag is a legitimate,
+                // self-healing vendor state — never a page. The message
+                // deliberately carries no FUTIDX-02 code.
+                info!(
+                    underlying = m.canonical,
+                    dhan_only = %join_dates(&m.dhan_only),
+                    groww_only = %join_dates(&m.groww_only),
+                    "index-futures parity depth note: far-serial publication lag — one vendor \
+                     lists extra far months beyond the other's max; comparable months agree"
+                );
+                metrics::counter!(
+                    "tv_index_futures_parity_depth_mismatch_total",
+                    "underlying" => m.canonical
+                )
+                .increment(1);
+            }
+        }
     }
 }
 
@@ -553,7 +724,11 @@ mod tests {
     #[test]
     fn test_index_futures_underlyings_pinned_exactly_four() {
         assert_eq!(INDEX_FUTURES_UNDERLYINGS.len(), 4, "§36: exactly 4");
-        assert_eq!(MAX_INDEX_FUTURE_TARGETS, 4);
+        assert_eq!(MAX_MONTHLY_EXPIRIES_PER_UNDERLYING, 6, "§36.7 envelope");
+        assert_eq!(
+            MAX_INDEX_FUTURE_TARGETS, 24,
+            "§36.7: 4 underlyings × 6-serial envelope — a bound, not an expected count"
+        );
         let canonicals: Vec<&str> = INDEX_FUTURES_UNDERLYINGS
             .iter()
             .map(|u| u.canonical)
@@ -580,6 +755,63 @@ mod tests {
             select_index_future_expiry(&dates, d("2026-07-08")),
             Some(d("2026-07-30")),
             "earlier future expiry wins"
+        );
+    }
+
+    #[test]
+    fn test_select_index_future_expiries_returns_all_at_or_after_today() {
+        // §36.7: ALL monthly expiries >= today, ascending; past ones dropped.
+        let dates = [
+            d("2026-06-10"),
+            d("2026-07-15"),
+            d("2026-08-12"),
+            d("2026-09-10"),
+        ];
+        assert_eq!(
+            select_index_future_expiries(&dates, d("2026-07-10")),
+            vec![d("2026-07-15"), d("2026-08-12"), d("2026-09-10")],
+            "all future months kept, ascending; the past month dropped"
+        );
+    }
+
+    #[test]
+    fn test_select_index_future_expiry_delegates_to_plural_first() {
+        // The `>= today` rule has exactly ONE implementation — the singular
+        // is the plural's first element on every fixture shape.
+        for (dates, today) in [
+            (vec![d("2026-07-30"), d("2026-08-27")], d("2026-07-08")),
+            (vec![d("2026-07-30"), d("2026-08-27")], d("2026-07-30")),
+            (vec![d("2026-07-30"), d("2026-08-27")], d("2026-07-31")),
+            (vec![d("2026-06-25")], d("2026-07-08")),
+            (vec![], d("2026-07-08")),
+        ] {
+            assert_eq!(
+                select_index_future_expiry(&dates, today),
+                select_index_future_expiries(&dates, today).first().copied(),
+                "singular == plural.first() for dates={dates:?} today={today}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_select_index_future_expiries_keeps_expiring_month_and_later_on_t_zero() {
+        // §36.7 NEVER-roll pin: on T-0 the expiring month stays ALONGSIDE
+        // the later months through the close.
+        let dates = [d("2026-07-30"), d("2026-08-27")];
+        assert_eq!(
+            select_index_future_expiries(&dates, d("2026-07-30")),
+            vec![d("2026-07-30"), d("2026-08-27")],
+            "T-0 keeps the expiring month AND the later months"
+        );
+    }
+
+    #[test]
+    fn test_select_index_future_expiries_drops_expired_month_next_morning() {
+        let dates = [d("2026-07-29"), d("2026-08-27")];
+        assert_eq!(
+            select_index_future_expiries(&dates, d("2026-07-30")),
+            vec![d("2026-08-27")],
+            "the expired month falls out of >= today the next morning"
         );
     }
 
@@ -648,14 +880,36 @@ mod tests {
     }
 
     #[test]
-    fn test_select_index_future_contracts_picks_nearest_per_underlying() {
-        let mut rows = four_rows("2026-08-27");
+    fn test_select_index_future_contracts_picks_all_months_per_underlying() {
+        // §36.7: 2 expiries per underlying → 8 contracts, BOTH months per
+        // canonical. Give the August wave distinct SIDs.
+        let mut rows: Vec<CsvRow> = four_rows("2026-08-27")
+            .into_iter()
+            .map(|mut r| {
+                r.security_id = format!("8{}", r.security_id);
+                r
+            })
+            .collect();
         rows.extend(four_rows("2026-07-30")); // nearer expiry, listed second
         let sel = select_index_future_contracts(&rows, d("2026-07-08"));
-        assert_eq!(sel.chosen.len(), 4);
+        assert_eq!(sel.chosen.len(), 8, "all months × all underlyings");
         assert!(sel.misses.is_empty());
+        for entry in &INDEX_FUTURES_UNDERLYINGS {
+            let mut expiries: Vec<&str> = sel
+                .chosen
+                .iter()
+                .filter(|r| canonicalize_index_symbol(&r.underlying_symbol) == entry.canonical)
+                .map(|r| r.expiry_date.as_str())
+                .collect();
+            expiries.sort_unstable();
+            assert_eq!(
+                expiries,
+                vec!["2026-07-30", "2026-08-27"],
+                "{}: both months chosen",
+                entry.canonical
+            );
+        }
         for row in &sel.chosen {
-            assert_eq!(row.expiry_date, "2026-07-30", "nearest expiry chosen");
             assert_eq!(row.instrument, "FUTIDX");
         }
     }
@@ -694,16 +948,70 @@ mod tests {
     #[test]
     fn test_select_index_future_contracts_fails_closed_on_duplicate_expiry() {
         let mut rows = four_rows("2026-07-30");
-        // A second NIFTY row at the SAME (underlying, expiry), different SID.
+        // A second NIFTY row at the SAME (underlying, expiry), different SID
+        // — plus a CLEAN second month proving the per-month degrade (§36.7).
         rows.push(futidx_row("NIFTY", "NSE_FNO", "35099", "2026-07-30"));
+        rows.push(futidx_row("NIFTY", "NSE_FNO", "36001", "2026-08-27"));
         let sel = select_index_future_contracts(&rows, d("2026-07-08"));
-        assert_eq!(sel.chosen.len(), 3, "NIFTY dropped fail-closed");
-        assert!(sel.chosen.iter().all(|r| r.underlying_symbol != "NIFTY"));
+        assert_eq!(
+            sel.chosen.len(),
+            4,
+            "the ambiguous NIFTY July dropped; NIFTY August + 3 others kept"
+        );
+        assert!(
+            sel.chosen
+                .iter()
+                .all(|r| !(r.underlying_symbol == "NIFTY" && r.expiry_date == "2026-07-30")),
+            "the ambiguous month is fail-closed"
+        );
+        assert!(
+            sel.chosen
+                .iter()
+                .any(|r| r.underlying_symbol == "NIFTY" && r.expiry_date == "2026-08-27"),
+            "§36.7 per-month degrade: the OTHER month of the underlying is still chosen"
+        );
         assert_eq!(
             sel.misses,
             vec![IndexFutureMiss {
                 canonical: "NIFTY",
                 reason: IndexFutureMissReason::AmbiguousDuplicateExpiry,
+                expiry: Some(d("2026-07-30")),
+            }]
+        );
+    }
+
+    /// §36.7: more distinct future expiries than the envelope allows =
+    /// corrupt/flooded master → the WHOLE underlying degrades fail-closed
+    /// (never truncated-and-trusted); other underlyings unaffected.
+    #[test]
+    fn test_select_monthly_serial_flood_degrades_whole_underlying() {
+        let mut rows = four_rows("2026-07-30");
+        // 6 EXTRA NIFTY months → 7 distinct future expiries for NIFTY.
+        for (i, exp) in [
+            "2026-08-27",
+            "2026-09-24",
+            "2026-10-29",
+            "2026-11-26",
+            "2026-12-31",
+            "2027-01-28",
+        ]
+        .iter()
+        .enumerate()
+        {
+            rows.push(futidx_row("NIFTY", "NSE_FNO", &format!("37{i:03}"), exp));
+        }
+        let sel = select_index_future_contracts(&rows, d("2026-07-08"));
+        assert!(
+            sel.chosen.iter().all(|r| r.underlying_symbol != "NIFTY"),
+            "zero NIFTY rows chosen — whole underlying fail-closed"
+        );
+        assert_eq!(sel.chosen.len(), 3, "the other 3 underlyings unaffected");
+        assert_eq!(
+            sel.misses,
+            vec![IndexFutureMiss {
+                canonical: "NIFTY",
+                reason: IndexFutureMissReason::MonthlySerialFlood,
+                expiry: None,
             }]
         );
     }
@@ -757,14 +1065,28 @@ mod tests {
                 "2026-07-30",
             ));
         }
+        // A CLEAN second NIFTY month — §36.7 per-month degrade keeps it.
+        rows.push(futidx_row("NIFTY", "NSE_FNO", "36001", "2026-08-27"));
         let sel = select_index_future_contracts(&rows, d("2026-07-08"));
-        assert_eq!(sel.chosen.len(), 3, "NIFTY dropped fail-closed");
-        assert!(sel.chosen.iter().all(|r| r.underlying_symbol != "NIFTY"));
+        assert!(
+            sel.chosen
+                .iter()
+                .all(|r| !(r.underlying_symbol == "NIFTY" && r.expiry_date == "2026-07-30")),
+            "the flooded NIFTY July dropped fail-closed"
+        );
+        assert!(
+            sel.chosen
+                .iter()
+                .any(|r| r.underlying_symbol == "NIFTY" && r.expiry_date == "2026-08-27"),
+            "§36.7 per-month degrade: the clean second month IS chosen"
+        );
+        assert_eq!(sel.chosen.len(), 4, "3 others + NIFTY August");
         assert_eq!(
             sel.misses,
             vec![IndexFutureMiss {
                 canonical: "NIFTY",
                 reason: IndexFutureMissReason::SameExpiryCandidateFlood,
+                expiry: Some(d("2026-07-30")),
             }]
         );
     }
@@ -831,6 +1153,7 @@ mod tests {
             vec![IndexFutureMiss {
                 canonical: "MIDCPNIFTY",
                 reason: IndexFutureMissReason::NoFutRows,
+                expiry: None,
             }]
         );
     }
@@ -843,6 +1166,7 @@ mod tests {
         assert!(sel.misses.contains(&IndexFutureMiss {
             canonical: "NIFTY",
             reason: IndexFutureMissReason::AllExpiriesPast,
+            expiry: None,
         }));
     }
 
@@ -864,6 +1188,7 @@ mod tests {
         assert!(sel.misses.contains(&IndexFutureMiss {
             canonical: "NIFTY",
             reason: IndexFutureMissReason::BadExpiryFormat,
+            expiry: None,
         }));
     }
 
@@ -879,8 +1204,10 @@ mod tests {
     }
 
     proptest::proptest! {
-        /// For random contract soups: result ≤ 4, every chosen row is FUTIDX +
-        /// allowlisted + expiry >= today, and the selector never panics.
+        /// For random contract soups: result ≤ MAX_INDEX_FUTURE_TARGETS,
+        /// every chosen row is FUTIDX + allowlisted + expiry >= today,
+        /// per-canonical chosen expiries are distinct (§36.7), and the
+        /// selector never panics.
         #[test]
         fn arbitrary_contract_sets_never_select_beyond_allowlist(
             rows in proptest::collection::vec(
@@ -915,6 +1242,8 @@ mod tests {
                 .collect();
             let sel = select_index_future_contracts(&csv_rows, today);
             proptest::prop_assert!(sel.chosen.len() <= MAX_INDEX_FUTURE_TARGETS);
+            let mut seen_canonical_expiry: std::collections::HashSet<(String, String)> =
+                std::collections::HashSet::new();
             for row in &sel.chosen {
                 proptest::prop_assert_eq!(&row.instrument, "FUTIDX");
                 let canonical = canonicalize_index_symbol(&row.underlying_symbol);
@@ -926,6 +1255,11 @@ mod tests {
                 let exp = NaiveDate::parse_from_str(&row.expiry_date, "%Y-%m-%d")
                     .expect("chosen row has a parsable expiry");
                 proptest::prop_assert!(exp >= today);
+                // §36.7: at most ONE chosen row per (canonical, expiry).
+                proptest::prop_assert!(
+                    seen_canonical_expiry.insert((canonical, row.expiry_date.clone())),
+                    "duplicate (canonical, expiry) in chosen set"
+                );
             }
         }
     }
@@ -957,25 +1291,104 @@ mod tests {
     }
 
     #[test]
+    fn test_cross_feed_parity_multiple_months_identical_ok() {
+        // §36.7: identical 3-month sets across all 4 canonicals → empty.
+        // Fixes the pre-2026-07-10 `.find()` first-entry comparator bug —
+        // the multi-month Vec must compare as a SET, not by first entry.
+        let months = ["2026-07-30", "2026-08-27", "2026-09-24"];
+        let mut dhan = Vec::new();
+        let mut groww = Vec::new();
+        for (u, base) in [
+            ("NIFTY", 35000),
+            ("BANKNIFTY", 35100),
+            ("MIDCPNIFTY", 35200),
+            ("SENSEX", 45000),
+        ] {
+            for (i, m) in months.iter().enumerate() {
+                dhan.push(feed_sel(u, m, &format!("{}", base + i)));
+                groww.push(feed_sel(u, m, &format!("{}", base + 900 + i)));
+            }
+        }
+        // Order-independence of the set compare: reverse one side.
+        groww.reverse();
+        assert!(compare_index_future_selections(&dhan, &groww).is_empty());
+    }
+
+    #[test]
     fn test_cross_feed_parity_flags_expiry_mismatch() {
+        // Nearest-month divergence → Divergence (pages FUTIDX-02).
         let dhan = vec![feed_sel("NIFTY", "2026-07-30", "35001")];
         let groww = vec![feed_sel("NIFTY", "2026-08-27", "99001")];
         let mismatches = compare_index_future_selections(&dhan, &groww);
         assert_eq!(mismatches.len(), 1);
         assert_eq!(mismatches[0].canonical, "NIFTY");
-        assert_eq!(mismatches[0].dhan_expiry, Some(d("2026-07-30")));
-        assert_eq!(mismatches[0].groww_expiry, Some(d("2026-08-27")));
+        assert_eq!(mismatches[0].dhan_only, vec![d("2026-07-30")]);
+        assert_eq!(mismatches[0].groww_only, vec![d("2026-08-27")]);
+        assert_eq!(mismatches[0].kind, ParityMismatchKind::Divergence);
     }
 
     #[test]
     fn test_cross_feed_parity_flags_one_sided_underlying() {
+        // A whole underlying present on only one feed stays Divergence —
+        // the other feed's set is EMPTY, so this is never depth-only.
         let dhan = vec![feed_sel("SENSEX", "2026-07-31", "45001")];
         let groww: Vec<FeedFutureSelection> = Vec::new();
         let mismatches = compare_index_future_selections(&dhan, &groww);
         assert_eq!(mismatches.len(), 1);
         assert_eq!(mismatches[0].canonical, "SENSEX");
-        assert_eq!(mismatches[0].dhan_expiry, Some(d("2026-07-31")));
-        assert_eq!(mismatches[0].groww_expiry, None);
+        assert_eq!(mismatches[0].dhan_only, vec![d("2026-07-31")]);
+        assert!(mismatches[0].groww_only.is_empty());
+        assert_eq!(mismatches[0].kind, ParityMismatchKind::Divergence);
+    }
+
+    #[test]
+    fn test_cross_feed_parity_far_suffix_is_depth_only() {
+        // §36.7: dhan {Jul,Aug,Sep} vs groww {Jul,Aug} — the one-sided Sep
+        // lies strictly beyond groww's max → DepthOnly (info, never a page).
+        let dhan = vec![
+            feed_sel("NIFTY", "2026-07-30", "35001"),
+            feed_sel("NIFTY", "2026-08-27", "35002"),
+            feed_sel("NIFTY", "2026-09-24", "35003"),
+        ];
+        let groww = vec![
+            feed_sel("NIFTY", "2026-07-30", "99001"),
+            feed_sel("NIFTY", "2026-08-27", "99002"),
+        ];
+        let mismatches = compare_index_future_selections(&dhan, &groww);
+        assert_eq!(mismatches.len(), 1);
+        assert_eq!(mismatches[0].canonical, "NIFTY");
+        assert_eq!(mismatches[0].dhan_only, vec![d("2026-09-24")]);
+        assert!(mismatches[0].groww_only.is_empty());
+        assert_eq!(mismatches[0].kind, ParityMismatchKind::DepthOnly);
+    }
+
+    #[test]
+    fn test_cross_feed_parity_hole_is_divergence() {
+        // §36.7: dhan {Jul,Sep} vs groww {Jul,Aug,Sep} — the one-sided Aug
+        // sits BELOW dhan's max (a HOLE) → Divergence (pages FUTIDX-02).
+        let dhan = vec![
+            feed_sel("NIFTY", "2026-07-30", "35001"),
+            feed_sel("NIFTY", "2026-09-24", "35003"),
+        ];
+        let groww = vec![
+            feed_sel("NIFTY", "2026-07-30", "99001"),
+            feed_sel("NIFTY", "2026-08-27", "99002"),
+            feed_sel("NIFTY", "2026-09-24", "99003"),
+        ];
+        let mismatches = compare_index_future_selections(&dhan, &groww);
+        assert_eq!(mismatches.len(), 1);
+        assert!(mismatches[0].dhan_only.is_empty());
+        assert_eq!(mismatches[0].groww_only, vec![d("2026-08-27")]);
+        assert_eq!(mismatches[0].kind, ParityMismatchKind::Divergence);
+    }
+
+    #[test]
+    fn test_join_dates_renders_sorted_list_and_dash_for_empty() {
+        assert_eq!(join_dates(&[]), "-");
+        assert_eq!(
+            join_dates(&[d("2026-08-27"), d("2026-09-24")]),
+            "2026-08-27,2026-09-24"
+        );
     }
 
     #[test]
@@ -1058,8 +1471,9 @@ mod tests {
         };
         assert_eq!(verdict.len(), 1);
         assert_eq!(verdict[0].canonical, "NIFTY");
-        assert_eq!(verdict[0].dhan_expiry, Some(d("2026-07-30")));
-        assert_eq!(verdict[0].groww_expiry, Some(d("2026-08-27")));
+        assert_eq!(verdict[0].dhan_only, vec![d("2026-07-30")]);
+        assert_eq!(verdict[0].groww_only, vec![d("2026-08-27")]);
+        assert_eq!(verdict[0].kind, ParityMismatchKind::Divergence);
 
         // And the same mismatch THROUGH the pub recorder (executes the
         // error!(FUTIDX-02) emit loop — log/counter noise is expected and

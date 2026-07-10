@@ -29,9 +29,10 @@ use tracing::{info, warn};
 /// Groww master instrument CSV (public static asset, no auth) — re-exported from
 /// `tickvault_common::constants` so the URL lives in the single constants source.
 ///
-/// §36 (2026-07-08): the watch set additionally carries the 4 nearest-expiry
-/// index futures (NIFTY/BANKNIFTY/MIDCPNIFTY on NSE, SENSEX on BSE; segment
-/// FNO, kind=ltp) — selected via the SAME shared never-roll expiry function
+/// §36 (2026-07-08) / §36.7 (2026-07-10): the watch set additionally carries
+/// ALL monthly-expiry index futures of the 4 underlyings
+/// (NIFTY/BANKNIFTY/MIDCPNIFTY on NSE, SENSEX on BSE; segment FNO, kind=ltp)
+/// — selected via the SAME shared never-roll expiry function
 /// the Dhan orchestrator uses (`crate::instrument::index_futures`).
 pub use tickvault_common::constants::GROWW_INSTRUMENT_CSV_URL;
 
@@ -414,9 +415,10 @@ fn extract_index_entries(rows: &[GrowwInstrumentRow]) -> Vec<WatchEntry> {
     entries
 }
 
-/// §36 (2026-07-08): extracts the ≤4 nearest-expiry index-future watch
-/// entries from the Groww master. ISIN-less resolution (FUT rows carry an
-/// empty `isin` — verified `docs/groww-ref/instrument-sample.csv`):
+/// §36 (2026-07-08) / §36.7 (2026-07-10): extracts ALL monthly-expiry
+/// index-future watch entries (one per (underlying, month `>= today`)) from
+/// the Groww master. ISIN-less resolution (FUT rows carry an empty `isin` —
+/// verified `docs/groww-ref/instrument-sample.csv`):
 ///
 /// 1. Filter `instrument_type == "FUT" && segment == "FNO"`.
 /// 2. Match `(row.exchange, canonicalize(row.underlying_symbol))` against
@@ -425,11 +427,14 @@ fn extract_index_entries(rows: &[GrowwInstrumentRow]) -> Vec<WatchEntry> {
 ///    `trading_symbol` regex (naming-drift hazard) and NEVER by
 ///    `underlying_exchange_token` (unverified id space).
 /// 3. Require a numeric `exchange_token` (non-numeric → skip + count).
-/// 4. Per underlying: parse expiry, sort asc, pick via the SAME shared
-///    [`crate::instrument::index_futures::select_index_future_expiry`] — a
-///    Dhan/Groww boundary-rule divergence is structurally impossible.
-/// 5. ≥2 rows at the chosen expiry → fail-closed miss
-///    (`AmbiguousDuplicateExpiry`).
+/// 4. Per underlying: parse expiry, sort asc, dedup, pick ALL via the SAME
+///    shared [`crate::instrument::index_futures::select_index_future_expiries`]
+///    — a Dhan/Groww boundary-rule divergence is structurally impossible;
+///    > [`crate::instrument::index_futures::MAX_MONTHLY_EXPIRIES_PER_UNDERLYING`]
+///    distinct serials → whole-underlying `MonthlySerialFlood` miss.
+/// 5. Per (underlying, month): candidate-flood cap → exact-dup token
+///    collapse → ≥2 TRULY-DISTINCT tokens → fail-closed miss for THAT month
+///    only (`AmbiguousDuplicateExpiry` / `SameExpiryCandidateFlood`).
 ///
 /// Misses are returned; the caller pages FUTIDX-01 (feed=groww) — degrade,
 /// the watch build stays valid. Cold path, once per activation.
@@ -452,7 +457,7 @@ pub fn extract_index_future_entries(
     use crate::instrument::index_extractor::canonicalize_index_symbol;
     use crate::instrument::index_futures::{
         INDEX_FUTURES_UNDERLYINGS, IndexFutureMiss, IndexFutureMissReason,
-        select_index_future_expiry,
+        select_index_future_expiries,
     };
 
     let mut entries: Vec<GrowwIndexFuture> = Vec::new();
@@ -493,75 +498,102 @@ pub fn extract_index_future_entries(
                 } else {
                     IndexFutureMissReason::NoFutRows
                 },
+                expiry: None,
             });
             continue;
         }
         candidates.sort_by_key(|(d, _)| *d);
-        let dates: Vec<chrono::NaiveDate> = candidates.iter().map(|(d, _)| *d).collect();
-        let Some(chosen) = select_index_future_expiry(&dates, today_ist) else {
+        // §36.7 (2026-07-10): the SERIAL count is distinct-keyed — duplicate
+        // rows at one expiry are handled per-month below.
+        let mut dates: Vec<chrono::NaiveDate> = candidates.iter().map(|(d, _)| *d).collect();
+        dates.dedup();
+        let expiries = select_index_future_expiries(&dates, today_ist);
+        if expiries.is_empty() {
             misses.push(IndexFutureMiss {
                 canonical: target.canonical,
                 reason: IndexFutureMissReason::AllExpiriesPast,
-            });
-            continue;
-        };
-        let at_chosen: Vec<&GrowwInstrumentRow> = candidates
-            .iter()
-            .filter(|(d, _)| *d == chosen)
-            .map(|(_, r)| *r)
-            .collect();
-        // Hostile-review round 3 (2026-07-08): envelope cap FIRST — mirror of
-        // the Dhan selector; a same-(underlying, expiry) candidate flood
-        // beyond the cap is corrupt vendor data and degrades fail-closed.
-        if at_chosen.len() > crate::instrument::index_futures::FUTIDX_SAME_EXPIRY_CANDIDATE_CAP {
-            misses.push(IndexFutureMiss {
-                canonical: target.canonical,
-                reason: IndexFutureMissReason::SameExpiryCandidateFlood,
+                expiry: None,
             });
             continue;
         }
-        // Hostile-review round 2 (2026-07-08): collapse vendor-glitch
-        // EXACT-duplicate master lines (SAME `exchange_token` at the chosen
-        // expiry) first-row-wins BEFORE the ambiguity count — mirror of the
-        // Dhan-side SECURITY_ID dedup in `select_index_future_contracts`.
-        // Only TRULY-DISTINCT tokens at the same expiry stay fail-closed.
-        // Round 3: HashSet-based O(n) dedup (was an O(n²) scan) — keyed on
-        // the bare `exchange_token`, I-P1-11-SAFE HERE because every row in
-        // `at_chosen` is FNO-segment FUT for ONE underlying/exchange by
-        // construction (single-segment set).
-        let mut seen_tokens: std::collections::HashSet<&str> =
-            std::collections::HashSet::with_capacity(at_chosen.len());
-        let mut distinct: Vec<&GrowwInstrumentRow> = Vec::with_capacity(at_chosen.len());
-        for row in &at_chosen {
-            if seen_tokens.insert(row.exchange_token.as_str()) {
-                distinct.push(row);
+        // §36.7 serial-flood envelope: more distinct future expiries than a
+        // legitimate master can list = corrupt/flooded file → the WHOLE
+        // underlying degrades fail-closed (never truncated-and-trusted) —
+        // this also bounds the cap-priority prefix so a flooded master can
+        // never eat the 1000-cap spot universe.
+        if expiries.len() > crate::instrument::index_futures::MAX_MONTHLY_EXPIRIES_PER_UNDERLYING {
+            misses.push(IndexFutureMiss {
+                canonical: target.canonical,
+                reason: IndexFutureMissReason::MonthlySerialFlood,
+                expiry: None,
+            });
+            continue;
+        }
+        for chosen in expiries {
+            let at_chosen: Vec<&GrowwInstrumentRow> = candidates
+                .iter()
+                .filter(|(d, _)| *d == chosen)
+                .map(|(_, r)| *r)
+                .collect();
+            // Hostile-review round 3 (2026-07-08): envelope cap FIRST — mirror of
+            // the Dhan selector; a same-(underlying, expiry) candidate flood
+            // beyond the cap is corrupt vendor data and degrades fail-closed
+            // (§36.7: per-MONTH — the other months of this underlying still
+            // process).
+            if at_chosen.len() > crate::instrument::index_futures::FUTIDX_SAME_EXPIRY_CANDIDATE_CAP
+            {
+                misses.push(IndexFutureMiss {
+                    canonical: target.canonical,
+                    reason: IndexFutureMissReason::SameExpiryCandidateFlood,
+                    expiry: Some(chosen),
+                });
+                continue;
             }
-        }
-        if distinct.len() > 1 {
-            misses.push(IndexFutureMiss {
+            // Hostile-review round 2 (2026-07-08): collapse vendor-glitch
+            // EXACT-duplicate master lines (SAME `exchange_token` at the chosen
+            // expiry) first-row-wins BEFORE the ambiguity count — mirror of the
+            // Dhan-side SECURITY_ID dedup in `select_index_future_contracts`.
+            // Only TRULY-DISTINCT tokens at the same expiry stay fail-closed
+            // (per-MONTH, §36.7). Round 3: HashSet-based O(n) dedup (was an
+            // O(n²) scan) — keyed on the bare `exchange_token`,
+            // I-P1-11-SAFE HERE because every row in `at_chosen` is
+            // FNO-segment FUT for ONE underlying/exchange by construction
+            // (single-segment set).
+            let mut seen_tokens: std::collections::HashSet<&str> =
+                std::collections::HashSet::with_capacity(at_chosen.len());
+            let mut distinct: Vec<&GrowwInstrumentRow> = Vec::with_capacity(at_chosen.len());
+            for row in &at_chosen {
+                if seen_tokens.insert(row.exchange_token.as_str()) {
+                    distinct.push(row);
+                }
+            }
+            if distinct.len() > 1 {
+                misses.push(IndexFutureMiss {
+                    canonical: target.canonical,
+                    reason: IndexFutureMissReason::AmbiguousDuplicateExpiry,
+                    expiry: Some(chosen),
+                });
+                continue;
+            }
+            let r = distinct[0];
+            let security_id = r.exchange_token.parse::<i64>().unwrap_or(0);
+            entries.push(GrowwIndexFuture {
+                entry: WatchEntry {
+                    exchange: r.exchange.clone(),
+                    segment: "FNO".to_string(),
+                    exchange_token: r.exchange_token.clone(),
+                    kind: WatchKind::Ltp,
+                    security_id,
+                    isin: None, // FUT rows are ISIN-less by design
+                    symbol_name: Some(r.groww_symbol.clone()),
+                    index_name: None,
+                    expiry_date: Some(chosen.format("%Y-%m-%d").to_string()),
+                    underlying_symbol: Some(target.canonical.to_string()),
+                },
                 canonical: target.canonical,
-                reason: IndexFutureMissReason::AmbiguousDuplicateExpiry,
+                expiry: chosen,
             });
-            continue;
         }
-        let r = distinct[0];
-        let security_id = r.exchange_token.parse::<i64>().unwrap_or(0);
-        entries.push(GrowwIndexFuture {
-            entry: WatchEntry {
-                exchange: r.exchange.clone(),
-                segment: "FNO".to_string(),
-                exchange_token: r.exchange_token.clone(),
-                kind: WatchKind::Ltp,
-                security_id,
-                isin: None, // FUT rows are ISIN-less by design
-                symbol_name: Some(r.groww_symbol.clone()),
-                index_name: None,
-                expiry_date: Some(chosen.format("%Y-%m-%d").to_string()),
-                underlying_symbol: Some(target.canonical.to_string()),
-            },
-            canonical: target.canonical,
-            expiry: chosen,
-        });
     }
     (entries, misses)
 }
@@ -703,10 +735,11 @@ fn resolve_stock_entries(
 /// Assembles the final watch set: enforces the 2% NTM tolerance, dedups by
 /// `(exchange_token, segment)` (I-P1-11 analogue), checks the `[100,1200]`
 /// envelope on the TRUE resolved size, then applies the optional deterministic
-/// `max_subscribe` first-run cap. Cap-priority order: §36 futures FIRST
-/// (≤4, operator-mandated — must survive the prefix truncate), then indices
-/// (small + high value), then stocks by token ascending. `max_subscribe` is
-/// also clamped to the Groww 1000-subscription hard cap.
+/// `max_subscribe` first-run cap. Cap-priority order: §36/§36.7 futures FIRST
+/// (all monthly serials, operator-mandated — must survive the prefix
+/// truncate), then indices (small + high value), then stocks by token
+/// ascending. `max_subscribe` is also clamped to the Groww 1000-subscription
+/// hard cap.
 fn assemble_watch_set(
     index_entries: Vec<WatchEntry>,
     stock_entries: Vec<WatchEntry>,
@@ -737,9 +770,10 @@ fn assemble_watch_set(
     let mut seen: std::collections::HashSet<(String, String, String)> =
         std::collections::HashSet::new();
     let mut deduped: Vec<WatchEntry> = Vec::new();
-    // §36: the ≤4 operator-mandated futures are PREPENDED (cap-priority) —
-    // the live-subscribe cap below is a prefix truncate, so futures must
-    // never be the first rows dropped under universe growth (hostile-review
+    // §36/§36.7: the operator-mandated monthly futures (cap-priority, ALL of
+    // them — ~12 typical, ≤24 by the serial envelope) are PREPENDED — the
+    // live-subscribe cap below is a prefix truncate, so futures must never
+    // be the first rows dropped under universe growth (hostile-review
     // round 1, 2026-07-08: appended-last futures were silently truncated
     // first while the gauge still reported 4). The dedup key includes
     // `segment`, so an FNO future can never steal a CASH/index slot.
@@ -900,7 +934,8 @@ fn build_groww_watch_from_csvs(
     let ntm_total = ntm.len();
     let (stock_entries, unresolved) = resolve_stock_entries(&ntm, &isin_map);
 
-    // §36 (2026-07-08): the 4 nearest-expiry index futures. DEGRADE ONLY —
+    // §36/§36.7 (2026-07-10): ALL monthly-expiry index futures of the 4
+    // underlyings. DEGRADE ONLY —
     // a miss pages FUTIDX-01 (feed=groww) and the watch build stays valid.
     // Feature-gated because the shared selector lives with the Dhan
     // instrument modules; the feature is default-ON in the app crate.
@@ -976,9 +1011,13 @@ fn build_groww_watch_from_csvs(
                     feed = "groww",
                     underlying = miss.canonical,
                     reason = ?miss.reason,
+                    expiry = %miss
+                        .expiry
+                        .map(|d| d.to_string())
+                        .unwrap_or_else(|| "ALL".into()),
                     candidates_seen = ?candidates_seen,
                     "index-future selection degraded — the Groww watch set runs WITHOUT that \
-                     future today; cash/index build unaffected"
+                     future (or that month) today; cash/index build unaffected"
                 );
                 metrics::counter!(
                     "tv_index_futures_selection_missing_total",
@@ -1031,8 +1070,9 @@ fn build_groww_watch_from_csvs(
                 expected = expected_futures,
                 live = live_futures,
                 "index-future(s) dropped from the LIVE subscribe set by the subscription cap — \
-                 the §36 futures are cap-priority (prepended), so this fires only under a \
-                 sub-4 operator cap override; master tables still carry the full selection"
+                 the §36 futures are cap-priority (prepended), so this fires only when an \
+                 operator cap override drops a mandated future; master tables still carry the \
+                 full selection"
             );
             metrics::counter!("tv_index_futures_cap_dropped_total", "feed" => "groww")
                 .increment((expected_futures - live_futures) as u64);
@@ -1046,7 +1086,8 @@ fn build_groww_watch_from_csvs(
 /// Distinct-(exchange, token, segment) count over the selected future
 /// entries — the SAME composite key `assemble_watch_set` dedups on, so the
 /// cap-drop check's `expected` can never be inflated by an exact-duplicate
-/// token (hostile-review round 2, 2026-07-08). O(n²) over ≤4 entries.
+/// token (hostile-review round 2, 2026-07-08). O(n²) over ≤24 entries
+/// (§36.7 envelope) — trivially fine on the cold path.
 fn distinct_future_key_count(entries: &[WatchEntry]) -> usize {
     let mut distinct: Vec<(&str, &str, &str)> = Vec::with_capacity(entries.len());
     for e in entries {
@@ -1276,7 +1317,7 @@ pub async fn build_and_write_groww_watch(
     );
     info!("groww watch: downloading NIFTY-Total-Market constituent list");
     let ntm_csv = fetch_text_hardened(&client, &ntm_url).await?;
-    // §36: the SAME validated IST trading date drives the nearest-expiry
+    // §36/§36.7: the SAME validated IST trading date drives the all-months
     // futures selection (already strict-format-checked above).
     let today_ist = chrono::NaiveDate::parse_from_str(trading_date_ist, "%Y-%m-%d")
         .map_err(|e| WatchBuildError::WriteFailed(format!("trading_date parse: {e}")))?;
@@ -1723,25 +1764,23 @@ mod tests {
 
     #[test]
     fn test_assemble_cap_pressure_keeps_all_futures_in_live_set() {
-        // Hostile-review round 1 (2026-07-08) regression: universe ≥ the
-        // 1000 hard cap → the §36 futures MUST survive the prefix truncate
-        // (pre-fix they were appended LAST and silently dropped FIRST while
-        // the pre-cap gauge still reported 4).
+        // Hostile-review round 1 (2026-07-08) regression, extended §36.7:
+        // universe ≥ the 1000 hard cap → ALL monthly §36 futures (3 months
+        // × 4 underlyings here) MUST survive the prefix truncate (pre-fix
+        // they were appended LAST and silently dropped FIRST while the
+        // pre-cap gauge still reported the full count).
         let stocks: Vec<WatchEntry> = (0..1100).map(|i| stock_entry(&format!("{i:05}"))).collect();
-        let futures: Vec<WatchEntry> = vec![
-            future_entry("61001"),
-            future_entry("61002"),
-            future_entry("61003"),
-            future_entry("71001"),
-        ];
+        let futures: Vec<WatchEntry> = (0..12)
+            .map(|i| future_entry(&format!("{}", 61_001 + i)))
+            .collect();
         let set = assemble_watch_set(vec![], stocks, futures, vec![], 1100, None).unwrap();
         assert_eq!(set.entries.len(), GROWW_MAX_SUBSCRIPTIONS, "hard cap");
         let live_futures = set.entries.iter().filter(|e| e.segment == "FNO").count();
-        assert_eq!(live_futures, 4, "all 4 §36 futures survive cap pressure");
+        assert_eq!(live_futures, 12, "all §36.7 futures survive cap pressure");
         // Cap-priority: the futures are the deterministic PREFIX.
-        assert!(set.entries[..4].iter().all(|e| e.segment == "FNO"));
-        // Master carries the full pre-cap universe (1104).
-        assert_eq!(set.master_entries.len(), 1104);
+        assert!(set.entries[..12].iter().all(|e| e.segment == "FNO"));
+        // Master carries the full pre-cap universe (1112).
+        assert_eq!(set.master_entries.len(), 1112);
     }
 
     /// Hostile-review round 2 (2026-07-08, F3): `expected_futures` for the
@@ -2247,9 +2286,9 @@ mod tests {
 
     #[cfg(feature = "daily_universe_fetcher")]
     #[test]
-    fn test_extract_index_future_entries_picks_nearest_expiry_four_underlyings() {
-        // 2 expiries per underlying → 4 entries, kind=ltp, segment=FNO,
-        // numeric tokens, NEAREST chosen.
+    fn test_extract_index_future_entries_takes_all_months_four_underlyings() {
+        // §36.7: 2 expiries per underlying → 8 entries (BOTH months per
+        // canonical), kind=ltp, segment=FNO, numeric tokens.
         let csv = format!(
             "{HEADER}\n{}{}",
             fut_rows_all_four("2026-08-27"),
@@ -2264,13 +2303,25 @@ mod tests {
         let rows = parse_groww_master(&csv).expect("parse");
         let (entries, misses) = extract_index_future_entries(&rows, groww_test_today());
         assert!(misses.is_empty(), "misses: {misses:?}");
-        assert_eq!(entries.len(), 4);
+        assert_eq!(entries.len(), 8, "all months × all underlyings (§36.7)");
+        for canonical in ["NIFTY", "BANKNIFTY", "MIDCPNIFTY", "SENSEX"] {
+            let mut expiries: Vec<&str> = entries
+                .iter()
+                .filter(|f| f.canonical == canonical)
+                .filter_map(|f| f.entry.expiry_date.as_deref())
+                .collect();
+            expiries.sort_unstable();
+            assert_eq!(
+                expiries,
+                vec!["2026-07-30", "2026-08-27"],
+                "{canonical}: both months kept"
+            );
+        }
         for f in &entries {
             let e = &f.entry;
             assert_eq!(e.kind, WatchKind::Ltp);
             assert_eq!(e.segment, "FNO");
             assert!(e.exchange_token.parse::<i64>().is_ok(), "numeric token");
-            assert_eq!(e.expiry_date.as_deref(), Some("2026-07-30"), "nearest");
         }
     }
 
@@ -2322,7 +2373,8 @@ mod tests {
     #[cfg(feature = "daily_universe_fetcher")]
     #[test]
     fn test_extract_index_future_entries_missing_underlying_degrades() {
-        // Only 3 of 4 present → 3 entries + 1 miss; build stays valid.
+        // Only 3 of 4 present → 3 entries + 1 whole-underlying miss
+        // (expiry: None); build stays valid.
         let csv = format!(
             "{HEADER}\n{}\n{}\n{}\n",
             fut_row("NSE", "61001", "NIFTY", "2026-07-30"),
@@ -2334,25 +2386,33 @@ mod tests {
         assert_eq!(entries.len(), 3);
         assert_eq!(misses.len(), 1);
         assert_eq!(misses[0].canonical, "MIDCPNIFTY");
+        assert_eq!(misses[0].expiry, None, "whole-underlying miss");
     }
 
     #[cfg(feature = "daily_universe_fetcher")]
     #[test]
     fn test_extract_index_future_entries_ambiguous_duplicate_fails_closed() {
         // Two NIFTY FUT rows at the SAME chosen expiry, different tokens →
-        // fail-closed miss (never guess a token).
+        // fail-closed miss for THAT MONTH (never guess a token); the clean
+        // second month of the SAME underlying IS kept (§36.7 per-month
+        // degrade).
         let csv = format!(
-            "{HEADER}\n{}\n{}\n",
+            "{HEADER}\n{}\n{}\n{}\n",
             fut_row("NSE", "61001", "NIFTY", "2026-07-30"),
             fut_row("NSE", "61099", "NIFTY", "2026-07-30"),
+            fut_row("NSE", "62001", "NIFTY", "2026-08-27"),
         );
         let rows = parse_groww_master(&csv).expect("parse");
         let (entries, misses) = extract_index_future_entries(&rows, groww_test_today());
-        assert!(entries.is_empty());
+        assert_eq!(entries.len(), 1, "only the clean August month survives");
+        assert_eq!(entries[0].entry.exchange_token, "62001");
+        assert_eq!(entries[0].entry.expiry_date.as_deref(), Some("2026-08-27"));
         assert!(misses.iter().any(|m| {
             m.canonical == "NIFTY"
                 && m.reason
                     == crate::instrument::index_futures::IndexFutureMissReason::AmbiguousDuplicateExpiry
+                && m.expiry
+                    == chrono::NaiveDate::from_ymd_opt(2026, 7, 30)
         }));
     }
 
@@ -2394,22 +2454,75 @@ mod tests {
             csv.push_str(&fut_row("NSE", &format!("9{i:04}"), "NIFTY", "2026-07-30"));
             csv.push('\n');
         }
+        // A CLEAN second NIFTY month — §36.7 per-month degrade keeps it.
+        csv.push_str(&fut_row("NSE", "62001", "NIFTY", "2026-08-27"));
+        csv.push('\n');
         let rows = parse_groww_master(&csv).expect("parse");
         let (entries, misses) = extract_index_future_entries(&rows, groww_test_today());
-        assert_eq!(entries.len(), 3, "NIFTY dropped fail-closed");
-        assert!(entries.iter().all(|f| f.canonical != "NIFTY"));
+        assert!(
+            entries.iter().all(|f| !(f.canonical == "NIFTY"
+                && f.entry.expiry_date.as_deref() == Some("2026-07-30"))),
+            "the flooded NIFTY July dropped fail-closed"
+        );
+        assert!(
+            entries
+                .iter()
+                .any(|f| f.canonical == "NIFTY"
+                    && f.entry.expiry_date.as_deref() == Some("2026-08-27")),
+            "§36.7 per-month degrade: the clean second month IS kept"
+        );
+        assert_eq!(entries.len(), 4, "3 others + NIFTY August");
         assert!(misses.iter().any(|m| {
             m.canonical == "NIFTY"
                 && m.reason
                     == crate::instrument::index_futures::IndexFutureMissReason::SameExpiryCandidateFlood
+                && m.expiry == chrono::NaiveDate::from_ymd_opt(2026, 7, 30)
+        }));
+    }
+
+    /// §36.7: more distinct future expiries than the envelope allows =
+    /// corrupt/flooded master → the WHOLE underlying degrades fail-closed;
+    /// the other 3 underlyings are intact.
+    #[cfg(feature = "daily_universe_fetcher")]
+    #[test]
+    fn test_extract_monthly_serial_flood_degrades_whole_underlying() {
+        use crate::instrument::index_futures::IndexFutureMissReason;
+        let mut csv = format!("{HEADER}\n{}", fut_rows_all_four("2026-07-30"));
+        // 6 EXTRA NIFTY months → 7 distinct future expiries for NIFTY.
+        for (i, exp) in [
+            "2026-08-27",
+            "2026-09-24",
+            "2026-10-29",
+            "2026-11-26",
+            "2026-12-31",
+            "2027-01-28",
+        ]
+        .iter()
+        .enumerate()
+        {
+            csv.push_str(&fut_row("NSE", &format!("63{i:03}"), "NIFTY", exp));
+            csv.push('\n');
+        }
+        let rows = parse_groww_master(&csv).expect("parse");
+        let (entries, misses) = extract_index_future_entries(&rows, groww_test_today());
+        assert!(
+            entries.iter().all(|f| f.canonical != "NIFTY"),
+            "zero NIFTY entries — whole underlying fail-closed"
+        );
+        assert_eq!(entries.len(), 3, "the other 3 underlyings intact");
+        assert!(misses.iter().any(|m| {
+            m.canonical == "NIFTY"
+                && m.reason == IndexFutureMissReason::MonthlySerialFlood
+                && m.expiry.is_none()
         }));
     }
 
     #[cfg(feature = "daily_universe_fetcher")]
     #[test]
     fn test_extract_index_future_entries_never_rolls_on_expiry_day() {
-        // T-0: today == the near expiry → the EXPIRING contract stays chosen
-        // (proves the SHARED chooser is used, not a re-implementation).
+        // T-0: today == the near expiry → the EXPIRING month stays chosen
+        // ALONGSIDE the next month (§36.7; proves the SHARED chooser is
+        // used, not a re-implementation).
         let csv = format!(
             "{HEADER}\n{}\n{}\n",
             fut_row("NSE", "61001", "NIFTY", "2026-07-30"),
@@ -2421,20 +2534,29 @@ mod tests {
         // Only NIFTY rows exist in this fixture — the other 3 degrade.
         assert_eq!(misses.len(), 3);
         assert!(misses.iter().all(|m| m.canonical != "NIFTY"));
-        assert_eq!(entries.len(), 1);
-        assert_eq!(
-            entries[0].entry.exchange_token, "61001",
-            "T-0 keeps expiring"
+        assert_eq!(entries.len(), 2, "expiring month + next month (§36.7)");
+        assert!(
+            entries.iter().any(|f| {
+                f.entry.exchange_token == "61001"
+                    && f.entry.expiry_date.as_deref() == Some("2026-07-30")
+            }),
+            "T-0 keeps the expiring month — the never-roll invariant"
         );
-        assert_eq!(entries[0].entry.expiry_date.as_deref(), Some("2026-07-30"));
+        assert!(
+            entries
+                .iter()
+                .any(|f| f.entry.expiry_date.as_deref() == Some("2026-08-27")),
+            "the next month is ALSO present"
+        );
     }
 
     #[cfg(feature = "daily_universe_fetcher")]
     #[test]
-    fn test_watch_set_includes_exactly_4_fno_futures() {
-        // End-to-end: indices + stocks + exactly 4 FNO futures; a CASH stock
-        // whose numeric token equals a future's token stays distinct (the
-        // dedup key includes segment); envelope + 1000-cap green.
+    fn test_watch_set_includes_every_monthly_fno_future() {
+        // End-to-end (§36.7): indices + stocks + 2 months × 4 FNO futures;
+        // a CASH stock whose numeric token equals a future's token stays
+        // distinct (the dedup key includes segment); envelope + 1000-cap
+        // green.
         let mut groww = format!("{HEADER}\n{}\n", idx_row("NIFTY"));
         let mut ntm = String::from("Company Name,Industry,Symbol,Series,ISIN Code\n");
         for i in 0..120 {
@@ -2447,10 +2569,18 @@ mod tests {
         groww.push_str(&format!("{}\n", eq_row("61001", "INE999999999")));
         ntm.push_str("CoX,Ind,SYMX,EQ,INE999999999\n");
         groww.push_str(&fut_rows_all_four("2026-07-30"));
+        // The August wave with distinct tokens.
+        groww.push_str(
+            &fut_rows_all_four("2026-08-27")
+                .replacen("61001", "62001", 1)
+                .replacen("61002", "62002", 1)
+                .replacen("61003", "62003", 1)
+                .replacen("71001", "72001", 1),
+        );
         let set =
             build_groww_watch_from_csvs(&groww, &ntm, None, groww_test_today()).expect("build ok");
         let fno: Vec<&WatchEntry> = set.entries.iter().filter(|e| e.segment == "FNO").collect();
-        assert_eq!(fno.len(), 4, "exactly 4 FNO futures");
+        assert_eq!(fno.len(), 8, "every monthly FNO future (2 months × 4)");
         assert!(fno.iter().all(|e| e.kind == WatchKind::Ltp));
         // The colliding CASH token survives alongside the FNO token.
         let colliding: Vec<&WatchEntry> = set
@@ -2459,8 +2589,8 @@ mod tests {
             .filter(|e| e.exchange_token == "61001")
             .collect();
         assert_eq!(colliding.len(), 2, "CASH + FNO with same token both kept");
-        // 1 index + 121 stocks + 4 futures.
-        assert_eq!(set.entries.len(), 126);
+        // 1 index + 121 stocks + 8 futures.
+        assert_eq!(set.entries.len(), 130);
         assert_eq!(set.resolved_stocks, 121);
         assert_eq!(set.indices, 1);
     }

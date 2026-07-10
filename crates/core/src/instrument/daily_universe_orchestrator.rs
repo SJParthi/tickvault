@@ -258,10 +258,12 @@ pub fn build_universe_from_bytes(
     // master-only — they NEVER enter `subscription_targets`.
     let fno_contracts = collect_applicable_fno_contracts(&rows, &fno);
 
-    // Step 3d — §36 (2026-07-08): select the ≤4 nearest-expiry FUTIDX rows
+    // Step 3d — §36/§36.7 (2026-07-10): select the all-months FUTIDX rows
     // from the already-collected contracts. DEGRADE ONLY — never an
     // orchestrator `Err` (the §4 fail-closed contract stays on the CSV, not
-    // on the futures overlay). Every miss pages FUTIDX-01 per underlying.
+    // on the futures overlay). Every miss pages FUTIDX-01: whole-underlying
+    // (expiry = "ALL") or a single month (expiry = the date) — labels stay
+    // static per-underlying; the month lives in the payload only.
     let futures_sel = select_index_future_contracts(&fno_contracts, today_ist);
     for miss in &futures_sel.misses {
         tracing::error!(
@@ -269,9 +271,13 @@ pub fn build_universe_from_bytes(
             feed = "dhan",
             underlying = miss.canonical,
             reason = ?miss.reason,
+            expiry = %miss
+                .expiry
+                .map(|d| d.to_string())
+                .unwrap_or_else(|| "ALL".into()),
             candidates_seen = ?futures_sel.fut_underlying_symbols_seen,
-            "index-future selection degraded — this feed runs WITHOUT that future today; \
-             spot universe unaffected"
+            "index-future selection degraded — this feed runs WITHOUT that future (or that \
+             month) today; spot universe unaffected"
         );
         metrics::counter!(
             "tv_index_futures_selection_missing_total",
@@ -403,21 +409,27 @@ mod tests {
                 38000 + i
             ));
         }
-        // The §36 FUTIDX rows — 3 NSE_FNO + 1 BSE_FNO, nearest expiry.
+        // The §36.7 FUTIDX rows — 3 NSE_FNO + 1 BSE_FNO, TWO months each
+        // (all monthly serials enter under the 2026-07-10 grant).
         s.push_str("61001,NSE,NSE_FNO,FUTIDX,NIFTY26JULFUT,26000,NIFTY,2026-07-30\n");
         s.push_str("61002,NSE,NSE_FNO,FUTIDX,BANKNIFTY26JULFUT,26009,BANKNIFTY,2026-07-30\n");
         s.push_str("61003,NSE,NSE_FNO,FUTIDX,MIDCPNIFTY26JULFUT,26074,MIDCPNIFTY,2026-07-30\n");
         s.push_str("71001,BSE,BSE_FNO,FUTIDX,SENSEX26JULFUT,1,SENSEX,2026-07-30\n");
+        s.push_str("62001,NSE,NSE_FNO,FUTIDX,NIFTY26AUGFUT,26000,NIFTY,2026-08-27\n");
+        s.push_str("62002,NSE,NSE_FNO,FUTIDX,BANKNIFTY26AUGFUT,26009,BANKNIFTY,2026-08-27\n");
+        s.push_str("62003,NSE,NSE_FNO,FUTIDX,MIDCPNIFTY26AUGFUT,26074,MIDCPNIFTY,2026-08-27\n");
+        s.push_str("72001,BSE,BSE_FNO,FUTIDX,SENSEX26AUGFUT,1,SENSEX,2026-08-27\n");
         let universe = build_universe_from_bytes(s.as_bytes(), None, test_today()).expect("build");
         use crate::instrument::daily_universe::InstrumentRole;
         assert_eq!(
             universe.count_by_role(InstrumentRole::IndexFuture),
-            4,
-            "all 4 §36 FUTIDX contracts enter the subscription targets"
+            8,
+            "ALL §36.7 monthly FUTIDX contracts (2 months × 4 underlyings) enter the \
+             subscription targets"
         );
-        // 30 NSE + 1 SENSEX + 100 underlyings + 4 futures.
-        assert_eq!(universe.total_count(), 135);
-        // The chosen rows are the exact FUTIDX SIDs (nearest expiry).
+        // 30 NSE + 1 SENSEX + 100 underlyings + 8 futures.
+        assert_eq!(universe.total_count(), 139);
+        // The chosen rows are the exact FUTIDX SIDs (both months).
         let mut futidx_sids: Vec<&str> = universe
             .subscription_targets
             .iter()
@@ -425,30 +437,40 @@ mod tests {
             .map(|t| t.csv_row.security_id.as_str())
             .collect();
         futidx_sids.sort_unstable();
-        assert_eq!(futidx_sids, vec!["61001", "61002", "61003", "71001"]);
+        assert_eq!(
+            futidx_sids,
+            vec![
+                "61001", "61002", "61003", "62001", "62002", "62003", "71001", "72001"
+            ]
+        );
 
         // Hostile-review round 2 (2026-07-08, F4): the shared warm/cold
-        // recording helper derives the SAME 4 exact-canonical selections from
+        // recording helper derives the SAME 8 exact-canonical selections from
         // the BUILT universe — this is what the §29 warm-snapshot boot path
         // replays, so warm parity/evidence provably match the cold path.
         let sels = super::super::index_futures::dhan_selections_from_universe(&universe);
-        let mut canonicals: Vec<&str> = sels.iter().map(|s| s.canonical).collect();
-        canonicals.sort_unstable();
-        assert_eq!(
-            canonicals,
-            vec!["BANKNIFTY", "MIDCPNIFTY", "NIFTY", "SENSEX"]
-        );
-        assert!(
-            sels.iter()
-                .all(|s| s.expiry == chrono::NaiveDate::from_ymd_opt(2026, 7, 30).expect("d")),
-            "expiry carried verbatim from the built universe"
-        );
-        let sensex = sels
+        assert_eq!(sels.len(), 8, "one selection per contract (§36.7)");
+        let jul = chrono::NaiveDate::from_ymd_opt(2026, 7, 30).expect("d");
+        let aug = chrono::NaiveDate::from_ymd_opt(2026, 8, 27).expect("d");
+        for canonical in ["NIFTY", "BANKNIFTY", "MIDCPNIFTY", "SENSEX"] {
+            let mut expiries: Vec<chrono::NaiveDate> = sels
+                .iter()
+                .filter(|s| s.canonical == canonical)
+                .map(|s| s.expiry)
+                .collect();
+            expiries.sort_unstable();
+            assert_eq!(
+                expiries,
+                vec![jul, aug],
+                "{canonical}: both months recorded"
+            );
+        }
+        let sensex_jul = sels
             .iter()
-            .find(|s| s.canonical == "SENSEX")
-            .expect("sensex");
-        assert_eq!(sensex.segment, "BSE_FNO");
-        assert_eq!(sensex.native_id, "71001");
+            .find(|s| s.canonical == "SENSEX" && s.expiry == jul)
+            .expect("sensex jul");
+        assert_eq!(sensex_jul.segment, "BSE_FNO");
+        assert_eq!(sensex_jul.native_id, "71001");
     }
 
     #[test]
