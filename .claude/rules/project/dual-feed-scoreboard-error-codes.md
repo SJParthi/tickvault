@@ -79,19 +79,30 @@ the month restart count under-counts — annotate the month summary.
    existing `run_partial=false` (evidence-backed) episode row with a
    `run_partial=true` re-classification, keeping the original verdict and
    logging `stage="blame_regression"`. Round 4 (2026-07-10): evidence
-   completeness is HORIZON-aware — a target day past the ~48h retention
-   is treated as partial evidence even when every retained file opened
-   cleanly (I/O success alone previously bypassed both `run_partial` and
-   the guard). If the guard's own read fails
+   completeness is HORIZON-aware — a target day past the retention
+   horizon is treated as partial evidence even when every retained file
+   opened cleanly (I/O success alone previously bypassed both
+   `run_partial` and the guard). Round 5 (2026-07-10) tightened the
+   horizon to YESTERDAY (`ERRORS_JSONL_EVIDENCE_RETENTION_DAYS = 1`):
+   the sweep is 48h by file MTIME, so only yesterday's 24 hourly files
+   are guaranteed alive at any instant of today — a 2-day-old target's
+   session-hour files are already swept for any run after ~10:00, and
+   the old `2` let exactly that backfill claim complete evidence and
+   destructively re-stamp evidence-backed blame. If the guard's own read fails
    (`stage="keep_better_read"`), it is OFF for that run — re-run stale
    days only with a healthy QuestDB read side. The DAILY row has its own
-   keep-better (round 4): a rerun can never erase an existing
-   `outcome='degraded'` verdict (`stage="outcome_regression"` names a
-   suppressed erase; `stage="outcome_keep_better_read"` = that guard's
-   read failed and it is OFF for the run). A post-trigger same-day boot
-   whose day already carries complete rows for BOTH feeds SKIPS the
-   redundant rerun + duplicate card (a forced `TICKVAULT_SCOREBOARD_NOW`
-   run still overrides). What a backfill CANNOT
+   keep-better (round 4; extended round 5): a rerun can never erase an
+   existing `outcome='degraded'` verdict, and a rerun that re-measured
+   ZERO ticks can never upgrade an existing `outcome='feed_off'` row to
+   complete-with-zeros (the evening re-enable-for-tomorrow rerun shape;
+   real measured ticks may upgrade) — `stage="outcome_regression"` names
+   a suppressed erase; `stage="outcome_keep_better_read"` = the guards'
+   shared read failed and both are OFF for the run. A post-trigger
+   same-day boot whose day already carries a TERMINAL row for BOTH feeds
+   — `complete` OR `feed_off` (round 5: complete-on-both left the latch
+   permanently dead on single-feed profiles) — SKIPS the redundant rerun
+   + duplicate card (a forced `TICKVAULT_SCOREBOARD_NOW` run still
+   overrides). What a backfill CANNOT
    recover is in `docs/runbooks/dual-feed-scoreboard.md`
    (same-day errors.jsonl correlation ages out after 48h → 805 episodes
    default broker, RSTs default indeterminate; boot-reconciled
@@ -102,12 +113,21 @@ the month restart count under-counts — annotate the month summary.
 4. `outcome='degraded'` days (audit under-count): treat the day's episode
    counts as a floor, not a truth — the runbook's month-end checklist
    excludes/annotates them.
-5. `outcome='feed_off'` days (round 4, 2026-07-10): the feed was switched
-   off for the day (zero up-kind connection rows + measured-zero ticks;
-   same-day runs additionally consult the runtime enabled flag so an
-   ENABLED-but-dead-broker day is never softened into feed_off). The card
-   says "no contest" and the runbook month SQL EXCLUDES these one-horse
-   days from the win/coverage sums.
+5. `outcome='feed_off'` days (round 4, 2026-07-10; detection REDESIGNED
+   round 5): the feed was switched off for the day — measured-zero ticks
+   + zero up-kind rows INSIDE the session window ([09:00, 15:30) IST — the
+   ~08:33 boot Connected row no longer defeats the /api/feeds
+   runtime-disable day) + either no up rows at all (config-off) or a
+   pre-session `source='feed_disabled'` toggle row (both feeds stamp the
+   same slug: the Groww bridge disable falling edge; the Dhan
+   dormant-entry SleepEntered row). A boot up row WITHOUT a disable marker
+   is an ENABLED-but-dead-broker day and is never softened into feed_off
+   (same-day runs additionally consult the runtime enabled flag). The
+   PARTNER feed's `unique_win_minutes`/`both_minutes` stamp the `-1`
+   sentinel on such a day (exclusive-vs-nothing is not a measurement).
+   The card says "no contest" and the runbook month SQL excludes the
+   WHOLE no-contest day (day-level `NOT IN` subquery — a row-level filter
+   left the surviving feed's one-horse row summing into the verdict).
 
 **Honest envelope:** the scoreboard is evidence, not proof. Lone mid-stream
 resets are honestly `indeterminate` (the `disconnect_cause.rs` envelope);

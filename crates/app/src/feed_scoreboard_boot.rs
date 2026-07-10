@@ -445,45 +445,133 @@ pub fn should_keep_degraded_outcome(
 }
 
 /// RunCatchUp already-ran latch (round 4, 2026-07-10 — LOW): `true` when
-/// BOTH feeds' daily rows already exist for the day with
-/// outcome='complete' — a post-trigger same-day boot (the post-close
-/// deploy restart is the dominant shape) then SKIPS the redundant re-run +
-/// duplicate Telegram card instead of re-aggregating an already-vouched
-/// day. Anything less than complete-on-both re-runs (a partial day may
-/// improve; degraded is protected by the daily keep-better guard). Pure;
-/// the caller additionally requires zero in-market boot-synthesized
-/// deaths (a real crash day must never skip its restart floor) and never
-/// applies the latch to forced (`TICKVAULT_SCOREBOARD_NOW`) runs.
+/// BOTH feeds' daily rows already exist for the day with a TERMINAL
+/// outcome — 'complete' OR 'feed_off' (round 5, 2026-07-10: on a
+/// single-feed-profile day the OFF feed's row is permanently 'feed_off',
+/// so requiring complete-on-both left the latch dead for exactly the
+/// profile that runs all month with one feed off — every evening boot
+/// re-ran and re-sent a duplicate card; a rerun also cannot "improve" a
+/// feed_off row, so treating it terminal is safe). A post-trigger
+/// same-day boot (the post-close deploy restart is the dominant shape)
+/// then SKIPS the redundant re-run + duplicate Telegram card instead of
+/// re-aggregating an already-vouched day. Partial days re-run (a rerun
+/// may improve them); degraded days re-run under the daily keep-better
+/// guard. Pure; the caller additionally requires zero in-market
+/// boot-synthesized deaths (a real crash day must never skip its restart
+/// floor) and never applies the latch to forced
+/// (`TICKVAULT_SCOREBOARD_NOW`) runs.
 #[must_use]
 pub fn catchup_rerun_is_redundant(existing_outcomes: &BTreeMap<String, String>) -> bool {
     ["dhan", "groww"].iter().all(|feed| {
         existing_outcomes
             .get(*feed)
-            .is_some_and(|o| o == "complete")
+            .is_some_and(|o| o == "complete" || o == "feed_off")
     })
 }
 
+/// The `ws_event_audit.source` slug both feeds stamp on the
+/// operator-toggle disable row (the Groww bridge's feed-disable falling
+/// edge Disconnected row; the Dhan dormant-entry SleepEntered row since
+/// round 5) — the durable marker that distinguishes a
+/// runtime-disabled-for-the-day feed from an enabled-but-broker-dead one.
+pub const FEED_DISABLE_SOURCE: &str = "feed_disabled";
+
+/// Seconds-of-IST-day for an IST-epoch-nanos timestamp. Pure.
+fn secs_of_day_ist_from_nanos(ts_ist_nanos: i64) -> i64 {
+    ts_ist_nanos.div_euclid(NANOS_PER_SEC).rem_euclid(86_400)
+}
+
+/// `true` for an up-kind `ws_event_audit` row whose ts falls INSIDE the
+/// market-hours window ([09:00, 15:30) IST) — the feed-off inference's
+/// session-scoped up signal (round 5, 2026-07-10 — HIGH): every
+/// config-enabled feed writes a boot Connected row at ~08:33, BEFORE the
+/// API server can even accept a runtime toggle, so counting whole-day up
+/// rows made the runtime-disable path the round-4 fix named essentially
+/// unreachable (the 08:33 row always defeated `!had_any_up_row`). Pure.
+#[must_use]
+pub fn is_session_up_row(ev: &WsAuditEventLite) -> bool {
+    is_up_kind(&ev.event_kind)
+        && u32::try_from(secs_of_day_ist_from_nanos(ev.ts_ist_nanos))
+            .is_ok_and(is_in_market_hours_secs)
+}
+
+/// `true` for a PRE-SESSION operator-toggle disable row
+/// (`source='feed_disabled'` with ts before the 09:15 session open) — the
+/// boot-connect-then-disable day's qualifier (round 5, 2026-07-10). The
+/// pre-session bound is honesty-critical: an IN-session disable of a
+/// zero-tick feed means the feed was ON when trading began and delivered
+/// nothing — that prefix is a real measured-zero window, never softened
+/// into feed_off. Pure.
+#[must_use]
+pub fn is_pre_session_feed_disable_row(ev: &WsAuditEventLite) -> bool {
+    ev.source == FEED_DISABLE_SOURCE
+        && secs_of_day_ist_from_nanos(ev.ts_ist_nanos) < SESSION_START_SECS_OF_DAY_IST
+}
+
 /// Feed-was-OFF-for-the-day inference (round 4, 2026-07-10 — the round-2
-/// finding left open across rounds): a feed with ZERO up-kind connection
-/// rows across the whole day AND a MEASURED zero tick count delivered
-/// nothing because it was switched off (never enabled this session /
-/// runtime-disabled), not because the broker lost a one-horse race — its
-/// row must stamp the distinct 'feed_off' outcome (excluded from the
+/// finding left open across rounds; REDESIGNED round 5, 2026-07-10 —
+/// HIGH): a feed that delivered a MEASURED zero tick count with ZERO
+/// up-kind rows inside the session window was switched off for the day —
+/// its row must stamp the distinct 'feed_off' outcome (excluded from the
 /// month sums) and the card must say "no contest" instead of declaring a
-/// winner. For SAME-DAY runs the runtime enabled flag disambiguates the
-/// enabled-but-fully-dead-broker day (`Some(true)` ⇒ NEVER feed_off — a
-/// catastrophic zero day stays loud); a backfill (`None`) infers from
-/// data alone (honest residual: an enabled feed whose broker was dead the
-/// ENTIRE day with zero successful connects is indistinguishable in a
-/// backfill — the runbook names it). A `-1` ticks sentinel never
-/// qualifies (unmeasured is not zero). Pure.
+/// winner.
+///
+/// The round-5 redesign (the boot-Connected-row defeat): up rows are
+/// SESSION-SCOPED ([`is_session_up_row`], [09:00, 15:30) IST) so the
+/// ~08:33 boot connect no longer defeats the inference — but zero session
+/// up rows ALONE cannot distinguish "runtime-disabled at 08:40" from
+/// "enabled with a dead broker all day" (both leave the 08:33 connect and
+/// nothing in session). The disambiguator is the durable pre-session
+/// `source='feed_disabled'` toggle row ([`is_pre_session_feed_disable_row`]):
+///
+/// | day shape | any up | pre-session disable row | verdict |
+/// |---|---|---|---|
+/// | config-off all day (no rows at all) | no | no | feed_off |
+/// | boot connect 08:33 → runtime-disable 08:40 | yes | yes | feed_off |
+/// | boot connect 08:33, enabled, broker dead | yes | no | NOT feed_off — a real catastrophic measured-zero day stays loud |
+///
+/// For SAME-DAY runs the runtime enabled flag additionally disambiguates
+/// (`Some(true)` ⇒ NEVER feed_off); a backfill (`None`) infers from data
+/// alone (honest residual: an enabled feed that never achieved a single
+/// successful connect ALL day — zero rows entirely — is indistinguishable
+/// from config-off in a backfill; the runbook names it). A `-1` ticks
+/// sentinel never qualifies (unmeasured is not zero). Pure.
 #[must_use]
 pub fn is_feed_off_day(
+    had_session_up_row: bool,
     had_any_up_row: bool,
+    had_pre_session_disable_row: bool,
     ticks: i64,
     runtime_enabled_now: Option<bool>,
 ) -> bool {
-    !had_any_up_row && ticks == 0 && runtime_enabled_now != Some(true)
+    ticks == 0
+        && runtime_enabled_now != Some(true)
+        && !had_session_up_row
+        && (!had_any_up_row || had_pre_session_disable_row)
+}
+
+/// Daily-row feed_off keep-better rule (round 5, 2026-07-10 — HIGH,
+/// erasure facet): `true` when writing this feed's row would UPGRADE an
+/// existing 'feed_off' verdict to complete/partial while the rerun still
+/// measured NO ticks for the feed (`ticks <= 0` — zero, or the `-1`
+/// unmeasured sentinel, which cannot disprove off either). The scenario:
+/// a config-off day correctly stamped feed_off, then a same-day evening
+/// boot with the feed re-enabled for TOMORROW (a natural month-long-test
+/// action) reruns with `runtime_enabled_now = Some(true)` and an evening
+/// Connected row — the fresh inference says "not off" and the DEDUP
+/// last-write-wins UPSERT would erase the feed_off row with
+/// complete-with-zeros, re-crowning the false one-horse winner. A rerun
+/// that measured REAL ticks (> 0) may upgrade — the feed genuinely
+/// streamed, so the day was never a no-contest. Mirrors
+/// [`should_keep_degraded_outcome`]; the caller logs
+/// `stage="outcome_regression"`. Pure.
+#[must_use]
+pub fn should_keep_feed_off_outcome(
+    existing_feed_outcome: Option<&str>,
+    new_is_feed_off: bool,
+    new_ticks: i64,
+) -> bool {
+    !new_is_feed_off && existing_feed_outcome == Some("feed_off") && new_ticks <= 0
 }
 
 /// Ticks a feed delivered today (feed-filtered + day-windowed). LOCAL
@@ -605,6 +693,46 @@ pub fn compute_minute_overlap(a: &HashSet<String>, b: &HashSet<String>) -> (i64,
         to_i64(b.len().saturating_sub(both)),
         to_i64(both),
     )
+}
+
+/// Step 5: stamp each feed's `unique_win_minutes` / `both_minutes` from
+/// the two session minute sets — UNLESS the PARTNER feed was off for the
+/// day, in which case the comparison columns take the `-1` sentinel
+/// (round 5, 2026-07-10 — MEDIUM): exclusive-vs-nothing is not a
+/// measurement, and the running feed's ~375 "unique win" minutes on a
+/// one-horse day flowed straight into the month verdict's headline
+/// `sum(unique_win_minutes)` (the runbook's row-level
+/// `outcome != 'feed_off'` filter removed only the OFF feed's row). The
+/// DB row itself must not carry a fabricated competitive win — the `-1`
+/// is skipped by the runbook's sentinel-guarded sums, and the month SQL
+/// additionally excludes the whole day (day-level subquery, runbook §2).
+/// Pure.
+pub fn apply_minute_overlap_and_feed_off_sentinels(
+    feed_numbers: &mut BTreeMap<&'static str, FeedDayNumbers>,
+    minute_sets: &BTreeMap<&'static str, Option<HashSet<String>>>,
+    feed_off: &BTreeMap<&'static str, bool>,
+) {
+    if let (Some(Some(dhan_set)), Some(Some(groww_set))) =
+        (minute_sets.get("dhan"), minute_sets.get("groww"))
+    {
+        let (dhan_only, groww_only, both) = compute_minute_overlap(dhan_set, groww_set);
+        if let Some(n) = feed_numbers.get_mut("dhan") {
+            n.unique_win_minutes = dhan_only;
+            n.both_minutes = both;
+        }
+        if let Some(n) = feed_numbers.get_mut("groww") {
+            n.unique_win_minutes = groww_only;
+            n.both_minutes = both;
+        }
+    }
+    for (feed, partner) in [("dhan", "groww"), ("groww", "dhan")] {
+        if feed_off.get(partner).copied().unwrap_or(false)
+            && let Some(n) = feed_numbers.get_mut(feed)
+        {
+            n.unique_win_minutes = SCOREBOARD_UNAVAILABLE_SENTINEL;
+            n.both_minutes = SCOREBOARD_UNAVAILABLE_SENTINEL;
+        }
+    }
 }
 
 /// Per-feed episode tally from the day's `feed_episode_audit` rows.
@@ -1027,11 +1155,29 @@ pub const CORRELATION_CODES: [&str; 7] = [
 /// target day older than this cannot be COVERED by the retained files
 /// even when every file opens cleanly, so I/O success alone must never
 /// claim complete evidence (round-4 hostile review 2026-07-10).
-pub const ERRORS_JSONL_EVIDENCE_RETENTION_DAYS: u64 = 2;
+///
+/// WHY 1 AND NOT 2 (round-5 hostile review 2026-07-10 — the boundary
+/// off-by-one): the sweeper (`observability.rs::sweep_errors_jsonl_retention`,
+/// hourly cadence, retention_hours = 48) deletes by file MTIME — any hourly
+/// file older than `now − 48h` is gone. Full-day coverage of a target day
+/// therefore requires `cutoff = now − 48h ≤ target_day_start`, i.e.
+/// `now ≤ target_day_start + 48h`. For target = today−1 that bound is
+/// `today_start + 24h` — satisfied at EVERY instant of today, so
+/// yesterday's 24 hourly files always survive. For target = today−2 the
+/// bound is `today_start` itself — satisfied only at exactly midnight, and
+/// the SESSION hours (the RESILIENCE-01 / WS-GAP-09 / PROC / RESOURCE
+/// evidence window, mtime ≈ 10:00–16:00 IST of D−2) are swept for any run
+/// after ~10:00 today. A `2` here let a D−2 backfill claim complete
+/// evidence over a readable-but-empty dir, skip the keep-better read, and
+/// destructively re-stamp evidence-backed blame `run_partial=false`.
+pub const ERRORS_JSONL_EVIDENCE_RETENTION_DAYS: u64 = 1;
 
 /// Round-4 evidence-horizon gate (2026-07-10 — HIGH): `true` when the
 /// retained ~48h of errors.jsonl files can still COVER the target day
-/// (`target_ist_day + 2 >= today_ist_day`). The scan's I/O-level
+/// (`target_ist_day + 1 >= today_ist_day` — the mtime-sweep derivation on
+/// [`ERRORS_JSONL_EVIDENCE_RETENTION_DAYS`]; round 5 tightened 2 → 1
+/// because a D−2 target is never fully covered by an on-day run). The
+/// scan's I/O-level
 /// `complete` flag AND this horizon TOGETHER decide `scan_complete` —
 /// gating only on I/O success made the round-3 keep-better guard vacuous
 /// for its flagship scenario (the >48h month-end backfill: readable dir,
@@ -1243,9 +1389,15 @@ pub fn last_minute_secs_of_day(minutes: &HashSet<String>) -> Option<i64> {
 /// stop cannot produce. Only a feed that streamed through ~15:28+ keeps
 /// the scheduled-stop carve-out. `None` (zero streamed session minutes
 /// with a prior-up row) is ALSO incompatible with a clean full-session
-/// stop and classifies real (honest residual: a feed whose broker was
-/// silent the entire day then cleanly stopped mis-classifies — named in
-/// the runbook; the crash-before-first-tick day dominates). Pure.
+/// stop and classifies real (honest residuals, BOTH named in the runbook
+/// §3 `post_close_restart` row: a feed whose broker was silent the entire
+/// day then cleanly stopped mis-classifies — the crash-before-first-tick
+/// day dominates; and the SILENT-TAIL variant — a broker tick-silent from
+/// before ~15:28 with the socket up (pings keep the watchdog quiet, no
+/// disconnect row) then cleanly 16:30-stopped + evening-restarted produces
+/// the same `< 15:28` shape and self-blames a process that survived to the
+/// scheduled stop — conservative error direction, cross-check tick-gap /
+/// FEED-STALL signals before signing). Pure.
 #[must_use]
 pub fn post_close_reconnect_is_real_death(last_streamed_minute_secs: Option<i64>) -> bool {
     match last_streamed_minute_secs {
@@ -2006,16 +2158,28 @@ pub async fn run_feed_scoreboard(
     // sentinel, never a fabricated 0 (hostile review 2026-07-10).
     let mut reconnects: Option<BTreeMap<String, i64>> = None;
     let mut mem_tallies: Option<BTreeMap<String, EpisodeTally>> = None;
-    // Feeds with ≥1 up-kind connection row today — the feed-off-day
-    // inference input (round 4, 2026-07-10). `None` = the ws read failed,
+    // The feed-off-day inference inputs (round 4, redesigned round 5,
+    // 2026-07-10): per feed — up-kind rows INSIDE the session window
+    // (the ~08:33 boot connect must not defeat a runtime-disable day),
+    // up-kind rows anywhere in the day, and pre-session
+    // source='feed_disabled' toggle rows. `None` = the ws read failed,
     // so feed-off can never be claimed (unmeasured is not off).
-    let mut up_feeds: Option<HashSet<String>> = None;
+    struct FeedUpSignals {
+        session_up: HashSet<String>,
+        any_up: HashSet<String>,
+        pre_session_disable: HashSet<String>,
+    }
+    let mut up_signals: Option<FeedUpSignals> = None;
     match exec_query(&client, questdb, &ws_sql).await {
         Some(body) => match parse_ws_events(&body) {
             Some(rows) => {
                 let mut recon: BTreeMap<String, i64> = BTreeMap::new();
                 let mut mem: BTreeMap<String, EpisodeTally> = BTreeMap::new();
-                let mut ups: HashSet<String> = HashSet::new();
+                let mut ups = FeedUpSignals {
+                    session_up: HashSet::new(),
+                    any_up: HashSet::new(),
+                    pre_session_disable: HashSet::new(),
+                };
                 let mut writer = FeedEpisodeAuditWriter::new(questdb);
                 let mut appended = 0_u64;
                 for ev in &rows {
@@ -2026,7 +2190,13 @@ pub async fn run_feed_scoreboard(
                         *recon.entry(ev.feed.clone()).or_default() += 1;
                     }
                     if is_up_kind(&ev.event_kind) {
-                        ups.insert(ev.feed.clone());
+                        ups.any_up.insert(ev.feed.clone());
+                        if is_session_up_row(ev) {
+                            ups.session_up.insert(ev.feed.clone());
+                        }
+                    }
+                    if is_pre_session_feed_disable_row(ev) {
+                        ups.pre_session_disable.insert(ev.feed.clone());
                     }
                     if let Some(episode) =
                         classify_ws_event_to_episode(ev, &corr, trading_date_ist_nanos)
@@ -2105,7 +2275,7 @@ pub async fn run_feed_scoreboard(
                 }
                 reconnects = Some(recon);
                 mem_tallies = Some(mem);
-                up_feeds = Some(ups);
+                up_signals = Some(ups);
             }
             None => {
                 error!(
@@ -2239,28 +2409,43 @@ pub async fn run_feed_scoreboard(
         feed_numbers.insert(label, n);
     }
 
-    // 5. Feed-level unique-win / both minutes from the two minute sets.
-    if let (Some(Some(dhan_set)), Some(Some(groww_set))) =
-        (minute_sets.get("dhan"), minute_sets.get("groww"))
-    {
-        let (dhan_only, groww_only, both) = compute_minute_overlap(dhan_set, groww_set);
-        if let Some(n) = feed_numbers.get_mut("dhan") {
-            n.unique_win_minutes = dhan_only;
-            n.both_minutes = both;
+    // 5a. The day's EXISTING daily-row outcomes — read ONCE, shared by the
+    //     feed_off keep-better (5b) and the degraded keep-better (7b). A
+    //     failed read turns BOTH guards off for this run, loudly.
+    let existing_daily: Option<BTreeMap<String, String>> = {
+        let daily_sql = build_existing_daily_outcome_sql(target_ist_day);
+        match exec_query(&client, questdb, &daily_sql)
+            .await
+            .as_deref()
+            .map(parse_existing_daily_outcomes)
+        {
+            Some(Some(existing)) => Some(existing),
+            Some(None) | None => {
+                error!(
+                    code = ErrorCode::Scoreboard01AggregationDegraded.code_str(),
+                    stage = "outcome_keep_better_read",
+                    "SCOREBOARD-01: existing daily-outcome read failed/unparsable \
+                     — the daily keep-better guards are OFF this run; a rerun may \
+                     erase a 'degraded' or 'feed_off' verdict"
+                );
+                None
+            }
         }
-        if let Some(n) = feed_numbers.get_mut("groww") {
-            n.unique_win_minutes = groww_only;
-            n.both_minutes = both;
-        }
-    }
+    };
 
-    // 5b. Feed-off-day detection (round 4, 2026-07-10 — the round-2
-    //     finding): a feed with zero up-kind connection rows AND a
-    //     measured zero tick count was switched off for the day — its row
-    //     stamps the distinct 'feed_off' outcome (excluded from the month
-    //     sums) and the card says "no contest". Same-day runs consult the
-    //     runtime enabled flag so an enabled-but-dead-broker day can NEVER
-    //     be softened into feed_off; a failed ws read claims nothing.
+    // 5b. Feed-off-day detection (round 4; redesigned round 5, 2026-07-10
+    //     — HIGH): a feed with a measured zero tick count, zero up-kind
+    //     rows INSIDE the session window, and either no up rows at all
+    //     (config-off) or a pre-session 'feed_disabled' toggle row (the
+    //     boot-connect-then-runtime-disable day) was switched off — its
+    //     row stamps the distinct 'feed_off' outcome (excluded from the
+    //     month sums) and the card says "no contest". Same-day runs
+    //     consult the runtime enabled flag so an enabled-but-dead-broker
+    //     day can NEVER be softened into feed_off (no disable row + a boot
+    //     up row keeps it loud on backfills too); a failed ws read claims
+    //     nothing. The keep-better arm preserves an existing 'feed_off'
+    //     row against a same-day evening rerun that re-measured zeros
+    //     with the feed now re-enabled for tomorrow.
     let mut feed_off: BTreeMap<&'static str, bool> = BTreeMap::new();
     for feed in tickvault_common::feed::Feed::ALL {
         let label = feed.as_str();
@@ -2274,10 +2459,30 @@ pub async fn run_feed_scoreboard(
                 groww_on
             }
         });
-        let off = up_feeds
-            .as_ref()
-            .is_some_and(|ups| is_feed_off_day(ups.contains(label), ticks, enabled_now));
-        if off {
+        let inferred = up_signals.as_ref().is_some_and(|ups| {
+            is_feed_off_day(
+                ups.session_up.contains(label),
+                ups.any_up.contains(label),
+                ups.pre_session_disable.contains(label),
+                ticks,
+                enabled_now,
+            )
+        });
+        let kept = existing_daily.as_ref().is_some_and(|m| {
+            should_keep_feed_off_outcome(m.get(label).map(String::as_str), inferred, ticks)
+        });
+        if kept {
+            error!(
+                code = ErrorCode::Scoreboard01AggregationDegraded.code_str(),
+                stage = "outcome_regression",
+                feed = label,
+                "SCOREBOARD-01: this rerun would ERASE the day's existing \
+                 'feed_off' verdict with complete-with-zeros (the feed \
+                 measured no ticks — a re-enable for tomorrow does not \
+                 rewrite today's no-contest) — keeping outcome=feed_off"
+            );
+        }
+        if inferred {
             info!(
                 feed = label,
                 "feed_scoreboard: {label} was switched off for the day — \
@@ -2285,8 +2490,15 @@ pub async fn run_feed_scoreboard(
                  month verdict; the card says no contest)"
             );
         }
-        feed_off.insert(label, off);
+        feed_off.insert(label, inferred || kept);
     }
+
+    // 5c. Feed-level unique-win / both minutes from the two minute sets —
+    //     with the `-1` sentinel on the PARTNER's comparison columns on a
+    //     feed-off day (round 5, 2026-07-10 — MEDIUM: exclusive-vs-nothing
+    //     is not a measurement; the phantom ~375 unique minutes skewed the
+    //     month verdict's headline sum).
+    apply_minute_overlap_and_feed_off_sentinels(&mut feed_numbers, &minute_sets, &feed_off);
 
     // 6. Fold the episode tallies in (when the aggregate answered).
     if let Some(ref tallies) = tallies {
@@ -2383,40 +2595,24 @@ pub async fn run_feed_scoreboard(
     //     outcome='complete' over the 15:45 run's 'degraded' verdict —
     //     the drop evidence is session-local and durable NOWHERE except
     //     the row being overwritten. A rerun must never downgrade
-    //     degraded → partial/complete. A failed guard read proceeds
-    //     without the guard, loudly (mirrors the episode keep-better).
-    if !matches!(outcome, ScoreboardOutcome::Degraded) {
-        let daily_sql = build_existing_daily_outcome_sql(target_ist_day);
-        match exec_query(&client, questdb, &daily_sql)
-            .await
-            .as_deref()
-            .map(parse_existing_daily_outcomes)
-        {
-            Some(Some(existing)) => {
-                if should_keep_degraded_outcome(&existing, outcome) {
-                    error!(
-                        code = ErrorCode::Scoreboard01AggregationDegraded.code_str(),
-                        stage = "outcome_regression",
-                        new_outcome = outcome.as_str(),
-                        "SCOREBOARD-01: this rerun would ERASE the day's \
-                         existing 'degraded' verdict (the original session's \
-                         audit-drop evidence is unrecoverable) — keeping \
-                         outcome=degraded"
-                    );
-                    degraded = true;
-                    outcome = ScoreboardOutcome::Degraded;
-                }
-            }
-            Some(None) | None => {
-                error!(
-                    code = ErrorCode::Scoreboard01AggregationDegraded.code_str(),
-                    stage = "outcome_keep_better_read",
-                    "SCOREBOARD-01: existing daily-outcome read failed/unparsable \
-                     — the daily keep-better guard is OFF this run; a rerun may \
-                     erase a 'degraded' verdict"
-                );
-            }
-        }
+    //     degraded → partial/complete. Uses the SHARED step-5a read
+    //     (round 5); a failed read already errored there and the guard is
+    //     OFF (mirrors the episode keep-better).
+    if !matches!(outcome, ScoreboardOutcome::Degraded)
+        && let Some(ref existing) = existing_daily
+        && should_keep_degraded_outcome(existing, outcome)
+    {
+        error!(
+            code = ErrorCode::Scoreboard01AggregationDegraded.code_str(),
+            stage = "outcome_regression",
+            new_outcome = outcome.as_str(),
+            "SCOREBOARD-01: this rerun would ERASE the day's \
+             existing 'degraded' verdict (the original session's \
+             audit-drop evidence is unrecoverable) — keeping \
+             outcome=degraded"
+        );
+        degraded = true;
+        outcome = ScoreboardOutcome::Degraded;
     }
 
     // 8. Write the two daily rows (deterministic ts — re-runs UPSERT).
@@ -3916,8 +4112,22 @@ mod tests {
         // run_partial stamp and the keep-better read gate.
         assert!(target_within_evidence_retention(DAY, DAY), "same day");
         assert!(
-            target_within_evidence_retention(DAY, DAY + 2),
-            "2-day-old target is still inside the 48h retention"
+            target_within_evidence_retention(DAY, DAY + 1),
+            "yesterday's 24 hourly files are always < 48h old at any \
+             instant of today (mtime sweep: cutoff < yesterday's day start)"
+        );
+        // Round-5 boundary flip (2026-07-10 — MEDIUM off-by-one): the 48h
+        // MTIME sweep covers a target day only while
+        // now ≤ target_day_start + 48h — for target = today−2 that holds
+        // only at exactly midnight, and the D−2 SESSION-hour files are
+        // swept for any run after ~10:00 today. A 2-day-old backfill is
+        // therefore PAST the horizon: run_partial=true + the keep-better
+        // read ENGAGED (the destructive blame-overwrite bypass at exactly
+        // the boundary day).
+        assert!(
+            !target_within_evidence_retention(DAY, DAY + 2),
+            "2-day-old target is PAST the mtime-sweep horizon — a D−2 \
+             backfill can never hold the day's full session evidence"
         );
         assert!(
             !target_within_evidence_retention(DAY, DAY + 3),
@@ -4008,30 +4218,280 @@ mod tests {
 
     #[test]
     fn test_is_feed_off_day_inference() {
-        // Round-4 MEDIUM (the round-2 finding): a feed with zero up rows +
-        // measured-zero ticks was switched off — never a one-horse win.
+        // Round-4 MEDIUM (the round-2 finding), REDESIGNED round 5: a feed
+        // with measured-zero ticks, zero SESSION up rows, and either no up
+        // rows at all (config-off) or a pre-session disable marker
+        // (runtime-disabled) was switched off — never a one-horse win.
+        // Args: (session_up, any_up, pre_session_disable, ticks, enabled_now)
         assert!(
-            is_feed_off_day(false, 0, None),
-            "backfill: data-only inference"
+            is_feed_off_day(false, false, false, 0, None),
+            "backfill, config-off all day (zero rows): data-only inference"
         );
         assert!(
-            is_feed_off_day(false, 0, Some(false)),
-            "same-day + runtime-disabled"
+            is_feed_off_day(false, false, false, 0, Some(false)),
+            "same-day config-off + runtime-disabled"
         );
         assert!(
-            !is_feed_off_day(false, 0, Some(true)),
+            !is_feed_off_day(false, false, false, 0, Some(true)),
             "same-day ENABLED but zero everything = a catastrophic day, \
              never softened into feed_off"
         );
         assert!(
-            !is_feed_off_day(true, 0, None),
-            "an up row means the feed WAS on at some point"
+            !is_feed_off_day(true, true, false, 0, None),
+            "an in-session up row means the feed WAS on during trading"
         );
-        assert!(!is_feed_off_day(false, 42, None), "ticks flowed = not off");
         assert!(
-            !is_feed_off_day(false, SCOREBOARD_UNAVAILABLE_SENTINEL, None),
+            !is_feed_off_day(false, false, false, 42, None),
+            "ticks flowed = not off"
+        );
+        assert!(
+            !is_feed_off_day(false, false, false, SCOREBOARD_UNAVAILABLE_SENTINEL, None),
             "a -1 sentinel is UNMEASURED, not zero — never claims feed_off"
         );
+    }
+
+    #[test]
+    fn test_is_session_up_row_scopes_up_kinds_to_market_hours_window() {
+        // Round-5 HIGH: the feed-off inference counts up rows ONLY inside
+        // [09:00, 15:30) IST — boundary sweep.
+        let up_at = |secs: i64| {
+            ev(
+                day_ts(secs),
+                "dhan",
+                "main_feed",
+                "connected",
+                "n/a",
+                -1,
+                true,
+            )
+        };
+        assert!(
+            !is_session_up_row(&up_at(8 * 3600 + 59 * 60 + 59)),
+            "08:59:59"
+        );
+        assert!(is_session_up_row(&up_at(9 * 3600)), "09:00:00 inclusive");
+        assert!(
+            is_session_up_row(&up_at(15 * 3600 + 29 * 60 + 59)),
+            "15:29:59"
+        );
+        assert!(
+            !is_session_up_row(&up_at(15 * 3600 + 30 * 60)),
+            "15:30 exclusive"
+        );
+        // Down kinds never count regardless of window.
+        let down = ev(
+            day_ts(10 * 3600),
+            "dhan",
+            "main_feed",
+            "disconnected",
+            "n/a",
+            -1,
+            true,
+        );
+        assert!(!is_session_up_row(&down));
+    }
+
+    #[test]
+    fn test_is_pre_session_feed_disable_row_source_and_bound() {
+        // Round-5 HIGH: the disable marker must carry the shared
+        // 'feed_disabled' slug AND land before the 09:15 session open.
+        let marker = |secs: i64, source: &str| {
+            ev(
+                day_ts(secs),
+                "groww",
+                "groww_bridge",
+                "disconnected",
+                source,
+                -1,
+                false,
+            )
+        };
+        assert!(is_pre_session_feed_disable_row(&marker(
+            8 * 3600 + 40 * 60,
+            FEED_DISABLE_SOURCE
+        )));
+        assert!(
+            !is_pre_session_feed_disable_row(&marker(
+                SESSION_START_SECS_OF_DAY_IST,
+                FEED_DISABLE_SOURCE
+            )),
+            "09:15:00 is session — an in-session disable never qualifies"
+        );
+        assert!(
+            !is_pre_session_feed_disable_row(&marker(8 * 3600 + 40 * 60, "n/a")),
+            "only the operator-toggle slug is a marker"
+        );
+        assert_eq!(FEED_DISABLE_SOURCE, "feed_disabled");
+    }
+
+    #[test]
+    fn test_feed_off_topology_runtime_disable_at_0840_vs_broker_dead_day() {
+        // Round-5 HIGH topology 1 — the runtime /api/feeds disable at
+        // 08:40 on a dhan-only day: the groww boot Connected row at 08:33
+        // (PRE-session) plus the pre-session 'feed_disabled' marker must
+        // classify the day feed_off; the round-4 whole-day up-row rule
+        // made this unreachable (the 08:33 row always defeated it).
+        let boot_connect = ev(
+            day_ts(8 * 3600 + 33 * 60),
+            "groww",
+            "groww_bridge",
+            "connected",
+            "groww_subscribed",
+            -1,
+            false,
+        );
+        let disable = ev(
+            day_ts(8 * 3600 + 40 * 60),
+            "groww",
+            "groww_bridge",
+            "disconnected_off_hours",
+            "feed_disabled",
+            -1,
+            false,
+        );
+        assert!(is_up_kind(&boot_connect.event_kind));
+        assert!(
+            !is_session_up_row(&boot_connect),
+            "the 08:33 boot connect is PRE-session — it must not defeat \
+             the feed-off inference"
+        );
+        assert!(
+            is_pre_session_feed_disable_row(&disable),
+            "the 08:40 toggle row is the pre-session disable marker"
+        );
+        assert!(
+            is_feed_off_day(false, true, true, 0, Some(false)),
+            "boot-connect-then-disable day: feed_off (no false winner)"
+        );
+        // The Dhan dormant-entry marker (SleepEntered, source=feed_disabled
+        // since round 5) qualifies identically.
+        let dhan_dormant = ev(
+            day_ts(8 * 3600 + 41 * 60),
+            "dhan",
+            "main_feed",
+            "sleep_entered",
+            "feed_disabled",
+            -1,
+            false,
+        );
+        assert!(is_pre_session_feed_disable_row(&dhan_dormant));
+        // Topology 2 — ENABLED-but-broker-dead groww day: the same 08:33
+        // boot connect, NO disable marker, zero ticks. NOT feed_off — a
+        // real catastrophic day stays a measured zero (a real winner
+        // verdict is allowed). Honesty-critical on the same-day run AND
+        // the backfill (enabled flag unavailable).
+        assert!(
+            !is_feed_off_day(false, true, false, 0, Some(true)),
+            "same-day enabled-but-broker-dead: measured zero, never feed_off"
+        );
+        assert!(
+            !is_feed_off_day(false, true, false, 0, None),
+            "backfill of the broker-dead day: the boot up row without a \
+             disable marker keeps it loud"
+        );
+        // An IN-session disable of a zero-tick feed is NOT pre-session —
+        // the 09:15–disable prefix was a real measured-zero window.
+        let midsession_disable = ev(
+            day_ts(9 * 3600 + 30 * 60),
+            "groww",
+            "groww_bridge",
+            "disconnected",
+            "feed_disabled",
+            -1,
+            true,
+        );
+        assert!(!is_pre_session_feed_disable_row(&midsession_disable));
+        // An in-session reconnect IS a session up row (the feed was on).
+        let session_up = ev(
+            day_ts(10 * 3600),
+            "groww",
+            "groww_bridge",
+            "reconnected",
+            "n/a",
+            -1,
+            true,
+        );
+        assert!(is_session_up_row(&session_up));
+        assert!(
+            !is_feed_off_day(true, true, true, 0, Some(false)),
+            "a session up row always defeats feed_off"
+        );
+    }
+
+    #[test]
+    fn test_apply_minute_overlap_and_feed_off_sentinels() {
+        // Round-5 MEDIUM: on a feed-off day the PARTNER's comparison
+        // columns take the -1 sentinel — exclusive-vs-nothing is not a
+        // measurement, and the phantom ~375 unique minutes skewed the
+        // month verdict's headline sum.
+        let minute = |h: i64, m: i64| format!("2026-07-10T{h:02}:{m:02}:00.000000Z");
+        let dhan_set: HashSet<String> = [minute(9, 15), minute(9, 16), minute(9, 17)]
+            .into_iter()
+            .collect();
+        let mk = |dhan_set: HashSet<String>, groww_set: HashSet<String>| {
+            let mut nums: BTreeMap<&'static str, FeedDayNumbers> = BTreeMap::new();
+            nums.insert("dhan", FeedDayNumbers::unavailable());
+            nums.insert("groww", FeedDayNumbers::unavailable());
+            let mut sets: BTreeMap<&'static str, Option<HashSet<String>>> = BTreeMap::new();
+            sets.insert("dhan", Some(dhan_set));
+            sets.insert("groww", Some(groww_set));
+            (nums, sets)
+        };
+        // Normal dual-feed day: real overlap, no sentinels.
+        let (mut nums, sets) = mk(dhan_set.clone(), [minute(9, 15)].into_iter().collect());
+        let both_on: BTreeMap<&'static str, bool> =
+            [("dhan", false), ("groww", false)].into_iter().collect();
+        apply_minute_overlap_and_feed_off_sentinels(&mut nums, &sets, &both_on);
+        assert_eq!(nums["dhan"].unique_win_minutes, 2);
+        assert_eq!(nums["dhan"].both_minutes, 1);
+        assert_eq!(nums["groww"].unique_win_minutes, 0);
+        // Groww-off day: dhan's "3 exclusive minutes vs nothing" is NOT a
+        // measurement — sentinel, never a phantom month-sum win.
+        let (mut nums, sets) = mk(dhan_set, HashSet::new());
+        let groww_off: BTreeMap<&'static str, bool> =
+            [("dhan", false), ("groww", true)].into_iter().collect();
+        apply_minute_overlap_and_feed_off_sentinels(&mut nums, &sets, &groww_off);
+        assert_eq!(
+            nums["dhan"].unique_win_minutes, SCOREBOARD_UNAVAILABLE_SENTINEL,
+            "the RUNNING feed's row on a feed-off day carries no phantom win"
+        );
+        assert_eq!(nums["dhan"].both_minutes, SCOREBOARD_UNAVAILABLE_SENTINEL);
+        // The OFF feed's own measured zeros stay (its row is feed_off and
+        // excluded day-level by the runbook SQL anyway).
+        assert_eq!(nums["groww"].unique_win_minutes, 0);
+    }
+
+    #[test]
+    fn test_should_keep_feed_off_outcome_evening_rerun_preserves_no_contest() {
+        // Round-5 HIGH (erasure facet) topology: a config-off day stamped
+        // feed_off, then a same-day EVENING boot with the feed re-enabled
+        // for tomorrow reruns (enabled_now=Some(true), an evening
+        // Connected row) and re-measures zero ticks — the rerun must keep
+        // feed_off, never re-crown the false one-horse winner.
+        assert!(
+            should_keep_feed_off_outcome(Some("feed_off"), false, 0),
+            "evening rerun with zero ticks preserves feed_off"
+        );
+        assert!(
+            should_keep_feed_off_outcome(Some("feed_off"), false, -1),
+            "an unmeasured rerun cannot disprove feed_off either"
+        );
+        assert!(
+            !should_keep_feed_off_outcome(Some("feed_off"), false, 42),
+            "real ticks measured = the feed genuinely streamed; upgrade allowed"
+        );
+        assert!(
+            !should_keep_feed_off_outcome(Some("feed_off"), true, 0),
+            "a rerun that itself infers feed_off has nothing to keep"
+        );
+        assert!(
+            !should_keep_feed_off_outcome(Some("complete"), false, 0),
+            "only an existing feed_off row is protected"
+        );
+        assert!(!should_keep_feed_off_outcome(None, false, 0), "first run");
+        // …and the RunCatchUp latch treats the preserved day as terminal
+        // (test_catchup_rerun_is_redundant_terminal_outcomes) so the
+        // evening boot skips the rerun entirely — no duplicate winner card.
     }
 
     #[test]
@@ -4069,9 +4529,13 @@ mod tests {
     }
 
     #[test]
-    fn test_catchup_rerun_is_redundant_requires_both_complete() {
-        // Round-4 LOW: the post-close deploy-restart RunCatchUp skips only
-        // when BOTH feeds already carry a complete row.
+    fn test_catchup_rerun_is_redundant_terminal_outcomes() {
+        // Round-4 LOW + round-5 fix: the post-close deploy-restart
+        // RunCatchUp skips when BOTH feeds already carry a TERMINAL row —
+        // 'complete' OR 'feed_off'. Requiring complete-on-both left the
+        // latch permanently dead on single-feed profiles (every day is a
+        // feed-off day there) and re-sent a duplicate card every evening
+        // boot.
         let both: BTreeMap<String, String> = [
             ("dhan".to_string(), "complete".to_string()),
             ("groww".to_string(), "complete".to_string()),
@@ -4079,7 +4543,14 @@ mod tests {
         .into_iter()
         .collect();
         assert!(catchup_rerun_is_redundant(&both));
-        for worse in ["partial", "degraded", "feed_off"] {
+        let mut single_feed = both.clone();
+        single_feed.insert("groww".to_string(), "feed_off".to_string());
+        assert!(
+            catchup_rerun_is_redundant(&single_feed),
+            "{{complete, feed_off}} is terminal — the single-feed-profile \
+             evening boot sends no duplicate card"
+        );
+        for worse in ["partial", "degraded"] {
             let mut m = both.clone();
             m.insert("groww".to_string(), worse.to_string());
             assert!(
@@ -4088,6 +4559,16 @@ mod tests {
                  keep-better-protected)"
             );
         }
+        let mixed: BTreeMap<String, String> = [
+            ("dhan".to_string(), "partial".to_string()),
+            ("groww".to_string(), "feed_off".to_string()),
+        ]
+        .into_iter()
+        .collect();
+        assert!(
+            !catchup_rerun_is_redundant(&mixed),
+            "{{partial, feed_off}} still re-runs — the partial side may improve"
+        );
         let mut one = both.clone();
         one.remove("dhan");
         assert!(!catchup_rerun_is_redundant(&one), "a missing row re-runs");

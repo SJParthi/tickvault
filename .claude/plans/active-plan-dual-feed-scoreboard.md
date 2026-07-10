@@ -436,7 +436,57 @@ forensic tables:
     pre-existing hook limitation on main; compensating control is
     plan-gate.sh (globs active-plan*.md). Follow-up for a separate PR.
   - Files: crates/app/src/feed_scoreboard_boot.rs, crates/app/src/main.rs, crates/storage/src/feed_scoreboard_persistence.rs, crates/core/src/notification/events.rs, docs/runbooks/dual-feed-scoreboard.md, .claude/rules/project/dual-feed-scoreboard-error-codes.md
-  - Tests: test_filter_boot_rows_to_day_blocks_cross_day_backfill_contamination, test_target_within_evidence_retention_gates_run_partial_and_keep_better, test_should_keep_degraded_outcome_and_parse_existing_daily_outcomes, test_is_feed_off_day_inference, test_last_minute_secs_of_day_and_post_close_reconnect_is_real_death, test_catchup_rerun_is_redundant_requires_both_complete, test_scoreboard_trigger_after_auto_stop_warn_threshold, test_dual_feed_scorecard_feed_off_no_contest, test_scoreboard_outcome_and_coverage_source_labels_stable
+  - Tests: test_filter_boot_rows_to_day_blocks_cross_day_backfill_contamination, test_target_within_evidence_retention_gates_run_partial_and_keep_better, test_should_keep_degraded_outcome_and_parse_existing_daily_outcomes, test_is_feed_off_day_inference, test_last_minute_secs_of_day_and_post_close_reconnect_is_real_death, test_catchup_rerun_is_redundant_terminal_outcomes, test_scoreboard_trigger_after_auto_stop_warn_threshold, test_dual_feed_scorecard_feed_off_no_contest, test_scoreboard_outcome_and_coverage_source_labels_stable
+
+- [x] Item 12 — Hostile-review round 5 fixes (2026-07-10)
+  - MEDIUM ×2 (evidence-horizon off-by-one at the D−2 boundary):
+    `ERRORS_JSONL_EVIDENCE_RETENTION_DAYS` 2 → 1 with the mtime-sweep
+    derivation in the const doc (full-day coverage ⇔ cutoff ≤ target day
+    start; only YESTERDAY is guaranteed alive at any instant of today —
+    a D−2 backfill's session-hour files are swept after ~10:00, so the
+    old 2 let it claim complete evidence, skip the keep-better read, and
+    destructively re-stamp evidence-backed blame `run_partial=false`).
+    The boundary test is FLIPPED: target = today−2 is PAST the horizon
+    (run_partial=true + keep-better engaged).
+  - HIGH facet a (feed_off unreachable for the runtime toggle): the
+    inference is redesigned — up rows are SESSION-SCOPED
+    (`is_session_up_row`, [09:00, 15:30) IST — the ~08:33 boot Connected
+    row no longer defeats it) and a boot-connect-then-disable day
+    qualifies via a PRE-session `source='feed_disabled'` toggle row
+    (`is_pre_session_feed_disable_row` / `FEED_DISABLE_SOURCE`; the Dhan
+    dormant-entry SleepEntered row now stamps the same slug as the Groww
+    bridge falling edge). An ENABLED-but-broker-dead day (boot up row, no
+    disable marker) is NEVER feed_off — a real catastrophic measured-zero
+    day stays loud, on same-day runs AND backfills.
+  - HIGH facet b (feed_off erasable by a same-day evening rerun):
+    `should_keep_feed_off_outcome` — a rerun that re-measured ZERO ticks
+    never upgrades an existing feed_off row to complete-with-zeros
+    (`stage="outcome_regression"`); real measured ticks may upgrade. The
+    existing-daily-outcome read is hoisted to step 5a and SHARED with the
+    degraded keep-better (one query, one loud failure path).
+  - HIGH facet c + LOW (latch vacuous on single-feed profiles):
+    `catchup_rerun_is_redundant` treats 'feed_off' as terminal alongside
+    'complete' — the single-feed-profile evening boot skips the rerun and
+    sends no duplicate winner card.
+  - MEDIUM ×2 (one-horse month-sum contamination): on a feed-off day the
+    PARTNER feed's `unique_win_minutes`/`both_minutes` stamp the −1
+    sentinel (`apply_minute_overlap_and_feed_off_sentinels` — exclusive-
+    vs-nothing is not a measurement), and the runbook §2 month SQL + the
+    per-day winner drill exclude the WHOLE no-contest day via the
+    day-level `NOT IN (SELECT trading_date_ist … WHERE outcome =
+    'feed_off')` subquery (the row-level filter left the surviving feed's
+    ~375 phantom exclusive minutes summing into the headline verdict, and
+    the card footnote's "does not count toward the month verdict" claim
+    is now mechanically true).
+  - LOW (post-close silent-tail residual doc drift): the runbook §3
+    `post_close_restart` row now NAMES the silent-tail false positive (a
+    broker tick-silent before ~15:28 with the socket up + clean 16:30
+    stop + evening start self-blames a surviving process — conservative
+    direction; cross-check tick-gap/FEED-STALL before signing), so the
+    `post_close_reconnect_is_real_death` doc-comment claim is true; the
+    fn doc names both residual variants.
+  - Files: crates/app/src/feed_scoreboard_boot.rs, crates/core/src/websocket/connection.rs, docs/runbooks/dual-feed-scoreboard.md, .claude/rules/project/dual-feed-scoreboard-error-codes.md
+  - Tests: test_target_within_evidence_retention_gates_run_partial_and_keep_better, test_is_feed_off_day_inference, test_feed_off_topology_runtime_disable_at_0840_vs_broker_dead_day, test_apply_minute_overlap_and_feed_off_sentinels, test_should_keep_feed_off_outcome_evening_rerun_preserves_no_contest, test_catchup_rerun_is_redundant_terminal_outcomes
 
 ## Scenarios
 

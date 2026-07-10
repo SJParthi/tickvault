@@ -81,8 +81,26 @@ SELECT feed, count() days,
        sum(case when partial_coverage then 1 else 0 end) partial_days
 FROM feed_scoreboard_daily
 WHERE trading_date_ist >= '2026-07-01' AND trading_date_ist < '2026-08-01'
-  AND outcome != 'feed_off' GROUP BY feed;
+  AND trading_date_ist NOT IN (
+    SELECT trading_date_ist FROM feed_scoreboard_daily
+    WHERE outcome = 'feed_off'
+      AND trading_date_ist >= '2026-07-01'
+      AND trading_date_ist < '2026-08-01')
+GROUP BY feed;
 ```
+
+**The feed_off exclusion is DAY-level, not row-level (round 5,
+2026-07-10):** a row-level `outcome != 'feed_off'` filter removes only the
+OFF feed's row while the SURVIVING feed's row for the same day still sums
+— its numbers are one-horse (no competitor to lose a minute to). The
+`NOT IN` subquery above drops the WHOLE no-contest day for BOTH feeds,
+which is what the daily card's "this day does not count toward the month
+verdict" footnote promises. Belt-and-braces: since round 5 the writer also
+stamps the surviving feed's `unique_win_minutes`/`both_minutes` with the
+`-1` sentinel on a feed-off day (exclusive-vs-nothing is not a
+measurement), so even a query that forgets the subquery no longer inflates
+`unique_mins` — but ticks/uptime/blame on the partner row remain one-horse
+context, hence the day-level exclusion stays the documented form.
 
 Caveats:
 - `avg(lag_*)` is polluted by the `-1` sentinels (pre-PR-3 days) —
@@ -117,14 +135,26 @@ WHERE outcome = 'feed_off'
 ORDER BY trading_date_ist;
 ```
 
-  Detection is zero up-kind connection rows + measured-zero ticks; same-day
-  runs also consult the live runtime flag so an ENABLED-but-dead-broker day
-  can never be softened into feed_off. Honest residual: on a PAST-day
-  backfill the inference is data-only — a feed that was enabled but never
-  achieved a single successful connect all day is indistinguishable from a
-  switched-off feed (both write zero up rows).
+  Detection (redesigned round 5, 2026-07-10): measured-zero ticks + zero
+  up-kind connection rows INSIDE the session window ([09:00, 15:30) IST —
+  the ~08:33 boot Connected row every config-enabled feed writes no longer
+  defeats the runtime-disable day) + either NO up rows at all (config-off)
+  or a PRE-session `source='feed_disabled'` toggle row (the
+  boot-connect-then-/api/feeds-disable day). A boot up row WITHOUT a
+  disable marker is an ENABLED-but-dead-broker day — a real catastrophic
+  measured zero, never softened into feed_off (on same-day runs the live
+  runtime flag enforces this too). An existing feed_off row is also
+  keep-better-protected: a same-day evening rerun with the feed re-enabled
+  for tomorrow (zero ticks re-measured) keeps feed_off and logs
+  `stage="outcome_regression"`; a rerun that measured REAL ticks may
+  upgrade. Honest residual: on a PAST-day backfill the inference is
+  data-only — an enabled feed that never achieved a single successful
+  connect ALL day (zero rows entirely) is indistinguishable from
+  config-off.
 
-Per-day winner drill (tiebreak = lag_p99 where measured):
+Per-day winner drill (tiebreak = lag_p99 where measured; the same
+day-level feed_off exclusion applies — a no-contest day would otherwise
+join here as a `-1`-vs-0 line):
 
 ```sql
 SELECT d.trading_date_ist, d.unique_win_minutes dhan_mins, g.unique_win_minutes groww_mins,
@@ -133,6 +163,9 @@ SELECT d.trading_date_ist, d.unique_win_minutes dhan_mins, g.unique_win_minutes 
 FROM (SELECT * FROM feed_scoreboard_daily WHERE feed = 'dhan') d
 JOIN (SELECT * FROM feed_scoreboard_daily WHERE feed = 'groww') g
   ON d.trading_date_ist = g.trading_date_ist
+WHERE d.trading_date_ist NOT IN (
+    SELECT trading_date_ist FROM feed_scoreboard_daily
+    WHERE outcome = 'feed_off')
 ORDER BY d.trading_date_ist;
 ```
 
@@ -170,7 +203,7 @@ Review guide per `blame_reason`:
 | `unknown_cause` / `unclassified` | Novel error text / novel source label | Read the `evidence` column; if a pattern repeats, extend the classifier (a dated PR) |
 | `off_hours_idle` | Pre/post-market idle cleanup | Expected noise — excluded from headline counts; no action |
 | `run_partial = true` rows | Classified with EXPIRED errors.jsonl evidence (>48h backfill; round 4 made this HORIZON-aware — a readable log dir whose retained files cannot COVER the target day counts as partial evidence too, so the flag can no longer lie false on aged-out backfills) | 805s defaulted broker, RSTs defaulted indeterminate — annotate rather than re-litigate (a re-run can NEVER downgrade an evidence-backed row — the keep-better guard suppresses it and logs `stage="blame_regression"`) |
-| `post_close_restart` | The reconnect landed AFTER 3:30 PM close AND the feed had streamed through ~15:28 (round 4: a feed whose last streamed minute leaves a HOLE before close re-classifies as a REAL in-market death instead — counted, floor engaged; only streamed-through-close keeps this carve-out, and a failed minute read keeps it loudly via `stage="post_close_disambiguation"`) | Forensic row only — excluded from the headline restarts/blame counts and the partial floor; no action unless it repeats on days with NO evening restart |
+| `post_close_restart` | The reconnect landed AFTER 3:30 PM close AND the feed had streamed through ~15:28 (round 4: a feed whose last streamed minute leaves a HOLE before close re-classifies as a REAL in-market death instead — counted, floor engaged; only streamed-through-close keeps this carve-out, and a failed minute read keeps it loudly via `stage="post_close_disambiguation"`). **Known residual (round 5): the silent-tail false positive** — a feed whose broker went tick-silent before ~15:28 with the socket UP (server pings keep the activity watchdog quiet, so NO disconnect row is written) that was then CLEANLY auto-stopped at 16:30 and evening-restarted produces the SAME data shape and re-classifies as an in-market `ours/process_restart` for a process that demonstrably survived to the scheduled stop. The error direction is self-blame inflation (conservative for the month verdict), but the row is factually wrong — before signing such a row, cross-check the day's tick-gap (WS-GAP-06) / FEED-STALL signals for a broker-silence tail and whether the OTHER feed streamed through close on the same process | Forensic row only — excluded from the headline restarts/blame counts and the partial floor; no action unless it repeats on days with NO evening restart |
 
 An `outcome = 'degraded'` day (audit-row drops) means that day's episode
 counts are a FLOOR — annotate the month summary accordingly:
@@ -182,13 +215,18 @@ FROM feed_scoreboard_daily WHERE outcome != 'complete' ORDER BY trading_date_ist
 
 ## 4. Backfill / re-run
 
-- **Post-close restarts DON'T duplicate the card (round 4):** a same-day
-  boot past the trigger whose day ALREADY carries complete rows for BOTH
-  feeds (the post-close deploy-restart shape) skips the catch-up re-run
-  and sends no duplicate Telegram; partial/degraded days still re-run,
-  and a boot that detected an in-market crash never skips (the restart
-  floor must land). A rerun can also never ERASE a `degraded` verdict —
-  the daily keep-better keeps it and logs `stage="outcome_regression"`.
+- **Post-close restarts DON'T duplicate the card (round 4; round 5 made
+  it work on single-feed days):** a same-day boot past the trigger whose
+  day ALREADY carries a TERMINAL row for BOTH feeds — `complete` OR
+  `feed_off` (a rerun cannot "improve" a feed-off day, and on a
+  single-feed profile EVERY day carries one feed_off row, so requiring
+  complete-on-both had left the latch permanently dead there) — skips the
+  catch-up re-run and sends no duplicate Telegram; partial/degraded days
+  still re-run, and a boot that detected an in-market crash never skips
+  (the restart floor must land). A rerun can also never ERASE a
+  `degraded` OR `feed_off` verdict — the daily keep-better keeps it and
+  logs `stage="outcome_regression"` (a rerun that measured REAL ticks may
+  upgrade a feed_off row: the feed genuinely streamed).
 - **A same-day backfill of a PAST day never inherits THIS boot's
   restarts (round 4):** the boot-reconciled process-death rows are
   day-filtered to the run's target day before they fold, so a mid-market
@@ -207,9 +245,13 @@ FROM feed_scoreboard_daily WHERE outcome != 'complete' ORDER BY trading_date_ist
 - **⚠ Re-runs are KEY-idempotent, NOT value-idempotent.** Every re-run
   RE-CLASSIFIES the day's episodes with the evidence available AT THE
   RE-RUN INSTANT, and the tables are last-write-wins on the DEDUP key. A
-  re-run more than 48h after the day (the errors.jsonl evidence horizon —
-  including the SCOREBOARD-01 triage advice "re-run once QuestDB is
-  healthy" followed late) would have OVERWRITTEN evidence-backed blame
+  re-run targeting any day OLDER THAN YESTERDAY (the errors.jsonl evidence
+  horizon: the 48h MTIME sweep guarantees full-day file coverage only for
+  yesterday — a 2-day-old target's session-hour files are already swept
+  for any run after ~10:00, so round 5 tightened the day-granular gate
+  from 2 to 1 — including the SCOREBOARD-01 triage advice "re-run once
+  QuestDB is healthy" followed late) would have OVERWRITTEN evidence-backed
+  blame
   with evidence-less defaults (`ours/dual_instance` → `broker/
   rate_limit_805`, corroborated `broker/bare_rst` → `indeterminate`).
   The keep-better guard now suppresses exactly that: a partial-evidence
