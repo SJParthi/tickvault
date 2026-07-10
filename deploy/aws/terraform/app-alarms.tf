@@ -238,6 +238,13 @@ resource "aws_cloudwatch_metric_alarm" "questdb_disconnected" {
 #     re-scraped 15:30->16:30 IST — a stale post-close value must never page.
 #     Actions OFF by default; the shared market-hours gate Lambda
 #     (market-hours-liveness-alarm.tf) enables them 09:20-15:35 IST Mon-Fri.
+#   - 2026-07-10 §36.7 (FUTIDX all-months): far-month (non-nearest) index
+#     future SIDs are excluded at the GAUGE PRODUCER (main.rs
+#     far_month_future_sids exclusion set) — far monthly serials tick
+#     sparsely by nature and would lift the healthy ~33 always-silent floor
+#     toward this threshold. Threshold 40 and the ~33 floor therefore STAND
+#     unchanged; the excluded SIDs remain seeded in the detector, so the
+#     WS-GAP-06 per-SID log still names a never-ticking month.
 # ---------------------------------------------------------------------------
 resource "aws_cloudwatch_metric_alarm" "tick_gap_instruments_silent" {
   alarm_name          = "tv-${var.environment}-tick-gap-instruments-silent"
