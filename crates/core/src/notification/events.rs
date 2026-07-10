@@ -468,6 +468,40 @@ pub enum NotificationEvent {
         detail: String,
     },
 
+    /// Once-per-trading-day Dhan-vs-Groww scorecard at 3:45 PM IST
+    /// (operator directive 2026-07-10 — run both feeds live for a month,
+    /// everything tracked + blame-attributed). Severity::Info +
+    /// `DispatchPolicy::Immediate` (the CrossVerify1mSummary precedent —
+    /// the daily digest must arrive AT 15:45, never coalesced). Any
+    /// degradation is carried loudly in the body (partial/degraded
+    /// footnotes), and a task death fires `DualFeedScorecardAborted`
+    /// instead — the daily signal can never be silently dropped.
+    DualFeedDailyScorecard {
+        /// Trading date in `YYYY-MM-DD` IST format.
+        trading_date_ist: String,
+        /// The Dhan side of the scorecard.
+        dhan: FeedScoreLine,
+        /// The Groww side of the scorecard.
+        groww: FeedScoreLine,
+        /// Session denominator in minutes (375 on a regular NSE day).
+        session_minutes: i64,
+        /// `true` when the day's coverage could not be fully vouched for
+        /// (a data source was unavailable mid-run).
+        partial_coverage: bool,
+        /// `true` when the connection-event record itself under-counted
+        /// today — drop counts are a floor, not a truth.
+        degraded: bool,
+    },
+
+    /// The daily dual-feed scorecard TASK died (panicked / errored) before
+    /// producing its summary. High so the ABSENCE of the daily scorecard is
+    /// impossible to miss (mirrors `CrossVerify1mAborted`). NOT fired on
+    /// graceful shutdown/cancellation.
+    DualFeedScorecardAborted {
+        /// Plain-English description of how the task died.
+        detail: String,
+    },
+
     // PR #4 (2026-05-19): DepthSpotPriceStale variant retired alongside
     // the deleted depth-20/200 infrastructure (operator lock 2026-05-15).
     // PR #5 (2026-05-19): 7 Phase2* variants retired alongside the
@@ -1136,6 +1170,107 @@ pub struct FeedStatusLine {
     pub last_tick_age_secs: Option<u64>,
 }
 
+/// One feed's side of the daily dual-feed scorecard (operator directive
+/// 2026-07-10). `-1` on any count means "not measured / unavailable" and
+/// renders honestly (never as a fabricated zero — audit Rule 11).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FeedScoreLine {
+    /// Feed display name ("Dhan" / "Groww").
+    pub name: String,
+    /// Ticks captured today; `-1` = unavailable.
+    pub ticks: i64,
+    /// Session minutes where ONLY this feed delivered prices; `-1` unknown.
+    pub exclusive_minutes: i64,
+    /// Day median exchange→receipt delay in ms; `-1` = not measured yet.
+    pub lag_p50_ms: i64,
+    /// Day worst-1% delay in ms; `-1` = not measured yet.
+    pub lag_p99_ms: i64,
+    /// In-market disconnect episodes; `-1` = record unavailable.
+    pub drops_market: i64,
+    /// Blame tallies over the day's episodes.
+    pub blame_broker: i64,
+    pub blame_ours: i64,
+    pub blame_unclear: i64,
+    /// Stall episodes (0 until the stall tracking upgrade ships).
+    pub stalls: i64,
+    /// Boot-reconciled process restarts detected today.
+    pub restarts: i64,
+    /// Session minutes with at least one tick; `-1` unknown.
+    pub streaming_minutes: i64,
+}
+
+/// The scorecard's ONE decision (Telegram commandment 8): who won today.
+/// Tiebreak ladder — exclusive minutes → worst-1% delay (only when BOTH are
+/// measured; a −1 sentinel never decides) → broker-blamed drops → even day.
+fn scorecard_verdict(dhan: &FeedScoreLine, groww: &FeedScoreLine) -> String {
+    // Rung 1: exclusive coverage minutes.
+    if dhan.exclusive_minutes >= 0
+        && groww.exclusive_minutes >= 0
+        && dhan.exclusive_minutes != groww.exclusive_minutes
+    {
+        let (w, l) = if dhan.exclusive_minutes > groww.exclusive_minutes {
+            (dhan, groww)
+        } else {
+            (groww, dhan)
+        };
+        return format!(
+            "\u{1f3c6} Verdict: {} won today — {} exclusive minutes vs {}.",
+            w.name, w.exclusive_minutes, l.exclusive_minutes
+        );
+    }
+    // Rung 2: worst-1% delay (lower wins; only when both are measured).
+    if dhan.lag_p99_ms >= 0 && groww.lag_p99_ms >= 0 && dhan.lag_p99_ms != groww.lag_p99_ms {
+        let (w, l) = if dhan.lag_p99_ms < groww.lag_p99_ms {
+            (dhan, groww)
+        } else {
+            (groww, dhan)
+        };
+        return format!(
+            "\u{1f3c6} Verdict: {} won today — faster prices (worst 1% delay {} vs {}).",
+            w.name,
+            render_ms(w.lag_p99_ms),
+            render_ms(l.lag_p99_ms)
+        );
+    }
+    // Rung 3: fewer broker-caused drops wins.
+    if dhan.drops_market >= 0 && groww.drops_market >= 0 && dhan.blame_broker != groww.blame_broker
+    {
+        let (w, l) = if dhan.blame_broker < groww.blame_broker {
+            (dhan, groww)
+        } else {
+            (groww, dhan)
+        };
+        return format!(
+            "\u{1f3c6} Verdict: {} won today — fewer broker-caused drops ({} vs {}).",
+            w.name, w.blame_broker, l.blame_broker
+        );
+    }
+    "\u{1f91d} Verdict: Even day.".to_string()
+}
+
+/// Renders a millisecond delay for the scorecard: `-1` = honest "not
+/// measured yet"; ≥1s renders in seconds for readability.
+fn render_ms(ms: i64) -> String {
+    if ms < 0 {
+        return "not measured yet".to_string();
+    }
+    if ms >= 1000 {
+        #[allow(clippy::cast_precision_loss)]
+        // APPROVED: display-only division of a bounded daily lag value.
+        return format!("{:.1} s", ms as f64 / 1000.0);
+    }
+    format!("{ms} ms")
+}
+
+/// Renders a `-1`-sentinel count: honest "?" instead of a fabricated zero.
+fn render_count(v: i64) -> String {
+    if v < 0 {
+        "?".to_string()
+    } else {
+        v.to_string()
+    }
+}
+
 /// Renders the per-feed status block shared by the readiness ("ready to
 /// trade") and end-of-day digest messages. One line per enabled feed:
 ///
@@ -1703,6 +1838,109 @@ impl NotificationEvent {
                      What to do RIGHT NOW:\n\
                      1. Check the app is still running.\n\
                      2. Restart the app to re-arm tomorrow's check."
+                )
+            }
+            Self::DualFeedDailyScorecard {
+                trading_date_ist,
+                dhan,
+                groww,
+                session_minutes,
+                partial_coverage,
+                degraded,
+            } => {
+                // Operator-charter §G wording: plain English, emoji status,
+                // IST 12-hour time, specific numbers, ONE decision (the
+                // verdict line), no library names, no file paths. −1
+                // sentinels render honestly ("?" / "not measured yet") —
+                // never fabricated zeros (audit Rule 11).
+                let streaming_line = |f: &FeedScoreLine| -> String {
+                    if f.streaming_minutes < 0 || *session_minutes <= 0 {
+                        return "unknown".to_string();
+                    }
+                    let ok = f.streaming_minutes.saturating_mul(100)
+                        >= session_minutes.saturating_mul(99);
+                    let mark = if ok { "\u{2705}" } else { "\u{26a0}\u{fe0f}" };
+                    format!(
+                        "{} of {} min {}",
+                        f.streaming_minutes, session_minutes, mark
+                    )
+                };
+                let blame_line = |f: &FeedScoreLine| -> String {
+                    format!(
+                        "{} (broker {} / ours {} / unclear {})",
+                        render_count(f.drops_market),
+                        render_count(f.blame_broker),
+                        render_count(f.blame_ours),
+                        render_count(f.blame_unclear)
+                    )
+                };
+                let mut footnotes = String::new();
+                if *partial_coverage {
+                    footnotes.push_str(
+                        "\n\u{26a0}\u{fe0f} Coverage was partial today — the app did not \
+                         watch the whole session; totals were recovered from the \
+                         day's stored data.",
+                    );
+                }
+                if *degraded {
+                    footnotes.push_str(
+                        "\n\u{26a0}\u{fe0f} Some connection events could not be recorded \
+                         today — treat the drop counts as a minimum, not a truth.",
+                    );
+                }
+                if dhan.lag_p50_ms >= 0 || dhan.lag_p99_ms >= 0 {
+                    footnotes.push_str(
+                        "\nNote: Dhan's price clock ticks in whole seconds, so its \
+                         delay can never read below about 1 second.",
+                    );
+                } else {
+                    footnotes.push_str(
+                        "\nDelay measurement starts with the next upgrade — today \
+                         reads \u{201c}not measured yet\u{201d}.",
+                    );
+                }
+                format!(
+                    "\u{1f4ca} <b>Daily feed scorecard @ 3:45 PM IST</b>\n\
+                     Date: {trading_date_ist}\n\
+                     Ticks today: Dhan {} | Groww {}\n\
+                     Minutes only one feed had prices: Dhan {} | Groww {}\n\
+                     Typical delay: Dhan {} | Groww {}\n\
+                     Worst 1% delay: Dhan {} | Groww {}\n\
+                     Drops in market hours: Dhan {} | Groww {}\n\
+                     Stalls: Dhan {} | Groww {}\n\
+                     App restarts detected: Dhan {} | Groww {}\n\
+                     Streaming: Dhan {} | Groww {}\n\
+                     {}{}",
+                    render_count(dhan.ticks),
+                    render_count(groww.ticks),
+                    render_count(dhan.exclusive_minutes),
+                    render_count(groww.exclusive_minutes),
+                    render_ms(dhan.lag_p50_ms),
+                    render_ms(groww.lag_p50_ms),
+                    render_ms(dhan.lag_p99_ms),
+                    render_ms(groww.lag_p99_ms),
+                    blame_line(dhan),
+                    blame_line(groww),
+                    render_count(dhan.stalls),
+                    render_count(groww.stalls),
+                    render_count(dhan.restarts),
+                    render_count(groww.restarts),
+                    streaming_line(dhan),
+                    streaming_line(groww),
+                    scorecard_verdict(dhan, groww),
+                    footnotes
+                )
+            }
+            Self::DualFeedScorecardAborted { detail } => {
+                let detail = html_escape(detail);
+                format!(
+                    "\u{26a0}\u{fe0f} <b>Daily feed scorecard did NOT run</b>\n\
+                     The 3:45 PM IST Dhan-vs-Groww scorecard died before \
+                     finishing.\n\
+                     Reason: {detail}\n\
+                     What to do RIGHT NOW:\n\
+                     1. Check the app is still running.\n\
+                     2. Restart the app to re-arm tomorrow's scorecard."
                 )
             }
             // PR #4/#5 (2026-05-19): DepthSpotPriceStale + 7 Phase2*
@@ -2370,6 +2608,8 @@ impl NotificationEvent {
             Self::EndOfDayDigest { .. } => "EndOfDayDigest",
             Self::CrossVerify1mSummary { .. } => "CrossVerify1mSummary",
             Self::CrossVerify1mAborted { .. } => "CrossVerify1mAborted",
+            Self::DualFeedDailyScorecard { .. } => "DualFeedDailyScorecard",
+            Self::DualFeedScorecardAborted { .. } => "DualFeedScorecardAborted",
             // PR #4/#5 (2026-05-19): DepthSpotPriceStale + 7 Phase2*
             // name arms retired.
             // PR #6a (2026-05-19): NseBhavcopyCheck* name arms retired.
@@ -2641,6 +2881,12 @@ impl NotificationEvent {
                 }
             }
             Self::CrossVerify1mAborted { .. } => Severity::High,
+            // Dual-feed scorecard (2026-07-10): Info per the contract — the
+            // daily digest is a positive signal; degradation is carried
+            // LOUDLY in the body (partial/degraded footnotes) and a task
+            // death fires the High Aborted variant below instead.
+            Self::DualFeedDailyScorecard { .. } => Severity::Info,
+            Self::DualFeedScorecardAborted { .. } => Severity::High,
             Self::SelfTestPassed { .. } => Severity::Info,
             Self::SelfTestDegraded { .. } => Severity::High,
             Self::RealtimeGuaranteeHealthy { .. } => Severity::Info,
@@ -2785,6 +3031,11 @@ impl NotificationEvent {
             // that re-renders the body — Severity::Info would otherwise be
             // batched by the default routing.
             Self::CrossVerify1mSummary { .. } => DispatchPolicy::Immediate,
+            // Dual-feed scorecard (2026-07-10): the once-per-day 15:45 IST
+            // digest must arrive AT 15:45 (post-close = off-hours, so the
+            // default Info routing would coalesce it) — same rationale as
+            // CrossVerify1mSummary above.
+            Self::DualFeedDailyScorecard { .. } => DispatchPolicy::Immediate,
             // 2026-07-08 (verified incident, operator complaint "why every
             // telegram notification is very late"): PR #1439's in-market
             // digest (900s window) swept the three once-per-trading-day
@@ -6012,6 +6263,167 @@ mod tests {
         assert!(msg.contains("did NOT run"));
         assert!(msg.contains("Reason: task panicked"));
         assert!(msg.contains("What to do RIGHT NOW"));
+    }
+
+    // -----------------------------------------------------------------------
+    // DualFeedDailyScorecard + DualFeedScorecardAborted (2026-07-10 PR-A)
+    // -----------------------------------------------------------------------
+
+    fn score_line(name: &str) -> FeedScoreLine {
+        FeedScoreLine {
+            name: name.to_string(),
+            ticks: 1_842_551,
+            exclusive_minutes: 14,
+            lag_p50_ms: -1,
+            lag_p99_ms: -1,
+            drops_market: 3,
+            blame_broker: 2,
+            blame_ours: 0,
+            blame_unclear: 1,
+            stalls: 0,
+            restarts: 0,
+            streaming_minutes: 373,
+        }
+    }
+
+    fn scorecard(dhan: FeedScoreLine, groww: FeedScoreLine) -> NotificationEvent {
+        NotificationEvent::DualFeedDailyScorecard {
+            trading_date_ist: "2026-07-10".to_string(),
+            dhan,
+            groww,
+            session_minutes: 375,
+            partial_coverage: false,
+            degraded: false,
+        }
+    }
+
+    #[test]
+    fn test_dual_feed_scorecard_topic_severity_policy() {
+        let ev = scorecard(score_line("Dhan"), score_line("Groww"));
+        assert_eq!(ev.topic(), "DualFeedDailyScorecard");
+        assert_eq!(ev.severity(), Severity::Info);
+        // The once-per-day 15:45 digest must arrive AT 15:45 — post-close is
+        // off-hours, so the default Info routing would coalesce it
+        // (CrossVerify1mSummary precedent).
+        assert_eq!(ev.dispatch_policy(), DispatchPolicy::Immediate);
+    }
+
+    #[test]
+    fn test_dual_feed_scorecard_body_verdict_ladder() {
+        // Rung 1: exclusive minutes decide.
+        let mut groww = score_line("Groww");
+        groww.exclusive_minutes = 63;
+        let msg = scorecard(score_line("Dhan"), groww).to_message();
+        assert!(
+            msg.contains("\u{1f3c6} Verdict: Groww won today — 63 exclusive minutes vs 14."),
+            "rung-1 verdict wrong: {msg}"
+        );
+        // Rung 2: tied exclusive minutes → measured worst-1% delay decides.
+        let mut d = score_line("Dhan");
+        let mut g = score_line("Groww");
+        d.lag_p99_ms = 2900;
+        g.lag_p99_ms = 740;
+        let msg = scorecard(d, g).to_message();
+        assert!(
+            msg.contains("Verdict: Groww won today — faster prices"),
+            "rung-2 verdict wrong: {msg}"
+        );
+        // Rung 2 skip: a −1 sentinel must never decide the delay rung.
+        let mut d = score_line("Dhan");
+        let g = score_line("Groww"); // lag -1 both sides
+        d.blame_broker = 5;
+        let msg = scorecard(d, g).to_message();
+        assert!(
+            msg.contains("Verdict: Groww won today — fewer broker-caused drops (2 vs 5)."),
+            "rung-3 verdict wrong: {msg}"
+        );
+        // Rung 4: identical evidence → even day.
+        let msg = scorecard(score_line("Dhan"), score_line("Groww")).to_message();
+        assert!(msg.contains("\u{1f91d} Verdict: Even day."), "{msg}");
+    }
+
+    #[test]
+    fn test_dual_feed_scorecard_body_sentinels_and_footnotes() {
+        // −1 lag renders honestly, never a fabricated 0 (audit Rule 11).
+        let msg = scorecard(score_line("Dhan"), score_line("Groww")).to_message();
+        assert!(msg.contains("not measured yet"), "{msg}");
+        assert!(
+            msg.contains("Delay measurement starts with the next upgrade"),
+            "unmeasured-lag footnote missing: {msg}"
+        );
+        // A MEASURED Dhan lag swaps in the whole-second floor footnote.
+        let mut d = score_line("Dhan");
+        d.lag_p50_ms = 1200;
+        d.lag_p99_ms = 2900;
+        let msg = scorecard(d, score_line("Groww")).to_message();
+        assert!(
+            msg.contains("Dhan's price clock ticks in whole seconds"),
+            "lag-floor footnote missing: {msg}"
+        );
+        assert!(msg.contains("1.2 s"), "≥1s delays render in seconds: {msg}");
+        // Partial + degraded days carry loud warnings.
+        let ev = NotificationEvent::DualFeedDailyScorecard {
+            trading_date_ist: "2026-07-10".to_string(),
+            dhan: score_line("Dhan"),
+            groww: score_line("Groww"),
+            session_minutes: 375,
+            partial_coverage: true,
+            degraded: true,
+        };
+        let msg = ev.to_message();
+        assert!(msg.contains("Coverage was partial today"), "{msg}");
+        assert!(msg.contains("treat the drop counts as a minimum"), "{msg}");
+    }
+
+    #[test]
+    fn test_dual_feed_scorecard_body_obeys_telegram_commandments() {
+        // 10-commandments litmus: emoji-first subject, IST 12-hour time,
+        // specific numbers, blame split, streaming check, no file paths,
+        // no library/infrastructure names.
+        let msg = scorecard(score_line("Dhan"), score_line("Groww")).to_message();
+        assert!(msg.contains("\u{1f4ca}"), "scorecard leads with 📊: {msg}");
+        assert!(msg.contains("3:45 PM IST"), "IST 12-hour time: {msg}");
+        assert!(msg.contains("Date: 2026-07-10"), "{msg}");
+        assert!(
+            msg.contains("Ticks today: Dhan 1842551 | Groww 1842551"),
+            "{msg}"
+        );
+        assert!(
+            msg.contains("Drops in market hours: Dhan 3 (broker 2 / ours 0 / unclear 1)"),
+            "blame split line missing: {msg}"
+        );
+        assert!(msg.contains("Streaming: Dhan 373 of 375 min"), "{msg}");
+        for banned in ["data/", "QuestDB", "ILP", "DEDUP", ".rs", "SQL"] {
+            assert!(
+                !msg.contains(banned),
+                "operator text must not carry {banned:?}: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_dual_feed_scorecard_aborted_event() {
+        let ev = NotificationEvent::DualFeedScorecardAborted {
+            detail: "the task crashed: boom".to_string(),
+        };
+        assert_eq!(ev.topic(), "DualFeedScorecardAborted");
+        assert_eq!(ev.severity(), Severity::High);
+        let msg = ev.to_message();
+        assert!(msg.contains("Daily feed scorecard did NOT run"), "{msg}");
+        assert!(msg.contains("3:45 PM IST"), "{msg}");
+        assert!(msg.contains("Reason: the task crashed: boom"), "{msg}");
+        assert!(msg.contains("What to do RIGHT NOW"), "{msg}");
+    }
+
+    #[test]
+    fn test_scorecard_render_helpers() {
+        // render_ms: sentinel / sub-second / ≥1s bands.
+        assert_eq!(render_ms(-1), "not measured yet");
+        assert_eq!(render_ms(180), "180 ms");
+        assert_eq!(render_ms(2900), "2.9 s");
+        // render_count: sentinel = honest "?", never a fabricated zero.
+        assert_eq!(render_count(-1), "?");
+        assert_eq!(render_count(42), "42");
     }
 
     // -----------------------------------------------------------------------
