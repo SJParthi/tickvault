@@ -10418,7 +10418,13 @@ fn seed_tick_gap_detector_from_plan(plan: &Option<SubscriptionPlan>) {
     // keeps logging a never-ticking month per-SID. Runs at every seed call
     // site (both boot arms + a runtime lane cold start), so a rebuilt plan
     // always overwrites the previous set.
-    let far = far_month_future_sids(plan);
+    // AM-r1 F6: nearest-month identity flows through the shared singular
+    // `select_index_future_expiry`, so the split honors `>= today` at
+    // seed time (a post-midnight lane cold start rolls correctly).
+    let today_ist = (chrono::Utc::now()
+        + chrono::TimeDelta::seconds(tickvault_common::constants::IST_UTC_OFFSET_SECONDS_I64))
+    .date_naive();
+    let far = far_month_future_sids(plan, today_ist);
     let far_month_excluded = far.len();
     store_far_month_future_exclusions(far);
     let Some(detector) = tickvault_core::pipeline::tick_gap_detector::global_tick_gap_detector()
@@ -10453,14 +10459,39 @@ fn seed_tick_gap_detector_from_plan(plan: &Option<SubscriptionPlan>) {
 /// a never-ticking month per-SID (the live-delivery probe for months 2..N).
 /// Composite key per I-P1-11 — a future SID numerically colliding with a
 /// spot SID on another segment must never exclude the spot.
+///
+/// AM-r1 F3 (2026-07-10): grouping is by the CANONICAL underlying
+/// (`canonicalize_index_symbol`), never the raw `underlying_symbol` literal —
+/// the Dhan master legally carries mixed alias literals across months of one
+/// underlying (the MIDCPNIFTY "NIFTY MIDCAP SELECT" precedent); raw-string
+/// groups would split, make every month its own "nearest", and silently
+/// disable the exclusion.
+///
+/// AM-r1 F6 (2026-07-10): the nearest month is identified through the SHARED
+/// singular `select_index_future_expiry` (the `>= today` rule keeps exactly
+/// ONE implementation). An underlying whose plan months are ALL `< today`
+/// (stale boot-frozen plan) gets NO nearest → nothing excluded for it —
+/// fail-safe: its SIDs stay counted, never wrongly subtracted.
+///
+/// AM-r1 F5 honest envelope (2026-07-10): the nearest/far split is per-BOOT,
+/// not per-day — this runs only at plan-seed time (both boot arms + a
+/// runtime lane cold start) on the boot-frozen plan. A process surviving
+/// across an expiry-day IST midnight WITHOUT a re-seed keeps yesterday's
+/// split (the subscription itself is equally boot-frozen — the same
+/// pre-existing envelope); the AWS daily 16:30 stop makes this a
+/// dev/manual-run-only residual. See `futidx-4-error-codes.md` §3.
 #[must_use]
 fn far_month_future_sids(
     plan: &SubscriptionPlan,
+    today_ist: chrono::NaiveDate,
 ) -> std::collections::HashSet<(u64, tickvault_common::types::ExchangeSegment)> {
     use tickvault_common::instrument_registry::SubscriptionCategory;
-    // Pass 1: the nearest (minimum) expiry per underlying. IndexDerivative
-    // is populated ONLY by the IndexFuture role in the DailyUniverse plan.
-    let mut min_expiry: std::collections::HashMap<&str, chrono::NaiveDate> =
+    use tickvault_core::instrument::index_extractor::canonicalize_index_symbol;
+    use tickvault_core::instrument::index_futures::select_index_future_expiry;
+    // Pass 1: collect the plan's expiry months per CANONICAL underlying.
+    // IndexDerivative is populated ONLY by the IndexFuture role in the
+    // DailyUniverse plan.
+    let mut months: std::collections::HashMap<String, Vec<chrono::NaiveDate>> =
         std::collections::HashMap::new();
     for inst in plan.registry.iter() {
         if inst.category != SubscriptionCategory::IndexDerivative {
@@ -10471,14 +10502,20 @@ fn far_month_future_sids(
             // cannot be proven non-nearest).
             continue;
         };
-        min_expiry
-            .entry(inst.underlying_symbol.as_str())
-            .and_modify(|m| {
-                if exp < *m {
-                    *m = exp;
-                }
-            })
-            .or_insert(exp);
+        months
+            .entry(canonicalize_index_symbol(&inst.underlying_symbol))
+            .or_default()
+            .push(exp);
+    }
+    // Nearest per canonical via the shared singular (F6).
+    let mut min_expiry: std::collections::HashMap<String, chrono::NaiveDate> =
+        std::collections::HashMap::new();
+    for (canonical, mut dates) in months {
+        dates.sort_unstable();
+        dates.dedup();
+        if let Some(nearest) = select_index_future_expiry(&dates, today_ist) {
+            min_expiry.insert(canonical, nearest);
+        }
     }
     // Pass 2: every future whose expiry is strictly AFTER its underlying's
     // nearest month is excluded from the alarm-facing silent counts.
@@ -10491,7 +10528,7 @@ fn far_month_future_sids(
         let Some(exp) = inst.expiry_date else {
             continue;
         };
-        if let Some(min) = min_expiry.get(inst.underlying_symbol.as_str())
+        if let Some(min) = min_expiry.get(&canonicalize_index_symbol(&inst.underlying_symbol))
             && exp > *min
         {
             out.insert((inst.security_id, inst.exchange_segment));
@@ -12264,6 +12301,11 @@ mod tests {
     // ── far_month_future_sids (§36.7 alarm-gate exclusion, 2026-07-10) ──
 
     #[cfg(feature = "daily_universe_fetcher")]
+    fn d(s: &str) -> chrono::NaiveDate {
+        chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").expect("test date")
+    }
+
+    #[cfg(feature = "daily_universe_fetcher")]
     fn far_month_test_plan(
         futures: &[(&str, &str, &str, &str)], // (sid, segment, underlying, expiry)
     ) -> SubscriptionPlan {
@@ -12311,7 +12353,7 @@ mod tests {
             ("45002", "BSE_FNO", "SENSEX", "2026-08-28"),
             ("45003", "BSE_FNO", "SENSEX", "2026-09-25"),
         ]);
-        let far = far_month_future_sids(&plan);
+        let far = far_month_future_sids(&plan, d("2026-07-10"));
         assert_eq!(far.len(), 4, "2 far months per underlying excluded");
         for (sid, seg) in [
             (35002, ExchangeSegment::NseFno),
@@ -12337,7 +12379,39 @@ mod tests {
             ("35003", "NSE_FNO", "MIDCPNIFTY", "2026-07-28"),
             ("45001", "BSE_FNO", "SENSEX", "2026-07-31"),
         ]);
-        assert!(far_month_future_sids(&plan).is_empty());
+        assert!(far_month_future_sids(&plan, d("2026-07-10")).is_empty());
+    }
+
+    #[test]
+    #[cfg(feature = "daily_universe_fetcher")]
+    fn test_far_month_future_sids_groups_by_canonical_across_alias_literals() {
+        use tickvault_common::types::ExchangeSegment;
+        // AM-r1 F3 regression: mixed alias literals for ONE underlying
+        // across months (the documented MIDCPNIFTY "NIFTY MIDCAP SELECT"
+        // drift) MUST land in one canonical group — the far month is
+        // excluded even though its raw literal differs from the nearest's.
+        let plan = far_month_test_plan(&[
+            ("35003", "NSE_FNO", "MIDCPNIFTY", "2026-07-28"),
+            ("35004", "NSE_FNO", "NIFTY MIDCAP SELECT", "2026-08-25"),
+        ]);
+        let far = far_month_future_sids(&plan, d("2026-07-10"));
+        assert_eq!(far.len(), 1, "the alias-literal far month is excluded");
+        assert!(far.contains(&(35004, ExchangeSegment::NseFno)));
+        assert!(!far.contains(&(35003, ExchangeSegment::NseFno)));
+    }
+
+    #[test]
+    #[cfg(feature = "daily_universe_fetcher")]
+    fn test_far_month_future_sids_all_months_past_excludes_nothing() {
+        // AM-r1 F6 fail-safe arm: a boot-frozen plan whose months are ALL
+        // `< today` (stale process) yields NO nearest via the shared
+        // singular → nothing is excluded — the SIDs stay counted rather
+        // than a dead front month being wrongly alarm-subtracted.
+        let plan = far_month_test_plan(&[
+            ("35001", "NSE_FNO", "NIFTY", "2026-07-30"),
+            ("35002", "NSE_FNO", "NIFTY", "2026-08-27"),
+        ]);
+        assert!(far_month_future_sids(&plan, d("2026-09-01")).is_empty());
     }
 
     #[test]

@@ -161,7 +161,18 @@ not comparable that day. Counter: `tv_index_futures_parity_mismatch_total`.
   SLO tick-freshness silent count and the `tv_tick_gap_instruments_silent` gauge
   (INDIA-VIX precedent — far months are legitimately sparse; threshold 40 and the 0.95 SLO
   boundary are unchanged). They remain SEEDED in the gap detector, so WS-GAP-06 still logs
-  a never-ticking month per-SID — the live-delivery probe for months 2..N.
+  a never-ticking month per-SID — the live-delivery probe for months 2..N. AM-r1 (2026-07-10)
+  hardening: grouping is by the CANONICAL underlying (alias-literal drift across months — the
+  MIDCPNIFTY precedent — can no longer split groups and silently disable the exclusion), the
+  nearest month flows through the shared `select_index_future_expiry` singular, and the two
+  alarm-facing consumer sites are pinned by the build-failing
+  `crates/app/tests/far_month_alarm_gate_wiring_guard.rs` ratchet. HONEST ENVELOPE (AM-r1 F5):
+  the nearest/far split is per-BOOT, not per-day — it is derived only at plan-seed time (boot
+  arms + a runtime lane cold start) from the boot-frozen plan. A process surviving across an
+  expiry-day IST midnight WITHOUT a re-seed keeps yesterday's split, so a genuinely dead
+  new-front-month would stay alarm-excluded until restart (the subscription itself is equally
+  boot-frozen — the same pre-existing envelope; the AWS daily 16:30 stop makes this a
+  dev/manual-run-only residual, and `far_month_excluded` in the seed `info!` line is the trace).
 - `tv_index_futures_cap_dropped_total{feed="groww"}` — (2026-07-08 hostile-review round 1)
   the §36 futures are CAP-PRIORITY in the Groww live-subscribe set (prepended before the
   prefix truncate), and `tv_index_futures_selected{feed="groww"}` is set from the POST-cap
