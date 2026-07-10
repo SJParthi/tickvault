@@ -945,6 +945,53 @@ fn test_silent_feed_alarms_are_window_gated() {
 }
 
 #[test]
+fn test_ws_pool_alarms_are_window_gated_not_always_armed() {
+    // 2026-07-10 incident pin (pre-09:00 deferral false-page fix): the pool
+    // watchdog writes tv_websocket_pool_all_dead +
+    // tv_websocket_failed_connections_count unconditionally every 5s, while
+    // the pool DELIBERATELY opens zero Dhan sockets until 09:00 IST (the
+    // by-design pre-open connect deferral). ws-pool-all-dead was the ONLY
+    // liveness-class alarm not in the market-hours window gate, so it paged
+    // "ALL live market data connections are down" every trading morning
+    // ~08:34-09:00 and on overnight catch-up-deploy boots (observed
+    // 2026-07-10 at 02:45, 03:42, 08:34 IST); ws-failed-connections shares
+    // the same false class. Fix = the house pattern: actions_enabled=false
+    // + membership in the gate Lambda's ALARM_NAMES join (armed 09:20-15:35
+    // IST Mon-Fri; the open path's set_alarm_state(OK) resets a stale
+    // pre-open ALARM so no false page carries into the armed window).
+    // Losing EITHER half regresses: dropping actions_enabled=false restores
+    // the daily false pages; dropping the ALARM_NAMES entry leaves the
+    // alarm actions-disabled FOREVER (exists but is dead).
+    let tf = read("deploy/aws/terraform/app-alarms.tf");
+    let gate = read("deploy/aws/terraform/market-hours-liveness-alarm.tf");
+    // Scope the membership check to the ALARM_NAMES join body itself, so a
+    // mere comment mention elsewhere in the gate file can never satisfy it.
+    let join_start = gate
+        .find("ALARM_NAMES = join(")
+        .expect("market-hours-liveness-alarm.tf must carry the ALARM_NAMES join"); // APPROVED: test
+    let join_rest = &gate[join_start..];
+    let join_end = join_rest
+        .find("])")
+        .expect("ALARM_NAMES join must close with `])`"); // APPROVED: test
+    let join_body = &join_rest[..join_end];
+    for name in ["ws_pool_all_dead", "ws_failed_connections"] {
+        let block = alarm_resource_block(&tf, name);
+        assert!(
+            block_has_attr(&block, "actions_enabled", "false"),
+            "{name} must ship actions_enabled=false (gate Lambda owns the 09:20-15:35 IST \
+             window; always-armed actions false-page during the by-design pre-09:00 IST \
+             Dhan connect deferral — 2026-07-10 incident):\n{block}"
+        );
+        assert!(
+            join_body.contains(&format!("aws_cloudwatch_metric_alarm.{name}.alarm_name")),
+            "{name} must be INSIDE the window-gate Lambda ALARM_NAMES join \
+             (market-hours-liveness-alarm.tf) — without it the alarm stays \
+             actions-disabled forever. Join body was:\n{join_body}"
+        );
+    }
+}
+
+#[test]
 fn test_boundary_catchup_alarm_uses_per_feed_dimensions() {
     // Rule-11 pin: the catch-up storm alarm must key on the EXPLICIT
     // { host, feed = "dhan" } dimensions map — NOT local.app_dimensions
