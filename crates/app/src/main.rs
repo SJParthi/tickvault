@@ -2842,6 +2842,17 @@ async fn main() -> Result<()> {
             std::sync::Arc::clone(&feed_health),
         );
 
+        // Dual-feed scoreboard on the FAST crash-recovery arm too (hostile
+        // review 2026-07-10, CRITICAL): this arm `return run_shutdown_fast`s
+        // and never reaches the slow-path spawn below — yet a mid-market
+        // process death with a valid cached token restarts through EXACTLY
+        // this arm, which is the one boot that must synthesize the
+        // process_death episode AND own the day's 15:45 scorecard. Without
+        // this call the flagship crash-restart day produced NO episode row,
+        // NO scorecard and NO Aborted page (nothing was spawned to die).
+        // `notifier` here is the fast_notifier clone from above.
+        spawn_feed_scoreboard_tasks(&config, &trading_calendar, &notifier);
+
         // --- Await shutdown ---
         return run_shutdown_fast(
             ws_handles,
@@ -14589,29 +14600,30 @@ fn spawn_feed_scoreboard_tasks(
     }
     use tickvault_app::feed_scoreboard_boot::{
         PROCESS_DEATH_RECONCILE_DELAY_SECS, ScoreboardStart, decide_scoreboard_start,
-        is_in_market_hours_secs, reconcile_process_death_episodes, run_feed_scoreboard,
+        parse_scoreboard_date_override, reconcile_process_death_episodes, run_feed_scoreboard,
     };
     use tickvault_common::constants::IST_UTC_OFFSET_SECONDS;
 
-    // ── Task 1: boot-time process-death reconciler ──
-    {
+    // ── Task 1: boot-time process-death reconciler (polling — hostile
+    // review 2026-07-10: a fast crash-recovery boot can wait out a 300s
+    // 429 cooldown before its first connect, past the old one-shot 180s
+    // query). The JoinHandle is threaded into Task 2 so a RunCatchUp /
+    // forced run aggregates AFTER the synthesized rows exist.
+    let reconcile_handle = {
         let pd_qcfg = config.questdb.clone();
         tokio::spawn(async move {
-            use chrono::{FixedOffset, TimeZone, Timelike, Utc};
-            let Some(ist_offset) = FixedOffset::east_opt(IST_UTC_OFFSET_SECONDS) else {
-                return;
-            };
+            use chrono::Utc;
             // Capture the boot instant BEFORE the settle sleep — the death
-            // gap is anchored to THIS boot.
-            let boot_ist = ist_offset.from_utc_datetime(&Utc::now().naive_utc());
-            let boot_secs_of_day = boot_ist.time().num_seconds_from_midnight();
+            // gap is anchored to THIS boot. (The in-session gate now keys
+            // on the DEATH window — the prior "up" row — inside the pure
+            // synthesis fn, never on the boot instant.)
             let boot_ist_secs = Utc::now()
                 .timestamp()
                 .saturating_add(i64::from(IST_UTC_OFFSET_SECONDS));
             let boot_ts_ist_nanos = boot_ist_secs.saturating_mul(1_000_000_000);
-            let boot_in_session = is_in_market_hours_secs(boot_secs_of_day);
             // Let this boot's own `connected` audit rows land first (async
-            // audit writer + ILP flush).
+            // audit writer + ILP flush); the reconciler then POLLS for the
+            // post-boot connect row (60s cadence, bounded).
             tokio::time::sleep(std::time::Duration::from_secs(
                 PROCESS_DEATH_RECONCILE_DELAY_SECS,
             ))
@@ -14627,11 +14639,10 @@ fn spawn_feed_scoreboard_tasks(
                 target_ist_day,
                 trading_date_ist_nanos,
                 boot_ts_ist_nanos,
-                boot_in_session,
             )
             .await;
-        });
-    }
+        })
+    };
 
     // ── Task 2: the daily aggregation + Telegram scorecard ──
     let sb_qcfg = config.questdb.clone();
@@ -14651,6 +14662,35 @@ fn spawn_feed_scoreboard_tasks(
         let force_now = std::env::var("TICKVAULT_SCOREBOARD_NOW")
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
+        // Past-day backfill (design contract §5): TICKVAULT_SCOREBOARD_DATE
+        // =YYYY-MM-DD, honored ONLY alongside TICKVAULT_SCOREBOARD_NOW.
+        // Fail-closed: a malformed date REFUSES the run loudly (the outer
+        // supervisor pages Aborted) instead of silently aggregating the
+        // wrong day.
+        let date_override: Option<(u64, String)> = if force_now {
+            match std::env::var("TICKVAULT_SCOREBOARD_DATE") {
+                Ok(raw) => match parse_scoreboard_date_override(&raw) {
+                    Some(v) => Some(v),
+                    None => {
+                        error!(
+                            code = tickvault_common::error_code::ErrorCode::
+                                Scoreboard01AggregationDegraded
+                                .code_str(),
+                            stage = "date_override_parse",
+                            raw = %raw,
+                            "SCOREBOARD-01: invalid TICKVAULT_SCOREBOARD_DATE — \
+                             expected strict YYYY-MM-DD; refusing the forced run"
+                        );
+                        return Err(format!(
+                            "invalid TICKVAULT_SCOREBOARD_DATE {raw:?} — expected YYYY-MM-DD"
+                        ));
+                    }
+                },
+                Err(_) => None,
+            }
+        } else {
+            None
+        };
         let is_trading_day = sb_calendar.is_trading_day(today_ist);
         match decide_scoreboard_start(boot_secs_of_day, is_trading_day, force_now, sb_trigger) {
             ScoreboardStart::SkipNonTradingDay => {
@@ -14666,6 +14706,7 @@ fn spawn_feed_scoreboard_tasks(
             }
             ScoreboardStart::RunNow => {
                 info!(
+                    backfill_date = date_override.as_ref().map_or("today", |(_, l)| l.as_str()),
                     "feed_scoreboard: TICKVAULT_SCOREBOARD_NOW set — running \
                      on-demand NOW (operator dry-run / backfill)"
                 );
@@ -14678,19 +14719,41 @@ fn spawn_feed_scoreboard_tasks(
                 tokio::time::sleep(std::time::Duration::from_secs(secs_until)).await;
             }
         }
+        // Aggregate AFTER the boot-time process-death reconciler finishes
+        // (hostile review 2026-07-10: a post-trigger RunCatchUp boot used
+        // to aggregate immediately — concurrently with / before the
+        // reconciler — so a just-synthesized death missed that run's
+        // tallies). The handle resolves in ≤ ~13 min worst case; the
+        // scheduled 15:45 path has usually long passed it.
+        let _ = reconcile_handle.await;
         // Recompute "today" AFTER the sleep (the trigger fires same-day, but
-        // a forced run near midnight must stamp the actual run day).
+        // a forced run near midnight must stamp the actual run day) — unless
+        // the operator pinned a backfill date.
         let run_ist = ist_offset.from_utc_datetime(&Utc::now().naive_utc());
         let run_ist_secs = Utc::now()
             .timestamp()
             .saturating_add(i64::from(IST_UTC_OFFSET_SECONDS));
+        let run_secs_of_day = run_ist.time().num_seconds_from_midnight();
         // APPROVED: epoch day number fits u64 trivially.
-        let target_ist_day = run_ist_secs.max(0) as u64 / 86_400;
+        let today_day = run_ist_secs.max(0) as u64 / 86_400;
+        let (target_ist_day, trading_date_label) = date_override.unwrap_or_else(|| {
+            (
+                today_day,
+                run_ist.date_naive().format("%Y-%m-%d").to_string(),
+            )
+        });
+        // A forced run BEFORE the trigger targeting TODAY covers only part
+        // of the session — the row is stamped partial and the card says so
+        // (hostile review 2026-07-10: never a mid-day row masquerading as
+        // a complete end-of-day row).
+        let forced_early_run =
+            force_now && target_ist_day == today_day && run_secs_of_day < sb_trigger;
         let summary = run_feed_scoreboard(
             &sb_qcfg,
             sb_metrics_port,
             target_ist_day,
-            run_ist.date_naive().format("%Y-%m-%d").to_string(),
+            trading_date_label,
+            forced_early_run,
         )
         .await?;
         info!("PROOF: feed_scoreboard daily aggregation fired");
@@ -14704,13 +14767,21 @@ fn spawn_feed_scoreboard_tasks(
                 name: name.to_string(),
                 ticks: n.ticks,
                 exclusive_minutes: n.unique_win_minutes,
+                // PR-3 NOTE: the lag day-histograms rewire THIS CONVERTER
+                // (read them from the summary), not just the row writer —
+                // the -1 sentinels here are what render "not measured yet".
                 lag_p50_ms: -1,
                 lag_p99_ms: -1,
                 drops_market: n.disconnects_market,
                 blame_broker: n.blame_broker,
                 blame_ours: n.blame_ours,
                 blame_unclear: n.blame_indeterminate,
-                stalls: n.stalls,
+                // PR-1 has NO stall emit site (the StallRestarted event kind
+                // ships in PR-2), so the table's 0 is unmeasurable-as-zero on
+                // the operator surface — render the honest "?" sentinel +
+                // footnote instead of a fabricated 0 (hostile review
+                // 2026-07-10; audit Rule 11). PR-2 flips this to n.stalls.
+                stalls: -1,
                 restarts: n.restarts,
                 streaming_minutes: n.streaming_minutes,
             }
@@ -14725,6 +14796,7 @@ fn spawn_feed_scoreboard_tasks(
                         session_minutes: summary.session_minutes,
                         partial_coverage: summary.partial_coverage,
                         degraded: summary.degraded,
+                        early_run: summary.early_run,
                     });
                 } else {
                     info!("feed_scoreboard: Telegram disabled — daily rows written only");

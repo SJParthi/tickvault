@@ -1321,23 +1321,50 @@ mod tests {
 
     /// Dual-feed scoreboard PR-A (operator 2026-07-10) meta-guard: main.rs
     /// MUST spawn the process-global scoreboard tasks (the boot-time
-    /// process-death reconciler + the 15:45 IST daily aggregation) and emit
-    /// the `DualFeedDailyScorecard` Telegram from the outer supervisor.
-    /// Rule 13 (audit-findings 2026-04-17): a variant/module defined + tested
-    /// but never called IS a bug — this source-scan fails the build if a
-    /// future refactor removes the call sites.
+    /// process-death reconciler + the 15:45 IST daily aggregation) on BOTH
+    /// boot paths and emit the `DualFeedDailyScorecard` Telegram from the
+    /// outer supervisor. Rule 13 (audit-findings 2026-04-17): a
+    /// variant/module defined + tested but never called IS a bug — this
+    /// source-scan fails the build if a future refactor removes the call
+    /// sites.
+    ///
+    /// Hostile review 2026-07-10 (CRITICAL): the FAST crash-recovery arm
+    /// `return run_shutdown_fast(...)`s and never reaches the slow-path
+    /// spawn — yet a mid-market process death restarts through EXACTLY that
+    /// arm, the one boot that must synthesize the process_death episode and
+    /// own the day's 15:45 scorecard. This ratchet therefore pins TWO call
+    /// sites by SOURCE ORDER (the per-boot-path source-order-scan pattern):
+    /// one BEFORE the fast arm's `return run_shutdown_fast(` and one AFTER
+    /// it (the slow/process-global prefix).
     #[test]
     fn test_feed_scoreboard_task_is_wired_into_main() {
         let main_rs = std::fs::read_to_string("../app/src/main.rs")
             .or_else(|_| std::fs::read_to_string("crates/app/src/main.rs"))
             .expect("main.rs must be readable");
+        let spawn_needle = "spawn_feed_scoreboard_tasks(&config, &trading_calendar, &notifier)";
+        let spawn_sites: Vec<usize> = main_rs
+            .match_indices(spawn_needle)
+            .map(|(i, _)| i)
+            .collect();
+        let fast_return = main_rs
+            .find("return run_shutdown_fast(")
+            .expect("main.rs must contain the fast-boot `return run_shutdown_fast(` arm");
         assert!(
-            main_rs.contains("spawn_feed_scoreboard_tasks(&config, &trading_calendar, &notifier)"),
+            spawn_sites.iter().any(|&i| i < fast_return),
+            "main.rs MUST spawn the dual-feed scoreboard tasks on the FAST \
+             crash-recovery boot arm (BEFORE `return run_shutdown_fast(`) — \
+             a mid-market process death restarts through that arm, and \
+             without the spawn the flagship crash-restart day records NO \
+             process_death episode, NO 15:45 scorecard and NO Aborted page. \
+             See .claude/plans/active-plan-dual-feed-scoreboard.md."
+        );
+        assert!(
+            spawn_sites.iter().any(|&i| i > fast_return),
             "main.rs MUST spawn the dual-feed scoreboard tasks from the \
-             process-global prefix (next to spawn_daily_tick_conservation_task). \
-             Without it the feed_scoreboard_boot module + the \
-             DualFeedDailyScorecard event are dead code. See \
-             .claude/plans/active-plan-dual-feed-scoreboard.md."
+             slow-boot process-global prefix too (next to \
+             spawn_daily_tick_conservation_task) — without it the \
+             feed_scoreboard_boot module + the DualFeedDailyScorecard event \
+             are dead code on normal boots."
         );
         assert!(
             main_rs.contains("NotificationEvent::DualFeedDailyScorecard {"),

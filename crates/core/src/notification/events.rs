@@ -491,6 +491,9 @@ pub enum NotificationEvent {
         /// `true` when the connection-event record itself under-counted
         /// today — drop counts are a floor, not a truth.
         degraded: bool,
+        /// `true` when the operator forced this run BEFORE the daily
+        /// trigger — the card covers the day only up to the run time.
+        early_run: bool,
     },
 
     /// The daily dual-feed scorecard TASK died (panicked / errored) before
@@ -1232,8 +1235,15 @@ fn scorecard_verdict(dhan: &FeedScoreLine, groww: &FeedScoreLine) -> String {
             render_ms(l.lag_p99_ms)
         );
     }
-    // Rung 3: fewer broker-caused drops wins.
-    if dhan.drops_market >= 0 && groww.drops_market >= 0 && dhan.blame_broker != groww.blame_broker
+    // Rung 3: fewer broker-caused drops wins. The blame tallies must BOTH
+    // be measured too — a -1 sentinel would otherwise "win" (-1 < N) and
+    // render as gibberish (hostile review 2026-07-10); sentinel days fall
+    // through to "Even day".
+    if dhan.drops_market >= 0
+        && groww.drops_market >= 0
+        && dhan.blame_broker >= 0
+        && groww.blame_broker >= 0
+        && dhan.blame_broker != groww.blame_broker
     {
         let (w, l) = if dhan.blame_broker < groww.blame_broker {
             (dhan, groww)
@@ -1263,12 +1273,20 @@ fn render_ms(ms: i64) -> String {
 }
 
 /// Renders a `-1`-sentinel count: honest "?" instead of a fabricated zero.
+/// Large measured counts (≥ 10,000 — the daily tick totals) get thousands
+/// separators per Telegram commandment 6 ("11,034 instruments").
 fn render_count(v: i64) -> String {
     if v < 0 {
-        "?".to_string()
-    } else {
-        v.to_string()
+        return "?".to_string();
     }
+    if v >= 10_000 {
+        // APPROVED: v is non-negative and bounded by daily tick volumes —
+        // fits usize on every supported target.
+        if let Ok(u) = usize::try_from(v) {
+            return format_with_commas(u);
+        }
+    }
+    v.to_string()
 }
 
 /// Renders the per-feed status block shared by the readiness ("ready to
@@ -1847,6 +1865,7 @@ impl NotificationEvent {
                 session_minutes,
                 partial_coverage,
                 degraded,
+                early_run,
             } => {
                 // Operator-charter §G wording: plain English, emoji status,
                 // IST 12-hour time, specific numbers, ONE decision (the
@@ -1865,21 +1884,36 @@ impl NotificationEvent {
                         f.streaming_minutes, session_minutes, mark
                     )
                 };
-                let blame_line = |f: &FeedScoreLine| -> String {
+                // The who-caused-them split covers ALL of the day's headline
+                // incidents (drops + stalls + restarts), so it lives on its
+                // OWN line, decoupled from the drops count — a day with 0
+                // drops and 1 restart must never read "0 (ours 1)" (hostile
+                // review 2026-07-10).
+                let incident_split = |f: &FeedScoreLine| -> String {
                     format!(
-                        "{} (broker {} / ours {} / unclear {})",
-                        render_count(f.drops_market),
+                        "broker {} / ours {} / unclear {}",
                         render_count(f.blame_broker),
                         render_count(f.blame_ours),
                         render_count(f.blame_unclear)
                     )
                 };
                 let mut footnotes = String::new();
-                if *partial_coverage {
+                if *early_run {
                     footnotes.push_str(
-                        "\n\u{26a0}\u{fe0f} Coverage was partial today — the app did not \
-                         watch the whole session; totals were recovered from the \
-                         day's stored data.",
+                        "\n\u{26a0}\u{fe0f} This card was produced early on operator \
+                         request — it covers the day only up to the run time; \
+                         re-run after close for the full-day card.",
+                    );
+                }
+                if *partial_coverage {
+                    // Honest PR-1 cause (hostile review 2026-07-10): this
+                    // flag flips on READ/WRITE failures while building the
+                    // card — NOT on "the app was down part of the session"
+                    // (restart detection is a later upgrade).
+                    footnotes.push_str(
+                        "\n\u{26a0}\u{fe0f} Some of today's records could not be read \
+                         while building this card — numbers shown as \u{201c}?\u{201d} \
+                         are missing, and the rest may under-count.",
                     );
                 }
                 if *degraded {
@@ -1899,6 +1933,12 @@ impl NotificationEvent {
                          reads \u{201c}not measured yet\u{201d}.",
                     );
                 }
+                if dhan.stalls < 0 && groww.stalls < 0 {
+                    footnotes.push_str(
+                        "\nStall tracking starts with the next upgrade — today \
+                         reads \u{201c}?\u{201d}.",
+                    );
+                }
                 format!(
                     "\u{1f4ca} <b>Daily feed scorecard @ 3:45 PM IST</b>\n\
                      Date: {trading_date_ist}\n\
@@ -1907,6 +1947,7 @@ impl NotificationEvent {
                      Typical delay: Dhan {} | Groww {}\n\
                      Worst 1% delay: Dhan {} | Groww {}\n\
                      Drops in market hours: Dhan {} | Groww {}\n\
+                     Who caused today's incidents: Dhan {} | Groww {}\n\
                      Stalls: Dhan {} | Groww {}\n\
                      App restarts detected: Dhan {} | Groww {}\n\
                      Streaming: Dhan {} | Groww {}\n\
@@ -1919,8 +1960,10 @@ impl NotificationEvent {
                     render_ms(groww.lag_p50_ms),
                     render_ms(dhan.lag_p99_ms),
                     render_ms(groww.lag_p99_ms),
-                    blame_line(dhan),
-                    blame_line(groww),
+                    render_count(dhan.drops_market),
+                    render_count(groww.drops_market),
+                    incident_split(dhan),
+                    incident_split(groww),
                     render_count(dhan.stalls),
                     render_count(groww.stalls),
                     render_count(dhan.restarts),
@@ -6294,6 +6337,7 @@ mod tests {
             session_minutes: 375,
             partial_coverage: false,
             degraded: false,
+            early_run: false,
         }
     }
 
@@ -6337,6 +6381,20 @@ mod tests {
             msg.contains("Verdict: Groww won today — fewer broker-caused drops (2 vs 5)."),
             "rung-3 verdict wrong: {msg}"
         );
+        // Rung 3 skip (hostile review 2026-07-10): a −1 blame sentinel must
+        // never win the drops rung nor render "-1" — falls to Even day.
+        let mut d = score_line("Dhan");
+        let g = score_line("Groww");
+        d.blame_broker = -1; // drops_market still >= 0
+        let msg = scorecard(d, g).to_message();
+        assert!(
+            msg.contains("\u{1f91d} Verdict: Even day."),
+            "a -1 blame sentinel must not decide rung 3: {msg}"
+        );
+        assert!(
+            !msg.contains("(-1 vs"),
+            "the -1 sentinel must never render in a verdict: {msg}"
+        );
         // Rung 4: identical evidence → even day.
         let msg = scorecard(score_line("Dhan"), score_line("Groww")).to_message();
         assert!(msg.contains("\u{1f91d} Verdict: Even day."), "{msg}");
@@ -6361,7 +6419,22 @@ mod tests {
             "lag-floor footnote missing: {msg}"
         );
         assert!(msg.contains("1.2 s"), "≥1s delays render in seconds: {msg}");
-        // Partial + degraded days carry loud warnings.
+        // Unmeasured stalls (PR-1: no stall emit site) render "?" + an
+        // explicit footnote — never a fabricated 0 (hostile review
+        // 2026-07-10; audit Rule 11).
+        let mut d = score_line("Dhan");
+        let mut g = score_line("Groww");
+        d.stalls = -1;
+        g.stalls = -1;
+        let msg = scorecard(d, g).to_message();
+        assert!(msg.contains("Stalls: Dhan ? | Groww ?"), "{msg}");
+        assert!(
+            msg.contains("Stall tracking starts with the next upgrade"),
+            "stall footnote missing: {msg}"
+        );
+        // Partial + degraded days carry loud warnings — the partial wording
+        // names the HONEST PR-1 cause (a read failure while building the
+        // card), never an unmeasured "app was down" claim.
         let ev = NotificationEvent::DualFeedDailyScorecard {
             trading_date_ist: "2026-07-10".to_string(),
             dhan: score_line("Dhan"),
@@ -6369,10 +6442,34 @@ mod tests {
             session_minutes: 375,
             partial_coverage: true,
             degraded: true,
+            early_run: false,
         };
         let msg = ev.to_message();
-        assert!(msg.contains("Coverage was partial today"), "{msg}");
+        assert!(
+            msg.contains("Some of today's records could not be read"),
+            "{msg}"
+        );
+        assert!(
+            !msg.contains("the app did not watch the whole session"),
+            "the unmeasured restart claim must not render: {msg}"
+        );
         assert!(msg.contains("treat the drop counts as a minimum"), "{msg}");
+        // An early forced run says so explicitly (the row is stamped
+        // partial; the card must not masquerade as end-of-day).
+        let ev = NotificationEvent::DualFeedDailyScorecard {
+            trading_date_ist: "2026-07-10".to_string(),
+            dhan: score_line("Dhan"),
+            groww: score_line("Groww"),
+            session_minutes: 375,
+            partial_coverage: false,
+            degraded: false,
+            early_run: true,
+        };
+        let msg = ev.to_message();
+        assert!(
+            msg.contains("produced early on operator request"),
+            "early-run footnote missing: {msg}"
+        );
     }
 
     #[test]
@@ -6384,13 +6481,20 @@ mod tests {
         assert!(msg.contains("\u{1f4ca}"), "scorecard leads with 📊: {msg}");
         assert!(msg.contains("3:45 PM IST"), "IST 12-hour time: {msg}");
         assert!(msg.contains("Date: 2026-07-10"), "{msg}");
+        // Commandment 6: big counts carry thousands separators.
         assert!(
-            msg.contains("Ticks today: Dhan 1842551 | Groww 1842551"),
+            msg.contains("Ticks today: Dhan 1,842,551 | Groww 1,842,551"),
             "{msg}"
         );
         assert!(
-            msg.contains("Drops in market hours: Dhan 3 (broker 2 / ours 0 / unclear 1)"),
-            "blame split line missing: {msg}"
+            msg.contains("Drops in market hours: Dhan 3 | Groww 3"),
+            "drops line missing: {msg}"
+        );
+        // The blame split is its OWN line, decoupled from the drops count
+        // (it covers ALL headline incidents — drops + stalls + restarts).
+        assert!(
+            msg.contains("Who caused today's incidents: Dhan broker 2 / ours 0 / unclear 1"),
+            "incident split line missing: {msg}"
         );
         assert!(msg.contains("Streaming: Dhan 373 of 375 min"), "{msg}");
         for banned in ["data/", "QuestDB", "ILP", "DEDUP", ".rs", "SQL"] {
@@ -6421,9 +6525,13 @@ mod tests {
         assert_eq!(render_ms(-1), "not measured yet");
         assert_eq!(render_ms(180), "180 ms");
         assert_eq!(render_ms(2900), "2.9 s");
-        // render_count: sentinel = honest "?", never a fabricated zero.
+        // render_count: sentinel = honest "?", never a fabricated zero;
+        // big measured counts get thousands separators (commandment 6).
         assert_eq!(render_count(-1), "?");
         assert_eq!(render_count(42), "42");
+        assert_eq!(render_count(9_999), "9999", "grouping starts at 10,000");
+        assert_eq!(render_count(10_000), "10,000");
+        assert_eq!(render_count(1_842_551), "1,842,551");
     }
 
     // -----------------------------------------------------------------------

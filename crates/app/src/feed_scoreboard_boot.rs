@@ -3,26 +3,33 @@
 //! captured, visualized, logged, monitored, 100% automated"* + *"ensure and
 //! CAPTURE that the issue really arose from the broker side"*).
 //!
-//! Two entry points, both spawned from `main.rs`'s process-global prefix
-//! (gated on `[scoreboard] enabled`):
+//! Two entry points, spawned from `main.rs` on BOTH boot paths — the slow
+//! process-global prefix AND the FAST crash-recovery arm (hostile review
+//! 2026-07-10: the fast arm is the DOMINANT mid-market restart channel and
+//! `return`s before the slow-path spawn) — gated on `[scoreboard] enabled`:
 //!
-//! 1. [`reconcile_process_death_episodes`] — ONCE per boot (delayed a few
-//!    minutes so this boot's `connected` audit rows land): a dying process
-//!    writes NO disconnect row, so the BOOTING process is its own
+//! 1. [`reconcile_process_death_episodes`] — ONCE per boot (first query
+//!    delayed a few minutes so this boot's `connected` audit rows land,
+//!    then POLLING until this boot's own connect row is visible): a dying
+//!    process writes NO disconnect row, so the BOOTING process is its own
 //!    correlation evidence. For each `(feed, ws_type, connection_index)`
-//!    whose last PRE-boot `ws_event_audit` row was an "up" kind and whose
-//!    first POST-boot `connected` row exists, synthesize ONE `process_death`
-//!    episode at the deterministic post-boot connected ts (DEDUP-idempotent
-//!    across repeated boots), blame ALWAYS `ours` with the deploy-vs-crash
-//!    sub-reason (`build_info::BUILD_GIT_SHA` vs the SSM
+//!    whose last PRE-boot `ws_event_audit` row was an "up" kind IN SESSION
+//!    (the DEATH-window gate) and whose first POST-boot `connected` row
+//!    exists, synthesize ONE `process_death` episode at the deterministic
+//!    post-boot connected ts (DEDUP-idempotent across repeated boots),
+//!    blame ALWAYS `ours` with the deploy-vs-crash sub-reason
+//!    (`build_info::BUILD_GIT_SHA` vs the SSM
 //!    `/tickvault/<env>/deploy/binary-git-sha` control-plane param,
 //!    fail-soft to `process_restart`).
 //! 2. [`run_feed_scoreboard`] — the 15:45 IST daily aggregation
 //!    (`tick_conservation_boot` idiom: pure decide fn with the RunCatchUp
-//!    late-boot variant + the `TICKVAULT_SCOREBOARD_NOW` operator override +
-//!    the trading-day gate). Classifies today's disconnect episodes from
+//!    late-boot variant + the `TICKVAULT_SCOREBOARD_NOW` operator override
+//!    (+ `TICKVAULT_SCOREBOARD_DATE=YYYY-MM-DD` past-day backfill) + the
+//!    trading-day gate). Classifies today's disconnect episodes from
 //!    `ws_event_audit` (+ the same-day errors.jsonl correlation scan),
-//!    UPSERTs `feed_episode_audit`, aggregates per-feed coverage from the
+//!    UPSERTs `feed_episode_audit` and tallies them IN MEMORY (the
+//!    read-back merges only the long-visible boot-reconciled rows — never
+//!    its own just-flushed rows), aggregates per-feed coverage from the
 //!    `ticks` partition, writes the two `feed_scoreboard_daily` rows, and
 //!    returns the summary the Telegram scorecard is built from.
 //!
@@ -58,7 +65,7 @@ use tickvault_storage::feed_scoreboard_persistence::{
     ScoreboardOutcome, ensure_feed_scoreboard_tables,
 };
 
-use crate::tick_conservation_boot::{build_conservation_ticks_count_sql, parse_questdb_count};
+use crate::tick_conservation_boot::parse_questdb_count;
 
 /// IST seconds-of-day of the DETERMINISTIC daily-row timestamp (15:45:00).
 /// This stamps `feed_scoreboard_daily.ts` regardless of when the run
@@ -82,11 +89,23 @@ pub const WS_GAP9_OVERLAP_WINDOW_SECS: i64 = 120;
 /// PROC-01 / RESOURCE-01..03 corroboration window (±300s).
 pub const RESOURCE_OVERLAP_WINDOW_SECS: i64 = 300;
 
-/// How long after boot the process-death reconciler waits so this boot's
-/// own `connected` audit rows have landed in QuestDB (the async audit
-/// writer + ILP flush). Honest envelope: a connect that lands later than
-/// this misses that day's synthesis — bounded, documented, fail-soft.
+/// How long after boot the process-death reconciler waits before its FIRST
+/// query so this boot's own `connected` audit rows have landed in QuestDB
+/// (the async audit writer + ILP flush).
 pub const PROCESS_DEATH_RECONCILE_DELAY_SECS: u64 = 180;
+
+/// Poll cadence + attempt bound for the reconciler (hostile review
+/// 2026-07-10): a fast crash-recovery boot inside a Dhan 429 window waits
+/// out the persisted WS-GAP-08 cooldown of up to 300s BEFORE
+/// `create_websocket_pool`, so this boot's first `connected` row can land
+/// well after the 180s first query — exactly the restart-storm case the
+/// process-death detection exists for. The reconciler therefore POLLS
+/// (DEDUP-idempotent synthesis makes repeats safe by construction) until a
+/// post-boot connect row appears or the attempt budget is spent:
+/// 180s + 9 × 60s ≈ 12.2 min total window, comfortably past the 300s
+/// cooldown + connection stagger + audit-flush latency (≥ 420s worst case).
+pub const PROCESS_DEATH_RECONCILE_POLL_INTERVAL_SECS: u64 = 60;
+pub const PROCESS_DEATH_RECONCILE_MAX_ATTEMPTS: u32 = 10;
 
 /// HTTP timeout for every QuestDB `/exec` read in this module.
 const SCOREBOARD_HTTP_TIMEOUT_SECS: u64 = 10;
@@ -139,10 +158,56 @@ pub fn is_in_market_hours_secs(secs_of_day_ist: u32) -> bool {
         .contains(&secs_of_day_ist)
 }
 
+/// Parse + validate the `TICKVAULT_SCOREBOARD_DATE=YYYY-MM-DD` past-day
+/// backfill override (design contract §5: `TICKVAULT_SCOREBOARD_NOW` "+
+/// optional date arg for past-day backfill"). Returns `(ist_day_number,
+/// label)`.
+///
+/// STRICT fail-closed validation (the `instrument_snapshot::
+/// is_valid_trading_date` discipline): exactly `YYYY-MM-DD`, digits only,
+/// a real calendar date, not before the 1970 epoch — anything else yields
+/// `None` and the caller REFUSES the run loudly rather than silently
+/// aggregating the wrong day.
+#[must_use]
+pub fn parse_scoreboard_date_override(raw: &str) -> Option<(u64, String)> {
+    let raw = raw.trim();
+    if raw.len() != 10 {
+        return None;
+    }
+    let ok_shape = raw.chars().enumerate().all(|(i, c)| {
+        if i == 4 || i == 7 {
+            c == '-'
+        } else {
+            c.is_ascii_digit()
+        }
+    });
+    if !ok_shape {
+        return None;
+    }
+    let date = chrono::NaiveDate::parse_from_str(raw, "%Y-%m-%d").ok()?;
+    let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1)?;
+    let days = date.signed_duration_since(epoch).num_days();
+    u64::try_from(days).ok().map(|d| (d, raw.to_string()))
+}
+
 // ---------------------------------------------------------------------------
 // SQL builders (pure — every literal is a compile-time constant or an i64;
 // no user input reaches the SQL, so there is no injection surface)
+//
+// REGRESSION LOCK (hostile review 2026-07-10, CRITICAL — empirically
+// confirmed on the pinned QuestDB 9.3.5): a bare integer literal compared
+// against a TIMESTAMP column is interpreted as epoch **MICROSECONDS**, not
+// nanoseconds. A nanosecond literal (`ts >= 1_783_996_200_000_000_000`)
+// silently matches ZERO rows — every window query would return empty and
+// the scoreboard would stamp fabricated all-zero "complete" days (the exact
+// audit-Rule-11 false-OK class). Every embedded window bound below MUST
+// therefore come from `day_bounds_micros` (nanos ÷ 1_000). The in-memory
+// side (parsers / correlation / episode rows) stays in nanos — only the SQL
+// literals are micros. Pinned by the per-builder digit-magnitude tests
+// (a 2026 date's micros bound has 16 digits; the broken nanos bound has 19).
 // ---------------------------------------------------------------------------
+
+const MICROS_PER_SEC: i64 = 1_000_000;
 
 fn day_bounds_nanos(target_ist_day: u64) -> (i64, i64) {
     // APPROVED: IST day numbers are ~20K, far below i64::MAX — saturating
@@ -154,11 +219,26 @@ fn day_bounds_nanos(target_ist_day: u64) -> (i64, i64) {
     (start, start.saturating_add(86_400 * NANOS_PER_SEC))
 }
 
+/// IST-day bounds in epoch MICROSECONDS — the ONLY representation legal in
+/// an embedded QuestDB TIMESTAMP comparison literal (see the regression
+/// lock above).
+fn day_bounds_micros(target_ist_day: u64) -> (i64, i64) {
+    // APPROVED: IST day numbers are ~20K, far below i64::MAX — saturating
+    // keeps adversarial inputs bounded.
+    let start = i64::try_from(target_ist_day)
+        .unwrap_or(0)
+        .saturating_mul(86_400)
+        .saturating_mul(MICROS_PER_SEC);
+    (start, start.saturating_add(86_400 * MICROS_PER_SEC))
+}
+
 /// The day's `ws_event_audit` rows in ts order. `cast(ts as long)` yields
-/// IST-epoch MICROseconds (`ts` stores IST wall-clock — data-integrity.md).
+/// IST-epoch MICROseconds (`ts` stores IST wall-clock — data-integrity.md);
+/// the window literals are micros too (QuestDB TIMESTAMP-comparison
+/// semantics — regression lock above).
 #[must_use]
 pub fn build_ws_events_day_sql(target_ist_day: u64) -> String {
-    let (start, end) = day_bounds_nanos(target_ist_day);
+    let (start, end) = day_bounds_micros(target_ist_day);
     format!(
         "select cast(ts as long), feed, ws_type, connection_index, event_kind, \
          source, dhan_code, down_secs, market_hours \
@@ -166,23 +246,55 @@ pub fn build_ws_events_day_sql(target_ist_day: u64) -> String {
     )
 }
 
-/// The day's classified episode rows (for the blame aggregate — includes
-/// the boot-reconciled process-death rows).
+/// The day's classified episode rows — ALL detectors (the ws-read-failed
+/// fallback path only; the race-free primary path tallies in memory and
+/// merges [`build_boot_reconciled_episode_day_sql`]). Micros literals.
 #[must_use]
 pub fn build_episode_day_sql(target_ist_day: u64) -> String {
-    let (start, end) = day_bounds_nanos(target_ist_day);
+    let (start, end) = day_bounds_micros(target_ist_day);
     format!(
         "select feed, episode_kind, blame, market_hours \
          from feed_episode_audit where ts >= {start} and ts < {end}"
     )
 }
 
+/// The day's `detector='boot_reconciled'` process-death rows ONLY. The
+/// daily run merges these into its IN-MEMORY step-2 tallies instead of
+/// reading back its own just-flushed rows (hostile review 2026-07-10:
+/// ILP-HTTP ACK = committed-to-WAL, NOT visible-to-SELECT — a same-run
+/// read-back can silently miss every episode just written; the
+/// boot-reconciled rows were written minutes-to-hours earlier and are long
+/// visible). Micros literals.
+#[must_use]
+pub fn build_boot_reconciled_episode_day_sql(target_ist_day: u64) -> String {
+    let (start, end) = day_bounds_micros(target_ist_day);
+    format!(
+        "select feed, episode_kind, blame, market_hours \
+         from feed_episode_audit where ts >= {start} and ts < {end} \
+         and detector = 'boot_reconciled'"
+    )
+}
+
+/// Ticks a feed delivered today (feed-filtered + day-windowed). LOCAL
+/// builder with MICROS literals — deliberately NOT the
+/// `tick_conservation_boot::build_conservation_ticks_count_sql` reuse: that
+/// shipped builder embeds NANOS literals (the same silent-zero bug class,
+/// pre-existing on main — reported for a separate fix PR).
+#[must_use]
+pub fn build_scoreboard_ticks_count_sql(feed: &str, target_ist_day: u64) -> String {
+    let (start, end) = day_bounds_micros(target_ist_day);
+    format!(
+        "select count() from ticks where feed = '{feed}' \
+         and ts >= {start} and ts < {end}"
+    )
+}
+
 /// Distinct `(security_id, segment)` pairs a feed delivered today. The
 /// distinct is segment-qualified per I-P1-11 (`security_id` alone is NOT
-/// unique — Dhan reuses ids across segments).
+/// unique — Dhan reuses ids across segments). Micros literals.
 #[must_use]
 pub fn build_feed_instruments_count_sql(feed: &str, target_ist_day: u64) -> String {
-    let (start, end) = day_bounds_nanos(target_ist_day);
+    let (start, end) = day_bounds_micros(target_ist_day);
     format!(
         "select count() from (select distinct security_id, segment from ticks \
          where feed = '{feed}' and ts >= {start} and ts < {end})"
@@ -191,11 +303,12 @@ pub fn build_feed_instruments_count_sql(feed: &str, target_ist_day: u64) -> Stri
 
 /// Distinct session minutes ([09:15, 15:30) IST) a feed delivered any tick
 /// in. ≤375 rows; the minute values are opaque keys compared in Rust.
+/// Micros literals.
 #[must_use]
 pub fn build_feed_session_minutes_sql(feed: &str, target_ist_day: u64) -> String {
-    let (day_start, _) = day_bounds_nanos(target_ist_day);
-    let sess_start = day_start.saturating_add(SESSION_START_SECS_OF_DAY_IST * NANOS_PER_SEC);
-    let sess_end = day_start.saturating_add(SESSION_END_SECS_OF_DAY_IST * NANOS_PER_SEC);
+    let (day_start, _) = day_bounds_micros(target_ist_day);
+    let sess_start = day_start.saturating_add(SESSION_START_SECS_OF_DAY_IST * MICROS_PER_SEC);
+    let sess_end = day_start.saturating_add(SESSION_END_SECS_OF_DAY_IST * MICROS_PER_SEC);
     format!(
         "select distinct date_trunc('minute', ts) from ticks \
          where feed = '{feed}' and ts >= {sess_start} and ts < {sess_end}"
@@ -297,7 +410,59 @@ pub struct EpisodeTally {
     pub blame_indeterminate: i64,
 }
 
-/// Aggregate the [`build_episode_day_sql`] response per feed. Pure.
+/// Fold ONE episode into a per-feed tally. Pure — the SINGLE tally rule
+/// shared by the SQL read-back aggregate AND the race-free in-memory path
+/// (so the two can never diverge on what counts as headline/off-hours).
+pub fn fold_episode_into_tally(t: &mut EpisodeTally, kind: &str, blame: &str, market_hours: bool) {
+    let mut headline = true;
+    match kind {
+        EPISODE_KIND_DISCONNECT => {
+            if market_hours {
+                t.disconnects_market += 1;
+            } else {
+                // A 'disconnect' row stamped off-market (edge second) —
+                // still counted off-hours, not in the headline.
+                t.disconnects_off_hours += 1;
+                headline = false;
+            }
+        }
+        EPISODE_KIND_OFF_HOURS_DISCONNECT => {
+            t.disconnects_off_hours += 1;
+            headline = false;
+        }
+        EPISODE_KIND_STALL_RESTART | EPISODE_KIND_NEVER_STREAMED_RESTART => t.stalls += 1,
+        EPISODE_KIND_PROCESS_DEATH => t.restarts += 1,
+        _ => {}
+    }
+    if headline {
+        match blame {
+            "broker" => t.blame_broker += 1,
+            "ours" => t.blame_ours += 1,
+            _ => t.blame_indeterminate += 1,
+        }
+    }
+}
+
+/// Sum every field of `add` into `base` (per feed). Pure — used to merge
+/// the boot-reconciled process-death read-back into the in-memory tallies.
+pub fn merge_episode_tallies(
+    base: &mut BTreeMap<String, EpisodeTally>,
+    add: &BTreeMap<String, EpisodeTally>,
+) {
+    for (feed, a) in add {
+        let t = base.entry(feed.clone()).or_default();
+        t.disconnects_market += a.disconnects_market;
+        t.disconnects_off_hours += a.disconnects_off_hours;
+        t.stalls += a.stalls;
+        t.restarts += a.restarts;
+        t.blame_broker += a.blame_broker;
+        t.blame_ours += a.blame_ours;
+        t.blame_indeterminate += a.blame_indeterminate;
+    }
+}
+
+/// Aggregate the [`build_episode_day_sql`] /
+/// [`build_boot_reconciled_episode_day_sql`] response per feed. Pure.
 #[must_use]
 pub fn aggregate_episode_rows(body: &str) -> Option<BTreeMap<String, EpisodeTally>> {
     let rows = parse_dataset(body)?;
@@ -311,34 +476,7 @@ pub fn aggregate_episode_rows(body: &str) -> Option<BTreeMap<String, EpisodeTall
         let kind = cols[1].as_str().unwrap_or("");
         let blame = cols[2].as_str().unwrap_or("");
         let market_hours = cols[3].as_bool().unwrap_or(false);
-        let t = out.entry(feed).or_default();
-        let mut headline = true;
-        match kind {
-            EPISODE_KIND_DISCONNECT => {
-                if market_hours {
-                    t.disconnects_market += 1;
-                } else {
-                    // A 'disconnect' row stamped off-market (edge second) —
-                    // still counted off-hours, not in the headline.
-                    t.disconnects_off_hours += 1;
-                    headline = false;
-                }
-            }
-            EPISODE_KIND_OFF_HOURS_DISCONNECT => {
-                t.disconnects_off_hours += 1;
-                headline = false;
-            }
-            EPISODE_KIND_STALL_RESTART | EPISODE_KIND_NEVER_STREAMED_RESTART => t.stalls += 1,
-            EPISODE_KIND_PROCESS_DEATH => t.restarts += 1,
-            _ => {}
-        }
-        if headline {
-            match blame {
-                "broker" => t.blame_broker += 1,
-                "ours" => t.blame_ours += 1,
-                _ => t.blame_indeterminate += 1,
-            }
-        }
+        fold_episode_into_tally(out.entry(feed).or_default(), kind, blame, market_hours);
     }
     Some(out)
 }
@@ -591,6 +729,26 @@ pub struct SynthesizedProcessDeath {
     pub connection_index: i64,
     /// Gap between the last pre-boot "up" row and the post-boot connect.
     pub down_secs: i64,
+    /// The death window was in market hours (derived from the PRIOR "up"
+    /// row — the death happened at/after that instant).
+    pub market_hours: bool,
+}
+
+/// `true` when `secs_of_day(ts_ist_nanos)` falls in the market-hours
+/// window. Pure.
+fn nanos_in_market_hours(ts_ist_nanos: i64) -> bool {
+    let secs_of_day = ts_ist_nanos.div_euclid(NANOS_PER_SEC).rem_euclid(86_400);
+    // APPROVED: rem_euclid(86_400) is always in [0, 86_400) — fits u32.
+    u32::try_from(secs_of_day).is_ok_and(is_in_market_hours_secs)
+}
+
+/// `true` when at least one post-boot `connected` row exists — the polling
+/// gate for the reconciler (this boot's own connect can land minutes after
+/// the first query, e.g. behind the 300s WS-GAP-08 429 cooldown). Pure.
+#[must_use]
+pub fn has_post_boot_connect(rows: &[WsAuditEventLite], boot_ts_ist_nanos: i64) -> bool {
+    rows.iter()
+        .any(|ev| ev.ts_ist_nanos >= boot_ts_ist_nanos && ev.event_kind == "connected")
 }
 
 /// Pure process-death detection over the day's audit rows.
@@ -600,17 +758,19 @@ pub struct SynthesizedProcessDeath {
 /// `sleep_resumed` — the connection was live when the process died), and a
 /// first `connected` row AT/AFTER boot must exist (this boot's connect —
 /// the deterministic episode ts; Groww's by-design double-`connected` per
-/// episode collapses to the EARLIEST). Out-of-session boots synthesize
-/// nothing (a 16:30 auto-stop → 08:30 start is the schedule, not a death).
+/// episode collapses to the EARLIEST).
+///
+/// Gate (hostile review 2026-07-10): synthesis keys on the DEATH window —
+/// the prior "up" row must be in-session (`market_hours` column, or its ts
+/// inside [09:00, 15:30) IST) — NOT on the boot instant. A 15:20 crash
+/// restarted at 15:35 is still a death; the scheduled 16:30 auto-stop →
+/// 08:30 start cycle stays excluded because the query is day-scoped (the
+/// prior day's rows never appear).
 #[must_use]
 pub fn synthesize_process_death_episodes(
     rows: &[WsAuditEventLite],
     boot_ts_ist_nanos: i64,
-    boot_in_session: bool,
 ) -> Vec<SynthesizedProcessDeath> {
-    if !boot_in_session {
-        return Vec::new();
-    }
     // BTreeMap for deterministic output ordering.
     let mut by_key: BTreeMap<(String, String, i64), (Option<&WsAuditEventLite>, Option<i64>)> =
         BTreeMap::new();
@@ -645,6 +805,13 @@ pub fn synthesize_process_death_episodes(
         if !was_up {
             continue;
         }
+        // Death-window gate: the connection was up IN SESSION when the
+        // process died (prior row's own market_hours flag, or its ts inside
+        // the window — belt and braces against a mis-stamped column).
+        let prior_in_session = prior.market_hours || nanos_in_market_hours(prior.ts_ist_nanos);
+        if !prior_in_session {
+            continue;
+        }
         out.push(SynthesizedProcessDeath {
             ts_ist_nanos: connect_ts,
             feed,
@@ -653,6 +820,7 @@ pub fn synthesize_process_death_episodes(
             down_secs: connect_ts
                 .saturating_sub(prior.ts_ist_nanos)
                 .saturating_div(NANOS_PER_SEC),
+            market_hours: prior_in_session,
         });
     }
     out
@@ -726,15 +894,20 @@ async fn exec_query(
 
 /// Runs once per boot (after the [`PROCESS_DEATH_RECONCILE_DELAY_SECS`]
 /// settle delay): synthesizes `process_death` episodes for connections that
-/// were "up" when the previous process died. Returns the number of
-/// synthesized episodes. Fail-soft everywhere; never blocks boot.
-// TEST-EXEMPT: orchestration over the unit-tested pure parts (synthesize_process_death_episodes / classify_build_sha_changed / parsers); a direct test needs live QuestDB + SSM.
+/// were "up" IN SESSION when the previous process died. POLLS (every
+/// [`PROCESS_DEATH_RECONCILE_POLL_INTERVAL_SECS`], up to
+/// [`PROCESS_DEATH_RECONCILE_MAX_ATTEMPTS`] attempts) until this boot's own
+/// post-boot `connected` row is visible — a fast crash-recovery boot can
+/// wait out a 300s WS-GAP-08 429 cooldown BEFORE connecting, past the old
+/// single 180s-delayed query. Synthesis is DEDUP-idempotent, so repeated
+/// attempts are safe by construction. Returns the number of synthesized
+/// episodes. Fail-soft everywhere; never blocks boot.
+// TEST-EXEMPT: orchestration over the unit-tested pure parts (synthesize_process_death_episodes / has_post_boot_connect / classify_build_sha_changed / parsers); a direct test needs live QuestDB + SSM.
 pub async fn reconcile_process_death_episodes(
     questdb: &QuestDbConfig,
     target_ist_day: u64,
     trading_date_ist_nanos: i64,
     boot_ts_ist_nanos: i64,
-    boot_in_session: bool,
 ) -> usize {
     ensure_feed_episode_audit_table(questdb).await;
     let Ok(client) = reqwest::Client::builder()
@@ -749,25 +922,53 @@ pub async fn reconcile_process_death_episodes(
         return 0;
     };
     let sql = build_ws_events_day_sql(target_ist_day);
-    let Some(body) = exec_query(&client, questdb, &sql).await else {
+    let mut rows: Option<Vec<WsAuditEventLite>> = None;
+    for attempt in 1..=PROCESS_DEATH_RECONCILE_MAX_ATTEMPTS {
+        let parsed = match exec_query(&client, questdb, &sql).await {
+            Some(body) => parse_ws_events(&body),
+            None => None,
+        };
+        match parsed {
+            // This boot's connect is visible — the pairing input is ready.
+            Some(r) if has_post_boot_connect(&r, boot_ts_ist_nanos) => {
+                rows = Some(r);
+                break;
+            }
+            // Readable but no post-boot connect YET (429 cooldown / stagger
+            // / audit-flush latency — or the feed is disabled/off-hours and
+            // will never connect). Keep the latest view; retry.
+            Some(r) => rows = Some(r),
+            // Read/parse failure — retryable inside the same budget.
+            None => {}
+        }
+        if attempt < PROCESS_DEATH_RECONCILE_MAX_ATTEMPTS {
+            tokio::time::sleep(Duration::from_secs(
+                PROCESS_DEATH_RECONCILE_POLL_INTERVAL_SECS,
+            ))
+            .await;
+        }
+    }
+    let Some(rows) = rows else {
         error!(
             code = ErrorCode::Scoreboard01AggregationDegraded.code_str(),
             stage = "reconcile_ws_events_read",
-            "SCOREBOARD-01: process-death reconciler could not read today's \
-             connection events — no episodes synthesized this boot"
+            "SCOREBOARD-01: process-death reconciler could not read/parse today's \
+             connection events (every poll attempt failed) — no episodes \
+             synthesized this boot"
         );
         return 0;
     };
-    let Some(rows) = parse_ws_events(&body) else {
-        error!(
-            code = ErrorCode::Scoreboard01AggregationDegraded.code_str(),
-            stage = "reconcile_ws_events_parse",
-            "SCOREBOARD-01: process-death reconciler could not parse the \
-             connection-event response"
+    if !has_post_boot_connect(&rows, boot_ts_ist_nanos) {
+        info!(
+            "feed_scoreboard: no post-boot connect row appeared inside the \
+             reconcile poll window — nothing synthesized (feed disabled / \
+             off-hours boot, or the connect is still pending; a later re-run \
+             with TICKVAULT_SCOREBOARD_NOW re-attempts nothing here — the \
+             15:45 aggregation still counts the coverage hole honestly)"
         );
         return 0;
-    };
-    let deaths = synthesize_process_death_episodes(&rows, boot_ts_ist_nanos, boot_in_session);
+    }
+    let deaths = synthesize_process_death_episodes(&rows, boot_ts_ist_nanos);
     if deaths.is_empty() {
         info!("feed_scoreboard: process-death reconciler found no gaps (clean boot)");
         return 0;
@@ -807,7 +1008,9 @@ pub async fn reconcile_process_death_episodes(
             dhan_code: -1,
             detector: "boot_reconciled",
             down_secs: d.down_secs,
-            market_hours: boot_in_session,
+            // Death-window flag from the prior "up" row — the death
+            // happened at/after that instant, not at the boot instant.
+            market_hours: d.market_hours,
             evidence: format!(
                 "prior state up; gap {}s before this boot's first connect",
                 d.down_secs
@@ -892,8 +1095,14 @@ pub struct ScoreboardSummary {
     pub dhan: FeedDayNumbers,
     pub groww: FeedDayNumbers,
     pub session_minutes: i64,
+    /// A data SOURCE was unavailable mid-run (read/parse/flush failure) —
+    /// distinct from `early_run` so the Telegram footnotes stay honest
+    /// about the CAUSE (hostile review 2026-07-10).
     pub partial_coverage: bool,
     pub degraded: bool,
+    /// The operator forced this run BEFORE the daily trigger — the card
+    /// covers the day only up to the run time (row stamped partial).
+    pub early_run: bool,
 }
 
 /// Runs the daily scoreboard aggregation once. Cold path (once/day at the
@@ -910,6 +1119,7 @@ pub async fn run_feed_scoreboard(
     metrics_port: u16,
     target_ist_day: u64,
     trading_date_label: String,
+    forced_early_run: bool,
 ) -> Result<ScoreboardSummary, String> {
     ensure_feed_scoreboard_tables(questdb).await;
     ensure_feed_episode_audit_table(questdb).await;
@@ -940,23 +1150,40 @@ pub async fn run_feed_scoreboard(
         }
     };
 
-    // 2. Classify today's disconnect episodes from ws_event_audit and
-    //    UPSERT them (DEDUP-idempotent — re-runs re-classify in place).
+    // 2. Classify today's disconnect episodes from ws_event_audit, UPSERT
+    //    them (DEDUP-idempotent — re-runs re-classify in place) and tally
+    //    them IN MEMORY. RACE LOCK (hostile review 2026-07-10): the tallies
+    //    MUST come from the rows just classified, never from a read-back of
+    //    the rows just flushed — the ILP-HTTP 200 ACK means
+    //    committed-to-WAL, NOT visible-to-SELECT (WAL-apply lag is
+    //    unbounded under load), so a same-run read-back can silently fold
+    //    the day's episodes in as ZEROS stamped outcome=complete.
     let ws_sql = build_ws_events_day_sql(target_ist_day);
-    let mut reconnects: BTreeMap<String, i64> = BTreeMap::new();
-    let mut episodes_written = false;
+    // `None` = the ws_event_audit read/parse itself FAILED — every value
+    // derived from it (reconnects, in-memory tallies) records the -1
+    // sentinel, never a fabricated 0 (hostile review 2026-07-10).
+    let mut reconnects: Option<BTreeMap<String, i64>> = None;
+    let mut mem_tallies: Option<BTreeMap<String, EpisodeTally>> = None;
     match exec_query(&client, questdb, &ws_sql).await {
         Some(body) => match parse_ws_events(&body) {
             Some(rows) => {
+                let mut recon: BTreeMap<String, i64> = BTreeMap::new();
+                let mut mem: BTreeMap<String, EpisodeTally> = BTreeMap::new();
                 let mut writer = FeedEpisodeAuditWriter::new(questdb);
                 let mut appended = 0_u64;
                 for ev in &rows {
                     if ev.event_kind == "reconnected" {
-                        *reconnects.entry(ev.feed.clone()).or_default() += 1;
+                        *recon.entry(ev.feed.clone()).or_default() += 1;
                     }
                     if let Some(episode) =
                         classify_ws_event_to_episode(ev, &corr, trading_date_ist_nanos)
                     {
+                        fold_episode_into_tally(
+                            mem.entry(episode.feed.clone()).or_default(),
+                            episode.episode_kind,
+                            episode.blame.as_str(),
+                            episode.market_hours,
+                        );
                         match writer.append_row(&episode) {
                             Ok(()) => appended += 1,
                             Err(err) => {
@@ -973,7 +1200,6 @@ pub async fn run_feed_scoreboard(
                 }
                 match writer.flush() {
                     Ok(()) => {
-                        episodes_written = true;
                         metrics::counter!("tv_feed_scoreboard_episode_rows_total")
                             .increment(appended);
                     }
@@ -987,6 +1213,8 @@ pub async fn run_feed_scoreboard(
                         sources_complete = false;
                     }
                 }
+                reconnects = Some(recon);
+                mem_tallies = Some(mem);
             }
             None => {
                 error!(
@@ -1007,21 +1235,58 @@ pub async fn run_feed_scoreboard(
         }
     }
 
-    // 3. Blame aggregate back from feed_episode_audit (includes the
-    //    boot-written process_death rows).
-    let tallies: Option<BTreeMap<String, EpisodeTally>> =
-        match exec_query(&client, questdb, &build_episode_day_sql(target_ist_day)).await {
-            Some(body) => aggregate_episode_rows(&body),
-            None => None,
-        };
-    if tallies.is_none() {
-        error!(
-            code = ErrorCode::Scoreboard01AggregationDegraded.code_str(),
-            stage = "episode_aggregate",
-            "SCOREBOARD-01: episode blame aggregate unavailable — recording sentinels"
-        );
-        sources_complete = false;
-    }
+    // 3. Blame tallies: the in-memory step-2 tallies (race-free) MERGED
+    //    with the boot-reconciled process-death rows read back from
+    //    feed_episode_audit (written at boot + minutes — long visible, so
+    //    the read-back is safe for THOSE rows). The full-table read-back is
+    //    ONLY the fallback when the ws read itself failed (rows an earlier
+    //    same-day run wrote are better than nothing; that path is already
+    //    stamped partial).
+    let tallies: Option<BTreeMap<String, EpisodeTally>> = match mem_tallies {
+        Some(mut mem) => {
+            let boot_sql = build_boot_reconciled_episode_day_sql(target_ist_day);
+            match exec_query(&client, questdb, &boot_sql).await {
+                Some(body) => match aggregate_episode_rows(&body) {
+                    Some(boot_rows) => merge_episode_tallies(&mut mem, &boot_rows),
+                    None => {
+                        error!(
+                            code = ErrorCode::Scoreboard01AggregationDegraded.code_str(),
+                            stage = "boot_reconciled_parse",
+                            "SCOREBOARD-01: boot-reconciled episode read-back \
+                             unparsable — restart counts may under-count"
+                        );
+                        sources_complete = false;
+                    }
+                },
+                None => {
+                    error!(
+                        code = ErrorCode::Scoreboard01AggregationDegraded.code_str(),
+                        stage = "boot_reconciled_read",
+                        "SCOREBOARD-01: boot-reconciled episode read-back failed \
+                         — restart counts may under-count"
+                    );
+                    sources_complete = false;
+                }
+            }
+            Some(mem)
+        }
+        None => {
+            let fallback =
+                match exec_query(&client, questdb, &build_episode_day_sql(target_ist_day)).await {
+                    Some(body) => aggregate_episode_rows(&body),
+                    None => None,
+                };
+            if fallback.is_none() {
+                error!(
+                    code = ErrorCode::Scoreboard01AggregationDegraded.code_str(),
+                    stage = "episode_aggregate",
+                    "SCOREBOARD-01: episode blame aggregate unavailable — recording sentinels"
+                );
+            }
+            // sources_complete already false (the ws read failed above).
+            fallback
+        }
+    };
 
     // 4. Per-feed tick / instrument / minute coverage (SQL over the day's
     //    ticks partition — flagged O(day-rows), server-side, cold).
@@ -1030,8 +1295,8 @@ pub async fn run_feed_scoreboard(
     for feed in tickvault_common::feed::Feed::ALL {
         let label = feed.as_str();
         let mut n = FeedDayNumbers::unavailable();
-        // Ticks (reuse the conservation builder — feed-filtered + windowed).
-        let ticks_sql = build_conservation_ticks_count_sql(label, target_ist_day);
+        // Ticks (LOCAL micros-literal builder — see the regression lock).
+        let ticks_sql = build_scoreboard_ticks_count_sql(label, target_ist_day);
         if let Some(body) = exec_query(&client, questdb, &ticks_sql).await
             && let Some(count) = parse_questdb_count(&body)
         {
@@ -1085,7 +1350,15 @@ pub async fn run_feed_scoreboard(
             n.blame_broker = t.blame_broker;
             n.blame_ours = t.blame_ours;
             n.blame_indeterminate = t.blame_indeterminate;
-            n.reconnects = reconnects.get(*label).copied().unwrap_or(0);
+            // The reconnect source is the ws_event_audit read — when THAT
+            // read failed, the column records the -1 sentinel even though
+            // the episode tallies (fallback read-back) answered: never a
+            // fabricated 0 (hostile review 2026-07-10).
+            n.reconnects = reconnects
+                .as_ref()
+                .map_or(SCOREBOARD_UNAVAILABLE_SENTINEL, |m| {
+                    m.get(*label).copied().unwrap_or(0)
+                });
         }
     }
 
@@ -1108,16 +1381,16 @@ pub async fn run_feed_scoreboard(
              day's episode counts are a floor, not a truth (outcome=degraded)"
         );
     }
-    if !episodes_written {
-        // Episode UPSERT never landed — the day's blame record is at best
-        // yesterday's re-read; keep it partial (already flagged above).
-        sources_complete = sources_complete && tallies.is_some();
-    }
-
+    // The persisted row is stamped partial for an early forced run too —
+    // it covers the day only up to the run time (hostile review
+    // 2026-07-10: a pre-15:45 forced run consumes the day's single
+    // scheduled run, so its mid-day numbers must never masquerade as a
+    // complete end-of-day row).
     let partial_coverage = !sources_complete;
+    let row_partial = partial_coverage || forced_early_run;
     let outcome = if degraded {
         ScoreboardOutcome::Degraded
-    } else if partial_coverage {
+    } else if row_partial {
         ScoreboardOutcome::Partial
     } else {
         ScoreboardOutcome::Complete
@@ -1172,7 +1445,7 @@ pub async fn run_feed_scoreboard(
             streaming_minutes: n.streaming_minutes,
             session_minutes: SCOREBOARD_SESSION_MINUTES,
             uptime_pct,
-            partial_coverage,
+            partial_coverage: row_partial,
             coverage_source: CoverageSource::SqlBackfill,
             outcome,
         };
@@ -1217,6 +1490,7 @@ pub async fn run_feed_scoreboard(
         session_minutes: SCOREBOARD_SESSION_MINUTES,
         partial_coverage,
         degraded,
+        early_run: forced_early_run,
     })
 }
 
@@ -1265,6 +1539,16 @@ mod tests {
         assert_eq!(RESOURCE_OVERLAP_WINDOW_SECS, 300);
     }
 
+    /// Micros day bounds every builder MUST embed (QuestDB interprets a
+    /// bare integer literal in a TIMESTAMP comparison as epoch MICROS —
+    /// the 2026-07-10 CRITICAL regression lock at the top of the SQL
+    /// section). For a 2026-era day the micros bound is 16 digits; the
+    /// broken nanos bound is 19 digits.
+    fn day_micros() -> (i64, i64) {
+        let start = (DAY as i64) * 86_400 * 1_000_000;
+        (start, start + 86_400 * 1_000_000)
+    }
+
     #[test]
     fn test_decide_scoreboard_start_boundaries() {
         let trigger = 56_700_u32; // 15:45:00 IST
@@ -1291,7 +1575,10 @@ mod tests {
             decide_scoreboard_start(trigger, false, true, trigger),
             ScoreboardStart::RunNow
         );
-        // Market-hours helper boundaries.
+    }
+
+    #[test]
+    fn test_is_in_market_hours_secs_boundaries() {
         assert!(!is_in_market_hours_secs(9 * 3600 - 1));
         assert!(is_in_market_hours_secs(9 * 3600));
         assert!(is_in_market_hours_secs(12 * 3600));
@@ -1299,33 +1586,133 @@ mod tests {
     }
 
     #[test]
-    fn test_build_scoreboard_sql_builders_feed_filtered_and_windowed() {
-        let start = (DAY as i64) * 86_400 * NANOS_PER_SEC;
-        let end = start + 86_400 * NANOS_PER_SEC;
+    fn test_parse_scoreboard_date_override_strict_fail_closed() {
+        // Valid strict YYYY-MM-DD → (ist day number, label).
+        let (day, label) = parse_scoreboard_date_override("2026-07-09").expect("valid date");
+        assert_eq!(label, "2026-07-09");
+        // 2026-07-09 = 20_643 days since 1970-01-01.
+        assert_eq!(day, 20_643);
+        // Whitespace tolerated (trimmed), nothing else.
+        assert_eq!(
+            parse_scoreboard_date_override(" 2026-07-09 ").map(|(d, _)| d),
+            Some(20_643)
+        );
+        // Fail-closed: malformed shapes / impossible dates / pre-epoch /
+        // traversal-ish junk all yield None — never a guessed day.
+        for bad in [
+            "",
+            "2026-7-9",
+            "2026/07/09",
+            "20260709",
+            "2026-13-01",
+            "2026-02-30",
+            "1969-12-31",
+            "2026-07-09x",
+            "x2026-07-09",
+            "2026-07-0..",
+            "２026-07-09",
+        ] {
+            assert_eq!(
+                parse_scoreboard_date_override(bad),
+                None,
+                "{bad:?} must be rejected fail-closed"
+            );
+        }
+    }
+
+    #[test]
+    fn test_build_ws_events_day_sql_micros_window() {
+        let (start, end) = day_micros();
+        // Regression lock: the embedded literals are MICROS (16 digits for
+        // a 2026 date), never the silently-empty NANOS form (19 digits).
+        assert_eq!(
+            start.to_string().len(),
+            16,
+            "micros bound must be 16 digits"
+        );
+        let nanos_start = (DAY as i64) * 86_400 * NANOS_PER_SEC;
+        assert_eq!(nanos_start.to_string().len(), 19);
         let ws = build_ws_events_day_sql(DAY);
         assert!(ws.contains("from ws_event_audit"), "{ws}");
         assert!(ws.contains("cast(ts as long)"), "micros cast: {ws}");
         assert!(ws.contains(&format!("ts >= {start}")), "{ws}");
         assert!(ws.contains(&format!("ts < {end}")), "{ws}");
         assert!(ws.contains("order by ts"), "{ws}");
+        assert!(
+            !ws.contains(&nanos_start.to_string()),
+            "NANOS literal must never reach the SQL (matches zero rows): {ws}"
+        );
+    }
 
+    #[test]
+    fn test_build_episode_day_sql_micros_window() {
+        let (start, end) = day_micros();
         let ep = build_episode_day_sql(DAY);
         assert!(ep.contains("from feed_episode_audit"), "{ep}");
         assert!(ep.contains(&format!("ts >= {start}")), "{ep}");
+        assert!(ep.contains(&format!("ts < {end}")), "{ep}");
+        assert!(
+            !ep.contains(&((DAY as i64) * 86_400 * NANOS_PER_SEC).to_string()),
+            "nanos literal banned: {ep}"
+        );
+    }
 
+    #[test]
+    fn test_build_boot_reconciled_episode_day_sql_micros_and_detector_filter() {
+        // The boot-reconciled variant carries the SAME micros window plus
+        // the detector filter (the race-fix merge source).
+        let (start, end) = day_micros();
+        let boot = build_boot_reconciled_episode_day_sql(DAY);
+        assert!(boot.contains("from feed_episode_audit"), "{boot}");
+        assert!(boot.contains(&format!("ts >= {start}")), "{boot}");
+        assert!(boot.contains(&format!("ts < {end}")), "{boot}");
+        assert!(boot.contains("detector = 'boot_reconciled'"), "{boot}");
+        assert!(
+            !boot.contains(&((DAY as i64) * 86_400 * NANOS_PER_SEC).to_string()),
+            "nanos literal banned: {boot}"
+        );
+    }
+
+    #[test]
+    fn test_build_scoreboard_ticks_count_sql_micros_window() {
+        let (start, end) = day_micros();
+        let sql = build_scoreboard_ticks_count_sql("groww", DAY);
+        assert!(sql.contains("from ticks"), "{sql}");
+        assert!(sql.contains("feed = 'groww'"), "{sql}");
+        assert!(sql.contains(&format!("ts >= {start}")), "{sql}");
+        assert!(sql.contains(&format!("ts < {end}")), "{sql}");
+        assert!(
+            !sql.contains(&((DAY as i64) * 86_400 * NANOS_PER_SEC).to_string()),
+            "nanos literal banned: {sql}"
+        );
+    }
+
+    #[test]
+    fn test_build_feed_instruments_count_sql_micros_and_segment_qualified() {
+        let (start, end) = day_micros();
         // I-P1-11: the instrument distinct is segment-qualified.
         let instr = build_feed_instruments_count_sql("groww", DAY);
         assert!(instr.contains("distinct security_id, segment"), "{instr}");
         assert!(instr.contains("feed = 'groww'"), "{instr}");
+        assert!(instr.contains(&format!("ts >= {start}")), "{instr}");
+        assert!(instr.contains(&format!("ts < {end}")), "{instr}");
+    }
 
-        // Session-minute window is [09:15, 15:30) in ts-space.
+    #[test]
+    fn test_build_feed_session_minutes_sql_micros_session_window() {
+        // Session-minute window is [09:15, 15:30) in MICROS ts-space.
+        let (start, _) = day_micros();
         let mins = build_feed_session_minutes_sql("dhan", DAY);
-        let sess_start = start + SESSION_START_SECS_OF_DAY_IST * NANOS_PER_SEC;
-        let sess_end = start + SESSION_END_SECS_OF_DAY_IST * NANOS_PER_SEC;
+        let sess_start = start + SESSION_START_SECS_OF_DAY_IST * 1_000_000;
+        let sess_end = start + SESSION_END_SECS_OF_DAY_IST * 1_000_000;
         assert!(mins.contains("feed = 'dhan'"), "{mins}");
         assert!(mins.contains(&format!("ts >= {sess_start}")), "{mins}");
         assert!(mins.contains(&format!("ts < {sess_end}")), "{mins}");
         assert!(mins.contains("date_trunc('minute', ts)"), "{mins}");
+        assert!(
+            !mins.contains(&(start * 1_000).to_string()),
+            "nanos literal banned: {mins}"
+        );
     }
 
     #[test]
@@ -1357,11 +1744,16 @@ mod tests {
             .map(|s| (*s).to_string())
             .collect();
         assert_eq!(compute_minute_overlap(&a, &b), (1, 2, 2));
-        // Minute-set parsing from an /exec body.
+    }
+
+    #[test]
+    fn test_parse_minute_set_from_exec_body() {
         let body =
             r#"{"dataset":[["2026-07-10T09:15:00.000000Z"],["2026-07-10T09:16:00.000000Z"]]}"#;
         let set = parse_minute_set(body).expect("parse");
         assert_eq!(set.len(), 2);
+        // Unparsable body → None (caller records sentinels).
+        assert_eq!(parse_minute_set("not json"), None);
     }
 
     #[test]
@@ -1386,7 +1778,7 @@ mod tests {
     }
 
     #[test]
-    fn test_correlation_overlap_windows() {
+    fn test_collect_correlation_evidence_and_has_overlap_windows() {
         let events = vec![
             JsonlCodeEvent {
                 code: "WS-GAP-09".to_string(),
@@ -1473,8 +1865,9 @@ mod tests {
 
     #[test]
     fn test_synthesize_process_death_up_state_prior() {
-        // Pre-boot: connected at 10:00. Boot at 11:00. Post-boot connect at
-        // 11:02 → ONE synthesized death at the post-boot connect ts.
+        // Pre-boot: connected at 10:00 IN SESSION. Boot at 11:00. Post-boot
+        // connect at 11:02 → ONE synthesized death at the post-boot
+        // connect ts, market_hours from the DEATH window (the prior row).
         let rows = vec![
             ev(
                 day_ts(36_000),
@@ -1496,15 +1889,79 @@ mod tests {
             ),
         ];
         let boot = day_ts(39_600);
-        let deaths = synthesize_process_death_episodes(&rows, boot, true);
+        let deaths = synthesize_process_death_episodes(&rows, boot);
         assert_eq!(deaths.len(), 1);
         assert_eq!(deaths[0].ts_ist_nanos, day_ts(39_720), "deterministic ts");
         assert_eq!(deaths[0].down_secs, 3_720);
         assert_eq!(deaths[0].feed, "dhan");
+        assert!(deaths[0].market_hours, "death window was in-session");
+        // Polling gate helper: the post-boot connect is visible here.
+        assert!(has_post_boot_connect(&rows, boot));
+        assert!(
+            !has_post_boot_connect(&rows[..1], boot),
+            "pre-boot rows alone must not satisfy the polling gate"
+        );
     }
 
     #[test]
-    fn test_synthesize_process_death_skips_down_state_and_out_of_session() {
+    fn test_synthesize_process_death_gates_on_death_window_not_boot_instant() {
+        // Hostile review 2026-07-10: an IN-SESSION crash (prior up row at
+        // 15:20) followed by an OUT-OF-SESSION restart (15:35 boot, 15:40
+        // connect) is STILL a death — the gate keys on the prior row's
+        // in-session-ness, never on the boot instant.
+        let crash_then_late_restart = vec![
+            ev(
+                day_ts(55_200), // 15:20 IST — in session, market_hours=true
+                "dhan",
+                "main_feed",
+                "connected",
+                "n/a",
+                -1,
+                true,
+            ),
+            ev(
+                day_ts(56_400), // 15:40 IST connect (post-close)
+                "dhan",
+                "main_feed",
+                "connected",
+                "n/a",
+                -1,
+                false,
+            ),
+        ];
+        let deaths = synthesize_process_death_episodes(&crash_then_late_restart, day_ts(56_100));
+        assert_eq!(deaths.len(), 1, "in-session death must synthesize");
+        assert!(deaths[0].market_hours);
+        // Belt-and-braces: a mis-stamped market_hours=false prior whose ts
+        // is inside [09:00, 15:30) still gates in via the ts check.
+        let mis_stamped = vec![
+            ev(
+                day_ts(40_000),
+                "dhan",
+                "main_feed",
+                "connected",
+                "n/a",
+                -1,
+                false, // wrong flag; ts says 11:06 IST
+            ),
+            ev(
+                day_ts(41_000),
+                "dhan",
+                "main_feed",
+                "connected",
+                "n/a",
+                -1,
+                true,
+            ),
+        ];
+        assert_eq!(
+            synthesize_process_death_episodes(&mis_stamped, day_ts(40_500)).len(),
+            1
+        );
+    }
+
+    #[test]
+    fn test_synthesize_process_death_skips_down_state_and_out_of_session_death() {
         // Prior row was a DISCONNECT (state down) → clean death of nothing.
         let down_prior = vec![
             ev(
@@ -1526,7 +1983,7 @@ mod tests {
                 true,
             ),
         ];
-        assert!(synthesize_process_death_episodes(&down_prior, day_ts(39_600), true).is_empty());
+        assert!(synthesize_process_death_episodes(&down_prior, day_ts(39_600)).is_empty());
         // sleep_entered prior → dormant, not up.
         let sleeping = vec![
             ev(
@@ -1548,29 +2005,30 @@ mod tests {
                 true,
             ),
         ];
-        assert!(synthesize_process_death_episodes(&sleeping, day_ts(39_600), true).is_empty());
-        // Out-of-session boot (16:30 auto-stop → 08:30 start) → nothing.
-        let up = vec![
+        assert!(synthesize_process_death_episodes(&sleeping, day_ts(39_600)).is_empty());
+        // OUT-OF-SESSION death window (prior up row at 16:35, flag false)
+        // → nothing (post-close idle churn, not an in-session death).
+        let post_close = vec![
             ev(
-                day_ts(36_000),
+                day_ts(59_700), // 16:35 IST
                 "dhan",
                 "main_feed",
                 "connected",
                 "n/a",
                 -1,
-                true,
+                false,
             ),
             ev(
-                day_ts(39_720),
+                day_ts(60_300), // 16:45 IST connect
                 "dhan",
                 "main_feed",
                 "connected",
                 "n/a",
                 -1,
-                true,
+                false,
             ),
         ];
-        assert!(synthesize_process_death_episodes(&up, day_ts(39_600), false).is_empty());
+        assert!(synthesize_process_death_episodes(&post_close, day_ts(60_000)).is_empty());
         // No post-boot connect row (yet) → nothing (no deterministic ts).
         let no_connect = vec![ev(
             day_ts(36_000),
@@ -1581,7 +2039,8 @@ mod tests {
             -1,
             true,
         )];
-        assert!(synthesize_process_death_episodes(&no_connect, day_ts(39_600), true).is_empty());
+        assert!(synthesize_process_death_episodes(&no_connect, day_ts(39_600)).is_empty());
+        assert!(!has_post_boot_connect(&no_connect, day_ts(39_600)));
     }
 
     #[test]
@@ -1618,8 +2077,8 @@ mod tests {
                 true,
             ),
         ];
-        let a = synthesize_process_death_episodes(&rows, day_ts(39_600), true);
-        let b = synthesize_process_death_episodes(&rows, day_ts(39_600), true);
+        let a = synthesize_process_death_episodes(&rows, day_ts(39_600));
+        let b = synthesize_process_death_episodes(&rows, day_ts(39_600));
         assert_eq!(a, b, "repeat reconciliation is deterministic");
         assert_eq!(a.len(), 1);
         assert_eq!(a[0].ts_ist_nanos, day_ts(39_700), "earliest connect wins");
@@ -1697,6 +2156,72 @@ mod tests {
     }
 
     #[test]
+    fn test_fold_episode_into_tally_matches_sql_aggregate_rule() {
+        // The in-memory race-fix path and the SQL read-back share ONE fold
+        // rule — a headline disconnect counts blame; off-hours does not.
+        let mut t = EpisodeTally::default();
+        fold_episode_into_tally(&mut t, EPISODE_KIND_DISCONNECT, "broker", true);
+        fold_episode_into_tally(&mut t, EPISODE_KIND_DISCONNECT, "ours", false);
+        fold_episode_into_tally(&mut t, EPISODE_KIND_OFF_HOURS_DISCONNECT, "broker", false);
+        fold_episode_into_tally(&mut t, EPISODE_KIND_PROCESS_DEATH, "ours", true);
+        fold_episode_into_tally(&mut t, EPISODE_KIND_STALL_RESTART, "broker", true);
+        assert_eq!(t.disconnects_market, 1);
+        assert_eq!(
+            t.disconnects_off_hours, 2,
+            "off-market disconnect + off-hours row"
+        );
+        assert_eq!(t.restarts, 1);
+        assert_eq!(t.stalls, 1);
+        assert_eq!(t.blame_broker, 2, "headline disconnect + stall");
+        assert_eq!(t.blame_ours, 1, "process death");
+        assert_eq!(t.blame_indeterminate, 0);
+    }
+
+    #[test]
+    fn test_merge_episode_tallies_sums_boot_reconciled_rows_in() {
+        let mut base: BTreeMap<String, EpisodeTally> = BTreeMap::new();
+        base.insert(
+            "dhan".to_string(),
+            EpisodeTally {
+                disconnects_market: 2,
+                blame_broker: 1,
+                blame_indeterminate: 1,
+                ..EpisodeTally::default()
+            },
+        );
+        let mut add: BTreeMap<String, EpisodeTally> = BTreeMap::new();
+        add.insert(
+            "dhan".to_string(),
+            EpisodeTally {
+                restarts: 1,
+                blame_ours: 1,
+                ..EpisodeTally::default()
+            },
+        );
+        add.insert(
+            "groww".to_string(),
+            EpisodeTally {
+                restarts: 1,
+                blame_ours: 1,
+                ..EpisodeTally::default()
+            },
+        );
+        merge_episode_tallies(&mut base, &add);
+        let d = base.get("dhan").copied().expect("dhan");
+        assert_eq!(d.disconnects_market, 2);
+        assert_eq!(d.restarts, 1);
+        assert_eq!(d.blame_broker, 1);
+        assert_eq!(d.blame_ours, 1);
+        assert_eq!(d.blame_indeterminate, 1);
+        let g = base
+            .get("groww")
+            .copied()
+            .expect("groww absent in base is created");
+        assert_eq!(g.restarts, 1);
+        assert_eq!(g.blame_ours, 1);
+    }
+
+    #[test]
     fn test_episode_kind_for_event_mapping() {
         assert_eq!(episode_kind_for_event("disconnected"), Some("disconnect"));
         assert_eq!(
@@ -1715,7 +2240,7 @@ mod tests {
     }
 
     #[test]
-    fn test_scan_errors_jsonl_missing_dir_is_incomplete_not_panic() {
+    fn test_scan_errors_jsonl_for_correlation_missing_dir_is_incomplete_not_panic() {
         let corr = scan_errors_jsonl_for_correlation(
             std::path::Path::new("/nonexistent/scoreboard/logs"),
             DAY,
