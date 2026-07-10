@@ -285,10 +285,20 @@ pub fn feed_coverage_daily_create_ddl() -> String {
 }
 
 /// Create both scoreboard tables if absent (idempotent, schema-self-heal
-/// pattern: CREATE → feed ADD COLUMN → NULL backfill → DEDUP ENABLE, in
-/// that order, per the 2026-06-28 feed-in-key override; never a table
-/// drop — SEBI retention). Failures log at `error!` but never block the
-/// run — the aggregation still reports via the log/Telegram path.
+/// pattern: CREATE → feed ADD COLUMN → DEDUP ENABLE, in that order, per the
+/// 2026-06-28 feed-in-key override; never a table drop — SEBI retention).
+///
+/// Deliberately NO `SET feed = 'dhan' WHERE feed IS NULL` backfill (hostile
+/// review 2026-07-10): these are GREENFIELD tables whose writers always
+/// stamp `feed`, and `feed_coverage_daily` legitimately carries
+/// `'cross'`/`'groww'` rows — a 'dhan' backfill would misattribute the very
+/// per-feed verdict this feature exists to produce.
+///
+/// Failures log at `error!` (code SCOREBOARD-01) but never block the run —
+/// the aggregation still reports via the log/Telegram path. NOTE the
+/// HTTP-CLIENT-01-class consequence: a failed ensure leaves the table to be
+/// auto-created by the first ILP write WITHOUT DEDUP UPSERT KEYS — a
+/// duplicate-row window until a later boot's ensure succeeds.
 // TEST-EXEMPT: live-QuestDB DDL runner (DDL strings unit-tested via the create_ddl tests)
 pub async fn ensure_feed_scoreboard_tables(questdb_config: &QuestDbConfig) {
     let base_url = format!(
@@ -302,8 +312,12 @@ pub async fn ensure_feed_scoreboard_tables(questdb_config: &QuestDbConfig) {
         Ok(c) => c,
         Err(err) => {
             error!(
+                code = "SCOREBOARD-01",
+                stage = "ensure_client_build",
                 ?err,
-                "feed_scoreboard: HTTP client build failed — tables not ensured"
+                "SCOREBOARD-01: HTTP client build failed — scoreboard tables not \
+                 ensured (first ILP write may auto-create them WITHOUT dedup — \
+                 duplicate-row window until the next successful boot)"
             );
             return;
         }
@@ -311,13 +325,11 @@ pub async fn ensure_feed_scoreboard_tables(questdb_config: &QuestDbConfig) {
     let statements = [
         feed_scoreboard_daily_create_ddl(),
         format!("ALTER TABLE {FEED_SCOREBOARD_DAILY_TABLE} ADD COLUMN IF NOT EXISTS feed SYMBOL;"),
-        format!("UPDATE {FEED_SCOREBOARD_DAILY_TABLE} SET feed = 'dhan' WHERE feed IS NULL;"),
         format!(
             "ALTER TABLE {FEED_SCOREBOARD_DAILY_TABLE} DEDUP ENABLE UPSERT KEYS({DEDUP_KEY_FEED_SCOREBOARD_DAILY});"
         ),
         feed_coverage_daily_create_ddl(),
         format!("ALTER TABLE {FEED_COVERAGE_DAILY_TABLE} ADD COLUMN IF NOT EXISTS feed SYMBOL;"),
-        format!("UPDATE {FEED_COVERAGE_DAILY_TABLE} SET feed = 'dhan' WHERE feed IS NULL;"),
         format!(
             "ALTER TABLE {FEED_COVERAGE_DAILY_TABLE} DEDUP ENABLE UPSERT KEYS({DEDUP_KEY_FEED_COVERAGE_DAILY});"
         ),
@@ -333,14 +345,18 @@ pub async fn ensure_feed_scoreboard_tables(questdb_config: &QuestDbConfig) {
             Ok(resp) => {
                 let status = resp.status();
                 let body = resp.text().await.unwrap_or_default();
-                error!(%status, ddl = ddl.as_str(),
+                error!(code = "SCOREBOARD-01", stage = "ensure_ddl",
+                    %status, ddl = ddl.as_str(),
                     body = %body.chars().take(200).collect::<String>(),
-                    "feed_scoreboard: DDL returned non-2xx");
+                    "SCOREBOARD-01: scoreboard DDL returned non-2xx (dedup may be \
+                     missing — duplicate-row window until a later ensure succeeds)");
             }
             Err(err) => error!(
+                code = "SCOREBOARD-01",
+                stage = "ensure_ddl",
                 ?err,
                 ddl = ddl.as_str(),
-                "feed_scoreboard: DDL request failed"
+                "SCOREBOARD-01: scoreboard DDL request failed"
             ),
         }
     }
@@ -609,7 +625,7 @@ mod tests {
     }
 
     #[test]
-    fn test_feed_scoreboard_daily_ddl_contains_expected_columns() {
+    fn test_feed_scoreboard_daily_create_ddl_contains_expected_columns() {
         let ddl = feed_scoreboard_daily_create_ddl();
         for col in [
             "ts ",
@@ -669,7 +685,7 @@ mod tests {
     }
 
     #[test]
-    fn test_feed_coverage_daily_dedup_key_full_instrument_pair_plus_feed() {
+    fn test_feed_coverage_daily_create_ddl_dedup_key_full_instrument_pair_plus_feed() {
         // I-P1-11: the per-instrument table carries the FULL composite
         // (security_id, exchange_segment) pair + feed + the deterministic ts.
         let has_token = |t: &str| {
@@ -716,7 +732,7 @@ mod tests {
     }
 
     #[test]
-    fn test_daily_append_row_writes_feed_and_outcome_symbols() {
+    fn test_append_daily_row_writes_feed_and_outcome_symbols() {
         let mut w = FeedScoreboardWriter::for_test();
         w.append_daily_row(&sample_daily_row())
             .expect("append must succeed");
@@ -740,7 +756,7 @@ mod tests {
     }
 
     #[test]
-    fn test_coverage_append_row_writes_instrument_pair() {
+    fn test_append_coverage_row_writes_instrument_pair() {
         let mut w = FeedScoreboardWriter::for_test();
         w.append_coverage_row(&sample_coverage_row())
             .expect("append must succeed");

@@ -138,8 +138,11 @@ pub fn feed_episode_audit_create_ddl() -> String {
 }
 
 /// Create the episode table if absent (idempotent, schema-self-heal
-/// pattern). Failures log at `error!` but never block the caller — the
-/// classified episodes still reach the log sinks.
+/// pattern). Failures log at `error!` (code SCOREBOARD-01) but never block
+/// the caller — the classified episodes still reach the log sinks. NOTE the
+/// HTTP-CLIENT-01-class consequence: a failed ensure leaves the table to be
+/// auto-created by the first ILP write WITHOUT DEDUP UPSERT KEYS — a
+/// duplicate-row window until a later boot's ensure succeeds.
 // TEST-EXEMPT: live-QuestDB DDL runner (DDL string unit-tested via feed_episode_audit_create_ddl tests)
 pub async fn ensure_feed_episode_audit_table(questdb_config: &QuestDbConfig) {
     let base_url = format!(
@@ -153,22 +156,26 @@ pub async fn ensure_feed_episode_audit_table(questdb_config: &QuestDbConfig) {
         Ok(c) => c,
         Err(err) => {
             error!(
+                code = "SCOREBOARD-01",
+                stage = "ensure_client_build",
                 ?err,
-                "feed_episode_audit: HTTP client build failed — table not ensured"
+                "SCOREBOARD-01: HTTP client build failed — episode table not \
+                 ensured (first ILP write may auto-create it WITHOUT dedup — \
+                 duplicate-row window until the next successful boot)"
             );
             return;
         }
     };
-    // CREATE first, then the feed self-heal triple (operator override
-    // 2026-06-28: feed in-key on every persisted table). Greenfield tables
-    // get the column + key from the CREATE; the triple is a no-op there and
-    // heals any table created by an earlier build. Backfill precedes the
-    // DEDUP-ENABLE so a re-keyed table upserts over a legacy NULL-feed row.
-    // Never drops the table (SEBI retention).
+    // CREATE first, then the feed ADD-COLUMN self-heal (operator override
+    // 2026-06-28: feed in-key on every persisted table). Greenfield table:
+    // the column + key come from the CREATE; the ALTER is a no-op there.
+    // Deliberately NO `SET feed = 'dhan'` NULL backfill (hostile review
+    // 2026-07-10): this table legitimately carries `'groww'` episode rows —
+    // on the blame system-of-record a 'dhan' backfill would misattribute
+    // the per-feed verdict. Never drops the table (SEBI retention).
     let statements = [
         feed_episode_audit_create_ddl(),
         format!("ALTER TABLE {FEED_EPISODE_AUDIT_TABLE} ADD COLUMN IF NOT EXISTS feed SYMBOL;"),
-        format!("UPDATE {FEED_EPISODE_AUDIT_TABLE} SET feed = 'dhan' WHERE feed IS NULL;"),
         format!(
             "ALTER TABLE {FEED_EPISODE_AUDIT_TABLE} DEDUP ENABLE UPSERT KEYS({DEDUP_KEY_FEED_EPISODE_AUDIT});"
         ),
@@ -184,14 +191,18 @@ pub async fn ensure_feed_episode_audit_table(questdb_config: &QuestDbConfig) {
             Ok(resp) => {
                 let status = resp.status();
                 let body = resp.text().await.unwrap_or_default();
-                error!(%status, ddl = ddl.as_str(),
+                error!(code = "SCOREBOARD-01", stage = "ensure_ddl",
+                    %status, ddl = ddl.as_str(),
                     body = %body.chars().take(200).collect::<String>(),
-                    "feed_episode_audit: DDL returned non-2xx");
+                    "SCOREBOARD-01: episode DDL returned non-2xx (dedup may be \
+                     missing — duplicate-row window until a later ensure succeeds)");
             }
             Err(err) => error!(
+                code = "SCOREBOARD-01",
+                stage = "ensure_ddl",
                 ?err,
                 ddl = ddl.as_str(),
-                "feed_episode_audit: DDL request failed"
+                "SCOREBOARD-01: episode DDL request failed"
             ),
         }
     }
