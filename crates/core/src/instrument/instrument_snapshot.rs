@@ -216,7 +216,16 @@ pub fn to_universe(snapshot: &PlanSnapshot) -> Option<DailyUniverse> {
     // was implicitly bounded to 1 future/underlying; without this arm a
     // corrupt/hand-edited v3 snapshot could warm-boot-subscribe unbounded
     // fabricated far months with only a DepthOnly (no-page) parity signal.
-    let mut seen_future_keys: Vec<(String, String)> = Vec::new();
+    // AM-r2 F1 (2026-07-10): the exact-duplicate skip carries the PARSED
+    // expiry — a repeat (security_id, segment) with the SAME month is a
+    // duplicated line (first-entry-wins, round-4 semantics); a repeat SID
+    // with a DIFFERENT month is corruption of the same family as two SIDs
+    // for one month (the writer emits one SID per (underlying, month)) and
+    // fails the whole snapshot closed. Pre-fix the expiry-less key silently
+    // `continue`d the second month — the warm boot subscribed one month
+    // fewer than the snapshot claimed with only an unpaged DepthOnly trace.
+    let mut seen_future_keys: std::collections::HashMap<(String, String), chrono::NaiveDate> =
+        std::collections::HashMap::new();
     let mut seen_future_canonical_expiries: std::collections::HashSet<(String, chrono::NaiveDate)> =
         std::collections::HashSet::new();
     let mut future_months_per_canonical: std::collections::HashMap<String, usize> =
@@ -273,13 +282,19 @@ pub fn to_universe(snapshot: &PlanSnapshot) -> Option<DailyUniverse> {
             {
                 return None;
             }
-            // Round 4 dedup (see the state comment above): exact composite
-            // duplicate → skip (never a spurious planner-drop FUTIDX-01);
-            // distinct SID for an already-seen (canonical, expiry) → fail
-            // closed (§36.7: distinct expiries per canonical are LEGAL).
+            // Round 4 dedup, AM-r2 F1 re-keyed (see the state comment
+            // above): exact duplicate line (same SID + segment + MONTH) →
+            // skip first-entry-wins (never a spurious planner-drop
+            // FUTIDX-01); the SAME SID claiming a DIFFERENT month → fail
+            // closed; a distinct SID for an already-seen (canonical,
+            // expiry) → fail closed (§36.7: distinct expiries per
+            // canonical are LEGAL, but every pairing of SID and month must
+            // be one-to-one).
             let key = (csv_row.security_id.clone(), csv_row.segment.clone());
-            if seen_future_keys.contains(&key) {
-                continue;
+            match seen_future_keys.get(&key) {
+                Some(prev_expiry) if *prev_expiry == expiry_parsed => continue,
+                Some(_) => return None,
+                None => {}
             }
             if !seen_future_canonical_expiries.insert((canonical.clone(), expiry_parsed)) {
                 return None;
@@ -293,7 +308,7 @@ pub fn to_universe(snapshot: &PlanSnapshot) -> Option<DailyUniverse> {
             {
                 return None;
             }
-            seen_future_keys.push(key);
+            seen_future_keys.insert(key, expiry_parsed);
         }
         // Derive the membership flags from `role` when the snapshot left them
         // at the serde default (`false`) — a snapshot written by pre-Sub-PR-#5
@@ -1255,6 +1270,50 @@ mod tests {
             to_universe(&snap).is_none(),
             "two DISTINCT SIDs for one parsed (underlying, expiry) month must fail closed \
              regardless of string spelling"
+        );
+    }
+
+    /// AM-r2 F1 (2026-07-10): ONE SID claiming TWO DIFFERENT months is the
+    /// mirror corruption of two-SIDs-one-month — the writer emits one SID
+    /// per (underlying, month). Pre-fix the expiry-less exact-duplicate key
+    /// silently `continue`d the second month (warm boot subscribed one
+    /// month fewer than the snapshot claimed, unpaged DepthOnly only).
+    #[test]
+    fn test_snapshot_index_future_same_sid_two_months_fail_closed() {
+        let snap = PlanSnapshot {
+            trading_date_ist: "2026-07-10".to_string(),
+            format: PLAN_SNAPSHOT_FORMAT_CURRENT,
+            targets: vec![
+                fut_target("35001", "2026-07-30"),
+                fut_target("35001", "2026-08-27"),
+            ],
+        };
+        assert!(
+            to_universe(&snap).is_none(),
+            "one SID claiming two DIFFERENT months is corruption — whole snapshot fails \
+             closed (cold rebuild), never a silent second-month drop"
+        );
+    }
+
+    /// AM-r2 F1 companion: the EXACT duplicate line — identical
+    /// (sid, segment, expiry) — keeps the round-4 first-entry-wins skip
+    /// (a duplicated vendor/snapshot line must never nuke the warm path).
+    #[test]
+    fn test_snapshot_index_future_exact_duplicate_line_still_first_entry_wins() {
+        let snap = PlanSnapshot {
+            trading_date_ist: "2026-07-10".to_string(),
+            format: PLAN_SNAPSHOT_FORMAT_CURRENT,
+            targets: vec![
+                fut_target("35001", "2026-07-30"),
+                fut_target("35001", "2026-07-30"),
+                fut_target("36001", "2026-08-27"),
+            ],
+        };
+        let uni = to_universe(&snap).expect("exact duplicate line is deduped, not fatal");
+        assert_eq!(
+            uni.subscription_targets.len(),
+            2,
+            "duplicate line collapses; both real months survive"
         );
     }
 
