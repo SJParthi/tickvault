@@ -69,10 +69,15 @@
 # user-data.sh.tftpl), so a healthy app publishes a datapoint every period
 # through 09:10–09:20 (no false-page in the extension) and a dead one goes
 # missing → 2×60s → page within ~2-3 min. Widening the MARKET-HOURS window to
-# 09:10 instead was REJECTED: its ALARM_NAMES list gates 9 alarms whose
-# signals are deliberately invalid pre-09:20 (SLO tick-freshness pre-open pin,
-# the 9-of-15 degraded lookback, first-score warmup) — that would re-open the
-# exact pre-open false-page class the 09:20 gate was built to avoid. The boot
+# 09:10 instead was REJECTED: its ALARM_NAMES list gates 11 alarms (count
+# 9 → 11 on 2026-07-10 with the ws-pool pair) — 9 whose signals are
+# deliberately invalid pre-09:20 (SLO tick-freshness pre-open pin, the
+# 9-of-15 degraded lookback, first-score warmup), plus the 2 ws-pool pagers
+# (ws-pool-all-dead + ws-failed-connections) whose gauges ARE valid from the
+# 09:00 IST pool connect but are gated for the pre-09:00 Dhan connect-
+# deferral false-page class (with the 09:00–09:20 handover residual accepted
+# — see app-alarms.tf). Widening would re-open the exact pre-open false-page
+# class the 09:20 gate was built to avoid for BOTH groups. The boot
 # window now hands over to the market-hours window at exactly 09:20 IST.
 # Residual (honest): a death in ~[09:16, 09:20) may not complete this alarm's
 # 2-period evaluation before the close disables actions (CloudWatch's
