@@ -1319,6 +1319,46 @@ mod tests {
         );
     }
 
+    /// Dual-feed scoreboard PR-A (operator 2026-07-10) meta-guard: main.rs
+    /// MUST spawn the process-global scoreboard tasks (the boot-time
+    /// process-death reconciler + the 15:45 IST daily aggregation) and emit
+    /// the `DualFeedDailyScorecard` Telegram from the outer supervisor.
+    /// Rule 13 (audit-findings 2026-04-17): a variant/module defined + tested
+    /// but never called IS a bug — this source-scan fails the build if a
+    /// future refactor removes the call sites.
+    #[test]
+    fn test_feed_scoreboard_task_is_wired_into_main() {
+        let main_rs = std::fs::read_to_string("../app/src/main.rs")
+            .or_else(|_| std::fs::read_to_string("crates/app/src/main.rs"))
+            .expect("main.rs must be readable");
+        assert!(
+            main_rs.contains("spawn_feed_scoreboard_tasks(&config, &trading_calendar, &notifier)"),
+            "main.rs MUST spawn the dual-feed scoreboard tasks from the \
+             process-global prefix (next to spawn_daily_tick_conservation_task). \
+             Without it the feed_scoreboard_boot module + the \
+             DualFeedDailyScorecard event are dead code. See \
+             .claude/plans/active-plan-dual-feed-scoreboard.md."
+        );
+        assert!(
+            main_rs.contains("NotificationEvent::DualFeedDailyScorecard {"),
+            "main.rs MUST emit `NotificationEvent::DualFeedDailyScorecard` from \
+             the outer scoreboard supervisor — the daily operator digest per \
+             the 2026-07-10 dual-feed directive."
+        );
+        assert!(
+            main_rs.contains("NotificationEvent::DualFeedScorecardAborted {"),
+            "main.rs MUST emit `DualFeedScorecardAborted` on the Err/panic arms \
+             of the outer scoreboard supervisor — the daily signal must never \
+             be silently dropped (audit Rule 11)."
+        );
+        assert!(
+            main_rs.contains("reconcile_process_death_episodes("),
+            "main.rs MUST run the boot-time process-death reconciler — without \
+             it a mid-session process death leaves NO episode row and the \
+             month verdict silently under-counts our own restarts."
+        );
+    }
+
     /// SLO-03 (live incident 2026-07-03 10:35 IST): `main.rs` MUST spawn the
     /// SLO evaluator/publisher through the SUPERVISED wrapper, never as a bare
     /// `tokio::spawn`. The bare spawn died silently mid-market — last

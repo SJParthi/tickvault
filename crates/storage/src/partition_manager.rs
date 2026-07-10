@@ -94,6 +94,13 @@ pub(crate) const DAY_PARTITIONED_TABLES: &[&str] = &[
     // ladder rung transition — same SEBI-audit class + DAY partitioning as
     // ws_event_audit; `feed` is in the DEDUP key.
     "groww_scale_audit",
+    // SCOREBOARD-01 (2026-07-10, dual-feed scoreboard PR-A): one row per
+    // (trading day, feed) verdict / per (trading day, feed) coverage snapshot /
+    // per outage episode — same SEBI-audit class + DAY partitioning as the
+    // audit tables above; `feed` is in every DEDUP key.
+    "feed_scoreboard_daily",
+    "feed_coverage_daily",
+    "feed_episode_audit",
 ];
 
 /// Tables EXEMPT from retention sweeping — NEVER detached or dropped.

@@ -1,6 +1,6 @@
 # Implementation Plan: Dual-Feed Scoreboard PR-A — tables + blame classifier + process-death reconciler + 15:45 IST daily task + Telegram scorecard
 
-**Status:** APPROVED
+**Status:** VERIFIED
 **Date:** 2026-07-10
 **Approved by:** Parthiban (operator) — 2026-07-10 dual-feed scoreboard directive ("run these two websockets live for a month... all tracked, captured, visualized, logged, monitored, 100% automated") + the blame-attribution directive ("ensure and CAPTURE that the issue really arose from the broker side")
 

@@ -45,7 +45,7 @@ use tracing::{error, info, warn};
 use tickvault_common::config::QuestDbConfig;
 use tickvault_common::error_code::ErrorCode;
 use tickvault_common::feed_blame::{
-    BlameClass, EPISODE_KIND_DISCONNECT, EPISODE_KIND_NEVER_STREAMED_RESTART,
+    EPISODE_KIND_DISCONNECT, EPISODE_KIND_NEVER_STREAMED_RESTART,
     EPISODE_KIND_OFF_HOURS_DISCONNECT, EPISODE_KIND_PROCESS_DEATH, EPISODE_KIND_STALL_RESTART,
     EpisodeEvidence, classify_episode,
 };
@@ -1227,6 +1227,7 @@ pub async fn run_feed_scoreboard(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tickvault_common::feed_blame::BlameClass;
 
     const DAY: u64 = 20_644; // an arbitrary IST day number
     fn day_ts(secs_into_day: i64) -> i64 {
