@@ -1346,8 +1346,14 @@ mod tests {
             .match_indices(spawn_needle)
             .map(|(i, _)| i)
             .collect();
+        // The CODE form of the fast-arm return (the call's arg list opens on
+        // the next line) — a prose mention in a comment carries `(...)` on
+        // the same line and must NOT anchor the split.
         let fast_return = main_rs
-            .find("return run_shutdown_fast(")
+            .match_indices("return run_shutdown_fast(")
+            .map(|(i, m)| (i, &main_rs[i + m.len()..]))
+            .find(|(_, rest)| rest.starts_with('\n') || rest.starts_with('\r'))
+            .map(|(i, _)| i)
             .expect("main.rs must contain the fast-boot `return run_shutdown_fast(` arm");
         assert!(
             spawn_sites.iter().any(|&i| i < fast_return),
