@@ -6,6 +6,7 @@
 //!
 //! # Modules
 //!
+//! - [`fast_boot_validation`] — AUTH-GAP-06 fast-boot cached-token validation
 //! - [`secret_manager`] — Fetches credentials from AWS SSM Parameter Store
 //! - [`totp_generator`] — Generates TOTP codes for 2FA
 //! - [`token_manager`] — JWT lifecycle with O(1) arc-swap reads and renewal
@@ -32,6 +33,7 @@
 //! let auth_header = token.access_token().expose_secret();
 //! ```
 
+pub mod fast_boot_validation;
 pub mod mid_session_watchdog;
 pub mod secret_manager;
 pub mod token_cache;

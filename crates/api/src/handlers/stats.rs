@@ -5,9 +5,12 @@
 
 use axum::Json;
 use axum::extract::State;
+use axum::response::{IntoResponse, Response};
 use serde::Serialize;
 
 use crate::state::SharedAppState;
+
+use crate::response_cache::cached_json_response;
 
 /// Timeout for QuestDB stats queries (cold path, not tick processing).
 const QUESTDB_STATS_TIMEOUT_SECS: u64 = 3;
@@ -37,7 +40,45 @@ pub struct StatsResponse {
 }
 
 /// `GET /api/stats` — fetch QuestDB counts in one call.
-pub async fn get_stats(State(state): State<SharedAppState>) -> Json<StatsResponse> {
+///
+/// 2026-07-09 audit hardening: the computed 200 body is TTL-cached (5s,
+/// single slot in [`SharedAppState`]) so an internet client hammering this
+/// public endpoint costs QuestDB at most one 5-query pass per TTL window.
+/// The rate limiter in `crate::public_guard` runs BEFORE this handler
+/// (route_layer); cache is the second line. A cache HIT touches QuestDB
+/// zero times. The always-200 contract is unchanged — a QuestDB-down
+/// zeroed body is deliberately cached too (bounded negative caching: the
+/// uncached down-path costs 5 failed HTTP attempts x 3s timeout per hit).
+pub async fn get_stats(State(state): State<SharedAppState>) -> Response {
+    if let Some(body) = state.stats_cache().get() {
+        metrics::counter!("tv_api_cache_hits_total", "endpoint" => "stats").increment(1);
+        return cached_json_response(body, "hit");
+    }
+
+    let stats = compute_stats(&state).await;
+    match serde_json::to_string(&stats) {
+        Ok(body) => {
+            state.stats_cache().put(body.clone());
+            cached_json_response(body, "miss")
+        }
+        // Practically unreachable (plain struct of bools/u64s) — fall
+        // through to the uncached Json path rather than 500 on a cache
+        // problem; never cache a body we could not serialize.
+        Err(_) => Json(stats).into_response(),
+    }
+}
+
+/// Runs the 5 QuestDB count queries and assembles the stats payload.
+/// Extracted from the handler so the cache wrapper stays thin and the
+/// existing field-level tests exercise the computation directly.
+///
+/// HONEST BOUND (adversarial review 2026-07-09): there is no single-flight
+/// on a cache miss, so with QuestDB black-holed (5 x 3s timeouts) the
+/// limiter still admits up to 5 computes/s (~75 concurrent worst case),
+/// each building one short-lived HTTP client. That is BOUNDED by the
+/// limiter (pre-change it was unbounded per internet client) and cold-path
+/// only; miss single-flighting is a flagged follow-up, not a regression.
+pub(crate) async fn compute_stats(state: &SharedAppState) -> StatsResponse {
     let cfg = state.questdb_config();
     let base_url = format!("http://{}:{}", cfg.host, cfg.http_port);
 
@@ -46,7 +87,7 @@ pub async fn get_stats(State(state): State<SharedAppState>) -> Json<StatsRespons
     let tables = query_count(&client, &base_url, "SHOW TABLES").await;
     let questdb_reachable = tables.is_some();
 
-    Json(StatsResponse {
+    StatsResponse {
         questdb_reachable,
         tables: tables.unwrap_or(0),
         // I-P1-08 (rewritten 2026-04-17): Lifecycle tables hold active + expired
@@ -76,7 +117,7 @@ pub async fn get_stats(State(state): State<SharedAppState>) -> Json<StatsRespons
         ticks: query_count(&client, &base_url, "SELECT count() FROM ticks")
             .await
             .unwrap_or(0),
-    })
+    }
 }
 
 /// Runs a count query against QuestDB's HTTP endpoint. Returns None on failure.
@@ -108,6 +149,7 @@ pub(crate) async fn query_count(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::response_cache::CACHE_MARKER_HEADER;
 
     #[test]
     fn test_build_stats_client_constructs_with_timeout() {
@@ -146,9 +188,8 @@ mod tests {
     // deleted SharedTopMoversSnapshot type.
 
     #[tokio::test]
-    async fn test_get_stats_returns_unreachable_when_questdb_down() {
+    async fn test_compute_stats_returns_unreachable_when_questdb_down() {
         use crate::state::SharedAppState;
-        use axum::extract::State;
         use tickvault_common::config::{DhanConfig, InstrumentConfig, QuestDbConfig};
 
         let state = SharedAppState::new(
@@ -179,7 +220,7 @@ mod tests {
             },
             std::sync::Arc::new(crate::state::SystemHealthStatus::new()),
         );
-        let result = get_stats(State(state)).await;
+        let result = compute_stats(&state).await;
         assert!(!result.questdb_reachable);
         assert_eq!(result.tables, 0);
         assert_eq!(result.underlyings, 0);
@@ -499,7 +540,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_get_stats_with_mock_questdb() {
+    async fn test_compute_stats_with_mock_questdb() {
         // First query: SHOW TABLES returns 2 tables (reachable=true).
         // Subsequent queries return counts.
         let responses = vec![
@@ -542,9 +583,92 @@ mod tests {
             },
             std::sync::Arc::new(crate::state::SystemHealthStatus::new()),
         );
-        let result = get_stats(axum::extract::State(state)).await;
+        let result = compute_stats(&state).await;
         assert!(result.questdb_reachable);
         assert_eq!(result.tables, 2);
+    }
+
+    /// 2026-07-09 hardening: a second `get_stats` call inside the TTL
+    /// window must be a cache HIT — byte-identical body with ZERO QuestDB
+    /// round-trips. The multi-mock server serves EXACTLY the 5 responses of
+    /// the first pass; an uncached second pass would hit the exhausted
+    /// server and produce the differing unreachable/zeros body.
+    #[tokio::test]
+    async fn test_get_stats_cache_hit_skips_questdb() {
+        let responses = vec![
+            r#"{"dataset":[["ticks"],["fno_underlyings"]]}"#,
+            r#"{"dataset":[[214]]}"#,
+            r#"{"dataset":[[96948]]}"#,
+            r#"{"dataset":[[31]]}"#,
+            r#"{"dataset":[[1000000]]}"#,
+        ];
+        let base_url = start_multi_mock_server(responses).await;
+        let port: u16 = base_url.rsplit(':').next().unwrap().parse().unwrap();
+
+        let state = SharedAppState::new(
+            tickvault_common::config::QuestDbConfig {
+                host: "127.0.0.1".to_string(),
+                http_port: port,
+                pg_port: 1,
+                ilp_port: 1,
+            },
+            tickvault_common::config::DhanConfig {
+                websocket_url: "wss://test".to_string(),
+                order_update_websocket_url: "wss://test".to_string(),
+                rest_api_base_url: "https://test".to_string(),
+                auth_base_url: "https://test".to_string(),
+                instrument_csv_url: "https://test".to_string(),
+                instrument_csv_fallback_url: "https://test".to_string(),
+                max_instruments_per_connection: 5000,
+                max_websocket_connections: 5,
+                sandbox_base_url: String::new(),
+            },
+            tickvault_common::config::InstrumentConfig {
+                daily_download_time: "08:55:00".to_string(),
+                csv_cache_directory: "/tmp/tv-cache".to_string(),
+                csv_cache_filename: "instruments.csv".to_string(),
+                csv_download_timeout_secs: 120,
+                build_window_start: "08:25:00".to_string(),
+                build_window_end: "08:55:00".to_string(),
+            },
+            std::sync::Arc::new(crate::state::SystemHealthStatus::new()),
+        );
+
+        let first = get_stats(State(state.clone())).await;
+        assert_eq!(
+            first
+                .headers()
+                .get(CACHE_MARKER_HEADER)
+                .and_then(|v| v.to_str().ok()),
+            Some("miss"),
+            "first call must be a cache miss"
+        );
+        let first_body = axum::body::to_bytes(first.into_body(), 64 * 1024)
+            .await
+            .expect("first body readable");
+        assert!(
+            String::from_utf8_lossy(&first_body).contains("\"tables\":2"),
+            "first (computed) body must carry the mocked counts"
+        );
+
+        // Second call: mock server is exhausted — only the cache can
+        // reproduce the same body.
+        let second = get_stats(State(state)).await;
+        assert_eq!(
+            second
+                .headers()
+                .get(CACHE_MARKER_HEADER)
+                .and_then(|v| v.to_str().ok()),
+            Some("hit"),
+            "second call inside the TTL must be a cache hit"
+        );
+        let second_body = axum::body::to_bytes(second.into_body(), 64 * 1024)
+            .await
+            .expect("second body readable");
+        assert_eq!(
+            first_body, second_body,
+            "cache hit must return the byte-identical body without any QuestDB call"
+        );
     }
 
     // -----------------------------------------------------------------------

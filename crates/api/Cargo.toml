@@ -28,6 +28,11 @@ serde_json = { workspace = true }
 chrono = { workspace = true }
 reqwest = { workspace = true }
 uuid = { workspace = true }
+# 2026-07-09 audit hardening: GCRA rate limiter for the two public
+# QuestDB-backed endpoints (/api/stats + /api/quote). NOT a new dependency —
+# governor is already a pinned workspace dep (the OMS order rate limiter
+# uses the same crate/pattern).
+governor = { workspace = true }
 # 2026-04-25 security audit (PR #357): bearer_token migrated from
 # `String` (with manual zeroize::Zeroize Drop impl) to `secrecy::SecretString`
 # per .claude/rules/project/rust-code.md (mandated secret type).

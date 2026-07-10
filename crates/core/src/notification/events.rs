@@ -2457,6 +2457,89 @@ impl NotificationEvent {
                     conn: 0,
                 })
             }
+            // Boot bubble (2026-07-09 operator escalation — the ~8-message
+            // boot spray folds into ONE live-edited checklist). Success-only
+            // milestones (all ≤ Severity::Medium pre-demotion, Low/Info
+            // now); failure events keep their legacy instant paging.
+            Self::AuthenticationSuccess
+            | Self::InstrumentBuildSuccess { .. }
+            | Self::WebSocketPoolOnline { .. }
+            | Self::WebSocketPoolDeferredOffHours { .. }
+            | Self::OrderUpdateConnected
+            | Self::OrderUpdateAuthenticated
+            | Self::BootHealthCheck { .. }
+            | Self::StartupComplete { .. } => Some(super::episode::BOOT_EPISODE_KEY),
+            // Feed-generic boot pings fold ONLY for the Groww feed (str
+            // compare — zero-alloc; the DHAT pin holds). Any other feed
+            // name keeps the legacy immediate lane.
+            Self::FeedAuthOk { feed }
+            | Self::FeedInstrumentsLoaded { feed, .. }
+            | Self::FeedConnectedAwaitingTicks { feed, .. } => {
+                if feed.eq_ignore_ascii_case("groww") {
+                    Some(super::episode::BOOT_EPISODE_KEY)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// Boot bubble (2026-07-09): the typed milestone this event folds into
+    /// the boot checklist. `Some` for EXACTLY the variants whose
+    /// [`Self::episode_key`] maps to the Boot family; `None` otherwise.
+    #[must_use]
+    pub fn boot_milestone(&self) -> Option<super::episode::BootMilestone> {
+        use super::episode::BootMilestone;
+        // Payload counts clamp defensively — never a panic (repo law).
+        fn clamp_u32(value: usize) -> u32 {
+            u32::try_from(value).unwrap_or(u32::MAX)
+        }
+        match self {
+            Self::BootHealthCheck {
+                services_healthy,
+                services_total,
+            } => Some(BootMilestone::Services {
+                healthy: clamp_u32(*services_healthy),
+                total: clamp_u32(*services_total),
+            }),
+            Self::AuthenticationSuccess => Some(BootMilestone::DhanAuth),
+            Self::InstrumentBuildSuccess {
+                derivative_count,
+                underlying_count,
+                ..
+            } => Some(BootMilestone::Instruments {
+                count: clamp_u32(derivative_count.saturating_add(*underlying_count)),
+            }),
+            Self::WebSocketPoolOnline {
+                connected,
+                total,
+                last_real_tick_age_secs,
+                ..
+            } => Some(BootMilestone::DhanFeedOnline {
+                connected: clamp_u32(*connected),
+                total: clamp_u32(*total),
+                last_real_tick_age_secs: *last_real_tick_age_secs,
+            }),
+            Self::WebSocketPoolDeferredOffHours { .. } => {
+                Some(BootMilestone::DhanFeedDeferredOffHours)
+            }
+            Self::OrderUpdateConnected => Some(BootMilestone::OrderUpdateConnected),
+            Self::OrderUpdateAuthenticated => Some(BootMilestone::OrderUpdateAuthenticated),
+            Self::StartupComplete { mode } => Some(BootMilestone::Complete { mode }),
+            Self::FeedAuthOk { feed } if feed.eq_ignore_ascii_case("groww") => {
+                Some(BootMilestone::GrowwAuth)
+            }
+            Self::FeedInstrumentsLoaded {
+                feed, subscribed, ..
+            } if feed.eq_ignore_ascii_case("groww") => Some(BootMilestone::GrowwInstruments {
+                subscribed: clamp_u32(*subscribed),
+            }),
+            Self::FeedConnectedAwaitingTicks {
+                feed, market_open, ..
+            } if feed.eq_ignore_ascii_case("groww") => Some(BootMilestone::GrowwConnected {
+                market_open: *market_open,
+            }),
             _ => None,
         }
     }
@@ -2590,7 +2673,13 @@ impl NotificationEvent {
             // is High (per audit-findings Rule 11 — no false-OK class).
             // PR #6a (2026-05-19): NseBhavcopyCheck* severity arms retired.
             Self::OrderUpdateConnected => Severity::Low,
-            Self::OrderUpdateAuthenticated => Severity::Medium,
+            // 2026-07-09 (operator escalation — one boot bubble): demoted
+            // Medium → Low. The event now folds into the green boot
+            // checklist whose prefix is fixed at [LOW]; a Medium fold
+            // would misleadingly flip the bubble amber, and as a
+            // standalone (boot_bubble=false rollback) it is a routine
+            // once-per-boot success ping, not an operator action.
+            Self::OrderUpdateAuthenticated => Severity::Low,
             Self::TokenRenewed => Severity::Low,
             Self::IpVerificationSuccess { .. } => Severity::Low,
             Self::StaticIpBootCheckPassed { .. } => Severity::Low,
@@ -2811,12 +2900,18 @@ mod tests {
     #[test]
     fn test_episode_key_none_for_non_episode_variants() {
         // Legacy path stays byte-identical for everything else.
+        // (2026-07-09: the boot-milestone variants moved to the Boot
+        // family — see test_episode_key_boot_variants_map_to_boot_family.)
         for event in [
-            NotificationEvent::StartupComplete { mode: "LIVE" },
-            NotificationEvent::AuthenticationSuccess,
             NotificationEvent::TokenRenewed,
             NotificationEvent::ShutdownInitiated,
-            NotificationEvent::OrderUpdateConnected,
+            NotificationEvent::ShutdownComplete,
+            NotificationEvent::SelfTestPassed { checks_passed: 8 },
+            NotificationEvent::MarketOpenStreamingConfirmation {
+                main_feed_active: 1,
+                main_feed_total: 1,
+                order_update_active: true,
+            },
             NotificationEvent::Custom {
                 message: "x".to_string(),
             },
@@ -2827,6 +2922,256 @@ mod tests {
                 event.topic()
             );
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Boot bubble (2026-07-09) — episode_key / boot_milestone mapping
+    // -----------------------------------------------------------------------
+
+    /// Every boot-milestone variant, constructed once for the mapping tests.
+    fn boot_mapped_events() -> Vec<NotificationEvent> {
+        vec![
+            NotificationEvent::BootHealthCheck {
+                services_healthy: 3,
+                services_total: 3,
+            },
+            NotificationEvent::AuthenticationSuccess,
+            NotificationEvent::InstrumentBuildSuccess {
+                source: "cache".to_string(),
+                derivative_count: 1000,
+                underlying_count: 46,
+            },
+            NotificationEvent::WebSocketPoolOnline {
+                connected: 1,
+                total: 1,
+                per_connection: vec![(4, 5000, Some(2))],
+                boot_path: BootPathLabel::Slow,
+                boot_wall_clock_secs: 94.0,
+                last_real_tick_age_secs: Some(2),
+                feeds: vec![],
+            },
+            NotificationEvent::WebSocketPoolDeferredOffHours {
+                deferred: 1,
+                total: 1,
+                boot_path: BootPathLabel::Slow,
+                feeds: vec![],
+            },
+            NotificationEvent::OrderUpdateConnected,
+            NotificationEvent::OrderUpdateAuthenticated,
+            NotificationEvent::StartupComplete { mode: "sandbox" },
+            NotificationEvent::FeedAuthOk {
+                feed: "Groww".to_string(),
+            },
+            NotificationEvent::FeedInstrumentsLoaded {
+                feed: "Groww".to_string(),
+                subscribed: 768,
+                indices: 2,
+                stocks: 766,
+                skipped: 0,
+            },
+            NotificationEvent::FeedConnectedAwaitingTicks {
+                feed: "Groww".to_string(),
+                subscribed: 768,
+                market_open: true,
+            },
+        ]
+    }
+
+    #[test]
+    fn test_episode_key_boot_variants_map_to_boot_family() {
+        use super::super::episode::{BOOT_EPISODE_KEY, EpisodeRole};
+        for event in boot_mapped_events() {
+            assert_eq!(
+                event.episode_key(),
+                Some(BOOT_EPISODE_KEY),
+                "boot milestone must map to the Boot key: {}",
+                event.topic()
+            );
+            assert_eq!(
+                event.episode_role(),
+                EpisodeRole::Open,
+                "boot milestones always fold as Open"
+            );
+            assert!(
+                event.boot_milestone().is_some(),
+                "boot-mapped variant must carry a milestone: {}",
+                event.topic()
+            );
+        }
+    }
+
+    #[test]
+    fn test_episode_key_non_groww_feed_is_none() {
+        // A future feed #3 (or a renamed feed) keeps the legacy lane —
+        // never a wrong fold into the boot bubble.
+        for event in [
+            NotificationEvent::FeedAuthOk {
+                feed: "SomeOtherFeed".to_string(),
+            },
+            NotificationEvent::FeedInstrumentsLoaded {
+                feed: "SomeOtherFeed".to_string(),
+                subscribed: 10,
+                indices: 1,
+                stocks: 9,
+                skipped: 0,
+            },
+            NotificationEvent::FeedConnectedAwaitingTicks {
+                feed: "SomeOtherFeed".to_string(),
+                subscribed: 10,
+                market_open: false,
+            },
+        ] {
+            assert!(event.episode_key().is_none(), "{}", event.topic());
+            assert!(event.boot_milestone().is_none(), "{}", event.topic());
+        }
+    }
+
+    #[test]
+    fn test_boot_milestone_mapping_all_variants() {
+        use super::super::episode::{BootMilestone, BootMilestone as M};
+        let m = NotificationEvent::BootHealthCheck {
+            services_healthy: 3,
+            services_total: 4,
+        }
+        .boot_milestone();
+        assert_eq!(
+            m,
+            Some(M::Services {
+                healthy: 3,
+                total: 4
+            })
+        );
+        assert_eq!(
+            NotificationEvent::AuthenticationSuccess.boot_milestone(),
+            Some(M::DhanAuth)
+        );
+        assert_eq!(
+            NotificationEvent::InstrumentBuildSuccess {
+                source: "cache".to_string(),
+                derivative_count: 1000,
+                underlying_count: 46,
+            }
+            .boot_milestone(),
+            Some(M::Instruments { count: 1046 }),
+            "count = derivatives + underlyings"
+        );
+        assert_eq!(
+            NotificationEvent::WebSocketPoolOnline {
+                connected: 1,
+                total: 1,
+                per_connection: vec![],
+                boot_path: BootPathLabel::Slow,
+                boot_wall_clock_secs: 1.0,
+                last_real_tick_age_secs: None,
+                feeds: vec![],
+            }
+            .boot_milestone(),
+            Some(M::DhanFeedOnline {
+                connected: 1,
+                total: 1,
+                last_real_tick_age_secs: None
+            })
+        );
+        assert_eq!(
+            NotificationEvent::WebSocketPoolDeferredOffHours {
+                deferred: 1,
+                total: 1,
+                boot_path: BootPathLabel::Slow,
+                feeds: vec![],
+            }
+            .boot_milestone(),
+            Some(M::DhanFeedDeferredOffHours)
+        );
+        assert_eq!(
+            NotificationEvent::OrderUpdateConnected.boot_milestone(),
+            Some(M::OrderUpdateConnected)
+        );
+        assert_eq!(
+            NotificationEvent::OrderUpdateAuthenticated.boot_milestone(),
+            Some(M::OrderUpdateAuthenticated)
+        );
+        assert_eq!(
+            NotificationEvent::StartupComplete { mode: "sandbox" }.boot_milestone(),
+            Some(BootMilestone::Complete { mode: "sandbox" })
+        );
+        assert_eq!(
+            NotificationEvent::FeedAuthOk {
+                feed: "Groww".to_string()
+            }
+            .boot_milestone(),
+            Some(M::GrowwAuth)
+        );
+        assert_eq!(
+            NotificationEvent::FeedInstrumentsLoaded {
+                feed: "Groww".to_string(),
+                subscribed: 768,
+                indices: 2,
+                stocks: 766,
+                skipped: 0,
+            }
+            .boot_milestone(),
+            Some(M::GrowwInstruments { subscribed: 768 })
+        );
+        assert_eq!(
+            NotificationEvent::FeedConnectedAwaitingTicks {
+                feed: "Groww".to_string(),
+                subscribed: 768,
+                market_open: false,
+            }
+            .boot_milestone(),
+            Some(M::GrowwConnected { market_open: false })
+        );
+        // Non-boot events carry no milestone.
+        assert!(NotificationEvent::TokenRenewed.boot_milestone().is_none());
+    }
+
+    #[test]
+    fn test_boot_episode_key_only_success_milestones() {
+        // Ratchet: nothing with severity ≥ High may ever map to the Boot
+        // bubble — failure events keep their legacy instant paging. The
+        // boot bubble's prefix is fixed at [LOW], so folding a paging
+        // event would silently demote it.
+        for event in boot_mapped_events() {
+            assert!(
+                event.severity() < Severity::High,
+                "a paging-severity event must never fold into the boot bubble: {} ({:?})",
+                event.topic(),
+                event.severity()
+            );
+        }
+        // The #1443 instant trio stays OUT of the bubble (separate instant
+        // messages) — regression pin for the market-open lane.
+        for event in [
+            NotificationEvent::SelfTestPassed { checks_passed: 8 },
+            NotificationEvent::MarketOpenStreamingConfirmation {
+                main_feed_active: 1,
+                main_feed_total: 1,
+                order_update_active: true,
+            },
+            NotificationEvent::MarketOpenReadinessConfirmation {
+                main_feed_active: 1,
+                main_feed_total: 1,
+                order_update_active: true,
+                token_remaining_secs: 20_000,
+            },
+        ] {
+            assert!(
+                event.episode_key().is_none(),
+                "#1443 instant-lane event must stay standalone: {}",
+                event.topic()
+            );
+            assert_eq!(event.dispatch_policy(), DispatchPolicy::Immediate);
+        }
+    }
+
+    #[test]
+    fn test_order_update_authenticated_severity_is_low() {
+        // 2026-07-09 pin: folding into the green [LOW] boot checklist —
+        // Medium would flip the bubble amber.
+        assert_eq!(
+            NotificationEvent::OrderUpdateAuthenticated.severity(),
+            Severity::Low
+        );
     }
 
     #[test]

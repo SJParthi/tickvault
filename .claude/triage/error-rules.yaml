@@ -1314,6 +1314,25 @@ rules:
       paired Telegram event — never manually re-mints first.
       Severity::High — pages with a 5-min cooldown, does not auto-fix.
 
+  - name: auth-gap-06-fast-boot-cached-token-validation-escalate
+    match:
+      code: AUTH-GAP-06
+    action: escalate
+    runbook_path: .claude/rules/project/wave-4-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 300
+    justification: >-
+      AUTH-GAP-06 = the FAST crash-recovery boot arm validated the
+      CACHED Dhan JWT with one /v2/profile call BEFORE any WebSocket
+      spawn. Either a Dhan 401/403 reject forced a re-mint through the
+      existing TokenManager machinery, or the validation degraded
+      (transient network / REST-surface error) and boot proceeded
+      loudly with the cached token after one bounded retry. The
+      re-mint / degraded-proceed IS the self-remediation; the operator
+      inspects — a repeat on every boot means the cache/mint chain is
+      broken. Severity::High — pages with a 5-min cooldown, does not
+      auto-fix.
+
   - name: resource-01-fd-count-high-escalate
     match:
       code: RESOURCE-01
@@ -1952,6 +1971,26 @@ rules:
       respawned (WS-GAP-05 pattern) so the stall-watchdog keeps running. A
       one-off respawn at shutdown is benign; a sustained respawn rate is a real
       supervisor bug — escalate so the operator inspects the panic backtrace.
+
+  # FEED-REJECT-01 = a live-feed sidecar opened a reject/error episode (the
+  # once-per-child alert edge that fires the fixed-wording Telegram) and the
+  # supervisor captured a bounded, secret-redacted SIGNATURE of the triggering
+  # sidecar line. The signature is the WHY behind a recurring reject loop (the
+  # 2026-07-09 all-day 09:22/14:17 IST loop was invisible in the coded
+  # stream) — escalate so the operator reads the signature per the runbook.
+  - name: feed-reject-01-sidecar-error-detail-escalate
+    match:
+      code: FEED-REJECT-01
+    action: escalate
+    runbook_path: .claude/rules/project/feed-stall-watchdog-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 0
+    justification: >-
+      FEED-REJECT-01 = the sidecar reject episode's bounded cause signature.
+      The restart/backoff machinery already owns recovery; the signature is
+      the triage payload — escalate so the operator reads WHY the feed loops
+      (NATS reject, subscribe failure, SDK decode error, SSM/boto3 failure)
+      instead of only the fixed Telegram wording.
 
   # WS-REINJECT-01 = the boot-time STAGE-C.2b WAL re-injection aborted — the
   # frame-channel consumer (tick processor) was dead (channel closed) or

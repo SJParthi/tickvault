@@ -306,6 +306,19 @@ pub enum ErrorCode {
     /// self-remediation; the standing CRITICAL profile page covers the
     /// unrecovered case. (2026-07-06.)
     AuthGap05ForcedRemintTriggered,
+    /// AUTH-GAP-06: fast-boot cached-token validation (2026-07-08 —
+    /// third morning cached-token outage, 08:32–09:06 IST on 2026-07-07).
+    /// The FAST crash-recovery boot arm validates the CACHED Dhan JWT with
+    /// ONE `GET /v2/profile` BEFORE any WebSocket spawn. A prefix-anchored
+    /// 401/403 rejection forces a re-mint through the existing TokenManager
+    /// machinery (RESILIENCE-03 in-flight tripwire preserved; the fast arm
+    /// passes `None` for the dual-instance lock flag — the documented §3
+    /// residual of `dual-instance-lock-2026-07-04.md`, unchanged). Any
+    /// other failure shape (transient network, REST-surface 400/429/5xx,
+    /// parse) proceeds with the cached token after ONE bounded retry —
+    /// loudly, never blocking boot. Severity::High — the re-mint /
+    /// degraded-proceed is the self-remediation; the operator must see it.
+    AuthGap06FastBootCachedTokenValidation,
     /// BOOT-01: slow-boot QuestDB readiness deadline approaching (>30s).
     Boot01QuestDbSlow,
     /// BOOT-02: boot deadline exceeded (>60s) — HALTING.
@@ -738,6 +751,17 @@ pub enum ErrorCode {
     /// resumes on respawn. Severity::High (a supervisor that keeps dying points at
     /// a real bug), auto-triage-safe (the respawn already self-healed).
     FeedSupervisor01Respawned,
+    /// FEED-REJECT-01 (2026-07-09) — a live-feed sidecar opened an
+    /// operator-actionable reject/error episode (the once-per-child alert edge
+    /// that fires the fixed-wording Telegram), and the supervisor captured a
+    /// BOUNDED (≤160 chars), secret-redacted SIGNATURE of the triggering
+    /// sidecar diagnostic line into the coded error stream. Closes the
+    /// 2026-07-09 all-day reject-loop blindness: the Telegram wording is fixed
+    /// per class (10-commandments correct), so without this code the operator
+    /// (and triage) could not query errors.jsonl / CloudWatch for WHY the loop
+    /// repeats. Severity::High, auto-triage-safe (visibility only — the
+    /// restart/backoff machinery already owns recovery).
+    FeedReject01SidecarErrorDetail,
     /// HTTP-CLIENT-01 (C2 2026-07-03) — `reqwest::ClientBuilder::build()`
     /// failed (TLS backend init / resolver init / fd exhaustion). Previously
     /// 8 storage sites fell back to `Client::new()`, which PANICS on the
@@ -920,6 +944,7 @@ impl ErrorCode {
             Self::AuthGap03TokenForceRenewedOnWake => "AUTH-GAP-03",
             Self::AuthGap04TotpRotatedExternally => "AUTH-GAP-04",
             Self::AuthGap05ForcedRemintTriggered => "AUTH-GAP-05",
+            Self::AuthGap06FastBootCachedTokenValidation => "AUTH-GAP-06",
             Self::Boot01QuestDbSlow => "BOOT-01",
             Self::Boot02DeadlineExceeded => "BOOT-02",
             Self::Boot03ClockSkewExceeded => "BOOT-03",
@@ -1014,6 +1039,8 @@ impl ErrorCode {
             Self::GrowwMaster01PersistFailed => "GROWW-MASTER-01",
             Self::FeedStall01SidecarRestarted => "FEED-STALL-01",
             Self::FeedSupervisor01Respawned => "FEED-SUPERVISOR-01",
+            // 2026-07-09: bounded sidecar reject-cause signature surfacing
+            Self::FeedReject01SidecarErrorDetail => "FEED-REJECT-01",
             // C2 (2026-07-03): panic-free reqwest client construction
             Self::HttpClient01BuildFailed => "HTTP-CLIENT-01",
             // §34 (2026-07-03): Groww multi-connection auto-scale ladder
@@ -1149,6 +1176,11 @@ impl ErrorCode {
             // persistent provider-side reject).
             | Self::FeedStall01SidecarRestarted
             | Self::FeedSupervisor01Respawned
+            // FEED-REJECT-01 (2026-07-09) — a sidecar reject/error episode
+            // opened; the coded line carries the bounded cause signature the
+            // operator needs to triage a recurring reject loop. High: it
+            // accompanies the HIGH GrowwSidecarRejected Telegram page.
+            | Self::FeedReject01SidecarErrorDetail
             // BP-08 (2026-07-01) — fd / RSS / spill-free early-warning
             // monitors: page at 80% so the operator acts before exhaustion.
             | Self::Resource01FdCountHigh
@@ -1163,6 +1195,13 @@ impl ErrorCode {
             // (auto-triage safe); the existing CRITICAL profile page covers
             // the unrecovered case.
             | Self::AuthGap05ForcedRemintTriggered
+            // AUTH-GAP-06 (2026-07-08) — fast-boot cached-token validation:
+            // a Dhan-rejected cached token was re-minted before any WS
+            // spawn, or the validation degraded and boot proceeded loudly
+            // with the cached token. High: the action already self-applied;
+            // the operator must see every occurrence (a repeat every boot
+            // means the cache/mint chain is broken).
+            | Self::AuthGap06FastBootCachedTokenValidation
             // GROWW-SCALE-01/02 (§34 2026-07-03) — the auto-scale ladder
             // rolled back a failed rung / halved on fleet-wide failure. The
             // auto-correction already applied; the operator must see every
@@ -1371,6 +1410,9 @@ impl ErrorCode {
             // AUTH-GAP-05 (2026-07-06) — sustained mid-session token-invalid:
             // forced re-mint triggered (runbook §AUTH-GAP-05).
             | Self::AuthGap05ForcedRemintTriggered
+            // AUTH-GAP-06 (2026-07-08) — fast-boot cached-token validation
+            // (runbook §AUTH-GAP-06).
+            | Self::AuthGap06FastBootCachedTokenValidation
             // BP-08 (2026-07-01) — fd / RSS / spill-free early-warning monitors
             // (promotes the RESERVED RESOURCE-01/02/03 stubs).
             | Self::Resource01FdCountHigh
@@ -1431,7 +1473,9 @@ impl ErrorCode {
                 ".claude/rules/project/groww-shared-master-error-codes.md"
             }
             // 2026-06-30: feed-agnostic sidecar stall-watchdog + supervisor respawn
-            Self::FeedStall01SidecarRestarted | Self::FeedSupervisor01Respawned => {
+            Self::FeedStall01SidecarRestarted
+            | Self::FeedSupervisor01Respawned
+            | Self::FeedReject01SidecarErrorDetail => {
                 ".claude/rules/project/feed-stall-watchdog-error-codes.md"
             }
             // C2 (2026-07-03): panic-free reqwest client construction
@@ -1560,6 +1604,7 @@ impl ErrorCode {
             Self::AuthGap03TokenForceRenewedOnWake,
             Self::AuthGap04TotpRotatedExternally,
             Self::AuthGap05ForcedRemintTriggered,
+            Self::AuthGap06FastBootCachedTokenValidation,
             Self::Boot01QuestDbSlow,
             Self::Boot02DeadlineExceeded,
             Self::Boot03ClockSkewExceeded,
@@ -1630,6 +1675,7 @@ impl ErrorCode {
             // 2026-06-30: feed-agnostic sidecar stall-watchdog + supervisor respawn
             Self::FeedStall01SidecarRestarted,
             Self::FeedSupervisor01Respawned,
+            Self::FeedReject01SidecarErrorDetail,
             // C2 (2026-07-03): panic-free reqwest client construction
             Self::HttpClient01BuildFailed,
             // §34 (2026-07-03): Groww multi-connection auto-scale ladder
@@ -1969,7 +2015,16 @@ mod tests {
         // 2026-07-08 (§36 FUTIDX-4): bumped 132 -> 134 for FUTIDX-01
         // (per-underlying nearest-expiry selection degraded, per feed) +
         // FUTIDX-02 (cross-feed expiry mismatch) — both Severity::High.
-        assert_eq!(ErrorCode::all().len(), 134);
+        // 2026-07-08 (AUTH-GAP-06 fast-boot cached-token validation):
+        // bumped 134 -> 135 — one GET /v2/profile validates the cached JWT
+        // before any WebSocket spawn on the fast crash-recovery arm; a
+        // prefix-anchored 401/403 forces a re-mint via the existing
+        // TokenManager machinery (2026-07-07 third morning outage).
+        // 2026-07-09 (Groww reject-loop hardening): bumped 135 -> 136 for
+        // FEED-REJECT-01 — bounded, secret-redacted sidecar reject-cause
+        // signature surfaced at the once-per-child alert edge (the all-day
+        // 09:22/14:17 IST reject loop was invisible in the coded stream).
+        assert_eq!(ErrorCode::all().len(), 136);
     }
 
     #[test]
@@ -2174,6 +2229,8 @@ mod tests {
                 // 2026-06-30: feed-agnostic sidecar stall-watchdog + respawn
                 || s.starts_with("FEED-STALL-")
                 || s.starts_with("FEED-SUPERVISOR-")
+                // 2026-07-09: bounded sidecar reject-cause signature surfacing
+                || s.starts_with("FEED-REJECT-")
                 // Wave-4-E1 / BP-07 (2026-07-01): OOM-kill monitor.
                 || s.starts_with("PROC-")
                 // C2 (2026-07-03): panic-free reqwest client construction.

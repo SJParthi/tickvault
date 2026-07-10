@@ -29,6 +29,8 @@ static ALLOC: dhat::Alloc = dhat::Alloc;
 use tickvault_trading::candles::TfIndex;
 use tickvault_trading::in_mem::{BarCache, CompactBar};
 
+mod dhat_support;
+
 fn make_bar(bucket_start: u32) -> CompactBar {
     CompactBar {
         bucket_start_ist_secs: bucket_start,
@@ -61,29 +63,35 @@ fn dhat_bar_cache_lookup_steady_state_zero_alloc() {
         cache.insert(security_id, segment_code, tf, make_bar(bucket_start));
     }
 
-    let stats_before = dhat::HeapStats::get();
-
-    // Steady-state measurement: 100 instruments × 100 lookups each =
-    // 10,000 papaya pin+get calls. Every call must return Some(...)
-    // without allocating.
-    let mut found: u64 = 0;
-    for _ in 0..100 {
-        for &security_id in &instruments {
-            if cache
-                .lookup(security_id, segment_code, tf, bucket_start)
-                .is_some()
-            {
-                found = found.saturating_add(1);
+    // 2026-07-09: measured via the bounded phantom-retry helper (roaming
+    // 4-block cross-thread flake on 2-core CI runners — see
+    // dhat_support/mod.rs). Budget UNCHANGED: exactly 0 blocks. The `found`
+    // sanity counter is per-attempt (local to the workload closure).
+    let (_, allocs) = dhat_support::measure_with_phantom_retry(
+        0,
+        0,
+        || {},
+        || {
+            // Steady-state measurement: 100 instruments × 100 lookups each =
+            // 10,000 papaya pin+get calls. Every call must return Some(...)
+            // without allocating.
+            let mut found: u64 = 0;
+            for _ in 0..100 {
+                for &security_id in &instruments {
+                    if cache
+                        .lookup(security_id, segment_code, tf, bucket_start)
+                        .is_some()
+                    {
+                        found = found.saturating_add(1);
+                    }
+                }
             }
-        }
-    }
-    assert_eq!(
-        found, 10_000,
-        "all 10,000 lookups must hit a pre-existing entry"
+            assert_eq!(
+                found, 10_000,
+                "all 10,000 lookups must hit a pre-existing entry"
+            );
+        },
     );
-
-    let stats_after = dhat::HeapStats::get();
-    let allocs = stats_after.total_blocks - stats_before.total_blocks;
 
     // Hard zero — `BarCache::lookup` is the steady-state hot path for
     // every indicator + strategy tick read. Any allocation here

@@ -31,6 +31,8 @@
 #[global_allocator]
 static ALLOC: dhat::Alloc = dhat::Alloc;
 
+mod dhat_support;
+
 use tickvault_core::notification::{
     CoalesceDecision, CoalescerConfig, NotificationEvent, Severity, TelegramCoalescer,
 };
@@ -53,40 +55,38 @@ fn bypass_path_zero_allocation() {
     };
     let plain_event = NotificationEvent::TokenRenewed;
 
-    // 2. Capture the heap state immediately before the hot loop.
+    // 2. Start the profiler, then measure via the bounded phantom-retry
+    //    helper (2026-07-09 — roaming 4-block cross-thread flake on 2-core
+    //    CI runners; see dhat_support/mod.rs). Budget UNCHANGED: 0 blocks.
     let _profiler = dhat::Profiler::builder().testing().build();
-    let stats_before = dhat::HeapStats::get();
 
     // 3. Hot loop — bypass calls + episode_key probes. The closure panics
     //    if it ever runs (it must not for bypass severities), which would
     //    fail the test before DHAT even gets a chance to assert.
-    for _ in 0..10_000 {
-        let decision = coalescer.observe("RiskHalt", Severity::Critical, || {
-            panic!("payload closure must not run on Critical bypass")
-        });
-        assert_eq!(decision, CoalesceDecision::Bypass);
+    let (new_bytes, new_blocks) = dhat_support::measure_with_phantom_retry(
+        0,
+        0,
+        || {},
+        || {
+            for _ in 0..10_000 {
+                let decision = coalescer.observe("RiskHalt", Severity::Critical, || {
+                    panic!("payload closure must not run on Critical bypass")
+                });
+                assert_eq!(decision, CoalesceDecision::Bypass);
 
-        let decision = coalescer.observe("WebSocketDisconnected", Severity::High, || {
-            panic!("payload closure must not run on High bypass")
-        });
-        assert_eq!(decision, CoalesceDecision::Bypass);
+                let decision = coalescer.observe("WebSocketDisconnected", Severity::High, || {
+                    panic!("payload closure must not run on High bypass")
+                });
+                assert_eq!(decision, CoalesceDecision::Bypass);
 
-        // 2026-07-07: the episode probe on the dispatch path is a Copy
-        // match — zero allocation whether it hits (WS lifecycle) or
-        // misses (every other variant).
-        assert!(ws_event.episode_key().is_some());
-        assert!(plain_event.episode_key().is_none());
-    }
-
-    // 4. Capture the heap state after the loop.
-    let stats_after = dhat::HeapStats::get();
-
-    let new_blocks = stats_after
-        .total_blocks
-        .saturating_sub(stats_before.total_blocks);
-    let new_bytes = stats_after
-        .total_bytes
-        .saturating_sub(stats_before.total_bytes);
+                // 2026-07-07: the episode probe on the dispatch path is a Copy
+                // match — zero allocation whether it hits (WS lifecycle) or
+                // misses (every other variant).
+                assert!(ws_event.episode_key().is_some());
+                assert!(plain_event.episode_key().is_none());
+            }
+        },
+    );
 
     // 5. Hard assert: zero new heap blocks across 20,000 bypass calls +
     //    20,000 episode_key probes. A regression that adds even one

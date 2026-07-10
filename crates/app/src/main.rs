@@ -171,8 +171,10 @@ const BOOT_COMPLETED_METRIC: &str = "tv_boot_completed";
 /// The boot-heartbeat alarm (`deploy/aws/terraform/boot-heartbeat-alarm.tf`,
 /// repointed off the `tv_realtime_guarantee_score` PROXY — the PR #1278
 /// follow-up flagged in `daily-universe-scope-expansion-2026-05-27.md` §19
-/// "EC2 cron heartbeat") pages when this metric is MISSING in the 08:50–09:10
-/// IST boot window.
+/// "EC2 cron heartbeat") pages when this metric is MISSING in the 08:50–09:20
+/// IST boot window (close widened from 09:10 on 2026-07-09 so the boot window
+/// hands over to the 09:20 market-hours liveness window with no alarm seam
+/// spanning the 09:15 market open).
 ///
 /// Called from BOTH boot-completion points (fast-boot crash-recovery + slow-boot
 /// normal), each reached ONLY after every boot gate has passed — a halt uses
@@ -1142,6 +1144,36 @@ async fn main() -> Result<()> {
         "feed" => tickvault_common::feed::Feed::Groww.as_str(),
     )
     .increment(0);
+    // Never-streamed attribution counter (2026-07-09 reject-loop hardening):
+    // same delta-baseline rationale as the counter above — pre-register so
+    // the CW agent's dropped-first-sample can never eat the session's first
+    // never-streamed restart from the attribution split. The pager math is
+    // unaffected (never-streamed restarts ALSO increment the stall counter
+    // above, which the tv-<env>-feed-stall-restarts alarm reads).
+    metrics::counter!(
+        "tv_feed_sidecar_never_streamed_restart_total",
+        "feed" => tickvault_common::feed::Feed::Groww.as_str(),
+    )
+    .increment(0);
+    // Seal-writer TRUE-DROP counter (2026-07-09 candle-drop paging PR):
+    // same delta-baseline rationale as the two registrations above — the CW
+    // agent's prometheus pipeline drops each counter series' FIRST sample
+    // as its baseline, and tv_seal_writer_drain_total{kind="dropped"}
+    // increments ONLY when sealed candles are truly dropped (ring + spill +
+    // DLQ all failed — AGGREGATOR-DROP-01, the only silent-data-loss path
+    // for sealed candles). Without this post-install registration the
+    // series is born AT the first drop and the dropped baseline sample IS
+    // the drop — a single-episode drop (the dominant shape) would produce
+    // ZERO datapoints and the tv-<env>-seal-writer-dropped counter alarm
+    // (deploy/aws/terraform/seal-drop-alarm.tf) would be dead on arrival.
+    // Registering at 0 here makes the series DENSE from boot (a 0-delta
+    // /metrics event per 60s scrape), so the dropped first sample is the
+    // harmless 0 baseline and the pager genuinely sees the session's first
+    // drop. The other 5 `kind` values are busy/self-baselining and feed no
+    // alarm — only "dropped" needs the honest baseline. Ratchet
+    // (source-order scan of this file):
+    // crates/app/tests/seal_drop_paging_wiring_guard.rs.
+    metrics::counter!("tv_seal_writer_drain_total", "kind" => "dropped").increment(0);
 
     // L18 (revised) + L121-L130 (Wave-5 in-memory-store plan §AA):
     // register the per-subsystem memory gauges, the sampler heartbeat,
@@ -1798,6 +1830,9 @@ async fn main() -> Result<()> {
         // notifier exists: a subsequent sidecar reject diagnostic can page the
         // operator. Stored once; the supervisor resolves it lazily per child.
         groww_sidecar_notifier_slot.store(Some(std::sync::Arc::clone(&fast_notifier)));
+        // Boot bubble (2026-07-09): declare which feed lines the checklist
+        // shows as pending from its first page.
+        fast_notifier.set_boot_expectations(config.feeds.dhan_enabled, config.feeds.groww_enabled);
         match ip_result {
             Ok(result) => {
                 if fast_trading_mode.is_live() {
@@ -1891,6 +1926,35 @@ async fn main() -> Result<()> {
                 indices as u64,
             );
         }
+
+        // AUTH-GAP-06 (2026-07-08 — operator incident, THIRD morning
+        // cached-token outage, 08:32–09:06 IST on 2026-07-07): the fast arm
+        // previously trusted yesterday's cached token blindly — Dhan had
+        // killed it (one active token at a time), so the WS pool spawned
+        // dead and stayed dead until the ~30-min AUTH-GAP-05 watchdog /
+        // manual intervention. Validate the cached token with ONE
+        // GET /v2/profile BEFORE any WebSocket spawn: a prefix-anchored
+        // 401/403 rejection forces a re-mint through the EXISTING
+        // TokenManager machinery (RESILIENCE-03 in-flight tripwire +
+        // Dhan mint semantics preserved; this arm passes None for the
+        // dual-instance lock flag per dual-instance-lock-2026-07-04.md §3
+        // — documented residual, deliberately UNCHANGED). Transient /
+        // REST-surface failures retry once, then proceed LOUDLY with the
+        // cached token — boot never hangs, never gains a mint-on-ambiguity
+        // path. Returns Some(manager) on the remint path so the deferred
+        // background arm below reuses it (no duplicate SSM fetch). Ordering
+        // (validation → cooldown wait → create_websocket_pool) is pinned by
+        // crates/app/tests/fast_boot_token_validation_wiring_guard.rs.
+        let fast_boot_prevalidated_token_manager =
+            tickvault_core::auth::fast_boot_validation::validate_cached_token_at_fast_boot(
+                &token_handle,
+                &client_id,
+                &config.dhan,
+                &config.token,
+                &config.network,
+                &fast_notifier,
+            )
+            .await;
 
         // WS-GAP-08 (2026-07-06 audit fix): the FAST crash-recovery arm must
         // ALSO honour a persisted Dhan 429 rate-limit cooldown BEFORE its
@@ -2315,6 +2379,17 @@ async fn main() -> Result<()> {
             },
             // SSM validation + TokenManager for renewal
             async {
+                // AUTH-GAP-06 (2026-07-08): the fast-boot cached-token
+                // validation may already have constructed (and re-minted
+                // through) a TokenManager on its Remint path — reuse it
+                // instead of a duplicate SSM fetch + duplicate manager.
+                if let Some(manager) = fast_boot_prevalidated_token_manager {
+                    info!(
+                        "deferred auth: reusing the AUTH-GAP-06 fast-boot validation \
+                         TokenManager (re-mint path) — skipping duplicate initialize_deferred"
+                    );
+                    return Ok(Ok(manager));
+                }
                 let timeout = std::time::Duration::from_secs(
                     tickvault_common::constants::TOKEN_INIT_TIMEOUT_SECS,
                 );
@@ -5599,6 +5674,9 @@ async fn build_shared_infra(
         NotificationService::spawn_episode_ticker(&notifier);
         notifier
     };
+    // Boot bubble (2026-07-09): declare which feed lines the checklist
+    // shows as pending from its first page.
+    notifier.set_boot_expectations(config.feeds.dhan_enabled, config.feeds.groww_enabled);
 
     // --- Health registry (drives /health + /api/feeds/health) ---
     let health_status: SharedHealthStatus = std::sync::Arc::new(SystemHealthStatus::new());
@@ -6892,18 +6970,18 @@ async fn start_dhan_lane(
         );
     }
 
-    // Boot-timing proof Telegram (DailyUniverse scope only — sentinel-guarded
-    // so Indices4Only emits nothing). Reads the wall-clock stashed by
-    // `load_daily_universe_plan`; gives the operator REAL daily evidence the
-    // O(1) warm path is working: warm-skip boots are sub-second regardless of
-    // the applicable-F&O master size; a full rebuild is the batched-seconds
-    // cold path.
+    // Boot-timing proof (DailyUniverse scope only — sentinel-guarded so
+    // Indices4Only emits nothing). Reads the wall-clock stashed by
+    // `load_daily_universe_plan`; REAL daily evidence the O(1) warm path is
+    // working. DEMOTED 2026-07-09 (operator escalation — Telegram noise N3):
+    // the standalone Telegram essay is now a structured log line; the
+    // operator-facing count lives on the boot bubble's Instruments line.
     if let Some(message) = format_instrument_load_telegram(
         INSTRUMENT_LOAD_ELAPSED_MS.load(std::sync::atomic::Ordering::Relaxed),
         INSTRUMENT_LOAD_WARM_SKIPPED.load(std::sync::atomic::Ordering::Relaxed),
         INSTRUMENT_LOAD_TOTAL_ROWS.load(std::sync::atomic::Ordering::Relaxed),
     ) {
-        notifier.notify(NotificationEvent::Custom { message });
+        info!(target: "boot", %message, "instrument load timing (demoted from Telegram 2026-07-09)");
     }
 
     // Only persist for CachedPlan (not yet persisted). FreshBuild already

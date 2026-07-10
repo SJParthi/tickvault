@@ -296,6 +296,79 @@ live WS feed.
 Trigger/RefuseLockLost arms), `crates/core/src/auth/token_health_gauge.rs`
 (the honest gauges), `crates/core/src/auth/token_manager.rs::dual_instance_lock_held`.
 
+## AUTH-GAP-06 — fast-boot cached-token validation (live 2026-07-08)
+
+**Status (2026-07-08):** LIVE — defined as
+`ErrorCode::AuthGap06FastBootCachedTokenValidation` with
+`code_str() == "AUTH-GAP-06"`. Severity::High. Auto-triage safe: YES (the
+re-mint / degraded-proceed is the self-remediation; the operator inspects,
+never manually re-mints first).
+
+**The incident this closes (2026-07-07 — THIRD morning outage of this
+class, 08:32–09:06 IST):** the FAST crash-recovery boot arm
+(`crates/app/src/main.rs`) restarts during market hours from a CACHED Dhan
+JWT and previously spawned the WebSocket pool with ZERO validation of that
+token. Dhan enforces one active token at a time (`authentication.md` rule
+5), so a token minted elsewhere overnight silently killed the cached one —
+the pool spawned dead and stayed dead until the AUTH-GAP-05 mid-session
+watchdog's ~30-minute self-heal window or manual intervention.
+
+**Trigger:** the fast arm now validates the cached token with **ONE
+`GET /v2/profile`** BEFORE the WS-GAP-08 cooldown wait and any WebSocket
+spawn (`crates/core/src/auth/fast_boot_validation.rs::validate_cached_token_at_fast_boot`,
+routed through the pure, unit-tested `classify_probe_result`):
+
+- **2xx** → proceed (one `info!`, `outcome="proceed"`). No page.
+- **Prefix-anchored HTTP 401/403** (the broker rejected OUR login — the
+  incident shape) → `error!(code = "AUTH-GAP-06")` + forced re-mint
+  through the EXISTING TokenManager machinery (`initialize_deferred`
+  bounded by `TOKEN_INIT_TIMEOUT_SECS`, then `force_renewal` —
+  RenewToken→generateAccessToken fallback with the RESILIENCE-03 in-flight
+  tripwire preserved). The fresh token lands in the shared handle the WS
+  pool reads; the deferred background arm REUSES this manager (no
+  duplicate SSM fetch).
+- **Anything else** (send-leg/network, REST-surface 400/429/5xx, parse,
+  unknown) → ONE bounded retry (`FAST_BOOT_PROFILE_RETRY_DELAY_SECS`),
+  then PROCEED with the cached token + `error!(code = "AUTH-GAP-06")` —
+  fail-open; a REST-surface outage with a healthy WS (the 2026-06-10
+  class) must neither block boot nor trigger a token-destroying mint
+  (the F12 no-mint-on-ambiguity lesson; classification reuses the
+  AUTH-GAP-05 prefix-anchored wrapper primitives — never a substring scan
+  of server-controlled body text).
+
+**Triage:**
+1. `mcp__tickvault-logs__tail_errors` — find `AUTH-GAP-06`; the payload
+   names the arm (rejected → re-mint / degraded-proceed / remint failed).
+2. `tv_fast_boot_token_validation_total{outcome}` —
+   `remint_triggered`/`remint_ok` = the self-heal worked (the WS spawned
+   with a fresh token); `remint_failed`/`remint_unavailable` = the mint
+   leg errored — cross-check AUTH-GAP-04 (TOTP secret), RESILIENCE-03
+   (in-flight lock refusal), and Dhan status; `degraded` = the REST
+   surface was unreachable at boot — cross-check REST-CANARY-01; the
+   AUTH-GAP-05 watchdog remains the in-session backstop either way.
+3. A `remint_triggered` on EVERY fast boot means something keeps killing
+   the cached token overnight (peer host mint, manual web login, the
+   Groww-style daily reset) — investigate the token lifecycle, not this
+   validation.
+
+**Honest envelope:** the fast arm still holds NO dual-instance lock — it
+passes `None` for the lock flag exactly as before
+(`dual-instance-lock-2026-07-04.md` §3 documented residual, UNCHANGED by
+this feature; no lock acquisition was added, pending the operator's
+halt-semantics decision for that arm). The validation is one bounded
+probe (+ one bounded retry) per boot on the cold path; it never blocks
+boot (every leg timeout-bounded, every failure falls through loudly to
+the pre-existing fast-arm semantics) and never touches the tick hot path.
+
+**Source:** `crates/common/src/error_code.rs::AuthGap06FastBootCachedTokenValidation`,
+`crates/core/src/auth/fast_boot_validation.rs` (`classify_probe_result` /
+`CachedTokenVerdict` / `validate_cached_token_at_fast_boot`), the main.rs
+fast-arm call site. Ratchets:
+`crates/app/tests/fast_boot_token_validation_wiring_guard.rs` — exactly
+one validation call in the main.rs production region, ordered before the
+cooldown wait + `create_websocket_pool`, plus a stub-guard that the helper
+actually probes `/v2/profile` and reaches `force_renewal`.
+
 ## DH-911 — Dhan API silent black-hole (Wave-4-E2)
 
 **Reserved.** Severity::High. Triage: subscribe accepted (no error

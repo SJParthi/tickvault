@@ -44,10 +44,11 @@ use super::coalescer::{
     classify_dispatch, effective_drain_window, render_digest, should_force_drain,
 };
 use super::episode::{
-    EPISODE_EDIT_FAILURES_FALLBACK_THRESHOLD, EpisodeAction, EpisodeConfig, EpisodeKey,
-    EpisodePhase, EpisodeRegistry, EpisodeRenderCtx, episode_snapshot, fnv1a_hash,
-    render_episode_first_page, render_episode_recovered, render_episode_recovering,
-    render_episode_stale_closed, render_episode_steady,
+    BOOT_EPISODE_KEY, EPISODE_EDIT_FAILURES_FALLBACK_THRESHOLD, EpisodeAction, EpisodeConfig,
+    EpisodeFamily, EpisodeKey, EpisodePhase, EpisodeRegistry, EpisodeRenderCtx, episode_config_for,
+    episode_snapshot, fnv1a_hash, render_boot_checklist, render_episode_first_page,
+    render_episode_recovered, render_episode_recovering, render_episode_stale_closed,
+    render_episode_steady,
 };
 use super::events::{NotificationEvent, Severity};
 
@@ -105,6 +106,18 @@ pub struct NotificationService {
     /// Best-effort snapshot writer channel (advisory episodes file).
     /// `None` in NoOp mode / when episode_mode is off.
     episode_store_tx: Option<tokio::sync::mpsc::Sender<String>>,
+    /// Boot bubble (2026-07-09) kill switch — `false` routes the boot
+    /// milestones back through their UNCHANGED legacy immediate lanes
+    /// (today's per-event spray, byte-identical) WITHOUT touching the
+    /// #1439 WS episode machinery. Sourced from `[notification] boot_bubble`.
+    boot_bubble: bool,
+    /// Serializes the ENTIRE boot fold→render→send/edit body — shared
+    /// with the drain ticker's re-drive so the two can never race a
+    /// duplicate first page. Boot milestones arrive milliseconds apart on
+    /// separate spawned tasks; two racing the in-flight FIRST send
+    /// (message id still unknown) would otherwise open duplicate bubbles.
+    /// Cold path — once per milestone / per 10s tick.
+    boot_dispatch_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl NotificationService {
@@ -118,6 +131,8 @@ impl NotificationService {
             episode_mode: true,
             episodes: Arc::new(EpisodeRegistry::new()),
             episode_store_tx: None,
+            boot_bubble: true,
+            boot_dispatch_lock: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
@@ -261,6 +276,13 @@ impl NotificationService {
             rehydrate_episodes(&service.episodes, &store_path).await;
             service.episode_store_tx = Some(spawn_episode_store_writer(store_path));
         }
+        // Boot bubble (2026-07-09): kill switch + best-effort deploy-flavor
+        // detection (previous boot's sha vs the built-in sha). Fail-open —
+        // NOTHING here can gate boot or any notify().
+        service.boot_bubble = config.boot_bubble;
+        if config.episode_mode && config.boot_bubble {
+            init_boot_sha_flavor(&service.episodes).await;
+        }
         Arc::new(service)
     }
 
@@ -352,7 +374,16 @@ impl NotificationService {
                 // BEFORE the coalescer branch (wiring-guard pinned).
                 // `episode_key()` is a zero-alloc Copy match, so the
                 // non-episode fast path pays one comparison only.
-                if self.episode_mode && event.episode_key().is_some() {
+                // Boot bubble (2026-07-09): boot milestones take the same
+                // lane ONLY while `boot_bubble` is on — the `false`
+                // rollback falls through to their unchanged legacy
+                // immediate dispatch (byte-identical spray) WITHOUT
+                // touching the WS episode families.
+                if self.episode_mode
+                    && event
+                        .episode_key()
+                        .is_some_and(|key| key.family != EpisodeFamily::Boot || self.boot_bubble)
+                {
                     let svc = Arc::clone(self);
                     tokio::spawn(async move {
                         svc.dispatch_episode_event(event).await;
@@ -547,6 +578,7 @@ impl NotificationService {
             let episodes = Arc::clone(&service.episodes);
             let store_tx = service.episode_store_tx.clone();
             let episode_mode = service.episode_mode;
+            let boot_lock = Arc::clone(&service.boot_dispatch_lock);
 
             tokio::spawn(async move {
                 let mut ticker = tokio::time::interval(interval);
@@ -561,6 +593,7 @@ impl NotificationService {
                     if episode_mode {
                         run_episode_tick(
                             &episodes,
+                            &boot_lock,
                             &client,
                             &base_url,
                             &token,
@@ -656,6 +689,7 @@ impl NotificationService {
             return;
         };
         let episodes = Arc::clone(&service.episodes);
+        let boot_lock = Arc::clone(&service.boot_dispatch_lock);
         let store_tx = service.episode_store_tx.clone();
         let token = bot_token.clone();
         let chat_id = chat_id.clone();
@@ -671,6 +705,7 @@ impl NotificationService {
                 ticker.tick().await;
                 run_episode_tick(
                     &episodes,
+                    &boot_lock,
                     &client,
                     &base_url,
                     &token,
@@ -766,6 +801,12 @@ impl NotificationService {
         let Some(key) = event.episode_key() else {
             return;
         };
+        // Boot bubble (2026-07-09): the Boot family has its own dispatcher
+        // (checklist fold + fixed-Low prefix + serialized transport). The
+        // 3-line branch keeps this shared fn's diff minimal (#1442-friendly).
+        if key.family == EpisodeFamily::Boot {
+            return self.dispatch_boot_episode_event(event).await;
+        }
         let role = event.episode_role();
         let severity = event.severity();
         let attempts_hint = episode_attempts_hint(&event);
@@ -1077,6 +1118,218 @@ impl NotificationService {
             );
         }
     }
+
+    // -----------------------------------------------------------------------
+    // Boot bubble (2026-07-09) — ONE consolidated boot checklist bubble
+    // -----------------------------------------------------------------------
+
+    /// Declares which feed lines the boot checklist shows as ⏳-pending
+    /// from the first page. Called by both boot lanes right after the
+    /// notifier is constructed. No-op when the bubble lane is off.
+    pub fn set_boot_expectations(&self, dhan_enabled: bool, groww_enabled: bool) {
+        if self.episode_mode && self.boot_bubble {
+            self.episodes
+                .set_boot_expectations(dhan_enabled, groww_enabled, epoch_ms_now());
+        }
+    }
+
+    /// Returns `true` when the consolidated boot bubble lane is on.
+    #[must_use]
+    pub fn boot_bubble_enabled(&self) -> bool {
+        self.boot_bubble
+    }
+
+    /// The boot-bubble dispatch shell — folds the event's milestone into
+    /// the one-per-boot checklist and delivers/edits the single bubble.
+    ///
+    /// The whole body runs under `boot_dispatch_lock` so concurrent boot
+    /// milestones (spawned tasks, ms apart) can never race the in-flight
+    /// first send into a duplicate bubble. Transport rungs are the SAME
+    /// as the WS episode path: id-capture send, fnv1a hash-skip, not-found
+    /// fallback fresh send, transient ladder — with TELEGRAM-01/03
+    /// loudness unchanged on every failure.
+    async fn dispatch_boot_episode_event(self: Arc<Self>, event: NotificationEvent) {
+        let NotificationMode::Active {
+            bot_token,
+            chat_id,
+            http_client,
+            telegram_api_base_url,
+            ..
+        } = &self.mode
+        else {
+            return;
+        };
+        let Some(milestone) = event.boot_milestone() else {
+            // Defensive: a Boot-keyed event without a milestone would be a
+            // mapping bug — deliver through the legacy immediate lane
+            // rather than drop (never-drop law).
+            let body = render_episode_first_page(&event.to_message());
+            let message = format!("{} {}", telegram_message_prefix(event.severity()), body);
+            let ok = send_telegram_chunk_with_retry(
+                http_client,
+                telegram_api_base_url,
+                bot_token,
+                chat_id,
+                &message,
+            )
+            .await;
+            if !ok {
+                metrics::counter!(
+                    "tv_telegram_dropped_total",
+                    "reason" => "send_failed",
+                )
+                .increment(1);
+                error!(
+                    target: "notification",
+                    code = tickvault_common::error_code::ErrorCode::Telegram01Dropped.code_str(),
+                    topic = event.topic(),
+                    "TELEGRAM-01: boot legacy passthrough delivery failed — operator alerts MAY be missed"
+                );
+            }
+            return;
+        };
+        // Serialize fold → render → send/edit end-to-end (cold path).
+        let _serialized = self.boot_dispatch_lock.lock().await;
+        let now_ms = epoch_ms_now();
+        let cfg = episode_config_for(EpisodeFamily::Boot);
+        let (decision, checklist) = self.episodes.apply_boot_milestone(milestone, now_ms, &cfg);
+        let ctx = EpisodeRenderCtx { now_ms };
+        // EVERY action renders the full checklist (first page, edit and
+        // fallback alike) — never the WS steady/first-page renders. The
+        // prefix is FIXED at [LOW]: the bubble is a green checklist.
+        let text = format!(
+            "{} {}",
+            telegram_message_prefix(Severity::Low),
+            render_boot_checklist(&checklist, &ctx)
+        );
+        metrics::counter!(
+            "tv_telegram_dispatched_total",
+            "severity" => Severity::Low.as_label(),
+            "coalesced" => "false",
+        )
+        .increment(1);
+        match decision.action {
+            EpisodeAction::SendFirstPage | EpisodeAction::SendNewFallback => {
+                metrics::counter!("tv_telegram_episode_events_total", "action" => "open")
+                    .increment(1);
+                let (ok, msg_id) = send_telegram_chunk_with_retry_returning_id(
+                    http_client,
+                    telegram_api_base_url,
+                    bot_token,
+                    chat_id,
+                    &text,
+                )
+                .await;
+                if ok {
+                    self.episodes.record_sent(key_boot(), msg_id, now_ms);
+                    self.episodes
+                        .record_edit_applied(key_boot(), now_ms, fnv1a_hash(&text));
+                    self.episodes.mark_boot_delivered();
+                } else {
+                    // Terminal transport failure — identical loudness to the
+                    // legacy path; the checklist stays dirty so the drain
+                    // ticker (≤10s) or the next milestone retries fresh.
+                    metrics::counter!(
+                        "tv_telegram_dropped_total",
+                        "reason" => "send_failed",
+                    )
+                    .increment(1);
+                    error!(
+                        target: "notification",
+                        code = tickvault_common::error_code::ErrorCode::Telegram01Dropped.code_str(),
+                        topic = event.topic(),
+                        "TELEGRAM-01: boot bubble first page delivery failed — operator alerts MAY be missed"
+                    );
+                }
+            }
+            EpisodeAction::EditThrottled => {
+                // Unreachable with the Boot 0s throttle; folded safely —
+                // the dirty checklist is re-driven by the drain ticker.
+                metrics::counter!(
+                    "tv_telegram_episode_events_total",
+                    "action" => "edit_throttled",
+                )
+                .increment(1);
+            }
+            EpisodeAction::Edit { message_id, .. } => {
+                let hash = fnv1a_hash(&text);
+                if hash == self.episodes.last_render_hash(key_boot()) {
+                    // Byte-identical render — nothing new to deliver.
+                    self.episodes.mark_boot_delivered();
+                    metrics::counter!(
+                        "tv_telegram_episode_events_total",
+                        "action" => "edit_throttled",
+                    )
+                    .increment(1);
+                    return;
+                }
+                match edit_telegram_message_with_retry(
+                    http_client,
+                    telegram_api_base_url,
+                    bot_token,
+                    chat_id,
+                    message_id,
+                    &text,
+                )
+                .await
+                {
+                    EditOutcome::Applied | EditOutcome::NotModifiedNoop => {
+                        self.episodes.record_edit_applied(key_boot(), now_ms, hash);
+                        self.episodes.mark_boot_delivered();
+                        metrics::counter!(
+                            "tv_telegram_episode_events_total",
+                            "action" => "edit",
+                        )
+                        .increment(1);
+                    }
+                    EditOutcome::Fallback => {
+                        // Bubble gone (>48h / deleted) — fresh full-checklist
+                        // bubble; the dirty flag stays and the ticker's
+                        // hash-skip self-heals it once the fallback landed.
+                        self.episode_fallback_send(key_boot(), &text, "not_found", now_ms)
+                            .await;
+                    }
+                    EditOutcome::Transient => {
+                        let failures = self.episodes.record_edit_failure(key_boot());
+                        if failures >= EPISODE_EDIT_FAILURES_FALLBACK_THRESHOLD {
+                            self.episode_fallback_send(
+                                key_boot(),
+                                &text,
+                                "transient_exhausted",
+                                now_ms,
+                            )
+                            .await;
+                        } else {
+                            // NEVER silent: counted + error!-loud; the drain
+                            // ticker re-drives within ~10s (a failed FINAL
+                            // edit has no next milestone to carry it).
+                            metrics::counter!(
+                                "tv_telegram_edit_fallback_total",
+                                "reason" => "transient_deferred",
+                            )
+                            .increment(1);
+                            error!(
+                                target: "notification",
+                                code = tickvault_common::error_code::ErrorCode::Telegram03EpisodeDegraded.code_str(),
+                                reason = "edit_transient_deferred",
+                                consecutive_failures = failures,
+                                "TELEGRAM-03: boot bubble edit failed transiently — the ticker re-drives or falls back to a fresh bubble"
+                            );
+                        }
+                    }
+                }
+            }
+            // Role is always Open for boot milestones; the FSM never
+            // returns Ignore/SendLegacy for Open. Folded defensively.
+            EpisodeAction::Ignore | EpisodeAction::SendLegacy => {}
+        }
+        self.persist_episodes();
+    }
+}
+
+/// The fixed boot-bubble key (tiny alias keeping call sites short).
+const fn key_boot() -> EpisodeKey {
+    BOOT_EPISODE_KEY
 }
 
 /// Renders + sends one Telegram message per drained summary.
@@ -1164,6 +1417,11 @@ async fn deliver_summaries(
 /// surface; stale/corrupt files are ignored at rehydrate.
 pub(crate) const EPISODE_STORE_PATH: &str = "data/notify/episodes.json";
 
+/// Advisory previous-boot build-sha file (boot bubble, 2026-07-09) —
+/// sibling of [`EPISODE_STORE_PATH`]. Best-effort, fail-open: unreadable /
+/// unwritable / missing ⇒ plain header, never a boot blocker.
+pub(crate) const BOOT_SHA_STORE_PATH: &str = "data/notify/last-boot-sha";
+
 /// Bound on the graceful-shutdown flush (drain + deliver + store write).
 pub(crate) const SHUTDOWN_FLUSH_TIMEOUT_SECS: u64 = 10;
 
@@ -1246,6 +1504,67 @@ async fn write_episode_store(path: &std::path::Path, json: &str) {
     }
 }
 
+/// Pure honesty rule for the boot bubble's "NEW CODE deployed" header:
+/// claimed ONLY when BOTH shas are plausible git shas (7–40 lowercase hex)
+/// AND differ. An `unknown` / missing / garbage sha on either side renders
+/// the plain header — never a false deploy claim.
+#[must_use]
+pub(crate) fn is_new_code_deploy(previous: Option<&str>, current: &str) -> bool {
+    fn valid(sha: &str) -> bool {
+        (7..=40).contains(&sha.len())
+            && sha
+                .chars()
+                .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c))
+    }
+    match previous {
+        Some(prev) => valid(prev) && valid(current) && prev != current,
+        None => false,
+    }
+}
+
+/// Boot bubble (2026-07-09): best-effort deploy-flavor detection — reads
+/// the previous boot's sha from [`BOOT_SHA_STORE_PATH`], compares with the
+/// built-in sha, stamps the checklist flavor, then records the current sha
+/// for the NEXT boot. Every filesystem error degrades to the plain header
+/// (`new_code = false`) at debug!-level — never boot-blocking.
+async fn init_boot_sha_flavor(episodes: &EpisodeRegistry) {
+    let current = tickvault_common::build_info::BUILD_GIT_SHA;
+    let path = std::path::Path::new(BOOT_SHA_STORE_PATH);
+    let previous = match tokio::fs::read_to_string(path).await {
+        Ok(contents) => Some(contents.trim().to_string()),
+        Err(err) => {
+            tracing::debug!(error = %err, "boot sha store unreadable — plain boot header");
+            None
+        }
+    };
+    let new_code = is_new_code_deploy(previous.as_deref(), current);
+    episodes.set_boot_flavor(
+        new_code,
+        tickvault_common::build_info::build_git_sha_short(),
+        epoch_ms_now(),
+    );
+    // Record the current sha for the next boot (best-effort).
+    if let Some(parent) = path.parent()
+        && let Err(err) = tokio::fs::create_dir_all(parent).await
+    {
+        tracing::debug!(error = %err, "boot sha store dir create failed — next boot renders plain");
+        return;
+    }
+    if let Err(err) = tokio::fs::write(path, current).await {
+        // Hostile-review fix 2026-07-09: a failed write would leave the
+        // PREVIOUS boot's sha on disk, so the NEXT restart of this same
+        // binary would falsely claim "NEW CODE deployed" again. Best-effort
+        // delete the stale sha so the next boot reads nothing → plain
+        // header (fail-open, never a false deploy claim).
+        let removed = tokio::fs::remove_file(path).await.is_ok();
+        tracing::debug!(
+            error = %err,
+            stale_sha_removed = removed,
+            "boot sha store write failed — stale sha cleared so the next boot renders plain (never a false NEW CODE claim)"
+        );
+    }
+}
+
 /// Boot-time rehydrate — fail-open, never gates boot. Corrupt JSON →
 /// error! TELEGRAM-03 (`rehydrate_corrupt`) + empty registry.
 async fn rehydrate_episodes(episodes: &EpisodeRegistry, path: &std::path::Path) {
@@ -1273,6 +1592,7 @@ async fn rehydrate_episodes(episodes: &EpisodeRegistry, path: &std::path::Path) 
 /// loudness.
 pub(crate) async fn run_episode_tick(
     episodes: &EpisodeRegistry,
+    boot_lock: &tokio::sync::Mutex<()>,
     client: &reqwest::Client,
     base_url: &str,
     token: &SecretString,
@@ -1280,6 +1600,13 @@ pub(crate) async fn run_episode_tick(
     store_tx: Option<&tokio::sync::mpsc::Sender<String>>,
 ) {
     let now_ms = epoch_ms_now();
+    // Boot bubble (2026-07-09): re-drive an undelivered checklist render
+    // (a failed FINAL edit has no next milestone to carry it) + silent
+    // retirement of a completed bubble past its window.
+    run_boot_tick(
+        episodes, boot_lock, client, base_url, token, chat_id, now_ms,
+    )
+    .await;
     let cfg = EpisodeConfig::default();
     let outcome = episodes.tick(now_ms, &cfg);
     if outcome.closed.is_empty() && outcome.expired.is_empty() {
@@ -1352,6 +1679,144 @@ pub(crate) async fn run_episode_tick(
         let json = episode_snapshot::encode(&episodes.snapshot());
         if let Err(err) = tx.try_send(json) {
             tracing::debug!(error = %err, "episode snapshot enqueue skipped (writer busy)");
+        }
+    }
+}
+
+/// Boot bubble (2026-07-09) — the drain-ticker half: retires a completed,
+/// fully-delivered bubble silently, and re-drives a DIRTY checklist
+/// (throttled/deferred/failed send or edit) so the final render always
+/// lands within ~one tick (≤10s). Duplicate-over-drop on a dead bubble;
+/// terminal failures keep TELEGRAM-01 loudness and stay dirty for the
+/// next tick (bounded: one attempt per ~10s tick).
+async fn run_boot_tick(
+    episodes: &EpisodeRegistry,
+    boot_lock: &tokio::sync::Mutex<()>,
+    client: &reqwest::Client,
+    base_url: &str,
+    token: &SecretString,
+    chat_id: &str,
+    now_ms: u64,
+) {
+    // Same serialization as the milestone dispatcher — the re-drive can
+    // never race a concurrent fold/send into a duplicate first page.
+    let _serialized = boot_lock.lock().await;
+    if episodes.retire_boot(now_ms) {
+        tracing::debug!("boot bubble retired (complete + delivered + past the retire window)");
+    }
+    let Some((checklist, message_id)) = episodes.boot_redrive_candidate() else {
+        return;
+    };
+    let ctx = EpisodeRenderCtx { now_ms };
+    let text = format!(
+        "{} {}",
+        telegram_message_prefix(Severity::Low),
+        render_boot_checklist(&checklist, &ctx)
+    );
+    let hash = fnv1a_hash(&text);
+    match message_id {
+        Some(id) => {
+            if hash == episodes.last_render_hash(BOOT_EPISODE_KEY) {
+                // Already delivered byte-identically (e.g. via a fallback
+                // fresh send) — nothing pending.
+                episodes.mark_boot_delivered();
+                return;
+            }
+            match edit_telegram_message_with_retry(client, base_url, token, chat_id, id, &text)
+                .await
+            {
+                EditOutcome::Applied | EditOutcome::NotModifiedNoop => {
+                    episodes.record_edit_applied(BOOT_EPISODE_KEY, now_ms, hash);
+                    episodes.mark_boot_delivered();
+                    metrics::counter!(
+                        "tv_telegram_episode_events_total",
+                        "action" => "edit",
+                    )
+                    .increment(1);
+                }
+                EditOutcome::Transient
+                    if episodes.record_edit_failure(BOOT_EPISODE_KEY)
+                        < EPISODE_EDIT_FAILURES_FALLBACK_THRESHOLD =>
+                {
+                    // Transient edit failure below the ladder threshold
+                    // (hostile-review fix 2026-07-09): DEFER — a single
+                    // 429 must not spawn a duplicate bubble the milestone
+                    // path would have retried. The checklist stays dirty;
+                    // the next ~10s tick re-drives. NEVER silent.
+                    metrics::counter!(
+                        "tv_telegram_edit_fallback_total",
+                        "reason" => "transient_deferred",
+                    )
+                    .increment(1);
+                    error!(
+                        target: "notification",
+                        code = tickvault_common::error_code::ErrorCode::Telegram03EpisodeDegraded.code_str(),
+                        reason = "edit_transient_deferred",
+                        "TELEGRAM-03: boot bubble re-drive edit failed transiently — the next tick retries or falls back to a fresh bubble"
+                    );
+                }
+                outcome @ (EditOutcome::Fallback | EditOutcome::Transient) => {
+                    // Bubble gone (not_found) / transient ladder exhausted
+                    // — fresh full-checklist bubble (duplicate-over-drop),
+                    // with the honest per-cause metric reason so the
+                    // TELEGRAM-03 triage split (bubble-gone vs API-flaky)
+                    // stays trustworthy.
+                    let reason = if matches!(outcome, EditOutcome::Fallback) {
+                        "not_found"
+                    } else {
+                        "transient_exhausted"
+                    };
+                    metrics::counter!(
+                        "tv_telegram_edit_fallback_total",
+                        "reason" => reason,
+                    )
+                    .increment(1);
+                    let (ok, msg_id) = send_telegram_chunk_with_retry_returning_id(
+                        client, base_url, token, chat_id, &text,
+                    )
+                    .await;
+                    if ok {
+                        episodes.replace_message_id(BOOT_EPISODE_KEY, msg_id, now_ms);
+                        episodes.record_edit_applied(BOOT_EPISODE_KEY, now_ms, hash);
+                        episodes.mark_boot_delivered();
+                    } else {
+                        metrics::counter!(
+                            "tv_telegram_dropped_total",
+                            "reason" => "send_failed",
+                        )
+                        .increment(1);
+                        error!(
+                            target: "notification",
+                            code = tickvault_common::error_code::ErrorCode::Telegram01Dropped.code_str(),
+                            "TELEGRAM-01: boot bubble re-drive delivery failed — operator alerts MAY be missed"
+                        );
+                    }
+                }
+            }
+        }
+        None => {
+            // The first page never landed — retry it fresh.
+            metrics::counter!("tv_telegram_episode_events_total", "action" => "open").increment(1);
+            let (ok, msg_id) = send_telegram_chunk_with_retry_returning_id(
+                client, base_url, token, chat_id, &text,
+            )
+            .await;
+            if ok {
+                episodes.record_sent(BOOT_EPISODE_KEY, msg_id, now_ms);
+                episodes.record_edit_applied(BOOT_EPISODE_KEY, now_ms, hash);
+                episodes.mark_boot_delivered();
+            } else {
+                metrics::counter!(
+                    "tv_telegram_dropped_total",
+                    "reason" => "send_failed",
+                )
+                .increment(1);
+                error!(
+                    target: "notification",
+                    code = tickvault_common::error_code::ErrorCode::Telegram01Dropped.code_str(),
+                    "TELEGRAM-01: boot bubble first-page retry failed — operator alerts MAY be missed"
+                );
+            }
         }
     }
 }
@@ -3455,6 +3920,10 @@ mod tests {
                     let (status_line, body) = if request.contains("/editMessageText") {
                         log_conn.lock().unwrap().push("edit".to_string());
                         match edit_status {
+                            200 => (
+                                "HTTP/1.1 200 OK",
+                                r#"{"ok":true,"result":{"message_id":777}}"#,
+                            ),
                             429 => (
                                 "HTTP/1.1 429 Too Many Requests",
                                 r#"{"ok":false,"description":"Too Many Requests"}"#,
@@ -3625,7 +4094,16 @@ mod tests {
             .build()
             .unwrap();
         let token = SecretString::from("test-bot-token".to_string());
-        run_episode_tick(&service.episodes, &client, &base_url, &token, "123", None).await;
+        run_episode_tick(
+            &service.episodes,
+            &tokio::sync::Mutex::new(()),
+            &client,
+            &base_url,
+            &token,
+            "123",
+            None,
+        )
+        .await;
         assert_eq!(
             service.episodes.live_count(),
             0,
@@ -3662,7 +4140,16 @@ mod tests {
             .build()
             .unwrap();
         let token = SecretString::from("test-bot-token".to_string());
-        run_episode_tick(&service.episodes, &client, &base_url, &token, "123", None).await;
+        run_episode_tick(
+            &service.episodes,
+            &tokio::sync::Mutex::new(()),
+            &client,
+            &base_url,
+            &token,
+            "123",
+            None,
+        )
+        .await;
         assert_eq!(
             service.episodes.live_count(),
             0,
@@ -3938,6 +4425,239 @@ mod tests {
         );
         NotificationService::spawn_episode_ticker(&with_coalescer);
         tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // -----------------------------------------------------------------------
+    // Boot bubble (2026-07-09) — one consolidated boot checklist bubble
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_dispatch_boot_serializes_concurrent_milestones_single_bubble() {
+        // Boot milestones fire ms apart on separate spawned tasks. The
+        // boot_dispatch_lock must serialize fold→render→send/edit so the
+        // race against the in-flight FIRST send can never open a second
+        // bubble: exactly ONE fresh send, everything else edits in place.
+        let (base_url, log) = start_recording_telegram_server(200).await;
+        let service = make_scripted_service(base_url);
+        let events = vec![
+            NotificationEvent::AuthenticationSuccess,
+            NotificationEvent::InstrumentBuildSuccess {
+                source: "cache".to_string(),
+                derivative_count: 1000,
+                underlying_count: 46,
+            },
+            NotificationEvent::OrderUpdateConnected,
+            NotificationEvent::OrderUpdateAuthenticated,
+            NotificationEvent::BootHealthCheck {
+                services_healthy: 3,
+                services_total: 3,
+            },
+        ];
+        let mut handles = Vec::new();
+        for event in events {
+            let svc = Arc::clone(&service);
+            handles.push(tokio::spawn(async move {
+                svc.dispatch_boot_episode_event(event).await;
+            }));
+        }
+        for h in handles {
+            h.await.expect("dispatch task must not panic");
+        }
+        let sends = log.lock().unwrap().iter().filter(|p| *p == "send").count();
+        let edits = log.lock().unwrap().iter().filter(|p| *p == "edit").count();
+        assert_eq!(sends, 1, "exactly ONE boot bubble first page");
+        // 4 edits when every fold changes the render; 3 is legal when
+        // OrderUpdateConnected folds AFTER OrderUpdateAuthenticated (its
+        // superset) — the byte-identical render hash-skips. The invariant
+        // is single-bubble, not a scheduling-order-dependent edit count.
+        assert!(
+            (3..=4).contains(&edits),
+            "every later milestone edits the SAME bubble (got {edits})"
+        );
+        assert_eq!(service.episodes.live_count(), 1, "one live boot episode");
+        let snap = service.episodes.snapshot();
+        assert_eq!(snap[0].message_id, Some(777));
+        let cl = service
+            .episodes
+            .boot_checklist()
+            .expect("checklist populated");
+        assert!(cl.dhan_auth && cl.order_update_authenticated);
+        assert_eq!(cl.instruments, Some(1046));
+        assert!(!cl.dirty, "all folds delivered");
+    }
+
+    #[tokio::test]
+    async fn test_boot_first_milestone_sends_then_second_edits_same_id() {
+        let (base_url, log) = start_recording_telegram_server(200).await;
+        let service = make_scripted_service(base_url);
+        Arc::clone(&service)
+            .dispatch_boot_episode_event(NotificationEvent::AuthenticationSuccess)
+            .await;
+        Arc::clone(&service)
+            .dispatch_boot_episode_event(NotificationEvent::StartupComplete { mode: "sandbox" })
+            .await;
+        assert_eq!(
+            log.lock().unwrap().as_slice(),
+            ["send", "edit"],
+            "first page then in-place edit"
+        );
+        let snap = service.episodes.snapshot();
+        assert_eq!(snap[0].message_id, Some(777));
+        let cl = service.episodes.boot_checklist().expect("checklist");
+        assert!(cl.is_complete());
+        // The completed render carries the load-bearing phrase.
+        let rendered = render_boot_checklist(
+            &cl,
+            &EpisodeRenderCtx {
+                now_ms: epoch_ms_now(),
+            },
+        );
+        assert!(rendered.contains("tickvault started"));
+    }
+
+    #[tokio::test]
+    async fn test_boot_bubble_mode_off_is_legacy_byte_identical() {
+        // Kill switch: boot_bubble=false routes boot milestones through
+        // the legacy immediate lane (registry untouched) while the #1439
+        // WS episode lane keeps working (independence pin).
+        let (base_url, log) = start_recording_telegram_server(200).await;
+        let mut owned = match Arc::try_unwrap(make_scripted_service(base_url)) {
+            Ok(s) => s,
+            Err(_) => unreachable!("fresh Arc has one owner"),
+        };
+        owned.boot_bubble = false;
+        let service = Arc::new(owned);
+        assert!(!service.boot_bubble_enabled());
+        service.notify(NotificationEvent::AuthenticationSuccess);
+        for _ in 0..50 {
+            if log.lock().unwrap().iter().any(|p| p == "send") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            service.episodes.live_count(),
+            0,
+            "boot_bubble=false must never touch the registry"
+        );
+        assert!(
+            log.lock().unwrap().iter().any(|p| p == "send"),
+            "the legacy immediate send still fired"
+        );
+        // WS episodes are INDEPENDENT of the boot kill switch.
+        service.notify(NotificationEvent::WebSocketDisconnected {
+            connection_index: 0,
+            reason: "reset".to_string(),
+        });
+        for _ in 0..50 {
+            if service.episodes.live_count() == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(service.episodes.live_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_boot_redrive_ticker_retries_failed_first_page() {
+        // A milestone folded while Telegram was down leaves the checklist
+        // dirty with NO message id. The drain ticker's boot arm re-drives
+        // a fresh full-checklist first page.
+        let (base_url, log) = start_recording_telegram_server(200).await;
+        let service = make_scripted_service(base_url.clone());
+        let cfg = episode_config_for(EpisodeFamily::Boot);
+        // Simulate the failed-send state (fold landed, delivery did not).
+        let _ = service.episodes.apply_boot_milestone(
+            super::super::episode::BootMilestone::DhanAuth,
+            epoch_ms_now(),
+            &cfg,
+        );
+        assert!(service.episodes.boot_redrive_candidate().is_some());
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(2))
+            .build()
+            .unwrap();
+        let token = SecretString::from("test-bot-token".to_string());
+        run_episode_tick(
+            &service.episodes,
+            &tokio::sync::Mutex::new(()),
+            &client,
+            &base_url,
+            &token,
+            "123",
+            None,
+        )
+        .await;
+        assert_eq!(
+            log.lock().unwrap().iter().filter(|p| *p == "send").count(),
+            1,
+            "the ticker must retry the first page fresh"
+        );
+        let snap = service.episodes.snapshot();
+        assert_eq!(snap[0].message_id, Some(777));
+        assert!(
+            service.episodes.boot_redrive_candidate().is_none(),
+            "delivered — nothing left to re-drive"
+        );
+        // A second tick with a clean checklist is a no-op (hash-skip /
+        // no candidate) — no duplicate bubbles.
+        run_episode_tick(
+            &service.episodes,
+            &tokio::sync::Mutex::new(()),
+            &client,
+            &base_url,
+            &token,
+            "123",
+            None,
+        )
+        .await;
+        assert_eq!(
+            log.lock().unwrap().iter().filter(|p| *p == "send").count(),
+            1,
+            "no re-send once delivered"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_set_boot_expectations_and_boot_bubble_enabled() {
+        let base_url = start_scripted_telegram_server().await;
+        let service = make_scripted_service(base_url);
+        assert!(service.boot_bubble_enabled(), "boot bubble defaults ON");
+        service.set_boot_expectations(true, true);
+        let cl = service
+            .episodes
+            .boot_checklist()
+            .expect("expectations create the checklist");
+        assert_eq!(cl.expectations, Some((true, true)));
+    }
+
+    #[test]
+    fn test_is_new_code_deploy_fail_open_and_unknown_sha() {
+        // Claimed ONLY when both shas are valid lowercase hex AND differ.
+        assert!(is_new_code_deploy(
+            Some("0123abc4567890fedcba0123abc4567890fedcba"),
+            "aaaa1112223334445556667778889990001112ff"
+        ));
+        assert!(is_new_code_deploy(Some("0123abc"), "aaaa111"));
+        // Same sha = plain restart.
+        assert!(!is_new_code_deploy(Some("0123abc"), "0123abc"));
+        // Unknown / garbage / short / uppercase / missing → never claimed.
+        assert!(!is_new_code_deploy(Some("unknown"), "0123abc"));
+        assert!(!is_new_code_deploy(Some("0123abc"), "unknown"));
+        assert!(!is_new_code_deploy(Some("0123AbC"), "0123abc"));
+        assert!(!is_new_code_deploy(Some("012345"), "0123abc"));
+        assert!(!is_new_code_deploy(Some(""), "0123abc"));
+        assert!(!is_new_code_deploy(None, "0123abc"));
+    }
+
+    #[tokio::test]
+    async fn test_init_boot_sha_flavor_never_panics_and_stamps_flavor() {
+        // Whatever the on-disk state, the flavor init must not panic and
+        // must leave a checklist with a stamped sha (fail-open new_code).
+        let reg = super::super::episode::EpisodeRegistry::new();
+        init_boot_sha_flavor(&reg).await;
+        let cl = reg.boot_checklist().expect("flavor creates the checklist");
+        assert!(!cl.build_sha_short.is_empty());
     }
 
     #[tokio::test]

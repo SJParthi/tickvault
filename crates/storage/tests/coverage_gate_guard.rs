@@ -55,22 +55,46 @@ fn coverage_json(entries: &[String]) -> String {
     format!(r#"{{"data":[{{"files":[{}]}}]}}"#, entries.join(","))
 }
 
+/// The crates listed in `quality/crate-coverage-thresholds.toml` `[crates]`
+/// (their listing is separately pinned by
+/// `crates/common/tests/coverage_threshold_lockdown.rs::coverage_lockdown_required_crates_are_listed`).
+const THRESHOLD_CRATES: [&str; 6] = ["common", "core", "trading", "storage", "api", "app"];
+
+/// Fully-covered file entries for every threshold-listed crate EXCEPT the
+/// ones in `except` (the test then appends its own crafted entry for those).
+/// Needed since 2026-07-10: the gate's fail-closed CRATE-PRESENCE ASSERT
+/// requires every thresholds-listed crate to appear in the report, so a
+/// single-crate fixture would (correctly) hard-fail on the other five.
+fn full_presence_entries(except: &[&str]) -> Vec<String> {
+    THRESHOLD_CRATES
+        .iter()
+        .filter(|c| !except.contains(c))
+        .map(|c| {
+            file_entry(
+                &format!("/home/runner/work/tickvault/tickvault/crates/{c}/src/lib.rs"),
+                100,
+                100,
+            )
+        })
+        .collect()
+}
+
 /// Fix half 1: absolute paths MUST be aggregated — at least one per-crate row
 /// is printed and a fully-covered fixture passes.
 #[test]
 fn coverage_gate_prints_rows_for_absolute_paths() {
-    let json = coverage_json(&[
-        file_entry(
-            "/home/runner/work/tickvault/tickvault/crates/common/src/config.rs",
-            100,
-            100,
-        ),
-        file_entry(
-            "/home/runner/work/tickvault/tickvault/crates/storage/src/lib.rs",
-            100,
-            100,
-        ),
-    ]);
+    let mut entries = full_presence_entries(&["common", "storage"]);
+    entries.push(file_entry(
+        "/home/runner/work/tickvault/tickvault/crates/common/src/config.rs",
+        100,
+        100,
+    ));
+    entries.push(file_entry(
+        "/home/runner/work/tickvault/tickvault/crates/storage/src/lib.rs",
+        100,
+        100,
+    ));
+    let json = coverage_json(&entries);
     let (code, out) = run_gate("tv_gate_abs_pass.json", &json);
     assert_eq!(
         code, 0,
@@ -110,11 +134,13 @@ fn coverage_gate_fails_closed_on_zero_matched_files() {
 /// absolute paths (the CI shape, which the old gate silently ignored).
 #[test]
 fn coverage_gate_fails_below_threshold_crate() {
-    let json = coverage_json(&[file_entry(
+    let mut entries = full_presence_entries(&["storage"]);
+    entries.push(file_entry(
         "/home/runner/work/tickvault/tickvault/crates/storage/src/lib.rs",
         100,
         50,
-    )]);
+    ));
+    let json = coverage_json(&entries);
     let (code, out) = run_gate("tv_gate_below_floor.json", &json);
     assert_ne!(code, 0, "50%% storage coverage must fail its floor:\n{out}");
     assert!(
@@ -141,6 +167,18 @@ fn coverage_gate_source_has_no_anchored_match() {
         src.contains("refusing vacuous pass"),
         "scripts/coverage-gate.sh must keep the fail-closed empty-aggregation guard"
     );
+    // 2026-07-10 pins: the crate-presence assert + the zero-thresholds
+    // fail-closed check must never be stripped from the gate.
+    assert!(
+        src.contains("crate-presence assert FAILED"),
+        "scripts/coverage-gate.sh must keep the fail-closed CRATE-PRESENCE \
+         assert (a thresholds-listed crate absent from the report = hard fail)"
+    );
+    assert!(
+        src.contains("parsed 0 entries"),
+        "scripts/coverage-gate.sh must keep the zero-thresholds fail-closed \
+         check (empty [crates] section = hard fail, never a vacuous pass)"
+    );
 }
 
 /// 2026-07-02 fix: a crate EXACTLY AT its threshold must PASS — a ratchet
@@ -155,11 +193,13 @@ fn coverage_gate_source_has_no_anchored_match() {
 #[test]
 fn coverage_gate_exact_threshold_value_passes() {
     // storage floor is 91.2 → 912 covered of 1000 lines is EXACTLY at it.
-    let json = coverage_json(&[file_entry(
+    let mut entries = full_presence_entries(&["storage"]);
+    entries.push(file_entry(
         "/home/runner/work/tickvault/tickvault/crates/storage/src/lib.rs",
         1000,
         912,
-    )]);
+    ));
+    let json = coverage_json(&entries);
     let (code, out) = run_gate("tv_gate_exact_at_floor.json", &json);
     assert_eq!(
         code, 0,
@@ -178,11 +218,13 @@ fn coverage_gate_exact_threshold_value_passes() {
 #[test]
 fn coverage_gate_one_line_below_threshold_fails_with_honest_display() {
     // 9119/10000 = 91.19% — strictly below the 91.2 storage floor.
-    let json = coverage_json(&[file_entry(
+    let mut entries = full_presence_entries(&["storage"]);
+    entries.push(file_entry(
         "/home/runner/work/tickvault/tickvault/crates/storage/src/lib.rs",
         10000,
         9119,
-    )]);
+    ));
+    let json = coverage_json(&entries);
     let (code, out) = run_gate("tv_gate_just_below_floor.json", &json);
     assert_ne!(
         code, 0,
@@ -192,5 +234,54 @@ fn coverage_gate_one_line_below_threshold_fails_with_honest_display() {
         out.contains("91.19"),
         "the FAIL row must display the true 2-decimal value (91.19), never a \
          rounded 91.2 that looks equal to the threshold:\n{out}"
+    );
+}
+
+/// 2026-07-10 CRATE-PRESENCE ASSERT ratchet (audit follow-up row 9, Rule 11
+/// false-OK class): a thresholds-listed crate that is ABSENT from the
+/// coverage report must HARD-FAIL the gate, NAMING the crate. Before this
+/// assert, a vanished crate (renamed directory, llvm-cov filter change,
+/// partial run) was simply never iterated and its floor passed vacuously.
+#[test]
+fn coverage_gate_fails_when_threshold_crate_missing_from_report() {
+    // Every threshold crate EXCEPT `app` — `app` silently vanished.
+    let json = coverage_json(&full_presence_entries(&["app"]));
+    let (code, out) = run_gate("tv_gate_missing_crate.json", &json);
+    assert_ne!(
+        code, 0,
+        "a thresholds-listed crate missing from the report MUST fail the gate \
+         (vacuous-pass regression):\n{out}"
+    );
+    assert!(
+        out.contains("MISSING: app"),
+        "the missing crate must be NAMED in the failure output:\n{out}"
+    );
+    assert!(
+        out.contains("crate-presence assert FAILED"),
+        "the failure must be explicit about the presence assert:\n{out}"
+    );
+}
+
+/// 2026-07-10 inverse direction: a crate present in the report but with NO
+/// explicit floor in the thresholds TOML still PASSES (default floor is
+/// enforced) but must emit a loud WARN naming it, so new crates get an
+/// explicit ratcheted floor added.
+#[test]
+fn coverage_gate_warns_on_report_crate_without_explicit_floor() {
+    let mut entries = full_presence_entries(&[]);
+    entries.push(file_entry(
+        "/home/runner/work/tickvault/tickvault/crates/newcrate/src/lib.rs",
+        100,
+        100,
+    ));
+    let json = coverage_json(&entries);
+    let (code, out) = run_gate("tv_gate_unlisted_crate.json", &json);
+    assert_eq!(
+        code, 0,
+        "an unlisted-but-fully-covered crate must not fail the gate:\n{out}"
+    );
+    assert!(
+        out.contains("WARN: newcrate"),
+        "an unlisted crate must be NAMED in a WARN so it gets a floor:\n{out}"
     );
 }

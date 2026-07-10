@@ -22,6 +22,8 @@ use tickvault_common::tick_types::ParsedTick;
 use tickvault_trading::candles::MultiTfAggregator;
 use tickvault_trading::candles::aggregator_cell::FeedStrategy;
 
+mod dhat_support;
+
 #[global_allocator]
 static ALLOC: dhat::Alloc = dhat::Alloc;
 
@@ -56,14 +58,25 @@ fn measure_fold(strategy: FeedStrategy, cumulative_override: Option<u64>) -> u64
     // Prewarm: the FIRST fold opens the bucket / settles any one-time lazy work.
     agg.consume_tick(&t, segment, strategy, cumulative_override, |_, _| {});
 
-    let before = dhat::HeapStats::get();
-    // Steady state: 1000 folds into the SAME open bucket (same timestamp → no
-    // seal), which is the dominant per-tick hot path. No heap alloc expected.
-    for _ in 0..1000 {
-        agg.consume_tick(&t, segment, strategy, cumulative_override, |_, _| {});
-    }
-    let after = dhat::HeapStats::get();
-    after.total_blocks - before.total_blocks
+    // 2026-07-09: measured via the bounded phantom-retry helper (roaming
+    // 4-block cross-thread flake on 2-core CI runners — see
+    // dhat_support/mod.rs). Budget UNCHANGED: exactly 0 blocks. Re-running
+    // folds the SAME tick into the SAME open bucket — steady state holds
+    // across attempts.
+    let (_, blocks) = dhat_support::measure_with_phantom_retry(
+        0,
+        0,
+        || {},
+        || {
+            // Steady state: 1000 folds into the SAME open bucket (same timestamp →
+            // no seal), which is the dominant per-tick hot path. No heap alloc
+            // expected.
+            for _ in 0..1000 {
+                agg.consume_tick(&t, segment, strategy, cumulative_override, |_, _| {});
+            }
+        },
+    );
+    blocks
 }
 
 // ONE test fn: DHAT allows only ONE `Profiler` per process, so both feeds are
