@@ -63,10 +63,57 @@ locals {
 # held this alarm STUCK FIRING across the gap (operator saw it firing while the
 # box was up + ticks flowing). App-death while the box is up is still caught by
 # systemd Restart=always + the in-app tick-gap Telegram + the EC2 status alarm.
+#
+# MARKET-HOURS-GATED (2026-07-10, pre-09:00 deferral false-page fix): the pool
+# watchdog sets `tv_websocket_pool_all_dead` unconditionally every 5s
+# (crates/core/src/websocket/pool_watchdog.rs), while the pool DELIBERATELY
+# opens zero Dhan sockets until 09:00 IST (the by-design pre-open connect
+# deferral in crates/app/src/main.rs). This alarm was the ONLY liveness-class
+# alarm NOT in the market-hours window-gate Lambda's ALARM_NAMES list, so it
+# paged "ALL live market data connections are down" 24/7: every trading
+# morning ~08:34-09:00 during the deferral, and on overnight catch-up-deploy
+# boots (observed 2026-07-10 at 02:45, 03:42 and 08:34 IST). The gauge stays
+# HONEST (no producer change — dashboards / doctor / SLO WS_health unchanged);
+# only the alarm ACTIONS are windowed: OFF by default, armed 09:20-15:35 IST
+# Mon-Fri by the gate Lambda (market-hours-liveness-alarm.tf), whose open
+# mode also set_alarm_state(OK)s the gated alarms — a stale pre-open ALARM
+# from the deferral window is reset at window open (edge-triggered, no
+# false-page carry-over). HONEST COVERAGE ENVELOPE (corrected 2026-07-10
+# review round 1): the boot-heartbeat alarm (tv_boot_completed, 08:50-09:20
+# IST window) + the 08:45 IST readiness pager cover ONLY the app-not-booted
+# class (both key on tv_boot_completed / EC2 state); a pool that connects at
+# 09:00 and dies POST-boot in [09:00, 09:20) with the process alive is
+# caught by NEITHER — its pre-09:22 coverer is the APP-SIDE 09:16:30 IST
+# market-open self-test (main_feed_active check, SELFTEST-02 Critical →
+# Telegram; gated on config features.market_open_self_test = true — if that
+# flag is ever disabled, the first page for this class slips to ~09:22).
+# From 09:20 the market-hours liveness alarm + this re-armed alarm own it —
+# a pool genuinely dead past 09:20 pages within ~2 min of window open
+# (2x60s eval after the OK reset). Residual (honest): the post-boot
+# [09:00, 09:20) death above first pages CloudWatch at ~09:22 — bounded,
+# same class as the boot-heartbeat §19 seam envelope (worst ~9-10 min).
+# GATE-OPEN SKIP-DAY RESIDUAL (2026-07-10 review round 1): the gate
+# Lambda's 09:20 open path returns SUCCESS without enabling when the
+# holiday-stop SSM marker == today OR the box is not up at 09:20 (crash +
+# autopilot race, operator stop/start straddling 09:20, stale marker) — a
+# SUCCESS skip does NOT fire the gate-errors watchman (it catches Lambda
+# ERRORS only), so on such a day BOTH ws-pool alarms stay disarmed for the
+# ENTIRE session even if the box comes up minutes later; a real mid-day
+# pool death then pages no CloudWatch alarm until the next day's open.
+# Before 2026-07-10 these two alarms were always-armed and WOULD have paged
+# that outage. Partial mitigation: the operator is CloudWatch-blind only —
+# the app-side tick-gap Telegram + the 09:16:30 self-test still run from
+# inside the app. FLAGGED FOLLOW-UP (not built in this PR): make the
+# open-path skip observable (custom metric / log-filter alarm on the
+# "leaving actions disabled" log line so a skip on a non-holiday weekday
+# pages), or have the start-watchdog/autopilot re-invoke the gate Lambda
+# with mode=open after a late in-window instance start.
+# Strictly better than the always-armed alarm's daily false-page noise.
+# In-window sensitivity (metric/threshold/eval periods) is UNCHANGED.
 # ---------------------------------------------------------------------------
 resource "aws_cloudwatch_metric_alarm" "ws_pool_all_dead" {
   alarm_name          = "tv-${var.environment}-ws-pool-all-dead"
-  alarm_description   = "Main-feed WebSocket pool reports all conns dead — no live ticks reaching the pipeline. See disaster-recovery.md scenario 6."
+  alarm_description   = "Main-feed WebSocket pool reports all conns dead DURING MARKET HOURS — no live ticks reaching the pipeline. Actions gated to 09:20-15:35 IST Mon-Fri by the market-hours gate Lambda (the pool defers Dhan connects until 09:00 IST by design, so the pre-open gauge is legitimately 1 and never pages). See disaster-recovery.md scenario 6."
   comparison_operator = "GreaterThanThreshold"
   evaluation_periods  = 2
   metric_name         = "tv_websocket_pool_all_dead"
@@ -76,16 +123,28 @@ resource "aws_cloudwatch_metric_alarm" "ws_pool_all_dead" {
   threshold           = 0
   treat_missing_data  = "notBreaching"
   dimensions          = local.app_dimensions
-  alarm_actions       = local.app_alarm_actions
-  ok_actions          = local.app_alarm_ok
+  # Actions OFF by default; the market-hours gate Lambda flips them ON
+  # 09:20-15:35 IST Mon-Fri (market-hours-liveness-alarm.tf).
+  actions_enabled = false
+  alarm_actions   = local.app_alarm_actions
+  ok_actions      = local.app_alarm_ok
 }
 
 # ---------------------------------------------------------------------------
 # 2. WS pool partial degradation — some but not all conns failed
+#
+# MARKET-HOURS-GATED (2026-07-10, pre-09:00 deferral false-page fix): written
+# by the SAME unconditional 5s pool-watchdog tick as ws_pool_all_dead above,
+# so it shares the same false class during the by-design pre-09:00 IST Dhan
+# connect deferral and overnight catch-up-deploy boots. Same fix, same
+# honest-coverage envelope as the ws_pool_all_dead comment block above:
+# gauge unchanged, actions windowed 09:20-15:35 IST Mon-Fri by the gate
+# Lambda (market-hours-liveness-alarm.tf), stale pre-open ALARM state reset
+# to OK at window open. In-window sensitivity is UNCHANGED.
 # ---------------------------------------------------------------------------
 resource "aws_cloudwatch_metric_alarm" "ws_failed_connections" {
   alarm_name          = "tv-${var.environment}-ws-failed-connections"
-  alarm_description   = "One or more main-feed conns are in failed state. Pool may self-heal via watchdog; investigate if sustained."
+  alarm_description   = "One or more main-feed conns are in failed state DURING MARKET HOURS. Pool may self-heal via watchdog; investigate if sustained. Actions gated to 09:20-15:35 IST Mon-Fri by the market-hours gate Lambda (pre-09:00 IST the pool defers Dhan connects by design)."
   comparison_operator = "GreaterThanThreshold"
   evaluation_periods  = 3
   metric_name         = "tv_websocket_failed_connections_count"
@@ -95,8 +154,11 @@ resource "aws_cloudwatch_metric_alarm" "ws_failed_connections" {
   threshold           = 0
   treat_missing_data  = "notBreaching"
   dimensions          = local.app_dimensions
-  alarm_actions       = local.app_alarm_actions
-  ok_actions          = local.app_alarm_ok
+  # Actions OFF by default; the market-hours gate Lambda flips them ON
+  # 09:20-15:35 IST Mon-Fri (market-hours-liveness-alarm.tf).
+  actions_enabled = false
+  alarm_actions   = local.app_alarm_actions
+  ok_actions      = local.app_alarm_ok
 }
 
 # ---------------------------------------------------------------------------
