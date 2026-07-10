@@ -302,8 +302,10 @@ fn day_bounds_nanos(target_ist_day: u64) -> (i64, i64) {
 
 /// IST-day bounds in epoch MICROSECONDS — the ONLY representation legal in
 /// an embedded QuestDB TIMESTAMP comparison literal (see the regression
-/// lock above).
-fn day_bounds_micros(target_ist_day: u64) -> (i64, i64) {
+/// lock above). `pub(crate)` since 2026-07-10: the tick-conservation audit's
+/// `build_conservation_ticks_count_sql` shares this single micros source so
+/// no per-file nanos re-derivation can regress (main-nanos-verdict hand-off).
+pub(crate) fn day_bounds_micros(target_ist_day: u64) -> (i64, i64) {
     // APPROVED: IST day numbers are ~20K, far below i64::MAX — saturating
     // keeps adversarial inputs bounded.
     let start = i64::try_from(target_ist_day)
