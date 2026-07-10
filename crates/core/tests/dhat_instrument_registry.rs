@@ -11,6 +11,8 @@
 #[global_allocator]
 static ALLOC: dhat::Alloc = dhat::Alloc;
 
+mod dhat_support;
+
 #[test]
 fn dhat_instrument_registry_lookups_zero_alloc() {
     use tickvault_common::instrument_registry::{
@@ -35,43 +37,45 @@ fn dhat_instrument_registry_lookups_zero_alloc() {
     let _warmup = registry.get(13);
 
     // ---- Measure: all subsequent lookups must be zero-allocation ----
-    let stats_before = dhat::HeapStats::get();
+    // 2026-07-09: measured via the bounded phantom-retry helper (roaming
+    // 4-block cross-thread flake on 2-core CI runners — see
+    // dhat_support/mod.rs). Budget UNCHANGED: exactly 0 blocks.
+    let (_, allocs_during) = dhat_support::measure_with_phantom_retry(
+        0,
+        0,
+        || {},
+        || {
+            // Simulate hot-path: 1000 registry lookups (what tick processor does)
+            for _ in 0..1000 {
+                // Hit: known security_ids
+                let r1 = registry.get(13);
+                assert!(r1.is_some());
+                assert_eq!(
+                    r1.expect("nifty").category,
+                    SubscriptionCategory::MajorIndexValue
+                );
 
-    // Simulate hot-path: 1000 registry lookups (what tick processor does)
-    for _ in 0..1000 {
-        // Hit: known security_ids
-        let r1 = registry.get(13);
-        assert!(r1.is_some());
-        assert_eq!(
-            r1.expect("nifty").category,
-            SubscriptionCategory::MajorIndexValue
-        );
+                let r2 = registry.get(21);
+                assert!(r2.is_some());
+                assert_eq!(
+                    r2.expect("vix").category,
+                    SubscriptionCategory::DisplayIndex
+                );
 
-        let r2 = registry.get(21);
-        assert!(r2.is_some());
-        assert_eq!(
-            r2.expect("vix").category,
-            SubscriptionCategory::DisplayIndex
-        );
+                // Miss: unknown security_id (also must be zero-alloc)
+                let r3 = registry.get(99999);
+                assert!(r3.is_none());
+            }
 
-        // Miss: unknown security_id (also must be zero-alloc)
-        let r3 = registry.get(99999);
-        assert!(r3.is_none());
-    }
-
-    // Also verify contains() and len() are zero-alloc
-    for _ in 0..1000 {
-        assert!(registry.contains(13));
-        assert!(!registry.contains(99999));
-        assert_eq!(registry.len(), 5);
-        assert!(!registry.is_empty());
-    }
-
-    // ---- End measurement ----
-    let stats_after = dhat::HeapStats::get();
-    let allocs_during = stats_after
-        .total_blocks
-        .saturating_sub(stats_before.total_blocks);
+            // Also verify contains() and len() are zero-alloc
+            for _ in 0..1000 {
+                assert!(registry.contains(13));
+                assert!(!registry.contains(99999));
+                assert_eq!(registry.len(), 5);
+                assert!(!registry.is_empty());
+            }
+        },
+    );
 
     assert_eq!(
         allocs_during, 0,

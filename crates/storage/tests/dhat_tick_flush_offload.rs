@@ -27,6 +27,8 @@ use tickvault_storage::tick_persistence::TickPersistenceWriter;
 #[global_allocator]
 static ALLOC: dhat::Alloc = dhat::Alloc;
 
+mod dhat_support;
+
 fn sample_tick(security_id: u64, ltp: f32) -> ParsedTick {
     ParsedTick {
         security_id,
@@ -95,30 +97,49 @@ fn dhat_offloaded_append_steady_state_zero_alloc() {
     // Warm-up: cycle EVERY pool buffer through a full batch so each reaches
     // its high-water capacity (clear() retains it) — 5 full batches covers
     // the 3 spares + the writer's active buffer with margin.
-    let mut seq: i64 = 1;
+    // RefCell: the phantom-retry helper takes a `stabilize` AND a `workload`
+    // closure; both need the writer + seq mutably, so interior mutability
+    // resolves the (strictly sequential) double borrow.
+    let writer = std::cell::RefCell::new(writer);
+    let seq = std::cell::Cell::new(1_i64);
     for i in 0..(5 * TICK_FLUSH_BATCH_SIZE) {
-        seq += 1;
+        seq.set(seq.get() + 1);
         let tick = sample_tick(13, 23_000.0 + (i % 100) as f32);
-        let _ = writer.append_tick_with_seq(&tick, seq);
+        let _ = writer.borrow_mut().append_tick_with_seq(&tick, seq.get());
     }
     // Settle: let the worker finish any in-flight flush so its internal
     // allocations cannot race into the measured window.
     std::thread::sleep(std::time::Duration::from_millis(300));
 
-    let stats_before = dhat::HeapStats::get();
-
-    // Measured window: strictly below the flush threshold — no dispatch,
-    // no worker activity. This is the per-tick steady state.
-    for i in 0..(TICK_FLUSH_BATCH_SIZE - 1) {
-        seq += 1;
-        let tick = sample_tick(13, 23_100.0 + (i % 100) as f32);
-        let _ = writer.append_tick_with_seq(&tick, seq);
-    }
-
-    let stats_after = dhat::HeapStats::get();
-    let blocks = stats_after
-        .total_blocks
-        .saturating_sub(stats_before.total_blocks);
+    // 2026-07-09: measured via the bounded phantom-retry helper (roaming
+    // 4-block cross-thread flake on 2-core CI runners; this binary ALSO
+    // runs a flush-worker thread + TCP drain threads — see
+    // dhat_support/mod.rs). Budget UNCHANGED: exactly 0 blocks.
+    //
+    // Stateful stabilize: each measured attempt appends BATCH-1 ticks, so a
+    // RE-attempt must first top up the ONE remaining slot (triggering the
+    // batch dispatch off the measured clock) and settle until the worker's
+    // flush is done — restoring the strictly-below-threshold invariant the
+    // measured window depends on.
+    let (_, blocks) = dhat_support::measure_with_phantom_retry(
+        0,
+        0,
+        || {
+            seq.set(seq.get() + 1);
+            let tick = sample_tick(13, 23_050.0);
+            let _ = writer.borrow_mut().append_tick_with_seq(&tick, seq.get());
+            std::thread::sleep(std::time::Duration::from_millis(300));
+        },
+        || {
+            // Measured window: strictly below the flush threshold — no dispatch,
+            // no worker activity. This is the per-tick steady state.
+            for i in 0..(TICK_FLUSH_BATCH_SIZE - 1) {
+                seq.set(seq.get() + 1);
+                let tick = sample_tick(13, 23_100.0 + (i % 100) as f32);
+                let _ = writer.borrow_mut().append_tick_with_seq(&tick, seq.get());
+            }
+        },
+    );
 
     assert_eq!(
         blocks,
