@@ -95,6 +95,17 @@ verified before the work is declared complete.
 6. **Archive after push, not before.**
    The active plan persists until the push succeeds.
 
+7. **Archiving is MANDATORY once the PR merges — the gate now enforces it
+   (2026-07-10).** The archive step in Phase 4 was skipped for weeks and 107
+   stale `active-plan*.md` files accumulated, making the design-first wall
+   vacuous (any impl change matched some stale APPROVED/VERIFIED plan). Since
+   2026-07-10, `plan-gate.sh` BLOCKS every implementation push when more than
+   `PLAN_GATE_MAX_ACTIVE` (default 5) active-plan files exist (V7 — see
+   `design-first-wall.md` "2026-07-10 hardening"). Archive convention:
+   `.claude/plans/archive/YYYY-MM-DD-<slug>.md`, where the date is the plan's
+   own `**Date:**` field when present (else the archive date) and the slug is
+   the filename minus the `active-plan-` prefix.
+
 ## What This Prevents
 
 - Approved plan items silently skipped during implementation
