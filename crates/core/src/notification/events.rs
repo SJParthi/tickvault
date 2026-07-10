@@ -1079,8 +1079,11 @@ pub enum NotificationEvent {
     /// one page per process per IST day. Severity::High — demands operator
     /// action (paste the next official NSE circular into the config).
     HolidayCalendarCoverageLow {
-        /// Signed days of coverage left (negative = already past the cliff).
-        days_remaining: i64,
+        /// Signed days of coverage left (negative = already past the
+        /// cliff); `None` = the configured holiday list is EMPTY
+        /// (pathological — the config guards prevent it in prod, but the
+        /// body renders it honestly instead of a fake number).
+        days_remaining: Option<i64>,
         /// Human-readable last covered date, e.g. "31 Dec 2026".
         coverage_end_display: String,
     },
@@ -2361,14 +2364,22 @@ impl NotificationEvent {
                 // produced by our own date formatter (never external text)
                 // but html_escape it anyway, consistent with every String arm.
                 let end = html_escape(coverage_end_display);
-                let when = if *days_remaining >= 0 {
-                    format!("runs out in {days_remaining} days (last covered day: {end})")
-                } else {
-                    let ago = days_remaining.unsigned_abs();
-                    format!(
-                        "already ran out {ago} days ago (last covered day: {end}) — market \
-                         holidays are currently being treated as trading days"
-                    )
+                let when = match days_remaining {
+                    Some(d) if *d >= 0 => {
+                        format!("runs out in {d} days (last covered day: {end})")
+                    }
+                    Some(d) => {
+                        let ago = d.unsigned_abs();
+                        format!(
+                            "already ran out {ago} days ago (last covered day: {end}) — market \
+                             holidays are currently being treated as trading days"
+                        )
+                    }
+                    // Pathological empty-calendar case (config guards prevent
+                    // it in prod) — render honestly, never a fake number.
+                    None => "is EMPTY — no market holidays are configured at all, so every \
+                             weekday is being treated as a trading day"
+                        .to_string(),
                 };
                 format!(
                     "⚠️ <b>Market holiday calendar needs updating</b>\n\
@@ -6295,7 +6306,7 @@ mod tests {
     #[test]
     fn test_holiday_calendar_coverage_low_severity_is_high() {
         let ev = NotificationEvent::HolidayCalendarCoverageLow {
-            days_remaining: 46,
+            days_remaining: Some(46),
             coverage_end_display: "31 Dec 2026".to_string(),
         };
         assert_eq!(ev.severity(), Severity::High);
@@ -6305,7 +6316,7 @@ mod tests {
     #[test]
     fn test_holiday_calendar_coverage_low_body_commandments() {
         let msg = NotificationEvent::HolidayCalendarCoverageLow {
-            days_remaining: 46,
+            days_remaining: Some(46),
             coverage_end_display: "31 Dec 2026".to_string(),
         }
         .to_message();
@@ -6329,7 +6340,7 @@ mod tests {
     #[test]
     fn test_holiday_calendar_coverage_low_body_past_cliff() {
         let msg = NotificationEvent::HolidayCalendarCoverageLow {
-            days_remaining: -3,
+            days_remaining: Some(-3),
             coverage_end_display: "31 Dec 2026".to_string(),
         }
         .to_message();

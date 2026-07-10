@@ -37,8 +37,12 @@
 //! calendar maintenance (Rule 3 targets market-data tasks that false-page
 //! off-hours; a stale calendar matters most across the year-end holiday
 //! stretch). Honest envelope: the alert latch is in-memory, so a restart
-//! re-arms it — at most one page per PROCESS per IST day, bounded by
-//! boots/day.
+//! re-arms it — at most one page per PROCESS per IST day. On a normal day
+//! that is 1-2 pages; a WS-GAP-09-class restart STORM during a stale
+//! window would page once per restart (the storm itself already pages
+//! louder than this reminder, and the episode machinery + a persistent
+//! latch are deliberately NOT added for a maintenance reminder —
+//! hostile-review M1, 2026-07-10, accepted envelope).
 //!
 //! ## Deliberately NOT wired here (follow-up, operator quote required)
 //!
@@ -116,6 +120,7 @@ pub fn spawn_calendar_staleness_watchdog(
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut last_alerted: Option<NaiveDate> = None;
+        let mut last_warned_no_notifier: Option<NaiveDate> = None;
         info!(
             coverage_end = %coverage_end_display(calendar.coverage_end_date()),
             threshold_days = CALENDAR_COVERAGE_WARN_THRESHOLD_DAYS,
@@ -138,8 +143,20 @@ pub fn spawn_calendar_staleness_watchdog(
             ) {
                 let Some(notifier) = notifier_slot.load_full() else {
                     // Boot prefix: notifier not built yet — retry shortly
-                    // WITHOUT setting the latch, so the page is delayed,
-                    // never lost for the day.
+                    // WITHOUT setting the alert latch, so the page is
+                    // delayed, never lost for the day. Hostile-review M2
+                    // (2026-07-10): a slot that NEVER fills (boot path that
+                    // bails before notifier construction) must still be
+                    // log-sink-visible — one warn! per IST day, own latch.
+                    if last_warned_no_notifier != Some(today) {
+                        warn!(
+                            days_remaining = ?remaining,
+                            "holiday-calendar coverage horizon is low but the \
+                             Telegram notifier is not up yet — retrying \
+                             delivery every 30s (log-sink-only until then)"
+                        );
+                        last_warned_no_notifier = Some(today);
+                    }
                     tokio::time::sleep(std::time::Duration::from_secs(
                         CALENDAR_STALENESS_NOTIFIER_RETRY_SECS,
                     ))
@@ -155,7 +172,7 @@ pub fn spawn_calendar_staleness_watchdog(
                      (paste the next official NSE circular into config)"
                 );
                 notifier.notify(NotificationEvent::HolidayCalendarCoverageLow {
-                    days_remaining: remaining.unwrap_or(i64::MIN),
+                    days_remaining: remaining,
                     coverage_end_display: end_display,
                 });
                 metrics::counter!(COUNTER_STALENESS_ALERTS).increment(1);

@@ -1380,22 +1380,38 @@ mod tests {
         let main_rs = std::fs::read_to_string("../app/src/main.rs")
             .or_else(|_| std::fs::read_to_string("crates/app/src/main.rs"))
             .expect("main.rs must be readable");
+        // Comment-stripped scan (hostile-review H1, 2026-07-10): a raw
+        // `contains` would still pass with the spawn commented out. Line
+        // comments suffice here — main.rs call sites are line-oriented and
+        // the anchor string never appears inside a string literal.
+        let non_comment: String = main_rs
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(
-            main_rs.contains("spawn_calendar_staleness_watchdog("),
+            non_comment.contains("spawn_calendar_staleness_watchdog("),
             "main.rs MUST call \
              `calendar_staleness::spawn_calendar_staleness_watchdog` from the \
-             common boot prefix (audit follow-up row 15). Without it, the \
-             holiday calendar runs off its year-end cliff with zero runtime \
-             warning and un-listed holidays are treated as trading days."
+             common boot prefix (audit follow-up row 15), NOT commented out. \
+             Without it, the holiday calendar runs off its year-end cliff \
+             with zero runtime warning and un-listed holidays are treated as \
+             trading days."
         );
         // Anti-vacuous: the spawn must receive the trading calendar AND the
         // lazily-filled notifier slot (a stub call with neither could
-        // satisfy a bare substring check). Scan the non-comment call-site
-        // region for both argument identifiers within the following lines.
-        let idx = main_rs
+        // satisfy a bare substring check). Scan the comment-stripped
+        // call-site region for both argument identifiers.
+        let idx = non_comment
             .find("spawn_calendar_staleness_watchdog(")
             .expect("checked above"); // APPROVED: test
-        let window = &main_rs[idx..main_rs.len().min(idx + 400)];
+        // Char-boundary-safe window end (string literals in main.rs carry
+        // non-ASCII; a raw byte slice could split a multi-byte char).
+        let mut end = non_comment.len().min(idx + 400);
+        while !non_comment.is_char_boundary(end) {
+            end -= 1;
+        }
+        let window = &non_comment[idx..end];
         assert!(
             window.contains("trading_calendar"),
             "the calendar-staleness watchdog call site must pass the \
