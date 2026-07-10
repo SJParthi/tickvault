@@ -34,12 +34,19 @@ silently absorbed.
 ## §1. FUTIDX-01 — index-future selection degraded
 
 **Severity:** High. **Auto-triage safe:** Yes (the degrade already happened — that feed simply
-runs WITHOUT that future for the day; the operator inspects the master CSV at leisure).
+runs WITHOUT that future (or that month) for the day; the operator inspects the master CSV at
+leisure).
 
-**Trigger:** at the Dhan ~08:45 daily-universe build (`ErrorCode::Futidx01SelectionDegraded`,
-emitted from `daily_universe_orchestrator.rs`) or the Groww watch-set build
-(`groww_activation.rs` / `instruments.rs` extraction), ≥1 of the 4 underlyings resolved ZERO
-valid nearest-expiry contracts. Reasons (the `reason` payload field):
+**Trigger** (AM-r2 F2 reword, 2026-07-10 — the pre-§36.7 "resolved ZERO valid nearest-expiry
+contracts" sentence was STALE; the whole-underlying-or-per-month formulation below is the
+operative one, matching §0): at the Dhan ~08:45 daily-universe build
+(`ErrorCode::Futidx01SelectionDegraded`, emitted from `daily_universe_orchestrator.rs`) or the
+Groww watch-set build (`groww_activation.rs` / `instruments.rs` extraction), a selection
+degrade fired for ≥1 of the 4 underlyings — EITHER the WHOLE underlying resolved zero valid
+monthly contracts (`NoFutRows` / `AllExpiriesPast` / `BadExpiryFormat` / `BadNativeToken` /
+`MonthlySerialFlood`), OR a SINGLE month of an otherwise-resolved underlying was dropped
+(`AmbiguousDuplicateExpiry` / `SameExpiryCandidateFlood` — the per-(underlying, expiry) arms)
+while its other months continued to subscribe. Reasons (the `reason` payload field):
 
 | Reason | Meaning |
 |---|---|

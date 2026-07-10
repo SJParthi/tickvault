@@ -244,3 +244,17 @@ Per `zero-loss-guarantee-charter.md` §3 (boxes for THIS plan):
 Rejected (refuters): scan_gaps_top_n TOCTOU (unreachable), warm-path CRITICAL variant
 (duplicate of F2 at wrong severity), release debug_assert (bound structurally unviolable),
 DepthOnly depth-unbounded (deliberate §36.7 design — vendor publication lag is not paged).
+
+## AM-R2 — hostile review round 2 (2026-07-10; 4 reviewers + 3 refuters/finding; 4 CONFIRMED of 7)
+
+| # | Sev | Finding | Fix |
+|---|---|---|---|
+| R2-F1 | MEDIUM | Snapshot exact-duplicate skip key `(security_id, segment)` omitted expiry and ran BEFORE the corruption gate — one SID claiming TWO months silently dropped the second month (warm boot under-subscribed, unpaged DepthOnly) | Key is now `HashMap<(sid, segment), parsed NaiveDate>`: identical (sid, segment, month) line → first-entry-wins skip; same SID + DIFFERENT month → whole snapshot None (fail closed). Tests: `test_snapshot_index_future_same_sid_two_months_fail_closed` + `..._exact_duplicate_line_still_first_entry_wins` |
+| R2-F2 | MEDIUM | `futidx-4-error-codes.md` §1 Trigger still defined the nearest-expiry-era firing condition ("resolved ZERO valid nearest-expiry contracts") | Reworded inline (PREVCLOSE-03 precedent) to the whole-underlying-or-per-month formulation; whole-underlying arms = NoFutRows / AllExpiriesPast / BadExpiryFormat / BadNativeToken / MonthlySerialFlood, per-month arms = AmbiguousDuplicateExpiry / SameExpiryCandidateFlood (matches the enum docs) |
+| R2-F3 | LOW | `groww_activation.rs` set_subscribed comment still said "INCLUDES the ≤4 §36 futures … no off-by-4" | Reworded to "~12 typical, ≤24 by the monthly-serial envelope … no futures-sized off-by-N; arithmetic is count-agnostic" |
+| R2-F4 | LOW | The F9 commit-body `§`-quoting prevention lived only in this (terminal, non-auto-loaded) plan | Promoted to the always-loaded `pr-completion-protocol.md` — new section "Commit-body quoting rule — section signs (AM-r1 F9, binding 2026-07-10)" (single-quoted `-m` / heredoc / `-F` file; verify with `git log -1 --format=%B`) |
+
+Rejected (refuters): DepthOnly demotion "weakens auditability" (false premise — FUTIDX-02
+never paged; DepthOnly is the deliberate D5 design), far-month set boot-frozen staleness
+(re-raise of AM-R1 F5, already documented as honest envelope), Groww parity records
+pre-assemble selection (post-cap honesty already handled at the gauge + cap-drop counter).
