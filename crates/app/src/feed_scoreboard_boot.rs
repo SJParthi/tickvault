@@ -508,6 +508,78 @@ pub fn is_pre_session_feed_disable_row(ev: &WsAuditEventLite) -> bool {
         && secs_of_day_ist_from_nanos(ev.ts_ist_nanos) < SESSION_START_SECS_OF_DAY_IST
 }
 
+/// `true` for an up-kind row that lands BEFORE the 09:15 session open —
+/// the state-at-open comparison's re-enable signal (round 6, 2026-07-10 —
+/// MEDIUM): a pre-session disable→RE-ENABLE flap leaves both a
+/// `feed_disabled` marker AND a later pre-session up row (Dhan
+/// SleepResumed / Groww Connected); only the LAST of the two toggles is
+/// the feed's state when trading began. Pure.
+#[must_use]
+pub fn is_pre_session_up_row(ev: &WsAuditEventLite) -> bool {
+    is_up_kind(&ev.event_kind)
+        && secs_of_day_ist_from_nanos(ev.ts_ist_nanos) < SESSION_START_SECS_OF_DAY_IST
+}
+
+/// State-at-session-open from the day's pre-session toggle timestamps
+/// (round 6, 2026-07-10 — MEDIUM): the disable marker qualifies feed_off
+/// ONLY when it is the LAST pre-session toggle event — a marker followed
+/// by a later pre-session up row (the 08:40-disable / 08:50-re-enable
+/// flap) means the feed was back ON at open, and a broker-dead session
+/// after that flap is the honest catastrophic measured-zero day, never
+/// softened into feed_off. Existence of a marker alone (the round-5
+/// predicate) is NOT enough. An equal-timestamp tie resolves to NOT-off
+/// (conservative: stays loud). Pure.
+#[must_use]
+pub fn pre_session_disable_is_state_at_open(
+    latest_pre_session_disable_ts: Option<i64>,
+    latest_pre_session_up_ts: Option<i64>,
+) -> bool {
+    match (latest_pre_session_disable_ts, latest_pre_session_up_ts) {
+        (Some(disable_ts), Some(up_ts)) => disable_ts > up_ts,
+        (Some(_), None) => true,
+        (None, _) => false,
+    }
+}
+
+/// Pairing window for [`parked_wake_indices`]: a WS-GAP-04 wake's
+/// SleepResumed row and the dormant gate's re-park `feed_disabled` marker
+/// land ~1s apart (wake ~09:00:00, marker ~09:00:01); 10s absorbs
+/// scheduler jitter without pairing across genuine episodes.
+pub const PARKED_WAKE_PAIR_WINDOW_NANOS: i64 = 10 * NANOS_PER_SEC;
+
+/// Indices of `sleep_resumed` rows the dormant gate immediately RE-PARKED
+/// (round 6, 2026-07-10 — MEDIUM): the WS-GAP-04 overnight wake emits its
+/// SleepResumed audit row at ~09:00:00 IST BEFORE the run-loop's
+/// feed_enabled gate parks the connection and stamps the
+/// SleepEntered/`feed_disabled` marker (~09:00:01) — so a feed the
+/// operator disabled WHILE SLEEPING writes one session-window "up" row
+/// despite never streaming, defeating the feed-off inference. A
+/// `sleep_resumed` row followed within [`PARKED_WAKE_PAIR_WINDOW_NANOS`]
+/// by a `feed_disabled` marker for the SAME
+/// (feed, ws_type, connection_index) is a parked wake, not evidence the
+/// feed was up — the fold excludes it from BOTH up signals (session-window
+/// and pre-session state-at-open). O(n·m) over one day's audit rows
+/// (≤ hundreds; cold path, one run/day). Pure.
+#[must_use]
+pub fn parked_wake_indices(rows: &[WsAuditEventLite]) -> HashSet<usize> {
+    rows.iter()
+        .enumerate()
+        .filter(|(_, wake)| wake.event_kind == "sleep_resumed")
+        .filter(|(_, wake)| {
+            rows.iter().any(|m| {
+                m.source == FEED_DISABLE_SOURCE
+                    && m.feed == wake.feed
+                    && m.ws_type == wake.ws_type
+                    && m.connection_index == wake.connection_index
+                    && m.ts_ist_nanos >= wake.ts_ist_nanos
+                    && m.ts_ist_nanos.saturating_sub(wake.ts_ist_nanos)
+                        <= PARKED_WAKE_PAIR_WINDOW_NANOS
+            })
+        })
+        .map(|(idx, _)| idx)
+        .collect()
+}
+
 /// Feed-was-OFF-for-the-day inference (round 4, 2026-07-10 — the round-2
 /// finding left open across rounds; REDESIGNED round 5, 2026-07-10 —
 /// HIGH): a feed that delivered a MEASURED zero tick count with ZERO
@@ -521,18 +593,29 @@ pub fn is_pre_session_feed_disable_row(ev: &WsAuditEventLite) -> bool {
 /// ~08:33 boot connect no longer defeats the inference — but zero session
 /// up rows ALONE cannot distinguish "runtime-disabled at 08:40" from
 /// "enabled with a dead broker all day" (both leave the 08:33 connect and
-/// nothing in session). The disambiguator is the durable pre-session
-/// `source='feed_disabled'` toggle row ([`is_pre_session_feed_disable_row`]):
+/// nothing in session). The disambiguator (STATE-AT-OPEN since round 6,
+/// 2026-07-10 — MEDIUM; existence of a marker was not enough) is the
+/// durable pre-session `source='feed_disabled'` toggle row being the LAST
+/// pre-session toggle ([`pre_session_disable_is_state_at_open`] over the
+/// day's latest [`is_pre_session_feed_disable_row`] /
+/// [`is_pre_session_up_row`] timestamps):
 ///
-/// | day shape | any up | pre-session disable row | verdict |
+/// | day shape | any up | disable = state at open | verdict |
 /// |---|---|---|---|
 /// | config-off all day (no rows at all) | no | no | feed_off |
 /// | boot connect 08:33 → runtime-disable 08:40 | yes | yes | feed_off |
+/// | disable 08:40 → RE-ENABLE 08:50, broker dead in session | yes | no (the 08:50 up row is the last toggle) | NOT feed_off — the round-6 flap topology stays loud |
 /// | boot connect 08:33, enabled, broker dead | yes | no | NOT feed_off — a real catastrophic measured-zero day stays loud |
 ///
-/// For SAME-DAY runs the runtime enabled flag additionally disambiguates
-/// (`Some(true)` ⇒ NEVER feed_off); a backfill (`None`) infers from data
-/// alone (honest residual: an enabled feed that never achieved a single
+/// The durable marker OUTRANKS the live runtime flag (round 6, the
+/// re-enable-before-first-run window): when the disable marker is the
+/// state at open with zero session up rows and zero ticks, a re-enable
+/// between 15:30 and the 15:45 trigger (`runtime_enabled_now =
+/// Some(true)`) no longer blocks feed_off — the flag is read at RUN time,
+/// not session time. `Some(true)` stays load-bearing only for the
+/// NO-MARKER arm (the enabled-but-broker-dead day, which has no
+/// `feed_disabled` row). A backfill (`None`) infers from data alone
+/// (honest residual: an enabled feed that never achieved a single
 /// successful connect ALL day — zero rows entirely — is indistinguishable
 /// from config-off in a backfill; the runbook names it). A `-1` ticks
 /// sentinel never qualifies (unmeasured is not zero). Pure.
@@ -540,14 +623,19 @@ pub fn is_pre_session_feed_disable_row(ev: &WsAuditEventLite) -> bool {
 pub fn is_feed_off_day(
     had_session_up_row: bool,
     had_any_up_row: bool,
-    had_pre_session_disable_row: bool,
+    disable_is_state_at_open: bool,
     ticks: i64,
     runtime_enabled_now: Option<bool>,
 ) -> bool {
-    ticks == 0
-        && runtime_enabled_now != Some(true)
-        && !had_session_up_row
-        && (!had_any_up_row || had_pre_session_disable_row)
+    if ticks != 0 || had_session_up_row {
+        return false;
+    }
+    if disable_is_state_at_open {
+        // The durable pre-session marker (last toggle before open) wins
+        // over the run-instant flag — see the doc table above.
+        return true;
+    }
+    !had_any_up_row && runtime_enabled_now != Some(true)
 }
 
 /// Daily-row feed_off keep-better rule (round 5, 2026-07-10 — HIGH,
@@ -2159,15 +2247,20 @@ pub async fn run_feed_scoreboard(
     let mut reconnects: Option<BTreeMap<String, i64>> = None;
     let mut mem_tallies: Option<BTreeMap<String, EpisodeTally>> = None;
     // The feed-off-day inference inputs (round 4, redesigned round 5,
-    // 2026-07-10): per feed — up-kind rows INSIDE the session window
-    // (the ~08:33 boot connect must not defeat a runtime-disable day),
-    // up-kind rows anywhere in the day, and pre-session
-    // source='feed_disabled' toggle rows. `None` = the ws read failed,
-    // so feed-off can never be claimed (unmeasured is not off).
+    // hardened round 6, 2026-07-10): per feed — up-kind rows INSIDE the
+    // session window (the ~08:33 boot connect must not defeat a
+    // runtime-disable day; a parked WS-GAP-04 wake never counts), up-kind
+    // rows anywhere in the day, and the LATEST pre-session
+    // (source='feed_disabled' marker, up-kind row) timestamps for the
+    // state-at-open comparison (a disable→re-enable flap must not soften
+    // a broker-dead session). `None` = the ws read failed, so feed-off
+    // can never be claimed (unmeasured is not off).
     struct FeedUpSignals {
         session_up: HashSet<String>,
         any_up: HashSet<String>,
-        pre_session_disable: HashSet<String>,
+        /// feed → (latest pre-session `feed_disabled` marker ts, latest
+        /// pre-session up-kind row ts) — IST nanos; `None` = no such row.
+        pre_session_toggles: BTreeMap<String, (Option<i64>, Option<i64>)>,
     }
     let mut up_signals: Option<FeedUpSignals> = None;
     match exec_query(&client, questdb, &ws_sql).await {
@@ -2178,11 +2271,15 @@ pub async fn run_feed_scoreboard(
                 let mut ups = FeedUpSignals {
                     session_up: HashSet::new(),
                     any_up: HashSet::new(),
-                    pre_session_disable: HashSet::new(),
+                    pre_session_toggles: BTreeMap::new(),
                 };
+                // WS-GAP-04 wakes the dormant gate immediately re-parked
+                // (round 6, 2026-07-10 — MEDIUM): their SleepResumed rows
+                // are machinery artifacts, not up evidence.
+                let parked = parked_wake_indices(&rows);
                 let mut writer = FeedEpisodeAuditWriter::new(questdb);
                 let mut appended = 0_u64;
-                for ev in &rows {
+                for (idx, ev) in rows.iter().enumerate() {
                     // Reconnects on the headline card compare the two
                     // BROKER FEEDS — the order-update trading channel is
                     // excluded (round-2 hostile review 2026-07-10).
@@ -2191,12 +2288,25 @@ pub async fn run_feed_scoreboard(
                     }
                     if is_up_kind(&ev.event_kind) {
                         ups.any_up.insert(ev.feed.clone());
-                        if is_session_up_row(ev) {
-                            ups.session_up.insert(ev.feed.clone());
+                        if !parked.contains(&idx) {
+                            if is_session_up_row(ev) {
+                                ups.session_up.insert(ev.feed.clone());
+                            }
+                            if is_pre_session_up_row(ev) {
+                                let e = ups
+                                    .pre_session_toggles
+                                    .entry(ev.feed.clone())
+                                    .or_insert((None, None));
+                                e.1 = Some(e.1.map_or(ev.ts_ist_nanos, |t| t.max(ev.ts_ist_nanos)));
+                            }
                         }
                     }
                     if is_pre_session_feed_disable_row(ev) {
-                        ups.pre_session_disable.insert(ev.feed.clone());
+                        let e = ups
+                            .pre_session_toggles
+                            .entry(ev.feed.clone())
+                            .or_insert((None, None));
+                        e.0 = Some(e.0.map_or(ev.ts_ist_nanos, |t| t.max(ev.ts_ist_nanos)));
                     }
                     if let Some(episode) =
                         classify_ws_event_to_episode(ev, &corr, trading_date_ist_nanos)
@@ -2433,19 +2543,22 @@ pub async fn run_feed_scoreboard(
         }
     };
 
-    // 5b. Feed-off-day detection (round 4; redesigned round 5, 2026-07-10
-    //     — HIGH): a feed with a measured zero tick count, zero up-kind
-    //     rows INSIDE the session window, and either no up rows at all
-    //     (config-off) or a pre-session 'feed_disabled' toggle row (the
-    //     boot-connect-then-runtime-disable day) was switched off — its
-    //     row stamps the distinct 'feed_off' outcome (excluded from the
-    //     month sums) and the card says "no contest". Same-day runs
-    //     consult the runtime enabled flag so an enabled-but-dead-broker
-    //     day can NEVER be softened into feed_off (no disable row + a boot
-    //     up row keeps it loud on backfills too); a failed ws read claims
-    //     nothing. The keep-better arm preserves an existing 'feed_off'
-    //     row against a same-day evening rerun that re-measured zeros
-    //     with the feed now re-enabled for tomorrow.
+    // 5b. Feed-off-day detection (round 4; redesigned round 5; hardened
+    //     round 6, 2026-07-10): a feed with a measured zero tick count,
+    //     zero up-kind rows INSIDE the session window (parked WS-GAP-04
+    //     wakes excluded), and either no up rows at all (config-off) or a
+    //     pre-session 'feed_disabled' toggle row that is the LAST
+    //     pre-session toggle (state-at-open — a disable→re-enable flap
+    //     does NOT qualify) was switched off — its row stamps the
+    //     distinct 'feed_off' outcome (excluded from the month sums) and
+    //     the card says "no contest". The enabled-but-dead-broker day can
+    //     NEVER be softened into feed_off (no disable-at-open state + a
+    //     boot up row keeps it loud on same-day runs AND backfills); a
+    //     failed ws read claims nothing. The durable state-at-open marker
+    //     outranks the run-instant enabled flag (the 15:30–15:45
+    //     re-enable window). The keep-better arm preserves an existing
+    //     'feed_off' row against a same-day evening rerun that
+    //     re-measured zeros with the feed now re-enabled for tomorrow.
     let mut feed_off: BTreeMap<&'static str, bool> = BTreeMap::new();
     for feed in tickvault_common::feed::Feed::ALL {
         let label = feed.as_str();
@@ -2460,10 +2573,15 @@ pub async fn run_feed_scoreboard(
             }
         });
         let inferred = up_signals.as_ref().is_some_and(|ups| {
+            let (disable_ts, up_ts) = ups
+                .pre_session_toggles
+                .get(label)
+                .copied()
+                .unwrap_or((None, None));
             is_feed_off_day(
                 ups.session_up.contains(label),
                 ups.any_up.contains(label),
-                ups.pre_session_disable.contains(label),
+                pre_session_disable_is_state_at_open(disable_ts, up_ts),
                 ticks,
                 enabled_now,
             )
@@ -4218,11 +4336,13 @@ mod tests {
 
     #[test]
     fn test_is_feed_off_day_inference() {
-        // Round-4 MEDIUM (the round-2 finding), REDESIGNED round 5: a feed
-        // with measured-zero ticks, zero SESSION up rows, and either no up
-        // rows at all (config-off) or a pre-session disable marker
+        // Round-4 MEDIUM (the round-2 finding), REDESIGNED round 5,
+        // hardened round 6: a feed with measured-zero ticks, zero SESSION
+        // up rows, and either no up rows at all (config-off) or a
+        // pre-session disable marker that is the feed's STATE AT OPEN
         // (runtime-disabled) was switched off — never a one-horse win.
-        // Args: (session_up, any_up, pre_session_disable, ticks, enabled_now)
+        // Args: (session_up, any_up, disable_is_state_at_open, ticks,
+        //        enabled_now)
         assert!(
             is_feed_off_day(false, false, false, 0, None),
             "backfill, config-off all day (zero rows): data-only inference"
@@ -4416,6 +4536,196 @@ mod tests {
             !is_feed_off_day(true, true, true, 0, Some(false)),
             "a session up row always defeats feed_off"
         );
+    }
+
+    #[test]
+    fn test_pre_session_disable_is_state_at_open_flap_topology() {
+        // Round-6 MEDIUM: the disable marker qualifies feed_off only as
+        // the feed's STATE AT SESSION OPEN — a pre-session
+        // disable→re-enable flap (08:40 off, 08:50 back on) followed by a
+        // broker-dead session must stay the loud catastrophic
+        // measured-zero day on BOTH the same-day run and the backfill.
+        let disable_0840 = day_ts(8 * 3600 + 40 * 60);
+        let resume_0850 = day_ts(8 * 3600 + 50 * 60);
+        let resume = ev(
+            resume_0850,
+            "dhan",
+            "main_feed",
+            "sleep_resumed",
+            "n/a",
+            -1,
+            false,
+        );
+        assert!(
+            is_pre_session_up_row(&resume),
+            "08:50 resume is pre-session"
+        );
+        let state_at_open =
+            pre_session_disable_is_state_at_open(Some(disable_0840), Some(resume_0850));
+        assert!(
+            !state_at_open,
+            "the 08:50 re-enable is the LAST pre-session toggle — the \
+             08:40 marker is not the state at open"
+        );
+        assert!(
+            !is_feed_off_day(false, true, state_at_open, 0, Some(false)),
+            "flap + broker-dead session, same-day run: NOT feed_off"
+        );
+        assert!(
+            !is_feed_off_day(false, true, state_at_open, 0, None),
+            "flap + broker-dead session, backfill: NOT feed_off"
+        );
+        // Unit sweep of the state-at-open comparison.
+        assert!(pre_session_disable_is_state_at_open(Some(10), None));
+        assert!(pre_session_disable_is_state_at_open(Some(20), Some(10)));
+        assert!(!pre_session_disable_is_state_at_open(Some(10), Some(20)));
+        assert!(
+            !pre_session_disable_is_state_at_open(Some(10), Some(10)),
+            "equal-ts tie resolves NOT-off (conservative: stays loud)"
+        );
+        assert!(!pre_session_disable_is_state_at_open(None, Some(10)));
+        assert!(!pre_session_disable_is_state_at_open(None, None));
+    }
+
+    #[test]
+    fn test_is_pre_session_up_row_bounds() {
+        // Pre-session up-row bound sweep: [09:00, 09:15) rows are BOTH
+        // session-window and pre-session; 09:15:00 is neither pre-session
+        // nor (for a 15:40 resume) session-scoped.
+        let up_at = |secs: i64| {
+            ev(
+                day_ts(secs),
+                "dhan",
+                "main_feed",
+                "connected",
+                "n/a",
+                -1,
+                false,
+            )
+        };
+        assert!(is_pre_session_up_row(&up_at(9 * 3600 + 14 * 60 + 59)));
+        assert!(!is_pre_session_up_row(&up_at(
+            SESSION_START_SECS_OF_DAY_IST
+        )));
+        let down = ev(
+            day_ts(8 * 3600),
+            "dhan",
+            "main_feed",
+            "disconnected",
+            "n/a",
+            -1,
+            false,
+        );
+        assert!(!is_pre_session_up_row(&down), "down kinds never count");
+    }
+
+    #[test]
+    fn test_parked_wake_indices_disable_while_sleeping() {
+        // Round-6 MEDIUM: the WS-GAP-04 wake emits SleepResumed at
+        // ~09:00:00 BEFORE the dormant gate parks the connection and
+        // stamps the feed_disabled marker (~09:00:01) — that wake row is
+        // machinery, not up evidence, and must not defeat feed_off on a
+        // disabled-while-sleeping day.
+        let wake = ev(
+            day_ts(9 * 3600),
+            "dhan",
+            "main_feed",
+            "sleep_resumed",
+            "n/a",
+            -1,
+            true,
+        );
+        let park = ev(
+            day_ts(9 * 3600 + 1),
+            "dhan",
+            "main_feed",
+            "sleep_entered",
+            FEED_DISABLE_SOURCE,
+            -1,
+            true,
+        );
+        let rows = vec![wake.clone(), park.clone()];
+        let parked = parked_wake_indices(&rows);
+        assert!(parked.contains(&0), "wake immediately re-parked is PARKED");
+        assert!(!parked.contains(&1));
+        // The paired day classifies feed_off: no session up (wake
+        // excluded), marker is the state at open, zero ticks.
+        assert!(is_session_up_row(&wake), "raw row IS session-window up");
+        let state_at_open = pre_session_disable_is_state_at_open(Some(park.ts_ist_nanos), None);
+        assert!(is_feed_off_day(false, true, state_at_open, 0, Some(false)));
+        // Control: an unpaired wake (feed re-enabled / genuinely resumed)
+        // stays a session up row.
+        assert!(
+            parked_wake_indices(&rows[..1]).is_empty(),
+            "no marker → not parked"
+        );
+        // Cross-key markers never pair.
+        let other_conn = WsAuditEventLite {
+            connection_index: 1,
+            ..park.clone()
+        };
+        assert!(
+            parked_wake_indices(&[wake.clone(), other_conn]).is_empty(),
+            "different connection_index → not parked"
+        );
+        let other_feed = WsAuditEventLite {
+            feed: "groww".to_string(),
+            ws_type: "groww_bridge".to_string(),
+            ..park.clone()
+        };
+        assert!(
+            parked_wake_indices(&[wake.clone(), other_feed]).is_empty(),
+            "different feed → not parked"
+        );
+        // A marker outside the pairing window (a later, unrelated
+        // disable) never retro-parks a genuine wake.
+        let late_marker = WsAuditEventLite {
+            ts_ist_nanos: day_ts(9 * 3600) + PARKED_WAKE_PAIR_WINDOW_NANOS + NANOS_PER_SEC,
+            ..park.clone()
+        };
+        assert!(
+            parked_wake_indices(&[wake.clone(), late_marker]).is_empty(),
+            "marker beyond the pairing window → not parked"
+        );
+        // A marker BEFORE the wake never pairs (ordering matters).
+        let earlier_marker = WsAuditEventLite {
+            ts_ist_nanos: day_ts(9 * 3600) - NANOS_PER_SEC,
+            ..park
+        };
+        assert!(
+            parked_wake_indices(&[wake, earlier_marker]).is_empty(),
+            "marker before the wake → not parked"
+        );
+    }
+
+    #[test]
+    fn test_feed_off_marker_outranks_live_flag_reenable_window() {
+        // Round-6 LOW: the durable state-at-open marker outranks the
+        // run-instant enabled flag — disable 08:40 (no later pre-session
+        // up), re-enable 15:40 for tomorrow, first run 15:45 with
+        // runtime_enabled_now = Some(true): still feed_off (the 15:40
+        // resume row is neither a session up row nor pre-session).
+        let evening_resume = ev(
+            day_ts(15 * 3600 + 40 * 60),
+            "groww",
+            "groww_bridge",
+            "connected",
+            "groww_subscribed",
+            -1,
+            false,
+        );
+        assert!(!is_session_up_row(&evening_resume), "15:40 is post-session");
+        assert!(!is_pre_session_up_row(&evening_resume));
+        let state_at_open =
+            pre_session_disable_is_state_at_open(Some(day_ts(8 * 3600 + 40 * 60)), None);
+        assert!(state_at_open);
+        assert!(
+            is_feed_off_day(false, true, state_at_open, 0, Some(true)),
+            "disable 08:40 + re-enable 15:40 + first run 15:45 => feed_off"
+        );
+        // The Some(true) veto stays load-bearing for the NO-marker
+        // enabled-but-broker-dead arm.
+        assert!(!is_feed_off_day(false, true, false, 0, Some(true)));
     }
 
     #[test]

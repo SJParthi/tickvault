@@ -65,40 +65,55 @@ per-column guard, plus a `*_days` measured-day count so a low total from
 few measured days is never misread as a good month:
 
 ```sql
-SELECT feed, count() days,
-       sum(case when unique_win_minutes >= 0 then unique_win_minutes else 0 end) unique_mins,
-       sum(case when unique_win_minutes >= 0 then 1 else 0 end) unique_mins_days,
-       sum(case when ticks_captured >= 0 then ticks_captured else 0 end) ticks,
-       sum(case when ticks_captured >= 0 then 1 else 0 end) ticks_days,
-       max(lag_max_ms) worst_ms,
-       sum(case when disconnects_market >= 0 then disconnects_market else 0 end) drops,
-       sum(case when disconnects_market >= 0 then 1 else 0 end) drops_days,
-       sum(case when blame_broker >= 0 then blame_broker else 0 end) broker,
-       sum(case when blame_ours >= 0 then blame_ours else 0 end) ours,
-       sum(case when blame_indeterminate >= 0 then blame_indeterminate else 0 end) unclear,
-       sum(case when stalls >= 0 then stalls else 0 end) stalls,
-       avg(uptime_pct) uptime,
-       sum(case when partial_coverage then 1 else 0 end) partial_days
-FROM feed_scoreboard_daily
-WHERE trading_date_ist >= '2026-07-01' AND trading_date_ist < '2026-08-01'
-  AND trading_date_ist NOT IN (
-    SELECT trading_date_ist FROM feed_scoreboard_daily
+SELECT s.feed, count() days,
+       sum(case when s.unique_win_minutes >= 0 then s.unique_win_minutes else 0 end) unique_mins,
+       sum(case when s.unique_win_minutes >= 0 then 1 else 0 end) unique_mins_days,
+       sum(case when s.ticks_captured >= 0 then s.ticks_captured else 0 end) ticks,
+       sum(case when s.ticks_captured >= 0 then 1 else 0 end) ticks_days,
+       max(s.lag_max_ms) worst_ms,
+       sum(case when s.disconnects_market >= 0 then s.disconnects_market else 0 end) drops,
+       sum(case when s.disconnects_market >= 0 then 1 else 0 end) drops_days,
+       sum(case when s.blame_broker >= 0 then s.blame_broker else 0 end) broker,
+       sum(case when s.blame_ours >= 0 then s.blame_ours else 0 end) ours,
+       sum(case when s.blame_indeterminate >= 0 then s.blame_indeterminate else 0 end) unclear,
+       sum(case when s.stalls >= 0 then s.stalls else 0 end) stalls,
+       avg(s.uptime_pct) uptime,
+       sum(case when s.partial_coverage then 1 else 0 end) partial_days
+FROM feed_scoreboard_daily s
+LEFT JOIN (
+    SELECT DISTINCT trading_date_ist FROM feed_scoreboard_daily
     WHERE outcome = 'feed_off'
       AND trading_date_ist >= '2026-07-01'
-      AND trading_date_ist < '2026-08-01')
-GROUP BY feed;
+      AND trading_date_ist < '2026-08-01') off
+  ON s.trading_date_ist = off.trading_date_ist
+WHERE off.trading_date_ist IS NULL
+  AND s.trading_date_ist >= '2026-07-01' AND s.trading_date_ist < '2026-08-01'
+GROUP BY s.feed;
 ```
+
+**⚠ QuestDB SQL dialect (round 6, 2026-07-10 — verified live on the pinned
+9.3.5):** the engine does NOT support `IN (SELECT …)` / `NOT IN (SELECT …)`
+subqueries against a TIMESTAMP column — it fails with
+`cannot compare TIMESTAMP with type CURSOR` (IN accepts only literal
+lists). The round-5 form of this query used `trading_date_ist NOT IN
+(SELECT …)` and errored on the first copy-paste. The LEFT JOIN
+anti-join above (`LEFT JOIN (SELECT DISTINCT …) off ON s.trading_date_ist
+= off.trading_date_ist WHERE off.trading_date_ist IS NULL`) is the
+execution-verified replacement shape — do NOT "simplify" it back to a
+`NOT IN` subquery in a future edit. (A two-step fallback also works:
+first `SELECT DISTINCT trading_date_ist … WHERE outcome='feed_off'`, then
+paste the dates as a literal `NOT IN ('…','…')` list.)
 
 **The feed_off exclusion is DAY-level, not row-level (round 5,
 2026-07-10):** a row-level `outcome != 'feed_off'` filter removes only the
 OFF feed's row while the SURVIVING feed's row for the same day still sums
 — its numbers are one-horse (no competitor to lose a minute to). The
-`NOT IN` subquery above drops the WHOLE no-contest day for BOTH feeds,
+anti-join above drops the WHOLE no-contest day for BOTH feeds,
 which is what the daily card's "this day does not count toward the month
 verdict" footnote promises. Belt-and-braces: since round 5 the writer also
 stamps the surviving feed's `unique_win_minutes`/`both_minutes` with the
 `-1` sentinel on a feed-off day (exclusive-vs-nothing is not a
-measurement), so even a query that forgets the subquery no longer inflates
+measurement), so even a query that forgets the anti-join no longer inflates
 `unique_mins` — but ticks/uptime/blame on the partner row remain one-horse
 context, hence the day-level exclusion stays the documented form.
 
@@ -135,26 +150,43 @@ WHERE outcome = 'feed_off'
 ORDER BY trading_date_ist;
 ```
 
-  Detection (redesigned round 5, 2026-07-10): measured-zero ticks + zero
-  up-kind connection rows INSIDE the session window ([09:00, 15:30) IST —
-  the ~08:33 boot Connected row every config-enabled feed writes no longer
-  defeats the runtime-disable day) + either NO up rows at all (config-off)
-  or a PRE-session `source='feed_disabled'` toggle row (the
-  boot-connect-then-/api/feeds-disable day). A boot up row WITHOUT a
-  disable marker is an ENABLED-but-dead-broker day — a real catastrophic
-  measured zero, never softened into feed_off (on same-day runs the live
-  runtime flag enforces this too). An existing feed_off row is also
-  keep-better-protected: a same-day evening rerun with the feed re-enabled
-  for tomorrow (zero ticks re-measured) keeps feed_off and logs
-  `stage="outcome_regression"`; a rerun that measured REAL ticks may
-  upgrade. Honest residual: on a PAST-day backfill the inference is
-  data-only — an enabled feed that never achieved a single successful
-  connect ALL day (zero rows entirely) is indistinguishable from
-  config-off.
+  Detection (redesigned round 5, hardened round 6, 2026-07-10):
+  measured-zero ticks + zero up-kind connection rows INSIDE the session
+  window ([09:00, 15:30) IST — the ~08:33 boot Connected row every
+  config-enabled feed writes no longer defeats the runtime-disable day; a
+  WS-GAP-04 wake's ~09:00:00 SleepResumed row that the dormant gate
+  immediately re-parked with a `feed_disabled` marker within seconds is
+  machinery, not up evidence, and is excluded too — the
+  disabled-while-sleeping overnight shape) + either NO up rows at all
+  (config-off) or a PRE-session `source='feed_disabled'` toggle row that
+  is the feed's STATE AT SESSION OPEN — i.e. the LAST pre-session toggle
+  (round 6: a disable→re-enable flap, 08:40 off / 08:50 back on, does NOT
+  qualify — the broker-dead session after it stays a loud catastrophic
+  measured zero). A boot up row WITHOUT a disable-at-open state is an
+  ENABLED-but-dead-broker day — never softened into feed_off (the live
+  runtime flag additionally blocks the NO-marker arm on same-day runs).
+  The durable state-at-open marker OUTRANKS the run-instant flag (round
+  6): re-enabling the day-long-disabled feed for tomorrow between 15:30
+  and the 15:45 trigger no longer stamps the day complete-with-zeros. An
+  existing feed_off row is also keep-better-protected: a same-day evening
+  rerun with the feed re-enabled for tomorrow (zero ticks re-measured)
+  keeps feed_off and logs `stage="outcome_regression"`; a rerun that
+  measured REAL ticks may upgrade. Honest residuals: (a) on a PAST-day
+  backfill the inference is data-only — an enabled feed that never
+  achieved a single successful connect ALL day (zero rows entirely) is
+  indistinguishable from config-off; (b) a Groww disable that lands while
+  the bridge is ALREADY disconnected writes NO `feed_disabled` marker (the
+  falling-edge row is latched on a prior connected state), so that day
+  reads catastrophic broker-dead, not feed_off — conservative direction
+  (stays loud, never softens); (c) a pre-session disable→re-enable where
+  the re-enable produces NO up row (broker already dead at the re-enable
+  instant) still reads state-at-open OFF and classifies feed_off —
+  narrow, and only reachable via a same-morning flap onto a dead broker.
 
 Per-day winner drill (tiebreak = lag_p99 where measured; the same
 day-level feed_off exclusion applies — a no-contest day would otherwise
-join here as a `-1`-vs-0 line):
+join here as a `-1`-vs-0 line; same anti-join shape as §2's month verdict
+— QuestDB rejects `NOT IN (SELECT …)` on TIMESTAMP):
 
 ```sql
 SELECT d.trading_date_ist, d.unique_win_minutes dhan_mins, g.unique_win_minutes groww_mins,
@@ -163,9 +195,11 @@ SELECT d.trading_date_ist, d.unique_win_minutes dhan_mins, g.unique_win_minutes 
 FROM (SELECT * FROM feed_scoreboard_daily WHERE feed = 'dhan') d
 JOIN (SELECT * FROM feed_scoreboard_daily WHERE feed = 'groww') g
   ON d.trading_date_ist = g.trading_date_ist
-WHERE d.trading_date_ist NOT IN (
-    SELECT trading_date_ist FROM feed_scoreboard_daily
-    WHERE outcome = 'feed_off')
+LEFT JOIN (
+    SELECT DISTINCT trading_date_ist FROM feed_scoreboard_daily
+    WHERE outcome = 'feed_off') off
+  ON d.trading_date_ist = off.trading_date_ist
+WHERE off.trading_date_ist IS NULL
 ORDER BY d.trading_date_ist;
 ```
 

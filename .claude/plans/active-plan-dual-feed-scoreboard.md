@@ -488,6 +488,48 @@ forensic tables:
   - Files: crates/app/src/feed_scoreboard_boot.rs, crates/core/src/websocket/connection.rs, docs/runbooks/dual-feed-scoreboard.md, .claude/rules/project/dual-feed-scoreboard-error-codes.md
   - Tests: test_target_within_evidence_retention_gates_run_partial_and_keep_better, test_is_feed_off_day_inference, test_feed_off_topology_runtime_disable_at_0840_vs_broker_dead_day, test_apply_minute_overlap_and_feed_off_sentinels, test_should_keep_feed_off_outcome_evening_rerun_preserves_no_contest, test_catchup_rerun_is_redundant_terminal_outcomes
 
+- [x] Item 13 — Hostile-review round 6 fixes (2026-07-10)
+  - HIGH ×2 (same root — runbook SQL unrunnable on the pinned QuestDB):
+    QuestDB 9.3.5 REJECTS `IN (SELECT …)` / `NOT IN (SELECT …)` against a
+    TIMESTAMP column ("cannot compare TIMESTAMP with type CURSOR" —
+    verified live by the review agents). Both canonical runbook queries
+    (the §2 month-end cumulative verdict SQL and the per-day winner
+    drill) are rewritten with the execution-verified LEFT JOIN anti-join
+    shape (`LEFT JOIN (SELECT DISTINCT trading_date_ist … WHERE
+    outcome='feed_off' …) off ON s.trading_date_ist =
+    off.trading_date_ist WHERE off.trading_date_ist IS NULL`), plus a
+    dialect note pinning the rejection so future edits don't regress to
+    the subquery form.
+  - MEDIUM (existence-based disable qualifier softens a flap +
+    broker-dead day): the feed_off qualifier is now STATE-AT-SESSION-OPEN
+    — the fold tracks per feed the LATEST pre-session `feed_disabled`
+    marker ts AND the latest pre-session up-kind row ts
+    (`pre_session_toggles: BTreeMap<String,(Option<i64>,Option<i64>)>`,
+    same single ws_event_audit read) and
+    `pre_session_disable_is_state_at_open` qualifies only when the
+    disable marker is the LAST pre-session toggle. The 08:40-disable /
+    08:50-re-enable flap followed by a dead-broker session stays the loud
+    catastrophic measured-zero day on both `Some(false)` and `None`.
+  - MEDIUM (WS-GAP-04 wake defeats feed_off on disable-while-sleeping
+    days): the ~09:00:00 SleepResumed row is emitted BEFORE the dormant
+    gate parks the connection and stamps the `feed_disabled` marker
+    (~09:00:01) — a session-up row for a feed that never streamed.
+    Scoreboard-side pairing fix (the WS wake path is untouched):
+    `parked_wake_indices` excludes a `sleep_resumed` row followed within
+    `PARKED_WAKE_PAIR_WINDOW_NANOS` (10s) by a `feed_disabled` marker for
+    the same (feed, ws_type, connection_index) from BOTH up signals.
+  - LOW (marker outranks the live flag — the 15:30–15:45 re-enable
+    window): with the state-at-open qualifier holding + zero session ups
+    + zero ticks, `is_feed_off_day` classifies feed_off even when
+    `runtime_enabled_now == Some(true)`; the `Some(true)` veto stays
+    load-bearing only for the NO-marker enabled-but-broker-dead arm.
+  - LOW (doc): the runbook honest-residuals list now names (b) the Groww
+    disable-while-disconnected suppressed-marker day (reads catastrophic,
+    not feed_off — conservative) and (c) the flap-onto-dead-broker
+    residual of the state-at-open design.
+  - Files: crates/app/src/feed_scoreboard_boot.rs, docs/runbooks/dual-feed-scoreboard.md, .claude/rules/project/dual-feed-scoreboard-error-codes.md
+  - Tests: test_pre_session_disable_is_state_at_open_flap_topology, test_parked_wake_indices_disable_while_sleeping, test_feed_off_marker_outranks_live_flag_reenable_window, test_is_pre_session_up_row_bounds, test_is_feed_off_day_inference, test_feed_off_topology_runtime_disable_at_0840_vs_broker_dead_day
+
 ## Scenarios
 
 | # | Scenario | Expected |

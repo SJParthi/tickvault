@@ -114,20 +114,30 @@ the month restart count under-counts — annotate the month summary.
    counts as a floor, not a truth — the runbook's month-end checklist
    excludes/annotates them.
 5. `outcome='feed_off'` days (round 4, 2026-07-10; detection REDESIGNED
-   round 5): the feed was switched off for the day — measured-zero ticks
-   + zero up-kind rows INSIDE the session window ([09:00, 15:30) IST — the
-   ~08:33 boot Connected row no longer defeats the /api/feeds
-   runtime-disable day) + either no up rows at all (config-off) or a
-   pre-session `source='feed_disabled'` toggle row (both feeds stamp the
-   same slug: the Groww bridge disable falling edge; the Dhan
-   dormant-entry SleepEntered row). A boot up row WITHOUT a disable marker
-   is an ENABLED-but-dead-broker day and is never softened into feed_off
-   (same-day runs additionally consult the runtime enabled flag). The
-   PARTNER feed's `unique_win_minutes`/`both_minutes` stamp the `-1`
-   sentinel on such a day (exclusive-vs-nothing is not a measurement).
-   The card says "no contest" and the runbook month SQL excludes the
-   WHOLE no-contest day (day-level `NOT IN` subquery — a row-level filter
-   left the surviving feed's one-horse row summing into the verdict).
+   round 5, HARDENED round 6): the feed was switched off for the day —
+   measured-zero ticks + zero up-kind rows INSIDE the session window
+   ([09:00, 15:30) IST — the ~08:33 boot Connected row no longer defeats
+   the /api/feeds runtime-disable day, and a WS-GAP-04 wake's ~09:00:00
+   SleepResumed row immediately re-parked by the dormant gate with a
+   `feed_disabled` marker is excluded as machinery, round 6) + either no
+   up rows at all (config-off) or a pre-session
+   `source='feed_disabled'` toggle row that is the feed's STATE AT
+   SESSION OPEN — the LAST pre-session toggle (round 6: a
+   disable→re-enable flap does NOT qualify; both feeds stamp the same
+   slug: the Groww bridge disable falling edge; the Dhan dormant-entry
+   SleepEntered row). A boot up row WITHOUT a disable-at-open state is an
+   ENABLED-but-dead-broker day and is never softened into feed_off (the
+   runtime enabled flag additionally blocks the NO-marker arm on same-day
+   runs; the durable marker itself OUTRANKS the run-instant flag, so a
+   15:30–15:45 re-enable-for-tomorrow no longer stamps the day
+   complete-with-zeros). The PARTNER feed's
+   `unique_win_minutes`/`both_minutes` stamp the `-1` sentinel on such a
+   day (exclusive-vs-nothing is not a measurement). The card says "no
+   contest" and the runbook month SQL excludes the WHOLE no-contest day
+   (day-level LEFT JOIN anti-join since round 6 — QuestDB 9.3.5 rejects
+   `NOT IN (SELECT …)` on TIMESTAMP with "cannot compare TIMESTAMP with
+   type CURSOR"; a row-level filter left the surviving feed's one-horse
+   row summing into the verdict).
 
 **Honest envelope:** the scoreboard is evidence, not proof. Lone mid-stream
 resets are honestly `indeterminate` (the `disconnect_cause.rs` envelope);
