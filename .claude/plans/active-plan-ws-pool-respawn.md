@@ -1,6 +1,6 @@
 # Implementation Plan: WS-GAP-05 pool-slot supervised respawn (W2 PR #8)
 
-**Status:** APPROVED
+**Status:** VERIFIED
 **Date:** 2026-07-10
 **Approved by:** Parthiban (operator) — Wave-2 coordinator directive, PR #8 of the wave ("treat as a bug fix — docs-vs-code drift where the DOCS are the contract")
 
