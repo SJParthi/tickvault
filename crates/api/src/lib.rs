@@ -110,6 +110,25 @@ pub fn build_router_with_auth(
     auth_config: ApiAuthConfig,
     _feed_toggle_public: bool,
 ) -> Router {
+    // API bearer-auth 401 counter pre-registration (2026-07-10, wave-2 #2):
+    // the CW agent's prometheus pipeline drops each counter series' FIRST
+    // sample as its delta baseline, and tv_api_auth_failed_total increments
+    // ONLY on a bearer-auth rejection (middleware.rs::require_bearer_auth,
+    // all 3 rejection arms). Without a boot-time registration the series is
+    // born AT the first 401 and the dropped baseline sample eats part of the
+    // session's first burst — silently raising the tv-<env>-api-auth-failed
+    // alarm's effective threshold (deploy/aws/terraform/auth-failed-alarm.tf,
+    // Sum >= 25 per 300s). Registering at 0 HERE — router construction, the
+    // single choke point BOTH boot paths call — is provably before the first
+    // possible 401 (the server cannot serve a request before its router
+    // exists) and runs after the boot Step-3 recorder install (main.rs calls
+    // observability::init_metrics before either API-server spawn; ratcheted
+    // by the source-order scan in
+    // crates/app/tests/auth_failed_alarm_wiring_guard.rs), so the series is
+    // DENSE from API-server start (a 0-delta /metrics event per 60s scrape)
+    // and the alarm sees every 401, including the first.
+    metrics::counter!("tv_api_auth_failed_total").increment(0);
+
     let cors = build_cors_layer(allowed_origins);
 
     // PR #6b (2026-05-19): /api/instruments/rebuild route RETIRED.
