@@ -276,7 +276,7 @@ fn test_auth_failed_alarm_filter_matches_emitted_series_shape() {
         "host=\"$.host\"",
         "namespace=\"Tickvault/Prod\"",
         // Alarm side. namespace/dimensions use the shared locals — the
-        // locals resolve to \"Tickvault/Prod\" / { host = \"tickvault-prod\" }
+        // locals resolve to "Tickvault/Prod" / { host = "tickvault-prod" }
         // (app-alarms.tf), pairing with the filter's hardcoded namespace +
         // $.host dimension above; both sides pinned so they cannot split.
         "statistic=\"Sum\"",
