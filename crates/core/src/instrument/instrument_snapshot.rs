@@ -67,14 +67,17 @@ pub const CACHE_BASE_DIR: &str = "data/instrument-cache";
 /// File name prefix. The full name is `plan-snapshot-YYYY-MM-DD.json`.
 const SNAPSHOT_PREFIX: &str = "plan-snapshot-";
 
-/// Snapshot format version (§36 2026-07-08). Format 2 = carries the
-/// `index_future` role + the optional segment/expiry/underlying fields.
-/// The loader REJECTS `format < PLAN_SNAPSHOT_FORMAT_CURRENT` → one
-/// deterministic cold build on deploy day (instead of a silent futures-less
-/// warm boot). The gate is keyed on FORMAT, never on futures COUNT — a
-/// legitimately degraded zero-futures day writes a format-2 snapshot that
+/// Snapshot format version (§36 2026-07-08; §36.7 2026-07-10). Format 2 =
+/// carries the `index_future` role + the optional segment/expiry/underlying
+/// fields. Format 3 (§36.7) = multiple `index_future` targets per underlying
+/// are legal (one per monthly expiry); the loader REJECTS
+/// `format < PLAN_SNAPSHOT_FORMAT_CURRENT` → one deterministic cold build on
+/// deploy day (a stale nearest-only snapshot never warm-boots a single-future
+/// day after the all-months code lands — the same doctrine the v2 bump
+/// established). The gate is keyed on FORMAT, never on futures COUNT — a
+/// legitimately degraded zero-futures day writes a format-3 snapshot that
 /// warm boots ACCEPT (no cold-rebuild loop).
-pub const PLAN_SNAPSHOT_FORMAT_CURRENT: u32 = 2;
+pub const PLAN_SNAPSHOT_FORMAT_CURRENT: u32 = 3;
 
 /// One subscription target, reduced to exactly the fields the plan-builder
 /// consumes. `role` is the stable wire-format label from
@@ -120,8 +123,8 @@ pub struct PlanSnapshot {
     /// written by pre-§36 code, which the loader rejects → cold build.
     #[serde(default)]
     pub format: u32,
-    /// The ~331 subscription targets (indices + F&O underlyings + the ≤4
-    /// §36 index futures).
+    /// The ~343 subscription targets (indices + F&O underlyings + the §36.7
+    /// all-months index futures, ~12 typical).
     pub targets: Vec<SnapshotTarget>,
 }
 
@@ -191,11 +194,14 @@ pub fn to_universe(snapshot: &PlanSnapshot) -> Option<DailyUniverse> {
     // §36 hostile-review round 4 (2026-07-08): per-future dedup state —
     // exact-duplicate entries (same composite (security_id, segment)) are
     // collapsed first-entry-wins so a corrupt snapshot can't fire a spurious
-    // planner-drop FUTIDX-01; a SECOND DISTINCT SID for the same canonical
-    // underlying is fail-closed (the writer only ever emits one contract per
-    // underlying — two is corruption; mirrors AmbiguousDuplicateExpiry).
+    // planner-drop FUTIDX-01. §36.7 (2026-07-10): the fail-closed corruption
+    // unit is per-(canonical, expiry_date) — the writer legitimately emits
+    // one contract per (underlying, monthly expiry), so distinct expiries
+    // per canonical are LEGAL; a SECOND DISTINCT SID for the SAME
+    // (canonical, expiry) is corruption (mirrors AmbiguousDuplicateExpiry).
     let mut seen_future_keys: Vec<(String, String)> = Vec::new();
-    let mut seen_future_canonicals: Vec<String> = Vec::new();
+    let mut seen_future_canonical_expiries: std::collections::HashSet<(String, String)> =
+        std::collections::HashSet::new();
     for t in &snapshot.targets {
         let role = parse_role(&t.role)?;
         let mut csv_row = CsvRow {
@@ -248,16 +254,17 @@ pub fn to_universe(snapshot: &PlanSnapshot) -> Option<DailyUniverse> {
             }
             // Round 4 dedup (see the state comment above): exact composite
             // duplicate → skip (never a spurious planner-drop FUTIDX-01);
-            // distinct SID for an already-seen canonical → fail closed.
+            // distinct SID for an already-seen (canonical, expiry) → fail
+            // closed (§36.7: distinct expiries per canonical are LEGAL).
             let key = (csv_row.security_id.clone(), csv_row.segment.clone());
             if seen_future_keys.contains(&key) {
                 continue;
             }
-            if seen_future_canonicals.contains(&canonical) {
+            let expiry_trimmed = csv_row.expiry_date.trim().to_string();
+            if !seen_future_canonical_expiries.insert((canonical, expiry_trimmed)) {
                 return None;
             }
             seen_future_keys.push(key);
-            seen_future_canonicals.push(canonical);
         }
         // Derive the membership flags from `role` when the snapshot left them
         // at the serde default (`false`) — a snapshot written by pre-Sub-PR-#5
@@ -863,20 +870,45 @@ mod tests {
 
         const INDEX_COUNT: usize = 3;
         const UNDERLYING_COUNT: usize = 328; // 3 + 328 = 331, the live size
-        const FUTURE_COUNT: usize = 4; // §36 FUTIDX-4
+        const FUTURE_COUNT: usize = 12; // §36.7: 3 months × 4 underlyings
         let mut targets = Vec::with_capacity(INDEX_COUNT + UNDERLYING_COUNT + FUTURE_COUNT);
         targets.push(target(InstrumentRole::Index, "13", "NIFTY"));
         targets.push(target(InstrumentRole::Index, "25", "BANKNIFTY"));
         targets.push(target(InstrumentRole::Index, "51", "SENSEX"));
-        targets.push(target_future("35001", "NIFTY", "NSE_FNO", "2026-07-30"));
-        targets.push(target_future("35002", "BANKNIFTY", "NSE_FNO", "2026-07-30"));
-        targets.push(target_future(
-            "35003",
-            "MIDCPNIFTY",
-            "NSE_FNO",
-            "2026-07-28",
-        ));
-        targets.push(target_future("45001", "SENSEX", "BSE_FNO", "2026-07-31"));
+        for (month_idx, (nse_expiry, bse_expiry)) in [
+            ("2026-07-30", "2026-07-31"),
+            ("2026-08-27", "2026-08-28"),
+            ("2026-09-24", "2026-09-25"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let base = 35_000 + month_idx * 1_000;
+            targets.push(target_future(
+                &format!("{base}"),
+                "NIFTY",
+                "NSE_FNO",
+                nse_expiry,
+            ));
+            targets.push(target_future(
+                &format!("{}", base + 1),
+                "BANKNIFTY",
+                "NSE_FNO",
+                nse_expiry,
+            ));
+            targets.push(target_future(
+                &format!("{}", base + 2),
+                "MIDCPNIFTY",
+                "NSE_FNO",
+                nse_expiry,
+            ));
+            targets.push(target_future(
+                &format!("{}", 45_000 + month_idx * 1_000),
+                "SENSEX",
+                "BSE_FNO",
+                bse_expiry,
+            ));
+        }
         for i in 0..UNDERLYING_COUNT {
             // 10000+ keeps ids well clear of the 3 index ids above; all unique.
             let sid = (10_000 + i).to_string();
@@ -1075,29 +1107,37 @@ mod tests {
         );
     }
 
-    /// Hostile-review round 4 (2026-07-08): duplicate IndexFuture entries in
-    /// a corrupt snapshot. EXACT duplicates (same SID + segment) are DEDUPED
-    /// first-entry-wins — previously they reached the planner, whose
-    /// composite-key dedup collapsed them and fired a spurious planner-drop
-    /// FUTIDX-01. A DISTINCT SID for an already-seen canonical underlying is
-    /// fail-closed (the writer only ever emits one contract per underlying).
-    #[test]
-    fn test_snapshot_index_future_duplicate_entries_deduped_or_fail_closed() {
-        let fut = |sid: &str| SnapshotTarget {
+    /// Snapshot-fixture future entry builder for the §36.7 dedup tests.
+    fn fut_target(sid: &str, expiry: &str) -> SnapshotTarget {
+        SnapshotTarget {
             role: "index_future".to_string(),
             security_id: sid.to_string(),
-            symbol_name: "NIFTY-Jul2026-FUT".to_string(),
+            symbol_name: format!("NIFTY-{expiry}-FUT"),
             is_fno_underlying: false,
             is_index_constituent: false,
             segment: Some("NSE_FNO".to_string()),
-            expiry_date: Some("2026-07-30".to_string()),
+            expiry_date: Some(expiry.to_string()),
             underlying_symbol: Some("NIFTY".to_string()),
-        };
+        }
+    }
+
+    /// Hostile-review round 4 (2026-07-08), re-keyed §36.7 (2026-07-10):
+    /// duplicate IndexFuture entries in a corrupt snapshot. EXACT duplicates
+    /// (same SID + segment) are DEDUPED first-entry-wins — previously they
+    /// reached the planner, whose composite-key dedup collapsed them and
+    /// fired a spurious planner-drop FUTIDX-01. A DISTINCT SID for an
+    /// already-seen (canonical, expiry) is fail-closed (the writer only
+    /// ever emits one contract per (underlying, month) — two is corruption).
+    #[test]
+    fn test_snapshot_index_future_same_expiry_distinct_sids_fail_closed() {
         // EXACT duplicate (same SID) → deduped to ONE target, snapshot OK.
         let snap = PlanSnapshot {
             trading_date_ist: "2026-07-08".to_string(),
             format: PLAN_SNAPSHOT_FORMAT_CURRENT,
-            targets: vec![fut("35001"), fut("35001")],
+            targets: vec![
+                fut_target("35001", "2026-07-30"),
+                fut_target("35001", "2026-07-30"),
+            ],
         };
         let uni = to_universe(&snap).expect("exact duplicate is deduped, not fatal");
         assert_eq!(
@@ -1106,16 +1146,63 @@ mod tests {
             "exact-duplicate future entries collapse first-entry-wins"
         );
         assert_eq!(uni.subscription_targets[0].csv_row.security_id, "35001");
-        // DISTINCT SID for the SAME canonical underlying → fail closed.
+        // DISTINCT SID for the SAME (canonical, expiry) → fail closed.
         let snap2 = PlanSnapshot {
             trading_date_ist: "2026-07-08".to_string(),
             format: PLAN_SNAPSHOT_FORMAT_CURRENT,
-            targets: vec![fut("35001"), fut("35099")],
+            targets: vec![
+                fut_target("35001", "2026-07-30"),
+                fut_target("35099", "2026-07-30"),
+            ],
         };
         assert!(
             to_universe(&snap2).is_none(),
-            "two DISTINCT SIDs for one underlying is corruption — fail closed"
+            "two DISTINCT SIDs for one (underlying, expiry) is corruption — fail closed"
         );
+    }
+
+    /// §36.7 (2026-07-10): distinct expiries per canonical are LEGAL — the
+    /// direct inversion of the pre-all-months per-canonical fail-closed arm
+    /// (which would have rejected EVERY valid multi-month snapshot →
+    /// permanent cold-build, warm path dead).
+    #[test]
+    fn test_snapshot_index_future_distinct_expiries_per_underlying_accepted() {
+        let snap = PlanSnapshot {
+            trading_date_ist: "2026-07-10".to_string(),
+            format: PLAN_SNAPSHOT_FORMAT_CURRENT,
+            targets: vec![
+                fut_target("35001", "2026-07-30"),
+                fut_target("36001", "2026-08-27"),
+            ],
+        };
+        let uni = to_universe(&snap).expect("two months of one underlying are legal (§36.7)");
+        assert_eq!(uni.subscription_targets.len(), 2);
+        let mut expiries: Vec<&str> = uni
+            .subscription_targets
+            .iter()
+            .map(|t| t.csv_row.expiry_date.as_str())
+            .collect();
+        expiries.sort_unstable();
+        assert_eq!(expiries, vec!["2026-07-30", "2026-08-27"]);
+    }
+
+    /// §36.7 (2026-07-10): a format-2 (nearest-only era) snapshot is
+    /// REJECTED at the load gate → one deterministic cold build on deploy
+    /// day — a stale single-future snapshot never warm-boots an all-months
+    /// day. Mirrors the v1→v2 format-gate test above.
+    #[test]
+    fn test_snapshot_format_2_rejected_after_v3_bump() {
+        let date = "2099-07-13";
+        let path = snapshot_path_for(date).expect("valid date");
+        std::fs::create_dir_all(CACHE_BASE_DIR).expect("mkdir");
+        let mut legacy = snapshot_from_universe(&large_sample_universe(), date);
+        legacy.format = 2; // simulate the §36 nearest-only writer
+        std::fs::write(&path, serde_json::to_vec(&legacy).unwrap()).expect("write");
+        assert!(
+            load_plan_snapshot_for_today(date).is_none(),
+            "format 2 < PLAN_SNAPSHOT_FORMAT_CURRENT must be rejected (deploy-day cold build)"
+        );
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
