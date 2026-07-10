@@ -1,18 +1,18 @@
 # Implementation Plan: Telegram Noise Cut PR-1 — CustomStatus variant + commandment reword (F2+F4)
 
-**Status:** APPROVED
+**Status:** VERIFIED
 **Date:** 2026-07-10
 **Approved by:** Parthiban (operator) — standing directive 2026-07-10, via coordinator
 
 ## Plan Items
 
-- [ ] Add `NotificationEvent::CustomStatus { message }` at `Severity::Low`; keep `Custom` at `Severity::High`
+- [x] Add `NotificationEvent::CustomStatus { message }` at `Severity::Low` and `CustomStatusUrgent { message }` (Low + `DispatchPolicy::Immediate`); keep `Custom` at `Severity::High`
   - Files: crates/core/src/notification/events.rs
-  - Tests: test_custom_status_severity_is_low, test_custom_is_high, test_custom_status_episode_key_is_none, test_low_custom_status_never_immediate_or_sms
-- [ ] Flip the 7 informational Custom emit sites to CustomStatus (Low); keep the 4 actionable at Custom (High)
-  - Files: crates/app/src/main.rs, crates/app/src/orphan_position_watchdog_boot.rs
-  - Tests: telegram_custom_noise_guard.rs (status_pings_use_custom_status_not_custom, actionable_custom_sites_stay_custom_high)
-- [ ] Reword the jargon-carrying Custom/CustomStatus bodies for commandments #2/#10
+  - Tests: test_custom_status_severity_is_low, test_custom_is_high, test_custom_status_episode_key_is_none, test_low_custom_status_never_immediate_or_sms, test_custom_status_urgent_is_immediate_and_low, test_custom_status_urgent_episode_key_is_none_and_topic_distinct
+- [x] Route the informational Custom emit sites to the Low variants (4 batched CustomStatus, 3 instant CustomStatusUrgent); keep the 4 actionable at Custom (High)
+  - Files: crates/app/src/main.rs (orphan_position_watchdog_boot.rs unchanged — its 2 sites stay Custom/High)
+  - Tests: telegram_custom_noise_guard.rs (status_pings_use_low_variant_not_custom, actionable_custom_sites_stay_custom_high)
+- [x] Reword the jargon-carrying Custom/CustomStatus bodies for commandments #2/#10; drop the hardcoded 🟢/⚪ glyphs from the feed toggle acks
   - Files: crates/app/src/main.rs
   - Tests: telegram_custom_noise_guard.rs (custom_bodies_carry_no_impl_jargon, custom_bodies_have_no_redundant_severity_prefix)
 
@@ -53,13 +53,36 @@ endpoint.
 
 ## Edge Cases
 
-- `Info < Low < Medium < High < Critical` (Severity is `Ord`): `CustomStatus`
-  at `Low` is strictly `< High`, so it can never trigger SMS.
-- `CustomStatus` and `Custom` have distinct `topic()` strings
-  (`"CustomStatus"` vs `"Custom"`), so demoted status pings coalesce in their
-  own bucket and never merge with a genuine High `Custom` alert.
-- `CustomStatus.dispatch_policy() == Default` (wildcard) → routed by severity:
-  Low → Digest (in-market) / Coalesce60 (off-hours), never Immediate.
+- `Info < Low < Medium < High < Critical` (Severity is `Ord`): both `CustomStatus`
+  and `CustomStatusUrgent` are `Low`, strictly `< High`, so neither can ever
+  trigger SMS (the SMS gate is `severity >= High`).
+- The three variants have distinct `topic()` strings (`"Custom"` /
+  `"CustomStatus"` / `"CustomStatusUrgent"`), so demoted status pings coalesce in
+  their own bucket and never merge with a genuine High `Custom` alert.
+- **Accepted digest behavior (operator's stated "fewer messages" goal):** the
+  four routine `CustomStatus` pings — Market closed, Price backups growing,
+  Background service auto-restarted, Recovered saved prices — have
+  `dispatch_policy() == Default`, so in market hours they BATCH into the 900s
+  digest and render as a terse per-topic count (`• CustomStatus xN`); off-hours
+  they render with bodies via the 60s coalescer. They never fire SMS and never
+  ship as their own instant message in-market. This is the intended cut. A
+  distinct-per-kind digest topic (so "market closed" and "backups growing" don't
+  share one count) is a noted PR-2 follow-up; the four ACTIONABLE alerts stay
+  Immediate + SMS and are never batched.
+- **FIX-5 — `CustomStatusUrgent` (instant, never SMS):** three operator-notable
+  but non-actionable events route to `CustomStatusUrgent` (Low severity → no SMS,
+  but `dispatch_policy() == Immediate` → ships instantly as its own bodied
+  message, NOT batched):
+  - main.rs 2752 **Fast start** — the fast-boot arm runs ONLY on a mid-market
+    restart (`should_fast_boot == has_cache && is_market_hours`), i.e. a
+    crash/unexpected restart DURING the session, not any routine pre-market boot.
+    The operator must SEE this at once ("why did the box restart mid-market?")
+    without being SMS-paged.
+  - main.rs 10762 / 10962 **Dhan feed started/stopped** — a feed on/off toggle is
+    a deliberate operator action; the ack ships instantly (per operator
+    preference) but never pages.
+  The hardcoded 🟢/⚪ glyphs were dropped from these two bodies (FIX-4): dispatch
+  already prepends the Low severity emoji, and a green ✅ on a STOP read wrong.
 - The 8905 spill-size ping demotes to `CustomStatus` because the root cause
   (`QuestDbDisconnected`, Critical) already pages in the same watchdog loop
   (`main.rs:8925`) — demoting avoids a duplicate page, not a lost alert.
@@ -106,7 +129,21 @@ No new metric/counter/alarm. The existing `tv_telegram_dispatched_total{severity
 label shifts `high` → `low` for the 7 flipped sites and those sites stop firing
 the SNS SMS leg (the intended noise cut). No CloudWatch alarm reads `Custom`
 severity, so there is zero alerting regression — verified: none of the alarmed
-`error!` ErrorCodes originate from a `Custom` emit site.
+`error!` ErrorCodes originate from a `Custom` emit site. **No SMS is re-added
+anywhere** — all seven flipped sites are `Low` (below the `>= High` SMS gate),
+whether batched (`CustomStatus`) or instant (`CustomStatusUrgent`).
+
+Digest-vs-instant split of the seven demoted pings (documented for the operator):
+- **Instant, no SMS (`CustomStatusUrgent`, `Immediate`):** Fast start (mid-market
+  restart recovery), Dhan feed started, Dhan feed stopped — ship at once as their
+  own bodied message.
+- **Batched, no SMS (`CustomStatus`, `Default`):** Market closed, Price backups
+  growing, Background service auto-restarted, Recovered saved prices — batch to a
+  terse digest count in market hours; bodies preserved off-hours (60s coalescer).
+- **Unchanged Immediate + SMS (`Custom`, High):** Price database unavailable, Low
+  disk space, and the two 15:25 orphan-position diagnostics.
+Distinct-per-kind digest topics for the four batched pings are a noted PR-2
+follow-up (today they share the single `CustomStatus` coalescer topic).
 
 ## Zero-Loss Guarantee Charter check
 
