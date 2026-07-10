@@ -860,17 +860,22 @@ pub enum ErrorCode {
     /// only — the production capture chain is untouched. Severity::Medium,
     /// auto-triage-safe.
     GrowwNative04WriterFailed,
-    /// FUTIDX-01 (§36 2026-07-08) — the nearest-expiry index-future selection
-    /// degraded for ≥1 of the 4 authorized underlyings on one feed (no FUT
-    /// rows / all expiries past / ambiguous duplicate expiry / unparsable
-    /// expiry). That feed runs WITHOUT that future for the day — degrade,
+    /// FUTIDX-01 (§36 2026-07-08; §36.7 all monthly expiries 2026-07-10) —
+    /// the index-future selection degraded on one feed: a whole underlying
+    /// (no FUT rows / all expiries past / unparsable expiry / monthly serial
+    /// flood) or a single month (ambiguous duplicate expiry / candidate
+    /// flood at that expiry — the payload's `expiry` field names it). That
+    /// feed runs WITHOUT that future (or that month) for the day — degrade,
     /// never HALT; the spot universe is unaffected. Severity::High,
     /// auto-triage-safe (the degrade already happened; operator inspects the
     /// day's master CSV + the alias-drift evidence payload at leisure).
     Futidx01SelectionDegraded,
-    /// FUTIDX-02 (§36 2026-07-08) — the boot-time cross-feed comparator found
-    /// the Dhan and Groww builds chose DIFFERENT expiry dates (or one-sided
-    /// presence) for an index-future underlying. Both feeds STAY LIVE
+    /// FUTIDX-02 (§36 2026-07-08; §36.7 expiry-SET parity 2026-07-10) — the
+    /// boot-time cross-feed comparator found the Dhan and Groww builds chose
+    /// DIVERGENT expiry sets in a comparable month (nearest differs, a hole,
+    /// or one-sided presence) for an index-future underlying (a pure
+    /// far-suffix depth difference is an info-level note, never this code).
+    /// Both feeds STAY LIVE
     /// (visibility, never a halt); cross-feed rows for that underlying are
     /// not comparable that day. One vendor's master is stale/divergent —
     /// operator compares the two masters' FUT rows and records a dated note.

@@ -425,10 +425,12 @@ fn boot_timing_proof_is_measured_and_surfaced() {
 }
 
 // ---------------------------------------------------------------------------
-// Section FUTIDX-4 (§36, 2026-07-08) — the index-futures grant is pinned to
-// exactly 4 underlyings, nearest expiry, never-roll, Quote mode. Any widening
-// (5th underlying, OPTIDX, non-nearest expiry, intraday resubscribe) requires
-// a fresh dated operator quote + a rule-file edit FIRST.
+// Section FUTIDX (§36 2026-07-08; §36.7 2026-07-10) — the index-futures grant
+// is pinned to exactly 4 underlyings, all monthly expiries `>= today`
+// (§36.7), never-roll, Quote mode. Any widening (5th underlying, OPTIDX,
+// non-monthly-serial instrument, expiry < today, breaking the
+// per-underlying serial envelope, intraday resubscribe) requires a fresh
+// dated operator quote + a rule-file edit FIRST.
 // ---------------------------------------------------------------------------
 
 fn index_futures_rs_body() -> String {
@@ -450,7 +452,7 @@ fn index_futures_rs_production_region() -> String {
 }
 
 #[test]
-fn futidx_scope_pinned_to_4_underlyings_nearest_expiry() {
+fn futidx_scope_pinned_to_4_underlyings_all_monthly_expiries() {
     let body = rule_file_body();
     for phrase in [
         "FUTIDX",
@@ -461,10 +463,15 @@ fn futidx_scope_pinned_to_4_underlyings_nearest_expiry() {
         "nearest expiry",
         "NEVER roll",
         "Quote mode",
+        // §36.7 (2026-07-10): the all-months grant + its fail-closed
+        // envelope must stay recorded in the rule file.
+        "ALL available monthly",
+        "MonthlySerialFlood",
+        "2026-07-10",
     ] {
         assert!(
             body.contains(phrase),
-            "rule file §36 must pin the FUTIDX-4 contract phrase: {phrase:?}"
+            "rule file §36/§36.7 must pin the FUTIDX contract phrase: {phrase:?}"
         );
     }
     // Hostile-review round 3 (2026-07-08): membership pins scan the
@@ -477,9 +484,14 @@ fn futidx_scope_pinned_to_4_underlyings_nearest_expiry() {
         src.contains("[IndexFutureUnderlying; 4]"),
         "INDEX_FUTURES_UNDERLYINGS must be an arity-4 array — a 5th underlying needs a rule edit"
     );
+    // §36.7: the per-underlying serial envelope + the derived total bound.
     assert!(
-        src.contains("MAX_INDEX_FUTURE_TARGETS: usize = 4"),
-        "MAX_INDEX_FUTURE_TARGETS must stay 4"
+        src.contains("MAX_MONTHLY_EXPIRIES_PER_UNDERLYING: usize = 6"),
+        "MAX_MONTHLY_EXPIRIES_PER_UNDERLYING must stay 6 — widening needs a rule edit"
+    );
+    assert!(
+        src.contains("INDEX_FUTURES_UNDERLYINGS.len() * MAX_MONTHLY_EXPIRIES_PER_UNDERLYING"),
+        "MAX_INDEX_FUTURE_TARGETS must stay derived (4 underlyings × serial envelope)"
     );
     for canonical in ["\"NIFTY\"", "\"BANKNIFTY\"", "\"MIDCPNIFTY\"", "\"SENSEX\""] {
         assert!(
@@ -517,26 +529,41 @@ fn futidx_scope_rule_file_pins_forbidden_remainder() {
 
 #[test]
 fn futidx_scope_never_roll_source_pin() {
-    // The shared boundary fn keeps the `>= today` nearest find AND has NO
-    // TradingCalendar parameter (accidental stock-style T-0 roll activation
-    // must stay unrepresentable).
+    // §36.7: the PLURAL fn owns the `>= today` filter (the never-roll rule
+    // lives in exactly ONE place) AND has NO TradingCalendar parameter
+    // (accidental stock-style T-0 roll activation must stay
+    // unrepresentable); the SINGULAR still exists and DELEGATES to the
+    // plural, so the rule cannot fork.
     let src = index_futures_rs_body();
     assert!(
-        src.contains("pub fn select_index_future_expiry("),
-        "the shared boundary fn must exist"
+        src.contains("pub fn select_index_future_expiries("),
+        "the shared plural boundary fn must exist"
     );
     let fn_start = src
-        .find("pub fn select_index_future_expiry(")
+        .find("pub fn select_index_future_expiries(")
         .expect("fn present");
     let fn_body = &src[fn_start..fn_start + 500];
     assert!(
         fn_body.contains(">= today_ist"),
-        "nearest = first expiry >= today (the never-roll rule)"
+        "ALL monthly expiries >= today (the never-roll rule, §36.7)"
     );
     assert!(
         !fn_body.contains("TradingCalendar"),
-        "select_index_future_expiry must NOT take a calendar — the calendar arm exists only \
+        "select_index_future_expiries must NOT take a calendar — the calendar arm exists only \
          to trigger the banned stock T-0 roll"
+    );
+    // Delegation pin: the singular exists and calls the plural.
+    assert!(
+        src.contains("pub fn select_index_future_expiry("),
+        "the singular nearest-month fn must still exist (SLO exclusion set + docs)"
+    );
+    let singular_start = src
+        .find("pub fn select_index_future_expiry(")
+        .expect("singular fn present");
+    let singular_body = &src[singular_start..singular_start + 500];
+    assert!(
+        singular_body.contains("select_index_future_expiries("),
+        "the singular must DELEGATE to the plural — the >= today rule has ONE implementation"
     );
 }
 

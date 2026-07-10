@@ -493,6 +493,7 @@ pub fn extract_index_future_entries(
                 } else {
                     IndexFutureMissReason::NoFutRows
                 },
+                expiry: None,
             });
             continue;
         }
@@ -502,6 +503,7 @@ pub fn extract_index_future_entries(
             misses.push(IndexFutureMiss {
                 canonical: target.canonical,
                 reason: IndexFutureMissReason::AllExpiriesPast,
+                expiry: None,
             });
             continue;
         };
@@ -517,6 +519,7 @@ pub fn extract_index_future_entries(
             misses.push(IndexFutureMiss {
                 canonical: target.canonical,
                 reason: IndexFutureMissReason::SameExpiryCandidateFlood,
+                expiry: Some(chosen),
             });
             continue;
         }
@@ -541,6 +544,7 @@ pub fn extract_index_future_entries(
             misses.push(IndexFutureMiss {
                 canonical: target.canonical,
                 reason: IndexFutureMissReason::AmbiguousDuplicateExpiry,
+                expiry: Some(chosen),
             });
             continue;
         }
