@@ -489,7 +489,10 @@ pub async fn run_tick_conservation_audit(
 // Groww lane conservation audit (feed='groww')
 // ---------------------------------------------------------------------------
 
-/// Nanoseconds in one IST day — the day-window width for the conservation scan.
+/// Nanoseconds in one IST day — the day-window width for the RUST-SIDE
+/// nanos-vs-nanos scans (the NDJSON line counter). NEVER embed this in a
+/// QuestDB literal — see the regression lock on
+/// [`build_conservation_ticks_count_sql`].
 const NANOS_PER_IST_DAY: i64 = 86_400_000_000_000;
 
 /// Build the feed-filtered per-IST-day `ticks` count SQL for a conservation
@@ -498,17 +501,28 @@ const NANOS_PER_IST_DAY: i64 = 86_400_000_000_000;
 /// rows, and an unfiltered count inflates one lane's `db_rows` with the other
 /// lane's ticks (2026-07-02 adversarial-sweep finding). `feed` is a compile-time
 /// constant (`CONSERVATION_FEED_*`), never user input — no injection surface.
+///
+/// REGRESSION LOCK (hostile review 2026-07-10, empirically confirmed on the
+/// pinned QuestDB 9.3.5): a bare integer literal compared against a TIMESTAMP
+/// column is interpreted as epoch **MICROSECONDS**, not nanoseconds. The
+/// previous NANOSECOND bounds placed the window ~year 58502 and matched ZERO
+/// rows — `db_rows = 0` on every run: the Dhan `tick_conservation_audit`
+/// forensic column was silently wrong (runbook triage step 5 dead), and the
+/// Groww lane's `delivery_residual` equalled the full delivered NDJSON count
+/// so `classify_groww_outcome` was permanently Partial (audit-Rule-11
+/// false-signal class). The bounds come from the SHARED
+/// [`crate::feed_scoreboard_boot::day_bounds_micros`] helper (the single
+/// micros source — no per-file nanos re-derivation can regress); the
+/// Rust-side NDJSON counter (`count_groww_ndjson_lines_for_ist_day`) compares
+/// nanos-vs-nanos in memory and stays nanos. Pinned (digit-magnitude, not
+/// substring presence) by `test_build_conservation_ticks_count_sql_feed_filtered`.
 #[must_use]
 pub fn build_conservation_ticks_count_sql(feed: &str, target_ist_day: u64) -> String {
-    // APPROVED: IST day numbers are ~20K, far below i64::MAX — saturating keeps adversarial inputs bounded.
-    let day_start_nanos = i64::try_from(target_ist_day)
-        .unwrap_or(0)
-        .saturating_mul(86_400)
-        .saturating_mul(1_000_000_000);
-    let day_end_nanos = day_start_nanos.saturating_add(NANOS_PER_IST_DAY);
+    let (day_start_micros, day_end_micros) =
+        crate::feed_scoreboard_boot::day_bounds_micros(target_ist_day);
     format!(
         "select count() from ticks where feed = '{feed}' \
-         and ts >= {day_start_nanos} and ts < {day_end_nanos}"
+         and ts >= {day_start_micros} and ts < {day_end_micros}"
     )
 }
 
@@ -774,15 +788,33 @@ mod tests {
             groww.contains("feed = 'groww'"),
             "Groww count must filter feed: {groww}"
         );
-        // Exact day window bounds: [day*86400e9, (day+1)*86400e9).
-        let start = (GROWW_TEST_DAY as i64) * 86_400 * 1_000_000_000;
-        let end = start + 86_400_000_000_000;
+        // REGRESSION LOCK (2026-07-10, proven live on QuestDB 9.3.5): the
+        // embedded day-window literals MUST be epoch MICROS (16 digits for a
+        // 2026 day) — the old 19-digit NANOS literals sat ~year 58502 and
+        // matched ZERO rows (db_rows=0 forever; Groww permanently Partial).
+        // Exact micros day window bounds: [day*86400e6, (day+1)*86400e6).
+        let start = (GROWW_TEST_DAY as i64) * 86_400 * 1_000_000;
+        let end = start + 86_400_000_000;
+        assert_eq!(
+            start.to_string().len(),
+            16,
+            "2026-era micros bound must be 16 digits"
+        );
+        let nanos_start = (GROWW_TEST_DAY as i64) * 86_400 * 1_000_000_000;
         for sql in [&dhan, &groww] {
             assert!(
                 sql.contains(&format!("ts >= {start}")),
                 "window start: {sql}"
             );
             assert!(sql.contains(&format!("ts < {end}")), "window end: {sql}");
+            assert!(
+                !sql.contains(&nanos_start.to_string()),
+                "nanos literal banned: {sql}"
+            );
+            assert!(
+                !sql.contains(&(nanos_start + 86_400_000_000_000).to_string()),
+                "nanos end literal banned: {sql}"
+            );
         }
     }
 
