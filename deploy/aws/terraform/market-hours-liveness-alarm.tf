@@ -338,8 +338,8 @@ resource "aws_lambda_function" "tv_market_hours_liveness_gate" {
         aws_cloudwatch_metric_alarm.realtime_guarantee_degraded.alarm_name,
         aws_cloudwatch_metric_alarm.boundary_catchup_storm_dhan.alarm_name,
         aws_cloudwatch_metric_alarm.dhan_exchange_lag_p99_high.alarm_name,
-        aws_cloudwatch_metric_alarm.ws_pool_all_dead.alarm_name,        # 2026-07-10 deferral false-page fix
-        aws_cloudwatch_metric_alarm.ws_failed_connections.alarm_name,   # 2026-07-10 deferral false-page fix
+        aws_cloudwatch_metric_alarm.ws_pool_all_dead.alarm_name,      # 2026-07-10 deferral false-page fix
+        aws_cloudwatch_metric_alarm.ws_failed_connections.alarm_name, # 2026-07-10 deferral false-page fix
       ])
       # Weekday-NSE-holiday safety: the open path skips enabling when this
       # instance is not up (holiday-gate.sh self-stop). Referencing
