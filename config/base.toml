@@ -435,3 +435,19 @@ segment     = "IDX_I"
 security_id = 21
 name        = "INDIA VIX"
 segment     = "IDX_I"
+
+# ===========================================================================
+# Dual-feed daily scoreboard (operator directive 2026-07-10 — run Dhan +
+# Groww live for a month, everything tracked/captured/blame-attributed).
+# PR-A is aggregation-only: reads ws_event_audit + ticks, writes the
+# feed_scoreboard_daily / feed_episode_audit forensic tables at 15:45 IST
+# and sends the daily Telegram scorecard. Safe-on; `enabled = false` is
+# the whole-subsystem rollback switch.
+# ===========================================================================
+[scoreboard]
+enabled                 = true
+telegram_enabled        = true
+coverage_detail_rows    = true   # per-instrument detail rows (populated by PR-4)
+presence_fold_enabled   = true   # hot-path presence fold (lands in PR-4)
+groww_lag_enabled       = true   # Groww lag histograms (land in PR-3)
+trigger_secs_of_day_ist = 56700  # 15:45:00 IST
