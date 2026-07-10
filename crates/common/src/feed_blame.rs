@@ -203,9 +203,18 @@ pub fn classify_episode(e: &EpisodeEvidence<'_>) -> (BlameClass, &'static str) {
         return (BlameClass::Broker, "auth_entitlement");
     }
 
-    // 3. Groww feed toggle — the disable gate closed the socket; ours.
+    // 3. Machine slugs from OUR OWN lifecycle machinery (hostile review
+    //    2026-07-10 — audited against every live emit site):
+    //    - `feed_disabled` (Groww disable gate) → the toggle closed the
+    //      socket; ours.
+    //    - `bridge_died` (groww_bridge supervisor falling edge — OUR task
+    //      panicked and was respawned, FEED-SUPERVISOR-01 class) →
+    //      definitionally ours, never "unclear".
     if e.source == "feed_disabled" {
         return (BlameClass::Ours, "feed_toggle");
+    }
+    if e.source == "bridge_died" {
+        return (BlameClass::Ours, "bridge_task_died");
     }
 
     // 4. Stall episodes (emitters land in PR-2; arms live day-1).
@@ -259,9 +268,16 @@ pub fn classify_episode(e: &EpisodeEvidence<'_>) -> (BlameClass, &'static str) {
         return (BlameClass::Indeterminate, "transport_ambiguous");
     }
 
-    // 8. Connect-phase / unknown buckets.
+    // 8. Connect-phase / unknown buckets. `clean close` is the
+    //    order-update WS clean-close arm (server Close frame / stream end —
+    //    Dhan's OTHER documented auth-rejection delivery mode OR a benign
+    //    idle-day close): not attributable from the row alone, but a NAMED
+    //    slug beats the unclassified floor for month-end review.
     if e.source == "Network / connection" {
         return (BlameClass::Indeterminate, "network_path");
+    }
+    if e.source == "clean close" {
+        return (BlameClass::Indeterminate, "clean_close");
     }
     if e.source == "Unknown" {
         return (BlameClass::Indeterminate, "unknown_cause");
@@ -431,6 +447,34 @@ mod tests {
     }
 
     #[test]
+    fn test_classify_groww_bridge_died_is_ours() {
+        // Hostile review 2026-07-10: the groww_bridge supervisor emits a
+        // Disconnected row with source `bridge_died` when OUR task panics
+        // and is respawned (FEED-SUPERVISOR-01 class) — definitionally
+        // ours, never the unclassified/indeterminate floor.
+        for kind in [EPISODE_KIND_DISCONNECT, EPISODE_KIND_OFF_HOURS_DISCONNECT] {
+            let e = EpisodeEvidence::bare(kind, "groww", "bridge_died", -1);
+            assert_eq!(
+                classify_episode(&e),
+                (BlameClass::Ours, "bridge_task_died"),
+                "bridge_died ({kind}) is our own task death"
+            );
+        }
+    }
+
+    #[test]
+    fn test_classify_order_update_clean_close_is_named_indeterminate() {
+        // The order-update WS `clean close` slug: not attributable from the
+        // row alone (idle-day close vs auth-reject delivery), but it gets a
+        // NAMED slug for month-end review instead of the unclassified floor.
+        let e = EpisodeEvidence::bare(EPISODE_KIND_DISCONNECT, "dhan", "clean close", -1);
+        assert_eq!(
+            classify_episode(&e),
+            (BlameClass::Indeterminate, "clean_close")
+        );
+    }
+
+    #[test]
     fn test_classify_stall_reasons() {
         // FEED-STALL-01 silent socket → broker.
         let stall = EpisodeEvidence {
@@ -556,7 +600,7 @@ mod tests {
     }
 
     #[test]
-    fn test_classifier_total_unknown_inputs_map_to_indeterminate() {
+    fn test_classify_episode_total_unknown_inputs_map_to_indeterminate() {
         // The fail-closed floor: novel kinds / sources / codes never panic,
         // never blank — always indeterminate/unclassified.
         for (kind, source, code) in [
