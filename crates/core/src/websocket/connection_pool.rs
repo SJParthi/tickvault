@@ -184,6 +184,38 @@ async fn run_supervised_pool_slot(conn: Arc<WebSocketConnection>) -> Result<(), 
                 )
                 .increment(1);
                 tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)).await;
+                // Adversarial-review hardening (2026-07-10, post-impl pass):
+                //
+                // (a) LOW fix — the backoff sleep above is not select!ed
+                // against the shutdown notify, so a graceful shutdown that
+                // lands MID-BACKOFF could otherwise let the loop re-enter
+                // run() and open one fresh socket post-shutdown-request.
+                // Re-checking the flag here shrinks that window to instants
+                // (the stored A5 notify permit + teardown's abort remain
+                // the hard floor).
+                //
+                // (b) MEDIUM fix — a clean-close exit never increments
+                // run()'s reconnect counter, so the WS-GAP-04 post-close
+                // sleep-until-open could NEVER engage for a persistent
+                // off-hours Close-frame loop: the slot would churn
+                // connect→Close all night at the 300s cap. Re-running the
+                // SAME market-hours gate the initial spawn uses restores
+                // WS-GAP-04 parity for this exit class: a no-op in market
+                // hours, a park-until-09:00-IST off-hours. The gate is a
+                // plain await, so a teardown abort still cancels the loop
+                // inside it; the post-gate flag re-check covers a graceful
+                // shutdown that arrived during a long off-hours park.
+                if conn.is_shutdown_requested() {
+                    return exit;
+                }
+                crate::websocket::market_hours_gate::defer_until_market_open_ist(
+                    "main_feed",
+                    "slot-respawn",
+                )
+                .await;
+                if conn.is_shutdown_requested() {
+                    return exit;
+                }
             }
         }
     }
@@ -2508,6 +2540,23 @@ mod tests {
         assert!(
             slot_region.contains("compute_pool_respawn_backoff_secs("),
             "slot loop must apply the storm-bounded respawn backoff"
+        );
+        // Adversarial-review hardening pins (2026-07-10): the Respawn arm
+        // must (a) re-run the WS-GAP-04-parity market-hours gate so an
+        // off-hours Close-frame loop parks until 09:00 IST instead of
+        // churning connects all night, and (b) re-check the shutdown flag
+        // after the backoff sleep + after the gate so a graceful shutdown
+        // landing mid-sleep can never open a fresh socket.
+        assert!(
+            slot_region.contains("defer_until_market_open_ist("),
+            "slot loop respawn arm must re-run the market-hours gate (WS-GAP-04 parity)"
+        );
+        assert!(
+            slot_region
+                .matches("if conn.is_shutdown_requested()")
+                .count()
+                >= 2,
+            "slot loop respawn arm must re-check shutdown after backoff AND after the gate"
         );
     }
 }

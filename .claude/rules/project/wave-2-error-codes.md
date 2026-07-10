@@ -82,9 +82,36 @@ drain, exactly as before.
    teardown reports `cancelled` there (the handles are aborted first);
    that is shutdown bookkeeping, not a live respawn.
 
+**Honest envelope (2026-07-10 adversarial-review outcomes):**
+- **Off-hours parity (MEDIUM, FIXED):** a clean-close exit never increments
+  `run()`'s reconnect counter, so the WS-GAP-04 post-close sleep could
+  never engage for this class — an off-hours Close-frame loop would have
+  churned connects all night. The Respawn arm therefore re-runs the SAME
+  market-hours gate the initial spawn uses (no-op in market hours,
+  park-until-09:00-IST off-hours) and re-checks the shutdown flag after
+  the backoff sleep AND after the gate, so a graceful shutdown landing
+  mid-sleep/mid-park can never open a fresh socket (the A5 notify permit
+  + teardown abort remain the hard floor).
+- **60s-metronome residual (MEDIUM, ACCEPTED — the WS-GAP-10 precedent):**
+  a server that consistently closes each session at ≥61s resets the
+  stability streak every cycle and pins the backoff at the 5s base —
+  worst case ~1 reconnect per ~66s on the locked 1-connection pool
+  (~1,300/day, inside Dhan limits), each cycle loud (one coded ERROR +
+  counter). Strictly better than the pre-W2#8 behaviour for the same
+  pattern (dead slot → 300s Halt → process-restart loop).
+- **Audit asymmetry (LOW, flagged follow-up):** the clean-close exit path
+  in `run()` stamps no `Disconnected` audit row / Telegram, and a
+  respawned session's first connect stamps "initial connect" (the
+  reconnect counter is fresh) — the WS-GAP-05 ERROR + counter are the
+  operator signal for this class today. Wiring a typed audit row into
+  the respawn arm is a follow-up (would touch `run()`'s audit surface,
+  deliberately out of this PR's no-state-machine-change scope).
+
 **Ratchet:**
 `connection_pool.rs::tests::ratchet_spawn_all_uses_supervised_slot_loop`
-(+ the classify/backoff/terminal-behaviour unit + tokio tests beside it).
+(pins the spawn wiring, classify call, counter, code field, backoff,
+market-hours gate, and the double shutdown re-check; + the
+classify/backoff/terminal-behaviour unit + tokio tests beside it).
 
 **Source:** `crates/core/src/websocket/connection_pool.rs::{run_supervised_pool_slot, classify_pool_slot_exit, compute_pool_respawn_backoff_secs}`; teardown drain: `WebSocketConnectionPool::supervise_pool`.
 
