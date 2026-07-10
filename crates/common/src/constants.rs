@@ -1162,6 +1162,39 @@ pub const DHAN_NSE_HOLIDAY_CROSS_CHECK_URL: &str =
     "https://www.nseindia.com/api/holiday-master?type=trading"; // APPROVED: infrastructure constant — operator-verified NSE 2026 research 2026-05-27
 
 // ---------------------------------------------------------------------------
+// Holiday-calendar coverage-horizon staleness guard (W2 PR#5, 2026-07-10 —
+// audit follow-up row 15). The `nse_holidays` config list covers one
+// calendar year at a time; `is_holiday()` has NO year bound, so once the
+// year rolls past the newest listed holiday, every un-listed weekday
+// holiday silently reads as a trading day. The guard pages the operator
+// BEFORE that cliff so the next official NSE circular gets pasted in time.
+// ---------------------------------------------------------------------------
+
+/// Page the operator when fewer than this many days of holiday-calendar
+/// coverage remain (strict `<` — exactly 60 days left is not yet stale).
+///
+/// Why 60: NSE typically publishes the next calendar year's trading-holiday
+/// circular in December. With coverage ending Dec 31, daily paging begins
+/// ~Nov 2 — a bounded "watch for the circular, then paste it" reminder
+/// window. 90 would start paging ~Oct 2, months before the circular
+/// plausibly exists (pager fatigue for an un-actionable reminder); 30 (Dec
+/// 1) leaves too little slack for a late circular + year-end operator
+/// absence. The pages stop the moment the new year's list lands in config.
+pub const CALENDAR_COVERAGE_WARN_THRESHOLD_DAYS: i64 = 60;
+
+/// Re-check cadence for the calendar-staleness watchdog. The AWS box
+/// restarts every trading weekday (08:30 IST auto-start), so the boot-time
+/// check alone gives daily cadence in prod; the 6h in-process loop covers
+/// long-lived local sessions. The per-IST-date alert latch keeps Telegram
+/// at ≤1 page per process per day regardless of this cadence.
+pub const CALENDAR_STALENESS_CHECK_INTERVAL_SECS: u64 = 21_600;
+
+/// Retry pause when the staleness check finds a stale calendar but the
+/// lazily-filled Telegram notifier slot is still empty (boot prefix) — the
+/// alert is re-attempted at this pace instead of being lost for the day.
+pub const CALENDAR_STALENESS_NOTIFIER_RETRY_SECS: u64 = 30;
+
+// ---------------------------------------------------------------------------
 // F&O Universe — Index Aliases (FNO symbol → IDX_I symbol)
 // ---------------------------------------------------------------------------
 
