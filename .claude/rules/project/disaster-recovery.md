@@ -92,7 +92,7 @@ is intact; if not, fall through to CSV download (~60s adds 30s to RTO).
 | Step | Action |
 |---|---|
 | Detection | Watchdog sees `active_count = 0` → Telegram CRITICAL |
-| Recovery | All 5 reconnect in parallel; `SubscribeRxGuard` restores subscriptions. **Wave 2:** if all reconnects exhaust the post-close gate, pool stays alive in dormant sleep instead of giving up. Pool supervisor (`respawn_dead_connections_loop`) re-spawns any panicked task within 5s (WS-GAP-05). |
+| Recovery | All 5 reconnect in parallel; `SubscribeRxGuard` restores subscriptions. **Wave 2:** if all reconnects exhaust the post-close gate, pool stays alive in dormant sleep instead of giving up. W2#8 (2026-07-10): the slot's supervised loop (`run_supervised_pool_slot`) re-enters the connection loop within ~5s after an unexpected clean exit (server Close / stream-end) — WS-GAP-05. (Release panics abort the process by `panic = "abort"`; recovery for a panic is process restart + WAL replay.) |
 | Spot freshness | If buffer stale (Mode C), live-tick resolver re-runs to confirm ATM |
 | **RTO** | ~30s in-market; pool re-converges at next market open if event happens after 15:30 IST. |
 
@@ -157,8 +157,10 @@ is intact; if not, fall through to CSV download (~60s adds 30s to RTO).
 
 The most common "long sleep" scenario. After 15:30 IST Friday close,
 the per-connection task transitions to dormant sleep (Wave-2-A
-WS-GAP-04). Pool supervisor (`respawn_dead_connections_loop`,
-WS-GAP-05) keeps the slot alive even if the inner task panics. Token
+WS-GAP-04). The slot's supervised loop (`run_supervised_pool_slot`,
+WS-GAP-05, W2#8 2026-07-10) keeps the slot alive across unexpected
+clean exits (server Close / stream-end); release-build panics abort
+the process by `panic = "abort"` (restart + WAL replay). Token
 manager runs in the background; the JWT may approach expiry over
 the weekend.
 

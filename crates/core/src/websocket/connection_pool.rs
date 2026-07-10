@@ -49,6 +49,147 @@ use crate::websocket::pool_watchdog::{PoolWatchdog, WatchdogVerdict};
 use crate::websocket::types::{ConnectionHealth, InstrumentSubscription, WebSocketError};
 
 // ---------------------------------------------------------------------------
+// W2#8 (WS-GAP-05, 2026-07-10) — pool-slot supervised respawn
+// ---------------------------------------------------------------------------
+
+/// Base backoff before re-entering `run()` after an unexpected clean exit —
+/// the "respawned within ~5s" WS-GAP-05 runbook contract
+/// (`.claude/rules/project/wave-2-error-codes.md`).
+const POOL_RESPAWN_BASE_BACKOFF_SECS: u64 = 5;
+
+/// Backoff ceiling for a PERSISTENT unexpected-clean-exit loop (e.g. Dhan
+/// politely Close-framing every session). Matches the WS-GAP-08 /
+/// `WS_RATE_LIMIT_BACKOFF_CAP_MS` 300s ceiling class: a pathological
+/// server-side close loop degrades to one reconnect per 5 minutes — loud
+/// (one coded ERROR per cycle), bounded, never a storm, never given up
+/// (the FEED-STALL-01 never-give-up-in-market philosophy).
+const POOL_RESPAWN_MAX_BACKOFF_SECS: u64 = 300;
+
+/// A `run()` session that survived at least this long resets the respawn
+/// backoff streak to 0 — mirrors the WS-GAP-10 order-update 60s
+/// reconnect-stability window, so a once-a-day polite close always
+/// recovers at the 5s base instead of a stale escalated backoff.
+const POOL_RESPAWN_STABILITY_RESET_SECS: u64 = 60;
+
+/// W2#8: verdict for a pool-slot `run()` exit — should the slot task
+/// re-enter `run()` (respawn) or terminate?
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PoolSlotExitVerdict {
+    /// Deliberate or unrecoverable exit — the slot task returns. Covers:
+    /// graceful shutdown / lane teardown (`shutdown_requested`), every
+    /// `Err` (`NonReconnectableDisconnect` is the deliberate anti-storm
+    /// stop for Dhan 805-class codes; `ReconnectionExhausted` is a
+    /// configured finite budget — respawning either would defeat a
+    /// deliberate bound; the pool watchdog's genuine-fatal Halt owns
+    /// process-level recovery), and a clean exit with the live frame
+    /// channel CLOSED (WS-GAP-07 — the tick consumer is dead, so a fresh
+    /// session would reconnect to Dhan and immediately exit again).
+    Terminal,
+    /// Unexpected clean exit (Dhan server Close frame / TCP stream-end
+    /// with no shutdown requested and a live consumer) — re-enter
+    /// `run()` after a storm-bounded backoff. Pre-W2#8 this class left
+    /// the slot dead until the watchdog's 300s Halt + 15-min WS-GAP-09
+    /// ride-out (which assumed a live reconnect loop and therefore
+    /// no-op'd) escalated to a full process restart.
+    Respawn,
+}
+
+/// W2#8: pure classifier for a pool-slot `run()` exit. See
+/// [`PoolSlotExitVerdict`] for the per-arm rationale.
+///
+/// Panics / cancellation are NOT inputs here: a panic propagates out of
+/// the slot task itself (release profile is `panic = "abort"`, so in the
+/// production binary it aborts the process — the TICK-FLUSH-01 honesty
+/// precedent; recovery is next-boot WAL replay), and a teardown `abort()`
+/// cancels the WHOLE slot task including this loop — cancellation can
+/// never respawn, so a torn-down lane can never be resurrected.
+fn classify_pool_slot_exit(
+    exit: &Result<(), WebSocketError>,
+    shutdown_requested: bool,
+    live_channel_closed: bool,
+) -> PoolSlotExitVerdict {
+    if shutdown_requested {
+        return PoolSlotExitVerdict::Terminal;
+    }
+    match exit {
+        Err(_) => PoolSlotExitVerdict::Terminal,
+        Ok(()) if live_channel_closed => PoolSlotExitVerdict::Terminal,
+        Ok(()) => PoolSlotExitVerdict::Respawn,
+    }
+}
+
+/// W2#8: pure storm-bounded respawn backoff — `min(5 × 2^n, 300)` seconds
+/// for the n-th CONSECUTIVE quick exit (5, 10, 20, 40, 80, 160, 300, 300…).
+/// Overflow-safe via `checked_shl` saturation to the cap.
+fn compute_pool_respawn_backoff_secs(consecutive_quick_exits: u32) -> u64 {
+    let doubled = if consecutive_quick_exits >= 32 {
+        POOL_RESPAWN_MAX_BACKOFF_SECS
+    } else {
+        POOL_RESPAWN_BASE_BACKOFF_SECS
+            .checked_shl(consecutive_quick_exits)
+            .unwrap_or(POOL_RESPAWN_MAX_BACKOFF_SECS)
+    };
+    doubled.min(POOL_RESPAWN_MAX_BACKOFF_SECS)
+}
+
+/// W2#8 (WS-GAP-05): the supervised pool-slot loop — the body of every
+/// per-connection task spawned by [`WebSocketConnectionPool::spawn_all`].
+///
+/// Replace-not-add by construction: the "respawn" is a serialized
+/// re-entry of `conn.run()` inside the SAME tokio task on the SAME slot
+/// `Arc` — never a second task, never a second socket, so the 2-WebSocket
+/// lock (`websocket-connection-scope-lock.md`) and the lane-FSM handle
+/// ownership (`DhanLaneRunHandles.ws_handles` H8 Drop floor,
+/// `PreLaneAbortGuard`, `teardown_dhan_lane_tasks` abort+drain) are all
+/// byte-identical to pre-W2#8. Subscription restoration on respawn is the
+/// SAME `connect_and_subscribe` re-send of the slot's assigned instruments
+/// that every in-loop reconnect already performs, and the
+/// `SubscribeRxGuard` slot reinstall gives the fresh session the
+/// subscribe-command receiver exactly as it does across reconnects.
+///
+/// Cold path — runs once per slot exit, never per tick.
+// O(1) EXEMPT: cold-path slot supervisor — one iteration per session exit.
+async fn run_supervised_pool_slot(conn: Arc<WebSocketConnection>) -> Result<(), WebSocketError> {
+    let mut consecutive_quick_exits: u32 = 0;
+    loop {
+        let session_started = std::time::Instant::now();
+        let exit = conn.run().await;
+        let verdict = classify_pool_slot_exit(
+            &exit,
+            conn.is_shutdown_requested(),
+            conn.live_frame_channel_closed(),
+        );
+        match verdict {
+            PoolSlotExitVerdict::Terminal => return exit,
+            PoolSlotExitVerdict::Respawn => {
+                // Stability reset: a session that lived ≥ 60s is a real
+                // recovery — the next backoff starts back at the 5s base.
+                if session_started.elapsed().as_secs() >= POOL_RESPAWN_STABILITY_RESET_SECS {
+                    consecutive_quick_exits = 0;
+                }
+                let backoff_secs = compute_pool_respawn_backoff_secs(consecutive_quick_exits);
+                consecutive_quick_exits = consecutive_quick_exits.saturating_add(1);
+                tracing::error!(
+                    connection_id = conn.connection_id(),
+                    backoff_secs,
+                    consecutive_quick_exits,
+                    code = tickvault_common::error_code::ErrorCode::WsGap05PoolRespawn.code_str(),
+                    "WS-GAP-05 pool slot exited cleanly WITHOUT a shutdown request \
+                     (server Close frame / stream-end) — respawning the slot's \
+                     connection loop after backoff"
+                );
+                metrics::counter!(
+                    "tv_ws_pool_respawn_total",
+                    "reason" => "unexpected_clean_exit"
+                )
+                .increment(1);
+                tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)).await;
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Connection Pool
 // ---------------------------------------------------------------------------
 
@@ -353,7 +494,15 @@ impl WebSocketConnectionPool {
                     &defer_label,
                 )
                 .await;
-                conn.run().await
+                // W2#8 (WS-GAP-05, 2026-07-10): supervised slot loop —
+                // re-enters `conn.run()` in THIS SAME task (replace-not-add)
+                // on an unexpected clean exit (server Close frame /
+                // stream-end), with a storm-bounded 5s→300s backoff. Every
+                // Err, every shutdown-requested exit, and a WS-GAP-07
+                // consumer-dead exit stay terminal; a teardown `abort()`
+                // cancels the whole loop so a torn-down lane is never
+                // resurrected.
+                run_supervised_pool_slot(conn).await
             }));
 
             info!(
@@ -716,15 +865,16 @@ impl WebSocketConnectionPool {
     /// the operator gets a Telegram alert if a connection task dies
     /// silently.
     ///
-    /// Design note: the per-connection task already owns its own
-    /// reconnect loop (`wait_with_backoff` + Wave 2 Item 5 sleep
-    /// path). A `JoinHandle` exits ONLY on real fatal events (panic,
-    /// `ReconnectionExhausted` outside post-close, graceful shutdown).
-    /// This supervisor surfaces those via metrics + ERROR logs so the
-    /// operator can investigate. Actual respawn-with-fresh-config is
-    /// deferred — the `wait_with_backoff` loop handles routine
-    /// disconnects and the post-close sleep keeps the task alive across
-    /// market closes.
+    /// Design note: the per-connection task owns its own reconnect loop
+    /// (`wait_with_backoff` + Wave 2 Item 5 sleep path), and since W2#8
+    /// (2026-07-10) the slot task ALSO self-respawns via
+    /// `run_supervised_pool_slot` on an unexpected clean exit (server
+    /// Close frame / stream-end) — see the WS-GAP-05 runbook. A
+    /// `JoinHandle` therefore resolves ONLY on real terminal events
+    /// (panic — process-aborting in release, `NonReconnectableDisconnect`,
+    /// `ReconnectionExhausted` under a finite budget, graceful shutdown,
+    /// or a teardown abort). This drain surfaces those via metrics +
+    /// ERROR logs at teardown so nothing exits silently.
     ///
     /// Returns when all handles have exited.
     // O(1) EXEMPT: cold-path supervisor — runs once per session.
@@ -2084,5 +2234,280 @@ mod tests {
             tokio::spawn(async { panic!("synthetic panic — Wave 2 Item 5.2 test") });
         WebSocketConnectionPool::supervise_pool(vec![handle]).await;
         // Reaching this assertion proves the supervisor kept its composure.
+    }
+
+    // ----------------------------------------------------------------------
+    // W2#8 (WS-GAP-05, 2026-07-10) — pool-slot supervised respawn.
+    // ----------------------------------------------------------------------
+
+    /// Builds a `WebSocketConnection` that fails fast: unroutable URL +
+    /// `reconnect_max_attempts: 1` (the connection.rs
+    /// `test_connection_run_zero_max_attempts` pattern) so `run()` exits
+    /// with `ReconnectionExhausted` in milliseconds.
+    fn make_fast_exit_connection(
+        feed_enable_flag: Option<Arc<AtomicBool>>,
+    ) -> (
+        Arc<WebSocketConnection>,
+        mpsc::Receiver<(u64, bytes::Bytes)>,
+    ) {
+        let (tx, rx) = mpsc::channel(8);
+        let mut conn = WebSocketConnection::new(
+            1,
+            make_test_token_handle(),
+            "test-client".to_string(),
+            DhanConfig {
+                websocket_url: "wss://127.0.0.1:19999".to_string(),
+                ..make_test_dhan_config()
+            },
+            WebSocketConfig {
+                reconnect_max_attempts: 1,
+                reconnect_initial_delay_ms: 1,
+                reconnect_max_delay_ms: 1,
+                ..make_test_ws_config()
+            },
+            vec![],
+            FeedMode::Ticker,
+            tx,
+            None,
+        );
+        if let Some(flag) = feed_enable_flag {
+            conn = conn.with_feed_enable_flag(flag);
+        }
+        (Arc::new(conn), rx)
+    }
+
+    // --- classify_pool_slot_exit: every arm ---
+
+    #[test]
+    fn test_classify_terminal_on_shutdown_even_for_clean_exit() {
+        // A graceful shutdown / lane teardown must NEVER respawn — the
+        // no-resurrect-after-teardown contract.
+        assert_eq!(
+            classify_pool_slot_exit(&Ok(()), true, false),
+            PoolSlotExitVerdict::Terminal
+        );
+    }
+
+    #[test]
+    fn test_classify_terminal_on_shutdown_with_err() {
+        assert_eq!(
+            classify_pool_slot_exit(
+                &Err(WebSocketError::ReconnectionExhausted {
+                    connection_id: 1,
+                    attempts: 1,
+                }),
+                true,
+                false
+            ),
+            PoolSlotExitVerdict::Terminal
+        );
+    }
+
+    #[test]
+    fn test_classify_terminal_on_reconnection_exhausted() {
+        // A configured finite retry budget stays a hard bound — respawning
+        // would defeat it through the back door.
+        assert_eq!(
+            classify_pool_slot_exit(
+                &Err(WebSocketError::ReconnectionExhausted {
+                    connection_id: 1,
+                    attempts: 3,
+                }),
+                false,
+                false
+            ),
+            PoolSlotExitVerdict::Terminal
+        );
+    }
+
+    #[test]
+    fn test_classify_terminal_on_non_reconnectable_disconnect() {
+        // Dhan 805-class codes deliberately STOP retrying (anti reconnect
+        // storm) — the respawn loop must not undo that design.
+        assert_eq!(
+            classify_pool_slot_exit(
+                &Err(WebSocketError::NonReconnectableDisconnect {
+                    code: crate::websocket::types::DisconnectCode::from_u16(805),
+                }),
+                false,
+                false
+            ),
+            PoolSlotExitVerdict::Terminal
+        );
+    }
+
+    #[test]
+    fn test_classify_terminal_on_clean_exit_with_dead_consumer() {
+        // WS-GAP-07: the tick consumer is gone — a fresh session would
+        // reconnect to Dhan and immediately exit again (connect churn with
+        // zero benefit). Terminal.
+        assert_eq!(
+            classify_pool_slot_exit(&Ok(()), false, true),
+            PoolSlotExitVerdict::Terminal
+        );
+    }
+
+    #[test]
+    fn test_classify_respawn_on_unexpected_clean_exit() {
+        // Server Close frame / stream-end with no shutdown and a live
+        // consumer — THE gap this PR closes.
+        assert_eq!(
+            classify_pool_slot_exit(&Ok(()), false, false),
+            PoolSlotExitVerdict::Respawn
+        );
+    }
+
+    // --- compute_pool_respawn_backoff_secs: base / doubling / cap ---
+
+    #[test]
+    fn test_respawn_backoff_base_is_5s_per_ws_gap_05_contract() {
+        assert_eq!(compute_pool_respawn_backoff_secs(0), 5);
+    }
+
+    #[test]
+    fn test_respawn_backoff_doubles_then_caps_at_300() {
+        assert_eq!(compute_pool_respawn_backoff_secs(1), 10);
+        assert_eq!(compute_pool_respawn_backoff_secs(2), 20);
+        assert_eq!(compute_pool_respawn_backoff_secs(3), 40);
+        assert_eq!(compute_pool_respawn_backoff_secs(4), 80);
+        assert_eq!(compute_pool_respawn_backoff_secs(5), 160);
+        assert_eq!(compute_pool_respawn_backoff_secs(6), 300);
+        assert_eq!(compute_pool_respawn_backoff_secs(7), 300);
+    }
+
+    #[test]
+    fn test_respawn_backoff_never_overflows_at_large_streaks() {
+        assert_eq!(compute_pool_respawn_backoff_secs(31), 300);
+        assert_eq!(compute_pool_respawn_backoff_secs(32), 300);
+        assert_eq!(compute_pool_respawn_backoff_secs(u32::MAX), 300);
+    }
+
+    #[test]
+    fn test_respawn_backoff_is_monotone_nondecreasing() {
+        let mut prev = 0;
+        for n in 0..40 {
+            let cur = compute_pool_respawn_backoff_secs(n);
+            assert!(cur >= prev, "backoff must never decrease (n={n})");
+            prev = cur;
+        }
+    }
+
+    // --- run_supervised_pool_slot: terminal / cancel behaviour ---
+
+    #[tokio::test]
+    async fn test_supervised_slot_terminal_err_no_respawn() {
+        // A `run()` Err (here: exhausted finite budget against an
+        // unroutable URL) must terminate the slot loop — never respawn.
+        let (conn, _rx) = make_fast_exit_connection(None);
+        let result = run_supervised_pool_slot(conn).await;
+        assert!(
+            matches!(result, Err(WebSocketError::ReconnectionExhausted { .. })),
+            "expected terminal ReconnectionExhausted, got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_supervised_slot_terminal_ok_on_shutdown_never_resurrects() {
+        // Feed disabled + graceful shutdown pre-set: `run()` exits the
+        // dormant gate with Ok(()) and `shutdown_requested == true` — the
+        // slot loop must return, NOT respawn (the graceful half of the
+        // no-resurrect-after-teardown contract; the abort half is the
+        // cancellation test below).
+        let flag = Arc::new(AtomicBool::new(false)); // feed disabled
+        let (conn, _rx) = make_fast_exit_connection(Some(flag));
+        conn.request_graceful_shutdown();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            run_supervised_pool_slot(conn),
+        )
+        .await
+        .expect("slot loop must terminate promptly on shutdown, not respawn");
+        assert!(result.is_ok(), "shutdown exit is Ok(()), got {result:?}");
+    }
+
+    #[tokio::test]
+    async fn test_supervised_slot_abort_is_cancelled_no_respawn() {
+        // Teardown aborts the slot handle → the WHOLE wrapper (respawn
+        // loop included) is cancelled. A cancelled slot can never respawn
+        // — this is the abort half of no-resurrect-after-teardown
+        // (`teardown_dhan_lane_tasks` step 3b aborts exactly these
+        // handles).
+        let flag = Arc::new(AtomicBool::new(false)); // feed disabled → parks dormant
+        let (conn, _rx) = make_fast_exit_connection(Some(flag));
+        let handle = tokio::spawn(run_supervised_pool_slot(conn));
+        // Give the task a moment to park in the dormant gate.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        handle.abort();
+        let join = handle.await;
+        assert!(
+            join.err().is_some_and(|e| e.is_cancelled()),
+            "aborted slot task must resolve as cancelled"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_spawn_all_handle_count_equals_connection_count() {
+        // Replace-not-add baseline: exactly ONE task per pool slot, and the
+        // W2#8 respawn is a re-entry INSIDE that task — the handle count is
+        // the structural ceiling on live connection tasks (2-WS lock).
+        let pool = WebSocketConnectionPool::new(
+            make_test_token_handle(),
+            "test-client".to_string(),
+            DhanConfig {
+                websocket_url: "wss://127.0.0.1:19999".to_string(),
+                ..make_test_dhan_config()
+            },
+            make_test_ws_config(),
+            vec![],
+            FeedMode::Ticker,
+            None,
+        )
+        .unwrap();
+        let handles = pool.spawn_all().await;
+        assert_eq!(handles.len(), pool.connection_count());
+        for h in &handles {
+            h.abort();
+        }
+    }
+
+    #[test]
+    fn ratchet_spawn_all_uses_supervised_slot_loop() {
+        // Source-scan ratchet: the ONLY per-slot spawn site must route
+        // through the supervised respawn loop, and the loop must classify
+        // via the pure verdict fn + carry the WS-GAP-05 code + counter.
+        // Removing any of these silently regresses the WS-GAP-05 respawn
+        // contract back to detect-only.
+        let src = include_str!("connection_pool.rs");
+        let spawn_all_region = src
+            .split("pub async fn spawn_all")
+            .nth(1)
+            .expect("spawn_all must exist");
+        let spawn_all_region = &spawn_all_region[..spawn_all_region
+            .find("pub fn take_frame_receiver")
+            .expect("take_frame_receiver must follow spawn_all")];
+        assert!(
+            spawn_all_region.contains("run_supervised_pool_slot(conn).await"),
+            "spawn_all's task body must call run_supervised_pool_slot"
+        );
+        let slot_region = src
+            .split("async fn run_supervised_pool_slot")
+            .nth(1)
+            .expect("run_supervised_pool_slot must exist");
+        assert!(
+            slot_region.contains("classify_pool_slot_exit("),
+            "slot loop must classify exits via classify_pool_slot_exit"
+        );
+        assert!(
+            slot_region.contains("tv_ws_pool_respawn_total"),
+            "slot loop respawn arm must increment tv_ws_pool_respawn_total"
+        );
+        assert!(
+            slot_region.contains("WsGap05PoolRespawn.code_str()"),
+            "slot loop respawn arm must carry the WS-GAP-05 error code"
+        );
+        assert!(
+            slot_region.contains("compute_pool_respawn_backoff_secs("),
+            "slot loop must apply the storm-bounded respawn backoff"
+        );
     }
 }
