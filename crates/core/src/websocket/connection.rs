@@ -823,6 +823,20 @@ impl WebSocketConnection {
             .load(std::sync::atomic::Ordering::Acquire)
     }
 
+    /// W2#8 (WS-GAP-05, 2026-07-10): Returns true if the downstream live
+    /// frame channel is CLOSED — the tick-processing consumer holding the
+    /// `Receiver` is gone (the WS-GAP-07 condition). The pool-slot respawn
+    /// classifier (`connection_pool::classify_pool_task_exit`) reads this
+    /// to distinguish a respawnable unexpected clean exit (server Close
+    /// frame / stream-end) from a consumer-dead exit where respawning
+    /// would only churn Dhan connects with zero benefit.
+    ///
+    /// Cold path — one atomic-ish check per pool-slot task exit, never per
+    /// tick.
+    pub(crate) fn live_frame_channel_closed(&self) -> bool {
+        self.frame_sender.is_closed()
+    }
+
     /// Returns the connection identifier.
     pub fn connection_id(&self) -> ConnectionId {
         self.connection_id
@@ -1946,7 +1960,15 @@ impl WebSocketConnection {
                     });
                 }
                 None => {
-                    // Stream ended — exit cleanly, outer loop reconnects.
+                    // Stream ended — exit cleanly. NOTE (W2#8 truth-sync,
+                    // 2026-07-10): the outer `run()` loop treats a clean
+                    // read-loop exit as TERMINAL for this run() invocation
+                    // (the pre-W2#8 comment here claimed "outer loop
+                    // reconnects" — stale). Recovery is now owned by the
+                    // pool-slot supervisor
+                    // (`connection_pool::run_supervised_pool_slot`), which
+                    // classifies a non-shutdown clean exit as respawnable
+                    // and re-enters run() with a storm-bounded backoff.
                     return Ok(());
                 }
                 Some(Ok(_)) => {
@@ -4717,6 +4739,26 @@ mod tests {
         assert!(
             conn.is_shutdown_requested(),
             "double-calling must remain true"
+        );
+    }
+
+    /// W2#8 (WS-GAP-05): `live_frame_channel_closed` must track the
+    /// downstream frame-channel Receiver lifecycle — false while the tick
+    /// consumer holds it, true after it drops. The pool-slot respawn
+    /// classifier uses this to keep a WS-GAP-07 consumer-dead clean exit
+    /// TERMINAL (respawning would churn Dhan connects with zero benefit).
+    #[tokio::test]
+    async fn test_live_frame_channel_closed_tracks_receiver_drop() {
+        let (tx, rx) = mpsc::channel(100);
+        let conn = make_test_conn_for_read_loop(tx);
+        assert!(
+            !conn.live_frame_channel_closed(),
+            "channel must read open while the consumer Receiver is alive"
+        );
+        drop(rx);
+        assert!(
+            conn.live_frame_channel_closed(),
+            "channel must read closed after the consumer Receiver drops"
         );
     }
 
