@@ -55,10 +55,19 @@ alarms:
 
 ## Edge Cases
 
-- **Real pre-09:20 outage:** covered by the boot-heartbeat alarm
-  (tv_boot_completed, actions windowed 08:50–09:20 IST per
-  boot-heartbeat-alarm.tf) + the 08:45 readiness pager; from 09:20 the
-  market-hours-liveness alarm + these two re-armed alarms take over. A
+- **Real pre-09:20 outage (corrected 2026-07-10 review round 1):** the
+  boot-heartbeat alarm (tv_boot_completed, actions windowed 08:50–09:20 IST
+  per boot-heartbeat-alarm.tf) + the 08:45 readiness pager cover ONLY the
+  app-not-booted class (both key on tv_boot_completed / EC2 state). A pool
+  that connects at 09:00 and dies POST-boot in [09:00, 09:20) with the
+  process alive is caught by NEITHER — its pre-09:22 coverer is the
+  app-side 09:16:30 IST market-open self-test (main_feed_active check,
+  SELFTEST-02 Critical → Telegram; gated on
+  `features.market_open_self_test = true` — if that flag is ever disabled,
+  the first page for this class slips to ~09:22). Residual (honest): that
+  post-boot death first pages CloudWatch at ~09:22 — bounded, same class
+  as the boot-heartbeat §19 seam envelope (worst ~9-10 min). From 09:20
+  the market-hours-liveness alarm + these two re-armed alarms take over. A
   pool genuinely dead past 09:20 pages within ~2 min of window open
   (ws_pool_all_dead is 2×60s eval after the open-time OK reset).
 - **Stale pre-open ALARM state:** the gate Lambda's open mode calls
@@ -81,6 +90,25 @@ alarms:
   residual as the other 9 gated alarms, watched by the gate-errors
   watchman + the explicit `state = "ENABLED"` pins on the event rules.
   The market-hours-liveness-missing alarm still owns whole-app death.
+- **Gate open SKIP day (2026-07-10 review round 1 — accepted residual):**
+  the gate Lambda's 09:20 open path returns SUCCESS without enabling when
+  the holiday-stop SSM marker == today OR the box is not up at 09:20
+  (crash + autopilot race — autopilot restarts every 15 min, so the box
+  can be back by ~09:30; operator manual stop/start straddling 09:20; a
+  stale/mis-stamped holiday marker). A SUCCESS skip does NOT fire the
+  gate-errors watchman (Lambda ERRORS only), so on such a day BOTH
+  ws-pool alarms stay disarmed for the ENTIRE session and a real mid-day
+  pool death pages no CloudWatch alarm until the next day's open — a new
+  full-session CloudWatch-blind window vs. the pre-PR always-armed
+  behaviour. Partial mitigation: the operator is CloudWatch-blind only —
+  the app-side tick-gap Telegram + the 09:16:30 market-open self-test
+  still run from inside the app (market-hours-liveness-missing shares the
+  same disarm, so it is not the mitigation). FLAGGED FOLLOW-UP (not built
+  in this PR): make the open-path skip observable (custom metric /
+  log-filter alarm on the "leaving actions disabled" log line so a skip
+  on a non-holiday weekday pages), or have the start-watchdog/autopilot
+  re-invoke the gate Lambda with mode=open after a late in-window
+  instance start.
 - **Terraform drift (someone re-enables always-on actions or drops the
   ALARM_NAMES entries):** the new ratchet test fails the build.
 - **False-OK masking:** none introduced — the gauge itself is unchanged
@@ -132,6 +160,33 @@ no data change.
   membership for both alarms
   - Files: crates/common/tests/cloudwatch_app_alarms_wiring.rs
   - Tests: test_ws_pool_alarms_are_window_gated_not_always_armed
+
+- [x] Item 4 (2026-07-10 review round 1) — harden the ratchet: string-aware
+  strip_hcl_comments on the gate file before extracting the ALARM_NAMES
+  join body (a commented-out member or a stale commented-out join copy can
+  never pass/hijack), whitespace-tolerant join-header locator, line-prefix
+  membership matching, plus a mutation self-test (commented-out member
+  fixture MUST fail) and a pin on the gate Lambda's open-path
+  set_alarm_state(OK) reset loop (load-bearing for the ~2-min coverage
+  claim). Mutation-verified against the real tf (member commented out →
+  test RED, reverted → green).
+  - Files: crates/common/tests/cloudwatch_app_alarms_wiring.rs
+  - Tests: test_ws_pool_alarms_are_window_gated_not_always_armed,
+    test_hcl_stripper_and_join_locator_reject_commented_out_members
+
+- [x] Item 5 (2026-07-10 review round 1) — doc-honesty corrections: stale
+  "9 alarms" count/rationale → 11 with the ws-pool distinction in
+  boot-heartbeat-alarm.tf + daily-universe-scope-expansion-2026-05-27.md
+  §19 (dated correction); corrected HONEST COVERAGE ENVELOPE attribution
+  (09:16:30 self-test covers app-up-pool-dead, not boot-heartbeat/
+  readiness) + gate-open SKIP-day residual + flagged follow-up recorded in
+  app-alarms.tf and this plan's Edge Cases / Failure Modes.
+  - Files: deploy/aws/terraform/app-alarms.tf,
+    deploy/aws/terraform/boot-heartbeat-alarm.tf,
+    .claude/rules/project/daily-universe-scope-expansion-2026-05-27.md,
+    .claude/plans/active-plan-ws-pool-alarm-gate.md
+  - Tests: test_ws_pool_alarms_are_window_gated_not_always_armed (doc-only
+    otherwise)
 
 ## Scenarios
 

@@ -78,11 +78,36 @@ locals {
 # Mon-Fri by the gate Lambda (market-hours-liveness-alarm.tf), whose open
 # mode also set_alarm_state(OK)s the gated alarms — a stale pre-open ALARM
 # from the deferral window is reset at window open (edge-triggered, no
-# false-page carry-over). HONEST COVERAGE ENVELOPE: a REAL pre-09:20 outage
-# is paged by the boot-heartbeat alarm (tv_boot_completed, 08:50-09:20 IST
-# window) + the 08:45 IST readiness pager; from 09:20 the market-hours
-# liveness alarm + this re-armed alarm own it — a pool genuinely dead past
-# 09:20 pages within ~2 min of window open (2x60s eval after the OK reset).
+# false-page carry-over). HONEST COVERAGE ENVELOPE (corrected 2026-07-10
+# review round 1): the boot-heartbeat alarm (tv_boot_completed, 08:50-09:20
+# IST window) + the 08:45 IST readiness pager cover ONLY the app-not-booted
+# class (both key on tv_boot_completed / EC2 state); a pool that connects at
+# 09:00 and dies POST-boot in [09:00, 09:20) with the process alive is
+# caught by NEITHER — its pre-09:22 coverer is the APP-SIDE 09:16:30 IST
+# market-open self-test (main_feed_active check, SELFTEST-02 Critical →
+# Telegram; gated on config features.market_open_self_test = true — if that
+# flag is ever disabled, the first page for this class slips to ~09:22).
+# From 09:20 the market-hours liveness alarm + this re-armed alarm own it —
+# a pool genuinely dead past 09:20 pages within ~2 min of window open
+# (2x60s eval after the OK reset). Residual (honest): the post-boot
+# [09:00, 09:20) death above first pages CloudWatch at ~09:22 — bounded,
+# same class as the boot-heartbeat §19 seam envelope (worst ~9-10 min).
+# GATE-OPEN SKIP-DAY RESIDUAL (2026-07-10 review round 1): the gate
+# Lambda's 09:20 open path returns SUCCESS without enabling when the
+# holiday-stop SSM marker == today OR the box is not up at 09:20 (crash +
+# autopilot race, operator stop/start straddling 09:20, stale marker) — a
+# SUCCESS skip does NOT fire the gate-errors watchman (it catches Lambda
+# ERRORS only), so on such a day BOTH ws-pool alarms stay disarmed for the
+# ENTIRE session even if the box comes up minutes later; a real mid-day
+# pool death then pages no CloudWatch alarm until the next day's open.
+# Before 2026-07-10 these two alarms were always-armed and WOULD have paged
+# that outage. Partial mitigation: the operator is CloudWatch-blind only —
+# the app-side tick-gap Telegram + the 09:16:30 self-test still run from
+# inside the app. FLAGGED FOLLOW-UP (not built in this PR): make the
+# open-path skip observable (custom metric / log-filter alarm on the
+# "leaving actions disabled" log line so a skip on a non-holiday weekday
+# pages), or have the start-watchdog/autopilot re-invoke the gate Lambda
+# with mode=open after a late in-window instance start.
 # Strictly better than the always-armed alarm's daily false-page noise.
 # In-window sensitivity (metric/threshold/eval periods) is UNCHANGED.
 # ---------------------------------------------------------------------------
