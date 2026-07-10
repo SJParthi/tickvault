@@ -314,6 +314,16 @@ pub async fn require_bearer_auth(
             if token_match {
                 Ok(next.run(request).await)
             } else {
+                // 401-burst visibility (2026-07-10): SINGLE UNLABELED counter —
+                // one increment per bearer-auth rejection, no per-401 log beyond
+                // the pre-existing BUG-3 warn (log-amplification defence; the
+                // warn already carries path + peer for forensics). Feeds the
+                // tv-<env>-api-auth-failed CloudWatch alarm via the metrics log
+                // group delta-extraction route (auth-failed-alarm.tf); the
+                // series is pre-registered at 0 in main.rs post-recorder-install
+                // (first-sample baseline). Lockstep ratchet:
+                // crates/app/tests/auth_failed_alarm_wiring_guard.rs.
+                metrics::counter!("tv_api_auth_failed_total").increment(1);
                 warn!(
                     path = %request_path,
                     peer = %client_peer_label(&request),
@@ -323,6 +333,8 @@ pub async fn require_bearer_auth(
             }
         }
         Some(_) => {
+            // 401-burst counter — see the invalid-token arm comment.
+            metrics::counter!("tv_api_auth_failed_total").increment(1);
             warn!(
                 path = %request_path,
                 peer = %client_peer_label(&request),
@@ -331,6 +343,8 @@ pub async fn require_bearer_auth(
             Err(StatusCode::UNAUTHORIZED)
         }
         None => {
+            // 401-burst counter — see the invalid-token arm comment.
+            metrics::counter!("tv_api_auth_failed_total").increment(1);
             warn!(
                 path = %request_path,
                 peer = %client_peer_label(&request),

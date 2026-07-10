@@ -910,6 +910,189 @@ fn test_silent_feed_alarms_are_window_gated() {
     }
 }
 
+/// Strip `#`-comments from an HCL (terraform) body, STRING-AWARE: a `#`
+/// inside a double-quoted string (e.g. an alarm_description's "drop #1")
+/// is kept as code. Adapted from the self-tested house pattern in
+/// `crates/app/tests/seal_drop_paging_wiring_guard.rs` after the
+/// 2026-07-10 hostile review proved (empirically — mutation stayed GREEN)
+/// that `test_ws_pool_alarms_are_window_gated_not_always_armed` passed
+/// vacuously with a join member commented out: HCL `#` comments already
+/// live INSIDE the ALARM_NAMES join body (the dated trailing comments),
+/// so a commented-out member line still satisfied a raw `.contains` —
+/// the alarm would ship actions_enabled=false and never be armed, with
+/// the ratchet green (false-OK, audit Rule 11). Comments can never be
+/// terraform configuration, so they are removed before matching.
+fn strip_hcl_comments(body: &str) -> String {
+    let mut out = String::with_capacity(body.len());
+    for line in body.lines() {
+        let bytes = line.as_bytes();
+        let mut in_str = false;
+        let mut esc = false;
+        let mut cut = line.len();
+        for (i, &b) in bytes.iter().enumerate() {
+            if esc {
+                esc = false;
+                continue;
+            }
+            match b {
+                b'\\' if in_str => esc = true,
+                b'"' => in_str = !in_str,
+                b'#' if !in_str => {
+                    cut = i;
+                    break;
+                }
+                _ => {}
+            }
+        }
+        out.push_str(&line[..cut]);
+        out.push('\n');
+    }
+    out
+}
+
+/// Locate the ALARM_NAMES join body in a COMMENT-STRIPPED gate-file body.
+/// Whitespace-tolerant around the `=` (a future terraform-fmt alignment
+/// group padding `ALARM_NAMES        = join(` must not panic the locator),
+/// and — because the input is comment-stripped — immune to a stale
+/// commented-out copy of the join hijacking the FIRST-occurrence search
+/// (the 2026-07-10 review's join-locator finding). The Lambda Python's
+/// `ALARM_NAMES = [n.strip()...]` line is skipped (not followed by
+/// `join(`).
+fn alarm_names_join_body(stripped_gate: &str) -> &str {
+    let mut from = 0;
+    while let Some(rel) = stripped_gate[from..].find("ALARM_NAMES") {
+        let start = from + rel;
+        let after = &stripped_gate[start + "ALARM_NAMES".len()..];
+        let after_eq = after.trim_start();
+        if let Some(rest) = after_eq.strip_prefix('=') {
+            let rest = rest.trim_start();
+            if let Some(body) = rest.strip_prefix("join(") {
+                let end = body
+                    .find("])")
+                    .expect("ALARM_NAMES join must close with `])`"); // APPROVED: test
+                return &body[..end];
+            }
+        }
+        from = start + "ALARM_NAMES".len();
+    }
+    panic!("market-hours-liveness-alarm.tf must carry the ALARM_NAMES join"); // APPROVED: test
+}
+
+/// True iff a LIVE (non-commented) line of the comment-stripped join body
+/// names the alarm member. Line-level prefix matching is the second layer
+/// of defense on top of comment stripping: a member can only count when a
+/// line's code content STARTS with its resource reference.
+fn join_member_present(stripped_join_body: &str, name: &str) -> bool {
+    let needle = format!("aws_cloudwatch_metric_alarm.{name}.alarm_name");
+    stripped_join_body
+        .lines()
+        .any(|l| l.trim_start().starts_with(&needle))
+}
+
+#[test]
+fn test_hcl_stripper_and_join_locator_reject_commented_out_members() {
+    // Anti-vacuity MUTATION self-test (2026-07-10 review, HIGH finding):
+    // the exact regression shape that made the original ratchet pass
+    // vacuously — a member commented out inside the join — must now FAIL
+    // the membership check, while a live member (even one carrying a
+    // trailing `#` comment, the real file's shape) still passes. Also
+    // pins the locator against (a) a stale commented-out COPY of the
+    // whole join above the live one and (b) terraform-fmt alignment
+    // padding around the `=`.
+    let fixture = "      # stale refactor residue — a commented-out copy of the join:\n\
+                   # ALARM_NAMES = join(\",\", [\n\
+                   #   aws_cloudwatch_metric_alarm.ws_pool_all_dead.alarm_name,\n\
+                   # ])\n\
+                   ALARM_NAMES        = join(\",\", [\n\
+                   aws_cloudwatch_metric_alarm.market_hours_liveness_missing.alarm_name,\n\
+                   # aws_cloudwatch_metric_alarm.ws_pool_all_dead.alarm_name,\n\
+                   aws_cloudwatch_metric_alarm.ws_failed_connections.alarm_name, # 2026-07-10\n\
+                   ])\n";
+    let stripped = strip_hcl_comments(fixture);
+    let body = alarm_names_join_body(&stripped);
+    assert!(
+        !join_member_present(body, "ws_pool_all_dead"),
+        "MUTATION MUST FAIL: a commented-out join member satisfied the \
+         membership check — the vacuous-pass hole is back. Body:\n{body}"
+    );
+    assert!(
+        join_member_present(body, "ws_failed_connections"),
+        "a LIVE member with a trailing # comment must still pass:\n{body}"
+    );
+    assert!(
+        join_member_present(body, "market_hours_liveness_missing"),
+        "a plain live member must pass:\n{body}"
+    );
+    // Stripper string-awareness: a `#` inside a double-quoted string is
+    // code, not a comment start.
+    let s = strip_hcl_comments("alarm_description = \"drop #1 kept\" # trailing gone\n");
+    assert!(
+        s.contains("drop #1 kept") && !s.contains("trailing gone"),
+        "strip_hcl_comments must keep in-string # and drop trailing comments: {s}"
+    );
+}
+
+#[test]
+fn test_ws_pool_alarms_are_window_gated_not_always_armed() {
+    // 2026-07-10 incident pin (pre-09:00 deferral false-page fix): the pool
+    // watchdog writes tv_websocket_pool_all_dead +
+    // tv_websocket_failed_connections_count unconditionally every 5s, while
+    // the pool DELIBERATELY opens zero Dhan sockets until 09:00 IST (the
+    // by-design pre-open connect deferral). ws-pool-all-dead was the ONLY
+    // liveness-class alarm not in the market-hours window gate, so it paged
+    // "ALL live market data connections are down" every trading morning
+    // ~08:34-09:00 and on overnight catch-up-deploy boots (observed
+    // 2026-07-10 at 02:45, 03:42, 08:34 IST); ws-failed-connections shares
+    // the same false class. Fix = the house pattern: actions_enabled=false
+    // + membership in the gate Lambda's ALARM_NAMES join (armed 09:20-15:35
+    // IST Mon-Fri; the open path's set_alarm_state(OK) resets a stale
+    // pre-open ALARM so no false page carries into the armed window).
+    // Losing EITHER half regresses: dropping actions_enabled=false restores
+    // the daily false pages; dropping the ALARM_NAMES entry leaves the
+    // alarm actions-disabled FOREVER (exists but is dead).
+    let tf = read("deploy/aws/terraform/app-alarms.tf");
+    let gate = read("deploy/aws/terraform/market-hours-liveness-alarm.tf");
+    // Scope the membership check to the COMMENT-STRIPPED ALARM_NAMES join
+    // body (2026-07-10 review hardening): a comment mention elsewhere in
+    // the gate file, a comment INSIDE the join (the trailing dated
+    // comments), or a stale commented-out copy of the join can never
+    // satisfy — or hijack — the check. Mutation-verified by
+    // test_hcl_stripper_and_join_locator_reject_commented_out_members.
+    let stripped_gate = strip_hcl_comments(&gate);
+    let join_body = alarm_names_join_body(&stripped_gate);
+    for name in ["ws_pool_all_dead", "ws_failed_connections"] {
+        let block = alarm_resource_block(&tf, name);
+        assert!(
+            block_has_attr(&block, "actions_enabled", "false"),
+            "{name} must ship actions_enabled=false (gate Lambda owns the 09:20-15:35 IST \
+             window; always-armed actions false-page during the by-design pre-09:00 IST \
+             Dhan connect deferral — 2026-07-10 incident):\n{block}"
+        );
+        assert!(
+            join_member_present(join_body, name),
+            "{name} must be INSIDE the window-gate Lambda ALARM_NAMES join \
+             (market-hours-liveness-alarm.tf, live line — commented out does NOT \
+             count) — without it the alarm stays actions-disabled forever. \
+             Join body was:\n{join_body}"
+        );
+    }
+    // Load-bearing companion pin (2026-07-10 review): the coverage claim
+    // "pages within ~2 min of window open" depends on the gate Lambda's
+    // open path resetting every gated alarm to OK — CloudWatch actions
+    // fire only on state TRANSITION, and ws_pool_all_dead is EXPECTED to
+    // sit in stale pre-open ALARM every morning (the 08:34-09:00 deferral
+    // window breaches it with actions disabled). Without the OK reset, a
+    // pool genuinely dead across 09:20 would page NEVER, not "in ~2 min".
+    // Matched on the comment-stripped body so the Lambda-source comment
+    // mentioning set_alarm_state can never satisfy it.
+    assert!(
+        stripped_gate.contains("cw.set_alarm_state(") && stripped_gate.contains("StateValue='OK'"),
+        "the gate Lambda's open path must keep the per-name set_alarm_state(OK) reset \
+         loop — without it a stale pre-open ALARM never transitions after arming and \
+         a real overnight-to-open outage pages NEVER"
+    );
+}
+
 #[test]
 fn test_boundary_catchup_alarm_uses_per_feed_dimensions() {
     // Rule-11 pin: the catch-up storm alarm must key on the EXPLICIT
