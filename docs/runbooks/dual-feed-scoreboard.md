@@ -121,6 +121,19 @@ FROM feed_scoreboard_daily WHERE outcome != 'complete' ORDER BY trading_date_ist
 - **Re-run today:** restart with `TICKVAULT_SCOREBOARD_NOW=1`. Idempotent —
   the daily row carries the deterministic 15:45 IST ts and the episode rows
   reuse their audit-row ts, so everything UPSERTs in place.
+- **Backfill a PAST day:** restart with `TICKVAULT_SCOREBOARD_NOW=1
+  TICKVAULT_SCOREBOARD_DATE=YYYY-MM-DD` (both required — the date is only
+  honored alongside the forced-run flag). Disconnect episodes + blame +
+  per-feed coverage totals + exclusive/both minutes rebuild from the
+  retained `ws_event_audit` + `ticks` tables; the run is DEDUP-idempotent.
+  A malformed date REFUSES the run loudly (strict `YYYY-MM-DD`, fail-closed)
+  — you get the "scorecard did NOT run" page, never the wrong day's row.
+- **Forced run BEFORE 3:45 PM:** allowed (dry-run), but the row is stamped
+  `partial_coverage=true` / `outcome=partial` and the Telegram says
+  "produced early on operator request" — a mid-day card never masquerades
+  as the end-of-day record. The once-per-process task has then consumed the
+  day's scheduled run; re-run after close (or let a post-close restart's
+  catch-up run) for the complete row.
 - **What a re-run/backfill CANNOT recover:**
   - errors.jsonl correlation older than the 48h retention → 805 episodes
     default `broker`, resets default `indeterminate` (rows flagged
@@ -129,21 +142,32 @@ FROM feed_scoreboard_daily WHERE outcome != 'complete' ORDER BY trading_date_ist
     per-process) → sentinels stay.
   - Per-instrument unique-wins for pre-PR-4 days.
   - Stall episode rows for days before the stall event kind ships (PR-2) —
-    those days honestly read `stalls = 0`; the CloudWatch counter
-    `tv_feed_sidecar_stall_restart_total` holds the past.
-- **Process deaths** are reconciled once per boot (≈3 min after start). A
-  death is only synthesized when the boot happened in-session AND this
-  boot's own connect row landed — the 16:30 auto-stop → 08:30 start cycle
-  never counts as a death.
+    those days honestly read `stalls = 0` in the table (the Telegram shows
+    "?"); the CloudWatch counter `tv_feed_sidecar_stall_restart_total`
+    holds the past.
+  - A process death whose boot's connect row NEVER landed inside the
+    reconcile poll window (below) — the coverage hole still shows in
+    `streaming_minutes`, but the episode row is absent.
+- **Process deaths** are reconciled once per boot on BOTH boot paths
+  (normal start AND the fast crash-recovery restart): the first query fires
+  ≈3 min after start, then POLLS every 60s (up to ~12 min total) until this
+  boot's own connect row is visible — covering a restart that waits out the
+  5-minute rate-limit cooldown before reconnecting. A death is synthesized
+  when the connection was up IN SESSION when the previous process died (the
+  gate keys on the DEATH window, so an in-session crash restarted after
+  close still counts) — the 16:30 auto-stop → 08:30 start cycle never
+  counts as a death (the prior day's rows are day-scoped out).
 
 ## 5. Day-1 notes (PR-A scope)
 
 - Disconnect episodes + blame + per-feed coverage totals + feed-level
   exclusive/both minutes work from day 1 (they aggregate the EXISTING
   `ws_event_audit` + `ticks` tables — any past day is backfillable for
-  those).
-- Lag = `-1` sentinels until PR-3; per-instrument detail until PR-4;
-  stall rows until PR-2. The Telegram footnotes say so explicitly.
+  those via `TICKVAULT_SCOREBOARD_NOW=1 TICKVAULT_SCOREBOARD_DATE=…`, §4).
+- Lag = `-1` sentinels until PR-3; stalls render "?" until PR-2 — the
+  Telegram carries explicit footnotes for BOTH. Per-instrument detail
+  (until PR-4) is table-only and never rendered on the card, so it needs
+  no footnote.
 - The whole subsystem is toggleable: `[scoreboard] enabled = false` in
   `config/base.toml` spawns nothing (the rollback switch).
 - Failure signal: SCOREBOARD-01 in the error stream

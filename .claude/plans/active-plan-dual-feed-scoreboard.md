@@ -60,9 +60,12 @@ forensic tables:
    cold-path QuestDB `/exec` reads, 10s timeout, fail-to-sentinel parses):
    episodes from today's `ws_event_audit` + same-day errors.jsonl
    correlation scan (RESILIENCE-01/03, WS-GAP-09 reasons ±120s, PROC-01 /
-   RESOURCE-01..03 ±300s) → classify → UPSERT `feed_episode_audit`; blame
-   aggregate read back from `feed_episode_audit` (includes the boot-written
-   process-death rows); per-feed ticks / distinct-instrument / session
+   RESOURCE-01..03 ±300s) → classify → UPSERT `feed_episode_audit` AND
+   tally IN MEMORY (review round 1: the ILP-HTTP ACK is commit-to-WAL, not
+   visible-to-SELECT — a same-run read-back races); the read-back merges
+   ONLY the boot-reconciled process-death rows (written minutes earlier,
+   long visible); every embedded SQL window bound is epoch MICROS (QuestDB
+   TIMESTAMP-literal semantics); per-feed ticks / distinct-instrument / session
    distinct-minute SQL over `ticks` (feed-level unique-win + both minutes
    computed in Rust from the two ≤375-entry minute sets); lag columns = −1
    sentinels with `lag_floor_ms` honesty column (PR-3 lands the histograms);
@@ -108,8 +111,13 @@ forensic tables:
 - QuestDB unreachable mid-run → −1 sentinels + `outcome='partial'`, row
   still written when the writer flush succeeds; SCOREBOARD-01 error!
   otherwise. NEVER fabricated zeros.
-- Boot reconciler: no post-boot `connected` row within the delay window →
-  skip that key (no deterministic ts to stamp; honest, documented).
+- Boot reconciler: no post-boot `connected` row yet → POLL every 60s (up to
+  ~12 min total — covers the 300s WS-GAP-08 429-cooldown wait before the
+  fast-boot connect); still none after the budget → skip (no deterministic
+  ts to stamp; honest, documented).
+- In-session crash + out-of-session restart (e.g. died 15:20, restarted
+  15:35) → STILL synthesized: the gate keys on the prior "up" row's
+  in-session-ness (the death window), never on the boot instant.
 - Feed disabled all day → its row shows 0 ticks / 0 minutes (query-backed
   truth, not fabricated).
 
@@ -197,11 +205,11 @@ forensic tables:
 
 - [x] Item 1 — Storage tables + writers (scoreboard daily + coverage detail + episode audit)
   - Files: crates/storage/src/feed_scoreboard_persistence.rs, crates/storage/src/feed_episode_audit_persistence.rs, crates/storage/src/lib.rs
-  - Tests: test_feed_scoreboard_daily_ddl_contains_expected_columns, test_feed_scoreboard_dedup_keys_ts_first_and_feed_in_key, test_feed_coverage_daily_dedup_key_full_instrument_pair_plus_feed, test_feed_episode_audit_ddl_contains_expected_columns, test_episode_append_row_writes_blame_and_feed_symbols, test_episode_flush_when_disconnected_errors, test_scoreboard_writers_use_ilp_http_conf
+  - Tests: test_feed_scoreboard_daily_create_ddl_contains_expected_columns, test_feed_scoreboard_dedup_keys_ts_first_and_feed_in_key, test_feed_coverage_daily_create_ddl_dedup_key_full_instrument_pair_plus_feed, test_feed_episode_audit_ddl_contains_expected_columns, test_episode_append_row_writes_blame_and_feed_symbols, test_episode_flush_when_disconnected_errors, test_scoreboard_writers_use_ilp_http_conf
 
 - [x] Item 2 — Pure total blame classifier
   - Files: crates/common/src/feed_blame.rs, crates/common/src/lib.rs
-  - Tests: test_blame_class_labels_stable_and_nonempty, test_classify_dhan_805_with_peer_evidence_is_ours_dual_instance, test_classify_dhan_805_without_evidence_is_broker, test_classify_dhan_807_is_broker_auth_token_expired, test_classify_dhan_auth_entitlement_codes_are_broker, test_classify_rst_with_ws_gap9_overlap_is_broker, test_classify_rst_without_overlap_is_indeterminate, test_classify_network_and_unknown_are_indeterminate, test_classify_groww_feed_toggle_is_ours, test_classify_stall_reasons, test_classify_resource_pressure_is_ours, test_classify_process_death_deploy_vs_crash, test_classify_off_hours_disconnect_is_indeterminate, test_classifier_total_unknown_inputs_map_to_indeterminate, prop_classifier_is_total_never_panics_never_blank
+  - Tests: test_blame_class_labels_stable_and_nonempty, test_classify_dhan_805_with_peer_evidence_is_ours_dual_instance, test_classify_dhan_805_without_evidence_is_broker, test_classify_dhan_807_is_broker_auth_token_expired, test_classify_dhan_auth_entitlement_codes_are_broker, test_classify_rst_with_ws_gap9_overlap_is_broker, test_classify_rst_without_overlap_is_indeterminate, test_classify_network_and_unknown_are_indeterminate, test_classify_groww_feed_toggle_is_ours, test_classify_stall_reasons, test_classify_resource_pressure_is_ours, test_classify_process_death_deploy_vs_crash, test_classify_off_hours_disconnect_is_indeterminate, test_classify_groww_bridge_died_is_ours, test_classify_order_update_clean_close_is_named_indeterminate, test_classify_episode_total_unknown_inputs_map_to_indeterminate, prop_classifier_is_total_never_panics_never_blank
 
 - [x] Item 3 — SCOREBOARD-01 error code + rule file
   - Files: crates/common/src/error_code.rs, .claude/rules/project/dual-feed-scoreboard-error-codes.md
@@ -213,7 +221,7 @@ forensic tables:
 
 - [x] Item 5 — Process-death reconciler + 15:45 IST daily task
   - Files: crates/app/src/feed_scoreboard_boot.rs, crates/app/src/lib.rs
-  - Tests: test_decide_scoreboard_start_boundaries, test_scoreboard_trigger_constant_is_1545_ist, test_build_scoreboard_sql_builders_feed_filtered_and_windowed, test_parse_ws_events_from_exec_body, test_compute_minute_overlap, test_parse_errors_jsonl_line_extracts_code_reason_ts, test_correlation_overlap_windows, test_synthesize_process_death_up_state_prior, test_synthesize_process_death_skips_down_state_and_out_of_session, test_synthesize_process_death_deterministic_ts_and_groww_double_connect, test_deploy_vs_crash_sub_reason, test_parse_prom_counter_sum_labeled_series
+  - Tests: test_decide_scoreboard_start_boundaries, test_scoreboard_trigger_constant_is_1545_ist, test_build_ws_events_day_sql_micros_window, test_build_episode_day_sql_micros_window, test_build_boot_reconciled_episode_day_sql_micros_and_detector_filter, test_build_scoreboard_ticks_count_sql_micros_window, test_build_feed_instruments_count_sql_micros_and_segment_qualified, test_build_feed_session_minutes_sql_micros_session_window, test_parse_ws_events_from_exec_body, test_compute_minute_overlap, test_parse_minute_set_from_exec_body, test_parse_errors_jsonl_line_extracts_code_reason_ts, test_collect_correlation_evidence_and_has_overlap_windows, test_synthesize_process_death_up_state_prior, test_synthesize_process_death_gates_on_death_window_not_boot_instant, test_synthesize_process_death_skips_down_state_and_out_of_session_death, test_synthesize_process_death_deterministic_ts_and_groww_double_connect, test_deploy_vs_crash_sub_reason, test_parse_prom_counter_sum_labeled_series, test_parse_scoreboard_date_override_strict_fail_closed, test_fold_episode_into_tally_matches_sql_aggregate_rule, test_merge_episode_tallies_sums_boot_reconciled_rows_in
 
 - [x] Item 6 — Telegram scorecard events + main.rs wiring
   - Files: crates/core/src/notification/events.rs, crates/app/src/main.rs, crates/core/src/auth/secret_manager.rs
@@ -222,6 +230,49 @@ forensic tables:
 - [x] Item 7 — Month-end runbook
   - Files: docs/runbooks/dual-feed-scoreboard.md
   - Tests: every_runbook_path_exists_on_disk (rule file cross-ref covers the rule doc; the runbook is prose)
+
+- [x] Item 8 — Hostile-review round 1 fixes (2026-07-10)
+  - CRITICAL: every embedded SQL window bound converted NANOS → MICROS
+    (QuestDB TIMESTAMP-comparison semantics, empirically confirmed on the
+    pinned 9.3.5 — nanos literals silently matched ZERO rows); the reused
+    tick_conservation ticks-count builder replaced by a local micros
+    builder (the shipped conservation builder's own nanos bug is
+    pre-existing on main — separate-PR candidate, reported).
+  - CRITICAL: scoreboard tasks now spawn on the FAST crash-recovery boot
+    arm too (before `return run_shutdown_fast`); the wiring ratchet pins
+    BOTH boot paths by source order.
+  - CRITICAL: SCOREBOARD-01 triage rule actually added to
+    .claude/triage/error-rules.yaml (the earlier commit message claimed it
+    without the file change — evidence-discipline fix).
+  - HIGH: write-then-read race removed — blame tallies computed IN MEMORY
+    from the just-classified rows; the read-back merges ONLY the
+    boot-reconciled process-death rows (long visible).
+  - HIGH: stalls render "?" + footnote on the card (no stall emit site
+    until PR-2 — never a fabricated 0); runbook footnote claim corrected.
+  - HIGH: pub-fn-test-guard ratchet restored to baseline 112 (test renames
+    embedding every new pub fn name — no baseline bump).
+  - MEDIUM: TICKVAULT_SCOREBOARD_DATE=YYYY-MM-DD past-day backfill
+    (fail-closed strict parse) honored with TICKVAULT_SCOREBOARD_NOW;
+    runbook §4 documents it; an early forced run stamps the row partial +
+    says so on the card.
+  - MEDIUM: reconnects record the −1 sentinel when the ws_event read
+    failed (never a fabricated 0).
+  - MEDIUM: `bridge_died` classifies ours/`bridge_task_died`;
+    `clean close` gets a named indeterminate slug.
+  - MEDIUM: reconciler POLLS (180s + up to 9×60s) for the post-boot
+    connect row — covers the 300s WS-GAP-08 429-cooldown restart case.
+  - MEDIUM: process-death gate keys on the DEATH window (prior "up" row
+    in-session), not the boot instant; RunCatchUp/forced runs await the
+    reconciler before aggregating.
+  - MEDIUM: partial-coverage footnote reworded to the honest PR-1 cause
+    (read failure while building the card).
+  - LOW (free): greenfield ensure fns drop the `SET feed='dhan'` NULL
+    backfill (misattribution risk on cross/groww rows); storage ensure
+    error! sites carry code=SCOREBOARD-01 + stage; verdict rung 3 guards
+    blame sentinels; tick counts render with thousands separators; the
+    who-caused-them split decoupled from the drops count.
+  - Files: crates/app/src/feed_scoreboard_boot.rs, crates/app/src/main.rs, crates/common/src/feed_blame.rs, crates/core/src/notification/events.rs, crates/core/src/auth/secret_manager.rs, crates/storage/src/feed_scoreboard_persistence.rs, crates/storage/src/feed_episode_audit_persistence.rs, .claude/triage/error-rules.yaml, docs/runbooks/dual-feed-scoreboard.md
+  - Tests: test_build_ws_events_day_sql_micros_window, test_build_scoreboard_ticks_count_sql_micros_window, test_feed_scoreboard_task_is_wired_into_main, test_parse_scoreboard_date_override_strict_fail_closed, test_fold_episode_into_tally_matches_sql_aggregate_rule, test_merge_episode_tallies_sums_boot_reconciled_rows_in, test_synthesize_process_death_gates_on_death_window_not_boot_instant, test_classify_groww_bridge_died_is_ours, test_dual_feed_scorecard_body_sentinels_and_footnotes, every_error_code_variant_has_a_triage_rule
 
 ## Scenarios
 

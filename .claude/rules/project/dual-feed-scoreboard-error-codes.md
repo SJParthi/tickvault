@@ -87,9 +87,13 @@ operator signal.
 
 **Source:**
 - `crates/common/src/error_code.rs::ErrorCode::Scoreboard01AggregationDegraded`
-- `crates/app/src/feed_scoreboard_boot.rs` (all emit sites)
+- `crates/app/src/feed_scoreboard_boot.rs` + the `spawn_feed_scoreboard_tasks`
+  arms in `crates/app/src/main.rs` (spawned on BOTH boot paths — the fast
+  crash-recovery arm AND the slow process-global prefix)
 - `crates/storage/src/feed_scoreboard_persistence.rs` /
-  `crates/storage/src/feed_episode_audit_persistence.rs` (the tables)
+  `crates/storage/src/feed_episode_audit_persistence.rs` (the tables; their
+  ensure-DDL failure arms carry the literal `code = "SCOREBOARD-01"` +
+  `stage` per the tag-guard convention)
 - `crates/common/src/feed_blame.rs` (the classifier — no emit sites; pure)
 
 ## §2. Blame taxonomy (persisted on every `feed_episode_audit` row)
@@ -103,6 +107,8 @@ operator signal.
 | Dhan 807 | broker | `auth_token_expired` |
 | Dhan 806/808–814 | broker | `auth_entitlement` |
 | Groww `feed_disabled` | ours | `feed_toggle` |
+| Groww `bridge_died` (our bridge task panicked + respawned — FEED-SUPERVISOR-01 class) | ours | `bridge_task_died` |
+| Order-update `clean close` (server Close frame / stream end — idle-day close vs auth-reject delivery, not attributable per-row) | indeterminate | `clean_close` |
 | Stall (PR-2), silent-socket / never-streamed | broker | `silent_socket` / `never_streamed` |
 | Stall, token/auth-stale class | ours | `token_minter_stale` |
 | Stall, Authorization/Permissions/entitlement class | broker | `entitlement_reject` |
