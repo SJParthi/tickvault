@@ -254,6 +254,43 @@ impl TradingCalendar {
         self.mock_trading_dates.len()
     }
 
+    /// Last calendar date this holiday calendar vouches for: December 31 of
+    /// the NEWEST year among the configured `nse_holidays` entries.
+    ///
+    /// NSE publishes its trading-holiday circular per CALENDAR YEAR, so a
+    /// calendar whose newest listed holiday is in year Y is authoritative
+    /// through Y-12-31 — after that, `is_holiday()` (a bare set lookup with
+    /// no year bound) silently treats every un-listed weekday holiday as a
+    /// trading day. Muhurat + mock dates are deliberately EXCLUDED: only
+    /// `nse_holidays` drives the safety-critical `is_trading_day()` gate.
+    ///
+    /// Returns `None` when the holiday list is empty (pathological — the
+    /// config guards in `crates/common/tests/` prevent it in prod; callers
+    /// treat `None` as maximally stale).
+    #[must_use]
+    pub fn coverage_end_date(&self) -> Option<NaiveDate> {
+        self.holidays
+            .iter()
+            .map(chrono::Datelike::year)
+            .max()
+            .and_then(|year| NaiveDate::from_ymd_opt(year, 12, 31))
+    }
+
+    /// Signed days of holiday-calendar coverage remaining from `today`
+    /// (IST wall-clock date by convention — pass `today_ist()` in prod).
+    ///
+    /// `Some(0)` means `today` is the final covered date; negative means
+    /// the calendar already ran off its cliff (e.g. a 2026-only calendar
+    /// queried on 2027-01-02 returns `Some(-2)`). `None` = empty calendar.
+    ///
+    /// Pure date math on `NaiveDate` — timezone-free, so the year-boundary
+    /// arithmetic cannot drift as long as the caller supplies an IST date.
+    #[must_use]
+    pub fn coverage_days_remaining(&self, today: NaiveDate) -> Option<i64> {
+        self.coverage_end_date()
+            .map(|end| end.signed_duration_since(today).num_days())
+    }
+
     /// Computes seconds from `now_utc_secs` until the next NSE market open
     /// (09:00 IST on the next trading day, skipping weekends + holidays).
     ///
@@ -361,6 +398,27 @@ pub fn ist_offset() -> FixedOffset {
 /// Returns today's date in IST.
 fn today_ist() -> NaiveDate {
     Utc::now().with_timezone(&ist_offset()).date_naive()
+}
+
+/// Classifies holiday-calendar coverage as stale.
+///
+/// Pure total function — the single decision point for the runtime
+/// coverage-horizon guard (`crates/app/src/calendar_staleness.rs`) and its
+/// tests:
+/// - `None` (empty calendar) → stale.
+/// - `Some(d)` → stale iff `d < threshold_days` (STRICT: exactly
+///   `threshold_days` of coverage left is NOT yet stale; one day fewer is).
+///
+/// With the default threshold
+/// (`constants::CALENDAR_COVERAGE_WARN_THRESHOLD_DAYS` = 60) and a calendar
+/// ending 2026-12-31, paging begins on 2026-11-02 (59 days remaining) and
+/// continues daily until the operator pastes the next official NSE circular.
+#[must_use]
+pub fn is_calendar_coverage_stale(days_remaining: Option<i64>, threshold_days: i64) -> bool {
+    match days_remaining {
+        None => true,
+        Some(d) => d < threshold_days,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1360,5 +1418,97 @@ mod tests {
         // loop increments candidate after checking, ending at day 14).
         let expected_last = start + chrono::Duration::days(14);
         assert_eq!(result, expected_last);
+    }
+
+    // ---------------------------------------------------------------
+    // W2 PR#5 (2026-07-10) — coverage-horizon staleness primitives
+    // ---------------------------------------------------------------
+
+    fn ymd(y: i32, m: u32, d: u32) -> NaiveDate {
+        NaiveDate::from_ymd_opt(y, m, d).unwrap() // APPROVED: test-only literal dates
+    }
+
+    #[test]
+    fn test_coverage_end_date_is_dec31_of_newest_year() {
+        // make_test_config lists 2026 holidays only → coverage vouches
+        // through 2026-12-31 (NOT the newest holiday date 2026-10-20).
+        let calendar = TradingCalendar::from_config(&make_test_config()).unwrap();
+        assert_eq!(calendar.coverage_end_date(), Some(ymd(2026, 12, 31)));
+    }
+
+    #[test]
+    fn test_coverage_end_date_multi_year_picks_max_year() {
+        let mut config = make_test_config();
+        config.nse_holidays.push(NseHolidayEntry {
+            date: "2027-01-26".to_string(), // Tuesday — weekday, parses
+            name: "Republic Day 2027 (synthetic test date)".to_string(),
+        });
+        let calendar = TradingCalendar::from_config(&config).unwrap();
+        assert_eq!(calendar.coverage_end_date(), Some(ymd(2027, 12, 31)));
+    }
+
+    #[test]
+    fn test_coverage_end_date_empty_calendar_is_none() {
+        let mut config = make_test_config();
+        config.nse_holidays.clear();
+        let calendar = TradingCalendar::from_config(&config).unwrap();
+        assert_eq!(calendar.coverage_end_date(), None);
+        assert_eq!(calendar.coverage_days_remaining(ymd(2026, 6, 1)), None);
+    }
+
+    #[test]
+    fn test_coverage_days_remaining_boundaries() {
+        // 2026-only calendar → coverage end 2026-12-31.
+        let calendar = TradingCalendar::from_config(&make_test_config()).unwrap();
+
+        // The audit-task canonical case: today 2026-11-15 → 46 days left.
+        assert_eq!(
+            calendar.coverage_days_remaining(ymd(2026, 11, 15)),
+            Some(46)
+        );
+        // Exactly N=60 days before the cliff: 2026-11-01.
+        assert_eq!(calendar.coverage_days_remaining(ymd(2026, 11, 1)), Some(60));
+        // One day later → 59 (first stale day at N=60).
+        assert_eq!(calendar.coverage_days_remaining(ymd(2026, 11, 2)), Some(59));
+        // One day earlier → 61 (not yet stale at N=60).
+        assert_eq!(
+            calendar.coverage_days_remaining(ymd(2026, 10, 31)),
+            Some(61)
+        );
+        // today == coverage end → 0 (today still covered, tomorrow not).
+        assert_eq!(calendar.coverage_days_remaining(ymd(2026, 12, 31)), Some(0));
+        // Past the cliff (year boundary crossed) → negative, honest.
+        assert_eq!(calendar.coverage_days_remaining(ymd(2027, 1, 2)), Some(-2));
+    }
+
+    #[test]
+    fn test_is_calendar_coverage_stale_truth_table() {
+        // Empty calendar = maximally stale.
+        assert!(is_calendar_coverage_stale(None, 60));
+        // Exactly threshold days left → NOT stale (strict `<`).
+        assert!(!is_calendar_coverage_stale(Some(60), 60));
+        // One fewer → stale.
+        assert!(is_calendar_coverage_stale(Some(59), 60));
+        // One more → not stale.
+        assert!(!is_calendar_coverage_stale(Some(61), 60));
+        // Zero and negative (post-cliff) → stale.
+        assert!(is_calendar_coverage_stale(Some(0), 60));
+        assert!(is_calendar_coverage_stale(Some(-30), 60));
+        // Degenerate threshold 0: nothing non-negative is stale.
+        assert!(!is_calendar_coverage_stale(Some(0), 0));
+        assert!(is_calendar_coverage_stale(Some(-1), 0));
+    }
+
+    #[test]
+    fn test_coverage_stale_canonical_audit_case() {
+        // Calendar ending 2026-12-31 + today 2026-11-15 → stale at N=60
+        // (46 days remaining) — the exact scenario from the 2026-07-09
+        // audit follow-up row 15.
+        let calendar = TradingCalendar::from_config(&make_test_config()).unwrap();
+        let remaining = calendar.coverage_days_remaining(ymd(2026, 11, 15));
+        assert!(is_calendar_coverage_stale(remaining, 60));
+        // And a fresh mid-year date is quiet.
+        let mid_year = calendar.coverage_days_remaining(ymd(2026, 6, 1));
+        assert!(!is_calendar_coverage_stale(mid_year, 60));
     }
 }

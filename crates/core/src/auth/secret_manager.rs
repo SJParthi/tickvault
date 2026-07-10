@@ -1470,6 +1470,66 @@ mod tests {
         );
     }
 
+    /// W2 PR#5 (2026-07-10, audit follow-up row 15): `main.rs` MUST spawn
+    /// the holiday-calendar coverage-horizon staleness watchdog from the
+    /// COMMON boot prefix. Without this wire, the `nse_holidays` calendar
+    /// (one calendar year at a time; `is_holiday` has NO year bound)
+    /// silently runs off its year-end cliff — every un-listed weekday
+    /// holiday reads as a trading day, the box auto-starts and burns a full
+    /// billable session on a market-closed day — with zero runtime signal
+    /// (the CI-only Jan-1 red-build ratchets are reactive, post-cliff).
+    /// The watchdog pages the operator (Severity::High, one page per
+    /// process per IST day) when < 60 days of coverage remain.
+    #[test]
+    fn test_calendar_staleness_watchdog_is_wired_into_main() {
+        let main_rs = std::fs::read_to_string("../app/src/main.rs")
+            .or_else(|_| std::fs::read_to_string("crates/app/src/main.rs"))
+            .expect("main.rs must be readable");
+        // Comment-stripped scan (hostile-review H1, 2026-07-10): a raw
+        // `contains` would still pass with the spawn commented out. Line
+        // comments suffice here — main.rs call sites are line-oriented and
+        // the anchor string never appears inside a string literal.
+        let non_comment: String = main_rs
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            non_comment.contains("spawn_calendar_staleness_watchdog("),
+            "main.rs MUST call \
+             `calendar_staleness::spawn_calendar_staleness_watchdog` from the \
+             common boot prefix (audit follow-up row 15), NOT commented out. \
+             Without it, the holiday calendar runs off its year-end cliff \
+             with zero runtime warning and un-listed holidays are treated as \
+             trading days."
+        );
+        // Anti-vacuous: the spawn must receive the trading calendar AND the
+        // lazily-filled notifier slot (a stub call with neither could
+        // satisfy a bare substring check). Scan the comment-stripped
+        // call-site region for both argument identifiers.
+        let idx = non_comment
+            .find("spawn_calendar_staleness_watchdog(")
+            .expect("checked above"); // APPROVED: test
+        // Char-boundary-safe window end (string literals in main.rs carry
+        // non-ASCII; a raw byte slice could split a multi-byte char).
+        let mut end = non_comment.len().min(idx + 400);
+        while !non_comment.is_char_boundary(end) {
+            end -= 1;
+        }
+        let window = &non_comment[idx..end];
+        assert!(
+            window.contains("trading_calendar"),
+            "the calendar-staleness watchdog call site must pass the \
+             process trading_calendar (found call without it)"
+        );
+        assert!(
+            window.contains("notifier_slot"),
+            "the calendar-staleness watchdog call site must pass the \
+             lazily-filled notifier slot so the High Telegram page can \
+             actually be delivered (found call without it)"
+        );
+    }
+
     /// Silent-feed hardening Item 4 (2026-07-06 incident): the Dhan
     /// exchange-lag p99 publisher MUST be spawned via its supervisor
     /// (respawn + counter — WS-GAP-05 / SLO-03 pattern). A bare

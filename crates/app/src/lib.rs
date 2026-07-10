@@ -19,6 +19,10 @@
 #![allow(clippy::doc_overindented_list_items)]
 
 pub mod bar_cache_loader;
+// W2 PR#5 (2026-07-10, audit follow-up row 15): holiday-calendar
+// coverage-horizon staleness watchdog - pages the operator BEFORE the
+// calendar runs off its year-end cliff into un-listed holidays.
+pub mod calendar_staleness;
 // Operator directive 2026-06-02: post-market (15:31 IST) 1-minute
 // cross-verification of live candles_1m vs Dhan intraday — CSV + audit + count.
 pub mod cross_verify_1m_boot;
