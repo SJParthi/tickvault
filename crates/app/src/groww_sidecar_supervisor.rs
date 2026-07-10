@@ -280,6 +280,141 @@ pub fn classify_sidecar_line(line: &str) -> SidecarLineClass {
     SidecarLineClass::Info
 }
 
+// ---------------------------------------------------------------------------
+// Stall-restart episode rows (dual-feed scoreboard PR-B, 2026-07-10)
+// ---------------------------------------------------------------------------
+
+/// Which stall-watchdog arm fired the kill+relaunch — the classic
+/// alive-but-silent arm (FEED-STALL-01) or the never-streamed-first-tick arm
+/// (FEED-STALL-01 §1b).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StallArm {
+    /// The classic stall arm: a known last-tick aged past the threshold.
+    SilentSocket,
+    /// The 2026-07-09 arm: connected + subscribed but never streamed a
+    /// first tick this session.
+    NeverStreamed,
+}
+
+/// Latched stall-cause codes shared between the pipe drains (writers) and
+/// the stall arms (reader) via a relaxed `AtomicU8`. Only the CONFIRMED
+/// reject classes latch (`sets_auth_rejected` — AuthRejected /
+/// EntitlementRejected); the generic transient `Error` class deliberately
+/// does NOT (it must not claim a credential/entitlement cause, mirroring the
+/// false-"refresh the api-key" fix), and a streaming recovery clears the
+/// latch so a LATER silent stall never inherits a stale cause.
+pub const STALL_CAUSE_NONE: u8 = 0;
+/// The child's last confirmed reject was `SidecarLineClass::AuthRejected`.
+pub const STALL_CAUSE_AUTH: u8 = 1;
+/// The child's last confirmed reject was `SidecarLineClass::EntitlementRejected`.
+pub const STALL_CAUSE_ENTITLEMENT: u8 = 2;
+
+/// Latch value for one classified sidecar line — `None` = leave the latch
+/// untouched, `Some(v)` = store `v`. Pure (unit-tested without a live child).
+#[must_use]
+pub const fn stall_cause_latch_update(class: SidecarLineClass) -> Option<u8> {
+    match class {
+        SidecarLineClass::AuthRejected => Some(STALL_CAUSE_AUTH),
+        SidecarLineClass::EntitlementRejected => Some(STALL_CAUSE_ENTITLEMENT),
+        // A streaming recovery clears any latched cause (edge semantics —
+        // the next stall must not inherit a pre-recovery reject class).
+        SidecarLineClass::Streaming => Some(STALL_CAUSE_NONE),
+        // Generic errors / subscribe / info lines never change the latch.
+        SidecarLineClass::Error | SidecarLineClass::Subscribed | SidecarLineClass::Info => None,
+    }
+}
+
+/// The FIXED machine cause slug stamped into the `stall_restarted` row's
+/// `source` column. A CONFIRMED reject class observed on the child (the
+/// latch) outranks the arm's generic slug — an auth-stale never-streamed
+/// loop is a token-minter problem, not broker silence. Pure, total: every
+/// input yields one of the four `STALL_SOURCE_*` slugs (never raw text).
+#[must_use]
+pub const fn stall_cause_slug(arm: StallArm, latched_cause: u8) -> &'static str {
+    match latched_cause {
+        STALL_CAUSE_AUTH => tickvault_common::feed_blame::STALL_SOURCE_AUTH_STALE,
+        STALL_CAUSE_ENTITLEMENT => tickvault_common::feed_blame::STALL_SOURCE_ENTITLEMENT,
+        _ => match arm {
+            StallArm::SilentSocket => tickvault_common::feed_blame::STALL_SOURCE_SILENT_SOCKET,
+            StallArm::NeverStreamed => tickvault_common::feed_blame::STALL_SOURCE_NEVER_STREAMED,
+        },
+    }
+}
+
+/// Fixed reason text for every `stall_restarted` audit row — the cause lives
+/// in the `source` slug; the silent window lives in `down_secs`. A FIXED
+/// literal so no runtime/child text can reach the table via this row.
+pub const STALL_RESTART_AUDIT_REASON: &str =
+    "stall watchdog killed + relaunched the sidecar (re-auth + re-subscribe)";
+
+/// Build ONE `ws_event_audit` row for a stall-watchdog kill+relaunch.
+///
+/// Mirrors `groww_bridge::build_groww_ws_audit_row` conventions (feed=groww,
+/// ws_type=groww_bridge, IST nanos designated ts + IST-midnight trading day)
+/// but carries the fleet child's `conn_id` as `connection_index` so a §34
+/// fleet child's stall row never collides with connection 0's. COLD PATH:
+/// at most one row per kill (bounded by the stall threshold cadence).
+#[must_use]
+pub fn build_stall_ws_audit_row(
+    cause_slug: &'static str,
+    silent_secs: u64,
+    conn_id: Option<usize>,
+) -> tickvault_common::ws_event_types::WsEventAuditRow {
+    let now_utc_nanos = chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default();
+    let now_ist_nanos =
+        now_utc_nanos.saturating_add(tickvault_common::constants::IST_UTC_OFFSET_NANOS);
+    let nanos_per_day: i64 = 86_400 * 1_000_000_000;
+    let trading_date_ist_nanos = now_ist_nanos - now_ist_nanos.rem_euclid(nanos_per_day);
+    tickvault_common::ws_event_types::WsEventAuditRow {
+        event_ts_ist_nanos: now_ist_nanos,
+        trading_date_ist_nanos,
+        feed: tickvault_common::feed::Feed::Groww,
+        ws_type: tickvault_common::ws_event_types::WsType::GrowwBridge,
+        connection_index: conn_id.map_or(0, |c| i64::try_from(c).unwrap_or(0)),
+        pool_size: 1,
+        event_kind: tickvault_common::ws_event_types::WsEventKind::StallRestarted,
+        // FIXED machine slug — never raw child text (redaction discipline).
+        source: cause_slug.to_string(),
+        reason: STALL_RESTART_AUDIT_REASON.to_string(),
+        dhan_code: tickvault_common::ws_event_types::WS_EVENT_NO_DHAN_CODE,
+        // The silent window that triggered the kill — the downtime the
+        // scoreboard attributes to the episode.
+        down_secs: i64::try_from(silent_secs).unwrap_or(i64::MAX),
+        attempts: 0,
+        market_hours: tickvault_common::market_hours::is_within_market_hours_ist(),
+    }
+}
+
+/// Emit ONE `stall_restarted` ws_event_audit row, best-effort (`try_send` —
+/// the supervision loop is never stalled by the forensic side-record; a
+/// full/closed channel is AUDIT-WS-01 exactly like the bridge emitter). No-op
+/// when no audit channel is attached (defensive / test builds).
+fn emit_stall_ws_audit(
+    tx: Option<&tokio::sync::mpsc::Sender<tickvault_common::ws_event_types::WsEventAuditRow>>,
+    cause_slug: &'static str,
+    silent_secs: u64,
+    conn_id: Option<usize>,
+) {
+    let Some(tx) = tx else {
+        return;
+    };
+    let row = build_stall_ws_audit_row(cause_slug, silent_secs, conn_id);
+    if let Err(err) = tx.try_send(row) {
+        let drop_reason = match err {
+            tokio::sync::mpsc::error::TrySendError::Full(_) => "full",
+            tokio::sync::mpsc::error::TrySendError::Closed(_) => "closed",
+        };
+        error!(
+            code = ErrorCode::AuditWs01EventWriteFailed.code_str(),
+            reason = drop_reason,
+            cause = cause_slug,
+            "groww stall_restarted ws_event_audit channel full/closed — row dropped \
+             (log + FEED-STALL-01 counter still fired)"
+        );
+        metrics::counter!("tv_ws_event_audit_dropped_total", "reason" => drop_reason).increment(1);
+    }
+}
+
 /// System Python used ONLY to create the isolated venv (never to run the
 /// sidecar — the sidecar runs from the venv's own python). This is the FIRST
 /// candidate tried; [`discover_system_python`] falls through [`PYTHON_CANDIDATES`]
@@ -949,6 +1084,12 @@ fn spawn_pipe_drain<R>(
     // supervisor-lifetime epoch-seconds of the last GrowwSidecarRejected
     // page. See [`GROWW_REJECT_PAGE_COOLDOWN_SECS`].
     reject_page_gate: Arc<std::sync::atomic::AtomicU64>,
+    // Stall-cause latch (scoreboard PR-B, 2026-07-10): the drains record the
+    // child's last CONFIRMED reject class (auth/entitlement — the
+    // `sets_auth_rejected` split) so a later stall-watchdog kill stamps the
+    // precise cause slug into its `stall_restarted` audit row. Cleared on a
+    // streaming recovery; generic `Error` lines never latch.
+    stall_cause: Arc<std::sync::atomic::AtomicU8>,
 ) -> tokio::task::JoinHandle<()>
 where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
@@ -958,6 +1099,9 @@ where
         // next_line() is cancel-safe and ends with Ok(None) on EOF (pipe closed).
         while let Ok(Some(line)) = lines.next_line().await {
             let class = classify_sidecar_line(&line);
+            if let Some(cause) = stall_cause_latch_update(class) {
+                stall_cause.store(cause, std::sync::atomic::Ordering::Relaxed);
+            }
             // The sidecar's SILENT-FEED WATCHDOG line ("subscribed N but received
             // NO records in 30s") is benign when the market is closed (silence is
             // expected after-hours — matches the `/feeds` page, PR #1260) but is a
@@ -1201,12 +1345,23 @@ async fn supervise_child(
     // lifetime, so a fresh child's fresh `alerted` latch can no longer page
     // every ~5-min never-streamed relaunch.
     reject_page_gate: &Arc<std::sync::atomic::AtomicU64>,
+    // Forensic `ws_event_audit` sender (scoreboard PR-B, 2026-07-10): a
+    // stall-watchdog kill+relaunch stamps ONE `stall_restarted` row so the
+    // 15:45 IST scorecard counts stall episodes with a cause slug. `None`
+    // (test / defensive) is a no-op — the FEED-STALL-01 log + counter for
+    // the same kill still fire.
+    ws_audit_tx: &Option<
+        tokio::sync::mpsc::Sender<tickvault_common::ws_event_types::WsEventAuditRow>,
+    >,
 ) -> SuperviseOutcome {
     // One latch per running child so the alert fires at most once per instance.
     let alerted = Arc::new(std::sync::atomic::AtomicBool::new(false));
     // FEED-REJECT-01 detail latch — per child, shared by both drains, re-armed
     // only by a streaming recovery (never by the fleet Suppress re-arm).
     let detail_logged = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // Stall-cause latch (PR-B): the drains record the child's last CONFIRMED
+    // reject class so a stall kill stamps the precise cause slug.
+    let stall_cause = Arc::new(std::sync::atomic::AtomicU8::new(STALL_CAUSE_NONE));
     let mut drains: Vec<tokio::task::JoinHandle<()>> = Vec::new();
     if let Some(stdout) = child.stdout.take() {
         drains.push(spawn_pipe_drain(
@@ -1218,6 +1373,7 @@ async fn supervise_child(
             conn_id,
             Arc::clone(&detail_logged),
             Arc::clone(reject_page_gate),
+            Arc::clone(&stall_cause),
         ));
     }
     if let Some(stderr) = child.stderr.take() {
@@ -1230,6 +1386,7 @@ async fn supervise_child(
             conn_id,
             Arc::clone(&detail_logged),
             Arc::clone(reject_page_gate),
+            Arc::clone(&stall_cause),
         ));
     }
     let abort_drains = || {
@@ -1318,6 +1475,18 @@ async fn supervise_child(
                         "feed" => feed.as_str(),
                     )
                     .increment(1);
+                    // Scoreboard PR-B: one `stall_restarted` forensic row per
+                    // kill (storm and non-storm alike — every kill is an
+                    // episode), cause slug from the drains' reject latch.
+                    emit_stall_ws_audit(
+                        ws_audit_tx.as_ref(),
+                        stall_cause_slug(
+                            StallArm::SilentSocket,
+                            stall_cause.load(std::sync::atomic::Ordering::Relaxed),
+                        ),
+                        stall_secs,
+                        conn_id,
+                    );
                     if let Err(err) = child.start_kill() {
                         warn!(error = %err, feed = feed.as_str(), "[feeds] sidecar stall-kill signal failed (already exiting?)");
                     }
@@ -1412,6 +1581,19 @@ async fn supervise_child(
                                 "feed" => feed.as_str(),
                             )
                             .increment(1);
+                            // Scoreboard PR-B: the never-streamed arm's own
+                            // `stall_restarted` forensic row (cause slug
+                            // `stall_never_streamed`, unless the drains
+                            // latched a confirmed auth/entitlement reject).
+                            emit_stall_ws_audit(
+                                ws_audit_tx.as_ref(),
+                                stall_cause_slug(
+                                    StallArm::NeverStreamed,
+                                    stall_cause.load(std::sync::atomic::Ordering::Relaxed),
+                                ),
+                                silent_secs,
+                                conn_id,
+                            );
                             metrics::counter!(
                                 "tv_feed_sidecar_never_streamed_restart_total",
                                 "feed" => feed.as_str(),
@@ -1454,6 +1636,13 @@ pub async fn run_groww_sidecar_supervisor(
     // `GrowwSidecarRejected` event per running child reject so the operator sees
     // WHY Groww has 0 ticks.
     notifier: Arc<arc_swap::ArcSwapOption<NotificationService>>,
+    // Forensic `ws_event_audit` sender (scoreboard PR-B, 2026-07-10): every
+    // stall-watchdog kill+relaunch writes ONE `stall_restarted` row through
+    // the SAME consumer the bridge/Dhan emitters use. `None` = no-op
+    // (defensive / test builds) — the FEED-STALL-01 signals still fire.
+    ws_audit_tx: Option<
+        tokio::sync::mpsc::Sender<tickvault_common::ws_event_types::WsEventAuditRow>,
+    >,
 ) {
     let mut consecutive_failures: u32 = 0;
     // DEFENSIVE (best-effort) stall-restart counter registration. The
@@ -1620,6 +1809,7 @@ pub async fn run_groww_sidecar_supervisor(
             &mut storm,
             opts.conn_id,
             &reject_page_gate,
+            &ws_audit_tx,
         )
         .await;
         match outcome {
@@ -1702,6 +1892,9 @@ pub fn spawn_supervised_groww_sidecar_supervisor(
     opts: GrowwSidecarOptions,
     feed_health: Arc<FeedHealthRegistry>,
     notifier: Arc<arc_swap::ArcSwapOption<NotificationService>>,
+    ws_audit_tx: Option<
+        tokio::sync::mpsc::Sender<tickvault_common::ws_event_types::WsEventAuditRow>,
+    >,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         loop {
@@ -1710,6 +1903,7 @@ pub fn spawn_supervised_groww_sidecar_supervisor(
                 opts.clone(),
                 Arc::clone(&feed_health),
                 Arc::clone(&notifier),
+                ws_audit_tx.clone(),
             ));
             let join_result = handle.await;
             let outcome = classify_supervisor_join(&join_result);
@@ -1750,6 +1944,8 @@ pub fn spawn_supervised_groww_sidecar_supervisor(
 ///
 /// Pure decision math (`fleet_reconcile_actions`) is unit-tested below;
 /// this loop is composition-only.
+// APPROVED: fleet wiring — every arg is a distinct owned resource
+#[allow(clippy::too_many_arguments)]
 // TEST-EXEMPT: spawn/abort/sleep reconciler loop; the pure reconcile decision (fleet_reconcile_actions) + the per-conn option/env/argv/needle primitives are unit-tested, and the child lifecycle is the already-tested run_groww_sidecar_supervisor.
 pub fn spawn_groww_scale_fleet(
     feed_runtime: Arc<FeedRuntimeState>,
@@ -1759,6 +1955,9 @@ pub fn spawn_groww_scale_fleet(
     wake: Arc<tokio::sync::Notify>,
     feed_health: Arc<FeedHealthRegistry>,
     notifier: Arc<arc_swap::ArcSwapOption<NotificationService>>,
+    ws_audit_tx: Option<
+        tokio::sync::mpsc::Sender<tickvault_common::ws_event_types::WsEventAuditRow>,
+    >,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut children: Vec<tokio::task::JoinHandle<()>> = Vec::new();
@@ -1786,6 +1985,7 @@ pub fn spawn_groww_scale_fleet(
                         conn_id,
                         &feed_health,
                         &notifier,
+                        ws_audit_tx.clone(),
                     );
                 }
             }
@@ -1801,6 +2001,7 @@ pub fn spawn_groww_scale_fleet(
                             conn_id,
                             &feed_health,
                             &notifier,
+                            ws_audit_tx.clone(),
                         ));
                     }
                 }
@@ -1849,6 +2050,9 @@ fn spawn_fleet_child(
     conn_id: usize,
     feed_health: &Arc<FeedHealthRegistry>,
     notifier: &Arc<arc_swap::ArcSwapOption<NotificationService>>,
+    ws_audit_tx: Option<
+        tokio::sync::mpsc::Sender<tickvault_common::ws_event_types::WsEventAuditRow>,
+    >,
 ) -> tokio::task::JoinHandle<()> {
     let files = crate::groww_bridge::shard_files(shards_root, conn_id);
     let opts = shard_sidecar_options(base_opts, &files, format!("c{conn_id:02}"));
@@ -1857,6 +2061,7 @@ fn spawn_fleet_child(
         opts,
         Arc::clone(feed_health),
         Arc::clone(notifier),
+        ws_audit_tx,
     ))
 }
 
@@ -3144,5 +3349,178 @@ mod tests {
             src.contains("signature = %sidecar_line_signature(&line)"),
             "the FEED-REJECT-01 emit must carry the bounded sanitized signature"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // Stall-restart episode rows (dual-feed scoreboard PR-B, 2026-07-10)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_stall_cause_latch_update_matrix() {
+        // Only CONFIRMED reject classes latch; streaming clears; the generic
+        // transient Error / subscribe / info classes never touch the latch
+        // (the false-"refresh the api-key" discipline carried over).
+        assert_eq!(
+            stall_cause_latch_update(SidecarLineClass::AuthRejected),
+            Some(STALL_CAUSE_AUTH)
+        );
+        assert_eq!(
+            stall_cause_latch_update(SidecarLineClass::EntitlementRejected),
+            Some(STALL_CAUSE_ENTITLEMENT)
+        );
+        assert_eq!(
+            stall_cause_latch_update(SidecarLineClass::Streaming),
+            Some(STALL_CAUSE_NONE)
+        );
+        for neutral in [
+            SidecarLineClass::Error,
+            SidecarLineClass::Subscribed,
+            SidecarLineClass::Info,
+        ] {
+            assert_eq!(stall_cause_latch_update(neutral), None, "{neutral:?}");
+        }
+    }
+
+    #[test]
+    fn test_stall_cause_slug_matrix() {
+        use tickvault_common::feed_blame::{
+            STALL_SOURCE_AUTH_STALE, STALL_SOURCE_ENTITLEMENT, STALL_SOURCE_NEVER_STREAMED,
+            STALL_SOURCE_SILENT_SOCKET,
+        };
+        // A latched confirmed reject class outranks the arm's generic slug.
+        for arm in [StallArm::SilentSocket, StallArm::NeverStreamed] {
+            assert_eq!(
+                stall_cause_slug(arm, STALL_CAUSE_AUTH),
+                STALL_SOURCE_AUTH_STALE
+            );
+            assert_eq!(
+                stall_cause_slug(arm, STALL_CAUSE_ENTITLEMENT),
+                STALL_SOURCE_ENTITLEMENT
+            );
+        }
+        // No latch → the arm's own slug.
+        assert_eq!(
+            stall_cause_slug(StallArm::SilentSocket, STALL_CAUSE_NONE),
+            STALL_SOURCE_SILENT_SOCKET
+        );
+        assert_eq!(
+            stall_cause_slug(StallArm::NeverStreamed, STALL_CAUSE_NONE),
+            STALL_SOURCE_NEVER_STREAMED
+        );
+        // Total: an unknown future latch value degrades to the arm slug,
+        // never a panic, never raw text.
+        assert_eq!(
+            stall_cause_slug(StallArm::SilentSocket, 250),
+            STALL_SOURCE_SILENT_SOCKET
+        );
+    }
+
+    #[test]
+    fn test_build_stall_ws_audit_row_shape() {
+        use tickvault_common::feed_blame::STALL_SOURCE_SILENT_SOCKET;
+        let row = build_stall_ws_audit_row(STALL_SOURCE_SILENT_SOCKET, 42, None);
+        assert_eq!(
+            row.event_kind,
+            tickvault_common::ws_event_types::WsEventKind::StallRestarted
+        );
+        assert_eq!(
+            row.ws_type,
+            tickvault_common::ws_event_types::WsType::GrowwBridge
+        );
+        assert_eq!(row.feed, tickvault_common::feed::Feed::Groww);
+        assert_eq!(row.connection_index, 0);
+        assert_eq!(row.source, STALL_SOURCE_SILENT_SOCKET);
+        // FIXED reason literal — never raw child text (redaction discipline).
+        assert_eq!(row.reason, STALL_RESTART_AUDIT_REASON);
+        assert_eq!(row.down_secs, 42);
+        assert_eq!(
+            row.dhan_code,
+            tickvault_common::ws_event_types::WS_EVENT_NO_DHAN_CODE
+        );
+        // §34 fleet child identity rides in connection_index.
+        let fleet = build_stall_ws_audit_row(STALL_SOURCE_SILENT_SOCKET, 7, Some(3));
+        assert_eq!(fleet.connection_index, 3);
+        // The designated ts + trading day are IST-consistent (day floor).
+        assert!(row.event_ts_ist_nanos >= row.trading_date_ist_nanos);
+        assert_eq!(
+            row.trading_date_ist_nanos % (86_400 * 1_000_000_000),
+            0,
+            "trading day must be an IST-midnight floor"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_emit_stall_ws_audit_noop_when_tx_none_and_sends_when_some() {
+        use tickvault_common::feed_blame::STALL_SOURCE_NEVER_STREAMED;
+        // No channel attached → no-op (defensive/test builds).
+        emit_stall_ws_audit(None, STALL_SOURCE_NEVER_STREAMED, 300, None);
+        // Attached channel → exactly one row, best-effort try_send.
+        let (tx, mut rx) =
+            tokio::sync::mpsc::channel::<tickvault_common::ws_event_types::WsEventAuditRow>(4);
+        emit_stall_ws_audit(Some(&tx), STALL_SOURCE_NEVER_STREAMED, 300, Some(1));
+        let row = rx.try_recv().expect("one stall row must be sent");
+        assert_eq!(row.source, STALL_SOURCE_NEVER_STREAMED);
+        assert_eq!(row.down_secs, 300);
+        assert_eq!(row.connection_index, 1);
+        assert!(rx.try_recv().is_err(), "exactly one row per emit");
+    }
+
+    #[test]
+    fn test_ratchet_stall_arms_emit_stall_restarted_rows() {
+        // WIRING RATCHET (scoreboard PR-B): BOTH stall-watchdog kill arms in
+        // supervise_child must stamp a `stall_restarted` forensic row before
+        // killing the child — deleting either emit silently blinds the
+        // 15:45 scorecard's stall column for that arm.
+        // Scan the PRODUCTION region only (split at #[cfg(test)]) — the
+        // seal_writer precedent: a whole-file scan would match this test's
+        // own literals (vacuous false-OK class).
+        let full = include_str!("groww_sidecar_supervisor.rs");
+        let src = full
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production region exists");
+        // CALL sites (the `fn emit_stall_ws_audit(` definition excluded).
+        let call_sites: Vec<usize> = src
+            .match_indices("emit_stall_ws_audit(")
+            .map(|(i, _)| i)
+            .filter(|&i| !src[..i].ends_with("fn "))
+            .collect();
+        assert!(
+            call_sites.len() >= 2,
+            "expected BOTH stall-arm call sites of emit_stall_ws_audit \
+             (found {})",
+            call_sites.len()
+        );
+        // Each arm variant must appear inside some call-site window.
+        for variant in ["StallArm::SilentSocket", "StallArm::NeverStreamed"] {
+            assert!(
+                call_sites.iter().any(|&i| {
+                    let end = (i + 400).min(src.len());
+                    src[i..end].contains(variant)
+                }),
+                "no emit_stall_ws_audit call site passes {variant}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_ratchet_main_wires_ws_audit_sender_into_supervisor_spawns() {
+        // WIRING RATCHET (scoreboard PR-B): main.rs must hand a live
+        // ws_event_audit sender to BOTH supervisor spawn sites (single-conn
+        // + §34 fleet) — a `None` there is a silent stall-row blackout.
+        let main_src = include_str!("main.rs");
+        for spawn in [
+            "spawn_supervised_groww_sidecar_supervisor(",
+            "spawn_groww_scale_fleet(",
+        ] {
+            let at = main_src
+                .find(spawn)
+                .unwrap_or_else(|| panic!("{spawn} spawn site must exist in main.rs"));
+            let window_end = (at + 1200).min(main_src.len());
+            assert!(
+                main_src[at..window_end].contains("spawn_ws_event_audit_consumer("),
+                "{spawn} must be handed a ws_event_audit sender (stall rows)"
+            );
+        }
     }
 }

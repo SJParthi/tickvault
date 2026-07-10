@@ -98,6 +98,18 @@ or reconnect behaviour.
   `groww-second-feed-scope-2026-06-19.md` §5 honest-envelope split —
   CAPTURE vs UPSTREAM, connected ≠ streaming — still holds). Same
   best-effort `try_send`; a write failure is still AUDIT-WS-01.
+- Append site (LIVE since scoreboard PR-B, 2026-07-10): the Groww sidecar
+  stall watchdog `crates/app/src/groww_sidecar_supervisor.rs`
+  (`emit_stall_ws_audit`) — ONE `WsEventKind::StallRestarted`
+  (`stall_restarted`) row per stall-watchdog kill+relaunch (classic
+  FEED-STALL-01 arm + the never-streamed arm), `feed='groww'` /
+  `ws_type='groww_bridge'`, with a FIXED machine cause slug in `source`
+  (`feed_blame::STALL_SOURCE_*` — never raw child text) and the silent
+  window in `down_secs`. Same best-effort `try_send`; a failure is still
+  AUDIT-WS-01. The 15:45 IST dual-feed scorecard aggregates these into
+  stall episodes (`dual-feed-scoreboard-error-codes.md` §2). NOT an
+  up-kind and NOT a plain disconnect — scoreboard pairing/feed-off logic
+  deliberately ignores it as a lifecycle "up" signal.
 
 ---
 

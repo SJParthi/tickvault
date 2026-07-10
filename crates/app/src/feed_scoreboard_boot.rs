@@ -1330,13 +1330,29 @@ pub fn scan_errors_jsonl_for_correlation(dir: &Path, target_ist_day: u64) -> Cor
 // Episode classification (ws_event_audit rows → feed_episode_audit rows)
 // ---------------------------------------------------------------------------
 
-/// Map a `ws_event_audit.event_kind` to a scoreboard episode kind. Pure.
+/// Map a `ws_event_audit.event_kind` (+ its `source` for stall rows) to a
+/// scoreboard episode kind. Pure.
 /// Connect / reconnect / sleep kinds are lifecycle, not episodes → `None`.
+///
+/// Scoreboard PR-B (2026-07-10): a `stall_restarted` row (the Groww stall
+/// watchdog's kill+relaunch — NOT an up-kind and NOT a plain disconnect)
+/// maps to the stall episode kinds; the `source` slug splits the
+/// never-streamed arm (`stall_never_streamed`) from the classic /
+/// auth-stale / entitlement causes, all of which are `stall_restart`.
 #[must_use]
-pub fn episode_kind_for_event(event_kind: &str) -> Option<&'static str> {
+pub fn episode_kind_for_event(event_kind: &str, source: &str) -> Option<&'static str> {
     match event_kind {
         "disconnected" => Some(EPISODE_KIND_DISCONNECT),
         "disconnected_off_hours" => Some(EPISODE_KIND_OFF_HOURS_DISCONNECT),
+        // The literal is pinned against WsEventKind::StallRestarted.as_str()
+        // by test_stall_restarted_literal_matches_event_kind.
+        "stall_restarted" => Some(
+            if source == tickvault_common::feed_blame::STALL_SOURCE_NEVER_STREAMED {
+                EPISODE_KIND_NEVER_STREAMED_RESTART
+            } else {
+                EPISODE_KIND_STALL_RESTART
+            },
+        ),
         _ => None,
     }
 }
@@ -1349,7 +1365,16 @@ pub fn classify_ws_event_to_episode(
     corr: &CorrelationEvidence,
     trading_date_ist_nanos: i64,
 ) -> Option<FeedEpisodeAuditRow> {
-    let episode_kind = episode_kind_for_event(&ev.event_kind)?;
+    let episode_kind = episode_kind_for_event(&ev.event_kind, &ev.source)?;
+    // Scoreboard PR-B (2026-07-10): a stall row's `source` carries the
+    // FIXED cause slug (`stall_silent_socket` / `stall_never_streamed` /
+    // `stall_auth_stale` / `stall_entitlement`) — thread it into the
+    // classifier's `stall_reason` so the stall arms (broker silent-socket /
+    // never-streamed / entitlement vs ours token-minter-stale) activate.
+    let is_stall = matches!(
+        episode_kind,
+        EPISODE_KIND_STALL_RESTART | EPISODE_KIND_NEVER_STREAMED_RESTART
+    );
     let evidence = EpisodeEvidence {
         episode_kind,
         feed: &ev.feed,
@@ -1371,7 +1396,7 @@ pub fn classify_ws_event_to_episode(
             ev.ts_ist_nanos,
             RESOURCE_OVERLAP_WINDOW_SECS,
         ),
-        stall_reason: "",
+        stall_reason: if is_stall { &ev.source } else { "" },
         build_sha_changed: None,
     };
     let (blame, blame_reason) = classify_episode(&evidence);
@@ -1386,7 +1411,11 @@ pub fn classify_ws_event_to_episode(
         blame_reason,
         source: ev.source.clone(),
         dhan_code: ev.dhan_code,
-        detector: "ws_event_audit",
+        detector: if is_stall {
+            "stall_row"
+        } else {
+            "ws_event_audit"
+        },
         down_secs: ev.down_secs,
         market_hours: ev.market_hours,
         evidence: format!("source={} dhan_code={}", ev.source, ev.dhan_code),
@@ -4136,9 +4165,12 @@ mod tests {
 
     #[test]
     fn test_episode_kind_for_event_mapping() {
-        assert_eq!(episode_kind_for_event("disconnected"), Some("disconnect"));
         assert_eq!(
-            episode_kind_for_event("disconnected_off_hours"),
+            episode_kind_for_event("disconnected", "n/a"),
+            Some("disconnect")
+        );
+        assert_eq!(
+            episode_kind_for_event("disconnected_off_hours", "n/a"),
             Some("off_hours_disconnect")
         );
         for lifecycle in [
@@ -4148,8 +4180,105 @@ mod tests {
             "sleep_resumed",
             "junk",
         ] {
-            assert_eq!(episode_kind_for_event(lifecycle), None, "{lifecycle}");
+            assert_eq!(
+                episode_kind_for_event(lifecycle, "n/a"),
+                None,
+                "{lifecycle}"
+            );
         }
+    }
+
+    #[test]
+    fn test_episode_kind_for_stall_restarted_rows() {
+        // PR-B: the stall-watchdog lifecycle row maps to the stall episode
+        // kinds — the never-streamed slug splits the kind; every other cause
+        // slug (incl. a future unknown one — fail-safe to the classic kind,
+        // never dropped) is a stall_restart.
+        use tickvault_common::feed_blame::{
+            STALL_SOURCE_AUTH_STALE, STALL_SOURCE_ENTITLEMENT, STALL_SOURCE_NEVER_STREAMED,
+            STALL_SOURCE_SILENT_SOCKET,
+        };
+        assert_eq!(
+            episode_kind_for_event("stall_restarted", STALL_SOURCE_NEVER_STREAMED),
+            Some(EPISODE_KIND_NEVER_STREAMED_RESTART)
+        );
+        for source in [
+            STALL_SOURCE_SILENT_SOCKET,
+            STALL_SOURCE_AUTH_STALE,
+            STALL_SOURCE_ENTITLEMENT,
+            "some_future_slug",
+        ] {
+            assert_eq!(
+                episode_kind_for_event("stall_restarted", source),
+                Some(EPISODE_KIND_STALL_RESTART),
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_stall_restarted_literal_matches_event_kind() {
+        // Lockstep pin: the SQL-read string literal above must equal the
+        // emitter's wire label — a WsEventKind rename can never silently
+        // detach the aggregation from the stall rows.
+        assert_eq!(
+            tickvault_common::ws_event_types::WsEventKind::StallRestarted.as_str(),
+            "stall_restarted"
+        );
+        // And a stall row must never be an up-kind (pairing/feed-off logic).
+        assert!(!is_up_kind("stall_restarted"));
+    }
+
+    #[test]
+    fn test_classify_stall_row_to_episode_blame_and_detector() {
+        use tickvault_common::feed_blame::{
+            STALL_SOURCE_AUTH_STALE, STALL_SOURCE_NEVER_STREAMED, STALL_SOURCE_SILENT_SOCKET,
+        };
+        let corr = CorrelationEvidence {
+            scan_complete: true,
+            ..CorrelationEvidence::default()
+        };
+        let mk = |source: &str| WsAuditEventLite {
+            ts_ist_nanos: day_ts(11 * 3600),
+            feed: "groww".to_string(),
+            ws_type: "groww_bridge".to_string(),
+            connection_index: 0,
+            event_kind: "stall_restarted".to_string(),
+            source: source.to_string(),
+            dhan_code: -1,
+            down_secs: 42,
+            market_hours: true,
+        };
+        // Silent socket → broker, detector stall_row, stall_reason threaded.
+        let row = classify_ws_event_to_episode(&mk(STALL_SOURCE_SILENT_SOCKET), &corr, 0)
+            .expect("stall rows classify to episodes");
+        assert_eq!(row.episode_kind, EPISODE_KIND_STALL_RESTART);
+        assert_eq!(row.blame, BlameClass::Broker);
+        assert_eq!(row.blame_reason, "silent_socket");
+        assert_eq!(row.detector, "stall_row");
+        assert_eq!(row.down_secs, 42);
+        // Auth-stale → OURS (the shared token minter is our duty).
+        let row = classify_ws_event_to_episode(&mk(STALL_SOURCE_AUTH_STALE), &corr, 0)
+            .expect("stall rows classify to episodes");
+        assert_eq!(row.blame, BlameClass::Ours);
+        assert_eq!(row.blame_reason, "token_minter_stale");
+        // Never-streamed → the distinct kind, broker.
+        let row = classify_ws_event_to_episode(&mk(STALL_SOURCE_NEVER_STREAMED), &corr, 0)
+            .expect("stall rows classify to episodes");
+        assert_eq!(row.episode_kind, EPISODE_KIND_NEVER_STREAMED_RESTART);
+        assert_eq!(row.blame_reason, "never_streamed");
+        // The tally fold counts BOTH stall kinds in the stalls column, never
+        // in the disconnect columns (scope item 3 verification).
+        let mut mem: BTreeMap<String, EpisodeTally> = BTreeMap::new();
+        for source in [STALL_SOURCE_SILENT_SOCKET, STALL_SOURCE_NEVER_STREAMED] {
+            let row = classify_ws_event_to_episode(&mk(source), &corr, 0).expect("classifies");
+            fold_market_data_episode(&mut mem, &row);
+        }
+        let t = mem.get("groww").copied().unwrap_or_default();
+        assert_eq!(t.stalls, 2);
+        assert_eq!(t.disconnects_market, 0);
+        assert_eq!(t.disconnects_off_hours, 0);
+        assert_eq!(t.blame_broker, 2, "stall blame feeds the headline split");
     }
 
     #[test]

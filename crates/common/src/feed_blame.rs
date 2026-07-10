@@ -70,13 +70,43 @@ impl BlameClass {
 pub const EPISODE_KIND_DISCONNECT: &str = "disconnect";
 /// Off-hours disconnect (Dhan pre/post-market idle cleanup class).
 pub const EPISODE_KIND_OFF_HOURS_DISCONNECT: &str = "off_hours_disconnect";
-/// Sidecar stall restart (FEED-STALL-01 semantics). Emitter lands in PR-2;
-/// the classifier arm exists day-1 so PR-2 activates it with zero edits here.
+/// Sidecar stall restart (FEED-STALL-01 semantics). Emitter LIVE since the
+/// scoreboard stall PR (PR-B, 2026-07-10): the Groww stall watchdog writes a
+/// `stall_restarted` ws_event_audit row per kill+relaunch, carrying one of
+/// the `STALL_SOURCE_*` cause slugs below in `source`.
 pub const EPISODE_KIND_STALL_RESTART: &str = "stall_restart";
-/// Never-streamed restart (FEED-STALL-01 §1b semantics). Emitter in PR-2.
+/// Never-streamed restart (FEED-STALL-01 §1b semantics). Emitter LIVE since
+/// PR-B (same `stall_restarted` event kind, `source = stall_never_streamed`).
 pub const EPISODE_KIND_NEVER_STREAMED_RESTART: &str = "never_streamed_restart";
 /// Boot-reconciled process death (the dying process wrote no disconnect row).
 pub const EPISODE_KIND_PROCESS_DEATH: &str = "process_death";
+
+// ---------------------------------------------------------------------------
+// Stall-restart cause slugs (dual-feed scoreboard PR-B, 2026-07-10)
+// ---------------------------------------------------------------------------
+// The FIXED machine slugs the Groww sidecar stall watchdog stamps into the
+// `ws_event_audit.source` column of a `stall_restarted` lifecycle row —
+// derived from the supervisor's OWN `SidecarLineClass` classification of the
+// child's diagnostics (never raw child text; redaction rules apply). Shared
+// here so the emitter (`groww_sidecar_supervisor`), the aggregation
+// (`feed_scoreboard_boot`), and the classifier arms below can never drift on
+// the literals. The classifier consumes them via `stall_reason` substring
+// arms (rule §4): `stall_auth_stale` → ours/token_minter_stale;
+// `stall_entitlement` → broker/entitlement_reject; `stall_never_streamed` →
+// broker/never_streamed; `stall_silent_socket` → broker/silent_socket.
+
+/// FEED-STALL-01 classic arm: alive-but-silent socket on a healthy host,
+/// no confirmed auth/entitlement reject observed on the child.
+pub const STALL_SOURCE_SILENT_SOCKET: &str = "stall_silent_socket";
+/// FEED-STALL-01 §1b arm: connected + subscribed but NEVER streamed a first
+/// tick this session (no confirmed auth/entitlement reject observed).
+pub const STALL_SOURCE_NEVER_STREAMED: &str = "stall_never_streamed";
+/// The child's last confirmed reject class was `AuthRejected` (the shared
+/// SSM access token is stale — the minter Lambda is OUR duty).
+pub const STALL_SOURCE_AUTH_STALE: &str = "stall_auth_stale";
+/// The child's last confirmed reject class was `EntitlementRejected`
+/// (SILENT-FEED watchdog / permissions / authorization — broker side).
+pub const STALL_SOURCE_ENTITLEMENT: &str = "stall_entitlement";
 
 /// Everything the classifier may consider for one episode. All fields are
 /// plain evidence — the classifier itself does NO I/O.
@@ -530,6 +560,56 @@ mod tests {
                 classify_episode(&e),
                 (BlameClass::Broker, "entitlement_reject"),
                 "{reason:?} must classify broker/entitlement_reject"
+            );
+        }
+    }
+
+    #[test]
+    fn test_classify_stall_source_slugs_map_exactly() {
+        // PR-B lockstep: the EXACT slugs the supervisor emits into the
+        // `stall_restarted` row's `source` (threaded through as
+        // `stall_reason` by the aggregation) must map to the contract's
+        // blame table — pins the emitter↔classifier literals together.
+        for (slug, kind, expected) in [
+            (
+                STALL_SOURCE_SILENT_SOCKET,
+                EPISODE_KIND_STALL_RESTART,
+                (BlameClass::Broker, "silent_socket"),
+            ),
+            (
+                STALL_SOURCE_NEVER_STREAMED,
+                EPISODE_KIND_NEVER_STREAMED_RESTART,
+                (BlameClass::Broker, "never_streamed"),
+            ),
+            (
+                STALL_SOURCE_AUTH_STALE,
+                EPISODE_KIND_STALL_RESTART,
+                (BlameClass::Ours, "token_minter_stale"),
+            ),
+            (
+                STALL_SOURCE_AUTH_STALE,
+                EPISODE_KIND_NEVER_STREAMED_RESTART,
+                (BlameClass::Ours, "token_minter_stale"),
+            ),
+            (
+                STALL_SOURCE_ENTITLEMENT,
+                EPISODE_KIND_STALL_RESTART,
+                (BlameClass::Broker, "entitlement_reject"),
+            ),
+            (
+                STALL_SOURCE_ENTITLEMENT,
+                EPISODE_KIND_NEVER_STREAMED_RESTART,
+                (BlameClass::Broker, "entitlement_reject"),
+            ),
+        ] {
+            let e = EpisodeEvidence {
+                stall_reason: slug,
+                ..EpisodeEvidence::bare(kind, "groww", slug, -1)
+            };
+            assert_eq!(
+                classify_episode(&e),
+                expected,
+                "slug {slug:?} on kind {kind:?} must map to {expected:?}"
             );
         }
     }

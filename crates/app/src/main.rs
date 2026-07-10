@@ -665,6 +665,10 @@ async fn main() -> Result<()> {
             std::sync::Arc::clone(&scale_runtime.wake),
             std::sync::Arc::clone(&feed_health),
             std::sync::Arc::clone(&groww_sidecar_notifier_slot),
+            // Scoreboard PR-B (2026-07-10): stall-watchdog kill+relaunch
+            // forensic rows (`stall_restarted`) — same consumer pattern as
+            // the bridge's lifecycle rows.
+            Some(spawn_ws_event_audit_consumer(config.questdb.clone())),
         );
         tokio::spawn(tickvault_app::groww_scale_ladder::run_groww_scale_ladder(
             groww_scale_cfg.clone(),
@@ -681,6 +685,11 @@ async fn main() -> Result<()> {
             tickvault_app::groww_sidecar_supervisor::GrowwSidecarOptions::default(),
             std::sync::Arc::clone(&feed_health),
             std::sync::Arc::clone(&groww_sidecar_notifier_slot),
+            // Scoreboard PR-B (2026-07-10): every stall-watchdog
+            // kill+relaunch stamps ONE `stall_restarted` ws_event_audit row
+            // (fixed cause slug in `source`) so the 15:45 IST scorecard
+            // counts stall episodes — same consumer the bridge uses.
+            Some(spawn_ws_event_audit_consumer(config.questdb.clone())),
         );
     }
     // ── index_constituency ts-pin migration — PROCESS-GLOBAL boot prefix ──
@@ -15080,12 +15089,14 @@ fn spawn_feed_scoreboard_tasks(
                 blame_broker: n.blame_broker,
                 blame_ours: n.blame_ours,
                 blame_unclear: n.blame_indeterminate,
-                // PR-1 has NO stall emit site (the StallRestarted event kind
-                // ships in PR-2), so the table's 0 is unmeasurable-as-zero on
-                // the operator surface — render the honest "?" sentinel +
-                // footnote instead of a fabricated 0 (hostile review
-                // 2026-07-10; audit Rule 11). PR-2 flips this to n.stalls.
-                stalls: -1,
+                // Scoreboard PR-B (2026-07-10): the StallRestarted event
+                // kind is LIVE — the stall watchdog writes one
+                // `stall_restarted` row per kill+relaunch, so the tally is a
+                // measurement from this deploy forward (0 = measured 0; the
+                // PR-1 "?" sentinel + footnote are retired — the runbook
+                // keeps the pre-ship-day caveat, and the CloudWatch counter
+                // holds the pre-ship past).
+                stalls: n.stalls,
                 restarts: n.restarts,
                 streaming_minutes: n.streaming_minutes,
             }
@@ -15093,20 +15104,16 @@ fn spawn_feed_scoreboard_tasks(
         match inner.await {
             Ok(Ok(Some(summary))) => {
                 if sb_telegram_enabled {
-                    // PR-2 NOTE (round-2 hostile review 2026-07-10): the
-                    // Groww disconnect instrumentation is structurally BLIND
-                    // to the dominant failure mode — the sidecar's internal
-                    // socket dying and reconnecting (the FEED-STALL-01
-                    // family) writes NO disconnect row until the PR-2 stall
-                    // detector ships; only feed-disable + bridge-death do.
-                    // Rendering the near-empty count as a MEASURED 0 next to
-                    // Dhan's fully-instrumented reset stream is an audit-
-                    // Rule-11 false-OK on the card — render the honest "?"
-                    // sentinel (mirror of stalls; the DB row keeps the
-                    // measured floor for the month sums, runbook-caveated).
-                    // PR-2 flips this back to the measured count.
-                    let mut groww_line = to_line("Groww", &summary.groww);
-                    groww_line.drops_market = -1;
+                    // Scoreboard PR-B (2026-07-10): the round-2 Groww
+                    // drops blind spot is CLOSED for its dominant failure
+                    // mode — the sidecar socket-death family now writes
+                    // `stall_restarted` rows (counted in the Stalls column),
+                    // so Groww's drops count (feed-disable + bridge-death)
+                    // renders as a measured number again. Honest residual
+                    // (runbook §6): in-sidecar reconnects that recover
+                    // FASTER than the 30s stall threshold remain invisible
+                    // to both columns on both card sides.
+                    let groww_line = to_line("Groww", &summary.groww);
                     sb_notifier.notify(NotificationEvent::DualFeedDailyScorecard {
                         trading_date_ist: summary.trading_date_ist.clone(),
                         dhan: to_line("Dhan", &summary.dhan),
