@@ -226,3 +226,21 @@ Per `zero-loss-guarantee-charter.md` §3 (boxes for THIS plan):
 - [x] Evidence: verbatim gate outputs recorded in the PR body / worker report
 - [x] "100%" wording carries the envelope qualifier (§36.4 rewrite — "100% inside the
   tested envelope, with ratcheted regression coverage: …")
+
+## AM-R1 — hostile review round 1 (2026-07-10; 4 reviewers + 3 refuters/finding; 9 CONFIRMED of 13)
+
+| # | Sev | Finding | Fix |
+|---|---|---|---|
+| F1 | MEDIUM | Snapshot fail-closed gate keyed on the RAW expiry string — "2026-7-30" vs "2026-07-30" (chrono non-padded leniency) bypassed the two-distinct-SIDs corruption check | `to_universe` keeps the parsed `NaiveDate` and keys `seen_future_canonical_expiries` on `(canonical, NaiveDate)`. Test: `test_snapshot_index_future_same_month_different_spelling_fail_closed` |
+| F2 | MEDIUM | Warm-snapshot path had NO MonthlySerialFlood envelope (pre-§36.7 implicit ≤1 future/underlying regressed to unbounded) | Warm path mirrors the cold envelope: >`MAX_MONTHLY_EXPIRIES_PER_UNDERLYING` months/canonical OR >`MAX_INDEX_FUTURE_TARGETS` total → snapshot rejected (None → cold rebuild). Tests: `test_snapshot_index_future_monthly_serial_flood_rejected`, `test_snapshot_index_future_total_cap_rejected_and_full_envelope_accepted` (24 accepted / 25 rejected) |
+| F3 | LOW | `far_month_future_sids` grouped nearest-month by RAW `underlying_symbol` — alias-literal drift (MIDCPNIFTY precedent) split groups and silently disabled the exclusion | Groups by `canonicalize_index_symbol`. Test: `test_far_month_future_sids_groups_by_canonical_across_alias_literals` |
+| F4 | LOW | Stale test name/comment claimed "format-2 accepted" post-v3-bump; loader warn said "pre-§36" for §36-era format-2 | Renamed `test_snapshot_current_format_zero_futures_accepted_no_rebuild_loop` (+ comment); loader warn → "format below current"; futidx-4 plan test list annotated |
+| F5 | LOW | Far-month exclusion refreshed only at plan-seed time; per-BOOT staleness across expiry-day midnight undocumented | Documented as HONEST ENVELOPE: fn doc + `futidx-4-error-codes.md` §3 alarm-gate note (per-boot, not per-day; AWS 16:30 stop bounds it to dev/manual runs; seed `info!` `far_month_excluded` is the trace). Seed-time `>= today` via F6 also makes a post-midnight lane cold start roll correctly |
+| F6 | MEDIUM | Singular `select_index_future_expiry` was a dormant pub fn — its documented consumer (D7 exclusion set) never called it (Rule 13 class) | WIRED (option A): `far_month_future_sids(plan, today_ist)` collects per-canonical sorted months and identifies nearest via the shared singular; all-months-past → nothing excluded (fail-safe). Test: `test_far_month_future_sids_all_months_past_excludes_nothing`; singular doc names the consumer |
+| F7 | LOW | D7 alarm-gate consumer sites (gauge subtraction + SLO filter) had no ratchet — silent regression re-opens the false-page class | NEW build-failing source-scan ratchet `crates/app/tests/far_month_alarm_gate_wiring_guard.rs` (4 tests: gauge filter+subtract, SLO filter, seed-before-detector ordering, canonical+singular derivation) |
+| F8 | LOW | `INDEX_FUTURES_UNDERLYINGS` doc cited the pre-rename guard test name | Citation → `futidx_scope_pinned_to_4_underlyings_all_monthly_expiries` |
+| F9 | LOW | Garbled `§` in two PUSHED commit bodies: f71e31541 body reads "futidx-4-error-codes.md $2" (intended **§2**) and e45a31881 body reads "groww-second-feed-scope $36.3" (intended **§36.3**) — shell `$2`/`$36` positional-param expansion in a double-quoted `git commit -m` | UNFIXABLE post-push (history rewrite/force-push banned). Corrected citations recorded HERE as the provenance authority. PREVENTION (binding for future sessions): commit bodies containing `§N` MUST be written via single-quoted strings or a heredoc, never a double-quoted `-m` |
+
+Rejected (refuters): scan_gaps_top_n TOCTOU (unreachable), warm-path CRITICAL variant
+(duplicate of F2 at wrong severity), release debug_assert (bound structurally unviolable),
+DepthOnly depth-unbounded (deliberate §36.7 design — vendor publication lag is not paged).
