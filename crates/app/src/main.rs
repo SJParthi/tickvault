@@ -14673,8 +14673,13 @@ fn spawn_feed_scoreboard_tasks(
     // 180s query). The JoinHandle is threaded into Task 2 so a RunCatchUp /
     // forced run aggregates AFTER the synthesized rows exist AND so its
     // panic/JoinError is always classified (never a silent task death).
-    // Returns the number of synthesized episodes.
-    let reconcile_handle: tokio::task::JoinHandle<usize> = {
+    // Returns the synthesized episode ROWS (round 3, 2026-07-10): the
+    // immediate paths fold them IN MEMORY — a SELECT read-back seconds
+    // after the ILP-HTTP flush can miss them (committed-to-WAL is NOT
+    // visible-to-SELECT).
+    let reconcile_handle: tokio::task::JoinHandle<
+        Vec<tickvault_storage::feed_episode_audit_persistence::FeedEpisodeAuditRow>,
+    > = {
         let pd_qcfg = config.questdb.clone();
         tokio::spawn(async move {
             // The anchor is the PROCESS-START instant captured at the very
@@ -14766,6 +14771,37 @@ fn spawn_feed_scoreboard_tasks(
         // two fabricated all-zero rows stamped outcome='complete'. The
         // TARGET date must be a past-or-today TRADING day; refusal pages
         // Aborted, matching the malformed-date arm.
+        //
+        // Round 3 (2026-07-10): the SAME semantic gate applies to the
+        // no-DATE forced arm — `TICKVAULT_SCOREBOARD_NOW=1` alone on a
+        // Saturday/holiday targeted the non-trading TODAY and (after
+        // 15:45) fabricated two all-zero rows stamped outcome='complete'.
+        // The natural weekend mistake is re-running Friday's card and
+        // forgetting the DATE var; refusal pages Aborted with the fix.
+        if force_now && date_override.is_none() {
+            let today_label = today_ist.format("%Y-%m-%d").to_string();
+            if let Err(why) = validate_scoreboard_backfill_date(
+                boot_day,
+                boot_day,
+                sb_calendar.is_trading_day(today_ist),
+            ) {
+                error!(
+                    code = tickvault_common::error_code::ErrorCode::Scoreboard01AggregationDegraded
+                        .code_str(),
+                    stage = "forced_now_non_trading",
+                    date = %today_label,
+                    "SCOREBOARD-01: TICKVAULT_SCOREBOARD_NOW without a date on \
+                     a non-trading day {why} — refusing the forced run (pass \
+                     TICKVAULT_SCOREBOARD_DATE=YYYY-MM-DD for the trading day \
+                     you meant)"
+                );
+                return Err(format!(
+                    "TICKVAULT_SCOREBOARD_NOW: today ({today_label}) {why} — \
+                     pass TICKVAULT_SCOREBOARD_DATE=YYYY-MM-DD for the trading \
+                     day you meant"
+                ));
+            }
+        }
         if let Some((target_day, label)) = &date_override {
             let target_is_trading = chrono::NaiveDate::parse_from_str(label, "%Y-%m-%d")
                 .map(|d| sb_calendar.is_trading_day(d))
@@ -14818,11 +14854,15 @@ fn spawn_feed_scoreboard_tasks(
         // the non-trading-day skip (round-2 hostile review 2026-07-10: the
         // reconciler was a bare spawn whose panic was silently discarded /
         // never awaited on the skip path — the SLO-03 silent-task-death
-        // class). Aggregation also runs AFTER it so a just-synthesized
-        // death never misses this run's tallies; the handle resolves in
-        // ≤ ~13 min worst case (the scheduled 15:45 path has long passed).
-        let boot_synthesized_deaths = match reconcile_handle.await {
-            Ok(n) => n,
+        // class). Aggregation also runs AFTER it AND receives the
+        // synthesized ROWS themselves (round 3): on the immediate
+        // RunCatchUp/RunNow paths the run fires seconds after the
+        // reconciler's flush, so the rows are folded in-memory instead of
+        // relying on a SELECT read-back inside the WAL-apply window. The
+        // handle resolves in ≤ ~13 min worst case (the scheduled 15:45
+        // path has long passed).
+        let boot_reconciled_rows = match reconcile_handle.await {
+            Ok(rows) => rows,
             Err(join_err) => {
                 if join_err.is_panic() {
                     error!(
@@ -14837,9 +14877,17 @@ fn spawn_feed_scoreboard_tasks(
                          re-creatable by a later re-run)"
                     );
                 }
-                0
+                Vec::new()
             }
         };
+        // The restart-day partial floor counts IN-MARKET deaths only —
+        // post-close restarts (market_hours=false, blame_reason
+        // post_close_restart) are the scheduled-stop-ambiguous shape and
+        // must not flip a completed day's rows to partial (round 3).
+        let boot_synthesized_deaths = boot_reconciled_rows
+            .iter()
+            .filter(|r| r.market_hours)
+            .count();
         if matches!(decision, ScoreboardStart::SkipNonTradingDay) {
             return Ok(None);
         }
@@ -14885,9 +14933,12 @@ fn spawn_feed_scoreboard_tasks(
             forced_early_run,
             // Same-day runs self-scrape the session's audit-drop counter and
             // apply the restart-day partial floor; backfills skip both
-            // (round-2: the counter is CURRENT-session state).
+            // (round-2: the counter is CURRENT-session state; round-3: the
+            // floor is ALSO data-driven off tallied restarts, so a backfill
+            // of a crash day still stamps partial).
             target_ist_day == today_day,
             boot_synthesized_deaths,
+            &boot_reconciled_rows,
         )
         .await?;
         info!("PROOF: feed_scoreboard daily aggregation fired");
@@ -14945,6 +14996,7 @@ fn spawn_feed_scoreboard_tasks(
                         partial_coverage: summary.partial_coverage,
                         degraded: summary.degraded,
                         early_run: summary.early_run,
+                        restart_partial: summary.restart_partial,
                     });
                 } else {
                     info!("feed_scoreboard: Telegram disabled — daily rows written only");

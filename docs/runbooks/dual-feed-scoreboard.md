@@ -148,7 +148,8 @@ Review guide per `blame_reason`:
 | `network_path` | Handshake / TLS / DNS / refused / timeout | Box egress + DNS health at that minute |
 | `unknown_cause` / `unclassified` | Novel error text / novel source label | Read the `evidence` column; if a pattern repeats, extend the classifier (a dated PR) |
 | `off_hours_idle` | Pre/post-market idle cleanup | Expected noise — excluded from headline counts; no action |
-| `run_partial = true` rows | Classified with EXPIRED errors.jsonl evidence (>48h backfill) | 805s defaulted broker, RSTs defaulted indeterminate — annotate rather than re-litigate |
+| `run_partial = true` rows | Classified with EXPIRED errors.jsonl evidence (>48h backfill) | 805s defaulted broker, RSTs defaulted indeterminate — annotate rather than re-litigate (a re-run can NEVER downgrade an evidence-backed row — the keep-better guard suppresses it and logs `stage="blame_regression"`) |
+| `post_close_restart` | The reconnect landed AFTER 3:30 PM close — indistinguishable from the clean scheduled stop (a clean shutdown writes no disconnect record) | Forensic row only — excluded from the headline restarts/blame counts and the partial floor; no action unless it repeats on days with NO evening restart |
 
 An `outcome = 'degraded'` day (audit-row drops) means that day's episode
 counts are a FLOOR — annotate the month summary accordingly:
@@ -165,6 +166,27 @@ FROM feed_scoreboard_daily WHERE outcome != 'complete' ORDER BY trading_date_ist
   reuse their audit-row ts, so everything UPSERTs in place. UNSET the
   variable afterwards: left set in a service unit, every 08:31 boot turns
   into an early partial run that consumes the day's single scheduled run.
+  On a NON-trading day (weekend/holiday), `TICKVAULT_SCOREBOARD_NOW=1`
+  alone is REFUSED with the "scorecard did NOT run" page — without the
+  refusal it targeted the non-trading TODAY and (after 15:45) fabricated
+  two all-zero rows stamped `complete`. A weekend re-run of a PAST day
+  therefore REQUIRES the DATE var (below).
+- **⚠ Re-runs are KEY-idempotent, NOT value-idempotent.** Every re-run
+  RE-CLASSIFIES the day's episodes with the evidence available AT THE
+  RE-RUN INSTANT, and the tables are last-write-wins on the DEDUP key. A
+  re-run more than 48h after the day (the errors.jsonl evidence horizon —
+  including the SCOREBOARD-01 triage advice "re-run once QuestDB is
+  healthy" followed late) would have OVERWRITTEN evidence-backed blame
+  with evidence-less defaults (`ours/dual_instance` → `broker/
+  rate_limit_805`, corroborated `broker/bare_rst` → `indeterminate`).
+  The keep-better guard now suppresses exactly that: a partial-evidence
+  run never replaces an existing `run_partial=false` row — the existing
+  verdict is kept, folded into the day's tallies, and the suppression is
+  logged loudly (`SCOREBOARD-01`, `stage="blame_regression"`). Same-day
+  re-runs with intact evidence remain fully idempotent. Residual: if the
+  keep-better read itself fails (`stage="keep_better_read"`), the guard
+  is OFF for that run — prefer re-running a stale day only when the
+  QuestDB read side is healthy.
 - **Backfill a PAST day:** restart with `TICKVAULT_SCOREBOARD_NOW=1
   TICKVAULT_SCOREBOARD_DATE=YYYY-MM-DD` (both required — the date is only
   honored alongside the forced-run flag; unset both afterwards). Disconnect
@@ -216,11 +238,20 @@ FROM feed_scoreboard_daily WHERE outcome != 'complete' ORDER BY trading_date_ist
   reconnects in seconds. A death is synthesized when the DEATH WINDOW —
   from the last pre-boot "up" record to this boot's reconnect — overlaps
   the session (so the normal day's pre-market ~08:34 connect followed by
-  an 11:00 crash counts, an in-session crash restarted after close counts,
-  and a purely pre-market crash does not) — the 16:30 auto-stop → 08:30
-  start cycle never counts as a death (the prior day's rows are day-scoped
-  out). Failed episode flushes retry 3× at 60s spacing before giving up
-  loudly.
+  an 11:00 crash counts and a purely pre-market crash does not) — the
+  16:30 auto-stop → NEXT-day 08:30 start cycle never counts as a death
+  (the prior day's rows are day-scoped out), and a SAME-day reconnect
+  landing after the 3:30 PM close (the 16:30 stop → manual evening start
+  workflow, or a just-post-close crash) is recorded as a forensic
+  `post_close_restart` row that is EXCLUDED from the headline
+  restarts/blame counts and the partial floor — with an edge-triggered
+  audit it is indistinguishable from the clean scheduled stop, so it must
+  never re-write a completed day's card. Failed episode flushes retry 3×
+  at 60s spacing before giving up loudly (`stage=
+  "reconcile_flush_exhausted"` — the counter and the success line then do
+  NOT fire; the boot's own card still counts the deaths in-memory, but
+  the rows never reached the table and the month restart count
+  under-counts).
 
 ## 5. Day-1 notes (PR-A scope)
 

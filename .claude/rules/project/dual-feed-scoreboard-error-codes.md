@@ -69,11 +69,25 @@ the month restart count under-counts — annotate the month summary.
    BOOT-01/BOOT-02).
 3. Backfill once QuestDB is healthy: restart with
    `TICKVAULT_SCOREBOARD_NOW=1` (the run is DEDUP-idempotent — same
-   deterministic 15:45 IST `ts`, so the day's rows UPSERT in place). What a
-   backfill CANNOT recover is in `docs/runbooks/dual-feed-scoreboard.md`
+   deterministic 15:45 IST `ts`, so the day's rows UPSERT in place; on a
+   NON-trading day the no-DATE forced run is REFUSED — pass
+   `TICKVAULT_SCOREBOARD_DATE` for the trading day you meant). ⚠ Re-runs
+   are KEY-idempotent, NOT VALUE-idempotent (round 3, 2026-07-10): a
+   re-run re-classifies with the evidence of the RE-RUN instant, and past
+   the 48h errors.jsonl horizon that evidence is gone — the keep-better
+   guard therefore SUPPRESSES any overwrite that would downgrade an
+   existing `run_partial=false` (evidence-backed) episode row with a
+   `run_partial=true` re-classification, keeping the original verdict and
+   logging `stage="blame_regression"`. If the guard's own read fails
+   (`stage="keep_better_read"`), it is OFF for that run — re-run stale
+   days only with a healthy QuestDB read side. What a backfill CANNOT
+   recover is in `docs/runbooks/dual-feed-scoreboard.md`
    (same-day errors.jsonl correlation ages out after 48h → 805 episodes
    default broker, RSTs default indeterminate; boot-reconciled
-   process-death rows are boot-only — see the §1 exception above).
+   process-death rows are boot-only — see the §1 exception above; a
+   `stage="reconcile_flush_exhausted"` line means the boot's synthesized
+   death rows never reached QuestDB at all — counted on that boot's own
+   card in-memory, permanently absent from the month table).
 4. `outcome='degraded'` days (audit under-count): treat the day's episode
    counts as a floor, not a truth — the runbook's month-end checklist
    excludes/annotates them.
@@ -109,6 +123,7 @@ operator signal.
 |---|---|---|
 | `process_death` (boot-reconciled), build sha changed vs deployed sha | ours | `deploy_restart` |
 | `process_death`, sha unchanged/unknown (fail-soft) | ours | `process_restart` |
+| `process_death`, reconnect landed AT/AFTER the 15:30 close (indistinguishable from the clean scheduled stop — edge-triggered audit, SIGTERM writes no row) | ours (row only — `market_hours=false`, EXCLUDED from headline restarts/blame + the partial floor) | `post_close_restart` |
 | Dhan 805 + same-day RESILIENCE-01/03 line | ours | `dual_instance` |
 | Dhan 805, no peer evidence (incl. >48h backfill) | broker | `rate_limit_805` |
 | Dhan 807 | broker | `auth_token_expired` |

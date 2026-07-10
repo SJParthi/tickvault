@@ -325,7 +325,59 @@ forensic tables:
     branch): the cross_verify_1m + tick_conservation nanos-vs-micros SQL
     bugs — verified REAL, handed off for a separate main fix PR.
   - Files: crates/app/src/feed_scoreboard_boot.rs, crates/app/src/main.rs, crates/core/src/notification/events.rs, crates/core/src/auth/secret_manager.rs, .claude/triage/error-rules.yaml, .claude/rules/project/dual-feed-scoreboard-error-codes.md, docs/runbooks/dual-feed-scoreboard.md
-  - Tests: test_synthesize_process_death_premarket_prior_midmarket_crash, test_synthesize_process_death_overnight_stop_start_cycle_excluded, test_synthesize_process_death_pairs_on_reconnected_and_gate_is_per_key, test_is_up_kind, test_is_market_data_ws_type_allowlist, test_fold_market_data_episode_skips_order_update, test_fold_episode_into_tally_unknown_kind_counts_nothing, test_validate_scoreboard_backfill_date, test_sanitize_scoreboard_trigger_bounds, test_scan_errors_jsonl_filters_codes_and_skips_bare_symlink_name, test_aggregate_episode_rows_tallies_per_feed, test_dual_feed_scorecard_groww_drops_sentinel_footnote, test_feed_scoreboard_task_is_wired_into_main
+  - Tests: test_synthesize_process_death_premarket_prior_midmarket_crash, test_synthesize_process_death_overnight_stop_start_cycle_excluded, test_synthesize_process_death_pairs_on_reconnected_and_gate_is_per_key, test_is_up_kind, test_is_market_data_ws_type_allowlist, test_fold_market_data_episode_skips_order_update, test_fold_episode_into_tally_unknown_kind_counts_nothing, test_validate_scoreboard_backfill_date, test_sanitize_scoreboard_trigger_bounds, test_scan_errors_jsonl_filters_codes_and_skips_bare_symlink_name, test_fold_episode_readback_rows_tallies_per_feed (renamed from test_aggregate_episode_rows_tallies_per_feed in round 3), test_dual_feed_scorecard_groww_drops_sentinel_footnote, test_feed_scoreboard_task_is_wired_into_main
+
+- [x] Item 10 — Hostile-review round 3 fixes (2026-07-10)
+  - MEDIUM (post-close phantom): a synthesized process death whose
+    reconnect lands AT/AFTER the 15:30 close is flagged
+    `post_close_restart` and stamped `market_hours=false` — the fold
+    excludes it from the headline restarts/blame tallies and it never
+    engages the restart-day partial floor. The 16:30 scheduled stop →
+    same-day manual evening start topology therefore no longer
+    synthesizes a phantom in-market death nor re-writes the day's
+    completed scorecard (the forensic row still persists, blame_reason
+    `post_close_restart`; the deliberately-ambiguous 15:35-crash shape is
+    folded into the same honest exclusion — the locked round-2 test was
+    revised with a dated comment).
+  - MEDIUM (read-back race on the immediate paths):
+    reconcile_process_death_episodes now returns the synthesized
+    FeedEpisodeAuditRow set; Task 2 folds those rows IN MEMORY via
+    fold_market_data_episode and the boot-reconciled SELECT read-back is
+    DEDUPED against them by (feed, ws_type, connection_index, ts) — the
+    RunCatchUp/RunNow run seconds after the flush can no longer render
+    "restarts: 0" inside the WAL-apply window. The stale "long visible"
+    comment was corrected to name the immediate-path exception; the
+    ws-read-failed fallback path applies the same in-memory fold +
+    dedupe.
+  - MEDIUM (NOW-without-DATE on a non-trading day): the no-DATE forced
+    arm now applies validate_scoreboard_backfill_date(today, today,
+    calendar) — a Saturday/holiday TICKVAULT_SCOREBOARD_NOW=1 run is
+    REFUSED (Aborted page) instead of fabricating two all-zero
+    outcome='complete' rows after 15:45; runbook §4 states a weekend
+    re-run of a past day REQUIRES the DATE var.
+  - MEDIUM (stale re-run destroys evidence-backed blame): step 2 applies
+    a keep-better guard — when this run's correlation evidence is PARTIAL
+    it reads the target day's existing episode rows first and SUPPRESSES
+    any UPSERT that would downgrade a run_partial=false row to
+    run_partial=true, keeping + folding the existing verdict and logging
+    error!(SCOREBOARD-01, stage="blame_regression"); runbook §4 + the
+    rule file now warn loudly that re-runs are KEY-idempotent, not
+    VALUE-idempotent.
+  - LOW (backfill restart-day floor): the partial floor is also
+    DATA-driven — tallied in-market restarts > 0 force the row partial on
+    a past-day backfill too (post-close restarts excluded by
+    construction).
+  - LOW (flush-failure false-OK): the synthesized counter + success line
+    fire only after a CONFIRMED flush; an all-retries-failed exit logs
+    error!(SCOREBOARD-01, stage="reconcile_flush_exhausted",
+    persisted=0) instead — the returned rows still feed the in-memory
+    tallies + floor.
+  - LOW (row-vs-card honesty): restart_partial threads through
+    ScoreboardSummary → DualFeedDailyScorecard; the card renders "The app
+    restarted during the day" whenever the persisted row is
+    restart-floor-partial.
+  - Files: crates/app/src/feed_scoreboard_boot.rs, crates/app/src/main.rs, crates/core/src/notification/events.rs, docs/runbooks/dual-feed-scoreboard.md, .claude/rules/project/dual-feed-scoreboard-error-codes.md
+  - Tests: test_synthesize_post_close_stop_then_evening_start_topology, test_forced_now_without_date_composes_with_trading_day_validation, test_fold_episode_readback_rows_dedupes_in_memory_keys, test_should_suppress_episode_overwrite_keep_better_rule, test_build_existing_episode_partiality_day_sql_and_parse, test_fold_episode_readback_rows_tallies_per_feed, test_dual_feed_scorecard_restart_partial_footnote
 
 ## Scenarios
 

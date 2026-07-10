@@ -494,6 +494,12 @@ pub enum NotificationEvent {
         /// `true` when the operator forced this run BEFORE the daily
         /// trigger — the card covers the day only up to the run time.
         early_run: bool,
+        /// `true` when the app restarted mid-day (an in-market process
+        /// death was detected) — records from before the restart may
+        /// under-count, and the persisted row is stamped partial; the card
+        /// must say so too (round-3 hostile review 2026-07-10: the row said
+        /// partial while the card stayed silent).
+        restart_partial: bool,
     },
 
     /// The daily dual-feed scorecard TASK died (panicked / errored) before
@@ -1886,6 +1892,7 @@ impl NotificationEvent {
                 partial_coverage,
                 degraded,
                 early_run,
+                restart_partial,
             } => {
                 // Operator-charter §G wording: plain English, emoji status,
                 // IST 12-hour time, specific numbers, ONE decision (the
@@ -1940,6 +1947,16 @@ impl NotificationEvent {
                     footnotes.push_str(
                         "\n\u{26a0}\u{fe0f} Some connection events could not be recorded \
                          today — treat the drop counts as a minimum, not a truth.",
+                    );
+                }
+                if *restart_partial {
+                    // Round-3 honesty fix: the persisted row is stamped
+                    // partial on a restart day — the card must carry the
+                    // same caveat, not stay silent.
+                    footnotes.push_str(
+                        "\n\u{26a0}\u{fe0f} The app restarted during the day — records \
+                         from before the restart may under-count, so today's \
+                         numbers are a floor, not a truth.",
                     );
                 }
                 if dhan.lag_p50_ms >= 0 || dhan.lag_p99_ms >= 0 {
@@ -6414,6 +6431,7 @@ mod tests {
             partial_coverage: false,
             degraded: false,
             early_run: false,
+            restart_partial: false,
         }
     }
 
@@ -6519,6 +6537,7 @@ mod tests {
             partial_coverage: true,
             degraded: true,
             early_run: false,
+            restart_partial: false,
         };
         let msg = ev.to_message();
         assert!(
@@ -6540,11 +6559,41 @@ mod tests {
             partial_coverage: false,
             degraded: false,
             early_run: true,
+            restart_partial: false,
         };
         let msg = ev.to_message();
         assert!(
             msg.contains("produced early on operator request"),
             "early-run footnote missing: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_dual_feed_scorecard_restart_partial_footnote() {
+        // Round-3 hostile review 2026-07-10: a restart day's card must
+        // carry the same partial caveat its persisted row does — never a
+        // silent row-vs-card honesty mismatch on exactly the day the
+        // feature exists for.
+        let ev = NotificationEvent::DualFeedDailyScorecard {
+            trading_date_ist: "2026-07-10".to_string(),
+            dhan: score_line("Dhan"),
+            groww: score_line("Groww"),
+            session_minutes: 375,
+            partial_coverage: false,
+            degraded: false,
+            early_run: false,
+            restart_partial: true,
+        };
+        let msg = ev.to_message();
+        assert!(
+            msg.contains("The app restarted during the day"),
+            "restart-partial footnote missing: {msg}"
+        );
+        // Absent on a clean day.
+        let msg = scorecard(score_line("Dhan"), score_line("Groww")).to_message();
+        assert!(
+            !msg.contains("The app restarted during the day"),
+            "restart footnote must not render on a clean day: {msg}"
         );
     }
 
