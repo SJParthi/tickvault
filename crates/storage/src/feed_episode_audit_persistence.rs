@@ -533,4 +533,83 @@ mod tests {
             "must target the HTTP port, not ILP TCP: {conf}"
         );
     }
+
+    // ========================================================================
+    // Persistence-helper tests — mock QuestDB /exec HTTP server + unreachable
+    // host (P2C pattern from groww_scale_audit_persistence.rs). These
+    // exercise the real ensure/constructor code paths: success (200),
+    // non-2xx (500) and transport-error arms.
+    // ========================================================================
+
+    const MOCK_HTTP_200: &str = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}";
+    const MOCK_HTTP_500: &str =
+        "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 13\r\n\r\n{\"error\":\"x\"}";
+
+    async fn spawn_mock_http(response: &'static str) -> u16 {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            loop {
+                if let Ok((mut stream, _)) = listener.accept().await {
+                    tokio::spawn(async move {
+                        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                        let mut buf = [0u8; 8192];
+                        let _ = stream.read(&mut buf).await;
+                        let _ = stream.write_all(response.as_bytes()).await;
+                    });
+                }
+            }
+        });
+        port
+    }
+
+    fn mock_cfg(http_port: u16) -> QuestDbConfig {
+        QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port,
+            pg_port: 1,
+            ilp_port: 1,
+        }
+    }
+
+    fn unreachable_cfg() -> QuestDbConfig {
+        // Port 1 is reserved and never listening; guarantees a real HTTP
+        // transport failure without touching any live service.
+        mock_cfg(1)
+    }
+
+    #[tokio::test]
+    async fn test_ensure_feed_episode_audit_table_mock_200_completes() {
+        // Success path: CREATE DDL + feed self-heal ALTER + DEDUP ENABLE all
+        // take the Ok(2xx) arm.
+        let port = spawn_mock_http(MOCK_HTTP_200).await;
+        ensure_feed_episode_audit_table(&mock_cfg(port)).await;
+    }
+
+    #[tokio::test]
+    async fn test_ensure_feed_episode_audit_table_mock_500_degrades_without_panic() {
+        // Non-2xx path: every DDL statement takes the log-and-continue arm
+        // (best-effort degrade — SCOREBOARD-01, never a panic, never blocks).
+        let port = spawn_mock_http(MOCK_HTTP_500).await;
+        ensure_feed_episode_audit_table(&mock_cfg(port)).await;
+    }
+
+    #[tokio::test]
+    async fn test_ensure_feed_episode_audit_table_unreachable_degrades_without_panic() {
+        // Transport-error path: every DDL send Err arm logs and continues.
+        ensure_feed_episode_audit_table(&unreachable_cfg()).await;
+    }
+
+    #[tokio::test]
+    async fn test_episode_writer_new_is_lazy_and_buffers_without_network() {
+        // `Sender::from_conf` with `http::` does not dial at construction
+        // (the ws_event_audit precedent), so new() against an unreachable
+        // host still builds a sender-backed writer whose appends land in the
+        // local buffer — the lazy-construction contract.
+        let mut w = FeedEpisodeAuditWriter::new(&unreachable_cfg());
+        assert_eq!(w.pending(), 0, "fresh writer has nothing pending");
+        w.append_row(&sample_row())
+            .expect("append must succeed without network");
+        assert_eq!(w.pending(), 1, "row buffered locally");
+    }
 }
