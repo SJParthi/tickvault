@@ -95,9 +95,9 @@
 
 ### WS-GAP-05 — Pool supervisor respawned task
 
-**Symptom:** `tv_ws_pool_respawn_total` increments.
-**Cause:** Per-connection task panicked or exited unexpectedly.
-**Fix:** Pool supervisor auto-respawns within 5s. If `rate(tv_ws_pool_respawn_total[5m]) > 1/min`, inspect `data/logs/errors.jsonl.*` for the panic backtrace immediately preceding the respawn.
+**Symptom:** `tv_ws_pool_respawn_total{reason="unexpected_clean_exit"}` increments.
+**Cause:** A main-feed connection session ended with a server Close frame / TCP stream-end without a shutdown request (W2#8, 2026-07-10).
+**Fix:** The slot's supervised loop auto-respawns within ~5s (storm-bounded 5s→300s backoff). If the rate sustains, Dhan keeps closing the session server-side — cross-check the token + Dhan status in `data/logs/errors.jsonl.*` (the WS-GAP-05 lines carry `backoff_secs` + `consecutive_quick_exits`). Release-build panics abort the process (`panic = "abort"`); recovery there is restart + WAL replay, not respawn.
 **Cross-reference:** `.claude/rules/project/wave-2-error-codes.md::WS-GAP-05`.
 
 ### WS-GAP-06 — Tick-gap detector fired

@@ -23,19 +23,97 @@ until the next market open instead of giving up. Replaces the legacy
 
 **Source:** `crates/core/src/websocket/connection.rs::wait_with_backoff`
 
-## WS-GAP-05 — pool supervisor respawned a dead connection task
+## WS-GAP-05 — pool slot respawned after an unexpected clean exit
 
-**Trigger:** `respawn_dead_connections_loop` in `connection_pool.rs`
-detected a pool-task `JoinHandle` that exited and respawned it within 5s.
-Indicates a panic / unexpected return inside the per-connection task.
+> **2026-07-10 truth-sync (W2#8).** The pre-2026-07-10 text here described a
+> `respawn_dead_connections_loop` / `spawn_pool_supervisor_task` design that
+> was NEVER BUILT (neither function ever existed; the shipped
+> `supervise_pool` was a log-and-count teardown drain whose own doc-comment
+> said "actual respawn is deferred"). W2#8 implements the respawn with
+> different — safer — semantics, described below.
+
+**Trigger (actual):** the per-slot task spawned by
+`WebSocketConnectionPool::spawn_all` runs the supervised loop
+`run_supervised_pool_slot` (`connection_pool.rs`). When `conn.run()`
+exits `Ok(())` WITHOUT a shutdown request and with a live downstream
+frame channel — i.e. a Dhan **server Close frame** or a **TCP
+stream-end** — the loop logs `error!(code = "WS-GAP-05")`, increments
+`tv_ws_pool_respawn_total{reason="unexpected_clean_exit"}`, sleeps a
+storm-bounded backoff (5s base per the original contract, doubling to a
+300s cap; a session that survives ≥60s resets the ladder — the WS-GAP-10
+stability-window precedent), and re-enters `run()` **in the SAME task on
+the SAME slot** — replace-not-add, so the 2-WebSocket lock and the lane
+handle ownership (`DhanLaneRunHandles` H8 Drop floor,
+`teardown_dhan_lane_tasks` abort+drain) are structurally unchanged.
+Pre-W2#8 this exit class left the slot dead until the pool watchdog's
+300s Halt + 15-min WS-GAP-09 ride-out (which assumed a live reconnect
+loop and therefore no-op'd on the dead task) escalated to a full
+process restart — ~5–20 min of dead feed for a 5-second problem.
+
+**What NEVER respawns (deliberate exits stay terminal):** graceful
+shutdown / lane teardown (`is_shutdown_requested`), a teardown `abort()`
+(cancels the whole loop — a torn-down lane can never be resurrected),
+`NonReconnectableDisconnect` (the Dhan 805-class anti-storm stop),
+`ReconnectionExhausted` (a configured finite retry budget), and a clean
+exit with the frame channel CLOSED (WS-GAP-07 — the tick consumer is
+dead; respawning would churn Dhan connects with zero benefit).
+
+**Honest panic envelope (the TICK-FLUSH-01 precedent):** the workspace
+release profile sets `panic = "abort"`, so in the PRODUCTION binary a
+panicked connection task ABORTS the process — "respawn on panic" was
+always physically impossible in release and is NOT claimed; recovery for
+a panic is process restart + WAL replay. In unwind (dev/test) builds a
+panic propagates out of the slot task and surfaces at the teardown
+drain, exactly as before.
 
 **Triage:**
-1. Search `data/logs/errors.jsonl.*` for the panic backtrace immediately
-   preceding the respawn.
-2. Repeated respawns (`tv_ws_pool_respawn_total` rate >1/min for 5min)
-   indicate cascading failure — operator must inspect.
+1. `mcp__tickvault-logs__tail_errors` — find `WS-GAP-05`; the payload
+   carries `connection_id`, `backoff_secs`, `consecutive_quick_exits`.
+2. A one-off respawn that recovers (ticks resume) = healthy self-heal,
+   no action. Repeated respawns
+   (`tv_ws_pool_respawn_total{reason="unexpected_clean_exit"}` rate
+   sustained) mean Dhan keeps closing our session server-side —
+   cross-check the token (`tv_token_remaining_seconds`, AUTH-GAP-*),
+   Dhan status, and the connection count (max 5 WS/account); the loop
+   is already backing off to the 300s ceiling — loud, never silent.
+3. The pre-existing teardown-drain labels (`ws_error` / `panic` /
+   `cancelled` / `unknown`) on the same counter fire at lane teardown
+   when the drain observes how each handle resolved — every deliberate
+   teardown reports `cancelled` there (the handles are aborted first);
+   that is shutdown bookkeeping, not a live respawn.
 
-**Source:** `crates/core/src/websocket/connection_pool.rs::spawn_pool_supervisor_task`
+**Honest envelope (2026-07-10 adversarial-review outcomes):**
+- **Off-hours parity (MEDIUM, FIXED):** a clean-close exit never increments
+  `run()`'s reconnect counter, so the WS-GAP-04 post-close sleep could
+  never engage for this class — an off-hours Close-frame loop would have
+  churned connects all night. The Respawn arm therefore re-runs the SAME
+  market-hours gate the initial spawn uses (no-op in market hours,
+  park-until-09:00-IST off-hours) and re-checks the shutdown flag after
+  the backoff sleep AND after the gate, so a graceful shutdown landing
+  mid-sleep/mid-park can never open a fresh socket (the A5 notify permit
+  + teardown abort remain the hard floor).
+- **60s-metronome residual (MEDIUM, ACCEPTED — the WS-GAP-10 precedent):**
+  a server that consistently closes each session at ≥61s resets the
+  stability streak every cycle and pins the backoff at the 5s base —
+  worst case ~1 reconnect per ~66s on the locked 1-connection pool
+  (~1,300/day, inside Dhan limits), each cycle loud (one coded ERROR +
+  counter). Strictly better than the pre-W2#8 behaviour for the same
+  pattern (dead slot → 300s Halt → process-restart loop).
+- **Audit asymmetry (LOW, flagged follow-up):** the clean-close exit path
+  in `run()` stamps no `Disconnected` audit row / Telegram, and a
+  respawned session's first connect stamps "initial connect" (the
+  reconnect counter is fresh) — the WS-GAP-05 ERROR + counter are the
+  operator signal for this class today. Wiring a typed audit row into
+  the respawn arm is a follow-up (would touch `run()`'s audit surface,
+  deliberately out of this PR's no-state-machine-change scope).
+
+**Ratchet:**
+`connection_pool.rs::tests::ratchet_spawn_all_uses_supervised_slot_loop`
+(pins the spawn wiring, classify call, counter, code field, backoff,
+market-hours gate, and the double shutdown re-check; + the
+classify/backoff/terminal-behaviour unit + tokio tests beside it).
+
+**Source:** `crates/core/src/websocket/connection_pool.rs::{run_supervised_pool_slot, classify_pool_slot_exit, compute_pool_respawn_backoff_secs}`; teardown drain: `WebSocketConnectionPool::supervise_pool`.
 
 ## WS-GAP-06 — tick-gap detector fired a coalesced summary
 
