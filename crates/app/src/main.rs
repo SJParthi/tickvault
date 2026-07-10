@@ -833,13 +833,14 @@ async fn main() -> Result<()> {
             loop {
                 ticker.tick().await;
                 let now = std::time::Instant::now();
-                // Wave-2-D Fix 4: bounded variant — even universe-wide
-                // silence (~25 K silent instruments) only allocates for
-                // the top-N. Returns (top_n_entries, total_silent).
-                let (gaps, total_silent) = detector_for_task.scan_gaps_top_n(
-                    now,
-                    tickvault_core::pipeline::tick_gap_detector::TICK_GAP_TOP_N_DEFAULT,
-                );
+                // §36.7 (2026-07-10): full walk (cap = map size) instead of
+                // the old top-N cap — the far-month exclusion below must see
+                // EVERY silent entry to subtract the excluded ones. Same
+                // cold-path walk class as the 10s SLO loop; entries come
+                // back largest-gap-first, so the WS-GAP-06 top-10 sample
+                // below is unchanged.
+                let (gaps, total_silent) =
+                    detector_for_task.scan_gaps_top_n(now, detector_for_task.len());
                 // Wave-Holiday-Gate (2026-05-09): suppress WS-GAP-06
                 // emission on Saturday/Sunday boots (and outside
                 // market hours). NSE doesn't stream on weekends, so
@@ -886,12 +887,23 @@ async fn main() -> Result<()> {
                 // below is deliberately UNCHANGED (pre-existing behavior;
                 // it is a coalesced log, not an alarm datapoint).
                 const TICK_GAP_GAUGE_SESSION_OPEN_SECS_OF_DAY_IST: u32 = 9 * 3600 + 15 * 60;
+                // §36.7 (2026-07-10): subtract the NON-NEAREST-month index
+                // futures from the ALARM-FACING gauge value only — far
+                // serials are legitimately sparse (minutes of silence) and
+                // would permanently lift the healthy always-silent floor
+                // (~33) toward the alarm threshold (40). The WS-GAP-06
+                // error emission + summary counter below stay keyed on the
+                // RAW total_silent (per-SID visibility unchanged).
+                let excluded_silent = gaps
+                    .iter()
+                    .filter(|(sid, seg, _)| is_far_month_future_sid(*sid, *seg))
+                    .count();
                 let gauge_silent = if tickvault_common::market_hours::now_ist_secs_of_day()
                     < TICK_GAP_GAUGE_SESSION_OPEN_SECS_OF_DAY_IST
                 {
                     0.0
                 } else {
-                    total_silent as f64
+                    total_silent.saturating_sub(excluded_silent) as f64
                 };
                 metrics::gauge!("tv_tick_gap_instruments_silent").set(gauge_silent);
                 if total_silent == 0 {
@@ -10399,6 +10411,15 @@ fn seed_tick_gap_detector_from_plan(plan: &Option<SubscriptionPlan>) {
     let Some(plan) = plan else {
         return;
     };
+    // §36.7 (2026-07-10): refresh the far-month IndexFuture exclusion set
+    // FIRST — it gates only the two ALARM-FACING counts (SLO tick_freshness
+    // + the silent gauge); the SIDs below are still SEEDED so WS-GAP-06
+    // keeps logging a never-ticking month per-SID. Runs at every seed call
+    // site (both boot arms + a runtime lane cold start), so a rebuilt plan
+    // always overwrites the previous set.
+    let far = far_month_future_sids(plan);
+    let far_month_excluded = far.len();
+    store_far_month_future_exclusions(far);
     let Some(detector) = tickvault_core::pipeline::tick_gap_detector::global_tick_gap_detector()
     else {
         return;
@@ -10413,9 +10434,106 @@ fn seed_tick_gap_detector_from_plan(plan: &Option<SubscriptionPlan>) {
     }
     info!(
         seeded,
+        far_month_excluded,
         "NT-15: seeded tick-gap detector with subscribed instruments — a \
-         never-ticking SID is now a first-tick black-hole signal"
+         never-ticking SID is now a first-tick black-hole signal; §36.7 \
+         non-nearest-month futures are excluded from the alarm-facing \
+         silent counts only"
     );
+}
+
+/// §36.7 (2026-07-10): composite `(security_id, exchange_segment)` keys of
+/// the NON-NEAREST-month IndexFuture targets — far monthly serials tick
+/// sparsely by nature; counting them as "silent" would permanently lift the
+/// healthy always-silent floor (~33) toward the many-instruments-silent
+/// alarm threshold (40) and drag SLO tick_freshness below 0.95.
+/// INDIA-VIX-precedent exclusion, applied ONLY to the two alarm-facing
+/// counts; the SIDs stay SEEDED in the gap detector so WS-GAP-06 still logs
+/// a never-ticking month per-SID (the live-delivery probe for months 2..N).
+/// Composite key per I-P1-11 — a future SID numerically colliding with a
+/// spot SID on another segment must never exclude the spot.
+#[must_use]
+fn far_month_future_sids(
+    plan: &SubscriptionPlan,
+) -> std::collections::HashSet<(u64, tickvault_common::types::ExchangeSegment)> {
+    use tickvault_common::instrument_registry::SubscriptionCategory;
+    // Pass 1: the nearest (minimum) expiry per underlying. IndexDerivative
+    // is populated ONLY by the IndexFuture role in the DailyUniverse plan.
+    let mut min_expiry: std::collections::HashMap<&str, chrono::NaiveDate> =
+        std::collections::HashMap::new();
+    for inst in plan.registry.iter() {
+        if inst.category != SubscriptionCategory::IndexDerivative {
+            continue;
+        }
+        let Some(exp) = inst.expiry_date else {
+            // Unparsable expiry: conservatively KEEP the SID counted (it
+            // cannot be proven non-nearest).
+            continue;
+        };
+        min_expiry
+            .entry(inst.underlying_symbol.as_str())
+            .and_modify(|m| {
+                if exp < *m {
+                    *m = exp;
+                }
+            })
+            .or_insert(exp);
+    }
+    // Pass 2: every future whose expiry is strictly AFTER its underlying's
+    // nearest month is excluded from the alarm-facing silent counts.
+    let mut out: std::collections::HashSet<(u64, tickvault_common::types::ExchangeSegment)> =
+        std::collections::HashSet::new();
+    for inst in plan.registry.iter() {
+        if inst.category != SubscriptionCategory::IndexDerivative {
+            continue;
+        }
+        let Some(exp) = inst.expiry_date else {
+            continue;
+        };
+        if let Some(min) = min_expiry.get(inst.underlying_symbol.as_str())
+            && exp > *min
+        {
+            out.insert((inst.security_id, inst.exchange_segment));
+        }
+    }
+    out
+}
+
+/// Process-global far-month exclusion set (§36.7). `RwLock` because a
+/// runtime Dhan-lane cold start rebuilds the plan and overwrites the set;
+/// readers are the 10s SLO loop + the 60s gauge loop (cold paths).
+static FAR_MONTH_FUTURE_EXCLUDED_SIDS: std::sync::OnceLock<
+    std::sync::RwLock<std::collections::HashSet<(u64, tickvault_common::types::ExchangeSegment)>>,
+> = std::sync::OnceLock::new();
+
+/// Overwrite the far-month exclusion set (called wherever the tick-gap
+/// detector is seeded from a fresh plan). Poison recovery per the house
+/// pattern — the data is still valid after a panicked writer.
+fn store_far_month_future_exclusions(
+    set: std::collections::HashSet<(u64, tickvault_common::types::ExchangeSegment)>,
+) {
+    let lock =
+        FAR_MONTH_FUTURE_EXCLUDED_SIDS.get_or_init(|| std::sync::RwLock::new(Default::default()));
+    match lock.write() {
+        Ok(mut guard) => *guard = set,
+        Err(poisoned) => *poisoned.into_inner() = set,
+    }
+}
+
+/// Is this (sid, segment) a NON-NEAREST-month §36.7 index future? Used by
+/// the SLO tick_freshness silent filter + the silent-instruments gauge —
+/// never by the seeding, the WS-GAP-06 log, or any data path.
+#[must_use]
+fn is_far_month_future_sid(
+    security_id: u64,
+    segment: tickvault_common::types::ExchangeSegment,
+) -> bool {
+    FAR_MONTH_FUTURE_EXCLUDED_SIDS
+        .get()
+        .is_some_and(|lock| match lock.read() {
+            Ok(guard) => guard.contains(&(security_id, segment)),
+            Err(poisoned) => poisoned.into_inner().contains(&(security_id, segment)),
+        })
 }
 
 /// Decide whether the runtime supervisor should SPAWN a fresh cold-start task
@@ -11708,11 +11826,16 @@ fn spawn_slo_publisher_task(
                         // 60s coalescer already performs.
                         let universe = d.len();
                         let (silent_entries, _total) = d.scan_gaps_top_n(Instant::now(), universe);
+                        // §36.7 (2026-07-10): NON-NEAREST-month index
+                        // futures are excluded alongside INDIA VIX —
+                        // far serials are legitimately sparse; the
+                        // nearest month stays counted (status quo).
                         let silent = silent_entries
                             .iter()
-                            .filter(|(sid, _, gap)| {
+                            .filter(|(sid, seg, gap)| {
                                 *gap >= SLO_TICK_FRESHNESS_DEGRADED_SECS
                                     && !SLO_TICK_FRESHNESS_EXCLUDED_SIDS.contains(sid)
+                                    && !is_far_month_future_sid(*sid, *seg)
                             })
                             .count();
                         compute_tick_freshness(silent, universe)
@@ -12135,6 +12258,85 @@ mod tests {
         // boundary; real outages still page.
         let v = compute_tick_freshness(700, 775);
         assert!(v < 0.80, "broad outage must land below Critical, got {v}");
+    }
+
+    // ── far_month_future_sids (§36.7 alarm-gate exclusion, 2026-07-10) ──
+
+    #[cfg(feature = "daily_universe_fetcher")]
+    fn far_month_test_plan(
+        futures: &[(&str, &str, &str, &str)], // (sid, segment, underlying, expiry)
+    ) -> SubscriptionPlan {
+        use tickvault_core::instrument::csv_parser::CsvRow;
+        use tickvault_core::instrument::daily_universe::{
+            DailyUniverse, InstrumentRole, SubscriptionTarget,
+        };
+        use tickvault_core::instrument::subscription_planner::build_subscription_plan_from_daily_universe;
+        let targets = futures
+            .iter()
+            .map(|(sid, segment, underlying, expiry)| SubscriptionTarget {
+                role: InstrumentRole::IndexFuture,
+                is_fno_underlying: false,
+                is_index_constituent: false,
+                csv_row: CsvRow {
+                    security_id: (*sid).to_string(),
+                    exch_id: if *segment == "BSE_FNO" { "BSE" } else { "NSE" }.to_string(),
+                    segment: (*segment).to_string(),
+                    instrument: "FUTIDX".to_string(),
+                    symbol_name: format!("{underlying}-{expiry}-FUT"),
+                    underlying_symbol: (*underlying).to_string(),
+                    expiry_date: (*expiry).to_string(),
+                    ..CsvRow::default()
+                },
+            })
+            .collect();
+        let universe = DailyUniverse {
+            subscription_targets: targets,
+            fno_contracts: vec![],
+        };
+        build_subscription_plan_from_daily_universe(&universe)
+    }
+
+    #[test]
+    #[cfg(feature = "daily_universe_fetcher")]
+    fn test_far_month_future_sids_keeps_nearest_excludes_rest() {
+        use tickvault_common::types::ExchangeSegment;
+        // 3 months × 2 underlyings → 4 excluded (the non-nearest months),
+        // the 2 nearest-month SIDs stay counted.
+        let plan = far_month_test_plan(&[
+            ("35001", "NSE_FNO", "NIFTY", "2026-07-30"),
+            ("35002", "NSE_FNO", "NIFTY", "2026-08-27"),
+            ("35003", "NSE_FNO", "NIFTY", "2026-09-24"),
+            ("45001", "BSE_FNO", "SENSEX", "2026-07-31"),
+            ("45002", "BSE_FNO", "SENSEX", "2026-08-28"),
+            ("45003", "BSE_FNO", "SENSEX", "2026-09-25"),
+        ]);
+        let far = far_month_future_sids(&plan);
+        assert_eq!(far.len(), 4, "2 far months per underlying excluded");
+        for (sid, seg) in [
+            (35002, ExchangeSegment::NseFno),
+            (35003, ExchangeSegment::NseFno),
+            (45002, ExchangeSegment::BseFno),
+            (45003, ExchangeSegment::BseFno),
+        ] {
+            assert!(far.contains(&(sid, seg)), "far month {sid} excluded");
+        }
+        // The nearest month of each underlying is NEVER excluded.
+        assert!(!far.contains(&(35001, ExchangeSegment::NseFno)));
+        assert!(!far.contains(&(45001, ExchangeSegment::BseFno)));
+    }
+
+    #[test]
+    #[cfg(feature = "daily_universe_fetcher")]
+    fn test_far_month_future_sids_single_month_excludes_nothing() {
+        // Single-month (the pre-§36.7 shape) → empty exclusion set — the
+        // alarm-facing counts are byte-identical to the nearest-only era.
+        let plan = far_month_test_plan(&[
+            ("35001", "NSE_FNO", "NIFTY", "2026-07-30"),
+            ("35002", "NSE_FNO", "BANKNIFTY", "2026-07-30"),
+            ("35003", "NSE_FNO", "MIDCPNIFTY", "2026-07-28"),
+            ("45001", "BSE_FNO", "SENSEX", "2026-07-31"),
+        ]);
+        assert!(far_month_future_sids(&plan).is_empty());
     }
 
     #[test]
