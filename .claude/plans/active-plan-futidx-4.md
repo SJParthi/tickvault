@@ -20,7 +20,7 @@ monthly expiries). File retained — its R3-4 record is cited by `futidx-4-error
   - Tests: test_daily_universe_plan_index_future_targets_quote_mode_fno_segments, test_daily_universe_plan_futidx_capped_at_4, test_daily_universe_plan_index_future_unknown_segment_skipped, test_daily_universe_plan_futures_dedup_composite_key
 - [x] Item 4 — Snapshot format v2 (role label + optional segment/expiry fields + format gate)
   - Files: crates/core/src/instrument/instrument_snapshot.rs
-  - Tests: test_parse_role_round_trips_index_future, test_snapshot_roundtrip_preserves_index_future_segment_and_expiry, test_snapshot_index_future_missing_segment_fails_closed, test_snapshot_format_v1_rejected_forces_cold_build_once, test_snapshot_format_v2_zero_futures_accepted_no_rebuild_loop, test_old_snapshot_without_new_fields_parses_with_empty_defaults
+  - Tests: test_parse_role_round_trips_index_future, test_snapshot_roundtrip_preserves_index_future_segment_and_expiry, test_snapshot_index_future_missing_segment_fails_closed, test_snapshot_format_v1_rejected_forces_cold_build_once, test_snapshot_current_format_zero_futures_accepted_no_rebuild_loop (renamed from ..._format_v2_... in AM-r1 F4, 2026-07-10), test_old_snapshot_without_new_fields_parses_with_empty_defaults
 - [x] Item 5 — REST-loop skips + lifecycle dedup + canary hardening
   - Files: crates/app/src/prev_day_ohlcv_boot.rs, crates/app/src/main.rs, crates/app/src/today_instrument.rs, crates/core/src/pipeline/tick_processor.rs
   - Tests: test_instrument_type_for_role_none_for_index_future, test_cross_verify_targets_exclude_index_future_role, test_extract_today_instruments_dedups_futidx_between_targets_and_contracts, test_canary_gauges_ignore_non_idx_i_segments
