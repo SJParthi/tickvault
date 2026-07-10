@@ -11554,9 +11554,11 @@ async fn park_running_dhan_lane(
         // fall back to the global instead of reading this stopped lane's manager.
         ctx.feed_runtime.clear_live_token_manager();
         info!("[dhan-lane] lane torn down (Stopping→Off) — ready to cold-start again on re-enable");
-        // FIX-5/FIX-4: instant toggle ack (Immediate, Low, never SMS); no
-        // hardcoded glyph — dispatch prepends the Low severity emoji (a green
-        // ✅ on a STOP read wrong).
+        // FIX-5: instant toggle ack (Immediate dispatch, Low severity → never
+        // SMS). FIX-4: dropped the redundant hardcoded in-body ⚪ glyph — the
+        // dispatcher already prepends the standard Low-severity ack tag
+        // (`✅ [LOW]`), and the body ("now disconnected") disambiguates the
+        // stop, so a second in-body glyph was pure noise.
         ctx.notifier.notify(NotificationEvent::CustomStatusUrgent {
             message: "<b>Dhan feed stopped</b>\nThe live price feed is now disconnected."
                 .to_string(),

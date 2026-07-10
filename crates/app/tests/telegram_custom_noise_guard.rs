@@ -249,46 +249,77 @@ fn actionable_custom_sites_stay_custom_high() {
 /// No Custom* body may re-introduce one of the SPECIFIC library/implementation
 /// phrases this PR removed. Hyphen/space variants are caught via `squish`
 /// (so "ring-buffer", "web socket", "quest db" are all locked out too).
-#[test]
-fn custom_bodies_carry_no_impl_jargon() {
-    // Regression-lock list: the phrases removed by this PR + the common
-    // tickvault library tokens. Each is matched against the squished body
-    // (lowercase, punctuation/space/hyphen stripped) so every spacing variant
-    // is caught by one needle.
-    const BANNED: &[&str] = &[
-        // phrases this PR removed
-        "docker compose",
-        "docker container",
-        "ring buffer",
-        "disk spill",
-        "spill file",
-        "spill",
-        "buffering",
-        "quest db",
-        "web socket",
-        "container",
-        // common tickvault library / impl tokens
+/// Tokenize a string on non-alphanumeric boundaries into whole, lowercased
+/// tokens. Used for the WORD-BOUNDARY ban path so a short acronym only trips
+/// when it is a WHOLE word — never as a substring inside a legitimate word
+/// (e.g. "sns" must not match inside "Indices NSE feed" / "…s NSE…").
+fn tokens(s: &str) -> Vec<String> {
+    s.split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|t| !t.is_empty())
+        .map(|t| t.to_ascii_lowercase())
+        .collect()
+}
+
+/// Two-mode regression-lock. Returns `Some(offending_needle)` if the body
+/// re-introduces removed jargon, else `None`.
+///
+///   - TOKEN mode (whole-word equality) for short acronyms / single words
+///     where an unbounded substring would over-match a legitimate word.
+///   - SQUISH-substring mode for multi-word / compound phrases where interior
+///     spacing/hyphenation is the evasion vector and the concatenation is
+///     distinctive enough to be substring-safe.
+fn banned_hit(literal: &str) -> Option<&'static str> {
+    // Whole-word tokens: short acronyms + single library names. Matched only
+    // as complete tokens, so "…s NSE…" can never trip "sns".
+    const TOKEN_BANNED: &[&str] = &[
+        "sns",
+        "ilp",
         "dlq",
         "mpsc",
-        "valkey",
         "rkyv",
-        "arc-swap",
+        "spill",
+        "container",
+        "buffering",
+        "valkey",
         "papaya",
-        "ilp",
-        "sns",
         "prometheus",
     ];
-    let banned_squished: Vec<String> = BANNED.iter().map(|b| squish(b)).collect();
-    for b in all_bodies() {
-        let squished = squish(&b.literal);
-        for (needle, original) in banned_squished.iter().zip(BANNED.iter()) {
-            assert!(
-                !squished.contains(needle.as_str()),
-                "Custom* body re-introduced banned impl/library token {original:?} \
-                 (commandment #2 regression-lock): {:?}",
-                b.literal
-            );
+    // Compound phrases: squished so "ring buffer" / "ring-buffer" / "ringbuffer",
+    // "web socket" / "websocket", "quest db" / "questdb" all match one needle.
+    const COMPOUND_BANNED: &[&str] = &[
+        "ring buffer",
+        "disk spill",
+        "web socket",
+        "quest db",
+        "arc-swap",
+        "docker compose",
+        "docker container",
+    ];
+    let toks = tokens(literal);
+    for banned in TOKEN_BANNED {
+        if toks.iter().any(|t| t == banned) {
+            return Some(banned);
         }
+    }
+    let squished = squish(literal);
+    for phrase in COMPOUND_BANNED {
+        if squished.contains(squish(phrase).as_str()) {
+            return Some(phrase);
+        }
+    }
+    None
+}
+
+#[test]
+fn custom_bodies_carry_no_impl_jargon() {
+    for b in all_bodies() {
+        assert!(
+            banned_hit(&b.literal).is_none(),
+            "Custom* body re-introduced banned impl/library jargon {:?} \
+             (commandment #2 regression-lock): {:?}",
+            banned_hit(&b.literal).unwrap_or(""),
+            b.literal
+        );
     }
 }
 
@@ -333,6 +364,33 @@ fn squish_normalizes_hyphen_and_space_variants() {
     assert_eq!(squish("ringbuffer"), "ringbuffer");
     assert_eq!(squish("web socket"), "websocket");
     assert_eq!(squish("Quest DB"), "questdb");
+}
+
+#[test]
+fn jargon_guard_allows_legit_nse_indices_wording() {
+    // FIX-A regression: squish("Indices NSE feed") == "indicesnsefeed" CONTAINS
+    // "sns", but the token path must NOT flag it (whole-word equality only).
+    assert_eq!(banned_hit("Indices NSE feed streaming"), None);
+    assert_eq!(banned_hit("all NSE services are ready"), None);
+    assert_eq!(
+        banned_hit("prices are flowing and all services are ready"),
+        None
+    );
+}
+
+#[test]
+fn jargon_guard_still_bites_bare_tokens_and_phrases() {
+    // Token path still bites a bare acronym / single-word token.
+    assert_eq!(banned_hit("dumped to the sns topic"), Some("sns"));
+    assert_eq!(banned_hit("spill files remain on disk"), Some("spill"));
+    assert_eq!(banned_hit("wrote via ILP"), Some("ilp"));
+    // Compound path still bites spacing/hyphen variants.
+    assert_eq!(banned_hit("stored in the ring-buffer"), Some("ring buffer"));
+    assert_eq!(banned_hit("stored in the ring buffer"), Some("ring buffer"));
+    assert_eq!(
+        banned_hit("restarting via docker compose"),
+        Some("docker compose")
+    );
 }
 
 #[test]
