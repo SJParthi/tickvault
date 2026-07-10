@@ -118,6 +118,66 @@ $ bash .claude/hooks/plan-gate.selftest.sh
 
 ---
 
+## 2026-07-10 hardening — the stale-plan-pile cap (V7)
+
+**The incident (2026-07-09 audit follow-up, Verified):** `.claude/plans/` had
+accumulated **107** `active-plan*.md` files from merged PRs that were never
+archived (plan-enforcement.md's "archive after push" step was skipped for
+weeks). Because the gate scans ALL active plans and passes when ANY complete
+APPROVED/IN_PROGRESS/VERIFIED plan references a changed crate (H3), the pile
+collectively referenced every crate in the workspace — so **any** new
+implementation change matched **some** stale plan and the wall was VACUOUS.
+H3's crate-reference check was defeated not by a single bad plan but by
+accumulation.
+
+**The fix (two halves, same PR):**
+
+1. **The pile was archived.** 106 of 107 plans (work merged/complete) moved to
+   `.claude/plans/archive/YYYY-MM-DD-<slug>.md`, dated from each plan's own
+   `**Date:**` field. Kept active: `active-plan-greeks-trading-core.md` only
+   (Status DRAFT, docs-only, explicitly awaiting operator approval).
+2. **V7 cap in `plan-gate.sh`:** when more than `PLAN_GATE_MAX_ACTIVE`
+   (default **5**) active-plan files exist, the gate BLOCKS every
+   implementation push with a loud message naming the count and the archive
+   remediation — even if one plan would individually satisfy the change.
+   Accumulation itself now trips the gate, so the vacuous state can never
+   silently return. At ≤5 plans, H3 retains real discriminating power.
+   No existing check was weakened (6-section, non-empty-body, Status,
+   crate-reference, PLAN-EXEMPT cap all unchanged); docs-only changes and the
+   ≤1-file PLAN-EXEMPT path are unaffected (they never consult plans).
+
+**Why a count cap and not date-recency or branch-slug correlation:**
+a "Date within N days" rule blocks legitimate long-running plans, requires a
+machine-parseable `**Date:**` many plans lack, and is trivially backdated —
+while STILL letting a recent-but-wrong plan pass vacuously at small counts.
+Branch/slug correlation is unreliable here (arbitrary generated branch names;
+CI runs on a detached merge ref). The cap is zero-heuristic, attacks the
+actual failure mode (accumulation), and its remediation is exactly what
+plan-enforcement.md already mandates.
+
+**The knob:** `PLAN_GATE_MAX_ACTIVE` env var raises the cap for the selftest
+(and, in an extraordinary many-parallel-plans burst, a LOCAL push). The CI
+"Design-First Wall" job never sets it, so the server-side wall always enforces
+the default 5 — a local override cannot merge past CI.
+
+**Honest envelope (no illusion):** V7 stops ACCIDENTAL vacuous passes — the
+stale-pile failure mode that actually occurred. It does NOT stop deliberate
+forgery: an author can still fabricate (or backdate) a fresh plan that names
+their crate and ticks the six sections. Plan CONTENT quality and truthfulness
+remain a human/reviewer responsibility; the gate enforces existence, shape,
+status, relevance, and now non-accumulation.
+
+**Selftest additions** (`plan-gate.selftest.sh`, 11 → 15 cases):
+
+```
+  ok   : 6 active plans (> cap 5) -> BLOCK (V7) (exit 2)
+  ok   : exactly 5 plans (at cap), one valid -> PASS (V7) (exit 0)
+  ok   : 6 plans + PLAN_GATE_MAX_ACTIVE=10 -> PASS (V7 knob) (exit 0)
+  ok   : 6 plans + non-integer knob -> BLOCK (V7 fail-closed) (exit 2)
+```
+
+---
+
 ## Auto-driver explanation
 
 > Sir, imagine the juice shop. The new rule: the boy is NOT allowed to switch on
