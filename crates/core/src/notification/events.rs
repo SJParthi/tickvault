@@ -1068,6 +1068,26 @@ pub enum NotificationEvent {
     /// whole-feed-down claim.
     GrowwSidecarRejected { reason: String, fleet_summary: bool },
 
+    /// W2 PR#5 (2026-07-10, audit follow-up row 15): the configured NSE
+    /// holiday calendar's coverage horizon is running out (or already ran
+    /// out). The holiday list covers one calendar year at a time and the
+    /// trading-day gate has NO year bound — past the newest listed year,
+    /// every un-listed weekday holiday silently reads as a trading day
+    /// (the box starts, feeds connect, a full billable session burns on a
+    /// market-closed day). Fired by the calendar-staleness watchdog
+    /// (`crates/app/src/calendar_staleness.rs`), edge-latched to at most
+    /// one page per process per IST day. Severity::High — demands operator
+    /// action (paste the next official NSE circular into the config).
+    HolidayCalendarCoverageLow {
+        /// Signed days of coverage left (negative = already past the
+        /// cliff); `None` = the configured holiday list is EMPTY
+        /// (pathological — the config guards prevent it in prod, but the
+        /// body renders it honestly instead of a fake number).
+        days_remaining: Option<i64>,
+        /// Human-readable last covered date, e.g. "31 Dec 2026".
+        coverage_end_display: String,
+    },
+
     /// Custom alert from any component.
     Custom { message: String },
     // RETIRED 2026-06-12: LastTickAfterBoundary deleted — it was defined but
@@ -2334,6 +2354,44 @@ impl NotificationEvent {
                     )
                 }
             }
+            Self::HolidayCalendarCoverageLow {
+                days_remaining,
+                coverage_end_display,
+            } => {
+                // Plain English per the 10 Telegram commandments: status
+                // emoji first, specific numbers, action verbs, one decision,
+                // no file paths / library names. `coverage_end_display` is
+                // produced by our own date formatter (never external text)
+                // but html_escape it anyway, consistent with every String arm.
+                let end = html_escape(coverage_end_display);
+                let when = match days_remaining {
+                    Some(d) if *d >= 0 => {
+                        format!("runs out in {d} days (last covered day: {end})")
+                    }
+                    Some(d) => {
+                        let ago = d.unsigned_abs();
+                        format!(
+                            "already ran out {ago} days ago (last covered day: {end}) — market \
+                             holidays are currently being treated as trading days"
+                        )
+                    }
+                    // Pathological empty-calendar case (config guards prevent
+                    // it in prod) — render honestly, never a fake number.
+                    None => "is EMPTY — no market holidays are configured at all, so every \
+                             weekday is being treated as a trading day"
+                        .to_string(),
+                };
+                format!(
+                    "⚠️ <b>Market holiday calendar needs updating</b>\n\
+                     The list of NSE market holidays {when}.\n\
+                     Without it, the system cannot tell holidays from trading days — it \
+                     will start up and run full sessions on closed-market days.\n\
+                     What you need to do:\n\
+                     1. Get the official NSE trading-holiday circular for the next year.\n\
+                     2. Add those dates to the trading calendar settings.\n\
+                     3. Restart the app — this reminder stops automatically."
+                )
+            }
             Self::Custom { message } => message.clone(),
         }
     }
@@ -2423,6 +2481,7 @@ impl NotificationEvent {
             Self::RealtimeGuaranteeDegraded { .. } => "RealtimeGuaranteeDegraded",
             Self::RealtimeGuaranteeCritical { .. } => "RealtimeGuaranteeCritical",
             Self::GrowwSidecarRejected { .. } => "GrowwSidecarRejected",
+            Self::HolidayCalendarCoverageLow { .. } => "HolidayCalendarCoverageLow",
             Self::Custom { .. } => "Custom",
         }
     }
@@ -2737,6 +2796,11 @@ impl NotificationEvent {
             // A genuine Groww feed reject (auth / entitlement / error) is
             // operator-actionable — pages so the 0-ticks cause is visible.
             Self::GrowwSidecarRejected { .. } => Severity::High,
+            // W2 PR#5 (2026-07-10): the holiday-calendar coverage cliff
+            // demands operator action (paste the next NSE circular) — High
+            // pages Telegram; the watchdog's per-IST-date latch bounds it
+            // to one page per process per day (audit Rule 4).
+            Self::HolidayCalendarCoverageLow { .. } => Severity::High,
         }
     }
 
@@ -6232,6 +6296,59 @@ mod tests {
         assert!(
             !msg.contains("force_renewal") && !msg.contains("arc-swap"),
             "library/function names must never appear: {msg}"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // W2 PR#5 (2026-07-10) — HolidayCalendarCoverageLow
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn test_holiday_calendar_coverage_low_severity_is_high() {
+        let ev = NotificationEvent::HolidayCalendarCoverageLow {
+            days_remaining: Some(46),
+            coverage_end_display: "31 Dec 2026".to_string(),
+        };
+        assert_eq!(ev.severity(), Severity::High);
+        assert_eq!(ev.topic(), "HolidayCalendarCoverageLow");
+    }
+
+    #[test]
+    fn test_holiday_calendar_coverage_low_body_commandments() {
+        let msg = NotificationEvent::HolidayCalendarCoverageLow {
+            days_remaining: Some(46),
+            coverage_end_display: "31 Dec 2026".to_string(),
+        }
+        .to_message();
+        // Specific numbers + the covered-end date + action steps.
+        assert!(msg.contains("46 days"), "got: {msg}");
+        assert!(msg.contains("31 Dec 2026"), "got: {msg}");
+        assert!(msg.contains("What you need to do"), "got: {msg}");
+        assert!(msg.contains("NSE"), "got: {msg}");
+        // 10 Telegram commandments: no file paths, no library names.
+        assert!(!msg.contains(".rs"), "file paths must never appear: {msg}");
+        assert!(
+            !msg.contains(".toml"),
+            "file paths must never appear: {msg}"
+        );
+        assert!(
+            !msg.contains("HashSet") && !msg.contains("is_holiday"),
+            "library/function names must never appear: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_holiday_calendar_coverage_low_body_past_cliff() {
+        let msg = NotificationEvent::HolidayCalendarCoverageLow {
+            days_remaining: Some(-3),
+            coverage_end_display: "31 Dec 2026".to_string(),
+        }
+        .to_message();
+        // Past-cliff wording is HONEST: already ran out + consequence.
+        assert!(msg.contains("already ran out 3 days ago"), "got: {msg}");
+        assert!(
+            msg.contains("treated as trading days"),
+            "past-cliff body must state the live consequence: {msg}"
         );
     }
 }

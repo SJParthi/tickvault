@@ -803,6 +803,21 @@ async fn main() -> Result<()> {
         tracing::warn!("session TradingCalendar already installed — skipping");
     }
 
+    // W2 PR#5 (2026-07-10, audit follow-up row 15) — holiday-calendar
+    // coverage-horizon staleness watchdog. Spawned in the COMMON boot prefix
+    // (every path: fast/slow/Groww-only) so the boot-time check gives daily
+    // cadence on the AWS box (which restarts every weekday 08:30 IST and is
+    // OFF at IST midnight — a midnight-anchored task would never run in
+    // prod). Uses the lazily-filled notifier slot declared above; a stale
+    // check before the notifier exists retries in 30s without consuming the
+    // per-IST-date alert latch. Loop body is panic-free (pure date math) —
+    // no supervisor; worst case the next boot re-checks.
+    let _calendar_staleness_watchdog =
+        tickvault_app::calendar_staleness::spawn_calendar_staleness_watchdog(
+            trading_calendar.clone(),
+            std::sync::Arc::clone(&groww_sidecar_notifier_slot),
+        );
+
     // Wave 2 — install global QuestDB config so any module can emit
     // audit rows without holding a config reference.
     if !tickvault_storage::set_global_questdb_config(config.questdb.clone()) {
