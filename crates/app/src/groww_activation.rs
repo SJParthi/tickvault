@@ -586,8 +586,8 @@ async fn activate_groww_lane(
                 if let Some(slot) = &scale_entries_slot {
                     slot.store(Some(std::sync::Arc::new(set.entries.clone())));
                 }
-                // §36 (2026-07-08): the ≤4 nearest-expiry index futures are
-                // the FNO entries of the assembled set.
+                // §36/§36.7 (2026-07-10): the all-months index futures are
+                // the FNO entries of the assembled set (~12 typical).
                 let index_futures = set
                     .entries
                     .iter()
@@ -609,12 +609,15 @@ async fn activate_groww_lane(
                 // /feeds page show REAL Groww counts instead of unknown until
                 // the sidecar's first status report. Idempotent overwrite: the
                 // bridge's later sidecar-status set stays authoritative.
-                // Hostile-review round 3 (2026-07-08): the non-index bucket is
-                // the LIVE set minus indices (mirror of the Dhan call in
-                // main.rs: `stocks = total - indices`) so it INCLUDES the ≤4
-                // §36 futures — the /feeds page and the FeedInstrumentsLoaded
-                // Telegram (`subscribed = entries.len()`) now agree
-                // (subscribed == stocks_bucket + indices, no off-by-4).
+                // Hostile-review round 3 (2026-07-08), §36.7 AM-r2 F3 reword
+                // (2026-07-10): the non-index bucket is the LIVE set minus
+                // indices (mirror of the Dhan call in main.rs:
+                // `stocks = total - indices`) so it INCLUDES the §36.7
+                // futures (~12 typical, ≤24 by the monthly-serial envelope)
+                // — the /feeds page and the FeedInstrumentsLoaded Telegram
+                // (`subscribed = entries.len()`) agree
+                // (subscribed == stocks_bucket + indices, no futures-sized
+                // off-by-N). The arithmetic is count-agnostic.
                 feed_health.set_subscribed(
                     Feed::Groww,
                     set.entries.len().saturating_sub(set.indices) as u64,

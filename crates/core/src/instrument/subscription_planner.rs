@@ -791,9 +791,9 @@ fn futidx_segment_from_csv(csv_segment: &str) -> Option<ExchangeSegment> {
 /// Builds a subscription plan from a daily-universe (~250 SIDs) per the
 /// 2026-05-27 `DailyUniverse` scope. Every SID subscribes in **Quote mode**
 /// (§8 — the 50-byte packet carries day OHLC at fixed offsets). IDX_I
-/// indices, NSE_EQ F&O-underlying/NTM spots, and (§36, 2026-07-08) the ≤4
-/// nearest-expiry FUTIDX contracts are subscribed — never any other
-/// derivative. Dedup is the composite `(security_id, exchange_segment)` key
+/// indices, NSE_EQ F&O-underlying/NTM spots, and (§36 2026-07-08 / §36.7
+/// 2026-07-10) the all-months FUTIDX contracts of the 4 underlyings are
+/// subscribed — never any other derivative. Dedup is the composite `(security_id, exchange_segment)` key
 /// (I-P1-11). Cold path — called once at boot.
 ///
 /// The instrument segment is derived from the target ROLE, which is
@@ -868,7 +868,7 @@ pub fn build_subscription_plan_from_daily_universe(universe: &DailyUniverse) -> 
                     feed_mode,
                 }
             }
-            // §36 (2026-07-08): one of the ≤4 nearest-expiry index futures.
+            // §36/§36.7 (2026-07-10): one of the all-months index futures.
             // Feed mode stays the plan-global Quote binding (§8 lock);
             // prev-close arrives in the Quote packet at bytes 38-41 (Ticket
             // #5525125, dhan_locked_facts.rs).
@@ -4288,8 +4288,8 @@ mod tests {
     // test below is retired `#[cfg(any())]` (PR #7b). The LIVE locked fact
     // (Ticket #5525125, `dhan_locked_facts.rs`) permits prev-close from the
     // QUOTE packet at bytes 38-41 for NSE_EQ AND NSE_FNO derivatives, and the
-    // §8 Quote-for-all lock stands: the 4 §36 FUTIDX SIDs subscribe in Quote
-    // mode. OI is NOT inline in Quote mode (separate code-5 packet,
+    // §8 Quote-for-all lock stands: ALL §36/§36.7 FUTIDX SIDs (every monthly
+    // serial since 2026-07-10) subscribe in Quote mode. OI is NOT inline in Quote mode (separate code-5 packet,
     // counted-and-dropped today — documented non-goal). Ratchets:
     // `crates/core/tests/prev_close_routing_5525125_guard.rs` (Quote+FNO
     // routing) + `test_daily_universe_plan_index_future_targets_quote_mode_fno_segments`.
@@ -5157,22 +5157,30 @@ mod daily_universe_plan_tests {
 
     #[test]
     #[cfg(feature = "daily_universe_fetcher")]
-    fn test_daily_universe_plan_futidx_capped_at_4() {
+    fn test_daily_universe_plan_futidx_plans_every_monthly_target() {
+        // §36.7 (2026-07-10): the planner plans EVERY (underlying, month)
+        // target the universe hands in — 2 months × 4 underlyings here,
+        // distinct SIDs, zero drops (the gauge-visible IndexDerivative
+        // count equals the handed-in count).
         let universe = DailyUniverse {
             subscription_targets: vec![
                 daily_futidx_target("35001", "NSE_FNO", "NIFTY", "2026-07-30"),
                 daily_futidx_target("35002", "NSE_FNO", "BANKNIFTY", "2026-07-30"),
                 daily_futidx_target("35003", "NSE_FNO", "MIDCPNIFTY", "2026-07-28"),
                 daily_futidx_target("45001", "BSE_FNO", "SENSEX", "2026-07-31"),
+                daily_futidx_target("36001", "NSE_FNO", "NIFTY", "2026-08-27"),
+                daily_futidx_target("36002", "NSE_FNO", "BANKNIFTY", "2026-08-27"),
+                daily_futidx_target("36003", "NSE_FNO", "MIDCPNIFTY", "2026-08-25"),
+                daily_futidx_target("46001", "BSE_FNO", "SENSEX", "2026-08-28"),
             ],
             fno_contracts: vec![],
         };
         let plan = build_subscription_plan_from_daily_universe(&universe);
         assert_eq!(
-            plan.summary.index_derivatives, 4,
-            "exactly 4 derivative instruments — one per §36 underlying"
+            plan.summary.index_derivatives, 8,
+            "every monthly target planned — one per (underlying, month)"
         );
-        assert_eq!(plan.summary.total, 4);
+        assert_eq!(plan.summary.total, 8, "zero planner-stage drops");
     }
 
     #[test]

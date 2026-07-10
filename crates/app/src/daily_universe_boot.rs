@@ -227,7 +227,7 @@ where
         }
     };
 
-    // §36 (2026-07-08): the IST trading date drives the nearest-expiry
+    // §36/§36.7 (2026-07-10): the IST trading date drives the all-months
     // FUTIDX selection inside the universe build. Hostile-review round 2
     // (2026-07-08, F5): re-derived from the LIVE wall clock PER BUILD
     // ATTEMPT — a boot stuck in the §4 infinite-retry loop across IST

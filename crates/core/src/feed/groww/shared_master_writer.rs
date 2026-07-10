@@ -1358,6 +1358,21 @@ mod tests {
                     expiry_date: Some("2026-07-30".to_owned()),
                     underlying_symbol: Some("NIFTY".to_owned()),
                 },
+                // §36.7 (2026-07-10): a SECOND month of the SAME underlying —
+                // multiple monthly serials produce one FUTIDX lifecycle row
+                // each, distinct tokens/expiries.
+                WatchEntry {
+                    exchange: "NSE".to_owned(),
+                    segment: "FNO".to_owned(),
+                    exchange_token: "62001".to_owned(),
+                    kind: WatchKind::Ltp,
+                    security_id: 62001,
+                    isin: None,
+                    symbol_name: Some("NSE-NIFTY-27Aug26-FUT".to_owned()),
+                    index_name: None,
+                    expiry_date: Some("2026-08-27".to_owned()),
+                    underlying_symbol: Some("NIFTY".to_owned()),
+                },
                 WatchEntry {
                     exchange: "NSE".to_owned(),
                     segment: "CASH".to_owned(),
@@ -1376,11 +1391,23 @@ mod tests {
             indices: 0,
         };
         let rows = build_groww_lifecycle_rows(&set, &std::collections::HashMap::new(), 1, 1, false);
-        assert_eq!(rows.len(), 2);
+        assert_eq!(rows.len(), 3);
         let fut = rows.iter().find(|r| r.security_id == 61001).expect("fut");
         assert_eq!(fut.instrument_type, "FUTIDX");
         assert_eq!(fut.exchange_segment, "NSE_FNO");
         assert!(fut.expiry_date_nanos > 0, "expiry stamped");
+        // §36.7: the second month is its own FUTIDX row with its own
+        // token/expiry (distinct lifecycle key).
+        let fut_aug = rows
+            .iter()
+            .find(|r| r.security_id == 62001)
+            .expect("aug fut");
+        assert_eq!(fut_aug.instrument_type, "FUTIDX");
+        assert_eq!(fut_aug.underlying_symbol, "NIFTY");
+        assert!(
+            fut_aug.expiry_date_nanos > fut.expiry_date_nanos,
+            "later month stamps a later expiry"
+        );
         // Hostile-review round 2 (2026-07-08): the FUTIDX master row must
         // carry the queryable canonical underlying (SEBI forensic
         // completeness — mirror of the Dhan-side lifecycle FUTIDX rows).
