@@ -78,9 +78,20 @@ the month restart count under-counts — annotate the month summary.
    guard therefore SUPPRESSES any overwrite that would downgrade an
    existing `run_partial=false` (evidence-backed) episode row with a
    `run_partial=true` re-classification, keeping the original verdict and
-   logging `stage="blame_regression"`. If the guard's own read fails
+   logging `stage="blame_regression"`. Round 4 (2026-07-10): evidence
+   completeness is HORIZON-aware — a target day past the ~48h retention
+   is treated as partial evidence even when every retained file opened
+   cleanly (I/O success alone previously bypassed both `run_partial` and
+   the guard). If the guard's own read fails
    (`stage="keep_better_read"`), it is OFF for that run — re-run stale
-   days only with a healthy QuestDB read side. What a backfill CANNOT
+   days only with a healthy QuestDB read side. The DAILY row has its own
+   keep-better (round 4): a rerun can never erase an existing
+   `outcome='degraded'` verdict (`stage="outcome_regression"` names a
+   suppressed erase; `stage="outcome_keep_better_read"` = that guard's
+   read failed and it is OFF for the run). A post-trigger same-day boot
+   whose day already carries complete rows for BOTH feeds SKIPS the
+   redundant rerun + duplicate card (a forced `TICKVAULT_SCOREBOARD_NOW`
+   run still overrides). What a backfill CANNOT
    recover is in `docs/runbooks/dual-feed-scoreboard.md`
    (same-day errors.jsonl correlation ages out after 48h → 805 episodes
    default broker, RSTs default indeterminate; boot-reconciled
@@ -91,6 +102,12 @@ the month restart count under-counts — annotate the month summary.
 4. `outcome='degraded'` days (audit under-count): treat the day's episode
    counts as a floor, not a truth — the runbook's month-end checklist
    excludes/annotates them.
+5. `outcome='feed_off'` days (round 4, 2026-07-10): the feed was switched
+   off for the day (zero up-kind connection rows + measured-zero ticks;
+   same-day runs additionally consult the runtime enabled flag so an
+   ENABLED-but-dead-broker day is never softened into feed_off). The card
+   says "no contest" and the runbook month SQL EXCLUDES these one-horse
+   days from the win/coverage sums.
 
 **Honest envelope:** the scoreboard is evidence, not proof. Lone mid-stream
 resets are honestly `indeterminate` (the `disconnect_cause.rs` envelope);
@@ -123,7 +140,7 @@ operator signal.
 |---|---|---|
 | `process_death` (boot-reconciled), build sha changed vs deployed sha | ours | `deploy_restart` |
 | `process_death`, sha unchanged/unknown (fail-soft) | ours | `process_restart` |
-| `process_death`, reconnect landed AT/AFTER the 15:30 close (indistinguishable from the clean scheduled stop — edge-triggered audit, SIGTERM writes no row) | ours (row only — `market_hours=false`, EXCLUDED from headline restarts/blame + the partial floor) | `post_close_restart` |
+| `process_death`, reconnect landed AT/AFTER the 15:30 close AND the feed streamed through ~15:28 (round 4, 2026-07-10: the carve-out now requires streamed-through-close — a last streamed minute BEFORE 15:28 is a hole a clean scheduled stop cannot leave, so that shape re-classifies as a REAL in-market death, `process_restart`/`deploy_restart`, counted + partial floor. A failed minute read keeps the carve-out, loudly: `stage="post_close_disambiguation"`) | ours (row only — `market_hours=false`, EXCLUDED from headline restarts/blame + the partial floor) | `post_close_restart` |
 | Dhan 805 + same-day RESILIENCE-01/03 line | ours | `dual_instance` |
 | Dhan 805, no peer evidence (incl. >48h backfill) | broker | `rate_limit_805` |
 | Dhan 807 | broker | `auth_token_expired` |

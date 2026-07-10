@@ -2900,6 +2900,7 @@ async fn main() -> Result<()> {
             &trading_calendar,
             &notifier,
             process_start_ist_nanos,
+            &feed_runtime,
         );
 
         // --- Await shutdown ---
@@ -3075,6 +3076,7 @@ async fn main() -> Result<()> {
         &trading_calendar,
         &notifier,
         process_start_ist_nanos,
+        &feed_runtime,
     );
 
     // -----------------------------------------------------------------------
@@ -14674,15 +14676,17 @@ fn spawn_feed_scoreboard_tasks(
     trading_calendar: &std::sync::Arc<TradingCalendar>,
     notifier: &std::sync::Arc<NotificationService>,
     process_start_ist_nanos: i64,
+    feed_runtime: &std::sync::Arc<tickvault_api::feed_state::FeedRuntimeState>,
 ) {
     if !config.scoreboard.enabled {
         info!("feed_scoreboard: disabled by [scoreboard] config — nothing spawned");
         return;
     }
     use tickvault_app::feed_scoreboard_boot::{
-        PROCESS_DEATH_RECONCILE_DELAY_SECS, ScoreboardStart, decide_scoreboard_start,
-        parse_scoreboard_date_override, reconcile_process_death_episodes, run_feed_scoreboard,
-        sanitize_scoreboard_trigger, validate_scoreboard_backfill_date,
+        PROCESS_DEATH_RECONCILE_DELAY_SECS, ScoreboardStart, day_already_scored_complete,
+        decide_scoreboard_start, parse_scoreboard_date_override, reconcile_process_death_episodes,
+        run_feed_scoreboard, sanitize_scoreboard_trigger, scoreboard_trigger_after_auto_stop,
+        validate_scoreboard_backfill_date,
     };
     use tickvault_common::constants::IST_UTC_OFFSET_SECONDS;
 
@@ -14702,6 +14706,23 @@ fn spawn_feed_scoreboard_tasks(
             "SCOREBOARD-01: [scoreboard] trigger_secs_of_day_ist is outside \
              [session close, 23:59:59] IST — falling back to the 15:45 IST \
              default so the daily scoreboard still fires"
+        );
+    }
+    // Round-4 LOW (2026-07-10): an ACCEPTED trigger past ~16:15 IST sleeps
+    // into the prod box's scheduled 16:30 auto-stop every day — graceful
+    // shutdown cancels the task silently by design, so the deliverable is
+    // disabled with zero signal. The bound stays wide (a manually-run box
+    // legitimately triggers later); this warns loudly instead.
+    if scoreboard_trigger_after_auto_stop(sb_trigger) {
+        warn!(
+            code =
+                tickvault_common::error_code::ErrorCode::Scoreboard01AggregationDegraded.code_str(),
+            stage = "trigger_after_auto_stop",
+            effective = sb_trigger,
+            "SCOREBOARD-01: [scoreboard] trigger_secs_of_day_ist fires at/after \
+             16:15 IST — on the auto-stopped prod box (16:30 IST EventBridge \
+             stop) the daily scoreboard would NEVER fire; move the trigger \
+             before 16:15 IST unless this box runs past 16:30"
         );
     }
 
@@ -14757,6 +14778,10 @@ fn spawn_feed_scoreboard_tasks(
     let sb_calendar = std::sync::Arc::clone(trading_calendar);
     let sb_telegram_enabled = config.scoreboard.telegram_enabled;
     let sb_notifier = std::sync::Arc::clone(notifier);
+    // Round-4 (feed-off days): the CURRENT runtime enabled flags
+    // disambiguate a switched-off feed from an enabled-but-dead broker on
+    // same-day runs (backfills infer from data alone).
+    let sb_feed_runtime = std::sync::Arc::clone(feed_runtime);
     let inner = tokio::spawn(async move {
         use chrono::{FixedOffset, TimeZone, Timelike, Utc};
         let Some(ist_offset) = FixedOffset::east_opt(IST_UTC_OFFSET_SECONDS) else {
@@ -14773,6 +14798,15 @@ fn spawn_feed_scoreboard_tasks(
         // Fail-closed: a malformed date REFUSES the run loudly (the outer
         // supervisor pages Aborted) instead of silently aggregating the
         // wrong day.
+        //
+        // Round-4 LOW (2026-07-10): every refusal arm previously
+        // `return Err(...)`ed BEFORE `reconcile_handle.await`, dropping the
+        // JoinHandle — a reconciler panic was silently discarded on exactly
+        // those paths, contradicting this function's own always-classified
+        // invariant. Refusals are now RECORDED and returned only AFTER the
+        // classify-await below (bounded ≤ ~13 min; the refusal paths are
+        // forced runs, so no trigger sleep intervenes).
+        let mut refusal: Option<String> = None;
         let date_override: Option<(u64, String)> = if force_now {
             match std::env::var("TICKVAULT_SCOREBOARD_DATE") {
                 Ok(raw) => match parse_scoreboard_date_override(&raw) {
@@ -14787,9 +14821,10 @@ fn spawn_feed_scoreboard_tasks(
                             "SCOREBOARD-01: invalid TICKVAULT_SCOREBOARD_DATE — \
                              expected strict YYYY-MM-DD; refusing the forced run"
                         );
-                        return Err(format!(
+                        refusal = Some(format!(
                             "invalid TICKVAULT_SCOREBOARD_DATE {raw:?} — expected YYYY-MM-DD"
                         ));
+                        None
                     }
                 },
                 Err(_) => None,
@@ -14816,7 +14851,7 @@ fn spawn_feed_scoreboard_tasks(
         // 15:45) fabricated two all-zero rows stamped outcome='complete'.
         // The natural weekend mistake is re-running Friday's card and
         // forgetting the DATE var; refusal pages Aborted with the fix.
-        if force_now && date_override.is_none() {
+        if refusal.is_none() && force_now && date_override.is_none() {
             let today_label = today_ist.format("%Y-%m-%d").to_string();
             if let Err(why) = validate_scoreboard_backfill_date(
                 boot_day,
@@ -14833,14 +14868,16 @@ fn spawn_feed_scoreboard_tasks(
                      TICKVAULT_SCOREBOARD_DATE=YYYY-MM-DD for the trading day \
                      you meant)"
                 );
-                return Err(format!(
+                refusal = Some(format!(
                     "TICKVAULT_SCOREBOARD_NOW: today ({today_label}) {why} — \
                      pass TICKVAULT_SCOREBOARD_DATE=YYYY-MM-DD for the trading \
                      day you meant"
                 ));
             }
         }
-        if let Some((target_day, label)) = &date_override {
+        if refusal.is_none()
+            && let Some((target_day, label)) = &date_override
+        {
             let target_is_trading = chrono::NaiveDate::parse_from_str(label, "%Y-%m-%d")
                 .map(|d| sb_calendar.is_trading_day(d))
                 .unwrap_or(false);
@@ -14856,36 +14893,42 @@ fn spawn_feed_scoreboard_tasks(
                      the forced backfill (an all-zero 'complete' day would \
                      pollute the month-end verdict)"
                 );
-                return Err(format!("TICKVAULT_SCOREBOARD_DATE {label} {why}"));
+                refusal = Some(format!("TICKVAULT_SCOREBOARD_DATE {label} {why}"));
             }
         }
         let is_trading_day = sb_calendar.is_trading_day(today_ist);
         let decision =
             decide_scoreboard_start(boot_secs_of_day, is_trading_day, force_now, sb_trigger);
-        match decision {
-            ScoreboardStart::SkipNonTradingDay => {
-                info!("feed_scoreboard: skipping the daily aggregation (non-trading day)");
-            }
-            ScoreboardStart::RunCatchUp => {
-                info!(
-                    now = %boot_ist.time(),
-                    "feed_scoreboard: late boot (past the trigger) — running the \
-                     day's scoreboard now as a catch-up (DEDUP-idempotent)"
-                );
-            }
-            ScoreboardStart::RunNow => {
-                info!(
-                    backfill_date = date_override.as_ref().map_or("today", |(_, l)| l.as_str()),
-                    "feed_scoreboard: TICKVAULT_SCOREBOARD_NOW set — running \
+        // A refused run logs/sleeps NOTHING here (the refusal paths are all
+        // forced runs — RunNow, never SleepThenRun — but the "running
+        // on-demand NOW" line would mislead); it still awaits + classifies
+        // the reconciler below before returning Err.
+        if refusal.is_none() {
+            match decision {
+                ScoreboardStart::SkipNonTradingDay => {
+                    info!("feed_scoreboard: skipping the daily aggregation (non-trading day)");
+                }
+                ScoreboardStart::RunCatchUp => {
+                    info!(
+                        now = %boot_ist.time(),
+                        "feed_scoreboard: late boot (past the trigger) — running the \
+                         day's scoreboard now as a catch-up (DEDUP-idempotent)"
+                    );
+                }
+                ScoreboardStart::RunNow => {
+                    info!(
+                        backfill_date = date_override.as_ref().map_or("today", |(_, l)| l.as_str()),
+                        "feed_scoreboard: TICKVAULT_SCOREBOARD_NOW set — running \
                      on-demand NOW (operator dry-run / backfill)"
-                );
-            }
-            ScoreboardStart::SleepThenRun(secs_until) => {
-                info!(
-                    secs_until,
-                    "feed_scoreboard: sleeping until the daily trigger"
-                );
-                tokio::time::sleep(std::time::Duration::from_secs(secs_until)).await;
+                    );
+                }
+                ScoreboardStart::SleepThenRun(secs_until) => {
+                    info!(
+                        secs_until,
+                        "feed_scoreboard: sleeping until the daily trigger"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_secs(secs_until)).await;
+                }
             }
         }
         // Await + CLASSIFY the boot-time reconciler on EVERY path — incl.
@@ -14918,6 +14961,12 @@ fn spawn_feed_scoreboard_tasks(
                 Vec::new()
             }
         };
+        // Round-4 LOW: refusals return HERE — after the reconciler's
+        // panic/JoinError was classified above, never before (the refusal
+        // arms used to drop the JoinHandle).
+        if let Some(reason) = refusal {
+            return Err(reason);
+        }
         // The restart-day partial floor counts IN-MARKET deaths only —
         // post-close restarts (market_hours=false, blame_reason
         // post_close_restart) are the scheduled-stop-ambiguous shape and
@@ -14963,6 +15012,37 @@ fn spawn_feed_scoreboard_tasks(
         // a complete end-of-day row).
         let forced_early_run =
             force_now && target_ist_day == today_day && run_secs_of_day < sb_trigger;
+        // Round-4 LOW rerun latch: a post-trigger same-day boot whose day
+        // ALREADY carries complete rows for BOTH feeds (the post-close
+        // deploy-restart shape) skips the redundant re-run + duplicate
+        // Telegram card. Never applied to forced runs (RunCatchUp only
+        // fires when !force_now) and never when THIS boot synthesized an
+        // in-market death (the restart floor must still land on the row);
+        // partial/degraded days re-run (a rerun may improve partial; the
+        // daily keep-better guard protects degraded).
+        if matches!(decision, ScoreboardStart::RunCatchUp)
+            && boot_synthesized_deaths == 0
+            && day_already_scored_complete(&sb_qcfg, target_ist_day).await
+        {
+            info!(
+                target_ist_day,
+                "feed_scoreboard: today's scorecard already ran to completion \
+                 — skipping the catch-up re-run (no duplicate card; a re-run \
+                 can be forced with TICKVAULT_SCOREBOARD_NOW=1)"
+            );
+            return Ok(None);
+        }
+        // Round-4 (feed-off days): same-day runs read the CURRENT runtime
+        // flags so an enabled-but-dead broker day can never be softened
+        // into 'feed_off'; backfills pass None (data-only inference).
+        let runtime_enabled_now = if target_ist_day == today_day {
+            Some((
+                sb_feed_runtime.is_enabled(tickvault_common::feed::Feed::Dhan),
+                sb_feed_runtime.is_enabled(tickvault_common::feed::Feed::Groww),
+            ))
+        } else {
+            None
+        };
         let summary = run_feed_scoreboard(
             &sb_qcfg,
             sb_metrics_port,
@@ -14977,6 +15057,7 @@ fn spawn_feed_scoreboard_tasks(
             target_ist_day == today_day,
             boot_synthesized_deaths,
             &boot_reconciled_rows,
+            runtime_enabled_now,
         )
         .await?;
         info!("PROOF: feed_scoreboard daily aggregation fired");
@@ -15035,6 +15116,8 @@ fn spawn_feed_scoreboard_tasks(
                         degraded: summary.degraded,
                         early_run: summary.early_run,
                         restart_partial: summary.restart_partial,
+                        dhan_feed_off: summary.dhan_feed_off,
+                        groww_feed_off: summary.groww_feed_off,
                     });
                 } else {
                     info!("feed_scoreboard: Telegram disabled — daily rows written only");

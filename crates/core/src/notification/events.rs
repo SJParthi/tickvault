@@ -500,6 +500,12 @@ pub enum NotificationEvent {
         /// must say so too (round-3 hostile review 2026-07-10: the row said
         /// partial while the card stayed silent).
         restart_partial: bool,
+        /// `true` when Dhan was switched OFF for the day — a one-horse
+        /// race: the verdict says "no contest" instead of declaring a
+        /// winner (round-4 hostile review 2026-07-10).
+        dhan_feed_off: bool,
+        /// `true` when Groww was switched OFF for the day (round 4).
+        groww_feed_off: bool,
     },
 
     /// The daily dual-feed scorecard TASK died (panicked / errored) before
@@ -1229,9 +1235,34 @@ pub struct FeedScoreLine {
 }
 
 /// The scorecard's ONE decision (Telegram commandment 8): who won today.
-/// Tiebreak ladder — exclusive minutes → worst-1% delay (only when BOTH are
-/// measured; a −1 sentinel never decides) → broker-blamed drops → even day.
-fn scorecard_verdict(dhan: &FeedScoreLine, groww: &FeedScoreLine) -> String {
+/// Tiebreak ladder — feed-off no-contest (round 4: a switched-off feed's
+/// measured zeros are a one-horse race, never a win for the other) →
+/// exclusive minutes → worst-1% delay (only when BOTH are measured; a −1
+/// sentinel never decides) → broker-blamed drops → even day.
+fn scorecard_verdict(
+    dhan: &FeedScoreLine,
+    groww: &FeedScoreLine,
+    dhan_feed_off: bool,
+    groww_feed_off: bool,
+) -> String {
+    // Rung 0 (round 4, 2026-07-10): a feed switched OFF for the day makes
+    // every comparison rung a one-horse race — no winner is declared.
+    if dhan_feed_off && groww_feed_off {
+        return "\u{1f91d} Verdict: not comparable — both feeds were switched \
+                off today, no contest."
+            .to_string();
+    }
+    if dhan_feed_off || groww_feed_off {
+        let off = if dhan_feed_off {
+            &dhan.name
+        } else {
+            &groww.name
+        };
+        return format!(
+            "\u{1f91d} Verdict: not comparable — {off} was switched off \
+             today, no contest."
+        );
+    }
     // Rung 1: exclusive coverage minutes.
     if dhan.exclusive_minutes >= 0
         && groww.exclusive_minutes >= 0
@@ -1893,6 +1924,8 @@ impl NotificationEvent {
                 degraded,
                 early_run,
                 restart_partial,
+                dhan_feed_off,
+                groww_feed_off,
             } => {
                 // Operator-charter §G wording: plain English, emoji status,
                 // IST 12-hour time, specific numbers, ONE decision (the
@@ -1959,6 +1992,18 @@ impl NotificationEvent {
                          numbers are a floor, not a truth.",
                     );
                 }
+                for (off, line) in [(dhan_feed_off, dhan), (groww_feed_off, groww)] {
+                    if *off {
+                        // Round-4 fix: a switched-off feed's day is a
+                        // one-horse race — say so and keep it out of the
+                        // month tally (its row is stamped 'feed_off').
+                        footnotes.push_str(&format!(
+                            "\n\u{26a0}\u{fe0f} {} was switched off today — no contest; \
+                             this day does not count toward the month verdict.",
+                            line.name
+                        ));
+                    }
+                }
                 if dhan.lag_p50_ms >= 0 || dhan.lag_p99_ms >= 0 {
                     footnotes.push_str(
                         "\nNote: Dhan's price clock ticks in whole seconds, so its \
@@ -2019,7 +2064,7 @@ impl NotificationEvent {
                     render_count(groww.restarts),
                     streaming_line(dhan),
                     streaming_line(groww),
-                    scorecard_verdict(dhan, groww),
+                    scorecard_verdict(dhan, groww, *dhan_feed_off, *groww_feed_off),
                     footnotes
                 )
             }
@@ -6432,6 +6477,8 @@ mod tests {
             degraded: false,
             early_run: false,
             restart_partial: false,
+            dhan_feed_off: false,
+            groww_feed_off: false,
         }
     }
 
@@ -6538,6 +6585,8 @@ mod tests {
             degraded: true,
             early_run: false,
             restart_partial: false,
+            dhan_feed_off: false,
+            groww_feed_off: false,
         };
         let msg = ev.to_message();
         assert!(
@@ -6560,6 +6609,8 @@ mod tests {
             degraded: false,
             early_run: true,
             restart_partial: false,
+            dhan_feed_off: false,
+            groww_feed_off: false,
         };
         let msg = ev.to_message();
         assert!(
@@ -6583,6 +6634,8 @@ mod tests {
             degraded: false,
             early_run: false,
             restart_partial: true,
+            dhan_feed_off: false,
+            groww_feed_off: false,
         };
         let msg = ev.to_message();
         assert!(
@@ -6632,6 +6685,74 @@ mod tests {
             !msg.contains("Groww connection drops are not counted yet"),
             "{msg}"
         );
+    }
+
+    #[test]
+    fn test_dual_feed_scorecard_feed_off_no_contest() {
+        // Round-4 hostile review 2026-07-10 (the round-2 finding): a feed
+        // switched OFF for the day is a one-horse race — the verdict must
+        // say "no contest" (never crown the other feed on exclusive
+        // minutes) and the card must carry the switched-off footnote.
+        let mut g = score_line("Groww");
+        g.ticks = 0;
+        g.exclusive_minutes = 0;
+        g.streaming_minutes = 0;
+        let ev = NotificationEvent::DualFeedDailyScorecard {
+            trading_date_ist: "2026-07-10".to_string(),
+            dhan: score_line("Dhan"),
+            groww: g,
+            session_minutes: 375,
+            partial_coverage: false,
+            degraded: false,
+            early_run: false,
+            restart_partial: false,
+            dhan_feed_off: false,
+            groww_feed_off: true,
+        };
+        let msg = ev.to_message();
+        assert!(
+            msg.contains(
+                "not comparable — Groww was switched off \n             today, no contest"
+            ) || msg.contains("not comparable — Groww was switched off today, no contest"),
+            "feed-off rung-0 verdict missing: {msg}"
+        );
+        assert!(
+            !msg.contains("won today"),
+            "a switched-off feed's day must never declare a winner: {msg}"
+        );
+        assert!(
+            msg.contains("Groww was switched off today — no contest"),
+            "feed-off footnote missing: {msg}"
+        );
+        // Both feeds off (a feeds-disabled test session) — still no winner.
+        let mut d = score_line("Dhan");
+        d.ticks = 0;
+        d.exclusive_minutes = 0;
+        d.streaming_minutes = 0;
+        let mut g = score_line("Groww");
+        g.ticks = 0;
+        g.exclusive_minutes = 0;
+        g.streaming_minutes = 0;
+        let ev = NotificationEvent::DualFeedDailyScorecard {
+            trading_date_ist: "2026-07-10".to_string(),
+            dhan: d,
+            groww: g,
+            session_minutes: 375,
+            partial_coverage: false,
+            degraded: false,
+            early_run: false,
+            restart_partial: false,
+            dhan_feed_off: true,
+            groww_feed_off: true,
+        };
+        let msg = ev.to_message();
+        assert!(
+            msg.contains("both feeds were switched"),
+            "both-off verdict missing: {msg}"
+        );
+        // A clean comparable day renders NO feed-off wording.
+        let msg = scorecard(score_line("Dhan"), score_line("Groww")).to_message();
+        assert!(!msg.contains("switched off today"), "{msg}");
     }
 
     #[test]

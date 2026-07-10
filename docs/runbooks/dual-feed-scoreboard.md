@@ -29,7 +29,7 @@ DETERMINISTIC trading-date 15:45:00 IST stamp, so re-runs UPSERT in place.
 | Per-instrument (PR-4) | `mapped_instruments`, `unmapped_instruments`, `covered_instrument_minutes` | `-1` until the presence registry ships |
 | Lag (PR-3) | `lag_p50_ms`, `lag_p99_ms`, `lag_max_ms`, `lag_samples`, `lag_floor_ms` | `-1` until the day histograms ship; `lag_floor_ms` is the honesty column (Dhan 1000 — whole-second price clock; Groww 1) |
 | Episodes | `disconnects_market`, `disconnects_off_hours`, `reconnects`, `stalls`, `blame_broker`, `blame_ours`, `blame_indeterminate`, `restarts_detected` | blame tallies exclude off-hours rows |
-| Honesty | `partial_coverage`, `coverage_source` (`in_memory`/`sql_backfill`/`mixed`), `outcome` (`complete`/`partial`/`degraded`) | `degraded` = the connection-event record itself under-counted that day |
+| Honesty | `partial_coverage`, `coverage_source` (`in_memory`/`sql_backfill`/`mixed`), `outcome` (`complete`/`partial`/`degraded`/`feed_off`) | `degraded` = the connection-event record itself under-counted that day; `feed_off` = the feed was switched off for the day (one-horse race — EXCLUDED from the month sums, round 4) |
 
 `feed_episode_audit` — DEDUP
 `(ts, trading_date_ist, feed, ws_type, connection_index, episode_kind)`.
@@ -80,7 +80,8 @@ SELECT feed, count() days,
        avg(uptime_pct) uptime,
        sum(case when partial_coverage then 1 else 0 end) partial_days
 FROM feed_scoreboard_daily
-WHERE trading_date_ist >= '2026-07-01' AND trading_date_ist < '2026-08-01' GROUP BY feed;
+WHERE trading_date_ist >= '2026-07-01' AND trading_date_ist < '2026-08-01'
+  AND outcome != 'feed_off' GROUP BY feed;
 ```
 
 Caveats:
@@ -102,6 +103,26 @@ WHERE lag_p99_ms >= 0 AND trading_date_ist >= '2026-07-01'
   a Groww win for that period.
 - `avg(uptime_pct)` includes partial days (their 0.0-with-partial-flag
   rows) — cross-check `partial_days` before quoting it.
+- **`outcome = 'feed_off'` days are EXCLUDED above (round 4, 2026-07-10):**
+  a day the operator ran dhan-only / groww-only (the /api/feeds toggle or a
+  single-feed profile) measures REAL zeros for the off feed — folding them
+  into the sums (or letting the card crown the other feed on 375 exclusive
+  minutes) skews the exact verdict this runbook exists to sign. Report them
+  separately, and name them next to the month totals:
+
+```sql
+SELECT trading_date_ist, feed FROM feed_scoreboard_daily
+WHERE outcome = 'feed_off'
+  AND trading_date_ist >= '2026-07-01' AND trading_date_ist < '2026-08-01'
+ORDER BY trading_date_ist;
+```
+
+  Detection is zero up-kind connection rows + measured-zero ticks; same-day
+  runs also consult the live runtime flag so an ENABLED-but-dead-broker day
+  can never be softened into feed_off. Honest residual: on a PAST-day
+  backfill the inference is data-only — a feed that was enabled but never
+  achieved a single successful connect all day is indistinguishable from a
+  switched-off feed (both write zero up rows).
 
 Per-day winner drill (tiebreak = lag_p99 where measured):
 
@@ -148,8 +169,8 @@ Review guide per `blame_reason`:
 | `network_path` | Handshake / TLS / DNS / refused / timeout | Box egress + DNS health at that minute |
 | `unknown_cause` / `unclassified` | Novel error text / novel source label | Read the `evidence` column; if a pattern repeats, extend the classifier (a dated PR) |
 | `off_hours_idle` | Pre/post-market idle cleanup | Expected noise — excluded from headline counts; no action |
-| `run_partial = true` rows | Classified with EXPIRED errors.jsonl evidence (>48h backfill) | 805s defaulted broker, RSTs defaulted indeterminate — annotate rather than re-litigate (a re-run can NEVER downgrade an evidence-backed row — the keep-better guard suppresses it and logs `stage="blame_regression"`) |
-| `post_close_restart` | The reconnect landed AFTER 3:30 PM close — indistinguishable from the clean scheduled stop (a clean shutdown writes no disconnect record) | Forensic row only — excluded from the headline restarts/blame counts and the partial floor; no action unless it repeats on days with NO evening restart |
+| `run_partial = true` rows | Classified with EXPIRED errors.jsonl evidence (>48h backfill; round 4 made this HORIZON-aware — a readable log dir whose retained files cannot COVER the target day counts as partial evidence too, so the flag can no longer lie false on aged-out backfills) | 805s defaulted broker, RSTs defaulted indeterminate — annotate rather than re-litigate (a re-run can NEVER downgrade an evidence-backed row — the keep-better guard suppresses it and logs `stage="blame_regression"`) |
+| `post_close_restart` | The reconnect landed AFTER 3:30 PM close AND the feed had streamed through ~15:28 (round 4: a feed whose last streamed minute leaves a HOLE before close re-classifies as a REAL in-market death instead — counted, floor engaged; only streamed-through-close keeps this carve-out, and a failed minute read keeps it loudly via `stage="post_close_disambiguation"`) | Forensic row only — excluded from the headline restarts/blame counts and the partial floor; no action unless it repeats on days with NO evening restart |
 
 An `outcome = 'degraded'` day (audit-row drops) means that day's episode
 counts are a FLOOR — annotate the month summary accordingly:
@@ -161,6 +182,18 @@ FROM feed_scoreboard_daily WHERE outcome != 'complete' ORDER BY trading_date_ist
 
 ## 4. Backfill / re-run
 
+- **Post-close restarts DON'T duplicate the card (round 4):** a same-day
+  boot past the trigger whose day ALREADY carries complete rows for BOTH
+  feeds (the post-close deploy-restart shape) skips the catch-up re-run
+  and sends no duplicate Telegram; partial/degraded days still re-run,
+  and a boot that detected an in-market crash never skips (the restart
+  floor must land). A rerun can also never ERASE a `degraded` verdict —
+  the daily keep-better keeps it and logs `stage="outcome_regression"`.
+- **A same-day backfill of a PAST day never inherits THIS boot's
+  restarts (round 4):** the boot-reconciled process-death rows are
+  day-filtered to the run's target day before they fold, so a mid-market
+  restart used to launch a past-day backfill can no longer stamp the past
+  day Partial with today's restart.
 - **Re-run today:** restart with `TICKVAULT_SCOREBOARD_NOW=1`. Idempotent —
   the daily row carries the deterministic 15:45 IST ts and the episode rows
   reuse their audit-row ts, so everything UPSERTs in place. UNSET the

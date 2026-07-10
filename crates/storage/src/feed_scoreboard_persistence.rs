@@ -119,6 +119,13 @@ pub enum ScoreboardOutcome {
     /// The episode source itself under-counted that day
     /// (`tv_ws_event_audit_dropped_total` non-zero) — treat counts as a floor.
     Degraded,
+    /// The feed was switched OFF for the day (runtime-disabled / never
+    /// enabled this session) — the measured zeros are real but the day is
+    /// a one-horse race: EXCLUDED from the win/coverage verdict rungs and
+    /// the month sums (round-4 hostile review 2026-07-10; the round-2
+    /// finding — a disabled-feed day previously stamped `complete` zeros
+    /// and contaminated the month totals).
+    FeedOff,
 }
 
 impl ScoreboardOutcome {
@@ -129,6 +136,7 @@ impl ScoreboardOutcome {
             Self::Complete => "complete",
             Self::Partial => "partial",
             Self::Degraded => "degraded",
+            Self::FeedOff => "feed_off",
         }
     }
 }
@@ -715,6 +723,9 @@ mod tests {
         assert_eq!(ScoreboardOutcome::Complete.as_str(), "complete");
         assert_eq!(ScoreboardOutcome::Partial.as_str(), "partial");
         assert_eq!(ScoreboardOutcome::Degraded.as_str(), "degraded");
+        // Round 4 (2026-07-10): the feed-was-off one-horse-race day —
+        // excluded from the month sums by the runbook SQL.
+        assert_eq!(ScoreboardOutcome::FeedOff.as_str(), "feed_off");
         assert_eq!(CoverageSource::InMemory.as_str(), "in_memory");
         assert_eq!(CoverageSource::SqlBackfill.as_str(), "sql_backfill");
         assert_eq!(CoverageSource::Mixed.as_str(), "mixed");

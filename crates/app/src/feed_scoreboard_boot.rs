@@ -273,6 +273,23 @@ pub fn sanitize_scoreboard_trigger(configured_secs_of_day_ist: u32) -> (u32, boo
 
 const MICROS_PER_SEC: i64 = 1_000_000;
 
+/// Latest trigger that still fires BEFORE the prod box's scheduled 16:30
+/// IST auto-stop, with flush headroom (16:15). An ACCEPTED trigger past
+/// this sleeps into the EventBridge stop every day — graceful shutdown
+/// cancels the task silently by design, so the whole deliverable is
+/// disabled with zero signal (round 4, 2026-07-10: the sanitizer's wide
+/// [15:30, 24:00) bound re-admitted the exact silent-teardown failure its
+/// own doc names). The bound stays wide (a manually-run box legitimately
+/// triggers later); the spawn site WARNS loudly instead.
+pub const SCOREBOARD_TRIGGER_AUTO_STOP_WARN_SECS: u32 = 16 * 3600 + 15 * 60; // 58_500
+
+/// `true` when an accepted trigger fires at/after the 16:15 IST warn
+/// threshold — on the auto-stopped prod box it would never fire. Pure.
+#[must_use]
+pub fn scoreboard_trigger_after_auto_stop(effective_trigger_secs_of_day_ist: u32) -> bool {
+    effective_trigger_secs_of_day_ist >= SCOREBOARD_TRIGGER_AUTO_STOP_WARN_SECS
+}
+
 fn day_bounds_nanos(target_ist_day: u64) -> (i64, i64) {
     // APPROVED: IST day numbers are ~20K, far below i64::MAX — saturating
     // keeps adversarial inputs bounded.
@@ -377,6 +394,96 @@ pub fn build_existing_episode_partiality_day_sql(target_ist_day: u64) -> String 
          cast(ts as long), run_partial, blame, market_hours \
          from feed_episode_audit where ts >= {start} and ts < {end}"
     )
+}
+
+/// The target day's EXISTING `feed_scoreboard_daily` outcomes — the
+/// DAILY-row keep-better guard input (round 4, 2026-07-10 — MEDIUM): a
+/// same-day evening RunCatchUp rerun re-measures the FRESH process-local
+/// audit-drop counter as 0 and would UPSERT outcome='complete' over the
+/// 15:45 run's 'degraded' verdict at the same deterministic ts — the drop
+/// evidence is session-local and durable NOWHERE except the overwritten
+/// row. Micros literals.
+#[must_use]
+pub fn build_existing_daily_outcome_sql(target_ist_day: u64) -> String {
+    let (start, end) = day_bounds_micros(target_ist_day);
+    format!(
+        "select feed, outcome from feed_scoreboard_daily \
+         where ts >= {start} and ts < {end}"
+    )
+}
+
+/// Parse the [`build_existing_daily_outcome_sql`] response into a
+/// feed → outcome map. Pure; `None` = unparsable body.
+#[must_use]
+pub fn parse_existing_daily_outcomes(body: &str) -> Option<BTreeMap<String, String>> {
+    let rows = parse_dataset(body)?;
+    let mut out = BTreeMap::new();
+    for row in rows {
+        if let Some(cols) = row.as_array()
+            && cols.len() >= 2
+            && let (Some(feed), Some(outcome)) = (cols[0].as_str(), cols[1].as_str())
+        {
+            out.insert(feed.to_string(), outcome.to_string());
+        }
+    }
+    Some(out)
+}
+
+/// Daily-outcome keep-better rule (round 4, 2026-07-10): `true` when
+/// writing `new` would ERASE an existing 'degraded' verdict for the day —
+/// a rerun must NEVER downgrade degraded → partial/complete (the degraded
+/// evidence was the ORIGINAL session's audit-drop counter, unrecoverable
+/// by any rerun). Every other combination proceeds (a rerun may still
+/// upgrade partial → complete with fresh full evidence). Pure.
+#[must_use]
+pub fn should_keep_degraded_outcome(
+    existing_outcomes: &BTreeMap<String, String>,
+    new: ScoreboardOutcome,
+) -> bool {
+    !matches!(new, ScoreboardOutcome::Degraded)
+        && existing_outcomes.values().any(|o| o == "degraded")
+}
+
+/// RunCatchUp already-ran latch (round 4, 2026-07-10 — LOW): `true` when
+/// BOTH feeds' daily rows already exist for the day with
+/// outcome='complete' — a post-trigger same-day boot (the post-close
+/// deploy restart is the dominant shape) then SKIPS the redundant re-run +
+/// duplicate Telegram card instead of re-aggregating an already-vouched
+/// day. Anything less than complete-on-both re-runs (a partial day may
+/// improve; degraded is protected by the daily keep-better guard). Pure;
+/// the caller additionally requires zero in-market boot-synthesized
+/// deaths (a real crash day must never skip its restart floor) and never
+/// applies the latch to forced (`TICKVAULT_SCOREBOARD_NOW`) runs.
+#[must_use]
+pub fn catchup_rerun_is_redundant(existing_outcomes: &BTreeMap<String, String>) -> bool {
+    ["dhan", "groww"].iter().all(|feed| {
+        existing_outcomes
+            .get(*feed)
+            .is_some_and(|o| o == "complete")
+    })
+}
+
+/// Feed-was-OFF-for-the-day inference (round 4, 2026-07-10 — the round-2
+/// finding left open across rounds): a feed with ZERO up-kind connection
+/// rows across the whole day AND a MEASURED zero tick count delivered
+/// nothing because it was switched off (never enabled this session /
+/// runtime-disabled), not because the broker lost a one-horse race — its
+/// row must stamp the distinct 'feed_off' outcome (excluded from the
+/// month sums) and the card must say "no contest" instead of declaring a
+/// winner. For SAME-DAY runs the runtime enabled flag disambiguates the
+/// enabled-but-fully-dead-broker day (`Some(true)` ⇒ NEVER feed_off — a
+/// catastrophic zero day stays loud); a backfill (`None`) infers from
+/// data alone (honest residual: an enabled feed whose broker was dead the
+/// ENTIRE day with zero successful connects is indistinguishable in a
+/// backfill — the runbook names it). A `-1` ticks sentinel never
+/// qualifies (unmeasured is not zero). Pure.
+#[must_use]
+pub fn is_feed_off_day(
+    had_any_up_row: bool,
+    ticks: i64,
+    runtime_enabled_now: Option<bool>,
+) -> bool {
+    !had_any_up_row && ticks == 0 && runtime_enabled_now != Some(true)
 }
 
 /// Ticks a feed delivered today (feed-filtered + day-windowed). LOCAL
@@ -628,6 +735,27 @@ pub fn boot_reconciled_skip_keys(rows: &[FeedEpisodeAuditRow]) -> HashSet<Episod
         .collect()
 }
 
+/// Day-filter for THIS boot's reconciled rows (round 4, 2026-07-10 —
+/// HIGH): the reconciler always targets the BOOT day, but a
+/// `TICKVAULT_SCOREBOARD_DATE` backfill retargets a PAST day — folding
+/// today's synthesized in-market process-death rows into the past day's
+/// tallies incremented the past day's restarts/blame and (via the
+/// data-driven floor) flipped its previously-correct completed row to
+/// Partial (deterministic-ts UPSERT is last-write-wins). Only rows whose
+/// ts lies inside the TARGET day's bounds may fold in-memory or key the
+/// read-back dedupe. Pure.
+#[must_use]
+pub fn filter_boot_rows_to_day(
+    rows: &[FeedEpisodeAuditRow],
+    target_ist_day: u64,
+) -> Vec<FeedEpisodeAuditRow> {
+    let (start, end) = day_bounds_nanos(target_ist_day);
+    rows.iter()
+        .filter(|r| r.ts_ist_nanos >= start && r.ts_ist_nanos < end)
+        .cloned()
+        .collect()
+}
+
 /// Fold a [`build_episode_day_sql`] / [`build_boot_reconciled_episode_day_sql`]
 /// response into per-feed tallies, SKIPPING any row whose
 /// `(feed, ws_type, connection_index, ts)` key is in `skip_keys` (this
@@ -801,10 +929,16 @@ pub struct CorrelationEvidence {
     pub ws_gap9_429_ts_nanos: Vec<i64>,
     /// PROC-01 / RESOURCE-01..03 line timestamps (IST nanos).
     pub resource_ts_nanos: Vec<i64>,
-    /// `false` when the scan could not read the log directory (aged-out
-    /// backfill day / missing dir) — episodes classified from partial
-    /// evidence are stamped `run_partial` (runbook note; 805 defaults
-    /// broker, RSTs default indeterminate).
+    /// `false` when the evidence CANNOT be complete: an I/O failure (the
+    /// log directory was unreadable / a file open failed) OR — applied by
+    /// the caller via [`target_within_evidence_retention`] — the target
+    /// day is older than the ~48h errors.jsonl retention horizon (round-4
+    /// hostile review 2026-07-10: a readable dir whose retained files
+    /// simply do not COVER an aged-out backfill day previously reported
+    /// `true`, silently bypassing BOTH `run_partial` and the keep-better
+    /// read). Episodes classified from partial evidence are stamped
+    /// `run_partial` (runbook note; 805 defaults broker, RSTs default
+    /// indeterminate).
     pub scan_complete: bool,
 }
 
@@ -888,9 +1022,33 @@ pub const CORRELATION_CODES: [&str; 7] = [
     "RESOURCE-03",
 ];
 
+/// errors.jsonl hourly files are retained ~48h (the observability
+/// retention sweeper) — the correlation-evidence horizon in IST days. A
+/// target day older than this cannot be COVERED by the retained files
+/// even when every file opens cleanly, so I/O success alone must never
+/// claim complete evidence (round-4 hostile review 2026-07-10).
+pub const ERRORS_JSONL_EVIDENCE_RETENTION_DAYS: u64 = 2;
+
+/// Round-4 evidence-horizon gate (2026-07-10 — HIGH): `true` when the
+/// retained ~48h of errors.jsonl files can still COVER the target day
+/// (`target_ist_day + 2 >= today_ist_day`). The scan's I/O-level
+/// `complete` flag AND this horizon TOGETHER decide `scan_complete` —
+/// gating only on I/O success made the round-3 keep-better guard vacuous
+/// for its flagship scenario (the >48h month-end backfill: readable dir,
+/// zero covering events, every re-classified row falsely stamped
+/// `run_partial=false`, the evidence-backed blame destructively
+/// overwritten with no `blame_regression` log). Pure.
+#[must_use]
+pub fn target_within_evidence_retention(target_ist_day: u64, today_ist_day: u64) -> bool {
+    target_ist_day.saturating_add(ERRORS_JSONL_EVIDENCE_RETENTION_DAYS) >= today_ist_day
+}
+
 /// Scan the errors.jsonl directory (blocking file I/O — callers wrap in
 /// `spawn_blocking`). Missing dir / unreadable files degrade to
-/// `scan_complete = false` evidence — fail-soft, never a panic. O(≤48h of
+/// `scan_complete = false` evidence — fail-soft, never a panic. NOTE: the
+/// caller must ALSO apply [`target_within_evidence_retention`] — this scan
+/// reports I/O completeness only and cannot know whether the retained
+/// files cover the target day (round 4, 2026-07-10). O(≤48h of
 /// retained hourly files), cold path, once per run; only
 /// [`CORRELATION_CODES`] events are retained in memory.
 #[must_use]
@@ -1049,6 +1207,51 @@ pub fn is_post_close_connect(prior_ts_ist_nanos: i64, connect_ts_ist_nanos: i64)
     let mh_end =
         day_start.saturating_add(i64::from(MARKET_HOURS_END_SECS_OF_DAY_IST) * NANOS_PER_SEC);
     connect_ts_ist_nanos >= mh_end
+}
+
+/// A post-close reconnect gets the CLEAN scheduled-stop carve-out only
+/// when the feed streamed through the session close — its last streamed
+/// session minute is at/after this IST seconds-of-day threshold (15:28;
+/// two minutes of slack for end-of-session tick sparsity). A last
+/// streamed minute BEFORE this is a HOLE before close — a clean 15:30
+/// close cannot leave one, so the death was a REAL in-market crash
+/// (round 4, 2026-07-10: a 15:26 crash whose 429-cooldown reconnect
+/// landed at ~15:31 was carved out, rendered "restarts: 0" and let the
+/// day stamp outcome='complete').
+pub const POST_CLOSE_CLEAN_STOP_MIN_LAST_MINUTE_SECS: i64 = 15 * 3600 + 28 * 60; // 55_680
+
+/// Latest streamed session minute as IST seconds-of-day, parsed from the
+/// opaque minute keys (`YYYY-MM-DDTHH:MM:…` — the ts column stores IST
+/// wall-clock per data-integrity.md, so the HH:MM substring IS the IST
+/// time of day). `None` = no session minute / unparsable keys. Pure.
+#[must_use]
+pub fn last_minute_secs_of_day(minutes: &HashSet<String>) -> Option<i64> {
+    minutes
+        .iter()
+        .filter_map(|m| {
+            let h: i64 = m.get(11..13)?.parse().ok()?;
+            let mi: i64 = m.get(14..16)?.parse().ok()?;
+            Some(h * 3600 + mi * 60)
+        })
+        .max()
+}
+
+/// Round-4 post-close disambiguation (2026-07-10 — MEDIUM): `true` when a
+/// synthesized death whose reconnect landed at/after 15:30 IST was a REAL
+/// in-market crash after all — the feed's last streamed session minute
+/// leaves a hole before the close (`< 15:28`), which a clean scheduled
+/// stop cannot produce. Only a feed that streamed through ~15:28+ keeps
+/// the scheduled-stop carve-out. `None` (zero streamed session minutes
+/// with a prior-up row) is ALSO incompatible with a clean full-session
+/// stop and classifies real (honest residual: a feed whose broker was
+/// silent the entire day then cleanly stopped mis-classifies — named in
+/// the runbook; the crash-before-first-tick day dominates). Pure.
+#[must_use]
+pub fn post_close_reconnect_is_real_death(last_streamed_minute_secs: Option<i64>) -> bool {
+    match last_streamed_minute_secs {
+        Some(m) => m < POST_CLOSE_CLEAN_STOP_MIN_LAST_MINUTE_SECS,
+        None => true,
+    }
 }
 
 /// `true` for a connection-"up" `ws_event_audit.event_kind`. The first
@@ -1354,10 +1557,81 @@ pub async fn reconcile_process_death_episodes(
              still counts the coverage hole honestly)"
         );
     }
-    let deaths = synthesize_process_death_episodes(&rows, boot_ts_ist_nanos);
+    let mut deaths = synthesize_process_death_episodes(&rows, boot_ts_ist_nanos);
     if deaths.is_empty() {
         info!("feed_scoreboard: process-death reconciler found no gaps (clean boot)");
         return Vec::new();
+    }
+    // Round-4 post-close disambiguation (2026-07-10 — MEDIUM): the round-3
+    // carve-out over-corrected — a REAL in-market crash whose reconnect
+    // lands at/after 15:30 (the 429-cooldown 15:26-crash shape, or any
+    // delayed recovery) rendered "restarts: 0" and let the day stamp
+    // complete. The day's per-feed streamed-minute set disambiguates: a
+    // clean scheduled stop streams through the close, a crash leaves a
+    // hole before it. Query failure keeps the carve-out (ambiguous —
+    // loudly logged), never a phantom in-market death on an I/O blip.
+    // Only the KNOWN feed labels may reach the interpolated SQL literal
+    // (the module's no-user-input-in-SQL contract — the feed strings here
+    // come back from ws_event_audit rows, not from Feed::ALL).
+    let post_close_feeds: std::collections::BTreeSet<String> = deaths
+        .iter()
+        .filter(|d| d.post_close_restart)
+        .map(|d| d.feed.clone())
+        .filter(|f| {
+            tickvault_common::feed::Feed::ALL
+                .iter()
+                .any(|known| known.as_str() == f)
+        })
+        .collect();
+    for feed in post_close_feeds {
+        let minutes_sql = build_feed_session_minutes_sql(&feed, target_ist_day);
+        let last = match exec_query(&client, questdb, &minutes_sql).await {
+            Some(body) => match parse_minute_set(&body) {
+                Some(set) => last_minute_secs_of_day(&set),
+                None => {
+                    error!(
+                        code = ErrorCode::Scoreboard01AggregationDegraded.code_str(),
+                        stage = "post_close_disambiguation",
+                        feed = %feed,
+                        "SCOREBOARD-01: post-close disambiguation minute read \
+                         unparsable — keeping the scheduled-stop carve-out \
+                         (a real crash recovered post-close may render \
+                         restarts=0 this boot)"
+                    );
+                    continue;
+                }
+            },
+            None => {
+                error!(
+                    code = ErrorCode::Scoreboard01AggregationDegraded.code_str(),
+                    stage = "post_close_disambiguation",
+                    feed = %feed,
+                    "SCOREBOARD-01: post-close disambiguation minute read \
+                     failed — keeping the scheduled-stop carve-out (a real \
+                     crash recovered post-close may render restarts=0 this \
+                     boot)"
+                );
+                continue;
+            }
+        };
+        if post_close_reconnect_is_real_death(last) {
+            warn!(
+                feed = %feed,
+                last_streamed_minute_secs = last,
+                "feed_scoreboard: post-close reconnect but the feed's last \
+                 streamed minute leaves a hole before the 15:30 close — a \
+                 clean scheduled stop cannot do that; reclassifying the \
+                 synthesized death as a REAL in-market process death \
+                 (round 4, 2026-07-10)"
+            );
+            for d in deaths
+                .iter_mut()
+                .filter(|d| d.post_close_restart && d.feed == feed)
+            {
+                d.post_close_restart = false;
+                d.market_hours = true;
+            }
+        }
     }
     // Deploy-vs-crash sub-reason (control-plane SSM read; fail-soft).
     let deployed_sha = fetch_deployed_binary_sha().await;
@@ -1564,16 +1838,51 @@ pub struct ScoreboardSummary {
     /// partial and the card carries the matching footnote (round 3,
     /// 2026-07-10: the row said partial while the card stayed silent).
     pub restart_partial: bool,
+    /// Dhan was switched OFF for the day (round 4, 2026-07-10) — its row
+    /// stamps the distinct 'feed_off' outcome and the card says "no
+    /// contest" instead of declaring a one-horse winner.
+    pub dhan_feed_off: bool,
+    /// Groww was switched OFF for the day (round 4, 2026-07-10).
+    pub groww_feed_off: bool,
+}
+
+/// RunCatchUp already-ran probe (round 4, 2026-07-10 — LOW): reads the
+/// day's existing daily-row outcomes; `true` when BOTH feeds already carry
+/// outcome='complete' (see [`catchup_rerun_is_redundant`]) so a
+/// post-trigger same-day boot (the post-close deploy restart) skips the
+/// redundant re-run + duplicate Telegram card. Any read/parse failure
+/// returns `false` — never skip on uncertainty. Forced runs and boots
+/// with in-market synthesized deaths never consult this (caller-gated).
+// TEST-EXEMPT: thin exec_query wrapper over the unit-tested pure parts (build_existing_daily_outcome_sql / parse_existing_daily_outcomes / catchup_rerun_is_redundant); a direct test needs live QuestDB.
+pub async fn day_already_scored_complete(questdb: &QuestDbConfig, target_ist_day: u64) -> bool {
+    let Ok(client) = reqwest::Client::builder()
+        .timeout(Duration::from_secs(SCOREBOARD_HTTP_TIMEOUT_SECS))
+        .build()
+    else {
+        return false;
+    };
+    let sql = build_existing_daily_outcome_sql(target_ist_day);
+    match exec_query(&client, questdb, &sql).await {
+        Some(body) => {
+            parse_existing_daily_outcomes(&body).is_some_and(|m| catchup_rerun_is_redundant(&m))
+        }
+        None => false,
+    }
 }
 
 /// Runs the daily scoreboard aggregation once. Cold path (once/day at the
 /// configured trigger). Fail-soft: missing sources record sentinels + an
 /// honest `partial`/`degraded` outcome — the summary is ALWAYS returned so
 /// the Telegram can never be silently dropped by a data failure.
+/// `runtime_enabled_now` = the CURRENT per-feed runtime flags
+/// `(dhan, groww)` — `Some` on same-day runs only (the feed-off-day
+/// disambiguator; a past-day backfill passes `None` and infers from data
+/// alone).
 ///
 /// # Errors
 /// Returns `Err` only when NOTHING could be measured (both the episode and
 /// tick sources unreachable) — the caller pages `DualFeedScorecardAborted`.
+#[allow(clippy::too_many_arguments)] // APPROVED: once-per-day orchestration entry with one caller; a params struct would just relocate the arity.
 // TEST-EXEMPT: orchestration over the unit-tested pure parts (SQL builders / parsers / overlap / tallies / classifier); a direct test needs live QuestDB — covered operationally by TICKVAULT_SCOREBOARD_NOW.
 pub async fn run_feed_scoreboard(
     questdb: &QuestDbConfig,
@@ -1584,6 +1893,7 @@ pub async fn run_feed_scoreboard(
     is_same_day_run: bool,
     boot_synthesized_deaths: usize,
     boot_reconciled_rows: &[FeedEpisodeAuditRow],
+    runtime_enabled_now: Option<(bool, bool)>,
 ) -> Result<ScoreboardSummary, String> {
     ensure_feed_scoreboard_tables(questdb).await;
     ensure_feed_episode_audit_table(questdb).await;
@@ -1602,7 +1912,7 @@ pub async fn run_feed_scoreboard(
 
     // 1. Same-day correlation evidence (blocking scan off the worker).
     let jsonl_dir = std::path::PathBuf::from(crate::observability::ERRORS_JSONL_DIR);
-    let corr = match tokio::task::spawn_blocking(move || {
+    let mut corr = match tokio::task::spawn_blocking(move || {
         scan_errors_jsonl_for_correlation(&jsonl_dir, target_ist_day)
     })
     .await
@@ -1613,6 +1923,34 @@ pub async fn run_feed_scoreboard(
             collect_correlation_evidence(&[], target_ist_day, false)
         }
     };
+    // Round-4 evidence-horizon downgrade (2026-07-10 — HIGH): I/O success
+    // is NOT evidence coverage — errors.jsonl retention is ~48h, so a
+    // backfill of an older day scans a READABLE dir whose files cannot
+    // cover the target day. Leaving scan_complete=true there (a) skipped
+    // the keep-better read entirely and (b) stamped every re-classified
+    // row run_partial=false — the exact silent destructive overwrite of
+    // evidence-backed blame the round-3 guard exists for. Downgrading
+    // here feeds BOTH the run_partial stamp and the keep-better gate.
+    let today_ist_day = u64::try_from(
+        chrono::Utc::now()
+            .timestamp()
+            .saturating_add(i64::from(
+                tickvault_common::constants::IST_UTC_OFFSET_SECONDS,
+            ))
+            .div_euclid(86_400),
+    )
+    .unwrap_or(0);
+    if corr.scan_complete && !target_within_evidence_retention(target_ist_day, today_ist_day) {
+        info!(
+            target_ist_day,
+            today_ist_day,
+            "feed_scoreboard: the target day is past the ~48h errors.jsonl \
+             evidence horizon — evidence treated as PARTIAL (rows stamp \
+             run_partial; the keep-better guard engages)"
+        );
+        corr.scan_complete = false;
+    }
+    let corr = corr;
 
     // 2. Classify today's disconnect episodes from ws_event_audit, UPSERT
     //    them (DEDUP-idempotent — re-runs re-classify in place) and tally
@@ -1668,11 +2006,16 @@ pub async fn run_feed_scoreboard(
     // sentinel, never a fabricated 0 (hostile review 2026-07-10).
     let mut reconnects: Option<BTreeMap<String, i64>> = None;
     let mut mem_tallies: Option<BTreeMap<String, EpisodeTally>> = None;
+    // Feeds with ≥1 up-kind connection row today — the feed-off-day
+    // inference input (round 4, 2026-07-10). `None` = the ws read failed,
+    // so feed-off can never be claimed (unmeasured is not off).
+    let mut up_feeds: Option<HashSet<String>> = None;
     match exec_query(&client, questdb, &ws_sql).await {
         Some(body) => match parse_ws_events(&body) {
             Some(rows) => {
                 let mut recon: BTreeMap<String, i64> = BTreeMap::new();
                 let mut mem: BTreeMap<String, EpisodeTally> = BTreeMap::new();
+                let mut ups: HashSet<String> = HashSet::new();
                 let mut writer = FeedEpisodeAuditWriter::new(questdb);
                 let mut appended = 0_u64;
                 for ev in &rows {
@@ -1681,6 +2024,9 @@ pub async fn run_feed_scoreboard(
                     // excluded (round-2 hostile review 2026-07-10).
                     if ev.event_kind == "reconnected" && is_market_data_ws_type(&ev.ws_type) {
                         *recon.entry(ev.feed.clone()).or_default() += 1;
+                    }
+                    if is_up_kind(&ev.event_kind) {
+                        ups.insert(ev.feed.clone());
                     }
                     if let Some(episode) =
                         classify_ws_event_to_episode(ev, &corr, trading_date_ist_nanos)
@@ -1759,6 +2105,7 @@ pub async fn run_feed_scoreboard(
                 }
                 reconnects = Some(recon);
                 mem_tallies = Some(mem);
+                up_feeds = Some(ups);
             }
             None => {
                 error!(
@@ -1794,9 +2141,15 @@ pub async fn run_feed_scoreboard(
     //    (rows an earlier same-day run wrote are better than nothing; that
     //    path is already stamped partial) — it applies the same in-memory
     //    fold + dedupe.
-    let skip_keys = boot_reconciled_skip_keys(boot_reconciled_rows);
+    //    ROUND-4 DAY FILTER (2026-07-10 — HIGH): the reconciler targets
+    //    the BOOT day, so on a `TICKVAULT_SCOREBOARD_DATE` past-day
+    //    backfill THIS boot's (today's) rows must fold into NOTHING — the
+    //    unconditional fold incremented the past day's restarts/blame and
+    //    flipped its completed row to Partial via the data-driven floor.
+    let boot_rows_for_day = filter_boot_rows_to_day(boot_reconciled_rows, target_ist_day);
+    let skip_keys = boot_reconciled_skip_keys(&boot_rows_for_day);
     let fold_boot_rows_in_memory = |mem: &mut BTreeMap<String, EpisodeTally>| {
-        for row in boot_reconciled_rows {
+        for row in &boot_rows_for_day {
             fold_market_data_episode(mem, row);
         }
     };
@@ -1901,6 +2254,40 @@ pub async fn run_feed_scoreboard(
         }
     }
 
+    // 5b. Feed-off-day detection (round 4, 2026-07-10 — the round-2
+    //     finding): a feed with zero up-kind connection rows AND a
+    //     measured zero tick count was switched off for the day — its row
+    //     stamps the distinct 'feed_off' outcome (excluded from the month
+    //     sums) and the card says "no contest". Same-day runs consult the
+    //     runtime enabled flag so an enabled-but-dead-broker day can NEVER
+    //     be softened into feed_off; a failed ws read claims nothing.
+    let mut feed_off: BTreeMap<&'static str, bool> = BTreeMap::new();
+    for feed in tickvault_common::feed::Feed::ALL {
+        let label = feed.as_str();
+        let ticks = feed_numbers
+            .get(label)
+            .map_or(SCOREBOARD_UNAVAILABLE_SENTINEL, |n| n.ticks);
+        let enabled_now = runtime_enabled_now.map(|(dhan_on, groww_on)| {
+            if matches!(feed, tickvault_common::feed::Feed::Dhan) {
+                dhan_on
+            } else {
+                groww_on
+            }
+        });
+        let off = up_feeds
+            .as_ref()
+            .is_some_and(|ups| is_feed_off_day(ups.contains(label), ticks, enabled_now));
+        if off {
+            info!(
+                feed = label,
+                "feed_scoreboard: {label} was switched off for the day — \
+                 stamping its row outcome='feed_off' (excluded from the \
+                 month verdict; the card says no contest)"
+            );
+        }
+        feed_off.insert(label, off);
+    }
+
     // 6. Fold the episode tallies in (when the aggregate answered).
     if let Some(ref tallies) = tallies {
         for (label, n) in &mut feed_numbers {
@@ -1982,13 +2369,55 @@ pub async fn run_feed_scoreboard(
     // complete end-of-day row).
     let partial_coverage = !sources_complete;
     let row_partial = partial_coverage || forced_early_run || restart_day_floor;
-    let outcome = if degraded {
+    let mut outcome = if degraded {
         ScoreboardOutcome::Degraded
     } else if row_partial {
         ScoreboardOutcome::Partial
     } else {
         ScoreboardOutcome::Complete
     };
+
+    // 7b. DAILY-outcome keep-better (round 4, 2026-07-10 — MEDIUM): a
+    //     same-day evening RunCatchUp rerun re-measures the FRESH
+    //     process's audit-drop counter as 0 and would UPSERT
+    //     outcome='complete' over the 15:45 run's 'degraded' verdict —
+    //     the drop evidence is session-local and durable NOWHERE except
+    //     the row being overwritten. A rerun must never downgrade
+    //     degraded → partial/complete. A failed guard read proceeds
+    //     without the guard, loudly (mirrors the episode keep-better).
+    if !matches!(outcome, ScoreboardOutcome::Degraded) {
+        let daily_sql = build_existing_daily_outcome_sql(target_ist_day);
+        match exec_query(&client, questdb, &daily_sql)
+            .await
+            .as_deref()
+            .map(parse_existing_daily_outcomes)
+        {
+            Some(Some(existing)) => {
+                if should_keep_degraded_outcome(&existing, outcome) {
+                    error!(
+                        code = ErrorCode::Scoreboard01AggregationDegraded.code_str(),
+                        stage = "outcome_regression",
+                        new_outcome = outcome.as_str(),
+                        "SCOREBOARD-01: this rerun would ERASE the day's \
+                         existing 'degraded' verdict (the original session's \
+                         audit-drop evidence is unrecoverable) — keeping \
+                         outcome=degraded"
+                    );
+                    degraded = true;
+                    outcome = ScoreboardOutcome::Degraded;
+                }
+            }
+            Some(None) | None => {
+                error!(
+                    code = ErrorCode::Scoreboard01AggregationDegraded.code_str(),
+                    stage = "outcome_keep_better_read",
+                    "SCOREBOARD-01: existing daily-outcome read failed/unparsable \
+                     — the daily keep-better guard is OFF this run; a rerun may \
+                     erase a 'degraded' verdict"
+                );
+            }
+        }
+    }
 
     // 8. Write the two daily rows (deterministic ts — re-runs UPSERT).
     let mut writer = FeedScoreboardWriter::new(questdb);
@@ -2041,7 +2470,14 @@ pub async fn run_feed_scoreboard(
             uptime_pct,
             partial_coverage: row_partial,
             coverage_source: CoverageSource::SqlBackfill,
-            outcome,
+            // A feed switched off for the day stamps the distinct
+            // 'feed_off' outcome so the month sums can exclude the
+            // one-horse days (round 4, 2026-07-10).
+            outcome: if feed_off.get(label).copied().unwrap_or(false) {
+                ScoreboardOutcome::FeedOff
+            } else {
+                outcome
+            },
         };
         if let Err(err) = writer.append_daily_row(&row) {
             error!(
@@ -2088,6 +2524,8 @@ pub async fn run_feed_scoreboard(
         // Threaded to the card footnote (round 3: the persisted row said
         // partial while the card rendered no restart caveat).
         restart_partial: restart_day_floor,
+        dhan_feed_off: feed_off.get("dhan").copied().unwrap_or(false),
+        groww_feed_off: feed_off.get("groww").copied().unwrap_or(false),
     })
 }
 
@@ -3408,5 +3846,262 @@ mod tests {
         );
         assert!(!corr.scan_complete, "missing dir = honest partial evidence");
         assert!(!corr.resilience_same_day);
+    }
+
+    // -----------------------------------------------------------------------
+    // Round-4 hostile-review fixes (2026-07-10)
+    // -----------------------------------------------------------------------
+
+    fn boot_row(ts: i64, market_hours: bool) -> FeedEpisodeAuditRow {
+        FeedEpisodeAuditRow {
+            ts_ist_nanos: ts,
+            trading_date_ist_nanos: 0,
+            feed: "dhan".to_string(),
+            ws_type: "main_feed".to_string(),
+            connection_index: 0,
+            episode_kind: EPISODE_KIND_PROCESS_DEATH,
+            blame: BlameClass::Ours,
+            blame_reason: "process_restart",
+            source: "boot_reconciled".to_string(),
+            dhan_code: -1,
+            detector: "boot_reconciled",
+            down_secs: 0,
+            market_hours,
+            evidence: String::new(),
+            run_partial: false,
+        }
+    }
+
+    #[test]
+    fn test_filter_boot_rows_to_day_blocks_cross_day_backfill_contamination() {
+        // Round-4 HIGH: the reconciler targets the BOOT day, so on a
+        // TICKVAULT_SCOREBOARD_DATE past-day backfill THIS boot's (today's)
+        // in-market rows must fold into NOTHING for the past target day —
+        // previously they incremented the past day's restarts/blame and
+        // engaged the data-driven Partial floor over its completed row.
+        let boot_day_row = boot_row(day_ts(11 * 3600), true); // today 11:00 IST
+        let past_day = DAY - 3; // backfill target: 3 days ago
+        let filtered = filter_boot_rows_to_day(std::slice::from_ref(&boot_day_row), past_day);
+        assert!(
+            filtered.is_empty(),
+            "a boot-day row must never fold into a past-day backfill"
+        );
+        // The fold over the filtered set tallies ZERO restarts → the
+        // data-driven floor (tallied_restarts > 0) stays OFF.
+        let mut mem: BTreeMap<String, EpisodeTally> = BTreeMap::new();
+        for row in &filtered {
+            fold_market_data_episode(&mut mem, row);
+        }
+        let tallied_restarts: i64 = mem.values().map(|t| t.restarts).sum();
+        assert_eq!(tallied_restarts, 0, "no floor on the past day");
+        // And the dedupe keys must come from the filtered set too — a
+        // cross-day key would never match the past day's read-back anyway,
+        // but the contract is day-scoped keys.
+        assert!(boot_reconciled_skip_keys(&filtered).is_empty());
+        // Same-day run (target == boot day): the row folds normally.
+        let same_day = filter_boot_rows_to_day(std::slice::from_ref(&boot_day_row), DAY);
+        assert_eq!(same_day.len(), 1);
+        let mut mem: BTreeMap<String, EpisodeTally> = BTreeMap::new();
+        for row in &same_day {
+            fold_market_data_episode(&mut mem, row);
+        }
+        assert_eq!(mem.get("dhan").map_or(0, |t| t.restarts), 1);
+    }
+
+    #[test]
+    fn test_target_within_evidence_retention_gates_run_partial_and_keep_better() {
+        // Round-4 HIGH: I/O success is NOT evidence coverage. A 5-day-old
+        // backfill target must classify as PARTIAL evidence even when every
+        // retained errors.jsonl file opened cleanly — feeding BOTH the
+        // run_partial stamp and the keep-better read gate.
+        assert!(target_within_evidence_retention(DAY, DAY), "same day");
+        assert!(
+            target_within_evidence_retention(DAY, DAY + 2),
+            "2-day-old target is still inside the 48h retention"
+        );
+        assert!(
+            !target_within_evidence_retention(DAY, DAY + 3),
+            "3-day-old target is past the retention horizon"
+        );
+        assert!(
+            !target_within_evidence_retention(DAY, DAY + 5),
+            "the flagship 5-day-old month-end backfill is partial evidence"
+        );
+        // The downgraded evidence stamps run_partial=true on every
+        // re-classified row…
+        let corr = CorrelationEvidence {
+            scan_complete: false, // the horizon downgrade applied
+            ..CorrelationEvidence::default()
+        };
+        let event = ev(
+            day_ts(10 * 3600),
+            "dhan",
+            "main_feed",
+            "disconnected",
+            "dhan_code",
+            805,
+            true,
+        );
+        let episode = classify_ws_event_to_episode(&event, &corr, day_ts(0)).expect("episode");
+        assert!(
+            episode.run_partial,
+            "aged-out evidence must stamp run_partial=true"
+        );
+        // …and the keep-better rule then SUPPRESSES the evidence-less
+        // overwrite of the existing evidence-backed (run_partial=false) row.
+        assert!(
+            should_suppress_episode_overwrite(Some(false), episode.run_partial),
+            "the >48h backfill must be suppressed against an evidence-backed row"
+        );
+    }
+
+    #[test]
+    fn test_build_existing_daily_outcome_sql_micros_window() {
+        // Round-4 MEDIUM: the daily keep-better guard input — micros
+        // literals per the module's regression lock (a nanos literal
+        // silently matches ZERO rows on QuestDB 9.3.5).
+        let sql = build_existing_daily_outcome_sql(DAY);
+        let (start, end) = day_micros();
+        assert!(sql.contains("from feed_scoreboard_daily"), "{sql}");
+        assert!(sql.contains(&format!("ts >= {start}")), "{sql}");
+        assert!(sql.contains(&format!("ts < {end}")), "{sql}");
+        assert!(
+            !sql.contains(&((DAY as i64) * 86_400 * NANOS_PER_SEC).to_string()),
+            "nanos literal banned: {sql}"
+        );
+    }
+
+    #[test]
+    fn test_should_keep_degraded_outcome_and_parse_existing_daily_outcomes() {
+        // Round-4 MEDIUM: an evening RunCatchUp rerun (fresh process, drop
+        // counter 0) must never erase the 15:45 run's 'degraded' verdict.
+        let body = r#"{"dataset":[["dhan","degraded"],["groww","degraded"]]}"#;
+        let existing = parse_existing_daily_outcomes(body).expect("parse");
+        assert_eq!(existing.get("dhan").map(String::as_str), Some("degraded"));
+        assert!(
+            should_keep_degraded_outcome(&existing, ScoreboardOutcome::Complete),
+            "degraded → complete is the erased-verdict regression"
+        );
+        assert!(
+            should_keep_degraded_outcome(&existing, ScoreboardOutcome::Partial),
+            "degraded → partial is a downgrade too"
+        );
+        assert!(
+            !should_keep_degraded_outcome(&existing, ScoreboardOutcome::Degraded),
+            "a degraded rerun writes degraded — nothing to keep"
+        );
+        // A partial/complete prior day never blocks (reruns may upgrade).
+        let body = r#"{"dataset":[["dhan","partial"],["groww","complete"]]}"#;
+        let existing = parse_existing_daily_outcomes(body).expect("parse");
+        assert!(!should_keep_degraded_outcome(
+            &existing,
+            ScoreboardOutcome::Complete
+        ));
+        // First run of the day: no rows, no keep.
+        let existing = parse_existing_daily_outcomes(r#"{"dataset":[]}"#).expect("parse");
+        assert!(!should_keep_degraded_outcome(
+            &existing,
+            ScoreboardOutcome::Complete
+        ));
+        assert_eq!(parse_existing_daily_outcomes("not json"), None);
+    }
+
+    #[test]
+    fn test_is_feed_off_day_inference() {
+        // Round-4 MEDIUM (the round-2 finding): a feed with zero up rows +
+        // measured-zero ticks was switched off — never a one-horse win.
+        assert!(
+            is_feed_off_day(false, 0, None),
+            "backfill: data-only inference"
+        );
+        assert!(
+            is_feed_off_day(false, 0, Some(false)),
+            "same-day + runtime-disabled"
+        );
+        assert!(
+            !is_feed_off_day(false, 0, Some(true)),
+            "same-day ENABLED but zero everything = a catastrophic day, \
+             never softened into feed_off"
+        );
+        assert!(
+            !is_feed_off_day(true, 0, None),
+            "an up row means the feed WAS on at some point"
+        );
+        assert!(!is_feed_off_day(false, 42, None), "ticks flowed = not off");
+        assert!(
+            !is_feed_off_day(false, SCOREBOARD_UNAVAILABLE_SENTINEL, None),
+            "a -1 sentinel is UNMEASURED, not zero — never claims feed_off"
+        );
+    }
+
+    #[test]
+    fn test_last_minute_secs_of_day_and_post_close_reconnect_is_real_death() {
+        // Round-4 MEDIUM: only a feed that streamed through ~15:28 keeps
+        // the scheduled-stop carve-out; a hole before close = a REAL
+        // in-market crash (the 15:26-crash → 15:31-reconnect shape).
+        let minute = |h: i64, m: i64| format!("2026-07-10T{h:02}:{m:02}:00.000000Z");
+        let set: HashSet<String> = [minute(9, 15), minute(12, 0), minute(15, 27)]
+            .into_iter()
+            .collect();
+        assert_eq!(last_minute_secs_of_day(&set), Some(15 * 3600 + 27 * 60));
+        assert!(
+            post_close_reconnect_is_real_death(Some(15 * 3600 + 27 * 60)),
+            "last minute 15:27 < 15:28 threshold = real in-market death"
+        );
+        assert!(
+            !post_close_reconnect_is_real_death(Some(15 * 3600 + 28 * 60)),
+            "streamed through 15:28 = the clean scheduled-stop shape"
+        );
+        assert!(
+            !post_close_reconnect_is_real_death(Some(15 * 3600 + 29 * 60)),
+            "streamed through 15:29 keeps the carve-out"
+        );
+        assert!(
+            post_close_reconnect_is_real_death(None),
+            "zero streamed session minutes with a prior-up row is \
+             incompatible with a clean full-session stop"
+        );
+        // Unparsable keys yield None (fail toward the real-death arm —
+        // documented residual; query FAILURE keeps the carve-out upstream).
+        let junk: HashSet<String> = ["gibberish".to_string()].into_iter().collect();
+        assert_eq!(last_minute_secs_of_day(&junk), None);
+        assert_eq!(last_minute_secs_of_day(&HashSet::new()), None);
+    }
+
+    #[test]
+    fn test_catchup_rerun_is_redundant_requires_both_complete() {
+        // Round-4 LOW: the post-close deploy-restart RunCatchUp skips only
+        // when BOTH feeds already carry a complete row.
+        let both: BTreeMap<String, String> = [
+            ("dhan".to_string(), "complete".to_string()),
+            ("groww".to_string(), "complete".to_string()),
+        ]
+        .into_iter()
+        .collect();
+        assert!(catchup_rerun_is_redundant(&both));
+        for worse in ["partial", "degraded", "feed_off"] {
+            let mut m = both.clone();
+            m.insert("groww".to_string(), worse.to_string());
+            assert!(
+                !catchup_rerun_is_redundant(&m),
+                "{worse} days must re-run (partial may improve; degraded is \
+                 keep-better-protected)"
+            );
+        }
+        let mut one = both.clone();
+        one.remove("dhan");
+        assert!(!catchup_rerun_is_redundant(&one), "a missing row re-runs");
+        assert!(!catchup_rerun_is_redundant(&BTreeMap::new()));
+    }
+
+    #[test]
+    fn test_scoreboard_trigger_after_auto_stop_warn_threshold() {
+        // Round-4 LOW: an accepted trigger at/after 16:15 IST sleeps into
+        // the prod 16:30 auto-stop every day — warn loudly at spawn.
+        assert!(!scoreboard_trigger_after_auto_stop(56_700), "15:45 default");
+        assert!(!scoreboard_trigger_after_auto_stop(58_499), "16:14:59");
+        assert!(scoreboard_trigger_after_auto_stop(58_500), "16:15:00");
+        assert!(scoreboard_trigger_after_auto_stop(61_200), "17:00");
+        assert_eq!(SCOREBOARD_TRIGGER_AUTO_STOP_WARN_SECS, 58_500);
     }
 }

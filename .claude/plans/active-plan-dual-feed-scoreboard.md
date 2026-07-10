@@ -379,6 +379,65 @@ forensic tables:
   - Files: crates/app/src/feed_scoreboard_boot.rs, crates/app/src/main.rs, crates/core/src/notification/events.rs, docs/runbooks/dual-feed-scoreboard.md, .claude/rules/project/dual-feed-scoreboard-error-codes.md
   - Tests: test_synthesize_post_close_stop_then_evening_start_topology, test_forced_now_without_date_composes_with_trading_day_validation, test_fold_episode_readback_rows_dedupes_in_memory_keys, test_should_suppress_episode_overwrite_keep_better_rule, test_build_existing_episode_partiality_day_sql_and_parse, test_fold_episode_readback_rows_tallies_per_feed, test_dual_feed_scorecard_restart_partial_footnote
 
+- [x] Item 11 — Hostile-review round 4 fixes (2026-07-10)
+  - HIGH (cross-day fold contamination — round-3 regression): THIS boot's
+    reconciled rows are DAY-FILTERED to the run's target day
+    (`filter_boot_rows_to_day`) before they fold in-memory AND before the
+    read-back dedupe keys are built — a mid-market restart used to launch
+    a `TICKVAULT_SCOREBOARD_DATE` past-day backfill can no longer
+    increment the past day's restarts/blame nor flip its completed row to
+    Partial via the data-driven floor.
+  - HIGH (evidence horizon — the round-3 guard was vacuous for its
+    flagship >48h backfill): evidence completeness is now
+    `io_complete && target_within_evidence_retention(target, today)`
+    (`ERRORS_JSONL_EVIDENCE_RETENTION_DAYS = 2`) — an aged-out backfill
+    day stamps `run_partial=true` on every re-classified row AND engages
+    the keep-better read (previously scan_complete=true skipped both and
+    the evidence-backed blame was destroyed silently). The
+    `CorrelationEvidence::scan_complete` doc now states the horizon
+    semantics.
+  - MEDIUM (evening rerun erases Degraded): DAILY-row keep-better — before
+    step 8 the run reads the day's existing `feed_scoreboard_daily`
+    outcomes (`build_existing_daily_outcome_sql` /
+    `parse_existing_daily_outcomes` / `should_keep_degraded_outcome`) and
+    never downgrades degraded → partial/complete
+    (`stage="outcome_regression"`; a failed guard read is loud:
+    `stage="outcome_keep_better_read"`).
+  - MEDIUM (feed-off days — the round-2 finding): a feed with zero
+    up-kind rows + measured-zero ticks stamps the NEW
+    `ScoreboardOutcome::FeedOff` (`'feed_off'`) outcome; same-day runs
+    consult the live `FeedRuntimeState` flags (threaded into
+    `spawn_feed_scoreboard_tasks` at both call sites) so an
+    enabled-but-dead-broker day is never softened; the verdict gains
+    rung 0 "not comparable — <feed> was switched off today, no contest" +
+    a card footnote, and the runbook month SQL excludes + reports
+    feed_off days.
+  - MEDIUM (post-close carve-out over-correction): the reconciler
+    disambiguates every `post_close_restart` candidate against the feed's
+    day minute set (`last_minute_secs_of_day` /
+    `post_close_reconnect_is_real_death`, threshold 15:28) — a last
+    streamed minute leaving a hole before close re-classifies as a REAL
+    in-market death (counted + floor); only streamed-through-close keeps
+    the carve-out; a failed minute read keeps it loudly
+    (`stage="post_close_disambiguation"`).
+  - LOW (refusal drops the reconciler handle): the forced-run refusal
+    arms record the refusal and return AFTER `reconcile_handle.await` —
+    a reconciler panic is classified on every path again.
+  - LOW (duplicate catch-up card): RunCatchUp consults
+    `day_already_scored_complete` (`catchup_rerun_is_redundant`) — a
+    post-trigger same-day boot with complete rows for BOTH feeds and zero
+    in-market boot-synthesized deaths skips the redundant rerun +
+    duplicate Telegram (forced runs override by construction).
+  - LOW (trigger past the auto-stop): an accepted trigger ≥ 16:15 IST
+    logs a loud SCOREBOARD-01 `stage="trigger_after_auto_stop"` warning
+    (`scoreboard_trigger_after_auto_stop`) — the silent-teardown failure
+    the round-2 bound re-admitted inside its own sanctioned range.
+  - LOW (plan-verify vacuous pass on named plans): no branch change —
+    pre-existing hook limitation on main; compensating control is
+    plan-gate.sh (globs active-plan*.md). Follow-up for a separate PR.
+  - Files: crates/app/src/feed_scoreboard_boot.rs, crates/app/src/main.rs, crates/storage/src/feed_scoreboard_persistence.rs, crates/core/src/notification/events.rs, docs/runbooks/dual-feed-scoreboard.md, .claude/rules/project/dual-feed-scoreboard-error-codes.md
+  - Tests: test_filter_boot_rows_to_day_blocks_cross_day_backfill_contamination, test_target_within_evidence_retention_gates_run_partial_and_keep_better, test_should_keep_degraded_outcome_and_parse_existing_daily_outcomes, test_is_feed_off_day_inference, test_last_minute_secs_of_day_and_post_close_reconnect_is_real_death, test_catchup_rerun_is_redundant_requires_both_complete, test_scoreboard_trigger_after_auto_stop_warn_threshold, test_dual_feed_scorecard_feed_off_no_contest, test_scoreboard_outcome_and_coverage_source_labels_stable
+
 ## Scenarios
 
 | # | Scenario | Expected |
