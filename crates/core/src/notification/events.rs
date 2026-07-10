@@ -1939,6 +1939,18 @@ impl NotificationEvent {
                          reads \u{201c}?\u{201d}.",
                     );
                 }
+                if groww.drops_market < 0 && dhan.drops_market >= 0 {
+                    // Round-2 hostile review 2026-07-10: Groww's internal
+                    // reconnects are not yet recorded (only a full feed
+                    // switch-off or a crash is), so a "0" would be a false
+                    // all-clear next to Dhan's fully-counted drops.
+                    footnotes.push_str(
+                        "\nGroww connection drops are not counted yet (its \
+                         internal reconnects become visible with the next \
+                         upgrade) — today reads \u{201c}?\u{201d}, so do not \
+                         compare drop counts between the two feeds today.",
+                    );
+                }
                 format!(
                     "\u{1f4ca} <b>Daily feed scorecard @ 3:45 PM IST</b>\n\
                      Date: {trading_date_ist}\n\
@@ -6469,6 +6481,43 @@ mod tests {
         assert!(
             msg.contains("produced early on operator request"),
             "early-run footnote missing: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_dual_feed_scorecard_groww_drops_sentinel_footnote() {
+        // Round-2 hostile review 2026-07-10: while the Groww disconnect
+        // instrumentation is blind to sidecar socket drops (pre-PR-2), the
+        // card renders Groww drops as the "?" sentinel + a footnote naming
+        // the blind spot — never a measured-looking 0 next to Dhan's fully
+        // instrumented count.
+        let mut g = score_line("Groww");
+        g.drops_market = -1;
+        let msg = scorecard(score_line("Dhan"), g).to_message();
+        assert!(
+            msg.contains("Drops in market hours: Dhan 3 | Groww ?"),
+            "{msg}"
+        );
+        assert!(
+            msg.contains("Groww connection drops are not counted yet"),
+            "the blind-spot footnote must render: {msg}"
+        );
+        // The drops verdict rung must not decide against the sentinel —
+        // identical evidence elsewhere → Even day.
+        let mut d = score_line("Dhan");
+        d.blame_broker = 5;
+        let mut g = score_line("Groww");
+        g.drops_market = -1;
+        let msg = scorecard(d, g).to_message();
+        assert!(
+            msg.contains("\u{1f91d} Verdict: Even day."),
+            "a sentinel drops side must never lose/win the drops rung: {msg}"
+        );
+        // Both sides measured → no footnote.
+        let msg = scorecard(score_line("Dhan"), score_line("Groww")).to_message();
+        assert!(
+            !msg.contains("Groww connection drops are not counted yet"),
+            "{msg}"
         );
     }
 

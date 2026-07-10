@@ -2261,7 +2261,11 @@ rules:
   # same-day ws_event_audit drop counter shows the episode source under-counted.
   # Best-effort forensic aggregate (AUDIT-WS-01 / GROWW-MASTER-01 class): the
   # live feeds, tick capture and trading are NEVER affected, and the tables are
-  # DEDUP-idempotent so a TICKVAULT_SCOREBOARD_NOW re-run backfills the day.
+  # DEDUP-idempotent so a TICKVAULT_SCOREBOARD_NOW re-run backfills the daily
+  # aggregation. EXCEPTION: boot-reconciled process-death rows are NOT
+  # re-creatable by a re-run (only the detecting boot can pair them; their
+  # flush retries 3x in place — an exhausted reconcile_flush is a permanent
+  # loss to annotate).
   # Escalate (not silence): a degraded daily scoreboard usually means QuestDB
   # was down at 15:45 (the BOOT-01/02 condition) and the operator should re-run
   # the backfill once QuestDB is healthy — the runbook names the exact steps.

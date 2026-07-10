@@ -320,6 +320,23 @@ async fn emit_boot_completed_when_feed_live(
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // PROCESS-START anchor (IST epoch nanos) for the dual-feed scoreboard's
+    // process-death reconciler — captured as the FIRST statement of main(),
+    // BEFORE any boot path can connect a feed (hostile review round 2,
+    // 2026-07-10: the FAST crash-recovery arm connects the Dhan main-feed +
+    // order-update WS BEFORE its scoreboard spawn, so an anchor stamped
+    // inside the spawned task classified this boot's own `connected` audit
+    // rows as PRE-boot and the flagship mid-market crash-restart synthesized
+    // NOTHING). Threaded into `spawn_feed_scoreboard_tasks` at both call
+    // sites; the source-order ratchet in secret_manager.rs pins that this
+    // anchor precedes every `create_websocket_pool` site.
+    let process_start_ist_nanos: i64 = chrono::Utc::now()
+        .timestamp()
+        .saturating_add(i64::from(
+            tickvault_common::constants::IST_UTC_OFFSET_SECONDS,
+        ))
+        .saturating_mul(1_000_000_000);
+
     // -----------------------------------------------------------------------
     // Step -1: Holiday-gate CLI short-circuit (cold path, no TLS / no runtime).
     // -----------------------------------------------------------------------
@@ -2851,7 +2868,12 @@ async fn main() -> Result<()> {
         // this call the flagship crash-restart day produced NO episode row,
         // NO scorecard and NO Aborted page (nothing was spawned to die).
         // `notifier` here is the fast_notifier clone from above.
-        spawn_feed_scoreboard_tasks(&config, &trading_calendar, &notifier);
+        spawn_feed_scoreboard_tasks(
+            &config,
+            &trading_calendar,
+            &notifier,
+            process_start_ist_nanos,
+        );
 
         // --- Await shutdown ---
         return run_shutdown_fast(
@@ -3005,7 +3027,12 @@ async fn main() -> Result<()> {
     // 15:45 IST daily Dhan-vs-Groww aggregation + Telegram scorecard. Gated
     // on `[scoreboard] enabled` (the B12 rollback switch). See
     // `spawn_feed_scoreboard_tasks`.
-    spawn_feed_scoreboard_tasks(&config, &trading_calendar, &notifier);
+    spawn_feed_scoreboard_tasks(
+        &config,
+        &trading_calendar,
+        &notifier,
+        process_start_ist_nanos,
+    );
 
     // -----------------------------------------------------------------------
     // DayOhlcTracker boot wiring (post 2026-05-26 simplification; MOVED to
@@ -14593,6 +14620,7 @@ fn spawn_feed_scoreboard_tasks(
     config: &ApplicationConfig,
     trading_calendar: &std::sync::Arc<TradingCalendar>,
     notifier: &std::sync::Arc<NotificationService>,
+    process_start_ist_nanos: i64,
 ) {
     if !config.scoreboard.enabled {
         info!("feed_scoreboard: disabled by [scoreboard] config — nothing spawned");
@@ -14601,29 +14629,50 @@ fn spawn_feed_scoreboard_tasks(
     use tickvault_app::feed_scoreboard_boot::{
         PROCESS_DEATH_RECONCILE_DELAY_SECS, ScoreboardStart, decide_scoreboard_start,
         parse_scoreboard_date_override, reconcile_process_death_episodes, run_feed_scoreboard,
+        sanitize_scoreboard_trigger, validate_scoreboard_backfill_date,
     };
     use tickvault_common::constants::IST_UTC_OFFSET_SECONDS;
 
-    // ── Task 1: boot-time process-death reconciler (polling — hostile
-    // review 2026-07-10: a fast crash-recovery boot can wait out a 300s
-    // 429 cooldown before its first connect, past the old one-shot 180s
-    // query). The JoinHandle is threaded into Task 2 so a RunCatchUp /
-    // forced run aggregates AFTER the synthesized rows exist.
-    let reconcile_handle = {
+    // Config sanity (round-2 hostile review 2026-07-10): a typo'd trigger
+    // ≥ 86400 slept past the 16:30 auto-stop every day — the task died at
+    // shutdown as silent teardown, so a config typo disabled the whole
+    // deliverable with zero signal. Out-of-range falls back to 15:45 IST.
+    let (sb_trigger, trigger_invalid) =
+        sanitize_scoreboard_trigger(config.scoreboard.trigger_secs_of_day_ist);
+    if trigger_invalid {
+        error!(
+            code =
+                tickvault_common::error_code::ErrorCode::Scoreboard01AggregationDegraded.code_str(),
+            stage = "trigger_config",
+            configured = config.scoreboard.trigger_secs_of_day_ist,
+            effective = sb_trigger,
+            "SCOREBOARD-01: [scoreboard] trigger_secs_of_day_ist is outside \
+             [session close, 23:59:59] IST — falling back to the 15:45 IST \
+             default so the daily scoreboard still fires"
+        );
+    }
+
+    // ── Task 1: boot-time process-death reconciler (polling per-key —
+    // hostile review 2026-07-10: a fast crash-recovery boot can wait out a
+    // 300s 429 cooldown before its first connect, past the old one-shot
+    // 180s query). The JoinHandle is threaded into Task 2 so a RunCatchUp /
+    // forced run aggregates AFTER the synthesized rows exist AND so its
+    // panic/JoinError is always classified (never a silent task death).
+    // Returns the number of synthesized episodes.
+    let reconcile_handle: tokio::task::JoinHandle<usize> = {
         let pd_qcfg = config.questdb.clone();
         tokio::spawn(async move {
-            use chrono::Utc;
-            // Capture the boot instant BEFORE the settle sleep — the death
-            // gap is anchored to THIS boot. (The in-session gate now keys
-            // on the DEATH window — the prior "up" row — inside the pure
-            // synthesis fn, never on the boot instant.)
-            let boot_ist_secs = Utc::now()
-                .timestamp()
-                .saturating_add(i64::from(IST_UTC_OFFSET_SECONDS));
-            let boot_ts_ist_nanos = boot_ist_secs.saturating_mul(1_000_000_000);
+            // The anchor is the PROCESS-START instant captured at the very
+            // top of main() (round-2 HIGH fix: stamping Utc::now() HERE runs
+            // when this task STARTS — on the fast crash-recovery arm that is
+            // AFTER the Dhan main-feed + order-update WS already connected,
+            // so their `connected` rows classified PRE-boot and the fast
+            // arm's process_death episodes were never synthesized).
+            let boot_ts_ist_nanos = process_start_ist_nanos;
+            let boot_ist_secs = process_start_ist_nanos.div_euclid(1_000_000_000);
             // Let this boot's own `connected` audit rows land first (async
-            // audit writer + ILP flush); the reconciler then POLLS for the
-            // post-boot connect row (60s cadence, bounded).
+            // audit writer + ILP flush); the reconciler then POLLS per-key
+            // for the post-boot up rows (60s cadence, bounded).
             tokio::time::sleep(std::time::Duration::from_secs(
                 PROCESS_DEATH_RECONCILE_DELAY_SECS,
             ))
@@ -14640,14 +14689,13 @@ fn spawn_feed_scoreboard_tasks(
                 trading_date_ist_nanos,
                 boot_ts_ist_nanos,
             )
-            .await;
+            .await
         })
     };
 
     // ── Task 2: the daily aggregation + Telegram scorecard ──
     let sb_qcfg = config.questdb.clone();
     let sb_metrics_port = config.observability.metrics_port;
-    let sb_trigger = config.scoreboard.trigger_secs_of_day_ist;
     let sb_calendar = std::sync::Arc::clone(trading_calendar);
     let sb_telegram_enabled = config.scoreboard.telegram_enabled;
     let sb_notifier = std::sync::Arc::clone(notifier);
@@ -14691,11 +14739,43 @@ fn spawn_feed_scoreboard_tasks(
         } else {
             None
         };
+        // APPROVED: epoch day number fits u64 trivially.
+        let boot_day = boot_ist
+            .timestamp()
+            .saturating_add(i64::from(IST_UTC_OFFSET_SECONDS))
+            .max(0) as u64
+            / 86_400;
+        // Semantic backfill-date validation (round-2 hostile review
+        // 2026-07-10): a well-shaped NON-TRADING or FUTURE date used to run
+        // the full aggregation against legitimately-empty sources and write
+        // two fabricated all-zero rows stamped outcome='complete'. The
+        // TARGET date must be a past-or-today TRADING day; refusal pages
+        // Aborted, matching the malformed-date arm.
+        if let Some((target_day, label)) = &date_override {
+            let target_is_trading = chrono::NaiveDate::parse_from_str(label, "%Y-%m-%d")
+                .map(|d| sb_calendar.is_trading_day(d))
+                .unwrap_or(false);
+            if let Err(why) =
+                validate_scoreboard_backfill_date(*target_day, boot_day, target_is_trading)
+            {
+                error!(
+                    code = tickvault_common::error_code::ErrorCode::Scoreboard01AggregationDegraded
+                        .code_str(),
+                    stage = "date_override_reject",
+                    date = %label,
+                    "SCOREBOARD-01: TICKVAULT_SCOREBOARD_DATE {why} — refusing \
+                     the forced backfill (an all-zero 'complete' day would \
+                     pollute the month-end verdict)"
+                );
+                return Err(format!("TICKVAULT_SCOREBOARD_DATE {label} {why}"));
+            }
+        }
         let is_trading_day = sb_calendar.is_trading_day(today_ist);
-        match decide_scoreboard_start(boot_secs_of_day, is_trading_day, force_now, sb_trigger) {
+        let decision =
+            decide_scoreboard_start(boot_secs_of_day, is_trading_day, force_now, sb_trigger);
+        match decision {
             ScoreboardStart::SkipNonTradingDay => {
-                info!("feed_scoreboard: skipping (non-trading day)");
-                return Ok(None);
+                info!("feed_scoreboard: skipping the daily aggregation (non-trading day)");
             }
             ScoreboardStart::RunCatchUp => {
                 info!(
@@ -14719,29 +14799,63 @@ fn spawn_feed_scoreboard_tasks(
                 tokio::time::sleep(std::time::Duration::from_secs(secs_until)).await;
             }
         }
-        // Aggregate AFTER the boot-time process-death reconciler finishes
-        // (hostile review 2026-07-10: a post-trigger RunCatchUp boot used
-        // to aggregate immediately — concurrently with / before the
-        // reconciler — so a just-synthesized death missed that run's
-        // tallies). The handle resolves in ≤ ~13 min worst case; the
-        // scheduled 15:45 path has usually long passed it.
-        let _ = reconcile_handle.await;
-        // Recompute "today" AFTER the sleep (the trigger fires same-day, but
-        // a forced run near midnight must stamp the actual run day) — unless
-        // the operator pinned a backfill date.
-        let run_ist = ist_offset.from_utc_datetime(&Utc::now().naive_utc());
-        let run_ist_secs = Utc::now()
-            .timestamp()
-            .saturating_add(i64::from(IST_UTC_OFFSET_SECONDS));
-        let run_secs_of_day = run_ist.time().num_seconds_from_midnight();
-        // APPROVED: epoch day number fits u64 trivially.
-        let today_day = run_ist_secs.max(0) as u64 / 86_400;
-        let (target_ist_day, trading_date_label) = date_override.unwrap_or_else(|| {
-            (
-                today_day,
-                run_ist.date_naive().format("%Y-%m-%d").to_string(),
-            )
-        });
+        // Await + CLASSIFY the boot-time reconciler on EVERY path — incl.
+        // the non-trading-day skip (round-2 hostile review 2026-07-10: the
+        // reconciler was a bare spawn whose panic was silently discarded /
+        // never awaited on the skip path — the SLO-03 silent-task-death
+        // class). Aggregation also runs AFTER it so a just-synthesized
+        // death never misses this run's tallies; the handle resolves in
+        // ≤ ~13 min worst case (the scheduled 15:45 path has long passed).
+        let boot_synthesized_deaths = match reconcile_handle.await {
+            Ok(n) => n,
+            Err(join_err) => {
+                if join_err.is_panic() {
+                    error!(
+                        code = tickvault_common::error_code::ErrorCode::
+                            Scoreboard01AggregationDegraded
+                            .code_str(),
+                        stage = "reconcile_panic",
+                        %join_err,
+                        "SCOREBOARD-01: the boot-time process-death reconciler \
+                         CRASHED — this boot's death episodes were NOT \
+                         synthesized (boot-reconciled rows are NOT \
+                         re-creatable by a later re-run)"
+                    );
+                }
+                0
+            }
+        };
+        if matches!(decision, ScoreboardStart::SkipNonTradingDay) {
+            return Ok(None);
+        }
+        // Target day: the IMMEDIATE paths (RunCatchUp / RunNow) stamp the
+        // DECISION day — the reconcile await above (≤ ~13 min) can cross
+        // IST midnight on a ~23:47+ recovery boot, and recomputing here
+        // would aggregate TOMORROW while the day that actually traded got
+        // no row (round-2 hostile review 2026-07-10). Only SleepThenRun (a
+        // same-day sleep to the trigger by construction) recomputes after
+        // the sleep.
+        let (today_day, today_label, run_secs_of_day) =
+            if matches!(decision, ScoreboardStart::SleepThenRun(_)) {
+                let run_ist = ist_offset.from_utc_datetime(&Utc::now().naive_utc());
+                let run_ist_secs = Utc::now()
+                    .timestamp()
+                    .saturating_add(i64::from(IST_UTC_OFFSET_SECONDS));
+                (
+                    // APPROVED: epoch day number fits u64 trivially.
+                    run_ist_secs.max(0) as u64 / 86_400,
+                    run_ist.date_naive().format("%Y-%m-%d").to_string(),
+                    run_ist.time().num_seconds_from_midnight(),
+                )
+            } else {
+                (
+                    boot_day,
+                    today_ist.format("%Y-%m-%d").to_string(),
+                    boot_secs_of_day,
+                )
+            };
+        let (target_ist_day, trading_date_label) =
+            date_override.unwrap_or((today_day, today_label));
         // A forced run BEFORE the trigger targeting TODAY covers only part
         // of the session — the row is stamped partial and the card says so
         // (hostile review 2026-07-10: never a mid-day row masquerading as
@@ -14754,6 +14868,11 @@ fn spawn_feed_scoreboard_tasks(
             target_ist_day,
             trading_date_label,
             forced_early_run,
+            // Same-day runs self-scrape the session's audit-drop counter and
+            // apply the restart-day partial floor; backfills skip both
+            // (round-2: the counter is CURRENT-session state).
+            target_ist_day == today_day,
+            boot_synthesized_deaths,
         )
         .await?;
         info!("PROOF: feed_scoreboard daily aggregation fired");
@@ -14789,10 +14908,24 @@ fn spawn_feed_scoreboard_tasks(
         match inner.await {
             Ok(Ok(Some(summary))) => {
                 if sb_telegram_enabled {
+                    // PR-2 NOTE (round-2 hostile review 2026-07-10): the
+                    // Groww disconnect instrumentation is structurally BLIND
+                    // to the dominant failure mode — the sidecar's internal
+                    // socket dying and reconnecting (the FEED-STALL-01
+                    // family) writes NO disconnect row until the PR-2 stall
+                    // detector ships; only feed-disable + bridge-death do.
+                    // Rendering the near-empty count as a MEASURED 0 next to
+                    // Dhan's fully-instrumented reset stream is an audit-
+                    // Rule-11 false-OK on the card — render the honest "?"
+                    // sentinel (mirror of stalls; the DB row keeps the
+                    // measured floor for the month sums, runbook-caveated).
+                    // PR-2 flips this back to the measured count.
+                    let mut groww_line = to_line("Groww", &summary.groww);
+                    groww_line.drops_market = -1;
                     sb_notifier.notify(NotificationEvent::DualFeedDailyScorecard {
                         trading_date_ist: summary.trading_date_ist.clone(),
                         dhan: to_line("Dhan", &summary.dhan),
-                        groww: to_line("Groww", &summary.groww),
+                        groww: groww_line,
                         session_minutes: summary.session_minutes,
                         partial_coverage: summary.partial_coverage,
                         degraded: summary.degraded,

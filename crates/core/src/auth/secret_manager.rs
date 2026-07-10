@@ -1341,11 +1341,43 @@ mod tests {
         let main_rs = std::fs::read_to_string("../app/src/main.rs")
             .or_else(|_| std::fs::read_to_string("crates/app/src/main.rs"))
             .expect("main.rs must be readable");
-        let spawn_needle = "spawn_feed_scoreboard_tasks(&config, &trading_calendar, &notifier)";
+        // Call sites (rustfmt wraps the arg list, so the needle is the call
+        // head), EXCLUDING the fn definition itself.
         let spawn_sites: Vec<usize> = main_rs
-            .match_indices(spawn_needle)
+            .match_indices("spawn_feed_scoreboard_tasks(")
             .map(|(i, _)| i)
+            .filter(|&i| !main_rs[..i].ends_with("fn "))
             .collect();
+        // Every call site must thread the PROCESS-START anchor (round-2
+        // HIGH fix 2026-07-10): the reconciler's boot_ts must be the
+        // process-start instant, never a Utc::now() stamped when the
+        // spawned task starts — on the fast arm that ran AFTER the feeds
+        // already connected, so every connect row classified PRE-boot and
+        // the fast arm synthesized nothing.
+        for &i in &spawn_sites {
+            let window = &main_rs[i..main_rs.len().min(i + 240)];
+            assert!(
+                window.contains("process_start_ist_nanos"),
+                "every spawn_feed_scoreboard_tasks call site must thread the \
+                 process-start anchor (round-2 hostile review 2026-07-10): {window}"
+            );
+        }
+        // The anchor must be captured BEFORE any WebSocket pool can be
+        // created on ANY boot path (source-order scan): a connect row
+        // stamped before the anchor would classify as PRE-boot.
+        let anchor = main_rs
+            .find("let process_start_ist_nanos")
+            .expect("main.rs must capture the process-start scoreboard anchor");
+        let first_pool = main_rs
+            .find("create_websocket_pool(")
+            .expect("main.rs must reference create_websocket_pool");
+        assert!(
+            anchor < first_pool,
+            "the process-start scoreboard anchor MUST be captured before every \
+             create_websocket_pool site (fast arm included) — otherwise this \
+             boot's own connect rows classify as PRE-boot and the process-death \
+             reconciler synthesizes nothing (round-2 hostile review 2026-07-10)."
+        );
         // The CODE form of the fast-arm return (the call's arg list opens on
         // the next line) — a prose mention in a comment carries `(...)` on
         // the same line and must NOT anchor the split.

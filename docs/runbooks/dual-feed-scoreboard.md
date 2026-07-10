@@ -38,28 +38,70 @@ Columns: `blame` (broker/ours/indeterminate — never blank), `blame_reason`
 (`ws_event_audit` / `stall_row` / `boot_reconciled`), `down_secs`,
 `market_hours`, `evidence` (≤200 chars, secret-redacted), `run_partial`.
 
+`down_secs` semantics per detector: `ws_event_audit` rows carry the REAL
+reconnect downtime from the audit row; `detector='boot_reconciled'`
+(process-death) rows record **0 = unknown** — the last-audit-row-to-
+reconnect gap is only an UPPER BOUND (audit rows are edge-triggered, so
+the prior row can be hours old) and lives in the `evidence` string, never
+in the column. NEVER sum `down_secs` across detectors as "total downtime".
+
+Headline-tally scope: the per-day `disconnects_*` / `reconnects` / blame /
+`restarts_detected` columns count MARKET-DATA channels only (`main_feed`,
+`groww_bridge`) — the Dhan order-update trading channel's episodes are
+persisted in `feed_episode_audit` with their `ws_type` for forensics but
+are EXCLUDED from the Dhan-vs-Groww comparison (a dead-token day once put
+39+ order-update drops on Dhan's card while its market feed was perfect).
+
 ## 2. Month-end cumulative verdict SQL
 
-Run via `mcp__tickvault-logs__questdb_sql` (or the QuestDB console):
+Run via `mcp__tickvault-logs__questdb_sql` (or the QuestDB console).
+
+**Sentinel rule (applies to EVERY LONG column):** a partial day persists
+the `-1` "source unavailable" sentinel into any column it could not
+measure — a naive `sum()` SUBTRACTS 1 per sentinel day and silently
+corrupts the month totals (it under-reports drops on exactly the feed
+that had the outage day). Every summed column therefore carries a
+per-column guard, plus a `*_days` measured-day count so a low total from
+few measured days is never misread as a good month:
 
 ```sql
-SELECT feed, count() days, sum(unique_win_minutes) unique_mins, sum(ticks_captured) ticks,
-       avg(lag_p50_ms) p50_ms, avg(lag_p99_ms) p99_ms, max(lag_max_ms) worst_ms,
-       sum(disconnects_market) drops, sum(blame_broker) broker, sum(blame_ours) ours,
-       sum(blame_indeterminate) unclear, sum(stalls) stalls, avg(uptime_pct) uptime,
+SELECT feed, count() days,
+       sum(case when unique_win_minutes >= 0 then unique_win_minutes else 0 end) unique_mins,
+       sum(case when unique_win_minutes >= 0 then 1 else 0 end) unique_mins_days,
+       sum(case when ticks_captured >= 0 then ticks_captured else 0 end) ticks,
+       sum(case when ticks_captured >= 0 then 1 else 0 end) ticks_days,
+       max(lag_max_ms) worst_ms,
+       sum(case when disconnects_market >= 0 then disconnects_market else 0 end) drops,
+       sum(case when disconnects_market >= 0 then 1 else 0 end) drops_days,
+       sum(case when blame_broker >= 0 then blame_broker else 0 end) broker,
+       sum(case when blame_ours >= 0 then blame_ours else 0 end) ours,
+       sum(case when blame_indeterminate >= 0 then blame_indeterminate else 0 end) unclear,
+       sum(case when stalls >= 0 then stalls else 0 end) stalls,
+       avg(uptime_pct) uptime,
        sum(case when partial_coverage then 1 else 0 end) partial_days
 FROM feed_scoreboard_daily
 WHERE trading_date_ist >= '2026-07-01' AND trading_date_ist < '2026-08-01' GROUP BY feed;
 ```
 
-Caveat: while lag columns are `-1` sentinels (pre-PR-3 days), `avg(lag_*)`
-is polluted by the sentinels — exclude them:
+Caveats:
+- `avg(lag_*)` is polluted by the `-1` sentinels (pre-PR-3 days) —
+  compute lag averages ONLY with a `WHERE lag_p99_ms >= 0` variant:
 
 ```sql
 SELECT feed, avg(lag_p99_ms) p99_ms FROM feed_scoreboard_daily
 WHERE lag_p99_ms >= 0 AND trading_date_ist >= '2026-07-01'
   AND trading_date_ist < '2026-08-01' GROUP BY feed;
 ```
+
+- **Groww drop/blame sums are a FLOOR for every pre-stall-upgrade (PR-2)
+  day:** Groww disconnect rows exist only for feed-disable and
+  bridge-death — the dominant sidecar socket-drop family writes no
+  episode row until the stall detector ships, so `drops`/`broker` for
+  Groww under-count those days and the daily card deliberately renders
+  Groww drops as "?" meanwhile. Do NOT read "Dhan N vs Groww 0 drops" as
+  a Groww win for that period.
+- `avg(uptime_pct)` includes partial days (their 0.0-with-partial-flag
+  rows) — cross-check `partial_days` before quoting it.
 
 Per-day winner drill (tiebreak = lag_p99 where measured):
 
@@ -120,14 +162,20 @@ FROM feed_scoreboard_daily WHERE outcome != 'complete' ORDER BY trading_date_ist
 
 - **Re-run today:** restart with `TICKVAULT_SCOREBOARD_NOW=1`. Idempotent —
   the daily row carries the deterministic 15:45 IST ts and the episode rows
-  reuse their audit-row ts, so everything UPSERTs in place.
+  reuse their audit-row ts, so everything UPSERTs in place. UNSET the
+  variable afterwards: left set in a service unit, every 08:31 boot turns
+  into an early partial run that consumes the day's single scheduled run.
 - **Backfill a PAST day:** restart with `TICKVAULT_SCOREBOARD_NOW=1
   TICKVAULT_SCOREBOARD_DATE=YYYY-MM-DD` (both required — the date is only
-  honored alongside the forced-run flag). Disconnect episodes + blame +
-  per-feed coverage totals + exclusive/both minutes rebuild from the
-  retained `ws_event_audit` + `ticks` tables; the run is DEDUP-idempotent.
-  A malformed date REFUSES the run loudly (strict `YYYY-MM-DD`, fail-closed)
-  — you get the "scorecard did NOT run" page, never the wrong day's row.
+  honored alongside the forced-run flag; unset both afterwards). Disconnect
+  episodes + blame + per-feed coverage totals + exclusive/both minutes
+  rebuild from the retained `ws_event_audit` + `ticks` tables; the run is
+  DEDUP-idempotent. A malformed date REFUSES the run loudly (strict
+  `YYYY-MM-DD`, fail-closed), and so do a NON-TRADING or FUTURE target date
+  (they would fabricate an all-zero "complete" day) — you get the
+  "scorecard did NOT run" page, never the wrong day's row. A backfill run
+  skips the same-session audit-drop cross-check (that counter belongs to
+  TODAY's session, not the target day).
 - **Forced run BEFORE 3:45 PM:** allowed (dry-run), but the row is stamped
   `partial_coverage=true` / `outcome=partial` and the Telegram says
   "produced early on operator request" — a mid-day card never masquerades
@@ -148,15 +196,31 @@ FROM feed_scoreboard_daily WHERE outcome != 'complete' ORDER BY trading_date_ist
   - A process death whose boot's connect row NEVER landed inside the
     reconcile poll window (below) — the coverage hole still shows in
     `streaming_minutes`, but the episode row is absent.
+  - **Boot-reconciled process-death rows in general:** only the BOOT that
+    detected the death can synthesize them (the pairing needs the last
+    pre-boot "up" row against THIS boot's first connect). If that boot's
+    write never landed — QuestDB down through all 3 flush retries, or the
+    reconciler crashed — the rows are gone for good; a
+    `TICKVAULT_SCOREBOARD_NOW` re-run re-aggregates the day but can NOT
+    re-create them, and the month restart count under-counts (the
+    SCOREBOARD-01 `reconcile_flush` / `reconcile_panic` error lines are the
+    evidence trail).
 - **Process deaths** are reconciled once per boot on BOTH boot paths
-  (normal start AND the fast crash-recovery restart): the first query fires
-  ≈3 min after start, then POLLS every 60s (up to ~12 min total) until this
-  boot's own connect row is visible — covering a restart that waits out the
-  5-minute rate-limit cooldown before reconnecting. A death is synthesized
-  when the connection was up IN SESSION when the previous process died (the
-  gate keys on the DEATH window, so an in-session crash restarted after
-  close still counts) — the 16:30 auto-stop → 08:30 start cycle never
-  counts as a death (the prior day's rows are day-scoped out).
+  (normal start AND the fast crash-recovery restart; the boot anchor is
+  the PROCESS-START instant, so connections made early in the fast boot
+  still count as this boot's own): the first query fires ≈3 min after
+  start, then POLLS every 60s (up to ~12 min total) PER KEY until every
+  connection that was up before the boot shows its own post-boot
+  connect/reconnect — covering a restart that waits out the 5-minute
+  rate-limit cooldown before reconnecting even while the other feed
+  reconnects in seconds. A death is synthesized when the DEATH WINDOW —
+  from the last pre-boot "up" record to this boot's reconnect — overlaps
+  the session (so the normal day's pre-market ~08:34 connect followed by
+  an 11:00 crash counts, an in-session crash restarted after close counts,
+  and a purely pre-market crash does not) — the 16:30 auto-stop → 08:30
+  start cycle never counts as a death (the prior day's rows are day-scoped
+  out). Failed episode flushes retry 3× at 60s spacing before giving up
+  loudly.
 
 ## 5. Day-1 notes (PR-A scope)
 

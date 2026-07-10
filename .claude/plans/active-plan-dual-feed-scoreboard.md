@@ -274,6 +274,59 @@ forensic tables:
   - Files: crates/app/src/feed_scoreboard_boot.rs, crates/app/src/main.rs, crates/common/src/feed_blame.rs, crates/core/src/notification/events.rs, crates/core/src/auth/secret_manager.rs, crates/storage/src/feed_scoreboard_persistence.rs, crates/storage/src/feed_episode_audit_persistence.rs, .claude/triage/error-rules.yaml, docs/runbooks/dual-feed-scoreboard.md
   - Tests: test_build_ws_events_day_sql_micros_window, test_build_scoreboard_ticks_count_sql_micros_window, test_feed_scoreboard_task_is_wired_into_main, test_parse_scoreboard_date_override_strict_fail_closed, test_fold_episode_into_tally_matches_sql_aggregate_rule, test_merge_episode_tallies_sums_boot_reconciled_rows_in, test_synthesize_process_death_gates_on_death_window_not_boot_instant, test_classify_groww_bridge_died_is_ours, test_dual_feed_scorecard_body_sentinels_and_footnotes, every_error_code_variant_has_a_triage_rule
 
+- [x] Item 9 — Hostile-review round 2 fixes (2026-07-10)
+  - CRITICAL: process-death gate is now DEATH-WINDOW OVERLAP —
+    [prior_ts, connect_ts] ∩ [09:00, 15:30) IST — so the normal-day
+    topology (pre-market ~08:34 connect + mid-market crash) synthesizes;
+    purely pre-market windows and the day-scoped overnight stop/start
+    cycle stay excluded (tests for all three topologies).
+  - HIGH: the reconciler's boot anchor is the PROCESS-START instant
+    captured as the first statement of main() and threaded into
+    spawn_feed_scoreboard_tasks (both boot paths) — never a Utc::now()
+    stamped when the spawned task starts (the fast arm connects the feeds
+    first); ratchet pins the anchor precedes every create_websocket_pool
+    site + the threading at both call sites.
+  - HIGH: headline tallies (drops / reconnects / blame / restarts) are
+    MARKET-DATA ws_types only (main_feed, groww_bridge) — order-update
+    episodes persist for forensics but never pollute the Dhan-vs-Groww
+    comparison; ws_type rides in both episode read-back SQLs.
+  - HIGH: Groww drops render the "?" sentinel + a blind-spot footnote on
+    the card until PR-2 (the sidecar's internal socket drops write no
+    episode row); runbook §2 caveats pre-PR-2 Groww drop/blame sums as a
+    floor.
+  - MEDIUM: reconciler poll gate is PER-KEY (every pre-boot-up key needs
+    its own post-boot up row) and pairing accepts reconnected /
+    sleep_resumed as up anchors (the 429-reject first-success case).
+  - MEDIUM: TICKVAULT_SCOREBOARD_DATE targets are validated against the
+    TradingCalendar + not-in-the-future — a non-trading/future date
+    refuses the run (Aborted page) instead of writing fabricated all-zero
+    'complete' rows.
+  - MEDIUM: runbook §2 month-verdict SQL guards every LONG column against
+    the −1 sentinels (+ per-column measured-day counts).
+  - MEDIUM: boot-reconciled rows persist down_secs=0 (unknown); the
+    edge-triggered prior-row gap is documented as an UPPER BOUND in the
+    evidence string only (never summed as downtime).
+  - MEDIUM: the AUDIT-WS-01 self-scrape is same-day-only (backfills skip
+    it) and a same-day run with ≥1 boot-synthesized process death stamps
+    the row at least partial (pre-crash drop state is unknowable).
+  - MEDIUM: the reconciler is awaited + panic-classified on EVERY Task-2
+    path (incl. the non-trading-day skip); its episode flush retries 3×60s
+    (boot-reconciled rows are NOT re-creatable by a re-run — triage rule +
+    rule file + runbook wording corrected).
+  - LOW (swept): RunCatchUp/RunNow stamp the DECISION day (a ~23:47
+    recovery boot no longer aggregates tomorrow after the reconcile
+    await); unknown episode kinds vote in NO tally column; the
+    errors.jsonl scan filters to the 7 correlation codes at parse time and
+    skips the bare errors.jsonl symlink; trigger_secs_of_day_ist is
+    validated at spawn ([session close, 23:59:59] IST, out-of-range falls
+    back to 15:45 + SCOREBOARD-01); runbook documents the persistent-env
+    footgun.
+  - Deliberately NOT fixed here (origin/main files, 0-line diff on this
+    branch): the cross_verify_1m + tick_conservation nanos-vs-micros SQL
+    bugs — verified REAL, handed off for a separate main fix PR.
+  - Files: crates/app/src/feed_scoreboard_boot.rs, crates/app/src/main.rs, crates/core/src/notification/events.rs, crates/core/src/auth/secret_manager.rs, .claude/triage/error-rules.yaml, .claude/rules/project/dual-feed-scoreboard-error-codes.md, docs/runbooks/dual-feed-scoreboard.md
+  - Tests: test_synthesize_process_death_premarket_prior_midmarket_crash, test_synthesize_process_death_overnight_stop_start_cycle_excluded, test_synthesize_process_death_pairs_on_reconnected_and_gate_is_per_key, test_is_up_kind, test_is_market_data_ws_type_allowlist, test_fold_market_data_episode_skips_order_update, test_fold_episode_into_tally_unknown_kind_counts_nothing, test_validate_scoreboard_backfill_date, test_sanitize_scoreboard_trigger_bounds, test_scan_errors_jsonl_filters_codes_and_skips_bare_symlink_name, test_aggregate_episode_rows_tallies_per_feed, test_dual_feed_scorecard_groww_drops_sentinel_footnote, test_feed_scoreboard_task_is_wired_into_main
+
 ## Scenarios
 
 | # | Scenario | Expected |

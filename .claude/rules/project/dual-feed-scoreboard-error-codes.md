@@ -35,8 +35,14 @@ typed record of every degraded leg of that aggregation.
 ## §1. SCOREBOARD-01 — daily scoreboard aggregation degraded
 
 **Severity:** Medium. **Auto-triage safe:** Yes (the degrade already
-happened; the tables are DEDUP-idempotent, so a re-run backfills the day —
-the operator inspects at leisure).
+happened; the tables are DEDUP-idempotent, so a re-run backfills the DAILY
+AGGREGATION — the operator inspects at leisure). EXCEPTION (round-2 hostile
+review 2026-07-10): `detector='boot_reconciled'` process-death rows are NOT
+re-creatable by any re-run — only the boot that detected the death can pair
+prior-up → first-connect. Their flush therefore retries in place (3 × 60s);
+if `stage="reconcile_flush"` exhausted every attempt (or
+`stage="reconcile_panic"` fired), those episodes are permanently lost and
+the month restart count under-counts — annotate the month summary.
 
 **Trigger:** one of the scoreboard legs failed
 (`ErrorCode::Scoreboard01AggregationDegraded`):
@@ -66,7 +72,8 @@ the operator inspects at leisure).
    deterministic 15:45 IST `ts`, so the day's rows UPSERT in place). What a
    backfill CANNOT recover is in `docs/runbooks/dual-feed-scoreboard.md`
    (same-day errors.jsonl correlation ages out after 48h → 805 episodes
-   default broker, RSTs default indeterminate).
+   default broker, RSTs default indeterminate; boot-reconciled
+   process-death rows are boot-only — see the §1 exception above).
 4. `outcome='degraded'` days (audit under-count): treat the day's episode
    counts as a floor, not a truth — the runbook's month-end checklist
    excludes/annotates them.
