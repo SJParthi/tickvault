@@ -132,10 +132,14 @@ accumulation.
 
 **The fix (two halves, same PR):**
 
-1. **The pile was archived.** 106 of 107 plans (work merged/complete) moved to
+1. **The pile was archived.** 105 of 107 plans (work merged/complete) moved to
    `.claude/plans/archive/YYYY-MM-DD-<slug>.md`, dated from each plan's own
-   `**Date:**` field. Kept active: `active-plan-greeks-trading-core.md` only
-   (Status DRAFT, docs-only, explicitly awaiting operator approval).
+   `**Date:**` field. Kept active: `active-plan-greeks-trading-core.md`
+   (Status DRAFT, docs-only, explicitly awaiting operator approval) and —
+   mid-flight adjustment — `active-plan-futidx-4.md`, which concurrent PR
+   #1465 modified while this PR was in flight (left active at main's content
+   for its own session to archive; archiving it here would have re-created
+   the modify/delete merge conflict).
 2. **V7 cap in `plan-gate.sh`:** when more than `PLAN_GATE_MAX_ACTIVE`
    (default **5**) active-plan files exist, the gate BLOCKS every
    implementation push with a loud message naming the count and the archive
