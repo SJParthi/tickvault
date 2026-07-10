@@ -187,7 +187,9 @@ pub fn snapshot_path_for(date: &str) -> Option<PathBuf> {
 #[must_use]
 pub fn to_universe(snapshot: &PlanSnapshot) -> Option<DailyUniverse> {
     use crate::instrument::index_extractor::canonicalize_index_symbol;
-    use crate::instrument::index_futures::INDEX_FUTURES_UNDERLYINGS;
+    use crate::instrument::index_futures::{
+        INDEX_FUTURES_UNDERLYINGS, MAX_INDEX_FUTURE_TARGETS, MAX_MONTHLY_EXPIRIES_PER_UNDERLYING,
+    };
 
     let mut subscription_targets: Vec<SubscriptionTarget> =
         Vec::with_capacity(snapshot.targets.len());
@@ -199,9 +201,26 @@ pub fn to_universe(snapshot: &PlanSnapshot) -> Option<DailyUniverse> {
     // one contract per (underlying, monthly expiry), so distinct expiries
     // per canonical are LEGAL; a SECOND DISTINCT SID for the SAME
     // (canonical, expiry) is corruption (mirrors AmbiguousDuplicateExpiry).
+    // AM-r1 F1 (2026-07-10): the corruption key is the PARSED NaiveDate,
+    // never the raw string — chrono `%Y-%m-%d` accepts non-zero-padded
+    // components ("2026-7-30"), so a raw-string key let two string-distinct
+    // spellings of the SAME month carry two DISTINCT SIDs past the gate
+    // (both subscribed; downstream parity parses both to one date and the
+    // BTreeSet dedups them, so FUTIDX-02 never fires). Mirrors the cold
+    // selector, which matches candidates by parsed date.
+    // AM-r1 F2 (2026-07-10): the warm path mirrors the cold-build
+    // MonthlySerialFlood envelope — more than
+    // MAX_MONTHLY_EXPIRIES_PER_UNDERLYING distinct future months for one
+    // canonical, or more than MAX_INDEX_FUTURE_TARGETS futures total,
+    // rejects the snapshot (None → cold rebuild). Pre-§36.7 the warm path
+    // was implicitly bounded to 1 future/underlying; without this arm a
+    // corrupt/hand-edited v3 snapshot could warm-boot-subscribe unbounded
+    // fabricated far months with only a DepthOnly (no-page) parity signal.
     let mut seen_future_keys: Vec<(String, String)> = Vec::new();
-    let mut seen_future_canonical_expiries: std::collections::HashSet<(String, String)> =
+    let mut seen_future_canonical_expiries: std::collections::HashSet<(String, chrono::NaiveDate)> =
         std::collections::HashSet::new();
+    let mut future_months_per_canonical: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
     for t in &snapshot.targets {
         let role = parse_role(&t.role)?;
         let mut csv_row = CsvRow {
@@ -242,9 +261,11 @@ pub fn to_universe(snapshot: &PlanSnapshot) -> Option<DailyUniverse> {
             // expiry MUST parse (`%Y-%m-%d`) and the underlying MUST
             // canonicalize to a §36 entry — the SAME two gates the parity
             // derivation applies — else the whole snapshot fails closed.
-            if chrono::NaiveDate::parse_from_str(csv_row.expiry_date.trim(), "%Y-%m-%d").is_err() {
+            let Ok(expiry_parsed) =
+                chrono::NaiveDate::parse_from_str(csv_row.expiry_date.trim(), "%Y-%m-%d")
+            else {
                 return None;
-            }
+            };
             let canonical = canonicalize_index_symbol(&csv_row.underlying_symbol);
             if !INDEX_FUTURES_UNDERLYINGS
                 .iter()
@@ -260,8 +281,16 @@ pub fn to_universe(snapshot: &PlanSnapshot) -> Option<DailyUniverse> {
             if seen_future_keys.contains(&key) {
                 continue;
             }
-            let expiry_trimmed = csv_row.expiry_date.trim().to_string();
-            if !seen_future_canonical_expiries.insert((canonical, expiry_trimmed)) {
+            if !seen_future_canonical_expiries.insert((canonical.clone(), expiry_parsed)) {
+                return None;
+            }
+            // AM-r1 F2: warm-path serial-flood envelope (see the state
+            // comment above) — per-canonical months bound + total bound.
+            let months = future_months_per_canonical.entry(canonical).or_insert(0);
+            *months += 1;
+            if *months > MAX_MONTHLY_EXPIRIES_PER_UNDERLYING
+                || seen_future_canonical_expiries.len() > MAX_INDEX_FUTURE_TARGETS
+            {
                 return None;
             }
             seen_future_keys.push(key);
@@ -402,18 +431,20 @@ pub fn load_plan_snapshot_for_today(trading_date_ist: &str) -> Option<DailyUnive
         );
         return None;
     }
-    // §36 (2026-07-08) format gate: a snapshot written by pre-§36 code
-    // (format 0) parses fine but silently LACKS the index-future targets —
-    // rejecting it forces exactly ONE deterministic cold build on deploy
-    // day, after which a format-2 snapshot is written. Keyed on FORMAT,
-    // never on futures count (a degraded zero-futures format-2 day is
-    // accepted — no rebuild loop).
+    // §36 (2026-07-08) / §36.7 (2026-07-10) format gate: a snapshot written
+    // by older code (format 0 = pre-§36 with no index-future targets;
+    // format 2 = §36-era nearest-only) parses fine but lacks/mis-shapes the
+    // index-future targets — rejecting anything below CURRENT forces
+    // exactly ONE deterministic cold build on deploy day, after which a
+    // current-format snapshot is written. Keyed on FORMAT, never on futures
+    // count (a degraded zero-futures current-format day is accepted — no
+    // rebuild loop).
     if snapshot.format < PLAN_SNAPSHOT_FORMAT_CURRENT {
         warn!(
             format = snapshot.format,
             required = PLAN_SNAPSHOT_FORMAT_CURRENT,
             date = trading_date_ist,
-            "plan snapshot format too old (pre-§36) — one-time cold build"
+            "plan snapshot format below current — one-time cold build"
         );
         return None;
     }
@@ -1188,6 +1219,134 @@ mod tests {
         assert_eq!(expiries, vec!["2026-07-30", "2026-08-27"]);
     }
 
+    /// Snapshot-fixture future entry builder with an explicit underlying
+    /// (AM-r1 F2 envelope tests need all four §36 canonicals).
+    fn fut_target_for(underlying: &str, segment: &str, sid: &str, expiry: &str) -> SnapshotTarget {
+        SnapshotTarget {
+            role: "index_future".to_string(),
+            security_id: sid.to_string(),
+            symbol_name: format!("{underlying}-{expiry}-FUT"),
+            is_fno_underlying: false,
+            is_index_constituent: false,
+            segment: Some(segment.to_string()),
+            expiry_date: Some(expiry.to_string()),
+            underlying_symbol: Some(underlying.to_string()),
+        }
+    }
+
+    /// AM-r1 F1 (2026-07-10): the fail-closed corruption gate keys on the
+    /// PARSED date — chrono `%Y-%m-%d` accepts non-zero-padded components,
+    /// so "2026-07-30" and "2026-7-30" are the SAME month. Two DISTINCT
+    /// SIDs across the two spellings previously bypassed the raw-string
+    /// key and BOTH subscribed silently (parity dedups the parsed dates,
+    /// so FUTIDX-02 never fires). Must fail closed exactly like the
+    /// identical-spelling case.
+    #[test]
+    fn test_snapshot_index_future_same_month_different_spelling_fail_closed() {
+        let snap = PlanSnapshot {
+            trading_date_ist: "2026-07-10".to_string(),
+            format: PLAN_SNAPSHOT_FORMAT_CURRENT,
+            targets: vec![
+                fut_target("35001", "2026-07-30"),
+                fut_target("35099", "2026-7-30"),
+            ],
+        };
+        assert!(
+            to_universe(&snap).is_none(),
+            "two DISTINCT SIDs for one parsed (underlying, expiry) month must fail closed \
+             regardless of string spelling"
+        );
+    }
+
+    /// AM-r1 F2 (2026-07-10): the warm path mirrors the cold-build
+    /// MonthlySerialFlood envelope — 7 distinct future months for one
+    /// canonical rejects the snapshot (None → cold rebuild). Pre-fix the
+    /// warm path accepted unbounded fabricated serials per underlying.
+    #[test]
+    fn test_snapshot_index_future_monthly_serial_flood_rejected() {
+        let months = [
+            "2026-07-30",
+            "2026-08-27",
+            "2026-09-24",
+            "2026-10-29",
+            "2026-11-26",
+            "2026-12-31",
+            "2027-01-28",
+        ];
+        let targets: Vec<SnapshotTarget> = months
+            .iter()
+            .enumerate()
+            .map(|(i, m)| fut_target(&format!("35{i:03}"), m))
+            .collect();
+        let snap = PlanSnapshot {
+            trading_date_ist: "2026-07-10".to_string(),
+            format: PLAN_SNAPSHOT_FORMAT_CURRENT,
+            targets,
+        };
+        assert!(
+            to_universe(&snap).is_none(),
+            ">MAX_MONTHLY_EXPIRIES_PER_UNDERLYING distinct months for one canonical is a \
+             corrupt snapshot — warm path must fail closed to the cold build"
+        );
+    }
+
+    /// AM-r1 F2 (2026-07-10): the total-futures envelope — >
+    /// MAX_INDEX_FUTURE_TARGETS futures rejects the snapshot. With the
+    /// per-canonical cap this arm is defense-in-depth (4 × 6 = 24 is the
+    /// reachable maximum), so the 25-future fixture necessarily also
+    /// carries one flooded canonical; the observable contract is None.
+    /// The 24-future companion below pins that the FULL legal envelope
+    /// still warm-boots.
+    #[test]
+    fn test_snapshot_index_future_total_cap_rejected_and_full_envelope_accepted() {
+        use crate::instrument::index_futures::{
+            INDEX_FUTURES_UNDERLYINGS, MAX_INDEX_FUTURE_TARGETS,
+            MAX_MONTHLY_EXPIRIES_PER_UNDERLYING,
+        };
+        let months = [
+            "2026-07-30",
+            "2026-08-27",
+            "2026-09-24",
+            "2026-10-29",
+            "2026-11-26",
+            "2026-12-31",
+        ];
+        assert_eq!(months.len(), MAX_MONTHLY_EXPIRIES_PER_UNDERLYING);
+        let mut targets: Vec<SnapshotTarget> = Vec::new();
+        let mut sid = 35000u32;
+        for u in INDEX_FUTURES_UNDERLYINGS {
+            for m in months {
+                sid += 1;
+                targets.push(fut_target_for(
+                    u.canonical,
+                    u.dhan_segment,
+                    &sid.to_string(),
+                    m,
+                ));
+            }
+        }
+        assert_eq!(targets.len(), MAX_INDEX_FUTURE_TARGETS);
+        // Full legal envelope (24 = 6 months × 4 underlyings) is ACCEPTED.
+        let snap_full = PlanSnapshot {
+            trading_date_ist: "2026-07-10".to_string(),
+            format: PLAN_SNAPSHOT_FORMAT_CURRENT,
+            targets: targets.clone(),
+        };
+        let uni = to_universe(&snap_full).expect("MAX_INDEX_FUTURE_TARGETS futures are legal");
+        assert_eq!(uni.subscription_targets.len(), MAX_INDEX_FUTURE_TARGETS);
+        // A 25th future (necessarily flooding one canonical) → fail closed.
+        targets.push(fut_target("39999", "2027-01-28"));
+        let snap_over = PlanSnapshot {
+            trading_date_ist: "2026-07-10".to_string(),
+            format: PLAN_SNAPSHOT_FORMAT_CURRENT,
+            targets,
+        };
+        assert!(
+            to_universe(&snap_over).is_none(),
+            ">MAX_INDEX_FUTURE_TARGETS futures total is a corrupt snapshot — fail closed"
+        );
+    }
+
     /// §36.7 (2026-07-10): a format-2 (nearest-only era) snapshot is
     /// REJECTED at the load gate → one deterministic cold build on deploy
     /// day — a stale single-future snapshot never warm-boots an all-months
@@ -1251,17 +1410,22 @@ mod tests {
     }
 
     #[test]
-    fn test_snapshot_format_v2_zero_futures_accepted_no_rebuild_loop() {
-        // The gate is keyed on FORMAT, never futures COUNT: a legitimately
-        // degraded zero-futures day writes a format-2 snapshot that warm
-        // boots ACCEPT — no cold-rebuild loop.
+    fn test_snapshot_current_format_zero_futures_accepted_no_rebuild_loop() {
+        // AM-r1 F4 rename (2026-07-10; was ..._format_v2_... — stale after
+        // the v3 bump). The gate is keyed on FORMAT, never futures COUNT: a
+        // legitimately degraded zero-futures day writes a CURRENT-format
+        // (v3) snapshot that warm boots ACCEPT — no cold-rebuild loop
+        // (contrast test_snapshot_format_2_rejected_after_v3_bump).
         let date = "2099-07-12";
         let path = snapshot_path_for(date).expect("valid date");
         let _ = std::fs::remove_file(&path);
         // large_sample_universe() has ZERO index futures.
         write_plan_snapshot(&large_sample_universe(), date).expect("write ok");
         let loaded = load_plan_snapshot_for_today(date);
-        assert!(loaded.is_some(), "format-2 zero-futures snapshot accepted");
+        assert!(
+            loaded.is_some(),
+            "current-format zero-futures snapshot accepted"
+        );
         let _ = std::fs::remove_file(&path);
     }
 

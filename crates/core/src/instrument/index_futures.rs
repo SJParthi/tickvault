@@ -73,7 +73,7 @@ pub struct IndexFutureUnderlying {
 
 /// §36: the ONLY four authorized index-futures underlyings. Adding a 5th
 /// requires a fresh dated operator quote + rule-file edit FIRST (ratcheted by
-/// `daily_universe_scope_guard.rs::futidx_scope_pinned_to_4_underlyings_nearest_expiry`).
+/// `daily_universe_scope_guard.rs::futidx_scope_pinned_to_4_underlyings_all_monthly_expiries`).
 pub const INDEX_FUTURES_UNDERLYINGS: [IndexFutureUnderlying; 4] = [
     IndexFutureUnderlying {
         canonical: "NIFTY",
@@ -135,9 +135,11 @@ pub fn select_index_future_expiries(
         .collect()
 }
 
-/// Nearest = first of [`select_index_future_expiries`] — retained for the
-/// nearest-month identity (SLO freshness exclusion set + docs). Delegates so
-/// the `>= today` rule has exactly ONE implementation.
+/// Nearest = first of [`select_index_future_expiries`]. Production consumer:
+/// the §36.7 D7 far-month alarm-gate exclusion (`far_month_future_sids` in
+/// `crates/app/src/main.rs`) identifies each underlying's nearest month
+/// through THIS fn (AM-r1 F6, 2026-07-10 — wired, not just documented).
+/// Delegates so the `>= today` rule has exactly ONE implementation.
 #[must_use]
 pub fn select_index_future_expiry(
     expiry_dates_sorted_asc: &[NaiveDate],
