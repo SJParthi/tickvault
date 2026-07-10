@@ -5,8 +5,9 @@
 #   The CloudWatch-only migration (#O1/#O2/#O3) retired the
 #   Loki -> Alertmanager -> Telegram route with NO replacement, so an `error!`
 #   reached only the log sinks. On 2026-07-06 the 12:00 IST REST-CANARY-01
-#   probe failure produced ZERO pages. These 9 log metric filters + alarms
-#   (8 on 2026-07-06; +AGGREGATOR-DROP-01 on 2026-07-09) on
+#   probe failure produced ZERO pages. These 10 log metric filters + alarms
+#   (8 on 2026-07-06; +AGGREGATOR-DROP-01 on 2026-07-09; +WAL-SUSPEND-01 on
+#   2026-07-10) on
 #   the /tickvault/<env>/app log group (the errors.jsonl stream) restore the
 #   route: error! -> errors.jsonl -> CloudWatch Logs -> filter -> tv_errcode_*
 #   metric -> alarm (<=5 min) -> SNS tv-alerts -> Telegram webhook Lambda.
@@ -36,6 +37,11 @@
 # The 2026-07-09 audit confirmed the Severity::Critical sealed-candle-drop
 # code (the ONLY silent-data-loss path for sealed candles) paged nobody.
 # Companion counter-side pager: seal-drop-alarm.tf.
+#
+# 2026-07-10 UPDATE (W2 PR#6): +1 entry (WAL-SUSPEND-01) -> 10 filters +
+# 10 alarms (~+$0.10/mo). Audit follow-up row 10: a WAL-suspended QuestDB
+# table silently stopped applying ILP-ACKed writes with zero signal — the
+# new 60s wal_tables() probe pages it here.
 # =============================================================================
 
 locals {
@@ -194,6 +200,29 @@ locals {
       ok_recovery = false # 2026-07-09: discrete permanent data loss - the dropped sealed candles do not come back when the episode ages out (Rule-11 false-recovery; PROC-01 precedent)
       desc        = "AGGREGATOR-DROP-01: sealed candle(s) DROPPED after ring + spill + DLQ ALL failed (Severity Critical - the only silent-data-loss path for sealed candles; by definition the host is out of memory AND out of disk AND data/dlq/ is unwritable). NO recovered/OK page: the loss is permanent - the auto-OK ~15 min later only means the episode aged out. Triage: docker/host state, df -h /data, ls -la data/spill/ data/dlq/; if the host is healthy and dirs writable, restart the app. Counter-side pager: tv-<env>-seal-writer-dropped (seal-drop-alarm.tf). Runbook: .claude/rules/project/wave-6-error-codes.md"
     }
+    # WAL-SUSPEND-01 (added 2026-07-10, W2 PR#6 — audit follow-up row 10):
+    # a QuestDB table's WAL apply is SUSPENDED (post disk-full / apply
+    # error) — ILP keeps ACKing rows into the table's WAL while they
+    # silently stop becoming visible/applied. Emit site:
+    # crates/storage/src/wal_suspension_watcher.rs::emit_wal_delta —
+    # error!(code = ErrorCode::WalSuspend01TableSuspended.code_str(),
+    # table = ...) fires ONCE per (table, suspension episode) on the
+    # rising edge of the 60s wal_tables() probe (Rule-4 edge latch; a
+    # merely-DOWN QuestDB never fires it — BOOT-01/02 own that page).
+    # ok_recovery = false: once-per-episode emitter (the ws-reinject-01
+    # precedent) — the auto-OK ~15 min after the single datapoint ages
+    # out would be a Rule-11 false recovery while the table is still
+    # suspended; the real recovery signals are the falling-edge info!
+    # line + tv_questdb_wal_suspended_tables returning to 0.
+    "wal-suspend-01" = {
+      pattern     = "{ $.code = \"WAL-SUSPEND-01\" && $.level = \"ERROR\" }"
+      period      = 300
+      threshold   = 1
+      eval        = 3
+      dta         = 1
+      ok_recovery = false # 2026-07-10: once-per-episode emitter - the auto-OK ~15 min later only means the datapoint aged out while the table may still be suspended (Rule-11 false-recovery; ws-reinject-01 precedent)
+      desc        = "WAL-SUSPEND-01: a QuestDB table's WAL apply is SUSPENDED - ingestion keeps ACKing rows while they silently stop becoming visible/applied (silent data-visibility loss; typical cause = a disk-full episode or a WAL apply error). Operator action: read the table/error_tag/error_message fields in the errors-jsonl stream, fix the underlying cause (df -h /data, QuestDB logs), then run ALTER TABLE <table> RESUME WAL in the QuestDB console - NEVER auto-executed (resuming into a still-broken disk replays the failure). NO recovered/OK page: the code fires once per suspension episode; recovery signal = the falling-edge recovery log + tv_questdb_wal_suspended_tables returning to 0. Runbook: .claude/rules/project/wal-suspension-error-codes.md"
+    }
   }
 }
 
@@ -230,7 +259,7 @@ resource "aws_cloudwatch_metric_alarm" "error_code" {
   # deliberately NO dimensions (see filter comment)
   alarm_actions = local.app_alarm_actions
   # ok_recovery = false (rest-canary-01, ws-reinject-01, proc-01, dh-906,
-  # aggregator-drop-01 [2026-07-09] -
+  # aggregator-drop-01 [2026-07-09], wal-suspend-01 [2026-07-10] -
   # the one-shot/discrete emitters) suppresses the OK page: their auto-OK
   # ~15 min after the datapoint ages out would be a Rule-11 false
   # "recovered" message while the condition persists (see the locals

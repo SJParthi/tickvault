@@ -2966,6 +2966,22 @@ async fn main() -> Result<()> {
             std::path::PathBuf::from("data/spill"),
         );
 
+    // W2 PR#6 (WAL-SUSPEND-01, 2026-07-10, audit follow-up row 10):
+    // supervised per-table QuestDB WAL-suspension probe. Polls
+    // `wal_tables()` every 60s via the shared probe client; a table whose
+    // WAL apply is SUSPENDED (post disk-full / apply error) keeps ACKing
+    // ILP rows while they silently stop becoming visible — this probe is
+    // the ONLY signal (boot probe + questdb_health see reachability/
+    // connection, not per-table apply). Edge-latched error!(code =
+    // "WAL-SUSPEND-01") pages via the errcode filter chain; a merely-DOWN
+    // QuestDB never fires it (BOOT-01/02 own that). Always-on like its
+    // monitor siblings; supervised so a probe panic respawns instead of
+    // vanishing (mirrors DISK-WATCHER-01).
+    let _wal_suspension_watcher_supervisor =
+        tickvault_storage::wal_suspension_watcher::spawn_supervised_wal_suspension_watcher(
+            config.questdb.clone(),
+        );
+
     // BP-07 (PROC-01, 2026-07-01): supervised OOM-kill monitor. Reads the
     // cgroup-v2 `memory.events` `oom_kill` counter vs a boot baseline every
     // 60s and pages Critical (`error!(code = "PROC-01")` + `tv_oom_kills_total`)

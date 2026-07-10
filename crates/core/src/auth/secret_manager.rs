@@ -1319,6 +1319,32 @@ mod tests {
         );
     }
 
+    /// W2 PR#6 (WAL-SUSPEND-01, 2026-07-10, audit follow-up row 10):
+    /// `main.rs` MUST spawn the supervised per-table QuestDB WAL-suspension
+    /// probe from the process-global monitor block. Without this wire, a
+    /// WAL-suspended `ticks` / `candles_1m` table (post disk-full / apply
+    /// error) keeps ACKing ILP rows while they silently stop becoming
+    /// visible — with ZERO signal: the boot probe + questdb_health check
+    /// reachability/connection, never per-table WAL apply. The SUPERVISED
+    /// wrapper (mirrors DISK-WATCHER-01) also covers the gauge going stale
+    /// on a probe-task death: the respawned watcher re-sets
+    /// `tv_questdb_wal_suspended_tables` on its first successful probe.
+    #[test]
+    fn test_wal_suspension_watcher_is_wired_into_main() {
+        let main_rs = std::fs::read_to_string("../app/src/main.rs")
+            .or_else(|_| std::fs::read_to_string("crates/app/src/main.rs"))
+            .expect("main.rs must be readable");
+        assert!(
+            main_rs.contains("spawn_supervised_wal_suspension_watcher("),
+            "main.rs MUST call `wal_suspension_watcher::\
+             spawn_supervised_wal_suspension_watcher` from the process-global \
+             monitor block (W2 PR#6 / WAL-SUSPEND-01). Without it, a \
+             WAL-suspended QuestDB table silently stops applying writes with \
+             zero operator signal — the exact silent-data-visibility-loss \
+             class the 2026-07-09 audit flagged."
+        );
+    }
+
     /// SLO-03 (live incident 2026-07-03 10:35 IST): `main.rs` MUST spawn the
     /// SLO evaluator/publisher through the SUPERVISED wrapper, never as a bare
     /// `tokio::spawn`. The bare spawn died silently mid-market — last
