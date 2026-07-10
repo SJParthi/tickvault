@@ -100,7 +100,14 @@ pub mod http_client;
 // Groww — both DELETED in SP5). Both feeds write here. See live-feed-purity.md
 // rule 11 + docs/design/sp5-unified-parity-audit-design.md. The two old physical
 // QuestDB tables are RETAINED on disk (SEBI 5y) but no longer written.
+/// Dual-feed scoreboard (operator 2026-07-10): one classified row per feed
+/// EPISODE (disconnect / stall / process death) with the blame verdict
+/// persisted — the month-end "who caused it" system-of-record.
+pub mod feed_episode_audit_persistence;
 pub mod feed_parity_1m_audit_persistence;
+/// Dual-feed scoreboard (operator 2026-07-10): the per-day per-feed
+/// scoreboard row + the per-instrument coverage detail table.
+pub mod feed_scoreboard_persistence;
 /// Groww auto-scale ladder forensic chain (§34, auto-scale PR-2 Item 8) —
 /// one row per ladder transition; feeds restart rehydration.
 pub mod groww_scale_audit_persistence;

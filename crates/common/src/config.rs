@@ -75,6 +75,13 @@ pub struct ApplicationConfig {
     /// behaviour byte-identical.
     #[serde(default)]
     pub feeds: FeedsConfig,
+    /// `[scoreboard]` — dual-feed daily scoreboard (operator directive
+    /// 2026-07-10: run Dhan + Groww live for a month, everything tracked,
+    /// captured, blame-attributed). Aggregation-only in PR-A (reads
+    /// existing tables), so `enabled` defaults ON — safe-on; flipping it
+    /// off is the whole-subsystem rollback switch (B12).
+    #[serde(default)]
+    pub scoreboard: ScoreboardConfig,
 }
 
 /// `[feeds]` — pluggable market-data feed selection (operator lock
@@ -259,6 +266,64 @@ fn default_groww_scale_rollback_hold_base_minutes() -> u64 {
 }
 fn default_groww_scale_advance_window_ist() -> [String; 2] {
     [String::from("09:20"), String::from("14:30")]
+}
+
+/// `[scoreboard]` — dual-feed daily scoreboard (operator directive
+/// 2026-07-10). All fields serde-defaulted so a missing section is the
+/// sensible day-1 shape (zero manual setup). `enabled = true` is SAFE-ON:
+/// the PR-A subsystem only READS existing tables (`ws_event_audit`,
+/// `ticks`) plus its own additive forensic tables — it touches no hot
+/// path, no order path, no feed lifecycle. Flipping `enabled = false` is
+/// the whole-subsystem rollback (nothing spawns; B12 rollback test
+/// `scoreboard_flag_rollback` pins the default + the off shape).
+#[derive(Debug, Clone, Deserialize)]
+pub struct ScoreboardConfig {
+    /// Master switch for the whole subsystem (boot reconciler + 15:45 IST
+    /// daily aggregation + Telegram scorecard).
+    #[serde(default = "default_scoreboard_enabled")]
+    pub enabled: bool,
+    /// Send the daily Telegram scorecard (the aggregation + tables still
+    /// run when this is off — forensic record without the ping).
+    #[serde(default = "default_scoreboard_enabled")]
+    pub telegram_enabled: bool,
+    /// Populate the per-instrument `feed_coverage_daily` detail rows
+    /// (~1.5K/day). Consumed by PR-4 (presence registry); the table +
+    /// flag ship in PR-A so the config surface is stable.
+    #[serde(default = "default_scoreboard_enabled")]
+    pub coverage_detail_rows: bool,
+    /// Hot-path per-tick presence fold (PR-4). `false` ⇒ coverage via SQL
+    /// totals only; per-instrument unique-wins "unavailable".
+    #[serde(default = "default_scoreboard_enabled")]
+    pub presence_fold_enabled: bool,
+    /// Groww exchange→receipt lag histogram fold (PR-3). Until it ships,
+    /// lag columns carry the −1 "not measured" sentinel.
+    #[serde(default = "default_scoreboard_enabled")]
+    pub groww_lag_enabled: bool,
+    /// IST seconds-of-day for the daily aggregation trigger. Default
+    /// 56_700 = 15:45:00 IST (after the 15:31 cross-verify + the 15:40
+    /// tick-conservation audit).
+    #[serde(default = "default_scoreboard_trigger_secs")]
+    pub trigger_secs_of_day_ist: u32,
+}
+
+fn default_scoreboard_enabled() -> bool {
+    true
+}
+fn default_scoreboard_trigger_secs() -> u32 {
+    15 * 3600 + 45 * 60 // 56_700 = 15:45:00 IST
+}
+
+impl Default for ScoreboardConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_scoreboard_enabled(),
+            telegram_enabled: default_scoreboard_enabled(),
+            coverage_detail_rows: default_scoreboard_enabled(),
+            presence_fold_enabled: default_scoreboard_enabled(),
+            groww_lag_enabled: default_scoreboard_enabled(),
+            trigger_secs_of_day_ist: default_scoreboard_trigger_secs(),
+        }
+    }
 }
 
 impl Default for GrowwScaleConfig {
@@ -2093,6 +2158,7 @@ mod tests {
             engine: EngineConfig::default(),
             in_mem: InMemConfig::default(),
             feeds: FeedsConfig::default(),
+            scoreboard: ScoreboardConfig::default(),
         }
     }
 
@@ -3369,6 +3435,55 @@ mod tests {
             .extract()
             .expect("explicit groww_native_shadow must round-trip");
         assert!(wrapper_on.feeds.groww_native_shadow);
+    }
+
+    /// Dual-feed scoreboard PR-A (2026-07-10): the `[scoreboard]` section
+    /// defaults SAFE-ON (aggregation-only — reads existing tables, no hot
+    /// path), trigger at 15:45:00 IST, and a missing section must default,
+    /// never error.
+    #[test]
+    fn test_scoreboard_config_defaults_enabled_safe_on() {
+        let sb = ScoreboardConfig::default();
+        assert!(sb.enabled, "scoreboard must default ON (aggregation-only)");
+        assert!(sb.telegram_enabled);
+        assert!(sb.coverage_detail_rows);
+        assert!(sb.presence_fold_enabled);
+        assert!(sb.groww_lag_enabled);
+        assert_eq!(
+            sb.trigger_secs_of_day_ist, 56_700,
+            "trigger must default to 15:45:00 IST"
+        );
+    }
+
+    /// B12 rollback test (`scoreboard_flag_rollback`): flipping
+    /// `[scoreboard] enabled = false` must round-trip through TOML — the
+    /// tested off-switch path that disables the whole subsystem — and an
+    /// EMPTY `[scoreboard]` section must fill every field from defaults.
+    #[test]
+    fn scoreboard_flag_rollback() {
+        use figment::Figment;
+        use figment::providers::{Format, Toml};
+
+        #[derive(Deserialize)]
+        struct Wrapper {
+            #[serde(default)]
+            scoreboard: ScoreboardConfig,
+        }
+        // Rollback shape: enabled=false parses and turns the subsystem off.
+        let off: Wrapper = Figment::new()
+            .merge(Toml::string("[scoreboard]\nenabled = false\n"))
+            .extract()
+            .expect("scoreboard rollback TOML must parse");
+        assert!(!off.scoreboard.enabled, "rollback flag must stick");
+        // Partial section: unspecified keys fill from serde defaults.
+        assert!(off.scoreboard.telegram_enabled);
+        assert_eq!(off.scoreboard.trigger_secs_of_day_ist, 56_700);
+        // Missing section entirely → full defaults, never an error.
+        let missing: Wrapper = Figment::new()
+            .merge(Toml::string("[feeds]\ndhan_enabled = true\n"))
+            .extract()
+            .expect("missing [scoreboard] must default");
+        assert!(missing.scoreboard.enabled);
     }
 
     /// A missing `[feeds]` section must fall back to the safe default

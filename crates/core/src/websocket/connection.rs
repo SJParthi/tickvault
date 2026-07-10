@@ -647,9 +647,16 @@ impl WebSocketConnection {
             connection_id = self.connection_id,
             "PR-E: Dhan feed disabled at runtime — connection dormant until re-enabled"
         );
+        // Source slug `feed_disabled` (round-5 scoreboard fix 2026-07-10):
+        // the SAME durable marker the Groww bridge stamps on its disable
+        // falling edge — the feed-scoreboard's feed-off-day inference keys
+        // on it to distinguish "operator runtime-disabled the feed" from
+        // "enabled but the broker was dead" (the honest catastrophic day).
+        // Previously "n/a", indistinguishable from the post-close dormant
+        // sleep row.
         self.emit_ws_audit(
             tickvault_common::ws_event_types::WsEventKind::SleepEntered,
-            "n/a",
+            "feed_disabled",
             "feed disabled at runtime (operator toggle)",
             None,
             0,

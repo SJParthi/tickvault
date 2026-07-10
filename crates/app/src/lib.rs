@@ -33,6 +33,10 @@ pub mod orphan_position_watchdog_boot;
 // GET /v2/profile at 09:05 / 12:00 / 15:25 IST, pages HIGH with the captured
 // (bounded, secret-redacted) body + final URL on any non-2xx.
 pub mod rest_canary_boot;
+// Dual-feed scoreboard PR-A (operator 2026-07-10): boot-time process-death
+// reconciler + the 15:45 IST daily Dhan-vs-Groww aggregation + the Telegram
+// scorecard summary (SCOREBOARD-01 family).
+pub mod feed_scoreboard_boot;
 pub mod tick_conservation_boot;
 // PR #8a (2026-05-19) — Slice 1: 09:15:00 IST `DayOhlcTracker::arm_sid()`
 // boot wiring per `index-day-ohlc-tracker-error-codes.md`. Closes the

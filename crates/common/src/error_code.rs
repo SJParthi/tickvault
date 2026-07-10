@@ -893,6 +893,18 @@ pub enum ErrorCode {
     /// operator compares the two masters' FUT rows and records a dated note.
     /// Severity::High.
     Futidx02CrossFeedExpiryMismatch,
+    /// SCOREBOARD-01 (dual-feed scoreboard PR-A, 2026-07-10) — the daily
+    /// 15:45 IST Dhan-vs-Groww scoreboard aggregation was DEGRADED: a
+    /// QuestDB `/exec` read failed (sentinels recorded, never fabricated
+    /// zeros), the `feed_scoreboard_daily` / `feed_episode_audit` ILP write
+    /// was rejected, the boot-time process-death reconciliation could not
+    /// read/write, or the same-day `ws_event_audit` drop counter shows the
+    /// episode source under-counted. Best-effort forensic aggregate
+    /// (AUDIT-WS-01 / GROWW-MASTER-01 class) — the live feeds, tick capture
+    /// and trading are NEVER affected; DEDUP-idempotent re-runs
+    /// (`TICKVAULT_SCOREBOARD_NOW`) backfill the day. Severity::Medium,
+    /// auto-triage-safe.
+    Scoreboard01AggregationDegraded,
 }
 
 impl ErrorCode {
@@ -1074,6 +1086,8 @@ impl ErrorCode {
             Self::GrowwNative04WriterFailed => "GROWW-NATIVE-04",
             Self::Futidx01SelectionDegraded => "FUTIDX-01",
             Self::Futidx02CrossFeedExpiryMismatch => "FUTIDX-02",
+            // Dual-feed scoreboard PR-A (2026-07-10)
+            Self::Scoreboard01AggregationDegraded => "SCOREBOARD-01",
         }
     }
 
@@ -1297,7 +1311,11 @@ impl ErrorCode {
             | Self::GrowwNative01ConnectFailed
             | Self::GrowwNative02AuthFailed
             | Self::GrowwNative03DecodeFailed
-            | Self::GrowwNative04WriterFailed => Severity::Medium,
+            | Self::GrowwNative04WriterFailed
+            // SCOREBOARD-01 (2026-07-10): best-effort daily forensic
+            // aggregate degraded; feeds/capture/trading unaffected, the
+            // DEDUP-idempotent re-run backfills. Medium.
+            | Self::Scoreboard01AggregationDegraded => Severity::Medium,
             // Low: trading-day / Dhan other
             // PR #6a (2026-05-19): I-P1-01 (DailyScheduler) + I-P1-02 (DeltaFieldCoverage) retired
             Self::InstrumentP2TradingDayGuard
@@ -1528,6 +1546,10 @@ impl ErrorCode {
             Self::Futidx01SelectionDegraded | Self::Futidx02CrossFeedExpiryMismatch => {
                 ".claude/rules/project/futidx-4-error-codes.md"
             }
+            // Dual-feed scoreboard PR-A (2026-07-10)
+            Self::Scoreboard01AggregationDegraded => {
+                ".claude/rules/project/dual-feed-scoreboard-error-codes.md"
+            }
         }
     }
 
@@ -1728,6 +1750,8 @@ impl ErrorCode {
             Self::GrowwNative04WriterFailed,
             Self::Futidx01SelectionDegraded,
             Self::Futidx02CrossFeedExpiryMismatch,
+            // Dual-feed scoreboard PR-A (2026-07-10)
+            Self::Scoreboard01AggregationDegraded,
         ]
     }
 }
@@ -2064,7 +2088,11 @@ mod tests {
         // for WAL-SUSPEND-01 — per-table QuestDB WAL-apply suspension probe
         // (a suspended table keeps ACKing ILP rows while they silently stop
         // becoming visible; previously zero signal).
-        assert_eq!(ErrorCode::all().len(), 137);
+        // 2026-07-10 (dual-feed scoreboard PR-A): bumped 137 -> 138 for
+        // SCOREBOARD-01 — the daily 15:45 IST Dhan-vs-Groww scoreboard
+        // aggregation degraded (best-effort forensic aggregate; sentinels,
+        // never fabricated zeros; DEDUP-idempotent re-run backfills).
+        assert_eq!(ErrorCode::all().len(), 138);
     }
 
     #[test]
@@ -2279,7 +2307,9 @@ mod tests {
                 || s.starts_with("HTTP-CLIENT-")
                 // §36 (2026-07-08; §36.7 all-months 2026-07-10): FUTIDX
                 // index futures.
-                || s.starts_with("FUTIDX-");
+                || s.starts_with("FUTIDX-")
+                // Dual-feed scoreboard PR-A (2026-07-10).
+                || s.starts_with("SCOREBOARD-");
             assert!(has_known_prefix, "unexpected code prefix: {s}");
         }
     }
