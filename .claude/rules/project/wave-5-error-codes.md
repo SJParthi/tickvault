@@ -98,9 +98,9 @@ prev-close routing matrix from `live-market-feed.md`:
 |---|---|---|
 | IDX_I | Ticker | standalone code 6 packet |
 | NSE_EQ | Quote OR Full | bytes 38-41 (Quote) / 50-53 (Full) of the packet |
-| NSE_FNO — **STALE pre-§36 row, superseded 2026-07-08** (hostile-review r3: edited inline so no future runtime-assertion implementer honors it; the ONLY live NSE_FNO subscriptions are the §36 FUTIDX-4 Quote row below) | ~~Full~~ | historical: bytes 50-53 of the Full packet (the Full requirement served the deleted OI/depth consumers; ratchet retired `#[cfg(any())]`, PR #7b) |
-| BSE_FNO — **STALE pre-§36 row, superseded 2026-07-08** (same carve-out; the ONLY live BSE_FNO subscription is the §36 SENSEX future, Quote row below) | ~~Full~~ | historical: bytes 50-53 of the Full packet |
-| NSE_FNO/BSE_FNO §36 FUTIDX-4 (Quote) — 2026-07-08 — **the AUTHORITATIVE row for these segments** | Quote | bytes 38-41 (Ticket #5525125, `dhan_locked_facts.rs`; OI via separate code-5 packet, currently uncaptured) |
+| NSE_FNO — **STALE pre-§36 row, superseded 2026-07-08** (hostile-review r3: edited inline so no future runtime-assertion implementer honors it; the ONLY live NSE_FNO subscriptions are the §36 FUTIDX Quote rows below — all monthly serials since 2026-07-10) | ~~Full~~ | historical: bytes 50-53 of the Full packet (the Full requirement served the deleted OI/depth consumers; ratchet retired `#[cfg(any())]`, PR #7b) |
+| BSE_FNO — **STALE pre-§36 row, superseded 2026-07-08** (same carve-out; the ONLY live BSE_FNO subscriptions are the §36 SENSEX futures, Quote rows below — all monthly serials since 2026-07-10) | ~~Full~~ | historical: bytes 50-53 of the Full packet |
+| NSE_FNO/BSE_FNO §36 FUTIDX (Quote) — 2026-07-08; all monthly serials since 2026-07-10 (§36.7) — **the AUTHORITATIVE row for these segments** | Quote | bytes 38-41 (Ticket #5525125, `dhan_locked_facts.rs`; OI via separate code-5 packet, currently uncaptured) |
 
 If any subscribed instrument has a `(segment, feed_mode)` pair outside the
 allowed cell of this matrix, PREVCLOSE-03 fires Severity::Critical and the

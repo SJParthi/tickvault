@@ -79,12 +79,12 @@ This product, starting from the date of this lock, opens exactly TWO WebSocket c
 
 | WebSocket | Count | Endpoint | Allowed instruments | Mode |
 |---|---|---|---|---|
-| **Main feed** | **1** | `wss://api-feed.dhan.co?version=2&token=<JWT>&clientId=<ID>&authType=2` | Daily-fetched universe (~250 SIDs): all `IDX_I` rows where `EXCH_ID IN (NSE, BSE)` AND `INSTRUMENT == INDEX` (~30) + every unique `UNDERLYING_SECURITY_ID` referenced by `FUTIDX/OPTIDX/FUTSTK/OPTSTK` rows, resolved to its NSE_EQ row (~218) + 4 FUTIDX nearest-expiry contracts (NIFTY/BANKNIFTY/MIDCPNIFTY = NSE_FNO, SENSEX = BSE_FNO) per §36 (2026-07-08) | **Quote (request code 17)** — 50-byte packets, gives day OHLC at fixed byte offsets |
+| **Main feed** | **1** | `wss://api-feed.dhan.co?version=2&token=<JWT>&clientId=<ID>&authType=2` | Daily-fetched universe (~250 SIDs): all `IDX_I` rows where `EXCH_ID IN (NSE, BSE)` AND `INSTRUMENT == INDEX` (~30) + every unique `UNDERLYING_SECURITY_ID` referenced by `FUTIDX/OPTIDX/FUTSTK/OPTSTK` rows, resolved to its NSE_EQ row (~218) + ALL available monthly FUTIDX expiries of the 4 underlyings (NIFTY/BANKNIFTY/MIDCPNIFTY = NSE_FNO, SENSEX = BSE_FNO; typically ~12 contracts, envelope ≤24) per §36/§36.7 (2026-07-10) | **Quote (request code 17)** — 50-byte packets, gives day OHLC at fixed byte offsets |
 | **Order update** | **1** | `wss://api-order-update.dhan.co` | Receives order events for orders WE place; filter `Source=P` | JSON, MsgCode 42 auth |
 
 **Total live WebSocket connections to Dhan: 2** (UNCHANGED from prior lock).
 
-**Universe size envelope (mechanical bound):** `MAX_DAILY_UNIVERSE_SIZE = 1200` (raised from 400 per §31, NTM expansion 2026-06-06). Boot HALTS if computed universe is outside `[100, 1200]`. Fits comfortably on 1 main-feed connection (Dhan cap = 5,000 SIDs/conn). The §36 FUTIDX-4 grant (2026-07-08) adds exactly 4 SIDs to the subscription set — still inside `[100, 1200]`.
+**Universe size envelope (mechanical bound):** `MAX_DAILY_UNIVERSE_SIZE = 1200` (raised from 400 per §31, NTM expansion 2026-06-06). Boot HALTS if computed universe is outside `[100, 1200]`. Fits comfortably on 1 main-feed connection (Dhan cap = 5,000 SIDs/conn). The §36.7 FUTIDX all-months grant (2026-07-10) adds the vendor-listed monthly serials (~12 SIDs typical, ≤24 by envelope) to the subscription set — still trivially inside `[100, 1200]` (≈343 total).
 
 **Subscription dispatch:** 250 SIDs sent in 3 JSON batches (Dhan cap = 100 SIDs/message), sequential with `SubscribeRxGuard` (PR #337) preserving subscription state across reconnects.
 
@@ -135,7 +135,7 @@ Per operator Quote 4: "for future or options it should be just marked as expired
 **Quote 5 (2026-05-29, applicable-F&O master — supersedes the §10-step-4 "indices + underlyings only" scope for the lifecycle table):**
 > "I asked you to pull ALL the FNO in instruments … only fno for our applicable fno instruments right dude … if yes go ahead"
 
-**MASTER vs SUBSCRIPTION (locked 2026-05-29):** `instrument_lifecycle` is the **full applicable-F&O master** — it stores, in addition to the indices + F&O underlying spots, **every applicable F&O contract**: the `FUTSTK`/`OPTSTK` rows whose `UNDERLYING_SECURITY_ID` resolves to one of our tracked NSE_EQ underlyings, plus the `FUTIDX`/`OPTIDX` rows for our tracked indices. Currency F&O (`FUTCUR`/`OPTCUR`), commodity F&O (`FUTCOM`/`OPTFUT`), and non-F&O equities NOT in our underlying set are EXCLUDED. These contract rows carry `lifecycle_state` transitions (`active` → `expired_contract`) and are NEVER deleted (SEBI §25 point-in-time). **This is the master/audit table ONLY — it does NOT change the WebSocket subscription**, which remains the 331-SID indices+spots set per §2 **plus the 4 §36 FUTIDX nearest-expiry contracts (2026-07-08)** + the 2-WebSocket lock. The `MAX_DAILY_UNIVERSE_SIZE = 1200` envelope in §2 bounds the *subscription* set, NOT the lifecycle master (which legitimately holds ~219K applicable-F&O rows).
+**MASTER vs SUBSCRIPTION (locked 2026-05-29):** `instrument_lifecycle` is the **full applicable-F&O master** — it stores, in addition to the indices + F&O underlying spots, **every applicable F&O contract**: the `FUTSTK`/`OPTSTK` rows whose `UNDERLYING_SECURITY_ID` resolves to one of our tracked NSE_EQ underlyings, plus the `FUTIDX`/`OPTIDX` rows for our tracked indices. Currency F&O (`FUTCUR`/`OPTCUR`), commodity F&O (`FUTCOM`/`OPTFUT`), and non-F&O equities NOT in our underlying set are EXCLUDED. These contract rows carry `lifecycle_state` transitions (`active` → `expired_contract`) and are NEVER deleted (SEBI §25 point-in-time). **This is the master/audit table ONLY — it does NOT change the WebSocket subscription**, which remains the 331-SID indices+spots set per §2 **plus the §36.7 all-monthly-expiries FUTIDX contracts of the 4 underlyings (2026-07-10; the nearest expiry is the first of each set)** + the 2-WebSocket lock. The `MAX_DAILY_UNIVERSE_SIZE = 1200` envelope in §2 bounds the *subscription* set, NOT the lifecycle master (which legitimately holds ~219K applicable-F&O rows).
 
 | Column | Type | Purpose |
 |---|---|---|
@@ -304,7 +304,7 @@ AWS list rates. Budget alarm ceiling = $35/mo pre-GST. Operator approved
 
 ## §8. Subscription mode — Quote for every SID (LOCKED per operator Quote 2)
 
-Every SID in the daily universe — indices, F&O underlyings, **and the 4 §36 FUTIDX contracts (2026-07-08)** — subscribes in **Quote mode**:
+Every SID in the daily universe — indices, F&O underlyings, **and the §36/§36.7 FUTIDX contracts (2026-07-08; all monthly expiries since 2026-07-10)** — subscribes in **Quote mode**:
 
 > §36 note (2026-07-08): in Quote mode, derivative OI is NOT inline (inline OI bytes 34-37 exist only in the Full packet) — OI arrives as the separate 12-byte code-5 packet (live-market-feed.md rule 9), which the tick processor currently counts-and-drops.
 
@@ -350,11 +350,11 @@ The new `instrument_lifecycle` orchestrator slots between existing Step 6 (auth)
               1. Read yesterday's active set from `instrument_lifecycle` (cold-path bootstrap)
               2. GET Dhan Detailed CSV with L1-L7 defense layers (§9)
               3. Validate + parse + SHA-256
-              4. Extract (a) indices (filter §2) + unique F&O underlyings (group by UNDERLYING_SECURITY_ID) → the 331-SID SUBSCRIPTION set (+ the 4 §36 FUTIDX nearest-expiry rows, 2026-07-08); AND (b) the applicable F&O CONTRACTS (FUTSTK/OPTSTK for resolved underlyings + FUTIDX/OPTIDX for tracked indices; currency/commodity excluded) → MASTER-only set per §5
+              4. Extract (a) indices (filter §2) + unique F&O underlyings (group by UNDERLYING_SECURITY_ID) → the 331-SID SUBSCRIPTION set (+ the §36.7 all-months FUTIDX rows, 2026-07-10); AND (b) the applicable F&O CONTRACTS (FUTSTK/OPTSTK for resolved underlyings + FUTIDX/OPTIDX for tracked indices; currency/commodity excluded) → MASTER-only set per §5
               5. Compute delta vs yesterday — emit added / expired / renamed transitions (over the full master set incl. contracts)
               6. UPSERT `instrument_lifecycle` (subscription set + applicable-F&O contracts per §5) + INSERT `instrument_lifecycle_audit`
               7. INSERT `instrument_fetch_audit` outcome row
-              8. Build `Arc<DailyUniverse>` for the WS subscription dispatcher — dispatcher reads `subscription_targets` ONLY (331), NEVER the contracts (2-WS lock) — the 4 §36 nearest-expiry FUTIDX rows are promoted INTO `subscription_targets` at build time (2026-07-08), so the dispatcher contract itself is unchanged
+              8. Build `Arc<DailyUniverse>` for the WS subscription dispatcher — dispatcher reads `subscription_targets` ONLY (331), NEVER the contracts (2-WS lock) — the §36.7 all-months FUTIDX rows are promoted INTO `subscription_targets` at build time (2026-07-10), so the dispatcher contract itself is unchanged
               9. Bust rkyv binary cache; rebuild for tomorrow's warm boot
               [Infinite retry on any L1-L4 failure per §4]
 08:34      Step 7: Spawn 1 main-feed WebSocket; subscribe Quote mode in 3 batches
@@ -386,7 +386,7 @@ The new `instrument_lifecycle` orchestrator slots between existing Step 6 (auth)
 | Per-row CSV schema validation | Reject CSV if >0.1% rows fail mandatory-field check | `crates/core/src/instrument/csv_parser.rs` (Sub-PR #4) |
 | Lifecycle reconciler test coverage | Idempotent UPSERT + state-flip + dangling-reference rejection | `crates/storage/tests/instrument_lifecycle_*.rs` (Sub-PR #9) |
 | RAM-first hot path (UNCHANGED) | banned-pattern scanner blocks SELECT in indicator/strategy/risk paths | already shipped |
-| `INDEX_FUTURES_UNDERLYINGS` const (len 4) + never-roll selector | §36 FUTIDX-4 scope pinned in code + rule text | `crates/storage/tests/daily_universe_scope_guard.rs::{futidx_scope_pinned_to_4_underlyings_nearest_expiry, futidx_scope_rule_file_pins_forbidden_remainder, futidx_scope_never_roll_source_pin, futidx_scope_legacy_gate_still_false}` (§36, 2026-07-08) |
+| `INDEX_FUTURES_UNDERLYINGS` const (len 4) + `MAX_MONTHLY_EXPIRIES_PER_UNDERLYING = 6` + never-roll all-months selector | §36/§36.7 FUTIDX scope pinned in code + rule text | `crates/storage/tests/daily_universe_scope_guard.rs::{futidx_scope_pinned_to_4_underlyings_all_monthly_expiries, futidx_scope_rule_file_pins_forbidden_remainder, futidx_scope_never_roll_source_pin, futidx_scope_legacy_gate_still_false}` (§36 2026-07-08; §36.7 2026-07-10) |
 
 ---
 
@@ -398,7 +398,7 @@ The new `instrument_lifecycle` orchestrator slots between existing Step 6 (auth)
 - Adds a give-up condition to the fetch retry loop (any code path returning Err without retry)
 - Changes the subscription mode for ANY universe SID from Quote to Ticker or Full without a dated operator quote
 - Adds a 2nd main-feed connection or any new WS endpoint
-- Subscribes the daily universe to derivative contracts **beyond the §36 grant** (OPTIDX/FUTSTK/OPTSTK always; FUTIDX beyond the 4 named underlyings or beyond the single nearest expiry) — otherwise only the UNDERLYING_SECURITY_ID spot rows are subscribed (§36, 2026-07-08)
+- Subscribes the daily universe to derivative contracts **beyond the §36 grant** (OPTIDX/FUTSTK/OPTSTK always; FUTIDX beyond the 4 named underlyings, beyond monthly serials `>= today`, or beyond the `MAX_MONTHLY_EXPIRIES_PER_UNDERLYING` envelope) — otherwise only the UNDERLYING_SECURITY_ID spot rows are subscribed (§36 2026-07-08; §36.7 2026-07-10)
 - DELETES rows from `instrument_lifecycle` (lifecycle_state transitions are the ONLY allowed mutation; no DELETE statements)
 - Changes `effective_main_feed_pool_size` to anything other than 1
 - Modifies instance type from r8g.large without the 4-file update protocol in §7 Mechanical Rule 1
@@ -987,7 +987,7 @@ the wrong/old security. The symbol+series cross-check catches the rare bad-ISIN 
 
 ---
 
-# §36 — Index futures (FUTIDX) for exactly 4 underlyings, nearest expiry, BOTH feeds (operator authorization 2026-07-08)
+# §36 — Index futures (FUTIDX) for exactly 4 underlyings, nearest expiry, BOTH feeds (operator authorization 2026-07-08) — EXPANDED to ALL monthly expiries 2026-07-10 (§36.7)
 
 ## §36.0 The verbatim operator demand (preserve exactly, do not paraphrase)
 
@@ -999,68 +999,112 @@ the wrong/old security. The symbol+series cross-check catches the rare bad-ISIN 
 
 ## §36.1 The grant — one paragraph
 
-The daily-universe SUBSCRIPTION set additionally carries exactly FOUR index-futures contracts:
-the NEAREST-expiry FUTIDX for NIFTY, BANKNIFTY, MIDCPNIFTY (NSE_FNO, ExchangeSegment 2) and
-SENSEX (BSE_FNO, ExchangeSegment 8), selected fresh every morning from the same Detailed CSV
+The daily-universe SUBSCRIPTION set additionally carries the index-futures contracts of
+exactly FOUR underlyings — since 2026-07-10 (§36.7) ALL monthly expiries `>= today`, of which
+the nearest expiry is the first — for NIFTY, BANKNIFTY, MIDCPNIFTY (NSE_FNO, ExchangeSegment 2)
+and SENSEX (BSE_FNO, ExchangeSegment 8), selected fresh every morning from the same Detailed CSV
 (`SM_EXPIRY_DATE`, never guessed/hardcoded), subscribed in **Quote mode (request code 17)** on
 the EXISTING single main-feed connection. Nearest = first expiry >= today; index futures
 NEVER roll — on expiry day the expiring contract stays subscribed through the 15:30 close (preserves
 `test_index_expiry_never_rolls_via_planner`); the next trading day's build advances
 automatically. Selection is a pure function of (CSV, IST trading date) evaluated once at build
-time; NO intraday resubscribe ever. The Groww watch set gains the SAME 4 logical contracts
-(same underlying + same expiry date; Groww exchange_tokens, kind=ltp, segment=FNO) on the
+time; NO intraday resubscribe ever. The Groww watch set gains the SAME logical contracts
+(same underlying + same expiry dates; Groww exchange_tokens, kind=ltp, segment=FNO) on the
 EXISTING single Groww connection — see groww-second-feed-scope-2026-06-19.md §36. Both feeds
-select via ONE shared pure function; a boot-time comparator pages FUTIDX-02 if they ever choose
-different expiry dates.
+select via ONE shared pure function; a boot-time comparator compares the expiry SET per
+underlying and pages FUTIDX-02 on any comparable-month divergence (§36.7).
 
 ## §36.2 What stays FORBIDDEN (unchanged REJECT set)
 
 OPTIDX, FUTSTK, OPTSTK subscriptions (master-only forever, §5 unchanged); any FUTIDX beyond the
-4 named underlyings (FINNIFTY, BANKEX, NIFTYNXT50, ... = REJECT); any expiry beyond the single
-nearest; any mode other than Quote for these SIDs; any early/intraday rollover (NO intraday
-resubscribe); any new WebSocket; any order placement on these contracts (dry_run + OMS
-untouched). This file must be edited FIRST with a fresh dated quote for any of the above.
+4 named underlyings (FINNIFTY, BANKEX, NIFTYNXT50, ... = REJECT); any NON-monthly-serial
+instrument; any expiry `< today`; more than `MAX_MONTHLY_EXPIRIES_PER_UNDERLYING` distinct
+expiries per underlying (fail-closed, never truncated); any mode other than Quote for these
+SIDs; any early/intraday rollover (NO intraday resubscribe); any new WebSocket; any order
+placement on these contracts (dry_run + OMS untouched). This file must be edited FIRST with a
+fresh dated quote for any of the above.
 
 ## §36.3 Prev-close / OI honest note
 
 Quote-mode NSE_FNO/BSE_FNO prev-close = Quote packet bytes 38-41 (Ticket #5525125,
 `dhan_locked_facts.rs`; ratcheted by the new NSE_FNO/BSE_FNO Quote routing parser tests). OI
-arrives as the separate code-5 packet and is NOT captured today — `ticks.oi = 0` for these 4
-SIDs. The 4 futures are excluded from the prev-day REST fetch and the 15:31 cross-verify
+arrives as the separate code-5 packet and is NOT captured today — `ticks.oi = 0` for ALL §36
+future SIDs (~12 under §36.7). ALL §36 futures are excluded from the prev-day REST fetch and the 15:31 cross-verify
 (Dhan-historical FUTIDX support + expiryCode convention UNVERIFIED-LIVE per annexure rule 8) —
 `*_pct_from_prev_day` columns read 0, fail-soft.
 
 ## §36.4 Honest envelope (mandatory §13 wording)
 
-100% inside the tested envelope, with ratcheted regression coverage: exactly 4 contracts pinned
-by `INDEX_FUTURES_UNDERLYINGS` (arity ratcheted in code AND rule text); nearest-expiry
-never-roll pinned by boundary tests at T-1 / T-0 / T+1 / all-past + proptest; Quote mode per the
-ratcheted §8 lock; both boot paths proven identical by the extended snapshot plan-identity
-ratchet; per-underlying degrade is loud (FUTIDX-01, High) and cross-feed expiry divergence pages
-FUTIDX-02 — never silently absorbed. Bandwidth delta: Dhan +4 Quote SIDs ~ 4 x 50 B x ~4 pkts/s
-~ 0.8 KB/s + ~48 B/s code-5 packets (<0.4% of the §8 envelope); Groww +4 LTP subs (~771 of the
-1000 cap); RAM +4 SIDs x 21 TF cells ~ 13 MB against ~7.8 GB r8g.large headroom; no
-buffer/channel constant changes; no cost impact (no instance/schedule/storage change — §15
-step 5 N/A). NOT claimed: futures OI capture; prev-day pct coverage for futures; Dhan live
-Quote cadence/field population for NSE_FNO and especially BSE_FNO FUTIDX (UNVERIFIED-LIVE —
-first session is the probe; tick-gap detector pages within 30s if silent); Groww live FNO
-subscribe_ltp delivery (UNVERIFIED-LIVE); cross-feed row comparability when vendor masters
-disagree on the front contract (DETECTED via FUTIDX-02, not prevented).
+100% inside the tested envelope, with ratcheted regression coverage: exactly 4 underlyings
+pinned by `INDEX_FUTURES_UNDERLYINGS` (arity ratcheted in code AND rule text); ALL monthly
+expiries `>= today` selected by ONE shared pure function (`select_index_future_expiries`),
+nearest-expiry never-roll pinned by T-1 / T-0 / T+1 / all-past boundary tests + proptest;
+per-(underlying, expiry) fail-closed degrade (flood/ambiguity drops only that month, loud
+FUTIDX-01 with the month named); serial envelope `MAX_MONTHLY_EXPIRIES_PER_UNDERLYING = 6`
+(a flooded master degrades fail-closed, never truncated); Quote mode per the ratcheted §8
+lock; snapshot format 3 forces one deterministic cold build on deploy day; cross-feed parity
+compares the expiry SET per underlying — comparable-month divergence pages FUTIDX-02,
+far-suffix vendor publication lag is an info-level note + counter.
+Bandwidth delta (typical ~12 contracts, vendor-controlled): Dhan ~12 × 50 B Quote × ~4 pkts/s
+≈ 2.4 KB/s + ~0.15 KB/s code-5 OI packets (<1.5% of the §8 envelope); Groww ~12 LTP subs
+(~779 of the 1000 cap, futures cap-priority); RAM ~12 SIDs × 21 TF cells ≈ 39 MB against
+~7.8 GB r8g.large headroom; universe ≈ 343 inside [100, 1200]; no buffer/channel constant
+changes; no cost impact (no instance/schedule/storage change — §15 step 5 N/A).
+NOT claimed: futures OI capture (`ticks.oi = 0` for ALL future SIDs — code-5 packets still
+counted-and-dropped); prev-day pct coverage for futures (role-keyed exclusion,
+`*_pct_from_prev_day` read 0, fail-soft); Dhan live Quote cadence/field population for
+NSE_FNO and especially BSE_FNO FUTIDX — and for months 2..N on BOTH feeds — UNVERIFIED-LIVE
+(first session is the probe; the seeded tick-gap detector logs a never-ticking month within
+30s via WS-GAP-06); Groww live FNO subscribe_ltp delivery UNVERIFIED-LIVE; how many monthly
+serials each vendor actually lists (typically 3; design takes whatever is listed, bounded
+≤6); cross-feed row comparability when vendor masters disagree on month depth (DETECTED via
+FUTIDX-02/depth-note, not prevented). FAR-MONTH LIQUIDITY: far serials tick rarely (minutes
+of legitimate silence, esp. MIDCPNIFTY/SENSEX) — non-nearest-month SIDs are therefore
+EXCLUDED from the SLO tick-freshness silent count and the `tv_tick_gap_instruments_silent`
+gauge (INDIA-VIX precedent; alarm threshold 40 and the 0.95 SLO boundary unchanged) while
+remaining SEEDED for per-SID WS-GAP-06 black-hole visibility.
 
 ## §36.5 Mechanical guards added
 
-`daily_universe_scope_guard.rs::{futidx_scope_pinned_to_4_underlyings_nearest_expiry,
+`daily_universe_scope_guard.rs::{futidx_scope_pinned_to_4_underlyings_all_monthly_expiries,
 futidx_scope_rule_file_pins_forbidden_remainder, futidx_scope_never_roll_source_pin,
 futidx_scope_legacy_gate_still_false}`; the selector boundary + proptest suite in
-`index_futures.rs`; planner/snapshot/Groww ratchets per
-`.claude/plans/active-plan-futidx-4.md`.
+`index_futures.rs` (incl. §36.7: `test_select_index_future_expiries_returns_all_at_or_after_today`,
+`test_select_index_future_expiries_keeps_expiring_month_and_later_on_t_zero`,
+`test_select_index_future_expiries_drops_expired_month_next_morning`,
+`test_select_monthly_serial_flood_degrades_whole_underlying`,
+`test_cross_feed_parity_far_suffix_is_depth_only`, `test_cross_feed_parity_hole_is_divergence`);
+planner/snapshot/Groww ratchets per `.claude/plans/active-plan-futidx-4.md` +
+`.claude/plans/active-plan-futidx-allmonths.md` (2026-07-10).
 
 ## §36.6 Auto-driver explanation
 
 > Sir, the juice shop already watches the live price of 4 fruit BASKETS. From today the same
-> ONE phone line also hears the price of the 4 "next-delivery basket coupons" (futures) —
-> exactly one coupon per basket, always the soonest delivery date, and on the coupon's last day
-> we keep listening to THAT coupon until closing time; tomorrow morning the list-maker picks
-> the next coupon automatically. Both of our two suppliers (Dhan and Groww) pick the coupon
-> with the same rule, and an inspector rings a bell if they ever disagree. No new phone lines.
-> No option coupons. No 5th basket.
+> ONE phone line also hears the price of every "delivery-date basket coupon" (future) the
+> market currently sells for each of the 4 baskets — this month's, next month's, the far
+> month's; on a coupon's last day we keep listening to THAT coupon until closing time, and
+> tomorrow's list simply no longer prints it. Both of our two suppliers (Dhan and Groww) pick
+> the coupons with the same rule, and an inspector rings a bell if they ever disagree on a
+> coupon both should be selling. No new phone lines. No option coupons. No 5th basket.
+
+## §36.7 — ALL available monthly expiries (operator authorization 2026-07-10)
+
+**Quote (2026-07-10, relayed verbatim via the coordinator session):**
+> "instead of only one current month futures contracts just take all the futures of these
+> indices — I mean take all available applicable months futures."
+
+The §36 grant EXPANDS from the single nearest-expiry contract to **ALL available monthly
+FUTIDX expiries `>= today`** per underlying, for the SAME 4 underlyings, BOTH feeds,
+whatever the vendor masters list (no hardcoded month count; envelope bound
+`MAX_MONTHLY_EXPIRIES_PER_UNDERLYING = 6` per underlying — beyond it the underlying
+degrades fail-closed, `MonthlySerialFlood`). The nearest expiry remains the FIRST element
+of each selected set and is still the only month counted by the SLO tick-freshness /
+silent-instruments alarm math (non-nearest months are legitimately sparse — see
+futidx-4-error-codes.md §3). Contracts NEVER roll: the expiring month streams through its
+final session (`>= today` keeps it on T-0) and simply falls out of the next morning's
+build — no rollover code exists. Quote mode for every contract. Everything else in
+§36.2 stays REJECT (OPTIDX, FUTSTK/OPTSTK master-only forever, 5th underlying, non-Quote
+mode, intraday resubscribe, new WS). Selection remains ONE shared pure function evaluated
+once per build per feed; cross-feed parity compares the expiry SET per underlying —
+nearest-month or in-set divergence pages FUTIDX-02 (High); a far-suffix depth difference
+(one vendor publishes far serials earlier) is an info-level note + counter, never a page.
