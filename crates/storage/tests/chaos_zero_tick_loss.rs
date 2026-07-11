@@ -43,6 +43,11 @@ const QUESTDB_SERVICE: &str = "tv-questdb";
 /// `crates/api/tests/tv_api_token_prod_guard.rs`: a shared static Mutex,
 /// poisoning-safe (a panicked lock holder must not cascade into the
 /// remaining tests).
+///
+/// SCOPE NOTE: this serializes within ONE process only — which is exactly
+/// what the chaos lane uses (plain `cargo test -- --ignored`). Under nextest
+/// each test is its own process and the lock would not serialize — irrelevant
+/// today because the nextest lanes never run `--ignored`.
 static DOCKER_PAUSE_LOCK: Mutex<()> = Mutex::new(());
 
 fn docker_pause_serial_guard() -> std::sync::MutexGuard<'static, ()> {
