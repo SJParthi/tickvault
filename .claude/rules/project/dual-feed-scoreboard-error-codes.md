@@ -161,8 +161,35 @@ asymmetry, not speed, and fall through). Resolution
 asymmetry stays stated on every surface: Dhan carries a ≥1s whole-second
 quantization floor while Groww is millisecond-precise but measured at the
 sidecar capture instant one hop downstream of the socket (`lag_floor_ms`
-column: 1000 dhan / 1 groww). Per-instrument unique-wins land
-in PR-4. **Stall episode rows are LIVE since PR-B (2026-07-10):** the Groww
+column: 1000 dhan / 1 groww). **Per-instrument coverage is LIVE since
+PR-D (2026-07-11):** the in-memory `FeedPresenceRegistry`
+(`crates/core/src/pipeline/feed_presence.rs`) folds one relaxed
+`fetch_or` per tick into per-slot 375-minute bitsets at the SAME
+DHAT-proven persist sites as the lag rings (both Dhan arms +
+the Groww drain), over a CANONICAL cross-feed slot space built at the
+daily-universe / Groww watch builds (stocks paired by ISIN, indices by
+`canonicalize_index_symbol`, the §36 futures by `(underlying, expiry)`
+contract identity — never native ids). On same-day runs the 15:45 drain
+(flagged O(slots × 12 words), cold) flips `unique_win_minutes` /
+`both_minutes` to registry truth ONLY when the registry covered the
+full session (`in_memory`) — on `mixed` days (mid-day restart — the
+pre-restart window is invisible to the process-local registry) the SQL
+minute sets stand for those two columns (PR-D fix round 1). It fills
+`mapped_instruments` / `unmapped_instruments` /
+`covered_instrument_minutes` (the registry's PARTIAL measurement on
+mixed days), writes the config-gated `feed_coverage_daily`
+per-instrument rows, and stamps `coverage_source` = `in_memory` (full
+session) / `mixed`. Fallback stays the SQL minute sets (`sql_backfill`), and the
+coverage keep-better (`stage="coverage_regression"` — mirror of the lag
+guard) stops a registry-less rerun/backfill from erasing a measured
+day's registry columns. Unmapped singletons are counted + named in the
+day's logs (bounded ≤20 sample); ticks folding for unregistered keys
+and slot-cap overflow are counted, never silent (Rule 11). Honest
+bounds: presence = ticks WE captured (not proof the exchange traded);
+the registry costs a fixed 192 KiB (2,048 slots × 2 feeds × 48 B) and
+one papaya read + one `fetch_or` per tick (DHAT
+`dhat_feed_presence.rs`, Criterion budget `feed_presence_record`).
+**Stall episode rows are LIVE since PR-B (2026-07-10):** the Groww
 sidecar stall watchdog stamps ONE `WsEventKind::StallRestarted`
 (`stall_restarted`) ws_event_audit row per kill+relaunch (both the classic
 FEED-STALL-01 arm and the §1b never-streamed arm), carrying a FIXED machine
@@ -195,6 +222,9 @@ operator signal.
   ensure-DDL failure arms carry the literal `code = "SCOREBOARD-01"` +
   `stage` per the tag-guard convention)
 - `crates/common/src/feed_blame.rs` (the classifier — no emit sites; pure)
+- `crates/core/src/pipeline/feed_presence.rs` (the presence registry) +
+  `crates/core/src/instrument/presence_registration.rs` (Dhan slot build)
+  + the Groww slot build in `crates/app/src/groww_activation.rs` (PR-D)
 
 ## §2. Blame taxonomy (persisted on every `feed_episode_audit` row)
 
@@ -235,6 +265,9 @@ This rule activates when editing:
 - `crates/storage/src/feed_episode_audit_persistence.rs`
 - `crates/app/src/feed_scoreboard_boot.rs`
 - `crates/app/src/groww_sidecar_supervisor.rs` (the `stall_restarted` emit)
+- `crates/core/src/pipeline/feed_presence.rs` (the presence registry)
+- `crates/core/src/instrument/presence_registration.rs` (Dhan slot build)
 - Any file containing `SCOREBOARD-01`, `Scoreboard01`, `feed_scoreboard_daily`,
   `feed_episode_audit`, `feed_coverage_daily`, `classify_episode`,
-  `BlameClass`, `StallRestarted`, or `STALL_SOURCE_`
+  `BlameClass`, `StallRestarted`, `STALL_SOURCE_`, `FeedPresenceRegistry`,
+  `record_presence`, or `PresenceRegistration`

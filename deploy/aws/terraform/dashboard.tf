@@ -255,8 +255,10 @@ resource "aws_cloudwatch_dashboard" "operator" {
 # allowlist). Resolution asymmetry is stated on the widget title: Dhan's
 # whole-second price clock gives it a >=1s floor; Groww is millisecond-
 # precise but measured one hop downstream (sidecar capture instant).
-# Rows 2-4 of the design (stall counters, catch-up seals, WS health, alarm
-# strip) land with scoreboard PR-4.
+# Rows 2-4 (scoreboard PR-D): stall counters + catch-up seals + WS health +
+# a feed-focused alarm strip + the honesty text widget — EXISTING metrics
+# and alarms only, ZERO new EMF series (design §6: total scoreboard cost
+# stays the single PR-C gauge).
 # =============================================================================
 resource "aws_cloudwatch_dashboard" "scoreboard" {
   dashboard_name = "tv-${var.environment}-scoreboard"
@@ -301,6 +303,91 @@ resource "aws_cloudwatch_dashboard" "scoreboard" {
           metrics = [[local.dash_namespace, "tv_groww_exchange_lag_p99_seconds"]]
           period  = 60
           stat    = "Maximum"
+        }
+      },
+
+      # ----- Row 2 (PR-D): stall restarts | catch-up seals per feed -----
+      {
+        type   = "metric"
+        x      = 0
+        y      = 8
+        width  = 12
+        height = 6
+        properties = {
+          title  = "Feed helper restarts (stalled / never-streamed sockets killed + relaunched)"
+          region = local.dash_region
+          view   = "timeSeries"
+          metrics = [
+            [local.dash_namespace, "tv_feed_sidecar_stall_restart_total"],
+            [local.dash_namespace, "tv_feed_sidecar_never_streamed_restart_total"]
+          ]
+          period = 300
+          stat   = "Sum"
+        }
+      },
+      {
+        type   = "metric"
+        x      = 12
+        y      = 8
+        width  = 12
+        height = 6
+        properties = {
+          title  = "Late catch-up candle seals per feed (delivery backlog signal)"
+          region = local.dash_region
+          view   = "timeSeries"
+          metrics = [
+            [local.dash_namespace, "tv_boundary_catchup_total", "host", "tickvault-prod", "feed", "dhan"],
+            [local.dash_namespace, "tv_boundary_catchup_total", "host", "tickvault-prod", "feed", "groww"]
+          ]
+          period = 300
+          stat   = "Sum"
+        }
+      },
+
+      # ----- Row 3 (PR-D): WS health | feed-focused alarm strip -----
+      {
+        type   = "metric"
+        x      = 0
+        y      = 14
+        width  = 12
+        height = 6
+        properties = {
+          title   = "Dhan WebSocket connections active (0 = feed dead)"
+          region  = local.dash_region
+          view    = "timeSeries"
+          metrics = [[local.dash_namespace, "tv_websocket_connections_active"]]
+          period  = 60
+          stat    = "Minimum"
+        }
+      },
+      {
+        type   = "alarm"
+        x      = 12
+        y      = 14
+        width  = 12
+        height = 6
+        properties = {
+          title = "Feed alarm status (red = firing -> already paged)"
+          alarms = [
+            aws_cloudwatch_metric_alarm.ws_pool_all_dead.arn,
+            aws_cloudwatch_metric_alarm.feed_stall_restarts.arn,
+            aws_cloudwatch_metric_alarm.boundary_catchup_storm_dhan.arn,
+            aws_cloudwatch_metric_alarm.dhan_exchange_lag_p99_high.arn,
+            aws_cloudwatch_metric_alarm.groww_exchange_lag_p99_high.arn,
+            aws_cloudwatch_metric_alarm.realtime_guarantee_degraded.arn
+          ]
+        }
+      },
+
+      # ----- Row 4 (PR-D): honesty text — no fake CW series for QuestDB data -----
+      {
+        type   = "text"
+        x      = 0
+        y      = 20
+        width  = 24
+        height = 2
+        properties = {
+          markdown = "**Coverage, blame and the daily verdict** live in the 3:45 PM IST Telegram scorecard + the QuestDB tables (`feed_scoreboard_daily` / `feed_coverage_daily` / `feed_episode_audit`) — per-instrument coverage is QuestDB-side data and is deliberately NOT re-published as CloudWatch series (zero extra EMF cost). This page is live trends only."
         }
       }
     ]

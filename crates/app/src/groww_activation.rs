@@ -643,6 +643,12 @@ async fn activate_groww_lane(
                         skipped: set.unresolved_stocks.len(),
                     },
                 );
+                // Scoreboard PR-D: register the Groww watch set into the
+                // per-instrument presence registry (cross-feed coverage
+                // slots — ISIN for stocks, canonical index name for
+                // indices, contract identity for futures). BEFORE the
+                // persist spawn below moves `set`. Cold path, idempotent.
+                register_groww_presence_from_watch(&set.entries, &attempt_watch_date);
                 // PR-A: persist the Groww instrument set into the SHARED
                 // `instrument_lifecycle` (+ `index_constituency`) master tables
                 // tagged `feed='groww'`. Fire-and-forget + degrade-safe — a
@@ -692,9 +698,171 @@ async fn activate_groww_lane(
     feed_runtime.mark_groww_lane_running();
 }
 
+/// Scoreboard PR-D: pure Groww watch-entry → presence-registration
+/// derivation. Mirrors the Dhan side (`presence_registration.rs`):
+/// - segment label via the SAME `groww_segment_label` mapping the master
+///   writer uses (the labels ticks carry), mapped to the shared binary
+///   segment codes;
+/// - pairing: futures by contract identity (canonical underlying +
+///   expiry), indices by DUAL-FIELD canonical resolution (PR-D review
+///   round 1, HIGH — the 2026-06-28 `groww_indices_absent_vs_dhan`
+///   token-only lesson repeated: the short `groww_symbol` token
+///   ("NSE-NIFTYAUTO" → "NIFTYAUTO") only covers the trading-symbol
+///   allowlist entries, while the display `symbol_name` ("NIFTY Auto" →
+///   "NIFTY AUTO") covers the descriptive ones — NEITHER field alone
+///   canonicalizes to every Dhan-registered index name, so ~20 of ~25
+///   co-listed indices split into two singleton slots. Canonicalize BOTH
+///   and pick whichever is an `NSE_INDEX_ALLOWLIST` member, falling back
+///   to the stripped token — e.g. BSE SENSEX, not an NSE-allowlist
+///   member, still pairs on the token), stocks by ISIN; anything else
+///   registers as a feed-local singleton (reported at drain, never
+///   dropped — Rule 11).
+///
+/// O(1) EXEMPT: cold-path activation derivation, once per watch build.
+#[must_use]
+pub(crate) fn groww_presence_registrations(
+    entries: &[tickvault_core::feed::groww::instruments::WatchEntry],
+) -> Vec<tickvault_core::pipeline::feed_presence::PresenceRegistration> {
+    use tickvault_core::feed::groww::instruments::WatchKind;
+    use tickvault_core::feed::groww::shared_master_writer::groww_segment_label;
+    use tickvault_core::instrument::index_extractor::{
+        NSE_INDEX_ALLOWLIST, canonicalize_index_symbol,
+    };
+    use tickvault_core::pipeline::feed_presence::{PairingKey, PresenceRegistration};
+
+    // Canonicalized allowlist — the exact value space the Dhan side
+    // registers its Index pairing keys in (built once, cold path).
+    let allowlist_canon: std::collections::HashSet<String> = NSE_INDEX_ALLOWLIST
+        .iter()
+        .map(|a| canonicalize_index_symbol(a))
+        .collect();
+    let mut out = Vec::with_capacity(entries.len());
+    for e in entries {
+        // validate_groww_tick rejects non-positive ids at the fold, so a
+        // non-positive watch id could never match a tick anyway.
+        let Ok(security_id) = u64::try_from(e.security_id) else {
+            continue;
+        };
+        let segment_label = groww_segment_label(e);
+        let segment_code = match segment_label {
+            "IDX_I" => 0u8,
+            "NSE_EQ" => 1,
+            "NSE_FNO" => 2,
+            "BSE_EQ" => 4,
+            "BSE_FNO" => 8,
+            // Unknown label — defensive skip (groww_segment_label is a
+            // closed 5-label map today).
+            _ => continue,
+        };
+        let pairing = if let (Some(underlying), Some(expiry)) =
+            (e.underlying_symbol.as_deref(), e.expiry_date.as_deref())
+        {
+            // §36 index future: contract identity, never native ids (the
+            // Groww exchange_token is a different id space from the Dhan
+            // FUTIDX SID — record_index_future_selection precedent).
+            Some(PairingKey::Future {
+                underlying: underlying.to_string(),
+                expiry: expiry.to_string(),
+            })
+        } else if matches!(e.kind, WatchKind::IndexValue) {
+            // Dual-field resolution (mirror `groww_indices_absent_vs_dhan`,
+            // instruments.rs): try the stripped token first
+            // (`NSE-NIFTY` → `NIFTY`), then the display `symbol_name`
+            // (`NIFTY Auto` → `NIFTY AUTO`) — whichever canonicalizes into
+            // the allowlist is the value the Dhan registration carries.
+            // Fallback: the stripped token (BSE SENSEX pairs here).
+            let name = e.index_name.as_deref().unwrap_or(&e.exchange_token);
+            let stripped = name
+                .strip_prefix("NSE-")
+                .or_else(|| name.strip_prefix("BSE-"))
+                .unwrap_or(name);
+            let canon_token = canonicalize_index_symbol(stripped);
+            let canon = if allowlist_canon.contains(&canon_token) {
+                canon_token
+            } else {
+                match e.symbol_name.as_deref().map(canonicalize_index_symbol) {
+                    Some(canon_name) if allowlist_canon.contains(&canon_name) => canon_name,
+                    _ => canon_token,
+                }
+            };
+            Some(PairingKey::Index(canon))
+        } else {
+            e.isin
+                .as_deref()
+                .map(str::trim)
+                .filter(|i| !i.is_empty())
+                .map(|i| PairingKey::Isin(i.to_string()))
+        };
+        let symbol = e
+            .symbol_name
+            .clone()
+            .or_else(|| e.index_name.clone())
+            .unwrap_or_else(|| e.exchange_token.clone());
+        out.push(PresenceRegistration {
+            security_id,
+            segment_code,
+            segment_label,
+            symbol,
+            pairing,
+        });
+    }
+    out
+}
+
+/// Registers the Groww watch set into the process-global presence registry
+/// for the watch date. Thin wrapper — no-op (debug log) when the registry
+/// is uninitialized (presence fold disabled).
+// TEST-EXEMPT: thin wrapper over groww_presence_registrations (tested) + feed_presence::register_instruments (tested); call site pinned by test_groww_presence_registration_site_wired.
+fn register_groww_presence_from_watch(
+    entries: &[tickvault_core::feed::groww::instruments::WatchEntry],
+    watch_date: &str,
+) {
+    let Ok(date) = chrono::NaiveDate::parse_from_str(watch_date, "%Y-%m-%d") else {
+        warn!(
+            watch_date,
+            "feed_presence: unparsable watch date — Groww registration skipped"
+        );
+        return;
+    };
+    let ist_day = tickvault_core::instrument::presence_registration::ist_day_from_date(date);
+    let regs = groww_presence_registrations(entries);
+    match tickvault_core::pipeline::feed_presence::register_instruments(Feed::Groww, ist_day, &regs)
+    {
+        Some(summary) => {
+            if summary.overflow_dropped > 0 {
+                error!(
+                    code = tickvault_common::error_code::ErrorCode::Scoreboard01AggregationDegraded
+                        .code_str(),
+                    stage = "presence_register_overflow",
+                    overflow_dropped = summary.overflow_dropped,
+                    "SCOREBOARD-01: presence slot table overflowed — coverage \
+                     rows for the dropped instruments are missing today"
+                );
+            }
+            info!(
+                feed = "groww",
+                registered = summary.registered,
+                paired = summary.paired,
+                ist_day,
+                "feed_presence: Groww watch set registered for per-instrument \
+                 coverage tracking"
+            );
+        }
+        None => {
+            tracing::debug!(
+                "feed_presence: registry uninitialized (presence fold \
+                 disabled) — Groww registration skipped"
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tickvault_core::feed::groww::instruments::WatchKind;
+    use tickvault_core::instrument::index_extractor::canonicalize_index_symbol;
+    use tickvault_core::pipeline::feed_presence::{PairingKey, PresenceRegistration};
 
     #[test]
     fn test_reconcile_lane_action_start_when_desired_and_not_activated() {
@@ -1000,6 +1168,211 @@ mod tests {
             src.contains(needle),
             "activation must record the Groww subscribe counts in feed-health \
              in the watch-set Ok(set) arm (FIX 13c)"
+        );
+    }
+
+    // ---- Scoreboard PR-D: Groww presence registration ----
+
+    fn watch_entry(
+        kind: WatchKind,
+        segment: &str,
+        exchange: &str,
+        security_id: i64,
+    ) -> tickvault_core::feed::groww::instruments::WatchEntry {
+        tickvault_core::feed::groww::instruments::WatchEntry {
+            exchange: exchange.to_string(),
+            segment: segment.to_string(),
+            exchange_token: security_id.to_string(),
+            kind,
+            security_id,
+            isin: None,
+            symbol_name: None,
+            index_name: None,
+            expiry_date: None,
+            underlying_symbol: None,
+        }
+    }
+
+    #[test]
+    fn test_groww_presence_registrations_index_stock_future_keys() {
+        let mut index = watch_entry(WatchKind::IndexValue, "CASH", "NSE", 0x4000_0000_0000_0001);
+        index.index_name = Some("NSE-NIFTY".to_string());
+        let mut stock = watch_entry(WatchKind::Ltp, "CASH", "NSE", 1333);
+        stock.isin = Some("INE002A01018".to_string());
+        stock.symbol_name = Some("RELIANCE".to_string());
+        let mut fut = watch_entry(WatchKind::Ltp, "FNO", "BSE", 999_777);
+        fut.underlying_symbol = Some("SENSEX".to_string());
+        fut.expiry_date = Some("2026-07-30".to_string());
+        let mut orphan = watch_entry(WatchKind::Ltp, "CASH", "NSE", 555);
+        orphan.symbol_name = Some("ODDSTOCK".to_string());
+
+        let regs = groww_presence_registrations(&[index, stock, fut, orphan]);
+        assert_eq!(regs.len(), 4);
+        // Index: IDX_I code 0, exchange prefix stripped + canonicalized.
+        assert_eq!(regs[0].segment_code, 0);
+        assert_eq!(regs[0].segment_label, "IDX_I");
+        assert_eq!(
+            regs[0].pairing,
+            Some(PairingKey::Index("NIFTY".to_string()))
+        );
+        // The canonicalizer must be the SHARED one (alias-drift lesson).
+        assert_eq!(canonicalize_index_symbol("NIFTY"), "NIFTY");
+        // Stock: NSE_EQ code 1 + ISIN pairing (the by_isin precedent).
+        assert_eq!(regs[1].segment_code, 1);
+        assert_eq!(regs[1].segment_label, "NSE_EQ");
+        assert_eq!(
+            regs[1].pairing,
+            Some(PairingKey::Isin("INE002A01018".to_string()))
+        );
+        // Future: BSE_FNO code 8 + contract-identity pairing.
+        assert_eq!(regs[2].segment_code, 8);
+        assert_eq!(
+            regs[2].pairing,
+            Some(PairingKey::Future {
+                underlying: "SENSEX".to_string(),
+                expiry: "2026-07-30".to_string(),
+            })
+        );
+        // ISIN-less stock: feed-local singleton, never dropped (Rule 11).
+        assert_eq!(regs[3].pairing, None);
+        assert_eq!(regs[3].symbol, "ODDSTOCK");
+    }
+
+    #[test]
+    fn test_groww_presence_registrations_skip_non_positive_ids() {
+        let bad = watch_entry(WatchKind::Ltp, "CASH", "NSE", -5);
+        assert!(groww_presence_registrations(&[bad]).is_empty());
+    }
+
+    /// The REAL 24 Groww NSE index rows (short `groww_symbol` token +
+    /// display `name`) — the same fixture pinned in
+    /// `instruments.rs::REAL_GROWW_NSE_INDICES` (2026-06-28 operator
+    /// verification).
+    const REAL_GROWW_NSE_INDICES: &[(&str, &str)] = &[
+        ("NIFTY", "NIFTY 50"),
+        ("BANKNIFTY", "NIFTY Bank"),
+        ("FINNIFTY", "Nifty Financial Services"),
+        ("INDIAVIX", "India Vix"),
+        ("NIFTYJR", "Nifty Next 50"),
+        ("MIDCAP50", "NIFTY MIDCAP 50"),
+        ("NIFTY100", "NIFTY 100"),
+        ("NIFTY500", "NIFTY 500"),
+        ("NIFTYAUTO", "NIFTY Auto"),
+        ("NIFTYCDTY", "NIFTY Commodities"),
+        ("NIFTYFMCG", "NIFTY FMCG"),
+        ("NIFTYIT", "NIFTY IT"),
+        ("NIFTYMEDIA", "NIFTY Media"),
+        ("NIFTYMETAL", "NIFTY Metal"),
+        ("NIFTYMIDCAP", "NIFTY Midcap 100"),
+        ("NIFTYMIDCAP150", "NIFTY Midcap 150"),
+        ("NIFTYMIDSELECT", "Nifty Midcap Select"),
+        ("NIFTYPHARMA", "NIFTY Pharma"),
+        ("NIFTYPSUBANK", "NIFTY PSU Bank"),
+        ("NIFTYPVTBANK", "NIFTY Pvt Bank"),
+        ("NIFTYREALTY", "NIFTY Realty"),
+        ("NIFTYSMALL", "NIFTY Smallcap 100"),
+        ("NIFTYSMALLCAP250", "NIFTY Smallcap 250"),
+        ("NIFTYTOTALMCAP", "Nifty Total Market"),
+    ];
+
+    /// Regression (PR-D review round 1, HIGH — the token-only pairing bug):
+    /// against the REAL 24 Groww NSE index rows, the dual-field resolution
+    /// must land 22 of them (= the 32-entry allowlist minus the 10
+    /// known-absent-on-Groww) on the EXACT canonical value the Dhan side
+    /// registers — not the buggy 4 that the token field alone resolves.
+    #[test]
+    fn test_groww_index_pairing_dual_field_matches_dhan_canonicals() {
+        use tickvault_core::instrument::index_extractor::NSE_INDEX_ALLOWLIST;
+
+        let entries: Vec<_> = REAL_GROWW_NSE_INDICES
+            .iter()
+            .enumerate()
+            .map(|(i, (token, name))| {
+                let mut e = watch_entry(
+                    WatchKind::IndexValue,
+                    "CASH",
+                    "NSE",
+                    0x4000_0000_0000_0000_i64 + i64::try_from(i).unwrap_or(0) + 1,
+                );
+                e.exchange_token = (*token).to_string();
+                e.index_name = Some(format!("NSE-{token}"));
+                e.symbol_name = Some((*name).to_string());
+                e
+            })
+            .collect();
+        let regs = groww_presence_registrations(&entries);
+        assert_eq!(regs.len(), 24);
+        let allowlist_canon: std::collections::HashSet<String> = NSE_INDEX_ALLOWLIST
+            .iter()
+            .map(|a| canonicalize_index_symbol(a))
+            .collect();
+        let keys: Vec<String> = regs
+            .iter()
+            .filter_map(|r| match &r.pairing {
+                Some(PairingKey::Index(name)) => Some(name.clone()),
+                _ => None,
+            })
+            .collect();
+        let paired = keys.iter().filter(|k| allowlist_canon.contains(*k)).count();
+        assert_eq!(
+            paired, 22,
+            "22 of the real 24 Groww NSE indices must resolve to a Dhan \
+             allowlist canonical (NIFTY Commodities is Dhan-untracked; \
+             NIFTY Midcap 100 is Dhan-tracked under the legacy \
+             \"NIFTY MID100 FREE\" symbol with no alias bridge — the \
+             pre-existing 2026-06-28 KNOWN_ABSENT_ON_GROWW stance, \
+             inherited here, NOT fixed in this PR); token-only pairing \
+             resolved just 4 — keys: {keys:?}"
+        );
+        // The previously-split spellings now pair on the Dhan canonical.
+        for expected in [
+            "NIFTY AUTO",
+            "NIFTY NEXT 50",
+            "INDIA VIX",
+            "MIDCPNIFTY",
+            "NIFTYMCAP50",
+            "NIFTY TOTAL MKT",
+        ] {
+            assert!(
+                keys.iter().any(|k| k == expected),
+                "expected canonical {expected} missing from {keys:?}"
+            );
+        }
+        // BSE SENSEX: not an NSE-allowlist member — pairs on the stripped
+        // token fallback, exactly what the Dhan side registers.
+        let mut sensex = watch_entry(WatchKind::IndexValue, "CASH", "BSE", 0x4000_0000_0000_0100);
+        sensex.index_name = Some("BSE-SENSEX".to_string());
+        sensex.symbol_name = Some("SENSEX".to_string());
+        let regs = groww_presence_registrations(&[sensex]);
+        assert_eq!(
+            regs[0].pairing,
+            Some(PairingKey::Index("SENSEX".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_groww_presence_registration_reg_type_matches_registry_input() {
+        // Compile-time shape pin: the derivation output feeds
+        // feed_presence::register_instruments directly.
+        let regs: Vec<PresenceRegistration> = groww_presence_registrations(&[]);
+        assert!(regs.is_empty());
+    }
+
+    /// Wiring ratchet (source-scan): the watch-set `Ok(set)` arm must
+    /// register the Groww presence slots BEFORE the master-persist spawn
+    /// moves `set` — a registration wired nowhere leaves every Groww
+    /// instrument an unregistered fold at 15:45.
+    #[test]
+    fn test_groww_presence_registration_site_wired() {
+        let src: String = include_str!("groww_activation.rs")
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        let needle = concat!("register_groww_presence_from_watch(", "&set.entries,");
+        assert!(
+            src.contains(needle),
+            "groww_activation must register the watch set into the presence \
+             registry in the Ok(set) arm"
         );
     }
 }

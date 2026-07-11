@@ -1563,6 +1563,78 @@ mod tests {
     /// SLO-03 incident proved: the `tv_dhan_exchange_lag_p99_seconds`
     /// stream stops with no error!, no counter, no respawn, and the lag
     /// alarm false-OKs on missing data (`notBreaching`).
+    /// Scoreboard PR-D meta-guard: main.rs MUST (a) init the per-instrument
+    /// presence registry on BOTH boot arms BEFORE the feeds spawn (the
+    /// boot-read fold gate — one-site wiring darkens per-instrument
+    /// coverage for every mid-market crash-restart session, the exact
+    /// feed-lag round-1 lesson) and (b) reset the Dhan presence bitsets in
+    /// the IST-midnight task next to the day-lag histogram reset.
+    #[test]
+    fn test_feed_presence_is_wired_into_main() {
+        let main_rs = std::fs::read_to_string("../app/src/main.rs")
+            .or_else(|_| std::fs::read_to_string("crates/app/src/main.rs"))
+            .expect("main.rs must be readable");
+        let init_needle = "feed_presence::init_feed_presence(";
+        let init_sites = main_rs
+            .lines()
+            .filter(|l| {
+                let t = l.trim_start();
+                !t.starts_with("//") && !t.starts_with("///") && t.contains(init_needle)
+            })
+            .count();
+        assert_eq!(
+            init_sites, 1,
+            "feed_presence::init_feed_presence must be called at EXACTLY 1 \
+             main.rs site (the PROCESS-GLOBAL boot prefix — PR-D fix round \
+             1, 2026-07-11); found {init_sites}."
+        );
+        // Source-order pin (PR-D fix round 1, review HIGH — the
+        // ratchet_tick_processor_spawns_before_reinject_await pattern):
+        // init is a GLOBAL.get() gate, so it MUST precede the Groww
+        // activation watcher spawn AND the first load_instruments call
+        // (the fast crash-recovery arm's) — a registration ordered before
+        // init is silently skipped, and a half-registered registry drains
+        // a false one-sided daily verdict at 15:45.
+        // Positions are computed over COMMENT-STRIPPED source (PR-D review
+        // round 2, LOW — the vacuous-ratchet class): a raw str::find could
+        // resolve to a future comment citing a needle literal and satisfy
+        // the ordering assertions vacuously; use the same line filter the
+        // count check above uses.
+        let stripped: String = main_rs
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let init_pos = stripped
+            .find(init_needle)
+            .expect("init_feed_presence site present");
+        let watcher_pos = stripped
+            .find("run_groww_activation_watcher(")
+            .expect("Groww activation watcher spawn present");
+        let load_pos = stripped
+            .find("load_instruments(")
+            .expect("load_instruments call present");
+        assert!(
+            init_pos < watcher_pos,
+            "init_feed_presence must precede the run_groww_activation_watcher \
+             spawn (init at stripped byte {init_pos}, watcher at \
+             {watcher_pos})"
+        );
+        assert!(
+            init_pos < load_pos,
+            "init_feed_presence must precede the first load_instruments call \
+             (init at stripped byte {init_pos}, load_instruments at \
+             {load_pos})"
+        );
+        assert!(
+            main_rs.contains("feed_presence::reset_daily("),
+            "the main.rs IST-midnight task must reset the Dhan presence \
+             bitsets (feed_presence::reset_daily) next to \
+             reset_day_lag_histogram — without it a long-lived process \
+             bleeds Friday's minutes into Monday's coverage rows."
+        );
+    }
+
     #[test]
     fn test_feed_lag_publisher_supervisor_is_wired_into_main() {
         let main_rs = std::fs::read_to_string("../app/src/main.rs")

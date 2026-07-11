@@ -604,6 +604,7 @@ jobs:
           crates/core/tests/dhat_feed_consumer.rs
           crates/core/tests/dhat_feed_lag_groww.rs
           crates/core/tests/dhat_feed_lag_ring.rs
+          crates/core/tests/dhat_feed_presence.rs
           crates/core/tests/dhat_instrument_registry.rs
           crates/core/tests/dhat_prev_close_writer.rs
           crates/core/tests/dhat_telegram_dispatcher.rs
@@ -658,6 +659,7 @@ jobs:
             --test dhat_feed_consumer \
             --test dhat_feed_lag_groww \
             --test dhat_feed_lag_ring \
+            --test dhat_feed_presence \
             --test dhat_instrument_registry \
             --test dhat_prev_close_writer \
             --test dhat_telegram_dispatcher \
@@ -675,8 +677,8 @@ jobs:
           # CI while all 9 tests passed (first live run of this lane,
           # 2026-07-09, job 86196056113).
           ran=$(grep -c 'Running.*tests/dhat_' /tmp/dhat-core.log || true)
-          if [ "$ran" -ne 10 ]; then
-            echo "::error::core DHAT step executed $ran targets, expected 10 — a --test flag was dropped from this step (drift list vs run step mismatch)."
+          if [ "$ran" -ne 11 ]; then
+            echo "::error::core DHAT step executed $ran targets, expected 11 — a --test flag was dropped from this step (drift list vs run step mismatch)."
             exit 1
           fi
 
