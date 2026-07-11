@@ -109,6 +109,10 @@ harness = false
 name = "feed_lag_ring"
 harness = false
 
+[[bench]]
+name = "feed_presence"
+harness = false
+
 # The NTM constituent proof harness imports `daily_universe_fetcher`-gated
 # modules (constituent_resolver / index_constituency / csv_parser), so it can
 # only build with that feature on. Without this declaration, auto-discovery

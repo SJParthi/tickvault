@@ -1359,6 +1359,19 @@ impl GrowwBridgeState {
                 parsed.tick.ts_ist_nanos,
                 wake_replay_window,
             );
+            // Scoreboard PR-D: per-instrument session-minute presence fold
+            // — co-located with the lag fold above (post-validate). The
+            // minute derives from the tick's own millisecond exchange
+            // stamp (one integer division — zero new clock reads); the
+            // (id, segment) key is the SAME composite the shared 21-TF
+            // engine folds on. validate_groww_tick already rejected
+            // security_id <= 0, so the u64 conversion cannot fail.
+            tickvault_core::pipeline::feed_presence::record_presence(
+                Feed::Groww,
+                u64::try_from(parsed.tick.security_id).unwrap_or(0),
+                parsed.tick.segment.binary_code(),
+                u32::try_from(parsed.tick.ts_ist_nanos / 1_000_000_000).unwrap_or(0),
+            );
             let row_received =
                 row_received_at_with_capture(parsed.capture_ns, wake_receipt_ist_nanos);
             // C2 (feed convergence): the ordered enrich → persist → aggregate
@@ -1585,6 +1598,10 @@ fn spawn_groww_ist_midnight_force_seal(
             // Friday's distribution before the next trading day fills it).
             // Cold, O(96); an empty/disabled feed's reset is a no-op.
             tickvault_core::pipeline::feed_lag_monitor::reset_day_lag_histogram(Feed::Groww);
+            // Scoreboard PR-D: reset the Groww presence bitsets at the same
+            // boundary (belt-and-braces — registration's day-change clear
+            // is the backstop). Cold, O(slots × 6).
+            tickvault_core::pipeline::feed_presence::reset_daily(Feed::Groww);
 
             // Only force-seal on trading days — a non-trading-day midnight has no
             // open buckets worth flushing (mirrors the Dhan task).
@@ -4629,6 +4646,44 @@ mod tests {
             "the Groww IST-midnight force-seal task must reset the Groww day \
              lag histogram exactly once (found {reset_sites} sites) — without \
              it Friday's distribution bleeds into Monday's scorecard row."
+        );
+    }
+
+    #[test]
+    fn test_record_presence_producer_site_wired_into_drain() {
+        // Scoreboard PR-D producer-half pin (sibling of the lag ratchet
+        // above): dropping the presence fold silently empties the Groww
+        // side of every coverage slot — the 15:45 drain then reports 375
+        // "Dhan unique win" minutes for every paired instrument (a false
+        // verdict, not a missing one).
+        let src = include_str!("groww_bridge.rs");
+        let producer_needle = format!("feed_presence::record_presence{}", "(");
+        let producer_call_sites = src
+            .lines()
+            .filter(|l| {
+                let t = l.trim_start();
+                !t.starts_with("//") && !t.starts_with("///") && t.contains(&producer_needle)
+            })
+            .count();
+        assert_eq!(
+            producer_call_sites, 1,
+            "groww_bridge.rs must fold Groww presence at EXACTLY 1 \
+             non-comment site (the validated drain hook, next to \
+             record_groww_tick); found {producer_call_sites}."
+        );
+        // The IST-midnight task must reset the Groww presence bitsets too.
+        let reset_needle = format!("feed_presence::reset_daily{}", "(Feed::Groww)");
+        let reset_sites = src
+            .lines()
+            .filter(|l| {
+                let t = l.trim_start();
+                !t.starts_with("//") && !t.starts_with("///") && t.contains(&reset_needle)
+            })
+            .count();
+        assert_eq!(
+            reset_sites, 1,
+            "the Groww IST-midnight force-seal task must reset the Groww \
+             presence bitsets exactly once (found {reset_sites} sites)."
         );
     }
 

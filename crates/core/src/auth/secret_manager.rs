@@ -1563,6 +1563,41 @@ mod tests {
     /// SLO-03 incident proved: the `tv_dhan_exchange_lag_p99_seconds`
     /// stream stops with no error!, no counter, no respawn, and the lag
     /// alarm false-OKs on missing data (`notBreaching`).
+    /// Scoreboard PR-D meta-guard: main.rs MUST (a) init the per-instrument
+    /// presence registry on BOTH boot arms BEFORE the feeds spawn (the
+    /// boot-read fold gate — one-site wiring darkens per-instrument
+    /// coverage for every mid-market crash-restart session, the exact
+    /// feed-lag round-1 lesson) and (b) reset the Dhan presence bitsets in
+    /// the IST-midnight task next to the day-lag histogram reset.
+    #[test]
+    fn test_feed_presence_is_wired_into_main() {
+        let main_rs = std::fs::read_to_string("../app/src/main.rs")
+            .or_else(|_| std::fs::read_to_string("crates/app/src/main.rs"))
+            .expect("main.rs must be readable");
+        let init_sites = main_rs
+            .lines()
+            .filter(|l| {
+                let t = l.trim_start();
+                !t.starts_with("//")
+                    && !t.starts_with("///")
+                    && t.contains("feed_presence::init_feed_presence(")
+            })
+            .count();
+        assert_eq!(
+            init_sites, 2,
+            "feed_presence::init_feed_presence must be called at EXACTLY 2 \
+             main.rs sites (fast crash-recovery arm + the process-global \
+             prefix); found {init_sites}."
+        );
+        assert!(
+            main_rs.contains("feed_presence::reset_daily("),
+            "the main.rs IST-midnight task must reset the Dhan presence \
+             bitsets (feed_presence::reset_daily) next to \
+             reset_day_lag_histogram — without it a long-lived process \
+             bleeds Friday's minutes into Monday's coverage rows."
+        );
+    }
+
     #[test]
     fn test_feed_lag_publisher_supervisor_is_wired_into_main() {
         let main_rs = std::fs::read_to_string("../app/src/main.rs")

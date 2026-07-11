@@ -312,6 +312,13 @@ pub fn build_universe_from_bytes(
     // universe (the same source the warm-snapshot path replays), so cold and
     // warm boots are provably identical here.
     super::index_futures::record_dhan_selection_from_universe(&universe, today_ist);
+    // Scoreboard PR-D: register the universe into the per-instrument
+    // presence registry (cross-feed coverage slots) — same seam as the
+    // parity recording above so cold + warm boots register identically.
+    super::presence_registration::register_dhan_presence_from_universe(
+        &universe,
+        super::presence_registration::ist_day_from_date(today_ist),
+    );
 
     Ok(universe)
 }

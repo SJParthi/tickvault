@@ -10,8 +10,9 @@
 > + the full blame taxonomy table).
 > **Tables:** `feed_scoreboard_daily` (one row per day per feed),
 > `feed_episode_audit` (one row per disconnect/stall/process-death episode,
-> blame persisted), `feed_coverage_daily` (per-instrument detail — populated
-> when the presence registry ships, PR-4).
+> blame persisted), `feed_coverage_daily` (per-instrument detail — POPULATED
+> since PR-D, 2026-07-11: one row per instrument per day from the in-memory
+> presence registry; config-gated `[scoreboard] coverage_detail_rows`).
 > **Daily Telegram:** "📊 Daily feed scorecard @ 3:45 PM IST" (Info,
 > immediate). Its absence is itself paged ("Daily feed scorecard did NOT
 > run", High).
@@ -26,7 +27,7 @@ DETERMINISTIC trading-date 15:45:00 IST stamp, so re-runs UPSERT in place.
 | Column group | Columns | Notes |
 |---|---|---|
 | Coverage | `ticks_captured`, `instruments_seen`, `unique_win_minutes`, `both_minutes`, `streaming_minutes`, `session_minutes` (375), `uptime_pct` | `-1` = source unavailable that run (NEVER a fabricated 0) |
-| Per-instrument (PR-4) | `mapped_instruments`, `unmapped_instruments`, `covered_instrument_minutes` | `-1` until the presence registry ships |
+| Per-instrument (MEASURED since PR-D, 2026-07-11) | `mapped_instruments`, `unmapped_instruments`, `covered_instrument_minutes` | Drained from the in-memory presence registry on same-day runs (per-instrument 375-minute bitsets; cross-feed slots paired by ISIN / canonical index name / future contract identity); `-1` = not measured (pre-ship days, past-day backfills — the registry is process-local + day-scoped). Since PR-D, `unique_win_minutes`/`both_minutes` are ALSO registry truth when `coverage_source` reads `in_memory`/`mixed` (the SQL minute sets remain the fallback source) |
 | Lag (MEASURED since PR-C, 2026-07-11) | `lag_p50_ms`, `lag_p99_ms`, `lag_max_ms`, `lag_samples`, `lag_floor_ms` | Drained from the in-memory per-feed DAY histograms on same-day runs (exchange→receipt, replay/re-tail excluded at record time); `-1` = not measured (pre-ship days, past-day backfills — the histograms are process-local + day-scoped — or a thin <50-sample day); `lag_floor_ms` is the honesty column (Dhan 1000 — whole-second price clock, p50/p99 can never read sub-second; Groww 1 — millisecond clock, but receipt = the sidecar capture instant one hop downstream of the socket, so the two feeds' clocks are NOT like-for-like) |
 | Episodes | `disconnects_market`, `disconnects_off_hours`, `reconnects`, `stalls`, `blame_broker`, `blame_ours`, `blame_indeterminate`, `restarts_detected` | blame tallies exclude off-hours rows |
 | Honesty | `partial_coverage`, `coverage_source` (`in_memory`/`sql_backfill`/`mixed`), `outcome` (`complete`/`partial`/`degraded`/`feed_off`) | `degraded` = the connection-event record itself under-counted that day; `feed_off` = the feed was switched off for the day (one-horse race — EXCLUDED from the month sums, round 4) |
@@ -221,13 +222,16 @@ WHERE off.trading_date_ist IS NULL
 ORDER BY d.trading_date_ist;
 ```
 
-Per-instrument worst offenders (from PR-4 onward):
+Per-instrument worst offenders (rows exist from PR-D, 2026-07-11 onward;
+`mapped = false` singleton rows carry `-1` comparison sentinels — the
+`mapped = true` filter below skips them):
 
 ```sql
 SELECT symbol_name, exchange_segment, sum(dhan_only_minutes) dhan_only,
        sum(groww_only_minutes) groww_only, sum(both_minutes) both
 FROM feed_coverage_daily
 WHERE trading_date_ist >= '2026-07-01' AND trading_date_ist < '2026-08-01'
+  AND mapped = true
 GROUP BY symbol_name, exchange_segment
 ORDER BY dhan_only + groww_only DESC LIMIT 25;
 ```
@@ -347,7 +351,15 @@ FROM feed_scoreboard_daily WHERE outcome != 'complete' ORDER BY trading_date_ist
     catch-up rerun has ZERO post-restart samples — its row keeps the
     15:45 run's measured columns via the same keep-better
     (`stage="lag_regression"` logs the suppression).
-  - Per-instrument unique-wins for pre-PR-4 days.
+  - Per-instrument unique-wins for pre-PR-D days (before 2026-07-11) AND
+    for any past-day backfill: the presence registry is process-local +
+    day-scoped, so only the day's own same-day 15:45 run (or a same-day
+    forced rerun) can read it. The coverage keep-better
+    (`stage="coverage_regression"`) folds a measured day's
+    registry-derived columns forward, so a backfill can never erase them
+    with the SQL approximation; `coverage_source` records which source
+    each row's numbers came from (`in_memory` full-session registry /
+    `mixed` post-restart partial registry / `sql_backfill`).
   - Stall episode rows for days before the stall event kind shipped
     (PR-B, 2026-07-10) — those days honestly read `stalls = 0` in the
     table and on the card (0 = "no rows existed", not "no stalls
@@ -408,8 +420,14 @@ FROM feed_scoreboard_daily WHERE outcome != 'complete' ORDER BY trading_date_ist
   watchdog's `stall_restarted` rows feed the Stalls column, 0 = measured
   0 from the ship date forward, and the PR-1 "?" footnote is retired
   (pre-ship days: see the §2 floor caveat + §4 backfill note).
-  Per-instrument detail (until PR-4) is table-only and never rendered on
-  the card, so it needs no footnote.
+  Per-instrument coverage is MEASURED since PR-D (2026-07-11): the
+  presence registry pairs instruments across feeds (ISIN for stocks,
+  canonical index name for indices, contract identity for the §36
+  futures) and the card's "Minutes only I had" line is registry truth on
+  `in_memory`/`mixed` days. Unmapped singletons are counted
+  (`unmapped_instruments`) + named in the day's logs (bounded sample) —
+  never silently dropped. Per-instrument detail stays table-only
+  (`feed_coverage_daily`), never rendered on the card.
 - The whole subsystem is toggleable: `[scoreboard] enabled = false` in
   `config/base.toml` spawns nothing (the rollback switch).
 - Failure signal: SCOREBOARD-01 in the error stream

@@ -2912,6 +2912,12 @@ async fn main() -> Result<()> {
         // this call the flagship crash-restart day produced NO episode row,
         // NO scorecard and NO Aborted page (nothing was spawned to die).
         // `notifier` here is the fast_notifier clone from above.
+        // Scoreboard PR-D: init the per-instrument presence registry
+        // BEFORE the feeds spawn (boot-read fold gate — no per-tick
+        // config access). Idempotent across boot arms.
+        tickvault_core::pipeline::feed_presence::init_feed_presence(
+            config.scoreboard.enabled && config.scoreboard.presence_fold_enabled,
+        );
         spawn_feed_scoreboard_tasks(
             &config,
             &trading_calendar,
@@ -3088,6 +3094,11 @@ async fn main() -> Result<()> {
     // 15:45 IST daily Dhan-vs-Groww aggregation + Telegram scorecard. Gated
     // on `[scoreboard] enabled` (the B12 rollback switch). See
     // `spawn_feed_scoreboard_tasks`.
+    // Scoreboard PR-D: init the per-instrument presence registry on the
+    // process-global prefix too (boot-read fold gate; idempotent).
+    tickvault_core::pipeline::feed_presence::init_feed_presence(
+        config.scoreboard.enabled && config.scoreboard.presence_fold_enabled,
+    );
     spawn_feed_scoreboard_tasks(
         &config,
         &trading_calendar,
@@ -3439,6 +3450,16 @@ async fn load_daily_universe_plan(
         tickvault_core::instrument::index_futures::record_dhan_selection_from_universe(
             &universe,
             now_ist.date_naive(),
+        );
+        // Scoreboard PR-D: register the warm universe into the
+        // per-instrument presence registry — same seam as the parity
+        // recording above (the FUTIDX-02 warm-path lesson: a seam wired
+        // only on the cold path loses the whole warm-boot trading day).
+        tickvault_core::instrument::presence_registration::register_dhan_presence_from_universe(
+            &universe,
+            tickvault_core::instrument::presence_registration::ist_day_from_date(
+                now_ist.date_naive(),
+            ),
         );
         let elapsed_ms = u64::try_from(warm_timer.elapsed().as_millis()).unwrap_or(u64::MAX);
         info!(
@@ -5370,6 +5391,12 @@ fn spawn_engine_b_aggregator(
             // Saturday-midnight `continue` must still clear Friday's
             // distribution before Monday's scorecard row). Cold, O(96).
             tickvault_core::pipeline::feed_lag_monitor::reset_day_lag_histogram(
+                tickvault_common::feed::Feed::Dhan,
+            );
+            // Scoreboard PR-D: reset the Dhan presence bitsets at the same
+            // boundary (belt-and-braces — the day-change clear at
+            // registration is the backstop). Cold, O(slots × 6).
+            tickvault_core::pipeline::feed_presence::reset_daily(
                 tickvault_common::feed::Feed::Dhan,
             );
 
@@ -14848,6 +14875,7 @@ fn spawn_feed_scoreboard_tasks(
     let sb_metrics_port = config.observability.metrics_port;
     let sb_calendar = std::sync::Arc::clone(trading_calendar);
     let sb_telegram_enabled = config.scoreboard.telegram_enabled;
+    let sb_coverage_detail = config.scoreboard.coverage_detail_rows;
     let sb_notifier = std::sync::Arc::clone(notifier);
     // Round-4 (feed-off days): the CURRENT runtime enabled flags
     // disambiguate a switched-off feed from an enabled-but-dead broker on
@@ -15120,6 +15148,9 @@ fn spawn_feed_scoreboard_tasks(
             target_ist_day,
             trading_date_label,
             forced_early_run,
+            // Scoreboard PR-D: per-instrument feed_coverage_daily rows are
+            // config-gated ([scoreboard] coverage_detail_rows).
+            sb_coverage_detail,
             // Same-day runs self-scrape the session's audit-drop counter and
             // apply the restart-day partial floor; backfills skip both
             // (round-2: the counter is CURRENT-session state; round-3: the

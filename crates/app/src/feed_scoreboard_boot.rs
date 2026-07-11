@@ -62,10 +62,12 @@ use tickvault_storage::feed_episode_audit_persistence::{
     FeedEpisodeAuditRow, FeedEpisodeAuditWriter, ensure_feed_episode_audit_table,
 };
 use tickvault_storage::feed_scoreboard_persistence::{
-    CoverageSource, FeedScoreboardDailyRow, FeedScoreboardWriter, LAG_FLOOR_MS_DHAN,
-    LAG_FLOOR_MS_GROWW, SCOREBOARD_SESSION_MINUTES, SCOREBOARD_UNAVAILABLE_SENTINEL,
-    ScoreboardOutcome, ensure_feed_scoreboard_tables,
+    CoverageSource, FeedCoverageDailyRow, FeedScoreboardDailyRow, FeedScoreboardWriter,
+    LAG_FLOOR_MS_DHAN, LAG_FLOOR_MS_GROWW, SCOREBOARD_SESSION_MINUTES,
+    SCOREBOARD_UNAVAILABLE_SENTINEL, ScoreboardOutcome, ensure_feed_scoreboard_tables,
 };
+
+use tickvault_core::pipeline::feed_presence::{FeedPresenceTotals, PresenceDrain, SlotCoverage};
 
 use crate::tick_conservation_boot::parse_questdb_count;
 
@@ -414,7 +416,9 @@ pub fn build_existing_daily_outcome_sql(target_ist_day: u64) -> String {
     let (start, end) = day_bounds_micros(target_ist_day);
     format!(
         "select feed, outcome, lag_p50_ms, lag_p99_ms, lag_max_ms, \
-         lag_samples from feed_scoreboard_daily \
+         lag_samples, unique_win_minutes, both_minutes, mapped_instruments, \
+         unmapped_instruments, covered_instrument_minutes, coverage_source \
+         from feed_scoreboard_daily \
          where ts >= {start} and ts < {end}"
     )
 }
@@ -504,6 +508,105 @@ pub fn fold_existing_lag_keep_better(
     n.lag_p99_ms = e.p99_ms;
     n.lag_max_ms = e.max_ms;
     n.lag_samples = e.samples;
+    true
+}
+
+/// One feed's EXISTING daily-row coverage columns (scoreboard PR-D) — the
+/// coverage keep-better guard input (columns 6..=11 of the SAME
+/// [`build_existing_daily_outcome_sql`] body the outcome/lag parses read).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExistingDailyCoverage {
+    pub unique_win_minutes: i64,
+    pub both_minutes: i64,
+    pub mapped_instruments: i64,
+    pub unmapped_instruments: i64,
+    pub covered_instrument_minutes: i64,
+    /// The persisted `coverage_source` label (`"in_memory"` / `"mixed"` /
+    /// `"sql_backfill"`); empty when the column is absent (pre-PR-D rows).
+    pub coverage_source: String,
+}
+
+/// Parse the [`build_existing_daily_outcome_sql`] response into a
+/// feed → existing-coverage map. Pure; `None` = unparsable body; rows
+/// without the coverage columns (pre-PR-D schema) record sentinels + an
+/// empty source label, never fabricated values.
+#[must_use]
+pub fn parse_existing_daily_coverage(
+    body: &str,
+) -> Option<BTreeMap<String, ExistingDailyCoverage>> {
+    let rows = parse_dataset(body)?;
+    let mut out = BTreeMap::new();
+    for row in rows {
+        if let Some(cols) = row.as_array()
+            && let Some(feed) = cols.first().and_then(|c| c.as_str())
+        {
+            let col = |i: usize| -> i64 {
+                cols.get(i)
+                    .and_then(serde_json::Value::as_i64)
+                    .unwrap_or(SCOREBOARD_UNAVAILABLE_SENTINEL)
+            };
+            out.insert(
+                feed.to_string(),
+                ExistingDailyCoverage {
+                    unique_win_minutes: col(6),
+                    both_minutes: col(7),
+                    mapped_instruments: col(8),
+                    unmapped_instruments: col(9),
+                    covered_instrument_minutes: col(10),
+                    coverage_source: cols
+                        .get(11)
+                        .and_then(|c| c.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                },
+            );
+        }
+    }
+    Some(out)
+}
+
+/// Rank of a coverage source for the keep-better comparison: the in-memory
+/// presence registry (exact per-instrument compare) outranks a mixed
+/// (partial-session registry) row, which outranks the SQL minute-set
+/// approximation. Unknown/absent labels rank lowest.
+#[must_use]
+pub fn coverage_source_rank(label: &str) -> u8 {
+    match label {
+        "in_memory" => 2,
+        "mixed" => 1,
+        _ => 0,
+    }
+}
+
+/// Coverage keep-better rule (scoreboard PR-D — mirror of the lag/outcome
+/// guards): a rerun whose coverage came from a LOWER-ranked source than the
+/// day's EXISTING row (a post-close deploy restart's empty registry falling
+/// back to SQL, or a past-day backfill) folds the existing measured
+/// coverage columns + source forward instead of erasing the 15:45 run's
+/// registry-derived numbers at the deterministic-ts UPSERT. A same-or-
+/// better-ranked run always writes its own values. Returns `true` when the
+/// fold fired — the caller logs `stage="coverage_regression"`. Pure.
+pub fn fold_existing_coverage_keep_better(
+    n: &mut FeedDayNumbers,
+    existing: Option<&ExistingDailyCoverage>,
+) -> bool {
+    let Some(e) = existing else {
+        return false; // no existing row — nothing to preserve
+    };
+    let existing_rank = coverage_source_rank(&e.coverage_source);
+    if coverage_source_rank(n.coverage_source.as_str()) >= existing_rank {
+        return false; // this run's source is same-or-better — it wins
+    }
+    n.unique_win_minutes = e.unique_win_minutes;
+    n.both_minutes = e.both_minutes;
+    n.mapped_instruments = e.mapped_instruments;
+    n.unmapped_instruments = e.unmapped_instruments;
+    n.covered_instrument_minutes = e.covered_instrument_minutes;
+    n.coverage_source = if existing_rank == 2 {
+        CoverageSource::InMemory
+    } else {
+        CoverageSource::Mixed
+    };
     true
 }
 
@@ -899,6 +1002,89 @@ pub fn apply_minute_overlap_and_feed_off_sentinels(
             n.both_minutes = SCOREBOARD_UNAVAILABLE_SENTINEL;
         }
     }
+}
+
+/// Step 5d (scoreboard PR-D): fold one day's drained presence-registry
+/// coverage into the per-feed numbers — flipping `unique_win_minutes` /
+/// `both_minutes` from the SQL minute-set approximation to REAL
+/// per-instrument tick presence and filling the per-instrument columns
+/// (`mapped_instruments` / `unmapped_instruments` /
+/// `covered_instrument_minutes`). `coverage_source` stamps `in_memory`
+/// when the registry covered the full session, `mixed` on a mid-day
+/// restart (the pre-restart window is invisible to the registry — the
+/// restart-day partial floor already stamps such a day partial).
+///
+/// The feed-off sentinel discipline is PRESERVED: a feed whose PARTNER
+/// was off for the day keeps the `-1` comparison sentinels (exclusive-
+/// vs-nothing is not a measurement — round 5, 2026-07-10), and a feed-off
+/// feed's own row is untouched. Pure.
+pub fn apply_presence_coverage(
+    feed_numbers: &mut BTreeMap<&'static str, FeedDayNumbers>,
+    drain: &PresenceDrain,
+    feed_off: &BTreeMap<&'static str, bool>,
+) {
+    let source = if drain.covers_full_session {
+        CoverageSource::InMemory
+    } else {
+        CoverageSource::Mixed
+    };
+    let totals: [(&str, &FeedPresenceTotals); 2] = [("dhan", &drain.dhan), ("groww", &drain.groww)];
+    for (label, t) in totals {
+        let Some(n) = feed_numbers.get_mut(label) else {
+            continue;
+        };
+        n.mapped_instruments = t.mapped_instruments;
+        n.unmapped_instruments = t.unmapped_instruments;
+        n.covered_instrument_minutes = t.covered_instrument_minutes;
+        n.coverage_source = source;
+        let partner = if label == "dhan" { "groww" } else { "dhan" };
+        if feed_off.get(partner).copied().unwrap_or(false) {
+            // Partner off — the comparison sentinels stand.
+            n.unique_win_minutes = SCOREBOARD_UNAVAILABLE_SENTINEL;
+            n.both_minutes = SCOREBOARD_UNAVAILABLE_SENTINEL;
+        } else {
+            n.unique_win_minutes = t.unique_win_minutes;
+            n.both_minutes = t.both_minutes;
+        }
+    }
+}
+
+/// Step 8b (scoreboard PR-D): build the per-instrument
+/// `feed_coverage_daily` rows from one day's drained slots. `feed` column:
+/// `'cross'` for mapped pairs, `'dhan'`/`'groww'` for singletons; singleton
+/// comparison columns carry the drain's `-1` sentinels. Pure.
+#[must_use]
+pub fn build_coverage_detail_rows(
+    slots: &[SlotCoverage],
+    ts_ist_nanos: i64,
+    trading_date_ist_nanos: i64,
+    covers_full_session: bool,
+    row_partial: bool,
+) -> Vec<FeedCoverageDailyRow> {
+    slots
+        .iter()
+        .map(|slot| FeedCoverageDailyRow {
+            ts_ist_nanos,
+            trading_date_ist_nanos,
+            security_id: slot.canonical_security_id,
+            exchange_segment: slot.segment_label.to_string(),
+            feed: if slot.mapped {
+                "cross".to_string()
+            } else if slot.dhan_registered {
+                "dhan".to_string()
+            } else {
+                "groww".to_string()
+            },
+            symbol_name: slot.symbol.clone(),
+            dhan_minutes: slot.dhan_minutes,
+            groww_minutes: slot.groww_minutes,
+            dhan_only_minutes: slot.dhan_only_minutes,
+            groww_only_minutes: slot.groww_only_minutes,
+            both_minutes: slot.both_minutes,
+            mapped: slot.mapped,
+            partial_coverage: row_partial || !covers_full_session,
+        })
+        .collect()
 }
 
 /// Per-feed episode tally from the day's `feed_episode_audit` rows.
@@ -2184,6 +2370,15 @@ pub struct FeedDayNumbers {
     pub blame_ours: i64,
     pub blame_indeterminate: i64,
     pub restarts: i64,
+    /// Per-instrument coverage columns (scoreboard PR-D) — REAL only when
+    /// the in-memory presence registry supplied them on a same-day run;
+    /// `-1` sentinels otherwise (a rerun that lost the registry folds the
+    /// day's EXISTING measured columns forward — the coverage keep-better).
+    pub mapped_instruments: i64,
+    pub unmapped_instruments: i64,
+    pub covered_instrument_minutes: i64,
+    /// Where THIS run's coverage numbers came from (per feed).
+    pub coverage_source: CoverageSource,
 }
 
 impl FeedDayNumbers {
@@ -2207,6 +2402,10 @@ impl FeedDayNumbers {
             blame_ours: s,
             blame_indeterminate: s,
             restarts: s,
+            mapped_instruments: s,
+            unmapped_instruments: s,
+            covered_instrument_minutes: s,
+            coverage_source: CoverageSource::SqlBackfill,
         }
     }
 
@@ -2300,6 +2499,7 @@ pub async fn run_feed_scoreboard(
     target_ist_day: u64,
     trading_date_label: String,
     forced_early_run: bool,
+    coverage_detail_rows: bool,
     is_same_day_run: bool,
     boot_synthesized_deaths: usize,
     boot_reconciled_rows: &[FeedEpisodeAuditRow],
@@ -2797,6 +2997,57 @@ pub async fn run_feed_scoreboard(
     //     month verdict's headline sum).
     apply_minute_overlap_and_feed_off_sentinels(&mut feed_numbers, &minute_sets, &feed_off);
 
+    // 5d. Per-instrument presence drain (scoreboard PR-D): on SAME-DAY runs
+    //     the in-memory presence registry (fed by the hot-path folds at the
+    //     same sites as the lag rings) supplies REAL per-instrument
+    //     coverage — the feed-level unique_win/both flip from the SQL
+    //     minute-set approximation to registry truth, and the
+    //     mapped/unmapped/covered columns fill in. `None` (fold disabled /
+    //     fresh post-close process / past-day backfill) keeps the SQL
+    //     numbers + sentinels, honestly — and the coverage keep-better
+    //     (6d) protects a measured existing row from being erased.
+    //     The drain is **flagged O(slots × 12 words)** — cold, once here.
+    let presence = if is_same_day_run {
+        tickvault_core::pipeline::feed_presence::drain_day(target_ist_day)
+    } else {
+        None
+    };
+    if let Some(ref d) = presence {
+        apply_presence_coverage(&mut feed_numbers, d, &feed_off);
+        // Rule 11: unmapped instruments + unregistered folds are NAMED /
+        // counted, never silently dropped. Bounded sample of unmapped
+        // symbols (≤ 20) so a vendor-master pairing drift is diagnosable
+        // from the day's logs.
+        let unmapped_sample: Vec<&str> = d
+            .slots
+            .iter()
+            .filter(|slot| !slot.mapped)
+            .take(20)
+            .map(|slot| slot.symbol.as_str())
+            .collect();
+        info!(
+            dhan_mapped = d.dhan.mapped_instruments,
+            dhan_unmapped = d.dhan.unmapped_instruments,
+            groww_mapped = d.groww.mapped_instruments,
+            groww_unmapped = d.groww.unmapped_instruments,
+            dhan_unregistered_folds = d.dhan.unregistered_folds,
+            groww_unregistered_folds = d.groww.unregistered_folds,
+            covers_full_session = d.covers_full_session,
+            ?unmapped_sample,
+            "feed_scoreboard: presence registry drained — per-instrument \
+             coverage is registry truth this run"
+        );
+        if d.overflow_dropped > 0 {
+            error!(
+                code = ErrorCode::Scoreboard01AggregationDegraded.code_str(),
+                stage = "presence_overflow",
+                overflow_dropped = d.overflow_dropped,
+                "SCOREBOARD-01: presence slot table overflowed this session — \
+                 per-instrument coverage is a floor, not a truth"
+            );
+        }
+    }
+
     // 6. Fold the episode tallies in (when the aggregate answered).
     if let Some(ref tallies) = tallies {
         for (label, n) in &mut feed_numbers {
@@ -2869,6 +3120,34 @@ pub async fn run_feed_scoreboard(
                      existing row carries a measured lag distribution — \
                      keeping the existing measured lag columns instead of \
                      overwriting them with -1"
+                );
+            }
+        }
+    }
+
+    // 6d. COVERAGE keep-better (scoreboard PR-D — mirror of the 6c lag
+    //     guard): a rerun whose coverage fell back to SQL (fresh post-close
+    //     process with an empty registry, or a past-day backfill) must not
+    //     erase the 15:45 run's registry-derived per-instrument columns at
+    //     the deterministic-ts UPSERT. Uses the SHARED step-5a body; a
+    //     failed read already errored there and the guard is OFF.
+    let existing_coverage: Option<BTreeMap<String, ExistingDailyCoverage>> = existing_daily_body
+        .as_deref()
+        .and_then(parse_existing_daily_coverage);
+    for feed in tickvault_common::feed::Feed::ALL {
+        let label = feed.as_str();
+        if let Some(n) = feed_numbers.get_mut(label) {
+            let existing = existing_coverage.as_ref().and_then(|m| m.get(label));
+            if fold_existing_coverage_keep_better(n, existing) {
+                error!(
+                    code = ErrorCode::Scoreboard01AggregationDegraded.code_str(),
+                    stage = "coverage_regression",
+                    feed = label,
+                    "SCOREBOARD-01: this rerun's coverage came from a \
+                     lower-ranked source than the day's existing row \
+                     (registry unavailable) — keeping the existing \
+                     registry-derived coverage columns instead of \
+                     overwriting them"
                 );
             }
         }
@@ -2991,9 +3270,14 @@ pub async fn run_feed_scoreboard(
             feed: label,
             ticks_captured: n.ticks,
             instruments_seen: n.instruments,
-            mapped_instruments: SCOREBOARD_UNAVAILABLE_SENTINEL,
-            unmapped_instruments: SCOREBOARD_UNAVAILABLE_SENTINEL,
-            covered_instrument_minutes: SCOREBOARD_UNAVAILABLE_SENTINEL,
+            // Scoreboard PR-D: registry-derived on same-day runs (step
+            // 5d); an unmeasured rerun folds the existing row's
+            // registry-derived values forward (step 6d coverage
+            // keep-better); -1 sentinels only when NOTHING ever measured
+            // the day.
+            mapped_instruments: n.mapped_instruments,
+            unmapped_instruments: n.unmapped_instruments,
+            covered_instrument_minutes: n.covered_instrument_minutes,
             unique_win_minutes: n.unique_win_minutes,
             both_minutes: n.both_minutes,
             // Scoreboard PR-C: measured from the in-memory day histograms
@@ -3022,7 +3306,11 @@ pub async fn run_feed_scoreboard(
             session_minutes: SCOREBOARD_SESSION_MINUTES,
             uptime_pct,
             partial_coverage: row_partial,
-            coverage_source: CoverageSource::SqlBackfill,
+            // Scoreboard PR-D: per-feed source truth — 'in_memory' when
+            // the registry covered the full session, 'mixed' on a mid-day
+            // restart, 'sql_backfill' when the registry was unavailable
+            // (or a higher-ranked existing row was folded forward, 6d).
+            coverage_source: n.coverage_source,
             // A feed switched off for the day stamps the distinct
             // 'feed_off' outcome so the month sums can exclude the
             // one-horse days (round 4, 2026-07-10).
@@ -3050,6 +3338,50 @@ pub async fn run_feed_scoreboard(
             "SCOREBOARD-01: daily rows flush failed (QuestDB down?) — the \
              DEDUP-idempotent TICKVAULT_SCOREBOARD_NOW re-run backfills"
         );
+    }
+
+    // 8b. Per-instrument coverage detail rows (scoreboard PR-D) — config-
+    //     gated ([scoreboard] coverage_detail_rows), same deterministic ts
+    //     so re-runs UPSERT in place (DEDUP: ts, trading_date_ist,
+    //     security_id, exchange_segment, feed — full I-P1-11 pair + feed).
+    //     ~1.5K rows, cold, once per run; a failed append/flush degrades
+    //     loudly and never blocks the daily rows (already flushed above).
+    if coverage_detail_rows && let Some(ref d) = presence {
+        let rows = build_coverage_detail_rows(
+            &d.slots,
+            row_ts_ist_nanos,
+            trading_date_ist_nanos,
+            d.covers_full_session,
+            row_partial,
+        );
+        let mut appended = 0usize;
+        for row in &rows {
+            if let Err(err) = writer.append_coverage_row(row) {
+                error!(
+                    code = ErrorCode::Scoreboard01AggregationDegraded.code_str(),
+                    stage = "coverage_append",
+                    security_id = row.security_id,
+                    ?err,
+                    "SCOREBOARD-01: coverage detail row append failed"
+                );
+            } else {
+                appended += 1;
+            }
+        }
+        if let Err(err) = writer.flush() {
+            error!(
+                code = ErrorCode::Scoreboard01AggregationDegraded.code_str(),
+                stage = "coverage_flush",
+                ?err,
+                "SCOREBOARD-01: coverage detail rows flush failed (QuestDB \
+                 down?) — the DEDUP-idempotent re-run backfills"
+            );
+        } else {
+            info!(
+                rows = appended,
+                "feed_scoreboard: per-instrument coverage detail rows written"
+            );
+        }
     }
 
     metrics::counter!("tv_feed_scoreboard_runs_total", "outcome" => outcome.as_str()).increment(1);
@@ -4756,6 +5088,21 @@ mod tests {
                 "lag keep-better column {col} missing: {sql}"
             );
         }
+        // Scoreboard PR-D: the coverage keep-better reads the SAME body —
+        // the coverage columns must ride the outcome query too.
+        for col in [
+            "unique_win_minutes",
+            "both_minutes",
+            "mapped_instruments",
+            "unmapped_instruments",
+            "covered_instrument_minutes",
+            "coverage_source",
+        ] {
+            assert!(
+                sql.contains(col),
+                "coverage keep-better column {col} missing: {sql}"
+            );
+        }
         assert!(
             !sql.contains(&((DAY as i64) * 86_400 * NANOS_PER_SEC).to_string()),
             "nanos literal banned: {sql}"
@@ -5448,5 +5795,202 @@ mod tests {
         assert!(scoreboard_trigger_after_auto_stop(58_500), "16:15:00");
         assert!(scoreboard_trigger_after_auto_stop(61_200), "17:00");
         assert_eq!(SCOREBOARD_TRIGGER_AUTO_STOP_WARN_SECS, 58_500);
+    }
+
+    // ---- Scoreboard PR-D: presence-registry coverage integration ----
+
+    fn presence_drain_fixture(covers_full_session: bool) -> PresenceDrain {
+        let slot = |sid: i64, mapped: bool, d: i64, g: i64, d_only: i64, g_only: i64, both: i64| {
+            SlotCoverage {
+                canonical_security_id: sid,
+                segment_label: "NSE_EQ",
+                symbol: format!("S{sid}"),
+                mapped,
+                dhan_registered: true,
+                groww_registered: mapped,
+                dhan_minutes: d,
+                groww_minutes: g,
+                dhan_only_minutes: d_only,
+                groww_only_minutes: g_only,
+                both_minutes: both,
+            }
+        };
+        PresenceDrain {
+            slots: vec![
+                slot(2885, true, 370, 372, 3, 5, 367),
+                slot(777, false, 12, 0, -1, -1, -1),
+            ],
+            dhan: FeedPresenceTotals {
+                registered_instruments: 2,
+                mapped_instruments: 1,
+                unmapped_instruments: 1,
+                covered_instrument_minutes: 382,
+                streaming_minutes: 373,
+                unique_win_minutes: 4,
+                both_minutes: 369,
+                unregistered_folds: 0,
+            },
+            groww: FeedPresenceTotals {
+                registered_instruments: 1,
+                mapped_instruments: 1,
+                unmapped_instruments: 0,
+                covered_instrument_minutes: 372,
+                streaming_minutes: 372,
+                unique_win_minutes: 3,
+                both_minutes: 369,
+                unregistered_folds: 7,
+            },
+            covers_full_session,
+            overflow_dropped: 0,
+        }
+    }
+
+    #[test]
+    fn test_apply_presence_coverage_flips_to_registry_truth() {
+        let mut nums: BTreeMap<&'static str, FeedDayNumbers> = BTreeMap::new();
+        nums.insert("dhan", FeedDayNumbers::unavailable());
+        nums.insert("groww", FeedDayNumbers::unavailable());
+        // SQL minute sets said something else — registry truth must win.
+        nums.get_mut("dhan").map(|n| n.unique_win_minutes = 99);
+        let both_on: BTreeMap<&'static str, bool> =
+            [("dhan", false), ("groww", false)].into_iter().collect();
+        apply_presence_coverage(&mut nums, &presence_drain_fixture(true), &both_on);
+        let d = nums["dhan"];
+        assert_eq!(d.unique_win_minutes, 4);
+        assert_eq!(d.both_minutes, 369);
+        assert_eq!(d.mapped_instruments, 1);
+        assert_eq!(d.unmapped_instruments, 1);
+        assert_eq!(d.covered_instrument_minutes, 382);
+        assert_eq!(d.coverage_source, CoverageSource::InMemory);
+        assert_eq!(nums["groww"].unique_win_minutes, 3);
+        // Mid-day restart → 'mixed' (partial-session registry).
+        let mut nums2: BTreeMap<&'static str, FeedDayNumbers> = BTreeMap::new();
+        nums2.insert("dhan", FeedDayNumbers::unavailable());
+        nums2.insert("groww", FeedDayNumbers::unavailable());
+        apply_presence_coverage(&mut nums2, &presence_drain_fixture(false), &both_on);
+        assert_eq!(nums2["dhan"].coverage_source, CoverageSource::Mixed);
+    }
+
+    #[test]
+    fn test_apply_presence_coverage_respects_partner_feed_off_sentinels() {
+        // Round-5 lesson preserved: exclusive-vs-nothing is not a
+        // measurement — the surviving feed keeps the -1 comparison
+        // sentinels even when the registry measured minutes.
+        let mut nums: BTreeMap<&'static str, FeedDayNumbers> = BTreeMap::new();
+        nums.insert("dhan", FeedDayNumbers::unavailable());
+        nums.insert("groww", FeedDayNumbers::unavailable());
+        let groww_off: BTreeMap<&'static str, bool> =
+            [("dhan", false), ("groww", true)].into_iter().collect();
+        apply_presence_coverage(&mut nums, &presence_drain_fixture(true), &groww_off);
+        assert_eq!(
+            nums["dhan"].unique_win_minutes, SCOREBOARD_UNAVAILABLE_SENTINEL,
+            "partner off — no competitive win"
+        );
+        assert_eq!(nums["dhan"].both_minutes, SCOREBOARD_UNAVAILABLE_SENTINEL);
+        // The per-instrument OWN-feed columns still carry the measurement.
+        assert_eq!(nums["dhan"].covered_instrument_minutes, 382);
+    }
+
+    #[test]
+    fn test_build_coverage_detail_rows_feed_labels_and_partial_flag() {
+        let d = presence_drain_fixture(true);
+        let rows = build_coverage_detail_rows(&d.slots, 1_000, 500, true, false);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].feed, "cross");
+        assert!(rows[0].mapped);
+        assert_eq!(rows[0].dhan_only_minutes, 3);
+        assert_eq!(rows[0].both_minutes, 367);
+        assert!(!rows[0].partial_coverage);
+        // Dhan-only singleton: feed='dhan', sentinel comparison columns.
+        assert_eq!(rows[1].feed, "dhan");
+        assert!(!rows[1].mapped);
+        assert_eq!(rows[1].dhan_only_minutes, -1);
+        // A partial-session registry stamps every row partial.
+        let rows = build_coverage_detail_rows(&d.slots, 1_000, 500, false, false);
+        assert!(rows.iter().all(|r| r.partial_coverage));
+        // A partial RUN stamps them too.
+        let rows = build_coverage_detail_rows(&d.slots, 1_000, 500, true, true);
+        assert!(rows.iter().all(|r| r.partial_coverage));
+    }
+
+    #[test]
+    fn test_parse_existing_daily_coverage_reads_columns_6_through_11() {
+        let body = r#"{"dataset":[["dhan","complete",1200,2900,5400,48213,14,361,740,12,270000,"in_memory"],["groww","complete",-1,-1,-1,-1,-1,-1,-1,-1,-1,"sql_backfill"]]}"#;
+        let cov = parse_existing_daily_coverage(body).expect("parse");
+        assert_eq!(
+            cov.get("dhan"),
+            Some(&ExistingDailyCoverage {
+                unique_win_minutes: 14,
+                both_minutes: 361,
+                mapped_instruments: 740,
+                unmapped_instruments: 12,
+                covered_instrument_minutes: 270_000,
+                coverage_source: "in_memory".to_string(),
+            })
+        );
+        // Pre-PR-D short rows (no coverage columns) record sentinels + an
+        // empty source label, never fabricated values.
+        let body = r#"{"dataset":[["dhan","partial",1200,2900,5400,48213]]}"#;
+        let cov = parse_existing_daily_coverage(body).expect("parse");
+        let d = cov.get("dhan").expect("row");
+        assert_eq!(d.unique_win_minutes, SCOREBOARD_UNAVAILABLE_SENTINEL);
+        assert_eq!(d.coverage_source, "");
+        assert_eq!(parse_existing_daily_coverage("not json"), None);
+    }
+
+    #[test]
+    fn test_coverage_source_rank_and_fold_existing_coverage_keep_better() {
+        assert_eq!(coverage_source_rank("in_memory"), 2);
+        assert_eq!(coverage_source_rank("mixed"), 1);
+        assert_eq!(coverage_source_rank("sql_backfill"), 0);
+        assert_eq!(coverage_source_rank(""), 0, "pre-PR-D rows rank lowest");
+
+        let existing = ExistingDailyCoverage {
+            unique_win_minutes: 14,
+            both_minutes: 361,
+            mapped_instruments: 740,
+            unmapped_instruments: 12,
+            covered_instrument_minutes: 270_000,
+            coverage_source: "in_memory".to_string(),
+        };
+        // A registry-less rerun (sql_backfill) must fold the measured
+        // in_memory row forward — the post-close catch-up erasure class.
+        let mut n = FeedDayNumbers::unavailable();
+        n.unique_win_minutes = 9; // SQL-derived
+        assert!(fold_existing_coverage_keep_better(&mut n, Some(&existing)));
+        assert_eq!(n.unique_win_minutes, 14);
+        assert_eq!(n.mapped_instruments, 740);
+        assert_eq!(n.coverage_source, CoverageSource::InMemory);
+        // A same-rank (in_memory) rerun writes its own values.
+        let mut n = FeedDayNumbers::unavailable();
+        n.coverage_source = CoverageSource::InMemory;
+        n.unique_win_minutes = 21;
+        assert!(!fold_existing_coverage_keep_better(&mut n, Some(&existing)));
+        assert_eq!(n.unique_win_minutes, 21);
+        // Mixed rerun over an in_memory row still folds forward (rank 1 < 2)
+        // and preserves the existing InMemory source label.
+        let mut n = FeedDayNumbers::unavailable();
+        n.coverage_source = CoverageSource::Mixed;
+        assert!(fold_existing_coverage_keep_better(&mut n, Some(&existing)));
+        assert_eq!(n.coverage_source, CoverageSource::InMemory);
+        // A mixed EXISTING row folds to Mixed.
+        let mut mixed_existing = existing.clone();
+        mixed_existing.coverage_source = "mixed".to_string();
+        let mut n = FeedDayNumbers::unavailable();
+        assert!(fold_existing_coverage_keep_better(
+            &mut n,
+            Some(&mixed_existing)
+        ));
+        assert_eq!(n.coverage_source, CoverageSource::Mixed);
+        // No existing row / a sql_backfill existing row: nothing to keep.
+        let mut n = FeedDayNumbers::unavailable();
+        assert!(!fold_existing_coverage_keep_better(&mut n, None));
+        let mut sql_existing = existing;
+        sql_existing.coverage_source = "sql_backfill".to_string();
+        let mut n = FeedDayNumbers::unavailable();
+        assert!(!fold_existing_coverage_keep_better(
+            &mut n,
+            Some(&sql_existing)
+        ));
     }
 }

@@ -60,6 +60,12 @@ pub mod daily_universe;
 #[cfg(feature = "daily_universe_fetcher")]
 pub mod index_futures;
 
+// Scoreboard PR-D (2026-07-11): Dhan-side presence-registry registration —
+// derives the cross-feed pairing keys (ISIN / canonical index / contract
+// identity) from the built DailyUniverse at BOTH boot seams.
+#[cfg(feature = "daily_universe_fetcher")]
+pub mod presence_registration;
+
 // Sub-PR #10 of 2026-05-27 daily-universe expansion: chain the
 // CSV parser + extractors + universe builder into a single pure
 // function. Maps each underlying error to the right INSTR-FETCH-*
