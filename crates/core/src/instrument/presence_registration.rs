@@ -76,11 +76,23 @@ pub fn dhan_presence_registrations(universe: &DailyUniverse) -> Vec<PresenceRegi
                     // Fail-closed skip — the planner pages this drop class.
                     _ => continue,
                 };
+                // Normalize the CSV expiry through NaiveDate (PR-D review
+                // round 1, LOW): chrono's `%Y-%m-%d` PARSE accepts a
+                // non-zero-padded vendor drift ("2026-7-30") that the raw
+                // string key would never match against the Groww side's
+                // always-padded `.format("%Y-%m-%d")` — silently unpairing
+                // every index future for the day. Re-emitting through the
+                // SAME formatter guarantees cross-feed key equality; an
+                // unparsable expiry falls back to the raw string (fail-soft
+                // feed-local singleton, visible as unmapped at drain).
+                let raw = target.csv_row.expiry_date.trim();
+                let expiry = chrono::NaiveDate::parse_from_str(raw, "%Y-%m-%d")
+                    .map_or_else(|_| raw.to_string(), |d| d.format("%Y-%m-%d").to_string());
                 (
                     seg,
                     Some(PairingKey::Future {
                         underlying: canonicalize_index_symbol(&target.csv_row.underlying_symbol),
-                        expiry: target.csv_row.expiry_date.trim().to_string(),
+                        expiry,
                     }),
                 )
             }
@@ -215,6 +227,30 @@ mod tests {
             regs[3].pairing,
             Some(PairingKey::Future {
                 underlying: "SENSEX".to_string(),
+                expiry: "2026-07-30".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn test_future_expiry_key_is_normalized_to_zero_padded_iso() {
+        // PR-D review round 1 (LOW): a non-zero-padded Dhan CSV expiry
+        // ("2026-7-30") passes the FUTIDX selector's chrono parse but the
+        // RAW string key would never equal the Groww side's padded
+        // "2026-07-30" — normalize through NaiveDate so both feeds emit
+        // the identical Future pairing key.
+        let mut fut_row = row("35001", "NSE_FNO", "NIFTY-Jul2026-FUT", "");
+        fut_row.underlying_symbol = "NIFTY".to_string();
+        fut_row.expiry_date = " 2026-7-30 ".to_string();
+        let universe = DailyUniverse {
+            subscription_targets: vec![target(InstrumentRole::IndexFuture, fut_row)],
+            fno_contracts: vec![],
+        };
+        let regs = dhan_presence_registrations(&universe);
+        assert_eq!(
+            regs[0].pairing,
+            Some(PairingKey::Future {
+                underlying: "NIFTY".to_string(),
                 expiry: "2026-07-30".to_string(),
             })
         );

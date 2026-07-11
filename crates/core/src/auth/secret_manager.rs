@@ -1574,20 +1574,45 @@ mod tests {
         let main_rs = std::fs::read_to_string("../app/src/main.rs")
             .or_else(|_| std::fs::read_to_string("crates/app/src/main.rs"))
             .expect("main.rs must be readable");
+        let init_needle = "feed_presence::init_feed_presence(";
         let init_sites = main_rs
             .lines()
             .filter(|l| {
                 let t = l.trim_start();
-                !t.starts_with("//")
-                    && !t.starts_with("///")
-                    && t.contains("feed_presence::init_feed_presence(")
+                !t.starts_with("//") && !t.starts_with("///") && t.contains(init_needle)
             })
             .count();
         assert_eq!(
-            init_sites, 2,
-            "feed_presence::init_feed_presence must be called at EXACTLY 2 \
-             main.rs sites (fast crash-recovery arm + the process-global \
-             prefix); found {init_sites}."
+            init_sites, 1,
+            "feed_presence::init_feed_presence must be called at EXACTLY 1 \
+             main.rs site (the PROCESS-GLOBAL boot prefix — PR-D fix round \
+             1, 2026-07-11); found {init_sites}."
+        );
+        // Source-order pin (PR-D fix round 1, review HIGH — the
+        // ratchet_tick_processor_spawns_before_reinject_await pattern):
+        // init is a GLOBAL.get() gate, so it MUST precede the Groww
+        // activation watcher spawn AND the first load_instruments call
+        // (the fast crash-recovery arm's) — a registration ordered before
+        // init is silently skipped, and a half-registered registry drains
+        // a false one-sided daily verdict at 15:45.
+        let init_pos = main_rs
+            .find(init_needle)
+            .expect("init_feed_presence site present");
+        let watcher_pos = main_rs
+            .find("run_groww_activation_watcher(")
+            .expect("Groww activation watcher spawn present");
+        let load_pos = main_rs
+            .find("load_instruments(")
+            .expect("load_instruments call present");
+        assert!(
+            init_pos < watcher_pos,
+            "init_feed_presence must precede the run_groww_activation_watcher \
+             spawn (init at byte {init_pos}, watcher at {watcher_pos})"
+        );
+        assert!(
+            init_pos < load_pos,
+            "init_feed_presence must precede the first load_instruments call \
+             (init at byte {init_pos}, load_instruments at {load_pos})"
         );
         assert!(
             main_rs.contains("feed_presence::reset_daily("),

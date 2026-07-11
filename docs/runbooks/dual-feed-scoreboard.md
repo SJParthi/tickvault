@@ -451,3 +451,12 @@ FROM feed_scoreboard_daily WHERE outcome != 'complete' ORDER BY trading_date_ist
       Groww-only by construction (the Dhan main-feed's silent-socket
       recoveries live in its disconnect/reconnect rows) — compare
       incident totals, never the stalls column across feeds.
+- [ ] `coverage_source='mixed'` days: the feed-level `unique_win_minutes`
+      / `both_minutes` are the SQL minute-set values (PR-D fix round 1 —
+      the partial-session registry window is cross-feed ASYMMETRIC on
+      restart days, so only a full-session registry flips those two
+      columns); the per-instrument mapped/unmapped/covered columns are
+      the registry's PARTIAL measurement on such a day. Residual (dev/
+      manual midnight-crossing runs): a post-09:15 FIRST registration
+      also stamps `mixed` — the destroyed pre-registration minutes are
+      not recovered, only honestly labelled.

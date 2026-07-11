@@ -583,9 +583,18 @@ pub fn coverage_source_rank(label: &str) -> u8 {
 /// day's EXISTING row (a post-close deploy restart's empty registry falling
 /// back to SQL, or a past-day backfill) folds the existing measured
 /// coverage columns + source forward instead of erasing the 15:45 run's
-/// registry-derived numbers at the deterministic-ts UPSERT. A same-or-
-/// better-ranked run always writes its own values. Returns `true` when the
-/// fold fired — the caller logs `stage="coverage_regression"`. Pure.
+/// registry-derived numbers at the deterministic-ts UPSERT. A strictly
+/// better-ranked run always writes its own values.
+///
+/// **Equal rank is VALUE-AWARE** (PR-D review round 1, HIGH): an evening
+/// same-day rerun re-registers today's slots (warm-snapshot boot) but its
+/// fresh process folded ZERO bits — equal-rank 'mixed' vs 'mixed' would
+/// otherwise erase the 15:45 run's measured coverage with zeros. A rerun
+/// that measured materially nothing (`covered_instrument_minutes == 0`)
+/// while the existing row measured something folds the existing row
+/// forward — the outcome keep-better's measured-zero precedent (round 5,
+/// 2026-07-10). Returns `true` when the fold fired — the caller logs
+/// `stage="coverage_regression"` and skips the step-8b detail rows. Pure.
 pub fn fold_existing_coverage_keep_better(
     n: &mut FeedDayNumbers,
     existing: Option<&ExistingDailyCoverage>,
@@ -594,8 +603,14 @@ pub fn fold_existing_coverage_keep_better(
         return false; // no existing row — nothing to preserve
     };
     let existing_rank = coverage_source_rank(&e.coverage_source);
-    if coverage_source_rank(n.coverage_source.as_str()) >= existing_rank {
-        return false; // this run's source is same-or-better — it wins
+    let new_rank = coverage_source_rank(n.coverage_source.as_str());
+    if new_rank > existing_rank {
+        return false; // this run's source is strictly better — it wins
+    }
+    if new_rank == existing_rank
+        && !(n.covered_instrument_minutes == 0 && e.covered_instrument_minutes > 0)
+    {
+        return false; // equal rank + a material measurement — it wins
     }
     n.unique_win_minutes = e.unique_win_minutes;
     n.both_minutes = e.both_minutes;
@@ -1011,13 +1026,28 @@ pub fn apply_minute_overlap_and_feed_off_sentinels(
 /// (`mapped_instruments` / `unmapped_instruments` /
 /// `covered_instrument_minutes`). `coverage_source` stamps `in_memory`
 /// when the registry covered the full session, `mixed` on a mid-day
-/// restart (the pre-restart window is invisible to the registry — the
-/// restart-day partial floor already stamps such a day partial).
+/// restart or late registration (the pre-restart / pre-registration
+/// window is invisible to the registry — the restart-day partial floor
+/// already stamps such a day partial).
 ///
-/// The feed-off sentinel discipline is PRESERVED: a feed whose PARTNER
-/// was off for the day keeps the `-1` comparison sentinels (exclusive-
-/// vs-nothing is not a measurement — round 5, 2026-07-10), and a feed-off
-/// feed's own row is untouched. Pure.
+/// **The feed-level unique_win/both flip is GATED on
+/// `covers_full_session`** (PR-D review round 1, HIGH): on a restart day
+/// the two feeds' registries recover the pre-restart window through
+/// DIFFERENT mechanisms (Dhan WAL re-injection vs Groww NDJSON re-tail /
+/// offset-resume) — a cross-feed ASYMMETRIC window whose recovered
+/// minutes would fabricate "unique wins" for whichever feed replayed
+/// more. The step-5c SQL minute sets (same [09:15, 15:30) window, read
+/// from the durable full-day `ticks` table) are symmetric and strictly
+/// more complete on such a day, so they STAND on `mixed` days; only the
+/// per-instrument OWN-feed columns (mapped/unmapped/covered) take the
+/// registry's partial measurement.
+///
+/// The feed-off discipline is PRESERVED and now matches this doc (PR-D
+/// review round 1, LOW): a feed-off feed's OWN row is untouched (its
+/// registry measured nothing — a 'measured' coverage_source label on it
+/// would be a false-OK), and a feed whose PARTNER was off keeps the `-1`
+/// comparison sentinels (exclusive-vs-nothing is not a measurement —
+/// round 5, 2026-07-10). Pure.
 pub fn apply_presence_coverage(
     feed_numbers: &mut BTreeMap<&'static str, FeedDayNumbers>,
     drain: &PresenceDrain,
@@ -1030,6 +1060,12 @@ pub fn apply_presence_coverage(
     };
     let totals: [(&str, &FeedPresenceTotals); 2] = [("dhan", &drain.dhan), ("groww", &drain.groww)];
     for (label, t) in totals {
+        if feed_off.get(label).copied().unwrap_or(false) {
+            // The OFF feed's own row is untouched — its registry measured
+            // nothing for the day; stamping 'in_memory'/'mixed' zeros on
+            // it would present an un-measurement as a measurement.
+            continue;
+        }
         let Some(n) = feed_numbers.get_mut(label) else {
             continue;
         };
@@ -1042,11 +1078,30 @@ pub fn apply_presence_coverage(
             // Partner off — the comparison sentinels stand.
             n.unique_win_minutes = SCOREBOARD_UNAVAILABLE_SENTINEL;
             n.both_minutes = SCOREBOARD_UNAVAILABLE_SENTINEL;
-        } else {
+        } else if drain.covers_full_session {
             n.unique_win_minutes = t.unique_win_minutes;
             n.both_minutes = t.both_minutes;
         }
+        // else: mixed — the symmetric full-day SQL minute-set values
+        // stamped by step 5c stand for the two comparison columns.
     }
+}
+
+/// PR-D fix round 1 (review HIGH): a HALF-REGISTERED registry must never
+/// persist a one-sided verdict. Returns the label of a feed whose drained
+/// union is EMPTY (zero streaming minutes) while the hot fold PROVABLY saw
+/// that feed's ticks this session (`unregistered_folds > 0`) — i.e. the
+/// feed streamed but its registration never landed (the init-ordering /
+/// CSV-retry-ladder class). The caller then DISCARDS the whole drain
+/// (keeping the SQL minute-set approximation for the day) with a coded
+/// SCOREBOARD-01 log — never a fabricated "partner won every minute" row.
+/// Pure.
+#[must_use]
+pub fn presence_drain_one_sided_feed(d: &PresenceDrain) -> Option<&'static str> {
+    [("dhan", &d.dhan), ("groww", &d.groww)]
+        .into_iter()
+        .find(|(_, t)| t.streaming_minutes == 0 && t.unregistered_folds > 0)
+        .map(|(label, _)| label)
 }
 
 /// Step 8b (scoreboard PR-D): build the per-instrument
@@ -3012,6 +3067,33 @@ pub async fn run_feed_scoreboard(
     } else {
         None
     };
+    // PR-D fix round 1 (review HIGH): refuse a ONE-SIDED drain — a feed
+    // whose union is empty while its unregistered-fold counter proves it
+    // streamed this session never got its registration (init-ordering /
+    // CSV-retry-ladder class). Persisting that drain would fabricate a
+    // "partner won every minute" verdict; discard it and let the SQL
+    // minute-set approximation stand for the day.
+    let presence = presence.and_then(|d| {
+        if let Some(feed) = presence_drain_one_sided_feed(&d) {
+            error!(
+                code = ErrorCode::Scoreboard01AggregationDegraded.code_str(),
+                stage = "presence_one_sided",
+                feed,
+                unregistered_folds = if feed == "dhan" {
+                    d.dhan.unregistered_folds
+                } else {
+                    d.groww.unregistered_folds
+                },
+                "SCOREBOARD-01: presence registry is one-sided — {feed} \
+                 streamed ticks this session but its registration never \
+                 landed (empty union + unregistered folds). Discarding the \
+                 drain; the SQL minute-set approximation stands for the day."
+            );
+            None
+        } else {
+            Some(d)
+        }
+    });
     if let Some(ref d) = presence {
         apply_presence_coverage(&mut feed_numbers, d, &feed_off);
         // Rule 11: unmapped instruments + unregistered folds are NAMED /
@@ -3134,11 +3216,13 @@ pub async fn run_feed_scoreboard(
     let existing_coverage: Option<BTreeMap<String, ExistingDailyCoverage>> = existing_daily_body
         .as_deref()
         .and_then(parse_existing_daily_coverage);
+    let mut coverage_kept_existing = false;
     for feed in tickvault_common::feed::Feed::ALL {
         let label = feed.as_str();
         if let Some(n) = feed_numbers.get_mut(label) {
             let existing = existing_coverage.as_ref().and_then(|m| m.get(label));
             if fold_existing_coverage_keep_better(n, existing) {
+                coverage_kept_existing = true;
                 error!(
                     code = ErrorCode::Scoreboard01AggregationDegraded.code_str(),
                     stage = "coverage_regression",
@@ -3346,7 +3430,25 @@ pub async fn run_feed_scoreboard(
     //     security_id, exchange_segment, feed — full I-P1-11 pair + feed).
     //     ~1.5K rows, cold, once per run; a failed append/flush degrades
     //     loudly and never blocks the daily rows (already flushed above).
-    if coverage_detail_rows && let Some(ref d) = presence {
+    //     PR-D fix round 1 (review MEDIUM): 8b is additionally gated on
+    //     the 6d verdict — when 6d folded the day's EXISTING coverage
+    //     forward for any feed, this run's drain is provably
+    //     lower-fidelity (an evening rerun's zero-bit registry / a
+    //     registry-less fallback), so writing its detail rows would
+    //     clobber the 15:45 run's real per-instrument rows at the same
+    //     DEDUP key (and, on a one-lane re-registration, ADD phantom
+    //     singleton rows under a flipped feed key).
+    if coverage_detail_rows && coverage_kept_existing && presence.is_some() {
+        info!(
+            "feed_scoreboard: per-instrument coverage detail rows SKIPPED — \
+             this run's drain is lower-fidelity than the day's existing row \
+             (6d coverage keep-better fired); the existing detail rows stand"
+        );
+    }
+    if coverage_detail_rows
+        && !coverage_kept_existing
+        && let Some(ref d) = presence
+    {
         let rows = build_coverage_detail_rows(
             &d.slots,
             row_ts_ist_nanos,
@@ -5851,7 +5953,9 @@ mod tests {
         nums.insert("dhan", FeedDayNumbers::unavailable());
         nums.insert("groww", FeedDayNumbers::unavailable());
         // SQL minute sets said something else — registry truth must win.
-        nums.get_mut("dhan").map(|n| n.unique_win_minutes = 99);
+        if let Some(n) = nums.get_mut("dhan") {
+            n.unique_win_minutes = 99;
+        }
         let both_on: BTreeMap<&'static str, bool> =
             [("dhan", false), ("groww", false)].into_iter().collect();
         apply_presence_coverage(&mut nums, &presence_drain_fixture(true), &both_on);
@@ -5863,12 +5967,54 @@ mod tests {
         assert_eq!(d.covered_instrument_minutes, 382);
         assert_eq!(d.coverage_source, CoverageSource::InMemory);
         assert_eq!(nums["groww"].unique_win_minutes, 3);
-        // Mid-day restart → 'mixed' (partial-session registry).
-        let mut nums2: BTreeMap<&'static str, FeedDayNumbers> = BTreeMap::new();
-        nums2.insert("dhan", FeedDayNumbers::unavailable());
-        nums2.insert("groww", FeedDayNumbers::unavailable());
-        apply_presence_coverage(&mut nums2, &presence_drain_fixture(false), &both_on);
-        assert_eq!(nums2["dhan"].coverage_source, CoverageSource::Mixed);
+    }
+
+    #[test]
+    fn test_apply_presence_coverage_mixed_day_keeps_sql_unique_win_both() {
+        // PR-D fix round 1 (review HIGH): on a partial-session drain
+        // ('mixed' — mid-day restart / late registration) the registry
+        // window is cross-feed ASYMMETRIC (WAL re-injection vs NDJSON
+        // re-tail), so the feed-level unique_win/both flip is REFUSED —
+        // the symmetric full-day step-5c SQL values stand; only the
+        // per-instrument own-feed columns take the registry measurement.
+        let mut nums: BTreeMap<&'static str, FeedDayNumbers> = BTreeMap::new();
+        nums.insert("dhan", FeedDayNumbers::unavailable());
+        nums.insert("groww", FeedDayNumbers::unavailable());
+        if let Some(n) = nums.get_mut("dhan") {
+            n.unique_win_minutes = 99; // the step-5c SQL value
+            n.both_minutes = 200;
+        }
+        let both_on: BTreeMap<&'static str, bool> =
+            [("dhan", false), ("groww", false)].into_iter().collect();
+        apply_presence_coverage(&mut nums, &presence_drain_fixture(false), &both_on);
+        let d = nums["dhan"];
+        assert_eq!(d.coverage_source, CoverageSource::Mixed);
+        assert_eq!(d.unique_win_minutes, 99, "SQL value stands on mixed");
+        assert_eq!(d.both_minutes, 200, "SQL value stands on mixed");
+        // The own-feed per-instrument columns still take the (partial)
+        // registry measurement.
+        assert_eq!(d.mapped_instruments, 1);
+        assert_eq!(d.covered_instrument_minutes, 382);
+    }
+
+    #[test]
+    fn test_presence_drain_one_sided_feed_detection() {
+        // PR-D fix round 1 (review HIGH): a feed with an EMPTY union that
+        // provably streamed (unregistered folds) marks the drain one-sided.
+        let mut d = presence_drain_fixture(true);
+        assert_eq!(presence_drain_one_sided_feed(&d), None, "healthy drain");
+        d.dhan.streaming_minutes = 0;
+        d.dhan.unregistered_folds = 12_345;
+        assert_eq!(presence_drain_one_sided_feed(&d), Some("dhan"));
+        // A genuinely silent feed (zero union, zero folds) is NOT
+        // one-sided — "the partner won" is then a real measurement.
+        d.dhan.unregistered_folds = 0;
+        assert_eq!(presence_drain_one_sided_feed(&d), None);
+        // And the Groww side mirrors.
+        let mut d = presence_drain_fixture(true);
+        d.groww.streaming_minutes = 0;
+        d.groww.unregistered_folds = 1;
+        assert_eq!(presence_drain_one_sided_feed(&d), Some("groww"));
     }
 
     #[test]
@@ -5889,6 +6035,10 @@ mod tests {
         assert_eq!(nums["dhan"].both_minutes, SCOREBOARD_UNAVAILABLE_SENTINEL);
         // The per-instrument OWN-feed columns still carry the measurement.
         assert_eq!(nums["dhan"].covered_instrument_minutes, 382);
+        // PR-D fix round 1 (review LOW — the doc/code mismatch): the OFF
+        // feed's OWN row is genuinely untouched — no registry zeros, no
+        // 'in_memory' stamp on a day its registry measured nothing.
+        assert_eq!(nums["groww"], FeedDayNumbers::unavailable());
     }
 
     #[test]
@@ -5961,10 +6111,11 @@ mod tests {
         assert_eq!(n.unique_win_minutes, 14);
         assert_eq!(n.mapped_instruments, 740);
         assert_eq!(n.coverage_source, CoverageSource::InMemory);
-        // A same-rank (in_memory) rerun writes its own values.
+        // A same-rank (in_memory) rerun that MEASURED writes its own values.
         let mut n = FeedDayNumbers::unavailable();
         n.coverage_source = CoverageSource::InMemory;
         n.unique_win_minutes = 21;
+        n.covered_instrument_minutes = 250_000;
         assert!(!fold_existing_coverage_keep_better(&mut n, Some(&existing)));
         assert_eq!(n.unique_win_minutes, 21);
         // Mixed rerun over an in_memory row still folds forward (rank 1 < 2)
@@ -5991,6 +6142,48 @@ mod tests {
         assert!(!fold_existing_coverage_keep_better(
             &mut n,
             Some(&sql_existing)
+        ));
+    }
+
+    #[test]
+    fn test_fold_existing_coverage_keep_better_equal_rank_zero_drain() {
+        // PR-D fix round 1 (review HIGH): an evening same-day rerun
+        // re-registers today's slots (warm-snapshot boot) but its fresh
+        // process folded ZERO bits — equal-rank 'mixed' vs 'mixed' must
+        // NOT erase the 15:45 run's measured coverage with zeros (the
+        // outcome keep-better's measured-zero precedent, round 5).
+        let existing = ExistingDailyCoverage {
+            unique_win_minutes: 30,
+            both_minutes: 300,
+            mapped_instruments: 740,
+            unmapped_instruments: 12,
+            covered_instrument_minutes: 270_000,
+            coverage_source: "mixed".to_string(),
+        };
+        let mut n = FeedDayNumbers::unavailable();
+        n.coverage_source = CoverageSource::Mixed;
+        n.covered_instrument_minutes = 0; // registered, zero bits folded
+        n.mapped_instruments = 740;
+        assert!(fold_existing_coverage_keep_better(&mut n, Some(&existing)));
+        assert_eq!(n.covered_instrument_minutes, 270_000);
+        assert_eq!(n.unique_win_minutes, 30);
+        assert_eq!(n.coverage_source, CoverageSource::Mixed);
+        // An equal-rank rerun that DID measure still writes its own values.
+        let mut n = FeedDayNumbers::unavailable();
+        n.coverage_source = CoverageSource::Mixed;
+        n.covered_instrument_minutes = 5;
+        assert!(!fold_existing_coverage_keep_better(&mut n, Some(&existing)));
+        assert_eq!(n.covered_instrument_minutes, 5);
+        // A zero-measured rerun over a ZERO-measured existing row also
+        // writes its own values (nothing material to preserve).
+        let mut zero_existing = existing;
+        zero_existing.covered_instrument_minutes = 0;
+        let mut n = FeedDayNumbers::unavailable();
+        n.coverage_source = CoverageSource::Mixed;
+        n.covered_instrument_minutes = 0;
+        assert!(!fold_existing_coverage_keep_better(
+            &mut n,
+            Some(&zero_existing)
         ));
     }
 }

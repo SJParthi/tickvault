@@ -66,6 +66,20 @@
 //!   session open — the scoreboard stamps `coverage_source='mixed'` and
 //!   the day partial, never fabricates (the established
 //!   restart-day-partial-floor pattern).
+//! - **Late first registration degrades the stamp too** (PR-D review
+//!   round 1, 2026-07-11): on a midnight-crossing process (dev/manual
+//!   runs; prod restarts daily) the maps keep routing D+1 session ticks
+//!   into slots still stamped day D. When the D+1 registration finally
+//!   lands (the §4 infinite CSV-retry ladder makes a post-09:15 landing
+//!   a designed possibility), the day-change clear zeroes those
+//!   genuinely-observed same-day pre-registration bits. The drain
+//!   therefore folds each feed's FIRST registration instant for the
+//!   target day into `covers_full_session` — a first registration after
+//!   session open degrades the stamp to `mixed` instead of over-claiming
+//!   full-session truth over a window it destroyed. Residual (bounded to
+//!   the same dev/manual-run envelope as the FUTIDX per-boot split): the
+//!   destroyed pre-registration minutes are not recovered — the SQL
+//!   minute sets remain the full-day approximation for such a day.
 //! - "Presence" = a tick WE received at our capture boundary — not proof
 //!   the exchange traded that minute (both vendors sample; the
 //!   tick-conservation §F wording applies).
@@ -245,6 +259,12 @@ struct SlotMeta {
 struct SlotTable {
     by_key: HashMap<SlotKey, u32>,
     meta: Vec<SlotMeta>,
+    /// Per feed: `(ist_day, instant)` of the FIRST registration call for
+    /// that day — drained into `covers_full_session` so a late first
+    /// registration (whose day-change clear destroyed the same-day
+    /// pre-registration bits) degrades the stamp to `mixed` (PR-D review
+    /// round 1, 2026-07-11).
+    first_registration: [Option<(u64, i64)>; Feed::COUNT],
 }
 
 /// The registry. One process-global instance behind [`init_feed_presence`].
@@ -331,6 +351,10 @@ impl FeedPresenceRegistry {
     /// day stamp; a NEW day clears the slot's bits for that feed first
     /// (correct even if the midnight reset was missed).
     ///
+    /// `now_ist_nanos` stamps the feed's FIRST registration instant for
+    /// `ist_day` (first call wins) — [`drain_day`] folds a post-session-open
+    /// first registration into `covers_full_session` (PR-D review round 1).
+    ///
     /// # Performance
     /// **O(universe) under a Mutex — cold path** (once per feed per day at
     /// the universe/watch build), never on the tick thread.
@@ -339,12 +363,19 @@ impl FeedPresenceRegistry {
         feed: Feed,
         ist_day: u64,
         regs: &[PresenceRegistration],
+        now_ist_nanos: i64,
     ) -> PresenceRegisterSummary {
         let mut table = self
             .slots
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let fi = feed.index();
+        // First-registration instant for this (feed, day) — first call
+        // wins; a later same-day re-registration never un-degrades.
+        match table.first_registration[fi] {
+            Some((day, _)) if day == ist_day => {}
+            _ => table.first_registration[fi] = Some((ist_day, now_ist_nanos)),
+        }
         let mut summary = PresenceRegisterSummary::default();
         let guard = self.maps[fi].pin();
         for reg in regs {
@@ -441,8 +472,10 @@ impl FeedPresenceRegistry {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut slots_out = Vec::new();
-        let mut union = [[0u64; PRESENCE_WORDS_PER_SLOT]; 2];
-        let mut totals = [FeedPresenceTotals::default(); 2];
+        // Feed::COUNT-sized (never hand-counted — the NTM 2-role→3-role
+        // boot-panic lesson pinned in `feed.rs`; PR-D review round 1 LOW).
+        let mut union = [[0u64; PRESENCE_WORDS_PER_SLOT]; Feed::COUNT];
+        let mut totals = [FeedPresenceTotals::default(); Feed::COUNT];
         let to_i64 = |v: u32| i64::from(v);
         for (idx, meta) in table.meta.iter().enumerate() {
             let dhan_day = meta.registered_day[Feed::Dhan.index()] == Some(target_ist_day);
@@ -556,11 +589,28 @@ impl FeedPresenceRegistry {
             .unwrap_or(i64::MAX / (86_400 * NANOS_PER_SEC))
             .saturating_mul(86_400 * NANOS_PER_SEC)
             .saturating_add(i64::from(PRESENCE_SESSION_START_SECS_OF_DAY_IST) * NANOS_PER_SEC);
+        // ... AND every drained feed's FIRST registration for the target
+        // day must precede the open (PR-D review round 1, 2026-07-11): a
+        // late first registration destroyed (day-change clear) or missed
+        // (unregistered folds) the 09:15→registration window, so the drain
+        // must not claim full-session truth over it.
+        let mut late_first_registration = false;
+        for feed in Feed::ALL {
+            let fi = feed.index();
+            if totals[fi].registered_instruments > 0
+                && let Some((day, at)) = table.first_registration[fi]
+                && day == target_ist_day
+                && at > session_open_ist_nanos
+            {
+                late_first_registration = true;
+            }
+        }
         Some(PresenceDrain {
             slots: slots_out,
             dhan: totals[Feed::Dhan.index()],
             groww: totals[Feed::Groww.index()],
-            covers_full_session: self.process_start_ist_nanos <= session_open_ist_nanos,
+            covers_full_session: self.process_start_ist_nanos <= session_open_ist_nanos
+                && !late_first_registration,
             overflow_dropped: i64::try_from(self.overflow_dropped.load(Ordering::Relaxed))
                 .unwrap_or(i64::MAX),
         })
@@ -571,15 +621,24 @@ impl FeedPresenceRegistry {
 /// `DHAN_LAG_RING` / `global_tick_gap_detector`).
 static GLOBAL: OnceLock<FeedPresenceRegistry> = OnceLock::new();
 
-/// Boot-time init (both main.rs boot arms, before the feeds spawn).
+/// Current IST wall-clock in nanos (the shared init/registration stamp).
+fn ist_now_nanos() -> i64 {
+    chrono::Utc::now()
+        .timestamp_nanos_opt()
+        .unwrap_or(0)
+        .saturating_add(tickvault_common::constants::IST_UTC_OFFSET_NANOS)
+}
+
+/// Boot-time init — the main.rs PROCESS-GLOBAL boot prefix, BEFORE the
+/// Groww activation watcher spawn and before either boot arm's
+/// `load_instruments` (PR-D review round 1, 2026-07-11: `register_
+/// instruments` is a `GLOBAL.get()` free fn that silently no-ops pre-init,
+/// so a registration ordered before init lost that feed's whole day).
 /// Idempotent: the first call constructs; later calls only refresh the
 /// enabled gate. `enabled` = `[scoreboard] enabled && presence_fold_enabled`
 /// (boot-read — no per-tick config access).
 pub fn init_feed_presence(enabled: bool) {
-    let start_ist_nanos = chrono::Utc::now()
-        .timestamp_nanos_opt()
-        .unwrap_or(0)
-        .saturating_add(tickvault_common::constants::IST_UTC_OFFSET_NANOS);
+    let start_ist_nanos = ist_now_nanos();
     let reg = GLOBAL.get_or_init(|| FeedPresenceRegistry::new(enabled, start_ist_nanos));
     reg.enabled.store(enabled, Ordering::Relaxed);
 }
@@ -600,9 +659,10 @@ pub fn register_instruments(
     ist_day: u64,
     regs: &[PresenceRegistration],
 ) -> Option<PresenceRegisterSummary> {
+    let now_ist_nanos = ist_now_nanos();
     GLOBAL
         .get()
-        .map(|reg| reg.register_instruments(feed, ist_day, regs))
+        .map(|reg| reg.register_instruments(feed, ist_day, regs, now_ist_nanos))
 }
 
 /// Cold-path day drain free fn (the 15:45 scoreboard input).
@@ -644,6 +704,13 @@ mod tests {
     /// 09:15:00 IST on `DAY`, as IST epoch secs.
     fn session_secs(offset: u32) -> u32 {
         u32::try_from(DAY * 86_400).unwrap_or(0) + PRESENCE_SESSION_START_SECS_OF_DAY_IST + offset
+    }
+
+    /// Registration instant used by the default test registrations: IST
+    /// midnight of `DAY` — safely BEFORE the 09:15 session open (so the
+    /// late-first-registration degrade never fires unless a test wants it).
+    fn reg_now() -> i64 {
+        i64::try_from(DAY).unwrap_or(0) * 86_400 * NANOS_PER_SEC
     }
 
     fn registry_for_day() -> FeedPresenceRegistry {
@@ -697,11 +764,13 @@ mod tests {
             Feed::Dhan,
             DAY,
             &[reg(2885, 1, "NSE_EQ", "RELIANCE", isin())],
+            reg_now(),
         );
         r.register_instruments(
             Feed::Groww,
             DAY,
             &[reg(1333, 1, "NSE_EQ", "RELIANCE", isin())],
+            reg_now(),
         );
         // Dhan ticks minutes 0 + 1; Groww ticks minutes 1 + 2.
         r.record_presence(Feed::Dhan, 2885, 1, session_secs(0));
@@ -734,8 +803,14 @@ mod tests {
             Feed::Groww,
             DAY,
             &[reg(0x4000_0000_0000_1234, 0, "IDX_I", "NSE-NIFTY", key())],
+            reg_now(),
         );
-        r.register_instruments(Feed::Dhan, DAY, &[reg(13, 0, "IDX_I", "NIFTY", key())]);
+        r.register_instruments(
+            Feed::Dhan,
+            DAY,
+            &[reg(13, 0, "IDX_I", "NIFTY", key())],
+            reg_now(),
+        );
         let d = r.drain_day(DAY).expect("drain");
         assert_eq!(d.slots.len(), 1);
         assert_eq!(d.slots[0].canonical_security_id, 13);
@@ -756,11 +831,13 @@ mod tests {
             Feed::Dhan,
             DAY,
             &[reg(428_001, 8, "BSE_FNO", "SENSEX-Jul2026-FUT", key())],
+            reg_now(),
         );
         r.register_instruments(
             Feed::Groww,
             DAY,
             &[reg(999_777, 8, "BSE_FNO", "SENSEX-Jul2026-FUT", key())],
+            reg_now(),
         );
         let d = r.drain_day(DAY).expect("drain");
         assert_eq!(d.slots.len(), 1, "different native ids, one contract slot");
@@ -771,7 +848,12 @@ mod tests {
     fn test_unmapped_singleton_reported_with_sentinel_comparison_columns() {
         let r = registry_for_day();
         // A Groww-only stock with no ISIN — feed-local slot.
-        r.register_instruments(Feed::Groww, DAY, &[reg(555, 1, "NSE_EQ", "ODDSTOCK", None)]);
+        r.register_instruments(
+            Feed::Groww,
+            DAY,
+            &[reg(555, 1, "NSE_EQ", "ODDSTOCK", None)],
+            reg_now(),
+        );
         r.record_presence(Feed::Groww, 555, 1, session_secs(0));
         let d = r.drain_day(DAY).expect("drain");
         assert_eq!(d.slots.len(), 1);
@@ -792,7 +874,12 @@ mod tests {
     #[test]
     fn test_unregistered_fold_counts_never_silent() {
         let r = registry_for_day();
-        r.register_instruments(Feed::Dhan, DAY, &[reg(13, 0, "IDX_I", "NIFTY", None)]);
+        r.register_instruments(
+            Feed::Dhan,
+            DAY,
+            &[reg(13, 0, "IDX_I", "NIFTY", None)],
+            reg_now(),
+        );
         // A tick for a SID outside the registered universe.
         r.record_presence(Feed::Dhan, 99_999, 1, session_secs(0));
         r.record_presence(Feed::Dhan, 13, 0, session_secs(0));
@@ -804,7 +891,12 @@ mod tests {
     #[test]
     fn test_out_of_session_ticks_never_set_bits() {
         let r = registry_for_day();
-        r.register_instruments(Feed::Dhan, DAY, &[reg(13, 0, "IDX_I", "NIFTY", None)]);
+        r.register_instruments(
+            Feed::Dhan,
+            DAY,
+            &[reg(13, 0, "IDX_I", "NIFTY", None)],
+            reg_now(),
+        );
         // 09:00 IST pre-open tick + 15:31 post-close tick.
         let day_base = u32::try_from(DAY * 86_400).unwrap_or(0);
         r.record_presence(Feed::Dhan, 13, 0, day_base + 9 * 3600);
@@ -817,7 +909,12 @@ mod tests {
     #[test]
     fn test_disabled_gate_no_bits_and_no_drain() {
         let r = FeedPresenceRegistry::new(false, 0);
-        r.register_instruments(Feed::Dhan, DAY, &[reg(13, 0, "IDX_I", "NIFTY", None)]);
+        r.register_instruments(
+            Feed::Dhan,
+            DAY,
+            &[reg(13, 0, "IDX_I", "NIFTY", None)],
+            reg_now(),
+        );
         r.record_presence(Feed::Dhan, 13, 0, session_secs(0));
         assert_eq!(r.drain_day(DAY), None, "disabled fold drains nothing");
     }
@@ -825,10 +922,20 @@ mod tests {
     #[test]
     fn test_stale_previous_day_slot_excluded_and_bits_cleared_on_new_day() {
         let r = registry_for_day();
-        r.register_instruments(Feed::Dhan, DAY, &[reg(13, 0, "IDX_I", "NIFTY", None)]);
+        r.register_instruments(
+            Feed::Dhan,
+            DAY,
+            &[reg(13, 0, "IDX_I", "NIFTY", None)],
+            reg_now(),
+        );
         r.record_presence(Feed::Dhan, 13, 0, session_secs(0));
         // Next day: re-register — the slot's bits for Dhan must clear.
-        r.register_instruments(Feed::Dhan, DAY + 1, &[reg(13, 0, "IDX_I", "NIFTY", None)]);
+        r.register_instruments(
+            Feed::Dhan,
+            DAY + 1,
+            &[reg(13, 0, "IDX_I", "NIFTY", None)],
+            reg_now(),
+        );
         // Yesterday's drain: the slot is no longer registered for DAY.
         assert_eq!(r.drain_day(DAY), None);
         let d1 = r.drain_day(DAY + 1).expect("drain new day");
@@ -841,7 +948,12 @@ mod tests {
     #[test]
     fn test_reset_daily_clears_bits_and_counters() {
         let r = registry_for_day();
-        r.register_instruments(Feed::Dhan, DAY, &[reg(13, 0, "IDX_I", "NIFTY", None)]);
+        r.register_instruments(
+            Feed::Dhan,
+            DAY,
+            &[reg(13, 0, "IDX_I", "NIFTY", None)],
+            reg_now(),
+        );
         r.record_presence(Feed::Dhan, 13, 0, session_secs(0));
         r.record_presence(Feed::Dhan, 4242, 1, session_secs(0)); // unregistered
         r.reset_daily(Feed::Dhan);
@@ -854,11 +966,11 @@ mod tests {
     fn test_register_instruments_reregistration_is_idempotent_same_day() {
         let r = registry_for_day();
         let regs = [reg(13, 0, "IDX_I", "NIFTY", None)];
-        r.register_instruments(Feed::Dhan, DAY, &regs);
+        r.register_instruments(Feed::Dhan, DAY, &regs, reg_now());
         r.record_presence(Feed::Dhan, 13, 0, session_secs(0));
         // Same-day re-registration (warm-snapshot boot + background
         // reconcile both register) must NOT clear the day's bits.
-        r.register_instruments(Feed::Dhan, DAY, &regs);
+        r.register_instruments(Feed::Dhan, DAY, &regs, reg_now());
         let d = r.drain_day(DAY).expect("drain");
         assert_eq!(d.dhan.covered_instrument_minutes, 1);
         assert_eq!(d.slots.len(), 1);
@@ -871,7 +983,7 @@ mod tests {
         for i in 0..(MAX_PRESENCE_SLOTS as u64 + 5) {
             regs.push(reg(i + 1, 1, "NSE_EQ", "S", None));
         }
-        let s = r.register_instruments(Feed::Dhan, DAY, &regs);
+        let s = r.register_instruments(Feed::Dhan, DAY, &regs, reg_now());
         assert_eq!(s.overflow_dropped, 5);
         assert_eq!(s.registered, MAX_PRESENCE_SLOTS);
         let d = r.drain_day(DAY).expect("drain");
@@ -883,10 +995,58 @@ mod tests {
         // Process "started" at 11:00 IST on DAY — after session open.
         let start = (i64::try_from(DAY).unwrap_or(0) * 86_400 + 11 * 3600) * NANOS_PER_SEC;
         let r = FeedPresenceRegistry::new(true, start);
-        r.register_instruments(Feed::Dhan, DAY, &[reg(13, 0, "IDX_I", "NIFTY", None)]);
+        r.register_instruments(
+            Feed::Dhan,
+            DAY,
+            &[reg(13, 0, "IDX_I", "NIFTY", None)],
+            reg_now(),
+        );
         r.record_presence(Feed::Dhan, 13, 0, session_secs(2 * 3600));
         let d = r.drain_day(DAY).expect("drain");
         assert!(!d.covers_full_session);
+    }
+
+    #[test]
+    fn test_late_first_registration_degrades_covers_full_session() {
+        // PR-D review round 1 (MEDIUM): a midnight-crossing process whose
+        // FIRST registration for the day lands AFTER the 09:15 open has
+        // destroyed (day-change clear) or missed (unregistered folds) the
+        // 09:15→registration window — the drain must degrade to a
+        // partial-session stamp, never claim full-session truth.
+        let r = registry_for_day(); // process alive from IST midnight
+        let late = reg_now() + i64::from(10 * 3600) * NANOS_PER_SEC; // 10:00 IST
+        r.register_instruments(Feed::Dhan, DAY, &[reg(13, 0, "IDX_I", "NIFTY", None)], late);
+        r.record_presence(Feed::Dhan, 13, 0, session_secs(2 * 3600));
+        let d = r.drain_day(DAY).expect("drain");
+        assert!(
+            !d.covers_full_session,
+            "post-open first registration must degrade the stamp"
+        );
+        // A later SAME-day re-registration never un-degrades (first wins).
+        r.register_instruments(
+            Feed::Dhan,
+            DAY,
+            &[reg(13, 0, "IDX_I", "NIFTY", None)],
+            reg_now(),
+        );
+        let d = r.drain_day(DAY).expect("drain");
+        assert!(!d.covers_full_session, "first registration instant wins");
+    }
+
+    #[test]
+    fn test_pre_open_first_registration_keeps_full_session_stamp() {
+        // The normal prod morning: process up + registered before 09:15 —
+        // the full-session stamp stands.
+        let r = registry_for_day();
+        r.register_instruments(
+            Feed::Dhan,
+            DAY,
+            &[reg(13, 0, "IDX_I", "NIFTY", None)],
+            reg_now() + i64::from(8 * 3600 + 45 * 60) * NANOS_PER_SEC, // 08:45
+        );
+        r.record_presence(Feed::Dhan, 13, 0, session_secs(0));
+        let d = r.drain_day(DAY).expect("drain");
+        assert!(d.covers_full_session);
     }
 
     #[test]

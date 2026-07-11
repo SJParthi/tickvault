@@ -704,11 +704,19 @@ async fn activate_groww_lane(
 ///   writer uses (the labels ticks carry), mapped to the shared binary
 ///   segment codes;
 /// - pairing: futures by contract identity (canonical underlying +
-///   expiry), indices by canonical index name (the `groww_symbol` with
-///   its `NSE-`/`BSE-` exchange prefix stripped, then
-///   `canonicalize_index_symbol` — the FUTIDX-02 alias lesson), stocks by
-///   ISIN; anything else registers as a feed-local singleton (reported at
-///   drain, never dropped — Rule 11).
+///   expiry), indices by DUAL-FIELD canonical resolution (PR-D review
+///   round 1, HIGH — the 2026-06-28 `groww_indices_absent_vs_dhan`
+///   token-only lesson repeated: the short `groww_symbol` token
+///   ("NSE-NIFTYAUTO" → "NIFTYAUTO") only covers the trading-symbol
+///   allowlist entries, while the display `symbol_name` ("NIFTY Auto" →
+///   "NIFTY AUTO") covers the descriptive ones — NEITHER field alone
+///   canonicalizes to every Dhan-registered index name, so ~20 of ~25
+///   co-listed indices split into two singleton slots. Canonicalize BOTH
+///   and pick whichever is an `NSE_INDEX_ALLOWLIST` member, falling back
+///   to the stripped token — e.g. BSE SENSEX, not an NSE-allowlist
+///   member, still pairs on the token), stocks by ISIN; anything else
+///   registers as a feed-local singleton (reported at drain, never
+///   dropped — Rule 11).
 ///
 /// O(1) EXEMPT: cold-path activation derivation, once per watch build.
 #[must_use]
@@ -717,9 +725,17 @@ pub(crate) fn groww_presence_registrations(
 ) -> Vec<tickvault_core::pipeline::feed_presence::PresenceRegistration> {
     use tickvault_core::feed::groww::instruments::WatchKind;
     use tickvault_core::feed::groww::shared_master_writer::groww_segment_label;
-    use tickvault_core::instrument::index_extractor::canonicalize_index_symbol;
+    use tickvault_core::instrument::index_extractor::{
+        NSE_INDEX_ALLOWLIST, canonicalize_index_symbol,
+    };
     use tickvault_core::pipeline::feed_presence::{PairingKey, PresenceRegistration};
 
+    // Canonicalized allowlist — the exact value space the Dhan side
+    // registers its Index pairing keys in (built once, cold path).
+    let allowlist_canon: std::collections::HashSet<String> = NSE_INDEX_ALLOWLIST
+        .iter()
+        .map(|a| canonicalize_index_symbol(a))
+        .collect();
     let mut out = Vec::with_capacity(entries.len());
     for e in entries {
         // validate_groww_tick rejects non-positive ids at the fold, so a
@@ -749,13 +765,27 @@ pub(crate) fn groww_presence_registrations(
                 expiry: expiry.to_string(),
             })
         } else if matches!(e.kind, WatchKind::IndexValue) {
-            // `NSE-NIFTY` / `BSE-SENSEX` → canonical `NIFTY` / `SENSEX`.
+            // Dual-field resolution (mirror `groww_indices_absent_vs_dhan`,
+            // instruments.rs): try the stripped token first
+            // (`NSE-NIFTY` → `NIFTY`), then the display `symbol_name`
+            // (`NIFTY Auto` → `NIFTY AUTO`) — whichever canonicalizes into
+            // the allowlist is the value the Dhan registration carries.
+            // Fallback: the stripped token (BSE SENSEX pairs here).
             let name = e.index_name.as_deref().unwrap_or(&e.exchange_token);
             let stripped = name
                 .strip_prefix("NSE-")
                 .or_else(|| name.strip_prefix("BSE-"))
                 .unwrap_or(name);
-            Some(PairingKey::Index(canonicalize_index_symbol(stripped)))
+            let canon_token = canonicalize_index_symbol(stripped);
+            let canon = if allowlist_canon.contains(&canon_token) {
+                canon_token
+            } else {
+                match e.symbol_name.as_deref().map(canonicalize_index_symbol) {
+                    Some(canon_name) if allowlist_canon.contains(&canon_name) => canon_name,
+                    _ => canon_token,
+                }
+            };
+            Some(PairingKey::Index(canon))
         } else {
             e.isin
                 .as_deref()
@@ -1212,6 +1242,109 @@ mod tests {
     fn test_groww_presence_registrations_skip_non_positive_ids() {
         let bad = watch_entry(WatchKind::Ltp, "CASH", "NSE", -5);
         assert!(groww_presence_registrations(&[bad]).is_empty());
+    }
+
+    /// The REAL 24 Groww NSE index rows (short `groww_symbol` token +
+    /// display `name`) — the same fixture pinned in
+    /// `instruments.rs::REAL_GROWW_NSE_INDICES` (2026-06-28 operator
+    /// verification).
+    const REAL_GROWW_NSE_INDICES: &[(&str, &str)] = &[
+        ("NIFTY", "NIFTY 50"),
+        ("BANKNIFTY", "NIFTY Bank"),
+        ("FINNIFTY", "Nifty Financial Services"),
+        ("INDIAVIX", "India Vix"),
+        ("NIFTYJR", "Nifty Next 50"),
+        ("MIDCAP50", "NIFTY MIDCAP 50"),
+        ("NIFTY100", "NIFTY 100"),
+        ("NIFTY500", "NIFTY 500"),
+        ("NIFTYAUTO", "NIFTY Auto"),
+        ("NIFTYCDTY", "NIFTY Commodities"),
+        ("NIFTYFMCG", "NIFTY FMCG"),
+        ("NIFTYIT", "NIFTY IT"),
+        ("NIFTYMEDIA", "NIFTY Media"),
+        ("NIFTYMETAL", "NIFTY Metal"),
+        ("NIFTYMIDCAP", "NIFTY Midcap 100"),
+        ("NIFTYMIDCAP150", "NIFTY Midcap 150"),
+        ("NIFTYMIDSELECT", "Nifty Midcap Select"),
+        ("NIFTYPHARMA", "NIFTY Pharma"),
+        ("NIFTYPSUBANK", "NIFTY PSU Bank"),
+        ("NIFTYPVTBANK", "NIFTY Pvt Bank"),
+        ("NIFTYREALTY", "NIFTY Realty"),
+        ("NIFTYSMALL", "NIFTY Smallcap 100"),
+        ("NIFTYSMALLCAP250", "NIFTY Smallcap 250"),
+        ("NIFTYTOTALMCAP", "Nifty Total Market"),
+    ];
+
+    /// Regression (PR-D review round 1, HIGH — the token-only pairing bug):
+    /// against the REAL 24 Groww NSE index rows, the dual-field resolution
+    /// must land 22 of them (= the 32-entry allowlist minus the 10
+    /// known-absent-on-Groww) on the EXACT canonical value the Dhan side
+    /// registers — not the buggy 4 that the token field alone resolves.
+    #[test]
+    fn test_groww_index_pairing_dual_field_matches_dhan_canonicals() {
+        use tickvault_core::instrument::index_extractor::NSE_INDEX_ALLOWLIST;
+
+        let entries: Vec<_> = REAL_GROWW_NSE_INDICES
+            .iter()
+            .enumerate()
+            .map(|(i, (token, name))| {
+                let mut e = watch_entry(
+                    WatchKind::IndexValue,
+                    "CASH",
+                    "NSE",
+                    0x4000_0000_0000_0000_i64 + i64::try_from(i).unwrap_or(0) + 1,
+                );
+                e.exchange_token = (*token).to_string();
+                e.index_name = Some(format!("NSE-{token}"));
+                e.symbol_name = Some((*name).to_string());
+                e
+            })
+            .collect();
+        let regs = groww_presence_registrations(&entries);
+        assert_eq!(regs.len(), 24);
+        let allowlist_canon: std::collections::HashSet<String> = NSE_INDEX_ALLOWLIST
+            .iter()
+            .map(|a| canonicalize_index_symbol(a))
+            .collect();
+        let keys: Vec<String> = regs
+            .iter()
+            .filter_map(|r| match &r.pairing {
+                Some(PairingKey::Index(name)) => Some(name.clone()),
+                _ => None,
+            })
+            .collect();
+        let paired = keys.iter().filter(|k| allowlist_canon.contains(*k)).count();
+        assert_eq!(
+            paired, 22,
+            "22 of the real 24 Groww NSE indices must resolve to a Dhan \
+             allowlist canonical (only NIFTY Commodities + NIFTY Midcap 100 \
+             are legitimately Dhan-untracked); token-only pairing resolved \
+             just 4 — keys: {keys:?}"
+        );
+        // The previously-split spellings now pair on the Dhan canonical.
+        for expected in [
+            "NIFTY AUTO",
+            "NIFTY NEXT 50",
+            "INDIA VIX",
+            "MIDCPNIFTY",
+            "NIFTYMCAP50",
+            "NIFTY TOTAL MKT",
+        ] {
+            assert!(
+                keys.iter().any(|k| k == expected),
+                "expected canonical {expected} missing from {keys:?}"
+            );
+        }
+        // BSE SENSEX: not an NSE-allowlist member — pairs on the stripped
+        // token fallback, exactly what the Dhan side registers.
+        let mut sensex = watch_entry(WatchKind::IndexValue, "CASH", "BSE", 0x4000_0000_0000_0100);
+        sensex.index_name = Some("BSE-SENSEX".to_string());
+        sensex.symbol_name = Some("SENSEX".to_string());
+        let regs = groww_presence_registrations(&[sensex]);
+        assert_eq!(
+            regs[0].pairing,
+            Some(PairingKey::Index("SENSEX".to_string()))
+        );
     }
 
     #[test]

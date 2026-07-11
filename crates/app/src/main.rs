@@ -700,6 +700,22 @@ async fn main() -> Result<()> {
     // publisher's dual-arm wiring. Inert while Groww is disabled (empty
     // ring → the ≥50-sample gate publishes nothing).
     let _groww_lag_publisher_supervisor = spawn_supervised_groww_lag_publisher();
+    // ── per-instrument presence registry init — PROCESS-GLOBAL boot prefix ──
+    // Scoreboard PR-D fix round 1 (review HIGH): init MUST precede BOTH the
+    // Groww activation watcher spawn below AND both boot arms'
+    // `load_instruments` — `feed_presence::register_instruments` is a
+    // GLOBAL.get() free fn that silently no-ops pre-init, so the previous
+    // fast-arm init site (~1,000 lines after its load_instruments)
+    // deterministically skipped the Dhan universe registration on every
+    // crash-recovery boot, and the Groww watcher could register after a
+    // later init — a same-day 15:45 drain of that half-registered registry
+    // persisted a false one-sided "Groww won every minute" verdict. ONE
+    // init site (the process-global-prefix pattern the lag publisher +
+    // ts-pin migration already use); ordering pinned by the
+    // `test_feed_presence_is_wired_into_main` source-order ratchet.
+    tickvault_core::pipeline::feed_presence::init_feed_presence(
+        config.scoreboard.enabled && config.scoreboard.presence_fold_enabled,
+    );
     // ── index_constituency ts-pin migration — PROCESS-GLOBAL boot prefix ──
     // F13/F14 hardening (2026-07-05): the one-shot, marker-gated TRUNCATE
     // migration runs here — BEFORE the Groww activation watcher and regardless
@@ -2912,12 +2928,9 @@ async fn main() -> Result<()> {
         // this call the flagship crash-restart day produced NO episode row,
         // NO scorecard and NO Aborted page (nothing was spawned to die).
         // `notifier` here is the fast_notifier clone from above.
-        // Scoreboard PR-D: init the per-instrument presence registry
-        // BEFORE the feeds spawn (boot-read fold gate — no per-tick
-        // config access). Idempotent across boot arms.
-        tickvault_core::pipeline::feed_presence::init_feed_presence(
-            config.scoreboard.enabled && config.scoreboard.presence_fold_enabled,
-        );
+        // (Scoreboard PR-D fix round 1: the presence-registry init moved to
+        // the process-global boot prefix — ONE site, ordered before the
+        // Groww watcher spawn and this arm's load_instruments.)
         spawn_feed_scoreboard_tasks(
             &config,
             &trading_calendar,
@@ -3094,11 +3107,8 @@ async fn main() -> Result<()> {
     // 15:45 IST daily Dhan-vs-Groww aggregation + Telegram scorecard. Gated
     // on `[scoreboard] enabled` (the B12 rollback switch). See
     // `spawn_feed_scoreboard_tasks`.
-    // Scoreboard PR-D: init the per-instrument presence registry on the
-    // process-global prefix too (boot-read fold gate; idempotent).
-    tickvault_core::pipeline::feed_presence::init_feed_presence(
-        config.scoreboard.enabled && config.scoreboard.presence_fold_enabled,
-    );
+    // (Scoreboard PR-D fix round 1: the presence-registry init moved to the
+    // process-global boot prefix — ONE site; see the ordering ratchet.)
     spawn_feed_scoreboard_tasks(
         &config,
         &trading_calendar,

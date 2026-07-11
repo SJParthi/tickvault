@@ -153,6 +153,11 @@ The FINAL scoreboard series PR: real per-instrument cross-feed coverage.
   dashboard rows 2-4 chart EXISTING series only.
 - O(N) flags: drain O(slots × 12 words) cold; registration O(universe)
   cold; only `record_presence` is hot and only it is O(1).
+- **Deviation record (review round 1, LOW):** the design-sketch
+  `/api/stats` intraday presence surface is DEFERRED — the 15:45 drain
+  log line + the `feed_coverage_daily` / `feed_scoreboard_daily` QuestDB
+  tables are the intraday/queryable operator surface; a follow-up may add
+  it to the debug handler. No code under `crates/api` changes in PR-D.
 
 ## Plan Items
 
@@ -178,6 +183,21 @@ The FINAL scoreboard series PR: real per-instrument cross-feed coverage.
 - [x] Item 7 — docs (runbook, rule file, metrics_catalog) + plan hygiene
   - Files: docs/runbooks/dual-feed-scoreboard.md, .claude/rules/project/dual-feed-scoreboard-error-codes.md, crates/app/src/metrics_catalog.rs, .claude/plans/archive/2026-07-11-scoreboard-groww-lag.md
   - Tests: (docs)
+- [x] Item 8 — review round 1 fixes (4 HIGH + 3 MEDIUM confirmed + LOWs):
+  dual-field Groww index pairing (token + display name vs the allowlist —
+  the 2026-06-28 token-only lesson); ONE process-global-prefix
+  `init_feed_presence` site ordered before the Groww watcher + both
+  `load_instruments` (source-order ratchet); one-sided-drain refusal
+  (`presence_drain_one_sided_feed` + `stage="presence_one_sided"`);
+  Groww fold same-IST-day gate (cross-day re-tail replay); late-first-
+  registration `covers_full_session` degrade; mixed-day unique_win/both
+  flip gated on `covers_full_session` (SQL minute sets stand); equal-rank
+  value-aware coverage keep-better (zero-measured rerun never erases);
+  step-8b detail rows skipped when 6d folded existing coverage forward;
+  feed-off own-row untouched (doc/code match); Feed::COUNT arrays in
+  drain_day; Dhan Future expiry key normalized to zero-padded ISO.
+  - Files: crates/core/src/pipeline/feed_presence.rs, crates/core/src/instrument/presence_registration.rs, crates/core/src/auth/secret_manager.rs, crates/app/src/groww_activation.rs, crates/app/src/groww_bridge.rs, crates/app/src/main.rs, crates/app/src/feed_scoreboard_boot.rs
+  - Tests: test_groww_index_pairing_dual_field_matches_dhan_canonicals, test_late_first_registration_degrades_covers_full_session, test_pre_open_first_registration_keeps_full_session_stamp, test_tick_is_same_ist_day_gates_cross_day_replay, test_apply_presence_coverage_mixed_day_keeps_sql_unique_win_both, test_presence_drain_one_sided_feed_detection, test_fold_existing_coverage_keep_better_equal_rank_zero_drain, test_future_expiry_key_is_normalized_to_zero_padded_iso, test_feed_presence_is_wired_into_main
 
 ## Scenarios
 

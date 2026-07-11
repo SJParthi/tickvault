@@ -701,6 +701,19 @@ fn capture_stamp_ist_nanos(
     .then_some(capture_ist_nanos)
 }
 
+/// Same-IST-day gate for the presence fold (scoreboard PR-D fix round 1,
+/// review MEDIUM): `true` when the tick's own exchange stamp and the wake
+/// receipt wall-clock fall on the SAME IST day number. The presence
+/// bitsets discard the day component (`ts % 86400`), so a cross-day
+/// NDJSON re-tail replay (rotation-failure degraded mode / byte-0
+/// re-tail) would otherwise fold yesterday's session minutes into
+/// today's slots as `in_memory` truth. Same-day replay stays idempotent
+/// (fetch_or). Pure integer math — one divide + compare, zero-alloc.
+fn tick_is_same_ist_day(tick_ts_ist_nanos: i64, wake_receipt_ist_nanos: i64) -> bool {
+    const DAY_NANOS: i64 = 86_400 * 1_000_000_000;
+    tick_ts_ist_nanos.div_euclid(DAY_NANOS) == wake_receipt_ist_nanos.div_euclid(DAY_NANOS)
+}
+
 /// Monotonic, replay-stable `capture_seq` source (TICK-SEQ-01): `max(prev+1,
 /// seed_nanos)`. The call site seeds it from the tick's IST epoch-nanos
 /// (`ts_ist_nanos`) — a replay-STABLE value (NOT wall-clock), so `capture_seq`
@@ -1366,12 +1379,23 @@ impl GrowwBridgeState {
             // (id, segment) key is the SAME composite the shared 21-TF
             // engine folds on. validate_groww_tick already rejected
             // security_id <= 0, so the u64 conversion cannot fail.
-            tickvault_core::pipeline::feed_presence::record_presence(
-                Feed::Groww,
-                u64::try_from(parsed.tick.security_id).unwrap_or(0),
-                parsed.tick.segment.binary_code(),
-                u32::try_from(parsed.tick.ts_ist_nanos / 1_000_000_000).unwrap_or(0),
-            );
+            // SAME-IST-DAY gate (PR-D review round 1, MEDIUM): the presence
+            // bitsets carry no day component (`ts % 86400`), and
+            // validate_groww_tick rejects FUTURE skew only — a cross-day
+            // NDJSON re-tail replay (the documented rotation-failure
+            // degraded mode / a byte-0 re-tail) would otherwise fold
+            // YESTERDAY's session minutes into today's registered slots as
+            // 'in_memory' truth. One divide + compare, zero-alloc — the
+            // Dhan fold sites are already behind the tick processor's
+            // is_today_ist stale-day gate.
+            if tick_is_same_ist_day(parsed.tick.ts_ist_nanos, wake_receipt_ist_nanos) {
+                tickvault_core::pipeline::feed_presence::record_presence(
+                    Feed::Groww,
+                    u64::try_from(parsed.tick.security_id).unwrap_or(0),
+                    parsed.tick.segment.binary_code(),
+                    u32::try_from(parsed.tick.ts_ist_nanos / 1_000_000_000).unwrap_or(0),
+                );
+            }
             let row_received =
                 row_received_at_with_capture(parsed.capture_ns, wake_receipt_ist_nanos);
             // C2 (feed convergence): the ordered enrich → persist → aggregate
@@ -4685,6 +4709,33 @@ mod tests {
             "the Groww IST-midnight force-seal task must reset the Groww \
              presence bitsets exactly once (found {reset_sites} sites)."
         );
+        // PR-D fix round 1 (review MEDIUM): the fold must sit behind the
+        // same-IST-day gate — a cross-day NDJSON re-tail replay must never
+        // fold yesterday's session minutes into today's bitsets.
+        let gate_needle = format!("tick_is_same_ist_day{}", "(parsed.tick.ts_ist_nanos");
+        assert!(
+            src.lines().any(|l| {
+                let t = l.trim_start();
+                !t.starts_with("//") && t.contains(&gate_needle)
+            }),
+            "the Groww presence fold must be gated on tick_is_same_ist_day \
+             (cross-day replay protection)"
+        );
+    }
+
+    #[test]
+    fn test_tick_is_same_ist_day_gates_cross_day_replay() {
+        const DAY_NANOS: i64 = 86_400 * 1_000_000_000;
+        let today_open = 20_644 * DAY_NANOS + (9 * 3600 + 15 * 60) * 1_000_000_000;
+        let now = 20_644 * DAY_NANOS + 10 * 3600 * 1_000_000_000;
+        // Same-day tick folds; yesterday's replayed line does not.
+        assert!(tick_is_same_ist_day(today_open, now));
+        assert!(!tick_is_same_ist_day(today_open - DAY_NANOS, now));
+        // Day boundaries: 23:59:59.999… of yesterday vs 00:00:00 of today.
+        assert!(!tick_is_same_ist_day(20_644 * DAY_NANOS - 1, now));
+        assert!(tick_is_same_ist_day(20_644 * DAY_NANOS, now));
+        // A (validator-bounded) small future skew inside the same day folds.
+        assert!(tick_is_same_ist_day(now + 30 * 1_000_000_000, now));
     }
 
     // ── 2026-07-02 adversarial-sweep fixes: bridge supervision + parse-time
