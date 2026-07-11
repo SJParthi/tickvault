@@ -17,10 +17,10 @@ use tracing::{debug, error, info, trace, warn};
 use crate::parser::dispatch_frame;
 use crate::parser::types::ParsedFrame;
 use tickvault_common::constants::{
-    DEDUP_RING_BUFFER_POWER, IST_UTC_OFFSET_SECONDS, MINIMUM_VALID_EXCHANGE_TIMESTAMP,
-    MUHURAT_PERSIST_END_SECS_OF_DAY_IST, MUHURAT_PERSIST_START_SECS_OF_DAY_IST, SECONDS_PER_DAY,
-    TICK_PERSIST_END_SECS_OF_DAY_IST, TICK_PERSIST_START_SECS_OF_DAY_IST,
-    WS_GRACE_AFTER_CLOSE_SECS_U32,
+    DEDUP_RING_BUFFER_POWER, EXCHANGE_SEGMENT_IDX_I, IST_UTC_OFFSET_SECONDS,
+    MINIMUM_VALID_EXCHANGE_TIMESTAMP, MUHURAT_PERSIST_END_SECS_OF_DAY_IST,
+    MUHURAT_PERSIST_START_SECS_OF_DAY_IST, SECONDS_PER_DAY, TICK_PERSIST_END_SECS_OF_DAY_IST,
+    TICK_PERSIST_START_SECS_OF_DAY_IST, WS_GRACE_AFTER_CLOSE_SECS_U32,
 };
 use tickvault_common::tick_types::{GreeksEnricher, ParsedTick};
 
@@ -282,6 +282,67 @@ fn check_tick_ohlc_integrity(ltp: f32, day_high: f32, day_low: f32) -> u8 {
         violations |= 0b100;
     }
     violations
+}
+
+/// Issue #858 — IDX_I prev-day close backstop (LIVE code-6 values → tick stream).
+///
+/// Per Dhan Ticket #5525125 (`live-market-feed.md` rule 10), indices (IDX_I)
+/// receive their previous-day close ONLY via the standalone code-6 PrevClose
+/// packet — the Quote-mode `close` field (bytes 38-41) is UNVERIFIED-LIVE for
+/// IDX_I and observed as `0.0`. The tick processor caches code-6 values per
+/// index but never routed them back into the tick stream — so index candles'
+/// `close_pct_from_prev_day` depended entirely on the unverified Quote field
+/// and read 0 whenever Dhan leaves it empty.
+///
+/// **LIVE-SESSION-ONLY gating (review round 1, HIGH-1):** the backstop
+/// consumes `index_prev_close_live` — a loop-local map populated EXCLUSIVELY
+/// by code-6 packets received in THIS process session. It deliberately does
+/// NOT read the file-loaded `index_prev_close_cache`
+/// (`data/instrument-cache/index-prev-close.json`): that file is never
+/// date-scoped, so values written during day D-1's session are close(D-2) —
+/// one trading day stale on a day-D boot. Stamping a wrong NON-ZERO
+/// prev-close is worse than the honest 0 it replaces (audit Rule 11).
+/// Dhan re-delivers code-6 on every (re)subscription, so a mid-session
+/// restart self-heals when the WS resubscribes; the boot-replay window
+/// (WAL re-injection runs before WS connect → live map empty) honestly
+/// reads 0 and replayed frames keep their original `day_close`
+/// (payload-hash determinism preserved).
+///
+/// Returns the live value to stamp into `tick.day_close`, or `None` when
+/// the tick must be left untouched. Fallback semantics (backstop, never an
+/// override):
+/// * non-IDX_I segment → `None` (equities/derivatives carry prev-close
+///   inline per Ticket #5525125; the live map holds only IDX_I entries — the
+///   segment gate here also preserves I-P1-11 safety for the
+///   security_id-only map key, mirroring the insert-side gate)
+/// * `day_close` already a usable positive finite value → `None` (a real
+///   packet-provided value ALWAYS wins; if Dhan does populate Quote close
+///   for IDX_I, the backstop never fires)
+/// * live-map miss → `None` (no code-6 packet THIS session — nothing to
+///   stamp, even if the file cache holds a possibly-stale row)
+/// * live value non-finite or non-positive (mangled code-6 frame) → `None`
+///
+/// O(1), zero allocation: two cheap gates, then one `HashMap::get` on the
+/// loop-owned live map (same task as the code-6 insert arm — no lock).
+#[inline(always)]
+fn idx_prev_close_backstop(
+    exchange_segment_code: u8,
+    day_close: f32,
+    index_prev_close_live: &std::collections::HashMap<u64, f32>,
+    security_id: u64,
+) -> Option<f32> {
+    if exchange_segment_code != EXCHANGE_SEGMENT_IDX_I {
+        return None;
+    }
+    if day_close.is_finite() && day_close > 0.0 {
+        // Real packet-provided value wins — the backstop only fills gaps.
+        return None;
+    }
+    // O(1) EXEMPT: HashMap `get` is O(1) hashing, not an O(n) scan.
+    index_prev_close_live
+        .get(&security_id)
+        .copied()
+        .filter(|cached| cached.is_finite() && *cached > 0.0)
 }
 
 /// Converts UTC nanoseconds to IST seconds-of-day.
@@ -901,6 +962,17 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
     };
     // O(1) EXEMPT: end
 
+    // Issue #858 review round 1 (HIGH-1) — LIVE-session code-6 map.
+    // Populated ONLY by code-6 PrevClose packets received in THIS process
+    // session; the #858 backstop reads THIS map, never the file-loaded
+    // `index_prev_close_cache` above (whose values can be one trading day
+    // stale on a day-D boot — the file is not date-scoped). The file cache
+    // keeps its pre-existing write/persist role untouched.
+    // O(1) EXEMPT: begin — one boot-time HashMap for ~28 indices
+    let mut index_prev_close_live: std::collections::HashMap<u64, f32> =
+        std::collections::HashMap::with_capacity(50);
+    // O(1) EXEMPT: end
+
     // PrevClose diagnostic counters — per-segment tracking + summary log.
     // Helps confirm exactly how many PrevClose packets Dhan sends per segment.
     let mut prev_close_idx_i: u64 = 0;
@@ -1272,6 +1344,31 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
                     if day_close_first_log_time.is_none() {
                         day_close_first_log_time = Some(Instant::now());
                     }
+                }
+
+                // Issue #858 — IDX_I prev-close backstop: indices receive
+                // prev-day close ONLY via the standalone code-6 PrevClose
+                // packet (Dhan Ticket #5525125); their Quote-mode `close`
+                // field is UNVERIFIED-LIVE and observed 0. Stamp the
+                // LIVE-session code-6 value into `day_close` so the
+                // downstream candle chain (aggregator_cell `prev_day_close`
+                // capture → route_seal `close_pct_from_prev_day` stamp)
+                // works for indices too. Fill-only: a real packet-provided
+                // value always wins. Review round 1 (HIGH-1): reads the
+                // live-session map ONLY — never the file-loaded cache,
+                // whose un-date-scoped values can be one trading day stale
+                // (wrong-nonzero is worse than the honest 0, audit Rule 11).
+                // O(1), zero-alloc: one local HashMap get on the loop-owned
+                // map (same task as the code-6 insert arm — no lock). Sits
+                // ABOVE the baseline counter's semantics: the counter above
+                // stays "packet-provided values only".
+                if let Some(prev_close) = idx_prev_close_backstop(
+                    tick.exchange_segment_code,
+                    tick.day_close,
+                    &index_prev_close_live,
+                    tick.security_id,
+                ) {
+                    tick.day_close = prev_close;
                 }
 
                 // Ingestion gate: drop ALL ticks outside [9:00 AM, 3:30 PM) IST.
@@ -1903,6 +2000,12 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
                 if exchange_segment_code == 0 {
                     // IDX_I segment
                     index_prev_close_cache.insert(security_id, previous_close);
+                    // Issue #858 review round 1 (HIGH-1): the live-session
+                    // map — the ONLY source the #858 backstop consumes. A
+                    // value here provably arrived via a code-6 packet in
+                    // THIS process session (never file-loaded, so never a
+                    // one-day-stale close(D-2) from yesterday's file).
+                    index_prev_close_live.insert(security_id, previous_close);
                     //
                     // Wave 1 Item 0.a — sync file write (`fs::write`) + rename moved to
                     // a dedicated writer task fed by a bounded
@@ -2357,6 +2460,182 @@ mod tests {
                  prev_close_writer::try_enqueue_global(...) instead."
             );
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #858 — IDX_I prev-close backstop (LIVE code-6 map → tick.day_close)
+    // -----------------------------------------------------------------------
+
+    /// Builds a one-entry LIVE-session map for the backstop tests (NIFTY
+    /// SID 13). Per review round 1 (HIGH-1) the backstop consumes only the
+    /// live-session code-6 map — never the file-loaded persisted cache.
+    fn nifty_prev_close_live(value: f32) -> std::collections::HashMap<u64, f32> {
+        let mut live = std::collections::HashMap::with_capacity(1);
+        live.insert(13u64, value);
+        live
+    }
+
+    /// Issue #858: an IDX_I tick with `day_close == 0.0` and a live-map hit
+    /// gets the code-6-received prev-close stamped.
+    #[test]
+    fn test_idx_prev_close_backstop_stamps_zero_day_close_on_cache_hit() {
+        let live = nifty_prev_close_live(23_146.45);
+        assert_eq!(
+            idx_prev_close_backstop(0, 0.0, &live, 13),
+            Some(23_146.45),
+            "IDX_I tick with day_close=0 must receive the live code-6 value"
+        );
+    }
+
+    /// Issue #858: a real packet-provided `day_close` always wins — the
+    /// backstop never overrides a positive finite value, even on a live hit.
+    #[test]
+    fn test_idx_prev_close_backstop_never_overrides_nonzero_day_close() {
+        let live = nifty_prev_close_live(23_146.45);
+        assert_eq!(
+            idx_prev_close_backstop(0, 23_200.0, &live, 13),
+            None,
+            "a positive finite Quote-provided day_close must never be overridden"
+        );
+    }
+
+    /// Issue #858: live-map miss leaves the tick untouched.
+    #[test]
+    fn test_idx_prev_close_backstop_cache_miss_returns_none() {
+        let live = nifty_prev_close_live(23_146.45);
+        assert_eq!(
+            idx_prev_close_backstop(0, 0.0, &live, 25),
+            None,
+            "an IDX_I SID absent from the live code-6 map must not be stamped"
+        );
+    }
+
+    /// Issue #858: non-IDX_I segments are untouched even when a numerically
+    /// colliding SID exists in the live map (I-P1-11 segment safety).
+    #[test]
+    fn test_idx_prev_close_backstop_non_idx_segment_returns_none() {
+        let live = nifty_prev_close_live(23_146.45);
+        for segment in [1u8, 2, 4, 8] {
+            assert_eq!(
+                idx_prev_close_backstop(segment, 0.0, &live, 13),
+                None,
+                "segment {segment} must never be stamped from the IDX_I live map"
+            );
+        }
+    }
+
+    /// Issue #858: a junk live value (non-finite or non-positive, e.g. from
+    /// a mangled code-6 frame that slipped past the finite guard) is never
+    /// stamped.
+    #[test]
+    fn test_idx_prev_close_backstop_rejects_junk_cached_values() {
+        for junk in [0.0f32, -1.0, f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let live = nifty_prev_close_live(junk);
+            assert_eq!(
+                idx_prev_close_backstop(0, 0.0, &live, 13),
+                None,
+                "junk live value {junk} must never be stamped"
+            );
+        }
+    }
+
+    /// Issue #858: an unusable NON-ZERO packet value (NaN / negative) also
+    /// takes the backstop — "fill when the packet value is unusable", which
+    /// is a strict superset of the `== 0.0` gap case and strictly safer.
+    #[test]
+    fn test_idx_prev_close_backstop_fills_non_finite_packet_value() {
+        let live = nifty_prev_close_live(23_146.45);
+        for unusable in [f32::NAN, -5.0f32] {
+            assert_eq!(
+                idx_prev_close_backstop(0, unusable, &live, 13),
+                Some(23_146.45),
+                "unusable packet day_close {unusable} must take the backstop"
+            );
+        }
+    }
+
+    /// Issue #858 review round 1 (HIGH-1): a value that exists ONLY in the
+    /// file-loaded persisted cache (no code-6 packet received THIS session)
+    /// must NOT be stamped — the file is not date-scoped, so its values can
+    /// be close(D-2), one trading day stale on a day-D boot. Wrong-nonzero
+    /// is worse than the honest 0 (audit Rule 11): the backstop consumes
+    /// ONLY the live-session map, which is empty here.
+    #[test]
+    fn test_idx_prev_close_backstop_file_loaded_only_value_not_stamped() {
+        // The persisted (file-loaded) cache holds yesterday's write — a
+        // possibly-stale close(D-2) value for NIFTY.
+        let persisted = nifty_prev_close_live(23_000.0);
+        assert_eq!(persisted.get(&13u64), Some(&23_000.0));
+        // The live-session map has seen NO code-6 packet yet (fresh boot /
+        // WAL boot-replay window). The backstop reads the LIVE map only.
+        let live: std::collections::HashMap<u64, f32> = std::collections::HashMap::new();
+        assert_eq!(
+            idx_prev_close_backstop(0, 0.0, &live, 13),
+            None,
+            "a file-loaded-only value must never be stamped — only values \
+             received via code-6 in THIS session are trustworthy for today"
+        );
+    }
+
+    /// Issue #858 review round 1 (HIGH-1): once a code-6 packet lands in
+    /// THIS session, the live map stamps TODAY's value — never the stale
+    /// file value, even when both exist for the same SID.
+    #[test]
+    fn test_idx_prev_close_backstop_live_code6_value_stamps() {
+        // Stale file-loaded value (close of D-2) exists…
+        let persisted = nifty_prev_close_live(23_000.0);
+        assert_eq!(persisted.get(&13u64), Some(&23_000.0));
+        // …but today's code-6 packet arrived in this session with close(D-1).
+        let live = nifty_prev_close_live(23_146.45);
+        assert_eq!(
+            idx_prev_close_backstop(0, 0.0, &live, 13),
+            Some(23_146.45),
+            "a live-session code-6 value must stamp — and it is today's \
+             value, not the stale file one"
+        );
+    }
+
+    /// Issue #858 review round 1 (HIGH-1) source-scan ratchet: the
+    /// production backstop call site must consume the LIVE-session map and
+    /// must NOT regress to the file-loaded cache; the code-6 arm must
+    /// populate the live map. Needles are built by concatenation so this
+    /// test's own source can never satisfy the scan (vacuous-pass class,
+    /// 2026-07-06 lesson).
+    #[test]
+    fn test_idx_prev_close_backstop_call_site_uses_live_map_ratchet() {
+        let src = include_str!("tick_processor.rs");
+        let call_start: String =
+            ["if let Some(prev_close) = idx_prev_close", "_backstop("].concat();
+        let start = src
+            .find(&call_start)
+            .expect("the #858 backstop call site must exist in the Tick arm");
+        // Bounded window: the 4-argument call fits well inside 400 bytes.
+        let end = start.saturating_add(400).min(src.len());
+        let window = &src[start..end];
+        let live_arg: String = ["&index_prev_close", "_live,"].concat();
+        assert!(
+            window.contains(&live_arg),
+            "HIGH-1 regression: the backstop call site must pass the \
+             live-session map"
+        );
+        let file_arg: String = ["&index_prev_close", "_cache,"].concat();
+        assert!(
+            !window.contains(&file_arg),
+            "HIGH-1 regression: the backstop call site must NOT read the \
+             file-loaded cache (values can be one trading day stale)"
+        );
+        // The code-6 arm must keep populating the live map so the backstop
+        // has a source at all.
+        let live_insert: String = [
+            "index_prev_close_live",
+            ".insert(security_id, previous_close)",
+        ]
+        .concat();
+        assert!(
+            src.contains(&live_insert),
+            "HIGH-1 regression: the code-6 PrevClose arm must populate the \
+             live-session map"
+        );
     }
 
     /// A5: Test helper — calls `run_tick_processor` with `NoopGreeksEnricher`
