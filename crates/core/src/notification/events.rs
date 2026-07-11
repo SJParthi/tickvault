@@ -1226,7 +1226,11 @@ pub struct FeedScoreLine {
     pub blame_broker: i64,
     pub blame_ours: i64,
     pub blame_unclear: i64,
-    /// Stall episodes (0 until the stall tracking upgrade ships).
+    /// Stall episodes — measured from the day's stall-restart records
+    /// (scoreboard PR-B, 2026-07-10): 0 means a MEASURED zero from this
+    /// deploy forward; `-1` = record unavailable. Groww-only by
+    /// construction today (Dhan's silent-socket detection reconnects
+    /// in-process and lands in the drops count instead).
     pub stalls: i64,
     /// Boot-reconciled process restarts detected today.
     pub restarts: i64,
@@ -1238,7 +1242,7 @@ pub struct FeedScoreLine {
 /// Tiebreak ladder — feed-off no-contest (round 4: a switched-off feed's
 /// measured zeros are a one-horse race, never a win for the other) →
 /// exclusive minutes → worst-1% delay (only when BOTH are measured; a −1
-/// sentinel never decides) → broker-blamed drops → even day.
+/// sentinel never decides) → broker-blamed incidents → even day.
 fn scorecard_verdict(
     dhan: &FeedScoreLine,
     groww: &FeedScoreLine,
@@ -1292,10 +1296,16 @@ fn scorecard_verdict(
             render_ms(l.lag_p99_ms)
         );
     }
-    // Rung 3: fewer broker-caused drops wins. The blame tallies must BOTH
-    // be measured too — a -1 sentinel would otherwise "win" (-1 < N) and
-    // render as gibberish (hostile review 2026-07-10); sentinel days fall
-    // through to "Even day".
+    // Rung 3: fewer broker-caused INCIDENTS wins — since PR-B the broker
+    // blame tally covers drops + stalls (restarts are always ours, so they
+    // never inflate it), and the wording must match what is compared: on a
+    // stall-heavy zero-drop day "fewer broker-caused drops (0 vs 5)" would
+    // contradict the card's own Drops line (review round 1, charter §D
+    // commandment 6 — the incident-split line was already reworded for
+    // exactly this reason). The blame tallies must BOTH be measured too —
+    // a -1 sentinel would otherwise "win" (-1 < N) and render as gibberish
+    // (hostile review 2026-07-10); sentinel days fall through to
+    // "Even day".
     if dhan.drops_market >= 0
         && groww.drops_market >= 0
         && dhan.blame_broker >= 0
@@ -1308,7 +1318,7 @@ fn scorecard_verdict(
             (groww, dhan)
         };
         return format!(
-            "\u{1f3c6} Verdict: {} won today — fewer broker-caused drops ({} vs {}).",
+            "\u{1f3c6} Verdict: {} won today — fewer broker-caused incidents ({} vs {}).",
             w.name, w.blame_broker, l.blame_broker
         );
     }
@@ -2015,24 +2025,13 @@ impl NotificationEvent {
                          reads \u{201c}not measured yet\u{201d}.",
                     );
                 }
-                if dhan.stalls < 0 && groww.stalls < 0 {
-                    footnotes.push_str(
-                        "\nStall tracking starts with the next upgrade — today \
-                         reads \u{201c}?\u{201d}.",
-                    );
-                }
-                if groww.drops_market < 0 && dhan.drops_market >= 0 {
-                    // Round-2 hostile review 2026-07-10: Groww's internal
-                    // reconnects are not yet recorded (only a full feed
-                    // switch-off or a crash is), so a "0" would be a false
-                    // all-clear next to Dhan's fully-counted drops.
-                    footnotes.push_str(
-                        "\nGroww connection drops are not counted yet (its \
-                         internal reconnects become visible with the next \
-                         upgrade) — today reads \u{201c}?\u{201d}, so do not \
-                         compare drop counts between the two feeds today.",
-                    );
-                }
+                // Scoreboard PR-B (2026-07-10): the PR-1 stall + Groww-drops
+                // sentinel footnotes are RETIRED — stall episodes are
+                // measured from this deploy forward (0 = measured 0; the
+                // runbook keeps the pre-ship-day caveat), and the Groww
+                // socket-death family is now visible in the Stalls column,
+                // so the drops count renders as a measurement again. A `-1`
+                // still renders as "?" defensively, without a stale claim.
                 format!(
                     "\u{1f4ca} <b>Daily feed scorecard @ 3:45 PM IST</b>\n\
                      Date: {trading_date_ist}\n\
@@ -6519,7 +6518,7 @@ mod tests {
         d.blame_broker = 5;
         let msg = scorecard(d, g).to_message();
         assert!(
-            msg.contains("Verdict: Groww won today — fewer broker-caused drops (2 vs 5)."),
+            msg.contains("Verdict: Groww won today — fewer broker-caused incidents (2 vs 5)."),
             "rung-3 verdict wrong: {msg}"
         );
         // Rung 3 skip (hostile review 2026-07-10): a −1 blame sentinel must
@@ -6560,9 +6559,20 @@ mod tests {
             "lag-floor footnote missing: {msg}"
         );
         assert!(msg.contains("1.2 s"), "≥1s delays render in seconds: {msg}");
-        // Unmeasured stalls (PR-1: no stall emit site) render "?" + an
-        // explicit footnote — never a fabricated 0 (hostile review
-        // 2026-07-10; audit Rule 11).
+        // Scoreboard PR-B (2026-07-10): stalls are MEASURED — a real count
+        // renders numerically and the retired PR-1 footnote never appears
+        // (0 = measured 0 from this deploy forward; the runbook keeps the
+        // pre-ship-day caveat).
+        let mut g = score_line("Groww");
+        g.stalls = 1;
+        let msg = scorecard(score_line("Dhan"), g).to_message();
+        assert!(msg.contains("Stalls: Dhan 0 | Groww 1"), "{msg}");
+        assert!(
+            !msg.contains("Stall tracking starts with the next upgrade"),
+            "the retired PR-1 stall footnote must not render: {msg}"
+        );
+        // A `-1` still renders as the defensive "?" — without the stale
+        // footnote claim.
         let mut d = score_line("Dhan");
         let mut g = score_line("Groww");
         d.stalls = -1;
@@ -6570,8 +6580,8 @@ mod tests {
         let msg = scorecard(d, g).to_message();
         assert!(msg.contains("Stalls: Dhan ? | Groww ?"), "{msg}");
         assert!(
-            msg.contains("Stall tracking starts with the next upgrade"),
-            "stall footnote missing: {msg}"
+            !msg.contains("Stall tracking starts with the next upgrade"),
+            "the retired PR-1 stall footnote must not render: {msg}"
         );
         // Partial + degraded days carry loud warnings — the partial wording
         // names the HONEST PR-1 cause (a read failure while building the
@@ -6652,11 +6662,10 @@ mod tests {
 
     #[test]
     fn test_dual_feed_scorecard_groww_drops_sentinel_footnote() {
-        // Round-2 hostile review 2026-07-10: while the Groww disconnect
-        // instrumentation is blind to sidecar socket drops (pre-PR-2), the
-        // card renders Groww drops as the "?" sentinel + a footnote naming
-        // the blind spot — never a measured-looking 0 next to Dhan's fully
-        // instrumented count.
+        // Scoreboard PR-B (2026-07-10): the round-2 Groww drops blind spot
+        // closed with the stall rows — the footnote is RETIRED. A `-1`
+        // (defensive) still renders as "?" and must never decide a verdict
+        // rung, but no stale "not counted yet" claim renders.
         let mut g = score_line("Groww");
         g.drops_market = -1;
         let msg = scorecard(score_line("Dhan"), g).to_message();
@@ -6665,8 +6674,8 @@ mod tests {
             "{msg}"
         );
         assert!(
-            msg.contains("Groww connection drops are not counted yet"),
-            "the blind-spot footnote must render: {msg}"
+            !msg.contains("Groww connection drops are not counted yet"),
+            "the retired blind-spot footnote must not render: {msg}"
         );
         // The drops verdict rung must not decide against the sentinel —
         // identical evidence elsewhere → Even day.
@@ -6679,7 +6688,7 @@ mod tests {
             msg.contains("\u{1f91d} Verdict: Even day."),
             "a sentinel drops side must never lose/win the drops rung: {msg}"
         );
-        // Both sides measured → no footnote.
+        // Both sides measured → still no footnote.
         let msg = scorecard(score_line("Dhan"), score_line("Groww")).to_message();
         assert!(
             !msg.contains("Groww connection drops are not counted yet"),

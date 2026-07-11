@@ -70,13 +70,45 @@ impl BlameClass {
 pub const EPISODE_KIND_DISCONNECT: &str = "disconnect";
 /// Off-hours disconnect (Dhan pre/post-market idle cleanup class).
 pub const EPISODE_KIND_OFF_HOURS_DISCONNECT: &str = "off_hours_disconnect";
-/// Sidecar stall restart (FEED-STALL-01 semantics). Emitter lands in PR-2;
-/// the classifier arm exists day-1 so PR-2 activates it with zero edits here.
+/// Sidecar stall restart (FEED-STALL-01 semantics). Emitter LIVE since the
+/// scoreboard stall PR (PR-B, 2026-07-10): the Groww stall watchdog writes a
+/// `stall_restarted` ws_event_audit row per kill+relaunch, carrying one of
+/// the `STALL_SOURCE_*` cause slugs below in `source`.
 pub const EPISODE_KIND_STALL_RESTART: &str = "stall_restart";
-/// Never-streamed restart (FEED-STALL-01 §1b semantics). Emitter in PR-2.
+/// Never-streamed restart (FEED-STALL-01 §1b semantics). Emitter LIVE since
+/// PR-B (same `stall_restarted` event kind, `source = stall_never_streamed`).
 pub const EPISODE_KIND_NEVER_STREAMED_RESTART: &str = "never_streamed_restart";
 /// Boot-reconciled process death (the dying process wrote no disconnect row).
 pub const EPISODE_KIND_PROCESS_DEATH: &str = "process_death";
+
+// ---------------------------------------------------------------------------
+// Stall-restart cause slugs (dual-feed scoreboard PR-B, 2026-07-10)
+// ---------------------------------------------------------------------------
+// The FIXED machine slugs the Groww sidecar stall watchdog stamps into the
+// `ws_event_audit.source` column of a `stall_restarted` lifecycle row —
+// derived from the supervisor's OWN `SidecarLineClass` classification of the
+// child's diagnostics (never raw child text; redaction rules apply). Shared
+// here so the emitter (`groww_sidecar_supervisor`), the aggregation
+// (`feed_scoreboard_boot`), and the classifier arms below can never drift on
+// the literals. The classifier consumes them via `stall_reason` EXACT-match
+// arms (rule §4; PR-B fix round 1 — the earlier substring arms silently
+// broker-blamed drifted slugs): `stall_auth_stale` → ours/token_minter_stale;
+// `stall_entitlement` → broker/entitlement_reject; `stall_never_streamed` →
+// broker/never_streamed; `stall_silent_socket` → broker/silent_socket; any
+// UNKNOWN slug falls through to the rule-9 indeterminate floor.
+
+/// FEED-STALL-01 classic arm: alive-but-silent socket on a healthy host,
+/// no confirmed auth/entitlement reject observed on the child.
+pub const STALL_SOURCE_SILENT_SOCKET: &str = "stall_silent_socket";
+/// FEED-STALL-01 §1b arm: connected + subscribed but NEVER streamed a first
+/// tick this session (no confirmed auth/entitlement reject observed).
+pub const STALL_SOURCE_NEVER_STREAMED: &str = "stall_never_streamed";
+/// The child's last confirmed reject class was `AuthRejected` (the shared
+/// SSM access token is stale — the minter Lambda is OUR duty).
+pub const STALL_SOURCE_AUTH_STALE: &str = "stall_auth_stale";
+/// The child's last confirmed reject class was `EntitlementRejected`
+/// (SILENT-FEED watchdog / permissions / authorization — broker side).
+pub const STALL_SOURCE_ENTITLEMENT: &str = "stall_entitlement";
 
 /// Everything the classifier may consider for one episode. All fields are
 /// plain evidence — the classifier itself does NO I/O.
@@ -155,9 +187,13 @@ pub const BLAME_REASON_UNCLASSIFIED: &str = "unclassified";
 ///    broker `auth_entitlement`.
 /// 3. Groww `feed_disabled` → ours `feed_toggle` (the operator/gate turned
 ///    the feed off).
-/// 4. Stall episodes → broker `silent_socket` / `never_streamed` /
-///    `entitlement_reject`, EXCEPT the token-stale class → ours
-///    `token_minter_stale` (the shared-minter Lambda is our duty).
+/// 4. Stall episodes → EXACT match on the four `STALL_SOURCE_*` slugs:
+///    broker `silent_socket` / `never_streamed` / `entitlement_reject`,
+///    EXCEPT the token-stale class → ours `token_minter_stale` (the
+///    shared-minter Lambda is our duty). An UNKNOWN/drifted slug is NOT
+///    silently broker-blamed — it falls through to the rule-9 floor
+///    (the never-streamed KIND itself still attributes, since it is
+///    derived upstream from the same slug).
 /// 5. Off-hours disconnects → indeterminate `off_hours_idle` (expected
 ///    pre/post-market cleanup noise; excluded from headline counts).
 /// 6. Resource pressure (PROC-01 / RESOURCE-* within ±300s) → ours
@@ -217,32 +253,40 @@ pub fn classify_episode(e: &EpisodeEvidence<'_>) -> (BlameClass, &'static str) {
         return (BlameClass::Ours, "bridge_task_died");
     }
 
-    // 4. Stall episodes (emitters land in PR-2; arms live day-1).
+    // 4. Stall episodes (emitter LIVE since PR-B). EXACT match on the four
+    //    lockstep STALL_SOURCE_* slugs the supervisor stamps
+    //    (`stall_cause_slug` is total over them; the aggregation threads
+    //    the row's `source` through as `stall_reason` verbatim). PR-B fix
+    //    round 1 (2026-07-10 review LOW): the earlier substring arms
+    //    terminated in an unconditional broker/silent_socket default, so
+    //    an UNKNOWN/drifted slug was silently BROKER-blamed (and a drifted
+    //    slug containing "auth" flipped to ours) — biasing the month
+    //    verdict's broker tally on schema drift. Unknown slugs now fall
+    //    through to the rule-9 indeterminate floor (fail-closed).
     if e.episode_kind == EPISODE_KIND_STALL_RESTART
         || e.episode_kind == EPISODE_KIND_NEVER_STREAMED_RESTART
     {
-        // Authorization / Permissions / SILENT-FEED entitlement class —
-        // checked BEFORE the auth/token class because "authorization"
-        // contains the substring "auth" (a NATS-level reject is a broker
-        // entitlement refusal, not our minter's duty).
-        if e.stall_reason.contains("entitlement")
-            || e.stall_reason.contains("authoriz")
-            || e.stall_reason.contains("permission")
-        {
-            return (BlameClass::Broker, "entitlement_reject");
+        match e.stall_reason {
+            // Hard authorization / permission / entitlement reject class
+            // (a NATS-level reject is a broker entitlement refusal, not
+            // our minter's duty).
+            STALL_SOURCE_ENTITLEMENT => return (BlameClass::Broker, "entitlement_reject"),
+            // Token-stale / auth class → the shared-minter Lambda (ours).
+            STALL_SOURCE_AUTH_STALE => return (BlameClass::Ours, "token_minter_stale"),
+            STALL_SOURCE_NEVER_STREAMED => return (BlameClass::Broker, "never_streamed"),
+            // Plain silent-socket stall (FEED-STALL-01 semantics: healthy
+            // host, dead server-side socket).
+            STALL_SOURCE_SILENT_SOCKET => return (BlameClass::Broker, "silent_socket"),
+            _ => {}
         }
-        // Token-stale / auth class → the shared-minter Lambda duty (ours).
-        if e.stall_reason.contains("auth") || e.stall_reason.contains("token") {
-            return (BlameClass::Ours, "token_minter_stale");
-        }
-        if e.episode_kind == EPISODE_KIND_NEVER_STREAMED_RESTART
-            || e.stall_reason.contains("never_streamed")
-        {
+        // The KIND itself is derived upstream from the never-streamed slug
+        // (episode_kind_for_event) — it carries the attribution even when
+        // the reason string drifted.
+        if e.episode_kind == EPISODE_KIND_NEVER_STREAMED_RESTART {
             return (BlameClass::Broker, "never_streamed");
         }
-        // Plain silent-socket stall (FEED-STALL-01 semantics: healthy host,
-        // dead server-side socket).
-        return (BlameClass::Broker, "silent_socket");
+        // Unknown/drifted slug on a plain stall kind: fall through to the
+        // evidence arms + rule-9 floor below (never silently blamed).
     }
 
     // 5. Off-hours disconnects — expected idle-cleanup noise; excluded from
@@ -476,16 +520,8 @@ mod tests {
 
     #[test]
     fn test_classify_stall_reasons() {
-        // FEED-STALL-01 silent socket → broker.
-        let stall = EpisodeEvidence {
-            stall_reason: "stall",
-            ..EpisodeEvidence::bare(EPISODE_KIND_STALL_RESTART, "groww", "stall_watchdog", -1)
-        };
-        assert_eq!(
-            classify_episode(&stall),
-            (BlameClass::Broker, "silent_socket")
-        );
-        // Never-streamed (kind OR reason slug) → broker.
+        // Never-streamed KIND attributes even with an empty/drifted reason
+        // (the kind is derived upstream from the same slug).
         let ns_kind = EpisodeEvidence::bare(
             EPISODE_KIND_NEVER_STREAMED_RESTART,
             "groww",
@@ -496,40 +532,78 @@ mod tests {
             classify_episode(&ns_kind),
             (BlameClass::Broker, "never_streamed")
         );
-        let ns_reason = EpisodeEvidence {
-            stall_reason: "never_streamed",
-            ..EpisodeEvidence::bare(EPISODE_KIND_STALL_RESTART, "groww", "stall_watchdog", -1)
-        };
-        assert_eq!(
-            classify_episode(&ns_reason),
-            (BlameClass::Broker, "never_streamed")
-        );
-        // FEED-REJECT-01 auth / token-stale class → the shared minter is OUR duty.
-        for reason in ["error [auth]", "access token stale"] {
-            let e = EpisodeEvidence {
-                stall_reason: reason,
-                ..EpisodeEvidence::bare(EPISODE_KIND_STALL_RESTART, "groww", "stall_watchdog", -1)
-            };
-            assert_eq!(
-                classify_episode(&e),
-                (BlameClass::Ours, "token_minter_stale"),
-                "{reason:?} must classify ours/token_minter_stale"
-            );
-        }
-        // Authorization / Permissions / entitlement class → broker.
-        for reason in [
+        // PR-B fix round 1 (review LOW): the stall arm is EXACT-match on
+        // the four lockstep slugs — raw child-text shapes and drifted
+        // slugs are NO LONGER substring-blamed; they land on the rule-9
+        // indeterminate floor (fail-closed, never a silent broker vote).
+        for raw in [
+            "stall",
+            "never_streamed", // the bare word is NOT the slug
+            "error [auth]",
+            "access token stale",
             "authorization violation",
             "permission violation",
             "entitlement",
+            "some_future_slug",
         ] {
             let e = EpisodeEvidence {
-                stall_reason: reason,
+                stall_reason: raw,
                 ..EpisodeEvidence::bare(EPISODE_KIND_STALL_RESTART, "groww", "stall_watchdog", -1)
             };
             assert_eq!(
                 classify_episode(&e),
+                (BlameClass::Indeterminate, BLAME_REASON_UNCLASSIFIED),
+                "{raw:?} is not a lockstep slug — must fail closed to the floor"
+            );
+        }
+    }
+
+    #[test]
+    fn test_classify_stall_source_slugs_map_exactly() {
+        // PR-B lockstep: the EXACT slugs the supervisor emits into the
+        // `stall_restarted` row's `source` (threaded through as
+        // `stall_reason` by the aggregation) must map to the contract's
+        // blame table — pins the emitter↔classifier literals together.
+        for (slug, kind, expected) in [
+            (
+                STALL_SOURCE_SILENT_SOCKET,
+                EPISODE_KIND_STALL_RESTART,
+                (BlameClass::Broker, "silent_socket"),
+            ),
+            (
+                STALL_SOURCE_NEVER_STREAMED,
+                EPISODE_KIND_NEVER_STREAMED_RESTART,
+                (BlameClass::Broker, "never_streamed"),
+            ),
+            (
+                STALL_SOURCE_AUTH_STALE,
+                EPISODE_KIND_STALL_RESTART,
+                (BlameClass::Ours, "token_minter_stale"),
+            ),
+            (
+                STALL_SOURCE_AUTH_STALE,
+                EPISODE_KIND_NEVER_STREAMED_RESTART,
+                (BlameClass::Ours, "token_minter_stale"),
+            ),
+            (
+                STALL_SOURCE_ENTITLEMENT,
+                EPISODE_KIND_STALL_RESTART,
                 (BlameClass::Broker, "entitlement_reject"),
-                "{reason:?} must classify broker/entitlement_reject"
+            ),
+            (
+                STALL_SOURCE_ENTITLEMENT,
+                EPISODE_KIND_NEVER_STREAMED_RESTART,
+                (BlameClass::Broker, "entitlement_reject"),
+            ),
+        ] {
+            let e = EpisodeEvidence {
+                stall_reason: slug,
+                ..EpisodeEvidence::bare(kind, "groww", slug, -1)
+            };
+            assert_eq!(
+                classify_episode(&e),
+                expected,
+                "slug {slug:?} on kind {kind:?} must map to {expected:?}"
             );
         }
     }

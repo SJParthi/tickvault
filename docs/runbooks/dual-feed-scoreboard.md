@@ -127,13 +127,23 @@ WHERE lag_p99_ms >= 0 AND trading_date_ist >= '2026-07-01'
   AND trading_date_ist < '2026-08-01' GROUP BY feed;
 ```
 
-- **Groww drop/blame sums are a FLOOR for every pre-stall-upgrade (PR-2)
-  day:** Groww disconnect rows exist only for feed-disable and
-  bridge-death — the dominant sidecar socket-drop family writes no
-  episode row until the stall detector ships, so `drops`/`broker` for
-  Groww under-count those days and the daily card deliberately renders
-  Groww drops as "?" meanwhile. Do NOT read "Dhan N vs Groww 0 drops" as
-  a Groww win for that period.
+- **Groww drop/blame sums are a FLOOR for every pre-PR-B day (before
+  2026-07-10):** Groww disconnect rows exist only for feed-disable and
+  bridge-death, and the dominant sidecar socket-drop family wrote no
+  episode row until the stall event kind shipped (PR-B, 2026-07-10) —
+  `drops`/`broker`/`stalls` for Groww under-count those days. Do NOT read
+  "Dhan N vs Groww 0 drops/stalls" as a Groww win for that period. FROM
+  PR-B forward the socket-death family lands in the `stalls` column
+  (blame-attributed via the `stall_*` source slugs) and the card renders
+  Groww drops + stalls as measurements. **Permanent asymmetry (honest):**
+  the stalls column is Groww-only by construction — the Dhan main-feed
+  has no sidecar; its silent-socket detection (WS-GAP-06 / activity
+  watchdog) reconnects in-process and is already counted in Dhan's
+  disconnect/reconnect rows. Compare INCIDENT TOTALS (drops + stalls +
+  restarts — the card's blame split already covers all three), never the
+  stalls column across feeds. Residual on BOTH feeds: in-sidecar /
+  in-process reconnects that recover faster than the 30s stall threshold
+  write no row anywhere.
 - `avg(uptime_pct)` includes partial days (their 0.0-with-partial-flag
   rows) — cross-check `partial_days` before quoting it.
 - **`outcome = 'feed_off'` days are EXCLUDED above (round 4, 2026-07-10):**
@@ -320,10 +330,13 @@ FROM feed_scoreboard_daily WHERE outcome != 'complete' ORDER BY trading_date_ist
   - Lag histograms for a past day (PR-3 onward they are in-memory,
     per-process) → sentinels stay.
   - Per-instrument unique-wins for pre-PR-4 days.
-  - Stall episode rows for days before the stall event kind ships (PR-2) —
-    those days honestly read `stalls = 0` in the table (the Telegram shows
-    "?"); the CloudWatch counter `tv_feed_sidecar_stall_restart_total`
-    holds the past.
+  - Stall episode rows for days before the stall event kind shipped
+    (PR-B, 2026-07-10) — those days honestly read `stalls = 0` in the
+    table and on the card (0 = "no rows existed", not "no stalls
+    happened"); the CloudWatch counter
+    `tv_feed_sidecar_stall_restart_total` holds the pre-ship past. From
+    PR-B forward the `stall_restarted` ws_event_audit rows are durable,
+    so a backfill of a POST-ship day rebuilds its stall episodes fully.
   - A process death whose boot's connect row NEVER landed inside the
     reconcile poll window (below) — the coverage hole still shows in
     `streaming_minutes`, but the episode row is absent.
@@ -368,10 +381,13 @@ FROM feed_scoreboard_daily WHERE outcome != 'complete' ORDER BY trading_date_ist
   exclusive/both minutes work from day 1 (they aggregate the EXISTING
   `ws_event_audit` + `ticks` tables — any past day is backfillable for
   those via `TICKVAULT_SCOREBOARD_NOW=1 TICKVAULT_SCOREBOARD_DATE=…`, §4).
-- Lag = `-1` sentinels until PR-3; stalls render "?" until PR-2 — the
-  Telegram carries explicit footnotes for BOTH. Per-instrument detail
-  (until PR-4) is table-only and never rendered on the card, so it needs
-  no footnote.
+- Lag = `-1` sentinels until PR-3 (the Telegram carries an explicit
+  footnote). Stalls are MEASURED since PR-B (2026-07-10): the stall
+  watchdog's `stall_restarted` rows feed the Stalls column, 0 = measured
+  0 from the ship date forward, and the PR-1 "?" footnote is retired
+  (pre-ship days: see the §2 floor caveat + §4 backfill note).
+  Per-instrument detail (until PR-4) is table-only and never rendered on
+  the card, so it needs no footnote.
 - The whole subsystem is toggleable: `[scoreboard] enabled = false` in
   `config/base.toml` spawns nothing (the rollback switch).
 - Failure signal: SCOREBOARD-01 in the error stream
@@ -390,4 +406,8 @@ FROM feed_scoreboard_daily WHERE outcome != 'complete' ORDER BY trading_date_ist
 - [ ] Coverage claims say "at our capture boundary" — a unique-win minute
       means the other feed delivered nothing THAT WE CAPTURED, not proof of
       what the exchange traded (both vendors sample).
-- [ ] Stall counts note the PR-2 ship date (earlier days read 0).
+- [ ] Stall counts note the PR-B ship date (2026-07-10 — earlier days
+      read 0 = "no rows", not "no stalls") AND that the stalls column is
+      Groww-only by construction (the Dhan main-feed's silent-socket
+      recoveries live in its disconnect/reconnect rows) — compare
+      incident totals, never the stalls column across feeds.

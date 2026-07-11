@@ -145,8 +145,23 @@ blame upgrades to broker only on corroboration (Dhan codes, WS-GAP-09
 overlap ±120s, stall-watchdog semantics). Lag columns are −1 sentinels until
 PR-3 lands the day histograms (Dhan additionally carries a ≥1s whole-second
 quantization floor — `lag_floor_ms` column). Per-instrument unique-wins land
-in PR-4; stall episode rows land in PR-2 (pre-ship days read 0 stalls — the
-CloudWatch `tv_feed_sidecar_stall_restart_total` counter holds the past).
+in PR-4. **Stall episode rows are LIVE since PR-B (2026-07-10):** the Groww
+sidecar stall watchdog stamps ONE `WsEventKind::StallRestarted`
+(`stall_restarted`) ws_event_audit row per kill+relaunch (both the classic
+FEED-STALL-01 arm and the §1b never-streamed arm), carrying a FIXED machine
+cause slug in `source` (`stall_silent_socket` / `stall_never_streamed` /
+`stall_auth_stale` / `stall_entitlement` — `feed_blame::STALL_SOURCE_*`;
+never raw child text) through the SAME best-effort try_send pipeline
+(failure = AUDIT-WS-01); the 15:45 aggregation maps them to the
+`stall_restart` / `never_streamed_restart` episode kinds (detector
+`stall_row`) and the card's Stalls column is a measurement from the PR-B
+deploy forward (0 = measured 0; PRE-ship days honestly read 0 with the
+CloudWatch `tv_feed_sidecar_stall_restart_total` counter holding the past —
+runbook caveat). Two honest bounds: (a) the **stalls column is Groww-only
+by construction** — the Dhan main-feed has no sidecar; its silent-socket
+detection is the WS-GAP-06/activity-watchdog reconnect machinery, already
+counted as disconnect/reconnect rows; (b) in-sidecar reconnects that
+recover FASTER than the 30s stall threshold write no row on either column.
 A failure here NEVER affects tick capture, candles, orders, or feed
 recovery. Delivery boundary: SCOREBOARD-01 is log-sink-only today (no
 `error_code_alerts` map entry — the alarm budget is exhausted); the daily
@@ -178,9 +193,10 @@ operator signal.
 | Groww `feed_disabled` | ours | `feed_toggle` |
 | Groww `bridge_died` (our bridge task panicked + respawned — FEED-SUPERVISOR-01 class) | ours | `bridge_task_died` |
 | Order-update `clean close` (server Close frame / stream end — idle-day close vs auth-reject delivery, not attributable per-row) | indeterminate | `clean_close` |
-| Stall (PR-2), silent-socket / never-streamed | broker | `silent_socket` / `never_streamed` |
-| Stall, token/auth-stale class | ours | `token_minter_stale` |
-| Stall, Authorization/Permissions/entitlement class | broker | `entitlement_reject` |
+| Stall row (LIVE since PR-B 2026-07-10), source `stall_silent_socket` / `stall_never_streamed` | broker | `silent_socket` / `never_streamed` |
+| Stall row, source `stall_auth_stale` (the child's last confirmed reject was auth-class — the shared token minter is OUR duty) | ours | `token_minter_stale` |
+| Stall row, source `stall_entitlement` (a HARD Authorization/Permissions/entitlement line — fix round 1 2026-07-10: the sidecar's benign SILENT-FEED watchdog lines no longer produce this slug; off-hours they never latch, in-market they latch a weak value that keeps the kill arm's own slug) | broker | `entitlement_reject` |
+| Stall row, UNKNOWN/drifted source slug (fix round 1: exact-match on the 4 lockstep slugs; a drifted slug is never silently broker-blamed) | indeterminate | `unclassified` (rule-9 floor; the `never_streamed_restart` KIND still attributes broker/`never_streamed`) |
 | PROC-01 / RESOURCE-01..03 within ±300s | ours | `resource_pressure` |
 | 'Dhan or network' RST + WS-GAP-09 overlap ±120s | broker | `bare_rst` / `rate_limit_429` |
 | 'Dhan or network' RST alone | indeterminate | `transport_ambiguous` |
@@ -201,6 +217,7 @@ This rule activates when editing:
 - `crates/storage/src/feed_scoreboard_persistence.rs`
 - `crates/storage/src/feed_episode_audit_persistence.rs`
 - `crates/app/src/feed_scoreboard_boot.rs`
+- `crates/app/src/groww_sidecar_supervisor.rs` (the `stall_restarted` emit)
 - Any file containing `SCOREBOARD-01`, `Scoreboard01`, `feed_scoreboard_daily`,
-  `feed_episode_audit`, `feed_coverage_daily`, `classify_episode`, or
-  `BlameClass`
+  `feed_episode_audit`, `feed_coverage_daily`, `classify_episode`,
+  `BlameClass`, `StallRestarted`, or `STALL_SOURCE_`
