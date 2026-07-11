@@ -314,9 +314,9 @@ resource "aws_cloudwatch_dashboard" "scoreboard" {
         width  = 12
         height = 6
         properties = {
-          title   = "Feed helper restarts (stalled / never-streamed sockets killed + relaunched)"
-          region  = local.dash_region
-          view    = "timeSeries"
+          title  = "Feed helper restarts (stalled / never-streamed sockets killed + relaunched)"
+          region = local.dash_region
+          view   = "timeSeries"
           metrics = [
             [local.dash_namespace, "tv_feed_sidecar_stall_restart_total"],
             [local.dash_namespace, "tv_feed_sidecar_never_streamed_restart_total"]
@@ -332,9 +332,9 @@ resource "aws_cloudwatch_dashboard" "scoreboard" {
         width  = 12
         height = 6
         properties = {
-          title   = "Late catch-up candle seals per feed (delivery backlog signal)"
-          region  = local.dash_region
-          view    = "timeSeries"
+          title  = "Late catch-up candle seals per feed (delivery backlog signal)"
+          region = local.dash_region
+          view   = "timeSeries"
           metrics = [
             [local.dash_namespace, "tv_boundary_catchup_total", "host", "tickvault-prod", "feed", "dhan"],
             [local.dash_namespace, "tv_boundary_catchup_total", "host", "tickvault-prod", "feed", "groww"]
