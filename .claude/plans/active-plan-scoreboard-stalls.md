@@ -24,7 +24,8 @@ ws_event_audit pipeline end-to-end:
    classifier can never drift): `STALL_SOURCE_SILENT_SOCKET` /
    `STALL_SOURCE_NEVER_STREAMED` / `STALL_SOURCE_AUTH_STALE` /
    `STALL_SOURCE_ENTITLEMENT`. The PR-A classifier stall arms activate
-   unchanged (substring arms verified against each slug; a lockstep test
+   (fix round 1 hardened them to EXACT-match on the 4 slugs — unknown
+   slugs fall to the rule-9 indeterminate floor; a lockstep test
    pins every slug→(blame, reason) pair).
 3. **`crates/app/src/groww_sidecar_supervisor.rs`** — the emit. Both
    `supervise_child` kill arms (classic FEED-STALL-01 stall + the §1b
@@ -110,6 +111,47 @@ ws_event_audit pipeline end-to-end:
     docs/runbooks/dual-feed-scoreboard.md,
     .claude/plans/active-plan-scoreboard-stalls.md
   - Tests: n/a (docs; the code-side ratchets above pin the contracts)
+
+### Fix round 1 (2026-07-10 hostile review — 1 HIGH + 2 MEDIUM confirmed + 2 LOWs)
+
+- [x] HIGH/MEDIUM (same root): `stall_restarted` rows TRANSPARENT to
+  process-death pairing — a pre-boot stall row displaced the last up-kind
+  row (`!is_up_kind` → continue) so any day with ≥1 stall kill before a
+  real crash never synthesized the boot-only Groww process_death (blame
+  under-count, permanent loss). Both last-pre trackers
+  (`synthesize_process_death_episodes` + `post_boot_pairing_complete`)
+  now skip stall rows in lockstep (the parked-wake precedent); a genuine
+  `disconnected` row still occupies the slot.
+  - Files: crates/app/src/feed_scoreboard_boot.rs,
+    .claude/rules/project/ws-event-audit-error-codes.md
+  - Tests: test_process_death_synthesizes_through_pre_boot_stall_restarted_row,
+    test_stall_restarted_transparent_skip_does_not_resurrect_down_key
+- [x] MEDIUM: SILENT-FEED latch gating — the drain latched ENTITLEMENT
+  from the sidecar's unconditional 30s silent watchdog lines (incl. the
+  benign ~08:35 pre-open print), making `stall_never_streamed`
+  effectively unreachable. The latch now uses the SAME market-hours
+  predicate as the alert path (off-hours silent-feed lines never latch)
+  and a DISTINCT weak `STALL_CAUSE_SILENT_FEED` value that never outranks
+  either kill arm's slug; only HARD authorization/permission/entitlement
+  lines latch `STALL_CAUSE_ENTITLEMENT` and outrank.
+  - Files: crates/app/src/groww_sidecar_supervisor.rs,
+    .claude/rules/project/feed-stall-watchdog-error-codes.md,
+    .claude/rules/project/dual-feed-scoreboard-error-codes.md
+  - Tests: test_stall_cause_latch_update_matrix (updated),
+    test_stall_cause_slug_matrix (updated),
+    test_stall_slug_combined_path_silent_feed_vs_hard_authorization
+- [x] LOW: classifier stall arm exact-matches the 4 lockstep
+  `STALL_SOURCE_*` slugs; an unknown/drifted slug falls to the rule-9
+  indeterminate `unclassified` floor instead of a silent broker vote
+  (the never-streamed KIND still attributes).
+  - Files: crates/common/src/feed_blame.rs
+  - Tests: test_classify_stall_reasons (rewritten),
+    test_classify_stall_source_slugs_map_exactly (unchanged, still green)
+- [x] LOW: verdict rung-3 wording matches what it compares — "fewer
+  broker-caused incidents" (blame covers drops + stalls since PR-B; the
+  old "drops" wording could contradict the card's own Drops line).
+  - Files: crates/core/src/notification/events.rs
+  - Tests: test_dual_feed_scorecard_body_verdict_ladder (updated literal)
 
 ## Edge Cases
 

@@ -195,7 +195,8 @@ operator signal.
 | Order-update `clean close` (server Close frame / stream end — idle-day close vs auth-reject delivery, not attributable per-row) | indeterminate | `clean_close` |
 | Stall row (LIVE since PR-B 2026-07-10), source `stall_silent_socket` / `stall_never_streamed` | broker | `silent_socket` / `never_streamed` |
 | Stall row, source `stall_auth_stale` (the child's last confirmed reject was auth-class — the shared token minter is OUR duty) | ours | `token_minter_stale` |
-| Stall row, source `stall_entitlement` (Authorization/Permissions/SILENT-FEED class) | broker | `entitlement_reject` |
+| Stall row, source `stall_entitlement` (a HARD Authorization/Permissions/entitlement line — fix round 1 2026-07-10: the sidecar's benign SILENT-FEED watchdog lines no longer produce this slug; off-hours they never latch, in-market they latch a weak value that keeps the kill arm's own slug) | broker | `entitlement_reject` |
+| Stall row, UNKNOWN/drifted source slug (fix round 1: exact-match on the 4 lockstep slugs; a drifted slug is never silently broker-blamed) | indeterminate | `unclassified` (rule-9 floor; the `never_streamed_restart` KIND still attributes broker/`never_streamed`) |
 | PROC-01 / RESOURCE-01..03 within ±300s | ours | `resource_pressure` |
 | 'Dhan or network' RST + WS-GAP-09 overlap ±120s | broker | `bare_rst` / `rate_limit_429` |
 | 'Dhan or network' RST alone | indeterminate | `transport_ambiguous` |

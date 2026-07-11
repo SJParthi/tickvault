@@ -1296,10 +1296,16 @@ fn scorecard_verdict(
             render_ms(l.lag_p99_ms)
         );
     }
-    // Rung 3: fewer broker-caused drops wins. The blame tallies must BOTH
-    // be measured too — a -1 sentinel would otherwise "win" (-1 < N) and
-    // render as gibberish (hostile review 2026-07-10); sentinel days fall
-    // through to "Even day".
+    // Rung 3: fewer broker-caused INCIDENTS wins — since PR-B the broker
+    // blame tally covers drops + stalls (restarts are always ours, so they
+    // never inflate it), and the wording must match what is compared: on a
+    // stall-heavy zero-drop day "fewer broker-caused drops (0 vs 5)" would
+    // contradict the card's own Drops line (review round 1, charter §D
+    // commandment 6 — the incident-split line was already reworded for
+    // exactly this reason). The blame tallies must BOTH be measured too —
+    // a -1 sentinel would otherwise "win" (-1 < N) and render as gibberish
+    // (hostile review 2026-07-10); sentinel days fall through to
+    // "Even day".
     if dhan.drops_market >= 0
         && groww.drops_market >= 0
         && dhan.blame_broker >= 0
@@ -1312,7 +1318,7 @@ fn scorecard_verdict(
             (groww, dhan)
         };
         return format!(
-            "\u{1f3c6} Verdict: {} won today — fewer broker-caused drops ({} vs {}).",
+            "\u{1f3c6} Verdict: {} won today — fewer broker-caused incidents ({} vs {}).",
             w.name, w.blame_broker, l.blame_broker
         );
     }
@@ -6512,7 +6518,7 @@ mod tests {
         d.blame_broker = 5;
         let msg = scorecard(d, g).to_message();
         assert!(
-            msg.contains("Verdict: Groww won today — fewer broker-caused drops (2 vs 5)."),
+            msg.contains("Verdict: Groww won today — fewer broker-caused incidents (2 vs 5)."),
             "rung-3 verdict wrong: {msg}"
         );
         // Rung 3 skip (hostile review 2026-07-10): a −1 blame sentinel must

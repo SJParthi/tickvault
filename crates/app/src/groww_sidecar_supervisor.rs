@@ -303,19 +303,63 @@ pub enum StallArm {
 /// does NOT (it must not claim a credential/entitlement cause, mirroring the
 /// false-"refresh the api-key" fix), and a streaming recovery clears the
 /// latch so a LATER silent stall never inherits a stale cause.
+///
+/// PR-B fix round 1 (2026-07-10 review MEDIUM): the EntitlementRejected
+/// class is SPLIT at latch time. A SILENT-FEED watchdog line
+/// ([`is_silent_feed_diagnostic`] — "subscribed N but received NO records
+/// in 30s") is (a) NEVER latched outside market hours (the sidecar prints
+/// it unconditionally 30s after subscribe, including the ~08:35 pre-open
+/// print the drain itself logs as benign INFO — the latch uses the SAME
+/// market-hours predicate as the alert path), and (b) in-market it latches
+/// the DISTINCT [`STALL_CAUSE_SILENT_FEED`] value which does NOT outrank
+/// either stall arm's slug — the silent-feed watchdog is the same
+/// evidence class as the arms themselves (silence), so it adds no
+/// attribution; only a HARD authorization / permission / entitlement line
+/// latches [`STALL_CAUSE_ENTITLEMENT`] and outranks the arm. Without the
+/// split, the sidecar's 30s watchdog always fired before the Rust 300s
+/// never-streamed threshold and `stall_never_streamed` was effectively
+/// unreachable in production.
 pub const STALL_CAUSE_NONE: u8 = 0;
 /// The child's last confirmed reject was `SidecarLineClass::AuthRejected`.
 pub const STALL_CAUSE_AUTH: u8 = 1;
-/// The child's last confirmed reject was `SidecarLineClass::EntitlementRejected`.
+/// The child's last confirmed reject was a HARD authorization / permission
+/// / entitlement line (`SidecarLineClass::EntitlementRejected` that is NOT
+/// a silent-feed watchdog diagnostic).
 pub const STALL_CAUSE_ENTITLEMENT: u8 = 2;
+/// The child's last reject-class line was an IN-MARKET SILENT-FEED watchdog
+/// diagnostic — corroborates silence but never outranks the arm's slug.
+pub const STALL_CAUSE_SILENT_FEED: u8 = 3;
 
 /// Latch value for one classified sidecar line — `None` = leave the latch
-/// untouched, `Some(v)` = store `v`. Pure (unit-tested without a live child).
+/// untouched, `Some(v)` = store `v`. `silent_feed_diag` =
+/// [`is_silent_feed_diagnostic`] for the same line; `market_open` = the
+/// same market-hours predicate the alert path uses (injected so this is
+/// unit-testable without a live clock). Pure.
 #[must_use]
-pub const fn stall_cause_latch_update(class: SidecarLineClass) -> Option<u8> {
+pub const fn stall_cause_latch_update(
+    class: SidecarLineClass,
+    silent_feed_diag: bool,
+    market_open: bool,
+) -> Option<u8> {
     match class {
         SidecarLineClass::AuthRejected => Some(STALL_CAUSE_AUTH),
-        SidecarLineClass::EntitlementRejected => Some(STALL_CAUSE_ENTITLEMENT),
+        SidecarLineClass::EntitlementRejected => {
+            if silent_feed_diag {
+                // The sidecar's 30s silent watchdog: benign off-hours
+                // (never latches — mirrors the alert-path gate); in-market
+                // it records the WEAK silent-feed corroboration only.
+                if market_open {
+                    Some(STALL_CAUSE_SILENT_FEED)
+                } else {
+                    None
+                }
+            } else {
+                // A hard authorization / permission / entitlement line is
+                // a real config fault at ANY time (see
+                // is_silent_feed_diagnostic's doc) — always latches.
+                Some(STALL_CAUSE_ENTITLEMENT)
+            }
+        }
         // A streaming recovery clears any latched cause (edge semantics —
         // the next stall must not inherit a pre-recovery reject class).
         SidecarLineClass::Streaming => Some(STALL_CAUSE_NONE),
@@ -325,15 +369,22 @@ pub const fn stall_cause_latch_update(class: SidecarLineClass) -> Option<u8> {
 }
 
 /// The FIXED machine cause slug stamped into the `stall_restarted` row's
-/// `source` column. A CONFIRMED reject class observed on the child (the
-/// latch) outranks the arm's generic slug — an auth-stale never-streamed
-/// loop is a token-minter problem, not broker silence. Pure, total: every
-/// input yields one of the four `STALL_SOURCE_*` slugs (never raw text).
+/// `source` column. A CONFIRMED HARD reject class observed on the child
+/// (the latch: auth / hard entitlement) outranks the arm's generic slug —
+/// an auth-stale never-streamed loop is a token-minter problem, not broker
+/// silence. The [`STALL_CAUSE_SILENT_FEED`] latch deliberately does NOT
+/// outrank: it is the same silence evidence the arm itself measured, so
+/// both arms keep their own slug (this is what makes
+/// `stall_never_streamed` reachable — PR-B fix round 1). Pure, total:
+/// every input yields one of the four `STALL_SOURCE_*` slugs (never raw
+/// text).
 #[must_use]
 pub const fn stall_cause_slug(arm: StallArm, latched_cause: u8) -> &'static str {
     match latched_cause {
         STALL_CAUSE_AUTH => tickvault_common::feed_blame::STALL_SOURCE_AUTH_STALE,
         STALL_CAUSE_ENTITLEMENT => tickvault_common::feed_blame::STALL_SOURCE_ENTITLEMENT,
+        // STALL_CAUSE_SILENT_FEED / STALL_CAUSE_NONE / unknown future
+        // values all degrade to the arm's own slug.
         _ => match arm {
             StallArm::SilentSocket => tickvault_common::feed_blame::STALL_SOURCE_SILENT_SOCKET,
             StallArm::NeverStreamed => tickvault_common::feed_blame::STALL_SOURCE_NEVER_STREAMED,
@@ -1099,9 +1150,6 @@ where
         // next_line() is cancel-safe and ends with Ok(None) on EOF (pipe closed).
         while let Ok(Some(line)) = lines.next_line().await {
             let class = classify_sidecar_line(&line);
-            if let Some(cause) = stall_cause_latch_update(class) {
-                stall_cause.store(cause, std::sync::atomic::Ordering::Relaxed);
-            }
             // The sidecar's SILENT-FEED WATCHDOG line ("subscribed N but received
             // NO records in 30s") is benign when the market is closed (silence is
             // expected after-hours — matches the `/feeds` page, PR #1260) but is a
@@ -1113,6 +1161,14 @@ where
             // level + alerting at ALL times.
             let silent_feed_diag = is_silent_feed_diagnostic(&line);
             let market_open = tickvault_common::market_hours::is_within_market_hours_ist();
+            // Stall-cause latch (PR-B fix round 1): gated on the SAME
+            // silent-feed/market-hours split as the alert path below — a
+            // benign off-hours SILENT-FEED print never counts as a
+            // confirmed reject, and an in-market one records only the weak
+            // silent-feed corroboration (see stall_cause_latch_update).
+            if let Some(cause) = stall_cause_latch_update(class, silent_feed_diag, market_open) {
+                stall_cause.store(cause, std::sync::atomic::Ordering::Relaxed);
+            }
             // Forward the child's OWN (already-redacted) line to tracing at the
             // level its class implies, so it reaches the 5-sink → CloudWatch.
             if silent_feed_diag {
@@ -3360,25 +3416,51 @@ mod tests {
         // Only CONFIRMED reject classes latch; streaming clears; the generic
         // transient Error / subscribe / info classes never touch the latch
         // (the false-"refresh the api-key" discipline carried over).
-        assert_eq!(
-            stall_cause_latch_update(SidecarLineClass::AuthRejected),
-            Some(STALL_CAUSE_AUTH)
-        );
-        assert_eq!(
-            stall_cause_latch_update(SidecarLineClass::EntitlementRejected),
-            Some(STALL_CAUSE_ENTITLEMENT)
-        );
-        assert_eq!(
-            stall_cause_latch_update(SidecarLineClass::Streaming),
-            Some(STALL_CAUSE_NONE)
-        );
-        for neutral in [
-            SidecarLineClass::Error,
-            SidecarLineClass::Subscribed,
-            SidecarLineClass::Info,
-        ] {
-            assert_eq!(stall_cause_latch_update(neutral), None, "{neutral:?}");
+        for (sf, open) in [(false, false), (false, true), (true, false), (true, true)] {
+            assert_eq!(
+                stall_cause_latch_update(SidecarLineClass::AuthRejected, sf, open),
+                Some(STALL_CAUSE_AUTH),
+                "auth latches regardless of silent-feed/market flags"
+            );
+            assert_eq!(
+                stall_cause_latch_update(SidecarLineClass::Streaming, sf, open),
+                Some(STALL_CAUSE_NONE),
+                "streaming recovery always clears"
+            );
+            for neutral in [
+                SidecarLineClass::Error,
+                SidecarLineClass::Subscribed,
+                SidecarLineClass::Info,
+            ] {
+                assert_eq!(
+                    stall_cause_latch_update(neutral, sf, open),
+                    None,
+                    "{neutral:?}"
+                );
+            }
         }
+        // PR-B fix round 1: the EntitlementRejected split. A HARD
+        // authorization/permission/entitlement line latches ENTITLEMENT at
+        // ANY time; the SILENT-FEED watchdog line latches the weak
+        // SILENT_FEED value in-market and NOTHING off-hours (the benign
+        // ~08:35 pre-open print must never count as a confirmed reject).
+        for open in [false, true] {
+            assert_eq!(
+                stall_cause_latch_update(SidecarLineClass::EntitlementRejected, false, open),
+                Some(STALL_CAUSE_ENTITLEMENT),
+                "hard entitlement lines latch at any hour"
+            );
+        }
+        assert_eq!(
+            stall_cause_latch_update(SidecarLineClass::EntitlementRejected, true, true),
+            Some(STALL_CAUSE_SILENT_FEED),
+            "in-market silent-feed watchdog latches the WEAK value"
+        );
+        assert_eq!(
+            stall_cause_latch_update(SidecarLineClass::EntitlementRejected, true, false),
+            None,
+            "off-hours silent-feed watchdog must never latch"
+        );
     }
 
     #[test]
@@ -3407,11 +3489,64 @@ mod tests {
             stall_cause_slug(StallArm::NeverStreamed, STALL_CAUSE_NONE),
             STALL_SOURCE_NEVER_STREAMED
         );
+        // PR-B fix round 1: the WEAK silent-feed latch never outranks the
+        // arm — both arms keep their own slug (this is what keeps
+        // stall_never_streamed reachable when the sidecar's 30s silent
+        // watchdog fired before the 300s never-streamed kill).
+        assert_eq!(
+            stall_cause_slug(StallArm::SilentSocket, STALL_CAUSE_SILENT_FEED),
+            STALL_SOURCE_SILENT_SOCKET
+        );
+        assert_eq!(
+            stall_cause_slug(StallArm::NeverStreamed, STALL_CAUSE_SILENT_FEED),
+            STALL_SOURCE_NEVER_STREAMED
+        );
         // Total: an unknown future latch value degrades to the arm slug,
         // never a panic, never raw text.
         assert_eq!(
             stall_cause_slug(StallArm::SilentSocket, 250),
             STALL_SOURCE_SILENT_SOCKET
+        );
+    }
+
+    #[test]
+    fn test_stall_slug_combined_path_silent_feed_vs_hard_authorization() {
+        // PR-B fix round 1 (review MEDIUM) — the COMBINED path the original
+        // tests never exercised: subscribed → the sidecar's SILENT-FEED
+        // watchdog lines → never-streamed kill. The latch must NOT convert
+        // the kill's attribution to entitlement.
+        use tickvault_common::feed_blame::{STALL_SOURCE_ENTITLEMENT, STALL_SOURCE_NEVER_STREAMED};
+        let silent = "groww sidecar: SILENT FEED — subscribed 767 stocks + 28 indices \
+                      but received NO live records in 30s";
+        let class = classify_sidecar_line(silent);
+        assert_eq!(class, SidecarLineClass::EntitlementRejected);
+        assert!(is_silent_feed_diagnostic(silent));
+        // In-market silent-feed lines latch the WEAK value → the
+        // never-streamed kill keeps its own slug.
+        let latched = stall_cause_latch_update(class, true, true).expect("latches in-market");
+        assert_eq!(latched, STALL_CAUSE_SILENT_FEED);
+        assert_eq!(
+            stall_cause_slug(StallArm::NeverStreamed, latched),
+            STALL_SOURCE_NEVER_STREAMED,
+            "silent-feed watchdog lines must not steal the never-streamed attribution"
+        );
+        // The same lines OFF-hours (the ~08:35 pre-open print on every
+        // normal boot) never latch at all.
+        assert_eq!(stall_cause_latch_update(class, true, false), None);
+        // A HARD authorization line before the kill DOES outrank the arm.
+        let hard = "NATS error_cb -> Authorization Violation";
+        let hard_class = classify_sidecar_line(hard);
+        assert_eq!(hard_class, SidecarLineClass::EntitlementRejected);
+        assert!(!is_silent_feed_diagnostic(hard));
+        let hard_latch = stall_cause_latch_update(hard_class, false, true).expect("hard latches");
+        assert_eq!(hard_latch, STALL_CAUSE_ENTITLEMENT);
+        assert_eq!(
+            stall_cause_slug(StallArm::NeverStreamed, hard_latch),
+            STALL_SOURCE_ENTITLEMENT
+        );
+        assert_eq!(
+            stall_cause_slug(StallArm::SilentSocket, hard_latch),
+            STALL_SOURCE_ENTITLEMENT
         );
     }
 

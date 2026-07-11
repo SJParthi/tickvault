@@ -108,8 +108,19 @@ or reconnect behaviour.
   window in `down_secs`. Same best-effort `try_send`; a failure is still
   AUDIT-WS-01. The 15:45 IST dual-feed scorecard aggregates these into
   stall episodes (`dual-feed-scoreboard-error-codes.md` §2). NOT an
-  up-kind and NOT a plain disconnect — scoreboard pairing/feed-off logic
-  deliberately ignores it as a lifecycle "up" signal.
+  up-kind and NOT a plain disconnect — and (PR-B fix round 1, 2026-07-10
+  review HIGH) the scoreboard's process-death pairing treats it as fully
+  TRANSPARENT: it is never an "up" signal AND it never occupies the
+  last-pre-boot slot (`synthesize_process_death_episodes` /
+  `post_boot_pairing_complete` skip it when tracking the prior row — the
+  parked-wake precedent). Rationale: the stall kill+relaunch restores
+  streaming WITHOUT a fresh Connected/Reconnected row (the bridge's audit
+  latches re-arm only on feed-disable / bridge-death falling edges), so
+  letting the stall row displace the morning connect acted as a DOWN
+  marker and permanently blocked the boot-only Groww process-death
+  synthesis for the rest of the day. A genuine `disconnected` /
+  `sleep_entered` row still occupies the slot, so the skip can never
+  resurrect a genuinely-down key.
 
 ---
 

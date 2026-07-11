@@ -1571,6 +1571,11 @@ fn death_window_overlaps_market_hours(prior_ts_ist_nanos: i64, connect_ts_ist_na
 /// time were silently dropped for the boot. A key that never reconnects
 /// (feed disabled mid-day) burns the bounded attempt budget, then the
 /// reconciler proceeds with whatever paired.
+///
+/// PR-B fix round 1 (2026-07-10 review HIGH): `stall_restarted` rows are
+/// TRANSPARENT here — see [`synthesize_process_death_episodes`] (the two
+/// last-pre trackers move in lockstep so the gate and the synthesis agree
+/// on which keys are pairing candidates).
 #[must_use]
 pub fn post_boot_pairing_complete(rows: &[WsAuditEventLite], boot_ts_ist_nanos: i64) -> bool {
     let mut state: BTreeMap<(&str, &str, i64), (Option<&str>, bool)> = BTreeMap::new();
@@ -1578,7 +1583,12 @@ pub fn post_boot_pairing_complete(rows: &[WsAuditEventLite], boot_ts_ist_nanos: 
         let key = (ev.feed.as_str(), ev.ws_type.as_str(), ev.connection_index);
         let entry = state.entry(key).or_insert((None, false));
         if ev.ts_ist_nanos < boot_ts_ist_nanos {
-            entry.0 = Some(ev.event_kind.as_str());
+            // Lockstep with synthesize_process_death_episodes: a stall
+            // kill+relaunch row never occupies the last-pre slot (the
+            // literal is pinned by test_stall_restarted_literal_matches_event_kind).
+            if ev.event_kind != "stall_restarted" {
+                entry.0 = Some(ev.event_kind.as_str());
+            }
         } else if is_up_kind(&ev.event_kind) {
             entry.1 = true;
         }
@@ -1615,6 +1625,20 @@ pub fn post_boot_pairing_complete(rows: &[WsAuditEventLite], boot_ts_ist_nanos: 
 /// `post_close_restart` and stamped `market_hours=false` so it never
 /// pollutes the headline restarts/blame vote or the restart-day partial
 /// floor.
+///
+/// Stall-row transparency (PR-B fix round 1, 2026-07-10 review HIGH): a
+/// `stall_restarted` row is a MACHINERY artifact — the Groww stall
+/// watchdog's kill+relaunch restores streaming WITHOUT a fresh up-kind
+/// row (the bridge's Connected/Reconnected latches re-arm only on
+/// feed-disable / bridge-death falling edges; a sidecar kill is invisible
+/// to them). Letting it occupy the last-pre-boot slot acted as a DOWN
+/// marker: after the day's FIRST stall kill, a later in-market process
+/// death on that key was silently dropped (`!is_up_kind → continue`) and
+/// the boot-only synthesized episode was permanently lost. Stall rows are
+/// therefore SKIPPED when tracking the last-pre-boot row (the
+/// [`parked_wake_indices`] transparent-row precedent) — a genuine down
+/// row (`disconnected` / `sleep_entered`) still occupies the slot, so the
+/// skip can never resurrect a genuinely-down key.
 #[must_use]
 pub fn synthesize_process_death_episodes(
     rows: &[WsAuditEventLite],
@@ -1627,6 +1651,12 @@ pub fn synthesize_process_death_episodes(
         let key = (ev.feed.clone(), ev.ws_type.clone(), ev.connection_index);
         let entry = by_key.entry(key).or_insert((None, None));
         if ev.ts_ist_nanos < boot_ts_ist_nanos {
+            // A stall kill+relaunch row is TRANSPARENT for pairing (see
+            // the fn doc; literal pinned by
+            // test_stall_restarted_literal_matches_event_kind).
+            if ev.event_kind == "stall_restarted" {
+                continue;
+            }
             // Track the LAST pre-boot row (rows arrive ts-ordered, but do
             // not depend on it).
             match entry.0 {
@@ -3001,6 +3031,20 @@ mod tests {
     }
 
     #[test]
+    fn test_day_bounds_micros_window() {
+        // The shared micros source (#1474 promoted it to pub(crate) so the
+        // tick-conservation audit reuses it): start = day × 86_400 × 1e6,
+        // end = start + one IST day in micros — NEVER nanos (the QuestDB
+        // TIMESTAMP-comparison regression lock).
+        let (start, end) = day_bounds_micros(DAY);
+        assert_eq!(start, (DAY as i64) * 86_400 * 1_000_000);
+        assert_eq!(end, start + 86_400 * 1_000_000);
+        // Adversarial input stays bounded (saturating math, no panic).
+        let (s, e) = day_bounds_micros(u64::MAX);
+        assert!(s <= e);
+    }
+
+    #[test]
     fn test_build_ws_events_day_sql_micros_window() {
         let (start, end) = day_micros();
         // Regression lock: the embedded literals are MICROS (16 digits for
@@ -3298,6 +3342,108 @@ mod tests {
             !post_boot_pairing_complete(&rows[..1], boot),
             "pre-boot up rows alone must keep the polling gate pending"
         );
+    }
+
+    #[test]
+    fn test_process_death_synthesizes_through_pre_boot_stall_restarted_row() {
+        // PR-B fix round 1 (review HIGH): a `stall_restarted` row is
+        // TRANSPARENT for pairing. Topology: morning connect 08:35 → stall
+        // kill+relaunch 11:00 (writes a stall row; the relaunch restores
+        // streaming with NO fresh up-kind row) → in-market process crash →
+        // boot 14:05 with post-boot connect 14:06. Pre-fix the stall row
+        // displaced the connect in the last-pre slot (`!is_up_kind` →
+        // continue) and the boot-only death episode was permanently lost.
+        let rows = vec![
+            ev(
+                day_ts(30_900), // 08:35 IST
+                "groww",
+                "groww_bridge",
+                "connected",
+                "groww_subscribed",
+                -1,
+                false,
+            ),
+            ev(
+                day_ts(39_600), // 11:00 IST — stall kill+relaunch
+                "groww",
+                "groww_bridge",
+                "stall_restarted",
+                "stall_silent_socket",
+                -1,
+                true,
+            ),
+            ev(
+                day_ts(50_760), // 14:06 IST — this boot's connect
+                "groww",
+                "groww_bridge",
+                "connected",
+                "groww_subscribed",
+                -1,
+                true,
+            ),
+        ];
+        let boot = day_ts(50_700); // 14:05 IST
+        let deaths = synthesize_process_death_episodes(&rows, boot);
+        assert_eq!(
+            deaths.len(),
+            1,
+            "a pre-boot stall row must not block process-death synthesis"
+        );
+        assert_eq!(deaths[0].ts_ist_nanos, day_ts(50_760));
+        assert!(deaths[0].market_hours, "death window was in-session");
+        // Lockstep: the polling gate sees the SAME candidate — complete
+        // with the post-boot connect, pending without it.
+        assert!(post_boot_pairing_complete(&rows, boot));
+        assert!(
+            !post_boot_pairing_complete(&rows[..2], boot),
+            "the connected+stall pre-boot pair must keep the key a PENDING \
+             pairing candidate (the stall row must not hide it from the gate)"
+        );
+    }
+
+    #[test]
+    fn test_stall_restarted_transparent_skip_does_not_resurrect_down_key() {
+        // The transparent skip must NOT resurrect a genuinely-down key: a
+        // `disconnected` row before the stall row still occupies the
+        // last-pre slot, so no death synthesizes.
+        let rows = vec![
+            ev(
+                day_ts(36_000), // 10:00 IST — genuine down marker
+                "groww",
+                "groww_bridge",
+                "disconnected",
+                "feed_disabled",
+                -1,
+                true,
+            ),
+            ev(
+                day_ts(39_600), // 11:00 IST — stall row after the down row
+                "groww",
+                "groww_bridge",
+                "stall_restarted",
+                "stall_silent_socket",
+                -1,
+                true,
+            ),
+            ev(
+                day_ts(50_760), // 14:06 IST — post-boot connect
+                "groww",
+                "groww_bridge",
+                "connected",
+                "groww_subscribed",
+                -1,
+                true,
+            ),
+        ];
+        let boot = day_ts(50_700);
+        assert!(
+            synthesize_process_death_episodes(&rows, boot).is_empty(),
+            "a down-prior key must stay down — the stall skip must not \
+             synthesize a death for a connection that was disconnected"
+        );
+        // The gate agrees: last-pre = disconnected → not a pairing
+        // candidate → vacuously complete even before any post-boot row.
+        assert!(post_boot_pairing_complete(&rows[..2], boot));
     }
 
     #[test]
