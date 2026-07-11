@@ -25,7 +25,7 @@
 # Filter is configured in user-data.sh.tftpl::amazon-cloudwatch-agent.json
 # emf_processor block — keeps custom-metric cost capped (28 selected
 # series × ~$0.30 ≈ $8.40/mo absolute, $5.40/mo above the 10-free-metric
-# tier — vs. ~₹4500/mo for an unfiltered 150-metric scrape; the 26-name
+# tier — vs. ~₹4500/mo for an unfiltered 150-metric scrape; the 27-name
 # MAIN EMF list is pinned by cloudwatch_app_alarms_wiring.rs, and the two
 # [host,feed] boundary-catchup declarations bring the series count to 28).
 # 2026-07-06 groww feed-down alerting: +3 selected metrics

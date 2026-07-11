@@ -2088,6 +2088,16 @@ pub struct FeedDayNumbers {
     pub streaming_minutes: i64,
     pub unique_win_minutes: i64,
     pub both_minutes: i64,
+    /// Day exchange→receipt lag distribution (scoreboard PR-C) — drained
+    /// from the in-memory per-feed day histograms on SAME-DAY runs only.
+    /// `-1` = not measured (past-day backfill — the histograms are
+    /// process-local and day-scoped, so a backfill can never read them; a
+    /// thin day below the 50-sample floor also stays `-1`, never a
+    /// fabricated distribution).
+    pub lag_p50_ms: i64,
+    pub lag_p99_ms: i64,
+    pub lag_max_ms: i64,
+    pub lag_samples: i64,
     pub disconnects_market: i64,
     pub disconnects_off_hours: i64,
     pub reconnects: i64,
@@ -2107,6 +2117,10 @@ impl FeedDayNumbers {
             streaming_minutes: s,
             unique_win_minutes: s,
             both_minutes: s,
+            lag_p50_ms: s,
+            lag_p99_ms: s,
+            lag_max_ms: s,
+            lag_samples: s,
             disconnects_market: s,
             disconnects_off_hours: s,
             reconnects: s,
@@ -2115,6 +2129,23 @@ impl FeedDayNumbers {
             blame_ours: s,
             blame_indeterminate: s,
             restarts: s,
+        }
+    }
+
+    /// Fold one feed's drained day-lag summary in (scoreboard PR-C). `None`
+    /// (backfill day / thin histogram / fold disabled) keeps the `-1`
+    /// sentinels — the card renders "not measured yet", never a fabricated
+    /// zero (Rule 11). Pure — the process-global histogram read stays in
+    /// the thin caller.
+    fn apply_day_lag(
+        &mut self,
+        summary: Option<tickvault_core::pipeline::feed_lag_monitor::DayLagSummary>,
+    ) {
+        if let Some(s) = summary {
+            self.lag_p50_ms = s.p50_ms;
+            self.lag_p99_ms = s.p99_ms;
+            self.lag_max_ms = s.max_ms;
+            self.lag_samples = s.samples;
         }
     }
 }
@@ -2702,6 +2733,28 @@ pub async fn run_feed_scoreboard(
         }
     }
 
+    // 6b. Day lag distributions (scoreboard PR-C): drain the in-memory
+    //     per-feed day histograms (feed_lag_monitor — fed by the same
+    //     record_* calls that drive the live lag gauges; replay/re-tail
+    //     excluded at record time, NEVER a SQL approximation over the
+    //     replay-contaminated `received_at` column). SCOPED to same-day
+    //     runs ONLY: the histograms are process-local + day-scoped (IST
+    //     midnight reset), so a past-day backfill can never read them — its
+    //     lag columns stay -1 sentinels, honestly. A mid-day restart leaves
+    //     only the post-restart window in the histogram; the restart-day
+    //     partial floor (step 7c) already stamps such a day partial and the
+    //     card carries the restart footnote — measured-but-partial, never
+    //     fabricated (Rule 11).
+    if is_same_day_run {
+        for feed in tickvault_common::feed::Feed::ALL {
+            if let Some(n) = feed_numbers.get_mut(feed.as_str()) {
+                n.apply_day_lag(tickvault_core::pipeline::feed_lag_monitor::day_lag_summary(
+                    *feed,
+                ));
+            }
+        }
+    }
+
     // 7. AUDIT-WS-01 under-count cross-check (self-scrape). SCOPED to
     //    same-day runs ONLY (round-2 hostile review 2026-07-10): the
     //    counter is CURRENT-SESSION state — a past-day backfill inheriting
@@ -2824,10 +2877,13 @@ pub async fn run_feed_scoreboard(
             covered_instrument_minutes: SCOREBOARD_UNAVAILABLE_SENTINEL,
             unique_win_minutes: n.unique_win_minutes,
             both_minutes: n.both_minutes,
-            lag_p50_ms: SCOREBOARD_UNAVAILABLE_SENTINEL,
-            lag_p99_ms: SCOREBOARD_UNAVAILABLE_SENTINEL,
-            lag_max_ms: SCOREBOARD_UNAVAILABLE_SENTINEL,
-            lag_samples: SCOREBOARD_UNAVAILABLE_SENTINEL,
+            // Scoreboard PR-C: measured from the in-memory day histograms
+            // on same-day runs (step 6b); -1 sentinels on backfill days /
+            // thin (<50-sample) days — never fabricated.
+            lag_p50_ms: n.lag_p50_ms,
+            lag_p99_ms: n.lag_p99_ms,
+            lag_max_ms: n.lag_max_ms,
+            lag_samples: n.lag_samples,
             lag_floor_ms: match *feed {
                 tickvault_common::feed::Feed::Dhan => LAG_FLOOR_MS_DHAN,
                 tickvault_common::feed::Feed::Groww => LAG_FLOOR_MS_GROWW,

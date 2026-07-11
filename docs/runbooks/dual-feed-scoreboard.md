@@ -27,7 +27,7 @@ DETERMINISTIC trading-date 15:45:00 IST stamp, so re-runs UPSERT in place.
 |---|---|---|
 | Coverage | `ticks_captured`, `instruments_seen`, `unique_win_minutes`, `both_minutes`, `streaming_minutes`, `session_minutes` (375), `uptime_pct` | `-1` = source unavailable that run (NEVER a fabricated 0) |
 | Per-instrument (PR-4) | `mapped_instruments`, `unmapped_instruments`, `covered_instrument_minutes` | `-1` until the presence registry ships |
-| Lag (PR-3) | `lag_p50_ms`, `lag_p99_ms`, `lag_max_ms`, `lag_samples`, `lag_floor_ms` | `-1` until the day histograms ship; `lag_floor_ms` is the honesty column (Dhan 1000 — whole-second price clock; Groww 1) |
+| Lag (MEASURED since PR-C, 2026-07-11) | `lag_p50_ms`, `lag_p99_ms`, `lag_max_ms`, `lag_samples`, `lag_floor_ms` | Drained from the in-memory per-feed DAY histograms on same-day runs (exchange→receipt, replay/re-tail excluded at record time); `-1` = not measured (pre-ship days, past-day backfills — the histograms are process-local + day-scoped — or a thin <50-sample day); `lag_floor_ms` is the honesty column (Dhan 1000 — whole-second price clock, p50/p99 can never read sub-second; Groww 1 — millisecond clock, but receipt = the sidecar capture instant one hop downstream of the socket, so the two feeds' clocks are NOT like-for-like) |
 | Episodes | `disconnects_market`, `disconnects_off_hours`, `reconnects`, `stalls`, `blame_broker`, `blame_ours`, `blame_indeterminate`, `restarts_detected` | blame tallies exclude off-hours rows |
 | Honesty | `partial_coverage`, `coverage_source` (`in_memory`/`sql_backfill`/`mixed`), `outcome` (`complete`/`partial`/`degraded`/`feed_off`) | `degraded` = the connection-event record itself under-counted that day; `feed_off` = the feed was switched off for the day (one-horse race — EXCLUDED from the month sums, round 4) |
 
@@ -118,8 +118,11 @@ measurement), so even a query that forgets the anti-join no longer inflates
 context, hence the day-level exclusion stays the documented form.
 
 Caveats:
-- `avg(lag_*)` is polluted by the `-1` sentinels (pre-PR-3 days) —
-  compute lag averages ONLY with a `WHERE lag_p99_ms >= 0` variant:
+- `avg(lag_*)` is polluted by the `-1` sentinels (pre-PR-C days,
+  backfilled days, thin days) — compute lag averages ONLY with a
+  `WHERE lag_p99_ms >= 0` variant, and NEVER compare Dhan-vs-Groww lag
+  below Dhan's 1s floor (`lag_floor_ms`; "Groww faster by <1s" is
+  unprovable against Dhan's whole-second clock):
 
 ```sql
 SELECT feed, avg(lag_p99_ms) p99_ms FROM feed_scoreboard_daily
@@ -327,8 +330,11 @@ FROM feed_scoreboard_daily WHERE outcome != 'complete' ORDER BY trading_date_ist
   - errors.jsonl correlation older than the 48h retention → 805 episodes
     default `broker`, resets default `indeterminate` (rows flagged
     `run_partial`).
-  - Lag histograms for a past day (PR-3 onward they are in-memory,
-    per-process) → sentinels stay.
+  - Lag histograms for a past day (they are in-memory, per-process,
+    day-scoped — reset at IST midnight) → sentinels stay. A mid-day
+    restart also loses the pre-restart window: the same-day row still
+    carries the post-restart distribution, stamped partial with the
+    restart footnote (measured-but-partial, never fabricated).
   - Per-instrument unique-wins for pre-PR-4 days.
   - Stall episode rows for days before the stall event kind shipped
     (PR-B, 2026-07-10) — those days honestly read `stalls = 0` in the
@@ -381,8 +387,12 @@ FROM feed_scoreboard_daily WHERE outcome != 'complete' ORDER BY trading_date_ist
   exclusive/both minutes work from day 1 (they aggregate the EXISTING
   `ws_event_audit` + `ticks` tables — any past day is backfillable for
   those via `TICKVAULT_SCOREBOARD_NOW=1 TICKVAULT_SCOREBOARD_DATE=…`, §4).
-- Lag = `-1` sentinels until PR-3 (the Telegram carries an explicit
-  footnote). Stalls are MEASURED since PR-B (2026-07-10): the stall
+- Lag is MEASURED since PR-C (2026-07-11): the per-feed day histograms
+  feed the lag columns + the card's delay lines from the ship date
+  forward (pre-ship days + backfills stay `-1` and render "not measured
+  yet"; the card footnote carries the Dhan ≥1s floor + the Groww
+  millisecond/sidecar-capture semantics). Stalls are MEASURED since
+  PR-B (2026-07-10): the stall
   watchdog's `stall_restarted` rows feed the Stalls column, 0 = measured
   0 from the ship date forward, and the PR-1 "?" footnote is retired
   (pre-ship days: see the §2 floor caveat + §4 backfill note).

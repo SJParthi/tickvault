@@ -1290,9 +1290,24 @@ impl GrowwBridgeState {
             // prove liveness (2026-07-06 false-recovery fix). The persisted
             // `received_at` keeps the exact pre-fix semantics (stamp, else
             // per-wake fallback).
-            if let Some(c) = capture_stamp_ist_nanos(parsed.capture_ns, wake_receipt_ist_nanos) {
+            let capture_ist = capture_stamp_ist_nanos(parsed.capture_ns, wake_receipt_ist_nanos);
+            if let Some(c) = capture_ist {
                 self.wake_max_capture_ist_nanos = self.wake_max_capture_ist_nanos.max(c);
             }
+            // Scoreboard PR-C: Groww exchange→capture lag fold — operands
+            // the drain ALREADY computed (zero new clock reads, zero
+            // allocation). Lines without a capture stamp (old-format /
+            // reconcile-sweep) and ≥60s-stale captures (byte-0 re-tail
+            // backlog) are EXCLUDED + counted inside record_groww_tick;
+            // admitted samples feed the trailing-60s ring (the
+            // tv_groww_exchange_lag_p99_seconds publisher) + the day
+            // histogram (the 15:45 scorecard lag columns) at Groww's
+            // native MILLISECOND precision.
+            tickvault_core::pipeline::feed_lag_monitor::record_groww_tick(
+                capture_ist,
+                wake_receipt_ist_nanos,
+                parsed.tick.ts_ist_nanos,
+            );
             let row_received =
                 row_received_at_with_capture(parsed.capture_ns, wake_receipt_ist_nanos);
             // C2 (feed convergence): the ordered enrich → persist → aggregate
@@ -1512,6 +1527,13 @@ fn spawn_groww_ist_midnight_force_seal(
             // SAME helper the Dhan IST-midnight force-seal uses.
             let sleep_secs = tickvault_common::market_hours::secs_until_next_ist_midnight().max(1);
             tokio::time::sleep(Duration::from_secs(sleep_secs)).await;
+
+            // Scoreboard PR-C: reset the Groww DAY lag histogram at every
+            // IST midnight — BEFORE the trading-day / feed-enabled gates
+            // below (a Saturday-midnight `continue` must still clear
+            // Friday's distribution before the next trading day fills it).
+            // Cold, O(96); an empty/disabled feed's reset is a no-op.
+            tickvault_core::pipeline::feed_lag_monitor::reset_day_lag_histogram(Feed::Groww);
 
             // Only force-seal on trading days — a non-trading-day midnight has no
             // open buckets worth flushing (mirrors the Dhan task).
@@ -4465,6 +4487,57 @@ mod tests {
         assert!(
             src.contains(&groww_feed),
             "the force-seal closure must route with feed: Feed::Groww (drop_d1: false)"
+        );
+    }
+
+    #[test]
+    fn test_record_groww_tick_producer_site_wired_into_drain() {
+        // Scoreboard PR-C producer-half pin (mirror of the Dhan
+        // `test_record_dhan_tick_producer_sites_wired_into_tick_processor`
+        // ratchet): the Groww lag pipeline has two wiring halves — the
+        // PUBLISHER (main.rs supervisor, pinned in secret_manager.rs) and
+        // the PRODUCER (the ONE `record_groww_tick` call at the validated
+        // drain site). Dropping the producer silently starves the Groww
+        // ring below the 50-sample floor: the publisher publishes NOTHING,
+        // the groww lag alarm reads notBreaching forever, and the 15:45
+        // scorecard lag columns regress to −1 — the exact dark-gauge class
+        // of the 2026-07-06 incident, on the second feed.
+        let src = include_str!("groww_bridge.rs");
+        // Needles are ASSEMBLED at runtime so this test's own literals can
+        // never self-match the include_str! scan (the `groww_feed` pattern
+        // above).
+        let producer_needle = format!("feed_lag_monitor::record_groww_tick{}", "(");
+        let producer_call_sites = src
+            .lines()
+            .filter(|l| {
+                let t = l.trim_start();
+                !t.starts_with("//") && !t.starts_with("///") && t.contains(&producer_needle)
+            })
+            .count();
+        assert_eq!(
+            producer_call_sites, 1,
+            "groww_bridge.rs must invoke the Groww lag producer at EXACTLY 1 \
+             non-comment site (the validated drain_new_data hook, AFTER \
+             validate_groww_tick); found {producer_call_sites}."
+        );
+        // The IST-midnight task must reset the Groww DAY histogram (before
+        // its trading-day/enabled gates).
+        let reset_needle = format!(
+            "feed_lag_monitor::reset_day_lag_histogram{}",
+            "(Feed::Groww)"
+        );
+        let reset_sites = src
+            .lines()
+            .filter(|l| {
+                let t = l.trim_start();
+                !t.starts_with("//") && !t.starts_with("///") && t.contains(&reset_needle)
+            })
+            .count();
+        assert_eq!(
+            reset_sites, 1,
+            "the Groww IST-midnight force-seal task must reset the Groww day \
+             lag histogram exactly once (found {reset_sites} sites) — without \
+             it Friday's distribution bleeds into Monday's scorecard row."
         );
     }
 

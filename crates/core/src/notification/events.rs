@@ -2014,15 +2014,27 @@ impl NotificationEvent {
                         ));
                     }
                 }
+                // Scoreboard PR-C (2026-07-11): delay is MEASURED — the day
+                // lag histograms are live. The footnote carries the
+                // resolution asymmetry honestly: Dhan's whole-second price
+                // clock (≥1 s floor) vs Groww's millisecond clock read one
+                // step after the wire (the sidecar writes each price down
+                // the instant it arrives). An unmeasured side (backfill
+                // re-run / too few samples) renders "not measured yet" with
+                // the honest cause — the retired PR-1 "next upgrade" claim
+                // never appears.
                 if dhan.lag_p50_ms >= 0 || dhan.lag_p99_ms >= 0 {
                     footnotes.push_str(
                         "\nNote: Dhan's price clock ticks in whole seconds, so its \
-                         delay can never read below about 1 second.",
+                         delay can never read below about 1 second; Groww's delay \
+                         is millisecond-precise, measured where its helper first \
+                         writes each price down (one step after the wire).",
                     );
                 } else {
                     footnotes.push_str(
-                        "\nDelay measurement starts with the next upgrade — today \
-                         reads \u{201c}not measured yet\u{201d}.",
+                        "\nDelay could not be measured today (a re-run for a past \
+                         day, or too few prices) — it reads \u{201c}not measured \
+                         yet\u{201d}.",
                     );
                 }
                 // Scoreboard PR-B (2026-07-10): the PR-1 stall + Groww-drops
@@ -6545,20 +6557,40 @@ mod tests {
         // −1 lag renders honestly, never a fabricated 0 (audit Rule 11).
         let msg = scorecard(score_line("Dhan"), score_line("Groww")).to_message();
         assert!(msg.contains("not measured yet"), "{msg}");
+        // Scoreboard PR-C: the retired PR-1 "next upgrade" claim must not
+        // render — the unmeasured arm now names the honest cause (backfill
+        // re-run / too few samples).
         assert!(
-            msg.contains("Delay measurement starts with the next upgrade"),
+            msg.contains("Delay could not be measured today"),
             "unmeasured-lag footnote missing: {msg}"
         );
-        // A MEASURED Dhan lag swaps in the whole-second floor footnote.
+        assert!(
+            !msg.contains("Delay measurement starts with the next upgrade"),
+            "the retired PR-1 delay footnote must not render: {msg}"
+        );
+        // MEASURED lag swaps in the resolution-asymmetry footnote (Dhan
+        // whole-second floor + Groww millisecond one-step-after-the-wire)
+        // and renders both feeds at their native precision.
         let mut d = score_line("Dhan");
+        let mut g = score_line("Groww");
         d.lag_p50_ms = 1200;
         d.lag_p99_ms = 2900;
-        let msg = scorecard(d, score_line("Groww")).to_message();
+        g.lag_p50_ms = 180;
+        g.lag_p99_ms = 740;
+        let msg = scorecard(d, g).to_message();
         assert!(
             msg.contains("Dhan's price clock ticks in whole seconds"),
             "lag-floor footnote missing: {msg}"
         );
+        assert!(
+            msg.contains("Groww's delay is millisecond-precise"),
+            "Groww receipt-clock semantics footnote missing: {msg}"
+        );
         assert!(msg.contains("1.2 s"), "≥1s delays render in seconds: {msg}");
+        assert!(
+            msg.contains("180 ms"),
+            "sub-second Groww delays render in milliseconds: {msg}"
+        );
         // Scoreboard PR-B (2026-07-10): stalls are MEASURED — a real count
         // renders numerically and the retired PR-1 footnote never appears
         // (0 = measured 0 from this deploy forward; the runbook keeps the

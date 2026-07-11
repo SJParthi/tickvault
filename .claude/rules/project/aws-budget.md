@@ -30,6 +30,22 @@ healthy floor and would have paged every healthy day):
 Total **≈ $1.50/mo pre-GST (~₹150/mo incl. 18% GST at ₹85/$)** — inside the
 $35/mo pre-GST budget alarm ceiling and the ~₹2,919/mo envelope.
 
+## COST NOTE 2026-07-11 — Groww exchange-lag visibility (scoreboard PR-C, +~$0.40/mo)
+
+The dual-feed scoreboard PR-C added, per `deploy/aws/terraform/silent-feed-alarms.tf` S4:
+
+- **+1 custom-metric series ≈ $0.30/mo:** `tv_groww_exchange_lag_p99_seconds`
+  (the Groww mirror of the Dhan lag gauge — its OWN EMF name, the 27th
+  allowlist entry; the Groww exclusion/clamp counters stay /metrics-only, ₹0).
+- **+1 alarm ≈ $0.10/mo:** groww-exchange-lag-p99-high (>5s ×10min,
+  window-gated 09:20-15:35 IST like the Dhan one; the window-gate Lambda now
+  arms 12 alarms).
+- **+1 CloudWatch dashboard: ₹0** (slot 2 of the 3 free dashboards —
+  `tv-<env>-scoreboard`, Dhan-vs-Groww lag trends).
+
+Total **≈ $0.40/mo pre-GST (~₹40/mo incl. 18% GST at ₹85/$)** — inside the
+$35/mo pre-GST budget alarm ceiling and the ~₹2,919/mo envelope.
+
 ## OPERATOR DECISION 2026-05-20 — Observability stack → CloudWatch-only
 
 > **Operator (Parthiban), 2026-05-20:** "except questdb app and cloud

@@ -338,6 +338,7 @@ resource "aws_lambda_function" "tv_market_hours_liveness_gate" {
         aws_cloudwatch_metric_alarm.realtime_guarantee_degraded.alarm_name,
         aws_cloudwatch_metric_alarm.boundary_catchup_storm_dhan.alarm_name,
         aws_cloudwatch_metric_alarm.dhan_exchange_lag_p99_high.alarm_name,
+        aws_cloudwatch_metric_alarm.groww_exchange_lag_p99_high.alarm_name, # 2026-07-11 scoreboard PR-C
         aws_cloudwatch_metric_alarm.ws_pool_all_dead.alarm_name,      # 2026-07-10 deferral false-page fix
         aws_cloudwatch_metric_alarm.ws_failed_connections.alarm_name, # 2026-07-10 deferral false-page fix
       ])
@@ -362,7 +363,7 @@ resource "aws_cloudwatch_log_group" "tv_market_hours_liveness_gate" {
 
 # ---------------------------------------------------------------------------
 # Watch the watchman (round-13, 2026-07-06): the gate Lambda's 09:20 IST open
-# invocation is the ONLY path that arms the 11 gated alarms (the ALARM_NAMES
+# invocation is the ONLY path that arms the 12 gated alarms (the ALARM_NAMES
 # env list above — incl. the leg-3 order-update reconnect-storm pager + the
 # 2026-07-06 silent-feed set + the 2026-07-10 ws-pool pair). A gate failure
 # previously re-opened
@@ -376,7 +377,7 @@ resource "aws_cloudwatch_log_group" "tv_market_hours_liveness_gate" {
 # ---------------------------------------------------------------------------
 resource "aws_cloudwatch_metric_alarm" "market_hours_gate_lambda_errors" {
   alarm_name          = "tv-${var.environment}-market-hours-gate-errors"
-  alarm_description   = "The market-hours gate Lambda FAILED - its 09:20 IST open invocation is the ONLY path that arms the 11 gated alarms (market-hours-liveness-missing, realtime-guarantee-critical, aggregator-no-seals, order-update-reconnect-storm, app-log-ingestion-silent, tick-gap-instruments-silent, realtime-guarantee-degraded, boundary-catchup-storm-dhan, dhan-exchange-lag-p99-high, ws-pool-all-dead, ws-failed-connections - the Lambda's ALARM_NAMES env is the authoritative list). A failed open leaves all 11 disarmed for the session (the 2026-07-06 leg-3 zero-page class); a failed close leaves them armed overnight (false-page risk). NO green OK page ever follows this alarm (ok_actions suppressed - the Lambda runs 2x/day, so an auto-OK is aged-out, never a fix): manually re-arm/verify the 11 gated alarms (enable_alarm_actions / disable_alarm_actions) REGARDLESS, after reading the gate Lambda's log group."
+  alarm_description   = "The market-hours gate Lambda FAILED - its 09:20 IST open invocation is the ONLY path that arms the 12 gated alarms (market-hours-liveness-missing, realtime-guarantee-critical, aggregator-no-seals, order-update-reconnect-storm, app-log-ingestion-silent, tick-gap-instruments-silent, realtime-guarantee-degraded, boundary-catchup-storm-dhan, dhan-exchange-lag-p99-high, groww-exchange-lag-p99-high, ws-pool-all-dead, ws-failed-connections - the Lambda's ALARM_NAMES env is the authoritative list). A failed open leaves all 12 disarmed for the session (the 2026-07-06 leg-3 zero-page class); a failed close leaves them armed overnight (false-page risk). NO green OK page ever follows this alarm (ok_actions suppressed - the Lambda runs 2x/day, so an auto-OK is aged-out, never a fix): manually re-arm/verify the 12 gated alarms (enable_alarm_actions / disable_alarm_actions) REGARDLESS, after reading the gate Lambda's log group."
   comparison_operator = "GreaterThanOrEqualToThreshold"
   evaluation_periods  = 1
   metric_name         = "Errors"
@@ -393,7 +394,7 @@ resource "aws_cloudwatch_metric_alarm" "market_hours_gate_lambda_errors" {
   # close), so the post-ALARM auto-OK is always AGED-OUT, never a fix — a
   # recurring Rule-11 false-recovery green per failure episode. Worse, for
   # THIS watchman the green also invited skipping the manual re-arm of the
-  # 11 gated alarms (incl. the leg-3 reconnect-storm pager) — the
+  # 12 gated alarms (incl. the leg-3 reconnect-storm pager) — the
   # description above says: re-arm manually REGARDLESS.
   ok_actions = []
 }
