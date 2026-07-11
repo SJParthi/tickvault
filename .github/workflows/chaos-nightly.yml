@@ -1,7 +1,7 @@
 # =============================================================================
 # tickvault — Chaos Test Suite (Weekly)
 # =============================================================================
-# Runs the 16 `#[ignore]`d chaos tests that exercise:
+# Runs the 11 `#[ignore]`d chaos tests (across 19 chaos_* test files) that exercise:
 #
 # 1. QuestDB outage / pause / sigkill / disk-full
 # 2. WS frame WAL replay / spill saturation / disk IO failure
@@ -57,8 +57,16 @@ jobs:
       CARGO_TERM_COLOR: always
       # Point the test env vars at the Docker compose stack's published ports.
       TV_QUESTDB_HTTP_URL: http://127.0.0.1:9000
-      TV_PROMETHEUS_URL: http://127.0.0.1:9090
       TV_METRICS_PORT: '9091'
+      # CI-only throwaway QuestDB PG credentials for the ephemeral runner
+      # container. deploy/docker/docker-compose.yml fail-closes with
+      # `${TV_QUESTDB_PG_USER:?...}` when these are unset (the root cause of
+      # every scheduled run since 2026-04-25 failing at `docker compose up`).
+      # Prod credentials come from AWS SSM via bootstrap.sh — these values
+      # never leave the runner and guard nothing (chaos tests use ILP/HTTP,
+      # not the PG wire).
+      TV_QUESTDB_PG_USER: chaos_ci
+      TV_QUESTDB_PG_PASSWORD: chaos-ci-local-dummy
       # Some chaos tests gate on this — off by default, on via workflow_dispatch.
       TV_SLOW_CHAOS: ${{ github.event.inputs.include_slow == 'true' && '1' || '' }}
 
@@ -85,26 +93,37 @@ jobs:
         # The chaos tests shell out to `docker compose pause/unpause/stop/start`
         # so the stack must be running at the start of each test. Individual
         # tests restore state in their teardown.
+        # Captured to /tmp/compose-up.log so the issue-filing step can quote
+        # a pre-test failure (all 11 runs since 2026-04-25 died HERE with the
+        # compose interpolation error, and the bot issues said "(chaos log
+        # not captured)" because /tmp/chaos.log was never created).
         run: |
-          docker compose -f deploy/docker/docker-compose.yml up -d
-          echo "Waiting for QuestDB to be ready..."
-          for i in {1..30}; do
-            if curl -fsS http://127.0.0.1:9000/status >/dev/null 2>&1; then
-              echo "QuestDB ready on attempt $i"
-              break
-            fi
-            sleep 2
-          done
-          curl -fsS http://127.0.0.1:9000/status || {
-            echo "QuestDB failed to come up after 60s"
-            docker compose -f deploy/docker/docker-compose.yml logs --tail=50
-            exit 1
-          }
+          set -euo pipefail
+          {
+            docker compose -f deploy/docker/docker-compose.yml up -d
+            echo "Waiting for QuestDB to be ready..."
+            for i in {1..30}; do
+              if curl -fsS http://127.0.0.1:9000/status >/dev/null 2>&1; then
+                echo "QuestDB ready on attempt $i"
+                break
+              fi
+              sleep 2
+            done
+            curl -fsS http://127.0.0.1:9000/status || {
+              echo "QuestDB failed to come up after 60s"
+              docker compose -f deploy/docker/docker-compose.yml logs --tail=50
+              exit 1
+            }
+          } 2>&1 | tee /tmp/compose-up.log
 
       - name: Build chaos tests (no-run)
         # Pre-build so the compile errors surface before any stack state is
-        # mutated by a test.
-        run: cargo test --workspace --no-run --tests
+        # mutated by a test. Scoped to the chaos_* test binaries only — the
+        # full workspace test build is normal CI's job and was the widest
+        # pre-test failure surface in this lane.
+        run: |
+          set -euo pipefail
+          cargo test --workspace --no-run --test 'chaos_*' 2>&1 | tee /tmp/build.log
 
       - name: Run chaos tests (--ignored)
         id: chaos
@@ -134,6 +153,8 @@ jobs:
           name: chaos-logs
           path: |
             /tmp/chaos.log
+            /tmp/build.log
+            /tmp/compose-up.log
             /tmp/docker-logs.txt
           retention-days: 14
 
@@ -143,19 +164,37 @@ jobs:
         with:
           script: |
             const fs = require('fs');
+            // Fallback ladder: the run can die BEFORE the chaos test step
+            // (compose up, cargo build), in which case /tmp/chaos.log never
+            // exists. Walk the step logs newest-stage-first so the issue
+            // always quotes the log of the stage that actually failed —
+            // never the "(chaos log not captured)" dead end again.
+            const sources = [
+              { path: '/tmp/chaos.log', note: 'chaos.log (chaos test step output)' },
+              { path: '/tmp/build.log', note: 'build.log (failure occurred before the chaos test step, during cargo build)' },
+              { path: '/tmp/compose-up.log', note: 'compose-up.log (failure occurred before the chaos test step, during docker compose up)' },
+              { path: '/tmp/docker-logs.txt', note: 'docker-logs.txt (container logs from teardown)' },
+            ];
             let log = '';
-            try {
-              log = fs.readFileSync('/tmp/chaos.log', 'utf8');
-              // Keep the issue body small — last 100 lines is plenty.
-              log = log.split('\n').slice(-100).join('\n');
-            } catch (e) {
-              log = '(chaos log not captured)';
+            let sourceNote = '(no logs captured — failure before any logged step)';
+            for (const s of sources) {
+              try {
+                log = fs.readFileSync(s.path, 'utf8');
+                sourceNote = `log source: ${s.note}`;
+                break;
+              } catch (e) {
+                // ENOENT — this stage never ran; try the next rung.
+              }
             }
+            // Keep the issue body small — last 100 lines is plenty.
+            log = log.split('\n').slice(-100).join('\n');
             const title = `chaos-regression: nightly ${new Date().toISOString().slice(0,10)}`;
             const body = [
               '## Chaos test suite failed',
               '',
               `Workflow: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+              '',
+              sourceNote,
               '',
               '### Last 100 lines',
               '```',
