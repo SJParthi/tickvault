@@ -36,24 +36,31 @@ stamped into `tick.day_close`. Downstream then works unchanged: aggregator_cell
 captures `prev_day_close` from `tick.day_close` (last-non-zero-wins), route_seal
 stamps `close_pct_from_prev_day`.
 
-**Cache read structure decision:** NO new structure, NO lock, NO papaya mirror.
-The code-6 insert arm and the Tick arm are two arms of the SAME `match` inside
-the SAME single-task loop, and `index_prev_close_cache` is a loop-local
-`HashMap` — the read is one O(1) `HashMap::get` with zero allocation and zero
-contention (the cheapest correct design consistent with `hot-path.md`). The
-two cheap gates (segment compare + finite-positive check) run BEFORE the hash,
-so non-IDX_I ticks pay 1 u8 compare. The security_id-only key is I-P1-11-safe
-because both the insert arm and the read gate are segment-gated to IDX_I.
+**Cache read structure decision (revised, review round 1 HIGH-1):** NO lock,
+NO papaya mirror — but ONE additional loop-local `HashMap<u64, f32>`
+(`index_prev_close_live`), populated ONLY in the code-6 arm during THIS
+process session. The backstop reads the LIVE map exclusively; the file-loaded
+`index_prev_close_cache` keeps its pre-existing write/persist role but is
+never a backstop source (its un-date-scoped values can be one trading day
+stale on a day-D boot). The code-6 insert arm and the Tick arm are two arms
+of the SAME `match` inside the SAME single-task loop — the read is one O(1)
+`HashMap::get` with zero allocation and zero contention (consistent with
+`hot-path.md`). The two cheap gates (segment compare + finite-positive check)
+run BEFORE the hash, so non-IDX_I ticks pay 1 u8 compare. The
+security_id-only key is I-P1-11-safe because both the insert arm and the
+read gate are segment-gated to IDX_I.
 
 ## Edge Cases
 
 - **Quote-provided value wins:** `day_close > 0.0 && is_finite` → backstop
   returns `None`; if Dhan ever populates Quote close for IDX_I, that value is
   never overridden (fill-only semantics).
-- **Cache miss** (code-6 not yet received this session, no file-cache row) →
-  `None`; the tick flows unchanged with `day_close = 0.0` (pre-fix behaviour).
-- **Corrupted file cache** (NaN/Inf/≤0 loaded from a damaged
-  `index-prev-close` JSON) → filtered, never stamped.
+- **Live-map miss** (code-6 not yet received THIS session) → `None`; the
+  tick flows unchanged with `day_close = 0.0` (pre-fix behaviour). A
+  file-cache-only row is deliberately NOT consulted (review HIGH-1 —
+  possibly one trading day stale).
+- **Junk live value** (NaN/Inf/≤0 from a mangled code-6 frame) → filtered,
+  never stamped.
 - **Unusable NON-zero packet value** (NaN / negative day_close from a mangled
   frame) → treated as a gap and backstopped — a strict superset of the `== 0.0`
   case, strictly safer.
@@ -72,17 +79,27 @@ because both the insert arm and the read gate are segment-gated to IDX_I.
 
 ## Failure Modes
 
-- **Code-6 packet never arrives AND no file cache** (Dhan-side omission on a
-  fresh boot): backstop is inert; index `close_pct_from_prev_day` reads 0 —
-  identical to pre-fix behaviour, never worse. The existing
-  `tv_prev_close_updates` counter + per-segment PrevClose summary log remain
-  the diagnostic surface.
-- **Stale file cache across days:** the file cache is rewritten on every code-6
-  arrival and the code-6 burst re-fires at each session's subscription; a
-  mid-day restart reads today's values back. A stale value would only survive
-  if TODAY's code-6 burst never arrived (see above — and then a slightly stale
-  prev-close is stamped, matching the pre-existing documented file-cache
-  design; no new failure mode is introduced by this PR).
+- **Code-6 packet never arrives THIS session** (Dhan-side omission — the
+  flaky-Dhan regime this fix targets): backstop is inert; index
+  `close_pct_from_prev_day` reads 0 — identical to pre-fix behaviour, never
+  worse. The existing `tv_prev_close_updates` counter + per-segment PrevClose
+  summary log remain the diagnostic surface.
+- **Stale file cache across days (review round 1, HIGH-1 — REAL failure mode,
+  CLOSED by live-session-only gating):** the earlier draft of this section
+  falsely claimed "no new failure mode is introduced". The file cache
+  (`data/instrument-cache/index-prev-close.json`) is NOT date-scoped: values
+  written during day D-1's session are close(D-2) — one trading day stale on
+  a day-D boot. Had the backstop consumed the file-loaded map, a day-D boot
+  where the code-6 packet arrives late (or never) would stamp a WRONG
+  NON-ZERO prev-close into the candle close_pct path — worse than the honest
+  0 it replaces (audit Rule 11). The fix: the backstop consumes ONLY the
+  loop-local `index_prev_close_live` map, populated exclusively in the
+  code-6 arm during THIS process session. The file cache keeps its
+  pre-existing write/persist role but is never read by the backstop.
+  **Honest residual:** between boot and the session's first code-6 packet,
+  IDX close_pct reads 0 — identical to pre-PR behaviour. Dhan re-delivers
+  code-6 on (re)subscription, so a mid-session restart self-heals when the
+  WS resubscribes.
 - **Hot-path regression risk:** bounded to 1 u8 compare per non-IDX tick; the
   pure fn allocates nothing (comparisons + `HashMap::get`). No `.clone()`, no
   `format!`, no `Vec::new()`, no lock.
@@ -98,6 +115,9 @@ Unit tests (pure fn, `crates/core/src/pipeline/tick_processor.rs::tests`):
 - `test_idx_prev_close_backstop_non_idx_segment_returns_none` (I-P1-11)
 - `test_idx_prev_close_backstop_rejects_junk_cached_values`
 - `test_idx_prev_close_backstop_fills_non_finite_packet_value`
+- `test_idx_prev_close_backstop_file_loaded_only_value_not_stamped` (review HIGH-1)
+- `test_idx_prev_close_backstop_live_code6_value_stamps` (review HIGH-1)
+- `test_idx_prev_close_backstop_call_site_uses_live_map_ratchet` (review HIGH-1 source-scan ratchet)
 
 Suites: `cargo test -p tickvault-core --lib` (block-scoped per
 `testing-scope.md`), tick_processor integration tests
@@ -147,8 +167,9 @@ file cache and code-6 arm are byte-identical to main.
 | 2 | IDX_I Quote tick, day_close=23200 (Dhan populated) | untouched — packet value wins |
 | 3 | IDX_I tick, cache miss | untouched (pre-fix behaviour) |
 | 4 | NSE_FNO tick with colliding SID 13 | untouched (segment gate, I-P1-11) |
-| 5 | Corrupted file cache (NaN/0/-1) | never stamped |
-| 6 | Mid-day restart | file cache reloads at boot → backstop works before the next code-6 burst |
+| 5 | Junk live value (NaN/0/-1) | never stamped |
+| 6 | Mid-day restart | live map starts empty (honest 0 during WAL boot-replay); Dhan re-delivers code-6 on WS resubscription → backstop resumes |
+| 7 | Day-D boot with only yesterday's file-cache row (close(D-2)) | NOT stamped — live-session-only gating (review HIGH-1) |
 
 ## Per-Item Guarantee Matrix
 
