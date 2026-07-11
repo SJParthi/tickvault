@@ -322,7 +322,7 @@ fn test_deployed_emf_source_labels_match_a_real_series_label() {
 }
 
 #[test]
-fn test_emf_metric_selectors_name_count_is_twenty_six() {
+fn test_emf_metric_selectors_name_count_is_twenty_seven() {
     // Pin the MAIN (host-only) EMF publish list: 19 alarm-backing signals
     // + 2 memory-measurement gauges added 2026-07-02 for the 2K-universe RAM
     // measurement (tv_process_rss_bytes — crates/storage/src/resource_monitor.rs;
@@ -332,7 +332,12 @@ fn test_emf_metric_selectors_name_count_is_twenty_six() {
     // tv_dhan_exchange_lag_p99_seconds (feed_lag_monitor gauge, alarmed in
     // silent-feed-alarms.tf) + tv_dhan_lag_samples_excluded_total (the
     // WAL-replay exclusion visibility counter — Rule 11: exclusions must be
-    // visible, never silent). tv_boundary_catchup_total is NOT in this list —
+    // visible, never silent)
+    // + 1 Groww lag signal added 2026-07-11 (scoreboard PR-C):
+    // tv_groww_exchange_lag_p99_seconds (the Groww feed_lag_monitor gauge —
+    // its OWN name, never a feed label on the Dhan gauge; alarmed in
+    // silent-feed-alarms.tf S4). The Groww exclusion/clamp counters stay
+    // /metrics-only (₹0). tv_boundary_catchup_total is NOT in this list —
     // it publishes ONLY via the SECOND [host,feed] declaration (host-only
     // folding would mask a Dhan storm under the Groww baseline).
     // Cost note: each custom metric series is ~$0.30/mo.
@@ -349,10 +354,11 @@ fn test_emf_metric_selectors_name_count_is_twenty_six() {
     let names = emf_declared_names(&user_data, "metric_selectors");
     assert_eq!(
         names.len(),
-        26,
-        "Z+ L2 VERIFY ratchet: expected exactly 26 names in the MAIN EMF \
+        27,
+        "Z+ L2 VERIFY ratchet: expected exactly 27 names in the MAIN EMF \
          metric_selectors list (24 post-#1437 groww feed-down alerting + 2 \
-         silent-feed lag names 2026-07-06); found {}: {names:?}",
+         silent-feed lag names 2026-07-06 + 1 groww lag gauge 2026-07-11 \
+         scoreboard PR-C); found {}: {names:?}",
         names.len()
     );
     for required in [
@@ -360,6 +366,7 @@ fn test_emf_metric_selectors_name_count_is_twenty_six() {
         "tv_subsystem_memory_estimated_bytes",
         "tv_dhan_exchange_lag_p99_seconds",
         "tv_dhan_lag_samples_excluded_total",
+        "tv_groww_exchange_lag_p99_seconds",
     ] {
         assert!(
             names.iter().any(|n| n == required),
@@ -919,7 +926,9 @@ fn test_realtime_guarantee_degraded_alarm_threshold_matches_slo_warn() {
 
 #[test]
 fn test_silent_feed_alarms_are_window_gated() {
-    // All 3 silent-feed alarms follow the house market-hours-gate pattern
+    // All 4 silent-feed alarms (3 from the 2026-07-06 hardening + the
+    // 2026-07-11 scoreboard PR-C groww lag mirror) follow the house
+    // market-hours-gate pattern
     // (Rule 3): actions_enabled=false + appended to the window-gate Lambda
     // ALARM_NAMES (09:20-15:35 IST Mon-Fri). The SLO publisher runs 24/7
     // with off-hours dimension dips; the lag gauge + tick-gap gauge go stale
@@ -930,6 +939,7 @@ fn test_silent_feed_alarms_are_window_gated() {
         "realtime_guarantee_degraded",
         "boundary_catchup_storm_dhan",
         "dhan_exchange_lag_p99_high",
+        "groww_exchange_lag_p99_high",
     ] {
         let block = alarm_resource_block(&tf, name);
         assert!(
@@ -942,6 +952,50 @@ fn test_silent_feed_alarms_are_window_gated() {
              (market-hours-liveness-alarm.tf)"
         );
     }
+}
+
+#[test]
+fn test_groww_exchange_lag_alarm_shape_is_pinned() {
+    // Scoreboard PR-C (2026-07-11): the Groww lag alarm mirrors the Dhan S3
+    // discipline at Groww's finer resolution — threshold 5 (seconds; no 1s
+    // floor: Groww's exchange clock is millisecond-precise, receipt =
+    // sidecar capture one hop downstream of the socket), strict 10-of-10
+    // at 60s/Maximum (safe: the metric is itself a trailing-60s p99, so a
+    // one-burst transient decays out within ~60s), notBreaching (nightly
+    // box stop + the >=50-sample publish gate make missing data NORMAL —
+    // feed-dead is owned by tv_groww_ws_active + the feed-stall pagers).
+    let tf = read("deploy/aws/terraform/silent-feed-alarms.tf");
+    let block = alarm_resource_block(&tf, "groww_exchange_lag_p99_high");
+    assert!(
+        block.contains("metric_name         = \"tv_groww_exchange_lag_p99_seconds\""),
+        "the groww lag alarm must watch tv_groww_exchange_lag_p99_seconds \
+         (its OWN gauge name — never the Dhan gauge, never a feed label):\n{block}"
+    );
+    assert!(
+        block_has_attr(&block, "threshold", "5"),
+        "groww_exchange_lag_p99_high threshold must be 5 (seconds — ~10-50x \
+         above the healthy sub-second band at Groww's ms resolution):\n{block}"
+    );
+    assert!(
+        block_has_attr(&block, "comparison_operator", "\"GreaterThanThreshold\""),
+        "groww_exchange_lag_p99_high must use GreaterThanThreshold"
+    );
+    assert!(
+        block_has_attr(&block, "evaluation_periods", "10")
+            && block_has_attr(&block, "datapoints_to_alarm", "10"),
+        "groww_exchange_lag_p99_high must latch strict 10-of-10 (the metric \
+         is a trailing-60s p99 — the S3 rationale)"
+    );
+    assert!(
+        block_has_attr(&block, "period", "60")
+            && block_has_attr(&block, "statistic", "\"Maximum\""),
+        "groww_exchange_lag_p99_high must evaluate period=60/Maximum"
+    );
+    assert!(
+        block_has_attr(&block, "treat_missing_data", "\"notBreaching\""),
+        "groww_exchange_lag_p99_high must be notBreaching (nightly stop + \
+         the publish gates make missing data normal)"
+    );
 }
 
 /// Strip `#`-comments from an HCL (terraform) body, STRING-AWARE: a `#`
@@ -1202,7 +1256,7 @@ fn test_boundary_catchup_alarm_uses_per_feed_dimensions() {
 }
 
 #[test]
-fn test_app_alarms_count_is_twenty_two() {
+fn test_app_alarms_count_is_twenty_three() {
     // Pin the count so future PRs that delete an alarm without updating
     // the rule files / PR body fail this guard. Cost note (aws-budget.md)
     // depends on this number — keeping the budget honest means keeping
@@ -1244,10 +1298,16 @@ fn test_app_alarms_count_is_twenty_two() {
     // (critical + degraded alarms watch the same metric). Cost: +4 custom
     // metric series (~$1.20/mo) + 3 alarms (~$0.30/mo) — dated note in
     // aws-budget.md.
+    // 23 (was 22) since 2026-07-11 (scoreboard PR-C): added
+    // `tv_groww_exchange_lag_p99_seconds` (alarm
+    // tv-<env>-groww-exchange-lag-p99-high — the Groww mirror of the Dhan
+    // lag signal at Groww's millisecond resolution, threshold 5s x10min,
+    // window-gated). Cost: +1 custom metric series (~$0.30/mo) + 1 alarm
+    // (~$0.10/mo) — dated note in aws-budget.md.
     let count = alarm_metric_names().len();
     assert_eq!(
-        count, 22,
-        "Z+ L2 VERIFY ratchet: expected exactly 22 app-level CloudWatch alarm \
+        count, 23,
+        "Z+ L2 VERIFY ratchet: expected exactly 23 app-level CloudWatch alarm \
          metric_name entries across app-alarms.tf + silent-feed-alarms.tf \
          (one per critical app signal; tv_realtime_guarantee_score counts twice — \
          critical + degraded). Found {count}. If you intentionally added \

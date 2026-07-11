@@ -279,6 +279,18 @@ pub enum ErrorCode {
     /// TCP flush OFF the tick-consumer thread. Severity::High (a flapping
     /// flush worker means QuestDB ILP or the host is degrading).
     TickFlush01WorkerRespawn,
+    /// WAL-SUSPEND-01: a QuestDB table's WAL apply is SUSPENDED — the 60s
+    /// `wal_tables()` probe (W2 PR#6, 2026-07-10, audit follow-up row 10)
+    /// got a SUCCESSFUL response showing `suspended=true` for the table.
+    /// ILP ingestion keeps ACKing rows into the table's WAL, but they
+    /// silently stop becoming visible/durable-applied — the
+    /// silent-data-visibility-loss class (post disk-full episode or WAL
+    /// apply error). Edge-latched: ONE emit per (table, suspension
+    /// episode); a merely-DOWN QuestDB never fires this (down ≠ suspended
+    /// — BOOT-01/02 own that page). Severity::High; NEVER auto-triaged —
+    /// the recovery action `ALTER TABLE <t> RESUME WAL` is an operator
+    /// decision (auto-resume can replay into a still-broken disk).
+    WalSuspend01TableSuspended,
     /// PROC-01: an OOM kill was detected — the cgroup-v2 `memory.events`
     /// `oom_kill` counter rose above the boot-time baseline. Some process in
     /// this cgroup (tickvault itself or a sidecar) was killed by the kernel
@@ -881,6 +893,18 @@ pub enum ErrorCode {
     /// operator compares the two masters' FUT rows and records a dated note.
     /// Severity::High.
     Futidx02CrossFeedExpiryMismatch,
+    /// SCOREBOARD-01 (dual-feed scoreboard PR-A, 2026-07-10) — the daily
+    /// 15:45 IST Dhan-vs-Groww scoreboard aggregation was DEGRADED: a
+    /// QuestDB `/exec` read failed (sentinels recorded, never fabricated
+    /// zeros), the `feed_scoreboard_daily` / `feed_episode_audit` ILP write
+    /// was rejected, the boot-time process-death reconciliation could not
+    /// read/write, or the same-day `ws_event_audit` drop counter shows the
+    /// episode source under-counted. Best-effort forensic aggregate
+    /// (AUDIT-WS-01 / GROWW-MASTER-01 class) — the live feeds, tick capture
+    /// and trading are NEVER affected; DEDUP-idempotent re-runs
+    /// (`TICKVAULT_SCOREBOARD_NOW`) backfill the day. Severity::Medium,
+    /// auto-triage-safe.
+    Scoreboard01AggregationDegraded,
 }
 
 impl ErrorCode {
@@ -945,6 +969,7 @@ impl ErrorCode {
             Self::WsSpill02FrameDropped => "WS-SPILL-02",
             Self::WsReinject01Aborted => "WS-REINJECT-01",
             Self::TickFlush01WorkerRespawn => "TICK-FLUSH-01",
+            Self::WalSuspend01TableSuspended => "WAL-SUSPEND-01",
             Self::Proc01OomKillDetected => "PROC-01",
             Self::AuthGap03TokenForceRenewedOnWake => "AUTH-GAP-03",
             Self::AuthGap04TotpRotatedExternally => "AUTH-GAP-04",
@@ -1061,6 +1086,8 @@ impl ErrorCode {
             Self::GrowwNative04WriterFailed => "GROWW-NATIVE-04",
             Self::Futidx01SelectionDegraded => "FUTIDX-01",
             Self::Futidx02CrossFeedExpiryMismatch => "FUTIDX-02",
+            // Dual-feed scoreboard PR-A (2026-07-10)
+            Self::Scoreboard01AggregationDegraded => "SCOREBOARD-01",
         }
     }
 
@@ -1167,6 +1194,12 @@ impl ErrorCode {
             // TICK-FLUSH-01 — off-thread tick flush worker respawned (B6);
             // flapping = QuestDB ILP / host degrading
             | Self::TickFlush01WorkerRespawn
+            // WAL-SUSPEND-01 — a table's WAL apply is suspended (W2 PR#6):
+            // silent data-visibility loss until the operator RESUMEs WAL.
+            // High, not Critical: the rows are durably in the table's WAL
+            // (apply resumes them) — staleness + disk growth, not
+            // permanent loss; but operator action IS required.
+            | Self::WalSuspend01TableSuspended
             // DHAN-LANE-01/02/03 — runtime Dhan-lane cold-start failures (D2b
             // 2026-06-26): a failed cold-start returns the FSM to Off + pages
             // the operator, never a half-running lane. High (operator must
@@ -1278,7 +1311,11 @@ impl ErrorCode {
             | Self::GrowwNative01ConnectFailed
             | Self::GrowwNative02AuthFailed
             | Self::GrowwNative03DecodeFailed
-            | Self::GrowwNative04WriterFailed => Severity::Medium,
+            | Self::GrowwNative04WriterFailed
+            // SCOREBOARD-01 (2026-07-10): best-effort daily forensic
+            // aggregate degraded; feeds/capture/trading unaffected, the
+            // DEDUP-idempotent re-run backfills. Medium.
+            | Self::Scoreboard01AggregationDegraded => Severity::Medium,
             // Low: trading-day / Dhan other
             // PR #6a (2026-05-19): I-P1-01 (DailyScheduler) + I-P1-02 (DeltaFieldCoverage) retired
             Self::InstrumentP2TradingDayGuard
@@ -1345,6 +1382,10 @@ impl ErrorCode {
             // B6 (2026-07-03): off-thread tick ILP flush worker
             Self::TickFlush01WorkerRespawn => {
                 ".claude/rules/project/tick-flush-worker-error-codes.md"
+            }
+            // W2 PR#6 (2026-07-10): per-table WAL-suspension probe
+            Self::WalSuspend01TableSuspended => {
+                ".claude/rules/project/wal-suspension-error-codes.md"
             }
             Self::WsGap04PostCloseSleep
             | Self::WsGap05PoolRespawn
@@ -1505,6 +1546,10 @@ impl ErrorCode {
             Self::Futidx01SelectionDegraded | Self::Futidx02CrossFeedExpiryMismatch => {
                 ".claude/rules/project/futidx-4-error-codes.md"
             }
+            // Dual-feed scoreboard PR-A (2026-07-10)
+            Self::Scoreboard01AggregationDegraded => {
+                ".claude/rules/project/dual-feed-scoreboard-error-codes.md"
+            }
         }
     }
 
@@ -1521,9 +1566,16 @@ impl ErrorCode {
     ///   operator judges WHICH vendor master is stale (design contract
     ///   `is_auto_triage_safe() == false`; previously drifted to the
     ///   blanket severity derivation and papered over in runbook prose).
+    /// - `WAL-SUSPEND-01` (W2 PR#6, 2026-07-10): the recovery action
+    ///   `ALTER TABLE <t> RESUME WAL` is an OPERATOR decision — resuming
+    ///   into a still-broken disk replays the failure; auto-triage must
+    ///   never execute it.
     #[must_use]
     pub const fn is_auto_triage_safe(self) -> bool {
-        if matches!(self, Self::Futidx02CrossFeedExpiryMismatch) {
+        if matches!(
+            self,
+            Self::Futidx02CrossFeedExpiryMismatch | Self::WalSuspend01TableSuspended
+        ) {
             return false;
         }
         !matches!(self.severity(), Severity::Critical)
@@ -1605,6 +1657,7 @@ impl ErrorCode {
             Self::WsSpill02FrameDropped,
             Self::WsReinject01Aborted,
             Self::TickFlush01WorkerRespawn,
+            Self::WalSuspend01TableSuspended,
             Self::Proc01OomKillDetected,
             Self::AuthGap03TokenForceRenewedOnWake,
             Self::AuthGap04TotpRotatedExternally,
@@ -1697,6 +1750,8 @@ impl ErrorCode {
             Self::GrowwNative04WriterFailed,
             Self::Futidx01SelectionDegraded,
             Self::Futidx02CrossFeedExpiryMismatch,
+            // Dual-feed scoreboard PR-A (2026-07-10)
+            Self::Scoreboard01AggregationDegraded,
         ]
     }
 }
@@ -2029,7 +2084,15 @@ mod tests {
         // FEED-REJECT-01 — bounded, secret-redacted sidecar reject-cause
         // signature surfaced at the once-per-child alert edge (the all-day
         // 09:22/14:17 IST reject loop was invisible in the coded stream).
-        assert_eq!(ErrorCode::all().len(), 136);
+        // 2026-07-10 (W2 PR#6, audit follow-up row 10): bumped 136 -> 137
+        // for WAL-SUSPEND-01 — per-table QuestDB WAL-apply suspension probe
+        // (a suspended table keeps ACKing ILP rows while they silently stop
+        // becoming visible; previously zero signal).
+        // 2026-07-10 (dual-feed scoreboard PR-A): bumped 137 -> 138 for
+        // SCOREBOARD-01 — the daily 15:45 IST Dhan-vs-Groww scoreboard
+        // aggregation degraded (best-effort forensic aggregate; sentinels,
+        // never fabricated zeros; DEDUP-idempotent re-run backfills).
+        assert_eq!(ErrorCode::all().len(), 138);
     }
 
     #[test]
@@ -2192,6 +2255,8 @@ mod tests {
                 || s.starts_with("REST-CANARY-")
                 // B6 (2026-07-03): off-thread tick ILP flush worker.
                 || s.starts_with("TICK-FLUSH-")
+                // W2 PR#6 (2026-07-10): per-table WAL-suspension probe.
+                || s.starts_with("WAL-SUSPEND-")
                 // PR #450 commit 8b (2026-05-03): prev_oi cache state.
                 || s.starts_with("PREVOI-")
                 // Wave 6 Sub-PR #1: multi-TF aggregator + boundary timer.
@@ -2242,7 +2307,9 @@ mod tests {
                 || s.starts_with("HTTP-CLIENT-")
                 // §36 (2026-07-08; §36.7 all-months 2026-07-10): FUTIDX
                 // index futures.
-                || s.starts_with("FUTIDX-");
+                || s.starts_with("FUTIDX-")
+                // Dual-feed scoreboard PR-A (2026-07-10).
+                || s.starts_with("SCOREBOARD-");
             assert!(has_known_prefix, "unexpected code prefix: {s}");
         }
     }

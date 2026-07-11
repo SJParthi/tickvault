@@ -123,6 +123,28 @@ restores the SOCKET; it does not claim the provider will never re-reject.
 `crates/app/src/groww_sidecar_supervisor.rs` (`should_restart_on_stall`, the
 `supervise_child` stall `select!` arm, the storm bound).
 
+**2026-07-10 update (dual-feed scoreboard PR-B):** every stall-watchdog
+kill+relaunch (this arm AND the §1b never-streamed arm, storm and non-storm
+alike) ALSO stamps ONE `WsEventKind::StallRestarted` (`stall_restarted`)
+`ws_event_audit` forensic row — best-effort try_send through the same
+consumer the bridge lifecycle rows use (failure = AUDIT-WS-01, never a
+supervision stall). The row's `source` carries a FIXED machine cause slug
+(`stall_silent_socket` / `stall_never_streamed` / `stall_auth_stale` /
+`stall_entitlement` — the drains latch the child's last CONFIRMED
+auth/entitlement reject class; generic `Error` lines never latch; a
+streaming recovery clears the latch). Latch split (PR-B fix round 1,
+2026-07-10 review MEDIUM): the sidecar's SILENT-FEED watchdog lines
+(`SILENT FEED …` / `STILL SILENT …`) are gated by the SAME market-hours
+predicate the alert path uses — the benign ~08:35 pre-open print on every
+normal boot never latches; in-market they latch a WEAK silent-feed value
+that does NOT outrank either kill arm's slug (only a HARD authorization /
+permission / entitlement line latches `stall_entitlement` and outranks) —
+without the split the sidecar's 30s watchdog always fired before the 300s
+never-streamed kill and `stall_never_streamed` was effectively
+unreachable. `down_secs` carries the silent
+window. The 15:45 IST scoreboard counts these as stall episodes with blame
+(`dual-feed-scoreboard-error-codes.md` §2). Counters + pagers UNCHANGED.
+
 ### §1b. 2026-07-09 Update — NEVER-STREAMED restart arm (`reason = "never_streamed"`)
 
 **The incident this closes:** the Groww feed paged `[HIGH] Groww live feed

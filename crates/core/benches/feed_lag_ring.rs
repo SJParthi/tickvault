@@ -1,10 +1,13 @@
 //! Silent-feed hardening Item 4 — Criterion benchmarks for the Dhan
 //! exchange-lag monitor.
 //!
-//! Two targets, two honesty tiers:
+//! Three targets, two honesty tiers:
 //! - `feed_lag/record_dhan_tick` — the HOT-PATH ring write (O(1),
 //!   zero-alloc). Budget: `feed_lag_record_dhan_tick` in
 //!   `quality/benchmark-budgets.toml` (≤ 100 ns).
+//! - `feed_lag/record_groww_tick` — the HOT-PATH Groww fold (scoreboard
+//!   PR-C: classify + ring write + day-histogram RMWs; O(1), zero-alloc).
+//!   Budget: `feed_lag_record_groww_tick` (≤ 100 ns).
 //! - `feed_lag/p99_window_full_ring` — the COLD-PATH publisher p99 over a
 //!   full 32,768-sample window via `select_nth_unstable`. This is
 //!   **O(N-window), NOT O(1)** — it runs on a 10 s supervised task off the
@@ -16,9 +19,13 @@ use std::hint::black_box;
 
 use criterion::{Criterion, criterion_group, criterion_main};
 
-use tickvault_core::pipeline::feed_lag_monitor::{compute_window_p99_ns, record_dhan_tick};
+use tickvault_core::pipeline::feed_lag_monitor::{
+    compute_window_p99_ns, record_dhan_tick, record_groww_tick,
+};
 
 const NANOS_PER_SEC: i64 = 1_000_000_000;
+const NANOS_PER_MS: i64 = 1_000_000;
+const IST_UTC_OFFSET_NANOS: i64 = 19_800 * NANOS_PER_SEC;
 
 /// Steady-state hot-path ring write on the process-global ring (the exact
 /// production entry point: two-condition replay check (boundary + dwell) +
@@ -70,5 +77,43 @@ fn bench_p99_window_full_ring(c: &mut Criterion) {
     });
 }
 
-criterion_group!(benches, bench_record_dhan_tick, bench_p99_window_full_ring);
+/// Steady-state Groww hot-path fold on the process-global Groww ring
+/// (scoreboard PR-C — the exact production entry point: capture/staleness
+/// classify + ring push + two day-histogram RMWs). HONEST COVERAGE: like
+/// the Dhan target, this measures the admitted-unclamped steady-state arm
+/// only — the metrics-emitting excluded/clamped arms are not in the loop.
+fn bench_record_groww_tick(c: &mut Criterion) {
+    let t0_utc_secs: i64 = 1_783_296_000 + 4 * 3600 + 1800;
+    let t0_ist_nanos: i64 = t0_utc_secs * NANOS_PER_SEC + IST_UTC_OFFSET_NANOS;
+
+    // Pre-init the global Groww ring outside the measured loop.
+    record_groww_tick(
+        Some(t0_ist_nanos + 150 * NANOS_PER_MS),
+        t0_ist_nanos + 150 * NANOS_PER_MS,
+        t0_ist_nanos,
+        false,
+    );
+
+    c.bench_function("feed_lag/record_groww_tick", |b| {
+        let mut i: i64 = 0;
+        b.iter(|| {
+            i = i.wrapping_add(NANOS_PER_MS);
+            let exchange = t0_ist_nanos + i;
+            let capture = exchange + 150 * NANOS_PER_MS;
+            record_groww_tick(
+                black_box(Some(capture)),
+                black_box(capture),
+                black_box(exchange),
+                black_box(false),
+            );
+        });
+    });
+}
+
+criterion_group!(
+    benches,
+    bench_record_dhan_tick,
+    bench_record_groww_tick,
+    bench_p99_window_full_ring
+);
 criterion_main!(benches);

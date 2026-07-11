@@ -39,6 +39,11 @@ governor = { workspace = true }
 # `secrecy` provides Drop+Zeroize transitively; the direct `zeroize` dep is
 # no longer needed in this crate.
 secrecy = { workspace = true }
+# W2#7 (2026-07-10): lock-free bearer-token hot-swap holder so the operator
+# can rotate the SSM token without an app restart. NOT a new dependency —
+# arc-swap is already a pinned workspace dep (1.9.1); the token_manager.rs
+# 24h-JWT swap uses the same crate/pattern.
+arc-swap = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

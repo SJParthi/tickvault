@@ -1319,6 +1319,137 @@ mod tests {
         );
     }
 
+    /// Dual-feed scoreboard PR-A (operator 2026-07-10) meta-guard: main.rs
+    /// MUST spawn the process-global scoreboard tasks (the boot-time
+    /// process-death reconciler + the 15:45 IST daily aggregation) on BOTH
+    /// boot paths and emit the `DualFeedDailyScorecard` Telegram from the
+    /// outer supervisor. Rule 13 (audit-findings 2026-04-17): a
+    /// variant/module defined + tested but never called IS a bug — this
+    /// source-scan fails the build if a future refactor removes the call
+    /// sites.
+    ///
+    /// Hostile review 2026-07-10 (CRITICAL): the FAST crash-recovery arm
+    /// `return run_shutdown_fast(...)`s and never reaches the slow-path
+    /// spawn — yet a mid-market process death restarts through EXACTLY that
+    /// arm, the one boot that must synthesize the process_death episode and
+    /// own the day's 15:45 scorecard. This ratchet therefore pins TWO call
+    /// sites by SOURCE ORDER (the per-boot-path source-order-scan pattern):
+    /// one BEFORE the fast arm's `return run_shutdown_fast(` and one AFTER
+    /// it (the slow/process-global prefix).
+    #[test]
+    fn test_feed_scoreboard_task_is_wired_into_main() {
+        let main_rs = std::fs::read_to_string("../app/src/main.rs")
+            .or_else(|_| std::fs::read_to_string("crates/app/src/main.rs"))
+            .expect("main.rs must be readable");
+        // Call sites (rustfmt wraps the arg list, so the needle is the call
+        // head), EXCLUDING the fn definition itself.
+        let spawn_sites: Vec<usize> = main_rs
+            .match_indices("spawn_feed_scoreboard_tasks(")
+            .map(|(i, _)| i)
+            .filter(|&i| !main_rs[..i].ends_with("fn "))
+            .collect();
+        // Every call site must thread the PROCESS-START anchor (round-2
+        // HIGH fix 2026-07-10): the reconciler's boot_ts must be the
+        // process-start instant, never a Utc::now() stamped when the
+        // spawned task starts — on the fast arm that ran AFTER the feeds
+        // already connected, so every connect row classified PRE-boot and
+        // the fast arm synthesized nothing.
+        for &i in &spawn_sites {
+            let window = &main_rs[i..main_rs.len().min(i + 240)];
+            assert!(
+                window.contains("process_start_ist_nanos"),
+                "every spawn_feed_scoreboard_tasks call site must thread the \
+                 process-start anchor (round-2 hostile review 2026-07-10): {window}"
+            );
+        }
+        // The anchor must be captured BEFORE any WebSocket pool can be
+        // created on ANY boot path (source-order scan): a connect row
+        // stamped before the anchor would classify as PRE-boot.
+        let anchor = main_rs
+            .find("let process_start_ist_nanos")
+            .expect("main.rs must capture the process-start scoreboard anchor");
+        let first_pool = main_rs
+            .find("create_websocket_pool(")
+            .expect("main.rs must reference create_websocket_pool");
+        assert!(
+            anchor < first_pool,
+            "the process-start scoreboard anchor MUST be captured before every \
+             create_websocket_pool site (fast arm included) — otherwise this \
+             boot's own connect rows classify as PRE-boot and the process-death \
+             reconciler synthesizes nothing (round-2 hostile review 2026-07-10)."
+        );
+        // The CODE form of the fast-arm return (the call's arg list opens on
+        // the next line) — a prose mention in a comment carries `(...)` on
+        // the same line and must NOT anchor the split.
+        let fast_return = main_rs
+            .match_indices("return run_shutdown_fast(")
+            .map(|(i, m)| (i, &main_rs[i + m.len()..]))
+            .find(|(_, rest)| rest.starts_with('\n') || rest.starts_with('\r'))
+            .map(|(i, _)| i)
+            .expect("main.rs must contain the fast-boot `return run_shutdown_fast(` arm");
+        assert!(
+            spawn_sites.iter().any(|&i| i < fast_return),
+            "main.rs MUST spawn the dual-feed scoreboard tasks on the FAST \
+             crash-recovery boot arm (BEFORE `return run_shutdown_fast(`) — \
+             a mid-market process death restarts through that arm, and \
+             without the spawn the flagship crash-restart day records NO \
+             process_death episode, NO 15:45 scorecard and NO Aborted page. \
+             See .claude/plans/active-plan-dual-feed-scoreboard.md."
+        );
+        assert!(
+            spawn_sites.iter().any(|&i| i > fast_return),
+            "main.rs MUST spawn the dual-feed scoreboard tasks from the \
+             slow-boot process-global prefix too (next to \
+             spawn_daily_tick_conservation_task) — without it the \
+             feed_scoreboard_boot module + the DualFeedDailyScorecard event \
+             are dead code on normal boots."
+        );
+        assert!(
+            main_rs.contains("NotificationEvent::DualFeedDailyScorecard {"),
+            "main.rs MUST emit `NotificationEvent::DualFeedDailyScorecard` from \
+             the outer scoreboard supervisor — the daily operator digest per \
+             the 2026-07-10 dual-feed directive."
+        );
+        assert!(
+            main_rs.contains("NotificationEvent::DualFeedScorecardAborted {"),
+            "main.rs MUST emit `DualFeedScorecardAborted` on the Err/panic arms \
+             of the outer scoreboard supervisor — the daily signal must never \
+             be silently dropped (audit Rule 11)."
+        );
+        assert!(
+            main_rs.contains("reconcile_process_death_episodes("),
+            "main.rs MUST run the boot-time process-death reconciler — without \
+             it a mid-session process death leaves NO episode row and the \
+             month verdict silently under-counts our own restarts."
+        );
+    }
+
+    /// W2 PR#6 (WAL-SUSPEND-01, 2026-07-10, audit follow-up row 10):
+    /// `main.rs` MUST spawn the supervised per-table QuestDB WAL-suspension
+    /// probe from the process-global monitor block. Without this wire, a
+    /// WAL-suspended `ticks` / `candles_1m` table (post disk-full / apply
+    /// error) keeps ACKing ILP rows while they silently stop becoming
+    /// visible — with ZERO signal: the boot probe + questdb_health check
+    /// reachability/connection, never per-table WAL apply. The SUPERVISED
+    /// wrapper (mirrors DISK-WATCHER-01) also covers the gauge going stale
+    /// on a probe-task death: the respawned watcher re-sets
+    /// `tv_questdb_wal_suspended_tables` on its first successful probe.
+    #[test]
+    fn test_wal_suspension_watcher_is_wired_into_main() {
+        let main_rs = std::fs::read_to_string("../app/src/main.rs")
+            .or_else(|_| std::fs::read_to_string("crates/app/src/main.rs"))
+            .expect("main.rs must be readable");
+        assert!(
+            main_rs.contains("spawn_supervised_wal_suspension_watcher("),
+            "main.rs MUST call `wal_suspension_watcher::\
+             spawn_supervised_wal_suspension_watcher` from the process-global \
+             monitor block (W2 PR#6 / WAL-SUSPEND-01). Without it, a \
+             WAL-suspended QuestDB table silently stops applying writes with \
+             zero operator signal — the exact silent-data-visibility-loss \
+             class the 2026-07-09 audit flagged."
+        );
+    }
+
     /// SLO-03 (live incident 2026-07-03 10:35 IST): `main.rs` MUST spawn the
     /// SLO evaluator/publisher through the SUPERVISED wrapper, never as a bare
     /// `tokio::spawn`. The bare spawn died silently mid-market — last
@@ -1365,6 +1496,66 @@ mod tests {
         );
     }
 
+    /// W2 PR#5 (2026-07-10, audit follow-up row 15): `main.rs` MUST spawn
+    /// the holiday-calendar coverage-horizon staleness watchdog from the
+    /// COMMON boot prefix. Without this wire, the `nse_holidays` calendar
+    /// (one calendar year at a time; `is_holiday` has NO year bound)
+    /// silently runs off its year-end cliff — every un-listed weekday
+    /// holiday reads as a trading day, the box auto-starts and burns a full
+    /// billable session on a market-closed day — with zero runtime signal
+    /// (the CI-only Jan-1 red-build ratchets are reactive, post-cliff).
+    /// The watchdog pages the operator (Severity::High, one page per
+    /// process per IST day) when < 60 days of coverage remain.
+    #[test]
+    fn test_calendar_staleness_watchdog_is_wired_into_main() {
+        let main_rs = std::fs::read_to_string("../app/src/main.rs")
+            .or_else(|_| std::fs::read_to_string("crates/app/src/main.rs"))
+            .expect("main.rs must be readable");
+        // Comment-stripped scan (hostile-review H1, 2026-07-10): a raw
+        // `contains` would still pass with the spawn commented out. Line
+        // comments suffice here — main.rs call sites are line-oriented and
+        // the anchor string never appears inside a string literal.
+        let non_comment: String = main_rs
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            non_comment.contains("spawn_calendar_staleness_watchdog("),
+            "main.rs MUST call \
+             `calendar_staleness::spawn_calendar_staleness_watchdog` from the \
+             common boot prefix (audit follow-up row 15), NOT commented out. \
+             Without it, the holiday calendar runs off its year-end cliff \
+             with zero runtime warning and un-listed holidays are treated as \
+             trading days."
+        );
+        // Anti-vacuous: the spawn must receive the trading calendar AND the
+        // lazily-filled notifier slot (a stub call with neither could
+        // satisfy a bare substring check). Scan the comment-stripped
+        // call-site region for both argument identifiers.
+        let idx = non_comment
+            .find("spawn_calendar_staleness_watchdog(")
+            .expect("checked above"); // APPROVED: test
+        // Char-boundary-safe window end (string literals in main.rs carry
+        // non-ASCII; a raw byte slice could split a multi-byte char).
+        let mut end = non_comment.len().min(idx + 400);
+        while !non_comment.is_char_boundary(end) {
+            end -= 1;
+        }
+        let window = &non_comment[idx..end];
+        assert!(
+            window.contains("trading_calendar"),
+            "the calendar-staleness watchdog call site must pass the \
+             process trading_calendar (found call without it)"
+        );
+        assert!(
+            window.contains("notifier_slot"),
+            "the calendar-staleness watchdog call site must pass the \
+             lazily-filled notifier slot so the High Telegram page can \
+             actually be delivered (found call without it)"
+        );
+    }
+
     /// Silent-feed hardening Item 4 (2026-07-06 incident): the Dhan
     /// exchange-lag p99 publisher MUST be spawned via its supervisor
     /// (respawn + counter — WS-GAP-05 / SLO-03 pattern). A bare
@@ -1372,6 +1563,78 @@ mod tests {
     /// SLO-03 incident proved: the `tv_dhan_exchange_lag_p99_seconds`
     /// stream stops with no error!, no counter, no respawn, and the lag
     /// alarm false-OKs on missing data (`notBreaching`).
+    /// Scoreboard PR-D meta-guard: main.rs MUST (a) init the per-instrument
+    /// presence registry on BOTH boot arms BEFORE the feeds spawn (the
+    /// boot-read fold gate — one-site wiring darkens per-instrument
+    /// coverage for every mid-market crash-restart session, the exact
+    /// feed-lag round-1 lesson) and (b) reset the Dhan presence bitsets in
+    /// the IST-midnight task next to the day-lag histogram reset.
+    #[test]
+    fn test_feed_presence_is_wired_into_main() {
+        let main_rs = std::fs::read_to_string("../app/src/main.rs")
+            .or_else(|_| std::fs::read_to_string("crates/app/src/main.rs"))
+            .expect("main.rs must be readable");
+        let init_needle = "feed_presence::init_feed_presence(";
+        let init_sites = main_rs
+            .lines()
+            .filter(|l| {
+                let t = l.trim_start();
+                !t.starts_with("//") && !t.starts_with("///") && t.contains(init_needle)
+            })
+            .count();
+        assert_eq!(
+            init_sites, 1,
+            "feed_presence::init_feed_presence must be called at EXACTLY 1 \
+             main.rs site (the PROCESS-GLOBAL boot prefix — PR-D fix round \
+             1, 2026-07-11); found {init_sites}."
+        );
+        // Source-order pin (PR-D fix round 1, review HIGH — the
+        // ratchet_tick_processor_spawns_before_reinject_await pattern):
+        // init is a GLOBAL.get() gate, so it MUST precede the Groww
+        // activation watcher spawn AND the first load_instruments call
+        // (the fast crash-recovery arm's) — a registration ordered before
+        // init is silently skipped, and a half-registered registry drains
+        // a false one-sided daily verdict at 15:45.
+        // Positions are computed over COMMENT-STRIPPED source (PR-D review
+        // round 2, LOW — the vacuous-ratchet class): a raw str::find could
+        // resolve to a future comment citing a needle literal and satisfy
+        // the ordering assertions vacuously; use the same line filter the
+        // count check above uses.
+        let stripped: String = main_rs
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let init_pos = stripped
+            .find(init_needle)
+            .expect("init_feed_presence site present");
+        let watcher_pos = stripped
+            .find("run_groww_activation_watcher(")
+            .expect("Groww activation watcher spawn present");
+        let load_pos = stripped
+            .find("load_instruments(")
+            .expect("load_instruments call present");
+        assert!(
+            init_pos < watcher_pos,
+            "init_feed_presence must precede the run_groww_activation_watcher \
+             spawn (init at stripped byte {init_pos}, watcher at \
+             {watcher_pos})"
+        );
+        assert!(
+            init_pos < load_pos,
+            "init_feed_presence must precede the first load_instruments call \
+             (init at stripped byte {init_pos}, load_instruments at \
+             {load_pos})"
+        );
+        assert!(
+            main_rs.contains("feed_presence::reset_daily("),
+            "the main.rs IST-midnight task must reset the Dhan presence \
+             bitsets (feed_presence::reset_daily) next to \
+             reset_day_lag_histogram — without it a long-lived process \
+             bleeds Friday's minutes into Monday's coverage rows."
+        );
+    }
+
     #[test]
     fn test_feed_lag_publisher_supervisor_is_wired_into_main() {
         let main_rs = std::fs::read_to_string("../app/src/main.rs")
@@ -1438,6 +1701,56 @@ mod tests {
             "run_dhan_lag_publisher must be called ONLY from the feed-lag \
              supervisor loop (found {inner_call_sites} non-comment mentions; \
              expected exactly 1: the supervisor call site)"
+        );
+    }
+
+    /// Scoreboard PR-C (2026-07-11): the GROWW exchange-lag p99 publisher
+    /// (`tv_groww_exchange_lag_p99_seconds`) MUST be spawned via its
+    /// supervisor from the PROCESS-GLOBAL boot prefix — one call site that
+    /// runs on EVERY boot mode (unlike the Dhan publisher's fast/slow
+    /// dual-arm wiring, the Groww bridge block executes before the boot
+    /// fork). A bare `tokio::spawn` or a dropped spawn regresses the SLO-03
+    /// silent-task-death class: the gauge stream stops with no error!, no
+    /// counter, no respawn, and the groww lag alarm false-OKs on missing
+    /// data (`notBreaching`).
+    #[test]
+    fn test_groww_lag_publisher_supervisor_is_wired_into_main() {
+        let main_rs = std::fs::read_to_string("../app/src/main.rs")
+            .or_else(|_| std::fs::read_to_string("crates/app/src/main.rs"))
+            .expect("main.rs must be readable");
+        let supervisor_call_sites = main_rs
+            .lines()
+            .filter(|l| {
+                let t = l.trim_start();
+                !t.starts_with("//")
+                    && !t.starts_with("///")
+                    && !t.contains("fn spawn_supervised_groww_lag_publisher")
+                    && t.contains("spawn_supervised_groww_lag_publisher(")
+            })
+            .count();
+        assert_eq!(
+            supervisor_call_sites, 1,
+            "spawn_supervised_groww_lag_publisher must have EXACTLY 1 call \
+             site in main.rs (the process-global boot prefix, next to the \
+             Groww bridge supervisor); found {supervisor_call_sites}. \
+             Removing it silently darkens the groww lag gauge for every \
+             session (notBreaching on missing data)."
+        );
+        // The supervisor must be the ONLY spawn path for the publisher loop.
+        let inner_call_sites = main_rs
+            .lines()
+            .filter(|l| {
+                let t = l.trim_start();
+                !t.starts_with("//")
+                    && !t.starts_with("///")
+                    && t.contains("run_groww_lag_publisher(")
+            })
+            .count();
+        assert_eq!(
+            inner_call_sites, 1,
+            "run_groww_lag_publisher must be called ONLY from the groww \
+             feed-lag supervisor loop (found {inner_call_sites} non-comment \
+             mentions; expected exactly 1: the supervisor call site)"
         );
     }
 

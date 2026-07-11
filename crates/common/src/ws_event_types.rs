@@ -86,6 +86,17 @@ pub enum WsEventKind {
     SleepEntered,
     /// The connection resumed from dormant sleep at the next market open.
     SleepResumed,
+    /// The feed-agnostic sidecar stall watchdog killed + relaunched an
+    /// alive-but-silent (or never-streamed) child (FEED-STALL-01 /
+    /// FEED-STALL-01 §1b semantics). NOT an "up" kind and NOT a plain
+    /// disconnect — the socket process was deliberately killed by OUR
+    /// watchdog because the SERVER stopped delivering; the scoreboard maps
+    /// it to the `stall_restart` / `never_streamed_restart` episode kinds
+    /// (dual-feed scoreboard PR-B, 2026-07-10). The row's `source` carries
+    /// a FIXED machine cause slug (`stall_silent_socket` /
+    /// `stall_never_streamed` / `stall_auth_stale` / `stall_entitlement` —
+    /// see `crate::feed_blame::STALL_SOURCE_*`), never raw child text.
+    StallRestarted,
 }
 
 impl WsEventKind {
@@ -99,12 +110,13 @@ impl WsEventKind {
             Self::Reconnected => "reconnected",
             Self::SleepEntered => "sleep_entered",
             Self::SleepResumed => "sleep_resumed",
+            Self::StallRestarted => "stall_restarted",
         }
     }
 
     /// All variants — lets tests assert exhaustiveness + wire-label uniqueness.
     #[must_use]
-    pub const fn all() -> [WsEventKind; 6] {
+    pub const fn all() -> [WsEventKind; 7] {
         [
             Self::Connected,
             Self::Disconnected,
@@ -112,6 +124,7 @@ impl WsEventKind {
             Self::Reconnected,
             Self::SleepEntered,
             Self::SleepResumed,
+            Self::StallRestarted,
         ]
     }
 }
@@ -199,6 +212,7 @@ mod tests {
                 "reconnected",
                 "sleep_entered",
                 "sleep_resumed",
+                "stall_restarted",
             ]
         );
         let unique: HashSet<&str> = labels.iter().copied().collect();
@@ -214,7 +228,26 @@ mod tests {
         // If a variant is added, `all()` must be updated — these pin the count so
         // a new WS type / event kind cannot silently escape the audit schema.
         assert_eq!(WsType::all().len(), 5);
-        assert_eq!(WsEventKind::all().len(), 6);
+        assert_eq!(WsEventKind::all().len(), 7);
+    }
+
+    #[test]
+    fn test_stall_restarted_is_neither_up_kind_nor_plain_disconnect_label() {
+        // Dual-feed scoreboard PR-B contract: the stall-restart lifecycle row
+        // must never be mistaken for a connection-up signal or a plain
+        // disconnect by string-matching consumers — its wire label is its
+        // own distinct value.
+        let label = WsEventKind::StallRestarted.as_str();
+        assert_eq!(label, "stall_restarted");
+        for reserved in [
+            "connected",
+            "reconnected",
+            "sleep_resumed",
+            "disconnected",
+            "disconnected_off_hours",
+        ] {
+            assert_ne!(label, reserved);
+        }
     }
 
     #[test]

@@ -701,6 +701,19 @@ fn capture_stamp_ist_nanos(
     .then_some(capture_ist_nanos)
 }
 
+/// Same-IST-day gate for the presence fold (scoreboard PR-D fix round 1,
+/// review MEDIUM): `true` when the tick's own exchange stamp and the wake
+/// receipt wall-clock fall on the SAME IST day number. The presence
+/// bitsets discard the day component (`ts % 86400`), so a cross-day
+/// NDJSON re-tail replay (rotation-failure degraded mode / byte-0
+/// re-tail) would otherwise fold yesterday's session minutes into
+/// today's slots as `in_memory` truth. Same-day replay stays idempotent
+/// (fetch_or). Pure integer math — one divide + compare, zero-alloc.
+fn tick_is_same_ist_day(tick_ts_ist_nanos: i64, wake_receipt_ist_nanos: i64) -> bool {
+    const DAY_NANOS: i64 = 86_400 * 1_000_000_000;
+    tick_ts_ist_nanos.div_euclid(DAY_NANOS) == wake_receipt_ist_nanos.div_euclid(DAY_NANOS)
+}
+
 /// Monotonic, replay-stable `capture_seq` source (TICK-SEQ-01): `max(prev+1,
 /// seed_nanos)`. The call site seeds it from the tick's IST epoch-nanos
 /// (`ts_ist_nanos`) — a replay-STABLE value (NOT wall-clock), so `capture_seq`
@@ -862,6 +875,21 @@ pub(crate) struct GrowwBridgeState {
     /// ("Prices are flowing") or pinning `tv_groww_ws_active = 1` before the
     /// relaunched sidecar has actually authenticated + subscribed + streamed.
     wake_max_capture_ist_nanos: i64,
+    /// Byte-0 re-tail REPLAY-WINDOW flag (scoreboard PR-C review round 1,
+    /// 2026-07-11) — the SECOND condition of the Groww lag stale-capture
+    /// exclusion (`feed_lag_monitor::record_groww_tick`; the ≥60 s dwell
+    /// alone also matches LIVE backlog drains — the ILP-backpressure pause
+    /// + the respawn-backoff wake — whose lines were never recorded and
+    /// must be ADMITTED to the day lag histogram). TRUE while drained
+    /// bytes may REPLAY lines a previous bridge/process already recorded:
+    /// set at construction (a fresh bridge without a proven same-day
+    /// offset resume byte-0 re-tails), on a `len < offset` shrink reset,
+    /// and re-armed after an archive-tail drain (the caller's byte-0
+    /// live-file re-tail follows); cleared FALSE on a proven same-day
+    /// snapshot resume and whenever a drain wake finishes fully caught up
+    /// to the file end (everything after that is live). Affects ONLY the
+    /// lag-sample classification — persist/fold/dedup are untouched.
+    replay_window: bool,
 }
 
 impl GrowwBridgeState {
@@ -904,6 +932,10 @@ impl GrowwBridgeState {
             active_drain_ist_day: None,
             liveness_max_exchange_ts_nanos: 0,
             wake_max_capture_ist_nanos: 0,
+            // A fresh bridge byte-0 re-tails until a resume proves a
+            // preserved offset or a drain fully catches up — replayed
+            // lines must not double-count in the day lag histogram.
+            replay_window: true,
         }
     }
 
@@ -982,6 +1014,9 @@ impl GrowwBridgeState {
                 )
                 .await;
                 self.offset = 0;
+                // The archive drain may have cleared the flag on catch-up;
+                // the byte-0 live-file tail that follows is a re-tail.
+                self.replay_window = true;
                 info!("groww bridge: capture file absent — snapshot ignored");
                 metrics::counter!("tv_groww_bridge_offset_resume_total", "outcome" => "no_file")
                     .increment(1);
@@ -993,6 +1028,11 @@ impl GrowwBridgeState {
             Some((offset, capture_seq)) => {
                 self.offset = offset;
                 self.capture_seq.store(capture_seq, Ordering::Relaxed);
+                // Proven same-day continuation from the flushed offset:
+                // every byte past it was never read — no replay possible,
+                // so post-downtime backlog lines keep their true lag in
+                // the day histogram (review round 1, 2026-07-11).
+                self.replay_window = false;
                 info!(
                     offset,
                     capture_seq,
@@ -1011,6 +1051,9 @@ impl GrowwBridgeState {
                 )
                 .await;
                 self.offset = 0;
+                // Same re-arm as the absent-file arm: the byte-0 re-tail
+                // of the rotated/replaced live file follows.
+                self.replay_window = true;
                 info!(
                     snapshot_offset = snap.offset,
                     file_len = current_len,
@@ -1188,13 +1231,21 @@ impl GrowwBridgeState {
             }
         };
         if len < self.offset {
-            // File shrank (rotation/truncate) — restart from the top.
+            // File shrank (rotation/truncate) — restart from the top. The
+            // byte-0 re-tail may replay already-recorded lines, so the lag
+            // classifier's replay window re-arms (review round 1,
+            // 2026-07-11).
             self.offset = 0;
             self.residual.clear();
+            self.replay_window = true;
         }
         if len == self.offset {
             return false; // nothing new
         }
+        // The lag classification for THIS wake's lines uses the flag as it
+        // stood when the bytes were read; a catch-up below clears it for
+        // the NEXT wake only.
+        let wake_replay_window = self.replay_window;
         if file.seek(SeekFrom::Start(self.offset)).await.is_err() {
             return false;
         }
@@ -1216,7 +1267,16 @@ impl GrowwBridgeState {
         // O(1) EXEMPT: per-WAKE read buffer, bounded by wake_read_budget (≤ 4 MiB take()); not per-tick.
         let mut chunk: Vec<u8> = Vec::new();
         match (&mut file).take(to_read).read_to_end(&mut chunk).await {
-            Ok(n) => self.offset = self.offset.saturating_add(n as u64),
+            Ok(n) => {
+                self.offset = self.offset.saturating_add(n as u64);
+                if self.offset >= len {
+                    // Fully caught up to the file end sampled this wake —
+                    // any replayable prefix is behind us; every later byte
+                    // is live (the flag re-arms only on a fresh
+                    // state/shrink/failed resume).
+                    self.replay_window = false;
+                }
+            }
             Err(err) => {
                 warn!(?err, "groww bridge: read failed");
                 return false;
@@ -1290,8 +1350,51 @@ impl GrowwBridgeState {
             // prove liveness (2026-07-06 false-recovery fix). The persisted
             // `received_at` keeps the exact pre-fix semantics (stamp, else
             // per-wake fallback).
-            if let Some(c) = capture_stamp_ist_nanos(parsed.capture_ns, wake_receipt_ist_nanos) {
+            let capture_ist = capture_stamp_ist_nanos(parsed.capture_ns, wake_receipt_ist_nanos);
+            if let Some(c) = capture_ist {
                 self.wake_max_capture_ist_nanos = self.wake_max_capture_ist_nanos.max(c);
+            }
+            // Scoreboard PR-C: Groww exchange→capture lag fold — operands
+            // the drain ALREADY computed (zero new clock reads, zero
+            // allocation). Lines without a capture stamp (old-format /
+            // reconcile-sweep) and ≥60s-stale captures INSIDE a byte-0
+            // re-tail replay window are EXCLUDED + counted inside
+            // record_groww_tick; ≥60s-stale captures on a PRESERVED offset
+            // (ILP-backpressure pause / respawn-backoff backlog — review
+            // round 1, 2026-07-11) are ADMITTED to the day histogram only;
+            // fresh admitted samples feed the trailing-60s ring (the
+            // tv_groww_exchange_lag_p99_seconds publisher) + the day
+            // histogram (the 15:45 scorecard lag columns) at Groww's
+            // native MILLISECOND precision.
+            tickvault_core::pipeline::feed_lag_monitor::record_groww_tick(
+                capture_ist,
+                wake_receipt_ist_nanos,
+                parsed.tick.ts_ist_nanos,
+                wake_replay_window,
+            );
+            // Scoreboard PR-D: per-instrument session-minute presence fold
+            // — co-located with the lag fold above (post-validate). The
+            // minute derives from the tick's own millisecond exchange
+            // stamp (one integer division — zero new clock reads); the
+            // (id, segment) key is the SAME composite the shared 21-TF
+            // engine folds on. validate_groww_tick already rejected
+            // security_id <= 0, so the u64 conversion cannot fail.
+            // SAME-IST-DAY gate (PR-D review round 1, MEDIUM): the presence
+            // bitsets carry no day component (`ts % 86400`), and
+            // validate_groww_tick rejects FUTURE skew only — a cross-day
+            // NDJSON re-tail replay (the documented rotation-failure
+            // degraded mode / a byte-0 re-tail) would otherwise fold
+            // YESTERDAY's session minutes into today's registered slots as
+            // 'in_memory' truth. One divide + compare, zero-alloc — the
+            // Dhan fold sites are already behind the tick processor's
+            // is_today_ist stale-day gate.
+            if tick_is_same_ist_day(parsed.tick.ts_ist_nanos, wake_receipt_ist_nanos) {
+                tickvault_core::pipeline::feed_presence::record_presence(
+                    Feed::Groww,
+                    u64::try_from(parsed.tick.security_id).unwrap_or(0),
+                    parsed.tick.segment.binary_code(),
+                    u32::try_from(parsed.tick.ts_ist_nanos / 1_000_000_000).unwrap_or(0),
+                );
             }
             let row_received =
                 row_received_at_with_capture(parsed.capture_ns, wake_receipt_ist_nanos);
@@ -1512,6 +1615,17 @@ fn spawn_groww_ist_midnight_force_seal(
             // SAME helper the Dhan IST-midnight force-seal uses.
             let sleep_secs = tickvault_common::market_hours::secs_until_next_ist_midnight().max(1);
             tokio::time::sleep(Duration::from_secs(sleep_secs)).await;
+
+            // Scoreboard PR-C: reset the Groww DAY lag histogram at every
+            // IST midnight — BEFORE the trading-day / feed-enabled gates
+            // below (a Saturday-midnight `continue` must still clear
+            // Friday's distribution before the next trading day fills it).
+            // Cold, O(96); an empty/disabled feed's reset is a no-op.
+            tickvault_core::pipeline::feed_lag_monitor::reset_day_lag_histogram(Feed::Groww);
+            // Scoreboard PR-D: reset the Groww presence bitsets at the same
+            // boundary (belt-and-braces — registration's day-change clear
+            // is the backstop). Cold, O(slots × 6).
+            tickvault_core::pipeline::feed_presence::reset_daily(Feed::Groww);
 
             // Only force-seal on trading days — a non-trading-day midnight has no
             // open buckets worth flushing (mirrors the Dhan task).
@@ -3781,6 +3895,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_replay_window_lifecycle_clears_on_catchup_and_rearms_on_shrink() {
+        // Scoreboard PR-C review round 1 (2026-07-11): the byte-0 re-tail
+        // replay-window flag — the SECOND condition of the Groww lag
+        // stale-capture exclusion — must arm on a fresh bridge, clear on a
+        // fully-caught-up drain (later ≥60s-dwelt lines are LIVE backlog:
+        // ILP-backpressure pause / respawn-backoff wake — admitted to the
+        // day histogram), and re-arm on a shrink/rotation reset.
+        let dir = retail_tmp_dir("replay_window_lifecycle");
+        let tick_file = dir.join("live-ticks.ndjson");
+        let reg = tickvault_common::feed_health::FeedHealthRegistry::new();
+        let mut state = retail_fresh_state();
+        assert!(
+            state.replay_window,
+            "a fresh bridge byte-0 re-tails — the replay window must arm at construction"
+        );
+        std::fs::write(&tick_file, retail_line(1)).expect("seed one live line");
+        assert!(state.drain_new_data(&tick_file, &reg).await);
+        assert!(
+            !state.replay_window,
+            "a fully-caught-up drain must clear the replay window — every later \
+             byte is live, so a post-pause backlog drain keeps its true lag"
+        );
+        // Rotation/truncate (len < offset) re-arms: the byte-0 re-tail may
+        // replay already-recorded lines.
+        std::fs::write(&tick_file, b"").expect("truncate");
+        let _ = state.drain_new_data(&tick_file, &reg).await;
+        assert!(
+            state.replay_window,
+            "a shrink/rotation reset must re-arm the replay window"
+        );
+        // ... and the re-tail clears it again once caught up.
+        std::fs::write(&tick_file, retail_line(2)).expect("rewrite");
+        assert!(state.drain_new_data(&tick_file, &reg).await);
+        assert!(
+            !state.replay_window,
+            "catching up after the re-tail must clear the replay window again"
+        );
+    }
+
+    #[tokio::test]
     async fn test_drain_replayed_backlog_parses_but_never_reads_fresh() {
         // THE 2026-07-06 false-recovery regression class, end-to-end through
         // the REAL drain body: a disable→re-enable replay of pre-disable
@@ -4466,6 +4620,122 @@ mod tests {
             src.contains(&groww_feed),
             "the force-seal closure must route with feed: Feed::Groww (drop_d1: false)"
         );
+    }
+
+    #[test]
+    fn test_record_groww_tick_producer_site_wired_into_drain() {
+        // Scoreboard PR-C producer-half pin (mirror of the Dhan
+        // `test_record_dhan_tick_producer_sites_wired_into_tick_processor`
+        // ratchet): the Groww lag pipeline has two wiring halves — the
+        // PUBLISHER (main.rs supervisor, pinned in secret_manager.rs) and
+        // the PRODUCER (the ONE `record_groww_tick` call at the validated
+        // drain site). Dropping the producer silently starves the Groww
+        // ring below the 50-sample floor: the publisher publishes NOTHING,
+        // the groww lag alarm reads notBreaching forever, and the 15:45
+        // scorecard lag columns regress to −1 — the exact dark-gauge class
+        // of the 2026-07-06 incident, on the second feed.
+        let src = include_str!("groww_bridge.rs");
+        // Needles are ASSEMBLED at runtime so this test's own literals can
+        // never self-match the include_str! scan (the `groww_feed` pattern
+        // above).
+        let producer_needle = format!("feed_lag_monitor::record_groww_tick{}", "(");
+        let producer_call_sites = src
+            .lines()
+            .filter(|l| {
+                let t = l.trim_start();
+                !t.starts_with("//") && !t.starts_with("///") && t.contains(&producer_needle)
+            })
+            .count();
+        assert_eq!(
+            producer_call_sites, 1,
+            "groww_bridge.rs must invoke the Groww lag producer at EXACTLY 1 \
+             non-comment site (the validated drain_new_data hook, AFTER \
+             validate_groww_tick); found {producer_call_sites}."
+        );
+        // The IST-midnight task must reset the Groww DAY histogram (before
+        // its trading-day/enabled gates).
+        let reset_needle = format!(
+            "feed_lag_monitor::reset_day_lag_histogram{}",
+            "(Feed::Groww)"
+        );
+        let reset_sites = src
+            .lines()
+            .filter(|l| {
+                let t = l.trim_start();
+                !t.starts_with("//") && !t.starts_with("///") && t.contains(&reset_needle)
+            })
+            .count();
+        assert_eq!(
+            reset_sites, 1,
+            "the Groww IST-midnight force-seal task must reset the Groww day \
+             lag histogram exactly once (found {reset_sites} sites) — without \
+             it Friday's distribution bleeds into Monday's scorecard row."
+        );
+    }
+
+    #[test]
+    fn test_record_presence_producer_site_wired_into_drain() {
+        // Scoreboard PR-D producer-half pin (sibling of the lag ratchet
+        // above): dropping the presence fold silently empties the Groww
+        // side of every coverage slot — the 15:45 drain then reports 375
+        // "Dhan unique win" minutes for every paired instrument (a false
+        // verdict, not a missing one).
+        let src = include_str!("groww_bridge.rs");
+        let producer_needle = format!("feed_presence::record_presence{}", "(");
+        let producer_call_sites = src
+            .lines()
+            .filter(|l| {
+                let t = l.trim_start();
+                !t.starts_with("//") && !t.starts_with("///") && t.contains(&producer_needle)
+            })
+            .count();
+        assert_eq!(
+            producer_call_sites, 1,
+            "groww_bridge.rs must fold Groww presence at EXACTLY 1 \
+             non-comment site (the validated drain hook, next to \
+             record_groww_tick); found {producer_call_sites}."
+        );
+        // The IST-midnight task must reset the Groww presence bitsets too.
+        let reset_needle = format!("feed_presence::reset_daily{}", "(Feed::Groww)");
+        let reset_sites = src
+            .lines()
+            .filter(|l| {
+                let t = l.trim_start();
+                !t.starts_with("//") && !t.starts_with("///") && t.contains(&reset_needle)
+            })
+            .count();
+        assert_eq!(
+            reset_sites, 1,
+            "the Groww IST-midnight force-seal task must reset the Groww \
+             presence bitsets exactly once (found {reset_sites} sites)."
+        );
+        // PR-D fix round 1 (review MEDIUM): the fold must sit behind the
+        // same-IST-day gate — a cross-day NDJSON re-tail replay must never
+        // fold yesterday's session minutes into today's bitsets.
+        let gate_needle = format!("tick_is_same_ist_day{}", "(parsed.tick.ts_ist_nanos");
+        assert!(
+            src.lines().any(|l| {
+                let t = l.trim_start();
+                !t.starts_with("//") && t.contains(&gate_needle)
+            }),
+            "the Groww presence fold must be gated on tick_is_same_ist_day \
+             (cross-day replay protection)"
+        );
+    }
+
+    #[test]
+    fn test_tick_is_same_ist_day_gates_cross_day_replay() {
+        const DAY_NANOS: i64 = 86_400 * 1_000_000_000;
+        let today_open = 20_644 * DAY_NANOS + (9 * 3600 + 15 * 60) * 1_000_000_000;
+        let now = 20_644 * DAY_NANOS + 10 * 3600 * 1_000_000_000;
+        // Same-day tick folds; yesterday's replayed line does not.
+        assert!(tick_is_same_ist_day(today_open, now));
+        assert!(!tick_is_same_ist_day(today_open - DAY_NANOS, now));
+        // Day boundaries: 23:59:59.999… of yesterday vs 00:00:00 of today.
+        assert!(!tick_is_same_ist_day(20_644 * DAY_NANOS - 1, now));
+        assert!(tick_is_same_ist_day(20_644 * DAY_NANOS, now));
+        // A (validator-bounded) small future skew inside the same day folds.
+        assert!(tick_is_same_ist_day(now + 30 * 1_000_000_000, now));
     }
 
     // ── 2026-07-02 adversarial-sweep fixes: bridge supervision + parse-time

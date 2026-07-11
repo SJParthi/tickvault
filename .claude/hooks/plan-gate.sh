@@ -28,6 +28,18 @@
 #   M5  PLAN-EXEMPT covers at most ONE implementation file (no whole-feature bypass)
 #   L6  base ref resolves origin/main → main, NUL-safe path handling throughout
 #
+# Stale-plan-pile hardening (2026-07-10 audit — the 107-stale-plan incident):
+#   V7  the gate REFUSES to evaluate when more than PLAN_GATE_MAX_ACTIVE
+#       (default 5) active-plan*.md files exist. With ~107 merged-but-never-
+#       archived APPROVED/VERIFIED plans collectively referencing every crate,
+#       ANY impl change matched SOME stale plan — H3's crate-reference check
+#       was defeated and the wall was VACUOUS. The cap makes accumulation
+#       itself trip the gate: archive merged plans to .claude/plans/archive/
+#       (per plan-enforcement.md) and the wall regains discriminating power.
+#       HONEST LIMIT: this stops ACCIDENTAL vacuous passes from stale piles;
+#       it does NOT stop deliberate forgery (fabricating/backdating a plan
+#       that names your crate) — plan CONTENT quality remains a review job.
+#
 # Usage:  plan-gate.sh <PROJECT_DIR>
 # Exit:   0 = allowed   ·   2 = BLOCK
 #
@@ -165,6 +177,24 @@ if [ "${#PLANS[@]}" -eq 0 ]; then
   printf '%s\n' "${IMPL[@]}" | sed 's/^/      changed: /' >&2
   echo "  THE DESIGN-FIRST WALL: write .claude/plans/active-plan.md and design it FIRST." >&2
   echo "  (Or, for a genuinely trivial ≤1-file change, add 'PLAN-EXEMPT: <reason>' to the commit body.)" >&2
+  exit 2
+fi
+
+# ── V7 (2026-07-10): a PILE of active plans makes the wall vacuous — refuse ──
+# With many merged-but-unarchived APPROVED/VERIFIED plans, some stale plan
+# references every crate and H3 is defeated. Fail LOUD until the pile is
+# archived. CI never sets PLAN_GATE_MAX_ACTIVE, so the server-side wall
+# always enforces the default cap; the env knob exists for the selftest.
+MAX_ACTIVE="${PLAN_GATE_MAX_ACTIVE:-5}"
+# Fail-closed on a garbage override: a non-integer knob must not disable V7.
+if ! printf '%s' "$MAX_ACTIVE" | grep -qE '^[0-9]+$'; then MAX_ACTIVE=5; fi
+if [ "${#PLANS[@]}" -gt "$MAX_ACTIVE" ]; then
+  echo "  plan-gate: BLOCK — ${#PLANS[@]} active-plan files exist (cap: ${MAX_ACTIVE})." >&2
+  echo "  A pile of stale active plans makes the design-first wall VACUOUS: any impl" >&2
+  echo "  change matches SOME stale plan (the 2026-07-10 107-stale-plan incident)." >&2
+  echo "  Fix: archive every plan whose work is merged to" >&2
+  echo "      .claude/plans/archive/YYYY-MM-DD-<slug>.md   (per plan-enforcement.md)" >&2
+  echo "  keeping ONLY genuinely-active plans, then push again." >&2
   exit 2
 fi
 

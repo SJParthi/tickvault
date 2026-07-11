@@ -468,6 +468,55 @@ pub enum NotificationEvent {
         detail: String,
     },
 
+    /// Once-per-trading-day Dhan-vs-Groww scorecard at 3:45 PM IST
+    /// (operator directive 2026-07-10 — run both feeds live for a month,
+    /// everything tracked + blame-attributed). Severity::Info +
+    /// `DispatchPolicy::Immediate` (the CrossVerify1mSummary precedent —
+    /// the daily digest must arrive AT 15:45, never coalesced). Any
+    /// degradation is carried loudly in the body (partial/degraded
+    /// footnotes), and a task death fires `DualFeedScorecardAborted`
+    /// instead — the daily signal can never be silently dropped.
+    DualFeedDailyScorecard {
+        /// Trading date in `YYYY-MM-DD` IST format.
+        trading_date_ist: String,
+        /// The Dhan side of the scorecard.
+        dhan: FeedScoreLine,
+        /// The Groww side of the scorecard.
+        groww: FeedScoreLine,
+        /// Session denominator in minutes (375 on a regular NSE day).
+        session_minutes: i64,
+        /// `true` when the day's coverage could not be fully vouched for
+        /// (a data source was unavailable mid-run).
+        partial_coverage: bool,
+        /// `true` when the connection-event record itself under-counted
+        /// today — drop counts are a floor, not a truth.
+        degraded: bool,
+        /// `true` when the operator forced this run BEFORE the daily
+        /// trigger — the card covers the day only up to the run time.
+        early_run: bool,
+        /// `true` when the app restarted mid-day (an in-market process
+        /// death was detected) — records from before the restart may
+        /// under-count, and the persisted row is stamped partial; the card
+        /// must say so too (round-3 hostile review 2026-07-10: the row said
+        /// partial while the card stayed silent).
+        restart_partial: bool,
+        /// `true` when Dhan was switched OFF for the day — a one-horse
+        /// race: the verdict says "no contest" instead of declaring a
+        /// winner (round-4 hostile review 2026-07-10).
+        dhan_feed_off: bool,
+        /// `true` when Groww was switched OFF for the day (round 4).
+        groww_feed_off: bool,
+    },
+
+    /// The daily dual-feed scorecard TASK died (panicked / errored) before
+    /// producing its summary. High so the ABSENCE of the daily scorecard is
+    /// impossible to miss (mirrors `CrossVerify1mAborted`). NOT fired on
+    /// graceful shutdown/cancellation.
+    DualFeedScorecardAborted {
+        /// Plain-English description of how the task died.
+        detail: String,
+    },
+
     // PR #4 (2026-05-19): DepthSpotPriceStale variant retired alongside
     // the deleted depth-20/200 infrastructure (operator lock 2026-05-15).
     // PR #5 (2026-05-19): 7 Phase2* variants retired alongside the
@@ -1068,6 +1117,26 @@ pub enum NotificationEvent {
     /// whole-feed-down claim.
     GrowwSidecarRejected { reason: String, fleet_summary: bool },
 
+    /// W2 PR#5 (2026-07-10, audit follow-up row 15): the configured NSE
+    /// holiday calendar's coverage horizon is running out (or already ran
+    /// out). The holiday list covers one calendar year at a time and the
+    /// trading-day gate has NO year bound — past the newest listed year,
+    /// every un-listed weekday holiday silently reads as a trading day
+    /// (the box starts, feeds connect, a full billable session burns on a
+    /// market-closed day). Fired by the calendar-staleness watchdog
+    /// (`crates/app/src/calendar_staleness.rs`), edge-latched to at most
+    /// one page per process per IST day. Severity::High — demands operator
+    /// action (paste the next official NSE circular into the config).
+    HolidayCalendarCoverageLow {
+        /// Signed days of coverage left (negative = already past the
+        /// cliff); `None` = the configured holiday list is EMPTY
+        /// (pathological — the config guards prevent it in prod, but the
+        /// body renders it honestly instead of a fake number).
+        days_remaining: Option<i64>,
+        /// Human-readable last covered date, e.g. "31 Dec 2026".
+        coverage_end_display: String,
+    },
+
     /// Custom alert from any component.
     Custom { message: String },
     // RETIRED 2026-06-12: LastTickAfterBoundary deleted — it was defined but
@@ -1134,6 +1203,180 @@ pub struct FeedStatusLine {
     pub instruments: Option<u64>,
     /// Seconds since this feed's most recent tick; `None` = no tick seen yet.
     pub last_tick_age_secs: Option<u64>,
+}
+
+/// One feed's side of the daily dual-feed scorecard (operator directive
+/// 2026-07-10). `-1` on any count means "not measured / unavailable" and
+/// renders honestly (never as a fabricated zero — audit Rule 11).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FeedScoreLine {
+    /// Feed display name ("Dhan" / "Groww").
+    pub name: String,
+    /// Ticks captured today; `-1` = unavailable.
+    pub ticks: i64,
+    /// Session minutes where ONLY this feed delivered prices; `-1` unknown.
+    pub exclusive_minutes: i64,
+    /// Day median exchange→receipt delay in ms; `-1` = not measured yet.
+    pub lag_p50_ms: i64,
+    /// Day worst-1% delay in ms; `-1` = not measured yet.
+    pub lag_p99_ms: i64,
+    /// In-market disconnect episodes; `-1` = record unavailable.
+    pub drops_market: i64,
+    /// Blame tallies over the day's episodes.
+    pub blame_broker: i64,
+    pub blame_ours: i64,
+    pub blame_unclear: i64,
+    /// Stall episodes — measured from the day's stall-restart records
+    /// (scoreboard PR-B, 2026-07-10): 0 means a MEASURED zero from this
+    /// deploy forward; `-1` = record unavailable. Groww-only by
+    /// construction today (Dhan's silent-socket detection reconnects
+    /// in-process and lands in the drops count instead).
+    pub stalls: i64,
+    /// Boot-reconciled process restarts detected today.
+    pub restarts: i64,
+    /// Session minutes with at least one tick; `-1` unknown.
+    pub streaming_minutes: i64,
+}
+
+/// The Dhan exchange-clock quantization floor in milliseconds — Dhan LTT
+/// carries WHOLE IST seconds, so its measured lag has a uniform [0,1)s
+/// inflation Groww's millisecond clock does not. The verdict's delay rung
+/// declares a winner ONLY when the cross-feed p99 delta EXCEEDS this floor
+/// (PR-C review round 1, 2026-07-11): a sub-floor "Groww faster by <1s" is
+/// unprovable against Dhan's whole-second clock — the runbook caveat made
+/// mechanical. MUST stay lockstep with the persisted `lag_floor_ms` column
+/// value for Dhan (`tickvault_storage::feed_scoreboard_persistence::
+/// LAG_FLOOR_MS_DHAN = 1000`; core cannot depend on storage — both values
+/// are pinned to 1000 by their own unit tests).
+const VERDICT_LAG_CLOCK_FLOOR_MS: i64 = 1000;
+
+/// The scorecard's ONE decision (Telegram commandment 8): who won today.
+/// Tiebreak ladder — feed-off no-contest (round 4: a switched-off feed's
+/// measured zeros are a one-horse race, never a win for the other) →
+/// exclusive minutes → worst-1% delay beyond the clock floor (only when
+/// BOTH are measured AND the delta exceeds [`VERDICT_LAG_CLOCK_FLOOR_MS`];
+/// a −1 sentinel never decides, and a sub-floor delta is clock asymmetry,
+/// not speed) → broker-blamed incidents → even day.
+fn scorecard_verdict(
+    dhan: &FeedScoreLine,
+    groww: &FeedScoreLine,
+    dhan_feed_off: bool,
+    groww_feed_off: bool,
+) -> String {
+    // Rung 0 (round 4, 2026-07-10): a feed switched OFF for the day makes
+    // every comparison rung a one-horse race — no winner is declared.
+    if dhan_feed_off && groww_feed_off {
+        return "\u{1f91d} Verdict: not comparable — both feeds were switched \
+                off today, no contest."
+            .to_string();
+    }
+    if dhan_feed_off || groww_feed_off {
+        let off = if dhan_feed_off {
+            &dhan.name
+        } else {
+            &groww.name
+        };
+        return format!(
+            "\u{1f91d} Verdict: not comparable — {off} was switched off \
+             today, no contest."
+        );
+    }
+    // Rung 1: exclusive coverage minutes.
+    if dhan.exclusive_minutes >= 0
+        && groww.exclusive_minutes >= 0
+        && dhan.exclusive_minutes != groww.exclusive_minutes
+    {
+        let (w, l) = if dhan.exclusive_minutes > groww.exclusive_minutes {
+            (dhan, groww)
+        } else {
+            (groww, dhan)
+        };
+        return format!(
+            "\u{1f3c6} Verdict: {} won today — {} exclusive minutes vs {}.",
+            w.name, w.exclusive_minutes, l.exclusive_minutes
+        );
+    }
+    // Rung 2: worst-1% delay (lower wins; only when both are measured AND
+    // the delta exceeds the Dhan whole-second clock floor — PR-C review
+    // round 1, 2026-07-11: Dhan's p99 physically cannot read below ~1s, so
+    // a raw compare would crown Groww "faster" on every healthy day from
+    // clock asymmetry, exactly the sub-floor comparison the runbook bans).
+    // A sub-floor delta falls through to the incident rung / "Even day".
+    if dhan.lag_p99_ms >= 0
+        && groww.lag_p99_ms >= 0
+        && dhan.lag_p99_ms.saturating_sub(groww.lag_p99_ms).abs() > VERDICT_LAG_CLOCK_FLOOR_MS
+    {
+        let (w, l) = if dhan.lag_p99_ms < groww.lag_p99_ms {
+            (dhan, groww)
+        } else {
+            (groww, dhan)
+        };
+        return format!(
+            "\u{1f3c6} Verdict: {} won today — faster prices beyond the clock floor \
+             (worst 1% delay {} vs {}).",
+            w.name,
+            render_ms(w.lag_p99_ms),
+            render_ms(l.lag_p99_ms)
+        );
+    }
+    // Rung 3: fewer broker-caused INCIDENTS wins — since PR-B the broker
+    // blame tally covers drops + stalls (restarts are always ours, so they
+    // never inflate it), and the wording must match what is compared: on a
+    // stall-heavy zero-drop day "fewer broker-caused drops (0 vs 5)" would
+    // contradict the card's own Drops line (review round 1, charter §D
+    // commandment 6 — the incident-split line was already reworded for
+    // exactly this reason). The blame tallies must BOTH be measured too —
+    // a -1 sentinel would otherwise "win" (-1 < N) and render as gibberish
+    // (hostile review 2026-07-10); sentinel days fall through to
+    // "Even day".
+    if dhan.drops_market >= 0
+        && groww.drops_market >= 0
+        && dhan.blame_broker >= 0
+        && groww.blame_broker >= 0
+        && dhan.blame_broker != groww.blame_broker
+    {
+        let (w, l) = if dhan.blame_broker < groww.blame_broker {
+            (dhan, groww)
+        } else {
+            (groww, dhan)
+        };
+        return format!(
+            "\u{1f3c6} Verdict: {} won today — fewer broker-caused incidents ({} vs {}).",
+            w.name, w.blame_broker, l.blame_broker
+        );
+    }
+    "\u{1f91d} Verdict: Even day.".to_string()
+}
+
+/// Renders a millisecond delay for the scorecard: `-1` = honest "not
+/// measured yet"; ≥1s renders in seconds for readability.
+fn render_ms(ms: i64) -> String {
+    if ms < 0 {
+        return "not measured yet".to_string();
+    }
+    if ms >= 1000 {
+        #[allow(clippy::cast_precision_loss)]
+        // APPROVED: display-only division of a bounded daily lag value.
+        return format!("{:.1} s", ms as f64 / 1000.0);
+    }
+    format!("{ms} ms")
+}
+
+/// Renders a `-1`-sentinel count: honest "?" instead of a fabricated zero.
+/// Large measured counts (≥ 10,000 — the daily tick totals) get thousands
+/// separators per Telegram commandment 6 ("11,034 instruments").
+fn render_count(v: i64) -> String {
+    if v < 0 {
+        return "?".to_string();
+    }
+    if v >= 10_000 {
+        // APPROVED: v is non-negative and bounded by daily tick volumes —
+        // fits usize on every supported target.
+        if let Ok(u) = usize::try_from(v) {
+            return format_with_commas(u);
+        }
+    }
+    v.to_string()
 }
 
 /// Renders the per-feed status block shared by the readiness ("ready to
@@ -1703,6 +1946,180 @@ impl NotificationEvent {
                      What to do RIGHT NOW:\n\
                      1. Check the app is still running.\n\
                      2. Restart the app to re-arm tomorrow's check."
+                )
+            }
+            Self::DualFeedDailyScorecard {
+                trading_date_ist,
+                dhan,
+                groww,
+                session_minutes,
+                partial_coverage,
+                degraded,
+                early_run,
+                restart_partial,
+                dhan_feed_off,
+                groww_feed_off,
+            } => {
+                // Operator-charter §G wording: plain English, emoji status,
+                // IST 12-hour time, specific numbers, ONE decision (the
+                // verdict line), no library names, no file paths. −1
+                // sentinels render honestly ("?" / "not measured yet") —
+                // never fabricated zeros (audit Rule 11).
+                let streaming_line = |f: &FeedScoreLine| -> String {
+                    if f.streaming_minutes < 0 || *session_minutes <= 0 {
+                        return "unknown".to_string();
+                    }
+                    let ok = f.streaming_minutes.saturating_mul(100)
+                        >= session_minutes.saturating_mul(99);
+                    let mark = if ok { "\u{2705}" } else { "\u{26a0}\u{fe0f}" };
+                    format!(
+                        "{} of {} min {}",
+                        f.streaming_minutes, session_minutes, mark
+                    )
+                };
+                // The who-caused-them split covers ALL of the day's headline
+                // incidents (drops + stalls + restarts), so it lives on its
+                // OWN line, decoupled from the drops count — a day with 0
+                // drops and 1 restart must never read "0 (ours 1)" (hostile
+                // review 2026-07-10).
+                let incident_split = |f: &FeedScoreLine| -> String {
+                    format!(
+                        "broker {} / ours {} / unclear {}",
+                        render_count(f.blame_broker),
+                        render_count(f.blame_ours),
+                        render_count(f.blame_unclear)
+                    )
+                };
+                let mut footnotes = String::new();
+                if *early_run {
+                    footnotes.push_str(
+                        "\n\u{26a0}\u{fe0f} This card was produced early on operator \
+                         request — it covers the day only up to the run time; \
+                         re-run after close for the full-day card.",
+                    );
+                }
+                if *partial_coverage {
+                    // Honest PR-1 cause (hostile review 2026-07-10): this
+                    // flag flips on READ/WRITE failures while building the
+                    // card — NOT on "the app was down part of the session"
+                    // (restart detection is a later upgrade).
+                    footnotes.push_str(
+                        "\n\u{26a0}\u{fe0f} Some of today's records could not be read \
+                         while building this card — numbers shown as \u{201c}?\u{201d} \
+                         are missing, and the rest may under-count.",
+                    );
+                }
+                if *degraded {
+                    footnotes.push_str(
+                        "\n\u{26a0}\u{fe0f} Some connection events could not be recorded \
+                         today — treat the drop counts as a minimum, not a truth.",
+                    );
+                }
+                if *restart_partial {
+                    // Round-3 honesty fix: the persisted row is stamped
+                    // partial on a restart day — the card must carry the
+                    // same caveat, not stay silent.
+                    footnotes.push_str(
+                        "\n\u{26a0}\u{fe0f} The app restarted during the day — records \
+                         from before the restart may under-count, so today's \
+                         numbers are a floor, not a truth.",
+                    );
+                }
+                for (off, line) in [(dhan_feed_off, dhan), (groww_feed_off, groww)] {
+                    if *off {
+                        // Round-4 fix: a switched-off feed's day is a
+                        // one-horse race — say so and keep it out of the
+                        // month tally (its row is stamped 'feed_off').
+                        footnotes.push_str(&format!(
+                            "\n\u{26a0}\u{fe0f} {} was switched off today — no contest; \
+                             this day does not count toward the month verdict.",
+                            line.name
+                        ));
+                    }
+                }
+                // Scoreboard PR-C (2026-07-11): delay is MEASURED — the day
+                // lag histograms are live. The footnote carries the
+                // resolution asymmetry honestly: Dhan's whole-second price
+                // clock (≥1 s floor) vs Groww's millisecond clock read one
+                // step after the wire (the sidecar writes each price down
+                // the instant it arrives). An unmeasured side (backfill
+                // re-run / too few samples) renders "not measured yet" with
+                // the honest cause — the retired PR-1 "next upgrade" claim
+                // never appears. The gate keys on EITHER feed (review
+                // round 1, 2026-07-11): a Dhan-off / thin-Dhan day with a
+                // measured Groww delay must never assert "Delay could not
+                // be measured today" under a card showing real Groww
+                // milliseconds (Rule-11 self-contradiction).
+                if dhan.lag_p50_ms >= 0
+                    || dhan.lag_p99_ms >= 0
+                    || groww.lag_p50_ms >= 0
+                    || groww.lag_p99_ms >= 0
+                {
+                    footnotes.push_str(
+                        "\nNote: Dhan's price clock ticks in whole seconds, so its \
+                         delay can never read below about 1 second; Groww's delay \
+                         is millisecond-precise, measured where its helper first \
+                         writes each price down (one step after the wire).",
+                    );
+                } else {
+                    footnotes.push_str(
+                        "\nDelay could not be measured today (a re-run for a past \
+                         day, or too few prices) — it reads \u{201c}not measured \
+                         yet\u{201d}.",
+                    );
+                }
+                // Scoreboard PR-B (2026-07-10): the PR-1 stall + Groww-drops
+                // sentinel footnotes are RETIRED — stall episodes are
+                // measured from this deploy forward (0 = measured 0; the
+                // runbook keeps the pre-ship-day caveat), and the Groww
+                // socket-death family is now visible in the Stalls column,
+                // so the drops count renders as a measurement again. A `-1`
+                // still renders as "?" defensively, without a stale claim.
+                format!(
+                    "\u{1f4ca} <b>Daily feed scorecard @ 3:45 PM IST</b>\n\
+                     Date: {trading_date_ist}\n\
+                     Ticks today: Dhan {} | Groww {}\n\
+                     Minutes only one feed had prices: Dhan {} | Groww {}\n\
+                     Typical delay: Dhan {} | Groww {}\n\
+                     Worst 1% delay: Dhan {} | Groww {}\n\
+                     Drops in market hours: Dhan {} | Groww {}\n\
+                     Who caused today's incidents: Dhan {} | Groww {}\n\
+                     Stalls: Dhan {} | Groww {}\n\
+                     App restarts detected: Dhan {} | Groww {}\n\
+                     Streaming: Dhan {} | Groww {}\n\
+                     {}{}",
+                    render_count(dhan.ticks),
+                    render_count(groww.ticks),
+                    render_count(dhan.exclusive_minutes),
+                    render_count(groww.exclusive_minutes),
+                    render_ms(dhan.lag_p50_ms),
+                    render_ms(groww.lag_p50_ms),
+                    render_ms(dhan.lag_p99_ms),
+                    render_ms(groww.lag_p99_ms),
+                    render_count(dhan.drops_market),
+                    render_count(groww.drops_market),
+                    incident_split(dhan),
+                    incident_split(groww),
+                    render_count(dhan.stalls),
+                    render_count(groww.stalls),
+                    render_count(dhan.restarts),
+                    render_count(groww.restarts),
+                    streaming_line(dhan),
+                    streaming_line(groww),
+                    scorecard_verdict(dhan, groww, *dhan_feed_off, *groww_feed_off),
+                    footnotes
+                )
+            }
+            Self::DualFeedScorecardAborted { detail } => {
+                let detail = html_escape(detail);
+                format!(
+                    "\u{26a0}\u{fe0f} <b>Daily feed scorecard did NOT run</b>\n\
+                     The 3:45 PM IST Dhan-vs-Groww scorecard died before \
+                     finishing.\n\
+                     Reason: {detail}\n\
+                     What to do RIGHT NOW:\n\
+                     1. Check the app is still running.\n\
+                     2. Restart the app to re-arm tomorrow's scorecard."
                 )
             }
             // PR #4/#5 (2026-05-19): DepthSpotPriceStale + 7 Phase2*
@@ -2334,6 +2751,44 @@ impl NotificationEvent {
                     )
                 }
             }
+            Self::HolidayCalendarCoverageLow {
+                days_remaining,
+                coverage_end_display,
+            } => {
+                // Plain English per the 10 Telegram commandments: status
+                // emoji first, specific numbers, action verbs, one decision,
+                // no file paths / library names. `coverage_end_display` is
+                // produced by our own date formatter (never external text)
+                // but html_escape it anyway, consistent with every String arm.
+                let end = html_escape(coverage_end_display);
+                let when = match days_remaining {
+                    Some(d) if *d >= 0 => {
+                        format!("runs out in {d} days (last covered day: {end})")
+                    }
+                    Some(d) => {
+                        let ago = d.unsigned_abs();
+                        format!(
+                            "already ran out {ago} days ago (last covered day: {end}) — market \
+                             holidays are currently being treated as trading days"
+                        )
+                    }
+                    // Pathological empty-calendar case (config guards prevent
+                    // it in prod) — render honestly, never a fake number.
+                    None => "is EMPTY — no market holidays are configured at all, so every \
+                             weekday is being treated as a trading day"
+                        .to_string(),
+                };
+                format!(
+                    "⚠️ <b>Market holiday calendar needs updating</b>\n\
+                     The list of NSE market holidays {when}.\n\
+                     Without it, the system cannot tell holidays from trading days — it \
+                     will start up and run full sessions on closed-market days.\n\
+                     What you need to do:\n\
+                     1. Get the official NSE trading-holiday circular for the next year.\n\
+                     2. Add those dates to the trading calendar settings.\n\
+                     3. Restart the app — this reminder stops automatically."
+                )
+            }
             Self::Custom { message } => message.clone(),
         }
     }
@@ -2370,6 +2825,8 @@ impl NotificationEvent {
             Self::EndOfDayDigest { .. } => "EndOfDayDigest",
             Self::CrossVerify1mSummary { .. } => "CrossVerify1mSummary",
             Self::CrossVerify1mAborted { .. } => "CrossVerify1mAborted",
+            Self::DualFeedDailyScorecard { .. } => "DualFeedDailyScorecard",
+            Self::DualFeedScorecardAborted { .. } => "DualFeedScorecardAborted",
             // PR #4/#5 (2026-05-19): DepthSpotPriceStale + 7 Phase2*
             // name arms retired.
             // PR #6a (2026-05-19): NseBhavcopyCheck* name arms retired.
@@ -2423,6 +2880,7 @@ impl NotificationEvent {
             Self::RealtimeGuaranteeDegraded { .. } => "RealtimeGuaranteeDegraded",
             Self::RealtimeGuaranteeCritical { .. } => "RealtimeGuaranteeCritical",
             Self::GrowwSidecarRejected { .. } => "GrowwSidecarRejected",
+            Self::HolidayCalendarCoverageLow { .. } => "HolidayCalendarCoverageLow",
             Self::Custom { .. } => "Custom",
         }
     }
@@ -2641,6 +3099,12 @@ impl NotificationEvent {
                 }
             }
             Self::CrossVerify1mAborted { .. } => Severity::High,
+            // Dual-feed scorecard (2026-07-10): Info per the contract — the
+            // daily digest is a positive signal; degradation is carried
+            // LOUDLY in the body (partial/degraded footnotes) and a task
+            // death fires the High Aborted variant below instead.
+            Self::DualFeedDailyScorecard { .. } => Severity::Info,
+            Self::DualFeedScorecardAborted { .. } => Severity::High,
             Self::SelfTestPassed { .. } => Severity::Info,
             Self::SelfTestDegraded { .. } => Severity::High,
             Self::RealtimeGuaranteeHealthy { .. } => Severity::Info,
@@ -2737,6 +3201,11 @@ impl NotificationEvent {
             // A genuine Groww feed reject (auth / entitlement / error) is
             // operator-actionable — pages so the 0-ticks cause is visible.
             Self::GrowwSidecarRejected { .. } => Severity::High,
+            // W2 PR#5 (2026-07-10): the holiday-calendar coverage cliff
+            // demands operator action (paste the next NSE circular) — High
+            // pages Telegram; the watchdog's per-IST-date latch bounds it
+            // to one page per process per day (audit Rule 4).
+            Self::HolidayCalendarCoverageLow { .. } => Severity::High,
         }
     }
 
@@ -2785,6 +3254,11 @@ impl NotificationEvent {
             // that re-renders the body — Severity::Info would otherwise be
             // batched by the default routing.
             Self::CrossVerify1mSummary { .. } => DispatchPolicy::Immediate,
+            // Dual-feed scorecard (2026-07-10): the once-per-day 15:45 IST
+            // digest must arrive AT 15:45 (post-close = off-hours, so the
+            // default Info routing would coalesce it) — same rationale as
+            // CrossVerify1mSummary above.
+            Self::DualFeedDailyScorecard { .. } => DispatchPolicy::Immediate,
             // 2026-07-08 (verified incident, operator complaint "why every
             // telegram notification is very late"): PR #1439's in-market
             // digest (900s window) swept the three once-per-trading-day
@@ -6015,6 +6489,475 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // DualFeedDailyScorecard + DualFeedScorecardAborted (2026-07-10 PR-A)
+    // -----------------------------------------------------------------------
+
+    fn score_line(name: &str) -> FeedScoreLine {
+        FeedScoreLine {
+            name: name.to_string(),
+            ticks: 1_842_551,
+            exclusive_minutes: 14,
+            lag_p50_ms: -1,
+            lag_p99_ms: -1,
+            drops_market: 3,
+            blame_broker: 2,
+            blame_ours: 0,
+            blame_unclear: 1,
+            stalls: 0,
+            restarts: 0,
+            streaming_minutes: 373,
+        }
+    }
+
+    fn scorecard(dhan: FeedScoreLine, groww: FeedScoreLine) -> NotificationEvent {
+        NotificationEvent::DualFeedDailyScorecard {
+            trading_date_ist: "2026-07-10".to_string(),
+            dhan,
+            groww,
+            session_minutes: 375,
+            partial_coverage: false,
+            degraded: false,
+            early_run: false,
+            restart_partial: false,
+            dhan_feed_off: false,
+            groww_feed_off: false,
+        }
+    }
+
+    #[test]
+    fn test_dual_feed_scorecard_topic_severity_policy() {
+        let ev = scorecard(score_line("Dhan"), score_line("Groww"));
+        assert_eq!(ev.topic(), "DualFeedDailyScorecard");
+        assert_eq!(ev.severity(), Severity::Info);
+        // The once-per-day 15:45 digest must arrive AT 15:45 — post-close is
+        // off-hours, so the default Info routing would coalesce it
+        // (CrossVerify1mSummary precedent).
+        assert_eq!(ev.dispatch_policy(), DispatchPolicy::Immediate);
+    }
+
+    #[test]
+    fn test_dual_feed_scorecard_body_verdict_ladder() {
+        // Rung 1: exclusive minutes decide.
+        let mut groww = score_line("Groww");
+        groww.exclusive_minutes = 63;
+        let msg = scorecard(score_line("Dhan"), groww).to_message();
+        assert!(
+            msg.contains("\u{1f3c6} Verdict: Groww won today — 63 exclusive minutes vs 14."),
+            "rung-1 verdict wrong: {msg}"
+        );
+        // Rung 2: tied exclusive minutes → measured worst-1% delay decides
+        // (delta 2160 ms > the 1000 ms clock floor).
+        let mut d = score_line("Dhan");
+        let mut g = score_line("Groww");
+        d.lag_p99_ms = 2900;
+        g.lag_p99_ms = 740;
+        let msg = scorecard(d, g).to_message();
+        assert!(
+            msg.contains("Verdict: Groww won today — faster prices beyond the clock floor"),
+            "rung-2 verdict wrong: {msg}"
+        );
+        // Rung-2 clock-floor guard (PR-C review round 1, 2026-07-11): a
+        // sub-floor delta is Dhan's whole-second quantization, not speed —
+        // 1400 vs 700 (delta 700 ≤ 1000) must NOT declare a lag winner;
+        // identical evidence elsewhere falls through to "Even day".
+        let mut d = score_line("Dhan");
+        let mut g = score_line("Groww");
+        d.lag_p99_ms = 1400;
+        g.lag_p99_ms = 700;
+        let msg = scorecard(d, g).to_message();
+        assert!(
+            !msg.contains("faster prices"),
+            "a sub-floor p99 delta must never decide the delay rung: {msg}"
+        );
+        assert!(
+            msg.contains("\u{1f91d} Verdict: Even day."),
+            "sub-floor delta falls through the ladder: {msg}"
+        );
+        // ... while a beyond-floor delta (5000 vs 700 = 4300 > 1000)
+        // decides.
+        let mut d = score_line("Dhan");
+        let mut g = score_line("Groww");
+        d.lag_p99_ms = 5000;
+        g.lag_p99_ms = 700;
+        let msg = scorecard(d, g).to_message();
+        assert!(
+            msg.contains("Verdict: Groww won today — faster prices beyond the clock floor"),
+            "a beyond-floor delta must decide rung 2: {msg}"
+        );
+        // The floor const must stay lockstep with the persisted Dhan
+        // lag_floor_ms value (LAG_FLOOR_MS_DHAN = 1000 in
+        // tickvault-storage — core cannot import it; both pin 1000).
+        assert_eq!(VERDICT_LAG_CLOCK_FLOOR_MS, 1000);
+        // Rung 2 skip: a −1 sentinel must never decide the delay rung.
+        let mut d = score_line("Dhan");
+        let g = score_line("Groww"); // lag -1 both sides
+        d.blame_broker = 5;
+        let msg = scorecard(d, g).to_message();
+        assert!(
+            msg.contains("Verdict: Groww won today — fewer broker-caused incidents (2 vs 5)."),
+            "rung-3 verdict wrong: {msg}"
+        );
+        // Rung 3 skip (hostile review 2026-07-10): a −1 blame sentinel must
+        // never win the drops rung nor render "-1" — falls to Even day.
+        let mut d = score_line("Dhan");
+        let g = score_line("Groww");
+        d.blame_broker = -1; // drops_market still >= 0
+        let msg = scorecard(d, g).to_message();
+        assert!(
+            msg.contains("\u{1f91d} Verdict: Even day."),
+            "a -1 blame sentinel must not decide rung 3: {msg}"
+        );
+        assert!(
+            !msg.contains("(-1 vs"),
+            "the -1 sentinel must never render in a verdict: {msg}"
+        );
+        // Rung 4: identical evidence → even day.
+        let msg = scorecard(score_line("Dhan"), score_line("Groww")).to_message();
+        assert!(msg.contains("\u{1f91d} Verdict: Even day."), "{msg}");
+    }
+
+    #[test]
+    fn test_dual_feed_scorecard_body_sentinels_and_footnotes() {
+        // −1 lag renders honestly, never a fabricated 0 (audit Rule 11).
+        let msg = scorecard(score_line("Dhan"), score_line("Groww")).to_message();
+        assert!(msg.contains("not measured yet"), "{msg}");
+        // Scoreboard PR-C: the retired PR-1 "next upgrade" claim must not
+        // render — the unmeasured arm now names the honest cause (backfill
+        // re-run / too few samples).
+        assert!(
+            msg.contains("Delay could not be measured today"),
+            "unmeasured-lag footnote missing: {msg}"
+        );
+        assert!(
+            !msg.contains("Delay measurement starts with the next upgrade"),
+            "the retired PR-1 delay footnote must not render: {msg}"
+        );
+        // MEASURED lag swaps in the resolution-asymmetry footnote (Dhan
+        // whole-second floor + Groww millisecond one-step-after-the-wire)
+        // and renders both feeds at their native precision.
+        let mut d = score_line("Dhan");
+        let mut g = score_line("Groww");
+        d.lag_p50_ms = 1200;
+        d.lag_p99_ms = 2900;
+        g.lag_p50_ms = 180;
+        g.lag_p99_ms = 740;
+        let msg = scorecard(d, g).to_message();
+        assert!(
+            msg.contains("Dhan's price clock ticks in whole seconds"),
+            "lag-floor footnote missing: {msg}"
+        );
+        assert!(
+            msg.contains("Groww's delay is millisecond-precise"),
+            "Groww receipt-clock semantics footnote missing: {msg}"
+        );
+        assert!(msg.contains("1.2 s"), "≥1s delays render in seconds: {msg}");
+        assert!(
+            msg.contains("180 ms"),
+            "sub-second Groww delays render in milliseconds: {msg}"
+        );
+        // Scoreboard PR-B (2026-07-10): stalls are MEASURED — a real count
+        // renders numerically and the retired PR-1 footnote never appears
+        // (0 = measured 0 from this deploy forward; the runbook keeps the
+        // pre-ship-day caveat).
+        let mut g = score_line("Groww");
+        g.stalls = 1;
+        let msg = scorecard(score_line("Dhan"), g).to_message();
+        assert!(msg.contains("Stalls: Dhan 0 | Groww 1"), "{msg}");
+        assert!(
+            !msg.contains("Stall tracking starts with the next upgrade"),
+            "the retired PR-1 stall footnote must not render: {msg}"
+        );
+        // A `-1` still renders as the defensive "?" — without the stale
+        // footnote claim.
+        let mut d = score_line("Dhan");
+        let mut g = score_line("Groww");
+        d.stalls = -1;
+        g.stalls = -1;
+        let msg = scorecard(d, g).to_message();
+        assert!(msg.contains("Stalls: Dhan ? | Groww ?"), "{msg}");
+        assert!(
+            !msg.contains("Stall tracking starts with the next upgrade"),
+            "the retired PR-1 stall footnote must not render: {msg}"
+        );
+        // Partial + degraded days carry loud warnings — the partial wording
+        // names the HONEST PR-1 cause (a read failure while building the
+        // card), never an unmeasured "app was down" claim.
+        let ev = NotificationEvent::DualFeedDailyScorecard {
+            trading_date_ist: "2026-07-10".to_string(),
+            dhan: score_line("Dhan"),
+            groww: score_line("Groww"),
+            session_minutes: 375,
+            partial_coverage: true,
+            degraded: true,
+            early_run: false,
+            restart_partial: false,
+            dhan_feed_off: false,
+            groww_feed_off: false,
+        };
+        let msg = ev.to_message();
+        assert!(
+            msg.contains("Some of today's records could not be read"),
+            "{msg}"
+        );
+        assert!(
+            !msg.contains("the app did not watch the whole session"),
+            "the unmeasured restart claim must not render: {msg}"
+        );
+        assert!(msg.contains("treat the drop counts as a minimum"), "{msg}");
+        // An early forced run says so explicitly (the row is stamped
+        // partial; the card must not masquerade as end-of-day).
+        let ev = NotificationEvent::DualFeedDailyScorecard {
+            trading_date_ist: "2026-07-10".to_string(),
+            dhan: score_line("Dhan"),
+            groww: score_line("Groww"),
+            session_minutes: 375,
+            partial_coverage: false,
+            degraded: false,
+            early_run: true,
+            restart_partial: false,
+            dhan_feed_off: false,
+            groww_feed_off: false,
+        };
+        let msg = ev.to_message();
+        assert!(
+            msg.contains("produced early on operator request"),
+            "early-run footnote missing: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_dual_feed_scorecard_mixed_lag_state_footnote_keys_on_either_feed() {
+        // PR-C review round 1 (2026-07-11): the delay footnote branch was
+        // keyed on Dhan alone — a Dhan-off / thin-Dhan day with a measured
+        // Groww delay rendered "Typical delay: Dhan not measured yet |
+        // Groww 180 ms" directly above "Delay could not be measured today"
+        // (a Rule-11 self-contradiction on the operator surface). The gate
+        // now keys on EITHER feed.
+        let d = score_line("Dhan"); // lag -1/-1
+        let mut g = score_line("Groww");
+        g.lag_p50_ms = 180;
+        g.lag_p99_ms = 740;
+        let msg = scorecard(d, g).to_message();
+        assert!(
+            !msg.contains("Delay could not be measured today"),
+            "a measured Groww delay must not render under an unmeasured claim: {msg}"
+        );
+        assert!(
+            msg.contains("Dhan's price clock ticks in whole seconds"),
+            "the asymmetry footnote must render on a mixed-state day: {msg}"
+        );
+        assert!(msg.contains("180 ms"), "{msg}");
+        // The mirror mixed state (Dhan measured / Groww unmeasured) —
+        // reachable on a thin-Groww day — must not claim unmeasured either.
+        let mut d = score_line("Dhan");
+        d.lag_p50_ms = 1200;
+        d.lag_p99_ms = 2900;
+        let g = score_line("Groww"); // lag -1/-1
+        let msg = scorecard(d, g).to_message();
+        assert!(
+            !msg.contains("Delay could not be measured today"),
+            "a measured Dhan delay must not render under an unmeasured claim: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_dual_feed_scorecard_restart_partial_footnote() {
+        // Round-3 hostile review 2026-07-10: a restart day's card must
+        // carry the same partial caveat its persisted row does — never a
+        // silent row-vs-card honesty mismatch on exactly the day the
+        // feature exists for.
+        let ev = NotificationEvent::DualFeedDailyScorecard {
+            trading_date_ist: "2026-07-10".to_string(),
+            dhan: score_line("Dhan"),
+            groww: score_line("Groww"),
+            session_minutes: 375,
+            partial_coverage: false,
+            degraded: false,
+            early_run: false,
+            restart_partial: true,
+            dhan_feed_off: false,
+            groww_feed_off: false,
+        };
+        let msg = ev.to_message();
+        assert!(
+            msg.contains("The app restarted during the day"),
+            "restart-partial footnote missing: {msg}"
+        );
+        // Absent on a clean day.
+        let msg = scorecard(score_line("Dhan"), score_line("Groww")).to_message();
+        assert!(
+            !msg.contains("The app restarted during the day"),
+            "restart footnote must not render on a clean day: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_dual_feed_scorecard_groww_drops_sentinel_footnote() {
+        // Scoreboard PR-B (2026-07-10): the round-2 Groww drops blind spot
+        // closed with the stall rows — the footnote is RETIRED. A `-1`
+        // (defensive) still renders as "?" and must never decide a verdict
+        // rung, but no stale "not counted yet" claim renders.
+        let mut g = score_line("Groww");
+        g.drops_market = -1;
+        let msg = scorecard(score_line("Dhan"), g).to_message();
+        assert!(
+            msg.contains("Drops in market hours: Dhan 3 | Groww ?"),
+            "{msg}"
+        );
+        assert!(
+            !msg.contains("Groww connection drops are not counted yet"),
+            "the retired blind-spot footnote must not render: {msg}"
+        );
+        // The drops verdict rung must not decide against the sentinel —
+        // identical evidence elsewhere → Even day.
+        let mut d = score_line("Dhan");
+        d.blame_broker = 5;
+        let mut g = score_line("Groww");
+        g.drops_market = -1;
+        let msg = scorecard(d, g).to_message();
+        assert!(
+            msg.contains("\u{1f91d} Verdict: Even day."),
+            "a sentinel drops side must never lose/win the drops rung: {msg}"
+        );
+        // Both sides measured → still no footnote.
+        let msg = scorecard(score_line("Dhan"), score_line("Groww")).to_message();
+        assert!(
+            !msg.contains("Groww connection drops are not counted yet"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn test_dual_feed_scorecard_feed_off_no_contest() {
+        // Round-4 hostile review 2026-07-10 (the round-2 finding): a feed
+        // switched OFF for the day is a one-horse race — the verdict must
+        // say "no contest" (never crown the other feed on exclusive
+        // minutes) and the card must carry the switched-off footnote.
+        let mut g = score_line("Groww");
+        g.ticks = 0;
+        g.exclusive_minutes = 0;
+        g.streaming_minutes = 0;
+        let ev = NotificationEvent::DualFeedDailyScorecard {
+            trading_date_ist: "2026-07-10".to_string(),
+            dhan: score_line("Dhan"),
+            groww: g,
+            session_minutes: 375,
+            partial_coverage: false,
+            degraded: false,
+            early_run: false,
+            restart_partial: false,
+            dhan_feed_off: false,
+            groww_feed_off: true,
+        };
+        let msg = ev.to_message();
+        assert!(
+            msg.contains(
+                "not comparable — Groww was switched off \n             today, no contest"
+            ) || msg.contains("not comparable — Groww was switched off today, no contest"),
+            "feed-off rung-0 verdict missing: {msg}"
+        );
+        assert!(
+            !msg.contains("won today"),
+            "a switched-off feed's day must never declare a winner: {msg}"
+        );
+        assert!(
+            msg.contains("Groww was switched off today — no contest"),
+            "feed-off footnote missing: {msg}"
+        );
+        // Both feeds off (a feeds-disabled test session) — still no winner.
+        let mut d = score_line("Dhan");
+        d.ticks = 0;
+        d.exclusive_minutes = 0;
+        d.streaming_minutes = 0;
+        let mut g = score_line("Groww");
+        g.ticks = 0;
+        g.exclusive_minutes = 0;
+        g.streaming_minutes = 0;
+        let ev = NotificationEvent::DualFeedDailyScorecard {
+            trading_date_ist: "2026-07-10".to_string(),
+            dhan: d,
+            groww: g,
+            session_minutes: 375,
+            partial_coverage: false,
+            degraded: false,
+            early_run: false,
+            restart_partial: false,
+            dhan_feed_off: true,
+            groww_feed_off: true,
+        };
+        let msg = ev.to_message();
+        assert!(
+            msg.contains("both feeds were switched"),
+            "both-off verdict missing: {msg}"
+        );
+        // A clean comparable day renders NO feed-off wording.
+        let msg = scorecard(score_line("Dhan"), score_line("Groww")).to_message();
+        assert!(!msg.contains("switched off today"), "{msg}");
+    }
+
+    #[test]
+    fn test_dual_feed_scorecard_body_obeys_telegram_commandments() {
+        // 10-commandments litmus: emoji-first subject, IST 12-hour time,
+        // specific numbers, blame split, streaming check, no file paths,
+        // no library/infrastructure names.
+        let msg = scorecard(score_line("Dhan"), score_line("Groww")).to_message();
+        assert!(msg.contains("\u{1f4ca}"), "scorecard leads with 📊: {msg}");
+        assert!(msg.contains("3:45 PM IST"), "IST 12-hour time: {msg}");
+        assert!(msg.contains("Date: 2026-07-10"), "{msg}");
+        // Commandment 6: big counts carry thousands separators.
+        assert!(
+            msg.contains("Ticks today: Dhan 1,842,551 | Groww 1,842,551"),
+            "{msg}"
+        );
+        assert!(
+            msg.contains("Drops in market hours: Dhan 3 | Groww 3"),
+            "drops line missing: {msg}"
+        );
+        // The blame split is its OWN line, decoupled from the drops count
+        // (it covers ALL headline incidents — drops + stalls + restarts).
+        assert!(
+            msg.contains("Who caused today's incidents: Dhan broker 2 / ours 0 / unclear 1"),
+            "incident split line missing: {msg}"
+        );
+        assert!(msg.contains("Streaming: Dhan 373 of 375 min"), "{msg}");
+        for banned in ["data/", "QuestDB", "ILP", "DEDUP", ".rs", "SQL"] {
+            assert!(
+                !msg.contains(banned),
+                "operator text must not carry {banned:?}: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_dual_feed_scorecard_aborted_event() {
+        let ev = NotificationEvent::DualFeedScorecardAborted {
+            detail: "the task crashed: boom".to_string(),
+        };
+        assert_eq!(ev.topic(), "DualFeedScorecardAborted");
+        assert_eq!(ev.severity(), Severity::High);
+        let msg = ev.to_message();
+        assert!(msg.contains("Daily feed scorecard did NOT run"), "{msg}");
+        assert!(msg.contains("3:45 PM IST"), "{msg}");
+        assert!(msg.contains("Reason: the task crashed: boom"), "{msg}");
+        assert!(msg.contains("What to do RIGHT NOW"), "{msg}");
+    }
+
+    #[test]
+    fn test_scorecard_render_helpers() {
+        // render_ms: sentinel / sub-second / ≥1s bands.
+        assert_eq!(render_ms(-1), "not measured yet");
+        assert_eq!(render_ms(180), "180 ms");
+        assert_eq!(render_ms(2900), "2.9 s");
+        // render_count: sentinel = honest "?", never a fabricated zero;
+        // big measured counts get thousands separators (commandment 6).
+        assert_eq!(render_count(-1), "?");
+        assert_eq!(render_count(42), "42");
+        assert_eq!(render_count(9_999), "9999", "grouping starts at 10,000");
+        assert_eq!(render_count(10_000), "10,000");
+        assert_eq!(render_count(1_842_551), "1,842,551");
+    }
+
+    // -----------------------------------------------------------------------
     // Coverage for the boot-message rendering branches adjacent to the
     // 2026-07-04 Groww boot-parity change (PR #1400 coverage gate: core
     // dipped 90.16% vs the 90.2% ratcheted floor — these pin the previously
@@ -6232,6 +7175,59 @@ mod tests {
         assert!(
             !msg.contains("force_renewal") && !msg.contains("arc-swap"),
             "library/function names must never appear: {msg}"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // W2 PR#5 (2026-07-10) — HolidayCalendarCoverageLow
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn test_holiday_calendar_coverage_low_severity_is_high() {
+        let ev = NotificationEvent::HolidayCalendarCoverageLow {
+            days_remaining: Some(46),
+            coverage_end_display: "31 Dec 2026".to_string(),
+        };
+        assert_eq!(ev.severity(), Severity::High);
+        assert_eq!(ev.topic(), "HolidayCalendarCoverageLow");
+    }
+
+    #[test]
+    fn test_holiday_calendar_coverage_low_body_commandments() {
+        let msg = NotificationEvent::HolidayCalendarCoverageLow {
+            days_remaining: Some(46),
+            coverage_end_display: "31 Dec 2026".to_string(),
+        }
+        .to_message();
+        // Specific numbers + the covered-end date + action steps.
+        assert!(msg.contains("46 days"), "got: {msg}");
+        assert!(msg.contains("31 Dec 2026"), "got: {msg}");
+        assert!(msg.contains("What you need to do"), "got: {msg}");
+        assert!(msg.contains("NSE"), "got: {msg}");
+        // 10 Telegram commandments: no file paths, no library names.
+        assert!(!msg.contains(".rs"), "file paths must never appear: {msg}");
+        assert!(
+            !msg.contains(".toml"),
+            "file paths must never appear: {msg}"
+        );
+        assert!(
+            !msg.contains("HashSet") && !msg.contains("is_holiday"),
+            "library/function names must never appear: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_holiday_calendar_coverage_low_body_past_cliff() {
+        let msg = NotificationEvent::HolidayCalendarCoverageLow {
+            days_remaining: Some(-3),
+            coverage_end_display: "31 Dec 2026".to_string(),
+        }
+        .to_message();
+        // Past-cliff wording is HONEST: already ran out + consequence.
+        assert!(msg.contains("already ran out 3 days ago"), "got: {msg}");
+        assert!(
+            msg.contains("treated as trading days"),
+            "past-cliff body must state the live consequence: {msg}"
         );
     }
 }

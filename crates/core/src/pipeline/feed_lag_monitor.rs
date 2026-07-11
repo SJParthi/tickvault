@@ -76,7 +76,7 @@
 //!   silent censoring of live lag (Rule 11).
 //!
 //! Every exclusion increments `tv_dhan_lag_samples_excluded_total`
-//! (CloudWatch-exported — it is in the 26-name EMF allowlist, ~$0.30/mo —
+//! (CloudWatch-exported — it is in the 27-name EMF allowlist, ~$0.30/mo —
 //! visible, never silent).
 //!
 //! # Publish gating (audit Rules 3 + 11)
@@ -122,6 +122,74 @@
 //! CloudWatch EMF export folds label dimensions under host-only dims, so a
 //! per-feed LABEL would silently fold Dhan and Groww series together. A
 //! future Groww lag gauge gets its OWN name.
+//!
+//! # Groww lag path (scoreboard PR-C, 2026-07-11)
+//!
+//! The reserved "future Groww lag gauge gets its OWN name" slot above is now
+//! filled: [`record_groww_tick`] feeds a SECOND, independent ring
+//! ([`GROWW_LAG_RING`]) and [`run_groww_lag_publisher`] emits
+//! **`tv_groww_exchange_lag_p99_seconds`** (own unlabeled name — never the
+//! Dhan gauge, never a `feed` label; EMF would fold the series together).
+//!
+//! Groww semantics differ from Dhan on BOTH clocks — stated honestly on
+//! every surface:
+//! - **Exchange clock:** Groww `ts_ist_nanos` carries MILLISECOND precision
+//!   (vs Dhan's whole-second LTT), so Groww lag preserves sub-second values
+//!   — the lag math stays in nanos end-to-end, never floored to seconds.
+//! - **Receipt clock:** Groww "receipt" = the sidecar's per-message
+//!   `capture_ns` stamp (capture-at-receipt inside the NATS callback — one
+//!   hop DOWNSTREAM of the socket, includes sidecar dwell). Dhan receipt is
+//!   stamped at WS-frame dequeue. NOT like-for-like clocks; the daily
+//!   scorecard's `lag_floor_ms` column (1000 dhan / 1 groww) + the Telegram
+//!   footnote carry the asymmetry.
+//! - **Replay/old-line exclusion (Groww's own TWO-condition discriminator
+//!   — the sidecar-path mirror of the Dhan capture_seq/live-boundary
+//!   pair; review round 1, 2026-07-11):** a line WITHOUT a `capture_ns`
+//!   stamp (old-format / reconcile-sweep rows) has no trusted receipt
+//!   instant — EXCLUDED + counted
+//!   (`tv_groww_lag_samples_excluded_total{reason="no_capture"}`). A line
+//!   whose wake-receipt − capture ≥ 60 s is excluded ONLY when the bridge
+//!   is inside a byte-0 re-tail REPLAY WINDOW (`replay_window = true` —
+//!   fresh bridge state without a proven same-day offset resume, a
+//!   shrink/rotation reset, or an archive drain; cleared once the drain
+//!   fully catches up to the file end) — those bytes may re-play lines a
+//!   previous bridge already recorded (the 2026-07-06 false-recovery
+//!   capture-freshness class). EXCLUDED + counted
+//!   (`reason="stale_capture"`). The SAME ≥60 s dwell with the offset
+//!   PRESERVED (`replay_window = false`) is a LIVE backlog drain — the
+//!   ILP-backpressure pause / respawn-backoff wake (the class the Dhan
+//!   side fixed on 2026-07-07, round-2 finding 3) — those lines were
+//!   NEVER recorded before, so they are ADMITTED into the day histogram
+//!   with their true capture−exchange lag (+ counted,
+//!   `tv_groww_lag_backlog_admitted_total`) but SKIP the trailing-60s
+//!   ring (their capture-based window key is already outside the window,
+//!   so a ring write could only evict fresh samples). Exclusions and
+//!   backlog admissions are visible, never silent (Rule 11).
+//!   Honest residuals: a re-tail of the LAST <60 s re-records those
+//!   recent samples once more (bounded duplicate, barely moves a p99
+//!   estimate); during a re-tail window, genuinely-new ≥60 s-old lines
+//!   PAST the previously-read offset are conservatively excluded too
+//!   (indistinguishable from the replayed prefix without per-line
+//!   provenance — a bounded day-histogram under-count on exactly the
+//!   re-tail episodes, strictly narrower than the pre-fix dwell-only
+//!   exclusion).
+//!
+//! # Per-feed DAY lag histograms (scoreboard PR-C)
+//!
+//! Both `record_*_tick` admitted arms ALSO fold the sample into a per-feed
+//! [`DailyLagHistogram`] — 96 quarter-octave log2 buckets over 1 ms…1 h
+//! (fixed-size atomic arrays, zero-alloc, one relaxed `fetch_add` + one
+//! relaxed `fetch_max` per tick). The 15:45 IST scoreboard drains them into
+//! the `feed_scoreboard_daily` lag columns (p50/p99/max/samples); the IST
+//! midnight tasks reset them ([`reset_day_lag_histogram`]). Envelope,
+//! stated plainly: the histograms are PROCESS-LOCAL (a mid-day restart
+//! loses the pre-restart window — the scorecard stamps the day partial,
+//! never fabricates), day-scoped by the midnight reset, and cover every
+//! admitted sample of the IST day including the few off-session ones
+//! (§30 always-on SIDs on Dhan; any off-session sidecar lines on Groww) —
+//! dominated by the ~375-minute session volume. Bucketed percentiles are
+//! quarter-octave estimates (±~9% relative), clamped to the true recorded
+//! max.
 
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
@@ -131,6 +199,7 @@ use tickvault_common::constants::{
     MUHURAT_PERSIST_START_SECS_OF_DAY_IST, SECONDS_PER_DAY, TICK_PERSIST_END_SECS_OF_DAY_IST,
     TICK_PERSIST_START_SECS_OF_DAY_IST,
 };
+use tickvault_common::feed::Feed;
 
 /// Ring capacity — ~65 s of headroom at the measured ~500 ticks/s Dhan rate.
 /// Above ~546 ticks/s sustained the trailing-60s window is best-effort
@@ -160,7 +229,36 @@ const MIN_LAG_SAMPLES: usize = 50;
 /// Publisher cadence (seconds). Mirrors the SLO publisher's 10 s tick.
 const PUBLISH_INTERVAL_SECS: u64 = 10;
 
+/// Groww stale-capture dwell (scoreboard PR-C) — ONE of the TWO exclusion
+/// conditions (the other is the bridge's byte-0 re-tail `replay_window`
+/// flag; review round 1, 2026-07-11 — the dwell ALONE is NOT a replay
+/// discriminator: an ILP-backpressure pause or a respawn-backoff wake
+/// gives LIVE never-recorded backlog lines the same ≥60 s signature, the
+/// exact class the Dhan side fixed on 2026-07-07 with its
+/// capture_seq/live-boundary pair). A line whose wake-receipt − capture
+/// stamp is ≥ this dwelt ≥ 60 s between the sidecar's capture-at-receipt
+/// instant and the bridge reading it: inside a re-tail replay window that
+/// is the 2026-07-06 false-recovery byte-0 backlog signature (EXCLUDED);
+/// with the offset preserved it is a live backlog drain (ADMITTED to the
+/// day histogram, ring skipped — the window key is already stale).
+/// Strict `<` on the ring-admit side: exactly 60.000000000 s takes the
+/// backlog/replay arm (mirrors [`REPLAY_EXCLUDE_DWELL_NANOS`]).
+const GROWW_LAG_STALE_CAPTURE_NANOS: i64 = 60_000_000_000;
+
 const NANOS_PER_SEC: i64 = 1_000_000_000;
+const NANOS_PER_MS: i64 = 1_000_000;
+
+/// Day-histogram bucket count: 24 octaves × 4 quarter-octave sub-buckets
+/// over 1 ms … [`LAG_HIST_MAX_MS`] (values above the cap clamp into the top
+/// bucket). Quarter-octave resolution keeps the bucketed p50/p99 within
+/// ~±9% relative error — enough to separate a 180 ms Groww median from a
+/// 1.2 s Dhan one on the daily scorecard.
+const LAG_HIST_BUCKETS: usize = 96;
+
+/// Day-histogram value cap in milliseconds (1 hour). A lag above this is a
+/// data anomaly, not a distribution point — it clamps into the top bucket
+/// and still drives the true `fetch_max`.
+const LAG_HIST_MAX_MS: u64 = 3_600_000;
 
 /// Outcome of one hot-path lag observation (returned for unit-test
 /// visibility; the metrics side effects live in [`record_dhan_tick`]).
@@ -168,8 +266,9 @@ const NANOS_PER_SEC: i64 = 1_000_000_000;
 enum LagRecordOutcome {
     /// Sample admitted into the ring. `clamped` = the raw lag was negative
     /// (host clock behind Dhan's whole-second stamp / ≤2 s BOOT-03 skew)
-    /// and was clamped to 0.
-    Admitted { clamped: bool },
+    /// and was clamped to 0. `lag_ns` = the admitted (clamped) lag — the
+    /// caller folds it into the per-feed day histogram (scoreboard PR-C).
+    Admitted { clamped: bool, lag_ns: u64 },
     /// Sample excluded by the two-condition WAL-replay discriminator —
     /// the row dwelt ≥ 60 s between capture and dequeue AND its capture
     /// instant predates this process's live boundary (i.e. it was captured
@@ -177,13 +276,105 @@ enum LagRecordOutcome {
     ExcludedReplay,
 }
 
-/// Preallocated single-writer lag ring. The ONLY writer is the Dhan tick
-/// processor task (one task per process; a D2b lane restart tears the old
-/// task down before spawning a new one). The publisher task is the only
-/// reader. All slot accesses are relaxed atomics: a racing read can at
-/// worst pair a fresh receive-instant with a stale lag value for ONE
-/// sample out of ≥50 — statistically negligible for a p99, and a
-/// stale/zero-init slot fails the recency filter.
+/// Outcome of one Groww lag classification (pure — see
+/// [`classify_groww_sample`]). The exclusion reasons are Groww's OWN
+/// two-condition discriminator (module doc "Groww lag path") — the
+/// sidecar-path mirror of the Dhan capture_seq/live-boundary pair.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GrowwLagOutcome {
+    /// Sample admitted: `recv_utc_nanos` is the trailing-window key (the
+    /// capture instant converted IST→UTC), `lag_ns` the clamped
+    /// capture−exchange lag (millisecond-precision preserved — never
+    /// floored to seconds), `clamped` = raw lag was negative.
+    Admitted {
+        recv_utc_nanos: i64,
+        lag_ns: u64,
+        clamped: bool,
+    },
+    /// A LIVE backlog line (review round 1, 2026-07-11): the capture
+    /// dwelt ≥ 60 s behind the wake receipt but the bridge is NOT inside
+    /// a re-tail replay window — an ILP-backpressure pause or a
+    /// respawn-backoff wake draining never-recorded bytes from a
+    /// PRESERVED offset. Admitted to the DAY histogram with its true
+    /// capture−exchange lag; the trailing-60s ring is SKIPPED (the
+    /// capture-based window key is already outside the window — a ring
+    /// write could only evict fresh samples). Counted.
+    AdmittedBacklog { lag_ns: u64, clamped: bool },
+    /// The line carried NO `capture_ns` stamp (old-format / reconcile-sweep
+    /// row) — no trusted receipt instant exists, so no honest lag can be
+    /// computed. Excluded + counted, never guessed from the wake clock
+    /// (a per-wake stamp on a replayed line would fabricate huge lag).
+    ExcludedNoCapture,
+    /// The capture stamp is ≥ 60 s older than the wake receipt AND the
+    /// bridge is inside a byte-0 re-tail replay window — the bytes may
+    /// re-play lines a previous bridge already recorded (the 2026-07-06
+    /// false-recovery class). Excluded + counted.
+    ExcludedStaleCapture,
+}
+
+/// Pure Groww lag classifier (scoreboard PR-C). Both instants are IST
+/// nanos, exactly as the drain site already computes them — ZERO new clock
+/// reads, zero allocation, O(1).
+///
+/// `capture_ist_nanos` = the plausibility-gated per-message capture stamp
+/// (the groww_bridge `capture_stamp_ist_nanos` output — `None` for
+/// old-format / reconcile-sweep lines); `wake_receipt_ist_nanos` = the
+/// per-wake receipt clock; `exchange_ts_ist_nanos` = the tick's
+/// millisecond-precision exchange stamp (`ts_ist_nanos`);
+/// `replay_window` = the bridge's episode-level byte-0 re-tail flag (the
+/// second exclusion condition — review round 1, 2026-07-11).
+fn classify_groww_sample(
+    capture_ist_nanos: Option<i64>,
+    wake_receipt_ist_nanos: i64,
+    exchange_ts_ist_nanos: i64,
+    replay_window: bool,
+) -> GrowwLagOutcome {
+    let Some(capture_ist) = capture_ist_nanos else {
+        return GrowwLagOutcome::ExcludedNoCapture;
+    };
+    // Both operands are IST nanos — subtract directly. Groww's exchange
+    // stamp has MILLISECOND precision, so sub-second lag is preserved
+    // (never floored to whole seconds — that is the Dhan-only quantization).
+    let raw_lag = capture_ist.saturating_sub(exchange_ts_ist_nanos);
+    let clamped = raw_lag < 0;
+    let lag_ns = u64::try_from(raw_lag).unwrap_or(0);
+    // Two-condition backlog/replay discriminator (review round 1,
+    // 2026-07-11 — the dwell ALONE misclassified live post-pause backlog
+    // drains as re-tail replays, the same class the Dhan side fixed on
+    // 2026-07-07): a capture the wake reads ≥ 60 s later is either a
+    // byte-0 re-tail REPLAY (replay_window — may double-count a previous
+    // bridge's samples → EXCLUDED) or a LIVE never-recorded backlog drain
+    // from a preserved offset (→ day histogram only; the ring's
+    // trailing-60s window could never hold it anyway).
+    if wake_receipt_ist_nanos.saturating_sub(capture_ist) >= GROWW_LAG_STALE_CAPTURE_NANOS {
+        return if replay_window {
+            GrowwLagOutcome::ExcludedStaleCapture
+        } else {
+            GrowwLagOutcome::AdmittedBacklog { lag_ns, clamped }
+        };
+    }
+    GrowwLagOutcome::Admitted {
+        // The trailing-window key is UTC nanos (the ring convention shared
+        // with the Dhan path, so `snapshot_window_into` compares against
+        // the publisher's UTC "now" identically for both feeds).
+        recv_utc_nanos: capture_ist.saturating_sub(IST_UTC_OFFSET_NANOS),
+        lag_ns,
+        clamped,
+    }
+}
+
+/// Preallocated lag ring. Dhan's writer is the tick processor task (one
+/// task per process; a D2b lane restart tears the old task down before
+/// spawning a new one); Groww's is the bridge drain task — normally ONE,
+/// but the (dormant, AWS-locked-out) §34 shard-fleet lab spawns one drain
+/// loop PER SHARD, so the head bump is a relaxed `fetch_add` RMW (review
+/// round 1, 2026-07-11): concurrent writers then interleave into distinct
+/// slots as sampling noise instead of silently colliding on one slot via
+/// a load/store head pair (lost samples + head under-advance). The
+/// publisher task is the only reader. All slot accesses are relaxed
+/// atomics: a racing read can at worst pair a fresh receive-instant with
+/// a stale lag value for ONE sample out of ≥50 — statistically negligible
+/// for a p99, and a stale/zero-init slot fails the recency filter.
 struct FeedLagRing {
     /// Clamped lag samples in nanoseconds, indexed by `head % RING_SLOTS`.
     lag_ns: Box<[AtomicU64]>,
@@ -255,16 +446,26 @@ impl FeedLagRing {
         // clock, ≤2 s per BOOT-03) clamps to 0 — never a panic, never a
         // negative sample. The clamp is COUNTED by the caller.
         let lag_ns = u64::try_from(raw_lag).unwrap_or(0);
+        self.push_sample(received_at_utc_nanos, lag_ns);
+        LagRecordOutcome::Admitted { clamped, lag_ns }
+    }
 
-        let head = self.head.load(Ordering::Relaxed);
+    /// Raw ring write shared by the Dhan `observe` path and the Groww
+    /// record path (which classifies BEFORE the ring — its exclusions are
+    /// capture-based, not the Dhan replay discriminator). O(1), zero-alloc:
+    /// two relaxed stores + one relaxed `fetch_add` head claim (the RMW —
+    /// review round 1, 2026-07-11 — keeps concurrent writers on distinct
+    /// slots under the dormant §34 shard-fleet path; a reader observing a
+    /// claimed-but-unwritten slot sees the zero-init/stale recv key and the
+    /// recency filter drops it, exactly the documented benign read race).
+    fn push_sample(&self, recv_utc_nanos: i64, lag_ns: u64) {
+        let head = self.head.fetch_add(1, Ordering::Relaxed);
         // Modulo of a fixed power-of-two capacity — always in bounds.
         #[allow(clippy::cast_possible_truncation)]
         // APPROVED: head % RING_SLOTS < 32_768 always fits usize
         let idx = (head % RING_SLOTS as u64) as usize;
-        self.recv_utc_nanos[idx].store(received_at_utc_nanos, Ordering::Relaxed);
+        self.recv_utc_nanos[idx].store(recv_utc_nanos, Ordering::Relaxed);
         self.lag_ns[idx].store(lag_ns, Ordering::Relaxed);
-        self.head.store(head.wrapping_add(1), Ordering::Relaxed);
-        LagRecordOutcome::Admitted { clamped }
     }
 
     /// Snapshot every sample received within the trailing 60 s into
@@ -295,6 +496,23 @@ impl FeedLagRing {
 /// construction (only the Dhan persist sites call [`record_dhan_tick`]).
 static DHAN_LAG_RING: OnceLock<FeedLagRing> = OnceLock::new();
 
+/// Process-global ring for the Groww feed (scoreboard PR-C) — a SECOND,
+/// fully independent [`FeedLagRing`]. The writer is the Groww bridge drain
+/// task (ONE on the production single-conn path; the dormant §34
+/// shard-fleet lab spawns one per shard — safe under the `fetch_add` head
+/// claim, see [`FeedLagRing`]); the only reader is
+/// [`run_groww_lag_publisher`]. The Groww path never calls `observe` (its
+/// exclusions are capture-based and decided BEFORE the ring in
+/// [`classify_groww_sample`]), so the Dhan live-boundary discriminator is
+/// unused here — the ring is built with boundary 0.
+static GROWW_LAG_RING: OnceLock<FeedLagRing> = OnceLock::new();
+
+fn groww_ring() -> &'static FeedLagRing {
+    // Boundary 0 = the Dhan-only replay discriminator is inert (the Groww
+    // path pushes pre-classified samples via `push_sample`, never `observe`).
+    GROWW_LAG_RING.get_or_init(|| FeedLagRing::new(0))
+}
+
 fn global_ring() -> &'static FeedLagRing {
     DHAN_LAG_RING.get_or_init(|| {
         // Live-boundary stamp (cold, once per process). The tick processor
@@ -312,26 +530,258 @@ fn global_ring() -> &'static FeedLagRing {
     })
 }
 
+// ---------------------------------------------------------------------------
+// Per-feed DAY lag histograms (scoreboard PR-C)
+// ---------------------------------------------------------------------------
+
+/// Day-scoped lag histogram: 96 quarter-octave log2 buckets over
+/// 1 ms…[`LAG_HIST_MAX_MS`] + a true `fetch_max`. Fixed-size atomic arrays
+/// — the record path is one relaxed `fetch_add` + one relaxed `fetch_max`,
+/// zero-alloc, O(1). Drain/reset are cold (O(96)). Reads during a drain are
+/// relaxed snapshots: a racing tick can shift a bucketed percentile by one
+/// sample out of ≥50 — statistically negligible, documented.
+struct DailyLagHistogram {
+    buckets: [AtomicU64; LAG_HIST_BUCKETS],
+    max_ms: AtomicU64,
+}
+
+/// One feed's drained day-lag distribution (scoreboard PR-C). Values in
+/// milliseconds; percentiles are quarter-octave bucket-midpoint estimates
+/// clamped to the true recorded max.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DayLagSummary {
+    pub p50_ms: i64,
+    pub p99_ms: i64,
+    pub max_ms: i64,
+    pub samples: i64,
+}
+
+/// Quarter-octave bucket index for a millisecond lag value: 4 sub-buckets
+/// per octave keyed on the exponent + the two bits below the MSB. `v < 1`
+/// folds into bucket 0; values above [`LAG_HIST_MAX_MS`] clamp into the top
+/// occupied index. Pure bit math — no float, no table.
+fn lag_hist_bucket_index(lag_ms: u64) -> usize {
+    let v = lag_ms.clamp(1, LAG_HIST_MAX_MS);
+    // v ≥ 1 → leading_zeros ≤ 63; exp = floor(log2 v) ∈ [0, 21] after clamp.
+    let exp = usize::try_from(63 - v.leading_zeros()).unwrap_or(0);
+    // Top-2 fraction bits below the MSB: (v << 2) is safe (v ≤ 2^22 after
+    // the clamp), then shift the MSB down to bit 2.
+    let frac = usize::try_from(((v << 2) >> exp) & 3).unwrap_or(0);
+    (exp * 4 + frac).min(LAG_HIST_BUCKETS - 1)
+}
+
+/// Lower bound of bucket `idx` in QUARTER-milliseconds — the exact inverse
+/// of [`lag_hist_bucket_index`]: `(4 + frac) · 2^exp`. Quarter-ms units
+/// keep the low-exponent bounds (1, 1.25, 1.5, 1.75 ms) exact integers —
+/// plain-ms integer division would degenerate them all to 1.
+fn lag_hist_bucket_lower_quarter_ms(idx: usize) -> u64 {
+    let exp = idx / 4;
+    let frac = (idx % 4) as u64;
+    // (4 + frac) << exp — exp ≤ 24 so no overflow anywhere near u64.
+    (4 + frac) << exp
+}
+
+impl DailyLagHistogram {
+    const fn new() -> Self {
+        #[allow(clippy::declare_interior_mutable_const)]
+        // APPROVED: const-array initializer element — each array slot gets its own AtomicU64.
+        const ZERO: AtomicU64 = AtomicU64::new(0);
+        Self {
+            buckets: [ZERO; LAG_HIST_BUCKETS],
+            max_ms: AtomicU64::new(0),
+        }
+    }
+
+    /// Hot-path fold: O(1), zero-alloc (one relaxed `fetch_add` + one
+    /// relaxed `fetch_max`).
+    fn record_ns(&self, lag_ns: u64) {
+        let lag_ms = lag_ns / (NANOS_PER_MS as u64);
+        self.buckets[lag_hist_bucket_index(lag_ms)].fetch_add(1, Ordering::Relaxed);
+        self.max_ms.fetch_max(lag_ms, Ordering::Relaxed);
+    }
+
+    /// IST-midnight reset (cold, O(96)).
+    fn reset(&self) {
+        for b in &self.buckets {
+            b.store(0, Ordering::Relaxed);
+        }
+        self.max_ms.store(0, Ordering::Relaxed);
+    }
+
+    /// Drain the day distribution WITHOUT resetting (re-runs of the 15:45
+    /// task stay idempotent; the midnight task owns the reset). Returns
+    /// `None` below [`MIN_LAG_SAMPLES`] — a thin day must publish −1
+    /// sentinels, never a fabricated distribution (Rule 11).
+    ///
+    /// # Performance
+    /// **O(96) — cold path** (once per 15:45 run / forced re-run).
+    fn summary(&self) -> Option<DayLagSummary> {
+        let counts: Vec<u64> = self
+            .buckets
+            .iter()
+            .map(|b| b.load(Ordering::Relaxed))
+            .collect();
+        let total: u64 = counts.iter().sum();
+        if (usize::try_from(total).unwrap_or(usize::MAX)) < MIN_LAG_SAMPLES {
+            return None;
+        }
+        let max_ms = self.max_ms.load(Ordering::Relaxed);
+        // Rank via the same 1-based ceil convention as compute_window_p99_ns.
+        let rank = |pct_num: u64| -> u64 { (total * pct_num).div_ceil(100).max(1) };
+        let value_at = |target_rank: u64| -> u64 {
+            let mut cum: u64 = 0;
+            for (idx, c) in counts.iter().enumerate() {
+                cum = cum.saturating_add(*c);
+                if cum >= target_rank {
+                    // Bucket midpoint (quarter-ms bounds → /8 back to ms),
+                    // clamped to the true recorded max (the top occupied
+                    // bucket's midpoint can overshoot).
+                    let lower_q = lag_hist_bucket_lower_quarter_ms(idx);
+                    let upper_q = lag_hist_bucket_lower_quarter_ms(idx + 1);
+                    return ((lower_q + upper_q) / 8).min(max_ms);
+                }
+            }
+            max_ms
+        };
+        Some(DayLagSummary {
+            p50_ms: i64::try_from(value_at(rank(50))).unwrap_or(i64::MAX),
+            p99_ms: i64::try_from(value_at(rank(99))).unwrap_or(i64::MAX),
+            max_ms: i64::try_from(max_ms).unwrap_or(i64::MAX),
+            samples: i64::try_from(total).unwrap_or(i64::MAX),
+        })
+    }
+}
+
+/// Per-feed day histograms — const-initialized statics (no OnceLock needed;
+/// the arrays are fixed-size atomics).
+static DHAN_DAY_LAG_HIST: DailyLagHistogram = DailyLagHistogram::new();
+static GROWW_DAY_LAG_HIST: DailyLagHistogram = DailyLagHistogram::new();
+
+fn day_hist(feed: Feed) -> &'static DailyLagHistogram {
+    match feed {
+        Feed::Dhan => &DHAN_DAY_LAG_HIST,
+        Feed::Groww => &GROWW_DAY_LAG_HIST,
+    }
+}
+
+/// Drain one feed's day-lag distribution for the 15:45 IST scorecard
+/// (non-destructive — re-runs read the same day data; the midnight reset
+/// owns the day boundary). `None` below the 50-sample floor.
+///
+/// # Performance
+/// **O(96) — cold path**, once per scoreboard run.
+pub fn day_lag_summary(feed: Feed) -> Option<DayLagSummary> {
+    day_hist(feed).summary()
+}
+
+/// IST-midnight day-histogram reset — called from BOTH existing midnight
+/// force-seal tasks (the Dhan Task 3 in main.rs + the Groww task in
+/// groww_bridge.rs), each resetting its OWN feed. Cold, O(96).
+pub fn reset_day_lag_histogram(feed: Feed) {
+    day_hist(feed).reset();
+}
+
 /// Hot-path entry point — called from the two Dhan persist sites in
 /// `tick_processor.rs` for every LIVE, in-session, dedup-passed tick.
 ///
 /// # Performance
 /// O(1), zero-alloc after the one-time ring init (two relaxed atomic
-/// stores + one relaxed head bump; DHAT-ratcheted by
-/// `crates/core/tests/dhat_feed_lag_ring.rs`, Criterion-budgeted by
-/// `feed_lag_record_dhan_tick` in `quality/benchmark-budgets.toml`).
+/// stores + one relaxed head bump + the two relaxed day-histogram RMWs;
+/// DHAT-ratcheted by `crates/core/tests/dhat_feed_lag_ring.rs`,
+/// Criterion-budgeted by `feed_lag_record_dhan_tick` in
+/// `quality/benchmark-budgets.toml`).
 pub fn record_dhan_tick(received_at_utc_nanos: i64, capture_seq_nanos: i64, exchange_ts_secs: u32) {
     match global_ring().observe(received_at_utc_nanos, capture_seq_nanos, exchange_ts_secs) {
         LagRecordOutcome::ExcludedReplay => {
             // Rule 11: exclusions are VISIBLE, never silent censoring. The
-            // counter is CloudWatch-exported (26-name EMF allowlist in
+            // counter is CloudWatch-exported (27-name EMF allowlist in
             // cloudwatch-agent.json + user-data.sh.tftpl, ~$0.30/mo).
             metrics::counter!("tv_dhan_lag_samples_excluded_total").increment(1);
         }
-        LagRecordOutcome::Admitted { clamped: true } => {
-            metrics::counter!("tv_dhan_lag_negative_clamped_total").increment(1);
+        LagRecordOutcome::Admitted { clamped, lag_ns } => {
+            // Scoreboard PR-C: the same admitted sample also feeds the
+            // day-scoped distribution (one fetch_add + one fetch_max).
+            DHAN_DAY_LAG_HIST.record_ns(lag_ns);
+            if clamped {
+                metrics::counter!("tv_dhan_lag_negative_clamped_total").increment(1);
+            }
         }
-        LagRecordOutcome::Admitted { clamped: false } => {}
+    }
+}
+
+/// Groww hot-path entry point (scoreboard PR-C) — called from the Groww
+/// bridge drain site (`groww_bridge.rs::drain_new_data`) for every
+/// validated NDJSON tick line, with operands the drain ALREADY computes
+/// (zero new clock reads):
+///
+/// - `capture_ist_nanos`: the plausibility-gated per-message capture stamp
+///   (`capture_stamp_ist_nanos` output — `None` for old-format /
+///   reconcile-sweep lines, which are EXCLUDED + counted).
+/// - `wake_receipt_ist_nanos`: the per-wake receipt clock (drives the ≥60 s
+///   stale-capture dwell condition).
+/// - `exchange_ts_ist_nanos`: the tick's millisecond-precision exchange
+///   stamp (`ts_ist_nanos`) — sub-second lag is PRESERVED (never floored
+///   to seconds; that quantization is Dhan-only).
+/// - `replay_window`: the bridge's episode-level byte-0 re-tail flag
+///   (review round 1, 2026-07-11) — the SECOND exclusion condition; a
+///   ≥60 s dwell with this `false` is a live backlog drain (admitted to
+///   the day histogram, ring skipped), never a censored exclusion.
+///
+/// # Performance
+/// O(1), zero-alloc on the admitted steady-state arm (pure classify + the
+/// ring's two relaxed stores + head bump + the two day-histogram RMWs;
+/// DHAT-ratcheted by `crates/core/tests/dhat_feed_lag_groww.rs`,
+/// Criterion-budgeted by `feed_lag_record_groww_tick`). The exclusion +
+/// backlog arms each fire one static-label counter per line (re-tail /
+/// post-pause drains only — not the steady state), mirroring the Dhan
+/// exclusion honesty.
+pub fn record_groww_tick(
+    capture_ist_nanos: Option<i64>,
+    wake_receipt_ist_nanos: i64,
+    exchange_ts_ist_nanos: i64,
+    replay_window: bool,
+) {
+    match classify_groww_sample(
+        capture_ist_nanos,
+        wake_receipt_ist_nanos,
+        exchange_ts_ist_nanos,
+        replay_window,
+    ) {
+        GrowwLagOutcome::Admitted {
+            recv_utc_nanos,
+            lag_ns,
+            clamped,
+        } => {
+            groww_ring().push_sample(recv_utc_nanos, lag_ns);
+            GROWW_DAY_LAG_HIST.record_ns(lag_ns);
+            if clamped {
+                metrics::counter!("tv_groww_lag_negative_clamped_total").increment(1);
+            }
+        }
+        GrowwLagOutcome::AdmittedBacklog { lag_ns, clamped } => {
+            // Live backlog drain (ILP-backpressure pause / respawn-backoff
+            // wake): never-recorded lines — the day histogram keeps their
+            // true lag; the trailing-60s ring is skipped (the capture-based
+            // window key is already outside the window, so a ring write
+            // could only evict fresh samples). Counted, never silent
+            // (Rule 11). /metrics-only, like the exclusion counter.
+            GROWW_DAY_LAG_HIST.record_ns(lag_ns);
+            metrics::counter!("tv_groww_lag_backlog_admitted_total").increment(1);
+            if clamped {
+                metrics::counter!("tv_groww_lag_negative_clamped_total").increment(1);
+            }
+        }
+        GrowwLagOutcome::ExcludedNoCapture => {
+            // Rule 11: exclusions are visible, never silent. /metrics-only
+            // (₹0 — deliberately NOT in the CloudWatch EMF allowlist; the
+            // gauge is the one new EMF series).
+            metrics::counter!("tv_groww_lag_samples_excluded_total", "reason" => "no_capture")
+                .increment(1);
+        }
+        GrowwLagOutcome::ExcludedStaleCapture => {
+            metrics::counter!("tv_groww_lag_samples_excluded_total", "reason" => "stale_capture")
+                .increment(1);
+        }
     }
 }
 
@@ -432,6 +882,43 @@ pub async fn run_dhan_lag_publisher() {
     }
 }
 
+/// The supervised 10 s GROWW lag publisher loop (scoreboard PR-C) — spawned
+/// ONCE per process from the main.rs process-global boot prefix (next to
+/// the Groww bridge supervisor — it runs on EVERY boot mode) via
+/// `spawn_supervised_groww_lag_publisher`, which respawns it on death and
+/// counts respawns (`tv_groww_lag_publisher_respawn_total`).
+///
+/// Emits **`tv_groww_exchange_lag_p99_seconds`** — the Groww gauge's OWN
+/// unlabeled name (module doc: an EMF `feed` label would silently fold the
+/// Dhan and Groww series together). Same gates as the Dhan publisher:
+/// in-session (Rule 3) AND ≥ [`MIN_LAG_SAMPLES`] in the trailing 60 s
+/// window, or it publishes NOTHING (Rule 11 — a Groww-disabled or quiet
+/// session must never read as "perfect lag"; with the feed off the ring
+/// stays empty and this task is inert). Groww's millisecond exchange
+/// precision flows through: a healthy value reads sub-second (~0.1–0.5 s),
+/// unlike Dhan's ≥1 s floor.
+///
+/// The trailing-window snapshot + p99 are honestly **O(N-window),
+/// N ≤ 32,768** per tick of this COLD task — never claimed O(1).
+// TEST-EXEMPT: infinite tokio scheduler loop — every decision is a unit-tested pure fn above (compute_window_p99_ns / compute_publish_value / is_in_session_ist).
+pub async fn run_groww_lag_publisher() {
+    let mut scratch: Vec<u64> = Vec::with_capacity(RING_SLOTS);
+    let mut interval = tokio::time::interval(std::time::Duration::from_secs(PUBLISH_INTERVAL_SECS));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        interval.tick().await;
+        let now = chrono::Utc::now();
+        let now_utc_nanos = now.timestamp_nanos_opt().unwrap_or(0);
+        groww_ring().snapshot_window_into(now_utc_nanos, &mut scratch);
+        let in_session = is_in_session_ist(now.timestamp(), tickvault_common::muhurat::current());
+        if let Some(p99_secs) = compute_publish_value(in_session, &mut scratch) {
+            metrics::gauge!("tv_groww_exchange_lag_p99_seconds").set(p99_secs);
+        }
+        // Out-of-session / thin window / feed disabled: publish NOTHING
+        // (Rule 11 — mirror of the Dhan publisher's tail semantics).
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -472,7 +959,10 @@ mod tests {
         // (BOTH conditions are required to exclude).
         assert_eq!(
             ring.observe(T0_UTC_NANOS, capture + 1, T0_EXCHANGE_IST_SECS),
-            LagRecordOutcome::Admitted { clamped: false },
+            LagRecordOutcome::Admitted {
+                clamped: false,
+                lag_ns: 0
+            },
             "a row dwelling 59.999999999s must be ADMITTED"
         );
         // Exclusion must NOT write the ring: only the admitted sample lands.
@@ -494,7 +984,10 @@ mod tests {
         let exchange_secs = T0_EXCHANGE_IST_SECS - 95; // 95 s wire+dwell lag
         assert_eq!(
             ring.observe(T0_UTC_NANOS, capture, exchange_secs),
-            LagRecordOutcome::Admitted { clamped: false },
+            LagRecordOutcome::Admitted {
+                clamped: false,
+                lag_ns: 95 * NANOS_PER_SEC as u64
+            },
             "a live >60s-dwell row with a post-boundary capture must be KEPT"
         );
         let mut scratch = Vec::with_capacity(RING_SLOTS);
@@ -511,7 +1004,10 @@ mod tests {
         let capture = T0_UTC_NANOS - 10 * REPLAY_EXCLUDE_DWELL_NANOS;
         assert_eq!(
             ring.observe(T0_UTC_NANOS, capture, T0_EXCHANGE_IST_SECS),
-            LagRecordOutcome::Admitted { clamped: false },
+            LagRecordOutcome::Admitted {
+                clamped: false,
+                lag_ns: 0
+            },
             "boundary 0 must fail OPEN (admit), never censor"
         );
     }
@@ -524,7 +1020,10 @@ mod tests {
         let exchange_secs = T0_EXCHANGE_IST_SECS - 46;
         assert_eq!(
             ring.observe(T0_UTC_NANOS, T0_UTC_NANOS - LIVE_DWELL_NANOS, exchange_secs),
-            LagRecordOutcome::Admitted { clamped: false },
+            LagRecordOutcome::Admitted {
+                clamped: false,
+                lag_ns: 46 * NANOS_PER_SEC as u64
+            },
         );
         let mut scratch = Vec::with_capacity(RING_SLOTS);
         ring.snapshot_window_into(T0_UTC_NANOS, &mut scratch);
@@ -544,7 +1043,10 @@ mod tests {
                 T0_UTC_NANOS - LIVE_DWELL_NANOS,
                 exchange_ahead_secs
             ),
-            LagRecordOutcome::Admitted { clamped: true },
+            LagRecordOutcome::Admitted {
+                clamped: true,
+                lag_ns: 0
+            },
         );
         let mut scratch = Vec::with_capacity(RING_SLOTS);
         ring.snapshot_window_into(T0_UTC_NANOS, &mut scratch);
@@ -735,6 +1237,264 @@ mod tests {
             T0_UTC_NANOS,
             T0_UTC_NANOS - LIVE_DWELL_NANOS,
             T0_EXCHANGE_IST_SECS,
+        );
+    }
+
+    // ── Groww classifier (scoreboard PR-C) ────────────────────────────────
+
+    /// `T0` expressed as an IST-nanos instant (the Groww operand timebase).
+    const T0_IST_NANOS: i64 = T0_UTC_NANOS + IST_UTC_OFFSET_NANOS;
+
+    #[test]
+    fn test_classify_groww_sample_no_capture_is_excluded() {
+        // Old-format / reconcile-sweep line: no capture stamp → excluded,
+        // never guessed from the wake clock (Rule 11: counted, not silent)
+        // — in AND out of a replay window.
+        for replay_window in [true, false] {
+            assert_eq!(
+                classify_groww_sample(
+                    None,
+                    T0_IST_NANOS,
+                    T0_IST_NANOS - NANOS_PER_SEC,
+                    replay_window
+                ),
+                GrowwLagOutcome::ExcludedNoCapture
+            );
+        }
+    }
+
+    #[test]
+    fn test_classify_groww_sample_stale_capture_boundary_excludes_at_exactly_60s() {
+        // A capture 60.000000000s older than the wake receipt INSIDE a
+        // byte-0 re-tail replay window → EXCLUDED (strict `<` on the
+        // ring-admit side; BOTH conditions required — review round 1,
+        // 2026-07-11).
+        let capture = T0_IST_NANOS - GROWW_LAG_STALE_CAPTURE_NANOS;
+        assert_eq!(
+            classify_groww_sample(Some(capture), T0_IST_NANOS, capture, true),
+            GrowwLagOutcome::ExcludedStaleCapture,
+            "a re-tail capture dwelling exactly 60s behind the wake must be EXCLUDED"
+        );
+        // One nano under → admitted (even inside the replay window — a
+        // <60s re-tail duplicate is the documented bounded residual).
+        assert_eq!(
+            classify_groww_sample(Some(capture + 1), T0_IST_NANOS, capture + 1, true),
+            GrowwLagOutcome::Admitted {
+                recv_utc_nanos: capture + 1 - IST_UTC_OFFSET_NANOS,
+                lag_ns: 0,
+                clamped: false
+            },
+            "a capture dwelling 59.999999999s must be ADMITTED"
+        );
+    }
+
+    #[test]
+    fn test_classify_groww_sample_live_backlog_without_retail_is_admitted_day_only() {
+        // Review round 1 (2026-07-11): the ILP-backpressure pause /
+        // respawn-backoff wake — the bridge drains LIVE never-recorded
+        // lines from a PRESERVED offset (`replay_window = false`) whose
+        // captures dwelt >60 s behind the wake. The dwell-only rule
+        // wrongly excluded them (the same class the Dhan side fixed on
+        // 2026-07-07, round-2 finding 3); with the two-condition
+        // discriminator they are ADMITTED as backlog: the day histogram
+        // keeps their TRUE ~150 ms capture−exchange lag, the ring is
+        // skipped (their window key is already outside the trailing 60 s).
+        let exchange = T0_IST_NANOS - 300 * NANOS_PER_SEC;
+        let capture = exchange + 150 * NANOS_PER_MS; // valid live lag
+        assert_eq!(
+            classify_groww_sample(Some(capture), T0_IST_NANOS, exchange, false),
+            GrowwLagOutcome::AdmittedBacklog {
+                lag_ns: 150_000_000,
+                clamped: false
+            },
+            "a live backlog line (preserved offset) must be ADMITTED to the \
+             day histogram with its true lag, never excluded as stale_capture"
+        );
+        // The SAME line inside a replay window stays excluded (it may
+        // double-count a previous bridge's recording).
+        assert_eq!(
+            classify_groww_sample(Some(capture), T0_IST_NANOS, exchange, true),
+            GrowwLagOutcome::ExcludedStaleCapture
+        );
+    }
+
+    #[test]
+    fn test_classify_groww_sample_preserves_sub_second_millisecond_lag() {
+        // Groww exchange stamps carry MILLISECOND precision: a 150 ms lag
+        // must survive as 150_000_000 ns — never floored to whole seconds
+        // (the Dhan-only quantization).
+        let exchange = T0_IST_NANOS;
+        let capture = T0_IST_NANOS + 150 * NANOS_PER_MS;
+        assert_eq!(
+            classify_groww_sample(Some(capture), capture, exchange, false),
+            GrowwLagOutcome::Admitted {
+                recv_utc_nanos: capture - IST_UTC_OFFSET_NANOS,
+                lag_ns: 150_000_000,
+                clamped: false
+            }
+        );
+    }
+
+    #[test]
+    fn test_classify_groww_sample_negative_lag_clamped() {
+        // Exchange stamp 200 ms AHEAD of the capture instant (host-vs-Groww
+        // clock skew) — clamps to 0, flagged, never negative, never a panic.
+        let capture = T0_IST_NANOS;
+        let exchange = T0_IST_NANOS + 200 * NANOS_PER_MS;
+        assert_eq!(
+            classify_groww_sample(Some(capture), capture, exchange, false),
+            GrowwLagOutcome::Admitted {
+                recv_utc_nanos: capture - IST_UTC_OFFSET_NANOS,
+                lag_ns: 0,
+                clamped: true
+            }
+        );
+        // The backlog arm clamps too (negative raw lag on a >60s-dwelt
+        // live line) — never a panic, never a negative histogram sample.
+        assert_eq!(
+            classify_groww_sample(
+                Some(capture - 2 * GROWW_LAG_STALE_CAPTURE_NANOS),
+                capture,
+                exchange,
+                false
+            ),
+            GrowwLagOutcome::AdmittedBacklog {
+                lag_ns: 0,
+                clamped: true
+            }
+        );
+    }
+
+    #[test]
+    fn test_record_groww_tick_smoke_on_global_ring() {
+        // Exercises the pub wrapper end-to-end on the process-global Groww
+        // ring (mirror of the Dhan smoke — no global-content assertions).
+        // Excluded arms must not panic and must not write.
+        record_groww_tick(None, T0_IST_NANOS, T0_IST_NANOS, false);
+        record_groww_tick(
+            Some(T0_IST_NANOS - GROWW_LAG_STALE_CAPTURE_NANOS),
+            T0_IST_NANOS,
+            T0_IST_NANOS,
+            true,
+        );
+        // Backlog arm (preserved offset, >60s dwell) must not panic.
+        record_groww_tick(
+            Some(T0_IST_NANOS - GROWW_LAG_STALE_CAPTURE_NANOS),
+            T0_IST_NANOS,
+            T0_IST_NANOS - GROWW_LAG_STALE_CAPTURE_NANOS - 150 * NANOS_PER_MS,
+            false,
+        );
+        // Admitted path (fresh capture, 120 ms lag) must not panic either.
+        record_groww_tick(
+            Some(T0_IST_NANOS + 120 * NANOS_PER_MS),
+            T0_IST_NANOS + 120 * NANOS_PER_MS,
+            T0_IST_NANOS,
+            false,
+        );
+    }
+
+    // ── Day lag histograms (scoreboard PR-C) ──────────────────────────────
+
+    #[test]
+    fn test_lag_hist_bucket_index_and_bounds_roundtrip() {
+        // Quarter-octave bit math: every value must land in the bucket
+        // whose [lower, next-lower) range contains it, and lower bounds
+        // must be strictly monotonic.
+        assert_eq!(lag_hist_bucket_index(0), 0); // sub-ms folds into bucket 0
+        assert_eq!(lag_hist_bucket_index(1), 0);
+        assert_eq!(lag_hist_bucket_index(1000), 39); // 1000 ms ∈ [896, 1024)
+        assert_eq!(lag_hist_bucket_lower_quarter_ms(39), 896 * 4);
+        assert_eq!(lag_hist_bucket_lower_quarter_ms(40), 1024 * 4);
+        // Containment in quarter-ms units (exact at every exponent).
+        for v in [1u64, 2, 3, 7, 18, 150, 999, 1000, 4096, 300_000, 3_599_999] {
+            let idx = lag_hist_bucket_index(v);
+            assert!(
+                lag_hist_bucket_lower_quarter_ms(idx) <= 4 * v
+                    && 4 * v < lag_hist_bucket_lower_quarter_ms(idx + 1),
+                "v={v} idx={idx} quarter-range=[{}, {})",
+                lag_hist_bucket_lower_quarter_ms(idx),
+                lag_hist_bucket_lower_quarter_ms(idx + 1)
+            );
+        }
+        // Above the cap: clamps into a valid top index, never out of bounds.
+        assert!(lag_hist_bucket_index(u64::MAX) < LAG_HIST_BUCKETS);
+        // Strictly monotonic lower bounds across the whole table.
+        for i in 0..LAG_HIST_BUCKETS {
+            assert!(lag_hist_bucket_lower_quarter_ms(i) < lag_hist_bucket_lower_quarter_ms(i + 1));
+        }
+    }
+
+    #[test]
+    fn test_day_histogram_percentiles_on_known_distribution() {
+        let h = DailyLagHistogram::new();
+        // 100 samples: 99 at 150 ms + 1 at 2.9 s → p50 AND p99 (rank 99 of
+        // 100) in the 150 ms bucket, max 2900.
+        for _ in 0..99 {
+            h.record_ns(150 * NANOS_PER_MS as u64);
+        }
+        h.record_ns(2_900 * NANOS_PER_MS as u64);
+        let s = h.summary().expect("100 samples clears the 50-sample floor");
+        assert_eq!(s.samples, 100);
+        assert_eq!(s.max_ms, 2_900);
+        // 150 ms → exp 7 (128), frac (600>>7)&3 = 0 → bucket [128, 160) →
+        // midpoint 144. Quarter-octave estimate (±~9% relative, documented).
+        assert_eq!(s.p50_ms, 144);
+        assert_eq!(s.p99_ms, 144);
+        // Tail-heavy distribution: 50 at 150 ms + 50 at 2.9 s → rank(99)
+        // lands in the 2.9 s bucket, clamped to the true recorded max.
+        let h2 = DailyLagHistogram::new();
+        for _ in 0..50 {
+            h2.record_ns(150 * NANOS_PER_MS as u64);
+            h2.record_ns(2_900 * NANOS_PER_MS as u64);
+        }
+        let s2 = h2.summary().expect("100 samples");
+        assert_eq!(s2.p50_ms, 144);
+        assert!(
+            s2.p99_ms > 2_500 && s2.p99_ms <= 2_900,
+            "p99 must land in the tail bucket, clamped to the true max: {}",
+            s2.p99_ms
+        );
+    }
+
+    #[test]
+    fn test_day_histogram_thin_day_returns_none_and_reset_clears() {
+        let h = DailyLagHistogram::new();
+        for _ in 0..(MIN_LAG_SAMPLES - 1) {
+            h.record_ns(NANOS_PER_SEC as u64);
+        }
+        assert_eq!(
+            h.summary(),
+            None,
+            "below the 50-sample floor the day must publish −1 sentinels, \
+             never a fabricated distribution (Rule 11)"
+        );
+        h.record_ns(NANOS_PER_SEC as u64);
+        assert!(h.summary().is_some(), "at the floor the summary publishes");
+        h.reset();
+        assert_eq!(h.summary(), None, "the IST-midnight reset clears the day");
+        assert_eq!(h.max_ms.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn test_reset_day_lag_histogram_and_day_lag_summary_route_to_the_right_feed() {
+        // The pub wrappers must route Groww→Groww (and never clear Dhan).
+        // Uses the process-global statics with relative assertions only —
+        // sibling tests may also touch them.
+        for _ in 0..MIN_LAG_SAMPLES {
+            GROWW_DAY_LAG_HIST.record_ns(180 * NANOS_PER_MS as u64);
+        }
+        let s = day_lag_summary(Feed::Groww).expect("groww day summary");
+        assert!(s.samples >= i64::try_from(MIN_LAG_SAMPLES).unwrap_or(i64::MAX));
+        assert!(
+            s.p50_ms > 0 && s.p50_ms < 1_000,
+            "Groww ms-precision keeps a 180 ms median sub-second: {}",
+            s.p50_ms
+        );
+        reset_day_lag_histogram(Feed::Groww);
+        assert_eq!(
+            day_lag_summary(Feed::Groww),
+            None,
+            "reset must clear the Groww day histogram"
         );
     }
 }

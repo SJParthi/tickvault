@@ -1391,6 +1391,19 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
                     tick.exchange_timestamp,
                 );
 
+                // Scoreboard PR-D: per-instrument session-minute presence
+                // fold — co-located with the DHAT-proven lag observation
+                // above (same post-gate position: valid/today/window/dedup
+                // all passed). Minute index is pure integer math over the
+                // exchange timestamp already in hand — zero new clock
+                // reads; one lock-free slot lookup + one relaxed fetch_or.
+                super::feed_presence::record_presence(
+                    tickvault_common::feed::Feed::Dhan,
+                    tick.security_id,
+                    tick.exchange_segment_code,
+                    tick.exchange_timestamp,
+                );
+
                 // C2 (feed convergence): the ordered enrich → persist →
                 // aggregate-handoff per-tick consumer sequence is the ONE
                 // shared `consume_feed_tick` core (`super::feed_consumer`) —
@@ -1679,6 +1692,17 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
                     super::feed_lag_monitor::record_dhan_tick(
                         tick.received_at_nanos,
                         capture_seq,
+                        tick.exchange_timestamp,
+                    );
+
+                    // Scoreboard PR-D: presence fold for the Full-packet
+                    // arm — mirrors the Ticker/Quote site above so both
+                    // Dhan persist paths feed the SAME presence bitsets
+                    // (uniform hot-path semantics across packet types).
+                    super::feed_presence::record_presence(
+                        tickvault_common::feed::Feed::Dhan,
+                        tick.security_id,
+                        tick.exchange_segment_code,
                         tick.exchange_timestamp,
                     );
 

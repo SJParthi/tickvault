@@ -3,7 +3,7 @@
 > **What this answers:** "How do I, as a human, query ticks and candles
 > BY NAME (NIFTY, RELIANCE, …) in the QuestDB console — without
 > hand-writing the composite instrument join every time?"
-> **Authority:** `.claude/plans/active-plan-questdb-named-views.md`,
+> **Authority:** `.claude/plans/archive/2026-07-08-questdb-named-views.md`,
 > `.claude/rules/project/http-client-error-codes.md` (§1
 > `named_views_ensure` degrade row),
 > `.claude/rules/project/security-id-uniqueness.md` (I-P1-11),

@@ -2253,3 +2253,55 @@ rules:
       data-comparability signal requiring an operator verdict on which vendor
       master is stale. Both feeds stay live; both re-select from fresh masters
       at the next build, so there is nothing safe to auto-fix.
+
+  # SCOREBOARD-01 (dual-feed scoreboard PR-A, 2026-07-10) = the daily 15:45 IST
+  # Dhan-vs-Groww scoreboard aggregation degraded — a QuestDB /exec read failed
+  # (sentinels recorded, never fabricated zeros), an ILP row write was rejected,
+  # the boot-time process-death reconciliation could not read/write, or the
+  # same-day ws_event_audit drop counter shows the episode source under-counted.
+  # Best-effort forensic aggregate (AUDIT-WS-01 / GROWW-MASTER-01 class): the
+  # live feeds, tick capture and trading are NEVER affected, and the tables are
+  # DEDUP-idempotent so a TICKVAULT_SCOREBOARD_NOW re-run backfills the daily
+  # aggregation. EXCEPTION: boot-reconciled process-death rows are NOT
+  # re-creatable by a re-run (only the detecting boot can pair them; their
+  # flush retries 3x in place — an exhausted reconcile_flush is a permanent
+  # loss to annotate).
+  # Escalate (not silence): a degraded daily scoreboard usually means QuestDB
+  # was down at 15:45 (the BOOT-01/02 condition) and the operator should re-run
+  # the backfill once QuestDB is healthy — the runbook names the exact steps.
+  - name: scoreboard-01-aggregation-degraded-escalate
+    match:
+      code: SCOREBOARD-01
+    action: escalate
+    runbook_path: .claude/rules/project/dual-feed-scoreboard-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 600
+    justification: >-
+      SCOREBOARD-01 = the daily dual-feed scoreboard aggregation was degraded.
+      Best-effort cold-path forensic aggregate — feeds/capture/trading are
+      unaffected and the DEDUP-idempotent re-run backfills; escalate so the
+      operator knows the day's row is partial/degraded and can re-run the
+      backfill after fixing the underlying QuestDB condition (cross-check
+      BOOT-01/02).
+
+  # WAL-SUSPEND-01 (W2 PR#6 2026-07-10, audit follow-up row 10) = a QuestDB
+  # table's WAL apply is SUSPENDED (post disk-full episode / apply error) —
+  # ILP keeps ACKing rows while they silently stop becoming visible/applied.
+  # Escalate: the recovery action `ALTER TABLE <t> RESUME WAL` is an OPERATOR
+  # decision — auto-resuming into a still-broken disk replays the failure
+  # (is_auto_triage_safe() == false severity-independent override).
+  - name: wal-suspend-01-table-suspended-escalate
+    match:
+      code: WAL-SUSPEND-01
+    action: escalate
+    runbook_path: .claude/rules/project/wal-suspension-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 300
+    justification: >-
+      WAL-SUSPEND-01 = per-table WAL-apply suspension (silent
+      data-visibility loss; the rows are durably in the table's WAL, so
+      staleness + disk growth, not permanent loss). Operator fixes the
+      underlying cause FIRST (df -h /data, QuestDB logs), then runs
+      ALTER TABLE <table> RESUME WAL in the QuestDB console — never
+      auto-executed. Recovery confirmed by the falling-edge log +
+      tv_questdb_wal_suspended_tables returning to 0.

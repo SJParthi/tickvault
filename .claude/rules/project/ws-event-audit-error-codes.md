@@ -98,6 +98,29 @@ or reconnect behaviour.
   `groww-second-feed-scope-2026-06-19.md` §5 honest-envelope split —
   CAPTURE vs UPSTREAM, connected ≠ streaming — still holds). Same
   best-effort `try_send`; a write failure is still AUDIT-WS-01.
+- Append site (LIVE since scoreboard PR-B, 2026-07-10): the Groww sidecar
+  stall watchdog `crates/app/src/groww_sidecar_supervisor.rs`
+  (`emit_stall_ws_audit`) — ONE `WsEventKind::StallRestarted`
+  (`stall_restarted`) row per stall-watchdog kill+relaunch (classic
+  FEED-STALL-01 arm + the never-streamed arm), `feed='groww'` /
+  `ws_type='groww_bridge'`, with a FIXED machine cause slug in `source`
+  (`feed_blame::STALL_SOURCE_*` — never raw child text) and the silent
+  window in `down_secs`. Same best-effort `try_send`; a failure is still
+  AUDIT-WS-01. The 15:45 IST dual-feed scorecard aggregates these into
+  stall episodes (`dual-feed-scoreboard-error-codes.md` §2). NOT an
+  up-kind and NOT a plain disconnect — and (PR-B fix round 1, 2026-07-10
+  review HIGH) the scoreboard's process-death pairing treats it as fully
+  TRANSPARENT: it is never an "up" signal AND it never occupies the
+  last-pre-boot slot (`synthesize_process_death_episodes` /
+  `post_boot_pairing_complete` skip it when tracking the prior row — the
+  parked-wake precedent). Rationale: the stall kill+relaunch restores
+  streaming WITHOUT a fresh Connected/Reconnected row (the bridge's audit
+  latches re-arm only on feed-disable / bridge-death falling edges), so
+  letting the stall row displace the morning connect acted as a DOWN
+  marker and permanently blocked the boot-only Groww process-death
+  synthesis for the rest of the day. A genuine `disconnected` /
+  `sleep_entered` row still occupies the slot, so the skip can never
+  resurrect a genuinely-down key.
 
 ---
 
