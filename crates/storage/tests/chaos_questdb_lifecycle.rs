@@ -38,10 +38,14 @@
 //! CI_WITH_DOCKER=1 cargo test --test chaos_questdb_lifecycle -- --ignored
 //! ```
 //!
-//! The non-ignored test in this file (`questdb_disappears_and_returns`) runs
-//! on every `cargo test` and uses only in-process TCP listeners — no docker,
-//! no filesystem tricks. It is the minimum mechanical proof that the
-//! disconnected → buffered → reconnected → drained sequence actually works.
+//! The non-ignored test in this file (`questdb_disappears_ticks_buffer_not_drop`)
+//! runs on every `cargo test` and uses only in-process TCP listeners — no
+//! docker, no filesystem tricks. It is the minimum mechanical proof that the
+//! disconnected → buffered sequence actually works. The `#[ignore]`d tests
+//! (`questdb_round_trip_preserves_every_tick`,
+//! `chaos_docker_questdb_kill_and_restart`,
+//! `chaos_sigkill_mid_batch_spill_replay`) cover the reconnected → drained
+//! round-trip and the docker/SIGKILL matrix under the chaos lane.
 
 use std::io::Read as _;
 use std::net::{TcpListener, TcpStream};

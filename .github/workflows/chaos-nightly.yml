@@ -8,6 +8,13 @@
 # 3. Zero-tick-loss defense chain (with real Docker stack)
 # 4. Mock WS server end-to-end
 #
+# HONESTY NOTE: of the 11 ignored tests, several SELF-SKIP in this lane —
+# some need a running tickvault app (TV_METRICS_PORT gate), others gate on
+# env flags this job does not set by default (CI_WITH_DOCKER,
+# CI_WITH_SIGKILL, TV_SLOW_CHAOS). This lane's green therefore covers the
+# executing subset only; enabling the gated tests is a follow-up once the
+# lane has its first green baseline.
+#
 # Why weekly (not every push):
 # - Each test spins up Docker compose, runs Rust tests, tears down.
 # - Total wall-clock ~30 min. Running on every PR would consume the free-
@@ -69,6 +76,14 @@ jobs:
       TV_QUESTDB_PG_PASSWORD: chaos-ci-local-dummy
       # Some chaos tests gate on this — off by default, on via workflow_dispatch.
       TV_SLOW_CHAOS: ${{ github.event.inputs.include_slow == 'true' && '1' || '' }}
+      # ubuntu-latest is amd64; the compose file's tv-questdb defaults to
+      # `platform: linux/arm64` (prod Graviton parity), which exec-format-
+      # fails on amd64 runners — the exact failure .github/workflows/
+      # groww-e2e.yml:12-16 documents (it works around it with a bare
+      # `docker run`). questdb/questdb:9.3.5 is a multi-arch manifest list
+      # (amd64 + arm64 verified 2026-07-11), so overriding the platform is
+      # a clean native pull, not an emulation hack.
+      TV_QDB_PLATFORM: linux/amd64
 
     steps:
       - name: Checkout
