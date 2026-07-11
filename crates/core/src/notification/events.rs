@@ -1238,11 +1238,25 @@ pub struct FeedScoreLine {
     pub streaming_minutes: i64,
 }
 
+/// The Dhan exchange-clock quantization floor in milliseconds — Dhan LTT
+/// carries WHOLE IST seconds, so its measured lag has a uniform [0,1)s
+/// inflation Groww's millisecond clock does not. The verdict's delay rung
+/// declares a winner ONLY when the cross-feed p99 delta EXCEEDS this floor
+/// (PR-C review round 1, 2026-07-11): a sub-floor "Groww faster by <1s" is
+/// unprovable against Dhan's whole-second clock — the runbook caveat made
+/// mechanical. MUST stay lockstep with the persisted `lag_floor_ms` column
+/// value for Dhan (`tickvault_storage::feed_scoreboard_persistence::
+/// LAG_FLOOR_MS_DHAN = 1000`; core cannot depend on storage — both values
+/// are pinned to 1000 by their own unit tests).
+const VERDICT_LAG_CLOCK_FLOOR_MS: i64 = 1000;
+
 /// The scorecard's ONE decision (Telegram commandment 8): who won today.
 /// Tiebreak ladder — feed-off no-contest (round 4: a switched-off feed's
 /// measured zeros are a one-horse race, never a win for the other) →
-/// exclusive minutes → worst-1% delay (only when BOTH are measured; a −1
-/// sentinel never decides) → broker-blamed incidents → even day.
+/// exclusive minutes → worst-1% delay beyond the clock floor (only when
+/// BOTH are measured AND the delta exceeds [`VERDICT_LAG_CLOCK_FLOOR_MS`];
+/// a −1 sentinel never decides, and a sub-floor delta is clock asymmetry,
+/// not speed) → broker-blamed incidents → even day.
 fn scorecard_verdict(
     dhan: &FeedScoreLine,
     groww: &FeedScoreLine,
@@ -1282,15 +1296,24 @@ fn scorecard_verdict(
             w.name, w.exclusive_minutes, l.exclusive_minutes
         );
     }
-    // Rung 2: worst-1% delay (lower wins; only when both are measured).
-    if dhan.lag_p99_ms >= 0 && groww.lag_p99_ms >= 0 && dhan.lag_p99_ms != groww.lag_p99_ms {
+    // Rung 2: worst-1% delay (lower wins; only when both are measured AND
+    // the delta exceeds the Dhan whole-second clock floor — PR-C review
+    // round 1, 2026-07-11: Dhan's p99 physically cannot read below ~1s, so
+    // a raw compare would crown Groww "faster" on every healthy day from
+    // clock asymmetry, exactly the sub-floor comparison the runbook bans).
+    // A sub-floor delta falls through to the incident rung / "Even day".
+    if dhan.lag_p99_ms >= 0
+        && groww.lag_p99_ms >= 0
+        && dhan.lag_p99_ms.saturating_sub(groww.lag_p99_ms).abs() > VERDICT_LAG_CLOCK_FLOOR_MS
+    {
         let (w, l) = if dhan.lag_p99_ms < groww.lag_p99_ms {
             (dhan, groww)
         } else {
             (groww, dhan)
         };
         return format!(
-            "\u{1f3c6} Verdict: {} won today — faster prices (worst 1% delay {} vs {}).",
+            "\u{1f3c6} Verdict: {} won today — faster prices beyond the clock floor \
+             (worst 1% delay {} vs {}).",
             w.name,
             render_ms(w.lag_p99_ms),
             render_ms(l.lag_p99_ms)
@@ -2014,15 +2037,35 @@ impl NotificationEvent {
                         ));
                     }
                 }
-                if dhan.lag_p50_ms >= 0 || dhan.lag_p99_ms >= 0 {
+                // Scoreboard PR-C (2026-07-11): delay is MEASURED — the day
+                // lag histograms are live. The footnote carries the
+                // resolution asymmetry honestly: Dhan's whole-second price
+                // clock (≥1 s floor) vs Groww's millisecond clock read one
+                // step after the wire (the sidecar writes each price down
+                // the instant it arrives). An unmeasured side (backfill
+                // re-run / too few samples) renders "not measured yet" with
+                // the honest cause — the retired PR-1 "next upgrade" claim
+                // never appears. The gate keys on EITHER feed (review
+                // round 1, 2026-07-11): a Dhan-off / thin-Dhan day with a
+                // measured Groww delay must never assert "Delay could not
+                // be measured today" under a card showing real Groww
+                // milliseconds (Rule-11 self-contradiction).
+                if dhan.lag_p50_ms >= 0
+                    || dhan.lag_p99_ms >= 0
+                    || groww.lag_p50_ms >= 0
+                    || groww.lag_p99_ms >= 0
+                {
                     footnotes.push_str(
                         "\nNote: Dhan's price clock ticks in whole seconds, so its \
-                         delay can never read below about 1 second.",
+                         delay can never read below about 1 second; Groww's delay \
+                         is millisecond-precise, measured where its helper first \
+                         writes each price down (one step after the wire).",
                     );
                 } else {
                     footnotes.push_str(
-                        "\nDelay measurement starts with the next upgrade — today \
-                         reads \u{201c}not measured yet\u{201d}.",
+                        "\nDelay could not be measured today (a re-run for a past \
+                         day, or too few prices) — it reads \u{201c}not measured \
+                         yet\u{201d}.",
                     );
                 }
                 // Scoreboard PR-B (2026-07-10): the PR-1 stall + Groww-drops
@@ -6502,16 +6545,49 @@ mod tests {
             msg.contains("\u{1f3c6} Verdict: Groww won today — 63 exclusive minutes vs 14."),
             "rung-1 verdict wrong: {msg}"
         );
-        // Rung 2: tied exclusive minutes → measured worst-1% delay decides.
+        // Rung 2: tied exclusive minutes → measured worst-1% delay decides
+        // (delta 2160 ms > the 1000 ms clock floor).
         let mut d = score_line("Dhan");
         let mut g = score_line("Groww");
         d.lag_p99_ms = 2900;
         g.lag_p99_ms = 740;
         let msg = scorecard(d, g).to_message();
         assert!(
-            msg.contains("Verdict: Groww won today — faster prices"),
+            msg.contains("Verdict: Groww won today — faster prices beyond the clock floor"),
             "rung-2 verdict wrong: {msg}"
         );
+        // Rung-2 clock-floor guard (PR-C review round 1, 2026-07-11): a
+        // sub-floor delta is Dhan's whole-second quantization, not speed —
+        // 1400 vs 700 (delta 700 ≤ 1000) must NOT declare a lag winner;
+        // identical evidence elsewhere falls through to "Even day".
+        let mut d = score_line("Dhan");
+        let mut g = score_line("Groww");
+        d.lag_p99_ms = 1400;
+        g.lag_p99_ms = 700;
+        let msg = scorecard(d, g).to_message();
+        assert!(
+            !msg.contains("faster prices"),
+            "a sub-floor p99 delta must never decide the delay rung: {msg}"
+        );
+        assert!(
+            msg.contains("\u{1f91d} Verdict: Even day."),
+            "sub-floor delta falls through the ladder: {msg}"
+        );
+        // ... while a beyond-floor delta (5000 vs 700 = 4300 > 1000)
+        // decides.
+        let mut d = score_line("Dhan");
+        let mut g = score_line("Groww");
+        d.lag_p99_ms = 5000;
+        g.lag_p99_ms = 700;
+        let msg = scorecard(d, g).to_message();
+        assert!(
+            msg.contains("Verdict: Groww won today — faster prices beyond the clock floor"),
+            "a beyond-floor delta must decide rung 2: {msg}"
+        );
+        // The floor const must stay lockstep with the persisted Dhan
+        // lag_floor_ms value (LAG_FLOOR_MS_DHAN = 1000 in
+        // tickvault-storage — core cannot import it; both pin 1000).
+        assert_eq!(VERDICT_LAG_CLOCK_FLOOR_MS, 1000);
         // Rung 2 skip: a −1 sentinel must never decide the delay rung.
         let mut d = score_line("Dhan");
         let g = score_line("Groww"); // lag -1 both sides
@@ -6545,20 +6621,40 @@ mod tests {
         // −1 lag renders honestly, never a fabricated 0 (audit Rule 11).
         let msg = scorecard(score_line("Dhan"), score_line("Groww")).to_message();
         assert!(msg.contains("not measured yet"), "{msg}");
+        // Scoreboard PR-C: the retired PR-1 "next upgrade" claim must not
+        // render — the unmeasured arm now names the honest cause (backfill
+        // re-run / too few samples).
         assert!(
-            msg.contains("Delay measurement starts with the next upgrade"),
+            msg.contains("Delay could not be measured today"),
             "unmeasured-lag footnote missing: {msg}"
         );
-        // A MEASURED Dhan lag swaps in the whole-second floor footnote.
+        assert!(
+            !msg.contains("Delay measurement starts with the next upgrade"),
+            "the retired PR-1 delay footnote must not render: {msg}"
+        );
+        // MEASURED lag swaps in the resolution-asymmetry footnote (Dhan
+        // whole-second floor + Groww millisecond one-step-after-the-wire)
+        // and renders both feeds at their native precision.
         let mut d = score_line("Dhan");
+        let mut g = score_line("Groww");
         d.lag_p50_ms = 1200;
         d.lag_p99_ms = 2900;
-        let msg = scorecard(d, score_line("Groww")).to_message();
+        g.lag_p50_ms = 180;
+        g.lag_p99_ms = 740;
+        let msg = scorecard(d, g).to_message();
         assert!(
             msg.contains("Dhan's price clock ticks in whole seconds"),
             "lag-floor footnote missing: {msg}"
         );
+        assert!(
+            msg.contains("Groww's delay is millisecond-precise"),
+            "Groww receipt-clock semantics footnote missing: {msg}"
+        );
         assert!(msg.contains("1.2 s"), "≥1s delays render in seconds: {msg}");
+        assert!(
+            msg.contains("180 ms"),
+            "sub-second Groww delays render in milliseconds: {msg}"
+        );
         // Scoreboard PR-B (2026-07-10): stalls are MEASURED — a real count
         // renders numerically and the retired PR-1 footnote never appears
         // (0 = measured 0 from this deploy forward; the runbook keeps the
@@ -6626,6 +6722,41 @@ mod tests {
         assert!(
             msg.contains("produced early on operator request"),
             "early-run footnote missing: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_dual_feed_scorecard_mixed_lag_state_footnote_keys_on_either_feed() {
+        // PR-C review round 1 (2026-07-11): the delay footnote branch was
+        // keyed on Dhan alone — a Dhan-off / thin-Dhan day with a measured
+        // Groww delay rendered "Typical delay: Dhan not measured yet |
+        // Groww 180 ms" directly above "Delay could not be measured today"
+        // (a Rule-11 self-contradiction on the operator surface). The gate
+        // now keys on EITHER feed.
+        let d = score_line("Dhan"); // lag -1/-1
+        let mut g = score_line("Groww");
+        g.lag_p50_ms = 180;
+        g.lag_p99_ms = 740;
+        let msg = scorecard(d, g).to_message();
+        assert!(
+            !msg.contains("Delay could not be measured today"),
+            "a measured Groww delay must not render under an unmeasured claim: {msg}"
+        );
+        assert!(
+            msg.contains("Dhan's price clock ticks in whole seconds"),
+            "the asymmetry footnote must render on a mixed-state day: {msg}"
+        );
+        assert!(msg.contains("180 ms"), "{msg}");
+        // The mirror mixed state (Dhan measured / Groww unmeasured) —
+        // reachable on a thin-Groww day — must not claim unmeasured either.
+        let mut d = score_line("Dhan");
+        d.lag_p50_ms = 1200;
+        d.lag_p99_ms = 2900;
+        let g = score_line("Groww"); // lag -1/-1
+        let msg = scorecard(d, g).to_message();
+        assert!(
+            !msg.contains("Delay could not be measured today"),
+            "a measured Dhan delay must not render under an unmeasured claim: {msg}"
         );
     }
 

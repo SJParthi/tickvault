@@ -240,3 +240,69 @@ resource "aws_cloudwatch_dashboard" "operator" {
     ]
   })
 }
+
+# =============================================================================
+# CloudWatch Dashboard #2 — dual-feed scoreboard live trends (scoreboard PR-C)
+# =============================================================================
+# Free tier: 3 dashboards; this is dashboard #2 of 3 (slot verified free
+# 2026-07-10, dual-feed scoreboard design §6). LIVE TRENDS ONLY — coverage,
+# blame and the daily verdict live in the 3:45 PM IST Telegram scorecard +
+# the QuestDB scoreboard tables (feed_scoreboard_daily / feed_episode_audit);
+# no fake CW series is charted for QuestDB-side data.
+#
+# Row 1 (PR-C scope): Dhan vs Groww exchange-lag p99 side by side — the
+# Groww gauge is the ONE new EMF series of PR-C (+$0.30/mo, 27-name
+# allowlist). Resolution asymmetry is stated on the widget title: Dhan's
+# whole-second price clock gives it a >=1s floor; Groww is millisecond-
+# precise but measured one hop downstream (sidecar capture instant).
+# Rows 2-4 of the design (stall counters, catch-up seals, WS health, alarm
+# strip) land with scoreboard PR-4.
+# =============================================================================
+resource "aws_cloudwatch_dashboard" "scoreboard" {
+  dashboard_name = "tv-${var.environment}-scoreboard"
+
+  dashboard_body = jsonencode({
+    widgets = [
+      {
+        type   = "text"
+        x      = 0
+        y      = 0
+        width  = 24
+        height = 2
+        properties = {
+          markdown = "# tickvault — dual-feed scoreboard (${var.environment})\nLive Dhan-vs-Groww feed trends. Coverage, blame and the daily verdict live in the 3:45 PM IST Telegram scorecard + the QuestDB scoreboard tables — this page is live trends only."
+        }
+      },
+      {
+        type   = "metric"
+        x      = 0
+        y      = 2
+        width  = 12
+        height = 6
+        properties = {
+          title   = "Dhan price delay, worst 1% (seconds — whole-second clock, floor ~1s)"
+          region  = local.dash_region
+          view    = "timeSeries"
+          metrics = [[local.dash_namespace, "tv_dhan_exchange_lag_p99_seconds"]]
+          period  = 60
+          stat    = "Maximum"
+        }
+      },
+      {
+        type   = "metric"
+        x      = 12
+        y      = 2
+        width  = 12
+        height = 6
+        properties = {
+          title   = "Groww price delay, worst 1% (seconds — millisecond clock, measured at helper capture)"
+          region  = local.dash_region
+          view    = "timeSeries"
+          metrics = [[local.dash_namespace, "tv_groww_exchange_lag_p99_seconds"]]
+          period  = 60
+          stat    = "Maximum"
+        }
+      }
+    ]
+  })
+}

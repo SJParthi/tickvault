@@ -398,18 +398,23 @@ pub fn build_existing_episode_partiality_day_sql(target_ist_day: u64) -> String 
     )
 }
 
-/// The target day's EXISTING `feed_scoreboard_daily` outcomes — the
-/// DAILY-row keep-better guard input (round 4, 2026-07-10 — MEDIUM): a
-/// same-day evening RunCatchUp rerun re-measures the FRESH process-local
-/// audit-drop counter as 0 and would UPSERT outcome='complete' over the
-/// 15:45 run's 'degraded' verdict at the same deterministic ts — the drop
-/// evidence is session-local and durable NOWHERE except the overwritten
-/// row. Micros literals.
+/// The target day's EXISTING `feed_scoreboard_daily` outcomes + lag
+/// columns — the DAILY-row keep-better guard input (round 4, 2026-07-10 —
+/// MEDIUM): a same-day evening RunCatchUp rerun re-measures the FRESH
+/// process-local audit-drop counter as 0 and would UPSERT
+/// outcome='complete' over the 15:45 run's 'degraded' verdict at the same
+/// deterministic ts — the drop evidence is session-local and durable
+/// NOWHERE except the overwritten row. The lag columns joined the read in
+/// PR-C review round 1 (2026-07-11 — HIGH): the same rerun's FRESH
+/// process has EMPTY day histograms, so without them the UPSERT erased the
+/// 15:45 run's MEASURED lag distribution with −1 (see
+/// [`fold_existing_lag_keep_better`]). Micros literals.
 #[must_use]
 pub fn build_existing_daily_outcome_sql(target_ist_day: u64) -> String {
     let (start, end) = day_bounds_micros(target_ist_day);
     format!(
-        "select feed, outcome from feed_scoreboard_daily \
+        "select feed, outcome, lag_p50_ms, lag_p99_ms, lag_max_ms, \
+         lag_samples from feed_scoreboard_daily \
          where ts >= {start} and ts < {end}"
     )
 }
@@ -429,6 +434,77 @@ pub fn parse_existing_daily_outcomes(body: &str) -> Option<BTreeMap<String, Stri
         }
     }
     Some(out)
+}
+
+/// One feed's EXISTING daily-row lag columns (PR-C review round 1,
+/// 2026-07-11) — the lag keep-better guard input. `-1` = the existing row
+/// never measured lag (pre-PR-C day / thin day / backfill).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExistingDailyLag {
+    pub p50_ms: i64,
+    pub p99_ms: i64,
+    pub max_ms: i64,
+    pub samples: i64,
+}
+
+/// Parse the [`build_existing_daily_outcome_sql`] response into a
+/// feed → existing-lag map (columns 2..=5 of the same body the outcome
+/// parse reads). Pure; `None` = unparsable body; a row without the lag
+/// columns (defensive) records sentinels, never fabricated values.
+#[must_use]
+pub fn parse_existing_daily_lag(body: &str) -> Option<BTreeMap<String, ExistingDailyLag>> {
+    let rows = parse_dataset(body)?;
+    let mut out = BTreeMap::new();
+    for row in rows {
+        if let Some(cols) = row.as_array()
+            && let Some(feed) = cols.first().and_then(|c| c.as_str())
+        {
+            let col = |i: usize| -> i64 {
+                cols.get(i)
+                    .and_then(serde_json::Value::as_i64)
+                    .unwrap_or(SCOREBOARD_UNAVAILABLE_SENTINEL)
+            };
+            out.insert(
+                feed.to_string(),
+                ExistingDailyLag {
+                    p50_ms: col(2),
+                    p99_ms: col(3),
+                    max_ms: col(4),
+                    samples: col(5),
+                },
+            );
+        }
+    }
+    Some(out)
+}
+
+/// Lag keep-better rule (PR-C review round 1, 2026-07-11 — HIGH): when
+/// THIS run measured no day lag (`n.lag_samples < 0` — a fresh post-close
+/// process's empty histograms, a thin <50-sample day, or a past-day
+/// backfill) but the day's EXISTING row carries a MEASURED distribution
+/// (`existing.samples >= 0`), fold the existing measured values forward
+/// instead of erasing them with −1 at the deterministic-ts UPSERT. A run
+/// that measured real samples always writes its own values (a rerun may
+/// update). Returns `true` when the fold fired — the caller logs
+/// `stage="lag_regression"`. Pure.
+pub fn fold_existing_lag_keep_better(
+    n: &mut FeedDayNumbers,
+    existing: Option<&ExistingDailyLag>,
+) -> bool {
+    if n.lag_samples >= 0 {
+        return false; // this run measured — its distribution wins
+    }
+    let Some(e) = existing else {
+        return false; // no existing row — nothing to preserve
+    };
+    if e.samples < 0 {
+        return false; // existing row never measured — −1 stands honestly
+    }
+    n.lag_p50_ms = e.p50_ms;
+    n.lag_p99_ms = e.p99_ms;
+    n.lag_max_ms = e.max_ms;
+    n.lag_samples = e.samples;
+    true
 }
 
 /// Daily-outcome keep-better rule (round 4, 2026-07-10): `true` when
@@ -2088,6 +2164,18 @@ pub struct FeedDayNumbers {
     pub streaming_minutes: i64,
     pub unique_win_minutes: i64,
     pub both_minutes: i64,
+    /// Day exchange→receipt lag distribution (scoreboard PR-C) — drained
+    /// from the in-memory per-feed day histograms on SAME-DAY runs only.
+    /// `-1` = not measured (past-day backfill — the histograms are
+    /// process-local and day-scoped, so a backfill can never read them; a
+    /// thin day below the 50-sample floor also stays `-1`, never a
+    /// fabricated distribution). A rerun that measured nothing folds the
+    /// day's EXISTING measured row forward instead of writing `-1` over it
+    /// (the step-6c lag keep-better — PR-C review round 1, 2026-07-11).
+    pub lag_p50_ms: i64,
+    pub lag_p99_ms: i64,
+    pub lag_max_ms: i64,
+    pub lag_samples: i64,
     pub disconnects_market: i64,
     pub disconnects_off_hours: i64,
     pub reconnects: i64,
@@ -2107,6 +2195,10 @@ impl FeedDayNumbers {
             streaming_minutes: s,
             unique_win_minutes: s,
             both_minutes: s,
+            lag_p50_ms: s,
+            lag_p99_ms: s,
+            lag_max_ms: s,
+            lag_samples: s,
             disconnects_market: s,
             disconnects_off_hours: s,
             reconnects: s,
@@ -2115,6 +2207,23 @@ impl FeedDayNumbers {
             blame_ours: s,
             blame_indeterminate: s,
             restarts: s,
+        }
+    }
+
+    /// Fold one feed's drained day-lag summary in (scoreboard PR-C). `None`
+    /// (backfill day / thin histogram / fold disabled) keeps the `-1`
+    /// sentinels — the card renders "not measured yet", never a fabricated
+    /// zero (Rule 11). Pure — the process-global histogram read stays in
+    /// the thin caller.
+    fn apply_day_lag(
+        &mut self,
+        summary: Option<tickvault_core::pipeline::feed_lag_monitor::DayLagSummary>,
+    ) {
+        if let Some(s) = summary {
+            self.lag_p50_ms = s.p50_ms;
+            self.lag_p99_ms = s.p99_ms;
+            self.lag_max_ms = s.max_ms;
+            self.lag_samples = s.samples;
         }
     }
 }
@@ -2580,13 +2689,16 @@ pub async fn run_feed_scoreboard(
         feed_numbers.insert(label, n);
     }
 
-    // 5a. The day's EXISTING daily-row outcomes — read ONCE, shared by the
-    //     feed_off keep-better (5b) and the degraded keep-better (7b). A
-    //     failed read turns BOTH guards off for this run, loudly.
-    let existing_daily: Option<BTreeMap<String, String>> = {
+    // 5a. The day's EXISTING daily-row outcomes + lag columns — read ONCE,
+    //     shared by the feed_off keep-better (5b), the lag keep-better
+    //     (6c), and the degraded keep-better (7b). A failed read turns ALL
+    //     the guards off for this run, loudly.
+    let existing_daily_body = {
         let daily_sql = build_existing_daily_outcome_sql(target_ist_day);
-        match exec_query(&client, questdb, &daily_sql)
-            .await
+        exec_query(&client, questdb, &daily_sql).await
+    };
+    let existing_daily: Option<BTreeMap<String, String>> = {
+        match existing_daily_body
             .as_deref()
             .map(parse_existing_daily_outcomes)
         {
@@ -2597,12 +2709,18 @@ pub async fn run_feed_scoreboard(
                     stage = "outcome_keep_better_read",
                     "SCOREBOARD-01: existing daily-outcome read failed/unparsable \
                      — the daily keep-better guards are OFF this run; a rerun may \
-                     erase a 'degraded' or 'feed_off' verdict"
+                     erase a 'degraded'/'feed_off' verdict or a measured lag \
+                     distribution"
                 );
                 None
             }
         }
     };
+    // The lag columns of the SAME body (PR-C review round 1, 2026-07-11) —
+    // the lag keep-better (6c) input; a failed read already errored above.
+    let existing_lag: Option<BTreeMap<String, ExistingDailyLag>> = existing_daily_body
+        .as_deref()
+        .and_then(parse_existing_daily_lag);
 
     // 5b. Feed-off-day detection (round 4; redesigned round 5; hardened
     //     round 6, 2026-07-10): a feed with a measured zero tick count,
@@ -2699,6 +2817,60 @@ pub async fn run_feed_scoreboard(
                 .map_or(SCOREBOARD_UNAVAILABLE_SENTINEL, |m| {
                     m.get(*label).copied().unwrap_or(0)
                 });
+        }
+    }
+
+    // 6b. Day lag distributions (scoreboard PR-C): drain the in-memory
+    //     per-feed day histograms (feed_lag_monitor — fed by the same
+    //     record_* calls that drive the live lag gauges; replay/re-tail
+    //     excluded at record time, NEVER a SQL approximation over the
+    //     replay-contaminated `received_at` column). SCOPED to same-day
+    //     runs ONLY: the histograms are process-local + day-scoped (IST
+    //     midnight reset), so a past-day backfill can never read them — its
+    //     lag columns stay -1 sentinels, honestly. A mid-day restart leaves
+    //     only the post-restart window in the histogram; the restart-day
+    //     partial floor (step 7c) already stamps such a day partial and the
+    //     card carries the restart footnote — measured-but-partial, never
+    //     fabricated (Rule 11).
+    if is_same_day_run {
+        for feed in tickvault_common::feed::Feed::ALL {
+            if let Some(n) = feed_numbers.get_mut(feed.as_str()) {
+                n.apply_day_lag(tickvault_core::pipeline::feed_lag_monitor::day_lag_summary(
+                    *feed,
+                ));
+            }
+        }
+    }
+
+    // 6c. LAG keep-better (PR-C review round 1, 2026-07-11 — HIGH): a
+    //     same-day evening RunCatchUp rerun fires precisely on
+    //     partial/degraded days (the latch skips only complete/feed_off
+    //     days), and a post-close deploy restart runs it in a FRESH
+    //     process whose day histograms are EMPTY — day_lag_summary returns
+    //     None, the sentinels stand, and step 8's deterministic-ts UPSERT
+    //     would erase the 15:45 run's MEASURED lag distribution with −1 on
+    //     exactly the incident days where it matters most (a past-day
+    //     backfill over a measured row is the same erasure). Mirror of the
+    //     outcome/episode keep-better guards: an unmeasured rerun folds the
+    //     existing measured lag columns forward; a rerun that measured
+    //     real samples still updates.
+    for feed in tickvault_common::feed::Feed::ALL {
+        let label = feed.as_str();
+        if let Some(n) = feed_numbers.get_mut(label) {
+            let existing = existing_lag.as_ref().and_then(|m| m.get(label));
+            if fold_existing_lag_keep_better(n, existing) {
+                error!(
+                    code = ErrorCode::Scoreboard01AggregationDegraded.code_str(),
+                    stage = "lag_regression",
+                    feed = label,
+                    kept_samples = n.lag_samples,
+                    "SCOREBOARD-01: this rerun measured no day lag (fresh \
+                     process / thin histogram / backfill) but the day's \
+                     existing row carries a measured lag distribution — \
+                     keeping the existing measured lag columns instead of \
+                     overwriting them with -1"
+                );
+            }
         }
     }
 
@@ -2824,10 +2996,16 @@ pub async fn run_feed_scoreboard(
             covered_instrument_minutes: SCOREBOARD_UNAVAILABLE_SENTINEL,
             unique_win_minutes: n.unique_win_minutes,
             both_minutes: n.both_minutes,
-            lag_p50_ms: SCOREBOARD_UNAVAILABLE_SENTINEL,
-            lag_p99_ms: SCOREBOARD_UNAVAILABLE_SENTINEL,
-            lag_max_ms: SCOREBOARD_UNAVAILABLE_SENTINEL,
-            lag_samples: SCOREBOARD_UNAVAILABLE_SENTINEL,
+            // Scoreboard PR-C: measured from the in-memory day histograms
+            // on same-day runs (step 6b); an unmeasured rerun folds the
+            // existing row's measured values forward (step 6c lag
+            // keep-better — review round 1, 2026-07-11); -1 sentinels only
+            // when NOTHING ever measured the day — never fabricated,
+            // never erasing a measured distribution.
+            lag_p50_ms: n.lag_p50_ms,
+            lag_p99_ms: n.lag_p99_ms,
+            lag_max_ms: n.lag_max_ms,
+            lag_samples: n.lag_samples,
             lag_floor_ms: match *feed {
                 tickvault_common::feed::Feed::Dhan => LAG_FLOOR_MS_DHAN,
                 tickvault_common::feed::Feed::Groww => LAG_FLOOR_MS_GROWW,
@@ -4570,6 +4748,14 @@ mod tests {
         assert!(sql.contains("from feed_scoreboard_daily"), "{sql}");
         assert!(sql.contains(&format!("ts >= {start}")), "{sql}");
         assert!(sql.contains(&format!("ts < {end}")), "{sql}");
+        // PR-C review round 1 (2026-07-11): the lag keep-better reads the
+        // SAME body — the lag columns must ride the outcome query.
+        for col in ["lag_p50_ms", "lag_p99_ms", "lag_max_ms", "lag_samples"] {
+            assert!(
+                sql.contains(col),
+                "lag keep-better column {col} missing: {sql}"
+            );
+        }
         assert!(
             !sql.contains(&((DAY as i64) * 86_400 * NANOS_PER_SEC).to_string()),
             "nanos literal banned: {sql}"
@@ -4609,6 +4795,97 @@ mod tests {
             ScoreboardOutcome::Complete
         ));
         assert_eq!(parse_existing_daily_outcomes("not json"), None);
+    }
+
+    #[test]
+    fn test_parse_existing_daily_lag_reads_columns_2_through_5() {
+        // PR-C review round 1 (2026-07-11): the lag keep-better parses the
+        // SAME extended body the outcome parse reads (cols 0..=1 outcome,
+        // 2..=5 lag) — a 6-column row yields both maps; a defensive short
+        // row records sentinels, never fabricated values.
+        let body = r#"{"dataset":[["dhan","partial",1200,2900,5400,48213],["groww","partial",-1,-1,-1,-1]]}"#;
+        let lag = parse_existing_daily_lag(body).expect("parse");
+        assert_eq!(
+            lag.get("dhan"),
+            Some(&ExistingDailyLag {
+                p50_ms: 1200,
+                p99_ms: 2900,
+                max_ms: 5400,
+                samples: 48213
+            })
+        );
+        assert_eq!(
+            lag.get("groww"),
+            Some(&ExistingDailyLag {
+                p50_ms: -1,
+                p99_ms: -1,
+                max_ms: -1,
+                samples: -1
+            })
+        );
+        // The outcome parse still reads the same body (shared read).
+        let outcomes = parse_existing_daily_outcomes(body).expect("parse");
+        assert_eq!(outcomes.get("dhan").map(String::as_str), Some("partial"));
+        // Defensive: a 2-column legacy row records lag sentinels.
+        let short = r#"{"dataset":[["dhan","complete"]]}"#;
+        let lag = parse_existing_daily_lag(short).expect("parse");
+        assert_eq!(lag.get("dhan").map(|l| l.samples), Some(-1));
+        assert_eq!(parse_existing_daily_lag("not json"), None);
+    }
+
+    #[test]
+    fn test_fold_existing_lag_keep_better_preserves_measured_on_unmeasured_rerun() {
+        // PR-C review round 1 (2026-07-11 — HIGH): a post-close same-day
+        // RunCatchUp rerun in a FRESH process (empty day histograms →
+        // day_lag_summary None → sentinels) must fold the 15:45 run's
+        // MEASURED lag columns forward instead of erasing them with −1.
+        let existing = ExistingDailyLag {
+            p50_ms: 1200,
+            p99_ms: 2900,
+            max_ms: 5400,
+            samples: 48213,
+        };
+        let mut n = FeedDayNumbers::unavailable();
+        assert!(
+            fold_existing_lag_keep_better(&mut n, Some(&existing)),
+            "an unmeasured rerun over a measured row must fire the keep-better"
+        );
+        assert_eq!(
+            (n.lag_p50_ms, n.lag_p99_ms, n.lag_max_ms, n.lag_samples),
+            (1200, 2900, 5400, 48213),
+            "the measured distribution must be folded forward verbatim"
+        );
+        // A rerun that measured REAL samples still updates (its own
+        // distribution wins — a rerun may improve a partial day).
+        let mut n = FeedDayNumbers::unavailable();
+        n.lag_p50_ms = 900;
+        n.lag_p99_ms = 2100;
+        n.lag_max_ms = 4000;
+        n.lag_samples = 61_000;
+        assert!(
+            !fold_existing_lag_keep_better(&mut n, Some(&existing)),
+            "a measured rerun must keep its own distribution"
+        );
+        assert_eq!(
+            (n.lag_p50_ms, n.lag_p99_ms, n.lag_max_ms, n.lag_samples),
+            (900, 2100, 4000, 61_000)
+        );
+        // No existing row / an existing row that never measured: the −1
+        // sentinels stand honestly and nothing logs.
+        let mut n = FeedDayNumbers::unavailable();
+        assert!(!fold_existing_lag_keep_better(&mut n, None));
+        assert_eq!(n.lag_samples, SCOREBOARD_UNAVAILABLE_SENTINEL);
+        let never_measured = ExistingDailyLag {
+            p50_ms: -1,
+            p99_ms: -1,
+            max_ms: -1,
+            samples: -1,
+        };
+        assert!(!fold_existing_lag_keep_better(
+            &mut n,
+            Some(&never_measured)
+        ));
+        assert_eq!(n.lag_samples, SCOREBOARD_UNAVAILABLE_SENTINEL);
     }
 
     #[test]

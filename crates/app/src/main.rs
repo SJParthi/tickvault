@@ -692,6 +692,14 @@ async fn main() -> Result<()> {
             Some(spawn_ws_event_audit_consumer(config.questdb.clone())),
         );
     }
+    // ── Groww exchange-lag publisher — PROCESS-GLOBAL boot prefix ──
+    // Scoreboard PR-C: publishes `tv_groww_exchange_lag_p99_seconds` (the
+    // Groww gauge's OWN name — never the Dhan gauge). Spawned here, next to
+    // the Groww bridge supervisor, so it runs on EVERY boot mode (fast
+    // crash-recovery included) — the single-site mirror of the Dhan
+    // publisher's dual-arm wiring. Inert while Groww is disabled (empty
+    // ring → the ≥50-sample gate publishes nothing).
+    let _groww_lag_publisher_supervisor = spawn_supervised_groww_lag_publisher();
     // ── index_constituency ts-pin migration — PROCESS-GLOBAL boot prefix ──
     // F13/F14 hardening (2026-07-05): the one-shot, marker-gated TRUNCATE
     // migration runs here — BEFORE the Groww activation watcher and regardless
@@ -5356,6 +5364,14 @@ fn spawn_engine_b_aggregator(
             // Sleep until the next IST midnight (bounded helper, ≤ 24h).
             let sleep_secs = tickvault_common::market_hours::secs_until_next_ist_midnight().max(1);
             tokio::time::sleep(std::time::Duration::from_secs(sleep_secs)).await;
+
+            // Scoreboard PR-C: reset the Dhan DAY lag histogram at every
+            // IST midnight — BEFORE the trading-day gate below (a
+            // Saturday-midnight `continue` must still clear Friday's
+            // distribution before Monday's scorecard row). Cold, O(96).
+            tickvault_core::pipeline::feed_lag_monitor::reset_day_lag_histogram(
+                tickvault_common::feed::Feed::Dhan,
+            );
 
             // Only force-seal on trading days — a non-trading-day
             // midnight has no open buckets worth flushing. `is_trading_day_today`
@@ -12268,6 +12284,52 @@ fn spawn_supervised_feed_lag_publisher() -> tokio::task::JoinHandle<()> {
     })
 }
 
+/// Scoreboard PR-C — supervise the GROWW exchange-lag p99 publisher
+/// (`tickvault_core::pipeline::feed_lag_monitor::run_groww_lag_publisher`,
+/// gauge `tv_groww_exchange_lag_p99_seconds` — its OWN name, never the Dhan
+/// gauge; an EMF `feed` label would fold the series together).
+///
+/// Spawned ONCE from the process-global boot prefix (next to the Groww
+/// bridge supervisor — it runs on EVERY boot mode, so no fast/slow
+/// dual-site + once-guard is needed; the single call site is pinned by
+/// `test_groww_lag_publisher_supervisor_is_wired_into_main` in
+/// secret_manager.rs). With the Groww feed disabled the ring stays empty,
+/// the ≥50-sample gate publishes nothing, and the task is inert.
+///
+/// Same SLO-03 / WS-GAP-05 supervisor semantics as the Dhan one: on every
+/// publisher death it logs `error!`, increments its OWN respawn counter
+/// `tv_groww_lag_publisher_respawn_total{reason}`, backs off
+/// [`FEED_LAG_PUBLISHER_RESPAWN_BACKOFF_SECS`], and respawns — the gauge
+/// stream can never vanish silently. No dedicated `ErrorCode` (same
+/// least-new-surface decision as the Dhan supervisor above).
+// TEST-EXEMPT: cold-path supervisor spawn wrapper — exit classification is
+// the unit-tested `disk_health_watcher::classify_join_exit`; the boot wiring
+// is pinned by `test_groww_lag_publisher_supervisor_is_wired_into_main`.
+// O(1) EXEMPT: cold-path supervisor — one task per session, fires only on publisher death.
+#[must_use]
+fn spawn_supervised_groww_lag_publisher() -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            let handle =
+                tokio::spawn(tickvault_core::pipeline::feed_lag_monitor::run_groww_lag_publisher());
+            let join_result = handle.await;
+            let reason = tickvault_storage::disk_health_watcher::classify_join_exit(&join_result);
+            error!(
+                reason,
+                backoff_secs = FEED_LAG_PUBLISHER_RESPAWN_BACKOFF_SECS,
+                "groww exchange-lag publisher task exited — respawning so the \
+                 tv_groww_exchange_lag_p99_seconds stream cannot vanish silently"
+            );
+            metrics::counter!("tv_groww_lag_publisher_respawn_total", "reason" => reason)
+                .increment(1);
+            tokio::time::sleep(std::time::Duration::from_secs(
+                FEED_LAG_PUBLISHER_RESPAWN_BACKOFF_SECS,
+            ))
+            .await;
+        }
+    })
+}
+
 // All pure helper function tests are in boot_helpers.rs (lib.rs target).
 // Only integration-level tests that require main.rs-specific code remain here.
 #[cfg(test)]
@@ -15080,11 +15142,13 @@ fn spawn_feed_scoreboard_tasks(
                 name: name.to_string(),
                 ticks: n.ticks,
                 exclusive_minutes: n.unique_win_minutes,
-                // PR-3 NOTE: the lag day-histograms rewire THIS CONVERTER
-                // (read them from the summary), not just the row writer —
-                // the -1 sentinels here are what render "not measured yet".
-                lag_p50_ms: -1,
-                lag_p99_ms: -1,
+                // Scoreboard PR-C (2026-07-11): the day lag histograms are
+                // LIVE — measured exchange→receipt distributions flow from
+                // the summary (drained same-day from the in-memory per-feed
+                // histograms; -1 survives only on backfill/thin days and
+                // still renders "not measured yet", never a fabricated 0).
+                lag_p50_ms: n.lag_p50_ms,
+                lag_p99_ms: n.lag_p99_ms,
                 drops_market: n.disconnects_market,
                 blame_broker: n.blame_broker,
                 blame_ours: n.blame_ours,

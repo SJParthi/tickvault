@@ -69,10 +69,11 @@
 # user-data.sh.tftpl), so a healthy app publishes a datapoint every period
 # through 09:10–09:20 (no false-page in the extension) and a dead one goes
 # missing → 2×60s → page within ~2-3 min. Widening the MARKET-HOURS window to
-# 09:10 instead was REJECTED: its ALARM_NAMES list gates 11 alarms (count
-# 9 → 11 on 2026-07-10 with the ws-pool pair) — 9 whose signals are
-# deliberately invalid pre-09:20 (SLO tick-freshness pre-open pin, the
-# 9-of-15 degraded lookback, first-score warmup), plus the 2 ws-pool pagers
+# 09:10 instead was REJECTED: its ALARM_NAMES list gates 12 alarms (count
+# 9 → 11 on 2026-07-10 with the ws-pool pair, → 12 on 2026-07-11 with
+# groww-exchange-lag-p99-high) — 10 whose signals are deliberately invalid
+# pre-09:20 (SLO tick-freshness pre-open pin, the 9-of-15 degraded
+# lookback, first-score warmup, lag-window warmup), plus the 2 ws-pool pagers
 # (ws-pool-all-dead + ws-failed-connections) whose gauges ARE valid from the
 # 09:00 IST pool connect but are gated for the pre-09:00 Dhan connect-
 # deferral false-page class (with the 09:00–09:20 handover residual accepted

@@ -1632,6 +1632,56 @@ mod tests {
         );
     }
 
+    /// Scoreboard PR-C (2026-07-11): the GROWW exchange-lag p99 publisher
+    /// (`tv_groww_exchange_lag_p99_seconds`) MUST be spawned via its
+    /// supervisor from the PROCESS-GLOBAL boot prefix — one call site that
+    /// runs on EVERY boot mode (unlike the Dhan publisher's fast/slow
+    /// dual-arm wiring, the Groww bridge block executes before the boot
+    /// fork). A bare `tokio::spawn` or a dropped spawn regresses the SLO-03
+    /// silent-task-death class: the gauge stream stops with no error!, no
+    /// counter, no respawn, and the groww lag alarm false-OKs on missing
+    /// data (`notBreaching`).
+    #[test]
+    fn test_groww_lag_publisher_supervisor_is_wired_into_main() {
+        let main_rs = std::fs::read_to_string("../app/src/main.rs")
+            .or_else(|_| std::fs::read_to_string("crates/app/src/main.rs"))
+            .expect("main.rs must be readable");
+        let supervisor_call_sites = main_rs
+            .lines()
+            .filter(|l| {
+                let t = l.trim_start();
+                !t.starts_with("//")
+                    && !t.starts_with("///")
+                    && !t.contains("fn spawn_supervised_groww_lag_publisher")
+                    && t.contains("spawn_supervised_groww_lag_publisher(")
+            })
+            .count();
+        assert_eq!(
+            supervisor_call_sites, 1,
+            "spawn_supervised_groww_lag_publisher must have EXACTLY 1 call \
+             site in main.rs (the process-global boot prefix, next to the \
+             Groww bridge supervisor); found {supervisor_call_sites}. \
+             Removing it silently darkens the groww lag gauge for every \
+             session (notBreaching on missing data)."
+        );
+        // The supervisor must be the ONLY spawn path for the publisher loop.
+        let inner_call_sites = main_rs
+            .lines()
+            .filter(|l| {
+                let t = l.trim_start();
+                !t.starts_with("//")
+                    && !t.starts_with("///")
+                    && t.contains("run_groww_lag_publisher(")
+            })
+            .count();
+        assert_eq!(
+            inner_call_sites, 1,
+            "run_groww_lag_publisher must be called ONLY from the groww \
+             feed-lag supervisor loop (found {inner_call_sites} non-comment \
+             mentions; expected exactly 1: the supervisor call site)"
+        );
+    }
+
     /// Session-B fix #1 (operator go 2026-07-04): the Groww scale-FLEET
     /// spawn in `main.rs` MUST be gated by the fleet dual-instance SSM lock
     /// (`acquire_groww_scale_fleet_lock`). A scale-test boot runs

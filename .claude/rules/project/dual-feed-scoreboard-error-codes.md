@@ -142,9 +142,26 @@ the month restart count under-counts — annotate the month summary.
 **Honest envelope:** the scoreboard is evidence, not proof. Lone mid-stream
 resets are honestly `indeterminate` (the `disconnect_cause.rs` envelope);
 blame upgrades to broker only on corroboration (Dhan codes, WS-GAP-09
-overlap ±120s, stall-watchdog semantics). Lag columns are −1 sentinels until
-PR-3 lands the day histograms (Dhan additionally carries a ≥1s whole-second
-quantization floor — `lag_floor_ms` column). Per-instrument unique-wins land
+overlap ±120s, stall-watchdog semantics). **Lag columns are LIVE since PR-C (2026-07-11):** the per-feed
+in-memory DAY histograms (fed by the same `record_*_tick` calls that drive
+the live lag gauges — `tv_dhan_exchange_lag_p99_seconds` +
+`tv_groww_exchange_lag_p99_seconds`; replay/re-tail excluded at record time,
+never a SQL approximation over the replay-contaminated `received_at` column)
+drain into `lag_p50_ms`/`lag_p99_ms`/`lag_max_ms`/`lag_samples` on same-day
+runs; a rerun/backfill that measured nothing folds the day's EXISTING
+measured row forward (the step-6c lag keep-better, review round 1
+2026-07-11 — `stage="lag_regression"` logs the suppression; a fresh
+post-close catch-up process's empty histograms can no longer erase the
+15:45 run's measured distribution with −1), so −1 survives only on days
+NOTHING ever measured: pre-ship days, never-measured backfilled days, and
+thin <50-sample days. The card's verdict delay rung declares a winner only
+when the cross-feed p99 delta exceeds the 1000 ms Dhan clock floor
+("faster prices beyond the clock floor" — sub-floor deltas are clock
+asymmetry, not speed, and fall through). Resolution
+asymmetry stays stated on every surface: Dhan carries a ≥1s whole-second
+quantization floor while Groww is millisecond-precise but measured at the
+sidecar capture instant one hop downstream of the socket (`lag_floor_ms`
+column: 1000 dhan / 1 groww). Per-instrument unique-wins land
 in PR-4. **Stall episode rows are LIVE since PR-B (2026-07-10):** the Groww
 sidecar stall watchdog stamps ONE `WsEventKind::StallRestarted`
 (`stall_restarted`) ws_event_audit row per kill+relaunch (both the classic
