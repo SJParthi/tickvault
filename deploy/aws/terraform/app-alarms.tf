@@ -4,8 +4,8 @@
 # network). The 21 alarms in THIS file cover application signals: WebSocket
 # health, QuestDB connectivity, token lifecycle, tick freshness, order
 # rejection, aggregator liveness, backpressure, clock drift, composite SLO
-# score. 3 more silent-feed alarms live in silent-feed-alarms.tf
-# (2026-07-06 incident hardening).
+# score. 4 more silent-feed alarms live in silent-feed-alarms.tf
+# (2026-07-06 incident hardening + scoreboard PR-C S4).
 #
 # Charter authority: operator-charter-forever.md §C row "100% monitoring"
 # + §F "Severity::Critical → Telegram". Without these the operator only
@@ -42,8 +42,8 @@
 #   - Current (2026-07-11, scoreboard PR-C groww lag gauge): 21 app alarms
 #     in THIS file + 4 in silent-feed-alarms.tf; 29 selected custom-metric
 #     series (27 main EMF names + the 2 [host,feed] boundary-catchup
-#     declarations). Overage now: alarms ≈ $1.80/mo + metrics (29 − 10
-#     free) × $0.30 = $5.70/mo ⇒ ~$7.50/mo ≈ ₹640/mo total (matches the
+#     declarations). Overage now: alarms ≈ $1.90/mo + metrics (29 − 10
+#     free) × $0.30 = $5.70/mo ⇒ ~$7.60/mo ≈ ₹650/mo total (matches the
 #     app_cloudwatch_alarms output below + aws-budget.md's 2026-07-06
 #     note). Operator MUST acknowledge before terraform apply.
 
@@ -716,7 +716,7 @@ resource "aws_cloudwatch_metric_alarm" "mem_used_high" {
 # ---------------------------------------------------------------------------
 
 output "app_cloudwatch_alarms" {
-  description = "21 application-level alarms in THIS file (19 Prometheus-via-CW-agent incl. #1437's 2 groww alarms + 1 disk-used + 1 mem-used Metrics-Insights); 3 more silent-feed alarms live in silent-feed-alarms.tf (2026-07-06 incident hardening). tick-gap-instruments-silent was RETUNED 2026-07-06 (threshold 100 -> 40 PROVISIONAL, 10-of-12 min, market-hours-gated). Cost note (2026-07-06 groww feed-down alerting adds 2 alarms + 3 selected metrics; silent-feed hardening adds 3 alarms + 4 selected series): overage above the 10 free-tier alarms ≈ $1.80/mo + 29 selected custom-metric series ≈ $5.70/mo overage above the 10 free-tier metrics (≈ $8.70/mo absolute at ~$0.30 each; EMF name count pinned by cloudwatch_app_alarms_wiring.rs) ≈ $7.50/mo ≈ ₹640/mo total — well inside the $55 budget cap."
+  description = "21 application-level alarms in THIS file (19 Prometheus-via-CW-agent incl. #1437's 2 groww alarms + 1 disk-used + 1 mem-used Metrics-Insights); 4 more silent-feed alarms live in silent-feed-alarms.tf (2026-07-06 incident hardening + scoreboard PR-C S4). tick-gap-instruments-silent was RETUNED 2026-07-06 (threshold 100 -> 40 PROVISIONAL, 10-of-12 min, market-hours-gated). Cost note (2026-07-06 groww feed-down alerting adds 2 alarms + 3 selected metrics; silent-feed hardening adds 3 alarms + 4 selected series; scoreboard PR-C S4 adds 1 lag alarm): overage above the 10 free-tier alarms ≈ $1.90/mo + 29 selected custom-metric series ≈ $5.70/mo overage above the 10 free-tier metrics (≈ $8.70/mo absolute at ~$0.30 each; EMF name count pinned by cloudwatch_app_alarms_wiring.rs) ≈ $7.60/mo ≈ ₹650/mo total — well inside the $55 budget cap."
   value = [
     aws_cloudwatch_metric_alarm.disk_used_high.alarm_name,
     aws_cloudwatch_metric_alarm.mem_used_high.alarm_name,

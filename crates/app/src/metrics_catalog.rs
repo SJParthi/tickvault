@@ -82,8 +82,13 @@
 //!     / aws-budget.md).
 //!   * `tv_groww_lag_samples_excluded_total{reason}` — /metrics-only
 //!     counter of excluded lines (`no_capture` = old-format/reconcile-sweep
-//!     rows; `stale_capture` = ≥60 s byte-0 re-tail backlog replays) —
+//!     rows; `stale_capture` = ≥60 s dwell INSIDE the bridge's byte-0
+//!     re-tail replay window (two-condition discriminator, 2026-07-11)) —
 //!     visible, never silent censoring (Rule 11). NOT CloudWatch-exported.
+//!   * `tv_groww_lag_backlog_admitted_total` — /metrics-only counter of
+//!     live ≥60 s preserved-offset backlog lines ADMITTED to the day
+//!     histogram only (the trailing-60s ring is skipped so the live p99
+//!     gauge is never polluted by a drain burst).
 //!   * `tv_groww_lag_negative_clamped_total` — /metrics-only counter of
 //!     negative-lag clamps (host-vs-Groww clock skew).
 //! Plus the per-feed DAY lag histograms (in-memory, drained into the
