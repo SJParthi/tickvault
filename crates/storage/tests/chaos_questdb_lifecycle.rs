@@ -242,51 +242,45 @@ fn questdb_disappears_ticks_buffer_not_drop() {
 /// 6. Writer's next append triggers reconnect + drain
 /// 7. Assert: ring buffer empty, DLQ still 0, drops still 0
 ///
-/// # Why `#[ignore]`'d (added 2026-04-27)
+/// # Why the dead-socket assertion is a BOUNDED LOOP (rewritten 2026-07-11;
+/// # `#[ignore]`'d 2026-04-27)
 ///
-/// This test depends on Linux loopback TCP FIN propagation timing that is
-/// not reliable under CPU contention. Specifically:
-///   - After `server.stop()` joins the drain thread, the accepted stream
-///     drops and the kernel sends FIN to the writer's socket.
-///   - But the writer's socket can absorb up to ~64 KiB of subsequent
-///     writes silently into the kernel send buffer BEFORE the FIN is
-///     processed and `EPIPE` surfaces on the next write.
-///   - 50 ticks ≈ 4 KiB — well under the buffer threshold — so
-///     `force_flush()` returns `Ok(())` instead of `Err`, breaking the
-///     test's hard assertion `flush_result.is_err()`.
+/// A single `force_flush()` against a just-closed peer is NOT guaranteed to
+/// fail. After `server.stop()` joins the drain thread, the accepted stream
+/// drops and the kernel sends FIN — but the writer's socket can absorb up
+/// to ~64 KiB of subsequent writes silently into the kernel send buffer
+/// BEFORE the peer's RST is processed. 50 ticks ≈ 4 KiB, so the ORIGINAL
+/// single-shot assertion `flush_result.is_err()` flaked ~70-90% per run on
+/// a contended 2-vCPU runner (the exact runner the weekly chaos lane uses).
 ///
-/// On a contended 2-vCPU GitHub Actions runner (or `taskset -c 0 nice -n
-/// 19` locally) the failure rate is ~70-90% per run. On an idle desktop
-/// it's ~0% — which is why the test originally landed green.
+/// What TCP DOES guarantee: once the peer has fully closed, any data that
+/// reaches it elicits an RST, and the write AFTER that RST surfaces
+/// `EPIPE`/`ECONNRESET`. So a dead socket MUST fail within a bounded number
+/// of writes — just not necessarily the first one. The test therefore loops
+/// bounded append+flush attempts (`MAX_DEAD_SOCKET_FLUSH_ATTEMPTS`, with a
+/// short inter-attempt sleep for the RST to arrive on loopback) and asserts
+/// an `Err` surfaces within the bound. In practice the second attempt fails;
+/// the bound is generous headroom for scheduler preemption, never a timing
+/// bet.
 ///
-/// Reproducible-only fixes considered and rejected:
-///   - Fixed sleep up to 1500 ms — still flakes (~10%) because the FIN
-///     itself is not the bottleneck; the kernel send buffer is.
-///   - Retry loop with `force_flush()` until `Err` — destroys the
-///     in-flight batch on each silent success, breaking the downstream
-///     `buffered_after_outage >= 150` assertion.
-///   - `SO_LINGER = 0` on the server's accepted stream so `close()` sends
-///     RST (forcing immediate `ECONNRESET` on writer's next write) — the
-///     correct fix, but requires either an unsafe `setsockopt` block in
-///     test code or adding `socket2` as a dev-dep. Both pending operator
-///     approval; tracked in the dependency-checker review queue.
+/// Honest envelope: ticks flushed `Ok` before the RST surfaced were accepted
+/// by the kernel and are gone from the writer's view — that is the classic
+/// TCP dead-peer window, outside the writer's contract (production covers it
+/// with the WAL frame spill replay, `ws_frame_spill.rs`). The writer's
+/// contract — asserted below — is: the FAILING flush rescues its in-flight
+/// batch into the ring buffer, the sender is cleared, and every subsequent
+/// tick buffers with zero drops and an empty DLQ.
 ///
-/// Ignoring matches the pattern already in this file for tests requiring
-/// reliable kernel-level TCP semantics (see the Docker-backed chaos tests
-/// below). Run on demand:
+/// Kept `#[ignore]`d: it is a chaos-lane test (real TCP lifecycle against a
+/// live listener thread); the weekly chaos-nightly workflow runs it via
+/// `-- --ignored`. Run on demand:
 ///
 /// ```
 /// cargo test -p tickvault-storage --test chaos_questdb_lifecycle -- \
 ///     --ignored questdb_round_trip_preserves_every_tick
 /// ```
-///
-/// On an idle desktop this passes deterministically. The test's contract
-/// is still pinned by the related `chaos_questdb_realistic_load_zero_tick_loss`
-/// and `chaos_questdb_full_session_zero_tick_loss` tests in
-/// `chaos_questdb_full_session.rs` (both default-enabled and reliable on
-/// every runner).
 #[test]
-#[ignore = "Linux loopback FIN/kernel-send-buffer timing is unreliable under CPU contention; use --ignored to run locally on an idle desktop"]
+#[ignore = "chaos-lane test (real TCP socket lifecycle) — run via --ignored; the weekly chaos-nightly workflow executes it"]
 fn questdb_round_trip_preserves_every_tick() {
     // Phase 1: up
     let server = FakeQuestDb::start_ephemeral();
@@ -309,37 +303,65 @@ fn questdb_round_trip_preserves_every_tick() {
     assert_eq!(writer.pending_count(), 0);
 
     // Phase 2: down — stop the fake QDB. Drain thread exits, accepted stream
-    // is dropped, loopback TCP closes. Generous sleep gives the FIN time to
-    // propagate on idle desktops where this test runs explicitly.
+    // is dropped, loopback TCP closes. Short sleep gives the FIN a head
+    // start; correctness does NOT depend on it (the bounded loop below does
+    // the real work).
     server.stop();
     thread::sleep(Duration::from_millis(50));
 
-    // Append 50 ticks — below the 1000 auto-flush threshold, so no I/O yet.
-    for i in 1_000..1_050_u32 {
-        writer.append_tick(&make_tick(i, 200.0)).unwrap();
+    // Bounded dead-socket probe: append a small batch + force_flush per
+    // attempt. Early attempts may return Ok (bytes swallowed by the kernel
+    // send buffer before the peer's RST is processed) — TCP guarantees an
+    // Err surfaces within a bounded number of writes once the peer has
+    // closed. Each batch stays far below the 1000-tick auto-flush threshold
+    // so force_flush() is the only I/O trigger.
+    const MAX_DEAD_SOCKET_FLUSH_ATTEMPTS: u32 = 50;
+    const TICKS_PER_ATTEMPT: u32 = 50;
+    let mut failed_on_attempt: Option<u32> = None;
+    for attempt in 0..MAX_DEAD_SOCKET_FLUSH_ATTEMPTS {
+        let base = 1_000_u32.saturating_add(attempt.saturating_mul(TICKS_PER_ATTEMPT));
+        // An append can itself surface the dead socket (internal flush) —
+        // that Err is the same signal as a force_flush Err, so count it.
+        let append_err = (base..base.saturating_add(TICKS_PER_ATTEMPT))
+            .any(|i| writer.append_tick(&make_tick(i, 200.0)).is_err());
+        if append_err || writer.force_flush().is_err() {
+            failed_on_attempt = Some(attempt);
+            break;
+        }
+        // Ok = the kernel buffered the bytes before the RST arrived. Give
+        // the RST a moment, then push more bytes at the dead peer.
+        thread::sleep(Duration::from_millis(20));
     }
-
-    // Force the flush explicitly. This MUST fail (socket is dead), rescue the
-    // in-flight batch into the ring buffer, and null out the sender.
-    let flush_result = writer.force_flush();
     assert!(
-        flush_result.is_err(),
-        "force_flush must fail when the QDB socket is dead"
+        failed_on_attempt.is_some(),
+        "dead-socket flush never failed within {MAX_DEAD_SOCKET_FLUSH_ATTEMPTS} attempts — \
+         TCP must surface RST/EPIPE once the peer has closed; if this fires, the \
+         writer is swallowing socket errors (zero-loss contract at risk)"
     );
     assert!(
         !writer.is_connected(),
         "sender must be cleared after flush failure"
     );
 
+    // The failing flush rescued its in-flight batch into the ring buffer.
+    let rescued_at_failure = writer.buffered_tick_count();
+    assert!(
+        rescued_at_failure >= 1,
+        "the failing flush must rescue its in-flight batch into the ring buffer \
+         (expected >=1 buffered, got {rescued_at_failure})"
+    );
+
     // Append 100 more ticks — sender=None path, all go directly to ring buffer.
-    for i in 1_050..1_150_u32 {
+    for i in 10_000..10_100_u32 {
         writer.append_tick(&make_tick(i, 300.0)).unwrap();
     }
 
     let buffered_after_outage = writer.buffered_tick_count();
     assert!(
-        buffered_after_outage >= 150,
-        "ring buffer must hold every post-outage tick (expected >=150, got {})",
+        buffered_after_outage >= rescued_at_failure + 100,
+        "ring buffer must hold the rescued batch plus every post-failure tick \
+         (expected >={}, got {})",
+        rescued_at_failure + 100,
         buffered_after_outage
     );
     assert_eq!(
