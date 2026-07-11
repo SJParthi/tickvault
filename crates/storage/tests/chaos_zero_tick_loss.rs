@@ -30,10 +30,29 @@
 
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::Mutex;
 use std::time::Duration;
 
 const DOCKER_COMPOSE_PATH: &str = "deploy/docker/docker-compose.yml";
 const QUESTDB_SERVICE: &str = "tv-questdb";
+
+/// Serializes the docker `pause`/`unpause` chaos tests. `cargo test` runs
+/// the tests of one binary on parallel threads, and `docker compose pause`
+/// on an ALREADY-paused container errors — so two tests pausing tv-questdb
+/// concurrently panic each other's `.expect("pause")`. House pattern from
+/// `crates/api/tests/tv_api_token_prod_guard.rs`: a shared static Mutex,
+/// poisoning-safe (a panicked lock holder must not cascade into the
+/// remaining tests).
+///
+/// SCOPE NOTE: this serializes within ONE process only — which is exactly
+/// what the chaos lane uses (plain `cargo test -- --ignored`). Under nextest
+/// each test is its own process and the lock would not serialize — irrelevant
+/// today because the nextest lanes never run `--ignored`.
+static DOCKER_PAUSE_LOCK: Mutex<()> = Mutex::new(());
+
+fn docker_pause_serial_guard() -> std::sync::MutexGuard<'static, ()> {
+    DOCKER_PAUSE_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 fn workspace_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -112,6 +131,44 @@ fn docker_stack_available() -> bool {
     }
 }
 
+/// Returns true if a LIVE tickvault app is serving `/metrics` on
+/// `TV_METRICS_PORT`. The chaos tests below assert on deltas of
+/// `tv_ticks_*` counters — with no app running, `read_metric` returns
+/// 0.0 for everything and every assertion passes VACUOUSLY (0 == 0),
+/// which is a false-OK class bug (audit-findings Rule 11). Each test
+/// gates on this BEFORE touching docker, so the skip path also works
+/// on machines where the compose stack isn't up.
+fn metrics_endpoint_reachable() -> bool {
+    let url = format!(
+        "http://127.0.0.1:{}/metrics",
+        std::env::var("TV_METRICS_PORT").unwrap_or_else(|_| "9091".to_string())
+    );
+    match Command::new("curl")
+        .args([
+            "-sS",
+            "-m",
+            "5",
+            "-o",
+            "/dev/null",
+            "-w",
+            "%{http_code}",
+            &url,
+        ])
+        .output()
+    {
+        Ok(o) => o.status.success() && o.stdout == b"200",
+        Err(_) => false,
+    }
+}
+
+/// Loud, explicit skip for the no-running-app case. NEVER a silent pass.
+fn skip_no_live_app() {
+    eprintln!(
+        "SKIP: no running tickvault app at TV_METRICS_PORT — this test validates a \
+         live app+QuestDB stack; vacuous 0==0 assertions forbidden per audit Rule 11"
+    );
+}
+
 /// Fetches the current value of a tv_* Prometheus gauge/counter by
 /// hitting the app's /metrics endpoint directly. Returns 0 if the
 /// metric isn't present.
@@ -151,10 +208,19 @@ fn read_metric(metric: &str) -> f64 {
 #[test]
 #[ignore = "requires Docker compose stack — run with `cargo test -- --ignored`"]
 fn chaos_questdb_outage_30s_loses_zero_ticks() {
+    // Reachability gate FIRST (before ANY docker command) — no live app
+    // means every metric delta is a vacuous 0==0 (audit Rule 11).
+    if !metrics_endpoint_reachable() {
+        skip_no_live_app();
+        return;
+    }
     if !docker_stack_available() {
         eprintln!("SKIP: docker compose stack not running (run `make docker-up` first)");
         return;
     }
+    // Serialize pause/unpause against the sibling chaos tests (pausing an
+    // already-paused container errors and panics the .expect()).
+    let _serial = docker_pause_serial_guard();
 
     let dropped_before = read_metric("tv_ticks_dropped_total");
     let processed_before = read_metric("tv_ticks_processed_total");
@@ -190,10 +256,18 @@ fn chaos_questdb_outage_30s_loses_zero_ticks() {
 #[test]
 #[ignore = "requires Docker compose stack — run with `cargo test -- --ignored`"]
 fn chaos_questdb_outage_pauses_unpause_cycle_is_idempotent() {
+    // Reachability gate FIRST (before ANY docker command) — the final
+    // dropped==0 assertion is vacuous without a live app (audit Rule 11).
+    if !metrics_endpoint_reachable() {
+        skip_no_live_app();
+        return;
+    }
     if !docker_stack_available() {
         eprintln!("SKIP: docker compose stack not running");
         return;
     }
+    // Serialize pause/unpause against the sibling chaos tests.
+    let _serial = docker_pause_serial_guard();
 
     // Pause/unpause 3 times in a row. The QuestDB writer state machine
     // must NOT accumulate errors that eventually trip the circuit
@@ -214,6 +288,12 @@ fn chaos_questdb_outage_pauses_unpause_cycle_is_idempotent() {
 #[test]
 #[ignore = "requires Docker compose stack + TV_SLOW_CHAOS=1 env var"]
 fn chaos_prolonged_outage_60s_triggers_disk_spill() {
+    // Reachability gate FIRST (before ANY docker command) — the spill +
+    // dropped assertions are vacuous without a live app (audit Rule 11).
+    if !metrics_endpoint_reachable() {
+        skip_no_live_app();
+        return;
+    }
     if !docker_stack_available() {
         eprintln!("SKIP: docker compose stack not running");
         return;
@@ -225,6 +305,8 @@ fn chaos_prolonged_outage_60s_triggers_disk_spill() {
         );
         return;
     }
+    // Serialize pause/unpause against the sibling chaos tests.
+    let _serial = docker_pause_serial_guard();
 
     let spilled_before = read_metric("tv_ticks_spilled_total");
     let dropped_before = read_metric("tv_ticks_dropped_total");

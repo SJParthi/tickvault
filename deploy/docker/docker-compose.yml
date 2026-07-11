@@ -69,9 +69,17 @@ services:
     # and conditional logic, which is fragile). Multi-arch tag is the
     # canonical Docker-recommended approach for cross-arch deployments.
     image: questdb/questdb:9.3.5
-    # Force arm64 on the deployed Graviton box; harmless on amd64 dev
-    # hosts (docker compose falls back to amd64 layers there).
-    platform: linux/arm64
+    # Force arm64 on the deployed Graviton box (default). The earlier claim
+    # that this is "harmless on amd64 dev hosts" was WRONG — `platform:`
+    # is a hard requirement, not a preference: on an amd64 host it pulls
+    # the arm64 layer and exec-format-fails (the exact failure documented
+    # in .github/workflows/groww-e2e.yml, which worked around it with a
+    # bare `docker run`). Env-interpolated so amd64 CI runners (chaos
+    # nightly lane) can set TV_QDB_PLATFORM=linux/amd64; the default keeps
+    # Mac dev + AWS Graviton (both arm64) byte-identical. The 9.3.5 tag is
+    # a multi-arch manifest list (verified 2026-07-11: amd64 5b6f1518... +
+    # arm64 ba849fed...), so either platform value resolves cleanly.
+    platform: ${TV_QDB_PLATFORM:-linux/arm64}
     container_name: tv-questdb
     hostname: tv-questdb
     restart: unless-stopped
