@@ -171,12 +171,15 @@ daily-universe / Groww watch builds (stocks paired by ISIN, indices by
 `canonicalize_index_symbol`, the §36 futures by `(underlying, expiry)`
 contract identity — never native ids). On same-day runs the 15:45 drain
 (flagged O(slots × 12 words), cold) flips `unique_win_minutes` /
-`both_minutes` to registry truth, fills `mapped_instruments` /
-`unmapped_instruments` / `covered_instrument_minutes`, writes the
-config-gated `feed_coverage_daily` per-instrument rows, and stamps
-`coverage_source` = `in_memory` (full session) / `mixed` (mid-day
-restart — the pre-restart window is invisible to the process-local
-registry). Fallback stays the SQL minute sets (`sql_backfill`), and the
+`both_minutes` to registry truth ONLY when the registry covered the
+full session (`in_memory`) — on `mixed` days (mid-day restart — the
+pre-restart window is invisible to the process-local registry) the SQL
+minute sets stand for those two columns (PR-D fix round 1). It fills
+`mapped_instruments` / `unmapped_instruments` /
+`covered_instrument_minutes` (the registry's PARTIAL measurement on
+mixed days), writes the config-gated `feed_coverage_daily`
+per-instrument rows, and stamps `coverage_source` = `in_memory` (full
+session) / `mixed`. Fallback stays the SQL minute sets (`sql_backfill`), and the
 coverage keep-better (`stage="coverage_regression"` — mirror of the lag
 guard) stops a registry-less rerun/backfill from erasing a measured
 day's registry columns. Unmapped singletons are counted + named in the

@@ -1317,9 +1317,12 @@ mod tests {
         assert_eq!(
             paired, 22,
             "22 of the real 24 Groww NSE indices must resolve to a Dhan \
-             allowlist canonical (only NIFTY Commodities + NIFTY Midcap 100 \
-             are legitimately Dhan-untracked); token-only pairing resolved \
-             just 4 — keys: {keys:?}"
+             allowlist canonical (NIFTY Commodities is Dhan-untracked; \
+             NIFTY Midcap 100 is Dhan-tracked under the legacy \
+             \"NIFTY MID100 FREE\" symbol with no alias bridge — the \
+             pre-existing 2026-06-28 KNOWN_ABSENT_ON_GROWW stance, \
+             inherited here, NOT fixed in this PR); token-only pairing \
+             resolved just 4 — keys: {keys:?}"
         );
         // The previously-split spellings now pair on the Dhan canonical.
         for expected in [

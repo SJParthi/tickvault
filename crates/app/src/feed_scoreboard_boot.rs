@@ -595,6 +595,17 @@ pub fn coverage_source_rank(label: &str) -> u8 {
 /// forward — the outcome keep-better's measured-zero precedent (round 5,
 /// 2026-07-10). Returns `true` when the fold fired — the caller logs
 /// `stage="coverage_regression"` and skips the step-8b detail rows. Pure.
+///
+/// Honest residual (PR-D review round 2, LOW): equal rank is value-aware
+/// ONLY at zero — a FORCED mid-day run's coverage row
+/// (`TICKVAULT_SCOREBOARD_NOW` at ~14:00, `mixed`) can still be replaced
+/// by a later same-day run's SMALLER nonzero post-restart window (forced
+/// run → in-session crash → pre-close reboot → the 15:45 drain measures
+/// only the post-reboot minutes; `mixed` == `mixed`, nonzero → it wins,
+/// and step 8b rewrites the detail rows from that window). Reachable only
+/// via a forced mid-session run + in-session crash + pre-close reboot —
+/// the normal 15:45-first-write flow cannot hit it (a pre-15:45 crash
+/// means no existing row). Documented in the runbook §4 triage note.
 pub fn fold_existing_coverage_keep_better(
     n: &mut FeedDayNumbers,
     existing: Option<&ExistingDailyCoverage>,

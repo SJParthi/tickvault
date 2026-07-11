@@ -1595,24 +1595,36 @@ mod tests {
         // (the fast crash-recovery arm's) — a registration ordered before
         // init is silently skipped, and a half-registered registry drains
         // a false one-sided daily verdict at 15:45.
-        let init_pos = main_rs
+        // Positions are computed over COMMENT-STRIPPED source (PR-D review
+        // round 2, LOW — the vacuous-ratchet class): a raw str::find could
+        // resolve to a future comment citing a needle literal and satisfy
+        // the ordering assertions vacuously; use the same line filter the
+        // count check above uses.
+        let stripped: String = main_rs
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let init_pos = stripped
             .find(init_needle)
             .expect("init_feed_presence site present");
-        let watcher_pos = main_rs
+        let watcher_pos = stripped
             .find("run_groww_activation_watcher(")
             .expect("Groww activation watcher spawn present");
-        let load_pos = main_rs
+        let load_pos = stripped
             .find("load_instruments(")
             .expect("load_instruments call present");
         assert!(
             init_pos < watcher_pos,
             "init_feed_presence must precede the run_groww_activation_watcher \
-             spawn (init at byte {init_pos}, watcher at {watcher_pos})"
+             spawn (init at stripped byte {init_pos}, watcher at \
+             {watcher_pos})"
         );
         assert!(
             init_pos < load_pos,
             "init_feed_presence must precede the first load_instruments call \
-             (init at byte {init_pos}, load_instruments at {load_pos})"
+             (init at stripped byte {init_pos}, load_instruments at \
+             {load_pos})"
         );
         assert!(
             main_rs.contains("feed_presence::reset_daily("),

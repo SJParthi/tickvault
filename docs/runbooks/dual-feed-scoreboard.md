@@ -27,7 +27,7 @@ DETERMINISTIC trading-date 15:45:00 IST stamp, so re-runs UPSERT in place.
 | Column group | Columns | Notes |
 |---|---|---|
 | Coverage | `ticks_captured`, `instruments_seen`, `unique_win_minutes`, `both_minutes`, `streaming_minutes`, `session_minutes` (375), `uptime_pct` | `-1` = source unavailable that run (NEVER a fabricated 0) |
-| Per-instrument (MEASURED since PR-D, 2026-07-11) | `mapped_instruments`, `unmapped_instruments`, `covered_instrument_minutes` | Drained from the in-memory presence registry on same-day runs (per-instrument 375-minute bitsets; cross-feed slots paired by ISIN / canonical index name / future contract identity); `-1` = not measured (pre-ship days, past-day backfills — the registry is process-local + day-scoped). Since PR-D, `unique_win_minutes`/`both_minutes` are ALSO registry truth when `coverage_source` reads `in_memory`/`mixed` (the SQL minute sets remain the fallback source) |
+| Per-instrument (MEASURED since PR-D, 2026-07-11) | `mapped_instruments`, `unmapped_instruments`, `covered_instrument_minutes` | Drained from the in-memory presence registry on same-day runs (per-instrument 375-minute bitsets; cross-feed slots paired by ISIN / canonical index name / future contract identity); `-1` = not measured (pre-ship days, past-day backfills — the registry is process-local + day-scoped). Since PR-D, `unique_win_minutes`/`both_minutes` are ALSO registry truth when `coverage_source` reads `in_memory`; on `mixed` days those two comparison columns keep the SQL minute-set values (fix round 1 — see the §6 checklist bullet) while the per-instrument mapped/unmapped/covered columns take the registry's partial measurement |
 | Lag (MEASURED since PR-C, 2026-07-11) | `lag_p50_ms`, `lag_p99_ms`, `lag_max_ms`, `lag_samples`, `lag_floor_ms` | Drained from the in-memory per-feed DAY histograms on same-day runs (exchange→receipt, replay/re-tail excluded at record time); `-1` = not measured (pre-ship days, past-day backfills — the histograms are process-local + day-scoped — or a thin <50-sample day); `lag_floor_ms` is the honesty column (Dhan 1000 — whole-second price clock, p50/p99 can never read sub-second; Groww 1 — millisecond clock, but receipt = the sidecar capture instant one hop downstream of the socket, so the two feeds' clocks are NOT like-for-like) |
 | Episodes | `disconnects_market`, `disconnects_off_hours`, `reconnects`, `stalls`, `blame_broker`, `blame_ours`, `blame_indeterminate`, `restarts_detected` | blame tallies exclude off-hours rows |
 | Honesty | `partial_coverage`, `coverage_source` (`in_memory`/`sql_backfill`/`mixed`), `outcome` (`complete`/`partial`/`degraded`/`feed_off`) | `degraded` = the connection-event record itself under-counted that day; `feed_off` = the feed was switched off for the day (one-horse race — EXCLUDED from the month sums, round 4) |
@@ -359,7 +359,14 @@ FROM feed_scoreboard_daily WHERE outcome != 'complete' ORDER BY trading_date_ist
     registry-derived columns forward, so a backfill can never erase them
     with the SQL approximation; `coverage_source` records which source
     each row's numbers came from (`in_memory` full-session registry /
-    `mixed` post-restart partial registry / `sql_backfill`).
+    `mixed` post-restart partial registry / `sql_backfill`). Residual
+    (equal rank is value-aware only at ZERO — PR-D review round 2): a
+    FORCED mid-day run's coverage row (`TICKVAULT_SCOREBOARD_NOW` at,
+    say, 14:00 → `mixed`) can be replaced by a later same-day run's
+    SMALLER nonzero post-restart window (forced run → in-session crash →
+    pre-close reboot; `mixed` == `mixed` with a nonzero drain wins) —
+    annotate such days rather than trusting the smaller window; the
+    normal 15:45-first-write flow cannot hit this shape.
   - Stall episode rows for days before the stall event kind shipped
     (PR-B, 2026-07-10) — those days honestly read `stalls = 0` in the
     table and on the card (0 = "no rows existed", not "no stalls
@@ -424,7 +431,8 @@ FROM feed_scoreboard_daily WHERE outcome != 'complete' ORDER BY trading_date_ist
   presence registry pairs instruments across feeds (ISIN for stocks,
   canonical index name for indices, contract identity for the §36
   futures) and the card's "Minutes only I had" line is registry truth on
-  `in_memory`/`mixed` days. Unmapped singletons are counted
+  `in_memory` (full-session) days ONLY — on `mixed` days it carries the
+  SQL minute-set values (fix round 1). Unmapped singletons are counted
   (`unmapped_instruments`) + named in the day's logs (bounded sample) —
   never silently dropped. Per-instrument detail stays table-only
   (`feed_coverage_daily`), never rendered on the card.
