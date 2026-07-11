@@ -207,6 +207,74 @@ for FINNIFTY + MIDCPNIFTY starting at 15:45 IST, post-market close.
 - Empty/missing/wrong token = 401 Unauthorized
 - Test: all `api_auth::tests::*`
 
+### 2026-07-10 Update — 401-burst counter + CloudWatch pager (wave-2 #2)
+
+Every bearer-auth rejection (all 3 arms of `require_bearer_auth` — invalid
+token / malformed Authorization header / missing header) now increments the
+SINGLE UNLABELED counter `tv_api_auth_failed_total`
+(`crates/api/src/middleware.rs`). Deliberately NO new per-401 log line — the
+counter is the burst signal; the pre-existing BUG-3 `warn!`s (path +
+sanitized peer, 2026-07-05) remain the per-event forensic surface
+(log-amplification defence, the same reasoning as the #1458 `debug!`-only
+429 handling). The paging chain is the metrics-log-group delta-extraction
+house pattern (`feed-stall-restart-alarm.tf` full-extraction variant):
+`/tickvault/<env>/metrics` log metric filter
+`{ $.tv_api_auth_failed_total = * }` → derived metric (raw name reused,
+`host` dimension) → alarm `tv-<env>-api-auth-failed` (Sum ≥ 25 per aligned
+300s window, `treat_missing_data = notBreaching`, always armed — the funnel
+is probeable 24/7) → SNS `tv-prod-alerts` → Telegram
+(`deploy/aws/terraform/auth-failed-alarm.tf`). Threshold rationale: a
+fat-fingered token paste stays in single-digit 401s per 5 min (never
+pages); a brute-force sweep against the public funnel is sustained
+hundreds+/min (always lands ≥ 25 in some aligned window). First-sample
+baseline (the feed-stall round-5 lesson): the series is pre-registered at 0
+in `crates/api/src/lib.rs::build_router_with_auth` (router construction —
+the single choke point both boot paths call, provably before the first
+servable 401 since no router means no request, and after the boot Step-3
+recorder install: main.rs calls `observability::init_metrics` before either
+API-server spawn), so the CW agent's dropped-first-sample delta baseline is
+the harmless 0, never part of the session's first burst. Lockstep ratchet:
+`crates/app/tests/auth_failed_alarm_wiring_guard.rs` (api-crate registration
+site + read-only main.rs install-before-router source-order scan +
+3 emit sites + tf shape built from the real metric literal + HCL-stripper
+self-test). Honest envelope: an aligned-window straddle (e.g. 24+24) never
+pages — only a sustained sweep does; if the metrics-log shipping leg is
+degraded (the 2026-07-06 collect_list class) this alarm is blind with it
+and the `warn!` lines in `/tickvault/<env>/app` are the fallback. Cost:
++1 alarm + 1 derived metric ≈ $0.40/mo.
+
+### 2026-07-10 Update — token rotation without restart (wave-2 #7)
+
+The bearer token is no longer frozen at boot (audit row 13). The expected
+token lives behind a SHARED lock-free hot-swap holder inside
+`ApiAuthConfig` (`crates/api/src/middleware.rs` — the token_manager.rs
+arc-swap house pattern; every per-request clone shares the holder, so a
+swap is instantly visible). A SUPERVISED app-side loop
+(`crates/app/src/api_token_rotation.rs`, spawned from BOTH main.rs boot
+arms, gated on `enabled`) re-reads `/tickvault/<env>/api/bearer-token`
+every 300s (READ-ONLY SSM GetParameter — never a write) and swaps ONLY a
+non-empty, shape-valid, genuinely-new value
+(`ApiAuthConfig::rotate_bearer_token` — fail-open: an SSM outage or a
+mis-seeded empty value keeps the CURRENT token working, never locks the
+operator out, never becomes accept-all). A WELL-FORMED-but-mismatched
+bearer additionally hints ONE out-of-band re-read, hard-floored at 60s
+(`OOB_RELOAD_FLOOR_SECS`, CAS-gated) — attacker 401 spam is bounded to
+≤1 SSM read per minute; the missing/malformed-header arms never hint.
+Honest rotation window: operator updates SSM → live within ≤5 min (or
+~60s under active mismatched use); the OLD token dies at the swap instant
+(single-value semantics, no dual-accept window). Observability:
+`tv_api_token_reloads_total{outcome="ok"|"unchanged"|"failed"|"rejected"}`
+(pre-registered at 0, first-sample-baseline discipline) +
+`tv_api_token_reload_respawn_total{reason}`; routine cycles are `debug!`,
+an actual rotation is one `info!`, and ≥3 consecutive read failures (or a
+rejected SSM value) fire ONE edge-latched `warn!` per episode.
+Deliberately NO new ErrorCode and NO new alarm: a failing re-read leaves
+auth WORKING on the old token — degraded-not-broken (the 401-burst pager
+above covers the attack surface). Lockstep ratchet:
+`crates/app/tests/api_token_rotation_wiring_guard.rs` (both boot-arm
+spawns + enabled gate; loop reads SSM + rotates + counters + never writes
+SSM; exactly one middleware OOB hint site).
+
 ---
 
 # OMS (Order Management System) Gap Enforcement

@@ -32,16 +32,32 @@
 //! exposes the inner bytes via `expose_secret()` only in
 //! [`require_bearer_auth`].
 //!
+//! # Token rotation without restart (W2#7, 2026-07-10)
+//! The expected token lives behind a shared lock-free hot-swap holder.
+//! A supervised app-side task (`crates/app/src/api_token_rotation.rs`)
+//! re-reads SSM every ~5 minutes (READ-ONLY GetParameter, never a write)
+//! and swaps via [`ApiAuthConfig::rotate_bearer_token`]; a well-formed but
+//! mismatched bearer additionally hints an out-of-band re-read, floored at
+//! [`OOB_RELOAD_FLOOR_SECS`]. Honest rotation window: operator updates SSM
+//! → live within ≤5 min (or ~60s under active mismatched use); the old
+//! token dies at the swap instant (single-value semantics). SSM outages
+//! are fail-open: the CURRENT token keeps working.
+//!
 //! # Authenticated Endpoints
 //! - `POST /api/instruments/rebuild` — triggers instrument reload
 //! - Any future mutating endpoints
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use arc_swap::ArcSwap;
 use axum::extract::Request;
 use axum::http::StatusCode;
 use axum::middleware::Next;
 use axum::response::Response;
 use secrecy::{ExposeSecret, SecretString};
-use tracing::{error, info, warn};
+use tokio::sync::Notify;
+use tracing::{debug, error, info, warn};
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -62,11 +78,96 @@ use tracing::{error, info, warn};
 pub struct ApiAuthConfig {
     /// Bearer token for authenticating mutating API requests.
     /// Empty (zero-length inner string) = auth disabled (development mode only).
-    /// Field is private — callers go through [`Self::expose_bearer_token`]
-    /// (constant-time comparison only) or never see the inner bytes at all.
-    bearer_token: SecretString,
-    /// Whether authentication is enabled.
+    ///
+    /// W2#7 (2026-07-10): the token now lives behind a SHARED lock-free
+    /// hot-swap holder so the SSM re-read task can rotate it WITHOUT an app
+    /// restart — every per-request `Clone` of this config shares the SAME
+    /// holder, so a swap is instantly visible to in-flight middleware
+    /// state. Reads are O(1) lock-free loads; the swap is a single atomic
+    /// pointer store. Field is private — callers never see the inner bytes
+    /// outside the constant-time comparison in [`require_bearer_auth`] and
+    /// the guarded [`Self::rotate_bearer_token`] path.
+    bearer_token: Arc<ArcSwap<SecretString>>,
+    /// 401-triggered out-of-band reload hint (W2#7): the mismatched-bearer
+    /// arm of [`require_bearer_auth`] pokes this (CAS-floored at
+    /// [`OOB_RELOAD_FLOOR_SECS`]) so the app-side reload loop can re-read
+    /// SSM ~60s into a rotation instead of waiting the full periodic
+    /// cadence. Shared across clones like the token holder.
+    reload_hint: Arc<TokenReloadHint>,
+    /// Whether authentication is enabled. Boot-time decision ONLY —
+    /// rotation can never enable/disable auth ([`Self::rotate_bearer_token`]
+    /// rejects empty/invalid values, so an enabled config stays enabled).
     pub enabled: bool,
+}
+
+/// Hard floor between two 401-triggered out-of-band SSM re-reads. An
+/// attacker spamming well-formed-but-wrong bearers can trigger at most ONE
+/// SSM read per this many seconds (DoS-amplification bound); per-request
+/// cost is one relaxed atomic load (+ one CAS at the floor edge).
+pub const OOB_RELOAD_FLOOR_SECS: u64 = 60;
+
+/// Upper bound accepted for a re-read token value. The real token is a
+/// short opaque secret; anything larger is a mis-seeded SSM parameter and
+/// is rejected rather than swapped in.
+const RELOAD_TOKEN_MAX_LEN: usize = 512;
+
+/// Shared 401→reload signalling state (see [`ApiAuthConfig::request_oob_reload`]).
+struct TokenReloadHint {
+    notify: Notify,
+    /// Unix epoch seconds of the last accepted out-of-band trigger.
+    /// `0` = never triggered.
+    last_trigger_epoch_secs: AtomicU64,
+}
+
+/// Outcome of a [`ApiAuthConfig::rotate_bearer_token`] attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TokenReloadOutcome {
+    /// A NEW valid token was swapped in — the old token is dead as of now.
+    Rotated,
+    /// The re-read value equals the current token (the common case).
+    Unchanged,
+    /// Empty / whitespace / control-char / oversized value — REJECTED;
+    /// the current token keeps working (fail-open, never accept-all).
+    RejectedInvalid,
+}
+
+/// Pure shape gate for a re-read token: non-empty, bounded length, no
+/// whitespace or control characters. An empty or placeholder SSM value can
+/// therefore never blank the live token (which would flip comparisons
+/// toward accept-nothing/accept-empty semantics).
+fn is_valid_reload_token(token: &str) -> bool {
+    !token.is_empty()
+        && token.len() <= RELOAD_TOKEN_MAX_LEN
+        && token.chars().all(|c| !c.is_whitespace() && !c.is_control())
+}
+
+/// Pure floor decision for the 401-triggered out-of-band re-read.
+/// `last_trigger_epoch_secs == 0` means "never triggered".
+///
+/// Degenerate-clock guard (hostile review 2026-07-10, MEDIUM): a `now` of 0
+/// (pre-1970 clock / `SystemTime` error coerced via `unwrap_or_default`)
+/// is DENIED outright — accepting it would CAS the sentinel 0→0 and leave
+/// `last == 0` forever, permanently disabling the 60s floor (every
+/// mismatched 401 would then hint an SSM read). Denying costs nothing: the
+/// periodic reload loop is the backstop.
+fn should_request_oob_reload(now_epoch_secs: u64, last_trigger_epoch_secs: u64) -> bool {
+    now_epoch_secs != 0
+        && (last_trigger_epoch_secs == 0
+            || now_epoch_secs.saturating_sub(last_trigger_epoch_secs) >= OOB_RELOAD_FLOOR_SECS)
+}
+
+/// SEC-3 constant-time byte comparison (length check + byte-by-byte XOR
+/// fold) — equal-time regardless of first-mismatch position, preventing
+/// timing-oracle recovery of the token. Shared by the request-auth path
+/// and the rotation same-value check so there is exactly ONE comparison
+/// implementation to audit.
+fn constant_time_token_eq(candidate: &[u8], expected: &[u8]) -> bool {
+    candidate.len() == expected.len()
+        && candidate
+            .iter()
+            .zip(expected.iter())
+            .fold(0u8, |acc, (a, b)| acc | (a ^ b))
+            == 0
 }
 
 impl std::fmt::Debug for ApiAuthConfig {
@@ -85,7 +186,11 @@ impl ApiAuthConfig {
     pub fn new(bearer_token: String) -> Self {
         let enabled = !bearer_token.is_empty();
         Self {
-            bearer_token: SecretString::from(bearer_token),
+            bearer_token: Arc::new(ArcSwap::from_pointee(SecretString::from(bearer_token))),
+            reload_hint: Arc::new(TokenReloadHint {
+                notify: Notify::new(),
+                last_trigger_epoch_secs: AtomicU64::new(0),
+            }),
             enabled,
         }
     }
@@ -99,7 +204,11 @@ impl ApiAuthConfig {
     pub fn from_token(bearer_token: SecretString) -> Self {
         let enabled = !bearer_token.expose_secret().is_empty();
         Self {
-            bearer_token,
+            bearer_token: Arc::new(ArcSwap::from_pointee(bearer_token)),
+            reload_hint: Arc::new(TokenReloadHint {
+                notify: Notify::new(),
+                last_trigger_epoch_secs: AtomicU64::new(0),
+            }),
             enabled,
         }
     }
@@ -107,17 +216,92 @@ impl ApiAuthConfig {
     /// Creates a disabled auth config (development/dry-run mode only).
     pub fn disabled() -> Self {
         Self {
-            bearer_token: SecretString::from(String::new()),
+            bearer_token: Arc::new(ArcSwap::from_pointee(SecretString::from(String::new()))),
+            reload_hint: Arc::new(TokenReloadHint {
+                notify: Notify::new(),
+                last_trigger_epoch_secs: AtomicU64::new(0),
+            }),
             enabled: false,
         }
     }
 
-    /// Returns the inner token bytes for the constant-time comparison in
-    /// [`require_bearer_auth`]. Do NOT call this from any other code path —
-    /// the entire point of `SecretString` is to keep the bytes inside the
-    /// secrecy boundary.
-    fn expose_bearer_token(&self) -> &[u8] {
-        self.bearer_token.expose_secret().as_bytes()
+    /// Loads the CURRENT token for the constant-time comparison in
+    /// [`require_bearer_auth`] (lock-free O(1) — the rotation-visible read).
+    /// Do NOT expose the inner bytes from any other code path — the entire
+    /// point of `SecretString` is to keep the bytes inside the secrecy
+    /// boundary.
+    fn load_bearer_token(&self) -> arc_swap::Guard<Arc<SecretString>> {
+        self.bearer_token.load()
+    }
+
+    /// W2#7 (2026-07-10): swap in a re-read token value WITHOUT a restart.
+    ///
+    /// Fail-open contract: an empty / whitespace / control-char / oversized
+    /// value is REJECTED (`RejectedInvalid`) and the CURRENT token keeps
+    /// working — an SSM mis-seed can never blank the live token or turn
+    /// auth into accept-all. A value equal to the current token returns
+    /// `Unchanged` (the common periodic-cycle case, so callers can stay
+    /// quiet). Only a genuinely NEW valid value swaps (`Rotated`) — the old
+    /// token dies at the swap instant (single-value semantics, no
+    /// dual-accept window, per the coordinator-approved W2#7 design).
+    ///
+    /// Cold path only (periodic ~5 min cadence / ≥60s-floored OOB) — never
+    /// on the request path.
+    pub fn rotate_bearer_token(&self, new_token: SecretString) -> TokenReloadOutcome {
+        if !is_valid_reload_token(new_token.expose_secret()) {
+            return TokenReloadOutcome::RejectedInvalid;
+        }
+        let current = self.bearer_token.load();
+        if constant_time_token_eq(
+            new_token.expose_secret().as_bytes(),
+            current.expose_secret().as_bytes(),
+        ) {
+            return TokenReloadOutcome::Unchanged;
+        }
+        self.bearer_token.store(Arc::new(new_token));
+        TokenReloadOutcome::Rotated
+    }
+
+    /// W2#7: 401-triggered out-of-band reload hint. Called ONLY from the
+    /// well-formed-but-mismatched bearer arm of [`require_bearer_auth`]
+    /// (never the missing/malformed-header arms — the cheapest probes must
+    /// not touch this path). Returns `true` when the hint was accepted
+    /// (floor elapsed AND this caller won the CAS); the app-side reload
+    /// loop wakes via [`Self::wait_oob_reload`]. Bounded to at most one
+    /// accepted trigger per [`OOB_RELOAD_FLOOR_SECS`] regardless of 401
+    /// volume — two racing requests inside the floor cannot double-trigger.
+    pub fn request_oob_reload(&self) -> bool {
+        let now_epoch_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or_default();
+        let last = self
+            .reload_hint
+            .last_trigger_epoch_secs
+            .load(Ordering::Relaxed);
+        if !should_request_oob_reload(now_epoch_secs, last) {
+            return false;
+        }
+        if self
+            .reload_hint
+            .last_trigger_epoch_secs
+            .compare_exchange(last, now_epoch_secs, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+        {
+            // notify_one stores a permit when no waiter is parked, so a
+            // trigger landing while the reload loop is mid-cycle is never
+            // lost — the next `wait_oob_reload` returns immediately.
+            self.reload_hint.notify.notify_one();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Awaits the next accepted 401-triggered reload hint (consumed by the
+    /// app-side reload loop's `select!` alongside the periodic tick).
+    pub async fn wait_oob_reload(&self) {
+        self.reload_hint.notify.notified().await;
     }
 
     /// Test-only accessor for integration tests in `tests/`.
@@ -132,9 +316,14 @@ impl ApiAuthConfig {
     ///
     /// Cannot be `#[cfg(test)]` because integration tests in `tests/` link
     /// against the non-test lib build.
+    ///
+    /// W2#7 (2026-07-10): returns an OWNED `String` (was `&str`) because the
+    /// current token now lives behind the lock-free hot-swap holder — a
+    /// borrowed slice cannot outlive the load guard. Test-only clone; the
+    /// production path never materializes the token outside the boundary.
     #[doc(hidden)]
-    pub fn token_value_for_test(&self) -> &str {
-        self.bearer_token.expose_secret()
+    pub fn token_value_for_test(&self) -> String {
+        self.bearer_token.load().expose_secret().to_string()
     }
 
     /// **TEST-ONLY constructor.** Loads the API token from the
@@ -299,21 +488,35 @@ pub async fn require_bearer_auth(
     match auth_header {
         Some(header) if header.starts_with("Bearer ") => {
             let token = &header[7..]; // Skip "Bearer "
-            // SEC-3: Constant-time comparison prevents timing oracle attacks.
-            // Length check + byte-by-byte XOR ensures equal-time regardless of position.
-            // expose_bearer_token() is the only call site that briefly accesses
-            // the SecretString inner bytes — kept inside the secrecy boundary.
-            let expected = config.expose_bearer_token();
-            let token_match = token.len() == expected.len()
-                && token
-                    .as_bytes()
-                    .iter()
-                    .zip(expected.iter())
-                    .fold(0u8, |acc, (a, b)| acc | (a ^ b))
-                    == 0;
+            // SEC-3: Constant-time comparison prevents timing oracle attacks
+            // (constant_time_token_eq — the single audited implementation).
+            // load_bearer_token() is the rotation-visible lock-free read of
+            // the CURRENT token (W2#7); the guard briefly accesses the
+            // SecretString inner bytes — kept inside the secrecy boundary.
+            let current_token = config.load_bearer_token();
+            let token_match =
+                constant_time_token_eq(token.as_bytes(), current_token.expose_secret().as_bytes());
             if token_match {
                 Ok(next.run(request).await)
             } else {
+                // 401-burst visibility (2026-07-10): SINGLE UNLABELED counter —
+                // one increment per bearer-auth rejection, no per-401 log beyond
+                // the pre-existing BUG-3 warn (log-amplification defence; the
+                // warn already carries path + peer for forensics). Feeds the
+                // tv-<env>-api-auth-failed CloudWatch alarm via the metrics log
+                // group delta-extraction route (auth-failed-alarm.tf); the
+                // series is pre-registered at 0 in main.rs post-recorder-install
+                // (first-sample baseline). Lockstep ratchet:
+                // crates/app/tests/auth_failed_alarm_wiring_guard.rs.
+                metrics::counter!("tv_api_auth_failed_total").increment(1);
+                // W2#7 (2026-07-10): a WELL-FORMED but mismatched bearer may be
+                // the operator's freshly rotated token arriving before the
+                // periodic SSM re-read — hint the reload loop, hard-floored at
+                // OOB_RELOAD_FLOOR_SECS (attacker 401 spam ⇒ ≤1 SSM read/60s).
+                // The missing/malformed-header arms deliberately do NOT hint.
+                if config.request_oob_reload() {
+                    debug!("GAP-SEC-01: mismatched bearer — out-of-band token re-read hinted");
+                }
                 warn!(
                     path = %request_path,
                     peer = %client_peer_label(&request),
@@ -323,6 +526,8 @@ pub async fn require_bearer_auth(
             }
         }
         Some(_) => {
+            // 401-burst counter — see the invalid-token arm comment.
+            metrics::counter!("tv_api_auth_failed_total").increment(1);
             warn!(
                 path = %request_path,
                 peer = %client_peer_label(&request),
@@ -331,6 +536,8 @@ pub async fn require_bearer_auth(
             Err(StatusCode::UNAUTHORIZED)
         }
         None => {
+            // 401-burst counter — see the invalid-token arm comment.
+            metrics::counter!("tv_api_auth_failed_total").increment(1);
             warn!(
                 path = %request_path,
                 peer = %client_peer_label(&request),
@@ -442,7 +649,10 @@ mod tests {
     fn test_api_auth_config_new_enabled() {
         let config = ApiAuthConfig::new("my-secret-token".to_string());
         assert!(config.enabled);
-        assert_eq!(config.bearer_token.expose_secret(), "my-secret-token");
+        assert_eq!(
+            config.bearer_token.load().expose_secret(),
+            "my-secret-token"
+        );
     }
 
     #[test]
@@ -455,14 +665,14 @@ mod tests {
     fn test_api_auth_config_disabled() {
         let config = ApiAuthConfig::disabled();
         assert!(!config.enabled);
-        assert!(config.bearer_token.expose_secret().is_empty());
+        assert!(config.bearer_token.load().expose_secret().is_empty());
     }
 
     #[test]
     fn test_api_auth_config_clone() {
         let config = ApiAuthConfig::new("token123".to_string());
         let cloned = config.clone();
-        assert_eq!(cloned.bearer_token.expose_secret(), "token123");
+        assert_eq!(cloned.bearer_token.load().expose_secret(), "token123");
         assert!(cloned.enabled);
     }
 
@@ -950,7 +1160,7 @@ mod tests {
         unsafe { std::env::remove_var("TV_API_TOKEN") };
         let config = ApiAuthConfig::from_env(true);
         assert!(!config.enabled, "dry_run + no token = auth disabled");
-        assert!(config.bearer_token.expose_secret().is_empty());
+        assert!(config.bearer_token.load().expose_secret().is_empty());
     }
 
     #[test]
@@ -964,12 +1174,12 @@ mod tests {
             "live mode + no token = auth enabled with generated token"
         );
         assert!(
-            !config.bearer_token.expose_secret().is_empty(),
+            !config.bearer_token.load().expose_secret().is_empty(),
             "generated token must not be empty"
         );
         // Verify it looks like a UUID v4
         assert_eq!(
-            config.bearer_token.expose_secret().len(),
+            config.bearer_token.load().expose_secret().len(),
             36,
             "UUID v4 is 36 chars"
         );
@@ -982,8 +1192,8 @@ mod tests {
         let config1 = ApiAuthConfig::from_env(false);
         let config2 = ApiAuthConfig::from_env(false);
         assert_ne!(
-            config1.bearer_token.expose_secret(),
-            config2.bearer_token.expose_secret(),
+            config1.bearer_token.load().expose_secret(),
+            config2.bearer_token.load().expose_secret(),
             "each call must generate a unique token"
         );
     }
@@ -994,7 +1204,7 @@ mod tests {
         // We test the struct constructor directly to avoid env var races.
         let config = ApiAuthConfig::new("explicit-token".to_string());
         assert!(config.enabled);
-        assert_eq!(config.bearer_token.expose_secret(), "explicit-token");
+        assert_eq!(config.bearer_token.load().expose_secret(), "explicit-token");
     }
 
     // =====================================================================
@@ -1006,7 +1216,7 @@ mod tests {
         // Whitespace-only token should still be "enabled" (non-empty)
         let config = ApiAuthConfig::new("   ".to_string());
         assert!(config.enabled);
-        assert_eq!(config.bearer_token.expose_secret(), "   ");
+        assert_eq!(config.bearer_token.load().expose_secret(), "   ");
     }
 
     #[tokio::test]
@@ -1079,7 +1289,7 @@ mod tests {
     fn test_api_auth_config_new_single_char_token() {
         let config = ApiAuthConfig::new("x".to_string());
         assert!(config.enabled);
-        assert_eq!(config.bearer_token.expose_secret(), "x");
+        assert_eq!(config.bearer_token.load().expose_secret(), "x");
     }
 
     #[tokio::test]
@@ -1126,7 +1336,7 @@ mod tests {
         let config = ApiAuthConfig::from_env(true);
         assert!(config.enabled);
         assert_eq!(
-            config.bearer_token.expose_secret(),
+            config.bearer_token.load().expose_secret(),
             "test-explicit-token-12345"
         );
 
@@ -1134,7 +1344,7 @@ mod tests {
         let config_live = ApiAuthConfig::from_env(false);
         assert!(config_live.enabled);
         assert_eq!(
-            config_live.bearer_token.expose_secret(),
+            config_live.bearer_token.load().expose_secret(),
             "test-explicit-token-12345"
         );
 
@@ -1152,7 +1362,7 @@ mod tests {
         unsafe { std::env::set_var("TV_API_TOKEN", "") };
         let config = ApiAuthConfig::from_env(true);
         assert!(!config.enabled, "empty token + dry_run = disabled");
-        assert!(config.bearer_token.expose_secret().is_empty());
+        assert!(config.bearer_token.load().expose_secret().is_empty());
         unsafe { std::env::remove_var("TV_API_TOKEN") };
     }
 
@@ -1165,9 +1375,9 @@ mod tests {
             config.enabled,
             "empty token + live = enabled with generated"
         );
-        assert!(!config.bearer_token.expose_secret().is_empty());
+        assert!(!config.bearer_token.load().expose_secret().is_empty());
         assert_eq!(
-            config.bearer_token.expose_secret().len(),
+            config.bearer_token.load().expose_secret().len(),
             36,
             "generated UUID v4 is 36 chars"
         );
@@ -1315,7 +1525,10 @@ mod tests {
         let config = ApiAuthConfig::new("test-token".to_string());
         // SecretString::expose_secret() returns &str — coerces from
         // SecretString only via the secrecy crate API, NEVER via Deref.
-        let exposed: &str = config.bearer_token.expose_secret();
+        // (W2#7: bind the hot-swap load guard first so the borrow outlives
+        // the temporary.)
+        let guard = config.bearer_token.load();
+        let exposed: &str = guard.expose_secret();
         assert_eq!(exposed, "test-token");
     }
 
@@ -1328,7 +1541,7 @@ mod tests {
         let config = ApiAuthConfig::from_token(token);
         assert!(config.enabled, "non-empty SecretString must enable auth");
         assert_eq!(
-            config.bearer_token.expose_secret(),
+            config.bearer_token.load().expose_secret(),
             "ssm-fetched-token",
             "token roundtrip"
         );
@@ -1361,7 +1574,7 @@ mod tests {
     }
 
     /// SEC-4: Constant-time comparison still works after the SecretString
-    /// migration. expose_bearer_token() returns the raw bytes only inside
+    /// migration. load_bearer_token() exposes the raw bytes only inside
     /// the auth middleware boundary.
     #[tokio::test]
     async fn test_from_token_full_auth_round_trip() {
@@ -1418,8 +1631,8 @@ mod tests {
     fn test_clone_preserves_secret_token_value() {
         let original = ApiAuthConfig::new("clone-me".to_string());
         let cloned = original.clone();
-        assert_eq!(original.bearer_token.expose_secret(), "clone-me");
-        assert_eq!(cloned.bearer_token.expose_secret(), "clone-me");
+        assert_eq!(original.bearer_token.load().expose_secret(), "clone-me");
+        assert_eq!(cloned.bearer_token.load().expose_secret(), "clone-me");
         assert_eq!(original.enabled, cloned.enabled);
     }
 
@@ -1433,7 +1646,7 @@ mod tests {
         // In-module access — verify accessor matches direct field access.
         assert_eq!(
             config.token_value_for_test(),
-            config.bearer_token.expose_secret()
+            config.bearer_token.load().expose_secret()
         );
         assert_eq!(config.token_value_for_test(), "private-field-test");
     }
@@ -1599,6 +1812,235 @@ mod tests {
         assert!(
             !src.contains(&banned_header_field) && !src.contains(&banned_auth_field),
             "auth-failure warns must NEVER log Authorization header values"
+        );
+    }
+    // -----------------------------------------------------------------------
+    // W2#7 — token rotation without restart + 401-triggered OOB reload hint
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_is_valid_reload_token_shape_gate() {
+        assert!(is_valid_reload_token("fresh-token-123"));
+        assert!(!is_valid_reload_token(""), "empty must be rejected");
+        assert!(
+            !is_valid_reload_token("has space"),
+            "whitespace must be rejected"
+        );
+        assert!(
+            !is_valid_reload_token("ctl\u{7}chr"),
+            "control chars must be rejected"
+        );
+        assert!(
+            !is_valid_reload_token("tok\nnewline"),
+            "newline must be rejected"
+        );
+        let oversized = "x".repeat(RELOAD_TOKEN_MAX_LEN + 1);
+        assert!(
+            !is_valid_reload_token(&oversized),
+            "oversized must be rejected"
+        );
+        let at_cap = "x".repeat(RELOAD_TOKEN_MAX_LEN);
+        assert!(is_valid_reload_token(&at_cap), "exactly at cap is valid");
+    }
+
+    #[test]
+    fn test_rotate_bearer_token_swaps_valid_value() {
+        let config = ApiAuthConfig::new("old-token".to_string());
+        let outcome = config.rotate_bearer_token(SecretString::from("new-token".to_string()));
+        assert_eq!(outcome, TokenReloadOutcome::Rotated);
+        assert_eq!(config.token_value_for_test(), "new-token");
+        assert!(config.enabled, "rotation never flips the enabled bit");
+    }
+
+    #[test]
+    fn test_rotate_bearer_token_rejects_empty() {
+        let config = ApiAuthConfig::new("old-token".to_string());
+        let outcome = config.rotate_bearer_token(SecretString::from(String::new()));
+        assert_eq!(outcome, TokenReloadOutcome::RejectedInvalid);
+        assert_eq!(
+            config.token_value_for_test(),
+            "old-token",
+            "fail-open: the current token must keep working"
+        );
+    }
+
+    #[test]
+    fn test_rotate_bearer_token_unchanged_on_same_value() {
+        let config = ApiAuthConfig::new("same-token".to_string());
+        let outcome = config.rotate_bearer_token(SecretString::from("same-token".to_string()));
+        assert_eq!(outcome, TokenReloadOutcome::Unchanged);
+        assert_eq!(config.token_value_for_test(), "same-token");
+    }
+
+    /// The rotation-visibility core: every per-request Clone shares the SAME
+    /// holder, so a swap through one handle is instantly visible via all
+    /// clones (the middleware's per-request State clone included).
+    #[test]
+    fn test_rotate_bearer_token_visible_across_clones() {
+        let config = ApiAuthConfig::new("boot-token".to_string());
+        let request_side_clone = config.clone();
+        let outcome = config.rotate_bearer_token(SecretString::from("rotated-token".to_string()));
+        assert_eq!(outcome, TokenReloadOutcome::Rotated);
+        assert_eq!(request_side_clone.token_value_for_test(), "rotated-token");
+    }
+
+    #[test]
+    fn test_should_request_oob_reload_floor() {
+        // Degenerate clock (now == 0, pre-1970/SystemTime-error) → denied:
+        // permitting it would CAS the 0→0 sentinel and permanently disable
+        // the floor (2026-07-10 hostile review MEDIUM #1).
+        assert!(!should_request_oob_reload(0, 0));
+        // Never triggered (sentinel 0) with a sane clock → allowed.
+        assert!(should_request_oob_reload(1_000, 0));
+        // Inside the floor → denied.
+        assert!(!should_request_oob_reload(1_000, 1_000));
+        assert!(!should_request_oob_reload(
+            1_000 + OOB_RELOAD_FLOOR_SECS - 1,
+            1_000
+        ));
+        // At/after the floor → allowed.
+        assert!(should_request_oob_reload(
+            1_000 + OOB_RELOAD_FLOOR_SECS,
+            1_000
+        ));
+        assert!(should_request_oob_reload(
+            1_000 + OOB_RELOAD_FLOOR_SECS + 1,
+            1_000
+        ));
+        // Clock regression (now < last) saturates to 0 elapsed → denied.
+        assert!(!should_request_oob_reload(900, 1_000));
+    }
+
+    #[tokio::test]
+    async fn test_request_oob_reload_floor_and_wait_oob_reload_wakeup() {
+        let config = ApiAuthConfig::new("token".to_string());
+        // First trigger is accepted and stores a permit even with no waiter.
+        assert!(config.request_oob_reload());
+        // Second trigger inside the 60s floor is denied.
+        assert!(
+            !config.request_oob_reload(),
+            "second trigger inside the floor must be denied"
+        );
+        // The stored permit wakes wait_oob_reload immediately (no lost hint).
+        tokio::time::timeout(std::time::Duration::from_secs(1), config.wait_oob_reload())
+            .await
+            .expect("stored notify permit must wake the waiter immediately");
+    }
+
+    #[test]
+    fn test_constant_time_token_eq() {
+        assert!(constant_time_token_eq(b"abc", b"abc"));
+        assert!(!constant_time_token_eq(b"abc", b"abd"));
+        assert!(!constant_time_token_eq(b"abc", b"abcd"), "length mismatch");
+        assert!(constant_time_token_eq(b"", b""), "empty == empty");
+    }
+
+    /// End-to-end rotation through the middleware: old token 401s after the
+    /// swap, new token is accepted — no restart, same router instance.
+    #[tokio::test]
+    async fn test_rotation_old_token_rejected_new_token_accepted() {
+        use axum::Router;
+        use axum::body::Body;
+        use axum::http::Request;
+        use axum::routing::get;
+        use tower::ServiceExt;
+
+        let config = ApiAuthConfig::new("boot-secret".to_string());
+        let rotator = config.clone();
+        let app = Router::new()
+            .route("/protected", get(mock_handler))
+            .layer(axum::middleware::from_fn_with_state(
+                config.clone(),
+                require_bearer_auth,
+            ))
+            .with_state(config);
+
+        // Boot token works.
+        let ok_before = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/protected")
+                    .header("Authorization", "Bearer boot-secret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ok_before.status(), StatusCode::OK);
+
+        // Rotate (as the SSM re-read task would).
+        assert_eq!(
+            rotator.rotate_bearer_token(SecretString::from("rotated-secret".to_string())),
+            TokenReloadOutcome::Rotated
+        );
+
+        // Old token dies at the swap instant.
+        let old_after = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/protected")
+                    .header("Authorization", "Bearer boot-secret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(old_after.status(), StatusCode::UNAUTHORIZED);
+
+        // New token accepted — no restart, same router.
+        let new_after = app
+            .oneshot(
+                Request::builder()
+                    .uri("/protected")
+                    .header("Authorization", "Bearer rotated-secret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(new_after.status(), StatusCode::OK);
+    }
+
+    /// Fail-open: a rejected (empty) swap leaves the current token serving.
+    #[tokio::test]
+    async fn test_rejected_swap_keeps_current_token_serving() {
+        use axum::Router;
+        use axum::body::Body;
+        use axum::http::Request;
+        use axum::routing::get;
+        use tower::ServiceExt;
+
+        let config = ApiAuthConfig::new("live-secret".to_string());
+        let rotator = config.clone();
+        let app = Router::new()
+            .route("/protected", get(mock_handler))
+            .layer(axum::middleware::from_fn_with_state(
+                config.clone(),
+                require_bearer_auth,
+            ))
+            .with_state(config);
+
+        assert_eq!(
+            rotator.rotate_bearer_token(SecretString::from(String::new())),
+            TokenReloadOutcome::RejectedInvalid
+        );
+
+        let still_ok = app
+            .oneshot(
+                Request::builder()
+                    .uri("/protected")
+                    .header("Authorization", "Bearer live-secret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            still_ok.status(),
+            StatusCode::OK,
+            "a rejected SSM value must never lock the operator out"
         );
     }
 }

@@ -6,7 +6,9 @@
 # Covers the original 6 scenarios PLUS the adversarial-review hardening
 # (2026-06-05): untracked new .rs (C1), digit-crate regex (H2), stale plan that
 # doesn't reference the change (H3), empty-body sections (M4), multi-file
-# PLAN-EXEMPT cap (M5).
+# PLAN-EXEMPT cap (M5) — PLUS the stale-plan-pile cap (V7, 2026-07-10): more
+# than PLAN_GATE_MAX_ACTIVE (default 5) active plans → BLOCK even when one of
+# them would individually satisfy the change (accumulation = vacuous wall).
 set -uo pipefail
 GATE="$(cd "$(dirname "$0")" && pwd)/plan-gate.sh"
 PASS=0; FAIL=0
@@ -83,6 +85,18 @@ s_digitcrate(){ mkdir -p crates/core2/src; echo "fn z(){}" > crates/core2/src/a.
 s_wrongcrate(){ echo "fn b(){}" >> crates/core/src/lib.rs; mkdir -p .claude/plans
   full_plan | sed 's/the core crate/the trading crate/; s/touches the core/touches the trading/' > .claude/plans/active-plan.md
   git add -A; git commit -qm "feat: core change, trading plan"; }
+# V7: 6 active plans (all individually valid + referencing core) — the PILE
+# itself must BLOCK, proving accumulation can no longer buy a vacuous pass.
+s_pile(){ echo "fn b(){}" >> crates/core/src/lib.rs; mkdir -p .claude/plans
+  for i in 1 2 3 4 5 6; do full_plan > ".claude/plans/active-plan-pile-$i.md"; done
+  git add -A; git commit -qm "feat: add b, six stale plans"; }
+# V7 boundary: exactly 5 plans (the cap), one satisfying -> still PASS.
+s_at_cap(){ echo "fn b(){}" >> crates/core/src/lib.rs; mkdir -p .claude/plans
+  for i in 1 2 3 4 5; do full_plan > ".claude/plans/active-plan-pile-$i.md"; done
+  git add -A; git commit -qm "feat: add b, five plans at cap"; }
+# V7 knob: same 6-plan pile but PLAN_GATE_MAX_ACTIVE raised -> PASS (selftest
+# knob only; CI never sets it, so the server-side wall enforces the default).
+s_pile_override(){ s_pile; }
 
 run "impl change + no plan -> BLOCK"                  2 s_no_plan
 run "impl change + PLAN-EXEMPT (1 file) -> PASS"      0 s_exempt
@@ -95,6 +109,21 @@ run "untracked NEW .rs file, no plan -> BLOCK (C1)"   2 s_untracked
 run "hollow plan (empty sections) -> BLOCK (M4)"      2 s_emptybody
 run "digit-crate (core2) src, no plan -> BLOCK (H2)"  2 s_digitcrate
 run "plan references wrong crate -> BLOCK (H3)"       2 s_wrongcrate
+run "6 active plans (> cap 5) -> BLOCK (V7)"          2 s_pile
+run "exactly 5 plans (at cap), one valid -> PASS (V7)" 0 s_at_cap
+# V7 knob cases — need the env var on the gate invocation itself. Guard the
+# setup (an impl change MUST exist, else the docs-only arm would pass vacuously).
+d=$(new_repo)
+( cd "$d"; s_pile_override ) >/dev/null 2>&1
+if [ "$(ls "$d"/.claude/plans/active-plan-pile-*.md 2>/dev/null | wc -l)" -ne 6 ]; then
+  echo "  FAIL : V7 knob setup broken (expected 6 pile plans)"; FAIL=$((FAIL+1))
+else
+  PLAN_GATE_MAX_ACTIVE=10 bash "$GATE" "$d" >/dev/null 2>&1
+  check "6 plans + PLAN_GATE_MAX_ACTIVE=10 -> PASS (V7 knob)" 0 $?
+  PLAN_GATE_MAX_ACTIVE=garbage bash "$GATE" "$d" >/dev/null 2>&1
+  check "6 plans + non-integer knob -> BLOCK (V7 fail-closed)" 2 $?
+fi
+rm -rf "$d"
 
 echo "  plan-gate self-test: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

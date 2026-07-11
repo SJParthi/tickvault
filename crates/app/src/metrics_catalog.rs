@@ -34,8 +34,79 @@
 //!     `&'static str` constants; no allocation on the hot path;
 //!   * `ALLOWED_*` slices → ratcheted by a runtime test in this same
 //!     module so any addition has to land here AND in the test.
+//!
+//! # Registered elsewhere — Dhan exchange-lag metrics (silent-feed Item 4)
+//!
+//! The 2026-07-06 silent-feed hardening added three metrics whose emit
+//! sites live in `tickvault_core::pipeline::feed_lag_monitor` (this app
+//! crate cannot host their names as consts without dead code — core cannot
+//! depend on app). Catalogued here for discoverability:
+//!   * `tv_dhan_exchange_lag_p99_seconds` — UNLABELED gauge, trailing-60s
+//!     exchange→receive lag p99, published every 10 s ONLY in-session
+//!     (regular [09:00,15:30) IST + Muhurat [18:00,19:30) when active)
+//!     with ≥50 samples. **Quantization floor: Dhan LTT is a u32 of whole IST
+//!     seconds, so the lag has a ≥1 s floor — a healthy p99 reads ~1–2 s
+//!     and can NEVER read 0; sub-second wire lag is UNMEASURABLE for
+//!     feed=dhan.** The dhan-only NAME (no `feed` label) sidesteps the
+//!     CloudWatch EMF host-only dimension label-folding trap.
+//!   * `tv_dhan_lag_samples_excluded_total` — counter of WAL-replay
+//!     samples excluded by the two-condition discriminator (receipt−capture
+//!     dwell ≥60 s AND pre-live-boundary capture — live rows delayed >60 s
+//!     in-pipeline by a consumer stall are KEPT; round-2 fix 2026-07-07)
+//!     (visible, never silent censoring — Rule 11). **CloudWatch-exported**:
+//!     it is in the 27-name host-only EMF allowlist of
+//!     `deploy/aws/cloudwatch-agent.json` + `user-data.sh.tftpl`
+//!     (~$0.30/mo, billed in silent-feed-alarms.tf / aws-budget.md) and is
+//!     pinned there by the EMF name-count ratchet.
+//!   * `tv_dhan_lag_negative_clamped_total` — /metrics-only counter of
+//!     negative-lag clamps (host-clock skew vs Dhan whole-second stamps);
+//!     NOT CloudWatch-exported (the only /metrics-only member of the trio).
+//! Plus the supervisor counter `tv_feed_lag_publisher_respawn_total{reason}`
+//! emitted by `spawn_supervised_feed_lag_publisher` in `main.rs`
+//! (WS-GAP-05/SLO-03 respawn pattern; `reason` labels are the static
+//! `classify_join_exit` set — no cardinality risk).
+//!
+//! # Registered elsewhere — Groww exchange-lag metrics (scoreboard PR-C)
+//!
+//! The 2026-07-11 scoreboard PR-C added the Groww mirror of the trio, emit
+//! sites also in `tickvault_core::pipeline::feed_lag_monitor`:
+//!   * `tv_groww_exchange_lag_p99_seconds` — UNLABELED gauge (its OWN name,
+//!     never a `feed` label on the Dhan gauge — the same EMF label-folding
+//!     trap), trailing-60s exchange→capture lag p99, 10 s cadence, same
+//!     in-session + ≥50-sample gates. **Semantics: Groww's exchange stamp
+//!     is MILLISECOND-precision (healthy p99 reads sub-second) and its
+//!     receipt clock is the sidecar's capture-at-receipt `capture_ns` —
+//!     one hop downstream of the socket, so not like-for-like with Dhan's
+//!     WS-dequeue receipt.** CloudWatch-exported: the ONE new EMF series of
+//!     PR-C (27-name allowlist, ~$0.30/mo, billed in silent-feed-alarms.tf
+//!     / aws-budget.md).
+//!   * `tv_groww_lag_samples_excluded_total{reason}` — /metrics-only
+//!     counter of excluded lines (`no_capture` = old-format/reconcile-sweep
+//!     rows; `stale_capture` = ≥60 s dwell INSIDE the bridge's byte-0
+//!     re-tail replay window (two-condition discriminator, 2026-07-11)) —
+//!     visible, never silent censoring (Rule 11). NOT CloudWatch-exported.
+//!   * `tv_groww_lag_backlog_admitted_total` — /metrics-only counter of
+//!     live ≥60 s preserved-offset backlog lines ADMITTED to the day
+//!     histogram only (the trailing-60s ring is skipped so the live p99
+//!     gauge is never polluted by a drain burst).
+//!   * `tv_groww_lag_negative_clamped_total` — /metrics-only counter of
+//!     negative-lag clamps (host-vs-Groww clock skew).
+//! Plus the per-feed DAY lag histograms (in-memory, drained into the
+//! `feed_scoreboard_daily` lag columns at 15:45 IST — no live metric) and
+//! the supervisor counter `tv_groww_lag_publisher_respawn_total{reason}`
+//! emitted by `spawn_supervised_groww_lag_publisher` in `main.rs` (single
+//! process-global-prefix spawn site — pinned in secret_manager.rs).
 
 #![allow(clippy::module_name_repetitions)]
+
+// Scoreboard PR-D (2026-07-11) — per-instrument presence registry
+// (`tickvault_core::pipeline::feed_presence`): deliberately ZERO metrics.
+// The hot fold is metrics-free by design (one papaya read + one relaxed
+// fetch_or; unregistered-fold / overflow counters are internal atomics
+// surfaced by the 15:45 drain's log line + the SCOREBOARD-01 error arms),
+// and per-instrument coverage is QuestDB-side data (`feed_coverage_daily`)
+// — never re-published as CloudWatch series (the design-§6 cost stance:
+// the scoreboard's ONE new EMF series remains the PR-C Groww lag gauge).
 
 /// Metric name for the per-component memory estimate gauge.
 ///

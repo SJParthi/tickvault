@@ -222,6 +222,17 @@ pub enum ErrorCode {
     /// (`reason="bare_dhan_reset"`) and the ceiling-exceeded fallback
     /// (`reason="ceiling_exceeded"`). Severity::Low.
     WsGap09WatchdogReconnectInPlace,
+    /// WS-GAP-10: the order-update WebSocket is in an in-market outage.
+    /// Tags three events (see `reason` field): `in_market_outage` — the
+    /// once-per-episode \[HIGH\] `OrderUpdateDisconnected` page fired from
+    /// INSIDE the never-give-up reconnect loop when consecutive in-market
+    /// failures reach 3 (the old task-exit emit in main.rs was dead code
+    /// since the WS-GAP-04 rewrite; verified live 2026-07-06: 39+ in-market
+    /// failures, zero HIGH pages); `threshold_streak` — the every-10th-failure
+    /// persist error; `task_exited_unreachable` — the defensive log at the
+    /// main.rs spawn site. Latch re-arms ONLY after a reconnect survives the
+    /// 60s stability window. Severity::High.
+    WsGap10OrderUpdateOutage,
     /// DISK-WATCHER-01: the spill disk-health watcher task exited
     /// (panic/cancel) and the supervisor respawned it so free-space
     /// monitoring — the early-warning for the "disk full + QuestDB down"
@@ -268,6 +279,18 @@ pub enum ErrorCode {
     /// TCP flush OFF the tick-consumer thread. Severity::High (a flapping
     /// flush worker means QuestDB ILP or the host is degrading).
     TickFlush01WorkerRespawn,
+    /// WAL-SUSPEND-01: a QuestDB table's WAL apply is SUSPENDED — the 60s
+    /// `wal_tables()` probe (W2 PR#6, 2026-07-10, audit follow-up row 10)
+    /// got a SUCCESSFUL response showing `suspended=true` for the table.
+    /// ILP ingestion keeps ACKing rows into the table's WAL, but they
+    /// silently stop becoming visible/durable-applied — the
+    /// silent-data-visibility-loss class (post disk-full episode or WAL
+    /// apply error). Edge-latched: ONE emit per (table, suspension
+    /// episode); a merely-DOWN QuestDB never fires this (down ≠ suspended
+    /// — BOOT-01/02 own that page). Severity::High; NEVER auto-triaged —
+    /// the recovery action `ALTER TABLE <t> RESUME WAL` is an operator
+    /// decision (auto-resume can replay into a still-broken disk).
+    WalSuspend01TableSuspended,
     /// PROC-01: an OOM kill was detected — the cgroup-v2 `memory.events`
     /// `oom_kill` counter rose above the boot-time baseline. Some process in
     /// this cgroup (tickvault itself or a sidecar) was killed by the kernel
@@ -286,6 +309,28 @@ pub enum ErrorCode {
     /// reconcile. Severity::Critical — auth is dead until the secret is
     /// fixed. AUTH-P11 (audit 2026-07-01).
     AuthGap04TotpRotatedExternally,
+    /// AUTH-GAP-05: sustained mid-session token-invalid — the mid-session
+    /// profile watchdog observed the consecutive-REAL-`/v2/profile`-failure
+    /// threshold during market hours and forced exactly ONE token re-mint
+    /// per failing episode via the existing renewal machinery
+    /// (lock-before-mint honored fail-closed; ~125s Dhan mint cooldown
+    /// honored; retry-once latch). Severity::High — the re-mint IS the
+    /// self-remediation; the standing CRITICAL profile page covers the
+    /// unrecovered case. (2026-07-06.)
+    AuthGap05ForcedRemintTriggered,
+    /// AUTH-GAP-06: fast-boot cached-token validation (2026-07-08 —
+    /// third morning cached-token outage, 08:32–09:06 IST on 2026-07-07).
+    /// The FAST crash-recovery boot arm validates the CACHED Dhan JWT with
+    /// ONE `GET /v2/profile` BEFORE any WebSocket spawn. A prefix-anchored
+    /// 401/403 rejection forces a re-mint through the existing TokenManager
+    /// machinery (RESILIENCE-03 in-flight tripwire preserved; the fast arm
+    /// passes `None` for the dual-instance lock flag — the documented §3
+    /// residual of `dual-instance-lock-2026-07-04.md`, unchanged). Any
+    /// other failure shape (transient network, REST-surface 400/429/5xx,
+    /// parse) proceeds with the cached token after ONE bounded retry —
+    /// loudly, never blocking boot. Severity::High — the re-mint /
+    /// degraded-proceed is the self-remediation; the operator must see it.
+    AuthGap06FastBootCachedTokenValidation,
     /// BOOT-01: slow-boot QuestDB readiness deadline approaching (>30s).
     Boot01QuestDbSlow,
     /// BOOT-02: boot deadline exceeded (>60s) — HALTING.
@@ -342,6 +387,12 @@ pub enum ErrorCode {
     /// TELEGRAM-02: coalescer state inconsistency (drain failed mid-window;
     /// next drain self-recovers). Informational.
     Telegram02CoalescerStateInconsistency,
+    /// TELEGRAM-03: episode live-edit machinery degraded (2026-07-07 UX
+    /// overhaul) — snapshot store write failed, rehydrate hit corrupt JSON,
+    /// or the edit-fallback ladder is storming. Delivery itself is
+    /// unaffected (duplicate-over-drop ladder terminates at TELEGRAM-01);
+    /// only the one-bubble-per-incident UX degrades.
+    Telegram03EpisodeDegraded,
 
     // -----------------------------------------------------------------------
     // Dhan Trading API (DH-9xx)
@@ -712,6 +763,17 @@ pub enum ErrorCode {
     /// resumes on respawn. Severity::High (a supervisor that keeps dying points at
     /// a real bug), auto-triage-safe (the respawn already self-healed).
     FeedSupervisor01Respawned,
+    /// FEED-REJECT-01 (2026-07-09) — a live-feed sidecar opened an
+    /// operator-actionable reject/error episode (the once-per-child alert edge
+    /// that fires the fixed-wording Telegram), and the supervisor captured a
+    /// BOUNDED (≤160 chars), secret-redacted SIGNATURE of the triggering
+    /// sidecar diagnostic line into the coded error stream. Closes the
+    /// 2026-07-09 all-day reject-loop blindness: the Telegram wording is fixed
+    /// per class (10-commandments correct), so without this code the operator
+    /// (and triage) could not query errors.jsonl / CloudWatch for WHY the loop
+    /// repeats. Severity::High, auto-triage-safe (visibility only — the
+    /// restart/backoff machinery already owns recovery).
+    FeedReject01SidecarErrorDetail,
     /// HTTP-CLIENT-01 (C2 2026-07-03) — `reqwest::ClientBuilder::build()`
     /// failed (TLS backend init / resolver init / fd exhaustion). Previously
     /// 8 storage sites fell back to `Client::new()`, which PANICS on the
@@ -810,6 +872,39 @@ pub enum ErrorCode {
     /// only — the production capture chain is untouched. Severity::Medium,
     /// auto-triage-safe.
     GrowwNative04WriterFailed,
+    /// FUTIDX-01 (§36 2026-07-08; §36.7 all monthly expiries 2026-07-10) —
+    /// the index-future selection degraded on one feed: a whole underlying
+    /// (no FUT rows / all expiries past / unparsable expiry / monthly serial
+    /// flood) or a single month (ambiguous duplicate expiry / candidate
+    /// flood at that expiry — the payload's `expiry` field names it). That
+    /// feed runs WITHOUT that future (or that month) for the day — degrade,
+    /// never HALT; the spot universe is unaffected. Severity::High,
+    /// auto-triage-safe (the degrade already happened; operator inspects the
+    /// day's master CSV + the alias-drift evidence payload at leisure).
+    Futidx01SelectionDegraded,
+    /// FUTIDX-02 (§36 2026-07-08; §36.7 expiry-SET parity 2026-07-10) — the
+    /// boot-time cross-feed comparator found the Dhan and Groww builds chose
+    /// DIVERGENT expiry sets in a comparable month (nearest differs, a hole,
+    /// or one-sided presence) for an index-future underlying (a pure
+    /// far-suffix depth difference is an info-level note, never this code).
+    /// Both feeds STAY LIVE
+    /// (visibility, never a halt); cross-feed rows for that underlying are
+    /// not comparable that day. One vendor's master is stale/divergent —
+    /// operator compares the two masters' FUT rows and records a dated note.
+    /// Severity::High.
+    Futidx02CrossFeedExpiryMismatch,
+    /// SCOREBOARD-01 (dual-feed scoreboard PR-A, 2026-07-10) — the daily
+    /// 15:45 IST Dhan-vs-Groww scoreboard aggregation was DEGRADED: a
+    /// QuestDB `/exec` read failed (sentinels recorded, never fabricated
+    /// zeros), the `feed_scoreboard_daily` / `feed_episode_audit` ILP write
+    /// was rejected, the boot-time process-death reconciliation could not
+    /// read/write, or the same-day `ws_event_audit` drop counter shows the
+    /// episode source under-counted. Best-effort forensic aggregate
+    /// (AUDIT-WS-01 / GROWW-MASTER-01 class) — the live feeds, tick capture
+    /// and trading are NEVER affected; DEDUP-idempotent re-runs
+    /// (`TICKVAULT_SCOREBOARD_NOW`) backfill the day. Severity::Medium,
+    /// auto-triage-safe.
+    Scoreboard01AggregationDegraded,
 }
 
 impl ErrorCode {
@@ -868,14 +963,18 @@ impl ErrorCode {
             Self::WsGap07LiveChannelClosed => "WS-GAP-07",
             Self::WsGap08RateLimitCooldown => "WS-GAP-08",
             Self::WsGap09WatchdogReconnectInPlace => "WS-GAP-09",
+            Self::WsGap10OrderUpdateOutage => "WS-GAP-10",
             Self::DiskWatcher01Respawned => "DISK-WATCHER-01",
             Self::WsSpill01WriterRespawn => "WS-SPILL-01",
             Self::WsSpill02FrameDropped => "WS-SPILL-02",
             Self::WsReinject01Aborted => "WS-REINJECT-01",
             Self::TickFlush01WorkerRespawn => "TICK-FLUSH-01",
+            Self::WalSuspend01TableSuspended => "WAL-SUSPEND-01",
             Self::Proc01OomKillDetected => "PROC-01",
             Self::AuthGap03TokenForceRenewedOnWake => "AUTH-GAP-03",
             Self::AuthGap04TotpRotatedExternally => "AUTH-GAP-04",
+            Self::AuthGap05ForcedRemintTriggered => "AUTH-GAP-05",
+            Self::AuthGap06FastBootCachedTokenValidation => "AUTH-GAP-06",
             Self::Boot01QuestDbSlow => "BOOT-01",
             Self::Boot02DeadlineExceeded => "BOOT-02",
             Self::Boot03ClockSkewExceeded => "BOOT-03",
@@ -891,6 +990,7 @@ impl ErrorCode {
             // Wave 3 — Telegram dispatcher (Item 11)
             Self::Telegram01Dropped => "TELEGRAM-01",
             Self::Telegram02CoalescerStateInconsistency => "TELEGRAM-02",
+            Self::Telegram03EpisodeDegraded => "TELEGRAM-03",
             // Wave 3-C — market-open self-test (Item 12)
             Self::Selftest01Passed => "SELFTEST-01",
             Self::Selftest02Failed => "SELFTEST-02",
@@ -969,6 +1069,8 @@ impl ErrorCode {
             Self::GrowwMaster01PersistFailed => "GROWW-MASTER-01",
             Self::FeedStall01SidecarRestarted => "FEED-STALL-01",
             Self::FeedSupervisor01Respawned => "FEED-SUPERVISOR-01",
+            // 2026-07-09: bounded sidecar reject-cause signature surfacing
+            Self::FeedReject01SidecarErrorDetail => "FEED-REJECT-01",
             // C2 (2026-07-03): panic-free reqwest client construction
             Self::HttpClient01BuildFailed => "HTTP-CLIENT-01",
             // §34 (2026-07-03): Groww multi-connection auto-scale ladder
@@ -982,6 +1084,10 @@ impl ErrorCode {
             Self::GrowwNative02AuthFailed => "GROWW-NATIVE-02",
             Self::GrowwNative03DecodeFailed => "GROWW-NATIVE-03",
             Self::GrowwNative04WriterFailed => "GROWW-NATIVE-04",
+            Self::Futidx01SelectionDegraded => "FUTIDX-01",
+            Self::Futidx02CrossFeedExpiryMismatch => "FUTIDX-02",
+            // Dual-feed scoreboard PR-A (2026-07-10)
+            Self::Scoreboard01AggregationDegraded => "SCOREBOARD-01",
         }
     }
 
@@ -1076,6 +1182,9 @@ impl ErrorCode {
             | Self::RestCanary01ProbeFailed
             // WS-GAP-07 — live frame channel closed (tick consumer died)
             | Self::WsGap07LiveChannelClosed
+            // WS-GAP-10 — order confirmations feed down in-market; the loop
+            // self-retries but the operator must see it (2026-07-06 incident)
+            | Self::WsGap10OrderUpdateOutage
             // WS-SPILL-01 — WAL writer respawned (flapping writer = disk dying)
             | Self::WsSpill01WriterRespawn
             // WS-REINJECT-01 — boot WAL re-injection aborted (consumer dead/
@@ -1085,6 +1194,12 @@ impl ErrorCode {
             // TICK-FLUSH-01 — off-thread tick flush worker respawned (B6);
             // flapping = QuestDB ILP / host degrading
             | Self::TickFlush01WorkerRespawn
+            // WAL-SUSPEND-01 — a table's WAL apply is suspended (W2 PR#6):
+            // silent data-visibility loss until the operator RESUMEs WAL.
+            // High, not Critical: the rows are durably in the table's WAL
+            // (apply resumes them) — staleness + disk growth, not
+            // permanent loss; but operator action IS required.
+            | Self::WalSuspend01TableSuspended
             // DHAN-LANE-01/02/03 — runtime Dhan-lane cold-start failures (D2b
             // 2026-06-26): a failed cold-start returns the FSM to Off + pages
             // the operator, never a half-running lane. High (operator must
@@ -1099,6 +1214,11 @@ impl ErrorCode {
             // persistent provider-side reject).
             | Self::FeedStall01SidecarRestarted
             | Self::FeedSupervisor01Respawned
+            // FEED-REJECT-01 (2026-07-09) — a sidecar reject/error episode
+            // opened; the coded line carries the bounded cause signature the
+            // operator needs to triage a recurring reject loop. High: it
+            // accompanies the HIGH GrowwSidecarRejected Telegram page.
+            | Self::FeedReject01SidecarErrorDetail
             // BP-08 (2026-07-01) — fd / RSS / spill-free early-warning
             // monitors: page at 80% so the operator acts before exhaustion.
             | Self::Resource01FdCountHigh
@@ -1108,6 +1228,18 @@ impl ErrorCode {
             // host is under TLS/resolver/fd pressure; the site already
             // degraded gracefully, but the operator must see it (High).
             | Self::HttpClient01BuildFailed
+            // AUTH-GAP-05 (2026-07-06) — sustained mid-session token-invalid
+            // forced a re-mint. High: the re-mint IS the self-remediation
+            // (auto-triage safe); the existing CRITICAL profile page covers
+            // the unrecovered case.
+            | Self::AuthGap05ForcedRemintTriggered
+            // AUTH-GAP-06 (2026-07-08) — fast-boot cached-token validation:
+            // a Dhan-rejected cached token was re-minted before any WS
+            // spawn, or the validation degraded and boot proceeded loudly
+            // with the cached token. High: the action already self-applied;
+            // the operator must see every occurrence (a repeat every boot
+            // means the cache/mint chain is broken).
+            | Self::AuthGap06FastBootCachedTokenValidation
             // GROWW-SCALE-01/02 (§34 2026-07-03) — the auto-scale ladder
             // rolled back a failed rung / halved on fleet-wide failure. The
             // auto-correction already applied; the operator must see every
@@ -1115,6 +1247,12 @@ impl ErrorCode {
             // server-side cap).
             | Self::GrowwScale01RollbackFired
             | Self::GrowwScale02GlobalHalve => Severity::High,
+            // FUTIDX-01/02 (§36 2026-07-08) — per-underlying selection degrade
+            // / cross-feed expiry divergence. Loud (Telegram High), never a
+            // halt; the spot universe + both live feeds are unaffected.
+            Self::Futidx01SelectionDegraded | Self::Futidx02CrossFeedExpiryMismatch => {
+                Severity::High
+            }
             // Medium: data pipeline correctness
             // PR #6b (2026-05-19): I-P0-01/02/04/05 retired with their modules.
             Self::InstrumentP1CrossSegmentCollision
@@ -1173,7 +1311,11 @@ impl ErrorCode {
             | Self::GrowwNative01ConnectFailed
             | Self::GrowwNative02AuthFailed
             | Self::GrowwNative03DecodeFailed
-            | Self::GrowwNative04WriterFailed => Severity::Medium,
+            | Self::GrowwNative04WriterFailed
+            // SCOREBOARD-01 (2026-07-10): best-effort daily forensic
+            // aggregate degraded; feeds/capture/trading unaffected, the
+            // DEDUP-idempotent re-run backfills. Medium.
+            | Self::Scoreboard01AggregationDegraded => Severity::Medium,
             // Low: trading-day / Dhan other
             // PR #6a (2026-05-19): I-P1-01 (DailyScheduler) + I-P1-02 (DeltaFieldCoverage) retired
             Self::InstrumentP2TradingDayGuard
@@ -1185,7 +1327,10 @@ impl ErrorCode {
             | Self::WsGap09WatchdogReconnectInPlace
             | Self::DiskWatcher01Respawned
             | Self::AuthGap03TokenForceRenewedOnWake
-            | Self::Telegram02CoalescerStateInconsistency => Severity::Low,
+            | Self::Telegram02CoalescerStateInconsistency
+            // TELEGRAM-03 (2026-07-07): episode UX degradation only — the
+            // never-drop delivery ladder is untouched, so Low.
+            | Self::Telegram03EpisodeDegraded => Severity::Low,
         }
     }
 
@@ -1238,12 +1383,17 @@ impl ErrorCode {
             Self::TickFlush01WorkerRespawn => {
                 ".claude/rules/project/tick-flush-worker-error-codes.md"
             }
+            // W2 PR#6 (2026-07-10): per-table WAL-suspension probe
+            Self::WalSuspend01TableSuspended => {
+                ".claude/rules/project/wal-suspension-error-codes.md"
+            }
             Self::WsGap04PostCloseSleep
             | Self::WsGap05PoolRespawn
             | Self::WsGap06TickGapSummary
             | Self::WsGap07LiveChannelClosed
             | Self::WsGap08RateLimitCooldown
             | Self::WsGap09WatchdogReconnectInPlace
+            | Self::WsGap10OrderUpdateOutage
             | Self::DiskWatcher01Respawned
             | Self::AuthGap03TokenForceRenewedOnWake
             | Self::Boot01QuestDbSlow
@@ -1259,9 +1409,9 @@ impl ErrorCode {
                 ".claude/rules/project/ws-event-audit-error-codes.md"
             }
             Self::Boot03ClockSkewExceeded => ".claude/rules/project/wave-2-c-error-codes.md",
-            Self::Telegram01Dropped | Self::Telegram02CoalescerStateInconsistency => {
-                ".claude/rules/project/wave-3-error-codes.md"
-            }
+            Self::Telegram01Dropped
+            | Self::Telegram02CoalescerStateInconsistency
+            | Self::Telegram03EpisodeDegraded => ".claude/rules/project/wave-3-error-codes.md",
             Self::Selftest01Passed | Self::Selftest02Failed => {
                 ".claude/rules/project/wave-3-c-error-codes.md"
             }
@@ -1303,6 +1453,12 @@ impl ErrorCode {
             // AUTH-P11 (2026-07-01) — TOTP secret rotated externally (promotes
             // the RESERVED AUTH-GAP-04 stub in wave-4-error-codes.md).
             | Self::AuthGap04TotpRotatedExternally
+            // AUTH-GAP-05 (2026-07-06) — sustained mid-session token-invalid:
+            // forced re-mint triggered (runbook §AUTH-GAP-05).
+            | Self::AuthGap05ForcedRemintTriggered
+            // AUTH-GAP-06 (2026-07-08) — fast-boot cached-token validation
+            // (runbook §AUTH-GAP-06).
+            | Self::AuthGap06FastBootCachedTokenValidation
             // BP-08 (2026-07-01) — fd / RSS / spill-free early-warning monitors
             // (promotes the RESERVED RESOURCE-01/02/03 stubs).
             | Self::Resource01FdCountHigh
@@ -1363,7 +1519,9 @@ impl ErrorCode {
                 ".claude/rules/project/groww-shared-master-error-codes.md"
             }
             // 2026-06-30: feed-agnostic sidecar stall-watchdog + supervisor respawn
-            Self::FeedStall01SidecarRestarted | Self::FeedSupervisor01Respawned => {
+            Self::FeedStall01SidecarRestarted
+            | Self::FeedSupervisor01Respawned
+            | Self::FeedReject01SidecarErrorDetail => {
                 ".claude/rules/project/feed-stall-watchdog-error-codes.md"
             }
             // C2 (2026-07-03): panic-free reqwest client construction
@@ -1385,6 +1543,13 @@ impl ErrorCode {
             | Self::GrowwNative04WriterFailed => {
                 ".claude/rules/project/groww-native-rust-error-codes.md"
             }
+            Self::Futidx01SelectionDegraded | Self::Futidx02CrossFeedExpiryMismatch => {
+                ".claude/rules/project/futidx-4-error-codes.md"
+            }
+            // Dual-feed scoreboard PR-A (2026-07-10)
+            Self::Scoreboard01AggregationDegraded => {
+                ".claude/rules/project/dual-feed-scoreboard-error-codes.md"
+            }
         }
     }
 
@@ -1393,8 +1558,26 @@ impl ErrorCode {
     /// daemon will log a summary and stop.
     ///
     /// Conservative default: Critical errors are NEVER auto-actioned.
+    ///
+    /// Severity-independent overrides (design contracts pinning MANUAL
+    /// triage on a non-Critical code):
+    /// - `FUTIDX-02` (hostile-review round 3, 2026-07-08): a cross-feed
+    ///   data-comparability verdict must never be auto-actioned — the
+    ///   operator judges WHICH vendor master is stale (design contract
+    ///   `is_auto_triage_safe() == false`; previously drifted to the
+    ///   blanket severity derivation and papered over in runbook prose).
+    /// - `WAL-SUSPEND-01` (W2 PR#6, 2026-07-10): the recovery action
+    ///   `ALTER TABLE <t> RESUME WAL` is an OPERATOR decision — resuming
+    ///   into a still-broken disk replays the failure; auto-triage must
+    ///   never execute it.
     #[must_use]
     pub const fn is_auto_triage_safe(self) -> bool {
+        if matches!(
+            self,
+            Self::Futidx02CrossFeedExpiryMismatch | Self::WalSuspend01TableSuspended
+        ) {
+            return false;
+        }
         !matches!(self.severity(), Severity::Critical)
     }
 
@@ -1468,14 +1651,18 @@ impl ErrorCode {
             Self::WsGap07LiveChannelClosed,
             Self::WsGap08RateLimitCooldown,
             Self::WsGap09WatchdogReconnectInPlace,
+            Self::WsGap10OrderUpdateOutage,
             Self::DiskWatcher01Respawned,
             Self::WsSpill01WriterRespawn,
             Self::WsSpill02FrameDropped,
             Self::WsReinject01Aborted,
             Self::TickFlush01WorkerRespawn,
+            Self::WalSuspend01TableSuspended,
             Self::Proc01OomKillDetected,
             Self::AuthGap03TokenForceRenewedOnWake,
             Self::AuthGap04TotpRotatedExternally,
+            Self::AuthGap05ForcedRemintTriggered,
+            Self::AuthGap06FastBootCachedTokenValidation,
             Self::Boot01QuestDbSlow,
             Self::Boot02DeadlineExceeded,
             Self::Boot03ClockSkewExceeded,
@@ -1490,6 +1677,7 @@ impl ErrorCode {
             Self::StorageGap04S3ArchiveFailed,
             Self::Telegram01Dropped,
             Self::Telegram02CoalescerStateInconsistency,
+            Self::Telegram03EpisodeDegraded,
             Self::Selftest01Passed,
             Self::Selftest02Failed,
             Self::Slo01Healthy,
@@ -1545,6 +1733,7 @@ impl ErrorCode {
             // 2026-06-30: feed-agnostic sidecar stall-watchdog + supervisor respawn
             Self::FeedStall01SidecarRestarted,
             Self::FeedSupervisor01Respawned,
+            Self::FeedReject01SidecarErrorDetail,
             // C2 (2026-07-03): panic-free reqwest client construction
             Self::HttpClient01BuildFailed,
             // §34 (2026-07-03): Groww multi-connection auto-scale ladder
@@ -1559,6 +1748,10 @@ impl ErrorCode {
             Self::GrowwNative02AuthFailed,
             Self::GrowwNative03DecodeFailed,
             Self::GrowwNative04WriterFailed,
+            Self::Futidx01SelectionDegraded,
+            Self::Futidx02CrossFeedExpiryMismatch,
+            // Dual-feed scoreboard PR-A (2026-07-10)
+            Self::Scoreboard01AggregationDegraded,
         ]
     }
 }
@@ -1868,7 +2061,54 @@ mod tests {
         // bumped 128 -> 129 for GROWW-SCALE-05 (dual scale-fleet instance
         // detected / SSM lock unprovable — fleet spawn refused fail-closed,
         // single-connection fallback).
-        assert_eq!(ErrorCode::all().len(), 129);
+        // 2026-07-06 (order-update outage paging PR-1): bumped 129 -> 130 for
+        // WS-GAP-10 (order-update in-market outage — the reachable in-loop
+        // [HIGH] page; the old task-exit emit was dead code since WS-GAP-04).
+        // 2026-07-07 (Telegram UX overhaul — episode live-edit coalescing):
+        // bumped 130 -> 131 for TELEGRAM-03 (episode machinery degraded:
+        // store_write_failed / rehydrate_corrupt / edit_fallback_storm —
+        // delivery unaffected, UX-only degrade, Severity::Low).
+        // 2026-07-06 (AUTH-GAP-05 token self-heal): bumped 131 -> 132 for
+        // AUTH-GAP-05 (sustained mid-session token-invalid — forced re-mint
+        // triggered via the existing renewal machinery; lock-before-mint +
+        // ~125s cooldown + retry-once latch honored).
+        // 2026-07-08 (§36 FUTIDX-4): bumped 132 -> 134 for FUTIDX-01
+        // (per-underlying nearest-expiry selection degraded, per feed) +
+        // FUTIDX-02 (cross-feed expiry mismatch) — both Severity::High.
+        // 2026-07-08 (AUTH-GAP-06 fast-boot cached-token validation):
+        // bumped 134 -> 135 — one GET /v2/profile validates the cached JWT
+        // before any WebSocket spawn on the fast crash-recovery arm; a
+        // prefix-anchored 401/403 forces a re-mint via the existing
+        // TokenManager machinery (2026-07-07 third morning outage).
+        // 2026-07-09 (Groww reject-loop hardening): bumped 135 -> 136 for
+        // FEED-REJECT-01 — bounded, secret-redacted sidecar reject-cause
+        // signature surfaced at the once-per-child alert edge (the all-day
+        // 09:22/14:17 IST reject loop was invisible in the coded stream).
+        // 2026-07-10 (W2 PR#6, audit follow-up row 10): bumped 136 -> 137
+        // for WAL-SUSPEND-01 — per-table QuestDB WAL-apply suspension probe
+        // (a suspended table keeps ACKing ILP rows while they silently stop
+        // becoming visible; previously zero signal).
+        // 2026-07-10 (dual-feed scoreboard PR-A): bumped 137 -> 138 for
+        // SCOREBOARD-01 — the daily 15:45 IST Dhan-vs-Groww scoreboard
+        // aggregation degraded (best-effort forensic aggregate; sentinels,
+        // never fabricated zeros; DEDUP-idempotent re-run backfills).
+        assert_eq!(ErrorCode::all().len(), 138);
+    }
+
+    #[test]
+    fn test_telegram_03_episode_degraded_contract() {
+        // Telegram UX overhaul (2026-07-07): episode live-edit machinery
+        // degrade signal. Low + auto-triage-safe — delivery is never at
+        // risk (the fallback ladder terminates at TELEGRAM-01 loudness).
+        let code = ErrorCode::Telegram03EpisodeDegraded;
+        assert_eq!(code.code_str(), "TELEGRAM-03");
+        assert_eq!("TELEGRAM-03".parse::<ErrorCode>(), Ok(code));
+        assert_eq!(code.severity(), Severity::Low);
+        assert!(code.is_auto_triage_safe());
+        assert_eq!(
+            code.runbook_path(),
+            ".claude/rules/project/wave-3-error-codes.md"
+        );
     }
 
     #[test]
@@ -1896,6 +2136,33 @@ mod tests {
             "GROWW-SCALE-05 runbook missing on disk: {shown}"
         );
         assert!(ErrorCode::all().contains(&code));
+    }
+
+    #[test]
+    fn test_futidx_codes_contract() {
+        // §36 FUTIDX-4 (hostile-review round 3, 2026-07-08).
+        let f1 = ErrorCode::Futidx01SelectionDegraded;
+        assert_eq!(f1.code_str(), "FUTIDX-01");
+        assert_eq!("FUTIDX-01".parse::<ErrorCode>(), Ok(f1));
+        assert_eq!(f1.severity(), Severity::High);
+        // Per-feed degrade self-heals next boot — auto-triage may inspect.
+        assert!(f1.is_auto_triage_safe());
+
+        let f2 = ErrorCode::Futidx02CrossFeedExpiryMismatch;
+        assert_eq!(f2.code_str(), "FUTIDX-02");
+        assert_eq!("FUTIDX-02".parse::<ErrorCode>(), Ok(f2));
+        assert_eq!(f2.severity(), Severity::High);
+        // Design contract (futidx-4-error-codes.md §2 + the R3-4 record in
+        // .claude/plans/active-plan-futidx-4.md — the in-repo authority;
+        // round 4 replaced a dangling scratchpad "FINAL.md" citation that
+        // never landed in the tree): a cross-feed comparability
+        // verdict is NEVER auto-actioned despite being non-Critical — the
+        // severity-independent override arm, not the blanket derivation.
+        assert!(!f2.is_auto_triage_safe());
+        assert_eq!(
+            f2.runbook_path(),
+            ".claude/rules/project/futidx-4-error-codes.md"
+        );
     }
 
     #[test]
@@ -1988,6 +2255,8 @@ mod tests {
                 || s.starts_with("REST-CANARY-")
                 // B6 (2026-07-03): off-thread tick ILP flush worker.
                 || s.starts_with("TICK-FLUSH-")
+                // W2 PR#6 (2026-07-10): per-table WAL-suspension probe.
+                || s.starts_with("WAL-SUSPEND-")
                 // PR #450 commit 8b (2026-05-03): prev_oi cache state.
                 || s.starts_with("PREVOI-")
                 // Wave 6 Sub-PR #1: multi-TF aggregator + boundary timer.
@@ -2030,10 +2299,17 @@ mod tests {
                 // 2026-06-30: feed-agnostic sidecar stall-watchdog + respawn
                 || s.starts_with("FEED-STALL-")
                 || s.starts_with("FEED-SUPERVISOR-")
+                // 2026-07-09: bounded sidecar reject-cause signature surfacing
+                || s.starts_with("FEED-REJECT-")
                 // Wave-4-E1 / BP-07 (2026-07-01): OOM-kill monitor.
                 || s.starts_with("PROC-")
                 // C2 (2026-07-03): panic-free reqwest client construction.
-                || s.starts_with("HTTP-CLIENT-");
+                || s.starts_with("HTTP-CLIENT-")
+                // §36 (2026-07-08; §36.7 all-months 2026-07-10): FUTIDX
+                // index futures.
+                || s.starts_with("FUTIDX-")
+                // Dual-feed scoreboard PR-A (2026-07-10).
+                || s.starts_with("SCOREBOARD-");
             assert!(has_known_prefix, "unexpected code prefix: {s}");
         }
     }

@@ -160,6 +160,35 @@ fn unique_dir(tag: &str) -> PathBuf {
     dir
 }
 
+/// Current wall-clock as IST epoch nanos — the sidecar's `now_ist_nanos()`
+/// convention (UTC epoch + 19,800s), the SAME epoch the bridge's
+/// `receipt_ist_nanos` / `groww_status_is_live` freshness gate compares against.
+fn now_ist_nanos() -> i64 {
+    chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        + tickvault_common::constants::IST_UTC_OFFSET_NANOS
+}
+
+/// Write the sidecar connect+subscribe PROOF status file EXACTLY like the real
+/// sidecar's `write_status` (groww_sidecar.py): event + counts + a FRESH
+/// IST-epoch `ts_ist_nanos` write stamp. The bridge's stale-status freshness
+/// gate (2026-07-06 fix) accepts a record only when its stamp is at/after the
+/// bridge's OWN start (the live floor) and within 120s of now — a stampless or
+/// pre-spawn record is honestly rejected as a prior-incarnation fossil. Tests
+/// that assert `connected` must therefore keep this record fresh, exactly like
+/// the real sidecar (which rewrites the status ≤1s apart on real emits) — the
+/// gate itself is never weakened here.
+fn write_status_streaming(path: &std::path::Path, stocks: u64, indices: u64) {
+    std::fs::write(
+        path,
+        format!(
+            "{{\"event\":\"streaming\",\"stocks\":{stocks},\"indices\":{indices},\"total\":{},\"ts_ist_nanos\":{}}}",
+            stocks + indices,
+            now_ist_nanos(),
+        ),
+    )
+    .expect("write status");
+}
+
 /// One synthetic NDJSON tick line in the EXACT sidecar schema.
 fn ndjson(security_id: i64, segment: &str, ts_ist_nanos: i64, ltp: f64, cum_volume: i64) -> String {
     let exchange_ts_millis = ts_ist_nanos / 1_000_000;
@@ -244,12 +273,11 @@ async fn groww_ticks_and_candles_land_tagged_feed_groww() {
     let tick_file = dir.join("live-ticks.ndjson");
     let status_file = dir.join("groww-status.json");
     std::fs::write(&tick_file, &nd).expect("write ndjson");
-    // Status file: the sidecar's connect+subscribe PROOF (streaming).
-    std::fs::write(
-        &status_file,
-        r#"{"event":"streaming","stocks":5,"indices":1,"total":6}"#,
-    )
-    .expect("write status");
+    // Status file: the sidecar's connect+subscribe PROOF (streaming), stamped
+    // fresh in the real sidecar's format. This pre-spawn write is (correctly)
+    // rejected by the freshness gate as pre-floor; the refresher task below
+    // supplies the post-spawn fresh proof.
+    write_status_streaming(&status_file, 5, 1);
 
     // Enable Groww + spawn the PUBLIC event-driven bridge against the temp files.
     let feeds = FeedsConfig {
@@ -270,7 +298,23 @@ async fn groww_ticks_and_candles_land_tagged_feed_groww() {
         test_aggregator(),
         std::sync::Arc::new(tickvault_app::groww_bridge::GrowwAuditLatches::default()),
         std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0)),
+        None,
     ));
+
+    // Mirror the real sidecar's ≤1s status rewrite on real emits: keep the
+    // streaming PROOF record FRESH (stamped at/after the bridge's live floor,
+    // which is set at bridge-task start) so the stale-status freshness gate
+    // can honestly latch `connected`. Without this, the single pre-spawn
+    // write above is rejected as a prior-incarnation fossil — the gate's
+    // exact design (2026-07-06 stale-status false-OK fix). Bounded loop
+    // (60s) comfortably outlives every assertion deadline below.
+    let refresher_status = status_file.clone();
+    let _status_refresher = tokio::spawn(async move {
+        for _ in 0..240 {
+            write_status_streaming(&refresher_status, 5, 1);
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    });
 
     // --- Assert the 5 ticks landed in `ticks` tagged feed='groww' ---
     let ticks_sql =
@@ -284,11 +328,8 @@ async fn groww_ticks_and_candles_land_tagged_feed_groww() {
     // The connect+subscribe PROOF must have flipped connected (streaming) + recorded
     // counts. Poll briefly: QuestDB WAL-apply can surface the row a beat before the
     // bridge's same-iteration `set_connected` is observable from this thread.
-    let now_ist = || {
-        chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
-            + tickvault_common::constants::IST_UTC_OFFSET_NANOS
-    };
-    let connect_deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let now_ist = now_ist_nanos;
+    let connect_deadline = std::time::Instant::now() + Duration::from_secs(10);
     while std::time::Instant::now() < connect_deadline
         && !feed_health
             .snapshot(Feed::Groww, true, true, true, now_ist())
@@ -432,6 +473,7 @@ async fn malformed_ndjson_line_is_skipped_and_valid_lines_land() {
         test_aggregator(),
         std::sync::Arc::new(tickvault_app::groww_bridge::GrowwAuditLatches::default()),
         std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0)),
+        None,
     ));
 
     let ticks_sql =
@@ -505,6 +547,7 @@ async fn replay_same_ndjson_is_idempotent_no_duplicate_rows() {
             test_aggregator(),
             std::sync::Arc::new(tickvault_app::groww_bridge::GrowwAuditLatches::default()),
             std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0)),
+            None,
         ));
         let _ = wait_until_count(&ticks_sql, 3, Duration::from_secs(15)).await;
         bridge.abort();

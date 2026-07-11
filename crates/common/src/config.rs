@@ -75,6 +75,13 @@ pub struct ApplicationConfig {
     /// behaviour byte-identical.
     #[serde(default)]
     pub feeds: FeedsConfig,
+    /// `[scoreboard]` — dual-feed daily scoreboard (operator directive
+    /// 2026-07-10: run Dhan + Groww live for a month, everything tracked,
+    /// captured, blame-attributed). Aggregation-only in PR-A (reads
+    /// existing tables), so `enabled` defaults ON — safe-on; flipping it
+    /// off is the whole-subsystem rollback switch (B12).
+    #[serde(default)]
+    pub scoreboard: ScoreboardConfig,
 }
 
 /// `[feeds]` — pluggable market-data feed selection (operator lock
@@ -278,6 +285,64 @@ fn default_groww_scale_gate_max_mem_used_pct() -> f64 {
 }
 fn default_groww_scale_advance_window_ist() -> [String; 2] {
     [String::from("09:20"), String::from("14:30")]
+}
+
+/// `[scoreboard]` — dual-feed daily scoreboard (operator directive
+/// 2026-07-10). All fields serde-defaulted so a missing section is the
+/// sensible day-1 shape (zero manual setup). `enabled = true` is SAFE-ON:
+/// the PR-A subsystem only READS existing tables (`ws_event_audit`,
+/// `ticks`) plus its own additive forensic tables — it touches no hot
+/// path, no order path, no feed lifecycle. Flipping `enabled = false` is
+/// the whole-subsystem rollback (nothing spawns; B12 rollback test
+/// `scoreboard_flag_rollback` pins the default + the off shape).
+#[derive(Debug, Clone, Deserialize)]
+pub struct ScoreboardConfig {
+    /// Master switch for the whole subsystem (boot reconciler + 15:45 IST
+    /// daily aggregation + Telegram scorecard).
+    #[serde(default = "default_scoreboard_enabled")]
+    pub enabled: bool,
+    /// Send the daily Telegram scorecard (the aggregation + tables still
+    /// run when this is off — forensic record without the ping).
+    #[serde(default = "default_scoreboard_enabled")]
+    pub telegram_enabled: bool,
+    /// Populate the per-instrument `feed_coverage_daily` detail rows
+    /// (~1.5K/day). Consumed by PR-4 (presence registry); the table +
+    /// flag ship in PR-A so the config surface is stable.
+    #[serde(default = "default_scoreboard_enabled")]
+    pub coverage_detail_rows: bool,
+    /// Hot-path per-tick presence fold (PR-4). `false` ⇒ coverage via SQL
+    /// totals only; per-instrument unique-wins "unavailable".
+    #[serde(default = "default_scoreboard_enabled")]
+    pub presence_fold_enabled: bool,
+    /// Groww exchange→receipt lag histogram fold (PR-3). Until it ships,
+    /// lag columns carry the −1 "not measured" sentinel.
+    #[serde(default = "default_scoreboard_enabled")]
+    pub groww_lag_enabled: bool,
+    /// IST seconds-of-day for the daily aggregation trigger. Default
+    /// 56_700 = 15:45:00 IST (after the 15:31 cross-verify + the 15:40
+    /// tick-conservation audit).
+    #[serde(default = "default_scoreboard_trigger_secs")]
+    pub trigger_secs_of_day_ist: u32,
+}
+
+fn default_scoreboard_enabled() -> bool {
+    true
+}
+fn default_scoreboard_trigger_secs() -> u32 {
+    15 * 3600 + 45 * 60 // 56_700 = 15:45:00 IST
+}
+
+impl Default for ScoreboardConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_scoreboard_enabled(),
+            telegram_enabled: default_scoreboard_enabled(),
+            coverage_detail_rows: default_scoreboard_enabled(),
+            presence_fold_enabled: default_scoreboard_enabled(),
+            groww_lag_enabled: default_scoreboard_enabled(),
+            trigger_secs_of_day_ist: default_scoreboard_trigger_secs(),
+        }
+    }
 }
 
 impl Default for GrowwScaleConfig {
@@ -1039,6 +1104,60 @@ pub struct NotificationConfig {
     /// Enable SMS alerts via AWS SNS for Critical/High severity events.
     /// Phone number is fetched from SSM at `/tickvault/{env}/sns/phone-number`.
     pub sns_enabled: bool,
+    /// Telegram UX Overhaul (2026-07-07) kill switch #1: episode live-edit
+    /// coalescing (one incident = one live-edited bubble). `false` makes
+    /// the `episode_key()` consultation a no-op → byte-identical legacy
+    /// per-event dispatch.
+    #[serde(default = "default_notification_episode_mode")]
+    pub episode_mode: bool,
+    /// Telegram UX Overhaul (2026-07-07) kill switch #2: LOW/MEDIUM digest
+    /// window (seconds) during market hours. Clamped to
+    /// [`NOTIFICATION_DIGEST_WINDOW_MIN_SECS`, `NOTIFICATION_DIGEST_WINDOW_MAX_SECS`]
+    /// via [`Self::digest_window_secs_clamped`]. `60` == legacy 60s
+    /// coalescing behavior.
+    #[serde(default = "default_notification_digest_window_secs")]
+    pub digest_window_secs: u64,
+    /// Boot bubble (2026-07-09 operator escalation) kill switch: ONE
+    /// consolidated, live-edited boot checklist bubble per boot. `false`
+    /// routes the boot milestones back through their unchanged legacy
+    /// immediate dispatch (per-event spray) WITHOUT touching the
+    /// `episode_mode` WS-episode machinery.
+    #[serde(default = "default_notification_boot_bubble")]
+    pub boot_bubble: bool,
+}
+
+/// Lower clamp bound for `[notification] digest_window_secs` (== the legacy
+/// 60s coalescer window, i.e. "digest off" behavior).
+pub const NOTIFICATION_DIGEST_WINDOW_MIN_SECS: u64 = 60;
+
+/// Upper clamp bound for `[notification] digest_window_secs` — one hour;
+/// anything longer would hide LOW/MEDIUM signal for an entire session.
+pub const NOTIFICATION_DIGEST_WINDOW_MAX_SECS: u64 = 3600;
+
+fn default_notification_episode_mode() -> bool {
+    true
+}
+
+fn default_notification_boot_bubble() -> bool {
+    true
+}
+
+fn default_notification_digest_window_secs() -> u64 {
+    900
+}
+
+impl NotificationConfig {
+    /// The digest window clamped to
+    /// [`NOTIFICATION_DIGEST_WINDOW_MIN_SECS`, `NOTIFICATION_DIGEST_WINDOW_MAX_SECS`].
+    /// A fat-fingered `0` or `86400` can never silence or flood the
+    /// operator — the clamp is applied at every consumer.
+    #[must_use]
+    pub fn digest_window_secs_clamped(&self) -> u64 {
+        self.digest_window_secs.clamp(
+            NOTIFICATION_DIGEST_WINDOW_MIN_SECS,
+            NOTIFICATION_DIGEST_WINDOW_MAX_SECS,
+        )
+    }
 }
 
 impl Default for NotificationConfig {
@@ -1048,6 +1167,9 @@ impl Default for NotificationConfig {
             telegram_api_base_url: "https://api.telegram.org".to_string(),
             send_timeout_ms: 10_000,
             sns_enabled: false,
+            episode_mode: default_notification_episode_mode(),
+            digest_window_secs: default_notification_digest_window_secs(),
+            boot_bubble: default_notification_boot_bubble(),
         }
     }
 }
@@ -2066,6 +2188,7 @@ mod tests {
             engine: EngineConfig::default(),
             in_mem: InMemConfig::default(),
             feeds: FeedsConfig::default(),
+            scoreboard: ScoreboardConfig::default(),
         }
     }
 
@@ -2791,6 +2914,55 @@ mod tests {
         assert_eq!(config.telegram_api_base_url, "https://api.telegram.org");
         assert_eq!(config.send_timeout_ms, 10_000);
         assert!(!config.sns_enabled);
+        // Telegram UX Overhaul (2026-07-07) kill switches.
+        assert!(config.episode_mode, "episode mode ships ON by default");
+        assert_eq!(config.digest_window_secs, 900);
+        // Boot bubble (2026-07-09) ships ON by default.
+        assert!(config.boot_bubble, "boot bubble ships ON by default");
+    }
+
+    #[test]
+    fn test_notification_digest_window_secs_clamped_to_60_3600() {
+        let mut config = NotificationConfig::default();
+        config.digest_window_secs = 0;
+        assert_eq!(
+            config.digest_window_secs_clamped(),
+            NOTIFICATION_DIGEST_WINDOW_MIN_SECS,
+            "fat-fingered 0 clamps to the 60s legacy floor"
+        );
+        config.digest_window_secs = 86_400;
+        assert_eq!(
+            config.digest_window_secs_clamped(),
+            NOTIFICATION_DIGEST_WINDOW_MAX_SECS,
+            "fat-fingered 86400 clamps to the 3600s ceiling"
+        );
+        config.digest_window_secs = 900;
+        assert_eq!(config.digest_window_secs_clamped(), 900);
+        config.digest_window_secs = 60;
+        assert_eq!(
+            config.digest_window_secs_clamped(),
+            60,
+            "60 == legacy behavior passes through"
+        );
+    }
+
+    #[test]
+    fn test_notification_episode_knobs_deserialize_with_defaults() {
+        // Old TOML without the new keys must still deserialize (serde
+        // defaults) — config-file rollback safety.
+        let toml_str = r#"
+            telegram_api_base_url = "https://api.telegram.org"
+            send_timeout_ms = 10000
+            sns_enabled = false
+        "#;
+        let config: NotificationConfig =
+            toml::from_str(toml_str).expect("legacy notification TOML must parse");
+        assert!(config.episode_mode);
+        assert_eq!(config.digest_window_secs, 900);
+        assert!(
+            config.boot_bubble,
+            "legacy TOML defaults the boot bubble ON"
+        );
     }
 
     // --- Wave-5 §K-L6/L7/L8 (PR #504c) ratchets -----------------------
@@ -3293,6 +3465,55 @@ mod tests {
             .extract()
             .expect("explicit groww_native_shadow must round-trip");
         assert!(wrapper_on.feeds.groww_native_shadow);
+    }
+
+    /// Dual-feed scoreboard PR-A (2026-07-10): the `[scoreboard]` section
+    /// defaults SAFE-ON (aggregation-only — reads existing tables, no hot
+    /// path), trigger at 15:45:00 IST, and a missing section must default,
+    /// never error.
+    #[test]
+    fn test_scoreboard_config_defaults_enabled_safe_on() {
+        let sb = ScoreboardConfig::default();
+        assert!(sb.enabled, "scoreboard must default ON (aggregation-only)");
+        assert!(sb.telegram_enabled);
+        assert!(sb.coverage_detail_rows);
+        assert!(sb.presence_fold_enabled);
+        assert!(sb.groww_lag_enabled);
+        assert_eq!(
+            sb.trigger_secs_of_day_ist, 56_700,
+            "trigger must default to 15:45:00 IST"
+        );
+    }
+
+    /// B12 rollback test (`scoreboard_flag_rollback`): flipping
+    /// `[scoreboard] enabled = false` must round-trip through TOML — the
+    /// tested off-switch path that disables the whole subsystem — and an
+    /// EMPTY `[scoreboard]` section must fill every field from defaults.
+    #[test]
+    fn scoreboard_flag_rollback() {
+        use figment::Figment;
+        use figment::providers::{Format, Toml};
+
+        #[derive(Deserialize)]
+        struct Wrapper {
+            #[serde(default)]
+            scoreboard: ScoreboardConfig,
+        }
+        // Rollback shape: enabled=false parses and turns the subsystem off.
+        let off: Wrapper = Figment::new()
+            .merge(Toml::string("[scoreboard]\nenabled = false\n"))
+            .extract()
+            .expect("scoreboard rollback TOML must parse");
+        assert!(!off.scoreboard.enabled, "rollback flag must stick");
+        // Partial section: unspecified keys fill from serde defaults.
+        assert!(off.scoreboard.telegram_enabled);
+        assert_eq!(off.scoreboard.trigger_secs_of_day_ist, 56_700);
+        // Missing section entirely → full defaults, never an error.
+        let missing: Wrapper = Figment::new()
+            .merge(Toml::string("[feeds]\ndhan_enabled = true\n"))
+            .extract()
+            .expect("missing [scoreboard] must default");
+        assert!(missing.scoreboard.enabled);
     }
 
     /// A missing `[feeds]` section must fall back to the safe default

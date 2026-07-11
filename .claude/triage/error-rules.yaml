@@ -812,6 +812,23 @@ rules:
       Silence; sustained recurrence is visible via
       tv_ws_watchdog_reconnect_in_place_total.
 
+  - name: ws-gap-10-order-update-outage-escalate
+    match:
+      code: WS-GAP-10
+    action: escalate
+    runbook_path: .claude/rules/project/wave-2-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 300
+    justification: >-
+      WS-GAP-10 = the order-update WebSocket is in an in-market outage
+      (>=3 consecutive reconnect failures; 2026-07-06 incident: dead token,
+      Dhan TCP-RST ~10ms after login, 39+ failures with zero HIGH pages).
+      The reconnect loop keeps retrying, but the order-confirmation feed is
+      down during market hours — the operator must inspect (dominant cause:
+      invalid token; token re-mint automation is a later PR). Escalate;
+      the in-loop page is already edge-triggered once per episode, and the
+      300s cooldown bounds repeat escalations across reason labels.
+
   - name: disk-watcher-01-respawn-escalate
     match:
       code: DISK-WATCHER-01
@@ -994,6 +1011,22 @@ rules:
     justification: >-
       Coalescer state inconsistency self-recovers on next drain.
       Informational — operator action only required if recurring.
+
+  - name: telegram-03-episode-degraded-silence
+    match:
+      code: TELEGRAM-03
+    action: silence
+    runbook_path: .claude/rules/project/wave-3-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 3600
+    justification: >-
+      TELEGRAM-03 = episode live-edit machinery degraded (snapshot store
+      write failed, corrupt rehydrate, or edit-fallback storm). Delivery
+      itself is never at risk — the duplicate-over-drop ladder terminates
+      at TELEGRAM-01 loudness, so only the one-bubble-per-incident UX
+      degrades. Severity::Low, auto-triage-safe. Silence with a 1h
+      cooldown; a sustained storm re-fires the signature and TELEGRAM-01
+      escalates if delivery ever actually drops.
 
   - name: selftest-01-passed-silence
     match:
@@ -1264,6 +1297,41 @@ rules:
       Severity::Critical — auth is dead until the secret is reconciled.
       Operator verifies /tickvault/<env>/dhan/totp-secret vs dhan.co and
       re-registers the TOTP. Never auto-actioned.
+
+  - name: auth-gap-05-forced-remint-triggered-escalate
+    match:
+      code: AUTH-GAP-05
+    action: escalate
+    runbook_path: .claude/rules/project/wave-4-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 300
+    justification: >-
+      AUTH-GAP-05 = the mid-session profile watchdog observed 2
+      consecutive REAL /v2/profile auth failures and fired exactly ONE
+      forced token re-mint for the episode (lock-before-mint, cooldown,
+      retry-once latch). The re-mint IS the self-remediation; the
+      operator inspects tv_token_forced_remint_total{outcome} and the
+      paired Telegram event — never manually re-mints first.
+      Severity::High — pages with a 5-min cooldown, does not auto-fix.
+
+  - name: auth-gap-06-fast-boot-cached-token-validation-escalate
+    match:
+      code: AUTH-GAP-06
+    action: escalate
+    runbook_path: .claude/rules/project/wave-4-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 300
+    justification: >-
+      AUTH-GAP-06 = the FAST crash-recovery boot arm validated the
+      CACHED Dhan JWT with one /v2/profile call BEFORE any WebSocket
+      spawn. Either a Dhan 401/403 reject forced a re-mint through the
+      existing TokenManager machinery, or the validation degraded
+      (transient network / REST-surface error) and boot proceeded
+      loudly with the cached token after one bounded retry. The
+      re-mint / degraded-proceed IS the self-remediation; the operator
+      inspects — a repeat on every boot means the cache/mint chain is
+      broken. Severity::High — pages with a 5-min cooldown, does not
+      auto-fix.
 
   - name: resource-01-fd-count-high-escalate
     match:
@@ -1904,6 +1972,26 @@ rules:
       one-off respawn at shutdown is benign; a sustained respawn rate is a real
       supervisor bug — escalate so the operator inspects the panic backtrace.
 
+  # FEED-REJECT-01 = a live-feed sidecar opened a reject/error episode (the
+  # once-per-child alert edge that fires the fixed-wording Telegram) and the
+  # supervisor captured a bounded, secret-redacted SIGNATURE of the triggering
+  # sidecar line. The signature is the WHY behind a recurring reject loop (the
+  # 2026-07-09 all-day 09:22/14:17 IST loop was invisible in the coded
+  # stream) — escalate so the operator reads the signature per the runbook.
+  - name: feed-reject-01-sidecar-error-detail-escalate
+    match:
+      code: FEED-REJECT-01
+    action: escalate
+    runbook_path: .claude/rules/project/feed-stall-watchdog-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 0
+    justification: >-
+      FEED-REJECT-01 = the sidecar reject episode's bounded cause signature.
+      The restart/backoff machinery already owns recovery; the signature is
+      the triage payload — escalate so the operator reads WHY the feed loops
+      (NATS reject, subscribe failure, SDK decode error, SSM/boto3 failure)
+      instead of only the fixed Telegram wording.
+
   # WS-REINJECT-01 = the boot-time STAGE-C.2b WAL re-injection aborted — the
   # frame-channel consumer (tick processor) was dead (channel closed) or
   # wedged (per-send timeout). The undelivered remainder stays durably staged
@@ -2124,3 +2212,96 @@ rules:
       already retried; a shadow-only data gap that the parity comparer
       reports honestly. Disk-full class root causes page via the existing
       disk watchers (DISK-WATCHER-01 / RESOURCE-03).
+
+  # FUTIDX-01 (§36 2026-07-08) = the nearest-expiry index-future selection
+  # degraded for >=1 of the 4 authorized underlyings on one feed (no FUT rows /
+  # all expiries past / ambiguous duplicate expiry / unparsable expiry). The
+  # degrade already happened — that feed runs WITHOUT that future for the day;
+  # the spot universe is unaffected and boot never HALTs. Escalate with a
+  # cooldown: the operator must see it (a vendor-master regression or an
+  # INDEX_SYMBOL_ALIASES drift, esp. MIDCPNIFTY) but a repeated per-underlying
+  # emit inside one build pages once.
+  - name: futidx-01-selection-degraded-escalate
+    match:
+      code: FUTIDX-01
+    action: escalate
+    runbook_path: .claude/rules/project/futidx-4-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 300
+    justification: >-
+      FUTIDX-01 = per-underlying index-future selection degrade (per feed).
+      Already self-limited (feed runs on the resolved subset; next day's build
+      re-selects from a fresh master). Operator inspects the day's master CSV
+      + the candidates_seen alias-drift evidence per the runbook — never
+      auto-fixed (a guessed SID/token is worse than a missing future).
+
+  # FUTIDX-02 (§36 2026-07-08) = the boot-time cross-feed comparator found the
+  # Dhan and Groww builds chose DIFFERENT expiry dates (or one-sided presence)
+  # for an index-future underlying. Both feeds STAY LIVE; cross-feed rows for
+  # that underlying are not comparable that day. Escalate: one vendor's master
+  # is stale/divergent and the operator must record a dated note — never
+  # auto-actioned (hand-patching either selection is banned by the runbook).
+  - name: futidx-02-cross-feed-expiry-mismatch-escalate
+    match:
+      code: FUTIDX-02
+    action: escalate
+    runbook_path: .claude/rules/project/futidx-4-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 300
+    justification: >-
+      FUTIDX-02 = cross-feed index-future expiry divergence — a
+      data-comparability signal requiring an operator verdict on which vendor
+      master is stale. Both feeds stay live; both re-select from fresh masters
+      at the next build, so there is nothing safe to auto-fix.
+
+  # SCOREBOARD-01 (dual-feed scoreboard PR-A, 2026-07-10) = the daily 15:45 IST
+  # Dhan-vs-Groww scoreboard aggregation degraded — a QuestDB /exec read failed
+  # (sentinels recorded, never fabricated zeros), an ILP row write was rejected,
+  # the boot-time process-death reconciliation could not read/write, or the
+  # same-day ws_event_audit drop counter shows the episode source under-counted.
+  # Best-effort forensic aggregate (AUDIT-WS-01 / GROWW-MASTER-01 class): the
+  # live feeds, tick capture and trading are NEVER affected, and the tables are
+  # DEDUP-idempotent so a TICKVAULT_SCOREBOARD_NOW re-run backfills the daily
+  # aggregation. EXCEPTION: boot-reconciled process-death rows are NOT
+  # re-creatable by a re-run (only the detecting boot can pair them; their
+  # flush retries 3x in place — an exhausted reconcile_flush is a permanent
+  # loss to annotate).
+  # Escalate (not silence): a degraded daily scoreboard usually means QuestDB
+  # was down at 15:45 (the BOOT-01/02 condition) and the operator should re-run
+  # the backfill once QuestDB is healthy — the runbook names the exact steps.
+  - name: scoreboard-01-aggregation-degraded-escalate
+    match:
+      code: SCOREBOARD-01
+    action: escalate
+    runbook_path: .claude/rules/project/dual-feed-scoreboard-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 600
+    justification: >-
+      SCOREBOARD-01 = the daily dual-feed scoreboard aggregation was degraded.
+      Best-effort cold-path forensic aggregate — feeds/capture/trading are
+      unaffected and the DEDUP-idempotent re-run backfills; escalate so the
+      operator knows the day's row is partial/degraded and can re-run the
+      backfill after fixing the underlying QuestDB condition (cross-check
+      BOOT-01/02).
+
+  # WAL-SUSPEND-01 (W2 PR#6 2026-07-10, audit follow-up row 10) = a QuestDB
+  # table's WAL apply is SUSPENDED (post disk-full episode / apply error) —
+  # ILP keeps ACKing rows while they silently stop becoming visible/applied.
+  # Escalate: the recovery action `ALTER TABLE <t> RESUME WAL` is an OPERATOR
+  # decision — auto-resuming into a still-broken disk replays the failure
+  # (is_auto_triage_safe() == false severity-independent override).
+  - name: wal-suspend-01-table-suspended-escalate
+    match:
+      code: WAL-SUSPEND-01
+    action: escalate
+    runbook_path: .claude/rules/project/wal-suspension-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 300
+    justification: >-
+      WAL-SUSPEND-01 = per-table WAL-apply suspension (silent
+      data-visibility loss; the rows are durably in the table's WAL, so
+      staleness + disk growth, not permanent loss). Operator fixes the
+      underlying cause FIRST (df -h /data, QuestDB logs), then runs
+      ALTER TABLE <table> RESUME WAL in the QuestDB console — never
+      auto-executed. Recovery confirmed by the falling-edge log +
+      tv_questdb_wal_suspended_tables returning to 0.

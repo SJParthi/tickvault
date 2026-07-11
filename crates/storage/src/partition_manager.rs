@@ -94,6 +94,13 @@ pub(crate) const DAY_PARTITIONED_TABLES: &[&str] = &[
     // ladder rung transition — same SEBI-audit class + DAY partitioning as
     // ws_event_audit; `feed` is in the DEDUP key.
     "groww_scale_audit",
+    // SCOREBOARD-01 (2026-07-10, dual-feed scoreboard PR-A): one row per
+    // (trading day, feed) verdict / per (trading day, feed) coverage snapshot /
+    // per outage episode — same SEBI-audit class + DAY partitioning as the
+    // audit tables above; `feed` is in every DEDUP key.
+    "feed_scoreboard_daily",
+    "feed_coverage_daily",
+    "feed_episode_audit",
 ];
 
 /// Tables EXEMPT from retention sweeping — NEVER detached or dropped.
@@ -241,21 +248,24 @@ impl PartitionManager {
 
     /// Detaches old partitions for a single table.
     ///
-    /// Uses QuestDB's `SHOW PARTITIONS FROM` to list partitions,
-    /// then `ALTER TABLE DETACH PARTITION` for those beyond retention.
+    /// Lists partitions via QuestDB's `table_partitions()` (filtered to those
+    /// older than the retention cutoff), then `ALTER TABLE DETACH PARTITION`
+    /// for the INACTIVE ones — the active (currently-written) partition is
+    /// never selected (QuestDB forbids detaching it, and it may hold
+    /// current-day data).
     async fn detach_partitions_for_table(
         &self,
         table: &str,
         cutoff_days: u32,
         _partition_by: &str,
     ) -> Result<u32> {
-        // Query partitions older than cutoff
-        let list_sql = format!(
-            "SELECT name FROM table_partitions('{}') \
-             WHERE minTimestamp < dateadd('d', -{}, now()) \
-             AND active = true",
-            table, cutoff_days
-        );
+        // Query partitions older than the retention cutoff. The cutoff/lookback
+        // filter stays server-side (unchanged) to preserve the exact retention
+        // semantics and avoid re-deriving an IST cutoff in Rust (the +5:30
+        // timestamp landmine in data-integrity.md). We project `active` so the
+        // active-partition EXCLUSION can be done by the pure, unit-testable
+        // `select_partitions_to_detach` below.
+        let list_sql = build_detach_list_sql(table, cutoff_days);
 
         let response = self
             .client
@@ -283,11 +293,25 @@ impl PartitionManager {
             .await
             .context("failed to read partition list response")?;
 
-        let partition_names = parse_partition_names(&body);
+        let rows = parse_partition_rows(&body);
+        // Fix (2026-07-09): detach the aged-out INACTIVE partitions, NEVER the
+        // active one. The previous predicate selected only `active = true`,
+        // which is contradictory with the cutoff filter (the active partition
+        // is the newest, never older than the cutoff), so the sweep detached
+        // ZERO partitions — a silent no-op.
+        let partition_names = select_partitions_to_detach(&rows);
 
         if partition_names.is_empty() {
             return Ok(0);
         }
+
+        // Proof the fixed predicate is non-vacuous: how many partitions were
+        // SELECTED for detach this sweep (intent). Effect is
+        // `tv_partition_detach_total` below (successful detaches only); a
+        // sustained `selected > detached` gap signals detach DDLs failing.
+        // Cold once-daily path, no labels (zero cardinality risk).
+        metrics::counter!("tv_partition_detach_selected_total")
+            .increment(partition_names.len() as u64);
 
         let mut detached: u32 = 0;
         for name in &partition_names {
@@ -302,6 +326,7 @@ impl PartitionManager {
             {
                 Ok(resp) if resp.status().is_success() => {
                     detached = detached.saturating_add(1);
+                    metrics::counter!("tv_partition_detach_total").increment(1);
                     debug!(table, partition = name, "partition detached");
                 }
                 Ok(resp) => {
@@ -330,15 +355,115 @@ impl PartitionManager {
     }
 }
 
-/// Parses partition names from QuestDB JSON response.
+/// A single row from QuestDB's `table_partitions('<table>')` result that the
+/// retention sweep needs to decide whether to detach.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PartitionRow {
+    /// Partition name (e.g. `2026-04-01` for DAY, `2026-04-01T09` for HOUR).
+    name: String,
+    /// `true` for the single currently-written partition. QuestDB refuses to
+    /// detach the active partition, so it is NEVER selected for detach.
+    active: bool,
+}
+
+/// Builds the partition-list SQL for a single table.
 ///
-/// Expected format: `{"columns":[{"name":"name","type":"VARCHAR"}],"dataset":[["2026-04-01"],["2026-04-02"]],...}`
-/// Returns a Vec of partition name strings.
-fn parse_partition_names(json: &str) -> Vec<String> {
+/// The cutoff/lookback filter is server-side (`minTimestamp < dateadd('d',
+/// -N, now())`) to preserve the existing retention semantics exactly. `active`
+/// is projected so the active-partition exclusion is done by
+/// [`select_partitions_to_detach`] (pure + unit-testable), NOT in SQL — the
+/// previous `AND active = true` predicate was the bug (it selected only the
+/// active partition, which is contradictory with the cutoff and which QuestDB
+/// refuses to detach, so ZERO partitions were ever detached).
+///
+/// `table` is ALWAYS a trusted compile-time / derived constant (one of
+/// `HOUR_PARTITIONED_TABLES`, `DAY_PARTITIONED_TABLES`, or
+/// `candle_table_names()`) — never external input — so it is not
+/// injection-validated here; the untrusted `name` values are validated by
+/// [`is_valid_partition_name`] before they reach a DETACH statement.
+fn build_detach_list_sql(table: &str, cutoff_days: u32) -> String {
+    format!(
+        "SELECT name, active FROM table_partitions('{}') \
+         WHERE minTimestamp < dateadd('d', -{}, now())",
+        table, cutoff_days
+    )
+}
+
+/// Validates a QuestDB partition name before it is interpolated into a
+/// `DETACH PARTITION LIST '<name>'` DDL statement.
+///
+/// QuestDB partition names are either `YYYY-MM-DD` (DAY) or `YYYY-MM-DDTHH`
+/// (HOUR). QuestDB's `/exec` endpoint has NO parameterized-query mechanism, so
+/// the name is string-interpolated; a name carrying a quote or DDL keyword
+/// (only possible from a corrupt / MITM'd QuestDB response, since the value is
+/// second-order data we did not author) would break out of the string literal.
+/// This fail-closed allowlist — digits, `-`, and a single `T` only — makes such
+/// a name impossible to inject: it is rejected here and never selected for
+/// detach.
+fn is_valid_partition_name(name: &str) -> bool {
+    // DAY: "2026-04-01" (10) or HOUR: "2026-04-01T09" (13). Allow the small
+    // range rather than a strict length so future QuestDB partition-by widths
+    // still pass, while a quote / space / DDL keyword can never appear.
+    !name.is_empty()
+        && name.len() <= 20
+        && name
+            .chars()
+            .all(|c| c.is_ascii_digit() || c == '-' || c == 'T')
+}
+
+/// Selects the partition NAMES to DETACH from the parsed `table_partitions`
+/// rows: every partition that is NOT active AND whose name is a
+/// well-formed partition name (see [`is_valid_partition_name`]). The rows are
+/// already restricted to those older than the retention cutoff by
+/// [`build_detach_list_sql`], so the remaining decision is "exclude the active
+/// (current-day) partition" plus the fail-closed name allowlist.
+///
+/// This is the fix for the retention no-op bug: the previous SQL predicate
+/// selected `active = true` (only the active partition, which QuestDB refuses
+/// to detach and which is never older than the cutoff), so the sweep detached
+/// nothing. Detaching only INACTIVE partitions can never touch the active /
+/// current-day partition, in the common case AND in the edge case where a table
+/// has not been written for more than `retention_days` (its active partition
+/// would pass the SQL cutoff but is still excluded here).
+fn select_partitions_to_detach(rows: &[PartitionRow]) -> Vec<String> {
+    rows.iter()
+        .filter(|row| !row.active && is_valid_partition_name(&row.name))
+        .map(|row| row.name.clone())
+        .collect()
+}
+
+/// Parses partition rows (`name`, `active`) from QuestDB's JSON response.
+///
+/// Expected format:
+/// `{"columns":[{"name":"name",...},{"name":"active",...}],"dataset":[["2026-04-01",false],...],...}`
+///
+/// Columns are located BY NAME (robust to projection reordering). A row missing
+/// the `name` or `active` field is skipped (fail-closed — never selected for
+/// detach), so a malformed response can never panic or detach the wrong set.
+fn parse_partition_rows(json: &str) -> Vec<PartitionRow> {
     // O(1) EXEMPT: begin — JSON parsing for DDL response (cold path, not hot)
     let parsed: serde_json::Value = match serde_json::from_str(json) {
         Ok(v) => v,
         Err(_) => return Vec::new(),
+    };
+
+    // Map column name -> index so we do not rely on projection order.
+    let columns = match parsed.get("columns").and_then(|c| c.as_array()) {
+        Some(arr) => arr,
+        None => return Vec::new(),
+    };
+    let mut name_idx: Option<usize> = None;
+    let mut active_idx: Option<usize> = None;
+    for (idx, col) in columns.iter().enumerate() {
+        match col.get("name").and_then(|n| n.as_str()) {
+            Some("name") => name_idx = Some(idx),
+            Some("active") => active_idx = Some(idx),
+            _ => {}
+        }
+    }
+    let (name_idx, active_idx) = match (name_idx, active_idx) {
+        (Some(n), Some(a)) => (n, a),
+        _ => return Vec::new(),
     };
 
     let dataset = match parsed.get("dataset").and_then(|d| d.as_array()) {
@@ -349,10 +474,10 @@ fn parse_partition_names(json: &str) -> Vec<String> {
     dataset
         .iter()
         .filter_map(|row| {
-            row.as_array()
-                .and_then(|cols| cols.first())
-                .and_then(|v| v.as_str())
-                .map(String::from)
+            let cols = row.as_array()?;
+            let name = cols.get(name_idx)?.as_str()?.to_string();
+            let active = cols.get(active_idx)?.as_bool()?;
+            Some(PartitionRow { name, active })
         })
         .collect()
     // O(1) EXEMPT: end
@@ -506,41 +631,182 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_parse_partition_names_valid() {
-        let json = r#"{"columns":[{"name":"name","type":"VARCHAR"}],"dataset":[["2026-04-01"],["2026-04-02"]],"count":2}"#;
-        let names = parse_partition_names(json);
-        assert_eq!(names.len(), 2);
-        assert_eq!(names[0], "2026-04-01");
-        assert_eq!(names[1], "2026-04-02");
+    // ---- pure selection-predicate tests (the retention no-op fix) ----------
+
+    fn row(name: &str, active: bool) -> PartitionRow {
+        PartitionRow {
+            name: name.to_string(),
+            active,
+        }
     }
 
     #[test]
-    fn test_parse_partition_names_empty_dataset() {
-        let json = r#"{"columns":[{"name":"name","type":"VARCHAR"}],"dataset":[],"count":0}"#;
-        let names = parse_partition_names(json);
-        assert!(names.is_empty());
+    fn test_select_partitions_to_detach_excludes_active_selects_inactive() {
+        // Fixture already restricted to <cutoff by the SQL: two aged inactive
+        // partitions + the active current-day partition.
+        let rows = vec![
+            row("2026-01-01", false),
+            row("2026-01-02", false),
+            row("2026-07-09", true), // active current-day partition
+        ];
+        let selected = select_partitions_to_detach(&rows);
+        assert_eq!(selected, vec!["2026-01-01", "2026-01-02"]);
+        // The active partition must NEVER be selected for detach.
+        assert!(
+            !selected.contains(&"2026-07-09".to_string()),
+            "active partition must never be detached"
+        );
     }
 
     #[test]
-    fn test_parse_partition_names_invalid_json() {
-        let names = parse_partition_names("not json");
-        assert!(names.is_empty());
+    fn test_regression_old_active_true_predicate_would_detach_wrong_set() {
+        // Regression: 2026-07-09 — the OLD `active = true` predicate selected
+        // the active partition (the one QuestDB refuses to detach) while the
+        // FIXED predicate selects the aged inactive partitions and excludes the
+        // active one. Proves the fix is NON-VACUOUS (the two disagree).
+        let rows = vec![
+            row("2026-01-01", false),
+            row("2026-01-02", false),
+            row("2026-07-09", true),
+        ];
+        // Mimic the OLD buggy selection (`active == true`).
+        let old_buggy: Vec<String> = rows
+            .iter()
+            .filter(|r| r.active)
+            .map(|r| r.name.clone())
+            .collect();
+        assert_eq!(
+            old_buggy,
+            vec!["2026-07-09"],
+            "old predicate picked the active partition"
+        );
+        let fixed = select_partitions_to_detach(&rows);
+        assert_ne!(fixed, old_buggy, "fix must diverge from the old predicate");
+        assert!(!fixed.contains(&"2026-07-09".to_string()));
+        assert_eq!(fixed, vec!["2026-01-01", "2026-01-02"]);
     }
 
     #[test]
-    fn test_parse_partition_names_missing_dataset() {
-        let json = r#"{"columns":[{"name":"name","type":"VARCHAR"}]}"#;
-        let names = parse_partition_names(json);
-        assert!(names.is_empty());
+    fn test_select_partitions_to_detach_empty_when_all_active() {
+        // A table whose only partition is the active one → detach nothing.
+        let rows = vec![row("2026-07-09", true)];
+        assert!(select_partitions_to_detach(&rows).is_empty());
     }
 
     #[test]
-    fn test_parse_partition_names_hour_format() {
-        let json = r#"{"columns":[{"name":"name","type":"VARCHAR"}],"dataset":[["2026-04-01T09"],["2026-04-01T10"]],"count":2}"#;
-        let names = parse_partition_names(json);
-        assert_eq!(names.len(), 2);
-        assert_eq!(names[0], "2026-04-01T09");
+    fn test_select_partitions_to_detach_empty_input() {
+        assert!(select_partitions_to_detach(&[]).is_empty());
+    }
+
+    #[test]
+    fn test_is_valid_partition_name_accepts_day_and_hour() {
+        assert!(is_valid_partition_name("2026-04-01")); // DAY
+        assert!(is_valid_partition_name("2026-04-01T09")); // HOUR
+    }
+
+    #[test]
+    fn test_is_valid_partition_name_rejects_injection_and_garbage() {
+        // A quote / space / DDL keyword can never reach the DETACH statement.
+        assert!(!is_valid_partition_name("2026-04-01'; DROP TABLE ticks--"));
+        assert!(!is_valid_partition_name("2026-04-01 09"));
+        assert!(!is_valid_partition_name("'; DELETE"));
+        assert!(!is_valid_partition_name(""));
+        assert!(!is_valid_partition_name(
+            "2026-04-01T09-with-a-very-long-suffix"
+        ));
+    }
+
+    #[test]
+    fn test_select_partitions_to_detach_skips_injection_name() {
+        // A hostile / corrupt partition name is inactive but must NOT be
+        // selected for detach (fail-closed allowlist).
+        let rows = vec![
+            row("2026-01-01", false),
+            row("2026-01-02'; DROP TABLE ticks--", false),
+        ];
+        assert_eq!(select_partitions_to_detach(&rows), vec!["2026-01-01"]);
+    }
+
+    #[test]
+    fn test_detach_list_sql_uses_inactive_not_active() {
+        // Extreme-check ratchet: the selection must not reintroduce the buggy
+        // `active = true` predicate, and must project `active` for the pure
+        // Rust exclusion.
+        let sql = build_detach_list_sql("ticks", 90);
+        assert!(
+            !sql.contains("active = true"),
+            "must not resurrect the no-op `active = true` predicate: {sql}"
+        );
+        assert!(
+            sql.contains("SELECT name, active"),
+            "must project active: {sql}"
+        );
+        assert!(
+            sql.contains("minTimestamp < dateadd('d', -90, now())"),
+            "cutoff filter must stay server-side: {sql}"
+        );
+    }
+
+    // ---- parse_partition_rows tests ---------------------------------------
+
+    #[test]
+    fn test_parse_partition_rows_valid() {
+        let json = r#"{"columns":[{"name":"name","type":"VARCHAR"},{"name":"active","type":"BOOLEAN"}],"dataset":[["2026-04-01",false],["2026-04-02",true]],"count":2}"#;
+        let rows = parse_partition_rows(json);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0], row("2026-04-01", false));
+        assert_eq!(rows[1], row("2026-04-02", true));
+    }
+
+    #[test]
+    fn test_parse_partition_rows_column_order_independent() {
+        // active projected BEFORE name — parser locates columns by name.
+        let json = r#"{"columns":[{"name":"active","type":"BOOLEAN"},{"name":"name","type":"VARCHAR"}],"dataset":[[false,"2026-04-01"]],"count":1}"#;
+        let rows = parse_partition_rows(json);
+        assert_eq!(rows, vec![row("2026-04-01", false)]);
+    }
+
+    #[test]
+    fn test_parse_partition_rows_empty_dataset() {
+        let json = r#"{"columns":[{"name":"name","type":"VARCHAR"},{"name":"active","type":"BOOLEAN"}],"dataset":[],"count":0}"#;
+        assert!(parse_partition_rows(json).is_empty());
+    }
+
+    #[test]
+    fn test_parse_partition_rows_invalid_json() {
+        assert!(parse_partition_rows("not json").is_empty());
+    }
+
+    #[test]
+    fn test_parse_partition_rows_missing_dataset() {
+        let json =
+            r#"{"columns":[{"name":"name","type":"VARCHAR"},{"name":"active","type":"BOOLEAN"}]}"#;
+        assert!(parse_partition_rows(json).is_empty());
+    }
+
+    #[test]
+    fn test_parse_partition_rows_missing_active_column() {
+        // Without an `active` column we cannot safely decide — return nothing.
+        let json = r#"{"columns":[{"name":"name","type":"VARCHAR"}],"dataset":[["2026-04-01"]],"count":1}"#;
+        assert!(parse_partition_rows(json).is_empty());
+    }
+
+    #[test]
+    fn test_parse_partition_rows_hour_format() {
+        let json = r#"{"columns":[{"name":"name","type":"VARCHAR"},{"name":"active","type":"BOOLEAN"}],"dataset":[["2026-04-01T09",false],["2026-04-01T10",true]],"count":2}"#;
+        let rows = parse_partition_rows(json);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0], row("2026-04-01T09", false));
+    }
+
+    #[test]
+    fn test_parse_partition_rows_panic_safety_malformed_row() {
+        // A row missing the active value (wrong-typed / short) is skipped, not
+        // panicked over, and never selected for detach.
+        let json = r#"{"columns":[{"name":"name","type":"VARCHAR"},{"name":"active","type":"BOOLEAN"}],"dataset":[["2026-04-01"],["2026-04-02",false]],"count":2}"#;
+        let rows = parse_partition_rows(json);
+        assert_eq!(rows, vec![row("2026-04-02", false)]);
+        assert!(select_partitions_to_detach(&rows).contains(&"2026-04-02".to_string()));
     }
 
     // (removed test_obi_in_hour_partitioned_tables — `obi_snapshots` is a

@@ -27,20 +27,27 @@ fn read(rel: &str) -> String {
     fs::read_to_string(&p).unwrap_or_else(|e| panic!("read {}: {e}", p.display())) // APPROVED: test
 }
 
-/// Pull every `metric_name = "tv_..."` literal out of `app-alarms.tf`.
+/// Pull every `metric_name = "tv_..."` literal out of the app-level alarm
+/// terraform files. 2026-07-06 (silent-feed incident hardening): scope
+/// EXTENDED from app-alarms.tf alone to ALSO cover silent-feed-alarms.tf —
+/// the 3 new alarms (SLO degraded dead-band, per-feed BOUNDARY-01 catch-up
+/// storm, Dhan exchange-lag p99) live there for PR-conflict isolation and
+/// must pass the same emit-site + EMF-filter drift checks.
 fn alarm_metric_names() -> Vec<String> {
-    let tf = read("deploy/aws/terraform/app-alarms.tf");
+    let mut tf = read("deploy/aws/terraform/app-alarms.tf");
+    tf.push('\n');
+    tf.push_str(&read("deploy/aws/terraform/silent-feed-alarms.tf"));
     let mut out = Vec::new();
     for line in tf.lines() {
         let trimmed = line.trim();
         if let Some(rest) = trimmed.strip_prefix("metric_name") {
             // Form: metric_name = "tv_..."
-            if let Some(start) = rest.find('"') {
-                if let Some(end) = rest[start + 1..].find('"') {
-                    let name = &rest[start + 1..start + 1 + end];
-                    if name.starts_with("tv_") {
-                        out.push(name.to_string());
-                    }
+            if let Some(start) = rest.find('"')
+                && let Some(end) = rest[start + 1..].find('"')
+            {
+                let name = &rest[start + 1..start + 1 + end];
+                if name.starts_with("tv_") {
+                    out.push(name.to_string());
                 }
             }
         }
@@ -70,16 +77,56 @@ fn collect_rs_sources(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
+/// Strip `//`-line-comments from a source body BEFORE needle matching.
+///
+/// 2026-07-06 anti-vacuity fix (mutation-proven hole): the whitespace
+/// compaction below made COMMENT text needle-matchable too — a doc comment
+/// in THIS very file mentioning a metric's emit macro self-satisfied the
+/// guard, so renaming the only real emit site left the guard green (the
+/// exact false-OK class, audit-findings Rule 11). Comments can never be an
+/// emit site, so they are removed before matching. `://` (URL scheme
+/// separators inside string literals) is treated as code, not a comment
+/// start — the `http_client_fallback_guard.rs` precedent.
+fn strip_line_comments(body: &str) -> String {
+    let mut out = String::with_capacity(body.len());
+    for line in body.lines() {
+        let bytes = line.as_bytes();
+        let mut cut = line.len();
+        let mut i = 0;
+        while i + 1 < bytes.len() {
+            if bytes[i] == b'/' && bytes[i + 1] == b'/' && (i == 0 || bytes[i - 1] != b':') {
+                cut = i;
+                break;
+            }
+            i += 1;
+        }
+        out.push_str(&line[..cut]);
+        out.push('\n');
+    }
+    out
+}
+
 /// True iff the literal metric name appears inside any
 /// `counter!`/`gauge!`/`histogram!` call in the workspace.
+///
+/// 2026-07-06 fix: each source body has its `//`-line-comments stripped
+/// (see [`strip_line_comments`]) and is then whitespace-STRIPPED before
+/// matching, so a rustfmt-wrapped multi-line `metrics::counter!` invocation
+/// naming e.g. `tv_feed_sidecar_stall_restart_total` normalizes to one
+/// contiguous needle and is guard-visible, while a mere COMMENT mention of
+/// the same macro-plus-name can never satisfy the guard (pinned by
+/// `test_emit_site_guard_ignores_comment_only_mentions`). Before the
+/// compaction fix the contiguous needles matched ONLY single-line emits —
+/// a multi-line emit made a real metric look missing (false-negative on
+/// the emit site, false-positive "missing" panic here).
 fn is_metric_emitted(name: &str) -> bool {
+    // No needle contains whitespace, so matching against the compacted
+    // body is exact. `counter!("name")` is covered by the `counter!("name`
+    // prefix, so three needles suffice.
     let needles = [
         format!("counter!(\"{name}\""),
         format!("gauge!(\"{name}\""),
         format!("histogram!(\"{name}\""),
-        format!("counter!(\"{name}\")"),
-        format!("gauge!(\"{name}\")"),
-        format!("histogram!(\"{name}\")"),
     ];
     let mut sources = Vec::new();
     collect_rs_sources(&workspace_root().join("crates"), &mut sources);
@@ -87,13 +134,52 @@ fn is_metric_emitted(name: &str) -> bool {
         let Ok(body) = fs::read_to_string(&path) else {
             continue;
         };
+        let code_only = strip_line_comments(&body);
+        let compact: String = code_only.chars().filter(|c| !c.is_whitespace()).collect();
         for needle in &needles {
-            if body.contains(needle) {
+            if compact.contains(needle) {
                 return true;
             }
         }
     }
     false
+}
+
+#[test]
+fn test_emit_site_guard_ignores_comment_only_mentions() {
+    // Anti-vacuity self-test (2026-07-06 mutation finding): a metric name
+    // that appears ONLY inside a comment must NOT count as an emit site.
+    // The sentinel below exists in the workspace exclusively inside the
+    // next comment line: counter!("tv_guard_vacuity_sentinel_comment_only_total"
+    assert!(
+        !is_metric_emitted("tv_guard_vacuity_sentinel_comment_only_total"),
+        "is_metric_emitted matched a name that appears ONLY in a comment — \
+         the emit-site guard is vacuous again (comment stripping regressed)."
+    );
+    // Positive control: the real FEED-STALL-01 multi-line emit in
+    // crates/app/src/groww_sidecar_supervisor.rs must still be found —
+    // proves comment stripping did not break REAL emit detection.
+    assert!(
+        is_metric_emitted("tv_feed_sidecar_stall_restart_total"),
+        "comment stripping broke detection of a REAL multi-line emit site \
+         (groww_sidecar_supervisor.rs FEED-STALL-01 counter)."
+    );
+}
+
+#[test]
+fn test_strip_line_comments_keeps_code_and_urls_drops_comments() {
+    let src = "let a = 1; // trailing comment counter!(\"tv_fake_total\"\n\
+               /// doc comment counter!(\"tv_fake_total\"\n\
+               let url = \"https://example.com\";\n";
+    let stripped = strip_line_comments(src);
+    assert!(
+        !stripped.contains("tv_fake_total"),
+        "comment text survived stripping: {stripped}"
+    );
+    assert!(
+        stripped.contains("let a = 1;") && stripped.contains("https://example.com"),
+        "code or URL text was wrongly removed: {stripped}"
+    );
 }
 
 #[test]
@@ -149,6 +235,10 @@ fn emf_regex_body<'a>(body: &'a str, key: &str) -> Option<&'a str> {
 
 /// The set of `tv_*` names inside an EMF anchored-regex alternation body
 /// (`a|b|c`), sorted + de-duplicated for order-independent comparison.
+/// NOTE: this parses only the FIRST `metric_selectors` occurrence — i.e. the
+/// MAIN host-only declaration. Use `emf_all_declared_names` for the union
+/// across ALL declarations (the 2026-07-06 per-feed second declaration has
+/// a single-name `^tv_boundary_catchup_total$` selector with no `(...)`).
 fn emf_declared_names(body: &str, key: &str) -> Vec<String> {
     let mut names: Vec<String> = emf_regex_body(body, key)
         .unwrap_or_default()
@@ -156,6 +246,38 @@ fn emf_declared_names(body: &str, key: &str) -> Vec<String> {
         .map(|s| s.trim().to_string())
         .filter(|s| s.starts_with("tv_"))
         .collect();
+    names.sort();
+    names.dedup();
+    names
+}
+
+/// The union of `tv_*` names across EVERY `metric_selectors` entry in an
+/// agent config body — handles BOTH the anchored alternation form
+/// (`^(a|b|c)$`, the main host-only declaration) and the single-name form
+/// (`^tv_boundary_catchup_total$`, the 2026-07-06 per-feed declaration).
+fn emf_all_declared_names(body: &str) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    let mut rest = body;
+    while let Some(idx) = rest.find("\"metric_selectors\":") {
+        rest = &rest[idx + "\"metric_selectors\":".len()..];
+        let Some(open) = rest.find("[\"") else { break };
+        let after = &rest[open + 2..];
+        let Some(close) = after.find('"') else { break };
+        let regex = &after[..close];
+        // Strip the anchors: `^(...)$` (alternation) or `^...$` (single name).
+        let inner = regex
+            .trim_start_matches("^(")
+            .trim_start_matches('^')
+            .trim_end_matches(")$")
+            .trim_end_matches('$');
+        for n in inner.split('|') {
+            let n = n.trim();
+            if n.starts_with("tv_") {
+                names.push(n.to_string());
+            }
+        }
+        rest = &after[close..];
+    }
     names.sort();
     names.dedup();
     names
@@ -200,30 +322,172 @@ fn test_deployed_emf_source_labels_match_a_real_series_label() {
 }
 
 #[test]
-fn test_emf_metric_selectors_name_count_is_twenty_one() {
-    // Pin the EMF publish list: 19 alarm-backing signals + 2 memory-measurement
-    // gauges added 2026-07-02 for the 2K-universe RAM measurement
-    // (tv_process_rss_bytes — crates/storage/src/resource_monitor.rs;
+fn test_emf_metric_selectors_name_count_is_twenty_seven() {
+    // Pin the MAIN (host-only) EMF publish list: 19 alarm-backing signals
+    // + 2 memory-measurement gauges added 2026-07-02 for the 2K-universe RAM
+    // measurement (tv_process_rss_bytes — crates/storage/src/resource_monitor.rs;
     // tv_subsystem_memory_estimated_bytes — crates/app/src/metrics_catalog.rs
-    // SUBSYSTEM_MEMORY_GAUGE_NAME). Cost note: each custom metric is ~$0.30/mo.
+    // SUBSYSTEM_MEMORY_GAUGE_NAME)
+    // + 2 silent-feed lag signals added 2026-07-06 (incident hardening):
+    // tv_dhan_exchange_lag_p99_seconds (feed_lag_monitor gauge, alarmed in
+    // silent-feed-alarms.tf) + tv_dhan_lag_samples_excluded_total (the
+    // WAL-replay exclusion visibility counter — Rule 11: exclusions must be
+    // visible, never silent)
+    // + 1 Groww lag signal added 2026-07-11 (scoreboard PR-C):
+    // tv_groww_exchange_lag_p99_seconds (the Groww feed_lag_monitor gauge —
+    // its OWN name, never a feed label on the Dhan gauge; alarmed in
+    // silent-feed-alarms.tf S4). The Groww exclusion/clamp counters stay
+    // /metrics-only (₹0). tv_boundary_catchup_total is NOT in this list —
+    // it publishes ONLY via the SECOND [host,feed] declaration (host-only
+    // folding would mask a Dhan storm under the Groww baseline).
+    // Cost note: each custom metric series is ~$0.30/mo.
     // If you intentionally add/remove a name, update BOTH configs + this pin.
+    //
+    // 24 (was 21) since 2026-07-06 (Groww feed-down alerting, operator
+    // directive): added `tv_groww_ws_active` (connected-level 0/1 gauge),
+    // `tv_feed_last_tick_age_seconds{feed}` (feed liveness age gauge — both
+    // emitted from crates/app/src/groww_bridge.rs), and
+    // `tv_feed_sidecar_stall_restart_total` (FEED-STALL-01 stall-kill
+    // counter — crates/app/src/groww_sidecar_supervisor.rs). Cost: +3
+    // custom metrics ≈ +$0.90/mo per the app-alarms.tf header cost note.
     let user_data = read("deploy/aws/terraform/user-data.sh.tftpl");
     let names = emf_declared_names(&user_data, "metric_selectors");
     assert_eq!(
         names.len(),
-        21,
-        "Z+ L2 VERIFY ratchet: expected exactly 21 names in the EMF metric_selectors \
-         list; found {}: {names:?}",
+        27,
+        "Z+ L2 VERIFY ratchet: expected exactly 27 names in the MAIN EMF \
+         metric_selectors list (24 post-#1437 groww feed-down alerting + 2 \
+         silent-feed lag names 2026-07-06 + 1 groww lag gauge 2026-07-11 \
+         scoreboard PR-C); found {}: {names:?}",
         names.len()
     );
     for required in [
         "tv_process_rss_bytes",
         "tv_subsystem_memory_estimated_bytes",
+        "tv_dhan_exchange_lag_p99_seconds",
+        "tv_dhan_lag_samples_excluded_total",
+        "tv_groww_exchange_lag_p99_seconds",
     ] {
         assert!(
             names.iter().any(|n| n == required),
-            "Z+ L2 VERIFY ratchet: {required} must be in the EMF metric_selectors list \
-             (2K-universe memory measurement reads it as a real CloudWatch metric)."
+            "Z+ L2 VERIFY ratchet: {required} must be in the MAIN EMF metric_selectors \
+             list (2K-universe memory measurement + 2026-07-06 silent-feed lag signals \
+             read them as real CloudWatch metrics)."
+        );
+    }
+}
+
+/// Split an agent-config body into its individual `metric_declaration`
+/// array objects (brace-balanced scan from the array opener).
+///
+/// Round-2 hardening (2026-07-07, finding 2): the per-feed ratchet
+/// previously used three INDEPENDENT whole-file substring checks — a
+/// multi-declaration reshuffle that kept a `[host,feed]` declaration for a
+/// DIFFERENT selector while moving `^tv_boundary_catchup_total$` into a new
+/// host-only declaration would have passed every check while the
+/// boundary_catchup_storm_dhan alarm (dimensions { host, feed = "dhan" })
+/// evaluated against a permanently-empty series. This parser lets the test
+/// bind selector and dimensions WITHIN one declaration object.
+fn emf_declaration_objects(body: &str) -> Vec<String> {
+    let marker = "\"metric_declaration\": [";
+    let mut out = Vec::new();
+    let Some(idx) = body.find(marker) else {
+        return out;
+    };
+    let rest = &body[idx + marker.len()..];
+    let mut depth = 0usize;
+    let mut start = None;
+    for (i, ch) in rest.char_indices() {
+        match ch {
+            '{' => {
+                if depth == 0 {
+                    start = Some(i);
+                }
+                depth += 1;
+            }
+            '}' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0
+                    && let Some(s) = start.take()
+                {
+                    out.push(rest[s..=i].to_string());
+                }
+            }
+            ']' if depth == 0 => break, // end of the metric_declaration array
+            _ => {}
+        }
+    }
+    out
+}
+
+#[test]
+fn test_second_emf_declaration_publishes_boundary_catchup_per_feed() {
+    // 2026-07-06 (silent-feed incident hardening): tv_boundary_catchup_total
+    // MUST be published under dimensions [host, feed] via a SECOND
+    // metric_declaration in BOTH agent configs. Per-feed is Rule-11-mandatory:
+    // Groww's 60s catch-up lateness margin makes catch-up sealing its ROUTINE
+    // steady-state path for quiet SIDs — a host-only folded series would
+    // either mask a Dhan storm under the Groww baseline or page on healthy
+    // Groww behaviour. The boundary_catchup_storm_dhan alarm
+    // (silent-feed-alarms.tf) keys on { host, feed = "dhan" }.
+    for rel in [
+        "deploy/aws/terraform/user-data.sh.tftpl",
+        "deploy/aws/cloudwatch-agent.json",
+    ] {
+        let body = read(rel);
+        assert!(
+            body.contains("\"dimensions\": [[\"host\", \"feed\"]]"),
+            "Z+ L2 VERIFY ratchet: {rel} must carry the SECOND metric_declaration with \
+             dimensions [[\"host\", \"feed\"]] — the per-feed BOUNDARY-01 export."
+        );
+        assert!(
+            body.contains("\"metric_selectors\": [\"^tv_boundary_catchup_total$\"]"),
+            "Z+ L2 VERIFY ratchet: {rel} must select ^tv_boundary_catchup_total$ in the \
+             per-feed declaration — without it the boundary-catchup-storm-dhan alarm \
+             evaluates against a permanently-empty metric."
+        );
+        // The per-feed declaration must NOT fold the metric host-only too:
+        // publishing BOTH a host-only and a [host,feed] series would double
+        // the cost and re-introduce the masked/folded series.
+        let main_names = emf_declared_names(&body, "metric_selectors");
+        assert!(
+            !main_names.iter().any(|n| n == "tv_boundary_catchup_total"),
+            "Z+ L2 VERIFY ratchet: {rel} must NOT list tv_boundary_catchup_total in the \
+             MAIN host-only declaration — it publishes ONLY under [host, feed]."
+        );
+        // Round-2 hardening (2026-07-07, finding 2): bind selector ↔
+        // dimensions WITHIN a single declaration object. The three checks
+        // above are independent whole-file substrings — a reshuffle that
+        // kept a [host,feed] declaration for a DIFFERENT selector while
+        // moving the boundary-catchup selector into a host-only declaration
+        // (outside the main alternation) would pass them all while the
+        // per-feed alarm watched a permanently-empty series.
+        let decls = emf_declaration_objects(&body);
+        assert!(
+            decls.len() >= 2,
+            "parser self-check: expected >= 2 metric_declaration objects in {rel}, found {} — \
+             emf_declaration_objects broken or the array collapsed",
+            decls.len()
+        );
+        let catchup: Vec<&String> = decls
+            .iter()
+            .filter(|d| d.contains("tv_boundary_catchup_total"))
+            .collect();
+        assert_eq!(
+            catchup.len(),
+            1,
+            "Z+ L2 VERIFY ratchet: {rel} must have EXACTLY ONE metric_declaration selecting \
+             tv_boundary_catchup_total (found {}) — a second declaration (e.g. host-only) \
+             would double-publish or fold the per-feed series",
+            catchup.len()
+        );
+        assert!(
+            catchup[0].contains("\"dimensions\": [[\"host\", \"feed\"]]")
+                && catchup[0].contains("\"metric_selectors\": [\"^tv_boundary_catchup_total$\"]"),
+            "Z+ L2 VERIFY ratchet: {rel} — the declaration selecting tv_boundary_catchup_total \
+             must ITSELF carry dimensions [[\"host\", \"feed\"]] + the anchored single-name \
+             selector (the boundary_catchup_storm_dhan alarm keys on {{ host, feed = dhan }}):\n{}",
+            catchup[0]
         );
     }
 }
@@ -273,8 +537,11 @@ fn test_deployed_emf_declaration_is_superset_of_every_alarm_metric() {
     // declaration, or the agent never publishes it and the alarm evaluates
     // against a permanently-empty metric (treat_missing_data=breaching pages
     // forever). This is the name-set superset check the restore fix pins.
+    // 2026-07-06: union across ALL metric_declaration entries — the per-feed
+    // [host,feed] second declaration carries tv_boundary_catchup_total, which
+    // backs the boundary-catchup-storm-dhan alarm.
     let user_data = read("deploy/aws/terraform/user-data.sh.tftpl");
-    let declared = emf_declared_names(&user_data, "metric_selectors");
+    let declared = emf_all_declared_names(&user_data);
     let alarms = alarm_metric_names();
     let missing: Vec<&String> = alarms.iter().filter(|a| !declared.contains(a)).collect();
     assert!(
@@ -316,6 +583,25 @@ fn test_reference_cloudwatch_agent_json_matches_deployed_emf_declaration() {
             .filter(|n| !deployed_names.contains(n))
             .collect::<Vec<_>>(),
     );
+    // 2026-07-06: the SECOND (per-feed) declaration must not drift either —
+    // compare the union across ALL declarations in both files.
+    let deployed_all = emf_all_declared_names(&user_data);
+    let reference_all = emf_all_declared_names(&reference);
+    assert_eq!(
+        deployed_all, reference_all,
+        "Z+ L3 RECONCILE drift-guard: the UNION of EMF-declared names (all \
+         metric_declaration entries, incl. the 2026-07-06 per-feed \
+         tv_boundary_catchup_total declaration) has drifted between the deployed \
+         user-data.sh.tftpl and the reference cloudwatch-agent.json."
+    );
+    assert!(
+        deployed_all
+            .iter()
+            .any(|n| n == "tv_boundary_catchup_total"),
+        "Z+ L3 RECONCILE drift-guard: tv_boundary_catchup_total must be declared \
+         (per-feed second declaration) — emf_all_declared_names parser broken or \
+         the declaration was deleted."
+    );
 }
 
 #[test]
@@ -336,8 +622,560 @@ fn test_emf_metric_namespace_is_tickvault_prod_in_both_configs() {
     }
 }
 
+/// Extract the body of a single `resource "aws_cloudwatch_metric_alarm" "<name>"`
+/// block from a terraform file body (brace-balanced scan from the header line).
+fn alarm_resource_block(body: &str, resource_name: &str) -> String {
+    let header = format!("resource \"aws_cloudwatch_metric_alarm\" \"{resource_name}\"");
+    let start = body
+        .find(&header)
+        .unwrap_or_else(|| panic!("resource block {resource_name} not found")); // APPROVED: test
+    let rest = &body[start..];
+    let open = rest.find('{').expect("resource block has an opening brace"); // APPROVED: test
+    let mut depth = 0usize;
+    for (i, ch) in rest[open..].char_indices() {
+        match ch {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return rest[..open + i + 1].to_string();
+                }
+            }
+            _ => {}
+        }
+    }
+    panic!("unbalanced braces in resource block {resource_name}"); // APPROVED: test
+}
+
+/// True iff `attr = value` (any whitespace around `=`) appears in the block.
+fn block_has_attr(block: &str, attr: &str, value: &str) -> bool {
+    block.lines().any(|l| {
+        let t = l.trim();
+        t.strip_prefix(attr)
+            .map(|rest| {
+                let rest = rest.trim_start();
+                rest.starts_with('=') && rest[1..].trim() == value
+            })
+            .unwrap_or(false)
+    })
+}
+
+/// Extract the string literal assigned to `pub const <name>: &str = "...";`
+/// in `crates/app/src/observability.rs`. If the RHS is another constant
+/// (e.g. `ERRORS_JSONL_DIR: &str = MACHINE_LOGS_DIR;`), resolve it one hop.
+/// Panics (fail-closed) if the declaration cannot be found — a rename must
+/// update THIS ratchet in the same PR as the agent configs.
+fn observability_dir_const(name: &str) -> String {
+    let src = read("crates/app/src/observability.rs");
+    let needle = format!("pub const {name}: &str =");
+    let line = src
+        .lines()
+        .find(|l| l.trim_start().starts_with(&needle))
+        .unwrap_or_else(|| {
+            panic!(
+                "Z+ L2 VERIFY ratchet: crates/app/src/observability.rs no longer \
+                 declares `{needle} ...` — the CW-agent log-shipping globs are \
+                 coupled to this constant; update this test + BOTH agent configs \
+                 in the same PR."
+            ) // APPROVED: test
+        });
+    let rhs = line[line.find('=').expect("has =") + 1..] // APPROVED: test
+        .trim()
+        .trim_end_matches(';')
+        .trim();
+    if let Some(stripped) = rhs.strip_prefix('"') {
+        return stripped
+            .split('"')
+            .next()
+            .expect("quoted literal") // APPROVED: test
+            .to_string();
+    }
+    // One-hop alias (ERRORS_JSONL_DIR = MACHINE_LOGS_DIR today).
+    observability_dir_const(rhs)
+}
+
 #[test]
-fn test_app_alarms_count_is_thirteen() {
+fn test_cw_agent_collects_machine_log_paths() {
+    // 2026-07-06: the 2026-07-05 machine/ move silently killed BOTH app log
+    // streams (old globs don't descend into machine/) — every log metric
+    // filter on /tickvault/prod/app was DOA. Round-2 review fix: the globs
+    // are now CROSS-COUPLED to the Rust sink constants in observability.rs
+    // (not just pinned as literals), so BOTH a config-side glob regression
+    // AND a code-side sink move (the exact 2026-07-05 vector — Rust moved,
+    // configs untouched) fail this build until the two move in lockstep.
+    let errors_dir = observability_dir_const("ERRORS_JSONL_DIR");
+    let app_dir = observability_dir_const("MACHINE_LOGS_DIR");
+    // `.2*` (date-stamped rotations only) matches the form main landed in
+    // PR #1438 — it excludes the bare errors.jsonl compat symlink AND the
+    // 0-byte machine/app.log placeholder, tailing only real rotated files.
+    let errors_glob = format!("/opt/tickvault/{errors_dir}/errors.jsonl.2*");
+    let app_glob = format!("/opt/tickvault/{app_dir}/app.2*");
+    for rel in [
+        "deploy/aws/terraform/user-data.sh.tftpl",
+        "deploy/aws/cloudwatch-agent.json",
+    ] {
+        let body = read(rel);
+        assert!(
+            body.contains(&errors_glob),
+            "Z+ L2 VERIFY ratchet: {rel} must tail the ERROR JSONL glob \
+             {errors_glob} (derived from observability.rs::ERRORS_JSONL_DIR; \
+             dotted + date-stamped, so the bare errors.jsonl compat symlink \
+             is excluded). \
+             Without it every error-code log metric filter on \
+             /tickvault/prod/app is DOA. If the Rust sink dir moved, move the \
+             agent-config globs in the SAME PR."
+        );
+        assert!(
+            body.contains(&app_glob),
+            "Z+ L2 VERIFY ratchet: {rel} must tail the hourly app-log glob \
+             {app_glob} (derived from observability.rs::MACHINE_LOGS_DIR). The \
+             2026-07-05 machine/ move took the hourly app log too \
+             (crates/app/src/main.rs init_app_log_appender). If the Rust sink \
+             dir moved, move the agent-config globs in the SAME PR."
+        );
+    }
+}
+
+#[test]
+fn test_tick_gap_silent_alarm_threshold_is_forty() {
+    // 2026-07-06 incident pin: 29-67 of 776 instruments were silent EVERY
+    // minute while the old threshold=100 never crossed — zero pages all day.
+    // Round-3 correction 2026-07-08 (review finding 4): the first retune
+    // shipped 25, BELOW the documented ~33 always-silent healthy floor
+    // (main.rs D2 note 2026-07-03 — the gauge is set from the same scan
+    // with no always-silent exclusion), so 25 would have breached every
+    // healthy in-session minute and paged daily. 40 (fires at >= 41,
+    // PROVISIONAL, one-trading-week soak mandated) clears the floor with
+    // margin and aligns with the SLO-degraded alarm's >= 39-silent
+    // freshness breach point; the 29-40 marginal band is owned by the
+    // SLO-degraded + lag-p99 alarms. 10-of-12 M-of-N at 60s/Maximum pages
+    // on the sustained upper band while a 1-3 min reconnect blip cannot
+    // reach 10 breaching minutes. Regressing ANY of these values either
+    // reproduces the zero-page miss (raise) or the daily-false-page
+    // inversion (lower below the floor).
+    let tf = read("deploy/aws/terraform/app-alarms.tf");
+    let block = alarm_resource_block(&tf, "tick_gap_instruments_silent");
+    assert!(
+        block_has_attr(&block, "threshold", "40"),
+        "tick_gap_instruments_silent threshold must be 40 (2026-07-08 round-3 \
+         retune — above the ~33 always-silent healthy floor):\n{block}"
+    );
+    assert!(
+        block_has_attr(&block, "comparison_operator", "\"GreaterThanThreshold\""),
+        "tick_gap_instruments_silent must use GreaterThanThreshold (fires at >= 41)"
+    );
+    assert!(
+        block_has_attr(&block, "evaluation_periods", "12")
+            && block_has_attr(&block, "datapoints_to_alarm", "10"),
+        "tick_gap_instruments_silent must latch M-of-N 10-of-12 (not strict-consecutive; \
+         a threshold-adjacent value flapping 39/41/39 must neither page nor let one clean \
+         scrape erase 9 min of evidence — the incident band was 29-67 silent/min)"
+    );
+    assert!(
+        block_has_attr(&block, "period", "60")
+            && block_has_attr(&block, "statistic", "\"Maximum\""),
+        "tick_gap_instruments_silent must evaluate period=60/Maximum (1 datapoint per 60s scrape)"
+    );
+    assert!(
+        block_has_attr(&block, "treat_missing_data", "\"notBreaching\""),
+        "tick_gap_instruments_silent must be notBreaching (nightly box stop)"
+    );
+}
+
+#[test]
+fn test_tick_gap_silent_alarm_is_window_gated() {
+    // Rule 3 (market-hours gate, MANDATORY): the silent-instruments gauge is
+    // written only in-session, so the LAST in-session value keeps being
+    // re-scraped 15:30->16:30 IST — a stale post-close value must never page.
+    // actions_enabled=false + the window-gate Lambda ALARM_NAMES entry is the
+    // enforcement pair; losing EITHER half re-opens the off-hours false-page.
+    let tf = read("deploy/aws/terraform/app-alarms.tf");
+    let block = alarm_resource_block(&tf, "tick_gap_instruments_silent");
+    assert!(
+        block_has_attr(&block, "actions_enabled", "false"),
+        "tick_gap_instruments_silent must ship actions_enabled=false (gate Lambda owns the window)"
+    );
+    let gate = read("deploy/aws/terraform/market-hours-liveness-alarm.tf");
+    assert!(
+        gate.contains("aws_cloudwatch_metric_alarm.tick_gap_instruments_silent.alarm_name"),
+        "tick_gap_instruments_silent must be in the window-gate Lambda ALARM_NAMES join \
+         (market-hours-liveness-alarm.tf) — without it the alarm stays actions-disabled forever"
+    );
+}
+
+#[test]
+fn test_tick_gap_silent_gauge_producer_pins_pre_open_to_zero() {
+    // Round-4 fix pin (2026-07-08, final-review findings 1/2/4): the
+    // tick-gap gauge producer in main.rs MUST pin the gauge to 0.0 during
+    // the NSE pre-open/auction window [09:00, 09:15) IST — the mirror of
+    // the round-3 SLO tick_freshness pre-open pin. Without it, the
+    // 09:08-09:15 matching/buffer freeze writes ~6-7 guaranteed breaching
+    // datapoints (boot-seeded ~775 SIDs silent, far above threshold 40)
+    // into the retuned alarm's 10-of-12 / 12-min lookback — the gate
+    // Lambda's forced-OK at 09:20 does NOT purge datapoints, so ~3
+    // open-ramp minutes > 40 would false-page at ~09:21 on ordinary days.
+    // This scan matches CODE only (comments stripped) so a comment mention
+    // can never satisfy it, and it asserts the UNPINNED raw write form is
+    // absent so the pin cannot be silently bypassed.
+    let body = fs::read_to_string(workspace_root().join("crates/app/src/main.rs"))
+        .expect("read crates/app/src/main.rs"); // APPROVED: test
+    let code_only = strip_line_comments(&body);
+    let compact: String = code_only.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(
+        compact.contains("constTICK_GAP_GAUGE_SESSION_OPEN_SECS_OF_DAY_IST:u32=9*3600+15*60"),
+        "main.rs must define TICK_GAP_GAUGE_SESSION_OPEN_SECS_OF_DAY_IST = 09:15:00 IST \
+         (the continuous-session open — the pre-open pin boundary)"
+    );
+    assert!(
+        compact.contains("now_ist_secs_of_day()<TICK_GAP_GAUGE_SESSION_OPEN_SECS_OF_DAY_IST"),
+        "main.rs must gate the tick-gap gauge value on now_ist_secs_of_day() < \
+         TICK_GAP_GAUGE_SESSION_OPEN_SECS_OF_DAY_IST (pre-open pin to 0.0)"
+    );
+    assert!(
+        compact.contains("gauge!(\"tv_tick_gap_instruments_silent\").set(gauge_silent)"),
+        "the tv_tick_gap_instruments_silent gauge write must use the pre-open-pinned \
+         gauge_silent value"
+    );
+    assert!(
+        !compact.contains("gauge!(\"tv_tick_gap_instruments_silent\").set(total_silent"),
+        "the tv_tick_gap_instruments_silent gauge must NOT be written from the raw \
+         total_silent count — that bypasses the [09:00, 09:15) IST pre-open pin"
+    );
+}
+
+#[test]
+fn test_realtime_guarantee_degraded_alarm_threshold_matches_slo_warn() {
+    // The degraded alarm's 0.95 threshold MUST equal SLO_WARN_THRESHOLD in
+    // crates/core/src/instrument/slo_score.rs — score == 0.95 is Healthy in
+    // Rust, and LessThanThreshold keeps it correctly non-breaching. If the
+    // Rust constant ever moves, this pin forces the alarm to move with it.
+    let slo = read("crates/core/src/instrument/slo_score.rs");
+    assert!(
+        slo.contains("pub const SLO_WARN_THRESHOLD: f64 = 0.95;"),
+        "SLO_WARN_THRESHOLD moved from 0.95 — update the realtime_guarantee_degraded \
+         alarm threshold in silent-feed-alarms.tf IN THE SAME PR, then update this pin"
+    );
+    let tf = read("deploy/aws/terraform/silent-feed-alarms.tf");
+    let block = alarm_resource_block(&tf, "realtime_guarantee_degraded");
+    assert!(
+        block_has_attr(&block, "threshold", "0.95"),
+        "realtime_guarantee_degraded threshold must equal SLO_WARN_THRESHOLD (0.95)"
+    );
+    assert!(
+        block_has_attr(&block, "comparison_operator", "\"LessThanThreshold\""),
+        "realtime_guarantee_degraded must use LessThanThreshold (score == 0.95 is Healthy)"
+    );
+    assert!(
+        block_has_attr(&block, "evaluation_periods", "15")
+            && block_has_attr(&block, "datapoints_to_alarm", "9"),
+        "realtime_guarantee_degraded must latch 9-of-15 (round-2 correction 2026-07-07: with \
+         universe 776, tick_freshness breaches < 0.95 only at >= 39 silent, so the incident's \
+         29-38-silent minutes SAMPLE Healthy on the once-per-60s point scrape — 12-of-15 could \
+         fail to latch on the very incident it closes; strict 15/15 would never latch on the \
+         125-crossing oscillation. 9-of-15 is the honest latch; a 2-3 min reconnect dip still \
+         cannot reach 9 breaching points)"
+    );
+    // Medium tier: the name/description must never carry a "critical" token —
+    // the < 0.80 sibling alarm owns that word.
+    for needle in ["alarm_name", "alarm_description"] {
+        let line = block
+            .lines()
+            .find(|l| l.trim_start().starts_with(needle))
+            .unwrap_or_else(|| panic!("{needle} missing from realtime_guarantee_degraded")); // APPROVED: test
+        assert!(
+            !line.to_lowercase().contains("critical"),
+            "realtime_guarantee_degraded {needle} must NOT contain a 'critical' token \
+             (Medium tier; the < 0.80 sibling owns Critical): {line}"
+        );
+    }
+}
+
+#[test]
+fn test_silent_feed_alarms_are_window_gated() {
+    // All 4 silent-feed alarms (3 from the 2026-07-06 hardening + the
+    // 2026-07-11 scoreboard PR-C groww lag mirror) follow the house
+    // market-hours-gate pattern
+    // (Rule 3): actions_enabled=false + appended to the window-gate Lambda
+    // ALARM_NAMES (09:20-15:35 IST Mon-Fri). The SLO publisher runs 24/7
+    // with off-hours dimension dips; the lag gauge + tick-gap gauge go stale
+    // after close — every one of them false-pages without the gate.
+    let tf = read("deploy/aws/terraform/silent-feed-alarms.tf");
+    let gate = read("deploy/aws/terraform/market-hours-liveness-alarm.tf");
+    for name in [
+        "realtime_guarantee_degraded",
+        "boundary_catchup_storm_dhan",
+        "dhan_exchange_lag_p99_high",
+        "groww_exchange_lag_p99_high",
+    ] {
+        let block = alarm_resource_block(&tf, name);
+        assert!(
+            block_has_attr(&block, "actions_enabled", "false"),
+            "{name} must ship actions_enabled=false (gate Lambda owns the window)"
+        );
+        assert!(
+            gate.contains(&format!("aws_cloudwatch_metric_alarm.{name}.alarm_name")),
+            "{name} must be in the window-gate Lambda ALARM_NAMES join \
+             (market-hours-liveness-alarm.tf)"
+        );
+    }
+}
+
+#[test]
+fn test_groww_exchange_lag_alarm_shape_is_pinned() {
+    // Scoreboard PR-C (2026-07-11): the Groww lag alarm mirrors the Dhan S3
+    // discipline at Groww's finer resolution — threshold 5 (seconds; no 1s
+    // floor: Groww's exchange clock is millisecond-precise, receipt =
+    // sidecar capture one hop downstream of the socket), strict 10-of-10
+    // at 60s/Maximum (safe: the metric is itself a trailing-60s p99, so a
+    // one-burst transient decays out within ~60s), notBreaching (nightly
+    // box stop + the >=50-sample publish gate make missing data NORMAL —
+    // feed-dead is owned by tv_groww_ws_active + the feed-stall pagers).
+    let tf = read("deploy/aws/terraform/silent-feed-alarms.tf");
+    let block = alarm_resource_block(&tf, "groww_exchange_lag_p99_high");
+    assert!(
+        block.contains("metric_name         = \"tv_groww_exchange_lag_p99_seconds\""),
+        "the groww lag alarm must watch tv_groww_exchange_lag_p99_seconds \
+         (its OWN gauge name — never the Dhan gauge, never a feed label):\n{block}"
+    );
+    assert!(
+        block_has_attr(&block, "threshold", "5"),
+        "groww_exchange_lag_p99_high threshold must be 5 (seconds — ~10-50x \
+         above the healthy sub-second band at Groww's ms resolution):\n{block}"
+    );
+    assert!(
+        block_has_attr(&block, "comparison_operator", "\"GreaterThanThreshold\""),
+        "groww_exchange_lag_p99_high must use GreaterThanThreshold"
+    );
+    assert!(
+        block_has_attr(&block, "evaluation_periods", "10")
+            && block_has_attr(&block, "datapoints_to_alarm", "10"),
+        "groww_exchange_lag_p99_high must latch strict 10-of-10 (the metric \
+         is a trailing-60s p99 — the S3 rationale)"
+    );
+    assert!(
+        block_has_attr(&block, "period", "60")
+            && block_has_attr(&block, "statistic", "\"Maximum\""),
+        "groww_exchange_lag_p99_high must evaluate period=60/Maximum"
+    );
+    assert!(
+        block_has_attr(&block, "treat_missing_data", "\"notBreaching\""),
+        "groww_exchange_lag_p99_high must be notBreaching (nightly stop + \
+         the publish gates make missing data normal)"
+    );
+}
+
+/// Strip `#`-comments from an HCL (terraform) body, STRING-AWARE: a `#`
+/// inside a double-quoted string (e.g. an alarm_description's "drop #1")
+/// is kept as code. Adapted from the self-tested house pattern in
+/// `crates/app/tests/seal_drop_paging_wiring_guard.rs` after the
+/// 2026-07-10 hostile review proved (empirically — mutation stayed GREEN)
+/// that `test_ws_pool_alarms_are_window_gated_not_always_armed` passed
+/// vacuously with a join member commented out: HCL `#` comments already
+/// live INSIDE the ALARM_NAMES join body (the dated trailing comments),
+/// so a commented-out member line still satisfied a raw `.contains` —
+/// the alarm would ship actions_enabled=false and never be armed, with
+/// the ratchet green (false-OK, audit Rule 11). Comments can never be
+/// terraform configuration, so they are removed before matching.
+fn strip_hcl_comments(body: &str) -> String {
+    let mut out = String::with_capacity(body.len());
+    for line in body.lines() {
+        let bytes = line.as_bytes();
+        let mut in_str = false;
+        let mut esc = false;
+        let mut cut = line.len();
+        for (i, &b) in bytes.iter().enumerate() {
+            if esc {
+                esc = false;
+                continue;
+            }
+            match b {
+                b'\\' if in_str => esc = true,
+                b'"' => in_str = !in_str,
+                b'#' if !in_str => {
+                    cut = i;
+                    break;
+                }
+                _ => {}
+            }
+        }
+        out.push_str(&line[..cut]);
+        out.push('\n');
+    }
+    out
+}
+
+/// Locate the ALARM_NAMES join body in a COMMENT-STRIPPED gate-file body.
+/// Whitespace-tolerant around the `=` (a future terraform-fmt alignment
+/// group padding `ALARM_NAMES        = join(` must not panic the locator),
+/// and — because the input is comment-stripped — immune to a stale
+/// commented-out copy of the join hijacking the FIRST-occurrence search
+/// (the 2026-07-10 review's join-locator finding). The Lambda Python's
+/// `ALARM_NAMES = [n.strip()...]` line is skipped (not followed by
+/// `join(`).
+fn alarm_names_join_body(stripped_gate: &str) -> &str {
+    let mut from = 0;
+    while let Some(rel) = stripped_gate[from..].find("ALARM_NAMES") {
+        let start = from + rel;
+        let after = &stripped_gate[start + "ALARM_NAMES".len()..];
+        let after_eq = after.trim_start();
+        if let Some(rest) = after_eq.strip_prefix('=') {
+            let rest = rest.trim_start();
+            if let Some(body) = rest.strip_prefix("join(") {
+                let end = body
+                    .find("])")
+                    .expect("ALARM_NAMES join must close with `])`"); // APPROVED: test
+                return &body[..end];
+            }
+        }
+        from = start + "ALARM_NAMES".len();
+    }
+    panic!("market-hours-liveness-alarm.tf must carry the ALARM_NAMES join"); // APPROVED: test
+}
+
+/// True iff a LIVE (non-commented) line of the comment-stripped join body
+/// names the alarm member. Line-level prefix matching is the second layer
+/// of defense on top of comment stripping: a member can only count when a
+/// line's code content STARTS with its resource reference.
+fn join_member_present(stripped_join_body: &str, name: &str) -> bool {
+    let needle = format!("aws_cloudwatch_metric_alarm.{name}.alarm_name");
+    stripped_join_body
+        .lines()
+        .any(|l| l.trim_start().starts_with(&needle))
+}
+
+#[test]
+fn test_hcl_stripper_and_join_locator_reject_commented_out_members() {
+    // Anti-vacuity MUTATION self-test (2026-07-10 review, HIGH finding):
+    // the exact regression shape that made the original ratchet pass
+    // vacuously — a member commented out inside the join — must now FAIL
+    // the membership check, while a live member (even one carrying a
+    // trailing `#` comment, the real file's shape) still passes. Also
+    // pins the locator against (a) a stale commented-out COPY of the
+    // whole join above the live one and (b) terraform-fmt alignment
+    // padding around the `=`.
+    let fixture = "      # stale refactor residue — a commented-out copy of the join:\n\
+                   # ALARM_NAMES = join(\",\", [\n\
+                   #   aws_cloudwatch_metric_alarm.ws_pool_all_dead.alarm_name,\n\
+                   # ])\n\
+                   ALARM_NAMES        = join(\",\", [\n\
+                   aws_cloudwatch_metric_alarm.market_hours_liveness_missing.alarm_name,\n\
+                   # aws_cloudwatch_metric_alarm.ws_pool_all_dead.alarm_name,\n\
+                   aws_cloudwatch_metric_alarm.ws_failed_connections.alarm_name, # 2026-07-10\n\
+                   ])\n";
+    let stripped = strip_hcl_comments(fixture);
+    let body = alarm_names_join_body(&stripped);
+    assert!(
+        !join_member_present(body, "ws_pool_all_dead"),
+        "MUTATION MUST FAIL: a commented-out join member satisfied the \
+         membership check — the vacuous-pass hole is back. Body:\n{body}"
+    );
+    assert!(
+        join_member_present(body, "ws_failed_connections"),
+        "a LIVE member with a trailing # comment must still pass:\n{body}"
+    );
+    assert!(
+        join_member_present(body, "market_hours_liveness_missing"),
+        "a plain live member must pass:\n{body}"
+    );
+    // Stripper string-awareness: a `#` inside a double-quoted string is
+    // code, not a comment start.
+    let s = strip_hcl_comments("alarm_description = \"drop #1 kept\" # trailing gone\n");
+    assert!(
+        s.contains("drop #1 kept") && !s.contains("trailing gone"),
+        "strip_hcl_comments must keep in-string # and drop trailing comments: {s}"
+    );
+}
+
+#[test]
+fn test_ws_pool_alarms_are_window_gated_not_always_armed() {
+    // 2026-07-10 incident pin (pre-09:00 deferral false-page fix): the pool
+    // watchdog writes tv_websocket_pool_all_dead +
+    // tv_websocket_failed_connections_count unconditionally every 5s, while
+    // the pool DELIBERATELY opens zero Dhan sockets until 09:00 IST (the
+    // by-design pre-open connect deferral). ws-pool-all-dead was the ONLY
+    // liveness-class alarm not in the market-hours window gate, so it paged
+    // "ALL live market data connections are down" every trading morning
+    // ~08:34-09:00 and on overnight catch-up-deploy boots (observed
+    // 2026-07-10 at 02:45, 03:42, 08:34 IST); ws-failed-connections shares
+    // the same false class. Fix = the house pattern: actions_enabled=false
+    // + membership in the gate Lambda's ALARM_NAMES join (armed 09:20-15:35
+    // IST Mon-Fri; the open path's set_alarm_state(OK) resets a stale
+    // pre-open ALARM so no false page carries into the armed window).
+    // Losing EITHER half regresses: dropping actions_enabled=false restores
+    // the daily false pages; dropping the ALARM_NAMES entry leaves the
+    // alarm actions-disabled FOREVER (exists but is dead).
+    let tf = read("deploy/aws/terraform/app-alarms.tf");
+    let gate = read("deploy/aws/terraform/market-hours-liveness-alarm.tf");
+    // Scope the membership check to the COMMENT-STRIPPED ALARM_NAMES join
+    // body (2026-07-10 review hardening): a comment mention elsewhere in
+    // the gate file, a comment INSIDE the join (the trailing dated
+    // comments), or a stale commented-out copy of the join can never
+    // satisfy — or hijack — the check. Mutation-verified by
+    // test_hcl_stripper_and_join_locator_reject_commented_out_members.
+    let stripped_gate = strip_hcl_comments(&gate);
+    let join_body = alarm_names_join_body(&stripped_gate);
+    for name in ["ws_pool_all_dead", "ws_failed_connections"] {
+        let block = alarm_resource_block(&tf, name);
+        assert!(
+            block_has_attr(&block, "actions_enabled", "false"),
+            "{name} must ship actions_enabled=false (gate Lambda owns the 09:20-15:35 IST \
+             window; always-armed actions false-page during the by-design pre-09:00 IST \
+             Dhan connect deferral — 2026-07-10 incident):\n{block}"
+        );
+        assert!(
+            join_member_present(join_body, name),
+            "{name} must be INSIDE the window-gate Lambda ALARM_NAMES join \
+             (market-hours-liveness-alarm.tf, live line — commented out does NOT \
+             count) — without it the alarm stays actions-disabled forever. \
+             Join body was:\n{join_body}"
+        );
+    }
+    // Load-bearing companion pin (2026-07-10 review): the coverage claim
+    // "pages within ~2 min of window open" depends on the gate Lambda's
+    // open path resetting every gated alarm to OK — CloudWatch actions
+    // fire only on state TRANSITION, and ws_pool_all_dead is EXPECTED to
+    // sit in stale pre-open ALARM every morning (the 08:34-09:00 deferral
+    // window breaches it with actions disabled). Without the OK reset, a
+    // pool genuinely dead across 09:20 would page NEVER, not "in ~2 min".
+    // Matched on the comment-stripped body so the Lambda-source comment
+    // mentioning set_alarm_state can never satisfy it.
+    assert!(
+        stripped_gate.contains("cw.set_alarm_state(") && stripped_gate.contains("StateValue='OK'"),
+        "the gate Lambda's open path must keep the per-name set_alarm_state(OK) reset \
+         loop — without it a stale pre-open ALARM never transitions after arming and \
+         a real overnight-to-open outage pages NEVER"
+    );
+}
+
+#[test]
+fn test_boundary_catchup_alarm_uses_per_feed_dimensions() {
+    // Rule-11 pin: the catch-up storm alarm must key on the EXPLICIT
+    // { host, feed = "dhan" } dimensions map — NOT local.app_dimensions
+    // (host-only). Groww's 60s catch-up margin makes catch-up sealing its
+    // ROUTINE steady state; a host-only series either masks a Dhan storm
+    // under the Groww baseline or pages on healthy Groww behaviour.
+    let tf = read("deploy/aws/terraform/silent-feed-alarms.tf");
+    let block = alarm_resource_block(&tf, "boundary_catchup_storm_dhan");
+    assert!(
+        block_has_attr(&block, "host", "\"tickvault-prod\"")
+            && block_has_attr(&block, "feed", "\"dhan\""),
+        "boundary_catchup_storm_dhan must carry the explicit {{ host, feed = dhan }} \
+         dimensions map:\n{block}"
+    );
+    assert!(
+        !block.contains("local.app_dimensions"),
+        "boundary_catchup_storm_dhan must NOT use local.app_dimensions (host-only folding \
+         masks a Dhan storm under the Groww catch-up baseline)"
+    );
+    assert!(
+        block_has_attr(&block, "statistic", "\"Sum\"") && block_has_attr(&block, "period", "300"),
+        "boundary_catchup_storm_dhan must evaluate Sum/300s — the CW agent ships counters \
+         as per-scrape DELTAS, so Sum over 5m IS increase(5m) (Rule 12)"
+    );
+}
+
+#[test]
+fn test_app_alarms_count_is_twenty_three() {
     // Pin the count so future PRs that delete an alarm without updating
     // the rule files / PR body fail this guard. Cost note (aws-budget.md)
     // depends on this number — keeping the budget honest means keeping
@@ -361,11 +1199,37 @@ fn test_app_alarms_count_is_thirteen() {
     // tick at/after 15:30 IST, without threading a notifier into the per-tick
     // hot path. Cost: +1 custom metric (~$0.30/mo) + 1 alarm (~$0.10/mo),
     // negligible within the ~₹2,058/mo envelope.
+    // 19 (was 17) since 2026-07-06 (Groww feed-down alerting, operator
+    // directive, #1437): added `tv_groww_ws_active` (alarm
+    // tv-<env>-groww-ws-inactive — Groww WS lost after being up this
+    // session) + `tv_feed_sidecar_stall_restart_total` (alarm
+    // tv-<env>-groww-stall-restart-storm — 3+ FEED-STALL-01 silent-feed
+    // kills within an hour = provider-side reject). Cost: +2 alarms
+    // (~$0.20/mo) + 3 custom metrics (~$0.90/mo incl. the un-alarmed
+    // tv_feed_last_tick_age_seconds), per the app-alarms.tf header note.
+    // 22 (was 19) since 2026-07-06 (silent-feed incident hardening — the Dhan
+    // feed degraded all day with 4 independent signals and zero pages): scope
+    // now ALSO covers silent-feed-alarms.tf, which adds
+    // `tv_realtime_guarantee_score` (degraded 0.80-0.95 dead-band, 9-of-15),
+    // `tv_boundary_catchup_total` (per-feed dhan catch-up storm, PROVISIONAL
+    // 2000/5m x2) and `tv_dhan_exchange_lag_p99_seconds` (exchange->receive
+    // lag p99 > 10s x10). Note: the score name appears TWICE in the count
+    // (critical + degraded alarms watch the same metric). Cost: +4 custom
+    // metric series (~$1.20/mo) + 3 alarms (~$0.30/mo) — dated note in
+    // aws-budget.md.
+    // 23 (was 22) since 2026-07-11 (scoreboard PR-C): added
+    // `tv_groww_exchange_lag_p99_seconds` (alarm
+    // tv-<env>-groww-exchange-lag-p99-high — the Groww mirror of the Dhan
+    // lag signal at Groww's millisecond resolution, threshold 5s x10min,
+    // window-gated). Cost: +1 custom metric series (~$0.30/mo) + 1 alarm
+    // (~$0.10/mo) — dated note in aws-budget.md.
     let count = alarm_metric_names().len();
     assert_eq!(
-        count, 17,
-        "Z+ L2 VERIFY ratchet: expected exactly 17 app-level CloudWatch alarms \
-         (one per critical app signal). Found {count}. If you intentionally added \
+        count, 23,
+        "Z+ L2 VERIFY ratchet: expected exactly 23 app-level CloudWatch alarm \
+         metric_name entries across app-alarms.tf + silent-feed-alarms.tf \
+         (one per critical app signal; tv_realtime_guarantee_score counts twice — \
+         critical + degraded). Found {count}. If you intentionally added \
          or removed one, update aws-budget.md custom-metric cost line AND this guard."
     );
 }

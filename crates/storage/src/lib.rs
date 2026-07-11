@@ -79,6 +79,13 @@ mod global_qcfg_tests {
 }
 
 pub mod boot_probe;
+// Human-readable analyst console views (`ticks_named` / `candles_named`) —
+// plain QuestDB views LEFT-joining ticks/candles_1m against the
+// instrument_lifecycle master. Cold-path console tooling only (O(join) at
+// SELECT time, honestly O(N); zero hot-path impact). NOT feature-gated:
+// the DDL builders compile feature-free; the lifecycle-ensure call inside
+// is `#[cfg(feature = "daily_universe_fetcher")]`-gated.
+pub mod console_views;
 // C2 (2026-07-03): HTTP-CLIENT-01 — panic-free reqwest client construction.
 // Shared OnceLock probe client for the repeating QuestDB readiness probes
 // (boot + every-5s pool watchdog + every-10s SLO scheduler); typed
@@ -93,7 +100,14 @@ pub mod http_client;
 // Groww — both DELETED in SP5). Both feeds write here. See live-feed-purity.md
 // rule 11 + docs/design/sp5-unified-parity-audit-design.md. The two old physical
 // QuestDB tables are RETAINED on disk (SEBI 5y) but no longer written.
+/// Dual-feed scoreboard (operator 2026-07-10): one classified row per feed
+/// EPISODE (disconnect / stall / process death) with the blame verdict
+/// persisted — the month-end "who caused it" system-of-record.
+pub mod feed_episode_audit_persistence;
 pub mod feed_parity_1m_audit_persistence;
+/// Dual-feed scoreboard (operator 2026-07-10): the per-day per-feed
+/// scoreboard row + the per-instrument coverage detail table.
+pub mod feed_scoreboard_persistence;
 /// Groww auto-scale ladder forensic chain (§34, auto-scale PR-2 Item 8) —
 /// one row per ladder transition; feeds restart rehydration.
 pub mod groww_scale_audit_persistence;
@@ -113,6 +127,13 @@ pub mod oom_monitor;
 // BP-08 (2026-07-01): RESOURCE-01/02/03 fd / RSS / spill-free early-warning
 // monitors — supervised poll mirroring oom_monitor + disk_health_watcher.
 pub mod resource_monitor;
+// W2 PR#6 (2026-07-10, audit follow-up row 10): WAL-SUSPEND-01 per-table
+// QuestDB WAL-apply suspension probe — supervised 60s wal_tables() poll
+// mirroring disk_health_watcher / oom_monitor / resource_monitor. A
+// suspended table (post disk-full / apply error) silently stops applying
+// ILP-ACKed rows; this is the ONLY probe that sees it (boot probe +
+// questdb_health check reachability/connection, not per-table apply).
+pub mod wal_suspension_watcher;
 // Sub-PR #10b-ε (2026-05-27): instrument_fetch_audit table contract —
 // schema constants + DEDUP key + FetchOutcome enum. Feature-gated under
 // `daily_universe_fetcher` per

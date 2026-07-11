@@ -37,6 +37,18 @@ use crate::notification::events::NotificationEvent;
 use crate::notification::service::NotificationService;
 
 // ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+
+/// Cadence of the `tv_token_remaining_seconds` live-countdown emitter
+/// (`token_gauge_loop`). The scheduled `renewal_loop` only touches the
+/// gauge at its own wakeups (once per ~23h sleep + after each renewal),
+/// so between renewals the CloudWatch countdown panel froze at the last
+/// emitted value. A 30s re-emit keeps the countdown live at negligible
+/// cost (one O(1) arc-swap load + one gauge set per tick — cold path).
+const TOKEN_GAUGE_INTERVAL_SECS: u64 = 30;
+
+// ---------------------------------------------------------------------------
 // Token Handle (shared with downstream consumers)
 // ---------------------------------------------------------------------------
 
@@ -46,6 +58,48 @@ use crate::notification::service::NotificationService;
 /// handle and call `load()` to get the current token. The pointer is
 /// swapped atomically on renewal — zero lock contention.
 pub type TokenHandle = Arc<ArcSwap<Option<TokenState>>>;
+
+// ---------------------------------------------------------------------------
+// AG5-R2-1 (2026-07-06): shared failure-reason wrapper constants.
+//
+// The AUTH-GAP-05 mid-session watchdog's mint-vs-no-mint classification
+// (`mid_session_watchdog.rs::classify_failure_reason`) prefix-matches the
+// failure-reason wrappers `get_user_profile` produces. Before this fix the
+// wrappers were DUPLICATED as independent inline `format!` literals here and
+// independent `const` copies in the watchdog — an innocent log-message reword
+// here would silently break the classification, and every unrecognized shape
+// fail-safes to `RealAuthFail`, i.e. TOWARD a destructive `generateAccessToken`
+// mint (resurrecting the AG5-R1-3 "REST outage kills the healthy token"
+// CRITICAL) while every watchdog test stayed green. These constants are now
+// the SINGLE source: the producer `format!` sites below interpolate them and
+// the watchdog imports them. Ratchet:
+// `mid_session_watchdog::tests::wrapper_constants_are_single_sourced_in_token_manager`.
+// ---------------------------------------------------------------------------
+
+/// Send-leg wrapper from `get_user_profile` — the HTTP request failed
+/// before ANY response was received (client-generated reqwest error text
+/// only; no server-controlled body can appear inside this wrapper).
+pub(crate) const PROFILE_SEND_LEG_WRAPPER: &str = "profile request failed:";
+
+/// HTTP-response wrapper from `get_user_profile`:
+/// `"profile request HTTP {status} url={url} body={body}"`. Everything
+/// after `body=` is server-controlled (bounded + secret-redacted but
+/// arbitrary text) — classifiers must therefore read ONLY the fixed
+/// prefix, never substring-scan the whole string (SEC-R1-3).
+pub(crate) const PROFILE_HTTP_RESPONSE_WRAPPER: &str = "profile request HTTP ";
+
+/// 200-with-unparseable-body wrapper from `get_user_profile` (WAF/CDN
+/// interception class — a REST-surface problem, not a token rejection).
+pub(crate) const PROFILE_PARSE_ERROR_WRAPPER: &str = "profile response parse error";
+
+/// RESILIENCE-03 in-flight mint-refusal reason PREFIX (`acquire_token`'s
+/// lock tripwire). SEC-R2-2: the AUTH-GAP-05 watchdog prefix-anchors on
+/// this shared literal to classify a `force_renewal` failure as the
+/// permanent lock refusal — never a substring scan of the rendered error,
+/// whose mint-HTTP-failure shape concatenates a server-controlled body
+/// that could forge "RESILIENCE-03".
+pub(crate) const RESILIENCE03_MINT_REFUSAL_REASON_PREFIX: &str =
+    "RESILIENCE-03: instance lock not held";
 
 /// Wave 2 Item 5.4 (AUTH-GAP-03) — global TokenManager handle so the
 /// WebSocket sleep-wake path can call `force_renewal_if_stale()`
@@ -179,7 +233,20 @@ impl TokenManager {
             }
         };
 
+        // SEC-C2-2 fix (2026-07-07): pin
+        // `redirect(Policy::none())` — the §18 CSV-downloader precedent.
+        // Dhan's auth + API endpoints never legitimately redirect, and with
+        // the default follow-up-to-10 policy a redirect-loop/limit failure
+        // surfaces on the SEND leg with the FINAL redirect URL (taken from
+        // the server-controlled Location header) embedded in the reqwest
+        // error text — letting a WAF/CDN-planted URL path reach the
+        // mid-session watchdog's send-leg transient-needle scan (space-free
+        // needles like "connecterror" are plantable in a path) and downgrade
+        // a paging RestSurfaceDegraded outage to a silent Transient. With
+        // Policy::none() a 3xx is an ordinary non-2xx RESPONSE → the
+        // HTTP-response wrapper → RestSurfaceDegraded (correct + paging).
         let http_client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
             .timeout(Duration::from_millis(network_config.request_timeout_ms))
             .build()
             .map_err(|err| ApplicationError::AuthenticationFailed {
@@ -426,7 +493,20 @@ impl TokenManager {
             }
         };
 
+        // SEC-C2-2 fix (2026-07-07): pin
+        // `redirect(Policy::none())` — the §18 CSV-downloader precedent.
+        // Dhan's auth + API endpoints never legitimately redirect, and with
+        // the default follow-up-to-10 policy a redirect-loop/limit failure
+        // surfaces on the SEND leg with the FINAL redirect URL (taken from
+        // the server-controlled Location header) embedded in the reqwest
+        // error text — letting a WAF/CDN-planted URL path reach the
+        // mid-session watchdog's send-leg transient-needle scan (space-free
+        // needles like "connecterror" are plantable in a path) and downgrade
+        // a paging RestSurfaceDegraded outage to a silent Transient. With
+        // Policy::none() a 3xx is an ordinary non-2xx RESPONSE → the
+        // HTTP-response wrapper → RestSurfaceDegraded (correct + paging).
         let http_client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
             .timeout(Duration::from_millis(network_config.request_timeout_ms))
             .build()
             .map_err(|err| ApplicationError::AuthenticationFailed {
@@ -489,11 +569,22 @@ impl TokenManager {
     /// Sleeps until the refresh window (token_validity - refresh_before_expiry),
     /// then renews the token. Retries with exponential backoff on failure.
     /// Runs indefinitely until the task is cancelled.
+    ///
+    /// Also drives the `tv_token_remaining_seconds` live-countdown
+    /// emitter (`token_gauge_loop`, 30s cadence) inside the SAME task
+    /// via `select!`, so the gauge's lifecycle stays coupled to the
+    /// lane-owned renewal task: aborting the returned handle — or the
+    /// renewal loop halting at its circuit breaker — stops the countdown
+    /// too (C4 — no orphan emitter after a Dhan-lane disable).
     #[instrument(skip_all)]
     pub fn spawn_renewal_task(self: &Arc<Self>) -> tokio::task::JoinHandle<()> {
         let manager = Arc::clone(self);
+        let gauge_manager = Arc::clone(self);
         tokio::spawn(async move {
-            manager.renewal_loop().await;
+            tokio::select! {
+                () = manager.renewal_loop() => {}
+                () = gauge_manager.token_gauge_loop() => {}
+            }
         })
     }
 
@@ -547,8 +638,11 @@ impl TokenManager {
                 // string defensively. The profile path uses header auth (no token
                 // in URL), but the same pattern is used in `acquire_token` (line
                 // 644) for consistency — defence in depth.
+                // AG5-R2-1: interpolate the SHARED wrapper constant — the
+                // watchdog classifier prefix-matches it; a reword must go
+                // through the constant (single-sourced, ratcheted).
                 reason: format!(
-                    "profile request failed: {}",
+                    "{PROFILE_SEND_LEG_WRAPPER} {}",
                     redact_url_params(&err.to_string())
                 ),
             })?;
@@ -581,14 +675,19 @@ impl TokenManager {
                 "DH-901: profile request failed"
             );
             return Err(ApplicationError::AuthenticationFailed {
+                // AG5-R2-1: shared wrapper constant (see the constant block
+                // near the top of this file) — the watchdog's status-aware
+                // classification prefix-anchors on it.
                 reason: format!(
-                    "profile request HTTP {status} url={redacted_url} body={captured_body}"
+                    "{PROFILE_HTTP_RESPONSE_WRAPPER}{status} url={redacted_url} body={captured_body}"
                 ),
             });
         }
 
         serde_json::from_str(&body_text).map_err(|err| ApplicationError::AuthenticationFailed {
-            reason: format!("profile response parse error: {err}"),
+            // AG5-R2-1: shared wrapper constant — classified as
+            // RestSurfaceDegraded (never a mint) by the watchdog.
+            reason: format!("{PROFILE_PARSE_ERROR_WRAPPER}: {err}"),
         })
     }
 
@@ -717,9 +816,14 @@ impl TokenManager {
                         .to_string(),
                 });
             return Err(ApplicationError::AuthenticationFailed {
-                reason: "RESILIENCE-03: instance lock not held — generateAccessToken mint \
-                         refused (fail-closed)"
-                    .to_string(),
+                // SEC-R2-2: built from the SHARED refusal prefix so the
+                // AUTH-GAP-05 watchdog can prefix-anchor its permanence
+                // classification on OUR literal (never a substring scan of
+                // text that concatenates a server-controlled body).
+                reason: format!(
+                    "{RESILIENCE03_MINT_REFUSAL_REASON_PREFIX} — generateAccessToken mint \
+                     refused (fail-closed)"
+                ),
             });
         }
 
@@ -1058,6 +1162,51 @@ impl TokenManager {
     }
 
     // -----------------------------------------------------------------------
+    // Private — Live Token Countdown Gauge
+    // -----------------------------------------------------------------------
+
+    /// Emits the `tv_token_remaining_seconds` gauge from the current
+    /// arc-swap token state.
+    ///
+    /// Same computation as the two `renewal_loop` emit sites
+    /// (`time_until_refresh(0)` = seconds until token expiry). Returns
+    /// the emitted value for testability, or `None` when no token is
+    /// loaded yet — in that case the gauge is deliberately NOT set: a 0
+    /// during the pre-auth boot window would falsely trip the
+    /// TokenExpiryCritical (<10min) alert before the first mint lands.
+    fn emit_token_remaining_gauge(&self) -> Option<u64> {
+        let guard = self.token.load();
+        let state = guard.as_ref().as_ref()?;
+        let remaining = state.time_until_refresh(0).as_secs();
+        metrics::gauge!("tv_token_remaining_seconds").set(remaining as f64);
+        Some(remaining)
+    }
+
+    /// Periodic live-countdown emitter for `tv_token_remaining_seconds`.
+    ///
+    /// Re-emits the gauge every [`TOKEN_GAUGE_INTERVAL_SECS`] (30s) so
+    /// the operator sees a live countdown between renewals instead of a
+    /// flat line frozen at the last `renewal_loop` wakeup. Cold path —
+    /// one O(1) arc-swap load + one gauge set per tick; the renewal
+    /// timing and the two in-loop emit sites are untouched.
+    ///
+    /// Runs forever; `spawn_renewal_task` drives it inside the SAME
+    /// task as `renewal_loop` via `select!`, so it dies with the
+    /// renewal loop (circuit-breaker halt or lane-teardown abort) — no
+    /// orphan emitter keeps stamping the gauge after a Dhan-lane
+    /// disable (C4 coupling).
+    async fn token_gauge_loop(self: Arc<Self>) {
+        let mut interval = tokio::time::interval(Duration::from_secs(TOKEN_GAUGE_INTERVAL_SECS));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            interval.tick().await;
+            // Skip-on-None handled inside the helper; the returned
+            // value exists for the unit tests.
+            let _emitted = self.emit_token_remaining_gauge();
+        }
+    }
+
+    // -----------------------------------------------------------------------
     // Private — Helpers
     // -----------------------------------------------------------------------
 
@@ -1219,6 +1368,24 @@ impl TokenManager {
         guard.as_ref().as_ref().map(|state| state.expires_at())
     }
 
+    /// RESILIENCE-03 (2026-07-06): read the dual-instance-lock ownership
+    /// flag so the mid-session re-mint trigger (AUTH-GAP-05) can PRE-GATE
+    /// fail-closed BEFORE calling [`Self::force_renewal`] — the refusal is
+    /// decided with ZERO external side effects (no TOTP, no HTTP).
+    ///
+    /// O(1) `Acquire` load of the same private `instance_lock_held` field
+    /// the `acquire_token` mint tripwire reads. `None` means no lock flag
+    /// was installed for this manager (fast-boot crash-recovery arm /
+    /// tests) — the tripwire is disarmed, exactly as strong as the
+    /// existing in-`acquire_token` gate on that arm (documented residual
+    /// per `dual-instance-lock-2026-07-04.md` §3).
+    #[must_use]
+    pub fn dual_instance_lock_held(&self) -> Option<bool> {
+        self.instance_lock_held
+            .as_ref()
+            .map(|flag| flag.load(std::sync::atomic::Ordering::Acquire))
+    }
+
     /// Test-only constructor for a `TokenManager` with no live auth I/O.
     /// Crate-visible so sibling-module tests (e.g. the WebSocket `connection`
     /// sleep-wake ratchets, D2c/C4) can build a real `Arc<TokenManager>` to
@@ -1341,6 +1508,60 @@ mod tests {
         TokenManager::new_for_test(initial_token)
     }
 
+    /// SEC-C2-2 ratchet (2026-07-07): every PRODUCTION `reqwest::Client`
+    /// built in this module must pin `redirect(Policy::none())`. Under the
+    /// default follow-redirects policy, a redirect-loop/limit failure
+    /// surfaces on the SEND leg with the FINAL redirect URL (from the
+    /// server-controlled Location header) embedded in the reqwest error
+    /// text — which the mid-session watchdog's send-leg transient-needle
+    /// scan would then substring-match ("connecterror" / "timedout" are
+    /// plantable in a URL path), downgrading a paging RestSurfaceDegraded
+    /// outage to a silent Transient. Test-region builders (mock servers
+    /// never redirect) are exempt via the production-region split.
+    #[test]
+    fn test_production_http_clients_pin_redirect_policy_none() {
+        let src = include_str!("token_manager.rs");
+        let production = src
+            .split("\nmod tests {")
+            .next()
+            .expect("split always yields at least one region");
+        assert!(
+            production.len() < src.len(),
+            "production-region split found no `mod tests` boundary — the \
+             scan would vacuously include this test's own literals"
+        );
+        let builder_needle = "reqwest::Client::builder()";
+        let mut checked = 0usize;
+        let mut search_from = 0usize;
+        while let Some(rel) = production[search_from..].find(builder_needle) {
+            let off = search_from.saturating_add(rel);
+            // The redirect pin must appear in the builder chain immediately
+            // following (before `.build()`), within a bounded window.
+            let window_end = off.saturating_add(400).min(production.len());
+            let chain = &production[off..window_end];
+            let build_off = chain
+                .find(".build()")
+                .expect("every reqwest builder chain must call .build() nearby");
+            assert!(
+                chain[..build_off].contains("redirect(reqwest::redirect::Policy::none())"),
+                "SEC-C2-2 regression: a production reqwest::Client::builder() \
+                 chain at byte {off} does not pin \
+                 `.redirect(reqwest::redirect::Policy::none())` before \
+                 `.build()` — the default follow policy lets a \
+                 server-controlled redirect URL enter the send-leg error text \
+                 the mid-session watchdog substring-scans"
+            );
+            checked = checked.saturating_add(1);
+            search_from = off.saturating_add(builder_needle.len());
+        }
+        assert!(
+            checked >= 2,
+            "expected at least the 2 production TokenManager client builders \
+             (initialize + deferred auth) — found {checked}; the scan went \
+             vacuous"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // RESILIENCE-03 mint tripwire (dual-instance lock hardening 2026-07-04)
     // -----------------------------------------------------------------------
@@ -1365,6 +1586,25 @@ mod tests {
             !mint_refused_by_instance_lock(None),
             "no lock expected (None — tests / fast-boot arm) must allow the mint"
         );
+    }
+
+    /// AUTH-GAP-05 (2026-07-06): the read-only lock accessor mirrors the
+    /// constructor flag exactly — `Some(true)` / `Some(false)` / `None` —
+    /// so the mid-session re-mint trigger can pre-gate fail-closed
+    /// without any network call.
+    #[test]
+    fn test_dual_instance_lock_held_mirrors_constructor_flag() {
+        let held = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let manager = TokenManager::new_for_test_with_lock_flag(None, Some(Arc::clone(&held)));
+        assert_eq!(manager.dual_instance_lock_held(), Some(true));
+
+        // The heartbeat loses the lock to a peer — the accessor observes it.
+        held.store(false, std::sync::atomic::Ordering::Release);
+        assert_eq!(manager.dual_instance_lock_held(), Some(false));
+
+        // No flag installed (fast-boot arm / tests) — tripwire disarmed.
+        let no_flag = TokenManager::new_for_test(None);
+        assert_eq!(no_flag.dual_instance_lock_held(), None);
     }
 
     #[tokio::test]
@@ -2073,6 +2313,84 @@ mod tests {
         assert!(
             result.unwrap_err().is_cancelled(),
             "task should be cancelled, not panicked"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // token gauge — live tv_token_remaining_seconds countdown emitter
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_emit_token_remaining_gauge_computes_remaining_seconds() {
+        // expires_in=86400 → the countdown helper must report ~24h,
+        // mirroring the renewal_loop emit sites (time_until_refresh(0)).
+        let data = DhanAuthResponseData {
+            access_token: "gauge-jwt".to_string(),
+            token_type: "Bearer".to_string(),
+            expires_in: 86_400,
+        };
+        let manager = make_test_manager(Some(TokenState::from_response(&data)));
+        let remaining = manager
+            .emit_token_remaining_gauge()
+            .expect("token loaded so the gauge must emit");
+        assert!(
+            (86_395..=86_400).contains(&remaining),
+            "remaining seconds must be ~expires_in (24h), got {remaining}"
+        );
+    }
+
+    #[test]
+    fn test_emit_token_remaining_gauge_skips_when_no_token() {
+        // Pre-auth boot window: no token loaded → the emitter must SKIP
+        // (never set 0 — that would falsely trip TokenExpiryCritical).
+        let manager = make_test_manager(None);
+        assert!(
+            manager.emit_token_remaining_gauge().is_none(),
+            "no token loaded must skip the gauge emit, not set 0"
+        );
+    }
+
+    #[test]
+    fn test_emit_token_remaining_gauge_saturates_to_zero_for_expired_token() {
+        // expires_in=0 → time_until_refresh(0) saturates to ZERO; the
+        // gauge emits 0 (a genuinely expired token IS a countdown of 0).
+        let data = DhanAuthResponseData {
+            access_token: "expired-gauge-jwt".to_string(),
+            token_type: "Bearer".to_string(),
+            expires_in: 0,
+        };
+        let manager = make_test_manager(Some(TokenState::from_response(&data)));
+        assert_eq!(
+            manager.emit_token_remaining_gauge(),
+            Some(0),
+            "expired token must emit a saturated 0, not skip"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_token_gauge_loop_ticks_forever_and_is_cancel_safe() {
+        let data = DhanAuthResponseData {
+            access_token: "gauge-loop-jwt".to_string(),
+            token_type: "Bearer".to_string(),
+            expires_in: 86_400,
+        };
+        let manager = make_test_manager(Some(TokenState::from_response(&data)));
+        let handle = tokio::spawn(Arc::clone(&manager).token_gauge_loop());
+        // Advance paused time across several 30s intervals — the
+        // emitter must keep running (never return on its own).
+        tokio::time::advance(Duration::from_secs(TOKEN_GAUGE_INTERVAL_SECS * 3)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            !handle.is_finished(),
+            "token_gauge_loop must run until cancelled"
+        );
+        handle.abort();
+        let result = handle.await;
+        assert!(
+            result
+                .expect_err("aborted task returns JoinError")
+                .is_cancelled(),
+            "gauge loop must cancel cleanly, not panic"
         );
     }
 
@@ -3493,5 +3811,35 @@ mod tests {
             "token_manager.rs renewal_loop success path MUST notify \
              NotificationEvent::TokenRenewed. See Phase 0 Item 17."
         );
+    }
+
+    /// B9 log-shipping restore plan (2026-07-07) — the live
+    /// `tv_token_remaining_seconds` countdown emitter must stay wired
+    /// into `spawn_renewal_task` in the SAME task as `renewal_loop`
+    /// (fused via `select!`), so aborting the lane-owned renewal handle
+    /// also stops the countdown (C4 — no orphan emitter keeps stamping
+    /// the gauge after a Dhan-lane disable), and the cadence stays 30s.
+    #[test]
+    fn test_token_gauge_countdown_is_spawned_with_renewal_loop() {
+        assert_eq!(
+            TOKEN_GAUGE_INTERVAL_SECS, 30,
+            "live countdown cadence must remain 30s (plan-approved)"
+        );
+        let source = include_str!("token_manager.rs");
+        let start = source
+            .find("pub fn spawn_renewal_task")
+            .expect("spawn_renewal_task must exist in token_manager.rs");
+        let end = source[start..]
+            .find("Public — User Profile")
+            .map_or(source.len(), |offset| start + offset);
+        let body = &source[start..end];
+        for marker in ["tokio::select!", "renewal_loop()", "token_gauge_loop()"] {
+            assert!(
+                body.contains(marker),
+                "spawn_renewal_task must fuse renewal_loop + token_gauge_loop \
+                 into one select!-driven task (C4 lifecycle coupling); \
+                 missing marker: {marker}"
+            );
+        }
     }
 }

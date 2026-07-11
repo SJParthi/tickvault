@@ -468,6 +468,55 @@ pub enum NotificationEvent {
         detail: String,
     },
 
+    /// Once-per-trading-day Dhan-vs-Groww scorecard at 3:45 PM IST
+    /// (operator directive 2026-07-10 — run both feeds live for a month,
+    /// everything tracked + blame-attributed). Severity::Info +
+    /// `DispatchPolicy::Immediate` (the CrossVerify1mSummary precedent —
+    /// the daily digest must arrive AT 15:45, never coalesced). Any
+    /// degradation is carried loudly in the body (partial/degraded
+    /// footnotes), and a task death fires `DualFeedScorecardAborted`
+    /// instead — the daily signal can never be silently dropped.
+    DualFeedDailyScorecard {
+        /// Trading date in `YYYY-MM-DD` IST format.
+        trading_date_ist: String,
+        /// The Dhan side of the scorecard.
+        dhan: FeedScoreLine,
+        /// The Groww side of the scorecard.
+        groww: FeedScoreLine,
+        /// Session denominator in minutes (375 on a regular NSE day).
+        session_minutes: i64,
+        /// `true` when the day's coverage could not be fully vouched for
+        /// (a data source was unavailable mid-run).
+        partial_coverage: bool,
+        /// `true` when the connection-event record itself under-counted
+        /// today — drop counts are a floor, not a truth.
+        degraded: bool,
+        /// `true` when the operator forced this run BEFORE the daily
+        /// trigger — the card covers the day only up to the run time.
+        early_run: bool,
+        /// `true` when the app restarted mid-day (an in-market process
+        /// death was detected) — records from before the restart may
+        /// under-count, and the persisted row is stamped partial; the card
+        /// must say so too (round-3 hostile review 2026-07-10: the row said
+        /// partial while the card stayed silent).
+        restart_partial: bool,
+        /// `true` when Dhan was switched OFF for the day — a one-horse
+        /// race: the verdict says "no contest" instead of declaring a
+        /// winner (round-4 hostile review 2026-07-10).
+        dhan_feed_off: bool,
+        /// `true` when Groww was switched OFF for the day (round 4).
+        groww_feed_off: bool,
+    },
+
+    /// The daily dual-feed scorecard TASK died (panicked / errored) before
+    /// producing its summary. High so the ABSENCE of the daily scorecard is
+    /// impossible to miss (mirrors `CrossVerify1mAborted`). NOT fired on
+    /// graceful shutdown/cancellation.
+    DualFeedScorecardAborted {
+        /// Plain-English description of how the task died.
+        detail: String,
+    },
+
     // PR #4 (2026-05-19): DepthSpotPriceStale variant retired alongside
     // the deleted depth-20/200 infrastructure (operator lock 2026-05-15).
     // PR #5 (2026-05-19): 7 Phase2* variants retired alongside the
@@ -558,6 +607,19 @@ pub enum NotificationEvent {
         threshold_secs: i64,
     },
 
+    /// AUTH-GAP-05 (2026-07-06) — the mid-session profile watchdog forced
+    /// a token re-mint after N consecutive REAL Dhan token rejections
+    /// during market hours. Severity::High; edge-triggered exactly once
+    /// per failing episode (the watchdog's retry-once latch). Fields are
+    /// label-only counts — never the JWT or any user data.
+    TokenForcedRemintTriggered {
+        /// Consecutive REAL `/v2/profile` auth failures observed.
+        consecutive_checks: u32,
+        /// The watchdog cadence (seconds) — used to render the human
+        /// "about N minutes" duration in the Telegram body.
+        check_interval_secs: u64,
+    },
+
     /// Order update WebSocket connected.
     OrderUpdateConnected,
 
@@ -570,12 +632,22 @@ pub enum NotificationEvent {
     OrderUpdateAuthenticated,
 
     /// Order update WebSocket disconnected.
+    ///
+    /// 2026-07-06 fix (WS-GAP-10): emitted edge-triggered ONCE per outage
+    /// episode from inside the reconnect loop at ≥3 consecutive in-market
+    /// failures. The old emit at the main.rs task-exit point was
+    /// unreachable — `run_order_update_connection` never returns since
+    /// the WS-GAP-04 never-give-up rewrite.
     OrderUpdateDisconnected { reason: String },
 
     /// Order update WebSocket reconnected after a transient disconnect.
-    /// Fires on every successful reconnect, inside or outside market
-    /// hours (Parthiban directive 2026-04-21 — full audit trail on all
-    /// WS events).
+    ///
+    /// 2026-07-06 fix: fires ONLY after the reconnected socket survives
+    /// the 60s stability window (`ORDER_UPDATE_RECONNECT_STABILITY_SECS`)
+    /// — the old connect-edge emission produced false-recovery storms
+    /// when Dhan killed each socket ~10ms after login (dead-token
+    /// incident, 2026-07-06). Time-survival, never frame-gated: the order
+    /// stream is legitimately silent for hours on idle days.
     ///
     /// Severity intentionally downgraded to `Severity::Low` (was Medium
     /// before 2026-04-26). Dhan's order-update server idle-disconnects
@@ -584,8 +656,7 @@ pub enum NotificationEvent {
     /// successful recovery is operator-informational, not pager-worthy
     /// — MEDIUM at that volume is pure pager fatigue. The companion
     /// `OrderUpdateDisconnected` (Severity::High) still pages on the
-    /// disconnect leg, and `OrderUpdateReconnectionExhausted` (if/when
-    /// added) would page CRITICAL on actual loss-of-feed.
+    /// disconnect leg (unchanged: `test_order_update_reconnected_severity_is_low`).
     OrderUpdateReconnected { consecutive_failures: u32 },
 
     /// CRITICAL: zero live ticks received during market hours past the
@@ -730,6 +801,50 @@ pub enum NotificationEvent {
         /// suffix between "market closed — idle is normal" and "market open
         /// — ticks should arrive shortly".
         market_open: bool,
+    },
+
+    /// A market-data feed went DOWN (operator directive 2026-07-06 — Groww
+    /// feed-down alerting parity with the Dhan main feed). Fired on the
+    /// feed's lifecycle FALLING edge (runtime disable / internal bridge
+    /// death), exactly ONCE per DOWN episode (edge-latched via
+    /// `GrowwAuditLatches::down_announced`, re-armed only when the feed is
+    /// STREAMING again). Never claims upstream tick counts — it only states
+    /// that prices from this feed will not flow until recovery. Severity is
+    /// field-driven: High in-market (pages + SNS), Low off-hours (60s
+    /// coalesced — the 2026-04-22 pre-market-spam precedent class).
+    FeedDown {
+        /// Feed display name (e.g. "Groww").
+        feed: String,
+        /// Fixed plain-English cause (never raw child text / URLs).
+        reason: String,
+        /// Whether the market was open at the falling edge — drives severity
+        /// (High in-market, Low off-hours) and the message register.
+        market_open: bool,
+        /// `true` when the feed was DELIBERATELY switched off (the runtime
+        /// feed toggle) — the body then says it stays OFF until re-enabled
+        /// from the feeds page. `false` for involuntary falling edges
+        /// (bridge death / internal restart) where the auto-retry trailer is
+        /// honest. Without this split the operator-disable page falsely
+        /// claimed "the system keeps retrying automatically" — a disabled
+        /// feed is NEVER retried, so the message actively delayed the one
+        /// action (re-enable) that fixes it (2026-07-06 fix, Telegram
+        /// commandment 7 + audit Rule 11).
+        operator_initiated: bool,
+    },
+
+    /// A previously-DOWN market-data feed is STREAMING again (operator
+    /// directive 2026-07-06). Fired exactly ONCE per DOWN episode, on the
+    /// STREAMING rising edge (a real tick / the feed's own streaming
+    /// status) — never on mere socket-connect, preserving the
+    /// connected ≠ streaming honesty split (`FeedConnectedAwaitingTicks`
+    /// keeps announcing socket-connect separately with "awaiting first
+    /// tick"). Severity::Medium — mirrors `WebSocketReconnected`.
+    FeedRecovered {
+        /// Feed display name (e.g. "Groww").
+        feed: String,
+        /// Total downtime of the episode in seconds (first-down-wins, so it
+        /// spans intermediate retry failures).
+        down_secs: u64,
     },
 
     /// Instrument build failed — includes manual trigger URL for retry.
@@ -993,7 +1108,34 @@ pub enum NotificationEvent {
     /// fires this ONCE per running-child reject (edge-triggered) with a fixed
     /// plain-English `reason` per class (never the raw child text — defense in
     /// depth so no runtime/credential data reaches Telegram). Severity::High.
-    GrowwSidecarRejected { reason: String },
+    ///
+    /// `fleet_summary` (exam-fix hardening 2026-07-06): `true` when `reason`
+    /// is a FLEET-coalesced "N of M connections retrying" summary — the body
+    /// then describes the partial-fleet condition instead of the single-conn
+    /// total-outage trailer ("receiving nothing … prices will not flow"),
+    /// which would contradict a partial summary with a false
+    /// whole-feed-down claim.
+    GrowwSidecarRejected { reason: String, fleet_summary: bool },
+
+    /// W2 PR#5 (2026-07-10, audit follow-up row 15): the configured NSE
+    /// holiday calendar's coverage horizon is running out (or already ran
+    /// out). The holiday list covers one calendar year at a time and the
+    /// trading-day gate has NO year bound — past the newest listed year,
+    /// every un-listed weekday holiday silently reads as a trading day
+    /// (the box starts, feeds connect, a full billable session burns on a
+    /// market-closed day). Fired by the calendar-staleness watchdog
+    /// (`crates/app/src/calendar_staleness.rs`), edge-latched to at most
+    /// one page per process per IST day. Severity::High — demands operator
+    /// action (paste the next official NSE circular into the config).
+    HolidayCalendarCoverageLow {
+        /// Signed days of coverage left (negative = already past the
+        /// cliff); `None` = the configured holiday list is EMPTY
+        /// (pathological — the config guards prevent it in prod, but the
+        /// body renders it honestly instead of a fake number).
+        days_remaining: Option<i64>,
+        /// Human-readable last covered date, e.g. "31 Dec 2026".
+        coverage_end_display: String,
+    },
 
     /// Custom alert from any component.
     Custom { message: String },
@@ -1061,6 +1203,180 @@ pub struct FeedStatusLine {
     pub instruments: Option<u64>,
     /// Seconds since this feed's most recent tick; `None` = no tick seen yet.
     pub last_tick_age_secs: Option<u64>,
+}
+
+/// One feed's side of the daily dual-feed scorecard (operator directive
+/// 2026-07-10). `-1` on any count means "not measured / unavailable" and
+/// renders honestly (never as a fabricated zero — audit Rule 11).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FeedScoreLine {
+    /// Feed display name ("Dhan" / "Groww").
+    pub name: String,
+    /// Ticks captured today; `-1` = unavailable.
+    pub ticks: i64,
+    /// Session minutes where ONLY this feed delivered prices; `-1` unknown.
+    pub exclusive_minutes: i64,
+    /// Day median exchange→receipt delay in ms; `-1` = not measured yet.
+    pub lag_p50_ms: i64,
+    /// Day worst-1% delay in ms; `-1` = not measured yet.
+    pub lag_p99_ms: i64,
+    /// In-market disconnect episodes; `-1` = record unavailable.
+    pub drops_market: i64,
+    /// Blame tallies over the day's episodes.
+    pub blame_broker: i64,
+    pub blame_ours: i64,
+    pub blame_unclear: i64,
+    /// Stall episodes — measured from the day's stall-restart records
+    /// (scoreboard PR-B, 2026-07-10): 0 means a MEASURED zero from this
+    /// deploy forward; `-1` = record unavailable. Groww-only by
+    /// construction today (Dhan's silent-socket detection reconnects
+    /// in-process and lands in the drops count instead).
+    pub stalls: i64,
+    /// Boot-reconciled process restarts detected today.
+    pub restarts: i64,
+    /// Session minutes with at least one tick; `-1` unknown.
+    pub streaming_minutes: i64,
+}
+
+/// The Dhan exchange-clock quantization floor in milliseconds — Dhan LTT
+/// carries WHOLE IST seconds, so its measured lag has a uniform [0,1)s
+/// inflation Groww's millisecond clock does not. The verdict's delay rung
+/// declares a winner ONLY when the cross-feed p99 delta EXCEEDS this floor
+/// (PR-C review round 1, 2026-07-11): a sub-floor "Groww faster by <1s" is
+/// unprovable against Dhan's whole-second clock — the runbook caveat made
+/// mechanical. MUST stay lockstep with the persisted `lag_floor_ms` column
+/// value for Dhan (`tickvault_storage::feed_scoreboard_persistence::
+/// LAG_FLOOR_MS_DHAN = 1000`; core cannot depend on storage — both values
+/// are pinned to 1000 by their own unit tests).
+const VERDICT_LAG_CLOCK_FLOOR_MS: i64 = 1000;
+
+/// The scorecard's ONE decision (Telegram commandment 8): who won today.
+/// Tiebreak ladder — feed-off no-contest (round 4: a switched-off feed's
+/// measured zeros are a one-horse race, never a win for the other) →
+/// exclusive minutes → worst-1% delay beyond the clock floor (only when
+/// BOTH are measured AND the delta exceeds [`VERDICT_LAG_CLOCK_FLOOR_MS`];
+/// a −1 sentinel never decides, and a sub-floor delta is clock asymmetry,
+/// not speed) → broker-blamed incidents → even day.
+fn scorecard_verdict(
+    dhan: &FeedScoreLine,
+    groww: &FeedScoreLine,
+    dhan_feed_off: bool,
+    groww_feed_off: bool,
+) -> String {
+    // Rung 0 (round 4, 2026-07-10): a feed switched OFF for the day makes
+    // every comparison rung a one-horse race — no winner is declared.
+    if dhan_feed_off && groww_feed_off {
+        return "\u{1f91d} Verdict: not comparable — both feeds were switched \
+                off today, no contest."
+            .to_string();
+    }
+    if dhan_feed_off || groww_feed_off {
+        let off = if dhan_feed_off {
+            &dhan.name
+        } else {
+            &groww.name
+        };
+        return format!(
+            "\u{1f91d} Verdict: not comparable — {off} was switched off \
+             today, no contest."
+        );
+    }
+    // Rung 1: exclusive coverage minutes.
+    if dhan.exclusive_minutes >= 0
+        && groww.exclusive_minutes >= 0
+        && dhan.exclusive_minutes != groww.exclusive_minutes
+    {
+        let (w, l) = if dhan.exclusive_minutes > groww.exclusive_minutes {
+            (dhan, groww)
+        } else {
+            (groww, dhan)
+        };
+        return format!(
+            "\u{1f3c6} Verdict: {} won today — {} exclusive minutes vs {}.",
+            w.name, w.exclusive_minutes, l.exclusive_minutes
+        );
+    }
+    // Rung 2: worst-1% delay (lower wins; only when both are measured AND
+    // the delta exceeds the Dhan whole-second clock floor — PR-C review
+    // round 1, 2026-07-11: Dhan's p99 physically cannot read below ~1s, so
+    // a raw compare would crown Groww "faster" on every healthy day from
+    // clock asymmetry, exactly the sub-floor comparison the runbook bans).
+    // A sub-floor delta falls through to the incident rung / "Even day".
+    if dhan.lag_p99_ms >= 0
+        && groww.lag_p99_ms >= 0
+        && dhan.lag_p99_ms.saturating_sub(groww.lag_p99_ms).abs() > VERDICT_LAG_CLOCK_FLOOR_MS
+    {
+        let (w, l) = if dhan.lag_p99_ms < groww.lag_p99_ms {
+            (dhan, groww)
+        } else {
+            (groww, dhan)
+        };
+        return format!(
+            "\u{1f3c6} Verdict: {} won today — faster prices beyond the clock floor \
+             (worst 1% delay {} vs {}).",
+            w.name,
+            render_ms(w.lag_p99_ms),
+            render_ms(l.lag_p99_ms)
+        );
+    }
+    // Rung 3: fewer broker-caused INCIDENTS wins — since PR-B the broker
+    // blame tally covers drops + stalls (restarts are always ours, so they
+    // never inflate it), and the wording must match what is compared: on a
+    // stall-heavy zero-drop day "fewer broker-caused drops (0 vs 5)" would
+    // contradict the card's own Drops line (review round 1, charter §D
+    // commandment 6 — the incident-split line was already reworded for
+    // exactly this reason). The blame tallies must BOTH be measured too —
+    // a -1 sentinel would otherwise "win" (-1 < N) and render as gibberish
+    // (hostile review 2026-07-10); sentinel days fall through to
+    // "Even day".
+    if dhan.drops_market >= 0
+        && groww.drops_market >= 0
+        && dhan.blame_broker >= 0
+        && groww.blame_broker >= 0
+        && dhan.blame_broker != groww.blame_broker
+    {
+        let (w, l) = if dhan.blame_broker < groww.blame_broker {
+            (dhan, groww)
+        } else {
+            (groww, dhan)
+        };
+        return format!(
+            "\u{1f3c6} Verdict: {} won today — fewer broker-caused incidents ({} vs {}).",
+            w.name, w.blame_broker, l.blame_broker
+        );
+    }
+    "\u{1f91d} Verdict: Even day.".to_string()
+}
+
+/// Renders a millisecond delay for the scorecard: `-1` = honest "not
+/// measured yet"; ≥1s renders in seconds for readability.
+fn render_ms(ms: i64) -> String {
+    if ms < 0 {
+        return "not measured yet".to_string();
+    }
+    if ms >= 1000 {
+        #[allow(clippy::cast_precision_loss)]
+        // APPROVED: display-only division of a bounded daily lag value.
+        return format!("{:.1} s", ms as f64 / 1000.0);
+    }
+    format!("{ms} ms")
+}
+
+/// Renders a `-1`-sentinel count: honest "?" instead of a fabricated zero.
+/// Large measured counts (≥ 10,000 — the daily tick totals) get thousands
+/// separators per Telegram commandment 6 ("11,034 instruments").
+fn render_count(v: i64) -> String {
+    if v < 0 {
+        return "?".to_string();
+    }
+    if v >= 10_000 {
+        // APPROVED: v is non-negative and bounded by daily tick volumes —
+        // fits usize on every supported target.
+        if let Ok(u) = usize::try_from(v) {
+            return format_with_commas(u);
+        }
+    }
+    v.to_string()
 }
 
 /// Renders the per-feed status block shared by the readiness ("ready to
@@ -1299,6 +1615,7 @@ impl NotificationEvent {
             | Self::WebSocketSleepEntered { .. }
             | Self::WebSocketSleepResumed { .. }
             | Self::WebSocketTokenForceRenewedOnWake { .. }
+            | Self::TokenForcedRemintTriggered { .. }
             | Self::WebSocketReconnectionExhausted { .. }
             // ── Dhan-scoped: order-update WebSocket ──
             | Self::OrderUpdateConnected
@@ -1313,9 +1630,9 @@ impl NotificationEvent {
             // ── Feed-generic: badge follows the `feed` field ──
             Self::FeedAuthOk { feed }
             | Self::FeedInstrumentsLoaded { feed, .. }
-            | Self::FeedConnectedAwaitingTicks { feed, .. } => {
-                feed_badge_for_name(feed).map(|b| b.badge())
-            }
+            | Self::FeedConnectedAwaitingTicks { feed, .. }
+            | Self::FeedDown { feed, .. }
+            | Self::FeedRecovered { feed, .. } => feed_badge_for_name(feed).map(|b| b.badge()),
             _ => None,
         }
     }
@@ -1631,6 +1948,180 @@ impl NotificationEvent {
                      2. Restart the app to re-arm tomorrow's check."
                 )
             }
+            Self::DualFeedDailyScorecard {
+                trading_date_ist,
+                dhan,
+                groww,
+                session_minutes,
+                partial_coverage,
+                degraded,
+                early_run,
+                restart_partial,
+                dhan_feed_off,
+                groww_feed_off,
+            } => {
+                // Operator-charter §G wording: plain English, emoji status,
+                // IST 12-hour time, specific numbers, ONE decision (the
+                // verdict line), no library names, no file paths. −1
+                // sentinels render honestly ("?" / "not measured yet") —
+                // never fabricated zeros (audit Rule 11).
+                let streaming_line = |f: &FeedScoreLine| -> String {
+                    if f.streaming_minutes < 0 || *session_minutes <= 0 {
+                        return "unknown".to_string();
+                    }
+                    let ok = f.streaming_minutes.saturating_mul(100)
+                        >= session_minutes.saturating_mul(99);
+                    let mark = if ok { "\u{2705}" } else { "\u{26a0}\u{fe0f}" };
+                    format!(
+                        "{} of {} min {}",
+                        f.streaming_minutes, session_minutes, mark
+                    )
+                };
+                // The who-caused-them split covers ALL of the day's headline
+                // incidents (drops + stalls + restarts), so it lives on its
+                // OWN line, decoupled from the drops count — a day with 0
+                // drops and 1 restart must never read "0 (ours 1)" (hostile
+                // review 2026-07-10).
+                let incident_split = |f: &FeedScoreLine| -> String {
+                    format!(
+                        "broker {} / ours {} / unclear {}",
+                        render_count(f.blame_broker),
+                        render_count(f.blame_ours),
+                        render_count(f.blame_unclear)
+                    )
+                };
+                let mut footnotes = String::new();
+                if *early_run {
+                    footnotes.push_str(
+                        "\n\u{26a0}\u{fe0f} This card was produced early on operator \
+                         request — it covers the day only up to the run time; \
+                         re-run after close for the full-day card.",
+                    );
+                }
+                if *partial_coverage {
+                    // Honest PR-1 cause (hostile review 2026-07-10): this
+                    // flag flips on READ/WRITE failures while building the
+                    // card — NOT on "the app was down part of the session"
+                    // (restart detection is a later upgrade).
+                    footnotes.push_str(
+                        "\n\u{26a0}\u{fe0f} Some of today's records could not be read \
+                         while building this card — numbers shown as \u{201c}?\u{201d} \
+                         are missing, and the rest may under-count.",
+                    );
+                }
+                if *degraded {
+                    footnotes.push_str(
+                        "\n\u{26a0}\u{fe0f} Some connection events could not be recorded \
+                         today — treat the drop counts as a minimum, not a truth.",
+                    );
+                }
+                if *restart_partial {
+                    // Round-3 honesty fix: the persisted row is stamped
+                    // partial on a restart day — the card must carry the
+                    // same caveat, not stay silent.
+                    footnotes.push_str(
+                        "\n\u{26a0}\u{fe0f} The app restarted during the day — records \
+                         from before the restart may under-count, so today's \
+                         numbers are a floor, not a truth.",
+                    );
+                }
+                for (off, line) in [(dhan_feed_off, dhan), (groww_feed_off, groww)] {
+                    if *off {
+                        // Round-4 fix: a switched-off feed's day is a
+                        // one-horse race — say so and keep it out of the
+                        // month tally (its row is stamped 'feed_off').
+                        footnotes.push_str(&format!(
+                            "\n\u{26a0}\u{fe0f} {} was switched off today — no contest; \
+                             this day does not count toward the month verdict.",
+                            line.name
+                        ));
+                    }
+                }
+                // Scoreboard PR-C (2026-07-11): delay is MEASURED — the day
+                // lag histograms are live. The footnote carries the
+                // resolution asymmetry honestly: Dhan's whole-second price
+                // clock (≥1 s floor) vs Groww's millisecond clock read one
+                // step after the wire (the sidecar writes each price down
+                // the instant it arrives). An unmeasured side (backfill
+                // re-run / too few samples) renders "not measured yet" with
+                // the honest cause — the retired PR-1 "next upgrade" claim
+                // never appears. The gate keys on EITHER feed (review
+                // round 1, 2026-07-11): a Dhan-off / thin-Dhan day with a
+                // measured Groww delay must never assert "Delay could not
+                // be measured today" under a card showing real Groww
+                // milliseconds (Rule-11 self-contradiction).
+                if dhan.lag_p50_ms >= 0
+                    || dhan.lag_p99_ms >= 0
+                    || groww.lag_p50_ms >= 0
+                    || groww.lag_p99_ms >= 0
+                {
+                    footnotes.push_str(
+                        "\nNote: Dhan's price clock ticks in whole seconds, so its \
+                         delay can never read below about 1 second; Groww's delay \
+                         is millisecond-precise, measured where its helper first \
+                         writes each price down (one step after the wire).",
+                    );
+                } else {
+                    footnotes.push_str(
+                        "\nDelay could not be measured today (a re-run for a past \
+                         day, or too few prices) — it reads \u{201c}not measured \
+                         yet\u{201d}.",
+                    );
+                }
+                // Scoreboard PR-B (2026-07-10): the PR-1 stall + Groww-drops
+                // sentinel footnotes are RETIRED — stall episodes are
+                // measured from this deploy forward (0 = measured 0; the
+                // runbook keeps the pre-ship-day caveat), and the Groww
+                // socket-death family is now visible in the Stalls column,
+                // so the drops count renders as a measurement again. A `-1`
+                // still renders as "?" defensively, without a stale claim.
+                format!(
+                    "\u{1f4ca} <b>Daily feed scorecard @ 3:45 PM IST</b>\n\
+                     Date: {trading_date_ist}\n\
+                     Ticks today: Dhan {} | Groww {}\n\
+                     Minutes only one feed had prices: Dhan {} | Groww {}\n\
+                     Typical delay: Dhan {} | Groww {}\n\
+                     Worst 1% delay: Dhan {} | Groww {}\n\
+                     Drops in market hours: Dhan {} | Groww {}\n\
+                     Who caused today's incidents: Dhan {} | Groww {}\n\
+                     Stalls: Dhan {} | Groww {}\n\
+                     App restarts detected: Dhan {} | Groww {}\n\
+                     Streaming: Dhan {} | Groww {}\n\
+                     {}{}",
+                    render_count(dhan.ticks),
+                    render_count(groww.ticks),
+                    render_count(dhan.exclusive_minutes),
+                    render_count(groww.exclusive_minutes),
+                    render_ms(dhan.lag_p50_ms),
+                    render_ms(groww.lag_p50_ms),
+                    render_ms(dhan.lag_p99_ms),
+                    render_ms(groww.lag_p99_ms),
+                    render_count(dhan.drops_market),
+                    render_count(groww.drops_market),
+                    incident_split(dhan),
+                    incident_split(groww),
+                    render_count(dhan.stalls),
+                    render_count(groww.stalls),
+                    render_count(dhan.restarts),
+                    render_count(groww.restarts),
+                    streaming_line(dhan),
+                    streaming_line(groww),
+                    scorecard_verdict(dhan, groww, *dhan_feed_off, *groww_feed_off),
+                    footnotes
+                )
+            }
+            Self::DualFeedScorecardAborted { detail } => {
+                let detail = html_escape(detail);
+                format!(
+                    "\u{26a0}\u{fe0f} <b>Daily feed scorecard did NOT run</b>\n\
+                     The 3:45 PM IST Dhan-vs-Groww scorecard died before \
+                     finishing.\n\
+                     Reason: {detail}\n\
+                     What to do RIGHT NOW:\n\
+                     1. Check the app is still running.\n\
+                     2. Restart the app to re-arm tomorrow's scorecard."
+                )
+            }
             // PR #4/#5 (2026-05-19): DepthSpotPriceStale + 7 Phase2*
             // Display arms retired with their variants.
             // PR #6a (2026-05-19): NseBhavcopyCheck* Display arms retired.
@@ -1745,6 +2236,23 @@ impl NotificationEvent {
                     connection_index.saturating_add(1)
                 )
             }
+            Self::TokenForcedRemintTriggered {
+                consecutive_checks,
+                check_interval_secs,
+            } => {
+                // Plain English per the 10 Telegram commandments: status
+                // emoji first, specific numbers, one decision, no library
+                // names / file paths / token material.
+                let minutes =
+                    u64::from(*consecutive_checks).saturating_mul(*check_interval_secs) / 60;
+                format!(
+                    "⚠️ <b>AUTH-GAP-05: broker login looks invalid — auto re-login started</b>\n\
+                     The broker rejected our login check {consecutive_checks} times in a row \
+                     (about {minutes} minutes). We are fetching a fresh login automatically.\n\
+                     If it clears you'll hear nothing more; if it fails again you'll get a red \
+                     alert — keep only ONE copy of the app running and restart it."
+                )
+            }
             Self::OrderUpdateConnected => "<b>Order Update WS connected</b>".to_string(),
             Self::OrderUpdateAuthenticated => {
                 "<b>Order Update WS authenticated</b>\nDhan accepted token — streaming live."
@@ -1835,6 +2343,58 @@ impl NotificationEvent {
                      Subscribed {sub} instruments — awaiting first tick ({suffix})",
                     feed_name = html_escape(feed),
                     sub = format_with_commas(*subscribed as usize),
+                )
+            }
+            Self::FeedDown {
+                feed,
+                reason,
+                market_open,
+                operator_initiated,
+            } => {
+                // `reason` is a fixed plain-English literal at every emit
+                // site (never raw child text / URLs), but html_escape it
+                // anyway for defense-in-depth, consistent with every String
+                // arm. The trailer BRANCHES on `operator_initiated`
+                // (2026-07-06 fix): a deliberately switched-off feed is
+                // NEVER retried, so the auto-retry reassurance would be a
+                // false signal that delays the one action (re-enable) that
+                // fixes it — the operator-disable form names that action
+                // instead (Telegram commandment 7). The involuntary form
+                // keeps the hostile-review-passed GrowwSidecarRejected
+                // honesty wording: state what will NOT flow + that retry is
+                // automatic.
+                let feed_name = html_escape(feed);
+                let reason = html_escape(reason);
+                match (*market_open, *operator_initiated) {
+                    (true, true) => format!(
+                        "🆘 <b>{feed_name} feed is DOWN</b>\n{reason}\n\n\
+                         Prices from {feed_name} will not flow while it is switched off. \
+                         It stays OFF until you re-enable it from the feeds page."
+                    ),
+                    (true, false) => format!(
+                        "🆘 <b>{feed_name} feed is DOWN</b>\n{reason}\n\n\
+                         Prices from {feed_name} will not flow until it recovers. \
+                         The system keeps retrying automatically — no restart needed."
+                    ),
+                    (false, true) => format!(
+                        "⚠️ <b>{feed_name} feed is down [off-hours]</b>\n{reason}\n\
+                         It stays off until you re-enable it from the feeds page — \
+                         idle is normal until then."
+                    ),
+                    (false, false) => format!(
+                        "⚠️ <b>{feed_name} feed is down [off-hours]</b>\n{reason}\n\
+                         Reconnect is automatic — idle is normal until market open."
+                    ),
+                }
+            }
+            Self::FeedRecovered { feed, down_secs } => {
+                // Honest recovery: fired ONLY on the streaming rising edge
+                // (real ticks), so "prices are flowing" is never a false-OK
+                // claim (connected ≠ streaming split preserved).
+                format!(
+                    "✅ <b>{feed_name} feed streaming again</b> — down {down_secs}s. \
+                     Prices are flowing.",
+                    feed_name = html_escape(feed),
                 )
             }
             Self::InstrumentBuildFailed {
@@ -2163,15 +2723,70 @@ impl NotificationEvent {
                      No action needed unless this recurs."
                 )
             }
-            Self::GrowwSidecarRejected { reason } => {
-                // `reason` is a fixed per-class &'static str mapped to String by
-                // the supervisor (never raw child text), but html_escape it
+            Self::GrowwSidecarRejected {
+                reason,
+                fleet_summary,
+            } => {
+                // `reason` is a fixed per-class &'static str (or the fleet
+                // coalescer's counted summary) mapped to String by the
+                // supervisor (never raw child text), but html_escape it
                 // anyway for defense-in-depth, consistent with every String arm.
+                let reason = html_escape(reason);
+                if *fleet_summary {
+                    // Fleet-coalesced partial summary (hostile-review fix
+                    // 2026-07-06): the trailer must NOT claim the whole feed
+                    // is "receiving nothing" — only the counted connections
+                    // reported a problem, and nothing positive is claimed
+                    // about the rest.
+                    format!(
+                        "🆘 <b>Groww live feed rejected</b>\n{reason}\n\nThe affected \
+                         connections keep retrying automatically. Prices from those \
+                         connections will not flow until they recover."
+                    )
+                } else {
+                    format!(
+                        "🆘 <b>Groww live feed rejected</b>\n{reason}\n\nThe Groww feed is \
+                         connected but receiving nothing. Until this is fixed, Groww \
+                         prices will not flow."
+                    )
+                }
+            }
+            Self::HolidayCalendarCoverageLow {
+                days_remaining,
+                coverage_end_display,
+            } => {
+                // Plain English per the 10 Telegram commandments: status
+                // emoji first, specific numbers, action verbs, one decision,
+                // no file paths / library names. `coverage_end_display` is
+                // produced by our own date formatter (never external text)
+                // but html_escape it anyway, consistent with every String arm.
+                let end = html_escape(coverage_end_display);
+                let when = match days_remaining {
+                    Some(d) if *d >= 0 => {
+                        format!("runs out in {d} days (last covered day: {end})")
+                    }
+                    Some(d) => {
+                        let ago = d.unsigned_abs();
+                        format!(
+                            "already ran out {ago} days ago (last covered day: {end}) — market \
+                             holidays are currently being treated as trading days"
+                        )
+                    }
+                    // Pathological empty-calendar case (config guards prevent
+                    // it in prod) — render honestly, never a fake number.
+                    None => "is EMPTY — no market holidays are configured at all, so every \
+                             weekday is being treated as a trading day"
+                        .to_string(),
+                };
                 format!(
-                    "🆘 <b>Groww live feed rejected</b>\n{}\n\nThe Groww feed is \
-                     connected but receiving nothing. Until this is fixed, Groww \
-                     prices will not flow.",
-                    html_escape(reason)
+                    "⚠️ <b>Market holiday calendar needs updating</b>\n\
+                     The list of NSE market holidays {when}.\n\
+                     Without it, the system cannot tell holidays from trading days — it \
+                     will start up and run full sessions on closed-market days.\n\
+                     What you need to do:\n\
+                     1. Get the official NSE trading-holiday circular for the next year.\n\
+                     2. Add those dates to the trading calendar settings.\n\
+                     3. Restart the app — this reminder stops automatically."
                 )
             }
             Self::Custom { message } => message.clone(),
@@ -2210,6 +2825,8 @@ impl NotificationEvent {
             Self::EndOfDayDigest { .. } => "EndOfDayDigest",
             Self::CrossVerify1mSummary { .. } => "CrossVerify1mSummary",
             Self::CrossVerify1mAborted { .. } => "CrossVerify1mAborted",
+            Self::DualFeedDailyScorecard { .. } => "DualFeedDailyScorecard",
+            Self::DualFeedScorecardAborted { .. } => "DualFeedScorecardAborted",
             // PR #4/#5 (2026-05-19): DepthSpotPriceStale + 7 Phase2*
             // name arms retired.
             // PR #6a (2026-05-19): NseBhavcopyCheck* name arms retired.
@@ -2219,6 +2836,7 @@ impl NotificationEvent {
             Self::WebSocketSleepEntered { .. } => "WebSocketSleepEntered",
             Self::WebSocketSleepResumed { .. } => "WebSocketSleepResumed",
             Self::WebSocketTokenForceRenewedOnWake { .. } => "WebSocketTokenForceRenewedOnWake",
+            Self::TokenForcedRemintTriggered { .. } => "TokenForcedRemintTriggered",
             Self::OrderUpdateConnected => "OrderUpdateConnected",
             Self::OrderUpdateAuthenticated => "OrderUpdateAuthenticated",
             Self::OrderUpdateDisconnected { .. } => "OrderUpdateDisconnected",
@@ -2230,6 +2848,8 @@ impl NotificationEvent {
             Self::FeedInstrumentsLoaded { .. } => "FeedInstrumentsLoaded",
             Self::FeedAuthOk { .. } => "FeedAuthOk",
             Self::FeedConnectedAwaitingTicks { .. } => "FeedConnectedAwaitingTicks",
+            Self::FeedDown { .. } => "FeedDown",
+            Self::FeedRecovered { .. } => "FeedRecovered",
             Self::InstrumentBuildFailed { .. } => "InstrumentBuildFailed",
             Self::IpVerificationFailed { .. } => "IpVerificationFailed",
             Self::IpVerificationSuccess { .. } => "IpVerificationSuccess",
@@ -2260,7 +2880,140 @@ impl NotificationEvent {
             Self::RealtimeGuaranteeDegraded { .. } => "RealtimeGuaranteeDegraded",
             Self::RealtimeGuaranteeCritical { .. } => "RealtimeGuaranteeCritical",
             Self::GrowwSidecarRejected { .. } => "GrowwSidecarRejected",
+            Self::HolidayCalendarCoverageLow { .. } => "HolidayCalendarCoverageLow",
             Self::Custom { .. } => "Custom",
+        }
+    }
+
+    /// Telegram UX Overhaul (2026-07-07): which episode bubble, if any,
+    /// this event folds into.
+    ///
+    /// `Some` ONLY for the WS lifecycle families that produce the observed
+    /// 40-message disconnect storms; EVERY other variant returns `None` so
+    /// the legacy dispatch path stays byte-identical. Zero-alloc (`Copy`
+    /// match) — DHAT-pinned on the dispatch bypass arm by
+    /// `crates/core/tests/dhat_telegram_dispatcher.rs`.
+    #[must_use]
+    pub fn episode_key(&self) -> Option<super::episode::EpisodeKey> {
+        use super::episode::{EpisodeFamily, EpisodeKey};
+        match self {
+            Self::WebSocketDisconnected {
+                connection_index, ..
+            }
+            | Self::WebSocketDisconnectedOffHours {
+                connection_index, ..
+            }
+            | Self::WebSocketReconnected {
+                connection_index, ..
+            } => Some(EpisodeKey {
+                family: EpisodeFamily::MainFeedWs,
+                conn: u8::try_from(*connection_index).unwrap_or(u8::MAX),
+            }),
+            Self::OrderUpdateDisconnected { .. } | Self::OrderUpdateReconnected { .. } => {
+                Some(EpisodeKey {
+                    family: EpisodeFamily::OrderUpdateWs,
+                    conn: 0,
+                })
+            }
+            // Boot bubble (2026-07-09 operator escalation — the ~8-message
+            // boot spray folds into ONE live-edited checklist). Success-only
+            // milestones (all ≤ Severity::Medium pre-demotion, Low/Info
+            // now); failure events keep their legacy instant paging.
+            Self::AuthenticationSuccess
+            | Self::InstrumentBuildSuccess { .. }
+            | Self::WebSocketPoolOnline { .. }
+            | Self::WebSocketPoolDeferredOffHours { .. }
+            | Self::OrderUpdateConnected
+            | Self::OrderUpdateAuthenticated
+            | Self::BootHealthCheck { .. }
+            | Self::StartupComplete { .. } => Some(super::episode::BOOT_EPISODE_KEY),
+            // Feed-generic boot pings fold ONLY for the Groww feed (str
+            // compare — zero-alloc; the DHAT pin holds). Any other feed
+            // name keeps the legacy immediate lane.
+            Self::FeedAuthOk { feed }
+            | Self::FeedInstrumentsLoaded { feed, .. }
+            | Self::FeedConnectedAwaitingTicks { feed, .. } => {
+                if feed.eq_ignore_ascii_case("groww") {
+                    Some(super::episode::BOOT_EPISODE_KEY)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// Boot bubble (2026-07-09): the typed milestone this event folds into
+    /// the boot checklist. `Some` for EXACTLY the variants whose
+    /// [`Self::episode_key`] maps to the Boot family; `None` otherwise.
+    #[must_use]
+    pub fn boot_milestone(&self) -> Option<super::episode::BootMilestone> {
+        use super::episode::BootMilestone;
+        // Payload counts clamp defensively — never a panic (repo law).
+        fn clamp_u32(value: usize) -> u32 {
+            u32::try_from(value).unwrap_or(u32::MAX)
+        }
+        match self {
+            Self::BootHealthCheck {
+                services_healthy,
+                services_total,
+            } => Some(BootMilestone::Services {
+                healthy: clamp_u32(*services_healthy),
+                total: clamp_u32(*services_total),
+            }),
+            Self::AuthenticationSuccess => Some(BootMilestone::DhanAuth),
+            Self::InstrumentBuildSuccess {
+                derivative_count,
+                underlying_count,
+                ..
+            } => Some(BootMilestone::Instruments {
+                count: clamp_u32(derivative_count.saturating_add(*underlying_count)),
+            }),
+            Self::WebSocketPoolOnline {
+                connected,
+                total,
+                last_real_tick_age_secs,
+                ..
+            } => Some(BootMilestone::DhanFeedOnline {
+                connected: clamp_u32(*connected),
+                total: clamp_u32(*total),
+                last_real_tick_age_secs: *last_real_tick_age_secs,
+            }),
+            Self::WebSocketPoolDeferredOffHours { .. } => {
+                Some(BootMilestone::DhanFeedDeferredOffHours)
+            }
+            Self::OrderUpdateConnected => Some(BootMilestone::OrderUpdateConnected),
+            Self::OrderUpdateAuthenticated => Some(BootMilestone::OrderUpdateAuthenticated),
+            Self::StartupComplete { mode } => Some(BootMilestone::Complete { mode }),
+            Self::FeedAuthOk { feed } if feed.eq_ignore_ascii_case("groww") => {
+                Some(BootMilestone::GrowwAuth)
+            }
+            Self::FeedInstrumentsLoaded {
+                feed, subscribed, ..
+            } if feed.eq_ignore_ascii_case("groww") => Some(BootMilestone::GrowwInstruments {
+                subscribed: clamp_u32(*subscribed),
+            }),
+            Self::FeedConnectedAwaitingTicks {
+                feed, market_open, ..
+            } if feed.eq_ignore_ascii_case("groww") => Some(BootMilestone::GrowwConnected {
+                market_open: *market_open,
+            }),
+            _ => None,
+        }
+    }
+
+    /// Telegram UX Overhaul (2026-07-07): the role this event plays inside
+    /// its episode. Disconnect-class → `Open` (the FSM decides open-vs-fold
+    /// by state presence); reconnect-class → `Resolve`. Meaningful only for
+    /// variants where [`Self::episode_key`] is `Some`.
+    #[must_use]
+    pub fn episode_role(&self) -> super::episode::EpisodeRole {
+        use super::episode::EpisodeRole;
+        match self {
+            Self::WebSocketReconnected { .. } | Self::OrderUpdateReconnected { .. } => {
+                EpisodeRole::Resolve
+            }
+            _ => EpisodeRole::Open,
         }
     }
 
@@ -2300,6 +3053,11 @@ impl NotificationEvent {
                 Severity::Low
             }
             Self::WebSocketTokenForceRenewedOnWake { .. } => Severity::Low,
+            // AUTH-GAP-05 (2026-07-06): the forced re-mint IS the
+            // self-remediation, but the operator must see every trigger —
+            // High (pages Telegram), not Critical (the standing
+            // MidSessionProfileInvalidated page covers the unrecovered case).
+            Self::TokenForcedRemintTriggered { .. } => Severity::High,
             // Routine zero-disconnect drift swap — green by design. Prior
             // `Custom` routing made every 60s drift fire [HIGH] amber; see
             // Fix #9 in .claude/plans/active-plan.md and .claude/rules/project/
@@ -2341,6 +3099,12 @@ impl NotificationEvent {
                 }
             }
             Self::CrossVerify1mAborted { .. } => Severity::High,
+            // Dual-feed scorecard (2026-07-10): Info per the contract — the
+            // daily digest is a positive signal; degradation is carried
+            // LOUDLY in the body (partial/degraded footnotes) and a task
+            // death fires the High Aborted variant below instead.
+            Self::DualFeedDailyScorecard { .. } => Severity::Info,
+            Self::DualFeedScorecardAborted { .. } => Severity::High,
             Self::SelfTestPassed { .. } => Severity::Info,
             Self::SelfTestDegraded { .. } => Severity::High,
             Self::RealtimeGuaranteeHealthy { .. } => Severity::Info,
@@ -2373,7 +3137,13 @@ impl NotificationEvent {
             // is High (per audit-findings Rule 11 — no false-OK class).
             // PR #6a (2026-05-19): NseBhavcopyCheck* severity arms retired.
             Self::OrderUpdateConnected => Severity::Low,
-            Self::OrderUpdateAuthenticated => Severity::Medium,
+            // 2026-07-09 (operator escalation — one boot bubble): demoted
+            // Medium → Low. The event now folds into the green boot
+            // checklist whose prefix is fixed at [LOW]; a Medium fold
+            // would misleadingly flip the bubble amber, and as a
+            // standalone (boot_bubble=false rollback) it is a routine
+            // once-per-boot success ping, not an operator action.
+            Self::OrderUpdateAuthenticated => Severity::Low,
             Self::TokenRenewed => Severity::Low,
             Self::IpVerificationSuccess { .. } => Severity::Low,
             Self::StaticIpBootCheckPassed { .. } => Severity::Low,
@@ -2404,6 +3174,22 @@ impl NotificationEvent {
             // `dispatch_policy()`.
             Self::FeedAuthOk { .. } => Severity::Low,
             Self::FeedConnectedAwaitingTicks { .. } => Severity::Low,
+            // 2026-07-06 Groww feed-down alerting: field-driven severity
+            // (CrossVerify1mSummary precedent) — one variant carries the
+            // in-market/off-hours split the Dhan WebSocketDisconnected /
+            // ...OffHours pair encodes with two variants. High pages
+            // Telegram + SNS mid-session; Low coalesces 60s off-hours
+            // (the 2026-04-22 pre-market TCP-reset spam precedent class).
+            Self::FeedDown { market_open, .. } => {
+                if *market_open {
+                    Severity::High
+                } else {
+                    Severity::Low
+                }
+            }
+            // Mirrors WebSocketReconnected (Medium) — a recovery is
+            // operator-visible but never pages SNS.
+            Self::FeedRecovered { .. } => Severity::Medium,
             Self::BootHealthCheck { .. } => Severity::Low,
             Self::OrphanPositionDetected { .. } => Severity::Critical,
             Self::OrphanPositionsClean => Severity::Info,
@@ -2415,6 +3201,11 @@ impl NotificationEvent {
             // A genuine Groww feed reject (auth / entitlement / error) is
             // operator-actionable — pages so the 0-ticks cause is visible.
             Self::GrowwSidecarRejected { .. } => Severity::High,
+            // W2 PR#5 (2026-07-10): the holiday-calendar coverage cliff
+            // demands operator action (paste the next NSE circular) — High
+            // pages Telegram; the watchdog's per-IST-date latch bounds it
+            // to one page per process per day (audit Rule 4).
+            Self::HolidayCalendarCoverageLow { .. } => Severity::High,
         }
     }
 
@@ -2463,6 +3254,24 @@ impl NotificationEvent {
             // that re-renders the body — Severity::Info would otherwise be
             // batched by the default routing.
             Self::CrossVerify1mSummary { .. } => DispatchPolicy::Immediate,
+            // Dual-feed scorecard (2026-07-10): the once-per-day 15:45 IST
+            // digest must arrive AT 15:45 (post-close = off-hours, so the
+            // default Info routing would coalesce it) — same rationale as
+            // CrossVerify1mSummary above.
+            Self::DualFeedDailyScorecard { .. } => DispatchPolicy::Immediate,
+            // 2026-07-08 (verified incident, operator complaint "why every
+            // telegram notification is very late"): PR #1439's in-market
+            // digest (900s window) swept the three once-per-trading-day
+            // market-open confirmations — "READY for market open @ 09:14"
+            // arrived at 09:28, "Streaming live @ 09:15:30" at 09:30,
+            // "self-test PASSED @ 09:16" at 09:30. Time-critical at the
+            // open; ship instantly. Severity stays Info — Immediate wins
+            // over severity in `classify_dispatch`, so color is untouched.
+            // (SelfTestDegraded/SelfTestCritical are High/Critical and
+            // already route immediate via the severity fallback.)
+            Self::MarketOpenReadinessConfirmation { .. }
+            | Self::MarketOpenStreamingConfirmation { .. }
+            | Self::SelfTestPassed { .. } => DispatchPolicy::Immediate,
             _ => DispatchPolicy::Default,
         }
     }
@@ -2483,6 +3292,361 @@ impl NotificationEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -----------------------------------------------------------------------
+    // Telegram UX Overhaul (2026-07-07) — episode_key / episode_role accessors
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_episode_role_resolve_for_reconnect_open_for_disconnect() {
+        use super::super::episode::EpisodeRole;
+        let disc = NotificationEvent::WebSocketDisconnected {
+            connection_index: 0,
+            reason: "reset".to_string(),
+        };
+        assert_eq!(disc.episode_role(), EpisodeRole::Open);
+        let rec = NotificationEvent::WebSocketReconnected {
+            connection_index: 0,
+            reason: None,
+            down_secs: 1,
+            attempts: 1,
+        };
+        assert_eq!(rec.episode_role(), EpisodeRole::Resolve);
+        let od_rec = NotificationEvent::OrderUpdateReconnected {
+            consecutive_failures: 2,
+        };
+        assert_eq!(od_rec.episode_role(), EpisodeRole::Resolve);
+    }
+
+    #[test]
+    fn test_episode_key_ws_lifecycle_variants_map_to_families() {
+        use super::super::episode::{EpisodeFamily, EpisodeRole};
+        let disc = NotificationEvent::WebSocketDisconnected {
+            connection_index: 0,
+            reason: "reset".to_string(),
+        };
+        let key = disc.episode_key().expect("main-feed disconnect has a key");
+        assert_eq!(key.family, EpisodeFamily::MainFeedWs);
+        assert_eq!(key.conn, 0);
+        assert_eq!(disc.episode_role(), EpisodeRole::Open);
+
+        let off = NotificationEvent::WebSocketDisconnectedOffHours {
+            connection_index: 0,
+            reason: "reset".to_string(),
+        };
+        assert_eq!(
+            off.episode_key().map(|k| k.family),
+            Some(EpisodeFamily::MainFeedWs)
+        );
+        assert_eq!(off.episode_role(), EpisodeRole::Open);
+
+        let rec = NotificationEvent::WebSocketReconnected {
+            connection_index: 0,
+            reason: None,
+            down_secs: 10,
+            attempts: 3,
+        };
+        assert_eq!(
+            rec.episode_key().map(|k| k.family),
+            Some(EpisodeFamily::MainFeedWs)
+        );
+        assert_eq!(rec.episode_role(), EpisodeRole::Resolve);
+
+        let od = NotificationEvent::OrderUpdateDisconnected {
+            reason: "reset".to_string(),
+        };
+        assert_eq!(
+            od.episode_key().map(|k| k.family),
+            Some(EpisodeFamily::OrderUpdateWs)
+        );
+        assert_eq!(od.episode_role(), EpisodeRole::Open);
+
+        let or = NotificationEvent::OrderUpdateReconnected {
+            consecutive_failures: 4,
+        };
+        assert_eq!(
+            or.episode_key().map(|k| k.family),
+            Some(EpisodeFamily::OrderUpdateWs)
+        );
+        assert_eq!(or.episode_role(), EpisodeRole::Resolve);
+    }
+
+    #[test]
+    fn test_episode_key_none_for_non_episode_variants() {
+        // Legacy path stays byte-identical for everything else.
+        // (2026-07-09: the boot-milestone variants moved to the Boot
+        // family — see test_episode_key_boot_variants_map_to_boot_family.)
+        for event in [
+            NotificationEvent::TokenRenewed,
+            NotificationEvent::ShutdownInitiated,
+            NotificationEvent::ShutdownComplete,
+            NotificationEvent::SelfTestPassed { checks_passed: 8 },
+            NotificationEvent::MarketOpenStreamingConfirmation {
+                main_feed_active: 1,
+                main_feed_total: 1,
+                order_update_active: true,
+            },
+            NotificationEvent::Custom {
+                message: "x".to_string(),
+            },
+        ] {
+            assert!(
+                event.episode_key().is_none(),
+                "non-episode variant must return None: {:?}",
+                event.topic()
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Boot bubble (2026-07-09) — episode_key / boot_milestone mapping
+    // -----------------------------------------------------------------------
+
+    /// Every boot-milestone variant, constructed once for the mapping tests.
+    fn boot_mapped_events() -> Vec<NotificationEvent> {
+        vec![
+            NotificationEvent::BootHealthCheck {
+                services_healthy: 3,
+                services_total: 3,
+            },
+            NotificationEvent::AuthenticationSuccess,
+            NotificationEvent::InstrumentBuildSuccess {
+                source: "cache".to_string(),
+                derivative_count: 1000,
+                underlying_count: 46,
+            },
+            NotificationEvent::WebSocketPoolOnline {
+                connected: 1,
+                total: 1,
+                per_connection: vec![(4, 5000, Some(2))],
+                boot_path: BootPathLabel::Slow,
+                boot_wall_clock_secs: 94.0,
+                last_real_tick_age_secs: Some(2),
+                feeds: vec![],
+            },
+            NotificationEvent::WebSocketPoolDeferredOffHours {
+                deferred: 1,
+                total: 1,
+                boot_path: BootPathLabel::Slow,
+                feeds: vec![],
+            },
+            NotificationEvent::OrderUpdateConnected,
+            NotificationEvent::OrderUpdateAuthenticated,
+            NotificationEvent::StartupComplete { mode: "sandbox" },
+            NotificationEvent::FeedAuthOk {
+                feed: "Groww".to_string(),
+            },
+            NotificationEvent::FeedInstrumentsLoaded {
+                feed: "Groww".to_string(),
+                subscribed: 768,
+                indices: 2,
+                stocks: 766,
+                skipped: 0,
+            },
+            NotificationEvent::FeedConnectedAwaitingTicks {
+                feed: "Groww".to_string(),
+                subscribed: 768,
+                market_open: true,
+            },
+        ]
+    }
+
+    #[test]
+    fn test_episode_key_boot_variants_map_to_boot_family() {
+        use super::super::episode::{BOOT_EPISODE_KEY, EpisodeRole};
+        for event in boot_mapped_events() {
+            assert_eq!(
+                event.episode_key(),
+                Some(BOOT_EPISODE_KEY),
+                "boot milestone must map to the Boot key: {}",
+                event.topic()
+            );
+            assert_eq!(
+                event.episode_role(),
+                EpisodeRole::Open,
+                "boot milestones always fold as Open"
+            );
+            assert!(
+                event.boot_milestone().is_some(),
+                "boot-mapped variant must carry a milestone: {}",
+                event.topic()
+            );
+        }
+    }
+
+    #[test]
+    fn test_episode_key_non_groww_feed_is_none() {
+        // A future feed #3 (or a renamed feed) keeps the legacy lane —
+        // never a wrong fold into the boot bubble.
+        for event in [
+            NotificationEvent::FeedAuthOk {
+                feed: "SomeOtherFeed".to_string(),
+            },
+            NotificationEvent::FeedInstrumentsLoaded {
+                feed: "SomeOtherFeed".to_string(),
+                subscribed: 10,
+                indices: 1,
+                stocks: 9,
+                skipped: 0,
+            },
+            NotificationEvent::FeedConnectedAwaitingTicks {
+                feed: "SomeOtherFeed".to_string(),
+                subscribed: 10,
+                market_open: false,
+            },
+        ] {
+            assert!(event.episode_key().is_none(), "{}", event.topic());
+            assert!(event.boot_milestone().is_none(), "{}", event.topic());
+        }
+    }
+
+    #[test]
+    fn test_boot_milestone_mapping_all_variants() {
+        use super::super::episode::{BootMilestone, BootMilestone as M};
+        let m = NotificationEvent::BootHealthCheck {
+            services_healthy: 3,
+            services_total: 4,
+        }
+        .boot_milestone();
+        assert_eq!(
+            m,
+            Some(M::Services {
+                healthy: 3,
+                total: 4
+            })
+        );
+        assert_eq!(
+            NotificationEvent::AuthenticationSuccess.boot_milestone(),
+            Some(M::DhanAuth)
+        );
+        assert_eq!(
+            NotificationEvent::InstrumentBuildSuccess {
+                source: "cache".to_string(),
+                derivative_count: 1000,
+                underlying_count: 46,
+            }
+            .boot_milestone(),
+            Some(M::Instruments { count: 1046 }),
+            "count = derivatives + underlyings"
+        );
+        assert_eq!(
+            NotificationEvent::WebSocketPoolOnline {
+                connected: 1,
+                total: 1,
+                per_connection: vec![],
+                boot_path: BootPathLabel::Slow,
+                boot_wall_clock_secs: 1.0,
+                last_real_tick_age_secs: None,
+                feeds: vec![],
+            }
+            .boot_milestone(),
+            Some(M::DhanFeedOnline {
+                connected: 1,
+                total: 1,
+                last_real_tick_age_secs: None
+            })
+        );
+        assert_eq!(
+            NotificationEvent::WebSocketPoolDeferredOffHours {
+                deferred: 1,
+                total: 1,
+                boot_path: BootPathLabel::Slow,
+                feeds: vec![],
+            }
+            .boot_milestone(),
+            Some(M::DhanFeedDeferredOffHours)
+        );
+        assert_eq!(
+            NotificationEvent::OrderUpdateConnected.boot_milestone(),
+            Some(M::OrderUpdateConnected)
+        );
+        assert_eq!(
+            NotificationEvent::OrderUpdateAuthenticated.boot_milestone(),
+            Some(M::OrderUpdateAuthenticated)
+        );
+        assert_eq!(
+            NotificationEvent::StartupComplete { mode: "sandbox" }.boot_milestone(),
+            Some(BootMilestone::Complete { mode: "sandbox" })
+        );
+        assert_eq!(
+            NotificationEvent::FeedAuthOk {
+                feed: "Groww".to_string()
+            }
+            .boot_milestone(),
+            Some(M::GrowwAuth)
+        );
+        assert_eq!(
+            NotificationEvent::FeedInstrumentsLoaded {
+                feed: "Groww".to_string(),
+                subscribed: 768,
+                indices: 2,
+                stocks: 766,
+                skipped: 0,
+            }
+            .boot_milestone(),
+            Some(M::GrowwInstruments { subscribed: 768 })
+        );
+        assert_eq!(
+            NotificationEvent::FeedConnectedAwaitingTicks {
+                feed: "Groww".to_string(),
+                subscribed: 768,
+                market_open: false,
+            }
+            .boot_milestone(),
+            Some(M::GrowwConnected { market_open: false })
+        );
+        // Non-boot events carry no milestone.
+        assert!(NotificationEvent::TokenRenewed.boot_milestone().is_none());
+    }
+
+    #[test]
+    fn test_boot_episode_key_only_success_milestones() {
+        // Ratchet: nothing with severity ≥ High may ever map to the Boot
+        // bubble — failure events keep their legacy instant paging. The
+        // boot bubble's prefix is fixed at [LOW], so folding a paging
+        // event would silently demote it.
+        for event in boot_mapped_events() {
+            assert!(
+                event.severity() < Severity::High,
+                "a paging-severity event must never fold into the boot bubble: {} ({:?})",
+                event.topic(),
+                event.severity()
+            );
+        }
+        // The #1443 instant trio stays OUT of the bubble (separate instant
+        // messages) — regression pin for the market-open lane.
+        for event in [
+            NotificationEvent::SelfTestPassed { checks_passed: 8 },
+            NotificationEvent::MarketOpenStreamingConfirmation {
+                main_feed_active: 1,
+                main_feed_total: 1,
+                order_update_active: true,
+            },
+            NotificationEvent::MarketOpenReadinessConfirmation {
+                main_feed_active: 1,
+                main_feed_total: 1,
+                order_update_active: true,
+                token_remaining_secs: 20_000,
+            },
+        ] {
+            assert!(
+                event.episode_key().is_none(),
+                "#1443 instant-lane event must stay standalone: {}",
+                event.topic()
+            );
+            assert_eq!(event.dispatch_policy(), DispatchPolicy::Immediate);
+        }
+    }
+
+    #[test]
+    fn test_order_update_authenticated_severity_is_low() {
+        // 2026-07-09 pin: folding into the green [LOW] boot checklist —
+        // Medium would flip the bubble amber.
+        assert_eq!(
+            NotificationEvent::OrderUpdateAuthenticated.severity(),
+            Severity::Low
+        );
+    }
 
     #[test]
     fn test_severity_as_label_returns_lowercase_string() {
@@ -2603,6 +3767,7 @@ mod tests {
     fn test_groww_sidecar_rejected_renders_reason_and_topic_and_severity() {
         let event = NotificationEvent::GrowwSidecarRejected {
             reason: "account lacks live market-data feed entitlement".to_string(),
+            fleet_summary: false,
         };
         let msg = event.to_message();
         // The plain-English reason reaches the operator…
@@ -2623,12 +3788,54 @@ mod tests {
     }
 
     #[test]
+    fn test_groww_sidecar_rejected_fleet_summary_body_is_fleet_aware() {
+        // Hostile-review fix 2026-07-06: a PARTIAL-fleet coalesced summary
+        // must not be wrapped in the single-conn total-outage trailer — the
+        // body would simultaneously report a partial count AND claim the
+        // whole feed is "receiving nothing" / "prices will not flow".
+        let event = NotificationEvent::GrowwSidecarRejected {
+            reason: "7 of 40 connections retrying (server session limit or throttle) — \
+                     no reject reported from the other 33 connections"
+                .to_string(),
+            fleet_summary: true,
+        };
+        let msg = event.to_message();
+        assert!(
+            msg.contains("7 of 40 connections retrying"),
+            "fleet summary reason missing: {msg}"
+        );
+        assert!(
+            !msg.contains("receiving nothing"),
+            "total-outage trailer must not wrap a partial fleet summary: {msg}"
+        );
+        assert!(
+            !msg.contains("Groww prices will not flow"),
+            "whole-feed no-flow claim must not wrap a partial fleet summary: {msg}"
+        );
+        assert!(
+            msg.contains("Prices from those connections will not flow"),
+            "fleet trailer must scope the no-flow claim to the affected connections: {msg}"
+        );
+        // Same topic/severity/badge as the single-conn arm — only the body
+        // trailer is fleet-aware.
+        assert_eq!(event.topic(), "GrowwSidecarRejected");
+        assert_eq!(event.severity(), Severity::High);
+        // The single-conn arm keeps its original total-outage wording.
+        let single = NotificationEvent::GrowwSidecarRejected {
+            reason: "access token stale".to_string(),
+            fleet_summary: false,
+        };
+        assert!(single.to_message().contains("receiving nothing"));
+    }
+
+    #[test]
     fn test_groww_sidecar_rejected_html_escapes_reason() {
         // Defense-in-depth: even though the supervisor only passes a fixed
         // &'static str reason, any angle brackets are escaped at the render
         // boundary (consistent with every other String arm).
         let event = NotificationEvent::GrowwSidecarRejected {
             reason: "<script>".to_string(),
+            fleet_summary: false,
         };
         let msg = event.to_message();
         assert!(!msg.contains("<script>"), "raw HTML not escaped: {msg}");
@@ -2636,6 +3843,186 @@ mod tests {
             msg.contains("&lt;script&gt;"),
             "expected escaped form: {msg}"
         );
+    }
+
+    #[test]
+    fn test_feed_down_in_market_is_high_severity() {
+        // Regression pin (2026-07-06 Groww feed-down alerting): a mid-session
+        // feed-DOWN must PAGE (High → Telegram + SNS) — the incident class is
+        // "Groww died at 10:31 IST, operator learned hours later".
+        let ev = NotificationEvent::FeedDown {
+            feed: "Groww".to_string(),
+            reason: "feed switched off by the operator".to_string(),
+            market_open: true,
+            operator_initiated: true,
+        };
+        assert_eq!(ev.severity(), Severity::High);
+    }
+
+    #[test]
+    fn test_feed_down_off_hours_is_low_severity() {
+        // Regression pin: off-hours feed-down must be Low (60s coalesced) —
+        // the 2026-04-22 pre-market Telegram-spam precedent class
+        // (WebSocketDisconnectedOffHours). The split is field-driven, not a
+        // second variant.
+        let ev = NotificationEvent::FeedDown {
+            feed: "Groww".to_string(),
+            reason: "feed switched off by the operator".to_string(),
+            market_open: false,
+            operator_initiated: true,
+        };
+        assert_eq!(ev.severity(), Severity::Low);
+    }
+
+    #[test]
+    fn test_feed_recovered_is_medium_severity() {
+        // Mirrors WebSocketReconnected (Medium): recovery is visible
+        // immediately but never pages SNS.
+        let ev = NotificationEvent::FeedRecovered {
+            feed: "Groww".to_string(),
+            down_secs: 154,
+        };
+        assert_eq!(ev.severity(), Severity::Medium);
+    }
+
+    #[test]
+    fn test_feed_down_renders_reason_and_topic_and_severity() {
+        // 10-commandments pin (pattern: GrowwSidecarRejected test above).
+        let ev = NotificationEvent::FeedDown {
+            feed: "Groww".to_string(),
+            reason: "internal restart — recovering automatically".to_string(),
+            market_open: true,
+            operator_initiated: false,
+        };
+        let msg = ev.to_message();
+        assert!(
+            msg.contains("internal restart — recovering automatically"),
+            "reason missing from message: {msg}"
+        );
+        // Status emoji at the start of the body (commandments 5/10) + the
+        // honest no-flow + auto-retry trailer.
+        assert!(msg.contains("🆘"), "severity emoji missing: {msg}");
+        assert!(msg.contains("Groww"), "feed name missing: {msg}");
+        assert!(
+            msg.contains("will not flow until it recovers"),
+            "honest no-flow claim missing: {msg}"
+        );
+        assert!(
+            msg.contains("retrying automatically"),
+            "auto-retry reassurance missing: {msg}"
+        );
+        // No library names / file paths (10 commandments).
+        assert!(!msg.contains(".rs"), "file path leaked: {msg}");
+        assert!(!msg.contains("mpsc"), "lib jargon leaked: {msg}");
+        assert_eq!(ev.topic(), "FeedDown");
+        assert_eq!(ev.severity(), Severity::High);
+        // Off-hours body flips register: soft warning, idle-is-normal.
+        let off = NotificationEvent::FeedDown {
+            feed: "Groww".to_string(),
+            reason: "feed switched off by the operator".to_string(),
+            market_open: false,
+            operator_initiated: true,
+        };
+        let off_msg = off.to_message();
+        assert!(
+            off_msg.contains("off-hours") && off_msg.contains("idle is normal"),
+            "off-hours body must say off-hours + idle is normal: {off_msg}"
+        );
+    }
+
+    #[test]
+    fn test_feed_down_operator_disable_body_names_the_action_not_auto_retry() {
+        // Regression pin (2026-07-06 fix): a DELIBERATE runtime disable is
+        // never retried by the system — the body must name the ONE action
+        // that fixes it (re-enable from the feeds page) and must NOT claim
+        // automatic retry/reconnect (Telegram commandment 7; a false
+        // auto-retry promise actively delays recovery — audit Rule 11).
+        let ev = NotificationEvent::FeedDown {
+            feed: "Groww".to_string(),
+            reason: "feed switched off by the operator".to_string(),
+            market_open: true,
+            operator_initiated: true,
+        };
+        let msg = ev.to_message();
+        assert!(
+            msg.contains("re-enable it from the feeds page"),
+            "operator-disable body must name the re-enable action: {msg}"
+        );
+        assert!(
+            !msg.contains("retrying automatically") && !msg.contains("Reconnect is automatic"),
+            "operator-disable body must NOT claim automatic retry: {msg}"
+        );
+        // Off-hours form of the same deliberate disable: same rule.
+        let off = NotificationEvent::FeedDown {
+            feed: "Groww".to_string(),
+            reason: "feed switched off by the operator".to_string(),
+            market_open: false,
+            operator_initiated: true,
+        };
+        let off_msg = off.to_message();
+        assert!(
+            off_msg.contains("re-enable it from the feeds page"),
+            "off-hours operator-disable body must name the re-enable action: {off_msg}"
+        );
+        assert!(
+            !off_msg.contains("Reconnect is automatic"),
+            "off-hours operator-disable body must NOT claim automatic reconnect: {off_msg}"
+        );
+    }
+
+    #[test]
+    fn test_feed_down_html_escapes_reason() {
+        // Defense-in-depth: reasons are fixed literals at every emit site,
+        // but any angle brackets are escaped at the render boundary
+        // (consistent with every other String arm).
+        let ev = NotificationEvent::FeedDown {
+            feed: "Groww".to_string(),
+            reason: "<script>".to_string(),
+            market_open: true,
+            operator_initiated: false,
+        };
+        let msg = ev.to_message();
+        assert!(!msg.contains("<script>"), "raw HTML not escaped: {msg}");
+        assert!(
+            msg.contains("&lt;script&gt;"),
+            "expected escaped form: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_feed_recovered_renders_down_secs_and_topic() {
+        let ev = NotificationEvent::FeedRecovered {
+            feed: "Groww".to_string(),
+            down_secs: 154,
+        };
+        let msg = ev.to_message();
+        assert!(msg.contains("✅"), "recovery emoji missing: {msg}");
+        assert!(
+            msg.contains("streaming again"),
+            "recovery must claim STREAMING (ticks), not just socket-connect: {msg}"
+        );
+        assert!(msg.contains("154"), "down duration missing: {msg}");
+        assert!(msg.contains("Groww"), "feed name missing: {msg}");
+        assert_eq!(ev.topic(), "FeedRecovered");
+    }
+
+    #[test]
+    fn test_feed_down_and_recovered_resolve_groww_badge() {
+        // Both variants must resolve the 🟢 GROWW badge via the feed-generic
+        // arm — falling to `_ => None` would violate the 2026-07-05
+        // "uniquely seen" per-feed badge directive.
+        let down = NotificationEvent::FeedDown {
+            feed: "Groww".to_string(),
+            reason: "x".to_string(),
+            market_open: true,
+            operator_initiated: false,
+        };
+        let rec = NotificationEvent::FeedRecovered {
+            feed: "Groww".to_string(),
+            down_secs: 1,
+        };
+        assert_eq!(down.feed_badge(), Some("🟢 GROWW"));
+        assert_eq!(rec.feed_badge(), Some("🟢 GROWW"));
     }
 
     #[test]
@@ -3583,6 +4970,49 @@ mod tests {
             assert!(
                 event.severity().tag().contains("[LOW]"),
                 "tag drift detected for {}",
+                event.topic()
+            );
+        }
+    }
+
+    /// 2026-07-08 ratchet (verified incident, operator complaint "why every
+    /// telegram notification is very late"): PR #1439's in-market digest
+    /// (900s window) swept the three once-per-trading-day market-open
+    /// confirmations — READY @ 09:14 delivered at 09:28, Streaming live
+    /// @ 09:15:30 at 09:30, self-test PASSED @ 09:16 at 09:30. These are
+    /// time-critical at the open: each MUST request `DispatchPolicy::
+    /// Immediate` (bypassing the digest via `classify_dispatch`) while
+    /// KEEPING `Severity::Info` (color decoupled from routing). Blocks
+    /// regression to the digest-swept pattern.
+    #[test]
+    fn test_market_open_confirmations_are_immediate_info() {
+        let events = [
+            NotificationEvent::MarketOpenReadinessConfirmation {
+                main_feed_active: 1,
+                main_feed_total: 1,
+                order_update_active: true,
+                token_remaining_secs: 20 * 3600,
+            },
+            NotificationEvent::MarketOpenStreamingConfirmation {
+                main_feed_active: 1,
+                main_feed_total: 1,
+                order_update_active: true,
+            },
+            NotificationEvent::SelfTestPassed { checks_passed: 7 },
+        ];
+        for event in events {
+            assert_eq!(
+                event.dispatch_policy(),
+                DispatchPolicy::Immediate,
+                "{} must request immediate dispatch (verified incident 2026-07-08 — \
+                 the in-market digest delayed the market-open confirmations ~15m)",
+                event.topic()
+            );
+            assert_eq!(
+                event.severity(),
+                Severity::Info,
+                "{} must stay Info — Immediate wins over severity in \
+                 classify_dispatch, so no severity bump is needed",
                 event.topic()
             );
         }
@@ -4776,6 +6206,7 @@ mod tests {
     fn test_groww_feed_events_carry_groww_badge_in_message() {
         let sidecar = NotificationEvent::GrowwSidecarRejected {
             reason: "access token stale".to_string(),
+            fleet_summary: false,
         };
         assert_eq!(sidecar.feed_badge(), Some("🟢 GROWW"));
         assert!(
@@ -5058,6 +6489,475 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // DualFeedDailyScorecard + DualFeedScorecardAborted (2026-07-10 PR-A)
+    // -----------------------------------------------------------------------
+
+    fn score_line(name: &str) -> FeedScoreLine {
+        FeedScoreLine {
+            name: name.to_string(),
+            ticks: 1_842_551,
+            exclusive_minutes: 14,
+            lag_p50_ms: -1,
+            lag_p99_ms: -1,
+            drops_market: 3,
+            blame_broker: 2,
+            blame_ours: 0,
+            blame_unclear: 1,
+            stalls: 0,
+            restarts: 0,
+            streaming_minutes: 373,
+        }
+    }
+
+    fn scorecard(dhan: FeedScoreLine, groww: FeedScoreLine) -> NotificationEvent {
+        NotificationEvent::DualFeedDailyScorecard {
+            trading_date_ist: "2026-07-10".to_string(),
+            dhan,
+            groww,
+            session_minutes: 375,
+            partial_coverage: false,
+            degraded: false,
+            early_run: false,
+            restart_partial: false,
+            dhan_feed_off: false,
+            groww_feed_off: false,
+        }
+    }
+
+    #[test]
+    fn test_dual_feed_scorecard_topic_severity_policy() {
+        let ev = scorecard(score_line("Dhan"), score_line("Groww"));
+        assert_eq!(ev.topic(), "DualFeedDailyScorecard");
+        assert_eq!(ev.severity(), Severity::Info);
+        // The once-per-day 15:45 digest must arrive AT 15:45 — post-close is
+        // off-hours, so the default Info routing would coalesce it
+        // (CrossVerify1mSummary precedent).
+        assert_eq!(ev.dispatch_policy(), DispatchPolicy::Immediate);
+    }
+
+    #[test]
+    fn test_dual_feed_scorecard_body_verdict_ladder() {
+        // Rung 1: exclusive minutes decide.
+        let mut groww = score_line("Groww");
+        groww.exclusive_minutes = 63;
+        let msg = scorecard(score_line("Dhan"), groww).to_message();
+        assert!(
+            msg.contains("\u{1f3c6} Verdict: Groww won today — 63 exclusive minutes vs 14."),
+            "rung-1 verdict wrong: {msg}"
+        );
+        // Rung 2: tied exclusive minutes → measured worst-1% delay decides
+        // (delta 2160 ms > the 1000 ms clock floor).
+        let mut d = score_line("Dhan");
+        let mut g = score_line("Groww");
+        d.lag_p99_ms = 2900;
+        g.lag_p99_ms = 740;
+        let msg = scorecard(d, g).to_message();
+        assert!(
+            msg.contains("Verdict: Groww won today — faster prices beyond the clock floor"),
+            "rung-2 verdict wrong: {msg}"
+        );
+        // Rung-2 clock-floor guard (PR-C review round 1, 2026-07-11): a
+        // sub-floor delta is Dhan's whole-second quantization, not speed —
+        // 1400 vs 700 (delta 700 ≤ 1000) must NOT declare a lag winner;
+        // identical evidence elsewhere falls through to "Even day".
+        let mut d = score_line("Dhan");
+        let mut g = score_line("Groww");
+        d.lag_p99_ms = 1400;
+        g.lag_p99_ms = 700;
+        let msg = scorecard(d, g).to_message();
+        assert!(
+            !msg.contains("faster prices"),
+            "a sub-floor p99 delta must never decide the delay rung: {msg}"
+        );
+        assert!(
+            msg.contains("\u{1f91d} Verdict: Even day."),
+            "sub-floor delta falls through the ladder: {msg}"
+        );
+        // ... while a beyond-floor delta (5000 vs 700 = 4300 > 1000)
+        // decides.
+        let mut d = score_line("Dhan");
+        let mut g = score_line("Groww");
+        d.lag_p99_ms = 5000;
+        g.lag_p99_ms = 700;
+        let msg = scorecard(d, g).to_message();
+        assert!(
+            msg.contains("Verdict: Groww won today — faster prices beyond the clock floor"),
+            "a beyond-floor delta must decide rung 2: {msg}"
+        );
+        // The floor const must stay lockstep with the persisted Dhan
+        // lag_floor_ms value (LAG_FLOOR_MS_DHAN = 1000 in
+        // tickvault-storage — core cannot import it; both pin 1000).
+        assert_eq!(VERDICT_LAG_CLOCK_FLOOR_MS, 1000);
+        // Rung 2 skip: a −1 sentinel must never decide the delay rung.
+        let mut d = score_line("Dhan");
+        let g = score_line("Groww"); // lag -1 both sides
+        d.blame_broker = 5;
+        let msg = scorecard(d, g).to_message();
+        assert!(
+            msg.contains("Verdict: Groww won today — fewer broker-caused incidents (2 vs 5)."),
+            "rung-3 verdict wrong: {msg}"
+        );
+        // Rung 3 skip (hostile review 2026-07-10): a −1 blame sentinel must
+        // never win the drops rung nor render "-1" — falls to Even day.
+        let mut d = score_line("Dhan");
+        let g = score_line("Groww");
+        d.blame_broker = -1; // drops_market still >= 0
+        let msg = scorecard(d, g).to_message();
+        assert!(
+            msg.contains("\u{1f91d} Verdict: Even day."),
+            "a -1 blame sentinel must not decide rung 3: {msg}"
+        );
+        assert!(
+            !msg.contains("(-1 vs"),
+            "the -1 sentinel must never render in a verdict: {msg}"
+        );
+        // Rung 4: identical evidence → even day.
+        let msg = scorecard(score_line("Dhan"), score_line("Groww")).to_message();
+        assert!(msg.contains("\u{1f91d} Verdict: Even day."), "{msg}");
+    }
+
+    #[test]
+    fn test_dual_feed_scorecard_body_sentinels_and_footnotes() {
+        // −1 lag renders honestly, never a fabricated 0 (audit Rule 11).
+        let msg = scorecard(score_line("Dhan"), score_line("Groww")).to_message();
+        assert!(msg.contains("not measured yet"), "{msg}");
+        // Scoreboard PR-C: the retired PR-1 "next upgrade" claim must not
+        // render — the unmeasured arm now names the honest cause (backfill
+        // re-run / too few samples).
+        assert!(
+            msg.contains("Delay could not be measured today"),
+            "unmeasured-lag footnote missing: {msg}"
+        );
+        assert!(
+            !msg.contains("Delay measurement starts with the next upgrade"),
+            "the retired PR-1 delay footnote must not render: {msg}"
+        );
+        // MEASURED lag swaps in the resolution-asymmetry footnote (Dhan
+        // whole-second floor + Groww millisecond one-step-after-the-wire)
+        // and renders both feeds at their native precision.
+        let mut d = score_line("Dhan");
+        let mut g = score_line("Groww");
+        d.lag_p50_ms = 1200;
+        d.lag_p99_ms = 2900;
+        g.lag_p50_ms = 180;
+        g.lag_p99_ms = 740;
+        let msg = scorecard(d, g).to_message();
+        assert!(
+            msg.contains("Dhan's price clock ticks in whole seconds"),
+            "lag-floor footnote missing: {msg}"
+        );
+        assert!(
+            msg.contains("Groww's delay is millisecond-precise"),
+            "Groww receipt-clock semantics footnote missing: {msg}"
+        );
+        assert!(msg.contains("1.2 s"), "≥1s delays render in seconds: {msg}");
+        assert!(
+            msg.contains("180 ms"),
+            "sub-second Groww delays render in milliseconds: {msg}"
+        );
+        // Scoreboard PR-B (2026-07-10): stalls are MEASURED — a real count
+        // renders numerically and the retired PR-1 footnote never appears
+        // (0 = measured 0 from this deploy forward; the runbook keeps the
+        // pre-ship-day caveat).
+        let mut g = score_line("Groww");
+        g.stalls = 1;
+        let msg = scorecard(score_line("Dhan"), g).to_message();
+        assert!(msg.contains("Stalls: Dhan 0 | Groww 1"), "{msg}");
+        assert!(
+            !msg.contains("Stall tracking starts with the next upgrade"),
+            "the retired PR-1 stall footnote must not render: {msg}"
+        );
+        // A `-1` still renders as the defensive "?" — without the stale
+        // footnote claim.
+        let mut d = score_line("Dhan");
+        let mut g = score_line("Groww");
+        d.stalls = -1;
+        g.stalls = -1;
+        let msg = scorecard(d, g).to_message();
+        assert!(msg.contains("Stalls: Dhan ? | Groww ?"), "{msg}");
+        assert!(
+            !msg.contains("Stall tracking starts with the next upgrade"),
+            "the retired PR-1 stall footnote must not render: {msg}"
+        );
+        // Partial + degraded days carry loud warnings — the partial wording
+        // names the HONEST PR-1 cause (a read failure while building the
+        // card), never an unmeasured "app was down" claim.
+        let ev = NotificationEvent::DualFeedDailyScorecard {
+            trading_date_ist: "2026-07-10".to_string(),
+            dhan: score_line("Dhan"),
+            groww: score_line("Groww"),
+            session_minutes: 375,
+            partial_coverage: true,
+            degraded: true,
+            early_run: false,
+            restart_partial: false,
+            dhan_feed_off: false,
+            groww_feed_off: false,
+        };
+        let msg = ev.to_message();
+        assert!(
+            msg.contains("Some of today's records could not be read"),
+            "{msg}"
+        );
+        assert!(
+            !msg.contains("the app did not watch the whole session"),
+            "the unmeasured restart claim must not render: {msg}"
+        );
+        assert!(msg.contains("treat the drop counts as a minimum"), "{msg}");
+        // An early forced run says so explicitly (the row is stamped
+        // partial; the card must not masquerade as end-of-day).
+        let ev = NotificationEvent::DualFeedDailyScorecard {
+            trading_date_ist: "2026-07-10".to_string(),
+            dhan: score_line("Dhan"),
+            groww: score_line("Groww"),
+            session_minutes: 375,
+            partial_coverage: false,
+            degraded: false,
+            early_run: true,
+            restart_partial: false,
+            dhan_feed_off: false,
+            groww_feed_off: false,
+        };
+        let msg = ev.to_message();
+        assert!(
+            msg.contains("produced early on operator request"),
+            "early-run footnote missing: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_dual_feed_scorecard_mixed_lag_state_footnote_keys_on_either_feed() {
+        // PR-C review round 1 (2026-07-11): the delay footnote branch was
+        // keyed on Dhan alone — a Dhan-off / thin-Dhan day with a measured
+        // Groww delay rendered "Typical delay: Dhan not measured yet |
+        // Groww 180 ms" directly above "Delay could not be measured today"
+        // (a Rule-11 self-contradiction on the operator surface). The gate
+        // now keys on EITHER feed.
+        let d = score_line("Dhan"); // lag -1/-1
+        let mut g = score_line("Groww");
+        g.lag_p50_ms = 180;
+        g.lag_p99_ms = 740;
+        let msg = scorecard(d, g).to_message();
+        assert!(
+            !msg.contains("Delay could not be measured today"),
+            "a measured Groww delay must not render under an unmeasured claim: {msg}"
+        );
+        assert!(
+            msg.contains("Dhan's price clock ticks in whole seconds"),
+            "the asymmetry footnote must render on a mixed-state day: {msg}"
+        );
+        assert!(msg.contains("180 ms"), "{msg}");
+        // The mirror mixed state (Dhan measured / Groww unmeasured) —
+        // reachable on a thin-Groww day — must not claim unmeasured either.
+        let mut d = score_line("Dhan");
+        d.lag_p50_ms = 1200;
+        d.lag_p99_ms = 2900;
+        let g = score_line("Groww"); // lag -1/-1
+        let msg = scorecard(d, g).to_message();
+        assert!(
+            !msg.contains("Delay could not be measured today"),
+            "a measured Dhan delay must not render under an unmeasured claim: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_dual_feed_scorecard_restart_partial_footnote() {
+        // Round-3 hostile review 2026-07-10: a restart day's card must
+        // carry the same partial caveat its persisted row does — never a
+        // silent row-vs-card honesty mismatch on exactly the day the
+        // feature exists for.
+        let ev = NotificationEvent::DualFeedDailyScorecard {
+            trading_date_ist: "2026-07-10".to_string(),
+            dhan: score_line("Dhan"),
+            groww: score_line("Groww"),
+            session_minutes: 375,
+            partial_coverage: false,
+            degraded: false,
+            early_run: false,
+            restart_partial: true,
+            dhan_feed_off: false,
+            groww_feed_off: false,
+        };
+        let msg = ev.to_message();
+        assert!(
+            msg.contains("The app restarted during the day"),
+            "restart-partial footnote missing: {msg}"
+        );
+        // Absent on a clean day.
+        let msg = scorecard(score_line("Dhan"), score_line("Groww")).to_message();
+        assert!(
+            !msg.contains("The app restarted during the day"),
+            "restart footnote must not render on a clean day: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_dual_feed_scorecard_groww_drops_sentinel_footnote() {
+        // Scoreboard PR-B (2026-07-10): the round-2 Groww drops blind spot
+        // closed with the stall rows — the footnote is RETIRED. A `-1`
+        // (defensive) still renders as "?" and must never decide a verdict
+        // rung, but no stale "not counted yet" claim renders.
+        let mut g = score_line("Groww");
+        g.drops_market = -1;
+        let msg = scorecard(score_line("Dhan"), g).to_message();
+        assert!(
+            msg.contains("Drops in market hours: Dhan 3 | Groww ?"),
+            "{msg}"
+        );
+        assert!(
+            !msg.contains("Groww connection drops are not counted yet"),
+            "the retired blind-spot footnote must not render: {msg}"
+        );
+        // The drops verdict rung must not decide against the sentinel —
+        // identical evidence elsewhere → Even day.
+        let mut d = score_line("Dhan");
+        d.blame_broker = 5;
+        let mut g = score_line("Groww");
+        g.drops_market = -1;
+        let msg = scorecard(d, g).to_message();
+        assert!(
+            msg.contains("\u{1f91d} Verdict: Even day."),
+            "a sentinel drops side must never lose/win the drops rung: {msg}"
+        );
+        // Both sides measured → still no footnote.
+        let msg = scorecard(score_line("Dhan"), score_line("Groww")).to_message();
+        assert!(
+            !msg.contains("Groww connection drops are not counted yet"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn test_dual_feed_scorecard_feed_off_no_contest() {
+        // Round-4 hostile review 2026-07-10 (the round-2 finding): a feed
+        // switched OFF for the day is a one-horse race — the verdict must
+        // say "no contest" (never crown the other feed on exclusive
+        // minutes) and the card must carry the switched-off footnote.
+        let mut g = score_line("Groww");
+        g.ticks = 0;
+        g.exclusive_minutes = 0;
+        g.streaming_minutes = 0;
+        let ev = NotificationEvent::DualFeedDailyScorecard {
+            trading_date_ist: "2026-07-10".to_string(),
+            dhan: score_line("Dhan"),
+            groww: g,
+            session_minutes: 375,
+            partial_coverage: false,
+            degraded: false,
+            early_run: false,
+            restart_partial: false,
+            dhan_feed_off: false,
+            groww_feed_off: true,
+        };
+        let msg = ev.to_message();
+        assert!(
+            msg.contains(
+                "not comparable — Groww was switched off \n             today, no contest"
+            ) || msg.contains("not comparable — Groww was switched off today, no contest"),
+            "feed-off rung-0 verdict missing: {msg}"
+        );
+        assert!(
+            !msg.contains("won today"),
+            "a switched-off feed's day must never declare a winner: {msg}"
+        );
+        assert!(
+            msg.contains("Groww was switched off today — no contest"),
+            "feed-off footnote missing: {msg}"
+        );
+        // Both feeds off (a feeds-disabled test session) — still no winner.
+        let mut d = score_line("Dhan");
+        d.ticks = 0;
+        d.exclusive_minutes = 0;
+        d.streaming_minutes = 0;
+        let mut g = score_line("Groww");
+        g.ticks = 0;
+        g.exclusive_minutes = 0;
+        g.streaming_minutes = 0;
+        let ev = NotificationEvent::DualFeedDailyScorecard {
+            trading_date_ist: "2026-07-10".to_string(),
+            dhan: d,
+            groww: g,
+            session_minutes: 375,
+            partial_coverage: false,
+            degraded: false,
+            early_run: false,
+            restart_partial: false,
+            dhan_feed_off: true,
+            groww_feed_off: true,
+        };
+        let msg = ev.to_message();
+        assert!(
+            msg.contains("both feeds were switched"),
+            "both-off verdict missing: {msg}"
+        );
+        // A clean comparable day renders NO feed-off wording.
+        let msg = scorecard(score_line("Dhan"), score_line("Groww")).to_message();
+        assert!(!msg.contains("switched off today"), "{msg}");
+    }
+
+    #[test]
+    fn test_dual_feed_scorecard_body_obeys_telegram_commandments() {
+        // 10-commandments litmus: emoji-first subject, IST 12-hour time,
+        // specific numbers, blame split, streaming check, no file paths,
+        // no library/infrastructure names.
+        let msg = scorecard(score_line("Dhan"), score_line("Groww")).to_message();
+        assert!(msg.contains("\u{1f4ca}"), "scorecard leads with 📊: {msg}");
+        assert!(msg.contains("3:45 PM IST"), "IST 12-hour time: {msg}");
+        assert!(msg.contains("Date: 2026-07-10"), "{msg}");
+        // Commandment 6: big counts carry thousands separators.
+        assert!(
+            msg.contains("Ticks today: Dhan 1,842,551 | Groww 1,842,551"),
+            "{msg}"
+        );
+        assert!(
+            msg.contains("Drops in market hours: Dhan 3 | Groww 3"),
+            "drops line missing: {msg}"
+        );
+        // The blame split is its OWN line, decoupled from the drops count
+        // (it covers ALL headline incidents — drops + stalls + restarts).
+        assert!(
+            msg.contains("Who caused today's incidents: Dhan broker 2 / ours 0 / unclear 1"),
+            "incident split line missing: {msg}"
+        );
+        assert!(msg.contains("Streaming: Dhan 373 of 375 min"), "{msg}");
+        for banned in ["data/", "QuestDB", "ILP", "DEDUP", ".rs", "SQL"] {
+            assert!(
+                !msg.contains(banned),
+                "operator text must not carry {banned:?}: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_dual_feed_scorecard_aborted_event() {
+        let ev = NotificationEvent::DualFeedScorecardAborted {
+            detail: "the task crashed: boom".to_string(),
+        };
+        assert_eq!(ev.topic(), "DualFeedScorecardAborted");
+        assert_eq!(ev.severity(), Severity::High);
+        let msg = ev.to_message();
+        assert!(msg.contains("Daily feed scorecard did NOT run"), "{msg}");
+        assert!(msg.contains("3:45 PM IST"), "{msg}");
+        assert!(msg.contains("Reason: the task crashed: boom"), "{msg}");
+        assert!(msg.contains("What to do RIGHT NOW"), "{msg}");
+    }
+
+    #[test]
+    fn test_scorecard_render_helpers() {
+        // render_ms: sentinel / sub-second / ≥1s bands.
+        assert_eq!(render_ms(-1), "not measured yet");
+        assert_eq!(render_ms(180), "180 ms");
+        assert_eq!(render_ms(2900), "2.9 s");
+        // render_count: sentinel = honest "?", never a fabricated zero;
+        // big measured counts get thousands separators (commandment 6).
+        assert_eq!(render_count(-1), "?");
+        assert_eq!(render_count(42), "42");
+        assert_eq!(render_count(9_999), "9999", "grouping starts at 10,000");
+        assert_eq!(render_count(10_000), "10,000");
+        assert_eq!(render_count(1_842_551), "1,842,551");
+    }
+
+    // -----------------------------------------------------------------------
     // Coverage for the boot-message rendering branches adjacent to the
     // 2026-07-04 Groww boot-parity change (PR #1400 coverage gate: core
     // dipped 90.16% vs the 90.2% ratcheted floor — these pin the previously
@@ -5240,6 +7140,94 @@ mod tests {
         assert!(
             silent.contains("zero live ticks") && silent.contains("120"),
             "got: {silent}"
+        );
+    }
+
+    /// AUTH-GAP-05 (2026-07-06) — the ONE HIGH forced-re-mint event:
+    /// severity / event_kind / Dhan badge / 10-commandments body (status
+    /// emoji, code id, specific numbers, NO token material, NO file paths).
+    #[test]
+    fn test_token_forced_remint_triggered_event() {
+        let ev = NotificationEvent::TokenForcedRemintTriggered {
+            consecutive_checks: 2,
+            check_interval_secs: 900,
+        };
+        assert_eq!(ev.severity(), Severity::High);
+        assert_eq!(ev.topic(), "TokenForcedRemintTriggered");
+        assert_eq!(
+            ev.feed_badge(),
+            Some(super::super::feed_badge::FeedBadge::Dhan.badge()),
+            "forced re-mint is Dhan-scoped — must lead with the Dhan badge"
+        );
+        let msg = ev.to_message();
+        assert!(msg.contains("AUTH-GAP-05"), "got: {msg}");
+        assert!(msg.contains("⚠️"), "status emoji missing: {msg}");
+        assert!(
+            msg.contains("2 times") && msg.contains("30 minutes"),
+            "specific numbers missing (2 checks × 900s = 30 min): {msg}"
+        );
+        // 10-commandments: never the JWT, never a file path or lib name.
+        assert!(
+            !msg.contains("eyJ"),
+            "JWT material must never appear: {msg}"
+        );
+        assert!(!msg.contains(".rs"), "file paths must never appear: {msg}");
+        assert!(
+            !msg.contains("force_renewal") && !msg.contains("arc-swap"),
+            "library/function names must never appear: {msg}"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // W2 PR#5 (2026-07-10) — HolidayCalendarCoverageLow
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn test_holiday_calendar_coverage_low_severity_is_high() {
+        let ev = NotificationEvent::HolidayCalendarCoverageLow {
+            days_remaining: Some(46),
+            coverage_end_display: "31 Dec 2026".to_string(),
+        };
+        assert_eq!(ev.severity(), Severity::High);
+        assert_eq!(ev.topic(), "HolidayCalendarCoverageLow");
+    }
+
+    #[test]
+    fn test_holiday_calendar_coverage_low_body_commandments() {
+        let msg = NotificationEvent::HolidayCalendarCoverageLow {
+            days_remaining: Some(46),
+            coverage_end_display: "31 Dec 2026".to_string(),
+        }
+        .to_message();
+        // Specific numbers + the covered-end date + action steps.
+        assert!(msg.contains("46 days"), "got: {msg}");
+        assert!(msg.contains("31 Dec 2026"), "got: {msg}");
+        assert!(msg.contains("What you need to do"), "got: {msg}");
+        assert!(msg.contains("NSE"), "got: {msg}");
+        // 10 Telegram commandments: no file paths, no library names.
+        assert!(!msg.contains(".rs"), "file paths must never appear: {msg}");
+        assert!(
+            !msg.contains(".toml"),
+            "file paths must never appear: {msg}"
+        );
+        assert!(
+            !msg.contains("HashSet") && !msg.contains("is_holiday"),
+            "library/function names must never appear: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_holiday_calendar_coverage_low_body_past_cliff() {
+        let msg = NotificationEvent::HolidayCalendarCoverageLow {
+            days_remaining: Some(-3),
+            coverage_end_display: "31 Dec 2026".to_string(),
+        }
+        .to_message();
+        // Past-cliff wording is HONEST: already ran out + consequence.
+        assert!(msg.contains("already ran out 3 days ago"), "got: {msg}");
+        assert!(
+            msg.contains("treated as trading days"),
+            "past-cliff body must state the live consequence: {msg}"
         );
     }
 }

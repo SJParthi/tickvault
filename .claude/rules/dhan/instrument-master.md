@@ -51,7 +51,9 @@
    2026-05-29).** `instrument_lifecycle` stores the indices + F&O underlying
    spots + **applicable F&O contracts** (FUTSTK/OPTSTK for resolved underlyings +
    FUTIDX/OPTIDX for tracked indices; currency/commodity EXCLUDED). The
-   **WebSocket subscription is the 331-SID indices+spots subset ONLY** — the
+   **WebSocket subscription is the 331-SID indices+spots subset plus the §36.7
+   all-monthly-expiry FUTIDX contracts of the 4 underlyings (2026-07-10, promoted into
+   `subscription_targets` at build time)** — the
    subscription dispatcher reads `DailyUniverse::subscription_targets`, NEVER the
    contract rows. The `[100,400]` `MAX_DAILY_UNIVERSE_SIZE` envelope bounds the
    SUBSCRIPTION set, not the lifecycle master (~219K applicable-F&O rows is fine).

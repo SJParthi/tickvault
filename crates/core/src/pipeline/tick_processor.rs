@@ -63,6 +63,7 @@ const INDEX_PREV_CLOSE_CACHE_PATH: &str = "data/instrument-cache/index-prev-clos
 /// assumes the directory exists and only writes the file atomically.
 // HOT-PATH-EXEMPT: boot-only init, runs once before tick processor starts.
 pub fn init_prev_close_cache_dir() -> std::io::Result<()> {
+    // O(1) EXEMPT: boot-only init — called once from main.rs Step 6b, never on the tick path.
     std::fs::create_dir_all(INDEX_PREV_CLOSE_CACHE_DIR)
 }
 
@@ -93,6 +94,21 @@ pub fn init_prev_close_cache_dir() -> std::io::Result<()> {
 /// SID 13 for NIFTY, and by the live universe seeded from the
 /// instrument master at boot.
 const CANARY_UNDERLYINGS: &[(u64, &str)] = &[(13, "NIFTY"), (25, "BANKNIFTY"), (51, "SENSEX")];
+
+/// §36 hardening (2026-07-08): the canary gauges track the 3 IDX_I SPOT
+/// indices — a NSE_FNO/BSE_FNO tick whose SID numerically collides with a
+/// spot SID (I-P1-11 class) must NOT bump the spot freshness gauge. One
+/// extra u8 equality compare — zero-alloc, O(1) (bounded 3-element scan),
+/// hot-path safe.
+#[inline]
+fn canary_index_for(security_id: u64, exchange_segment_code: u8) -> Option<usize> {
+    if exchange_segment_code != 0 {
+        return None;
+    }
+    CANARY_UNDERLYINGS
+        .iter()
+        .position(|(sid, _)| *sid == security_id)
+}
 
 /// B6 adversarial round 1 (HIGH-3): idle-drain cadence for the tick loop.
 ///
@@ -143,14 +159,18 @@ const IDLE_FLUSH_DRAIN_INTERVAL: std::time::Duration = std::time::Duration::from
 fn is_within_persist_window(exchange_timestamp: u32, muhurat_active: bool) -> bool {
     // exchange_timestamp is already IST epoch seconds — no offset needed.
     let ist_secs_of_day = exchange_timestamp % SECONDS_PER_DAY;
+    // O(1) EXEMPT: begin — Range::contains is two integer comparisons, not a Vec scan.
     if (TICK_PERSIST_START_SECS_OF_DAY_IST..TICK_PERSIST_END_SECS_OF_DAY_IST)
+        // O(1) EXEMPT: Range::contains — two-comparison O(1) bounds check (scanner heuristic misreads it as Vec::contains).
         .contains(&ist_secs_of_day)
     {
         return true;
     }
     muhurat_active
         && (MUHURAT_PERSIST_START_SECS_OF_DAY_IST..MUHURAT_PERSIST_END_SECS_OF_DAY_IST)
+            // O(1) EXEMPT: Range::contains — O(1) bounds check.
             .contains(&ist_secs_of_day)
+    // O(1) EXEMPT: end
 }
 
 /// Returns `true` if the exchange timestamp's IST day matches today.
@@ -445,6 +465,7 @@ fn is_wall_clock_within_persist_window(received_at_nanos: i64, muhurat_active: b
     // wrongly rejected.
     let grace_upper_bound =
         TICK_PERSIST_END_SECS_OF_DAY_IST.saturating_add(WS_GRACE_AFTER_CLOSE_SECS_U32);
+    // O(1) EXEMPT: Range::contains — two-comparison O(1) bounds check (scanner heuristic misreads it as Vec::contains).
     if (TICK_PERSIST_START_SECS_OF_DAY_IST..grace_upper_bound).contains(&wall_clock_ist_secs_of_day)
     {
         return true;
@@ -452,7 +473,9 @@ fn is_wall_clock_within_persist_window(received_at_nanos: i64, muhurat_active: b
     // CCL-06: additive Muhurat evening window when today is a Muhurat session.
     muhurat_active
         && (MUHURAT_PERSIST_START_SECS_OF_DAY_IST..MUHURAT_PERSIST_END_SECS_OF_DAY_IST)
+            // O(1) EXEMPT: Range::contains — O(1) bounds check.
             .contains(&wall_clock_ist_secs_of_day)
+    // O(1) EXEMPT: end
 }
 
 /// Selects the depth timestamp: exchange_timestamp if valid, else wall-clock.
@@ -544,15 +567,21 @@ impl TickDedupRing {
     /// # Panics (debug only)
     /// Debug-asserts that `power` is in [8, 24].
     fn new(power: u32) -> Self {
+        // O(1) EXEMPT: begin — one-time boot construction (never per-tick); the
+        // debug_assert Range::contains is two integer comparisons, and the vec!
+        // is the ring's single preallocation.
         debug_assert!(
+            // O(1) EXEMPT: RangeInclusive::contains inside a boot-time constructor debug_assert.
             (8..=24).contains(&power),
             "dedup ring buffer power out of range"
         );
         let size = 1_usize << power;
         Self {
+            // O(1) EXEMPT: ring pre-allocated ONCE at construction — zero alloc per tick thereafter.
             slots: vec![u64::MAX; size].into_boxed_slice(),
             mask: size.wrapping_sub(1),
         }
+        // O(1) EXEMPT: end
     }
 
     /// Returns `true` ONLY for a true byte-identical double-delivery of the same
@@ -1326,108 +1355,171 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
                 // `Utc::now()` (~59 ns measured) — index ticks hit this
                 // branch on every frame and the probe granularity is
                 // seconds.
-                for (idx, (sid, _name)) in CANARY_UNDERLYINGS.iter().enumerate() {
-                    if *sid == tick.security_id {
-                        #[allow(clippy::cast_precision_loss)]
-                        // APPROVED: epoch seconds (~1.7e9) are exactly representable in f64
-                        canary_gauges[idx]
-                            .set(received_at_nanos.saturating_div(1_000_000_000) as f64);
-                        break;
-                    }
+                // §36 (2026-07-08): segment-gated — only IDX_I ticks bump
+                // the canaries (an NSE_FNO FUTIDX sid collision must not).
+                if let Some(idx) = canary_index_for(tick.security_id, tick.exchange_segment_code) {
+                    #[allow(clippy::cast_precision_loss)]
+                    // APPROVED: epoch seconds (~1.7e9) are exactly representable in f64
+                    canary_gauges[idx].set(received_at_nanos.saturating_div(1_000_000_000) as f64);
                 }
 
-                // O(1) inline Greeks enrichment: compute IV + delta/gamma/theta/vega
-                // for F&O option ticks, update underlying LTP cache for index/equity.
-                // Runs BEFORE persistence so Greeks values are stored in QuestDB.
-                if let Some(ref mut enricher) = greeks_enricher {
-                    enricher.enrich(&mut tick);
-                }
+                // Silent-feed hardening Item 4 (2026-07-06 incident): observe
+                // the exchange→receive lag for this LIVE Dhan tick. O(1),
+                // zero-alloc (two relaxed atomic stores into a preallocated
+                // ring). The TWO-condition replay discriminator (round-2 fix
+                // 2026-07-07, finding 3: receipt−capture dwell ≥60s AND
+                // capture instant BEFORE the process live boundary) excludes
+                // boot-time WAL-replayed rows EXACTLY (capture_seq is stamped
+                // at the ORIGINAL WS-read instant and preserved through
+                // re-injection, while received_at is re-stamped at dequeue)
+                // while KEEPING genuinely-lagged live ticks — INCLUDING live
+                // rows delayed >60s in the frame channel by a consumer stall,
+                // which the dwell alone misclassified as replay (starving the
+                // window into a stale-healthy gauge) — no Rule-11 censoring
+                // of the measured signal. Sits AFTER every gate
+                // (valid/today/in-window/dedup). Honest caveat: §30
+                // window-exempt always-on SIDs (GIFT Nifty) bypass the
+                // window gates above, so their OFF-session live ticks ARE
+                // recorded into the ring — the publisher's session gate
+                // (feed_lag_monitor::is_in_session_ist, regular + Muhurat
+                // windows) keeps those samples from being PUBLISHED
+                // off-session; the first in-session minute can include up
+                // to 60s of pre-window always-on samples.
+                super::feed_lag_monitor::record_dhan_tick(
+                    tick.received_at_nanos,
+                    capture_seq,
+                    tick.exchange_timestamp,
+                );
 
-                // 29-tf engine Phase 2.7 (hostile bug-hunt CRITICAL C2 fix):
-                // run the lifecycle enricher ONCE per tick BEFORE both the
-                // VOLUME-MONO-01 guard and the persistence branch. The
-                // enricher's `volume_is_first_seen` + `phase` flags must
-                // suppress the monotonicity check when (a) it's the first
-                // tick of the day for this instrument or (b) phase != OPEN.
-                // Without this gate, IST midnight rollover fires ~24,300
-                // false VOLUME-MONO-01 alerts at 09:15 IST every trading
-                // day (per L13).
-                let lifecycle_for_tick: Option<(
-                    bool,
-                    super::tick_enricher::EnrichedTickFlags,
-                    TickLifecycle,
-                )> = tick_enricher.as_ref().map(|enricher| {
-                    // Phase 2.10 M1 fix: per-tick exchange_timestamp drives
-                    // phase classification (not wall-clock arrival).
-                    let tick_secs_of_day = tick.exchange_timestamp % 86_400;
-                    let enriched = enricher.enrich_tick(&tick, tick_secs_of_day);
-                    let life = TickLifecycle {
-                        volume_delta: enriched.volume_delta,
-                        prev_day_close: enriched.prev_day_close,
-                        prev_day_oi: enriched.prev_day_oi,
-                        phase: enriched.phase as u8,
-                    };
-                    let flags = super::tick_enricher::EnrichedTickFlags {
-                        volume_is_first_seen: enriched.volume_is_first_seen,
-                        volume_is_regression: enriched.volume_is_regression,
-                        phase: enriched.phase,
-                    };
-                    (enriched.volume_is_first_seen, flags, life)
-                });
+                // Scoreboard PR-D: per-instrument session-minute presence
+                // fold — co-located with the DHAT-proven lag observation
+                // above (same post-gate position: valid/today/window/dedup
+                // all passed). Minute index is pure integer math over the
+                // exchange timestamp already in hand — zero new clock
+                // reads; one lock-free slot lookup + one relaxed fetch_or.
+                super::feed_presence::record_presence(
+                    tickvault_common::feed::Feed::Dhan,
+                    tick.security_id,
+                    tick.exchange_segment_code,
+                    tick.exchange_timestamp,
+                );
 
-                // Persist tick to QuestDB — ingestion gate above already verified
-                // [09:00, 15:30) IST and today's date. This block only handles
-                // QuestDB write errors (connection down, buffer full, etc.).
-                if let Some(ref mut writer) = tick_writer {
-                    let result = if let Some((_, _, life)) = lifecycle_for_tick {
-                        writer.append_tick_enriched_with_seq(&tick, life, capture_seq)
-                    } else {
-                        writer.append_tick_with_seq(&tick, capture_seq)
-                    };
-                    match result {
-                        Ok(()) => {
-                            m_ticks_persisted.increment(1);
-                            ticks_persisted = ticks_persisted.saturating_add(1);
+                // C2 (feed convergence): the ordered enrich → persist →
+                // aggregate-handoff per-tick consumer sequence is the ONE
+                // shared `consume_feed_tick` core (`super::feed_consumer`) —
+                // the same core the Groww bridge delegates to. Dhan's
+                // aggregate handoff is the tick broadcast: Engine B (the
+                // multi-TF aggregator) subscribes to it off this hot path
+                // (#T1b). Monomorphized closures — inlines to the exact
+                // pre-C2 straight-line code (DHAT + bench-gated).
+                //
+                // The lifecycle result crosses from the enrich stage to the
+                // persist stage (and to the VOLUME-MONO-01 gate below) via a
+                // zero-alloc `Cell` of Copy data — two closures cannot share
+                // a `&mut` local, and the tuple is `Copy` end-to-end.
+                let lifecycle_cell: std::cell::Cell<
+                    Option<(bool, super::tick_enricher::EnrichedTickFlags, TickLifecycle)>,
+                > = std::cell::Cell::new(None);
+                super::feed_consumer::consume_feed_tick(
+                    tickvault_common::feed::Feed::Dhan,
+                    &mut tick,
+                    |t| {
+                        // O(1) inline Greeks enrichment: compute IV +
+                        // delta/gamma/theta/vega for F&O option ticks, update
+                        // underlying LTP cache for index/equity. Runs BEFORE
+                        // persistence so Greeks values are stored in QuestDB.
+                        if let Some(ref mut enricher) = greeks_enricher {
+                            enricher.enrich(t);
                         }
-                        Err(err) => {
-                            storage_errors = storage_errors.saturating_add(1);
-                            m_storage_errors.increment(1);
-                            // Audit Rule 5: persist failures use error! (Telegram-
-                            // routable). Edge-triggered (Rule 4): page on the FIRST
-                            // error + every 1000th to avoid per-tick spam. The tick
-                            // is NOT lost — force_flush rescues it into the
-                            // ring → spill → WAL chain.
-                            if storage_errors == 1 || storage_errors.is_multiple_of(1000) {
-                                error!(
-                                    ?err,
-                                    security_id = tick.security_id,
-                                    total_errors = storage_errors,
-                                    "failed to append tick to QuestDB (tick rescued to ring/spill/WAL)"
-                                );
+
+                        // 29-tf engine Phase 2.7 (hostile bug-hunt CRITICAL C2 fix):
+                        // run the lifecycle enricher ONCE per tick BEFORE both the
+                        // VOLUME-MONO-01 guard and the persistence branch. The
+                        // enricher's `volume_is_first_seen` + `phase` flags must
+                        // suppress the monotonicity check when (a) it's the first
+                        // tick of the day for this instrument or (b) phase != OPEN.
+                        // Without this gate, IST midnight rollover fires ~24,300
+                        // false VOLUME-MONO-01 alerts at 09:15 IST every trading
+                        // day (per L13).
+                        lifecycle_cell.set(tick_enricher.as_ref().map(|enricher| {
+                            // Phase 2.10 M1 fix: per-tick exchange_timestamp drives
+                            // phase classification (not wall-clock arrival).
+                            let tick_secs_of_day = t.exchange_timestamp % 86_400;
+                            let enriched = enricher.enrich_tick(t, tick_secs_of_day);
+                            let life = TickLifecycle {
+                                volume_delta: enriched.volume_delta,
+                                prev_day_close: enriched.prev_day_close,
+                                prev_day_oi: enriched.prev_day_oi,
+                                phase: enriched.phase as u8,
+                            };
+                            let flags = super::tick_enricher::EnrichedTickFlags {
+                                volume_is_first_seen: enriched.volume_is_first_seen,
+                                volume_is_regression: enriched.volume_is_regression,
+                                phase: enriched.phase,
+                            };
+                            (enriched.volume_is_first_seen, flags, life)
+                        }));
+                    },
+                    |t| {
+                        // Persist tick to QuestDB — ingestion gate above already
+                        // verified [09:00, 15:30) IST and today's date. This block
+                        // only handles QuestDB write errors (connection down,
+                        // buffer full, etc.).
+                        if let Some(ref mut writer) = tick_writer {
+                            let result = if let Some((_, _, life)) = lifecycle_cell.get() {
+                                writer.append_tick_enriched_with_seq(t, life, capture_seq)
+                            } else {
+                                writer.append_tick_with_seq(t, capture_seq)
+                            };
+                            match result {
+                                Ok(()) => {
+                                    m_ticks_persisted.increment(1);
+                                    ticks_persisted = ticks_persisted.saturating_add(1);
+                                }
+                                Err(err) => {
+                                    storage_errors = storage_errors.saturating_add(1);
+                                    m_storage_errors.increment(1);
+                                    // Audit Rule 5: persist failures use error! (Telegram-
+                                    // routable). Edge-triggered (Rule 4): page on the FIRST
+                                    // error + every 1000th to avoid per-tick spam. The tick
+                                    // is NOT lost — force_flush rescues it into the
+                                    // ring → spill → WAL chain.
+                                    if storage_errors == 1 || storage_errors.is_multiple_of(1000) {
+                                        error!(
+                                            ?err,
+                                            security_id = t.security_id,
+                                            total_errors = storage_errors,
+                                            "failed to append tick to QuestDB (tick rescued to ring/spill/WAL)"
+                                        );
+                                    }
+                                }
                             }
                         }
-                    }
-                }
-
-                // O(1) broadcast to browser WebSocket clients (if any are connected).
-                // Lagging receivers auto-skip — chart only needs latest price.
-                //
-                // Audit finding #1/#19 (2026-04-17): `sender.send()` returns
-                // `Err(SendError)` ONLY when ALL receivers have closed (not
-                // on lag — lag is surfaced to each receiver individually).
-                // A closed-all-receivers state means downstream trading
-                // signals are dead. Count + error-log so operator sees it.
-                if let Some(ref sender) = tick_broadcast
-                    && sender.send(tick).is_err()
-                {
-                    metrics::counter!("tv_tick_broadcast_send_errors_total").increment(1);
-                    // O(1) EXEMPT: error path — tracing static dispatch is
-                    // the only allocation and it's off the zero-loss fast path.
-                    error!(
-                        "tick broadcast send failed — ALL subscribers closed; \
-                         trading pipeline + browser feed are dead"
-                    );
-                }
+                    },
+                    |t| {
+                        // Aggregate handoff = O(1) broadcast (Engine B + browser
+                        // WebSocket clients). Lagging receivers auto-skip — the
+                        // chart only needs the latest price.
+                        //
+                        // Audit finding #1/#19 (2026-04-17): `sender.send()` returns
+                        // `Err(SendError)` ONLY when ALL receivers have closed (not
+                        // on lag — lag is surfaced to each receiver individually).
+                        // A closed-all-receivers state means downstream trading
+                        // signals are dead. Count + error-log so operator sees it.
+                        if let Some(ref sender) = tick_broadcast
+                            && sender.send(*t).is_err()
+                        {
+                            metrics::counter!("tv_tick_broadcast_send_errors_total").increment(1);
+                            // O(1) EXEMPT: error path — tracing static dispatch is
+                            // the only allocation and it's off the zero-loss fast path.
+                            error!(
+                                "tick broadcast send failed — ALL subscribers closed; \
+                                 trading pipeline + browser feed are dead"
+                            );
+                        }
+                    },
+                );
+                let lifecycle_for_tick = lifecycle_cell.get();
 
                 // Candle-engine re-architecture #T1b: in-loop candle
                 // aggregation removed. Engine B (the multi-TF aggregator)
@@ -1575,9 +1667,44 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
                     }
 
                     // O(1) inline Greeks enrichment for Full packet ticks.
+                    //
+                    // C2 exception (documented + pinned by
+                    // `feed_consumer_convergence_guard.rs`): this Full-packet
+                    // arm does NOT delegate to `consume_feed_tick` — its
+                    // aggregate handoff (the broadcast ~100 lines below) is
+                    // separated from this enrich+persist block by DEPTH-frame
+                    // gating whose loop-`continue`s decide which frames are
+                    // broadcast. Routing it through the shared core would
+                    // either broadcast frames that today are skipped (behavior
+                    // change) or drop persistence for depth-invalid frames
+                    // (data loss). The Quote/Ticker `Tick` arm above — the
+                    // production path under the Quote-mode locked universe —
+                    // and the Groww bridge both delegate.
                     if let Some(ref mut enricher) = greeks_enricher {
                         enricher.enrich(&mut tick);
                     }
+
+                    // Silent-feed hardening Item 4: exchange→receive lag
+                    // observation for the Full-packet arm — mirrors the
+                    // Ticker/Quote persist site above so both Dhan persist
+                    // paths feed the SAME lag window (uniform hot-path
+                    // semantics across packet types). O(1), zero-alloc.
+                    super::feed_lag_monitor::record_dhan_tick(
+                        tick.received_at_nanos,
+                        capture_seq,
+                        tick.exchange_timestamp,
+                    );
+
+                    // Scoreboard PR-D: presence fold for the Full-packet
+                    // arm — mirrors the Ticker/Quote site above so both
+                    // Dhan persist paths feed the SAME presence bitsets
+                    // (uniform hot-path semantics across packet types).
+                    super::feed_presence::record_presence(
+                        tickvault_common::feed::Feed::Dhan,
+                        tick.security_id,
+                        tick.exchange_segment_code,
+                        tick.exchange_timestamp,
+                    );
 
                     // Persist tick to QuestDB — ingestion gate above already verified
                     // [09:00, 15:30) IST and today's date.
@@ -1777,7 +1904,7 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
                     // IDX_I segment
                     index_prev_close_cache.insert(security_id, previous_close);
                     //
-                    // Wave 1 Item 0.a — sync `std::fs::write` + rename moved to
+                    // Wave 1 Item 0.a — sync file write (`fs::write`) + rename moved to
                     // a dedicated writer task fed by a bounded
                     // `tokio::sync::mpsc::channel(64)`; the hot path enqueues
                     // a `bytes::Bytes` payload via `try_enqueue_global`. Drop
@@ -5301,6 +5428,30 @@ mod tests {
     // -----------------------------------------------------------------------
     // Channel backpressure metric (M6)
     // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_canary_gauges_ignore_non_idx_i_segments() {
+        // §36 (2026-07-08): an NSE_FNO tick with sid 13 must NOT bump the
+        // NIFTY canary (I-P1-11 sid collision); the IDX_I tick must.
+        assert_eq!(
+            super::canary_index_for(13, 2),
+            None,
+            "NSE_FNO sid 13 ignored"
+        );
+        assert_eq!(
+            super::canary_index_for(13, 8),
+            None,
+            "BSE_FNO sid 13 ignored"
+        );
+        assert_eq!(super::canary_index_for(13, 0), Some(0), "IDX_I NIFTY bumps");
+        assert_eq!(super::canary_index_for(25, 0), Some(1));
+        assert_eq!(super::canary_index_for(51, 0), Some(2));
+        assert_eq!(
+            super::canary_index_for(9999, 0),
+            None,
+            "non-canary sid ignored"
+        );
+    }
 
     #[test]
     fn test_channel_occupancy_metric() {

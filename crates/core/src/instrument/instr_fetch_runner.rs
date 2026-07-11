@@ -74,14 +74,16 @@ use super::instr_fetch_retry_adapter::TelegramEmit;
 /// Returns `(LoopOutcome::Exhausted { attempts_used: 0 }, None)` only
 /// when called with `max_attempts = Some(0)` — a test-only escape
 /// hatch.
-pub async fn run_daily_universe_fetch_runner<Fetch, FetchFut>(
+pub async fn run_daily_universe_fetch_runner<Fetch, FetchFut, DateFn>(
     fetch_fn: Fetch,
     max_attempts: Option<u32>,
     ntm_map: Option<&IndexConstituencyMap>,
+    today_ist_fn: DateFn,
 ) -> (LoopOutcome, Option<DailyUniverse>)
 where
     Fetch: FnMut(u32) -> FetchFut,
     FetchFut: Future<Output = Result<Vec<u8>, CsvDownloadError>>,
+    DateFn: Fn() -> chrono::NaiveDate,
 {
     // Wrap the pure builder so the FULL error detail (e.g. the dangling-
     // reference sample from `INSTR-FETCH-03`) reaches Loki on every failed
@@ -92,7 +94,14 @@ where
         // §31 NTM (Sub-PR #10b): `ntm_map` is the best-effort niftyindices
         // constituency fetched once by the boot caller; `None` means the source
         // degraded (caller already emitted NTM-CONSTITUENCY-01) → core universe.
-        build_universe_from_bytes(bytes, ntm_map).inspect_err(|e| {
+        // Hostile-review round 2 (2026-07-08, F5): the IST trading date is
+        // re-derived PER BUILD ATTEMPT, not frozen at boot entry — a boot
+        // stuck in the §4 retry loop across IST midnight (esp. the T-0→T+1
+        // expiry crossing) must select FUTIDX with the NEW date, never keep
+        // the just-expired contract for the whole next session. Delivers the
+        // plan's "boot spanning IST midnight → both builders re-run for the
+        // new date" edge-case claim on the Dhan side.
+        build_universe_from_bytes(bytes, ntm_map, today_ist_fn()).inspect_err(|e| {
             let code = e.error_code().code_str();
             warn!(
                 code = code,
@@ -246,9 +255,39 @@ mod tests {
             let next = outcomes.borrow_mut().remove(0);
             async move { next }
         };
-        let (outcome, universe) = run_daily_universe_fetch_runner(fetch, Some(1), None).await;
+        let (outcome, universe) = run_daily_universe_fetch_runner(fetch, Some(1), None, || {
+            chrono::NaiveDate::from_ymd_opt(2026, 7, 8).expect("date")
+        })
+        .await;
         assert_eq!(outcome, LoopOutcome::Exhausted { attempts_used: 1 });
         assert!(universe.is_none());
+    }
+
+    /// Hostile-review round 2 (2026-07-08, F5): the IST trading date is
+    /// re-derived PER BUILD ATTEMPT — a boot spanning IST midnight inside
+    /// the §4 retry loop must select FUTIDX with the NEW date, never the
+    /// frozen boot-entry date. Two failing build attempts → two date-fn
+    /// invocations.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn runner_rederives_trading_date_per_build_attempt() {
+        let outcomes = RefCell::new(vec![Ok(b"junk-1".to_vec()), Ok(b"junk-2".to_vec())]);
+        let fetch = |_attempt: u32| {
+            let next = outcomes.borrow_mut().remove(0);
+            async move { next }
+        };
+        let date_calls = std::cell::Cell::new(0_u32);
+        let (outcome, universe) = run_daily_universe_fetch_runner(fetch, Some(2), None, || {
+            date_calls.set(date_calls.get() + 1);
+            chrono::NaiveDate::from_ymd_opt(2026, 7, 8).expect("date")
+        })
+        .await;
+        assert_eq!(outcome, LoopOutcome::Exhausted { attempts_used: 2 });
+        assert!(universe.is_none());
+        assert_eq!(
+            date_calls.get(),
+            2,
+            "trading date must be re-derived on EVERY build attempt (not frozen at entry)"
+        );
     }
 
     /// End-to-end: fetcher returns CsvDownloadError -> loop retries once,
@@ -264,7 +303,10 @@ mod tests {
             let next = outcomes.borrow_mut().remove(0);
             async move { next }
         };
-        let (outcome, universe) = run_daily_universe_fetch_runner(fetch, Some(1), None).await;
+        let (outcome, universe) = run_daily_universe_fetch_runner(fetch, Some(1), None, || {
+            chrono::NaiveDate::from_ymd_opt(2026, 7, 8).expect("date")
+        })
+        .await;
         assert_eq!(outcome, LoopOutcome::Exhausted { attempts_used: 1 });
         assert!(universe.is_none());
     }
@@ -280,7 +322,10 @@ mod tests {
             let next = outcomes.borrow_mut().pop();
             async move { next.unwrap_or(Err(CsvDownloadError::BodyTooLarge)) }
         };
-        let (outcome, universe) = run_daily_universe_fetch_runner(fetch, Some(0), None).await;
+        let (outcome, universe) = run_daily_universe_fetch_runner(fetch, Some(0), None, || {
+            chrono::NaiveDate::from_ymd_opt(2026, 7, 8).expect("date")
+        })
+        .await;
         assert_eq!(outcome, LoopOutcome::Exhausted { attempts_used: 0 });
         assert!(universe.is_none());
         assert!(!fetch_called, "max_attempts=0 must not invoke fetcher");

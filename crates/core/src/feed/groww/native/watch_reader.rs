@@ -237,6 +237,8 @@ mod tests {
                     isin: Some("INE000A01001".to_owned()),
                     symbol_name: Some("TEST".to_owned()),
                     index_name: None,
+                    expiry_date: None,
+                    underlying_symbol: None,
                 },
                 WatchEntry {
                     exchange: "BSE".to_owned(),
@@ -247,6 +249,8 @@ mod tests {
                     isin: None,
                     symbol_name: None,
                     index_name: Some("BSE-SENSEX".to_owned()),
+                    expiry_date: None,
+                    underlying_symbol: None,
                 },
             ],
             master_entries: vec![],
@@ -265,6 +269,84 @@ mod tests {
             Some(&TickIdentity {
                 security_id: 51,
                 segment: "IDX_I"
+            })
+        );
+    }
+
+    /// §36 (2026-07-08): an FNO index-future entry round-trips through the
+    /// REAL writer → reader → subject map: segment NSE_FNO/BSE_FNO, subject
+    /// `/ld/fo/{nse,bse}/price.<token>`; the new optional `expiry_date`
+    /// provenance field is skipped-when-None for old entries and IGNORED by
+    /// this reader (additive JSON).
+    #[test]
+    fn test_watch_file_roundtrip_with_fno_entries() {
+        use crate::feed::groww::instruments::{GrowwWatchSet, WatchEntry, WatchKind};
+        let set = GrowwWatchSet {
+            entries: vec![
+                WatchEntry {
+                    exchange: "NSE".to_owned(),
+                    segment: "FNO".to_owned(),
+                    exchange_token: "61001".to_owned(),
+                    kind: WatchKind::Ltp,
+                    security_id: 61001,
+                    isin: None,
+                    symbol_name: Some("NSE-NIFTY-30Jul26-FUT".to_owned()),
+                    index_name: None,
+                    expiry_date: Some("2026-07-30".to_owned()),
+                    underlying_symbol: None,
+                },
+                WatchEntry {
+                    exchange: "BSE".to_owned(),
+                    segment: "FNO".to_owned(),
+                    exchange_token: "71001".to_owned(),
+                    kind: WatchKind::Ltp,
+                    security_id: 71001,
+                    isin: None,
+                    symbol_name: Some("BSE-SENSEX-31Jul26-FUT".to_owned()),
+                    index_name: None,
+                    expiry_date: Some("2026-07-31".to_owned()),
+                    underlying_symbol: None,
+                },
+                // Old-shape stock entry: expiry_date None → field absent on wire.
+                WatchEntry {
+                    exchange: "NSE".to_owned(),
+                    segment: "CASH".to_owned(),
+                    exchange_token: "2885".to_owned(),
+                    kind: WatchKind::Ltp,
+                    security_id: 2885,
+                    isin: Some("INE002A01018".to_owned()),
+                    symbol_name: Some("RELIANCE".to_owned()),
+                    index_name: None,
+                    expiry_date: None,
+                    underlying_symbol: None,
+                },
+            ],
+            master_entries: vec![],
+            resolved_stocks: 1,
+            unresolved_stocks: vec![],
+            indices: 0,
+        };
+        let json =
+            crate::feed::groww::instruments::serialize_watch_file_for_test(&set, "2026-07-08");
+        assert!(
+            json.contains("\"expiry_date\": \"2026-07-30\""),
+            "FNO entry carries the provenance expiry"
+        );
+        let doc = parse_watch_file(&json).expect("writer output parses");
+        let (map, skipped) = build_subject_map(&doc).expect("map builds");
+        assert_eq!(skipped, 0);
+        assert_eq!(
+            map.get("/ld/fo/nse/price.61001"),
+            Some(&TickIdentity {
+                security_id: 61001,
+                segment: "NSE_FNO"
+            })
+        );
+        assert_eq!(
+            map.get("/ld/fo/bse/price.71001"),
+            Some(&TickIdentity {
+                security_id: 71001,
+                segment: "BSE_FNO"
             })
         );
     }

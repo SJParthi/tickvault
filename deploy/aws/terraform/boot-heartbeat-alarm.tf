@@ -51,10 +51,43 @@
 # fire every evening at 16:30 IST when the box is intentionally stopped. So this
 # alarm's ACTIONS are gated to the boot window only: actions_enabled=false by
 # default; a tiny boot-window Lambda turns them ON at 08:50 IST (10 min after
-# the 08:40 IST soft boot deadline in §10) and OFF at 09:10 IST (before market
-# open). Outside that 20-min weekday window the alarm publishes nothing, so the
-# nightly/weekend stop can never page. This mirrors the inline-Lambda pattern
-# already used in budget-guards.tf.
+# the 08:40 IST soft boot deadline in §10) and OFF at 09:20 IST. Outside that
+# 30-min weekday window the alarm publishes nothing, so the nightly/weekend
+# stop can never page. This mirrors the inline-Lambda pattern already used in
+# budget-guards.tf.
+#
+# 2026-07-09 SEAM CLOSURE (audit finding — the 09:10–09:20 IST blind hole
+# spanning the 09:15 market open): the close was originally 09:10 IST while
+# the market-hours liveness window (market-hours-liveness-alarm.tf) only opens
+# at 09:20 IST — AND its open-mode Lambda resets its alarms to OK, so its
+# 5-period missing-data evaluation cannot page before ~09:25-09:26 IST. Net: a
+# process death anywhere in [09:10, 09:20) IST — exactly spanning the market
+# open — paged NOBODY inside the seam and at best ~09:25 (up to ~15 min blind).
+# tv_boot_completed is the RIGHT signal to extend: metrics-exporter-prometheus
+# re-renders the gauge on every 60s CW-agent scrape while the process is alive
+# (verified: scrape_interval 60s + the metric_selectors allowlist in
+# user-data.sh.tftpl), so a healthy app publishes a datapoint every period
+# through 09:10–09:20 (no false-page in the extension) and a dead one goes
+# missing → 2×60s → page within ~2-3 min. Widening the MARKET-HOURS window to
+# 09:10 instead was REJECTED: its ALARM_NAMES list gates 12 alarms (count
+# 9 → 11 on 2026-07-10 with the ws-pool pair, → 12 on 2026-07-11 with
+# groww-exchange-lag-p99-high) — 10 whose signals are deliberately invalid
+# pre-09:20 (SLO tick-freshness pre-open pin, the 9-of-15 degraded
+# lookback, first-score warmup, lag-window warmup), plus the 2 ws-pool pagers
+# (ws-pool-all-dead + ws-failed-connections) whose gauges ARE valid from the
+# 09:00 IST pool connect but are gated for the pre-09:00 Dhan connect-
+# deferral false-page class (with the 09:00–09:20 handover residual accepted
+# — see app-alarms.tf). Widening would re-open the exact pre-open false-page
+# class the 09:20 gate was built to avoid for BOTH groups. The boot
+# window now hands over to the market-hours window at exactly 09:20 IST.
+# Residual (honest): a death in ~[09:16, 09:20) may not complete this alarm's
+# 2-period evaluation before the close disables actions (CloudWatch's
+# missing-data evaluation range can pad the naive 2×60s by 1-2 periods, so the
+# safe boundary is ~09:16, not ~09:17:30) — the market-hours liveness alarm
+# then pages at ~09:25-09:26 (worst ~9-10 min, inside the ≤10 min envelope).
+# Ratchet:
+# crates/common/tests/aws_alarm_semantics_guard.rs
+# (test_boot_heartbeat_window_hands_over_to_market_hours_window).
 #
 # DONE (the PR #1278 follow-up): the dedicated `tv_boot_completed` gauge is now
 # emitted by crates/app/src/main.rs (both boot paths) and added to the CloudWatch
@@ -86,8 +119,9 @@ resource "aws_cloudwatch_metric_alarm" "boot_heartbeat_missing" {
   treat_missing_data = "breaching"
   dimensions         = local.app_dimensions
 
-  # Actions OFF by default; the boot-window Lambda flips them ON 08:50-09:10 IST
-  # Mon-Fri so the intentional nightly/weekend stop can never false-page.
+  # Actions OFF by default; the boot-window Lambda flips them ON 08:50-09:20 IST
+  # Mon-Fri (close widened from 09:10 on 2026-07-09 — market-open seam closure)
+  # so the intentional nightly/weekend stop can never false-page.
   actions_enabled = false
   alarm_actions   = local.app_alarm_actions
   ok_actions      = local.app_alarm_ok
@@ -109,8 +143,10 @@ cw = boto3.client('cloudwatch')
 ALARM_NAME = os.environ['ALARM_NAME']
 
 # mode="open"  (08:50 IST) -> enable alarm actions for the boot window.
-# mode="close" (09:10 IST) -> disable them again so the nightly/weekend stop
+# mode="close" (09:20 IST) -> disable them again so the nightly/weekend stop
 #                             (metric goes missing intentionally) never pages.
+#                             (2026-07-09: was 09:10 — moved to 09:20 to close
+#                             the market-open seam; see the header note.)
 def handler(event, context):
     mode = (event or {}).get('mode', 'close')
     if mode == 'open':
@@ -202,13 +238,24 @@ resource "aws_cloudwatch_event_rule" "tv_boot_heartbeat_open" {
   state = "ENABLED"
 }
 
-# Close the window at 09:10 IST (03:40 UTC) Mon-Fri — before market open so the
-# steady-state realtime_guarantee_critical alarm takes over and the nightly stop
-# never false-pages.
+# Close the window at 09:20 IST (03:50 UTC) Mon-Fri — the exact minute the
+# market-hours liveness window opens (market-hours-liveness-alarm.tf
+# tv_market_hours_liveness_open, also cron(50 3)), so liveness coverage hands
+# over with NO seam across the 09:15 market open. 2026-07-09: moved from
+# 09:10 IST (cron(40 3)) — the old close left [09:10, 09:20) IST with no alarm
+# able to page a dead app (see the header SEAM CLOSURE note). The two crons
+# act on DISJOINT alarm sets (this Lambda gates ONLY boot_heartbeat_missing;
+# the market gate manages its own 9), so same-minute firing has no race.
 resource "aws_cloudwatch_event_rule" "tv_boot_heartbeat_close" {
   name                = "tv-${var.environment}-boot-heartbeat-close"
-  description         = "Disable boot-heartbeat alarm actions at 09:10 IST (Mon-Fri)"
-  schedule_expression = "cron(40 3 ? * MON-FRI *)"
+  description         = "Disable boot-heartbeat alarm actions at 09:20 IST (Mon-Fri) — hands over to the market-hours liveness window (2026-07-09 seam closure; was 09:10)"
+  schedule_expression = "cron(50 3 ? * MON-FRI *)"
+  # 2026-07-09 (defense-in-depth — the same #1404 lesson the open rule learned):
+  # with `state` absent the AWS provider stops MANAGING rule state, so a
+  # once-disabled close rule stays disabled forever on AWS — leaving this
+  # breaching-on-missing alarm's actions armed past 09:20 and false-paging the
+  # intentional 16:30 IST stop nightly. Pin ENABLED explicitly.
+  state = "ENABLED"
 }
 
 resource "aws_cloudwatch_event_target" "tv_boot_heartbeat_open" {
@@ -242,6 +289,6 @@ resource "aws_lambda_permission" "tv_boot_heartbeat_close" {
 }
 
 output "boot_heartbeat_alarm_name" {
-  description = "Boot-heartbeat alarm (pages on a hung/never-booted app in the 08:50-09:10 IST window). Signal: the dedicated tv_boot_completed gauge MISSING (treat_missing_data=breaching) — emitted by crates/app/src/main.rs on a completed boot, in the CW-agent filter (daily-universe-scope-expansion-2026-05-27.md §19). Repointed off the tv_realtime_guarantee_score proxy (PR #1278 follow-up)."
+  description = "Boot-heartbeat alarm (pages on a hung/never-booted/DIED-BEFORE-09:20 app in the 08:50-09:20 IST window — widened from 09:10 on 2026-07-09 to close the market-open seam). Signal: the dedicated tv_boot_completed gauge MISSING (treat_missing_data=breaching) — emitted by crates/app/src/main.rs on a completed boot, in the CW-agent filter (daily-universe-scope-expansion-2026-05-27.md §19). Repointed off the tv_realtime_guarantee_score proxy (PR #1278 follow-up)."
   value       = aws_cloudwatch_metric_alarm.boot_heartbeat_missing.alarm_name
 }

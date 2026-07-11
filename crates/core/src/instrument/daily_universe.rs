@@ -60,6 +60,13 @@ pub enum InstrumentRole {
     /// `is_index_constituent` — so these three primary classes stay mutually
     /// exclusive while the flags carry the lossless "and/or" membership.
     IndexConstituent,
+    /// §36 (2026-07-08) / §36.7 (2026-07-10): one of the monthly-expiry
+    /// FUTIDX contracts of the 4 underlyings (NIFTY/BANKNIFTY/MIDCPNIFTY =
+    /// NSE_FNO, SENSEX = BSE_FNO; ALL monthly serials `>= today`) promoted
+    /// into `subscription_targets` at build time. The planner derives the
+    /// segment from `csv_row.segment` (NOT from the role — SENSEX is
+    /// BSE_FNO). Selected once per trading date; NEVER rolls intraday.
+    IndexFuture,
 }
 
 impl InstrumentRole {
@@ -73,6 +80,7 @@ impl InstrumentRole {
             Self::Index => "index",
             Self::FnoUnderlying => "fno_underlying",
             Self::IndexConstituent => "index_constituent",
+            Self::IndexFuture => "index_future",
         }
     }
 }
@@ -251,6 +259,7 @@ pub fn build_daily_universe(
     fno: FnoUnderlyingExtraction,
     fno_contracts: Vec<CsvRow>,
     ntm_constituents: Vec<CsvRow>,
+    index_futures: Vec<CsvRow>,
 ) -> Result<DailyUniverse, BuildError> {
     let mut subscription_targets: Vec<SubscriptionTarget> = Vec::new();
 
@@ -345,6 +354,33 @@ pub fn build_daily_universe(
                 });
                 by_key.insert(key, new_idx);
             }
+        }
+    }
+
+    // Pass 5 — §36/§36.7 (2026-07-10): promote the all-months FUTIDX rows
+    // into `subscription_targets`. The chosen rows ALSO stay in
+    // `fno_contracts` (master path untouched); dedup here is on the
+    // composite `(security_id, segment)` key (I-P1-11) against everything
+    // pushed so far AND within the futures set itself. Runs BEFORE the
+    // envelope check (~+12, envelope ≤24 — trivially inside `[100, 1200]`).
+    // Empty input (spot-only rollback pin) ⇒ byte-identical prior behavior.
+    if !index_futures.is_empty() {
+        use std::collections::HashSet;
+        let mut seen: HashSet<(String, String)> = subscription_targets
+            .iter()
+            .map(|t| (t.csv_row.security_id.clone(), t.csv_row.segment.clone()))
+            .collect();
+        for row in index_futures {
+            let key = (row.security_id.clone(), row.segment.clone());
+            if !seen.insert(key) {
+                continue;
+            }
+            subscription_targets.push(SubscriptionTarget {
+                role: InstrumentRole::IndexFuture,
+                is_fno_underlying: false,
+                is_index_constituent: false,
+                csv_row: row,
+            });
         }
     }
 
@@ -472,7 +508,8 @@ mod tests {
         // 30 indices + 1 SENSEX + 219 underlyings = 250 total.
         let indices = make_indices(30);
         let fno = make_fno(219);
-        let universe = build_daily_universe(indices, fno, Vec::new(), Vec::new()).expect("build");
+        let universe =
+            build_daily_universe(indices, fno, Vec::new(), Vec::new(), Vec::new()).expect("build");
         assert_eq!(universe.total_count(), 250);
         assert_eq!(universe.count_by_role(InstrumentRole::Index), 31);
         assert_eq!(universe.count_by_role(InstrumentRole::FnoUnderlying), 219);
@@ -485,6 +522,7 @@ mod tests {
             make_indices(30),
             make_fno(100),
             vec![nse_eq_row("49081", "NIFTY26JUN24000CE")],
+            Vec::new(),
             Vec::new(),
         )
         .expect("build");
@@ -499,7 +537,7 @@ mod tests {
         // 30 indices + 1 SENSEX + 50 underlyings = 81, below MIN=100.
         let indices = make_indices(30);
         let fno = make_fno(50);
-        let result = build_daily_universe(indices, fno, Vec::new(), Vec::new());
+        let result = build_daily_universe(indices, fno, Vec::new(), Vec::new(), Vec::new());
         assert!(matches!(
             result,
             Err(BuildError::UniverseSizeOutOfBounds {
@@ -515,7 +553,7 @@ mod tests {
         // 30 indices + 1 SENSEX + 1170 underlyings = 1201, above MAX=1200.
         let indices = make_indices(30);
         let fno = make_fno(1170);
-        let result = build_daily_universe(indices, fno, Vec::new(), Vec::new());
+        let result = build_daily_universe(indices, fno, Vec::new(), Vec::new(), Vec::new());
         assert!(matches!(
             result,
             Err(BuildError::UniverseSizeOutOfBounds {
@@ -531,8 +569,8 @@ mod tests {
         // 30 indices + 1 SENSEX + 69 underlyings = 100, exactly MIN.
         let indices = make_indices(30);
         let fno = make_fno(69);
-        let universe =
-            build_daily_universe(indices, fno, Vec::new(), Vec::new()).expect("at MIN accepts");
+        let universe = build_daily_universe(indices, fno, Vec::new(), Vec::new(), Vec::new())
+            .expect("at MIN accepts");
         assert_eq!(universe.total_count(), 100);
     }
 
@@ -541,8 +579,8 @@ mod tests {
         // 30 indices + 1 SENSEX + 1169 underlyings = 1200, exactly MAX.
         let indices = make_indices(30);
         let fno = make_fno(1169);
-        let universe =
-            build_daily_universe(indices, fno, Vec::new(), Vec::new()).expect("at MAX accepts");
+        let universe = build_daily_universe(indices, fno, Vec::new(), Vec::new(), Vec::new())
+            .expect("at MAX accepts");
         assert_eq!(universe.total_count(), 1200);
     }
 
@@ -550,7 +588,8 @@ mod tests {
     fn indices_appear_before_underlyings_in_order() {
         let indices = make_indices(30);
         let fno = make_fno(69);
-        let universe = build_daily_universe(indices, fno, Vec::new(), Vec::new()).expect("build");
+        let universe =
+            build_daily_universe(indices, fno, Vec::new(), Vec::new(), Vec::new()).expect("build");
 
         // First 30 are NSE indices, then BSE SENSEX, then underlyings.
         for (i, t) in universe.subscription_targets.iter().take(31).enumerate() {
@@ -570,7 +609,8 @@ mod tests {
     fn bse_sensex_appears_after_nse_indices() {
         let indices = make_indices(30);
         let fno = make_fno(69);
-        let universe = build_daily_universe(indices, fno, Vec::new(), Vec::new()).expect("build");
+        let universe =
+            build_daily_universe(indices, fno, Vec::new(), Vec::new(), Vec::new()).expect("build");
 
         // Index target #30 (0-indexed) should be SENSEX.
         let sensex = &universe.subscription_targets[30];
@@ -582,7 +622,8 @@ mod tests {
     fn count_by_role_returns_correct_counts() {
         let indices = make_indices(30);
         let fno = make_fno(150);
-        let universe = build_daily_universe(indices, fno, Vec::new(), Vec::new()).expect("build");
+        let universe =
+            build_daily_universe(indices, fno, Vec::new(), Vec::new(), Vec::new()).expect("build");
         assert_eq!(universe.count_by_role(InstrumentRole::Index), 31);
         assert_eq!(universe.count_by_role(InstrumentRole::FnoUnderlying), 150);
         // Sum equals total.
@@ -601,6 +642,7 @@ mod tests {
             InstrumentRole::IndexConstituent.as_str(),
             "index_constituent"
         );
+        assert_eq!(InstrumentRole::IndexFuture.as_str(), "index_future");
     }
 
     #[test]
@@ -621,7 +663,8 @@ mod tests {
             total_derivative_count: 1,
         };
         let indices = make_indices(100); // 100 + 1 = 101 indices alone
-        let universe = build_daily_universe(indices, fno, Vec::new(), Vec::new()).expect("build");
+        let universe =
+            build_daily_universe(indices, fno, Vec::new(), Vec::new(), Vec::new()).expect("build");
         // Ghost SID is silently skipped → 0 fno_underlying entries.
         assert_eq!(universe.count_by_role(InstrumentRole::FnoUnderlying), 0);
         assert_eq!(universe.count_by_role(InstrumentRole::Index), 101);
@@ -641,7 +684,7 @@ mod tests {
             dangling_count: 0,
             total_derivative_count: 0,
         };
-        let result = build_daily_universe(indices, fno, Vec::new(), Vec::new());
+        let result = build_daily_universe(indices, fno, Vec::new(), Vec::new(), Vec::new());
         assert!(matches!(
             result,
             Err(BuildError::UniverseSizeOutOfBounds { actual: 0, .. })
@@ -661,8 +704,14 @@ mod tests {
     #[test]
     fn ntm_fold_empty_is_unchanged() {
         // Empty ntm_constituents (today, pre-#10) → identical to current.
-        let a = build_daily_universe(make_indices(30), make_fno(150), Vec::new(), Vec::new())
-            .expect("build");
+        let a = build_daily_universe(
+            make_indices(30),
+            make_fno(150),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        )
+        .expect("build");
         assert_eq!(a.total_count(), 181);
         assert_eq!(a.index_constituent_count(), 0);
         assert_eq!(a.fno_underlying_count(), 150);
@@ -672,14 +721,21 @@ mod tests {
     fn ntm_fold_both_case_sets_both_flags_no_dup() {
         // Constituent SID "U0001" collides with an F&O underlying pushed in
         // Pass 3 → the existing target gets is_index_constituent, NO new row.
-        let before = build_daily_universe(make_indices(30), make_fno(150), Vec::new(), Vec::new())
-            .expect("before")
-            .total_count();
+        let before = build_daily_universe(
+            make_indices(30),
+            make_fno(150),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        )
+        .expect("before")
+        .total_count();
         let universe = build_daily_universe(
             make_indices(30),
             make_fno(150),
             Vec::new(),
             vec![nse_eq_row("U0001", "STK1")],
+            Vec::new(),
         )
         .expect("build");
         // No duplicate row — count unchanged.
@@ -707,6 +763,7 @@ mod tests {
             make_fno(150),
             Vec::new(),
             vec![nse_eq_row("999999", "PURECONST")],
+            Vec::new(),
         )
         .expect("build");
         assert_eq!(universe.total_count(), 182); // 181 + 1 new
@@ -732,6 +789,7 @@ mod tests {
                 nse_eq_row("999999", "PURECONST"),
                 nse_eq_row("999999", "PURECONST"),
             ],
+            Vec::new(),
         )
         .expect("build");
         assert_eq!(universe.total_count(), 182, "repeat folded once, not twice");
@@ -748,6 +806,7 @@ mod tests {
             make_fno(150),
             Vec::new(),
             vec![nse_eq_row("51", "FIFTYONE_EQ")],
+            Vec::new(),
         )
         .expect("build");
         // SENSEX index (IDX_I, sid 51) must remain a pure Index.
@@ -770,6 +829,7 @@ mod tests {
             make_fno(150),
             Vec::new(),
             vec![nse_eq_row("U0001", "STK1")], // both-case
+            Vec::new(),
         )
         .expect("build");
         assert_eq!(universe.fno_underlying_count(), 150);
@@ -786,6 +846,7 @@ mod tests {
                 nse_eq_row("U0001", "STK1"),       // both-case
                 nse_eq_row("999999", "PURECONST"), // pure constituent
             ],
+            Vec::new(),
         )
         .expect("build");
         assert_eq!(universe.index_constituent_count(), 2);
@@ -803,9 +864,126 @@ mod tests {
             symbol_name: "BADROW".to_string(),
             ..Default::default()
         };
-        let universe = build_daily_universe(make_indices(30), make_fno(150), Vec::new(), vec![bad])
-            .expect("build");
+        let universe = build_daily_universe(
+            make_indices(30),
+            make_fno(150),
+            Vec::new(),
+            vec![bad],
+            Vec::new(),
+        )
+        .expect("build");
         assert_eq!(universe.index_constituent_count(), 0, "non-NSE_EQ dropped");
         assert_eq!(universe.total_count(), 181, "no row added");
+    }
+
+    // ----- §36 (2026-07-08): FUTIDX-4 Pass 5 fold -----
+
+    fn futidx_row(underlying: &str, segment: &str, sid: &str, expiry: &str) -> CsvRow {
+        CsvRow {
+            security_id: sid.to_string(),
+            exch_id: if segment == "BSE_FNO" { "BSE" } else { "NSE" }.to_string(),
+            segment: segment.to_string(),
+            instrument: "FUTIDX".to_string(),
+            symbol_name: format!("{underlying}-FUT"),
+            underlying_security_id: "26000".to_string(),
+            underlying_symbol: underlying.to_string(),
+            expiry_date: expiry.to_string(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_build_daily_universe_pass5_promotes_futidx_targets() {
+        let futures = vec![
+            futidx_row("NIFTY", "NSE_FNO", "35001", "2026-07-30"),
+            futidx_row("BANKNIFTY", "NSE_FNO", "35002", "2026-07-30"),
+            futidx_row("MIDCPNIFTY", "NSE_FNO", "35003", "2026-07-28"),
+            futidx_row("SENSEX", "BSE_FNO", "45001", "2026-07-31"),
+        ];
+        let universe = build_daily_universe(
+            make_indices(30),
+            make_fno(150),
+            Vec::new(),
+            Vec::new(),
+            futures,
+        )
+        .expect("build");
+        // Envelope counts the futures: 31 indices + 150 underlyings + 4.
+        assert_eq!(universe.total_count(), 185);
+        assert_eq!(universe.count_by_role(InstrumentRole::IndexFuture), 4);
+        let fut = universe
+            .subscription_targets
+            .iter()
+            .find(|t| t.csv_row.security_id == "45001")
+            .expect("SENSEX future promoted");
+        assert_eq!(fut.role, InstrumentRole::IndexFuture);
+        assert_eq!(fut.csv_row.segment, "BSE_FNO");
+        assert!(!fut.is_fno_underlying && !fut.is_index_constituent);
+    }
+
+    #[test]
+    fn test_count_by_role_includes_index_future() {
+        let futures = vec![futidx_row("NIFTY", "NSE_FNO", "35001", "2026-07-30")];
+        let universe = build_daily_universe(
+            make_indices(30),
+            make_fno(150),
+            Vec::new(),
+            Vec::new(),
+            futures,
+        )
+        .expect("build");
+        assert_eq!(universe.count_by_role(InstrumentRole::IndexFuture), 1);
+        // Existing role counts unaffected.
+        assert_eq!(universe.count_by_role(InstrumentRole::Index), 31);
+        assert_eq!(universe.count_by_role(InstrumentRole::FnoUnderlying), 150);
+    }
+
+    #[test]
+    fn test_daily_universe_spot_only_when_no_future_rows() {
+        // The rollback pin: an empty `index_futures` param ⇒ byte-identical
+        // prior (spot-only) behavior — same targets, same order, same counts.
+        let a = build_daily_universe(
+            make_indices(30),
+            make_fno(150),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        )
+        .expect("build a");
+        assert_eq!(a.count_by_role(InstrumentRole::IndexFuture), 0);
+        assert_eq!(a.total_count(), 181);
+        assert!(
+            a.subscription_targets
+                .iter()
+                .all(|t| t.role != InstrumentRole::IndexFuture)
+        );
+    }
+
+    #[test]
+    fn test_pass5_dedup_futidx_on_composite_key() {
+        // A duplicate futures row (same sid + segment) folds ONCE (I-P1-11);
+        // an NSE_FNO SID numerically equal to an NSE_EQ spot SID is a
+        // DIFFERENT composite key and both survive.
+        let futures = vec![
+            futidx_row("NIFTY", "NSE_FNO", "35001", "2026-07-30"),
+            futidx_row("NIFTY", "NSE_FNO", "35001", "2026-07-30"), // dup
+            futidx_row("BANKNIFTY", "NSE_FNO", "U0001", "2026-07-30"), // collides with spot U0001
+        ];
+        let universe = build_daily_universe(
+            make_indices(30),
+            make_fno(150),
+            Vec::new(),
+            Vec::new(),
+            futures,
+        )
+        .expect("build");
+        assert_eq!(universe.count_by_role(InstrumentRole::IndexFuture), 2);
+        // Both the NSE_EQ spot and the NSE_FNO future with sid "U0001" survive.
+        let u0001: Vec<_> = universe
+            .subscription_targets
+            .iter()
+            .filter(|t| t.csv_row.security_id == "U0001")
+            .collect();
+        assert_eq!(u0001.len(), 2, "cross-segment sid collision: both kept");
     }
 }

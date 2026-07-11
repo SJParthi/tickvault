@@ -4,6 +4,19 @@
 > **Scope:** Any file touching main WebSocket connection pool, subscription planning, or instrument distribution.
 > **Ground truth:** `docs/dhan-ref/03-live-market-feed-websocket.md`, `docs/dhan-ref/08-annexure-enums.md`
 
+## 2026-07-08 Update — FUTIDX-4 nearest-expiry subscription (daily-universe §36) — EXPANDED to all months 2026-07-10 (§36.7)
+
+Per the operator authorization recorded in `daily-universe-scope-expansion-2026-05-27.md` §36
+(2026-07-08), the daily-universe plan additionally subscribes ALL monthly-expiry FUTIDX
+contracts of the 4 underlyings (2026-07-10 §36.7; nearest = first expiry >= today remains the
+set's first element; shared selector `crates/core/src/instrument/index_futures.rs`) —
+NIFTY / BANKNIFTY / MIDCPNIFTY (NSE_FNO) + SENSEX (BSE_FNO) — in Quote mode on the
+existing single main-feed connection. The "planner returns `false`" guard text below is
+HISTORICAL (legacy-path only) — the live FUTIDX path is the DailyUniverse `IndexFuture` role
+promoted into `subscription_targets` at build time; `should_subscribe_index_derivatives` still
+returns `false` forever. Index futures NEVER roll intraday; nearest = first expiry >= today
+(shared selector `crates/core/src/instrument/index_futures.rs`).
+
 ## 2026-07-02 Update — DailyUniverse activity-watchdog floor 3s → 15s (audit GAP-1, OPERATOR APPROVED)
 
 > **Status: Operator approved 2026-07-02: "approve 15s"** — Parthiban

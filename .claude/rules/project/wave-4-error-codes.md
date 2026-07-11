@@ -113,7 +113,9 @@ against a boot-time baseline (captured on the FIRST successful read, so a
 pre-existing lifetime OOM count never fires a spurious page). A positive delta
 means one or more processes in this cgroup — tickvault itself OR a sidecar —
 were killed by the kernel OOM killer. The monitor emits
-`error!(code = "PROC-01", …)` (Telegram Critical) and increments
+`error!(code = "PROC-01", …)` — pages via the `tv-<env>-errcode-proc-01`
+log-filter alarm → SNS → Telegram since 2026-07-06 (the `error!` alone never
+routed to Telegram post-CloudWatch-migration) — and increments
 `tv_oom_kills_total` by the delta, then advances the baseline so the same
 kills are not re-reported.
 
@@ -189,9 +191,12 @@ exhausted `TOTP_MAX_RETRIES` (each retry waits a fresh 30s window). A
 genuinely wrong secret — the classic cause is the operator regenerating
 the 2FA/TOTP seed via the dhan.co web UI without updating the SSM param —
 never produces a valid code, so the loop terminates. That terminal branch
-now fires a distinctly-typed `error!(code = "AUTH-GAP-04", …)` (Telegram
-Critical) instead of a generic `AuthenticationFailed`, pointing the
-operator at the exact SSM parameter to reconcile.
+now fires a distinctly-typed `error!(code = "AUTH-GAP-04", …)` — pages via
+the `tv-<env>-errcode-auth-gap-04` log-filter alarm → SNS → Telegram since
+2026-07-06 (the `error!` alone never routed to Telegram
+post-CloudWatch-migration); the site separately fires the generic
+`AuthenticationFailed` NotificationEvent (not typed as AUTH-GAP-04) — pointing
+the operator at the exact SSM parameter to reconcile.
 
 **Triage:**
 1. `mcp__tickvault-logs__tail_errors` — read the `AUTH-GAP-04` payload
@@ -204,6 +209,165 @@ operator at the exact SSM parameter to reconcile.
 
 **Source:** `crates/common/src/error_code.rs::AuthGap04TotpRotatedExternally`,
 `crates/core/src/auth/token_manager.rs` (the TOTP-exhaustion terminal branch).
+
+## AUTH-GAP-05 — sustained mid-session token-invalid: forced re-mint triggered (live 2026-07-06)
+
+**Status (2026-07-06):** LIVE — defined as
+`ErrorCode::AuthGap05ForcedRemintTriggered` with `code_str() == "AUTH-GAP-05"`.
+Severity::High. Auto-triage safe: YES (the forced re-mint IS the
+self-remediation; the operator inspects, never manually re-mints first).
+
+**Trigger:** the 900s market-hours-gated mid-session profile watchdog
+(`crates/core/src/auth/mid_session_watchdog.rs`) observed
+`CONSECUTIVE_INVALID_REMINT_THRESHOLD` (= 2) consecutive REAL `/v2/profile`
+auth failures (~30 min of a Dhan-rejected token; transient network blips
+neither escalate nor clear the counter). **Classification update (F12,
+2026-07-08):** a SEND-LEG failure (the request never got a response) whose
+error text matches NO known transient needle now classifies
+`RestSurfaceDegraded` — it pages via the pre-existing rising-edge CRITICAL
+but NEVER walks the counter toward the destructive mint (previously it fell
+through to `RealAuthFail`, so two novel reqwest/proxy wordings ~30 min
+apart could mint against a healthy token). Only status-proven 401/403,
+dataPlan/segment invalidation, token expiry, and unknown NON-send-leg
+shapes count as REAL. The pure `decide_remint` core then
+fires exactly ONE forced re-mint per failing episode through the EXISTING
+`TokenManager::force_renewal()` machinery (RenewToken-then-fallback-
+generateAccessToken), honoring:
+
+- **Lock-before-mint (RESILIENCE-03), fail-closed:** when
+  `TokenManager::dual_instance_lock_held()` reads `Some(false)` the mint is
+  REFUSED with ZERO external side effects — a peer owns the Dhan session and
+  its active token is never destroyed. The refusal is checked BEFORE the
+  cooldown so a cooldown hold can never mask the safety refusal. The
+  `error!` on this arm is tagged `RESILIENCE-01`.
+- **~125s Dhan mint cooldown** (`DHAN_TOKEN_GENERATION_COOLDOWN_SECS`) via
+  the pure `cooldown_elapsed` input — structurally moot at the 900s cadence,
+  hard-stopped anyway. **HONEST SCOPE (AG5-R2-1, 2026-07-06):** this
+  cooldown gates ONLY the watchdog's own mints — `acquire_token` has NO
+  mint-cooldown gate (the 125s cooldown in `token_manager.rs` lives solely
+  in the boot-time `initialize` TOTP retry loop), so an uncoordinated
+  concurrent caller (the ~23h renewal loop's failure retries, the
+  AUTH-GAP-03 ws-wake force renewal, and — SEC-R4-1, 2026-07-06 — the
+  lane-owned 4h token sweep's `force_renewal_if_stale` backstop in
+  `start_dhan_lane`) can still issue a second
+  `generateAccessToken` inside Dhan's ~125s window during the same
+  dead-token episode. Bounded + self-correcting (Dhan rejects/rate-limits
+  the second mint; the loops keep retrying). Moving the cooldown stamp into
+  `TokenManager` so ALL `renew_with_fallback` callers share one gate is a
+  flagged follow-up. The sweep itself is LANE-OWNED since SEC-R4-1
+  (registered in `DhanLaneRunHandles`, aborted on teardown/Drop) — a
+  detached copy previously survived every runtime Dhan disable, kept the
+  dead lane's JWT alive via RenewToken, and fired a false RESILIENCE-03
+  "peer owns the session" Critical page every 4h after a lane
+  stop/restart.
+- **Retry-once latch** (`remint_attempted_this_episode`) — at most one mint
+  (and one HIGH `TokenForcedRemintTriggered` Telegram) per failing episode;
+  a clean check re-arms.
+
+**Escalation / NO mid-session HALT:** a failed or non-restoring re-mint is
+covered by the pre-existing CRITICAL `MidSessionProfileInvalidated` page +
+the 23h renewal-loop circuit breaker. The BOOT-path DH-901
+rotate→retry-once→HALT law is untouched — a mid-session HALT would drop the
+live WS feed.
+
+**Triage:**
+1. `mcp__tickvault-logs__tail_errors` — find `AUTH-GAP-05`; the payload
+   carries `consecutive` (trigger) or `permanent` (failure classification).
+2. `tv_token_forced_remint_total{outcome}` —
+   `triggered`/`ok` = self-heal working; `failed` = the re-mint itself
+   errored (check Dhan status + SSM TOTP secret, cross-check AUTH-GAP-04);
+   `refused_lock_lost` = the PRE-mint gate refused — a peer holds the
+   dual-instance lock (see RESILIENCE-03 in
+   `dual-instance-lock-2026-07-04.md` — decide which host owns the
+   session); `refused_lock_lost_inflight` (SEC-R2-2, 2026-07-06) = the
+   in-flight RESILIENCE-03 tripwire INSIDE `force_renewal` refused (the
+   lock was lost between the watchdog's gate and the mint) — same
+   peer-ownership triage, distinct series so an in-flight refusal never
+   conflates with the pre-gate one; classified prefix-anchored on our own
+   refusal literal, never on server-controlled body text; `cooldown` = a
+   sub-125s re-trigger was held.
+3. Gauges `tv_token_valid` (0/1 AND-composed, live 15s poller in
+   `crates/core/src/auth/token_health_gauge.rs`) and
+   `tv_token_remaining_seconds` (now LIVE, no longer frozen at mint time)
+   show whether the re-mint restored validity within one poll/cycle.
+
+**Source:** `crates/common/src/error_code.rs::AuthGap05ForcedRemintTriggered`,
+`crates/core/src/auth/mid_session_watchdog.rs` (`decide_remint` + the
+Trigger/RefuseLockLost arms), `crates/core/src/auth/token_health_gauge.rs`
+(the honest gauges), `crates/core/src/auth/token_manager.rs::dual_instance_lock_held`.
+
+## AUTH-GAP-06 — fast-boot cached-token validation (live 2026-07-08)
+
+**Status (2026-07-08):** LIVE — defined as
+`ErrorCode::AuthGap06FastBootCachedTokenValidation` with
+`code_str() == "AUTH-GAP-06"`. Severity::High. Auto-triage safe: YES (the
+re-mint / degraded-proceed is the self-remediation; the operator inspects,
+never manually re-mints first).
+
+**The incident this closes (2026-07-07 — THIRD morning outage of this
+class, 08:32–09:06 IST):** the FAST crash-recovery boot arm
+(`crates/app/src/main.rs`) restarts during market hours from a CACHED Dhan
+JWT and previously spawned the WebSocket pool with ZERO validation of that
+token. Dhan enforces one active token at a time (`authentication.md` rule
+5), so a token minted elsewhere overnight silently killed the cached one —
+the pool spawned dead and stayed dead until the AUTH-GAP-05 mid-session
+watchdog's ~30-minute self-heal window or manual intervention.
+
+**Trigger:** the fast arm now validates the cached token with **ONE
+`GET /v2/profile`** BEFORE the WS-GAP-08 cooldown wait and any WebSocket
+spawn (`crates/core/src/auth/fast_boot_validation.rs::validate_cached_token_at_fast_boot`,
+routed through the pure, unit-tested `classify_probe_result`):
+
+- **2xx** → proceed (one `info!`, `outcome="proceed"`). No page.
+- **Prefix-anchored HTTP 401/403** (the broker rejected OUR login — the
+  incident shape) → `error!(code = "AUTH-GAP-06")` + forced re-mint
+  through the EXISTING TokenManager machinery (`initialize_deferred`
+  bounded by `TOKEN_INIT_TIMEOUT_SECS`, then `force_renewal` —
+  RenewToken→generateAccessToken fallback with the RESILIENCE-03 in-flight
+  tripwire preserved). The fresh token lands in the shared handle the WS
+  pool reads; the deferred background arm REUSES this manager (no
+  duplicate SSM fetch).
+- **Anything else** (send-leg/network, REST-surface 400/429/5xx, parse,
+  unknown) → ONE bounded retry (`FAST_BOOT_PROFILE_RETRY_DELAY_SECS`),
+  then PROCEED with the cached token + `error!(code = "AUTH-GAP-06")` —
+  fail-open; a REST-surface outage with a healthy WS (the 2026-06-10
+  class) must neither block boot nor trigger a token-destroying mint
+  (the F12 no-mint-on-ambiguity lesson; classification reuses the
+  AUTH-GAP-05 prefix-anchored wrapper primitives — never a substring scan
+  of server-controlled body text).
+
+**Triage:**
+1. `mcp__tickvault-logs__tail_errors` — find `AUTH-GAP-06`; the payload
+   names the arm (rejected → re-mint / degraded-proceed / remint failed).
+2. `tv_fast_boot_token_validation_total{outcome}` —
+   `remint_triggered`/`remint_ok` = the self-heal worked (the WS spawned
+   with a fresh token); `remint_failed`/`remint_unavailable` = the mint
+   leg errored — cross-check AUTH-GAP-04 (TOTP secret), RESILIENCE-03
+   (in-flight lock refusal), and Dhan status; `degraded` = the REST
+   surface was unreachable at boot — cross-check REST-CANARY-01; the
+   AUTH-GAP-05 watchdog remains the in-session backstop either way.
+3. A `remint_triggered` on EVERY fast boot means something keeps killing
+   the cached token overnight (peer host mint, manual web login, the
+   Groww-style daily reset) — investigate the token lifecycle, not this
+   validation.
+
+**Honest envelope:** the fast arm still holds NO dual-instance lock — it
+passes `None` for the lock flag exactly as before
+(`dual-instance-lock-2026-07-04.md` §3 documented residual, UNCHANGED by
+this feature; no lock acquisition was added, pending the operator's
+halt-semantics decision for that arm). The validation is one bounded
+probe (+ one bounded retry) per boot on the cold path; it never blocks
+boot (every leg timeout-bounded, every failure falls through loudly to
+the pre-existing fast-arm semantics) and never touches the tick hot path.
+
+**Source:** `crates/common/src/error_code.rs::AuthGap06FastBootCachedTokenValidation`,
+`crates/core/src/auth/fast_boot_validation.rs` (`classify_probe_result` /
+`CachedTokenVerdict` / `validate_cached_token_at_fast_boot`), the main.rs
+fast-arm call site. Ratchets:
+`crates/app/tests/fast_boot_token_validation_wiring_guard.rs` — exactly
+one validation call in the main.rs production region, ordered before the
+cooldown wait + `create_websocket_pool`, plus a stub-guard that the helper
+actually probes `/v2/profile` and reaches `force_renewal`.
 
 ## DH-911 — Dhan API silent black-hole (Wave-4-E2)
 

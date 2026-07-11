@@ -404,10 +404,14 @@ fn boot_timing_proof_is_measured_and_surfaced() {
             && main.contains("tv_instrument_load_total_rows"),
         "main.rs must emit the 3 boot-timing Prometheus gauges"
     );
+    // 2026-07-09 (operator escalation — Telegram noise N3): the standalone
+    // boot-timing Telegram essay was DEMOTED to a structured log line; the
+    // operator-facing instrument count lives on the boot bubble's
+    // Instruments line. The pure formatter + its sentinel guard stay.
     assert!(
         main.contains("fn format_instrument_load_telegram")
-            && main.contains("NotificationEvent::Custom { message }"),
-        "main.rs must emit a boot-timing Telegram line via the pure formatter"
+            && main.contains("demoted from Telegram 2026-07-09"),
+        "main.rs must log the boot-timing line via the pure formatter (demoted, log-only)"
     );
     assert!(
         main.contains("O(1) warm-path proof"),
@@ -417,5 +421,169 @@ fn boot_timing_proof_is_measured_and_surfaced() {
     assert!(
         main.contains("if elapsed_ms == u64::MAX") || main.contains("== u64::MAX"),
         "the formatter must suppress the Telegram when timing was not measured"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Section FUTIDX (§36 2026-07-08; §36.7 2026-07-10) — the index-futures grant
+// is pinned to exactly 4 underlyings, all monthly expiries `>= today`
+// (§36.7), never-roll, Quote mode. Any widening (5th underlying, OPTIDX,
+// non-monthly-serial instrument, expiry < today, breaking the
+// per-underlying serial envelope, intraday resubscribe) requires a fresh
+// dated operator quote + a rule-file edit FIRST.
+// ---------------------------------------------------------------------------
+
+fn index_futures_rs_body() -> String {
+    let path = repo_root().join("crates/core/src/instrument/index_futures.rs");
+    std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {} failed: {e}", path.display()))
+}
+
+/// PRODUCTION region only — split at the first `#[cfg(test)]` (the house
+/// AGGREGATOR-SEAL-01 2026-07-06 precedent: a whole-file scan is satisfiable
+/// by test-fixture literals, making the membership pin vacuous — hostile-
+/// review round 3, 2026-07-08). Fails loudly if the marker ever disappears
+/// (a marker-less file would silently regress to the whole-file scan).
+fn index_futures_rs_production_region() -> String {
+    let body = index_futures_rs_body();
+    let Some((prod, _tests)) = body.split_once("#[cfg(test)]") else {
+        panic!("index_futures.rs must carry a #[cfg(test)] marker — production-region split");
+    };
+    prod.to_string()
+}
+
+#[test]
+fn futidx_scope_pinned_to_4_underlyings_all_monthly_expiries() {
+    let body = rule_file_body();
+    for phrase in [
+        "FUTIDX",
+        "NIFTY",
+        "BANKNIFTY",
+        "MIDCPNIFTY",
+        "SENSEX",
+        "nearest expiry",
+        "NEVER roll",
+        "Quote mode",
+        // §36.7 (2026-07-10): the all-months grant + its fail-closed
+        // envelope must stay recorded in the rule file.
+        "ALL available monthly",
+        "MonthlySerialFlood",
+        "2026-07-10",
+    ] {
+        assert!(
+            body.contains(phrase),
+            "rule file §36/§36.7 must pin the FUTIDX contract phrase: {phrase:?}"
+        );
+    }
+    // Hostile-review round 3 (2026-07-08): membership pins scan the
+    // PRODUCTION region ONLY — the whole-file scan was satisfiable by
+    // test-fixture literals (four_rows()/proptest lists carry the same
+    // quoted canonicals PLUS "FINNIFTY"), so a membership swap in the
+    // production const kept this ratchet green.
+    let src = index_futures_rs_production_region();
+    assert!(
+        src.contains("[IndexFutureUnderlying; 4]"),
+        "INDEX_FUTURES_UNDERLYINGS must be an arity-4 array — a 5th underlying needs a rule edit"
+    );
+    // §36.7: the per-underlying serial envelope + the derived total bound.
+    assert!(
+        src.contains("MAX_MONTHLY_EXPIRIES_PER_UNDERLYING: usize = 6"),
+        "MAX_MONTHLY_EXPIRIES_PER_UNDERLYING must stay 6 — widening needs a rule edit"
+    );
+    assert!(
+        src.contains("INDEX_FUTURES_UNDERLYINGS.len() * MAX_MONTHLY_EXPIRIES_PER_UNDERLYING"),
+        "MAX_INDEX_FUTURE_TARGETS must stay derived (4 underlyings × serial envelope)"
+    );
+    for canonical in ["\"NIFTY\"", "\"BANKNIFTY\"", "\"MIDCPNIFTY\"", "\"SENSEX\""] {
+        assert!(
+            src.contains(canonical),
+            "index_futures.rs PRODUCTION region must carry the canonical literal {canonical}"
+        );
+    }
+    // Non-vacuity self-test: the production region must EXCLUDE the
+    // test-only literals (FINNIFTY/BANKEX live in fixtures + the §36.2
+    // REJECT doc only) — proves the split actually removed the test region
+    // and the membership pin bites on the production const.
+    assert!(
+        !src.contains("\"FINNIFTY\""),
+        "production region must not carry \"FINNIFTY\" — the split is vacuous if it does"
+    );
+}
+
+#[test]
+fn futidx_scope_rule_file_pins_forbidden_remainder() {
+    let body = rule_file_body();
+    for phrase in [
+        "OPTIDX",
+        "FUTSTK",
+        "OPTSTK",
+        "master-only",
+        "NO intraday resubscribe",
+        "beyond the §36 grant",
+    ] {
+        assert!(
+            body.contains(phrase),
+            "rule file must keep the §36 forbidden-remainder phrase: {phrase:?}"
+        );
+    }
+}
+
+#[test]
+fn futidx_scope_never_roll_source_pin() {
+    // §36.7: the PLURAL fn owns the `>= today` filter (the never-roll rule
+    // lives in exactly ONE place) AND has NO TradingCalendar parameter
+    // (accidental stock-style T-0 roll activation must stay
+    // unrepresentable); the SINGULAR still exists and DELEGATES to the
+    // plural, so the rule cannot fork.
+    let src = index_futures_rs_body();
+    assert!(
+        src.contains("pub fn select_index_future_expiries("),
+        "the shared plural boundary fn must exist"
+    );
+    let fn_start = src
+        .find("pub fn select_index_future_expiries(")
+        .expect("fn present");
+    let fn_body = &src[fn_start..fn_start + 500];
+    assert!(
+        fn_body.contains(">= today_ist"),
+        "ALL monthly expiries >= today (the never-roll rule, §36.7)"
+    );
+    assert!(
+        !fn_body.contains("TradingCalendar"),
+        "select_index_future_expiries must NOT take a calendar — the calendar arm exists only \
+         to trigger the banned stock T-0 roll"
+    );
+    // Delegation pin: the singular exists and calls the plural.
+    assert!(
+        src.contains("pub fn select_index_future_expiry("),
+        "the singular nearest-month fn must still exist (SLO exclusion set + docs)"
+    );
+    let singular_start = src
+        .find("pub fn select_index_future_expiry(")
+        .expect("singular fn present");
+    let singular_body = &src[singular_start..singular_start + 500];
+    assert!(
+        singular_body.contains("select_index_future_expiries("),
+        "the singular must DELEGATE to the plural — the >= today rule has ONE implementation"
+    );
+}
+
+#[test]
+fn futidx_scope_legacy_gate_still_false() {
+    // The legacy planner gate was NOT the vector — it stays `false` forever.
+    let path = repo_root().join("crates/core/src/instrument/subscription_planner.rs");
+    let src = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("read {} failed: {e}", path.display()));
+    // The gate fn name is assembled at runtime so THIS file never contains
+    // the retired-flag substring the `indices4only_scope_lock_guard.rs`
+    // whole-crates scan bans (its allowlist covers only 3 files).
+    let gate_fn_name: String = ["should_", "subscribe_index_", "derivatives"].concat();
+    let gate = src
+        .find(&format!("pub const fn {gate_fn_name}"))
+        .expect("legacy gate fn must still exist");
+    let gate_body = &src[gate..gate + 200];
+    assert!(
+        gate_body.contains("false"),
+        "the legacy index-derivatives gate must keep returning false — the §36 FUTIDX path \
+         is the DailyUniverse IndexFuture role, never this gate"
     );
 }

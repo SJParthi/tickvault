@@ -34,6 +34,54 @@ unwritable — by definition catastrophic.
 
 **Source:** `crates/storage/src/shadow_persistence.rs::ShadowCandleWriter::handle_drop`.
 
+### 2026-07-09 Update — AGGREGATOR-DROP-01 now PAGES (dual route)
+
+The 2026-07-09 audit confirmed this Severity::Critical code paged NOBODY
+post-CloudWatch-migration: no `error_code_alerts` entry existed and the
+companion counter never reached CloudWatch. Both routes are now live:
+
+1. **errcode log-filter alarm** (`tv-<env>-errcode-aggregator-drop-01`,
+   `deploy/aws/terraform/error-code-alarms.tf`): the emit site —
+   `crates/storage/src/seal_writer_loop.rs::record_cycle_observability`,
+   `error!(code = ErrorCode::AggregatorDrop01.code_str(), dropped = N)` per
+   drain cycle with a non-zero truly-dropped count — flows
+   errors.jsonl → CW Logs `/tickvault/<env>/app` → filter
+   `{ $.code = "AGGREGATOR-DROP-01" && $.level = "ERROR" }` →
+   `tv_errcode_aggregator_drop_01` → alarm (≤5 min) → SNS → Telegram.
+   `ok_recovery = false`: the loss is PERMANENT — an auto-OK ~15 min after
+   the episode ages out can never mean the candles came back (Rule-11).
+2. **counter-side pager** (`tv-<env>-seal-writer-dropped`,
+   `deploy/aws/terraform/seal-drop-alarm.tf`, the
+   `feed-stall-restart-alarm.tf` house pattern): a log metric filter on
+   `/tickvault/<env>/metrics` extracts the per-scrape deltas of
+   `tv_seal_writer_drain_total{kind="dropped"}` into the DERIVED
+   `tv_seal_writer_drain_dropped_total` [host] metric (kind-sliced so the
+   busy submitted/flushed series never inflate the Sum; distinct name so a
+   future unfiltered extraction can never double-count), alarmed at
+   Sum ≥ 1 per aligned 300s window, always armed (a drop at the
+   IST-midnight force-seal burst is equally permanent), no ok_actions.
+   Redundancy rationale: a drop still pages if the errors.jsonl shipping
+   leg is degraded (the 2026-07-06 collect_list incident class).
+   **First-sample baseline (the feed-stall round-5 lesson):** the CW
+   agent's delta pipeline drops each counter series' first sample as its
+   baseline; since `kind="dropped"` increments only on a real drop, a
+   lazily-born series would lose the session's FIRST drop entirely — so
+   main.rs pre-registers the dropped series at 0 immediately after the
+   metrics recorder installs (boot Step 2, next to the stall-restart
+   registration), making it dense from boot.
+
+Lockstep ratchet: `crates/app/tests/seal_drop_paging_wiring_guard.rs`
+(5 tests — post-install registration order, emit-site stub-guard, both
+terraform shapes built from the real `code_str()` / metric literals, plus
+a string-aware HCL-comment-stripper self-test so tf comments can never
+satisfy the shape needles).
+Honest envelope: paging latency ≤ ~5 min on either route; a drop inside the
+pre-install boot window increments a no-op counter handle (route 2 blind;
+physically implausible — ring+spill+DLQ must all fail on live seal traffic
+inside the boot prefix) but route 1 still sees its ERROR line; the delta
+counter shape is not live-verified from the sandbox — if it ever proved
+cumulative, Sum over-pages (fail-loud, never a silent miss).
+
 ### 2026-05-11 Update — 4-alert drop-class family is now live
 
 Per Wave 6 Sub-PR #1 items 1.4j/l/n/o (merged #584/#587/#589/#590) the
@@ -131,6 +179,56 @@ so it routes through Telegram per `error_level_meta_guard.rs` Rule 5.
 
 **Source:** `crates/storage/src/shadow_persistence.rs::ShadowCandleWriter`
 + existing fix at `candle_persistence.rs::flush_buffer` (legacy path).
+
+### 2026-07-06 Update — silent candle-persist exam bug closed (HTTP ACK + loud loop)
+
+The 2026-07-06 groww-only live exam exposed the worst-case silent variant:
+~71K candles sealed in RAM, ZERO rows in the `candles_*` tables, ZERO log
+lines from the seal-writer leg — no AGGREGATOR-SEAL-01, no heartbeat. Two
+verified holes, both fixed on branch `claude/fix-candle-writer-recovery`:
+
+1. **Fire-and-forget ILP TCP** — `ShadowCandleWriter` used
+   `tcp::addr=host:ilp_port`. A server-side reject NEVER returned `Err`
+   (the same class as the 2026-07-05 `ws_event_audit` empty-table
+   incident), so every drain cycle "flushed Ok" (or quietly recovered via
+   reconnect+replay at `debug!`) while QuestDB discarded the rows. The
+   writer now uses **ILP-over-HTTP**
+   (`http::addr=host:http_port;protocol_version=1;`) — every flush gets a
+   per-request server ACK, so a reject surfaces as `Err`, `drain_once`
+   fires `error!(code = AGGREGATOR-SEAL-01)` and the ring→spill→DLQ rescue
+   engages. IN-CYCLE reconnect + same-buffer replay is KEPT (recovery now
+   logs at `info!`, matching the tick writer's visible line). Ratchet:
+   `shadow_candle_writer::tests::test_ilp_conf_targets_http_port_not_tcp`.
+   **2026-07-06 hostile-review hardening (same branch):** (a) after a
+   failed flush, `drain_once` now rescues the popped seals to spill/DLQ
+   AND calls `ShadowCandleWriter::discard_pending()` — cross-cycle buffer
+   retention would replay a server-REJECTED row forever (one poisoned row
+   = dead candle leg for the session) and grow the buffer without bound
+   during an outage toward the questdb-rs 100 MiB `max_buf_size` wedge;
+   the spill/DLQ tier is the durable floor for the rescued rows. (b) The
+   HTTP conf pins `retry_timeout=0` (the questdb-rs INTERNAL 10s
+   sleep-and-resend loop is disabled — the writer's own bounded
+   reconnect ladder owns retry) + `request_timeout=5000` ms, and the loop
+   runs each drain cycle under `block_in_place` on the multi-thread
+   runtime — a failed cycle blocks ≤ ~30s worst-case (was ~80-120s of
+   synchronous blocking pinning a tokio worker with the library
+   defaults). (c) The observability ratchet below now scans the
+   PRODUCTION region only (split at `#[cfg(test)]`) — the previous
+   whole-file `include_str!` scan matched its own assertion literals
+   (vacuous; false-OK class); mutation-verified.
+   Additional ratchets:
+   `seal_writer_task::tests::test_drain_once_discards_writer_buffer_after_flush_failure_rescue`,
+   `shadow_candle_writer::tests::test_discard_pending_clears_buffer_and_pending_for_clean_next_cycle`.
+2. **The loop dropped every `CycleOutcome`** — the Wave-6 item-1.4 counter
+   fan-out was never wired, and truly-dropped seals never fired
+   AGGREGATOR-DROP-01. `run_seal_writer_loop` now fans every cycle into
+   `tv_seal_writer_drain_total{kind=submitted|flushed_rows|flush_failed|
+   rescued_spill|rescued_dlq|dropped}`, fires
+   `error!(code = ErrorCode::AggregatorDrop01.code_str())` on any
+   truly-dropped seal, and emits an UNCONDITIONAL once-per-60s `info!`
+   progress report (`SEAL_WRITER_PROGRESS_REPORT_SECS`) — silence can never
+   again mean unknown. Ratchet:
+   `seal_writer_loop::tests::test_ratchet_loop_wires_observability_not_silence`.
 
 ## AGGREGATOR-HB-01 — per-minute aggregator seal-burst heartbeat (positive signal)
 

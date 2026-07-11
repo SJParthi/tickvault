@@ -19,6 +19,10 @@
 #![allow(clippy::doc_overindented_list_items)]
 
 pub mod bar_cache_loader;
+// W2 PR#5 (2026-07-10, audit follow-up row 15): holiday-calendar
+// coverage-horizon staleness watchdog - pages the operator BEFORE the
+// calendar runs off its year-end cliff into un-listed holidays.
+pub mod calendar_staleness;
 // Operator directive 2026-06-02: post-market (15:31 IST) 1-minute
 // cross-verification of live candles_1m vs Dhan intraday — CSV + audit + count.
 pub mod cross_verify_1m_boot;
@@ -29,6 +33,10 @@ pub mod orphan_position_watchdog_boot;
 // GET /v2/profile at 09:05 / 12:00 / 15:25 IST, pages HIGH with the captured
 // (bounded, secret-redacted) body + final URL on any non-2xx.
 pub mod rest_canary_boot;
+// Dual-feed scoreboard PR-A (operator 2026-07-10): boot-time process-death
+// reconciler + the 15:45 IST daily Dhan-vs-Groww aggregation + the Telegram
+// scorecard summary (SCOREBOARD-01 family).
+pub mod feed_scoreboard_boot;
 pub mod tick_conservation_boot;
 // PR #8a (2026-05-19) — Slice 1: 09:15:00 IST `DayOhlcTracker::arm_sid()`
 // boot wiring per `index-day-ohlc-tracker-error-codes.md`. Closes the
@@ -47,6 +55,11 @@ pub mod dhan_activation;
 pub mod groww_activation;
 /// Groww second-feed bridge — consumer side (operator lock §32). Default-OFF.
 pub mod groww_bridge;
+/// Fleet-scoped Telegram alert coalescing for the Groww auto-scale fleet
+/// (§34, exam-fix 2026-07-06): reject/connected transitions across ALL fleet
+/// connections aggregate into at most ONE Telegram per 60s window per
+/// direction; single-connection semantics untouched.
+pub mod groww_fleet_alerts;
 /// Groww NATIVE-RUST shadow client runner (PR-R1 parity migration, operator
 /// "go" 2026-07-04 — `groww-second-feed-scope-2026-06-19.md` §35). Default-OFF
 /// behind `[feeds] groww_native_shadow`.
@@ -135,6 +148,10 @@ pub mod lifecycle_reconcile_orchestrator;
 // Outer daily-universe boot orchestrator: §4 fetch-runner → reconcile →
 // terminal fetch-audit, capturing CSV SHA-256 provenance. Feature-gated
 // §21; the main.rs Step-6c task spawn is the final wiring PR.
+/// W2#7 (2026-07-10): supervised SSM re-read loop so the operator can
+/// rotate the API bearer token (/tickvault/<env>/api/bearer-token) without
+/// an app restart — closes audit row 13.
+pub mod api_token_rotation;
 #[cfg(feature = "daily_universe_fetcher")]
 pub mod daily_universe_boot;
 pub mod subsystem_memory;

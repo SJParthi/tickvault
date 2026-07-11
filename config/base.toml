@@ -261,6 +261,19 @@ twenty_depth_max_instruments = 50
 telegram_api_base_url = "https://api.telegram.org"
 send_timeout_ms = 10000
 sns_enabled = false
+# Telegram UX Overhaul (2026-07-07) kill switch #1: one incident = one
+# live-edited Telegram bubble for WS lifecycle storms. Set false to revert
+# to byte-identical legacy per-event dispatch (no code change needed).
+episode_mode = true
+# Kill switch #2: LOW/MEDIUM digest window (seconds) during market hours.
+# Clamped to [60, 3600] at load; 60 == legacy 60s coalescing behavior.
+digest_window_secs = 900
+# Boot bubble (2026-07-09): ONE consolidated live-edited boot checklist
+# bubble per boot. Set false to revert to the legacy per-event boot spray
+# (WS episodes are untouched either way). Note: the bubble also requires
+# episode_mode = true — turning episode_mode off reverts BOTH the WS
+# episode bubbles AND the boot bubble to legacy dispatch.
+boot_bubble = true
 
 [observability]
 metrics_bind_addr = "127.0.0.1"
@@ -422,3 +435,19 @@ segment     = "IDX_I"
 security_id = 21
 name        = "INDIA VIX"
 segment     = "IDX_I"
+
+# ===========================================================================
+# Dual-feed daily scoreboard (operator directive 2026-07-10 — run Dhan +
+# Groww live for a month, everything tracked/captured/blame-attributed).
+# PR-A is aggregation-only: reads ws_event_audit + ticks, writes the
+# feed_scoreboard_daily / feed_episode_audit forensic tables at 15:45 IST
+# and sends the daily Telegram scorecard. Safe-on; `enabled = false` is
+# the whole-subsystem rollback switch.
+# ===========================================================================
+[scoreboard]
+enabled                 = true
+telegram_enabled        = true
+coverage_detail_rows    = true   # per-instrument detail rows (populated by PR-4)
+presence_fold_enabled   = true   # hot-path presence fold (lands in PR-4)
+groww_lag_enabled       = true   # Groww lag histograms (land in PR-3)
+trigger_secs_of_day_ist = 56700  # 15:45:00 IST

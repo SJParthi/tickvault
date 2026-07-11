@@ -421,7 +421,7 @@ Tests in `crates/*/tests/gap_enforcement.rs` verify:
 
 **Metrics (Prometheus):** `tv_tick_processing_duration_ns`, `tv_wire_to_done_duration_ns`, `tv_orders_placed_total`, `tv_daily_pnl`, `tv_websocket_connections_active`
 **Traces (OpenTelemetry → Jaeger):** spans on WS reads, parsing, OMS, risk checks, persistence
-**Logs (tracing → Loki via Alloy):** Structured JSON, ERROR → Telegram alert
+**Logs (tracing → CloudWatch Logs via CW agent in prod; Loki/Alloy local only):** Structured JSON. The 9 filtered codes (see `deploy/aws/terraform/error-code-alarms.tf`; AGGREGATOR-DROP-01 added 2026-07-09) page via CloudWatch metric-filter alarms → SNS → Telegram; all other coded ERRORs are log-sink-only unless they have their own metric alarm or typed NotificationEvent.
 
 ## BENCHMARK BUDGETS
 

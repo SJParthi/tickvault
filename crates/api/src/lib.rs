@@ -42,12 +42,17 @@ pub mod feed_state;
 pub mod feed_state_persist;
 pub mod handlers;
 pub mod middleware;
+pub mod public_guard;
+pub mod response_cache;
 pub mod state;
+
+use std::sync::Arc;
 
 use axum::Router;
 use tower_http::cors::CorsLayer;
 
 use middleware::{ApiAuthConfig, request_tracing, require_bearer_auth};
+use public_guard::{PublicEndpointLimiter, public_rate_limit};
 use state::SharedAppState;
 
 /// Builds the full axum router with all routes and middleware.
@@ -105,6 +110,25 @@ pub fn build_router_with_auth(
     auth_config: ApiAuthConfig,
     _feed_toggle_public: bool,
 ) -> Router {
+    // API bearer-auth 401 counter pre-registration (2026-07-10, wave-2 #2):
+    // the CW agent's prometheus pipeline drops each counter series' FIRST
+    // sample as its delta baseline, and tv_api_auth_failed_total increments
+    // ONLY on a bearer-auth rejection (middleware.rs::require_bearer_auth,
+    // all 3 rejection arms). Without a boot-time registration the series is
+    // born AT the first 401 and the dropped baseline sample eats part of the
+    // session's first burst — silently raising the tv-<env>-api-auth-failed
+    // alarm's effective threshold (deploy/aws/terraform/auth-failed-alarm.tf,
+    // Sum >= 25 per 300s). Registering at 0 HERE — router construction, the
+    // single choke point BOTH boot paths call — is provably before the first
+    // possible 401 (the server cannot serve a request before its router
+    // exists) and runs after the boot Step-3 recorder install (main.rs calls
+    // observability::init_metrics before either API-server spawn; ratcheted
+    // by the source-order scan in
+    // crates/app/tests/auth_failed_alarm_wiring_guard.rs), so the series is
+    // DENSE from API-server start (a 0-delta /metrics event per 60s scrape)
+    // and the alarm sees every 401, including the first.
+    metrics::counter!("tv_api_auth_failed_total").increment(0);
+
     let cors = build_cors_layer(allowed_origins);
 
     // PR #6b (2026-05-19): /api/instruments/rebuild route RETIRED.
@@ -223,10 +247,8 @@ pub fn build_router_with_auth(
             "/board",
             axum::routing::get(handlers::board_page::board_page),
         )
-        .route(
-            "/api/board/data",
-            axum::routing::get(handlers::board::board_data),
-        )
+        // NOTE (2026-07-09 follow-up): `/api/board/data` moved DOWN to the
+        // rate-limited sub-router — the HTML shell above stays unlimited.
         .route(
             "/health",
             axum::routing::get(handlers::health::health_check),
@@ -247,12 +269,34 @@ pub fn build_router_with_auth(
         .route(
             "/api/feeds/health",
             axum::routing::get(handlers::feeds::get_feeds_health),
-        )
+        );
+
+    // 2026-07-09 audit hardening (+ same-day follow-up): the THREE
+    // unauthenticated QuestDB-backed endpoints live on their OWN sub-router
+    // behind a shared GCRA rate limiter (`route_layer` — structurally
+    // cannot wrap /api/feeds, /health, the HTML shells, the debug routes,
+    // or the bearer-gated POST). Handler-level TTL caches (SharedAppState)
+    // are the second line; limit-first is the documented ordering. See
+    // `public_guard.rs` module docs for the global-not-per-IP rationale +
+    // the budget analysis (one /board tab + one /dashboard tab ≈ 0.53 req/s
+    // vs the 5 req/s sustained budget).
+    let public_limiter = Arc::new(PublicEndpointLimiter::new());
+    let limited_public_routes: Router<SharedAppState> = Router::new()
         .route("/api/stats", axum::routing::get(handlers::stats::get_stats))
         .route(
             "/api/quote/{security_id}",
             axum::routing::get(handlers::quote::get_quote),
-        );
+        )
+        // 2026-07-09 follow-up (closes the #1458 HIGH residual): the board
+        // JSON snapshot (3 QuestDB queries/hit) is budgeted + 2s-cached.
+        .route(
+            "/api/board/data",
+            axum::routing::get(handlers::board::board_data),
+        )
+        .route_layer(axum::middleware::from_fn_with_state(
+            public_limiter,
+            public_rate_limit,
+        ));
     // The 4 `/api/debug/*` routes live on `debug_routes` above (bearer-auth
     // gated, security trim 2026-07-04) — no longer on the public router.
     //
@@ -264,6 +308,7 @@ pub fn build_router_with_auth(
     // `cascade_fanout` accessor on AppState retired. See above comment
     // on the merged routes block.
     public_routes
+        .merge(limited_public_routes)
         .merge(debug_routes)
         .merge(protected_routes)
         .layer(axum::middleware::from_fn(request_tracing))
@@ -684,6 +729,197 @@ mod tests {
                 axum::http::StatusCode::OK,
                 "POST /api/feeds/{{feed}} with the valid bearer token must pass \
                  the gate (feed_toggle_public={feed_toggle_public})"
+            );
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // 2026-07-09 audit hardening: public-endpoint rate limit scope
+    // -------------------------------------------------------------------
+
+    /// Fires `count` GET requests at `uri` through clones of the router
+    /// (the limiter Arc is shared across clones) and returns the statuses.
+    async fn fire_gets(router: &Router, uri: &str, count: usize) -> Vec<axum::http::StatusCode> {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let mut statuses = Vec::with_capacity(count);
+        for _ in 0..count {
+            let response = router
+                .clone()
+                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            statuses.push(response.status());
+        }
+        statuses
+    }
+
+    #[tokio::test]
+    async fn test_public_stats_rate_limit_429_after_burst() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let router = build_router(auth_test_state(), &[], true);
+
+        // Adversarial-review de-flake (2026-07-09): GCRA replenishes one
+        // cell every 200ms, so an exact "burst+1th request is 429"
+        // assertion flakes on a slow (llvm-cov) runner. Instead: prime the
+        // cache with one request (the only one that does the unreachable
+        // port-1 DB compute), then fire burst+5 fast cache-hit requests
+        // and require BOTH ≥1 success and ≥1 429 among them.
+        let _prime = fire_gets(&router, "/api/stats", 1).await;
+        let burst = crate::public_guard::PUBLIC_API_BURST as usize;
+        let statuses = fire_gets(&router, "/api/stats", burst + 5).await;
+        assert!(
+            statuses.contains(&axum::http::StatusCode::OK),
+            "requests within the burst must be 200, got {statuses:?}"
+        );
+        assert!(
+            statuses.contains(&axum::http::StatusCode::TOO_MANY_REQUESTS),
+            "past the burst the limiter must return 429, got {statuses:?}"
+        );
+
+        // The 429 shape carries Retry-After (fire until we see one).
+        let mut limited = None;
+        for _ in 0..5 {
+            let response = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/api/stats")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            if response.status() == axum::http::StatusCode::TOO_MANY_REQUESTS {
+                limited = Some(response);
+                break;
+            }
+        }
+        let limited = limited.expect("a rapid request past the burst must be limited");
+        assert_eq!(
+            limited
+                .headers()
+                .get(axum::http::header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok()),
+            Some("1"),
+            "429 must carry Retry-After"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_public_quote_shares_rate_limit_budget() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let router = build_router(auth_test_state(), &[], true);
+
+        // Exhaust the shared GCRA cell via stats (burst + margin; the first
+        // request populates the cache so the rest are fast cache hits)...
+        let burst = crate::public_guard::PUBLIC_API_BURST as usize;
+        let _ = fire_gets(&router, "/api/stats", burst + 5).await;
+
+        // ...then quote requests draw from the SAME budget → at least one
+        // rapid quote must be 429 without ever reaching the handler (the
+        // de-flake loop tolerates GCRA replenishment on a slow runner: 3
+        // rapid requests can never ALL be replenished inside ~ms).
+        let mut saw_429 = false;
+        for _ in 0..3 {
+            let response = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/api/quote/13")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            if response.status() == axum::http::StatusCode::TOO_MANY_REQUESTS {
+                saw_429 = true;
+                break;
+            }
+        }
+        assert!(
+            saw_429,
+            "stats + quote share one budget (they protect the same DB)"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_board_data_shares_rate_limit_budget() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        // 2026-07-09 follow-up (closes the #1458 HIGH residual): the board
+        // JSON snapshot rides the SAME shared GCRA cell as stats + quote.
+        let router = build_router(auth_test_state(), &[], true);
+
+        // Exhaust the shared cell via stats (burst + margin; the first
+        // request populates the cache so the rest are fast cache hits —
+        // +8 margin per the adversarial-review llvm-cov headroom note)...
+        let burst = crate::public_guard::PUBLIC_API_BURST as usize;
+        let _ = fire_gets(&router, "/api/stats", burst + 8).await;
+
+        // ...then rapid board requests draw from the SAME budget → at least
+        // one must be 429 (same GCRA-replenishment de-flake loop as the
+        // quote budget test: 3 rapid requests can never ALL be replenished
+        // inside ~ms).
+        let mut saw_429 = false;
+        for _ in 0..3 {
+            let response = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/api/board/data")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            if response.status() == axum::http::StatusCode::TOO_MANY_REQUESTS {
+                saw_429 = true;
+                break;
+            }
+        }
+        assert!(
+            saw_429,
+            "board/data must share the public-endpoint budget (it protects the same DB)"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_feeds_and_health_not_rate_limited_after_burst() {
+        // Locked contracts (websocket-connection-scope-lock.md 2026-07-04
+        // banner + operator 2026-06-23 "public read, authed toggle"):
+        // exhausting the public-endpoint limiter must NOT touch
+        // GET /api/feeds, GET /api/feeds/health, or GET /health — they are
+        // structurally outside the rate-limited sub-router. The /board +
+        // /dashboard HTML shells (static, no DB) are pinned never-limited
+        // too (2026-07-09 follow-up: only the JSON data poll is budgeted).
+        let router = build_router(auth_test_state(), &[], true);
+
+        // Exhaust the limiter (burst + a margin).
+        let burst = crate::public_guard::PUBLIC_API_BURST as usize;
+        let _ = fire_gets(&router, "/api/stats", burst + 3).await;
+
+        for uri in [
+            "/api/feeds",
+            "/api/feeds/health",
+            "/health",
+            "/board",
+            "/dashboard",
+        ] {
+            let statuses = fire_gets(&router, uri, 15).await;
+            assert!(
+                statuses.iter().all(|s| *s == axum::http::StatusCode::OK),
+                "{uri} must never be rate limited, got {statuses:?}"
             );
         }
     }

@@ -134,8 +134,11 @@ fn build_groww_ws_audit_row(
         connection_index: 0,
         pool_size: 1,
         event_kind,
+        // O(1) EXEMPT: begin — WS lifecycle audit row: at most one per
+        // connect/disconnect transition (COLD PATH per the fn docs), never per tick.
         source: source.to_string(),
         reason: reason.to_string(),
+        // O(1) EXEMPT: end
         // Groww has no Dhan disconnect codes.
         dhan_code: WS_EVENT_NO_DHAN_CODE,
         down_secs: 0,
@@ -196,8 +199,11 @@ fn groww_ws_audit_drop_reason(
 /// `"streaming"`; the counts are the SIDs the sidecar actually subscribed today.
 /// `emitted`/`dropped` are the honest-feed PROOF (operator 2026-06-29): records the
 /// producer DECODED+EMITTED vs DECODED-but-DROPPED (a `sid_map` miss / missing
-/// field). Both are `#[serde(default)]` so an OLD sidecar status (no fields) parses
-/// to 0 — forward-safe, no error.
+/// field). All are `#[serde(default)]` so an OLD sidecar status (no fields) parses
+/// to 0 — forward-safe, no error. `ts_ist_nanos` (the sidecar's own write stamp,
+/// present in every `write_status` record) is the FRESHNESS signal: a status
+/// record with `ts_ist_nanos == 0` (old format) can never prove liveness — see
+/// [`groww_status_is_live`] (stale-status false-OK fix, 2026-07-06).
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq)]
 struct GrowwStatusLine {
     event: GrowwStatusEvent,
@@ -209,6 +215,20 @@ struct GrowwStatusLine {
     emitted: u64,
     #[serde(default)]
     dropped: u64,
+    /// IST epoch nanos (UTC epoch + 19,800s — the SAME convention as
+    /// [`receipt_ist_nanos`] and the tick lines' `ts_ist_nanos`) the sidecar
+    /// stamped when it WROTE this record (`write_status` → `now_ist_nanos()`
+    /// in `groww_sidecar.py`). The cross-language epoch contract is ratcheted
+    /// by `test_sidecar_status_stamp_shares_the_ist_epoch_convention`
+    /// (2026-07-06 fix: the sidecar previously stamped the PLAIN UTC epoch,
+    /// so every real record read 19,800s old and the freshness gate rejected
+    /// it forever). 0 = the stamp is absent (old-format line) — treated as
+    /// NEVER-live, fail-closed. A pre-fix sidecar's UTC-epoch stamp reads
+    /// ~5.5h old under this gate and is likewise rejected — correct, since
+    /// any such file is by definition a pre-restart fossil (the supervisor
+    /// relaunches the sidecar from the same deployed tree as this binary).
+    #[serde(default)]
+    ts_ist_nanos: i64,
 }
 
 /// The sidecar's two PROOF status events. `Unknown` tolerates a future/unexpected
@@ -235,6 +255,66 @@ fn parse_groww_status_line(text: &str) -> Option<GrowwStatusLine> {
         return None;
     }
     serde_json::from_str::<GrowwStatusLine>(trimmed).ok()
+}
+
+/// Max age for a sidecar status record to count as LIVE evidence at FIRST
+/// observation per connected episode (the sidecar rewrites the status ≤1s
+/// apart while streaming and once at subscribe, so a healthy record is always
+/// well inside this bound; a record older than it is a fossil from a killed /
+/// stalled / prior-day sidecar — mirrors the ladder's
+/// `PLATEAU_PROOF_FRESHNESS_SECS` fossil-aging pattern). The one-shot
+/// `subscribed` write is NOT rewritten on a tickless window, so this window
+/// deliberately does NOT need to cover the boot-ordering notifier-slot
+/// deferral: once a record has been observed fresh, the bridge latches
+/// `fresh_status_seen_this_episode` and the deferral / gauge no longer
+/// require the record to STILL be fresh at announce time (2026-07-06 fix —
+/// the floor check alone kills fossils; without the latch, a >120s
+/// docker/notifier boot chain silently LOST the boot-connect ping and left
+/// the gauge 0 until the first tick, contradicting the in-code
+/// "delayed, never lost" contract).
+const GROWW_STATUS_LIVE_MAX_AGE_NANOS: i64 = 120 * NANOS_PER_SECOND;
+
+/// PURE freshness classification of one sidecar status record (stale-status
+/// false-OK fix, 2026-07-06). A status is LIVE evidence ONLY when ALL hold:
+///
+/// 1. it carries a write stamp (`ts_ist_nanos > 0` — an old-format record
+///    without one can never prove liveness, fail-closed),
+/// 2. the stamp is at/after the caller's live FLOOR (the bridge incarnation
+///    start, advanced on every runtime-disabled wake) — so yesterday's
+///    EBS-persisted file at boot AND the pre-disable frozen file on a
+///    disable→re-enable cycle are both fossils, never proof,
+/// 3. the stamp is within [`GROWW_STATUS_LIVE_MAX_AGE_NANOS`] of now (a
+///    killed sidecar's last write ages out), and
+/// 4. the stamp is not absurdly in the future (garbage / clock-skew guard —
+///    a future stamp beyond the same window is rejected, fail-closed).
+///
+/// The incident class this closes: the sidecar status file is NEVER deleted
+/// on a runtime disable (the child is `start_kill`ed mid-write-cadence) nor
+/// at boot (EBS persists it across the daily stop/start), so a bare
+/// `event == streaming` read latched `streaming_observed`, fired a false
+/// "✅ Prices are flowing" `FeedRecovered` on every disable→re-enable, and
+/// pinned `tv_groww_ws_active = 1` all session while a dead-at-boot sidecar
+/// streamed nothing (blinding the groww-ws-inactive alarm).
+///
+/// EPOCH CONTRACT (2026-07-06 fix): both sides of the comparison are "IST
+/// epoch" nanos (UTC epoch + 19,800s) — `status_ts_ist_nanos` is stamped by
+/// the sidecar's `now_ist_nanos()` (the `replace(tzinfo=timezone.utc)`
+/// trick, same as `ms_to_ist_nanos`), and `now`/`floor` come from
+/// [`receipt_ist_nanos`]. The sidecar previously stamped the PLAIN UTC epoch
+/// (`.timestamp()` on an aware datetime ignores the zone), making condition
+/// 3 unsatisfiable (every real record read ≈19,800s old) — every fresh
+/// status was rejected forever. Ratchet:
+/// `test_sidecar_status_stamp_shares_the_ist_epoch_convention`.
+#[must_use]
+fn groww_status_is_live(
+    status_ts_ist_nanos: i64,
+    now_ist_nanos: i64,
+    live_floor_ist_nanos: i64,
+) -> bool {
+    status_ts_ist_nanos > 0
+        && status_ts_ist_nanos >= live_floor_ist_nanos
+        && now_ist_nanos.saturating_sub(status_ts_ist_nanos) <= GROWW_STATUS_LIVE_MAX_AGE_NANOS
+        && status_ts_ist_nanos.saturating_sub(now_ist_nanos) <= GROWW_STATUS_LIVE_MAX_AGE_NANOS
 }
 
 /// One capture-at-receipt tick line the Python sidecar appends. The fields are
@@ -465,6 +545,7 @@ fn validate_groww_tick(
         return Err(GrowwTickReject::NonPositiveSecurityId);
     }
     if !(MIN_PLAUSIBLE_TS_IST_NANOS..=MAX_PLAUSIBLE_TS_IST_NANOS)
+        // O(1) EXEMPT: RangeInclusive::contains — two-comparison O(1) bounds check (scanner heuristic misreads it as Vec::contains).
         .contains(&parsed.tick.ts_ist_nanos)
     {
         return Err(GrowwTickReject::TimestampOutOfRange);
@@ -504,6 +585,14 @@ fn receipt_ist_nanos() -> i64 {
         .timestamp_nanos_opt()
         .unwrap_or(0)
         .saturating_add(tickvault_common::constants::IST_UTC_OFFSET_NANOS)
+}
+
+/// IST epoch SECONDS "now" — the down-episode clock for the feed-down
+/// alerting latches (operator 2026-07-06). Same clock on the falling and
+/// rising edges, so `down_secs` is a well-formed duration regardless of the
+/// IST offset.
+fn ist_epoch_secs_now() -> u64 {
+    (receipt_ist_nanos() / 1_000_000_000).max(0) as u64
 }
 
 /// Pure liveness-advance decision (2026-07-03 frozen-snapshot masking fix):
@@ -585,17 +674,44 @@ fn row_received_at_with_capture(
     capture_ns_utc: Option<i64>,
     wake_receipt_ist_nanos: i64,
 ) -> Option<i64> {
-    if let Some(ns) = capture_ns_utc {
-        let capture_ist_nanos =
-            ns.saturating_add(tickvault_common::constants::IST_UTC_OFFSET_NANOS);
-        if capture_ist_nanos > GROWW_MIN_PLAUSIBLE_RECEIPT_IST_NANOS
-            && capture_ist_nanos
-                <= wake_receipt_ist_nanos.saturating_add(GROWW_FUTURE_TS_TOLERANCE_NANOS)
-        {
-            return Some(capture_ist_nanos);
-        }
-    }
-    row_received_at(wake_receipt_ist_nanos)
+    capture_stamp_ist_nanos(capture_ns_utc, wake_receipt_ist_nanos)
+        .or_else(|| row_received_at(wake_receipt_ist_nanos))
+}
+
+/// The plausibility-gated per-message capture stamp ONLY (no wake-stamp
+/// fallback) in IST nanos — the TRUSTED evidence of WHEN the sidecar actually
+/// captured the line at its NATS callback. Extracted (2026-07-06 replayed-
+/// backlog false-recovery fix) so the liveness/recovery signal can
+/// distinguish a line captured FRESH this episode from a replayed
+/// pre-disable / pre-respawn backlog line: only a stamp at/after the live
+/// floor may latch `streaming_observed`. A line WITHOUT a capture stamp
+/// (old-format / reconcile-sweep row) returns `None` — it still persists and
+/// folds, but it can never prove liveness (the sidecar's ≤1s status rewrite
+/// on real emits covers those flows via the freshness-gated status channel).
+/// Pure arithmetic — O(1), no clock read, no allocation per line.
+fn capture_stamp_ist_nanos(
+    capture_ns_utc: Option<i64>,
+    wake_receipt_ist_nanos: i64,
+) -> Option<i64> {
+    let ns = capture_ns_utc?;
+    let capture_ist_nanos = ns.saturating_add(tickvault_common::constants::IST_UTC_OFFSET_NANOS);
+    (capture_ist_nanos > GROWW_MIN_PLAUSIBLE_RECEIPT_IST_NANOS
+        && capture_ist_nanos
+            <= wake_receipt_ist_nanos.saturating_add(GROWW_FUTURE_TS_TOLERANCE_NANOS))
+    .then_some(capture_ist_nanos)
+}
+
+/// Same-IST-day gate for the presence fold (scoreboard PR-D fix round 1,
+/// review MEDIUM): `true` when the tick's own exchange stamp and the wake
+/// receipt wall-clock fall on the SAME IST day number. The presence
+/// bitsets discard the day component (`ts % 86400`), so a cross-day
+/// NDJSON re-tail replay (rotation-failure degraded mode / byte-0
+/// re-tail) would otherwise fold yesterday's session minutes into
+/// today's slots as `in_memory` truth. Same-day replay stays idempotent
+/// (fetch_or). Pure integer math — one divide + compare, zero-alloc.
+fn tick_is_same_ist_day(tick_ts_ist_nanos: i64, wake_receipt_ist_nanos: i64) -> bool {
+    const DAY_NANOS: i64 = 86_400 * 1_000_000_000;
+    tick_ts_ist_nanos.div_euclid(DAY_NANOS) == wake_receipt_ist_nanos.div_euclid(DAY_NANOS)
 }
 
 /// Monotonic, replay-stable `capture_seq` source (TICK-SEQ-01): `max(prev+1,
@@ -622,8 +738,12 @@ fn next_capture_seq(counter: &AtomicI64, seed_nanos: i64) -> i64 {
 /// testable; O(n) single drain (no per-line shift).
 fn drain_complete_prefix(residual: &mut Vec<u8>) -> Vec<u8> {
     match residual.iter().rposition(|&b| b == b'\n') {
+        // O(1) EXEMPT: begin — per-WAKE bounded residual drain (capped by the
+        // 4 MiB read budget), amortized across the lines it yields; documented
+        // "O(n) single drain" in the fn docs. Not a per-tick allocation site.
         Some(last_nl) => residual.drain(..=last_nl).collect(),
         None => Vec::new(),
+        // O(1) EXEMPT: end
     }
 }
 
@@ -682,6 +802,7 @@ fn spawn_tick_file_watcher(
     let watch_dir = tick_file_path.parent().unwrap_or_else(|| Path::new("."));
     watcher
         .watch(watch_dir, RecursiveMode::NonRecursive)
+        // O(1) EXEMPT: watcher-setup error path — once per bridge start.
         .with_context(|| format!("groww bridge: failed to watch dir {}", watch_dir.display()))?;
     Ok((watcher, wake_rx))
 }
@@ -742,6 +863,33 @@ pub(crate) struct GrowwBridgeState {
     /// (`should_restart_on_stall` via `last_tick_age_secs`) can fire instead of
     /// being masked by duplicate re-dumps.
     liveness_max_exchange_ts_nanos: i64,
+    /// Max plausibility-gated per-message capture stamp
+    /// ([`capture_stamp_ist_nanos`]) across the lines parsed by the MOST
+    /// RECENT `drain_new_data` call (reset each call; 0 = no trusted capture
+    /// stamp this wake). 2026-07-06 replayed-backlog false-recovery fix: the
+    /// run loop latches `streaming_observed` from the tick channel ONLY when
+    /// this is at/after the live floor — a drained pre-disable / pre-respawn
+    /// backlog (the sidecar keeps appending for ≤2s after a runtime disable;
+    /// a respawned bridge byte-0 re-tails already-captured bytes) carries
+    /// OLD capture stamps and must persist/fold WITHOUT firing FeedRecovered
+    /// ("Prices are flowing") or pinning `tv_groww_ws_active = 1` before the
+    /// relaunched sidecar has actually authenticated + subscribed + streamed.
+    wake_max_capture_ist_nanos: i64,
+    /// Byte-0 re-tail REPLAY-WINDOW flag (scoreboard PR-C review round 1,
+    /// 2026-07-11) — the SECOND condition of the Groww lag stale-capture
+    /// exclusion (`feed_lag_monitor::record_groww_tick`; the ≥60 s dwell
+    /// alone also matches LIVE backlog drains — the ILP-backpressure pause
+    /// + the respawn-backoff wake — whose lines were never recorded and
+    /// must be ADMITTED to the day lag histogram). TRUE while drained
+    /// bytes may REPLAY lines a previous bridge/process already recorded:
+    /// set at construction (a fresh bridge without a proven same-day
+    /// offset resume byte-0 re-tails), on a `len < offset` shrink reset,
+    /// and re-armed after an archive-tail drain (the caller's byte-0
+    /// live-file re-tail follows); cleared FALSE on a proven same-day
+    /// snapshot resume and whenever a drain wake finishes fully caught up
+    /// to the file end (everything after that is live). Affects ONLY the
+    /// lag-sample classification — persist/fold/dedup are untouched.
+    replay_window: bool,
 }
 
 impl GrowwBridgeState {
@@ -777,12 +925,32 @@ impl GrowwBridgeState {
             seeded: std::collections::HashSet::new(),
             capture_seq,
             offset: 0,
+            // O(1) EXEMPT: bridge-state construction — once per bridge start, not per tick.
             residual: Vec::new(),
             last_offset_persist: None,
             ilp_backpressure_active: false,
             active_drain_ist_day: None,
             liveness_max_exchange_ts_nanos: 0,
+            wake_max_capture_ist_nanos: 0,
+            // A fresh bridge byte-0 re-tails until a resume proves a
+            // preserved offset or a drain fully catches up — replayed
+            // lines must not double-count in the day lag histogram.
+            replay_window: true,
         }
+    }
+
+    /// TRUE when the most recent [`Self::drain_new_data`] call parsed at
+    /// least one line whose per-message capture stamp is at/after
+    /// `live_floor_ist_nanos` — i.e. the sidecar captured it FRESH this
+    /// episode, not a replayed pre-disable / pre-respawn backlog line. The
+    /// run loop gates the tick-channel `streaming_observed` latch (and only
+    /// that — persist/fold stay unconditional, zero-loss) on this, mirroring
+    /// the status channel's `groww_status_is_live` floor (2026-07-06
+    /// replayed-backlog false-recovery fix). Pure — O(1) compare.
+    #[must_use]
+    pub(crate) fn wake_had_fresh_capture(&self, live_floor_ist_nanos: i64) -> bool {
+        self.wake_max_capture_ist_nanos > 0
+            && self.wake_max_capture_ist_nanos >= live_floor_ist_nanos
     }
 
     /// Read the first [`GROWW_OFFSET_HEAD_LEN`] bytes of the capture file (the
@@ -790,10 +958,12 @@ impl GrowwBridgeState {
     /// empty head never matches a snapshot, forcing the byte-0 re-tail).
     async fn read_file_head(tick_file_path: &Path) -> String {
         let Ok(mut f) = File::open(tick_file_path).await else {
+            // O(1) EXEMPT: resume/persist identity-guard fail-safe arm — cold path (boot resume + throttled offset persist).
             return String::new();
         };
         let mut buf = [0u8; GROWW_OFFSET_HEAD_LEN];
         let Ok(n) = f.read(&mut buf).await else {
+            // O(1) EXEMPT: resume/persist identity-guard fail-safe arm — cold path.
             return String::new();
         };
         String::from_utf8_lossy(&buf[..n]).into_owned()
@@ -844,6 +1014,9 @@ impl GrowwBridgeState {
                 )
                 .await;
                 self.offset = 0;
+                // The archive drain may have cleared the flag on catch-up;
+                // the byte-0 live-file tail that follows is a re-tail.
+                self.replay_window = true;
                 info!("groww bridge: capture file absent — snapshot ignored");
                 metrics::counter!("tv_groww_bridge_offset_resume_total", "outcome" => "no_file")
                     .increment(1);
@@ -855,6 +1028,11 @@ impl GrowwBridgeState {
             Some((offset, capture_seq)) => {
                 self.offset = offset;
                 self.capture_seq.store(capture_seq, Ordering::Relaxed);
+                // Proven same-day continuation from the flushed offset:
+                // every byte past it was never read — no replay possible,
+                // so post-downtime backlog lines keep their true lag in
+                // the day histogram (review round 1, 2026-07-11).
+                self.replay_window = false;
                 info!(
                     offset,
                     capture_seq,
@@ -873,6 +1051,9 @@ impl GrowwBridgeState {
                 )
                 .await;
                 self.offset = 0;
+                // Same re-arm as the absent-file arm: the byte-0 re-tail
+                // of the rotated/replaced live file follows.
+                self.replay_window = true;
                 info!(
                     snapshot_offset = snap.offset,
                     file_len = current_len,
@@ -1033,6 +1214,10 @@ impl GrowwBridgeState {
         tick_file_path: &Path,
         feed_health: &tickvault_common::feed_health::FeedHealthRegistry,
     ) -> bool {
+        // Reset the per-wake fresh-capture evidence BEFORE any early return
+        // so a quiet/failed wake can never re-report the PREVIOUS wake's
+        // freshness (2026-07-06 replayed-backlog false-recovery fix).
+        self.wake_max_capture_ist_nanos = 0;
         let mut file = match File::open(tick_file_path).await {
             Ok(f) => f,
             // Sidecar not started yet — nothing to read.
@@ -1046,13 +1231,21 @@ impl GrowwBridgeState {
             }
         };
         if len < self.offset {
-            // File shrank (rotation/truncate) — restart from the top.
+            // File shrank (rotation/truncate) — restart from the top. The
+            // byte-0 re-tail may replay already-recorded lines, so the lag
+            // classifier's replay window re-arms (review round 1,
+            // 2026-07-11).
             self.offset = 0;
             self.residual.clear();
+            self.replay_window = true;
         }
         if len == self.offset {
             return false; // nothing new
         }
+        // The lag classification for THIS wake's lines uses the flag as it
+        // stood when the bytes were read; a catch-up below clears it for
+        // the NEXT wake only.
+        let wake_replay_window = self.replay_window;
         if file.seek(SeekFrom::Start(self.offset)).await.is_err() {
             return false;
         }
@@ -1071,9 +1264,19 @@ impl GrowwBridgeState {
                 "groww bridge: ILP buffer over cap — pausing NDJSON consumption until QuestDB recovers (capture file holds the tail; zero loss)"
             );
         }
+        // O(1) EXEMPT: per-WAKE read buffer, bounded by wake_read_budget (≤ 4 MiB take()); not per-tick.
         let mut chunk: Vec<u8> = Vec::new();
         match (&mut file).take(to_read).read_to_end(&mut chunk).await {
-            Ok(n) => self.offset = self.offset.saturating_add(n as u64),
+            Ok(n) => {
+                self.offset = self.offset.saturating_add(n as u64);
+                if self.offset >= len {
+                    // Fully caught up to the file end sampled this wake —
+                    // any replayable prefix is behind us; every later byte
+                    // is live (the flag re-arms only on a fresh
+                    // state/shrink/failed resume).
+                    self.replay_window = false;
+                }
+            }
             Err(err) => {
                 warn!(?err, "groww bridge: read failed");
                 return false;
@@ -1116,7 +1319,7 @@ impl GrowwBridgeState {
             if line.is_empty() {
                 continue;
             }
-            let parsed = match parse_groww_tick_line(line) {
+            let mut parsed = match parse_groww_tick_line(line) {
                 Ok(p) => p,
                 Err(err) => {
                     error!(?err, "groww bridge: skipping malformed tick line");
@@ -1140,96 +1343,161 @@ impl GrowwBridgeState {
             parsed_any = true;
             wake_max_exchange_ts_nanos = wake_max_exchange_ts_nanos.max(parsed.tick.ts_ist_nanos);
             let seq = next_capture_seq(&self.capture_seq, parsed.tick.ts_ist_nanos);
+            // Trusted per-message capture stamp (None for old-format /
+            // reconcile-sweep rows): tracked as the wake max so the run loop
+            // can gate the streaming latch on capture FRESHNESS — a replayed
+            // pre-disable backlog line carries an OLD stamp and must never
+            // prove liveness (2026-07-06 false-recovery fix). The persisted
+            // `received_at` keeps the exact pre-fix semantics (stamp, else
+            // per-wake fallback).
+            let capture_ist = capture_stamp_ist_nanos(parsed.capture_ns, wake_receipt_ist_nanos);
+            if let Some(c) = capture_ist {
+                self.wake_max_capture_ist_nanos = self.wake_max_capture_ist_nanos.max(c);
+            }
+            // Scoreboard PR-C: Groww exchange→capture lag fold — operands
+            // the drain ALREADY computed (zero new clock reads, zero
+            // allocation). Lines without a capture stamp (old-format /
+            // reconcile-sweep) and ≥60s-stale captures INSIDE a byte-0
+            // re-tail replay window are EXCLUDED + counted inside
+            // record_groww_tick; ≥60s-stale captures on a PRESERVED offset
+            // (ILP-backpressure pause / respawn-backoff backlog — review
+            // round 1, 2026-07-11) are ADMITTED to the day histogram only;
+            // fresh admitted samples feed the trailing-60s ring (the
+            // tv_groww_exchange_lag_p99_seconds publisher) + the day
+            // histogram (the 15:45 scorecard lag columns) at Groww's
+            // native MILLISECOND precision.
+            tickvault_core::pipeline::feed_lag_monitor::record_groww_tick(
+                capture_ist,
+                wake_receipt_ist_nanos,
+                parsed.tick.ts_ist_nanos,
+                wake_replay_window,
+            );
+            // Scoreboard PR-D: per-instrument session-minute presence fold
+            // — co-located with the lag fold above (post-validate). The
+            // minute derives from the tick's own millisecond exchange
+            // stamp (one integer division — zero new clock reads); the
+            // (id, segment) key is the SAME composite the shared 21-TF
+            // engine folds on. validate_groww_tick already rejected
+            // security_id <= 0, so the u64 conversion cannot fail.
+            // SAME-IST-DAY gate (PR-D review round 1, MEDIUM): the presence
+            // bitsets carry no day component (`ts % 86400`), and
+            // validate_groww_tick rejects FUTURE skew only — a cross-day
+            // NDJSON re-tail replay (the documented rotation-failure
+            // degraded mode / a byte-0 re-tail) would otherwise fold
+            // YESTERDAY's session minutes into today's registered slots as
+            // 'in_memory' truth. One divide + compare, zero-alloc — the
+            // Dhan fold sites are already behind the tick processor's
+            // is_today_ist stale-day gate.
+            if tick_is_same_ist_day(parsed.tick.ts_ist_nanos, wake_receipt_ist_nanos) {
+                tickvault_core::pipeline::feed_presence::record_presence(
+                    Feed::Groww,
+                    u64::try_from(parsed.tick.security_id).unwrap_or(0),
+                    parsed.tick.segment.binary_code(),
+                    u32::try_from(parsed.tick.ts_ist_nanos / 1_000_000_000).unwrap_or(0),
+                );
+            }
             let row_received =
                 row_received_at_with_capture(parsed.capture_ns, wake_receipt_ist_nanos);
-            if let Err(err) =
-                self.live_writer
-                    .append_row(&live_tick_row(&parsed, seq, row_received))
-            {
-                error!(
-                    ?err,
-                    "groww bridge: shared ticks (feed=groww) append failed"
-                );
-            } else {
-                // The dashboard counter is bumped ONLY on a successful flush below,
-                // by the number of rows actually persisted. Stamp the WALL-CLOCK
-                // receipt time (NOT the exchange ts) for the most-recent row.
-                last_receipt_ist_nanos = receipt_ist_nanos();
-            }
-            // Fold through the SHARED 21-TF engine (ONE common candle engine).
-            let pt = match build_parsed_tick(&parsed) {
-                Ok(pt) => pt,
-                Err(reason) => {
-                    error!(
-                        ?reason,
-                        security_id = parsed.tick.security_id,
-                        "groww bridge: tick cannot fold through the shared 21-TF engine (width guard)"
-                    );
-                    continue;
-                }
-            };
-            let seg_code = pt.exchange_segment_code;
-            let key = (pt.security_id, seg_code);
-            let cum_volume_u64 = match u64::try_from(parsed.tick.cum_volume) {
-                Ok(v) => v,
-                Err(_) => {
-                    error!(
-                        security_id = parsed.tick.security_id,
-                        cum_volume = parsed.tick.cum_volume,
-                        "groww bridge: negative cum_volume past validation — dropping tick"
-                    );
-                    continue;
-                }
-            };
-            // First sight: register + seed the cumulative baseline (idempotent).
-            if self.seeded.insert(key) {
-                self.aggregator.pre_populate(std::iter::once(key));
-                self.aggregator
-                    .seed_cumulative(pt.security_id, seg_code, cum_volume_u64);
-            }
-            // Route every sealed bar across ALL 21 TFs through the SHARED
-            // seal-writer chain, tagged feed=Groww.
-            let stats = self.aggregator.consume_tick(
-                &pt,
-                seg_code,
-                FeedStrategy::GROWW,
-                Some(cum_volume_u64),
-                |tf, state| {
-                    let Some(sender) = global_seal_sender() else {
+            // C2 (feed convergence): the ordered enrich → persist → aggregate
+            // per-tick consumer sequence is the ONE shared `consume_feed_tick`
+            // core (`tickvault_core::pipeline::feed_consumer`) — the same core
+            // the Dhan tick processor delegates to. The core NEVER invokes the
+            // enrich stage for Feed::Groww (no greeks/OI — plan edge E5), and
+            // pins the persist-before-fold order. Monomorphized closures over
+            // the private ParsedGrowwTick — zero-alloc, no dyn.
+            let live_writer = &mut self.live_writer;
+            let seeded = &mut self.seeded;
+            let aggregator = &self.aggregator;
+            tickvault_core::pipeline::feed_consumer::consume_feed_tick(
+                Feed::Groww,
+                &mut parsed,
+                |_| {}, // Groww has no enrichment stage; the core gates it anyway.
+                |p| {
+                    if let Err(err) = live_writer.append_row(&live_tick_row(p, seq, row_received)) {
+                        error!(
+                            ?err,
+                            "groww bridge: shared ticks (feed=groww) append failed"
+                        );
+                    } else {
+                        // The dashboard counter is bumped ONLY on a successful flush below,
+                        // by the number of rows actually persisted. Stamp the WALL-CLOCK
+                        // receipt time (NOT the exchange ts) for the most-recent row.
+                        last_receipt_ist_nanos = receipt_ist_nanos();
+                    }
+                },
+                |p| {
+                    // Fold through the SHARED 21-TF engine (ONE common candle engine).
+                    let pt = match build_parsed_tick(p) {
+                        Ok(pt) => pt,
+                        Err(reason) => {
+                            error!(
+                                ?reason,
+                                security_id = p.tick.security_id,
+                                "groww bridge: tick cannot fold through the shared 21-TF engine (width guard)"
+                            );
+                            return;
+                        }
+                    };
+                    let seg_code = pt.exchange_segment_code;
+                    let key = (pt.security_id, seg_code);
+                    let Ok(cum_volume_u64) = u64::try_from(p.tick.cum_volume) else {
+                        error!(
+                            security_id = p.tick.security_id,
+                            cum_volume = p.tick.cum_volume,
+                            "groww bridge: negative cum_volume past validation — dropping tick"
+                        );
                         return;
                     };
-                    crate::seal_routing::route_seal(
-                        crate::seal_routing::SealRouteParams {
-                            feed: Feed::Groww,
-                            drop_d1: false,
-                            prev_day_cache: None,
-                            heartbeat: None,
-                            feed_health_on_m1: Some(feed_health),
-                        },
-                        pt.security_id,
+                    // First sight: register + seed the cumulative baseline (idempotent).
+                    if seeded.insert(key) {
+                        aggregator.pre_populate(std::iter::once(key));
+                        aggregator.seed_cumulative(pt.security_id, seg_code, cum_volume_u64);
+                    }
+                    // Route every sealed bar across ALL 21 TFs through the SHARED
+                    // seal-writer chain, tagged feed=Groww.
+                    let stats = aggregator.consume_tick(
+                        &pt,
                         seg_code,
-                        tf,
-                        state,
-                        sender,
+                        FeedStrategy::GROWW,
+                        Some(cum_volume_u64),
+                        |tf, state| {
+                            let Some(sender) = global_seal_sender() else {
+                                return;
+                            };
+                            crate::seal_routing::route_seal(
+                                crate::seal_routing::SealRouteParams {
+                                    feed: Feed::Groww,
+                                    drop_d1: false,
+                                    prev_day_cache: None,
+                                    heartbeat: None,
+                                    feed_health_on_m1: Some(feed_health),
+                                },
+                                pt.security_id,
+                                seg_code,
+                                tf,
+                                state,
+                                sender,
+                            );
+                        },
                     );
+                    if stats.late_count > 0 {
+                        // AGGREGATOR-LATE-01 visibility (2026-07-03): Groww late
+                        // discards were previously COMPLETELY silent — this path
+                        // captured `stats` but never read `late_count` (no counter,
+                        // no log), so a Discard-policy drop wave was invisible. Count
+                        // them with the `feed=groww` label; the Dhan site keeps its
+                        // label-less series (mirroring the `tv_seal_mpsc_dropped_total`
+                        // per-feed labelling precedent in `seal_routing.rs`) so the
+                        // existing tv-aggregator-late-tick-sustained alert series is
+                        // not renamed or broken.
+                        metrics::counter!("tv_aggregator_late_ticks_discarded_total", "feed" => "groww")
+                            .increment(u64::from(stats.late_count));
+                    }
+                    if !stats.instrument_found {
+                        aggregator.pre_populate(std::iter::once(key));
+                    }
                 },
             );
-            if stats.late_count > 0 {
-                // AGGREGATOR-LATE-01 visibility (2026-07-03): Groww late
-                // discards were previously COMPLETELY silent — this path
-                // captured `stats` but never read `late_count` (no counter,
-                // no log), so a Discard-policy drop wave was invisible. Count
-                // them with the `feed=groww` label; the Dhan site keeps its
-                // label-less series (mirroring the `tv_seal_mpsc_dropped_total`
-                // per-feed labelling precedent in `seal_routing.rs`) so the
-                // existing tv-aggregator-late-tick-sustained alert series is
-                // not renamed or broken.
-                metrics::counter!("tv_aggregator_late_ticks_discarded_total", "feed" => "groww")
-                    .increment(u64::from(stats.late_count));
-            }
-            if !stats.instrument_found {
-                self.aggregator.pre_populate(std::iter::once(key));
-            }
         }
         // Flush the buffered rows. The dashboard "ticks" counter is bumped ONLY by
         // the number of rows ACTUALLY persisted to QuestDB (the flush return value),
@@ -1347,6 +1615,17 @@ fn spawn_groww_ist_midnight_force_seal(
             // SAME helper the Dhan IST-midnight force-seal uses.
             let sleep_secs = tickvault_common::market_hours::secs_until_next_ist_midnight().max(1);
             tokio::time::sleep(Duration::from_secs(sleep_secs)).await;
+
+            // Scoreboard PR-C: reset the Groww DAY lag histogram at every
+            // IST midnight — BEFORE the trading-day / feed-enabled gates
+            // below (a Saturday-midnight `continue` must still clear
+            // Friday's distribution before the next trading day fills it).
+            // Cold, O(96); an empty/disabled feed's reset is a no-op.
+            tickvault_core::pipeline::feed_lag_monitor::reset_day_lag_histogram(Feed::Groww);
+            // Scoreboard PR-D: reset the Groww presence bitsets at the same
+            // boundary (belt-and-braces — registration's day-change clear
+            // is the backstop). Cold, O(slots × 6).
+            tickvault_core::pipeline::feed_presence::reset_daily(Feed::Groww);
 
             // Only force-seal on trading days — a non-trading-day midnight has no
             // open buckets worth flushing (mirrors the Dhan task).
@@ -1675,8 +1954,10 @@ pub const GROWW_ARCHIVE_DRAIN_MAX_WAKES: u32 = 4096;
 #[must_use]
 pub fn archive_path_for_ist_day(tick_file_path: &Path, ist_day: i64) -> PathBuf {
     let date = chrono::DateTime::<chrono::Utc>::from_timestamp(ist_day.saturating_mul(86_400), 0)
+        // O(1) EXEMPT: IST-midnight archive-path naming — once per day/rotation, cold path.
         .map(|d| d.format("%Y%m%d").to_string())
         .unwrap_or_default();
+    // O(1) EXEMPT: archive-path naming — once per rotation, cold path.
     let name = format!("live-ticks-{date}.ndjson");
     tick_file_path
         .parent()
@@ -1721,6 +2002,18 @@ pub struct GrowwAuditLatches {
     /// closed-market boot announces exactly once and a genuine reconnect
     /// announces exactly once more.
     pub boot_connect_announced: std::sync::atomic::AtomicBool,
+    /// Feed-down alerting (operator 2026-07-06): a `FeedDown` Telegram was
+    /// consumed for the CURRENT down episode — set once on the FIRST falling
+    /// edge (feed disable / bridge death), cleared only when the streaming
+    /// rising edge fires the honest `FeedRecovered`. Edge-triggered per
+    /// audit-findings Rule 4: one DOWN page per episode, never per idle turn.
+    pub down_announced: std::sync::atomic::AtomicBool,
+    /// IST epoch SECONDS of the FIRST falling edge of the current down
+    /// episode (0 = not down). First-down-wins CAS (mirror of the Dhan
+    /// `record_disconnect` total-downtime semantics) so the recovery's
+    /// `down_secs` spans intermediate retry failures / repeated bridge
+    /// deaths, not just the latest one.
+    pub down_since_epoch_secs: std::sync::atomic::AtomicU64,
 }
 
 impl GrowwAuditLatches {
@@ -1739,6 +2032,49 @@ impl GrowwAuditLatches {
     pub fn rearm_boot_connect(&self) {
         self.boot_connect_announced
             .store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Consume the feed-DOWN falling edge (operator 2026-07-06): stamps the
+    /// episode's first-down instant (first-down-wins CAS — a second falling
+    /// edge inside the same episode keeps the original stamp so `down_secs`
+    /// spans the whole episode) and returns `true` exactly once per DOWN
+    /// episode. The caller fires ONE `FeedDown` Telegram on `true`; repeated
+    /// falling edges (bridge respawn storms, idle disable turns) read `false`
+    /// until [`Self::take_feed_recovery`] closes the episode.
+    pub fn try_announce_feed_down(&self, now_epoch_secs: u64) -> bool {
+        // First-down-wins: only stamp when no episode is in progress (0).
+        // A lost CAS means an earlier falling edge already stamped this
+        // episode — exactly the desired outcome, so the Err is discarded
+        // into a named binding (must_use satisfied, no behavior on Err).
+        let _first_down_stamp = self.down_since_epoch_secs.compare_exchange(
+            0,
+            now_epoch_secs.max(1),
+            std::sync::atomic::Ordering::Relaxed,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        !self
+            .down_announced
+            .swap(true, std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Close the feed-DOWN episode on the STREAMING rising edge: returns
+    /// `Some(down_secs)` exactly once per episode (and re-arms the latch for
+    /// the next episode), `None` when no episode is in progress. The caller
+    /// fires ONE honest `FeedRecovered` Telegram on `Some` — recovery is
+    /// claimed on ticks/streaming, never on mere socket-connect. Call ONLY
+    /// when the Telegram notifier is deliverable: an unfilled boot-ordering
+    /// slot must DEFER (skip the call) so the episode is delayed, never lost.
+    pub fn take_feed_recovery(&self, now_epoch_secs: u64) -> Option<u64> {
+        if !self
+            .down_announced
+            .swap(false, std::sync::atomic::Ordering::Relaxed)
+        {
+            return None;
+        }
+        let since = self
+            .down_since_epoch_secs
+            .swap(0, std::sync::atomic::Ordering::Relaxed);
+        Some(now_epoch_secs.saturating_sub(since))
     }
 }
 
@@ -1831,6 +2167,7 @@ pub fn spawn_supervised_groww_bridge(
         // bridge task respawns.
         let aggregator = MultiTfAggregator::with_capacity(GROWW_AGGREGATOR_CAPACITY);
         spawn_groww_ist_midnight_force_seal(
+            // O(1) EXEMPT: spawn-time wiring (once per process) — MultiTfAggregator::clone shares the same papaya Arc.
             aggregator.clone(),
             Arc::clone(&feed_runtime),
             Arc::clone(&trading_calendar),
@@ -1841,6 +2178,7 @@ pub fn spawn_supervised_groww_bridge(
         // duplicate driver tasks. The clone shares the SAME papaya map + the
         // SAME event-time watermark the bridge's consume path advances.
         spawn_groww_catchup_seal(
+            // O(1) EXEMPT: spawn-time wiring (once per process) — shares the same papaya Arc.
             aggregator.clone(),
             Arc::clone(&feed_runtime),
             trading_calendar,
@@ -1897,6 +2235,8 @@ async fn supervise_groww_bridge_loop(
         loop {
             let started = std::time::Instant::now();
             let handle = tokio::spawn(run_groww_bridge(
+                // O(1) EXEMPT: begin — supervisor respawn wiring (at most one per
+                // bridge death + backoff): Arc/PathBuf/config handle clones, cold path.
                 qdb.clone(),
                 tick_file_path.clone(),
                 status_file_path.clone(),
@@ -1905,10 +2245,19 @@ async fn supervise_groww_bridge_loop(
                 ws_audit_tx.clone(),
                 notifier_slot.clone(),
                 aggregator.clone(),
+                // O(1) EXEMPT: end
                 Arc::clone(&audit_latches),
                 Arc::clone(&capture_seq),
+                conn_id,
             ));
             let reason = match handle.await {
+                // PANIC HONESTY (house standard: tick-flush-worker-error-codes.md
+                // §1): this arm engages in UNWIND (dev/test) builds only — the
+                // workspace release profile sets `panic = "abort"`, so in the
+                // production binary a panic inside run_groww_bridge ABORTS the
+                // whole process before a JoinError can exist. Release-build
+                // recovery for that class is the EXTERNAL process restart +
+                // the boot Telegram chain, never this supervisor.
                 Err(err) if err.is_panic() => "panic",
                 // A non-panic JoinError = the inner task was CANCELLED — the
                 // runtime is shutting down (finding M2). Do NOT respawn onto a
@@ -1950,6 +2299,49 @@ async fn supervise_groww_bridge_loop(
                 // re-arm the boot-connect edge so the respawned bridge
                 // announces the (re)connected socket exactly once.
                 audit_latches.rearm_boot_connect();
+                // Feed-down alerting (operator 2026-07-06): the connected
+                // feed just went DOWN — the previous DB-row-only silence was
+                // the incident class. ONE FeedDown Telegram per DOWN episode
+                // (latched; a respawn storm never re-pages), fail-open when
+                // the lazily-filled slot is still empty at boot ordering
+                // (audit row above is already written; the page is skipped,
+                // never blocks the respawn). Cold path — event-driven, never
+                // per tick. The connected-level gauge drops to 0 so the
+                // CloudWatch inactivity alarm sees the outage too.
+                //
+                // PANIC HONESTY (tick-flush-worker-error-codes.md §1 house
+                // standard): this whole bridge-death falling-edge block
+                // (audit row + gauge→0 + FeedDown page) is reachable for
+                // non-panic exits / UNWIND (dev/test) builds ONLY. In the
+                // release (panic = "abort") binary a bridge panic — e.g. an
+                // overflow-checks trip — aborts the PROCESS: no FeedDown
+                // page fires, and the gauge goes MISSING (the exporter is
+                // gone; notBreaching keeps the groww-ws-inactive alarm
+                // SILENT), not 0. Visibility + recovery for that class are
+                // the external process restart + the boot/StartupComplete
+                // Telegram chain. No in-process panic self-healing is
+                // claimed for release builds.
+                metrics::gauge!("tv_groww_ws_active").set(0.0);
+                if audit_latches.try_announce_feed_down(ist_epoch_secs_now())
+                    && let Some(notifier) = notifier_slot.as_ref().and_then(|slot| slot.load_full())
+                {
+                    notifier.notify(tickvault_core::notification::NotificationEvent::FeedDown {
+                        feed: Feed::Groww.display_name().to_string(), // O(1) EXEMPT: cold path — once per DOWN episode
+                        reason: "internal restart — recovering automatically".to_string(), // O(1) EXEMPT: cold path — once per DOWN episode
+                        // Calendar-aware (2026-07-06 fix): never page High +
+                        // SNS on a Saturday manual run / NSE weekday holiday
+                        // (the 2026-05-09 false-page class).
+                        market_open: tickvault_common::market_hours::is_trading_session_now(),
+                        // A bridge death that REACHES this arm is
+                        // auto-recovering (the supervisor respawns it), so
+                        // the auto-retry trailer is honest for every exit
+                        // that can fire this page. A release-build panic
+                        // never reaches here (panic = "abort" — process
+                        // abort; see the PANIC HONESTY note above): recovery
+                        // there is the external process restart.
+                        operator_initiated: false,
+                    });
+                }
             }
             error!(
                 code =
@@ -1997,12 +2389,41 @@ pub const GROWW_SHARDS_DIR_DEFAULT: &str = "data/groww/shards";
 /// sort correctly in `ls`).
 #[must_use]
 pub fn shard_files(shards_root: &Path, conn_id: usize) -> GrowwShardFiles {
+    // O(1) EXEMPT: fleet path derivation — once per connection spawn/scale event, cold path.
     let dir = shards_root.join(format!("c{conn_id:02}"));
     GrowwShardFiles {
         conn_id,
+        // O(1) EXEMPT: PathBuf clone at shard-path derivation — cold fleet path.
         watch_dir: dir.clone(),
         tick_file: dir.join("live-ticks.ndjson"),
         status_file: dir.join("groww-status.json"),
+    }
+}
+
+/// Best-effort removal of one connection's subscribe-proof status file
+/// (hardening 2026-07-06): the status path is undated and the sidecar never
+/// deletes it, so a killed connection would otherwise keep "proving" its
+/// subscription forever — pinning the ladder's plateau gate at the fleet's
+/// historical maximum. Called on fleet scale-down (after the child abort)
+/// and by the ladder's start-of-run sweep. Returns `true` when a file was
+/// actually removed; a missing file is a clean no-op.
+pub(crate) fn remove_subscribe_proof(shards_root: &Path, conn_id: usize) -> bool {
+    let status_file = shard_files(shards_root, conn_id).status_file;
+    // O(1) EXEMPT: best-effort proof-file removal — fleet scale-down / boot sweep, cold path.
+    match std::fs::remove_file(&status_file) {
+        Ok(()) => true,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => false,
+        Err(err) => {
+            // Best-effort: the ladder's freshness gate ages the leftover
+            // out within its bound, so this is degraded, never silent.
+            tracing::warn!(
+                conn_id,
+                error = %err,
+                path = %status_file.display(),
+                "groww shard scale-down: subscribe-proof status file removal failed"
+            );
+            false
+        }
     }
 }
 
@@ -2037,11 +2458,13 @@ pub fn spawn_supervised_groww_shard_bridges(
         // force-seal, one catch-up seal, one capture-seq counter.
         let aggregator = MultiTfAggregator::with_capacity(GROWW_AGGREGATOR_CAPACITY);
         spawn_groww_ist_midnight_force_seal(
+            // O(1) EXEMPT: fleet spawn-time wiring (once per process) — shares the same papaya Arc.
             aggregator.clone(),
             Arc::clone(&feed_runtime),
             Arc::clone(&trading_calendar),
         );
         spawn_groww_catchup_seal(
+            // O(1) EXEMPT: fleet spawn-time wiring (once per process) — shares the same papaya Arc.
             aggregator.clone(),
             Arc::clone(&feed_runtime),
             trading_calendar,
@@ -2055,6 +2478,8 @@ pub fn spawn_supervised_groww_shard_bridges(
             // ws_event_audit rows stay per-connection honest).
             let audit_latches = Arc::new(GrowwAuditLatches::default());
             handles.push(tokio::spawn(supervise_groww_bridge_loop(
+                // O(1) EXEMPT: begin — per-conn fleet spawn wiring (once per connection
+                // at scale-up): Arc/config handle clones, cold path.
                 qdb.clone(),
                 files.tick_file,
                 files.status_file,
@@ -2063,6 +2488,7 @@ pub fn spawn_supervised_groww_shard_bridges(
                 ws_audit_tx.clone(),
                 notifier_slot.clone(),
                 aggregator.clone(),
+                // O(1) EXEMPT: end
                 audit_latches,
                 Arc::clone(&capture_seq),
                 Some(conn_id),
@@ -2138,6 +2564,13 @@ pub async fn run_groww_bridge(
     // monotonic across N connections. The single-conn wrapper passes a
     // fresh private counter — behavior-identical to the pre-scale path.
     capture_seq: Arc<AtomicI64>,
+    // §34 fleet identity (exam-fix 2026-07-06): `Some(n)` routes the
+    // boot-connect Telegram ping through the FLEET-scoped alert coalescer
+    // (at most ONE connected ping per 60s window across ALL shard bridges,
+    // instead of one per connection per episode); `None` (single-conn path)
+    // keeps today's semantics byte-identical. ws_event_audit rows, logs and
+    // feed-health stay per-connection either way — only Telegram coalesces.
+    conn_id: Option<usize>,
 ) {
     info!(
         path = %tick_file_path.display(),
@@ -2190,6 +2623,59 @@ pub async fn run_groww_bridge(
     // and the respawned bridge's first rising edge classifies as RECONNECTED, so the
     // forensic chain never reads Connected→Connected with no disconnect between.
 
+    // Groww liveness gauges (operator 2026-07-06 feed-down alerting).
+    // Handles registered LAZILY on first publish (2026-07-06 stale-status
+    // hardening): a session where Groww is never enabled must leave BOTH
+    // metrics MISSING (the prometheus exporter renders a registered gauge at
+    // its last value on every scrape), so the groww-ws-inactive alarm's
+    // notBreaching keeps a deliberate config/runtime disable silent —
+    // mirroring the order-update precedent (tv_order_update_ws_active is
+    // only registered after a successful connect). Once registered, the
+    // handle is cached — O(1) per wake, static &'static str labels, zero
+    // per-wake allocation. Published from THIS loop (≤1s wake cadence)
+    // because the Dhan pool watchdog is Dhan-lane-spawned and never runs on
+    // a groww-only boot.
+    // - `tv_groww_ws_active`: CONNECTED-level 0/1. Registered ONLY at the
+    //   FIRST connected episode of the session (2026-07-06 boot-grace fix —
+    //   mirrors the order-update precedent exactly): the Groww activation
+    //   chain (CSV pull-until-success → sidecar launch incl. possible venv
+    //   re-provision → SSM token read → NATS connect → subscribe) routinely
+    //   exceeds the alarm's 60s×2 shape on cold/slow boots, so publishing an
+    //   honest 0 from the first enabled wake produced a false pre-open
+    //   ALARM/OK page pair on ordinary boot mornings. MISSING + notBreaching
+    //   keeps the alarm silent for a boot chain of ANY length; once
+    //   registered, 0/1 publishes every wake so a mid-session outage, a
+    //   failed disable→re-enable, and a runtime disable all show. Honest
+    //   envelope: a sidecar DEAD AT BOOT (never connects) leaves the metric
+    //   missing — that class is paged by the sidecar supervisor's reject
+    //   alerts + the FEED-STALL-01 watchdog, not by this alarm.
+    // - `tv_feed_last_tick_age_seconds{feed="groww"}`: seconds since the
+    //   feed's most-recent tick; SKIPPED (never a fake 0, not even the
+    //   registration-default 0) until the first tick of the session so
+    //   missing-data + notBreaching stays silent.
+    let mut m_groww_active: Option<metrics::Gauge> = None;
+    let mut m_groww_tick_age: Option<metrics::Gauge> = None;
+    // Live-evidence floor (2026-07-06 false-recovery fix): sidecar evidence
+    // — a status record's write stamp (`groww_status_is_live`) OR a tick
+    // line's per-message capture stamp (`wake_had_fresh_capture`) — only
+    // counts when it is at/after this floor. Initialized to THIS bridge
+    // incarnation's start (yesterday's EBS-persisted file / a pre-panic
+    // byte-0 re-tail can never latch) and advanced on every runtime-disabled
+    // wake (the pre-disable frozen status file AND the ≤2s pre-disable
+    // NDJSON backlog can never close a DOWN episode after a re-enable).
+    let mut live_floor_ist_nanos: i64 = receipt_ist_nanos();
+    // Episode latch for the one-shot `subscribed` status record (2026-07-06
+    // boot-deferral fix): the sidecar writes `subscribed` exactly ONCE and
+    // only rewrites on real emits, so on a tickless window the record is
+    // fresh for just GROWW_STATUS_LIVE_MAX_AGE_NANOS. Once observed FRESH
+    // (past the floor), this latch keeps the status-evidence path open so
+    // the boot-connect notifier deferral stays "delayed, never lost" and the
+    // connected gauge does not require the record to STILL be fresh at
+    // announce time. Reset on every disabled wake (with the floor advance).
+    let mut fresh_status_seen_this_episode = false;
+    // One-per-incarnation triage breadcrumb for a skipped stale status file.
+    let mut stale_status_logged = false;
+
     loop {
         // Wake on EITHER a filesystem event (zero-latency) OR the fallback timer.
         // The fallback also re-polls the status file (cheap) so a `subscribed`/
@@ -2235,7 +2721,8 @@ pub async fn run_groww_bridge(
                 .audited_connected
                 .load(std::sync::atomic::Ordering::Relaxed)
             {
-                let kind = if tickvault_common::market_hours::is_within_market_hours_ist() {
+                let in_market = tickvault_common::market_hours::is_within_market_hours_ist();
+                let kind = if in_market {
                     WsEventKind::Disconnected
                 } else {
                     WsEventKind::DisconnectedOffHours
@@ -2249,6 +2736,33 @@ pub async fn run_groww_bridge(
                 audit_latches
                     .prior_disconnect
                     .store(true, std::sync::atomic::Ordering::Relaxed);
+                // Feed-down alerting (operator 2026-07-06): the connected
+                // feed just went DOWN — the previous DB-row-only silence was
+                // the incident class. ONE FeedDown Telegram per DOWN episode
+                // (latched; repeat idle disable turns never re-page).
+                // Fail-open on an unfilled boot-ordering notifier slot: the
+                // audit row above is already written, the latch is still
+                // set, only the page is skipped — the disable path is never
+                // blocked. Cold path — event-driven, never per tick.
+                if audit_latches.try_announce_feed_down(ist_epoch_secs_now())
+                    && let Some(notifier) = notifier_slot.as_ref().and_then(|slot| slot.load_full())
+                {
+                    notifier.notify(tickvault_core::notification::NotificationEvent::FeedDown {
+                        feed: Feed::Groww.display_name().to_string(), // O(1) EXEMPT: cold path — once per DOWN episode
+                        reason: "feed switched off by the operator".to_string(), // O(1) EXEMPT: cold path — once per DOWN episode
+                        // Calendar-aware (2026-07-06 fix): severity must not
+                        // page High + SNS inside the 09:00–15:30 clock window
+                        // on a Saturday manual run / NSE weekday holiday —
+                        // the 2026-05-09 false-page class. The audit-row kind
+                        // above keeps the time-of-day split (Dhan parity).
+                        market_open: tickvault_common::market_hours::is_trading_session_now(),
+                        // A runtime disable is a DELIBERATE toggle (the
+                        // bearer-gated feeds page) — the body must say "stays
+                        // off until you re-enable it", never a false
+                        // "retrying automatically" (2026-07-06 fix).
+                        operator_initiated: true,
+                    });
+                }
             }
             audit_latches
                 .audited_connected
@@ -2259,86 +2773,185 @@ pub async fn run_groww_bridge(
             audit_latches.rearm_boot_connect();
             connect_logged = false;
             streaming_observed = false;
+            fresh_status_seen_this_episode = false;
+            // Advance the live-evidence floor every disabled wake: after a
+            // re-enable, ONLY evidence the sidecar produces AFTER this
+            // instant — a status write stamp OR a tick line's per-message
+            // capture stamp — can latch streaming / close the DOWN episode.
+            // The pre-disable frozen "streaming" file AND the ≤2s of
+            // pre-disable NDJSON backlog the sidecar appends before its
+            // kill are fossils (2026-07-06 false-recovery fix; the backlog
+            // still persists + folds on re-enable — zero loss — it just
+            // proves nothing about liveness).
+            live_floor_ist_nanos = receipt_ist_nanos();
+            // Connected-level gauge drops to 0 while disabled ONLY when it
+            // was already registered this session (a genuine enabled→off
+            // transition shows the outage). A session where Groww was never
+            // enabled leaves the metric MISSING so notBreaching keeps the
+            // deliberate disable silent (no daily ALARM/OK churn).
+            if let Some(gauge) = m_groww_active.as_ref() {
+                gauge.set(0.0);
+            }
             continue;
         }
 
         // CONNECT+SUBSCRIBE PROOF: read the sidecar status file (cheap, best-effort).
+        // FRESHNESS-GATED (2026-07-06 stale-status false-OK fix): the sidecar
+        // never deletes this file (a killed child freezes it at its last
+        // write, EBS persists it across the daily stop/start), so a record is
+        // evidence ONLY once it has been observed with a write stamp at/after
+        // the live floor AND recent — a stale record is treated exactly like
+        // an absent file (no connect log, no boot-connect ping, no streaming
+        // latch, no count refresh). This is what keeps FeedRecovered ("Prices
+        // are flowing") and tv_groww_ws_active honest across disable→
+        // re-enable cycles and dead-at-boot sidecars. EPISODE LATCH
+        // (2026-07-06 boot-deferral fix): the `subscribed` record is written
+        // ONCE and only rewritten on real emits, so freshness is required at
+        // the FIRST observation per episode, then latched — otherwise a
+        // >120s docker/notifier boot chain silently LOST the deferred
+        // boot-connect ping ("delayed, never lost" broken) and the connected
+        // gauge stayed 0 on tickless windows while the sidecar was healthily
+        // subscribed. The floor (advanced on every disabled wake) alone
+        // kills fossils; the max-age window ages out a KILLED sidecar's last
+        // write before it can ever latch.
         if let Some(status) = read_status_file(&status_file_path).await {
-            // First `subscribed`/`streaming` observation → emit the ONE CONNECT log
-            // + record the subscribe counts (idempotent; only logged once).
-            if !connect_logged && status.event != GrowwStatusEvent::Unknown {
-                info!(
-                    stocks = status.stocks,
-                    indices = status.indices,
-                    total = status.stocks + status.indices,
-                    "Groww live feed CONNECTED — subscribed {} stocks + {} indices = {}",
-                    status.stocks,
-                    status.indices,
-                    status.stocks + status.indices
-                );
-                feed_health.set_subscribed(Feed::Groww, status.stocks, status.indices);
-                connect_logged = true;
-            } else if status.event != GrowwStatusEvent::Unknown {
-                // Keep the counts fresh on a re-subscribe (reconnect) without re-logging.
-                feed_health.set_subscribed(Feed::Groww, status.stocks, status.indices);
+            if groww_status_is_live(
+                status.ts_ist_nanos,
+                receipt_ist_nanos(),
+                live_floor_ist_nanos,
+            ) {
+                fresh_status_seen_this_episode = true;
             }
-            // Boot-stage socket-connected announcement (operator 2026-07-04 —
-            // "i need the same view display everything even for groww"): on
-            // the FIRST observed subscribe state per connected episode, emit
-            // ONE ws_event_audit Connected row AT SOCKET-CONNECT time + ONE
-            // Telegram ping — WITHOUT waiting for the first streaming tick
-            // (a closed market previously meant total boot silence). The
-            // existing first-streaming-tick rising edge below is KEPT
-            // unchanged as the streaming confirmation; this is ADDITIVE.
-            // Edge-latched via `boot_connect_announced` (once per episode,
-            // never per poll); a notifier slot that exists but is not yet
-            // filled (boot ordering) defers to the next wake so the ping is
-            // delayed, never lost.
-            let notifier = notifier_slot.as_ref().and_then(|slot| slot.load_full());
-            let notifier_ready = match notifier_slot.as_ref() {
-                None => true, // no Telegram wiring (tests) — audit row only
-                Some(_) => notifier.is_some(),
-            };
-            if should_announce_boot_connect(
-                status.event != GrowwStatusEvent::Unknown,
-                audit_latches
-                    .boot_connect_announced
-                    .load(std::sync::atomic::Ordering::Relaxed),
-                notifier_ready,
-            ) && audit_latches.try_announce_boot_connect()
-            {
-                emit_groww_ws_audit(
-                    ws_audit_tx.as_ref(),
-                    WsEventKind::Connected,
-                    "groww_subscribed",
-                    "groww socket connected + subscribed — awaiting first tick",
-                );
-                if let Some(notifier) = notifier {
-                    notifier.notify(
+            if !fresh_status_seen_this_episode {
+                if !stale_status_logged {
+                    stale_status_logged = true;
+                    info!(
+                        status_ts_ist_nanos = status.ts_ist_nanos,
+                        live_floor_ist_nanos,
+                        "groww bridge: ignoring STALE sidecar status file (leftover from a \
+                         prior sidecar incarnation) — waiting for fresh subscribe/streaming \
+                         proof before claiming the feed is live"
+                    );
+                }
+            } else {
+                // First `subscribed`/`streaming` observation → emit the ONE CONNECT log
+                // + record the subscribe counts (idempotent; only logged once).
+                if !connect_logged && status.event != GrowwStatusEvent::Unknown {
+                    info!(
+                        stocks = status.stocks,
+                        indices = status.indices,
+                        total = status.stocks + status.indices,
+                        "Groww live feed CONNECTED — subscribed {} stocks + {} indices = {}",
+                        status.stocks,
+                        status.indices,
+                        status.stocks + status.indices
+                    );
+                    feed_health.set_subscribed(Feed::Groww, status.stocks, status.indices);
+                    connect_logged = true;
+                } else if status.event != GrowwStatusEvent::Unknown {
+                    // Keep the counts fresh on a re-subscribe (reconnect) without re-logging.
+                    feed_health.set_subscribed(Feed::Groww, status.stocks, status.indices);
+                }
+                // Boot-stage socket-connected announcement (operator 2026-07-04 —
+                // "i need the same view display everything even for groww"): on
+                // the FIRST observed subscribe state per connected episode, emit
+                // ONE ws_event_audit Connected row AT SOCKET-CONNECT time + ONE
+                // Telegram ping — WITHOUT waiting for the first streaming tick
+                // (a closed market previously meant total boot silence). The
+                // existing first-streaming-tick rising edge below is KEPT
+                // unchanged as the streaming confirmation; this is ADDITIVE.
+                // Edge-latched via `boot_connect_announced` (once per episode,
+                // never per poll); a notifier slot that exists but is not yet
+                // filled (boot ordering) defers to the next wake so the ping is
+                // delayed, never lost.
+                let notifier = notifier_slot.as_ref().and_then(|slot| slot.load_full());
+                let notifier_ready = match notifier_slot.as_ref() {
+                    None => true, // no Telegram wiring (tests) — audit row only
+                    Some(_) => notifier.is_some(),
+                };
+                if should_announce_boot_connect(
+                    status.event != GrowwStatusEvent::Unknown,
+                    audit_latches
+                        .boot_connect_announced
+                        .load(std::sync::atomic::Ordering::Relaxed),
+                    notifier_ready,
+                ) && audit_latches.try_announce_boot_connect()
+                {
+                    emit_groww_ws_audit(
+                        ws_audit_tx.as_ref(),
+                        WsEventKind::Connected,
+                        "groww_subscribed",
+                        "groww socket connected + subscribed — awaiting first tick",
+                    );
+                    // FLEET-scoped Telegram coalescing (exam-fix 2026-07-06): in
+                    // fleet mode every shard bridge used to fire its own LOW
+                    // "connected — Subscribed N" ping per connected episode —
+                    // alternating with the per-connection reject alerts into
+                    // dozens of messages. Fleet connections now emit at most ONE
+                    // connected ping per 60s window (the FIRST bridge in the
+                    // window carries its own subscribe counts); suppressed pings
+                    // keep their ws_event_audit row + CONNECT log + feed-health
+                    // update above. Single-conn (`conn_id == None`) = today's
+                    // behavior byte-identical.
+                    let connected_decision = crate::groww_fleet_alerts::global_fleet_alert_decision(
+                        conn_id,
+                        crate::groww_fleet_alerts::FleetAlertKind::Connected,
+                    );
+                    if matches!(
+                        connected_decision,
+                        crate::groww_fleet_alerts::FleetAlertDecision::Suppress
+                    ) {
+                        metrics::counter!(
+                            "tv_groww_fleet_alerts_suppressed_total",
+                            "direction" => "connected",
+                        )
+                        .increment(1);
+                    } else if let Some(notifier) = notifier {
+                        notifier.notify(
                         tickvault_core::notification::NotificationEvent::FeedConnectedAwaitingTicks {
+                            // O(1) EXEMPT: one Telegram event per fleet connect edge — cold notification path.
                             feed: Feed::Groww.display_name().to_string(),
                             subscribed: status.stocks.saturating_add(status.indices),
                             market_open:
                                 tickvault_common::market_hours::is_within_market_hours_ist(),
                         },
                     );
+                    }
                 }
-            }
-            // HONEST-FEED PROOF (operator 2026-06-29): surface the producer-side
-            // decoded+emitted vs decoded-but-dropped counts so a sid-map mismatch
-            // ("streaming but 0 ticks") is a VISIBLE number, not a silent drop.
-            // Always refreshed from the latest status (the sidecar reports cumulative
-            // totals); display-only, never changes the verdict or `connected`.
-            feed_health.set_decode_counts(Feed::Groww, status.emitted, status.dropped);
-            if status.event == GrowwStatusEvent::Streaming {
-                streaming_observed = true;
+                // HONEST-FEED PROOF (operator 2026-06-29): surface the producer-side
+                // decoded+emitted vs decoded-but-dropped counts so a sid-map mismatch
+                // ("streaming but 0 ticks") is a VISIBLE number, not a silent drop.
+                // Always refreshed from the latest status (the sidecar reports cumulative
+                // totals); display-only, never changes the verdict or `connected`.
+                feed_health.set_decode_counts(Feed::Groww, status.emitted, status.dropped);
+                if status.event == GrowwStatusEvent::Streaming {
+                    streaming_observed = true;
+                }
             }
         }
 
-        // Drain whatever new bytes arrived (the real ingestion body).
+        // Drain whatever new bytes arrived (the real ingestion body — ALWAYS
+        // unconditional: every drained line persists + folds, zero loss).
         let parsed_a_tick = state.drain_new_data(&tick_file_path, &feed_health).await;
-        if parsed_a_tick {
-            // A first parsed tick is the strongest proof the feed is live.
+        // FRESHNESS-GATED streaming latch (2026-07-06 replayed-backlog
+        // false-recovery fix): a parsed tick proves the feed is live ONLY
+        // when its per-message capture stamp is at/after the live floor —
+        // the SAME floor the status channel uses. Without the gate, the ≤2s
+        // pre-disable NDJSON backlog (the sidecar keeps appending until its
+        // 2s disable poll kills it, and the disable arm idles WITHOUT
+        // draining) replayed on the first re-enable wake: it latched
+        // streaming, fired a false "✅ Prices are flowing" FeedRecovered
+        // BEFORE the relaunched sidecar had even authenticated, consumed the
+        // DOWN episode, and pinned tv_groww_ws_active = 1 all session while
+        // the relaunch failed — the exact blind-alarm/false-OK class the
+        // status-file floor closed, through the second evidence channel. The
+        // same gate covers a respawned bridge's byte-0 re-tail of
+        // already-captured bytes. Lines WITHOUT a capture stamp (old-format /
+        // reconcile-sweep rows) never latch here — the sidecar's ≤1s status
+        // rewrite on real emits latches those flows via the status channel.
+        if parsed_a_tick && state.wake_had_fresh_capture(live_floor_ist_nanos) {
+            // A freshly-captured parsed tick is the strongest proof the feed
+            // is live.
             streaming_observed = true;
         }
 
@@ -2373,6 +2986,74 @@ pub async fn run_groww_bridge(
             audit_latches
                 .prior_disconnect
                 .store(false, std::sync::atomic::Ordering::Relaxed);
+        }
+
+        // FeedRecovered (operator 2026-07-06): close the DOWN episode ONCE,
+        // on the STREAMING rising edge only — recovery is claimed on ticks /
+        // the sidecar's own streaming status, never on mere socket-connect
+        // (the boot-connect ping above keeps saying "awaiting first tick").
+        // Deliberately OUTSIDE the `audited_connected` gate: if the lazily-
+        // filled Telegram slot is not deliverable yet (boot ordering), the
+        // episode latch is NOT consumed and the next ≤1s wake retries —
+        // delayed, never lost.
+        if streaming_observed
+            && audit_latches
+                .down_announced
+                .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            let notifier = notifier_slot.as_ref().and_then(|slot| slot.load_full());
+            let notifier_ready = match notifier_slot.as_ref() {
+                None => true, // no Telegram wiring (tests) — consume silently
+                Some(_) => notifier.is_some(),
+            };
+            if notifier_ready
+                && let Some(down_secs) = audit_latches.take_feed_recovery(ist_epoch_secs_now())
+                && let Some(notifier) = notifier
+            {
+                notifier.notify(
+                    tickvault_core::notification::NotificationEvent::FeedRecovered {
+                        feed: Feed::Groww.display_name().to_string(), // O(1) EXEMPT: cold path — once per DOWN-episode recovery
+                        down_secs,
+                    },
+                );
+            }
+        }
+
+        // Groww liveness gauges (operator 2026-07-06): cold ≤1s cadence,
+        // handles cached after the first publish. Connected-level active bit
+        // — 1 while the connected episode holds (socket connected +
+        // subscribed OR streaming, FRESH evidence only — a stale status file
+        // or a replayed tick backlog can never latch it). BOOT GRACE
+        // (2026-07-06 fix — order-update precedent): the gauge is REGISTERED
+        // only at the first connected episode of the session, so the metric
+        // is MISSING (notBreaching → alarm silent) for the whole activation
+        // chain (CSV pull-until-success → sidecar launch/venv → token →
+        // connect → subscribe) — a chain of ANY length never produces the
+        // pre-open false ALARM/OK page pair the unverified "~2min grace"
+        // assumed away. Once registered, 0/1 publishes every enabled wake
+        // (plus 0 on disabled wakes), so a mid-session outage, a failed
+        // disable→re-enable, and a runtime disable all show honestly. A
+        // sidecar DEAD AT BOOT leaves the metric missing — that class pages
+        // via the sidecar supervisor's reject alerts + FEED-STALL-01, not
+        // this alarm (documented in app-alarms.tf).
+        let connected_episode = streaming_observed
+            || audit_latches
+                .boot_connect_announced
+                .load(std::sync::atomic::Ordering::Relaxed);
+        if connected_episode || m_groww_active.is_some() {
+            m_groww_active
+                .get_or_insert_with(|| metrics::gauge!("tv_groww_ws_active"))
+                .set(if connected_episode { 1.0 } else { 0.0 });
+        }
+        // Tick age: SKIP (never a fake 0 — the gauge is not even REGISTERED,
+        // so the exporter renders nothing) until the first tick of the
+        // session — missing data + the alarm's notBreaching stays silent.
+        if let Some(age) = feed_health.last_tick_age_secs(Feed::Groww, receipt_ist_nanos()) {
+            m_groww_tick_age
+                .get_or_insert_with(
+                    || metrics::gauge!("tv_feed_last_tick_age_seconds", "feed" => "groww"),
+                )
+                .set(age as f64);
         }
     }
 }
@@ -2850,6 +3531,31 @@ mod tests {
         assert_eq!(GROWW_SHARDS_DIR_DEFAULT, "data/groww/shards");
     }
 
+    /// Hardening 2026-07-06: scale-down must be able to drop the killed
+    /// conn's subscribe-proof file (undated path, never sidecar-deleted) so
+    /// the ladder's plateau gate cannot count dead connections.
+    /// test coverage (pub-fn-test-guard line): remove_subscribe_proof
+    #[test]
+    fn test_remove_subscribe_proof_removes_only_the_target_conn() {
+        let root = std::env::temp_dir().join(format!(
+            "tv_bridge_proof_rm_{}_{}",
+            std::process::id(),
+            line!()
+        ));
+        for conn_id in 0..2 {
+            let files = shard_files(&root, conn_id);
+            std::fs::create_dir_all(&files.watch_dir).unwrap_or_else(|e| panic!("mkdir: {e}"));
+            std::fs::write(&files.status_file, b"{}").unwrap_or_else(|e| panic!("write: {e}"));
+        }
+        // Removes the target, leaves the sibling.
+        assert!(remove_subscribe_proof(&root, 1));
+        assert!(!shard_files(&root, 1).status_file.exists());
+        assert!(shard_files(&root, 0).status_file.exists());
+        // Missing file → clean no-op (idempotent).
+        assert!(!remove_subscribe_proof(&root, 1));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn test_run_groww_bridge_has_runtime_disable_gate() {
         // Feed-toggle API (2026-06-19): the bridge MUST check the shared runtime
@@ -2940,6 +3646,371 @@ mod tests {
         assert_eq!(got.event, GrowwStatusEvent::Streaming);
         assert_eq!(got.emitted, 0, "absent emitted → serde default 0");
         assert_eq!(got.dropped, 0, "absent dropped → serde default 0");
+        assert_eq!(
+            got.ts_ist_nanos, 0,
+            "absent ts_ist_nanos → serde default 0 (never-live, fail-closed)"
+        );
+    }
+
+    #[test]
+    fn test_parse_groww_status_line_carries_write_stamp() {
+        // Stale-status false-OK fix (2026-07-06): the sidecar's own write
+        // stamp (`ts_ist_nanos` from write_status) MUST survive the parse —
+        // it is the freshness signal that keeps a killed / prior-day
+        // sidecar's frozen "streaming" record from latching liveness.
+        let s = r#"{"event":"streaming","stocks":765,"indices":2,"total":767,"ts_ist_nanos":1780000020123000000}"#;
+        let got = parse_groww_status_line(s).expect("parse streaming");
+        assert_eq!(got.ts_ist_nanos, 1_780_000_020_123_000_000);
+    }
+
+    // test coverage (one line for pub-fn-test-guard test.*<fn>): groww_status_is_live
+
+    #[test]
+    fn test_groww_status_is_live_fresh_after_floor_is_live() {
+        // A record written after the floor and within the max-age window is
+        // live evidence (the healthy ≤1s streaming-rewrite case).
+        let now = 2_000_000_000 * NANOS_PER_SECOND;
+        let floor = now - 3_600 * NANOS_PER_SECOND;
+        assert!(groww_status_is_live(now - NANOS_PER_SECOND, now, floor));
+        assert!(groww_status_is_live(now, now, floor));
+    }
+
+    #[test]
+    fn test_groww_status_is_live_zero_stamp_is_never_live() {
+        // Old-format record without a write stamp → fail-closed, never live.
+        let now = 2_000_000_000 * NANOS_PER_SECOND;
+        assert!(!groww_status_is_live(0, now, 0));
+        assert!(!groww_status_is_live(-1, now, i64::MIN));
+    }
+
+    #[test]
+    fn test_groww_status_is_live_pre_floor_stamp_is_stale() {
+        // The disable→re-enable / boot-with-yesterdays-file class: a record
+        // written BEFORE the live floor (bridge incarnation start / last
+        // disabled wake) is a fossil from a killed sidecar — never evidence,
+        // even if it is recent by wall clock.
+        let now = 2_000_000_000 * NANOS_PER_SECOND;
+        let floor = now - 10 * NANOS_PER_SECOND;
+        assert!(!groww_status_is_live(floor - 1, now, floor));
+        assert!(
+            groww_status_is_live(floor, now, floor),
+            "at-floor stamp counts (>= floor)"
+        );
+    }
+
+    #[test]
+    fn test_groww_status_is_live_aged_out_stamp_is_stale() {
+        // A stamp older than GROWW_STATUS_LIVE_MAX_AGE_NANOS ages out (the
+        // sidecar rewrites ≤1s while streaming, so a healthy record is
+        // always far inside the bound).
+        let now = 2_000_000_000 * NANOS_PER_SECOND;
+        let floor = 0;
+        let stale = now - GROWW_STATUS_LIVE_MAX_AGE_NANOS - 1;
+        assert!(!groww_status_is_live(stale, now, floor));
+        let boundary = now - GROWW_STATUS_LIVE_MAX_AGE_NANOS;
+        assert!(
+            groww_status_is_live(boundary, now, floor),
+            "exactly-at-window stamp still counts"
+        );
+    }
+
+    #[test]
+    fn test_groww_status_is_live_absurd_future_stamp_is_rejected() {
+        // Garbage / clock-skew guard: a stamp absurdly in the FUTURE of the
+        // receipt clock is rejected fail-closed (it would otherwise pass the
+        // floor + age checks forever).
+        let now = 2_000_000_000 * NANOS_PER_SECOND;
+        let future = now + GROWW_STATUS_LIVE_MAX_AGE_NANOS + 1;
+        assert!(!groww_status_is_live(future, now, 0));
+        assert!(
+            groww_status_is_live(now + GROWW_STATUS_LIVE_MAX_AGE_NANOS, now, 0),
+            "small forward skew inside the window is tolerated"
+        );
+    }
+
+    #[test]
+    fn test_sidecar_status_stamp_shares_the_ist_epoch_convention() {
+        // CROSS-LANGUAGE EPOCH RATCHET (2026-07-06 CRITICAL fix): the Rust
+        // freshness gate (`groww_status_is_live`) compares the sidecar's
+        // status write stamp against `receipt_ist_nanos()` = UTC epoch +
+        // 19,800s ("IST epoch"). The sidecar's `now_ist_nanos()` previously
+        // returned `datetime.now(tz=IST).timestamp()` — the PLAIN UTC epoch
+        // (`.timestamp()` on an aware datetime ignores the zone) — so every
+        // genuinely fresh record read ≈19,800s old, 165× the 120s window:
+        // the gate rejected ALL real status evidence forever, killing the
+        // boot-connect announcement and false-firing the groww-ws-inactive
+        // alarm every morning. Pin that `now_ist_nanos` uses the SAME
+        // `replace(tzinfo=timezone.utc)` trick as `ms_to_ist_nanos` (the
+        // verified IST-epoch producer for the tick lines), so both sides of
+        // the gate share one epoch.
+        let sidecar = include_str!("../../../scripts/groww-sidecar/groww_sidecar.py");
+        let def_at = sidecar
+            .find("def now_ist_nanos(")
+            .expect("sidecar must define now_ist_nanos");
+        let body_region = &sidecar[def_at..];
+        let body_end = body_region[1..]
+            .find("\ndef ")
+            .map_or(body_region.len(), |rel| rel + 1);
+        let body = &body_region[..body_end];
+        // 2026-07-06 anti-vacuity hardening: every assertion below runs
+        // against the body's EXECUTABLE code lines only (docstring + `#`
+        // comment lines stripped). The function's own docstring quotes the
+        // `replace(tzinfo=timezone.utc)` literal in prose, so a positive
+        // `body.contains(...)` was self-satisfied by documentation — a
+        // rewrite to `return time.time_ns()` (plain UTC epoch, the exact
+        // stale-forever bug) passed the guard. Prose can no longer satisfy
+        // the pin.
+        let mut in_docstring = false;
+        let code_lines: Vec<&str> = body
+            .lines()
+            .filter(|line| {
+                let t = line.trim_start();
+                let quotes = t.matches("\"\"\"").count();
+                if quotes == 1 {
+                    // A lone triple-quote toggles docstring state; the line
+                    // itself is docstring text either way.
+                    in_docstring = !in_docstring;
+                    return false;
+                }
+                if quotes >= 2 {
+                    return false; // one-line docstring
+                }
+                !in_docstring && !t.starts_with('#') && !t.is_empty()
+            })
+            .collect();
+        assert!(
+            code_lines
+                .iter()
+                .any(|l| l.contains("replace(tzinfo=timezone.utc)") && l.contains(".timestamp()")),
+            "groww_sidecar.py: now_ist_nanos (the status-file write stamp) must use the \
+             replace(tzinfo=timezone.utc)...timestamp() IST-epoch trick on an EXECUTABLE \
+             code line (not just the docstring) — the same convention as ms_to_ist_nanos \
+             and the Rust receipt_ist_nanos — or the bridge's groww_status_is_live gate \
+             classifies every real status record as 19,800s stale forever:\n{body}"
+        );
+        // A bare aware-datetime `.timestamp()` in the same body's CODE
+        // would reintroduce the UTC-epoch bug; the replace-trick line is
+        // the only allowed `.timestamp()` call site.
+        let bare_utc_calls = code_lines
+            .iter()
+            .filter(|t| t.contains(".timestamp()") && !t.contains("replace(tzinfo=timezone.utc)"))
+            .count();
+        assert_eq!(
+            bare_utc_calls, 0,
+            "groww_sidecar.py: now_ist_nanos must not call .timestamp() on a bare aware \
+             datetime in code (that returns the plain UTC epoch, not IST epoch)"
+        );
+        // `time.time()` / `time.time_ns()` are the other plain-UTC-epoch
+        // producers a future "pythonic simplification" would reach for —
+        // ban them from the body's code outright.
+        let plain_epoch_calls = code_lines
+            .iter()
+            .filter(|t| t.contains("time.time(") || t.contains("time.time_ns("))
+            .count();
+        assert_eq!(
+            plain_epoch_calls, 0,
+            "groww_sidecar.py: now_ist_nanos must not call time.time()/time.time_ns() — \
+             both return the plain UTC epoch, reintroducing the 19,800s-stale-forever \
+             freshness-gate bug"
+        );
+        // 2026-07-07 hardening (review finding): the wall-clock SOURCE line is
+        // the other half of the two-line function and was previously unpinned.
+        // A one-token revert to `datetime.now(timezone.utc)` — or dropping
+        // `tz=IST` on a UTC-configured box — makes the `replace(tzinfo=
+        // timezone.utc)` trick a no-op (the datetime is already UTC wall
+        // clock), so `now_ist_nanos` returns the plain UTC epoch again: the
+        // exact 19,800s stale-forever regression, with the replace-trick line
+        // still present to satisfy the positive pin above. Pin the IST-zoned
+        // now positively on an EXECUTABLE code line.
+        assert!(
+            code_lines
+                .iter()
+                .any(|l| l.contains("datetime.now(tz=IST)")),
+            "groww_sidecar.py: now_ist_nanos must take its wall clock from \
+             datetime.now(tz=IST) on an EXECUTABLE code line — any other now-source \
+             (datetime.now(timezone.utc), a naked datetime.now() on a UTC box) turns \
+             the replace(tzinfo=timezone.utc) trick into a no-op and the stamp back \
+             into the plain UTC epoch, so groww_status_is_live classifies every real \
+             status record as 19,800s stale forever:\n{body}"
+        );
+        // ...and ban every OTHER datetime.now(...) / utcnow() source in the
+        // body's code so the IST-keyword form is the ONLY wall-clock read
+        // (a positional `datetime.now(IST)` must be rewritten to the pinned
+        // `tz=IST` keyword form — the ratchet is deliberately strict).
+        let non_ist_now_calls = code_lines
+            .iter()
+            .filter(|l| {
+                (l.contains("datetime.now(") && !l.contains("datetime.now(tz=IST)"))
+                    || l.contains("utcnow(")
+            })
+            .count();
+        assert_eq!(
+            non_ist_now_calls, 0,
+            "groww_sidecar.py: now_ist_nanos must not read the wall clock from any \
+             source other than datetime.now(tz=IST) — datetime.now(timezone.utc) / \
+             naked datetime.now() / utcnow() all defeat the IST-epoch replace-trick \
+             and reintroduce the 19,800s-stale-forever freshness-gate bug"
+        );
+    }
+
+    #[test]
+    fn test_capture_stamp_ist_nanos_trusted_stamp_only_no_fallback() {
+        // 2026-07-06 replayed-backlog fix: the liveness/recovery signal needs
+        // the TRUSTED per-message capture stamp ONLY — a missing stamp
+        // (old-format / reconcile-sweep row) must return None, never the
+        // always-fresh wake fallback (which would defeat the floor gate).
+        let wake = 2_000_000_000 * NANOS_PER_SECOND;
+        assert_eq!(capture_stamp_ist_nanos(None, wake), None);
+        // A plausible capture converts UTC → IST-nanos convention.
+        let capture_utc = wake - tickvault_common::constants::IST_UTC_OFFSET_NANOS - 5;
+        assert_eq!(
+            capture_stamp_ist_nanos(Some(capture_utc), wake),
+            Some(capture_utc.saturating_add(tickvault_common::constants::IST_UTC_OFFSET_NANOS)),
+        );
+        // Implausible stamps (degenerate ~1970 / far ahead of the wake clock)
+        // are rejected exactly like row_received_at_with_capture's gate.
+        assert_eq!(capture_stamp_ist_nanos(Some(0), wake), None);
+        let far_future_utc = wake; // + offset lands ~5.5h ahead of the wake
+        assert_eq!(capture_stamp_ist_nanos(Some(far_future_utc), wake), None);
+    }
+
+    #[test]
+    fn test_wake_had_fresh_capture_gates_on_floor_and_zero() {
+        let mut state = retail_fresh_state();
+        // No trusted capture this wake → never fresh, for ANY floor
+        // (including i64::MIN-ish floors — the > 0 guard).
+        state.wake_max_capture_ist_nanos = 0;
+        assert!(!state.wake_had_fresh_capture(0));
+        assert!(!state.wake_had_fresh_capture(i64::MIN));
+        // A capture at/after the floor is fresh; before the floor is not
+        // (the replayed pre-disable backlog class).
+        let floor = 2_000_000_000 * NANOS_PER_SECOND;
+        state.wake_max_capture_ist_nanos = floor;
+        assert!(state.wake_had_fresh_capture(floor), "at-floor counts");
+        state.wake_max_capture_ist_nanos = floor - 1;
+        assert!(
+            !state.wake_had_fresh_capture(floor),
+            "a pre-floor capture stamp is a replayed fossil — never liveness"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_replay_window_lifecycle_clears_on_catchup_and_rearms_on_shrink() {
+        // Scoreboard PR-C review round 1 (2026-07-11): the byte-0 re-tail
+        // replay-window flag — the SECOND condition of the Groww lag
+        // stale-capture exclusion — must arm on a fresh bridge, clear on a
+        // fully-caught-up drain (later ≥60s-dwelt lines are LIVE backlog:
+        // ILP-backpressure pause / respawn-backoff wake — admitted to the
+        // day histogram), and re-arm on a shrink/rotation reset.
+        let dir = retail_tmp_dir("replay_window_lifecycle");
+        let tick_file = dir.join("live-ticks.ndjson");
+        let reg = tickvault_common::feed_health::FeedHealthRegistry::new();
+        let mut state = retail_fresh_state();
+        assert!(
+            state.replay_window,
+            "a fresh bridge byte-0 re-tails — the replay window must arm at construction"
+        );
+        std::fs::write(&tick_file, retail_line(1)).expect("seed one live line");
+        assert!(state.drain_new_data(&tick_file, &reg).await);
+        assert!(
+            !state.replay_window,
+            "a fully-caught-up drain must clear the replay window — every later \
+             byte is live, so a post-pause backlog drain keeps its true lag"
+        );
+        // Rotation/truncate (len < offset) re-arms: the byte-0 re-tail may
+        // replay already-recorded lines.
+        std::fs::write(&tick_file, b"").expect("truncate");
+        let _ = state.drain_new_data(&tick_file, &reg).await;
+        assert!(
+            state.replay_window,
+            "a shrink/rotation reset must re-arm the replay window"
+        );
+        // ... and the re-tail clears it again once caught up.
+        std::fs::write(&tick_file, retail_line(2)).expect("rewrite");
+        assert!(state.drain_new_data(&tick_file, &reg).await);
+        assert!(
+            !state.replay_window,
+            "catching up after the re-tail must clear the replay window again"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_drain_replayed_backlog_parses_but_never_reads_fresh() {
+        // THE 2026-07-06 false-recovery regression class, end-to-end through
+        // the REAL drain body: a disable→re-enable replay of pre-disable
+        // bytes (old capture_ns) must PERSIST (parsed_a_tick == true, zero
+        // loss) yet never count as fresh liveness evidence — while a line
+        // the sidecar captures AFTER the floor must latch.
+        let dir = retail_tmp_dir("fresh_capture_gate");
+        let tick_file = dir.join("live-ticks.ndjson");
+        let reg = tickvault_common::feed_health::FeedHealthRegistry::new();
+        let mut state = retail_fresh_state();
+
+        // The live floor, as the run loop would advance it on a disabled wake.
+        let floor = receipt_ist_nanos();
+        let old_capture_utc =
+            floor - tickvault_common::constants::IST_UTC_OFFSET_NANOS - 3_600 * NANOS_PER_SECOND;
+        let line_old = format!(
+            "{{\"security_id\":1001,\"segment\":\"NSE_EQ\",\"ts_ist_nanos\":{RETAIL_BASE_TS_NANOS},\"exchange_ts_millis\":{},\"ltp\":100.5,\"cum_volume\":10,\"capture_ns\":{old_capture_utc}}}\n",
+            RETAIL_BASE_TS_NANOS / 1_000_000
+        );
+        std::fs::write(&tick_file, &line_old).expect("seed pre-disable backlog line");
+        assert!(
+            state.drain_new_data(&tick_file, &reg).await,
+            "the replayed backlog line must still parse + persist (zero loss)"
+        );
+        assert!(
+            !state.wake_had_fresh_capture(floor),
+            "a pre-floor capture stamp must NOT read as fresh liveness — this is the \
+             false-FeedRecovered / pinned-gauge regression class"
+        );
+
+        // A line WITHOUT capture_ns (reconcile-sweep / old format) also never
+        // latches — only the status channel can prove those flows live.
+        {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&tick_file)
+                .expect("open append");
+            f.write_all(retail_line(1).as_bytes()).expect("append");
+        }
+        assert!(state.drain_new_data(&tick_file, &reg).await);
+        assert!(
+            !state.wake_had_fresh_capture(floor),
+            "a stamp-less line must not satisfy the freshness gate"
+        );
+
+        // A genuinely fresh capture (stamped after the floor) latches.
+        let fresh_capture_utc =
+            receipt_ist_nanos() - tickvault_common::constants::IST_UTC_OFFSET_NANOS;
+        let ts2 = RETAIL_BASE_TS_NANOS + 2 * NANOS_PER_SECOND;
+        let line_fresh = format!(
+            "{{\"security_id\":1002,\"segment\":\"NSE_EQ\",\"ts_ist_nanos\":{ts2},\"exchange_ts_millis\":{},\"ltp\":101.5,\"cum_volume\":11,\"capture_ns\":{fresh_capture_utc}}}\n",
+            ts2 / 1_000_000
+        );
+        {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&tick_file)
+                .expect("open append");
+            f.write_all(line_fresh.as_bytes()).expect("append fresh");
+        }
+        assert!(state.drain_new_data(&tick_file, &reg).await);
+        assert!(
+            state.wake_had_fresh_capture(floor),
+            "a capture stamped after the floor is the strongest liveness proof"
+        );
+
+        // The per-wake evidence resets: a quiet wake (nothing new) must not
+        // re-report the previous wake's freshness.
+        assert!(!state.drain_new_data(&tick_file, &reg).await);
+        assert!(
+            !state.wake_had_fresh_capture(floor),
+            "freshness is per-wake evidence — a quiet wake proves nothing"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -3160,10 +4231,12 @@ mod tests {
         let disable_idx = src
             .find("if !feed_runtime.is_enabled(Feed::Groww) {")
             .expect("disable branch present");
-        // Window widened (PR-10, then 2026-07-02 M3 atomic-latch expansion) to
-        // span the ws_event_audit falling-edge emit block — the latch re-arm
-        // lives just below it.
-        let after = &src[disable_idx..disable_idx + 2600];
+        // Window widened (PR-10, then 2026-07-02 M3 atomic-latch expansion,
+        // then 2026-07-06 feed-down alerting: the latched FeedDown Telegram
+        // emit now lives inside the falling-edge block) to span the
+        // ws_event_audit + FeedDown emit blocks — the latch re-arm lives
+        // just below them.
+        let after = &src[disable_idx..disable_idx + 4200];
         assert!(
             after.contains(&clear)
                 && after.contains("connect_logged = false")
@@ -3288,6 +4361,63 @@ mod tests {
             "post-disconnect subscribe must announce once more"
         );
         assert!(!latches.try_announce_boot_connect(), "and only once");
+    }
+
+    #[test]
+    fn test_try_announce_feed_down_fires_once_per_episode() {
+        // Feed-down alerting (operator 2026-07-06): ONE FeedDown page per
+        // DOWN episode — repeated falling edges (idle disable turns, bridge
+        // respawn storms) must never re-page (audit-findings Rule 4).
+        let latches = GrowwAuditLatches::default();
+        assert!(
+            latches.try_announce_feed_down(1_000),
+            "first falling edge announces"
+        );
+        for _ in 0..10 {
+            assert!(
+                !latches.try_announce_feed_down(1_050),
+                "subsequent falling edges must NEVER re-announce (spam trap)"
+            );
+        }
+        // First-down-wins: the episode stamp stays at the FIRST edge so
+        // down_secs spans the whole episode, not just the latest death.
+        assert_eq!(
+            latches
+                .down_since_epoch_secs
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1_000
+        );
+    }
+
+    #[test]
+    fn test_take_feed_recovery_returns_down_secs_and_rearms() {
+        // Rising edge closes the episode ONCE (down_secs from the FIRST
+        // falling edge), then the next falling edge opens a fresh episode.
+        let latches = GrowwAuditLatches::default();
+        assert!(latches.try_announce_feed_down(1_000));
+        assert_eq!(latches.take_feed_recovery(1_154), Some(154));
+        assert_eq!(
+            latches.take_feed_recovery(1_155),
+            None,
+            "episode already closed — recovery fires once"
+        );
+        assert!(
+            latches.try_announce_feed_down(2_000),
+            "next falling edge opens a fresh episode"
+        );
+        assert_eq!(latches.take_feed_recovery(2_010), Some(10));
+    }
+
+    #[test]
+    fn test_take_feed_recovery_none_when_not_down() {
+        // No episode in progress → no recovery Telegram (no false-positive
+        // "streaming again" on a normal first connect).
+        let latches = GrowwAuditLatches::default();
+        assert_eq!(latches.take_feed_recovery(1_000), None);
+        // A clock stamped 0 at the falling edge is clamped to 1, so the
+        // recovery duration never reads as the "not down" sentinel.
+        assert!(latches.try_announce_feed_down(0));
+        assert_eq!(latches.take_feed_recovery(5), Some(4));
     }
 
     #[test]
@@ -3490,6 +4620,122 @@ mod tests {
             src.contains(&groww_feed),
             "the force-seal closure must route with feed: Feed::Groww (drop_d1: false)"
         );
+    }
+
+    #[test]
+    fn test_record_groww_tick_producer_site_wired_into_drain() {
+        // Scoreboard PR-C producer-half pin (mirror of the Dhan
+        // `test_record_dhan_tick_producer_sites_wired_into_tick_processor`
+        // ratchet): the Groww lag pipeline has two wiring halves — the
+        // PUBLISHER (main.rs supervisor, pinned in secret_manager.rs) and
+        // the PRODUCER (the ONE `record_groww_tick` call at the validated
+        // drain site). Dropping the producer silently starves the Groww
+        // ring below the 50-sample floor: the publisher publishes NOTHING,
+        // the groww lag alarm reads notBreaching forever, and the 15:45
+        // scorecard lag columns regress to −1 — the exact dark-gauge class
+        // of the 2026-07-06 incident, on the second feed.
+        let src = include_str!("groww_bridge.rs");
+        // Needles are ASSEMBLED at runtime so this test's own literals can
+        // never self-match the include_str! scan (the `groww_feed` pattern
+        // above).
+        let producer_needle = format!("feed_lag_monitor::record_groww_tick{}", "(");
+        let producer_call_sites = src
+            .lines()
+            .filter(|l| {
+                let t = l.trim_start();
+                !t.starts_with("//") && !t.starts_with("///") && t.contains(&producer_needle)
+            })
+            .count();
+        assert_eq!(
+            producer_call_sites, 1,
+            "groww_bridge.rs must invoke the Groww lag producer at EXACTLY 1 \
+             non-comment site (the validated drain_new_data hook, AFTER \
+             validate_groww_tick); found {producer_call_sites}."
+        );
+        // The IST-midnight task must reset the Groww DAY histogram (before
+        // its trading-day/enabled gates).
+        let reset_needle = format!(
+            "feed_lag_monitor::reset_day_lag_histogram{}",
+            "(Feed::Groww)"
+        );
+        let reset_sites = src
+            .lines()
+            .filter(|l| {
+                let t = l.trim_start();
+                !t.starts_with("//") && !t.starts_with("///") && t.contains(&reset_needle)
+            })
+            .count();
+        assert_eq!(
+            reset_sites, 1,
+            "the Groww IST-midnight force-seal task must reset the Groww day \
+             lag histogram exactly once (found {reset_sites} sites) — without \
+             it Friday's distribution bleeds into Monday's scorecard row."
+        );
+    }
+
+    #[test]
+    fn test_record_presence_producer_site_wired_into_drain() {
+        // Scoreboard PR-D producer-half pin (sibling of the lag ratchet
+        // above): dropping the presence fold silently empties the Groww
+        // side of every coverage slot — the 15:45 drain then reports 375
+        // "Dhan unique win" minutes for every paired instrument (a false
+        // verdict, not a missing one).
+        let src = include_str!("groww_bridge.rs");
+        let producer_needle = format!("feed_presence::record_presence{}", "(");
+        let producer_call_sites = src
+            .lines()
+            .filter(|l| {
+                let t = l.trim_start();
+                !t.starts_with("//") && !t.starts_with("///") && t.contains(&producer_needle)
+            })
+            .count();
+        assert_eq!(
+            producer_call_sites, 1,
+            "groww_bridge.rs must fold Groww presence at EXACTLY 1 \
+             non-comment site (the validated drain hook, next to \
+             record_groww_tick); found {producer_call_sites}."
+        );
+        // The IST-midnight task must reset the Groww presence bitsets too.
+        let reset_needle = format!("feed_presence::reset_daily{}", "(Feed::Groww)");
+        let reset_sites = src
+            .lines()
+            .filter(|l| {
+                let t = l.trim_start();
+                !t.starts_with("//") && !t.starts_with("///") && t.contains(&reset_needle)
+            })
+            .count();
+        assert_eq!(
+            reset_sites, 1,
+            "the Groww IST-midnight force-seal task must reset the Groww \
+             presence bitsets exactly once (found {reset_sites} sites)."
+        );
+        // PR-D fix round 1 (review MEDIUM): the fold must sit behind the
+        // same-IST-day gate — a cross-day NDJSON re-tail replay must never
+        // fold yesterday's session minutes into today's bitsets.
+        let gate_needle = format!("tick_is_same_ist_day{}", "(parsed.tick.ts_ist_nanos");
+        assert!(
+            src.lines().any(|l| {
+                let t = l.trim_start();
+                !t.starts_with("//") && t.contains(&gate_needle)
+            }),
+            "the Groww presence fold must be gated on tick_is_same_ist_day \
+             (cross-day replay protection)"
+        );
+    }
+
+    #[test]
+    fn test_tick_is_same_ist_day_gates_cross_day_replay() {
+        const DAY_NANOS: i64 = 86_400 * 1_000_000_000;
+        let today_open = 20_644 * DAY_NANOS + (9 * 3600 + 15 * 60) * 1_000_000_000;
+        let now = 20_644 * DAY_NANOS + 10 * 3600 * 1_000_000_000;
+        // Same-day tick folds; yesterday's replayed line does not.
+        assert!(tick_is_same_ist_day(today_open, now));
+        assert!(!tick_is_same_ist_day(today_open - DAY_NANOS, now));
+        // Day boundaries: 23:59:59.999… of yesterday vs 00:00:00 of today.
+        assert!(!tick_is_same_ist_day(20_644 * DAY_NANOS - 1, now));
+        assert!(tick_is_same_ist_day(20_644 * DAY_NANOS, now));
+        // A (validator-bounded) small future skew inside the same day folds.
+        assert!(tick_is_same_ist_day(now + 30 * 1_000_000_000, now));
     }
 
     // ── 2026-07-02 adversarial-sweep fixes: bridge supervision + parse-time

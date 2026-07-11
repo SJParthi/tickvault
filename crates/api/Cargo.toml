@@ -28,12 +28,22 @@ serde_json = { workspace = true }
 chrono = { workspace = true }
 reqwest = { workspace = true }
 uuid = { workspace = true }
+# 2026-07-09 audit hardening: GCRA rate limiter for the two public
+# QuestDB-backed endpoints (/api/stats + /api/quote). NOT a new dependency —
+# governor is already a pinned workspace dep (the OMS order rate limiter
+# uses the same crate/pattern).
+governor = { workspace = true }
 # 2026-04-25 security audit (PR #357): bearer_token migrated from
 # `String` (with manual zeroize::Zeroize Drop impl) to `secrecy::SecretString`
 # per .claude/rules/project/rust-code.md (mandated secret type).
 # `secrecy` provides Drop+Zeroize transitively; the direct `zeroize` dep is
 # no longer needed in this crate.
 secrecy = { workspace = true }
+# W2#7 (2026-07-10): lock-free bearer-token hot-swap holder so the operator
+# can rotate the SSM token without an app restart. NOT a new dependency —
+# arc-swap is already a pinned workspace dep (1.9.1); the token_manager.rs
+# 24h-JWT swap uses the same crate/pattern.
+arc-swap = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

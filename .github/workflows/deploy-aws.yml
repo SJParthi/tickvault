@@ -51,6 +51,12 @@ on:
       - 'deploy/docker/**'
       # Config TOML (loaded by app at boot)
       - 'config/**'
+      # CloudWatch agent + prometheus scrape configs (2026-07-06): the deploy's
+      # OBSERVABILITY-LAST block copies these to the box + fetch-configs the
+      # agent on every deploy — an agent-config-only change (e.g. the machine/
+      # log-path fix) must self-deploy instead of waiting for the next Rust push.
+      - 'deploy/aws/cloudwatch-agent.json'
+      - 'deploy/aws/prometheus.yaml'
       # The deploy workflow ITSELF (so a PR that fixes the deploy
       # auto-redeploys without the operator clicking "Run workflow").
       # Charter: "everything completely comprehensively fully automated".
@@ -604,6 +610,8 @@ jobs:
               "if [ -f repo/deploy/docker/docker-compose.yml ]; then export TV_QUESTDB_PG_USER=$(aws ssm get-parameter --region ap-south-1 --name /tickvault/prod/questdb/pg-user --with-decryption --output text --query Parameter.Value 2>/dev/null || echo admin); export TV_QUESTDB_PG_PASSWORD=$(aws ssm get-parameter --region ap-south-1 --name /tickvault/prod/questdb/pg-password --with-decryption --output text --query Parameter.Value 2>/dev/null || echo quest); (cd repo/deploy/docker && TV_QUESTDB_PG_USER=\"$TV_QUESTDB_PG_USER\" TV_QUESTDB_PG_PASSWORD=\"$TV_QUESTDB_PG_PASSWORD\" docker compose up -d) || (echo FATAL: docker compose up failed; exit 1); else echo FATAL: docker-compose.yml missing from repo/deploy/docker; exit 1; fi",
               "# Verify QuestDB is actually listening on 9000 (HTTP) within 30s",
               "for i in 1 2 3 4 5 6; do if curl -fsS http://127.0.0.1:9000/exec?query=SELECT%201 >/dev/null 2>&1; then echo QUESTDB-UP; break; fi; sleep 5; if [ $i -eq 6 ]; then echo FATAL: QuestDB not responding on :9000 after 30s; docker compose -f repo/deploy/docker/docker-compose.yml ps; exit 1; fi; done",
+              "# Console-shell HARD canary (2026-07-06 shell-hang fix; hard gate 2026-07-08): the console back lambda rewrites GET / -> /index.html, so /index.html must complete box-locally within 5s on every box deploy — this is the lane that ships QuestDB image bumps. curl -f fails on any code >= 400, and --max-time 5 fails an unframed keep-alive response whose body never completes (curl exit 28): completion-within-5s IS the framing assertion. Disclosed limitation: a framed 3xx at /index.html (< 400) passes curl -f here; the end-to-end proxy gate in terraform-apply.yml requires a literal 200 and catches that shape on the next in-window apply. Never probe bare / here: QuestDB answers it with an unframed keep-alive 301 that would hang this shell.",
+              "curl -fsS --max-time 5 -o /dev/null http://127.0.0.1:9000/index.html || { echo \"FATAL: console shell page (/index.html) not served as a complete HTTP 200 within 5s on the box\"; exit 1; }",
               "# === TRADING APP FIRST ===",
               "# The trading app is the deploy. Start + verify it BEFORE touching the",
               "# CloudWatch agent, so a broken OBSERVABILITY agent can never block or",
@@ -637,7 +645,7 @@ jobs:
               "sleep 8",
               "echo === CWAGENT STATUS ===; sudo /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a status || true",
               "echo === CWAGENT OWN LOG tail40 ===; sudo tail -n 40 /opt/aws/amazon-cloudwatch-agent/logs/amazon-cloudwatch-agent.log 2>/dev/null || true",
-              "echo === APP LOG DIR ===; ls -la /opt/tickvault/data/logs/ 2>/dev/null | head -20 || true",
+              "echo === APP LOG DIR ===; ls -la /opt/tickvault/data/logs/ 2>/dev/null | head -20 || true; ls -la /opt/tickvault/data/logs/machine/ 2>/dev/null | head -20 || true",
               "echo DEPLOY OK"
             ]' \
             --query 'Command.CommandId' --output text)
@@ -888,9 +896,66 @@ jobs:
           fi
           echo "DEPLOY VERIFIED: tickvault reached readiness (systemd active, or a healthy slow WAL-replay boot with no crash)"
 
+      - name: Verify log ingestion (LOG-INGESTION-SMOKE, non-fatal)
+        # Incident 2026-07-06 17:19 IST: the app moved its machine logs to
+        # data/logs/machine/ while the on-box CloudWatch agent kept tailing the
+        # old top-level globs — the app stayed healthy, the log SHIPPER went
+        # silently dead, and /tickvault/prod/app ingested nothing for a whole
+        # session with zero signal. This step is the per-deploy detector: it
+        # proves fresh app log events actually reach CloudWatch AFTER the
+        # restarted agent picked up the NEW config this deploy shipped.
+        #
+        # NON-FATAL by design (2026-06-09 doctrine: a broken OBSERVABILITY
+        # surface must never fail, roll back, or auto-stop a verified-healthy
+        # TRADING app). On timeout: ::warning:: + an SNS page so the operator
+        # knows the shipper needs a look — then exit 0. The market-hours
+        # tv-<env>-app-log-ingestion-silent alarm (log-retention.tf) is the
+        # continuous in-session counterpart to this one-shot deploy check.
+        # IAM: logs:FilterLogEvents on the app log group ARN (oidc.tf).
+        if: env.DEPLOY_SKIP_REASON == ''
+        run: |
+          set +e
+          REGION="${{ vars.AWS_REGION || 'ap-south-1' }}"
+          IID="${{ secrets.EC2_INSTANCE_ID }}"
+          # START_MS captured HERE, in-step, AFTER readiness — any event found
+          # below was ingested after the agent restart with the new config, so
+          # a success proves the NEW globs ship (not a leftover from the old
+          # config). Self-contained: no cross-step env plumbing.
+          START_MS=$(date +%s%3N)
+          echo "LOG-INGESTION-SMOKE: polling /tickvault/prod/app stream ${IID}/app for events newer than ${START_MS} (12 polls x 25s = ~5 min budget)"
+          FOUND=0
+          for i in $(seq 1 12); do
+            sleep 25
+            COUNT=$(aws logs filter-log-events \
+              --region "$REGION" \
+              --log-group-name /tickvault/prod/app \
+              --log-stream-names "${IID}/app" \
+              --start-time "$START_MS" \
+              --limit 1 \
+              --query 'length(events)' --output text 2>/dev/null || echo 0)
+            echo "poll $i/12: fresh events seen = ${COUNT:-0}"
+            if [ "${COUNT:-0}" != "0" ] && [ "${COUNT:-0}" != "None" ]; then FOUND=1; break; fi
+          done
+          if [ "$FOUND" -eq 1 ]; then
+            echo "LOG-INGESTION-SMOKE OK: fresh app log events reached CloudWatch group /tickvault/prod/app (~$((i * 25))s after readiness) — the log shipper is alive on the new config."
+            exit 0
+          fi
+          echo "::warning::LOG-INGESTION-SMOKE: no fresh app log events in /tickvault/prod/app stream ${IID}/app within ~5 min of readiness — the CloudWatch agent is likely not shipping (glob/config mismatch or dead agent). The deploy itself is VERIFIED HEALTHY; NOT rolling back. Check the on-box === CWAGENT STATUS === / === APP LOG DIR === dumps above."
+          SHORT_SHA="${GITHUB_SHA:0:7}"
+          IST_TIME="$(TZ='Asia/Kolkata' date +'%I:%M %p IST')"
+          aws sns publish \
+            --region "$REGION" \
+            --topic-arn arn:aws:sns:${REGION}:${{ steps.acct.outputs.id }}:tv-prod-alerts \
+            --subject "⚠️ tickvault deployed but its logs are NOT reaching CloudWatch" \
+            --message "⚠️ New code went LIVE at ${IST_TIME} (version ${SHORT_SHA}) and the app is running fine — but its logs are NOT arriving in CloudWatch. Same signature as the 06 Jul incident: the log shipper on the box looks dead. Trading is unaffected. What you need to do RIGHT NOW: 1. Open the box (SSM session). 2. Check the CloudWatch agent status. 3. Restart the agent if it is stopped or misconfigured. Run: ${{ github.run_id }}" \
+          || echo "::warning::LOG-INGESTION-SMOKE: the SNS page also failed — operator must rely on this run log + the market-hours ingestion-silent alarm."
+          exit 0
+
       - name: Record deployed binary git SHA to SSM (B9 deploy provenance)
-        # Runs ONLY after the swap is verified healthy (same gate as the
-        # success Telegram — an intentional off-hours skip writes nothing).
+        # Runs ONLY after the swap is verified healthy (the standalone
+        # success Telegram was retired 2026-07-09 — the app's boot bubble
+        # "NEW CODE deployed" header is the deploy-landed signal now; an
+        # intentional off-hours skip writes nothing).
         # Consumers: the operator-portal footer (binary <sha7>) and the
         # deploy-watchdog binary-vs-main mismatch metric + 24h stale alarm.
         # NON-FATAL by design: a provenance-recording failure must never
@@ -919,23 +984,13 @@ jobs:
             echo "::warning::refusing to record non-hex sha to /tickvault/prod/deploy/binary-git-sha (GITHUB_SHA failed the 40-lowercase-hex check; deploy itself is verified healthy)"
           fi
 
-      - name: Notify Telegram on success
-        # ANTI-FALSE-OK: an intentional off-hours skip now exits the deploy job
-        # GREEN (see the "Ensure instance running" step), so `success()` alone
-        # would fire a "✅ deployed" Telegram for a run that deployed NOTHING.
-        # Gate on DEPLOY_SKIP_REASON == '' so the skip stays silent — a real
-        # deploy (skip reason empty) still pages success as before.
-        if: success() && env.DEPLOY_SKIP_REASON == ''
-        run: |
-          # The SNS topic has a Telegram webhook subscription; publish a
-          # plain-English message so the operator sees the deploy land clearly.
-          SHORT_SHA="${GITHUB_SHA:0:7}"
-          IST_TIME="$(TZ='Asia/Kolkata' date +'%I:%M %p IST')"
-          aws sns publish \
-            --region ${{ vars.AWS_REGION || 'ap-south-1' }} \
-            --topic-arn arn:aws:sns:${{ vars.AWS_REGION || 'ap-south-1' }}:${{ steps.acct.outputs.id }}:tv-prod-alerts \
-            --subject "✅ tickvault deployed — new code is LIVE" \
-            --message "✅ New code is LIVE on AWS, deployed at ${IST_TIME} (version ${SHORT_SHA}). The app restarted on the latest code. Nothing for you to do."
+      # 2026-07-09 (operator escalation — Telegram noise N1): the standalone
+      # "✅ tickvault deployed — new code is LIVE" success publish is RETIRED.
+      # The consolidated boot bubble's header ("tickvault starting — NEW CODE
+      # deployed (build <sha>)") carries the deploy signal from the box itself
+      # the moment the new binary boots — one bubble instead of two messages.
+      # Every FAILURE-path publish below (and the log-shipping warning above)
+      # is retained unchanged.
 
       - name: Auto-stop tickvault service on deploy failure (kills Telegram spam)
         # Not on an intentional off-hours skip: the box is already stopped, so

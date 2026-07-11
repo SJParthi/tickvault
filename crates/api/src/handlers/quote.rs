@@ -8,6 +8,7 @@ use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use serde::Serialize;
 
+use crate::response_cache::cached_json_response;
 use crate::state::SharedAppState;
 
 /// Timeout for QuestDB quote queries (cold path, not tick processing).
@@ -57,12 +58,20 @@ pub struct QuoteResponse {
 }
 
 /// `GET /api/quote/:security_id` — fetch the latest tick from QuestDB.
+///
+/// 2026-07-09 audit hardening: successful (200) bodies are TTL-cached per
+/// security_id (1s, bounded map in [`SharedAppState`]) — "latest tick"
+/// honestly becomes "latest tick, ≤1s old". ONLY 200 responses are cached:
+/// 400/404/503 are never stored, so attacker-chosen garbage security_ids
+/// can never grow the map (only SIDs with real tick rows enter) and a
+/// negative entry can never mask a just-arrived first tick. The rate
+/// limiter in `crate::public_guard` runs BEFORE this handler (route_layer).
 pub async fn get_quote(
     State(state): State<SharedAppState>,
     Path(security_id): Path<u64>,
 ) -> impl IntoResponse {
     // SECURITY: defense-in-depth guard against invalid security_id.
-    // The u32 type from Axum's Path extractor already prevents SQL injection,
+    // The u64 type from Axum's Path extractor already prevents SQL injection,
     // but we reject 0 as an invalid security_id (no instrument has id=0).
     if security_id == 0 {
         return (
@@ -72,14 +81,23 @@ pub async fn get_quote(
             .into_response();
     }
 
+    if let Some(body) = state.quote_cache().get(security_id) {
+        metrics::counter!("tv_api_cache_hits_total", "endpoint" => "quote").increment(1);
+        return cached_json_response(body, "hit");
+    }
+
     let cfg = state.questdb_config();
     let base_url = format!("http://{}:{}", cfg.host, cfg.http_port);
 
     let client = build_questdb_client(QUESTDB_QUOTE_TIMEOUT_SECS);
 
     match query_latest_tick(&client, &base_url, security_id).await {
-        Some(quote) => match serde_json::to_value(&quote) {
-            Ok(json) => (StatusCode::OK, Json(json)).into_response(),
+        Some(quote) => match serde_json::to_string(&quote) {
+            Ok(body) => {
+                // Cache ONLY the 200 body (see handler docs).
+                state.quote_cache().put(security_id, body.clone());
+                cached_json_response(body, "miss")
+            }
             Err(_) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({"error": "failed to serialize quote response"})),
@@ -577,6 +595,113 @@ mod tests {
         let state = mock_state(port);
         let response = get_quote(State(state), Path(12345)).await.into_response();
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    // -----------------------------------------------------------------------
+    // 2026-07-09 hardening: TTL cache — only 200 bodies, never errors
+    // -----------------------------------------------------------------------
+
+    /// A second call inside the 1s TTL must be a cache HIT — byte-identical
+    /// 200 body with ZERO QuestDB round-trips. The single-response mock
+    /// serves the row EXACTLY once; an uncached second call would hit the
+    /// exhausted server and 503/404.
+    #[tokio::test]
+    async fn test_get_quote_cache_hit_returns_identical_200() {
+        let body = r#"{"dataset":[[12345,"dhan","NSE_FNO",1500.5,100,50000,1234,1490.0,1510.0,1485.0,1495.0,"2026-03-08T10:30:00.000000Z"]]}"#;
+        let base_url = start_mock_server(body).await;
+        let port: u16 = base_url
+            .rsplit(':')
+            .next()
+            .expect("port should exist")
+            .parse()
+            .expect("port should parse");
+
+        let state = mock_state(port);
+        let first = get_quote(State(state.clone()), Path(12345))
+            .await
+            .into_response();
+        assert_eq!(first.status(), StatusCode::OK);
+        assert_eq!(
+            first
+                .headers()
+                .get(crate::response_cache::CACHE_MARKER_HEADER)
+                .and_then(|v| v.to_str().ok()),
+            Some("miss"),
+            "first call must be a cache miss"
+        );
+        let first_body = axum::body::to_bytes(first.into_body(), 64 * 1024)
+            .await
+            .expect("first body readable");
+
+        // Mock exhausted — only the cache can reproduce this 200.
+        let second = get_quote(State(state), Path(12345)).await.into_response();
+        assert_eq!(second.status(), StatusCode::OK);
+        assert_eq!(
+            second
+                .headers()
+                .get(crate::response_cache::CACHE_MARKER_HEADER)
+                .and_then(|v| v.to_str().ok()),
+            Some("hit"),
+            "second call inside the TTL must be a cache hit"
+        );
+        let second_body = axum::body::to_bytes(second.into_body(), 64 * 1024)
+            .await
+            .expect("second body readable");
+        assert_eq!(
+            first_body, second_body,
+            "cache hit must return the byte-identical 200 body"
+        );
+    }
+
+    /// Error responses are NEVER cached: a 404 (no data yet) must not
+    /// poison the cache — the next request goes back to QuestDB and picks
+    /// up a just-arrived first tick as a fresh 200.
+    #[tokio::test]
+    async fn test_get_quote_404_is_never_cached() {
+        let responses = vec![
+            // call 1: empty dataset → query miss...
+            r#"{"dataset":[]}"#,
+            // ...then reachability probe succeeds → 404 verdict.
+            r#"{"dataset":[["ticks"]]}"#,
+            // call 2: the first tick has arrived → 200.
+            r#"{"dataset":[[777,"dhan","IDX_I",100.5,null,null,null,null,null,null,null,"2026-07-09T10:30:00.000000Z"]]}"#,
+        ];
+        let base_url = start_multi_mock_server(responses).await;
+        let port: u16 = base_url
+            .rsplit(':')
+            .next()
+            .expect("port should exist")
+            .parse()
+            .expect("port should parse");
+
+        let state = mock_state(port);
+        let first = get_quote(State(state.clone()), Path(777))
+            .await
+            .into_response();
+        assert_eq!(first.status(), StatusCode::NOT_FOUND);
+        assert!(
+            state.quote_cache().is_empty(),
+            "a 404 must never enter the cache"
+        );
+
+        let second = get_quote(State(state), Path(777)).await.into_response();
+        assert_eq!(
+            second.status(),
+            StatusCode::OK,
+            "the request after the first tick must be a fresh 200, not a cached 404"
+        );
+    }
+
+    /// The 400 invalid-SID guard runs before any cache/DB work and is
+    /// never cached either.
+    #[tokio::test]
+    async fn test_get_quote_zero_security_id_not_cached() {
+        let state = mock_state(1);
+        let response = get_quote(State(state.clone()), Path(0))
+            .await
+            .into_response();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(state.quote_cache().is_empty(), "400 must never be cached");
     }
 
     // -----------------------------------------------------------------------

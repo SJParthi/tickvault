@@ -4,7 +4,7 @@
 > (operator, 2026-07-03; Mac-first execution confirmed).
 > **Error codes:** `.claude/rules/project/groww-scale-error-codes.md`
 > (GROWW-SCALE-01..04).
-> **Plan:** `.claude/plans/active-plan-groww-autoscale.md`.
+> **Plan:** `.claude/plans/archive/2026-07-03-groww-autoscale.md`.
 
 ## What this test does
 

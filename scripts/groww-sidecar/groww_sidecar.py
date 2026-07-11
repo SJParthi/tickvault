@@ -1531,8 +1531,23 @@ def ms_to_ist_nanos(ts_millis: int) -> int:
 
 
 def now_ist_nanos() -> int:
-    """Current wall-clock time as IST epoch nanoseconds (for the status file ts)."""
-    return int(datetime.now(tz=IST).timestamp() * 1_000_000_000)
+    """Current wall-clock time as IST epoch nanoseconds (for the status file ts).
+
+    EPOCH CONTRACT (2026-07-06 fix, cross-language — ratcheted by
+    test_sidecar_status_stamp_shares_the_ist_epoch_convention in
+    crates/app/src/groww_bridge.rs): this MUST use the same
+    `replace(tzinfo=timezone.utc)` trick as ms_to_ist_nanos so the stamp is
+    "IST epoch" = UTC epoch + 19,800s — the SAME convention the Rust bridge's
+    receipt clock (`receipt_ist_nanos`) uses. The previous
+    `datetime.now(tz=IST).timestamp()` returned the PLAIN UTC epoch
+    (`.timestamp()` on an aware datetime ignores the zone), so the bridge's
+    freshness gate (`groww_status_is_live`, 120s window) read every genuinely
+    fresh status record as ~19,800s old and classified it STALE forever —
+    killing the connect/subscribe evidence path and false-firing the
+    groww-ws-inactive alarm every morning.
+    """
+    dt_ist = datetime.now(tz=IST)
+    return int(dt_ist.replace(tzinfo=timezone.utc).timestamp() * 1_000_000_000)
 
 
 def write_status(event: str, stocks: int, indices: int) -> None:

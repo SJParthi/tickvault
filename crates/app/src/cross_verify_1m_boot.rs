@@ -56,6 +56,10 @@ const FETCH_DEGRADED_FAIL_FRACTION: f64 = 0.10;
 const SECONDS_PER_MINUTE: i64 = 60;
 /// Nanoseconds per second (IST-epoch → nanos).
 const NANOS_PER_SEC: i64 = 1_000_000_000;
+/// Epoch-microsecond scale — the ONLY representation legal in an embedded
+/// QuestDB TIMESTAMP comparison literal (see the regression lock on
+/// [`our_candles_select_sql`]).
+const MICROS_PER_SEC: i64 = 1_000_000;
 
 /// IST seconds-of-day for the post-market cross-verify trigger (15:31:00).
 const CROSS_VERIFY_TRIGGER_SECS_OF_DAY_IST: u32 = 15 * 3600 + 31 * 60; // 55_860
@@ -415,8 +419,22 @@ pub fn parse_our_candles_dataset(body: &str) -> Vec<MinuteCandle> {
 
 /// Build the QuestDB SELECT for ONE instrument's `candles_1m` rows on the
 /// trading day. Pure (testable). `trading_date` is the IST date; the day window
-/// is `[date 00:00, date+1 00:00)` in IST nanoseconds (QuestDB stores `ts` in
-/// IST nanos for live candles).
+/// is `[date 00:00, date+1 00:00)` in IST time. The PARAMETER stays in IST
+/// nanoseconds (the in-memory convention everywhere else in this module); ONLY
+/// the embedded SQL literals are microseconds.
+///
+/// REGRESSION LOCK (hostile review 2026-07-10, empirically confirmed on the
+/// pinned QuestDB 9.3.5): a bare integer literal compared against a TIMESTAMP
+/// column is interpreted as epoch **MICROSECONDS**, not nanoseconds. The
+/// previous NANOSECOND bounds placed the WHERE window ~year 58502 and matched
+/// ZERO rows — `ours` was always empty, `compared=0` forever, and the run
+/// self-labelled BLIND every day (the system's only OHLCV parity signal
+/// vouched for nothing). COMPOUNDING second bug: `(ts / 1)` yields MICROS, so
+/// the projected minute key must be re-scaled `* 1000` to align with the
+/// NANOSECOND keys produced by `intraday_utc_secs_to_ist_minute_nanos` — a
+/// WHERE-only fix would still join zero minutes in `diff_minute_candles`.
+/// Both are pinned (digit-magnitude, not substring presence) by
+/// `test_our_candles_select_sql_micros_window_and_nanos_key`.
 ///
 /// **Feed-scoped (operator 2026-06-19, "same tables + feed column"):** since the
 /// `candles_1m` table is now shared by Dhan and Groww (distinguished by the
@@ -426,13 +444,14 @@ pub fn parse_our_candles_dataset(body: &str) -> Vec<MinuteCandle> {
 /// minute-by-minute exact compare would see phantom mismatches / double minutes.
 #[must_use]
 pub fn our_candles_select_sql(security_id: i64, segment: &str, day_start_ist_nanos: i64) -> String {
-    let day_end = day_start_ist_nanos.saturating_add(86_400 * NANOS_PER_SEC);
+    let day_start_micros = day_start_ist_nanos / 1_000;
+    let day_end_micros = day_start_micros.saturating_add(86_400 * MICROS_PER_SEC);
     let feed = tickvault_storage::shadow_candle_writer::CANDLE_FEED_DHAN;
     format!(
-        "SELECT (ts / 1) AS ts_nanos, open, high, low, close, volume \
+        "SELECT (ts / 1) * 1000 AS ts_nanos, open, high, low, close, volume \
          FROM candles_1m \
          WHERE security_id = {security_id} AND segment = '{segment}' AND feed = '{feed}' \
-         AND ts >= {day_start_ist_nanos} AND ts < {day_end} ORDER BY ts ASC"
+         AND ts >= {day_start_micros} AND ts < {day_end_micros} ORDER BY ts ASC"
     )
 }
 
@@ -881,6 +900,28 @@ pub const fn default_csv_dir() -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn test_cross_verify_targets_exclude_index_future_role() {
+        // §36 (2026-07-08): the main.rs 15:31 target build keeps ONLY roles
+        // for which `instrument_type_for_role` returns Some — the IndexFuture
+        // None arm therefore excludes futures from cross-verify by
+        // construction (spot-only; CROSS-VERIFY-1M-02 math untouched).
+        use crate::prev_day_ohlcv_boot::instrument_type_for_role;
+        use tickvault_core::instrument::daily_universe::InstrumentRole;
+        let roles = [
+            InstrumentRole::Index,
+            InstrumentRole::FnoUnderlying,
+            InstrumentRole::IndexConstituent,
+            InstrumentRole::IndexFuture,
+        ];
+        let kept: Vec<&'static str> = roles
+            .iter()
+            .filter_map(|r| instrument_type_for_role(*r))
+            .collect();
+        assert_eq!(kept, vec!["INDEX", "EQUITY", "EQUITY"]);
+        assert!(instrument_type_for_role(InstrumentRole::IndexFuture).is_none());
+    }
+
     use super::*;
 
     fn mc(minute_ts: i64, o: f64, h: f64, l: f64, c: f64, v: i64) -> MinuteCandle {
@@ -1056,9 +1097,48 @@ mod tests {
         // not double-count minutes in the Dhan-vs-Dhan-historical compare.
         assert!(sql.contains("feed = 'dhan'"));
         assert!(sql.contains("ORDER BY ts ASC"));
-        // day window upper bound = start + 24h in nanos.
+        // day window upper bound = (start + 24h) in MICROS (QuestDB literal
+        // semantics — see the regression lock on the builder).
+        assert!(sql.contains(
+            &(1_780_000_000_000_000_000_i64 / 1_000 + 86_400 * MICROS_PER_SEC).to_string()
+        ));
+    }
+
+    /// REGRESSION LOCK (2026-07-10, proven live on QuestDB 9.3.5): the WHERE
+    /// bounds MUST be epoch MICROSECONDS (16 digits for a 2026 day) — the old
+    /// 19-digit NANOSECOND literals sat ~year 58502 and matched ZERO rows
+    /// (compared=0/BLIND forever). The projected minute key MUST be re-scaled
+    /// `(ts / 1) * 1000` back to nanos so it joins the Dhan-side nanos keys.
+    /// Digit-magnitude semantics, not substring presence.
+    #[test]
+    fn test_our_candles_select_sql_micros_window_and_nanos_key() {
+        // 2026-07-10 00:00 IST as nanos (19 digits).
+        let day_start_ist_nanos = 1_784_005_200_000_000_000_i64;
+        let sql = our_candles_select_sql(13, "IDX_I", day_start_ist_nanos);
+
+        let start_micros = day_start_ist_nanos / 1_000;
+        let end_micros = start_micros + 86_400 * MICROS_PER_SEC;
+        assert_eq!(
+            start_micros.to_string().len(),
+            16,
+            "2026-era micros bound must be 16 digits"
+        );
+        assert!(sql.contains(&format!("ts >= {start_micros}")), "{sql}");
+        assert!(sql.contains(&format!("ts < {end_micros}")), "{sql}");
+        // The broken 19-digit nanos literals must be ABSENT.
         assert!(
-            sql.contains(&(1_780_000_000_000_000_000_i64 + 86_400 * NANOS_PER_SEC).to_string())
+            !sql.contains(&day_start_ist_nanos.to_string()),
+            "nanos start literal banned: {sql}"
+        );
+        assert!(
+            !sql.contains(&(day_start_ist_nanos + 86_400 * NANOS_PER_SEC).to_string()),
+            "nanos end literal banned: {sql}"
+        );
+        // Nanos-aligned join key: (ts / 1) is MICROS on QuestDB; ×1000 makes
+        // ts_nanos genuinely nanos so diff_minute_candles keys match.
+        assert!(
+            sql.contains("(ts / 1) * 1000 AS ts_nanos"),
+            "micros→nanos key rescale banned from regressing: {sql}"
         );
     }
 

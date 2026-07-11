@@ -9,6 +9,14 @@
 #
 # Default criterion-dir: target/criterion
 #
+# Env:
+#   BENCH_BUDGET_MULTIPLIER (float, default 1.0) — scales the ABSOLUTE ns
+#   budgets from quality/benchmark-budgets.toml for slower runner classes
+#   (the "runner-class multiplier" remediation documented in bench.yml's
+#   header). The TOML values stay the dev-hardware truth and are NEVER
+#   edited; the multiplier is the explicit, logged hardware adjustment.
+#   It does NOT touch the regression arm (max_regression_pct is unchanged).
+#
 # Exit codes (consumed by .github/workflows/bench.yml baseline-ratchet logic):
 #   0 = clean — all benchmarks within budget, no confident regression
 #   1 = absolute-budget breach ONLY (per-element ns budget exceeded)
@@ -27,6 +35,16 @@ set -euo pipefail
 
 CRITERION_DIR="${1:-target/criterion}"
 BUDGETS_FILE="quality/benchmark-budgets.toml"
+BENCH_BUDGET_MULTIPLIER="${BENCH_BUDGET_MULTIPLIER:-1.0}"
+
+# Validate the multiplier early and loudly: digits and at most one dot only
+# (rejects empty, negative, and non-numeric garbage before it reaches Python).
+case "$BENCH_BUDGET_MULTIPLIER" in
+  ''|*[!0-9.]*|.|*.*.*)
+    echo "ERROR: BENCH_BUDGET_MULTIPLIER must be a positive number, got '$BENCH_BUDGET_MULTIPLIER'" >&2
+    exit 1
+    ;;
+esac
 
 if [ ! -d "$CRITERION_DIR" ]; then
   echo "INFO: No criterion results found at $CRITERION_DIR — skipping bench gate."
@@ -93,6 +111,16 @@ abs_failed = False   # absolute per-element ns budget breach -> exit 1
 reg_failed = False   # confident (CI lower bound) regression breach -> exit 2
 checked = 0
 
+# Runner-class multiplier for ABSOLUTE budgets only (never the regression
+# arm). Default 1.0 = dev-hardware budgets exactly as written in the TOML.
+multiplier = float('$BENCH_BUDGET_MULTIPLIER')
+if multiplier <= 0:
+    print(f'ERROR: BENCH_BUDGET_MULTIPLIER must be > 0, got {multiplier}', file=sys.stderr)
+    sys.exit(1)
+if multiplier != 1.0:
+    print(f'  NOTE: absolute budgets scaled x{multiplier:g} for shared-runner hardware (BENCH_BUDGET_MULTIPLIER={multiplier:g})')
+    print('')
+
 # Walk criterion results
 criterion_dir = '$CRITERION_DIR'
 for root, dirs, files in os.walk(criterion_dir):
@@ -135,11 +163,14 @@ for root, dirs, files in os.walk(criterion_dir):
         if budget_ns is not None:
             checked += 1
             unit = f' ({median_ns:.0f}ns / {n_elements})' if n_elements > 1 else ''
-            if per_elem_ns > budget_ns:
-                print(f'  FAIL: {bench_name}: {per_elem_ns:.0f}ns{unit} (budget: {budget_ns:.0f}ns)')
+            effective_ns = budget_ns * multiplier
+            budget_label = (f'{effective_ns:.0f}ns = {budget_ns:.0f}ns x{multiplier:g}'
+                            if multiplier != 1.0 else f'{budget_ns:.0f}ns')
+            if per_elem_ns > effective_ns:
+                print(f'  FAIL: {bench_name}: {per_elem_ns:.0f}ns{unit} (budget: {budget_label})')
                 abs_failed = True
             else:
-                print(f'  PASS: {bench_name}: {per_elem_ns:.0f}ns{unit} (budget: {budget_ns:.0f}ns)')
+                print(f'  PASS: {bench_name}: {per_elem_ns:.0f}ns{unit} (budget: {budget_label})')
         else:
             print(f'  INFO: {bench_name}: {median_ns:.0f}ns (no budget defined — skipping)')
 

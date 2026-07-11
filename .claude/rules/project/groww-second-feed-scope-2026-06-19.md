@@ -458,3 +458,56 @@ Always loaded. Reinforced on any session editing
 the `[feeds] groww_native_shadow` key, or any file containing
 `groww_native_shadow` / `rust-live-ticks.ndjson` / `GROWW_SOCKET_TOKEN_URL`.
 
+
+---
+
+# §36 — FUTIDX-4 in the Groww watch set (operator authorization 2026-07-08)
+
+> **Cross-link:** the Dhan-side grant is `daily-universe-scope-expansion-2026-05-27.md` §36
+> (same section number deliberately, cross-linked both ways).
+
+## §36.0 The verbatim operator demand (preserve exactly, do not paraphrase)
+
+**Quote (2026-07-08):**
+> "for both dhan and groww we need to add futures and those also should be subscribed along with this, especially only for nifty banknifty and sensex nifty midcap."
+
+**Quote (2026-07-10, relayed verbatim via the coordinator session — §36.7 all-months expansion):**
+> "instead of only one current month futures contracts just take all the futures of these
+> indices — I mean take all available applicable months futures."
+
+## §36.1 The grant
+
+The Groww watch set gains one entry per (underlying, monthly expiry `>= today`) —
+`{exchange: NSE×3 / BSE×1, segment: "FNO", exchange_token: <numeric>, kind: ltp}` — ALL
+vendor-listed monthly serials of the SAME 4 underlyings the Dhan side subscribes (§36.7 of
+the daily-universe lock, 2026-07-10; typically ~12, envelope ≤6 serials/underlying;
+NIFTY, BANKNIFTY, MIDCPNIFTY on NSE; SENSEX on BSE), ALL cap-priority in the live-subscribe
+set. Expiry resolution comes ONLY from the static Groww master CSV
+(`GROWW_INSTRUMENT_CSV_URL` — the `no-rest-except-live-feed-2026-06-27.md` §3 KEEP class);
+§33 LIVE-FEED-ONLY is untouched (NO Groww historical call ever). ONE Groww connection unchanged
+(`groww-scale-aws-lockout-2026-07-06.md` untouched). Rows land in the SAME shared tables tagged
+`feed='groww'` with feed-in-key DEDUP. Both feeds select the expiries via ONE shared pure function
+(`crates/core/src/instrument/index_futures.rs::select_index_future_expiries` — ALL monthly
+expiries >= today, nearest first, NEVER rolls); missing FUT rows degrade per-underlying —
+or per-(underlying, month) for month-scoped reasons (FUTIDX-01, feed=groww) —
+never fail the watch build; cross-feed expiry-SET divergence in any comparable month pages
+FUTIDX-02 (a far-suffix depth difference is an info-level note, never a page).
+
+## §36.2 Honest notes
+
+Groww LTP carries only `{ltp, tsInMillis}` — no volume/OI for futures (`cum_volume` stays 0). A
+Groww future's `security_id` is the Groww exchange_token — a DIFFERENT id space from Dhan's
+FUTIDX SID for the same contract (cross-feed comparison maps by contract = underlying+expiry,
+never by id). Live Groww FNO `subscribe_ltp` delivery is UNVERIFIED-LIVE — the first enabled
+session is the probe; the feed-stall watchdog + FUTIDX-01 payloads make silence loud. Live
+Groww FNO LTP delivery for months 2..N is UNVERIFIED-LIVE (§36.7 — same class as the
+original 4). Under §36.7 the live set is ~779 of the 1000 cap (~767 spots + ~12 futures).
+
+## §36.3 REJECT list (Groww side)
+
+OPTIDX/CE/PE entries in the watch set; futures of a 5th underlying; any non-monthly-serial
+entry; >`MAX_MONTHLY_EXPIRIES_PER_UNDERLYING` (6) serials per underlying (fail-closed, never
+truncated); any new Groww connection; any Groww historical fetch (§33); resolving expiry from
+anything but the static master CSV. (The pre-2026-07-10 single-expiry-per-underlying ban is
+REMOVED by this dated §36.7 edit.) This file must be edited FIRST with a fresh dated quote
+for any of the above.

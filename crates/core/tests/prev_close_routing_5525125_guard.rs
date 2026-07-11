@@ -38,9 +38,9 @@
 //! - `.claude/rules/dhan/live-market-feed.md` — Mechanical Rule 7/8/10.
 
 use tickvault_common::constants::{
-    EXCHANGE_SEGMENT_IDX_I, EXCHANGE_SEGMENT_NSE_EQ, EXCHANGE_SEGMENT_NSE_FNO, FULL_OFFSET_CLOSE,
-    FULL_QUOTE_PACKET_SIZE, PREV_CLOSE_OFFSET_PRICE, PREVIOUS_CLOSE_PACKET_SIZE,
-    QUOTE_OFFSET_CLOSE, QUOTE_PACKET_SIZE,
+    EXCHANGE_SEGMENT_BSE_FNO, EXCHANGE_SEGMENT_IDX_I, EXCHANGE_SEGMENT_NSE_EQ,
+    EXCHANGE_SEGMENT_NSE_FNO, FULL_OFFSET_CLOSE, FULL_QUOTE_PACKET_SIZE, PREV_CLOSE_OFFSET_PRICE,
+    PREVIOUS_CLOSE_PACKET_SIZE, QUOTE_OFFSET_CLOSE, QUOTE_PACKET_SIZE,
 };
 use tickvault_core::parser::full_packet::parse_full_packet;
 use tickvault_core::parser::previous_close::parse_previous_close_packet;
@@ -227,4 +227,88 @@ fn test_prev_close_routing_offsets_are_distinct_per_ticket_5525125() {
     assert_ne!(QUOTE_OFFSET_CLOSE, FULL_OFFSET_CLOSE);
     assert_ne!(QUOTE_OFFSET_CLOSE, PREV_CLOSE_OFFSET_PRICE);
     assert_ne!(FULL_OFFSET_CLOSE, PREV_CLOSE_OFFSET_PRICE);
+}
+
+/// §36 (2026-07-08) — NSE_FNO FUTIDX in **Quote mode**: the previous-day
+/// close is inside the Quote packet (response code 4) at bytes 38-41 as
+/// f32 LE, exactly as for NSE_EQ. This is the LIVE locked fact
+/// (`dhan_locked_facts.rs::locked_ticket_5525125_nse_eq_fno_prev_close_from_quote_full`)
+/// — the "NSE_FNO → Full" row of the old PREVCLOSE-03 matrix served the
+/// deleted OI/depth consumers and its ratchet is retired `#[cfg(any())]`
+/// (PR #7b). The parser is segment-agnostic; this ratchet pins that a
+/// segment-byte-2 Quote packet routes the close correctly for the §36/§36.7
+/// Quote-mode FUTIDX subscriptions (all monthly serials since 2026-07-10).
+#[test]
+fn test_prev_close_routing_nse_fno_from_quote_close_field_bytes_38_to_41() {
+    const NIFTY_FUT_PREV_CLOSE: f32 = 23_146.45;
+    const NIFTY_FUT_SECURITY_ID: u32 = 35001;
+
+    let mut buf = vec![0u8; QUOTE_PACKET_SIZE];
+    write_header(
+        &mut buf,
+        4,
+        EXCHANGE_SEGMENT_NSE_FNO,
+        NIFTY_FUT_SECURITY_ID,
+        QUOTE_PACKET_SIZE as u16,
+    );
+    buf[QUOTE_OFFSET_CLOSE..QUOTE_OFFSET_CLOSE + 4]
+        .copy_from_slice(&NIFTY_FUT_PREV_CLOSE.to_le_bytes());
+
+    let header = make_header(
+        4,
+        EXCHANGE_SEGMENT_NSE_FNO,
+        NIFTY_FUT_SECURITY_ID,
+        QUOTE_PACKET_SIZE as u16,
+    );
+    let tick = parse_quote_packet(&buf, &header, 0)
+        .expect("Quote parser must accept a 50-byte NSE_FNO packet");
+    assert!(
+        (tick.day_close - NIFTY_FUT_PREV_CLOSE).abs() < f32::EPSILON,
+        "Ticket #5525125 + §36: NSE_FNO prev_close MUST be readable from \
+         Quote (code 4) bytes 38-41 (f32 LE). Got {got}, expected {expected}.",
+        got = tick.day_close,
+        expected = NIFTY_FUT_PREV_CLOSE,
+    );
+    assert_eq!(tick.exchange_segment_code, EXCHANGE_SEGMENT_NSE_FNO);
+    assert_eq!(tick.security_id, u64::from(NIFTY_FUT_SECURITY_ID));
+}
+
+/// §36 (2026-07-08) — BSE_FNO (SENSEX future) in **Quote mode**: same
+/// bytes-38-41 routing with segment byte 8. UNVERIFIED-LIVE caveat: no
+/// live BSE_FNO Quote packet has been observed yet (first enabled session
+/// is the probe; the tick-gap detector pages within 30s if silent) — this
+/// ratchet pins the PARSER contract, not Dhan's live emission.
+#[test]
+fn test_prev_close_routing_bse_fno_from_quote_close_field_bytes_38_to_41() {
+    const SENSEX_FUT_PREV_CLOSE: f32 = 80_123.75;
+    const SENSEX_FUT_SECURITY_ID: u32 = 45001;
+
+    let mut buf = vec![0u8; QUOTE_PACKET_SIZE];
+    write_header(
+        &mut buf,
+        4,
+        EXCHANGE_SEGMENT_BSE_FNO,
+        SENSEX_FUT_SECURITY_ID,
+        QUOTE_PACKET_SIZE as u16,
+    );
+    buf[QUOTE_OFFSET_CLOSE..QUOTE_OFFSET_CLOSE + 4]
+        .copy_from_slice(&SENSEX_FUT_PREV_CLOSE.to_le_bytes());
+
+    let header = make_header(
+        4,
+        EXCHANGE_SEGMENT_BSE_FNO,
+        SENSEX_FUT_SECURITY_ID,
+        QUOTE_PACKET_SIZE as u16,
+    );
+    let tick = parse_quote_packet(&buf, &header, 0)
+        .expect("Quote parser must accept a 50-byte BSE_FNO packet");
+    assert!(
+        (tick.day_close - SENSEX_FUT_PREV_CLOSE).abs() < f32::EPSILON,
+        "§36: BSE_FNO prev_close MUST be readable from Quote (code 4) \
+         bytes 38-41 (f32 LE). Got {got}, expected {expected}.",
+        got = tick.day_close,
+        expected = SENSEX_FUT_PREV_CLOSE,
+    );
+    assert_eq!(tick.exchange_segment_code, EXCHANGE_SEGMENT_BSE_FNO);
+    assert_eq!(tick.security_id, u64::from(SENSEX_FUT_SECURITY_ID));
 }

@@ -774,17 +774,33 @@ pub fn build_subscription_plan(
     SubscriptionPlan { registry, summary }
 }
 
+/// §36 (2026-07-08): map an IndexFuture target's CSV segment string to the
+/// WebSocket `ExchangeSegment`. FUTIDX segment CANNOT be derived from the
+/// role alone (SENSEX = BSE_FNO, the NSE three = NSE_FNO), so it comes from
+/// the authoritative `csv_row.segment`. Unknown values → `None` (fail-closed
+/// skip + counter — never mis-subscribed).
+#[cfg(feature = "daily_universe_fetcher")]
+fn futidx_segment_from_csv(csv_segment: &str) -> Option<ExchangeSegment> {
+    match csv_segment {
+        "NSE_FNO" => Some(ExchangeSegment::NseFno),
+        "BSE_FNO" => Some(ExchangeSegment::BseFno),
+        _ => None,
+    }
+}
+
 /// Builds a subscription plan from a daily-universe (~250 SIDs) per the
 /// 2026-05-27 `DailyUniverse` scope. Every SID subscribes in **Quote mode**
-/// (§8 — the 50-byte packet carries day OHLC at fixed offsets). Only IDX_I
-/// indices and NSE_EQ F&O-underlying spots are subscribed — NO derivative
-/// contracts. Dedup is the composite `(security_id, exchange_segment)` key
+/// (§8 — the 50-byte packet carries day OHLC at fixed offsets). IDX_I
+/// indices, NSE_EQ F&O-underlying/NTM spots, and (§36 2026-07-08 / §36.7
+/// 2026-07-10) the all-months FUTIDX contracts of the 4 underlyings are
+/// subscribed — never any other derivative. Dedup is the composite `(security_id, exchange_segment)` key
 /// (I-P1-11). Cold path — called once at boot.
 ///
 /// The instrument segment is derived from the target ROLE, which is
 /// authoritative per rule §2 (indices → IDX_I; F&O underlyings resolve to
-/// their NSE_EQ spot row). Rows whose `security_id` is not a valid `u64`
-/// are skipped + counted — never panics on malformed CSV-derived data.
+/// their NSE_EQ spot row; IndexFuture → [`futidx_segment_from_csv`]). Rows
+/// whose `security_id` is not a valid `u64` are skipped + counted — never
+/// panics on malformed CSV-derived data.
 #[cfg(feature = "daily_universe_fetcher")]
 pub fn build_subscription_plan_from_daily_universe(universe: &DailyUniverse) -> SubscriptionPlan {
     // §8: the daily universe subscribes every SID in Quote mode.
@@ -796,6 +812,17 @@ pub fn build_subscription_plan_from_daily_universe(universe: &DailyUniverse) -> 
     let mut seen_ids: HashSet<(u64, ExchangeSegment)> =
         HashSet::with_capacity(universe.subscription_targets.len());
     let mut skipped_unparsable_sid: usize = 0;
+    let mut skipped_futidx_bad_segment: usize = 0;
+    // §36 hostile-review round 2 (2026-07-08): count the IndexFuture targets
+    // the universe HANDED the planner, so the post-plan honesty check below
+    // can page FUTIDX-01 on ANY planner-stage drop of a chosen future
+    // (unparsable SID / unknown segment / composite-key dedup) — the Dhan
+    // mirror of the Groww post-cap gauge fix (round 1, R1-B).
+    let expected_futures = universe
+        .subscription_targets
+        .iter()
+        .filter(|t| t.role == InstrumentRole::IndexFuture)
+        .count();
 
     for target in &universe.subscription_targets {
         let Ok(security_id) = target.csv_row.security_id.parse::<u64>() else {
@@ -809,6 +836,16 @@ pub fn build_subscription_plan_from_daily_universe(universe: &DailyUniverse) -> 
             InstrumentRole::FnoUnderlying | InstrumentRole::IndexConstituent => {
                 ExchangeSegment::NseEquity
             }
+            // §36 (2026-07-08): FUTIDX segment comes from the CSV row —
+            // SENSEX is BSE_FNO, the NSE three are NSE_FNO. Unknown segment
+            // → fail-closed skip + counter, never mis-subscribed.
+            InstrumentRole::IndexFuture => match futidx_segment_from_csv(&target.csv_row.segment) {
+                Some(seg) => seg,
+                None => {
+                    skipped_futidx_bad_segment += 1;
+                    continue;
+                }
+            },
         };
         if !seen_ids.insert((security_id, segment)) {
             continue;
@@ -831,6 +868,27 @@ pub fn build_subscription_plan_from_daily_universe(universe: &DailyUniverse) -> 
                     feed_mode,
                 }
             }
+            // §36/§36.7 (2026-07-10): one of the all-months index futures.
+            // Feed mode stays the plan-global Quote binding (§8 lock);
+            // prev-close arrives in the Quote packet at bytes 38-41 (Ticket
+            // #5525125, dhan_locked_facts.rs).
+            InstrumentRole::IndexFuture => SubscribedInstrument {
+                security_id,
+                exchange_segment: segment,
+                category: SubscriptionCategory::IndexDerivative,
+                // Precise contract label (Dhan-support commandment).
+                display_label: target.csv_row.symbol_name.clone(),
+                underlying_symbol: target.csv_row.underlying_symbol.clone(),
+                instrument_kind: Some(DhanInstrumentKind::FutureIndex),
+                expiry_date: NaiveDate::parse_from_str(
+                    target.csv_row.expiry_date.trim(),
+                    "%Y-%m-%d",
+                )
+                .ok(),
+                strike_price: None,
+                option_type: None,
+                feed_mode,
+            },
         };
         instruments.push(instrument);
     }
@@ -841,11 +899,40 @@ pub fn build_subscription_plan_from_daily_universe(universe: &DailyUniverse) -> 
             "daily-universe plan: skipped rows with non-numeric security_id"
         );
     }
+    if skipped_futidx_bad_segment > 0 {
+        warn!(
+            skipped_futidx_bad_segment,
+            "daily-universe plan: skipped IndexFuture targets with unknown csv segment (§36 \
+             fail-closed — expected NSE_FNO or BSE_FNO)"
+        );
+    }
 
     let registry = InstrumentRegistry::from_instruments(instruments);
     metrics::gauge!("tv_instrument_registry_cross_segment_collisions")
         .set(registry.cross_segment_collisions() as f64);
     metrics::gauge!("tv_instrument_registry_total_entries").set(registry.len() as f64);
+
+    // §36 hostile-review round 2 (2026-07-08): the Dhan futures gauge is
+    // POST-PLAN and honest — it reports what is actually IN the plan, and a
+    // planner-stage drop of a chosen future is LOUD (FUTIDX-01), mirroring
+    // the Groww post-cap fix. IndexDerivative is populated ONLY by the
+    // IndexFuture role in the DailyUniverse plan, so the category count IS
+    // the planned-futures count.
+    let planned_futures = registry.category_count(SubscriptionCategory::IndexDerivative);
+    metrics::gauge!("tv_index_futures_selected", "feed" => "dhan").set(planned_futures as f64);
+    if planned_futures < expected_futures {
+        tracing::error!(
+            code = tickvault_common::error_code::ErrorCode::Futidx01SelectionDegraded.code_str(),
+            feed = "dhan",
+            expected = expected_futures,
+            planned = planned_futures,
+            skipped_unparsable_sid,
+            skipped_futidx_bad_segment,
+            "index-future(s) dropped at the PLAN stage (unparsable SID / unknown segment / \
+             composite-key dedup) — the gauge reports the POST-PLAN count; subscription \
+             proceeds without them"
+        );
+    }
 
     let total = registry.len();
     let exceeds_capacity = total > MAX_TOTAL_SUBSCRIPTIONS;
@@ -4195,6 +4282,18 @@ mod tests {
     //   NSE_FNO  → Full           (bytes 50-53 of Full packet)
     //   BSE_FNO  → Full           (bytes 50-53 of Full packet)
     //
+    // 2026-07-08 correction (§36 FUTIDX-4, dated): the NSE_FNO/BSE_FNO
+    // "→ Full" rows above are STALE for the live DailyUniverse path — the
+    // Full requirement served the deleted OI/depth consumers and its ratchet
+    // test below is retired `#[cfg(any())]` (PR #7b). The LIVE locked fact
+    // (Ticket #5525125, `dhan_locked_facts.rs`) permits prev-close from the
+    // QUOTE packet at bytes 38-41 for NSE_EQ AND NSE_FNO derivatives, and the
+    // §8 Quote-for-all lock stands: ALL §36/§36.7 FUTIDX SIDs (every monthly
+    // serial since 2026-07-10) subscribe in Quote mode. OI is NOT inline in Quote mode (separate code-5 packet,
+    // counted-and-dropped today — documented non-goal). Ratchets:
+    // `crates/core/tests/prev_close_routing_5525125_guard.rs` (Quote+FNO
+    // routing) + `test_daily_universe_plan_index_future_targets_quote_mode_fno_segments`.
+    //
     // These tests verify the planner output today (default config = Full)
     // and ratchet against future regression where someone downgrades F&O
     // to Quote/Ticker and silently loses prev_close for half the universe.
@@ -4934,6 +5033,38 @@ mod daily_universe_plan_tests {
         assert_eq!(plan.summary.feed_mode, FeedMode::Quote);
     }
 
+    /// Hostile-review round 2 (2026-07-08, F2 — Dhan mirror of the Groww
+    /// post-cap fix): a planner-stage drop of a chosen IndexFuture target
+    /// (unknown segment here; unparsable SID is the sibling arm) leaves the
+    /// POST-PLAN IndexDerivative count BELOW the handed-in future count —
+    /// the honesty gap the post-plan gauge + FUTIDX-01 error now cover.
+    #[test]
+    fn test_plan_futidx_planner_drop_is_counted_post_plan() {
+        let mut good = daily_target(InstrumentRole::IndexFuture, "35001", "NSE_FNO", "NIFTY-FUT");
+        good.csv_row.underlying_symbol = "NIFTY".to_string();
+        good.csv_row.expiry_date = "2026-07-30".to_string();
+        let mut bad = daily_target(
+            InstrumentRole::IndexFuture,
+            "45001",
+            "MCX_COMM", // unknown FUTIDX segment → fail-closed planner skip
+            "SENSEX-FUT",
+        );
+        bad.csv_row.underlying_symbol = "SENSEX".to_string();
+        bad.csv_row.expiry_date = "2026-07-30".to_string();
+        let universe = DailyUniverse {
+            subscription_targets: vec![good, bad],
+            fno_contracts: vec![],
+        };
+        let plan = build_subscription_plan_from_daily_universe(&universe);
+        // 2 futures handed in, 1 survives the plan — the post-plan gauge
+        // reports 1 (not 2) and the FUTIDX-01 planner-drop error fires.
+        assert_eq!(
+            plan.summary.index_derivatives, 1,
+            "post-plan count is honest"
+        );
+        assert_eq!(plan.summary.total, 1);
+    }
+
     #[test]
     fn test_daily_universe_plan_dedup_composite_and_skips_unparsable() {
         let universe = DailyUniverse {
@@ -4957,6 +5088,145 @@ mod daily_universe_plan_tests {
             "dup dropped + unparsable skipped → 1 survivor"
         );
         assert_eq!(plan.summary.major_index_values, 1);
+    }
+
+    // ----- §36 (2026-07-08): FUTIDX-4 planner arm -----
+
+    #[cfg(feature = "daily_universe_fetcher")]
+    fn daily_futidx_target(
+        security_id: &str,
+        segment: &str,
+        underlying: &str,
+        expiry: &str,
+    ) -> SubscriptionTarget {
+        SubscriptionTarget {
+            role: InstrumentRole::IndexFuture,
+            is_fno_underlying: false,
+            is_index_constituent: false,
+            csv_row: CsvRow {
+                security_id: security_id.to_string(),
+                exch_id: if segment == "BSE_FNO" { "BSE" } else { "NSE" }.to_string(),
+                segment: segment.to_string(),
+                instrument: "FUTIDX".to_string(),
+                symbol_name: format!("{underlying}-Jul2026-FUT"),
+                underlying_symbol: underlying.to_string(),
+                expiry_date: expiry.to_string(),
+                ..CsvRow::default()
+            },
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "daily_universe_fetcher")]
+    fn test_daily_universe_plan_index_future_targets_quote_mode_fno_segments() {
+        let universe = DailyUniverse {
+            subscription_targets: vec![
+                daily_target(InstrumentRole::Index, "13", "IDX_I", "NIFTY"),
+                daily_futidx_target("35001", "NSE_FNO", "NIFTY", "2026-07-30"),
+                daily_futidx_target("45001", "BSE_FNO", "SENSEX", "2026-07-31"),
+            ],
+            fno_contracts: vec![],
+        };
+        let plan = build_subscription_plan_from_daily_universe(&universe);
+        assert_eq!(plan.summary.total, 3);
+        assert_eq!(plan.summary.index_derivatives, 2, "both futures counted");
+        // §8: plan-global Quote mode, futures included.
+        assert_eq!(plan.summary.feed_mode, FeedMode::Quote);
+        let nifty_fut = plan
+            .registry
+            .get_with_segment(35001, ExchangeSegment::NseFno)
+            .expect("NIFTY future in registry at NSE_FNO");
+        assert_eq!(nifty_fut.category, SubscriptionCategory::IndexDerivative);
+        assert_eq!(nifty_fut.feed_mode, FeedMode::Quote);
+        assert_eq!(
+            nifty_fut.instrument_kind,
+            Some(DhanInstrumentKind::FutureIndex)
+        );
+        assert_eq!(
+            nifty_fut.expiry_date,
+            NaiveDate::from_ymd_opt(2026, 7, 30),
+            "expiry parsed from SM_EXPIRY_DATE"
+        );
+        assert_eq!(nifty_fut.underlying_symbol, "NIFTY");
+        let sensex_fut = plan
+            .registry
+            .get_with_segment(45001, ExchangeSegment::BseFno)
+            .expect("SENSEX future in registry at BSE_FNO");
+        assert_eq!(sensex_fut.exchange_segment, ExchangeSegment::BseFno);
+    }
+
+    #[test]
+    #[cfg(feature = "daily_universe_fetcher")]
+    fn test_daily_universe_plan_futidx_plans_every_monthly_target() {
+        // §36.7 (2026-07-10): the planner plans EVERY (underlying, month)
+        // target the universe hands in — 2 months × 4 underlyings here,
+        // distinct SIDs, zero drops (the gauge-visible IndexDerivative
+        // count equals the handed-in count).
+        let universe = DailyUniverse {
+            subscription_targets: vec![
+                daily_futidx_target("35001", "NSE_FNO", "NIFTY", "2026-07-30"),
+                daily_futidx_target("35002", "NSE_FNO", "BANKNIFTY", "2026-07-30"),
+                daily_futidx_target("35003", "NSE_FNO", "MIDCPNIFTY", "2026-07-28"),
+                daily_futidx_target("45001", "BSE_FNO", "SENSEX", "2026-07-31"),
+                daily_futidx_target("36001", "NSE_FNO", "NIFTY", "2026-08-27"),
+                daily_futidx_target("36002", "NSE_FNO", "BANKNIFTY", "2026-08-27"),
+                daily_futidx_target("36003", "NSE_FNO", "MIDCPNIFTY", "2026-08-25"),
+                daily_futidx_target("46001", "BSE_FNO", "SENSEX", "2026-08-28"),
+            ],
+            fno_contracts: vec![],
+        };
+        let plan = build_subscription_plan_from_daily_universe(&universe);
+        assert_eq!(
+            plan.summary.index_derivatives, 8,
+            "every monthly target planned — one per (underlying, month)"
+        );
+        assert_eq!(plan.summary.total, 8, "zero planner-stage drops");
+    }
+
+    #[test]
+    #[cfg(feature = "daily_universe_fetcher")]
+    fn test_daily_universe_plan_index_future_unknown_segment_skipped() {
+        let universe = DailyUniverse {
+            subscription_targets: vec![
+                daily_target(InstrumentRole::Index, "13", "IDX_I", "NIFTY"),
+                // A wiring-bug row: IndexFuture role with a non-FNO segment.
+                daily_futidx_target("35001", "MCX_COMM", "NIFTY", "2026-07-30"),
+                daily_futidx_target("35002", "garbage", "BANKNIFTY", "2026-07-30"),
+            ],
+            fno_contracts: vec![],
+        };
+        let plan = build_subscription_plan_from_daily_universe(&universe);
+        assert_eq!(
+            plan.summary.total, 1,
+            "bad-segment futures skipped fail-closed, never mis-subscribed"
+        );
+        assert_eq!(plan.summary.index_derivatives, 0);
+    }
+
+    #[test]
+    #[cfg(feature = "daily_universe_fetcher")]
+    fn test_daily_universe_plan_futures_dedup_composite_key() {
+        // I-P1-11: an NSE_FNO future SID numerically equal to an NSE_EQ spot
+        // SID → BOTH survive (composite (sid, segment) identity).
+        let universe = DailyUniverse {
+            subscription_targets: vec![
+                daily_target(InstrumentRole::FnoUnderlying, "2885", "NSE_EQ", "RELIANCE"),
+                daily_futidx_target("2885", "NSE_FNO", "NIFTY", "2026-07-30"),
+            ],
+            fno_contracts: vec![],
+        };
+        let plan = build_subscription_plan_from_daily_universe(&universe);
+        assert_eq!(plan.summary.total, 2, "both segments kept");
+        assert!(
+            plan.registry
+                .get_with_segment(2885, ExchangeSegment::NseEquity)
+                .is_some()
+        );
+        assert!(
+            plan.registry
+                .get_with_segment(2885, ExchangeSegment::NseFno)
+                .is_some()
+        );
     }
 
     #[test]
