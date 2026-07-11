@@ -1242,7 +1242,7 @@ pub struct FeedScoreLine {
 /// Tiebreak ladder — feed-off no-contest (round 4: a switched-off feed's
 /// measured zeros are a one-horse race, never a win for the other) →
 /// exclusive minutes → worst-1% delay (only when BOTH are measured; a −1
-/// sentinel never decides) → broker-blamed drops → even day.
+/// sentinel never decides) → broker-blamed incidents → even day.
 fn scorecard_verdict(
     dhan: &FeedScoreLine,
     groww: &FeedScoreLine,
