@@ -17,10 +17,10 @@ use tracing::{debug, error, info, trace, warn};
 use crate::parser::dispatch_frame;
 use crate::parser::types::ParsedFrame;
 use tickvault_common::constants::{
-    DEDUP_RING_BUFFER_POWER, IST_UTC_OFFSET_SECONDS, MINIMUM_VALID_EXCHANGE_TIMESTAMP,
-    MUHURAT_PERSIST_END_SECS_OF_DAY_IST, MUHURAT_PERSIST_START_SECS_OF_DAY_IST, SECONDS_PER_DAY,
-    TICK_PERSIST_END_SECS_OF_DAY_IST, TICK_PERSIST_START_SECS_OF_DAY_IST,
-    WS_GRACE_AFTER_CLOSE_SECS_U32,
+    DEDUP_RING_BUFFER_POWER, EXCHANGE_SEGMENT_IDX_I, IST_UTC_OFFSET_SECONDS,
+    MINIMUM_VALID_EXCHANGE_TIMESTAMP, MUHURAT_PERSIST_END_SECS_OF_DAY_IST,
+    MUHURAT_PERSIST_START_SECS_OF_DAY_IST, SECONDS_PER_DAY, TICK_PERSIST_END_SECS_OF_DAY_IST,
+    TICK_PERSIST_START_SECS_OF_DAY_IST, WS_GRACE_AFTER_CLOSE_SECS_U32,
 };
 use tickvault_common::tick_types::{GreeksEnricher, ParsedTick};
 
@@ -282,6 +282,54 @@ fn check_tick_ohlc_integrity(ltp: f32, day_high: f32, day_low: f32) -> u8 {
         violations |= 0b100;
     }
     violations
+}
+
+/// Issue #858 — IDX_I prev-day close backstop (code-6 cache → tick stream).
+///
+/// Per Dhan Ticket #5525125 (`live-market-feed.md` rule 10), indices (IDX_I)
+/// receive their previous-day close ONLY via the standalone code-6 PrevClose
+/// packet — the Quote-mode `close` field (bytes 38-41) is UNVERIFIED-LIVE for
+/// IDX_I and observed as `0.0`. The tick processor already caches code-6
+/// values per index (`index_prev_close_cache`, file-backed for mid-day
+/// restarts) but never routed them back into the tick stream — so index
+/// candles' `close_pct_from_prev_day` depended entirely on the unverified
+/// Quote field and read 0 whenever Dhan leaves it empty.
+///
+/// Returns the cached value to stamp into `tick.day_close`, or `None` when
+/// the tick must be left untouched. Fallback semantics (backstop, never an
+/// override):
+/// * non-IDX_I segment → `None` (equities/derivatives carry prev-close
+///   inline per Ticket #5525125; the cache holds only IDX_I entries — the
+///   segment gate here also preserves I-P1-11 safety for the
+///   security_id-only cache key, mirroring the insert-side gate)
+/// * `day_close` already a usable positive finite value → `None` (a real
+///   packet-provided value ALWAYS wins; if Dhan does populate Quote close
+///   for IDX_I, the backstop never fires)
+/// * cache miss → `None` (no code-6 packet this session and no file-cache
+///   row — nothing to stamp)
+/// * cached value non-finite or non-positive (corrupted file cache) → `None`
+///
+/// O(1), zero allocation: two cheap gates, then one `HashMap::get` on the
+/// loop-owned cache (same task as the code-6 insert arm — no lock).
+#[inline(always)]
+fn idx_prev_close_backstop(
+    exchange_segment_code: u8,
+    day_close: f32,
+    index_prev_close_cache: &std::collections::HashMap<u64, f32>,
+    security_id: u64,
+) -> Option<f32> {
+    if exchange_segment_code != EXCHANGE_SEGMENT_IDX_I {
+        return None;
+    }
+    if day_close.is_finite() && day_close > 0.0 {
+        // Real packet-provided value wins — the backstop only fills gaps.
+        return None;
+    }
+    // O(1) EXEMPT: HashMap `get` is O(1) hashing, not an O(n) scan.
+    index_prev_close_cache
+        .get(&security_id)
+        .copied()
+        .filter(|cached| cached.is_finite() && *cached > 0.0)
 }
 
 /// Converts UTC nanoseconds to IST seconds-of-day.
@@ -1272,6 +1320,27 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
                     if day_close_first_log_time.is_none() {
                         day_close_first_log_time = Some(Instant::now());
                     }
+                }
+
+                // Issue #858 — IDX_I prev-close backstop: indices receive
+                // prev-day close ONLY via the standalone code-6 PrevClose
+                // packet (Dhan Ticket #5525125); their Quote-mode `close`
+                // field is UNVERIFIED-LIVE and observed 0. Stamp the
+                // code-6-cached value into `day_close` so the downstream
+                // candle chain (aggregator_cell `prev_day_close` capture →
+                // route_seal `close_pct_from_prev_day` stamp) works for
+                // indices too. Fill-only: a real packet-provided value
+                // always wins. O(1), zero-alloc: one local HashMap get on
+                // the loop-owned cache (same task as the code-6 insert arm
+                // — no lock). Sits ABOVE the baseline counter's semantics:
+                // the counter above stays "packet-provided values only".
+                if let Some(prev_close) = idx_prev_close_backstop(
+                    tick.exchange_segment_code,
+                    tick.day_close,
+                    &index_prev_close_cache,
+                    tick.security_id,
+                ) {
+                    tick.day_close = prev_close;
                 }
 
                 // Ingestion gate: drop ALL ticks outside [9:00 AM, 3:30 PM) IST.
@@ -2355,6 +2424,95 @@ mod tests {
                 "Wave 1 Item 0.a regression: sync `{banned}` reappeared in \
                  the PrevClose IDX_I arm. Use \
                  prev_close_writer::try_enqueue_global(...) instead."
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #858 — IDX_I prev-close backstop (code-6 cache → tick.day_close)
+    // -----------------------------------------------------------------------
+
+    /// Builds a one-entry cache for the backstop tests (NIFTY SID 13).
+    fn nifty_prev_close_cache(value: f32) -> std::collections::HashMap<u64, f32> {
+        let mut cache = std::collections::HashMap::with_capacity(1);
+        cache.insert(13u64, value);
+        cache
+    }
+
+    /// Issue #858: an IDX_I tick with `day_close == 0.0` and a cache hit
+    /// gets the code-6-cached prev-close stamped.
+    #[test]
+    fn test_idx_prev_close_backstop_stamps_zero_day_close_on_cache_hit() {
+        let cache = nifty_prev_close_cache(23_146.45);
+        assert_eq!(
+            idx_prev_close_backstop(0, 0.0, &cache, 13),
+            Some(23_146.45),
+            "IDX_I tick with day_close=0 must receive the code-6 cached value"
+        );
+    }
+
+    /// Issue #858: a real packet-provided `day_close` always wins — the
+    /// backstop never overrides a positive finite value, even on cache hit.
+    #[test]
+    fn test_idx_prev_close_backstop_never_overrides_nonzero_day_close() {
+        let cache = nifty_prev_close_cache(23_146.45);
+        assert_eq!(
+            idx_prev_close_backstop(0, 23_200.0, &cache, 13),
+            None,
+            "a positive finite Quote-provided day_close must never be overridden"
+        );
+    }
+
+    /// Issue #858: cache miss leaves the tick untouched.
+    #[test]
+    fn test_idx_prev_close_backstop_cache_miss_returns_none() {
+        let cache = nifty_prev_close_cache(23_146.45);
+        assert_eq!(
+            idx_prev_close_backstop(0, 0.0, &cache, 25),
+            None,
+            "an IDX_I SID absent from the code-6 cache must not be stamped"
+        );
+    }
+
+    /// Issue #858: non-IDX_I segments are untouched even when a numerically
+    /// colliding SID exists in the cache (I-P1-11 segment safety).
+    #[test]
+    fn test_idx_prev_close_backstop_non_idx_segment_returns_none() {
+        let cache = nifty_prev_close_cache(23_146.45);
+        for segment in [1u8, 2, 4, 8] {
+            assert_eq!(
+                idx_prev_close_backstop(segment, 0.0, &cache, 13),
+                None,
+                "segment {segment} must never be stamped from the IDX_I cache"
+            );
+        }
+    }
+
+    /// Issue #858: a corrupted cache value (non-finite or non-positive,
+    /// e.g. from a damaged file cache) is never stamped.
+    #[test]
+    fn test_idx_prev_close_backstop_rejects_junk_cached_values() {
+        for junk in [0.0f32, -1.0, f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let cache = nifty_prev_close_cache(junk);
+            assert_eq!(
+                idx_prev_close_backstop(0, 0.0, &cache, 13),
+                None,
+                "junk cached value {junk} must never be stamped"
+            );
+        }
+    }
+
+    /// Issue #858: an unusable NON-ZERO packet value (NaN / negative) also
+    /// takes the backstop — "fill when the packet value is unusable", which
+    /// is a strict superset of the `== 0.0` gap case and strictly safer.
+    #[test]
+    fn test_idx_prev_close_backstop_fills_non_finite_packet_value() {
+        let cache = nifty_prev_close_cache(23_146.45);
+        for unusable in [f32::NAN, -5.0f32] {
+            assert_eq!(
+                idx_prev_close_backstop(0, unusable, &cache, 13),
+                Some(23_146.45),
+                "unusable packet day_close {unusable} must take the backstop"
             );
         }
     }
