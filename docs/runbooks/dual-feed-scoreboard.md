@@ -122,7 +122,12 @@ Caveats:
   backfilled days, thin days) — compute lag averages ONLY with a
   `WHERE lag_p99_ms >= 0` variant, and NEVER compare Dhan-vs-Groww lag
   below Dhan's 1s floor (`lag_floor_ms`; "Groww faster by <1s" is
-  unprovable against Dhan's whole-second clock):
+  unprovable against Dhan's whole-second clock). The card's verdict
+  delay rung enforces this mechanically since review round 1
+  (2026-07-11): it declares a lag winner only when the cross-feed p99
+  delta EXCEEDS 1000 ms ("faster prices beyond the clock floor");
+  sub-floor deltas fall through — apply the same discipline to any
+  manual month-SQL comparison:
 
 ```sql
 SELECT feed, avg(lag_p99_ms) p99_ms FROM feed_scoreboard_daily
@@ -331,10 +336,17 @@ FROM feed_scoreboard_daily WHERE outcome != 'complete' ORDER BY trading_date_ist
     default `broker`, resets default `indeterminate` (rows flagged
     `run_partial`).
   - Lag histograms for a past day (they are in-memory, per-process,
-    day-scoped — reset at IST midnight) → sentinels stay. A mid-day
-    restart also loses the pre-restart window: the same-day row still
-    carries the post-restart distribution, stamped partial with the
-    restart footnote (measured-but-partial, never fabricated).
+    day-scoped — reset at IST midnight) → a re-run measures nothing
+    itself, but the lag keep-better (review round 1, 2026-07-11) folds
+    the day's EXISTING measured lag columns forward, so a rerun/backfill
+    can never erase a measured distribution with −1; sentinels stay only
+    when NOTHING ever measured the day. A mid-day restart loses the
+    pre-restart window: a pre-close 15:45 run carries the post-restart
+    distribution, stamped partial with the restart footnote
+    (measured-but-partial, never fabricated); a POST-CLOSE restart's
+    catch-up rerun has ZERO post-restart samples — its row keeps the
+    15:45 run's measured columns via the same keep-better
+    (`stage="lag_regression"` logs the suppression).
   - Per-instrument unique-wins for pre-PR-4 days.
   - Stall episode rows for days before the stall event kind shipped
     (PR-B, 2026-07-10) — those days honestly read `stalls = 0` in the

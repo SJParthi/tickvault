@@ -82,6 +82,45 @@ lag MEASURED for both feeds, per day, per the design contract §3.
   - Files: docs/runbooks/dual-feed-scoreboard.md, .claude/rules/project/dual-feed-scoreboard-error-codes.md, .claude/rules/project/daily-universe-scope-expansion-2026-05-27.md, .claude/rules/project/aws-budget.md, crates/app/src/metrics_catalog.rs, .claude/plans/archive/2026-07-10-scoreboard-stalls.md
   - Tests: (docs — covered by the ratchets above)
 
+### Fix round 1 (2026-07-11 — hostile review, 5 confirmed + trivial LOWs)
+
+- [x] HIGH+MEDIUM (same root): lag keep-better — a same-day post-close
+  RunCatchUp rerun / past-day backfill with empty day histograms must fold
+  the day's EXISTING measured lag columns forward instead of UPSERTing −1
+  over them (step-5a read extended to the lag columns; step-6c fold;
+  `stage="lag_regression"` on suppression); runbook + rule-file claims
+  corrected.
+  - Files: crates/app/src/feed_scoreboard_boot.rs, docs/runbooks/dual-feed-scoreboard.md, .claude/rules/project/dual-feed-scoreboard-error-codes.md
+  - Tests: test_fold_existing_lag_keep_better_preserves_measured_on_unmeasured_rerun, test_parse_existing_daily_lag_reads_columns_2_through_5, test_build_existing_daily_outcome_sql_micros_window
+- [x] MEDIUM: Groww stale_capture exclusion is now the TWO-condition
+  discriminator (bridge episode-level `replay_window` flag AND ≥60s dwell)
+  — a live backlog drain (ILP-backpressure pause / respawn-backoff wake,
+  preserved offset) is ADMITTED to the day histogram
+  (`AdmittedBacklog`, ring skipped, `tv_groww_lag_backlog_admitted_total`),
+  mirroring the Dhan 2026-07-07 round-2 fix.
+  - Files: crates/core/src/pipeline/feed_lag_monitor.rs, crates/app/src/groww_bridge.rs, crates/core/tests/dhat_feed_lag_groww.rs, crates/core/benches/feed_lag_ring.rs
+  - Tests: test_classify_groww_sample_live_backlog_without_retail_is_admitted_day_only, test_replay_window_lifecycle_clears_on_catchup_and_rearms_on_shrink, test_classify_groww_sample_stale_capture_boundary_excludes_at_exactly_60s
+- [x] MEDIUM: rung-2 verdict clock-floor guard — a lag winner is declared
+  only when |dhan_p99 − groww_p99| > 1000 ms (the Dhan whole-second
+  floor); wording "faster prices beyond the clock floor".
+  - Files: crates/core/src/notification/events.rs
+  - Tests: test_dual_feed_scorecard_body_verdict_ladder
+- [x] MEDIUM (+2 dup LOWs): the "Delay could not be measured today"
+  footnote keys on EITHER feed — a mixed-state day (one feed measured)
+  never renders the unmeasured claim over a measured value.
+  - Files: crates/core/src/notification/events.rs
+  - Tests: test_dual_feed_scorecard_mixed_lag_state_footnote_keys_on_either_feed
+- [x] LOW: `FeedLagRing::push_sample` head bump is a relaxed `fetch_add`
+  RMW (multi-writer under the dormant §34 shard fleet degrades to sampling
+  noise, never a broken single-writer invariant); ring docs updated.
+  - Files: crates/core/src/pipeline/feed_lag_monitor.rs
+  - Tests: test_ring_wraparound (existing — semantics preserved)
+- [x] LOW ×2: comment-count lockstep — boot-heartbeat-alarm.tf gated-alarm
+  rationale 11→12 (10 + 2 split); app-alarms.tf cost arithmetic 28→29
+  series / $8.40→$8.70 / $7.20→$7.50.
+  - Files: deploy/aws/terraform/boot-heartbeat-alarm.tf, deploy/aws/terraform/app-alarms.tf
+  - Tests: (comment-only; aws_alarm_semantics_guard + cloudwatch_app_alarms_wiring stay green)
+
 ## Edge Cases
 
 - **Line without `capture_ns`** (old-format / reconcile-sweep): no trusted

@@ -91,6 +91,7 @@ fn bench_record_groww_tick(c: &mut Criterion) {
         Some(t0_ist_nanos + 150 * NANOS_PER_MS),
         t0_ist_nanos + 150 * NANOS_PER_MS,
         t0_ist_nanos,
+        false,
     );
 
     c.bench_function("feed_lag/record_groww_tick", |b| {
@@ -103,6 +104,7 @@ fn bench_record_groww_tick(c: &mut Criterion) {
                 black_box(Some(capture)),
                 black_box(capture),
                 black_box(exchange),
+                black_box(false),
             );
         });
     });

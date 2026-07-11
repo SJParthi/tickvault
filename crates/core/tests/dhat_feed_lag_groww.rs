@@ -56,6 +56,7 @@ fn dhat_record_groww_tick_hot_path_zero_allocation() {
         Some(t0_ist_nanos + 150 * NANOS_PER_MS),
         t0_ist_nanos + 150 * NANOS_PER_MS,
         t0_ist_nanos,
+        false,
     );
 
     // Testing-mode profiler (house pattern — dhat_feed_lag_ring.rs):
@@ -77,7 +78,7 @@ fn dhat_record_groww_tick_hot_path_zero_allocation() {
                 // 150 ms lag), varying exchange + capture instants.
                 let exchange = t0_ist_nanos + i * NANOS_PER_MS;
                 let capture = exchange + 150 * NANOS_PER_MS;
-                record_groww_tick(Some(capture), capture, exchange);
+                record_groww_tick(Some(capture), capture, exchange, false);
                 std::hint::black_box(i);
             }
         },

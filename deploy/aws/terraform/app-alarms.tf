@@ -23,11 +23,11 @@
 #                         -> Operator's phone
 #
 # Filter is configured in user-data.sh.tftpl::amazon-cloudwatch-agent.json
-# emf_processor block — keeps custom-metric cost capped (28 selected
-# series × ~$0.30 ≈ $8.40/mo absolute, $5.40/mo above the 10-free-metric
+# emf_processor block — keeps custom-metric cost capped (29 selected
+# series × ~$0.30 ≈ $8.70/mo absolute, $5.70/mo above the 10-free-metric
 # tier — vs. ~₹4500/mo for an unfiltered 150-metric scrape; the 27-name
 # MAIN EMF list is pinned by cloudwatch_app_alarms_wiring.rs, and the two
-# [host,feed] boundary-catchup declarations bring the series count to 28).
+# [host,feed] boundary-catchup declarations bring the series count to 29).
 # 2026-07-06 groww feed-down alerting: +3 selected metrics
 # (tv_groww_ws_active, tv_feed_last_tick_age_seconds,
 # tv_feed_sidecar_stall_restart_total) ≈ +$0.90/mo, +2 alarms ≈ +$0.20/mo.
@@ -39,10 +39,11 @@
 #   - Post-PR (historical): 18 alarms, 12 custom metrics.
 #     Overage then: 8 alarms × $0.10 = $0.80/mo + 2 custom metrics × $0.30
 #     = $0.60/mo ≈ ₹120/mo extra.
-#   - Current (2026-07-08, silent-feed hardening): 21 app alarms in THIS
-#     file + 3 in silent-feed-alarms.tf; 28 selected custom-metric series.
-#     Overage now: alarms ≈ $1.80/mo + metrics (28 − 10 free) × $0.30 =
-#     $5.40/mo ⇒ ~$7.20/mo ≈ ₹610/mo total (matches the
+#   - Current (2026-07-11, scoreboard PR-C groww lag gauge): 21 app alarms
+#     in THIS file + 4 in silent-feed-alarms.tf; 29 selected custom-metric
+#     series (27 main EMF names + the 2 [host,feed] boundary-catchup
+#     declarations). Overage now: alarms ≈ $1.80/mo + metrics (29 − 10
+#     free) × $0.30 = $5.70/mo ⇒ ~$7.50/mo ≈ ₹640/mo total (matches the
 #     app_cloudwatch_alarms output below + aws-budget.md's 2026-07-06
 #     note). Operator MUST acknowledge before terraform apply.
 
@@ -715,7 +716,7 @@ resource "aws_cloudwatch_metric_alarm" "mem_used_high" {
 # ---------------------------------------------------------------------------
 
 output "app_cloudwatch_alarms" {
-  description = "21 application-level alarms in THIS file (19 Prometheus-via-CW-agent incl. #1437's 2 groww alarms + 1 disk-used + 1 mem-used Metrics-Insights); 3 more silent-feed alarms live in silent-feed-alarms.tf (2026-07-06 incident hardening). tick-gap-instruments-silent was RETUNED 2026-07-06 (threshold 100 -> 40 PROVISIONAL, 10-of-12 min, market-hours-gated). Cost note (2026-07-06 groww feed-down alerting adds 2 alarms + 3 selected metrics; silent-feed hardening adds 3 alarms + 4 selected series): overage above the 10 free-tier alarms ≈ $1.80/mo + 28 selected custom-metric series ≈ $5.40/mo overage above the 10 free-tier metrics (≈ $8.40/mo absolute at ~$0.30 each; EMF name count pinned by cloudwatch_app_alarms_wiring.rs) ≈ $7.20/mo ≈ ₹610/mo total — well inside the $55 budget cap."
+  description = "21 application-level alarms in THIS file (19 Prometheus-via-CW-agent incl. #1437's 2 groww alarms + 1 disk-used + 1 mem-used Metrics-Insights); 3 more silent-feed alarms live in silent-feed-alarms.tf (2026-07-06 incident hardening). tick-gap-instruments-silent was RETUNED 2026-07-06 (threshold 100 -> 40 PROVISIONAL, 10-of-12 min, market-hours-gated). Cost note (2026-07-06 groww feed-down alerting adds 2 alarms + 3 selected metrics; silent-feed hardening adds 3 alarms + 4 selected series): overage above the 10 free-tier alarms ≈ $1.80/mo + 29 selected custom-metric series ≈ $5.70/mo overage above the 10 free-tier metrics (≈ $8.70/mo absolute at ~$0.30 each; EMF name count pinned by cloudwatch_app_alarms_wiring.rs) ≈ $7.50/mo ≈ ₹640/mo total — well inside the $55 budget cap."
   value = [
     aws_cloudwatch_metric_alarm.disk_used_high.alarm_name,
     aws_cloudwatch_metric_alarm.mem_used_high.alarm_name,
