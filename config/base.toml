@@ -451,3 +451,15 @@ coverage_detail_rows    = true   # per-instrument detail rows (populated by PR-4
 presence_fold_enabled   = true   # hot-path presence fold (lands in PR-4)
 groww_lag_enabled       = true   # Groww lag histograms (land in PR-3)
 trigger_secs_of_day_ist = 56700  # 15:45:00 IST
+
+# ===========================================================================
+# Per-minute spot 1m REST pipeline (operator grant 2026-07-12 — PR-2, the
+# SPOT half). Every trading-day minute close in [09:16:00, 15:30:00] IST,
+# fetch the just-closed minute's official 1m OHLCV for the 3 IDX_I spot
+# indices (NIFTY 13 / BANKNIFTY 25 / SENSEX 51) via Dhan POST
+# /v2/charts/intraday and persist to the spot_1m_rest table. Cold path;
+# the WS candle pipeline is untouched. An ABSENT section = disabled
+# (fail-safe); `enabled = false` is the rollback switch.
+# ===========================================================================
+[spot_1m_rest]
+enabled = true
