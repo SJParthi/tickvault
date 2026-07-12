@@ -42,6 +42,7 @@ use tickvault_common::config::{ApplicationConfig, BrutexCrossverifyConfig, Quest
 use tickvault_common::constants::IST_UTC_OFFSET_SECONDS;
 use tickvault_common::error_code::ErrorCode;
 use tickvault_common::feed::Feed;
+use tickvault_common::sanitize::sanitize_audit_string;
 use tickvault_common::trading_calendar::TradingCalendar;
 use tickvault_core::notification::{NotificationEvent, NotificationService};
 use tickvault_storage::brutex_crossverify_persistence::{
@@ -435,9 +436,14 @@ pub fn day_prefix(prefix: &str, date_label: &str) -> String {
 /// `true` for keys the runner fetches as BruteX CSVs (case-insensitive
 /// `.csv` suffix). The segment path component in the key is ADVISORY only —
 /// symbols come from the CSV rows and the mapping decides identity.
+///
+/// Byte-safe by construction: producer-controlled S3 keys may contain
+/// multi-byte UTF-8 whose `len - 4` offset is not a char boundary — a string
+/// slice there would panic (`panic = "abort"` would kill the process on a
+/// hostile object name), so the suffix compare operates on raw bytes.
 #[must_use]
 pub fn key_is_csv(key: &str) -> bool {
-    key.len() >= 4 && key[key.len() - 4..].eq_ignore_ascii_case(".csv")
+    key.len() >= 4 && key.as_bytes()[key.len() - 4..].eq_ignore_ascii_case(b".csv")
 }
 
 /// `true` for the day's best-effort manifest object.
@@ -1120,7 +1126,10 @@ pub async fn run_brutex_crossverify(
             break;
         }
         if *size > 0 && u64::try_from(*size).unwrap_or(u64::MAX) > cfg.max_object_bytes {
-            warn!(key = %key, size, "brutex_crossverify: object over size cap — skipped");
+            warn!(
+                key = %sanitize_audit_string(key),
+                size, "brutex_crossverify: object over size cap — skipped"
+            );
             degraded_counter("s3_object_oversize");
             run_partial = true;
             continue;
@@ -1139,7 +1148,7 @@ pub async fn run_brutex_crossverify(
                 error!(
                     code = ErrorCode::BrutexXverify02RunDegraded.code_str(),
                     stage = "s3_get",
-                    key = %key,
+                    key = %sanitize_audit_string(key),
                     %err,
                     "BRUTEX-XVERIFY-02: object fetch failed after bounded \
                      attempts — skipped (partial coverage)"
@@ -1189,7 +1198,7 @@ pub async fn run_brutex_crossverify(
                 error!(
                     code = ErrorCode::BrutexXverify02RunDegraded.code_str(),
                     stage = "csv_parse",
-                    key = %key,
+                    key = %sanitize_audit_string(key),
                     %err,
                     "BRUTEX-XVERIFY-02: CSV parse failed — object skipped"
                 );
@@ -1992,6 +2001,32 @@ mod tests {
         assert!(!key_is_csv("csv"));
         assert!(key_is_manifest("brutex/2026-07-10/_MANIFEST.json"));
         assert!(!key_is_manifest("brutex/2026-07-10/MANIFEST.json"));
+    }
+
+    /// FIX ROUND 2 (security HIGH): `key_is_csv` must be byte-safe on
+    /// producer-controlled multi-byte UTF-8 keys. The pre-fix
+    /// `key[key.len() - 4..]` string slice PANICS when `len - 4` is not a
+    /// char boundary — under `panic = "abort"` a hostile S3 object name
+    /// would kill the trading process.
+    #[test]
+    fn test_key_is_csv_multibyte_utf8_never_panics() {
+        // Multi-byte key with a genuine .csv suffix (suffix is pure ASCII).
+        assert!(key_is_csv("データ.csv"));
+        assert!(key_is_csv("brutex/2026-07-10/NSE_EQ/データ.CSV"));
+        // Short key (len < 4) — false, no underflow.
+        assert!(!key_is_csv("a"));
+        assert!(!key_is_csv(""));
+        // Panic reproducers: len - 4 lands INSIDE a multi-byte sequence.
+        // "abcé" = 5 bytes; 5 - 4 = 1 (boundary OK) — but "abécd" and
+        // "xxé--" style keys put the offset mid-sequence. Construct keys
+        // where byte len-4 splits the 2-byte 'é' (0xC3 0xA9):
+        assert!(!key_is_csv("abcé")); // 5 bytes, not .csv
+        assert!(!key_is_csv("aéxx")); // 6 bytes; len-4 = 2 = mid-'é' — must NOT panic
+        assert!(!key_is_csv("xéyz")); // 6 bytes; same mid-sequence offset class
+        // 4-byte emoji directly before a non-.csv tail — mid-sequence offsets.
+        assert!(!key_is_csv("💹xx")); // 6 bytes; len-4 = 2 = inside the emoji
+        // Multi-byte key whose last 4 BYTES are not ASCII at all.
+        assert!(!key_is_csv("データ"));
     }
 
     #[test]

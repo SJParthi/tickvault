@@ -156,11 +156,16 @@ fn truncate_chars(line: &str, max_chars: usize) -> String {
 }
 
 /// True when every char of the trimmed uppercase symbol is in the allowed
-/// charset: ASCII alphanumeric, space, `.`, `-`, `_`, `&`, `/`.
+/// charset: ASCII alphanumeric, space, `.`, `-`, `_` — ALIGNED (FIX ROUND 2)
+/// with the API's `is_valid_symbol_param` (`[A-Za-z0-9 ._-]`, the §37.3
+/// contract). `&` and `/` were removed: rows admitted here but rejected by
+/// the API produced dead drill-down links (400). Strictest charset wins —
+/// M&M-style NSE symbols become counted bad rows until a future contract
+/// amendment widens BOTH sides in lockstep.
 fn symbol_charset_ok(symbol: &str) -> bool {
     symbol
         .chars()
-        .all(|c| c.is_ascii_alphanumeric() || matches!(c, ' ' | '.' | '-' | '_' | '&' | '/'))
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, ' ' | '.' | '-' | '_'))
 }
 
 /// Parse a BruteX price field to integer paise. Rejects non-finite, ≤ 0,
@@ -1266,6 +1271,26 @@ mod tests {
         for sample in &parsed.bad_row_samples {
             assert!(sample.chars().count() <= BAD_ROW_SAMPLE_MAX_CHARS);
         }
+    }
+
+    /// FIX ROUND 2: the parse charset is ALIGNED with the API's
+    /// `is_valid_symbol_param` (`[A-Za-z0-9 ._-]`) — `&` and `/` symbols
+    /// become counted bad rows so a comparable row can never carry a
+    /// symbol the drill-down API would 400 on. NOTE: real NSE symbols
+    /// like `M&M` / `M&MFIN` are therefore excluded until a FUTURE
+    /// contract amendment widens the §37.3 charset on BOTH sides
+    /// (parse + API) in lockstep.
+    #[test]
+    fn csv_symbol_with_ampersand_or_slash_is_bad_row() {
+        let body = csv(&[
+            "M&M,2026-07-10 09:15:00,1.00,2.00,1.00,1.50,0,0",
+            "A/B,2026-07-10 09:15:00,1.00,2.00,1.00,1.50,0,0",
+            "GOOD,2026-07-10 09:15:00,1.00,2.00,1.00,1.50,0,0",
+        ]);
+        let parsed = parse_brutex_csv(&body, 100).expect("parses");
+        assert_eq!(parsed.rows.len(), 1);
+        assert_eq!(parsed.rows[0].symbol, "GOOD");
+        assert_eq!(parsed.bad_rows, 2);
     }
 
     #[test]
