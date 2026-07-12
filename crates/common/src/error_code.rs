@@ -948,6 +948,42 @@ pub enum ErrorCode {
     /// are DEDUP-idempotent (`ts, security_id, exchange_segment, feed`).
     /// Severity::High, auto-triage-safe.
     Spot1m02PersistFailed,
+    /// CHAIN-01 (per-minute REST pipeline PR-3, operator grant 2026-07-12)
+    /// — the option-chain Data-API ENTITLEMENT is absent: Dhan rejected an
+    /// expirylist / option-chain call with the DH-902 / DATA 806 class
+    /// (or a 401/403 whose body names the missing subscription). Fires
+    /// ONCE per day (edge-triggered); the chain pipeline stays DOWN for
+    /// the day — never a per-minute 401 storm. Severity::High,
+    /// auto-triage NO (severity-independent override: restoring the
+    /// entitlement is an operator/broker account decision, never a code
+    /// fix).
+    Chain01EntitlementAbsent,
+    /// CHAIN-02 (per-minute REST pipeline PR-3, 2026-07-12) — the
+    /// per-minute option-chain fetch degraded: a whole minute failed for
+    /// one/all of the 3 underlyings (transport error, non-2xx, budget
+    /// overrun, malformed body, or a 200 whose chain carried zero strikes
+    /// — `outcome="empty"`, counted, never silent). The ESCALATION
+    /// emission (the one that also pages the typed Telegram event) fires
+    /// edge-triggered after 3 consecutive fully-failed minutes (persist
+    /// failures count — a fetched-but-never-persisted minute is NOT ok).
+    /// Severity::High, auto-triage-safe (the next minute re-attempts;
+    /// the WS pipeline is untouched).
+    Chain02FetchDegraded,
+    /// CHAIN-03 (per-minute REST pipeline PR-3, 2026-07-12) — the
+    /// `option_chain_1m` QuestDB persist leg failed (ensure-DDL non-2xx /
+    /// unreachable, ILP append rejected, or the ILP-over-HTTP flush was
+    /// refused by the server ACK; failed flushes DISCARD pending rows —
+    /// the poisoned-buffer defense). Best-effort forensic write;
+    /// re-appends are DEDUP-idempotent. Severity::High, auto-triage-safe.
+    Chain03PersistFailed,
+    /// CHAIN-04 (per-minute REST pipeline PR-3, 2026-07-12) — the
+    /// day-start expirylist warmup failed after bounded retries (3
+    /// attempts, 3s/6s backoff): the chain pipeline degrades to
+    /// DISABLED-FOR-THE-DAY — expiry dates come ONLY from the API
+    /// (option-chain.md rule 9), NEVER guessed. One page per day.
+    /// Severity::High, auto-triage-safe (the next trading-day boot
+    /// re-attempts automatically).
+    Chain04ExpirylistFailed,
 }
 
 impl ErrorCode {
@@ -1137,6 +1173,11 @@ impl ErrorCode {
             // Per-minute spot 1m REST pipeline (operator grant 2026-07-12)
             Self::Spot1m01FetchDegraded => "SPOT1M-01",
             Self::Spot1m02PersistFailed => "SPOT1M-02",
+            // Per-minute option-chain REST pipeline (PR-3, 2026-07-12)
+            Self::Chain01EntitlementAbsent => "CHAIN-01",
+            Self::Chain02FetchDegraded => "CHAIN-02",
+            Self::Chain03PersistFailed => "CHAIN-03",
+            Self::Chain04ExpirylistFailed => "CHAIN-04",
         }
     }
 
@@ -1303,7 +1344,16 @@ impl ErrorCode {
             // a halt — the WS candle pipeline is untouched and re-appends
             // are DEDUP-idempotent.
             | Self::Spot1m01FetchDegraded
-            | Self::Spot1m02PersistFailed => Severity::High,
+            | Self::Spot1m02PersistFailed
+            // CHAIN-01..04 (PR-3, 2026-07-12) — the option-chain half of
+            // the per-minute REST pipeline. High: entitlement absence /
+            // sustained fetch degrade / persist failure / expirylist
+            // failure all need operator eyes; never a halt — the WS
+            // pipeline is untouched and re-appends are DEDUP-idempotent.
+            | Self::Chain01EntitlementAbsent
+            | Self::Chain02FetchDegraded
+            | Self::Chain03PersistFailed
+            | Self::Chain04ExpirylistFailed => Severity::High,
             // FUTIDX-01/02 (§36 2026-07-08) — per-underlying selection degrade
             // / cross-feed expiry divergence. Loud (Telegram High), never a
             // halt; the spot universe + both live feeds are unaffected.
@@ -1621,6 +1671,14 @@ impl ErrorCode {
             Self::Spot1m01FetchDegraded | Self::Spot1m02PersistFailed => {
                 ".claude/rules/project/rest-1m-pipeline-error-codes.md"
             }
+            // Per-minute option-chain REST pipeline (PR-3, 2026-07-12) —
+            // one runbook for the whole per-minute REST pipeline family.
+            Self::Chain01EntitlementAbsent
+            | Self::Chain02FetchDegraded
+            | Self::Chain03PersistFailed
+            | Self::Chain04ExpirylistFailed => {
+                ".claude/rules/project/rest-1m-pipeline-error-codes.md"
+            }
         }
     }
 
@@ -1652,6 +1710,10 @@ impl ErrorCode {
             Self::Futidx02CrossFeedExpiryMismatch
                 | Self::WalSuspend01TableSuspended
                 | Self::BrutexXverify01DivergenceFound
+                // CHAIN-01 (PR-3, 2026-07-12): restoring the option-chain
+                // Data-API entitlement is an operator/broker ACCOUNT
+                // decision — never auto-actioned despite High severity.
+                | Self::Chain01EntitlementAbsent
         ) {
             return false;
         }
@@ -1835,6 +1897,11 @@ impl ErrorCode {
             // Per-minute spot 1m REST pipeline (operator grant 2026-07-12)
             Self::Spot1m01FetchDegraded,
             Self::Spot1m02PersistFailed,
+            // Per-minute option-chain REST pipeline (PR-3, 2026-07-12)
+            Self::Chain01EntitlementAbsent,
+            Self::Chain02FetchDegraded,
+            Self::Chain03PersistFailed,
+            Self::Chain04ExpirylistFailed,
         ]
     }
 }
@@ -2184,7 +2251,16 @@ mod tests {
         // 140 -> 142 for SPOT1M-01 (per-minute spot fetch degraded — edge-
         // triggered escalation) + SPOT1M-02 (spot_1m_rest persist failed —
         // best-effort, DEDUP-idempotent re-append).
-        assert_eq!(ErrorCode::all().len(), 142);
+        // 2026-07-12 (per-minute option-chain REST pipeline PR-3): bumped
+        // for CHAIN-01 (entitlement absent — once-per-day edge,
+        // manual triage) + CHAIN-02 (per-minute chain fetch degraded —
+        // edge-triggered escalation) + CHAIN-03 (option_chain_1m persist
+        // failed — best-effort, DEDUP-idempotent) + CHAIN-04 (day-start
+        // expirylist warmup failed — pipeline disabled-for-the-day, never
+        // a guessed expiry).
+        // 2026-07-12 merge note: BRUTEX-XVERIFY (2) + SPOT1M (2) landed on
+        // this branch at 142; main's CHAIN-01..04 (4) merge in => 146.
+        assert_eq!(ErrorCode::all().len(), 146);
     }
 
     #[test]
@@ -2254,6 +2330,38 @@ mod tests {
         assert_eq!(
             f2.runbook_path(),
             ".claude/rules/project/futidx-4-error-codes.md"
+        );
+    }
+
+    #[test]
+    fn test_chain_codes_contract() {
+        // Per-minute option-chain REST pipeline (PR-3, 2026-07-12).
+        let c1 = ErrorCode::Chain01EntitlementAbsent;
+        assert_eq!(c1.code_str(), "CHAIN-01");
+        assert_eq!("CHAIN-01".parse::<ErrorCode>(), Ok(c1));
+        assert_eq!(c1.severity(), Severity::High);
+        // Design contract: the entitlement is an operator/broker ACCOUNT
+        // decision — NEVER auto-actioned despite being non-Critical (the
+        // FUTIDX-02 severity-independent override precedent).
+        assert!(!c1.is_auto_triage_safe());
+
+        for (code, s) in [
+            (ErrorCode::Chain02FetchDegraded, "CHAIN-02"),
+            (ErrorCode::Chain03PersistFailed, "CHAIN-03"),
+            (ErrorCode::Chain04ExpirylistFailed, "CHAIN-04"),
+        ] {
+            assert_eq!(code.code_str(), s);
+            assert_eq!(s.parse::<ErrorCode>(), Ok(code));
+            assert_eq!(code.severity(), Severity::High);
+            // Degrades self-heal (next minute / next trading-day boot) —
+            // auto-triage may inspect.
+            assert!(code.is_auto_triage_safe());
+            assert!(ErrorCode::all().contains(&code));
+        }
+        // The whole family shares the per-minute REST pipeline runbook.
+        assert_eq!(
+            c1.runbook_path(),
+            ".claude/rules/project/rest-1m-pipeline-error-codes.md"
         );
     }
 
@@ -2405,7 +2513,9 @@ mod tests {
                 // BruteX↔TickVault daily cross-verify (2026-07-12).
                 || s.starts_with("BRUTEX-XVERIFY-")
                 // Per-minute spot 1m REST pipeline (operator grant 2026-07-12).
-                || s.starts_with("SPOT1M-");
+                || s.starts_with("SPOT1M-")
+                // Per-minute option-chain REST pipeline (PR-3, 2026-07-12).
+                || s.starts_with("CHAIN-");
             assert!(has_known_prefix, "unexpected code prefix: {s}");
         }
     }

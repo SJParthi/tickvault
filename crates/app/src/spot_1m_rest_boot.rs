@@ -112,6 +112,13 @@ pub struct Spot1mRestTaskParams {
     pub questdb: QuestDbConfig,
     /// Dhan REST v2 base URL (joined via `join_api_url` — never `format!`).
     pub rest_api_base_url: String,
+    /// PR-3 sequencing signal (OPTIONAL — plumbed only when the chain leg
+    /// is enabled): the boundary seconds-of-day of the minute this task
+    /// just finished firing, published at the END of each fire (success or
+    /// failure) via `send_replace` (never fails, receivers optional). The
+    /// option-chain leg wakes on it so it fires immediately AFTER the spot
+    /// fetch; `None` keeps PR-2 behaviour byte-identical.
+    pub minute_done_tx: Option<tokio::sync::watch::Sender<Option<u32>>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -673,6 +680,12 @@ pub async fn run_spot_1m_rest(params: Spot1mRestTaskParams) {
         }
 
         fire_one_minute(&params, &client, &url, &mut writer, &mut edge, fire).await;
+        // PR-3 sequencing: tell the option-chain leg this minute's spot
+        // fire is DONE (success or failure — the chain must never block on
+        // a failing spot leg). `send_replace` never errors.
+        if let Some(tx) = &params.minute_done_tx {
+            tx.send_replace(Some(fire));
+        }
         last_fired = Some(fire);
         // H2 overrun accounting: boundaries that fully elapsed DURING the
         // fire can never be fetched — count them loudly + feed the edge.

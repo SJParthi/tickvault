@@ -483,3 +483,20 @@ compare_volume           = false    # groww live volume is always 0
 # ===========================================================================
 [spot_1m_rest]
 enabled = true
+
+# ===========================================================================
+# Per-minute option-chain REST pipeline (operator grant 2026-07-12 — PR-3,
+# the OPTION-CHAIN half). When enabled: a day-start expirylist warmup pins
+# each underlying's CURRENT expiry, then every session minute — sequenced
+# right after the spot leg — the FULL current-expiry option chain for the
+# 3 underlyings is pulled via POST /v2/optionchain and persisted to the
+# option_chain_1m table. Cold path; the WS pipeline is untouched.
+# DEFAULT-OFF pending the live entitlement probe (the account had no
+# Option Chain Data-API entitlement in June 2026 — DH-902/806 class).
+# While disabled, probe_and_report = true runs ONE boot-time expirylist
+# probe and reports the verdict via Telegram; the pipeline NEVER auto-runs
+# — the operator flips `enabled = true` after an entitled verdict.
+# ===========================================================================
+[option_chain_1m]
+enabled = false  # pending live entitlement probe
+probe_and_report = true

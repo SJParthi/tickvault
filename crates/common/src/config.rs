@@ -99,6 +99,15 @@ pub struct ApplicationConfig {
     /// section ⇒ DISABLED (fail-safe default off).
     #[serde(default)]
     pub spot_1m_rest: Spot1mRestConfig,
+    /// `[option_chain_1m]` — per-minute option-chain REST pipeline (operator
+    /// grant 2026-07-12, `no-rest-except-live-feed-2026-06-27.md` §8; PR-3,
+    /// the OPTION-CHAIN half). Config-gated DEFAULT-OFF pending the
+    /// first-live-boot entitlement probe (the account had no Option Chain
+    /// Data-API entitlement in June 2026 — DH-902/806 class — and the
+    /// entitlement is unprobeable from the dev sandbox). Absent section ⇒
+    /// pipeline disabled + probe-and-report ON.
+    #[serde(default)]
+    pub option_chain_1m: OptionChain1mConfig,
 }
 
 /// `[feeds]` — pluggable market-data feed selection (operator lock
@@ -486,6 +495,55 @@ pub struct Spot1mRestConfig {
     /// OFF (fail-safe) — `config/base.toml` turns it on explicitly.
     #[serde(default)]
     pub enabled: bool,
+}
+
+/// `[option_chain_1m]` — per-minute option-chain REST pipeline (operator
+/// grant 2026-07-12; PR-3, the OPTION-CHAIN half). Cold path only — the
+/// WS candle pipeline, tick capture and trading are untouched.
+///
+/// Semantics (the honest reading of the operator's "auto-enables/reports"
+/// intent WITHOUT a silent behaviour change — documented in the module doc
+/// of `crates/app/src/option_chain_1m_boot.rs`):
+/// - `enabled = true` → run the per-minute pipeline. The boot-time
+///   entitlement probe still runs FIRST; an entitlement-class reject
+///   (DH-902 / DATA 806) fires ONE edge-triggered page and keeps the
+///   pipeline down for the day.
+/// - `enabled = false` + `probe_and_report = true` (the DEFAULT) → at boot
+///   (Dhan lane up, trading day) run ONE expirylist probe, report the
+///   verdict via Telegram (entitled → "flip the setting on"; not entitled
+///   → names the DH-902/806 class), then exit. The full pipeline NEVER
+///   auto-runs while `enabled = false` — the operator flips the config.
+///
+/// Fail-safe shape: both fields `#[serde(default)]`-covered, so an absent
+/// `[option_chain_1m]` section (or a TOML written before this PR)
+/// deserializes to `{ enabled: false, probe_and_report: true }`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct OptionChain1mConfig {
+    /// Master switch for the per-minute option-chain fetcher. Default OFF
+    /// (pending the live entitlement probe) — flipping the DEFAULT needs a
+    /// fresh dated operator quote.
+    #[serde(default)]
+    pub enabled: bool,
+    /// When the pipeline is disabled, still run the ONE boot-time
+    /// expirylist entitlement probe and report the verdict via Telegram.
+    /// Default ON so the operator learns the entitlement state on the
+    /// first live boot without enabling the pipeline.
+    #[serde(default = "default_chain_1m_probe_and_report")]
+    pub probe_and_report: bool,
+}
+
+/// serde default for [`OptionChain1mConfig::probe_and_report`] — ON.
+fn default_chain_1m_probe_and_report() -> bool {
+    true
+}
+
+impl Default for OptionChain1mConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            probe_and_report: default_chain_1m_probe_and_report(),
+        }
+    }
 }
 
 impl Default for GrowwScaleConfig {
@@ -2323,6 +2381,7 @@ mod tests {
             scoreboard: ScoreboardConfig::default(),
             brutex_crossverify: BrutexCrossverifyConfig::default(),
             spot_1m_rest: Spot1mRestConfig::default(),
+            option_chain_1m: OptionChain1mConfig::default(),
         }
     }
 
@@ -3754,6 +3813,50 @@ mod tests {
             .extract()
             .expect("explicit enabled = true must round-trip");
         assert!(on.spot_1m_rest.enabled);
+    }
+
+    /// Per-minute option-chain REST pipeline (operator grant 2026-07-12,
+    /// PR-3): the `[option_chain_1m]` pipeline is DEFAULT-OFF (pending the
+    /// live entitlement probe) with `probe_and_report` DEFAULT-ON — via
+    /// `Default`, via a missing section, and via an empty section — and
+    /// explicit values round-trip.
+    #[test]
+    fn test_option_chain_1m_default_off_config_gate() {
+        use figment::Figment;
+        use figment::providers::{Format, Toml};
+
+        let d = OptionChain1mConfig::default();
+        assert!(!d.enabled, "option_chain_1m must default OFF (entitlement)");
+        assert!(d.probe_and_report, "probe_and_report must default ON");
+
+        #[derive(Deserialize)]
+        struct Wrapper {
+            #[serde(default)]
+            option_chain_1m: OptionChain1mConfig,
+        }
+        // Missing section entirely → pipeline off, probe on, never an error.
+        let missing: Wrapper = Figment::new()
+            .merge(Toml::string("[other]\nx = 1\n"))
+            .extract()
+            .expect("missing [option_chain_1m] must default, not error");
+        assert!(!missing.option_chain_1m.enabled);
+        assert!(missing.option_chain_1m.probe_and_report);
+        // Empty section (no keys) → same via the field-level defaults.
+        let empty: Wrapper = Figment::new()
+            .merge(Toml::string("[option_chain_1m]\n"))
+            .extract()
+            .expect("empty [option_chain_1m] must default, not error");
+        assert!(!empty.option_chain_1m.enabled);
+        assert!(empty.option_chain_1m.probe_and_report);
+        // Explicit values round-trip (the future opt-in shape).
+        let on: Wrapper = Figment::new()
+            .merge(Toml::string(
+                "[option_chain_1m]\nenabled = true\nprobe_and_report = false\n",
+            ))
+            .extract()
+            .expect("explicit values must round-trip");
+        assert!(on.option_chain_1m.enabled);
+        assert!(!on.option_chain_1m.probe_and_report);
     }
 
     /// A missing `[feeds]` section must fall back to the safe default

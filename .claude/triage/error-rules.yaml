@@ -2398,3 +2398,82 @@ rules:
       recovery is re-run-safe; the underlying condition is QuestDB
       ILP/HTTP health, which needs operator eyes (make doctor,
       BOOT-01/BOOT-02 cross-check) rather than a blind auto-fix.
+
+  # -----------------------------------------------------------------------
+  # Per-minute option-chain REST pipeline (operator grant 2026-07-12, PR-3)
+  # -----------------------------------------------------------------------
+
+  # CHAIN-01 = the option-chain Data-API ENTITLEMENT is absent (DH-902 /
+  # DATA 806 class). NOT auto-triage-safe: restoring the entitlement is an
+  # operator/broker account decision — escalate, never an auto-fix. The
+  # pipeline already stopped itself for the day (no reject storm).
+  - name: chain-01-entitlement-absent-escalate
+    match:
+      code: CHAIN-01
+    action: escalate
+    runbook_path: .claude/rules/project/rest-1m-pipeline-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 600
+    justification: >-
+      CHAIN-01 = option-chain entitlement absent. The chain pipeline is
+      already down for the day by construction; the fix is an account
+      decision (buy/renew the Option Chain Data-API subscription on the
+      broker portal, or flip the option_chain_1m setting off). Never
+      auto-actioned.
+
+  # CHAIN-02 = the per-minute option-chain fetch degraded (transport /
+  # non-2xx / budget overrun / parse failure / empty chain). Escalate:
+  # the next minute boundary re-attempts automatically and the Telegram
+  # page is edge-triggered app-side (3 consecutive fully-failed minutes).
+  - name: chain-02-fetch-degraded-escalate
+    match:
+      code: CHAIN-02
+    action: escalate
+    runbook_path: .claude/rules/project/rest-1m-pipeline-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 600
+    justification: >-
+      CHAIN-02 = per-minute option-chain fetch degraded. The scheduler
+      self-retries every minute close; escalate so the operator inspects
+      the bounded secret-redacted sample failure and cross-checks the
+      spot leg (SPOT1M-01) + REST-CANARY-01 per the runbook. Missing
+      minutes stay absent (never fabricated) and backfill safely via
+      DEDUP-idempotent re-appends.
+
+  # CHAIN-03 = the option_chain_1m QuestDB persist leg failed (ensure-DDL
+  # / ILP append / ILP-over-HTTP flush ACK; failed flushes discard pending
+  # — poisoned-buffer defense). Best-effort forensic write — escalate so
+  # the operator checks QuestDB health + disk (this table is the biggest
+  # DAY-partitioned writer — ~70 MB/day).
+  - name: chain-03-persist-failed-escalate
+    match:
+      code: CHAIN-03
+    action: escalate
+    runbook_path: .claude/rules/project/rest-1m-pipeline-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 600
+    justification: >-
+      CHAIN-03 = option_chain_1m persist failed. Re-appends are
+      DEDUP-idempotent so recovery is re-run-safe; the underlying
+      condition is QuestDB ILP/HTTP health or disk pressure (make doctor,
+      BOOT-01/BOOT-02 + RESOURCE-03 cross-check) rather than a blind
+      auto-fix.
+
+  # CHAIN-04 = the day-start expirylist warmup failed after bounded
+  # retries — the chain pipeline degraded to disabled-for-the-day (never
+  # a guessed expiry). Escalate: the next trading-day boot re-warms
+  # automatically; mid-day the operator may restart once the REST surface
+  # is healthy if today's chain data matters.
+  - name: chain-04-expirylist-failed-escalate
+    match:
+      code: CHAIN-04
+    action: escalate
+    runbook_path: .claude/rules/project/rest-1m-pipeline-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 600
+    justification: >-
+      CHAIN-04 = day-start expirylist warmup failed. Expiry dates come
+      only from the broker API (never guessed), so the pipeline stays
+      down for the day by design; operator judgement decides between
+      waiting for tomorrow's boot and restarting after the REST surface
+      recovers.
