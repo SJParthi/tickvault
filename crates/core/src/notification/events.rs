@@ -490,6 +490,58 @@ pub enum NotificationEvent {
         failed_minutes: u32,
     },
 
+    /// Per-minute option-chain REST pipeline (operator grant 2026-07-12,
+    /// PR-3): the per-minute option-chain snapshot has fully failed for
+    /// several minutes in a row (edge-triggered ONCE per episode, Rule 4;
+    /// re-armed only after a successful minute). Severity::High.
+    ChainFetchDegraded {
+        /// How many minutes in a row have fully failed.
+        consecutive_failed_minutes: u32,
+        /// The most recent failed minute, IST 12-hour (e.g. "10:42 AM").
+        minute_ist: String,
+    },
+
+    /// The per-minute option-chain snapshot RECOVERED after a failing
+    /// episode (falling edge — one Info ping; the missing minutes stay
+    /// absent until re-pulled, never fabricated).
+    ChainFetchRecovered {
+        /// The minute that succeeded, IST 12-hour (e.g. "10:45 AM").
+        minute_ist: String,
+        /// How many minutes had fully failed during the episode.
+        failed_minutes: u32,
+    },
+
+    /// The broker rejected the option-chain data request because the
+    /// account has NO option-chain data subscription (entitlement absent —
+    /// the DH-902 / DATA 806 class). Fired ONCE per day. Severity depends
+    /// on intent: HIGH when the pipeline was switched ON and expected to
+    /// record (actionable — the operator must fix the subscription or
+    /// switch the setting off); INFO when it was only the boot-time
+    /// probe-and-report verdict for a disabled pipeline.
+    ChainEntitlementAbsent {
+        /// `true` when the option-chain pipeline was enabled (expected to
+        /// run); `false` for the probe-only verdict.
+        pipeline_enabled: bool,
+        /// Plain-English detail naming the reject class (already
+        /// secret-redacted + bounded at the emit site).
+        detail: String,
+    },
+
+    /// The boot-time option-chain probe CONFIRMED the account IS entitled
+    /// to option-chain data while the pipeline is switched OFF — one Info
+    /// ping telling the operator the recording can be turned on.
+    ChainEntitlementConfirmed,
+
+    /// The day-start expiry-date lookup for the option chain failed after
+    /// bounded retries — the chain recording stays OFF for the day
+    /// (expiry dates come ONLY from the broker's list, never guessed).
+    /// One HIGH page per day (CHAIN-04).
+    ChainExpirylistFailed {
+        /// Plain-English detail (already secret-redacted + bounded at the
+        /// emit site).
+        detail: String,
+    },
+
     /// Once-per-trading-day Dhan-vs-Groww scorecard at 3:45 PM IST
     /// (operator directive 2026-07-10 — run both feeds live for a month,
     /// everything tracked + blame-attributed). Severity::Info +
@@ -2001,6 +2053,91 @@ impl NotificationEvent {
                      record until re-pulled — nothing is made up."
                 )
             }
+            Self::ChainFetchDegraded {
+                consecutive_failed_minutes,
+                minute_ist,
+            } => {
+                format!(
+                    "\u{1f198} <b>Minute-by-minute option chain recording is FAILING</b>\n\
+                     The per-minute option chain snapshot for NIFTY, BANKNIFTY \
+                     and SENSEX has failed {consecutive_failed_minutes} minutes \
+                     in a row (latest failed minute: {minute_ist} IST).\n\
+                     Live streaming prices are NOT affected — only the \
+                     per-minute option chain record is missing.\n\
+                     What to do RIGHT NOW:\n\
+                     1. Check the broker data subscription is still active.\n\
+                     2. If live streaming prices ALSO stopped, treat it as a \
+                     full data outage.\n\
+                     3. Missing minutes stay blank — nothing is made up."
+                )
+            }
+            Self::ChainFetchRecovered {
+                minute_ist,
+                failed_minutes,
+            } => {
+                format!(
+                    "\u{2705} <b>Minute-by-minute option chain recording recovered</b>\n\
+                     The per-minute option chain snapshot is working again as \
+                     of {minute_ist} IST, after {failed_minutes} failed \
+                     minute(s). The minutes that failed stay blank in the \
+                     record until re-pulled — nothing is made up."
+                )
+            }
+            Self::ChainEntitlementAbsent {
+                pipeline_enabled,
+                detail,
+            } => {
+                let detail = html_escape(detail);
+                if *pipeline_enabled {
+                    format!(
+                        "\u{1f198} <b>Option chain recording CANNOT run — no data \
+                         subscription</b>\n\
+                         The broker refused the option chain data request: this \
+                         account has NO option chain data subscription right now.\n\
+                         Broker said: {detail}\n\
+                         Option chain recording stays OFF for today. Live \
+                         streaming prices are NOT affected.\n\
+                         What to do RIGHT NOW:\n\
+                         1. Buy/renew the option chain data subscription with the \
+                         broker, OR\n\
+                         2. Turn the option chain recording setting off so this \
+                         alert stops."
+                    )
+                } else {
+                    format!(
+                        "\u{1f514} <b>Option chain check: NOT available on this \
+                         account</b>\n\
+                         Today's one-time check confirmed the broker account has \
+                         NO option chain data subscription (broker said: \
+                         {detail}).\n\
+                         Nothing is broken — option chain recording is switched \
+                         off and stays off. Buy the subscription with the broker \
+                         if you want this data."
+                    )
+                }
+            }
+            Self::ChainEntitlementConfirmed => "\u{2705} <b>Option chain data IS available on \
+                 this account</b>\n\
+                 Today's one-time check confirmed the broker WILL serve option \
+                 chain data. Recording is currently switched OFF.\n\
+                 To start recording it minute-by-minute: turn ON the option \
+                 chain setting and restart the app."
+                .to_string(),
+            Self::ChainExpirylistFailed { detail } => {
+                let detail = html_escape(detail);
+                format!(
+                    "\u{1f198} <b>Option chain recording could NOT start today</b>\n\
+                     The day-start lookup of option expiry dates failed after \
+                     several tries, so option chain recording stays OFF for \
+                     today (expiry dates are never guessed).\n\
+                     Broker said: {detail}\n\
+                     Live streaming prices are NOT affected. Tomorrow's start \
+                     retries automatically.\n\
+                     What to do RIGHT NOW:\n\
+                     1. Check the broker data connection is healthy.\n\
+                     2. If this repeats daily, contact the broker."
+                )
+            }
             Self::DualFeedDailyScorecard {
                 trading_date_ist,
                 dhan,
@@ -2880,6 +3017,11 @@ impl NotificationEvent {
             Self::CrossVerify1mAborted { .. } => "CrossVerify1mAborted",
             Self::Spot1mFetchDegraded { .. } => "Spot1mFetchDegraded",
             Self::Spot1mFetchRecovered { .. } => "Spot1mFetchRecovered",
+            Self::ChainFetchDegraded { .. } => "ChainFetchDegraded",
+            Self::ChainFetchRecovered { .. } => "ChainFetchRecovered",
+            Self::ChainEntitlementAbsent { .. } => "ChainEntitlementAbsent",
+            Self::ChainEntitlementConfirmed => "ChainEntitlementConfirmed",
+            Self::ChainExpirylistFailed { .. } => "ChainExpirylistFailed",
             Self::DualFeedDailyScorecard { .. } => "DualFeedDailyScorecard",
             Self::DualFeedScorecardAborted { .. } => "DualFeedScorecardAborted",
             // PR #4/#5 (2026-05-19): DepthSpotPriceStale + 7 Phase2*
@@ -3159,6 +3301,22 @@ impl NotificationEvent {
             // failed minutes); the recovery is a positive Info ping.
             Self::Spot1mFetchDegraded { .. } => Severity::High,
             Self::Spot1mFetchRecovered { .. } => Severity::Info,
+            Self::ChainFetchDegraded { .. } => Severity::High,
+            Self::ChainFetchRecovered { .. } => Severity::Info,
+            // HIGH only when the pipeline was ON and expected to record;
+            // the probe-only verdict for a disabled pipeline is an Info
+            // heads-up, never a page (the operator asked for a report).
+            Self::ChainEntitlementAbsent {
+                pipeline_enabled, ..
+            } => {
+                if *pipeline_enabled {
+                    Severity::High
+                } else {
+                    Severity::Info
+                }
+            }
+            Self::ChainEntitlementConfirmed => Severity::Info,
+            Self::ChainExpirylistFailed { .. } => Severity::High,
             // Dual-feed scorecard (2026-07-10): Info per the contract — the
             // daily digest is a positive signal; degradation is carried
             // LOUDLY in the body (partial/degraded footnotes) and a task
@@ -6585,6 +6743,112 @@ mod tests {
         assert!(msg.contains("4 failed"), "got: {msg}");
         // No false-OK: recovery never claims the missing minutes came back.
         assert!(msg.contains("nothing is made up"), "got: {msg}");
+    }
+
+    // -----------------------------------------------------------------------
+    // ChainFetchDegraded / ChainFetchRecovered / ChainEntitlementAbsent /
+    // ChainEntitlementConfirmed (2026-07-12 — per-minute option-chain REST
+    // pipeline PR-3)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_chain_fetch_degraded_is_high_with_action_lines() {
+        let event = NotificationEvent::ChainFetchDegraded {
+            consecutive_failed_minutes: 3,
+            minute_ist: "10:42 AM".to_string(),
+        };
+        assert_eq!(event.topic(), "ChainFetchDegraded");
+        assert_eq!(event.severity(), Severity::High);
+        let msg = event.to_message();
+        assert!(msg.contains("FAILING"), "got: {msg}");
+        assert!(msg.contains("3 minutes"), "got: {msg}");
+        // IST 12-hour timestamp (Telegram commandment 9).
+        assert!(msg.contains("10:42 AM IST"), "got: {msg}");
+        assert!(msg.contains("What to do RIGHT NOW"), "got: {msg}");
+        // Honest scope line: the live WS pipeline is untouched.
+        assert!(msg.contains("NOT affected"), "got: {msg}");
+    }
+
+    #[test]
+    fn test_chain_fetch_recovered_is_info_positive_ping() {
+        let event = NotificationEvent::ChainFetchRecovered {
+            minute_ist: "10:45 AM".to_string(),
+            failed_minutes: 4,
+        };
+        assert_eq!(event.topic(), "ChainFetchRecovered");
+        assert_eq!(event.severity(), Severity::Info);
+        let msg = event.to_message();
+        assert!(msg.contains("recovered"), "got: {msg}");
+        assert!(msg.contains("10:45 AM IST"), "got: {msg}");
+        assert!(msg.contains("4 failed"), "got: {msg}");
+        // No false-OK: recovery never claims the missing minutes came back.
+        assert!(msg.contains("nothing is made up"), "got: {msg}");
+    }
+
+    /// The entitlement-absent verdict is HIGH (actionable) when the
+    /// pipeline was switched ON, but only an Info heads-up for the
+    /// probe-only path of a disabled pipeline — never a page for a report
+    /// the operator asked for.
+    #[test]
+    fn test_chain_entitlement_absent_severity_splits_on_intent() {
+        let paged = NotificationEvent::ChainEntitlementAbsent {
+            pipeline_enabled: true,
+            detail: "DH-902 access not subscribed".to_string(),
+        };
+        assert_eq!(paged.topic(), "ChainEntitlementAbsent");
+        assert_eq!(paged.severity(), Severity::High);
+        let msg = paged.to_message();
+        assert!(msg.contains("CANNOT run"), "got: {msg}");
+        assert!(msg.contains("DH-902"), "got: {msg}");
+        assert!(msg.contains("What to do RIGHT NOW"), "got: {msg}");
+        assert!(msg.contains("NOT affected"), "got: {msg}");
+
+        let probe = NotificationEvent::ChainEntitlementAbsent {
+            pipeline_enabled: false,
+            detail: "DH-902 access not subscribed".to_string(),
+        };
+        assert_eq!(probe.severity(), Severity::Info);
+        let msg = probe.to_message();
+        assert!(msg.contains("NOT available"), "got: {msg}");
+        assert!(msg.contains("Nothing is broken"), "got: {msg}");
+        // Payload detail is HTML-escaped like every String arm.
+        let hostile = NotificationEvent::ChainEntitlementAbsent {
+            pipeline_enabled: false,
+            detail: "<script>x</script>".to_string(),
+        };
+        assert!(!hostile.to_message().contains("<script>"));
+    }
+
+    #[test]
+    fn test_chain_expirylist_failed_is_high_with_action_lines() {
+        let event = NotificationEvent::ChainExpirylistFailed {
+            detail: "http 500 <i>x</i>".to_string(),
+        };
+        assert_eq!(event.topic(), "ChainExpirylistFailed");
+        assert_eq!(event.severity(), Severity::High);
+        let msg = event.to_message();
+        assert!(msg.contains("could NOT start today"), "got: {msg}");
+        // Honest: never a guessed expiry; live prices untouched.
+        assert!(msg.contains("never guessed"), "got: {msg}");
+        assert!(msg.contains("NOT affected"), "got: {msg}");
+        assert!(msg.contains("What to do RIGHT NOW"), "got: {msg}");
+        // Payload detail is HTML-escaped like every String arm.
+        assert!(!msg.contains("<i>"), "got: {msg}");
+    }
+
+    #[test]
+    fn test_chain_entitlement_confirmed_is_info_with_flip_instruction() {
+        let event = NotificationEvent::ChainEntitlementConfirmed;
+        assert_eq!(event.topic(), "ChainEntitlementConfirmed");
+        assert_eq!(event.severity(), Severity::Info);
+        let msg = event.to_message();
+        assert!(msg.contains("IS available"), "got: {msg}");
+        // Plain-English action (10 commandments — no config-key jargon in
+        // the Telegram body; the exact key lives in the probe's log line).
+        assert!(msg.contains("turn ON the option"), "got: {msg}");
+        assert!(!msg.contains("option_chain_1m"), "got: {msg}");
+        // Honest: recording is NOT running yet.
+        assert!(msg.contains("switched OFF"), "got: {msg}");
     }
 
     // -----------------------------------------------------------------------

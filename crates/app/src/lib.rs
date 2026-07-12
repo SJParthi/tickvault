@@ -38,6 +38,13 @@ pub mod rest_canary_boot;
 // for the 3 IDX_I spot indices via POST /v2/charts/intraday and persist to
 // the `spot_1m_rest` table (SPOT1M-01/02).
 pub mod spot_1m_rest_boot;
+// Per-minute option-chain REST pipeline (operator grant 2026-07-12, PR-3 —
+// the OPTION-CHAIN half; config-gated DEFAULT-OFF pending the live
+// entitlement probe): day-start expirylist warmup, then each session
+// minute — sequenced right after the spot leg — pull the current-expiry
+// chain for the 3 underlyings via POST /v2/optionchain and persist to the
+// `option_chain_1m` table (CHAIN-01..04).
+pub mod option_chain_1m_boot;
 // Dual-feed scoreboard PR-A (operator 2026-07-10): boot-time process-death
 // reconciler + the 15:45 IST daily Dhan-vs-Groww aggregation + the Telegram
 // scorecard summary (SCOREBOARD-01 family).

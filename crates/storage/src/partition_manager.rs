@@ -106,6 +106,12 @@ pub(crate) const DAY_PARTITIONED_TABLES: &[&str] = &[
     // trivial disk; same DAY partitioning + retention class as the
     // daily-data tables above; `feed` is in the DEDUP key.
     "spot_1m_rest",
+    // CHAIN-03 (2026-07-12, per-minute REST pipeline PR-3): one row per
+    // fetched (minute, underlying, expiry, strike, leg) — ~1-3K rows/min
+    // worst case (~70 MB/day at wide chains; disk envelope flagged as an
+    // operator retention follow-up in option_chain_1m_persistence.rs);
+    // same DAY partitioning + retention class; `feed` is in the DEDUP key.
+    "option_chain_1m",
 ];
 
 /// Tables EXEMPT from retention sweeping — NEVER detached or dropped.
