@@ -1411,6 +1411,21 @@ pub const DHAN_CHARTS_INTRADAY_PATH: &str = "/charts/intraday";
 /// Endpoint: POST <https://api.dhan.co/v2/charts/historical>
 pub const DHAN_CHARTS_HISTORICAL_PATH: &str = "/charts/historical";
 
+/// Path for the full option chain (appended to rest_api_base_url).
+/// Endpoint: POST <https://api.dhan.co/v2/optionchain>
+/// Requires BOTH `access-token` AND `client-id` headers; rate limit is
+/// 1 unique request per 3 seconds (re-verified 2026-07-12 — UNCHANGED;
+/// multiple DISTINCT underlyings may go concurrently within the window).
+/// Re-added 2026-07-12 for the per-minute REST pipeline PR-3 — the
+/// 2026-06-28 deletion removed the prior `OPTION_CHAIN_*` constants with
+/// the retired subsystem; this is the §8 REBUILD, not a revival.
+pub const DHAN_OPTION_CHAIN_PATH: &str = "/optionchain";
+
+/// Path for the option-chain expiry list (appended to rest_api_base_url).
+/// Endpoint: POST <https://api.dhan.co/v2/optionchain/expirylist>
+/// Same headers + rate limit class as [`DHAN_OPTION_CHAIN_PATH`].
+pub const DHAN_OPTION_CHAIN_EXPIRYLIST_PATH: &str = "/optionchain/expirylist";
+
 // ---------------------------------------------------------------------------
 // Authentication — User Profile & IP Management Endpoints
 // ---------------------------------------------------------------------------
@@ -1632,6 +1647,82 @@ const _: () = assert!(
     SPOT_1M_REST_RETRY_OFFSETS_MS[3] + SPOT_1M_REST_REQUEST_TIMEOUT_SECS * 1_000
         < SPOT_1M_REST_SID_BUDGET_SECS * 1_000,
     "SPOT_1M ladder schedule (last offset + one request timeout) must fit the budget"
+);
+
+// ---------------------------------------------------------------------------
+// Option-chain 1m REST pipeline (operator grant 2026-07-12 — PR-3, the
+// OPTION-CHAIN half; config-gated DEFAULT-OFF pending the live entitlement
+// probe). The 3 underlyings are the SAME [`SPOT_1M_REST_INDICES`] set and
+// the fire boundaries reuse SPOT_1M_REST_FIRST/LAST_FIRE_SECS_OF_DAY_IST —
+// the chain leg is sequenced immediately AFTER the spot leg each minute.
+// ---------------------------------------------------------------------------
+
+/// Fallback post-boundary fire delay (ms) for the chain leg: the chain
+/// task normally wakes when the SPOT leg signals its minute complete
+/// (~0.3–1.5 s after the boundary); when the spot leg is disabled, dead,
+/// or slow, this timer fires the chain anyway — sequencing is best-effort,
+/// never a hard dependency ("never blocked forever if spot is dead").
+pub const CHAIN_1M_FALLBACK_DELAY_MS: u64 = 2_500;
+
+/// Defensive per-underlying minimum gap (secs) between two option-chain
+/// requests for the SAME underlying — Dhan's documented limit is 1 unique
+/// request per 3 seconds (option-chain.md rule 4; DISTINCT underlyings may
+/// go concurrently). One request per underlying per minute leaves ~60 s
+/// gaps, so this guard never engages in normal operation.
+pub const CHAIN_1M_MIN_GAP_SECS: u64 = 3;
+
+/// Per-REQUEST HTTP timeout (secs) for one option-chain / expirylist call.
+/// Chains are BIG (hundreds of strikes × 2 legs) — 10 s, double the spot
+/// leg's 5 s, still bounded well inside the minute by the budget below.
+pub const CHAIN_1M_REQUEST_TIMEOUT_SECS: u64 = 10;
+
+/// HARD wall-clock budget (secs) for ONE underlying's per-minute chain
+/// fetch (`tokio::time::timeout` around the whole leg) — overruns can
+/// never stack across boundaries; a budget trip is that underlying's
+/// failure for the minute.
+pub const CHAIN_1M_UNDERLYING_BUDGET_SECS: u64 = 20;
+
+/// Maximum accepted response body size (bytes) for one option-chain call —
+/// a full NIFTY chain (~150 strikes × 2 legs × ~17 fields) is ~200–400 KiB;
+/// 8 MiB bounds a hostile/misbehaving server (csv_downloader §18 pattern,
+/// streamed cap).
+pub const CHAIN_1M_MAX_BODY_BYTES: usize = 8 * 1024 * 1024;
+
+/// Consecutive fully-failed chain minutes (no underlying succeeded, or the
+/// persist leg failed) before the ONE edge-triggered CHAIN-02 escalation
+/// page fires — mirrors [`SPOT_1M_REST_CONSECUTIVE_FAIL_PAGE_THRESHOLD`].
+pub const CHAIN_1M_CONSECUTIVE_FAIL_PAGE_THRESHOLD: u32 = 3;
+
+/// Bounded day-start expirylist retry backoffs (secs) BETWEEN attempts —
+/// 3 attempts total (first try + these two backoffs). Each backoff is ≥
+/// [`CHAIN_1M_MIN_GAP_SECS`]: a retry of the SAME unique request inside
+/// Dhan's 1-unique-per-3s window would earn the very rate-limit reject it
+/// retries (hostile-review L1). On final failure the chain pipeline
+/// degrades to disabled-for-the-day (CHAIN-04; NEVER a guessed expiry —
+/// option-chain.md rule 9).
+pub const CHAIN_1M_EXPIRYLIST_RETRY_BACKOFF_SECS: [u64; 2] = [3, 6];
+
+const _: () = assert!(
+    CHAIN_1M_EXPIRYLIST_RETRY_BACKOFF_SECS[0] >= CHAIN_1M_MIN_GAP_SECS
+        && CHAIN_1M_EXPIRYLIST_RETRY_BACKOFF_SECS[1] >= CHAIN_1M_MIN_GAP_SECS,
+    "expirylist retries must not re-enter Dhan's 1-unique-per-3s window"
+);
+
+// Compile-time consistency: the chain leg's whole fire (fallback delay +
+// per-underlying budget) must finish inside the minute, and the fallback
+// delay must be LONGER than the spot leg's post-boundary fire delay (the
+// chain is sequenced AFTER the spot fetch).
+const _: () = assert!(
+    CHAIN_1M_FALLBACK_DELAY_MS + CHAIN_1M_UNDERLYING_BUDGET_SECS * 1_000 < 60_000,
+    "CHAIN_1M fire (fallback delay + underlying budget) must finish inside the minute"
+);
+const _: () = assert!(
+    CHAIN_1M_FALLBACK_DELAY_MS > SPOT_1M_REST_FIRE_DELAY_MS,
+    "CHAIN_1M fallback delay must trail the spot leg's fire delay (chain fires after spot)"
+);
+const _: () = assert!(
+    CHAIN_1M_REQUEST_TIMEOUT_SECS < CHAIN_1M_UNDERLYING_BUDGET_SECS,
+    "CHAIN_1M per-request timeout must fit inside the per-underlying budget"
 );
 
 /// Daily reset signal time (IST). After market close at 15:30,
@@ -3630,6 +3721,32 @@ mod tests {
             "ladder schedule must fit the budget"
         );
         assert_eq!(SPOT_1M_REST_MAX_BODY_BYTES, 2 * 1024 * 1024);
+    }
+
+    /// Option-chain 1m REST pipeline (operator grant 2026-07-12, PR-3) —
+    /// the endpoint paths + the chain leg's bounded timing envelope.
+    #[test]
+    fn test_chain_1m_constants_pinned() {
+        assert_eq!(DHAN_OPTION_CHAIN_PATH, "/optionchain");
+        assert_eq!(DHAN_OPTION_CHAIN_EXPIRYLIST_PATH, "/optionchain/expirylist");
+        assert!(DHAN_OPTION_CHAIN_PATH.starts_with('/'));
+        assert!(DHAN_OPTION_CHAIN_EXPIRYLIST_PATH.starts_with('/'));
+        // The chain fires AFTER the spot leg; its fallback timer trails the
+        // spot fire delay and the whole fire fits inside the minute.
+        assert_eq!(CHAIN_1M_FALLBACK_DELAY_MS, 2_500);
+        assert!(CHAIN_1M_FALLBACK_DELAY_MS > SPOT_1M_REST_FIRE_DELAY_MS);
+        assert_eq!(CHAIN_1M_REQUEST_TIMEOUT_SECS, 10);
+        assert_eq!(CHAIN_1M_UNDERLYING_BUDGET_SECS, 20);
+        assert!(CHAIN_1M_FALLBACK_DELAY_MS + CHAIN_1M_UNDERLYING_BUDGET_SECS * 1_000 < 60_000);
+        assert!(CHAIN_1M_REQUEST_TIMEOUT_SECS < CHAIN_1M_UNDERLYING_BUDGET_SECS);
+        // Dhan's documented option-chain limit: 1 unique request / 3s.
+        assert_eq!(CHAIN_1M_MIN_GAP_SECS, 3);
+        assert_eq!(CHAIN_1M_CONSECUTIVE_FAIL_PAGE_THRESHOLD, 3);
+        assert_eq!(CHAIN_1M_EXPIRYLIST_RETRY_BACKOFF_SECS, [3, 6]);
+        // Each expirylist retry backoff clears the 1-unique-per-3s window
+        // (retrying the SAME request inside it earns the reject it retries).
+        assert!(CHAIN_1M_EXPIRYLIST_RETRY_BACKOFF_SECS[0] >= CHAIN_1M_MIN_GAP_SECS);
+        assert_eq!(CHAIN_1M_MAX_BODY_BYTES, 8 * 1024 * 1024);
     }
 
     /// Constant pin — 60s grace after close.

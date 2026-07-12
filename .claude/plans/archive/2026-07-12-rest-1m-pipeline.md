@@ -178,9 +178,31 @@ new WebSocket (2-WS lock untouched), no order path.
     domain stays the canonical `dhan`/`groww` set from `data-integrity.md`;
     error counters landed as `tv_spot1m_fetch_total{outcome}` +
     `tv_spot1m_persist_errors_total{stage}` (not `tv_spot_1m_rest_*`).
-- [ ] PR-3 (chain leg, `tickvault-app` + `tickvault-storage` + `tickvault-common`): per-minute option-chain fetcher (DEFAULT-OFF) + `option_chain_1m` table + CHAIN-01..04 codes + entitlement probe
-  - Files: crates/app/src/option_chain_1m_boot.rs, crates/app/src/main.rs, crates/storage/src/option_chain_1m_persistence.rs, crates/common/src/constants.rs, crates/common/src/config.rs, crates/common/src/error_code.rs, .claude/rules/project/rest-1m-pipeline-error-codes.md
-  - Tests: test_option_chain_request_pascal_case_underlying_scrip_int, test_option_chain_strike_keys_parse_decimal_strings, test_option_chain_ce_pe_optional_absent_side, test_option_chain_pacing_one_unique_per_3s, test_expirylist_warmup_fail_closed_keeps_leg_dormant, test_option_chain_1m_default_off_config_gate
+- [x] PR-3 (chain leg, `tickvault-app` + `tickvault-storage` + `tickvault-common`): per-minute option-chain fetcher (DEFAULT-OFF) + `option_chain_1m` table + CHAIN-01..04 codes + entitlement probe
+  - Files: crates/app/src/option_chain_1m_boot.rs, crates/app/src/spot_1m_rest_boot.rs (surgical: optional minute-done watch sender only), crates/app/src/lib.rs, crates/app/src/main.rs, crates/app/tests/option_chain_1m_wiring_guard.rs, crates/storage/src/option_chain_1m_persistence.rs, crates/storage/src/lib.rs, crates/storage/src/partition_manager.rs, crates/common/src/constants.rs, crates/common/src/config.rs, crates/common/src/error_code.rs, crates/core/src/notification/events.rs, config/base.toml, .claude/rules/project/rest-1m-pipeline-error-codes.md, .claude/triage/error-rules.yaml
+  - Tests: test_option_chain_request_pascal_case_underlying_scrip_int, test_option_chain_strike_keys_parse_decimal_strings, test_option_chain_ce_pe_optional_absent_side, test_option_chain_pacing_one_unique_per_3s, test_expirylist_warmup_fail_closed_keeps_leg_dormant, test_option_chain_1m_default_off_config_gate, test_select_current_expiry_on_expiry_day_keeps_same_day, test_parse_option_chain_hostile_inputs_never_panic, test_is_entitlement_reject_classification, test_spot_signal_satisfies_minute_ordering, test_wait_until_chain_fire_signal_wakes_early_and_fallback_bounds, test_option_chain_1m_dedup_key_shape, test_chain1m_flush_when_disconnected_errors_and_discards_pending, test_chain_codes_contract, ratchet_chain1m_spawn_and_probe_are_config_gated_inside_post_market_seam, ratchet_chain1m_watch_channel_is_plumbed_between_spot_and_chain, ratchet_chain1m_boot_module_is_not_a_stub
+  - As-built deltas vs the original sketch (noted in the PR body): (a) the
+    six CHAIN codes in "Failure Modes" collapsed to FOUR as-built —
+    CHAIN-01 = entitlement absent (once-per-day edge, manual triage),
+    CHAIN-02 = per-minute fetch degraded (subsumes the sketched
+    fetch-failed + DH-904 + parse-failure trio via the `stage`/`outcome`
+    taxonomy, mirroring the SPOT1M-01 shape), CHAIN-03 = persist failed
+    (the SPOT1M-02 mirror the sketch omitted), CHAIN-04 = expirylist
+    warmup failed. (b) NO in-minute DH-904 10→20→40→80s ladder on the
+    chain leg — one request per underlying per minute is trivially inside
+    the 1-per-3s limit, so a rate-limit reject is simply that minute's
+    failure (counted, edge-fed) and the next boundary re-attempts; the
+    defensive ≥3s per-underlying min-gap guard covers the limit
+    structurally. (c) The DEDUP key uses `leg` (SYMBOL "CE"/"PE") rather
+    than the sketched `option_type` column name. (d) Counters landed as
+    `tv_chain1m_fetch_total{outcome}` + `tv_chain1m_persist_errors_total{stage}`
+    (not `tv_option_chain_1m_*`), mirroring the PR-2 naming. (e) A fifth
+    typed Telegram event `ChainExpirylistFailed` was added beyond the
+    four sketched — the CHAIN-04 "ONE page" demand needed a typed vehicle
+    (post-CloudWatch-migration an error! alone never pages). (f) Probe
+    semantics documented: on an entitled verdict the pipeline does NOT
+    auto-enable — the operator flips `[option_chain_1m].enabled` (honest
+    report, never a silent behaviour change).
 
 ## Per-Item Guarantee Matrix
 
