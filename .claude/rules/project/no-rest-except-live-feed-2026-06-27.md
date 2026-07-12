@@ -2,6 +2,8 @@
 
 > **⚠ 2026-07-12 NOTE — BruteX cross-verify S3 read is a KEEP class:** per the operator's 2026-07-12 directive recorded verbatim in `groww-second-feed-scope-2026-06-19.md` §37, TickVault reads BruteX-produced backtest CSVs from OUR OWN S3 bucket (`s3://tv-prod-cold/crossverify/*`) via `aws-sdk-s3` GetObject/ListObjectsV2. That is an INTERNAL artifact transfer from our own infrastructure — the same class as the S3 cold-archive surface — NOT a market-data REST endpoint of Dhan or Groww. A new **KEEP** row is added to the §3 inventory below. This lock's ban on Dhan/Groww market-data REST pulls is UNCHANGED.
 >
+> **⚠ 2026-07-12 NOTE (SECOND same-day directive) — per-minute REST pipeline is a scheduled-pull KEEP class:** a SECOND 2026-07-12 operator directive (relayed verbatim via the coordinator session, quote preserved in §8.0 below) adds a narrow **scheduled-pull KEEP class**: the per-minute **spot-1m intraday fetch** (`POST /v2/charts/intraday`, interval `"1"`, exactly 3 IDX_I SIDs — NIFTY=13, BANKNIFTY=25, SENSEX=51) + the per-minute **option-chain fetch** (`POST /v2/optionchain` + `POST /v2/optionchain/expirylist`, the same 3 underlyings' current expiry, config-gated DEFAULT-OFF pending the first-live-boot entitlement probe) — **see the new §8**. Two new KEEP rows join the §3 inventory; the matching legacy REMOVE rows are annotated, never deleted. The ban on all OTHER market-data REST pulls is UNCHANGED.
+>
 > **Authority:** CLAUDE.md > `operator-charter-forever.md` §I > `daily-universe-scope-expansion-2026-05-27.md` §3 > `groww-second-feed-scope-2026-06-19.md` > this file > defaults.
 > **Scope:** PERMANENT once confirmed. Every Phase. Every PR. Every future Claude/Cowork session. Applies to BOTH Dhan (feed #1) and Groww (feed #2).
 > **Operator-locked:** 2026-06-27 (verbatim quote below).
@@ -48,14 +50,16 @@ A **literal** reading ("kill ALL REST") is self-contradictory: it would also kil
 | ~~`POST api.groww.in/v1/token/api/access`~~ | ~~`groww/auth.rs`~~ | Groww live-feed AUTH | **REMOVED 2026-07-02** — superseded by the shared token-minter SSM read (`groww-shared-token-minter-2026-07-02.md`); TickVault never mints |
 | `GET GROWW_INSTRUMENT_CSV_URL` | `constants.rs:612`; `instruments.rs:639` | Groww master (static ref) — the MAP source | **KEEP** |
 | `POST api.groww.in/v1/api/apex/v1/socket/token/create/` (per-session socket-token mint) | `constants.rs` (`GROWW_SOCKET_TOKEN_URL`); `feed/groww/native/socket_token.rs` | Groww live-feed AUTH — mints the per-session NATS user JWT from the SSM-read access token (NOT an access-token mint; the shared-minter lock 2026-07-02 is untouched). Recorded 2026-07-04 with the native-shadow-client authorization (`groww-second-feed-scope-2026-06-19.md` §35); the Python sidecar's SDK already makes this exact call | **KEEP** (added 2026-07-04) |
-| `POST /v2/charts/intraday` (1m cross-verify) | `cross_verify_1m_boot.rs:283`; `constants.rs:1255` | MARKET-DATA pull | **REMOVE** |
+| `POST /v2/charts/intraday` (1m cross-verify) | `cross_verify_1m_boot.rs:283`; `constants.rs:1255` | MARKET-DATA pull | **REMOVE** (historical uses removed; the narrow §8 scheduled-pull use was re-authorized 2026-07-12) |
 | `POST /v2/charts/historical` (prev-day OHLCV) | `prev_day_ohlcv_boot.rs:120`; `constants.rs:1259` | MARKET-DATA pull | **REMOVE** |
 | `GET /v2/profile` (REST canary + mid-session watchdog) | `rest_canary_boot.rs:170`; `mid_session_watchdog.rs:30` | MARKET-DATA-adjacent poll | **REMOVE** (canary + watchdog) |
 | `GET /v2/profile` (token_manager validity check) | `token_manager.rs:466` | AUTH-adjacent | **operator ruling** — auth-adjacent, not a price pull |
 | `POST /v2/marketfeed/quote` / `/marketfeed/ltp` (open-price fallback) | `open_price_rest_fallback.rs:136`; `open_price_source.rs:48` | MARKET-DATA pull | **REMOVE** |
-| `POST /v2/optionchain` (option-chain cache) | ~~`option_chain_cache_loader.rs`~~ | MARKET-DATA pull | **REMOVED 2026-06-28** (entire option_chain subsystem deleted per operator directive) |
+| `POST /v2/optionchain` (option-chain cache) | ~~`option_chain_cache_loader.rs`~~ | MARKET-DATA pull | **REMOVED 2026-06-28** (entire option_chain subsystem deleted per operator directive; historical uses removed — the narrow §8 scheduled-pull use was re-authorized 2026-07-12) |
 | `GET /v2/positions` (orphan-position watchdog) | `orphan_position_watchdog_boot.rs:8` | TRADING (not market-data, not live-feed) | **operator ruling** — trading-adjacent, not a price pull |
 | `aws-sdk-s3` GetObject/ListObjectsV2 on `s3://tv-prod-cold/crossverify/*` (BruteX cross-verify CSVs) | future `crates/app/src/brutex_crossverify_boot.rs` (code lands in the §37 follow-up PR) | internal artifact transfer from OUR OWN infrastructure (BruteX-produced CSVs in our own bucket) — NOT a market-data REST endpoint of Dhan or Groww | **KEEP** (added 2026-07-12) — authorized by the 2026-07-12 operator quote recorded in `groww-second-feed-scope-2026-06-19.md` §37 |
+| `POST /v2/charts/intraday` (per-minute spot-1m scheduled pull, 3 IDX_I SIDs — §8) | future `crates/app/src/spot_1m_rest_boot.rs` + `crates/storage/src/spot_1m_rest_persistence.rs` (code lands in the §8 follow-up PR) | scheduled-pull market-data KEEP class (§8) — interval `"1"`, NIFTY=13 / BANKNIFTY=25 / SENSEX=51 spot ONLY, once per minute in-session, writes ONLY the new `spot_1m_rest` table | **KEEP** (added 2026-07-12 — §8) |
+| `POST /v2/optionchain` + `POST /v2/optionchain/expirylist` (per-minute chain, config-gated — §8) | future `crates/app/src/option_chain_1m_boot.rs` + `crates/storage/src/option_chain_1m_persistence.rs` (code lands in the §8 follow-up PR) | scheduled-pull market-data KEEP class (§8) — 3 underlyings' CURRENT expiry, sequenced after the spot fetch, writes ONLY the new `option_chain_1m` table | **KEEP** (added 2026-07-12 — §8; DEFAULT-OFF pending the first-live-boot entitlement probe) |
 
 **What removing the REMOVE rows costs (honest, fail-soft):** prev-day `*_pct_from_prev_day` columns read 0 (already boot-never-blocks); the 15:31 IST 1m cross-verify (the only OHLCV parity signal) goes away; REST canary + mid-session profile watchdog go away (lose early "REST died" detection); open-price fallback + option-chain cache go away. **The live feed, dedup, and mapping all keep working — nothing in the hot path or the master build breaks.**
 
@@ -85,5 +89,57 @@ Always loaded. Activates on any session that:
 - Edits `crates/common/src/constants.rs` (any Dhan/Groww REST URL constant)
 - Edits any file under `crates/core/src/historical/`, `crates/core/src/option_chain/`, or any `*_rest_*` / `*_canary_*` / `*_watchdog_*` boot module
 - Edits `crates/app/src/cross_verify_1m_boot.rs`, `prev_day_ohlcv_boot.rs`, `rest_canary_boot.rs`, `mid_session_watchdog.rs`, `open_price_rest_fallback.rs`, `option_chain_cache_loader.rs`
+- Edits `crates/app/src/spot_1m_rest_boot.rs`, `crates/app/src/option_chain_1m_boot.rs`, `crates/storage/src/spot_1m_rest_persistence.rs`, `crates/storage/src/option_chain_1m_persistence.rs` (the §8 scheduled-pull modules)
 - Adds any new REST call to `api.dhan.co`, `api.groww.in`, or any market-data host
-- Any file containing `charts/intraday`, `charts/historical`, `marketfeed/ltp`, `marketfeed/quote`, `optionchain`, `/v2/profile`, `generateAccessToken`, `RenewToken`, `api-scrip-master`, `niftyindices`, `GROWW_INSTRUMENT_CSV_URL`, `/v1/token`
+- Any file containing `charts/intraday`, `charts/historical`, `marketfeed/ltp`, `marketfeed/quote`, `optionchain`, `/v2/profile`, `generateAccessToken`, `RenewToken`, `api-scrip-master`, `niftyindices`, `GROWW_INSTRUMENT_CSV_URL`, `/v1/token`, `spot_1m_rest`, `option_chain_1m`
+
+---
+
+# §8. Per-minute REST pipeline — scheduled-pull KEEP class (operator authorization 2026-07-12)
+
+## §8.0 The verbatim operator demand (preserve exactly, do not paraphrase)
+
+**Quote (2026-07-12, relayed verbatim via the coordinator session — typos preserved):**
+> "nifty bank nifty and sensex... precisely at each and every minute close we need to fetch the one minute candle and we need to define a new table for this... let the websocket live feed generate but... based on every minute close precise close within a second... we can pull the nifty banknifty and sensex spot in a second... one min ohlcv... this is only for spot... once it is fetched successfully just save it in a new table... meanwhile for option chain also at the time of day start fetch all the [expiry] dates and at the precise time when it fetched the spot indices data then instantly in the second pull option chain also [with the] rate limiter also... so that... we have the entire options chain data of current expiry of entire nifty banknifty and sensex"
+
+**Same-day operator additions (2026-07-12):**
+1. **Sequencing** — the spot fetch fires FIRST at each minute close (~1s after the boundary); the option-chain fetch follows immediately after in the next available seconds (SEQUENCED, not simultaneous).
+2. **Rate limit re-verified** — the option-chain limit was checked against the live Dhan docs on 2026-07-12 and is UNCHANGED: **1 unique request per 3 seconds**, with multiple DIFFERENT underlyings/expiries allowed concurrently inside the window (the v2.5 enhancement); Data-API budget 5/sec + 100,000/day unchanged.
+
+## §8.1 The grant — one paragraph
+
+Two narrowly-scoped, SCHEDULED market-data REST pulls join the KEEP set: (a) a **per-minute spot-1m fetch** — at each minute close during the NSE session, `POST /v2/charts/intraday` (interval `"1"`) for exactly THREE IDX_I spot SIDs (NIFTY=13, BANKNIFTY=25, SENSEX=51), persisting the just-closed official 1-minute OHLCV into the NEW `spot_1m_rest` QuestDB table (DEDUP UPSERT KEYS `(ts, security_id, exchange_segment, feed)` per I-P1-11 + feed-in-key); and (b) a **per-minute option-chain fetch** — one day-start `POST /v2/optionchain/expirylist` per underlying, then per minute (sequenced AFTER the spot fetch) `POST /v2/optionchain` for the same 3 underlyings' CURRENT expiry, persisting per-minute per-strike per-leg rows into the NEW `option_chain_1m` table. Both are COLD-PATH scheduled tasks in the app crate — never the tick hot path; the WebSocket candle pipeline is untouched; the 2-WS lock is untouched. Total request volume ≈ 6-9 requests/minute in-session (3 intraday + 3 optionchain + retries), trivially inside the Data-API 5/sec + 100K/day budget and the 1-unique-per-3s chain rule (3 DISTINCT underlyings may go concurrently).
+
+## §8.2 The two KEEP endpoints — exact scope
+
+| Endpoint | Scope (LOCKED) | Cadence | Destination table | Gate |
+|---|---|---|---|---|
+| `POST /v2/charts/intraday` (interval `"1"`) | 3 IDX_I spot SIDs ONLY: NIFTY=13, BANKNIFTY=25, SENSEX=51 | once per minute close, [09:15, 15:30) IST trading days | `spot_1m_rest` ONLY (never `ticks`/`candles_*`/`historical_candles`) | `[spot_1m_rest]` config; enabled in base.toml, serde default OFF |
+| `POST /v2/optionchain` + `POST /v2/optionchain/expirylist` | the SAME 3 underlyings, CURRENT (nearest) expiry only; expirylist once at day start | chain once per minute, SEQUENCED after the spot fetch; 1 unique req/3s honored (3 distinct underlyings concurrent); `client-id` header required | `option_chain_1m` ONLY | `[option_chain_1m]` config — **DEFAULT-OFF** pending the first-live-boot entitlement probe |
+
+## §8.3 Probe outcome (2026-07-12, recorded honestly)
+
+The option-chain entitlement (absent June 2026 — the DH-902/806 class that got the old subsystem deleted 2026-06-28) is **UNPROBEABLE from the development sandbox**: `dhan.co` egress is 403-blocked at the proxy AND no minted access token exists in SSM (only client-id/client-secret/totp-secret; minting from the sandbox would invalidate the live prod token per `authentication.md` rule 5). Therefore the chain half ships **config-gated DEFAULT-OFF** with a **first-live-boot entitlement probe** (one bounded `POST /v2/optionchain/expirylist` call) that reports the verdict via Telegram; only then does the operator enable it per config. The spot half is INDEPENDENT and is NEVER blocked by the chain half.
+
+## §8.4 Honest envelope (mandatory per operator-charter §F)
+
+- **Just-closed-minute availability is UNDOCUMENTED and UNVERIFIED-LIVE** — how fast Dhan's intraday endpoint surfaces the minute that closed 1 second ago is unknown until the first live session. The fetcher does bounded in-minute retries and MEASURES the close-to-data latency with a histogram — a slow/empty response is loud (typed ErrorCode + counter), never a false-OK.
+- The chain entitlement is UNPROVEN until the live boot probe (§8.3); the chain half stays OFF until proven + operator-enabled.
+- Disk envelope (honest): `option_chain_1m` ≈ ~337K rows ≈ ~70 MB/day at ~150 strikes ≈ ~6.3 GB/90d (~20-28% of the 30 GB EBS) — retention/partition-manager registration is a flagged follow-up in the code PRs; `spot_1m_rest` is trivial (~1,125 rows/day).
+- Cold-path only; zero hot-path involvement; zero new WebSocket; §28 indicators/strategies boundary untouched; token via the existing TokenManager (never logged).
+
+## §8.5 What a PR that violates this grant looks like (REJECT)
+
+- Extends either endpoint to ANY other SID, underlying, segment, expiry set, or timeframe (a 4th index, stocks, non-current expiries, interval ≠ "1") without a fresh dated operator quote HERE first.
+- Writes either fetch's output to `ticks`, `candles_*`, `historical_candles`, or any table other than `spot_1m_rest` / `option_chain_1m` (live-feed purity).
+- Involves the tick hot path, the WS read loops, or any per-tick code in the scheduled fetch (cold-path only).
+- Wires either table into strategy/indicator/risk paths (§28 boundary of `daily-universe-scope-expansion-2026-05-27.md`).
+- Converts the per-minute schedule to unbounded/tighter polling, or exceeds the 1-unique-per-3s chain rule / Data-API 5-per-sec budget.
+- Ships `[option_chain_1m]` DEFAULT-ON before the entitlement is proven live AND a fresh dated operator quote is recorded here.
+- Re-adds any OTHER §3 REMOVE-row endpoint under cover of this grant.
+
+Any such PR MUST be rejected in review even if the operator approves verbally — the operator must update this §8 FIRST with a dated quote.
+
+## §8.6 Auto-driver / Insta-reel explanation
+
+> Sir, the juice shop's LIVE price board keeps shouting as before — nothing changes there. NEW: once every minute, exactly when the minute hand ticks, the boy makes ONE quick phone call to the supplier for the OFFICIAL last-minute price card of just the 3 big baskets (NIFTY, BANKNIFTY, SENSEX) and files it in a brand-new drawer. Right after that call, he makes a second call for the option-coupon price sheet of the same 3 baskets — but that second phone stays UNPLUGGED until we confirm the supplier will actually answer it (last time they refused). Six-ish short calls a minute, filed in two new drawers, never touching the live board or the old drawers.

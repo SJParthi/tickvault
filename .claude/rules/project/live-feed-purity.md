@@ -175,6 +175,30 @@ and replaced with the hard bans in this rule.
     - **Reads `candles_1m`** (allowed — "Reading `ticks`/`candles_*` from
       pipeline code is ALLOWED"); writes ONLY to the new audit table + CSV.
 
+12. **Per-minute REST spot-1m + option-chain capture — ALLOWED 2026-07-12
+    (operator directive; see `no-rest-except-live-feed-2026-06-27.md` §8 for
+    the verbatim quote + full grant).** TWO new allowed REST-write
+    destinations join `prev_day_ohlcv` (rule 9) and `cross_verify_1m_audit`
+    (rule 11):
+    - **`spot_1m_rest`** — the just-closed official 1-minute OHLCV for the
+      3 IDX_I spot SIDs (NIFTY=13, BANKNIFTY=25, SENSEX=51) via
+      `POST /v2/charts/intraday` (interval `"1"`), fetched once per minute
+      close in-session. Writes ONLY `spot_1m_rest`.
+    - **`option_chain_1m`** — per-minute per-strike per-leg current-expiry
+      chain snapshots for the same 3 underlyings via `POST /v2/optionchain`
+      (+ day-start `POST /v2/optionchain/expirylist`), config-gated
+      DEFAULT-OFF pending the first-live-boot entitlement probe. Writes
+      ONLY `option_chain_1m`.
+
+    NEITHER destination is `ticks`, `candles_*`, or `historical_candles` —
+    the hard ban in rules 1-6 stands unchanged: no synthesized ticks, no
+    backfill, no REST-derived row ever crosses into the live tables. The
+    modules live in `crates/app/src/spot_1m_rest_boot.rs` /
+    `crates/app/src/option_chain_1m_boot.rs` +
+    `crates/storage/src/spot_1m_rest_persistence.rs` /
+    `crates/storage/src/option_chain_1m_persistence.rs` (NOT under
+    `crates/core/src/historical/`).
+
 ## Test ratchet
 
 - Pre-commit hook (banned-pattern-scanner.sh, category 6) — fails the
