@@ -161,12 +161,23 @@ new WebSocket (2-WS lock untouched), no order path.
 
 ## Plan Items
 
-- [ ] PR-1 (THIS PR, docs-only): rule-file authorization set + this plan file
+- [x] PR-1 (docs-only, MERGED as #1486): rule-file authorization set + this plan file
   - Files: .claude/rules/project/no-rest-except-live-feed-2026-06-27.md, .claude/rules/dhan/option-chain.md, .claude/rules/project/option-chain-cross-verify-error-codes.md, .claude/rules/project/historical-candles-cross-verify.md, .claude/rules/project/live-feed-purity.md, .claude/plans/active-plan-rest-1m-pipeline.md
   - Tests: N/A — docs-only (plan-gate + per-item-guarantee-check hooks are the verification)
-- [ ] PR-2 (spot leg, `tickvault-app` + `tickvault-storage` + `tickvault-common`): per-minute spot-1m fetcher + `spot_1m_rest` table + SPOT1M-01/02 codes + rest-1m-pipeline-error-codes.md
-  - Files: crates/app/src/spot_1m_rest_boot.rs, crates/app/src/main.rs, crates/storage/src/spot_1m_rest_persistence.rs, crates/storage/src/partition_manager.rs, crates/common/src/constants.rs, crates/common/src/config.rs, crates/common/src/error_code.rs, .claude/rules/project/rest-1m-pipeline-error-codes.md
-  - Tests: test_spot_1m_window_builder_exact_minute, test_spot_1m_response_filter_drops_other_minutes, test_spot_1m_ist_offset_plus_19800, test_spot_1m_dedup_key_includes_segment_and_feed, test_spot_1m_scheduler_gates_session_and_trading_day, test_spot_1m_rest_table_registered_for_day_partitioning
+- [x] PR-2 (spot leg, `tickvault-app` + `tickvault-storage` + `tickvault-common`): per-minute spot-1m fetcher + `spot_1m_rest` table + SPOT1M-01/02 codes + rest-1m-pipeline-error-codes.md
+  - Files: crates/app/src/spot_1m_rest_boot.rs, crates/app/src/lib.rs, crates/app/src/main.rs, crates/app/tests/spot_1m_rest_wiring_guard.rs, crates/storage/src/spot_1m_rest_persistence.rs, crates/storage/src/partition_manager.rs, crates/common/src/constants.rs, crates/common/src/config.rs, crates/common/src/error_code.rs, crates/core/src/notification/events.rs, config/base.toml, .claude/rules/project/rest-1m-pipeline-error-codes.md, .claude/triage/error-rules.yaml
+  - Tests: test_minute_window_strings_open_plus_60s, test_parse_intraday_columnar_for_minute_utc_to_ist_and_filter, test_select_minute_candle_exact_match_only, test_minute_open_ist_nanos_matches_ist_as_epoch_convention, test_spot_1m_rest_dedup_key_ts_first_segment_and_feed_in_key, test_next_fire_past_window_returns_none, test_day_is_over_non_trading_day_or_past_window, test_fire_walk_covers_exactly_375_minutes, test_day_partitioned_tables_not_empty, ratchet_spot1m_spawn_is_config_gated_inside_post_market_seam, ratchet_spot1m_boot_module_is_not_a_stub
+  - As-built deltas vs the original promises (noted in the PR body): the six
+    promised test names were placeholders — the real suite above supersedes
+    them 1:1 by concern (window builder / minute filter / +19800 / DEDUP key /
+    session+trading-day gates / partition registration) plus the 2026-07-12
+    adversarial-review additions (same-second re-fire, per-SID minute budget,
+    missed-boundary accounting, persist-gated edge, discard_pending, body
+    cap). `feed` is stamped `'dhan'` with a separate `source='rest_intraday'`
+    SYMBOL label (NOT the originally-sketched `'dhan_rest'`) so the `feed`
+    domain stays the canonical `dhan`/`groww` set from `data-integrity.md`;
+    error counters landed as `tv_spot1m_fetch_total{outcome}` +
+    `tv_spot1m_persist_errors_total{stage}` (not `tv_spot_1m_rest_*`).
 - [ ] PR-3 (chain leg, `tickvault-app` + `tickvault-storage` + `tickvault-common`): per-minute option-chain fetcher (DEFAULT-OFF) + `option_chain_1m` table + CHAIN-01..04 codes + entitlement probe
   - Files: crates/app/src/option_chain_1m_boot.rs, crates/app/src/main.rs, crates/storage/src/option_chain_1m_persistence.rs, crates/common/src/constants.rs, crates/common/src/config.rs, crates/common/src/error_code.rs, .claude/rules/project/rest-1m-pipeline-error-codes.md
   - Tests: test_option_chain_request_pascal_case_underlying_scrip_int, test_option_chain_strike_keys_parse_decimal_strings, test_option_chain_ce_pe_optional_absent_side, test_option_chain_pacing_one_unique_per_3s, test_expirylist_warmup_fail_closed_keeps_leg_dormant, test_option_chain_1m_default_off_config_gate
