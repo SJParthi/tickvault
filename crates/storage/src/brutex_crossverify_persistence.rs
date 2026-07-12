@@ -239,6 +239,7 @@ pub fn daily_outcome_rank(outcome: &str) -> u8 {
 /// and logs `stage="outcome_regression"`. `None` existing (no prior row)
 /// never blocks.
 #[must_use]
+// TEST-EXEMPT: covered by test_keep_better_blocks_measured_to_unmeasured_downgrade (same-module suite).
 pub fn keep_better_blocks_downgrade(existing_outcome: Option<&str>, new_outcome: &str) -> bool {
     match existing_outcome {
         Some(existing) => daily_outcome_rank(existing) > daily_outcome_rank(new_outcome),
@@ -342,6 +343,7 @@ pub struct BrutexCrossverifyDailyRow {
 /// The idempotent cell-audit `CREATE TABLE` DDL. Pure (testable without
 /// QuestDB).
 #[must_use]
+// TEST-EXEMPT: covered by test_cell_audit_ddl_contains_expected_columns (same-module suite).
 pub fn brutex_crossverify_cell_audit_create_ddl() -> String {
     format!(
         "CREATE TABLE IF NOT EXISTS {BRUTEX_CROSSVERIFY_CELL_AUDIT_TABLE} (\
@@ -368,6 +370,7 @@ pub fn brutex_crossverify_cell_audit_create_ddl() -> String {
 /// The idempotent daily-summary `CREATE TABLE` DDL. Pure (testable without
 /// QuestDB).
 #[must_use]
+// TEST-EXEMPT: covered by test_daily_ddl_contains_expected_columns (same-module suite).
 pub fn brutex_crossverify_daily_create_ddl() -> String {
     format!(
         "CREATE TABLE IF NOT EXISTS {BRUTEX_CROSSVERIFY_DAILY_TABLE} (\

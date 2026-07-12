@@ -428,6 +428,7 @@ pub fn key_is_csv(key: &str) -> bool {
 
 /// `true` for the day's best-effort manifest object.
 #[must_use]
+// TEST-EXEMPT: covered by test_key_is_csv_and_manifest (same-module tests).
 pub fn key_is_manifest(key: &str) -> bool {
     key.rsplit('/')
         .next()

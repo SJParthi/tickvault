@@ -246,7 +246,7 @@ fn resolve_header(header_line: &str) -> Result<HeaderIndexes, BrutexCsvError> {
 /// `bad_rows` with the first ≤5 offending lines sampled (truncated to 80
 /// chars). Duplicate `(symbol, minute)` keys collapse LAST-wins. Parsing
 /// stops once `max_rows` rows are ACCEPTED (`truncated = true`).
-// TEST-EXEMPT-NOT-NEEDED: covered by the `csv_*` tests below.
+// TEST-EXEMPT: covered by the `csv_*` suite below (csv_happy_path_three_rows_with_volume_and_oi, csv_missing_header_is_typed_error, csv_seeded_fuzz_never_panics, ...).
 pub fn parse_brutex_csv(bytes: &[u8], max_rows: usize) -> Result<ParsedCsv, BrutexCsvError> {
     // BOM strip.
     let body = bytes.strip_prefix(b"\xef\xbb\xbf").unwrap_or(bytes);
@@ -424,8 +424,8 @@ impl GrowwSymbolMap {
     /// rows consumed; everything else ignored). Duplicate EQUITY symbols
     /// prefer NSE_EQ over BSE_EQ; any OTHER duplicate identity poisons the
     /// key as ambiguous (fail-closed) and is counted.
-    // TEST-EXEMPT-NOT-NEEDED: covered by the `map_*` tests below.
     #[must_use]
+    // TEST-EXEMPT: covered by the `map_*` tests below (same-module suite).
     pub fn from_lifecycle_rows(rows: Vec<LifecycleRow>) -> Self {
         let mut map = Self::default();
         for row in rows {
@@ -475,6 +475,7 @@ impl GrowwSymbolMap {
     /// Number of keys poisoned as ambiguous during the build.
     // WIRING-EXEMPT: consumed by Unit 5 runner (same PR)
     #[must_use]
+    // TEST-EXEMPT: covered by map_garbage_is_unmapped_and_duplicates_are_ambiguous (same-module suite).
     pub fn ambiguous_key_count(&self) -> usize {
         self.ambiguous_keys
     }
@@ -894,8 +895,8 @@ fn shifted_match_rate(
 /// Both maps are keyed `(symbol identity, IST minute nanos)` with prices in
 /// integer paise. Pure — the caller owns persistence, Telegram, and error
 /// codes. See the module docs for classification semantics.
-// TEST-EXEMPT-NOT-NEEDED: covered by the `compare_*` tests below.
 #[must_use]
+// TEST-EXEMPT: covered by the `compare_*` tests below (same-module suite).
 pub fn compare_day(
     brutex: &HashMap<BarKey, MinuteBar>,
     live: &HashMap<BarKey, MinuteBar>,

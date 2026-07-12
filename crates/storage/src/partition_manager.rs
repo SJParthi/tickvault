@@ -101,6 +101,11 @@ pub(crate) const DAY_PARTITIONED_TABLES: &[&str] = &[
     "feed_scoreboard_daily",
     "feed_coverage_daily",
     "feed_episode_audit",
+    // BRUTEX-XVERIFY-01/02 (2026-07-12, §37): one row per divergent cell /
+    // one row per trading-day summary — same SEBI-audit class + DAY
+    // partitioning as cross_verify_1m_audit / feed_scoreboard_daily.
+    "brutex_crossverify_cell_audit",
+    "brutex_crossverify_daily",
 ];
 
 /// Tables EXEMPT from retention sweeping — NEVER detached or dropped.
