@@ -230,6 +230,8 @@ fast path; it already contains the NATS-over-WS + nkey + protobuf decode.
 
 # §33 — Groww LIVE-FEED-ONLY (operator lock 2026-06-26)
 
+> **⚠ PARTIALLY SUPERSEDED 2026-07-12 by §37 below** — the operator re-authorized ONE narrow backtest-comparison mechanism: read-only consumption of BruteX-produced backtest CSVs from OUR OWN S3 bucket. §33's ban on TickVault-side Groww historical/API fetching stands unchanged; see §37.
+>
 > **Authority:** this section SUPERSEDES the §0 Quote-1 live-vs-backtest deliverable and
 > HALTS the §32 Python-sidecar backtest-comparison purpose (the `get_historical_candles`
 > capture + the Rust consumer's "parity checker" role). It does NOT lift the §32 Python
@@ -251,6 +253,8 @@ fast path; it already contains the NATS-over-WS + nkey + protobuf decode.
 FORBIDDEN until the operator re-authorizes with a fresh dated quote. The live-vs-backtest
 1-minute parity track is CANCELLED.**
 
+> **2026-07-12 note:** the "pulling from Groww" ban above stands UNCHANGED. §37 (dated quote) re-authorizes ONLY the read-only consumption of BruteX-PRODUCED backtest CSVs from our own S3 bucket — a comparison mechanism, not a Groww fetch.
+
 ## §33.2 What this HALTS / CANCELS
 
 | Cancelled | Detail |
@@ -259,6 +263,8 @@ FORBIDDEN until the operator re-authorizes with a fresh dated quote. The live-vs
 | §32.1/§32.2 backtest-comparison purpose | The Python sidecar's role is reduced to **live tick capture only**. No `get_historical_candles` / `growwapi` historical call. The Rust consumer is a live 1m/21-TF sealer, NOT a parity checker, for Groww. |
 | Plan parity track | `.claude/plans/active-plan-groww-live-backtest-parity.md` SP5 (parity audit table) / SP6 / SP6a / SP6b (`BacktestSource` trait + Dhan/Groww fetchers) / SP7 (parity orchestrator) are CANCELLED. The abandoned SP6a branch (`claude/parity-sp6-backtest-source`) was discarded. |
 | Any Groww `BacktestSource` impl | `crates/core/src/feed/groww/backtest.rs`, `scripts/groww-sidecar/groww_backtest_fetch.py`, and any Groww historical fetcher MUST NOT be created. |
+
+> **2026-07-12 note:** the SP5–SP7 cancellation and the `BacktestSource` / `backtest`-module naming ban stand. The §37 consumer is a DIFFERENT mechanism (S3-CSV read of BruteX artifacts) named `brutex_crossverify` — never `backtest`/`BacktestSource`.
 
 ## §33.3 What is UNCHANGED
 
@@ -277,6 +283,8 @@ Any such PR MUST be rejected in review even if the operator approves verbally �
 must update this §33 FIRST with a fresh dated quote re-authorizing Groww historical, only then
 can the PR land.
 
+> **2026-07-12 note:** the required §33 update happened — §37 below carries the fresh dated operator quote authorizing the narrow BruteX-S3-CSV consumption path (and ONLY that path). Every REJECT bullet above still applies to any TickVault-side Groww API/historical fetch.
+
 ## §33.5 Honest envelope (mandatory per §5 / operator-charter §F)
 
 > "Groww is live-feed-only as of 2026-06-26. We capture and seal Groww LIVE ticks (1m + 21 TFs,
@@ -284,6 +292,8 @@ can the PR land.
 > claim about Groww live-vs-backtest agreement, because we deliberately fetch NO Groww backtest
 > data. The Dhan-side historical cross-verify is the only OHLCV parity signal in the system and
 > is untouched."
+
+> **2026-07-12 note:** TickVault still fetches NO Groww backtest data from Groww; since 2026-07-12 it CONSUMES BruteX-produced backtest CSVs from our own S3 per §37, so the Dhan cross-verify is no longer the ONLY OHLCV parity signal — the §37 BruteX↔TickVault daily comparison is the second one.
 
 ## §33.6 Auto-driver / Insta-reel explanation
 
@@ -511,3 +521,126 @@ truncated); any new Groww connection; any Groww historical fetch (§33); resolvi
 anything but the static master CSV. (The pre-2026-07-10 single-expiry-per-underlying ban is
 REMOVED by this dated §36.7 edit.) This file must be edited FIRST with a fresh dated quote
 for any of the above.
+
+---
+
+# §37 — BruteX backtest cross-verification: S3-CSV read-only consumption (operator authorization 2026-07-12)
+
+> **Authority:** this section PARTIALLY SUPERSEDES §33 (see the dated banner on §33's header
+> and the dated notes on §33.1/§33.2/§33.4/§33.5). It re-authorizes exactly ONE narrow
+> backtest-comparison mechanism — read-only consumption of BruteX-PRODUCED backtest CSVs from
+> OUR OWN S3 bucket — and NOTHING else. §33's ban on TickVault-side Groww historical/API
+> fetching stands unchanged. The 2-Dhan-WS lock (§3), the shared-table model, default-OFF
+> per-feed toggles, native-Rust-only/no-brutex-code, and the §4/§32.4/§36.3 REJECT conditions
+> all stand unchanged.
+> **Cross-ref:** `no-rest-except-live-feed-2026-06-27.md` §3 (the 2026-07-12 KEEP row for the
+> S3 read); companion plan `.claude/plans/active-plan-brutex-crossverify.md`.
+
+## §37.0 The verbatim operator quotes (preserve exactly, do not paraphrase)
+
+**Quote 1 (2026-07-12, the directive):**
+> "Build the daily cross-verification CHECK on the TickVault side, full protocol, read-only on the live capture. Every day after close, compare BruteX's backtest 1-minute against TickVault's own live 1-minute and flag divergence. INPUT (from BruteX): CSVs at s3://<CROSSVERIFY_BUCKET>/crossverify/groww/<YYYY-MM-DD>/<segment>/<symbol>.csv, columns symbol,timestamp_ist,open,high,low,close,volume,oi (spot indices+stocks + NIFTY/BANKNIFTY/SENSEX futures; feed=groww). TICKVAULT SIDE: read your own candles_1m where feed='groww' for the same day. Join BruteX symbol ↔ your security_id via instrument_lifecycle... COMPARE per (symbol, minute) in BOTH: open/high/low/close within a CONFIGURABLE tolerance (default: equal to 2 decimals)... Minutes in only one side → flag missing_backtest / missing_live. REPORT (daily): per symbol — matched · diverged (minute + both OHLC + diff) · missing_backtest · missing_live; + a run summary that QUANTIFIES the typical fluctuation (so we SEE the normal noise) and FLAGS anything beyond tolerance. Surface on the TickVault dashboard + a summary. HONESTY: neither side is ground truth — you have a known tick-conservation residual, Groww historical has vendor-fill fluctuation — separate 'expected fluctuation' from 'real divergence,' never assume live is correct."
+
+**Quote 2 (2026-07-12, webpage):**
+> "view report wise and even webpage view dashboard everywhere it should be easily accessible"
+
+**Quote 3 (2026-07-12, OHLC-only):**
+> "as of now except volume only OHLC alone should be checked... since volume is directly fetched in live websocket feed"
+
+## §37.1 The grant — one paragraph
+
+A post-close (15:50 IST) read-only comparer reads BruteX-produced backtest 1m CSVs from
+`s3://tv-prod-cold/crossverify/groww/<YYYY-MM-DD>/<segment>/<symbol>.csv` (our own bucket —
+`tv-${environment}-cold` in terraform; the prod instance role already has read access on the
+whole bucket, zero IAM change) and compares them against TickVault's own `candles_1m`
+(`feed='groww'`). TickVault makes ZERO Groww API historical calls — §33 stands for the Groww
+API surface. S3 GetObject/ListObjectsV2 on our own bucket is NOT a market-data REST pull
+under `no-rest-except-live-feed-2026-06-27.md` (internal artifact transfer, same class as the
+S3 cold-archive KEEP row — see the 2026-07-12 KEEP row added there). The new workspace dep
+`aws-sdk-s3` (exact pin, same feature set as the sibling aws-sdk-* pins) is authorized by
+Quote 1 as the read mechanism (flagged in the PR for the operator's visibility per the
+CLAUDE.md new-dep approval rule).
+
+## §37.2 The comparison contract (LOCKED)
+
+- Per (symbol, minute): **O/H/L/C ONLY** (Quote 3), via **integer-paise equality** with a
+  configurable `tolerance_paise` (default `0` = exact at 2 decimals — the honest form of
+  Quote 1's "equal to 2 decimals"; never a float `|diff| <= epsilon` compare).
+- **Volume** is STORED both sides in audit rows but NOT classified. Flipping volume checking
+  on = a config toggle `compare_volume`, which is a HARD NO-OP for `feed='groww'` (whose live
+  candles carry `volume=0` always — sidecar is price-only) — refused loudly, never a silent
+  100%-divergence storm.
+- **Index presence** = live bar existence (a live bar implies ≥1 tick — the aggregator opens
+  `tick_count` at 1, so `tick_count>0` is equivalent to bar existence; documented as a
+  bar-existence check, no extra rigor claimed).
+- Minutes present in only one side → `missing_backtest` / `missing_live` categories —
+  REPORTED, never counted as "real divergence" (our side only bars minutes that actually
+  ticked; the vendor fills).
+- Backtest bars outside `[09:15, 15:30)` IST → `out_of_session` (window-filtered on the
+  backtest side, never counted `missing_live`).
+- The LAST TWO session minutes (15:28, 15:29) are compared ONLY when the live bar exists,
+  else counted `tail_unsealed` — Groww has no close-time force-seal (the 15:30:05 IST
+  close-time force-seal is `Feed::Dhan`-only, verified in main.rs Task 3b) and the watermark
+  catch-up's 60s Groww margin leaves those buckets unsealed at 15:50.
+
+## §37.3 The BruteX producer contract (the shared contract; relay target for the BruteX repo)
+
+- `symbol` = the NSE trading symbol for stocks (`RELIANCE`); the canonical index name
+  (`NIFTY` / `BANKNIFTY` / `SENSEX`) for indices; `<UNDERLYING>-<YYYY-MM-DD>-FUT` for futures
+  (`NSE-` / `BSE-` prefixed forms tolerated).
+- `<segment>` path component ∈ {`IDX_I`, `NSE_EQ`, `BSE_EQ`, `NSE_FNO`, `BSE_FNO`} —
+  ADVISORY only (the §37.4 join decides; a label disagreement is counted, never trusted
+  verbatim as the join key).
+- `timestamp_ist` = `"YYYY-MM-DD HH:MM:SS"`, the minute-OPEN IST label, session
+  `09:15:00`–`15:29:00`.
+- Header row REQUIRED. Optional `_MANIFEST.json` written AFTER all files (the
+  publish-complete marker).
+- Publish deadline **15:45 IST**; if absent at 15:50 → bounded re-poll until **16:05**, then
+  the day reads `NO_DATA` LOUDLY — never a pass (Rule 11: `compared == 0` can never render
+  green).
+
+## §37.4 Mapping (the answered question)
+
+The join table is `instrument_lifecycle WHERE feed='groww' AND dry_run=false` (one
+current-state row per instrument, ts pinned):
+
+- **Stocks:** by `symbol_name` (the NSE trading symbol, `instrument_type='EQUITY'`).
+- **Indices:** by `symbol_name` AFTER stripping the `NSE-`/`BSE-` prefix +
+  `canonicalize_index_symbol` (`instrument_type='INDEX'`).
+- **Futures:** by `(underlying_symbol, expiry_date)` CONTRACT identity
+  (`instrument_type='FUTIDX'`) — never by native id (§36.2: Groww token ≠ Dhan SID).
+- Symbols are NEVER matched raw across classes (an index join without the
+  `instrument_type` filter can swallow FUT rows — both start `NSE-`).
+
+## §37.5 Honest envelope (mandatory per §5 / operator-charter §F)
+
+> "100% inside the tested envelope, with ratcheted regression coverage: a pure ratchet-tested
+> comparer (paise-integer compare, hostile CSV parse, mapping normalization, keep-better
+> rerun guard). NOT claimed: EITHER side as ground truth — TickVault carries the known
+> tick-conservation residual, Groww historical carries vendor-fill fluctuation — the report
+> separates 'expected fluctuation' from 'real divergence' and never assumes live is correct
+> (Quote 1). The live S3 + QuestDB legs are verified on the box at the first enabled run (no
+> AWS creds in CI). The results page is a read-only public GET per Quote 2 + the 2026-06-23
+> public-read precedent. Codes BRUTEX-XVERIFY-01/02 are log-sink-only today (no CloudWatch
+> `error_code_alerts` entry) — the Telegram daily summary is the operator signal."
+
+## §37.6 What a violating PR looks like (REJECT)
+
+- Any Groww API historical/candle fetch from TickVault (§33 stands).
+- Any module/type named `backtest` / `BacktestSource` (§33.2 naming ban stands — the
+  consumer is `brutex_crossverify`).
+- Reviving SP5–SP7 of the cancelled parity plan.
+- Writing to `ticks` / `candles_*` from this path (audit tables ONLY — live-feed purity
+  rule 4).
+- Any hot-path involvement (this is a once-a-day cold-path task).
+- A mutating web endpoint (the §37 surface is read-only GET).
+- Classifying volume in the verdict without a fresh dated quote flipping Quote 3.
+
+Any such PR MUST be rejected in review even if the operator approves verbally — the operator
+must update THIS §37 first with a fresh dated quote.
+
+## §37.7 Trigger (auto-loaded)
+
+Always loaded. Reinforced on any session editing `crates/app/src/brutex_crossverify*`,
+`crates/storage/src/brutex_crossverify*`, the `[brutex_crossverify]` config section, or any
+file containing `BRUTEX-XVERIFY` or `brutex_crossverify`.
