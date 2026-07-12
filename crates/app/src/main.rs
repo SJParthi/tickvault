@@ -14346,7 +14346,7 @@ fn spawn_post_market_tasks(
             notifier.clone(),
             std::sync::Arc::clone(&trading_calendar),
             config.dhan.rest_api_base_url.clone(),
-            client_id,
+            client_id.clone(),
             config.strategy.dry_run,
         );
     // Phase 0 Item 22d (2026-05-15): End-of-day digest at
@@ -14640,6 +14640,17 @@ fn spawn_post_market_tasks(
     // session correctly runs none). Config-gated fail-safe: an absent
     // `[spot_1m_rest]` section disables it. Supervised respawn wrapper;
     // self-skips on non-trading days / past 15:30 IST (audit Rule 3).
+    // PR-3 (2026-07-12): the spot→chain sequencing signal. Created ONLY
+    // when BOTH halves are enabled — with the chain off, the spot leg's
+    // behaviour stays byte-identical to PR-2 (no sender, no publishes).
+    let (spot_minute_done_tx, spot_minute_done_rx) =
+        if config.spot_1m_rest.enabled && config.option_chain_1m.enabled {
+            let (tx, rx) = tokio::sync::watch::channel::<Option<u32>>(None);
+            (Some(tx), Some(rx))
+        } else {
+            (None, None)
+        };
+
     if config.spot_1m_rest.enabled {
         let _spot1m_supervisor = tickvault_app::spot_1m_rest_boot::spawn_supervised_spot_1m_rest(
             tickvault_app::spot_1m_rest_boot::Spot1mRestTaskParams {
@@ -14648,6 +14659,7 @@ fn spawn_post_market_tasks(
                 calendar: std::sync::Arc::clone(&trading_calendar),
                 questdb: config.questdb.clone(),
                 rest_api_base_url: config.dhan.rest_api_base_url.clone(),
+                minute_done_tx: spot_minute_done_tx,
             },
         );
         info!(
@@ -14656,6 +14668,49 @@ fn spawn_post_market_tasks(
         );
     } else {
         info!("spot_1m_rest: disabled by config — per-minute spot fetch not spawned");
+    }
+
+    // Operator grant 2026-07-12 (PR-3, the OPTION-CHAIN half): per-minute
+    // option-chain pipeline — day-start expirylist warmup, then the full
+    // current-expiry chain for the 3 underlyings each session minute,
+    // sequenced right after the spot leg, persisted to `option_chain_1m`
+    // (CHAIN-01..04). Config-gated DEFAULT-OFF pending the live
+    // entitlement probe; while disabled, `probe_and_report` (default ON)
+    // runs ONE boot-time expirylist probe and reports the verdict via
+    // Telegram — the pipeline NEVER auto-runs on a probe pass (the
+    // operator flips `[option_chain_1m].enabled`). Same shared Dhan-gated
+    // seam + once-guard as the spot leg.
+    {
+        let chain_params = tickvault_app::option_chain_1m_boot::OptionChain1mTaskParams {
+            token_handle: std::sync::Arc::clone(&token_handle),
+            notifier: notifier.clone(),
+            calendar: std::sync::Arc::clone(&trading_calendar),
+            questdb: config.questdb.clone(),
+            rest_api_base_url: config.dhan.rest_api_base_url.clone(),
+            client_id: client_id.clone(),
+            spot_minute_done: spot_minute_done_rx,
+        };
+        if config.option_chain_1m.enabled {
+            let _chain1m_supervisor =
+                tickvault_app::option_chain_1m_boot::spawn_supervised_option_chain_1m(chain_params);
+            info!(
+                "option_chain_1m: per-minute option-chain REST pipeline spawned \
+                 (expirylist warmup, then each minute close right after the spot leg)"
+            );
+        } else if config.option_chain_1m.probe_and_report {
+            tokio::spawn(
+                tickvault_app::option_chain_1m_boot::run_option_chain_1m_probe(chain_params),
+            );
+            info!(
+                "option_chain_1m: pipeline disabled by config — boot-time \
+                 entitlement probe spawned (verdict via Telegram)"
+            );
+        } else {
+            info!(
+                "option_chain_1m: disabled by config (probe_and_report off) — \
+                 no option-chain REST activity"
+            );
+        }
     }
 }
 
