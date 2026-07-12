@@ -65,6 +65,15 @@ pub const OPTION_CHAIN_1M_TABLE: &str = "option_chain_1m";
 /// key column — safe here because every strike value comes from the SAME
 /// deterministic decimal-string parse (`"25650.000000"` → f64), so a
 /// re-fetch produces a bit-identical key.
+///
+/// **PARSE-ONLY INVARIANT (hostile-review L3, ratcheted):** the float key
+/// is safe ONLY while strikes are NEVER computed arithmetically. Any
+/// future writer that DERIVES strikes (e.g. `ATM ± k×step`) would produce
+/// bit-different f64s for the same logical strike and silently mint
+/// duplicate rows — such a change MUST first move this key to a paise
+/// LONG (`strike_paise`, with `strike DOUBLE` kept as a display column).
+/// Build-failing ratchet:
+/// `crates/app/tests/option_chain_1m_wiring_guard.rs::ratchet_chain1m_strike_is_parse_only_never_computed`.
 pub const DEDUP_KEY_OPTION_CHAIN_1M: &str =
     "ts, underlying_security_id, exchange_segment, expiry, strike, leg, feed";
 

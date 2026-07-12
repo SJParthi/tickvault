@@ -955,7 +955,7 @@ pub enum ErrorCode {
     Chain03PersistFailed,
     /// CHAIN-04 (per-minute REST pipeline PR-3, 2026-07-12) — the
     /// day-start expirylist warmup failed after bounded retries (3
-    /// attempts, 2s/4s backoff): the chain pipeline degrades to
+    /// attempts, 3s/6s backoff): the chain pipeline degrades to
     /// DISABLED-FOR-THE-DAY — expiry dates come ONLY from the API
     /// (option-chain.md rule 9), NEVER guessed. One page per day.
     /// Severity::High, auto-triage-safe (the next trading-day boot

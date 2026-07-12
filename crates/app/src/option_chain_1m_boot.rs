@@ -223,17 +223,51 @@ pub fn min_gap_wait_ms(last_request_ms_of_day: Option<i64>, now_ms_of_day: i64) 
     u64::try_from(gap.saturating_sub(elapsed)).unwrap_or(0)
 }
 
+/// Backoff before re-entering the fire loop after a stale wake where the
+/// wall clock sits BEFORE the fire moment (clock step-BACK / NTP step /
+/// VM pause-resume): milliseconds until the fire moment. Without this,
+/// the already-satisfied spot signal makes [`wait_for_signal_or_fallback`]
+/// return with ZERO awaits and the staleness gate `continue`s straight
+/// back to the SAME fire — a no-yield busy-spin pinning a tokio worker
+/// (2-vCPU prod host) plus a `warn!` storm for the step magnitude
+/// (hostile-review H1). `0` when the wake is at/past the fire (the normal
+/// stale path re-arms via `last_fired`). Pure.
+#[must_use]
+pub fn stale_wake_backoff_ms(fire_secs_of_day: u32, woke_at_secs_of_day: u32) -> u64 {
+    u64::from(fire_secs_of_day.saturating_sub(woke_at_secs_of_day)).saturating_mul(1_000)
+}
+
+/// `true` when the body parses as the documented Dhan error-JSON shape —
+/// a JSON OBJECT carrying an `errorCode` or `errorType` field
+/// (api-introduction.md rule 6: exactly 3 string fields, always present).
+/// A gateway/WAF HTML block page never satisfies this, so wording checks
+/// gated on it cannot false-positive on proxy pages (hostile-review M2).
+/// Pure.
+#[must_use]
+pub fn body_has_dhan_error_shape(body: &str) -> bool {
+    serde_json::from_str::<Value>(body).is_ok_and(|v| {
+        v.as_object()
+            .is_some_and(|o| o.contains_key("errorCode") || o.contains_key("errorType"))
+    })
+}
+
 /// Entitlement-class classification (CHAIN-01 vs transient CHAIN-02): a
 /// reject naming `DH-902` or Data-API `806` anywhere in the body, or a
-/// 401/403 whose body names the missing SUBSCRIPTION. A bare 401 without
-/// that wording is a token-class transient (the renewal machinery owns
-/// it), never an entitlement verdict. Pure.
+/// 401/403 whose body BOTH has the Dhan error-JSON shape
+/// ([`body_has_dhan_error_shape`] — a WAF/proxy HTML page mentioning
+/// "subscription" is a TRANSIENT, never a day-killing verdict) AND names
+/// the missing SUBSCRIPTION. A bare 401 without that wording is a
+/// token-class transient (the renewal machinery owns it), never an
+/// entitlement verdict. Residual false-positive direction (documented in
+/// the runbook §2b): a genuine Dhan-shaped 403 naming "subscription" for
+/// a non-entitlement reason still classifies absent — bounded to one HIGH
+/// page, day-scoped, WS untouched. Pure.
 #[must_use]
 pub fn is_entitlement_reject(status: u16, body: &str) -> bool {
     if body.contains("DH-902") || body.contains("\"806\"") {
         return true;
     }
-    if matches!(status, 401 | 403) {
+    if matches!(status, 401 | 403) && body_has_dhan_error_shape(body) {
         let lower = body.to_lowercase();
         return lower.contains("subscrib") || lower.contains("data apis not");
     }
@@ -243,6 +277,18 @@ pub fn is_entitlement_reject(status: u16, body: &str) -> bool {
 // ---------------------------------------------------------------------------
 // Pure chain-response parsing (hostile-input hardened)
 // ---------------------------------------------------------------------------
+
+/// Hard cap on parsed strikes per chain response (a hostile/corrupt body
+/// inside the 8 MiB cap can never mint unbounded rows/RAM): a real NIFTY
+/// chain carries ~100–200 strikes; 400 strikes (⇒ ≤800 legs) is ~2×
+/// headroom. Strikes past the cap are COUNTED as truncated (coalesced
+/// `error!` at the caller — never silent).
+pub const MAX_STRIKES_PER_CHAIN: usize = 400;
+
+/// Strike-plausibility ceiling (exclusive): a parsed strike must satisfy
+/// `0 < strike < MAX_PLAUSIBLE_STRIKE` or it is skipped + counted with
+/// the invalid keys (no NSE index strike approaches 10M).
+pub const MAX_PLAUSIBLE_STRIKE: f64 = 10_000_000.0;
 
 /// One parsed option leg (CE or PE) of one strike.
 #[derive(Clone, Debug, PartialEq)]
@@ -273,9 +319,13 @@ pub struct ParsedChain {
     /// contributes one leg — CE or PE `null`/absent is skipped, never a
     /// panic; option-chain.md rule 7).
     pub legs: Vec<ParsedLeg>,
-    /// Strike keys that did not parse as decimal numbers (skipped, counted
-    /// by the caller — never silent).
+    /// Strike keys that did not parse as decimal numbers OR parsed to an
+    /// implausible value (non-finite, ≤ 0, ≥ [`MAX_PLAUSIBLE_STRIKE`]) —
+    /// skipped, counted by the caller — never silent.
     pub invalid_strikes: u32,
+    /// Strikes past [`MAX_STRIKES_PER_CHAIN`] — dropped by the parse cap,
+    /// counted by the caller (coalesced `error!`) — never silent.
+    pub truncated_strikes: u32,
 }
 
 /// Tolerant numeric read: JSON number (int OR float) → f64; anything else
@@ -339,15 +389,23 @@ pub fn parse_option_chain(body: &str) -> Option<ParsedChain> {
         underlying_spot: val_f64(data, "last_price"),
         ..ParsedChain::default()
     };
+    let mut strikes_kept: usize = 0;
     for (strike_key, legs) in oc {
         let Ok(strike) = strike_key.trim().parse::<f64>() else {
             chain.invalid_strikes = chain.invalid_strikes.saturating_add(1);
             continue;
         };
-        if !strike.is_finite() {
+        // Plausibility bound: finite, positive, below the sanity ceiling
+        // (a corrupt/hostile key like "-5" or "1e300" never mints a row).
+        if !strike.is_finite() || strike <= 0.0 || strike >= MAX_PLAUSIBLE_STRIKE {
             chain.invalid_strikes = chain.invalid_strikes.saturating_add(1);
             continue;
         }
+        if strikes_kept >= MAX_STRIKES_PER_CHAIN {
+            chain.truncated_strikes = chain.truncated_strikes.saturating_add(1);
+            continue;
+        }
+        strikes_kept += 1;
         if let Some(ce) = parse_leg(strike, OPTION_CHAIN_1M_LEG_CE, legs.get("ce")) {
             chain.legs.push(ce);
         }
@@ -419,7 +477,13 @@ async fn read_body_capped(mut resp: reqwest::Response) -> Result<String, String>
         ));
     }
     let mut buf: Vec<u8> = Vec::new();
-    while let Some(chunk) = resp.chunk().await.map_err(|e| format!("read: {e}"))? {
+    while let Some(chunk) = resp
+        .chunk()
+        .await
+        // Transport errors ride the same secret-redact + 300-char bound
+        // as body captures (a reqwest error can echo the URL/peer text).
+        .map_err(|e| format!("read: {}", capture_rest_error_body(&e.to_string())))?
+    {
         if !accumulation_within_cap(buf.len(), chunk.len(), CHAIN_1M_MAX_BODY_BYTES) {
             return Err(format!(
                 "body exceeded cap {CHAIN_1M_MAX_BODY_BYTES} bytes mid-stream"
@@ -453,7 +517,9 @@ async fn chain_fetch_once(
         .await
         .map_err(|e| ChainFetchFailure {
             entitlement: false,
-            msg: format!("send: {}", redact_url_params(&e.to_string())),
+            // Same secret-redact + 300-char bound as body captures — a
+            // reqwest send error can echo the URL/peer text unbounded.
+            msg: format!("send: {}", capture_rest_error_body(&e.to_string())),
         })?;
     let status = resp.status();
     if !status.is_success() {
@@ -650,8 +716,11 @@ pub async fn run_option_chain_1m_probe(params: OptionChain1mTaskParams) {
             info!(
                 symbol = probe_symbol,
                 expiries = expiries.len(),
+                config_key = "[option_chain_1m].enabled",
                 "option_chain_1m: entitlement probe PASSED — chain data is \
-                 available; pipeline stays OFF until the config is flipped"
+                 available; pipeline stays OFF until the config is flipped \
+                 (the Telegram body carries the plain-English action; the \
+                 exact key lives HERE)"
             );
             params
                 .notifier
@@ -866,11 +935,29 @@ async fn fire_one_chain_minute(
                     metrics::histogram!("tv_chain1m_close_to_data_ms")
                         .record(close_to_data_ms as f64);
                     if chain.invalid_strikes > 0 {
+                        metrics::counter!("tv_chain1m_invalid_strikes_total")
+                            .increment(u64::from(chain.invalid_strikes));
                         warn!(
                             symbol = target.symbol,
                             invalid_strikes = chain.invalid_strikes,
                             minute = %minute_label,
-                            "option_chain_1m: skipped unparsable strike keys"
+                            "option_chain_1m: skipped unparsable/implausible strike keys"
+                        );
+                    }
+                    if chain.truncated_strikes > 0 {
+                        // Coalesced ONCE per underlying per fire — a body
+                        // past the strike cap is counted, never silent.
+                        metrics::counter!("tv_chain1m_strikes_truncated_total")
+                            .increment(u64::from(chain.truncated_strikes));
+                        error!(
+                            code = ErrorCode::Chain02FetchDegraded.code_str(),
+                            stage = "strikes_truncated",
+                            symbol = target.symbol,
+                            truncated_strikes = chain.truncated_strikes,
+                            cap = MAX_STRIKES_PER_CHAIN,
+                            minute = %minute_label,
+                            "CHAIN-02: chain response exceeded the strike cap — \
+                             extra strikes dropped (counted, never silent)"
                         );
                     }
                     let expiry_nanos = minute_open_ist_nanos(target.expiry, 0);
@@ -984,20 +1071,24 @@ async fn fire_one_chain_minute(
         }
     }
 
-    record_chain_minute_verdict(
-        params,
-        edge,
-        &minute_label,
-        ok_count,
-        error_count,
-        empty_count,
-        persist_failed,
-        sample_failure.as_deref(),
-    );
-
+    // An entitlement stop pages CHAIN-01 (once, day-scoped) at the caller
+    // — skip the CHAIN-02 edge accounting for the same minute so one
+    // event can never double-page (hostile-review L2).
     match entitlement {
         Some(detail) => MinuteVerdict::EntitlementStop(detail),
-        None => MinuteVerdict::Continue,
+        None => {
+            record_chain_minute_verdict(
+                params,
+                edge,
+                &minute_label,
+                ok_count,
+                error_count,
+                empty_count,
+                persist_failed,
+                sample_failure.as_deref(),
+            );
+            MinuteVerdict::Continue
+        }
     }
 }
 
@@ -1321,6 +1412,15 @@ pub async fn run_option_chain_1m(
                         / 60)
                         * 60,
                 );
+            }
+            let backoff_ms = stale_wake_backoff_ms(fire, woke);
+            if backoff_ms > 0 {
+                // Clock stepped BACK across the boundary (woke < fire):
+                // the spot signal already satisfies this fire, so the
+                // next wait would return with ZERO awaits — sleep up to
+                // the fire moment instead of busy-spinning + storming
+                // the warn! above (hostile-review H1).
+                tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
             }
             continue;
         }
@@ -1653,6 +1753,55 @@ mod tests {
         );
     }
 
+    /// Implausible strikes (≤ 0 or ≥ the sanity ceiling) are skipped +
+    /// counted with the invalid keys — never a row, never silent.
+    #[test]
+    fn test_parse_option_chain_implausible_strikes_skipped_and_counted() {
+        let body = r#"{"data": {"oc": {
+            "0.000000": {"ce": {"last_price": 1}},
+            "-5.000000": {"ce": {"last_price": 1}},
+            "99999999999.000000": {"ce": {"last_price": 1}},
+            "25650.000000": {"ce": {"last_price": 2}}
+        }}}"#;
+        let parsed = parse_option_chain(body).expect("parses");
+        assert_eq!(parsed.invalid_strikes, 3, "0 / negative / >=10M skipped");
+        assert_eq!(parsed.legs.len(), 1);
+        assert_eq!(parsed.legs[0].strike, 25_650.0);
+    }
+
+    /// Strikes past [`MAX_STRIKES_PER_CHAIN`] are dropped + counted as
+    /// truncated (a hostile body inside the byte cap can never mint
+    /// unbounded rows).
+    #[test]
+    fn test_parse_option_chain_strike_cap_truncates_and_counts() {
+        let mut entries: Vec<String> = Vec::new();
+        for i in 0..(MAX_STRIKES_PER_CHAIN + 7) {
+            entries.push(format!(
+                r#""{}.000000": {{"ce": {{"last_price": 1}}}}"#,
+                10_000 + i
+            ));
+        }
+        let body = format!(r#"{{"data": {{"oc": {{ {} }}}}}}"#, entries.join(","));
+        let parsed = parse_option_chain(&body).expect("parses");
+        assert_eq!(parsed.truncated_strikes, 7);
+        assert_eq!(parsed.legs.len(), MAX_STRIKES_PER_CHAIN);
+        assert_eq!(parsed.invalid_strikes, 0);
+    }
+
+    /// serde_json's built-in recursion limit (128) makes deeply-nested
+    /// hostile JSON ERROR instead of overflowing the stack — verified
+    /// here as the depth guard: ~200-deep nesting returns `None`, no
+    /// abort (hostile-review recursion-depth follow-up; evidence that no
+    /// extra depth guard is needed on this parse path).
+    #[test]
+    fn test_parse_option_chain_deep_nesting_errors_cleanly_no_overflow() {
+        let deep = format!("{{\"data\":{}{}}}", "[".repeat(200), "]".repeat(200));
+        assert!(parse_option_chain(&deep).is_none());
+        // Same via a deeply nested OBJECT chain.
+        let deep_obj = format!("{}\"x\"{}", "{\"a\":".repeat(200), "}".repeat(200));
+        assert!(parse_option_chain(&deep_obj).is_none());
+    }
+
     // ---- entitlement classification ------------------------------------------
 
     #[test]
@@ -1666,12 +1815,33 @@ mod tests {
             401,
             r#"{"errorCode":"806","errorMessage":"Data APIs not subscribed"}"#
         ));
-        // 401/403 naming the subscription → entitlement.
+        // 401/403 whose DHAN-SHAPED error body names the subscription →
+        // entitlement (the shape gate: errorCode/errorType present).
         assert!(is_entitlement_reject(
+            403,
+            r#"{"errorType":"Access","errorCode":"DH-XYZ","errorMessage":"user has not subscribed to Data APIs"}"#
+        ));
+        assert!(is_entitlement_reject(
+            401,
+            r#"{"errorCode":"X","errorMessage":"Data APIs not enabled"}"#
+        ));
+        // A WAF/gateway HTML 403 mentioning "subscription" is NOT Dhan's
+        // error shape → TRANSIENT, never a day-killing entitlement
+        // verdict (hostile-review M2 — the false-positive direction).
+        assert!(!is_entitlement_reject(
+            403,
+            "<html><body>Access denied. See our subscription plans for subscribers.</body></html>"
+        ));
+        // Un-shaped plain text with the wording is likewise transient.
+        assert!(!is_entitlement_reject(
             403,
             "user has not subscribed to Data APIs"
         ));
-        assert!(is_entitlement_reject(401, "Data APIs not enabled"));
+        // Dhan-shaped 401 WITHOUT the wording is a token-class transient.
+        assert!(!is_entitlement_reject(
+            401,
+            r#"{"errorType":"Auth","errorCode":"DH-901","errorMessage":"invalid token"}"#
+        ));
         // A bare 401 (token-expired class) is TRANSIENT — the renewal
         // machinery owns it; never an entitlement verdict.
         assert!(!is_entitlement_reject(401, "invalid token"));
@@ -1681,6 +1851,13 @@ mod tests {
         assert!(!is_entitlement_reject(500, "internal error"));
         // "806" must be the quoted code, not any number in the body.
         assert!(!is_entitlement_reject(400, r#"{"took_ms": 806}"#));
+        // The shape helper itself: object with errorCode/errorType = yes;
+        // arrays / plain text / other objects = no.
+        assert!(body_has_dhan_error_shape(r#"{"errorCode":"DH-902"}"#));
+        assert!(body_has_dhan_error_shape(r#"{"errorType":"Access"}"#));
+        assert!(!body_has_dhan_error_shape(r#"{"status":"failed"}"#));
+        assert!(!body_has_dhan_error_shape(r#"["errorCode"]"#));
+        assert!(!body_has_dhan_error_shape("<html>errorCode</html>"));
     }
 
     // ---- pacing (1 unique request / 3s per underlying) -------------------------
@@ -1802,6 +1979,50 @@ mod tests {
         );
     }
 
+    /// Clock-step-BACK defense (hostile-review H1): when a stale wake
+    /// lands BEFORE the fire moment (NTP step / VM pause-resume) with the
+    /// spot signal already satisfied, the pre-satisfied wait returns with
+    /// ZERO awaits — the stale arm's `stale_wake_backoff_ms` sleep is
+    /// what breaks the busy-spin: non-zero exactly when `woke < fire`,
+    /// and the loop actually awaits it.
+    #[tokio::test]
+    async fn test_clock_step_back_stale_arm_awaits_instead_of_busy_spin() {
+        use tokio::sync::watch;
+        let fire: u32 = 560 * 60; // 09:20:00 IST
+        // The spin ingredient: a pre-satisfied signal returns instantly
+        // (no await at all), so the loop alone would spin at CPU speed.
+        let (tx, rx) = watch::channel::<Option<u32>>(Some(fire));
+        let mut rx_opt = Some(rx);
+        let started = std::time::Instant::now();
+        wait_for_signal_or_fallback(5_000, fire, &mut rx_opt).await;
+        assert!(
+            started.elapsed() < Duration::from_millis(50),
+            "pre-satisfied signal returns without awaiting"
+        );
+        drop(tx);
+        // The backoff is non-zero precisely for the step-back shape…
+        assert_eq!(stale_wake_backoff_ms(fire, fire - 3), 3_000);
+        assert_eq!(stale_wake_backoff_ms(fire, fire.saturating_sub(1)), 1_000);
+        // …and zero on the normal stale-forward / exact-boundary shapes
+        // (those re-arm via `last_fired`, no sleep needed).
+        assert_eq!(stale_wake_backoff_ms(fire, fire), 0);
+        assert_eq!(stale_wake_backoff_ms(fire, fire + 90), 0);
+        // The loop-shaped composition: pre-satisfied wait + the stale
+        // arm's backoff sleep — one iteration now awaits >= the step gap
+        // instead of spinning (millisecond-scaled for the test).
+        let (tx, rx) = watch::channel::<Option<u32>>(Some(fire));
+        let mut rx_opt = Some(rx);
+        let started = std::time::Instant::now();
+        wait_for_signal_or_fallback(5_000, fire, &mut rx_opt).await;
+        let backoff_ms = stale_wake_backoff_ms(fire, fire - 1).min(120);
+        tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+        assert!(
+            started.elapsed() >= Duration::from_millis(100),
+            "the stale-arm backoff bounds the loop iteration"
+        );
+        drop(tx);
+    }
+
     // ---- edge verdict ----------------------------------------------------------
 
     #[test]
@@ -1816,7 +2037,7 @@ mod tests {
 
     /// The expirylist warmup fail-closed contract: with every attempt
     /// failing (unreachable server), the warmup ends `Failed` — never a
-    /// guessed expiry, never a resolved set. Real-time (~6 s of constant
+    /// guessed expiry, never a resolved set. Real-time (~9 s of constant
     /// backoffs — the workspace tokio has no `test-util` paused clock);
     /// port-1 connection refusals themselves are instant.
     #[tokio::test]

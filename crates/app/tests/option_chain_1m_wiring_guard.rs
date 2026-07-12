@@ -220,3 +220,64 @@ fn ratchet_chain1m_boot_module_is_not_a_stub() {
         );
     }
 }
+
+/// DEDUP float-key safety ratchet (hostile-review L3): `strike` sits in
+/// the `option_chain_1m` DEDUP UPSERT KEYS as a DOUBLE — safe ONLY
+/// because every strike is PARSED from Dhan's decimal-string map key
+/// (bit-identical f64 on re-fetch: "25650.0" and "25650.000000" parse to
+/// the same bits) and is NEVER computed arithmetically. Any future
+/// writer deriving strikes (e.g. ATM ± k×step) would silently mint
+/// duplicate rows — that change must move the key to a paise LONG first
+/// (see the note in `option_chain_1m_persistence.rs`).
+#[test]
+fn ratchet_chain1m_strike_is_parse_only_never_computed() {
+    let boot_src = read_app_src("src/option_chain_1m_boot.rs");
+    let persist_src = read_app_src("../storage/src/option_chain_1m_persistence.rs");
+
+    // The single strike-producing site: the decimal-string key parse.
+    assert!(
+        boot_src.contains("strike_key.trim().parse::<f64>()"),
+        "option_chain_1m_boot.rs lost the parse-only strike site — strikes \
+         must come ONLY from Dhan's decimal-string keys"
+    );
+
+    // No arithmetic on strikes anywhere in either module (the invariant
+    // the float DEDUP key depends on). Comment lines are stripped so
+    // doc-comment prose (`/// strike, leg`) never false-positives.
+    let strip_comments = |src: &str| -> String {
+        src.lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let boot_code = strip_comments(&boot_src);
+    let persist_code = strip_comments(&persist_src);
+    for (name, src) in [
+        ("option_chain_1m_boot.rs", boot_code.as_str()),
+        ("option_chain_1m_persistence.rs", persist_code.as_str()),
+    ] {
+        for needle in [
+            "strike *",
+            "strike +",
+            "strike /",
+            "strike -",
+            "* strike",
+            "+ strike",
+            "/ strike",
+            "strike.mul",
+            "strike.add",
+            "strike.sub",
+            "strike.div",
+            "strike.round",
+            "strike.floor",
+            "strike.ceil",
+        ] {
+            assert!(
+                !src.contains(needle),
+                "{name} contains `{needle}` — computing/deriving strikes \
+                 breaks the parse-only invariant the float DEDUP key depends \
+                 on; move the key to a paise LONG before landing arithmetic"
+            );
+        }
+    }
+}

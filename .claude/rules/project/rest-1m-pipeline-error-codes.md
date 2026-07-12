@@ -209,7 +209,14 @@ asked for, never a page.
 **Honest envelope:** the classification is derived from Dhan's error body
 wording; a Dhan-side rewording could degrade an entitlement reject to the
 transient CHAIN-02 class — LOUDER (the 3-minute escalation edge still
-pages), never silent.
+pages), never silent. The 401/403 wording arm additionally requires the
+DHAN ERROR-JSON SHAPE (`errorCode`/`errorType` field present —
+`body_has_dhan_error_shape`), so a gateway/WAF HTML block page mentioning
+"subscription" classifies TRANSIENT and can never kill the day
+(hostile-review M2). Residual false-positive direction: a genuine
+Dhan-shaped 403 naming "subscription" for a non-entitlement reason still
+classifies absent — bounded to ONE HIGH page, day-scoped, the WS feed
+untouched; triage step 2 (the Dhan portal check) disambiguates.
 
 ## §2c. CHAIN-02 — per-minute option-chain fetch degraded
 
@@ -296,7 +303,14 @@ the CHAIN-02 failure edge.
 
 **Honest envelope:** the table is a forensic/reference capture — a persist
 outage loses chain rows for the outage window only; it never affects tick
-capture, the WS candles, or trading.
+capture, the WS candles, or trading. **Partial-persist wrinkle
+(hostile-review L4, documented — no code change):** an append failure
+mid-underlying skips that underlying's REMAINING legs while
+earlier-appended legs (including other underlyings already in the buffer)
+may still flush — so a minute can be PARTIALLY present in the table while
+the failure edge honestly counts it fully-failed (persist-gated). A later
+re-run/backfill of the same minute UPSERTs in place (DEDUP-idempotent)
+and heals the partial rows.
 
 ## §2e. CHAIN-04 — day-start expirylist warmup failed (pipeline down for the day)
 
@@ -305,18 +319,29 @@ re-warms automatically; nothing to fix mid-day unless the REST surface
 itself is down — which other codes own).
 
 **Trigger:** the day-start `POST /v2/optionchain/expirylist` warmup
-failed after bounded retries — 3 attempts per underlying with 2 s / 4 s
-backoffs (`CHAIN_1M_EXPIRYLIST_RETRY_BACKOFF_SECS`) — or every listed
-expiry was already past (a stale-data anomaly), or no token was available
-at warmup time (`ErrorCode::Chain04ExpirylistFailed`, `stage="warmup"` /
-`stage="warmup_no_token"`). Expiry dates come ONLY from the API
-(option-chain.md rule 9) — the pipeline NEVER guesses one, so it degrades
-to DISABLED-FOR-THE-DAY: one coded error + `tv_chain1m_expirylist_failed_total`
-+ ONE typed HIGH `ChainExpirylistFailed` Telegram page, and the
-supervisor exits without respawn. The probe-only path logs
-`stage="probe_inconclusive"` / `stage="probe_client_build"` /
-`stage="probe_no_token"` on a transient probe failure — log-sink only, no
-verdict that day (tomorrow's boot re-probes).
+failed after bounded retries — 3 attempts per underlying with 3 s / 6 s
+backoffs (`CHAIN_1M_EXPIRYLIST_RETRY_BACKOFF_SECS`; each ≥ the 3 s
+unique-request window, so a retry can never earn the rate-limit reject it
+retries) — or every listed expiry was already past (a stale-data
+anomaly) (`ErrorCode::Chain04ExpirylistFailed`, `stage="warmup"`). Expiry
+dates come ONLY from the API (option-chain.md rule 9) — the pipeline
+NEVER guesses one, so it degrades to DISABLED-FOR-THE-DAY: one coded
+error + `tv_chain1m_expirylist_failed_total` + ONE typed HIGH
+`ChainExpirylistFailed` Telegram page, and the supervisor exits without
+respawn.
+
+**Bounded respawn-retry arms (NOT down-for-the-day — hostile-review M1
+truth-sync):** `stage="warmup_no_token"` (no access token at warmup time)
+logs the coded error and returns WITHOUT disabling the day — the
+supervisor respawns after the 30 s backoff and the warmup retries until
+the token machinery delivers one (no Telegram, no expirylist counter —
+the AUTH-GAP runbooks own the token page). The HTTP-client build failure
+arm behaves the same way but is coded CHAIN-02 (`stage="client_build"` —
+see §2c item 3). The probe-only path logs `stage="probe_inconclusive"` /
+`stage="probe_client_build"` / `stage="probe_no_token"` /
+`stage="probe_task_exit"` (probe task died in an unwind build) on a
+transient probe failure — log-sink only, no verdict that day (tomorrow's
+boot re-probes).
 
 **Triage:**
 1. `mcp__tickvault-logs__tail_errors` — find `CHAIN-04`; the payload

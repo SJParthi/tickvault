@@ -14698,9 +14698,26 @@ fn spawn_post_market_tasks(
                  (expirylist warmup, then each minute close right after the spot leg)"
             );
         } else if config.option_chain_1m.probe_and_report {
-            tokio::spawn(
+            // Once-only best-effort probe; its exit is MONITORED so an
+            // unwind-build panic is never silent (release aborts anyway).
+            let probe_handle = tokio::spawn(
                 tickvault_app::option_chain_1m_boot::run_option_chain_1m_probe(chain_params),
             );
+            tokio::spawn(async move {
+                if let Err(join_err) = probe_handle.await
+                    && !join_err.is_cancelled()
+                {
+                    error!(
+                        code = tickvault_common::error_code::ErrorCode::Chain04ExpirylistFailed
+                            .code_str(),
+                        stage = "probe_task_exit",
+                        ?join_err,
+                        "CHAIN-04: the option-chain entitlement probe task \
+                         died (panic) — no verdict today; tomorrow's boot \
+                         re-probes"
+                    );
+                }
+            });
             info!(
                 "option_chain_1m: pipeline disabled by config — boot-time \
                  entitlement probe spawned (verdict via Telegram)"

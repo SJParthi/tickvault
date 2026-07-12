@@ -2121,7 +2121,7 @@ impl NotificationEvent {
                  Today's one-time check confirmed the broker WILL serve option \
                  chain data. Recording is currently switched OFF.\n\
                  To start recording it minute-by-minute: turn ON the option \
-                 chain setting (option_chain_1m → enabled) and restart the app."
+                 chain setting and restart the app."
                 .to_string(),
             Self::ChainExpirylistFailed { detail } => {
                 let detail = html_escape(detail);
@@ -6843,8 +6843,10 @@ mod tests {
         assert_eq!(event.severity(), Severity::Info);
         let msg = event.to_message();
         assert!(msg.contains("IS available"), "got: {msg}");
-        // Names the exact setting to flip (the operator's next action).
-        assert!(msg.contains("option_chain_1m"), "got: {msg}");
+        // Plain-English action (10 commandments — no config-key jargon in
+        // the Telegram body; the exact key lives in the probe's log line).
+        assert!(msg.contains("turn ON the option"), "got: {msg}");
+        assert!(!msg.contains("option_chain_1m"), "got: {msg}");
         // Honest: recording is NOT running yet.
         assert!(msg.contains("switched OFF"), "got: {msg}");
     }

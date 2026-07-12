@@ -1694,10 +1694,19 @@ pub const CHAIN_1M_MAX_BODY_BYTES: usize = 8 * 1024 * 1024;
 pub const CHAIN_1M_CONSECUTIVE_FAIL_PAGE_THRESHOLD: u32 = 3;
 
 /// Bounded day-start expirylist retry backoffs (secs) BETWEEN attempts —
-/// 3 attempts total (first try + these two backoffs). On final failure the
-/// chain pipeline degrades to disabled-for-the-day (CHAIN-04; NEVER a
-/// guessed expiry — option-chain.md rule 9).
-pub const CHAIN_1M_EXPIRYLIST_RETRY_BACKOFF_SECS: [u64; 2] = [2, 4];
+/// 3 attempts total (first try + these two backoffs). Each backoff is ≥
+/// [`CHAIN_1M_MIN_GAP_SECS`]: a retry of the SAME unique request inside
+/// Dhan's 1-unique-per-3s window would earn the very rate-limit reject it
+/// retries (hostile-review L1). On final failure the chain pipeline
+/// degrades to disabled-for-the-day (CHAIN-04; NEVER a guessed expiry —
+/// option-chain.md rule 9).
+pub const CHAIN_1M_EXPIRYLIST_RETRY_BACKOFF_SECS: [u64; 2] = [3, 6];
+
+const _: () = assert!(
+    CHAIN_1M_EXPIRYLIST_RETRY_BACKOFF_SECS[0] >= CHAIN_1M_MIN_GAP_SECS
+        && CHAIN_1M_EXPIRYLIST_RETRY_BACKOFF_SECS[1] >= CHAIN_1M_MIN_GAP_SECS,
+    "expirylist retries must not re-enter Dhan's 1-unique-per-3s window"
+);
 
 // Compile-time consistency: the chain leg's whole fire (fallback delay +
 // per-underlying budget) must finish inside the minute, and the fallback
@@ -3733,7 +3742,10 @@ mod tests {
         // Dhan's documented option-chain limit: 1 unique request / 3s.
         assert_eq!(CHAIN_1M_MIN_GAP_SECS, 3);
         assert_eq!(CHAIN_1M_CONSECUTIVE_FAIL_PAGE_THRESHOLD, 3);
-        assert_eq!(CHAIN_1M_EXPIRYLIST_RETRY_BACKOFF_SECS, [2, 4]);
+        assert_eq!(CHAIN_1M_EXPIRYLIST_RETRY_BACKOFF_SECS, [3, 6]);
+        // Each expirylist retry backoff clears the 1-unique-per-3s window
+        // (retrying the SAME request inside it earns the reject it retries).
+        assert!(CHAIN_1M_EXPIRYLIST_RETRY_BACKOFF_SECS[0] >= CHAIN_1M_MIN_GAP_SECS);
         assert_eq!(CHAIN_1M_MAX_BODY_BYTES, 8 * 1024 * 1024);
     }
 
