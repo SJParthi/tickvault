@@ -2,6 +2,8 @@
 
 > **⚠ RETIRED 2026-06-28.** The 8 `OPTION-CHAIN-01..08` `ErrorCode` variants and the entire `option_chain` REST subsystem were DELETED per operator directive 2026-06-28 ("drop the option chain entire implementations and its table also"). The subsystem was disabled since 2026-06-02 (no Dhan Option Chain Data API entitlement) with no live consumer; its QuestDB table was dropped 2026-06-23. The §1 historical content below is retained for audit only — NONE of these codes exist as enum variants anymore. (The §2 CROSS-VERIFY codes were already retired 2026-05-26.)
 >
+> **2026-07-12 note:** a NEW per-minute option-chain snapshot subsystem was authorized (operator directive 2026-07-12 — see `no-rest-except-live-feed-2026-06-27.md` §8; config-gated DEFAULT-OFF pending the first-live-boot entitlement probe). It does NOT revive the `OptionChain01..08` variants — the rebuild's error codes (CHAIN-01..04, alongside the spot-side SPOT1M-01/02) live in `.claude/rules/project/rest-1m-pipeline-error-codes.md`, which lands WITH the code PRs. The §1 content below stays historical.
+>
 > **Status:** CONTRACT STUBS (historical). Production emit sites land in PR #8 (option_chain module) and PR #9 (cross_verify module) of the AWS-lifecycle 14-PR sequence per `.claude/plans/aws-lifecycle/THE-FINAL-PLAN.md` §5.
 > **Authority:** CLAUDE.md > operator-charter-forever.md > this file.
 > **Companion docs:**

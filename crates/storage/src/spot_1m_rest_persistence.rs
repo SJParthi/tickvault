@@ -322,20 +322,63 @@ impl Spot1mRestWriter {
 
     /// Flushes buffered rows over ILP-HTTP (per-flush server ACK).
     ///
+    /// On ANY failed flush the pending buffer is DISCARDED (the 2026-07-06
+    /// shadow-writer `discard_pending` precedent — hostile-review M2): a
+    /// server-REJECTED row retained across flushes would be re-sent every
+    /// minute forever and block ALL later rows for the session. The rows
+    /// are re-fetchable and DEDUP-idempotent, so the durable floor for a
+    /// discarded minute is a re-fetch/backfill, and the miss is LOUD
+    /// (SPOT1M-02 error + `tv_spot1m_rows_discarded_total` + the minute
+    /// feeds the SPOT1M-01 failure edge).
+    ///
     /// # Errors
-    /// `Err` when disconnected or the HTTP flush fails (rows stay buffered).
+    /// `Err` when disconnected or the HTTP flush fails (pending discarded).
     pub fn flush(&mut self) -> Result<()> {
         if self.pending == 0 {
             return Ok(());
         }
-        let Some(sender) = self.sender.as_mut() else {
-            anyhow::bail!("spot_1m_rest: no ILP sender (QuestDB unreachable)");
-        };
-        sender
-            .flush(&mut self.buffer)
-            .context("spot_1m_rest ILP flush")?;
+        if self.sender.is_none() {
+            let dropped = self.discard_pending();
+            anyhow::bail!(
+                "spot_1m_rest: no ILP sender (QuestDB unreachable) — \
+                 {dropped} pending row(s) discarded (re-fetchable, DEDUP-idempotent)"
+            );
+        }
+        let flushed = self
+            .sender
+            .as_mut()
+            .map(|sender| sender.flush(&mut self.buffer));
+        match flushed {
+            Some(Ok(())) => {
+                self.pending = 0;
+                Ok(())
+            }
+            Some(Err(err)) => {
+                let dropped = self.discard_pending();
+                Err(anyhow::Error::new(err).context(format!(
+                    "spot_1m_rest ILP flush failed — {dropped} pending row(s) \
+                     discarded (poisoned-buffer defense; rows are re-fetchable)"
+                )))
+            }
+            // Unreachable (checked above) — treated as the no-sender arm.
+            None => {
+                let dropped = self.discard_pending();
+                anyhow::bail!("spot_1m_rest: ILP sender vanished — {dropped} row(s) discarded");
+            }
+        }
+    }
+
+    /// Drop every buffered-but-unflushed row (poisoned-buffer defense).
+    /// Returns the discarded row count; counted by
+    /// `tv_spot1m_rows_discarded_total` so a discard is never silent.
+    pub fn discard_pending(&mut self) -> usize {
+        let dropped = self.pending;
+        if dropped > 0 {
+            metrics::counter!("tv_spot1m_rows_discarded_total").increment(dropped as u64);
+        }
+        self.buffer.clear();
         self.pending = 0;
-        Ok(())
+        dropped
     }
 }
 
@@ -444,15 +487,36 @@ mod tests {
     }
 
     #[test]
-    fn test_spot1m_flush_when_disconnected_errors_and_rows_stay_pending() {
+    fn test_spot1m_flush_when_disconnected_errors_and_discards_pending() {
+        // 2026-07-12 M2 (poisoned-buffer defense): a failed flush DISCARDS
+        // the pending buffer — one rejected row can never wedge the rest of
+        // the session; the rows are re-fetchable + DEDUP-idempotent.
         let mut w = Spot1mRestWriter::for_test();
         w.append_row(&sample_row()).expect("append must succeed");
         let err = w.flush().expect_err("disconnected flush must error");
         assert!(err.to_string().contains("no ILP sender"));
-        assert_eq!(w.pending(), 1, "rows stay pending, never lost");
+        assert!(err.to_string().contains("discarded"));
+        assert_eq!(w.pending(), 0, "failed flush discards pending (M2)");
+        assert!(w.buffer_utf8().is_empty(), "ILP buffer cleared on discard");
         // Empty flush is a no-op Ok.
         let mut empty = Spot1mRestWriter::for_test();
         assert!(empty.flush().is_ok());
+    }
+
+    /// `discard_pending` clears BOTH the row count and the ILP buffer so
+    /// the next fire starts from a clean slate (shadow-writer precedent).
+    #[test]
+    fn test_spot1m_discard_pending_clears_buffer_and_count() {
+        let mut w = Spot1mRestWriter::for_test();
+        w.append_row(&sample_row()).expect("append must succeed");
+        w.append_row(&sample_row()).expect("append must succeed");
+        assert_eq!(w.pending(), 2);
+        assert!(!w.buffer_utf8().is_empty());
+        assert_eq!(w.discard_pending(), 2, "returns the discarded count");
+        assert_eq!(w.pending(), 0);
+        assert!(w.buffer_utf8().is_empty());
+        // Idempotent: a second discard drops nothing.
+        assert_eq!(w.discard_pending(), 0);
     }
 
     /// Transport ratchet (2026-07-05 fire-and-forget lesson): ILP-over-HTTP

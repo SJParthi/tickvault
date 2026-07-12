@@ -50,12 +50,18 @@ fn ratchet_spot1m_spawn_is_config_gated_inside_post_market_seam() {
     let seam_pos = main_src
         .find(POST_MARKET_FN)
         .expect("spawn_post_market_tasks must exist in main.rs");
+    // Pin the seam's END too (2026-07-12 review L1 — a one-sided check
+    // would still pass if the spawn migrated into ANY later fn): the next
+    // top-level `fn ` after the seam bounds it.
+    let seam_end = main_src[seam_pos + POST_MARKET_FN.len()..]
+        .find("\nfn ")
+        .map_or(main_src.len(), |off| seam_pos + POST_MARKET_FN.len() + off);
     assert!(
-        spawn_pos > seam_pos,
+        spawn_pos > seam_pos && spawn_pos < seam_end,
         "the spot_1m spawn at byte {spawn_pos} must live INSIDE \
-         spawn_post_market_tasks (fn at byte {seam_pos}) — that seam is \
-         called from BOTH boot paths and carries the process-global \
-         once-guard"
+         spawn_post_market_tasks (fn spans bytes {seam_pos}..{seam_end}) — \
+         that seam is called from BOTH boot paths and carries the \
+         process-global once-guard"
     );
 
     let gate_positions: Vec<usize> = main_src
@@ -102,6 +108,14 @@ fn ratchet_spot1m_boot_module_is_not_a_stub() {
         // Edge-triggered escalation + recovery events are wired.
         "Spot1mFetchDegraded",
         "Spot1mFetchRecovered",
+        // 2026-07-12 hostile-review fixes stay wired: the hard per-SID
+        // ladder budget (H2), the missed-boundary loud accounting (H2),
+        // the same-second re-fire horizon (H1), and the streamed body cap
+        // (security M).
+        "SPOT_1M_REST_SID_BUDGET_SECS",
+        "tv_spot1m_boundary_skipped_total",
+        "next_fire_after(",
+        "SPOT_1M_REST_MAX_BODY_BYTES",
     ] {
         assert!(
             module_src.contains(needle),

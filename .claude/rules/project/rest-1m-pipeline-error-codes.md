@@ -60,14 +60,27 @@ the `stage` field):
    token at fire time, or a 200 whose body never contained the just-closed
    minute (`outcome="empty"` — counted, included in the failure edge,
    never silent per audit Rule 11). Sub-edge: log-only, never a page.
-2. `stage="escalation"` — the EDGE: 3 consecutive fully-failed minutes
-   (no SID succeeded). Fires ONCE per episode + the typed HIGH Telegram
-   event; re-armed only after a minute where at least one SID succeeds
-   (recovery = one Info Telegram).
+2. `stage="escalation"` — the EDGE: 3 consecutive fully-failed minutes.
+   Since the 2026-07-12 hostile-review M1 fix, "fully failed" = no SID
+   succeeded **OR the persist leg (append/flush) failed** — a day-long
+   QuestDB outage therefore pages through THIS edge (fetch-ok-but-lost
+   rows are not "ok"). Fires ONCE per episode + the typed HIGH Telegram
+   event; re-armed only after a minute where the fetch AND persist both
+   succeed (recovery = one Info Telegram).
 3. `stage="client_build"` / `stage="task_respawn"` — the long-lived HTTP
    client could not be built (HTTP-CLIENT-01 class — host fd/TLS/resolver
    pressure) or the scheduler task died and the supervisor respawned it
    (`tv_spot1m_task_respawn_total{reason}`).
+4. `stage="boundary_skipped"` (2026-07-12 H2 fix) — one or more minute
+   boundaries elapsed UNFETCHED (a fire overran its minute, or a
+   suspend/clock step swallowed boundaries). Counted by
+   `tv_spot1m_boundary_skipped_total`, coalesced to ONE coded log, and
+   each missed minute FEEDS the failure edge (a sustained-overrun outage
+   still reaches the escalation page). Overruns are structurally bounded:
+   each SID's whole ladder is `tokio::time::timeout`-bounded by
+   `SPOT_1M_REST_SID_BUDGET_SECS` (20 s) with a 5 s per-request timeout
+   (`SPOT_1M_REST_REQUEST_TIMEOUT_SECS`), const-asserted < the minute —
+   `tv_spot1m_sid_budget_exceeded_total` counts budget trips.
 
 **Triage:**
 1. `mcp__tickvault-logs__tail_errors` — find `SPOT1M-01`; the payload
@@ -107,17 +120,22 @@ first ILP write may auto-create the table WITHOUT DEDUP UPSERT KEYS, a
 duplicate-row window until a later ensure succeeds), an ILP buffer append
 was rejected (`stage="append"`), or the ILP-over-HTTP flush was refused by
 the per-request server ACK (`stage="flush"` — the 2026-07-05
-fire-and-forget lesson; rejects surface as `Err`, never silently).
+fire-and-forget lesson; rejects surface as `Err`, never silently). On ANY
+failed flush the writer DISCARDS its pending buffer (the shadow-writer
+`discard_pending` precedent, 2026-07-12 M2 fix — one server-rejected row
+can never wedge the rest of the session's rows;
+`tv_spot1m_rows_discarded_total` counts the drops) and the minute feeds
+the SPOT1M-01 failure edge (M1 — persist failure = not-fully-OK).
 
 **Triage:**
 1. `mcp__tickvault-logs__tail_errors` — find `SPOT1M-02`; the `stage`
    names the failing leg. `tv_spot1m_persist_errors_total{stage}` rate
    non-zero → QuestDB ILP/HTTP degraded; run `make doctor` (cross-check
    BOOT-01/BOOT-02 if it coincides with boot).
-2. The fetched values for the failed flush are dropped for THAT minute
-   only (the fetch is re-attempted next minute for the NEXT candle; the
-   missed row can be backfilled by a manual re-run once QuestDB recovers —
-   DEDUP makes it safe).
+2. The fetched values for the failed flush are DISCARDED for THAT minute
+   (poisoned-buffer defense; the fetch is re-attempted next minute for
+   the NEXT candle; the missed rows can be backfilled by a manual re-run
+   once QuestDB recovers — DEDUP makes it safe).
 3. `mcp__tickvault-logs__questdb_sql "select count(*) from spot_1m_rest
    where ts > dateadd('h', -1, now())"` — confirm rows are landing again
    after recovery (a regular trading hour = 180 rows: 60 minutes × 3).
