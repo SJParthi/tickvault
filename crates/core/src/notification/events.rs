@@ -468,6 +468,28 @@ pub enum NotificationEvent {
         detail: String,
     },
 
+    /// Per-minute spot 1m REST pipeline (operator grant 2026-07-12): the
+    /// per-minute pull of the just-closed minute's official index candle
+    /// has fully failed (no index succeeded) for several minutes in a row.
+    /// Fires ONCE per failing episode (edge-triggered, audit-findings
+    /// Rule 4); re-armed only after a successful minute. Severity::High.
+    Spot1mFetchDegraded {
+        /// How many minutes in a row have fully failed.
+        consecutive_failed_minutes: u32,
+        /// The most recent failed minute, IST 12-hour (e.g. "10:42 AM").
+        minute_ist: String,
+    },
+
+    /// The per-minute index candle pull RECOVERED after a failing episode
+    /// (falling edge — one Info ping so the operator knows it self-healed;
+    /// the missing minutes stay absent until re-pulled, never fabricated).
+    Spot1mFetchRecovered {
+        /// The minute that succeeded, IST 12-hour (e.g. "10:45 AM").
+        minute_ist: String,
+        /// How many minutes had fully failed during the episode.
+        failed_minutes: u32,
+    },
+
     /// Once-per-trading-day Dhan-vs-Groww scorecard at 3:45 PM IST
     /// (operator directive 2026-07-10 — run both feeds live for a month,
     /// everything tracked + blame-attributed). Severity::Info +
@@ -1948,6 +1970,37 @@ impl NotificationEvent {
                      2. Restart the app to re-arm tomorrow's check."
                 )
             }
+            Self::Spot1mFetchDegraded {
+                consecutive_failed_minutes,
+                minute_ist,
+            } => {
+                format!(
+                    "\u{1f198} <b>Minute-by-minute index candle pull is FAILING</b>\n\
+                     The per-minute pull of the official 1-minute candle for \
+                     NIFTY, BANKNIFTY and SENSEX has failed \
+                     {consecutive_failed_minutes} minutes in a row (latest \
+                     failed minute: {minute_ist} IST).\n\
+                     Live streaming prices are NOT affected — only the \
+                     per-minute official record copy is missing.\n\
+                     What to do RIGHT NOW:\n\
+                     1. Check the broker data subscription is still active.\n\
+                     2. If live streaming prices ALSO stopped, treat it as a \
+                     full data outage.\n\
+                     3. Missing minutes fill in safely once the pull recovers."
+                )
+            }
+            Self::Spot1mFetchRecovered {
+                minute_ist,
+                failed_minutes,
+            } => {
+                format!(
+                    "\u{2705} <b>Minute-by-minute index candle pull recovered</b>\n\
+                     The per-minute official candle pull is working again as \
+                     of {minute_ist} IST, after {failed_minutes} failed \
+                     minute(s). The minutes that failed stay blank in the \
+                     record until re-pulled — nothing is made up."
+                )
+            }
             Self::DualFeedDailyScorecard {
                 trading_date_ist,
                 dhan,
@@ -2825,6 +2878,8 @@ impl NotificationEvent {
             Self::EndOfDayDigest { .. } => "EndOfDayDigest",
             Self::CrossVerify1mSummary { .. } => "CrossVerify1mSummary",
             Self::CrossVerify1mAborted { .. } => "CrossVerify1mAborted",
+            Self::Spot1mFetchDegraded { .. } => "Spot1mFetchDegraded",
+            Self::Spot1mFetchRecovered { .. } => "Spot1mFetchRecovered",
             Self::DualFeedDailyScorecard { .. } => "DualFeedDailyScorecard",
             Self::DualFeedScorecardAborted { .. } => "DualFeedScorecardAborted",
             // PR #4/#5 (2026-05-19): DepthSpotPriceStale + 7 Phase2*
@@ -3099,6 +3154,11 @@ impl NotificationEvent {
                 }
             }
             Self::CrossVerify1mAborted { .. } => Severity::High,
+            // Per-minute spot 1m REST pipeline (2026-07-12): the degraded
+            // page is the edge-triggered escalation (3 consecutive fully-
+            // failed minutes); the recovery is a positive Info ping.
+            Self::Spot1mFetchDegraded { .. } => Severity::High,
+            Self::Spot1mFetchRecovered { .. } => Severity::Info,
             // Dual-feed scorecard (2026-07-10): Info per the contract — the
             // daily digest is a positive signal; degradation is carried
             // LOUDLY in the body (partial/degraded footnotes) and a task
@@ -6486,6 +6546,45 @@ mod tests {
         assert!(msg.contains("did NOT run"));
         assert!(msg.contains("Reason: task panicked"));
         assert!(msg.contains("What to do RIGHT NOW"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Spot1mFetchDegraded + Spot1mFetchRecovered (2026-07-12 — per-minute
+    // spot 1m REST pipeline PR-2)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_spot_1m_fetch_degraded_is_high_with_action_lines() {
+        let event = NotificationEvent::Spot1mFetchDegraded {
+            consecutive_failed_minutes: 3,
+            minute_ist: "10:42 AM".to_string(),
+        };
+        assert_eq!(event.topic(), "Spot1mFetchDegraded");
+        assert_eq!(event.severity(), Severity::High);
+        let msg = event.to_message();
+        assert!(msg.contains("FAILING"), "got: {msg}");
+        assert!(msg.contains("3 minutes in a row"), "got: {msg}");
+        // IST 12-hour timestamp (Telegram commandment 9).
+        assert!(msg.contains("10:42 AM IST"), "got: {msg}");
+        assert!(msg.contains("What to do RIGHT NOW"), "got: {msg}");
+        // Honest scope line: the live WS pipeline is untouched.
+        assert!(msg.contains("NOT affected"), "got: {msg}");
+    }
+
+    #[test]
+    fn test_spot_1m_fetch_recovered_is_info_positive_ping() {
+        let event = NotificationEvent::Spot1mFetchRecovered {
+            minute_ist: "10:45 AM".to_string(),
+            failed_minutes: 4,
+        };
+        assert_eq!(event.topic(), "Spot1mFetchRecovered");
+        assert_eq!(event.severity(), Severity::Info);
+        let msg = event.to_message();
+        assert!(msg.contains("recovered"), "got: {msg}");
+        assert!(msg.contains("10:45 AM IST"), "got: {msg}");
+        assert!(msg.contains("4 failed"), "got: {msg}");
+        // No false-OK: recovery never claims the missing minutes came back.
+        assert!(msg.contains("nothing is made up"), "got: {msg}");
     }
 
     // -----------------------------------------------------------------------
