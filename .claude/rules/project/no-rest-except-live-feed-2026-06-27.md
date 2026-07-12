@@ -1,5 +1,7 @@
 # No REST Except Live Feed — Market-Data REST Lock (Operator Lock 2026-06-27)
 
+> **⚠ 2026-07-12 NOTE — BruteX cross-verify S3 read is a KEEP class:** per the operator's 2026-07-12 directive recorded verbatim in `groww-second-feed-scope-2026-06-19.md` §37, TickVault reads BruteX-produced backtest CSVs from OUR OWN S3 bucket (`s3://tv-prod-cold/crossverify/*`) via `aws-sdk-s3` GetObject/ListObjectsV2. That is an INTERNAL artifact transfer from our own infrastructure — the same class as the S3 cold-archive surface — NOT a market-data REST endpoint of Dhan or Groww. A new **KEEP** row is added to the §3 inventory below. This lock's ban on Dhan/Groww market-data REST pulls is UNCHANGED.
+>
 > **Authority:** CLAUDE.md > `operator-charter-forever.md` §I > `daily-universe-scope-expansion-2026-05-27.md` §3 > `groww-second-feed-scope-2026-06-19.md` > this file > defaults.
 > **Scope:** PERMANENT once confirmed. Every Phase. Every PR. Every future Claude/Cowork session. Applies to BOTH Dhan (feed #1) and Groww (feed #2).
 > **Operator-locked:** 2026-06-27 (verbatim quote below).
@@ -53,6 +55,7 @@ A **literal** reading ("kill ALL REST") is self-contradictory: it would also kil
 | `POST /v2/marketfeed/quote` / `/marketfeed/ltp` (open-price fallback) | `open_price_rest_fallback.rs:136`; `open_price_source.rs:48` | MARKET-DATA pull | **REMOVE** |
 | `POST /v2/optionchain` (option-chain cache) | ~~`option_chain_cache_loader.rs`~~ | MARKET-DATA pull | **REMOVED 2026-06-28** (entire option_chain subsystem deleted per operator directive) |
 | `GET /v2/positions` (orphan-position watchdog) | `orphan_position_watchdog_boot.rs:8` | TRADING (not market-data, not live-feed) | **operator ruling** — trading-adjacent, not a price pull |
+| `aws-sdk-s3` GetObject/ListObjectsV2 on `s3://tv-prod-cold/crossverify/*` (BruteX cross-verify CSVs) | future `crates/app/src/brutex_crossverify_boot.rs` (code lands in the §37 follow-up PR) | internal artifact transfer from OUR OWN infrastructure (BruteX-produced CSVs in our own bucket) — NOT a market-data REST endpoint of Dhan or Groww | **KEEP** (added 2026-07-12) — authorized by the 2026-07-12 operator quote recorded in `groww-second-feed-scope-2026-06-19.md` §37 |
 
 **What removing the REMOVE rows costs (honest, fail-soft):** prev-day `*_pct_from_prev_day` columns read 0 (already boot-never-blocks); the 15:31 IST 1m cross-verify (the only OHLCV parity signal) goes away; REST canary + mid-session profile watchdog go away (lose early "REST died" detection); open-price fallback + option-chain cache go away. **The live feed, dedup, and mapping all keep working — nothing in the hot path or the master build breaks.**
 
