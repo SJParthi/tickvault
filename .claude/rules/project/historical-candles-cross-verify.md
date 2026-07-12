@@ -3,6 +3,8 @@
 > **Authority:** CLAUDE.md > this file.
 > **Scope:** Any file touching historical candle fetching, cross-verification, or candle persistence.
 > **Ground truth:** `docs/dhan-ref/05-historical-data.md`
+>
+> **2026-07-12 scope note:** the per-minute `spot_1m_rest` fetch (operator authorization 2026-07-12 — `no-rest-except-live-feed-2026-06-27.md` §8) is a SEPARATE official-candle CAPTURE subsystem. It is NOT cross-verification, NOT a backfill, and NOT governed by this file's fetch/retry/tolerance contracts — it writes ONLY the new `spot_1m_rest` table, never `ticks`, never `candles_*`, never `historical_candles`. Live-feed purity (`live-feed-purity.md`) is unaffected.
 
 ## Historical Candle Fetch
 
