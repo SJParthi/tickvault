@@ -153,6 +153,18 @@ aws-lc-rs = "1.17.0"
 aws-config = { version = "1.8.18", default-features = false, features = ["behavior-version-latest", "default-https-client", "rt-tokio", "credentials-process", "sso"] }
 aws-sdk-sns = { version = "1.103.0", default-features = false, features = ["behavior-version-latest", "default-https-client", "rt-tokio"] }
 aws-sdk-ssm = { version = "1.112.0", default-features = false, features = ["behavior-version-latest", "default-https-client", "rt-tokio"] }
+# 2026-07-12 (BruteX crossverify Commit 2, coordinator-approved): read-only
+# S3 GET/List of the BruteX-produced crossverify CSVs on tv-prod-cold.
+# 1.137.0 is the NEWEST aws-sdk-s3 whose aws-smithy-* requirements resolve
+# against the versions already in Cargo.lock (1.138.0 needs
+# aws-smithy-runtime-api 1.13 vs locked 1.12.3) — additive lock entries only,
+# zero bumps to existing pins. Same feature shape as the sibling SDK crates.
+# The `=` prefix is REQUIRED here (deviation from the house bare-version
+# style): Cargo treats a bare "1.137.0" as the caret range ^1.137.0, so a
+# fresh resolution of this NEW dep maximizes to 1.138.0 and force-bumps the
+# locked aws-smithy pins; `cargo update --precise` is banned (CLAUDE.md), so
+# the exact `=` requirement is the only way to land 1.137.0 additively.
+aws-sdk-s3 = { version = "=1.137.0", default-features = false, features = ["behavior-version-latest", "default-https-client", "rt-tokio"] }
 
 # ---- Section 16: CLI ----
 clap = { version = "4.6.1", features = ["derive"] }
