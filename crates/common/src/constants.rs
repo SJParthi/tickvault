@@ -1581,6 +1581,26 @@ pub const SPOT_1M_REST_CONSECUTIVE_FAIL_PAGE_THRESHOLD: u32 = 3;
 /// `PROBE_STALE_GRACE_SECS` precedent scaled to the 60 s cadence).
 pub const SPOT_1M_REST_FIRE_STALE_GRACE_SECS: u32 = 30;
 
+/// Per-REQUEST HTTP timeout (secs) for a single intraday poll. Deliberately
+/// SHORT (5 s, not the 15 s house Dhan-charts value): the fire budget is one
+/// minute, and a black-holed peer must never let the ladder overrun it
+/// (2026-07-12 hostile-review H2 — the 15 s value made the worst-case
+/// ladder ~81 s).
+pub const SPOT_1M_REST_REQUEST_TIMEOUT_SECS: u64 = 5;
+
+/// HARD wall-clock budget (secs) for ONE index's whole in-minute ladder —
+/// enforced with `tokio::time::timeout` around the ladder, so no
+/// combination of stalls can push a fire past the next boundary. A budget
+/// overrun counts as that SID's failure for the minute.
+pub const SPOT_1M_REST_SID_BUDGET_SECS: u64 = 20;
+
+/// Maximum accepted response body size (bytes) for one intraday poll —
+/// one minute × one index is a few hundred bytes; even a grossly
+/// over-delivering full-day columnar response is well under 2 MiB. Bodies
+/// beyond the cap are rejected before buffering (the csv_downloader
+/// `MAX_CSV_BODY_BYTES` §18 hardening pattern).
+pub const SPOT_1M_REST_MAX_BODY_BYTES: usize = 2 * 1024 * 1024;
+
 // Compile-time consistency: the fire window is anchored to the canonical
 // session gate — first fire = market open + 60 s (the 09:15 candle closes
 // at 09:16:00); last fire = the 15:30:00 close boundary itself.
@@ -1599,9 +1619,19 @@ const _: () = assert!(
         && SPOT_1M_REST_RETRY_OFFSETS_MS[2] < SPOT_1M_REST_RETRY_OFFSETS_MS[3],
     "SPOT_1M retry offsets must be strictly increasing"
 );
+// The REAL in-minute budget math (2026-07-12 hostile-review H2 fix — the
+// earlier assert ignored per-request timeouts): the hard per-SID ladder
+// budget, plus the post-boundary fire delay, must finish inside the minute;
+// and the ladder's own schedule (last offset + one full request timeout)
+// must fit inside that budget so the timeout only fires on genuine stalls.
 const _: () = assert!(
-    SPOT_1M_REST_FIRE_DELAY_MS + SPOT_1M_REST_RETRY_OFFSETS_MS[3] < 60_000,
-    "SPOT_1M ladder must finish inside the minute (before the next boundary)"
+    SPOT_1M_REST_FIRE_DELAY_MS + SPOT_1M_REST_SID_BUDGET_SECS * 1_000 < 60_000,
+    "SPOT_1M per-SID ladder budget must finish inside the minute"
+);
+const _: () = assert!(
+    SPOT_1M_REST_RETRY_OFFSETS_MS[3] + SPOT_1M_REST_REQUEST_TIMEOUT_SECS * 1_000
+        < SPOT_1M_REST_SID_BUDGET_SECS * 1_000,
+    "SPOT_1M ladder schedule (last offset + one request timeout) must fit the budget"
 );
 
 /// Daily reset signal time (IST). After market close at 15:30,
@@ -3586,6 +3616,20 @@ mod tests {
         );
         assert_eq!(SPOT_1M_REST_CONSECUTIVE_FAIL_PAGE_THRESHOLD, 3);
         assert!(u64::from(SPOT_1M_REST_FIRE_STALE_GRACE_SECS) * 1_000 < 60_000);
+        // 2026-07-12 H2 fix: the REAL minute budget — short per-request
+        // timeout + a hard per-SID ladder budget that fits the minute.
+        assert_eq!(SPOT_1M_REST_REQUEST_TIMEOUT_SECS, 5);
+        assert_eq!(SPOT_1M_REST_SID_BUDGET_SECS, 20);
+        assert!(
+            SPOT_1M_REST_FIRE_DELAY_MS + SPOT_1M_REST_SID_BUDGET_SECS * 1_000 < 60_000,
+            "budget must finish inside the minute"
+        );
+        assert!(
+            SPOT_1M_REST_RETRY_OFFSETS_MS[3] + SPOT_1M_REST_REQUEST_TIMEOUT_SECS * 1_000
+                < SPOT_1M_REST_SID_BUDGET_SECS * 1_000,
+            "ladder schedule must fit the budget"
+        );
+        assert_eq!(SPOT_1M_REST_MAX_BODY_BYTES, 2 * 1024 * 1024);
     }
 
     /// Constant pin — 60s grace after close.

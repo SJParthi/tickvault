@@ -3,7 +3,7 @@
 //!
 //! Every trading-day minute close in session — the 09:15 candle closes at
 //! 09:16:00 IST; the last (15:29) candle closes at 15:30:00 — this task
-//! wakes ~300 ms after the boundary and fetches THAT just-closed minute's
+//! wakes shortly after the boundary and fetches THAT just-closed minute's
 //! official 1m OHLCV for the 3 IDX_I spot indices (NIFTY 13, BANKNIFTY 25,
 //! SENSEX 51) via Dhan `POST /v2/charts/intraday` (interval `"1"`), then
 //! persists to the `spot_1m_rest` QuestDB table (DEDUP-idempotent — a
@@ -18,6 +18,16 @@
 //! `tv_spot1m_close_to_data_ms` histogram (minute close → successful
 //! retrieval) as the live measurement. A minute whose candle never appears
 //! is `outcome="empty"` — counted, edge-tracked, never silent (Rule 11).
+//!
+//! **First-attempt timing (honest):** the boundary sleep is computed on a
+//! SECOND-granular clock plus the 300 ms fire delay, so the first attempt
+//! lands anywhere from ~0.3 s to ~1.3 s after the minute close (never a
+//! sub-second guarantee). Each SID's whole ladder is HARD-bounded by
+//! `tokio::time::timeout(SPOT_1M_REST_SID_BUDGET_SECS)` and each request by
+//! `SPOT_1M_REST_REQUEST_TIMEOUT_SECS`, so a fire can never overrun the
+//! minute; if a boundary IS ever missed (suspend / clock step), the miss is
+//! COUNTED (`tv_spot1m_boundary_skipped_total`) + coalesced-logged + fed
+//! into the failure edge — never silent (Rule 11).
 //!
 //! ## Rate budget (Dhan Data-API 5/sec)
 //! One fire = 3 concurrent requests (one per index), plus at most 4 ladder
@@ -60,7 +70,8 @@ use tickvault_common::constants::{
     DHAN_CANDLE_INTERVAL_1MIN, DHAN_CHARTS_INTRADAY_PATH, IST_UTC_OFFSET_SECONDS, SECONDS_PER_DAY,
     SPOT_1M_REST_CONSECUTIVE_FAIL_PAGE_THRESHOLD, SPOT_1M_REST_FIRE_DELAY_MS,
     SPOT_1M_REST_FIRE_STALE_GRACE_SECS, SPOT_1M_REST_FIRST_FIRE_SECS_OF_DAY_IST,
-    SPOT_1M_REST_INDICES, SPOT_1M_REST_LAST_FIRE_SECS_OF_DAY_IST, SPOT_1M_REST_RETRY_OFFSETS_MS,
+    SPOT_1M_REST_INDICES, SPOT_1M_REST_LAST_FIRE_SECS_OF_DAY_IST, SPOT_1M_REST_MAX_BODY_BYTES,
+    SPOT_1M_REST_REQUEST_TIMEOUT_SECS, SPOT_1M_REST_RETRY_OFFSETS_MS, SPOT_1M_REST_SID_BUDGET_SECS,
 };
 use tickvault_common::error_code::ErrorCode;
 use tickvault_common::sanitize::{capture_rest_error_body, redact_url_params};
@@ -77,8 +88,6 @@ use crate::cross_verify_1m_boot::{MinuteCandle, parse_intraday_1m_candles};
 
 /// Dhan `instrument` enum value for IDX_I index rows.
 const SPOT_1M_INSTRUMENT_INDEX: &str = "INDEX";
-/// Per-request REST timeout (the house Dhan-charts value).
-const SPOT_1M_REST_TIMEOUT_SECS: u64 = 15;
 /// Backoff before the supervisor respawns a dead/failed scheduler run.
 const SPOT_1M_RESPAWN_BACKOFF_SECS: u64 = 30;
 /// Milliseconds per second / per day (wall-clock latency math).
@@ -121,6 +130,36 @@ pub fn next_minute_close_fire(now_secs_of_day: u32) -> Option<u32> {
     }
     let next_boundary = now_secs_of_day.div_ceil(60).saturating_mul(60);
     (next_boundary <= SPOT_1M_REST_LAST_FIRE_SECS_OF_DAY_IST).then_some(next_boundary)
+}
+
+/// The next boundary STRICTLY AFTER the last fired one (2026-07-12
+/// hostile-review H1 fix): a fire that completes within its own boundary
+/// second must never re-select the SAME boundary — `last_fired` advances
+/// the horizon to `last_fired + 1` so instant-completing (or
+/// instant-failing) fires can't duplicate fetches, double-count edge
+/// "minutes", or double-sample the latency histogram. Pure.
+#[must_use]
+pub fn next_fire_after(now_secs_of_day: u32, last_fired: Option<u32>) -> Option<u32> {
+    let horizon = match last_fired {
+        Some(lf) => now_secs_of_day.max(lf.saturating_add(1)),
+        None => now_secs_of_day,
+    };
+    next_minute_close_fire(horizon)
+}
+
+/// How many fire boundaries fell inside `(last_boundary, now]` — i.e. were
+/// MISSED while a long fire / suspend held the loop past them (2026-07-12
+/// hostile-review H2 fix). `last_boundary` must itself be a boundary
+/// (multiple of 60); the count clamps at the session's last boundary. Each
+/// missed boundary is a minute we will NEVER fetch this session — the
+/// caller counts it loudly and feeds it into the failure edge. Pure.
+#[must_use]
+pub fn count_missed_boundaries(last_boundary: u32, now_secs_of_day: u32) -> u32 {
+    let hi = now_secs_of_day.min(SPOT_1M_REST_LAST_FIRE_SECS_OF_DAY_IST);
+    if hi <= last_boundary {
+        return 0;
+    }
+    (hi / 60).saturating_sub(last_boundary / 60)
 }
 
 /// `true` when a wake at `woke_at_secs_of_day` is fresh enough to fetch the
@@ -361,17 +400,65 @@ enum SidFetchOutcome {
     Failed(String),
 }
 
+/// One attempt's typed failure — `rate_limited` is derived from the REAL
+/// `StatusCode` (429), never a substring scan of the message (2026-07-12
+/// review LOW).
+#[derive(Clone, Debug, PartialEq)]
+struct FetchFailure {
+    rate_limited: bool,
+    msg: String,
+}
+
+/// `true` when a DECLARED `Content-Length` fits the body cap (an absent
+/// declaration passes — the streamed accumulator below still enforces the
+/// cap). Pure (2026-07-12 security-review M — unbounded body read).
+#[must_use]
+pub fn declared_len_within_cap(declared_len: Option<u64>, cap_bytes: usize) -> bool {
+    declared_len.is_none_or(|len| len <= cap_bytes as u64)
+}
+
+/// `true` when accumulating `chunk_len` more bytes onto `buffered_len`
+/// stays within the body cap. Pure.
+#[must_use]
+pub fn accumulation_within_cap(buffered_len: usize, chunk_len: usize, cap_bytes: usize) -> bool {
+    buffered_len.saturating_add(chunk_len) <= cap_bytes
+}
+
+/// Read a response body with the [`SPOT_1M_REST_MAX_BODY_BYTES`] cap
+/// enforced BOTH on the declared `Content-Length` and on the streamed
+/// accumulation (the csv_downloader §18 body-cap pattern) — a
+/// misbehaving/hostile server can never buffer unbounded bytes here.
+async fn read_body_capped(mut resp: reqwest::Response) -> Result<String, String> {
+    if !declared_len_within_cap(resp.content_length(), SPOT_1M_REST_MAX_BODY_BYTES) {
+        return Err(format!(
+            "body too large: declared {} bytes > cap {SPOT_1M_REST_MAX_BODY_BYTES}",
+            resp.content_length().unwrap_or_default()
+        ));
+    }
+    let mut buf: Vec<u8> = Vec::new();
+    while let Some(chunk) = resp.chunk().await.map_err(|e| format!("read: {e}"))? {
+        if !accumulation_within_cap(buf.len(), chunk.len(), SPOT_1M_REST_MAX_BODY_BYTES) {
+            return Err(format!(
+                "body exceeded cap {SPOT_1M_REST_MAX_BODY_BYTES} bytes mid-stream"
+            ));
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    String::from_utf8(buf).map_err(|_| "body not valid UTF-8".to_string())
+}
+
 /// One intraday REST round-trip → the raw 2xx body text (parsed by the
 /// caller via [`parse_intraday_columnar_for_minute`] — a malformed body
 /// parses to no candles and rides the ladder like an empty one). `Err`
 /// carries status + token-redacted URL + ≤300-char secret-redacted body
-/// (the DHAN-REST-400 capture discipline).
+/// (the DHAN-REST-400 capture discipline). Bodies (success AND error) are
+/// read through the streamed cap.
 async fn spot_1m_fetch_once(
     client: &reqwest::Client,
     url: &str,
     jwt: &str,
     body: &serde_json::Value,
-) -> Result<String, String> {
+) -> Result<String, FetchFailure> {
     let resp = client
         .post(url)
         .header("access-token", jwt)
@@ -379,24 +466,36 @@ async fn spot_1m_fetch_once(
         .json(body)
         .send()
         .await
-        .map_err(|e| format!("send: {}", redact_url_params(&e.to_string())))?;
+        .map_err(|e| FetchFailure {
+            rate_limited: false,
+            msg: format!("send: {}", redact_url_params(&e.to_string())),
+        })?;
     let status = resp.status();
     if !status.is_success() {
-        let error_body = resp.text().await.unwrap_or_default();
-        return Err(format!(
-            "http {status} url={} body={}",
-            redact_url_params(url),
-            capture_rest_error_body(&error_body)
-        ));
+        let error_body = read_body_capped(resp).await.unwrap_or_default();
+        return Err(FetchFailure {
+            rate_limited: status == reqwest::StatusCode::TOO_MANY_REQUESTS,
+            msg: format!(
+                "http {status} url={} body={}",
+                redact_url_params(url),
+                capture_rest_error_body(&error_body)
+            ),
+        });
     }
-    resp.text().await.map_err(|e| format!("read: {e}"))
+    read_body_capped(resp).await.map_err(|msg| FetchFailure {
+        rate_limited: false,
+        msg,
+    })
 }
 
 /// Bounded in-minute re-poll ladder for ONE index: first attempt at the
 /// fire instant, then re-polls at [`SPOT_1M_REST_RETRY_OFFSETS_MS`] until
 /// the target minute's candle appears — after the last offset the minute
 /// is `Empty`/`Failed`, never an unbounded in-minute retry (DH-904/429
-/// counts + falls out of the ladder like any other error).
+/// counts via the REAL `StatusCode` + falls out of the ladder like any
+/// other error). The WHOLE ladder is additionally hard-bounded by
+/// [`SPOT_1M_REST_SID_BUDGET_SECS`] in [`fetch_minute_bounded`] so no
+/// stall combination can overrun the minute (2026-07-12 H2 fix).
 async fn fetch_minute_with_ladder(
     client: &reqwest::Client,
     url: &str,
@@ -431,18 +530,54 @@ async fn fetch_minute_with_ladder(
                 // landed yet; the next ladder rung re-polls.
                 last_error = None;
             }
-            Err(reason) => {
-                if reason.contains("429") {
+            Err(failure) => {
+                if failure.rate_limited {
                     // DH-904 class: counted; NEVER retried past the ladder.
                     metrics::counter!("tv_spot1m_rate_limited_total").increment(1);
                 }
-                last_error = Some(reason);
+                last_error = Some(failure.msg);
             }
         }
     }
     match last_error {
         Some(reason) => SidFetchOutcome::Failed(reason),
         None => SidFetchOutcome::Empty,
+    }
+}
+
+/// The ladder wrapped in the HARD per-SID wall-clock budget
+/// ([`SPOT_1M_REST_SID_BUDGET_SECS`]): a budget overrun is that SID's
+/// failure for the minute — the fire can never overrun the next boundary
+/// (the const-asserts in `constants.rs` pin the budget < 60 s including
+/// the per-request timeout).
+async fn fetch_minute_bounded(
+    client: &reqwest::Client,
+    url: &str,
+    jwt: &secrecy::SecretString,
+    body: &serde_json::Value,
+    target_minute_ist_nanos: i64,
+    minute_close_ms_of_day: i64,
+) -> SidFetchOutcome {
+    match tokio::time::timeout(
+        Duration::from_secs(SPOT_1M_REST_SID_BUDGET_SECS),
+        fetch_minute_with_ladder(
+            client,
+            url,
+            jwt,
+            body,
+            target_minute_ist_nanos,
+            minute_close_ms_of_day,
+        ),
+    )
+    .await
+    {
+        Ok(outcome) => outcome,
+        Err(_elapsed) => {
+            metrics::counter!("tv_spot1m_sid_budget_exceeded_total").increment(1);
+            SidFetchOutcome::Failed(format!(
+                "ladder budget exceeded ({SPOT_1M_REST_SID_BUDGET_SECS}s) — peer stalling"
+            ))
+        }
     }
 }
 
@@ -468,7 +603,7 @@ pub async fn run_spot_1m_rest(params: Spot1mRestTaskParams) {
     // failure degrades loudly and returns — the supervisor retries after
     // its bounded backoff; NEVER a `Client::new()` panic fallback.
     let client = match reqwest::Client::builder()
-        .timeout(Duration::from_secs(SPOT_1M_REST_TIMEOUT_SECS))
+        .timeout(Duration::from_secs(SPOT_1M_REST_REQUEST_TIMEOUT_SECS))
         .redirect(reqwest::redirect::Policy::none())
         .build()
     {
@@ -487,10 +622,14 @@ pub async fn run_spot_1m_rest(params: Spot1mRestTaskParams) {
     };
     let mut writer = Spot1mRestWriter::new(&params.questdb);
     let mut edge = FailureEdge::default();
+    // H1 (2026-07-12): the last boundary actually HANDLED (fired or
+    // skipped-stale) — the next fire is always STRICTLY after it, so a
+    // fast-completing fire can never re-fire the same boundary second.
+    let mut last_fired: Option<u32> = None;
     info!(
         indices = SPOT_1M_REST_INDICES.len(),
         "spot_1m_rest: per-minute fetch loop armed (fires each minute close \
-         09:16:00–15:30:00 IST, ~300ms after the boundary)"
+         09:16:00–15:30:00 IST, ~0.3–1.3s after the boundary)"
     );
 
     loop {
@@ -501,7 +640,7 @@ pub async fn run_spot_1m_rest(params: Spot1mRestTaskParams) {
             return;
         }
         let now = ist_secs_of_day_now();
-        let Some(fire) = next_minute_close_fire(now) else {
+        let Some(fire) = next_fire_after(now, last_fired) else {
             info!("spot_1m_rest: past 15:30 IST — today's minute fires complete");
             return;
         };
@@ -511,7 +650,8 @@ pub async fn run_spot_1m_rest(params: Spot1mRestTaskParams) {
 
         // Staleness gate: a suspend / clock step can wake us far past the
         // boundary (or on the next day). Skip + recompute, never fetch a
-        // long-gone minute as if it just closed.
+        // long-gone minute as if it just closed. Every boundary that
+        // elapsed while asleep is COUNTED as missed (H2 — never silent).
         let woke = ist_secs_of_day_now();
         if !fire_is_fresh(fire, woke) {
             warn!(
@@ -520,10 +660,71 @@ pub async fn run_spot_1m_rest(params: Spot1mRestTaskParams) {
                 "spot_1m_rest: woke too far past the minute boundary \
                  (suspend/clock step?) — skipping this minute"
             );
+            // Boundaries in (fire-60, woke) are gone (a midnight-wrap wake
+            // counts 0 — the trading-day gate exits next iteration).
+            let missed = count_missed_boundaries(fire.saturating_sub(60), woke.saturating_sub(1));
+            record_skipped_boundaries(&params, &mut edge, missed, fire);
+            // Advance past everything that already elapsed so the next
+            // iteration never re-selects a long-gone boundary.
+            if woke > fire {
+                last_fired = Some((woke.min(SPOT_1M_REST_LAST_FIRE_SECS_OF_DAY_IST) / 60) * 60);
+            }
             continue;
         }
 
         fire_one_minute(&params, &client, &url, &mut writer, &mut edge, fire).await;
+        last_fired = Some(fire);
+        // H2 overrun accounting: boundaries that fully elapsed DURING the
+        // fire can never be fetched — count them loudly + feed the edge.
+        let after = ist_secs_of_day_now();
+        let missed = count_missed_boundaries(fire, after.saturating_sub(1));
+        record_skipped_boundaries(&params, &mut edge, missed, fire);
+        if missed > 0 {
+            last_fired = Some((after.min(SPOT_1M_REST_LAST_FIRE_SECS_OF_DAY_IST) / 60) * 60);
+        }
+    }
+}
+
+/// Loud accounting for minute boundaries that elapsed UNFETCHED (fire
+/// overrun / suspend / clock step): counter + ONE coalesced coded log +
+/// each missed minute feeds the failure edge so a sustained-overrun outage
+/// still reaches the SPOT1M-01 escalation page (2026-07-12 H2 fix).
+fn record_skipped_boundaries(
+    params: &Spot1mRestTaskParams,
+    edge: &mut FailureEdge,
+    skipped: u32,
+    context_secs_of_day: u32,
+) {
+    if skipped == 0 {
+        return;
+    }
+    metrics::counter!("tv_spot1m_boundary_skipped_total").increment(u64::from(skipped));
+    let around = format_minute_ist_12h(context_secs_of_day);
+    error!(
+        code = ErrorCode::Spot1m01FetchDegraded.code_str(),
+        stage = "boundary_skipped",
+        skipped,
+        around = %around,
+        "SPOT1M-01: minute boundaries elapsed unfetched (fire overrun / \
+         suspend) — those minutes stay absent (re-fetchable via backfill)"
+    );
+    for _ in 0..skipped {
+        if let EdgeAction::Page { consecutive } = edge.record_minute(true) {
+            error!(
+                code = ErrorCode::Spot1m01FetchDegraded.code_str(),
+                stage = "escalation",
+                consecutive,
+                minute = %around,
+                "SPOT1M-01: per-minute spot fetch fully failed for consecutive \
+                 minutes — paging (edge-triggered)"
+            );
+            params
+                .notifier
+                .notify(NotificationEvent::Spot1mFetchDegraded {
+                    consecutive_failed_minutes: consecutive,
+                    minute_ist: around.clone(),
+                });
+        }
     }
 }
 
@@ -554,6 +755,10 @@ async fn fire_one_minute(
     let mut ok_count: usize = 0;
     let mut empty_count: usize = 0;
     let mut error_count: usize = 0;
+    // M1 (2026-07-12): a minute is fully-OK for the edge ONLY when the
+    // fetch succeeded AND append+flush confirmed — a day-long QuestDB
+    // outage must eventually page via the SAME Spot1mFetchDegraded path.
+    let mut persist_failed = false;
     let mut sample_failure: Option<String> = None;
 
     if let Some(jwt) = jwt {
@@ -567,11 +772,11 @@ async fn fire_one_minute(
             record_minute_verdict(
                 params,
                 edge,
-                minute_open_secs,
                 &minute_label,
                 0,
                 error_count,
                 0,
+                false,
                 sample_failure.as_deref(),
             );
             return;
@@ -586,15 +791,9 @@ async fn fire_one_minute(
             let jwt = jwt.clone();
             let body = spot_1m_request_body(&security_id.to_string(), &from_dt, &to_dt);
             join_set.spawn(async move {
-                let outcome = fetch_minute_with_ladder(
-                    &client,
-                    &url,
-                    &jwt,
-                    &body,
-                    target_nanos,
-                    minute_close_ms,
-                )
-                .await;
+                let outcome =
+                    fetch_minute_bounded(&client, &url, &jwt, &body, target_nanos, minute_close_ms)
+                        .await;
                 (security_id, symbol, outcome)
             });
         }
@@ -621,7 +820,19 @@ async fn fire_one_minute(
                     let row = Spot1mRestRow {
                         ts_ist_nanos: candle.minute_ts_ist_nanos,
                         trading_date_ist_nanos: trading_date_nanos,
-                        security_id: i64::try_from(security_id).unwrap_or_default(),
+                        // Unreachable for the pinned 13/25/51 set; a
+                        // hypothetical overflow is LOUD + a visible
+                        // sentinel, never a silent sid=0 (review LOW).
+                        security_id: i64::try_from(security_id).unwrap_or_else(|_| {
+                            error!(
+                                code = ErrorCode::Spot1m02PersistFailed.code_str(),
+                                stage = "sid_overflow",
+                                security_id,
+                                "SPOT1M-02: security_id exceeds i64 — row \
+                                 stamped with the i64::MAX sentinel"
+                            );
+                            i64::MAX
+                        }),
                         symbol,
                         open: candle.open,
                         high: candle.high,
@@ -632,6 +843,7 @@ async fn fire_one_minute(
                         fetched_at_ist_nanos: fetched_at_ist_nanos_now(),
                     };
                     if let Err(err) = writer.append_row(&row) {
+                        persist_failed = true;
                         metrics::counter!("tv_spot1m_persist_errors_total", "stage" => "append")
                             .increment(1);
                         error!(
@@ -641,6 +853,9 @@ async fn fire_one_minute(
                             ?err,
                             "SPOT1M-02: spot_1m_rest row append failed"
                         );
+                        if sample_failure.is_none() {
+                            sample_failure = Some(format!("persist append failed: {err:#}"));
+                        }
                     }
                 }
                 SidFetchOutcome::Empty => {
@@ -663,15 +878,19 @@ async fn fire_one_minute(
             }
         }
         if let Err(err) = writer.flush() {
+            persist_failed = true;
             metrics::counter!("tv_spot1m_persist_errors_total", "stage" => "flush").increment(1);
             error!(
                 code = ErrorCode::Spot1m02PersistFailed.code_str(),
                 stage = "flush",
-                pending = writer.pending(),
                 ?err,
-                "SPOT1M-02: spot_1m_rest ILP flush failed — rows stay buffered \
-                 (DEDUP-idempotent; the next successful flush lands them)"
+                "SPOT1M-02: spot_1m_rest ILP flush failed — pending rows \
+                 discarded (poisoned-buffer defense; minutes stay absent and \
+                 re-fetchable via DEDUP-idempotent backfill)"
             );
+            if sample_failure.is_none() {
+                sample_failure = Some(format!("persist flush failed: {err:#}"));
+            }
         }
     } else {
         // No token at fire time — REST cannot succeed; the whole minute is
@@ -686,13 +905,21 @@ async fn fire_one_minute(
     record_minute_verdict(
         params,
         edge,
-        minute_open_secs,
         &minute_label,
         ok_count,
         error_count,
         empty_count,
+        persist_failed,
         sample_failure.as_deref(),
     );
+}
+
+/// M1 (2026-07-12): the edge's "fully failed" verdict for one fired
+/// minute — no SID succeeded, OR the persist leg (append/flush) failed.
+/// A fetched-but-never-persisted minute is NOT ok. Pure.
+#[must_use]
+pub fn minute_fully_failed(ok_count: usize, persist_failed: bool) -> bool {
+    ok_count == 0 || persist_failed
 }
 
 /// Coalesced per-minute verdict: ONE coded log per fired minute with any
@@ -701,14 +928,14 @@ async fn fire_one_minute(
 fn record_minute_verdict(
     params: &Spot1mRestTaskParams,
     edge: &mut FailureEdge,
-    minute_open_secs: u32,
     minute_label: &str,
     ok_count: usize,
     error_count: usize,
     empty_count: usize,
+    persist_failed: bool,
     sample_failure: Option<&str>,
 ) {
-    let fully_failed = ok_count == 0;
+    let fully_failed = minute_fully_failed(ok_count, persist_failed);
     let action = edge.record_minute(fully_failed);
     match action {
         EdgeAction::Page { consecutive } => {
@@ -742,7 +969,7 @@ fn record_minute_verdict(
                 });
         }
         EdgeAction::None => {
-            if error_count > 0 || empty_count > 0 {
+            if error_count > 0 || empty_count > 0 || persist_failed {
                 // Coalesced ONCE per fire (never per retry); log-sink-only —
                 // sub-edge failures never page (the escalation arm does).
                 error!(
@@ -752,15 +979,13 @@ fn record_minute_verdict(
                     ok = ok_count,
                     errors = error_count,
                     empty = empty_count,
+                    persist_failed,
                     sample = sample_failure.unwrap_or("none captured"),
                     "SPOT1M-01: per-minute spot fetch degraded for this minute"
                 );
             }
         }
     }
-    // Silence the unused warning on fully-successful minutes (the label is
-    // only rendered on failure paths).
-    let _ = minute_open_secs;
 }
 
 /// Spawn the supervised per-minute scheduler. The supervisor respawns a
@@ -857,6 +1082,125 @@ mod tests {
             now = fire + 1;
         }
         assert_eq!(fires, 375, "one fire per session minute");
+    }
+
+    // ---- next_fire_after (H1 — same-second duplicate re-fire) ---------------
+
+    /// A fully-successful fire completing WITHIN its boundary second must
+    /// select the NEXT boundary, never the same one again (2026-07-12 H1).
+    #[test]
+    fn test_next_fire_after_fast_completion_same_second_never_refires() {
+        let fire = 10 * 3600; // 10:00:00 boundary just fired
+        // Post-fire wall clock still reads the boundary second.
+        assert_eq!(next_fire_after(fire, Some(fire)), Some(fire + 60));
+        // Sub-second later (clock now fire+1): still the next boundary.
+        assert_eq!(next_fire_after(fire + 1, Some(fire)), Some(fire + 60));
+    }
+
+    /// An instant-failing fire loop (no token — completes in µs) must
+    /// advance one boundary per fire, never re-fire the same boundary and
+    /// never inflate the edge with duplicate "minutes".
+    #[test]
+    fn test_next_fire_after_instant_fail_loop_advances_one_boundary_per_fire() {
+        let mut last_fired: Option<u32> = None;
+        let now = 10 * 3600; // wall clock frozen at 10:00:00 (instant fires)
+        let mut fired = Vec::new();
+        for _ in 0..3 {
+            let fire = next_fire_after(now, last_fired).expect("in window");
+            fired.push(fire);
+            last_fired = Some(fire);
+        }
+        assert_eq!(
+            fired,
+            vec![10 * 3600, 10 * 3600 + 60, 10 * 3600 + 120],
+            "each instant fire advances exactly one boundary"
+        );
+    }
+
+    /// Normal pacing (fire completes in ~1 s, next wake mid-minute) is
+    /// unchanged by the H1 horizon: the next boundary is selected.
+    #[test]
+    fn test_next_fire_after_normal_pacing_selects_next_boundary() {
+        let fire = 10 * 3600;
+        // 10:00:01 after firing 10:00:00 → 10:01:00.
+        assert_eq!(next_fire_after(fire + 1, Some(fire)), Some(fire + 60));
+        // First iteration of the day (no last_fired): unchanged semantics.
+        assert_eq!(next_fire_after(FIRST - 100, None), Some(FIRST));
+        // The LAST boundary fired → None (day complete), never a re-fire.
+        assert_eq!(next_fire_after(LAST, Some(LAST)), None);
+    }
+
+    // ---- count_missed_boundaries (H2 — overrun accounting) ------------------
+
+    #[test]
+    fn test_count_missed_boundaries_zero_within_same_minute() {
+        let fire = 10 * 3600;
+        // Fire completed 5 s into its own minute: nothing missed.
+        assert_eq!(count_missed_boundaries(fire, fire + 5), 0);
+        assert_eq!(count_missed_boundaries(fire, fire), 0);
+        // `now - 1` convention: an exact next-boundary wall clock is NOT
+        // missed (it fires now) — the caller passes now-1.
+        assert_eq!(count_missed_boundaries(fire, fire + 59), 0);
+    }
+
+    #[test]
+    fn test_count_missed_boundaries_counts_each_overrun_minute() {
+        let fire = 10 * 3600;
+        // A 61 s fire: wall clock now fire+61 → caller passes fire+60 →
+        // boundary fire+60 was passed (< now) → 1 missed.
+        assert_eq!(count_missed_boundaries(fire, fire + 60), 1);
+        // An 81 s ladder-class overrun: still 1 (fire+60 missed; fire+120
+        // not yet reached).
+        assert_eq!(count_missed_boundaries(fire, fire + 80), 1);
+        // A 130 s stall: 2 boundaries gone.
+        assert_eq!(count_missed_boundaries(fire, fire + 130), 2);
+    }
+
+    #[test]
+    fn test_count_missed_boundaries_clamps_at_session_last() {
+        // Overrun past 15:30: only boundaries up to LAST count.
+        assert_eq!(count_missed_boundaries(LAST - 60, LAST + 3600), 1);
+        assert_eq!(count_missed_boundaries(LAST, LAST + 3600), 0);
+    }
+
+    // ---- minute_fully_failed (M1 — persist confirmation) --------------------
+
+    #[test]
+    fn test_minute_fully_failed_requires_fetch_and_persist_ok() {
+        // Fetch ok + persist ok → not failed.
+        assert!(!minute_fully_failed(3, false));
+        assert!(!minute_fully_failed(1, false));
+        // No SID fetched → failed regardless of persist.
+        assert!(minute_fully_failed(0, false));
+        // Fetched but persist (append/flush) failed → STILL failed for the
+        // edge: a day-long QuestDB outage must page (M1).
+        assert!(minute_fully_failed(3, true));
+        assert!(minute_fully_failed(0, true));
+    }
+
+    // ---- body cap (security M — unbounded read) ------------------------------
+
+    #[test]
+    fn test_declared_len_within_cap_rejects_oversize_content_length() {
+        let cap = SPOT_1M_REST_MAX_BODY_BYTES;
+        // Declared Content-Length beyond the cap → rejected up front.
+        assert!(!declared_len_within_cap(Some(cap as u64 + 1), cap));
+        assert!(declared_len_within_cap(Some(cap as u64), cap));
+        assert!(declared_len_within_cap(Some(0), cap));
+        // Absent declaration passes the pre-check (streamed cap enforces).
+        assert!(declared_len_within_cap(None, cap));
+    }
+
+    #[test]
+    fn test_accumulation_within_cap_rejects_streamed_overrun() {
+        let cap = SPOT_1M_REST_MAX_BODY_BYTES;
+        // Streamed accumulation: the chunk that would cross the cap is
+        // rejected — no unbounded buffering.
+        assert!(accumulation_within_cap(0, cap, cap));
+        assert!(!accumulation_within_cap(1, cap, cap));
+        assert!(!accumulation_within_cap(cap, 1, cap));
+        // Overflow-safe (saturating add, never wraps to a small value).
+        assert!(!accumulation_within_cap(usize::MAX, usize::MAX, cap));
     }
 
     // ---- fire_is_fresh -----------------------------------------------------
