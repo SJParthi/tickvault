@@ -2305,3 +2305,48 @@ rules:
       ALTER TABLE <table> RESUME WAL in the QuestDB console — never
       auto-executed. Recovery confirmed by the falling-edge log +
       tv_questdb_wal_suspended_tables returning to 0.
+
+  # -----------------------------------------------------------------------
+  # Per-minute spot 1m REST pipeline (operator grant 2026-07-12, PR-2)
+  # -----------------------------------------------------------------------
+
+  # SPOT1M-01 = the per-minute pull of the just-closed minute's official 1m
+  # index candle degraded (transport / non-2xx / 429-after-ladder / no token
+  # / 200-but-empty). Escalate (not auto_restart): the next minute boundary
+  # re-attempts automatically by construction, and the runbook's triage is
+  # operator judgement (data-plan vs token vs Dhan seal latency — the
+  # close_to_data_ms histogram evidence). The escalation emission is already
+  # edge-triggered app-side (3 consecutive fully-failed minutes).
+  - name: spot1m-01-fetch-degraded-escalate
+    match:
+      code: SPOT1M-01
+    action: escalate
+    runbook_path: .claude/rules/project/rest-1m-pipeline-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 600
+    justification: >-
+      SPOT1M-01 = per-minute spot 1m REST fetch degraded. The scheduler
+      self-retries every minute close and the Telegram page is
+      edge-triggered app-side; escalate so the operator inspects the
+      bounded secret-redacted sample failure (status + redacted URL +
+      body) and cross-checks REST-CANARY-01 / the WS feed per the runbook.
+      Missing minutes stay absent (never fabricated) and backfill safely
+      via DEDUP-idempotent re-appends.
+
+  # SPOT1M-02 = the spot_1m_rest QuestDB persist leg failed (ensure-DDL /
+  # ILP append / ILP-over-HTTP flush ACK). Best-effort forensic write —
+  # the fetch loop continues; escalate so the operator checks QuestDB
+  # health (cross-check BOOT-01/02) and re-runs once healthy.
+  - name: spot1m-02-persist-failed-escalate
+    match:
+      code: SPOT1M-02
+    action: escalate
+    runbook_path: .claude/rules/project/rest-1m-pipeline-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 600
+    justification: >-
+      SPOT1M-02 = spot_1m_rest persist failed. Rows for the failed flush
+      stay buffered where possible and re-appends are DEDUP-idempotent, so
+      recovery is re-run-safe; the underlying condition is QuestDB
+      ILP/HTTP health, which needs operator eyes (make doctor,
+      BOOT-01/BOOT-02 cross-check) rather than a blind auto-fix.
