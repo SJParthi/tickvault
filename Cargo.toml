@@ -155,16 +155,19 @@ aws-sdk-sns = { version = "1.103.0", default-features = false, features = ["beha
 aws-sdk-ssm = { version = "1.112.0", default-features = false, features = ["behavior-version-latest", "default-https-client", "rt-tokio"] }
 # 2026-07-12 (BruteX crossverify Commit 2, coordinator-approved): read-only
 # S3 GET/List of the BruteX-produced crossverify CSVs on tv-prod-cold.
-# 1.137.0 is the NEWEST aws-sdk-s3 whose aws-smithy-* requirements resolve
-# against the versions already in Cargo.lock (1.138.0 needs
-# aws-smithy-runtime-api 1.13 vs locked 1.12.3) — additive lock entries only,
-# zero bumps to existing pins. Same feature shape as the sibling SDK crates.
-# The `=` prefix is REQUIRED here (deviation from the house bare-version
-# style): Cargo treats a bare "1.137.0" as the caret range ^1.137.0, so a
-# fresh resolution of this NEW dep maximizes to 1.138.0 and force-bumps the
-# locked aws-smithy pins; `cargo update --precise` is banned (CLAUDE.md), so
-# the exact `=` requirement is the only way to land 1.137.0 additively.
-aws-sdk-s3 = { version = "=1.137.0", default-features = false, features = ["behavior-version-latest", "default-https-client", "rt-tokio"] }
+# 1.138.0 is the aws-sdk-s3 whose aws-smithy-* requirements (eventstream
+# 0.61.1 / http 0.64.0 / json 0.63.0 / observability 0.3.0 / schema 0.2.0 /
+# xml 0.61.1 / types 1.6.1 / runtime 1.12.0 / runtime-api 1.13.0 +
+# aws-runtime 1.8.1) match origin/main's Cargo.lock aws family EXACTLY, so
+# the resolved tree carries ZERO duplicate aws-smithy-* crates. (The earlier
+# =1.137.0 pin matched this BRANCH's stale lock family instead; against
+# main's newer family it produced 6 aws-smithy duplicates in cargo-deny
+# bans.) Same feature shape as the sibling SDK crates. The `=` prefix is
+# REQUIRED (deviation from the house bare-version style): a bare version is
+# a caret range, so a future fresh resolution could silently move this dep
+# onto a smithy generation that no longer matches the rest of the lock; the
+# exact `=` requirement keeps the family alignment deliberate.
+aws-sdk-s3 = { version = "=1.138.0", default-features = false, features = ["behavior-version-latest", "default-https-client", "rt-tokio"] }
 
 # ---- Section 16: CLI ----
 clap = { version = "4.6.1", features = ["derive"] }

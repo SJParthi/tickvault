@@ -142,7 +142,7 @@ skip = [
     { crate = "block-buffer", reason = "follows digest version split (0.10/0.12)" },
     { crate = "crypto-common", reason = "follows digest version split (0.1/0.2)" },
     { crate = "hmac", reason = "aws-sigv4 1.4.3 uses 0.13, totp-rs uses 0.12" },
-    { crate = "sha1", reason = "aws-smithy-checksums 0.64.8 (aws-sdk-s3 1.137.0) is on 0.11; aws-config/axum/totp-rs/tungstenite remain on 0.10 — same crypto-family split as the entries above" },
+    { crate = "sha1", reason = "aws-smithy-checksums 0.65.0 (aws-sdk-s3 1.138.0) is on 0.11; aws-config/axum/totp-rs/tungstenite remain on 0.10 — same crypto-family split as the entries above" },
     { crate = "sha2", reason = "aws-sigv4 1.4.3 uses 0.11, totp-rs/digest use 0.10" },
     { crate = "typenum", reason = "transitive splits 1.19/1.20 across digest 0.10/0.11" },
     # toml_edit 0.22 (direct) + toml_edit 0.23 (via cargo-deny internal) etc.
