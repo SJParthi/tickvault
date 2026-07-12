@@ -127,12 +127,16 @@ fn is_valid_date_shape(s: &str) -> bool {
             .all(|&i| b[i].is_ascii_digit())
 }
 
-/// Symbol param allowlist: 1..=64 chars of `[A-Za-z0-9 ._-]`.
+/// Symbol param allowlist: 1..=64 chars of `[A-Za-z0-9 ._&-]`.
+/// FIX ROUND 3 (2026-07-12): `&` added in lockstep with the CSV parse
+/// charset (`symbol_charset_ok` in `brutex_crossverify_compare.rs`) —
+/// real NSE F&O symbols carry it (M&M, M&MFIN, GMRP&UI); every sink
+/// escapes it (`%26` in hrefs, `&amp;` in HTML, single-quoted in SQL).
 fn is_valid_symbol_param(s: &str) -> bool {
     !s.is_empty()
         && s.len() <= 64
         && s.bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b' ' | b'.' | b'_' | b'-'))
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b' ' | b'.' | b'_' | b'-' | b'&'))
 }
 
 /// Days since 1970-01-01 for a civil date (Howard Hinnant's algorithm).
@@ -227,8 +231,9 @@ fn minute_hhmm(iso: &str) -> String {
     }
 }
 
-/// URL-encodes a symbol for the drill-down link (allowlisted charset: only
-/// the space needs encoding among `[A-Za-z0-9 ._-]`; everything else is
+/// URL-encodes a symbol for the drill-down link (allowlisted charset: the
+/// space and `&` need encoding among `[A-Za-z0-9 ._&-]` — `&` → `%26` so an
+/// M&M-class symbol can never split the query string; everything else is
 /// percent-encoded anyway as defense in depth).
 fn url_encode_symbol(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
@@ -676,7 +681,7 @@ pub async fn crossverify_page(
     {
         return (
             StatusCode::BAD_REQUEST,
-            "invalid symbol parameter — max 64 chars of [A-Za-z0-9 ._-]",
+            "invalid symbol parameter — max 64 chars of [A-Za-z0-9 ._&-]",
         )
             .into_response();
     }
@@ -844,8 +849,13 @@ mod tests {
         assert!(is_valid_symbol_param("NIFTY 50"));
         assert!(is_valid_symbol_param("TCS.NS"));
         assert!(is_valid_symbol_param("M_M-EQ"));
+        // FIX ROUND 3: `&` accepted in lockstep with the parse charset —
+        // real NSE symbols M&M / M&MFIN / GMRP&UI must drill down.
+        assert!(is_valid_symbol_param("M&M"));
+        assert!(is_valid_symbol_param("GMRP&UI"));
         assert!(!is_valid_symbol_param(""));
         assert!(!is_valid_symbol_param("a'b"));
+        assert!(!is_valid_symbol_param("A/B"));
         assert!(!is_valid_symbol_param("<script>"));
         assert!(!is_valid_symbol_param(&"x".repeat(65)));
         assert!(is_valid_symbol_param(&"x".repeat(64)));
@@ -876,6 +886,9 @@ mod tests {
         assert!(sql.contains("observed_at = '2026-07-12T10:20:00.000000Z'"));
         assert!(sql.contains("LIMIT 2000"));
         assert!(sql.contains("ORDER BY minute_ts_ist"));
+        // FIX ROUND 3: `&` rides inside the single-quoted literal untouched.
+        let sql_amp = cell_select_sql(42, "M&M", "2026-07-12T10:20:00.000000Z");
+        assert!(sql_amp.contains("symbol = 'M&M'"));
     }
 
     #[test]
@@ -920,6 +933,9 @@ mod tests {
     fn url_encode_symbol_encodes_space() {
         assert_eq!(url_encode_symbol("NIFTY 50"), "NIFTY%2050");
         assert_eq!(url_encode_symbol("TCS.NS"), "TCS.NS");
+        // FIX ROUND 3: `&` percent-encodes so it can never split the query.
+        assert_eq!(url_encode_symbol("M&M"), "M%26M");
+        assert_eq!(url_encode_symbol("GMRP&UI"), "GMRP%26UI");
     }
 
     // ---- parsers ----
@@ -1102,6 +1118,18 @@ mod tests {
         assert!(!page.contains("<script>"));
         assert!(!page.contains("<img src=x"));
         assert!(page.contains("&lt;script&gt;"));
+    }
+
+    /// FIX ROUND 3: an M&M-class symbol renders HTML-escaped (`M&amp;M`)
+    /// and its drill-down href carries the percent-encoded form (`M%26M`).
+    #[test]
+    fn render_ampersand_symbol_escapes_html_and_encodes_href() {
+        let run = run_row("clean", "");
+        let rows = vec![daily("M&M", "clean", 0)];
+        let page = render_crossverify_page("2026-07-12", Some(&run), &rows, None);
+        assert!(page.contains("M&amp;M"));
+        assert!(page.contains("symbol=M%26M"));
+        assert!(!page.contains(">M&M<"), "raw ampersand must never render");
     }
 
     #[test]
