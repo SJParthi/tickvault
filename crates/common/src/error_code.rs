@@ -2130,7 +2130,11 @@ mod tests {
         // SCOREBOARD-01 — the daily 15:45 IST Dhan-vs-Groww scoreboard
         // aggregation degraded (best-effort forensic aggregate; sentinels,
         // never fabricated zeros; DEDUP-idempotent re-run backfills).
-        assert_eq!(ErrorCode::all().len(), 138);
+        // 2026-07-12 (per-minute spot 1m REST pipeline PR-2): bumped
+        // 138 -> 140 for SPOT1M-01 (per-minute spot fetch degraded — edge-
+        // triggered escalation) + SPOT1M-02 (spot_1m_rest persist failed —
+        // best-effort, DEDUP-idempotent re-append).
+        assert_eq!(ErrorCode::all().len(), 140);
     }
 
     #[test]
