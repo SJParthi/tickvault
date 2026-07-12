@@ -2939,6 +2939,16 @@ async fn main() -> Result<()> {
             &feed_runtime,
         );
 
+        // BruteX↔TickVault daily cross-verify (BRUTEX-XVERIFY, 2026-07-12) —
+        // the 15:50 IST runner must exist on BOTH boot paths (mirror of the
+        // scoreboard spawn above). Config-gated ([brutex_crossverify] enabled,
+        // default OFF); disabled = one info! + return, nothing spawned.
+        tickvault_app::brutex_crossverify_boot::spawn_brutex_crossverify_task(
+            &config,
+            &trading_calendar,
+            &notifier,
+        );
+
         // --- Await shutdown ---
         return run_shutdown_fast(
             ws_handles,
@@ -3115,6 +3125,16 @@ async fn main() -> Result<()> {
         &notifier,
         process_start_ist_nanos,
         &feed_runtime,
+    );
+
+    // BruteX↔TickVault daily cross-verify (BRUTEX-XVERIFY, 2026-07-12) —
+    // PROCESS-GLOBAL spawn like the scoreboard above: the 15:50 IST runner
+    // + supervisor. Config-gated ([brutex_crossverify] enabled, default OFF);
+    // disabled = one info! + return, nothing spawned.
+    tickvault_app::brutex_crossverify_boot::spawn_brutex_crossverify_task(
+        &config,
+        &trading_calendar,
+        &notifier,
     );
 
     // -----------------------------------------------------------------------
