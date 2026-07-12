@@ -283,12 +283,15 @@ fn max_date_sql() -> String {
 }
 
 /// SQL for all daily rows (per-symbol + `__RUN__`) of one trading day.
+/// Defensive `LIMIT` (mirrors [`CELL_DRILLDOWN_LIMIT`]) bounds a hostile /
+/// corrupted table — a legitimate day is ≤ ~800 rows (universe + run row).
 fn daily_select_sql(date_micros: i64) -> String {
     format!(
         "SELECT symbol, security_id, exchange_segment, outcome, minutes_compared, \
          cells_compared, diverged_cells, missing_live, missing_brutex, tail_unsealed, \
          out_of_session, unmapped_symbols, run_partial, observed_at, note \
-         FROM {BRUTEX_CROSSVERIFY_DAILY_TABLE} WHERE trading_date_ist = {date_micros}"
+         FROM {BRUTEX_CROSSVERIFY_DAILY_TABLE} WHERE trading_date_ist = {date_micros} \
+         LIMIT {CELL_DRILLDOWN_LIMIT}"
     )
 }
 
@@ -621,7 +624,9 @@ fn push_footer(page: &mut String) {
 /// Runs one QuestDB `/exec` query and returns the `dataset` rows. `None` on
 /// any transport / non-JSON / missing-table failure (the caller renders the
 /// honest empty state).
-// TEST-EXEMPT: live-QuestDB /exec I/O — response extraction + row parsing are the pure fns unit-tested below.
+///
+/// Covered by the mock-QuestDB handler tests below (happy path, connection
+/// refused, non-JSON body, missing `dataset` key).
 async fn query_dataset(
     client: &reqwest::Client,
     base_url: &str,
@@ -645,7 +650,9 @@ async fn query_dataset(
 ///
 /// Thin async shell: validate params (fail-closed 400), run the QuestDB
 /// queries, hand everything to the pure renderers above.
-// TEST-EXEMPT: thin I/O shell over live QuestDB — validation, SQL builders, parsers and renderers are all pure fns unit-tested below.
+///
+/// Covered end-to-end by the mock-QuestDB handler tests below (400 params,
+/// latest-date resolution, explicit-date drill-down, degraded/empty states).
 pub async fn crossverify_page(
     State(state): State<SharedAppState>,
     Query(params): Query<CrossverifyParams>,
@@ -858,6 +865,7 @@ mod tests {
         assert!(sql.contains("FROM brutex_crossverify_daily"));
         assert!(sql.contains("trading_date_ist = 1777000000000000"));
         assert!(sql.contains("run_partial"));
+        assert!(sql.contains("LIMIT 2000"), "defensive daily-row cap");
     }
 
     #[test]
@@ -1112,5 +1120,243 @@ mod tests {
             assert_eq!(outcome_banner(o).0, "bad", "{o} must be loud");
         }
         assert!(outcome_banner("<x>").1.contains("&lt;x&gt;"));
+    }
+
+    // ---- async handler shell (in-process mock QuestDB — board.rs pattern) ----
+
+    use crate::feed_state::FeedRuntimeState;
+    use std::sync::Arc;
+    use tickvault_common::config::{DhanConfig, FeedsConfig, InstrumentConfig, QuestDbConfig};
+
+    /// State pointing QuestDB at a specific port (1 = nothing listens →
+    /// connection refused fast, exercising the honest degraded path).
+    fn test_state_with_port(http_port: u16) -> SharedAppState {
+        let health = Arc::new(crate::state::SystemHealthStatus::new());
+        SharedAppState::new_with_feed_runtime(
+            QuestDbConfig {
+                host: "127.0.0.1".to_string(),
+                http_port,
+                pg_port: 8812,
+                ilp_port: 9009,
+            },
+            DhanConfig {
+                websocket_url: "wss://api-feed.dhan.co".to_string(),
+                order_update_websocket_url: "wss://api-order-update.dhan.co".to_string(),
+                rest_api_base_url: "https://api.dhan.co/v2".to_string(),
+                auth_base_url: "https://auth.dhan.co".to_string(),
+                instrument_csv_url: "https://images.dhan.co/api-data/api-scrip-master-detailed.csv"
+                    .to_string(),
+                instrument_csv_fallback_url: "https://images.dhan.co/api-data/api-scrip-master.csv"
+                    .to_string(),
+                max_instruments_per_connection: 5000,
+                max_websocket_connections: 5,
+                sandbox_base_url: String::new(),
+            },
+            InstrumentConfig {
+                daily_download_time: "08:55:00".to_string(),
+                csv_cache_directory: "/tmp/tv-cache".to_string(),
+                csv_cache_filename: "instruments.csv".to_string(),
+                csv_download_timeout_secs: 120,
+                build_window_start: "08:25:00".to_string(),
+                build_window_end: "08:55:00".to_string(),
+            },
+            health,
+            Arc::new(FeedRuntimeState::from_config(&FeedsConfig::default())),
+        )
+    }
+
+    /// Multi-request mock QuestDB serving one canned response per connection,
+    /// then EXHAUSTING (further connections refused) — the board.rs / #1458
+    /// house pattern.
+    async fn start_multi_mock_server(responses: Vec<&'static str>) -> u16 {
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind should succeed");
+        let port = listener.local_addr().expect("local_addr").port();
+
+        tokio::spawn(async move {
+            for body in responses {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut buf = vec![0u8; 4096];
+                let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.shutdown().await;
+            }
+        });
+
+        port
+    }
+
+    async fn body_text(resp: Response) -> String {
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("body bytes");
+        String::from_utf8(bytes.to_vec()).expect("utf8 body")
+    }
+
+    /// Canned daily /exec body: one `__RUN__` aggregate + one symbol row
+    /// (column order = `daily_select_sql`).
+    const DAILY_BODY: &str = r#"{"dataset":[
+        ["__RUN__",0,"","diverged",375,1500,3,1,0,2,0,0,false,"2026-07-11T15:50:00.000000Z","tolerance 0 paise"],
+        ["RELIANCE",2885,"NSE_EQ","diverged",375,1500,3,1,0,2,0,0,false,"2026-07-11T15:50:00.000000Z",""]
+    ]}"#;
+    const MAX_DATE_BODY: &str = r#"{"dataset":[["2026-07-11T00:00:00.000000Z"]]}"#;
+    const CELLS_BODY: &str = r#"{"dataset":[
+        ["2026-07-11T10:15:00.000000Z","diverged","close",123450,123460,0,0]
+    ]}"#;
+
+    #[tokio::test]
+    async fn crossverify_page_rejects_bad_date_with_400() {
+        let resp = crossverify_page(
+            State(test_state_with_port(1)),
+            Query(CrossverifyParams {
+                date: Some("2026/07/11".to_string()),
+                symbol: None,
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn crossverify_page_rejects_bad_symbol_with_400() {
+        let resp = crossverify_page(
+            State(test_state_with_port(1)),
+            Query(CrossverifyParams {
+                date: Some("2026-07-11".to_string()),
+                symbol: Some("a'b".to_string()),
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn crossverify_page_questdb_down_renders_honest_empty_state() {
+        // Port 1: connection refused → both queries return None → honest
+        // "no runs yet" state with the "latest" label (never a fake clean page).
+        let resp = crossverify_page(
+            State(test_state_with_port(1)),
+            Query(CrossverifyParams {
+                date: None,
+                symbol: None,
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_text(resp).await;
+        assert!(body.contains("no cross-verify runs recorded yet"));
+        assert!(body.contains("latest"));
+    }
+
+    #[tokio::test]
+    async fn crossverify_page_latest_date_path_renders_run_and_symbol_rows() {
+        // No date param → 2 queries: max(trading_date_ist), then daily rows.
+        let port = start_multi_mock_server(vec![MAX_DATE_BODY, DAILY_BODY]).await;
+        let resp = crossverify_page(
+            State(test_state_with_port(port)),
+            Query(CrossverifyParams {
+                date: None,
+                symbol: None,
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers()
+                .get(header::X_FRAME_OPTIONS)
+                .map(|v| v.as_bytes()),
+            Some(b"SAMEORIGIN".as_slice())
+        );
+        let body = body_text(resp).await;
+        assert!(body.contains("2026-07-11"), "resolved latest day in title");
+        assert!(body.contains("DIVERGED"), "run-row banner");
+        assert!(body.contains("RELIANCE"), "per-symbol row");
+        assert!(body.contains("Run totals"), "run-row totals line");
+        assert!(body.contains("tolerance 0 paise"), "run note rendered");
+    }
+
+    #[tokio::test]
+    async fn crossverify_page_explicit_date_with_symbol_renders_drilldown() {
+        // Explicit date + symbol → 2 queries: daily rows, then audit cells
+        // pinned to the run row's observed_at.
+        let port = start_multi_mock_server(vec![DAILY_BODY, CELLS_BODY]).await;
+        let resp = crossverify_page(
+            State(test_state_with_port(port)),
+            Query(CrossverifyParams {
+                date: Some("2026-07-11".to_string()),
+                symbol: Some("RELIANCE".to_string()),
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_text(resp).await;
+        assert!(body.contains("Drill-down — RELIANCE"));
+        assert!(body.contains("10:15"), "cell minute rendered HH:MM IST");
+        assert!(body.contains("close"), "cell field rendered");
+        assert!(body.contains("1234.50"), "paise rendered as rupees");
+    }
+
+    #[tokio::test]
+    async fn crossverify_page_symbol_without_run_row_skips_cell_query() {
+        // Daily body has NO __RUN__ row → observed_at gate fails closed →
+        // the cell query is never issued (mock serves exactly ONE response).
+        const SYMBOL_ONLY_BODY: &str = r#"{"dataset":[
+            ["TCS",11536,"NSE_EQ","clean",375,1500,0,0,0,0,0,0,false,"2026-07-11T15:50:00.000000Z",""]
+        ]}"#;
+        let port = start_multi_mock_server(vec![SYMBOL_ONLY_BODY]).await;
+        let resp = crossverify_page(
+            State(test_state_with_port(port)),
+            Query(CrossverifyParams {
+                date: Some("2026-07-11".to_string()),
+                symbol: Some("TCS".to_string()),
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_text(resp).await;
+        assert!(body.contains("no audit cells recorded for this symbol"));
+    }
+
+    #[tokio::test]
+    async fn crossverify_page_malformed_exec_body_renders_empty_state() {
+        let port = start_multi_mock_server(vec!["definitely not json"]).await;
+        let resp = crossverify_page(
+            State(test_state_with_port(port)),
+            Query(CrossverifyParams {
+                date: Some("2026-07-11".to_string()),
+                symbol: None,
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_text(resp).await;
+        assert!(body.contains("no cross-verify runs recorded yet"));
+    }
+
+    #[tokio::test]
+    async fn crossverify_page_missing_dataset_key_renders_empty_state() {
+        let port = start_multi_mock_server(vec![r#"{"query":"x","count":0}"#]).await;
+        let resp = crossverify_page(
+            State(test_state_with_port(port)),
+            Query(CrossverifyParams {
+                date: Some("2026-07-11".to_string()),
+                symbol: None,
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_text(resp).await;
+        assert!(body.contains("no cross-verify runs recorded yet"));
     }
 }

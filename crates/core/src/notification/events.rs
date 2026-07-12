@@ -2235,8 +2235,18 @@ impl NotificationEvent {
                 } else {
                     format!("{}\n", html_escape(hint))
                 };
+                // Commandment 10: severity emoji at the START of the
+                // subject, from the canonical set — ✅ only on a
+                // fully-measured clean day; every other outcome
+                // (diverged/partial/blind/no_data/degraded/unknown)
+                // leads with ⚠️.
+                let lead: &str = if outcome.as_str() == "clean" {
+                    "\u{2705}"
+                } else {
+                    "\u{26a0}\u{fe0f}"
+                };
                 format!(
-                    "\u{1f50d} <b>BruteX vs live 1-minute check — \
+                    "{lead} <b>BruteX vs live 1-minute check — \
                      {trading_date_ist}: {verdict}</b>\n\
                      {loud}\
                      Files read from BruteX: {} | Symbols compared: {}\n\
@@ -7155,8 +7165,8 @@ mod tests {
         assert_eq!(ev.dispatch_policy(), DispatchPolicy::Immediate);
         let msg = ev.to_message();
         assert!(
-            msg.contains("\u{1f50d}"),
-            "leads with the check emoji: {msg}"
+            msg.starts_with("\u{2705}"),
+            "clean day leads with the canonical OK emoji: {msg}"
         );
         assert!(
             msg.contains("BruteX vs live 1-minute check — 2026-07-12: CLEAN"),
@@ -7241,6 +7251,10 @@ mod tests {
             "Our feed had a stall episode at 10:14 AM — the gap lines up.",
         );
         let msg = ev.to_message();
+        assert!(
+            msg.starts_with("\u{26a0}\u{fe0f}"),
+            "diverged day leads with the canonical warning emoji: {msg}"
+        );
         assert!(
             msg.contains("BruteX vs live 1-minute check — 2026-07-12: DIVERGED"),
             "{msg}"

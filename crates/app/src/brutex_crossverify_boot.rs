@@ -81,6 +81,20 @@ const MAX_ROWS_PER_CSV: usize = 200_000;
 /// run-row note — the daily aggregates stay exact).
 const MAX_CELL_ROWS_PERSISTED: usize = 50_000;
 
+/// Aggregate accepted-row ceiling across ALL folded CSVs in one run —
+/// defense-in-depth on top of the per-object [`MAX_ROWS_PER_CSV`] cap.
+/// A hostile/runaway producer publishing MANY near-cap objects (the
+/// 2,000-key list cap × 200K rows/object = 400M rows) could otherwise
+/// fold unbounded rows into RAM; a legitimate ~770-symbol day is ~290K
+/// rows, so 1M gives >3x headroom while bounding worst-case memory.
+const MAX_TOTAL_FOLDED_ROWS: usize = 1_000_000;
+
+/// Pure decision: has the aggregate folded-row ceiling been reached?
+/// Inclusive at the cap so the fold stops BEFORE the next object.
+fn total_row_cap_reached(total_rows_folded: usize) -> bool {
+    total_rows_folded >= MAX_TOTAL_FOLDED_ROWS
+}
+
 /// Base backoff between S3 GetObject attempts (doubles per attempt).
 const S3_RETRY_BASE_MS: u64 = 500;
 
@@ -1071,7 +1085,26 @@ pub async fn run_brutex_crossverify(
     let mut unmapped_syms: BTreeSet<String> = BTreeSet::new();
     let mut files_read: i64 = 0;
     let mut bad_rows_total: usize = 0;
-    for (key, size) in &csv_keys {
+    let mut total_rows_folded: usize = 0;
+    for (idx, (key, size)) in csv_keys.iter().enumerate() {
+        if total_row_cap_reached(total_rows_folded) {
+            let skipped_objects = csv_keys.len() - idx;
+            error!(
+                code = ErrorCode::BrutexXverify02RunDegraded.code_str(),
+                stage = "total_row_cap",
+                total_rows = total_rows_folded,
+                skipped_objects,
+                "BRUTEX-XVERIFY-02: aggregate folded-row ceiling reached — \
+                 stopping the fold (partial coverage)"
+            );
+            degraded_counter("total_row_cap");
+            run_partial = true;
+            degraded_notes.push(format!(
+                "total_row_cap: {total_rows_folded} rows folded, \
+                 {skipped_objects} objects skipped"
+            ));
+            break;
+        }
         if now_ist_secs_of_day() >= cfg.deadline_secs_of_day_ist {
             error!(
                 code = ErrorCode::BrutexXverify02RunDegraded.code_str(),
@@ -1120,6 +1153,7 @@ pub async fn run_brutex_crossverify(
             Ok(parsed) => {
                 files_read += 1;
                 bad_rows_total += parsed.bad_rows;
+                total_rows_folded = total_rows_folded.saturating_add(parsed.rows.len());
                 if parsed.truncated {
                     run_partial = true;
                     degraded_notes.push(format!("{key}: row cap hit (truncated)"));
@@ -1255,14 +1289,22 @@ pub async fn run_brutex_crossverify(
     }
 
     // ── Leg 5: the pure comparison ──
-    let cmp = compare_day(
-        &brutex_bars,
-        &live_bars,
-        &CompareCfg {
-            tolerance_paise: cfg.price_tolerance_paise,
-            compare_volume: cfg.compare_volume,
-        },
-    );
+    // Synchronous CPU work over up to ~1M folded bars — run it under
+    // `block_in_place` so a worst-case compare cannot stall this tokio
+    // worker's peers. `block_in_place` panics on a current_thread
+    // runtime, so the flavor guard falls back to an inline call there
+    // (tests / degenerate runtimes; the prod runtime is multi-thread).
+    let cmp_cfg = CompareCfg {
+        tolerance_paise: cfg.price_tolerance_paise,
+        compare_volume: cfg.compare_volume,
+    };
+    let cmp = if tokio::runtime::Handle::current().runtime_flavor()
+        == tokio::runtime::RuntimeFlavor::MultiThread
+    {
+        tokio::task::block_in_place(|| compare_day(&brutex_bars, &live_bars, &cmp_cfg))
+    } else {
+        compare_day(&brutex_bars, &live_bars, &cmp_cfg)
+    };
     let measured = cmp
         .outcome
         .unwrap_or(BrutexCrossverifyDailyOutcome::Degraded);
@@ -1696,6 +1738,35 @@ pub fn spawn_brutex_crossverify_task(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── aggregate row ceiling (FIX 2, review round 1) ──
+
+    #[test]
+    fn test_total_row_cap_reached_boundaries() {
+        assert!(!total_row_cap_reached(0), "empty fold never capped");
+        assert!(
+            !total_row_cap_reached(MAX_TOTAL_FOLDED_ROWS - 1),
+            "one below the ceiling keeps folding"
+        );
+        assert!(
+            total_row_cap_reached(MAX_TOTAL_FOLDED_ROWS),
+            "inclusive at the ceiling — the NEXT object is skipped"
+        );
+        assert!(
+            total_row_cap_reached(usize::MAX),
+            "saturated accumulator stays capped"
+        );
+    }
+
+    #[test]
+    fn test_total_row_cap_leaves_headroom_over_a_legit_day() {
+        // A legitimate ~770-symbol day is ~290K rows (770 × 375 minutes);
+        // the ceiling must not trip on real traffic.
+        assert!(MAX_TOTAL_FOLDED_ROWS >= 3 * 770 * 375);
+        // ...but must be far below the hostile worst case
+        // (2,000 keys × MAX_ROWS_PER_CSV).
+        assert!(MAX_TOTAL_FOLDED_ROWS < 2_000 * MAX_ROWS_PER_CSV);
+    }
 
     // ── scheduling ──
 
