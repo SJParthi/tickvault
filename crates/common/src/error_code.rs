@@ -905,6 +905,29 @@ pub enum ErrorCode {
     /// (`TICKVAULT_SCOREBOARD_NOW`) backfill the day. Severity::Medium,
     /// auto-triage-safe.
     Scoreboard01AggregationDegraded,
+    /// BRUTEX-XVERIFY-01 (BruteX↔TickVault daily cross-verify, 2026-07-12) —
+    /// the 15:50 IST run found ≥1 divergent cell (or missing-live /
+    /// missing-brutex minute) between the BruteX-produced Groww 1-minute
+    /// OHLCV CSVs (S3 `crossverify/groww/<date>/`) and the live
+    /// `candles_1m` (`feed='groww'`) — paise-integer compare, inclusive
+    /// tolerance. Each cell is a `brutex_crossverify_cell_audit` row; the
+    /// daily verdict row + Telegram summary carry the counts. Severity::High;
+    /// NOT auto-triage-safe (severity-independent override — a cross-system
+    /// data-comparability verdict is an OPERATOR judgment: which side's
+    /// pipeline drifted; the FUTIDX-02 precedent).
+    BrutexXverify01DivergenceFound,
+    /// BRUTEX-XVERIFY-02 (BruteX↔TickVault daily cross-verify, 2026-07-12) —
+    /// the 15:50 IST run itself DEGRADED: S3 list/get failed after bounded
+    /// retries, no objects appeared by the 16:05 IST wall-clock cap
+    /// (NO_DATA), CSV parse rejected, the symbol→security_id mapping read
+    /// failed, the live `candles_1m` read failed, or the forensic ILP write
+    /// was rejected. The day is stamped `no_data` / `blind` / `degraded` —
+    /// never a fabricated clean verdict (Rule 11). Best-effort cold path:
+    /// the live feeds, tick capture and trading are NEVER affected; the
+    /// DEDUP-idempotent tables let a healthy re-run backfill the day.
+    /// Severity::High, auto-triage-safe (the degrade already happened —
+    /// the operator inspects; the next trading day re-runs).
+    BrutexXverify02RunDegraded,
 }
 
 impl ErrorCode {
@@ -1088,6 +1111,9 @@ impl ErrorCode {
             Self::Futidx02CrossFeedExpiryMismatch => "FUTIDX-02",
             // Dual-feed scoreboard PR-A (2026-07-10)
             Self::Scoreboard01AggregationDegraded => "SCOREBOARD-01",
+            // BruteX↔TickVault daily cross-verify (2026-07-12)
+            Self::BrutexXverify01DivergenceFound => "BRUTEX-XVERIFY-01",
+            Self::BrutexXverify02RunDegraded => "BRUTEX-XVERIFY-02",
         }
     }
 
@@ -1251,6 +1277,12 @@ impl ErrorCode {
             // / cross-feed expiry divergence. Loud (Telegram High), never a
             // halt; the spot universe + both live feeds are unaffected.
             Self::Futidx01SelectionDegraded | Self::Futidx02CrossFeedExpiryMismatch => {
+                Severity::High
+            }
+            // BRUTEX-XVERIFY-01/02 (2026-07-12) — daily cross-verify
+            // divergence / degraded run. Loud (Telegram High), never a
+            // halt; the live feeds + tick capture are unaffected.
+            Self::BrutexXverify01DivergenceFound | Self::BrutexXverify02RunDegraded => {
                 Severity::High
             }
             // Medium: data pipeline correctness
@@ -1550,6 +1582,10 @@ impl ErrorCode {
             Self::Scoreboard01AggregationDegraded => {
                 ".claude/rules/project/dual-feed-scoreboard-error-codes.md"
             }
+            // BruteX↔TickVault daily cross-verify (2026-07-12)
+            Self::BrutexXverify01DivergenceFound | Self::BrutexXverify02RunDegraded => {
+                ".claude/rules/project/brutex-crossverify-error-codes.md"
+            }
         }
     }
 
@@ -1570,11 +1606,17 @@ impl ErrorCode {
     ///   `ALTER TABLE <t> RESUME WAL` is an OPERATOR decision — resuming
     ///   into a still-broken disk replays the failure; auto-triage must
     ///   never execute it.
+    /// - `BRUTEX-XVERIFY-01` (2026-07-12): a cross-system (BruteX vs
+    ///   TickVault) data-comparability verdict is an operator judgment —
+    ///   the operator decides which capture chain is at fault (the
+    ///   FUTIDX-02 precedent); auto-triage must never act on it.
     #[must_use]
     pub const fn is_auto_triage_safe(self) -> bool {
         if matches!(
             self,
-            Self::Futidx02CrossFeedExpiryMismatch | Self::WalSuspend01TableSuspended
+            Self::Futidx02CrossFeedExpiryMismatch
+                | Self::WalSuspend01TableSuspended
+                | Self::BrutexXverify01DivergenceFound
         ) {
             return false;
         }
@@ -1752,6 +1794,9 @@ impl ErrorCode {
             Self::Futidx02CrossFeedExpiryMismatch,
             // Dual-feed scoreboard PR-A (2026-07-10)
             Self::Scoreboard01AggregationDegraded,
+            // BruteX↔TickVault daily cross-verify (2026-07-12)
+            Self::BrutexXverify01DivergenceFound,
+            Self::BrutexXverify02RunDegraded,
         ]
     }
 }
@@ -2092,7 +2137,12 @@ mod tests {
         // SCOREBOARD-01 — the daily 15:45 IST Dhan-vs-Groww scoreboard
         // aggregation degraded (best-effort forensic aggregate; sentinels,
         // never fabricated zeros; DEDUP-idempotent re-run backfills).
-        assert_eq!(ErrorCode::all().len(), 138);
+        // 2026-07-12 (BruteX crossverify Commit 1): bumped 138 -> 140 for
+        // BRUTEX-XVERIFY-01 (daily BruteX-vs-live 1m divergence found —
+        // High, NOT auto-triage-safe: a data-comparability signal is never
+        // auto-actioned) + BRUTEX-XVERIFY-02 (run degraded — S3/CSV/QuestDB
+        // leg failed; keep-better guard + DEDUP-idempotent re-run backfills).
+        assert_eq!(ErrorCode::all().len(), 140);
     }
 
     #[test]
@@ -2309,7 +2359,9 @@ mod tests {
                 // index futures.
                 || s.starts_with("FUTIDX-")
                 // Dual-feed scoreboard PR-A (2026-07-10).
-                || s.starts_with("SCOREBOARD-");
+                || s.starts_with("SCOREBOARD-")
+                // BruteX↔TickVault daily cross-verify (2026-07-12).
+                || s.starts_with("BRUTEX-XVERIFY-");
             assert!(has_known_prefix, "unexpected code prefix: {s}");
         }
     }
