@@ -73,6 +73,11 @@ pub const BRUTEX_XVERIFY_RUN_ROW_SECS_OF_DAY_IST: i64 = 57_000;
 /// out of range (15:50:00 IST).
 const DEFAULT_TRIGGER_SECS_OF_DAY_IST: u32 = 57_000;
 
+/// Fallback deadline when `[brutex_crossverify] deadline_secs_of_day_ist`
+/// is out of range or not after the trigger (16:05:00 IST — the config.rs
+/// default).
+const DEFAULT_DEADLINE_SECS_OF_DAY_IST: u32 = 57_900;
+
 /// Accepted-row cap per CSV object (a 5 MiB object cannot legitimately
 /// carry more; bounds memory on a hostile body).
 const MAX_ROWS_PER_CSV: usize = 200_000;
@@ -161,6 +166,35 @@ pub fn sanitize_xverify_trigger(configured_secs_of_day_ist: u32) -> (u32, bool) 
     } else {
         (DEFAULT_TRIGGER_SECS_OF_DAY_IST, true)
     }
+}
+
+/// Validate the configured `(trigger, deadline)` PAIR at spawn (round-4
+/// fix — the deadline gets the same treatment as the trigger):
+/// - a deadline ≥ 86400 falls back to 16:05 IST (57_900);
+/// - `trigger < deadline` is enforced — a trigger at/after the deadline
+///   would make the empty-prefix re-poll loop record NO_DATA on its FIRST
+///   poll every day; on violation BOTH reset to the defaults.
+///
+/// Returns `(effective_trigger, effective_deadline, was_invalid)`.
+#[must_use]
+pub fn sanitize_xverify_schedule(
+    configured_trigger_secs_of_day_ist: u32,
+    configured_deadline_secs_of_day_ist: u32,
+) -> (u32, u32, bool) {
+    let (mut trigger, trigger_invalid) =
+        sanitize_xverify_trigger(configured_trigger_secs_of_day_ist);
+    let (mut deadline, deadline_invalid) = if configured_deadline_secs_of_day_ist < 86_400 {
+        (configured_deadline_secs_of_day_ist, false)
+    } else {
+        (DEFAULT_DEADLINE_SECS_OF_DAY_IST, true)
+    };
+    let mut invalid = trigger_invalid || deadline_invalid;
+    if trigger >= deadline {
+        trigger = DEFAULT_TRIGGER_SECS_OF_DAY_IST;
+        deadline = DEFAULT_DEADLINE_SECS_OF_DAY_IST;
+        invalid = true;
+    }
+    (trigger, deadline, invalid)
 }
 
 /// Strict `YYYY-MM-DD` parse for the backfill env override (fail-closed —
@@ -322,14 +356,16 @@ pub struct LiveCandleRow {
 
 /// Parse the lifecycle `/exec` dataset into [`LifecycleRow`]s. Row order:
 /// `[security_id, exchange_segment, instrument_type, symbol_name,
-/// underlying_symbol, expiry_micros]`. Fail-soft per row.
-#[must_use]
-pub fn parse_lifecycle_dataset(body: &str) -> Vec<LifecycleRow> {
+/// underlying_symbol, expiry_micros]`. Fail-soft per row; fail-LOUD on a
+/// malformed body or a missing `dataset` key (round-4 fix: an empty Vec on
+/// garbage was indistinguishable from an empty table and produced a false
+/// massive `missing_live` day). A genuine `"dataset": []` stays `Ok(vec![])`.
+pub fn parse_lifecycle_dataset(body: &str) -> Result<Vec<LifecycleRow>, String> {
     let Ok(v) = serde_json::from_str::<serde_json::Value>(body) else {
-        return Vec::new();
+        return Err("malformed /exec response: not valid JSON".to_owned());
     };
     let Some(rows) = v.get("dataset").and_then(|d| d.as_array()) else {
-        return Vec::new();
+        return Err("malformed /exec response: missing dataset array".to_owned());
     };
     let mut out = Vec::with_capacity(rows.len());
     for row in rows {
@@ -357,19 +393,20 @@ pub fn parse_lifecycle_dataset(body: &str) -> Vec<LifecycleRow> {
             expiry_ymd,
         });
     }
-    out
+    Ok(out)
 }
 
 /// Parse the live `candles_1m` `/exec` dataset. Row order:
 /// `[ts_nanos, security_id, segment, open, high, low, close, volume,
-/// tick_count]`. Fail-soft per row.
-#[must_use]
-pub fn parse_live_candles_dataset(body: &str) -> Vec<LiveCandleRow> {
+/// tick_count]`. Fail-soft per row; fail-LOUD on a malformed body or a
+/// missing `dataset` key (round-4 fix — see [`parse_lifecycle_dataset`]).
+/// A genuine `"dataset": []` stays `Ok(vec![])`.
+pub fn parse_live_candles_dataset(body: &str) -> Result<Vec<LiveCandleRow>, String> {
     let Ok(v) = serde_json::from_str::<serde_json::Value>(body) else {
-        return Vec::new();
+        return Err("malformed /exec response: not valid JSON".to_owned());
     };
     let Some(rows) = v.get("dataset").and_then(|d| d.as_array()) else {
-        return Vec::new();
+        return Err("malformed /exec response: missing dataset array".to_owned());
     };
     let mut out = Vec::with_capacity(rows.len());
     for row in rows {
@@ -408,7 +445,7 @@ pub fn parse_live_candles_dataset(body: &str) -> Vec<LiveCandleRow> {
             tick_count,
         });
     }
-    out
+    Ok(out)
 }
 
 /// Parse the keep-better read body: the first row's first column (the
@@ -467,6 +504,37 @@ pub fn parse_manifest_files(body: &str) -> Option<u64> {
 // ---------------------------------------------------------------------------
 // Pure — outcome folding + summary shaping
 // ---------------------------------------------------------------------------
+
+/// The NO_DATA (daily-row note, Telegram detail) pair for a day whose
+/// deadline passed with zero CSVs. When S3 LISTING ERRORS occurred during
+/// the run, "prefix stayed empty" would be dishonest — we could not actually
+/// see the prefix — so the wording names the listing errors instead
+/// (round-4 fix, audit Rule 11).
+#[must_use]
+pub fn no_data_wording(had_list_errors: bool) -> (&'static str, &'static str) {
+    if had_list_errors {
+        (
+            "no_data: S3 listing errors occurred during the run — the prefix \
+             could not be confirmed empty by the deadline",
+            "S3 listing errors occurred; no BruteX files were readable by the \
+             16:05 IST deadline",
+        )
+    } else {
+        (
+            "no_data: the day's S3 prefix stayed empty through the deadline",
+            "no BruteX files appeared by the 16:05 IST deadline",
+        )
+    }
+}
+
+/// Clamp a (mis)configured NEGATIVE price tolerance to 0 (exact match).
+/// A negative tolerance would fail EVERY price compare — `|a − b| <=
+/// negative` is never true — silently marking the whole day diverged
+/// (round-4 fix).
+#[must_use]
+pub fn sanitize_price_tolerance_paise(configured: i64) -> i64 {
+    configured.max(0)
+}
 
 /// Fold the measured comparison outcome with the run's partial-evidence
 /// flag: a CLEAN verdict over partial coverage is honestly `partial`
@@ -949,8 +1017,11 @@ pub async fn run_brutex_crossverify(
         .map_err(|e| format!("http_client_build: {e}"))?;
 
     // ── Leg 1: the symbol mapping (instrument_lifecycle, feed='groww') ──
-    let mapping_rows = match exec_query(&client, questdb, &lifecycle_select_sql()).await {
-        Ok(body) => parse_lifecycle_dataset(&body),
+    let mapping_rows = match exec_query(&client, questdb, &lifecycle_select_sql())
+        .await
+        .and_then(|body| parse_lifecycle_dataset(&body))
+    {
+        Ok(rows) => rows,
         Err(err) => {
             error!(
                 code = ErrorCode::BrutexXverify02RunDegraded.code_str(),
@@ -986,6 +1057,7 @@ pub async fn run_brutex_crossverify(
     let prefix = day_prefix(&cfg.prefix, date_label);
     let mut run_partial = false;
     let mut degraded_notes: Vec<String> = Vec::new();
+    let mut had_list_errors = false;
     let (csv_keys, manifest_key) = loop {
         match list_day_objects(&s3, &cfg.bucket, &prefix, cfg.max_keys).await {
             Ok((keys, capped)) => {
@@ -1024,6 +1096,7 @@ pub async fn run_brutex_crossverify(
                      the deadline"
                 );
                 degraded_counter("s3_list");
+                had_list_errors = true;
             }
         }
         match next_poll_wait(
@@ -1035,9 +1108,11 @@ pub async fn run_brutex_crossverify(
             None => {
                 info!(
                     prefix = %prefix,
+                    had_list_errors,
                     "brutex_crossverify: no CSV objects by the deadline — \
                      recording NO_DATA for the day"
                 );
+                let (note, detail) = no_data_wording(had_list_errors);
                 return Ok(record_unmeasured_day(
                     &client,
                     questdb,
@@ -1045,12 +1120,12 @@ pub async fn run_brutex_crossverify(
                     day_start_nanos,
                     BrutexCrossverifyDailyOutcome::NoData,
                     0,
-                    "no_data: the day's S3 prefix stayed empty through the deadline".to_owned(),
+                    note.to_owned(),
                     RunSummary::unmeasured(
                         date_label,
                         BrutexCrossverifyDailyOutcome::NoData,
                         0,
-                        "no BruteX files appeared by the 16:05 IST deadline".to_owned(),
+                        detail.to_owned(),
                     ),
                 )
                 .await);
@@ -1227,43 +1302,45 @@ pub async fn run_brutex_crossverify(
     }
 
     // ── Leg 4: the day's live candles (feed='groww') ──
-    let live_body =
-        match exec_query(&client, questdb, &live_candles_select_sql(day_start_nanos)).await {
-            Ok(body) => body,
-            Err(err) => {
-                error!(
-                    code = ErrorCode::BrutexXverify02RunDegraded.code_str(),
-                    stage = "questdb_read",
-                    leg = "candles_1m",
-                    %err,
-                    "BRUTEX-XVERIFY-02: live candles read failed — the day degrades"
-                );
-                degraded_counter("questdb_read");
-                return Ok(record_unmeasured_day(
-                    &client,
-                    questdb,
-                    run_ts_nanos,
-                    day_start_nanos,
+    let live_rows = match exec_query(&client, questdb, &live_candles_select_sql(day_start_nanos))
+        .await
+        .and_then(|body| parse_live_candles_dataset(&body))
+    {
+        Ok(rows) => rows,
+        Err(err) => {
+            error!(
+                code = ErrorCode::BrutexXverify02RunDegraded.code_str(),
+                stage = "questdb_read",
+                leg = "candles_1m",
+                %err,
+                "BRUTEX-XVERIFY-02: live candles read failed — the day degrades"
+            );
+            degraded_counter("questdb_read");
+            return Ok(record_unmeasured_day(
+                &client,
+                questdb,
+                run_ts_nanos,
+                day_start_nanos,
+                BrutexCrossverifyDailyOutcome::Degraded,
+                files_read,
+                "degraded: candles_1m read failed".to_owned(),
+                RunSummary::unmeasured(
+                    date_label,
                     BrutexCrossverifyDailyOutcome::Degraded,
                     files_read,
-                    "degraded: candles_1m read failed".to_owned(),
-                    RunSummary::unmeasured(
-                        date_label,
-                        BrutexCrossverifyDailyOutcome::Degraded,
-                        files_read,
-                        "the live minute candles could not be read".to_owned(),
-                    ),
-                )
-                .await);
-            }
-        };
+                    "the live minute candles could not be read".to_owned(),
+                ),
+            )
+            .await);
+        }
+    };
     let reverse: HashMap<(i64, &str), &String> = symbol_ids
         .iter()
         .map(|(sym, (sid, seg))| ((*sid, seg.as_str()), sym))
         .collect();
     let mut live_bars: HashMap<BarKey, MinuteBar> = HashMap::new();
     let mut live_paise_rejects: u64 = 0;
-    for r in parse_live_candles_dataset(&live_body) {
+    for r in live_rows {
         let Some(sym) = reverse.get(&(r.security_id, r.segment.as_str())) else {
             // Live instruments outside the BruteX symbol set are not part
             // of the comparison universe (BruteX decides its own coverage).
@@ -1304,7 +1381,7 @@ pub async fn run_brutex_crossverify(
     // runtime, so the flavor guard falls back to an inline call there
     // (tests / degenerate runtimes; the prod runtime is multi-thread).
     let cmp_cfg = CompareCfg {
-        tolerance_paise: cfg.price_tolerance_paise,
+        tolerance_paise: sanitize_price_tolerance_paise(cfg.price_tolerance_paise),
         compare_volume: cfg.compare_volume,
     };
     let cmp = if tokio::runtime::Handle::current().runtime_flavor()
@@ -1553,7 +1630,7 @@ pub fn spawn_brutex_crossverify_task(
         info!("brutex_crossverify: disabled by [brutex_crossverify] config — nothing spawned");
         return;
     }
-    let bx_cfg = config.brutex_crossverify.clone();
+    let mut bx_cfg = config.brutex_crossverify.clone();
     let qcfg = config.questdb.clone();
     let cal = Arc::clone(trading_calendar);
     let telegram_enabled = bx_cfg.telegram_enabled;
@@ -1616,17 +1693,25 @@ pub fn spawn_brutex_crossverify_task(
             );
             return Err("date_override_non_trading".to_owned());
         }
-        let (trigger, trig_invalid) = sanitize_xverify_trigger(bx_cfg.trigger_secs_of_day_ist);
-        if trig_invalid {
+        let (trigger, deadline, sched_invalid) = sanitize_xverify_schedule(
+            bx_cfg.trigger_secs_of_day_ist,
+            bx_cfg.deadline_secs_of_day_ist,
+        );
+        if sched_invalid {
             error!(
                 code = ErrorCode::BrutexXverify02RunDegraded.code_str(),
                 stage = "trigger_config",
-                configured = bx_cfg.trigger_secs_of_day_ist,
-                effective = trigger,
-                "BRUTEX-XVERIFY-02: trigger_secs_of_day_ist out of range — \
-                 falling back to 15:50 IST"
+                configured_trigger = bx_cfg.trigger_secs_of_day_ist,
+                configured_deadline = bx_cfg.deadline_secs_of_day_ist,
+                effective_trigger = trigger,
+                effective_deadline = deadline,
+                "BRUTEX-XVERIFY-02: trigger/deadline config out of range or \
+                 trigger not before deadline — falling back to \
+                 15:50/16:05 IST"
             );
         }
+        bx_cfg.trigger_secs_of_day_ist = trigger;
+        bx_cfg.deadline_secs_of_day_ist = deadline;
         let decision = decide_brutex_xverify_start(
             boot_secs,
             cal.is_trading_day(today_ist),
@@ -1809,6 +1894,60 @@ mod tests {
     }
 
     #[test]
+    fn test_sanitize_xverify_schedule_deadline_clamp_and_ordering() {
+        // Valid pair passes through untouched.
+        assert_eq!(
+            sanitize_xverify_schedule(57_000, 57_900),
+            (57_000, 57_900, false)
+        );
+        // Deadline >= 86400 clamps to the 16:05 IST default.
+        assert_eq!(
+            sanitize_xverify_schedule(57_000, 86_400),
+            (57_000, 57_900, true)
+        );
+        assert_eq!(
+            sanitize_xverify_schedule(57_000, u32::MAX),
+            (57_000, 57_900, true)
+        );
+        // trigger >= deadline resets BOTH to the defaults.
+        assert_eq!(
+            sanitize_xverify_schedule(57_900, 57_900),
+            (57_000, 57_900, true)
+        );
+        assert_eq!(
+            sanitize_xverify_schedule(58_000, 57_100),
+            (57_000, 57_900, true)
+        );
+        // Both out of range: clamps land on the (valid) defaults.
+        assert_eq!(
+            sanitize_xverify_schedule(86_400, 86_400),
+            (57_000, 57_900, true)
+        );
+    }
+
+    #[test]
+    fn test_sanitize_price_tolerance_paise_clamps_negative_to_zero() {
+        assert_eq!(sanitize_price_tolerance_paise(-1), 0);
+        assert_eq!(sanitize_price_tolerance_paise(i64::MIN), 0);
+        assert_eq!(sanitize_price_tolerance_paise(0), 0);
+        assert_eq!(sanitize_price_tolerance_paise(5), 5);
+    }
+
+    #[test]
+    fn test_no_data_wording_names_listing_errors_honestly() {
+        let (note, detail) = no_data_wording(false);
+        assert!(note.contains("prefix stayed empty"), "clean-list wording");
+        assert!(detail.contains("no BruteX files appeared"));
+        let (note, detail) = no_data_wording(true);
+        assert!(
+            note.contains("listing errors occurred"),
+            "list-error wording must not claim the prefix stayed empty"
+        );
+        assert!(!note.contains("stayed empty"));
+        assert!(detail.contains("listing errors occurred"));
+    }
+
+    #[test]
     fn test_parse_xverify_date_override_strict_fail_closed() {
         let (d, label) = parse_xverify_date_override("2026-07-10").expect("valid");
         assert_eq!(label, "2026-07-10");
@@ -1948,7 +2087,7 @@ mod tests {
             [null,"NSE_EQ","EQUITY","BAD","",null],
             [1,"","EQUITY","X","",null]
         ]}"#;
-        let rows = parse_lifecycle_dataset(body);
+        let rows = parse_lifecycle_dataset(body).expect("valid dataset body");
         assert_eq!(rows.len(), 2, "junk rows skipped fail-soft");
         assert_eq!(rows[0].symbol_name, "TCS");
         assert_eq!(rows[0].expiry_ymd, None);
@@ -1956,8 +2095,21 @@ mod tests {
         // 1_785_283_200_000_000 micros = epoch day 20_663 = 2026-07-29
         // (anchor: day 20_644 = 2026-07-10, pinned in test_ist_midnight_nanos).
         assert_eq!(rows[1].expiry_ymd.as_deref(), Some("2026-07-29"));
-        assert!(parse_lifecycle_dataset("not json").is_empty());
-        assert!(parse_lifecycle_dataset("{}").is_empty());
+    }
+
+    #[test]
+    fn test_parse_lifecycle_dataset_loud_on_malformed_or_missing_dataset() {
+        // Round-4 fix: malformed body / missing `dataset` key are typed
+        // errors (routed to the BRUTEX-XVERIFY-02 questdb_read degraded
+        // arm), never a silent empty mapping.
+        assert!(parse_lifecycle_dataset("not json").is_err());
+        assert!(parse_lifecycle_dataset("{}").is_err());
+        assert!(parse_lifecycle_dataset(r#"{"dataset":"nope"}"#).is_err());
+        // A genuine empty dataset stays Ok (a legitimately empty table).
+        assert_eq!(
+            parse_lifecycle_dataset(r#"{"dataset":[]}"#).expect("empty is ok"),
+            Vec::new()
+        );
     }
 
     #[test]
@@ -1966,12 +2118,24 @@ mod tests {
             [1783701900000000000,11536,"NSE_EQ",100.5,101.0,100.0,100.75,0,42],
             [1783701900000000000,null,"NSE_EQ",1,2,3,4,0,0]
         ]}"#;
-        let rows = parse_live_candles_dataset(body);
+        let rows = parse_live_candles_dataset(body).expect("valid dataset body");
         assert_eq!(rows.len(), 1, "null security_id skipped");
         assert_eq!(rows[0].minute_nanos, 1_783_701_900_000_000_000);
         assert_eq!(rows[0].security_id, 11_536);
         assert_eq!(rows[0].segment, "NSE_EQ");
         assert_eq!(rows[0].tick_count, 42);
+    }
+
+    #[test]
+    fn test_parse_live_candles_dataset_loud_on_malformed_or_missing_dataset() {
+        assert!(parse_live_candles_dataset("not json").is_err());
+        assert!(parse_live_candles_dataset("{}").is_err());
+        assert!(parse_live_candles_dataset(r#"{"dataset":42}"#).is_err());
+        assert!(
+            parse_live_candles_dataset(r#"{"dataset":[]}"#)
+                .expect("empty is ok")
+                .is_empty()
+        );
     }
 
     #[test]

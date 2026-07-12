@@ -757,7 +757,7 @@ pub async fn crossverify_page(
 }
 
 // ---------------------------------------------------------------------------
-// Tests (pure fns only — the I/O shell is TEST-EXEMPT per repo convention)
+// Tests (pure fns + handler round-trips against a mock QuestDB /exec server)
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
