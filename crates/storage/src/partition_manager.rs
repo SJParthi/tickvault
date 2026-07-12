@@ -106,6 +106,11 @@ pub(crate) const DAY_PARTITIONED_TABLES: &[&str] = &[
     // partitioning as cross_verify_1m_audit / feed_scoreboard_daily.
     "brutex_crossverify_cell_audit",
     "brutex_crossverify_daily",
+    // SPOT1M-01/02 (2026-07-12, per-minute REST pipeline PR-2): one row per
+    // fetched (minute, index) — ~1,125 rows/day (375 min × 3 IDX_I SIDs),
+    // trivial disk; same DAY partitioning + retention class as the
+    // daily-data tables above; `feed` is in the DEDUP key.
+    "spot_1m_rest",
 ];
 
 /// Tables EXEMPT from retention sweeping — NEVER detached or dropped.

@@ -471,3 +471,15 @@ max_keys                 = 2000     # listed-key cap per day
 fetch_attempts_per_object = 3
 price_tolerance_paise    = 0        # exact match (inclusive <= compare)
 compare_volume           = false    # groww live volume is always 0
+
+# ===========================================================================
+# Per-minute spot 1m REST pipeline (operator grant 2026-07-12 — PR-2, the
+# SPOT half). Every trading-day minute close in [09:16:00, 15:30:00] IST,
+# fetch the just-closed minute's official 1m OHLCV for the 3 IDX_I spot
+# indices (NIFTY 13 / BANKNIFTY 25 / SENSEX 51) via Dhan POST
+# /v2/charts/intraday and persist to the spot_1m_rest table. Cold path;
+# the WS candle pipeline is untouched. An ABSENT section = disabled
+# (fail-safe); `enabled = false` is the rollback switch.
+# ===========================================================================
+[spot_1m_rest]
+enabled = true

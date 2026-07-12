@@ -41,6 +41,11 @@ pub mod orphan_position_watchdog_boot;
 // GET /v2/profile at 09:05 / 12:00 / 15:25 IST, pages HIGH with the captured
 // (bounded, secret-redacted) body + final URL on any non-2xx.
 pub mod rest_canary_boot;
+// Per-minute spot 1m REST pipeline (operator grant 2026-07-12, PR-2 — the
+// SPOT half): fetch each just-closed session minute's official 1m OHLCV
+// for the 3 IDX_I spot indices via POST /v2/charts/intraday and persist to
+// the `spot_1m_rest` table (SPOT1M-01/02).
+pub mod spot_1m_rest_boot;
 // Dual-feed scoreboard PR-A (operator 2026-07-10): boot-time process-death
 // reconciler + the 15:45 IST daily Dhan-vs-Groww aggregation + the Telegram
 // scorecard summary (SCOREBOARD-01 family).

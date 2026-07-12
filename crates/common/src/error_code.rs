@@ -928,6 +928,26 @@ pub enum ErrorCode {
     /// Severity::High, auto-triage-safe (the degrade already happened —
     /// the operator inspects; the next trading day re-runs).
     BrutexXverify02RunDegraded,
+    /// SPOT1M-01 (per-minute REST pipeline PR-2, operator grant 2026-07-12)
+    /// — the per-minute spot 1m REST fetch degraded: a whole minute failed
+    /// for one/all of the 3 IDX_I spot indices (transport error, non-2xx,
+    /// DH-904/429 after the bounded in-minute re-poll ladder, no token, or
+    /// a 200 whose body never carried the just-closed minute's candle —
+    /// `outcome="empty"`, counted, never silent). The ESCALATION emission
+    /// (the one that also pages the typed Telegram event) fires
+    /// edge-triggered after 3 consecutive fully-failed minutes; sub-edge
+    /// per-minute emissions are coalesced once per fire. Severity::High,
+    /// auto-triage-safe (the fetch already degraded; the next minute
+    /// re-attempts; the WS candle pipeline is untouched).
+    Spot1m01FetchDegraded,
+    /// SPOT1M-02 (per-minute REST pipeline PR-2, 2026-07-12) — the
+    /// `spot_1m_rest` QuestDB persist leg failed (ensure-DDL non-2xx /
+    /// unreachable, ILP append rejected, or the ILP-over-HTTP flush was
+    /// refused by the server ACK). Best-effort forensic write: the fetch
+    /// loop continues, rows stay buffered where possible, and re-appends
+    /// are DEDUP-idempotent (`ts, security_id, exchange_segment, feed`).
+    /// Severity::High, auto-triage-safe.
+    Spot1m02PersistFailed,
 }
 
 impl ErrorCode {
@@ -1114,6 +1134,9 @@ impl ErrorCode {
             // BruteX↔TickVault daily cross-verify (2026-07-12)
             Self::BrutexXverify01DivergenceFound => "BRUTEX-XVERIFY-01",
             Self::BrutexXverify02RunDegraded => "BRUTEX-XVERIFY-02",
+            // Per-minute spot 1m REST pipeline (operator grant 2026-07-12)
+            Self::Spot1m01FetchDegraded => "SPOT1M-01",
+            Self::Spot1m02PersistFailed => "SPOT1M-02",
         }
     }
 
@@ -1272,7 +1295,15 @@ impl ErrorCode {
             // rollback (a repeat at the same rung = the discovered
             // server-side cap).
             | Self::GrowwScale01RollbackFired
-            | Self::GrowwScale02GlobalHalve => Severity::High,
+            | Self::GrowwScale02GlobalHalve
+            // SPOT1M-01/02 (operator grant 2026-07-12) — the per-minute
+            // spot 1m REST fetch/persist degraded. High: the operator must
+            // see a failing exchange-record pull (the escalation is
+            // edge-triggered at 3 consecutive fully-failed minutes); never
+            // a halt — the WS candle pipeline is untouched and re-appends
+            // are DEDUP-idempotent.
+            | Self::Spot1m01FetchDegraded
+            | Self::Spot1m02PersistFailed => Severity::High,
             // FUTIDX-01/02 (§36 2026-07-08) — per-underlying selection degrade
             // / cross-feed expiry divergence. Loud (Telegram High), never a
             // halt; the spot universe + both live feeds are unaffected.
@@ -1586,6 +1617,10 @@ impl ErrorCode {
             Self::BrutexXverify01DivergenceFound | Self::BrutexXverify02RunDegraded => {
                 ".claude/rules/project/brutex-crossverify-error-codes.md"
             }
+            // Per-minute spot 1m REST pipeline (operator grant 2026-07-12)
+            Self::Spot1m01FetchDegraded | Self::Spot1m02PersistFailed => {
+                ".claude/rules/project/rest-1m-pipeline-error-codes.md"
+            }
         }
     }
 
@@ -1797,6 +1832,9 @@ impl ErrorCode {
             // BruteX↔TickVault daily cross-verify (2026-07-12)
             Self::BrutexXverify01DivergenceFound,
             Self::BrutexXverify02RunDegraded,
+            // Per-minute spot 1m REST pipeline (operator grant 2026-07-12)
+            Self::Spot1m01FetchDegraded,
+            Self::Spot1m02PersistFailed,
         ]
     }
 }
@@ -2142,7 +2180,11 @@ mod tests {
         // High, NOT auto-triage-safe: a data-comparability signal is never
         // auto-actioned) + BRUTEX-XVERIFY-02 (run degraded — S3/CSV/QuestDB
         // leg failed; keep-better guard + DEDUP-idempotent re-run backfills).
-        assert_eq!(ErrorCode::all().len(), 140);
+        // 2026-07-12 (per-minute spot 1m REST pipeline PR-2): bumped
+        // 140 -> 142 for SPOT1M-01 (per-minute spot fetch degraded — edge-
+        // triggered escalation) + SPOT1M-02 (spot_1m_rest persist failed —
+        // best-effort, DEDUP-idempotent re-append).
+        assert_eq!(ErrorCode::all().len(), 142);
     }
 
     #[test]
@@ -2361,7 +2403,9 @@ mod tests {
                 // Dual-feed scoreboard PR-A (2026-07-10).
                 || s.starts_with("SCOREBOARD-")
                 // BruteX↔TickVault daily cross-verify (2026-07-12).
-                || s.starts_with("BRUTEX-XVERIFY-");
+                || s.starts_with("BRUTEX-XVERIFY-")
+                // Per-minute spot 1m REST pipeline (operator grant 2026-07-12).
+                || s.starts_with("SPOT1M-");
             assert!(has_known_prefix, "unexpected code prefix: {s}");
         }
     }

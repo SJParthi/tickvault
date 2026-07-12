@@ -91,6 +91,14 @@ pub struct ApplicationConfig {
     /// `enabled = false` is the whole-subsystem rollback switch (B12).
     #[serde(default)]
     pub brutex_crossverify: BrutexCrossverifyConfig,
+    /// `[spot_1m_rest]` — per-minute spot 1m REST pipeline (operator grant
+    /// 2026-07-12, `no-rest-except-live-feed-2026-06-27.md` §8): every
+    /// trading-day minute close in session, fetch that just-closed minute's
+    /// official 1m OHLCV for the 3 IDX_I spot indices via Dhan
+    /// `POST /v2/charts/intraday` and persist to `spot_1m_rest`. Absent
+    /// section ⇒ DISABLED (fail-safe default off).
+    #[serde(default)]
+    pub spot_1m_rest: Spot1mRestConfig,
 }
 
 /// `[feeds]` — pluggable market-data feed selection (operator lock
@@ -456,6 +464,28 @@ impl Default for BrutexCrossverifyConfig {
             compare_volume: default_brutex_xverify_compare_volume(),
         }
     }
+}
+
+/// `[spot_1m_rest]` — per-minute spot 1m REST pipeline (operator grant
+/// 2026-07-12; PR-2, the SPOT half). Cold path only — the WS candle
+/// pipeline is untouched.
+///
+/// Fail-safe shape: `enabled` is `#[serde(default)]` = `false`, so an
+/// absent `[spot_1m_rest]` section (or a TOML written before this PR)
+/// disables the fetcher entirely. `config/base.toml` explicitly sets
+/// `enabled = true`.
+///
+/// Extension point (PR-3, option chain): every FUTURE field on this
+/// struct MUST also be `#[serde(default)]` so older TOMLs keep
+/// deserializing byte-identically — nothing chain-specific ships in
+/// PR-2; the chain PR adds its own knobs here without a config-surface
+/// break (the `GrowwFeedTuning` sub-table precedent).
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct Spot1mRestConfig {
+    /// Master switch for the per-minute spot 1m REST fetcher. Default
+    /// OFF (fail-safe) — `config/base.toml` turns it on explicitly.
+    #[serde(default)]
+    pub enabled: bool,
 }
 
 impl Default for GrowwScaleConfig {
@@ -2292,6 +2322,7 @@ mod tests {
             feeds: FeedsConfig::default(),
             scoreboard: ScoreboardConfig::default(),
             brutex_crossverify: BrutexCrossverifyConfig::default(),
+            spot_1m_rest: Spot1mRestConfig::default(),
         }
     }
 
@@ -3684,6 +3715,45 @@ mod tests {
             .extract()
             .expect("missing [brutex_crossverify] must default");
         assert!(!missing.brutex_crossverify.enabled);
+    }
+
+    /// Per-minute spot 1m REST pipeline (operator grant 2026-07-12): the
+    /// `[spot_1m_rest]` section is FAIL-SAFE default OFF — via `Default`,
+    /// via a missing section, and via an empty section — and an explicit
+    /// `enabled = true` (the `config/base.toml` shape) must round-trip.
+    #[test]
+    fn test_spot_1m_rest_config_defaults_off_and_round_trips() {
+        use figment::Figment;
+        use figment::providers::{Format, Toml};
+
+        assert!(
+            !Spot1mRestConfig::default().enabled,
+            "spot_1m_rest must default OFF (fail-safe; base.toml opts in)"
+        );
+
+        #[derive(Deserialize)]
+        struct Wrapper {
+            #[serde(default)]
+            spot_1m_rest: Spot1mRestConfig,
+        }
+        // Missing section entirely → disabled, never an error.
+        let missing: Wrapper = Figment::new()
+            .merge(Toml::string("[other]\nx = 1\n"))
+            .extract()
+            .expect("missing [spot_1m_rest] must default, not error");
+        assert!(!missing.spot_1m_rest.enabled);
+        // Empty section (no keys) → disabled via the field-level default.
+        let empty: Wrapper = Figment::new()
+            .merge(Toml::string("[spot_1m_rest]\n"))
+            .extract()
+            .expect("empty [spot_1m_rest] must default, not error");
+        assert!(!empty.spot_1m_rest.enabled);
+        // Explicit ON (the base.toml shape) round-trips.
+        let on: Wrapper = Figment::new()
+            .merge(Toml::string("[spot_1m_rest]\nenabled = true\n"))
+            .extract()
+            .expect("explicit enabled = true must round-trip");
+        assert!(on.spot_1m_rest.enabled);
     }
 
     /// A missing `[feeds]` section must fall back to the safe default

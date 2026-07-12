@@ -14650,6 +14650,33 @@ fn spawn_post_market_tasks(
         });
         info!("rest_canary: REST-health probe task spawned (09:05 / 12:00 / 15:25 IST)");
     }
+
+    // Operator grant 2026-07-12 (PR-2, the SPOT half): per-minute spot 1m
+    // REST pipeline — every trading-day minute close in [09:16:00, 15:30:00]
+    // IST, fetch the just-closed minute's official 1m OHLCV for the 3 IDX_I
+    // spot indices via POST /v2/charts/intraday and persist to the
+    // `spot_1m_rest` table (SPOT1M-01/02). Spawned from BOTH boot paths via
+    // this shared Dhan-gated site (Dhan-REST-dependent — token; a Groww-only
+    // session correctly runs none). Config-gated fail-safe: an absent
+    // `[spot_1m_rest]` section disables it. Supervised respawn wrapper;
+    // self-skips on non-trading days / past 15:30 IST (audit Rule 3).
+    if config.spot_1m_rest.enabled {
+        let _spot1m_supervisor = tickvault_app::spot_1m_rest_boot::spawn_supervised_spot_1m_rest(
+            tickvault_app::spot_1m_rest_boot::Spot1mRestTaskParams {
+                token_handle: std::sync::Arc::clone(&token_handle),
+                notifier: notifier.clone(),
+                calendar: std::sync::Arc::clone(&trading_calendar),
+                questdb: config.questdb.clone(),
+                rest_api_base_url: config.dhan.rest_api_base_url.clone(),
+            },
+        );
+        info!(
+            "spot_1m_rest: per-minute spot 1m REST pipeline spawned \
+             (fires each minute close 09:16:00–15:30:00 IST)"
+        );
+    } else {
+        info!("spot_1m_rest: disabled by config — per-minute spot fetch not spawned");
+    }
 }
 
 /// Daily 15:40 IST tick-conservation audit — PROCESS-GLOBAL (2026-07-02
