@@ -198,6 +198,10 @@ pub mod shadow_seal_columns;
 // Per-minute spot 1m REST pipeline (operator grant 2026-07-12, PR-2 — the
 // SPOT half; SPOT1M-02): the `spot_1m_rest` table DDL + ILP-over-HTTP writer.
 pub mod spot_1m_rest_persistence;
+// Per-minute option-chain REST pipeline (operator grant 2026-07-12, PR-3 —
+// the OPTION-CHAIN half; CHAIN-03): the `option_chain_1m` table DDL +
+// ILP-over-HTTP writer.
+pub mod option_chain_1m_persistence;
 // B6 (2026-07-03): off-thread tick ILP flush worker — keeps the blocking
 // questdb TCP flush off the tick-consumer thread (TICK-FLUSH-01).
 pub(crate) mod tick_flush_worker;
