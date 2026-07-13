@@ -51,6 +51,8 @@ drift/missing-tick problem against an independent second source.
 
 ## §2. The pluggable-feed contract (LOCKED)
 
+> **⚠ 2026-07-13:** the "#1 Dhan … Default **ON** (unchanged)" row and the run-mode table's "Today / prod default: dhan=true" are SUPERSEDED — the Dhan live WS is retired (operator directive 2026-07-13, verbatim in `websocket-connection-scope-lock.md`'s 2026-07-13 banner); prod default is now `dhan_enabled = false` + `groww_enabled = true` (Groww is the sole live feed; Dhan is REST-only).
+
 | Feed | Provider | Default | Connection | Reuses tickvault resilience chain | Writes to |
 |---|---|---|---|---|---|
 | **#1 Dhan** | Dhan | **ON** (unchanged) | ≤2 WS (main-feed + order-update) | yes (existing) | `ticks`, `candles_*`, audit tables (UNCHANGED) |
