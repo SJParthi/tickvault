@@ -1433,7 +1433,7 @@ mod tests {
     /// realistic cost is the paced gaps: the 2026-07-13 incident cohort of
     /// 91 ≈ 45 s + 91 × 334 ms ≈ 75 s). No unbounded loops anywhere.
     #[test]
-    fn test_second_pass_duration_bound_is_linear_and_bounded() {
+    fn test_second_pass_duration_bound_ms_is_linear_and_bounded() {
         assert_eq!(
             second_pass_duration_bound_ms(0),
             RETRY_429_COOLDOWN_SECS * 1_000
