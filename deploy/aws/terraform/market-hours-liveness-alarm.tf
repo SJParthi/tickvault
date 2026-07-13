@@ -365,19 +365,20 @@ resource "aws_lambda_function" "tv_market_hours_liveness_gate" {
       # set_alarm_state(OK) below resets any stale pre-open ALARM at window
       # open (edge-triggered — no false-page carry-over into the armed
       # window).
+      # PR-C2 (2026-07-13): realtime-guarantee-critical/-degraded +
+      # ws-pool-all-dead + ws-failed-connections left this list — their
+      # alarms were RETIRED with the Dhan live-WS lane (emitters deleted;
+      # see app-alarms.tf / silent-feed-alarms.tf dated notes). The gate now
+      # arms 8 alarms.
       ALARM_NAMES = join(",", [
         aws_cloudwatch_metric_alarm.market_hours_liveness_missing.alarm_name,
-        aws_cloudwatch_metric_alarm.realtime_guarantee_critical.alarm_name,
         aws_cloudwatch_metric_alarm.aggregator_no_seals.alarm_name,
         aws_cloudwatch_metric_alarm.order_update_reconnect_storm.alarm_name, # 2026-07-06 flapper alarm
         aws_cloudwatch_metric_alarm.app_log_ingestion_silent.alarm_name,
         aws_cloudwatch_metric_alarm.tick_gap_instruments_silent.alarm_name,
-        aws_cloudwatch_metric_alarm.realtime_guarantee_degraded.alarm_name,
         aws_cloudwatch_metric_alarm.boundary_catchup_storm_dhan.alarm_name,
         aws_cloudwatch_metric_alarm.dhan_exchange_lag_p99_high.alarm_name,
         aws_cloudwatch_metric_alarm.groww_exchange_lag_p99_high.alarm_name, # 2026-07-11 scoreboard PR-C
-        aws_cloudwatch_metric_alarm.ws_pool_all_dead.alarm_name,            # 2026-07-10 deferral false-page fix
-        aws_cloudwatch_metric_alarm.ws_failed_connections.alarm_name,       # 2026-07-10 deferral false-page fix
       ])
       # Weekday-NSE-holiday safety: the open path skips enabling when this
       # instance is not up (holiday-gate.sh self-stop). Referencing
