@@ -39,8 +39,13 @@
 //!   page (§36.7).
 //!
 //! COLD PATH — every function here runs once per feed per boot/activation.
-
-#![cfg(feature = "daily_universe_fetcher")]
+//!
+//! PR-C1 (2026-07-13): the module-level `daily_universe_fetcher` gate was
+//! REMOVED per the daily-universe 2026-07-13 banner §(d) — the §36.7 GROWW
+//! futures leg STANDS after the Dhan live-WS retirement, and this shared
+//! selector must not depend on a build feature (a future feature removal
+//! would silently drop the Groww futures — a scope violation). Ratchet:
+//! `tests::test_futidx_selector_is_not_feature_gated`.
 
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
@@ -564,6 +569,12 @@ fn record_selection_in(
 /// the §29 warm-snapshot boot path so BOTH boot paths produce the identical
 /// parity entry + boot-evidence lines (previously the warm path emitted
 /// neither until the background reconcile ran — and never, if it failed).
+///
+/// PR-C1 (2026-07-13): ITEM-level feature gate only — this Dhan-side helper
+/// consumes the feature-gated `DailyUniverse` and RETIRES with the Dhan
+/// instrument chain in Phase C3; the shared selector + Groww-consumed API of
+/// this module are deliberately ungated (banner §(d) de-gate).
+#[cfg(feature = "daily_universe_fetcher")]
 pub fn dhan_selections_from_universe(
     universe: &crate::instrument::daily_universe::DailyUniverse,
 ) -> Vec<FeedFutureSelection> {
@@ -599,7 +610,10 @@ pub fn dhan_selections_from_universe(
 // Thin recording wrapper — the global-recorder side effect is deliberately
 // NOT asserted from tests (see the recorder-test honesty note above
 // `record_selection_in`); the pure derivation + the recorder core are tested.
+// PR-C1 (2026-07-13): ITEM-level gate — Dhan-side helper, retires in C3
+// (see dhan_selections_from_universe above).
 // TEST-EXEMPT: thin wrapper over dhan_selections_from_universe (tested) + record_index_future_selection (tested)
+#[cfg(feature = "daily_universe_fetcher")]
 pub fn record_dhan_selection_from_universe(
     universe: &crate::instrument::daily_universe::DailyUniverse,
     trading_date_ist: NaiveDate,
@@ -691,6 +705,60 @@ pub fn record_index_future_selection(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// PR-C1 (2026-07-13) ratchet — daily-universe 2026-07-13 banner §(d):
+    /// this shared selector module must NEVER regain a MODULE-LEVEL
+    /// `daily_universe_fetcher` gate (a future removal of the feature would
+    /// silently drop the Groww §36.7 futures — a scope violation), and the
+    /// Groww extraction call chain in `feed/groww/instruments.rs` must stay
+    /// UNCONDITIONAL. The two Dhan-side `DailyUniverse` helpers keep their
+    /// documented ITEM-level gates until Phase C3 deletes them.
+    #[test]
+    fn test_futidx_selector_is_not_feature_gated() {
+        // (a) No inner module-level gate in THIS file (the `#![cfg(...)]`
+        //     form that gated the whole module pre-C1).
+        let own_src = include_str!("index_futures.rs");
+        assert!(
+            !own_src.contains(concat!("#![cfg(feature = \"daily_universe_fetcher\")", "]")),
+            "index_futures.rs regained a module-level daily_universe_fetcher gate — \
+             the Groww §36.7 futures mandate must not depend on a build feature"
+        );
+        // (b) The mod.rs declaration is ungated: the `pub mod index_futures;`
+        //     line must NOT be immediately preceded by a cfg attribute.
+        let mod_src = include_str!("mod.rs");
+        let decl = mod_src
+            .find("pub mod index_futures;")
+            .expect("mod.rs declares index_futures"); // APPROVED: test
+        let preceding_line = mod_src[..decl].trim_end().rsplit('\n').next().unwrap_or(""); // APPROVED: test
+        assert!(
+            !preceding_line.contains("cfg(feature"),
+            "mod.rs re-gated `pub mod index_futures;` behind a feature \
+             (preceding line: {preceding_line:?})"
+        );
+        // (c) The Groww extraction site is unconditional: no cfg attribute
+        //     directly precedes `pub fn extract_index_future_entries(`.
+        let groww_src = include_str!("../feed/groww/instruments.rs");
+        let extract = groww_src
+            .find("pub fn extract_index_future_entries(")
+            .expect("groww instruments declares extract_index_future_entries"); // APPROVED: test
+        // Scan the attribute/doc block above the fn (up to 6 lines) for a
+        // feature gate — `#[must_use]` is fine, `#[cfg(feature = ...)]` is not.
+        let above: Vec<&str> = groww_src[..extract]
+            .trim_end()
+            .rsplit('\n')
+            .take(6)
+            .collect();
+        assert!(
+            above.iter().all(|l| !l.contains("cfg(feature")),
+            "extract_index_future_entries regained a feature gate — the Groww \
+             futures extraction must be unconditional (lines above: {above:?})"
+        );
+        // (d) The dead empty-futures fallback stayed dead.
+        assert!(
+            !groww_src.contains("futures require the shared selector (feature-gated)"),
+            "the not(feature) empty-futures fallback returned to instruments.rs"
+        );
+    }
 
     fn d(s: &str) -> NaiveDate {
         NaiveDate::parse_from_str(s, "%Y-%m-%d").expect("test date")
@@ -1019,6 +1087,9 @@ mod tests {
     /// Hostile-review round 2 (2026-07-08, F4): the warm/cold-shared
     /// derivation is empty on a futures-less universe and skips targets
     /// whose expiry is unparsable — never panics, never invents a selection.
+    /// PR-C1 (2026-07-13): feature-gated WITH its subject — the Dhan-side
+    /// `DailyUniverse` helper keeps an item-level gate until Phase C3.
+    #[cfg(feature = "daily_universe_fetcher")]
     #[test]
     fn test_dhan_selections_from_universe_empty_without_future_targets() {
         use crate::instrument::daily_universe::DailyUniverse;
