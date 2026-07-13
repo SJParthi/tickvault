@@ -666,6 +666,7 @@ pub fn collect_fut_underlying_symbols_seen(rows: &[GrowwInstrumentRow]) -> Vec<S
 /// day's selection naturally). `None` when the master carries no usable
 /// option row for the underlying (the caller degrades that underlying
 /// for the day — NEVER a guessed expiry). Pure.
+#[cfg(feature = "daily_universe_fetcher")]
 #[must_use]
 pub fn select_current_option_expiry(
     rows: &[GrowwInstrumentRow],
@@ -2271,6 +2272,7 @@ mod tests {
 
     /// Option-row struct literal for the expiry-selection tests (PR-3):
     /// the chain leg's expiry source is the master's CE/PE rows.
+    #[cfg(feature = "daily_universe_fetcher")]
     fn option_row(
         exchange: &str,
         underlying: &str,
@@ -2294,6 +2296,7 @@ mod tests {
     /// The chain leg's expiry selection: nearest CE/PE expiry at-or-after
     /// today, per (exchange, canonical underlying) — FUT rows and other
     /// underlyings/exchanges never leak in; malformed expiries skip.
+    #[cfg(feature = "daily_universe_fetcher")]
     #[test]
     fn test_select_current_option_expiry_nearest_at_or_after_today() {
         let today = chrono::NaiveDate::from_ymd_opt(2026, 7, 13).expect("date");
@@ -2339,6 +2342,7 @@ mod tests {
     /// trading day (T+1) rolls to the next listed expiry naturally; a
     /// master whose every expiry is past yields None (degrade, never a
     /// guess) — as does a master with NO option rows for the underlying.
+    #[cfg(feature = "daily_universe_fetcher")]
     #[test]
     fn test_select_current_option_expiry_expiry_day_t0_holds_t1_rolls() {
         let rows = vec![

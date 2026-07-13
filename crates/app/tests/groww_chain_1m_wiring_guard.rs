@@ -252,9 +252,16 @@ fn ratchet_groww_chain1m_strike_is_parse_only_never_computed() {
         "groww_option_chain_1m_boot.rs lost the parse-only strike site — \
          strikes must come ONLY from the response's string keys"
     );
-    // No arithmetic on strikes anywhere in the module (comment lines are
-    // stripped so doc-comment prose never false-positives).
-    let code: String = module_src
+    // No arithmetic on strikes anywhere in the PRODUCTION region (split at
+    // `#[cfg(test)]` — the house pattern: the module's own unit-test
+    // float-compare assertions like `(ce.strike - X).abs()` must never
+    // false-positive); comment lines are stripped so doc-comment prose
+    // never matches.
+    let production_region = module_src
+        .split("#[cfg(test)]")
+        .next()
+        .unwrap_or(module_src.as_str());
+    let code: String = production_region
         .lines()
         .filter(|l| !l.trim_start().starts_with("//"))
         .collect::<Vec<_>>()
