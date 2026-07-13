@@ -247,6 +247,14 @@ resource "aws_iam_role_policy" "tv_instance" {
         Resource = "*"
       },
       {
+        # S3 cold-bucket access for the box. Consumers (2026-07-13 audit):
+        #   - partition manager S3 archival (partitions/* — the designed >90d
+        #     cold-tier leg; STORAGE-GAP-04)
+        #   - BruteX cross-verify CSV read (crossverify/* — §37 KEEP class)
+        #   - Groww NDJSON capture archival (groww-capture/* — added 2026-07-13
+        #     with the disk-retention hardening PR; s3:PutObject + s3:GetObject
+        #     for head-object verification are ALREADY covered by this
+        #     whole-bucket statement, so no new statement was needed)
         Effect = "Allow"
         Action = [
           "s3:GetObject",
