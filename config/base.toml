@@ -488,12 +488,16 @@ enabled = true
 # right after the spot leg — the FULL current-expiry option chain for the
 # 3 underlyings is pulled via POST /v2/optionchain and persisted to the
 # option_chain_1m table. Cold path; the WS pipeline is untouched.
-# DEFAULT-OFF pending the live entitlement probe (the account had no
-# Option Chain Data-API entitlement in June 2026 — DH-902/806 class).
-# While disabled, probe_and_report = true runs ONE boot-time expirylist
-# probe and reports the verdict via Telegram; the pipeline NEVER auto-runs
-# — the operator flips `enabled = true` after an entitled verdict.
+# Shipped DEFAULT-OFF pending the live entitlement probe (the account had
+# no Option Chain Data-API entitlement in June 2026 — DH-902/806 class).
+# 2026-07-13: the first-live-boot probe PASSED at 08:31:49 IST ("entitlement
+# probe PASSED — chain data is available", NIFTY, 18 expiries — CloudWatch
+# /tickvault/prod/app) → enabled per the dated operator note recorded in
+# no-rest-except-live-feed-2026-06-27.md §8.7. probe_and_report stays true
+# (inert while enabled — the boot probe only runs when the pipeline is
+# disabled; keeping it true preserves the probe as the automatic fallback
+# canary if `enabled` is ever rolled back).
 # ===========================================================================
 [option_chain_1m]
-enabled = false  # pending live entitlement probe
+enabled = true  # entitlement proven live 2026-07-13 08:31:49 IST (§8.7)
 probe_and_report = true

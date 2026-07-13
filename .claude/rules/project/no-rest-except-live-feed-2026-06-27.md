@@ -120,7 +120,7 @@ Two narrowly-scoped, SCHEDULED market-data REST pulls join the KEEP set: (a) a *
 | Endpoint | Scope (LOCKED) | Cadence | Destination table | Gate |
 |---|---|---|---|---|
 | `POST /v2/charts/intraday` (interval `"1"`) | 3 IDX_I spot SIDs ONLY: NIFTY=13, BANKNIFTY=25, SENSEX=51 | once per minute close, [09:15, 15:30) IST trading days | `spot_1m_rest` ONLY (never `ticks`/`candles_*`/`historical_candles`) | `[spot_1m_rest]` config; enabled in base.toml, serde default OFF |
-| `POST /v2/optionchain` + `POST /v2/optionchain/expirylist` | the SAME 3 underlyings, CURRENT (nearest) expiry only; expirylist once at day start | chain once per minute, SEQUENCED after the spot fetch; 1 unique req/3s honored (3 distinct underlyings concurrent); `client-id` header required | `option_chain_1m` ONLY | `[option_chain_1m]` config — **DEFAULT-OFF** pending the first-live-boot entitlement probe |
+| `POST /v2/optionchain` + `POST /v2/optionchain/expirylist` | the SAME 3 underlyings, CURRENT (nearest) expiry only; expirylist once at day start | chain once per minute, SEQUENCED after the spot fetch; 1 unique req/3s honored (3 distinct underlyings concurrent); `client-id` header required | `option_chain_1m` ONLY | `[option_chain_1m]` config — shipped **DEFAULT-OFF** pending the first-live-boot entitlement probe; **flipped ON 2026-07-13 after the probe PASSED live (§8.7)** |
 
 ## §8.3 Probe outcome (2026-07-12, recorded honestly)
 
@@ -148,6 +148,20 @@ Any such PR MUST be rejected in review even if the operator approves verbally �
 ## §8.6 Auto-driver / Insta-reel explanation
 
 > Sir, the juice shop's LIVE price board keeps shouting as before — nothing changes there. NEW: once every minute, exactly when the minute hand ticks, the boy makes ONE quick phone call to the supplier for the OFFICIAL last-minute price card of just the 3 big baskets (NIFTY, BANKNIFTY, SENSEX) and files it in a brand-new drawer. Right after that call, he makes a second call for the option-coupon price sheet of the same 3 baskets — but that second phone stays UNPLUGGED until we confirm the supplier will actually answer it (last time they refused). Six-ish short calls a minute, filed in two new drawers, never touching the live board or the old drawers.
+
+## §8.7 — 2026-07-13: entitlement probe PASSED live → `[option_chain_1m].enabled` flips to true (dated note) + spot window hotfix recorded
+
+**Entitlement evidence (Verified, CloudWatch `/tickvault/prod/app`, quoted verbatim):** the first live boot's entitlement probe PASSED at **08:31:49 IST on 2026-07-13** —
+> `"option_chain_1m: entitlement probe PASSED — chain data is available; pipeline stays OFF until the config is flipped (the Telegram body carries the plain-English action; the exact key lives HERE)","symbol":"NIFTY","expiries":18,"config_key":"[option_chain_1m].enabled"`
+
+— i.e. `POST /v2/optionchain/expirylist` answered for the granted underlyings (18 expiries returned for NIFTY; the chain data plan is entitled).
+
+**Authorization (VERBATIM, relayed via the coordinator session, 2026-07-13):**
+> "flip [option_chain_1m] enabled=true — the boot entitlement probe PASSED this morning (08:31:49, 'chain data is available'), and the operator's standing directive demands the chain live; make sure the chain still fires via the 2.5s fallback when the spot fetch fails so one broken leg never silences the other"
+
+Per that relayed directive (rooted in the operator's standing 2026-07-12 §8.0 grant — chain data live once entitled), and with the entitlement now PROVEN LIVE above, `config/base.toml [option_chain_1m].enabled` flips `false → true` (PR carrying this note). The 2.5 s fallback demand in the quote is VERIFIED, not assumed: the spot leg publishes its minute-done signal unconditionally after every fire (success or failure — pinned by `option_chain_1m_wiring_guard`), and the chain's `test_wait_until_chain_fire_signal_wakes_early_and_fallback_bounds` arms (a)–(e) prove the no-receiver / stale-signal / dropped-sender / pre-satisfied cases all bound to the fallback timer — one broken leg never silences the other. This satisfies the §8.5 REJECT row ("Ships `[option_chain_1m]` DEFAULT-ON before the entitlement is proven live AND a fresh dated operator quote is recorded here") — both conditions are now met and recorded HERE first, in the same PR as the flip. The serde DEFAULT stays OFF (fail-safe: an absent section still means disabled); `probe_and_report` stays true (inert while enabled; the automatic fallback canary on any rollback). Everything else in §8.2's scope table — 3 underlyings, current expiry only, per-minute cadence, `option_chain_1m` table only — is UNCHANGED.
+
+**Same-day spot-window hotfix (recorded for §8.2 accuracy):** the spot half's FIRST live session (2026-07-13) failed every minute (`SPOT1M-01`, `ok=0/errors=0/empty=3` from 09:16 IST — Dhan answered `2xx` without the target candle) because the fetcher used a same-date `[minute open, open+60s]` request window, a shape never live-proven. The fix (same PR) switches each per-minute fire to the ONLY live-proven window shape — day-granular `fromDate = D 00:00:00, toDate = D+1 00:00:00` (the exact body the 15:31 cross-verify + prev-day fetchers use) — with client-side filtering to the exact minute, plus a previous-minute backfill on every fire AND one bounded post-session sweep (~15:31 IST) that repairs any session minute still missing above the per-SID persisted watermark (DEDUP-idempotent re-appends; the sweep is what gives the final 15:29 candle a repair path). Cadence, SIDs, table, and budget are UNCHANGED (still 3 requests per minute close; a full-day body is ~20 KB, far inside the 2 MiB cap and the Data-API budget) — this is a request-SHAPE correction inside the existing §8 grant, not a scope change.
 
 ---
 
