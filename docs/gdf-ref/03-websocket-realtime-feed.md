@@ -1,7 +1,7 @@
 # GDF 03 — WebSocket Realtime Feed (SubscribeRealtime)
 
 > **Source:** https://globaldatafeeds.in/global-datafeeds-apis/global-datafeeds-apis/websockets-api-documentation/function-subscriberealtime/ · …/introduction/type-of-data-available/ · …/documentation-support/api-fields-description/
-> **Fetched:** 2026-07-13 · **Evidence tier:** CLIENT-LIB-SOURCE(wsgfdl-py@1.3.5 :: gfdlws/realtime.py + README) + GITHUB-SAMPLE(js-2020, dhelm-2018) + SEARCH (doc-page prose). Verbatim JSON from official artifacts.
+> **Fetched:** 2026-07-13 · **Evidence tier:** **LIVE-DOC (the function-subscriberealtime page — operator-pasted from a live browser 2026-07-13; see §3b)** + CLIENT-LIB-SOURCE(wsgfdl-py@1.3.5 :: gfdlws/realtime.py + README) + GITHUB-SAMPLE(js-2020, dhelm-2018) + SEARCH (other doc-page prose). Verbatim JSON from official artifacts + the live paste (preserved at the coordinator scratchpad `gdf-live-subscriberealtime-paste.md`).
 
 ---
 
@@ -14,7 +14,7 @@ One request PER SYMBOL — "If you want to subscribe to data of multiple symbols
 ```
 
 Unsubscribe = the SAME message with `"Unsubscribe":"true"`. Notes:
-- `Unsubscribe` is a **string** `"true"/"false"`, not a JSON bool (official SDK). The JS sample omits it entirely (default = subscribe). Optional-and-case-tolerant treatment **Assumed** — verify live (U-16).
+- `Unsubscribe` is a **string** `"true"/"false"`, not a JSON bool (official SDK). **LIVE-DOC confirmation (2026-07-13 paste):** the live page lists `Unsubscribe | [true]/[false], default = [false] | Optional. If [true], instrumentIdentifier is unsubscribed` — optionality Verified for THIS function; cross-function case tolerance still Assumed (U-16). The live sample request omits it: `{ MessageType: "SubscribeRealtime", Exchange: "NFO", InstrumentIdentifier: "NIFTY-I" }`.
 - `Exchange` mandatory; supported values per GFDL comment: `NSE, NSE_IDX, NFO, CDS, MCX` (BSE family on entitled keys — see 01 §2).
 - `InstrumentIdentifier` accepts all 3 formats (continuous `NIFTY-I`, long `FUTIDX_NIFTY_30JUL2020_XX_0`, contractwise `NIFTY20JULFUT`) + index display names (`NIFTY 50` on `NSE_IDX`) + cash symbols as-is (`BAJAJ-AUTO`, `RELCAPITAL.BE`) — full grammar in 06 §2. Special characters are sent as-is on WS (no encoding).
 - There is NO documented subscribe-ACK — the first `RealtimeResult` is the confirmation (Assumed; rejection-frame shape when the function/symbol is not entitled is **Unknown**, U-13).
@@ -23,7 +23,7 @@ Unsubscribe = the SAME message with `"Unsubscribe":"true"`. Notes:
 
 ## 2. Push cadence — 1 update per second per symbol (L1, conflated)
 
-- GDF's own docs: "returns market data every second (Bid/Ask/Trade)"; type-of-data page: "Realtime data updating at 1 second frequency … This is L1 data with single best Bid & Ask details." (SEARCH, Verified.)
+- GDF's own docs: "returns market data every second (Bid/Ask/Trade)" — **now LIVE-DOC Verified verbatim** (2026-07-13 operator paste of the function page; previously SEARCH-tier); type-of-data page: "Realtime data updating at 1 second frequency … This is L1 data with single best Bid & Ask details." (SEARCH, Verified.)
 - Each push is a **full-image** L1 tick (complete quote every time — no deltas/incremental encoding).
 - This is aligned with NSE's own non-colo vendor broadcast, which is itself ~1s snapshots ("MARKET FEED … Realtime Snapshot" per the NSE vendor spec) — so the 1s cadence is the distribution reality, not GDF-only conflation. "True tick-by-tick data with time-stamp of 1 second" (GDF desktop marketing) is internally contradictory marketing for the same 1s L1. See 12 §2.
 - Pushes flow from subscribe until market close. Whether EVERY symbol truly gets an update EVERY second under burst load: **Unknown** (U-17 — live probe).
@@ -39,6 +39,23 @@ Unsubscribe = the SAME message with `"Unsubscribe":"true"`. Notes:
 ```json
 {"Exchange":"NSE","InstrumentIdentifier":"SBIN","LastTradeTime":1536558991,"ServerTime":1536558991,"AverageTradedPrice":291.31,"BuyPrice":290.15,"BuyQty":5441,"Close":291.65,"High":293.25,"Low":289.15,"LastTradePrice":290.2,"LastTradeQty":323,"Open":290.65,"OpenInterest":0,"QuotationLot":0.0,"SellPrice":290.3,"SellQty":551,"TotalQtyTraded":7422459,"Value":2162236531.29,"PreOpen":false,"MessageType":"RealtimeResult"}
 ```
+
+## 3b. LIVE-DOC sample (2026-07-13 operator paste of the live page) — the pack's only LIVE-DOC evidence
+
+Live page sample response, verbatim ("Example of returned data in JSON format. This data is returned every second"):
+
+```json
+{"Exchange":"NFO","InstrumentIdentifier":"NIFTY-I","LastTradeTime":1776057749,"ServerTime":1776057749,"AverageTradedPrice":23689.38,"BuyPrice":23772.3,"BuyQty":325,"Close":24101.0,"High":23782.0,"Low":23625.0,"LastTradePrice":23775.0,"LastTradeQty":0,"Open":23748.0,"OpenInterest":18782270,"QuotationLot":65.0,"SellPrice":23775.0,"SellQty":975,"TotalQtyTraded":2596880,"Value":61518477134.4,"PreOpen":false,"PriceChange":-326.0,"PriceChangePercentage":-1.35,"OpenInterestChange":205335,"MessageType":"RealtimeResult"}
+```
+
+What the live page CONFIRMS (upgrades to LIVE-DOC/Verified):
+- 1/sec cadence wording verbatim: "returns market data every second (Bid/Ask/Trade)".
+- Epoch wording verbatim: "LastTradeTime, ServerTradeTime : These values are expressed as no. of seconds since Epoch time (i.e. 1st January 1970). Also known as Unix Time." ⚠ page prose TYPO: "ServerTradeTime" — the JSON field is `ServerTime`.
+- ARITH on the live sample: 1776057749 = 2026-04-13 10:52:29 IST (05:22:29 UTC) — in-session under the true-UTC reading (third independent confirmation); `PriceChange −326.0 = LastTradePrice 23775.0 − Close 24101.0` ✓ — `Close` = previous day's close, stated verbatim on the page ("Close (previous Day's Close)"), as is `OpenInterestChange` ("vs previous trading day's Close").
+- Full 2022-era field list is CURRENT: the page enumerates all 23 fields incl. `PriceChange`, `PriceChangePercentage`, `OpenInterestChange` (the fields absent in 2018) — glosses verbatim: ATP=VWAP, Value=Turnover, QuotationLot=Lot Size, BuyQty=Bid Size.
+- `LastTradeQty: 0` appears in a LIVE realtime sample (a quote-refresh second without a fresh trade print) — decoders must accept LTQ=0 on the stream, not only on quote pulls.
+- `LastTradeTime == ServerTime` in this sample (zero visible lag at capture).
+- NIFTY `QuotationLot` 65.0 in the 2026 sample (50.0 in the 2022 sample; 75.0 in the 2025 master row) — lot sizes CHANGE; never hardcode.
 
 ## 4. COMPLETE RealtimeResult field table
 

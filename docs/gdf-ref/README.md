@@ -9,18 +9,18 @@
 
 ## ⚠ ACCESS CONSTRAINT — read before trusting any tier label
 
-**globaldatafeeds.in was NOT directly fetchable from the research environment** (egress proxy returned 403 for the site, for web.archive.org, and for every relay). Therefore **NOTHING in this pack is labeled LIVE-DOC and nothing is labeled ARCHIVED** — those tiers were unattainable. Doc-page content was recovered two ways:
+**globaldatafeeds.in was NOT directly fetchable from the research environment** (egress proxy returned 403 for the site, for web.archive.org, and for every relay). Therefore almost nothing in this pack is labeled LIVE-DOC and nothing is labeled ARCHIVED. **Exception (2026-07-13, post-initial-draft): one page — the SubscribeRealtime function page — was pasted verbatim by the OPERATOR from a live browser and is labeled LIVE-DOC (operator-pasted); see `03` §3b.** All other doc-page content was recovered two ways:
 
 1. **Search-engine extraction** of the live pages (substantive, URL-cited, NOT byte-verbatim) → labeled **SEARCH**.
 2. **Official GFDL artifacts read as raw source**: four official PyPI packages (`Author-email: developer@globaldatafeeds.in`) and GFDL's official JavaScript sample + 2018 third-party client docs preserved verbatim in GitHub mirrors → labeled **CLIENT-LIB-SOURCE(pkg@ver)** / **GITHUB-SAMPLE**.
 
-All verbatim JSON in this pack comes from tier-2 artifacts and IS byte-exact. All doc-page prose comes from tier-1 and should be re-verified against the live pages before contracting.
+All verbatim JSON in this pack comes from tier-2 artifacts (plus the operator paste) and IS byte-exact. All SEARCH-tier prose should be re-verified against the live pages before contracting.
 
 ## Evidence-tier legend (header block on every section)
 
 | Tier | Meaning |
 |---|---|
-| `LIVE-DOC` | direct fetch of globaldatafeeds.in — **UNUSED (unattainable this research pass)** |
+| `LIVE-DOC` | live globaldatafeeds.in page content — unattainable by direct fetch; **used ONLY for operator-pasted live pages (2026-07-13: the SubscribeRealtime page, `03` §3b)** |
 | `ARCHIVED` | web.archive.org capture — **UNUSED (unattainable)** |
 | `SEARCH` | search-engine extraction of the named live page URL, 2026-07-13; substantive but not byte-verbatim |
 | `CLIENT-LIB-SOURCE(pkg@ver)` | read from an extracted OFFICIAL GFDL PyPI sdist: `wsgfdl-py@1.3.5` (2025-11-28, newest WS lib), `GFDLWS@0.0.4`, `ws-gfdl@1.1.0` (2022), `gfdl-rest@1.0.3`. Includes each package's official README with real captured server responses |
@@ -137,6 +137,14 @@ See per-topic files for full request/response detail. Presence key: JS = officia
 | GetExchangeSnapshotAfterMarket / GetLastQuoteOptionChainWithGreeks | server-side names (LimitationResult) | — | 11, 07 |
 | **StreamAllSymbols / StreamAllSnapshots** | Streaming API (docs only; wire unknown) | — | 10 |
 | Delayed twins (SubscribeSnapshot/GetSnapshot/GetHistory/GetExchangeSnapshot Delayed) | Delayed API | — | 01, 04 |
+
+## The CURRENT (2026) live docs tree — authoritative function inventory
+
+> **Source:** sidebar navigation of the live docs, captured in the 2026-07-13 operator paste of the SubscribeRealtime page · **Tier:** LIVE-DOC (operator-pasted).
+
+Top-level API sections in the 2026 docs: **WebSockets API, Streaming API, OptionChain API, Greeks API, Delayed API, GainersLosers, Volume Shockers, GetHolidays** — i.e. Greeks/OptionChain/Delayed/GainersLosers/VolumeShockers are SEPARATE top-level sections in 2026 (this pack's Greeks coverage in `07` remains CLIENT-LIB-SOURCE-tier and matches), the **Streaming API is confirmed as a live current section** (10), and **`GetHolidays` is a 2026 section NOT present in any mined SDK/sample — wire shape uncaptured** (see `99-UNKNOWNS.md` U-24).
+
+WebSockets API functions listed in the 2026 sidebar (26): How To Connect, Authenticate, SubscribeRealtime, SubscribeSnapshot, GetLastQuote, GetLastQuoteShort, GetLastQuoteShortWithClose, GetLastQuoteArray, GetLastQuoteArrayShort, GetLastQuoteArrayShortWithClose, GetSnapshot, GetHistory, GetHistoryAfterMarket, GetExchanges, GetInstrumentsOnSearch, GetInstruments, GetInstrumentTypes, GetProducts, GetExpiryDates, GetOptionTypes, GetStrikePrices, GetServerInfo, GetLimitation, GetMarketMessages, GetExchangeMessages, GetExchangeSnapshot — all covered by this pack; GetHistoryAfterMarket + GetMarketMessages/GetExchangeMessages existence in the CURRENT docs is thereby LIVE-DOC-confirmed. Remaining sidebar sections: REST API, DotNet API, COM API, Code Samples, API Fields Description, Symbol Naming Conventions, Diagnostic API Responses, Pricing & Sales, Contact, FAQs.
 
 ## What this pack prevents
 

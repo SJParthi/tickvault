@@ -29,7 +29,7 @@
 | U-21 | Confirm `TokenNumber` == the exchange's own numeric token (NSE/BSE/MCX token space) and its churn behavior on re-listings | both | identity Option A soundness (13 §4) | client (identity) |
 | U-22 | REST path for GetHistoryAfterMarket (no SDK class exists); and is the SDK's GetHistoryGreeks-posts-to-`GetHistory/` path a bug or server routing? Why is the REST GetHistoryGreeks response XML with DD-MM-YYYY timestamps? | probe | REST history integration | client (REST path only) |
 | U-23 | Confirm epoch-UTC timestamp convention on LIVE ticks for EVERY entitled exchange (verified by doc arithmetic for NSE-family only): compare `LastTradeTime` vs wall clock on NSE, NSE_IDX, NFO, MCX, BSE | probe | a hidden per-exchange IST-shift would corrupt every time key | client (time keys) |
-| U-24 | Delayed-API details (per-exchange delay values available, key model) · BSE_DEBT/NCDEX API coverage · .NET/COM docs (uncaptured) · the 2024 Python all-functions PDF (unfetched) · network-partition disconnect behavior (half-open socket detection beyond Echo silence) | both | completeness of secondary surfaces | none |
+| U-24 | Delayed-API details (per-exchange delay values available, key model) · BSE_DEBT/NCDEX API coverage · .NET/COM docs (uncaptured) · the 2024 Python all-functions PDF (unfetched) · network-partition disconnect behavior (half-open socket detection beyond Echo silence) · **`GetHolidays`** — a top-level section in the CURRENT 2026 docs tree (LIVE-DOC nav, operator paste 2026-07-13) absent from every mined SDK/sample: wire shape uncaptured | both | completeness of secondary surfaces | none |
 
 ## Priority ordering
 
