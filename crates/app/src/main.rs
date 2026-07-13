@@ -201,8 +201,17 @@ fn emit_boot_completed() {
 /// would false-NEGATIVE a feed that is legitimately still coming up. A bounded
 /// wait removes that race while keeping the honest end-state: a feed that never
 /// comes up correctly withholds the "alive" signal. Boot is cold path, so a
-/// bounded 60s poll is well inside every boot budget.
-const BOOT_COMPLETED_FEED_LIVENESS_WAIT_SECS: u64 = 60;
+/// bounded poll is well inside every boot budget.
+///
+/// WIDENED 60 -> 300 (2026-07-13, deploy-hang fix hostile-review round 1
+/// MEDIUM): the Groww lane flips running only after the watch-list BUILD
+/// succeeds — a merely-SLOW cold-boot build (>60s: CSV download + resolve on
+/// a cold cache) exhausted the old 60s window and withheld `tv_boot_completed`
+/// FOREVER, so the 08:40 IST boot-heartbeat alarm false-paged a HEALTHY boot.
+/// 300s comfortably covers a slow-but-good build while still paging honestly
+/// on a genuinely dead feed (the 08:30 boot + 300s ceiling resolves well
+/// before the 08:40 alarm evaluation).
+const BOOT_COMPLETED_FEED_LIVENESS_WAIT_SECS: u64 = 300;
 
 /// Poll cadence for the boot-completed feed-liveness wait.
 const BOOT_COMPLETED_FEED_LIVENESS_POLL_MS: u64 = 1000;
@@ -1823,6 +1832,41 @@ async fn main() -> Result<()> {
         }
     }
 
+    // =====================================================================
+    // PROCESS-GLOBAL systemd WATCHDOG=1 pinger (2026-07-13, deploy-hang fix
+    // hostile-review round 1 CRITICAL). The unit sets WatchdogSec=60, and
+    // BOTH pre-existing `notify_systemd_watchdog()` ping tasks
+    // (`spawn_heartbeat_watchdog`) are Dhan-gated: the FAST-arm spawn runs
+    // only on a dhan-enabled crash-recovery boot, and the slow-boot spawn
+    // lives INSIDE `start_dhan_lane` (lane-owned; a PR-E lane teardown
+    // aborts it). Sending READY=1 on a Dhan-OFF boot (the same-date
+    // deploy-hang fix) would therefore ARM the watchdog with NOBODY pinging
+    // -> systemd SIGABRTs the process at t+60s -> Restart=always loop ->
+    // StartLimitBurst hard-fail minutes after a deploy that reported
+    // success (Rule-11 false-OK), and the next 08:30 boot dies by ~08:40.
+    // This thin, FEED-AGNOSTIC, process-lifetime task pings every
+    // WATCHDOG_INTERVAL_SECS (30s) from the shared boot prefix, BEFORE any
+    // boot path can send READY=1 (both READY-capable arms — the FAST arm
+    // and the Dhan-OFF arm — sit below this line in source order; a
+    // source-scan ratchet pinning that ordering + the absence of any feed
+    // gate on this spawn must land with this fix). Extra pings alongside
+    // the lane-owned `spawn_heartbeat_watchdog` are harmless (each
+    // WATCHDOG=1 just resets the 60s timer); the lane-owned tasks keep
+    // their ownership semantics untouched — and this task ALSO closes the
+    // pre-existing PR-E hole where a runtime Dhan disable aborted the ONLY
+    // pinger of a watchdog-armed process. No-op outside systemd
+    // (`notify_systemd_watchdog` requires NOTIFY_SOCKET).
+    let _process_global_watchdog_pinger = tokio::spawn(async {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(
+            tickvault_app::boot_helpers::WATCHDOG_INTERVAL_SECS,
+        ));
+        interval.tick().await; // skip the immediate first tick
+        loop {
+            interval.tick().await;
+            infra::notify_systemd_watchdog();
+        }
+    });
+
     let fast_cache = token_cache::load_token_cache_fast();
     // PR #6b (2026-05-19): inlined `is_within_build_window` after retiring
     // instrument_loader.rs. The window (09:00:00..15:30:00 IST) matches the
@@ -3417,6 +3461,48 @@ async fn main() -> Result<()> {
         }
         None
     };
+
+    // =======================================================================
+    // Dhan-OFF boot completion signals (deploy-hang fix, 2026-07-13).
+    //
+    // The systemd unit is Type=notify with TimeoutStartSec=infinity: systemd
+    // releases the `systemctl restart tickvault` start job ONLY when the app
+    // sends sd_notify(READY=1). Both pre-existing notify sites are Dhan-gated
+    // — the FAST crash-recovery arm (filtered on `config.feeds.dhan_enabled`)
+    // and the slow-boot site inside `start_dhan_lane` — so the Phase-A
+    // `dhan_enabled=false` flip (#1496, 2026-07-13) left every prod boot
+    // stuck `activating` forever: the on-box deploy script's
+    // `systemctl restart tickvault` never returned, the SSM command never
+    // reached a terminal state, and the deploy workflow's wait budget expired
+    // into the auto-stop mid-script (runs 29269805430 / 29273283894 — every
+    // post-#1496 deploy failed identically). This arm sends READY=1 and the
+    // feed-liveness-gated `tv_boot_completed` (the 08:40 IST boot-heartbeat
+    // alarm's signal — equally lane-owned before this fix, so a Dhan-OFF boot
+    // would also have false-paged that alarm every morning) for the Dhan-OFF
+    // boot, mirroring the two existing sites. `dhan_poolless_idle=false`:
+    // with `dhan_enabled=false` the Dhan term of `boot_completed_should_emit`
+    // is vacuous and the gate genuinely waits (bounded — see
+    // BOOT_COMPLETED_FEED_LIVENESS_WAIT_SECS, widened 60->300 per the
+    // 2026-07-13 hostile-review MEDIUM: a merely-slow watch-list build must
+    // not withhold the metric forever) for the Groww lane — a Groww that
+    // never comes up still withholds the metric so the
+    // boot-heartbeat alarm pages (Rule 11, no false-OK). READY=1 is sent
+    // FIRST (unconditionally for this arm): systemd start-job release must
+    // never be held hostage to feed liveness — the PROCESS booted; feed
+    // health has its own alarms. No-op when NOTIFY_SOCKET is unset (local
+    // `cargo run` / Mac scale-test boots, which took this arm long before
+    // Phase A without ever running under systemd).
+    // =======================================================================
+    if !config.feeds.dhan_enabled {
+        infra::notify_systemd_ready();
+        emit_boot_completed_when_feed_live(
+            &feed_runtime,
+            config.feeds.dhan_enabled,
+            config.feeds.groww_enabled,
+            false,
+        )
+        .await;
+    }
 
     // =======================================================================
     // PROCESS RUN-LOOP (BOTH Dhan-OFF and Dhan-ON-slow).
