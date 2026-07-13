@@ -6,6 +6,8 @@
 >
 > **⚠ 2026-07-13 NOTE — GROWW per-minute REST pipeline is a scheduled-pull KEEP class:** a 2026-07-13 operator directive (relayed verbatim via the coordinator session, quotes preserved in §9.0 below + `groww-second-feed-scope-2026-06-19.md` §38) extends the §8 scheduled-pull KEEP class to GROWW: the per-minute **spot-1m fetch** (`GET api.groww.in/v1/historical/candles`, `candle_interval="1minute"`, 3 Groww spot indices) + the per-minute **option-chain fetch** (`GET api.groww.in/v1/option-chain/...`, the same 3 underlyings' current expiry) + a bounded **per-contract 1m fetch** (same candles endpoint, `segment=FNO`, selected option contracts) — **see the new §9**. Two new KEEP rows join the §3 inventory. The ban on all OTHER market-data REST pulls (incl. any BULK Groww historical sweep) is UNCHANGED.
 >
+> **⚠ 2026-07-13 NOTE (THIRD same-period directive) — Dhan live WS retired; KEEP-row repurposing:** per the operator's 2026-07-13 retirement directive (verbatim in `websocket-connection-scope-lock.md`'s "2026-07-13 Amendment"), the Dhan LIVE-FEED half of §1's one-liner no longer exists — for Dhan, market data is now EXCLUSIVELY the §8 scheduled-pull KEEP class (spot-1m + option-chain + historical); the live-feed WS in §1 now means the GROWW feed (and, when its trial goes live, GDF per `gdf-third-feed-scope-2026-07-13.md`). Three §3 row effects: **(1) the Dhan "live-feed AUTH" KEEP rows (generateAccessToken / RenewToken / getIP-setIP) are KEPT with a repurposed rationale** — they now produce the token/gate for the Dhan REST stack (spot-1m/chain/historical) + the functional-dormant order-update WS inside `dhan_rest_stack`, no longer for a market-data WS; **(2) the Dhan Detailed CSV instrument-master KEEP row is RETIRED** (operator Q3: *"hereafter no Dhan instrument download/parsing — just direct hardcoded security IDs passed to spot 1m and option chain"*; the Phase B dependency map proved ZERO surviving consumers — the Groww watch build reads its OWN master CSV, never the Dhan one); **(3) the niftyindices NTM row and the Groww master CSV row are UNCHANGED** (their surviving consumer is the Groww watch build via its own hardened client). Row annotations below are edited in place per house style (rows annotated, never deleted).
+>
 > **Authority:** CLAUDE.md > `operator-charter-forever.md` §I > `daily-universe-scope-expansion-2026-05-27.md` §3 > `groww-second-feed-scope-2026-06-19.md` > this file > defaults.
 > **Scope:** PERMANENT once confirmed. Every Phase. Every PR. Every future Claude/Cowork session. Applies to BOTH Dhan (feed #1) and Groww (feed #2).
 > **Operator-locked:** 2026-06-27 (verbatim quote below).
@@ -44,10 +46,10 @@ A **literal** reading ("kill ALL REST") is self-contradictory: it would also kil
 
 | Endpoint | File:line | Class | Verdict |
 |---|---|---|---|
-| `POST auth.dhan.co/.../generateAccessToken` | `constants.rs:1246` | live-feed AUTH | **KEEP** |
-| `GET /v2/RenewToken` | `auth/types.rs:353`, `constants.rs:1250` | live-feed AUTH | **KEEP** |
-| `GET/PUT /v2/ip/getIP` `setIP` | `constants.rs:1017,1270,1279`; `main.rs:4417…` | live-feed STATIC-IP gate | **KEEP** |
-| `GET images.dhan.co/api-data/api-scrip-master-detailed.csv` | `csv_downloader.rs:129,209` | instrument-master (static ref) — the MAP source | **KEEP** |
+| `POST auth.dhan.co/.../generateAccessToken` | `constants.rs:1246` | Dhan AUTH — since 2026-07-13 serves the REST stack (§8 spot-1m/chain + historical) + the dormant order-update WS, not a market-data WS | **KEEP** (rationale repurposed 2026-07-13) |
+| `GET /v2/RenewToken` | `auth/types.rs:353`, `constants.rs:1250` | Dhan AUTH — REST stack + dormant order-update WS (2026-07-13) | **KEEP** (rationale repurposed 2026-07-13) |
+| `GET/PUT /v2/ip/getIP` `setIP` | `constants.rs:1017,1270,1279`; `main.rs:4417…` | Dhan STATIC-IP gate — order-API prerequisite (April 2026 mandate), kept for the REST stack + future order path | **KEEP** (rationale repurposed 2026-07-13) |
+| `GET images.dhan.co/api-data/api-scrip-master-detailed.csv` | ~~`csv_downloader.rs:129,209`~~ | instrument-master (static ref) — WAS the Dhan-WS map source | **RETIRED 2026-07-13** (Dhan live WS retired — Q3: no Dhan instrument download/parsing at all; hardcoded SIDs feed the §8 pulls; the Groww watch build never consumed this CSV — Phase B map, Verified; downloader deleted in the Phase C PRs) |
 | `GET niftyindices.com ind_niftytotalmarket_list.csv` | `instruments.rs:646`; `main.rs:1978,2667,6806` | constituents (static ref) — the MAP source | **KEEP** |
 | ~~`POST api.groww.in/v1/token/api/access`~~ | ~~`groww/auth.rs`~~ | Groww live-feed AUTH | **REMOVED 2026-07-02** — superseded by the shared token-minter SSM read (`groww-shared-token-minter-2026-07-02.md`); TickVault never mints |
 | `GET GROWW_INSTRUMENT_CSV_URL` | `constants.rs:612`; `instruments.rs:639` | Groww master (static ref) — the MAP source | **KEEP** |
@@ -130,7 +132,7 @@ The option-chain entitlement (absent June 2026 — the DH-902/806 class that got
 
 - **Just-closed-minute availability is UNDOCUMENTED and UNVERIFIED-LIVE** — how fast Dhan's intraday endpoint surfaces the minute that closed 1 second ago is unknown until the first live session. The fetcher does bounded in-minute retries and MEASURES the close-to-data latency with a histogram — a slow/empty response is loud (typed ErrorCode + counter), never a false-OK.
 - The chain entitlement is UNPROVEN until the live boot probe (§8.3); the chain half stays OFF until proven + operator-enabled.
-- Disk envelope (honest): `option_chain_1m` ≈ ~337K rows ≈ ~70 MB/day at ~150 strikes ≈ ~6.3 GB/90d (~20-28% of the 30 GB EBS) — retention/partition-manager registration is a flagged follow-up in the code PRs; `spot_1m_rest` is trivial (~1,125 rows/day).
+- Disk envelope (honest): `option_chain_1m` ≈ ~337K rows ≈ ~70 MB/day at ~150 strikes ≈ ~6.3 GB/90d (~12-17% of the 50 GB EBS — 50 GB since 2026-07-13, was 30) — retention/partition-manager registration is a flagged follow-up in the code PRs; `spot_1m_rest` is trivial (~1,125 rows/day).
 - Cold-path only; zero hot-path involvement; zero new WebSocket; §28 indicators/strategies boundary untouched; token via the existing TokenManager (never logged).
 
 ## §8.5 What a PR that violates this grant looks like (REJECT)
