@@ -111,6 +111,10 @@ pub mod feed_scoreboard_persistence;
 /// Groww auto-scale ladder forensic chain (§34, auto-scale PR-2 Item 8) —
 /// one row per ladder transition; feeds restart rehydration.
 pub mod groww_scale_audit_persistence;
+/// Daily timeframe-consistency verifier (operator 2026-07-13): one row per
+/// finding cell where a stored higher-TF candle disagrees with its
+/// recomputed-from-1m value (TF-VERIFY-01/02).
+pub mod tf_consistency_audit_persistence;
 pub mod tick_conservation_audit_persistence;
 pub mod ws_event_audit_persistence;
 // PR-E (2026-05-26): `candle_persistence` module deleted alongside the
