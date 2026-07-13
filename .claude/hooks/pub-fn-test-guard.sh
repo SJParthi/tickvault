@@ -15,7 +15,12 @@
 set -uo pipefail
 
 PROJECT_DIR="${1:-.}"
-cd "$PROJECT_DIR" || exit 0
+# 2026-07-13 hardening: a bad project dir used to `exit 0` silently — a guard
+# that cannot evaluate must refuse loudly, never pass.
+cd "$PROJECT_DIR" || {
+  echo "  FAIL: pub-fn-test-guard: cannot cd to project dir '$PROJECT_DIR' — refusing to pass silently" >&2
+  exit 2
+}
 
 MODE="${2:-staged}"
 HOOKS_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -32,6 +37,13 @@ else
 fi
 
 if [ -z "$FILES" ]; then
+  if [ "$MODE" = "all" ]; then
+    # 2026-07-13 hardening: in "all" mode an empty `find crates` means the
+    # guard is running somewhere without the workspace — refuse loudly.
+    # (In "staged" mode an empty staged-file list is a legitimate clean pass.)
+    echo "  FAIL: pub-fn-test-guard (all mode): no crates/*.rs found under '$PROJECT_DIR' — guard cannot evaluate; refusing to pass silently" >&2
+    exit 2
+  fi
   exit 0
 fi
 
