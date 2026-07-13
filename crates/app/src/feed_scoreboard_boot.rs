@@ -1246,6 +1246,12 @@ pub fn fold_episode_into_tally(t: &mut EpisodeTally, kind: &str, blame: &str, ma
 /// Groww (hostile review round 2, 2026-07-10). Episode ROWS for every
 /// ws_type are still persisted for forensics; only the headline tallies
 /// filter.
+///
+/// Maintenance note (PR-C1, 2026-07-13 hostile-review L3): this is an
+/// ALLOWLIST — a future feed's market-data ws_type (e.g. the GDF trial's
+/// `gdf_feed`, `gdf-third-feed-scope-2026-07-13.md`) MUST be added here, or
+/// its up rows are excluded from the feed_off / any_up classification and
+/// the day misreads `feed_off` despite live GDF rows.
 #[must_use]
 pub fn is_market_data_ws_type(ws_type: &str) -> bool {
     matches!(ws_type, "main_feed" | "groww_bridge")

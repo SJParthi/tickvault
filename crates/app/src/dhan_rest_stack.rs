@@ -54,6 +54,22 @@
 //!    reconnect / post-close-sleep machinery (WS-GAP-04/10) is
 //!    self-contained; it runs as its own tokio task and can never block or
 //!    kill this stack's bring-up.
+//!    **Dormancy honesty (2026-07-13 hostile-review M1/M2):** while
+//!    functionally dormant, incoming order-update frames are parsed,
+//!    COUNTED (`tv_order_update_dormant_events_total` — a stack-held DRAIN
+//!    task consumes the broadcast; the positive "order activity observed
+//!    while dormant" signal) and DISCARDED — no WAL capture, no OMS
+//!    consumer; durable order-event capture returns with live trading (the
+//!    OMS wiring). Boot-staged order-update WAL segments remain UNDRAINED
+//!    on dhan-off boots (pre-existing Phase A residual — C2 settles the
+//!    replay topology).
+//!    **Paging honesty (2026-07-13 hostile-review L2):** there is NO
+//!    CloudWatch dead-socket alarm for this stack's order-update WS —
+//!    `tv_order_update_ws_active` is written ONLY by the (dead) lane spawn
+//!    sites, so the `tv-<env>-order-update-ws-inactive` alarm is
+//!    missing-data-silent both ways on a dhan-off boot; the WS-GAP-10
+//!    in-loop outage page (notifier wired) is the SOLE pager. Re-homing
+//!    the gauge into the connection loop is a C2 target.
 //!
 //! **Deliberately NOT spawned (stay lane-only; deletion is a later phase):**
 //! the WS pool, universe build / CSV download, prev-day OHLCV, the SLO
@@ -645,10 +661,18 @@ async fn run_dhan_rest_stack(params: DhanRestStackParams) {
     //
     // Parameter honesty:
     //   - `order_sender`: a STACK-LOCAL broadcast channel (capacity mirrors
-    //     the legacy 256); the receiver is dropped INTENTIONALLY — no OMS
-    //     consumer exists until live trading returns. The connection's
-    //     send-drop arm logs + counts (`tv_order_update_broadcast_drops_total`,
-    //     audit-findings 2026-04-24 finding #4) — never silent.
+    //     the legacy 256); a stack-held DRAIN task consumes every event —
+    //     counted (`tv_order_update_dormant_events_total`, static label) and
+    //     DISCARDED: no WAL capture, no OMS consumer until live trading
+    //     returns (the OMS wiring restores durable order-event capture).
+    //     Holding a live receiver keeps the connection's dropped-receiver
+    //     error arm (`tv_order_update_broadcast_drops_total`) dormant BY
+    //     CONSTRUCTION — that arm again means what it says (a crashed
+    //     subscriber), never "the stack is dormant by design"
+    //     (2026-07-13 hostile-review M1: the WS receives ALL account order
+    //     events incl. the operator's manual Dhan-app orders, so a dropped
+    //     receiver produced a per-event false "subscriber crashed" ERROR
+    //     stream on any manual-order day).
     //   - `wal_spill = None` (Verified 2026-07-13): the order-update WAL
     //     replay staging is a `main()` STAGE-C boot concern — main.rs stages
     //     residual frames at boot, and BOTH drain sites (fast arm + lane)
@@ -661,8 +685,26 @@ async fn run_dhan_rest_stack(params: DhanRestStackParams) {
     //     /api/feeds handler 409-refuses a runtime Dhan enable.
     // -----------------------------------------------------------------------
     {
-        let (order_update_sender, _order_update_receiver) =
+        let (order_update_sender, mut order_update_receiver) =
             tokio::sync::broadcast::channel::<tickvault_common::order_types::OrderUpdate>(256);
+        // Dormant DRAIN task (2026-07-13 hostile-review M1): the receiver is
+        // HELD and drained — never dropped. Events are parsed upstream,
+        // counted here, and DISCARDED (module docs item 5 dormancy honesty);
+        // `Lagged` is impossible in practice at this event rate but is
+        // skipped defensively; `Closed` (sender gone = connection task dead)
+        // ends the drain — the WS-GAP-10 unreachable-exit error at the spawn
+        // below is the loud signal for that case.
+        tokio::spawn(async move {
+            loop {
+                match order_update_receiver.recv().await {
+                    Ok(_event) => {
+                        metrics::counter!("tv_order_update_dormant_events_total").increment(1);
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        });
         let ou_url = config.dhan.order_update_websocket_url.clone();
         let ou_client_id = client_id.clone();
         let ou_token = Arc::clone(&token_handle);
@@ -715,8 +757,8 @@ async fn run_dhan_rest_stack(params: DhanRestStackParams) {
         });
         info!(
             "Dhan REST-only stack: order-update WS spawned (functional-dormant, Q4-i — \
-             connects at market open via the off-hours gate; no OMS consumer until live \
-             trading returns)"
+             connects at market open via the off-hours gate; incoming order events are \
+             drained + counted, NOT persisted, until live trading returns)"
         );
     }
 
@@ -1088,6 +1130,13 @@ mod tests {
             "run_order_update_connection(",
             // Stack-local broadcast channel (no OMS consumer — dormant).
             "broadcast::channel::<tickvault_common::order_types::OrderUpdate>",
+            // 2026-07-13 hostile-review M1: the receiver is HELD + drained —
+            // dropping it makes the connection's send arm spam a per-event
+            // false "subscriber crashed" ERROR on every manual account order.
+            "order_update_receiver.recv()",
+            // The dormant-activity counter is the CODE line, not the comment
+            // (full macro invocation so a comment mention can never satisfy).
+            "metrics::counter!(\"tv_order_update_dormant_events_total\")",
             // Lifecycle rows keep flowing to ws_event_audit.
             "ws_audit_consumer::spawn_ws_event_audit_consumer(",
             // Operator visibility: the authenticated Telegram listener.

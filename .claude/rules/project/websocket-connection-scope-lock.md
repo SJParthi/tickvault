@@ -194,7 +194,12 @@ as historical audit; THIS table is the effective contract.
 > order-update WS (functional-dormant — Phase 5a, after the family-claim tripwire), so a
 > dhan-off boot opens **≤1 Dhan WS (order-update only)**; the legacy fast-arm/lane spawn
 > sites remain dead code until the Phase C2 deletion, after which the stack is the sole
-> call site.
+> call site. **Dormancy honesty (2026-07-13, PR-C1 round-2):** while functionally
+> dormant, incoming order-update frames are parsed, counted
+> (`tv_order_update_dormant_events_total`) and DISCARDED — no WAL capture, no OMS
+> consumer; durable order-event capture returns with live trading (the OMS wiring), and
+> boot-staged order-update WAL segments remain undrained on dhan-off boots (pre-existing
+> Phase A residual, C2 target).
 
 ### §B. What the Phase C deletion PRs MAY remove (authorized by Q1/Q3/Q4; consumer map Verified 2026-07-13)
 
