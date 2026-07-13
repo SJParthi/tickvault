@@ -512,3 +512,38 @@ probe_and_report = true
 # ===========================================================================
 [groww_spot_1m]
 enabled = true
+
+# ===========================================================================
+# Groww per-minute option-chain REST leg (operator grant 2026-07-13 — PR-3
+# of the Groww per-minute REST plan). When enabled: every session minute —
+# sequenced right after the Groww spot fetch — pull the CURRENT-expiry
+# option chain for NIFTY/BANKNIFTY (NSE) + SENSEX (BSE) and persist every
+# per-strike per-leg row into the option_chain_1m table tagged feed='groww'
+# (feed-in-key DEDUP — the Dhan rows are untouched). Expiry comes from the
+# daily Groww instruments master CSV (zero extra rate cost — never a new
+# expiry endpoint, never guessed). Shipped DEFAULT-OFF pending the first
+# live probe: the endpoint is documented-available, but the live response
+# shape / strike keys / latency / rate-limit family are UNVERIFIED-LIVE.
+# probe_and_report = true runs ONE bounded boot-time chain call per
+# underlying and reports the measured verdict via Telegram (persists
+# nothing) — flip enabled = true only after the probe passes.
+# ===========================================================================
+[groww_option_chain_1m]
+enabled = true # flipped 2026-07-13 after the live probe PASSED (groww-second-feed-scope §38.6); serde default stays OFF
+probe_and_report = true # inert while enabled; the rollback canary (the Dhan §8.7 precedent)
+
+# ===========================================================================
+# Daily timeframe-consistency verifier (operator directive 2026-07-13 —
+# "how will you guarantee that all our defined timeframes internally are
+# correct — how do you identify whether any miscalculation or data
+# issues"). At 15:40 IST every trading day, recompute every sealed
+# higher-timeframe candle (2m..4h) from its stored 1-minute constituents
+# and compare exactly — Dhan verifies TODAY (stable after the 15:30:05
+# close seal); Groww verifies the PREVIOUS trading day (its tails seal at
+# IST midnight). Findings land in the tf_consistency_audit table + one
+# Telegram summary (TF-VERIFY-01/02). Cold path; the live candle pipeline
+# is untouched. An ABSENT section = disabled (fail-safe);
+# `enabled = false` is the rollback switch.
+# ===========================================================================
+[tf_consistency]
+enabled = true

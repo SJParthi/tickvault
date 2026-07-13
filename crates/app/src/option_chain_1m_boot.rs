@@ -5,7 +5,9 @@
 //! Every trading-day minute close in session — sequenced immediately AFTER
 //! the spot leg (`spot_1m_rest_boot.rs`) — this task pulls the FULL
 //! current-expiry option chain for the 3 IDX_I underlyings (NIFTY 13,
-//! BANKNIFTY 25, SENSEX 51) via Dhan `POST /v2/optionchain` and persists
+//! BANKNIFTY 25, SENSEX 51 — the `CHAIN_1M_UNDERLYINGS` subset; INDIA VIX
+//! is SPOT-ONLY per the 2026-07-13 operator scope addition and can never
+//! enter this leg) via Dhan `POST /v2/optionchain` and persists
 //! every per-strike per-leg row to the `option_chain_1m` QuestDB table
 //! (DEDUP-idempotent — a re-fetch UPSERTs in place). Cold path ONLY: the
 //! WS candle pipeline, tick capture and trading are untouched.
@@ -79,9 +81,9 @@ use tickvault_common::config::QuestDbConfig;
 use tickvault_common::constants::{
     CHAIN_1M_CONSECUTIVE_FAIL_PAGE_THRESHOLD, CHAIN_1M_EXPIRYLIST_RETRY_BACKOFF_SECS,
     CHAIN_1M_FALLBACK_DELAY_MS, CHAIN_1M_MAX_BODY_BYTES, CHAIN_1M_MIN_GAP_SECS,
-    CHAIN_1M_REQUEST_TIMEOUT_SECS, CHAIN_1M_UNDERLYING_BUDGET_SECS,
+    CHAIN_1M_REQUEST_TIMEOUT_SECS, CHAIN_1M_UNDERLYING_BUDGET_SECS, CHAIN_1M_UNDERLYINGS,
     DHAN_OPTION_CHAIN_EXPIRYLIST_PATH, DHAN_OPTION_CHAIN_PATH, IST_UTC_OFFSET_SECONDS,
-    SECONDS_PER_DAY, SPOT_1M_REST_CONSECUTIVE_FAIL_PAGE_THRESHOLD, SPOT_1M_REST_INDICES,
+    SECONDS_PER_DAY, SPOT_1M_REST_CONSECUTIVE_FAIL_PAGE_THRESHOLD,
 };
 use tickvault_common::error_code::ErrorCode;
 use tickvault_common::sanitize::{capture_rest_error_body, redact_url_params};
@@ -627,8 +629,8 @@ async fn resolve_current_expiries(
     client_id: &str,
     today: NaiveDate,
 ) -> WarmupOutcome {
-    let mut resolved = Vec::with_capacity(SPOT_1M_REST_INDICES.len());
-    for (security_id, symbol) in SPOT_1M_REST_INDICES {
+    let mut resolved = Vec::with_capacity(CHAIN_1M_UNDERLYINGS.len());
+    for (security_id, symbol) in CHAIN_1M_UNDERLYINGS {
         match fetch_expirylist_bounded(client, expirylist_url, jwt, client_id, security_id).await {
             Ok(expiries) => {
                 let Some(expiry) = select_current_expiry(&expiries, today) else {
@@ -710,7 +712,7 @@ pub async fn run_option_chain_1m_probe(params: OptionChain1mTaskParams) {
     };
     // Probe with the FIRST underlying only (NIFTY) — one cheap call
     // answers the account-level entitlement question.
-    let (probe_sid, probe_symbol) = SPOT_1M_REST_INDICES[0];
+    let (probe_sid, probe_symbol) = CHAIN_1M_UNDERLYINGS[0];
     match fetch_expirylist_bounded(&client, &url, &jwt, &params.client_id, probe_sid).await {
         Ok(expiries) => {
             info!(
@@ -1221,7 +1223,11 @@ async fn wait_until_chain_fire(
 /// The signal-or-timer core of [`wait_until_chain_fire`], parameterized on
 /// the fallback duration so the tokio tests exercise every arm with
 /// millisecond timers (no `test-util` paused clock available).
-async fn wait_for_signal_or_fallback(
+/// `pub(crate)` since 2026-07-13: the Groww chain leg
+/// (`groww_option_chain_1m_boot.rs`) reuses this exact core with its own
+/// fallback constant — one sequencing implementation, two feeds.
+// TEST-EXEMPT: exercised by test_wait_until_chain_fire_signal_wakes_early_and_fallback_bounds + the stale-wake tokio tests below (visibility widened only).
+pub(crate) async fn wait_for_signal_or_fallback(
     fallback_ms: u64,
     fire_secs_of_day: u32,
     spot_rx: &mut Option<tokio::sync::watch::Receiver<Option<u32>>>,

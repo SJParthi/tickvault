@@ -709,7 +709,7 @@ latency measurement is load-bearing (the signal→next-minute-fill window depend
 
 PER-MINUTE SCHEDULED pulls only, in-session ([09:15, 15:30) IST trading days, the Dhan §8
 fire pattern): (a) **spot 1m** — the 3 indices (NIFTY / BANKNIFTY on NSE, SENSEX on BSE,
-segment CASH) via `GET https://api.groww.in/v1/historical/candles`
+segment CASH; **+ INDIA VIX since 2026-07-13 — runtime-resolved, SPOT ONLY, per §38.7**) via `GET https://api.groww.in/v1/historical/candles`
 (`candle_interval="1minute"`, `groww_symbol` identity), one day-granular
 `start_time`/`end_time` window per fire with client-side target-minute filtering (the
 Dhan-#1499 lesson — never an undocumented sub-minute window); (b) **option chain** — the
@@ -735,7 +735,7 @@ tasks only; the live WS capture chain, the tick hot path, and the Dhan legs are 
 | Expiry source | the already-ingested daily Groww instruments CSV (nearest expiry ≥ today; never-roll) — no new expiry REST endpoint |
 | Rate budget | ~6–12 requests/min in-session against the documented Live Data 10/sec + 300/min type bucket (the `/historical/*` + `/option-chain/*` bucket is UNNAMED in the docs → conservatively assumed Live Data); own min-gap pacing on the chain/contract legs |
 | Latency mandate (Quote 2) | per-fetch close-to-data latency stored PER-ROW + histograms (`tv_groww_spot1m_close_to_data_ms` / `tv_groww_chain1m_close_to_data_ms`) + a plain-English daily digest/scorecard line per feed per leg |
-| Config gates | `[groww_spot_1m]` / `[groww_option_chain_1m]` / the contract-leg section — all serde default OFF; base.toml opts in per leg; the chain leg's DEFAULT stays OFF pending first-live-session verification + a dated note |
+| Config gates | `[groww_spot_1m]` / `[groww_option_chain_1m]` / the contract-leg section — all serde default OFF; base.toml opts in per leg; the chain leg's DEFAULT stayed OFF pending first-live-session verification + a dated note — **verified + flipped ON in base.toml 2026-07-13 after the live probe PASSED (§38.6; the serde DEFAULT stays OFF)** |
 
 ## §38.3 Honest envelope (mandatory per §5 / operator-charter §F)
 
@@ -789,3 +789,109 @@ Always loaded. Reinforced on any session editing `crates/app/src/groww_spot_1m*`
 `[groww_option_chain_1m]` config sections, or any file containing `groww_spot_1m`,
 `groww_option_chain_1m`, `option_contract_1m_rest`, `v1/historical/candles`,
 `v1/option-chain`, `tv_groww_spot1m_close_to_data_ms`, or `tv_groww_chain1m_close_to_data_ms`.
+
+## §38.6 — 2026-07-13: chain-leg first-live verification PASSED → `[groww_option_chain_1m].enabled` flips to true in base.toml (dated note)
+
+**Live-probe evidence (Verified, prod box, build `eeca0ec`, ~11:47 PM IST 2026-07-13 —
+the operator's Telegram probe report, relayed verbatim via the coordinator session):**
+the boot-time Groww chain probe (`run_groww_chain_1m_probe`, the probe-only path this
+grant shipped DEFAULT-OFF) hit the live `GET /v1/option-chain/...` endpoint for all 3
+underlyings' current expiry and PASSED:
+
+| Underlying | Strikes | Contract prices | Fetch time | Payload |
+|---|---|---|---|---|
+| NIFTY | 99 | 198 | 0.2s | 36 KB |
+| BANKNIFTY | 172 | 344 | 0.2s | 64 KB |
+| SENSEX | 189 | 378 | 0.2s | 69 KB |
+
+The probe report closed with: *"recording currently switched OFF — to start, turn ON the
+setting and restart."*
+
+**Authorization (coordinator-relayed operator directive, 2026-07-13):** the operator
+directed enabling the chain leg TONIGHT so that tomorrow's session records option chains
+from the first in-session minute close (09:16 IST). Per that directive, and mirroring the
+Dhan precedent exactly (`no-rest-except-live-feed-2026-06-27.md` §8.7),
+`config/base.toml [groww_option_chain_1m].enabled` flips `false → true` in the PR carrying
+this note. This satisfies BOTH conditions of the §38.4 REJECT row ("Shipping the chain leg
+DEFAULT-ON before first-live-session verification AND a fresh dated quote recorded here"):
+the first-live verification is the probe evidence above, and this dated note is the quote
+record — recorded HERE first, in the same PR as the flip.
+
+**What stays unchanged (fail-safe posture, the Dhan §8.7 shape):** the serde DEFAULT in
+`crates/common/src/config.rs` stays OFF (an absent `[groww_option_chain_1m]` section still
+means disabled); `probe_and_report` stays `true` (inert while enabled; the automatic
+fallback canary on any rollback to `enabled = false`); everything else in the §38.2 scope
+table — 3 underlyings, current expiry only, per-minute cadence sequenced after the spot
+leg, `option_chain_1m` table only (`feed='groww'`), the shared Live Data budget share —
+is UNCHANGED.
+
+**Honest caveat (§38.3 discipline):** the probe proves ENTITLEMENT + response SHAPE +
+fetch SPEED with the market CLOSED (~11:47 PM IST). It does NOT prove in-session
+just-closed-minute freshness or per-minute delivery under load — those are MEASURED from
+the first enabled session onward via the per-row `close_to_data_ms` column + the
+`tv_groww_chain1m_close_to_data_ms` histogram (Quote 2), and any in-session problem
+surfaces through the leg's own edge-triggered paging (the CHAIN-02-class 3-minute
+escalation + the coded per-minute failure logs — see
+`rest-1m-pipeline-error-codes.md`), never a silent gap.
+
+## §38.7 — 2026-07-13: INDIA VIX joins the Groww per-minute SPOT leg (3 → 4 targets; SPOT ONLY)
+
+**The operator scope (2026-07-13, verbatim intent, relayed via the coordinator
+session):** add India VIX to the per-minute spot pull on the Groww leg; resolve the
+correct Groww exchange/segment/groww_symbol for the VIX index from the Groww master — do
+NOT guess the literal; same fetch machinery; per-SID independence (VIX failing can never
+delay the other 3); volume 0/absent expected; whether Groww's historical-candles endpoint
+serves India VIX is a live-probe unknown — persistent reject/empty = named forensics rows
++ one coalesced page ("VIX not served by Groww"), never silent.
+
+**The grant — one paragraph:** the Groww spot leg (`groww_spot_1m_boot.rs`) fetches a
+4th index — **INDIA VIX** — each in-session minute close, through the SAME bounded
+ladder / budget / backfill / sweep / forensics machinery as the 3 core indices. SPOT
+ONLY: no chain leg, no contracts (the chain stays 3 underlyings — the
+`GROWW_CHAIN_1M_UNDERLYINGS` arity guard is annotated, unchanged). The VIX identity is
+**RUNTIME-resolved, never guessed**: at each fire until resolved, the leg reads the day's
+watch file (`data/groww/groww-watch-<date>.json` — the ingested Groww master product) and
+matches an `index_value` entry whose `exchange_token` OR display `symbol_name`
+canonicalizes (the house `canonicalize_index_symbol` path, with the new additive
+`INDIAVIX → INDIA VIX` alias grounded in the live 2026-06-28 master capture:
+token `INDIAVIX`, name "India Vix") to the allowlisted `INDIA VIX`; the entry's
+`index_name` (the groww_symbol) + exchange + segment become the candles-query identity
+and `stable_index_security_id(groww_symbol)` the persisted id (cross-checked against the
+entry's own id — derivation drift refuses). Unresolved (watch file absent / no VIX row)
+= fail-SOFT: one edge-latched coded warn (`SPOT1M-01`, `stage="vix_unresolved"`) + the
+per-attempt `tv_groww_spot1m_vix_unresolved_total` counter + VIX skipped for the day —
+the 3 core targets are NEVER blocked.
+
+**Per-SID independence + escalation-edge keying (implemented as CORE-keyed):** each
+target runs its own hard-budgeted ladder sequentially (budget re-derived 18 s → 14 s so
+4 × budget + the fire delay still finishes inside the minute — const-asserted), so a VIX
+stall can never starve the core 3. The 3-consecutive-minutes escalation page keys on the
+**ORIGINAL 3 core indices** (`MinuteEdgeTally` — core fetch ok + core/shared persist
+only): a VIX-only failure (fetch, empty, or VIX row append) NEVER pages the leg, while
+core-all-failed still pages even when VIX alone succeeded; a shared ILP flush failure
+pages (core rows are lost too).
+
+**VIX-not-served visibility:** every VIX minute gets the normal per-minute
+`rest_fetch_audit` forensics row (outcome named — `ok`/`empty`/`error`/`no_token`/
+`named_gap`, never silent) + the VIX-specific `tv_groww_spot1m_vix_empty_total` counter
+on 2xx-without-the-minute. At the once-per-session 15:31 sweep, ZERO persisted VIX
+minutes while ≥1 core index persisted fires ONE coalesced coded warn per day
+(`SPOT1M-01`, `stage="vix_not_served"`: "India VIX not served by Groww
+historical-candles — named gap rows written; other-broker coverage unaffected") +
+`tv_groww_spot1m_vix_not_served_total`. Delivery boundary (honest): the SPOT1M codes are
+log-sink-only per `rest-1m-pipeline-error-codes.md` §3 — the daily warn is the coalesced
+signal, not a Telegram page; wiring a typed event/CloudWatch filter is a flagged
+follow-up.
+
+**Honest envelope (§38.3 discipline):** whether Groww's historical-candles endpoint
+SERVES India VIX at all is UNVERIFIED-LIVE — the first enabled session is the probe, and
+the counters + daily latch above are the measured answer either way. VIX volume 0/absent
+is EXPECTED (indices are price-only); rows persist `feed='groww'` into the SAME
+`spot_1m_rest` table under the live-lane canonical id, so cross-source joins work by
+construction. The runtime resolution depends on the Groww lane's watch build having run
+(a Groww-disabled session leaves VIX unresolved — fail-soft, counted, warned once).
+
+**What a violating PR looks like (REJECT):** hardcoding a GUESSED VIX groww_symbol
+literal; adding VIX (or any index) to the chain/contract legs under cover of this grant;
+letting a VIX failure feed the core escalation edge or block/reorder the core fetches; a
+5th spot index without a fresh dated quote HERE first.

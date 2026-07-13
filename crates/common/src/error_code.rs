@@ -961,6 +961,37 @@ pub enum ErrorCode {
     /// Severity::High, auto-triage-safe (the next trading-day boot
     /// re-attempts automatically).
     Chain04ExpirylistFailed,
+
+    // -----------------------------------------------------------------------
+    // Operator 2026-07-13: daily timeframe-consistency verifier.
+    // "how will you guarantee that all our defined timeframes internally are
+    // correct — how do you identify whether any miscalculation or data
+    // issues" → at 15:40 IST every trading day, recompute every sealed
+    // higher-TF candle (2m..4h, both feeds) from its stored candles_1m
+    // constituents and compare exactly (integer-paise OHLC, exact i64
+    // volume). Dhan verifies TODAY; Groww verifies the PREVIOUS trading
+    // day (no close-time force-seal — its tails seal at IST midnight).
+    // See tf-consistency-error-codes.md.
+    // -----------------------------------------------------------------------
+    /// TF-VERIFY-01: the daily timeframe-consistency verifier found ≥1
+    /// paging finding for a (feed, date) pass — a higher-TF candle
+    /// disagrees with its recomputed-from-1m value (`mismatch`), a stored
+    /// TF row is missing where 1m data exists (`missing_tf_row`), a TF row
+    /// exists over zero 1m rows (`no_1m_coverage`), a stored TF ts is off
+    /// the 09:15-anchored grid (`off_grid_ts`), or duplicate rows share a
+    /// DEDUP key (`duplicate_key`). ONE coalesced emission per (feed, date)
+    /// pass, never per-row. Severity::High, auto-triage NO
+    /// (severity-independent override — a TF-definition verdict is an
+    /// operator data-integrity judgment, the Futidx02 precedent).
+    TfVerify01MismatchFound,
+    /// TF-VERIFY-02: the daily timeframe-consistency run DEGRADED — HTTP
+    /// client build failure, QuestDB unreachable, discovery failure, a
+    /// per-SID query failure, a LIMIT-hit truncation tripwire, an audit
+    /// flush failure (pending rows discarded — poisoned-buffer defense),
+    /// or the 900s wall-clock budget exceeded (`stage` names the leg).
+    /// Severity::High, auto-triage-safe (the next trading day re-runs
+    /// automatically; forced reruns are DEDUP-idempotent).
+    TfVerify02RunDegraded,
 }
 
 impl ErrorCode {
@@ -1152,6 +1183,9 @@ impl ErrorCode {
             Self::Chain02FetchDegraded => "CHAIN-02",
             Self::Chain03PersistFailed => "CHAIN-03",
             Self::Chain04ExpirylistFailed => "CHAIN-04",
+            // Daily timeframe-consistency verifier (operator 2026-07-13)
+            Self::TfVerify01MismatchFound => "TF-VERIFY-01",
+            Self::TfVerify02RunDegraded => "TF-VERIFY-02",
         }
     }
 
@@ -1334,6 +1368,13 @@ impl ErrorCode {
             Self::Futidx01SelectionDegraded | Self::Futidx02CrossFeedExpiryMismatch => {
                 Severity::High
             }
+            // TF-VERIFY-01/02 (operator 2026-07-13) — the daily
+            // timeframe-consistency verifier found a TF-vs-1m divergence /
+            // ran degraded. High: operator eyes required on every occurrence
+            // (a divergence questions the higher-TF candle store; a degraded
+            // run could not vouch for it); never a halt — the live candle
+            // pipeline is untouched and reruns are DEDUP-idempotent.
+            Self::TfVerify01MismatchFound | Self::TfVerify02RunDegraded => Severity::High,
             // Medium: data pipeline correctness
             // PR #6b (2026-05-19): I-P0-01/02/04/05 retired with their modules.
             Self::InstrumentP1CrossSegmentCollision
@@ -1643,6 +1684,10 @@ impl ErrorCode {
             | Self::Chain04ExpirylistFailed => {
                 ".claude/rules/project/rest-1m-pipeline-error-codes.md"
             }
+            // Daily timeframe-consistency verifier (operator 2026-07-13)
+            Self::TfVerify01MismatchFound | Self::TfVerify02RunDegraded => {
+                ".claude/rules/project/tf-consistency-error-codes.md"
+            }
         }
     }
 
@@ -1673,6 +1718,13 @@ impl ErrorCode {
                 // Data-API entitlement is an operator/broker ACCOUNT
                 // decision — never auto-actioned despite High severity.
                 | Self::Chain01EntitlementAbsent
+                // TF-VERIFY-01 (operator 2026-07-13): a TF-vs-1m divergence
+                // is a data-comparability VERDICT over the audit rows — the
+                // operator judges whether it is a restart window, a real
+                // aggregator bug, or a dead seal leg. An auto-triage rerun
+                // would re-stamp rows and could mask the evidence (the
+                // Futidx02 precedent).
+                | Self::TfVerify01MismatchFound
         ) {
             return false;
         }
@@ -1858,6 +1910,9 @@ impl ErrorCode {
             Self::Chain02FetchDegraded,
             Self::Chain03PersistFailed,
             Self::Chain04ExpirylistFailed,
+            // Daily timeframe-consistency verifier (operator 2026-07-13)
+            Self::TfVerify01MismatchFound,
+            Self::TfVerify02RunDegraded,
         ]
     }
 }
@@ -2209,7 +2264,12 @@ mod tests {
         // failed — best-effort, DEDUP-idempotent) + CHAIN-04 (day-start
         // expirylist warmup failed — pipeline disabled-for-the-day, never
         // a guessed expiry).
-        assert_eq!(ErrorCode::all().len(), 144);
+        // 2026-07-13 (daily timeframe-consistency verifier): bumped
+        // 144 -> 146 for TF-VERIFY-01 (higher-TF candle disagrees with its
+        // recomputed-from-1m value — coalesced per (feed, date) pass,
+        // manual triage) + TF-VERIFY-02 (the daily run degraded —
+        // client/query/truncation/flush/budget stage taxonomy).
+        assert_eq!(ErrorCode::all().len(), 146);
     }
 
     #[test]
@@ -2315,6 +2375,35 @@ mod tests {
             c1.runbook_path(),
             ".claude/rules/project/rest-1m-pipeline-error-codes.md"
         );
+    }
+
+    #[test]
+    fn test_tf_verify_codes_contract() {
+        // Daily timeframe-consistency verifier (operator 2026-07-13).
+        let v1 = ErrorCode::TfVerify01MismatchFound;
+        assert_eq!(v1.code_str(), "TF-VERIFY-01");
+        assert_eq!("TF-VERIFY-01".parse::<ErrorCode>(), Ok(v1));
+        assert_eq!(v1.severity(), Severity::High);
+        // Design contract: a TF-vs-1m divergence is a data-comparability
+        // VERDICT — NEVER auto-actioned despite being non-Critical (the
+        // FUTIDX-02 severity-independent override precedent).
+        assert!(!v1.is_auto_triage_safe());
+
+        let v2 = ErrorCode::TfVerify02RunDegraded;
+        assert_eq!(v2.code_str(), "TF-VERIFY-02");
+        assert_eq!("TF-VERIFY-02".parse::<ErrorCode>(), Ok(v2));
+        assert_eq!(v2.severity(), Severity::High);
+        // The degrade already happened; the next trading day re-runs and
+        // forced reruns are DEDUP-idempotent — auto-triage may inspect.
+        assert!(v2.is_auto_triage_safe());
+
+        for code in [v1, v2] {
+            assert!(ErrorCode::all().contains(&code));
+            assert_eq!(
+                code.runbook_path(),
+                ".claude/rules/project/tf-consistency-error-codes.md"
+            );
+        }
     }
 
     #[test]
@@ -2465,7 +2554,9 @@ mod tests {
                 // Per-minute spot 1m REST pipeline (operator grant 2026-07-12).
                 || s.starts_with("SPOT1M-")
                 // Per-minute option-chain REST pipeline (PR-3, 2026-07-12).
-                || s.starts_with("CHAIN-");
+                || s.starts_with("CHAIN-")
+                // Operator 2026-07-13: daily timeframe-consistency verifier
+                || s.starts_with("TF-VERIFY-");
             assert!(has_known_prefix, "unexpected code prefix: {s}");
         }
     }

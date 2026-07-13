@@ -11,7 +11,13 @@
 //! # Usage
 //! ```ignore
 //! let notifier = NotificationService::initialize(&config.notification).await;
-//! notifier.notify(NotificationEvent::StartupComplete { mode: "LIVE" });
+//! notifier.notify(NotificationEvent::StartupComplete {
+//!     mode: "LIVE",
+//!     spot_1m_enabled: true,
+//!     spot_1m_indices: 4,
+//!     chain_1m_enabled: true,
+//!     chain_1m_underlyings: 3,
+//! });
 //! ```
 
 pub mod coalescer;

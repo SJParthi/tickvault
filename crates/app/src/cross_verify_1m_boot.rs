@@ -27,7 +27,6 @@ use serde_json::json;
 use tracing::{error, info, warn};
 
 use tickvault_common::config::QuestDbConfig;
-use tickvault_common::constants::IST_UTC_OFFSET_SECONDS;
 use tickvault_common::sanitize::{capture_rest_error_body, redact_url_params};
 use tickvault_common::url_join::join_api_url;
 use tickvault_core::auth::token_manager::TokenHandle;
@@ -35,6 +34,12 @@ use tickvault_storage::feed_parity_1m_audit_persistence::{
     FeedParity1mAuditWriter, FeedParity1mMismatch, MismatchField, csv_header,
     ensure_feed_parity_1m_audit_table, mismatch_to_csv_line,
 };
+
+// Phase C1 (2026-07-13): the intraday request/parse primitives relocated to
+// `dhan_intraday_parse` (the spot-1m legs must outlive this module, which the
+// Phase C deletion PRs remove) — re-imported here so every remaining consumer
+// in this file is byte-identical.
+use crate::dhan_intraday_parse::{MinuteCandle, intraday_request_body, parse_intraday_1m_candles};
 
 /// Dhan Data-API rate limit: 5 requests/second.
 const DATA_API_RPS: u32 = 5;
@@ -52,9 +57,27 @@ const CROSS_VERIFY_CSV_DIR: &str = "data/cross-verify";
 /// the run is flagged degraded (CROSS-VERIFY-1M-02) so the operator knows the
 /// day's verification could not vouch for the full universe (false-OK guard).
 const FETCH_DEGRADED_FAIL_FRACTION: f64 = 0.10;
-/// Seconds per IST trading minute bucket (1m candle).
-const SECONDS_PER_MINUTE: i64 = 60;
-/// Nanoseconds per second (IST-epoch → nanos).
+/// 429-coordination follow-up (2026-07-13, live incident: 91/776 fetches
+/// failed HTTP 429 at 15:31–15:33 → compared=0, a BLIND day): cool-down
+/// before the ONE bounded second pass over the 429-failed cohort — long
+/// enough for Dhan's rate-limit window to clear, short enough that even a
+/// worst-case full-universe cohort finishes well before the 16:30 IST box
+/// stop.
+const RETRY_429_COOLDOWN_SECS: u64 = 45;
+/// Second-pass pacing ceiling (requests/second) — deliberately BELOW the
+/// Data-API 5/sec budget so the retry pass can never re-earn the 429s it
+/// is retrying.
+const RETRY_429_MAX_PER_SEC: u64 = 3;
+// The second pass must pace strictly inside the Data-API budget.
+const _: () = assert!(
+    RETRY_429_MAX_PER_SEC < DATA_API_RPS as u64,
+    "cross-verify 429 second pass must pace below the Data-API 5/sec budget"
+);
+/// Nanoseconds per second (IST-epoch → nanos). Test-fixture scale since the
+/// Phase C1 parser relocation (production nanos math moved with the parser;
+/// `SECONDS_PER_MINUTE` moved too — the #1506 merge's re-add is dropped here
+/// as it has no remaining consumer in this file).
+#[cfg(test)]
 const NANOS_PER_SEC: i64 = 1_000_000_000;
 /// Epoch-microsecond scale — the ONLY representation legal in an embedded
 /// QuestDB TIMESTAMP comparison literal (see the regression lock on
@@ -62,7 +85,9 @@ const NANOS_PER_SEC: i64 = 1_000_000_000;
 const MICROS_PER_SEC: i64 = 1_000_000;
 
 /// IST seconds-of-day for the post-market cross-verify trigger (15:31:00).
-const CROSS_VERIFY_TRIGGER_SECS_OF_DAY_IST: u32 = 15 * 3600 + 31 * 60; // 55_860
+/// `pub(crate)` so the spot-1m post-session sweep can const-assert it fires
+/// CLEAR of this run's burst window (429-coordination 2026-07-13).
+pub(crate) const CROSS_VERIFY_TRIGGER_SECS_OF_DAY_IST: u32 = 15 * 3600 + 31 * 60; // 55_860
 
 /// Decision for WHEN the post-market 1-minute cross-verify should fire.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -179,20 +204,6 @@ mod start_decision_tests {
     }
 }
 
-/// One 1-minute candle, keyed by its IST-minute bucket. `volume` is `i64`
-/// (exact integer compare). Prices are `f64` (our `candles_1m` and Dhan REST
-/// are both f64 — exact compare per the operator's "exact match").
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct MinuteCandle {
-    /// IST-minute bucket start, in nanoseconds (the join key).
-    pub minute_ts_ist_nanos: i64,
-    pub open: f64,
-    pub high: f64,
-    pub low: f64,
-    pub close: f64,
-    pub volume: i64,
-}
-
 /// Outcome counts for one instrument's compare (and aggregated for the day).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct CompareStats {
@@ -282,96 +293,6 @@ pub fn diff_minute_candles(
         }
     }
     (out, stats)
-}
-
-/// Build the `/v2/charts/intraday` request body for ONE spot symbol, interval
-/// `"1"`, for a single trading day. `to_date` is the next calendar day so the
-/// whole `from_date` session is captured (intraday uses datetime strings).
-/// Pure.
-#[must_use]
-pub fn intraday_request_body(
-    security_id: &str,
-    exchange_segment: &str,
-    instrument: &str,
-    from_date: NaiveDate,
-    to_date: NaiveDate,
-) -> serde_json::Value {
-    json!({
-        "securityId": security_id,
-        "exchangeSegment": exchange_segment,
-        "instrument": instrument,
-        "interval": "1",
-        "oi": false,
-        "fromDate": from_date.format("%Y-%m-%d 00:00:00").to_string(),
-        "toDate": to_date.format("%Y-%m-%d 00:00:00").to_string(),
-    })
-}
-
-/// Convert a Dhan intraday UTC-epoch-second timestamp into the IST-minute
-/// bucket nanoseconds our `candles_1m` is keyed by. `data-integrity.md`:
-/// historical/intraday REST timestamps are UTC epoch seconds → `+IST_UTC_OFFSET`
-/// then floor to the minute, then ×1e9. O(1), saturating.
-#[must_use]
-pub fn intraday_utc_secs_to_ist_minute_nanos(utc_epoch_secs: i64) -> i64 {
-    let ist_secs = utc_epoch_secs.saturating_add(i64::from(IST_UTC_OFFSET_SECONDS));
-    let minute_floor = ist_secs - ist_secs.rem_euclid(SECONDS_PER_MINUTE);
-    minute_floor.saturating_mul(NANOS_PER_SEC)
-}
-
-/// Parse Dhan's columnar intraday response into `MinuteCandle`s. Parallel
-/// arrays `open/high/low/close/volume/timestamp`; all must be the same
-/// non-zero length. Returns empty on malformed/empty. Pure — never panics.
-#[must_use]
-pub fn parse_intraday_1m_candles(body: &str) -> Vec<MinuteCandle> {
-    let Ok(v) = serde_json::from_str::<serde_json::Value>(body) else {
-        return Vec::new();
-    };
-    let arr = |k: &str| v.get(k).and_then(|x| x.as_array());
-    let (Some(open), Some(high), Some(low), Some(close), Some(vol), Some(ts)) = (
-        arr("open"),
-        arr("high"),
-        arr("low"),
-        arr("close"),
-        arr("volume"),
-        arr("timestamp"),
-    ) else {
-        return Vec::new();
-    };
-    let n = ts.len();
-    if n == 0
-        || open.len() != n
-        || high.len() != n
-        || low.len() != n
-        || close.len() != n
-        || vol.len() != n
-    {
-        return Vec::new();
-    }
-    let mut out = Vec::with_capacity(n);
-    for i in 0..n {
-        let (Some(o), Some(h), Some(l), Some(c), Some(t)) = (
-            open[i].as_f64(),
-            high[i].as_f64(),
-            low[i].as_f64(),
-            close[i].as_f64(),
-            ts[i].as_i64(),
-        ) else {
-            continue;
-        };
-        let volume = vol[i]
-            .as_i64()
-            .or_else(|| vol[i].as_f64().map(|f| f as i64))
-            .unwrap_or(0);
-        out.push(MinuteCandle {
-            minute_ts_ist_nanos: intraday_utc_secs_to_ist_minute_nanos(t),
-            open: o,
-            high: h,
-            low: l,
-            close: c,
-            volume,
-        });
-    }
-    out
 }
 
 /// Parse our `candles_1m` QuestDB `/exec` dataset into `MinuteCandle`s for ONE
@@ -564,6 +485,64 @@ pub fn final_flush(writer: &mut FeedParity1mAuditWriter) -> FlushOutcome {
     }
 }
 
+// ---------------------------------------------------------------------------
+// 429-coordination second pass (2026-07-13 follow-up) — pure primitives
+// ---------------------------------------------------------------------------
+
+/// One target's FIRST-pass fetch verdict, for the second-pass cohort math.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FirstPassFetch {
+    /// Fetched + compared (or QuestDB-side only failure) — never retried.
+    Ok,
+    /// Failed with HTTP 429 (rate-limited) — eligible for the ONE bounded
+    /// second pass.
+    Failed429,
+    /// Failed for any non-429 reason — counted failed immediately, never
+    /// retried (a 400/auth-class failure would just re-fail).
+    FailedOther,
+}
+
+/// Indices (into the first-pass target slice) of the targets whose fetch
+/// failed with HTTP 429 — the bounded second-pass cohort. Order-preserving.
+/// Pure.
+#[must_use]
+pub fn collect_429_cohort(verdicts: &[FirstPassFetch]) -> Vec<usize> {
+    verdicts
+        .iter()
+        .enumerate()
+        .filter(|(_, v)| **v == FirstPassFetch::Failed429)
+        .map(|(i, _)| i)
+        .collect()
+}
+
+/// Gap (ms) between second-pass requests so the pass never exceeds
+/// `max_per_sec` requests/second (ceil so N × gap ≥ 1000 ms). A zero input
+/// degrades to 1 request/second — never a division panic, never a burst.
+/// Pure.
+#[must_use]
+pub fn retry_pace_gap_ms(max_per_sec: u64) -> u64 {
+    if max_per_sec == 0 {
+        return 1_000;
+    }
+    1_000_u64.div_ceil(max_per_sec)
+}
+
+/// Upper bound (ms) on the whole second pass: the fixed cool-down plus one
+/// paced gap per cohort member (each request itself is already bounded by
+/// the per-request timeout). Linear in the cohort, never a loop — the pass
+/// runs ONCE. Pure.
+#[must_use]
+pub fn second_pass_duration_bound_ms(cohort_len: usize) -> u64 {
+    RETRY_429_COOLDOWN_SECS
+        .saturating_mul(1_000)
+        .saturating_add(
+            (cohort_len as u64).saturating_mul(
+                retry_pace_gap_ms(RETRY_429_MAX_PER_SEC)
+                    .saturating_add(REST_TIMEOUT_SECS.saturating_mul(1_000)),
+            ),
+        )
+}
+
 /// Run the post-market 1-minute cross-verification for every spot instrument in
 /// the universe. Cold path, fail-soft per symbol; never blocks. Writes the
 /// audit table + CSV; returns the summary for the caller to emit Telegram.
@@ -630,78 +609,105 @@ pub async fn run_cross_verify_1m(
     let trading_date_ist_nanos = day_start_ist_nanos;
     let to_date = trading_date.succ_opt().unwrap_or(trading_date);
     let mut summary = CrossVerify1mSummary::default();
-    // First captured fetch-failure reason (status + URL + bounded redacted
-    // body) — carried into the CROSS-VERIFY-1M-02 log so a degraded day
-    // names its cause instead of just counting failures (DHAN-REST-400).
+    // First captured FINAL fetch-failure reason (status + URL + bounded
+    // redacted body) — carried into the CROSS-VERIFY-1M-02 log so a degraded
+    // day names its cause instead of just counting failures (DHAN-REST-400).
     let mut sample_fetch_failure: Option<String> = None;
     // CSV is built in-memory then written once at the end (one file open).
     let mut csv = String::from(csv_header());
     csv.push('\n');
 
+    let ctx = CompareCtx {
+        client: &client,
+        questdb_exec_url: &questdb_exec_url,
+        intraday_url: &intraday_url,
+        jwt: &jwt,
+        limiter: &limiter,
+        trading_date,
+        to_date,
+        day_start_ist_nanos,
+        run_ts_ist_nanos,
+        trading_date_ist_nanos,
+    };
+
+    // First pass. A 429 is DEFERRED to the bounded second pass below, not
+    // counted failed yet (429-coordination 2026-07-13 — the live incident:
+    // 91/776 fetches 429'd at 15:31–15:33 → compared=0, a BLIND day).
+    let mut verdicts: Vec<FirstPassFetch> = Vec::with_capacity(spot_targets.len());
     for target in spot_targets {
         summary.instruments_checked = summary.instruments_checked.saturating_add(1);
-
-        // Our candles_1m for the day (QuestDB).
-        let our_sql =
-            our_candles_select_sql(target.security_id, &target.segment, day_start_ist_nanos);
-        let ours = match http_get_text(&client, &questdb_exec_url, &[("query", our_sql.as_str())])
-            .await
-        {
-            Ok(body) => parse_our_candles_dataset(&body),
-            Err(reason) => {
-                warn!(security_id = target.security_id, %reason, "cross_verify_1m: candles_1m query failed (skip)");
-                Vec::new()
+        match compare_one_target(&ctx, target, &mut writer, &mut csv).await {
+            Ok(stats) => {
+                summary.stats = summary.stats.merge(stats);
+                verdicts.push(FirstPassFetch::Ok);
             }
-        };
-
-        // Dhan intraday 1m (rate-gated).
-        for _ in 0..RATE_GATE_MAX_SPINS {
-            if limiter.check().is_ok() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(RATE_GATE_BACKOFF_MS)).await;
-        }
-        let body = intraday_request_body(
-            target.security_id.to_string().as_str(),
-            &target.segment,
-            target.instrument,
-            trading_date,
-            to_date,
-        );
-        let dhan = match dhan_intraday_fetch(&client, &intraday_url, &jwt, &body).await {
-            Ok(candles) => candles,
-            Err(reason) => {
-                summary.fetch_failures = summary.fetch_failures.saturating_add(1);
-                if sample_fetch_failure.is_none() {
-                    sample_fetch_failure = Some(reason.clone());
-                }
-                warn!(security_id = target.security_id, %reason, "cross_verify_1m: intraday fetch failed (skip)");
-                continue;
-            }
-        };
-
-        let (mismatches, stats) = diff_minute_candles(
-            target.security_id,
-            &target.segment,
-            &target.symbol,
-            run_ts_ist_nanos,
-            trading_date_ist_nanos,
-            &ours,
-            &dhan,
-        );
-        summary.stats = summary.stats.merge(stats);
-        for m in &mismatches {
-            if writer.append_mismatch(m).is_err() {
-                error!(
-                    code = tickvault_common::error_code::ErrorCode::CrossVerify1m01MismatchFound
-                        .code_str(),
+            Err(failure) if failure.rate_limited => {
+                verdicts.push(FirstPassFetch::Failed429);
+                warn!(
                     security_id = target.security_id,
-                    "cross_verify_1m: audit append failed"
+                    reason = %failure.reason,
+                    "cross_verify_1m: intraday fetch rate-limited (HTTP 429) — \
+                     deferred to the bounded second pass"
                 );
             }
-            csv.push_str(&mismatch_to_csv_line(m));
-            csv.push('\n');
+            Err(failure) => {
+                verdicts.push(FirstPassFetch::FailedOther);
+                summary.fetch_failures = summary.fetch_failures.saturating_add(1);
+                if sample_fetch_failure.is_none() {
+                    sample_fetch_failure = Some(failure.reason.clone());
+                }
+                warn!(security_id = target.security_id, reason = %failure.reason, "cross_verify_1m: intraday fetch failed (skip)");
+            }
         }
+    }
+
+    // ONE bounded second pass over the 429 cohort (429-coordination
+    // 2026-07-13): cool down, then retry each 429-failed symbol ONCE, paced
+    // below the Data-API budget, folding successes into the comparison
+    // BEFORE the report. Anything still failing lands in fetch_failures and
+    // rides the unchanged honest BLIND/DEGRADED classification. Never a
+    // loop — one pass, linearly bounded (`second_pass_duration_bound_ms`).
+    let cohort = collect_429_cohort(&verdicts);
+    if !cohort.is_empty() {
+        info!(
+            cohort = cohort.len(),
+            cooldown_secs = RETRY_429_COOLDOWN_SECS,
+            bound_ms = second_pass_duration_bound_ms(cohort.len()),
+            "cross_verify_1m: HTTP 429 cohort — one bounded, paced second \
+             pass after cool-down"
+        );
+        tokio::time::sleep(Duration::from_secs(RETRY_429_COOLDOWN_SECS)).await;
+        let gap = Duration::from_millis(retry_pace_gap_ms(RETRY_429_MAX_PER_SEC));
+        let mut recovered: usize = 0;
+        for idx in cohort {
+            tokio::time::sleep(gap).await;
+            let Some(target) = spot_targets.get(idx) else {
+                continue;
+            };
+            match compare_one_target(&ctx, target, &mut writer, &mut csv).await {
+                Ok(stats) => {
+                    summary.stats = summary.stats.merge(stats);
+                    recovered = recovered.saturating_add(1);
+                    metrics::counter!("tv_cross_verify_1m_retry_429_total", "outcome" => "recovered")
+                        .increment(1);
+                }
+                Err(failure) => {
+                    summary.fetch_failures = summary.fetch_failures.saturating_add(1);
+                    metrics::counter!("tv_cross_verify_1m_retry_429_total", "outcome" => "still_failed")
+                        .increment(1);
+                    if sample_fetch_failure.is_none() {
+                        sample_fetch_failure = Some(failure.reason.clone());
+                    }
+                    warn!(
+                        security_id = target.security_id,
+                        reason = %failure.reason,
+                        "cross_verify_1m: second-pass fetch failed (final — \
+                         counted into the degraded math)"
+                    );
+                }
+            }
+        }
+        info!(recovered, "cross_verify_1m: 429 second pass complete");
     }
 
     // DHAN-REST-400 item 4: skip-when-empty final flush — the 2026-06-10
@@ -770,8 +776,104 @@ pub struct CrossVerifyTarget {
     pub instrument: &'static str,
 }
 
+/// One intraday fetch's TYPED failure — `rate_limited` derives from the
+/// REAL `StatusCode` (429), never a substring scan of the message (the
+/// spot-1m `FetchFailure` precedent; 429-coordination 2026-07-13 — the
+/// second pass needs to distinguish the retryable 429 class).
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct IntradayFetchFailure {
+    rate_limited: bool,
+    reason: String,
+}
+
+/// Shared borrowed context for ONE target's compare — used identically by
+/// the first pass and the bounded 429 second pass (429-coordination
+/// 2026-07-13).
+struct CompareCtx<'a> {
+    client: &'a reqwest::Client,
+    questdb_exec_url: &'a str,
+    intraday_url: &'a str,
+    jwt: &'a str,
+    limiter: &'a tickvault_trading::oms::rate_limiter::OrderRateLimiter,
+    trading_date: NaiveDate,
+    to_date: NaiveDate,
+    day_start_ist_nanos: i64,
+    run_ts_ist_nanos: i64,
+    trading_date_ist_nanos: i64,
+}
+
+/// Compare ONE target end-to-end: query our `candles_1m`, rate-gate, fetch
+/// Dhan's intraday 1m, diff, append mismatches to the audit writer + CSV.
+/// `Err` carries the TYPED fetch failure so the caller can defer 429s to
+/// the bounded second pass. Extracted from the first-pass loop body
+/// unchanged (429-coordination 2026-07-13) so both passes share one code
+/// path.
+async fn compare_one_target(
+    ctx: &CompareCtx<'_>,
+    target: &CrossVerifyTarget,
+    writer: &mut FeedParity1mAuditWriter,
+    csv: &mut String,
+) -> Result<CompareStats, IntradayFetchFailure> {
+    // Our candles_1m for the day (QuestDB).
+    let our_sql =
+        our_candles_select_sql(target.security_id, &target.segment, ctx.day_start_ist_nanos);
+    let ours = match http_get_text(
+        ctx.client,
+        ctx.questdb_exec_url,
+        &[("query", our_sql.as_str())],
+    )
+    .await
+    {
+        Ok(body) => parse_our_candles_dataset(&body),
+        Err(reason) => {
+            warn!(security_id = target.security_id, %reason, "cross_verify_1m: candles_1m query failed (skip)");
+            Vec::new()
+        }
+    };
+
+    // Dhan intraday 1m (rate-gated).
+    for _ in 0..RATE_GATE_MAX_SPINS {
+        if ctx.limiter.check().is_ok() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(RATE_GATE_BACKOFF_MS)).await;
+    }
+    let body = intraday_request_body(
+        target.security_id.to_string().as_str(),
+        &target.segment,
+        target.instrument,
+        ctx.trading_date,
+        ctx.to_date,
+    );
+    let dhan = dhan_intraday_fetch(ctx.client, ctx.intraday_url, ctx.jwt, &body).await?;
+
+    let (mismatches, stats) = diff_minute_candles(
+        target.security_id,
+        &target.segment,
+        &target.symbol,
+        ctx.run_ts_ist_nanos,
+        ctx.trading_date_ist_nanos,
+        &ours,
+        &dhan,
+    );
+    for m in &mismatches {
+        if writer.append_mismatch(m).is_err() {
+            error!(
+                code = tickvault_common::error_code::ErrorCode::CrossVerify1m01MismatchFound
+                    .code_str(),
+                security_id = target.security_id,
+                "cross_verify_1m: audit append failed"
+            );
+        }
+        csv.push_str(&mismatch_to_csv_line(m));
+        csv.push('\n');
+    }
+    Ok(stats)
+}
+
 /// One intraday REST round-trip → parsed candles. `Ok(empty)` for an
-/// empty/malformed body (no candles), `Err` for transport/HTTP failure.
+/// empty/malformed body (no candles), `Err` for transport/HTTP failure
+/// (typed — `rate_limited` for HTTP 429).
 ///
 /// DHAN-REST-400 (2026-06-10): the previous error was just `"http 400"` —
 /// Dhan's `errorType`/`errorCode`/`errorMessage` body and the final request
@@ -784,7 +886,7 @@ async fn dhan_intraday_fetch(
     url: &str,
     jwt: &str,
     body: &serde_json::Value,
-) -> Result<Vec<MinuteCandle>, String> {
+) -> Result<Vec<MinuteCandle>, IntradayFetchFailure> {
     let resp = client
         .post(url)
         .header("access-token", jwt)
@@ -792,17 +894,26 @@ async fn dhan_intraday_fetch(
         .json(body)
         .send()
         .await
-        .map_err(|e| format!("send: {}", redact_url_params(&e.to_string())))?;
+        .map_err(|e| IntradayFetchFailure {
+            rate_limited: false,
+            reason: format!("send: {}", redact_url_params(&e.to_string())),
+        })?;
     let status = resp.status();
     if !status.is_success() {
         let error_body = resp.text().await.unwrap_or_default();
-        return Err(format!(
-            "http {status} url={} body={}",
-            redact_url_params(url),
-            capture_rest_error_body(&error_body)
-        ));
+        return Err(IntradayFetchFailure {
+            rate_limited: status == reqwest::StatusCode::TOO_MANY_REQUESTS,
+            reason: format!(
+                "http {status} url={} body={}",
+                redact_url_params(url),
+                capture_rest_error_body(&error_body)
+            ),
+        });
     }
-    let text = resp.text().await.map_err(|e| format!("read: {e}"))?;
+    let text = resp.text().await.map_err(|e| IntradayFetchFailure {
+        rate_limited: false,
+        reason: format!("read: {e}"),
+    })?;
     Ok(parse_intraday_1m_candles(&text))
 }
 
@@ -923,6 +1034,7 @@ mod tests {
     }
 
     use super::*;
+    use tickvault_common::constants::IST_UTC_OFFSET_SECONDS;
 
     fn mc(minute_ts: i64, o: f64, h: f64, l: f64, c: f64, v: i64) -> MinuteCandle {
         MinuteCandle {
@@ -1009,64 +1121,9 @@ mod tests {
         assert_eq!(m.feed, tickvault_common::feed::Feed::Dhan.as_str());
     }
 
-    #[test]
-    fn intraday_request_body_has_interval_1_and_string_sid() {
-        let from = NaiveDate::from_ymd_opt(2026, 6, 2).expect("from");
-        let to = NaiveDate::from_ymd_opt(2026, 6, 3).expect("to");
-        let b = intraday_request_body("1333", "NSE_EQ", "EQUITY", from, to);
-        assert_eq!(b["securityId"], "1333", "string sid");
-        assert_eq!(b["interval"], "1", "1-minute interval as STRING");
-        assert_eq!(b["exchangeSegment"], "NSE_EQ");
-        assert_eq!(b["fromDate"], "2026-06-02 00:00:00");
-        assert_eq!(b["toDate"], "2026-06-03 00:00:00");
-    }
-
-    #[test]
-    fn intraday_utc_secs_to_ist_minute_nanos_floors_to_minute() {
-        // 2026-06-02 06:02:07 UTC = 11:32:07 IST. Floor to 11:32:00 IST.
-        let utc = 1_780_380_127_i64; // arbitrary epoch second
-        let got = intraday_utc_secs_to_ist_minute_nanos(utc);
-        // It must be a whole minute in IST nanos.
-        assert_eq!(
-            got % (SECONDS_PER_MINUTE * NANOS_PER_SEC),
-            0,
-            "floored to minute"
-        );
-        // And exactly IST offset + minute floor.
-        let ist = utc + i64::from(IST_UTC_OFFSET_SECONDS);
-        let expected = (ist - ist.rem_euclid(60)) * NANOS_PER_SEC;
-        assert_eq!(got, expected);
-    }
-
-    #[test]
-    fn parse_intraday_1m_candles_happy_path() {
-        let body = r#"{"open":[100.0,101.0],"high":[100.5,101.5],"low":[99.5,100.5],"close":[100.2,101.2],"volume":[10,20],"timestamp":[1780380120,1780380180]}"#;
-        let c = parse_intraday_1m_candles(body);
-        assert_eq!(c.len(), 2);
-        assert_eq!(c[0].open, 100.0);
-        assert_eq!(c[1].volume, 20);
-        // minute buckets differ by exactly 60s in nanos.
-        assert_eq!(
-            c[1].minute_ts_ist_nanos - c[0].minute_ts_ist_nanos,
-            SECONDS_PER_MINUTE * NANOS_PER_SEC
-        );
-    }
-
-    #[test]
-    fn parse_intraday_1m_candles_rejects_length_mismatch_and_malformed() {
-        assert!(parse_intraday_1m_candles("not json").is_empty());
-        assert!(parse_intraday_1m_candles("{}").is_empty());
-        let mismatch = r#"{"open":[1.0],"high":[1.0],"low":[1.0],"close":[1.0],"volume":[1],"timestamp":[1,2]}"#;
-        assert!(parse_intraday_1m_candles(mismatch).is_empty());
-    }
-
-    #[test]
-    fn parse_intraday_1m_candles_volume_as_float_truncates() {
-        let body = r#"{"open":[1.0],"high":[1.0],"low":[1.0],"close":[1.0],"volume":[12345.0],"timestamp":[1780380120]}"#;
-        let c = parse_intraday_1m_candles(body);
-        assert_eq!(c.len(), 1);
-        assert_eq!(c[0].volume, 12345);
-    }
+    // Phase C1 (2026-07-13): the intraday_request_body /
+    // intraday_utc_secs_to_ist_minute_nanos / parse_intraday_1m_candles unit
+    // tests moved WITH their subjects to `dhan_intraday_parse.rs`.
 
     #[test]
     fn parse_our_candles_dataset_happy_path() {
@@ -1330,6 +1387,73 @@ mod tests {
         assert_eq!(v["missing_ours"], 15);
         assert_eq!(v["fetch_failures"], 2);
         assert_eq!(v["degraded"], false);
+    }
+
+    // -----------------------------------------------------------------
+    // 429-coordination second pass (2026-07-13 follow-up)
+    // -----------------------------------------------------------------
+
+    /// Cohort collection: exactly the 429-failed indices, order-preserved;
+    /// Ok and non-429 failures never enter the retry cohort.
+    #[test]
+    fn test_collect_429_cohort_selects_only_rate_limited_in_order() {
+        use FirstPassFetch::{Failed429, FailedOther, Ok as FpOk};
+        let verdicts = [FpOk, Failed429, FailedOther, Failed429, FpOk, Failed429];
+        assert_eq!(collect_429_cohort(&verdicts), vec![1, 3, 5]);
+        // The 2026-07-13 incident shape: 91 of 776 rate-limited.
+        let mut day = vec![FpOk; 776];
+        for slot in day.iter_mut().take(91) {
+            *slot = Failed429;
+        }
+        assert_eq!(collect_429_cohort(&day).len(), 91);
+        // No 429s → empty cohort → the second pass never runs.
+        assert!(collect_429_cohort(&[FpOk, FailedOther]).is_empty());
+        assert!(collect_429_cohort(&[]).is_empty());
+    }
+
+    /// Pacing math: the gap keeps the second pass at ≤ 3 requests/second —
+    /// strictly below the Data-API 5/sec budget — and a zero input degrades
+    /// to 1/sec instead of panicking or bursting.
+    #[test]
+    fn test_retry_pace_gap_ms_stays_inside_data_api_budget() {
+        let gap = retry_pace_gap_ms(RETRY_429_MAX_PER_SEC);
+        assert_eq!(gap, 334, "ceil(1000/3)");
+        // N paced requests span ≥ 1 s per N — never more than 3/sec.
+        assert!(gap * RETRY_429_MAX_PER_SEC >= 1_000);
+        assert!(RETRY_429_MAX_PER_SEC < u64::from(DATA_API_RPS));
+        // Degenerate inputs stay safe.
+        assert_eq!(retry_pace_gap_ms(0), 1_000);
+        assert_eq!(retry_pace_gap_ms(1), 1_000);
+        assert_eq!(retry_pace_gap_ms(5), 200);
+    }
+
+    /// The whole second pass is linearly bounded: cool-down + one paced gap
+    /// + at most one full request timeout per cohort member (the honest
+    /// pathological ceiling — a real 429 answers in milliseconds, so the
+    /// realistic cost is the paced gaps: the 2026-07-13 incident cohort of
+    /// 91 ≈ 45 s + 91 × 334 ms ≈ 75 s). No unbounded loops anywhere.
+    #[test]
+    fn test_second_pass_duration_bound_ms_is_linear_and_bounded() {
+        assert_eq!(
+            second_pass_duration_bound_ms(0),
+            RETRY_429_COOLDOWN_SECS * 1_000
+        );
+        let per_member = retry_pace_gap_ms(RETRY_429_MAX_PER_SEC) + REST_TIMEOUT_SECS * 1_000;
+        assert_eq!(
+            second_pass_duration_bound_ms(91),
+            RETRY_429_COOLDOWN_SECS * 1_000 + 91 * per_member
+        );
+        // Strictly linear (one pass, one request per member — never a loop).
+        assert_eq!(
+            second_pass_duration_bound_ms(776) - second_pass_duration_bound_ms(775),
+            per_member
+        );
+        // The realistic (paced-gap-only) incident-cohort cost fits in ~2 min
+        // — well inside the ~57 min between the 15:31 run and the 16:30 IST
+        // box stop even after the first pass.
+        let realistic_91_ms =
+            RETRY_429_COOLDOWN_SECS * 1_000 + 91 * retry_pace_gap_ms(RETRY_429_MAX_PER_SEC);
+        assert!(realistic_91_ms < 2 * 60 * 1_000);
     }
 
     #[test]
