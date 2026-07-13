@@ -3,6 +3,7 @@
 > **Fetched:** 2026-07-13 · **Evidence tier:** n/a — this file enumerates what the public evidence genuinely does NOT state. Every `**Unknown**`/`U-n` flag in files 01–13 resolves here. Union of all research passes, deduped.
 > **How to use:** rows marked *sales* → email/call GDF sales (sales@globaldatafeeds.in, +91-77210 80002) with the EXACT question wording; rows marked *probe* → answerable in the first hour of a trial key; *both* → ask AND verify.
 > **Blocking legend:** `client` = blocks building the Rust client · `purchase` = blocks the buy/no-buy decision · `ops` = blocks operational planning · `none` = nice-to-know.
+> **2026-07-13:** the browser-paste capture queue for closing the doc-derived unknowns below lives in [`00-PASTE-LIST.md`](./00-PASTE-LIST.md) (WAF re-verified total that date; operator paste is the only route).
 
 | # | Question (exact wording to ask / probe) | How | Why it matters | Blocking |
 |---|---|---|---|---|
