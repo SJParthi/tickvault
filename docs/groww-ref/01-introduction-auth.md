@@ -3,6 +3,8 @@
 > **Source:** https://groww.in/trade-api/docs/python-sdk
 > **Verified:** 12 June 2026 · **Package:** `growwapi` · **Python:** 3.9+
 
+> **⚠ SUPERSEDED ON RATE LIMITS + TOKEN LIFECYCLE (2026-07-13 full-coverage refresh):** the authoritative rate-limit/capacity truth is [`15-rate-limits-and-capacity.md`](./15-rate-limits-and-capacity.md) and the CORRECTED auth/token truth is [`17-token-lifecycle.md`](./17-token-lifecycle.md) — this page's "two auth flows" reading under-counts (the REST intro documents THREE, incl. the direct Access Token that officially "(Expires daily at 6:00 AM)"). Content below retained as the June-2026 python-sdk-page capture.
+
 Welcome to the Groww Trading API. The APIs let you build and automate trading strategies with access to real-time market data, order placement, portfolio management, and more. The SDK wraps Groww's REST-like APIs into easy-to-use Python methods. With it you can execute and modify orders in real time, manage your portfolio, access live market data, and more through a clean Python interface.
 
 ## Key Features

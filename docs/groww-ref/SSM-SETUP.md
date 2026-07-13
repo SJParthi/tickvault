@@ -1,5 +1,7 @@
 # Groww feed — AWS SSM credential setup
 
+> **⚠ SUPERSEDED (2026-07-02 operator lock, banner added 2026-07-13):** this file's Groww-credential guidance predates and conflicts with the shared token-minter lock — [`.claude/rules/project/groww-shared-token-minter-2026-07-02.md`](../../.claude/rules/project/groww-shared-token-minter-2026-07-02.md) is authoritative. TickVault now only ever READS the bruteX-Lambda-minted `/tickvault/<env>/groww/access-token` (the `api-key`/`totp-secret` params below are Lambda-only by IAM; TickVault NEVER mints — the mint path described below was deleted). Token lifecycle facts: [`17-token-lifecycle.md`](./17-token-lifecycle.md). Content below retained as the 2026-06-19 historical record.
+
 > **Scope:** the two secrets the native Rust Groww auth (`crate::feed::groww::auth`)
 > reads. Mirrors the Dhan SSM convention `/tickvault/<env>/<service>/<key>`.
 > **Locked 2026-06-19** — the Rust code reads exactly these names; don't rename
