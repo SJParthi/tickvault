@@ -59,6 +59,11 @@ pub mod groww_option_chain_1m_boot;
 // reconciler + the 15:45 IST daily Dhan-vs-Groww aggregation + the Telegram
 // scorecard summary (SCOREBOARD-01 family).
 pub mod feed_scoreboard_boot;
+// Daily timeframe-consistency verifier (operator 2026-07-13): at 15:40 IST,
+// recompute every higher-TF candle (2m..4h) from the stored 1m rows and
+// compare against the persisted TF tables — Dhan verifies TODAY, Groww
+// verifies the PREVIOUS trading day (TF-VERIFY-01/02).
+pub mod tf_consistency_boot;
 pub mod tick_conservation_boot;
 // PR #8a (2026-05-19) — Slice 1: 09:15:00 IST `DayOhlcTracker::arm_sid()`
 // boot wiring per `index-day-ohlc-tracker-error-codes.md`. Closes the

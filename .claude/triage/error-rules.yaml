@@ -2429,3 +2429,48 @@ rules:
       down for the day by design; operator judgement decides between
       waiting for tomorrow's boot and restarting after the REST surface
       recovers.
+
+  # -----------------------------------------------------------------------
+  # Daily timeframe-consistency verifier (operator 2026-07-13)
+  # -----------------------------------------------------------------------
+
+  # TF-VERIFY-01 = the 15:40 IST verifier found stored higher-TF candles
+  # that disagree with their recompute-from-1m (mismatch / missing_tf_row /
+  # no_1m_coverage / off_grid_ts / duplicate_key). A data-integrity
+  # divergence between two of OUR OWN stores is never auto-actioned
+  # (is_auto_triage_safe = false, the FUTIDX-02 precedent): the operator
+  # decides whether the aggregator, the seal writer, or the 1m baseline is
+  # wrong — auto-"fixing" either side would forge candle data.
+  - name: tf-verify-01-mismatch-found-escalate
+    match:
+      code: TF-VERIFY-01
+    action: escalate
+    runbook_path: .claude/rules/project/tf-consistency-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 600
+    justification: >-
+      TF-VERIFY-01 = stored TF candle disagrees with its 1m recompute.
+      The tf_consistency_audit table carries every finding cell; the
+      operator triages via the per-category/per-TF SQL in the runbook and
+      compares against prior days (trend, not absolute) before deciding
+      which store is wrong. Nothing is safe to auto-fix.
+
+  # TF-VERIFY-02 = the verifier run itself degraded (client build /
+  # discovery / per-SID query / truncation / flush / budget). Best-effort
+  # forensic cold-path task: a lost run loses one day's verification
+  # signal, never any market data, and a TICKVAULT_TF_VERIFY_NOW +
+  # TICKVAULT_TF_VERIFY_DATE backfill re-run UPSERTs in place once the
+  # cause (usually QuestDB health at 15:40) is fixed.
+  - name: tf-verify-02-run-degraded-escalate
+    match:
+      code: TF-VERIFY-02
+    action: escalate
+    runbook_path: .claude/rules/project/tf-consistency-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 600
+    justification: >-
+      TF-VERIFY-02 = timeframe-consistency run degraded. The stage field
+      names the failing leg; the operator cross-checks QuestDB health
+      (BOOT-01/02, WAL-SUSPEND-01) and backfills with the env override
+      re-run per the runbook. Auto-restarting the app for a degraded
+      forensic run would be worse than the miss.

@@ -2880,4 +2880,18 @@ mod tests {
             "midnight guard must not feed the edge"
         );
     }
+
+    /// The expiry-unresolved degrade detail is plain-English, bounded, and
+    /// carries every degraded symbol + the scanned row count (pure fn).
+    #[test]
+    fn test_expiry_degrade_detail_names_symbols_and_row_count() {
+        let detail = expiry_degrade_detail(&["NIFTY", "SENSEX"], 421);
+        assert_eq!(
+            detail,
+            "NIFTY, SENSEX — no usable option expiry in today's contract list (421 rows scanned)"
+        );
+        let single = expiry_degrade_detail(&["BANKNIFTY"], 0);
+        assert!(single.starts_with("BANKNIFTY — "));
+        assert!(single.contains("(0 rows scanned)"));
+    }
 }

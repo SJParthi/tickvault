@@ -649,6 +649,7 @@ impl GrowwTokenCache {
     /// network read (the pacing floor), so the no-token fire arms are
     /// testable hermetically.
     #[cfg(test)]
+    // TEST-EXEMPT: cfg(test)-only constructor consumed by the hermetic fire-arm tests below — guard raw-grep false positive
     pub(crate) fn for_test_paced_out(now_ms: i64) -> Self {
         Self {
             token: None,
@@ -661,6 +662,7 @@ impl GrowwTokenCache {
     /// returns it without any SSM read, so the token-path fire arms are
     /// testable hermetically against a mock server.
     #[cfg(test)]
+    // TEST-EXEMPT: cfg(test)-only constructor consumed by the hermetic fire-arm tests below — guard raw-grep false positive
     pub(crate) fn for_test_with_token(token: SecretString) -> Self {
         Self {
             token: Some(token),
