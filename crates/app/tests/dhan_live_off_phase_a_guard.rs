@@ -173,18 +173,51 @@ fn test_overlay_and_gate_and_suppression_warn_exist() {
 /// lane while the boot config says Dhan is off (a POST /api/feeds/dhan
 /// enable would otherwise collide with the REST-only stack's dual-instance
 /// SSM lock: AlreadyHeld → DHAN-LANE-03 retry loop + pages).
+///
+/// Strengthened 2026-07-13 (review LOW — anywhere-in-file grep was
+/// semi-vacuous): the scan is now scoped to the SUPERVISOR FUNCTION REGION
+/// and source-order asserted — the gate needle must open BEFORE the
+/// refusal warn, and BOTH must precede the cold-start spawn inside that
+/// region — so an inverted gate (`if ctx.config...`), an emptied gate
+/// body, or a gate moved off the spawn path all fail the build.
 #[test]
 fn test_runtime_cold_start_refusal_exists() {
     let main_src = strip_line_comments(&read("crates/app/src/main.rs"));
+
+    // Extract the supervisor function region: from its `pub async fn` to
+    // the next top-level fn (the cold-start driver it spawns).
+    let region_start = main_src
+        .find("pub async fn run_dhan_lane_runtime_supervisor(")
+        .expect("run_dhan_lane_runtime_supervisor must exist in main.rs"); // APPROVED: test
+    let region_end = main_src
+        .find("pub async fn run_dhan_lane_cold_start(")
+        .expect("run_dhan_lane_cold_start must exist in main.rs"); // APPROVED: test
     assert!(
-        main_src.contains("if !ctx.config.feeds.dhan_enabled {"),
-        "run_dhan_lane_runtime_supervisor lost the config gate on the \
-         cold-start spawn (operator directive 2026-07-13)"
+        region_start < region_end,
+        "the supervisor must be defined before the cold-start driver \
+         (source-order assumption of this scan)"
     );
+    let region = &main_src[region_start..region_end];
+
+    let gate_pos = region.find("if !ctx.config.feeds.dhan_enabled {").expect(
+        "run_dhan_lane_runtime_supervisor lost the config gate on the \
+         cold-start spawn (operator directive 2026-07-13)",
+    ); // APPROVED: test
+    let warn_pos = region
+        .find("Dhan live WS lane retired by operator directive 2026-07-13")
+        .expect(
+            "the supervisor lost the runtime-enable refusal notice — the \
+             refusal must be logged (edge-latched), never silent",
+        ); // APPROVED: test
+    let spawn_pos = region
+        .find("tokio::spawn(run_dhan_lane_cold_start(")
+        .expect("the supervisor lost its cold-start spawn call"); // APPROVED: test
     assert!(
-        main_src.contains("Dhan live WS lane retired by operator directive 2026-07-13"),
-        "main.rs lost the runtime-enable refusal notice — the refusal must \
-         be logged (edge-latched), never silent"
+        gate_pos < warn_pos && warn_pos < spawn_pos,
+        "the refusal gate must OPEN before its warn body and BOTH must \
+         precede the cold-start spawn (gate @{gate_pos} < warn @{warn_pos} \
+         < spawn @{spawn_pos} within the supervisor region) — an inverted \
+         or emptied gate, or a gate moved off the spawn path, fails here"
     );
 }
 
