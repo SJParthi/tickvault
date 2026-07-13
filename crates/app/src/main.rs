@@ -2977,13 +2977,17 @@ async fn main() -> Result<()> {
             &feed_runtime,
         );
 
-        // Groww per-minute spot 1m REST leg on the FAST crash-recovery arm
-        // too (hostile round 1 item 1 — the scoreboard dual-site pattern):
-        // this arm `return run_shutdown_fast`s and never reaches the
-        // slow-path spawn below, yet a mid-market crash restart routes
-        // through EXACTLY this arm — without this call the flagship
-        // crash-restart day ran NO per-minute fetches and NO 15:31 sweep.
-        spawn_groww_spot_1m_leg(&config, &notifier, &trading_calendar);
+        // Daily 15:40 IST timeframe-consistency verifier on the FAST
+        // crash-recovery arm too (operator 2026-07-13; the scoreboard
+        // dual-spawn precedent directly above): this arm `return
+        // run_shutdown_fast`s and never reaches the process-global spawn
+        // below, yet a mid-market crash-restart session must still own the
+        // day's 15:40 TF-VERIFY run. Once-per-process guarded inside.
+        tickvault_app::tf_consistency_boot::spawn_tf_consistency_tasks(
+            &config,
+            &trading_calendar,
+            &notifier,
+        );
 
         // --- Await shutdown ---
         return run_shutdown_fast(
@@ -3163,15 +3167,19 @@ async fn main() -> Result<()> {
         &feed_runtime,
     );
 
-    // Groww per-minute spot 1m REST leg (operator grant 2026-07-13 — PR-2 of
-    // the Groww per-minute REST plan) — the slow-path call site; the FAST
-    // crash-recovery arm carries its own (hostile round 1 item 1 — the
-    // scoreboard dual-site pattern). Every trading-day minute close in
-    // [09:16:00, 15:30:00] IST it fetches the just-closed minute's official
-    // Groww 1m OHLCV for the 3 spot indices and persists to `spot_1m_rest`
-    // tagged feed='groww' (+ `rest_fetch_audit` forensics rows). See
-    // `spawn_groww_spot_1m_leg`.
-    spawn_groww_spot_1m_leg(&config, &notifier, &trading_calendar);
+    // Daily 15:40 IST timeframe-consistency verifier — PROCESS-GLOBAL like
+    // the conservation audit + scoreboard above (operator 2026-07-13):
+    // recompute every higher-TF candle (2m..4h) from the stored 1m rows and
+    // compare against the persisted TF tables — Dhan verifies TODAY, Groww
+    // verifies the PREVIOUS trading day (TF-VERIFY-01/02). Gated on
+    // `[tf_consistency] enabled` + trading-day inside the task; the
+    // once-per-process AtomicBool inside makes the fast-arm + prefix
+    // dual-spawn safe. See `tf_consistency_boot::spawn_tf_consistency_tasks`.
+    tickvault_app::tf_consistency_boot::spawn_tf_consistency_tasks(
+        &config,
+        &trading_calendar,
+        &notifier,
+    );
 
     // -----------------------------------------------------------------------
     // DayOhlcTracker boot wiring (post 2026-05-26 simplification; MOVED to

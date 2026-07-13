@@ -489,16 +489,17 @@ enabled = true  # entitlement proven live 2026-07-13 08:31:49 IST (§8.7)
 probe_and_report = true
 
 # ===========================================================================
-# Groww per-minute spot 1m REST leg (operator grant 2026-07-13 — PR-2 of
-# the Groww per-minute REST plan). Every trading-day minute close in
-# [09:16:00, 15:30:00] IST, fetch the just-closed minute's official 1m
-# OHLCV for the 3 spot indices (NSE-NIFTY / NSE-BANKNIFTY / BSE-SENSEX)
-# via Groww GET /v1/historical/candles and persist to the SAME
-# spot_1m_rest table tagged feed='groww' (feed-in-key DEDUP — the Dhan
-# rows are untouched). Token: shared-minter SSM READ-ONLY (never mint).
-# Independent of the Dhan lane (process-global spawn) — a Dhan-off session
-# still runs it. Cold path; the WS pipelines are untouched. An ABSENT
-# section = disabled (fail-safe); `enabled = false` is the rollback switch.
+# Daily timeframe-consistency verifier (operator directive 2026-07-13 —
+# "how will you guarantee that all our defined timeframes internally are
+# correct — how do you identify whether any miscalculation or data
+# issues"). At 15:40 IST every trading day, recompute every sealed
+# higher-timeframe candle (2m..4h) from its stored 1-minute constituents
+# and compare exactly — Dhan verifies TODAY (stable after the 15:30:05
+# close seal); Groww verifies the PREVIOUS trading day (its tails seal at
+# IST midnight). Findings land in the tf_consistency_audit table + one
+# Telegram summary (TF-VERIFY-01/02). Cold path; the live candle pipeline
+# is untouched. An ABSENT section = disabled (fail-safe);
+# `enabled = false` is the rollback switch.
 # ===========================================================================
-[groww_spot_1m]
+[tf_consistency]
 enabled = true
