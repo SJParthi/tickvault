@@ -1,5 +1,7 @@
 # MASTER CONTEXT — Groww SDK + NSE/BSE Market Data
 
+> **⚠ SUPERSEDED ON THE HISTORICAL-CANDLES ENDPOINT (2026-07-13 full-coverage refresh):** the authoritative Groww historical-candles reference is [`11-historical-candles.md`](./11-historical-candles.md) (current `GET /v1/historical/candles`, deprecated `/candle/range`, the 30/90/180-day caps with byte-verified provenance, expiries/contracts companions). This file's §1.5 summary is a June-2026 compilation, not a lossless capture — its caps-table provenance was flagged in the 2026-07-13 refutation pass. Content below retained as compiled context.
+
 > **Single drop-in context file for a Claude Code session.** Combines: (1) the Groww Trading API Python SDK surface, and (2) NSE/BSE end-of-day market-data sources (spot + F&O + indices + SENSEX).
 > **Compiled & verified:** 13 June 2026. Sources checked live this session.
 > **Standing assumptions for the Code session:** prices in ₹; NSE blocks bare HTTP (cookie dance required); archive URLs rotate (treat every raw URL as "verify on first run"); EOD bhavcopy ≠ intraday (intraday comes from the Groww candles API).

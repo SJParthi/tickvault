@@ -53,3 +53,18 @@ index for that official pack; the older reverse-read/context docs
 | 09 | [`09-instruments-csv.md`](./09-instruments-csv.md) | instrument.csv, exchange tokens, DataFrame helpers |
 | 12 | [`12-sdk-exceptions.md`](./12-sdk-exceptions.md) | SDK exception classes |
 | 13 | [`13-annexures-enums.md`](./13-annexures-enums.md) | All enums: exchange, segment, product, order type, validity, statuses |
+
+---
+
+## 2026-07-13 full-coverage refresh
+
+Per the 2026-07-13 full-coverage directive, the remaining doc areas of the 26-page capture were compiled into evidence-tiered reference files (gdf-ref conventions: tier labels on every claim + a consolidated unknowns file). Access note: groww.in was 403-blocked at the sandbox proxy on 2026-07-13 — these files rest on the 2026-07-03 lossless capture + 2026-07-13 live search-mediated cross-checks + the official `growwapi` 1.5.0 wheel source, with the proxy-block honestly recorded per file. Key corrections landed with this refresh: the docs define **THREE auth approaches** (not two), and the **daily ~06:00 IST token expiry IS officially documented** ("(Expires daily at 6:00 AM)", REST intro) — see `17-token-lifecycle.md`.
+
+| # | Local file | Contents |
+|---|------------|----------|
+| 11 | [`11-historical-candles.md`](./11-historical-candles.md) | Historical candles: current `GET /v1/historical/candles` (12 intervals, 30/90/180-day caps, `[ts,o,h,l,c,volume,oi]`, ISO-T-vs-space timestamp wart), deprecated `/candle/range`, expiries/contracts companions, current-day-serving UNDOCUMENTED section |
+| 14 | [`14-option-chain.md`](./14-option-chain.md) | `GET /v1/option-chain/exchange/{exchange}/underlying/{underlying}?expiry_date=` — full verbatim response (underlying_ltp + all strikes × CE/PE with greeks), no strike-window param, no response timestamp, rate-limit family Unknown |
+| 15 | [`15-rate-limits-and-capacity.md`](./15-rate-limits-and-capacity.md) | THE capacity-truth file: official 3-family rate-limit table verbatim + freshness forensics (stale 15/s third-party tables refuted), unassigned families, per-minute-pipeline arithmetic, 429 behaviour, live-probe plan |
+| 16 | [`16-orders-margins-portfolio.md`](./16-orders-margins-portfolio.md) | Orders/smart-orders/portfolio/margin endpoint inventory + full verbatim field tables (order detail 22 fields, both margin endpoints) + annexure enums + the official GA000–GA007 error-code table — **NOT used by TickVault** (doc completeness only) |
+| 17 | [`17-token-lifecycle.md`](./17-token-lifecycle.md) | CORRECTED token lifecycle: 3 documented auth approaches, mint wire shapes verbatim, the officially documented daily 6:00 AM expiry + the machine-readable `expiry` response field the SDK discards, python-sdk-vs-REST wording contradiction, token-minter-lock cross-ref |
+| 99 | [`99-UNKNOWNS.md`](./99-UNKNOWNS.md) | Consolidated `[U-n]` open-questions table (gdf-ref style) — every genuinely undocumented item with the exact Groww-support question or live probe that answers it |
