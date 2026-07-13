@@ -94,7 +94,8 @@ the distinct-key count).
 
 **Severity:** High. **Auto-triage safe:** **No** — hostile-review round 3 (2026-07-08)
 reconciled the enum to the design contract (THIS section + the R3-4 record in
-`.claude/plans/archive/2026-07-08-futidx-4.md` (archived 2026-07-13) — the in-repo authority; round 4 (2026-07-08)
+`.claude/plans/archive/2026-07-08-futidx-4.md` — the in-repo authority (archived from
+active 2026-07-13 per plan-enforcement rule 7); round 4 (2026-07-08)
 replaced a dangling scratchpad "FINAL.md D0.5/T3.4" citation that never landed in the
 tree): `is_auto_triage_safe()`
 now carries a severity-independent override arm returning `false` for FUTIDX-02, so ANY
