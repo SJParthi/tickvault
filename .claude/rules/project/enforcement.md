@@ -34,13 +34,44 @@ paths:
 ## Test Count Baseline (.test-count-baseline)
 - Ratchet mechanism — count can only go UP
 - Manual override only: `echo <count> > .claude/hooks/.test-count-baseline`
-- Gitignored (local machine state)
+- Local machine state — genuinely gitignored AND untracked (was accidentally
+  git-tracked until 2026-07-13 — untracked in this fix; gitignore never
+  applied to already-tracked files, so a stale committed count dirtied the
+  tree on every gate run on any machine whose committed baseline was below
+  the live count)
+- Auto-stamped by `test-count-guard.sh` on first run per machine; the ratchet
+  applies per-machine from that point
+- CI never runs this guard — a CI run would establish a fresh baseline and
+  pass vacuously (merge-gate-lock-2026-07-04.md §3 row 6)
 
 ## Untested Pub Fn Baseline (.untested-pubfn-baseline)
 - Ratchet mechanism — count can only go DOWN
 - Every new pub fn must have a matching #[test] or "// TEST-EXEMPT: <reason>"
 - Manual override: `echo <count> > .claude/hooks/.untested-pubfn-baseline`
-- Gitignored (local machine state)
+- Local machine state — genuinely gitignored AND untracked (was accidentally
+  git-tracked until 2026-07-13 — untracked in this fix; gitignore never
+  applied to already-tracked files, so the stale committed count hard-blocked
+  pre-push gate 6 over unrelated diffs on any machine whose committed
+  baseline was below the live count)
+- Auto-stamped by `pub-fn-test-guard.sh` (all mode) on first run per machine;
+  the ratchet applies per-machine from that point
+- CI never runs this guard — a CI run would establish a fresh baseline and
+  pass vacuously (merge-gate-lock-2026-07-04.md §3 row 6)
+
+### 2026-07-13 baseline untracking — one-time migration + fail-closed notes
+- **One-time migration:** after pulling the 2026-07-13 untracking commit, a
+  machine whose local baseline was auto-bumped by the guard may see
+  `git pull` refuse over these two files (`git stash` is banned): run
+  `git checkout -- .claude/hooks/.test-count-baseline .claude/hooks/.untested-pubfn-baseline`
+  then re-pull; the guards re-stamp per-machine on the next run.
+- **Honest envelope:** on ephemeral containers the ratchet protects only
+  within-session (first run auto-stamps); the cross-machine floor is
+  deliberately not claimed — per merge-gate-lock-2026-07-04.md §3 row 6
+  these guards are local-only.
+- **Fail-closed behavior change (same fix):** pushes from a cwd that is not
+  a git repo, or a repo without crates/, now BLOCK loudly (exit 2) instead
+  of silently passing — a push of an intentionally non-tickvault repo must
+  run outside the gated session.
 
 ## Financial Test Baseline (.financial-test-baseline)
 - Ratchet mechanism — count can only go DOWN
