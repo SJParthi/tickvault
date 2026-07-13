@@ -1403,14 +1403,18 @@ async fn run_tf_pass(p: PassParams<'_>, state: &mut RunState) -> PassStats {
         // (~1,260 1m rows) exceeds TF_VERIFY_1M_ROW_LIMIT, so classifying
         // truncation first made every FAST-arm boot (empty always_on set)
         // a guaranteed daily Degraded page. The exclusion is still sound
-        // on a TRUNCATED row set: the session window holds at most 375
-        // 1m rows (< the 500 LIMIT — pinned by the
-        // `TF_VERIFY_1M_ROW_LIMIT > 375` assertion below), so a truncated
-        // (>= LIMIT-row) response necessarily contains out-of-session
+        // on a TRUNCATED row set: with 1m DEDUP engaged the session
+        // window holds at most 375 distinct 1m rows (< the 500 LIMIT —
+        // pinned by the `TF_VERIFY_1M_ROW_LIMIT > 375` assertion below),
+        // so a truncated (>= LIMIT-row) response carries out-of-session
         // rows, and under the query's ORDER BY ts ASC the pre-open rows
         // sort into the returned prefix (even a purely post-close
         // overflow lands inside the LIMIT because in-session rows fill
-        // at most 375 of its slots).
+        // at most 375 of its slots). If 1m DEDUP were broken (duplicate
+        // keys inflating the in-session count past the LIMIT with zero
+        // out-of-session rows), this exclusion simply does not fire and
+        // the instrument falls through to the LOUD Query-A truncation
+        // degrade below — never a silent partial compare.
         if has_out_of_session_1m_row(&rows_1m, day_start_nanos) {
             // Refuter round 2: the DATA-derived exclusion gets its own
             // reason label — an instrument reaching this arm is by
@@ -3332,14 +3336,30 @@ mod tests {
         let out_of_session_in_loop = loop_body
             .find("has_out_of_session_1m_row(&rows_1m")
             .expect("H2 exclusion must be inside the loop");
-        let first_truncated = loop_body
-            .find(r#"count_query_failure(&mut stats, "truncated")"#)
-            .expect("the Query-A truncation tripwire must exist");
+        // Final-refuter hardening: anchor the Query-A tripwire on its
+        // literal `if truncated_1m` guard, NOT on the first generic
+        // "truncated" classification — otherwise deleting the Query-A
+        // tripwire would let this ratchet match the Query-B occurrence
+        // and pass vacuously.
+        let query_a_tripwire = loop_body
+            .find("if truncated_1m")
+            .expect("the Query-A truncation tripwire (`if truncated_1m`) must exist");
         assert!(
-            out_of_session_in_loop < first_truncated,
+            out_of_session_in_loop < query_a_tripwire,
             "refuter round 3: the always-on exclusion must precede the \
              Query-A truncation tripwire (a truncated always-on \
              instrument is excluded, never degraded)"
+        );
+        // Belt-and-braces: BOTH in-loop truncation classifications
+        // (Query A + Query B) must exist — a refactor deleting either
+        // tripwire fails here instead of passing vacuously.
+        let in_loop_truncated_count = loop_body
+            .matches(r#"count_query_failure(&mut stats, "truncated")"#)
+            .count();
+        assert_eq!(
+            in_loop_truncated_count, 2,
+            "exactly two in-loop truncation tripwires expected (Query A \
+             + Query B); found {in_loop_truncated_count}"
         );
     }
 
