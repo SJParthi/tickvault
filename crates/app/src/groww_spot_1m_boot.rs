@@ -183,6 +183,11 @@ pub struct GrowwSpot1mTaskParams {
 /// minute. Month/day boundaries via `succ_opt` (cross-verify semantics).
 /// Pure.
 fn groww_day_window_strings(trading_date: NaiveDate) -> (String, String) {
+    // `succ_opt` is `None` ONLY for `NaiveDate::MAX` (year 262142) — an
+    // unreachable input for a live trading date. The fallback collapses the
+    // window to zero width (start == end), which the server answers with an
+    // empty candle set → the minute rides the ladder as target-absent
+    // (typed degrade, never a panic) — explicit per hostile round 1 item 10.
     let next_day = trading_date.succ_opt().unwrap_or(trading_date);
     (
         trading_date.format("%Y-%m-%d 00:00:00").to_string(),
@@ -420,6 +425,67 @@ fn sweep_missing_minutes(
         m = m.saturating_add(NANOS_PER_MINUTE);
     }
     out
+}
+
+/// The FIRST session minute a run's first fire actually covers: the
+/// target's one-minute-lookback backfill minute when that is in-session,
+/// else the target itself. Everything BEFORE it is the run's pre-boot
+/// blind window (item 2). Pure.
+fn first_covered_minute(target_minute_nanos: i64, session_first_minute_nanos: i64) -> i64 {
+    let prev = target_minute_nanos.saturating_sub(NANOS_PER_MINUTE);
+    if prev >= session_first_minute_nanos {
+        prev
+    } else {
+        target_minute_nanos
+    }
+}
+
+/// PRE-BOOT session minutes THIS RUN never covered (hostile round 1
+/// item 2 — the mid-session-boot silent hole): everything in
+/// `[session_first, first_covered)` when the run's first fire covered
+/// `first_covered` (its first target's backfill minute, or the target
+/// itself when the backfill was out-of-session), or the WHOLE session when
+/// the run never fired at all. These are AUDIT-ONLY named gaps — §38
+/// forbids a bulk backfill fetch, so the sweep names them (one
+/// `rest_fetch_audit` row each, outcome `named_gap`, class `pre_boot`)
+/// without ever fetching them. The same mechanism covers a supervisor
+/// respawn (the fresh run cannot vouch for pre-respawn minutes; a
+/// previously-persisted minute keeps its own `ok` row — `outcome` is in
+/// the DEDUP key, so the gap row lands ALONGSIDE, never over it). Pure.
+fn pre_boot_gap_minutes(
+    first_covered_minute_nanos: Option<i64>,
+    session_first_minute_nanos: i64,
+    session_last_minute_nanos: i64,
+) -> Vec<i64> {
+    let end_exclusive = first_covered_minute_nanos
+        .unwrap_or(i64::MAX)
+        .min(session_last_minute_nanos.saturating_add(NANOS_PER_MINUTE));
+    let mut out = Vec::new();
+    let mut m = session_first_minute_nanos;
+    while m < end_exclusive {
+        out.push(m);
+        m = m.saturating_add(NANOS_PER_MINUTE);
+    }
+    out
+}
+
+/// `true` when a vendor candle's OHLC is implausible — any non-positive
+/// O/H/L/C or `high < low` (hostile round 1 item 9). The row is STILL
+/// persisted verbatim (we mirror the vendor), but never silently: the
+/// caller counts + logs one coded line per fired minute. Pure.
+fn candle_ohlc_implausible(c: &MinuteCandle) -> bool {
+    c.open <= 0.0 || c.high <= 0.0 || c.low <= 0.0 || c.close <= 0.0 || c.high < c.low
+}
+
+/// How many EXTRA candles beyond the first share the target minute bucket
+/// (hostile round 1 item 11 — first-match-wins stays, duplicates are
+/// counted + debug-logged, never invisible). Pure.
+fn duplicate_minute_candles(candles: &[MinuteCandle], minute_nanos: i64) -> usize {
+    candles
+        .iter()
+        .filter(|c| c.minute_ts_ist_nanos == minute_nanos)
+        .count()
+        .saturating_sub(1)
 }
 
 /// Per-symbol latest successfully PERSISTED minute (append + flush
@@ -681,11 +747,12 @@ async fn read_body_capped(mut resp: reqwest::Response) -> Result<String, String>
 /// presence + sanitized body, via one bounded `warn!` per occurrence.
 async fn groww_fetch_once(
     client: &reqwest::Client,
+    url: &str,
     query: &[(&'static str, String); 6],
     token: &SecretString,
 ) -> Result<String, FetchFailure> {
     let resp = client
-        .get(GROWW_HISTORICAL_CANDLES_URL)
+        .get(url)
         .query(query)
         .bearer_auth(token.expose_secret())
         .header(GROWW_API_VERSION_HEADER, GROWW_API_VERSION_VALUE)
@@ -711,7 +778,7 @@ async fn groww_fetch_once(
             // sanitized, never raw.
             metrics::counter!("tv_groww_spot1m_rate_limited_total").increment(1);
             warn!(
-                endpoint = GROWW_HISTORICAL_CANDLES_URL,
+                endpoint = url,
                 retry_after_present,
                 body = %captured,
                 "groww_spot_1m: HTTP 429 rate-limited (shared Live-Data \
@@ -739,9 +806,14 @@ async fn groww_fetch_once(
 /// is `Empty`/`Failed`, never an unbounded in-minute retry. Every 2xx body
 /// is filtered CLIENT-SIDE to the exact minute (a stale body serving only
 /// earlier minutes rides the ladder as target-absent) and mined for the
-/// due previous-minute backfill (sticky — the first hit wins).
+/// due previous-minute backfill (sticky — the first hit wins). An
+/// AUTH-CLASS reject (401/403) SHORT-CIRCUITS the remaining rungs
+/// immediately (hostile round 1 item 12 — every further rung with the same
+/// dead token is a doomed 401; the caller drops the token cache + skips
+/// the remaining symbols for this fire).
 async fn fetch_minute_with_ladder(
     client: &reqwest::Client,
+    url: &str,
     query: &[(&'static str, String); 6],
     token: &SecretString,
     target_minute_ist_nanos: i64,
@@ -760,7 +832,7 @@ async fn fetch_minute_with_ladder(
             tokio::time::sleep(Duration::from_millis(deltas[attempt - 1])).await;
         }
         let started = std::time::Instant::now();
-        let result = groww_fetch_once(client, query, token).await;
+        let result = groww_fetch_once(client, url, query, token).await;
         let latency_ms = i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX);
         #[allow(clippy::cast_precision_loss)] // APPROVED: histogram sample only
         metrics::histogram!("tv_groww_spot1m_fetch_duration_ms").record(latency_ms as f64);
@@ -777,6 +849,20 @@ async fn fetch_minute_with_ladder(
                         backfill_minute_ist_nanos.and_then(|b| select_minute_candle(&candles, b));
                 }
                 if let Some(candle) = select_minute_candle(&candles, target_minute_ist_nanos) {
+                    // Item 11: first-match-wins stays; duplicates of the
+                    // target minute are counted + debug-logged, never
+                    // invisible.
+                    let dupes = duplicate_minute_candles(&candles, target_minute_ist_nanos);
+                    if dupes > 0 {
+                        metrics::counter!("tv_groww_spot1m_duplicate_candle_total")
+                            .increment(dupes as u64);
+                        tracing::debug!(
+                            target_minute_ist_nanos,
+                            duplicates = dupes,
+                            "groww_spot_1m: vendor served duplicate candles \
+                             for the target minute — first match kept"
+                        );
+                    }
                     let close_to_data_ms =
                         (ist_millis_of_day_now() - minute_close_ms_of_day).max(0);
                     return (
@@ -803,6 +889,13 @@ async fn fetch_minute_with_ladder(
                 forensics.final_http_status = failure.status;
                 forensics.error_class = error_class_for_status(failure.status);
                 last_error = Some(failure.msg);
+                if failure.auth_rejected {
+                    // Item 12: an auth-class reject dooms every further
+                    // rung with the same token — abort the ladder NOW; the
+                    // caller drops the token cache + short-circuits the
+                    // remaining symbols for this fire.
+                    break;
+                }
             }
         }
     }
@@ -820,13 +913,19 @@ async fn fetch_minute_with_ladder(
 
 /// The ladder wrapped in the HARD per-symbol wall-clock budget
 /// ([`GROWW_SPOT_1M_SYMBOL_BUDGET_SECS`]): a budget overrun is that
-/// symbol's failure for the minute — the SEQUENTIAL 3-symbol fire can
-/// never overrun the next boundary (the const-asserts in `constants.rs`
-/// pin 3 × budget + fire delay < 60 s). The overrun arm's forensics are
-/// honest sentinels (the timed-out ladder's partial state is dropped with
-/// its future — attempts reads 0, class `budget_exceeded`).
+/// symbol's failure for the minute. HONEST bound (hostile round 1 item 8):
+/// the `constants.rs` const-asserts pin ONLY the three LADDERS + fire
+/// delay inside the minute (3 × budget + delay < 60 s) — the SSM token
+/// read and the ILP append/flush legs run OUTSIDE that budget, so a whole
+/// fire CAN still overrun the next boundary under a stalling SSM/QuestDB;
+/// every boundary that elapses that way is counted LOUDLY by
+/// `count_missed_boundaries` (H2) + the `boundary_skipped` forensics rows,
+/// never silently. The overrun arm's forensics are honest sentinels (the
+/// timed-out ladder's partial state is dropped with its future — attempts
+/// reads 0, class `budget_exceeded`).
 async fn fetch_minute_bounded(
     client: &reqwest::Client,
+    url: &str,
     query: &[(&'static str, String); 6],
     token: &SecretString,
     target_minute_ist_nanos: i64,
@@ -837,6 +936,7 @@ async fn fetch_minute_bounded(
         Duration::from_secs(GROWW_SPOT_1M_SYMBOL_BUDGET_SECS),
         fetch_minute_with_ladder(
             client,
+            url,
             query,
             token,
             target_minute_ist_nanos,
@@ -949,6 +1049,40 @@ fn build_fetch_audit_row(
     }
 }
 
+/// Forensics rows for the symbols SKIPPED after an auth-class reject
+/// short-circuited the fire (hostile round 1 item 12): no request is ever
+/// sent for them with the dead token — outcome `no_token`, class `auth`,
+/// 0/-1 sentinels (no HTTP happened). Pure — unit-tested below.
+fn build_auth_short_circuit_rows(
+    remaining: &[(&'static str, &'static str, &'static str, &'static str)],
+    target_minute_ist_nanos: i64,
+    trading_date_nanos: i64,
+) -> Vec<RestFetchAuditRow> {
+    let forensics = LadderForensics {
+        attempts: 0,
+        rate_limited_count: 0,
+        final_http_status: 0,
+        final_latency_ms: -1,
+        error_class: "auth",
+        auth_rejected: true,
+    };
+    remaining
+        .iter()
+        .map(|&(groww_symbol, symbol, _exchange, _segment)| {
+            build_fetch_audit_row(
+                target_minute_ist_nanos,
+                trading_date_nanos,
+                stable_index_security_id(groww_symbol),
+                symbol,
+                &forensics,
+                RestFetchOutcome::NoToken,
+                -1,
+                "auth",
+            )
+        })
+        .collect()
+}
+
 /// Best-effort forensics append: a failure logs (coded) + counts and
 /// RETURNS — the fetch loop, the verdict and the failure edge are never
 /// affected by the forensics leg.
@@ -1035,6 +1169,12 @@ pub async fn run_groww_spot_1m(params: GrowwSpot1mTaskParams) {
     // H1: the last boundary actually HANDLED (fired or skipped-stale) —
     // the next fire is always STRICTLY after it.
     let mut last_fired: Option<u32> = None;
+    // Item 2: the first session minute THIS RUN actually covered (its first
+    // fire's backfill minute, or the target when the backfill was
+    // out-of-session). Everything before it is the run's pre-boot blind
+    // window — the sweep names those minutes AUDIT-ONLY (no fetch; §38
+    // forbids a bulk backfill). `None` = the run never fired.
+    let mut first_covered: Option<i64> = None;
     info!(
         symbols = GROWW_SPOT_1M_SYMBOLS.len(),
         "groww_spot_1m: per-minute fetch loop armed (fires each minute close \
@@ -1049,6 +1189,11 @@ pub async fn run_groww_spot_1m(params: GrowwSpot1mTaskParams) {
             info!("groww_spot_1m: no longer a trading day — exiting");
             return;
         }
+        // Item 7: the trading date as of THIS iteration's start — a suspend
+        // across IST midnight makes the post-wake `today_ist()` a DIFFERENT
+        // day, and stamping pre-suspend session seconds onto it would file
+        // forensics rows under the wrong trading date.
+        let iter_date = today_ist();
         let now = ist_secs_of_day_now();
         let Some(fire) = next_fire_after(now, last_fired) else {
             info!(
@@ -1062,6 +1207,7 @@ pub async fn run_groww_spot_1m(params: GrowwSpot1mTaskParams) {
                 &mut audit_writer,
                 &mut tracker,
                 &mut token_cache,
+                first_covered,
             )
             .await;
             return;
@@ -1082,13 +1228,29 @@ pub async fn run_groww_spot_1m(params: GrowwSpot1mTaskParams) {
                  (suspend/clock step?) — skipping this minute"
             );
             let missed = count_missed_boundaries(fire.saturating_sub(60), woke.saturating_sub(1));
-            record_skipped_boundaries(&params, &mut edge, &mut audit_writer, missed, fire);
+            record_skipped_boundaries(
+                &params,
+                &mut edge,
+                &mut audit_writer,
+                missed,
+                fire,
+                iter_date,
+            );
             if woke > fire {
                 last_fired = Some((woke.min(SPOT_1M_REST_LAST_FIRE_SECS_OF_DAY_IST) / 60) * 60);
             }
             continue;
         }
 
+        // Item 2: the run's first fire covers its target + (when
+        // in-session) the target's one-minute-lookback backfill minute —
+        // everything earlier is the pre-boot blind window the sweep names.
+        if first_covered.is_none() {
+            let target = minute_open_ist_nanos(iter_date, fire.saturating_sub(60));
+            let session_first =
+                minute_open_ist_nanos(iter_date, SPOT_1M_REST_FIRST_FIRE_SECS_OF_DAY_IST - 60);
+            first_covered = Some(first_covered_minute(target, session_first));
+        }
         fire_one_minute(
             &params,
             &client,
@@ -1105,7 +1267,14 @@ pub async fn run_groww_spot_1m(params: GrowwSpot1mTaskParams) {
         // fire can never be fetched — count them loudly + feed the edge.
         let after = ist_secs_of_day_now();
         let missed = count_missed_boundaries(fire, after.saturating_sub(1));
-        record_skipped_boundaries(&params, &mut edge, &mut audit_writer, missed, fire + 60);
+        record_skipped_boundaries(
+            &params,
+            &mut edge,
+            &mut audit_writer,
+            missed,
+            fire + 60,
+            iter_date,
+        );
         if missed > 0 {
             last_fired = Some((after.min(SPOT_1M_REST_LAST_FIRE_SECS_OF_DAY_IST) / 60) * 60);
         }
@@ -1124,6 +1293,7 @@ fn record_skipped_boundaries(
     audit_writer: &mut RestFetchAuditWriter,
     skipped: u32,
     first_missed_boundary_secs: u32,
+    iter_date: NaiveDate,
 ) {
     if skipped == 0 {
         return;
@@ -1139,7 +1309,21 @@ fn record_skipped_boundaries(
         "SPOT1M-01: Groww minute boundaries elapsed unfetched (fire overrun \
          / suspend) — those minutes stay absent (backfill/sweep may recover)"
     );
+    // Item 7: a wake that crossed IST midnight would stamp the missed
+    // PRE-SUSPEND session seconds onto the POST-WAKE date — wrong trading
+    // date on every row. The counter + coalesced log above already fired;
+    // skip the (mis-dated) forensics rows + edge accounting.
     let trading_date = today_ist();
+    if trading_date != iter_date {
+        warn!(
+            %iter_date,
+            %trading_date,
+            "groww_spot_1m: wake crossed IST midnight — skipping the \
+             boundary-skip forensics rows (they would carry the wrong \
+             trading date); the day is over for this run"
+        );
+        return;
+    }
     let trading_date_nanos = minute_open_ist_nanos(trading_date, 0);
     let skip_forensics = LadderForensics {
         attempts: 0,
@@ -1219,7 +1403,7 @@ async fn fire_one_minute(
     // M1: a minute is fully-OK for the edge ONLY when the fetch succeeded
     // AND append+flush confirmed (a day-long QuestDB outage must page).
     let mut persist_failed = false;
-    let mut auth_reject_seen = false;
+    let mut implausible_count: usize = 0;
     let mut sample_failure: Option<String> = None;
     // Minutes appended this fire, committed to the tracker ONLY after the
     // flush confirms (a failed flush discards the buffer — never a false
@@ -1227,7 +1411,9 @@ async fn fire_one_minute(
     let mut staged: Vec<(i64, i64)> = Vec::new();
 
     if let Some(token) = token_cache.ensure_token().await {
-        for (groww_symbol, symbol, exchange, segment) in GROWW_SPOT_1M_SYMBOLS {
+        for (idx, &(groww_symbol, symbol, exchange, segment)) in
+            GROWW_SPOT_1M_SYMBOLS.iter().enumerate()
+        {
             let security_id = stable_index_security_id(groww_symbol);
             let query = groww_candles_query(groww_symbol, exchange, segment, trading_date);
             let backfill_nanos = backfill_minute_nanos(
@@ -1237,6 +1423,7 @@ async fn fire_one_minute(
             );
             let (outcome, forensics) = fetch_minute_bounded(
                 client,
+                GROWW_HISTORICAL_CANDLES_URL,
                 &query,
                 &token,
                 target_nanos,
@@ -1244,7 +1431,6 @@ async fn fire_one_minute(
                 minute_close_ms,
             )
             .await;
-            auth_reject_seen |= forensics.auth_rejected;
 
             // Forensics row FIRST (success AND failure) — best-effort, the
             // verdict below is computed independently.
@@ -1308,6 +1494,9 @@ async fn fire_one_minute(
             };
             if let Some((candle, close_to_data_ms)) = own_outcome {
                 ok_count = ok_count.saturating_add(1);
+                if candle_ohlc_implausible(&candle) {
+                    implausible_count = implausible_count.saturating_add(1);
+                }
                 metrics::counter!("tv_groww_spot1m_fetch_total", "outcome" => "ok").increment(1);
                 #[allow(clippy::cast_precision_loss)] // APPROVED: histogram sample only
                 metrics::histogram!("tv_groww_spot1m_close_to_data_ms")
@@ -1339,6 +1528,9 @@ async fn fire_one_minute(
                 }
             }
             if let Some(backfill) = backfill_candle {
+                if candle_ohlc_implausible(&backfill) {
+                    implausible_count = implausible_count.saturating_add(1);
+                }
                 // Honest delay: the backfilled minute closed 60 s before
                 // this fire's target minute close.
                 let backfill_close_to_data_ms =
@@ -1374,6 +1566,32 @@ async fn fire_one_minute(
                     staged.push((security_id, backfill.minute_ts_ist_nanos));
                 }
             }
+            if forensics.auth_rejected {
+                // Item 12: drop the dead token NOW and short-circuit the
+                // remaining symbols for THIS fire — every further request
+                // with the same rejected token is a doomed 401 (~15 wasted
+                // rejects worst case). The next fire's ensure_token
+                // re-reads SSM at the ≥60s floor (unchanged); NEVER a mint.
+                token_cache.note_auth_rejected();
+                let remaining = &GROWW_SPOT_1M_SYMBOLS[idx + 1..];
+                if !remaining.is_empty() {
+                    error_count = error_count.saturating_add(remaining.len());
+                    warn!(
+                        skipped_symbols = remaining.len(),
+                        "groww_spot_1m: auth-class reject — remaining symbols \
+                         short-circuited for this fire (no doomed requests); \
+                         forensics rows still emitted"
+                    );
+                    for row in
+                        build_auth_short_circuit_rows(remaining, target_nanos, trading_date_nanos)
+                    {
+                        metrics::counter!("tv_groww_spot1m_fetch_total", "outcome" => "error")
+                            .increment(1);
+                        audit_append_best_effort(audit_writer, &row);
+                    }
+                }
+                break;
+            }
         }
         if let Err(err) = writer.flush() {
             persist_failed = true;
@@ -1397,12 +1615,21 @@ async fn fire_one_minute(
                 tracker.commit(security_id, minute_nanos);
             }
         }
-        if auth_reject_seen {
-            // The ~06:00 IST daily token reset class: drop the cache; the
-            // next fire's ensure_token re-reads SSM at ≥60s pacing (fires
-            // are 60s apart, so the pacing never starves recovery). NEVER
-            // a mint.
-            token_cache.note_auth_rejected();
+        if implausible_count > 0 {
+            // Item 9: implausible vendor OHLC (non-positive O/H/L/C or
+            // high<low) is persisted VERBATIM (we mirror the vendor) but
+            // never silently — one coded line per fired minute + counter.
+            metrics::counter!("tv_groww_spot1m_implausible_ohlc_total")
+                .increment(implausible_count as u64);
+            warn!(
+                code = ErrorCode::Spot1m01FetchDegraded.code_str(),
+                stage = "implausible_ohlc",
+                feed = SPOT_1M_REST_FEED_GROWW,
+                minute = %minute_label,
+                candles = implausible_count,
+                "SPOT1M-01: vendor candle(s) with implausible OHLC \
+                 (non-positive or high<low) — persisted verbatim, flagged"
+            );
         }
     } else {
         // No token at fire time — nothing can be sent; the whole minute is
@@ -1536,6 +1763,7 @@ async fn run_post_session_sweep(
     audit_writer: &mut RestFetchAuditWriter,
     tracker: &mut PersistTracker,
     token_cache: &mut GrowwTokenCache,
+    first_covered: Option<i64>,
 ) {
     // Wait for the sweep instant (a run reaching here right at 15:30:00
     // sleeps ~60s; a late boot past 15:31 fires immediately).
@@ -1568,13 +1796,40 @@ async fn run_post_session_sweep(
 
     let mut swept: u64 = 0;
     let mut still_missing: u64 = 0;
+    let mut pre_boot_named: u64 = 0;
     let mut staged: Vec<(i64, i64)> = Vec::new();
     let mut persist_failed = false;
     for (groww_symbol, symbol, exchange, segment) in GROWW_SPOT_1M_SYMBOLS {
         let security_id = stable_index_security_id(groww_symbol);
+        // Item 2: the run's PRE-BOOT blind window [session_first,
+        // first_covered) is named AUDIT-ONLY — one `named_gap`/`pre_boot`
+        // forensics row per minute, NO fetch (§38 forbids a bulk
+        // backfill). A whole-session blind run (never fired) names every
+        // session minute and skips the fetch-sweep entirely.
+        let pre_boot = pre_boot_gap_minutes(first_covered, session_first, session_last);
+        if !pre_boot.is_empty() {
+            pre_boot_named = pre_boot_named.saturating_add(pre_boot.len() as u64);
+            metrics::counter!("tv_groww_spot1m_pre_boot_gap_total")
+                .increment(pre_boot.len() as u64);
+            record_named_gaps(
+                audit_writer,
+                &pre_boot,
+                trading_date_nanos,
+                security_id,
+                symbol,
+                RestFetchOutcome::NamedGap,
+                "pre_boot",
+                0,
+            );
+        }
+        // The FETCH-sweep repairs only the run's OWN live window
+        // [first_covered, session_last] above the persisted watermark.
+        let Some(fetch_floor) = first_covered else {
+            continue;
+        };
         let missing = sweep_missing_minutes(
             tracker.last_persisted(security_id),
-            session_first,
+            fetch_floor.max(session_first),
             session_last,
         );
         if missing.is_empty() {
@@ -1605,39 +1860,40 @@ async fn run_post_session_sweep(
             continue;
         };
         let query = groww_candles_query(groww_symbol, exchange, segment, trading_date);
-        let candles = match groww_fetch_once(client, &query, token).await {
-            Ok(body_text) => {
-                let (candles, stats) = parse_groww_1m_candles(&body_text);
-                record_parse_stats(stats);
-                candles
-            }
-            Err(failure) => {
-                error!(
-                    code = ErrorCode::Spot1m01FetchDegraded.code_str(),
-                    stage = "sweep_failed",
-                    feed = SPOT_1M_REST_FEED_GROWW,
-                    security_id,
-                    reason = %failure.msg,
-                    "SPOT1M-01: Groww post-session sweep fetch failed for this symbol"
-                );
-                still_missing = still_missing.saturating_add(missing.len() as u64);
-                record_named_gaps(
-                    audit_writer,
-                    &missing,
-                    trading_date_nanos,
-                    security_id,
-                    symbol,
-                    if failure.rate_limited {
-                        RestFetchOutcome::RateLimited
-                    } else {
-                        RestFetchOutcome::Error
-                    },
-                    error_class_for_status(failure.status),
-                    i64::from(failure.status),
-                );
-                continue;
-            }
-        };
+        let candles =
+            match groww_fetch_once(client, GROWW_HISTORICAL_CANDLES_URL, &query, token).await {
+                Ok(body_text) => {
+                    let (candles, stats) = parse_groww_1m_candles(&body_text);
+                    record_parse_stats(stats);
+                    candles
+                }
+                Err(failure) => {
+                    error!(
+                        code = ErrorCode::Spot1m01FetchDegraded.code_str(),
+                        stage = "sweep_failed",
+                        feed = SPOT_1M_REST_FEED_GROWW,
+                        security_id,
+                        reason = %failure.msg,
+                        "SPOT1M-01: Groww post-session sweep fetch failed for this symbol"
+                    );
+                    still_missing = still_missing.saturating_add(missing.len() as u64);
+                    record_named_gaps(
+                        audit_writer,
+                        &missing,
+                        trading_date_nanos,
+                        security_id,
+                        symbol,
+                        if failure.rate_limited {
+                            RestFetchOutcome::RateLimited
+                        } else {
+                            RestFetchOutcome::Error
+                        },
+                        error_class_for_status(failure.status),
+                        i64::from(failure.status),
+                    );
+                    continue;
+                }
+            };
         let mut found_for_sid: u64 = 0;
         let mut gaps: Vec<i64> = Vec::new();
         for minute_nanos in &missing {
@@ -1677,14 +1933,17 @@ async fn run_post_session_sweep(
             }
         }
         // NAMED GAPS: the finally-unrecovered minutes for this symbol —
-        // one queryable forensics row each, never a silent hole.
+        // one queryable forensics row each, never a silent hole. Item 6
+        // semantics: outcome `named_gap` (a fetch DID happen and answered
+        // 200 without the minute — the status is the ACTUAL last one),
+        // never the misleading 200+`error` pair.
         record_named_gaps(
             audit_writer,
             &gaps,
             trading_date_nanos,
             security_id,
             symbol,
-            RestFetchOutcome::Error,
+            RestFetchOutcome::NamedGap,
             "named_gap",
             200,
         );
@@ -1703,6 +1962,29 @@ async fn run_post_session_sweep(
         );
         still_missing = still_missing.saturating_add(swept);
         swept = 0;
+        // Item 4: the staged-but-unflushed swept minutes are STILL absent
+        // from the table — without their own rows the counter bump above
+        // would be the only trace. Name each one (`named_gap` /
+        // `flush_failed`; the fetch itself answered 200) BEFORE the
+        // best-effort audit flush below.
+        for &(groww_symbol, gap_symbol, _, _) in GROWW_SPOT_1M_SYMBOLS.iter() {
+            let gap_sid = stable_index_security_id(groww_symbol);
+            let lost: Vec<i64> = staged
+                .iter()
+                .filter(|(sid, _)| *sid == gap_sid)
+                .map(|(_, minute)| *minute)
+                .collect();
+            record_named_gaps(
+                audit_writer,
+                &lost,
+                trading_date_nanos,
+                gap_sid,
+                gap_symbol,
+                RestFetchOutcome::NamedGap,
+                "flush_failed",
+                200,
+            );
+        }
     } else {
         for (security_id, minute_nanos) in staged {
             tracker.commit(security_id, minute_nanos);
@@ -1711,17 +1993,19 @@ async fn run_post_session_sweep(
     audit_flush_best_effort(audit_writer);
     metrics::counter!("tv_groww_spot1m_sweep_backfilled_total").increment(swept);
     metrics::counter!("tv_groww_spot1m_sweep_still_missing_total").increment(still_missing);
-    if still_missing > 0 || persist_failed {
+    if still_missing > 0 || persist_failed || pre_boot_named > 0 {
         error!(
             code = ErrorCode::Spot1m01FetchDegraded.code_str(),
             stage = "sweep_incomplete",
             feed = SPOT_1M_REST_FEED_GROWW,
             swept,
             still_missing,
+            pre_boot = pre_boot_named,
             persist_failed,
             "SPOT1M-01: Groww post-session sweep left session minutes absent \
-             — NAMED GAPS recorded in rest_fetch_audit (DEDUP-idempotent \
-             manual re-run remains possible)"
+             — NAMED GAPS recorded in rest_fetch_audit (pre-boot minutes are \
+             audit-only by design; DEDUP-idempotent manual re-run remains \
+             possible)"
         );
     } else {
         info!(
@@ -1746,7 +2030,10 @@ fn record_named_gaps(
     final_http_status: i64,
 ) {
     let forensics = LadderForensics {
-        attempts: 1, // the one sweep attempt
+        // Item 6: status 0 = NO fetch ever happened for this gap (pre-boot
+        // / no-token) ⇒ attempts 0; a non-zero ACTUAL status means the one
+        // sweep fetch ran ⇒ attempts 1. Never a fabricated pair.
+        attempts: u32::from(final_http_status != 0),
         rate_limited_count: 0,
         final_http_status: u16::try_from(final_http_status).unwrap_or(0),
         final_latency_ms: -1,
@@ -2284,5 +2571,169 @@ mod tests {
                 "{gs}: groww_symbol carries its exchange prefix"
             );
         }
+    }
+
+    // ---- hostile round 1: pre-boot gaps / plausibility / duplicates / 401 ----
+
+    /// Item 2 (the coordinator's canonical case): a mid-session boot at
+    /// 11:00 IST fires first at the 11:00 boundary (target = the 10:59
+    /// open; its backfill covers the 10:58 open), so the run's pre-boot
+    /// blind window is the opens [09:15, 10:57] — 103 minutes, named per
+    /// symbol, NO fetch.
+    #[test]
+    fn test_pre_boot_gap_minutes_boot_at_11_names_0915_to_1057_opens() {
+        let date = NaiveDate::from_ymd_opt(2026, 7, 13).expect("valid date");
+        let session_first = minute_open_ist_nanos(date, 9 * 3600 + 15 * 60);
+        let session_last = minute_open_ist_nanos(date, 15 * 3600 + 29 * 60);
+        let target_1059 = minute_open_ist_nanos(date, 10 * 3600 + 59 * 60);
+        let covered = first_covered_minute(target_1059, session_first);
+        assert_eq!(
+            covered,
+            target_1059 - NANOS_PER_MINUTE,
+            "the first fire's backfill covers the 10:58 open"
+        );
+        let gaps = pre_boot_gap_minutes(Some(covered), session_first, session_last);
+        assert_eq!(gaps.first().copied(), Some(session_first), "starts 09:15");
+        assert_eq!(
+            gaps.last().copied(),
+            Some(covered - NANOS_PER_MINUTE),
+            "ends at the 10:57 open — everything the run never covered"
+        );
+        assert_eq!(gaps.len(), 103, "opens 09:15..=10:57 inclusive");
+    }
+
+    /// Item 2 edge cases: a run that never fired names the WHOLE session;
+    /// a boot before/at the session open has NO pre-boot window; the same
+    /// mechanism covers a supervisor respawn (fresh run, later first fire).
+    #[test]
+    fn test_pre_boot_gap_minutes_never_fired_and_clean_boot() {
+        let date = NaiveDate::from_ymd_opt(2026, 7, 13).expect("valid date");
+        let session_first = minute_open_ist_nanos(date, 9 * 3600 + 15 * 60);
+        let session_last = minute_open_ist_nanos(date, 15 * 3600 + 29 * 60);
+        // Never fired → the whole 375-minute session is pre-boot.
+        assert_eq!(
+            pre_boot_gap_minutes(None, session_first, session_last).len(),
+            375
+        );
+        // Clean pre-open boot: first fire targets the 09:15 open (no
+        // in-session backfill) → first covered == session first → no gap.
+        let covered = first_covered_minute(session_first, session_first);
+        assert_eq!(covered, session_first);
+        assert!(pre_boot_gap_minutes(Some(covered), session_first, session_last).is_empty());
+    }
+
+    /// Item 9: non-positive O/H/L/C or high<low flags; a normal candle
+    /// (incl. zero-volume index) does not.
+    #[test]
+    fn test_candle_ohlc_implausible_flags_bad_and_passes_good() {
+        let good = MinuteCandle {
+            minute_ts_ist_nanos: 1,
+            open: 25_000.0,
+            high: 25_010.0,
+            low: 24_990.0,
+            close: 25_005.0,
+            volume: 0,
+        };
+        assert!(!candle_ohlc_implausible(&good));
+        for bad in [
+            MinuteCandle { open: 0.0, ..good },
+            MinuteCandle { high: -1.0, ..good },
+            MinuteCandle { low: 0.0, ..good },
+            MinuteCandle {
+                close: -0.5,
+                ..good
+            },
+            MinuteCandle {
+                high: 24_000.0,
+                low: 24_500.0,
+                ..good
+            },
+        ] {
+            assert!(candle_ohlc_implausible(&bad), "must flag {bad:?}");
+        }
+    }
+
+    /// Item 11: duplicates of the target minute beyond the first are
+    /// counted (first-match-wins persists; the count makes it visible).
+    #[test]
+    fn test_duplicate_minute_candles_counts_extras_only() {
+        let c = |ts: i64| MinuteCandle {
+            minute_ts_ist_nanos: ts,
+            open: 1.0,
+            high: 1.0,
+            low: 1.0,
+            close: 1.0,
+            volume: 0,
+        };
+        let candles = vec![c(100), c(200), c(200), c(200), c(300)];
+        assert_eq!(duplicate_minute_candles(&candles, 200), 2);
+        assert_eq!(duplicate_minute_candles(&candles, 100), 0);
+        assert_eq!(duplicate_minute_candles(&candles, 999), 0);
+    }
+
+    /// Item 12 (fire-level): the symbols skipped after an auth reject get
+    /// `no_token`/`auth` forensics rows with 0/-1 sentinels — never a
+    /// doomed request, never a silent skip.
+    #[test]
+    fn test_build_auth_short_circuit_rows_names_remaining_symbols() {
+        let rows = build_auth_short_circuit_rows(&GROWW_SPOT_1M_SYMBOLS[1..], 900, 0);
+        assert_eq!(rows.len(), 2, "two symbols remain after the first");
+        for (row, (gs, symbol, _, _)) in rows.iter().zip(&GROWW_SPOT_1M_SYMBOLS[1..]) {
+            assert_eq!(row.outcome, RestFetchOutcome::NoToken);
+            assert_eq!(row.error_class, "auth");
+            assert_eq!(row.final_http_status, 0, "no HTTP happened");
+            assert_eq!(row.attempts, 0);
+            assert_eq!(row.fetch_latency_ms, -1);
+            assert_eq!(row.close_to_data_ms, -1);
+            assert_eq!(row.ts_ist_nanos, 900);
+            assert_eq!(row.security_id, stable_index_security_id(gs));
+            assert_eq!(row.symbol, *symbol);
+        }
+        assert!(build_auth_short_circuit_rows(&[], 900, 0).is_empty());
+    }
+
+    /// Item 12 (ladder-level): an HTTP 401 SHORT-CIRCUITS the ladder on
+    /// the FIRST attempt — no further doomed rungs (attempts == 1, not 5)
+    /// — and the forensics carry the auth classification.
+    #[tokio::test]
+    async fn test_ladder_short_circuits_on_auth_reject() {
+        const MOCK_401: &str = "HTTP/1.1 401 Unauthorized\r\nContent-Length: 2\r\n\r\n{}";
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        tokio::spawn(async move {
+            loop {
+                if let Ok((mut stream, _)) = listener.accept().await {
+                    tokio::spawn(async move {
+                        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                        let mut buf = [0u8; 8192];
+                        let _ = stream.read(&mut buf).await;
+                        let _ = stream.write_all(MOCK_401.as_bytes()).await;
+                    });
+                }
+            }
+        });
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(2))
+            .build()
+            .expect("client");
+        let url = format!("http://127.0.0.1:{port}/v1/historical/candles");
+        let date = NaiveDate::from_ymd_opt(2026, 7, 13).expect("valid date");
+        let query = groww_candles_query("NSE-NIFTY", "NSE", "CASH", date);
+        let token = SecretString::from("test-token");
+        let (outcome, forensics) =
+            fetch_minute_with_ladder(&client, &url, &query, &token, 900, None, 0).await;
+        assert_eq!(
+            forensics.attempts, 1,
+            "auth reject must abort the ladder on the first rung"
+        );
+        assert!(forensics.auth_rejected);
+        assert_eq!(forensics.final_http_status, 401);
+        assert_eq!(forensics.error_class, "auth");
+        assert!(
+            matches!(outcome, SymbolFetchOutcome::Failed { .. }),
+            "got {outcome:?}"
+        );
     }
 }
