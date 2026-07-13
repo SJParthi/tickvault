@@ -1890,14 +1890,18 @@ const _: () = assert!(
 /// (sequencing is best-effort, never a hard dependency).
 pub const GROWW_CHAIN_1M_FALLBACK_DELAY_MS: u64 = 2_500;
 
-/// DEFENSIVE per-underlying minimum gap (ms) between two Groww chain
-/// requests for the SAME underlying. Groww documents NO chain-specific
-/// rate rule (`docs/groww-ref/14-option-chain.md` §4 — the family is
-/// UNDOCUMENTED, Unknown ≠ unlimited), so this is NOT doc-mandated (the
-/// Dhan 1-per-3s contrast): 1 s is consistent with the ≤6 req/s
-/// minute-boundary pacing ceiling of
-/// `docs/groww-ref/15-rate-limits-and-capacity.md` and, at one request
-/// per underlying per minute, never engages in normal operation.
+/// MECHANICAL cross-request minimum gap (ms) between ANY two consecutive
+/// Groww chain requests — ONE scalar stamp spans underlyings, so a fire's
+/// 3 requests spread over ≥ 2 s (chain leg ≤ 1 req/s sustained) instead
+/// of bursting back-to-back at the minute boundary (hostile-round-1
+/// MEDIUM-1). Groww documents NO chain-specific rate rule
+/// (`docs/groww-ref/14-option-chain.md` §4 — the family is UNDOCUMENTED,
+/// Unknown ≠ unlimited), so the VALUE is not doc-mandated (the Dhan
+/// 1-per-3s contrast): 1 s keeps the combined spot+chain boundary burst
+/// inside the ≤6 req/s pacing ceiling of
+/// `docs/groww-ref/15-rate-limits-and-capacity.md` with bruteX co-tenancy
+/// headroom. The wait runs INSIDE the per-underlying budget (the
+/// min-gap + timeout < budget const-assert below stays coherent).
 pub const GROWW_CHAIN_1M_MIN_GAP_MS: u64 = 1_000;
 
 /// Per-REQUEST HTTP timeout (secs) for one Groww chain call — chains are

@@ -85,11 +85,21 @@ pub const OPTION_CHAIN_1M_FEED_DHAN: &str = "dhan";
 pub const OPTION_CHAIN_1M_FEED_GROWW: &str = "groww";
 
 /// `source` SYMBOL label — provenance beyond `feed` (label, NOT in-key).
+///
+/// SLUG CONVENTION (the ONE consistent choice — hostile-round-1 NIT-7):
+/// every REST-leg `source` slug is `rest_` + the VENDOR ENDPOINT path
+/// snake_cased, exactly the Groww-SPOT-leg convention —
+/// Dhan `/v2/charts/intraday` → `rest_intraday`, Groww `/v1/candles` →
+/// `rest_candles`, Dhan `/v2/optionchain` → `rest_optionchain`, Groww
+/// `/v1/option-chain` → `rest_option_chain`. The `feed` column (in the
+/// DEDUP key) is what distinguishes vendors; `source` records WHICH
+/// endpoint produced the row. The two chain slugs differ by one
+/// underscore because the vendors' endpoint paths do — query the chain
+/// class with `source LIKE 'rest_option%chain'` (or just filter `feed`).
 pub const OPTION_CHAIN_1M_SOURCE: &str = "rest_optionchain";
 
-/// `source` SYMBOL label for the Groww chain leg (Groww
-/// `GET /v1/option-chain/...` — deliberately distinct from the Dhan
-/// `rest_optionchain` label so provenance is grep-able beyond `feed`).
+/// `source` SYMBOL label for the Groww chain leg — endpoint-derived per
+/// the convention above (Groww `GET /v1/option-chain/...`).
 pub const OPTION_CHAIN_1M_SOURCE_GROWW_CHAIN: &str = "rest_option_chain";
 
 /// `exchange_segment` SYMBOL value — the 3 underlyings are all IDX_I.

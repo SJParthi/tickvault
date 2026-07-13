@@ -644,6 +644,31 @@ impl GrowwTokenCache {
         }
     }
 
+    /// Test-only: a chain-leg cache whose last SSM read is "just now" and
+    /// holds NO token — `ensure_token` then returns `None` WITHOUT any
+    /// network read (the pacing floor), so the no-token fire arms are
+    /// testable hermetically.
+    #[cfg(test)]
+    pub(crate) fn for_test_paced_out(now_ms: i64) -> Self {
+        Self {
+            token: None,
+            last_read_ms: Some(now_ms),
+            chain_leg: true,
+        }
+    }
+
+    /// Test-only: a chain-leg cache PRELOADED with a token — `ensure_token`
+    /// returns it without any SSM read, so the token-path fire arms are
+    /// testable hermetically against a mock server.
+    #[cfg(test)]
+    pub(crate) fn for_test_with_token(token: SecretString) -> Self {
+        Self {
+            token: Some(token),
+            last_read_ms: None,
+            chain_leg: true,
+        }
+    }
+
     /// The cached token, reading from SSM (paced) when absent. `None` when
     /// the read is not yet due or failed — the caller counts the minute as
     /// a no-token miss and the next fire retries (fires are 60 s apart, so

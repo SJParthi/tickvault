@@ -52,9 +52,20 @@
 //! `docs/groww-ref/15-rate-limits-and-capacity.md`, shared-token bucket
 //! co-tenanted with bruteX), one request per underlying per minute (NO
 //! in-minute re-poll ladder — the chain is a live snapshot, not a sealing
-//! candle), plus a DEFENSIVE per-underlying
-//! [`GROWW_CHAIN_1M_MIN_GAP_MS`] guard (not doc-mandated — the Dhan
-//! 1-per-3s contrast) that never engages in normal operation. Every 429
+//! candle), plus a MECHANICAL cross-request
+//! [`GROWW_CHAIN_1M_MIN_GAP_MS`] guard: ONE scalar last-request stamp
+//! spans consecutive chain requests (any underlying), so within a fire
+//! the 2nd/3rd requests each wait out the remaining gap instead of
+//! bursting back-to-back at the boundary.
+//!
+//! Spacing math (hostile-round-1 MEDIUM-1): with a 1,000 ms min gap the
+//! 3 requests of one fire spread over ≥ 2 × 1,000 ms = 2 s → the chain
+//! leg contributes at most 1 req/s sustained. The fallback wake trails
+//! the spot fire by [`GROWW_CHAIN_1M_FALLBACK_DELAY_MS`] (2.5 s), and
+//! even in the worst overlap (spot still laddering when the chain's
+//! fallback fires) the combined boundary burst is spot's ≤1 in-flight
+//! request + the chain's ≤1 req/s — comfortably inside the ≤6 req/s
+//! family ceiling and the ~3 req/s bruteX co-tenancy headroom. Every 429
 //! is counted + shape-captured (the live-probe (e) requirement); payload
 //! bytes + strike/leg counts are histogrammed (the live-probe (d)
 //! requirement — chain size is undocumented, U-12).
@@ -205,8 +216,14 @@ pub struct GrowwParsedLeg {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct GrowwParsedChain {
     /// The response's own `underlying_ltp` (Groww's view of the underlying
-    /// at snapshot time).
+    /// at snapshot time). 0.0 when the field is absent/null/non-numeric —
+    /// see `underlying_ltp_missing` (LOW-5: vendor absence must be
+    /// distinguishable from a real 0).
     pub underlying_ltp: f64,
+    /// `true` when the payload carried NO numeric `underlying_ltp` — the
+    /// persisted `underlying_spot = 0.0` then means "vendor omitted it",
+    /// not a real price of 0 (counted + one coded warn per fired minute).
+    pub underlying_ltp_missing: bool,
     /// Every present leg across every kept strike (a one-sided deep-OTM
     /// strike contributes one leg — CE or PE absent/null is skipped, never
     /// a panic; whether both sides are always present is Unknown, so the
@@ -288,8 +305,13 @@ pub fn parse_groww_option_chain(body: &str) -> Option<GrowwParsedChain> {
     // Envelope-tolerant: payload-wrapped or bare.
     let data = v.get("payload").filter(|p| p.is_object()).unwrap_or(&v);
     let strikes = data.get("strikes").and_then(Value::as_object)?;
+    // Absence-aware read (LOW-5): absent / null / non-numeric persists as
+    // 0.0 BUT is flagged so the caller can tell vendor omission from a
+    // real 0.
+    let underlying_ltp = data.get("underlying_ltp").and_then(Value::as_f64);
     let mut chain = GrowwParsedChain {
-        underlying_ltp: val_f64(data, "underlying_ltp"),
+        underlying_ltp: underlying_ltp.unwrap_or(0.0),
+        underlying_ltp_missing: underlying_ltp.is_none(),
         ..GrowwParsedChain::default()
     };
     for (strike_key, legs) in strikes {
@@ -322,11 +344,14 @@ pub fn parse_groww_option_chain(body: &str) -> Option<GrowwParsedChain> {
 // Pure pacing / classification helpers
 // ---------------------------------------------------------------------------
 
-/// Defensive per-underlying pacing: milliseconds still to wait so two
-/// requests for the SAME underlying are ≥ [`GROWW_CHAIN_1M_MIN_GAP_MS`]
-/// apart (NOT doc-mandated — Groww documents no chain rule; consistent
-/// with the ≤6 req/s pacing ceiling). A midnight-wrapped/backwards clock
-/// yields 0 (never a long spurious sleep). Pure.
+/// Mechanical cross-request pacing: milliseconds still to wait so ANY two
+/// CONSECUTIVE chain requests (across underlyings — one scalar stamp, the
+/// hostile-round-1 MEDIUM-1 fix) are ≥ [`GROWW_CHAIN_1M_MIN_GAP_MS`]
+/// apart. This is what spreads one fire's 3 requests over ≥ 2 s instead
+/// of a back-to-back boundary burst (Groww documents no chain rule, but
+/// the ≤6 req/s family ceiling + bruteX co-tenancy demand real spacing).
+/// A midnight-wrapped/backwards clock yields 0 (never a long spurious
+/// sleep). Pure.
 #[must_use]
 pub fn groww_min_gap_wait_ms(last_request_ms_of_day: Option<i64>, now_ms_of_day: i64) -> u64 {
     let Some(last) = last_request_ms_of_day else {
@@ -513,7 +538,21 @@ pub struct GrowwChainTarget {
     pub expiry: NaiveDate,
     /// The expiry as the query-param string (`"YYYY-MM-DD"`).
     pub expiry_str: String,
+    /// The chain endpoint URL for this underlying — computed ONCE at
+    /// target build (not per minute) via [`groww_chain_url`]; tests point
+    /// it at a hermetic mock server (the round-1 coverage battery).
+    pub url: String,
 }
+
+/// Day-keyed cache of the resolved chain targets, shared across supervisor
+/// respawns (hostile-round-1 MEDIUM-4): a flapping ~30s respawn loop must
+/// NOT re-download the multi-MB instruments master every cycle. Only the
+/// TINY resolved targets (≤3 entries) are cached — never the raw master
+/// rows (holding the multi-MB Vec all day would be wasted RAM). Refreshes
+/// only on an IST date change; the day-start degrade page also fires only
+/// on the first (cache-filling) resolve, never per respawn.
+pub type GrowwChainTargetsCache =
+    Arc<tokio::sync::Mutex<Option<(NaiveDate, Vec<GrowwChainTarget>)>>>;
 
 /// Resolve the current expiry for every underlying from parsed master
 /// rows. Returns `(targets, degraded)` — a `None` expiry degrades that
@@ -533,6 +572,7 @@ pub fn resolve_groww_chain_targets(
                 security_id: stable_index_security_id(groww_symbol),
                 expiry,
                 expiry_str: expiry.format("%Y-%m-%d").to_string(),
+                url: groww_chain_url(exchange, underlying),
             }),
             None => degraded.push(underlying),
         }
@@ -767,7 +807,7 @@ async fn fire_one_groww_chain_minute(
     params: &GrowwChain1mTaskParams,
     client: &reqwest::Client,
     targets: &[GrowwChainTarget],
-    last_request_ms: &mut [Option<i64>],
+    last_request_ms: &mut Option<i64>,
     writer: &mut OptionChain1mWriter,
     audit_writer: &mut RestFetchAuditWriter,
     edge: &mut FailureEdge,
@@ -791,19 +831,19 @@ async fn fire_one_groww_chain_minute(
 
     if let Some(token) = token_cache.ensure_token().await {
         for (idx, target) in targets.iter().enumerate() {
-            let url = groww_chain_url(target.exchange, target.underlying);
             let (outcome, requested_at_ms, latency_ms) = fetch_groww_chain_bounded(
                 client,
-                &url,
+                &target.url,
                 &target.expiry_str,
                 &token,
                 minute_close_ms,
-                last_request_ms.get(idx).copied().flatten(),
+                // ONE scalar across consecutive requests — the min-gap
+                // engages BETWEEN underlyings too (MEDIUM-1: 3 requests
+                // spread ≥ 2 s, never a back-to-back boundary burst).
+                *last_request_ms,
             )
             .await;
-            if let Some(slot) = last_request_ms.get_mut(idx) {
-                *slot = Some(requested_at_ms);
-            }
+            *last_request_ms = Some(requested_at_ms);
             let mut auth_rejected = false;
             match outcome {
                 GrowwChainFetchOutcome::Found {
@@ -827,6 +867,24 @@ async fn fire_one_groww_chain_minute(
                             .record(chain.legs.len() as f64);
                         metrics::histogram!("tv_groww_chain1m_payload_bytes")
                             .record(payload_bytes as f64);
+                    }
+                    if chain.underlying_ltp_missing {
+                        // LOW-5: vendor omitted the underlying spot — the
+                        // persisted underlying_spot = 0.0 is ABSENCE, not
+                        // a real 0. One coded warn per underlying per
+                        // fired minute (≤3/min) + a static-label counter.
+                        metrics::counter!("tv_groww_chain1m_underlying_spot_missing_total")
+                            .increment(1);
+                        warn!(
+                            code = ErrorCode::Chain02FetchDegraded.code_str(),
+                            stage = "underlying_ltp_missing",
+                            feed = OPTION_CHAIN_1M_FEED_GROWW,
+                            symbol = target.underlying,
+                            minute = %minute_label,
+                            "groww_chain_1m: payload carried no numeric \
+                             underlying_ltp — underlying_spot persisted as \
+                             0.0 (vendor omission, not a real 0)"
+                        );
                     }
                     if chain.invalid_strikes > 0 {
                         metrics::counter!("tv_groww_chain1m_invalid_strikes_total")
@@ -1235,7 +1293,11 @@ fn record_groww_chain_skipped_boundaries(
 /// expiry (tomorrow's boot re-warms — the supervisor deliberately does
 /// NOT respawn that stop).
 // TEST-EXEMPT: live-deps async runner — every scheduling / parsing / expiry-selection / edge decision is a pure fn unit-tested (here + in the reused spot/chain modules + instruments.rs); the HTTP leg mirrors the tested patterns; wiring pinned by crates/app/tests/groww_chain_1m_wiring_guard.rs.
-pub async fn run_groww_chain_1m(params: GrowwChain1mTaskParams, disabled_for_day: Arc<AtomicBool>) {
+pub async fn run_groww_chain_1m(
+    params: GrowwChain1mTaskParams,
+    disabled_for_day: Arc<AtomicBool>,
+    targets_cache: GrowwChainTargetsCache,
+) {
     // Idempotent DDL first (CREATE → ADD COLUMN self-heal — incl. the
     // 2026-07-13 rho/close_to_data_ms additions — → DEDUP ENABLE) for BOTH
     // tables; failures degrade loudly inside and never block.
@@ -1272,6 +1334,45 @@ pub async fn run_groww_chain_1m(params: GrowwChain1mTaskParams, disabled_for_day
     // master (zero rate cost — NEVER an expiry REST endpoint, NEVER a
     // guessed expiry) ----
     let today = today_ist();
+    // Respawn fast-path (MEDIUM-4): today's targets were already resolved
+    // by an earlier run in this process — reuse them (no multi-MB master
+    // re-download per ~30s respawn cycle); refresh only on a date change.
+    let cached = {
+        let cell = targets_cache.lock().await;
+        cell.as_ref()
+            .filter(|(date, _)| *date == today)
+            .map(|(_, cached)| cached.clone())
+    };
+    let targets = if let Some(targets) = cached {
+        info!(
+            underlyings = targets.len(),
+            "groww_chain_1m: reusing today's resolved expiries (supervisor \
+             respawn — the instruments master is NOT re-downloaded)"
+        );
+        Some(targets)
+    } else {
+        resolve_and_cache_chain_targets(&params, &disabled_for_day, &targets_cache, today).await
+    };
+    let Some(targets) = targets else {
+        // Warmup degraded to disabled-for-the-day (page/logs already
+        // emitted inside) — the supervisor deliberately does not respawn.
+        return;
+    };
+    run_groww_chain_minute_loop(&params, &client, targets).await;
+}
+
+/// Day-start warmup (the cache-filling slow path): download the
+/// instruments master (bounded retries), resolve today's CURRENT expiry
+/// per underlying, emit the per-underlying degrade page + forensics, then
+/// cache the resolved targets for supervisor respawns (MEDIUM-4). `None`
+/// = disabled for the day (page already fired; the supervisor exits).
+// TEST-EXEMPT: live-deps warmup shell — the resolution (resolve_groww_chain_targets / select_current_option_expiry) and detail formatting (expiry_degrade_detail) are the unit-tested pure parts.
+async fn resolve_and_cache_chain_targets(
+    params: &GrowwChain1mTaskParams,
+    disabled_for_day: &AtomicBool,
+    targets_cache: &GrowwChainTargetsCache,
+    today: NaiveDate,
+) -> Option<Vec<GrowwChainTarget>> {
     let rows = match download_master_bounded().await {
         Ok(rows) => rows,
         Err(detail) => {
@@ -1295,7 +1396,7 @@ pub async fn run_groww_chain_1m(params: GrowwChain1mTaskParams, disabled_for_day
                     ),
                 });
             disabled_for_day.store(true, Ordering::SeqCst);
-            return;
+            return None;
         }
     };
     let (targets, degraded) = resolve_groww_chain_targets(&rows, today);
@@ -1347,7 +1448,7 @@ pub async fn run_groww_chain_1m(params: GrowwChain1mTaskParams, disabled_for_day
         // Every underlying degraded — nothing to fetch today (the page
         // above already fired).
         disabled_for_day.store(true, Ordering::SeqCst);
-        return;
+        return None;
     }
     for t in &targets {
         info!(
@@ -1358,7 +1459,19 @@ pub async fn run_groww_chain_1m(params: GrowwChain1mTaskParams, disabled_for_day
             "groww_chain_1m: current expiry resolved from the instruments master"
         );
     }
+    *targets_cache.lock().await = Some((today, targets.clone()));
+    Some(targets)
+}
 
+/// The armed per-minute fire loop (split from `run_groww_chain_1m` by the
+/// MEDIUM-4 warmup-cache refactor — the body is the pre-split loop,
+/// unchanged).
+// TEST-EXEMPT: live-deps scheduler loop — every decision inside is a unit-tested pure fn (next_fire_after / fire_is_fresh / count_missed_boundaries / stale_wake_backoff_ms / groww_min_gap_wait_ms).
+async fn run_groww_chain_minute_loop(
+    params: &GrowwChain1mTaskParams,
+    client: &reqwest::Client,
+    targets: Vec<GrowwChainTarget>,
+) {
     let mut writer = OptionChain1mWriter::new_with_feed(
         &params.questdb,
         OPTION_CHAIN_1M_FEED_GROWW,
@@ -1368,7 +1481,9 @@ pub async fn run_groww_chain_1m(params: GrowwChain1mTaskParams, disabled_for_day
     let mut edge = FailureEdge::default();
     let mut token_cache = GrowwTokenCache::new_chain();
     let mut last_fired: Option<u32> = None;
-    let mut last_request_ms: Vec<Option<i64>> = vec![None; targets.len()];
+    // ONE scalar spanning consecutive chain requests (any underlying) —
+    // the cross-request min-gap pacing state (MEDIUM-1).
+    let mut last_request_ms: Option<i64> = None;
     let mut spot_rx = params.spot_minute_done.clone();
     info!(
         underlyings = targets.len(),
@@ -1408,7 +1523,7 @@ pub async fn run_groww_chain_1m(params: GrowwChain1mTaskParams, disabled_for_day
             );
             let missed = count_missed_boundaries(fire.saturating_sub(60), woke.saturating_sub(1));
             record_groww_chain_skipped_boundaries(
-                &params,
+                params,
                 &mut edge,
                 &mut audit_writer,
                 &targets,
@@ -1431,8 +1546,8 @@ pub async fn run_groww_chain_1m(params: GrowwChain1mTaskParams, disabled_for_day
         }
 
         fire_one_groww_chain_minute(
-            &params,
-            &client,
+            params,
+            client,
             &targets,
             &mut last_request_ms,
             &mut writer,
@@ -1448,7 +1563,7 @@ pub async fn run_groww_chain_1m(params: GrowwChain1mTaskParams, disabled_for_day
         let after = ist_secs_of_day_now();
         let missed = count_missed_boundaries(fire, after.saturating_sub(1));
         record_groww_chain_skipped_boundaries(
-            &params,
+            params,
             &mut edge,
             &mut audit_writer,
             &targets,
@@ -1473,10 +1588,14 @@ pub fn spawn_supervised_groww_chain_1m(
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let disabled_for_day = Arc::new(AtomicBool::new(false));
+        // Shared across respawns (MEDIUM-4): the day's resolved targets —
+        // a flapping backoff loop never re-downloads the multi-MB master.
+        let targets_cache: GrowwChainTargetsCache = Arc::new(tokio::sync::Mutex::new(None));
         loop {
             let inner = tokio::spawn(run_groww_chain_1m(
                 params.clone(),
                 Arc::clone(&disabled_for_day),
+                Arc::clone(&targets_cache),
             ));
             let result = inner.await;
             let reason = classify_join_exit(&result);
@@ -1531,6 +1650,25 @@ pub struct GrowwChainProbeResult {
     pub measured: Option<(u32, usize, i64, usize)>,
     /// Bounded failure description (already redacted) when not measured.
     pub failure: Option<String>,
+}
+
+/// Is the probe instant inside the in-session window `[09:16, 15:30)`
+/// IST where a live chain payload is expected? Outside it a thin / empty
+/// / stale payload is NOT a failure verdict — the endpoint legitimately
+/// serves stale-or-nothing off-hours (LOW-3 probe honesty). Pure.
+#[must_use]
+pub fn probe_in_session(secs_of_day: u32) -> bool {
+    (9 * 3600 + 16 * 60..15 * 3600 + 30 * 60).contains(&secs_of_day)
+}
+
+/// The out-of-hours caveat prefixed to a NON-passing probe verdict when
+/// the probe ran outside [`probe_in_session`] — an off-hours miss must
+/// never read as a false "did NOT pass" (LOW-3). Pure.
+#[must_use]
+pub fn probe_out_of_hours_caveat(ok: bool, in_session: bool) -> Option<&'static str> {
+    (!ok && !in_session).then_some(
+        "measured OUTSIDE market hours — payload may be stale/empty; re-probe in session",
+    )
 }
 
 /// Plain-English probe verdict detail — bounded, measured numbers only
@@ -1627,12 +1765,12 @@ pub async fn run_groww_chain_1m_probe(params: GrowwChain1mTaskParams) {
             failure: Some("no usable option expiry in today's contract list".to_string()),
         });
     }
-    for target in &targets {
-        let url = groww_chain_url(target.exchange, target.underlying);
+    for (idx, target) in targets.iter().enumerate() {
+        let url = &target.url;
         // Sequential + min-gap paced (one boot-time call per underlying).
         tokio::time::sleep(Duration::from_millis(GROWW_CHAIN_1M_MIN_GAP_MS)).await;
         let started = std::time::Instant::now();
-        let result = groww_chain_fetch_once(&client, &url, &target.expiry_str, &token).await;
+        let result = groww_chain_fetch_once(&client, url, &target.expiry_str, &token).await;
         let latency_ms = i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX);
         match result {
             Ok(body) => {
@@ -1665,7 +1803,8 @@ pub async fn run_groww_chain_1m_probe(params: GrowwChain1mTaskParams) {
                 }
             }
             Err(failure) => {
-                if failure.auth_rejected {
+                let auth_rejected = failure.auth_rejected;
+                if auth_rejected {
                     token_cache.note_auth_rejected();
                 }
                 results.push(GrowwChainProbeResult {
@@ -1674,10 +1813,32 @@ pub async fn run_groww_chain_1m_probe(params: GrowwChain1mTaskParams) {
                     // Already secret-redacted + bounded at capture.
                     failure: Some(failure.msg),
                 });
+                if auth_rejected {
+                    // LOW-3: the item-12 short-circuit, mirrored into the
+                    // probe — every further request with the same rejected
+                    // token is a doomed 401; report the rest as skipped.
+                    for skipped in &targets[idx + 1..] {
+                        results.push(GrowwChainProbeResult {
+                            underlying: skipped.underlying,
+                            measured: None,
+                            failure: Some(
+                                "skipped — an earlier underlying hit an auth-class \
+                                 reject (no doomed requests)"
+                                    .to_string(),
+                            ),
+                        });
+                    }
+                    break;
+                }
             }
         }
     }
     let (ok, detail) = format_probe_detail(&results);
+    let in_session = probe_in_session(ist_secs_of_day_now());
+    let detail = match probe_out_of_hours_caveat(ok, in_session) {
+        Some(caveat) => format!("{caveat}: {detail}"),
+        None => detail,
+    };
     if ok {
         info!(
             detail = %detail,
@@ -1687,7 +1848,7 @@ pub async fn run_groww_chain_1m_probe(params: GrowwChain1mTaskParams) {
              (the Telegram body carries the plain-English action; the exact \
              key lives HERE)"
         );
-    } else {
+    } else if in_session {
         error!(
             code = ErrorCode::Chain02FetchDegraded.code_str(),
             stage = "probe",
@@ -1695,6 +1856,17 @@ pub async fn run_groww_chain_1m_probe(params: GrowwChain1mTaskParams) {
             detail = %detail,
             "CHAIN-02: Groww chain probe did NOT pass — verdict reported; \
              pipeline stays OFF (tomorrow's boot re-probes)"
+        );
+    } else {
+        // LOW-3 probe honesty: an off-hours miss is NOT a failure verdict
+        // — the endpoint legitimately serves stale/empty payloads outside
+        // the session. The Telegram carries the same caveated detail; no
+        // coded failure is asserted.
+        warn!(
+            detail = %detail,
+            "groww_chain_1m: probe measured outside market hours — payload \
+             may be stale/empty; re-probe in session before reading this \
+             as a failure"
         );
     }
     params
@@ -1800,6 +1972,34 @@ mod tests {
         assert!((bare_ce.ltp - 300.0).abs() < 1e-9);
         assert!((bare_ce.rho).abs() < 1e-9, "missing greeks → 0.0");
         assert_eq!(bare_ce.oi, 0, "missing open_interest → 0");
+        assert!(
+            !chain.underlying_ltp_missing,
+            "a present numeric underlying_ltp is not flagged missing"
+        );
+    }
+
+    #[test]
+    fn test_parse_groww_option_chain_underlying_ltp_absence_is_flagged() {
+        // LOW-5: absent / null / non-numeric underlying_ltp → 0.0 WITH the
+        // missing flag set (vendor omission ≠ a real 0); a present numeric
+        // value (even 0.0) is NOT flagged.
+        for body in [
+            r#"{"payload":{"strikes":{"100":{"CE":{"ltp":1.0}}}}}"#,
+            r#"{"payload":{"underlying_ltp":null,"strikes":{"100":{"CE":{"ltp":1.0}}}}}"#,
+            r#"{"payload":{"underlying_ltp":"25641.7","strikes":{"100":{"CE":{"ltp":1.0}}}}}"#,
+        ] {
+            let chain = parse_groww_option_chain(body).expect("parses");
+            assert!(chain.underlying_ltp_missing, "flagged for {body}");
+            assert!(chain.underlying_ltp.abs() < 1e-12);
+        }
+        let real_zero = parse_groww_option_chain(
+            r#"{"underlying_ltp":0.0,"strikes":{"100":{"CE":{"ltp":1.0}}}}"#,
+        )
+        .expect("parses");
+        assert!(
+            !real_zero.underlying_ltp_missing,
+            "a PRESENT numeric 0.0 is a real value, never flagged as absence"
+        );
     }
 
     #[test]
@@ -2058,6 +2258,32 @@ mod tests {
         assert!(!ok);
     }
 
+    #[test]
+    fn test_probe_in_session_window_boundaries() {
+        // [09:16:00, 15:30:00) IST — the first minute close with a live
+        // chain through the session's last minute close.
+        assert!(!probe_in_session(9 * 3600 + 15 * 60 + 59));
+        assert!(probe_in_session(9 * 3600 + 16 * 60));
+        assert!(probe_in_session(12 * 3600));
+        assert!(probe_in_session(15 * 3600 + 29 * 60 + 59));
+        assert!(!probe_in_session(15 * 3600 + 30 * 60));
+        assert!(!probe_in_session(0));
+        assert!(!probe_in_session(23 * 3600));
+    }
+
+    #[test]
+    fn test_probe_out_of_hours_caveat_gates_on_verdict_and_session() {
+        // LOW-3: ONLY a non-pass measured OUTSIDE the session carries the
+        // stale/empty caveat; a pass never does, and an in-session miss is
+        // a genuine failure verdict.
+        let caveat = probe_out_of_hours_caveat(false, false).expect("caveated");
+        assert!(caveat.contains("OUTSIDE market hours"), "got: {caveat}");
+        assert!(caveat.contains("re-probe in session"), "got: {caveat}");
+        assert!(probe_out_of_hours_caveat(false, true).is_none());
+        assert!(probe_out_of_hours_caveat(true, false).is_none());
+        assert!(probe_out_of_hours_caveat(true, true).is_none());
+    }
+
     // ---- sequencing (the reused wait core with the GROWW fallback) ---------
 
     /// The GROWW chain leg reuses the Dhan wait core with its OWN fallback
@@ -2089,6 +2315,569 @@ mod tests {
         assert!(
             waited < fb,
             "signal must wake before the fallback: {waited:?}"
+        );
+    }
+
+    // ---- HTTP leg (hermetic mock server — round-1 coverage battery) --------
+
+    /// Minimal one-shot HTTP mock: accepts connections forever, answers
+    /// each request with the fixed response bytes (the spot module's
+    /// mock-401 precedent).
+    async fn spawn_chain_mock(response: &'static str) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        tokio::spawn(async move {
+            loop {
+                if let Ok((mut stream, _)) = listener.accept().await {
+                    tokio::spawn(async move {
+                        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                        let mut buf = [0u8; 8192];
+                        let _ = stream.read(&mut buf).await;
+                        let _ = stream.write_all(response.as_bytes()).await;
+                    });
+                }
+            }
+        });
+        format!("http://127.0.0.1:{port}/v1/option-chain/exchange/NSE/underlying/NIFTY")
+    }
+
+    fn test_client() -> reqwest::Client {
+        reqwest::Client::builder()
+            .timeout(Duration::from_secs(2))
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .expect("client")
+    }
+
+    #[tokio::test]
+    async fn test_fetch_bounded_found_empty_and_parse_failure_via_mock() {
+        let token = SecretString::from("test-token");
+
+        // (a) A parseable chain → Found with the measured freshness signal
+        // + payload bytes; the request stamp + latency are real readings.
+        let body = r#"{"payload":{"underlying_ltp":100.5,"strikes":{"100":{"CE":{"ltp":1.5},"PE":{"ltp":2.5}}}}}"#;
+        // Leak one response string per case — test-only, bounded.
+        let resp: &'static str = Box::leak(
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            )
+            .into_boxed_str(),
+        );
+        let url = spawn_chain_mock(resp).await;
+        let (outcome, requested_at_ms, latency_ms) =
+            fetch_groww_chain_bounded(&test_client(), &url, "2026-07-16", &token, 0, None).await;
+        match outcome {
+            GrowwChainFetchOutcome::Found {
+                chain,
+                close_to_data_ms,
+                payload_bytes,
+            } => {
+                assert_eq!(chain.legs.len(), 2);
+                assert!(!chain.underlying_ltp_missing);
+                assert!(close_to_data_ms >= 0);
+                assert_eq!(payload_bytes, body.len());
+            }
+            other => panic!("expected Found, got {other:?}"),
+        }
+        assert!(requested_at_ms >= 0);
+        assert!(latency_ms >= 0);
+
+        // (b) A parseable 2xx with ZERO strikes → Empty (never silent).
+        let empty_body = r#"{"payload":{"underlying_ltp":1.0,"strikes":{}}}"#;
+        let empty_resp: &'static str = Box::leak(
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{empty_body}",
+                empty_body.len()
+            )
+            .into_boxed_str(),
+        );
+        let url = spawn_chain_mock(empty_resp).await;
+        let (outcome, _, _) =
+            fetch_groww_chain_bounded(&test_client(), &url, "2026-07-16", &token, 0, None).await;
+        assert_eq!(outcome, GrowwChainFetchOutcome::Empty);
+
+        // (c) A 2xx that is not a parseable option chain → Failed(200).
+        let url = spawn_chain_mock("HTTP/1.1 200 OK\r\nContent-Length: 8\r\n\r\nnot-json").await;
+        let (outcome, _, _) =
+            fetch_groww_chain_bounded(&test_client(), &url, "2026-07-16", &token, 0, None).await;
+        match outcome {
+            GrowwChainFetchOutcome::Failed(f) => {
+                assert_eq!(f.status, 200);
+                assert!(!f.rate_limited && !f.auth_rejected);
+                assert!(f.msg.contains("not a parseable"), "got: {}", f.msg);
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_fetch_once_classifies_auth_rate_limit_5xx_and_transport() {
+        let token = SecretString::from("test-token");
+        let client = test_client();
+
+        // 401 + 403 → auth-class (status-typed, never a substring scan).
+        for resp in [
+            "HTTP/1.1 401 Unauthorized\r\nContent-Length: 2\r\n\r\n{}",
+            "HTTP/1.1 403 Forbidden\r\nContent-Length: 2\r\n\r\n{}",
+        ] {
+            let url = spawn_chain_mock(resp).await;
+            let failure = groww_chain_fetch_once(&client, &url, "2026-07-16", &token)
+                .await
+                .expect_err("non-2xx must fail");
+            assert!(failure.auth_rejected, "got: {failure:?}");
+            assert!(!failure.rate_limited);
+        }
+
+        // 429 with Retry-After → rate_limited + the live-probe (e) shape
+        // (Retry-After presence captured into the bounded msg).
+        let url = spawn_chain_mock(
+            "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 3\r\nContent-Length: 2\r\n\r\n{}",
+        )
+        .await;
+        let failure = groww_chain_fetch_once(&client, &url, "2026-07-16", &token)
+            .await
+            .expect_err("429 must fail");
+        assert!(failure.rate_limited);
+        assert!(!failure.auth_rejected);
+        assert_eq!(failure.status, 429);
+        assert!(
+            failure.msg.contains("retry_after_present=true"),
+            "got: {}",
+            failure.msg
+        );
+
+        // 500 → neither flag; the bounded body capture rides in msg.
+        let url =
+            spawn_chain_mock("HTTP/1.1 500 Internal Server Error\r\nContent-Length: 2\r\n\r\n{}")
+                .await;
+        let failure = groww_chain_fetch_once(&client, &url, "2026-07-16", &token)
+            .await
+            .expect_err("5xx must fail");
+        assert_eq!(failure.status, 500);
+        assert!(!failure.rate_limited && !failure.auth_rejected);
+
+        // Transport (closed port) → status 0, "send:" prefix.
+        let dead = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let dead_port = dead.local_addr().expect("addr").port();
+        drop(dead);
+        let url = format!("http://127.0.0.1:{dead_port}/v1/option-chain");
+        let failure = groww_chain_fetch_once(&client, &url, "2026-07-16", &token)
+            .await
+            .expect_err("closed port must fail");
+        assert_eq!(failure.status, 0);
+        assert!(failure.msg.starts_with("send:"), "got: {}", failure.msg);
+    }
+
+    #[tokio::test]
+    async fn test_fetch_once_rejects_oversized_declared_body() {
+        // Declared Content-Length past the 8 MiB cap → refused BEFORE the
+        // stream is read (§18 body-cap discipline); surfaces as a 200-class
+        // failure whose msg names the cap.
+        let declared = GROWW_CHAIN_1M_MAX_BODY_BYTES + 1;
+        let resp: &'static str = Box::leak(
+            format!("HTTP/1.1 200 OK\r\nContent-Length: {declared}\r\n\r\n").into_boxed_str(),
+        );
+        let url = spawn_chain_mock(resp).await;
+        let token = SecretString::from("test-token");
+        let failure = groww_chain_fetch_once(&test_client(), &url, "2026-07-16", &token)
+            .await
+            .expect_err("oversized declared body must fail");
+        assert_eq!(failure.status, 200);
+        assert!(
+            failure.msg.contains("body too large"),
+            "got: {}",
+            failure.msg
+        );
+    }
+
+    // ---- fire / verdict / boundary sinks (hermetic — no-token + edges) -----
+
+    fn test_params() -> GrowwChain1mTaskParams {
+        use tickvault_common::config::{NseHolidayEntry, TradingConfig};
+        let cfg = TradingConfig {
+            market_open_time: "09:00:00".to_string(),
+            market_close_time: "15:30:00".to_string(),
+            order_cutoff_time: "15:29:00".to_string(),
+            data_collection_start: "09:00:00".to_string(),
+            data_collection_end: "15:30:00".to_string(),
+            timezone: "Asia/Kolkata".to_string(),
+            max_orders_per_second: 10,
+            nse_holidays: vec![NseHolidayEntry {
+                date: "2026-01-26".to_string(),
+                name: "Republic Day".to_string(),
+            }],
+            muhurat_trading_dates: vec![],
+            nse_mock_trading_dates: vec![],
+        };
+        GrowwChain1mTaskParams {
+            notifier: NotificationService::disabled(),
+            calendar: Arc::new(
+                TradingCalendar::from_config(&cfg).expect("synthetic calendar builds"),
+            ),
+            questdb: QuestDbConfig {
+                host: "127.0.0.1".to_string(),
+                http_port: 1,
+                pg_port: 8812,
+                ilp_port: 9009,
+            },
+            spot_minute_done: None,
+        }
+    }
+
+    fn test_target(underlying: &'static str, exchange: &'static str) -> GrowwChainTarget {
+        test_target_with_url(underlying, exchange, groww_chain_url(exchange, underlying))
+    }
+
+    fn test_target_with_url(
+        underlying: &'static str,
+        exchange: &'static str,
+        url: String,
+    ) -> GrowwChainTarget {
+        GrowwChainTarget {
+            underlying,
+            exchange,
+            security_id: 1,
+            expiry: NaiveDate::from_ymd_opt(2026, 7, 16).expect("valid date"),
+            expiry_str: "2026-07-16".to_string(),
+            url,
+        }
+    }
+
+    fn epoch_ms_now() -> i64 {
+        i64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("post-epoch clock")
+                .as_millis(),
+        )
+        .expect("fits i64")
+    }
+
+    /// The no-token fire arm: every underlying is a counted full miss +
+    /// one `no_token` forensics row each; nothing is persisted to the
+    /// chain table and NO network request happens (the paced-out cache
+    /// returns None without an SSM read).
+    #[tokio::test]
+    async fn test_fire_no_token_arm_counts_misses_and_writes_forensics() {
+        let params = test_params();
+        let targets = vec![test_target("NIFTY", "NSE"), test_target("SENSEX", "BSE")];
+        let mut last_request_ms: Option<i64> = None;
+        let mut writer = OptionChain1mWriter::for_test_with_feed(
+            OPTION_CHAIN_1M_FEED_GROWW,
+            OPTION_CHAIN_1M_SOURCE_GROWW_CHAIN,
+        );
+        let mut audit_writer = RestFetchAuditWriter::for_test();
+        let mut edge = FailureEdge::default();
+        let mut token_cache = GrowwTokenCache::for_test_paced_out(epoch_ms_now());
+        fire_one_groww_chain_minute(
+            &params,
+            &test_client(),
+            &targets,
+            &mut last_request_ms,
+            &mut writer,
+            &mut audit_writer,
+            &mut edge,
+            &mut token_cache,
+            9 * 3600 + 16 * 60,
+        )
+        .await;
+        assert_eq!(writer.pending(), 0, "no chain rows without a token");
+        // The sink flushes at the end of every fire; the disconnected test
+        // writer discards on flush — so pending is 0 AND the appends are
+        // proven via the edge below (one fully-failed minute recorded).
+        assert_eq!(audit_writer.pending(), 0, "flush ran (best-effort discard)");
+        assert!(
+            last_request_ms.is_none(),
+            "no request happened — the pacing stamp must stay unset"
+        );
+        // The fire fed the edge EXACTLY one fully-failed minute: two more
+        // failed minutes reach the 3-threshold page on the third total.
+        assert!(matches!(edge.record_minute(true), EdgeAction::None));
+        assert!(matches!(
+            edge.record_minute(true),
+            EdgeAction::Page { consecutive: 3 }
+        ));
+    }
+
+    fn non_trading_params() -> GrowwChain1mTaskParams {
+        use tickvault_common::config::{NseHolidayEntry, TradingConfig};
+        let mut params = test_params();
+        let cfg = TradingConfig {
+            market_open_time: "09:00:00".to_string(),
+            market_close_time: "15:30:00".to_string(),
+            order_cutoff_time: "15:29:00".to_string(),
+            data_collection_start: "09:00:00".to_string(),
+            data_collection_end: "15:30:00".to_string(),
+            timezone: "Asia/Kolkata".to_string(),
+            max_orders_per_second: 10,
+            // TODAY is a declared holiday → is_trading_day_today() is
+            // false regardless of the weekday the test runs on.
+            nse_holidays: vec![NseHolidayEntry {
+                date: today_ist().format("%Y-%m-%d").to_string(),
+                name: "synthetic test holiday".to_string(),
+            }],
+            muhurat_trading_dates: vec![],
+            nse_mock_trading_dates: vec![],
+        };
+        params.calendar =
+            Arc::new(TradingCalendar::from_config(&cfg).expect("synthetic calendar builds"));
+        params
+    }
+
+    /// A non-trading day: the run degrades the DDL ensures loudly against
+    /// the unreachable QuestDB, gates BEFORE any warmup/fetch, and the
+    /// supervisor classifies the clean exit as day-over and stops (no
+    /// respawn loop on a holiday).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_run_and_supervisor_exit_on_non_trading_day() {
+        let params = non_trading_params();
+        let cache: GrowwChainTargetsCache = Arc::new(tokio::sync::Mutex::new(None));
+        let disabled = Arc::new(AtomicBool::new(false));
+        tokio::time::timeout(
+            Duration::from_secs(30),
+            run_groww_chain_1m(params.clone(), Arc::clone(&disabled), Arc::clone(&cache)),
+        )
+        .await
+        .expect("run must return promptly on a non-trading day");
+        assert!(
+            cache.lock().await.is_none(),
+            "no warmup / master download on a non-trading day"
+        );
+        assert!(!disabled.load(Ordering::SeqCst));
+
+        let handle = spawn_supervised_groww_chain_1m(params);
+        tokio::time::timeout(Duration::from_secs(30), handle)
+            .await
+            .expect("supervisor must exit day-over, never respawn on a holiday")
+            .expect("supervisor join");
+    }
+
+    /// The token-path fire against a hermetic mock (target-carried URL):
+    /// a Found underlying (with a vendor-omitted underlying_ltp — the
+    /// LOW-5 warn arm) + an Empty underlying. The disconnected test
+    /// writer's flush fails, so the persist gate counts the minute fully
+    /// failed (M1) even though the fetch found a chain.
+    #[tokio::test]
+    async fn test_fire_token_path_found_and_empty_via_mock() {
+        let params = test_params();
+        // Found body: one strike, both legs, NO underlying_ltp (LOW-5 arm),
+        // one invalid strike key (counted-skip arm).
+        let body = r#"{"payload":{"strikes":{"100":{"CE":{"ltp":1.5},"PE":{"ltp":2.5}},"bogus":{"CE":{"ltp":9.0}}}}}"#;
+        let found_resp: &'static str = Box::leak(
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            )
+            .into_boxed_str(),
+        );
+        let found_url = spawn_chain_mock(found_resp).await;
+        let empty_body = r#"{"payload":{"underlying_ltp":1.0,"strikes":{}}}"#;
+        let empty_resp: &'static str = Box::leak(
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{empty_body}",
+                empty_body.len()
+            )
+            .into_boxed_str(),
+        );
+        let empty_url = spawn_chain_mock(empty_resp).await;
+        let targets = vec![
+            test_target_with_url("NIFTY", "NSE", found_url),
+            test_target_with_url("SENSEX", "BSE", empty_url),
+        ];
+        let mut last_request_ms: Option<i64> = None;
+        let mut writer = OptionChain1mWriter::for_test_with_feed(
+            OPTION_CHAIN_1M_FEED_GROWW,
+            OPTION_CHAIN_1M_SOURCE_GROWW_CHAIN,
+        );
+        let mut audit_writer = RestFetchAuditWriter::for_test();
+        let mut edge = FailureEdge::default();
+        let mut token_cache = GrowwTokenCache::for_test_with_token(SecretString::from("t"));
+        fire_one_groww_chain_minute(
+            &params,
+            &test_client(),
+            &targets,
+            &mut last_request_ms,
+            &mut writer,
+            &mut audit_writer,
+            &mut edge,
+            &mut token_cache,
+            9 * 3600 + 16 * 60,
+        )
+        .await;
+        assert!(
+            last_request_ms.is_some(),
+            "requests happened — the cross-request pacing stamp advanced"
+        );
+        // The fetch side found a chain (ok_count = 1) BUT the disconnected
+        // test writer's flush fails → the persist gate (the spot M1
+        // discipline) honestly counts the minute FULLY FAILED: the edge
+        // holds 1, so two more failed minutes reach the 3-threshold page.
+        assert!(matches!(edge.record_minute(true), EdgeAction::None));
+        assert!(matches!(
+            edge.record_minute(true),
+            EdgeAction::Page { consecutive: 3 }
+        ));
+    }
+
+    /// The token-path fire's auth short-circuit (the item-12 mirror): a
+    /// 401 on the FIRST underlying drops the token, skips the remaining
+    /// underlyings (no doomed requests), and the minute counts fully
+    /// failed.
+    #[tokio::test]
+    async fn test_fire_token_path_auth_reject_short_circuits_via_mock() {
+        let params = test_params();
+        let url_401 =
+            spawn_chain_mock("HTTP/1.1 401 Unauthorized\r\nContent-Length: 2\r\n\r\n{}").await;
+        // The second target's port is CLOSED — a request there would be a
+        // transport error; the short-circuit must never send it at all
+        // (nothing observable would distinguish — the skip is proven by
+        // the forensics count in the no-token test's pattern + coverage).
+        let dead = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let dead_port = dead.local_addr().expect("addr").port();
+        drop(dead);
+        let targets = vec![
+            test_target_with_url("NIFTY", "NSE", url_401),
+            test_target_with_url(
+                "SENSEX",
+                "BSE",
+                format!("http://127.0.0.1:{dead_port}/v1/option-chain"),
+            ),
+        ];
+        let mut last_request_ms: Option<i64> = None;
+        let mut writer = OptionChain1mWriter::for_test_with_feed(
+            OPTION_CHAIN_1M_FEED_GROWW,
+            OPTION_CHAIN_1M_SOURCE_GROWW_CHAIN,
+        );
+        let mut audit_writer = RestFetchAuditWriter::for_test();
+        let mut edge = FailureEdge::default();
+        let mut token_cache = GrowwTokenCache::for_test_with_token(SecretString::from("t"));
+        fire_one_groww_chain_minute(
+            &params,
+            &test_client(),
+            &targets,
+            &mut last_request_ms,
+            &mut writer,
+            &mut audit_writer,
+            &mut edge,
+            &mut token_cache,
+            9 * 3600 + 17 * 60,
+        )
+        .await;
+        // Fully failed (401 + skipped) → the edge holds ONE failed minute:
+        // the page fires on the third total.
+        assert!(matches!(edge.record_minute(true), EdgeAction::None));
+        assert!(matches!(
+            edge.record_minute(true),
+            EdgeAction::Page { consecutive: 3 }
+        ));
+    }
+
+    /// The verdict sink's three edge arms execute without panicking and
+    /// the edge state machine advances exactly as the pure FailureEdge
+    /// contract says (page after the threshold, recover on the next ok).
+    #[test]
+    fn test_record_minute_verdict_page_recover_and_sub_edge_arms() {
+        let params = test_params();
+        let mut edge = FailureEdge::default();
+        // Sub-edge failure (ok_count > 0) → the coalesced minute_failed arm.
+        record_groww_chain_minute_verdict(&params, &mut edge, "9:16 AM", 2, 1, 0, false, None);
+        // Fully-failed minutes up to the threshold → the Page arm fires
+        // inside (edge-triggered — the FOLLOWING failed minute is None).
+        for _ in 0..tickvault_common::constants::GROWW_CHAIN_1M_CONSECUTIVE_FAIL_PAGE_THRESHOLD {
+            record_groww_chain_minute_verdict(
+                &params,
+                &mut edge,
+                "9:17 AM",
+                0,
+                2,
+                0,
+                false,
+                Some("NIFTY: http 500"),
+            );
+        }
+        assert!(matches!(edge.record_minute(true), EdgeAction::None));
+        // An ok minute AFTER the paged episode → the Recover arm.
+        record_groww_chain_minute_verdict(&params, &mut edge, "9:21 AM", 2, 0, 0, false, None);
+        assert!(matches!(edge.record_minute(true), EdgeAction::None));
+        // A persist-gated failure counts fully-failed even with fetch OKs
+        // (the spot M1 discipline — pure fn already pins it; this pins the
+        // sink wiring).
+        record_groww_chain_minute_verdict(&params, &mut edge, "9:22 AM", 2, 0, 0, true, None);
+    }
+
+    /// Boundary-skip accounting: zero skips is a no-op; a real skip writes
+    /// one `outcome=skipped` forensics row per (minute, underlying); a wake
+    /// that crossed IST midnight (iter_date ≠ today) skips the mis-dated
+    /// rows (the item-7 guard) after the counter + coalesced log.
+    #[test]
+    fn test_record_skipped_boundaries_rows_and_midnight_guard() {
+        let params = test_params();
+        let targets = vec![test_target("NIFTY", "NSE"), test_target("SENSEX", "BSE")];
+        let today = today_ist();
+
+        let mut edge = FailureEdge::default();
+        let mut audit_writer = RestFetchAuditWriter::for_test();
+        record_groww_chain_skipped_boundaries(
+            &params,
+            &mut edge,
+            &mut audit_writer,
+            &targets,
+            0,
+            9 * 3600 + 17 * 60,
+            today,
+        );
+        assert_eq!(audit_writer.pending(), 0, "zero skips → no rows");
+        assert!(
+            matches!(edge.record_minute(false), EdgeAction::None),
+            "zero skips must not feed the edge"
+        );
+
+        // 3 skipped minutes: each feeds the edge (the internal Page fires
+        // at the threshold) — provable via the Recover on the next ok.
+        record_groww_chain_skipped_boundaries(
+            &params,
+            &mut edge,
+            &mut audit_writer,
+            &targets,
+            3,
+            9 * 3600 + 17 * 60,
+            today,
+        );
+        assert!(
+            matches!(
+                edge.record_minute(false),
+                EdgeAction::Recover { failed_minutes: 3 }
+            ),
+            "3 skipped minutes must have fed the edge to the paged state"
+        );
+        // The sink flushes best-effort at the end (the disconnected test
+        // writer discards) — the edge assert above proves the rows ran.
+        assert_eq!(audit_writer.pending(), 0, "flushed (best-effort discard)");
+
+        // Midnight-crossing guard: iter_date behind today → counter + log
+        // only, NO (mis-dated) forensics rows, NO edge feeding.
+        let mut fresh_writer = RestFetchAuditWriter::for_test();
+        let mut fresh_edge = FailureEdge::default();
+        record_groww_chain_skipped_boundaries(
+            &params,
+            &mut fresh_edge,
+            &mut fresh_writer,
+            &targets,
+            2,
+            9 * 3600 + 17 * 60,
+            today.pred_opt().expect("yesterday exists"),
+        );
+        assert_eq!(fresh_writer.pending(), 0, "midnight guard skips the rows");
+        assert!(
+            matches!(fresh_edge.record_minute(false), EdgeAction::None),
+            "midnight guard must not feed the edge"
         );
     }
 }

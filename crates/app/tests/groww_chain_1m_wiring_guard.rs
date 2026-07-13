@@ -39,7 +39,11 @@ fn read_app_src(rel: &str) -> String {
 const HELPER_DEF: &str = "fn spawn_groww_spot_1m_leg(";
 const CHAIN_SPAWN_CALL: &str = "spawn_supervised_groww_chain_1m(";
 const PROBE_CALL: &str = "run_groww_chain_1m_probe(";
-const CHAIN_GATE: &str = "config.groww_option_chain_1m.enabled";
+// The REAL branch (hostile-round-1 NIT-6): a dead `let chain_enabled = ...`
+// binding anywhere before an UNCONDITIONAL spawn must not satisfy the gate
+// pin — the needle is the `if` itself, plus the binding assertion below.
+const CHAIN_GATE: &str = "if chain_enabled {";
+const CHAIN_GATE_BINDING: &str = "let chain_enabled = config.groww_option_chain_1m.enabled;";
 const PROBE_GATE: &str = "config.groww_option_chain_1m.probe_and_report";
 
 /// The helper body span in main.rs: from the definition to the next
@@ -109,6 +113,15 @@ fn ratchet_groww_chain1m_spawn_and_probe_are_config_gated_inside_the_dual_arm_he
              site at byte {site}"
         );
     }
+    // ... and `chain_enabled` must really BE the config read (NIT-6: the
+    // `if chain_enabled {` pin alone could gate on a repurposed flag).
+    assert!(
+        main_src
+            .match_indices(CHAIN_GATE_BINDING)
+            .any(|(pos, _)| pos > def_pos && pos < spawn_positions[0]),
+        "the `{CHAIN_GATE_BINDING}` binding must sit inside the helper \
+         before the chain spawn site"
+    );
 }
 
 /// Sequencing pin: the watch channel exists ONLY when both legs are on,
