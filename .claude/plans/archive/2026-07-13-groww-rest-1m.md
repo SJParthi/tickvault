@@ -1,6 +1,6 @@
 # Implementation Plan: Groww per-minute REST pipeline — spot 1m + option chain + per-contract 1m
 
-**Status:** IN_PROGRESS
+**Status:** VERIFIED
 **Date:** 2026-07-13
 **Approved by:** Parthiban (operator) — directive relayed verbatim via the coordinator session, 2026-07-13 (quotes preserved in this plan + the rule amendments: `groww-second-feed-scope-2026-06-19.md` §38, `no-rest-except-live-feed-2026-06-27.md` §9).
 
