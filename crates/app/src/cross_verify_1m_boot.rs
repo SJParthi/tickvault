@@ -73,9 +73,11 @@ const _: () = assert!(
     RETRY_429_MAX_PER_SEC < DATA_API_RPS as u64,
     "cross-verify 429 second pass must pace below the Data-API 5/sec budget"
 );
-/// Seconds per IST trading minute bucket (1m candle).
-const SECONDS_PER_MINUTE: i64 = 60;
-/// Nanoseconds per second (IST-epoch → nanos).
+/// Nanoseconds per second (IST-epoch → nanos). Test-fixture scale since the
+/// Phase C1 parser relocation (production nanos math moved with the parser;
+/// `SECONDS_PER_MINUTE` moved too — the #1506 merge's re-add is dropped here
+/// as it has no remaining consumer in this file).
+#[cfg(test)]
 const NANOS_PER_SEC: i64 = 1_000_000_000;
 /// Epoch-microsecond scale — the ONLY representation legal in an embedded
 /// QuestDB TIMESTAMP comparison literal (see the regression lock on
@@ -1431,7 +1433,7 @@ mod tests {
     /// realistic cost is the paced gaps: the 2026-07-13 incident cohort of
     /// 91 ≈ 45 s + 91 × 334 ms ≈ 75 s). No unbounded loops anywhere.
     #[test]
-    fn test_second_pass_duration_bound_is_linear_and_bounded() {
+    fn test_second_pass_duration_bound_ms_is_linear_and_bounded() {
         assert_eq!(
             second_pass_duration_bound_ms(0),
             RETRY_429_COOLDOWN_SECS * 1_000
