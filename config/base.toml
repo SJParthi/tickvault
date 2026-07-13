@@ -502,3 +502,22 @@ probe_and_report = true
 # ===========================================================================
 [groww_spot_1m]
 enabled = true
+
+# ===========================================================================
+# Groww per-minute option-chain REST leg (operator grant 2026-07-13 — PR-3
+# of the Groww per-minute REST plan). When enabled: every session minute —
+# sequenced right after the Groww spot fetch — pull the CURRENT-expiry
+# option chain for NIFTY/BANKNIFTY (NSE) + SENSEX (BSE) and persist every
+# per-strike per-leg row into the option_chain_1m table tagged feed='groww'
+# (feed-in-key DEDUP — the Dhan rows are untouched). Expiry comes from the
+# daily Groww instruments master CSV (zero extra rate cost — never a new
+# expiry endpoint, never guessed). Shipped DEFAULT-OFF pending the first
+# live probe: the endpoint is documented-available, but the live response
+# shape / strike keys / latency / rate-limit family are UNVERIFIED-LIVE.
+# probe_and_report = true runs ONE bounded boot-time chain call per
+# underlying and reports the measured verdict via Telegram (persists
+# nothing) — flip enabled = true only after the probe passes.
+# ===========================================================================
+[groww_option_chain_1m]
+enabled = false # pending the first live probe (see probe_and_report)
+probe_and_report = true

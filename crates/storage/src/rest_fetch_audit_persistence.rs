@@ -57,9 +57,13 @@ pub const REST_FETCH_AUDIT_TABLE: &str = "rest_fetch_audit";
 pub const DEDUP_KEY_REST_FETCH_AUDIT: &str =
     "ts, trading_date_ist, feed, leg, security_id, exchange_segment, outcome";
 
-/// `leg` SYMBOL value — the per-minute SPOT 1m fetch (the only live leg
-/// today; `chain_1m` / `contract_1m` land with PR-3/PR-4).
+/// `leg` SYMBOL value — the per-minute SPOT 1m fetch.
 pub const REST_FETCH_LEG_SPOT_1M: &str = "spot_1m";
+
+/// `leg` SYMBOL value — the per-minute OPTION-CHAIN fetch (PR-3, the Groww
+/// chain leg; one row per (minute, underlying), attempts=1 — the chain has
+/// no in-minute re-poll ladder). `contract_1m` lands with PR-4.
+pub const REST_FETCH_LEG_CHAIN_1M: &str = "chain_1m";
 
 const QUESTDB_DDL_TIMEOUT_SECS: u64 = 10;
 
@@ -511,6 +515,15 @@ mod tests {
         // Exactly (ts, trading_date_ist, feed, leg, security_id,
         // exchange_segment, outcome).
         assert_eq!(DEDUP_KEY_REST_FETCH_AUDIT.matches(',').count() + 1, 7);
+    }
+
+    /// Leg SYMBOL wire strings are stable + distinct (the DEDUP key relies
+    /// on `leg` separating the spot and chain rows for the same minute).
+    #[test]
+    fn test_rest_fetch_leg_wire_strings_stable_and_distinct() {
+        assert_eq!(REST_FETCH_LEG_SPOT_1M, "spot_1m");
+        assert_eq!(REST_FETCH_LEG_CHAIN_1M, "chain_1m");
+        assert_ne!(REST_FETCH_LEG_SPOT_1M, REST_FETCH_LEG_CHAIN_1M);
     }
 
     /// Outcome SYMBOL wire strings are stable (forensic queries group on

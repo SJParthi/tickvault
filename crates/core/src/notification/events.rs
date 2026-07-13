@@ -512,6 +512,53 @@ pub enum NotificationEvent {
         failed_minutes: u32,
     },
 
+    /// Groww per-minute option-chain REST leg (operator grant 2026-07-13,
+    /// PR-3 of the Groww per-minute REST plan): the per-minute Groww
+    /// option-chain snapshot has fully failed for several minutes in a row
+    /// (edge-triggered ONCE per episode, Rule 4; re-armed only after a
+    /// successful minute). Severity::High.
+    GrowwChain1mFetchDegraded {
+        /// How many minutes in a row have fully failed.
+        consecutive_failed_minutes: u32,
+        /// The most recent failed minute, IST 12-hour (e.g. "10:42 AM").
+        minute_ist: String,
+    },
+
+    /// The Groww per-minute option-chain snapshot RECOVERED after a
+    /// failing episode (falling edge — one Info ping; the missing minutes
+    /// stay absent until re-pulled, never fabricated).
+    GrowwChain1mFetchRecovered {
+        /// The minute that succeeded, IST 12-hour (e.g. "10:45 AM").
+        minute_ist: String,
+        /// How many minutes had fully failed during the episode.
+        failed_minutes: u32,
+    },
+
+    /// The Groww chain leg could not resolve today's option expiry for one
+    /// or more underlyings from the daily instruments list (list download
+    /// failed after bounded tries, or the list carried no usable option
+    /// rows) — those underlyings' chain recording stays OFF for the day
+    /// (expiry dates are never guessed). One HIGH page per day.
+    GrowwChain1mExpiryUnresolved {
+        /// Plain-English detail naming the affected underlyings / cause
+        /// (already secret-redacted + bounded at the emit site).
+        detail: String,
+    },
+
+    /// The boot-time Groww option-chain probe verdict (pipeline switched
+    /// OFF, probe-and-report ON): one Info ping carrying the MEASURED
+    /// result — whether the chain answered, how many strikes, how fast, or
+    /// which reject class — so the operator can decide to turn recording
+    /// on. Nothing was recorded either way.
+    GrowwChain1mProbeVerdict {
+        /// `true` when every underlying's chain call answered with a
+        /// parseable chain.
+        ok: bool,
+        /// Plain-English measured detail (already secret-redacted +
+        /// bounded at the emit site).
+        detail: String,
+    },
+
     /// Per-minute option-chain REST pipeline (operator grant 2026-07-12,
     /// PR-3): the per-minute option-chain snapshot has fully failed for
     /// several minutes in a row (edge-triggered ONCE per episode, Rule 4;
@@ -2107,6 +2154,78 @@ impl NotificationEvent {
                      the record until re-pulled — nothing is made up."
                 )
             }
+            Self::GrowwChain1mFetchDegraded {
+                consecutive_failed_minutes,
+                minute_ist,
+            } => {
+                format!(
+                    "\u{1f198} <b>Groww minute-by-minute option chain recording is FAILING</b>\n\
+                     The per-minute option chain snapshot for NIFTY, BANKNIFTY \
+                     and SENSEX from the second broker (Groww) has failed \
+                     {consecutive_failed_minutes} minutes in a row (latest \
+                     failed minute: {minute_ist} IST).\n\
+                     Live streaming prices are NOT affected — only Groww's \
+                     per-minute option chain record is missing.\n\
+                     What to do RIGHT NOW:\n\
+                     1. Check the Groww account's daily access is active \
+                     (the shared morning key).\n\
+                     2. If Groww live streaming prices ALSO stopped, treat it \
+                     as a full Groww outage.\n\
+                     3. Missing minutes stay blank — nothing is made up."
+                )
+            }
+            Self::GrowwChain1mFetchRecovered {
+                minute_ist,
+                failed_minutes,
+            } => {
+                format!(
+                    "\u{2705} <b>Groww minute-by-minute option chain recording recovered</b>\n\
+                     The Groww per-minute option chain snapshot is working \
+                     again as of {minute_ist} IST, after {failed_minutes} \
+                     failed minute(s). The minutes that failed stay blank in \
+                     the record until re-pulled — nothing is made up."
+                )
+            }
+            Self::GrowwChain1mExpiryUnresolved { detail } => {
+                let detail = html_escape(detail);
+                format!(
+                    "\u{1f198} <b>Groww option chain recording could NOT start \
+                     for some indices today</b>\n\
+                     Today's contract list from Groww did not give a usable \
+                     option expiry date, so those indices' option chain \
+                     recording stays OFF for today (expiry dates are never \
+                     guessed).\n\
+                     Detail: {detail}\n\
+                     Live streaming prices are NOT affected. Tomorrow's start \
+                     retries automatically.\n\
+                     What to do RIGHT NOW:\n\
+                     1. Nothing urgent — the affected recording is off for \
+                     today only.\n\
+                     2. If this repeats daily, the Groww contract list has a \
+                     problem — check with the broker."
+                )
+            }
+            Self::GrowwChain1mProbeVerdict { ok, detail } => {
+                let detail = html_escape(detail);
+                if *ok {
+                    format!(
+                        "\u{2705} <b>Groww option chain check PASSED</b>\n\
+                         Today's one-time check pulled the Groww option chain \
+                         successfully. Measured: {detail}\n\
+                         Recording is currently switched OFF. To start \
+                         recording it minute-by-minute: turn ON the Groww \
+                         option chain setting and restart the app."
+                    )
+                } else {
+                    format!(
+                        "\u{1f514} <b>Groww option chain check did NOT pass</b>\n\
+                         Today's one-time check could not pull a usable Groww \
+                         option chain. Measured: {detail}\n\
+                         Nothing is broken — recording is switched off and \
+                         stays off. Tomorrow's start checks again."
+                    )
+                }
+            }
             Self::ChainFetchDegraded {
                 consecutive_failed_minutes,
                 minute_ist,
@@ -3073,6 +3192,10 @@ impl NotificationEvent {
             Self::Spot1mFetchRecovered { .. } => "Spot1mFetchRecovered",
             Self::GrowwSpot1mFetchDegraded { .. } => "GrowwSpot1mFetchDegraded",
             Self::GrowwSpot1mFetchRecovered { .. } => "GrowwSpot1mFetchRecovered",
+            Self::GrowwChain1mFetchDegraded { .. } => "GrowwChain1mFetchDegraded",
+            Self::GrowwChain1mFetchRecovered { .. } => "GrowwChain1mFetchRecovered",
+            Self::GrowwChain1mExpiryUnresolved { .. } => "GrowwChain1mExpiryUnresolved",
+            Self::GrowwChain1mProbeVerdict { .. } => "GrowwChain1mProbeVerdict",
             Self::ChainFetchDegraded { .. } => "ChainFetchDegraded",
             Self::ChainFetchRecovered { .. } => "ChainFetchRecovered",
             Self::ChainEntitlementAbsent { .. } => "ChainEntitlementAbsent",
@@ -3362,6 +3485,14 @@ impl NotificationEvent {
             // Info ping on the falling edge.
             Self::GrowwSpot1mFetchDegraded { .. } => Severity::High,
             Self::GrowwSpot1mFetchRecovered { .. } => Severity::Info,
+            Self::GrowwChain1mFetchDegraded { .. } => Severity::High,
+            Self::GrowwChain1mFetchRecovered { .. } => Severity::Info,
+            // One page per day when an underlying's chain recording could
+            // not start (never a guessed expiry) — actionable, not fatal.
+            Self::GrowwChain1mExpiryUnresolved { .. } => Severity::High,
+            // The probe is informational either way — nothing was expected
+            // to record while the pipeline is switched off.
+            Self::GrowwChain1mProbeVerdict { .. } => Severity::Info,
             Self::ChainFetchDegraded { .. } => Severity::High,
             Self::ChainFetchRecovered { .. } => Severity::Info,
             // HIGH only when the pipeline was ON and expected to record;
@@ -6845,6 +6976,87 @@ mod tests {
         assert!(msg.contains("4 failed"), "got: {msg}");
         // No false-OK: recovery never claims the missing minutes came back.
         assert!(msg.contains("nothing is made up"), "got: {msg}");
+    }
+
+    // -----------------------------------------------------------------------
+    // GrowwChain1m* events (2026-07-13 — Groww per-minute option-chain
+    // leg, PR-3 of the Groww REST plan)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_groww_chain_1m_fetch_degraded_is_high_with_action_lines() {
+        let event = NotificationEvent::GrowwChain1mFetchDegraded {
+            consecutive_failed_minutes: 3,
+            minute_ist: "10:42 AM".to_string(),
+        };
+        assert_eq!(event.topic(), "GrowwChain1mFetchDegraded");
+        assert_eq!(event.severity(), Severity::High);
+        let msg = event.to_message();
+        assert!(msg.contains("Groww"), "got: {msg}");
+        assert!(msg.contains("FAILING"), "got: {msg}");
+        assert!(msg.contains("3 minutes in a row"), "got: {msg}");
+        // IST 12-hour timestamp (Telegram commandment 9).
+        assert!(msg.contains("10:42 AM IST"), "got: {msg}");
+        assert!(msg.contains("What to do RIGHT NOW"), "got: {msg}");
+        // Honest scope line: the live WS pipelines are untouched.
+        assert!(msg.contains("NOT affected"), "got: {msg}");
+    }
+
+    #[test]
+    fn test_groww_chain_1m_fetch_recovered_is_info_positive_ping() {
+        let event = NotificationEvent::GrowwChain1mFetchRecovered {
+            minute_ist: "10:45 AM".to_string(),
+            failed_minutes: 4,
+        };
+        assert_eq!(event.topic(), "GrowwChain1mFetchRecovered");
+        assert_eq!(event.severity(), Severity::Info);
+        let msg = event.to_message();
+        assert!(msg.contains("Groww"), "got: {msg}");
+        assert!(msg.contains("recovered"), "got: {msg}");
+        assert!(msg.contains("10:45 AM IST"), "got: {msg}");
+        assert!(msg.contains("4 failed"), "got: {msg}");
+        // No false-OK: recovery never claims the missing minutes came back.
+        assert!(msg.contains("nothing is made up"), "got: {msg}");
+    }
+
+    #[test]
+    fn test_groww_chain_1m_expiry_unresolved_is_high_and_escapes_detail() {
+        let event = NotificationEvent::GrowwChain1mExpiryUnresolved {
+            detail: "SENSEX: no usable option rows <script>".to_string(),
+        };
+        assert_eq!(event.topic(), "GrowwChain1mExpiryUnresolved");
+        assert_eq!(event.severity(), Severity::High);
+        let msg = event.to_message();
+        assert!(msg.contains("could NOT start"), "got: {msg}");
+        assert!(msg.contains("never"), "expiry never guessed: {msg}");
+        // Hostile detail is HTML-escaped, never raw.
+        assert!(!msg.contains("<script>"), "got: {msg}");
+        assert!(msg.contains("&lt;script&gt;"), "got: {msg}");
+        assert!(msg.contains("What to do RIGHT NOW"), "got: {msg}");
+    }
+
+    #[test]
+    fn test_groww_chain_1m_probe_verdict_is_info_both_ways() {
+        let passed = NotificationEvent::GrowwChain1mProbeVerdict {
+            ok: true,
+            detail: "NIFTY: 102 strikes in 0.8s".to_string(),
+        };
+        assert_eq!(passed.topic(), "GrowwChain1mProbeVerdict");
+        assert_eq!(passed.severity(), Severity::Info);
+        let msg = passed.to_message();
+        assert!(msg.contains("PASSED"), "got: {msg}");
+        assert!(msg.contains("102 strikes"), "got: {msg}");
+        assert!(msg.contains("switched OFF"), "honest state: {msg}");
+
+        let failed = NotificationEvent::GrowwChain1mProbeVerdict {
+            ok: false,
+            detail: "http 403 <b>hostile</b>".to_string(),
+        };
+        assert_eq!(failed.severity(), Severity::Info);
+        let msg = failed.to_message();
+        assert!(msg.contains("did NOT pass"), "got: {msg}");
+        assert!(!msg.contains("<b>hostile</b>"), "escaped: {msg}");
+        assert!(msg.contains("Nothing is broken"), "got: {msg}");
     }
 
     // -----------------------------------------------------------------------
