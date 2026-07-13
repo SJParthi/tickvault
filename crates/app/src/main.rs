@@ -2972,6 +2972,14 @@ async fn main() -> Result<()> {
             &feed_runtime,
         );
 
+        // Groww per-minute spot 1m REST leg on the FAST crash-recovery arm
+        // too (hostile round 1 item 1 — the scoreboard dual-site pattern):
+        // this arm `return run_shutdown_fast`s and never reaches the
+        // slow-path spawn below, yet a mid-market crash restart routes
+        // through EXACTLY this arm — without this call the flagship
+        // crash-restart day ran NO per-minute fetches and NO 15:31 sweep.
+        spawn_groww_spot_1m_leg(&config, &notifier, &trading_calendar);
+
         // --- Await shutdown ---
         return run_shutdown_fast(
             ws_handles,
@@ -3149,6 +3157,16 @@ async fn main() -> Result<()> {
         process_start_ist_nanos,
         &feed_runtime,
     );
+
+    // Groww per-minute spot 1m REST leg (operator grant 2026-07-13 — PR-2 of
+    // the Groww per-minute REST plan) — the slow-path call site; the FAST
+    // crash-recovery arm carries its own (hostile round 1 item 1 — the
+    // scoreboard dual-site pattern). Every trading-day minute close in
+    // [09:16:00, 15:30:00] IST it fetches the just-closed minute's official
+    // Groww 1m OHLCV for the 3 spot indices and persists to `spot_1m_rest`
+    // tagged feed='groww' (+ `rest_fetch_audit` forensics rows). See
+    // `spawn_groww_spot_1m_leg`.
+    spawn_groww_spot_1m_leg(&config, &notifier, &trading_calendar);
 
     // -----------------------------------------------------------------------
     // DayOhlcTracker boot wiring (post 2026-05-26 simplification; MOVED to
@@ -15013,6 +15031,43 @@ fn spawn_daily_tick_conservation_task(
 ///    and `DualFeedScorecardAborted` on Err/panic — the daily signal can
 ///    never be silently dropped. Graceful-shutdown cancellation stays
 ///    silent (normal teardown, not an abort).
+/// Groww per-minute spot 1m REST leg (operator grant 2026-07-13 — PR-2 of
+/// the Groww per-minute REST plan), called from BOTH boot arms (the FAST
+/// crash-recovery arm AND the slow process-global prefix — the
+/// `spawn_feed_scoreboard_tasks` dual-site pattern; hostile round 1 item 1:
+/// a mid-market crash restart takes the fast arm's `return
+/// run_shutdown_fast` and would otherwise never run this leg or its 15:31
+/// sweep). PROCESS-GLOBAL and deliberately NOT the Dhan-gated
+/// `spawn_post_market_tasks` seam: this leg's token is the shared-minter
+/// SSM read (never the Dhan JWT), so a Dhan-off (Groww-only) session still
+/// runs it. Config-gated fail-safe: an absent `[groww_spot_1m]` section
+/// disables it. Supervised respawn wrapper; self-skips on non-trading days
+/// / past 15:30 IST (post the one bounded ~15:31 repair sweep).
+// TEST-EXEMPT: tokio::spawn wrapper over the unit-tested boot module; BOTH call sites + the config gate pinned by crates/app/tests/groww_spot_1m_wiring_guard.rs.
+fn spawn_groww_spot_1m_leg(
+    config: &ApplicationConfig,
+    notifier: &std::sync::Arc<NotificationService>,
+    trading_calendar: &std::sync::Arc<TradingCalendar>,
+) {
+    if config.groww_spot_1m.enabled {
+        let _groww_spot1m_supervisor =
+            tickvault_app::groww_spot_1m_boot::spawn_supervised_groww_spot_1m(
+                tickvault_app::groww_spot_1m_boot::GrowwSpot1mTaskParams {
+                    notifier: notifier.clone(),
+                    calendar: std::sync::Arc::clone(trading_calendar),
+                    questdb: config.questdb.clone(),
+                },
+            );
+        info!(
+            "groww_spot_1m: Groww per-minute spot 1m REST leg spawned \
+             (fires each minute close 09:16:00-15:30:00 IST; sequential \
+             symbol pacing)"
+        );
+    } else {
+        info!("groww_spot_1m: disabled by config — Groww per-minute spot fetch not spawned");
+    }
+}
+
 // TEST-EXEMPT: tokio::spawn wrapper over the unit-tested pure parts (decide_scoreboard_start / synthesize_process_death_episodes / SQL builders / parsers); spawn site pinned by test_feed_scoreboard_task_is_wired_into_main.
 fn spawn_feed_scoreboard_tasks(
     config: &ApplicationConfig,
