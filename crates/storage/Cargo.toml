@@ -41,6 +41,9 @@ secrecy = { workspace = true }
 aws-config = { workspace = true }
 aws-sdk-s3 = { workspace = true }
 flate2 = { workspace = true }
+# Review round 2 (2026-07-13): SHA-256 content identity for the S3
+# reuse/conflict decision (workspace-pinned; the app crate already uses it).
+sha2 = { workspace = true }
 
 [features]
 # Sub-PR #10b-ε of 2026-05-27 daily-universe expansion: gates the

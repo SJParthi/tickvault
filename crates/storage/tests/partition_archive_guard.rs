@@ -174,8 +174,9 @@ fn verify_inputs_come_from_real_recount_and_head_calls() {
         "process_one must obtain the recount from the real recount_rows() call"
     );
     assert!(
-        process_one.contains("self.head_object_len("),
-        "process_one must obtain the S3 length from the real head_object_len() call"
+        process_one.contains("self.head_object_meta("),
+        "process_one must obtain the S3 length + checksum from the real \
+         head_object_meta() call"
     );
     // The two fetched values must be the ones handed to verify_archive —
     // pin the binding names appearing in the verify_archive call.
@@ -189,6 +190,16 @@ fn verify_inputs_come_from_real_recount_and_head_calls() {
             "verify_archive must be fed the fetched `{needle}` value, not a stub"
         );
     }
+    // Round 2: the reuse decision must compare the STORED checksum against
+    // the freshly exported digest (content identity, not just length).
+    assert!(
+        process_one.contains("checksum_sha256_b64"),
+        "the reuse arm must consult the stored sha256 checksum"
+    );
+    assert!(
+        process_one.contains("gzip_sha256_b64"),
+        "the reuse arm must compare against the freshly exported gzip sha256"
+    );
     // Vacuous-pass tripwires: verify inputs must never be self-satisfied.
     for forbidden in ["Some(exported.rows)", "Some(exported.gzip_bytes)"] {
         assert!(

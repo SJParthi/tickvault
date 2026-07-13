@@ -32,15 +32,21 @@
 //!    in the RAW (pre-compression) stream with a quote-aware state machine
 //!    (review round 1, F5 — a raw `\n` count over-counts on STRING fields
 //!    carrying embedded newlines, e.g. this module's own audit `detail`).
-//! 3. **Upload (never-overwrite, review round 1 F1)** — `HeadObject` FIRST:
-//!    an existing object of the SAME length is REUSED (an interrupted prior
-//!    run's verified upload); a DIFFERENT length is a loud `S3Conflict`
-//!    (keep the partition — never overwrite what may be the only copy of
-//!    already-dropped data); absent → conditional `PutObject` with
-//!    `If-None-Match: "*"` to `s3://<bucket>/questdb-partitions/<table>/
-//!    <partition>.csv.gz`. Bucket = explicit config, else `tv-<env>-cold`
-//!    ONLY when the environment env var is EXPLICITLY set — no env var, no
-//!    archival (fail-closed; a dev box can never write the prod bucket).
+//! 3. **Upload (never-overwrite, review rounds 1+2)** — `HeadObject` FIRST
+//!    (with `ChecksumMode::Enabled`): an existing object is REUSED only on
+//!    CONTENT IDENTITY — equal length (fast pre-filter) AND a stored SHA-256
+//!    checksum equal to the fresh export's digest (round 2: a stale object
+//!    plus a mutated partition with a coincidental compressed length must
+//!    never reach a drop; ETag is deliberately NOT used — under SSE-KMS it
+//!    is not the MD5). Length/checksum mismatch OR a checksum-less
+//!    foreign/legacy object is a loud `S3Conflict` (keep the partition —
+//!    never overwrite what may be the only copy of already-dropped data);
+//!    absent → conditional `PutObject` with `If-None-Match: "*"` +
+//!    `checksum_sha256` (S3 validates the body server-side) to
+//!    `s3://<bucket>/questdb-partitions/<table>/<partition>.csv.gz`. Bucket
+//!    = explicit config, else `tv-<env>-cold` ONLY when the environment env
+//!    var is EXPLICITLY set — no env var, no archival (fail-closed; a dev
+//!    box can never write the prod bucket).
 //! 4. **Verify (fail-closed, ALL of)** — (a) `SELECT count()` over the same
 //!    range taken AFTER the export equals the exported record count (the
 //!    ≥2-day floor makes the count stable); (b) `HeadObject` exists and
@@ -352,6 +358,10 @@ pub struct VerifiedArchive {
     pub csv_bytes: u64,
     /// Compressed bytes on disk == S3 ContentLength (verified equal).
     pub gzip_bytes: u64,
+    /// SHA-256 of the compressed archive (hex) — computed while writing the
+    /// gzip stream; the same digest (base64) travels on the S3 PutObject
+    /// `checksum_sha256` and gates the reuse arm (review round 2).
+    pub gzip_sha256_hex: String,
     _proof: VerifyProof,
 }
 
@@ -401,12 +411,14 @@ impl VerifyFailure {
 /// (b) S3 ContentLength present AND equal to the local gzip length.
 /// (Check (c), the line-count-vs-file equivalence, is structural: the
 /// newline count was taken over the exact bytes fed to the encoder.)
+#[allow(clippy::too_many_arguments)] // pure decision fn; every input is a distinct verified fact
 pub(crate) fn verify_archive(
     table: &str,
     partition: &str,
     exported_rows: u64,
     csv_bytes: u64,
     local_gzip_len: u64,
+    gzip_sha256_hex: &str,
     recount: Option<u64>,
     s3_content_length: Option<u64>,
 ) -> Result<VerifiedArchive, VerifyFailure> {
@@ -430,8 +442,90 @@ pub(crate) fn verify_archive(
         rows: exported_rows,
         csv_bytes,
         gzip_bytes: local_gzip_len,
+        gzip_sha256_hex: gzip_sha256_hex.to_string(),
         _proof: VerifyProof,
     })
+}
+
+// ---------------------------------------------------------------------------
+// Content identity (pure — review round 2)
+// ---------------------------------------------------------------------------
+
+/// Standard base64 (RFC 4648, with padding) — exactly what S3's
+/// `x-amz-checksum-sha256` header carries. Hand-rolled for a fixed 32-byte
+/// digest rather than adding a new supply-chain root; pinned by a
+/// known-vector unit test below.
+pub(crate) fn base64_encode(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = chunk.get(1).copied().unwrap_or(0) as u32;
+        let b2 = chunk.get(2).copied().unwrap_or(0) as u32;
+        let triple = (b0 << 16) | (b1 << 8) | b2;
+        out.push(ALPHABET[(triple >> 18) as usize & 0x3f] as char);
+        out.push(ALPHABET[(triple >> 12) as usize & 0x3f] as char);
+        out.push(if chunk.len() > 1 {
+            ALPHABET[(triple >> 6) as usize & 0x3f] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            ALPHABET[triple as usize & 0x3f] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
+/// Lowercase hex of a digest (audit-row provenance column).
+pub(crate) fn hex_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        out.push(HEX[(b >> 4) as usize] as char);
+        out.push(HEX[(b & 0x0f) as usize] as char);
+    }
+    out
+}
+
+/// `Write` adapter folding every byte into a SHA-256 digest on its way to
+/// the inner writer — the gzip stream is hashed AS IT IS WRITTEN, so the
+/// content-identity digest covers exactly the bytes on disk (and therefore
+/// exactly the bytes S3 receives) with no second file read.
+struct Sha256Writer<W: Write> {
+    inner: W,
+    hasher: sha2::Sha256,
+}
+
+impl<W: Write> Sha256Writer<W> {
+    fn new(inner: W) -> Self {
+        use sha2::Digest as _;
+        Self {
+            inner,
+            hasher: sha2::Sha256::new(),
+        }
+    }
+
+    /// Consumes the adapter: `(inner writer, 32-byte digest)`.
+    fn finish(self) -> (W, [u8; 32]) {
+        use sha2::Digest as _;
+        (self.inner, self.hasher.finalize().into())
+    }
+}
+
+impl<W: Write> Write for Sha256Writer<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        use sha2::Digest as _;
+        let n = self.inner.write(buf)?;
+        self.hasher.update(&buf[..n]);
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -555,6 +649,7 @@ pub fn partition_archive_audit_create_ddl() -> String {
             rows_archived      LONG, \
             csv_bytes          LONG, \
             gzip_bytes         LONG, \
+            gzip_sha256        STRING, \
             s3_key             STRING, \
             detail             STRING\
         ) timestamp(ts) PARTITION BY DAY \
@@ -572,6 +667,9 @@ pub(crate) struct PartitionArchiveAuditRow {
     pub rows_archived: i64,
     pub csv_bytes: i64,
     pub gzip_bytes: i64,
+    /// SHA-256 (hex) of the compressed archive — content-identity
+    /// provenance (review round 2); empty on failure rows with no export.
+    pub gzip_sha256: String,
     pub s3_key: String,
     pub detail: String,
 }
@@ -666,6 +764,8 @@ impl PartitionArchiveAuditWriter {
             .context("csv_bytes")?
             .column_i64("gzip_bytes", r.gzip_bytes)
             .context("gzip_bytes")?
+            .column_str("gzip_sha256", &r.gzip_sha256)
+            .context("gzip_sha256")?
             .column_str("s3_key", &r.s3_key)
             .context("s3_key")?
             .column_str("detail", &r.detail)
@@ -742,7 +842,20 @@ struct ExportedCsv {
     rows: u64,
     csv_bytes: u64,
     gzip_bytes: u64,
+    /// SHA-256 of the compressed file, base64 (the S3 checksum wire format).
+    gzip_sha256_b64: String,
+    /// SHA-256 of the compressed file, lowercase hex (audit provenance).
+    gzip_sha256_hex: String,
     path: PathBuf,
+}
+
+/// S3 `HeadObject` metadata relevant to the reuse/conflict decision.
+struct S3ObjectMeta {
+    /// ContentLength.
+    len: u64,
+    /// `x-amz-checksum-sha256` attribute (base64), when the object carries
+    /// one. Our uploads ALWAYS set it; a foreign/legacy object may not.
+    checksum_sha256_b64: Option<String>,
 }
 
 /// QuestDB partition archiver — see the module docs for the full contract.
@@ -995,31 +1108,57 @@ impl PartitionArchiver {
             .csv_bytes_exported
             .saturating_add(exported.csv_bytes);
 
-        // 2. Never-overwrite upload (F1): HeadObject FIRST. Same length →
-        //    reuse (an interrupted prior run's verified upload); different
-        //    length → LOUD conflict, keep the partition (the object may be
-        //    the only copy of already-dropped data); absent → conditional
-        //    PutObject with `If-None-Match: "*"`.
-        match self.head_object_len(&s3_key).await {
-            Some(existing_len) if existing_len == exported.gzip_bytes => {
+        // 2. Never-overwrite upload (F1): HeadObject FIRST. Reuse requires
+        //    CONTENT IDENTITY (review round 2): equal length (fast
+        //    pre-filter) AND a stored SHA-256 checksum equal to the freshly
+        //    exported gzip's digest — a stale object from a failed prior run
+        //    plus a mutated partition (backfill into a >hot-window
+        //    partition) with a coincidental compressed length can no longer
+        //    slip through to a drop. Length or checksum mismatch, OR an
+        //    object with NO checksum attribute (foreign/legacy) → LOUD
+        //    conflict, keep the partition (the object may be the only copy
+        //    of already-dropped data). Absent → conditional PutObject with
+        //    `If-None-Match: "*"` + `checksum_sha256`.
+        match self.head_object_meta(&s3_key).await {
+            Some(meta)
+                if meta.len == exported.gzip_bytes
+                    && meta.checksum_sha256_b64.as_deref()
+                        == Some(exported.gzip_sha256_b64.as_str()) =>
+            {
                 info!(
                     table,
                     partition,
                     s3_key = %s3_key,
-                    len = existing_len,
-                    "same-length S3 archive already present — reusing it (no re-upload)"
+                    len = meta.len,
+                    sha256 = %exported.gzip_sha256_hex,
+                    "identical S3 archive already present (length + SHA-256 match) — \
+                     reusing it (no re-upload)"
                 );
             }
-            Some(existing_len) => {
+            Some(meta) => {
+                let reason = if meta.len != exported.gzip_bytes {
+                    format!(
+                        "existing S3 object length {} != local gzip {}",
+                        meta.len, exported.gzip_bytes
+                    )
+                } else if meta.checksum_sha256_b64.is_none() {
+                    "existing S3 object has NO sha256 checksum attribute \
+                     (foreign/legacy object)"
+                        .to_string()
+                } else {
+                    format!(
+                        "existing S3 object sha256 {} != local gzip sha256 {}",
+                        meta.checksum_sha256_b64.as_deref().unwrap_or(""),
+                        exported.gzip_sha256_b64
+                    )
+                };
                 self.record_failure(
                     table,
                     partition,
                     ArchiveOutcome::S3Conflict,
                     &format!(
-                        "existing S3 object length {existing_len} != local gzip \
-                         {} — NEVER overwritten (may be the only copy of \
-                         already-dropped data); operator must inspect the key",
-                        exported.gzip_bytes
+                        "{reason} — NEVER overwritten (may be the only copy of \
+                         already-dropped data); operator must inspect the key"
                     ),
                     summary,
                 );
@@ -1027,7 +1166,10 @@ impl PartitionArchiver {
                 return;
             }
             None => {
-                if let Err(err) = self.upload_to_s3(&exported.path, &s3_key).await {
+                if let Err(err) = self
+                    .upload_to_s3(&exported.path, &s3_key, &exported.gzip_sha256_b64)
+                    .await
+                {
                     self.record_failure(
                         table,
                         partition,
@@ -1047,13 +1189,14 @@ impl PartitionArchiver {
 
         // 3. Verify — recount AFTER the export + S3 head. All fail-closed.
         let recount = self.recount_rows(table, &start, &end).await;
-        let s3_len = self.head_object_len(&s3_key).await;
+        let s3_len = self.head_object_meta(&s3_key).await.map(|m| m.len);
         let proof = match verify_archive(
             table,
             partition,
             exported.rows,
             exported.csv_bytes,
             exported.gzip_bytes,
+            &exported.gzip_sha256_hex,
             recount,
             s3_len,
         ) {
@@ -1217,7 +1360,13 @@ impl PartitionArchiver {
         }
 
         let file = std::fs::File::create(&path).context("create archive temp file")?;
-        let mut encoder = GzEncoder::new(std::io::BufWriter::new(file), Compression::default());
+        // Review round 2: the compressed stream is SHA-256-hashed as it is
+        // written — the digest is the content identity for the S3
+        // reuse/conflict decision and travels on the conditional PutObject.
+        let mut encoder = GzEncoder::new(
+            Sha256Writer::new(std::io::BufWriter::new(file)),
+            Compression::default(),
+        );
         // F5 (review round 1): quote-aware RECORD counting — a raw `\n`
         // count over-counts on STRING fields carrying embedded newlines.
         let mut counter = CsvRecordCounter::default();
@@ -1227,9 +1376,12 @@ impl PartitionArchiver {
             csv_bytes = csv_bytes.saturating_add(chunk.len() as u64);
             encoder.write_all(&chunk).context("gzip write failed")?;
         }
-        let mut writer = encoder.finish().context("gzip finish failed")?;
+        let hashing_writer = encoder.finish().context("gzip finish failed")?;
+        let (mut writer, digest) = hashing_writer.finish();
         writer.flush().context("temp file flush failed")?;
         drop(writer);
+        let gzip_sha256_b64 = base64_encode(&digest);
+        let gzip_sha256_hex = hex_encode(&digest);
 
         let records = counter.records();
         if records == 0 {
@@ -1247,6 +1399,8 @@ impl PartitionArchiver {
             rows: records.saturating_sub(1),
             csv_bytes,
             gzip_bytes,
+            gzip_sha256_b64,
+            gzip_sha256_hex,
             path,
         })
     }
@@ -1255,8 +1409,12 @@ impl PartitionArchiver {
     /// (`If-None-Match: "*"`, review round 1 F1): only called after the
     /// HeadObject pre-check saw no object, and the condition makes even a
     /// lost race (concurrent writer landing between head and put) a loud
-    /// 412 failure instead of a silent overwrite.
-    async fn upload_to_s3(&self, path: &Path, key: &str) -> Result<()> {
+    /// 412 failure instead of a silent overwrite. The precomputed SHA-256
+    /// (review round 2) rides as `x-amz-checksum-sha256`: S3 validates the
+    /// received body against it server-side (a corrupted upload is REJECTED,
+    /// never stored), and the stored attribute is the content identity a
+    /// later run's reuse decision requires.
+    async fn upload_to_s3(&self, path: &Path, key: &str, sha256_b64: &str) -> Result<()> {
         let body = aws_sdk_s3::primitives::ByteStream::from_path(path)
             .await
             .context("open temp file for S3 upload")?;
@@ -1265,10 +1423,11 @@ impl PartitionArchiver {
             .bucket(&self.bucket)
             .key(key)
             .if_none_match("*")
+            .checksum_sha256(sha256_b64)
             .body(body)
             .send()
             .await
-            .context("S3 conditional PutObject (If-None-Match: \"*\") failed")?;
+            .context("S3 conditional PutObject (If-None-Match + checksum_sha256) failed")?;
         Ok(())
     }
 
@@ -1290,17 +1449,30 @@ impl PartitionArchiver {
         parse_count_response(&body)
     }
 
-    /// S3 `HeadObject` ContentLength (verify leg (b)). `None` = missing.
-    async fn head_object_len(&self, key: &str) -> Option<u64> {
+    /// S3 `HeadObject` metadata: ContentLength (verify leg (b) + the reuse
+    /// pre-filter) and the stored SHA-256 checksum attribute (base64 — the
+    /// review-round-2 content identity; requested via
+    /// `ChecksumMode::Enabled`, `None` when the object was written without
+    /// one, e.g. a foreign/legacy object). `None` overall = object missing.
+    async fn head_object_meta(&self, key: &str) -> Option<S3ObjectMeta> {
         let head = self
             .s3
             .head_object()
             .bucket(&self.bucket)
             .key(key)
+            .checksum_mode(aws_sdk_s3::types::ChecksumMode::Enabled)
             .send()
             .await
             .ok()?;
-        head.content_length().and_then(|n| u64::try_from(n).ok())
+        let len = head.content_length().and_then(|n| u64::try_from(n).ok())?;
+        Some(S3ObjectMeta {
+            len,
+            checksum_sha256_b64: head
+                .checksum_sha256()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(ToString::to_string),
+        })
     }
 
     /// The ONLY destructive step — requires the [`VerifiedArchive`] proof,
@@ -1365,6 +1537,7 @@ impl PartitionArchiver {
             rows_archived: 0,
             csv_bytes: 0,
             gzip_bytes: 0,
+            gzip_sha256: String::new(),
             s3_key: String::new(),
             detail,
         };
@@ -1520,6 +1693,7 @@ fn audit_row_from_proof(
         rows_archived: i64::try_from(proof.rows).unwrap_or(i64::MAX),
         csv_bytes: i64::try_from(proof.csv_bytes).unwrap_or(i64::MAX),
         gzip_bytes: i64::try_from(proof.gzip_bytes).unwrap_or(i64::MAX),
+        gzip_sha256: proof.gzip_sha256_hex.clone(),
         s3_key: s3_key.to_string(),
         detail: capture_rest_error_body(detail),
     }
@@ -1779,6 +1953,7 @@ mod tests {
             100,
             5000,
             1200,
+            "aabbcc",
             Some(100),
             Some(1200),
         )
@@ -1788,20 +1963,30 @@ mod tests {
         assert_eq!(proof.rows, 100);
         assert_eq!(proof.csv_bytes, 5000);
         assert_eq!(proof.gzip_bytes, 1200);
+        assert_eq!(proof.gzip_sha256_hex, "aabbcc");
     }
 
     #[test]
     fn test_verify_archive_zero_row_partition_passes() {
         // Header-only export (0 data rows) with recount 0 is a legitimate
         // empty partition — verified and droppable.
-        let proof = verify_archive("ticks", "2026-04-01T09", 0, 20, 40, Some(0), Some(40))
-            .expect("empty ok");
+        let proof = verify_archive(
+            "ticks",
+            "2026-04-01T09",
+            0,
+            20,
+            40,
+            "d1e2",
+            Some(0),
+            Some(40),
+        )
+        .expect("empty ok");
         assert_eq!(proof.rows, 0);
     }
 
     #[test]
     fn test_verify_archive_recount_unavailable_fails() {
-        let err = verify_archive("t", "2026-04-01", 100, 5000, 1200, None, Some(1200))
+        let err = verify_archive("t", "2026-04-01", 100, 5000, 1200, "d1e2", None, Some(1200))
             .expect_err("recount unavailable must fail");
         assert_eq!(err, VerifyFailure::RecountUnavailable);
         assert_eq!(err.outcome(), ArchiveOutcome::CountMismatch);
@@ -1809,8 +1994,17 @@ mod tests {
 
     #[test]
     fn test_verify_archive_row_count_mismatch_fails() {
-        let err = verify_archive("t", "2026-04-01", 100, 5000, 1200, Some(101), Some(1200))
-            .expect_err("recount != exported must fail");
+        let err = verify_archive(
+            "t",
+            "2026-04-01",
+            100,
+            5000,
+            1200,
+            "d1e2",
+            Some(101),
+            Some(1200),
+        )
+        .expect_err("recount != exported must fail");
         assert_eq!(
             err,
             VerifyFailure::RowCountMismatch {
@@ -1823,7 +2017,7 @@ mod tests {
 
     #[test]
     fn test_verify_archive_s3_missing_fails() {
-        let err = verify_archive("t", "2026-04-01", 100, 5000, 1200, Some(100), None)
+        let err = verify_archive("t", "2026-04-01", 100, 5000, 1200, "d1e2", Some(100), None)
             .expect_err("missing S3 object must fail");
         assert_eq!(err, VerifyFailure::S3ObjectMissing);
         assert_eq!(err.outcome(), ArchiveOutcome::SizeMismatch);
@@ -1831,8 +2025,17 @@ mod tests {
 
     #[test]
     fn test_verify_archive_s3_size_mismatch_fails() {
-        let err = verify_archive("t", "2026-04-01", 100, 5000, 1200, Some(100), Some(1199))
-            .expect_err("size mismatch must fail");
+        let err = verify_archive(
+            "t",
+            "2026-04-01",
+            100,
+            5000,
+            1200,
+            "d1e2",
+            Some(100),
+            Some(1199),
+        )
+        .expect_err("size mismatch must fail");
         assert_eq!(
             err,
             VerifyFailure::S3SizeMismatch {
@@ -1847,7 +2050,7 @@ mod tests {
     fn test_verify_archive_multiple_failures_fail_on_first_check() {
         // Both legs broken → still Err (order: recount first). Every
         // combination of a failing check yields Err — never a proof.
-        let err = verify_archive("t", "2026-04-01", 100, 5000, 1200, Some(99), None)
+        let err = verify_archive("t", "2026-04-01", 100, 5000, 1200, "d1e2", Some(99), None)
             .expect_err("multiple failures must fail");
         assert!(matches!(err, VerifyFailure::RowCountMismatch { .. }));
     }
@@ -1875,6 +2078,50 @@ mod tests {
         );
         // rows = newlines − 1 header
         assert_eq!(streamed_newlines - 1, 3);
+    }
+
+    // ---- content identity: base64 / hex / Sha256Writer (review round 2) ----
+
+    #[test]
+    fn test_base64_encode_known_vectors() {
+        // RFC 4648 vectors + the well-known sha256("abc") digest in the
+        // exact wire format S3's x-amz-checksum-sha256 carries.
+        assert_eq!(base64_encode(b""), "");
+        assert_eq!(base64_encode(b"f"), "Zg==");
+        assert_eq!(base64_encode(b"fo"), "Zm8=");
+        assert_eq!(base64_encode(b"foo"), "Zm9v");
+        assert_eq!(base64_encode(b"foob"), "Zm9vYg==");
+        assert_eq!(base64_encode(b"fooba"), "Zm9vYmE=");
+        assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
+        use sha2::Digest as _;
+        let digest: [u8; 32] = sha2::Sha256::digest(b"abc").into();
+        assert_eq!(
+            base64_encode(&digest),
+            "ungWv48Bz+pBQUDeXa4iI7ADYaOWF3qctBD/YfIAFa0=",
+            "sha256(\"abc\") base64 known vector"
+        );
+        assert_eq!(
+            hex_encode(&digest),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+            "sha256(\"abc\") hex known vector"
+        );
+    }
+
+    #[test]
+    fn test_sha256_writer_digest_matches_oneshot_and_passes_bytes_through() {
+        use sha2::Digest as _;
+        let payload = b"the compressed archive bytes, split across writes";
+        let mut w = Sha256Writer::new(Vec::new());
+        w.write_all(&payload[..7]).expect("write 1");
+        w.write_all(&payload[7..]).expect("write 2");
+        w.flush().expect("flush");
+        let (inner, digest) = w.finish();
+        assert_eq!(
+            inner, payload,
+            "every byte must pass through to the inner writer"
+        );
+        let oneshot: [u8; 32] = sha2::Sha256::digest(payload).into();
+        assert_eq!(digest, oneshot, "streamed digest == one-shot digest");
     }
 
     // ---- bucket / environment resolution ------------------------------------
@@ -2071,6 +2318,7 @@ mod tests {
             rows_archived: 0,
             csv_bytes: 0,
             gzip_bytes: 0,
+            gzip_sha256: String::new(),
             s3_key: String::new(),
             detail: String::new(),
         };
@@ -2092,6 +2340,7 @@ mod tests {
             rows_archived: 100,
             csv_bytes: 5000,
             gzip_bytes: 1200,
+            gzip_sha256: "ab12".to_string(),
             s3_key: "questdb-partitions/ticks/2026-04-01T09.csv.gz".to_string(),
             detail: String::new(),
         };
@@ -2110,6 +2359,7 @@ mod tests {
             rows_archived: 0,
             csv_bytes: 0,
             gzip_bytes: 0,
+            gzip_sha256: String::new(),
             s3_key: String::new(),
             detail: "S3 PutObject failed".to_string(),
         };
@@ -2340,7 +2590,10 @@ mod stub_integration_tests {
 
     /// Stateful mini-S3 (path-style `/bucket/key…`): PUT stores the body
     /// length, HEAD answers 200 + content-length or 404.
-    fn s3_responder(objects: Arc<Mutex<HashMap<String, usize>>>) -> Responder {
+    /// Stored stub object: (content length, optional sha256 checksum b64).
+    type StubObjects = Arc<Mutex<HashMap<String, (usize, Option<String>)>>>;
+
+    fn s3_responder(objects: StubObjects) -> Responder {
         Arc::new(move |req: &SeenRequest| {
             let key = req
                 .target
@@ -2355,18 +2608,24 @@ mod stub_integration_tests {
                         .header("content-length")
                         .and_then(|v| v.parse::<usize>().ok())
                         .unwrap_or(0);
-                    objects.lock().expect("s3 lock").insert(key, len);
+                    let checksum = req.header("x-amz-checksum-sha256").map(ToString::to_string);
+                    objects
+                        .lock()
+                        .expect("s3 lock")
+                        .insert(key, (len, checksum));
                     (200, vec![("etag".into(), "\"stub\"".into())], Vec::new())
                 }
                 "HEAD" => match objects.lock().expect("s3 lock").get(&key) {
-                    Some(len) => (
-                        200,
-                        vec![
+                    Some((len, checksum)) => {
+                        let mut headers = vec![
                             ("content-length".into(), len.to_string()),
                             ("etag".into(), "\"stub\"".into()),
-                        ],
-                        Vec::new(),
-                    ),
+                        ];
+                        if let Some(sum) = checksum {
+                            headers.push(("x-amz-checksum-sha256".into(), sum.clone()));
+                        }
+                        (200, headers, Vec::new())
+                    }
                     None => (404, vec![("content-length".into(), "0".into())], Vec::new()),
                 },
                 _ => (500, Vec::new(), b"unexpected s3 method".to_vec()),
@@ -2461,13 +2720,16 @@ mod stub_integration_tests {
         ))
     }
 
-    /// Deterministic gzip length of a body under the export's settings
-    /// (flate2 default level, default header) — used to pre-seed the F1
-    /// same-length reuse case.
-    fn gzip_len(body: &[u8]) -> usize {
+    /// Deterministic gzip (length, sha256 b64) of a body under the export's
+    /// settings (flate2 default level, default header) — pre-seeds the F1
+    /// reuse/conflict cases with exactly what the export will produce.
+    fn gzip_meta(body: &[u8]) -> (usize, String) {
+        use sha2::Digest as _;
         let mut enc = GzEncoder::new(Vec::new(), Compression::default());
         enc.write_all(body).expect("gzip");
-        enc.finish().expect("finish").len()
+        let compressed = enc.finish().expect("finish");
+        let digest: [u8; 32] = sha2::Sha256::digest(&compressed).into();
+        (compressed.len(), base64_encode(&digest))
     }
 
     async fn build_archiver(
@@ -2547,6 +2809,13 @@ mod stub_integration_tests {
             Some("*"),
             "PutObject must be conditional (If-None-Match: *)"
         );
+        let (_, expected_sha) = gzip_meta(CSV.as_bytes());
+        assert_eq!(
+            s3_reqs[put_pos].header("x-amz-checksum-sha256"),
+            Some(expected_sha.as_str()),
+            "PutObject must carry the precomputed sha256 (review round 2 — \
+             S3 validates the body server-side and stores the content identity)"
+        );
         assert!(objects.lock().expect("objects").contains_key(TICKS_KEY));
 
         // F2: the audit stub ACKed flushes (verified + dropped rows).
@@ -2611,7 +2880,7 @@ mod stub_integration_tests {
         objects
             .lock()
             .expect("seed")
-            .insert(TICKS_KEY.to_string(), 999_999);
+            .insert(TICKS_KEY.to_string(), (999_999, None));
         let (s3_url, s3_log) = spawn_stub(s3_responder(Arc::clone(&objects))).await;
 
         let mut archiver =
@@ -2637,7 +2906,7 @@ mod stub_integration_tests {
         );
         assert_eq!(
             objects.lock().expect("objects").get(TICKS_KEY),
-            Some(&999_999),
+            Some(&(999_999, None)),
             "the pre-existing object must be untouched"
         );
     }
@@ -2646,15 +2915,16 @@ mod stub_integration_tests {
     // a current_thread runtime would starve the stub server tasks while
     // the flush blocks (deadlock until the request timeout).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_stub_f1_same_length_reuses_existing_upload_then_drops() {
+    async fn test_stub_f1_identical_length_and_checksum_reuses_then_drops() {
         let (qdb_url, qdb_log) =
             spawn_stub(qdb_responder(vec!["2026-04-01T09"], 3, CSV, vec![], 200)).await;
         let (ilp_url, _ilp_log) = spawn_stub(ilp_responder(204)).await;
         let objects = Arc::new(Mutex::new(HashMap::new()));
+        let (len, sha_b64) = gzip_meta(CSV.as_bytes());
         objects
             .lock()
             .expect("seed")
-            .insert(TICKS_KEY.to_string(), gzip_len(CSV.as_bytes()));
+            .insert(TICKS_KEY.to_string(), (len, Some(sha_b64)));
         let (s3_url, s3_log) = spawn_stub(s3_responder(Arc::clone(&objects))).await;
 
         let mut archiver =
@@ -2673,10 +2943,93 @@ mod stub_integration_tests {
                 .expect("s3 log")
                 .iter()
                 .any(|r| r.method == "PUT"),
-            "same-length existing object is reused, never re-uploaded"
+            "an identical (length + sha256) existing object is reused, never re-uploaded"
         );
         assert!(
             qdb_log
+                .lock()
+                .expect("qdb log")
+                .iter()
+                .any(|r| r.target.contains("DROP PARTITION"))
+        );
+    }
+
+    // Multi-thread runtime: the questdb-rs ILP flush is SYNC-blocking;
+    // a current_thread runtime would starve the stub server tasks while
+    // the flush blocks (deadlock until the request timeout).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_stub_r2_same_length_different_checksum_is_conflict() {
+        // Review round 2: length equality is only a pre-filter — a stale
+        // object with a coincidental compressed length but DIFFERENT content
+        // must be a conflict-keep, never a reuse-then-drop.
+        let (qdb_url, qdb_log) =
+            spawn_stub(qdb_responder(vec!["2026-04-01T09"], 3, CSV, vec![], 200)).await;
+        let (ilp_url, _ilp_log) = spawn_stub(ilp_responder(204)).await;
+        let objects = Arc::new(Mutex::new(HashMap::new()));
+        let (len, _) = gzip_meta(CSV.as_bytes());
+        objects.lock().expect("seed").insert(
+            TICKS_KEY.to_string(),
+            (
+                len,
+                Some("c3RhbGUgY29udGVudCBkaWdlc3QgISEhISEhISE=".to_string()),
+            ),
+        );
+        let (s3_url, s3_log) = spawn_stub(s3_responder(Arc::clone(&objects))).await;
+
+        let mut archiver =
+            build_archiver(&qdb_url, &ilp_url, &s3_url, test_retention_cfg(200)).await;
+        let summary = archiver.archive_and_drop_old_partitions().await;
+
+        assert_eq!(summary.dropped, 0, "checksum mismatch must never drop");
+        assert_eq!(summary.failed, 1, "S3Conflict counts as a failure");
+        assert!(
+            !s3_log
+                .lock()
+                .expect("s3 log")
+                .iter()
+                .any(|r| r.method == "PUT"),
+            "a same-length different-content object must NEVER be overwritten"
+        );
+        assert!(
+            !qdb_log
+                .lock()
+                .expect("qdb log")
+                .iter()
+                .any(|r| r.target.contains("DROP PARTITION"))
+        );
+    }
+
+    // Multi-thread runtime: see the note on the first stub test.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_stub_r2_same_length_missing_checksum_is_conflict() {
+        // Review round 2: a foreign/legacy object without a sha256 checksum
+        // attribute has UNPROVABLE content — conflict-keep, never reuse.
+        let (qdb_url, qdb_log) =
+            spawn_stub(qdb_responder(vec!["2026-04-01T09"], 3, CSV, vec![], 200)).await;
+        let (ilp_url, _ilp_log) = spawn_stub(ilp_responder(204)).await;
+        let objects = Arc::new(Mutex::new(HashMap::new()));
+        let (len, _) = gzip_meta(CSV.as_bytes());
+        objects
+            .lock()
+            .expect("seed")
+            .insert(TICKS_KEY.to_string(), (len, None));
+        let (s3_url, s3_log) = spawn_stub(s3_responder(Arc::clone(&objects))).await;
+
+        let mut archiver =
+            build_archiver(&qdb_url, &ilp_url, &s3_url, test_retention_cfg(200)).await;
+        let summary = archiver.archive_and_drop_old_partitions().await;
+
+        assert_eq!(summary.dropped, 0, "unprovable content must never drop");
+        assert_eq!(summary.failed, 1, "S3Conflict counts as a failure");
+        assert!(
+            !s3_log
+                .lock()
+                .expect("s3 log")
+                .iter()
+                .any(|r| r.method == "PUT")
+        );
+        assert!(
+            !qdb_log
                 .lock()
                 .expect("qdb log")
                 .iter()
