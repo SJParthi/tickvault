@@ -79,8 +79,8 @@ pub struct ReinjectOutcome {
 /// awaiting this helper. Without a live consumer, any replay larger than
 /// `FRAME_CHANNEL_CAPACITY` fills the channel, the next send stalls for the
 /// full `send_timeout`, and the run aborts NOT-clean — the WAL never
-/// archives and the re-replay storm loop is NOT broken. Ratcheted by
-/// `tests::ratchet_tick_processor_spawns_before_reinject_await`.
+/// archives and the re-replay storm loop is NOT broken.
+// TEST-EXEMPT: PR-C2 (2026-07-13) retired both main.rs re-injection call sites (and their ratchets) with the Dhan live-WS lane; the helper is retained un-consumed pending the Phase C module cleanup — behavior was pinned by the retired ratchets while consumers existed.
 pub async fn reinject_wal_frames(
     sender: &Sender<(u64, Bytes)>,
     frames: Vec<(u64, Bytes)>,
