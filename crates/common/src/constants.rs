@@ -1224,6 +1224,13 @@ pub const INDEX_SYMBOL_ALIASES: &[(&str, &str)] = &[
     ("NIFTY MIDCAP SELECT", "MIDCPNIFTY"),
     ("NIFTY MIDCAP 50", "NIFTYMCAP50"),
     ("NIFTY TOTAL MARKET", "NIFTY TOTAL MKT"),
+    // Groww→Dhan spelling bridge (2026-07-13, Groww spot-leg INDIA VIX
+    // scope addition): the live Groww master (2026-06-28 capture — the
+    // `REAL_GROWW_NSE_INDICES` fixture) publishes India VIX with the
+    // compact token `INDIAVIX` (display name "India Vix" already
+    // normalizes to the canonical "INDIA VIX"). Additive alias so the
+    // runtime VIX resolution matches on EITHER identity key.
+    ("INDIAVIX", "INDIA VIX"),
 ];
 
 // ---------------------------------------------------------------------------
@@ -1761,7 +1768,7 @@ pub const GROWW_API_VERSION_HEADER: &str = "x-api-version";
 /// Header value companion to [`GROWW_API_VERSION_HEADER`].
 pub const GROWW_API_VERSION_VALUE: &str = "1.0";
 
-/// The 3 spot indices the Groww per-minute REST leg fetches, as
+/// The 3 CORE spot indices the Groww per-minute REST leg fetches, as
 /// `(groww_symbol, human symbol, exchange, segment)` — the SAME logical
 /// indices as [`SPOT_1M_REST_INDICES`] in Groww's identity space: the V2
 /// candles endpoint takes the `groww_symbol` (`NSE-NIFTY` — NOT the
@@ -1769,14 +1776,40 @@ pub const GROWW_API_VERSION_VALUE: &str = "1.0";
 /// indices (`docs/groww-ref/09-prompt-nse-indices-data.md` +
 /// `docs/groww-ref/11-historical-candles.md`). Persisted rows join the
 /// live lane via `stable_index_security_id(groww_symbol)` + `feed='groww'`.
+///
+/// 2026-07-13 (operator scope addition, relayed — the §38.6 grant in
+/// `groww-second-feed-scope-2026-06-19.md`): the Groww spot leg tracks a
+/// 4th index — [`GROWW_SPOT_1M_VIX_SYMBOL`] (INDIA VIX) — which is
+/// deliberately NOT in this const: its `groww_symbol` is RUNTIME-resolved
+/// from the day's ingested Groww master (the watch file), never guessed.
+/// This const stays the 3-CORE set; the escalation edge keys on it.
 pub const GROWW_SPOT_1M_SYMBOLS: [(&str, &str, &str, &str); 3] = [
     ("NSE-NIFTY", "NIFTY", "NSE", "CASH"),
     ("NSE-BANKNIFTY", "BANKNIFTY", "NSE", "CASH"),
     ("BSE-SENSEX", "SENSEX", "BSE", "CASH"),
 ];
 
-// Arity guard: the Groww leg tracks the SAME 3 logical indices as the Dhan
-// leg — a 4th index on either side needs a fresh dated operator quote.
+/// The 4th Groww spot-leg index — INDIA VIX (operator scope 2026-07-13,
+/// relayed via the coordinator session: "add India VIX to the per-minute
+/// spot pull on the Groww leg; resolve the correct Groww
+/// exchange/segment/groww_symbol for the VIX index from the Groww master —
+/// do NOT guess the literal"). This is the CANONICAL human symbol (the
+/// `NSE_INDEX_ALLOWLIST` member, same literal as `PHASE_0_IDX_I_SYMBOLS`);
+/// the Groww-side identity (`groww_symbol`/exchange/segment) is
+/// RUNTIME-resolved by matching the day's Groww master index rows through
+/// `canonicalize_index_symbol` (the live 2026-06-28 master lists it under
+/// NSE as token `INDIAVIX`, display name "India Vix" — see the
+/// `REAL_GROWW_NSE_INDICES` fixture in
+/// `crates/core/src/feed/groww/instruments.rs`). SPOT ONLY — no chain, no
+/// contracts; whether Groww's historical-candles endpoint SERVES India VIX
+/// is a live-probe UNKNOWN (persistent empty = named forensics rows + one
+/// daily coded warn, never silent).
+pub const GROWW_SPOT_1M_VIX_SYMBOL: &str = "INDIA VIX";
+
+// Arity guard: this CONST tracks the SAME 3 logical indices as the Dhan
+// leg. The Groww leg's 4th index (INDIA VIX, 2026-07-13 operator scope —
+// see GROWW_SPOT_1M_VIX_SYMBOL) is runtime-resolved and deliberately NOT
+// in this const set; any FURTHER index needs a fresh dated operator quote.
 const _: () = assert!(
     GROWW_SPOT_1M_SYMBOLS.len() == SPOT_1M_REST_INDICES.len(),
     "GROWW_SPOT_1M_SYMBOLS must mirror the 3-index SPOT_1M_REST_INDICES set"
@@ -1797,15 +1830,18 @@ pub const GROWW_SPOT_1M_RETRY_OFFSETS_MS: [u64; 4] = [700, 1_500, 3_000, 6_000];
 pub const GROWW_SPOT_1M_REQUEST_TIMEOUT_SECS: u64 = 5;
 
 /// HARD wall-clock budget (secs) for ONE symbol's whole in-minute ladder.
-/// 18 s (not the Dhan leg's 20 s — a DELIBERATE tightening): the Groww leg
-/// fetches its 3 symbols SEQUENTIALLY (the minute-boundary pacing rule of
-/// `docs/groww-ref/15-rate-limits-and-capacity.md` — the shared-token 10/s
-/// Live-Data bucket is TYPE-pooled and co-tenanted with bruteX, so each
-/// boundary burst is spread to at most ONE in-flight request at a time,
-/// far inside the ≤6 req/s ceiling), so the WHOLE fire is bounded by
-/// 3 × budget; 3 × 18 s + the fire delay still finishes inside the minute
-/// (const-asserted below).
-pub const GROWW_SPOT_1M_SYMBOL_BUDGET_SECS: u64 = 18;
+/// 14 s (not the Dhan leg's 20 s — a DELIBERATE tightening; was 18 s at
+/// 3 targets, re-derived 2026-07-13 when INDIA VIX made it 4 targets): the
+/// Groww leg fetches its targets SEQUENTIALLY (the minute-boundary pacing
+/// rule of `docs/groww-ref/15-rate-limits-and-capacity.md` — the
+/// shared-token 10/s Live-Data bucket is TYPE-pooled and co-tenanted with
+/// bruteX, so each boundary burst is spread to at most ONE in-flight
+/// request at a time, far inside the ≤6 req/s ceiling), so the WHOLE fire
+/// is bounded by 4 × budget (3 core + the runtime-resolved INDIA VIX);
+/// 4 × 14 s + the fire delay still finishes inside the minute, and the
+/// ladder schedule (last 6 s offset + one 5 s request timeout = 11 s)
+/// still fits one budget — both const-asserted below.
+pub const GROWW_SPOT_1M_SYMBOL_BUDGET_SECS: u64 = 14;
 
 /// Maximum accepted response body size (bytes) for one Groww candles poll
 /// — a full-day 375-row tuple response is ~20 KB; 2 MiB bounds a
@@ -1827,15 +1863,17 @@ const _: () = assert!(
         && GROWW_SPOT_1M_RETRY_OFFSETS_MS[2] < GROWW_SPOT_1M_RETRY_OFFSETS_MS[3],
     "GROWW_SPOT_1M retry offsets must be strictly increasing"
 );
-// SEQUENTIAL-fetch budget math: the whole fire (fire delay + 3 sequential
-// per-symbol ladder budgets) must finish inside the minute, and the
-// ladder's own schedule (last offset + one full request timeout) must fit
-// inside one symbol's budget so the timeout only fires on genuine stalls.
+// SEQUENTIAL-fetch budget math: the whole fire (fire delay + 4 sequential
+// per-target ladder budgets — the 3 core symbols + 1 for the
+// runtime-resolved INDIA VIX target, 2026-07-13 operator scope) must
+// finish inside the minute, and the ladder's own schedule (last offset +
+// one full request timeout) must fit inside one symbol's budget so the
+// timeout only fires on genuine stalls.
 const _: () = assert!(
     GROWW_SPOT_1M_FIRE_DELAY_MS
-        + (GROWW_SPOT_1M_SYMBOLS.len() as u64) * GROWW_SPOT_1M_SYMBOL_BUDGET_SECS * 1_000
+        + (GROWW_SPOT_1M_SYMBOLS.len() as u64 + 1) * GROWW_SPOT_1M_SYMBOL_BUDGET_SECS * 1_000
         < 60_000,
-    "GROWW_SPOT_1M sequential fire (delay + 3 x symbol budget) must finish inside the minute"
+    "GROWW_SPOT_1M sequential fire (delay + 4 x symbol budget incl. the runtime VIX target) must finish inside the minute"
 );
 const _: () = assert!(
     GROWW_SPOT_1M_RETRY_OFFSETS_MS[3] + GROWW_SPOT_1M_REQUEST_TIMEOUT_SECS * 1_000
@@ -1877,10 +1915,13 @@ pub const GROWW_CHAIN_1M_UNDERLYINGS: [(&str, &str, &str); 3] = [
 ];
 
 // Arity guard: the Groww chain leg tracks the SAME 3 logical indices as
-// the spot legs — a 4th underlying needs a fresh dated operator quote.
+// the CORE spot set — a 4th underlying needs a fresh dated operator
+// quote. 2026-07-13: the spot leg's 4th index (INDIA VIX,
+// GROWW_SPOT_1M_VIX_SYMBOL) is SPOT ONLY per the relayed operator scope
+// ("no chain, no contracts") — the chain leg deliberately stays 3.
 const _: () = assert!(
     GROWW_CHAIN_1M_UNDERLYINGS.len() == GROWW_SPOT_1M_SYMBOLS.len(),
-    "GROWW_CHAIN_1M_UNDERLYINGS must mirror the 3-index GROWW_SPOT_1M_SYMBOLS set"
+    "GROWW_CHAIN_1M_UNDERLYINGS must mirror the 3-index CORE GROWW_SPOT_1M_SYMBOLS set"
 );
 
 /// Fallback post-boundary fire delay (ms) for the Groww chain leg —
@@ -3997,8 +4038,11 @@ mod tests {
         assert_eq!(GROWW_CANDLE_INTERVAL_1MIN, "1minute");
         assert_eq!(GROWW_API_VERSION_HEADER, "x-api-version");
         assert_eq!(GROWW_API_VERSION_VALUE, "1.0");
-        // The 3-symbol table mirrors the Dhan set in Groww identity space:
-        // groww_symbol (NOT token / bare trading symbol), segment CASH.
+        // The 3-CORE-symbol table mirrors the Dhan set in Groww identity
+        // space: groww_symbol (NOT token / bare trading symbol), segment
+        // CASH. 2026-07-13 operator scope (relayed): the 4th Groww spot
+        // index — INDIA VIX — is RUNTIME-resolved from the day's master
+        // (never a guessed const literal), so it is deliberately NOT here.
         assert_eq!(
             GROWW_SPOT_1M_SYMBOLS,
             [
@@ -4008,8 +4052,17 @@ mod tests {
             ]
         );
         assert_eq!(GROWW_SPOT_1M_SYMBOLS.len(), SPOT_1M_REST_INDICES.len());
+        // The canonical VIX human symbol (2026-07-13 scope addition) — the
+        // NSE_INDEX_ALLOWLIST / PHASE_0_IDX_I_SYMBOLS literal, and NEVER a
+        // groww_symbol (the Groww identity is runtime-resolved).
+        assert_eq!(GROWW_SPOT_1M_VIX_SYMBOL, "INDIA VIX");
+        assert!(PHASE_0_IDX_I_SYMBOLS.contains(&GROWW_SPOT_1M_VIX_SYMBOL));
+        assert!(!GROWW_SPOT_1M_VIX_SYMBOL.contains('-'));
         // Timing envelope mirrors the Dhan leg, tightened for the
-        // SEQUENTIAL 3-symbol fire (pacing rule: ≤1 in-flight request).
+        // SEQUENTIAL 4-target fire (3 core + the runtime VIX target;
+        // pacing rule: ≤1 in-flight request). Budget re-derived 18 → 14 on
+        // 2026-07-13 so 4 sequential budgets + the fire delay still finish
+        // inside the minute.
         assert_eq!(GROWW_SPOT_1M_FIRE_DELAY_MS, 300);
         assert_eq!(GROWW_SPOT_1M_RETRY_OFFSETS_MS, [700, 1_500, 3_000, 6_000]);
         assert!(
@@ -4019,12 +4072,14 @@ mod tests {
             "offsets strictly increasing"
         );
         assert_eq!(GROWW_SPOT_1M_REQUEST_TIMEOUT_SECS, 5);
-        assert_eq!(GROWW_SPOT_1M_SYMBOL_BUDGET_SECS, 18);
+        assert_eq!(GROWW_SPOT_1M_SYMBOL_BUDGET_SECS, 14);
         assert!(
             GROWW_SPOT_1M_FIRE_DELAY_MS
-                + (GROWW_SPOT_1M_SYMBOLS.len() as u64) * GROWW_SPOT_1M_SYMBOL_BUDGET_SECS * 1_000
+                + (GROWW_SPOT_1M_SYMBOLS.len() as u64 + 1)
+                    * GROWW_SPOT_1M_SYMBOL_BUDGET_SECS
+                    * 1_000
                 < 60_000,
-            "sequential fire must finish inside the minute"
+            "sequential fire (incl. the runtime VIX target) must finish inside the minute"
         );
         assert!(
             GROWW_SPOT_1M_RETRY_OFFSETS_MS[3] + GROWW_SPOT_1M_REQUEST_TIMEOUT_SECS * 1_000
@@ -4269,6 +4324,12 @@ mod tests {
         assert!(has("NIFTY MIDCAP SELECT", "MIDCPNIFTY"));
         assert!(has("NIFTY MIDCAP 50", "NIFTYMCAP50"));
         assert!(has("NIFTY TOTAL MARKET", "NIFTY TOTAL MKT"));
+        // 2026-07-13 (Groww spot-leg INDIA VIX scope): the live Groww
+        // master's compact token spelling must canonicalize to the
+        // allowlisted "INDIA VIX" so the runtime VIX resolution matches on
+        // the token key too (the display name "India Vix" already
+        // normalizes without an alias).
+        assert!(has("INDIAVIX", "INDIA VIX"));
     }
 
     // =======================================================================

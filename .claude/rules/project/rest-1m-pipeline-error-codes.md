@@ -180,6 +180,21 @@ under the `tv_groww_spot1m_*` prefix (`fetch_total{outcome}`,
 The typed pages are the Groww-specific `GrowwSpot1mFetchDegraded` /
 `GrowwSpot1mFetchRecovered` Telegram events (same 3-minute edge).
 
+**2026-07-13 scope note — the Groww spot leg covers 4 indices (INDIA VIX
+added, SPOT ONLY; `groww-second-feed-scope-2026-06-19.md` §38.7):** the
+4th target's Groww identity is RUNTIME-resolved from the day's watch file
+(never a guessed literal). VIX-specific stages on `SPOT1M-01`
+(`feed="groww"`, both `warn!`-level, log-sink-only per §3):
+`stage="vix_unresolved"` — the day's master carries no resolvable VIX row
+(one edge-latched warn per run; `tv_groww_spot1m_vix_unresolved_total` per
+attempt; VIX skipped, the 3 core indices unaffected) — and
+`stage="vix_not_served"` — the once-per-session sweep found ZERO persisted
+VIX minutes while the core indices persisted ("India VIX not served by
+Groww historical-candles"; `tv_groww_spot1m_vix_not_served_total`, plus
+`tv_groww_spot1m_vix_empty_total` per 2xx-without-the-minute VIX ladder).
+Per-SID independence: the 3-minute escalation edge keys on the 3 CORE
+indices only — a VIX-only failure never pages, core-all-failed still does.
+
 ## §2. SPOT1M-02 — spot_1m_rest persist failed
 
 **Severity:** High. **Auto-triage safe:** Yes (best-effort persist; the
