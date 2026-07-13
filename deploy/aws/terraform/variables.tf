@@ -64,13 +64,13 @@ variable "enable_eip" {
 }
 
 variable "ebs_gp3_size_gb" {
-  description = "Root EBS volume size in GB. 30 per operator lock 2026-05-29 §7 Quote 6 — 30 GB hot window keeps the all-in bill ~₹2,919/mo (r8g.large, §7 Quote 7); the partition manager auto-archives partitions >90d to the cheaper S3 cold bucket (~4x cheaper than EBS/GB), so EBS holds only hot data. gp3 grows online (no stop, no data loss) — raise this anytime the hot window needs more. root_block_device[0].volume_size is in the instance lifecycle.ignore_changes so a later `terraform apply` does NOT revert a script-grown disk (gp3 cannot shrink anyway). This var documents the intended size for a FRESH provision."
+  description = "Root EBS volume size in GB. 50 per operator approval 2026-07-13 (prod disk-pressure remediation — root fs hit 82% on 2026-07-13 growing ~2.5-3.6 GB/day with zero reclamation; grown 30 -> 50 as the pressure-relief backstop alongside the retention-code fixes; supersedes the 2026-05-29 §7 Quote 6 30 GB lock — history 10 -> 30 -> 50). Bill impact ~+₹180/mo incl GST (~₹2,919 -> ~₹3,101, still under the $35/mo pre-GST budget alarm). The partition manager archives partitions >90d to the cheaper S3 cold bucket (~4x cheaper than EBS/GB), so EBS holds only hot data. gp3 grows online (no stop, no data loss) — raise this anytime the hot window needs more. root_block_device[0].volume_size is in the instance lifecycle.ignore_changes so a `terraform apply` does NOT touch the LIVE volume (and cannot revert a script-grown disk — gp3 cannot shrink anyway). This var documents the intended size for a FRESH provision; the LIVE grow is done out-of-band via scripts/aws-upgrade-instance.sh --ebs-size 50 (online aws ec2 modify-volume, no stop), with the filesystem grown by cloud-init growpart/resizefs at the next daily 08:30 IST boot or immediately via the in-guest growpart + xfs_growfs one-liner the script prints."
   type        = number
-  default     = 30
+  default     = 50
 
   validation {
     condition     = var.ebs_gp3_size_gb >= 10 && var.ebs_gp3_size_gb <= 200
-    error_message = "EBS is sized 10-200 GB. 30 GB default per operator lock 2026-05-29 (hot window + S3 cold-tier archival keeps bill ~₹2,919/mo on r8g.large). gp3 grows online beyond this if needed."
+    error_message = "EBS is sized 10-200 GB. 50 GB default per operator approval 2026-07-13 (disk-pressure grow; was 30 per the 2026-05-29 lock). gp3 grows online beyond this if needed."
   }
 }
 

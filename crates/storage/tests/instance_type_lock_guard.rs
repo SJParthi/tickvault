@@ -131,19 +131,18 @@ fn instance_lock_supersession_markers_present_in_operator_charter() {
 }
 
 /// Section C — the bill in §7 must match the locked figure. Operator
-/// approved ~₹2,919/mo on 2026-06-30 (r8g.large, 270 hrs, 30 GB EBS, +EIP
-/// kept, incl. 18% GST; supersedes the earlier ~₹2,058 / ~₹1,514 figures —
-/// the r8g.large upgrade adds ~₹420/mo and the kept EIP adds ~₹306/mo). If
-/// someone re-tunes this in the rule file without operator approval, the
-/// build fails.
+/// approved ~₹3,101/mo on 2026-07-13 (EBS 30 -> 50 GB disk-pressure grow,
+/// +~₹180/mo over the 2026-06-30 ~₹2,919/mo r8g.large figure; 270 hrs,
+/// 50 GB EBS, +EIP kept, incl. 18% GST). If someone re-tunes this in the
+/// rule file without operator approval, the build fails.
 #[test]
-fn instance_lock_monthly_bill_pinned_to_rupees_2919() {
+fn instance_lock_monthly_bill_pinned_to_rupees_3101() {
     let root = repo_root();
     let body =
         read(&root.join(".claude/rules/project/daily-universe-scope-expansion-2026-05-27.md"));
     assert!(
-        body.contains("~₹2,919/mo") || body.contains("Rs 2,919/mo"),
-        "rule file §7 must pin the ~₹2,919/mo bill (operator approved 2026-06-30: r8g.large, 270 hrs, 30 GB EBS, +EIP, incl GST)"
+        body.contains("~₹3,101/mo") || body.contains("Rs 3,101/mo"),
+        "rule file §7 must pin the ~₹3,101/mo bill (operator approved 2026-07-13: EBS 50 GB grow on r8g.large, 270 hrs, +EIP, incl GST)"
     );
 }
 

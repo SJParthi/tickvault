@@ -1744,7 +1744,7 @@ const _: () = assert!(
 /// previous-day-only restriction; just-closed-minute freshness is
 /// UNDOCUMENTED/UNVERIFIED-LIVE per `docs/groww-ref/99-UNKNOWNS.md` — the
 /// ladder + histogram are the probe).
-pub const GROWW_HISTORICAL_CANDLES_URL: &str = "https://api.groww.in/v1/historical/candles";
+pub const GROWW_HISTORICAL_CANDLES_URL: &str = "https://api.groww.in/v1/historical/candles"; // APPROVED: constants.rs is the single REST-URL source
 
 /// Groww `candle_interval` literal for 1-minute candles (`"1minute"`, NOT
 /// the Dhan-style `"1"` — interval literals + the 30-days-per-request 1m

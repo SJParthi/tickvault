@@ -99,6 +99,16 @@ pub struct ApplicationConfig {
     /// pipeline disabled + probe-and-report ON.
     #[serde(default)]
     pub option_chain_1m: OptionChain1mConfig,
+    /// `[groww_spot_1m]` — Groww per-minute spot 1m REST leg (operator grant
+    /// 2026-07-13, `.claude/plans/active-plan-groww-rest-1m.md` PR-2): every
+    /// trading-day minute close in session, fetch that just-closed minute's
+    /// official 1m OHLCV for the 3 spot indices via Groww
+    /// `GET /v1/historical/candles` and persist to `spot_1m_rest` tagged
+    /// `feed='groww'`. Independent of the Dhan lane (spawned process-global;
+    /// a Dhan-off session still runs it). Absent section ⇒ DISABLED
+    /// (fail-safe default off).
+    #[serde(default)]
+    pub groww_spot_1m: GrowwSpot1mConfig,
     /// `[tf_consistency]` — daily timeframe-consistency verifier (operator
     /// directive 2026-07-13: *"how will you guarantee that all our defined
     /// timeframes internally are correct"*). At 15:40 IST every trading day,
@@ -2296,6 +2306,7 @@ mod tests {
             scoreboard: ScoreboardConfig::default(),
             spot_1m_rest: Spot1mRestConfig::default(),
             option_chain_1m: OptionChain1mConfig::default(),
+            groww_spot_1m: GrowwSpot1mConfig::default(),
             tf_consistency: TfConsistencyConfig::default(),
         }
     }
@@ -3705,6 +3716,45 @@ mod tests {
             .expect("explicit values must round-trip");
         assert!(on.option_chain_1m.enabled);
         assert!(!on.option_chain_1m.probe_and_report);
+    }
+
+    /// Groww per-minute spot 1m REST leg (operator grant 2026-07-13,
+    /// PR-2): the `[groww_spot_1m]` section is FAIL-SAFE default OFF —
+    /// via `Default`, via a missing section, and via an empty section —
+    /// and an explicit `enabled = true` (the base.toml shape) round-trips.
+    #[test]
+    fn test_groww_spot_1m_config_defaults_off_and_round_trips() {
+        use figment::Figment;
+        use figment::providers::{Format, Toml};
+
+        assert!(
+            !GrowwSpot1mConfig::default().enabled,
+            "groww_spot_1m must default OFF (fail-safe; base.toml opts in)"
+        );
+
+        #[derive(Deserialize)]
+        struct Wrapper {
+            #[serde(default)]
+            groww_spot_1m: GrowwSpot1mConfig,
+        }
+        // Missing section entirely → disabled, never an error.
+        let missing: Wrapper = Figment::new()
+            .merge(Toml::string("[other]\nx = 1\n"))
+            .extract()
+            .expect("missing [groww_spot_1m] must default, not error");
+        assert!(!missing.groww_spot_1m.enabled);
+        // Empty section (no keys) → disabled via the field-level default.
+        let empty: Wrapper = Figment::new()
+            .merge(Toml::string("[groww_spot_1m]\n"))
+            .extract()
+            .expect("empty [groww_spot_1m] must default, not error");
+        assert!(!empty.groww_spot_1m.enabled);
+        // Explicit ON (the base.toml shape) round-trips.
+        let on: Wrapper = Figment::new()
+            .merge(Toml::string("[groww_spot_1m]\nenabled = true\n"))
+            .extract()
+            .expect("explicit enabled = true must round-trip");
+        assert!(on.groww_spot_1m.enabled);
     }
 
     /// Daily timeframe-consistency verifier (operator 2026-07-13): the
