@@ -98,7 +98,8 @@ text) MUST be written via a SINGLE-quoted `-m '...'`, a heredoc, or
 `git commit -F <file>` — NEVER a double-quoted `-m "..."`. After committing,
 verify with `git log -1 --format=%B | grep -c '§'` when the body cites
 sections. (Corrected citations for the two garbled commits are recorded in
-`.claude/plans/active-plan-futidx-allmonths.md` AM-R1 F9.)
+`.claude/plans/archive/2026-07-10-futidx-allmonths.md` AM-R1 F9 — archived from
+active 2026-07-13 per plan-enforcement rule 7.)
 
 ## When CI fails mid-loop
 
