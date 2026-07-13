@@ -13,11 +13,29 @@
 //!
 //! 1. dual-instance SSM lock BEFORE any mint (lock-before-mint,
 //!    `dual-instance-lock-2026-07-04.md` §2 — reuses
-//!    `tickvault_core::instance_lock` exactly as the lane does), retried
-//!    forever in the background on AlreadyHeld / SSM failure (bounded
-//!    exponential backoff, cap [`DHAN_REST_STACK_BACKOFF_CAP_SECS`]) — the
-//!    process is NEVER halted and the Groww feed / shared infra are NEVER
-//!    blocked by this task;
+//!    `tickvault_core::instance_lock` exactly as the lane does). The two
+//!    failure classes are handled DIFFERENTLY (2026-07-13 hostile-review
+//!    HIGH — the lurk-and-steal fix; recorded in
+//!    `dual-instance-lock-2026-07-04.md` §3.5):
+//!    - **AlreadyHeld** (`stage = "already_held"`): bounded patience of
+//!      [`DHAN_REST_STACK_ALREADYHELD_PATIENCE_SECS`] cumulative backoff
+//!      (≫ the 90s lock TTL, so our OWN previous process's stale entry
+//!      from a deploy/daily-restart clears inside the window and we
+//!      acquire) — then the stack pages ONCE (`DualInstanceDetected`) and
+//!      **PARKS permanently**: no further SSM polling, so a genuine live
+//!      peer's lock can structurally NEVER be seized via the 90s
+//!      stale-takeover the moment that peer restarts. Restart is the only
+//!      retry. Holder machine identity is NOT reliably comparable (every
+//!      `generate_host_id` call site passes `aws_instance_id = None`, so
+//!      the machine component is the literal `local` everywhere) — hence
+//!      the bounded window applies to ALL AlreadyHeld holders, same- and
+//!      different-machine alike.
+//!    - **SSM transport errors** (`stage = "ssm_transport"`): bounded
+//!      exponential backoff (cap [`DHAN_REST_STACK_BACKOFF_CAP_SECS`]),
+//!      retried forever in the background — an SSM outage proves nothing
+//!      about peers, and fail-closed means no mint until the lock is held.
+//!    Either way the process is NEVER halted and the Groww feed / shared
+//!    infra are NEVER blocked by this task;
 //! 2. `TokenManager::initialize` (SSM creds → TOTP → JWT) with the SAME
 //!    `instance_lock_held` wiring (RESILIENCE-03 mint tripwire), then
 //!    `set_global_token_manager` + `feed_runtime.set_live_token_manager` so
@@ -52,10 +70,12 @@
 //! shutdown-notify chain (the lane's Item 19f bridge is lane-scoped), so a
 //! process stop leaves the lock parameter in SSM until the 90s TTL clears
 //! it. The next boot's stack absorbs that window: its acquire loop retries
-//! with backoff and wins once the TTL expires; the DualInstanceDetected
-//! Telegram is deferred past the TTL window
-//! ([`DHAN_REST_STACK_PEER_PAGE_MIN_ATTEMPT`]) so a quick restart never
-//! pages against its own stale entry.
+//! with backoff inside the bounded AlreadyHeld patience window and wins
+//! once the TTL expires; the DualInstanceDetected Telegram is deferred
+//! past the TTL window ([`DHAN_REST_STACK_PEER_PAGE_MIN_ATTEMPT`]) so a
+//! quick restart never pages against its own stale entry. A holder that
+//! SURVIVES the patience window is a genuine live peer (its heartbeat kept
+//! renewing past the TTL) → one page + permanent park (see module item 1).
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -90,6 +110,20 @@ const DHAN_REST_STACK_LOG_EVERY_N_ATTEMPTS: u32 = 10;
 /// STILL exists at attempt 5 is a genuine live peer (its heartbeat kept
 /// renewing past the TTL) — page-worthy; the self-stale window is not.
 const DHAN_REST_STACK_PEER_PAGE_MIN_ATTEMPT: u32 = 5;
+/// Bounded AlreadyHeld patience (2026-07-13 lurk-and-steal fix): total
+/// cumulative backoff the stack is willing to wait on a held lock before
+/// PARKING permanently. 5 minutes ≫ the 90s TTL, so a same-machine
+/// previous process (deploy / daily restart / crash) always goes stale and
+/// is taken over INSIDE the window; a holder that survives it has a live
+/// heartbeat — a genuine peer we must never lurk against (a lurking loop
+/// would seize the peer's lock via the 90s stale-takeover the instant the
+/// peer restarts, then mint and kill the peer's token).
+const DHAN_REST_STACK_ALREADYHELD_PATIENCE_SECS: u64 = 300;
+/// Floor on the token-init retry ladder (2026-07-13 mint-cooldown fix):
+/// every gap between `TokenManager::initialize` attempts must clear Dhan's
+/// ~125s generateAccessToken cooldown — see
+/// [`dhan_rest_token_backoff_secs`].
+const DHAN_REST_STACK_TOKEN_RETRY_FLOOR_SECS: u64 = 130;
 
 /// Process-global once-guard: the REST-only stack must never be brought up
 /// twice (N stacks = N heartbeats + N renewal loops + N canary/spot/chain
@@ -138,6 +172,30 @@ pub fn dhan_rest_retry_should_log(attempt: u32) -> bool {
 #[must_use]
 pub fn dhan_rest_peer_page_due(attempt: u32, already_paged: bool) -> bool {
     !already_paged && attempt >= DHAN_REST_STACK_PEER_PAGE_MIN_ATTEMPT
+}
+
+/// PARK decision for the lock-acquire loop (2026-07-13 lurk-and-steal fix):
+/// once the CUMULATIVE AlreadyHeld backoff reaches
+/// [`DHAN_REST_STACK_ALREADYHELD_PATIENCE_SECS`], the holder has out-lived
+/// the 90s TTL by a wide margin (its heartbeat is alive — a genuine peer)
+/// and the stack must stop polling SSM entirely so it can never seize that
+/// peer's lock via the stale-takeover. SSM transport errors do NOT feed
+/// this counter (they prove nothing about peers). Pure — unit-tested.
+#[must_use]
+pub fn dhan_rest_lock_park_due(already_held_wait_secs: u64) -> bool {
+    already_held_wait_secs >= DHAN_REST_STACK_ALREADYHELD_PATIENCE_SECS
+}
+
+/// Backoff for the `TokenManager::initialize` retry loop — floored at
+/// [`DHAN_REST_STACK_TOKEN_RETRY_FLOOR_SECS`] so EVERY inter-attempt gap
+/// clears Dhan's ~125s generateAccessToken mint cooldown from attempt 1
+/// (130s → 260s → 300s cap; the generic 10/20/40/80s early rungs sat
+/// INSIDE the cooldown). Pure — unit-tested.
+#[must_use]
+pub fn dhan_rest_token_backoff_secs(attempt: u32) -> u64 {
+    // Shift clamped to 2: 130 << 2 = 520 already exceeds the 300s cap.
+    let shift = attempt.saturating_sub(1).min(2);
+    (DHAN_REST_STACK_TOKEN_RETRY_FLOOR_SECS << shift).min(DHAN_REST_STACK_BACKOFF_CAP_SECS)
 }
 
 /// Spawn the Dhan REST-only stack bring-up as ONE background task (plus a
@@ -237,9 +295,57 @@ async fn run_dhan_rest_stack(params: DhanRestStackParams) {
     let lock_key = instance_lock::compute_instance_lock_path(&env);
 
     {
-        let mut attempt: u32 = 0;
+        // 2026-07-13 lurk-and-steal fix: AlreadyHeld and SSM-transport
+        // failures are SEPARATE arms with SEPARATE counters. AlreadyHeld
+        // accumulates a bounded patience budget and then PARKS the stack
+        // permanently (never lurks, never steals — see the module docs and
+        // dual-instance-lock-2026-07-04.md §3.5); SSM transport errors
+        // retry forever with bounded backoff (an outage proves nothing
+        // about peers; fail-closed — no mint until the lock is held).
+        let mut held_attempt: u32 = 0;
+        let mut held_wait_secs: u64 = 0;
+        let mut ssm_attempt: u32 = 0;
         let mut peer_paged = false;
+        let mut last_holder = String::new();
         loop {
+            if dhan_rest_lock_park_due(held_wait_secs) {
+                // Patience exhausted: the holder's heartbeat kept renewing
+                // far past the 90s TTL — a genuine live peer, not our own
+                // stale entry. Page once (if the TTL-deferred page has not
+                // fired yet) and PARK: no further SSM polling from this
+                // process, so the peer's lock can never be seized via the
+                // stale-takeover the moment the peer restarts.
+                if !peer_paged {
+                    params
+                        .notifier
+                        .notify(NotificationEvent::DualInstanceDetected {
+                            holder: last_holder.clone(),
+                            lock_key: lock_key.clone(),
+                        });
+                }
+                error!(
+                    code = ErrorCode::Resilience01DualInstanceDetected.code_str(),
+                    severity = ErrorCode::Resilience01DualInstanceDetected
+                        .severity()
+                        .as_str(),
+                    stage = "already_held_parked",
+                    peer = %last_holder,
+                    lock_key = %lock_key,
+                    waited_secs = held_wait_secs,
+                    "Dhan REST-only stack PARKED: a live peer has held the \
+                     dual-instance lock past the {}s patience window — refusing to \
+                     lurk (a parked stack can never seize the peer's lock via the \
+                     90s stale-takeover); the retained Dhan REST surface stays DOWN \
+                     this process while Groww + shared infra keep running; RESTART \
+                     is the only retry",
+                    DHAN_REST_STACK_ALREADYHELD_PATIENCE_SECS
+                );
+                info!(
+                    "Dhan REST-only stack parked — no further SSM lock polling this \
+                     process (restart to re-attempt once the peer is stopped)"
+                );
+                return;
+            }
             match instance_lock::try_acquire_instance_lock(&ssm_client, &env, &host_id).await {
                 Ok(instance_lock::AcquireOutcome::Acquired) => {
                     instance_lock_held.store(true, Ordering::Release);
@@ -252,55 +358,76 @@ async fn run_dhan_rest_stack(params: DhanRestStackParams) {
                     break;
                 }
                 Ok(instance_lock::AcquireOutcome::AlreadyHeld { holder }) => {
-                    attempt = attempt.saturating_add(1);
-                    if dhan_rest_retry_should_log(attempt) {
+                    held_attempt = held_attempt.saturating_add(1);
+                    if dhan_rest_retry_should_log(held_attempt) {
                         error!(
                             code = ErrorCode::Resilience01DualInstanceDetected.code_str(),
                             severity = ErrorCode::Resilience01DualInstanceDetected
                                 .severity()
                                 .as_str(),
+                            stage = "already_held",
                             peer = %holder,
                             lock_key = %lock_key,
-                            attempt,
+                            attempt = held_attempt,
+                            waited_secs = held_wait_secs,
                             "Dhan REST-only stack: another process holds the dual-instance \
-                             lock — retrying in background (never halts; the peer's Dhan \
-                             session is untouched — no mint before the lock)"
+                             lock — bounded patience in progress (parks at {}s; the peer's \
+                             Dhan session is untouched — no mint before the lock)",
+                            DHAN_REST_STACK_ALREADYHELD_PATIENCE_SECS
                         );
                     } else {
-                        debug!(attempt, peer = %holder, "dual-instance lock still held — retrying");
+                        debug!(
+                            attempt = held_attempt,
+                            peer = %holder,
+                            "dual-instance lock still held — bounded patience retry"
+                        );
                     }
-                    if dhan_rest_peer_page_due(attempt, peer_paged) {
+                    if dhan_rest_peer_page_due(held_attempt, peer_paged) {
                         // Past the 90s TTL self-stale window (see the const
                         // docs) — a genuine live peer. Page ONCE per process.
                         params
                             .notifier
                             .notify(NotificationEvent::DualInstanceDetected {
-                                holder,
+                                holder: holder.clone(),
                                 lock_key: lock_key.clone(),
                             });
                         peer_paged = true;
                     }
+                    last_holder = holder;
+                    let wait = dhan_rest_stack_backoff_secs(held_attempt);
+                    held_wait_secs = held_wait_secs.saturating_add(wait);
+                    tokio::time::sleep(Duration::from_secs(wait)).await;
                 }
                 Err(err) => {
-                    attempt = attempt.saturating_add(1);
-                    if dhan_rest_retry_should_log(attempt) {
+                    ssm_attempt = ssm_attempt.saturating_add(1);
+                    if dhan_rest_retry_should_log(ssm_attempt) {
                         error!(
                             code = ErrorCode::Resilience01DualInstanceDetected.code_str(),
                             severity = ErrorCode::Resilience01DualInstanceDetected
                                 .severity()
                                 .as_str(),
+                            stage = "ssm_transport",
                             error = %err,
                             lock_key = %lock_key,
-                            attempt,
-                            "Dhan REST-only stack: SSM lock acquire failed — retrying in \
-                             background (cannot prove there is no peer, so no mint yet)"
+                            attempt = ssm_attempt,
+                            "Dhan REST-only stack: SSM lock acquire failed (transport) — \
+                             retrying in background (cannot prove there is no peer, so \
+                             no mint yet; transport errors never count toward the \
+                             AlreadyHeld park patience)"
                         );
                     } else {
-                        debug!(attempt, error = %err, "SSM lock acquire failed — retrying");
+                        debug!(
+                            attempt = ssm_attempt,
+                            error = %err,
+                            "SSM lock acquire failed (transport) — retrying"
+                        );
                     }
+                    tokio::time::sleep(Duration::from_secs(dhan_rest_stack_backoff_secs(
+                        ssm_attempt,
+                    )))
+                    .await;
                 }
             }
-            tokio::time::sleep(Duration::from_secs(dhan_rest_stack_backoff_secs(attempt))).await;
         }
     }
 
@@ -320,10 +447,20 @@ async fn run_dhan_rest_stack(params: DhanRestStackParams) {
     // -----------------------------------------------------------------------
     // Phase 2: TokenManager (SSM creds → TOTP → JWT), the SAME wiring the
     // lane uses — the `instance_lock_held` flag rides in as the
-    // RESILIENCE-03 mint tripwire. Retry-forever: a failed/timed-out init
-    // logs loudly (TokenManager's own internals page AUTH-GAP-04 /
-    // AuthenticationFailed as today) and re-attempts at the backoff cap —
-    // the 300s cap also respects Dhan's ~125s mint cooldown.
+    // RESILIENCE-03 mint tripwire. Retry-forever with a ≥130s floor between
+    // initialize attempts (`dhan_rest_token_backoff_secs`: 130 → 260 →
+    // 300s cap) so EVERY retry clears Dhan's ~125s generateAccessToken
+    // cooldown from attempt 1 (2026-07-13 fix — the generic 10/20/40/80s
+    // early rungs sat INSIDE the cooldown). A failed/timed-out init logs
+    // loudly (TokenManager's own internals page AUTH-GAP-04 /
+    // AuthenticationFailed as today).
+    //
+    // Honest residual (same class as AUTH-GAP-05 AG5-R2-1): the
+    // TOKEN_INIT_TIMEOUT_SECS arm abandons an IN-FLIGHT mint that may have
+    // SUCCEEDED server-side — the next attempt's fresh mint invalidates
+    // that orphaned token. Bounded and self-correcting (Dhan enforces one
+    // active token; the retry loop converges on the newest mint), but it
+    // is a real extra mint, not zero.
     // -----------------------------------------------------------------------
     let token_manager = {
         let mut attempt: u32 = 0;
@@ -364,14 +501,17 @@ async fn run_dhan_rest_stack(params: DhanRestStackParams) {
                             timeout_secs = TOKEN_INIT_TIMEOUT_SECS,
                             attempt,
                             "Dhan REST-only stack authentication timed out — Dhan API may be \
-                             unreachable; retrying in background"
+                             unreachable; retrying in background (an in-flight mint that \
+                             succeeded server-side is orphaned and superseded by the next \
+                             attempt's fresh mint — bounded, self-correcting)"
                         );
                     } else {
                         debug!(attempt, "REST-stack auth timed out — retrying");
                     }
                 }
             }
-            tokio::time::sleep(Duration::from_secs(dhan_rest_stack_backoff_secs(attempt))).await;
+            // ≥130s floor — every gap clears the ~125s mint cooldown.
+            tokio::time::sleep(Duration::from_secs(dhan_rest_token_backoff_secs(attempt))).await;
         }
     };
 
@@ -587,13 +727,45 @@ mod tests {
         assert!(!dhan_rest_retry_should_log(0), "attempt 0 never logs");
     }
 
-    /// `dhan_rest_peer_page_due` — the Telegram fires once, and only past
-    /// the 90s-TTL self-stale window (cumulative backoff before attempt 5 =
-    /// 10+20+40+80 = 150s > INSTANCE_LOCK_TTL_SECS), so a quick restart
-    /// never pages against its own stale lock entry.
+    /// Same-machine bounded patience (2026-07-13 lurk-and-steal fix,
+    /// bounded-window FALLBACK — holder machine identity is NOT reliably
+    /// comparable because every `generate_host_id` call site passes
+    /// `aws_instance_id = None`, so the machine component is `local`
+    /// everywhere): the patience window must comfortably cover the 90s
+    /// lock TTL so our OWN previous process's stale entry (deploy / daily
+    /// restart / crash) is always taken over INSIDE the window, and the
+    /// park predicate must be false everywhere below the threshold.
     #[test]
-    fn test_dhan_rest_peer_page_due_defers_past_ttl_and_latches() {
-        // Prove the deferral really clears the TTL window.
+    fn test_dhan_rest_lock_same_machine_bounded_patience_covers_ttl() {
+        // ≥3x TTL margin: a same-machine restart can never be mislabeled a
+        // genuine peer just because the TTL takeover was a beat late.
+        assert!(
+            DHAN_REST_STACK_ALREADYHELD_PATIENCE_SECS >= 3 * instance_lock::INSTANCE_LOCK_TTL_SECS,
+            "patience {}s must be >= 3x the {}s lock TTL",
+            DHAN_REST_STACK_ALREADYHELD_PATIENCE_SECS,
+            instance_lock::INSTANCE_LOCK_TTL_SECS
+        );
+        assert!(!dhan_rest_lock_park_due(0));
+        assert!(!dhan_rest_lock_park_due(
+            instance_lock::INSTANCE_LOCK_TTL_SECS
+        ));
+        assert!(!dhan_rest_lock_park_due(
+            DHAN_REST_STACK_ALREADYHELD_PATIENCE_SECS - 1
+        ));
+        assert!(dhan_rest_lock_park_due(
+            DHAN_REST_STACK_ALREADYHELD_PATIENCE_SECS
+        ));
+        assert!(dhan_rest_lock_park_due(u64::MAX), "no overflow / saturates");
+    }
+
+    /// Foreign-machine (genuine live peer) arm: the page fires ONCE, only
+    /// past the TTL self-stale window (a holder still fresh past the TTL
+    /// has a live heartbeat = a real peer), and the loop then PARKS —
+    /// cumulative backoff reaches the park threshold within one more
+    /// attempt, so a lurking retry-forever loop is structurally impossible.
+    #[test]
+    fn test_dhan_rest_lock_genuine_peer_pages_once_then_parks() {
+        // Page timing: cumulative backoff before the page attempt > TTL.
         let cumulative_before_page: u64 = (1..DHAN_REST_STACK_PEER_PAGE_MIN_ATTEMPT)
             .map(dhan_rest_stack_backoff_secs)
             .sum();
@@ -607,9 +779,66 @@ mod tests {
         assert!(!dhan_rest_peer_page_due(1, false));
         assert!(!dhan_rest_peer_page_due(4, false));
         assert!(dhan_rest_peer_page_due(5, false));
-        assert!(dhan_rest_peer_page_due(50, false));
         // Latched: once paged, never again.
         assert!(!dhan_rest_peer_page_due(5, true));
         assert!(!dhan_rest_peer_page_due(500, true));
+        // Page-before-park: the page attempt precedes the park instant...
+        assert!(
+            cumulative_before_page < DHAN_REST_STACK_ALREADYHELD_PATIENCE_SECS,
+            "the peer page must fire BEFORE the park threshold"
+        );
+        // ...and the park is reached within ONE more backoff step after the
+        // page (bounded lurk window; never retry-forever).
+        let cumulative_through_page_attempt: u64 = (1..=DHAN_REST_STACK_PEER_PAGE_MIN_ATTEMPT)
+            .map(dhan_rest_stack_backoff_secs)
+            .sum();
+        assert!(
+            dhan_rest_lock_park_due(cumulative_through_page_attempt),
+            "cumulative backoff through the page attempt ({}s) must reach the \
+             {}s park threshold — AlreadyHeld can never lurk forever",
+            cumulative_through_page_attempt,
+            DHAN_REST_STACK_ALREADYHELD_PATIENCE_SECS
+        );
+    }
+
+    /// SSM transport errors keep the bounded-backoff retry-FOREVER arm:
+    /// the ladder stays capped (no overflow at extreme attempts), the
+    /// coalesced-log discipline holds at any attempt count, and the park
+    /// predicate consumes ONLY the AlreadyHeld cumulative wait (its sole
+    /// parameter) — transport attempts can never park the stack.
+    #[test]
+    fn test_dhan_rest_lock_ssm_transport_retry_is_unbounded_and_never_parks() {
+        // Ladder is safe at any transport-attempt count.
+        assert_eq!(dhan_rest_stack_backoff_secs(6), 300);
+        assert_eq!(dhan_rest_stack_backoff_secs(1_000_000), 300);
+        assert_eq!(dhan_rest_stack_backoff_secs(u32::MAX), 300);
+        // Coalescing holds forever (first + every 10th).
+        assert!(dhan_rest_retry_should_log(1_000_000));
+        assert!(!dhan_rest_retry_should_log(1_000_001));
+        // Park is a function of the AlreadyHeld wait ONLY: with zero
+        // AlreadyHeld wait accumulated, no number of transport retries can
+        // trip it (the loop never feeds transport sleeps into it).
+        assert!(!dhan_rest_lock_park_due(0));
+    }
+
+    /// `dhan_rest_token_backoff_secs` — every inter-attempt gap of the
+    /// token-init loop clears Dhan's ~125s mint cooldown (130 → 260 →
+    /// 300s cap), with no overflow at extreme attempts (2026-07-13
+    /// mint-cooldown fix).
+    #[test]
+    fn test_dhan_rest_token_backoff_secs_floors_above_mint_cooldown() {
+        assert_eq!(dhan_rest_token_backoff_secs(0), 130, "attempt 0 as 1");
+        assert_eq!(dhan_rest_token_backoff_secs(1), 130);
+        assert_eq!(dhan_rest_token_backoff_secs(2), 260);
+        assert_eq!(dhan_rest_token_backoff_secs(3), 300, "cap engages");
+        assert_eq!(dhan_rest_token_backoff_secs(4), 300);
+        assert_eq!(dhan_rest_token_backoff_secs(u32::MAX), 300, "no overflow");
+        // The floor itself clears the documented ~125s cooldown.
+        for attempt in 0..64 {
+            assert!(
+                dhan_rest_token_backoff_secs(attempt) > 125,
+                "attempt {attempt} gap must exceed the ~125s mint cooldown"
+            );
+        }
     }
 }
