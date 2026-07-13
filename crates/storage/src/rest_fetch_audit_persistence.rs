@@ -62,8 +62,15 @@ pub const REST_FETCH_LEG_SPOT_1M: &str = "spot_1m";
 
 /// `leg` SYMBOL value — the per-minute OPTION-CHAIN fetch (PR-3, the Groww
 /// chain leg; one row per (minute, underlying), attempts=1 — the chain has
-/// no in-minute re-poll ladder). `contract_1m` lands with PR-4.
+/// no in-minute re-poll ladder).
 pub const REST_FETCH_LEG_CHAIN_1M: &str = "chain_1m";
+
+/// `leg` SYMBOL value — the per-minute PER-CONTRACT candle fetch (PR-4,
+/// the Groww fill-model leg; one row per (minute, contract) with
+/// `security_id` = the contract's Groww exchange_token and `symbol` = the
+/// UNDERLYING's plain symbol — the full contract identity lives in the
+/// `option_contract_1m_rest.groww_symbol` column).
+pub const REST_FETCH_LEG_CONTRACT_1M: &str = "contract_1m";
 
 const QUESTDB_DDL_TIMEOUT_SECS: u64 = 10;
 
@@ -523,7 +530,10 @@ mod tests {
     fn test_rest_fetch_leg_wire_strings_stable_and_distinct() {
         assert_eq!(REST_FETCH_LEG_SPOT_1M, "spot_1m");
         assert_eq!(REST_FETCH_LEG_CHAIN_1M, "chain_1m");
+        assert_eq!(REST_FETCH_LEG_CONTRACT_1M, "contract_1m");
         assert_ne!(REST_FETCH_LEG_SPOT_1M, REST_FETCH_LEG_CHAIN_1M);
+        assert_ne!(REST_FETCH_LEG_CHAIN_1M, REST_FETCH_LEG_CONTRACT_1M);
+        assert_ne!(REST_FETCH_LEG_SPOT_1M, REST_FETCH_LEG_CONTRACT_1M);
     }
 
     /// Outcome SYMBOL wire strings are stable (forensic queries group on

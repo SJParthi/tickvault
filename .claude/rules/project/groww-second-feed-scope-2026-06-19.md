@@ -895,3 +895,39 @@ construction. The runtime resolution depends on the Groww lane's watch build hav
 literal; adding VIX (or any index) to the chain/contract legs under cover of this grant;
 letting a VIX failure feed the core escalation edge or block/reorder the core fetches; a
 5th spot index without a fresh dated quote HERE first.
+
+## §38.8 The decision-freshness gate (operator verbatim-intent, 2026-07-13 — recorded with PR-4)
+
+**Operator verbatim-intent (2026-07-13, relayed via the coordinator
+session — labeled as intent, not a literal quote):**
+> "we cannot rely on backfill — within the particular second or few
+> seconds it should definitely be pulled for TRADING DECISIONS; we need
+> precise filling."
+
+**The rule (binding on every future consumer of the §38 REST tables):**
+
+1. **Backfill and sweep repairs are RECORD-COMPLETENESS ONLY** — they
+   exist for backtest parity, cross-verification and audit. A
+   backfilled/swept row is NEVER a trading-decision input: the fill-model
+   window (signal on minute M → fill at minute M+1's worst-case) only
+   works when M's data arrived within seconds of M's close.
+2. **Any future strategy consumer of `spot_1m_rest` / `option_chain_1m`
+   / `option_contract_1m_rest` MUST fail closed on staleness:** a row
+   whose retrieval was older than a configured freshness threshold ⇒ NO
+   trade for that minute — never a trade on late data, never a guessed
+   fill.
+3. **Stale rows are mechanically distinguishable TODAY** — no schema
+   change is needed when a consumer arrives: every row carries
+   `close_to_data_ms` (own-fire rows measure ~1-2 s; a
+   backfilled/swept row carries its REAL ≥ 60 s delay — the #1499
+   semantics split), and the `rest_fetch_audit` row's outcome names the
+   recovery path (`ok` repaired-late vs the own-fire `ok`).
+4. **No strategy code ships under this gate** — the §28
+   indicators/strategies boundary stands; wiring any of these tables
+   into a decision path needs its own dated operator scope FIRST.
+
+(Numbered §38.8 — §38.5 is the Trigger, §38.6 is the chain-flip dated
+note, and §38.7 is the VIX spot-leg grant, all of which predate this
+subsection on `main`.) Mirrored (one
+paragraph each) into `no-rest-except-live-feed-2026-06-27.md` §9 and
+`rest-1m-pipeline-error-codes.md` §3.

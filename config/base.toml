@@ -533,6 +533,28 @@ enabled = true # flipped 2026-07-13 after the live probe PASSED (groww-second-fe
 probe_and_report = true # inert while enabled; the rollback canary (the Dhan §8.7 precedent)
 
 # ===========================================================================
+# Groww per-minute PER-CONTRACT 1m candle REST leg (operator grant
+# 2026-07-13 — PR-4 of the Groww per-minute REST plan, the FILL-MODEL
+# leg). When enabled: every session minute — sequenced right after the
+# Groww chain fetch — pull the just-closed minute's 1m candle for a
+# BOUNDED ATM-window selection of option contracts (ATM ±
+# strikes_each_side x CE+PE x 3 underlyings, hard-capped per minute) via
+# Groww GET /v1/historical/candles (segment=FNO) and persist to the NEW
+# option_contract_1m_rest table tagged feed='groww' (feed-in-key DEDUP).
+# DEPENDS ON THE CHAIN LEG: the per-minute ATM anchor is the chain's
+# underlying price — the chain leg is live (enabled = true above, §38.6),
+# but THIS leg stays OFF until the operator flips it with its own dated
+# note. Rows are RECORD data: any future strategy consumer must fail
+# closed on staleness per the decision-freshness gate
+# (groww-second-feed-scope-2026-06-19.md §38.8).
+# An ABSENT section = disabled (fail-safe); `enabled = false` is the
+# rollback switch.
+# ===========================================================================
+[groww_contract_1m]
+enabled = false # stays OFF until the operator's dated flip note (the chain leg feeds its ATM anchors)
+strikes_each_side = 2
+
+# ===========================================================================
 # Daily timeframe-consistency verifier (operator directive 2026-07-13 —
 # "how will you guarantee that all our defined timeframes internally are
 # correct — how do you identify whether any miscalculation or data

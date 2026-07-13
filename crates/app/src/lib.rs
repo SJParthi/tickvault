@@ -55,6 +55,13 @@ pub mod groww_spot_1m_boot;
 // underlyings, sequenced after the Groww spot leg → `option_chain_1m`
 // feed='groww' + `rest_fetch_audit` leg='chain_1m' forensics rows.
 pub mod groww_option_chain_1m_boot;
+// Groww per-minute PER-CONTRACT 1m candle REST leg (operator grant
+// 2026-07-13 — PR-4 of the Groww per-minute REST plan, the fill-model
+// leg): the just-closed minute's 1m candle for a bounded ATM-window
+// contract selection, sequenced after the Groww chain leg →
+// `option_contract_1m_rest` feed='groww' + `rest_fetch_audit`
+// leg='contract_1m' forensics rows.
+pub mod groww_contract_1m_boot;
 // Dual-feed scoreboard PR-A (operator 2026-07-10): boot-time process-death
 // reconciler + the 15:45 IST daily Dhan-vs-Groww aggregation + the Telegram
 // scorecard summary (SCOREBOARD-01 family).

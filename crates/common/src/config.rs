@@ -130,6 +130,20 @@ pub struct ApplicationConfig {
     /// Absent section ⇒ DISABLED (fail-safe default off).
     #[serde(default)]
     pub tf_consistency: TfConsistencyConfig,
+    /// `[groww_contract_1m]` — Groww per-minute PER-CONTRACT 1m candle REST
+    /// leg (operator grant 2026-07-13,
+    /// `.claude/plans/active-plan-groww-rest-1m.md` PR-4 — the fill-model
+    /// leg): every trading-day minute close in session — sequenced after
+    /// the Groww CHAIN leg (its per-minute `underlying_ltp` is the ATM
+    /// anchor) — fetch the just-closed minute's 1m candle for a BOUNDED
+    /// ATM-window selection of option contracts via Groww
+    /// `GET /v1/historical/candles` (`segment=FNO`) and persist to the NEW
+    /// `option_contract_1m_rest` table tagged `feed='groww'`. Requires the
+    /// chain leg (`[groww_option_chain_1m] enabled = true`) — without it
+    /// there is no anchor and the leg is refused loudly at spawn. Absent
+    /// section ⇒ DISABLED (fail-safe default off).
+    #[serde(default)]
+    pub groww_contract_1m: GrowwContract1mConfig,
 }
 
 /// `[feeds]` — pluggable market-data feed selection (operator lock
@@ -535,6 +549,48 @@ impl Default for GrowwOptionChain1mConfig {
         Self {
             enabled: false,
             probe_and_report: default_chain_1m_probe_and_report(),
+        }
+    }
+}
+
+/// serde default for [`GrowwContract1mConfig::strikes_each_side`] — the
+/// pinned [`crate::constants::GROWW_CONTRACT_1M_DEFAULT_STRIKES_EACH_SIDE`].
+fn default_groww_contract_1m_strikes_each_side() -> u32 {
+    crate::constants::GROWW_CONTRACT_1M_DEFAULT_STRIKES_EACH_SIDE
+}
+
+/// `[groww_contract_1m]` — Groww per-minute per-contract 1m candle REST
+/// leg (operator grant 2026-07-13; PR-4 of the Groww per-minute REST plan
+/// — the fill-model leg). Cold path only — the WS pipelines, tick capture
+/// and trading are untouched.
+///
+/// Fail-safe shape: `enabled` is `#[serde(default)]` = `false`, so an
+/// absent `[groww_contract_1m]` section (or a TOML written before this PR)
+/// disables the fetcher entirely. `config/base.toml` ships the section
+/// with `enabled = false` — the leg DEPENDS on the chain leg's per-minute
+/// anchors, so it stays OFF until `[groww_option_chain_1m]` is live and
+/// the operator flips this with a dated note.
+#[derive(Debug, Clone, Deserialize)]
+pub struct GrowwContract1mConfig {
+    /// Master switch for the Groww per-minute contract candle fetcher.
+    /// Default OFF (fail-safe; depends on the chain leg's anchors).
+    #[serde(default)]
+    pub enabled: bool,
+    /// ATM window half-width: strikes selected EACH SIDE of the ATM strike
+    /// per underlying (× CE+PE × 3 underlyings = the per-minute contract
+    /// count). Default 2 → 30 contracts/minute = exactly the
+    /// `GROWW_CONTRACT_1M_MAX_PER_MINUTE` envelope cap; a wider value is
+    /// truncated deterministically nearest-ATM-first at the cap (counted +
+    /// one coded warn, never fetched past it).
+    #[serde(default = "default_groww_contract_1m_strikes_each_side")]
+    pub strikes_each_side: u32,
+}
+
+impl Default for GrowwContract1mConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            strikes_each_side: default_groww_contract_1m_strikes_each_side(),
         }
     }
 }
@@ -2377,6 +2433,7 @@ mod tests {
             groww_spot_1m: GrowwSpot1mConfig::default(),
             groww_option_chain_1m: GrowwOptionChain1mConfig::default(),
             tf_consistency: TfConsistencyConfig::default(),
+            groww_contract_1m: GrowwContract1mConfig::default(),
         }
     }
 
@@ -3969,6 +4026,56 @@ mod tests {
             .extract()
             .expect("explicit enabled = true must round-trip");
         assert!(on.tf_consistency.enabled);
+    }
+
+    /// PR-4 (Groww contract leg): the `[groww_contract_1m]` section is
+    /// FAIL-SAFE default OFF — an absent section, an empty section, and an
+    /// older TOML all deserialize to disabled with the pinned ATM-window
+    /// default; explicit values round-trip.
+    #[test]
+    fn test_groww_contract_1m_config_defaults_off_and_round_trips() {
+        use figment::Figment;
+        use figment::providers::{Format, Toml};
+
+        let d = GrowwContract1mConfig::default();
+        assert!(
+            !d.enabled,
+            "groww_contract_1m must default OFF (fail-safe; depends on the chain leg)"
+        );
+        assert_eq!(
+            d.strikes_each_side,
+            crate::constants::GROWW_CONTRACT_1M_DEFAULT_STRIKES_EACH_SIDE,
+            "the ATM window default is the pinned constant"
+        );
+
+        #[derive(Deserialize)]
+        struct Wrapper {
+            #[serde(default)]
+            groww_contract_1m: GrowwContract1mConfig,
+        }
+        // Missing section entirely → disabled, never an error.
+        let missing: Wrapper = Figment::new()
+            .merge(Toml::string("[other]\nx = 1\n"))
+            .extract()
+            .expect("missing [groww_contract_1m] must default, not error");
+        assert!(!missing.groww_contract_1m.enabled);
+        assert_eq!(missing.groww_contract_1m.strikes_each_side, 2);
+        // Empty section (no keys) → field-level defaults.
+        let empty: Wrapper = Figment::new()
+            .merge(Toml::string("[groww_contract_1m]\n"))
+            .extract()
+            .expect("empty [groww_contract_1m] must default, not error");
+        assert!(!empty.groww_contract_1m.enabled);
+        assert_eq!(empty.groww_contract_1m.strikes_each_side, 2);
+        // Explicit values (the future flip shape) round-trip.
+        let on: Wrapper = Figment::new()
+            .merge(Toml::string(
+                "[groww_contract_1m]\nenabled = true\nstrikes_each_side = 1\n",
+            ))
+            .extract()
+            .expect("explicit values must round-trip");
+        assert!(on.groww_contract_1m.enabled);
+        assert_eq!(on.groww_contract_1m.strikes_each_side, 1);
     }
 
     /// A missing `[feeds]` section must fall back to the safe default
