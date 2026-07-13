@@ -453,7 +453,10 @@ fn extract_index_entries(rows: &[GrowwInstrumentRow]) -> Vec<WatchEntry> {
 /// FORBIDDEN (hostile-review round 1, 2026-07-08: `"BANKNIFTY…".contains
 /// ("NIFTY")` mislabeled BANKNIFTY/MIDCPNIFTY as NIFTY → false FUTIDX-02
 /// pages every dual-feed boot).
-#[cfg(feature = "daily_universe_fetcher")]
+///
+/// PR-C1 (2026-07-13): UNCONDITIONAL — the `daily_universe_fetcher` gate was
+/// removed (daily-universe 2026-07-13 banner §(d): the §36.7 Groww futures
+/// mandate must not depend on a build feature).
 #[must_use]
 pub fn extract_index_future_entries(
     rows: &[GrowwInstrumentRow],
@@ -610,7 +613,6 @@ pub fn extract_index_future_entries(
 /// canonical + parsed expiry it was selected under. The parity recorder
 /// consumes `canonical`/`expiry` verbatim — never re-derived from symbol
 /// strings (§36; hostile-review round 1, 2026-07-08).
-#[cfg(feature = "daily_universe_fetcher")]
 #[derive(Debug, Clone)]
 pub struct GrowwIndexFuture {
     /// The live-subscription watch entry (segment `FNO`, kind `Ltp`).
@@ -629,7 +631,6 @@ pub struct GrowwIndexFuture {
 /// FUTIDX-01 runbook promises on BOTH feeds (hostile-review round 1,
 /// 2026-07-08: the Groww emit carried no evidence exactly where symbol
 /// drift is most likely). Cold path, once per degraded activation.
-#[cfg(feature = "daily_universe_fetcher")]
 #[must_use]
 pub fn collect_fut_underlying_symbols_seen(rows: &[GrowwInstrumentRow]) -> Vec<String> {
     use crate::instrument::index_futures::MAX_UNDERLYING_SYMBOLS_EVIDENCE;
@@ -666,7 +667,12 @@ pub fn collect_fut_underlying_symbols_seen(rows: &[GrowwInstrumentRow]) -> Vec<S
 /// day's selection naturally). `None` when the master carries no usable
 /// option row for the underlying (the caller degrades that underlying
 /// for the day — NEVER a guessed expiry). Pure.
-#[cfg(feature = "daily_universe_fetcher")]
+///
+/// De-gated with the PR-C1 FUTIDX de-gate (scope-lock §B): this file
+/// carries ZERO feature-gate attributes (whole-file ratchet
+/// `test_futidx_selector_is_not_feature_gated` arm (c)) — the merged PR-3
+/// gate from #1509 is removed here, matching the unconditional
+/// `canonicalize_index_symbol` dependency.
 #[must_use]
 pub fn select_current_option_expiry(
     rows: &[GrowwInstrumentRow],
@@ -733,7 +739,6 @@ pub async fn download_groww_master_rows() -> Result<Vec<GrowwInstrumentRow>, Wat
 /// O(1) EXEMPT: cold-path daily build only (once per Groww master load),
 /// not the per-tick path. Bounded by the 32-entry allowlist × resolved
 /// NSE index count.
-#[cfg(feature = "daily_universe_fetcher")]
 #[must_use]
 fn groww_indices_absent_vs_dhan(index_entries: &[WatchEntry]) -> Vec<&'static str> {
     use crate::instrument::index_extractor::{NSE_INDEX_ALLOWLIST, canonicalize_index_symbol};
@@ -973,9 +978,8 @@ fn build_groww_watch_from_csvs(
     // FIX C (2026-06-28): audit Groww vs Dhan index coverage. Emit ONE boot
     // line naming the Dhan-tracked indices that Groww's master does not carry
     // as an IDX row, so the genuine Groww limitation is VISIBLE, never silently
-    // dropped. Cold-path, once per master load; feature-gated because the Dhan
-    // `index_extractor` (the allowlist + canonicalizer) lives behind it.
-    #[cfg(feature = "daily_universe_fetcher")]
+    // dropped. Cold-path, once per master load. PR-C1 (2026-07-13):
+    // UNCONDITIONAL — `index_extractor` was de-gated with the §36.7 selector.
     {
         use crate::instrument::index_extractor::NSE_INDEX_ALLOWLIST;
         let absent = groww_indices_absent_vs_dhan(&index_entries);
@@ -1005,8 +1009,9 @@ fn build_groww_watch_from_csvs(
     // §36/§36.7 (2026-07-10): ALL monthly-expiry index futures of the 4
     // underlyings. DEGRADE ONLY —
     // a miss pages FUTIDX-01 (feed=groww) and the watch build stays valid.
-    // Feature-gated because the shared selector lives with the Dhan
-    // instrument modules; the feature is default-ON in the app crate.
+    // PR-C1 (2026-07-13): UNCONDITIONAL — the shared selector was de-gated
+    // (daily-universe 2026-07-13 banner §(d)); the empty-futures
+    // `not(feature)` fallback is DELETED as dead code.
     //
     // Hostile-review round 4 (2026-07-08): this block EXTRACTS only — every
     // §36 emission (FUTIDX-01 errors + counters, boot-evidence lines, the
@@ -1019,7 +1024,6 @@ fn build_groww_watch_from_csvs(
     // divergence re-paged FUTIDX-02 every retry (non-edge-triggered, audit
     // Rule 4 violation), and the matching case logged "parity OK" all day
     // for a feed that subscribed NOTHING (false-OK, audit Rule 11).
-    #[cfg(feature = "daily_universe_fetcher")]
     let (future_entries, future_misses, groww_selection) = {
         let (futures, misses) = extract_index_future_entries(&rows, today_ist);
         // Parity units: the canonical + expiry come VERBATIM from the
@@ -1037,11 +1041,6 @@ fn build_groww_watch_from_csvs(
         }
         let entries = futures.into_iter().map(|f| f.entry).collect::<Vec<_>>();
         (entries, misses, groww_selection)
-    };
-    #[cfg(not(feature = "daily_universe_fetcher"))]
-    let future_entries = {
-        let _ = today_ist; // futures require the shared selector (feature-gated)
-        Vec::<WatchEntry>::new()
     };
 
     // Hostile-review round 2 (2026-07-08): `expected` is the DISTINCT
@@ -1064,8 +1063,8 @@ fn build_groww_watch_from_csvs(
     // §36 emissions — POST-assemble-success ONLY (round 4, see the block
     // comment above): a failed build attempt records/emits NOTHING, so the
     // activation retry loop can never spam FUTIDX-02 or log a false
-    // "parity OK" for a feed that subscribed nothing.
-    #[cfg(feature = "daily_universe_fetcher")]
+    // "parity OK" for a feed that subscribed nothing. PR-C1 (2026-07-13):
+    // UNCONDITIONAL (the de-gate).
     {
         use tickvault_common::error_code::ErrorCode;
         if !future_misses.is_empty() {
@@ -1146,8 +1145,6 @@ fn build_groww_watch_from_csvs(
                 .increment((expected_futures - live_futures) as u64);
         }
     }
-    #[cfg(not(feature = "daily_universe_fetcher"))]
-    let _ = (raw_futures, expected_futures);
     Ok(set)
 }
 
@@ -2063,7 +2060,6 @@ mod tests {
     // NOT publish as an IDX row (genuine Groww limitation). Canonical
     // (allowlist) spelling — the assertion is canonicalized so it is resilient
     // to whitespace/alias differences.
-    #[cfg(feature = "daily_universe_fetcher")]
     const KNOWN_ABSENT_ON_GROWW: &[&str] = &[
         "NIFTY 200",
         "GIFTNIFTY",
@@ -2077,7 +2073,6 @@ mod tests {
         "NIFTY MICROCAP250",
     ];
 
-    #[cfg(feature = "daily_universe_fetcher")]
     #[test]
     fn test_groww_indices_absent_vs_dhan_is_exactly_the_ten() {
         use crate::instrument::index_extractor::{NSE_INDEX_ALLOWLIST, canonicalize_index_symbol};
@@ -2138,7 +2133,6 @@ mod tests {
     /// audit (token-only) would falsely flag ~22 of these absent → the live
     /// `absent_on_groww=28` bug. This is the regression the synthetic FIX-C test
     /// missed (it fed allowlist-spelled tokens, so token-only matched trivially).
-    #[cfg(feature = "daily_universe_fetcher")]
     const REAL_GROWW_NSE_INDICES: &[(&str, &str)] = &[
         ("NIFTY", "NIFTY 50"),
         ("BANKNIFTY", "NIFTY Bank"),
@@ -2166,7 +2160,6 @@ mod tests {
         ("NIFTYTOTALMCAP", "Nifty Total Market"),
     ];
 
-    #[cfg(feature = "daily_universe_fetcher")]
     #[test]
     fn test_groww_indices_absent_vs_dhan_is_exactly_the_ten_real_spellings() {
         use crate::instrument::index_extractor::canonicalize_index_symbol;
@@ -2209,7 +2202,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "daily_universe_fetcher")]
     #[test]
     fn test_groww_indices_absent_vs_dhan_empty_when_full_coverage() {
         use crate::instrument::index_extractor::NSE_INDEX_ALLOWLIST;
@@ -2272,7 +2264,6 @@ mod tests {
 
     /// Option-row struct literal for the expiry-selection tests (PR-3):
     /// the chain leg's expiry source is the master's CE/PE rows.
-    #[cfg(feature = "daily_universe_fetcher")]
     fn option_row(
         exchange: &str,
         underlying: &str,
@@ -2296,7 +2287,6 @@ mod tests {
     /// The chain leg's expiry selection: nearest CE/PE expiry at-or-after
     /// today, per (exchange, canonical underlying) — FUT rows and other
     /// underlyings/exchanges never leak in; malformed expiries skip.
-    #[cfg(feature = "daily_universe_fetcher")]
     #[test]
     fn test_select_current_option_expiry_nearest_at_or_after_today() {
         let today = chrono::NaiveDate::from_ymd_opt(2026, 7, 13).expect("date");
@@ -2342,7 +2332,6 @@ mod tests {
     /// trading day (T+1) rolls to the next listed expiry naturally; a
     /// master whose every expiry is past yields None (degrade, never a
     /// guess) — as does a master with NO option rows for the underlying.
-    #[cfg(feature = "daily_universe_fetcher")]
     #[test]
     fn test_select_current_option_expiry_expiry_day_t0_holds_t1_rolls() {
         let rows = vec![
@@ -2373,7 +2362,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "daily_universe_fetcher")]
     #[test]
     fn test_groww_row_missing_new_headers_degrades_not_fails_master() {
         // A master WITHOUT the underlying_symbol/expiry_date columns still
@@ -2394,7 +2382,6 @@ mod tests {
         assert_eq!(misses.len(), 4, "all 4 underlyings degrade — build valid");
     }
 
-    #[cfg(feature = "daily_universe_fetcher")]
     #[test]
     fn test_extract_index_future_entries_records_exact_canonicals() {
         // Hostile-review round 1 (2026-07-08) regression: the parity
@@ -2421,7 +2408,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "daily_universe_fetcher")]
     #[test]
     fn test_extract_index_future_entries_bad_token_reason_is_bad_native_token() {
         // Hostile-review round 1: all candidates token-invalid with VALID
@@ -2438,7 +2424,6 @@ mod tests {
         }));
     }
 
-    #[cfg(feature = "daily_universe_fetcher")]
     #[test]
     fn test_collect_fut_underlying_symbols_seen_bounded_distinct() {
         // The Groww FUTIDX-01 evidence mirror: distinct FUT/FNO
@@ -2455,7 +2440,6 @@ mod tests {
         assert_eq!(seen, vec!["NIFTY".to_string(), "MIDCPNIFTY".to_string()]);
     }
 
-    #[cfg(feature = "daily_universe_fetcher")]
     #[test]
     fn test_extract_index_future_entries_takes_all_months_four_underlyings() {
         // §36.7: 2 expiries per underlying → 8 entries (BOTH months per
@@ -2496,7 +2480,6 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "daily_universe_fetcher")]
     #[test]
     fn test_extract_index_future_entries_sensex_on_bse_others_nse() {
         // A (bogus) NSE-listed SENSEX future must be skipped; the BSE row wins.
@@ -2521,7 +2504,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "daily_universe_fetcher")]
     #[test]
     fn test_extract_index_future_entries_uses_underlying_symbol_not_trading_symbol() {
         // Row A: NIFTY-looking trading_symbol but underlying FINNIFTY → NOT
@@ -2541,7 +2523,6 @@ mod tests {
         assert_eq!(entries[0].canonical, "NIFTY");
     }
 
-    #[cfg(feature = "daily_universe_fetcher")]
     #[test]
     fn test_extract_index_future_entries_missing_underlying_degrades() {
         // Only 3 of 4 present → 3 entries + 1 whole-underlying miss
@@ -2560,7 +2541,6 @@ mod tests {
         assert_eq!(misses[0].expiry, None, "whole-underlying miss");
     }
 
-    #[cfg(feature = "daily_universe_fetcher")]
     #[test]
     fn test_extract_index_future_entries_ambiguous_duplicate_fails_closed() {
         // Two NIFTY FUT rows at the SAME chosen expiry, different tokens →
@@ -2591,7 +2571,6 @@ mod tests {
     /// master line (SAME exchange_token at the chosen expiry) collapses
     /// first-row-wins — never classified ambiguous; only truly-distinct
     /// tokens at the same expiry stay fail-closed (previous test above).
-    #[cfg(feature = "daily_universe_fetcher")]
     #[test]
     fn test_extract_dedups_exact_duplicate_token_before_ambiguity() {
         let csv = format!(
@@ -2616,7 +2595,6 @@ mod tests {
     /// a same-(underlying, expiry) candidate flood beyond
     /// `FUTIDX_SAME_EXPIRY_CANDIDATE_CAP` degrades fail-closed with its own
     /// reason; corrupt vendor data is never processed.
-    #[cfg(feature = "daily_universe_fetcher")]
     #[test]
     fn test_extract_flood_beyond_cap_degrades_fail_closed() {
         use crate::instrument::index_futures::FUTIDX_SAME_EXPIRY_CANDIDATE_CAP;
@@ -2654,7 +2632,6 @@ mod tests {
     /// §36.7: more distinct future expiries than the envelope allows =
     /// corrupt/flooded master → the WHOLE underlying degrades fail-closed;
     /// the other 3 underlyings are intact.
-    #[cfg(feature = "daily_universe_fetcher")]
     #[test]
     fn test_extract_monthly_serial_flood_degrades_whole_underlying() {
         use crate::instrument::index_futures::IndexFutureMissReason;
@@ -2688,7 +2665,6 @@ mod tests {
         }));
     }
 
-    #[cfg(feature = "daily_universe_fetcher")]
     #[test]
     fn test_extract_index_future_entries_never_rolls_on_expiry_day() {
         // T-0: today == the near expiry → the EXPIRING month stays chosen
@@ -2721,7 +2697,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "daily_universe_fetcher")]
     #[test]
     fn test_watch_set_includes_every_monthly_fno_future() {
         // End-to-end (§36.7): indices + stocks + 2 months × 4 FNO futures;

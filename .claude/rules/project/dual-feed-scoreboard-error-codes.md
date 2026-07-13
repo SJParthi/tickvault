@@ -54,14 +54,18 @@ typed record of every degraded leg of that aggregation.
 > honestly to Groww-singleton slots (every slot one-sided); `unique_win_minutes` /
 > `both_minutes` on the Groww row follow the documented one-horse semantics.
 >
-> **Honest obligation — Phase C acceptance criterion, NOT resolved here:** (b) and (c)
-> are in tension AFTER the Phase C rewire — the rewired order-update WS still writes
-> Dhan-feed `ws_event_audit` lifecycle rows, and an IN-SESSION order-update reconnect row
-> is an up-kind row inside the session window that could defeat the round-6 `feed_off`
-> classification (which requires ZERO session up-rows) for the permanently-off Dhan
-> feed. The Phase C rewire PR MUST either exclude order-update
-> (`ws_type='order_update'`) rows from the `feed_off` detection or re-scope the Dhan
-> daily row — flagged as a Phase C acceptance criterion.
+> **Honest obligation — Phase C acceptance criterion, CLOSED in PR-C1 (2026-07-13):**
+> (b) and (c) were in tension AFTER the Phase C rewire — the rewired order-update WS
+> still writes Dhan-feed `ws_event_audit` lifecycle rows, and an IN-SESSION order-update
+> reconnect row is an up-kind row inside the session window that could defeat the
+> round-6 `feed_off` classification (which requires ZERO session up-rows) for the
+> permanently-off Dhan feed. **CLOSED:** PR-C1 (the same PR that ships the Q4-i
+> order-update rewire) gates the feed_off up-signals on the existing
+> `is_market_data_ws_type()` allowlist — `is_session_up_row`, `is_pre_session_up_row`
+> AND the `any_up` fold all exclude `ws_type='order_update'` rows, pinned by
+> `test_is_session_up_row_ignores_order_update_ws` +
+> `test_is_pre_session_up_row_ignores_order_update_ws`. Episode ROWS for order_update
+> are still persisted for forensics; only the up-signal classification filters.
 
 ## §1. SCOREBOARD-01 — daily scoreboard aggregation degraded
 

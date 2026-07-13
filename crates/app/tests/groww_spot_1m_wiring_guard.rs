@@ -203,6 +203,20 @@ fn ratchet_groww_spot1m_boot_module_is_not_a_stub() {
         "tv_groww_spot1m_ts_form_total",
         // The close→data honesty histogram (operator Quote 2).
         "tv_groww_spot1m_close_to_data_ms",
+        // 2026-07-13 (operator scope, §38.7): the 4th spot target — INDIA
+        // VIX — is RUNTIME-resolved from the day's Groww master (never a
+        // guessed literal), per-SID independent (the escalation edge keys
+        // on the CORE tally), with the daily "not served" latch + the
+        // VIX-specific counters. Losing any of these re-opens the
+        // silent-VIX hole.
+        "vix_target_from_watch_doc(",
+        "ensure_vix_target(",
+        "MinuteEdgeTally",
+        "vix_not_served_verdict(",
+        "tv_groww_spot1m_vix_unresolved_total",
+        "tv_groww_spot1m_vix_empty_total",
+        "tv_groww_spot1m_vix_not_served_total",
+        "GROWW_SPOT_1M_VIX_SYMBOL",
     ] {
         assert!(
             module_src.contains(needle),

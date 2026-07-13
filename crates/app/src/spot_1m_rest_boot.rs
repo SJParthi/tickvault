@@ -4,8 +4,11 @@
 //! Every trading-day minute close in session — the 09:15 candle closes at
 //! 09:16:00 IST; the last (15:29) candle closes at 15:30:00 — this task
 //! wakes shortly after the boundary and fetches THAT just-closed minute's
-//! official 1m OHLCV for the 3 IDX_I spot indices (NIFTY 13, BANKNIFTY 25,
-//! SENSEX 51) via Dhan `POST /v2/charts/intraday` (interval `"1"`), then
+//! official 1m OHLCV for the 4 IDX_I spot indices (NIFTY 13, BANKNIFTY 25,
+//! SENSEX 51, INDIA VIX 21 — VIX per the operator scope addition
+//! 2026-07-13, relayed via the coordinator session: INDIA VIX joins the
+//! spot 1m pull, SPOT ONLY, no option chain) via Dhan
+//! `POST /v2/charts/intraday` (interval `"1"`), then
 //! persists to the `spot_1m_rest` QuestDB table (DEDUP-idempotent — a
 //! re-fetch UPSERTs in place). Cold path ONLY: the WS candle pipeline,
 //! tick capture and trading are untouched.
@@ -48,9 +51,13 @@
 //!    failed flush — stays absent DURING the session; and the 15:30:00
 //!    fire is the last, so a vendor-late 15:29 candle has no in-session
 //!    repair path at all. The one bounded post-session sweep
-//!    (~15:31:00 IST, single fire, [`run_post_session_sweep`]) closes all
+//!    (~15:33:30 IST, single fire, [`run_post_session_sweep`]) closes all
 //!    three: it re-fetches the day window once per SID and persists every
-//!    session minute above the watermark that is still missing.
+//!    session minute above the watermark that is still missing. The sweep
+//!    fires at 15:33:30 — NOT 15:31 — so its ≤4 requests clear the 15:31
+//!    bulk cross-verify's burst window (2026-07-13 live session: 91/776
+//!    cross-verify fetches 429'd at 15:31–15:33; see the 429-coordination
+//!    follow-up in `rest-1m-pipeline-error-codes.md`).
 //!
 //! **First-attempt timing (honest):** the boundary sleep is computed on a
 //! SECOND-granular clock plus the 300 ms fire delay, so the first attempt
@@ -63,10 +70,33 @@
 //! into the failure edge — never silent (Rule 11).
 //!
 //! ## Rate budget (Dhan Data-API 5/sec)
-//! One fire = 3 concurrent requests (one per index), plus at most 4 ladder
-//! re-polls per index spread over ~6 s — worst case 3 requests at any one
-//! ladder instant, comfortably inside the 5/sec Data-API budget and the
-//! prev-day fetcher's 4/sec headroom assumption (Q2/Q3 2026-06-23 lesson).
+//! One fire = 4 concurrent requests (one per index), plus at most 4 ladder
+//! re-polls per index spread over ~6 s and staggered by the deterministic
+//! per-SID jitter (0/150/300/450 ms) — worst case 4 requests at the fire
+//! instant, inside the 5/sec Data-API budget (verified for the 2026-07-13
+//! 4-SID arity; re-poll instants never exceed the initial burst).
+//!
+//! ## INDIA VIX (2026-07-13) — live-probe unknown, per-SID independence
+//! Whether Dhan's intraday endpoint serves INDIA VIX 1m candles at all is
+//! a LIVE-PROBE UNKNOWN. Two guarantees keep that honest:
+//! 1. **Per-SID independence** — each SID rides its OWN budgeted ladder in
+//!    its OWN JoinSet task, and the escalation edge's "fully failed" means
+//!    ZERO SIDs succeeded ([`minute_fully_failed`]) — a never-serving VIX
+//!    can never delay, fail, or edge-count a minute where the other 3
+//!    succeeded (unit-pinned below).
+//! 2. **Per-SID persistent-empty detector** ([`SidServedTracker`]) — a SID
+//!    accumulating [`SPOT_1M_REST_SID_NOT_SERVED_THRESHOLD`] consecutive
+//!    empty/failed minutes WHILE ≥1 other SID succeeded in those same
+//!    minutes (vendor-not-serving, NOT a global outage) fires ONE
+//!    edge-latched `SPOT1M-01 stage="sid_not_served"` page per SID
+//!    (re-armed only by that SID's own recovery — one Info ping).
+//!
+//! ## Volume (index candles)
+//! Index candles legitimately carry zero/absent volume — the columnar
+//! parser defaults an absent `volume` to `0` and NOTHING in this module
+//! treats `volume == 0` as an error: a candle is "served" purely by its
+//! presence at the target minute (OHLC), so VIX/index rows with volume 0
+//! persist normally.
 //!
 //! ## Boot wiring (honest answer, module contract)
 //! Spawned from `main.rs::spawn_post_market_tasks` — the SAME seam as the
@@ -107,10 +137,13 @@ use tracing::{error, info, warn};
 use tickvault_common::config::QuestDbConfig;
 use tickvault_common::constants::{
     DHAN_CHARTS_INTRADAY_PATH, IST_UTC_OFFSET_SECONDS, SECONDS_PER_DAY,
-    SPOT_1M_REST_CONSECUTIVE_FAIL_PAGE_THRESHOLD, SPOT_1M_REST_FIRE_DELAY_MS,
-    SPOT_1M_REST_FIRE_STALE_GRACE_SECS, SPOT_1M_REST_FIRST_FIRE_SECS_OF_DAY_IST,
-    SPOT_1M_REST_INDICES, SPOT_1M_REST_LAST_FIRE_SECS_OF_DAY_IST, SPOT_1M_REST_MAX_BODY_BYTES,
+    SPOT_1M_REST_429_EXTRA_BACKOFF_MS, SPOT_1M_REST_CONSECUTIVE_FAIL_PAGE_THRESHOLD,
+    SPOT_1M_REST_FIRE_DELAY_MS, SPOT_1M_REST_FIRE_STALE_GRACE_SECS,
+    SPOT_1M_REST_FIRST_FIRE_SECS_OF_DAY_IST, SPOT_1M_REST_INDICES,
+    SPOT_1M_REST_LADDER_JITTER_SLOTS, SPOT_1M_REST_LADDER_JITTER_STEP_MS,
+    SPOT_1M_REST_LAST_FIRE_SECS_OF_DAY_IST, SPOT_1M_REST_MAX_BODY_BYTES,
     SPOT_1M_REST_REQUEST_TIMEOUT_SECS, SPOT_1M_REST_RETRY_OFFSETS_MS, SPOT_1M_REST_SID_BUDGET_SECS,
+    SPOT_1M_REST_SID_NOT_SERVED_THRESHOLD,
 };
 use tickvault_common::error_code::ErrorCode;
 use tickvault_common::sanitize::{capture_rest_error_body, redact_url_params};
@@ -124,7 +157,7 @@ use tickvault_storage::spot_1m_rest_persistence::{
     SPOT_1M_REST_SEGMENT_IDX_I, Spot1mRestRow, Spot1mRestWriter, ensure_spot_1m_rest_table,
 };
 
-use crate::cross_verify_1m_boot::{MinuteCandle, intraday_request_body, parse_intraday_1m_candles};
+use crate::dhan_intraday_parse::{MinuteCandle, intraday_request_body, parse_intraday_1m_candles};
 
 /// Dhan `instrument` enum value for IDX_I index rows.
 const SPOT_1M_INSTRUMENT_INDEX: &str = "INDEX";
@@ -314,13 +347,32 @@ pub fn backfill_minute_nanos(
     (prev >= session_first_minute_nanos && last_persisted.is_none_or(|l| l < prev)).then_some(prev)
 }
 
-/// Post-session sweep instant, IST seconds-of-day: 15:31:00 — one minute
-/// after the last (15:30:00) fire, once the whole session is final. The
-/// single bounded sweep re-fetches the day window ONCE per SID and
-/// backfills every session minute above the persisted watermark that is
-/// still missing (M1, review 2026-07-13: the 15:30:00 fire is the LAST, so
-/// a vendor-late 15:29 candle had no repair path).
-const SPOT_1M_REST_SWEEP_FIRE_SECS_OF_DAY_IST: u32 = 15 * 3600 + 31 * 60;
+/// Post-session sweep instant, IST seconds-of-day: 15:33:30 — after the
+/// last (15:30:00) fire, once the whole session is final. The single
+/// bounded sweep re-fetches the day window ONCE per SID and backfills
+/// every session minute above the persisted watermark that is still
+/// missing (M1, review 2026-07-13: the 15:30:00 fire is the LAST, so a
+/// vendor-late 15:29 candle had no repair path).
+///
+/// 429-coordination (2026-07-13, same-day follow-up): moved from 15:31:00
+/// to 15:33:30 so the sweep's ≤4 requests land AFTER the 15:31 bulk
+/// cross-verify's observed 429 burst window (live session 2026-07-13:
+/// 91/776 cross-verify fetches failed HTTP 429 between 15:31 and 15:33).
+/// The const-assert below pins the sweep strictly clear of that window.
+const SPOT_1M_REST_SWEEP_FIRE_SECS_OF_DAY_IST: u32 = 15 * 3600 + 33 * 60 + 30;
+
+// The sweep must clear the cross-verify burst: at least 150 s after the
+// 15:31:00 cross-verify trigger (burst observed through 15:33), and still
+// comfortably before the 16:30 IST box stop.
+const _: () = assert!(
+    SPOT_1M_REST_SWEEP_FIRE_SECS_OF_DAY_IST
+        >= crate::cross_verify_1m_boot::CROSS_VERIFY_TRIGGER_SECS_OF_DAY_IST + 150,
+    "post-session sweep must clear the 15:31-15:33 cross-verify burst window"
+);
+const _: () = assert!(
+    SPOT_1M_REST_SWEEP_FIRE_SECS_OF_DAY_IST < 16 * 3600 + 30 * 60,
+    "post-session sweep must fire before the 16:30 IST box stop"
+);
 
 /// All session minutes STILL MISSING above the persisted watermark at
 /// sweep time: `(watermark, session_last]` step one minute (the whole
@@ -385,6 +437,41 @@ pub fn retry_sleep_deltas_ms() -> [u64; 4] {
         o[2].saturating_sub(o[1]),
         o[3].saturating_sub(o[2]),
     ]
+}
+
+/// Deterministic per-SID ladder jitter (ms) for the SID at `slot` in the
+/// pinned [`SPOT_1M_REST_INDICES`] array: `(slot % slots) × step` → 0 /
+/// 150 / 300 / 450 ms for the 4 spot SIDs. The slot (a SID's fixed position in
+/// the const array) is used instead of `sid % 3` because the pinned SIDs
+/// 13/25/51 give `1/1/0` under `% 3` — two of three would still re-poll in
+/// lockstep. NO randomness — deterministic + testable (429-coordination
+/// follow-up 2026-07-13). Pure.
+#[must_use]
+pub fn ladder_jitter_ms(slot: usize) -> u64 {
+    (slot as u64 % SPOT_1M_REST_LADDER_JITTER_SLOTS) * SPOT_1M_REST_LADDER_JITTER_STEP_MS
+}
+
+/// The sleep (ms) before one ladder re-poll: the schedule delta, plus the
+/// per-SID jitter on the FIRST re-poll only (shifting the whole schedule —
+/// later deltas are relative, so the shift carries through), plus the
+/// bounded [`SPOT_1M_REST_429_EXTRA_BACKOFF_MS`] when the PREVIOUS attempt
+/// was rate-limited (HTTP 429) so the next poll never lands straight back
+/// inside Dhan's rate-limit window. Pure — worst-case totals are
+/// const-asserted inside the hard per-SID budget in `constants.rs`.
+#[must_use]
+pub fn ladder_sleep_ms(
+    base_delta_ms: u64,
+    is_first_repoll: bool,
+    jitter_ms: u64,
+    prev_rate_limited: bool,
+) -> u64 {
+    base_delta_ms
+        .saturating_add(if is_first_repoll { jitter_ms } else { 0 })
+        .saturating_add(if prev_rate_limited {
+            SPOT_1M_REST_429_EXTRA_BACKOFF_MS
+        } else {
+            0
+        })
 }
 
 /// IST 12-hour label for a seconds-of-day instant (Telegram commandment 9
@@ -454,6 +541,101 @@ impl FailureEdge {
                 EdgeAction::None
             }
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Pure per-SID not-served detector (2026-07-13 — the INDIA VIX live-probe
+// companion; operator scope addition 2026-07-13, relayed via the
+// coordinator session)
+// ---------------------------------------------------------------------------
+
+/// What the caller must do for ONE SID after recording a minute's per-SID
+/// served verdicts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SidEdgeAction {
+    /// Nothing to page for this SID this minute.
+    None,
+    /// RISING edge: this SID reached
+    /// [`SPOT_1M_REST_SID_NOT_SERVED_THRESHOLD`] consecutive counted
+    /// not-served minutes (each with ≥1 sibling success) — page ONCE
+    /// (High), latched until this SID's own recovery.
+    Page { consecutive: u32 },
+    /// FALLING edge: a paged SID was served again — one Info ping; the
+    /// latch re-arms.
+    Recover { not_served_minutes: u32 },
+}
+
+/// Per-SID persistent-empty state: consecutive COUNTED not-served minutes
+/// + the page latch.
+#[derive(Debug, Default)]
+struct SidServedState {
+    consecutive_not_served: u32,
+    paged: bool,
+}
+
+/// Per-SID "is the vendor serving this index?" tracker. Distinguishes
+/// vendor-not-serving-ONE-index from a global outage:
+///
+/// | This minute, this SID | ≥1 OTHER SID served? | Effect on this SID |
+/// |---|---|---|
+/// | served (own-minute candle retrieved) | — | streak reset; `Recover` if paged |
+/// | not served | yes | streak +1; `Page` once at the threshold |
+/// | not served | no (global outage) | HOLD — neither counts nor resets |
+///
+/// The global-outage HOLD keeps the two signals disjoint: a full outage is
+/// the [`FailureEdge`]'s page, and a mid-streak global blip can neither
+/// inflate nor launder a genuine vendor-not-serving streak. Pure state
+/// machine — unit-tested without a clock. State is per scheduler run
+/// (session-scoped, same envelope as [`FailureEdge`] — a task respawn
+/// restarts the streak).
+#[derive(Debug, Default)]
+pub struct SidServedTracker {
+    per_sid: HashMap<SecurityId, SidServedState>,
+}
+
+impl SidServedTracker {
+    /// Record one fired minute's per-SID served verdicts (`served` = the
+    /// SID's OWN target-minute candle was retrieved this fire) and return
+    /// one action per input SID, index-aligned with `verdicts`.
+    pub fn record_minute(
+        &mut self,
+        verdicts: &[(SecurityId, bool)],
+    ) -> Vec<(SecurityId, SidEdgeAction)> {
+        let any_served = verdicts.iter().any(|&(_, served)| served);
+        verdicts
+            .iter()
+            .map(|&(sid, served)| {
+                let state = self.per_sid.entry(sid).or_default();
+                let action = if served {
+                    let not_served_minutes = state.consecutive_not_served;
+                    let was_paged = state.paged;
+                    state.consecutive_not_served = 0;
+                    state.paged = false;
+                    if was_paged {
+                        SidEdgeAction::Recover { not_served_minutes }
+                    } else {
+                        SidEdgeAction::None
+                    }
+                } else if any_served {
+                    state.consecutive_not_served = state.consecutive_not_served.saturating_add(1);
+                    if !state.paged
+                        && state.consecutive_not_served >= SPOT_1M_REST_SID_NOT_SERVED_THRESHOLD
+                    {
+                        state.paged = true;
+                        SidEdgeAction::Page {
+                            consecutive: state.consecutive_not_served,
+                        }
+                    } else {
+                        SidEdgeAction::None
+                    }
+                } else {
+                    // Global-outage minute (no SID served): HOLD.
+                    SidEdgeAction::None
+                };
+                (sid, action)
+            })
+            .collect()
     }
 }
 
@@ -612,13 +794,18 @@ async fn spot_1m_fetch_once(
 }
 
 /// Bounded in-minute re-poll ladder for ONE index: first attempt at the
-/// fire instant, then re-polls at [`SPOT_1M_REST_RETRY_OFFSETS_MS`] until
-/// the target minute's candle appears — after the last offset the minute
-/// is `Empty`/`Failed`, never an unbounded in-minute retry (DH-904/429
-/// counts via the REAL `StatusCode` + falls out of the ladder like any
-/// other error). The WHOLE ladder is additionally hard-bounded by
-/// [`SPOT_1M_REST_SID_BUDGET_SECS`] in [`fetch_minute_bounded`] so no
-/// stall combination can overrun the minute (2026-07-12 H2 fix).
+/// fire instant, then re-polls at [`SPOT_1M_REST_RETRY_OFFSETS_MS`] (the
+/// whole schedule shifted by the deterministic per-SID `jitter_ms` so the
+/// 3 SIDs never re-poll in lockstep) until the target minute's candle
+/// appears — after the last offset the minute is `Empty`/`Failed`, never
+/// an unbounded in-minute retry. DH-904/429 counts via the REAL
+/// `StatusCode` AND adds the bounded extra backoff before the NEXT rung
+/// ([`ladder_sleep_ms`]) — same rung count, never an extra retry
+/// (429-coordination follow-up 2026-07-13). The WHOLE ladder is
+/// additionally hard-bounded by [`SPOT_1M_REST_SID_BUDGET_SECS`] in
+/// [`fetch_minute_bounded`] so no stall combination can overrun the
+/// minute (2026-07-12 H2 fix).
+#[allow(clippy::too_many_arguments)] // APPROVED: private ladder — a struct would be pure ceremony
 async fn fetch_minute_with_ladder(
     client: &reqwest::Client,
     url: &str,
@@ -627,15 +814,23 @@ async fn fetch_minute_with_ladder(
     target_minute_ist_nanos: i64,
     backfill_minute_ist_nanos: Option<i64>,
     minute_close_ms_of_day: i64,
+    jitter_ms: u64,
 ) -> SidFetchOutcome {
     let deltas = retry_sleep_deltas_ms();
     let mut last_error: Option<String> = None;
+    let mut prev_rate_limited = false;
     // Sticky: the FIRST 2xx body carrying the due backfill minute wins —
     // preserved across rungs and across a failing own-minute verdict.
     let mut backfill_found: Option<MinuteCandle> = None;
     for attempt in 0..=deltas.len() {
         if attempt > 0 {
-            tokio::time::sleep(Duration::from_millis(deltas[attempt - 1])).await;
+            let sleep_ms = ladder_sleep_ms(
+                deltas[attempt - 1],
+                attempt == 1,
+                jitter_ms,
+                prev_rate_limited,
+            );
+            tokio::time::sleep(Duration::from_millis(sleep_ms)).await;
         }
         let started = std::time::Instant::now();
         let result = spot_1m_fetch_once(client, url, jwt.expose_secret(), body).await;
@@ -663,12 +858,15 @@ async fn fetch_minute_with_ladder(
                 // 2xx without the target minute — the seal may not have
                 // landed yet; the next ladder rung re-polls.
                 last_error = None;
+                prev_rate_limited = false;
             }
             Err(failure) => {
                 if failure.rate_limited {
-                    // DH-904 class: counted; NEVER retried past the ladder.
+                    // DH-904 class: counted; the NEXT rung waits the extra
+                    // bounded backoff; NEVER retried past the ladder.
                     metrics::counter!("tv_spot1m_rate_limited_total").increment(1);
                 }
+                prev_rate_limited = failure.rate_limited;
                 last_error = Some(failure.msg);
             }
         }
@@ -689,6 +887,7 @@ async fn fetch_minute_with_ladder(
 /// failure for the minute — the fire can never overrun the next boundary
 /// (the const-asserts in `constants.rs` pin the budget < 60 s including
 /// the per-request timeout).
+#[allow(clippy::too_many_arguments)] // APPROVED: private budget wrapper over the ladder — same rationale
 async fn fetch_minute_bounded(
     client: &reqwest::Client,
     url: &str,
@@ -697,6 +896,7 @@ async fn fetch_minute_bounded(
     target_minute_ist_nanos: i64,
     backfill_minute_ist_nanos: Option<i64>,
     minute_close_ms_of_day: i64,
+    jitter_ms: u64,
 ) -> SidFetchOutcome {
     match tokio::time::timeout(
         Duration::from_secs(SPOT_1M_REST_SID_BUDGET_SECS),
@@ -708,6 +908,7 @@ async fn fetch_minute_bounded(
             target_minute_ist_nanos,
             backfill_minute_ist_nanos,
             minute_close_ms_of_day,
+            jitter_ms,
         ),
     )
     .await
@@ -766,6 +967,8 @@ pub async fn run_spot_1m_rest(params: Spot1mRestTaskParams) {
     };
     let mut writer = Spot1mRestWriter::new(&params.questdb);
     let mut edge = FailureEdge::default();
+    // 2026-07-13 VIX companion: per-SID vendor-not-serving detector.
+    let mut sid_tracker = SidServedTracker::default();
     // 2026-07-13 backfill sweep: per-SID latest PERSISTED minute — drives
     // the previous-minute repair on every fire.
     let mut tracker = PersistTracker::default();
@@ -829,6 +1032,7 @@ pub async fn run_spot_1m_rest(params: Spot1mRestTaskParams) {
             &url,
             &mut writer,
             &mut edge,
+            &mut sid_tracker,
             &mut tracker,
             fire,
         )
@@ -930,19 +1134,21 @@ fn build_spot_1m_row(
     }
 }
 
-/// One minute-close fire: 3 concurrent ladder fetches (each carrying the
+/// One minute-close fire: 4 concurrent ladder fetches (each carrying the
 /// full-day proven window) → persist the target minute AND the
 /// previous-minute backfill when due → counters → edge accounting.
 /// Failures are coalesced to ONE coded log per fire. Edge honesty: the
 /// verdict is the OWN target minute's fetch + persist — a backfill hit
 /// never counts as this fire's `ok` (a minute that lands only via
 /// next-fire backfill was still that fire's failure).
+#[allow(clippy::too_many_arguments)] // APPROVED: private fire sink over the run loop's owned state — a struct would be pure ceremony
 async fn fire_one_minute(
     params: &Spot1mRestTaskParams,
     client: &reqwest::Client,
     url: &str,
     writer: &mut Spot1mRestWriter,
     edge: &mut FailureEdge,
+    sid_tracker: &mut SidServedTracker,
     tracker: &mut PersistTracker,
     fire_secs_of_day: u32,
 ) {
@@ -972,6 +1178,12 @@ async fn fire_one_minute(
     // flush confirms (a failed flush discards the buffer — never a false
     // watermark advance).
     let mut staged: Vec<(SecurityId, i64)> = Vec::new();
+    // 2026-07-13 VIX companion: per-SID served verdicts for THIS minute
+    // (served = the SID's OWN target-minute candle was retrieved). A
+    // join-failed task leaves its SID unrecorded (HOLD); the no-token arm
+    // records nothing (a global miss — the detector deliberately never
+    // counts it).
+    let mut sid_verdicts: Vec<(SecurityId, &'static str, bool)> = Vec::new();
 
     if let Some(jwt) = jwt {
         let target_nanos = minute_open_ist_nanos(trading_date, minute_open_secs);
@@ -980,7 +1192,7 @@ async fn fire_one_minute(
         let minute_close_ms = i64::from(fire_secs_of_day).saturating_mul(MILLIS_PER_SEC);
 
         let mut join_set = tokio::task::JoinSet::new();
-        for (security_id, symbol) in SPOT_1M_REST_INDICES {
+        for (slot, (security_id, symbol)) in SPOT_1M_REST_INDICES.into_iter().enumerate() {
             let client = client.clone();
             let url = url.to_string();
             let jwt = jwt.clone();
@@ -992,6 +1204,9 @@ async fn fire_one_minute(
                 target_nanos,
                 session_first_nanos,
             );
+            // 429-coordination (2026-07-13): deterministic per-SID schedule
+            // shift so the 3 concurrent ladders never re-poll in lockstep.
+            let jitter_ms = ladder_jitter_ms(slot);
             join_set.spawn(async move {
                 let outcome = fetch_minute_bounded(
                     &client,
@@ -1001,6 +1216,7 @@ async fn fire_one_minute(
                     target_nanos,
                     backfill_nanos,
                     minute_close_ms,
+                    jitter_ms,
                 )
                 .await;
                 (security_id, symbol, outcome)
@@ -1049,6 +1265,7 @@ async fn fire_one_minute(
                     (None, backfill_candle)
                 }
             };
+            sid_verdicts.push((security_id, symbol, own_outcome.is_some()));
             if let Some((candle, close_to_data_ms)) = own_outcome {
                 ok_count = ok_count.saturating_add(1);
                 metrics::counter!("tv_spot1m_fetch_total", "outcome" => "ok").increment(1);
@@ -1155,6 +1372,7 @@ async fn fire_one_minute(
         persist_failed,
         sample_failure.as_deref(),
     );
+    record_sid_served_verdicts(params, sid_tracker, &sid_verdicts, &minute_label);
 }
 
 /// M1 (2026-07-12): the edge's "fully failed" verdict for one fired
@@ -1165,13 +1383,16 @@ pub fn minute_fully_failed(ok_count: usize, persist_failed: bool) -> bool {
     ok_count == 0 || persist_failed
 }
 
-/// ONE bounded post-session repair sweep (~15:31:00 IST, single fire —
-/// M1, review 2026-07-13): once the session is final, re-fetch the proven
+/// ONE bounded post-session repair sweep (~15:33:30 IST, single fire —
+/// M1, review 2026-07-13; moved off 15:31 the same day so it clears the
+/// bulk cross-verify's observed 15:31–15:33 429 burst window): once the
+/// session is final, re-fetch the proven
 /// day window ONCE per SID that still has session minutes above its
 /// persisted watermark (the 15:29 candle after a vendor-late seal, a
 /// flush-failed backfill row, any tail gap the per-minute one-minute
-/// lookback could not reach) and persist every one found. Bounded: ≤3
-/// requests total, ≤375 minutes/SID, DEDUP-idempotent re-appends; loud
+/// lookback could not reach) and persist every one found. Bounded: ≤4
+/// requests total (one per pinned SID since the 2026-07-13 VIX addition),
+/// ≤375 minutes/SID, DEDUP-idempotent re-appends; loud
 /// counters (`tv_spot1m_sweep_backfilled_total` /
 /// `tv_spot1m_sweep_still_missing_total`) + one coalesced coded log; the
 /// swept rows' `close_to_data_ms` column stamps the honest real delay.
@@ -1333,6 +1554,74 @@ async fn run_post_session_sweep(
             "spot_1m_rest: post-session sweep complete — every session \
              minute above the watermark is persisted"
         );
+    }
+}
+
+/// 2026-07-13 VIX companion: feed one fired minute's per-SID served
+/// verdicts into the [`SidServedTracker`] and emit the edge-latched
+/// per-SID page / recovery ping + the per-counted-minute counter
+/// (`tv_spot1m_sid_not_served_total{symbol}` — 4 static label values, the
+/// pinned index symbols). Counting semantics live in the tracker doc.
+fn record_sid_served_verdicts(
+    params: &Spot1mRestTaskParams,
+    sid_tracker: &mut SidServedTracker,
+    verdicts: &[(SecurityId, &'static str, bool)],
+    minute_label: &str,
+) {
+    if verdicts.is_empty() {
+        return;
+    }
+    let any_served = verdicts.iter().any(|&(_, _, served)| served);
+    let pairs: Vec<(SecurityId, bool)> = verdicts
+        .iter()
+        .map(|&(sid, _, served)| (sid, served))
+        .collect();
+    let actions = sid_tracker.record_minute(&pairs);
+    for (&(security_id, symbol, served), &(_, action)) in verdicts.iter().zip(actions.iter()) {
+        if !served && any_served {
+            // One counted vendor-not-serving minute for this SID (a
+            // global-outage minute is deliberately NOT counted here).
+            metrics::counter!("tv_spot1m_sid_not_served_total", "symbol" => symbol).increment(1);
+        }
+        match action {
+            SidEdgeAction::Page { consecutive } => {
+                error!(
+                    code = ErrorCode::Spot1m01FetchDegraded.code_str(),
+                    stage = "sid_not_served",
+                    sid = security_id,
+                    symbol,
+                    consecutive,
+                    minute = minute_label,
+                    "SPOT1M-01: the vendor is not returning 1-minute candles \
+                     for this index while the other indices succeed — paging \
+                     once per SID (edge-latched; re-armed on this SID's \
+                     recovery)"
+                );
+                params
+                    .notifier
+                    .notify(NotificationEvent::Spot1mSidNotServed {
+                        symbol: symbol.to_string(),
+                        consecutive_minutes: consecutive,
+                    });
+            }
+            SidEdgeAction::Recover { not_served_minutes } => {
+                info!(
+                    sid = security_id,
+                    symbol,
+                    not_served_minutes,
+                    minute = minute_label,
+                    "spot_1m_rest: this index is being served again after a \
+                     paged not-served episode"
+                );
+                params
+                    .notifier
+                    .notify(NotificationEvent::Spot1mSidServedRecovered {
+                        symbol: symbol.to_string(),
+                        not_served_minutes,
+                    });
+            }
+            SidEdgeAction::None => {}
+        }
     }
 }
 
@@ -1851,7 +2140,7 @@ mod tests {
     // ---- post-session sweep (M1, review 2026-07-13) --------------------------
 
     /// The M1 scenario: the 15:29 candle sealed late, its own 15:30:00
-    /// fire found nothing (watermark stuck at 15:28) — the 15:31 sweep
+    /// fire found nothing (watermark stuck at 15:28) — the 15:33:30 sweep
     /// must select exactly the 15:29 minute and find it in the final
     /// day-window response.
     #[test]
@@ -1911,6 +2200,110 @@ mod tests {
             session_last,
         );
         assert_eq!(missing, vec![session_last - NANOS_PER_MINUTE, session_last]);
+    }
+
+    // ---- 429 coordination (2026-07-13 follow-up) -----------------------------
+
+    /// The sweep fire instant is pinned at 15:33:30 IST — strictly clear of
+    /// the bulk cross-verify's observed 15:31–15:33 429 burst window
+    /// (2026-07-13 live session: 91/776 cross-verify fetches 429'd there).
+    #[test]
+    fn test_sweep_fire_instant_clears_cross_verify_burst_window() {
+        assert_eq!(
+            SPOT_1M_REST_SWEEP_FIRE_SECS_OF_DAY_IST,
+            15 * 3600 + 33 * 60 + 30, // 15:33:30 = 56_010
+        );
+        // ≥ 150 s after the 15:31:00 cross-verify trigger (burst observed
+        // through 15:33) and before the 16:30 IST box stop.
+        assert!(
+            SPOT_1M_REST_SWEEP_FIRE_SECS_OF_DAY_IST
+                >= crate::cross_verify_1m_boot::CROSS_VERIFY_TRIGGER_SECS_OF_DAY_IST + 150
+        );
+        assert!(SPOT_1M_REST_SWEEP_FIRE_SECS_OF_DAY_IST > SPOT_1M_REST_LAST_FIRE_SECS_OF_DAY_IST);
+        assert!(SPOT_1M_REST_SWEEP_FIRE_SECS_OF_DAY_IST < 16 * 3600 + 30 * 60);
+    }
+
+    /// Deterministic per-SID jitter: one distinct value per slot of the
+    /// pinned index array (0 / 150 / 300 / 450 ms at the 2026-07-13 4-SID
+    /// arity), bounded by `(slots - 1) × step`, wrapping for defensive
+    /// out-of-range slots. Slot-based (not `sid % n`) because the pinned
+    /// SIDs give colliding residues — ladders would re-poll in lockstep.
+    #[test]
+    fn test_ladder_jitter_ms_bounds_and_decorrelation() {
+        let jitters: Vec<u64> = (0..SPOT_1M_REST_INDICES.len())
+            .map(ladder_jitter_ms)
+            .collect();
+        assert_eq!(
+            jitters,
+            vec![0, 150, 300, 450],
+            "one distinct shift per SID"
+        );
+        let max = (SPOT_1M_REST_LADDER_JITTER_SLOTS - 1) * SPOT_1M_REST_LADDER_JITTER_STEP_MS;
+        for j in &jitters {
+            assert!(*j <= max, "jitter bounded by (slots-1) x step");
+        }
+        // All four schedules are pairwise distinct — no lockstep re-polls.
+        for a in 0..jitters.len() {
+            for b in (a + 1)..jitters.len() {
+                assert_ne!(jitters[a], jitters[b], "slots {a} and {b} collide");
+            }
+        }
+        // Defensive wrap for a hypothetical 5th slot.
+        assert_eq!(ladder_jitter_ms(4), 0);
+    }
+
+    /// The ladder sleep composition: jitter shifts ONLY the first re-poll
+    /// (later deltas are relative, so the whole schedule carries the
+    /// shift), and a 429 on the previous attempt adds exactly the bounded
+    /// extra backoff.
+    #[test]
+    fn test_ladder_sleep_ms_jitter_and_429_backoff_composition() {
+        let deltas = retry_sleep_deltas_ms();
+        // First re-poll, no 429: base + jitter.
+        assert_eq!(
+            ladder_sleep_ms(deltas[0], true, 300, false),
+            deltas[0] + 300
+        );
+        // Later re-poll: jitter NOT re-applied.
+        assert_eq!(ladder_sleep_ms(deltas[1], false, 300, false), deltas[1]);
+        // 429 on the previous attempt: + the bounded extra backoff.
+        assert_eq!(
+            ladder_sleep_ms(deltas[2], false, 300, true),
+            deltas[2] + SPOT_1M_REST_429_EXTRA_BACKOFF_MS
+        );
+        // First re-poll after a first-attempt 429: both apply.
+        assert_eq!(
+            ladder_sleep_ms(deltas[0], true, 150, true),
+            deltas[0] + 150 + SPOT_1M_REST_429_EXTRA_BACKOFF_MS
+        );
+    }
+
+    /// Worst-case all-429 jittered schedule stays inside the hard per-SID
+    /// budget: every rung rate-limited (extra backoff before each of the 4
+    /// re-polls) + max jitter + one full request timeout < 20 s.
+    #[test]
+    fn test_ladder_worst_case_429_schedule_stays_inside_sid_budget() {
+        let deltas = retry_sleep_deltas_ms();
+        let max_jitter =
+            (SPOT_1M_REST_LADDER_JITTER_SLOTS - 1) * SPOT_1M_REST_LADDER_JITTER_STEP_MS;
+        let mut total_sleep_ms: u64 = 0;
+        for (i, delta) in deltas.iter().enumerate() {
+            total_sleep_ms += ladder_sleep_ms(*delta, i == 0, max_jitter, true);
+        }
+        // Scheduled sleeps sum to the (jittered) last offset + 4 backoffs.
+        assert_eq!(
+            total_sleep_ms,
+            SPOT_1M_REST_RETRY_OFFSETS_MS[3]
+                + max_jitter
+                + deltas.len() as u64 * SPOT_1M_REST_429_EXTRA_BACKOFF_MS
+        );
+        // Plus one full request timeout: still inside the hard budget the
+        // `tokio::time::timeout` enforces (19.3 s < 20 s).
+        assert!(
+            total_sleep_ms + SPOT_1M_REST_REQUEST_TIMEOUT_SECS * 1_000
+                < SPOT_1M_REST_SID_BUDGET_SECS * 1_000,
+            "worst-case 429 ladder must fit the per-SID budget"
+        );
     }
 
     /// Tracker: max-merge commits; double-persisting the same minute
@@ -2018,6 +2411,172 @@ mod tests {
         // Recovery WITHOUT a page: no Recover event (never a false ping).
         assert_eq!(edge.record_minute(false), EdgeAction::None);
         assert_eq!(edge.record_minute(false), EdgeAction::None);
+    }
+
+    // ---- per-SID not-served detector (2026-07-13 — INDIA VIX companion) ----
+
+    const NIFTY: SecurityId = 13;
+    const BANKNIFTY: SecurityId = 25;
+    const SENSEX: SecurityId = 51;
+    const VIX: SecurityId = 21;
+    const N: u32 = SPOT_1M_REST_SID_NOT_SERVED_THRESHOLD;
+
+    fn minute(vix_served: bool, others_served: bool) -> [(SecurityId, bool); 4] {
+        [
+            (NIFTY, others_served),
+            (BANKNIFTY, others_served),
+            (SENSEX, others_served),
+            (VIX, vix_served),
+        ]
+    }
+
+    fn vix_action(actions: &[(SecurityId, SidEdgeAction)]) -> SidEdgeAction {
+        actions
+            .iter()
+            .find(|(sid, _)| *sid == VIX)
+            .map(|&(_, a)| a)
+            .expect("VIX action present")
+    }
+
+    /// A 3-ok / 1-empty minute is NOT fully-failed and NOT edge-counted —
+    /// per-SID independence: a never-serving VIX can never fail or delay
+    /// the other 3 (2026-07-13 requirement 2a).
+    #[test]
+    fn test_partial_minute_three_ok_one_empty_is_not_fully_failed_or_edge_counted() {
+        // The M1 verdict: 3 SIDs succeeded, persist ok → NOT fully failed.
+        assert!(!minute_fully_failed(3, false));
+        // And the escalation edge never counts it: threshold-many such
+        // minutes still page nothing.
+        let mut edge = FailureEdge::default();
+        for _ in 0..(SPOT_1M_REST_CONSECUTIVE_FAIL_PAGE_THRESHOLD * 2) {
+            assert_eq!(
+                edge.record_minute(minute_fully_failed(3, false)),
+                EdgeAction::None,
+                "a 3-ok/1-empty minute must never feed the global edge"
+            );
+        }
+    }
+
+    /// LATCH: the per-SID detector pages ONCE at N counted not-served
+    /// minutes (each with sibling successes) and never re-pages while
+    /// latched.
+    #[test]
+    fn test_sid_not_served_pages_once_at_threshold_then_stays_latched() {
+        let mut t = SidServedTracker::default();
+        for i in 1..N {
+            assert_eq!(
+                vix_action(&t.record_minute(&minute(false, true))),
+                SidEdgeAction::None,
+                "below threshold at minute {i}"
+            );
+        }
+        assert_eq!(
+            vix_action(&t.record_minute(&minute(false, true))),
+            SidEdgeAction::Page { consecutive: N },
+            "rising edge at exactly N"
+        );
+        // No re-page while the episode continues.
+        for _ in 0..20 {
+            assert_eq!(
+                vix_action(&t.record_minute(&minute(false, true))),
+                SidEdgeAction::None,
+                "latched — never a second page in the same episode"
+            );
+        }
+        // The healthy siblings never see any action.
+        let actions = t.record_minute(&minute(false, true));
+        for &(sid, action) in &actions {
+            if sid != VIX {
+                assert_eq!(action, SidEdgeAction::None, "sibling {sid} untouched");
+            }
+        }
+    }
+
+    /// RE-ARM: the SID's own recovery emits ONE Recover and re-arms the
+    /// latch — a later persistent episode pages again.
+    #[test]
+    fn test_sid_not_served_recovery_rearms_the_latch() {
+        let mut t = SidServedTracker::default();
+        for _ in 0..N {
+            t.record_minute(&minute(false, true));
+        }
+        // Recovery: VIX served again → one Info edge.
+        assert_eq!(
+            vix_action(&t.record_minute(&minute(true, true))),
+            SidEdgeAction::Recover {
+                not_served_minutes: N
+            }
+        );
+        // A second served minute emits nothing (no repeated recovery ping).
+        assert_eq!(
+            vix_action(&t.record_minute(&minute(true, true))),
+            SidEdgeAction::None
+        );
+        // Re-armed: a fresh N-minute episode pages again.
+        for _ in 1..N {
+            assert_eq!(
+                vix_action(&t.record_minute(&minute(false, true))),
+                SidEdgeAction::None
+            );
+        }
+        assert_eq!(
+            vix_action(&t.record_minute(&minute(false, true))),
+            SidEdgeAction::Page { consecutive: N }
+        );
+    }
+
+    /// GLOBAL OUTAGE: minutes where NO SID succeeded neither count toward
+    /// nor reset a SID's streak — the detector can never fire on a general
+    /// outage (that is the FailureEdge's page), and a mid-streak global
+    /// blip cannot launder a genuine vendor-not-serving streak.
+    #[test]
+    fn test_sid_not_served_global_outage_neither_counts_nor_resets() {
+        let mut t = SidServedTracker::default();
+        // A long pure global outage never fires the per-SID page.
+        for _ in 0..(N * 3) {
+            for &(_, action) in &t.record_minute(&minute(false, false)) {
+                assert_eq!(
+                    action,
+                    SidEdgeAction::None,
+                    "global outage must not page per-SID"
+                );
+            }
+        }
+        // A streak interrupted by a global-outage minute HOLDS (does not
+        // reset): N-1 counted + 1 global + 1 counted = page.
+        for _ in 1..N {
+            assert_eq!(
+                vix_action(&t.record_minute(&minute(false, true))),
+                SidEdgeAction::None
+            );
+        }
+        assert_eq!(
+            vix_action(&t.record_minute(&minute(false, false))),
+            SidEdgeAction::None,
+            "global-outage minute holds the streak"
+        );
+        assert_eq!(
+            vix_action(&t.record_minute(&minute(false, true))),
+            SidEdgeAction::Page { consecutive: N },
+            "the held streak completes on the next counted minute"
+        );
+    }
+
+    /// Recovery without a page emits nothing (no false Info ping), and a
+    /// no-token / empty-verdict minute is a no-op.
+    #[test]
+    fn test_sid_not_served_no_false_recovery_and_empty_verdicts_noop() {
+        let mut t = SidServedTracker::default();
+        t.record_minute(&minute(false, true)); // 1 counted, below threshold
+        assert_eq!(
+            vix_action(&t.record_minute(&minute(true, true))),
+            SidEdgeAction::None,
+            "recovery below the page threshold is silent"
+        );
+        assert!(
+            t.record_minute(&[]).is_empty(),
+            "empty verdicts are a no-op"
+        );
     }
 
     // ---- select_minute_candle ---------------------------------------------

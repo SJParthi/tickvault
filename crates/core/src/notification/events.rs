@@ -187,6 +187,16 @@ pub enum NotificationEvent {
     StartupComplete {
         /// "LIVE" or "OFFLINE".
         mode: &'static str,
+        /// Per-minute spot 1m REST leg armed at boot (config truth —
+        /// 2026-07-13 operator visibility rider: the boot Telegram must say
+        /// what the per-minute price capture will actually do today).
+        spot_1m_enabled: bool,
+        /// How many indices the spot leg pulls (4 since 2026-07-13).
+        spot_1m_indices: u32,
+        /// Per-minute option-chain REST leg armed at boot (config truth).
+        chain_1m_enabled: bool,
+        /// How many underlyings the chain leg pulls (3 — VIX is spot-only).
+        chain_1m_underlyings: u32,
     },
 
     /// Dhan authentication token acquired at boot.
@@ -564,6 +574,31 @@ pub enum NotificationEvent {
         minute_ist: String,
         /// How many minutes had fully failed during the episode.
         failed_minutes: u32,
+    },
+
+    /// Per-SID persistent-empty detector (operator scope addition
+    /// 2026-07-13, relayed via the coordinator session — the INDIA VIX
+    /// live-probe companion): ONE index accumulated N consecutive
+    /// empty/failed minutes in the per-minute spot pull WHILE the other
+    /// indices succeeded in those same minutes — the vendor is not serving
+    /// THIS index, not a general outage. Fires ONCE per SID per episode
+    /// (edge-latched, Rule 4); re-armed only by that SID's own recovery.
+    /// Severity::High.
+    Spot1mSidNotServed {
+        /// The affected index (e.g. "INDIA VIX").
+        symbol: String,
+        /// How many counted minutes in a row this index went unserved.
+        consecutive_minutes: u32,
+    },
+
+    /// A previously-not-served index is being served again (falling edge —
+    /// one Info ping; the missing minutes stay absent until re-pulled,
+    /// never fabricated).
+    Spot1mSidServedRecovered {
+        /// The recovered index (e.g. "INDIA VIX").
+        symbol: String,
+        /// How many counted minutes the index went unserved.
+        not_served_minutes: u32,
     },
 
     /// Groww per-minute option-chain REST leg (operator grant 2026-07-13,
@@ -1838,7 +1873,13 @@ impl NotificationEvent {
     /// Callers outside this impl use [`Self::to_message`].
     fn message_body(&self) -> String {
         match self {
-            Self::StartupComplete { mode } => {
+            Self::StartupComplete {
+                mode,
+                spot_1m_enabled,
+                spot_1m_indices,
+                chain_1m_enabled,
+                chain_1m_underlyings,
+            } => {
                 // SECURITY: Do not expose internal service ports in Telegram.
                 // Dashboards line trimmed in #O1/#O2/#O3/#O4 — Grafana,
                 // Prometheus, Alertmanager, Valkey all removed in the
@@ -1849,8 +1890,35 @@ impl NotificationEvent {
                 // conscious operator-approved override of the "no version
                 // numbers in body" Telegram commandment (B9 directive
                 // 2026-07-03) — it answers "WHICH code booted?" at a glance.
+                // 2026-07-13 operator visibility rider: say what the
+                // per-minute price capture will ACTUALLY do today (a
+                // midnight boot is silent until 9:16 AM and the operator
+                // asked "what happened to it?"). Truthful per-leg wording —
+                // a switched-off leg says so.
+                let capture_line = match (spot_1m_enabled, chain_1m_enabled) {
+                    (true, true) => format!(
+                        "\u{2705} Per-minute price capture — armed (fires \
+                         9:16 AM to 3:30 PM IST on trading days): spot \
+                         candles for {spot_1m_indices} indices + option \
+                         chain for {chain_1m_underlyings} indices"
+                    ),
+                    (true, false) => format!(
+                        "\u{2705} Per-minute price capture — armed (fires \
+                         9:16 AM to 3:30 PM IST on trading days): spot \
+                         candles for {spot_1m_indices} indices; option \
+                         chain — switched off"
+                    ),
+                    (false, true) => format!(
+                        "\u{2705} Per-minute price capture — armed (fires \
+                         9:16 AM to 3:30 PM IST on trading days): option \
+                         chain for {chain_1m_underlyings} indices; spot \
+                         candles — switched off"
+                    ),
+                    (false, false) => "Per-minute price capture — switched off".to_string(),
+                };
                 format!(
-                    "<b>tickvault started</b>\nMode: {mode}\nBuild: {build}\n\n\
+                    "<b>tickvault started</b>\nMode: {mode}\nBuild: {build}\n\
+                     {capture_line}\n\n\
                      Dashboards: QuestDB Console (local) / CloudWatch (prod)",
                     build = tickvault_common::build_info::build_git_sha_short(),
                 )
@@ -2318,6 +2386,44 @@ impl NotificationEvent {
                      The Groww per-minute official candle pull is working \
                      again as of {minute_ist} IST, after {failed_minutes} \
                      failed minute(s). The minutes that failed stay blank in \
+                     the record until re-pulled — nothing is made up."
+                )
+            }
+            Self::Spot1mSidNotServed {
+                symbol,
+                consecutive_minutes,
+            } => {
+                format!(
+                    "\u{1f198} <b>Dhan is not returning 1-minute candles for \
+                     {symbol}</b>\n\
+                     For {consecutive_minutes} minutes in a row the official \
+                     1-minute candle for {symbol} was missing from the \
+                     per-minute pull while the other indices came through \
+                     fine — the other indices are unaffected, so this looks \
+                     like the broker not serving THIS index, not a general \
+                     outage.\n\
+                     Live streaming prices are NOT affected — only the \
+                     per-minute official record copy for {symbol} is \
+                     missing.\n\
+                     What to do RIGHT NOW:\n\
+                     1. Nothing urgent — the other indices keep recording \
+                     normally.\n\
+                     2. If this fires every day, ask the broker whether \
+                     1-minute candles exist for this index at all.\n\
+                     3. Missing minutes fill in safely if the broker starts \
+                     serving them."
+                )
+            }
+            Self::Spot1mSidServedRecovered {
+                symbol,
+                not_served_minutes,
+            } => {
+                format!(
+                    "\u{2705} <b>Dhan is serving 1-minute candles for \
+                     {symbol} again</b>\n\
+                     The per-minute official candle pull for {symbol} is \
+                     working again after {not_served_minutes} missed \
+                     minute(s). The minutes that were missed stay blank in \
                      the record until re-pulled — nothing is made up."
                 )
             }
@@ -3361,6 +3467,8 @@ impl NotificationEvent {
             Self::Spot1mFetchRecovered { .. } => "Spot1mFetchRecovered",
             Self::GrowwSpot1mFetchDegraded { .. } => "GrowwSpot1mFetchDegraded",
             Self::GrowwSpot1mFetchRecovered { .. } => "GrowwSpot1mFetchRecovered",
+            Self::Spot1mSidNotServed { .. } => "Spot1mSidNotServed",
+            Self::Spot1mSidServedRecovered { .. } => "Spot1mSidServedRecovered",
             Self::GrowwChain1mFetchDegraded { .. } => "GrowwChain1mFetchDegraded",
             Self::GrowwChain1mFetchRecovered { .. } => "GrowwChain1mFetchRecovered",
             Self::GrowwChain1mExpiryUnresolved { .. } => "GrowwChain1mExpiryUnresolved",
@@ -3529,7 +3637,7 @@ impl NotificationEvent {
             }
             Self::OrderUpdateConnected => Some(BootMilestone::OrderUpdateConnected),
             Self::OrderUpdateAuthenticated => Some(BootMilestone::OrderUpdateAuthenticated),
-            Self::StartupComplete { mode } => Some(BootMilestone::Complete { mode }),
+            Self::StartupComplete { mode, .. } => Some(BootMilestone::Complete { mode }),
             Self::FeedAuthOk { feed } if feed.eq_ignore_ascii_case("groww") => {
                 Some(BootMilestone::GrowwAuth)
             }
@@ -3671,6 +3779,8 @@ impl NotificationEvent {
             // Info ping on the falling edge.
             Self::GrowwSpot1mFetchDegraded { .. } => Severity::High,
             Self::GrowwSpot1mFetchRecovered { .. } => Severity::Info,
+            Self::Spot1mSidNotServed { .. } => Severity::High,
+            Self::Spot1mSidServedRecovered { .. } => Severity::Info,
             Self::GrowwChain1mFetchDegraded { .. } => Severity::High,
             Self::GrowwChain1mFetchRecovered { .. } => Severity::Info,
             // One page per day when an underlying's chain recording could
@@ -4033,7 +4143,13 @@ mod tests {
             },
             NotificationEvent::OrderUpdateConnected,
             NotificationEvent::OrderUpdateAuthenticated,
-            NotificationEvent::StartupComplete { mode: "sandbox" },
+            NotificationEvent::StartupComplete {
+                mode: "sandbox",
+                spot_1m_enabled: true,
+                spot_1m_indices: 4,
+                chain_1m_enabled: true,
+                chain_1m_underlyings: 3,
+            },
             NotificationEvent::FeedAuthOk {
                 feed: "Groww".to_string(),
             },
@@ -4166,7 +4282,14 @@ mod tests {
             Some(M::OrderUpdateAuthenticated)
         );
         assert_eq!(
-            NotificationEvent::StartupComplete { mode: "sandbox" }.boot_milestone(),
+            NotificationEvent::StartupComplete {
+                mode: "sandbox",
+                spot_1m_enabled: true,
+                spot_1m_indices: 4,
+                chain_1m_enabled: true,
+                chain_1m_underlyings: 3
+            }
+            .boot_milestone(),
             Some(BootMilestone::Complete { mode: "sandbox" })
         );
         assert_eq!(
@@ -4267,7 +4390,13 @@ mod tests {
         // (e.g. always returning "Event") cannot pass.
         let cases: Vec<(NotificationEvent, &'static str)> = vec![
             (
-                NotificationEvent::StartupComplete { mode: "LIVE" },
+                NotificationEvent::StartupComplete {
+                    mode: "LIVE",
+                    spot_1m_enabled: true,
+                    spot_1m_indices: 4,
+                    chain_1m_enabled: true,
+                    chain_1m_underlyings: 3,
+                },
                 "StartupComplete",
             ),
             (
@@ -4306,7 +4435,13 @@ mod tests {
 
     #[test]
     fn test_startup_complete_live_message() {
-        let event = NotificationEvent::StartupComplete { mode: "LIVE" };
+        let event = NotificationEvent::StartupComplete {
+            mode: "LIVE",
+            spot_1m_enabled: true,
+            spot_1m_indices: 4,
+            chain_1m_enabled: true,
+            chain_1m_underlyings: 3,
+        };
         let msg = event.to_message();
         assert!(msg.contains("LIVE"));
         assert!(msg.contains("started"));
@@ -4348,11 +4483,68 @@ mod tests {
         assert!(!msg.contains("Valkey"), "retired in #O4: {msg}");
     }
 
+    /// 2026-07-13 operator visibility rider: the boot Telegram states the
+    /// per-minute price capture's ACTUAL config state — on/on, on/off,
+    /// off/on and off/off arms all worded truthfully.
+    #[test]
+    fn test_startup_complete_per_minute_capture_wording_arms() {
+        let build = |spot: bool, chain: bool| NotificationEvent::StartupComplete {
+            mode: "LIVE",
+            spot_1m_enabled: spot,
+            spot_1m_indices: 4,
+            chain_1m_enabled: chain,
+            chain_1m_underlyings: 3,
+        };
+
+        let both = build(true, true).to_message();
+        assert!(
+            both.contains("Per-minute price capture — armed"),
+            "got: {both}"
+        );
+        assert!(both.contains("9:16 AM to 3:30 PM IST"), "got: {both}");
+        assert!(both.contains("spot candles for 4 indices"), "got: {both}");
+        assert!(both.contains("option chain for 3 indices"), "got: {both}");
+        assert!(!both.contains("switched off"), "got: {both}");
+
+        let chain_off = build(true, false).to_message();
+        assert!(
+            chain_off.contains("spot candles for 4 indices"),
+            "got: {chain_off}"
+        );
+        assert!(
+            chain_off.contains("option chain — switched off"),
+            "got: {chain_off}"
+        );
+
+        let spot_off = build(false, true).to_message();
+        assert!(
+            spot_off.contains("option chain for 3 indices"),
+            "got: {spot_off}"
+        );
+        assert!(
+            spot_off.contains("spot candles — switched off"),
+            "got: {spot_off}"
+        );
+
+        let both_off = build(false, false).to_message();
+        assert!(
+            both_off.contains("Per-minute price capture — switched off"),
+            "got: {both_off}"
+        );
+        assert!(!both_off.contains("armed"), "got: {both_off}");
+    }
+
     #[test]
     fn test_startup_complete_message_contains_build_sha() {
         // B9 deploy provenance: the boot Telegram must carry the short git
         // SHA of the running binary so the operator sees WHICH code booted.
-        let event = NotificationEvent::StartupComplete { mode: "LIVE" };
+        let event = NotificationEvent::StartupComplete {
+            mode: "LIVE",
+            spot_1m_enabled: true,
+            spot_1m_indices: 4,
+            chain_1m_enabled: true,
+            chain_1m_underlyings: 3,
+        };
         let msg = event.to_message();
         let expected = format!(
             "Build: {}",
@@ -4628,7 +4820,13 @@ mod tests {
 
     #[test]
     fn test_startup_complete_offline_message() {
-        let event = NotificationEvent::StartupComplete { mode: "OFFLINE" };
+        let event = NotificationEvent::StartupComplete {
+            mode: "OFFLINE",
+            spot_1m_enabled: true,
+            spot_1m_indices: 4,
+            chain_1m_enabled: true,
+            chain_1m_underlyings: 3,
+        };
         let msg = event.to_message();
         assert!(msg.contains("OFFLINE"));
         // Post-#O1/#O2/#O3/#O4: dashboard line names QuestDB + CloudWatch
@@ -5063,7 +5261,13 @@ mod tests {
 
     #[test]
     fn test_startup_complete_is_info() {
-        let event = NotificationEvent::StartupComplete { mode: "LIVE" };
+        let event = NotificationEvent::StartupComplete {
+            mode: "LIVE",
+            spot_1m_enabled: true,
+            spot_1m_indices: 4,
+            chain_1m_enabled: true,
+            chain_1m_underlyings: 3,
+        };
         assert_eq!(event.severity(), Severity::Info);
     }
 
@@ -5811,7 +6015,13 @@ mod tests {
     #[test]
     fn test_every_severity_variant_is_reachable() {
         // Verify each severity level is returned by at least one event variant
-        let info_event = NotificationEvent::StartupComplete { mode: "LIVE" };
+        let info_event = NotificationEvent::StartupComplete {
+            mode: "LIVE",
+            spot_1m_enabled: true,
+            spot_1m_indices: 4,
+            chain_1m_enabled: true,
+            chain_1m_underlyings: 3,
+        };
         assert_eq!(info_event.severity(), Severity::Info);
 
         let low_event = NotificationEvent::TokenRenewed;
@@ -6859,7 +7069,13 @@ mod tests {
         // Non-feed events are byte-identical to before — no badge, no "—"
         // prefix injected.
         let events = [
-            NotificationEvent::StartupComplete { mode: "sandbox" },
+            NotificationEvent::StartupComplete {
+                mode: "sandbox",
+                spot_1m_enabled: true,
+                spot_1m_indices: 4,
+                chain_1m_enabled: true,
+                chain_1m_underlyings: 3,
+            },
             NotificationEvent::QuestDbReconnected {
                 writer: "ticks".to_string(),
                 failed_checks_before_recovery: 3,
@@ -7170,6 +7386,33 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // Spot1mSidNotServed + Spot1mSidServedRecovered (operator scope addition
+    // 2026-07-13, relayed via the coordinator session — the INDIA VIX
+    // live-probe companion)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_spot_1m_sid_not_served_is_high_names_the_index_and_scopes_honestly() {
+        let event = NotificationEvent::Spot1mSidNotServed {
+            symbol: "INDIA VIX".to_string(),
+            consecutive_minutes: 10,
+        };
+        assert_eq!(event.topic(), "Spot1mSidNotServed");
+        assert_eq!(event.severity(), Severity::High);
+        let msg = event.to_message();
+        // The operator-mandated plain-English core wording.
+        assert!(
+            msg.contains("not returning 1-minute candles for INDIA VIX"),
+            "got: {msg}"
+        );
+        assert!(msg.contains("other indices are unaffected"), "got: {msg}");
+        assert!(msg.contains("10 minutes in a row"), "got: {msg}");
+        assert!(msg.contains("What to do RIGHT NOW"), "got: {msg}");
+        // Honest scope line: the live WS pipeline is untouched.
+        assert!(msg.contains("NOT affected"), "got: {msg}");
+    }
+
+    // -----------------------------------------------------------------------
     // GrowwChain1m* events (2026-07-13 — Groww per-minute option-chain
     // leg, PR-3 of the Groww REST plan)
     // -----------------------------------------------------------------------
@@ -7191,6 +7434,24 @@ mod tests {
         assert!(msg.contains("What to do RIGHT NOW"), "got: {msg}");
         // Honest scope line: the live WS pipelines are untouched.
         assert!(msg.contains("NOT affected"), "got: {msg}");
+    }
+
+    #[test]
+    fn test_spot_1m_sid_served_recovered_is_info_positive_ping() {
+        let event = NotificationEvent::Spot1mSidServedRecovered {
+            symbol: "INDIA VIX".to_string(),
+            not_served_minutes: 12,
+        };
+        assert_eq!(event.topic(), "Spot1mSidServedRecovered");
+        assert_eq!(event.severity(), Severity::Info);
+        let msg = event.to_message();
+        assert!(
+            msg.contains("serving 1-minute candles for INDIA VIX again"),
+            "got: {msg}"
+        );
+        assert!(msg.contains("12 missed"), "got: {msg}");
+        // No false-OK: recovery never claims the missing minutes came back.
+        assert!(msg.contains("nothing is made up"), "got: {msg}");
     }
 
     #[test]
