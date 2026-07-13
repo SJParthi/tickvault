@@ -152,6 +152,31 @@ the `stage` field):
    `SPOT_1M_REST_SID_BUDGET_SECS` (20 s) with a 5 s per-request timeout
    (`SPOT_1M_REST_REQUEST_TIMEOUT_SECS`), const-asserted < the minute —
    `tv_spot1m_sid_budget_exceeded_total` counts budget trips.
+5. `stage="sid_not_served"` (2026-07-13 — INDIA VIX joins the spot set;
+   operator scope addition 2026-07-13, relayed via the coordinator
+   session: INDIA VIX joins the spot 1m pull, spot only, no option
+   chain) — the per-SID persistent-empty detector: ONE SID accumulated
+   `SPOT_1M_REST_SID_NOT_SERVED_THRESHOLD` (10) consecutive empty/failed
+   minutes WHILE ≥1 other SID succeeded in those same minutes — the
+   vendor is not serving THIS index (a global-outage minute neither
+   counts nor resets the streak; general outages stay the
+   `stage="escalation"` edge's page). Fires ONE edge-latched HIGH page
+   per SID per episode (typed `Spot1mSidNotServed` Telegram, plain
+   English: "Dhan is not returning 1-minute candles for INDIA VIX — the
+   other indices are unaffected"), re-armed only by that SID's own
+   recovery (one Info `Spot1mSidServedRecovered`). Counter:
+   `tv_spot1m_sid_not_served_total{symbol}` (4 static label values —
+   the pinned index symbols), one increment per counted not-served
+   minute. HONESTY: whether Dhan `/v2/charts/intraday` serves INDIA VIX
+   1m candles at all is a LIVE-PROBE UNKNOWN — the spot set is now 4
+   SIDs (NIFTY 13 / BANKNIFTY 25 / SENSEX 51 / INDIA VIX 21; still
+   inside the Data-API 5/sec budget, jitter slots widened 0/150/300/450
+   ms, worst-case ladder 19.45 s < the 20 s budget), the chain leg stays
+   the VIX-free 3-underlying `CHAIN_1M_UNDERLYINGS` subset
+   (const-asserted — VIX can never enter the option-chain pipeline),
+   per-SID independence is unit-pinned (a 3-ok/1-empty minute is NOT
+   fully-failed and NOT edge-counted), and index candles legitimately
+   carry zero volume (never flagged as an error).
 
 **Triage:**
 1. `mcp__tickvault-logs__tail_errors` — find `SPOT1M-01`; the payload

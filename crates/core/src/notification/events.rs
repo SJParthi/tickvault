@@ -512,6 +512,31 @@ pub enum NotificationEvent {
         failed_minutes: u32,
     },
 
+    /// Per-SID persistent-empty detector (operator scope addition
+    /// 2026-07-13, relayed via the coordinator session — the INDIA VIX
+    /// live-probe companion): ONE index accumulated N consecutive
+    /// empty/failed minutes in the per-minute spot pull WHILE the other
+    /// indices succeeded in those same minutes — the vendor is not serving
+    /// THIS index, not a general outage. Fires ONCE per SID per episode
+    /// (edge-latched, Rule 4); re-armed only by that SID's own recovery.
+    /// Severity::High.
+    Spot1mSidNotServed {
+        /// The affected index (e.g. "INDIA VIX").
+        symbol: String,
+        /// How many counted minutes in a row this index went unserved.
+        consecutive_minutes: u32,
+    },
+
+    /// A previously-not-served index is being served again (falling edge —
+    /// one Info ping; the missing minutes stay absent until re-pulled,
+    /// never fabricated).
+    Spot1mSidServedRecovered {
+        /// The recovered index (e.g. "INDIA VIX").
+        symbol: String,
+        /// How many counted minutes the index went unserved.
+        not_served_minutes: u32,
+    },
+
     /// Per-minute option-chain REST pipeline (operator grant 2026-07-12,
     /// PR-3): the per-minute option-chain snapshot has fully failed for
     /// several minutes in a row (edge-triggered ONCE per episode, Rule 4;
@@ -2107,6 +2132,44 @@ impl NotificationEvent {
                      the record until re-pulled — nothing is made up."
                 )
             }
+            Self::Spot1mSidNotServed {
+                symbol,
+                consecutive_minutes,
+            } => {
+                format!(
+                    "\u{1f198} <b>Dhan is not returning 1-minute candles for \
+                     {symbol}</b>\n\
+                     For {consecutive_minutes} minutes in a row the official \
+                     1-minute candle for {symbol} was missing from the \
+                     per-minute pull while the other indices came through \
+                     fine — the other indices are unaffected, so this looks \
+                     like the broker not serving THIS index, not a general \
+                     outage.\n\
+                     Live streaming prices are NOT affected — only the \
+                     per-minute official record copy for {symbol} is \
+                     missing.\n\
+                     What to do RIGHT NOW:\n\
+                     1. Nothing urgent — the other indices keep recording \
+                     normally.\n\
+                     2. If this fires every day, ask the broker whether \
+                     1-minute candles exist for this index at all.\n\
+                     3. Missing minutes fill in safely if the broker starts \
+                     serving them."
+                )
+            }
+            Self::Spot1mSidServedRecovered {
+                symbol,
+                not_served_minutes,
+            } => {
+                format!(
+                    "\u{2705} <b>Dhan is serving 1-minute candles for \
+                     {symbol} again</b>\n\
+                     The per-minute official candle pull for {symbol} is \
+                     working again after {not_served_minutes} missed \
+                     minute(s). The minutes that were missed stay blank in \
+                     the record until re-pulled — nothing is made up."
+                )
+            }
             Self::ChainFetchDegraded {
                 consecutive_failed_minutes,
                 minute_ist,
@@ -3073,6 +3136,8 @@ impl NotificationEvent {
             Self::Spot1mFetchRecovered { .. } => "Spot1mFetchRecovered",
             Self::GrowwSpot1mFetchDegraded { .. } => "GrowwSpot1mFetchDegraded",
             Self::GrowwSpot1mFetchRecovered { .. } => "GrowwSpot1mFetchRecovered",
+            Self::Spot1mSidNotServed { .. } => "Spot1mSidNotServed",
+            Self::Spot1mSidServedRecovered { .. } => "Spot1mSidServedRecovered",
             Self::ChainFetchDegraded { .. } => "ChainFetchDegraded",
             Self::ChainFetchRecovered { .. } => "ChainFetchRecovered",
             Self::ChainEntitlementAbsent { .. } => "ChainEntitlementAbsent",
@@ -3362,6 +3427,8 @@ impl NotificationEvent {
             // Info ping on the falling edge.
             Self::GrowwSpot1mFetchDegraded { .. } => Severity::High,
             Self::GrowwSpot1mFetchRecovered { .. } => Severity::Info,
+            Self::Spot1mSidNotServed { .. } => Severity::High,
+            Self::Spot1mSidServedRecovered { .. } => Severity::Info,
             Self::ChainFetchDegraded { .. } => Severity::High,
             Self::ChainFetchRecovered { .. } => Severity::Info,
             // HIGH only when the pipeline was ON and expected to record;
@@ -6843,6 +6910,51 @@ mod tests {
         assert!(msg.contains("recovered"), "got: {msg}");
         assert!(msg.contains("10:45 AM IST"), "got: {msg}");
         assert!(msg.contains("4 failed"), "got: {msg}");
+        // No false-OK: recovery never claims the missing minutes came back.
+        assert!(msg.contains("nothing is made up"), "got: {msg}");
+    }
+
+    // -----------------------------------------------------------------------
+    // Spot1mSidNotServed + Spot1mSidServedRecovered (operator scope addition
+    // 2026-07-13, relayed via the coordinator session — the INDIA VIX
+    // live-probe companion)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_spot_1m_sid_not_served_is_high_names_the_index_and_scopes_honestly() {
+        let event = NotificationEvent::Spot1mSidNotServed {
+            symbol: "INDIA VIX".to_string(),
+            consecutive_minutes: 10,
+        };
+        assert_eq!(event.topic(), "Spot1mSidNotServed");
+        assert_eq!(event.severity(), Severity::High);
+        let msg = event.to_message();
+        // The operator-mandated plain-English core wording.
+        assert!(
+            msg.contains("not returning 1-minute candles for INDIA VIX"),
+            "got: {msg}"
+        );
+        assert!(msg.contains("other indices are unaffected"), "got: {msg}");
+        assert!(msg.contains("10 minutes in a row"), "got: {msg}");
+        assert!(msg.contains("What to do RIGHT NOW"), "got: {msg}");
+        // Honest scope line: the live WS pipeline is untouched.
+        assert!(msg.contains("NOT affected"), "got: {msg}");
+    }
+
+    #[test]
+    fn test_spot_1m_sid_served_recovered_is_info_positive_ping() {
+        let event = NotificationEvent::Spot1mSidServedRecovered {
+            symbol: "INDIA VIX".to_string(),
+            not_served_minutes: 12,
+        };
+        assert_eq!(event.topic(), "Spot1mSidServedRecovered");
+        assert_eq!(event.severity(), Severity::Info);
+        let msg = event.to_message();
+        assert!(
+            msg.contains("serving 1-minute candles for INDIA VIX again"),
+            "got: {msg}"
+        );
+        assert!(msg.contains("12 missed"), "got: {msg}");
         // No false-OK: recovery never claims the missing minutes came back.
         assert!(msg.contains("nothing is made up"), "got: {msg}");
     }
