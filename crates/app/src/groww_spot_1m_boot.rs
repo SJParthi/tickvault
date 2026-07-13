@@ -171,6 +171,14 @@ pub struct GrowwSpot1mTaskParams {
     pub calendar: Arc<TradingCalendar>,
     /// QuestDB target for the `spot_1m_rest` + `rest_fetch_audit` tables.
     pub questdb: QuestDbConfig,
+    /// Chain-leg sequencing signal (PR-3): the boundary seconds-of-day this
+    /// leg just finished firing, published UNCONDITIONALLY at the END of
+    /// every fire — success OR failure — via `send_replace` (never errors;
+    /// the Dhan seam's exact semantics: the chain must never block on a
+    /// failing spot leg, and its own fallback timer covers a dead/disabled
+    /// one). `None` when the chain leg is disabled — zero publishes, the
+    /// loop stays byte-identical to PR-2.
+    pub minute_done_tx: Option<tokio::sync::watch::Sender<Option<u32>>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -603,17 +611,36 @@ fn fetched_at_ist_nanos_now() -> i64 {
 /// In-process cache of the shared-minter Groww access token: read READ-ONLY
 /// from SSM (`fetch_groww_access_token`), dropped on any auth-class reject
 /// (never cached past an auth failure), re-read at ≥60 s pacing — NEVER
-/// minted (`groww-shared-token-minter-2026-07-02.md`).
-struct GrowwTokenCache {
+/// minted (`groww-shared-token-minter-2026-07-02.md`). Shared with the
+/// PR-3 chain leg (`groww_option_chain_1m_boot.rs`) via [`Self::new_chain`]
+/// — the token is ONE shared resource; each leg owns its OWN cache instance
+/// so the read-failure error code + counter route to that leg's taxonomy.
+pub(crate) struct GrowwTokenCache {
     token: Option<SecretString>,
     last_read_ms: Option<i64>,
+    /// `true` when the CHAIN leg owns this cache — routes the SSM
+    /// read-failure emit to CHAIN-02 / `tv_groww_chain1m_*` instead of the
+    /// spot taxonomy. Behaviour (pacing, drop-on-auth-reject) is identical.
+    chain_leg: bool,
 }
 
 impl GrowwTokenCache {
-    fn new() -> Self {
+    // TEST-EXEMPT: trivial constructor — the pacing decision it feeds (should_reread_token) is unit-tested below.
+    pub(crate) fn new() -> Self {
         Self {
             token: None,
             last_read_ms: None,
+            chain_leg: false,
+        }
+    }
+
+    /// Chain-leg constructor (PR-3) — same cache semantics, chain-routed
+    /// read-failure emits.
+    // TEST-EXEMPT: trivial constructor — same tested semantics as new(); the routing flag is exercised by the chain wiring guard's stub scan.
+    pub(crate) fn new_chain() -> Self {
+        Self {
+            chain_leg: true,
+            ..Self::new()
         }
     }
 
@@ -621,16 +648,30 @@ impl GrowwTokenCache {
     /// the read is not yet due or failed — the caller counts the minute as
     /// a no-token miss and the next fire retries (fires are 60 s apart, so
     /// pacing never starves recovery).
-    async fn ensure_token(&mut self) -> Option<SecretString> {
+    // TEST-EXEMPT: live-SSM async read — the pacing decision (should_reread_token) is unit-tested; the emit routing is pinned by the wiring guards.
+    pub(crate) async fn ensure_token(&mut self) -> Option<SecretString> {
         if self.token.is_none() && should_reread_token(self.last_read_ms, epoch_millis_now()) {
             self.last_read_ms = Some(epoch_millis_now());
             match fetch_groww_access_token().await {
                 Ok(token) => {
                     info!(
-                        "groww_spot_1m: shared access token read from SSM \
+                        chain_leg = self.chain_leg,
+                        "groww_rest_1m: shared access token read from SSM \
                          (read-only; minted by the token-minter Lambda)"
                     );
                     self.token = Some(token);
+                }
+                Err(err) if self.chain_leg => {
+                    metrics::counter!("tv_groww_chain1m_token_read_failed_total").increment(1);
+                    error!(
+                        code = ErrorCode::Chain02FetchDegraded.code_str(),
+                        stage = "token_read",
+                        feed = SPOT_1M_REST_FEED_GROWW,
+                        ?err,
+                        "CHAIN-02: shared Groww access token SSM read failed \
+                         — the chain leg's minutes miss until the read \
+                         succeeds (re-read paced at 60s; NEVER minted)"
+                    );
                 }
                 Err(err) => {
                     metrics::counter!("tv_groww_spot1m_token_read_failed_total").increment(1);
@@ -652,10 +693,12 @@ impl GrowwTokenCache {
     /// Drop the cached token after an auth-class reject (401/403 — the
     /// ~06:00 IST daily reset surfaces this way): the NEXT `ensure_token`
     /// re-reads SSM at the pacing floor. Never mints.
-    fn note_auth_rejected(&mut self) {
+    // TEST-EXEMPT: one-line state drop — exercised via the mock-401 short-circuit tokio test below.
+    pub(crate) fn note_auth_rejected(&mut self) {
         if self.token.take().is_some() {
             warn!(
-                "groww_spot_1m: auth-class reject — cached token dropped; \
+                chain_leg = self.chain_leg,
+                "groww_rest_1m: auth-class reject — cached token dropped; \
                  re-reading from SSM at >=60s pacing (never minting)"
             );
         }
@@ -1263,6 +1306,13 @@ pub async fn run_groww_spot_1m(params: GrowwSpot1mTaskParams) {
         )
         .await;
         last_fired = Some(fire);
+        // Chain-leg sequencing (PR-3): publish this fire's boundary
+        // UNCONDITIONALLY — success OR failure (the chain must never block
+        // on a failing spot leg; the Dhan seam's semantics). `send_replace`
+        // never errors; no receiver = no cost.
+        if let Some(tx) = &params.minute_done_tx {
+            tx.send_replace(Some(fire));
+        }
         // H2 overrun accounting: boundaries that fully elapsed DURING the
         // fire can never be fetched — count them loudly + feed the edge.
         let after = ist_secs_of_day_now();

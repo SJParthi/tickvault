@@ -1744,6 +1744,7 @@ const _: () = assert!(
 /// previous-day-only restriction; just-closed-minute freshness is
 /// UNDOCUMENTED/UNVERIFIED-LIVE per `docs/groww-ref/99-UNKNOWNS.md` — the
 /// ladder + histogram are the probe).
+// APPROVED: constants.rs is the single static-URL source (same as GROWW_INSTRUMENT_CSV_URL)
 pub const GROWW_HISTORICAL_CANDLES_URL: &str = "https://api.groww.in/v1/historical/candles";
 
 /// Groww `candle_interval` literal for 1-minute candles (`"1minute"`, NOT
@@ -1840,6 +1841,118 @@ const _: () = assert!(
     GROWW_SPOT_1M_RETRY_OFFSETS_MS[3] + GROWW_SPOT_1M_REQUEST_TIMEOUT_SECS * 1_000
         < GROWW_SPOT_1M_SYMBOL_BUDGET_SECS * 1_000,
     "GROWW_SPOT_1M ladder schedule (last offset + one request timeout) must fit the budget"
+);
+
+// ---------------------------------------------------------------------------
+// Groww option-chain 1m REST leg (operator grant 2026-07-13 — PR-3 of the
+// Groww per-minute REST plan, `.claude/plans/active-plan-groww-rest-1m.md`;
+// authorization `groww-second-feed-scope-2026-06-19.md` §38 +
+// `no-rest-except-live-feed-2026-06-27.md` §9). Mirrors the Dhan chain leg
+// (`CHAIN_1M_*` above) onto Groww's option-chain endpoint. Session
+// boundaries, staleness grace and the page threshold REUSE the
+// SPOT_1M_REST_* session constants (NSE-session facts, not broker facts).
+// ---------------------------------------------------------------------------
+
+/// Groww option-chain REST endpoint prefix (documented + SDK-verified —
+/// `docs/groww-ref/14-option-chain.md` §1; `client.py:490` in the official
+/// `growwapi` 1.5.0 wheel). Full shape:
+/// `GET {prefix}/exchange/{exchange}/underlying/{underlying}?expiry_date=YYYY-MM-DD`
+/// — the `underlying` path param is the PLAIN symbol (`NIFTY`, NOT the
+/// `groww_symbol`). Bearer + `x-api-version: 1.0` headers, same as the
+/// candles endpoint. The response carries NO timestamp of any kind
+/// (Verified-absence, §3) — the snapshot moment is stamped client-side.
+// APPROVED: constants.rs is the single static-URL source (same as GROWW_INSTRUMENT_CSV_URL)
+pub const GROWW_OPTION_CHAIN_URL_PREFIX: &str = "https://api.groww.in/v1/option-chain";
+
+/// The 3 underlyings the Groww per-minute chain leg fetches, as
+/// `(plain underlying, exchange, groww_symbol)` — the SAME logical indices
+/// as [`GROWW_SPOT_1M_SYMBOLS`]: the chain endpoint takes the PLAIN symbol
+/// + exchange (`docs/groww-ref/14-option-chain.md` §1); the `groww_symbol`
+/// third element feeds `stable_index_security_id` so persisted rows carry
+/// the SAME ids the Groww live lane uses.
+pub const GROWW_CHAIN_1M_UNDERLYINGS: [(&str, &str, &str); 3] = [
+    ("NIFTY", "NSE", "NSE-NIFTY"),
+    ("BANKNIFTY", "NSE", "NSE-BANKNIFTY"),
+    ("SENSEX", "BSE", "BSE-SENSEX"),
+];
+
+// Arity guard: the Groww chain leg tracks the SAME 3 logical indices as
+// the spot legs — a 4th underlying needs a fresh dated operator quote.
+const _: () = assert!(
+    GROWW_CHAIN_1M_UNDERLYINGS.len() == GROWW_SPOT_1M_SYMBOLS.len(),
+    "GROWW_CHAIN_1M_UNDERLYINGS must mirror the 3-index GROWW_SPOT_1M_SYMBOLS set"
+);
+
+/// Fallback post-boundary fire delay (ms) for the Groww chain leg —
+/// mirrors [`CHAIN_1M_FALLBACK_DELAY_MS`]: the chain task normally wakes
+/// when the GROWW spot leg signals its minute complete; when the spot leg
+/// is disabled, dead, or slow, this timer fires the chain anyway
+/// (sequencing is best-effort, never a hard dependency).
+pub const GROWW_CHAIN_1M_FALLBACK_DELAY_MS: u64 = 2_500;
+
+/// DEFENSIVE per-underlying minimum gap (ms) between two Groww chain
+/// requests for the SAME underlying. Groww documents NO chain-specific
+/// rate rule (`docs/groww-ref/14-option-chain.md` §4 — the family is
+/// UNDOCUMENTED, Unknown ≠ unlimited), so this is NOT doc-mandated (the
+/// Dhan 1-per-3s contrast): 1 s is consistent with the ≤6 req/s
+/// minute-boundary pacing ceiling of
+/// `docs/groww-ref/15-rate-limits-and-capacity.md` and, at one request
+/// per underlying per minute, never engages in normal operation.
+pub const GROWW_CHAIN_1M_MIN_GAP_MS: u64 = 1_000;
+
+/// Per-REQUEST HTTP timeout (secs) for one Groww chain call — chains are
+/// BIG (~100–300 KB per `docs/groww-ref/14-option-chain.md` §5, Assumed);
+/// mirrors the Dhan chain leg's 10 s.
+pub const GROWW_CHAIN_1M_REQUEST_TIMEOUT_SECS: u64 = 10;
+
+/// HARD wall-clock budget (secs) for ONE underlying's per-minute chain
+/// fetch (min-gap wait + one request). 15 s — DELIBERATELY tighter than
+/// the Dhan chain's 20 s: the Groww leg fetches its 3 underlyings
+/// SEQUENTIALLY (the ≤6 req/s shared-bucket pacing rule, the spot-leg
+/// precedent), so the whole fire is bounded by 3 × budget and must still
+/// finish inside the minute (const-asserted below).
+pub const GROWW_CHAIN_1M_UNDERLYING_BUDGET_SECS: u64 = 15;
+
+/// Maximum accepted response body size (bytes) for one Groww chain call —
+/// ~100–300 KB expected; 8 MiB bounds a hostile/misbehaving server
+/// (csv_downloader §18 streamed-cap pattern; mirrors the Dhan chain cap).
+pub const GROWW_CHAIN_1M_MAX_BODY_BYTES: usize = 8 * 1024 * 1024;
+
+/// Consecutive fully-failed Groww chain minutes before the ONE
+/// edge-triggered escalation page fires — the chain leg REUSES the spot
+/// `FailureEdge`, so this MUST equal the spot threshold (const-asserted).
+pub const GROWW_CHAIN_1M_CONSECUTIVE_FAIL_PAGE_THRESHOLD: u32 = 3;
+
+/// Bounded warmup retry backoffs (secs) BETWEEN Groww instruments-master
+/// download attempts — 3 attempts total (first try + these two). The
+/// master is a public static CSV (`GROWW_INSTRUMENT_CSV_URL` — the §3/§9
+/// KEEP class, zero rate budget); on final failure the chain leg degrades
+/// to disabled-for-the-day (NEVER a guessed expiry).
+pub const GROWW_CHAIN_1M_MASTER_RETRY_BACKOFF_SECS: [u64; 2] = [3, 6];
+
+const _: () = assert!(
+    GROWW_CHAIN_1M_CONSECUTIVE_FAIL_PAGE_THRESHOLD == SPOT_1M_REST_CONSECUTIVE_FAIL_PAGE_THRESHOLD,
+    "the Groww chain leg reuses the spot FailureEdge — thresholds must agree"
+);
+// SEQUENTIAL-fetch budget math: the whole chain fire (fallback delay + 3
+// sequential per-underlying budgets) must finish inside the minute; the
+// per-request timeout + min-gap must fit one underlying's budget; and the
+// fallback delay must TRAIL the Groww spot leg's post-boundary fire delay
+// (the chain is sequenced AFTER the spot fetch).
+const _: () = assert!(
+    GROWW_CHAIN_1M_FALLBACK_DELAY_MS
+        + (GROWW_CHAIN_1M_UNDERLYINGS.len() as u64) * GROWW_CHAIN_1M_UNDERLYING_BUDGET_SECS * 1_000
+        < 60_000,
+    "GROWW_CHAIN_1M sequential fire (fallback + 3 x underlying budget) must finish inside the minute"
+);
+const _: () = assert!(
+    GROWW_CHAIN_1M_MIN_GAP_MS + GROWW_CHAIN_1M_REQUEST_TIMEOUT_SECS * 1_000
+        < GROWW_CHAIN_1M_UNDERLYING_BUDGET_SECS * 1_000,
+    "GROWW_CHAIN_1M min-gap + one request timeout must fit the per-underlying budget"
+);
+const _: () = assert!(
+    GROWW_CHAIN_1M_FALLBACK_DELAY_MS > GROWW_SPOT_1M_FIRE_DELAY_MS,
+    "GROWW_CHAIN_1M fallback delay must trail the Groww spot leg's fire delay"
 );
 
 /// Daily reset signal time (IST). After market close at 15:30,
@@ -3917,6 +4030,71 @@ mod tests {
         assert_eq!(GROWW_SPOT_1M_MAX_BODY_BYTES, 2 * 1024 * 1024);
         // Token-minter lock pacing: re-READ from SSM at ≥60 s, never mint.
         assert_eq!(GROWW_SPOT_1M_TOKEN_REREAD_FLOOR_SECS, 60);
+    }
+
+    /// Constant pins — the Groww per-minute option-chain leg (PR-3 of the
+    /// Groww per-minute REST plan; every value grounded in
+    /// `docs/groww-ref/14-option-chain.md` + `15-rate-limits-and-capacity.md`
+    /// or the mirrored Dhan chain leg).
+    #[test]
+    fn test_groww_chain_1m_constants_pinned() {
+        // Documented + SDK-verified endpoint prefix; the token travels in
+        // the Authorization header, NEVER the URL.
+        assert_eq!(
+            GROWW_OPTION_CHAIN_URL_PREFIX,
+            "https://api.groww.in/v1/option-chain"
+        );
+        assert!(GROWW_OPTION_CHAIN_URL_PREFIX.starts_with("https://"));
+        assert!(!GROWW_OPTION_CHAIN_URL_PREFIX.contains("token"));
+        // The 3-underlying table: PLAIN symbol + exchange for the path
+        // params, groww_symbol for the stable live-lane id.
+        assert_eq!(
+            GROWW_CHAIN_1M_UNDERLYINGS,
+            [
+                ("NIFTY", "NSE", "NSE-NIFTY"),
+                ("BANKNIFTY", "NSE", "NSE-BANKNIFTY"),
+                ("SENSEX", "BSE", "BSE-SENSEX"),
+            ]
+        );
+        assert_eq!(
+            GROWW_CHAIN_1M_UNDERLYINGS.len(),
+            GROWW_SPOT_1M_SYMBOLS.len()
+        );
+        // Every chain groww_symbol matches its spot-leg twin (same stable
+        // id space — the persisted rows must join the live lane).
+        for ((_, _, chain_gs), (spot_gs, ..)) in GROWW_CHAIN_1M_UNDERLYINGS
+            .iter()
+            .zip(GROWW_SPOT_1M_SYMBOLS.iter())
+        {
+            assert_eq!(chain_gs, spot_gs, "chain/spot groww_symbol drift");
+        }
+        // Sequencing + pacing envelope (sequential 3-underlying fire).
+        assert_eq!(GROWW_CHAIN_1M_FALLBACK_DELAY_MS, 2_500);
+        assert!(GROWW_CHAIN_1M_FALLBACK_DELAY_MS > GROWW_SPOT_1M_FIRE_DELAY_MS);
+        assert_eq!(GROWW_CHAIN_1M_MIN_GAP_MS, 1_000);
+        assert_eq!(GROWW_CHAIN_1M_REQUEST_TIMEOUT_SECS, 10);
+        assert_eq!(GROWW_CHAIN_1M_UNDERLYING_BUDGET_SECS, 15);
+        assert!(
+            GROWW_CHAIN_1M_FALLBACK_DELAY_MS
+                + (GROWW_CHAIN_1M_UNDERLYINGS.len() as u64)
+                    * GROWW_CHAIN_1M_UNDERLYING_BUDGET_SECS
+                    * 1_000
+                < 60_000,
+            "sequential chain fire must finish inside the minute"
+        );
+        assert!(
+            GROWW_CHAIN_1M_MIN_GAP_MS + GROWW_CHAIN_1M_REQUEST_TIMEOUT_SECS * 1_000
+                < GROWW_CHAIN_1M_UNDERLYING_BUDGET_SECS * 1_000,
+            "min-gap + one request timeout must fit the underlying budget"
+        );
+        assert_eq!(GROWW_CHAIN_1M_MAX_BODY_BYTES, 8 * 1024 * 1024);
+        // The chain leg reuses the spot FailureEdge — thresholds agree.
+        assert_eq!(
+            GROWW_CHAIN_1M_CONSECUTIVE_FAIL_PAGE_THRESHOLD,
+            SPOT_1M_REST_CONSECUTIVE_FAIL_PAGE_THRESHOLD
+        );
+        // Warmup master-download retries: bounded, 3 attempts total.
+        assert_eq!(GROWW_CHAIN_1M_MASTER_RETRY_BACKOFF_SECS, [3, 6]);
     }
 
     /// Constant pin — 60s grace after close.
