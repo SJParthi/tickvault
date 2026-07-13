@@ -71,11 +71,15 @@
 //!
 //! ## Pacing (the §38.3 capacity envelope — const-asserted in constants.rs)
 //! Contracts are fetched SEQUENTIALLY with a mechanical
-//! [`GROWW_CONTRACT_1M_MIN_GAP_MS`] cross-request gap (≤ ~3.3 req/s), so
-//! the worst-overlap boundary burst (spot ≤1 in-flight + chain ≤1 req/s +
-//! contract) stays inside the ≤6 req/s shared-bucket ceiling; worst-case
-//! per-minute totals across all three Groww legs ≈ 48 requests (typical
-//! ~36) ≈ 16% of the 300/min budget. The whole fire carries a HARD
+//! [`GROWW_CONTRACT_1M_MIN_GAP_MS`] cross-request gap (500 ms → ≤ 2.0
+//! req/s; re-derived 2026-07-13 when INDIA VIX made the spot leg 4
+//! sequential targets), so the worst-overlap boundary burst — spot worst
+//! second 3 requests (a target-transition instant) + chain ≤1 req/s +
+//! contract 2 req/s = 6.00 req/s — sits exactly AT the ≤6 req/s
+//! shared-bucket pacing ceiling (broker hard ceiling 10/s); worst-case
+//! per-minute totals across all three Groww legs = 53 requests (30 + 20
+//! spot incl. the VIX target + 3 chain; typical ~37) ≈ 17.7% of the
+//! 300/min budget. The whole fire carries a HARD
 //! [`GROWW_CONTRACT_1M_FIRE_BUDGET_SECS`] deadline — contracts not reached
 //! are SKIPPED loudly (forensics rows + counter), never fetched into the
 //! next minute.
@@ -2453,10 +2457,12 @@ mod tests {
     fn test_contract_min_gap_wait_ms_math_and_midnight_wrap() {
         // First request: no wait.
         assert_eq!(contract_min_gap_wait_ms(None, 1_000), 0);
-        // 100ms since the last request → wait the remaining 200ms.
-        assert_eq!(contract_min_gap_wait_ms(Some(10_000), 10_100), 200);
+        // 100ms since the last request → wait the remaining 400ms (500ms gap).
+        assert_eq!(contract_min_gap_wait_ms(Some(10_000), 10_100), 400);
+        // Partially elapsed → the exact remainder.
+        assert_eq!(contract_min_gap_wait_ms(Some(10_000), 10_400), 100);
         // Gap already satisfied.
-        assert_eq!(contract_min_gap_wait_ms(Some(10_000), 10_400), 0);
+        assert_eq!(contract_min_gap_wait_ms(Some(10_000), 10_600), 0);
         // Midnight wrap / backwards clock → 0, never a long spurious sleep.
         assert_eq!(contract_min_gap_wait_ms(Some(86_399_000), 100), 0);
     }

@@ -2126,12 +2126,20 @@ pub const GROWW_CONTRACT_1M_FALLBACK_DELAY_MS: u64 = 8_000;
 
 /// MECHANICAL cross-request minimum gap (ms) between ANY two consecutive
 /// contract candle requests — the chain leg's min-gap PATTERN at a
-/// contract-sized value: 300 ms → the contract leg contributes at most
-/// ~3.3 req/s, keeping the combined worst-overlap boundary burst (spot ≤1
-/// in-flight + chain ≤1 req/s + contract) inside the ≤6 req/s pacing
-/// ceiling of `docs/groww-ref/15-rate-limits-and-capacity.md` with bruteX
-/// co-tenancy headroom (const-asserted below).
-pub const GROWW_CONTRACT_1M_MIN_GAP_MS: u64 = 300;
+/// contract-sized value: 500 ms → the contract leg contributes at most
+/// 2.0 req/s. RE-DERIVED 2026-07-13 (was 300 ms) when INDIA VIX joined
+/// the spot leg (3 → 4 sequential targets, §38.7 of the groww-scope
+/// lock): the honest spot worst-SECOND is 3 requests (a fast-failing
+/// target's last ladder rung in the same second as the NEXT target's
+/// rung-0 + rung-1 at +0.7 s — the 4th target makes those transitions
+/// MORE FREQUENT, never faster), so at 300 ms the worst overlap was
+/// 3 + 1 + 3.33 = 7.33 req/s > the ≤6 req/s pacing ceiling of
+/// `docs/groww-ref/15-rate-limits-and-capacity.md`. At 500 ms:
+/// 3 + 1 + 2 = 6.00 req/s — exactly AT the self-imposed ceiling
+/// (const-asserted below with exact rational math), with the broker's
+/// documented 10/s hard ceiling far above. Pure pacing cost: 29 gaps ×
+/// 500 ms = 14.5 s of the 45 s fire budget — still bounded.
+pub const GROWW_CONTRACT_1M_MIN_GAP_MS: u64 = 500;
 
 /// Per-REQUEST HTTP timeout (secs) for one contract candles call — the
 /// spot leg's 5 s (same endpoint, same ~20 KB day-window body).
@@ -2176,28 +2184,35 @@ const _: () = assert!(
     GROWW_CONTRACT_1M_FALLBACK_DELAY_MS + GROWW_CONTRACT_1M_FIRE_BUDGET_SECS * 1_000 < 60_000,
     "GROWW_CONTRACT_1M fire (fallback + fire budget) must finish inside the minute"
 );
-// Boundary-burst pacing ceiling (§38.3): spot ≤1 in-flight + chain ≤
-// 1000/chain-gap req/s + contract ≤ 1000/contract-gap req/s must stay
-// inside the ≤6 req/s shared-bucket ceiling even in the worst overlap.
-// EXACT rational math via cross-multiplication (round-1 review LOW: the
-// former `1_000 / 300 = 3` integer division silently rounded the true
-// 3.33 req/s DOWN — optimistic):
-//   1 + 1000/cg + 1000/kg ≤ 6  ⇔  1000·kg + 1000·cg ≤ 5·cg·kg
-// (all terms positive). Today: 1000·300 + 1000·1000 = 1.3M ≤ 5·1000·300
-// = 1.5M — the true worst-overlap burst is 1 + 1 + 3.33 ≈ 5.33 req/s.
+// Boundary-burst pacing ceiling (§38.3, RE-DERIVED 2026-07-13 for the
+// VIX 4th spot target): the honest spot worst-SECOND is 3 requests
+// (sequential targets, ≤1 in-flight, but a fast-failing target's last
+// ladder rung can share one second with the next target's rung-0 +
+// rung-1 at +0.7 s; the 4th target makes such transitions more
+// frequent, never faster) + chain ≤ 1000/chain-gap req/s + contract ≤
+// 1000/contract-gap req/s, all inside the ≤6 req/s shared-bucket
+// ceiling even in the worst overlap. EXACT rational math via
+// cross-multiplication (round-1 review LOW: integer division rounds
+// 1000/gap DOWN — optimistic):
+//   3 + 1000/kg + 1000/cg ≤ 6  ⇔  1000·kg + 1000·cg ≤ 3·cg·kg
+// (all terms positive). Today: 1000·500 + 1000·1000 = 1.5M ≤
+// 3·1000·500 = 1.5M — the worst-overlap burst is 3 + 1 + 2 = 6.00
+// req/s, exactly AT the self-imposed ceiling (broker hard ceiling 10/s).
 const _: () = assert!(
     1_000 * GROWW_CONTRACT_1M_MIN_GAP_MS + 1_000 * GROWW_CHAIN_1M_MIN_GAP_MS
-        <= 5 * GROWW_CHAIN_1M_MIN_GAP_MS * GROWW_CONTRACT_1M_MIN_GAP_MS,
-    "spot + chain + contract worst-overlap boundary burst must stay inside the 6 req/s ceiling (exact rational math)"
+        <= 3 * GROWW_CHAIN_1M_MIN_GAP_MS * GROWW_CONTRACT_1M_MIN_GAP_MS,
+    "spot(3) + chain + contract worst-overlap boundary burst must stay inside the 6 req/s ceiling (exact rational math)"
 );
-// Per-minute request math (the §38.3 capacity envelope): worst case
-// 30 contracts + the spot leg's 15 (3 symbols × 5 ladder rungs) + 3 chain
-// = 48 requests/min ≈ 16% of the 300/min shared budget (typical ≈ 36/min:
-// 30 + 3 + 3). Const-asserted at ≤ 60 (20% of the budget) so a future cap
-// raise cannot silently eat the bruteX co-tenancy headroom.
+// Per-minute request math (the §38.3 capacity envelope, re-derived
+// 2026-07-13 for the VIX 4th spot target): worst case 30 contracts +
+// the spot leg's 20 (3 core symbols + the runtime VIX target = 4 × 5
+// ladder rungs) + 3 chain = 53 requests/min ≈ 17.7% of the 300/min
+// shared budget (typical ≈ 37/min: 30 + 4 + 3). Const-asserted at ≤ 60
+// (20% of the budget) so a future cap raise cannot silently eat the
+// bruteX co-tenancy headroom.
 const _: () = assert!(
     GROWW_CONTRACT_1M_MAX_PER_MINUTE
-        + GROWW_SPOT_1M_SYMBOLS.len() * (GROWW_SPOT_1M_RETRY_OFFSETS_MS.len() + 1)
+        + (GROWW_SPOT_1M_SYMBOLS.len() + 1) * (GROWW_SPOT_1M_RETRY_OFFSETS_MS.len() + 1)
         + GROWW_CHAIN_1M_UNDERLYINGS.len()
         <= 60,
     "the three Groww REST legs' worst-case per-minute request total must stay <= 20% of the 300/min budget"
@@ -4421,7 +4436,7 @@ mod tests {
     fn test_groww_contract_1m_constants_pinned() {
         assert_eq!(GROWW_CONTRACT_1M_FALLBACK_DELAY_MS, 8_000);
         assert!(GROWW_CONTRACT_1M_FALLBACK_DELAY_MS > GROWW_CHAIN_1M_FALLBACK_DELAY_MS);
-        assert_eq!(GROWW_CONTRACT_1M_MIN_GAP_MS, 300);
+        assert_eq!(GROWW_CONTRACT_1M_MIN_GAP_MS, 500);
         assert_eq!(GROWW_CONTRACT_1M_REQUEST_TIMEOUT_SECS, 5);
         assert_eq!(GROWW_CONTRACT_1M_MAX_PER_MINUTE, 30);
         assert_eq!(GROWW_CONTRACT_1M_FIRE_BUDGET_SECS, 45);
@@ -4432,23 +4447,26 @@ mod tests {
             GROWW_CONTRACT_1M_FALLBACK_DELAY_MS + GROWW_CONTRACT_1M_FIRE_BUDGET_SECS * 1_000
                 < 60_000
         );
-        // Worst-overlap boundary burst inside the 6 req/s family ceiling:
-        // spot (sequential, <=1 in-flight) + chain + contract. EXACT
-        // rational cross-multiplication (integer division would round the
-        // contract leg's true 3.33 req/s down to 3 — optimistic):
-        //   1 + 1000/cg + 1000/kg <= 6  <=>  1000*kg + 1000*cg <= 5*cg*kg.
+        // Worst-overlap boundary burst inside the 6 req/s family ceiling
+        // (re-derived 2026-07-13 for the VIX 4th spot target): spot worst
+        // second = 3 requests (target-transition instant) + chain + contract.
+        // EXACT rational cross-multiplication:
+        //   3 + 1000/kg + 1000/cg <= 6  <=>  1000*kg + 1000*cg <= 3*cg*kg
+        // — today 1000*500 + 1000*1000 = 1.5M = 3*1000*500 exactly:
+        // 3 + 1 + 2 = 6.00 req/s AT the self-imposed ceiling.
         assert!(
             1_000 * GROWW_CONTRACT_1M_MIN_GAP_MS + 1_000 * GROWW_CHAIN_1M_MIN_GAP_MS
-                <= 5 * GROWW_CHAIN_1M_MIN_GAP_MS * GROWW_CONTRACT_1M_MIN_GAP_MS
+                <= 3 * GROWW_CHAIN_1M_MIN_GAP_MS * GROWW_CONTRACT_1M_MIN_GAP_MS
         );
         // Per-minute request math (the capacity envelope): 30 contracts +
-        // the spot leg's worst 15 (3 symbols x 5 ladder rungs) + 3 chain
-        // = 48/min <= 20% of the 300/min shared budget (typical ~36/min).
+        // the spot leg's worst 20 (3 core + the runtime VIX target = 4
+        // targets x 5 ladder rungs) + 3 chain = 53/min ~ 17.7% of the
+        // 300/min shared budget (typical ~37/min).
         assert_eq!(
             GROWW_CONTRACT_1M_MAX_PER_MINUTE
-                + GROWW_SPOT_1M_SYMBOLS.len() * (GROWW_SPOT_1M_RETRY_OFFSETS_MS.len() + 1)
+                + (GROWW_SPOT_1M_SYMBOLS.len() + 1) * (GROWW_SPOT_1M_RETRY_OFFSETS_MS.len() + 1)
                 + GROWW_CHAIN_1M_UNDERLYINGS.len(),
-            48
+            53
         );
         // The default ATM window fills the cap exactly (5 strikes x 2 legs
         // x 3 underlyings = 30) — a wider default needs a dated quote.
