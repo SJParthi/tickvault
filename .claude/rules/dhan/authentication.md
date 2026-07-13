@@ -22,6 +22,15 @@
    - Only renews ACTIVE tokens. Expired tokens return error.
    - Extends validity by another 24 hours.
    - **One active token at a time** — generating new token invalidates the old one.
+   - **2026-07-13 note (UNVERIFIED-LIVE — search-index + SDK relayed):** the new
+     docs.dhanhq.co renew-token page describes renewal as **expiring the current token and
+     issuing a NEW one** (adopt the response token; the one-active-token invariant is
+     unchanged) and states plainly it works **only for tokens generated via Dhan Web**. One
+     search summary claimed the verb is POST, but the official SDK (2.3.0rc1) and the docs
+     curl example both indicate **GET** — so GET stands here; live-probe BOTH verbs from the
+     prod box before changing this rule or any code. Runtime risk is bounded by the existing
+     RenewToken→generateAccessToken fallback. See `docs/dhan-ref/02-authentication.md`
+     "2026-07-13 Upstream Update" + `docs/dhan-ref/verification-2026-07-13.md` §4 flag 3.
 
 6. **API Key & Secret flow (OAuth-style, 12-month validity).**
    - Step 1: `POST https://auth.dhan.co/app/generate-consent?client_id={dhanClientId}` with headers `app_id`, `app_secret`. Max 25 consentAppId per day.

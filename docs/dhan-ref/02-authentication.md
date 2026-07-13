@@ -217,3 +217,34 @@ Headers: access-token: {JWT}
 3. **Static IP only for orders** — data APIs, market feed, portfolio all work without IP whitelisting.
 4. **TOTP enables automation** — without TOTP, token must be manually generated from web UI daily.
 5. **For tickvault**: Use TOTP method for daily auto-renewal. Generate token at pre-market (before 9:00 AM IST), renew before expiry.
+
+---
+
+## 2026-07-13 Upstream Update — RenewToken (§2.2) — UNVERIFIED-LIVE
+
+Per repo convention this dated section supersedes without rewriting §2.2 above. Evidence is
+search-index-relayed (Dhan hosts proxy-blocked from the verifying sandbox) plus direct fetches of
+the official Python SDK; **no live API call was made — live-probe before ANY code change**. Full
+evidence chain: `verification-2026-07-13.md` §4 flag 3.
+
+1. **New docs portal page:** RenewToken is now also documented at
+   `https://docs.dhanhq.co/api/v2/authentication/renew-token` (alongside dhanhq.co/docs/v2).
+2. **Semantics — renew ISSUES A NEW token** (2 independent sources; UNVERIFIED-LIVE): the
+   live-indexed page states "This API **expires your current token and provides you with a new
+   token** with another 24 hours of validity"; the official SDK docstring likewise returns "the
+   **new** access token". This supersedes §2.2's "Extends validity by another 24 hours"
+   same-token reading. The one-active-token invariant (§8.2) is unaffected — consumers must
+   simply adopt the RESPONSE token rather than assuming the old JWT string stays valid.
+3. **Web-tokens-only now stated plainly:** "You can use this only for tokens generated from
+   Dhan Web" — upgrades §2.2's hedged Important note from inference to (indexed) upstream text.
+4. **HTTP verb DISPUTED — GET remains best-supported; do NOT flip to POST without a live
+   probe:** one search summary of the new page claimed "Method: POST", but a second summary of
+   the SAME page said its curl example (no `-X`) indicates GET; the official SDK — main branch
+   AND the released 2.3.0rc1 sdist (PyPI direct fetch) — calls `requests.get` on
+   `/v2/RenewToken`; a community POST attempt (DhanHQ-py issue #108, 2025-10-25) received HTTP
+   400. §2.2's curl (default GET) therefore stands. Any future change requires probing BOTH
+   verbs from the prod box (never from a sandbox — no token exists there and minting one would
+   invalidate the live prod token).
+5. **Runtime risk is bounded either way:** tickvault's TokenManager already runs
+   RenewToken-then-`generateAccessToken` fallback, so a wrong verb or the new-token semantics
+   degrades to one extra mint, not an outage.
