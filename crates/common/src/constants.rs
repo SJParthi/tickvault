@@ -1584,6 +1584,27 @@ pub const SPOT_1M_REST_FIRE_DELAY_MS: u64 = 300;
 /// minute close (fire delay + final offset), well inside the next boundary.
 pub const SPOT_1M_REST_RETRY_OFFSETS_MS: [u64; 4] = [700, 1_500, 3_000, 6_000];
 
+/// Deterministic per-SID ladder jitter STEP (ms) — each spot SID shifts its
+/// whole re-poll schedule by `slot × step` (slot = the SID's fixed position
+/// in [`SPOT_1M_REST_INDICES`]), so the 3 concurrent ladders never re-poll
+/// Dhan in lockstep (429-coordination follow-up 2026-07-13: the first live
+/// session showed `/v2/charts/intraday` rate-limiting when consumers
+/// align). Deterministic + pure — no randomness anywhere.
+pub const SPOT_1M_REST_LADDER_JITTER_STEP_MS: u64 = 150;
+
+/// Number of distinct jitter slots (== the pinned [`SPOT_1M_REST_INDICES`]
+/// arity): worst-case jitter is `(slots - 1) × step` = 300 ms.
+pub const SPOT_1M_REST_LADDER_JITTER_SLOTS: u64 = 3;
+
+/// Extra bounded backoff (ms) applied before the NEXT ladder attempt after
+/// an HTTP 429 (DH-904 class) response — gives Dhan's rate-limit window a
+/// beat instead of re-polling straight back into it (429-coordination
+/// follow-up 2026-07-13). Applied at most once per remaining rung (≤ 4×);
+/// the rung COUNT is unchanged (never an extra retry), and the worst-case
+/// schedule still fits the hard per-SID budget (const-asserted below).
+/// 429s stay counted via the existing `tv_spot1m_rate_limited_total`.
+pub const SPOT_1M_REST_429_EXTRA_BACKOFF_MS: u64 = 2_000;
+
 /// First per-minute fire boundary, IST seconds-of-day: 09:16:00 — the
 /// close of the session's first (09:15) 1-minute candle.
 pub const SPOT_1M_REST_FIRST_FIRE_SECS_OF_DAY_IST: u32 = 9 * 3600 + 16 * 60;
@@ -1636,6 +1657,10 @@ const _: () = assert!(
     "SPOT_1M last fire must be the 15:30:00 IST close boundary"
 );
 const _: () = assert!(
+    SPOT_1M_REST_LADDER_JITTER_SLOTS == SPOT_1M_REST_INDICES.len() as u64,
+    "SPOT_1M jitter slot count must equal the pinned index arity"
+);
+const _: () = assert!(
     SPOT_1M_REST_RETRY_OFFSETS_MS[0] < SPOT_1M_REST_RETRY_OFFSETS_MS[1]
         && SPOT_1M_REST_RETRY_OFFSETS_MS[1] < SPOT_1M_REST_RETRY_OFFSETS_MS[2]
         && SPOT_1M_REST_RETRY_OFFSETS_MS[2] < SPOT_1M_REST_RETRY_OFFSETS_MS[3],
@@ -1650,10 +1675,18 @@ const _: () = assert!(
     SPOT_1M_REST_FIRE_DELAY_MS + SPOT_1M_REST_SID_BUDGET_SECS * 1_000 < 60_000,
     "SPOT_1M per-SID ladder budget must finish inside the minute"
 );
+// 429-coordination follow-up (2026-07-13): the schedule bound now includes
+// the worst-case deterministic jitter ((slots-1) × step = 300 ms) AND a 429
+// extra backoff before EVERY remaining rung (4 × 2 s = 8 s) — the fully
+// hostile schedule (6 s + 0.3 s + 8 s + one 5 s request timeout = 19.3 s)
+// still fits the 20 s hard per-SID budget.
 const _: () = assert!(
-    SPOT_1M_REST_RETRY_OFFSETS_MS[3] + SPOT_1M_REST_REQUEST_TIMEOUT_SECS * 1_000
+    SPOT_1M_REST_RETRY_OFFSETS_MS[3]
+        + (SPOT_1M_REST_LADDER_JITTER_SLOTS - 1) * SPOT_1M_REST_LADDER_JITTER_STEP_MS
+        + SPOT_1M_REST_RETRY_OFFSETS_MS.len() as u64 * SPOT_1M_REST_429_EXTRA_BACKOFF_MS
+        + SPOT_1M_REST_REQUEST_TIMEOUT_SECS * 1_000
         < SPOT_1M_REST_SID_BUDGET_SECS * 1_000,
-    "SPOT_1M ladder schedule (last offset + one request timeout) must fit the budget"
+    "SPOT_1M ladder schedule (last offset + max jitter + max 429 backoffs + one request timeout) must fit the budget"
 );
 
 // ---------------------------------------------------------------------------
@@ -3994,6 +4027,25 @@ mod tests {
             SPOT_1M_REST_RETRY_OFFSETS_MS[3] + SPOT_1M_REST_REQUEST_TIMEOUT_SECS * 1_000
                 < SPOT_1M_REST_SID_BUDGET_SECS * 1_000,
             "ladder schedule must fit the budget"
+        );
+        // 429-coordination follow-up (2026-07-13): deterministic per-SID
+        // jitter + bounded 429 extra backoff, worst case still inside the
+        // hard 20 s per-SID budget (6 s + 0.3 s + 8 s + 5 s = 19.3 s).
+        assert_eq!(SPOT_1M_REST_LADDER_JITTER_STEP_MS, 150);
+        assert_eq!(SPOT_1M_REST_LADDER_JITTER_SLOTS, 3);
+        assert_eq!(
+            SPOT_1M_REST_LADDER_JITTER_SLOTS as usize,
+            SPOT_1M_REST_INDICES.len(),
+            "jitter slots must equal the pinned index arity"
+        );
+        assert_eq!(SPOT_1M_REST_429_EXTRA_BACKOFF_MS, 2_000);
+        assert!(
+            SPOT_1M_REST_RETRY_OFFSETS_MS[3]
+                + (SPOT_1M_REST_LADDER_JITTER_SLOTS - 1) * SPOT_1M_REST_LADDER_JITTER_STEP_MS
+                + SPOT_1M_REST_RETRY_OFFSETS_MS.len() as u64 * SPOT_1M_REST_429_EXTRA_BACKOFF_MS
+                + SPOT_1M_REST_REQUEST_TIMEOUT_SECS * 1_000
+                < SPOT_1M_REST_SID_BUDGET_SECS * 1_000,
+            "worst-case jittered + 429-backed-off schedule must fit the budget"
         );
         assert_eq!(SPOT_1M_REST_MAX_BODY_BYTES, 2 * 1024 * 1024);
     }

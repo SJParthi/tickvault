@@ -71,6 +71,23 @@ row's `close_to_data_ms` column stamps the REAL (> 60 s) retrieval delay
 while the histogram keeps sampling own-fire retrievals only. See
 `no-rest-except-live-feed-2026-06-27.md` §8.7 for the dated record.
 
+**2026-07-13 429-coordination follow-up (same-day, second PR):** the first
+live session ALSO showed `/v2/charts/intraday` rate-limiting BOTH
+consumers — the 15:31 bulk cross-verify lost 91/776 fetches to HTTP 429 at
+15:31–15:33 (compared=0, a BLIND day). Three bounded changes: (a) the spot
+half's ONE post-session repair sweep now fires at **~15:33:30 IST** (was
+~15:31:00) so its ≤3 requests clear that burst window (const-asserted ≥
+the cross-verify trigger + 150 s and before the 16:30 IST box stop);
+(b) the in-minute re-poll ladder carries a deterministic per-SID schedule
+jitter (slot × 150 ms — 0/150/300 ms, NO randomness) so the 3 concurrent
+ladders never re-poll in lockstep, and an HTTP 429 adds a bounded +2 s
+backoff before the NEXT rung (same rung count — never an extra retry;
+still counted by `tv_spot1m_rate_limited_total`; the worst-case all-429
+jittered schedule of 19.3 s is const-asserted inside the 20 s per-SID
+budget); (c) the cross-verify gained its OWN bounded 429 second pass —
+see the dated note in `cross-verify-1m-error-codes.md` §2 and the
+`tv_cross_verify_1m_retry_429_total{outcome}` counters.
+
 The OPTION-CHAIN half (PR-3, appended 2026-07-12) shares the same minute
 boundaries, SEQUENCED immediately after the spot leg via a watch signal the
 spot task publishes at the end of each fire (fallback timer 2.5 s after the
@@ -108,7 +125,9 @@ the `stage` field):
 1. `stage="minute_failed"` — coalesced ONCE per fired minute when one or
    more of the 3 SIDs ended the bounded ladder without the target candle:
    transport error, non-2xx (incl. DH-904/429 — counted by
-   `tv_spot1m_rate_limited_total`, never retried past the ladder), no
+   `tv_spot1m_rate_limited_total`, +2 s bounded backoff before the next
+   rung since the 2026-07-13 429-coordination follow-up, never retried
+   past the ladder), no
    token at fire time, or a 200 whose body never contained the just-closed
    minute (`outcome="empty"` — counted, included in the failure edge,
    never silent per audit Rule 11). Sub-edge: log-only, never a page.
