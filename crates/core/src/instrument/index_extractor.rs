@@ -36,8 +36,12 @@
 //!   shipped that
 //! - Daily universe builder combining indices + underlyings — Sub-PR #7
 //! - Persistence to `instrument_lifecycle` table — Sub-PR #9
-
-#![cfg(feature = "daily_universe_fetcher")]
+//!
+//! PR-C1 (2026-07-13): the module-level `daily_universe_fetcher` gate was
+//! REMOVED — the Groww watch build consumes `NSE_INDEX_ALLOWLIST` +
+//! `canonicalize_index_symbol` (scope-lock amendment §B KEEP items) and the
+//! de-gated `index_futures` selector imports the canonicalizer, so this
+//! module must build in every feature mode.
 
 use thiserror::Error;
 use tickvault_common::constants::INDEX_SYMBOL_ALIASES;

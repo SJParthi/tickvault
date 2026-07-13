@@ -77,6 +77,11 @@ pub mod boot_helpers;
 /// Dhan lane's running flag honest across runtime toggles and enforces the
 /// Dhan-disable safety gate at the supervisor layer (operator 2026-06-21/24).
 pub mod dhan_activation;
+/// Shared Dhan `/v2/charts/intraday` 1m request/response primitives —
+/// relocated from `cross_verify_1m_boot.rs` in Phase C1 of the 2026-07-13
+/// Dhan live-WS retirement (the spot-1m legs must outlive the cross-verify
+/// module the Phase C deletion PRs remove). Pure move, zero behavior change.
+pub mod dhan_intraday_parse;
 /// Dhan REST-only auth bootstrap (Phase A of the Dhan-live-feed removal,
 /// operator directive 2026-07-13): with `feeds.dhan_enabled = false` this
 /// brings up the RETAINED Dhan REST surface — dual-instance lock →
@@ -193,3 +198,8 @@ pub mod trading_pipeline;
 /// re-injection — replaces the raw try_send loop that dropped 1,127,801
 /// frames + kept the WAL unconfirmed (self-feeding re-replay storm).
 pub mod wal_reinject;
+/// Shared `ws_event_audit` channel + consumer helper — relocated from the
+/// main.rs binary in Phase C1 (2026-07-13) so the lib-side `dhan_rest_stack`
+/// (which owns the functional-dormant order-update WS per operator ruling
+/// Q4-i) can create its own audit consumer. Pure move, zero behavior change.
+pub mod ws_audit_consumer;

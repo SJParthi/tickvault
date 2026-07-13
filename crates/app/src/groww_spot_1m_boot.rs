@@ -139,7 +139,7 @@ use tickvault_storage::spot_1m_rest_persistence::{
     Spot1mRestRow, Spot1mRestWriter, ensure_spot_1m_rest_table,
 };
 
-use crate::cross_verify_1m_boot::MinuteCandle;
+use crate::dhan_intraday_parse::MinuteCandle;
 // The session-boundary scheduling primitives + edge tracker + body-cap
 // helpers are REUSED from the Dhan spot leg (they are NSE-session facts and
 // pure state machines — the option_chain_1m_boot precedent).
