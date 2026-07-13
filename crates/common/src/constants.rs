@@ -1562,12 +1562,46 @@ pub const MARKET_CLOSE_TIME_IST_EXCLUSIVE: &str = "15:30:00";
 // Spot 1m REST pipeline (operator grant 2026-07-12 — PR-2, the SPOT half)
 // ---------------------------------------------------------------------------
 
-/// The 3 IDX_I spot indices the per-minute REST pipeline fetches, as
-/// `(security_id, symbol)` pairs: NIFTY=13, BANKNIFTY=25, SENSEX=51.
-/// Deliberately NOT INDIA VIX (21) — the grant covers the 3 tradeable
-/// major indices only. Segment is always `IDX_I`, instrument `INDEX`.
-pub const SPOT_1M_REST_INDICES: [(SecurityId, &str); 3] =
-    [(13, "NIFTY"), (25, "BANKNIFTY"), (51, "SENSEX")];
+/// The 4 IDX_I spot indices the per-minute REST pipeline fetches, as
+/// `(security_id, symbol)` pairs: NIFTY=13, BANKNIFTY=25, SENSEX=51,
+/// INDIA VIX=21. Segment is always `IDX_I`, instrument `INDEX`.
+///
+/// INDIA VIX joined on 2026-07-13 (operator scope addition 2026-07-13,
+/// relayed via the coordinator session: INDIA VIX joins the spot 1m pull,
+/// SPOT ONLY, no option chain) — the original 2026-07-12 grant covered the
+/// 3 tradeable major indices. The chain leg deliberately keeps its own
+/// 3-underlying [`CHAIN_1M_UNDERLYINGS`] subset (const-asserted below the
+/// chain constants), so VIX can never leak into the option-chain pipeline.
+///
+/// HONESTY — whether Dhan `/v2/charts/intraday` serves INDIA VIX 1m
+/// candles at all is a LIVE-PROBE UNKNOWN: per-SID independence of the
+/// fire (each SID rides its own budgeted ladder in its own JoinSet task,
+/// and the failure edge's "fully failed" = ZERO SIDs succeeded) means a
+/// never-serving VIX can never delay or fail the other 3; the per-SID
+/// persistent-empty detector ([`SPOT_1M_REST_SID_NOT_SERVED_THRESHOLD`])
+/// pages it loudly instead of letting it rot silently.
+///
+/// Rate budget with 4 SIDs: one fire = 4 concurrent initial requests (one
+/// per index) — inside the Data-API 5/sec budget; re-polls are staggered
+/// by the deterministic per-SID jitter (0/150/300/450 ms), so no ladder
+/// instant ever exceeds the initial 4-wide burst.
+pub const SPOT_1M_REST_INDICES: [(SecurityId, &str); 4] = [
+    (13, "NIFTY"),
+    (25, "BANKNIFTY"),
+    (51, "SENSEX"),
+    (INDIA_VIX_SECURITY_ID, "INDIA VIX"),
+];
+
+/// Consecutive counted not-served minutes for ONE SID before the ONE
+/// edge-latched per-SID `SPOT1M-01 stage="sid_not_served"` page fires
+/// (operator scope addition 2026-07-13 — the INDIA VIX live-probe
+/// companion). A minute COUNTS toward a SID's streak only when that SID
+/// failed/was empty while ≥1 OTHER SID succeeded in the SAME minute — a
+/// global-outage minute (zero SIDs served) neither counts nor resets, so
+/// this detector distinguishes vendor-not-serving-this-index from a
+/// general outage (which the [`SPOT_1M_REST_CONSECUTIVE_FAIL_PAGE_THRESHOLD`]
+/// edge owns). Re-armed only by that SID's own recovery.
+pub const SPOT_1M_REST_SID_NOT_SERVED_THRESHOLD: u32 = 10;
 
 /// Post-minute-close fire delay (ms): the fetcher wakes ~300 ms after each
 /// minute boundary so Dhan has a beat to seal the just-closed candle before
@@ -1586,15 +1620,16 @@ pub const SPOT_1M_REST_RETRY_OFFSETS_MS: [u64; 4] = [700, 1_500, 3_000, 6_000];
 
 /// Deterministic per-SID ladder jitter STEP (ms) — each spot SID shifts its
 /// whole re-poll schedule by `slot × step` (slot = the SID's fixed position
-/// in [`SPOT_1M_REST_INDICES`]), so the 3 concurrent ladders never re-poll
+/// in [`SPOT_1M_REST_INDICES`]), so the 4 concurrent ladders never re-poll
 /// Dhan in lockstep (429-coordination follow-up 2026-07-13: the first live
 /// session showed `/v2/charts/intraday` rate-limiting when consumers
 /// align). Deterministic + pure — no randomness anywhere.
 pub const SPOT_1M_REST_LADDER_JITTER_STEP_MS: u64 = 150;
 
 /// Number of distinct jitter slots (== the pinned [`SPOT_1M_REST_INDICES`]
-/// arity): worst-case jitter is `(slots - 1) × step` = 300 ms.
-pub const SPOT_1M_REST_LADDER_JITTER_SLOTS: u64 = 3;
+/// arity): worst-case jitter is `(slots - 1) × step` = 450 ms (4 slots
+/// since the 2026-07-13 INDIA VIX scope addition).
+pub const SPOT_1M_REST_LADDER_JITTER_SLOTS: u64 = 4;
 
 /// Extra bounded backoff (ms) applied before the NEXT ladder attempt after
 /// an HTTP 429 (DH-904 class) response — gives Dhan's rate-limit window a
@@ -1676,10 +1711,10 @@ const _: () = assert!(
     "SPOT_1M per-SID ladder budget must finish inside the minute"
 );
 // 429-coordination follow-up (2026-07-13): the schedule bound now includes
-// the worst-case deterministic jitter ((slots-1) × step = 300 ms) AND a 429
-// extra backoff before EVERY remaining rung (4 × 2 s = 8 s) — the fully
-// hostile schedule (6 s + 0.3 s + 8 s + one 5 s request timeout = 19.3 s)
-// still fits the 20 s hard per-SID budget.
+// the worst-case deterministic jitter ((slots-1) × step = 450 ms at the
+// 4-SID arity) AND a 429 extra backoff before EVERY remaining rung
+// (4 × 2 s = 8 s) — the fully hostile schedule (6 s + 0.45 s + 8 s + one
+// 5 s request timeout = 19.45 s) still fits the 20 s hard per-SID budget.
 const _: () = assert!(
     SPOT_1M_REST_RETRY_OFFSETS_MS[3]
         + (SPOT_1M_REST_LADDER_JITTER_SLOTS - 1) * SPOT_1M_REST_LADDER_JITTER_STEP_MS
@@ -1691,11 +1726,37 @@ const _: () = assert!(
 
 // ---------------------------------------------------------------------------
 // Option-chain 1m REST pipeline (operator grant 2026-07-12 — PR-3, the
-// OPTION-CHAIN half; config-gated DEFAULT-OFF pending the live entitlement
-// probe). The 3 underlyings are the SAME [`SPOT_1M_REST_INDICES`] set and
-// the fire boundaries reuse SPOT_1M_REST_FIRST/LAST_FIRE_SECS_OF_DAY_IST —
-// the chain leg is sequenced immediately AFTER the spot leg each minute.
+// OPTION-CHAIN half). The 3 underlyings are the [`CHAIN_1M_UNDERLYINGS`]
+// subset below (NOT the full [`SPOT_1M_REST_INDICES`] set since the
+// 2026-07-13 INDIA VIX spot-only scope addition) and the fire boundaries
+// reuse SPOT_1M_REST_FIRST/LAST_FIRE_SECS_OF_DAY_IST — the chain leg is
+// sequenced immediately AFTER the spot leg each minute.
 // ---------------------------------------------------------------------------
+
+/// The 3 underlyings of the per-minute option-chain leg: NIFTY=13,
+/// BANKNIFTY=25, SENSEX=51 — the §8 grant's chain scope, UNCHANGED by the
+/// 2026-07-13 INDIA VIX spot addition (operator scope addition 2026-07-13,
+/// relayed via the coordinator session: INDIA VIX joins the spot 1m pull,
+/// SPOT ONLY, no option chain). The const-asserts below pin this as the
+/// VIX-free prefix of [`SPOT_1M_REST_INDICES`], so the spot set can never
+/// silently widen the chain scope.
+pub const CHAIN_1M_UNDERLYINGS: [(SecurityId, &str); 3] =
+    [(13, "NIFTY"), (25, "BANKNIFTY"), (51, "SENSEX")];
+
+// The chain scope is the strict SID prefix of the spot set…
+const _: () = assert!(
+    CHAIN_1M_UNDERLYINGS[0].0 == SPOT_1M_REST_INDICES[0].0
+        && CHAIN_1M_UNDERLYINGS[1].0 == SPOT_1M_REST_INDICES[1].0
+        && CHAIN_1M_UNDERLYINGS[2].0 == SPOT_1M_REST_INDICES[2].0,
+    "CHAIN_1M_UNDERLYINGS must stay the SID prefix of SPOT_1M_REST_INDICES"
+);
+// …and INDIA VIX (spot-only, 2026-07-13) can never enter the chain scope.
+const _: () = assert!(
+    CHAIN_1M_UNDERLYINGS[0].0 != INDIA_VIX_SECURITY_ID
+        && CHAIN_1M_UNDERLYINGS[1].0 != INDIA_VIX_SECURITY_ID
+        && CHAIN_1M_UNDERLYINGS[2].0 != INDIA_VIX_SECURITY_ID,
+    "INDIA VIX is SPOT-ONLY (2026-07-13 scope) — never an option-chain underlying"
+);
 
 /// Fallback post-boundary fire delay (ms) for the chain leg: the chain
 /// task normally wakes when the SPOT leg signals its minute complete
@@ -1839,13 +1900,17 @@ pub const GROWW_SPOT_1M_SYMBOLS: [(&str, &str, &str, &str); 3] = [
 /// daily coded warn, never silent).
 pub const GROWW_SPOT_1M_VIX_SYMBOL: &str = "INDIA VIX";
 
-// Arity guard: this CONST tracks the SAME 3 logical indices as the Dhan
-// leg. The Groww leg's 4th index (INDIA VIX, 2026-07-13 operator scope —
-// see GROWW_SPOT_1M_VIX_SYMBOL) is runtime-resolved and deliberately NOT
-// in this const set; any FURTHER index needs a fresh dated operator quote.
+// Arity guard: this CONST tracks the SAME 3 CORE logical indices as the
+// chain-scope subset [`CHAIN_1M_UNDERLYINGS`]. The 2026-07-13 INDIA VIX
+// scope addition put VIX on BOTH spot legs — the Dhan leg as the 4th
+// `SPOT_1M_REST_INDICES` entry (fixed IDX_I SID 21) and the Groww leg as
+// the runtime-resolved `GROWW_SPOT_1M_VIX_SYMBOL` target (deliberately NOT
+// in this const set — its Groww identity comes from the day's master).
+// VIX is SPOT ONLY on both legs; any FURTHER index needs a fresh dated
+// operator quote.
 const _: () = assert!(
-    GROWW_SPOT_1M_SYMBOLS.len() == SPOT_1M_REST_INDICES.len(),
-    "GROWW_SPOT_1M_SYMBOLS must mirror the 3-index SPOT_1M_REST_INDICES set"
+    GROWW_SPOT_1M_SYMBOLS.len() == 3 && GROWW_SPOT_1M_SYMBOLS.len() == CHAIN_1M_UNDERLYINGS.len(),
+    "GROWW_SPOT_1M_SYMBOLS must stay the 3 core indices (Groww VIX is runtime-resolved, not const)"
 );
 
 /// Post-minute-close fire delay (ms) for the Groww leg — mirrors
@@ -3991,15 +4056,36 @@ mod tests {
         assert_eq!(MARKET_CLOSE_IST_NANOS, 55_800_000_000_000);
     }
 
-    /// Spot 1m REST pipeline (operator grant 2026-07-12) — the 3-index
-    /// set is pinned to NIFTY=13, BANKNIFTY=25, SENSEX=51 (never INDIA
-    /// VIX), and the fire window is [09:16:00, 15:30:00] IST inclusive.
+    /// Spot 1m REST pipeline (operator grant 2026-07-12) — the index set
+    /// is pinned to NIFTY=13, BANKNIFTY=25, SENSEX=51 + INDIA VIX=21
+    /// (operator scope addition 2026-07-13, relayed via the coordinator
+    /// session: INDIA VIX joins the spot 1m pull, spot only, no option
+    /// chain), and the fire window is [09:16:00, 15:30:00] IST inclusive.
     #[test]
     fn test_spot_1m_rest_constants_pinned() {
         assert_eq!(
             SPOT_1M_REST_INDICES,
+            [
+                (13, "NIFTY"),
+                (25, "BANKNIFTY"),
+                (51, "SENSEX"),
+                (21, "INDIA VIX")
+            ]
+        );
+        assert_eq!(SPOT_1M_REST_INDICES[3].0, INDIA_VIX_SECURITY_ID);
+        // The chain leg stays the VIX-free 3-underlying §8 scope.
+        assert_eq!(
+            CHAIN_1M_UNDERLYINGS,
             [(13, "NIFTY"), (25, "BANKNIFTY"), (51, "SENSEX")]
         );
+        assert!(
+            CHAIN_1M_UNDERLYINGS
+                .iter()
+                .all(|&(sid, _)| sid != INDIA_VIX_SECURITY_ID),
+            "INDIA VIX is SPOT-ONLY — never a chain underlying"
+        );
+        // Per-SID not-served detector threshold (~10 minutes).
+        assert_eq!(SPOT_1M_REST_SID_NOT_SERVED_THRESHOLD, 10);
         assert_eq!(SPOT_1M_REST_FIRST_FIRE_SECS_OF_DAY_IST, 33_360); // 09:16:00
         assert_eq!(SPOT_1M_REST_LAST_FIRE_SECS_OF_DAY_IST, 55_800); // 15:30:00
         // Both boundaries are exact minute marks.
@@ -4030,9 +4116,10 @@ mod tests {
         );
         // 429-coordination follow-up (2026-07-13): deterministic per-SID
         // jitter + bounded 429 extra backoff, worst case still inside the
-        // hard 20 s per-SID budget (6 s + 0.3 s + 8 s + 5 s = 19.3 s).
+        // hard 20 s per-SID budget (6 s + 0.45 s + 8 s + 5 s = 19.45 s at
+        // the 4-SID arity).
         assert_eq!(SPOT_1M_REST_LADDER_JITTER_STEP_MS, 150);
-        assert_eq!(SPOT_1M_REST_LADDER_JITTER_SLOTS, 3);
+        assert_eq!(SPOT_1M_REST_LADDER_JITTER_SLOTS, 4);
         assert_eq!(
             SPOT_1M_REST_LADDER_JITTER_SLOTS as usize,
             SPOT_1M_REST_INDICES.len(),
@@ -4103,7 +4190,12 @@ mod tests {
                 ("BSE-SENSEX", "SENSEX", "BSE", "CASH"),
             ]
         );
-        assert_eq!(GROWW_SPOT_1M_SYMBOLS.len(), SPOT_1M_REST_INDICES.len());
+        // The Groww CONST set stays the 3 core indices; the Dhan set is 4
+        // (VIX = the fixed 4th entry) and the Groww 4th target is the
+        // runtime-resolved VIX (2026-07-13 scope, both legs SPOT ONLY).
+        assert_eq!(GROWW_SPOT_1M_SYMBOLS.len(), 3);
+        assert_eq!(GROWW_SPOT_1M_SYMBOLS.len(), CHAIN_1M_UNDERLYINGS.len());
+        assert_eq!(SPOT_1M_REST_INDICES.len(), 4);
         // The canonical VIX human symbol (2026-07-13 scope addition) — the
         // NSE_INDEX_ALLOWLIST / PHASE_0_IDX_I_SYMBOLS literal, and NEVER a
         // groww_symbol (the Groww identity is runtime-resolved).
