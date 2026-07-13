@@ -789,12 +789,9 @@ async fn main() -> Result<()> {
             .context("failed to build trading calendar")?,
     );
 
-    // Wave 2 Item 5 (G1) — install global TradingCalendar handle so the
-    // main-feed `wait_with_backoff` post-close path can sleep until the
-    // next NSE market open instead of giving up.
-    if !tickvault_core::websocket::connection::set_market_calendar(trading_calendar.clone()) {
-        tracing::warn!("global TradingCalendar already installed — skipping");
-    }
+    // (PR-C2, 2026-07-13: the Wave-2 `websocket::connection::set_market_calendar`
+    // global install retired with the deleted main-feed sleep path — the
+    // surviving order-update WS takes the calendar as an explicit parameter.)
 
     // Feed-health false-RED fix (2026-06-29) — install the SAME calendar in
     // `common::market_hours` so the `/feeds` health verdict's `market_open`
