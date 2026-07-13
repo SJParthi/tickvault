@@ -993,6 +993,7 @@ mod tests {
             "run_post_session_sweep(",
             "pub minute_done_tx",
             "send_replace",
+            // TEST-EXEMPT: string-literal ratchet needle (not a fn declaration) — pub-fn-test-guard grep false positive
             "pub fn spawn_supervised_spot_1m_rest",
         ] {
             assert!(

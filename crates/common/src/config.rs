@@ -121,6 +121,15 @@ pub struct ApplicationConfig {
     /// disabled + probe-and-report ON.
     #[serde(default)]
     pub groww_option_chain_1m: GrowwOptionChain1mConfig,
+    /// `[tf_consistency]` — daily timeframe-consistency verifier (operator
+    /// directive 2026-07-13: *"how will you guarantee that all our defined
+    /// timeframes internally are correct"*). At 15:40 IST every trading day,
+    /// recompute every sealed higher-TF candle (2m..4h, both feeds) from its
+    /// stored `candles_1m` constituents and compare exactly; findings land
+    /// in `tf_consistency_audit` + one Telegram summary. Cold path only.
+    /// Absent section ⇒ DISABLED (fail-safe default off).
+    #[serde(default)]
+    pub tf_consistency: TfConsistencyConfig,
 }
 
 /// `[feeds]` — pluggable market-data feed selection (operator lock
@@ -383,6 +392,24 @@ impl Default for ScoreboardConfig {
 pub struct Spot1mRestConfig {
     /// Master switch for the per-minute spot 1m REST fetcher. Default
     /// OFF (fail-safe) — `config/base.toml` turns it on explicitly.
+    #[serde(default)]
+    pub enabled: bool,
+}
+
+/// `[tf_consistency]` — daily timeframe-consistency verifier (operator
+/// directive 2026-07-13). Cold path only — the live candle pipeline, tick
+/// capture and trading are untouched; the verifier READS `candles_*` and
+/// writes ONLY its own `tf_consistency_audit` table.
+///
+/// Fail-safe shape: `enabled` is `#[serde(default)]` = `false`, so an
+/// absent `[tf_consistency]` section (or a TOML written before this PR)
+/// disables the verifier entirely. `config/base.toml` explicitly sets
+/// `enabled = true`.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct TfConsistencyConfig {
+    /// Master switch for the daily 15:40 IST timeframe-consistency
+    /// verifier. Default OFF (fail-safe) — `config/base.toml` turns it on
+    /// explicitly.
     #[serde(default)]
     pub enabled: bool,
 }
@@ -2335,6 +2362,7 @@ mod tests {
             option_chain_1m: OptionChain1mConfig::default(),
             groww_spot_1m: GrowwSpot1mConfig::default(),
             groww_option_chain_1m: GrowwOptionChain1mConfig::default(),
+            tf_consistency: TfConsistencyConfig::default(),
         }
     }
 
@@ -3832,6 +3860,45 @@ mod tests {
             .expect("explicit values must round-trip");
         assert!(on.groww_option_chain_1m.enabled);
         assert!(!on.groww_option_chain_1m.probe_and_report);
+    }
+
+    /// Daily timeframe-consistency verifier (operator 2026-07-13): the
+    /// `[tf_consistency]` section is fail-safe DEFAULT-OFF — via `Default`,
+    /// via a missing section, and via an empty section — and the explicit
+    /// base.toml opt-in round-trips.
+    #[test]
+    fn test_tf_consistency_config_default_off_and_round_trip() {
+        use figment::Figment;
+        use figment::providers::{Format, Toml};
+
+        assert!(
+            !TfConsistencyConfig::default().enabled,
+            "tf_consistency must default OFF (fail-safe; base.toml opts in)"
+        );
+
+        #[derive(Deserialize)]
+        struct Wrapper {
+            #[serde(default)]
+            tf_consistency: TfConsistencyConfig,
+        }
+        // Missing section entirely → disabled, never an error.
+        let missing: Wrapper = Figment::new()
+            .merge(Toml::string("[other]\nx = 1\n"))
+            .extract()
+            .expect("missing [tf_consistency] must default, not error");
+        assert!(!missing.tf_consistency.enabled);
+        // Empty section (no keys) → disabled via the field-level default.
+        let empty: Wrapper = Figment::new()
+            .merge(Toml::string("[tf_consistency]\n"))
+            .extract()
+            .expect("empty [tf_consistency] must default, not error");
+        assert!(!empty.tf_consistency.enabled);
+        // Explicit ON (the base.toml shape) round-trips.
+        let on: Wrapper = Figment::new()
+            .merge(Toml::string("[tf_consistency]\nenabled = true\n"))
+            .extract()
+            .expect("explicit enabled = true must round-trip");
+        assert!(on.tf_consistency.enabled);
     }
 
     /// A missing `[feeds]` section must fall back to the safe default
