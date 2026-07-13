@@ -2171,7 +2171,7 @@ pub const GROWW_CONTRACT_1M_DEFAULT_STRIKES_EACH_SIDE: u32 = 2;
 /// failing while its last anchor sits frozen) makes the underlying
 /// UNRESOLVED for the minute — a NAMED skip (coded warn `anchor_stale` +
 /// counter + `rest_fetch_audit` rows), never a silently-frozen off-ATM
-/// fetch window (round-1 review M3; the §38.7 decision-freshness
+/// fetch window (round-1 review M3; the §38.8 decision-freshness
 /// principle applied to the selection input). 5 minutes ≈ the 3-minute
 /// escalation edge + margin: the chain leg's own paging fires first.
 pub const GROWW_CONTRACT_1M_ANCHOR_MAX_AGE_MINUTES: u32 = 5;

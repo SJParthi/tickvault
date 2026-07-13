@@ -37,7 +37,7 @@
 //!   edge) makes the underlying UNRESOLVED for the minute (stage
 //!   `anchor_stale`: counter + edge-latched coded warn + named audit
 //!   rows), never a silently-frozen off-ATM window (round-1 review M3;
-//!   the §38.7 decision-freshness principle applied to the selection
+//!   the §38.8 decision-freshness principle applied to the selection
 //!   input).
 //! - WINDOW: ATM ± `strikes_each_side` (config, default 2) strikes × CE+PE
 //!   per underlying, interleaved round-robin across underlyings by
@@ -982,7 +982,7 @@ async fn fire_one_groww_contract_minute(
         .unwrap_or_default();
     // Review M3: an anchor frozen past the max age (chain leg dead /
     // silently failing) is a NAMED unresolved skip — never a silently
-    // trusted off-ATM window (§38.7 decision-freshness at the selection
+    // trusted off-ATM window (§38.8 decision-freshness at the selection
     // input).
     let (anchors, stale) = partition_fresh_anchors(
         &raw_anchors,

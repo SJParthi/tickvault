@@ -190,7 +190,7 @@ pub struct GrowwChain1mTaskParams {
 /// leg dead / silently failing) must become VISIBLY stale — beyond
 /// `GROWW_CONTRACT_1M_ANCHOR_MAX_AGE_MINUTES` the contract leg treats the
 /// underlying as unresolved (named skip), never fetching a frozen
-/// off-ATM window silently (§38.7 decision-freshness alignment).
+/// off-ATM window silently (§38.8 decision-freshness alignment).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct GrowwChainAnchor {
     /// The vendor `underlying_ltp` (a REAL LTP only — omitted/zero never
