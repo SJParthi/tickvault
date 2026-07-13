@@ -735,23 +735,25 @@ mod tests {
             "mod.rs re-gated `pub mod index_futures;` behind a feature \
              (preceding line: {preceding_line:?})"
         );
-        // (c) The Groww extraction site is unconditional: no cfg attribute
-        //     directly precedes `pub fn extract_index_future_entries(`.
+        // (c) The Groww instruments file carries NO feature gate AT ALL —
+        //     the strongest simple pin (2026-07-13 hostile-review L1: the
+        //     previous 6-line look-back above `extract_index_future_entries`
+        //     could be evaded by an attribute placed ABOVE the doc block;
+        //     whole-file zero-occurrence cannot). The fn-existence check
+        //     keeps the pin non-vacuous. This assertion's own literal lives
+        //     in THIS file, so it can never satisfy itself in the scanned
+        //     Groww source.
         let groww_src = include_str!("../feed/groww/instruments.rs");
-        let extract = groww_src
-            .find("pub fn extract_index_future_entries(")
-            .expect("groww instruments declares extract_index_future_entries"); // APPROVED: test
-        // Scan the attribute/doc block above the fn (up to 6 lines) for a
-        // feature gate — `#[must_use]` is fine, `#[cfg(feature = ...)]` is not.
-        let above: Vec<&str> = groww_src[..extract]
-            .trim_end()
-            .rsplit('\n')
-            .take(6)
-            .collect();
         assert!(
-            above.iter().all(|l| !l.contains("cfg(feature")),
-            "extract_index_future_entries regained a feature gate — the Groww \
-             futures extraction must be unconditional (lines above: {above:?})"
+            groww_src.contains("pub fn extract_index_future_entries("),
+            "groww instruments lost extract_index_future_entries — the §36.7 \
+             extraction site moved; re-point this ratchet"
+        );
+        assert!(
+            !groww_src.contains("cfg(feature"),
+            "feed/groww/instruments.rs regained a feature gate — the Groww \
+             futures extraction (and the whole Groww instruments module) must \
+             stay unconditional (daily-universe 2026-07-13 banner §(d))"
         );
         // (d) The dead empty-futures fallback stayed dead.
         assert!(
@@ -1089,15 +1091,28 @@ mod tests {
     /// whose expiry is unparsable — never panics, never invents a selection.
     /// PR-C1 (2026-07-13): feature-gated WITH its subject — the Dhan-side
     /// `DailyUniverse` helper keeps an item-level gate until Phase C3.
+    /// PR-C1 round-2 (2026-07-13): the test name carries BOTH the derivation
+    /// (`dhan_selections_from_universe`) AND its thin recording wrapper
+    /// (`record_dhan_selection_from_universe`) so the pub-fn-test-guard name
+    /// heuristic pins both — the wrapper's TEST-EXEMPT comment sits above its
+    /// item-level `#[cfg]` attribute, outside the guard's preceding-line
+    /// window. The wrapper is smoke-called (never panics on a futures-less
+    /// universe; single-feed record → the comparator cannot fire; the global
+    /// recorder side effect is deliberately NOT asserted — see the
+    /// recorder-test honesty note above `record_selection_in`).
     #[cfg(feature = "daily_universe_fetcher")]
     #[test]
-    fn test_dhan_selections_from_universe_empty_without_future_targets() {
+    fn test_record_dhan_selection_from_universe_and_dhan_selections_from_universe_empty() {
         use crate::instrument::daily_universe::DailyUniverse;
         let universe = DailyUniverse {
             subscription_targets: vec![],
             fno_contracts: vec![],
         };
         assert!(dhan_selections_from_universe(&universe).is_empty());
+        // Smoke: the wrapper is a no-op-derivation single-feed record on an
+        // empty universe — must not panic. Far date so a future test that
+        // records a "groww" selection can never accidentally pair with it.
+        record_dhan_selection_from_universe(&universe, d("2099-01-01"));
     }
 
     /// Hostile-review round 2 (2026-07-08): a vendor-glitch EXACT-duplicate

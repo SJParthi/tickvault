@@ -28,8 +28,11 @@ fn rest_stack_src() -> String {
     fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
 }
 
+// PR-C1 round-2 (2026-07-13): renamed to carry the relocated helper's full fn
+// name (`spawn_ws_event_audit_consumer`) so the pub-fn-test-guard name
+// heuristic keeps pinning it after the main.rs → lib module move.
 #[test]
-fn test_ws_event_audit_consumer_is_spawned_at_boot() {
+fn test_spawn_ws_event_audit_consumer_wired_and_moved_intact() {
     // The consumer is spawned via the shared helper, which the main-feed
     // pool, the legacy order-update spawn sites AND the dhan_rest_stack
     // rewire site (PR-C1, 2026-07-13) all reuse.
