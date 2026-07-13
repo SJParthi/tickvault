@@ -468,6 +468,56 @@ pub enum NotificationEvent {
         detail: String,
     },
 
+    /// Daily timeframe-consistency verifier (operator directive 2026-07-13:
+    /// *"how will you guarantee that all our defined timeframes internally
+    /// are correct"*): the ONE 3:40 PM IST summary covering BOTH passes —
+    /// Dhan (today) and Groww (previous trading day). Severity is
+    /// data-dependent: `Info` only when candles were compared, every paging
+    /// count is zero and the run was not degraded (or when there was
+    /// genuinely nothing to check — a feed-off `no_data` day); everything
+    /// else is `High`. A `buckets_compared == 0` run with data expected
+    /// must NEVER read as PASS (audit Rule 11 — the BLIND wording).
+    TfConsistencySummary {
+        /// The Dhan trading day verified, `YYYY-MM-DD` IST.
+        dhan_date_ist: String,
+        /// The Groww trading day verified (previous trading day), IST.
+        groww_date_ist: String,
+        /// Instruments examined across both passes.
+        instruments: u64,
+        /// Higher-timeframe candles present on BOTH sides and compared.
+        buckets_compared: u64,
+        /// Field-cells where a stored candle disagrees with its recompute.
+        mismatches: u64,
+        /// Windows with 1-minute data but NO stored higher-TF candle.
+        missing_tf_rows: u64,
+        /// Stored higher-TF candles with ZERO 1-minute rows behind them.
+        no_coverage: u64,
+        /// Stored candles whose timestamp is off the 9:15 AM grid.
+        off_grid: u64,
+        /// Duplicate rows sharing one storage key.
+        duplicates: u64,
+        /// True when any query/flush/budget leg degraded — the run cannot
+        /// vouch for the full universe.
+        degraded: bool,
+        /// True when findings exceeded the stored-detail cap (counts stay
+        /// exact; only the per-row detail was truncated).
+        truncated: bool,
+        /// Stable run verdict: `pass` / `mismatch` / `degraded` / `blind`
+        /// / `no_data`.
+        status_label: String,
+        /// Up to 10 plain-English worst offenders.
+        top_detail: Vec<String>,
+    },
+
+    /// The daily timeframe-consistency TASK died (panicked/failed) before
+    /// producing its summary. High so the absence of the daily verdict is
+    /// impossible to miss. NOT fired on graceful shutdown/cancellation
+    /// (the 16:30 IST auto-stop is a normal teardown, not an abort).
+    TfConsistencyAborted {
+        /// Plain-English description of how the task died.
+        detail: String,
+    },
+
     /// Per-minute spot 1m REST pipeline (operator grant 2026-07-12): the
     /// per-minute pull of the just-closed minute's official index candle
     /// has fully failed (no index succeeded) for several minutes in a row.
@@ -2022,6 +2072,107 @@ impl NotificationEvent {
                      2. Restart the app to re-arm tomorrow's check."
                 )
             }
+            Self::TfConsistencySummary {
+                dhan_date_ist,
+                groww_date_ist,
+                instruments,
+                buckets_compared,
+                mismatches,
+                missing_tf_rows,
+                no_coverage,
+                off_grid,
+                duplicates,
+                degraded,
+                truncated,
+                status_label,
+                top_detail,
+            } => {
+                let paging = mismatches
+                    .saturating_add(*missing_tf_rows)
+                    .saturating_add(*no_coverage)
+                    .saturating_add(*off_grid)
+                    .saturating_add(*duplicates);
+                let clean = paging == 0 && !*degraded && *buckets_compared > 0;
+                if clean {
+                    format!(
+                        "\u{2705} <b>Daily timeframe check @ 3:40 PM IST — PASS</b>\n\
+                         Dhan day: {dhan_date_ist} | Groww day: {groww_date_ist}\n\
+                         Instruments: {instruments} | Candles compared: {buckets_compared}\n\
+                         Every 2-minute-to-4-hour candle matches its 1-minute \
+                         building blocks exactly."
+                    )
+                } else if status_label == "no_data" {
+                    format!(
+                        "\u{1f515} <b>Daily timeframe check @ 3:40 PM IST — nothing to check</b>\n\
+                         Dhan day: {dhan_date_ist} | Groww day: {groww_date_ist}\n\
+                         No candles were recorded for these days (feeds were \
+                         off). This is not a pass and not a failure — there \
+                         was simply nothing to verify."
+                    )
+                } else if *buckets_compared == 0 {
+                    // The BLIND day: rows may exist but NOTHING could be
+                    // compared. An empty finding list must never read as a
+                    // pass (audit Rule 11 — the false-OK class).
+                    format!(
+                        "\u{1f198} <b>Daily timeframe check @ 3:40 PM IST — BLIND</b>\n\
+                         Dhan day: {dhan_date_ist} | Groww day: {groww_date_ist}\n\
+                         Checked NOTHING today — could NOT verify a single \
+                         candle. This is not a pass.\n\
+                         What to do RIGHT NOW:\n\
+                         1. Check the database is up and reachable.\n\
+                         2. Confirm the live feeds recorded candles today.\n\
+                         3. Re-run the check once the database is healthy."
+                    )
+                } else {
+                    let coverage_note = if *degraded {
+                        "\nCoverage was PARTIAL — some data could not be read, \
+                         so today's check cannot vouch for everything."
+                    } else {
+                        ""
+                    };
+                    let truncated_note = if *truncated {
+                        "\nCounts exceed the stored detail — only the first \
+                         findings were recorded row-by-row; the totals are exact."
+                    } else {
+                        ""
+                    };
+                    let mut detail_block = String::new();
+                    for line in top_detail.iter().take(10) {
+                        detail_block.push('\n');
+                        detail_block.push_str("• ");
+                        detail_block.push_str(&html_escape(line));
+                    }
+                    format!(
+                        "\u{26a0}\u{fe0f} <b>Daily timeframe check @ 3:40 PM IST — \
+                         NEEDS ATTENTION</b>\n\
+                         Dhan day: {dhan_date_ist} | Groww day: {groww_date_ist}\n\
+                         Instruments: {instruments} | Candles compared: {buckets_compared}\n\
+                         Value differences: {mismatches} | Missing candles: {missing_tf_rows}\n\
+                         Candles with no 1-minute data behind them: {no_coverage}\n\
+                         Off-grid timestamps: {off_grid} | Duplicates: {duplicates}\
+                         {coverage_note}{truncated_note}{detail_block}\n\
+                         What to do RIGHT NOW:\n\
+                         1. Review the worst offenders above — do they cluster \
+                         on one timeframe or one time of day?\n\
+                         2. If the app restarted mid-session today, restart \
+                         windows explain value differences.\n\
+                         3. Any off-grid timestamp means the candle clock \
+                         itself is wrong — escalate immediately."
+                    )
+                }
+            }
+            Self::TfConsistencyAborted { detail } => {
+                let detail = html_escape(detail);
+                format!(
+                    "\u{26a0}\u{fe0f} <b>Daily timeframe check did NOT run</b>\n\
+                     The 3:40 PM IST check that recomputes every higher-timeframe \
+                     candle from its 1-minute building blocks died before finishing.\n\
+                     Reason: {detail}\n\
+                     What to do RIGHT NOW:\n\
+                     1. Check the app is still running.\n\
+                     2. Restart the app to re-arm tomorrow's check."
+                )
+            }
             Self::Spot1mFetchDegraded {
                 consecutive_failed_minutes,
                 minute_ist,
@@ -3015,6 +3166,8 @@ impl NotificationEvent {
             Self::EndOfDayDigest { .. } => "EndOfDayDigest",
             Self::CrossVerify1mSummary { .. } => "CrossVerify1mSummary",
             Self::CrossVerify1mAborted { .. } => "CrossVerify1mAborted",
+            Self::TfConsistencySummary { .. } => "TfConsistencySummary",
+            Self::TfConsistencyAborted { .. } => "TfConsistencyAborted",
             Self::Spot1mFetchDegraded { .. } => "Spot1mFetchDegraded",
             Self::Spot1mFetchRecovered { .. } => "Spot1mFetchRecovered",
             Self::ChainFetchDegraded { .. } => "ChainFetchDegraded",
@@ -3296,6 +3449,37 @@ impl NotificationEvent {
                 }
             }
             Self::CrossVerify1mAborted { .. } => Severity::High,
+            // Daily timeframe-consistency verifier (2026-07-13): Info ONLY
+            // when candles were actually compared, every paging count is
+            // zero and the run was not degraded — or when there was
+            // genuinely nothing to check (a feed-off `no_data` day, which
+            // must never page High every day of a disabled-feed month).
+            // buckets_compared == 0 with data expected is BLIND → High
+            // (audit Rule 11: an empty compare set never reads as pass).
+            Self::TfConsistencySummary {
+                buckets_compared,
+                mismatches,
+                missing_tf_rows,
+                no_coverage,
+                off_grid,
+                duplicates,
+                degraded,
+                status_label,
+                ..
+            } => {
+                let paging = mismatches
+                    .saturating_add(*missing_tf_rows)
+                    .saturating_add(*no_coverage)
+                    .saturating_add(*off_grid)
+                    .saturating_add(*duplicates);
+                if (paging == 0 && !*degraded && *buckets_compared > 0) || status_label == "no_data"
+                {
+                    Severity::Info
+                } else {
+                    Severity::High
+                }
+            }
+            Self::TfConsistencyAborted { .. } => Severity::High,
             // Per-minute spot 1m REST pipeline (2026-07-12): the degraded
             // page is the edge-triggered escalation (3 consecutive fully-
             // failed minutes); the recovery is a positive Info ping.
@@ -3472,6 +3656,11 @@ impl NotificationEvent {
             // that re-renders the body — Severity::Info would otherwise be
             // batched by the default routing.
             Self::CrossVerify1mSummary { .. } => DispatchPolicy::Immediate,
+            // Daily timeframe-consistency verifier (2026-07-13): the
+            // once-per-day post-market summary must arrive AT 3:40 PM IST,
+            // not coalesced into a batching window — the exact
+            // CrossVerify1mSummary rationale above.
+            Self::TfConsistencySummary { .. } => DispatchPolicy::Immediate,
             // Dual-feed scorecard (2026-07-10): the once-per-day 15:45 IST
             // digest must arrive AT 15:45 (post-close = off-hours, so the
             // default Info routing would coalesce it) — same rationale as
