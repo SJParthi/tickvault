@@ -224,6 +224,15 @@ pub struct GrowwScaleSnapshot {
 pub struct FeedRuntimeState {
     dhan: Arc<AtomicBool>,
     groww: Arc<AtomicBool>,
+    /// The IMMUTABLE boot-config value of `feeds.dhan_enabled` (Phase A,
+    /// operator directive 2026-07-13). Distinct from the mutable `dhan`
+    /// runtime atomic: with the Dhan live WS lane retired by config
+    /// (`dhan_enabled = false` in base + production), the runtime
+    /// cold-start supervisor refuses a lane start — so the `/api/feeds`
+    /// handler must refuse a Dhan ENABLE at the API layer too (409),
+    /// instead of flipping a flag that can never take effect (a Rule-11
+    /// false-OK: /feeds would show ON while nothing can start).
+    dhan_config_enabled: bool,
     /// Set once by the boot wiring when the Groww bridge task is actually
     /// spawned (i.e. `groww_enabled` was true at boot). Read by the API to tell
     /// the operator honestly whether a runtime toggle will take effect.
@@ -281,6 +290,10 @@ impl FeedRuntimeState {
         Self {
             dhan: Arc::new(AtomicBool::new(feeds.dhan_enabled)),
             groww: Arc::new(AtomicBool::new(feeds.groww_enabled)),
+            // Phase A (2026-07-13): the boot-config Dhan value is retained
+            // immutably so the API can refuse a runtime enable of the
+            // retired lane (config-off is authoritative).
+            dhan_config_enabled: feeds.dhan_enabled,
             // The lane is not running until the boot wiring spawns it.
             groww_lane_running: AtomicBool::new(false),
             dhan_lane_running: AtomicBool::new(false),
@@ -367,6 +380,18 @@ impl FeedRuntimeState {
 
     pub fn set_dhan_disable_allowed(&self, allowed: bool) {
         self.dhan_disable_allowed.store(allowed, Ordering::Relaxed);
+    }
+
+    /// Phase A (operator directive 2026-07-13): was `feeds.dhan_enabled`
+    /// TRUE in the boot config? `false` means the Dhan live WS lane is
+    /// retired for this process — the runtime cold-start supervisor refuses
+    /// a lane start, so the `/api/feeds` handler refuses the enable
+    /// direction (409) instead of recording a flag that can never take
+    /// effect. Immutable for the process lifetime (config change + restart
+    /// is the only way to change it).
+    #[must_use]
+    pub fn is_dhan_config_enabled(&self) -> bool {
+        self.dhan_config_enabled
     }
 
     /// PR-E: may the operator DISABLE Dhan right now? `false` once live trading
@@ -542,6 +567,7 @@ impl std::fmt::Debug for FeedRuntimeState {
         f.debug_struct("FeedRuntimeState")
             .field("dhan", &self.dhan)
             .field("groww", &self.groww)
+            .field("dhan_config_enabled", &self.dhan_config_enabled)
             .field("groww_lane_running", &self.groww_lane_running)
             .field("dhan_lane_running", &self.dhan_lane_running)
             .field("dhan_pool_present", &self.dhan_pool_present)
@@ -597,6 +623,26 @@ mod tests {
         let state = FeedRuntimeState::from_config(&feeds);
         assert!(state.is_enabled(Feed::Dhan));
         assert!(state.is_enabled(Feed::Groww));
+        assert!(state.is_dhan_config_enabled());
+    }
+
+    #[test]
+    fn test_is_dhan_config_enabled_immutable_across_runtime_toggles() {
+        // Phase A (2026-07-13): the boot-config Dhan value is IMMUTABLE —
+        // runtime toggles flip the atomic, never the config snapshot the
+        // API refusal gate reads.
+        let feeds = FeedsConfig {
+            dhan_enabled: false,
+            groww_enabled: true,
+            ..Default::default()
+        };
+        let state = FeedRuntimeState::from_config(&feeds);
+        assert!(!state.is_dhan_config_enabled());
+        state.set_enabled(Feed::Dhan, true);
+        assert!(
+            !state.is_dhan_config_enabled(),
+            "runtime enable must not mutate the boot-config snapshot"
+        );
     }
 
     #[test]

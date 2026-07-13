@@ -8,14 +8,18 @@
 //! a shared [`crate::feed_state::FeedRuntimeState`] `Arc` that the Groww bridge
 //! reads every loop iteration — pause/resume Groww writes mid-session, no restart.
 //!
-//! **Honest envelope (PR-E / PR-2):** BOTH feeds are runtime-toggleable. The Dhan
-//! *disable* direction is safety-gated — `POST /api/feeds/dhan {enabled:false}` is
-//! allowed only when `can_disable_dhan()` is true (no-orders data-pull phase) and
-//! returns `409 CONFLICT` once live trading is on, so the system is never blinded
-//! mid-trade. Enabling Dhan is always allowed. A boot-ON Dhan toggle is a true
-//! live pause/resume; a boot-OFF Dhan enable records the flag but does NOT mark
-//! the lane running (no false-OK — the `dhan_pool_present` sentinel is false), so
-//! a restart with `dhan_enabled=true` is required to actually stream.
+//! **Honest envelope (PR-E / PR-2, amended 2026-07-13):** BOTH feeds are
+//! runtime-toggleable when their boot config allows a lane. The Dhan *disable*
+//! direction is safety-gated — `POST /api/feeds/dhan {enabled:false}` is allowed
+//! only when `can_disable_dhan()` is true (no-orders data-pull phase) and returns
+//! `409 CONFLICT` once live trading is on, so the system is never blinded
+//! mid-trade. The Dhan *enable* direction is allowed ONLY when the boot config
+//! has `dhan_enabled = true` (a boot-ON lane's live pause/resume). With the Dhan
+//! live WS lane RETIRED by operator directive 2026-07-13 (`dhan_enabled = false`
+//! in base + production config), a Dhan enable returns `409 CONFLICT` — flipping
+//! the flag would be a Rule-11 false-OK (feed-state.json persisted + /feeds
+//! showing ON while the runtime cold-start supervisor refuses to start the
+//! lane). Re-enabling requires a config change + restart.
 
 use axum::Json;
 use axum::extract::{Path, State};
@@ -127,10 +131,35 @@ pub async fn set_feed(
         ));
     }
 
+    // Phase A refusal (operator directive 2026-07-13 — "now remove this entire
+    // Dhan live websocket feed instruments subscription even entire live
+    // websocket feed itself"): with the boot CONFIG carrying
+    // `dhan_enabled = false`, the Dhan live WS lane is RETIRED — the runtime
+    // cold-start supervisor refuses to start it, so accepting this enable
+    // would be a false-OK (flag flipped + feed-state.json persisted + /feeds
+    // rendering ON while nothing can ever start). Refuse at the API layer in
+    // BOTH trading modes; do NOT flip the runtime flag, do NOT persist.
+    // Bearer-auth semantics are untouched (this handler already sits behind
+    // the unconditional bearer gate — 2026-07-04 lock).
+    if feed == Feed::Dhan && req.enabled && !state.feed_runtime().is_dhan_config_enabled() {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(FeedErrorResponse {
+                error: "the Dhan live feed was retired by operator directive 2026-07-13 \
+                     (Dhan is REST-only now; Groww is the live feed) — enabling it at \
+                     runtime is refused because nothing would start; to re-enable, set \
+                     dhan_enabled = true in the config and restart the app"
+                    .to_string(),
+                allowed: toggleable_except_dhan_labels(),
+            }),
+        ));
+    }
+
     // PR-E safety gate (operator-authorized 2026-06-21): DISABLING Dhan is the
     // one dangerous direction — it blinds the system. Allowed in the no-orders
     // data-pull phase (`dry_run`), REFUSED once live trading is on (so the feed
-    // can't be killed mid-trade). Enabling Dhan is always allowed.
+    // can't be killed mid-trade). Enabling Dhan is always allowed for a
+    // boot-ON lane (the Phase A gate above owns the boot-OFF case).
     if feed == Feed::Dhan && !req.enabled && !state.feed_runtime().can_disable_dhan() {
         return Err((
             StatusCode::CONFLICT,
@@ -168,17 +197,17 @@ pub async fn set_feed(
     // true live pause/resume — the dormant Dhan activation watcher (PR-2) keeps
     // the `dhan_lane_running` flag truthful both ways and the main-feed pool
     // reconnects via the shared enable flag (PR-E in-loop dormancy), no restart.
-    // If Dhan was OFF at boot, no main-feed pool was ever spawned, so enabling it
-    // via API records the flag but the full boot-OFF cold-start of the Dhan boot
-    // spine is not yet wired (the deferred residual of feed-toggle-full-lifecycle)
-    // — that still needs `dhan_enabled=true` in config + restart. The response
-    // carries `dhan_lane_running` so the page can tell the two cases apart.
+    // 2026-07-13: the boot-OFF (config dhan_enabled=false) enable case never
+    // reaches here anymore — the Phase A gate above refuses it with 409 — so
+    // this warn covers only the boot-ON transient where the lane is not (yet /
+    // any longer) marked running mid re-activation. The response carries
+    // `dhan_lane_running` so the page can tell the cases apart.
     if feed == Feed::Dhan && req.enabled && !state.feed_runtime().is_dhan_lane_running() {
         tracing::warn!(
-            "feed 'dhan' enabled via API but its main-feed pool was not started at \
-             boot (dhan_enabled=false then) — runtime pause/resume works for a \
-             boot-ON Dhan feed, but a boot-OFF Dhan feed's full cold-start is not \
-             yet wired; set dhan_enabled=true in config and restart to start it"
+            "feed 'dhan' enabled via API while its lane is not marked running — \
+             the boot-ON activation watcher re-activates it (runtime \
+             pause/resume); the response carries dhan_lane_running for the page \
+             to poll"
         );
     }
     metrics::counter!(
@@ -633,7 +662,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_set_feed_dhan_enable_always_allowed() {
-        // Enabling Dhan is never gated (only the disable direction is dangerous).
+        // Enabling Dhan is allowed when the BOOT CONFIG has dhan_enabled=true
+        // (a boot-ON lane's runtime pause/resume) — even while live trading
+        // gates the disable direction. FeedsConfig::default() is config-ON,
+        // so the Phase A retirement gate (config-off) does not apply here.
         let state = test_state(FeedsConfig::default());
         state.feed_runtime().set_dhan_disable_allowed(false);
         state.feed_runtime().set_enabled(Feed::Dhan, false);
@@ -643,8 +675,117 @@ mod tests {
             Json(SetFeedRequest { enabled: true }),
         )
         .await;
-        let Json(resp) = res.expect("enabling dhan always allowed");
+        let Json(resp) = res.expect("enabling a boot-ON dhan lane is allowed");
         assert!(resp.dhan_enabled);
+    }
+
+    /// Phase A (operator directive 2026-07-13): with the boot config carrying
+    /// `dhan_enabled = false` (the retired lane), a runtime Dhan ENABLE is
+    /// refused with 409 in the no-orders (dry-run) mode — the runtime flag is
+    /// NOT flipped (no false-OK: nothing could ever start).
+    /// test coverage (pub-fn-test-guard): is_dhan_config_enabled
+    #[tokio::test]
+    async fn test_set_feed_dhan_enable_refused_when_config_off_dry_run_mode() {
+        let state = test_state(FeedsConfig {
+            dhan_enabled: false,
+            groww_enabled: true,
+            ..Default::default()
+        });
+        // Default trading mode: dhan_disable_allowed = true (no-orders phase).
+        assert!(state.feed_runtime().can_disable_dhan());
+        let res = set_feed(
+            State(state.clone()),
+            Path("dhan".to_string()),
+            Json(SetFeedRequest { enabled: true }),
+        )
+        .await;
+        let Err((code, Json(body))) = res else {
+            panic!("enabling the retired (config-off) dhan lane must be refused");
+        };
+        assert_eq!(code, StatusCode::CONFLICT);
+        assert!(
+            body.error.contains("2026-07-13") && body.error.contains("restart"),
+            "refusal must name the directive + the config-change-and-restart \
+             path: {}",
+            body.error
+        );
+        assert!(
+            !state.feed_runtime().is_enabled(Feed::Dhan),
+            "the runtime flag must NOT flip on a refused enable"
+        );
+    }
+
+    /// Same refusal in the LIVE-TRADING mode (dhan_disable_allowed = false):
+    /// the Phase A gate is trading-mode-independent.
+    #[tokio::test]
+    async fn test_set_feed_dhan_enable_refused_when_config_off_live_trading_mode() {
+        let state = test_state(FeedsConfig {
+            dhan_enabled: false,
+            groww_enabled: true,
+            ..Default::default()
+        });
+        state.feed_runtime().set_dhan_disable_allowed(false);
+        let res = set_feed(
+            State(state.clone()),
+            Path("dhan".to_string()),
+            Json(SetFeedRequest { enabled: true }),
+        )
+        .await;
+        let Err((code, _body)) = res else {
+            panic!("enabling the retired dhan lane must be refused in live mode too");
+        };
+        assert_eq!(code, StatusCode::CONFLICT);
+        assert!(!state.feed_runtime().is_enabled(Feed::Dhan));
+    }
+
+    /// The DISABLE direction stays allowed (a no-op narrowing) when the lane
+    /// is retired by config — only the enable direction is refused.
+    #[tokio::test]
+    async fn test_set_feed_dhan_disable_still_allowed_when_config_off() {
+        let state = test_state(FeedsConfig {
+            dhan_enabled: false,
+            groww_enabled: true,
+            ..Default::default()
+        });
+        let res = set_feed(
+            State(state.clone()),
+            Path("dhan".to_string()),
+            Json(SetFeedRequest { enabled: false }),
+        )
+        .await;
+        let Json(resp) = res.expect("disabling the retired dhan lane is a no-op, not an error");
+        assert!(!resp.dhan_enabled);
+        assert!(!state.feed_runtime().is_enabled(Feed::Dhan));
+    }
+
+    /// Groww toggles are UNAFFECTED by the Dhan retirement gate.
+    #[tokio::test]
+    async fn test_set_feed_groww_toggles_unaffected_when_dhan_config_off() {
+        let state = test_state(FeedsConfig {
+            dhan_enabled: false,
+            groww_enabled: false,
+            ..Default::default()
+        });
+        let Json(on) = set_feed(
+            State(state.clone()),
+            Path("groww".to_string()),
+            Json(SetFeedRequest { enabled: true }),
+        )
+        .await
+        .expect("groww enable unaffected");
+        assert!(on.groww_enabled);
+        let Json(off) = set_feed(
+            State(state.clone()),
+            Path("groww".to_string()),
+            Json(SetFeedRequest { enabled: false }),
+        )
+        .await
+        .expect("groww disable unaffected");
+        assert!(!off.groww_enabled);
+        assert!(
+            !state.feed_runtime().is_enabled(Feed::Dhan),
+            "dhan untouched throughout"
+        );
     }
 
     #[tokio::test]
