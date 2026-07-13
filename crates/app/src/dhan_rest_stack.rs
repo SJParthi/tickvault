@@ -130,6 +130,30 @@ const DHAN_REST_STACK_TOKEN_RETRY_FLOOR_SECS: u64 = 130;
 /// families). First caller wins; later calls log INFO and return `None`.
 static DHAN_REST_STACK_SPAWNED: AtomicBool = AtomicBool::new(false);
 
+/// Process-global once-guard for the Dhan-REST SCHEDULED TASK FAMILY —
+/// SHARED between the lane path (`main.rs::spawn_post_market_tasks`: REST
+/// canary + spot_1m_rest + option_chain_1m + the lane-only orphan watchdog
+/// / EOD digest / 1m cross-verify) and this REST-only stack's Phase 5
+/// (canary + spot + chain).
+///
+/// INVARIANT (2026-07-13 hostile-review MEDIUM): the family is spawned AT
+/// MOST ONCE per process, WHICHEVER path claims first — so a future
+/// relaxation of the runtime cold-start refusal (or any new path into
+/// `run_dhan_lane_cold_start` → `spawn_post_market_tasks`) can never
+/// double-spawn the canary/spot/chain schedulers alongside this stack's
+/// (double Data-API pulls per minute close, double Telegram). Mutual
+/// exclusion by construction still holds today; this guard makes it
+/// mechanical instead of situational.
+static POST_MARKET_TASK_FAMILY_CLAIMED: AtomicBool = AtomicBool::new(false);
+
+/// Claim the shared Dhan-REST task-family once-guard: `true` exactly once
+/// per process (first caller wins). Called by BOTH spawn paths — the
+/// lane's `spawn_post_market_tasks` (main.rs) and this stack's Phase 5.
+#[must_use]
+pub fn claim_post_market_task_family_once() -> bool {
+    !POST_MARKET_TASK_FAMILY_CLAIMED.swap(true, Ordering::SeqCst)
+}
+
 /// Everything the bring-up task needs — Arc clones of the process-shared
 /// infra main.rs already built (nothing here is lane-owned).
 pub struct DhanRestStackParams {
@@ -577,6 +601,22 @@ async fn run_dhan_rest_stack(params: DhanRestStackParams) {
     // orphan watchdog, EOD digest and cross-verify deliberately stay
     // lane-only per the Phase A scope).
     // -----------------------------------------------------------------------
+    // Shared once-guard (2026-07-13 hostile-review MEDIUM): claim the
+    // Dhan-REST task family BEFORE spawning it, the SAME guard the lane's
+    // spawn_post_market_tasks claims — so a future relaxation of the
+    // runtime cold-start refusal can never run canary/spot/chain TWICE in
+    // one process. Unreachable today (mutual exclusion by construction);
+    // if it ever fires, the invariant is broken — stay down loudly.
+    if !claim_post_market_task_family_once() {
+        error!(
+            "Dhan REST-only stack: the Dhan-REST scheduled task family is ALREADY \
+             claimed this process (the lane's spawn_post_market_tasks ran first) — \
+             refusing to double-spawn canary/spot_1m_rest/option_chain_1m; the \
+             lane/stack mutual-exclusion invariant is broken, investigate (the \
+             stack stays DOWN: gauge remains 0)"
+        );
+        return;
+    }
     let token_handle = token_manager.token_handle();
     let config = &params.config;
 
@@ -819,6 +859,18 @@ mod tests {
         // AlreadyHeld wait accumulated, no number of transport retries can
         // trip it (the loop never feeds transport sleeps into it).
         assert!(!dhan_rest_lock_park_due(0));
+    }
+
+    /// `claim_post_market_task_family_once` — first caller wins, every
+    /// later claim is refused (the shared lane/stack task-family guard;
+    /// FIX 4 invariant: canary/spot/chain can never spawn twice per
+    /// process). NOTE: mutates the process-global static — no other test
+    /// in this binary touches it.
+    #[test]
+    fn test_claim_post_market_task_family_once_first_caller_wins() {
+        assert!(claim_post_market_task_family_once(), "first claim wins");
+        assert!(!claim_post_market_task_family_once(), "second refused");
+        assert!(!claim_post_market_task_family_once(), "latched forever");
     }
 
     /// `dhan_rest_token_backoff_secs` — every inter-attempt gap of the

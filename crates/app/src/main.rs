@@ -9241,7 +9241,8 @@ async fn start_dhan_lane(
     //   * the one-shot prev-day OHLCV fetch — self-exits after its bounded
     //     fail-soft fetch pass;
     //   * process-LATCHED families (spawned at most once per process):
-    //     post-market tasks (POST_MARKET_TASKS_SPAWNED), the market-open
+    //     post-market tasks (the shared lib guard
+    //     claim_post_market_task_family_once), the market-open
     //     one-shots (MARKET_OPEN_ONE_SHOTS_SPAWNED + fire-time dhan gate),
     //     the SLO supervisor (SLO_PUBLISHER_SUPERVISOR_SPAWNED), and the
     //     FirstSeenSet midnight reset (FIRST_SEEN_RESET_SPAWNED).
@@ -14373,16 +14374,22 @@ fn redact_ip_last_octet(raw: &str) -> String {
     "[REDACTED]".to_string()
 }
 
-/// Process-global once-guard for `spawn_post_market_tasks` (2026-07-02
-/// adversarial-sweep fix). The runtime Dhan cold-start path
-/// (`run_dhan_lane_cold_start` → `start_dhan_lane`) re-invokes
-/// `spawn_post_market_tasks` on EVERY disable→enable cycle, and the spawned
-/// tasks are bare `tokio::spawn`s not owned by `DhanLaneRunHandles` — so N
-/// enable cycles before the triggers accumulated N duplicate task families
-/// (N EOD digests, N cross-verifies, N orphan watchdogs). First caller wins;
-/// later calls log INFO and return.
-static POST_MARKET_TASKS_SPAWNED: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+// Process-global once-guard for `spawn_post_market_tasks` (2026-07-02
+// adversarial-sweep fix): the runtime Dhan cold-start path
+// (`run_dhan_lane_cold_start` → `start_dhan_lane`) re-invokes
+// `spawn_post_market_tasks` on EVERY disable→enable cycle, and the spawned
+// tasks are bare `tokio::spawn`s not owned by `DhanLaneRunHandles` — so N
+// enable cycles before the guard accumulated N duplicate task families
+// (N EOD digests, N cross-verifies, N orphan watchdogs). First caller wins;
+// later calls log INFO and return.
+//
+// 2026-07-13 (Phase A FIX 4): the guard static moved into the lib —
+// `tickvault_app::dhan_rest_stack::claim_post_market_task_family_once()` —
+// because the Dhan REST-only stack's Phase 5 spawns the SAME canary/spot/
+// chain family and must claim the SAME guard. INVARIANT: the Dhan-REST
+// scheduled task family is spawned at most once per process, whichever
+// path (lane or REST-only stack) claims first — a future relaxation of the
+// runtime cold-start refusal can never double-spawn canary/spot/chain.
 
 /// Spawn the scheduled daily tasks — the 15:25 IST orphan-position watchdog,
 /// end-of-day digest (15:31:30 IST), the 1-minute cross-verify (15:31:00 IST),
@@ -14409,10 +14416,11 @@ fn spawn_post_market_tasks(
     feed_runtime: std::sync::Arc<tickvault_api::feed_state::FeedRuntimeState>,
     feed_health: std::sync::Arc<tickvault_common::feed_health::FeedHealthRegistry>,
 ) {
-    if POST_MARKET_TASKS_SPAWNED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+    if !tickvault_app::dhan_rest_stack::claim_post_market_task_family_once() {
         info!(
             "post-market tasks already spawned this process — skipping duplicate \
-             (runtime Dhan cold-start re-entry)"
+             (runtime Dhan cold-start re-entry, or the Dhan REST-only stack \
+             already owns the canary/spot/chain family)"
         );
         return;
     }
