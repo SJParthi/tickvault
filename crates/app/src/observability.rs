@@ -608,6 +608,41 @@ pub fn sweep_errors_jsonl_retention(
     Ok(deleted)
 }
 
+/// Size cap for the single-file WARN+ append log
+/// (`data/logs/machine/errors.log`) — 512 MiB (2026-07-13 disk-retention
+/// hardening).
+///
+/// That file is deliberately skipped by every retention sweeper (the
+/// `*.log`-name guard in [`sweep_app_log_retention`] protects the human
+/// daily log), so before this cap it was the one unbounded single file in
+/// the log family — 100s of MB across degraded days (429 storms, tick-gap
+/// warns). Truncating it loses nothing uniquely: the same WARN+ lines also
+/// exist in the hourly machine app logs (`app.YYYY-MM-DD-HH`, 168 h
+/// retention) and — for ERROR — in `errors.jsonl.*` (48 h retention).
+pub const ERRORS_LOG_MAX_BYTES: u64 = 512 * 1024 * 1024;
+
+/// Truncates `path` to 0 bytes when it exceeds `max_bytes`; returns the
+/// pre-truncation size when a truncation happened, `Ok(None)` otherwise
+/// (including a missing file — never creates one). Safe against the live
+/// tracing writer: the file is opened `O_APPEND`, so every subsequent write
+/// repositions at the (new) EOF — no sparse hole, no torn offset. Hosted by
+/// the hourly errors.jsonl retention sweeper task in `main.rs` (no new
+/// task). Canonical path names are untouched — the caller passes
+/// `boot_helpers::ERROR_LOG_FILE_PATH`.
+pub fn cap_errors_log_size(path: &std::path::Path, max_bytes: u64) -> std::io::Result<Option<u64>> {
+    let size = match std::fs::metadata(path) {
+        Ok(meta) => meta.len(),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err),
+    };
+    if size <= max_bytes {
+        return Ok(None);
+    }
+    let file = std::fs::OpenOptions::new().write(true).open(path)?;
+    file.set_len(0)?;
+    Ok(Some(size))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1452,5 +1487,62 @@ mod tests {
         let _ = std::fs::remove_dir_all(&nonexistent);
         let deleted = sweep_category_log_retention(&nonexistent, "movers", 24).unwrap();
         assert_eq!(deleted, 0);
+    }
+
+    // ── errors.log size cap (2026-07-13 disk-retention hardening) ──────────
+
+    fn cap_tmp_file(name: &str, bytes: usize) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let path = std::env::temp_dir().join(format!("tv-errcap-{name}-{nanos}.log"));
+        std::fs::write(&path, vec![b'x'; bytes]).unwrap();
+        path
+    }
+
+    #[test]
+    fn test_cap_errors_log_under_limit_untouched() {
+        let path = cap_tmp_file("under", 100);
+        let outcome = cap_errors_log_size(&path, 200).unwrap();
+        assert_eq!(outcome, None, "under-limit file must be untouched");
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 100);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_cap_errors_log_at_limit_untouched() {
+        let path = cap_tmp_file("atlimit", 200);
+        let outcome = cap_errors_log_size(&path, 200).unwrap();
+        assert_eq!(outcome, None, "exactly-at-cap file must be untouched");
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 200);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_cap_errors_log_over_limit_truncated() {
+        let path = cap_tmp_file("over", 300);
+        let outcome = cap_errors_log_size(&path, 200).unwrap();
+        assert_eq!(outcome, Some(300), "must report the pre-truncation size");
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            0,
+            "over-cap file must be truncated to 0"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_cap_errors_log_missing_file_ok() {
+        let path = std::env::temp_dir().join("tv-errcap-definitely-missing.log");
+        let _ = std::fs::remove_file(&path);
+        let outcome = cap_errors_log_size(&path, 200).unwrap();
+        assert_eq!(outcome, None);
+        assert!(!path.exists(), "the cap must never CREATE the file");
+    }
+
+    #[test]
+    fn test_errors_log_cap_is_512_mib() {
+        assert_eq!(ERRORS_LOG_MAX_BYTES, 512 * 1024 * 1024);
     }
 }

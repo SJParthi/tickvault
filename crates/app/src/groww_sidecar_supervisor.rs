@@ -654,6 +654,16 @@ pub struct GrowwSidecarOptions {
     /// §34: human-readable shard identity for the child's log lines
     /// (`GROWW_SHARD_SPEC` env). Counts + ranges only — never a credential.
     pub shard_spec: Option<String>,
+    /// Disk-retention hardening (2026-07-13): S3 bucket for the sidecar's
+    /// rotated capture archives, injected into the child as
+    /// `TICKVAULT_GROWW_ARCHIVE_S3_BUCKET`. Sourced from
+    /// `[feeds.groww] capture_archive_s3_bucket`. Empty = archival OFF
+    /// (the sidecar keeps archives on disk; it NEVER deletes a file without
+    /// a verified S3 copy). A bucket/prefix name only — never a credential.
+    pub archive_s3_bucket: String,
+    /// Key prefix inside the archive bucket, injected as
+    /// `TICKVAULT_GROWW_ARCHIVE_S3_PREFIX`.
+    pub archive_s3_prefix: String,
 }
 
 impl Default for GrowwSidecarOptions {
@@ -668,6 +678,8 @@ impl Default for GrowwSidecarOptions {
             conn_id: None,
             watch_dir: None,
             shard_spec: None,
+            archive_s3_bucket: String::new(),
+            archive_s3_prefix: String::new(),
         }
     }
 }
@@ -692,6 +704,8 @@ pub fn shard_sidecar_options(
         conn_id: Some(files.conn_id),
         watch_dir: Some(files.watch_dir.clone()),
         shard_spec: Some(shard_spec),
+        archive_s3_bucket: base.archive_s3_bucket.clone(),
+        archive_s3_prefix: base.archive_s3_prefix.clone(),
     }
 }
 
@@ -1804,7 +1818,14 @@ pub async fn run_groww_sidecar_supervisor(
             .env(
                 "GROWW_STATUS_FILE",
                 opts.status_file.to_string_lossy().as_ref(),
-            );
+            )
+            // Disk-retention hardening (2026-07-13): capture-archive S3
+            // destination for the sidecar's verified offload sweep. Bucket +
+            // prefix NAMES only — never a credential (the sidecar uses the
+            // instance-profile credential chain, same as the SSM token read).
+            // Empty bucket = archival OFF (archives kept on disk).
+            .env("TICKVAULT_GROWW_ARCHIVE_S3_BUCKET", &opts.archive_s3_bucket)
+            .env("TICKVAULT_GROWW_ARCHIVE_S3_PREFIX", &opts.archive_s3_prefix);
         // §34 auto-scale: fleet children get their conn identity + per-conn
         // watch dir. Counts/paths only — never a credential. Single-conn path
         // sets NONE of these (byte-identical env to pre-scale).
@@ -2661,6 +2682,44 @@ mod tests {
                  credential env var — Groww credentials are Lambda-only"
             );
         }
+    }
+
+    #[test]
+    fn test_supervisor_injects_archive_s3_env() {
+        // Disk-retention hardening (2026-07-13): the supervisor must inject
+        // BOTH capture-archive S3 env vars into the sidecar child so the
+        // verified offload sweep knows its destination. Name/prefix strings
+        // only — never a credential. Source-scan (the supervise loop is
+        // TEST-EXEMPT); split needles so rustfmt wrapping can't break it.
+        let src = include_str!("groww_sidecar_supervisor.rs");
+        let bucket_key = format!("\"TICKVAULT_GROWW_ARCHIVE{}_S3_BUCKET\"", "");
+        let prefix_key = format!("\"TICKVAULT_GROWW_ARCHIVE{}_S3_PREFIX\"", "");
+        assert!(
+            src.contains(&bucket_key) && src.contains("opts.archive_s3_bucket"),
+            "the supervisor must inject TICKVAULT_GROWW_ARCHIVE_S3_BUCKET \
+             from opts.archive_s3_bucket"
+        );
+        assert!(
+            src.contains(&prefix_key) && src.contains("opts.archive_s3_prefix"),
+            "the supervisor must inject TICKVAULT_GROWW_ARCHIVE_S3_PREFIX \
+             from opts.archive_s3_prefix"
+        );
+    }
+
+    #[test]
+    fn test_shard_options_carry_archive_s3_fields() {
+        // §34 fleet children must inherit the archive destination — a shard
+        // child that silently dropped it would accumulate its own capture
+        // archives unbounded.
+        let base = GrowwSidecarOptions {
+            archive_s3_bucket: "tv-prod-cold".to_string(),
+            archive_s3_prefix: "groww-capture".to_string(),
+            ..GrowwSidecarOptions::default()
+        };
+        let files = crate::groww_bridge::shard_files(Path::new("data/groww"), 3);
+        let child = shard_sidecar_options(&base, &files, "shard 3".to_string());
+        assert_eq!(child.archive_s3_bucket, "tv-prod-cold");
+        assert_eq!(child.archive_s3_prefix, "groww-capture");
     }
 
     // ── requirements fingerprint re-provisioning gate (2026-07-02 boto3 swap) ──

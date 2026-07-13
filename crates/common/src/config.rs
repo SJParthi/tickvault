@@ -205,6 +205,20 @@ pub struct GrowwFeedTuning {
     /// `[feeds.groww.scale]` — multi-connection auto-scale ladder config.
     #[serde(default)]
     pub scale: GrowwScaleConfig,
+    /// S3 bucket for the sidecar's rotated capture archives
+    /// (`live-ticks-YYYYMMDD.ndjson`) — 2026-07-13 disk-retention hardening.
+    /// The supervisor injects this into the sidecar child as
+    /// `TICKVAULT_GROWW_ARCHIVE_S3_BUCKET`; the sidecar uploads each rotated
+    /// archive, VERIFIES the copy (head_object size match), and only then
+    /// deletes the local file after a grace window. Empty (the default) =
+    /// archival OFF: rotated archives are kept on disk (dev-Mac behaviour) —
+    /// the sidecar NEVER deletes a file without a verified S3 copy.
+    #[serde(default)]
+    pub capture_archive_s3_bucket: String,
+    /// Key prefix inside the archive bucket (`<prefix>/<filename>`).
+    /// Empty = bucket root.
+    #[serde(default)]
+    pub capture_archive_s3_prefix: String,
 }
 
 /// Tier A ceiling (§34.2, operator lock 2026-07-03): the Monday-approved
@@ -3696,6 +3710,62 @@ mod tests {
             .extract()
             .expect("explicit groww_native_shadow must round-trip");
         assert!(wrapper_on.feeds.groww_native_shadow);
+    }
+
+    /// Disk-retention hardening (2026-07-13): the Groww capture-archive S3
+    /// fields default EMPTY (= archival OFF, dev-Mac behaviour unchanged) —
+    /// both via `Default` and via a TOML that omits the keys.
+    #[test]
+    fn test_feeds_groww_capture_archive_defaults_empty() {
+        let tuning = GrowwFeedTuning::default();
+        assert!(
+            tuning.capture_archive_s3_bucket.is_empty(),
+            "archive bucket must default empty (archival OFF)"
+        );
+        assert!(tuning.capture_archive_s3_prefix.is_empty());
+
+        use figment::Figment;
+        use figment::providers::{Format, Toml};
+        #[derive(Deserialize)]
+        struct Wrapper {
+            feeds: FeedsConfig,
+        }
+        let wrapper: Wrapper = Figment::new()
+            .merge(Toml::string(
+                "[feeds]\ndhan_enabled = true\ngroww_enabled = false\n",
+            ))
+            .extract()
+            .expect("missing capture_archive keys must default, not error");
+        assert!(wrapper.feeds.groww.capture_archive_s3_bucket.is_empty());
+        assert!(wrapper.feeds.groww.capture_archive_s3_prefix.is_empty());
+    }
+
+    /// Disk-retention hardening (2026-07-13): explicit `[feeds.groww]`
+    /// capture-archive keys round-trip.
+    #[test]
+    fn test_feeds_groww_capture_archive_round_trip() {
+        use figment::Figment;
+        use figment::providers::{Format, Toml};
+        #[derive(Deserialize)]
+        struct Wrapper {
+            feeds: FeedsConfig,
+        }
+        let wrapper: Wrapper = Figment::new()
+            .merge(Toml::string(
+                "[feeds]\ndhan_enabled = true\ngroww_enabled = false\n\
+                 [feeds.groww]\ncapture_archive_s3_bucket = \"tv-prod-cold\"\n\
+                 capture_archive_s3_prefix = \"groww-capture\"\n",
+            ))
+            .extract()
+            .expect("explicit capture_archive keys must round-trip");
+        assert_eq!(
+            wrapper.feeds.groww.capture_archive_s3_bucket,
+            "tv-prod-cold"
+        );
+        assert_eq!(
+            wrapper.feeds.groww.capture_archive_s3_prefix,
+            "groww-capture"
+        );
     }
 
     /// Dual-feed scoreboard PR-A (2026-07-10): the `[scoreboard]` section
