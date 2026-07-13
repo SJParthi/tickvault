@@ -1,0 +1,43 @@
+# Dhan live-docs crawl list — 2026-07-13
+#
+# Provenance: docs/dhan-ref/verification-2026-07-13.md §3 (the operator
+# paste list from the 2026-07-13 search-index verification sweep, branch
+# claude/dhan-docs-verification-2026-07-13). The sandbox proxy 403-blocks
+# every Dhan host; this list is fetched runner-side by
+# .github/workflows/docs-fetch.yml where egress is open.
+#
+# Format: `SEED <url>` = fetched AND nav-crawled for doc links;
+# bare `<url>` = fetched only; `#` = comment.
+
+# Nav roots (seed the discovery crawl — defines the completeness universe)
+SEED https://dhanhq.co/docs/v2/
+SEED https://docs.dhanhq.co/
+
+# The 21 dhan-ref section pages (verification §3 checklist)
+https://dhanhq.co/docs/v2/authentication/
+https://dhanhq.co/docs/v2/live-market-feed/
+https://dhanhq.co/docs/v2/full-market-depth/
+https://dhanhq.co/docs/v2/historical-data/
+https://dhanhq.co/docs/v2/option-chain/
+https://dhanhq.co/docs/v2/orders/
+https://dhanhq.co/docs/v2/super-order/
+https://dhanhq.co/docs/v2/forever/
+https://dhanhq.co/docs/v2/conditional-trigger/
+https://dhanhq.co/docs/v2/edis/
+https://dhanhq.co/docs/v2/postback/
+https://dhanhq.co/docs/v2/annexure/
+https://dhanhq.co/docs/v2/instruments/
+https://dhanhq.co/docs/v2/order-update/
+https://dhanhq.co/docs/v2/market-quote/
+https://dhanhq.co/docs/v2/portfolio/
+https://dhanhq.co/docs/v2/funds/
+https://dhanhq.co/docs/v2/statements/
+https://dhanhq.co/docs/v2/traders-control/
+https://dhanhq.co/docs/v2/releases/
+
+# Snapshot-only coverage (no dhan-ref file)
+https://dhanhq.co/docs/v2/expired-options-data/
+
+# NEW docs portal pages named in verification §3 / §4 flag 7
+https://docs.dhanhq.co/api/v2/authentication/renew-token
+https://docs.dhanhq.co/api/v2/funds/calculate-multi-margin

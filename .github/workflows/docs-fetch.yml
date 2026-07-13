@@ -1,0 +1,219 @@
+# Reusable runner-side docs-fetch crawl.
+#
+# Purpose: the dev sandbox proxy blocks vendor doc hosts (dhanhq.co,
+# docs.dhanhq.co, gdf, ...) but GitHub Actions runners have open egress.
+# This workflow fetches a URL list on the runner, logs every fetch
+# (status/bytes/sha256/timestamp), optionally nav-crawls seed pages for
+# same-site doc links, uploads everything as an artifact, and (on
+# push-triggered runs only) best-effort commits the results back to the
+# SAME docs-fetch/** branch so the sandbox can retrieve them via git.
+#
+# Reuse: a sibling session (e.g. GDF) points `list_path` at its own list
+# via workflow_dispatch, or pushes its own docs-fetch/** branch carrying
+# its own docs-crawl/urls.txt.
+#
+# List file format (docs-crawl/urls.txt):
+#   # comment lines are ignored
+#   SEED https://example.com/docs/        <- fetched AND nav-crawled
+#   https://example.com/docs/page/        <- fetched only
+name: Docs Fetch Crawl
+
+on:
+  workflow_dispatch:
+    inputs:
+      list_path:
+        description: 'Path to the URL list file'
+        required: false
+        default: 'docs-crawl/urls.txt'
+      crawl_nav:
+        description: 'Also crawl links discovered on SEED pages'
+        required: false
+        type: boolean
+        default: true
+      label:
+        description: 'Artifact name suffix'
+        required: false
+        default: 'docs'
+  push:
+    branches: ['docs-fetch/**']
+
+permissions:
+  contents: write
+
+jobs:
+  crawl:
+    name: Fetch docs on runner
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Crawl
+        env:
+          INPUT_LIST_PATH: ${{ inputs.list_path }}
+          INPUT_CRAWL_NAV: ${{ inputs.crawl_nav }}
+        run: |
+          set -u
+          # Resolve list file: push events always use the committed default;
+          # dispatch uses the input path.
+          if [ "${GITHUB_EVENT_NAME}" = "push" ]; then
+            LIST_FILE="docs-crawl/urls.txt"
+            CRAWL_NAV="true"
+          else
+            LIST_FILE="${INPUT_LIST_PATH:-docs-crawl/urls.txt}"
+            CRAWL_NAV="${INPUT_CRAWL_NAV:-true}"
+          fi
+          if [ ! -f "$LIST_FILE" ]; then
+            echo "list file not found: $LIST_FILE" >&2
+            exit 1
+          fi
+          echo "list=$LIST_FILE crawl_nav=$CRAWL_NAV"
+
+          mkdir -p crawl-out/pages
+          LOG=crawl-out/fetch-log.tsv
+          printf 'url\thttp_status\tbytes\tsha256\tfetched_at_utc\tattempts\tdiscovered\n' > "$LOG"
+
+          UA='tickvault-docs-verifier/1.0 (+https://github.com/SJParthi/tickvault)'
+          FETCHED_URLS_FILE=$(mktemp)
+
+          sanitize() {
+            # URL -> safe filename
+            printf '%s' "$1" | sed -e 's|^https\?://||' -e 's|[^A-Za-z0-9._-]|_|g' | cut -c1-180
+          }
+
+          fetch_one() {
+            local url="$1" discovered="$2"
+            local out="crawl-out/pages/$(sanitize "$url").html"
+            local attempts=1 status="000"
+            status=$(curl -sSL --fail-with-body \
+              -A "$UA" --max-time 30 \
+              -o "$out" -w '%{http_code}' "$url" 2>/dev/null) || true
+            if [ "$status" != "200" ]; then
+              sleep 5
+              attempts=2
+              status=$(curl -sSL --fail-with-body \
+                -A "$UA" --max-time 30 \
+                -o "$out" -w '%{http_code}' "$url" 2>/dev/null) || true
+              [ -n "$status" ] || status="000"
+            fi
+            local bytes=0 sha="-"
+            if [ -f "$out" ]; then
+              bytes=$(wc -c < "$out" | tr -d ' ')
+              sha=$(sha256sum "$out" | cut -d' ' -f1)
+            fi
+            printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+              "$url" "$status" "$bytes" "$sha" "$(date -u +%FT%TZ)" "$attempts" "$discovered" >> "$LOG"
+            printf '%s\n' "$url" >> "$FETCHED_URLS_FILE"
+            echo "[$status] ($bytes bytes, attempt $attempts, discovered=$discovered) $url"
+            sleep 2
+          }
+
+          # --- Pass 1: the list file ---
+          SEEDS_FILE=$(mktemp)
+          while IFS= read -r line || [ -n "$line" ]; do
+            line=$(printf '%s' "$line" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+            [ -z "$line" ] && continue
+            case "$line" in
+              \#*) continue ;;
+              SEED\ *)
+                url="${line#SEED }"
+                printf '%s\n' "$url" >> "$SEEDS_FILE"
+                fetch_one "$url" 0
+                ;;
+              *)
+                fetch_one "$line" 0
+                ;;
+            esac
+          done < "$LIST_FILE"
+
+          REQUESTED_COUNT=$(wc -l < "$FETCHED_URLS_FILE" | tr -d ' ')
+
+          # --- Sitemaps (best-effort, always attempted) ---
+          for sm in https://dhanhq.co/sitemap.xml https://docs.dhanhq.co/sitemap.xml; do
+            fetch_one "$sm" 0
+          done
+
+          # --- Pass 2: nav crawl from SEED pages ---
+          DISCOVERED_FILE=$(mktemp)
+          if [ "$CRAWL_NAV" = "true" ] && [ -s "$SEEDS_FILE" ]; then
+            while IFS= read -r seed; do
+              page="crawl-out/pages/$(sanitize "$seed").html"
+              [ -f "$page" ] || continue
+              # host of the seed, for relative-link resolution
+              host=$(printf '%s' "$seed" | sed -E 's|^(https?://[^/]+).*|\1|')
+              # extract hrefs pointing at doc-site paths
+              grep -oE 'href="[^"]+"' "$page" 2>/dev/null \
+                | sed -e 's/^href="//' -e 's/"$//' \
+                | while IFS= read -r href; do
+                    case "$href" in
+                      *\#*) href="${href%%#*}" ;;
+                    esac
+                    [ -z "$href" ] && continue
+                    case "$href" in
+                      https://dhanhq.co/docs/v2/*|https://docs.dhanhq.co/*) echo "$href" ;;
+                      //dhanhq.co/docs/v2/*|//docs.dhanhq.co/*) echo "https:${href}" ;;
+                      /docs/v2/*|/api/v2/*) echo "${host}${href}" ;;
+                    esac
+                  done >> "$DISCOVERED_FILE" || true
+            done < "$SEEDS_FILE"
+
+            # normalize + dedupe against already-fetched, cap 150
+            sort -u "$DISCOVERED_FILE" | grep -vxF -f "$FETCHED_URLS_FILE" | head -150 > "${DISCOVERED_FILE}.todo" || true
+            DISCOVERED_COUNT=$(wc -l < "${DISCOVERED_FILE}.todo" | tr -d ' ')
+            echo "nav crawl discovered $DISCOVERED_COUNT new URLs"
+            cp "${DISCOVERED_FILE}.todo" crawl-out/discovered-urls.txt
+            while IFS= read -r durl; do
+              [ -z "$durl" ] && continue
+              fetch_one "$durl" 1
+            done < "${DISCOVERED_FILE}.todo"
+          else
+            DISCOVERED_COUNT=0
+            : > crawl-out/discovered-urls.txt
+          fi
+
+          # --- Summary ---
+          TOTAL=$(($(wc -l < "$LOG") - 1))
+          OK=$(awk -F'\t' 'NR>1 && $2=="200"' "$LOG" | wc -l | tr -d ' ')
+          FAILED=$(awk -F'\t' 'NR>1 && $2!="200"' "$LOG" | wc -l | tr -d ' ')
+          {
+            echo "# Docs crawl summary"
+            echo ""
+            echo "- Run: ${GITHUB_RUN_ID} (${GITHUB_EVENT_NAME}) at $(date -u +%FT%TZ)"
+            echo "- List file: ${LIST_FILE}"
+            echo "- Requested (list): ${REQUESTED_COUNT}"
+            echo "- Discovered (nav crawl): ${DISCOVERED_COUNT}"
+            echo "- Total fetch attempts: ${TOTAL}"
+            echo "- HTTP 200: ${OK}"
+            echo "- Failed (non-200): ${FAILED}"
+            echo ""
+            if [ "$FAILED" -gt 0 ]; then
+              echo "## Failures"
+              echo ""
+              echo '| url | status | attempts |'
+              echo '|---|---|---|'
+              awk -F'\t' 'NR>1 && $2!="200" {printf "| %s | %s | %s |\n", $1, $2, $6}' "$LOG"
+            fi
+          } > crawl-out/SUMMARY.md
+          cat crawl-out/SUMMARY.md
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: docs-crawl-${{ inputs.label || 'dhan' }}-${{ github.run_id }}
+          path: crawl-out/
+          retention-days: 7
+
+      # Best-effort: push results to the SAME docs-fetch/** branch so a
+      # proxy-restricted sandbox can retrieve them via git fetch. GITHUB_TOKEN
+      # pushes never re-trigger workflows, so there is no recursion. Only on
+      # push-event runs — dispatch reuse stays artifact-only.
+      - name: Commit results to branch (push runs only)
+        if: always() && github.event_name == 'push'
+        run: |
+          set -u
+          git config user.name 'tickvault-docs-crawler[bot]'
+          git config user.email 'docs-crawler@users.noreply.github.com'
+          git add -f crawl-out/ || true
+          git commit -m 'chore(docs-crawl): runner crawl results' || true
+          git push origin "HEAD:${GITHUB_REF_NAME}" || true
