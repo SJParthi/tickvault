@@ -484,3 +484,19 @@ enabled = true
 [option_chain_1m]
 enabled = true  # entitlement proven live 2026-07-13 08:31:49 IST (§8.7)
 probe_and_report = true
+
+# ===========================================================================
+# Daily timeframe-consistency verifier (operator directive 2026-07-13 —
+# "how will you guarantee that all our defined timeframes internally are
+# correct — how do you identify whether any miscalculation or data
+# issues"). At 15:40 IST every trading day, recompute every sealed
+# higher-timeframe candle (2m..4h) from its stored 1-minute constituents
+# and compare exactly — Dhan verifies TODAY (stable after the 15:30:05
+# close seal); Groww verifies the PREVIOUS trading day (its tails seal at
+# IST midnight). Findings land in the tf_consistency_audit table + one
+# Telegram summary (TF-VERIFY-01/02). Cold path; the live candle pipeline
+# is untouched. An ABSENT section = disabled (fail-safe);
+# `enabled = false` is the rollback switch.
+# ===========================================================================
+[tf_consistency]
+enabled = true
