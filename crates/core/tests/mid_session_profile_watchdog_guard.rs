@@ -55,22 +55,26 @@ fn mid_session_watchdog_module_exists() {
 }
 
 // ---------------------------------------------------------------------------
-// (2) main.rs spawns the watchdog after auth is initialized
+// (2) the Dhan REST stack spawns the watchdog after auth is initialized
+//     (RE-POINTED PR-C2, 2026-07-13: the spawn moved from the deleted
+//     `start_dhan_lane` in main.rs into `dhan_rest_stack.rs` — the single
+//     surviving Dhan boot path after the live-WS lane retirement per
+//     websocket-connection-scope-lock.md "2026-07-13 Amendment".)
 // ---------------------------------------------------------------------------
 
 #[test]
 fn main_rs_spawns_mid_session_watchdog() {
-    let src = read("crates/app/src/main.rs");
+    let src = read("crates/app/src/dhan_rest_stack.rs");
     assert!(
         src.contains("spawn_mid_session_profile_watchdog"),
-        "main.rs must spawn the mid-session profile watchdog — without it, \
-         a mid-session dataPlan/segment/token invalidation goes undetected \
-         until the next boot, exactly the 2026-04-21 failure mode."
+        "dhan_rest_stack.rs must spawn the mid-session profile watchdog — \
+         without it, a mid-session dataPlan/segment/token invalidation goes \
+         undetected until the next boot, exactly the 2026-04-21 failure mode."
     );
     assert!(
         src.contains("mid-session profile watchdog spawned"),
-        "main.rs must log a confirmation line so deployment logs show the \
-         watchdog is running."
+        "dhan_rest_stack.rs must log a confirmation line so deployment logs \
+         show the watchdog is running."
     );
 }
 

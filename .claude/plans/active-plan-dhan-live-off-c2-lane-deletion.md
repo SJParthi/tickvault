@@ -129,13 +129,13 @@ Until merge, the branch can be abandoned with zero prod impact (prod already run
 
 ## Plan Items
 
-- [ ] Archive C1 plan; create this plan (Files: .claude/plans/*)
-- [ ] Delete FAST crash-recovery boot arm + run_shutdown_fast (Files: crates/app/src/main.rs; Tests: systemd_boot_notify_guard, boot_path_notify_parity, fast_boot_token_validation_wiring_guard removal/adjust)
-- [ ] Delete lane fns + gate simplification (Files: crates/app/src/main.rs; Tests: d2a/d2_stage2 guards adjusted)
-- [ ] Delete D2b supervisor + dhan_activation.rs + LaneState (Files: crates/app/src/main.rs, crates/app/src/dhan_activation.rs, crates/api/src/feed_state.rs; Tests: chaos_feed_state, feed handler tests)
-- [ ] Delete main-feed WS machinery (Files: crates/core/src/websocket/*; Tests: core suite both feature modes)
-- [ ] Delete spawn_post_market_tasks + wire family-claim comment (Files: crates/app/src/main.rs, crates/app/src/dhan_rest_stack.rs; Tests: tick_conservation_wiring_guard adjusted)
-- [ ] SLO publisher deletion + terraform retirement + rule-file note (Files: crates/app/src/main.rs, crates/core/src/instrument/slo_score.rs, deploy/aws/terraform/*, .claude/rules/project/wave-3-d-error-codes.md; Tests: cloudwatch wiring guards adjusted)
-- [ ] Re-home tv_order_update_ws_active (Files: crates/core/src/websocket/order_update_connection.rs; Tests: gauge write pin)
-- [ ] Non-blocking Dhan-OFF liveness emit (Files: crates/app/src/main.rs; Tests: boot_completed_metric_guard)
+- [x] Archive C1 plan; create this plan (Files: .claude/plans/*)
+- [x] Delete FAST crash-recovery boot arm + run_shutdown_fast (Files: crates/app/src/main.rs; Tests: systemd_boot_notify_guard, boot_path_notify_parity, fast_boot_token_validation_wiring_guard removal/adjust)
+- [x] Delete lane fns + gate simplification (Files: crates/app/src/main.rs; Tests: d2a/d2_stage2 guards adjusted)
+- [x] Delete D2b supervisor + dhan_activation.rs + LaneState (Files: crates/app/src/main.rs, crates/app/src/dhan_activation.rs, crates/api/src/feed_state.rs; Tests: chaos_feed_state, feed handler tests)
+- [x] Delete main-feed WS machinery (Files: crates/core/src/websocket/*; Tests: core suite both feature modes)
+- [x] Delete spawn_post_market_tasks + wire family-claim comment (Files: crates/app/src/main.rs, crates/app/src/dhan_rest_stack.rs; Tests: tick_conservation_wiring_guard adjusted)
+- [x] SLO publisher deletion + rule-file PARK note (Files: crates/app/src/main.rs, .claude/rules/project/wave-3-d-error-codes.md) — publisher deleted per the operator PARK ruling; wave-3-d banner added. Terraform alarm REMOVAL deferred to Phase C follow-up (both realtime-guarantee alarms are dormant-safe: treat_missing_data=notBreaching + actions off by default; the liveness alarm was re-pointed to the Groww lag gauge in Phase A); slo_score.rs retained as a contract stub per the same banner
+- [x] Re-home tv_order_update_ws_active (Files: crates/core/src/websocket/order_update_connection.rs; Tests: gauge write pin)
+- [x] Non-blocking Dhan-OFF liveness emit (Files: crates/app/src/main.rs; Tests: boot_completed_metric_guard)
 - [ ] New ratchets + baseline syncs (Files: crates/app/tests/*, quality baselines)

@@ -1,5 +1,7 @@
 # Wave 3-D Error Codes
 
+> **⚠ SLO PUBLISHER PARKED 2026-07-13 (PR-C2 — Dhan live-WS lane deletion; operator PARK ruling recorded in `.claude/plans/active-plan-dhan-live-off-c2-lane-deletion.md`):** the 10s SLO evaluator/publisher (`spawn_slo_publisher_task` / `spawn_supervised_slo_publisher` in main.rs) was DELETED with the lane — its six dimensions were dominated by the retired Dhan inputs (WS pool health, Dhan tick freshness, Phase-2 outcome), so the composite could never again read honestly on the Groww-only runtime. Effects: `tv_realtime_guarantee_score` + the `tv_realtime_guarantee_dimension` gauges are no longer published (the `tv-<env>-realtime-guarantee-critical`/`-degraded` CloudWatch alarms sit dormant on missing data — `treat_missing_data = notBreaching`, actions off by default — full terraform removal is a flagged Phase C follow-up); the SLO-01/SLO-02 emit sites died with the publisher; SLO-03 (the publisher-respawn supervisor code) has no emitter. The `slo_score.rs` pure evaluator + the `SloXX` ErrorCode variants are RETAINED (contract stubs) pending either a Groww-scoped SLO re-design with a fresh dated operator quote, or Phase C variant cleanup. The market-hours liveness alarm was re-pointed off the score to `tv_groww_exchange_lag_p99_seconds` in Phase A (2026-07-13). Content below retained for historical audit.
+
 > **Authority:** This file is the runbook target for the new ErrorCode
 > variants added in the Wave 3-D hardening implementation (Item 13 —
 > composite real-time guarantee score gauge). Cross-ref test
