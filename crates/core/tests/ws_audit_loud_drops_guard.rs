@@ -64,10 +64,12 @@ fn assert_drop_arms_loud(src: &str, file: &str) {
     );
 }
 
-#[test]
-fn test_main_feed_drop_arm_is_loud() {
-    assert_drop_arms_loud(&read_ws_src("connection.rs"), "connection.rs");
-}
+// RETIRED (PR-C2, 2026-07-13 - Dhan live-WS lane deletion, operator
+// retirement directive per websocket-connection-scope-lock.md
+// "2026-07-13 Amendment" S/B): test_main_feed_drop_arm_is_loud died with the machinery it pinned -
+// the main-feed `emit_ws_audit` drop arm was deleted with
+// `connection.rs`. The surviving order-update drop arm keeps its own loud
+// pin (`test_order_update_drop_arm_is_loud`, below).
 
 #[test]
 fn test_order_update_drop_arm_is_loud() {

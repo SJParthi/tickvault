@@ -197,7 +197,18 @@ pub struct DhanRestStackParams {
     /// Runtime feed-state — receives `set_live_token_manager` so the token
     /// gauges read this stack's manager.
     pub feed_runtime: Arc<FeedRuntimeState>,
+    /// Shared /health state (PR-C2, 2026-07-13): the stack owns the token
+    /// block writer (`token_remaining_secs` + `token_valid`) — the lane's
+    /// `spawn_token_health_writer` died with the lane, and without a writer
+    /// GET /health would report the token invalid forever.
+    pub health: tickvault_api::state::SharedHealthStatus,
 }
+
+/// Cadence (seconds) of the /health token-block writer (PR-C2 re-home of
+/// the deleted lane's `spawn_token_health_writer` — B3 round-2 lineage).
+/// Matches the former 10s cadence so the /health / READY / EOD token block
+/// stays within the same ≤10s staleness envelope the B3 plan documented.
+const TOKEN_HEALTH_WRITER_INTERVAL_SECS: u64 = 10;
 
 /// Bounded exponential backoff for the stack's retry-forever loops:
 /// 10s → 20s → 40s → 80s → 160s → 300s cap (attempt is 1-based; 0 is
@@ -594,9 +605,43 @@ async fn run_dhan_rest_stack(params: DhanRestStackParams) {
         tickvault_core::auth::mid_session_watchdog::spawn_mid_session_profile_watchdog(
             Arc::clone(&token_manager),
             Some(Arc::clone(&params.notifier)),
-            token_profile_valid,
+            Arc::clone(&token_profile_valid),
         );
     info!("Dhan REST-only stack: mid-session profile watchdog spawned (15-min cadence)");
+
+    // PR-C2 (2026-07-13): the token observability writers re-home HERE from
+    // the deleted lane (the Phase A comment's "stay lane-only" is closed):
+    //  1. the 15s `tv_token_valid` / `tv_token_remaining_seconds` gauge
+    //     poller (the AUTH-GAP-05 honest gauges — their only prior spawn
+    //     sites were the deleted fast arm + lane), and
+    //  2. the 10s /health token-block writer (`token_remaining_secs` +
+    //     `token_valid`, AND-composed with the profile-truth flag above —
+    //     the F15 derivation), so GET /health keeps an honest token verdict.
+    let _token_health_gauge_handle =
+        tickvault_core::auth::token_health_gauge::spawn_token_health_gauge_poller(
+            Arc::clone(&token_manager),
+            Arc::clone(&token_profile_valid),
+        );
+    let _token_health_writer_handle = {
+        let writer_manager = Arc::clone(&token_manager);
+        let writer_profile = Arc::clone(&token_profile_valid);
+        let writer_health = params.health.clone();
+        tokio::spawn(async move {
+            let mut interval =
+                tokio::time::interval(Duration::from_secs(TOKEN_HEALTH_WRITER_INTERVAL_SECS));
+            loop {
+                interval.tick().await;
+                let secs = writer_manager.seconds_until_expiry();
+                let profile_ok = writer_profile.load(Ordering::Acquire);
+                writer_health.set_token_remaining_secs(secs);
+                // F15 derivation: locally-valid (> 0, fail-closed at the
+                // expiry instant) AND the profile-truth flag — a Dhan-killed
+                // but locally-unexpired token can never read valid.
+                writer_health.set_token_valid(secs > 0 && profile_ok);
+            }
+        })
+    };
+    info!("Dhan REST-only stack: token health gauge poller + /health token writer spawned");
 
     // -----------------------------------------------------------------------
     // Phase 4: Dhan client-id (the option-chain endpoints need the extra
