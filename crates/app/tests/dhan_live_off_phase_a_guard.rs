@@ -23,9 +23,11 @@
 //!    `crates/api/src/feed_state_persist.rs` (a stale
 //!    `data/feed-state.json` with `dhan_enabled: true` can never resurrect
 //!    the retired lane) + the suppression predicate + the boot-site warn.
-//! 4. The runtime cold-start supervisor carries the refusal (a POST
-//!    /api/feeds/dhan enable must not cold-start the full lane against the
-//!    REST-only stack's SSM lock).
+//! 4. The runtime cold-start supervisor carries the refusal, keyed off the
+//!    RAW pre-overlay TOML value (round-2 FIX A) — a POST /api/feeds/dhan
+//!    enable must not cold-start the full lane against the REST-only
+//!    stack's SSM lock, and the spawn must live inside the gate's else arm
+//!    (brace-matched — round-2 FIX C).
 //! 5. Stub-guard (audit-findings Rule 14): `dhan_rest_stack.rs` really
 //!    brings the retained REST surface up — lock-before-mint, token init,
 //!    renewal, watchdog, canary, spot, chain, gauge.
@@ -169,17 +171,56 @@ fn test_overlay_and_gate_and_suppression_warn_exist() {
     );
 }
 
+/// Naive brace matcher for the Pin 4 structural scan: returns the offset of
+/// the `}` closing the `{` at `open`. Honest residual: it counts every brace
+/// byte, so a `{`/`}` inside a string literal in the scanned block would
+/// skew the depth — acceptable here because the supervisor's gate/else
+/// blocks are small, contain no braces in their string literals today, and
+/// a skew FAILS the assertions loudly (never a vacuous pass).
+fn find_matching_brace(src: &str, open: usize) -> usize {
+    assert_eq!(
+        src.as_bytes()[open],
+        b'{',
+        "brace scan must start at an opening brace"
+    );
+    let mut depth = 0usize;
+    for (i, b) in src.bytes().enumerate().skip(open) {
+        match b {
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return i;
+                }
+            }
+            _ => {}
+        }
+    }
+    panic!("unbalanced braces from offset {open}"); // APPROVED: test
+}
+
 /// Pin 4 — the runtime cold-start supervisor refuses to start the retired
-/// lane while the boot config says Dhan is off (a POST /api/feeds/dhan
+/// lane while the RAW boot TOML says Dhan is off (a POST /api/feeds/dhan
 /// enable would otherwise collide with the REST-only stack's dual-instance
-/// SSM lock: AlreadyHeld → DHAN-LANE-03 retry loop + pages).
+/// SSM lock: AlreadyHeld → DHAN-LANE-03 retry loop + pages). Round-2 FIX A
+/// (2026-07-13): the gate reads `feed_runtime.is_dhan_config_enabled()`
+/// (seeded PRE-overlay), never the overlaid `ctx.config.feeds` — a
+/// persisted runtime-OFF overlay must not permanently retire a config-ON
+/// lane.
 ///
-/// Strengthened 2026-07-13 (review LOW — anywhere-in-file grep was
-/// semi-vacuous): the scan is now scoped to the SUPERVISOR FUNCTION REGION
-/// and source-order asserted — the gate needle must open BEFORE the
-/// refusal warn, and BOTH must precede the cold-start spawn inside that
-/// region — so an inverted gate (`if ctx.config...`), an emptied gate
-/// body, or a gate moved off the spawn path all fail the build.
+/// Strengthened 2026-07-13 round 2 (review LOW — the round-1 order-only
+/// scan still passed if the spawn was hoisted UNCONDITIONAL after the gate
+/// closed): the scan now brace-matches the gate block and requires
+/// (a) the refusal warn INSIDE the gate block (an emptied gate fails),
+/// (b) the gate to close directly into an `else` arm (an unconditional
+/// spawn after the gate fails — no else), and
+/// (c) the region's ONLY cold-start spawn to live INSIDE that else arm
+/// (a second/hoisted spawn site or a gate moved off the spawn path fails).
+/// An inverted gate (`if feed_runtime.is_dhan_config_enabled()`) fails the
+/// needle match itself. Honest residual (source-scan-inherent): a
+/// restructure that keeps this exact if/else shape but changes the RUNTIME
+/// meaning of `is_dhan_config_enabled()` is caught by the feed_state unit
+/// tests, not by this scan.
 #[test]
 fn test_runtime_cold_start_refusal_exists() {
     let main_src = strip_line_comments(&read("crates/app/src/main.rs"));
@@ -199,25 +240,77 @@ fn test_runtime_cold_start_refusal_exists() {
     );
     let region = &main_src[region_start..region_end];
 
-    let gate_pos = region.find("if !ctx.config.feeds.dhan_enabled {").expect(
-        "run_dhan_lane_runtime_supervisor lost the config gate on the \
-         cold-start spawn (operator directive 2026-07-13)",
+    // Round-2 FIX A: the gate must read the RAW config snapshot...
+    const GATE_NEEDLE: &str = "if !feed_runtime.is_dhan_config_enabled() {";
+    let gate_pos = region.find(GATE_NEEDLE).expect(
+        "run_dhan_lane_runtime_supervisor lost the RAW-config gate on the \
+         cold-start spawn (operator directive 2026-07-13 + round-2 FIX A)",
     ); // APPROVED: test
+    // ...and must never regress to the OVERLAID ctx.config value (a
+    // persisted runtime-OFF overlay would permanently 409-lock a config-ON
+    // boot out of the PR-E disable→restart→re-enable round trip).
+    assert!(
+        !region.contains("if !ctx.config.feeds.dhan_enabled {"),
+        "the refusal gate must not regress to the OVERLAID config value \
+         (round-2 FIX A, 2026-07-13)"
+    );
+
+    // (a) The refusal warn lives INSIDE the gate block.
+    let gate_open = gate_pos + GATE_NEEDLE.len() - 1;
+    let gate_close = find_matching_brace(region, gate_open);
     let warn_pos = region
         .find("Dhan live WS lane retired by operator directive 2026-07-13")
         .expect(
             "the supervisor lost the runtime-enable refusal notice — the \
              refusal must be logged (edge-latched), never silent",
         ); // APPROVED: test
-    let spawn_pos = region
-        .find("tokio::spawn(run_dhan_lane_cold_start(")
-        .expect("the supervisor lost its cold-start spawn call"); // APPROVED: test
     assert!(
-        gate_pos < warn_pos && warn_pos < spawn_pos,
-        "the refusal gate must OPEN before its warn body and BOTH must \
-         precede the cold-start spawn (gate @{gate_pos} < warn @{warn_pos} \
-         < spawn @{spawn_pos} within the supervisor region) — an inverted \
-         or emptied gate, or a gate moved off the spawn path, fails here"
+        gate_open < warn_pos && warn_pos < gate_close,
+        "the refusal notice must live INSIDE the gate block (warn \
+         @{warn_pos} not in ({gate_open}, {gate_close})) — an emptied or \
+         relocated gate body fails here"
+    );
+
+    // (b) The gate closes directly into an `else` arm (no unconditional
+    // fall-through to the spawn, no `else if` re-gate).
+    let after_gate = &region[gate_close + 1..];
+    let ws = after_gate.len() - after_gate.trim_start().len();
+    let else_kw = gate_close + 1 + ws;
+    assert!(
+        region[else_kw..].starts_with("else"),
+        "the refusal gate must close into an `else` arm hosting the spawn — \
+         an unconditional spawn hoisted after the gate fails here"
+    );
+    let else_open = region[else_kw..]
+        .find('{')
+        .map(|o| else_kw + o)
+        .expect("the else arm must open a block"); // APPROVED: test
+    assert!(
+        region[else_kw + "else".len()..else_open].trim().is_empty(),
+        "the else arm must open its block directly (an `else if` re-gate \
+         would change the refusal semantics)"
+    );
+
+    // (c) The region's ONLY cold-start spawn lives INSIDE the else arm.
+    const SPAWN_NEEDLE: &str = "tokio::spawn(run_dhan_lane_cold_start(";
+    let spawn_positions: Vec<usize> = region
+        .match_indices(SPAWN_NEEDLE)
+        .map(|(pos, _)| pos)
+        .collect();
+    assert_eq!(
+        spawn_positions.len(),
+        1,
+        "expected exactly 1 cold-start spawn in the supervisor region; a \
+         second (unconditional/hoisted) spawn site bypassing the refusal \
+         gate fails here"
+    );
+    let spawn_pos = spawn_positions[0];
+    let else_close = find_matching_brace(region, else_open);
+    assert!(
+        else_open < spawn_pos && spawn_pos < else_close,
+        "the cold-start spawn must live INSIDE the refusal gate's else arm \
+         (spawn @{spawn_pos} not in ({else_open}, {else_close})) — a spawn \
+         moved off the gated path fails here"
     );
 }
 

@@ -54,10 +54,16 @@
 //!
 //! **Mutual exclusion by construction:** this stack is spawned ONLY from the
 //! Dhan-OFF branch of main.rs (the `else` of `if config.feeds.dhan_enabled`)
-//! — the same flag gates the fast crash-recovery arm off AND makes the
-//! runtime cold-start supervisor REFUSE a lane start — so the lane's own
-//! lock / TokenManager / post-market seam can never run alongside this
-//! stack. A process-global once-guard additionally rejects a double spawn.
+//! AND only when the RAW boot TOML retires the lane
+//! (`FeedRuntimeState::is_dhan_config_enabled() == false`, seeded
+//! PRE-overlay — round-2 FIX A, 2026-07-13). The same raw value makes the
+//! /api/feeds handler 409-refuse a Dhan enable and the runtime cold-start
+//! supervisor refuse a lane start — so the lane's own lock / TokenManager /
+//! post-market seam can never run alongside this stack. On a config-ON boot
+//! whose runtime overlay left Dhan off, this stack does NOT spawn (the lane
+//! is dormant, not retired — a runtime re-enable cold-starts the full lane,
+//! which owns the REST surface via `spawn_post_market_tasks`). A
+//! process-global once-guard additionally rejects a double spawn.
 //!
 //! **Panic honesty (the TICK-FLUSH-01 precedent):** the release profile sets
 //! `panic = "abort"`, so a panicked bring-up task aborts the PROCESS in
@@ -226,8 +232,9 @@ pub fn dhan_rest_token_backoff_secs(attempt: u32) -> u64 {
 /// tiny exit monitor so an unwind-build death is never silent). Returns
 /// `None` when the once-guard rejects a duplicate spawn.
 ///
-/// Called ONLY from main.rs's Dhan-OFF branch — see the module docs for the
-/// mutual-exclusion contract with the Dhan lane.
+/// Called ONLY from main.rs's Dhan-OFF branch, and only when the RAW boot
+/// TOML retires the lane — see the module docs for the mutual-exclusion
+/// contract with the Dhan lane.
 // TEST-EXEMPT: orchestration spawn around live I/O (SSM lock + TOTP mint +
 // task spawns); the pure decisions (dhan_rest_stack_backoff_secs,
 // dhan_rest_retry_should_log, dhan_rest_peer_page_due) are unit-tested
@@ -335,18 +342,16 @@ async fn run_dhan_rest_stack(params: DhanRestStackParams) {
             if dhan_rest_lock_park_due(held_wait_secs) {
                 // Patience exhausted: the holder's heartbeat kept renewing
                 // far past the 90s TTL — a genuine live peer, not our own
-                // stale entry. Page once (if the TTL-deferred page has not
-                // fired yet) and PARK: no further SSM polling from this
+                // stale entry. PARK: no further SSM polling from this
                 // process, so the peer's lock can never be seized via the
                 // stale-takeover the moment the peer restarts.
-                if !peer_paged {
-                    params
-                        .notifier
-                        .notify(NotificationEvent::DualInstanceDetected {
-                            holder: last_holder.clone(),
-                            lock_key: lock_key.clone(),
-                        });
-                }
+                //
+                // Invariant (round-2 FIX B — the former defensive re-page
+                // here was dead code): the DualInstanceDetected page has
+                // ALWAYS fired before park — the ladder's page attempt (5,
+                // 150s cumulative) strictly precedes the 300s park threshold
+                // (first reachable at 310s, loop top), pinned by
+                // test_dhan_rest_lock_genuine_peer_pages_once_then_parks.
                 error!(
                     code = ErrorCode::Resilience01DualInstanceDetected.code_str(),
                     severity = ErrorCode::Resilience01DualInstanceDetected

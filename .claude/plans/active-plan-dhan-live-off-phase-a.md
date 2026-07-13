@@ -47,22 +47,37 @@ apply; this item's specifics are in the sections above).
    application site log ONE `warn!` naming the 2026-07-13 directive when a
    widening overlay is suppressed.
 4. **Runtime cold-start gate** — `main.rs::run_dhan_lane_runtime_supervisor`
-   refuses to spawn `run_dhan_lane_cold_start` when
-   `ctx.config.feeds.dhan_enabled == false` (a POST /api/feeds/dhan enable
-   would otherwise cold-start the full lane and collide with the REST-only
-   auth stack: dual-instance SSM lock AlreadyHeld → DHAN-LANE-03 retry loop +
-   pages). Refusal is edge-latched once per attempt-episode (re-arms when the
-   desired-ON flag drops). REVISED (review round 1, FIX 3): the /feeds POST
-   handler ALSO refuses the Dhan ENABLE direction with 409 CONFLICT when the
-   boot config carries `dhan_enabled = false` (both trading modes; runtime
-   flag not flipped, nothing persisted — the pre-fix accept was a Rule-11
-   false-OK: /feeds showed ON while nothing could start). Boot-ON semantics
-   and the PR-E disable gate + bearer auth are unchanged.
+   refuses to spawn `run_dhan_lane_cold_start` when the RAW boot TOML
+   retires the lane (`feed_runtime.is_dhan_config_enabled() == false` —
+   round-2 FIX A; a POST /api/feeds/dhan enable would otherwise cold-start
+   the full lane and collide with the REST-only auth stack: dual-instance
+   SSM lock AlreadyHeld → DHAN-LANE-03 retry loop + pages). Refusal is
+   edge-latched once per attempt-episode (re-arms when the desired-ON flag
+   drops). REVISED (review round 1, FIX 3): the /feeds POST handler ALSO
+   refuses the Dhan ENABLE direction with 409 CONFLICT on the same
+   condition (both trading modes; runtime flag not flipped, nothing
+   persisted — the pre-fix accept was a Rule-11 false-OK: /feeds showed ON
+   while nothing could start). REVISED (review round 2, FIX A): BOTH gates
+   key off the RAW pre-overlay TOML value (`dhan_config_enabled_raw`
+   captured in main.rs BEFORE `overlay_feeds`, threaded via
+   `FeedRuntimeState::from_config_with_dhan_config`) — seeding from the
+   post-overlay effective value would let a persisted runtime-OFF overlay
+   permanently 409-lock a config-ON boot with a misleading "config change +
+   restart" message (breaking the PR-E disable→restart→re-enable round
+   trip). A config-ON + overlay-OFF boot is dormant-not-retired: the toggle
+   re-enable stays ALLOWED and cold-starts the full lane (pre-Phase-A
+   behavior); the REST-only stack does NOT spawn on that boot (same raw
+   gate — no lock collision possible). Boot-ON semantics and the PR-E
+   disable gate + bearer auth are unchanged.
 5. **THE CORE — Dhan REST-only auth bootstrap** — new module
    `crates/app/src/dhan_rest_stack.rs` (`spawn_dhan_rest_stack`), spawned from
    main.rs's Dhan-OFF branch (the `else` of `if config.feeds.dhan_enabled`,
    i.e. the "DHAN LANE SKIPPED" arm — process-global scope, after
-   `build_shared_infra` + the metrics recorder install). One background task:
+   `build_shared_infra` + the metrics recorder install), and ONLY when the
+   RAW boot TOML retires the lane (`is_dhan_config_enabled() == false` —
+   round-2 FIX A; a config-ON + overlay-OFF boot must not hold the SSM
+   lock, since its runtime re-enable cold-starts the full lane). One
+   background task:
    a. dual-instance SSM lock BEFORE any mint (`try_acquire_instance_lock` +
       `spawn_instance_lock_heartbeat`, lock-before-mint per
       `dual-instance-lock-2026-07-04.md` §2, addendum §3.5). REVISED
@@ -94,8 +109,9 @@ apply; this item's specifics are in the sections above).
       pool, universe build/CSV download, prev-day OHLCV, SLO publisher,
       cross-verify, EOD digest, orphan watchdog, order-update WS.
    e. Mutual exclusion by construction: spawned ONLY from the Dhan-OFF
-      branch; the runtime cold-start is refused (item 4); a process-global
-      once-guard rejects double-spawn.
+      branch AND only when the raw TOML retires the lane; the runtime
+      cold-start is refused on the same raw gate (item 4); a
+      process-global once-guard rejects double-spawn.
    f. Observability: `tv_dhan_rest_stack_up` gauge (0 at bring-up start, 1 on
       stack-up), one `info!` naming what was spawned; failures use `error!`
       with existing ErrorCodes where they fit (NO new ErrorCode variants).
@@ -112,7 +128,11 @@ apply; this item's specifics are in the sections above).
 7. **New ratchets** — `crates/app/tests/dhan_live_off_phase_a_guard.rs`:
    (a) both TOMLs carry `dhan_enabled = false`; (b) main.rs spawns the REST
    stack in the Dhan-OFF branch; (c) the overlay AND-gate exists in
-   feed_state_persist.rs; (d) the runtime cold-start refusal needle exists.
+   feed_state_persist.rs; (d) the runtime cold-start refusal gate reads the
+   RAW config snapshot and the spawn lives inside its else arm
+   (brace-matched — round-2 FIX C; an inverted gate, an emptied gate body,
+   an overlaid-config regression, or an unconditional/hoisted spawn all
+   fail the build).
 
 ## Edge Cases
 
@@ -121,10 +141,19 @@ apply; this item's specifics are in the sections above).
   + ONE warn naming the directive. Groww's persisted choice still honored.
 - **Corrupt/missing overlay**: unchanged fail-safe (config default).
 - **Operator toggles Dhan ON via POST /api/feeds/dhan at runtime**
-  (REVISED, FIX 3): the API REFUSES with 409 (directive + restart path
-  named in the body); the runtime flag never flips, nothing is persisted,
-  /feeds keeps showing OFF. The supervisor's edge-latched refusal remains
-  as defence-in-depth behind it. No lane, no double auth stack.
+  (REVISED, FIX 3): with the RAW TOML carrying `dhan_enabled = false`, the
+  API REFUSES with 409 (directive + restart path named in the body); the
+  runtime flag never flips, nothing is persisted, /feeds keeps showing OFF.
+  The supervisor's edge-latched refusal remains as defence-in-depth behind
+  it. No lane, no double auth stack.
+- **Config-ON boot + persisted runtime-OFF overlay** (round-2 FIX A): the
+  lane is dormant, NOT retired — the boot leaves Dhan runtime-off, the
+  REST-only stack does NOT spawn (raw gate), and the toggle re-enable is
+  ALLOWED: the D2b cold-start brings up the full lane (which owns the Dhan
+  REST surface via `spawn_post_market_tasks`). Pre-Phase-A behavior
+  restored; honest residual: the Dhan REST surface is absent on such a
+  boot until the operator re-enables (exactly as pre-Phase-A). Latent
+  today (both shipped TOMLs carry false).
 - **Quick restart (<90s) after a stop**: the previous process's REST-stack
   SSM lock entry is not yet stale → AlreadyHeld → the stack retries with
   backoff inside the bounded patience window and acquires once the 90s TTL
@@ -135,7 +164,8 @@ apply; this item's specifics are in the sections above).
 - **TV_ENVIRONMENT=dev/local boots** (base.toml only): dhan_enabled=false +
   groww_enabled=false = a no-feed config — boots with the existing WARN
   (main.rs `any_enabled()` arm), REST stack still runs (it is gated only on
-  dhan_enabled=false), matching "Dhan REST retained surface keeps running".
+  the RAW dhan_enabled=false), matching "Dhan REST retained surface keeps
+  running".
 - **Non-trading day / late boot**: canary/spot/chain tasks self-skip exactly
   as they do today (audit Rule 3 gates live inside those modules).
 - **spot/chain config gates**: `[spot_1m_rest].enabled` /
@@ -187,8 +217,9 @@ apply; this item's specifics are in the sections above).
 - `crates/common` — `test_production_groww_live_dhan_rest_only` (replaces
   `test_production_runs_both_feeds`).
 - `crates/app` — new guard `dhan_live_off_phase_a_guard.rs` (5 tests, source
-  scans per §7 of Design; Pin 4 is region-scoped + source-order asserted per
-  review FIX 6); `dhan_rest_stack.rs` unit tests for the pure helpers
+  scans per §7 of Design; Pin 4 is region-scoped + brace-matched into the
+  gate's else arm per review FIX 6 + round-2 FIX C); `dhan_rest_stack.rs`
+  unit tests for the pure helpers
   (`dhan_rest_stack_backoff_secs`, `dhan_rest_retry_should_log`, bounded
   AlreadyHeld patience + page-then-park math, ssm-transport retry,
   `dhan_rest_token_backoff_secs` ≥130s mint-cooldown floor, the shared
@@ -196,6 +227,12 @@ apply; this item's specifics are in the sections above).
 - `crates/api` (FIX 3) — handler tests: Dhan enable refused 409 in BOTH
   trading modes when config-off (flag not flipped), Dhan disable still a
   no-op success, Groww toggles unaffected, config snapshot immutable.
+- `crates/api` (round-2 FIX A) — raw-seeding truth table:
+  `test_dhan_config_enabled_seeded_from_raw_toml_not_overlay`
+  (feed_state.rs — runtime seeds effective, gate seeds raw, both
+  directions) + `test_set_feed_dhan_enable_gate_keys_off_raw_config_not_overlay`
+  (feeds.rs — config-ON + overlay-OFF enable ALLOWED; raw-false stays 409
+  regardless of the effective value).
 - Full suites: `cargo test -p tickvault-common -p tickvault-api -p
   tickvault-app` + fmt + clippy + banned-pattern scanner + plan-gate.
 - Files: `config/base.toml`, `config/production.toml`,
@@ -210,7 +247,7 @@ apply; this item's specifics are in the sections above).
 - **Config-only revert**: set `dhan_enabled = true` in production.toml (and
   update `production_config_wiring.rs` + the phase-A guard with a fresh dated
   operator quote) → the lane boots exactly as before; the REST stack does not
-  spawn (its gate is `!dhan_enabled`); `spawn_post_market_tasks` resumes
+  spawn (its gate is the RAW `!dhan_enabled`); `spawn_post_market_tasks` resumes
   owning canary/spot/chain. The overlay AND-gate then has no effect
   (config=true && persisted wins = old behaviour for persisted=false → false,
   persisted=true → true — byte-identical to the pre-Phase-A overlay).
