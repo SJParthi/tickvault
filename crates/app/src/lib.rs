@@ -62,6 +62,12 @@ pub mod boot_helpers;
 /// Dhan lane's running flag honest across runtime toggles and enforces the
 /// Dhan-disable safety gate at the supervisor layer (operator 2026-06-21/24).
 pub mod dhan_activation;
+/// Dhan REST-only auth bootstrap (Phase A of the Dhan-live-feed removal,
+/// operator directive 2026-07-13): with `feeds.dhan_enabled = false` this
+/// brings up the RETAINED Dhan REST surface — dual-instance lock →
+/// TokenManager → renewal + mid-session watchdog → REST canary +
+/// spot_1m_rest + option_chain_1m — WITHOUT any WebSocket lane.
+pub mod dhan_rest_stack;
 /// Groww runtime activation watcher — feed toggle cold-starts/teardowns the
 /// whole Groww lane live (operator 2026-06-24). Default-OFF; dormant until enabled.
 pub mod groww_activation;
