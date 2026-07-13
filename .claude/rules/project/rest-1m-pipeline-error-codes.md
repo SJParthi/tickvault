@@ -243,8 +243,10 @@ A minute the 15:31 sweep still cannot recover is a NAMED GAP: one
 200+`error` pair; `final_http_status` = the ACTUAL last status when a
 fetch happened, 0 sentinel when none) and class slugs `named_gap` /
 `pre_boot` (a mid-session boot's pre-boot blind window is named
-AUDIT-ONLY — §38/§9 forbid a bulk backfill fetch) / `flush_failed` (swept
-minutes lost at the ILP flush) / `no_token` — never a silent hole.
+AUDIT-ONLY — §38/§9 forbid a bulk backfill fetch) / `persist_failed`
+(fetched OK but the ILP APPEND failed — a persist failure, never dressed
+as vendor absence; round-2 LOW) / `flush_failed` (swept minutes lost at
+the ILP flush) / `no_token` — never a silent hole.
 
 ## §2b. CHAIN-01 — option-chain entitlement absent (pipeline down for the day)
 

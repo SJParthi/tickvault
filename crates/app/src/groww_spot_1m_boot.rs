@@ -1896,6 +1896,9 @@ async fn run_post_session_sweep(
             };
         let mut found_for_sid: u64 = 0;
         let mut gaps: Vec<i64> = Vec::new();
+        // Round-2 LOW: fetched-OK-but-append-failed minutes are a PERSIST
+        // failure, not vendor absence — classed separately below.
+        let mut persist_gaps: Vec<i64> = Vec::new();
         for minute_nanos in &missing {
             let Some(candle) = select_minute_candle(&candles, *minute_nanos) else {
                 still_missing = still_missing.saturating_add(1);
@@ -1926,7 +1929,7 @@ async fn run_post_session_sweep(
                     "SPOT1M-02: Groww post-session sweep row append failed"
                 );
                 still_missing = still_missing.saturating_add(1);
-                gaps.push(*minute_nanos);
+                persist_gaps.push(*minute_nanos);
             } else {
                 found_for_sid = found_for_sid.saturating_add(1);
                 staged.push((security_id, *minute_nanos));
@@ -1936,7 +1939,10 @@ async fn run_post_session_sweep(
         // one queryable forensics row each, never a silent hole. Item 6
         // semantics: outcome `named_gap` (a fetch DID happen and answered
         // 200 without the minute — the status is the ACTUAL last one),
-        // never the misleading 200+`error` pair.
+        // never the misleading 200+`error` pair. Round-2 LOW: minutes
+        // whose fetch SUCCEEDED but whose ILP append failed are a PERSIST
+        // failure, not vendor absence — class `persist_failed` (same
+        // `named_gap` outcome, so the DEDUP semantics are unchanged).
         record_named_gaps(
             audit_writer,
             &gaps,
@@ -1945,6 +1951,16 @@ async fn run_post_session_sweep(
             symbol,
             RestFetchOutcome::NamedGap,
             "named_gap",
+            200,
+        );
+        record_named_gaps(
+            audit_writer,
+            &persist_gaps,
+            trading_date_nanos,
+            security_id,
+            symbol,
+            RestFetchOutcome::NamedGap,
+            "persist_failed",
             200,
         );
         swept = swept.saturating_add(found_for_sid);
@@ -2016,6 +2032,23 @@ async fn run_post_session_sweep(
     }
 }
 
+/// Gap-row forensics (item 6 + round-2 LOW semantics): `final_http_status`
+/// is the ACTUAL last status when a fetch happened for the gap (e.g. the
+/// sweep 200 that lacked the minute, or the 200 whose row failed the ILP
+/// append — class `persist_failed`), 0 sentinel when none did (pre-boot /
+/// no-token) — and attempts mirrors it (1 when a fetch ran, else 0).
+/// Never a fabricated status/attempt pair. Pure.
+fn named_gap_forensics(error_class: &'static str, final_http_status: i64) -> LadderForensics {
+    LadderForensics {
+        attempts: u32::from(final_http_status != 0),
+        rate_limited_count: 0,
+        final_http_status: u16::try_from(final_http_status).unwrap_or(0),
+        final_latency_ms: -1,
+        error_class,
+        auth_rejected: false,
+    }
+}
+
 /// One queryable forensics row per finally-unrecovered minute (the NAMED
 /// GAP contract: a hole is a row, never silence). Best-effort appends.
 #[allow(clippy::too_many_arguments)] // APPROVED: private forensics sink — a struct would be pure ceremony
@@ -2029,17 +2062,7 @@ fn record_named_gaps(
     error_class: &'static str,
     final_http_status: i64,
 ) {
-    let forensics = LadderForensics {
-        // Item 6: status 0 = NO fetch ever happened for this gap (pre-boot
-        // / no-token) ⇒ attempts 0; a non-zero ACTUAL status means the one
-        // sweep fetch ran ⇒ attempts 1. Never a fabricated pair.
-        attempts: u32::from(final_http_status != 0),
-        rate_limited_count: 0,
-        final_http_status: u16::try_from(final_http_status).unwrap_or(0),
-        final_latency_ms: -1,
-        error_class,
-        auth_rejected: false,
-    };
+    let forensics = named_gap_forensics(error_class, final_http_status);
     for minute_nanos in gap_minutes_nanos {
         let row = build_fetch_audit_row(
             *minute_nanos,
@@ -2669,6 +2692,32 @@ mod tests {
         assert_eq!(duplicate_minute_candles(&candles, 200), 2);
         assert_eq!(duplicate_minute_candles(&candles, 100), 0);
         assert_eq!(duplicate_minute_candles(&candles, 999), 0);
+    }
+
+    /// Round-2 LOW + item 6: gap-row forensics semantics — a
+    /// `persist_failed` gap (fetched OK, ILP append failed) carries the
+    /// ACTUAL 200 + attempts 1; a no-fetch gap (`pre_boot` / `no_token`)
+    /// carries the 0 sentinel + attempts 0; a sweep target-absence
+    /// (`named_gap`) carries its actual 200 + attempts 1.
+    #[test]
+    fn test_named_gap_forensics_status_and_attempts_semantics() {
+        let persist = named_gap_forensics("persist_failed", 200);
+        assert_eq!(persist.final_http_status, 200, "actual status kept");
+        assert_eq!(persist.attempts, 1, "a fetch ran for this gap");
+        assert_eq!(persist.error_class, "persist_failed");
+        assert_eq!(persist.final_latency_ms, -1);
+
+        let absent = named_gap_forensics("named_gap", 200);
+        assert_eq!(absent.final_http_status, 200);
+        assert_eq!(absent.attempts, 1);
+
+        for no_fetch in [
+            named_gap_forensics("pre_boot", 0),
+            named_gap_forensics("no_token", 0),
+        ] {
+            assert_eq!(no_fetch.final_http_status, 0, "0 sentinel — no fetch");
+            assert_eq!(no_fetch.attempts, 0, "no fetch ⇒ no attempt");
+        }
     }
 
     /// Item 12 (fire-level): the symbols skipped after an auth reject get
