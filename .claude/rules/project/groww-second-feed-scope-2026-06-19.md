@@ -716,17 +716,17 @@ sequenced after the spot leg; (c) **per-contract 1m** — the same `/v1/historic
 endpoint with `segment=FNO` for a BOUNDED selected set of active option contracts (selection
 fed by the chain snapshot / instruments master; envelope cap on contracts per minute). The
 bulk-history / backtest-fetch ban of §33 OTHERWISE STANDS — no 30-day sweeps, no past-day
-backfills beyond the one-minute-lookback and 15:31 post-session sweep patterns, no
-`BacktestSource`/`backtest` naming. Cold-path scheduled tasks only; the live WS capture
-chain, the tick hot path, and the Dhan legs are untouched.
+backfills beyond the one-minute-lookback and 15:31 post-session sweep patterns (the Dhan
+PR #1499 pattern, pending merge), no `BacktestSource`/`backtest` naming. Cold-path scheduled
+tasks only; the live WS capture chain, the tick hot path, and the Dhan legs are untouched.
 
 ## §38.2 The locked contract table
 
 | Aspect | Locked value |
 |---|---|
-| Endpoints | `GET api.groww.in/v1/historical/candles` (`candle_interval="1minute"`, day-granular `start_time`/`end_time` in `yyyy-MM-dd HH:mm:ss` IST, target-minute filtered client-side) + `GET api.groww.in/v1/option-chain/exchange/{e}/underlying/{u}?expiry_date=YYYY-MM-DD` |
-| Identity | `groww_symbol` ONLY: indices `NSE-NIFTY` / `NSE-BANKNIFTY` / `BSE-SENSEX` (segment CASH); contracts `NSE-NIFTY-04Jan24-19200-CE`-shape (segment FNO). Persisted `security_id` = the SAME ids the Groww live lane uses (`stable_index_security_id` indices; `exchange_token` contracts) |
-| Token | shared-minter SSM READ-ONLY via the existing `fetch_groww_access_token` (`/tickvault/<env>/groww/access-token`) — NEVER minted, never logged, never in URLs; `Authorization: Bearer <token>` + `x-api-version: 1.0` |
+| Endpoints | `GET api.groww.in/v1/historical/candles` (`candle_interval="1minute"`, day-granular `start_time`/`end_time` in `yyyy-MM-dd HH:mm:ss` (IST Assumed — Indian-exchange convention, confirm live), target-minute filtered client-side) + `GET api.groww.in/v1/option-chain/exchange/{e}/underlying/{u}?expiry_date=YYYY-MM-DD` |
+| Identity | the CANDLE legs (spot + contracts) take `groww_symbol`: indices `NSE-NIFTY` / `NSE-BANKNIFTY` / `BSE-SENSEX` (segment CASH); contracts `NSE-NIFTY-04Jan24-19200-CE`-shape (segment FNO). The CHAIN endpoint's `underlying` path param is the PLAIN symbol (`NIFTY` / `BANKNIFTY` / `SENSEX`), NOT groww_symbol. Persisted `security_id` = the SAME ids the Groww live lane uses (`stable_index_security_id` indices; `exchange_token` contracts) |
+| Token | shared-minter SSM READ-ONLY via the existing `fetch_groww_access_token` (`/tickvault/<env>/groww/access-token`) — NEVER minted, never logged, never in URLs; `Authorization: Bearer <token>` + `x-api-version: 1.0`. The token's ~06:00 IST daily expiry is OFFICIALLY documented (upgraded from assumption, 2026-07-13 docs research); the bruteX minter Lambda re-mints ~06:05 IST |
 | Tables | SAME shared tables + feed-in-key: `spot_1m_rest` + `option_chain_1m` tagged `feed='groww'` (their DEDUP keys already carry `feed`); the per-contract leg gets ONE new table (proposal `option_contract_1m_rest`) with `feed` in its DEDUP key + retention registration. NEVER `ticks` / `candles_*` / `historical_candles` |
 | Expiry source | the already-ingested daily Groww instruments CSV (nearest expiry ≥ today; never-roll) — no new expiry REST endpoint |
 | Rate budget | ~6–12 requests/min in-session against the documented Live Data 10/sec + 300/min type bucket (the `/historical/*` + `/option-chain/*` bucket is UNNAMED in the docs → conservatively assumed Live Data); own min-gap pacing on the chain/contract legs |
@@ -746,7 +746,13 @@ chain, the tick hot path, and the Dhan legs are untouched.
 > Neither side is ground truth per the §37 doctrine — TickVault carries the known
 > tick-conservation residual, Groww's candle store carries vendor-fill/sealing fluctuation —
 > the parity comparison separates expected fluctuation from real divergence and never
-> assumes live is correct."
+> assumes live is correct. Capacity verdict (2026-07-13 docs research): the rate buckets are
+> TYPE-LEVEL POOLED (exhausting one API throttles the whole type; Orders changed 15→10
+> between Dec'25 and Mar'26 — numbers CAN change, re-verify on the box), Groww documents NO
+> Retry-After/ban/cooldown for 429 and the SDK ships ZERO client-side throttling — pacing
+> (minute-boundary bursts spread to ≤6 req/s against the shared 10/s ceiling) and timeouts
+> are entirely ours; worst-case ~18 req/min ≈ 6% of the 300/min budget solo, ~66% with
+> in-session BruteX co-tenancy — still inside."
 
 ## §38.4 What a violating PR looks like (REJECT)
 

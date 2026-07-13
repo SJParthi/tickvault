@@ -184,13 +184,13 @@ selected set of active option contracts (the fill-model leg), persisting into ON
 scheduled tasks — never the tick hot path; the Groww live WS capture and the Dhan §8 legs
 are untouched. The §33 bulk-history/backtest-fetch ban otherwise stands: no multi-day
 sweeps, no past-day backfills beyond the one-minute-lookback + 15:31 post-session sweep
-patterns.
+patterns (the Dhan PR #1499 pattern, pending merge).
 
 ## §9.2 The KEEP endpoints — exact scope
 
 | Endpoint | Scope (LOCKED) | Cadence | Destination table | Gate |
 |---|---|---|---|---|
-| `GET api.groww.in/v1/historical/candles` (spot) | 3 Groww spot indices ONLY: `NSE-NIFTY` / `NSE-BANKNIFTY` / `BSE-SENSEX`, segment CASH; `candle_interval="1minute"`; day-granular window + client-side minute filter; `Authorization: Bearer <shared-minter SSM read-only token>` + `x-api-version: 1.0` | once per minute close, [09:15, 15:30) IST trading days, + one bounded 15:31 sweep | `spot_1m_rest` ONLY, `feed='groww'` (never `ticks`/`candles_*`/`historical_candles`) | `[groww_spot_1m]` config, serde default OFF, base.toml opts in |
+| `GET api.groww.in/v1/historical/candles` (spot) | 3 Groww spot indices ONLY: `NSE-NIFTY` / `NSE-BANKNIFTY` / `BSE-SENSEX`, segment CASH; `candle_interval="1minute"`; day-granular window + client-side minute filter; `Authorization: Bearer <shared-minter SSM read-only token>` + `x-api-version: 1.0` | once per minute close, [09:15, 15:30) IST trading days, + one bounded 15:31 sweep (the Dhan PR #1499 pattern, pending merge) | `spot_1m_rest` ONLY, `feed='groww'` (never `ticks`/`candles_*`/`historical_candles`) | `[groww_spot_1m]` config, serde default OFF, base.toml opts in |
 | `GET api.groww.in/v1/option-chain/exchange/{e}/underlying/{u}?expiry_date=...` | the SAME 3 underlyings, CURRENT (nearest ≥ today) expiry only, from the already-ingested Groww instruments CSV | once per minute, SEQUENCED after the Groww spot fetch; own min-gap pacing | `option_chain_1m` ONLY, `feed='groww'` | `[groww_option_chain_1m]` config — **DEFAULT-OFF** pending first-live-session verification + a dated note |
 | `GET api.groww.in/v1/historical/candles` (contracts) | a BOUNDED selected set of active option contracts (`segment=FNO`, `groww_symbol` like `NSE-NIFTY-04Jan24-19200-CE`; envelope cap per minute; selection fed by the chain snapshot / instruments master) | once per minute, after the chain leg | NEW `option_contract_1m_rest` ONLY (`feed` in DEDUP key; retention registered) | config-gated, serde default OFF |
 
@@ -204,7 +204,13 @@ patterns.
 - **Rate-bucket unknown:** the docs' type-level table (Live Data 10/sec + 300/min; no
   per-day cap) does not NAME the `/historical/*` or `/option-chain/*` buckets — conservatively
   ASSUMED Live Data. Our ~6–12 requests/min is far inside either reading; 429s are counted,
-  never out-polled.
+  never out-polled. Capacity verdict (2026-07-13 docs research): the buckets are TYPE-LEVEL
+  POOLED (exhausting one API throttles the whole type; Orders changed 15→10 between Dec'25
+  and Mar'26 — the numbers CAN change, re-verify on the box), and Groww documents NO
+  Retry-After/ban/cooldown for 429 while the SDK ships ZERO client-side throttling — pacing
+  (minute-boundary bursts spread to ≤6 req/s against the shared 10/s ceiling) and timeouts
+  are entirely ours; worst-case ~18 req/min ≈ 6% of the 300/min budget solo, ~66% with
+  in-session BruteX co-tenancy — still inside.
 - **Shared-account budget note:** whether Groww scopes rate limits per API key, per token,
   or per account is officially UNSTATED (Unknown). Both BruteX and TickVault present the ONE
   shared daily minter token, so the bucket is EFFECTIVELY shared for us either way — an
