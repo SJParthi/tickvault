@@ -32,8 +32,9 @@
 > writer), `crates/common/src/constants.rs` (`CHAIN_1M_*` +
 > `DHAN_OPTION_CHAIN_*` constants),
 > `crates/common/src/config.rs::OptionChain1mConfig` (`[option_chain_1m]`,
-> DEFAULT-OFF pending the live entitlement probe; `probe_and_report`
-> default ON), `crates/common/src/error_code.rs::ErrorCode::{
+> serde DEFAULT-OFF fail-safe; base.toml `enabled = true` since 2026-07-13
+> — the live probe PASSED, see `no-rest-except-live-feed-2026-06-27.md`
+> §8.7; `probe_and_report` default ON), `crates/common/src/error_code.rs::ErrorCode::{
 > Chain01EntitlementAbsent, Chain02FetchDegraded, Chain03PersistFailed,
 > Chain04ExpirylistFailed}`.
 
@@ -53,13 +54,35 @@ is the honest live probe of that latency. Every failure class below is a
 DEGRADE — the live WS candle pipeline, tick capture, and trading are NEVER
 affected.
 
+**2026-07-13 first-live-session hotfix (same-day):** the spot fetcher's
+original same-date `[minute open, open+60s]` request window was answered
+`2xx` WITHOUT the target candle for EVERY session minute (SPOT1M-01
+`ok=0/errors=0/empty=3` from 09:16 IST; the matcher itself was verified
+correct). Each fire now sends the ONLY live-proven window shape — the
+day-granular `fromDate = D 00:00:00, toDate = D+1 00:00:00` body the 15:31
+cross-verify uses — filtered client-side to the exact minute, PLUS a
+previous-minute BACKFILL sweep: each fire also persists the previous
+minute when it was not successfully persisted (per-SID in-memory
+watermark, committed only after a confirmed flush; DEDUP-idempotent
+re-appends; `tv_spot1m_backfilled_total` counts repairs). Edge honesty:
+a fire's verdict is its OWN target minute — a minute that lands only via
+next-fire backfill was still that fire's failure, and the backfilled
+row's `close_to_data_ms` column stamps the REAL (> 60 s) retrieval delay
+while the histogram keeps sampling own-fire retrievals only. See
+`no-rest-except-live-feed-2026-06-27.md` §8.7 for the dated record.
+
 The OPTION-CHAIN half (PR-3, appended 2026-07-12) shares the same minute
 boundaries, SEQUENCED immediately after the spot leg via a watch signal the
 spot task publishes at the end of each fire (fallback timer 2.5 s after the
 boundary — the chain is never blocked by a disabled/dead/slow spot leg). It
-is config-gated **DEFAULT-OFF** pending a live entitlement probe (the
+SHIPPED config-gated **DEFAULT-OFF** pending a live entitlement probe (the
 account had NO Option Chain Data-API entitlement in June 2026 — DH-902/806
-class — and the entitlement is unprobeable from the dev sandbox): while
+class — and the entitlement is unprobeable from the dev sandbox); the
+first-live-boot probe **PASSED at 08:31:49 IST on 2026-07-13** ("entitlement
+probe PASSED — chain data is available", NIFTY, 18 expiries) and
+`[option_chain_1m].enabled` is **true in base.toml since 2026-07-13** per
+the dated note in `no-rest-except-live-feed-2026-06-27.md` §8.7 (the serde
+DEFAULT stays off — fail-safe): while
 disabled, `probe_and_report` (default ON) runs ONE boot-time expirylist
 probe and reports the verdict via Telegram; the pipeline NEVER auto-runs —
 the operator flips `[option_chain_1m].enabled`. When enabled: a day-start
