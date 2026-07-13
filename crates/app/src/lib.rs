@@ -50,6 +50,11 @@ pub mod option_chain_1m_boot;
 // 1m OHLCV for the 3 spot indices → `spot_1m_rest` feed='groww' + the
 // `rest_fetch_audit` per-fetch forensics rows.
 pub mod groww_spot_1m_boot;
+// Groww per-minute option-chain REST leg (operator grant 2026-07-13 — PR-3
+// of the Groww per-minute REST plan): the current-expiry chain for the 3
+// underlyings, sequenced after the Groww spot leg → `option_chain_1m`
+// feed='groww' + `rest_fetch_audit` leg='chain_1m' forensics rows.
+pub mod groww_option_chain_1m_boot;
 // Dual-feed scoreboard PR-A (operator 2026-07-10): boot-time process-death
 // reconciler + the 15:45 IST daily Dhan-vs-Groww aggregation + the Telegram
 // scorecard summary (SCOREBOARD-01 family).

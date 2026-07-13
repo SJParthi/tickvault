@@ -109,6 +109,18 @@ pub struct ApplicationConfig {
     /// (fail-safe default off).
     #[serde(default)]
     pub groww_spot_1m: GrowwSpot1mConfig,
+    /// `[groww_option_chain_1m]` — Groww per-minute option-chain REST leg
+    /// (operator grant 2026-07-13, `.claude/plans/active-plan-groww-rest-1m.md`
+    /// PR-3): every trading-day minute close in session — sequenced after
+    /// the Groww spot leg — fetch the CURRENT-expiry option chain for the
+    /// 3 underlyings via Groww `GET /v1/option-chain/...` and persist to
+    /// the EXISTING `option_chain_1m` table tagged `feed='groww'`. Shipped
+    /// DEFAULT-OFF pending the first live probe (the endpoint is
+    /// documented-available — unlike Dhan's entitlement question — but the
+    /// live shape/latency are UNVERIFIED). Absent section ⇒ pipeline
+    /// disabled + probe-and-report ON.
+    #[serde(default)]
+    pub groww_option_chain_1m: GrowwOptionChain1mConfig,
     /// `[tf_consistency]` — daily timeframe-consistency verifier (operator
     /// directive 2026-07-13: *"how will you guarantee that all our defined
     /// timeframes internally are correct"*). At 15:40 IST every trading day,
@@ -463,6 +475,48 @@ pub struct GrowwSpot1mConfig {
 }
 
 impl Default for OptionChain1mConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            probe_and_report: default_chain_1m_probe_and_report(),
+        }
+    }
+}
+
+/// `[groww_option_chain_1m]` — Groww per-minute option-chain REST leg
+/// (operator grant 2026-07-13; PR-3 of the Groww per-minute REST plan).
+/// Cold path only — the WS pipelines, tick capture and trading are
+/// untouched.
+///
+/// Config semantics mirror the Dhan `[option_chain_1m]` gate:
+/// - `enabled = true` → run the per-minute chain pipeline (sequenced after
+///   the Groww spot leg via the watch signal + fallback timer).
+/// - `enabled = false` + `probe_and_report = true` (the default) → run ONE
+///   bounded boot-time chain probe per underlying, report the measured
+///   verdict (shape / strikes / latency / reject class) via an Info
+///   Telegram + coded log, persist NOTHING, then exit. The pipeline NEVER
+///   auto-runs while `enabled = false` — the operator flips the config
+///   after the probe verdict.
+///
+/// DEFAULT-OFF rationale (dated 2026-07-13): the Groww chain endpoint is
+/// documented-available (no Dhan-style entitlement question), but the live
+/// response shape / strike-key format / latency / rate-limit family are
+/// UNVERIFIED-LIVE (`docs/groww-ref/99-UNKNOWNS.md` U-4/U-11/U-12/U-13) —
+/// the probe is the first live measurement. Flipping the DEFAULT needs a
+/// fresh dated operator quote.
+#[derive(Debug, Clone, Deserialize)]
+pub struct GrowwOptionChain1mConfig {
+    /// Master switch for the Groww per-minute chain fetcher. Default OFF
+    /// (pending the first live probe).
+    #[serde(default)]
+    pub enabled: bool,
+    /// When the pipeline is disabled, still run the ONE boot-time chain
+    /// probe and report the measured verdict via Telegram. Default ON.
+    #[serde(default = "default_chain_1m_probe_and_report")]
+    pub probe_and_report: bool,
+}
+
+impl Default for GrowwOptionChain1mConfig {
     fn default() -> Self {
         Self {
             enabled: false,
@@ -2307,6 +2361,7 @@ mod tests {
             spot_1m_rest: Spot1mRestConfig::default(),
             option_chain_1m: OptionChain1mConfig::default(),
             groww_spot_1m: GrowwSpot1mConfig::default(),
+            groww_option_chain_1m: GrowwOptionChain1mConfig::default(),
             tf_consistency: TfConsistencyConfig::default(),
         }
     }
@@ -3755,6 +3810,56 @@ mod tests {
             .extract()
             .expect("explicit enabled = true must round-trip");
         assert!(on.groww_spot_1m.enabled);
+    }
+
+    /// Config-gate contract (Groww per-minute REST plan PR-3): the
+    /// `[groww_option_chain_1m]` section is DEFAULT-OFF with
+    /// probe-and-report ON — mirrors the Dhan `[option_chain_1m]` gate;
+    /// an absent/empty section (or an older TOML) never errors.
+    #[test]
+    fn test_groww_option_chain_1m_config_defaults_off_probe_on_and_round_trips() {
+        use figment::Figment;
+        use figment::providers::{Format, Toml};
+
+        let d = GrowwOptionChain1mConfig::default();
+        assert!(
+            !d.enabled,
+            "groww_option_chain_1m must default OFF (pending the first live probe)"
+        );
+        assert!(
+            d.probe_and_report,
+            "probe_and_report must default ON (the operator learns the live verdict)"
+        );
+
+        #[derive(Deserialize)]
+        struct Wrapper {
+            #[serde(default)]
+            groww_option_chain_1m: GrowwOptionChain1mConfig,
+        }
+        // Missing section entirely → disabled + probe ON, never an error.
+        let missing: Wrapper = Figment::new()
+            .merge(Toml::string("[other]\nx = 1\n"))
+            .extract()
+            .expect("missing [groww_option_chain_1m] must default, not error");
+        assert!(!missing.groww_option_chain_1m.enabled);
+        assert!(missing.groww_option_chain_1m.probe_and_report);
+        // Empty section (no keys) → field-level defaults.
+        let empty: Wrapper = Figment::new()
+            .merge(Toml::string("[groww_option_chain_1m]\n"))
+            .extract()
+            .expect("empty [groww_option_chain_1m] must default, not error");
+        assert!(!empty.groww_option_chain_1m.enabled);
+        assert!(empty.groww_option_chain_1m.probe_and_report);
+        // Explicit ON (the future flip shape) round-trips; probe can be
+        // explicitly silenced.
+        let on: Wrapper = Figment::new()
+            .merge(Toml::string(
+                "[groww_option_chain_1m]\nenabled = true\nprobe_and_report = false\n",
+            ))
+            .extract()
+            .expect("explicit values must round-trip");
+        assert!(on.groww_option_chain_1m.enabled);
+        assert!(!on.groww_option_chain_1m.probe_and_report);
     }
 
     /// Daily timeframe-consistency verifier (operator 2026-07-13): the
