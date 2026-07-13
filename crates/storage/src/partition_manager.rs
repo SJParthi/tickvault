@@ -112,6 +112,12 @@ pub(crate) const DAY_PARTITIONED_TABLES: &[&str] = &[
     // operator retention follow-up in option_chain_1m_persistence.rs);
     // same DAY partitioning + retention class; `feed` is in the DEDUP key.
     "option_chain_1m",
+    // SPOT1M-01/02 leg=contract_1m (2026-07-13, Groww REST plan PR-4 — the
+    // fill-model leg): one row per fetched (minute, contract) — bounded by
+    // the per-minute selection cap (~30 contracts × 375 min ≈ ~11K rows/day,
+    // trivial disk); same DAY partitioning + retention class; `feed` +
+    // `exchange_segment` are in the DEDUP key.
+    "option_contract_1m_rest",
     // SPOT1M-02 stages audit_ensure_* (2026-07-13, Groww spot-1m PR-2): one
     // row per REST fetch attempt outcome per (minute, symbol, feed, leg) —
     // ~1-2K rows/day for the Groww spot leg (375 min x 3 symbols x attempts),

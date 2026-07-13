@@ -168,7 +168,28 @@ pub struct GrowwChain1mTaskParams {
     /// seconds-of-day the spot leg just finished firing). `None` when the
     /// spot leg is disabled — the fallback timer then paces every fire.
     pub spot_minute_done: Option<tokio::sync::watch::Receiver<Option<u32>>>,
+    /// PR-4 sequencing: the boundary seconds-of-day THIS leg just finished
+    /// firing, published UNCONDITIONALLY at the END of every chain fire —
+    /// success OR failure — via `send_replace` (the spot leg's exact
+    /// semantics: the contract leg must never block on a failing chain
+    /// leg; its own fallback timer covers a dead one). `None` when the
+    /// contract leg is disabled — zero publishes, the loop stays
+    /// byte-identical to PR-3.
+    pub minute_done_tx: Option<tokio::sync::watch::Sender<Option<u32>>>,
+    /// PR-4 selection anchors: the LATEST per-underlying `underlying_ltp`
+    /// this leg observed (the contract leg's ATM anchor), updated inside
+    /// each fire's Found arm BEFORE the minute-done publish. `None` when
+    /// the contract leg is disabled. Poisoning-safe lock (release builds
+    /// abort on panic anyway); the map is 3 entries, cold path.
+    pub anchor_store: Option<GrowwChainAnchorStore>,
 }
+
+/// The chain → contract in-memory anchor handoff (PR-4): plain-symbol →
+/// the latest Groww `underlying_ltp`. A missing/omitted vendor LTP never
+/// overwrites a previous good anchor (ATM moves slowly; a minute-old
+/// anchor still selects the right window).
+pub type GrowwChainAnchorStore =
+    std::sync::Arc<std::sync::Mutex<std::collections::HashMap<&'static str, f64>>>;
 
 // ---------------------------------------------------------------------------
 // Pure request building
@@ -583,7 +604,7 @@ pub fn resolve_groww_chain_targets(
 /// Bounded master download: first try + the constant backoffs (the master
 /// is a public static CSV — zero auth, zero rate budget; retrying it never
 /// storms anyone).
-async fn download_master_bounded() -> Result<Vec<GrowwInstrumentRow>, String> {
+pub(crate) async fn download_master_bounded() -> Result<Vec<GrowwInstrumentRow>, String> {
     let mut last_err = String::from("master download never attempted");
     for attempt in 0..MASTER_DOWNLOAD_ATTEMPTS {
         if attempt > 0 {
@@ -852,6 +873,18 @@ async fn fire_one_groww_chain_minute(
                     payload_bytes,
                 } => {
                     ok_count = ok_count.saturating_add(1);
+                    // PR-4: hand the contract leg its ATM anchor — only a
+                    // REAL vendor LTP updates it (an omitted/zero LTP never
+                    // erases a previous good anchor).
+                    if let Some(store) = &params.anchor_store
+                        && !chain.underlying_ltp_missing
+                        && chain.underlying_ltp > 0.0
+                    {
+                        store
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .insert(target.underlying, chain.underlying_ltp);
+                    }
                     metrics::counter!("tv_groww_chain1m_fetch_total", "outcome" => "ok")
                         .increment(1);
                     // The measured freshness signal + the live-probe (d)
@@ -1557,6 +1590,13 @@ async fn run_groww_chain_minute_loop(
             fire,
         )
         .await;
+        // PR-4 sequencing: tell the contract leg this minute's chain fire
+        // is DONE — published on success AND failure (the contract leg is
+        // never hard-gated on chain success; the anchors above carry the
+        // last-good selection input). `send_replace` never errors.
+        if let Some(tx) = &params.minute_done_tx {
+            tx.send_replace(Some(fire));
+        }
         last_fired = Some(fire);
         // Overrun accounting: boundaries that fully elapsed DURING the
         // fire can never be fetched — count them loudly + feed the edge.
@@ -2526,6 +2566,8 @@ mod tests {
                 ilp_port: 9009,
             },
             spot_minute_done: None,
+            minute_done_tx: None,
+            anchor_store: None,
         }
     }
 

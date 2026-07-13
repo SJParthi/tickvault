@@ -2098,6 +2098,102 @@ const _: () = assert!(
     "GROWW_CHAIN_1M fallback delay must trail the Groww spot leg's fire delay"
 );
 
+// ---------------------------------------------------------------------------
+// Groww per-contract 1m candle REST leg (operator grant 2026-07-13 — PR-4
+// of the Groww per-minute REST plan, the FILL-MODEL leg;
+// `.claude/plans/active-plan-groww-rest-1m.md`; authorization
+// `groww-second-feed-scope-2026-06-19.md` §38 +
+// `no-rest-except-live-feed-2026-06-27.md` §9). Same endpoint + headers +
+// interval literal + body cap as the Groww spot leg (`GROWW_HISTORICAL_
+// CANDLES_URL` / `GROWW_API_VERSION_*` / `GROWW_CANDLE_INTERVAL_1MIN` /
+// `GROWW_SPOT_1M_MAX_BODY_BYTES` — one request, one day-window body shape),
+// with `segment=FNO` and a per-contract `groww_symbol` identity like
+// `NSE-NIFTY-04Jan24-19200-CE`. Sequenced AFTER the Groww chain leg (its
+// per-minute `underlying_ltp` is the ATM anchor). Session boundaries,
+// staleness grace and the page threshold REUSE the SPOT_1M_REST_* session
+// constants (NSE-session facts, not broker facts).
+// ---------------------------------------------------------------------------
+
+/// Fallback post-boundary fire delay (ms) for the contract leg — the
+/// contract task normally wakes when the GROWW CHAIN leg signals its
+/// minute complete (spot → chain → contract sequencing); when the chain
+/// leg is dead or slow, this timer fires the contract leg anyway
+/// (sequencing is best-effort, never a hard dependency). 8 s trails the
+/// chain's NORMAL completion window (chain fallback 2.5 s + 3 sequential
+/// underlyings at the 1 s min-gap ≈ 5-7 s) so the fresh anchor usually
+/// exists by the time selection runs.
+pub const GROWW_CONTRACT_1M_FALLBACK_DELAY_MS: u64 = 8_000;
+
+/// MECHANICAL cross-request minimum gap (ms) between ANY two consecutive
+/// contract candle requests — the chain leg's min-gap PATTERN at a
+/// contract-sized value: 300 ms → the contract leg contributes at most
+/// ~3.3 req/s, keeping the combined worst-overlap boundary burst (spot ≤1
+/// in-flight + chain ≤1 req/s + contract) inside the ≤6 req/s pacing
+/// ceiling of `docs/groww-ref/15-rate-limits-and-capacity.md` with bruteX
+/// co-tenancy headroom (const-asserted below).
+pub const GROWW_CONTRACT_1M_MIN_GAP_MS: u64 = 300;
+
+/// Per-REQUEST HTTP timeout (secs) for one contract candles call — the
+/// spot leg's 5 s (same endpoint, same ~20 KB day-window body).
+pub const GROWW_CONTRACT_1M_REQUEST_TIMEOUT_SECS: u64 = 5;
+
+/// HARD envelope cap on contracts fetched per minute (the §38 "envelope
+/// cap on contracts per minute"). The default ATM window fills it exactly:
+/// (2 × 2 + 1) strikes × 2 legs × 3 underlyings = 30. A selection larger
+/// than the cap (config-widened window) is truncated DETERMINISTICALLY
+/// nearest-ATM-first — counted + one coded warn, never fetched past the
+/// cap, never silent.
+pub const GROWW_CONTRACT_1M_MAX_PER_MINUTE: usize = 30;
+
+/// HARD wall-clock deadline (secs) for ONE minute's whole contract fire:
+/// contracts not reached before the deadline are SKIPPED loudly (counted +
+/// forensics rows), never fetched into the next minute. Normal fires
+/// finish in ~10-20 s (cap × (min-gap + one round-trip)); the deadline
+/// only engages on a stalling peer.
+pub const GROWW_CONTRACT_1M_FIRE_BUDGET_SECS: u64 = 45;
+
+/// Default ATM window half-width (strikes each side of ATM) for the
+/// contract selection — the `[groww_contract_1m] strikes_each_side`
+/// config default. 2 each side → 5 strikes × CE+PE × 3 underlyings = 30
+/// contracts/minute = exactly the envelope cap (const-asserted below).
+pub const GROWW_CONTRACT_1M_DEFAULT_STRIKES_EACH_SIDE: u32 = 2;
+
+const _: () = assert!(
+    GROWW_CONTRACT_1M_FALLBACK_DELAY_MS > GROWW_CHAIN_1M_FALLBACK_DELAY_MS,
+    "the contract leg is sequenced AFTER the chain leg — its fallback must trail the chain's"
+);
+const _: () = assert!(
+    GROWW_CONTRACT_1M_FALLBACK_DELAY_MS + GROWW_CONTRACT_1M_FIRE_BUDGET_SECS * 1_000 < 60_000,
+    "GROWW_CONTRACT_1M fire (fallback + fire budget) must finish inside the minute"
+);
+// Boundary-burst pacing ceiling (§38.3): spot ≤1 in-flight + chain ≤1 req/s
+// (its 1s min-gap) + contract ≤ 1000/min-gap req/s must stay inside the
+// ≤6 req/s shared-bucket ceiling even in the worst overlap.
+const _: () = assert!(
+    1 + 1_000 / GROWW_CHAIN_1M_MIN_GAP_MS + 1_000 / GROWW_CONTRACT_1M_MIN_GAP_MS <= 6,
+    "spot + chain + contract worst-overlap boundary burst must stay inside the 6 req/s ceiling"
+);
+// Per-minute request math (the §38.3 capacity envelope): worst case
+// 30 contracts + the spot leg's 15 (3 symbols × 5 ladder rungs) + 3 chain
+// = 48 requests/min ≈ 16% of the 300/min shared budget (typical ≈ 36/min:
+// 30 + 3 + 3). Const-asserted at ≤ 60 (20% of the budget) so a future cap
+// raise cannot silently eat the bruteX co-tenancy headroom.
+const _: () = assert!(
+    GROWW_CONTRACT_1M_MAX_PER_MINUTE
+        + GROWW_SPOT_1M_SYMBOLS.len() * (GROWW_SPOT_1M_RETRY_OFFSETS_MS.len() + 1)
+        + GROWW_CHAIN_1M_UNDERLYINGS.len()
+        <= 60,
+    "the three Groww REST legs' worst-case per-minute request total must stay <= 20% of the 300/min budget"
+);
+// The DEFAULT ATM window fills the cap exactly — a wider default needs a
+// fresh dated operator quote AND a cap re-derivation.
+const _: () = assert!(
+    ((2 * GROWW_CONTRACT_1M_DEFAULT_STRIKES_EACH_SIDE as usize + 1) * 2)
+        * GROWW_CHAIN_1M_UNDERLYINGS.len()
+        <= GROWW_CONTRACT_1M_MAX_PER_MINUTE,
+    "the default ATM window (strikes x CE+PE x underlyings) must fit the per-minute contract cap"
+);
+
 /// Daily reset signal time (IST). After market close at 15:30,
 /// historical re-fetch + cross-verification runs. At 16:00 IST the daily
 /// reset signal fires (candle aggregator reset, indicator reset, etc.).
@@ -4298,6 +4394,46 @@ mod tests {
         );
         // Warmup master-download retries: bounded, 3 attempts total.
         assert_eq!(GROWW_CHAIN_1M_MASTER_RETRY_BACKOFF_SECS, [3, 6]);
+    }
+
+    /// PR-4 (Groww contract leg): the fill-model leg's pacing + envelope
+    /// constants — the cap, the ATM-window default, and the boundary-burst
+    /// math are all mechanical (the const asserts re-prove them at compile
+    /// time; this test pins the VALUES so a drift is a conscious edit).
+    #[test]
+    fn test_groww_contract_1m_constants_pinned() {
+        assert_eq!(GROWW_CONTRACT_1M_FALLBACK_DELAY_MS, 8_000);
+        assert!(GROWW_CONTRACT_1M_FALLBACK_DELAY_MS > GROWW_CHAIN_1M_FALLBACK_DELAY_MS);
+        assert_eq!(GROWW_CONTRACT_1M_MIN_GAP_MS, 300);
+        assert_eq!(GROWW_CONTRACT_1M_REQUEST_TIMEOUT_SECS, 5);
+        assert_eq!(GROWW_CONTRACT_1M_MAX_PER_MINUTE, 30);
+        assert_eq!(GROWW_CONTRACT_1M_FIRE_BUDGET_SECS, 45);
+        assert_eq!(GROWW_CONTRACT_1M_DEFAULT_STRIKES_EACH_SIDE, 2);
+        // Fallback + fire budget fit the minute.
+        assert!(
+            GROWW_CONTRACT_1M_FALLBACK_DELAY_MS + GROWW_CONTRACT_1M_FIRE_BUDGET_SECS * 1_000
+                < 60_000
+        );
+        // Worst-overlap boundary burst inside the 6 req/s family ceiling:
+        // spot (sequential, <=1 in-flight) + chain (1s min-gap) + contract.
+        assert!(1 + 1_000 / GROWW_CHAIN_1M_MIN_GAP_MS + 1_000 / GROWW_CONTRACT_1M_MIN_GAP_MS <= 6);
+        // Per-minute request math (the capacity envelope): 30 contracts +
+        // the spot leg's worst 15 (3 symbols x 5 ladder rungs) + 3 chain
+        // = 48/min <= 20% of the 300/min shared budget (typical ~36/min).
+        assert_eq!(
+            GROWW_CONTRACT_1M_MAX_PER_MINUTE
+                + GROWW_SPOT_1M_SYMBOLS.len() * (GROWW_SPOT_1M_RETRY_OFFSETS_MS.len() + 1)
+                + GROWW_CHAIN_1M_UNDERLYINGS.len(),
+            48
+        );
+        // The default ATM window fills the cap exactly (5 strikes x 2 legs
+        // x 3 underlyings = 30) — a wider default needs a dated quote.
+        assert_eq!(
+            (2 * GROWW_CONTRACT_1M_DEFAULT_STRIKES_EACH_SIDE as usize + 1)
+                * 2
+                * GROWW_CHAIN_1M_UNDERLYINGS.len(),
+            GROWW_CONTRACT_1M_MAX_PER_MINUTE
+        );
     }
 
     /// Constant pin — 60s grace after close.

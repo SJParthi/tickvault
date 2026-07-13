@@ -414,7 +414,7 @@ fn vix_not_served_verdict(targets: &[GrowwSpotTarget], tracker: &PersistTracker)
 /// to Groww from day one; the consumer filters client-side to the exact
 /// minute. Month/day boundaries via `succ_opt` (cross-verify semantics).
 /// Pure.
-fn groww_day_window_strings(trading_date: NaiveDate) -> (String, String) {
+pub(crate) fn groww_day_window_strings(trading_date: NaiveDate) -> (String, String) {
     // `succ_opt` is `None` ONLY for `NaiveDate::MAX` (year 262142) — an
     // unreachable input for a live trading date. The fallback collapses the
     // window to zero width (start == end), which the server answers with an
@@ -432,7 +432,7 @@ fn groww_day_window_strings(trading_date: NaiveDate) -> (String, String) {
 /// `start_time` / `end_time` / `candle_interval="1minute"` (SDK-verified
 /// param set; identity = the `groww_symbol`, never the token or the bare
 /// trading symbol). Pure.
-fn groww_candles_query(
+pub(crate) fn groww_candles_query(
     groww_symbol: &str,
     exchange: &str,
     segment: &str,
@@ -511,12 +511,31 @@ fn parse_groww_candle_ts(v: &serde_json::Value) -> Option<(i64, GrowwTsForm)> {
 }
 
 /// Per-body parse accounting — which ts forms were seen + how many rows
-/// were malformed (all counted, never silent).
+/// were malformed (all counted, never silent). Shared with the PR-4
+/// contract leg (`groww_contract_1m_boot.rs`) — each leg records the
+/// stats into its OWN counter names.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct GrowwParseStats {
-    epoch_ts_rows: u32,
-    string_ts_rows: u32,
-    malformed_rows: u32,
+pub(crate) struct GrowwParseStats {
+    pub(crate) epoch_ts_rows: u32,
+    pub(crate) string_ts_rows: u32,
+    pub(crate) malformed_rows: u32,
+}
+
+/// One parsed Groww candle tuple `[ts, o, h, l, c, volume, oi]` — the
+/// SHARED wire row (PR-4 refactor): the spot leg maps it to
+/// [`MinuteCandle`] (dropping `oi` — indices carry none), the contract
+/// leg consumes `oi` directly (the fill-model column).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct GrowwCandleRow {
+    pub(crate) minute_ts_ist_nanos: i64,
+    pub(crate) open: f64,
+    pub(crate) high: f64,
+    pub(crate) low: f64,
+    pub(crate) close: f64,
+    pub(crate) volume: i64,
+    /// Candle tuple element 6 (`open_interest`) — 0 when absent/null
+    /// (indices legitimately carry none; contracts carry the real OI).
+    pub(crate) oi: i64,
 }
 
 /// Parse a Groww candles response body into [`MinuteCandle`]s. Envelope:
@@ -527,6 +546,26 @@ struct GrowwParseStats {
 /// + counted — never a panic (typed-degrade discipline). `volume` may be
 /// null (indices) → 0; non-finite prices skip the row. Pure.
 fn parse_groww_1m_candles(body: &str) -> (Vec<MinuteCandle>, GrowwParseStats) {
+    let (rows, stats) = parse_groww_1m_candle_rows(body);
+    let candles = rows
+        .into_iter()
+        .map(|r| MinuteCandle {
+            minute_ts_ist_nanos: r.minute_ts_ist_nanos,
+            open: r.open,
+            high: r.high,
+            low: r.low,
+            close: r.close,
+            volume: r.volume,
+        })
+        .collect();
+    (candles, stats)
+}
+
+/// The SHARED candle-tuple parser (PR-4 refactor — one wire parser, two
+/// consumers): identical envelope/row/timestamp semantics to the original
+/// spot parser, PLUS the `oi` element (tuple[6], tolerant: absent/null →
+/// 0) the contract leg consumes. Pure.
+pub(crate) fn parse_groww_1m_candle_rows(body: &str) -> (Vec<GrowwCandleRow>, GrowwParseStats) {
     let mut stats = GrowwParseStats::default();
     let Ok(v) = serde_json::from_str::<serde_json::Value>(body) else {
         stats.malformed_rows = 1;
@@ -572,30 +611,34 @@ fn parse_groww_1m_candles(body: &str) -> (Vec<MinuteCandle>, GrowwParseStats) {
             continue;
         }
         // Index volume is legitimately null/0 — stored verbatim, never a
-        // malformed marker. `open_interest` (tuple[6]) is ignored on the
-        // spot leg (the contract leg consumes it in PR-4).
-        let volume = tuple[5]
-            .as_i64()
-            .or_else(|| {
-                tuple[5]
-                    .as_f64()
-                    .filter(|f| f.is_finite() && f.abs() < 9.2e18)
-                    .map(|f| f as i64)
+        // malformed marker. `oi` (tuple[6]) is tolerant the same way: the
+        // spot leg drops it, the contract leg persists it verbatim.
+        let tolerant_i64 = |v: Option<&serde_json::Value>| -> i64 {
+            v.and_then(|v| {
+                v.as_i64().or_else(|| {
+                    v.as_f64()
+                        .filter(|f| f.is_finite() && f.abs() < 9.2e18)
+                        .map(|f| f as i64)
+                })
             })
-            .unwrap_or(0);
+            .unwrap_or(0)
+        };
+        let volume = tolerant_i64(tuple.get(5));
+        let oi = tolerant_i64(tuple.get(6));
         match form {
             GrowwTsForm::EpochSecs => stats.epoch_ts_rows = stats.epoch_ts_rows.saturating_add(1),
             GrowwTsForm::IstString => {
                 stats.string_ts_rows = stats.string_ts_rows.saturating_add(1);
             }
         }
-        out.push(MinuteCandle {
+        out.push(GrowwCandleRow {
             minute_ts_ist_nanos,
             open,
             high,
             low,
             close,
             volume,
+            oi,
         });
     }
     (out, stats)
@@ -776,7 +819,7 @@ fn should_reread_token(last_read_ms: Option<i64>, now_ms: i64) -> bool {
 }
 
 /// Bounded failure slug for the forensics row — NEVER raw body text. Pure.
-fn error_class_for_status(status: u16) -> &'static str {
+pub(crate) fn error_class_for_status(status: u16) -> &'static str {
     match status {
         0 => "transport",
         401 | 403 => "auth",
@@ -842,10 +885,22 @@ fn fetched_at_ist_nanos_now() -> i64 {
 pub(crate) struct GrowwTokenCache {
     token: Option<SecretString>,
     last_read_ms: Option<i64>,
-    /// `true` when the CHAIN leg owns this cache — routes the SSM
-    /// read-failure emit to CHAIN-02 / `tv_groww_chain1m_*` instead of the
-    /// spot taxonomy. Behaviour (pacing, drop-on-auth-reject) is identical.
-    chain_leg: bool,
+    /// WHICH Groww REST leg owns this cache — routes the SSM read-failure
+    /// emit to that leg's error-code/counter taxonomy. Behaviour (pacing,
+    /// drop-on-auth-reject) is identical across legs.
+    leg: GrowwRestLegRoute,
+}
+
+/// The owning REST leg of a [`GrowwTokenCache`] — error-routing only.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum GrowwRestLegRoute {
+    /// Spot 1m leg (SPOT1M-01 / `tv_groww_spot1m_*`).
+    Spot,
+    /// Option-chain leg (CHAIN-02 / `tv_groww_chain1m_*`).
+    Chain,
+    /// Per-contract 1m leg (SPOT1M-01 leg=contract_1m /
+    /// `tv_groww_contract1m_*` — PR-4).
+    Contract,
 }
 
 impl GrowwTokenCache {
@@ -854,7 +909,7 @@ impl GrowwTokenCache {
         Self {
             token: None,
             last_read_ms: None,
-            chain_leg: false,
+            leg: GrowwRestLegRoute::Spot,
         }
     }
 
@@ -863,7 +918,17 @@ impl GrowwTokenCache {
     // TEST-EXEMPT: trivial constructor — same tested semantics as new(); the routing flag is exercised by the chain wiring guard's stub scan.
     pub(crate) fn new_chain() -> Self {
         Self {
-            chain_leg: true,
+            leg: GrowwRestLegRoute::Chain,
+            ..Self::new()
+        }
+    }
+
+    /// Contract-leg constructor (PR-4) — same cache semantics,
+    /// contract-routed read-failure emits.
+    // TEST-EXEMPT: trivial constructor — same tested semantics as new(); the routing flag is exercised by the contract wiring guard's stub scan.
+    pub(crate) fn new_contract() -> Self {
+        Self {
+            leg: GrowwRestLegRoute::Contract,
             ..Self::new()
         }
     }
@@ -878,7 +943,7 @@ impl GrowwTokenCache {
         Self {
             token: None,
             last_read_ms: Some(now_ms),
-            chain_leg: true,
+            leg: GrowwRestLegRoute::Chain,
         }
     }
 
@@ -891,7 +956,7 @@ impl GrowwTokenCache {
         Self {
             token: Some(token),
             last_read_ms: None,
-            chain_leg: true,
+            leg: GrowwRestLegRoute::Chain,
         }
     }
 
@@ -906,13 +971,13 @@ impl GrowwTokenCache {
             match fetch_groww_access_token().await {
                 Ok(token) => {
                     info!(
-                        chain_leg = self.chain_leg,
+                        leg = ?self.leg,
                         "groww_rest_1m: shared access token read from SSM \
                          (read-only; minted by the token-minter Lambda)"
                     );
                     self.token = Some(token);
                 }
-                Err(err) if self.chain_leg => {
+                Err(err) if self.leg == GrowwRestLegRoute::Chain => {
                     metrics::counter!("tv_groww_chain1m_token_read_failed_total").increment(1);
                     error!(
                         code = ErrorCode::Chain02FetchDegraded.code_str(),
@@ -921,6 +986,19 @@ impl GrowwTokenCache {
                         ?err,
                         "CHAIN-02: shared Groww access token SSM read failed \
                          — the chain leg's minutes miss until the read \
+                         succeeds (re-read paced at 60s; NEVER minted)"
+                    );
+                }
+                Err(err) if self.leg == GrowwRestLegRoute::Contract => {
+                    metrics::counter!("tv_groww_contract1m_token_read_failed_total").increment(1);
+                    error!(
+                        code = ErrorCode::Spot1m01FetchDegraded.code_str(),
+                        stage = "token_read",
+                        feed = SPOT_1M_REST_FEED_GROWW,
+                        leg = "contract_1m",
+                        ?err,
+                        "SPOT1M-01: shared Groww access token SSM read failed \
+                         — the contract leg's minutes miss until the read \
                          succeeds (re-read paced at 60s; NEVER minted)"
                     );
                 }
@@ -948,7 +1026,7 @@ impl GrowwTokenCache {
     pub(crate) fn note_auth_rejected(&mut self) {
         if self.token.take().is_some() {
             warn!(
-                chain_leg = self.chain_leg,
+                leg = ?self.leg,
                 "groww_rest_1m: auth-class reject — cached token dropped; \
                  re-reading from SSM at >=60s pacing (never minting)"
             );

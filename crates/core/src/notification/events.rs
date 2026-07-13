@@ -648,6 +648,40 @@ pub enum NotificationEvent {
         detail: String,
     },
 
+    /// Groww per-minute PER-CONTRACT candle REST leg (operator grant
+    /// 2026-07-13, PR-4 of the Groww per-minute REST plan — the fill-model
+    /// leg): the per-minute contract candle pull has fully failed for
+    /// several minutes in a row (edge-triggered ONCE per episode, Rule 4;
+    /// re-armed only after a successful minute). Severity::High.
+    GrowwContract1mFetchDegraded {
+        /// How many minutes in a row have fully failed.
+        consecutive_failed_minutes: u32,
+        /// The most recent failed minute, IST 12-hour (e.g. "10:42 AM").
+        minute_ist: String,
+    },
+
+    /// The Groww per-minute contract candle pull RECOVERED after a failing
+    /// episode (falling edge — one Info ping; the missing minutes stay
+    /// absent until re-pulled, never fabricated).
+    GrowwContract1mFetchRecovered {
+        /// The minute that succeeded, IST 12-hour (e.g. "10:45 AM").
+        minute_ist: String,
+        /// How many minutes had fully failed during the episode.
+        failed_minutes: u32,
+    },
+
+    /// The Groww contract leg could not build today's contract book for
+    /// one or more underlyings from the daily instruments list (list
+    /// download failed after bounded tries, or the list carried no usable
+    /// option contracts at the current expiry) — those underlyings'
+    /// per-contract recording stays OFF for the day (contract identities
+    /// are never guessed). One HIGH page per day.
+    GrowwContract1mBookUnresolved {
+        /// Plain-English detail naming the affected underlyings / cause
+        /// (already secret-redacted + bounded at the emit site).
+        detail: String,
+    },
+
     /// Per-minute option-chain REST pipeline (operator grant 2026-07-12,
     /// PR-3): the per-minute option-chain snapshot has fully failed for
     /// several minutes in a row (edge-triggered ONCE per episode, Rule 4;
@@ -2499,6 +2533,57 @@ impl NotificationEvent {
                     )
                 }
             }
+            Self::GrowwContract1mFetchDegraded {
+                consecutive_failed_minutes,
+                minute_ist,
+            } => {
+                format!(
+                    "\u{1f198} <b>Groww minute-by-minute option CONTRACT price \
+                     recording is FAILING</b>\n\
+                     The per-minute price pull for the selected NIFTY, \
+                     BANKNIFTY and SENSEX option contracts from the second \
+                     broker (Groww) has failed {consecutive_failed_minutes} \
+                     minutes in a row (latest failed minute: {minute_ist} \
+                     IST).\n\
+                     Live streaming prices are NOT affected — only Groww's \
+                     per-minute contract price record is missing.\n\
+                     What to do RIGHT NOW:\n\
+                     1. Check the Groww account's daily access is active \
+                     (the shared morning key).\n\
+                     2. If the Groww option chain recording ALSO failed, the \
+                     problem is upstream of this leg.\n\
+                     3. Missing minutes stay blank — nothing is made up."
+                )
+            }
+            Self::GrowwContract1mFetchRecovered {
+                minute_ist,
+                failed_minutes,
+            } => {
+                format!(
+                    "\u{2705} <b>Groww minute-by-minute option contract price \
+                     recording recovered</b>\n\
+                     The Groww per-minute contract price pull is working \
+                     again as of {minute_ist} IST, after {failed_minutes} \
+                     failed minute(s). The minutes that failed stay blank in \
+                     the record until re-pulled — nothing is made up."
+                )
+            }
+            Self::GrowwContract1mBookUnresolved { detail } => {
+                let detail = html_escape(detail);
+                format!(
+                    "\u{1f198} <b>Groww option contract recording could NOT \
+                     start for some indices today</b>\n\
+                     Today's contract list from Groww did not give usable \
+                     option contracts for the current expiry, so those \
+                     indices' per-minute contract recording stays OFF for \
+                     today (contract identities are never guessed).\n\
+                     Detail: {detail}\n\
+                     Live streaming prices are NOT affected. Tomorrow's start \
+                     retries automatically.\n\
+                     If this repeats for days, the contract list itself has a \
+                     problem — check with the broker."
+                )
+            }
             Self::ChainFetchDegraded {
                 consecutive_failed_minutes,
                 minute_ist,
@@ -3473,6 +3558,9 @@ impl NotificationEvent {
             Self::GrowwChain1mFetchRecovered { .. } => "GrowwChain1mFetchRecovered",
             Self::GrowwChain1mExpiryUnresolved { .. } => "GrowwChain1mExpiryUnresolved",
             Self::GrowwChain1mProbeVerdict { .. } => "GrowwChain1mProbeVerdict",
+            Self::GrowwContract1mFetchDegraded { .. } => "GrowwContract1mFetchDegraded",
+            Self::GrowwContract1mFetchRecovered { .. } => "GrowwContract1mFetchRecovered",
+            Self::GrowwContract1mBookUnresolved { .. } => "GrowwContract1mBookUnresolved",
             Self::ChainFetchDegraded { .. } => "ChainFetchDegraded",
             Self::ChainFetchRecovered { .. } => "ChainFetchRecovered",
             Self::ChainEntitlementAbsent { .. } => "ChainEntitlementAbsent",
@@ -3789,6 +3877,12 @@ impl NotificationEvent {
             // The probe is informational either way — nothing was expected
             // to record while the pipeline is switched off.
             Self::GrowwChain1mProbeVerdict { .. } => Severity::Info,
+            // The contract leg mirrors the chain edge semantics: one HIGH
+            // page per failing episode, one Info recovery, one HIGH per day
+            // for an unresolvable contract book.
+            Self::GrowwContract1mFetchDegraded { .. } => Severity::High,
+            Self::GrowwContract1mFetchRecovered { .. } => Severity::Info,
+            Self::GrowwContract1mBookUnresolved { .. } => Severity::High,
             Self::ChainFetchDegraded { .. } => Severity::High,
             Self::ChainFetchRecovered { .. } => Severity::Info,
             // HIGH only when the pipeline was ON and expected to record;
@@ -7416,6 +7510,57 @@ mod tests {
     // GrowwChain1m* events (2026-07-13 — Groww per-minute option-chain
     // leg, PR-3 of the Groww REST plan)
     // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_groww_contract_1m_fetch_degraded_is_high_with_action_lines() {
+        let event = NotificationEvent::GrowwContract1mFetchDegraded {
+            consecutive_failed_minutes: 3,
+            minute_ist: "10:42 AM".to_string(),
+        };
+        assert_eq!(event.topic(), "GrowwContract1mFetchDegraded");
+        assert_eq!(event.severity(), Severity::High);
+        let msg = event.to_message();
+        assert!(msg.contains("Groww"), "got: {msg}");
+        assert!(msg.contains("FAILING"), "got: {msg}");
+        assert!(msg.contains("3 minutes in a row"), "got: {msg}");
+        // IST 12-hour timestamp (Telegram commandment 9).
+        assert!(msg.contains("10:42 AM IST"), "got: {msg}");
+        assert!(msg.contains("What to do RIGHT NOW"), "got: {msg}");
+        // Honest scope line: the live WS pipelines are untouched.
+        assert!(msg.contains("NOT affected"), "got: {msg}");
+    }
+
+    #[test]
+    fn test_groww_contract_1m_fetch_recovered_is_info_positive_ping() {
+        let event = NotificationEvent::GrowwContract1mFetchRecovered {
+            minute_ist: "10:45 AM".to_string(),
+            failed_minutes: 4,
+        };
+        assert_eq!(event.topic(), "GrowwContract1mFetchRecovered");
+        assert_eq!(event.severity(), Severity::Info);
+        let msg = event.to_message();
+        assert!(msg.contains("Groww"), "got: {msg}");
+        assert!(msg.contains("recovered"), "got: {msg}");
+        assert!(msg.contains("10:45 AM IST"), "got: {msg}");
+        assert!(msg.contains("4 failed"), "got: {msg}");
+        // No false-OK: recovery never claims the missing minutes came back.
+        assert!(msg.contains("nothing is made up"), "got: {msg}");
+    }
+
+    #[test]
+    fn test_groww_contract_1m_book_unresolved_is_high_and_escapes_detail() {
+        let event = NotificationEvent::GrowwContract1mBookUnresolved {
+            detail: "SENSEX: no usable contracts <script>".to_string(),
+        };
+        assert_eq!(event.topic(), "GrowwContract1mBookUnresolved");
+        assert_eq!(event.severity(), Severity::High);
+        let msg = event.to_message();
+        assert!(msg.contains("could NOT"), "got: {msg}");
+        assert!(msg.contains("never guessed"), "got: {msg}");
+        // Hostile detail is HTML-escaped, never raw.
+        assert!(!msg.contains("<script>"), "got: {msg}");
+        assert!(msg.contains("&lt;script&gt;"), "got: {msg}");
+    }
 
     #[test]
     fn test_groww_chain_1m_fetch_degraded_is_high_with_action_lines() {
