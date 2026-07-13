@@ -100,6 +100,40 @@ semantics, and log text are byte-identical (ratchet:
 `test_named_lock_path_dhan_name_matches_legacy_path`). Runbook:
 `groww-scale-error-codes.md` §4b.
 
+## §3.5. 2026-07-13 addendum — the Dhan REST-only stack supersedes the lane's HALT-on-AlreadyHeld (Phase A)
+
+**Operator authorization:** the 2026-07-13 directive retiring the Dhan live WS
+lane — *"now remove this entire Dhan live websocket feed instruments
+subscription even entire live websocket feed itself... As of now only Groww
+and Dhan historical api pull as we discussed last night along with option
+chain."* With `dhan_enabled = false` the lane (and its §2 Step 6a-prime HALT)
+never runs; the retained Dhan REST surface is brought up by
+`crates/app/src/dhan_rest_stack.rs`, whose lock semantics supersede the HALT
+**for this path only** (the lane's §2 contract is untouched for a config-ON
+boot):
+
+- **AlreadyHeld → bounded patience, then PARK (never seize, never lurk):**
+  holder machine identity is not reliably comparable (both lock call sites
+  generate `local:` host_ids — `generate_host_id(..., None)`), so ALL
+  AlreadyHeld gets a bounded patience window
+  (`DHAN_REST_STACK_ALREADYHELD_PATIENCE_SECS` = 300s of cumulative backoff,
+  ≥3× the 90s TTL — our own previous process's stale entry from a
+  deploy/daily-restart clears inside it and the stack acquires). A holder
+  that SURVIVES the window has a live heartbeat = a genuine peer: ONE
+  `DualInstanceDetected` page (TTL-deferred so a quick restart never pages
+  against its own stale entry) + the stack **PARKS permanently** — no
+  further SSM polling, so it can structurally never steal the peer's lock
+  via the 90s stale-takeover the moment that peer restarts. Restart is the
+  only retry; the process keeps running Groww + shared infra.
+- **SSM transport errors** (`stage = "ssm_transport"`, distinct from the
+  AlreadyHeld `stage = "already_held"` arms) retry with bounded exponential
+  backoff FOREVER in the background — never blocking the Groww feed
+  (fail-closed: an SSM outage proves nothing about peers, so no mint until
+  the lock is held).
+- **Lock-before-mint is UNCHANGED:** the token phase is unreachable until
+  the lock is `Acquired`; the heartbeat + `instance_lock_held`
+  RESILIENCE-03 tripwire wiring is byte-identical to the lane's.
+
 ## §4. What a PR that violates this lock looks like (REJECT)
 
 - Re-introduces a trading-mode (`is_live()`) or any other gate that can skip the
