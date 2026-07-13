@@ -67,6 +67,9 @@ use tickvault_core::pipeline::run_tick_processor;
 use tickvault_core::websocket::connection_pool::WebSocketConnectionPool;
 use tickvault_core::websocket::order_update_connection::run_order_update_connection;
 use tickvault_core::websocket::types::{InstrumentSubscription, WebSocketError};
+// Phase C1 (2026-07-13): relocated from this binary to the lib so
+// dhan_rest_stack can create its own ws_event_audit consumer (Q4-i rewire).
+use tickvault_app::ws_audit_consumer::spawn_ws_event_audit_consumer;
 
 // PR-E (2026-05-26): ensure_candle_table_dedup_keys retired alongside
 // the deleted candle_persistence module + historical_candles table.
@@ -4148,84 +4151,12 @@ fn create_websocket_pool(
     Some((receiver, pool))
 }
 
-/// Bounded capacity for the WS-event audit channel. WS lifecycle events are
-/// rare (a few per connection per day), so a small bound is ample; the producer
-/// `try_send`s and drops on the (practically unreachable) full case rather than
-/// ever blocking the WS read loop.
-const WS_EVENT_AUDIT_CHANNEL_CAPACITY: usize = 1024;
-
-/// Creates the WS-event audit channel + spawns its consumer task, returning the
-/// `Sender` to hand to a WebSocket producer (the main-feed pool OR the
-/// order-update connection). Self-contained: each call owns one consumer
-/// writing to the shared `ws_event_audit` table (ILP appends are independent),
-/// so the order-update connection reuses this exact pattern with no boot
-/// refactor.
-fn spawn_ws_event_audit_consumer(
-    questdb_cfg: tickvault_common::config::QuestDbConfig,
-) -> tokio::sync::mpsc::Sender<tickvault_common::ws_event_types::WsEventAuditRow> {
-    let (tx, rx) = tokio::sync::mpsc::channel::<tickvault_common::ws_event_types::WsEventAuditRow>(
-        WS_EVENT_AUDIT_CHANNEL_CAPACITY,
-    );
-    tokio::spawn(async move {
-        run_ws_event_audit_consumer(rx, questdb_cfg).await;
-    });
-    tx
-}
-
-/// Drains the WS-event audit channel into the `ws_event_audit` QuestDB table.
-///
-/// Owns the ILP writer for the table's lifetime, ensures the table exists once
-/// at start, then appends + flushes each row as it arrives. A flush failure
-/// emits AUDIT-WS-01 (Medium) — the WS events still reached CloudWatch logs +
-/// Telegram, so this is a forensic-record gap, never a recovery-path failure.
-/// Exits cleanly when all producers (the pool connections) drop their senders.
-async fn run_ws_event_audit_consumer(
-    mut rx: tokio::sync::mpsc::Receiver<tickvault_common::ws_event_types::WsEventAuditRow>,
-    questdb_cfg: tickvault_common::config::QuestDbConfig,
-) {
-    use tickvault_common::error_code::ErrorCode;
-    use tickvault_storage::ws_event_audit_persistence::{
-        WsEventAuditWriter, ensure_ws_event_audit_table,
-    };
-
-    ensure_ws_event_audit_table(&questdb_cfg).await;
-    let mut writer = WsEventAuditWriter::new(&questdb_cfg);
-    while let Some(row) = rx.recv().await {
-        if let Err(err) = writer.append_row(&row) {
-            error!(
-                code = ErrorCode::AuditWs01EventWriteFailed.code_str(),
-                ws_type = row.ws_type.as_str(),
-                connection_index = row.connection_index,
-                event_kind = row.event_kind.as_str(),
-                ?err,
-                "ws_event_audit: append failed"
-            );
-            metrics::counter!("tv_ws_event_audit_write_errors_total", "stage" => "append")
-                .increment(1);
-            continue;
-        }
-        if let Err(err) = writer.flush() {
-            error!(
-                code = ErrorCode::AuditWs01EventWriteFailed.code_str(),
-                ws_type = row.ws_type.as_str(),
-                connection_index = row.connection_index,
-                event_kind = row.event_kind.as_str(),
-                ?err,
-                "ws_event_audit: flush failed"
-            );
-            metrics::counter!("tv_ws_event_audit_write_errors_total", "stage" => "flush")
-                .increment(1);
-        } else {
-            metrics::counter!(
-                "tv_ws_event_audit_rows_total",
-                "ws_type" => row.ws_type.as_str(),
-                "event_kind" => row.event_kind.as_str(),
-            )
-            .increment(1);
-        }
-    }
-    info!("ws_event_audit consumer: all producers dropped — exiting");
-}
+// Phase C1 (2026-07-13): the WS-event audit channel + consumer helper
+// (`spawn_ws_event_audit_consumer` / `run_ws_event_audit_consumer` /
+// `WS_EVENT_AUDIT_CHANNEL_CAPACITY`) RELOCATED to the lib module
+// `tickvault_app::ws_audit_consumer` (pure move, zero behavior change) so
+// `dhan_rest_stack` — which owns the functional-dormant order-update WS per
+// operator ruling Q4-i — can create its own consumer. Re-imported below.
 
 /// Spawns all WebSocket connections in the pool (with stagger).
 /// Call AFTER the tick processor is started so frames are consumed immediately.
