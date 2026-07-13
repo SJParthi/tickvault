@@ -378,7 +378,14 @@ chain-specific rate rule). Groww counters mirror the Dhan names under the
 `GrowwChain1mFetchDegraded` / `GrowwChain1mFetchRecovered` Telegram
 events (same 3-minute persist-gated edge). Forensics: one
 `rest_fetch_audit` row per (minute, underlying) with `leg='chain_1m'`,
-`attempts=1` (no re-poll ladder — live snapshot semantics).
+`attempts=1` (no re-poll ladder — live snapshot semantics). Gate note
+(2026-07-13): the Groww chain leg shipped base.toml DEFAULT-OFF
+(probe-only); the first live probe PASSED the same night (build
+`eeca0ec`, ~11:47 PM IST) and `[groww_option_chain_1m].enabled` flipped
+to `true` in base.toml — dated record in
+`groww-second-feed-scope-2026-06-19.md` §38.6; the serde DEFAULT stays
+OFF (fail-safe) and `probe_and_report` stays `true` (inert while
+enabled; the rollback canary).
 
 ## §2d. CHAIN-03 — option_chain_1m persist failed
 
