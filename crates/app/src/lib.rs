@@ -188,3 +188,8 @@ pub mod trading_pipeline;
 /// re-injection — replaces the raw try_send loop that dropped 1,127,801
 /// frames + kept the WAL unconfirmed (self-feeding re-replay storm).
 pub mod wal_reinject;
+/// Shared `ws_event_audit` channel + consumer helper — relocated from the
+/// main.rs binary in Phase C1 (2026-07-13) so the lib-side `dhan_rest_stack`
+/// (which owns the functional-dormant order-update WS per operator ruling
+/// Q4-i) can create its own audit consumer. Pure move, zero behavior change.
+pub mod ws_audit_consumer;

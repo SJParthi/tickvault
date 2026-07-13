@@ -189,6 +189,12 @@ as historical audit; THIS table is the effective contract.
 > fast crash-recovery arm + `start_dhan_lane` — both OFF with `dhan_enabled = false` — so
 > the live Dhan WS count is 0 until the Phase C rewire spawns it from `dhan_rest_stack`
 > (functional-dormant, ≤1).
+>
+> **2026-07-13 PR-C1 note (Q4-i rewire SHIPPED):** `dhan_rest_stack` now spawns the
+> order-update WS (functional-dormant — Phase 5a, after the family-claim tripwire), so a
+> dhan-off boot opens **≤1 Dhan WS (order-update only)**; the legacy fast-arm/lane spawn
+> sites remain dead code until the Phase C2 deletion, after which the stack is the sole
+> call site.
 
 ### §B. What the Phase C deletion PRs MAY remove (authorized by Q1/Q3/Q4; consumer map Verified 2026-07-13)
 
