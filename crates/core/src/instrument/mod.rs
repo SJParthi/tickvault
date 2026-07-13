@@ -32,9 +32,12 @@ pub mod subscription_planner;
 pub mod csv_downloader;
 
 // Sub-PR #4 of 2026-05-27 daily-universe expansion: robust parser for
-// the Dhan Detailed instrument-master CSV. Same feature flag as the
-// downloader — both compose into Sub-PR #10's orchestrator.
-#[cfg(feature = "daily_universe_fetcher")]
+// the Dhan Detailed instrument-master CSV.
+// PR-C1 (2026-07-13): DE-GATED from `daily_universe_fetcher` — it is a
+// compile-time dependency (`CsvRow`) of the de-gated `index_futures`
+// selector below (the minimal transitive closure; pure parse module, no
+// feature-only deps). The Phase C3 deletion of the Dhan CSV chain will
+// split `CsvRow` out before removing this module.
 pub mod csv_parser;
 
 // Sub-PR #5 of 2026-05-27 daily-universe expansion: extract the set
@@ -45,7 +48,11 @@ pub mod fno_underlying_extractor;
 
 // Sub-PR #6 of 2026-05-27 daily-universe expansion: extract every
 // IDX_I INDEX row (NSE indices + 1 BSE SENSEX) per §2 universe scope.
-#[cfg(feature = "daily_universe_fetcher")]
+// PR-C1 (2026-07-13): DE-GATED from `daily_universe_fetcher` — the Groww
+// watch build consumes `NSE_INDEX_ALLOWLIST` + `canonicalize_index_symbol`
+// (the scope-lock amendment §B KEEP items) and the de-gated `index_futures`
+// selector imports the canonicalizer; the §36.7 Groww futures mandate must
+// not depend on a build feature.
 pub mod index_extractor;
 
 // Sub-PR #7 of 2026-05-27 daily-universe expansion: combine the F&O
@@ -57,7 +64,12 @@ pub mod daily_universe;
 // §36 (2026-07-08) / §36.7 (2026-07-10): all-monthly-expiries FUTIDX
 // selection — the ONE shared pure selector both the Dhan orchestrator and
 // the Groww watch builder call.
-#[cfg(feature = "daily_universe_fetcher")]
+// PR-C1 (2026-07-13): DE-GATED from `daily_universe_fetcher` per the
+// daily-universe 2026-07-13 banner §(d): the §36.7 GROWW futures leg
+// STANDS after the Dhan retirement, and gating the shared selector behind
+// the feature would let a future feature removal silently drop the Groww
+// futures (a scope violation). Ratchet:
+// `index_futures.rs::tests::test_futidx_selector_is_not_feature_gated`.
 pub mod index_futures;
 
 // Scoreboard PR-D (2026-07-11): Dhan-side presence-registry registration —

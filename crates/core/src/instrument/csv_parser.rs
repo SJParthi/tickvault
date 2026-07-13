@@ -29,8 +29,11 @@
 //! - Caller-side persistence to `instrument_lifecycle` table — Sub-PR #9
 //!
 //! This module ships ONLY the parser: bytes in, validated rows out.
-
-#![cfg(feature = "daily_universe_fetcher")]
+//!
+//! PR-C1 (2026-07-13): the module-level `daily_universe_fetcher` gate was
+//! REMOVED — `index_futures` (de-gated per the daily-universe 2026-07-13
+//! banner §(d)) depends on [`CsvRow`] at compile time, so this pure parse
+//! module must build in every feature mode.
 
 use thiserror::Error;
 use tickvault_common::sanitize::sanitize_audit_string;
