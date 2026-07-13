@@ -112,6 +112,12 @@ pub(crate) const DAY_PARTITIONED_TABLES: &[&str] = &[
     // operator retention follow-up in option_chain_1m_persistence.rs);
     // same DAY partitioning + retention class; `feed` is in the DEDUP key.
     "option_chain_1m",
+    // SPOT1M-02 stages audit_ensure_* (2026-07-13, Groww spot-1m PR-2): one
+    // row per REST fetch attempt outcome per (minute, symbol, feed, leg) —
+    // ~1-2K rows/day for the Groww spot leg (375 min x 3 symbols x attempts),
+    // trivial disk; same DAY partitioning + SEBI retention class as the audit
+    // tables above; `feed` + `exchange_segment` are in the DEDUP key.
+    "rest_fetch_audit",
 ];
 
 /// Tables EXEMPT from retention sweeping — NEVER detached or dropped.
