@@ -11533,7 +11533,20 @@ async fn run_process_runloop(
         "system ready — press Ctrl+C to stop"
     );
 
-    notifier.notify(NotificationEvent::StartupComplete { mode });
+    // 2026-07-13 operator visibility rider: the boot Telegram states what
+    // the per-minute Dhan REST legs will ACTUALLY do today (config truth) —
+    // a midnight boot is otherwise silent about them until 09:16 IST.
+    notifier.notify(NotificationEvent::StartupComplete {
+        mode,
+        spot_1m_enabled: config.spot_1m_rest.enabled,
+        spot_1m_indices: u32::try_from(tickvault_common::constants::SPOT_1M_REST_INDICES.len())
+            .unwrap_or(0),
+        chain_1m_enabled: config.option_chain_1m.enabled,
+        chain_1m_underlyings: u32::try_from(
+            tickvault_common::constants::CHAIN_1M_UNDERLYINGS.len(),
+        )
+        .unwrap_or(0),
+    });
 
     // --- Post-market WebSocket disconnect timer ---
     // Compute sleep duration until market_close_time (15:30 IST).

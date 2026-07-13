@@ -187,6 +187,16 @@ pub enum NotificationEvent {
     StartupComplete {
         /// "LIVE" or "OFFLINE".
         mode: &'static str,
+        /// Per-minute spot 1m REST leg armed at boot (config truth —
+        /// 2026-07-13 operator visibility rider: the boot Telegram must say
+        /// what the per-minute price capture will actually do today).
+        spot_1m_enabled: bool,
+        /// How many indices the spot leg pulls (4 since 2026-07-13).
+        spot_1m_indices: u32,
+        /// Per-minute option-chain REST leg armed at boot (config truth).
+        chain_1m_enabled: bool,
+        /// How many underlyings the chain leg pulls (3 — VIX is spot-only).
+        chain_1m_underlyings: u32,
     },
 
     /// Dhan authentication token acquired at boot.
@@ -1762,7 +1772,13 @@ impl NotificationEvent {
     /// Callers outside this impl use [`Self::to_message`].
     fn message_body(&self) -> String {
         match self {
-            Self::StartupComplete { mode } => {
+            Self::StartupComplete {
+                mode,
+                spot_1m_enabled,
+                spot_1m_indices,
+                chain_1m_enabled,
+                chain_1m_underlyings,
+            } => {
                 // SECURITY: Do not expose internal service ports in Telegram.
                 // Dashboards line trimmed in #O1/#O2/#O3/#O4 — Grafana,
                 // Prometheus, Alertmanager, Valkey all removed in the
@@ -1773,8 +1789,35 @@ impl NotificationEvent {
                 // conscious operator-approved override of the "no version
                 // numbers in body" Telegram commandment (B9 directive
                 // 2026-07-03) — it answers "WHICH code booted?" at a glance.
+                // 2026-07-13 operator visibility rider: say what the
+                // per-minute price capture will ACTUALLY do today (a
+                // midnight boot is silent until 9:16 AM and the operator
+                // asked "what happened to it?"). Truthful per-leg wording —
+                // a switched-off leg says so.
+                let capture_line = match (spot_1m_enabled, chain_1m_enabled) {
+                    (true, true) => format!(
+                        "\u{2705} Per-minute price capture — armed (fires \
+                         9:16 AM to 3:30 PM IST on trading days): spot \
+                         candles for {spot_1m_indices} indices + option \
+                         chain for {chain_1m_underlyings} indices"
+                    ),
+                    (true, false) => format!(
+                        "\u{2705} Per-minute price capture — armed (fires \
+                         9:16 AM to 3:30 PM IST on trading days): spot \
+                         candles for {spot_1m_indices} indices; option \
+                         chain — switched off"
+                    ),
+                    (false, true) => format!(
+                        "\u{2705} Per-minute price capture — armed (fires \
+                         9:16 AM to 3:30 PM IST on trading days): option \
+                         chain for {chain_1m_underlyings} indices; spot \
+                         candles — switched off"
+                    ),
+                    (false, false) => "Per-minute price capture — switched off".to_string(),
+                };
                 format!(
-                    "<b>tickvault started</b>\nMode: {mode}\nBuild: {build}\n\n\
+                    "<b>tickvault started</b>\nMode: {mode}\nBuild: {build}\n\
+                     {capture_line}\n\n\
                      Dashboards: QuestDB Console (local) / CloudWatch (prod)",
                     build = tickvault_common::build_info::build_git_sha_short(),
                 )
@@ -3302,7 +3345,7 @@ impl NotificationEvent {
             }
             Self::OrderUpdateConnected => Some(BootMilestone::OrderUpdateConnected),
             Self::OrderUpdateAuthenticated => Some(BootMilestone::OrderUpdateAuthenticated),
-            Self::StartupComplete { mode } => Some(BootMilestone::Complete { mode }),
+            Self::StartupComplete { mode, .. } => Some(BootMilestone::Complete { mode }),
             Self::FeedAuthOk { feed } if feed.eq_ignore_ascii_case("groww") => {
                 Some(BootMilestone::GrowwAuth)
             }
@@ -3778,7 +3821,13 @@ mod tests {
             },
             NotificationEvent::OrderUpdateConnected,
             NotificationEvent::OrderUpdateAuthenticated,
-            NotificationEvent::StartupComplete { mode: "sandbox" },
+            NotificationEvent::StartupComplete {
+                mode: "sandbox",
+                spot_1m_enabled: true,
+                spot_1m_indices: 4,
+                chain_1m_enabled: true,
+                chain_1m_underlyings: 3,
+            },
             NotificationEvent::FeedAuthOk {
                 feed: "Groww".to_string(),
             },
@@ -3911,7 +3960,14 @@ mod tests {
             Some(M::OrderUpdateAuthenticated)
         );
         assert_eq!(
-            NotificationEvent::StartupComplete { mode: "sandbox" }.boot_milestone(),
+            NotificationEvent::StartupComplete {
+                mode: "sandbox",
+                spot_1m_enabled: true,
+                spot_1m_indices: 4,
+                chain_1m_enabled: true,
+                chain_1m_underlyings: 3
+            }
+            .boot_milestone(),
             Some(BootMilestone::Complete { mode: "sandbox" })
         );
         assert_eq!(
@@ -4012,7 +4068,13 @@ mod tests {
         // (e.g. always returning "Event") cannot pass.
         let cases: Vec<(NotificationEvent, &'static str)> = vec![
             (
-                NotificationEvent::StartupComplete { mode: "LIVE" },
+                NotificationEvent::StartupComplete {
+                    mode: "LIVE",
+                    spot_1m_enabled: true,
+                    spot_1m_indices: 4,
+                    chain_1m_enabled: true,
+                    chain_1m_underlyings: 3,
+                },
                 "StartupComplete",
             ),
             (
@@ -4051,7 +4113,13 @@ mod tests {
 
     #[test]
     fn test_startup_complete_live_message() {
-        let event = NotificationEvent::StartupComplete { mode: "LIVE" };
+        let event = NotificationEvent::StartupComplete {
+            mode: "LIVE",
+            spot_1m_enabled: true,
+            spot_1m_indices: 4,
+            chain_1m_enabled: true,
+            chain_1m_underlyings: 3,
+        };
         let msg = event.to_message();
         assert!(msg.contains("LIVE"));
         assert!(msg.contains("started"));
@@ -4093,11 +4161,68 @@ mod tests {
         assert!(!msg.contains("Valkey"), "retired in #O4: {msg}");
     }
 
+    /// 2026-07-13 operator visibility rider: the boot Telegram states the
+    /// per-minute price capture's ACTUAL config state — on/on, on/off,
+    /// off/on and off/off arms all worded truthfully.
+    #[test]
+    fn test_startup_complete_per_minute_capture_wording_arms() {
+        let build = |spot: bool, chain: bool| NotificationEvent::StartupComplete {
+            mode: "LIVE",
+            spot_1m_enabled: spot,
+            spot_1m_indices: 4,
+            chain_1m_enabled: chain,
+            chain_1m_underlyings: 3,
+        };
+
+        let both = build(true, true).to_message();
+        assert!(
+            both.contains("Per-minute price capture — armed"),
+            "got: {both}"
+        );
+        assert!(both.contains("9:16 AM to 3:30 PM IST"), "got: {both}");
+        assert!(both.contains("spot candles for 4 indices"), "got: {both}");
+        assert!(both.contains("option chain for 3 indices"), "got: {both}");
+        assert!(!both.contains("switched off"), "got: {both}");
+
+        let chain_off = build(true, false).to_message();
+        assert!(
+            chain_off.contains("spot candles for 4 indices"),
+            "got: {chain_off}"
+        );
+        assert!(
+            chain_off.contains("option chain — switched off"),
+            "got: {chain_off}"
+        );
+
+        let spot_off = build(false, true).to_message();
+        assert!(
+            spot_off.contains("option chain for 3 indices"),
+            "got: {spot_off}"
+        );
+        assert!(
+            spot_off.contains("spot candles — switched off"),
+            "got: {spot_off}"
+        );
+
+        let both_off = build(false, false).to_message();
+        assert!(
+            both_off.contains("Per-minute price capture — switched off"),
+            "got: {both_off}"
+        );
+        assert!(!both_off.contains("armed"), "got: {both_off}");
+    }
+
     #[test]
     fn test_startup_complete_message_contains_build_sha() {
         // B9 deploy provenance: the boot Telegram must carry the short git
         // SHA of the running binary so the operator sees WHICH code booted.
-        let event = NotificationEvent::StartupComplete { mode: "LIVE" };
+        let event = NotificationEvent::StartupComplete {
+            mode: "LIVE",
+            spot_1m_enabled: true,
+            spot_1m_indices: 4,
+            chain_1m_enabled: true,
+            chain_1m_underlyings: 3,
+        };
         let msg = event.to_message();
         let expected = format!(
             "Build: {}",
@@ -4373,7 +4498,13 @@ mod tests {
 
     #[test]
     fn test_startup_complete_offline_message() {
-        let event = NotificationEvent::StartupComplete { mode: "OFFLINE" };
+        let event = NotificationEvent::StartupComplete {
+            mode: "OFFLINE",
+            spot_1m_enabled: true,
+            spot_1m_indices: 4,
+            chain_1m_enabled: true,
+            chain_1m_underlyings: 3,
+        };
         let msg = event.to_message();
         assert!(msg.contains("OFFLINE"));
         // Post-#O1/#O2/#O3/#O4: dashboard line names QuestDB + CloudWatch
@@ -4808,7 +4939,13 @@ mod tests {
 
     #[test]
     fn test_startup_complete_is_info() {
-        let event = NotificationEvent::StartupComplete { mode: "LIVE" };
+        let event = NotificationEvent::StartupComplete {
+            mode: "LIVE",
+            spot_1m_enabled: true,
+            spot_1m_indices: 4,
+            chain_1m_enabled: true,
+            chain_1m_underlyings: 3,
+        };
         assert_eq!(event.severity(), Severity::Info);
     }
 
@@ -5556,7 +5693,13 @@ mod tests {
     #[test]
     fn test_every_severity_variant_is_reachable() {
         // Verify each severity level is returned by at least one event variant
-        let info_event = NotificationEvent::StartupComplete { mode: "LIVE" };
+        let info_event = NotificationEvent::StartupComplete {
+            mode: "LIVE",
+            spot_1m_enabled: true,
+            spot_1m_indices: 4,
+            chain_1m_enabled: true,
+            chain_1m_underlyings: 3,
+        };
         assert_eq!(info_event.severity(), Severity::Info);
 
         let low_event = NotificationEvent::TokenRenewed;
@@ -6604,7 +6747,13 @@ mod tests {
         // Non-feed events are byte-identical to before — no badge, no "—"
         // prefix injected.
         let events = [
-            NotificationEvent::StartupComplete { mode: "sandbox" },
+            NotificationEvent::StartupComplete {
+                mode: "sandbox",
+                spot_1m_enabled: true,
+                spot_1m_indices: 4,
+                chain_1m_enabled: true,
+                chain_1m_underlyings: 3,
+            },
             NotificationEvent::QuestDbReconnected {
                 writer: "ticks".to_string(),
                 failed_checks_before_recovery: 3,
