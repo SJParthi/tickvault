@@ -51,6 +51,8 @@ drift/missing-tick problem against an independent second source.
 
 ## §2. The pluggable-feed contract (LOCKED)
 
+> **⚠ 2026-07-13 (extended in Phase B):** the "#1 Dhan … Default **ON** (unchanged)" row and the run-mode table's "Today / prod default: dhan=true" are SUPERSEDED — the Dhan live WS is RETIRED (operator directive 2026-07-13, verbatim + full contract in `websocket-connection-scope-lock.md`'s "2026-07-13 Amendment" §-section). **Groww is now the SOLE live market-data feed**; prod = `dhan_enabled = false` + `groww_enabled = true`; Dhan is REST-only (spot-1m / chain / historical) plus the functional-dormant order-update WS inside `dhan_rest_stack`. The per-feed enable/disable CONTRACT itself is UNCHANGED and load-bearing — it is the pluggable seam feed #3 (GDF, `gdf-third-feed-scope-2026-07-13.md`) plugs into; the "Both (the target)" run mode row now reads Groww + GDF prospectively, not Groww + Dhan. §5's and §34.3's honest-envelope references to measuring/comparing against the Dhan live feed (e.g. "quantify the Dhan-live-feed drift... against an independent second source", "measuring that drift against Dhan is the whole point") are OVERTAKEN BY EVENTS — the measurement CONCLUDED (it is what retired the Dhan feed; evidence table in the scope-lock amendment §E); until GDF is live, Groww runs single-source and the §37/§38 REST comparisons are the parity signals.
+
 | Feed | Provider | Default | Connection | Reuses tickvault resilience chain | Writes to |
 |---|---|---|---|---|---|
 | **#1 Dhan** | Dhan | **ON** (unchanged) | ≤2 WS (main-feed + order-update) | yes (existing) | `ticks`, `candles_*`, audit tables (UNCHANGED) |
@@ -106,6 +108,8 @@ must update this rule file FIRST with a dated quote, only then can the PR land.
 > ZERO audit rows. See `groww-shared-master-error-codes.md` §0 (2026-06-29 close-out).
 
 ## §5. Honest envelope (mandatory per `operator-charter-forever.md` §F)
+
+> **⚠ 2026-07-13:** the "by extension, quantify the Dhan-live-feed drift" clause below is CONCLUDED, not ongoing — the comparison retired the Dhan live WS (see the §2 banner + `websocket-connection-scope-lock.md` "2026-07-13 Amendment" §E for the quantified record). The CAPTURE-vs-UPSTREAM split and every Groww-side guarantee below stand unchanged.
 
 When any PR / commit / Telegram for this work invokes "100% guarantee", qualify it exactly:
 

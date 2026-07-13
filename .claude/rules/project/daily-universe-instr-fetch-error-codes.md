@@ -7,6 +7,20 @@
 
 ---
 
+> **⚠ RETIREMENT AUTHORIZED 2026-07-13 (deletion lands with the Phase C PRs):** the
+> daily-universe fetch chain these four codes instrument is retired with the Dhan live WS
+> (operator Q1/Q3, 2026-07-13 — verbatim in `websocket-connection-scope-lock.md`
+> "2026-07-13 Amendment"; no Dhan instrument download/parsing at all, hardcoded SIDs feed
+> the retained REST pulls). `INSTR-FETCH-01` (`InstrFetch01CsvHardFailed`),
+> `INSTR-FETCH-02` (`InstrFetch02SchemaValidationFailed`), `INSTR-FETCH-03`
+> (`InstrFetch03DanglingReferences`) and `INSTR-FETCH-04`
+> (`InstrFetch04UniverseSizeOutOfBounds`) retire — their only emit sites
+> (`daily_universe_boot` / orchestrator / `main.rs` Step 6c) die with the chain; no
+> CloudWatch log-filter alarm exists for any of them (Verified — only a cosmetic
+> triage-text mention in `boot-heartbeat-alarm.tf`, edited in Phase C). The
+> `instrument_fetch_audit` TABLE is retained (forensic, SEBI). Content below retained for
+> historical audit.
+
 ## §0. Why these codes exist
 
 The daily-universe fetch chain (Sub-PRs #3 + #4 + #5 + #6 + #7) drives boot from raw bytes → validated CSV → unique underlyings → indices → 250-SID universe. Every error path in that chain MUST fail-closed with a typed `ErrorCode` so the orchestrator (Sub-PR #10) can route the failure to:

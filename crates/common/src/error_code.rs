@@ -2330,7 +2330,10 @@ mod tests {
         assert_eq!("FUTIDX-02".parse::<ErrorCode>(), Ok(f2));
         assert_eq!(f2.severity(), Severity::High);
         // Design contract (futidx-4-error-codes.md §2 + the R3-4 record in
-        // .claude/plans/active-plan-futidx-4.md — the in-repo authority;
+        // .claude/plans/archive/2026-07-08-futidx-4.md — the in-repo
+        // authority (archived from active-plan-futidx-4.md per
+        // plan-enforcement rule 7; path synced 2026-07-13, deferred from
+        // the Groww REST-1m PR-1);
         // round 4 replaced a dangling scratchpad "FINAL.md" citation that
         // never landed in the tree): a cross-feed comparability
         // verdict is NEVER auto-actioned despite being non-Critical — the

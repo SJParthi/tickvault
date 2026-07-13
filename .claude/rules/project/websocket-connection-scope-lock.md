@@ -1,5 +1,7 @@
 # WebSocket Connection Scope Lock — Operator Lock 2026-05-15
 
+> **⚠ DHAN LIVE WS RETIRED 2026-07-13 (operator directive — Phase A banner; FULL AMENDMENT: the "2026-07-13 Amendment" §-section below):** the Dhan main-feed live WebSocket is RETIRED. Operator verbatim: *"now remove this entire Dhan live websocket feed instruments subscription even entire live websocket feed itself... As of now only Groww and Dhan historical api pull as we discussed last night along with option chain."* Rationale verbatim: *"when we checked the live websocket feed candles and historical data api candles for Dhan has a massive major mismatches... that's why I want to remove this. For Groww let us have live websocket feed api as of now."* (Both operator 2026-07-13, relayed verbatim via the coordinator session.) Effect: `dhan_enabled = false` in base + production config; the PR-E runtime-toggle **ON-half is REVOKED** (a runtime Dhan enable is refused API-side with 409 — re-enable requires a config change + restart + a fresh dated quote); **Groww is the sole live feed**; Dhan is retained for REST pulls only (`spot_1m_rest` / `option_chain_1m` / historical per `no-rest-except-live-feed-2026-06-27.md` §8) **plus the order-update WS — KEPT functional-dormant, rewired into `dhan_rest_stack` (operator Q4-i "agreed dude" ruling, 2026-07-13 — supersedes this banner's original "pending a separate operator decision" wording; the rewire lands in Phase C — see the amendment §A below)**. Lock semantics of the Dhan REST-only stack: `dual-instance-lock-2026-07-04.md` §3.5.
+>
 > **⚠ ALLOWED-INSTRUMENTS SUPERSEDED 2026-05-27 by [`daily-universe-scope-expansion-2026-05-27.md`](./daily-universe-scope-expansion-2026-05-27.md):** main-feed subscription expanded from 4 IDX_I SIDs (`LOCKED_UNIVERSE`) to ~250 daily-fetched SIDs (all NSE indices + 1 BSE SENSEX + unique F&O underlyings); all in Quote mode (was Ticker for IDX_I). `SubscriptionScope::Indices4Only` retires; replaced by `SubscriptionScope::DailyUniverse`. The 2-WebSocket lock itself (1 main-feed + 1 order-update) is UNCHANGED. Contents below retained as 2026-05-15 historical audit.
 >
 > **⚠ SECOND-FEED EXTENSION 2026-06-19 by [`groww-second-feed-scope-2026-06-19.md`](./groww-second-feed-scope-2026-06-19.md):** the 2-**Dhan**-WebSocket lock below is UNCHANGED. The operator authorized adding **GROWW** as an independent, **default-OFF** second market-data feed (feed #2) under a per-feed enable/disable contract. Groww is **native tickvault Rust** (brutex is reference only — no code pulled) reusing the same WAL/ring/spill/DLQ/aggregator chain; it adds NO Dhan connection and touches NO Dhan code. See that file for the verbatim authorization + full contract.
@@ -143,6 +145,176 @@ To add a new WS type or instrument class in a future phase:
 
 ---
 
+## 2026-07-13 Amendment — Dhan live main-feed RETIRED; order-update WS functional-dormant; Groww sole live feed
+
+> **Authority for this section:** the four verbatim operator quotes of 2026-07-13
+> (relayed via the coordinator session), preserved exactly:
+>
+> **Q1:** "now remove this entire Dhan live websocket feed instruments subscription even
+> entire live websocket feed itself... As of now only Groww and Dhan historical api pull as
+> we discussed last night along with option chain."
+>
+> **Q2:** "when we checked the live websocket feed candles and historical data api candles
+> for Dhan has a massive major mismatches... that's why I want to remove this. For Groww
+> let us have live websocket feed api as of now. But for Dhan as we discussed last night
+> only those should be needed and included [the REST pulls: spot 1m per minute + option
+> chain + historical]."
+>
+> **Q3:** "Just Dhan live websocket feed instruments download — I mean the entire process
+> completely related to Dhan live websocket feed itself should be switched off entirely or
+> removed." (+ verbatim intent: "hereafter no Dhan instrument download/parsing — just
+> direct hardcoded security IDs passed to spot 1m and option chain.")
+>
+> **Q4:** "agreed dude" — agreement to (i) the order-update WS rewire into
+> `dhan_rest_stack` (functional-dormant), (ii) tick-gap detector + WS-GAP-06 deletion
+> (the Groww feed-stall watchdog owns stall detection), (iii) `SubscriptionScope` enum
+> deletion via THIS rule edit.
+
+### §A. The new LOCKED state (supersedes the 2026-05-15 "complete allowed set" table)
+
+| Connection | State (2026-07-13) | Detail |
+|---|---|---|
+| **Dhan main-feed live WS** (`wss://api-feed.dhan.co`) | **RETIRED — deletion authorized** | Phase A (PR #1496) flipped `dhan_enabled = false` (base + production), revoked the PR-E runtime ON-half (API-side 409), and brought up the REST-only stack (`crates/app/src/dhan_rest_stack.rs`). The Phase C code PRs DELETE the lane: WS pool, subscription planner, `SubscriptionScope` enum, daily-universe fetch chain, tick-gap detector. Re-introduction requires a fresh dated operator quote HERE first (§D). |
+| **Dhan order-update WS** (`wss://api-order-update.dhan.co`) | **KEPT — functional-dormant inside `dhan_rest_stack`** (Q4-i) | Rewired in Phase C: spawned from `dhan_rest_stack` (which owns the TokenManager — JWT + dhanClientId are its only needs; MsgCode-42 JSON auth per `live-order-update.md`; zero instrument/universe/registry dependency, map §6 Verified). "Functional-dormant" = connected + authenticated, receiving order events for any order placed via REST; it carries NO market data and is NOT a live price feed. Its WAL replay staging (`ws_type=order_update`) is process-global and unaffected. |
+| **Groww live feed** (native NATS-over-WS, 1 connection) | **THE SOLE LIVE MARKET-DATA FEED** | Per `groww-second-feed-scope-2026-06-19.md` (contract unchanged) + `groww-scale-aws-lockout-2026-07-06.md` (1 connection). Same WAL→ring→spill→DLQ→aggregator chain, rows tagged `feed='groww'`. |
+| **Dhan REST retained surface** | KEPT (not a WS) | Token/auth stack + per-minute `spot_1m_rest` + per-minute `option_chain_1m` (+ probe) + historical, per `no-rest-except-live-feed-2026-06-27.md` §8; SIDs are the HARDCODED `SPOT_1M_REST_INDICES` (NIFTY=13, BANKNIFTY=25, SENSEX=51 — `constants.rs`), per Q3 verbatim intent. Lock semantics: `dual-instance-lock-2026-07-04.md` §3.5. |
+| **GDF (feed #3)** | Separate lock — NOT governed here | `gdf-third-feed-scope-2026-07-13.md` (default OFF, trial-first). This amendment deliberately leaves the pluggable seam clean for it: `FeedsConfig`, feed-in-key shared tables, WAL/ring/spill/aggregator are all UNTOUCHED by the Dhan deletions. |
+
+**Total live market-data WebSocket connections: 1 (Groww).** Total Dhan WebSocket
+connections: **TODAY (post-Phase-A): 0 · AFTER the Phase C rewire: ≤1** (order-update,
+functional-dormant). The 2026-05-15 "two Dhan phone lines" lock text below is retained
+as historical audit; THIS table is the effective contract.
+
+> Footnote (tense honesty): the order-update WS is spawned today ONLY from the Dhan-gated
+> fast crash-recovery arm + `start_dhan_lane` — both OFF with `dhan_enabled = false` — so
+> the live Dhan WS count is 0 until the Phase C rewire spawns it from `dhan_rest_stack`
+> (functional-dormant, ≤1).
+
+### §B. What the Phase C deletion PRs MAY remove (authorized by Q1/Q3/Q4; consumer map Verified 2026-07-13)
+
+Per the Phase B dependency map (`(security_id, exchange_segment)` consumer analysis, every
+row Verified with file:line evidence):
+
+1. **The Dhan main-feed WS lane:** connection pool, per-slot supervised loops, subscription
+   builder/dispatcher, `SubscribeRxGuard`, the lane FSM (`LaneState` / `start_dhan_lane` /
+   `stop_dhan_lane` / `run_dhan_lane_runtime`), the pool watchdog, the lane-owned SLO
+   publisher wiring, WAL live-feed re-injection arms specific to the Dhan pool.
+2. **`SubscriptionScope` enum + planner (Q4-iii — THIS edit is the dated rule-file
+   authorization the enum's own guards demand):** `subscription_planner.rs`, the
+   `SubscriptionScope` enum in `config.rs`, `LOCKED_UNIVERSE`,
+   `effective_main_feed_pool_size`, and the ratchet
+   `crates/core/tests/indices4only_scope_lock_guard.rs` (which exists to pin that enum).
+3. **The Dhan instrument-download chain (Q3):** `csv_downloader`, `csv_parser`,
+   `fno_underlying_extractor`, `daily_universe(.rs/_orchestrator/_boot)`,
+   `instr_fetch_{loop,runner,retry_*}`, `today_instrument`,
+   `lifecycle_reconcile_*` (app modules), `constituent_resolver`, the core
+   `index_constituency/` module + the lane mapping half of `index_constituency_boot`
+   (the process-global ts-pin MIGRATION half is KEPT), `instr_fetch_audit_writer`,
+   `prev_day_ohlcv_boot`, `cross_verify_1m_boot` (after relocating
+   `parse_intraday_1m_candles` + `MinuteCandle`, consumed by `spot_1m_rest_boot`),
+   `InstrumentRegistry`, plan-snapshot files.
+4. **Tick-gap detector + WS-GAP-06 (Q4-ii):** the detector, its seeding, the far-month
+   alarm-gate exclusion sites, `tv_tick_gap_*` metrics — AND the CloudWatch alarm on
+   `tv_tick_gap_instruments_silent`
+   (`aws_cloudwatch_metric_alarm.tick_gap_instruments_silent` =
+   `tv-<env>-tick-gap-instruments-silent`, `deploy/aws/terraform/app-alarms.tf`,
+   including its market-hours window-gate membership + the file's alarm-count/cost
+   note), which retires WITH the detector — otherwise Phase C orphans a dead monitor
+   (the gauge is never written again once the detector dies). Groww stall detection is
+   the FEED-level stall watchdog (`feed-stall-watchdog-error-codes.md`) — see the honest
+   envelope in §C.
+5. **Error codes** whose only emit sites die with the chain: INSTR-FETCH-01..04,
+   NTM-CONSTITUENCY-01, PREVDAY-01, CROSS-VERIFY-1M-01/02, DHAN-LANE-01..04, WS-GAP-06
+   (retirement banners in their rule files; enum variants deleted in the Phase C PRs so
+   the cross-ref tests stay green in both directions).
+
+**What Phase C MUST KEEP/REWIRE (the Groww/shared seam — scope-lock obligations):**
+`index_extractor` (`NSE_INDEX_ALLOWLIST` + `canonicalize_index_symbol`),
+`index_futures.rs` (the §36 selector — DE-GATED from the `daily_universe_fetcher` cargo
+feature, else the Groww §36.7 futures silently drop = a scope violation),
+`instrument_snapshot::is_valid_trading_date`, `presence_registration::ist_day_from_date`,
+`storage::lifecycle_reconciler::classify_transition`, the `instrument_lifecycle` /
+`index_constituency` / `instrument_fetch_audit` TABLES (SEBI never-delete), the ts-pin
+migration, the Groww `shared_master_writer`, the scoreboard, `feed_presence`, and the
+constants `INDEX_CONSTITUENCY_BASE_URL` / `GROWW_INSTRUMENT_CSV_URL` /
+`SPOT_1M_REST_INDICES` / `DHAN_OPTION_CHAIN_*`.
+
+### §C. Honest envelope (mandatory per operator-charter §F)
+
+> "100% inside the tested envelope, with ratcheted regression coverage: Groww capture
+> keeps the full bounded zero-tick-loss chain (WAL-before-broadcast → ring → NDJSON spill
+> → DLQ, `TICK_BUFFER_CAPACITY` ratcheted); the Dhan REST stack keeps lock-before-mint +
+> RESILIENCE-03 (`dual-instance-lock-2026-07-04.md` §3.5); the retirement is
+> config-reversible until Phase C deletes the code, and irreversible-without-a-fresh-quote
+> after. NOT claimed: (a) any Dhan live tick capture — by design, per Q1/Q2 there is NONE;
+> Dhan market data is the per-minute official REST candles only, so intraminute Dhan price
+> movement is invisible between fetches; (b) per-SID silence detection — WS-GAP-06 and the
+> tick-gap detector die with the Dhan WS (Q4-ii); Groww's stall watchdog is FEED-level
+> (whole-universe last-tick), so a single silent Groww instrument is visible only via the
+> scoreboard presence/coverage columns and the 15:45 scorecard, not a 30s per-SID page;
+> (c) a second live feed as cross-check — until GDF (feed #3) goes live, Groww is a
+> single-source live feed and the §37/§38 REST comparisons are the only independent OHLCV
+> parity signals."
+
+### §D. What a PR that violates this amendment looks like (REJECT)
+
+- Re-introduces ANY Dhan market-data WebSocket (main-feed, depth, or a new endpoint)
+  without a fresh dated operator quote added to THIS section first.
+- Re-adds a `SubscriptionScope` enum, `LOCKED_UNIVERSE`, a subscription planner, or any
+  Dhan instrument CSV download/parse path (Q3: hardcoded SIDs only).
+- Restores the PR-E runtime Dhan-enable ON-half (the 409 refusal is the contract; a Dhan
+  re-enable is config + restart + a fresh dated quote).
+- Deletes or breaks the KEEP/REWIRE seam items in §B (the Groww §36 futures selector, the
+  canonicalizer, the SEBI tables, the ts-pin migration, `parse_intraday_1m_candles`).
+- Removes the order-update WS instead of rewiring it into `dhan_rest_stack` (Q4-i keeps
+  it functional-dormant), or spawns it anywhere OTHER than `dhan_rest_stack`.
+- Deletes `FeedsConfig` / feed-in-key columns / the WAL-ring-aggregator seam "because only
+  one feed remains" — the pluggable contract must stay clean for GDF
+  (`gdf-third-feed-scope-2026-07-13.md`).
+- Weakens the Groww feed's resilience chain in the name of the Dhan deletion.
+
+Any such PR MUST be rejected in review even if the operator approves verbally — the
+operator must update this section FIRST with a dated quote.
+
+### §E. The "why" record — quantified evidence behind Q2 (for the permanent record)
+
+The operator's "massive major mismatches" rationale is backed by committed, quantified
+evidence (all Verified, sources cited):
+
+| # | Evidence | Value | Source |
+|---|---|---|---|
+| 1 | Dhan main-feed delivery lag (exchange LTT → our receive), 2026-07-06, all trading day, 776-SID Quote subscription, 10-min windows | p50 1.38 s / p90 8.50 s / p95 14.93 s / **p99 46.37 s / max 198.69 s** | `docs/dhan-support/2026-07-08-orderupdate-rst-and-feed-lag.md` (Incident 3 table + timeline row) |
+| 2 | Independent comparison feed (Groww), SAME host, SAME minutes | **p99 = 562 ms** — ~82× better at p99; rules out our host/NIC/network/pipeline. Dhan's whole-second LTT quantization explains ≤ ~1 s, not 46 s | same doc, Incident 3 + "Key observation" §3 |
+| 3 | Per-minute silent instruments on the Dhan feed, 2026-07-06 | **29–67 instruments/minute** with tick gaps of 300–978 s; **590 gap events** logged | same doc, timeline row "per-minute tick gaps" |
+| 4 | The 15:31 IST Dhan cross-verify was **BLIND SINCE BIRTH** | The `candles_1m`-side SELECT used NANOSECOND literals against QuestDB's MICROSECOND timestamp comparison — the WHERE window sat ~year 58502 and matched ZERO rows on every run since the feature shipped; `compared=0` reported honestly as BLIND, so no mismatch page ever fired. Fixed by PR #1474 (commit `f84b4398`, merged 2026-07-11) — the first sessions with a WORKING comparison are what surfaced the live-vs-historical candle mismatches behind Q2 | PR #1474 commit body (`git show f84b4398`); `crates/app/src/cross_verify_1m_boot.rs` digit-magnitude ratchets |
+| 5 | Cross-verify design expectation vs observation | `cross-verify-1m-error-codes.md` §1 documents that NON-ZERO High/Low sampling noise is expected (Dhan WS is a ~2–4 ticks/sec SAMPLED stream vs their full-tape candle API) — "track the trend, not the absolute count". The post-#1474 observed divergence + the Incident-3 lag class exceeded that expected-noise envelope in the operator's judgment (Q2: "massive major mismatches") | `.claude/rules/project/cross-verify-1m-error-codes.md` §1; operator Q2 |
+| 6 | Server-side transport instability (supporting) | 2026-07-06: token invalidated server-side with ZERO mints from our box (DH-906 for 4+ hours); 39+ order-update RST-after-accepted-login cycles. 2026-07-08 13:55–14:06 IST: 7 bare-RST main-feed disconnect cycles + a ~2-min full outage — continuing the 2026-07-02 RST pattern | same support doc, Incidents 1/2/4; `docs/dhan-support/2026-07-02-mainfeed-tcp-resets.md` (the file on disk; the 2026-07-08 doc's own cross-link cites the same name) |
+
+Honest note on row 5: the WS-sampled-vs-full-tape asymmetry means SOME candle divergence
+was always expected by design; the retirement decision is the operator's judgment call on
+its magnitude (Q2 verbatim) reinforced by rows 1–3 (delivery lag + silence), which are
+NOT explainable by sampling. Neither side of any candle comparison is claimed as ground
+truth (the §37 doctrine). Provenance honesty: the 2026-07-11 first-honest-run mismatch
+COUNTS are NOT repo-quantified — they exist only in the AWS box's `cross_verify_1m_audit`
+table, the day's `data/cross-verify/` CSV, and the Telegram summary; the "massive major
+mismatches" magnitude is the operator's own observation of those outputs (Q2), not a
+number reproducible from this repository.
+
+### §F. Auto-driver / Insta-reel explanation
+
+> Sir, the juice shop had two price boards. Supplier Dhan's live board kept freezing —
+> some days a price took 46 seconds, once over 3 minutes, to appear, while supplier
+> Groww's board on the SAME wall showed the same price in half a second. Worse, when we
+> finally fixed our checking machine (it had been comparing against the wrong year for
+> weeks!), Dhan's live board didn't even match Dhan's OWN official record book. So the
+> owner said: take Dhan's live board DOWN. Keep Groww's live board as the only live one.
+> From Dhan we now take just the official printed price card once a minute (the REST
+> pulls) — and we keep one Dhan phone line plugged in but silent (the order-confirmation
+> line), ready for the day we place orders again. A third supplier (GDF) is being
+> auditioned separately — the wall hooks stay ready for their board.
+
+---
+
 ## Trigger (auto-loaded paths)
 
 Always loaded. Activates on any session that:
@@ -153,3 +325,4 @@ Always loaded. Activates on any session that:
 - Edits `config/base.toml` `[subscription]` or `[websocket]` sections
 - Adds any new `wss://` URL constant
 - Calls any `spawn_*_connection` or `spawn_*_pipeline` function
+- Edits `crates/app/src/dhan_rest_stack.rs` or any file containing `SPOT_1M_REST_INDICES` (the post-retirement Dhan surface)

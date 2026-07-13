@@ -427,6 +427,15 @@ async fn main() -> Result<()> {
     // AND the Dhan-off per-feed boot dispatcher gate (the `config.feeds`
     // dhan-enabled skip-guard further down) read the EFFECTIVE state with no
     // further edits.
+    // Round-2 FIX A (2026-07-13): capture the RAW TOML Dhan value BEFORE the
+    // feed-state overlay is applied. The Phase A "lane retired" truth — the
+    // /api/feeds 409 gate, the runtime cold-start refusal, and the REST-only
+    // stack spawn below — is a statement about the CONFIG, never about the
+    // last webpage toggle. Seeding it from the POST-overlay effective value
+    // would let a persisted runtime-OFF overlay permanently 409-lock a
+    // config-ON boot with a misleading "config change + restart" message
+    // (breaking the PR-E disable→restart→re-enable round trip).
+    let dhan_config_enabled_raw = config.feeds.dhan_enabled;
     {
         let overlay_path = tickvault_api::feed_state_persist::feed_state_path();
         let persisted = tickvault_api::feed_state_persist::load_feed_state(&overlay_path);
@@ -443,6 +452,24 @@ async fn main() -> Result<()> {
                  — falling back to the config default per-feed enabled state"
             );
         }
+        // 2026-07-13 operator directive ("now remove this entire Dhan live
+        // websocket feed instruments subscription even entire live websocket
+        // feed itself"): the Dhan overlay is narrow-only — config-off is
+        // AUTHORITATIVE for the retired Dhan live WS lane, so a STALE
+        // pre-directive webpage toggle (`dhan_enabled: true` in
+        // data/feed-state.json) can never resurrect it. One boot-time warn
+        // makes the suppression visible (never silent).
+        if tickvault_api::feed_state_persist::dhan_overlay_suppressed(
+            &config.feeds,
+            persisted.as_ref(),
+        ) {
+            warn!(
+                "feed-state overlay requested dhan_enabled=true but the config says false — \
+                 overlay SUPPRESSED: the Dhan live WS lane is retired by operator directive \
+                 2026-07-13 (Dhan is REST-only; Groww is the live feed). Re-enabling requires \
+                 a config change + restart."
+            );
+        }
         config.feeds = tickvault_api::feed_state_persist::overlay_feeds(config.feeds, persisted);
     }
     let feeds = &config.feeds;
@@ -450,8 +477,14 @@ async fn main() -> Result<()> {
     // `Arc<FeedRuntimeState>` seeded from config, handed to BOTH the API state
     // (so `POST /api/feeds/{feed}` flips it) AND the Groww bridge (which reads it
     // live each loop) — so a runtime toggle is observed without a restart.
+    // The runtime atomics seed from the EFFECTIVE (post-overlay) feeds; the
+    // Phase A retirement snapshot seeds from the RAW TOML value captured
+    // above (round-2 FIX A, 2026-07-13).
     let feed_runtime = std::sync::Arc::new(
-        tickvault_api::feed_state::FeedRuntimeState::from_config(feeds),
+        tickvault_api::feed_state::FeedRuntimeState::from_config_with_dhan_config(
+            feeds,
+            dhan_config_enabled_raw,
+        ),
     );
     // Live-feed health check (operator 2026-06-22): the ONE shared per-feed
     // signal registry. The feed lanes update it (ticks/candles/drops/connected);
@@ -2939,6 +2972,14 @@ async fn main() -> Result<()> {
             &feed_runtime,
         );
 
+        // Groww per-minute spot 1m REST leg on the FAST crash-recovery arm
+        // too (hostile round 1 item 1 — the scoreboard dual-site pattern):
+        // this arm `return run_shutdown_fast`s and never reaches the
+        // slow-path spawn below, yet a mid-market crash restart routes
+        // through EXACTLY this arm — without this call the flagship
+        // crash-restart day ran NO per-minute fetches and NO 15:31 sweep.
+        spawn_groww_spot_1m_leg(&config, &notifier, &trading_calendar);
+
         // Daily 15:40 IST timeframe-consistency verifier on the FAST
         // crash-recovery arm too (operator 2026-07-13; the scoreboard
         // dual-spawn precedent directly above): this arm `return
@@ -3129,6 +3170,16 @@ async fn main() -> Result<()> {
         &feed_runtime,
     );
 
+    // Groww per-minute spot 1m REST leg (operator grant 2026-07-13 — PR-2 of
+    // the Groww per-minute REST plan) — the slow-path call site; the FAST
+    // crash-recovery arm carries its own (hostile round 1 item 1 — the
+    // scoreboard dual-site pattern). Every trading-day minute close in
+    // [09:16:00, 15:30:00] IST it fetches the just-closed minute's official
+    // Groww 1m OHLCV for the 3 spot indices and persists to `spot_1m_rest`
+    // tagged feed='groww' (+ `rest_fetch_audit` forensics rows). See
+    // `spawn_groww_spot_1m_leg`.
+    spawn_groww_spot_1m_leg(&config, &notifier, &trading_calendar);
+
     // Daily 15:40 IST timeframe-consistency verifier — PROCESS-GLOBAL like
     // the conservation audit + scoreboard above (operator 2026-07-13):
     // recompute every higher-TF candle (2m..4h) from the stored 1m rows and
@@ -3303,6 +3354,59 @@ async fn main() -> Result<()> {
             "DHAN LANE SKIPPED (dhan_enabled=false) — shared-infra-only runtime; \
              the unified run-loop keeps the API + seal-writer + aggregator alive"
         );
+        // ===================================================================
+        // Phase A (operator directive 2026-07-13 — "now remove this entire
+        // Dhan live websocket feed instruments subscription even entire live
+        // websocket feed itself"): the Dhan live WS lane is retired, but the
+        // Dhan REST retained surface (token/auth stack, REST canary,
+        // per-minute spot_1m_rest, per-minute option_chain_1m + entitlement
+        // probe) must KEEP RUNNING. Before Phase A those subsystems lived
+        // exclusively inside the lane / fast-boot arm and died with it. The
+        // REST-only stack brings them up WITHOUT any WebSocket.
+        //
+        // Placement notes (mutual exclusion + reachability):
+        //   - Spawned ONLY here, in the Dhan-OFF branch, and ONLY when the
+        //     RAW boot TOML retires the lane (`is_dhan_config_enabled() ==
+        //     false` — round-2 FIX A, 2026-07-13). The lane (whose
+        //     `spawn_post_market_tasks` seam owns these subsystems on a
+        //     Dhan-ON boot) can never run alongside it: the runtime
+        //     cold-start supervisor REFUSES a lane start on the SAME raw
+        //     gate (see run_dhan_lane_runtime_supervisor).
+        //   - The FAST crash-recovery arm is filtered on
+        //     `config.feeds.dhan_enabled` (its `fast_cache.filter`), so with
+        //     Dhan off it never fires its early return — every Dhan-off boot
+        //     reaches THIS slow-path site. The metrics recorder + notifier +
+        //     shared infra are all installed well above (`build_shared_infra`).
+        //   - Bring-up is a background task with internal retry-forever
+        //     loops: it never blocks boot and never halts the process.
+        // ===================================================================
+        if feed_runtime.is_dhan_config_enabled() {
+            // Round-2 FIX A (2026-07-13): a config-ON boot whose feed-state
+            // overlay (last webpage toggle) left Dhan runtime-OFF — the lane
+            // is DORMANT, not retired. The REST-only stack must NOT spawn
+            // here: it would hold the dual-instance SSM lock + mint the
+            // TokenManager, and the (allowed) runtime re-enable's cold-start
+            // would then collide with our OWN process (AlreadyHeld →
+            // DHAN-LANE-03 retry loop + RESILIENCE-01 pages). The retained
+            // Dhan REST surface comes up WITH the lane on re-enable
+            // (`spawn_post_market_tasks`) — pre-Phase-A behavior; until
+            // then the Dhan REST surface is honestly absent (as it was
+            // pre-Phase-A on every runtime-OFF boot).
+            info!(
+                "Dhan REST-only stack NOT spawned: the boot TOML carries dhan_enabled=true \
+                 (lane dormant via the runtime overlay, not retired) — a runtime re-enable \
+                 cold-starts the full lane, which owns the Dhan REST surface"
+            );
+        } else {
+            let _dhan_rest_stack_monitor = tickvault_app::dhan_rest_stack::spawn_dhan_rest_stack(
+                tickvault_app::dhan_rest_stack::DhanRestStackParams {
+                    config: std::sync::Arc::new(config.clone()),
+                    notifier: std::sync::Arc::clone(&notifier),
+                    calendar: std::sync::Arc::clone(&trading_calendar),
+                    feed_runtime: std::sync::Arc::clone(&feed_runtime),
+                },
+            );
+        }
         None
     };
 
@@ -9217,7 +9321,8 @@ async fn start_dhan_lane(
     //   * the one-shot prev-day OHLCV fetch — self-exits after its bounded
     //     fail-soft fetch pass;
     //   * process-LATCHED families (spawned at most once per process):
-    //     post-market tasks (POST_MARKET_TASKS_SPAWNED), the market-open
+    //     post-market tasks (the shared lib guard
+    //     claim_post_market_task_family_once), the market-open
     //     one-shots (MARKET_OPEN_ONE_SHOTS_SPAWNED + fire-time dhan gate),
     //     the SLO supervisor (SLO_PUBLISHER_SUPERVISOR_SPAWNED), and the
     //     FirstSeenSet midnight reset (FIRST_SEEN_RESET_SPAWNED).
@@ -10799,6 +10904,10 @@ pub async fn run_dhan_lane_runtime_supervisor(
 ) {
     use tickvault_api::feed_state::{Feed, LaneState};
     let mut active_task: Option<tokio::task::JoinHandle<()>> = None;
+    // 2026-07-13 refusal latch — edge-triggered once per attempt-episode
+    // (audit Rule 4): set on the first refused cold-start of an ON period,
+    // re-armed when the operator toggles Dhan OFF again. Never per-2s spam.
+    let mut cold_start_refusal_logged = false;
     loop {
         // Idle (zero Dhan work) until the runtime context exists. The context is
         // populated by `main()` right after `build_shared_infra`, which runs in
@@ -10961,12 +11070,50 @@ pub async fn run_dhan_lane_runtime_supervisor(
             feed_runtime.dhan_lane_state(),
             active_task.is_some(),
         ) {
-            info!(
-                "[dhan-lane] runtime supervisor spawning cold-start (boot-OFF Dhan enabled at \
-                 runtime, lane is Off)"
-            );
-            let task = tokio::spawn(run_dhan_lane_cold_start(std::sync::Arc::clone(ctx)));
-            active_task = Some(task);
+            // 2026-07-13 operator directive ("now remove this entire Dhan
+            // live websocket feed instruments subscription even entire live
+            // websocket feed itself"): with `dhan_enabled = false` in the
+            // RAW boot TOML, the Dhan REST-only stack (`dhan_rest_stack.rs`)
+            // already owns the dual-instance SSM lock + the TokenManager. A
+            // runtime cold-start of the FULL lane (POST /api/feeds/dhan →
+            // desired-ON here) would collide with it — Step 6a-prime sees
+            // AlreadyHeld → DHAN-LANE-03 retry loop + RESILIENCE-01 pages
+            // against our OWN process. The supervisor therefore REFUSES the
+            // cold-start while the RAW config says Dhan is off; re-enabling
+            // the live WS lane requires a config change + restart (and a
+            // fresh dated operator quote per production_config_wiring.rs).
+            //
+            // Round-2 FIX A (2026-07-13): the gate reads the RAW TOML
+            // snapshot (`is_dhan_config_enabled`, seeded pre-overlay), NOT
+            // the overlaid `ctx.config.feeds` — a persisted runtime-OFF
+            // overlay on a config-ON boot leaves the lane dormant-but-NOT-
+            // retired (the REST-only stack did NOT spawn on that boot, same
+            // raw gate — no lock to collide with), so the cold-start stays
+            // allowed there (pre-Phase-A round trip). This keeps the gate in
+            // lockstep with the /api/feeds 409 arm: the API never accepts an
+            // enable this supervisor would refuse.
+            if !feed_runtime.is_dhan_config_enabled() {
+                if !cold_start_refusal_logged {
+                    warn!(
+                        "Dhan live WS lane retired by operator directive 2026-07-13 — runtime \
+                         enable refused; config change + restart required (the Dhan REST-only \
+                         stack keeps running; toggling the feed OFF re-arms this notice)"
+                    );
+                    cold_start_refusal_logged = true;
+                }
+            } else {
+                info!(
+                    "[dhan-lane] runtime supervisor spawning cold-start (boot-OFF Dhan enabled \
+                     at runtime, lane is Off)"
+                );
+                let task = tokio::spawn(run_dhan_lane_cold_start(std::sync::Arc::clone(ctx)));
+                active_task = Some(task);
+            }
+        }
+        if !desired_on {
+            // Operator toggled Dhan back OFF — re-arm the refusal notice for
+            // the next ON attempt-episode (edge-triggered, audit Rule 4).
+            cold_start_refusal_logged = false;
         }
 
         tokio::time::sleep(DHAN_LANE_RUNTIME_POLL).await;
@@ -14316,16 +14463,22 @@ fn redact_ip_last_octet(raw: &str) -> String {
     "[REDACTED]".to_string()
 }
 
-/// Process-global once-guard for `spawn_post_market_tasks` (2026-07-02
-/// adversarial-sweep fix). The runtime Dhan cold-start path
-/// (`run_dhan_lane_cold_start` → `start_dhan_lane`) re-invokes
-/// `spawn_post_market_tasks` on EVERY disable→enable cycle, and the spawned
-/// tasks are bare `tokio::spawn`s not owned by `DhanLaneRunHandles` — so N
-/// enable cycles before the triggers accumulated N duplicate task families
-/// (N EOD digests, N cross-verifies, N orphan watchdogs). First caller wins;
-/// later calls log INFO and return.
-static POST_MARKET_TASKS_SPAWNED: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+// Process-global once-guard for `spawn_post_market_tasks` (2026-07-02
+// adversarial-sweep fix): the runtime Dhan cold-start path
+// (`run_dhan_lane_cold_start` → `start_dhan_lane`) re-invokes
+// `spawn_post_market_tasks` on EVERY disable→enable cycle, and the spawned
+// tasks are bare `tokio::spawn`s not owned by `DhanLaneRunHandles` — so N
+// enable cycles before the guard accumulated N duplicate task families
+// (N EOD digests, N cross-verifies, N orphan watchdogs). First caller wins;
+// later calls log INFO and return.
+//
+// 2026-07-13 (Phase A FIX 4): the guard static moved into the lib —
+// `tickvault_app::dhan_rest_stack::claim_post_market_task_family_once()` —
+// because the Dhan REST-only stack's Phase 5 spawns the SAME canary/spot/
+// chain family and must claim the SAME guard. INVARIANT: the Dhan-REST
+// scheduled task family is spawned at most once per process, whichever
+// path (lane or REST-only stack) claims first — a future relaxation of the
+// runtime cold-start refusal can never double-spawn canary/spot/chain.
 
 /// Spawn the scheduled daily tasks — the 15:25 IST orphan-position watchdog,
 /// end-of-day digest (15:31:30 IST), the 1-minute cross-verify (15:31:00 IST),
@@ -14352,10 +14505,11 @@ fn spawn_post_market_tasks(
     feed_runtime: std::sync::Arc<tickvault_api::feed_state::FeedRuntimeState>,
     feed_health: std::sync::Arc<tickvault_common::feed_health::FeedHealthRegistry>,
 ) {
-    if POST_MARKET_TASKS_SPAWNED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+    if !tickvault_app::dhan_rest_stack::claim_post_market_task_family_once() {
         info!(
             "post-market tasks already spawned this process — skipping duplicate \
-             (runtime Dhan cold-start re-entry)"
+             (runtime Dhan cold-start re-entry, or the Dhan REST-only stack \
+             already owns the canary/spot/chain family)"
         );
         return;
     }
@@ -14903,6 +15057,43 @@ fn spawn_daily_tick_conservation_task(
 ///    and `DualFeedScorecardAborted` on Err/panic — the daily signal can
 ///    never be silently dropped. Graceful-shutdown cancellation stays
 ///    silent (normal teardown, not an abort).
+/// Groww per-minute spot 1m REST leg (operator grant 2026-07-13 — PR-2 of
+/// the Groww per-minute REST plan), called from BOTH boot arms (the FAST
+/// crash-recovery arm AND the slow process-global prefix — the
+/// `spawn_feed_scoreboard_tasks` dual-site pattern; hostile round 1 item 1:
+/// a mid-market crash restart takes the fast arm's `return
+/// run_shutdown_fast` and would otherwise never run this leg or its 15:31
+/// sweep). PROCESS-GLOBAL and deliberately NOT the Dhan-gated
+/// `spawn_post_market_tasks` seam: this leg's token is the shared-minter
+/// SSM read (never the Dhan JWT), so a Dhan-off (Groww-only) session still
+/// runs it. Config-gated fail-safe: an absent `[groww_spot_1m]` section
+/// disables it. Supervised respawn wrapper; self-skips on non-trading days
+/// / past 15:30 IST (post the one bounded ~15:31 repair sweep).
+// TEST-EXEMPT: tokio::spawn wrapper over the unit-tested boot module; BOTH call sites + the config gate pinned by crates/app/tests/groww_spot_1m_wiring_guard.rs.
+fn spawn_groww_spot_1m_leg(
+    config: &ApplicationConfig,
+    notifier: &std::sync::Arc<NotificationService>,
+    trading_calendar: &std::sync::Arc<TradingCalendar>,
+) {
+    if config.groww_spot_1m.enabled {
+        let _groww_spot1m_supervisor =
+            tickvault_app::groww_spot_1m_boot::spawn_supervised_groww_spot_1m(
+                tickvault_app::groww_spot_1m_boot::GrowwSpot1mTaskParams {
+                    notifier: notifier.clone(),
+                    calendar: std::sync::Arc::clone(trading_calendar),
+                    questdb: config.questdb.clone(),
+                },
+            );
+        info!(
+            "groww_spot_1m: Groww per-minute spot 1m REST leg spawned \
+             (fires each minute close 09:16:00-15:30:00 IST; sequential \
+             symbol pacing)"
+        );
+    } else {
+        info!("groww_spot_1m: disabled by config — Groww per-minute spot fetch not spawned");
+    }
+}
+
 // TEST-EXEMPT: tokio::spawn wrapper over the unit-tested pure parts (decide_scoreboard_start / synthesize_process_death_episodes / SQL builders / parsers); spawn site pinned by test_feed_scoreboard_task_is_wired_into_main.
 fn spawn_feed_scoreboard_tasks(
     config: &ApplicationConfig,

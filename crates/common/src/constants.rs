@@ -1725,6 +1725,123 @@ const _: () = assert!(
     "CHAIN_1M per-request timeout must fit inside the per-underlying budget"
 );
 
+// ---------------------------------------------------------------------------
+// Groww spot 1m REST leg (operator grant 2026-07-13 — PR-2 of the Groww
+// per-minute REST plan, `.claude/plans/active-plan-groww-rest-1m.md`;
+// authorization recorded in `groww-second-feed-scope-2026-06-19.md` §38 +
+// `no-rest-except-live-feed-2026-06-27.md` §9). Mirrors the Dhan spot leg
+// (`SPOT_1M_REST_*` above) onto Groww's `GET /v1/historical/candles`
+// endpoint. The fire boundaries, staleness grace and page threshold REUSE
+// the SPOT_1M_REST_* session constants (they are NSE-session facts, not
+// Dhan facts).
+// ---------------------------------------------------------------------------
+
+/// Groww historical/intraday candles endpoint (V2 — ground truth
+/// `docs/groww-ref/11-historical-candles.md`; SDK-verified `client.py:903`
+/// in the official `growwapi` 1.5.0 wheel). GET with query params
+/// `exchange` / `segment` / `groww_symbol` / `start_time` / `end_time` /
+/// `candle_interval`. Serves same-day 1-minute candles (the docs pose no
+/// previous-day-only restriction; just-closed-minute freshness is
+/// UNDOCUMENTED/UNVERIFIED-LIVE per `docs/groww-ref/99-UNKNOWNS.md` — the
+/// ladder + histogram are the probe).
+pub const GROWW_HISTORICAL_CANDLES_URL: &str = "https://api.groww.in/v1/historical/candles"; // APPROVED: constants.rs is the single REST-URL source
+
+/// Groww `candle_interval` literal for 1-minute candles (`"1minute"`, NOT
+/// the Dhan-style `"1"` — interval literals + the 30-days-per-request 1m
+/// range cap per `docs/groww-ref/11-historical-candles.md`; our
+/// day-granular windows are far inside the cap).
+pub const GROWW_CANDLE_INTERVAL_1MIN: &str = "1minute";
+
+/// Groww API version header name + value — sent on every trade-API call by
+/// the official SDK (`_build_headers`, `client.py:1362-1378`; header set
+/// reconciled in `docs/groww-ref/README.md`) alongside
+/// `Authorization: Bearer <token>`.
+pub const GROWW_API_VERSION_HEADER: &str = "x-api-version";
+/// Header value companion to [`GROWW_API_VERSION_HEADER`].
+pub const GROWW_API_VERSION_VALUE: &str = "1.0";
+
+/// The 3 spot indices the Groww per-minute REST leg fetches, as
+/// `(groww_symbol, human symbol, exchange, segment)` — the SAME logical
+/// indices as [`SPOT_1M_REST_INDICES`] in Groww's identity space: the V2
+/// candles endpoint takes the `groww_symbol` (`NSE-NIFTY` — NOT the
+/// exchange token, NOT the bare trading symbol), with `segment=CASH` for
+/// indices (`docs/groww-ref/09-prompt-nse-indices-data.md` +
+/// `docs/groww-ref/11-historical-candles.md`). Persisted rows join the
+/// live lane via `stable_index_security_id(groww_symbol)` + `feed='groww'`.
+pub const GROWW_SPOT_1M_SYMBOLS: [(&str, &str, &str, &str); 3] = [
+    ("NSE-NIFTY", "NIFTY", "NSE", "CASH"),
+    ("NSE-BANKNIFTY", "BANKNIFTY", "NSE", "CASH"),
+    ("BSE-SENSEX", "SENSEX", "BSE", "CASH"),
+];
+
+// Arity guard: the Groww leg tracks the SAME 3 logical indices as the Dhan
+// leg — a 4th index on either side needs a fresh dated operator quote.
+const _: () = assert!(
+    GROWW_SPOT_1M_SYMBOLS.len() == SPOT_1M_REST_INDICES.len(),
+    "GROWW_SPOT_1M_SYMBOLS must mirror the 3-index SPOT_1M_REST_INDICES set"
+);
+
+/// Post-minute-close fire delay (ms) for the Groww leg — mirrors
+/// [`SPOT_1M_REST_FIRE_DELAY_MS`]. Groww's just-closed-minute availability
+/// latency is undocumented; the ladder + histogram measure it.
+pub const GROWW_SPOT_1M_FIRE_DELAY_MS: u64 = 300;
+
+/// Bounded in-minute re-poll ladder for the Groww leg: offsets (ms) FROM
+/// the first attempt — mirrors [`SPOT_1M_REST_RETRY_OFFSETS_MS`].
+pub const GROWW_SPOT_1M_RETRY_OFFSETS_MS: [u64; 4] = [700, 1_500, 3_000, 6_000];
+
+/// Per-REQUEST HTTP timeout (secs) for one Groww candles poll — mirrors
+/// the Dhan leg's 5 s (bounded inside the minute; the SDK ships INFINITE
+/// default timeouts, so this bound is entirely ours).
+pub const GROWW_SPOT_1M_REQUEST_TIMEOUT_SECS: u64 = 5;
+
+/// HARD wall-clock budget (secs) for ONE symbol's whole in-minute ladder.
+/// 18 s (not the Dhan leg's 20 s — a DELIBERATE tightening): the Groww leg
+/// fetches its 3 symbols SEQUENTIALLY (the minute-boundary pacing rule of
+/// `docs/groww-ref/15-rate-limits-and-capacity.md` — the shared-token 10/s
+/// Live-Data bucket is TYPE-pooled and co-tenanted with bruteX, so each
+/// boundary burst is spread to at most ONE in-flight request at a time,
+/// far inside the ≤6 req/s ceiling), so the WHOLE fire is bounded by
+/// 3 × budget; 3 × 18 s + the fire delay still finishes inside the minute
+/// (const-asserted below).
+pub const GROWW_SPOT_1M_SYMBOL_BUDGET_SECS: u64 = 18;
+
+/// Maximum accepted response body size (bytes) for one Groww candles poll
+/// — a full-day 375-row tuple response is ~20 KB; 2 MiB bounds a
+/// hostile/misbehaving server (csv_downloader §18 streamed-cap pattern).
+pub const GROWW_SPOT_1M_MAX_BODY_BYTES: usize = 2 * 1024 * 1024;
+
+/// Minimum spacing (secs) between SSM re-reads of the shared Groww access
+/// token after an auth-class reject — the token-minter lock's ≥60 s pacing
+/// (`groww-shared-token-minter-2026-07-02.md`): re-READ, never mint. The
+/// daily ~06:00 IST token expiry is OFFICIALLY documented
+/// (`docs/groww-ref/17-token-lifecycle.md`) — an in-session 401 means the
+/// minter re-minted or the token was invalidated; the fresh value arrives
+/// via the same SSM read.
+pub const GROWW_SPOT_1M_TOKEN_REREAD_FLOOR_SECS: u64 = 60;
+
+const _: () = assert!(
+    GROWW_SPOT_1M_RETRY_OFFSETS_MS[0] < GROWW_SPOT_1M_RETRY_OFFSETS_MS[1]
+        && GROWW_SPOT_1M_RETRY_OFFSETS_MS[1] < GROWW_SPOT_1M_RETRY_OFFSETS_MS[2]
+        && GROWW_SPOT_1M_RETRY_OFFSETS_MS[2] < GROWW_SPOT_1M_RETRY_OFFSETS_MS[3],
+    "GROWW_SPOT_1M retry offsets must be strictly increasing"
+);
+// SEQUENTIAL-fetch budget math: the whole fire (fire delay + 3 sequential
+// per-symbol ladder budgets) must finish inside the minute, and the
+// ladder's own schedule (last offset + one full request timeout) must fit
+// inside one symbol's budget so the timeout only fires on genuine stalls.
+const _: () = assert!(
+    GROWW_SPOT_1M_FIRE_DELAY_MS
+        + (GROWW_SPOT_1M_SYMBOLS.len() as u64) * GROWW_SPOT_1M_SYMBOL_BUDGET_SECS * 1_000
+        < 60_000,
+    "GROWW_SPOT_1M sequential fire (delay + 3 x symbol budget) must finish inside the minute"
+);
+const _: () = assert!(
+    GROWW_SPOT_1M_RETRY_OFFSETS_MS[3] + GROWW_SPOT_1M_REQUEST_TIMEOUT_SECS * 1_000
+        < GROWW_SPOT_1M_SYMBOL_BUDGET_SECS * 1_000,
+    "GROWW_SPOT_1M ladder schedule (last offset + one request timeout) must fit the budget"
+);
+
 /// Daily reset signal time (IST). After market close at 15:30,
 /// historical re-fetch + cross-verification runs. At 16:00 IST the daily
 /// reset signal fires (candle aggregator reset, indicator reset, etc.).
@@ -3747,6 +3864,59 @@ mod tests {
         // (retrying the SAME request inside it earns the reject it retries).
         assert!(CHAIN_1M_EXPIRYLIST_RETRY_BACKOFF_SECS[0] >= CHAIN_1M_MIN_GAP_SECS);
         assert_eq!(CHAIN_1M_MAX_BODY_BYTES, 8 * 1024 * 1024);
+    }
+
+    /// Groww spot 1m REST leg (operator grant 2026-07-13, PR-2 of the
+    /// Groww per-minute REST plan) — endpoint identity, the 3-symbol table,
+    /// the SEQUENTIAL-fetch timing envelope and the token re-read floor.
+    #[test]
+    fn test_groww_spot_1m_constants_pinned() {
+        assert_eq!(
+            GROWW_HISTORICAL_CANDLES_URL,
+            "https://api.groww.in/v1/historical/candles"
+        );
+        assert!(GROWW_HISTORICAL_CANDLES_URL.starts_with("https://"));
+        // The Groww interval literal — never the Dhan-style "1".
+        assert_eq!(GROWW_CANDLE_INTERVAL_1MIN, "1minute");
+        assert_eq!(GROWW_API_VERSION_HEADER, "x-api-version");
+        assert_eq!(GROWW_API_VERSION_VALUE, "1.0");
+        // The 3-symbol table mirrors the Dhan set in Groww identity space:
+        // groww_symbol (NOT token / bare trading symbol), segment CASH.
+        assert_eq!(
+            GROWW_SPOT_1M_SYMBOLS,
+            [
+                ("NSE-NIFTY", "NIFTY", "NSE", "CASH"),
+                ("NSE-BANKNIFTY", "BANKNIFTY", "NSE", "CASH"),
+                ("BSE-SENSEX", "SENSEX", "BSE", "CASH"),
+            ]
+        );
+        assert_eq!(GROWW_SPOT_1M_SYMBOLS.len(), SPOT_1M_REST_INDICES.len());
+        // Timing envelope mirrors the Dhan leg, tightened for the
+        // SEQUENTIAL 3-symbol fire (pacing rule: ≤1 in-flight request).
+        assert_eq!(GROWW_SPOT_1M_FIRE_DELAY_MS, 300);
+        assert_eq!(GROWW_SPOT_1M_RETRY_OFFSETS_MS, [700, 1_500, 3_000, 6_000]);
+        assert!(
+            GROWW_SPOT_1M_RETRY_OFFSETS_MS
+                .windows(2)
+                .all(|w| w[0] < w[1]),
+            "offsets strictly increasing"
+        );
+        assert_eq!(GROWW_SPOT_1M_REQUEST_TIMEOUT_SECS, 5);
+        assert_eq!(GROWW_SPOT_1M_SYMBOL_BUDGET_SECS, 18);
+        assert!(
+            GROWW_SPOT_1M_FIRE_DELAY_MS
+                + (GROWW_SPOT_1M_SYMBOLS.len() as u64) * GROWW_SPOT_1M_SYMBOL_BUDGET_SECS * 1_000
+                < 60_000,
+            "sequential fire must finish inside the minute"
+        );
+        assert!(
+            GROWW_SPOT_1M_RETRY_OFFSETS_MS[3] + GROWW_SPOT_1M_REQUEST_TIMEOUT_SECS * 1_000
+                < GROWW_SPOT_1M_SYMBOL_BUDGET_SECS * 1_000,
+            "ladder schedule must fit one symbol's budget"
+        );
+        assert_eq!(GROWW_SPOT_1M_MAX_BODY_BYTES, 2 * 1024 * 1024);
+        // Token-minter lock pacing: re-READ from SSM at ≥60 s, never mint.
+        assert_eq!(GROWW_SPOT_1M_TOKEN_REREAD_FLOOR_SECS, 60);
     }
 
     /// Constant pin — 60s grace after close.

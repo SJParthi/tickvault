@@ -159,6 +159,27 @@ re-appends UPSERT in place. Release-build panics abort the process
 (`panic = "abort"`) — the respawn arms are unwind-build/self-heal paths,
 the same honesty note as TICK-FLUSH-01.
 
+**2026-07-13 — the GROWW spot leg emits this SAME code (no new variant):**
+the Groww per-minute spot 1m REST leg
+(`crates/app/src/groww_spot_1m_boot.rs`, operator grant 2026-07-13 —
+`groww-second-feed-scope-2026-06-19.md` §38 /
+`no-rest-except-live-feed-2026-06-27.md` §9, plan
+`.claude/plans/active-plan-groww-rest-1m.md` PR-2) reuses `SPOT1M-01` with
+the SAME stage taxonomy, distinguished by a **`feed = "groww"` field on
+every emit** (the Dhan sites stay field-less — grep `feed="groww"` to
+split). Groww-specific additions: `stage="token_read"` (the shared-minter
+SSM read failed — re-read paced ≥60 s, NEVER minted, per
+`groww-shared-token-minter-2026-07-02.md`) and the sweep stages
+(`sweep_failed`/`sweep_incomplete` — the #1499 post-session repair sweep,
+shipped in the Groww leg from day one alongside the day-granular window +
+the one-minute-lookback backfill). Groww counters mirror the Dhan names
+under the `tv_groww_spot1m_*` prefix (`fetch_total{outcome}`,
+`close_to_data_ms`, `rate_limited_total`, `boundary_skipped_total`,
+`task_respawn_total{reason}`, `backfilled_total`, `sweep_*`,
+`ts_form_total{form}` — the UNVERIFIED-LIVE timestamp wire-format probe).
+The typed pages are the Groww-specific `GrowwSpot1mFetchDegraded` /
+`GrowwSpot1mFetchRecovered` Telegram events (same 3-minute edge).
+
 ## §2. SPOT1M-02 — spot_1m_rest persist failed
 
 **Severity:** High. **Auto-triage safe:** Yes (best-effort persist; the
@@ -195,6 +216,37 @@ the SPOT1M-01 failure edge (M1 — persist failure = not-fully-OK).
 **Honest envelope:** the table is a forensic/reference record — a persist
 outage loses rows for the outage window only; it never affects tick
 capture, the WS candles, or trading.
+
+**2026-07-13 — the GROWW spot leg emits this SAME code (no new variant):**
+the Groww leg's persist errors carry a **`feed = "groww"` field** on every
+emit, same stage taxonomy (`append`/`flush`; ensure stages are shared —
+the table DDL is one), counters under `tv_groww_spot1m_persist_errors_total{stage}`
++ `tv_groww_spot1m_rows_discarded_total` (per-feed discard series — a
+Groww discard never inflates the Dhan signal). SAME table, `feed='groww'`
+rows — `feed` is already in the DEDUP key, so the two feeds' rows never
+collide. ADDITIONALLY (operator scope addition 2026-07-13): the NEW
+**`rest_fetch_audit` per-fetch forensics table**
+(`crates/storage/src/rest_fetch_audit_persistence.rs` — one row per
+`(target minute, symbol, feed, leg)` fetch, success AND failure, DEDUP
+`(ts, trading_date_ist, feed, leg, security_id, exchange_segment, outcome)`
+— `outcome` in-key per phase-0 DEDUP rule 3 so TRANSITION rows BOTH
+survive: a sweep gap row never overwrites the minute's original ladder
+row; hostile round 1 item 5) is written BEST-EFFORT by the Groww leg (the
+Dhan leg's emit sites are a fast FOLLOW-UP after #1499 merges); its
+ensure/append/flush failures reuse SPOT1M-02 with stages
+`audit_ensure_client_build` / `audit_ensure_ddl` / `audit_append` /
+`audit_flush` + `tv_rest_fetch_audit_persist_errors_total{stage}` — a
+forensics write failure NEVER affects the fetch loop or the failure edge.
+A minute the 15:31 sweep still cannot recover is a NAMED GAP: one
+`rest_fetch_audit` row per (minute, symbol) with the DISTINCT
+`outcome="named_gap"` (hostile round 1 item 6 — never a misleading
+200+`error` pair; `final_http_status` = the ACTUAL last status when a
+fetch happened, 0 sentinel when none) and class slugs `named_gap` /
+`pre_boot` (a mid-session boot's pre-boot blind window is named
+AUDIT-ONLY — §38/§9 forbid a bulk backfill fetch) / `persist_failed`
+(fetched OK but the ILP APPEND failed — a persist failure, never dressed
+as vendor absence; round-2 LOW) / `flush_failed` (swept minutes lost at
+the ILP flush) / `no_token` — never a silent hole.
 
 ## §2b. CHAIN-01 — option-chain entitlement absent (pipeline down for the day)
 
@@ -419,12 +471,17 @@ This rule activates when editing:
 - `crates/common/src/error_code.rs` (any `Spot1m0*` or `Chain0*` variant)
 - `crates/app/src/spot_1m_rest_boot.rs`
 - `crates/app/src/option_chain_1m_boot.rs`
+- `crates/app/src/groww_spot_1m_boot.rs` (the 2026-07-13 Groww leg)
 - `crates/storage/src/spot_1m_rest_persistence.rs`
 - `crates/storage/src/option_chain_1m_persistence.rs`
-- `crates/common/src/config.rs` (`Spot1mRestConfig` / `OptionChain1mConfig`)
+- `crates/storage/src/rest_fetch_audit_persistence.rs` (the 2026-07-13
+  per-fetch forensics table)
+- `crates/common/src/config.rs` (`Spot1mRestConfig` / `OptionChain1mConfig`
+  / `GrowwSpot1mConfig`)
 - Any file containing `SPOT1M-01`, `SPOT1M-02`, `Spot1m01FetchDegraded`,
   `Spot1m02PersistFailed`, `spot_1m_rest`, `SPOT_1M_REST_INDICES`,
   `tv_spot1m_fetch_total`, `CHAIN-01`, `CHAIN-02`, `CHAIN-03`, `CHAIN-04`,
   `Chain01EntitlementAbsent`, `Chain02FetchDegraded`,
-  `Chain03PersistFailed`, `Chain04ExpirylistFailed`, `option_chain_1m`, or
-  `tv_chain1m_fetch_total`
+  `Chain03PersistFailed`, `Chain04ExpirylistFailed`, `option_chain_1m`,
+  `tv_chain1m_fetch_total`, `GROWW_SPOT_1M_SYMBOLS`, `rest_fetch_audit`, or
+  `tv_groww_spot1m_fetch_total`
