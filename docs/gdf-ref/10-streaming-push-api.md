@@ -1,41 +1,77 @@
 # GDF 10 — Streaming "Push Type" API (StreamAllSymbols / StreamAllSnapshots)
 
-> **Source:** https://globaldatafeeds.in/global-datafeeds-apis/global-datafeeds-apis/streaming_api/ (landing) · https://globaldatafeeds.in/global-datafeeds-apis/global-datafeeds-apis/streaming_api/stream-all-symbols/ (operator-supplied URL) · …/advanced_streaming_api/ (hosts SubscribeOptionChain) · …/introduction/type-of-apis-available/
-> **Fetched:** 2026-07-13 · **Evidence tier:** SEARCH (existence + one-liners ONLY — the function pages themselves were unfetchable and are absent from every accessible mirror). **This file is mostly a documented GAP** — see §3.
+> **Source:** https://globaldatafeeds.in/global-datafeeds-apis/global-datafeeds-apis/streaming_api/stream-all-symbols/ · …/streaming_api/ (landing) · …/advanced_streaming_api/ (hosts SubscribeOptionChain) · …/introduction/type-of-apis-available/
+> **Fetched:** 2026-07-13 · **Evidence tier:** **LIVE-DOC (the stream-all-symbols page — operator-pasted from a live browser 2026-07-13; preserved at the coordinator scratchpad `gdf-live-streamallsymbols-paste.md`)** + SEARCH (landing/one-liners). The 2026 docs sidebar (LIVE-DOC nav) confirms the Streaming API as a live current top-level section.
 
 ---
 
-## 1. What IS established (Verified)
+## 1. Product model (LIVE-DOC, Verified)
 
-| Fact | Evidence |
+| Fact | Detail |
 |---|---|
-| A separate **"Streaming API"** doc section exists — described as a "**Push Type API**": once connected, it pushes realtime and snapshot data whenever new updates are available | SEARCH: type-of-apis page + streaming_api landing (re-confirmed by a fresh search in the 2026-07-13 reconciliation pass) |
-| **`StreamAllSymbols`** — "streams data of ALL symbols of the exchange" — NO per-symbol subscribe | SEARCH (function listed on the landing page) |
-| **`StreamAllSnapshots`** — streams snapshot bars of all symbols | SEARCH |
-| An **`advanced_streaming_api/`** section additionally hosts `SubscribeOptionChain` (07 §2) | SEARCH (URL evidence) |
-| **NO official client implements either Stream function** — verified absence across ALL official SDK generations 2018 → wsgfdl-py 1.3.5 (2025-11-28) and the JS sample | CLIENT-LIB-SOURCE (grep, verified absence) |
-| Zero wire-shape leakage anywhere — no request/response JSON in any search snippet, mirror, or package | Verified absence |
-| This family is DISTINCT from the standard WS API's per-symbol `SubscribeRealtime`/`SubscribeSnapshot`; the standard API's package-gated concurrent-symbol limits (50–500-class per search snippets) apply to the normal WS API instead | SEARCH |
+| What it is | "Push Type API": after connecting + authenticating, the server streams realtime data of **ALL symbols of ALL exchanges enabled on the API key** — NO per-symbol subscribe calls at all |
+| Entitlement | Verbatim: "No additional function is required to be enabled for this functionality Only the Authentication need to be done. It will send Realtime data of all symbols of those exchanges which are enabled for that API key." → **key-level (per-exchange) entitlement; the firehose auto-starts after auth** |
+| Auth | IDENTICAL to the standard WS API: `{"MessageType":"Authenticate","Password":accessKey}` → `{"Complete":true,"Message":"Welcome!","MessageType":"AuthenticateResult"}` |
+| Semantics | Same field SET as `RealtimeResult` (03 §4) — incl. `Close` = prev-day close, epoch-seconds wording identical to the SubscribeRealtime page — but a **DIFFERENT wire dialect** (§2) |
+| Sibling | `StreamAllSnapshots` — snapshot bars of all symbols; **wire shape still uncaptured** (U-1 residual) |
 
-## 2. Adjacent mechanism that EXISTS today (fallback)
+## 2. WIRE FORMAT — Batch envelope with ABBREVIATED keys (a THIRD dialect!)
 
-Whole-exchange data is already pullable WITHOUT the Streaming API: `GetExchangeSnapshot` (minute-bar granularity, entire exchange, `From`/`To` paging, max 5 snapshots/call — 04 §5) and the server-side `GetExchangeSnapshotAfterMarket` capability name. `StreamAllSnapshots` is PRESUMABLY the push variant of GetExchangeSnapshot — **Assumed, unverified**.
+Ticks arrive wrapped in a batch object, rows keyed by SHORT names (NOT the PascalCase `RealtimeResult` shape — a distinct serde struct is required):
 
-## 3. What is NOT known (all → `99-UNKNOWNS.md` U-1)
+```json
+{"T":"Batch","data":[
+{"E":"NFO","I":"OPTSTK_SBIN_28OCT2025_CE_860","LTT":1759831039,"STT":1759831040,"ATP":22.22,"BP":20.15,"BQ":15000,"C":25.95,"H":26.5,"L":19.25,"LTP":20.15,"LTQ":0,"O":26.45,"OI":1998000,"QL":750,"SP":20.25,"SQ":750,"TTQ":3099000,"VAL":68859780,"PO":false,"PC":-5.8,"PCP":-22.35,"OIC":232500,"T":"RT"},
+{"E":"NFO","I":"OPTSTK_OFSS_28OCT2025_CE_9200","LTT":1759831039,"STT":1759831040,"ATP":305.12,"BP":378,"BQ":75,"C":249.55,"H":383,"L":250,"LTP":377.5,"LTQ":0,"O":251.35,"OI":19950,"QL":75,"SP":380.5,"SQ":75,"TTQ":199050,"VAL":60734136,"PO":false,"PC":127.95,"PCP":51.27,"OIC":-3375,"T":"RT"},
+{"E":"NFO","I":"OPTIDX_MIDCPNIFTY_28OCT2025_PE_12300","LTT":1759831039,"STT":1759831040,"ATP":20.46,"BP":19.55,"BQ":140,"C":27.6,"H":26.25,"L":16.75,"LTP":20.25,"LTQ":140,"O":25.85,"OI":206500,"QL":140,"SP":20.4,"SQ":700,"TTQ":574140,"VAL":11746904.4,"PO":false,"PC":-7.35,"PCP":-26.63,"OIC":-25900,"T":"RT"}
+]}
+```
+
+(LIVE-DOC verbatim rows; the doc-page sample carried 17 array elements — 14 elided above, a mix of OPTSTK/OPTIDX incl. quoted-only rows; page note: "++ multiple line of traded symbols in batch wise format like above".)
+
+### Abbreviated-key legend (verbatim from the page) ↔ long-name ↔ type
+
+| Abbrev | Long name (03 §4 semantics) | Type |
+|---|---|---|
+| `T` (outer) | envelope discriminator `"Batch"` | string |
+| `T` (row) | MessageType `"RT"` (realtime row) | string — ⚠ same key name at both levels |
+| `E` / `I` | Exchange / InstrumentIdentifier (LONG format observed) | string |
+| `LTT` / `STT` | LastTradeTime / ServerTime | int, epoch seconds |
+| `LTP` / `LTQ` | LastTradePrice / LastTradeQty | f64 / int |
+| `ATP` | AverageTradedPrice | f64 |
+| `O` / `H` / `L` | Open / High / Low | f64 |
+| `C` | Close (**prev-day close** — ARITH re-verified: SBIN row PC −5.8 = LTP 20.15 − C 25.95) | f64 |
+| `BP`/`BQ` · `SP`/`SQ` | BuyPrice/BuyQty · SellPrice/SellQty (L1) | f64/int |
+| `TTQ` / `VAL` | TotalQtyTraded / Value | int / f64 |
+| `OI` / `OIC` | OpenInterest / OpenInterestChange | int / int (signed) |
+| `QL` | QuotationLot | number |
+| `PO` | PreOpen | bool |
+| `PC` / `PCP` | PriceChange / PriceChangePercentage | f64 |
+
+### Observed behaviors (from the LIVE-DOC sample)
+
+- `STT − LTT = 1` second in every sample row (server stamp one second after exchange stamp). LTT 1759831039 = 2025-10-07 15:27:19 IST (ARITH — in-session, true-UTC reading holds in this dialect too).
+- **Quoted-only rows stream too**: full-universe delivery includes untraded strikes — rows with `ATP/H/L/O/TTQ/VAL` all 0 and `LTP` 0 (or carrying a previous value). A consumer MUST tolerate zero-OHLC rows and not treat them as corrupt.
+- `LTQ: 0` on traded rows (quote-refresh seconds), matching the standard-feed behavior (03 §3b).
+- Number formatting drifts int-vs-float per row (`"BP":378` vs `"BP":20.15`) — parse all prices as f64.
+
+## 3. Adjacent mechanism (unchanged)
+
+Whole-exchange PULL exists without the Streaming API: `GetExchangeSnapshot` (04 §5) + the server-side `GetExchangeSnapshotAfterMarket` name. `StreamAllSnapshots` is presumably the push variant — wire shape **Unknown** (U-1 residual).
+
+## 4. What is STILL not known (U-1 residual — see 99-UNKNOWNS)
 
 | Gap | Why it matters |
 |---|---|
-| Request/response wire JSON (both functions) | cannot build a client without it |
-| Same socket/port as the standard WS API, or a separate endpoint? | connection architecture |
-| Tick-level or bar-level for StreamAllSymbols? Cadence? | whether it replaces per-symbol SubscribeRealtime for a large universe |
-| Scope: whole exchange vs the key's entitled symbol set? | entitlement + filtering design |
-| Bandwidth (an NFO-wide 1s stream could be very large) | host sizing |
-| Entitlement/pricing (separate SKU?) | purchase decision |
-| Interaction with `AllowedInstruments` symbol caps | quota model |
-
-**This is the #1 sales/live-probe item.** For tickvault, a stream-all mode would eliminate per-symbol subscribe batching entirely (at the cost of app-side watch-set filtering) — but nothing may be designed against it until U-1 is answered.
+| Dedicated endpoint/port vs the standard WS host:port | connection architecture |
+| Batch emission cadence + batch size bounds (rows per Batch frame, frames/sec) | consumer sizing |
+| Bandwidth for a full NFO universe (tens of thousands of L1 rows/sec-class?) | host + network sizing |
+| Do request-response functions (GetLimitation, GetInstruments, …) work on the SAME streaming connection? | boot design |
+| `StreamAllSnapshots` wire shape | bar firehose option |
+| Pricing/cost of enabling exchanges for streaming (key-level entitlement = the pricing axis) | purchase decision |
 
 ## What this prevents
 
-- Designing feed-#3 around a function family whose wire format has literally never been observed.
-- Confusing `advanced_streaming_api`'s SubscribeOptionChain (known shape, 07 §2) with the unknown Stream* pair.
+- Decoding the firehose with the `RealtimeResult` struct (it is a different, abbreviated-key Batch dialect — needs its own serde type; note the two-level `T` key).
+- Treating zero-OHLC untraded-strike rows as data corruption.
+- Assuming per-symbol subscription control exists on this API (it is all-or-nothing per exchange on the key).

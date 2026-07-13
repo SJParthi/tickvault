@@ -9,7 +9,7 @@
 
 ## ⚠ ACCESS CONSTRAINT — read before trusting any tier label
 
-**globaldatafeeds.in was NOT directly fetchable from the research environment** (egress proxy returned 403 for the site, for web.archive.org, and for every relay). Therefore almost nothing in this pack is labeled LIVE-DOC and nothing is labeled ARCHIVED. **Exception (2026-07-13, post-initial-draft): one page — the SubscribeRealtime function page — was pasted verbatim by the OPERATOR from a live browser and is labeled LIVE-DOC (operator-pasted); see `03` §3b.** All other doc-page content was recovered two ways:
+**globaldatafeeds.in was NOT directly fetchable from the research environment** (egress proxy returned 403 for the site, for web.archive.org, and for every relay). Therefore almost nothing in this pack is labeled LIVE-DOC and nothing is labeled ARCHIVED. **Exception (2026-07-13, post-initial-draft): TWO pages — the SubscribeRealtime function page (`03` §3b) and the StreamAllSymbols page (`10`) — were pasted verbatim by the OPERATOR from a live browser and are labeled LIVE-DOC (operator-pasted).** All other doc-page content was recovered two ways:
 
 1. **Search-engine extraction** of the live pages (substantive, URL-cited, NOT byte-verbatim) → labeled **SEARCH**.
 2. **Official GFDL artifacts read as raw source**: four official PyPI packages (`Author-email: developer@globaldatafeeds.in`) and GFDL's official JavaScript sample + 2018 third-party client docs preserved verbatim in GitHub mirrors → labeled **CLIENT-LIB-SOURCE(pkg@ver)** / **GITHUB-SAMPLE**.
@@ -20,7 +20,7 @@ All verbatim JSON in this pack comes from tier-2 artifacts (plus the operator pa
 
 | Tier | Meaning |
 |---|---|
-| `LIVE-DOC` | live globaldatafeeds.in page content — unattainable by direct fetch; **used ONLY for operator-pasted live pages (2026-07-13: the SubscribeRealtime page, `03` §3b)** |
+| `LIVE-DOC` | live globaldatafeeds.in page content — unattainable by direct fetch; **used ONLY for operator-pasted live pages (2026-07-13: SubscribeRealtime `03` §3b + StreamAllSymbols `10`)** |
 | `ARCHIVED` | web.archive.org capture — **UNUSED (unattainable)** |
 | `SEARCH` | search-engine extraction of the named live page URL, 2026-07-13; substantive but not byte-verbatim |
 | `CLIENT-LIB-SOURCE(pkg@ver)` | read from an extracted OFFICIAL GFDL PyPI sdist: `wsgfdl-py@1.3.5` (2025-11-28, newest WS lib), `GFDLWS@0.0.4`, `ws-gfdl@1.1.0` (2022), `gfdl-rest@1.0.3`. Includes each package's official README with real captured server responses |
@@ -86,7 +86,7 @@ Adjudicated 2026-07-13 across 6 parallel research passes + raw artifacts. Confli
 | 29 | GetInstruments row carries `TokenNumber` (exchange numeric token, string) + ISIN (equities) + QuotationLot + Series + price bands + 52wk | Verified |
 | 30 | Greeks realtime/last-quote APIs key on **Token**, not identifier; 18 greek fields incl. Vanna/Charm/Zomma/Volga/DTR; historical greeks exist | Verified |
 | 31 | L1 only — no depth function on WS/REST; OptionChain `Depth` = strike-count around ATM | Verified |
-| 32 | Streaming API (StreamAllSymbols/StreamAllSnapshots) exists as separate doc'd product; wire shapes/entitlement/endpoint | Verified (existence) / **Unknown** (everything else, U-1) |
+| 32 | Streaming API (StreamAllSymbols/StreamAllSnapshots) exists as separate doc'd product; **StreamAllSymbols wire format + auth-only entitlement LIVE-DOC-captured 2026-07-13** (Batch/abbreviated-key dialect — 10); endpoint/cadence/bandwidth/StreamAllSnapshots-shape still **Unknown** (U-1 residual) | Verified (existence + StreamAllSymbols wire) / Unknown (residual) |
 | 33 | Whole-exchange pull exists TODAY without Streaming API: GetExchangeSnapshot (+ server-side GetExchangeSnapshotAfterMarket) | Verified |
 | 34 | Delayed API = same functions with backend-configured per-exchange delay; same response fields | Verified |
 | 35 | REST: GET-only, `accessKey` query param, path = function name + `/`; JSON default, `xml=true`, `format=CSV`; ALL-CAPS keys; known SDK bugs | Verified |
@@ -135,7 +135,8 @@ See per-topic files for full request/response detail. Presence key: JS = officia
 | GetTopGainersLosers / GetVolumeShockers | WS+REST / WS | W2 W3 R / W3 | 05 |
 | Echo (server-push heartbeat) | WS | JS (comment) | 02 |
 | GetExchangeSnapshotAfterMarket / GetLastQuoteOptionChainWithGreeks | server-side names (LimitationResult) | — | 11, 07 |
-| **StreamAllSymbols / StreamAllSnapshots** | Streaming API (docs only; wire unknown) | — | 10 |
+| **StreamAllSymbols** | Streaming API — **wire format LIVE-DOC-captured 2026-07-13** (Batch dialect, abbreviated keys; endpoint/cadence still open) | — | 10 |
+| **StreamAllSnapshots** | Streaming API (docs only; wire still unknown) | — | 10 |
 | Delayed twins (SubscribeSnapshot/GetSnapshot/GetHistory/GetExchangeSnapshot Delayed) | Delayed API | — | 01, 04 |
 
 ## The CURRENT (2026) live docs tree — authoritative function inventory

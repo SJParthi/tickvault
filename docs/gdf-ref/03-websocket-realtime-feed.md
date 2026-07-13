@@ -40,7 +40,7 @@ Unsubscribe = the SAME message with `"Unsubscribe":"true"`. Notes:
 {"Exchange":"NSE","InstrumentIdentifier":"SBIN","LastTradeTime":1536558991,"ServerTime":1536558991,"AverageTradedPrice":291.31,"BuyPrice":290.15,"BuyQty":5441,"Close":291.65,"High":293.25,"Low":289.15,"LastTradePrice":290.2,"LastTradeQty":323,"Open":290.65,"OpenInterest":0,"QuotationLot":0.0,"SellPrice":290.3,"SellQty":551,"TotalQtyTraded":7422459,"Value":2162236531.29,"PreOpen":false,"MessageType":"RealtimeResult"}
 ```
 
-## 3b. LIVE-DOC sample (2026-07-13 operator paste of the live page) — the pack's only LIVE-DOC evidence
+## 3b. LIVE-DOC sample (2026-07-13 operator paste of the live page) — the pack's first LIVE-DOC evidence (the second is the StreamAllSymbols page, 10)
 
 Live page sample response, verbatim ("Example of returned data in JSON format. This data is returned every second"):
 

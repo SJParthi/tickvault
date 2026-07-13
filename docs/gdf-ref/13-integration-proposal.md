@@ -50,7 +50,7 @@ Plus: `ws_event_types.rs:61` fixed `[WsType; 5]`, `main.rs` lane spawn sites (a 
 | Frame sizes | must NOT cap frames at defaults (instrument master = one multi-MB frame) | config knob |
 | New dependencies | **NONE expected** (tokio-tungstenite, serde_json, secrecy, aws-sdk-ssm all pinned) | zero approval asks |
 
-Complexity ≈ 25–40% of the Groww native client (no NATS framing, no nkey, no protobuf, no per-session token mint). Design decision flagged for PR-0: SubscribeRealtime-per-watch-entry (closest to existing patterns; 1 frame/symbol, quota-aware resubscribe) vs stream-all+filter (blocked on U-1).
+Complexity ≈ 25–40% of the Groww native client (no NATS framing, no nkey, no protobuf, no per-session token mint). Design decision flagged for PR-0 — **the architecture fork is now REAL (StreamAllSymbols wire LIVE-DOC-captured 2026-07-13, 10 §2)**: (a) SubscribeRealtime-per-watch-entry — closest to existing patterns; 1 frame/symbol, quota-aware resubscribe, decodes the PascalCase `RealtimeResult` dialect; vs (b) StreamAllSymbols firehose + client-side watch-set filter — zero subscribe management (auth-only; auto-starts for the key's enabled exchanges), but requires its OWN serde struct for the Batch/abbreviated-key dialect (`{"T":"Batch","data":[{"E":…,"I":…,"LTT":…,"T":"RT"},…]}` — NOT the RealtimeResult shape), must tolerate untraded zero-OHLC rows, and its cadence/bandwidth/endpoint remain unmeasured (U-1 residual). The daily-universe scope still bounds what is PERSISTED either way.
 
 ## 4. Identity recommendation
 
@@ -94,7 +94,7 @@ Each PR: draft → All Green on the exact final head → coordinator merges (mer
 
 1. Authorize GDF as feed #3 at all (dated quote) + purchase/trial decision (blocked on U-1/U-2/U-3/U-5 sales answers).
 2. `FeedStrategy::GDF` late-tick policy (Refold like Dhan vs Discard like Groww) + `drop_d1` policy.
-3. Per-symbol subscribe vs stream-all (blocked on U-1).
+3. Per-symbol subscribe vs StreamAllSymbols firehose+filter — the fork is now real (wire dialect captured, 10 §2); still gated on the U-1 RESIDUAL answers (endpoint, cadence, bandwidth, same-connection request support).
 4. Plaintext-ws acceptance if U-2 answers "no TLS" (API key cleartext on the wire).
 5. GDF historical API usage (default: forbidden — no KEEP row).
 6. Whether `Feed::Dhan` survives as a dormant legacy variant if Dhan is removed concurrently (recommended: yes — `feed='dhan'` rows are SEBI-retained forever; GDF PRs must rebase on the post-removal `Feed` shape).

@@ -65,6 +65,7 @@
 
 - GDF solves NEITHER of the two Dhan pain points (conflation, second-resolution stamps). Groww's ms-precision feed remains strictly better on both axes.
 - GDF's genuine strengths: uniform documented 1s cadence for all symbols; per-tick lag observability (dual timestamps); inline OI + VWAP + PreOpen; a real historical API with sane UTC epochs and generous quotas — useful as an INDEPENDENT third source / cross-verify anchor, with the vendor-built-candle caveat.
+- **StreamAllSymbols firehose (wire LIVE-DOC-captured 2026-07-13 — 10):** a documented whole-entitled-universe push mode with zero subscribe management — unique among the three feeds (Dhan and Groww are both per-symbol-subscribe). Same 1s L1 quality class and epoch-seconds stamps (STT−LTT=1s in samples); a distinct Batch/abbreviated-key dialect; delivers untraded symbols too (zero-OHLC rows). Cadence/bandwidth unmeasured (U-1 residual).
 - Everything quality-critical that remains open is a live-trial question: U-6 (bar stamp), U-7 (tick history granularity), U-17 (burst cadence + lag distribution), U-19 (reliability), U-23 (epoch confirmation per exchange).
 
 ## What this prevents
