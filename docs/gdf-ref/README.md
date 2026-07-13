@@ -58,6 +58,13 @@ REST function lists via snippet nav text; its exact slug is still unknown.
 browser-paste list (Tier 1 = protocol-critical never-captured pages first) — each paste
 becomes LIVE-DOC tier, the only route past the WAF.
 
+**Coverage manifest:** [`00-COVERAGE-MANIFEST.md`](./00-COVERAGE-MANIFEST.md) enumerates
+EVERY known page/sub-section of GDF's docs (from the LIVE-DOC sidebar nav capture below +
+the pack's URL universe + the search-derived slugs) with a per-URL status — 2/81 rows
+fetched-verbatim (the operator pastes), 38 blocked-by-WAF (re-verified 2026-07-13), 12
+known-URL never-fetched, 29 slug-unknown; every known page enumerated, none silently
+absent.
+
 ## Evidence-tier legend (header block on every section)
 
 | Tier | Meaning |
@@ -77,6 +84,7 @@ Confidence labels: **Verified** (multiple consistent sources or official artifac
 | File | Contents |
 |---|---|
 | `00-PASTE-LIST.md` | the operator browser-paste capture queue (2026-07-13) — ordered URL list for closing WAF-blocked doc pages |
+| `00-COVERAGE-MANIFEST.md` | the completeness manifest (2026-07-13) — every known GDF doc page/sub-section enumerated with per-URL status: 2/81 fetched-verbatim, 38 WAF-blocked, 12 known-URL unfetched, 29 slug-unknown |
 | `01-product-and-entitlement.md` | vendor status, segments matrix, product tiers, pricing evidence, licensing, trial |
 | `02-authentication-and-connection.md` | endpoint model, Authenticate handshake, session exclusivity (new-connection-wins), Echo heartbeat, reconnect contract, maintenance windows, frame sizes |
 | `03-websocket-realtime-feed.md` | SubscribeRealtime/Unsubscribe, 1/sec/symbol cadence, COMPLETE RealtimeResult field table, PreOpen, OI, no depth |
