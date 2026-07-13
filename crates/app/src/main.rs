@@ -3385,6 +3385,45 @@ async fn main() -> Result<()> {
     };
 
     // =======================================================================
+    // Dhan-OFF boot completion signals (deploy-hang fix, 2026-07-13).
+    //
+    // The systemd unit is Type=notify with TimeoutStartSec=infinity: systemd
+    // releases the `systemctl restart tickvault` start job ONLY when the app
+    // sends sd_notify(READY=1). Both pre-existing notify sites are Dhan-gated
+    // — the FAST crash-recovery arm (filtered on `config.feeds.dhan_enabled`)
+    // and the slow-boot site inside `start_dhan_lane` — so the Phase-A
+    // `dhan_enabled=false` flip (#1496, 2026-07-13) left every prod boot
+    // stuck `activating` forever: the on-box deploy script's
+    // `systemctl restart tickvault` never returned, the SSM command never
+    // reached a terminal state, and the deploy workflow's wait budget expired
+    // into the auto-stop mid-script (runs 29269805430 / 29273283894 — every
+    // post-#1496 deploy failed identically). This arm sends READY=1 and the
+    // feed-liveness-gated `tv_boot_completed` (the 08:40 IST boot-heartbeat
+    // alarm's signal — equally lane-owned before this fix, so a Dhan-OFF boot
+    // would also have false-paged that alarm every morning) for the Dhan-OFF
+    // boot, mirroring the two existing sites. `dhan_poolless_idle=false`:
+    // with `dhan_enabled=false` the Dhan term of `boot_completed_should_emit`
+    // is vacuous and the gate genuinely waits (bounded 60s) for the Groww
+    // lane — a Groww that never comes up still withholds the metric so the
+    // boot-heartbeat alarm pages (Rule 11, no false-OK). READY=1 is sent
+    // FIRST (unconditionally for this arm): systemd start-job release must
+    // never be held hostage to feed liveness — the PROCESS booted; feed
+    // health has its own alarms. No-op when NOTIFY_SOCKET is unset (local
+    // `cargo run` / Mac scale-test boots, which took this arm long before
+    // Phase A without ever running under systemd).
+    // =======================================================================
+    if !config.feeds.dhan_enabled {
+        infra::notify_systemd_ready();
+        emit_boot_completed_when_feed_live(
+            &feed_runtime,
+            config.feeds.dhan_enabled,
+            config.feeds.groww_enabled,
+            false,
+        )
+        .await;
+    }
+
+    // =======================================================================
     // PROCESS RUN-LOOP (BOTH Dhan-OFF and Dhan-ON-slow).
     //
     // Built once over the hoisted shared infra: market-close timer,

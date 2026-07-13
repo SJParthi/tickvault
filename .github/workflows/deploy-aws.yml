@@ -624,7 +624,18 @@ jobs:
               "# On systemctl failure, dump status + journal so the deploy log shows WHY (Z+ L1 DETECT).",
               "# Two journal dumps: (1) -xeu (rich systemd metadata, useful for context),",
               "# (2) --output=cat -n 200 (raw app stdout/stderr ONLY, no systemd noise — the actual error).",
-              "systemctl restart tickvault || (echo ===== systemctl status ===== && systemctl status tickvault.service --no-pager -l || true; echo ===== app stdout/stderr ONLY last 200 ===== && journalctl -u tickvault.service -n 200 --no-pager --output=cat || true; echo ===== journalctl -xeu last 100 ===== && journalctl -xeu tickvault.service -n 100 --no-pager || true; exit 1)",
+              "# BOUNDED restart (2026-07-13 deploy-hang fix): the unit is Type=notify with",
+              "# TimeoutStartSec=infinity, so `systemctl restart` blocks until the app sends",
+              "# sd_notify(READY=1). A boot path that never sends it (the #1496 Dhan-OFF arm",
+              "# did exactly that) hung THIS LINE forever: the SSM command never reached a",
+              "# terminal state, the workflow wait budget expired, and the auto-stop killed",
+              "# the box mid-script with EMPTY on-box output (runs 29269805430 / 29273283894",
+              "# — every post-#1496 deploy, 3/3 identical). `timeout 300` bounds the CLIENT",
+              "# wait (5x the 60s QuestDB boot gate; the swap already happened above, so a",
+              "# timeout here is a VERIFY failure, never a half-swap). On timeout the start",
+              "# job keeps running in the background — the journal dumps + exit 1 make the",
+              "# deploy fail LOUDLY with the on-box reason instead of hanging into auto-stop.",
+              "timeout 300 systemctl restart tickvault || (echo ===== systemctl restart failed or exceeded 300s - app likely never sent READY=1 ===== && systemctl status tickvault.service --no-pager -l || true; echo ===== app stdout/stderr ONLY last 200 ===== && journalctl -u tickvault.service -n 200 --no-pager --output=cat || true; echo ===== journalctl -xeu last 100 ===== && journalctl -xeu tickvault.service -n 100 --no-pager || true; exit 1)",
               "sleep 5",
               "systemctl is-active --quiet tickvault || (echo ===== service inactive after 5s ===== && systemctl status tickvault.service --no-pager -l || true; echo ===== app stdout/stderr ONLY last 200 ===== && journalctl -u tickvault.service -n 200 --no-pager --output=cat || true; echo ===== journalctl -xeu last 100 ===== && journalctl -xeu tickvault.service -n 100 --no-pager || true; exit 1)",
               "echo TICKVAULT-UP",
@@ -668,20 +679,29 @@ jobs:
         # Status=InProgress (with EMPTY stdout/stderr, because SSM only fills
         # those at a terminal state) and hard-failed a deploy that was actually
         # still progressing (deploy run 26732460896, 2026-06-01). We poll
-        # manually with a 10-minute budget for a genuine TERMINAL state instead.
+        # manually with a ~15-minute budget for a genuine TERMINAL state instead.
         continue-on-error: true
         run: |
           set -uo pipefail
           REGION="${{ vars.AWS_REGION || 'ap-south-1' }}"
           CMD_ID="${{ steps.ssm.outputs.command_id }}"
           IID="${{ secrets.EC2_INSTANCE_ID }}"
-          # 120 polls × 5s = 600s (10 min). SSM send-command default execution
-          # timeout is 3600s, so the command itself is never killed under us.
-          for i in $(seq 1 120); do
+          # 150 polls × 5s = 750s nominal. Bumped 120 → 150 (2026-07-13): the
+          # observed cadence is ~6.3s/poll (5s sleep + ~1.3s API round-trip —
+          # runs 29269805430 / 29273283894 burned 120 polls in ~12.6 min), and
+          # the on-box script now carries a bounded 300s `systemctl restart`
+          # (deploy-hang fix, same date). Worst honest failure path — S3
+          # download + 40s smoke + docker up + 300s restart timeout + journal
+          # dumps — must still reach a TERMINAL SSM state inside this budget,
+          # otherwise the auto-stop kills the box mid-script with EMPTY on-box
+          # output (SSM fills stdout/stderr only at a terminal state). 150
+          # polls ≈ 15.7 min real. SSM send-command default execution timeout
+          # is 3600s, so the command itself is never killed under us.
+          for i in $(seq 1 150); do
             STATUS=$(aws ssm get-command-invocation \
               --region "$REGION" --command-id "$CMD_ID" --instance-id "$IID" \
               --query 'Status' --output text 2>/dev/null || echo "Pending")
-            echo "poll $i/120: status=$STATUS"
+            echo "poll $i/150: status=$STATUS"
             case "$STATUS" in
               Success|Failed|Cancelled|TimedOut)
                 echo "reached terminal state: $STATUS"
@@ -690,7 +710,7 @@ jobs:
             esac
             sleep 5
           done
-          echo "::warning::SSM command still non-terminal after 10 min — the Fetch step below will report the real status."
+          echo "::warning::SSM command still non-terminal after ~15 min — the Fetch step below will report the real status."
 
       - name: Fetch SSM command output + fail loudly on box-side error
         # if: always() — print the box-side STDOUT/STDERR no matter what, so a
