@@ -655,6 +655,21 @@ async fn main() -> Result<()> {
     let groww_scale_entries: std::sync::Arc<
         arc_swap::ArcSwapOption<Vec<tickvault_core::feed::groww::instruments::WatchEntry>>,
     > = std::sync::Arc::new(arc_swap::ArcSwapOption::empty());
+    // ── Groww capture rotation-at-open — PROCESS-GLOBAL, BEFORE both spawns ──
+    // 2026-07-13 disk-retention hardening (review round 1 redesign, F1+F2):
+    // rotate a stale previous-IST-day capture file HERE, synchronously,
+    // strictly BEFORE the Groww bridge task AND the sidecar supervisor spawn
+    // below — ordering holds by construction on EVERY boot arm (this is the
+    // single shared spawn site; the ratchet in disk_retention_wiring_guard.rs
+    // pins the source order). Only Rust renames at open: the rename completes
+    // before the sidecar process exists (it can never re-open the old inode)
+    // and before the bridge's one-shot archive-drain decision runs (F1), and
+    // the archive is named by the bridge's snapshot day — the exact name
+    // drain_archive_tail_if_needed probes (F2). Scale-lab per-conn shard
+    // captures (main-locked-out, dev only) are not rotated at open.
+    let _rotated_capture = tickvault_app::groww_bridge::rotate_stale_groww_capture_at_open(
+        std::path::Path::new(tickvault_app::groww_bridge::GROWW_TICK_FILE_DEFAULT),
+    );
     if groww_scale_enabled {
         let _groww_shard_bridges =
             tickvault_app::groww_bridge::spawn_supervised_groww_shard_bridges(
@@ -698,13 +713,22 @@ async fn main() -> Result<()> {
     // FEED-SUPERVISOR-01: spawn the feed-agnostic sidecar supervisor under a
     // respawning wrapper so the stall-watchdog (FEED-STALL-01) can never die
     // silently — a panic/return respawns it (WS-GAP-05 / DISK-WATCHER-01 pattern).
+    // Disk-retention hardening (2026-07-13): thread the capture-archive S3
+    // destination from `[feeds.groww]` into the sidecar child env so rotated
+    // capture archives are verified-offloaded to S3 instead of accumulating
+    // unbounded on the 30 GB root EBS. Empty bucket = archival OFF.
+    let groww_sidecar_options = tickvault_app::groww_sidecar_supervisor::GrowwSidecarOptions {
+        archive_s3_bucket: config.feeds.groww.capture_archive_s3_bucket.clone(),
+        archive_s3_prefix: config.feeds.groww.capture_archive_s3_prefix.clone(),
+        ..tickvault_app::groww_sidecar_supervisor::GrowwSidecarOptions::default()
+    };
     if groww_scale_enabled {
         // §34: the ladder publishes desired_conns; the fleet reconciles the
         // per-conn Python children to it (spawn missing / kill newest).
         let scale_runtime = tickvault_app::groww_scale_ladder::GrowwScaleRuntime::default();
         let _groww_fleet = tickvault_app::groww_sidecar_supervisor::spawn_groww_scale_fleet(
             std::sync::Arc::clone(&feed_runtime),
-            tickvault_app::groww_sidecar_supervisor::GrowwSidecarOptions::default(),
+            groww_sidecar_options.clone(),
             groww_shards_root.clone(),
             std::sync::Arc::clone(&scale_runtime.desired_conns),
             std::sync::Arc::clone(&scale_runtime.wake),
@@ -727,7 +751,7 @@ async fn main() -> Result<()> {
     } else {
         tickvault_app::groww_sidecar_supervisor::spawn_supervised_groww_sidecar_supervisor(
             std::sync::Arc::clone(&feed_runtime),
-            tickvault_app::groww_sidecar_supervisor::GrowwSidecarOptions::default(),
+            groww_sidecar_options.clone(),
             std::sync::Arc::clone(&feed_health),
             std::sync::Arc::clone(&groww_sidecar_notifier_slot),
             // Scoreboard PR-B (2026-07-10): every stall-watchdog
@@ -1637,6 +1661,29 @@ async fn main() -> Result<()> {
                     ),
                 }
             }
+            // 2026-07-13 disk-retention hardening: the single-file WARN+
+            // append log is deliberately skipped by every retention sweeper
+            // (the `*.log`-name guard), so it was the one unbounded log
+            // file. Cap it at ERRORS_LOG_MAX_BYTES — the same WARN+ lines
+            // also live in the hourly machine app logs + errors.jsonl, so a
+            // truncation loses nothing uniquely. Hosted here (the existing
+            // hourly sweep task) rather than a new task.
+            match observability::cap_errors_log_size(
+                Path::new(tickvault_app::boot_helpers::ERROR_LOG_FILE_PATH),
+                observability::ERRORS_LOG_MAX_BYTES,
+            ) {
+                Ok(None) => {}
+                Ok(Some(prev_bytes)) => tracing::info!(
+                    prev_bytes,
+                    max_bytes = observability::ERRORS_LOG_MAX_BYTES,
+                    "errors.log exceeded its size cap — reset to 0 (WARN+ lines \
+                     remain in the hourly app logs + errors.jsonl)"
+                ),
+                Err(err) => tracing::warn!(
+                    ?err,
+                    "errors.log size cap check failed — file keeps growing until fixed"
+                ),
+            }
         }
     });
 
@@ -1720,6 +1767,33 @@ async fn main() -> Result<()> {
                     }
                 }
             }
+        }
+    });
+
+    // 2026-07-13 disk-retention hardening: prune confirmed-replay WAL
+    // segments from `<wal_dir>/archive/` older than 7 days (F3: matches
+    // SPILL_FILE_MAX_AGE_SECS and preserves the confirm-on-channel
+    // residual's only copy across a long weekend for triage). Archived
+    // segments are post-confirmed-replay copies (frames re-injected +
+    // durably persisted); the same-day 15:40 IST tick-conservation audit
+    // reads only the CURRENT day's frames, so a 7-day retention can never
+    // change it. Before this task, `archive/` grew ~0.15–0.6 GB/day
+    // unbounded on the prod 30 GB volume. Process-global boot prefix (both
+    // boot arms) — deliberately NOT the Dhan-lane periodic health loop,
+    // which never runs on a Groww-only boot. Prunes once at task start
+    // (each daily prod boot reclaims immediately), then every 6 h.
+    tokio::spawn(async {
+        use std::time::Duration;
+        loop {
+            let wal_dir = tickvault_app::tick_conservation_boot::ws_wal_dir();
+            let _outcome = tickvault_storage::ws_frame_spill::prune_archived_segments(
+                &wal_dir,
+                tickvault_common::constants::WS_WAL_ARCHIVE_RETENTION_SECS,
+            );
+            tokio::time::sleep(Duration::from_secs(
+                tickvault_common::constants::WS_WAL_ARCHIVE_PRUNE_INTERVAL_SECS,
+            ))
+            .await;
         }
     });
 
