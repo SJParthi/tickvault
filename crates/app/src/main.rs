@@ -1601,6 +1601,29 @@ async fn main() -> Result<()> {
                     ),
                 }
             }
+            // 2026-07-13 disk-retention hardening: the single-file WARN+
+            // append log is deliberately skipped by every retention sweeper
+            // (the `*.log`-name guard), so it was the one unbounded log
+            // file. Cap it at ERRORS_LOG_MAX_BYTES — the same WARN+ lines
+            // also live in the hourly machine app logs + errors.jsonl, so a
+            // truncation loses nothing uniquely. Hosted here (the existing
+            // hourly sweep task) rather than a new task.
+            match observability::cap_errors_log_size(
+                Path::new(tickvault_app::boot_helpers::ERROR_LOG_FILE_PATH),
+                observability::ERRORS_LOG_MAX_BYTES,
+            ) {
+                Ok(None) => {}
+                Ok(Some(prev_bytes)) => tracing::info!(
+                    prev_bytes,
+                    max_bytes = observability::ERRORS_LOG_MAX_BYTES,
+                    "errors.log exceeded its size cap — reset to 0 (WARN+ lines \
+                     remain in the hourly app logs + errors.jsonl)"
+                ),
+                Err(err) => tracing::warn!(
+                    ?err,
+                    "errors.log size cap check failed — file keeps growing until fixed"
+                ),
+            }
         }
     });
 
@@ -1684,6 +1707,31 @@ async fn main() -> Result<()> {
                     }
                 }
             }
+        }
+    });
+
+    // 2026-07-13 disk-retention hardening: prune confirmed-replay WAL
+    // segments from `<wal_dir>/archive/` older than 2 days. Archived
+    // segments are post-confirmed-replay copies (frames re-injected +
+    // durably persisted); the same-day 15:40 IST tick-conservation audit
+    // reads only the CURRENT day's frames, so a 2-day retention can never
+    // change it. Before this task, `archive/` grew ~0.15–0.6 GB/day
+    // unbounded on the prod 30 GB volume. Process-global boot prefix (both
+    // boot arms) — deliberately NOT the Dhan-lane periodic health loop,
+    // which never runs on a Groww-only boot. Prunes once at task start
+    // (each daily prod boot reclaims immediately), then every 6 h.
+    tokio::spawn(async {
+        use std::time::Duration;
+        loop {
+            let wal_dir = tickvault_app::tick_conservation_boot::ws_wal_dir();
+            let _outcome = tickvault_storage::ws_frame_spill::prune_archived_segments(
+                &wal_dir,
+                tickvault_common::constants::WS_WAL_ARCHIVE_RETENTION_SECS,
+            );
+            tokio::time::sleep(Duration::from_secs(
+                tickvault_common::constants::WS_WAL_ARCHIVE_PRUNE_INTERVAL_SECS,
+            ))
+            .await;
         }
     });
 

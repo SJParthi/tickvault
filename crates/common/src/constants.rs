@@ -2178,6 +2178,23 @@ pub const PERIODIC_HEALTH_CHECK_INTERVAL_SECS: u64 = 300;
 /// Spill files older than this are auto-deleted during the periodic health check.
 pub const SPILL_FILE_MAX_AGE_SECS: u64 = 7 * 24 * 3600;
 
+/// Retention for confirmed-replay WAL segments in `<wal_dir>/archive/`
+/// (2 days in seconds) — 2026-07-13 disk-retention hardening.
+///
+/// Archived segments are POST-confirmed-replay copies: their frames were
+/// re-injected into the live pipeline AND durably persisted before
+/// `confirm_replayed` moved them out of `replaying/`. The only reader of
+/// `archive/` after that point is the same-day 15:40 IST tick-conservation
+/// audit (`count_frames_for_ist_day`), which counts frames for the CURRENT
+/// day only (with a 3-day segment-creation pre-filter); a segment older
+/// than 2 days carries no current-day frames, so pruning it can never
+/// change the audit. Before this retention existed, `archive/` grew
+/// ~0.15–0.6 GB/day unbounded on the prod 30 GB volume.
+pub const WS_WAL_ARCHIVE_RETENTION_SECS: u64 = 172_800;
+
+/// Cadence of the WAL archive prune task (6 hours in seconds).
+pub const WS_WAL_ARCHIVE_PRUNE_INTERVAL_SECS: u64 = 6 * 3600;
+
 // ---------------------------------------------------------------------------
 // Subscription Planner — ATM Strike Range
 // ---------------------------------------------------------------------------
