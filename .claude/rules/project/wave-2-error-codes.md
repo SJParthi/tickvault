@@ -117,6 +117,20 @@ classify/backoff/terminal-behaviour unit + tokio tests beside it).
 
 ## WS-GAP-06 — tick-gap detector fired a coalesced summary
 
+> **⚠ RETIREMENT AUTHORIZED 2026-07-13 (deletion lands with the Phase C PRs):** the
+> tick-gap detector and this code are DELETED with the Dhan live WS (operator Q4-ii
+> "agreed dude" — *tick-gap detector + WS-GAP-06 deleted; the Groww feed-stall watchdog
+> owns stall detection*, 2026-07-13; full contract in `websocket-connection-scope-lock.md`
+> "2026-07-13 Amendment"). The detector was fed ONLY by the Dhan WS pipeline
+> (`record_tick_global` at `tick_processor.rs`; the Groww bridge never recorded into it —
+> Phase B map, Verified), so post-retirement it is a no-input shell. Honest envelope of
+> the deletion: FEED-level stall detection for Groww is `FEED-STALL-01`
+> (`feed-stall-watchdog-error-codes.md`); PER-SID silence visibility moves to the
+> scoreboard presence/coverage columns (15:45 IST cadence) — there is deliberately NO 30s
+> per-SID page anymore. The `tv_tick_gap_instruments_silent` gauge, the WS-GAP-06 seeding,
+> and the §36 far-month alarm-gate exclusion die with it. Content below retained for
+> historical audit.
+
 **Trigger:** Item 8's `TickGapDetector` observed ≥1 instrument with
 silence ≥30s during the most recent 60s coalesce window.
 
