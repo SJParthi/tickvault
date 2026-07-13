@@ -3,7 +3,9 @@
 > **Source:** https://groww.in/trade-api/docs/curl/backtesting · https://groww.in/trade-api/docs/curl/historical-data · https://groww.in/trade-api/docs/python-sdk/backtesting · https://groww.in/trade-api/docs/curl/annexures
 > **Fetched/Verified:** 2026-07-13 (via the 2026-07-03 lossless capture + 2026-07-13 live cross-checks; groww.in direct fetch proxy-blocked from the sandbox — provenance stated honestly)
 > **Evidence tiers:** Verified / Assumed / Unknown per README legend. "Verified (capture 2026-07-03)" = verbatim from the 26-page lossless official capture; "Verified (live 2026-07-13)" = independently matched by same-day live-page search extraction or mirror forensics; "Verified (SDK 1.5.0)" = read from the official `growwapi` 1.5.0 wheel (PyPI latest as of 2026-07-13).
-> **Related:** `14-option-chain.md` (chain + greeks), `15-rate-limits-and-capacity.md` (family attribution for these endpoints), `99-UNKNOWNS.md` (U-1, U-2, U-3, U-6, U-7, U-16)
+> **Related:** `14-option-chain.md` (chain + greeks), `15-rate-limits-and-capacity.md` (family attribution for these endpoints), `99-UNKNOWNS.md` (U-1, U-2, U-3, U-4, U-6, U-7, U-16)
+
+> **⚠ SCOPE — REFERENCE DOCUMENTATION ONLY, NOT FETCH AUTHORIZATION.** This file documents the Groww historical-candles REST surface for completeness. Groww historical/backtest fetching from TickVault is governed by `.claude/rules/project/groww-second-feed-scope-2026-06-19.md` §33 (LIVE-FEED-ONLY) / §37 (the narrow BruteX-S3 CSV consumption grant — TickVault reads BruteX-produced artifacts from our own bucket, never this API). Any future TickVault REST consumer of these endpoints requires its own dated operator grant recorded in that rule file FIRST. (Same banner class as the Dhan full-market-depth stub.)
 
 ---
 
@@ -58,7 +60,7 @@ Request schema, verbatim (capture 2026-07-03, REST variant — all 6 required):
 - **Epoch unit wart (Verified both sources):** the CURRENT endpoint's docs say epoch **seconds**; the DEPRECATED endpoint's SDK docstring says "epoch **milliseconds** or yyyy-MM-dd HH:mm:ss". The unit differs between old (ms) and new (s).
 - **Timezone: NOT stated anywhere in the docs (Verified-absence).** All examples use exchange-session wall-clock times (`09:15:00`, `15:30:00`). **Assumed: IST.** No UTC mention on any captured page.
 
-**`groww_symbol` format (Verified, capture verbatim — "Exchange + Trading Symbol + Expiry Date (DDMmmYY) + Strike Price + Option Type"):**
+**`groww_symbol` format (Verified, capture — the page defines it as "formed by concatenating" Exchange + Trading Symbol + Expiry Date ("format: DDMmmYY, example: 23Jan25"; derivatives only) + Strike Price (options only) + Option Type; the compressed form here is a faithful compaction of that bulleted definition, not a verbatim string):**
 
 | Class | Examples (verbatim) |
 | --- | --- |
@@ -141,7 +143,7 @@ Verbatim (capture 2026-07-03, truncated to 2 candles; page states "All prices in
 
 ## 6. SPECIAL SECTION — Current-day serving & minute freshness: UNDOCUMENTED
 
-**The docs contain ZERO statements about current-day availability or just-closed-minute latency.** Grep-verified across ALL 26 pages of the 2026-07-03 lossless capture on 2026-07-13 (terms: current day / same day / today / in-progress / latest candle / delay / latency / freshness — zero relevant hits; the only "today" hits are a Smart Orders prose line and a trade-list window default). A groww.in-domain-restricted live search on 2026-07-13 surfaced nothing further. Every documented example uses past dates.
+**The docs contain ZERO statements about current-day availability or just-closed-minute latency.** Grep-verified across ALL 26 pages of the 2026-07-03 lossless capture on 2026-07-13 (terms: current day / same day / today / in-progress / latest candle / delay / latency / freshness — zero relevant hits; the only "today" hits are a Smart Orders prose line and the smart-order-list `start_date_time` window default). A groww.in-domain-restricted live search on 2026-07-13 surfaced nothing further. Every documented example uses past dates.
 
 The ONLY adjacent statement in the whole corpus is the Live Data page's OHLC note, verbatim:
 

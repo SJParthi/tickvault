@@ -5,6 +5,8 @@
 > **Evidence tiers:** Verified / Assumed / Unknown per README legend.
 > **Related:** `11-historical-candles.md` (expiry discovery), `15-rate-limits-and-capacity.md` (family attribution), `99-UNKNOWNS.md` (U-4, U-11, U-12, U-13)
 
+> **⚠ SCOPE — REFERENCE DOCUMENTATION ONLY, NOT FETCH AUTHORIZATION.** This file documents the Groww option-chain REST surface for completeness. TickVault makes NO Groww option-chain calls today — the Groww feed is LIVE-FEED-ONLY per `.claude/rules/project/groww-second-feed-scope-2026-06-19.md` §33 (the §37 grant covers only BruteX-produced S3 CSVs, not this API; the §8 per-minute chain pipeline in `no-rest-except-live-feed-2026-06-27.md` is DHAN-side only). Any future TickVault REST consumer of this endpoint requires its own dated operator grant recorded in the rule file FIRST. (Same banner class as the Dhan full-market-depth stub.)
+
 ---
 
 ## 1. Endpoint

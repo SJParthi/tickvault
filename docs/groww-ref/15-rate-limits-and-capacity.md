@@ -3,7 +3,7 @@
 > **Source:** https://groww.in/trade-api/docs/curl#rate-limits · https://groww.in/trade-api/docs/python-sdk (Rate Limits section) · https://groww.in/trade-api/docs/python-sdk/exceptions
 > **Fetched/Verified:** 2026-07-13 (via the 2026-07-03 lossless capture + 2026-07-13 live cross-checks; groww.in direct fetch proxy-blocked from the sandbox — provenance stated honestly)
 > **Evidence tiers:** Verified / Assumed / Unknown per README legend.
-> **Related:** `11-historical-candles.md` §10, `14-option-chain.md` §4, `99-UNKNOWNS.md` (U-4..U-10)
+> **Related:** `11-historical-candles.md` §10, `14-option-chain.md` §4, `99-UNKNOWNS.md` (U-4..U-10, U-14)
 
 ---
 
