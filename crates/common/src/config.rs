@@ -1035,18 +1035,63 @@ impl QuestDbConfig {
 }
 
 /// Partition retention configuration (separate from QuestDbConfig to avoid breaking existing code).
+///
+/// 2026-07-13 (disk-pressure remediation): grew the archive→verify→drop knobs.
+/// Two retention classes exist:
+/// - **market-data** (`ticks` + the 21 `candles_*` tables) → `market_data_hot_days`
+/// - **everything else** (audit / daily-data tables) → `retention_days`
+///
+/// The destructive archive→verify→drop leg is gated on `archive_enabled`
+/// (serde default **false**), so a config rollback (`archive_enabled = false`,
+/// or simply deleting the key) restores the legacy detach-only behaviour
+/// instantly. `market_data_hot_days` defaulting to 14 is safe-by-default
+/// precisely BECAUSE the flow is fail-closed: nothing is ever dropped unless
+/// its S3 copy has been row-count- and size-verified, and nothing at all
+/// happens while `archive_enabled` is false.
 #[derive(Debug, Clone, Deserialize)]
 pub struct PartitionRetentionConfig {
-    /// Hot partition retention in days. Partitions older than this are detached.
+    /// Hot partition retention in days for the STANDARD class (audit /
+    /// daily-data tables). Partitions older than this are detached (legacy
+    /// path) or archived→verified→dropped (when `archive_enabled`).
     /// Default: 90 days. Set to 0 to disable auto-detach.
     #[serde(default = "default_retention_days")]
     pub retention_days: u32,
+    /// Hot window in days for the HIGH-VOLUME market-data class (`ticks` +
+    /// the 21 `candles_*` tables, ~1.2–2 GB/day combined). 90 days of ticks
+    /// (~135+ GB) can never fit the 30 GB volume — the hot window must be
+    /// shorter, with S3 as the durable long-term store (aws-budget.md §5
+    /// hot-window-on-EBS doctrine; SEBI retention satisfied by the S3 copy).
+    /// Only consulted when `archive_enabled = true`; clamped to a hard
+    /// MIN_HOT_DAYS=2 floor at use (today + yesterday are untouchable).
+    #[serde(default = "default_market_data_hot_days")]
+    pub market_data_hot_days: u32,
+    /// Master gate for the archive→verify→drop leg. serde default FALSE so
+    /// the destructive behaviour must be explicitly configured on
+    /// (config/base.toml sets it true for prod); flipping it off restores
+    /// the legacy detach-only cycle byte-identically.
+    #[serde(default)]
+    pub archive_enabled: bool,
+    /// S3 bucket receiving verified partition archives. Empty (the default)
+    /// = derive `tv-<env>-cold` from TV_ENVIRONMENT/ENVIRONMENT (prod →
+    /// `tv-prod-cold`, the bucket the instance role already reads/writes).
+    #[serde(default)]
+    pub archive_bucket: String,
+    /// Per-run bound on archived partitions (oldest first) so the first
+    /// catch-up sweep (weeks of hourly ticks partitions) converges over a
+    /// few post-market runs instead of overrunning the 16:30 IST box stop.
+    /// 0 = unlimited.
+    #[serde(default = "default_max_partitions_per_run")]
+    pub max_partitions_per_run: u32,
 }
 
 impl Default for PartitionRetentionConfig {
     fn default() -> Self {
         Self {
             retention_days: default_retention_days(),
+            market_data_hot_days: default_market_data_hot_days(),
+            archive_enabled: false,
+            archive_bucket: String::new(),
+            max_partitions_per_run: default_max_partitions_per_run(),
         }
     }
 }
@@ -1054,6 +1099,20 @@ impl Default for PartitionRetentionConfig {
 /// Default retention: 90 days of hot data.
 const fn default_retention_days() -> u32 {
     90
+}
+
+/// Default market-data hot window: 14 days. Inert unless `archive_enabled`;
+/// safe-by-default because the archive→verify→drop flow is fail-closed
+/// (no verified S3 copy ⇒ no drop).
+const fn default_market_data_hot_days() -> u32 {
+    14
+}
+
+/// Default per-run archive bound: 200 partitions. At ~8–24 hourly ticks
+/// partitions + ~22 daily candle partitions per aged-out day, one run covers
+/// several days of backlog while staying far inside the post-market window.
+const fn default_max_partitions_per_run() -> u32 {
+    200
 }
 
 // `ValkeyConfig` struct + `default_valkey_password` helper DELETED in
@@ -2074,6 +2133,45 @@ mod tests {
         // partitions is the documented retention default.
         assert_eq!(default_retention_days(), 90);
         assert_eq!(PartitionRetentionConfig::default().retention_days, 90);
+    }
+
+    #[test]
+    fn test_partition_retention_serde_defaults_backward_compatible() {
+        // A pre-2026-07-13 config carrying ONLY retention_days must parse
+        // with the archive leg OFF and the documented class defaults —
+        // missing keys = legacy behaviour (archive_enabled false).
+        let cfg: PartitionRetentionConfig =
+            toml::from_str("retention_days = 90").expect("legacy section must parse");
+        assert_eq!(cfg.retention_days, 90);
+        assert_eq!(cfg.market_data_hot_days, 14);
+        assert!(!cfg.archive_enabled, "archive leg must default OFF");
+        assert!(cfg.archive_bucket.is_empty(), "bucket must default derived");
+        assert_eq!(cfg.max_partitions_per_run, 200);
+    }
+
+    #[test]
+    fn test_partition_retention_archive_enabled_default_false() {
+        // The destructive leg must be explicitly configured on. Kills
+        // `default -> true` mutants and pins the instant-rollback contract
+        // (delete the key ⇒ detach-only legacy behaviour).
+        assert!(!PartitionRetentionConfig::default().archive_enabled);
+        assert_eq!(default_market_data_hot_days(), 14);
+        assert_eq!(default_max_partitions_per_run(), 200);
+        let cfg: PartitionRetentionConfig =
+            toml::from_str("").expect("empty section must parse via defaults");
+        assert!(!cfg.archive_enabled);
+    }
+
+    #[test]
+    fn test_partition_retention_full_section_parses() {
+        let cfg: PartitionRetentionConfig = toml::from_str(
+            "retention_days = 90\nmarket_data_hot_days = 14\narchive_enabled = true\narchive_bucket = \"tv-prod-cold\"\nmax_partitions_per_run = 50\n",
+        )
+        .expect("full section must parse");
+        assert!(cfg.archive_enabled);
+        assert_eq!(cfg.archive_bucket, "tv-prod-cold");
+        assert_eq!(cfg.market_data_hot_days, 14);
+        assert_eq!(cfg.max_partitions_per_run, 50);
     }
 
     // =======================================================================

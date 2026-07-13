@@ -11454,8 +11454,54 @@ async fn run_process_runloop(
             }
         }
 
+        // Post-market: archive→verify→drop old QuestDB partitions (2026-07-13
+        // disk-pressure remediation). MUST run BEFORE the legacy detach cycle
+        // so a >retention_days partition is archived+dropped (disk freed, S3
+        // copy verified) rather than detached-unarchived (renamed inside the
+        // same volume, zero bytes freed). Gated on `archive_enabled` (serde
+        // default false) — a config rollback restores detach-only behaviour
+        // byte-identically. Fail-closed: a partition is dropped ONLY after
+        // its S3 copy is row-count- and size-verified; any failure keeps the
+        // partition and retries next run.
+        if config.partition_retention.archive_enabled {
+            match tickvault_storage::partition_archive::PartitionArchiver::new(
+                &config.questdb,
+                &config.partition_retention,
+            )
+            .await
+            {
+                Ok(mut archiver) => {
+                    let summary = archiver.archive_and_drop_old_partitions().await;
+                    info!(
+                        tables_scanned = summary.tables_scanned,
+                        partitions_considered = summary.partitions_considered,
+                        verified = summary.verified,
+                        dropped = summary.dropped,
+                        failed = summary.failed,
+                        rows_archived = summary.rows_archived,
+                        gzip_bytes_uploaded = summary.gzip_bytes_uploaded,
+                        csv_bytes_exported = summary.csv_bytes_exported,
+                        "post-market partition archive complete (verified S3 copy before every drop)"
+                    );
+                }
+                Err(err) => {
+                    error!(
+                        ?err,
+                        code = tickvault_common::error_code::ErrorCode::StorageGap04S3ArchiveFailed
+                            .code_str(),
+                        "partition archiver construction failed — archive cycle skipped \
+                         this run (fail-closed no-op; detach cycle still runs)"
+                    );
+                }
+            }
+        }
+
         // Post-market: detach old QuestDB partitions (Phase B).
         // Runs daily after pipeline stops — keeps hot data bounded to retention_days.
+        // KEPT even with the archive leg enabled: the archive cycle above drops
+        // aged partitions first, so this legacy cycle finds nothing new — but its
+        // `total_detached=…` log lines keep firing so the CloudWatch evidence
+        // trail (the 15:30 IST "partition" filter) continues uninterrupted.
         {
             let retention_days = config.partition_retention.retention_days;
             if retention_days > 0 {
