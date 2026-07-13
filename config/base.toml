@@ -519,8 +519,8 @@ enabled = true
 # nothing) — flip enabled = true only after the probe passes.
 # ===========================================================================
 [groww_option_chain_1m]
-enabled = false # pending the first live probe (see probe_and_report)
-probe_and_report = true
+enabled = true # flipped 2026-07-13 after the live probe PASSED (groww-second-feed-scope §38.6); serde default stays OFF
+probe_and_report = true # inert while enabled; the rollback canary (the Dhan §8.7 precedent)
 
 # ===========================================================================
 # Daily timeframe-consistency verifier (operator directive 2026-07-13 —
