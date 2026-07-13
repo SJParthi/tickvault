@@ -17,7 +17,7 @@
 //!   3. Revert the weekday-only schedule (MON-FRI) back to daily (Mon-Sun).
 //!   4. Flip `enable_eip` default to true (no orders for 3 months → no Dhan
 //!      static-IP need → EIP off saves ~₹430/mo).
-//!   5. Change the EBS default away from 30 GB (hot window sizing for ~₹2,058/mo).
+//!   5. Change the EBS default away from 50 GB (2026-07-13 disk-pressure grow; was 30).
 //!
 //! Each assertion fails the build with an operator-readable message so the next
 //! session (or Cowork task) cannot regress the locked config by accident.
@@ -175,18 +175,20 @@ fn deploy_eip_is_enabled_by_default() {
     );
 }
 
-/// EBS hot-window default is 30 GB (sized for the ~₹2,058/mo bill; S3 cold-tier
+/// EBS hot-window default is 50 GB (operator approval 2026-07-13 — prod
+/// disk-pressure grow 30 -> 50; history 10 -> 30 -> 50; S3 cold-tier
 /// archives partitions > 90d).
 #[test]
-fn deploy_ebs_default_is_30gb() {
+fn deploy_ebs_default_is_50gb() {
     let vars = squish(&read(VARIABLES_TF));
     assert!(
         vars.contains("variable \"ebs_gp3_size_gb\""),
         "variables.tf must declare `ebs_gp3_size_gb`."
     );
     assert!(
-        vars.contains("type = number default = 30"),
-        "ebs_gp3_size_gb must default to 30 GB (operator lock 2026-05-29 §7 Quote 6)."
+        vars.contains("type = number default = 50"),
+        "ebs_gp3_size_gb must default to 50 GB (operator approval 2026-07-13 — \
+         disk-pressure grow; supersedes the 2026-05-29 §7 Quote 6 30 GB lock)."
     );
 }
 

@@ -224,6 +224,21 @@ pub struct GrowwScaleSnapshot {
 pub struct FeedRuntimeState {
     dhan: Arc<AtomicBool>,
     groww: Arc<AtomicBool>,
+    /// The IMMUTABLE RAW TOML value of `feeds.dhan_enabled` (Phase A,
+    /// operator directive 2026-07-13) — captured BEFORE the feed-state
+    /// overlay is applied (round-2 review MEDIUM, 2026-07-13). Distinct
+    /// from the mutable `dhan` runtime atomic: with the Dhan live WS lane
+    /// retired by config (`dhan_enabled = false` in base + production),
+    /// the runtime cold-start supervisor refuses a lane start — so the
+    /// `/api/feeds` handler must refuse a Dhan ENABLE at the API layer too
+    /// (409), instead of flipping a flag that can never take effect (a
+    /// Rule-11 false-OK: /feeds would show ON while nothing can start).
+    /// "Retired" is a statement about the CONFIG, never about the last
+    /// webpage toggle: seeding this from the POST-overlay effective value
+    /// would let a persisted runtime-OFF overlay permanently 409-lock a
+    /// config-ON boot with a misleading "config change + restart" message
+    /// (breaking the PR-E disable→restart→re-enable round trip).
+    dhan_config_enabled: bool,
     /// Set once by the boot wiring when the Groww bridge task is actually
     /// spawned (i.e. `groww_enabled` was true at boot). Read by the API to tell
     /// the operator honestly whether a runtime toggle will take effect.
@@ -278,9 +293,35 @@ impl FeedRuntimeState {
     /// to `dry_run` via [`Self::set_dhan_disable_allowed`].
     #[must_use]
     pub fn from_config(feeds: &FeedsConfig) -> Self {
+        // No-overlay path (tests / `Default`): the effective and RAW Dhan
+        // config values coincide, so the raw seed is `feeds.dhan_enabled`.
+        Self::from_config_with_dhan_config(feeds, feeds.dhan_enabled)
+    }
+
+    /// Build from the boot config + the RAW (pre-overlay) TOML value of
+    /// `feeds.dhan_enabled`. Production (main.rs) uses THIS constructor:
+    /// `feeds` is the POST-overlay EFFECTIVE state (it seeds the runtime
+    /// atomics), while `dhan_config_enabled_raw` is captured BEFORE
+    /// `overlay_feeds` is applied — the Phase A "lane retired" truth is a
+    /// CONFIG statement, so a persisted runtime-OFF overlay
+    /// (data/feed-state.json) on a config-ON boot must never 409-lock the
+    /// PR-E disable→restart→re-enable round trip, and no overlay shape can
+    /// un-retire a config-OFF lane (round-2 review MEDIUM, 2026-07-13; the
+    /// overlay AND-gate in `feed_state_persist` already narrows the
+    /// EFFECTIVE value — this keeps the refusal gate keyed off the config
+    /// alone, in BOTH directions).
+    #[must_use]
+    pub fn from_config_with_dhan_config(
+        feeds: &FeedsConfig,
+        dhan_config_enabled_raw: bool,
+    ) -> Self {
         Self {
             dhan: Arc::new(AtomicBool::new(feeds.dhan_enabled)),
             groww: Arc::new(AtomicBool::new(feeds.groww_enabled)),
+            // Phase A (2026-07-13): the RAW TOML Dhan value is retained
+            // immutably so the API can refuse a runtime enable of the
+            // retired lane (raw config-off is authoritative; round-2 FIX A).
+            dhan_config_enabled: dhan_config_enabled_raw,
             // The lane is not running until the boot wiring spawns it.
             groww_lane_running: AtomicBool::new(false),
             dhan_lane_running: AtomicBool::new(false),
@@ -367,6 +408,21 @@ impl FeedRuntimeState {
 
     pub fn set_dhan_disable_allowed(&self, allowed: bool) {
         self.dhan_disable_allowed.store(allowed, Ordering::Relaxed);
+    }
+
+    /// Phase A (operator directive 2026-07-13): was `feeds.dhan_enabled`
+    /// TRUE in the RAW boot TOML (BEFORE the feed-state overlay — round-2
+    /// FIX A)? `false` means the Dhan live WS lane is retired for this
+    /// process — the runtime cold-start supervisor refuses a lane start, so
+    /// the `/api/feeds` handler refuses the enable direction (409) instead
+    /// of recording a flag that can never take effect. `true` with the
+    /// runtime flag off means dormant-not-retired (a persisted runtime-OFF
+    /// overlay): the toggle re-enable stays allowed. Immutable for the
+    /// process lifetime (config change + restart is the only way to change
+    /// it).
+    #[must_use]
+    pub fn is_dhan_config_enabled(&self) -> bool {
+        self.dhan_config_enabled
     }
 
     /// PR-E: may the operator DISABLE Dhan right now? `false` once live trading
@@ -542,6 +598,7 @@ impl std::fmt::Debug for FeedRuntimeState {
         f.debug_struct("FeedRuntimeState")
             .field("dhan", &self.dhan)
             .field("groww", &self.groww)
+            .field("dhan_config_enabled", &self.dhan_config_enabled)
             .field("groww_lane_running", &self.groww_lane_running)
             .field("dhan_lane_running", &self.dhan_lane_running)
             .field("dhan_pool_present", &self.dhan_pool_present)
@@ -597,6 +654,68 @@ mod tests {
         let state = FeedRuntimeState::from_config(&feeds);
         assert!(state.is_enabled(Feed::Dhan));
         assert!(state.is_enabled(Feed::Groww));
+        assert!(state.is_dhan_config_enabled());
+    }
+
+    #[test]
+    fn test_is_dhan_config_enabled_immutable_across_runtime_toggles() {
+        // Phase A (2026-07-13): the boot-config Dhan value is IMMUTABLE —
+        // runtime toggles flip the atomic, never the config snapshot the
+        // API refusal gate reads.
+        let feeds = FeedsConfig {
+            dhan_enabled: false,
+            groww_enabled: true,
+            ..Default::default()
+        };
+        let state = FeedRuntimeState::from_config(&feeds);
+        assert!(!state.is_dhan_config_enabled());
+        state.set_enabled(Feed::Dhan, true);
+        assert!(
+            !state.is_dhan_config_enabled(),
+            "runtime enable must not mutate the boot-config snapshot"
+        );
+    }
+
+    /// Round-2 FIX A (2026-07-13): the 409/refusal gate is seeded from the
+    /// RAW pre-overlay TOML value, and the feed-state overlay can flip it in
+    /// NEITHER direction.
+    /// test coverage (pub-fn-test-guard): from_config_with_dhan_config
+    #[test]
+    fn test_dhan_config_enabled_seeded_from_raw_toml_not_overlay() {
+        // config-ON boot + persisted runtime-OFF overlay: the EFFECTIVE
+        // feeds carry dhan=false (seeds the runtime atomic OFF) while the
+        // RAW TOML said true — the lane is dormant, NOT retired, so the
+        // refusal gate must stay open (pre-Phase-A round trip restored).
+        let effective_off = FeedsConfig {
+            dhan_enabled: false,
+            groww_enabled: true,
+            ..Default::default()
+        };
+        let state = FeedRuntimeState::from_config_with_dhan_config(&effective_off, true);
+        assert!(
+            !state.is_enabled(Feed::Dhan),
+            "the runtime atomic seeds from the EFFECTIVE (post-overlay) value"
+        );
+        assert!(
+            state.is_dhan_config_enabled(),
+            "the refusal gate reads the RAW TOML value — a runtime-OFF \
+             overlay must not 409-lock a config-ON lane"
+        );
+
+        // Defensive inverse (production-impossible: the overlay AND-gate can
+        // never widen raw=false to effective=true) — pins that the gate is
+        // keyed off the raw value ALONE, so no overlay shape can un-retire a
+        // config-OFF lane either.
+        let effective_on = FeedsConfig {
+            dhan_enabled: true,
+            ..Default::default()
+        };
+        let state = FeedRuntimeState::from_config_with_dhan_config(&effective_on, false);
+        assert!(state.is_enabled(Feed::Dhan));
+        assert!(
+            !state.is_dhan_config_enabled(),
+            "raw=false keeps the lane retired regardless of the effective value"
+        );
     }
 
     #[test]

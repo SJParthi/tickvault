@@ -227,6 +227,8 @@ For every plan item / new feature / Telegram message / docs:
 
 ## I. WebSocket connection scope lock (MANDATORY, FOREVER — operator lock 2026-05-15)
 
+> **⚠ DHAN LIVE WS RETIRED 2026-07-13:** the Dhan main-feed live WS is retired by operator directive 2026-07-13 (*"now remove this entire Dhan live websocket feed instruments subscription even entire live websocket feed itself... As of now only Groww and Dhan historical api pull as we discussed last night along with option chain."*) — `dhan_enabled = false` in base + production, the PR-E runtime ON-half is revoked (runtime re-enable refused; config change + restart required), Groww is the sole live feed, Dhan is retained for REST pulls + the dormant order-update WS pending a separate operator decision. Full amendment lands in the Phase B PR; see the `websocket-connection-scope-lock.md` 2026-07-13 banner.
+>
 > **⚠ ALLOWED-INSTRUMENTS SUPERSEDED 2026-05-27 by [`daily-universe-scope-expansion-2026-05-27.md`](./daily-universe-scope-expansion-2026-05-27.md):** main-feed expanded from 4 IDX_I SIDs to ~250 daily-fetched SIDs (all NSE indices + 1 BSE SENSEX + unique F&O underlyings, all Quote mode). The 2-WebSocket lock (1 main-feed + 1 order-update FOREVER) is UNCHANGED — only the instrument set on the single main-feed conn expanded per operator approval 2026-05-27. The 2026-05-15 verbatim quote below still binds the 2-WS architecture.
 >
 > Operator verbatim 2026-05-15:
