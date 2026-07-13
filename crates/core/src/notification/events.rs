@@ -490,6 +490,28 @@ pub enum NotificationEvent {
         failed_minutes: u32,
     },
 
+    /// Groww per-minute spot 1m REST leg (operator grant 2026-07-13): the
+    /// per-minute pull of the just-closed minute's official index candle
+    /// from the SECOND broker (Groww) has fully failed for several minutes
+    /// in a row. Fires ONCE per failing episode (edge-triggered, Rule 4);
+    /// re-armed only after a successful minute. Severity::High.
+    GrowwSpot1mFetchDegraded {
+        /// How many minutes in a row have fully failed.
+        consecutive_failed_minutes: u32,
+        /// The most recent failed minute, IST 12-hour (e.g. "10:42 AM").
+        minute_ist: String,
+    },
+
+    /// The Groww per-minute index candle pull RECOVERED after a failing
+    /// episode (falling edge — one Info ping; the missing minutes stay
+    /// absent until re-pulled, never fabricated).
+    GrowwSpot1mFetchRecovered {
+        /// The minute that succeeded, IST 12-hour (e.g. "10:45 AM").
+        minute_ist: String,
+        /// How many minutes had fully failed during the episode.
+        failed_minutes: u32,
+    },
+
     /// Per-minute option-chain REST pipeline (operator grant 2026-07-12,
     /// PR-3): the per-minute option-chain snapshot has fully failed for
     /// several minutes in a row (edge-triggered ONCE per episode, Rule 4;
@@ -2052,6 +2074,38 @@ impl NotificationEvent {
                      record until re-pulled — nothing is made up."
                 )
             }
+            Self::GrowwSpot1mFetchDegraded {
+                consecutive_failed_minutes,
+                minute_ist,
+            } => {
+                format!(
+                    "\u{1f198} <b>Groww minute-by-minute index candle pull is FAILING</b>\n\
+                     The per-minute pull of the official 1-minute candle for \
+                     NIFTY, BANKNIFTY and SENSEX from the second broker \
+                     (Groww) has failed {consecutive_failed_minutes} minutes \
+                     in a row (latest failed minute: {minute_ist} IST).\n\
+                     Live streaming prices are NOT affected — only Groww's \
+                     per-minute official record copy is missing.\n\
+                     What to do RIGHT NOW:\n\
+                     1. Check the Groww account's daily access is active \
+                     (the shared morning key).\n\
+                     2. If Groww live streaming prices ALSO stopped, treat it \
+                     as a full Groww outage.\n\
+                     3. Missing minutes fill in safely once the pull recovers."
+                )
+            }
+            Self::GrowwSpot1mFetchRecovered {
+                minute_ist,
+                failed_minutes,
+            } => {
+                format!(
+                    "\u{2705} <b>Groww minute-by-minute index candle pull recovered</b>\n\
+                     The Groww per-minute official candle pull is working \
+                     again as of {minute_ist} IST, after {failed_minutes} \
+                     failed minute(s). The minutes that failed stay blank in \
+                     the record until re-pulled — nothing is made up."
+                )
+            }
             Self::ChainFetchDegraded {
                 consecutive_failed_minutes,
                 minute_ist,
@@ -3018,6 +3072,8 @@ impl NotificationEvent {
             Self::CrossVerify1mAborted { .. } => "CrossVerify1mAborted",
             Self::Spot1mFetchDegraded { .. } => "Spot1mFetchDegraded",
             Self::Spot1mFetchRecovered { .. } => "Spot1mFetchRecovered",
+            Self::GrowwSpot1mFetchDegraded { .. } => "GrowwSpot1mFetchDegraded",
+            Self::GrowwSpot1mFetchRecovered { .. } => "GrowwSpot1mFetchRecovered",
             Self::ChainFetchDegraded { .. } => "ChainFetchDegraded",
             Self::ChainFetchRecovered { .. } => "ChainFetchRecovered",
             Self::ChainEntitlementAbsent { .. } => "ChainEntitlementAbsent",
@@ -3310,6 +3366,11 @@ impl NotificationEvent {
             // failed minutes); the recovery is a positive Info ping.
             Self::Spot1mFetchDegraded { .. } => Severity::High,
             Self::Spot1mFetchRecovered { .. } => Severity::Info,
+            // Groww per-minute spot 1m REST leg (2026-07-13): same edge
+            // semantics as the Dhan leg — one High page per episode, one
+            // Info ping on the falling edge.
+            Self::GrowwSpot1mFetchDegraded { .. } => Severity::High,
+            Self::GrowwSpot1mFetchRecovered { .. } => Severity::Info,
             Self::ChainFetchDegraded { .. } => Severity::High,
             Self::ChainFetchRecovered { .. } => Severity::Info,
             // HIGH only when the pipeline was ON and expected to record;
@@ -6870,6 +6931,47 @@ mod tests {
         assert_eq!(event.topic(), "Spot1mFetchRecovered");
         assert_eq!(event.severity(), Severity::Info);
         let msg = event.to_message();
+        assert!(msg.contains("recovered"), "got: {msg}");
+        assert!(msg.contains("10:45 AM IST"), "got: {msg}");
+        assert!(msg.contains("4 failed"), "got: {msg}");
+        // No false-OK: recovery never claims the missing minutes came back.
+        assert!(msg.contains("nothing is made up"), "got: {msg}");
+    }
+
+    // -----------------------------------------------------------------------
+    // GrowwSpot1mFetchDegraded + GrowwSpot1mFetchRecovered (2026-07-13 —
+    // Groww per-minute spot 1m REST leg, PR-2 of the Groww REST plan)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_groww_spot_1m_fetch_degraded_is_high_with_action_lines() {
+        let event = NotificationEvent::GrowwSpot1mFetchDegraded {
+            consecutive_failed_minutes: 3,
+            minute_ist: "10:42 AM".to_string(),
+        };
+        assert_eq!(event.topic(), "GrowwSpot1mFetchDegraded");
+        assert_eq!(event.severity(), Severity::High);
+        let msg = event.to_message();
+        assert!(msg.contains("Groww"), "got: {msg}");
+        assert!(msg.contains("FAILING"), "got: {msg}");
+        assert!(msg.contains("3 minutes in a row"), "got: {msg}");
+        // IST 12-hour timestamp (Telegram commandment 9).
+        assert!(msg.contains("10:42 AM IST"), "got: {msg}");
+        assert!(msg.contains("What to do RIGHT NOW"), "got: {msg}");
+        // Honest scope line: the live WS pipelines are untouched.
+        assert!(msg.contains("NOT affected"), "got: {msg}");
+    }
+
+    #[test]
+    fn test_groww_spot_1m_fetch_recovered_is_info_positive_ping() {
+        let event = NotificationEvent::GrowwSpot1mFetchRecovered {
+            minute_ist: "10:45 AM".to_string(),
+            failed_minutes: 4,
+        };
+        assert_eq!(event.topic(), "GrowwSpot1mFetchRecovered");
+        assert_eq!(event.severity(), Severity::Info);
+        let msg = event.to_message();
+        assert!(msg.contains("Groww"), "got: {msg}");
         assert!(msg.contains("recovered"), "got: {msg}");
         assert!(msg.contains("10:45 AM IST"), "got: {msg}");
         assert!(msg.contains("4 failed"), "got: {msg}");
