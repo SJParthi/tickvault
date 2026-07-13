@@ -14,10 +14,17 @@
 //!
 //! Two passes per run:
 //! - `feed='dhan'` verifies **TODAY** (amend-frozen after the close seal);
-//! - `feed='groww'` verifies the **PREVIOUS trading day** (Groww has NO
-//!   close-time force-seal — its session tails seal at the IST-midnight
-//!   force-seal, so D-1 is fully stable and gets FULL coverage including
-//!   final buckets; a missing D-1 tail row is a genuine `missing_tf_row`).
+//! - `feed='groww'` verifies the **PREVIOUS trading day**. Groww has NO
+//!   close-time force-seal — its session-final buckets would only seal at
+//!   the IST-midnight force-seal, which NEVER RUNS on the prod schedule
+//!   (the box auto-stops at 16:30 IST and the bridge resumes from a
+//!   persisted NDJSON offset, so the finals are never rebuilt). Every
+//!   TF's FINAL session window is therefore STRUCTURALLY absent for
+//!   Groww: a missing final row takes the NON-PAGING `tail_unsealed`
+//!   carve-out (counter only — no audit row, no page); a PRESENT final
+//!   row is sealed data and is compared normally; non-final Groww
+//!   windows keep full paging classification. Dhan finals are covered
+//!   by the 15:30:05 close-time force-seal and are never carved out.
 //!
 //! The bucket grid is REIMPLEMENTED here independently (windows
 //! `[33_300 + k*S, min(+S, 55_800))` per trading day) and cross-pinned
@@ -44,7 +51,7 @@ use tracing::{error, info, warn};
 use tickvault_common::config::{ApplicationConfig, QuestDbConfig};
 use tickvault_common::constants::{MARKET_CLOSE_IST_NANOS, MARKET_OPEN_IST_NANOS};
 use tickvault_common::error_code::ErrorCode;
-use tickvault_common::segment::segment_code_to_str;
+use tickvault_common::segment::{segment_code_to_str, segment_str_to_code};
 use tickvault_common::trading_calendar::TradingCalendar;
 use tickvault_core::notification::{NotificationEvent, NotificationService};
 use tickvault_storage::tf_consistency_audit_persistence::{
@@ -65,6 +72,12 @@ pub const TF_VERIFY_RUN_BUDGET_SECS: u64 = 900;
 
 /// Per-request HTTP timeout against the local QuestDB `/exec` endpoint.
 const TF_VERIFY_HTTP_TIMEOUT_SECS: u64 = 15;
+
+/// Response-body byte cap on every `/exec` read — checked BEFORE the
+/// serde_json parse (stage `oversize`), so a hostile / runaway response
+/// can never be fed to the JSON parser. Sized well above any legitimate
+/// bounded query result (≤3,000 rows).
+pub const TF_VERIFY_MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 
 /// Explicit SQL `LIMIT` on the per-SID `candles_1m` day query. Sized above
 /// the theoretical max (375 rows/day) so a healthy day can never touch it;
@@ -419,8 +432,11 @@ pub fn diff_strict_fields(stored: &CandleRow, rec: &Recomputed) -> Vec<DiffField
 }
 
 /// Sorts + de-duplicates rows by `ts_nanos`, keeping the FIRST row per key
-/// (deterministic) and returning the duplicated keys — DEDUP should make
-/// duplicates impossible, so their presence is a paging finding. Pure.
+/// as returned (stable within one response — the stable sort preserves the
+/// server's arrival order among equal keys, so WHICH duplicate is "first"
+/// may differ across runs) and returning the duplicated keys — DEDUP
+/// should make duplicates impossible, so their presence is a paging
+/// finding. Pure.
 #[must_use]
 pub fn dedup_sorted_rows(mut rows: Vec<CandleRow>) -> (Vec<CandleRow>, Vec<i64>) {
     rows.sort_by_key(|r| r.ts_nanos);
@@ -460,17 +476,29 @@ pub struct TfCompareCounts {
     pub bucket_gaps: u64,
     pub soft_tick_count: u64,
     pub volume_overflows: u64,
+    /// Final-window stored rows ABSENT under the Groww tail carve-out
+    /// (structurally unsealed on the prod schedule) — counted, never a
+    /// finding, never a page.
+    pub tail_unsealed: u64,
 }
 
 /// Compare ONE instrument's stored rows of ONE higher TF against the
 /// recompute over its (sorted, de-duplicated) 1m rows. Pure — O(rows) with
 /// a single sweep over the grid.
+///
+/// `exempt_final_missing` is the Groww tail carve-out: when `true`, an
+/// ABSENT stored row on the grid's FINAL window counts `tail_unsealed`
+/// instead of a paging `missing_tf_row` (Groww finals never seal on the
+/// prod schedule — the 16:30 IST auto-stop precedes the midnight
+/// force-seal). A PRESENT final row is still compared normally, and
+/// non-final windows keep full classification. Dhan passes `false`.
 #[must_use]
 pub fn compare_tf(
     tf: TfIndex,
     rows_1m_sorted: &[CandleRow],
     stored_rows: &[CandleRow],
     day_start_ist_nanos: i64,
+    exempt_final_missing: bool,
 ) -> (Vec<FindingDraft>, TfCompareCounts) {
     let tf_secs = tf.seconds_per_bucket();
     let tf_label = tf.display_name();
@@ -508,7 +536,9 @@ pub fn compare_tf(
                 recomputed_volume: 0,
                 one_m_rows: 0,
             });
-            continue; // compare on the FIRST row (deterministic).
+            // Compare on the FIRST row seen (server-order-dependent
+            // across runs; stable within this one response).
+            continue;
         }
         stored_by_sod.insert(sod, *r);
     }
@@ -578,17 +608,25 @@ pub fn compare_tf(
                 }
             }
             (None, Some(rec)) => {
-                findings.push(FindingDraft {
-                    tf: tf_label,
-                    bucket_secs_of_day: start,
-                    category: FindingCategory::MissingTfRow,
-                    field: "n/a",
-                    stored_value: 0.0,
-                    recomputed_value: rec.close,
-                    stored_volume: 0,
-                    recomputed_volume: rec.volume,
-                    one_m_rows,
-                });
+                if exempt_final_missing && w.is_final {
+                    // H1 Groww tail carve-out: the final session bucket is
+                    // STRUCTURALLY absent (no close-time force-seal; the
+                    // 16:30 IST auto-stop precedes the midnight seal) —
+                    // counted, no audit row, no page.
+                    counts.tail_unsealed = counts.tail_unsealed.saturating_add(1);
+                } else {
+                    findings.push(FindingDraft {
+                        tf: tf_label,
+                        bucket_secs_of_day: start,
+                        category: FindingCategory::MissingTfRow,
+                        field: "n/a",
+                        stored_value: 0.0,
+                        recomputed_value: rec.close,
+                        stored_volume: 0,
+                        recomputed_volume: rec.volume,
+                        one_m_rows,
+                    });
+                }
             }
             (Some(s), None) => {
                 findings.push(FindingDraft {
@@ -666,8 +704,11 @@ pub fn select_tf_union_sql(
             )
         })
         .collect();
+    // M4: wrap the UNION in a subquery so the LIMIT binds to the WHOLE
+    // union (the discovery-builder shape) — a bare LIMIT after the last
+    // UNION ALL arm binds unreliably on QuestDB.
     format!(
-        "{} LIMIT {TF_VERIFY_TF_UNION_ROW_LIMIT}",
+        "SELECT * FROM ({}) LIMIT {TF_VERIFY_TF_UNION_ROW_LIMIT}",
         arms.join(" UNION ALL ")
     )
 }
@@ -764,14 +805,18 @@ pub fn parse_tf_union_dataset(
 ) -> Result<(Vec<(TfIndex, CandleRow)>, bool), String> {
     let rows = json_dataset(body)?;
     let truncated = rows.len() >= limit;
+    // PERF: the label→TfIndex lookup table is hoisted ABOVE the row loop —
+    // a fresh tf_verify_targets() Vec per ROW allocated quadratically.
+    let targets = tf_verify_targets();
     let mut out = Vec::with_capacity(rows.len());
     for row in &rows {
         let Some(cols) = row.as_array() else { continue };
         let Some(label) = cols.first().and_then(|c| c.as_str()) else {
             continue;
         };
-        let Some(tf) = tf_verify_targets()
-            .into_iter()
+        let Some(tf) = targets
+            .iter()
+            .copied()
             .find(|tf| tf.display_name() == label)
         else {
             continue;
@@ -899,6 +944,9 @@ pub struct PassStats {
     pub duplicates: u64,
     pub bucket_gaps: u64,
     pub soft_tick_count: u64,
+    /// Groww final-window carve-out count (structurally unsealed on the
+    /// prod schedule) — a counter, never a finding, never a page.
+    pub tail_unsealed: u64,
     pub query_failures: u64,
     pub rows_seen: bool,
     pub degraded: bool,
@@ -929,6 +977,9 @@ pub struct TfConsistencySummaryData {
     pub no_coverage: u64,
     pub off_grid: u64,
     pub duplicates: u64,
+    /// Groww end-of-day buckets absent BY DESIGN (never sealed on the prod
+    /// schedule) — not verified, not paged; named in the Telegram summary.
+    pub tail_unsealed: u64,
     pub degraded: bool,
     pub truncated: bool,
     pub status_label: String,
@@ -1015,6 +1066,71 @@ pub fn always_on_string_set(set: &HashSet<(u64, u8)>) -> HashSet<(i64, String)> 
         .collect()
 }
 
+/// H2 — state-independent always-on detection. `true` when ANY parsed 1m
+/// baseline row for the target day sits outside the `[09:15:00, 15:30:00)`
+/// IST session window. Only always-on instruments (GIFT Nifty) can carry
+/// out-of-session 1m rows — the aggregator's session gate blocks everyone
+/// else — so this identifies always-on membership from the DATA itself,
+/// even when the process-global `always_on::current()` set is empty (the
+/// FAST crash-recovery boot arm never initializes it). Applied BEFORE any
+/// classification (including `off_grid_ts`). Pure.
+#[must_use]
+pub fn has_out_of_session_1m_row(rows_1m: &[CandleRow], day_start_ist_nanos: i64) -> bool {
+    rows_1m.iter().any(|r| {
+        let sod = secs_of_day_from_nanos(r.ts_nanos, day_start_ist_nanos);
+        sod < i64::from(SESSION_OPEN_SECS_OF_DAY_IST)
+            || sod >= i64::from(SESSION_CLOSE_SECS_OF_DAY_IST)
+    })
+}
+
+/// L8 — second-order SQL-injection defense. A discovered `segment` string
+/// comes back from the database and is re-interpolated into the follow-up
+/// per-SID queries, so it MUST be one of the exact literals
+/// `segment_code_to_str` can produce (the 8 known segment strings; the
+/// `"UNKNOWN"` fallback arm is deliberately NOT allowlisted).
+/// `segment_str_to_code` IS that exact allowlist — a poisoned segment
+/// (e.g. `x' OR '1'='1`) is refused and never reaches a query. Pure.
+#[must_use]
+pub fn is_allowlisted_segment(segment: &str) -> bool {
+    segment_str_to_code(segment).is_some()
+}
+
+/// SEC — the `/exec` response-body cap classify arm: `true` when the body
+/// exceeds [`TF_VERIFY_MAX_RESPONSE_BYTES`], in which case the caller
+/// refuses it (stage `oversize`) BEFORE any JSON parse. Pure.
+#[must_use]
+pub fn response_exceeds_cap(body_len: usize) -> bool {
+    body_len > TF_VERIFY_MAX_RESPONSE_BYTES
+}
+
+/// L7(a) — pure refusal decision for a FORCED run
+/// (`TICKVAULT_TF_VERIFY_NOW` WITHOUT `TICKVAULT_TF_VERIFY_DATE`).
+/// Refused on a non-trading day (nothing to verify — the scoreboard
+/// round-5 mechanic) AND on a trading day BEFORE the 15:40 IST trigger
+/// (today's candles are still being sealed — verifying them would page
+/// false findings). `NOW` + `DATE` for a past trading day is validated
+/// separately and is never refused here. `None` = run proceeds. Pure.
+#[must_use]
+pub fn forced_run_refusal(
+    has_date_override: bool,
+    is_trading_day: bool,
+    now_secs_of_day_ist: u32,
+) -> Option<&'static str> {
+    if has_date_override {
+        return None;
+    }
+    if !is_trading_day {
+        return Some("non-trading day — nothing sealed to verify");
+    }
+    if now_secs_of_day_ist < TF_VERIFY_TRIGGER_SECS_OF_DAY_IST {
+        return Some(
+            "before the 3:40 PM IST trigger on a trading day — today's \
+             candles are still unsealed",
+        );
+    }
+    None
+}
+
 // ---------------------------------------------------------------------------
 // The orchestrator (async — live QuestDB deps; pure helpers tested above)
 // ---------------------------------------------------------------------------
@@ -1050,9 +1166,21 @@ async fn http_get_text(
     if !resp.status().is_success() {
         return Err((format!("http {}", resp.status()), "query_failed"));
     }
-    resp.text()
+    let body = resp
+        .text()
         .await
-        .map_err(|e| (format!("read: {e}"), "query_failed"))
+        .map_err(|e| (format!("read: {e}"), "query_failed"))?;
+    // SEC: refuse an oversize body BEFORE the serde_json parse.
+    if response_exceeds_cap(body.len()) {
+        return Err((
+            format!(
+                "response body {} bytes exceeds the {TF_VERIFY_MAX_RESPONSE_BYTES}-byte cap",
+                body.len()
+            ),
+            "oversize",
+        ));
+    }
+    Ok(body)
 }
 
 fn count_query_failure(stats: &mut PassStats, stage: &'static str) {
@@ -1098,10 +1226,13 @@ async fn run_tf_pass(p: PassParams<'_>, state: &mut RunState) -> PassStats {
             }
         },
         Err((reason, stage)) => {
-            let stage = if stage == "questdb_unreachable" {
-                "questdb_unreachable"
-            } else {
+            // Transport-class stages (questdb_unreachable / oversize) keep
+            // their identity; generic HTTP/read failures fold into the
+            // discovery stage.
+            let stage = if stage == "query_failed" {
                 "discovery"
+            } else {
+                stage
             };
             count_query_failure(&mut stats, stage);
             warn!(feed = p.feed, %reason, "tf_consistency: discovery query failed");
@@ -1115,13 +1246,18 @@ async fn run_tf_pass(p: PassParams<'_>, state: &mut RunState) -> PassStats {
             degraded = stats.degraded,
             "tf_consistency: no instruments discovered for this feed/day"
         );
-        emit_pass_signals(p.feed, &stats);
+        emit_pass_degrade_signal(p.feed, &stats);
         return stats;
     }
     stats.rows_seen = true;
 
+    // H1: the Groww pass carves out ABSENT final-window rows (structurally
+    // unsealed on the prod schedule); Dhan finals are close-time-sealed.
+    let exempt_final_missing = p.feed == "groww";
+
     // ── Per-instrument sweep ──
     let mut pass_samples: Vec<String> = Vec::new();
+    let mut bad_segments: u64 = 0;
     for (idx, (sid, segment)) in instruments.iter().enumerate() {
         // Wall-clock budget between SIDs: remaining SIDs read-degraded.
         // The `break` right after guarantees exactly ONE coalesced emission.
@@ -1146,6 +1282,16 @@ async fn run_tf_pass(p: PassParams<'_>, state: &mut RunState) -> PassStats {
                 TF_VERIFY_POLITENESS_SLEEP_MS,
             ))
             .await;
+        }
+        // L8: the discovered segment string is re-interpolated into the
+        // follow-up per-SID SQL — refuse anything outside the exact
+        // known-segment allowlist BEFORE building any query (second-order
+        // injection defense). Counted per instrument; ONE coalesced
+        // TF-VERIFY-02 error! per pass after the sweep.
+        if !is_allowlisted_segment(segment) {
+            bad_segments = bad_segments.saturating_add(1);
+            count_query_failure(&mut stats, "bad_segment");
+            continue;
         }
         if p.always_on.contains(&(*sid, segment.clone())) {
             metrics::counter!("tv_tf_verify_excluded_total", "reason" => "always_on").increment(1);
@@ -1174,6 +1320,21 @@ async fn run_tf_pass(p: PassParams<'_>, state: &mut RunState) -> PassStats {
                 continue;
             }
         };
+
+        // H2: state-independent always-on exclusion. Only always-on
+        // instruments (GIFT Nifty) can carry out-of-session 1m rows (the
+        // aggregator session gate blocks everyone else), so a single 1m
+        // row outside [09:15, 15:30) IST marks the instrument always-on
+        // even when the process-global set is empty (the FAST
+        // crash-recovery boot arm never initializes it). Applied BEFORE
+        // any classification, including off_grid.
+        if has_out_of_session_1m_row(&rows_1m, day_start_nanos) {
+            metrics::counter!("tv_tf_verify_excluded_total", "reason" => "always_on").increment(1);
+            // Mirror the set-based exclusion above: an excluded instrument
+            // is not counted as examined.
+            stats.instruments = stats.instruments.saturating_sub(1);
+            continue;
+        }
 
         // Query B — the 19-way higher-TF union.
         let sql_tf = select_tf_union_sql(p.feed, *sid, segment, day_start_nanos);
@@ -1224,13 +1385,20 @@ async fn run_tf_pass(p: PassParams<'_>, state: &mut RunState) -> PassStats {
             if stored.is_empty() && rows_1m_sorted.is_empty() {
                 continue;
             }
-            let (tf_drafts, counts) = compare_tf(tf, &rows_1m_sorted, &stored, day_start_nanos);
+            let (tf_drafts, counts) = compare_tf(
+                tf,
+                &rows_1m_sorted,
+                &stored,
+                day_start_nanos,
+                exempt_final_missing,
+            );
             drafts.extend(tf_drafts);
             stats.buckets_compared = stats
                 .buckets_compared
                 .saturating_add(counts.buckets_compared);
             stats.bucket_gaps = stats.bucket_gaps.saturating_add(counts.bucket_gaps);
             stats.soft_tick_count = stats.soft_tick_count.saturating_add(counts.soft_tick_count);
+            stats.tail_unsealed = stats.tail_unsealed.saturating_add(counts.tail_unsealed);
             if counts.volume_overflows > 0 {
                 // Corrupt data — Σ(volume) overflowed i64. Degrades the run
                 // under the query_failed stage (the data was unusable).
@@ -1240,8 +1408,6 @@ async fn run_tf_pass(p: PassParams<'_>, state: &mut RunState) -> PassStats {
                     .increment(counts.volume_overflows);
             }
         }
-        metrics::counter!("tv_tf_verify_buckets_compared_total").increment(stats.buckets_compared);
-        metrics::counter!("tv_tf_verify_bucket_gap_total").increment(stats.bucket_gaps);
 
         // Fold the drafts into audit rows + counters + samples.
         for d in &drafts {
@@ -1299,9 +1465,35 @@ async fn run_tf_pass(p: PassParams<'_>, state: &mut RunState) -> PassStats {
         }
     }
 
+    // M3: the compared/gap/tail counters are emitted ONCE per pass — the
+    // stats fields are CUMULATIVE across instruments, so an in-loop
+    // emission would overcount quadratically.
+    metrics::counter!("tv_tf_verify_buckets_compared_total").increment(stats.buckets_compared);
+    metrics::counter!("tv_tf_verify_bucket_gap_total").increment(stats.bucket_gaps);
+    // H1: Groww final windows absent by design (never sealed on the prod
+    // schedule) — visible, never silent, never a page.
+    metrics::counter!("tv_tf_verify_tail_unsealed_total").increment(stats.tail_unsealed);
+
     // Soft tick_count divergence is a counter, never a page.
     metrics::counter!("tv_tf_verify_soft_divergence_total", "field" => "tick_count")
         .increment(stats.soft_tick_count);
+
+    // L8: ONE coalesced bad-segment error per pass (never per instrument).
+    // The poisoned value itself is deliberately NOT logged — it is
+    // attacker-controlled text; the audit trail is the count + the stage
+    // counter.
+    if bad_segments > 0 {
+        error!(
+            code = ErrorCode::TfVerify02RunDegraded.code_str(),
+            stage = "bad_segment",
+            feed = p.feed,
+            date = %stats.date_label,
+            count = bad_segments,
+            "TF-VERIFY-02: discovered segment value(s) outside the \
+             known-segment allowlist — those instruments were skipped and \
+             their segment strings never reached a follow-up query"
+        );
+    }
 
     // Coalesced TF-VERIFY-01 — ONE per (feed, date) pass with ≥1 paging
     // finding; the samples name up to 10 offenders (never per-row spam).
@@ -1322,13 +1514,16 @@ async fn run_tf_pass(p: PassParams<'_>, state: &mut RunState) -> PassStats {
              tf_consistency_audit rows"
         );
     }
-    emit_pass_signals(p.feed, &stats);
+    emit_pass_degrade_signal(p.feed, &stats);
     stats
 }
 
 /// Coalesced per-pass TF-VERIFY-02 degrade signal (edge — one line per
-/// pass, not per SID) + the per-pass runs counter.
-fn emit_pass_signals(feed: &'static str, stats: &PassStats) {
+/// pass, not per SID). L5: the runs-verdict counters are deliberately NOT
+/// emitted here — they are emitted once in `run_tf_consistency` AFTER the
+/// final audit flush, so a flush failure can never record a pass verdict
+/// for a run that reports degraded.
+fn emit_pass_degrade_signal(feed: &'static str, stats: &PassStats) {
     if stats.degraded {
         error!(
             code = ErrorCode::TfVerify02RunDegraded.code_str(),
@@ -1341,13 +1536,6 @@ fn emit_pass_signals(feed: &'static str, stats: &PassStats) {
              tv_tf_verify_query_failures_total)"
         );
     }
-    let status = classify_run_status(
-        stats.buckets_compared,
-        stats.paging_findings(),
-        stats.degraded,
-        stats.rows_seen,
-    );
-    metrics::counter!("tv_tf_verify_runs_total", "status" => status.as_str()).increment(1);
 }
 
 /// Run the full daily verification: the Dhan pass for `dhan_date` (today)
@@ -1398,6 +1586,7 @@ pub async fn run_tf_consistency(
                 no_coverage: 0,
                 off_grid: 0,
                 duplicates: 0,
+                tail_unsealed: 0,
                 degraded: true,
                 truncated: false,
                 status_label: RunStatus::Blind.as_str().to_string(),
@@ -1453,8 +1642,9 @@ pub async fn run_tf_consistency(
              window — the Groww pass is skipped (degraded, never a guessed date)"
         );
         metrics::counter!("tv_tf_verify_query_failures_total", "stage" => "discovery").increment(1);
-        metrics::counter!("tv_tf_verify_runs_total", "status" => RunStatus::Blind.as_str())
-            .increment(1);
+        // L5: no runs-verdict counter here — the flush-adjusted final
+        // classification below emits it (this synthetic degraded stats
+        // block classifies Blind there).
         PassStats {
             date_label: groww_label.clone(),
             degraded: true,
@@ -1493,6 +1683,12 @@ pub async fn run_tf_consistency(
     );
     let combined = combine_statuses(dhan_status, groww_status);
 
+    // L5: the runs-verdict counters are emitted HERE — after the final
+    // flush fed into the per-pass classification above — so a failed
+    // flush can never record status="pass" while the run reads degraded.
+    metrics::counter!("tv_tf_verify_runs_total", "status" => dhan_status.as_str()).increment(1);
+    metrics::counter!("tv_tf_verify_runs_total", "status" => groww_status.as_str()).increment(1);
+
     let summary = TfConsistencySummaryData {
         dhan_date_ist: dhan_stats.date_label.clone(),
         groww_date_ist: groww_stats.date_label.clone(),
@@ -1513,6 +1709,9 @@ pub async fn run_tf_consistency(
             .saturating_add(groww_stats.no_coverage),
         off_grid: dhan_stats.off_grid.saturating_add(groww_stats.off_grid),
         duplicates: dhan_stats.duplicates.saturating_add(groww_stats.duplicates),
+        tail_unsealed: dhan_stats
+            .tail_unsealed
+            .saturating_add(groww_stats.tail_unsealed),
         degraded: dhan_stats.degraded || groww_stats.degraded || flush_degraded,
         truncated: state.truncated,
         status_label: combined.as_str().to_string(),
@@ -1529,6 +1728,7 @@ pub async fn run_tf_consistency(
         no_coverage = summary.no_coverage,
         off_grid = summary.off_grid,
         duplicates = summary.duplicates,
+        tail_unsealed = summary.tail_unsealed,
         "tf_consistency: daily timeframe-consistency verification complete"
     );
     summary
@@ -1603,6 +1803,15 @@ pub fn spawn_tf_consistency_tasks(
                     Err(_) => None,
                 }
             } else {
+                // L7(b): DATE without NOW does nothing — say so ONCE
+                // instead of silently ignoring the operator's override.
+                if std::env::var("TICKVAULT_TF_VERIFY_DATE").is_ok() {
+                    warn!(
+                        "tf_consistency: TICKVAULT_TF_VERIFY_DATE is ignored \
+                         without TICKVAULT_TF_VERIFY_NOW=1 — set both to \
+                         backfill a past trading day"
+                    );
+                }
                 None
             };
             let is_trading_day = calendar.is_trading_day(today_ist);
@@ -1612,14 +1821,20 @@ pub fn spawn_tf_consistency_tasks(
                     return Ok(None);
                 }
                 TfVerifyStart::RunNow => {
-                    // The scoreboard round-5 mechanic: NOW without a DATE on
-                    // a non-trading day would verify an empty weekend "today"
-                    // — refused with an info log, never a page.
-                    if date_override.is_none() && !is_trading_day {
+                    // L7(a) + the scoreboard round-5 mechanic: NOW without a
+                    // DATE is refused on a non-trading day (an empty weekend
+                    // "today") AND on a trading day BEFORE the 15:40 trigger
+                    // (today's candles are still unsealed — verifying them
+                    // would page false findings). Info log, never a page;
+                    // NOW + DATE for a past trading day stays allowed.
+                    if let Some(reason) =
+                        forced_run_refusal(date_override.is_some(), is_trading_day, now_secs_of_day)
+                    {
                         info!(
-                            "tf_consistency: TICKVAULT_TF_VERIFY_NOW without a date on a \
-                             non-trading day — refusing (pass TICKVAULT_TF_VERIFY_DATE=\
-                             YYYY-MM-DD for the trading day you meant)"
+                            %reason,
+                            "tf_consistency: TICKVAULT_TF_VERIFY_NOW without a date \
+                             refused (pass TICKVAULT_TF_VERIFY_DATE=YYYY-MM-DD for \
+                             the trading day you meant)"
                         );
                         return Ok(None);
                     }
@@ -1662,6 +1877,7 @@ pub fn spawn_tf_consistency_tasks(
                     no_coverage: s.no_coverage,
                     off_grid: s.off_grid,
                     duplicates: s.duplicates,
+                    tail_unsealed: s.tail_unsealed,
                     degraded: s.degraded,
                     truncated: s.truncated,
                     status_label: s.status_label,
@@ -2140,7 +2356,9 @@ mod tests {
         let c = row(33_360, 2.0, 2.0, 2.0, 2.0, 2, 2);
         let (rows, dups) = dedup_sorted_rows(vec![c, a, b]);
         assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0].close, 1.0, "FIRST row wins deterministically");
+        // Which duplicate is "first" is server-order-dependent across
+        // runs; within THIS response the first-seen row wins (stable sort).
+        assert_eq!(rows[0].close, 1.0, "first-seen row wins in this response");
         assert_eq!(dups, vec![a.ts_nanos]);
         // No duplicates → empty dup list.
         let (rows, dups) = dedup_sorted_rows(vec![c]);
@@ -2163,7 +2381,7 @@ mod tests {
             row(33_420, 101.5, 101.75, 98.0, 99.0, 30, 5),
         ];
         let stored = vec![row(33_300, 100.0, 102.0, 98.0, 99.0, 60, 12)];
-        let (findings, counts) = compare_tf(TfIndex::M5, &ones, &stored, DAY_START);
+        let (findings, counts) = compare_tf(TfIndex::M5, &ones, &stored, DAY_START, false);
         assert!(findings.is_empty(), "{findings:?}");
         assert_eq!(counts.buckets_compared, 1);
         assert_eq!(counts.bucket_gaps, 1, "3 of 5 minutes present");
@@ -2175,7 +2393,7 @@ mod tests {
         let ones = vec![row(33_300, 100.0, 101.0, 99.0, 100.5, 10, 3)];
         // Stored high + volume wrong.
         let stored = vec![row(33_300, 100.0, 105.0, 99.0, 100.5, 11, 3)];
-        let (findings, counts) = compare_tf(TfIndex::M5, &ones, &stored, DAY_START);
+        let (findings, counts) = compare_tf(TfIndex::M5, &ones, &stored, DAY_START, false);
         assert_eq!(counts.buckets_compared, 1);
         let cats: Vec<_> = findings.iter().map(|f| (f.category, f.field)).collect();
         assert!(cats.contains(&(FindingCategory::Mismatch, "high")));
@@ -2193,7 +2411,7 @@ mod tests {
     #[test]
     fn test_compare_tf_missing_tf_row_pages_when_1m_present() {
         let ones = vec![row(33_300, 100.0, 101.0, 99.0, 100.5, 10, 3)];
-        let (findings, counts) = compare_tf(TfIndex::M5, &ones, &[], DAY_START);
+        let (findings, counts) = compare_tf(TfIndex::M5, &ones, &[], DAY_START, false);
         assert_eq!(counts.buckets_compared, 0);
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].category, FindingCategory::MissingTfRow);
@@ -2204,7 +2422,7 @@ mod tests {
     #[test]
     fn test_compare_tf_no_1m_coverage_when_stored_over_nothing() {
         let stored = vec![row(33_300, 100.0, 101.0, 99.0, 100.5, 10, 3)];
-        let (findings, counts) = compare_tf(TfIndex::M5, &[], &stored, DAY_START);
+        let (findings, counts) = compare_tf(TfIndex::M5, &[], &stored, DAY_START, false);
         assert_eq!(counts.buckets_compared, 0);
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].category, FindingCategory::No1mCoverage);
@@ -2214,7 +2432,7 @@ mod tests {
     fn test_compare_tf_off_grid_stored_ts_detected() {
         // A 09:16:00 "5m" row is off the 09:15-anchored grid.
         let stored = vec![row(33_360, 100.0, 101.0, 99.0, 100.5, 10, 3)];
-        let (findings, _) = compare_tf(TfIndex::M5, &[], &stored, DAY_START);
+        let (findings, _) = compare_tf(TfIndex::M5, &[], &stored, DAY_START, false);
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].category, FindingCategory::OffGridTs);
         assert_eq!(findings[0].bucket_secs_of_day, 33_360);
@@ -2226,7 +2444,7 @@ mod tests {
         let first = row(33_300, 100.0, 101.0, 99.0, 100.5, 10, 3);
         let mut second = first;
         second.close = 999.0;
-        let (findings, counts) = compare_tf(TfIndex::M5, &ones, &[first, second], DAY_START);
+        let (findings, counts) = compare_tf(TfIndex::M5, &ones, &[first, second], DAY_START, false);
         // The duplicate is flagged; the compare ran on the FIRST row and
         // matched, so no mismatch rows.
         assert_eq!(counts.buckets_compared, 1);
@@ -2245,7 +2463,7 @@ mod tests {
             row(33_300, 1.0, 1.0, 1.0, 1.0, 1, 1),
             row(33_600, 2.0, 2.0, 2.0, 2.0, 2, 1),
         ];
-        let (findings, counts) = compare_tf(TfIndex::M5, &ones, &stored, DAY_START);
+        let (findings, counts) = compare_tf(TfIndex::M5, &ones, &stored, DAY_START, false);
         assert!(findings.is_empty(), "{findings:?}");
         assert_eq!(counts.buckets_compared, 2);
     }
@@ -2259,7 +2477,7 @@ mod tests {
             row(55_740, 10.5, 12.0, 10.0, 11.0, 5, 2), // 15:29
         ];
         let stored = vec![row(54_900, 10.0, 12.0, 9.0, 11.0, 10, 4)];
-        let (findings, counts) = compare_tf(TfIndex::H1, &ones, &stored, DAY_START);
+        let (findings, counts) = compare_tf(TfIndex::H1, &ones, &stored, DAY_START, false);
         assert!(findings.is_empty(), "{findings:?}");
         assert_eq!(counts.buckets_compared, 1);
     }
@@ -2268,7 +2486,7 @@ mod tests {
     fn test_compare_tf_tick_count_divergence_is_soft() {
         let ones = vec![row(33_300, 1.0, 1.0, 1.0, 1.0, 1, 5)];
         let stored = vec![row(33_300, 1.0, 1.0, 1.0, 1.0, 1, 6)];
-        let (findings, counts) = compare_tf(TfIndex::M5, &ones, &stored, DAY_START);
+        let (findings, counts) = compare_tf(TfIndex::M5, &ones, &stored, DAY_START, false);
         assert!(findings.is_empty(), "soft signal must not page");
         assert_eq!(counts.soft_tick_count, 1);
     }
@@ -2280,7 +2498,7 @@ mod tests {
             row(33_360, 1.0, 1.0, 1.0, 1.0, 1, 1),
         ];
         let stored = vec![row(33_300, 1.0, 1.0, 1.0, 1.0, 1, 1)];
-        let (findings, counts) = compare_tf(TfIndex::M5, &ones, &stored, DAY_START);
+        let (findings, counts) = compare_tf(TfIndex::M5, &ones, &stored, DAY_START, false);
         assert_eq!(counts.volume_overflows, 1);
         assert_eq!(counts.buckets_compared, 0, "corrupt window not compared");
         assert!(findings.is_empty());
@@ -2337,9 +2555,16 @@ mod tests {
         );
         assert!(!sql.contains("candles_1d"), "D1 excluded by design: {sql}");
         assert!(sql.contains("feed = 'groww'"), "{sql}");
+        // M4: the LIMIT must bind to the WHOLE union via the wrapped
+        // subquery shape (the discovery-builder precedent) — a bare LIMIT
+        // after the last UNION ALL arm binds unreliably on QuestDB.
         assert!(
-            sql.ends_with("LIMIT 2000"),
-            "explicit LIMIT tripwire: {sql}"
+            sql.starts_with("SELECT * FROM ("),
+            "union must be wrapped so LIMIT binds to the whole union: {sql}"
+        );
+        assert!(
+            sql.ends_with(") LIMIT 2000"),
+            "explicit whole-union LIMIT tripwire: {sql}"
         );
     }
 
@@ -2586,5 +2811,275 @@ mod tests {
         assert!(TF_VERIFY_DISCOVERY_ROW_LIMIT > 1_200);
         assert_eq!(TF_VERIFY_MAX_AUDIT_ROWS_PER_RUN, 10_000);
         assert_eq!(TF_VERIFY_PREV_DAY_LOOKBACK_DAYS, 7);
+        assert_eq!(TF_VERIFY_MAX_RESPONSE_BYTES, 8 * 1024 * 1024);
+    }
+
+    // -------------------------------------------------------------------
+    // H1 — Groww final-window tail carve-out
+    // -------------------------------------------------------------------
+
+    /// H1: with the Groww carve-out ON, an ABSENT stored row on the FINAL
+    /// window counts `tail_unsealed` (no finding, no page) — the final
+    /// buckets never seal on the prod schedule.
+    #[test]
+    fn test_compare_tf_groww_final_missing_is_tail_unsealed_not_paging() {
+        // M5 final window is [15:25, 15:30) — start 55_500.
+        let ones = vec![row(55_500, 100.0, 101.0, 99.0, 100.5, 10, 3)];
+        let (findings, counts) = compare_tf(TfIndex::M5, &ones, &[], DAY_START, true);
+        assert!(
+            findings.is_empty(),
+            "groww final-window absence must not page: {findings:?}"
+        );
+        assert_eq!(counts.tail_unsealed, 1, "counted, never silent");
+        assert_eq!(counts.buckets_compared, 0);
+    }
+
+    /// H1: the carve-out is FINAL-window-only — a missing NON-final Groww
+    /// row is still the genuine dead-seal-leg `missing_tf_row` page.
+    #[test]
+    fn test_compare_tf_groww_nonfinal_missing_still_pages() {
+        let ones = vec![row(33_300, 100.0, 101.0, 99.0, 100.5, 10, 3)];
+        let (findings, counts) = compare_tf(TfIndex::M5, &ones, &[], DAY_START, true);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].category, FindingCategory::MissingTfRow);
+        assert_eq!(counts.tail_unsealed, 0);
+    }
+
+    /// H1: Dhan (carve-out OFF) keeps paging a missing FINAL row — the
+    /// 15:30:05 close-time force-seal covers Dhan finals, so absence is a
+    /// real lost seal.
+    #[test]
+    fn test_compare_tf_dhan_final_missing_still_pages() {
+        let ones = vec![row(55_500, 100.0, 101.0, 99.0, 100.5, 10, 3)];
+        let (findings, counts) = compare_tf(TfIndex::M5, &ones, &[], DAY_START, false);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].category, FindingCategory::MissingTfRow);
+        assert_eq!(findings[0].bucket_secs_of_day, 55_500);
+        assert_eq!(counts.tail_unsealed, 0);
+    }
+
+    /// H1: a PRESENT Groww final row is sealed data — it is compared
+    /// normally and a mismatch still pages even with the carve-out ON.
+    #[test]
+    fn test_compare_tf_groww_final_present_mismatch_still_pages() {
+        let ones = vec![row(55_500, 100.0, 101.0, 99.0, 100.5, 10, 3)];
+        // Stored final row exists but its high disagrees.
+        let stored = vec![row(55_500, 100.0, 105.0, 99.0, 100.5, 10, 3)];
+        let (findings, counts) = compare_tf(TfIndex::M5, &ones, &stored, DAY_START, true);
+        assert_eq!(counts.buckets_compared, 1);
+        assert_eq!(counts.tail_unsealed, 0);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].category, FindingCategory::Mismatch);
+        assert_eq!(findings[0].field, "high");
+    }
+
+    // -------------------------------------------------------------------
+    // H2 — state-independent always-on exclusion
+    // -------------------------------------------------------------------
+
+    /// H2: an out-of-session 1m row marks the instrument always-on from
+    /// the DATA alone — no registry set involved, so the exclusion holds
+    /// even on FAST-arm boots where `always_on::current()` is empty.
+    #[test]
+    fn test_has_out_of_session_1m_row_detects_always_on_without_registry() {
+        // 03:00 IST — the GIFT-Nifty overnight signature.
+        let overnight = vec![row(3 * 3600, 1.0, 1.0, 1.0, 1.0, 0, 1)];
+        assert!(has_out_of_session_1m_row(&overnight, DAY_START));
+        // Boundary: exactly 15:30:00 is OUT of session.
+        let at_close = vec![row(55_800, 1.0, 1.0, 1.0, 1.0, 0, 1)];
+        assert!(has_out_of_session_1m_row(&at_close, DAY_START));
+        // Boundary: 09:14:59 is OUT; 09:15:00 and 15:29:00 are IN.
+        let pre_open = vec![row(33_299, 1.0, 1.0, 1.0, 1.0, 0, 1)];
+        assert!(has_out_of_session_1m_row(&pre_open, DAY_START));
+        let in_session = vec![
+            row(33_300, 1.0, 1.0, 1.0, 1.0, 0, 1),
+            row(55_740, 1.0, 1.0, 1.0, 1.0, 0, 1),
+        ];
+        assert!(!has_out_of_session_1m_row(&in_session, DAY_START));
+        assert!(!has_out_of_session_1m_row(&[], DAY_START));
+    }
+
+    /// H2: a NORMAL instrument (all 1m rows in-session) is NOT excluded —
+    /// an out-of-grid STORED TF row still pages off_grid.
+    #[test]
+    fn test_in_session_1m_with_off_grid_stored_still_pages_off_grid() {
+        let ones = vec![row(33_300, 100.0, 101.0, 99.0, 100.5, 10, 3)];
+        assert!(
+            !has_out_of_session_1m_row(&ones, DAY_START),
+            "in-session 1m rows must not trip the always-on exclusion"
+        );
+        // A 09:16:00 "5m" stored row is off the 09:15-anchored grid —
+        // still a paging finding (the exclusion never swallows off_grid
+        // for normal instruments), carve-out flag irrelevant.
+        let stored = vec![row(33_360, 100.0, 101.0, 99.0, 100.5, 10, 3)];
+        let (findings, _) = compare_tf(TfIndex::M5, &ones, &stored, DAY_START, true);
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.category == FindingCategory::OffGridTs),
+            "{findings:?}"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // L8 — segment allowlist (second-order injection defense)
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_is_allowlisted_segment_exact_allowlist_and_poison() {
+        // Exactly the 8 strings segment_code_to_str can produce.
+        for seg in [
+            "IDX_I",
+            "NSE_EQ",
+            "NSE_FNO",
+            "NSE_CURRENCY",
+            "BSE_EQ",
+            "MCX_COMM",
+            "BSE_CURRENCY",
+            "BSE_FNO",
+        ] {
+            assert!(is_allowlisted_segment(seg), "{seg} must be allowlisted");
+        }
+        // The unknown-arm fallback string is deliberately NOT allowlisted.
+        assert!(!is_allowlisted_segment("UNKNOWN"));
+        // A poisoned DB value must be refused, never interpolated.
+        assert!(!is_allowlisted_segment("x' OR '1'='1"));
+        assert!(!is_allowlisted_segment("IDX_I'; DROP TABLE ticks; --"));
+        assert!(!is_allowlisted_segment(""));
+        assert!(!is_allowlisted_segment("nse_eq"), "case-sensitive");
+    }
+
+    // -------------------------------------------------------------------
+    // SEC — response body cap classify arm
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_response_exceeds_cap_boundary() {
+        assert!(!response_exceeds_cap(0));
+        assert!(!response_exceeds_cap(TF_VERIFY_MAX_RESPONSE_BYTES));
+        assert!(response_exceeds_cap(TF_VERIFY_MAX_RESPONSE_BYTES + 1));
+        assert!(response_exceeds_cap(usize::MAX));
+    }
+
+    // -------------------------------------------------------------------
+    // L7(a) — forced-run refusal decision
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_forced_run_refusal_variants() {
+        // NOW + DATE (past trading day, validated separately) → never
+        // refused here, at ANY time of day.
+        assert_eq!(forced_run_refusal(true, true, 10 * 3600), None);
+        assert_eq!(forced_run_refusal(true, false, 10 * 3600), None);
+        // NOW without DATE on a non-trading day → refused.
+        assert!(forced_run_refusal(false, false, 10 * 3600).is_some());
+        // NOW without DATE on a trading day BEFORE 15:40 → refused (the
+        // day's candles are still unsealed).
+        let before = forced_run_refusal(false, true, TF_VERIFY_TRIGGER_SECS_OF_DAY_IST - 1);
+        assert!(before.is_some_and(|r| r.contains("unsealed")), "{before:?}");
+        // NOW without DATE AT/AFTER the 15:40 trigger on a trading day →
+        // allowed (today is sealed).
+        assert_eq!(
+            forced_run_refusal(false, true, TF_VERIFY_TRIGGER_SECS_OF_DAY_IST),
+            None
+        );
+        assert_eq!(forced_run_refusal(false, true, 17 * 3600), None);
+    }
+
+    // -------------------------------------------------------------------
+    // Structural ratchets (M3 / L5 / H2 / L8 wiring — source-order scans
+    // over the PRODUCTION regions of this file; the extraction markers are
+    // first-occurrence anchors, which always land in production code
+    // because the tests sit at the end of the file)
+    // -------------------------------------------------------------------
+
+    const OWN_SRC: &str = include_str!("tf_consistency_boot.rs");
+
+    fn run_tf_pass_body() -> &'static str {
+        let start = OWN_SRC
+            .find("async fn run_tf_pass")
+            .expect("run_tf_pass must exist");
+        let end = OWN_SRC
+            .find("fn emit_pass_degrade_signal")
+            .expect("emit_pass_degrade_signal must exist");
+        assert!(start < end, "run_tf_pass must precede its degrade helper");
+        &OWN_SRC[start..end]
+    }
+
+    /// M3: the cumulative-stats counters are emitted ONCE per pass — never
+    /// inside the per-instrument loop (which double-counts quadratically).
+    #[test]
+    fn test_ratchet_pass_counters_emitted_once_outside_instrument_loop() {
+        let body = run_tf_pass_body();
+        let loop_start = body
+            .find("for (idx, (sid, segment)) in instruments.iter()")
+            .expect("per-instrument loop must exist");
+        let post_loop = body
+            .find("// M3:")
+            .expect("the M3 once-per-pass emission block must exist");
+        assert!(loop_start < post_loop);
+        let loop_region = &body[loop_start..post_loop];
+        for counter in [
+            "tv_tf_verify_buckets_compared_total",
+            "tv_tf_verify_bucket_gap_total",
+            "tv_tf_verify_tail_unsealed_total",
+        ] {
+            assert!(
+                !loop_region.contains(counter),
+                "{counter} must not be emitted inside the per-instrument loop"
+            );
+            assert_eq!(
+                body.matches(counter).count(),
+                1,
+                "{counter} must be emitted exactly once per pass"
+            );
+        }
+    }
+
+    /// L5: the runs-verdict counter is never emitted from the per-pass
+    /// path — only after the final flush feeds the classification.
+    #[test]
+    fn test_ratchet_runs_counter_emitted_after_final_flush() {
+        assert!(
+            !run_tf_pass_body().contains("tv_tf_verify_runs_total"),
+            "runs verdict must not be emitted per pass (pre-flush)"
+        );
+        let flush_at = OWN_SRC
+            .find("state.writer.flush()")
+            .expect("final flush must exist");
+        let runs_at = OWN_SRC
+            .find(r#""tv_tf_verify_runs_total", "status" => dhan_status"#)
+            .expect("post-flush runs emission must exist");
+        assert!(
+            flush_at < runs_at,
+            "the runs verdict counters must be emitted AFTER the final flush"
+        );
+    }
+
+    /// H2 + L8 wiring order inside the per-instrument sweep: the segment
+    /// allowlist gate precedes ANY query build, and the data-derived
+    /// always-on exclusion precedes Query B and all classification.
+    #[test]
+    fn test_ratchet_exclusion_gates_precede_queries_and_classification() {
+        let body = run_tf_pass_body();
+        let allowlist = body
+            .find("is_allowlisted_segment(segment)")
+            .expect("L8 allowlist gate must exist");
+        let q_a = body.find("select_1m_sql(").expect("Query A must exist");
+        let out_of_session = body
+            .find("has_out_of_session_1m_row(&rows_1m")
+            .expect("H2 data-derived exclusion must exist");
+        let q_b = body
+            .find("select_tf_union_sql(")
+            .expect("Query B must exist");
+        let classify = body
+            .find("dedup_sorted_rows(")
+            .expect("classification start must exist");
+        assert!(allowlist < q_a, "L8: allowlist before any interpolation");
+        assert!(out_of_session < q_b, "H2: exclusion before Query B");
+        assert!(
+            out_of_session < classify,
+            "H2: exclusion before ANY classification (incl. off_grid)"
+        );
     }
 }

@@ -471,12 +471,12 @@ pub enum NotificationEvent {
     /// Daily timeframe-consistency verifier (operator directive 2026-07-13:
     /// *"how will you guarantee that all our defined timeframes internally
     /// are correct"*): the ONE 3:40 PM IST summary covering BOTH passes —
-    /// Dhan (today) and Groww (previous trading day). Severity is
-    /// data-dependent: `Info` only when candles were compared, every paging
-    /// count is zero and the run was not degraded (or when there was
-    /// genuinely nothing to check — a feed-off `no_data` day); everything
-    /// else is `High`. A `buckets_compared == 0` run with data expected
-    /// must NEVER read as PASS (audit Rule 11 — the BLIND wording).
+    /// Dhan (today) and Groww (previous trading day). Severity AND wording
+    /// derive from `status_label` (the verifier's flush-adjusted verdict —
+    /// L6 fix, never re-derived from the counts, which can disagree on
+    /// edge days): `Info` only for `pass` / `no_data`; everything else is
+    /// `High`. A `buckets_compared == 0` run with data expected must NEVER
+    /// read as PASS (audit Rule 11 — the BLIND wording).
     TfConsistencySummary {
         /// The Dhan trading day verified, `YYYY-MM-DD` IST.
         dhan_date_ist: String,
@@ -496,6 +496,10 @@ pub enum NotificationEvent {
         off_grid: u64,
         /// Duplicate rows sharing one storage key.
         duplicates: u64,
+        /// Groww end-of-day buckets that are never sealed on the
+        /// production schedule (the system stops before midnight) — not
+        /// verified BY DESIGN, never a page (H1 carve-out).
+        tail_unsealed: u64,
         /// True when any query/flush/budget leg degraded — the run cannot
         /// vouch for the full universe.
         degraded: bool,
@@ -2082,24 +2086,33 @@ impl NotificationEvent {
                 no_coverage,
                 off_grid,
                 duplicates,
+                tail_unsealed,
                 degraded,
                 truncated,
                 status_label,
                 top_detail,
             } => {
-                let paging = mismatches
-                    .saturating_add(*missing_tf_rows)
-                    .saturating_add(*no_coverage)
-                    .saturating_add(*off_grid)
-                    .saturating_add(*duplicates);
-                let clean = paging == 0 && !*degraded && *buckets_compared > 0;
-                if clean {
+                // H1: name the Groww end-of-day buckets that are never
+                // sealed on the production schedule — honest coverage
+                // note, never a finding.
+                let tail_note = if *tail_unsealed > 0 {
+                    format!(
+                        "\n{tail_unsealed} Groww end-of-day buckets are not \
+                         sealed by design (the system stops before the \
+                         midnight seal) — not verified."
+                    )
+                } else {
+                    String::new()
+                };
+                // L6: wording derives from status_label — the verifier's
+                // flush-adjusted verdict — never re-derived from counts.
+                if status_label == "pass" {
                     format!(
                         "\u{2705} <b>Daily timeframe check @ 3:40 PM IST — PASS</b>\n\
                          Dhan day: {dhan_date_ist} | Groww day: {groww_date_ist}\n\
                          Instruments: {instruments} | Candles compared: {buckets_compared}\n\
                          Every 2-minute-to-4-hour candle matches its 1-minute \
-                         building blocks exactly."
+                         building blocks exactly.{tail_note}"
                     )
                 } else if status_label == "no_data" {
                     format!(
@@ -2150,7 +2163,7 @@ impl NotificationEvent {
                          Value differences: {mismatches} | Missing candles: {missing_tf_rows}\n\
                          Candles with no 1-minute data behind them: {no_coverage}\n\
                          Off-grid timestamps: {off_grid} | Duplicates: {duplicates}\
-                         {coverage_note}{truncated_note}{detail_block}\n\
+                         {tail_note}{coverage_note}{truncated_note}{detail_block}\n\
                          What to do RIGHT NOW:\n\
                          1. Review the worst offenders above — do they cluster \
                          on one timeframe or one time of day?\n\
@@ -3449,31 +3462,17 @@ impl NotificationEvent {
                 }
             }
             Self::CrossVerify1mAborted { .. } => Severity::High,
-            // Daily timeframe-consistency verifier (2026-07-13): Info ONLY
-            // when candles were actually compared, every paging count is
-            // zero and the run was not degraded — or when there was
-            // genuinely nothing to check (a feed-off `no_data` day, which
-            // must never page High every day of a disabled-feed month).
-            // buckets_compared == 0 with data expected is BLIND → High
-            // (audit Rule 11: an empty compare set never reads as pass).
-            Self::TfConsistencySummary {
-                buckets_compared,
-                mismatches,
-                missing_tf_rows,
-                no_coverage,
-                off_grid,
-                duplicates,
-                degraded,
-                status_label,
-                ..
-            } => {
-                let paging = mismatches
-                    .saturating_add(*missing_tf_rows)
-                    .saturating_add(*no_coverage)
-                    .saturating_add(*off_grid)
-                    .saturating_add(*duplicates);
-                if (paging == 0 && !*degraded && *buckets_compared > 0) || status_label == "no_data"
-                {
+            // Daily timeframe-consistency verifier (2026-07-13): severity
+            // derives from status_label itself — the verifier's
+            // flush-adjusted verdict (L6 fix: a count-derived re-check can
+            // contradict the label on edge days, e.g. blind-without-
+            // degrade). Info ONLY for a real `pass` or a feed-off
+            // `no_data` day (which must never page High every day of a
+            // disabled-feed month); everything else — mismatch, degraded,
+            // blind — is High (audit Rule 11: an empty compare set never
+            // reads as pass).
+            Self::TfConsistencySummary { status_label, .. } => {
+                if status_label == "pass" || status_label == "no_data" {
                     Severity::Info
                 } else {
                     Severity::High

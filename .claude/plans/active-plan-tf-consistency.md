@@ -95,10 +95,16 @@ the baseline minus `D1` which is excluded by design: Dhan drops D1 at the
 write boundary and Groww D1 is a partial-day midnight bucket) from its
 constituent `candles_1m` rows and compares exactly. Two passes per run:
 `feed='dhan'` verifies TODAY (stable after the close seal); `feed='groww'`
-verifies the PREVIOUS trading day (pure calendar walk-back ≤7 days — Groww
-has no close-time force-seal, its tails seal at IST midnight, so D-1 gets
-FULL coverage including final buckets and a missing D-1 tail row is a real
-`missing_tf_row` page). The bucket grid is REIMPLEMENTED independently
+verifies the PREVIOUS trading day (pure calendar walk-back ≤7 days). Groww
+has no close-time force-seal and the IST-midnight force-seal NEVER RUNS on
+the prod schedule (the box auto-stops at 16:30 IST; the bridge resumes
+from a persisted NDJSON offset so the finals are never rebuilt) — every
+Groww TF's FINAL session window is structurally absent, so an absent
+Groww final row takes the NON-PAGING `tail_unsealed` carve-out (counter
+`tv_tf_verify_tail_unsealed_total` + a Telegram note; no audit row, no
+page); a PRESENT final row is compared normally, non-final windows keep
+full classification, and Dhan finals are never carved out (review round 1
+fix H1). The bucket grid is REIMPLEMENTED independently
 (windows `[33_300 + k*S, min(+S, 55_800))` per trading day) and cross-pinned
 against `TfIndex::bucket_start` by a hand-literal tripwire test so lockstep
 drift is impossible. Query strategy per (feed, date): ONE discovery query
@@ -128,7 +134,12 @@ enabled` + trading day; env `TICKVAULT_TF_VERIFY_NOW` force-runs and
   finding row (would explode on legitimately sparse instruments).
 - Stored TF row over ZERO member 1m rows → `no_1m_coverage` (pages).
 - Recomputed present, stored row absent → `missing_tf_row` (pages) — the
-  dead-seal-leg detector.
+  dead-seal-leg detector. EXCEPTION (review round 1 fix H1): an absent
+  Groww FINAL-window row is the non-paging `tail_unsealed` carve-out —
+  Groww finals never seal on the prod schedule (16:30 auto-stop precedes
+  the midnight seal), so without it every day floods thousands of false
+  `missing_tf_row` pages. A present Groww final row is still compared;
+  Dhan finals and Groww non-finals keep the page.
 - Stored TF ts not on the 09:15-anchored grid → `off_grid_ts` (pages) —
   the purest anchoring-bug signal.
 - Duplicate rows per DEDUP key in a response → `duplicate_key` (pages),
@@ -139,16 +150,27 @@ enabled` + trading day; env `TICKVAULT_TF_VERIFY_NOW` force-runs and
 - Query returns rows == LIMIT → truncation tripwire → read_degraded.
 - Weekend/holiday walk-back for the Groww D-1 date (≤7 days, else the
   Groww pass degrades loudly).
-- Non-trading day: skip; `TICKVAULT_TF_VERIFY_NOW` without a DATE on a
-  non-trading day is REFUSED with an info log (the scoreboard round-5
-  mechanic); NOW + DATE backfills that past trading day.
+- Non-trading day: skip; `TICKVAULT_TF_VERIFY_NOW` without a DATE is
+  REFUSED with an info log on a non-trading day AND on a trading day
+  BEFORE the 15:40 trigger (unsealed today — review round 1 fix L7a);
+  NOW + DATE backfills that past trading day. DATE without NOW is ignored
+  with one warn line (L7b).
 - Late boot (post-15:40): RunCatchUp — runs immediately (idempotent).
 - Volume i64 overflow on the recompute sum: checked_add → degraded, never
   a wrap.
 - Feed off all day: zero rows both sides → `no_data` status, Info wording,
   never a daily High page and never a PASS claim.
-- Always-on instruments (GIFT Nifty): excluded via the process-global
-  always_on set (midnight-only seals + pre-open clamp semantics), counted.
+- Always-on instruments (GIFT Nifty): excluded STATE-INDEPENDENTLY (review
+  round 1 fix H2) — in the process-global always_on set OR any parsed 1m
+  row outside [09:15, 15:30) IST (only always-on instruments can carry
+  out-of-session 1m rows; the set is empty on FAST-arm boots). Applied
+  before any classification (incl. off_grid), counted reason="always_on".
+- Poisoned/unknown discovered segment string (second-order injection —
+  review round 1 fix L8): refused against the exact known-segment
+  allowlist BEFORE any follow-up SQL; stage `bad_segment`, ONE coalesced
+  error per pass, the value itself never logged or interpolated.
+- Oversize /exec response (> 8 MiB): refused BEFORE the JSON parse
+  (stage `oversize` — review round 1 SEC fix).
 - Mid-day-restart volume/day-open divergences: REPORTED as mismatches, the
   runbook explains recognition — never suppressed.
 
@@ -212,7 +234,12 @@ pre-registration): `tv_tf_verify_runs_total{status}`,
 `tv_tf_verify_query_failures_total{stage}`, `tv_tf_verify_bucket_gap_total`,
 `tv_tf_verify_soft_divergence_total{field}`,
 `tv_tf_verify_excluded_total{reason}`,
-`tv_tf_verify_audit_rows_discarded_total`. Error codes TF-VERIFY-01
+`tv_tf_verify_tail_unsealed_total` (the Groww final-window carve-out —
+review round 1 fix H1),
+`tv_tf_verify_audit_rows_discarded_total`. The cumulative pass counters
+(compared / gap / tail) are emitted ONCE per pass (M3 fix — in-loop
+emission overcounted quadratically) and the runs verdict is emitted after
+the final flush (L5 fix). Error codes TF-VERIFY-01
 (coalesced, ≤10 named samples, never per-row) + TF-VERIFY-02 (per degraded
 stage) — both log-sink-only; the operator page is the typed
 `TfConsistencySummary` / `TfConsistencyAborted` Telegram (data-dependent

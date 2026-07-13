@@ -35,9 +35,24 @@ compares field-by-field against the stored TF tables, per feed:
 - **`feed='dhan'` verifies TODAY** — stable after the 15:30:05 IST
   close-time force-seal.
 - **`feed='groww'` verifies the PREVIOUS trading day** — Groww has no
-  close-time force-seal (session tails seal at the IST-midnight force-seal),
-  so only D-1 has full coverage. There is deliberately NO `tail_unsealed`
-  category: a missing Groww D-1 tail row IS a `missing_tf_row` finding.
+  close-time force-seal; its session-final buckets would only seal at the
+  IST-midnight force-seal, which **NEVER RUNS on the prod schedule**: the
+  box auto-stops at 16:30 IST and the bridge resumes from a persisted
+  NDJSON offset, so the finals are never rebuilt. Every Groww TF's FINAL
+  session window (every TF's last window before 15:30 — including the
+  M30/H1–H4 finals whose natural bucket end falls at 15:45–17:15) is
+  therefore STRUCTURALLY absent. An ABSENT Groww final row takes the
+  NON-PAGING **`tail_unsealed`** carve-out
+  (`tv_tf_verify_tail_unsealed_total` counter + the Telegram note "N
+  Groww end-of-day buckets are not sealed by design — not verified"; no
+  audit row, no page). A PRESENT Groww final row is sealed data and is
+  compared normally; non-final Groww windows keep full paging
+  classification, and Dhan finals are never carved out (the close-time
+  force-seal covers them). **Operator data-completeness insight (flagged):
+  on the production schedule the Groww final TF buckets NEVER persist —
+  the last ~1–5 minutes of each session exist only in the 1m/live record
+  for Groww higher TFs until the schedule or a close-time Groww seal
+  changes that.**
 
 The bucket grid is REIMPLEMENTED independently in the verifier (windows
 `[09:15:00 + k·S, min(+S, 15:30:00))`, final partial buckets truncated at
@@ -46,7 +61,15 @@ literals — so a shared-bug in the aggregator's own grid cannot vacuously
 self-verify. Comparison is exact: OHLC via integer paise, volume exact i64
 (checked-add overflow → degraded), `tick_count` divergence is SOFT
 (counter only). D1 and always-on/GIFT-Nifty cells are excluded and counted
-(`tv_tf_verify_excluded_total{reason="d1"|"always_on"}`).
+(`tv_tf_verify_excluded_total{reason="d1"|"always_on"}`). The always-on
+exclusion is **state-independent** (H2 fix): an instrument is excluded
+when it is in the process-global `always_on::current()` set OR when its
+parsed 1m rows for the target day carry ANY timestamp outside
+[09:15:00, 15:30:00) IST — only always-on instruments can have
+out-of-session 1m rows (the aggregator session gate blocks everyone
+else), so the exclusion holds even on FAST crash-recovery boots where the
+registration set is never initialized. It is applied BEFORE any
+classification (including `off_grid_ts`).
 
 Everything is COLD-PATH (one scheduled run/day, read-only SELECTs +
 audit-table writes) — the tick hot path, the aggregator, the seal writer,
@@ -70,14 +93,16 @@ a `tf_consistency_audit` row + `tv_tf_verify_findings_total{category}`):
 | Category | Meaning |
 |---|---|
 | `mismatch` | a stored TF field (open/high/low/close paise, or volume i64) differs from the 1m recompute — one row PER differing field |
-| `missing_tf_row` | 1m rows cover a bucket window but the TF table has NO row for it (a lost seal — incl. the Groww D-1 tail) |
+| `missing_tf_row` | 1m rows cover a bucket window but the TF table has NO row for it (a lost seal). EXCEPTION: an absent Groww FINAL-window row is the non-paging `tail_unsealed` carve-out (structurally unsealed on the prod schedule — see §0) |
 | `no_1m_coverage` | a stored TF row exists but ZERO 1m rows cover its window (baseline hole — the recompute cannot vouch) |
 | `off_grid_ts` | a stored TF row's `ts` is not on the session bucket grid (bucket-boundary corruption) |
 | `duplicate_key` | two stored TF rows share `(ts, security_id, segment, tf)` for one feed — DEDUP failed; compared on the FIRST row |
 
 SOFT (never pages, no audit row beyond counters): `tick_count` divergence
-(`tv_tf_verify_soft_divergence_total{field="tick_count"}`) and 1m-baseline
-gaps between buckets (`tv_tf_verify_bucket_gap_total`).
+(`tv_tf_verify_soft_divergence_total{field="tick_count"}`), 1m-baseline
+gaps between buckets (`tv_tf_verify_bucket_gap_total`), and the Groww
+final-window carve-out (`tv_tf_verify_tail_unsealed_total` — named in the
+Telegram summary, never a finding).
 
 **Triage:**
 1. `mcp__tickvault-logs__tail_errors` — find `TF-VERIFY-01`; the payload
@@ -124,6 +149,8 @@ repairs the day once the cause is fixed; the operator inspects first).
 | `discovery` | the per-(feed,date) instrument-discovery query failed |
 | `query_failed` | a per-SID 1m / TF-union query or parse failed (that SID skipped; also folds a volume checked-add overflow) |
 | `questdb_unreachable` | the /exec transport leg failed outright |
+| `bad_segment` | a DISCOVERED segment string is outside the exact known-segment allowlist (the 8 strings `segment_code_to_str` can produce; `UNKNOWN` excluded) — second-order injection defense: the instrument is skipped, the poisoned value NEVER reaches a follow-up query and is never logged; ONE coalesced error per pass |
+| `oversize` | an /exec response body exceeded the 8 MiB `TF_VERIFY_MAX_RESPONSE_BYTES` cap — refused BEFORE the JSON parse |
 | `truncated` | a query hit its explicit LIMIT (500 1m / 2,000 TF-union / 3,000 discovery rows) — a partial compare is NEVER trusted; the SID/pass reads degraded |
 | `flush_failed` | the audit ILP-over-HTTP flush was refused by the per-request server ACK — pending rows DISCARDED (poisoned-buffer defense, `tv_tf_verify_audit_rows_discarded_total`) |
 | `budget_exceeded` | the 900s run budget elapsed between SIDs — remaining instruments skipped, ONE coalesced error |
@@ -132,7 +159,11 @@ repairs the day once the cause is fixed; the operator inspects first).
 EXISTED classifies **Blind** — the Telegram says BLIND, never PASS.
 `compared == 0` with NO rows on either side is **NoData** (Info — an
 off-day, not a failure). Any paging finding → MismatchFound; any degrade →
-Degraded; else Pass. `tv_tf_verify_runs_total{status}` records the verdict.
+Degraded; else Pass. `tv_tf_verify_runs_total{status}` records the verdict
+AFTER the final audit flush (L5 fix — a failed flush can never record
+`status="pass"` for a run that reports degraded), and the Telegram
+wording/severity derive from that same flush-adjusted `status_label`
+(L6 fix — never re-derived from the counts).
 
 **Triage:**
 1. `mcp__tickvault-logs__tail_errors` — find `TF-VERIFY-02`; the `stage`
@@ -143,10 +174,16 @@ Degraded; else Pass. `tv_tf_verify_runs_total{status}` records the verdict.
    BOOT-01/BOOT-02, WAL-SUSPEND-01, and the sibling 15:31/15:40/15:45
    post-market tasks, which share the target).
 3. Backfill once healthy: restart with `TICKVAULT_TF_VERIFY_NOW=1` (+
-   `TICKVAULT_TF_VERIFY_DATE` for a specific trading day; NOW without DATE
-   on a non-trading day is REFUSED with an info log). Re-runs UPSERT in
-   place (DEDUP key includes the deterministic run `ts` = target day
-   15:40:00 IST).
+   `TICKVAULT_TF_VERIFY_DATE` for a specific trading day). NOW without
+   DATE is REFUSED with an info log on a non-trading day AND on a trading
+   day BEFORE the 15:40 IST trigger (today's candles are still unsealed —
+   L7a); DATE without NOW is IGNORED with one warn line (L7b). Re-runs
+   UPSERT in place (DEDUP key includes the deterministic run `ts` =
+   target day 15:40:00 IST). **Rerun stale-row residual (L7c):** the
+   audit is KEY-idempotent, NOT value-idempotent — a finding that
+   vanishes on a rerun (e.g. data repaired between runs) remains in the
+   table as a forensic row for its original run key; the LATEST Telegram
+   summary is the verdict (the scoreboard envelope discipline).
 4. Sustained `truncated` on real instruments means the day's row counts
    outgrew the LIMIT envelope — raise the named cap constants in a
    reviewed PR, never silently.
