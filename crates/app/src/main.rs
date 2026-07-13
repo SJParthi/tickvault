@@ -15241,6 +15241,32 @@ fn spawn_groww_spot_1m_leg(
     } else {
         (None, None)
     };
+    // PR-4 sequencing + selection handoff: the chain→contract channel +
+    // anchor store exist ONLY when BOTH legs are on (contract-off keeps
+    // the chain leg byte-identical to PR-3). The contract leg DEPENDS on
+    // the chain leg's per-minute anchors — enabled-without-chain is
+    // refused loudly, never a silent anchor-less loop.
+    let contract_enabled = config.groww_contract_1m.enabled && chain_enabled;
+    if config.groww_contract_1m.enabled && !chain_enabled {
+        warn!(
+            code = tickvault_common::error_code::ErrorCode::Spot1m01FetchDegraded.code_str(),
+            stage = "enabled_without_chain",
+            feed = "groww",
+            leg = "contract_1m",
+            "SPOT1M-01: [groww_contract_1m] is enabled but the chain leg \
+             ([groww_option_chain_1m]) is OFF — the contract leg needs the \
+             chain's per-minute ATM anchors; NOT spawned (enable the chain \
+             leg first)"
+        );
+    }
+    let (chain_minute_done_tx, chain_minute_done_rx, contract_anchor_store) = if contract_enabled {
+        let (tx, rx) = tokio::sync::watch::channel::<Option<u32>>(None);
+        let store: tickvault_app::groww_option_chain_1m_boot::GrowwChainAnchorStore =
+            std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+        (Some(tx), Some(rx), Some(store))
+    } else {
+        (None, None, None)
+    };
     if config.groww_spot_1m.enabled {
         let _groww_spot1m_supervisor =
             tickvault_app::groww_spot_1m_boot::spawn_supervised_groww_spot_1m(
@@ -15271,6 +15297,8 @@ fn spawn_groww_spot_1m_leg(
                     calendar: std::sync::Arc::clone(trading_calendar),
                     questdb: config.questdb.clone(),
                     spot_minute_done,
+                    minute_done_tx: chain_minute_done_tx,
+                    anchor_store: contract_anchor_store.clone(),
                 },
             );
         info!(
@@ -15278,6 +15306,34 @@ fn spawn_groww_spot_1m_leg(
              (fires each minute close right after the Groww spot fetch; \
              sequential underlying pacing)"
         );
+        // Groww per-contract 1m leg (PR-4, the fill-model leg): sequenced
+        // after the chain fire via the watch signal + fallback timer;
+        // selection = ATM window from the chain's in-memory anchors,
+        // hard-capped per minute. DEFAULT-OFF (depends on the chain leg).
+        if contract_enabled {
+            let _groww_contract1m_supervisor =
+                tickvault_app::groww_contract_1m_boot::spawn_supervised_groww_contract_1m(
+                    tickvault_app::groww_contract_1m_boot::GrowwContract1mTaskParams {
+                        notifier: notifier.clone(),
+                        calendar: std::sync::Arc::clone(trading_calendar),
+                        questdb: config.questdb.clone(),
+                        chain_minute_done: chain_minute_done_rx,
+                        anchor_store: contract_anchor_store,
+                        strikes_each_side: config.groww_contract_1m.strikes_each_side,
+                    },
+                );
+            info!(
+                "groww_contract_1m: Groww per-minute contract candle leg \
+                 spawned (fires each minute close right after the Groww \
+                 chain fetch; ATM-window selection, sequential contract \
+                 pacing)"
+            );
+        } else {
+            info!(
+                "groww_contract_1m: disabled by config — Groww per-minute \
+                 contract fetch not spawned"
+            );
+        }
     } else if config.groww_option_chain_1m.probe_and_report {
         let _groww_chain1m_probe = tokio::spawn(
             tickvault_app::groww_option_chain_1m_boot::run_groww_chain_1m_probe(
@@ -15286,6 +15342,8 @@ fn spawn_groww_spot_1m_leg(
                     calendar: std::sync::Arc::clone(trading_calendar),
                     questdb: config.questdb.clone(),
                     spot_minute_done: None,
+                    minute_done_tx: None,
+                    anchor_store: None,
                 },
             ),
         );

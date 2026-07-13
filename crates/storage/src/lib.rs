@@ -212,6 +212,11 @@ pub mod spot_1m_rest_persistence;
 // the OPTION-CHAIN half; CHAIN-03): the `option_chain_1m` table DDL +
 // ILP-over-HTTP writer.
 pub mod option_chain_1m_persistence;
+// Per-contract 1m candle leg of the Groww per-minute REST pipeline
+// (operator grant 2026-07-13, PR-4 — the fill-model leg): the
+// `option_contract_1m_rest` table DDL + ILP-over-HTTP writer (feed in the
+// DEDUP key; retention registered in partition_manager.rs).
+pub mod option_contract_1m_rest_persistence;
 // Per-fetch forensics for the per-minute REST legs (operator scope addition
 // 2026-07-13, Groww REST plan PR-2): the `rest_fetch_audit` table DDL +
 // ILP-over-HTTP writer — one row per (target minute, symbol, feed, leg).

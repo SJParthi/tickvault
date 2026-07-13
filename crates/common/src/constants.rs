@@ -2098,6 +2098,134 @@ const _: () = assert!(
     "GROWW_CHAIN_1M fallback delay must trail the Groww spot leg's fire delay"
 );
 
+// ---------------------------------------------------------------------------
+// Groww per-contract 1m candle REST leg (operator grant 2026-07-13 — PR-4
+// of the Groww per-minute REST plan, the FILL-MODEL leg;
+// `.claude/plans/active-plan-groww-rest-1m.md`; authorization
+// `groww-second-feed-scope-2026-06-19.md` §38 +
+// `no-rest-except-live-feed-2026-06-27.md` §9). Same endpoint + headers +
+// interval literal + body cap as the Groww spot leg (`GROWW_HISTORICAL_
+// CANDLES_URL` / `GROWW_API_VERSION_*` / `GROWW_CANDLE_INTERVAL_1MIN` /
+// `GROWW_SPOT_1M_MAX_BODY_BYTES` — one request, one day-window body shape),
+// with `segment=FNO` and a per-contract `groww_symbol` identity like
+// `NSE-NIFTY-04Jan24-19200-CE`. Sequenced AFTER the Groww chain leg (its
+// per-minute `underlying_ltp` is the ATM anchor). Session boundaries,
+// staleness grace and the page threshold REUSE the SPOT_1M_REST_* session
+// constants (NSE-session facts, not broker facts).
+// ---------------------------------------------------------------------------
+
+/// Fallback post-boundary fire delay (ms) for the contract leg — the
+/// contract task normally wakes when the GROWW CHAIN leg signals its
+/// minute complete (spot → chain → contract sequencing); when the chain
+/// leg is dead or slow, this timer fires the contract leg anyway
+/// (sequencing is best-effort, never a hard dependency). 8 s trails the
+/// chain's NORMAL completion window (chain fallback 2.5 s + 3 sequential
+/// underlyings at the 1 s min-gap ≈ 5-7 s) so the fresh anchor usually
+/// exists by the time selection runs.
+pub const GROWW_CONTRACT_1M_FALLBACK_DELAY_MS: u64 = 8_000;
+
+/// MECHANICAL cross-request minimum gap (ms) between ANY two consecutive
+/// contract candle requests — the chain leg's min-gap PATTERN at a
+/// contract-sized value: 500 ms → the contract leg contributes at most
+/// 2.0 req/s. RE-DERIVED 2026-07-13 (was 300 ms) when INDIA VIX joined
+/// the spot leg (3 → 4 sequential targets, §38.7 of the groww-scope
+/// lock): the honest spot worst-SECOND is 3 requests (a fast-failing
+/// target's last ladder rung in the same second as the NEXT target's
+/// rung-0 + rung-1 at +0.7 s — the 4th target makes those transitions
+/// MORE FREQUENT, never faster), so at 300 ms the worst overlap was
+/// 3 + 1 + 3.33 = 7.33 req/s > the ≤6 req/s pacing ceiling of
+/// `docs/groww-ref/15-rate-limits-and-capacity.md`. At 500 ms:
+/// 3 + 1 + 2 = 6.00 req/s — exactly AT the self-imposed ceiling
+/// (const-asserted below with exact rational math), with the broker's
+/// documented 10/s hard ceiling far above. Pure pacing cost: 29 gaps ×
+/// 500 ms = 14.5 s of the 45 s fire budget — still bounded.
+pub const GROWW_CONTRACT_1M_MIN_GAP_MS: u64 = 500;
+
+/// Per-REQUEST HTTP timeout (secs) for one contract candles call — the
+/// spot leg's 5 s (same endpoint, same ~20 KB day-window body).
+pub const GROWW_CONTRACT_1M_REQUEST_TIMEOUT_SECS: u64 = 5;
+
+/// HARD envelope cap on contracts fetched per minute (the §38 "envelope
+/// cap on contracts per minute"). The default ATM window fills it exactly:
+/// (2 × 2 + 1) strikes × 2 legs × 3 underlyings = 30. A selection larger
+/// than the cap (config-widened window) is truncated DETERMINISTICALLY
+/// nearest-ATM-first — counted + one coded warn, never fetched past the
+/// cap, never silent.
+pub const GROWW_CONTRACT_1M_MAX_PER_MINUTE: usize = 30;
+
+/// HARD wall-clock deadline (secs) for ONE minute's whole contract fire:
+/// contracts not reached before the deadline are SKIPPED loudly (counted +
+/// forensics rows), never fetched into the next minute. Normal fires
+/// finish in ~10-20 s (cap × (min-gap + one round-trip)); the deadline
+/// only engages on a stalling peer.
+pub const GROWW_CONTRACT_1M_FIRE_BUDGET_SECS: u64 = 45;
+
+/// Default ATM window half-width (strikes each side of ATM) for the
+/// contract selection — the `[groww_contract_1m] strikes_each_side`
+/// config default. 2 each side → 5 strikes × CE+PE × 3 underlyings = 30
+/// contracts/minute = exactly the envelope cap (const-asserted below).
+pub const GROWW_CONTRACT_1M_DEFAULT_STRIKES_EACH_SIDE: u32 = 2;
+
+/// Maximum ATM-anchor age (minutes) the contract leg will still trust. A
+/// chain-leg anchor OLDER than this (the chain leg died or is silently
+/// failing while its last anchor sits frozen) makes the underlying
+/// UNRESOLVED for the minute — a NAMED skip (coded warn `anchor_stale` +
+/// counter + `rest_fetch_audit` rows), never a silently-frozen off-ATM
+/// fetch window (round-1 review M3; the §38.8 decision-freshness
+/// principle applied to the selection input). 5 minutes ≈ the 3-minute
+/// escalation edge + margin: the chain leg's own paging fires first.
+pub const GROWW_CONTRACT_1M_ANCHOR_MAX_AGE_MINUTES: u32 = 5;
+
+const _: () = assert!(
+    GROWW_CONTRACT_1M_FALLBACK_DELAY_MS > GROWW_CHAIN_1M_FALLBACK_DELAY_MS,
+    "the contract leg is sequenced AFTER the chain leg — its fallback must trail the chain's"
+);
+const _: () = assert!(
+    GROWW_CONTRACT_1M_FALLBACK_DELAY_MS + GROWW_CONTRACT_1M_FIRE_BUDGET_SECS * 1_000 < 60_000,
+    "GROWW_CONTRACT_1M fire (fallback + fire budget) must finish inside the minute"
+);
+// Boundary-burst pacing ceiling (§38.3, RE-DERIVED 2026-07-13 for the
+// VIX 4th spot target): the honest spot worst-SECOND is 3 requests
+// (sequential targets, ≤1 in-flight, but a fast-failing target's last
+// ladder rung can share one second with the next target's rung-0 +
+// rung-1 at +0.7 s; the 4th target makes such transitions more
+// frequent, never faster) + chain ≤ 1000/chain-gap req/s + contract ≤
+// 1000/contract-gap req/s, all inside the ≤6 req/s shared-bucket
+// ceiling even in the worst overlap. EXACT rational math via
+// cross-multiplication (round-1 review LOW: integer division rounds
+// 1000/gap DOWN — optimistic):
+//   3 + 1000/kg + 1000/cg ≤ 6  ⇔  1000·kg + 1000·cg ≤ 3·cg·kg
+// (all terms positive). Today: 1000·500 + 1000·1000 = 1.5M ≤
+// 3·1000·500 = 1.5M — the worst-overlap burst is 3 + 1 + 2 = 6.00
+// req/s, exactly AT the self-imposed ceiling (broker hard ceiling 10/s).
+const _: () = assert!(
+    1_000 * GROWW_CONTRACT_1M_MIN_GAP_MS + 1_000 * GROWW_CHAIN_1M_MIN_GAP_MS
+        <= 3 * GROWW_CHAIN_1M_MIN_GAP_MS * GROWW_CONTRACT_1M_MIN_GAP_MS,
+    "spot(3) + chain + contract worst-overlap boundary burst must stay inside the 6 req/s ceiling (exact rational math)"
+);
+// Per-minute request math (the §38.3 capacity envelope, re-derived
+// 2026-07-13 for the VIX 4th spot target): worst case 30 contracts +
+// the spot leg's 20 (3 core symbols + the runtime VIX target = 4 × 5
+// ladder rungs) + 3 chain = 53 requests/min ≈ 17.7% of the 300/min
+// shared budget (typical ≈ 37/min: 30 + 4 + 3). Const-asserted at ≤ 60
+// (20% of the budget) so a future cap raise cannot silently eat the
+// bruteX co-tenancy headroom.
+const _: () = assert!(
+    GROWW_CONTRACT_1M_MAX_PER_MINUTE
+        + (GROWW_SPOT_1M_SYMBOLS.len() + 1) * (GROWW_SPOT_1M_RETRY_OFFSETS_MS.len() + 1)
+        + GROWW_CHAIN_1M_UNDERLYINGS.len()
+        <= 60,
+    "the three Groww REST legs' worst-case per-minute request total must stay <= 20% of the 300/min budget"
+);
+// The DEFAULT ATM window fills the cap exactly — a wider default needs a
+// fresh dated operator quote AND a cap re-derivation.
+const _: () = assert!(
+    ((2 * GROWW_CONTRACT_1M_DEFAULT_STRIKES_EACH_SIDE as usize + 1) * 2)
+        * GROWW_CHAIN_1M_UNDERLYINGS.len()
+        <= GROWW_CONTRACT_1M_MAX_PER_MINUTE,
+    "the default ATM window (strikes x CE+PE x underlyings) must fit the per-minute contract cap"
+);
+
 /// Daily reset signal time (IST). After market close at 15:30,
 /// historical re-fetch + cross-verification runs. At 16:00 IST the daily
 /// reset signal fires (candle aggregator reset, indicator reset, etc.).
@@ -4323,6 +4451,56 @@ mod tests {
         );
         // Warmup master-download retries: bounded, 3 attempts total.
         assert_eq!(GROWW_CHAIN_1M_MASTER_RETRY_BACKOFF_SECS, [3, 6]);
+    }
+
+    /// PR-4 (Groww contract leg): the fill-model leg's pacing + envelope
+    /// constants — the cap, the ATM-window default, and the boundary-burst
+    /// math are all mechanical (the const asserts re-prove them at compile
+    /// time; this test pins the VALUES so a drift is a conscious edit).
+    #[test]
+    fn test_groww_contract_1m_constants_pinned() {
+        assert_eq!(GROWW_CONTRACT_1M_FALLBACK_DELAY_MS, 8_000);
+        assert!(GROWW_CONTRACT_1M_FALLBACK_DELAY_MS > GROWW_CHAIN_1M_FALLBACK_DELAY_MS);
+        assert_eq!(GROWW_CONTRACT_1M_MIN_GAP_MS, 500);
+        assert_eq!(GROWW_CONTRACT_1M_REQUEST_TIMEOUT_SECS, 5);
+        assert_eq!(GROWW_CONTRACT_1M_MAX_PER_MINUTE, 30);
+        assert_eq!(GROWW_CONTRACT_1M_FIRE_BUDGET_SECS, 45);
+        assert_eq!(GROWW_CONTRACT_1M_DEFAULT_STRIKES_EACH_SIDE, 2);
+        assert_eq!(GROWW_CONTRACT_1M_ANCHOR_MAX_AGE_MINUTES, 5);
+        // Fallback + fire budget fit the minute.
+        assert!(
+            GROWW_CONTRACT_1M_FALLBACK_DELAY_MS + GROWW_CONTRACT_1M_FIRE_BUDGET_SECS * 1_000
+                < 60_000
+        );
+        // Worst-overlap boundary burst inside the 6 req/s family ceiling
+        // (re-derived 2026-07-13 for the VIX 4th spot target): spot worst
+        // second = 3 requests (target-transition instant) + chain + contract.
+        // EXACT rational cross-multiplication:
+        //   3 + 1000/kg + 1000/cg <= 6  <=>  1000*kg + 1000*cg <= 3*cg*kg
+        // — today 1000*500 + 1000*1000 = 1.5M = 3*1000*500 exactly:
+        // 3 + 1 + 2 = 6.00 req/s AT the self-imposed ceiling.
+        assert!(
+            1_000 * GROWW_CONTRACT_1M_MIN_GAP_MS + 1_000 * GROWW_CHAIN_1M_MIN_GAP_MS
+                <= 3 * GROWW_CHAIN_1M_MIN_GAP_MS * GROWW_CONTRACT_1M_MIN_GAP_MS
+        );
+        // Per-minute request math (the capacity envelope): 30 contracts +
+        // the spot leg's worst 20 (3 core + the runtime VIX target = 4
+        // targets x 5 ladder rungs) + 3 chain = 53/min ~ 17.7% of the
+        // 300/min shared budget (typical ~37/min).
+        assert_eq!(
+            GROWW_CONTRACT_1M_MAX_PER_MINUTE
+                + (GROWW_SPOT_1M_SYMBOLS.len() + 1) * (GROWW_SPOT_1M_RETRY_OFFSETS_MS.len() + 1)
+                + GROWW_CHAIN_1M_UNDERLYINGS.len(),
+            53
+        );
+        // The default ATM window fills the cap exactly (5 strikes x 2 legs
+        // x 3 underlyings = 30) — a wider default needs a dated quote.
+        assert_eq!(
+            (2 * GROWW_CONTRACT_1M_DEFAULT_STRIKES_EACH_SIDE as usize + 1)
+                * 2
+                * GROWW_CHAIN_1M_UNDERLYINGS.len(),
+            GROWW_CONTRACT_1M_MAX_PER_MINUTE
+        );
     }
 
     /// Constant pin — 60s grace after close.
