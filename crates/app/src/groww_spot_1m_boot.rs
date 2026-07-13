@@ -1911,7 +1911,7 @@ mod tests {
         for v in [
             serde_json::json!(0),                     // 1970 — implausible
             serde_json::json!(-1_783_914_300),        // negative
-            serde_json::json!(5_000_000_000),         // year 2128 — implausible
+            serde_json::json!(5_000_000_000_i64),     // year 2128 — implausible
             serde_json::json!(1e30),                  // absurd float
             serde_json::json!(1_783_914_300.5),       // fractional seconds
             serde_json::json!("13-07-2026 09:15:00"), // wrong date order
