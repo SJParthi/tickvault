@@ -103,6 +103,18 @@ day-granular window. Fix:
   enable flip; the boot probe verdict line remains the entitlement canary
   on any rollback.
 
+## Per-Item Guarantee Matrix
+
+See `per-wave-guarantee-matrix.md` — the full 15-row 100% Guarantee Matrix
+and the 7-row Resilience Demand Matrix apply to EVERY item in this plan
+(cross-referenced per the canonical rule instead of inlined). Item-specific
+notes: no hot-path involvement (cold-path REST, once per minute + one
+post-session sweep), so the DHAT/Criterion rows are N/A — cold path,
+flagged honestly; every other row is proven by the tests named per item
+below, the wiring guards, and the honest-envelope wording in the PR body
+(any "100%" claim is qualified inside the tested envelope, with ratcheted
+regression coverage).
+
 ## Plan Items
 
 - [x] Diagnose live failure — verdict written (window bug; matcher verified
@@ -116,7 +128,13 @@ day-granular window. Fix:
   extraction + honest close_to_data_ms + edge semantics unchanged)
   - Files: crates/app/src/spot_1m_rest_boot.rs
   - Tests: test_parse_intraday_columnar_for_minutes_backfill_hit, test_backfill_minute_nanos_hit_and_not_needed, test_backfill_minute_nanos_first_session_minute_has_no_backfill, test_persist_tracker_commit_max_merge_and_double_persist_idempotent, test_backfill_never_flips_edge_accounting
-- [x] Option-chain enable flip + §8.7 dated rule note + runbook sync
+- [x] Post-session sweep (M1, review 2026-07-13) — one bounded ~15:31 IST
+  fire repairs every session minute still missing above the per-SID
+  watermark (gives the final 15:29 candle its repair path; also closes the
+  L2/L4 gaps: ≥2-fire-old absences and flush-failed backfill rows)
+  - Files: crates/app/src/spot_1m_rest_boot.rs
+  - Tests: test_sweep_recovers_vendor_late_1529_minute, test_sweep_missing_minutes_noop_when_complete, test_sweep_missing_minutes_full_session_and_tail_gap
+- [x] Option-chain enable flip + §8.7 dated rule note (verbatim relayed authorization quoted) + runbook sync + CHAIN-03 day-1 DEDUP checklist (M2/M3)
   - Files: config/base.toml, .claude/rules/project/no-rest-except-live-feed-2026-06-27.md, .claude/rules/project/rest-1m-pipeline-error-codes.md
   - Tests: existing test_wait_until_chain_fire_signal_wakes_early_and_fallback_bounds (fallback arms a–e) + option_chain_1m_wiring_guard (send_replace pin)
 
@@ -126,6 +144,7 @@ day-granular window. Fix:
 |---|----------|----------|
 | 1 | Minute M candle available at fire M+60 | Found via day window, persisted, ok=3, histogram sampled |
 | 2 | Minute M sealed late (> 6.3 s) | M's fire empty (honest failure); M repaired by fire M+120's backfill with real delay stamp |
+| 2b | 15:29 sealed late (no next fire) | Repaired by the ~15:31 post-session sweep with real delay stamp |
 | 3 | Flush failure mid-fire | Watermark not advanced; SPOT1M-02; next fire re-backfills |
 | 4 | Chain leg with spot leg hung | 2.5 s fallback timer fires the chain (tested arms a–e) |
 | 5 | Chain entitlement regresses | CHAIN-01/02 loud; rollback = config flip |
