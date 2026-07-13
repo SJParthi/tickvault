@@ -54,7 +54,7 @@
 //!    (~15:33:30 IST, single fire, [`run_post_session_sweep`]) closes all
 //!    three: it re-fetches the day window once per SID and persists every
 //!    session minute above the watermark that is still missing. The sweep
-//!    fires at 15:33:30 — NOT 15:31 — so its ≤3 requests clear the 15:31
+//!    fires at 15:33:30 — NOT 15:31 — so its ≤4 requests clear the 15:31
 //!    bulk cross-verify's burst window (2026-07-13 live session: 91/776
 //!    cross-verify fetches 429'd at 15:31–15:33; see the 429-coordination
 //!    follow-up in `rest-1m-pipeline-error-codes.md`).
@@ -355,7 +355,7 @@ pub fn backfill_minute_nanos(
 /// vendor-late 15:29 candle had no repair path).
 ///
 /// 429-coordination (2026-07-13, same-day follow-up): moved from 15:31:00
-/// to 15:33:30 so the sweep's ≤3 requests land AFTER the 15:31 bulk
+/// to 15:33:30 so the sweep's ≤4 requests land AFTER the 15:31 bulk
 /// cross-verify's observed 429 burst window (live session 2026-07-13:
 /// 91/776 cross-verify fetches failed HTTP 429 between 15:31 and 15:33).
 /// The const-assert below pins the sweep strictly clear of that window.
@@ -1390,8 +1390,9 @@ pub fn minute_fully_failed(ok_count: usize, persist_failed: bool) -> bool {
 /// day window ONCE per SID that still has session minutes above its
 /// persisted watermark (the 15:29 candle after a vendor-late seal, a
 /// flush-failed backfill row, any tail gap the per-minute one-minute
-/// lookback could not reach) and persist every one found. Bounded: ≤3
-/// requests total, ≤375 minutes/SID, DEDUP-idempotent re-appends; loud
+/// lookback could not reach) and persist every one found. Bounded: ≤4
+/// requests total (one per pinned SID since the 2026-07-13 VIX addition),
+/// ≤375 minutes/SID, DEDUP-idempotent re-appends; loud
 /// counters (`tv_spot1m_sweep_backfilled_total` /
 /// `tv_spot1m_sweep_still_missing_total`) + one coalesced coded log; the
 /// swept rows' `close_to_data_ms` column stamps the honest real delay.
