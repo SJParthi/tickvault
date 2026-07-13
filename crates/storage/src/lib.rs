@@ -111,6 +111,10 @@ pub mod feed_scoreboard_persistence;
 /// Groww auto-scale ladder forensic chain (§34, auto-scale PR-2 Item 8) —
 /// one row per ladder transition; feeds restart rehydration.
 pub mod groww_scale_audit_persistence;
+/// Daily timeframe-consistency verifier (operator 2026-07-13): one row per
+/// finding cell where a stored higher-TF candle disagrees with its
+/// recomputed-from-1m value (TF-VERIFY-01/02).
+pub mod tf_consistency_audit_persistence;
 pub mod tick_conservation_audit_persistence;
 pub mod ws_event_audit_persistence;
 // PR-E (2026-05-26): `candle_persistence` module deleted alongside the
@@ -208,6 +212,10 @@ pub mod spot_1m_rest_persistence;
 // the OPTION-CHAIN half; CHAIN-03): the `option_chain_1m` table DDL +
 // ILP-over-HTTP writer.
 pub mod option_chain_1m_persistence;
+// Per-fetch forensics for the per-minute REST legs (operator scope addition
+// 2026-07-13, Groww REST plan PR-2): the `rest_fetch_audit` table DDL +
+// ILP-over-HTTP writer — one row per (target minute, symbol, feed, leg).
+pub mod rest_fetch_audit_persistence;
 // B6 (2026-07-03): off-thread tick ILP flush worker — keeps the blocking
 // questdb TCP flush off the tick-consumer thread (TICK-FLUSH-01).
 pub(crate) mod tick_flush_worker;

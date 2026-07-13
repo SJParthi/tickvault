@@ -121,15 +121,32 @@ fn test_post_market_tasks_has_process_global_once_guard() {
     // Runtime Dhan cold-start re-invokes spawn_post_market_tasks on every
     // disable→enable cycle; without the once-guard, N cycles = N duplicate
     // EOD digests / cross-verifies / orphan watchdogs (2026-07-02 HIGH).
+    //
+    // 2026-07-13 (Phase A FIX 4): the guard is now SHARED with the Dhan
+    // REST-only stack — the static lives in the lib
+    // (dhan_rest_stack::POST_MARKET_TASK_FAMILY_CLAIMED) so BOTH spawn
+    // paths (the lane's spawn_post_market_tasks AND the stack's Phase 5
+    // canary/spot/chain family) claim the SAME once-guard. This guard now
+    // pins both halves of that invariant.
     let src = main_rs_source();
     assert!(
-        src.contains("POST_MARKET_TASKS_SPAWNED"),
-        "spawn_post_market_tasks must be protected by the process-global \
-         POST_MARKET_TASKS_SPAWNED once-guard."
+        src.contains("!tickvault_app::dhan_rest_stack::claim_post_market_task_family_once()"),
+        "spawn_post_market_tasks must be protected by the SHARED \
+         claim_post_market_task_family_once once-guard (lib static shared \
+         with the Dhan REST-only stack)."
+    );
+    let stack_src = {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/dhan_rest_stack.rs");
+        fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
+    };
+    assert!(
+        stack_src.contains("POST_MARKET_TASK_FAMILY_CLAIMED.swap(true"),
+        "the shared once-guard must use an atomic swap(true) so exactly the \
+         FIRST caller proceeds and later re-entries no-op."
     );
     assert!(
-        src.contains("POST_MARKET_TASKS_SPAWNED.swap(true"),
-        "the once-guard must use an atomic swap(true) so exactly the FIRST \
-         caller proceeds and later cold-start re-entries no-op."
+        stack_src.contains("claim_post_market_task_family_once()"),
+        "the Dhan REST-only stack must claim the shared task-family \
+         once-guard before spawning canary/spot/chain (FIX 4 invariant)."
     );
 }

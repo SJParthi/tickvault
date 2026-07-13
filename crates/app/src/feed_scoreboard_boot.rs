@@ -688,16 +688,25 @@ fn secs_of_day_ist_from_nanos(ts_ist_nanos: i64) -> i64 {
     ts_ist_nanos.div_euclid(NANOS_PER_SEC).rem_euclid(86_400)
 }
 
-/// `true` for an up-kind `ws_event_audit` row whose ts falls INSIDE the
-/// market-hours window ([09:00, 15:30) IST) — the feed-off inference's
-/// session-scoped up signal (round 5, 2026-07-10 — HIGH): every
+/// `true` for a MARKET-DATA up-kind `ws_event_audit` row whose ts falls
+/// INSIDE the market-hours window ([09:00, 15:30) IST) — the feed-off
+/// inference's session-scoped up signal (round 5, 2026-07-10 — HIGH): every
 /// config-enabled feed writes a boot Connected row at ~08:33, BEFORE the
 /// API server can even accept a runtime toggle, so counting whole-day up
 /// rows made the runtime-disable path the round-4 fix named essentially
-/// unreachable (the 08:33 row always defeated `!had_any_up_row`). Pure.
+/// unreachable (the 08:33 row always defeated `!had_any_up_row`).
+///
+/// PR-C1 (2026-07-13 — the Phase B "Honest obligation" acceptance
+/// criterion, CLOSED): rows are additionally gated on
+/// [`is_market_data_ws_type`] — the Q4-i-rewired ORDER-UPDATE WS (a
+/// trading-channel socket that stays connected on the permanently-off Dhan
+/// feed) writes Dhan-feed up-kind rows INSIDE the session, and without the
+/// filter one such Reconnected row would defeat the round-6 `feed_off`
+/// classification forever. Pure.
 #[must_use]
 pub fn is_session_up_row(ev: &WsAuditEventLite) -> bool {
-    is_up_kind(&ev.event_kind)
+    is_market_data_ws_type(&ev.ws_type)
+        && is_up_kind(&ev.event_kind)
         && u32::try_from(secs_of_day_ist_from_nanos(ev.ts_ist_nanos))
             .is_ok_and(is_in_market_hours_secs)
 }
@@ -715,15 +724,20 @@ pub fn is_pre_session_feed_disable_row(ev: &WsAuditEventLite) -> bool {
         && secs_of_day_ist_from_nanos(ev.ts_ist_nanos) < SESSION_START_SECS_OF_DAY_IST
 }
 
-/// `true` for an up-kind row that lands BEFORE the 09:15 session open —
-/// the state-at-open comparison's re-enable signal (round 6, 2026-07-10 —
-/// MEDIUM): a pre-session disable→RE-ENABLE flap leaves both a
+/// `true` for a MARKET-DATA up-kind row that lands BEFORE the 09:15 session
+/// open — the state-at-open comparison's re-enable signal (round 6,
+/// 2026-07-10 — MEDIUM): a pre-session disable→RE-ENABLE flap leaves both a
 /// `feed_disabled` marker AND a later pre-session up row (Dhan
 /// SleepResumed / Groww Connected); only the LAST of the two toggles is
-/// the feed's state when trading began. Pure.
+/// the feed's state when trading began.
+///
+/// PR-C1 (2026-07-13): gated on [`is_market_data_ws_type`] — a pre-session
+/// ORDER-UPDATE Connected row is trading-channel machinery, never a
+/// market-data re-enable signal (see [`is_session_up_row`]). Pure.
 #[must_use]
 pub fn is_pre_session_up_row(ev: &WsAuditEventLite) -> bool {
-    is_up_kind(&ev.event_kind)
+    is_market_data_ws_type(&ev.ws_type)
+        && is_up_kind(&ev.event_kind)
         && secs_of_day_ist_from_nanos(ev.ts_ist_nanos) < SESSION_START_SECS_OF_DAY_IST
 }
 
@@ -1232,6 +1246,12 @@ pub fn fold_episode_into_tally(t: &mut EpisodeTally, kind: &str, blame: &str, ma
 /// Groww (hostile review round 2, 2026-07-10). Episode ROWS for every
 /// ws_type are still persisted for forensics; only the headline tallies
 /// filter.
+///
+/// Maintenance note (PR-C1, 2026-07-13 hostile-review L3): this is an
+/// ALLOWLIST — a future feed's market-data ws_type (e.g. the GDF trial's
+/// `gdf_feed`, `gdf-third-feed-scope-2026-07-13.md`) MUST be added here, or
+/// its up rows are excluded from the feed_off / any_up classification and
+/// the day misreads `feed_off` despite live GDF rows.
 #[must_use]
 pub fn is_market_data_ws_type(ws_type: &str) -> bool {
     matches!(ws_type, "main_feed" | "groww_bridge")
@@ -2722,7 +2742,14 @@ pub async fn run_feed_scoreboard(
                     if ev.event_kind == "reconnected" && is_market_data_ws_type(&ev.ws_type) {
                         *recon.entry(ev.feed.clone()).or_default() += 1;
                     }
-                    if is_up_kind(&ev.event_kind) {
+                    // PR-C1 (2026-07-13): up-signals count MARKET-DATA rows
+                    // ONLY (the Phase B "Honest obligation" acceptance
+                    // criterion) — the Q4-i-rewired order-update WS keeps
+                    // writing Dhan up-kind rows on a permanently-off Dhan
+                    // feed and must never defeat feed_off. The predicates
+                    // carry the same filter internally; this outer gate
+                    // covers the `any_up` fold.
+                    if is_market_data_ws_type(&ev.ws_type) && is_up_kind(&ev.event_kind) {
                         ups.any_up.insert(ev.feed.clone());
                         if !parked.contains(&idx) {
                             if is_session_up_row(ev) {
@@ -5423,6 +5450,88 @@ mod tests {
             true,
         );
         assert!(!is_session_up_row(&down));
+    }
+
+    /// PR-C1 (2026-07-13) — the Phase B "Honest obligation" acceptance
+    /// criterion, CLOSED: the Q4-i-rewired order-update WS writes Dhan-feed
+    /// up-kind rows (Connected/Reconnected) INSIDE the session on a
+    /// permanently-off Dhan feed; those trading-channel rows must NEVER
+    /// defeat the round-6 `feed_off` classification. Genuine market-data
+    /// up rows (main_feed / groww_bridge) still count.
+    #[test]
+    fn test_is_session_up_row_ignores_order_update_ws() {
+        let in_session = 10 * 3600; // 10:00 IST — inside [09:00, 15:30)
+        for kind in ["connected", "reconnected", "sleep_resumed"] {
+            let ou = ev(
+                day_ts(in_session),
+                "dhan",
+                "order_update",
+                kind,
+                "n/a",
+                -1,
+                true,
+            );
+            assert!(
+                !is_session_up_row(&ou),
+                "an in-session order-update `{kind}` row must not count as a \
+                 session up signal (it would block feed_off forever)"
+            );
+        }
+        // Market-data rows on BOTH feeds still count unchanged.
+        let dhan_up = ev(
+            day_ts(in_session),
+            "dhan",
+            "main_feed",
+            "reconnected",
+            "n/a",
+            -1,
+            true,
+        );
+        assert!(is_session_up_row(&dhan_up), "main_feed up still counts");
+        let groww_up = ev(
+            day_ts(in_session),
+            "groww",
+            "groww_bridge",
+            "connected",
+            "n/a",
+            -1,
+            true,
+        );
+        assert!(is_session_up_row(&groww_up), "groww_bridge up still counts");
+    }
+
+    /// PR-C1 (2026-07-13): the pre-session arm mirrors the session arm — a
+    /// pre-session order-update Connected row is trading-channel machinery,
+    /// never a market-data re-enable signal for the state-at-open compare.
+    #[test]
+    fn test_is_pre_session_up_row_ignores_order_update_ws() {
+        let pre_session = 8 * 3600 + 50 * 60; // 08:50 IST — before 09:15 open
+        let ou = ev(
+            day_ts(pre_session),
+            "dhan",
+            "order_update",
+            "connected",
+            "n/a",
+            -1,
+            false,
+        );
+        assert!(
+            !is_pre_session_up_row(&ou),
+            "a pre-session order-update Connected row must not read as a re-enable"
+        );
+        let dhan_up = ev(
+            day_ts(pre_session),
+            "dhan",
+            "main_feed",
+            "sleep_resumed",
+            "n/a",
+            -1,
+            false,
+        );
+        assert!(
+            is_pre_session_up_row(&dhan_up),
+            "a pre-session main_feed up row still counts (the flap re-enable signal)"
+        );
     }
 
     #[test]

@@ -9,6 +9,22 @@
 
 ---
 
+> **⚠ RETIREMENT AUTHORIZED 2026-07-13 (deletion lands with the Phase C PRs):** the
+> 15:31 IST Dhan live-vs-historical 1m cross-verify — and with it `CROSS-VERIFY-1M-01`
+> (`CrossVerify1m01MismatchFound`) and `CROSS-VERIFY-1M-02`
+> (`CrossVerify1m02FetchDegraded`) — retires with the Dhan live WS: with no Dhan live
+> candles there is no live side to compare (operator Q1/Q2, 2026-07-13;
+> `websocket-connection-scope-lock.md` "2026-07-13 Amendment"). For the record: this
+> subsystem was BLIND SINCE BIRTH until PR #1474 (2026-07-11) fixed the micros-vs-nanos
+> SQL literal bug (`compared=0` on every run, honestly reported as BLIND), and its FIRST
+> working sessions surfaced the live-vs-historical mismatches behind the operator's Q2
+> retirement rationale — the amendment's §E evidence table carries the numbers. Phase C
+> obligation: `spot_1m_rest_boot` imports `parse_intraday_1m_candles` + `MinuteCandle`
+> from `cross_verify_1m_boot.rs` — the parser MUST be relocated before the file is
+> deleted (Phase B map §4, Verified). The `cross_verify_1m_audit` table + CSVs are
+> retained (forensic). Ongoing OHLCV parity signals: the §37 BruteX comparison + the §38
+> Groww/Dhan per-minute REST tables. Content below retained for historical audit.
+
 ## §0. Why this exists (operator directive 2026-06-02)
 
 Operator quote: *"put back the historical cross verification at precise 3.31 pm
@@ -80,6 +96,20 @@ report a clean "all match" on an empty/partial compare set).
 2. Check Dhan Data-API health + our rate budget (5/sec, 100k/day). 243 calls is
    well inside budget, so sustained failure points at Dhan-side or network.
 3. The 15:31 run is best-effort and never blocks; next trading day re-runs.
+
+**2026-07-13 update — bounded 429 second pass now exists:** the live
+2026-07-13 run lost 91/776 fetches to HTTP 429 at 15:31–15:33 (compared=0,
+a BLIND day). Fetch failures are now TYPED on the real `StatusCode`: 429s
+are deferred out of the first pass into a cohort, and after a 45 s
+cool-down the run retries that cohort ONCE, paced at ≤3 requests/second
+(strictly below the Data-API 5/sec budget), folding successes into the
+comparison BEFORE the report. Anything still failing lands in
+`fetch_failures` and rides the unchanged honest BLIND/DEGRADED
+classification — one pass, linearly bounded, never a loop. Counters:
+`tv_cross_verify_1m_retry_429_total{outcome="recovered"|"still_failed"}`.
+The spot-1m post-session sweep simultaneously moved to ~15:33:30 IST so
+its requests clear this run's burst window (see
+`rest-1m-pipeline-error-codes.md`).
 
 **Source:** `crates/app/src/cross_verify_1m_boot.rs::run_cross_verify_1m`,
 `crates/common/src/error_code.rs::CrossVerify1m02FetchDegraded`.

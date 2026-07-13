@@ -71,6 +71,23 @@ row's `close_to_data_ms` column stamps the REAL (> 60 s) retrieval delay
 while the histogram keeps sampling own-fire retrievals only. See
 `no-rest-except-live-feed-2026-06-27.md` §8.7 for the dated record.
 
+**2026-07-13 429-coordination follow-up (same-day, second PR):** the first
+live session ALSO showed `/v2/charts/intraday` rate-limiting BOTH
+consumers — the 15:31 bulk cross-verify lost 91/776 fetches to HTTP 429 at
+15:31–15:33 (compared=0, a BLIND day). Three bounded changes: (a) the spot
+half's ONE post-session repair sweep now fires at **~15:33:30 IST** (was
+~15:31:00) so its ≤3 requests clear that burst window (const-asserted ≥
+the cross-verify trigger + 150 s and before the 16:30 IST box stop);
+(b) the in-minute re-poll ladder carries a deterministic per-SID schedule
+jitter (slot × 150 ms — 0/150/300 ms, NO randomness) so the 3 concurrent
+ladders never re-poll in lockstep, and an HTTP 429 adds a bounded +2 s
+backoff before the NEXT rung (same rung count — never an extra retry;
+still counted by `tv_spot1m_rate_limited_total`; the worst-case all-429
+jittered schedule of 19.3 s is const-asserted inside the 20 s per-SID
+budget); (c) the cross-verify gained its OWN bounded 429 second pass —
+see the dated note in `cross-verify-1m-error-codes.md` §2 and the
+`tv_cross_verify_1m_retry_429_total{outcome}` counters.
+
 The OPTION-CHAIN half (PR-3, appended 2026-07-12) shares the same minute
 boundaries, SEQUENCED immediately after the spot leg via a watch signal the
 spot task publishes at the end of each fire (fallback timer 2.5 s after the
@@ -108,7 +125,9 @@ the `stage` field):
 1. `stage="minute_failed"` — coalesced ONCE per fired minute when one or
    more of the 3 SIDs ended the bounded ladder without the target candle:
    transport error, non-2xx (incl. DH-904/429 — counted by
-   `tv_spot1m_rate_limited_total`, never retried past the ladder), no
+   `tv_spot1m_rate_limited_total`, +2 s bounded backoff before the next
+   rung since the 2026-07-13 429-coordination follow-up, never retried
+   past the ladder), no
    token at fire time, or a 200 whose body never contained the just-closed
    minute (`outcome="empty"` — counted, included in the failure edge,
    never silent per audit Rule 11). Sub-edge: log-only, never a page.
@@ -133,6 +152,31 @@ the `stage` field):
    `SPOT_1M_REST_SID_BUDGET_SECS` (20 s) with a 5 s per-request timeout
    (`SPOT_1M_REST_REQUEST_TIMEOUT_SECS`), const-asserted < the minute —
    `tv_spot1m_sid_budget_exceeded_total` counts budget trips.
+5. `stage="sid_not_served"` (2026-07-13 — INDIA VIX joins the spot set;
+   operator scope addition 2026-07-13, relayed via the coordinator
+   session: INDIA VIX joins the spot 1m pull, spot only, no option
+   chain) — the per-SID persistent-empty detector: ONE SID accumulated
+   `SPOT_1M_REST_SID_NOT_SERVED_THRESHOLD` (10) consecutive empty/failed
+   minutes WHILE ≥1 other SID succeeded in those same minutes — the
+   vendor is not serving THIS index (a global-outage minute neither
+   counts nor resets the streak; general outages stay the
+   `stage="escalation"` edge's page). Fires ONE edge-latched HIGH page
+   per SID per episode (typed `Spot1mSidNotServed` Telegram, plain
+   English: "Dhan is not returning 1-minute candles for INDIA VIX — the
+   other indices are unaffected"), re-armed only by that SID's own
+   recovery (one Info `Spot1mSidServedRecovered`). Counter:
+   `tv_spot1m_sid_not_served_total{symbol}` (4 static label values —
+   the pinned index symbols), one increment per counted not-served
+   minute. HONESTY: whether Dhan `/v2/charts/intraday` serves INDIA VIX
+   1m candles at all is a LIVE-PROBE UNKNOWN — the spot set is now 4
+   SIDs (NIFTY 13 / BANKNIFTY 25 / SENSEX 51 / INDIA VIX 21; still
+   inside the Data-API 5/sec budget, jitter slots widened 0/150/300/450
+   ms, worst-case ladder 19.45 s < the 20 s budget), the chain leg stays
+   the VIX-free 3-underlying `CHAIN_1M_UNDERLYINGS` subset
+   (const-asserted — VIX can never enter the option-chain pipeline),
+   per-SID independence is unit-pinned (a 3-ok/1-empty minute is NOT
+   fully-failed and NOT edge-counted), and index candles legitimately
+   carry zero volume (never flagged as an error).
 
 **Triage:**
 1. `mcp__tickvault-logs__tail_errors` — find `SPOT1M-01`; the payload
@@ -158,6 +202,42 @@ re-attempts, and a later manual re-run of the day is possible because
 re-appends UPSERT in place. Release-build panics abort the process
 (`panic = "abort"`) — the respawn arms are unwind-build/self-heal paths,
 the same honesty note as TICK-FLUSH-01.
+
+**2026-07-13 — the GROWW spot leg emits this SAME code (no new variant):**
+the Groww per-minute spot 1m REST leg
+(`crates/app/src/groww_spot_1m_boot.rs`, operator grant 2026-07-13 —
+`groww-second-feed-scope-2026-06-19.md` §38 /
+`no-rest-except-live-feed-2026-06-27.md` §9, plan
+`.claude/plans/active-plan-groww-rest-1m.md` PR-2) reuses `SPOT1M-01` with
+the SAME stage taxonomy, distinguished by a **`feed = "groww"` field on
+every emit** (the Dhan sites stay field-less — grep `feed="groww"` to
+split). Groww-specific additions: `stage="token_read"` (the shared-minter
+SSM read failed — re-read paced ≥60 s, NEVER minted, per
+`groww-shared-token-minter-2026-07-02.md`) and the sweep stages
+(`sweep_failed`/`sweep_incomplete` — the #1499 post-session repair sweep,
+shipped in the Groww leg from day one alongside the day-granular window +
+the one-minute-lookback backfill). Groww counters mirror the Dhan names
+under the `tv_groww_spot1m_*` prefix (`fetch_total{outcome}`,
+`close_to_data_ms`, `rate_limited_total`, `boundary_skipped_total`,
+`task_respawn_total{reason}`, `backfilled_total`, `sweep_*`,
+`ts_form_total{form}` — the UNVERIFIED-LIVE timestamp wire-format probe).
+The typed pages are the Groww-specific `GrowwSpot1mFetchDegraded` /
+`GrowwSpot1mFetchRecovered` Telegram events (same 3-minute edge).
+
+**2026-07-13 scope note — the Groww spot leg covers 4 indices (INDIA VIX
+added, SPOT ONLY; `groww-second-feed-scope-2026-06-19.md` §38.7):** the
+4th target's Groww identity is RUNTIME-resolved from the day's watch file
+(never a guessed literal). VIX-specific stages on `SPOT1M-01`
+(`feed="groww"`, both `warn!`-level, log-sink-only per §3):
+`stage="vix_unresolved"` — the day's master carries no resolvable VIX row
+(one edge-latched warn per run; `tv_groww_spot1m_vix_unresolved_total` per
+attempt; VIX skipped, the 3 core indices unaffected) — and
+`stage="vix_not_served"` — the once-per-session sweep found ZERO persisted
+VIX minutes while the core indices persisted ("India VIX not served by
+Groww historical-candles"; `tv_groww_spot1m_vix_not_served_total`, plus
+`tv_groww_spot1m_vix_empty_total` per 2xx-without-the-minute VIX ladder).
+Per-SID independence: the 3-minute escalation edge keys on the 3 CORE
+indices only — a VIX-only failure never pages, core-all-failed still does.
 
 ## §2. SPOT1M-02 — spot_1m_rest persist failed
 
@@ -195,6 +275,37 @@ the SPOT1M-01 failure edge (M1 — persist failure = not-fully-OK).
 **Honest envelope:** the table is a forensic/reference record — a persist
 outage loses rows for the outage window only; it never affects tick
 capture, the WS candles, or trading.
+
+**2026-07-13 — the GROWW spot leg emits this SAME code (no new variant):**
+the Groww leg's persist errors carry a **`feed = "groww"` field** on every
+emit, same stage taxonomy (`append`/`flush`; ensure stages are shared —
+the table DDL is one), counters under `tv_groww_spot1m_persist_errors_total{stage}`
++ `tv_groww_spot1m_rows_discarded_total` (per-feed discard series — a
+Groww discard never inflates the Dhan signal). SAME table, `feed='groww'`
+rows — `feed` is already in the DEDUP key, so the two feeds' rows never
+collide. ADDITIONALLY (operator scope addition 2026-07-13): the NEW
+**`rest_fetch_audit` per-fetch forensics table**
+(`crates/storage/src/rest_fetch_audit_persistence.rs` — one row per
+`(target minute, symbol, feed, leg)` fetch, success AND failure, DEDUP
+`(ts, trading_date_ist, feed, leg, security_id, exchange_segment, outcome)`
+— `outcome` in-key per phase-0 DEDUP rule 3 so TRANSITION rows BOTH
+survive: a sweep gap row never overwrites the minute's original ladder
+row; hostile round 1 item 5) is written BEST-EFFORT by the Groww leg (the
+Dhan leg's emit sites are a fast FOLLOW-UP after #1499 merges); its
+ensure/append/flush failures reuse SPOT1M-02 with stages
+`audit_ensure_client_build` / `audit_ensure_ddl` / `audit_append` /
+`audit_flush` + `tv_rest_fetch_audit_persist_errors_total{stage}` — a
+forensics write failure NEVER affects the fetch loop or the failure edge.
+A minute the 15:31 sweep still cannot recover is a NAMED GAP: one
+`rest_fetch_audit` row per (minute, symbol) with the DISTINCT
+`outcome="named_gap"` (hostile round 1 item 6 — never a misleading
+200+`error` pair; `final_http_status` = the ACTUAL last status when a
+fetch happened, 0 sentinel when none) and class slugs `named_gap` /
+`pre_boot` (a mid-session boot's pre-boot blind window is named
+AUDIT-ONLY — §38/§9 forbid a bulk backfill fetch) / `persist_failed`
+(fetched OK but the ILP APPEND failed — a persist failure, never dressed
+as vendor absence; round-2 LOW) / `flush_failed` (swept minutes lost at
+the ILP flush) / `no_token` — never a silent hole.
 
 ## §2b. CHAIN-01 — option-chain entitlement absent (pipeline down for the day)
 
@@ -240,6 +351,13 @@ DHAN ERROR-JSON SHAPE (`errorCode`/`errorType` field present —
 Dhan-shaped 403 naming "subscription" for a non-entitlement reason still
 classifies absent — bounded to ONE HIGH page, day-scoped, the WS feed
 untouched; triage step 2 (the Dhan portal check) disambiguates.
+
+**2026-07-13 — the GROWW chain leg NEVER emits CHAIN-01:** Groww's chain
+endpoint has no separate Data-API entitlement question (the shared-minter
+access token is the only gate) and no expirylist endpoint (expiries come
+from the already-ingested daily instruments CSV), so a Groww auth /
+transport reject is a CHAIN-02 transient (`feed = "groww"`), never a
+day-killing CHAIN-01.
 
 ## §2c. CHAIN-02 — per-minute option-chain fetch degraded
 
@@ -289,6 +407,44 @@ the `stage` field — the SPOT1M-01 taxonomy applied to the chain leg):
 re-poll ladder (the chain is a live snapshot, not a just-sealed candle) —
 a failed minute is a counted, coded, visible gap; re-appends UPSERT in
 place so a later manual re-run backfills safely.
+
+**2026-07-13 — the GROWW chain leg emits this SAME code (no new
+variant):** the Groww per-minute option-chain leg
+(`crates/app/src/groww_option_chain_1m_boot.rs`, plan
+`.claude/plans/active-plan-groww-rest-1m.md` PR-3) reuses `CHAIN-02` with
+the SAME stage taxonomy, distinguished by a **`feed = "groww"` field on
+every emit** (the Dhan sites stay field-less — grep `feed="groww"` to
+split). Groww-specific additions: `stage="probe"` (the boot-time
+probe-only path — one bounded chain GET, verdict via Info Telegram,
+persists nothing), `stage="expiry_unresolved"` (the daily Groww
+instruments CSV carried no FNO CE/PE rows ≥ today for an underlying —
+that underlying degrades for the day, coded + counted by
+`tv_groww_chain1m_expiry_unresolved_total` + the typed HIGH
+`GrowwChain1mExpiryUnresolved` Telegram; NEVER guessed), and
+`stage="strikes_truncated"` (a hostile/oversized chain body hit the
+strike cap — truncated + counted, never unbounded). `stage="token_read"`
+lives on the shared token cache (`tv_groww_chain1m_token_read_failed_total`
+— re-read paced ≥60 s, NEVER minted). Sequencing mirrors the Dhan leg:
+the chain fires on the spot leg's watch signal after every spot fire,
+bounded by the ~2.5 s fallback timer; one request per underlying per
+minute, sequential, with a defensive 1 s min-gap (Groww documents no
+chain-specific rate rule). Groww counters mirror the Dhan names under the
+`tv_groww_chain1m_*` prefix (`fetch_total{outcome}`, `close_to_data_ms`,
+`fetch_duration_ms`, `strikes_per_chain`, `legs_per_chain`,
+`payload_bytes`, `rate_limited_total`, `boundary_skipped_total`,
+`underlying_budget_exceeded_total`, `invalid_strikes_total`,
+`task_respawn_total{reason}`). The typed pages are the Groww-specific
+`GrowwChain1mFetchDegraded` / `GrowwChain1mFetchRecovered` Telegram
+events (same 3-minute persist-gated edge). Forensics: one
+`rest_fetch_audit` row per (minute, underlying) with `leg='chain_1m'`,
+`attempts=1` (no re-poll ladder — live snapshot semantics). Gate note
+(2026-07-13): the Groww chain leg shipped base.toml DEFAULT-OFF
+(probe-only); the first live probe PASSED the same night (build
+`eeca0ec`, ~11:47 PM IST) and `[groww_option_chain_1m].enabled` flipped
+to `true` in base.toml — dated record in
+`groww-second-feed-scope-2026-06-19.md` §38.6; the serde DEFAULT stays
+OFF (fail-safe) and `probe_and_report` stays `true` (inert while
+enabled; the rollback canary).
 
 ## §2d. CHAIN-03 — option_chain_1m persist failed
 
@@ -352,6 +508,23 @@ the failure edge honestly counts it fully-failed (persist-gated). A later
 re-run/backfill of the same minute UPSERTs in place (DEDUP-idempotent)
 and heals the partial rows.
 
+**2026-07-13 — the GROWW chain leg emits this SAME code (no new
+variant):** the Groww leg writes the SAME `option_chain_1m` table with
+`feed='groww'` rows (`feed` is already in the DEDUP key — the two feeds'
+rows never collide), same stage taxonomy (`append`/`flush`; the
+ensure-DDL stages are shared — one table, one DDL), with a **`feed =
+"groww"` field on every emit** and counters under
+`tv_groww_chain1m_persist_errors_total{stage}` +
+`tv_groww_chain1m_rows_discarded_total`. Two columns added 2026-07-13 via
+ALTER-ADD self-heal for the Groww leg: `rho` (Groww supplies it; Dhan
+does not) and `close_to_data_ms` (per-row latency stamp — the ONLY
+freshness signal, since Groww's chain response carries NO timestamp).
+Dhan rows leave both NULL (the Dhan emit path is untouched). The Groww
+leg's `rest_fetch_audit` forensics failures reuse the SPOT1M-02 stage
+names `audit_append` / `audit_flush` but are coded CHAIN-03 with
+`leg='chain_1m'` context — a forensics write failure NEVER affects the
+fetch loop or the failure edge.
+
 ## §2e. CHAIN-04 — day-start expirylist warmup failed (pipeline down for the day)
 
 **Severity:** High. **Auto-triage safe:** Yes (the next trading-day boot
@@ -400,6 +573,13 @@ boot re-probes).
 failing expirylist would be a reject storm for zero benefit; one loud
 page + a clean daily boundary is the honest degrade.
 
+**2026-07-13 — the GROWW chain leg NEVER emits CHAIN-04:** there is no
+Groww expirylist endpoint — the CURRENT expiry per underlying is resolved
+from the already-ingested daily Groww instruments CSV (nearest ≥ today,
+never-roll). A master that carries no usable FNO rows for an underlying
+degrades THAT underlying via CHAIN-02 `stage="expiry_unresolved"`
+(`feed = "groww"`), never a whole-pipeline CHAIN-04 day-kill.
+
 ## §3. Delivery boundary (honest — no false-OK)
 
 All six codes (SPOT1M-01/02 + CHAIN-01..04) are **log-sink-only today**: NO `error_code_alerts` map entry in
@@ -419,12 +599,20 @@ This rule activates when editing:
 - `crates/common/src/error_code.rs` (any `Spot1m0*` or `Chain0*` variant)
 - `crates/app/src/spot_1m_rest_boot.rs`
 - `crates/app/src/option_chain_1m_boot.rs`
+- `crates/app/src/groww_spot_1m_boot.rs` (the 2026-07-13 Groww leg)
+- `crates/app/src/groww_option_chain_1m_boot.rs` (the 2026-07-13 Groww
+  chain leg)
 - `crates/storage/src/spot_1m_rest_persistence.rs`
 - `crates/storage/src/option_chain_1m_persistence.rs`
-- `crates/common/src/config.rs` (`Spot1mRestConfig` / `OptionChain1mConfig`)
+- `crates/storage/src/rest_fetch_audit_persistence.rs` (the 2026-07-13
+  per-fetch forensics table)
+- `crates/common/src/config.rs` (`Spot1mRestConfig` / `OptionChain1mConfig`
+  / `GrowwSpot1mConfig` / `GrowwOptionChain1mConfig`)
 - Any file containing `SPOT1M-01`, `SPOT1M-02`, `Spot1m01FetchDegraded`,
   `Spot1m02PersistFailed`, `spot_1m_rest`, `SPOT_1M_REST_INDICES`,
   `tv_spot1m_fetch_total`, `CHAIN-01`, `CHAIN-02`, `CHAIN-03`, `CHAIN-04`,
   `Chain01EntitlementAbsent`, `Chain02FetchDegraded`,
-  `Chain03PersistFailed`, `Chain04ExpirylistFailed`, `option_chain_1m`, or
-  `tv_chain1m_fetch_total`
+  `Chain03PersistFailed`, `Chain04ExpirylistFailed`, `option_chain_1m`,
+  `tv_chain1m_fetch_total`, `GROWW_SPOT_1M_SYMBOLS`, `rest_fetch_audit`,
+  `tv_groww_spot1m_fetch_total`, `GROWW_CHAIN_1M_UNDERLYINGS`, or
+  `tv_groww_chain1m_fetch_total`

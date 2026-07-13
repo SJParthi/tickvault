@@ -99,6 +99,37 @@ pub struct ApplicationConfig {
     /// pipeline disabled + probe-and-report ON.
     #[serde(default)]
     pub option_chain_1m: OptionChain1mConfig,
+    /// `[groww_spot_1m]` — Groww per-minute spot 1m REST leg (operator grant
+    /// 2026-07-13, `.claude/plans/active-plan-groww-rest-1m.md` PR-2): every
+    /// trading-day minute close in session, fetch that just-closed minute's
+    /// official 1m OHLCV for the 3 spot indices via Groww
+    /// `GET /v1/historical/candles` and persist to `spot_1m_rest` tagged
+    /// `feed='groww'`. Independent of the Dhan lane (spawned process-global;
+    /// a Dhan-off session still runs it). Absent section ⇒ DISABLED
+    /// (fail-safe default off).
+    #[serde(default)]
+    pub groww_spot_1m: GrowwSpot1mConfig,
+    /// `[groww_option_chain_1m]` — Groww per-minute option-chain REST leg
+    /// (operator grant 2026-07-13, `.claude/plans/active-plan-groww-rest-1m.md`
+    /// PR-3): every trading-day minute close in session — sequenced after
+    /// the Groww spot leg — fetch the CURRENT-expiry option chain for the
+    /// 3 underlyings via Groww `GET /v1/option-chain/...` and persist to
+    /// the EXISTING `option_chain_1m` table tagged `feed='groww'`. Shipped
+    /// DEFAULT-OFF pending the first live probe (the endpoint is
+    /// documented-available — unlike Dhan's entitlement question — but the
+    /// live shape/latency are UNVERIFIED). Absent section ⇒ pipeline
+    /// disabled + probe-and-report ON.
+    #[serde(default)]
+    pub groww_option_chain_1m: GrowwOptionChain1mConfig,
+    /// `[tf_consistency]` — daily timeframe-consistency verifier (operator
+    /// directive 2026-07-13: *"how will you guarantee that all our defined
+    /// timeframes internally are correct"*). At 15:40 IST every trading day,
+    /// recompute every sealed higher-TF candle (2m..4h, both feeds) from its
+    /// stored `candles_1m` constituents and compare exactly; findings land
+    /// in `tf_consistency_audit` + one Telegram summary. Cold path only.
+    /// Absent section ⇒ DISABLED (fail-safe default off).
+    #[serde(default)]
+    pub tf_consistency: TfConsistencyConfig,
 }
 
 /// `[feeds]` — pluggable market-data feed selection (operator lock
@@ -365,6 +396,24 @@ pub struct Spot1mRestConfig {
     pub enabled: bool,
 }
 
+/// `[tf_consistency]` — daily timeframe-consistency verifier (operator
+/// directive 2026-07-13). Cold path only — the live candle pipeline, tick
+/// capture and trading are untouched; the verifier READS `candles_*` and
+/// writes ONLY its own `tf_consistency_audit` table.
+///
+/// Fail-safe shape: `enabled` is `#[serde(default)]` = `false`, so an
+/// absent `[tf_consistency]` section (or a TOML written before this PR)
+/// disables the verifier entirely. `config/base.toml` explicitly sets
+/// `enabled = true`.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct TfConsistencyConfig {
+    /// Master switch for the daily 15:40 IST timeframe-consistency
+    /// verifier. Default OFF (fail-safe) — `config/base.toml` turns it on
+    /// explicitly.
+    #[serde(default)]
+    pub enabled: bool,
+}
+
 /// `[option_chain_1m]` — per-minute option-chain REST pipeline (operator
 /// grant 2026-07-12; PR-3, the OPTION-CHAIN half). Cold path only — the
 /// WS candle pipeline, tick capture and trading are untouched.
@@ -405,7 +454,69 @@ fn default_chain_1m_probe_and_report() -> bool {
     true
 }
 
+/// `[groww_spot_1m]` — Groww per-minute spot 1m REST leg (operator grant
+/// 2026-07-13; PR-2 of the Groww per-minute REST plan). Cold path only —
+/// the WS pipelines, tick capture and trading are untouched.
+///
+/// Fail-safe shape: `enabled` is `#[serde(default)]` = `false`, so an
+/// absent `[groww_spot_1m]` section (or a TOML written before this PR)
+/// disables the fetcher entirely. `config/base.toml` explicitly sets
+/// `enabled = true` (the Dhan spot-leg precedent: spot on, chain gated).
+///
+/// Extension point (PR-3/PR-4, chain + contract legs): every FUTURE field
+/// on this struct MUST also be `#[serde(default)]` so older TOMLs keep
+/// deserializing byte-identically (the `Spot1mRestConfig` precedent).
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct GrowwSpot1mConfig {
+    /// Master switch for the Groww per-minute spot 1m REST fetcher.
+    /// Default OFF (fail-safe) — `config/base.toml` turns it on explicitly.
+    #[serde(default)]
+    pub enabled: bool,
+}
+
 impl Default for OptionChain1mConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            probe_and_report: default_chain_1m_probe_and_report(),
+        }
+    }
+}
+
+/// `[groww_option_chain_1m]` — Groww per-minute option-chain REST leg
+/// (operator grant 2026-07-13; PR-3 of the Groww per-minute REST plan).
+/// Cold path only — the WS pipelines, tick capture and trading are
+/// untouched.
+///
+/// Config semantics mirror the Dhan `[option_chain_1m]` gate:
+/// - `enabled = true` → run the per-minute chain pipeline (sequenced after
+///   the Groww spot leg via the watch signal + fallback timer).
+/// - `enabled = false` + `probe_and_report = true` (the default) → run ONE
+///   bounded boot-time chain probe per underlying, report the measured
+///   verdict (shape / strikes / latency / reject class) via an Info
+///   Telegram + coded log, persist NOTHING, then exit. The pipeline NEVER
+///   auto-runs while `enabled = false` — the operator flips the config
+///   after the probe verdict.
+///
+/// DEFAULT-OFF rationale (dated 2026-07-13): the Groww chain endpoint is
+/// documented-available (no Dhan-style entitlement question), but the live
+/// response shape / strike-key format / latency / rate-limit family are
+/// UNVERIFIED-LIVE (`docs/groww-ref/99-UNKNOWNS.md` U-4/U-11/U-12/U-13) —
+/// the probe is the first live measurement. Flipping the DEFAULT needs a
+/// fresh dated operator quote.
+#[derive(Debug, Clone, Deserialize)]
+pub struct GrowwOptionChain1mConfig {
+    /// Master switch for the Groww per-minute chain fetcher. Default OFF
+    /// (pending the first live probe).
+    #[serde(default)]
+    pub enabled: bool,
+    /// When the pipeline is disabled, still run the ONE boot-time chain
+    /// probe and report the measured verdict via Telegram. Default ON.
+    #[serde(default = "default_chain_1m_probe_and_report")]
+    pub probe_and_report: bool,
+}
+
+impl Default for GrowwOptionChain1mConfig {
     fn default() -> Self {
         Self {
             enabled: false,
@@ -2347,6 +2458,9 @@ mod tests {
             scoreboard: ScoreboardConfig::default(),
             spot_1m_rest: Spot1mRestConfig::default(),
             option_chain_1m: OptionChain1mConfig::default(),
+            groww_spot_1m: GrowwSpot1mConfig::default(),
+            groww_option_chain_1m: GrowwOptionChain1mConfig::default(),
+            tf_consistency: TfConsistencyConfig::default(),
         }
     }
 
@@ -3755,6 +3869,134 @@ mod tests {
             .expect("explicit values must round-trip");
         assert!(on.option_chain_1m.enabled);
         assert!(!on.option_chain_1m.probe_and_report);
+    }
+
+    /// Groww per-minute spot 1m REST leg (operator grant 2026-07-13,
+    /// PR-2): the `[groww_spot_1m]` section is FAIL-SAFE default OFF —
+    /// via `Default`, via a missing section, and via an empty section —
+    /// and an explicit `enabled = true` (the base.toml shape) round-trips.
+    #[test]
+    fn test_groww_spot_1m_config_defaults_off_and_round_trips() {
+        use figment::Figment;
+        use figment::providers::{Format, Toml};
+
+        assert!(
+            !GrowwSpot1mConfig::default().enabled,
+            "groww_spot_1m must default OFF (fail-safe; base.toml opts in)"
+        );
+
+        #[derive(Deserialize)]
+        struct Wrapper {
+            #[serde(default)]
+            groww_spot_1m: GrowwSpot1mConfig,
+        }
+        // Missing section entirely → disabled, never an error.
+        let missing: Wrapper = Figment::new()
+            .merge(Toml::string("[other]\nx = 1\n"))
+            .extract()
+            .expect("missing [groww_spot_1m] must default, not error");
+        assert!(!missing.groww_spot_1m.enabled);
+        // Empty section (no keys) → disabled via the field-level default.
+        let empty: Wrapper = Figment::new()
+            .merge(Toml::string("[groww_spot_1m]\n"))
+            .extract()
+            .expect("empty [groww_spot_1m] must default, not error");
+        assert!(!empty.groww_spot_1m.enabled);
+        // Explicit ON (the base.toml shape) round-trips.
+        let on: Wrapper = Figment::new()
+            .merge(Toml::string("[groww_spot_1m]\nenabled = true\n"))
+            .extract()
+            .expect("explicit enabled = true must round-trip");
+        assert!(on.groww_spot_1m.enabled);
+    }
+
+    /// Config-gate contract (Groww per-minute REST plan PR-3): the
+    /// `[groww_option_chain_1m]` section is DEFAULT-OFF with
+    /// probe-and-report ON — mirrors the Dhan `[option_chain_1m]` gate;
+    /// an absent/empty section (or an older TOML) never errors.
+    #[test]
+    fn test_groww_option_chain_1m_config_defaults_off_probe_on_and_round_trips() {
+        use figment::Figment;
+        use figment::providers::{Format, Toml};
+
+        let d = GrowwOptionChain1mConfig::default();
+        assert!(
+            !d.enabled,
+            "groww_option_chain_1m must default OFF (pending the first live probe)"
+        );
+        assert!(
+            d.probe_and_report,
+            "probe_and_report must default ON (the operator learns the live verdict)"
+        );
+
+        #[derive(Deserialize)]
+        struct Wrapper {
+            #[serde(default)]
+            groww_option_chain_1m: GrowwOptionChain1mConfig,
+        }
+        // Missing section entirely → disabled + probe ON, never an error.
+        let missing: Wrapper = Figment::new()
+            .merge(Toml::string("[other]\nx = 1\n"))
+            .extract()
+            .expect("missing [groww_option_chain_1m] must default, not error");
+        assert!(!missing.groww_option_chain_1m.enabled);
+        assert!(missing.groww_option_chain_1m.probe_and_report);
+        // Empty section (no keys) → field-level defaults.
+        let empty: Wrapper = Figment::new()
+            .merge(Toml::string("[groww_option_chain_1m]\n"))
+            .extract()
+            .expect("empty [groww_option_chain_1m] must default, not error");
+        assert!(!empty.groww_option_chain_1m.enabled);
+        assert!(empty.groww_option_chain_1m.probe_and_report);
+        // Explicit ON (the future flip shape) round-trips; probe can be
+        // explicitly silenced.
+        let on: Wrapper = Figment::new()
+            .merge(Toml::string(
+                "[groww_option_chain_1m]\nenabled = true\nprobe_and_report = false\n",
+            ))
+            .extract()
+            .expect("explicit values must round-trip");
+        assert!(on.groww_option_chain_1m.enabled);
+        assert!(!on.groww_option_chain_1m.probe_and_report);
+    }
+
+    /// Daily timeframe-consistency verifier (operator 2026-07-13): the
+    /// `[tf_consistency]` section is fail-safe DEFAULT-OFF — via `Default`,
+    /// via a missing section, and via an empty section — and the explicit
+    /// base.toml opt-in round-trips.
+    #[test]
+    fn test_tf_consistency_config_default_off_and_round_trip() {
+        use figment::Figment;
+        use figment::providers::{Format, Toml};
+
+        assert!(
+            !TfConsistencyConfig::default().enabled,
+            "tf_consistency must default OFF (fail-safe; base.toml opts in)"
+        );
+
+        #[derive(Deserialize)]
+        struct Wrapper {
+            #[serde(default)]
+            tf_consistency: TfConsistencyConfig,
+        }
+        // Missing section entirely → disabled, never an error.
+        let missing: Wrapper = Figment::new()
+            .merge(Toml::string("[other]\nx = 1\n"))
+            .extract()
+            .expect("missing [tf_consistency] must default, not error");
+        assert!(!missing.tf_consistency.enabled);
+        // Empty section (no keys) → disabled via the field-level default.
+        let empty: Wrapper = Figment::new()
+            .merge(Toml::string("[tf_consistency]\n"))
+            .extract()
+            .expect("empty [tf_consistency] must default, not error");
+        assert!(!empty.tf_consistency.enabled);
+        // Explicit ON (the base.toml shape) round-trips.
+        let on: Wrapper = Figment::new()
+            .merge(Toml::string("[tf_consistency]\nenabled = true\n"))
+            .extract()
+            .expect("explicit enabled = true must round-trip");
+        assert!(on.tf_consistency.enabled);
     }
 
     /// A missing `[feeds]` section must fall back to the safe default
