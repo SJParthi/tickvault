@@ -898,4 +898,129 @@ mod tests {
             );
         }
     }
+
+    /// Exhaustive property sweep over the stack's whole pure decision
+    /// surface (2026-07-13, post-#1499 merge hardening): every retry /
+    /// page / park decision the bring-up loop can take is pinned across
+    /// the full realistic attempt domain, not just the ladder's named
+    /// rungs — a refactor that bends any monotonicity, cap, floor, or
+    /// boundary fails here before it can reach the live SSM/mint loops.
+    #[test]
+    fn test_dhan_rest_stack_decision_surface_exhaustive_sweep() {
+        // (a) Generic backoff: monotone non-decreasing, base-floored,
+        //     hard-capped, and the cap is REACHED (never an unreachable
+        //     asymptote) within the documented 6 rungs.
+        let mut prev = 0u64;
+        for attempt in 0..=64u32 {
+            let gap = dhan_rest_stack_backoff_secs(attempt);
+            assert!(gap >= DHAN_REST_STACK_BACKOFF_BASE_SECS, "base floor");
+            assert!(gap <= DHAN_REST_STACK_BACKOFF_CAP_SECS, "hard cap");
+            assert!(gap >= prev, "attempt {attempt}: backoff must never shrink");
+            prev = gap;
+        }
+        assert_eq!(
+            dhan_rest_stack_backoff_secs(6),
+            DHAN_REST_STACK_BACKOFF_CAP_SECS,
+            "cap reached at rung 6"
+        );
+
+        // (b) Token backoff: same shape AND strictly above the generic
+        //     early rungs (the whole point of the 130s floor).
+        let mut prev = 0u64;
+        for attempt in 0..=64u32 {
+            let gap = dhan_rest_token_backoff_secs(attempt);
+            assert!(gap >= DHAN_REST_STACK_TOKEN_RETRY_FLOOR_SECS, "130s floor");
+            assert!(gap <= DHAN_REST_STACK_BACKOFF_CAP_SECS, "hard cap");
+            assert!(
+                gap >= prev,
+                "attempt {attempt}: token backoff must never shrink"
+            );
+            prev = gap;
+        }
+
+        // (c) Retry-log cadence: EXACT set membership over 0..=40 — first
+        //     attempt, then every Nth; nothing else (log-storm bound).
+        for attempt in 0..=40u32 {
+            let expected = attempt == 1
+                || (attempt > 0 && attempt % DHAN_REST_STACK_LOG_EVERY_N_ATTEMPTS == 0);
+            assert_eq!(
+                dhan_rest_retry_should_log(attempt),
+                expected,
+                "cadence mismatch at attempt {attempt}"
+            );
+        }
+        assert!(!dhan_rest_retry_should_log(0), "attempt 0 never logs");
+
+        // (d) Peer-page decision matrix: fires exactly once, only from the
+        //     min-attempt boundary onward, and never re-fires once paged.
+        let min = DHAN_REST_STACK_PEER_PAGE_MIN_ATTEMPT;
+        assert!(!dhan_rest_peer_page_due(min - 1, false), "below boundary");
+        assert!(dhan_rest_peer_page_due(min, false), "at boundary");
+        assert!(dhan_rest_peer_page_due(min + 1, false), "above boundary");
+        for attempt in 0..=64u32 {
+            assert!(
+                !dhan_rest_peer_page_due(attempt, true),
+                "attempt {attempt}: already-paged must never re-page"
+            );
+        }
+
+        // (e) Park boundary: exact >= threshold semantics (299/300/301)
+        //     plus the domain extremes.
+        let patience = DHAN_REST_STACK_ALREADYHELD_PATIENCE_SECS;
+        assert!(!dhan_rest_lock_park_due(0), "fresh loop never parks");
+        assert!(!dhan_rest_lock_park_due(patience - 1), "one second short");
+        assert!(dhan_rest_lock_park_due(patience), "exactly at patience");
+        assert!(dhan_rest_lock_park_due(patience + 1), "past patience");
+        assert!(dhan_rest_lock_park_due(u64::MAX), "saturated domain end");
+    }
+
+    /// Source-scan pin of the #1499-mirrored spot→chain contract
+    /// (2026-07-13 sequencing merge): PR #1499 rewrote the spot-1m fetch
+    /// internals (day-window + backfill + the 15:31 post-session sweep)
+    /// WITHOUT changing the spawn surface this REST-only stack mirrors
+    /// from main.rs's `spawn_post_market_tasks`. The stack therefore
+    /// inherits the sweep by construction — this test fails the build if
+    /// either side of that contract drifts (a sweep moved OUT of the
+    /// shared task, a params-field rename, or the stack dropping the
+    /// spot→chain sequencing channel) so the mirror can never diverge
+    /// silently again.
+    #[test]
+    fn test_dhan_rest_stack_mirrors_spot_chain_contract_post_1499() {
+        // The shared spot-1m module still owns the sweep + sequencing
+        // signal (the #1499 semantics both spawn paths inherit).
+        let spot_src = include_str!("spot_1m_rest_boot.rs");
+        for needle in [
+            "run_post_session_sweep(",
+            "pub minute_done_tx",
+            "send_replace",
+            "pub fn spawn_supervised_spot_1m_rest",
+        ] {
+            assert!(
+                spot_src.contains(needle),
+                "spot_1m_rest_boot.rs lost `{needle}` — the #1499-mirrored \
+                 contract drifted; re-check dhan_rest_stack's spawn mirror"
+            );
+        }
+
+        // This module's PRODUCTION region (split at the test-module marker
+        // so these assertion literals can never satisfy themselves) still
+        // spawns the same supervised task and builds the sequencing
+        // channel the lane path uses.
+        let own_src = include_str!("dhan_rest_stack.rs");
+        let (prod, _) = own_src
+            .split_once("#[cfg(test)]")
+            .expect("dhan_rest_stack.rs must keep its test module marker");
+        for needle in [
+            "spawn_supervised_spot_1m_rest(",
+            "spawn_supervised_option_chain_1m(",
+            "watch::channel::<Option<u32>>",
+            "minute_done_tx",
+        ] {
+            assert!(
+                prod.contains(needle),
+                "dhan_rest_stack.rs production region lost `{needle}` — the \
+                 REST-only stack no longer mirrors spawn_post_market_tasks"
+            );
+        }
+    }
 }
