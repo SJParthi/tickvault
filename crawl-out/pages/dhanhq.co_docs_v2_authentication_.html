@@ -1,0 +1,2340 @@
+
+<!doctype html>
+<html lang="en" class="no-js">
+  <head>
+    
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width,initial-scale=1">
+      
+      
+      
+      
+        <link rel="prev" href="..">
+      
+      
+        <link rel="next" href="../orders/">
+      
+      
+        
+      
+      
+      <link rel="icon" href="https://images.dhan.co/common/dhanhq-favicon.png">
+      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.7.1">
+    
+    
+    <title>Authentication - DhanHQ Ver 2.0 / API Document</title>
+
+
+    
+      <link rel="stylesheet" href="../assets/stylesheets/main.484c7ddc.min.css">
+      
+      
+
+
+    
+    
+      
+    
+    
+      
+        
+        
+        <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+        <link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Roboto:300,300i,400,400i,700,700i%7CRoboto+Mono:400,400i,700,700i&display=fallback">
+        <style>:root{--md-text-font:"Roboto";--md-code-font:"Roboto Mono"}</style>
+      
+    
+    
+      <link rel="stylesheet" href="../extra.css">
+    
+    <script>__md_scope=new URL("..",location),__md_hash=e=>[...e].reduce(((e,_)=>(e<<5)-e+_.charCodeAt(0)),0),__md_get=(e,_=localStorage,t=__md_scope)=>JSON.parse(_.getItem(t.pathname+"."+e)),__md_set=(e,_,t=localStorage,a=__md_scope)=>{try{t.setItem(a.pathname+"."+e,JSON.stringify(_))}catch(e){}}</script>
+    
+      
+  
+
+
+  
+  
+
+<script id="__analytics">function __md_analytics(){function e(){dataLayer.push(arguments)}window.dataLayer=window.dataLayer||[],e("js",new Date),e("config","UA-209487654-3"),document.addEventListener("DOMContentLoaded",(function(){document.forms.search&&document.forms.search.query.addEventListener("blur",(function(){this.value&&e("event","search",{search_term:this.value})}));document$.subscribe((function(){var t=document.forms.feedback;if(void 0!==t)for(var a of t.querySelectorAll("[type=submit]"))a.addEventListener("click",(function(a){a.preventDefault();var n=document.location.pathname,d=this.getAttribute("data-md-value");e("event","feedback",{page:n,data:d}),t.firstElementChild.disabled=!0;var r=t.querySelector(".md-feedback__note [data-md-value='"+d+"']");r&&(r.hidden=!1)})),t.hidden=!1})),location$.subscribe((function(t){e("config","UA-209487654-3",{page_path:t.pathname})}))}));var t=document.createElement("script");t.async=!0,t.src="https://www.googletagmanager.com/gtag/js?id=UA-209487654-3",document.getElementById("__analytics").insertAdjacentElement("afterEnd",t)}</script>
+  
+    <script>"undefined"!=typeof __md_analytics&&__md_analytics()</script>
+  
+
+    
+    
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <link rel="icon" href="../img/favicon.png">
+    <meta name="generator" content="mkdocs-1.2.3, mkdocs-material-8.1.7">
+    <meta name="google-site-verification" content="szZSEzhedFt8R8zFFtPgH5MwKc3OAVQ3zaexU1padbg" />
+    <!-- Google Tag Manager -->
+    <script>(function(w,d,s,l,i){w[l]=w[l]||[];w[l].push({'gtm.start':
+    new Date().getTime(),event:'gtm.js'});var f=d.getElementsByTagName(s)[0],
+    j=d.createElement(s),dl=l!='dataLayer'?'&l='+l:'';j.async=true;j.src=
+    'https://www.googletagmanager.com/gtm.js?id='+i+dl;f.parentNode.insertBefore(j,f);
+    })(window,document,'script','dataLayer','GTM-T8CH7DW');</script>
+    <!-- End Google Tag Manager -->
+
+    
+
+    
+
+    
+
+    
+
+    
+
+    
+
+    
+
+    
+
+    
+
+    
+
+    
+
+    
+
+    
+
+    
+
+    
+
+    
+    
+    
+        <link rel="canonical" href="https://dhanhq.co/docs/v2/authentication/">
+        <meta name="keyword" content="dhanhq api, dhanhq api document, dhanhq authentication, dhanhq api key, dhanhq api secret, dhanhq api authentication, dhanhq static ip, dhanhq ip setup, dhanhq totp, dhanhq api key based authentication">
+        <meta name="description" content="Authentication module for DhanHQ APIs for Individual users and Partners, including access token based authentication, API key based authentication, static ip setup and TOTP setup." data-rdm="">
+    
+
+    
+
+  </head>
+  
+  
+    <body dir="ltr">
+  
+    
+    <input class="md-toggle" data-md-toggle="drawer" type="checkbox" id="__drawer" autocomplete="off">
+    <input class="md-toggle" data-md-toggle="search" type="checkbox" id="__search" autocomplete="off">
+    <label class="md-overlay" for="__drawer"></label>
+    <div data-md-component="skip">
+      
+        
+        <a href="#authentication" class="md-skip">
+          Skip to content
+        </a>
+      
+    </div>
+    <div data-md-component="announce">
+      
+        <aside class="md-banner">
+          <div class="md-banner__inner md-grid md-typeset">
+            
+            
+  You are on the latest version of DhanHQ API.
+
+          </div>
+          
+        </aside>
+      
+    </div>
+    
+    
+      
+
+  
+
+<header class="md-header md-header--shadow" data-md-component="header">
+  <nav class="md-header__inner md-grid" aria-label="Header">
+    <a href="/" title="Ver 2.0 / API Documentation" class="md-header__button md-logo" aria-label="Ver 2.0 / API Documentation" data-md-component="logo">
+      
+  <img src="../img/DhanHQ_logo.svg" alt="logo">
+
+    </a>
+    <label class="md-header__button md-icon" for="__drawer">
+      
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M3 6h18v2H3zm0 5h18v2H3zm0 5h18v2H3z"/></svg>
+    </label>
+    <div class="md-header__title" data-md-component="header-title">
+      <div class="md-header__ellipsis">
+        <div class="md-header__topic">
+          <span class="md-ellipsis">
+            Ver 2.0 / API Documentation
+          </span>
+        </div>
+        <div class="md-header__topic" data-md-component="header-topic">
+          <span class="md-ellipsis">
+            
+              Authentication
+            
+          </span>
+        </div>
+      </div>
+    </div>
+    
+    
+      <script>var palette=__md_get("__palette");if(palette&&palette.color){if("(prefers-color-scheme)"===palette.color.media){var media=matchMedia("(prefers-color-scheme: light)"),input=document.querySelector(media.matches?"[data-md-color-media='(prefers-color-scheme: light)']":"[data-md-color-media='(prefers-color-scheme: dark)']");palette.color.media=input.getAttribute("data-md-color-media"),palette.color.scheme=input.getAttribute("data-md-color-scheme"),palette.color.primary=input.getAttribute("data-md-color-primary"),palette.color.accent=input.getAttribute("data-md-color-accent")}for(var[key,value]of Object.entries(palette.color))document.body.setAttribute("data-md-color-"+key,value)}</script>
+    
+    
+    
+      
+      
+        <label class="md-header__button md-icon" for="__search">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+        </label>
+        <div class="md-search" data-md-component="search" role="dialog">
+  <label class="md-search__overlay" for="__search"></label>
+  <div class="md-search__inner" role="search">
+    <form class="md-search__form" name="search">
+      <input type="text" class="md-search__input" name="query" aria-label="Search" placeholder="Search" autocapitalize="off" autocorrect="off" autocomplete="off" spellcheck="false" data-md-component="search-query" required>
+      <label class="md-search__icon md-icon" for="__search">
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M20 11v2H8l5.5 5.5-1.42 1.42L4.16 12l7.92-7.92L13.5 5.5 8 11z"/></svg>
+      </label>
+      <nav class="md-search__options" aria-label="Search">
+        
+        <button type="reset" class="md-search__icon md-icon" title="Clear" aria-label="Clear" tabindex="-1">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg>
+        </button>
+      </nav>
+      
+    </form>
+    <div class="md-search__output">
+      <div class="md-search__scrollwrap" tabindex="0" data-md-scrollfix>
+        <div class="md-search-result" data-md-component="search-result">
+          <div class="md-search-result__meta">
+            Initializing search
+          </div>
+          <ol class="md-search-result__list" role="presentation"></ol>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+      
+    
+    
+  </nav>
+  
+</header>
+    
+    <div class="md-container" data-md-component="container">
+      
+      
+        
+          
+        
+      
+      <main class="md-main" data-md-component="main">
+        <div class="md-main__inner md-grid">
+          
+            
+              
+              <div class="md-sidebar md-sidebar--primary" data-md-component="sidebar" data-md-type="navigation" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+
+
+<nav class="md-nav md-nav--primary" aria-label="Navigation" data-md-level="0">
+  <label class="md-nav__title" for="__drawer">
+    <a href="/" title="Ver 2.0 / API Documentation" class="md-nav__button md-logo" aria-label="Ver 2.0 / API Documentation" data-md-component="logo">
+      
+  <img src="../img/DhanHQ_logo.svg" alt="logo">
+
+    </a>
+    Ver 2.0 / API Documentation
+  </label>
+  
+  <ul class="md-nav__list" data-md-scrollfix>
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href=".." class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Introduction
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+    
+  
+  
+  
+    <li class="md-nav__item md-nav__item--active">
+      
+      <input class="md-nav__toggle md-toggle" type="checkbox" id="__toc">
+      
+      
+        
+      
+      
+        <label class="md-nav__link md-nav__link--active" for="__toc">
+          
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Authentication
+  
+
+    
+  </span>
+  
+  
+
+          <span class="md-nav__icon md-icon"></span>
+        </label>
+      
+      <a href="./" class="md-nav__link md-nav__link--active">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Authentication
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+      
+        
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#eligibility" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Eligibility
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#access-for-individual-traders" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Access for Individual Traders
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Access for Individual Traders">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#access-token" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Access Token
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Access Token">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#generate-token" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Generate Token
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#renew-token" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Renew Token
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#api-key-secret" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        API key &amp; secret
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#for-partners" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        For Partners
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#setup-static-ip" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Setup Static IP
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Setup Static IP">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#set-ip" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Set IP
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#modify-ip" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Modify IP
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#get-ip" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Get IP
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#setup-totp" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Setup TOTP
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Setup TOTP">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#what-is-totp" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        What is TOTP?
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#how-to-set-up-totp" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        How to set up TOTP
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#user-profile" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        User Profile
+      
+    </span>
+  </a>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+    
+    
+      
+        
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--section md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_3" >
+        
+          
+          <label class="md-nav__link" for="__nav_3" id="__nav_3_label" tabindex="">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Trading APIs
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_3_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_3">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Trading APIs
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../orders/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Orders
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../super-order/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Super Order
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../forever/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Forever Order
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../conditional-trigger/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Conditional Trigger
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../portfolio/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Portfolio and Positions
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../edis/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    EDIS
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../traders-control/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Trader's Control
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../funds/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Funds & Margin
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../statements/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Statement
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../postback/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Postback
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../order-update/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Live Order Update
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+    
+    
+      
+        
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--section md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_4" >
+        
+          
+          <label class="md-nav__link" for="__nav_4" id="__nav_4_label" tabindex="">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Data APIs
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_4_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_4">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Data APIs
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../market-quote/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Market Quote
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../live-market-feed/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Live Market Feed
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../full-market-depth/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Full Market Depth
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../historical-data/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Historical Data
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../expired-options-data/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Expired Options Data
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../option-chain/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Option Chain
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../annexure/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Annexure
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../instruments/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Instrument List
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../releases/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Releases
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+  </ul>
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+            
+              
+              <div class="md-sidebar md-sidebar--secondary" data-md-component="sidebar" data-md-type="toc" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#eligibility" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Eligibility
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#access-for-individual-traders" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Access for Individual Traders
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Access for Individual Traders">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#access-token" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Access Token
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Access Token">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#generate-token" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Generate Token
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#renew-token" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Renew Token
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#api-key-secret" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        API key &amp; secret
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#for-partners" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        For Partners
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#setup-static-ip" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Setup Static IP
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Setup Static IP">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#set-ip" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Set IP
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#modify-ip" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Modify IP
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#get-ip" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Get IP
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#setup-totp" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Setup TOTP
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Setup TOTP">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#what-is-totp" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        What is TOTP?
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#how-to-set-up-totp" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        How to set up TOTP
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#user-profile" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        User Profile
+      
+    </span>
+  </a>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+          
+          
+            <div class="md-content" data-md-component="content">
+              
+              <article class="md-content__inner md-typeset">
+                
+                  
+
+
+
+<!-- Google Tag Manager (noscript) -->
+
+<noscript><iframe src="https://www.googletagmanager.com/ns.html?id=GTM-T8CH7DW"
+height="0" width="0" style="display:none;visibility:hidden"></iframe></noscript>
+
+<!-- End Google Tag Manager (noscript) -->
+
+<h1 id="authentication">Authentication</h1>
+<p>DhanHQ APIs require authentication based on an access token which needs to be passed with every request. There are various different methods to generate this access token depending on user type and the purpose of usage.</p>
+<p>There are two categories in which users of DhanHQ APIs are divided:</p>
+<ul>
+<li>
+<p>Individual - Users who have Dhan account and are coders, traders, geeks who want to build their own algorithm or trading system on top of DhanHQ APIs</p>
+</li>
+<li>
+<p>Partners - Platforms who want to build on top of DhanHQ APIs and serve it to their users. This can be algo platforms, fintechs, banks, PMS, and others.</p>
+</li>
+</ul>
+<h2 id="eligibility">Eligibility</h2>
+<p>All Dhan users get access to Trading APIs for free. This means you can place and manage orders, positions, funds and all other transactions without paying any extra charges. For Data APIs, there are additional charges which are mentioned on the platform.</p>
+<p>If you are a partner who wants to get integrated and build on top of DhanHQ APIs, you can reach out to us by filling form on the DhanHQ website <a href = "https://dhanhq.co/trading-apis" target = "_blank">here</a>. We are looking forward to build the ecosystem around DhanHQ APIs.</p>
+<h2 id="access-for-individual-traders">Access for Individual Traders</h2>
+<p>As an individual trader, there are two methods using which a user can generate an access token:</p>
+<ul>
+<li>Directly generate access token from Dhan Web</li>
+<li>Use API key based authentication method
+<br>
+<br></li>
+</ul>
+<h3 id="access-token">Access Token</h3>
+<p>Individual traders can directly get their Access Token from <a href="https://web.dhan.co">web.dhan.co</a>. All Dhan users are eligible to get free access to Trading APIs. Here's how to get your Access Token:</p>
+<ul>
+<li>
+<p>Login to <a href="https://web.dhan.co">web.dhan.co</a></p>
+</li>
+<li>
+<p>Click on My Profile and navigate to <b><i>'Access DhanHQ APIs'</i></b></p>
+</li>
+<li>
+<p>Generate "Access Token" for a validity of 24 hours from there.</p>
+</li>
+<li>
+<p>User have an option to enter Postback URL while generating the access token, to get order updates as <a href = "/postback/">Postback</a>.</p>
+</li>
+</ul>
+<h4 id="generate-token">Generate Token</h4>
+<p>In addition to generating token manually from Dhan Web, you can also generate token from below endpoint if <a href="#setup-totp">TOTP</a> is enabled for your account.</p>
+<p><b>Request Structure</b></p>
+<pre><code>curl --location --request POST 
+'https://auth.dhan.co/app/generateAccessToken?dhanClientId=1000000001&amp;pin=11111&amp;totp=000000'
+</code></pre>
+<p><br>
+<b>Query Parameters</b></p>
+<table>
+    <thead>
+        <tr>
+            <td>Field</td>
+            <td>Description</td>
+        </tr>
+    </thead>
+    <tbody>
+        <tr>
+            <td>dhanClientId</td>
+            <td>Client ID of the user</td>
+        </tr>
+        <tr>
+            <td>pin</td>
+            <td>Dhan Pin of the user - 6 digit numeric code</td>
+        </tr>
+        <tr>
+            <td>totp</td>
+            <td>TOTP code - setup in authenticator</td>
+        </tr>
+    </tbody>
+</table>
+
+<p><b>Response Structure</b></p>
+<pre><code>{
+    "dhanClientId": "1000000401",
+    "dhanClientName": "JOHN DOE",
+    "dhanClientUcc": "ABCD12345E",
+    "givenPowerOfAttorney": false,
+    "accessToken": "eyJ...",
+    "expiryTime": "2026-01-01T00:00:00.000"
+}
+</code></pre>
+<p><br>
+<b>Parameters</b></p>
+<table>
+    <thead>
+        <tr>
+            <td>Field</td>
+            <td>Type</td>
+            <td>Description</td>
+        </tr>
+    </thead>
+    <tbody>
+        <tr>
+            <td>dhanClientId</td>
+            <td>string</td>
+            <td>User specific identification generated by Dhan</td>
+        </tr>
+        <tr>
+            <td>dhanClientName</td>
+            <td>string</td>
+            <td>Name registered on Dhan</td>
+        </tr>
+        <tr>
+            <td>dhanClientUcc</td>
+            <td>string</td>
+            <td>Unique Client Code registered with Dhan</td>
+        </tr>
+        <tr>
+            <td>givenPowerOfAttorney</td>
+            <td>boolean</td>
+            <td>DDPI status</td>
+        </tr>
+        <tr>
+            <td>accessToken</td>
+            <td>string</td>
+            <td>Generated Access Token</td>
+        </tr>
+        <tr>
+            <td>expiryTime</td>
+            <td>string</td>
+            <td>Token Expiry Time - set to 24 hours from generation</td>
+        </tr>
+    </tbody>
+</table>
+
+<h4 id="renew-token">Renew Token</h4>
+<p>You can refresh your token for 24 hours with this API. This API expires your current token and provides you with a new token with another 24 hours of validity. You can use this only for tokens generated from Dhan Web.</p>
+<pre><code>curl --location 'https://api.dhan.co/v2/RenewToken' \
+--header 'access-token: {JWT Token}' \
+--header 'dhanClientId: {Client ID}'
+</code></pre>
+<p>Note: This only renews tokens which are active. If you try to renew an expired token, it will return an error.</p>
+<h3 id="api-key-secret">API key &amp; secret</h3>
+<p>Individuals can login with an OAuth based flow as well. All dhan users can generate individual user specific API key and secret. To generate API key and secret, a user needs to follow the below steps:</p>
+<ul>
+<li>
+<p>Login to <a href="https://web.dhan.co">web.dhan.co</a></p>
+</li>
+<li>
+<p>Click on My Profile and navigate to <b><i>'Access DhanHQ APIs'</i></b></p>
+</li>
+<li>
+<p>Toggle to <b><i>'API key'</i></b> and enter your app name</p>
+</li>
+<li>
+<p>Enter <strong>App name</strong>, <strong>Redirect URL</strong> (to be used at the end of Step 2 provided below) and <strong>Postback URL</strong> (which is option to get updates on <a href = "/postback/">Postback</a>).</p>
+</li>
+</ul>
+<div class="admonition note">
+<p class="admonition-title">Note</p>
+<p>API Key &amp; Secret are valid for 12 months from the date of generation</p>
+</div>
+<p>After getting the API key and secret, user needs to follow below three steps, in order to generate access token, which can be used for all other API authentication.</p>
+<p><br></p>
+<p><b>STEP 1 : Generate Consent</b><br>
+This API is provided to generate consent to initiate a login session. On this step, the App ID and secret is validated and a new session is created for the user to enter credentials.</p>
+<pre><code>curl --location --request POST 'https://auth.dhan.co/app/generate-consent?client_id={dhanClientId}' \
+--header 'app_id: {API key}' \
+--header 'app_secret: {API secret}'
+</code></pre>
+<p>The response of this flow will have <code class="code">consentAppId</code>. This <code class="code">consentAppId</code> will be required for the next step of browser based flow.</p>
+<div class="admonition note">
+<p class="admonition-title">Note</p>
+<p>User can generate upto 25 <code class="code">consentAppId</code> in a day. Each consent app ID stay active until tokenId is generated for them. However, at any given point of time, only one token will be generated.</p>
+</div>
+<p><b>Header</b></p>
+<table>
+    <thead>
+        <tr>
+            <td>Field</td>
+            <td>Description</td>
+        </tr>
+    </thead>
+    <tbody>
+        <tr>
+            <td>app_id <br> <i class="required">required</i> </td>
+            <td>API Key generated from Dhan</td>
+        </tr>
+        <tr>
+            <td>app_secret<br> <i class="required">required</i> </td>
+            <td>API Secret generated from Dhan</td>
+        </tr>
+    </tbody>
+</table>
+
+<p><b>Response Structure</b></p>
+<pre><code>{
+    "consentAppId": "940b0ca1-3ff4-4476-b46e-03a3ce7dc55d",
+    "consentAppStatus": "GENERATED",
+    "status": "success"
+}
+</code></pre>
+<p><b>Parameters</b></p>
+<table>
+    <thead>
+        <tr>
+            <td>Field</td>
+            <td>Description</td>
+        </tr>
+    </thead>
+    <tbody>
+        <tr>
+            <td>consentAppId</td>
+            <td>Temporary session ID, to be used in step 2</td>
+        </tr>
+        <tr>
+            <td>consentAppStatus</td>
+            <td>Status of the API request</td>
+        </tr>
+    </tbody>
+</table>
+
+<p><br></p>
+<p><b>STEP 2 : Browser based login</b><br></p>
+<p>This endpoint needs to be opened directly on a browser. On this step, the user needs to enter their Dhan credentials, validate with 2FA like OTP/pin/password. If the login is successful, the user is redirected to the URL provided while generating the API key. Along with the redirect, we also send <code class='code'>tokenId</code> which needs to be used in step 3.</p>
+<div class="admonition note">
+<p class="admonition-title">Note</p>
+<p>This will end up with a 302 redirect on the browser. You can consume the <code class='code'>tokenId</code> from the path parameter directly.</p>
+</div>
+<p><b>Request URL</b></p>
+<pre><code>https://auth.dhan.co/login/consentApp-login?consentAppId={consentAppId}
+</code></pre>
+<p><b>Path Parameter</b></p>
+<table>
+    <thead>
+        <tr>
+            <td>Field</td>
+            <td>Description</td>
+        </tr>
+    </thead>
+    <tbody>
+        <tr>
+            <td>consentAppId<br> <i class="required">required</i> </td>
+            <td>Temporary session ID created in Generate Consent (I) stage</td>
+        </tr>
+    </tbody>
+</table>
+
+<p><b>Response Structure</b></p>
+<pre><code>{redirect_URL}/?tokenId={Token ID for user}
+</code></pre>
+<p><b>Parameters</b></p>
+<table>
+    <thead>
+        <tr>
+            <td>Field</td>
+            <td>Description</td>
+        </tr>
+    </thead>
+    <tbody>
+        <tr>
+            <td>tokenId</td>
+            <td>Token ID to be used to generate Access Token</td>
+        </tr>
+    </tbody>
+</table>
+
+<p><b>STEP 3 : Consume Consent</b><br>
+This API is to generate access token by validating API key &amp; secret and using <code class = "code">tokenId</code> generated in the above step. This results in the <code class = "code">access token</code> which needs to be used in all other API endpoints.</p>
+<pre><code>curl --location 'https://auth.dhan.co/app/consumeApp-consent?tokenId={Token ID}' \
+--header 'app_id: {API Key}' \
+--header 'app_secret: {API Secret}'
+</code></pre>
+<p><b>Path Parameter</b></p>
+<table>
+    <thead>
+        <tr>
+            <td>Field</td>
+            <td>Description</td>
+        </tr>
+    </thead>
+    <tbody>
+        <tr>
+            <td>tokenId <br> <i class="required">required</i> </td>
+            <td>User specific token ID, obtained in stage II</td>
+        </tr>
+    </tbody>
+</table>
+
+<p><b>Header</b></p>
+<table>
+    <thead>
+        <tr>
+            <td>Field</td>
+            <td>Description</td>
+        </tr>
+    </thead>
+    <tbody>
+        <tr>
+            <td>app_id <br> <i class="required">required</i> </td>
+            <td>API Key generated from Dhan</td>
+        </tr>
+        <tr>
+            <td>app_secret<br> <i class="required">required</i> </td>
+            <td>API Secret generated from Dhan</td>
+        </tr>
+    </tbody>
+</table>
+
+<p><b>Response Structure</b></p>
+<pre><code>{
+    "dhanClientId": "1000000001",
+    "dhanClientName": "JOHN DOE",
+    "dhanClientUcc": "CEFE4265",
+    "givenPowerOfAttorney": true,
+    "accessToken": {access token},
+    "expiryTime": "2025-09-23T12:37:23"
+}
+</code></pre>
+<p><b>Parameters</b></p>
+<table>
+    <thead>
+        <tr>
+            <td>Field</td>
+            <td>Description</td>
+        </tr>
+    </thead>
+    <tbody>
+        <tr>
+            <td>dhanClientId</td>
+            <td>User specific identification generated by Dhan</td>
+        </tr>
+        <tr>
+            <td>dhanClientName</td>
+            <td>Name of the User</td>
+        </tr>
+        <tr>
+            <td>dhanClientUcc</td>
+            <td>Unique Client Code (UCC)</td>
+        </tr>
+        <tr>
+            <td>givenPowerOfAttorney</td>
+            <td>Whether the user has activated DDPI (true/false)</td>
+        </tr>
+        <tr>
+            <td>accessToken</td>
+            <td>JWT access token to be used for API authentication</td>
+        </tr>
+        <tr>
+            <td>expiryTime</td>
+            <td>ISO timestamp when the access token expires as per IST</td>
+        </tr>
+    </tbody>
+</table>
+
+<h2 id="for-partners">For Partners</h2>
+<p>Once partner receives <code class='code'>partner_id</code> &amp; <code class='code'>partner_secret</code>. they can use this authentication mechanism for their users.</p>
+<p>This login method is a three step based, which is outlined below. This is for all different types of platforms, wherein the user can login to their Dhan account right from the third party platform itself.</p>
+<p><br></p>
+<p><b>STEP 1 : Generate Consent</b><br>
+This API is to generate consent to initiate a login session for a user. This is to validate the partner and allow them to start the authentication process.</p>
+<pre><code>curl --location 'https://auth.dhan.co/partner/generate-consent' \
+--header 'partner_id: {Partner ID}' \
+--header 'partner_secret: {Partner Secret}'
+</code></pre>
+<p>The response of this flow will have <code class="code">consentId</code>. This <code class="code">consentId</code> can be used for the next browser based flow.</p>
+<p><img alt="01" src="../img/01.png" />
+<br></p>
+<p><b>Header</b></p>
+<table>
+    <thead>
+        <tr>
+            <td>Field</td>
+            <td>Description</td>
+        </tr>
+    </thead>
+    <tbody>
+        <tr>
+            <td>partner_id <br> <i class="required">required</i> </td>
+            <td>Partner ID provided by Dhan</td>
+        </tr>
+        <tr>
+            <td>partner_secret<br> <i class="required">required</i> </td>
+            <td>Partner Secret provided by Dhan</td>
+        </tr>
+    </tbody>
+</table>
+
+<p><b>Response Structure</b></p>
+<pre><code>{
+    "consentId": "ab5aaab6-38cb-41fc-a074-c816e2f9a3e0",
+    "consentStatus": "GENERATED"
+}
+</code></pre>
+<p><b>Parameters</b></p>
+<table>
+    <thead>
+        <tr>
+            <td>Field</td>
+            <td>Description</td>
+        </tr>
+    </thead>
+    <tbody>
+        <tr>
+            <td>consentId</td>
+            <td>Temporary session ID on partner level, to be used in step 2</td>
+        </tr>
+    </tbody>
+</table>
+
+<p><br></p>
+<p><b>STEP 2 : Dhan login on browser for user</b><br></p>
+<p>This endpoint needs to be opened directly on a tab for browser based applications or on the webview for mobile apps. On this step, the end user needs to enter their Dhan credentials, validate with 2FA like OTP/pin/password. If the login is successful, the user is redirected to the URL provided to us. Along with the redirect, we also send <code class='code'>tokenId</code> which needs to be used in step 3.</p>
+<p><img alt="02" src="https://dev-images.dhan.co/common/02.png" />
+<br></p>
+<div class="admonition note">
+<p class="admonition-title">Note</p>
+<p>This will end up with a 302 redirect on the browser. You can consume the <code class='code'>tokenId</code> from the path parameter directly.</p>
+</div>
+<p><b>Request URL</b></p>
+<pre><code>https://auth.dhan.co/consent-login?consentId={consentId}
+</code></pre>
+<p><b>Path Parameter</b></p>
+<table>
+    <thead>
+        <tr>
+            <td>Field</td>
+            <td>Description</td>
+        </tr>
+    </thead>
+    <tbody>
+        <tr>
+            <td>consentId <br> <i class="required">required</i> </td>
+            <td>Temporary session ID created in Generate Consent (I) stage</td>
+        </tr>
+    </tbody>
+</table>
+
+<p><b>Response Structure</b></p>
+<pre><code>{redirect_URL}/?tokenId={Token ID for user}
+</code></pre>
+<p><b>Parameters</b></p>
+<table>
+    <thead>
+        <tr>
+            <td>Field</td>
+            <td>Description</td>
+        </tr>
+    </thead>
+    <tbody>
+        <tr>
+            <td>tokenId</td>
+            <td>Token ID to be used to generate Access Token</td>
+        </tr>
+    </tbody>
+</table>
+
+<p><b>STEP 3 : Consume Consent</b><br>
+This API is to generate access token by validating partner credentials and using <code class = "code">tokenId</code> generated in the above step.</p>
+<pre><code>curl --location 'https://auth.dhan.co/partner/consume-consent?tokenId={Token ID}' \
+--header 'partner_id: {Partner ID}' \
+--header 'partner_secret: {Partner Secret}'
+</code></pre>
+<p><br></p>
+<p><img alt="03" src="https://dev-images.dhan.co/common/03.png" /></p>
+<p><b>Path Parameter</b></p>
+<table>
+    <thead>
+        <tr>
+            <td>Field</td>
+            <td>Description</td>
+        </tr>
+    </thead>
+    <tbody>
+        <tr>
+            <td>tokenId <br> <i class="required">required</i> </td>
+            <td>User specific token ID, obtained in stage II</td>
+        </tr>
+    </tbody>
+</table>
+
+<p><b>Header</b></p>
+<table>
+    <thead>
+        <tr>
+            <td>Field</td>
+            <td>Description</td>
+        </tr>
+    </thead>
+    <tbody>
+        <tr>
+            <td>partner_id <br> <i class="required">required</i> </td>
+            <td>Partner ID provided by Dhan</td>
+        </tr>
+        <tr>
+            <td>partner_secret<br> <i class="required">required</i> </td>
+            <td>Partner Secret provided by Dhan</td>
+        </tr>
+    </tbody>
+</table>
+
+<p><b>Response Structure</b></p>
+<pre><code>{
+    "dhanClientId": "1000000001",
+    "dhanClientName": "JOHN DOE",
+    "dhanClientUcc": "CEFE4265",
+    "givenPowerOfAttorney": true,
+    "accessToken": {access token},
+    "expiryTime": "2025-09-23T12:37:23"
+}
+</code></pre>
+<p><b>Parameters</b></p>
+<table>
+    <thead>
+        <tr>
+            <td>Field</td>
+            <td>Description</td>
+        </tr>
+    </thead>
+    <tbody>
+        <tr>
+            <td>dhanClientId</td>
+            <td>User specific identification generated by Dhan</td>
+        </tr>
+        <tr>
+            <td>dhanClientName</td>
+            <td>Name of the User</td>
+        </tr>
+        <tr>
+            <td>dhanClientUcc</td>
+            <td>Unique Client Code (UCC)</td>
+        </tr>
+        <tr>
+            <td>givenPowerOfAttorney</td>
+            <td>Whether the user has activated DDPI (true/false)</td>
+        </tr>
+        <tr>
+            <td>accessToken</td>
+            <td>JWT access token to be used for API authentication</td>
+        </tr>
+        <tr>
+            <td>expiryTime</td>
+            <td>ISO timestamp when the access token expires as per IST</td>
+        </tr>
+    </tbody>
+</table>
+
+<h2 id="setup-static-ip">Setup Static IP</h2>
+<p>Static IP whitelisting is mandatory as per the new SEBI and exchange guidelines. In line with this, you can use the below APIs to set Static IP for your account. Alternatively, you can also use Dhan Web (<a href = "https://web.dhan.co/">web.dhan.co</a>) to setup your Static IP.</p>
+<p>You can set up a primary and a secondary IP for your account. Do note that each individual needs to have a unique static IP. Once an IP is whitelisted, it cannot be edited for the next 7 days or as recommended by the exchange.
+Do note that Static IP is only required while using Order Placement APIs including Orders, Super Order, Forever Order. While fetching order details or trade details, no such IP whitelisting is required.</p>
+<p>Below set of APIs can be used to manage Static IP for your account.</p>
+<div class="admonition info">
+<p class="admonition-title">Info</p>
+<p>A static IP is a fixed, permanent internet address for your device or server. Unlike the default IP you get on home Wi-Fi (which your ISP changes automatically from time to time), a static IP never changes. To use one, you need to request and purchase it separately from your Internet Service Provider (ISP).</p>
+</div>
+<h3 id="set-ip">Set IP</h3>
+<p>You can use this API to setup Primary and Secondary IP for your account. This supports both IPv4 and IPv6 formats while setting up. </p>
+<p>Once an IP is setup, you cannot modify the same for the next 7 days.</p>
+<pre><code>curl --request POST \
+--url https://api.dhan.co/v2/ip/setIP \
+--header 'Accept: application/json' \
+--header 'Content-Type: application/json' \
+--header 'access-token: {Access Token}' \
+--data '{
+"dhanClientId": "1000000001",
+"ip": "10.200.10.10",
+"ipFlag": "PRIMARY"
+}'
+</code></pre>
+<p><b>Parameters</b></p>
+<table>
+    <thead>
+        <tr>
+            <td>Field</td>
+            <td>Type</td>
+            <td>Description</td>
+        </tr>
+    </thead>
+    <tbody>
+        <tr>
+            <td>dhanClientId <br> <i class="required">required</i> </td>
+            <td>string</td>
+            <td>User specific identification generated by Dhan</td>
+        </tr>
+        <tr>
+            <td>ip<br> <i class="required">required</i> </td>
+            <td>string</td>
+            <td>Static IP address in IPv4 or IPv6 format</td>
+        </tr>
+        <tr>
+            <td>ipFlag <br> <i class="required">required</i> </td>
+            <td>string (enum)</td>
+            <td>Flag to set the IP as primary or secondary<br>
+            <code class="code">PRIMARY</code>&nbsp; <code class="code">SECONDARY</code></td>
+        </tr>
+    </tbody>
+</table>
+
+<p><b>Response Structure</b></p>
+<pre><code>{
+"message": "IP saved successfully",
+"status": "SUCCESS"
+}
+</code></pre>
+<p><b>Parameters</b></p>
+<table>
+    <thead>
+        <tr>
+            <td>Field</td>
+            <td>Description</td>
+        </tr>
+    </thead>
+    <tbody>
+        <tr>
+            <td>message</td>
+            <td>API response confirmation</td>
+        </tr>
+        <tr>
+            <td>status</td>
+            <td>Status of the request</td>
+        </tr>
+    </tbody>
+</table>
+
+<h3 id="modify-ip">Modify IP</h3>
+<p>You can use this API to modify Primary and Secondary IP set for your account. This API can only be used in the period wherein IP modification is allowed, which is once every 7 days.</p>
+<pre><code>curl --request PUT \
+--url https://api.dhan.co/v2/ip/modifyIP \
+--header 'Accept: application/json' \
+--header 'Content-Type: application/json' \
+--header 'access-token: {Access Token}\
+--data '{
+"dhanClientId": "1000000001",
+"ip": "10.200.10.10",
+"ipFlag": "PRIMARY"
+}'
+</code></pre>
+<p><b>Parameters</b></p>
+<table>
+    <thead>
+        <tr>
+            <td>Field</td>
+            <td>Type</td>
+            <td>Description</td>
+        </tr>
+    </thead>
+    <tbody>
+        <tr>
+            <td>dhanClientId <br> <i class="required">required</i> </td>
+            <td>string</td>
+            <td>User specific identification generated by Dhan</td>
+        </tr>
+        <tr>
+            <td>ip<br> <i class="required">required</i> </td>
+            <td>string</td>
+            <td>Static IP address in IPv4 or IPv6 format</td>
+        </tr>
+        <tr>
+            <td>ipFlag <br> <i class="required">required</i> </td>
+            <td>string (enum)</td>
+            <td>Flag to set the IP as primary or secondary<br>
+            <code class="code">PRIMARY</code>&nbsp; <code class="code">SECONDARY</code></td>
+        </tr>
+    </tbody>
+</table>
+
+<p><b>Response Structure</b></p>
+<pre><code>{
+"message": "IP saved successfully",
+"status": "SUCCESS"
+}
+</code></pre>
+<p><b>Parameters</b></p>
+<table>
+    <thead>
+        <tr>
+            <td>Field</td>
+            <td>Description</td>
+        </tr>
+    </thead>
+    <tbody>
+        <tr>
+            <td>message</td>
+            <td>API response confirmation</td>
+        </tr>
+        <tr>
+            <td>status</td>
+            <td>Status of the request</td>
+        </tr>
+    </tbody>
+</table>
+
+<h3 id="get-ip">Get IP</h3>
+<p>This API is to get the list of currently set IPs - both primary and secondary along with the date when this IP will be allowed to be modified.</p>
+<pre><code>curl --request GET \
+--url https://api.dhan.co/v2/ip/getIP \
+--header 'Accept: application/json' \
+--header 'access-token: {Access Token}'
+</code></pre>
+<p>This is a GET request, where in the <code class="code">access-token</code> needs to be passed on header.</p>
+<p><b>Response Structure</b></p>
+<pre><code>{
+    "modifyDateSecondary": "2025-09-30",
+    "secondaryIP": "10.420.43.12",
+    "modifyDatePrimary": "2025-09-28",
+    "primaryIP": "10.420.29.14"
+}
+</code></pre>
+<p><b>Parameters</b></p>
+<table>
+    <thead>
+        <tr>
+            <td>Field</td>
+            <td>Type</td>
+            <td>Description</td>
+        </tr>
+    </thead>
+    <tbody>
+        <tr>
+            <td>modifyDateSecondary</td>
+            <td>string</td>
+            <td>Date from which the secondary IP can be modified (YYYY-MM-DD)</td>
+        </tr>
+        <tr>
+            <td>secondaryIP</td>
+            <td>string</td>
+            <td>Currently set secondary static IP (IPv4 or IPv6)</td>
+        </tr>
+        <tr>
+            <td>modifyDatePrimary</td>
+            <td>string</td>
+            <td>Date from which the primary IP can be modified (YYYY-MM-DD)</td>
+        </tr>
+        <tr>
+            <td>primaryIP</td>
+            <td>string</td>
+            <td>Currently set primary static IP (IPv4 or IPv6)</td>
+        </tr>
+    </tbody>
+</table>
+
+<h2 id="setup-totp">Setup TOTP</h2>
+<p>As an API user, you can setup TOTP to simplify authentication for API-only flows, as an alternative to enter OTP received on email or mobile number.</p>
+<h3 id="what-is-totp">What is TOTP?</h3>
+<p>Time-based One-Time Password (TOTP) is a 6-digit code generated from a shared secret and current time (RFC 6238). Once you enable TOTP for your account, you’ll receive a secret (via QR/code) that your server can use to generate a fresh code every 30 seconds.</p>
+<h3 id="how-to-set-up-totp">How to set up TOTP</h3>
+<ol>
+<li>Go to Dhan Web &gt; DhanHQ Trading APIs section</li>
+<li>Select Setup TOTP</li>
+<li>Confirm with OTP on mobile/email</li>
+<li>Scan the QR via an Authenticator app or enter the code shown into the Authenticator</li>
+<li>Confirm by entering the first TOTP</li>
+</ol>
+<p>Once this is is setup, you will by default see TOTP as an option while logging into any partner platforms or inside the API key based authentication mode.</p>
+<h2 id="user-profile">User Profile</h2>
+<p>User Profile API can be used to check validity of access token and account setup. It is a simple GET request and can be a great test API for you to start integration.</p>
+<pre><code>curl --location 'https://api.dhan.co/v2/profile' \
+--header 'access-token: {JWT}'
+</code></pre>
+<p><b>Response Structure</b></p>
+<pre><code>{
+    "dhanClientId": "1100003626",
+    "tokenValidity": "30/03/2025 15:37",
+    "activeSegment": "Equity, Derivative, Currency, Commodity",
+    "ddpi": "Active",
+    "mtf": "Active",
+    "dataPlan": "Active",
+    "dataValidity": "2024-12-05 09:37:52.0"
+}
+</code></pre>
+<p><b>Parameters</b></p>
+<table>
+    <thead>
+        <tr>
+            <td>Field</td>
+            <td>Type</td>
+            <td>Description</td>
+        </tr>
+    </thead>
+    <tbody>
+        <tr>
+            <td>dhanClientId</td>
+            <td>string</td>
+            <td>User specific identification generated by Dhan</td>
+        </tr>
+        <tr>
+            <td>tokenValidity</td>
+            <td>string</td>
+            <td>Validity date and time for Token</td>
+        </tr>
+        <tr>
+            <td>activeSegment</td>
+            <td>string</td>
+            <td>All active segments in user accounts</td>
+        </tr>
+        <tr>
+            <td>ddpi</td>
+            <td>string</td>
+            <td>DDPI status of the user<br>
+            <code class="code">Active</code>&nbsp; <code class="code">Deactive</code></td>
+        </tr>
+        <tr>
+            <td>mtf</td>
+            <td>string</td>
+            <td>MTF consent status of the user<br><code class="code">Active</code>&nbsp; <code class="code">Deactive</code></td></td>
+        </tr>
+        <tr>
+            <td>dataPlan</td>
+            <td>string</td>
+            <td>Data API subscription status<br>
+            <code class="code">Active</code>&nbsp; <code class="code">Deactive</code></td></td>
+        </tr>
+        <tr>
+            <td>dataValidity</td>
+            <td>string</td>
+            <td>Validity date and time for Data API Subscription</td>
+        </tr>
+    </tbody>     
+</table>
+
+<p><br></p>
+
+
+
+
+
+
+
+
+
+  
+
+
+
+
+                
+              </article>
+            </div>
+          
+          
+  <script>var tabs=__md_get("__tabs");if(Array.isArray(tabs))e:for(var set of document.querySelectorAll(".tabbed-set")){var labels=set.querySelector(".tabbed-labels");for(var tab of tabs)for(var label of labels.getElementsByTagName("label"))if(label.innerText.trim()===tab){var input=document.getElementById(label.htmlFor);input.checked=!0;continue e}}</script>
+
+<script>var target=document.getElementById(location.hash.slice(1));target&&target.name&&(target.checked=target.name.startsWith("__tabbed_"))</script>
+        </div>
+        
+      </main>
+      
+        <footer class="md-footer">
+  
+  <div class="md-footer-meta md-typeset">
+    <div class="md-footer-meta__inner md-grid">
+      <div class="md-copyright">
+  
+    <div class="md-copyright__highlight">
+      Copyright &copy; 2024 Moneylicious Securities Private Limited
+    </div>
+  
+  
+</div>
+      
+    </div>
+  </div>
+</footer>
+      
+    </div>
+    <div class="md-dialog" data-md-component="dialog">
+      <div class="md-dialog__inner md-typeset"></div>
+    </div>
+    
+    
+    
+      
+      
+      <script id="__config" type="application/json">{"annotate": null, "base": "..", "features": ["content.tabs.link", "content.code.copy", "navigation.sections"], "search": "../assets/javascripts/workers/search.2c215733.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": null}</script>
+    
+    
+      <script src="../assets/javascripts/bundle.79ae519e.min.js"></script>
+      
+    
+  
+                          <!-- DhanHQ Chatbot Widget -->
+                          <script src="/assets/docs/chatbot-widget.js"></script>
+</body>
+</html>

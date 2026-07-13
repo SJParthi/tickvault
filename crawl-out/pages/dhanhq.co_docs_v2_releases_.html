@@ -1,0 +1,1865 @@
+
+<!doctype html>
+<html lang="en" class="no-js">
+  <head>
+    
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width,initial-scale=1">
+      
+      
+      
+      
+        <link rel="prev" href="../instruments/">
+      
+      
+      
+        
+      
+      
+      <link rel="icon" href="https://images.dhan.co/common/dhanhq-favicon.png">
+      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.7.1">
+    
+    
+    <title>Releases - DhanHQ Ver 2.0 / API Document</title>
+
+
+    
+      <link rel="stylesheet" href="../assets/stylesheets/main.484c7ddc.min.css">
+      
+      
+
+
+    
+    
+      
+    
+    
+      
+        
+        
+        <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+        <link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Roboto:300,300i,400,400i,700,700i%7CRoboto+Mono:400,400i,700,700i&display=fallback">
+        <style>:root{--md-text-font:"Roboto";--md-code-font:"Roboto Mono"}</style>
+      
+    
+    
+      <link rel="stylesheet" href="../extra.css">
+    
+    <script>__md_scope=new URL("..",location),__md_hash=e=>[...e].reduce(((e,_)=>(e<<5)-e+_.charCodeAt(0)),0),__md_get=(e,_=localStorage,t=__md_scope)=>JSON.parse(_.getItem(t.pathname+"."+e)),__md_set=(e,_,t=localStorage,a=__md_scope)=>{try{t.setItem(a.pathname+"."+e,JSON.stringify(_))}catch(e){}}</script>
+    
+      
+  
+
+
+  
+  
+
+<script id="__analytics">function __md_analytics(){function e(){dataLayer.push(arguments)}window.dataLayer=window.dataLayer||[],e("js",new Date),e("config","UA-209487654-3"),document.addEventListener("DOMContentLoaded",(function(){document.forms.search&&document.forms.search.query.addEventListener("blur",(function(){this.value&&e("event","search",{search_term:this.value})}));document$.subscribe((function(){var t=document.forms.feedback;if(void 0!==t)for(var a of t.querySelectorAll("[type=submit]"))a.addEventListener("click",(function(a){a.preventDefault();var n=document.location.pathname,d=this.getAttribute("data-md-value");e("event","feedback",{page:n,data:d}),t.firstElementChild.disabled=!0;var r=t.querySelector(".md-feedback__note [data-md-value='"+d+"']");r&&(r.hidden=!1)})),t.hidden=!1})),location$.subscribe((function(t){e("config","UA-209487654-3",{page_path:t.pathname})}))}));var t=document.createElement("script");t.async=!0,t.src="https://www.googletagmanager.com/gtag/js?id=UA-209487654-3",document.getElementById("__analytics").insertAdjacentElement("afterEnd",t)}</script>
+  
+    <script>"undefined"!=typeof __md_analytics&&__md_analytics()</script>
+  
+
+    
+    
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <link rel="icon" href="../img/favicon.png">
+    <meta name="generator" content="mkdocs-1.2.3, mkdocs-material-8.1.7">
+    <meta name="google-site-verification" content="szZSEzhedFt8R8zFFtPgH5MwKc3OAVQ3zaexU1padbg" />
+    <!-- Google Tag Manager -->
+    <script>(function(w,d,s,l,i){w[l]=w[l]||[];w[l].push({'gtm.start':
+    new Date().getTime(),event:'gtm.js'});var f=d.getElementsByTagName(s)[0],
+    j=d.createElement(s),dl=l!='dataLayer'?'&l='+l:'';j.async=true;j.src=
+    'https://www.googletagmanager.com/gtm.js?id='+i+dl;f.parentNode.insertBefore(j,f);
+    })(window,document,'script','dataLayer','GTM-T8CH7DW');</script>
+    <!-- End Google Tag Manager -->
+
+    
+
+    
+
+    
+
+    
+
+    
+
+    
+
+    
+
+    
+
+    
+
+    
+
+    
+
+    
+
+    
+
+    
+
+    
+
+    
+    
+    
+
+    
+
+  </head>
+  
+  
+    <body dir="ltr">
+  
+    
+    <input class="md-toggle" data-md-toggle="drawer" type="checkbox" id="__drawer" autocomplete="off">
+    <input class="md-toggle" data-md-toggle="search" type="checkbox" id="__search" autocomplete="off">
+    <label class="md-overlay" for="__drawer"></label>
+    <div data-md-component="skip">
+      
+        
+        <a href="#release-notes" class="md-skip">
+          Skip to content
+        </a>
+      
+    </div>
+    <div data-md-component="announce">
+      
+        <aside class="md-banner">
+          <div class="md-banner__inner md-grid md-typeset">
+            
+            
+  You are on the latest version of DhanHQ API.
+
+          </div>
+          
+        </aside>
+      
+    </div>
+    
+    
+      
+
+  
+
+<header class="md-header md-header--shadow" data-md-component="header">
+  <nav class="md-header__inner md-grid" aria-label="Header">
+    <a href="/" title="Ver 2.0 / API Documentation" class="md-header__button md-logo" aria-label="Ver 2.0 / API Documentation" data-md-component="logo">
+      
+  <img src="../img/DhanHQ_logo.svg" alt="logo">
+
+    </a>
+    <label class="md-header__button md-icon" for="__drawer">
+      
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M3 6h18v2H3zm0 5h18v2H3zm0 5h18v2H3z"/></svg>
+    </label>
+    <div class="md-header__title" data-md-component="header-title">
+      <div class="md-header__ellipsis">
+        <div class="md-header__topic">
+          <span class="md-ellipsis">
+            Ver 2.0 / API Documentation
+          </span>
+        </div>
+        <div class="md-header__topic" data-md-component="header-topic">
+          <span class="md-ellipsis">
+            
+              Releases
+            
+          </span>
+        </div>
+      </div>
+    </div>
+    
+    
+      <script>var palette=__md_get("__palette");if(palette&&palette.color){if("(prefers-color-scheme)"===palette.color.media){var media=matchMedia("(prefers-color-scheme: light)"),input=document.querySelector(media.matches?"[data-md-color-media='(prefers-color-scheme: light)']":"[data-md-color-media='(prefers-color-scheme: dark)']");palette.color.media=input.getAttribute("data-md-color-media"),palette.color.scheme=input.getAttribute("data-md-color-scheme"),palette.color.primary=input.getAttribute("data-md-color-primary"),palette.color.accent=input.getAttribute("data-md-color-accent")}for(var[key,value]of Object.entries(palette.color))document.body.setAttribute("data-md-color-"+key,value)}</script>
+    
+    
+    
+      
+      
+        <label class="md-header__button md-icon" for="__search">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+        </label>
+        <div class="md-search" data-md-component="search" role="dialog">
+  <label class="md-search__overlay" for="__search"></label>
+  <div class="md-search__inner" role="search">
+    <form class="md-search__form" name="search">
+      <input type="text" class="md-search__input" name="query" aria-label="Search" placeholder="Search" autocapitalize="off" autocorrect="off" autocomplete="off" spellcheck="false" data-md-component="search-query" required>
+      <label class="md-search__icon md-icon" for="__search">
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M20 11v2H8l5.5 5.5-1.42 1.42L4.16 12l7.92-7.92L13.5 5.5 8 11z"/></svg>
+      </label>
+      <nav class="md-search__options" aria-label="Search">
+        
+        <button type="reset" class="md-search__icon md-icon" title="Clear" aria-label="Clear" tabindex="-1">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg>
+        </button>
+      </nav>
+      
+    </form>
+    <div class="md-search__output">
+      <div class="md-search__scrollwrap" tabindex="0" data-md-scrollfix>
+        <div class="md-search-result" data-md-component="search-result">
+          <div class="md-search-result__meta">
+            Initializing search
+          </div>
+          <ol class="md-search-result__list" role="presentation"></ol>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+      
+    
+    
+  </nav>
+  
+</header>
+    
+    <div class="md-container" data-md-component="container">
+      
+      
+        
+          
+        
+      
+      <main class="md-main" data-md-component="main">
+        <div class="md-main__inner md-grid">
+          
+            
+              
+              <div class="md-sidebar md-sidebar--primary" data-md-component="sidebar" data-md-type="navigation" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+
+
+<nav class="md-nav md-nav--primary" aria-label="Navigation" data-md-level="0">
+  <label class="md-nav__title" for="__drawer">
+    <a href="/" title="Ver 2.0 / API Documentation" class="md-nav__button md-logo" aria-label="Ver 2.0 / API Documentation" data-md-component="logo">
+      
+  <img src="../img/DhanHQ_logo.svg" alt="logo">
+
+    </a>
+    Ver 2.0 / API Documentation
+  </label>
+  
+  <ul class="md-nav__list" data-md-scrollfix>
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href=".." class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Introduction
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../authentication/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Authentication
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+    
+    
+      
+        
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--section md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_3" >
+        
+          
+          <label class="md-nav__link" for="__nav_3" id="__nav_3_label" tabindex="">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Trading APIs
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_3_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_3">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Trading APIs
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../orders/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Orders
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../super-order/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Super Order
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../forever/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Forever Order
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../conditional-trigger/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Conditional Trigger
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../portfolio/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Portfolio and Positions
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../edis/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    EDIS
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../traders-control/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Trader's Control
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../funds/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Funds & Margin
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../statements/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Statement
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../postback/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Postback
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../order-update/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Live Order Update
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+    
+    
+      
+        
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--section md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_4" >
+        
+          
+          <label class="md-nav__link" for="__nav_4" id="__nav_4_label" tabindex="">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Data APIs
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_4_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_4">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Data APIs
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../market-quote/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Market Quote
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../live-market-feed/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Live Market Feed
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../full-market-depth/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Full Market Depth
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../historical-data/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Historical Data
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../expired-options-data/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Expired Options Data
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../option-chain/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Option Chain
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../annexure/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Annexure
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../instruments/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Instrument List
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+    
+  
+  
+  
+    <li class="md-nav__item md-nav__item--active">
+      
+      <input class="md-nav__toggle md-toggle" type="checkbox" id="__toc">
+      
+      
+        
+      
+      
+        <label class="md-nav__link md-nav__link--active" for="__toc">
+          
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Releases
+  
+
+    
+  </span>
+  
+  
+
+          <span class="md-nav__icon md-icon"></span>
+        </label>
+      
+      <a href="./" class="md-nav__link md-nav__link--active">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Releases
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+      
+        
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#version-25" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Version 2.5
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Version 2.5">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#new-features" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        New Features
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#improvements" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Improvements
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#version-24" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Version 2.4
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Version 2.4">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#new-features_1" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        New Features
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#breaking-changes" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Breaking Changes
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#version-23" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Version 2.3
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Version 2.3">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#new-features_2" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        New Features
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#version-22" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Version 2.2
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Version 2.2">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#new-features_3" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        New Features
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#improvements_1" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Improvements
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#breaking-changes_1" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Breaking Changes
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#version-21" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Version 2.1
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Version 2.1">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#new-features_4" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        New Features
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#improvements_2" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Improvements
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#version-2" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Version 2
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Version 2">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#new-features_5" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        New Features
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#improvements_3" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Improvements
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#breaking-changes_2" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Breaking Changes
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#bug-fixes" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Bug Fixes
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+      
+    </li>
+  
+
+    
+  </ul>
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+            
+              
+              <div class="md-sidebar md-sidebar--secondary" data-md-component="sidebar" data-md-type="toc" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#version-25" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Version 2.5
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Version 2.5">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#new-features" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        New Features
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#improvements" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Improvements
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#version-24" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Version 2.4
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Version 2.4">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#new-features_1" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        New Features
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#breaking-changes" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Breaking Changes
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#version-23" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Version 2.3
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Version 2.3">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#new-features_2" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        New Features
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#version-22" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Version 2.2
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Version 2.2">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#new-features_3" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        New Features
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#improvements_1" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Improvements
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#breaking-changes_1" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Breaking Changes
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#version-21" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Version 2.1
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Version 2.1">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#new-features_4" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        New Features
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#improvements_2" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Improvements
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#version-2" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Version 2
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Version 2">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#new-features_5" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        New Features
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#improvements_3" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Improvements
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#breaking-changes_2" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Breaking Changes
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#bug-fixes" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Bug Fixes
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+          
+          
+            <div class="md-content" data-md-component="content">
+              
+              <article class="md-content__inner md-typeset">
+                
+                  
+
+
+
+<!-- Google Tag Manager (noscript) -->
+<noscript><iframe src="https://www.googletagmanager.com/ns.html?id=GTM-T8CH7DW"
+height="0" width="0" style="display:none;visibility:hidden"></iframe></noscript>
+<!-- End Google Tag Manager (noscript) -->
+
+<h1 id="release-notes">Release Notes</h1>
+<!-- Along with this, we are also bringing enhancements to the Super Order with option to enable AMO and trigger, while deprecating BO and CO order from API. -->
+
+<h2 id="version-25">Version 2.5</h2>
+<p><em>Date: Monday Feb 09 2026</em></p>
+<p>We are introducing Conditional Trigger Orders, a new order type that allows you to place orders based on specific market conditions. Also, we are introducing P&amp;L based exit under Trader's control along with an Exit All API. These APIs are built to provide you with more flexibility and control over your trades. We have also enhanced our Option Chain API offering for you.</p>
+<h3 id="new-features">New Features</h3>
+<ul>
+<li>
+<p><strong>Conditional Trigger Orders</strong><br>
+    Conditional Trigger Orders allow you to place orders that are triggered when a certain condition is met. This feature is built to provide you with more flexibility and control over your trades. You can now place orders that are triggered when a certain condition is met, allowing you to automate your trading strategies and react quickly to market changes. You can read more about the same <a href = "/docs/v2/conditional-trigger">here</a>.</p>
+</li>
+<li>
+<p><strong>P&amp;L based exit under Trader's control</strong><br>
+    P&amp;L based exit allows you to set a profit or loss percentage at which your position will be automatically closed. You can now set a profit or loss percentage at which your position will be automatically closed, allowing you to automate your trading strategies and react quickly to market changes. Read more about the same <a href = "/docs/v2/conditional-trigger/#pnl-based-exit-under-traders-control">here</a>.</p>
+</li>
+<li>
+<p><strong>Exit All API</strong><br>
+    Exit All API allows you to close all your open positions and open orders with a single API call - <a href = "/docs/v2/conditional-trigger/#exit-all-api">here</a>.</p>
+</li>
+<li>
+<p><strong>Access Token Generation via API</strong><br>
+    You can now generate access token via API when you have TOTP configured for your account along with a regenration logic built in - <a href = "/docs/v2/authentication/#generate-token">here</a>.</p>
+</li>
+</ul>
+<h3 id="improvements">Improvements</h3>
+<ul>
+<li><strong>Option Chain API</strong><br>
+    We have enhanced the rate limits for Option Chain API - you can now make multiple unique requests for option chain data for different expiry dates and strikes, each within 3 seconds. Along with this, we have also added new fields to the response - <code>average_price</code> and <code>security_id</code> - <a href = "/docs/v2/option-chain/#option-chain_1">here</a>.</li>
+</ul>
+<p><br></p>
+<h2 id="version-24">Version 2.4</h2>
+<p><em>Date: Monday Sep 22 2025</em></p>
+<p>In line with the changes in SEBI guidelines on Retail Participation in Algorithmic Trading, we are bringing changes to the authentication module - primarily in 3 areas - reduced Access Token duration, API Key based authentication and IP setup.</p>
+<h3 id="new-features_1">New Features</h3>
+<ul>
+<li><strong>API Key based login</strong><br>
+    We have introduced a new authentication module for accessing APIs - API key and secret for individuals. You can now use this method to generate API key for one year validity and generate new access token daily by verifying your Dhan credentials. You can read more about the same <a href = "/docs/v2/authentication/#api-key-secret">here</a>.</li>
+</ul>
+<h3 id="breaking-changes">Breaking Changes</h3>
+<ul>
+<li>
+<p><strong>Access Token can only be generated for 24 hours</strong><br>
+    Access token based authentication will only be allowed for 24 hours after generating token. This is in line with the exchange and SEBI guidelines on management of API access.</p>
+</li>
+<li>
+<p><strong>Static IP Requirement</strong><br>
+    Static IP is required for all Order APIs for placing, modifying and cancelling any type of orders - including normal orders, super orders and forever orders. You can setup IP directly via API as per the <a href = "/docs/v2/authentication/#setup-static-ip">.Setup Static IP APIs</a>.</p>
+</li>
+</ul>
+<p><br></p>
+<h2 id="version-23">Version 2.3</h2>
+<p><em>Date: Monday Sep 08 2025</em></p>
+<p>We are adding one of the most requested data on APIs - 200 Market Depth on Websockets and historical expired options contract data. Along with this, we are changing rate limit for Order APIs to 10 order per second, in accordance with regulations.</p>
+<h3 id="new-features_2">New Features</h3>
+<ul>
+<li>
+<p><strong>Full Market Depth</strong><br>
+    You can get depth upto 200 levels directly on websocket - an extension of 20 Market Depth with more data so you can design trading system on top of more data and find our opportunity zones seamlessly. You can read more about how this will work <a href = "/docs/v2/full-market-depth/#200-level">here</a>.</p>
+</li>
+<li>
+<p><strong>Historical Options Data</strong><br>
+    This endpoint is built for you to fetch options data of expired contracts, on a rolling basis. You do not need to look for the security ID for expired contracts, rather you can enter strikes as ATM +/- to fetch data. You can also get rolling IV, OI and volumes directly from <a href = "/docs/v2/expired-options-data">here</a>.</p>
+</li>
+</ul>
+<p><br></p>
+<h2 id="version-22">Version 2.2</h2>
+<p><em>Date: Friday Mar 07 2025</em></p>
+<p>We are adding a new order type on Dhan and which is available on v2 of DhanHQ API. This order type is called Super Order. This along with a major update to Historical Data APIs is added. You can now fetch upto last 5 years of Intraday Historical Data (minutewise) and also OI data for futures and options instruments.</p>
+<h3 id="new-features_3">New Features</h3>
+<ul>
+<li>
+<p><strong>Super Orders</strong><br>
+    Super Orders are a new order type which allows you to combine multiple orders for entry and exit into single order. You can enter a position and place target and stop loss orders for the same along with the option to trail your stop loss. This combines the benefits of a bracket order and a trailing stop, and is available across all exchanges and segments - <a href = "/docs/v2/super-order">Super Order</a>.</p>
+</li>
+<li>
+<p><strong>User Profile</strong><br>
+    User Profile API is built to give a status check about different information related to user's account. This includes token validity, active segments, Data API subscription status and validity, and different user configurations like DDPI status and MTF enablement - <a href = "/docs/v2/#user-profile">here</a>.</p>
+</li>
+</ul>
+<h3 id="improvements_1">Improvements</h3>
+<ul>
+<li>
+<p><strong>Intraday Historical Data</strong><br>
+    Intraday Historical Data is now available for last 5 years of data. This is available for all NSE, BSE and MCX instruments. Along with increase in time range, we have also added OI data for futures and options instruments. There is <code>oi</code> parameter added to the API. Also, the <code>from_date</code> and <code>to_date</code> has option to pass IST time as well to fetch particular number of bars only. You can head over to documentation for updates in fields - <a href = "/docs/v2/historical-data/#intraday-historical-data">here</a>.</p>
+</li>
+<li>
+<p><strong>Daily Historical Data</strong><br>
+    Daily Historical Data has added OI data for futures and options instruments. There is <code>oi</code> parameter added to the API which is <em>optional</em> and can be used to fetch OI data - <a href = "/docs/v2/historical-data/#daily-historical-data">here</a>.</p>
+</li>
+<li>
+<p><strong><code>CorrelationId</code> on Live Order Update</strong><br>
+    Live Order Update now has two additional keys called 'CorrelationId' and 'Remarks' - <a href = "/docs/v2/order-update/#order-update">here</a>.</p>
+</li>
+</ul>
+<h3 id="breaking-changes_1">Breaking Changes</h3>
+<ul>
+<li><strong>Changes in Rate Limit</strong><br>
+    Rate limits have been increased for Data APIs which includes Historical Data. There are no rate limits on minute and hourly time frames. You can request upto 1,00,000 requests in a day and seconds timeframe are limited to 5 requests per second - <a href = "/docs/v2/#rate-limits">Rate Limit</a>.</li>
+</ul>
+<p><br></p>
+<h2 id="version-21">Version 2.1</h2>
+<p><em>Date: Monday Jan 06 2025</em></p>
+<p>This add-on to DhanHQ v2 comes with 20 level market depth (Level 3 data) for APIs. Along with that, this also covers Option Chain API, which was released in between and smaller enhancements.</p>
+<h3 id="new-features_4">New Features</h3>
+<ul>
+<li>
+<p><strong>20 Market Depth</strong><br>
+    You can get real-time streaming of 20 level market depth, for all NSE instruments with <a href = "/docs/v2/full-market-depth">20 Market Depth</a>. It is delivered via websockets and can be used to detect demand-supply zones and build your systems on top of it.</p>
+</li>
+<li>
+<p><strong>Option Chain</strong><br>
+    Dhan's Advanced Option Chain is made available on a single API request, for any underlying. With this, you get OI, greeks, volume, top bid/ask and price data of all strikes of any Option Instrument, across exchanges and segments - for NSE, BSE and MCX traded options - <a href = "/docs/v2/option-chain">Option Chain API</a>.</p>
+</li>
+</ul>
+<h3 id="improvements_2">Improvements</h3>
+<ul>
+<li><strong>'expiryCode' in Daily Historical Data</strong><br>
+    Daily Historical Data now has expiryCode as an <em>"Optional"</em> field - <a href = "/docs/v2/historical-data/#daily-historical-data">Daily Historical Data API</a>.</li>
+</ul>
+<p><br></p>
+<h2 id="version-2">Version 2</h2>
+<p><em>Date: Monday Sep 15 2024</em></p>
+<p>DhanHQ v2 extends execution capability with live order updates and forever orders on superfast APIs. Along with this, we also released Market Quote APIs, built on top of Live Market Feed which can be integrated with ease. We have also introduced improvements, bug fixes and increased stability with new version.</p>
+<h3 id="new-features_5">New Features</h3>
+<ul>
+<li>
+<p><strong>Market Quote</strong><br>
+    Fetch LTP, Quote (with OI) and Market Depth data directly on API, for upto 1000 instruments at once with <a href = "/docs/v2/market-quote">Market Quote API</a>.</p>
+</li>
+<li>
+<p><strong>Forever Orders</strong><br>
+    Place, modify and manage your Forever Orders, including single and OCO orders to manage risk and trade efficiently with <a href = "/docs/v2/forever">Forever Order API</a>.</p>
+</li>
+<li>
+<p><strong>Live Order Update</strong><br>
+    Order Updates are sent in real time via websockets, which will update order status of all your orders placed via any platform - <a href = "/docs/v2/order-update">Live Order Update</a>.</p>
+</li>
+<li>
+<p><strong>Margin Calculator</strong><br>
+    Margin Calculation simplifies order placement by providing details about required margin and available balances before placing order - <a href = "/docs/v2/funds/#margin-calculator">Margin Calculator API</a>.</p>
+</li>
+</ul>
+<h3 id="improvements_3">Improvements</h3>
+<ul>
+<li>
+<p><strong>Intraday Historical Data</strong><br>
+    Intraday Historical Data now provides OHLC with Volume data for last 5 trading days across timeframes such as 1 min, 5 min, 15 min, 25 min and 60 min - <a href = "/docs/v2/historical-data/#intraday-historical-data">Intraday Historical Data API</a>.</p>
+</li>
+<li>
+<p><strong>GET Order APIs</strong><br>
+    <code>filledQty</code>, <code>remainingQuantity</code> and <code>averageTradedPrice</code> is available as part of all GET Order APIs, which makes it simpler to fetch post execution details of an order. We have also added <code>PART_TRADED</code> as a flag on <code>orderStatus</code> which will be clear distinction for partially traded orders.</p>
+</li>
+<li>
+<p><strong>Live Market Feed</strong><br>
+    You can now authorise <a href = "/docs/v2/live-market-feed/">Live Market Feed</a> via Query Parameters and subscribe/unsubscribe to instruments via JSON messages on websockets with this version. Also, <code>FULL</code> packet is now available which will gives LTP, Quote, OI and Market Depth data in a single packet.</p>
+</li>
+</ul>
+<h3 id="breaking-changes_2">Breaking Changes</h3>
+<ul>
+<li>
+<p><strong>Order Placement</strong><br>
+    Deprecated non-mandatory request keys including <code>tradingSymbol</code>, <code>drvExpiryDate</code>, <code>drvOptionType</code> and <code>drvStrikePrice</code> from Order Placement API endpoints. Along with this, pre-open AMO orders can also be placed now with <code>PRE_OPEN</code> tag.</p>
+</li>
+<li>
+<p><strong>Order Modification</strong><br> 
+    <code>quantity</code> field needs to be placed order quantity instead of pending order quantity. Earlier, for Order Modification API, in case of partial execution, user needed to pass pending order quantity, which led to errors due to simultaneous execution on exchange or need to call GET Trade APIs as well.
+    <code>quantity</code> and <code>price</code> fields are conditionally required for modification.</p>
+<div class="admonition note">
+<p class="admonition-title"><code>quantity</code> field in Order Modification</p>
+</div>
+</li>
+<li>
+<p><strong>Daily Historical Data</strong><br>
+    <code>symbol</code> is replaced with <code>securityId</code> as key in Daily Historical Data, making it simple for users to fetch data everywhere with Security ID itself - <a href = "/docs/v2/historical-data/#daily-historical-data">Daily Historical Data API</a>.</p>
+</li>
+<li>
+<p><strong>Error Messages</strong><br>
+    Now error messages are categorised with DH-900 series which helps you self debug on level of error - <a href = "/docs/v2/#errors">Error Codes</a>.</p>
+</li>
+<li>
+<p><strong>Security ID List Mapping</strong><br>
+    Security ID List is now comprehensive with tag changes as well. Check new mappings and description - <a href = "/docs/v2/instruments">Security ID List</a>.</p>
+</li>
+<li>
+<p><strong>Epoch time introduced instead of Julian time in Historical Data APIs</strong> - 
+    Timestamp in <a href = "/docs/v2/historical-data/#daily-historical-data">Daily Historical Data API</a> and <a href = "/docs/v2/historical-data/#intraday-historical-data">Intraday Historical Data API</a> is now Epoch or UNIX time and with key <code>timestamp</code>.</p>
+</li>
+<li>
+<p><strong><code>Market Depth</code> deprecated as mode in Live Market Feed</strong><br>
+    <code>Market Depth</code> mode is now replaced with <code>FULL</code> packet which has combined data of Quote, OI and market depth in single packet, enabling ease in subscribing and fetching data.</p>
+</li>
+<li>
+<p><strong>Change in endpoint for Trade History and Kill Switch</strong><br>
+    New endpoint for Trade History is <code>/trades</code>, making it common with other Trade book APIs. For Kill Switch, the new endpoint as per nomenclature is <code>killswitch</code>.</p>
+</li>
+</ul>
+<h3 id="bug-fixes">Bug Fixes</h3>
+<ul>
+<li>
+<p><strong><code>realizedProfit</code> and <code>unrealizedProfit</code> in Positions API</strong><br>
+    You can now get realtime values of <code>realizedProfit</code> and <code>unrealizedProfit</code> on <a href = "/docs/v2/portfolio/#positions">Positions API</a>.</p>
+</li>
+<li>
+<p><strong>Target leg modification in Order Modification API</strong><br>
+    <code>TARGET_LEG</code> was not getting modified with <a href = "/docs/v2/orders/#order-modification">Order Modification API</a> which is fixed now.</p>
+</li>
+</ul>
+<p><br></p>
+
+
+
+
+
+
+
+
+
+  
+
+
+
+
+                
+              </article>
+            </div>
+          
+          
+  <script>var tabs=__md_get("__tabs");if(Array.isArray(tabs))e:for(var set of document.querySelectorAll(".tabbed-set")){var labels=set.querySelector(".tabbed-labels");for(var tab of tabs)for(var label of labels.getElementsByTagName("label"))if(label.innerText.trim()===tab){var input=document.getElementById(label.htmlFor);input.checked=!0;continue e}}</script>
+
+<script>var target=document.getElementById(location.hash.slice(1));target&&target.name&&(target.checked=target.name.startsWith("__tabbed_"))</script>
+        </div>
+        
+      </main>
+      
+        <footer class="md-footer">
+  
+  <div class="md-footer-meta md-typeset">
+    <div class="md-footer-meta__inner md-grid">
+      <div class="md-copyright">
+  
+    <div class="md-copyright__highlight">
+      Copyright &copy; 2024 Moneylicious Securities Private Limited
+    </div>
+  
+  
+</div>
+      
+    </div>
+  </div>
+</footer>
+      
+    </div>
+    <div class="md-dialog" data-md-component="dialog">
+      <div class="md-dialog__inner md-typeset"></div>
+    </div>
+    
+    
+    
+      
+      
+      <script id="__config" type="application/json">{"annotate": null, "base": "..", "features": ["content.tabs.link", "content.code.copy", "navigation.sections"], "search": "../assets/javascripts/workers/search.2c215733.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": null}</script>
+    
+    
+      <script src="../assets/javascripts/bundle.79ae519e.min.js"></script>
+      
+    
+  
+                          <!-- DhanHQ Chatbot Widget -->
+                          <script src="/assets/docs/chatbot-widget.js"></script>
+</body>
+</html>
