@@ -81,6 +81,20 @@ report a clean "all match" on an empty/partial compare set).
    well inside budget, so sustained failure points at Dhan-side or network.
 3. The 15:31 run is best-effort and never blocks; next trading day re-runs.
 
+**2026-07-13 update — bounded 429 second pass now exists:** the live
+2026-07-13 run lost 91/776 fetches to HTTP 429 at 15:31–15:33 (compared=0,
+a BLIND day). Fetch failures are now TYPED on the real `StatusCode`: 429s
+are deferred out of the first pass into a cohort, and after a 45 s
+cool-down the run retries that cohort ONCE, paced at ≤3 requests/second
+(strictly below the Data-API 5/sec budget), folding successes into the
+comparison BEFORE the report. Anything still failing lands in
+`fetch_failures` and rides the unchanged honest BLIND/DEGRADED
+classification — one pass, linearly bounded, never a loop. Counters:
+`tv_cross_verify_1m_retry_429_total{outcome="recovered"|"still_failed"}`.
+The spot-1m post-session sweep simultaneously moved to ~15:33:30 IST so
+its requests clear this run's burst window (see
+`rest-1m-pipeline-error-codes.md`).
+
 **Source:** `crates/app/src/cross_verify_1m_boot.rs::run_cross_verify_1m`,
 `crates/common/src/error_code.rs::CrossVerify1m02FetchDegraded`.
 
