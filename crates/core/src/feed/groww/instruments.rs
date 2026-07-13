@@ -667,7 +667,12 @@ pub fn collect_fut_underlying_symbols_seen(rows: &[GrowwInstrumentRow]) -> Vec<S
 /// day's selection naturally). `None` when the master carries no usable
 /// option row for the underlying (the caller degrades that underlying
 /// for the day — NEVER a guessed expiry). Pure.
-#[cfg(feature = "daily_universe_fetcher")]
+///
+/// De-gated with the PR-C1 FUTIDX de-gate (scope-lock §B): this file
+/// carries ZERO feature-gate attributes (whole-file ratchet
+/// `test_futidx_selector_is_not_feature_gated` arm (c)) — the merged PR-3
+/// gate from #1509 is removed here, matching the unconditional
+/// `canonicalize_index_symbol` dependency.
 #[must_use]
 pub fn select_current_option_expiry(
     rows: &[GrowwInstrumentRow],
@@ -2255,6 +2260,106 @@ mod tests {
         assert_eq!(rows[0].underlying_symbol, "NIFTY");
         assert_eq!(rows[0].expiry_date, "2026-07-30");
         assert!(rows[0].isin.is_empty(), "FUT rows are ISIN-less");
+    }
+
+    /// Option-row struct literal for the expiry-selection tests (PR-3):
+    /// the chain leg's expiry source is the master's CE/PE rows.
+    fn option_row(
+        exchange: &str,
+        underlying: &str,
+        instrument_type: &str,
+        expiry: &str,
+    ) -> GrowwInstrumentRow {
+        GrowwInstrumentRow {
+            exchange: exchange.to_string(),
+            exchange_token: "66751".to_string(),
+            groww_symbol: format!("{exchange}-{underlying}-opt"),
+            name: String::new(),
+            instrument_type: instrument_type.to_string(),
+            segment: "FNO".to_string(),
+            series: String::new(),
+            isin: String::new(),
+            underlying_symbol: underlying.to_string(),
+            expiry_date: expiry.to_string(),
+        }
+    }
+
+    /// The chain leg's expiry selection: nearest CE/PE expiry at-or-after
+    /// today, per (exchange, canonical underlying) — FUT rows and other
+    /// underlyings/exchanges never leak in; malformed expiries skip.
+    #[test]
+    fn test_select_current_option_expiry_nearest_at_or_after_today() {
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 7, 13).expect("date");
+        let rows = vec![
+            option_row("NSE", "NIFTY", "CE", "2026-07-16"),
+            option_row("NSE", "NIFTY", "PE", "2026-07-23"),
+            option_row("NSE", "NIFTY", "CE", "2026-07-09"), // past — skipped
+            option_row("NSE", "BANKNIFTY", "CE", "2026-07-14"), // other underlying
+            option_row("BSE", "SENSEX", "PE", "2026-07-15"),
+            // A FUT row for the same underlying must NEVER drive the
+            // OPTION expiry (futures are monthly, options weekly).
+            {
+                let mut fut = option_row("NSE", "NIFTY", "FUT", "2026-07-14");
+                fut.instrument_type = "FUT".to_string();
+                fut
+            },
+            // Malformed expiry — skipped, never a panic.
+            option_row("NSE", "NIFTY", "CE", "not-a-date"),
+            // Empty expiry (older master without the column) — skipped.
+            option_row("NSE", "NIFTY", "PE", ""),
+        ];
+        assert_eq!(
+            select_current_option_expiry(&rows, "NSE", "NIFTY", today),
+            Some(chrono::NaiveDate::from_ymd_opt(2026, 7, 16).expect("date"))
+        );
+        assert_eq!(
+            select_current_option_expiry(&rows, "NSE", "BANKNIFTY", today),
+            Some(chrono::NaiveDate::from_ymd_opt(2026, 7, 14).expect("date"))
+        );
+        // SENSEX resolves on BSE only — the NSE view of SENSEX is empty.
+        assert_eq!(
+            select_current_option_expiry(&rows, "BSE", "SENSEX", today),
+            Some(chrono::NaiveDate::from_ymd_opt(2026, 7, 15).expect("date"))
+        );
+        assert_eq!(
+            select_current_option_expiry(&rows, "NSE", "SENSEX", today),
+            None
+        );
+    }
+
+    /// Expiry-day boundary (the house never-roll precedent): on T-0 the
+    /// SAME-DAY expiry is still current through the session; the next
+    /// trading day (T+1) rolls to the next listed expiry naturally; a
+    /// master whose every expiry is past yields None (degrade, never a
+    /// guess) — as does a master with NO option rows for the underlying.
+    #[test]
+    fn test_select_current_option_expiry_expiry_day_t0_holds_t1_rolls() {
+        let rows = vec![
+            option_row("NSE", "NIFTY", "CE", "2026-07-16"),
+            option_row("NSE", "NIFTY", "PE", "2026-07-23"),
+        ];
+        let d = |s: &str| chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").expect("date");
+        // T-0 (expiry day): the same-day expiry holds.
+        assert_eq!(
+            select_current_option_expiry(&rows, "NSE", "NIFTY", d("2026-07-16")),
+            Some(d("2026-07-16"))
+        );
+        // T+1: rolled to the next listed expiry.
+        assert_eq!(
+            select_current_option_expiry(&rows, "NSE", "NIFTY", d("2026-07-17")),
+            Some(d("2026-07-23"))
+        );
+        // Every listed expiry past (stale master anomaly) → None.
+        assert_eq!(
+            select_current_option_expiry(&rows, "NSE", "NIFTY", d("2026-08-01")),
+            None
+        );
+        // Master lacks FNO option rows for the underlying → None (the
+        // caller degrades that underlying for the day, coded + counted).
+        assert_eq!(
+            select_current_option_expiry(&[], "NSE", "NIFTY", d("2026-07-13")),
+            None
+        );
     }
 
     #[test]
