@@ -707,7 +707,11 @@ pub fn select_current_option_expiry(
 /// malformed dates skip silently here (the expiry selector already
 /// counted/decided the day's expiry — this is the row extraction for it).
 /// Pure.
-#[cfg(feature = "daily_universe_fetcher")]
+///
+/// UNGATED by design: `test_futidx_selector_is_not_feature_gated` pins this
+/// whole file to ZERO feature gates (daily-universe 2026-07-13 banner §(d));
+/// every dependency here (`canonicalize_index_symbol`, the row struct) is
+/// itself unconditional.
 #[must_use]
 pub fn select_option_contract_rows<'a>(
     rows: &'a [GrowwInstrumentRow],
@@ -2401,7 +2405,6 @@ mod tests {
     /// (exchange, canonical underlying) at EXACTLY the given expiry — FUT
     /// rows, other expiries, other exchanges and malformed dates never
     /// leak in; the canonical matcher is shared with the expiry selector.
-    #[cfg(feature = "daily_universe_fetcher")]
     #[test]
     fn test_select_option_contract_rows_exact_expiry_ce_pe_only() {
         let expiry = chrono::NaiveDate::from_ymd_opt(2026, 7, 16).expect("date");
@@ -2427,7 +2430,6 @@ mod tests {
         assert!(select_option_contract_rows(&[], "NSE", "NIFTY", expiry).is_empty());
     }
 
-    #[cfg(feature = "daily_universe_fetcher")]
     #[test]
     fn test_groww_row_missing_new_headers_degrades_not_fails_master() {
         // A master WITHOUT the underlying_symbol/expiry_date columns still
