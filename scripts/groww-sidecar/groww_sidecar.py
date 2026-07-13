@@ -863,19 +863,57 @@ def still_silent_rewarn_interval_secs(
 
 
 # ---------------------------------------------------------------------------
-# Capture-file rotation (PR-3, 2026-07-02) — the WRITER owns rotation.
-# At the first write after IST midnight the current file is archived to
-# live-ticks-YYYYMMDD.ndjson (the COMPLETED IST day) and a fresh file opens;
-# archives older than NDJSON_ARCHIVE_KEEP_DAYS are deleted (the rows are in
-# QuestDB, cross-verified at 15:31 + conservation-audited at 15:40 daily — the
-# archive is only a crash-recovery window). Rotation happens BETWEEN records
-# (never splits a line) and ONLY at the IST day boundary: the market is closed
-# at midnight, so the Rust bridge's per-file capture_seq restart can never
-# collide same-second dedup keys across the boundary. A rotation failure NEVER
-# stops capture — the sidecar keeps appending to the current file.
+# Capture-file rotation (PR-3, 2026-07-02; hardened 2026-07-13) — the WRITER
+# owns rotation. Two rotation triggers:
+#   1. IST-midnight (original): at the first write after IST midnight the
+#      current file is archived to live-ticks-YYYYMMDD.ndjson (the COMPLETED
+#      IST day) and a fresh file opens.
+#   2. ROTATION-AT-OPEN (2026-07-13, prod disk-full remediation): the prod box
+#      runs 08:30-16:30 IST and is NEVER alive at IST midnight, so trigger 1
+#      never fired there and the live file grew ~1 GB/day unbounded. At open,
+#      if the existing file's last write (mtime, converted to the IST day —
+#      honest: the last day anything was appended) belongs to a PREVIOUS IST
+#      day, it is archived under the SAME dated naming convention before the
+#      fresh file opens. One stat — never a file scan.
+# After any rotation (and once at startup) a daemon-thread archive sweep
+# uploads each dated archive to S3, VERIFIES the copy (head_object
+# ContentLength == local size), and only then deletes the local file after a
+# grace window (see ARCHIVE_DELETE_GRACE_SECS). The pre-2026-07-13 blind 2-day
+# age-delete is RETIRED — the verified S3 offload is the ONE archival path,
+# and NEVER delete without the verified S3 copy is the invariant. Rotation
+# happens BETWEEN records (never splits a line) and ONLY at an IST day
+# boundary: the market is closed at midnight (and pre-open), so the Rust
+# bridge's per-file capture_seq restart can never collide same-second dedup
+# keys across the boundary. A rotation failure NEVER stops capture — the
+# sidecar keeps appending to the current file.
 # ---------------------------------------------------------------------------
 
-NDJSON_ARCHIVE_KEEP_DAYS = 2
+# Grace window before a verified-uploaded archive may be deleted locally.
+# BOTH the file's mtime age AND this process's uptime must exceed it. Why the
+# uptime leg (Verified from crates/app/src/groww_bridge.rs): at BOOT, when the
+# bridge's persisted flushed-offset snapshot belongs to a PREVIOUS IST day, it
+# re-reads the rotated archive's tail (drain_archive_tail_if_needed) through
+# the persist path. The archive's mtime is stale (yesterday's last write), so
+# an mtime-only grace would pass INSTANTLY at the 08:31 at-open rotation and
+# could delete the archive before the co-booted bridge drains it. The sidecar
+# is spawned by the supervisor inside the SAME app process as the bridge, so
+# 45 minutes of sidecar uptime guarantees the bridge's one-shot boot drain
+# finished long before any delete fires.
+ARCHIVE_DELETE_GRACE_SECS = 45 * 60
+
+# S3 offload destination — injected by the Rust supervisor from
+# [feeds.groww] capture_archive_s3_bucket / capture_archive_s3_prefix.
+# Empty/unset bucket = archival OFF: archives are KEPT on disk (dev Mac).
+ARCHIVE_S3_BUCKET_ENV = "TICKVAULT_GROWW_ARCHIVE_S3_BUCKET"
+ARCHIVE_S3_PREFIX_ENV = "TICKVAULT_GROWW_ARCHIVE_S3_PREFIX"
+
+# Process start instant — the uptime leg of the delete-grace gate.
+_PROCESS_START_SECS = time.time()
+
+# Single-flight latch for the sweep daemon thread + bounded once-per-file
+# warning dedup (no per-loop spam).
+_ARCHIVE_SWEEP_LOCK = threading.Lock()
+_ARCHIVE_WARNED: set = set()
 
 
 def _ist_day(now_secs: float) -> int:
@@ -894,25 +932,227 @@ def _archive_path(base: str, day_ordinal: int) -> str:
     return f"{root}-{_ist_date_str(day_ordinal)}{ext}"
 
 
-def _archives_to_delete(paths: list, base: str, today_ordinal: int, keep_days: int) -> list:
-    """Pure retention selector: dated archives older than keep_days."""
-    root, ext = os.path.splitext(os.path.basename(base))
-    out = []
-    for p in paths:
-        name = os.path.basename(p)
-        if not (name.startswith(root + "-") and name.endswith(ext)):
-            continue
-        stamp = name[len(root) + 1 : len(name) - len(ext)]
-        if len(stamp) != 8 or not stamp.isdigit():
-            continue
+def _should_rotate_at_open(mtime_day_ordinal: int, today_ordinal: int) -> bool:
+    """Pure gate: rotate an existing live file at open ONLY when its last
+    write day (mtime's IST day) is strictly BEFORE today's IST day. A
+    same-day (or clock-skewed future) mtime means an in-day sidecar restart —
+    append must continue, never rotate."""
+    return mtime_day_ordinal < today_ordinal
+
+
+def _collision_free_archive_path(base: str, day_ordinal: int, exists_fn) -> str:
+    """Pure-testable: the dated archive path, with a numeric suffix appended
+    on collision (-1, -2, ...) — NEVER overwrite an existing archive."""
+    candidate = _archive_path(base, day_ordinal)
+    if not exists_fn(candidate):
+        return candidate
+    root, ext = os.path.splitext(candidate)
+    n = 1
+    while exists_fn(f"{root}-{n}{ext}"):
+        n += 1
+    return f"{root}-{n}{ext}"
+
+
+def _archive_delete_eligible(
+    s3_verified: bool, age_secs: float, uptime_secs: float, grace_secs: float
+) -> bool:
+    """Pure delete-eligibility gate for a local archive file.
+
+    NEVER delete without the verified S3 copy — s3_verified is the hard
+    precondition; the two grace legs (file age AND process uptime, see
+    ARCHIVE_DELETE_GRACE_SECS) protect the Rust bridge's boot-time archive
+    tail drain.
+    """
+    if not s3_verified:
+        return False
+    return age_secs >= grace_secs and uptime_secs >= grace_secs
+
+
+def _rotate_at_open_if_stale(path: str):
+    """ROTATION-AT-OPEN: archive a previous-IST-day live file before opening.
+
+    One os.stat. Returns the archive path when a rotation happened, else
+    None. Failure never stops capture (the caller opens/append the existing
+    file exactly as before).
+    """
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None  # no existing file — fresh open
+    if st.st_size <= 0:
+        return None  # empty file — nothing worth archiving
+    mtime_day = _ist_day(st.st_mtime)
+    if not _should_rotate_at_open(mtime_day, _ist_day(time.time())):
+        return None
+    archive = _collision_free_archive_path(path, mtime_day, os.path.exists)
+    try:
+        os.replace(path, archive)
+    except OSError as exc:
+        print(
+            f"groww sidecar error [rotate-at-open]: {type(exc).__name__}: {exc} — "
+            "capture continues on the existing file",
+            file=sys.stderr,
+            flush=True,
+        )
+        return None
+    print(
+        f"groww capture rotated at open: {archive} "
+        f"({st.st_size} bytes, last written IST day {_ist_date_str(mtime_day)}) "
+        f"-> fresh {path}",
+        flush=True,
+    )
+    return archive
+
+
+def _list_capture_archives(base: str) -> list:
+    """All dated (incl. collision-suffixed) archives next to the live file."""
+    root, ext = os.path.splitext(base)
+    return sorted(glob.glob(f"{root}-*{ext}"))
+
+
+def _warn_once(key: str, message: str) -> None:
+    """One bounded warning per file per session — never per-loop spam."""
+    if key in _ARCHIVE_WARNED:
+        return
+    _ARCHIVE_WARNED.add(key)
+    print(message, file=sys.stderr, flush=True)
+
+
+def _s3_object_matches(s3, bucket: str, key: str, local_size: int) -> bool:
+    """head_object VERIFY: True only when the S3 copy's ContentLength equals
+    the local file size. Any error (missing object, creds, endpoint) = False."""
+    try:
+        head = s3.head_object(Bucket=bucket, Key=key)
+        return int(head.get("ContentLength", -1)) == local_size
+    except Exception:  # noqa: BLE001 - verify must never raise into the sweep
+        return False
+
+
+def _archive_sweep(base: str) -> None:
+    """Upload rotated capture archives to S3, verify, then delete after grace.
+
+    Runs on a DAEMON thread (never delays feed auth/subscribe/streaming).
+    Idempotent: re-runs re-verify (skipping already-uploaded objects) or
+    re-upload under the same key, then delete. Bounded retries: a failed
+    upload is retried at the NEXT trigger (next startup / next midnight
+    rotation), never in a loop. Logs filenames/sizes/keys ONLY — never a
+    token or credential.
+    """
+    bucket = (os.environ.get(ARCHIVE_S3_BUCKET_ENV) or "").strip()
+    prefix = (os.environ.get(ARCHIVE_S3_PREFIX_ENV) or "").strip().strip("/")
+    archives = _list_capture_archives(base)
+    if not archives:
+        return
+    if not bucket:
+        _warn_once(
+            "no-bucket",
+            "groww sidecar: capture archival disabled (no "
+            f"{ARCHIVE_S3_BUCKET_ENV} configured) — "
+            f"{len(archives)} archive(s) kept on disk",
+        )
+        return
+    try:
+        import boto3  # deferred: only the S3 offload path needs AWS
+    except Exception as exc:  # noqa: BLE001
+        _warn_once("no-boto3", f"groww sidecar: boto3 unavailable ({type(exc).__name__}) — archives kept on disk")
+        return
+    region = os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION") or "ap-south-1"
+    try:
+        s3 = boto3.client("s3", region_name=region)
+    except Exception as exc:  # noqa: BLE001
+        _warn_once("no-s3-client", f"groww sidecar: S3 client init failed ({type(exc).__name__}) — archives kept on disk")
+        return
+
+    # Pass A — upload (skip files whose S3 copy already verifies).
+    for path in archives:
+        name = os.path.basename(path)
+        key = f"{prefix}/{name}" if prefix else name
         try:
-            d = datetime.strptime(stamp, "%Y%m%d").replace(tzinfo=timezone.utc)
-        except ValueError:
+            size = os.path.getsize(path)
+        except OSError:
+            continue  # vanished between glob and stat
+        if _s3_object_matches(s3, bucket, key, size):
+            continue  # already offloaded — idempotent skip
+        try:
+            s3.upload_file(path, bucket, key)
+            print(
+                f"groww capture archive uploaded: {name} ({size} bytes) -> s3://{bucket}/{key}",
+                flush=True,
+            )
+        except Exception as exc:  # noqa: BLE001 - keep the file, retry next trigger
+            _warn_once(
+                f"upload:{name}",
+                f"groww sidecar: archive upload failed for {name} "
+                f"({type(exc).__name__}) — file KEPT; retry at the next "
+                "startup/rotation sweep",
+            )
+
+    # Grace sleep: the delete pass must not run before the co-booted Rust
+    # bridge's one-shot boot archive drain has finished (see
+    # ARCHIVE_DELETE_GRACE_SECS). Sleeping the uptime deficit on a daemon
+    # thread costs nothing.
+    uptime = time.time() - _PROCESS_START_SECS
+    deficit = ARCHIVE_DELETE_GRACE_SECS - uptime
+    if deficit > 0:
+        time.sleep(deficit)
+
+    # Pass B — verified delete. NEVER delete without the verified S3 copy:
+    # eligibility = head_object-verified AT DELETE TIME + both grace legs
+    # (_archive_delete_eligible). Anything ineligible is simply kept.
+    now = time.time()
+    uptime = now - _PROCESS_START_SECS
+    for path in archives:
+        name = os.path.basename(path)
+        key = f"{prefix}/{name}" if prefix else name
+        try:
+            st = os.stat(path)
+        except OSError:
+            continue  # already gone
+        verified = _s3_object_matches(s3, bucket, key, st.st_size)
+        if not verified:
+            _warn_once(
+                f"verify:{name}",
+                f"groww sidecar: archive {name} has no size-verified S3 copy — "
+                "file KEPT (retry at the next sweep)",
+            )
             continue
-        ordinal = int(d.timestamp() + 19800) // 86400 if False else (d - datetime(1970, 1, 1, tzinfo=timezone.utc)).days
-        if today_ordinal - ordinal > keep_days:
-            out.append(p)
-    return out
+        if not _archive_delete_eligible(verified, now - st.st_mtime, uptime, ARCHIVE_DELETE_GRACE_SECS):
+            continue  # inside a grace window — next trigger handles it
+        try:
+            os.remove(path)
+            print(
+                f"groww capture archive removed after verified S3 offload: "
+                f"{name} ({st.st_size} bytes == s3://{bucket}/{key})",
+                flush=True,
+            )
+        except OSError as exc:
+            _warn_once(
+                f"remove:{name}",
+                f"groww sidecar: archive delete failed for {name} ({exc}) — retry at the next sweep",
+            )
+
+
+def _spawn_archive_sweep(base: str) -> bool:
+    """Start the archive sweep on a daemon thread — single-flight (a running
+    sweep covers the current archives; a rotation during it is picked up by
+    the NEXT trigger). Returns whether a thread was started."""
+    if not _ARCHIVE_SWEEP_LOCK.acquire(blocking=False):
+        return False
+
+    def _run():
+        try:
+            _archive_sweep(base)
+        except Exception as exc:  # noqa: BLE001 - sweep death must never kill capture
+            print(
+                f"groww sidecar error [archive-sweep]: {type(exc).__name__}: {exc}",
+                file=sys.stderr,
+                flush=True,
+            )
+        finally:
+            _ARCHIVE_SWEEP_LOCK.release()
+
+    threading.Thread(target=_run, name="groww-archive-sweep", daemon=True).start()
+    return True
 
 
 class _RotatingOut:
@@ -924,9 +1164,17 @@ class _RotatingOut:
 
     def __init__(self, path: str):
         self._path = path
+        # ROTATION-AT-OPEN (2026-07-13): a live file whose last write belongs
+        # to a previous IST day is archived BEFORE opening — the prod box
+        # (08:30-16:30 IST) is never alive at IST midnight, so this is the
+        # trigger that actually fires there. One stat, never a file scan.
+        _rotate_at_open_if_stale(path)
         self._fh = open(path, "a", buffering=1)
         self._day = _ist_day(time.time())
         self._rotate_error_printed = False
+        # Startup archive sweep: verified S3 offload of anything rotated (now
+        # or by previous sessions) + retry of previously failed uploads.
+        _spawn_archive_sweep(path)
 
     def _maybe_rotate(self) -> None:
         now_day = _ist_day(time.time())
@@ -940,27 +1188,16 @@ class _RotatingOut:
             self._fh.flush()
             os.fsync(self._fh.fileno())
             self._fh.close()
-            archive = _archive_path(self._path, completed)
+            archive = _collision_free_archive_path(self._path, completed, os.path.exists)
             os.replace(self._path, archive)
             print(
                 f"groww capture rotated: {archive} (completed IST day) -> fresh {self._path}",
                 flush=True,
             )
-            for stale in _archives_to_delete(
-                glob.glob(_archive_path(self._path, 0).replace("19700101", "*")),
-                self._path,
-                now_day,
-                NDJSON_ARCHIVE_KEEP_DAYS,
-            ):
-                try:
-                    os.remove(stale)
-                    print(f"groww capture archive removed (retention): {stale}", flush=True)
-                except OSError as exc:
-                    print(
-                        f"groww sidecar error [rotate-retention]: {exc} — will retry next midnight",
-                        file=sys.stderr,
-                        flush=True,
-                    )
+            # 2026-07-13: retention is the verified S3 offload sweep — the ONE
+            # archival path (the old blind 2-day age-delete is retired; NEVER
+            # delete without the verified S3 copy).
+            _spawn_archive_sweep(self._path)
         except Exception as exc:  # noqa: BLE001 - rotation must never stop capture
             if not self._rotate_error_printed:
                 print(

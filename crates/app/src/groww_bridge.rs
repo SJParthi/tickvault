@@ -4998,9 +4998,19 @@ mod tests {
         // reset capture_seq and collide same-second dedup keys) and must never
         // stop capture on failure.
         let sidecar = include_str!("../../../scripts/groww-sidecar/groww_sidecar.py");
+        // 2026-07-13 (disk-retention hardening): the blind 2-day age-delete
+        // (`NDJSON_ARCHIVE_KEEP_DAYS`) is RETIRED — retention is now the
+        // verified S3 offload sweep (see groww_capture_archive_guard.rs in
+        // crates/common for the full contract). Pin the delete-grace constant
+        // that replaced it.
         assert!(
-            sidecar.contains("NDJSON_ARCHIVE_KEEP_DAYS = 2"),
-            "archive retention constant must be pinned"
+            sidecar.contains("ARCHIVE_DELETE_GRACE_SECS = 45 * 60"),
+            "archive delete-grace constant must be pinned"
+        );
+        assert!(
+            !sidecar.contains("NDJSON_ARCHIVE_KEEP_DAYS"),
+            "the blind age-delete constant must stay retired — deletion goes \
+             through the verified S3 offload path only"
         );
         assert!(
             sidecar.contains("def _ist_day(") && sidecar.contains("class _RotatingOut"),
