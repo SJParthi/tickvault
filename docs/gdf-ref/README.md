@@ -16,6 +16,48 @@
 
 All verbatim JSON in this pack comes from tier-2 artifacts (plus the operator paste) and IS byte-exact. All SEARCH-tier prose should be re-verified against the live pages before contracting.
 
+## 2026-07-13 freshness sweep (dated update)
+
+A same-day re-verification pass (crawl + PyPI + slug discovery), run after the pack build:
+
+**Crawl verdict — the WAF block is still TOTAL.** 42/42 requests across BOTH hosts
+(`globaldatafeeds.in` AND `docs.globaldatafeeds.in` — robots.txt, sitemaps, every resolved
+doc URL, the docs-portal root and a known deep page) returned HTTP 403 via WebFetch, which
+does reach the site (sandbox curl is proxy-denied at CONNECT before reaching it, so it gives
+no WAF signal). archive.org (Wayback availability API + CDX) is unreachable from this
+environment entirely, so no ARCHIVE-tier fallback was possible. **Zero bytes of page content
+were retrieved**; nothing in this pack changed tier as a result of the sweep.
+
+**PyPI verdict — 4/4 official SDKs unchanged since the pack's baseline; zero protocol drift
+possible.** Verified via the PyPI JSON API 2026-07-13:
+
+| Package | Baseline = latest | Latest upload date |
+|---|---|---|
+| `wsgfdl-py` | 1.3.5 | 2025-11-28 |
+| `gfdl-rest` | 1.0.3 | 2024-11-11 |
+| `GFDLWS` | 0.0.4 | 2024-09-16 |
+| `ws-gfdl` | 1.1.0 | 2022-08-12 |
+
+Two additional official-author (`developer@globaldatafeeds.in`) packages were found, neither
+carrying protocol content: `GlobalDatafeeds-ws` 0.0.1 (2024-10-14) is a **verified empty
+shell** — wheel + sdist both contain zero code modules; `restgfdl-py` is indexed on PyPI but
+has **zero retrievable releases** (JSON API returns Not Found). No pack update required.
+
+**New slug leads (tier: SEARCH-SNIPPET only — URLs seen in search results; page content was
+NEVER fetched and must not be treated as captured):** `P/rest-api-documentation/function-getsnapshot/`
+(REST GetSnapshot — new), `P/introduction/introduction-to-apis/`, six
+`P/api-code-samples/…` slugs (websockets-python/-java/-nodejs/-javascript-sample,
+rest-python, download-code-samples-2), documentation index slugs under
+`…/documentation-support/documentation/`, the docs-portal slug pattern
+`docs.globaldatafeeds.in/<function>-<10-hex>` (e.g. `getserverinfo-15575607e0`), and the
+asset `https://globaldatafeeds.in/wp-content/uploads/2024/07/GFDL_Websocket_Python_Sample_AllFunctions.pdf`
+(a WS-Python all-functions sample PDF). GetHolidays is confirmed present in BOTH the WS and
+REST function lists via snippet nav text; its exact slug is still unknown.
+
+**Operator capture queue:** [`00-PASTE-LIST.md`](./00-PASTE-LIST.md) is the ordered
+browser-paste list (Tier 1 = protocol-critical never-captured pages first) — each paste
+becomes LIVE-DOC tier, the only route past the WAF.
+
 ## Evidence-tier legend (header block on every section)
 
 | Tier | Meaning |
@@ -34,6 +76,7 @@ Confidence labels: **Verified** (multiple consistent sources or official artifac
 
 | File | Contents |
 |---|---|
+| `00-PASTE-LIST.md` | the operator browser-paste capture queue (2026-07-13) — ordered URL list for closing WAF-blocked doc pages |
 | `01-product-and-entitlement.md` | vendor status, segments matrix, product tiers, pricing evidence, licensing, trial |
 | `02-authentication-and-connection.md` | endpoint model, Authenticate handshake, session exclusivity (new-connection-wins), Echo heartbeat, reconnect contract, maintenance windows, frame sizes |
 | `03-websocket-realtime-feed.md` | SubscribeRealtime/Unsubscribe, 1/sec/symbol cadence, COMPLETE RealtimeResult field table, PreOpen, OI, no depth |
