@@ -1788,9 +1788,7 @@ async fn main() -> Result<()> {
     // =======================================================================
     let SharedInfraHandles {
         notifier,
-        // PR-C2: no main()-scope consumer left (the lane + EOD digest owned
-        // it); the API server inside build_shared_infra still reads it.
-        health_status: _health_status,
+        health_status,
         tick_broadcast_sender,
         order_update_sender,
         api_handle,
@@ -2090,6 +2088,8 @@ async fn main() -> Result<()> {
             notifier: std::sync::Arc::clone(&notifier),
             calendar: std::sync::Arc::clone(&trading_calendar),
             feed_runtime: std::sync::Arc::clone(&feed_runtime),
+            // PR-C2: the stack owns the /health token-block writer.
+            health: health_status.clone(),
         },
     );
 
@@ -2171,6 +2171,13 @@ async fn main() -> Result<()> {
 async fn run_slow_boot_observability(
     mut tick_rx: tokio::sync::broadcast::Receiver<tickvault_common::tick_types::ParsedTick>,
     questdb_config: tickvault_common::config::QuestDbConfig,
+    // PR-C2 (2026-07-13): the deleted Dhan pool watchdog was the ONLY
+    // production writer of the /health `questdb_reachable` flag — without a
+    // replacement, GET /health (and overall_status) would report QuestDB
+    // down FOREVER on the lane-less runtime (Rule-11 false-degraded). This
+    // task's 2s /exec ping is the surviving reachability probe, so it now
+    // owns the flag write.
+    health: tickvault_api::state::SharedHealthStatus,
 ) {
     info!("S4-T1d: slow-boot observability task started");
 
@@ -2182,7 +2189,6 @@ async fn run_slow_boot_observability(
 
     let mut qdb_health_poller = tickvault_storage::questdb_health::QuestDbHealthPoller::new();
     let qdb_health_interval = std::time::Duration::from_secs(2); // APPROVED: pre-existing literal, session-7 tech debt tracked for cleanup
-    let mut last_qdb_health_check = std::time::Instant::now();
 
     // Audit finding #2 (2026-04-24): wire TickGapTracker::detect_stale_instruments()
     // to a 30s periodic poller. The method existed in the tracker but was never
@@ -2217,22 +2223,38 @@ async fn run_slow_boot_observability(
         questdb_config.host, questdb_config.http_port
     );
 
+    // PR-C2 (2026-07-13): the QuestDB ping + the 30s stale scan are now
+    // CADENCE-driven (a select! interval arm) instead of tick-driven. With
+    // the Dhan live WS retired, this broadcast has no publisher — a
+    // recv()-gated ping would never fire and /health would stay blind (the
+    // same starvation also affected total-silence incidents pre-C2).
+    let mut qdb_ping_ticker = tokio::time::interval(qdb_health_interval);
+    qdb_ping_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
-        match tick_rx.recv().await {
-            Ok(tick) => {
-                // Gap detection — same logic as fast-boot consumer. Gap
-                // tracker fires its own log/metric on ERROR thresholds;
-                // no backfill request is published (in-market backfill
-                // disabled by user policy).
-                let _ = tick_gap_tracker.record_tick(tick.security_id, tick.exchange_timestamp);
-
+        tokio::select! {
+            recv = tick_rx.recv() => match recv {
+                Ok(tick) => {
+                    // Gap detection — the tracker fires its own log/metric on
+                    // ERROR thresholds; no backfill request is published
+                    // (in-market backfill disabled by user policy).
+                    let _ =
+                        tick_gap_tracker.record_tick(tick.security_id, tick.exchange_timestamp);
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                    warn!(
+                        skipped,
+                        "S4-T1d: slow-boot observer lagged {skipped} ticks — gap tracker state is still valid"
+                    );
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    info!("S4-T1d: slow-boot observer shutting down (broadcast closed)");
+                    return;
+                }
+            },
+            _ = qdb_ping_ticker.tick() => {
                 // Audit finding #2 (2026-04-24): periodic per-instrument stall
-                // scan every 30 s. Returns the count of newly-stale instruments;
-                // the tracker itself emits an ERROR per-instrument (→ Telegram)
-                // and increments `tv_stale_ltp_instruments`. Here we just
-                // track cadence so the scan runs even when no ticks are
-                // flowing (otherwise the loop would wait on tick_rx.recv()
-                // forever during a total-silence incident).
+                // scan every 30 s — cadence-tracked so the scan runs even when
+                // no ticks are flowing (total-silence incidents).
                 if last_stale_check.elapsed() >= stale_check_interval {
                     let newly_stale = tick_gap_tracker.detect_stale_instruments();
                     if newly_stale > 0 {
@@ -2241,29 +2263,19 @@ async fn run_slow_boot_observability(
                     last_stale_check = std::time::Instant::now();
                 }
 
-                // QuestDB HTTP health ping every 2 seconds.
-                if last_qdb_health_check.elapsed() >= qdb_health_interval {
-                    let connected = match http_client.get(&questdb_ping_url).send().await {
-                        Ok(resp) => resp.status().is_success(),
-                        Err(_) => false,
-                    };
-                    let verdict = qdb_health_poller.tick(connected, std::time::Instant::now());
-                    tickvault_storage::questdb_health::emit_metrics_for_verdict(
-                        verdict,
-                        &qdb_health_poller,
-                    );
-                    last_qdb_health_check = std::time::Instant::now();
-                }
-            }
-            Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
-                warn!(
-                    skipped,
-                    "S4-T1d: slow-boot observer lagged {skipped} ticks — gap tracker state is still valid"
+                // QuestDB HTTP health ping every 2 seconds — feeds the
+                // metrics verdict AND the /health `questdb_reachable` flag
+                // (the PR-C2 re-home; see the `health` parameter doc above).
+                let connected = match http_client.get(&questdb_ping_url).send().await {
+                    Ok(resp) => resp.status().is_success(),
+                    Err(_) => false,
+                };
+                health.set_questdb_reachable(connected);
+                let verdict = qdb_health_poller.tick(connected, std::time::Instant::now());
+                tickvault_storage::questdb_health::emit_metrics_for_verdict(
+                    verdict,
+                    &qdb_health_poller,
                 );
-            }
-            Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                info!("S4-T1d: slow-boot observer shutting down (broadcast closed)");
-                return;
             }
         }
     }
@@ -2999,8 +3011,9 @@ async fn build_shared_infra(
     {
         let obs_rx = tick_broadcast_sender.subscribe();
         let questdb_cfg = config.questdb.clone();
+        let obs_health = health_status.clone();
         tokio::spawn(async move {
-            run_slow_boot_observability(obs_rx, questdb_cfg).await;
+            run_slow_boot_observability(obs_rx, questdb_cfg, obs_health).await;
         });
         info!("slow-boot observability consumer started");
     }
@@ -3623,27 +3636,6 @@ mod tests {
         assert!(
             src.contains("NO FEED ENABLED"),
             "Step C: the no-feed idle branch must exist (idle, not crash)"
-        );
-    }
-
-    // ---------------------------------------------------------------------
-    // D2b — runtime Dhan-lane cold-start FSM (pure helpers + wiring guards).
-    // The FSM transition function itself is unit-tested in feed_state.rs.
-    // ---------------------------------------------------------------------
-
-    #[test]
-    fn gate_hold_reasserted_before_runtime_teardown() {
-        // H5 source-scan: the runtime Stop path re-asserts can_disable_dhan()
-        // immediately before the irreversible teardown, and on gate-closed it
-        // bumps the disable-aborted counter + stays Running.
-        let src = include_str!("main.rs");
-        assert!(
-            src.contains("if !ctx.feed_runtime.can_disable_dhan() \u{7b}"),
-            "H5: the runtime Stop must re-assert can_disable_dhan() before teardown"
-        );
-        assert!(
-            src.contains("tv_dhan_lane_disable_aborted_total"),
-            "H5: a gate-closed disable must bump the disable-aborted counter"
         );
     }
 }
