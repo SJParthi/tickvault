@@ -32,6 +32,37 @@ system-of-record tables (`ws_event_audit`, `ticks`) — it is NEVER on the tick
 hot path, the order path, or any feed's recovery path. SCOREBOARD-01 is the
 typed record of every degraded leg of that aggregation.
 
+> **⚠ 2026-07-13 supersession (Dhan live WS retired):** the month-long dual-feed
+> comparison purpose above is CONCLUDED — the Dhan live WS is retired by the 2026-07-13
+> operator directive (verbatim + quantified evidence: `websocket-connection-scope-lock.md`
+> "2026-07-13 Amendment" §E). The scoreboard machinery is KEPT as the Groww-monitoring
+> scorecard + the audit surface for the Dhan REST cross-checks. Contract points:
+> **(a)** Dhan `feed_scoreboard_daily` rows legitimately read `feed_off`/absent —
+> "Dhan live feed disabled by operator 2026-07-13", never an outage; the round-6
+> disable-at-session-open detection already classifies a config-OFF Dhan day as
+> `feed_off` (no up rows + no toggle = the config-off arm). **(b)** The blame classifier
+> and SCOREBOARD-01 must NOT page for the missing Dhan feed: no Dhan episodes exist to
+> classify on a retired-feed day (no `ws_event_audit` Dhan rows are written — true TODAY,
+> post-Phase-A, where the order-update WS is not spawned; see the obligation below for
+> the post-Phase-C state), and a
+> `feed_off` day is excluded from the month sums per the existing round-4/5/6 semantics —
+> any future "Dhan absent" page would be a Rule-11 false alarm, REJECT. **(c)** The Dhan
+> rows of the blame taxonomy table (805/807/streak arms) are retained for the
+> already-captured dual-feed days + historical backfills; the order-update WS (kept
+> functional-dormant in `dhan_rest_stack`) still writes its lifecycle rows, which the
+> scoreboard may aggregate as before. **(d)** Cross-feed presence pairing degrades
+> honestly to Groww-singleton slots (every slot one-sided); `unique_win_minutes` /
+> `both_minutes` on the Groww row follow the documented one-horse semantics.
+>
+> **Honest obligation — Phase C acceptance criterion, NOT resolved here:** (b) and (c)
+> are in tension AFTER the Phase C rewire — the rewired order-update WS still writes
+> Dhan-feed `ws_event_audit` lifecycle rows, and an IN-SESSION order-update reconnect row
+> is an up-kind row inside the session window that could defeat the round-6 `feed_off`
+> classification (which requires ZERO session up-rows) for the permanently-off Dhan
+> feed. The Phase C rewire PR MUST either exclude order-update
+> (`ws_type='order_update'`) rows from the `feed_off` detection or re-scope the Dhan
+> daily row — flagged as a Phase C acceptance criterion.
+
 ## §1. SCOREBOARD-01 — daily scoreboard aggregation degraded
 
 **Severity:** Medium. **Auto-triage safe:** Yes (the degrade already

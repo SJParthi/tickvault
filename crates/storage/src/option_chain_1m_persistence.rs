@@ -80,8 +80,27 @@ pub const DEDUP_KEY_OPTION_CHAIN_1M: &str =
 /// `feed` SYMBOL value — the source broker is Dhan (REST leg).
 pub const OPTION_CHAIN_1M_FEED_DHAN: &str = "dhan";
 
+/// `feed` SYMBOL value — the source broker is Groww (the 2026-07-13 PR-3
+/// Groww chain leg; feed-in-key DEDUP keeps the two feeds' rows distinct).
+pub const OPTION_CHAIN_1M_FEED_GROWW: &str = "groww";
+
 /// `source` SYMBOL label — provenance beyond `feed` (label, NOT in-key).
+///
+/// SLUG CONVENTION (the ONE consistent choice — hostile-round-1 NIT-7):
+/// every REST-leg `source` slug is `rest_` + the VENDOR ENDPOINT path
+/// snake_cased, exactly the Groww-SPOT-leg convention —
+/// Dhan `/v2/charts/intraday` → `rest_intraday`, Groww `/v1/candles` →
+/// `rest_candles`, Dhan `/v2/optionchain` → `rest_optionchain`, Groww
+/// `/v1/option-chain` → `rest_option_chain`. The `feed` column (in the
+/// DEDUP key) is what distinguishes vendors; `source` records WHICH
+/// endpoint produced the row. The two chain slugs differ by one
+/// underscore because the vendors' endpoint paths do — query the chain
+/// class with `source LIKE 'rest_option%chain'` (or just filter `feed`).
 pub const OPTION_CHAIN_1M_SOURCE: &str = "rest_optionchain";
+
+/// `source` SYMBOL label for the Groww chain leg — endpoint-derived per
+/// the convention above (Groww `GET /v1/option-chain/...`).
+pub const OPTION_CHAIN_1M_SOURCE_GROWW_CHAIN: &str = "rest_option_chain";
 
 /// `exchange_segment` SYMBOL value — the 3 underlyings are all IDX_I.
 pub const OPTION_CHAIN_1M_SEGMENT_IDX_I: &str = "IDX_I";
@@ -160,7 +179,9 @@ pub fn option_chain_1m_create_ddl() -> String {
             volume                 LONG, \
             previous_oi            LONG, \
             underlying_spot        DOUBLE, \
-            fetched_at             TIMESTAMP\
+            fetched_at             TIMESTAMP, \
+            rho                    DOUBLE, \
+            close_to_data_ms       LONG\
         ) timestamp(ts) PARTITION BY DAY \
         DEDUP UPSERT KEYS({DEDUP_KEY_OPTION_CHAIN_1M});"
     )
@@ -168,9 +189,13 @@ pub fn option_chain_1m_create_ddl() -> String {
 
 /// Every non-designated column as `(name, type)` — the single source for
 /// both the CREATE DDL sanity tests and the per-column `ALTER ADD COLUMN
-/// IF NOT EXISTS` self-heal below. Pure.
+/// IF NOT EXISTS` self-heal below. The 2026-07-13 Groww-leg additions
+/// (`rho`, `close_to_data_ms`) ride the SAME self-heal: a live table
+/// created by an earlier build gains them via `ALTER ADD COLUMN IF NOT
+/// EXISTS` at the next boot (nullable — the Dhan rows simply leave them
+/// NULL until the Dhan leg ever stamps them). Pure.
 #[must_use]
-pub fn option_chain_1m_columns() -> [(&'static str, &'static str); 21] {
+pub fn option_chain_1m_columns() -> [(&'static str, &'static str); 23] {
     [
         ("trading_date_ist", "TIMESTAMP"),
         ("underlying_security_id", "LONG"),
@@ -193,6 +218,16 @@ pub fn option_chain_1m_columns() -> [(&'static str, &'static str); 21] {
         ("previous_oi", "LONG"),
         ("underlying_spot", "DOUBLE"),
         ("fetched_at", "TIMESTAMP"),
+        // Groww-leg additions (2026-07-13, PR-3 — additive, benefit both
+        // feeds; grounding: `docs/groww-ref/14-option-chain.md` §2 response
+        // schema (per-leg greeks carry `rho`; verified against BruteX's
+        // production use of the same account) + the spot-leg
+        // `close_to_data_ms` honesty-column precedent (the chain response
+        // carries NO timestamp — Verified-absence, §3 — so the measured
+        // close→data delay is the ONLY freshness signal). Dhan rows leave
+        // both NULL (the Dhan emit path is untouched).
+        ("rho", "DOUBLE"),
+        ("close_to_data_ms", "LONG"),
     ]
 }
 
@@ -299,13 +334,52 @@ pub struct OptionChain1mWriter {
     sender: Option<Sender>,
     buffer: Buffer,
     pending: usize,
+    /// The `feed` SYMBOL stamped on every appended row (`'dhan'`/`'groww'`).
+    feed: &'static str,
+    /// The `source` SYMBOL stamped on every appended row (provenance label).
+    source: &'static str,
+}
+
+/// The per-feed discarded-rows counter name — the Dhan and Groww chain
+/// legs each keep their own series so a Groww discard can never inflate
+/// the Dhan signal (the spot-writer precedent). Pure.
+#[must_use]
+fn chain_1m_discard_counter_for(feed: &str) -> &'static str {
+    if feed == OPTION_CHAIN_1M_FEED_GROWW {
+        "tv_groww_chain1m_rows_discarded_total"
+    } else {
+        "tv_chain1m_rows_discarded_total"
+    }
+}
+
+/// The per-feed written-rows counter name (same per-feed split). Pure.
+#[must_use]
+fn chain_1m_written_counter_for(feed: &str) -> &'static str {
+    if feed == OPTION_CHAIN_1M_FEED_GROWW {
+        "tv_groww_chain1m_rows_written_total"
+    } else {
+        "tv_chain1m_rows_written_total"
+    }
 }
 
 impl OptionChain1mWriter {
     /// Production constructor — ILP-over-HTTP sender, lazy on failure.
+    /// Stamps `feed='dhan'` / `source='rest_optionchain'` (the original
+    /// PR-3 behaviour, byte-identical — the Groww leg uses
+    /// [`Self::new_with_feed`]).
     #[must_use]
     // TEST-EXEMPT: production ILP-connect constructor (lazy-build contract exercised via test_chain1m_writer_new_is_lazy...); append/flush paths covered via for_test()
     pub fn new(config: &QuestDbConfig) -> Self {
+        Self::new_with_feed(config, OPTION_CHAIN_1M_FEED_DHAN, OPTION_CHAIN_1M_SOURCE)
+    }
+
+    /// Feed-parameterized production constructor (operator grant 2026-07-13
+    /// — the Groww chain leg writes the SAME table tagged `feed='groww'`,
+    /// source [`OPTION_CHAIN_1M_SOURCE_GROWW_CHAIN`]). Lazy on failure
+    /// like [`Self::new`].
+    #[must_use]
+    // TEST-EXEMPT: production ILP-connect constructor (same lazy-build contract as new(); the feed/source stamping is exercised via for_test_with_feed()).
+    pub fn new_with_feed(config: &QuestDbConfig, feed: &'static str, source: &'static str) -> Self {
         let conf = option_chain_1m_ilp_http_conf(config);
         match Sender::from_conf(&conf) {
             Ok(s) => {
@@ -314,30 +388,43 @@ impl OptionChain1mWriter {
                     sender: Some(s),
                     buffer: b,
                     pending: 0,
+                    feed,
+                    source,
                 }
             }
             Err(err) => {
                 warn!(
                     ?err,
-                    "option_chain_1m writer: QuestDB unreachable — buffering locally"
+                    feed, "option_chain_1m writer: QuestDB unreachable — buffering locally"
                 );
                 Self {
                     sender: None,
                     buffer: Buffer::new(ProtocolVersion::V1),
                     pending: 0,
+                    feed,
+                    source,
                 }
             }
         }
     }
 
-    /// Test constructor — disconnected writer, empty buffer.
+    /// Test constructor — disconnected writer, empty buffer (Dhan stamps).
     #[must_use]
     // TEST-EXEMPT: test-only helper used by the append/flush unit tests below.
     pub fn for_test() -> Self {
+        Self::for_test_with_feed(OPTION_CHAIN_1M_FEED_DHAN, OPTION_CHAIN_1M_SOURCE)
+    }
+
+    /// Test constructor with explicit feed/source stamps.
+    #[must_use]
+    // TEST-EXEMPT: test-only helper used by the feed-stamp unit tests below.
+    pub fn for_test_with_feed(feed: &'static str, source: &'static str) -> Self {
         Self {
             sender: None,
             buffer: Buffer::new(ProtocolVersion::V1),
             pending: 0,
+            feed,
+            source,
         }
     }
 
@@ -356,19 +443,45 @@ impl OptionChain1mWriter {
 
     /// Appends one option-chain leg row (cold path, ≤~3K rows/minute,
     /// batched: the fetcher appends a whole minute then flushes once).
+    /// The Dhan emit path — `rho` / `close_to_data_ms` stay UNWRITTEN
+    /// (NULL in QuestDB) until the Dhan leg ever stamps them.
     ///
     /// # Errors
     /// Propagates ILP buffer errors (table/column append failure).
     pub fn append_row(&mut self, r: &OptionChain1mRow) -> Result<()> {
-        self.buffer
+        self.append_row_inner(r, None)
+    }
+
+    /// Appends one row WITH the 2026-07-13 extension columns — the Groww
+    /// chain leg stamps the per-leg `rho` greek
+    /// (`docs/groww-ref/14-option-chain.md` §2) and the measured
+    /// `close_to_data_ms` delay (the chain response carries NO timestamp —
+    /// the measured delay is the only freshness signal).
+    ///
+    /// # Errors
+    /// Propagates ILP buffer errors (table/column append failure).
+    pub fn append_row_ext(
+        &mut self,
+        r: &OptionChain1mRow,
+        rho: f64,
+        close_to_data_ms: i64,
+    ) -> Result<()> {
+        self.append_row_inner(r, Some((rho, close_to_data_ms)))
+    }
+
+    /// Shared append body — `ext` = the optional `(rho, close_to_data_ms)`
+    /// extension pair (ILP rows are sparse: absent columns land NULL).
+    fn append_row_inner(&mut self, r: &OptionChain1mRow, ext: Option<(f64, i64)>) -> Result<()> {
+        let b = self
+            .buffer
             .table(OPTION_CHAIN_1M_TABLE)
             .context("table")?
             // Symbols BEFORE columns (ILP tags-before-fields rule).
             .symbol("exchange_segment", OPTION_CHAIN_1M_SEGMENT_IDX_I)
             .context("exchange_segment")?
-            .symbol("feed", OPTION_CHAIN_1M_FEED_DHAN)
+            .symbol("feed", self.feed)
             .context("feed")?
-            .symbol("source", OPTION_CHAIN_1M_SOURCE)
+            .symbol("source", self.source)
             .context("source")?
             .symbol("underlying_symbol", r.underlying_symbol)
             .context("underlying_symbol")?
@@ -408,8 +521,16 @@ impl OptionChain1mWriter {
             .column_f64("underlying_spot", r.underlying_spot)
             .context("underlying_spot")?
             .column_ts("fetched_at", TimestampNanos::new(r.fetched_at_ist_nanos))
-            .context("fetched_at")?
-            .at(TimestampNanos::new(r.ts_ist_nanos))
+            .context("fetched_at")?;
+        let b = if let Some((rho, close_to_data_ms)) = ext {
+            b.column_f64("rho", rho)
+                .context("rho")?
+                .column_i64("close_to_data_ms", close_to_data_ms)
+                .context("close_to_data_ms")?
+        } else {
+            b
+        };
+        b.at(TimestampNanos::new(r.ts_ist_nanos))
             .context("designated timestamp")?;
         self.pending = self.pending.saturating_add(1);
         Ok(())
@@ -445,7 +566,8 @@ impl OptionChain1mWriter {
             .map(|sender| sender.flush(&mut self.buffer));
         match flushed {
             Some(Ok(())) => {
-                metrics::counter!("tv_chain1m_rows_written_total").increment(self.pending as u64);
+                metrics::counter!(chain_1m_written_counter_for(self.feed))
+                    .increment(self.pending as u64);
                 self.pending = 0;
                 Ok(())
             }
@@ -465,12 +587,14 @@ impl OptionChain1mWriter {
     }
 
     /// Drop every buffered-but-unflushed row (poisoned-buffer defense).
-    /// Returns the discarded row count; counted by
-    /// `tv_chain1m_rows_discarded_total` so a discard is never silent.
+    /// Returns the discarded row count; counted per feed
+    /// (`tv_chain1m_rows_discarded_total` /
+    /// `tv_groww_chain1m_rows_discarded_total`) so a discard is never
+    /// silent and a Groww discard never inflates the Dhan signal.
     pub fn discard_pending(&mut self) -> usize {
         let dropped = self.pending;
         if dropped > 0 {
-            metrics::counter!("tv_chain1m_rows_discarded_total").increment(dropped as u64);
+            metrics::counter!(chain_1m_discard_counter_for(self.feed)).increment(dropped as u64);
         }
         self.buffer.clear();
         self.pending = 0;
@@ -563,10 +687,82 @@ mod tests {
     fn test_option_chain_1m_symbol_labels_stable() {
         assert_eq!(OPTION_CHAIN_1M_TABLE, "option_chain_1m");
         assert_eq!(OPTION_CHAIN_1M_FEED_DHAN, "dhan");
+        assert_eq!(OPTION_CHAIN_1M_FEED_GROWW, "groww");
         assert_eq!(OPTION_CHAIN_1M_SOURCE, "rest_optionchain");
+        assert_eq!(OPTION_CHAIN_1M_SOURCE_GROWW_CHAIN, "rest_option_chain");
+        assert_ne!(
+            OPTION_CHAIN_1M_SOURCE, OPTION_CHAIN_1M_SOURCE_GROWW_CHAIN,
+            "provenance labels must stay distinguishable beyond feed"
+        );
         assert_eq!(OPTION_CHAIN_1M_SEGMENT_IDX_I, "IDX_I");
         assert_eq!(OPTION_CHAIN_1M_LEG_CE, "CE");
         assert_eq!(OPTION_CHAIN_1M_LEG_PE, "PE");
+    }
+
+    /// Per-feed counter routing (the spot-writer precedent): a Groww
+    /// discard/write can never inflate the Dhan series.
+    #[test]
+    fn test_chain1m_per_feed_counter_names() {
+        assert_eq!(
+            chain_1m_discard_counter_for(OPTION_CHAIN_1M_FEED_DHAN),
+            "tv_chain1m_rows_discarded_total"
+        );
+        assert_eq!(
+            chain_1m_discard_counter_for(OPTION_CHAIN_1M_FEED_GROWW),
+            "tv_groww_chain1m_rows_discarded_total"
+        );
+        assert_eq!(
+            chain_1m_written_counter_for(OPTION_CHAIN_1M_FEED_DHAN),
+            "tv_chain1m_rows_written_total"
+        );
+        assert_eq!(
+            chain_1m_written_counter_for(OPTION_CHAIN_1M_FEED_GROWW),
+            "tv_groww_chain1m_rows_written_total"
+        );
+    }
+
+    /// The Groww-parameterized writer stamps `feed=groww` + its own source
+    /// label, and `append_row_ext` writes the 2026-07-13 extension columns
+    /// (`rho` + `close_to_data_ms`); the plain Dhan `append_row` leaves
+    /// them UNWRITTEN (NULL in QuestDB — the Dhan emit path untouched).
+    #[test]
+    fn test_chain1m_append_row_ext_groww_stamps_feed_rho_and_latency() {
+        let mut w = OptionChain1mWriter::for_test_with_feed(
+            OPTION_CHAIN_1M_FEED_GROWW,
+            OPTION_CHAIN_1M_SOURCE_GROWW_CHAIN,
+        );
+        w.append_row_ext(&sample_row(), 5.1802, 1_042)
+            .expect("ext append must succeed");
+        assert_eq!(w.pending(), 1);
+        let line = w.buffer_utf8();
+        assert!(line.contains(",feed=groww"), "feed tag missing: {line}");
+        assert!(
+            line.contains(",source=rest_option_chain"),
+            "groww source tag missing: {line}"
+        );
+        assert!(line.contains("rho=5.1802"), "rho missing: {line}");
+        assert!(
+            line.contains("close_to_data_ms=1042i"),
+            "close_to_data_ms missing: {line}"
+        );
+
+        // The Dhan path never writes the extension columns.
+        let mut dhan = OptionChain1mWriter::for_test();
+        dhan.append_row(&sample_row()).expect("append must succeed");
+        let dhan_line = dhan.buffer_utf8();
+        assert!(dhan_line.contains(",feed=dhan"), "got: {dhan_line}");
+        assert!(
+            dhan_line.contains(",source=rest_optionchain"),
+            "got: {dhan_line}"
+        );
+        assert!(
+            !dhan_line.contains("rho="),
+            "Dhan must not stamp rho: {dhan_line}"
+        );
+        assert!(
+            !dhan_line.contains("close_to_data_ms="),
+            "Dhan must not stamp close_to_data_ms: {dhan_line}"
+        );
     }
 
     #[test]

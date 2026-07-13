@@ -2980,6 +2980,18 @@ async fn main() -> Result<()> {
         // crash-restart day ran NO per-minute fetches and NO 15:31 sweep.
         spawn_groww_spot_1m_leg(&config, &notifier, &trading_calendar);
 
+        // Daily 15:40 IST timeframe-consistency verifier on the FAST
+        // crash-recovery arm too (operator 2026-07-13; the scoreboard
+        // dual-spawn precedent directly above): this arm `return
+        // run_shutdown_fast`s and never reaches the process-global spawn
+        // below, yet a mid-market crash-restart session must still own the
+        // day's 15:40 TF-VERIFY run. Once-per-process guarded inside.
+        tickvault_app::tf_consistency_boot::spawn_tf_consistency_tasks(
+            &config,
+            &trading_calendar,
+            &notifier,
+        );
+
         // --- Await shutdown ---
         return run_shutdown_fast(
             ws_handles,
@@ -3167,6 +3179,20 @@ async fn main() -> Result<()> {
     // tagged feed='groww' (+ `rest_fetch_audit` forensics rows). See
     // `spawn_groww_spot_1m_leg`.
     spawn_groww_spot_1m_leg(&config, &notifier, &trading_calendar);
+
+    // Daily 15:40 IST timeframe-consistency verifier — PROCESS-GLOBAL like
+    // the conservation audit + scoreboard above (operator 2026-07-13):
+    // recompute every higher-TF candle (2m..4h) from the stored 1m rows and
+    // compare against the persisted TF tables — Dhan verifies TODAY, Groww
+    // verifies the PREVIOUS trading day (TF-VERIFY-01/02). Gated on
+    // `[tf_consistency] enabled` + trading-day inside the task; the
+    // once-per-process AtomicBool inside makes the fast-arm + prefix
+    // dual-spawn safe. See `tf_consistency_boot::spawn_tf_consistency_tasks`.
+    tickvault_app::tf_consistency_boot::spawn_tf_consistency_tasks(
+        &config,
+        &trading_calendar,
+        &notifier,
+    );
 
     // -----------------------------------------------------------------------
     // DayOhlcTracker boot wiring (post 2026-05-26 simplification; MOVED to
@@ -15043,12 +15069,23 @@ fn spawn_daily_tick_conservation_task(
 /// runs it. Config-gated fail-safe: an absent `[groww_spot_1m]` section
 /// disables it. Supervised respawn wrapper; self-skips on non-trading days
 /// / past 15:30 IST (post the one bounded ~15:31 repair sweep).
-// TEST-EXEMPT: tokio::spawn wrapper over the unit-tested boot module; BOTH call sites + the config gate pinned by crates/app/tests/groww_spot_1m_wiring_guard.rs.
+// TEST-EXEMPT: tokio::spawn wrapper over the unit-tested boot modules; BOTH call sites + the config gates pinned by crates/app/tests/groww_spot_1m_wiring_guard.rs + crates/app/tests/groww_chain_1m_wiring_guard.rs.
 fn spawn_groww_spot_1m_leg(
     config: &ApplicationConfig,
     notifier: &std::sync::Arc<NotificationService>,
     trading_calendar: &std::sync::Arc<TradingCalendar>,
 ) {
+    // PR-3 sequencing: the spot→chain minute-done watch channel exists
+    // ONLY when BOTH Groww REST legs are enabled — chain-off keeps the
+    // spot leg byte-identical to PR-2 (no sender, no publishes; the Dhan
+    // seam's precedent).
+    let chain_enabled = config.groww_option_chain_1m.enabled;
+    let (minute_done_tx, spot_minute_done) = if config.groww_spot_1m.enabled && chain_enabled {
+        let (tx, rx) = tokio::sync::watch::channel::<Option<u32>>(None);
+        (Some(tx), Some(rx))
+    } else {
+        (None, None)
+    };
     if config.groww_spot_1m.enabled {
         let _groww_spot1m_supervisor =
             tickvault_app::groww_spot_1m_boot::spawn_supervised_groww_spot_1m(
@@ -15056,6 +15093,7 @@ fn spawn_groww_spot_1m_leg(
                     notifier: notifier.clone(),
                     calendar: std::sync::Arc::clone(trading_calendar),
                     questdb: config.questdb.clone(),
+                    minute_done_tx,
                 },
             );
         info!(
@@ -15065,6 +15103,43 @@ fn spawn_groww_spot_1m_leg(
         );
     } else {
         info!("groww_spot_1m: disabled by config — Groww per-minute spot fetch not spawned");
+    }
+    // Groww per-minute option-chain leg (PR-3): sequenced after the spot
+    // fire via the watch signal + fallback timer; DEFAULT-OFF pending the
+    // first live probe — the probe-and-report path runs instead while
+    // disabled (one bounded chain call per underlying, Info verdict).
+    if chain_enabled {
+        let _groww_chain1m_supervisor =
+            tickvault_app::groww_option_chain_1m_boot::spawn_supervised_groww_chain_1m(
+                tickvault_app::groww_option_chain_1m_boot::GrowwChain1mTaskParams {
+                    notifier: notifier.clone(),
+                    calendar: std::sync::Arc::clone(trading_calendar),
+                    questdb: config.questdb.clone(),
+                    spot_minute_done,
+                },
+            );
+        info!(
+            "groww_chain_1m: Groww per-minute option-chain leg spawned \
+             (fires each minute close right after the Groww spot fetch; \
+             sequential underlying pacing)"
+        );
+    } else if config.groww_option_chain_1m.probe_and_report {
+        let _groww_chain1m_probe = tokio::spawn(
+            tickvault_app::groww_option_chain_1m_boot::run_groww_chain_1m_probe(
+                tickvault_app::groww_option_chain_1m_boot::GrowwChain1mTaskParams {
+                    notifier: notifier.clone(),
+                    calendar: std::sync::Arc::clone(trading_calendar),
+                    questdb: config.questdb.clone(),
+                    spot_minute_done: None,
+                },
+            ),
+        );
+        info!(
+            "groww_chain_1m: pipeline OFF — one boot-time chain probe \
+             spawned (verdict via Telegram; persists nothing)"
+        );
+    } else {
+        info!("groww_chain_1m: disabled by config (probe off) — nothing spawned");
     }
 }
 

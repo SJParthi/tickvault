@@ -1,5 +1,23 @@
 # Dual-Feed Scoreboard — Operator Runbook (month-end verdict + daily triage)
 
+> **⚠ SUPERSEDED IN PURPOSE 2026-07-13 (operator directive — Dhan live WS retired):** the
+> 2026-07-10 month-long Dhan-vs-Groww live comparison is CONCLUDED EARLY by the 2026-07-13
+> retirement directive (verbatim + evidence record: `websocket-connection-scope-lock.md`
+> "2026-07-13 Amendment" §E — the comparison's own findings, p99 46.37s vs 562ms lag +
+> 29–67 silent SIDs/min + the post-#1474 candle mismatches, are WHY the Dhan feed was
+> retired). From 2026-07-13 the scorecard is a **GROWW-monitoring scorecard + Dhan REST
+> cross-checks** (§37 BruteX / §38 per-minute REST parity), not a two-feed contest:
+> **Dhan rows legitimately read `feed_off` / absent — "Dhan live feed disabled by operator
+> 2026-07-13" — never an outage implication.** The `feed_off` day detection (round 4/5/6
+> semantics below) already handles this honestly: the pre-session disable state stamps
+> `feed_off`, the partner feed's `unique_win_minutes`/`both_minutes` read the −1 sentinel
+> ("exclusive-vs-nothing is not a measurement"), and the month SQL's no-contest exclusion
+> applies. The §2 month-end cumulative VERDICT SQL is retained for the ALREADY-CAPTURED
+> 2026-07-10..12 dual-feed days (historical audit) and for a future GDF-vs-Groww month
+> (`gdf-third-feed-scope-2026-07-13.md`); do not sign a "month verdict" spanning the
+> retirement boundary without splitting at 2026-07-13. Tables, blame taxonomy, and the
+> daily 15:45 IST Telegram are UNCHANGED.
+
 > **Purpose:** the operator runs Dhan + Groww live in parallel for a month
 > (directive 2026-07-10) and signs a month-end verdict: which feed covered
 > more, which was faster, who caused the drops — with every claim backed by
