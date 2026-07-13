@@ -118,3 +118,36 @@
 8. **Option Chain enhanced** — since v2.5, `security_id` field in response
 9. **Python SDK versioning** — Python SDK versions (2.0.0→2.2.0rc1) do NOT match API platform versions (2.0→2.5)
 10. **SEBI algo trading framework** — SEBI directive Feb 2025, effective Aug 2025. Static IP + 2FA + API key traceability mandatory.
+
+---
+
+## 2026-07-13 Upstream Update (search-index spot-check + PyPI — see `verification-2026-07-13.md`)
+
+Per repo convention this dated section supersedes without rewriting the text above.
+
+### (a) Provenance inconsistency in THIS file (flagged, header NOT rewritten)
+
+The header says **Extracted: 2026-03-13**, yet the "Version 2.5.1 — Mar 17, 2026" section above
+postdates that extraction. Per the header NOTE, version labels are our INTERNAL mapping of
+Dhan's dated releases — the 2.5.1 section was compiled from dated announcements (MPP circulars,
+SDK changes) and **may never have been a releases-page entry at all**. Do not treat the header
+extraction date as covering the 2.5.1 section, and do not cite "v2.5.1" as a Dhan-published
+release label.
+
+### (b) Live releases page — latest indexed entry still Feb 09, 2026
+
+The 2026-07-13 search-index spot-check of https://dhanhq.co/docs/v2/releases/ surfaced **no
+entry newer than Feb 09, 2026** (our "v2.5"). No "v2.6"-class release found. **Absence =
+Unknown** — search snippets cannot prove nothing newer exists (index-lag caveat); the page was
+not directly readable from the sandbox (proxy-blocked).
+
+### (c) Python SDK — 2.2.0 final + 2.3.0rc1 (PyPI direct fetch = Verified for the SDK facts)
+
+- `dhanhq` **2.2.0** (final) uploaded to PyPI **2026-04-24** — supersedes the header NOTE's
+  "2.2.0rc1" as the latest stable.
+- `dhanhq` **2.3.0rc1** uploaded **2026-07-07**. Features per the GitHub releases page
+  (Secondary): **Conditional Orders**, **Global Stocks (US)** incl. a separate live feed,
+  **P&L Based Exit**, **Multi-leg Margin Calculator** (documented on the new
+  docs.dhanhq.co portal at api/v2/funds/calculate-multi-margin), enhanced FullDepth callback
+  handling. Global Stocks is out of tickvault scope.
+- SDK versions still do NOT map to platform versions (takeaway 9 stands).

@@ -259,3 +259,31 @@ pub struct FundLimitResponse {
 6. **Pre-trade margin check** — call margin calculator before placing orders. If `insufficientBalance > 0`, do NOT place the order.
 
 7. **`availableBalance` vs `availabelBalance`** — Single margin response uses `availableBalance` (correct spelling). Fund limit uses `availabelBalance` (typo). These are DIFFERENT fields in different responses with different spellings.
+
+---
+
+## 2026-07-13 Upstream Update — multi-margin request naming + Multi-leg Margin Calculator — UNVERIFIED-LIVE
+
+Per repo convention this dated section supersedes without rewriting §3 above. Evidence chain:
+`verification-2026-07-13.md` §4 flag 4. **No live API call was made — live-probe before any
+multi-margin call is trusted.** There is no multi-margin caller in `crates/` today, so this has
+zero runtime impact.
+
+1. **The §3 naming ambiguity now tilts to `includeOrder` (singular) + `scripList`.** The earlier
+   note (§3, "Our implementation uses `includeOrders` (plural) and `scripts`") is the
+   LESS-supported reading as of 2026-07-13:
+   - Live-indexed docs summary (search-relayed): the multi-margin request "includes parameters
+     like includePosition, **includeOrder**, dhanClientId, and a **scripList**".
+   - The OFFICIAL Python SDK — released 2.3.0rc1 sdist, direct PyPI fetch (Verified for the SDK)
+     — sends the wire body `{"includePosition": …, "includeOrder": …, "scripList": […]}` to
+     `POST /margincalculator/multi` (`src/dhanhq/_funds.py::margin_calculator_multi`).
+   The §3 example JSON (`includeOrders` + `scripts`) is retained above as history; any future
+   implementation should START from `includeOrder`/`scripList` and confirm by live probe.
+2. **Multi-leg Margin Calculator is now documented on the new docs portal:**
+   `https://docs.dhanhq.co/api/v2/funds/calculate-multi-margin` (live-indexed). SDK 2.3.0rc1
+   (PyPI description verbatim, uploaded 2026-07-07): "Multi-leg Margin Calculator - compute
+   combined margin for multiple orders with hedge benefits." Whether that portal page is the
+   SAME `/margincalculator/multi` endpoint or a NEW one is **Unknown** — probe target on the
+   next live crawl (operator paste list, `verification-2026-07-13.md` §3).
+3. **`availabelBalance` typo still live** in the indexed v1 AND v2 funds pages (exact-term
+   search hit only those two pages) — the §4/§6 "do NOT fix it" rule stands.
