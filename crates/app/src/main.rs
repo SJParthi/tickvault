@@ -3117,6 +3117,36 @@ async fn main() -> Result<()> {
         &feed_runtime,
     );
 
+    // Groww per-minute spot 1m REST leg (operator grant 2026-07-13 — PR-2 of
+    // the Groww per-minute REST plan) — PROCESS-GLOBAL like the scoreboard /
+    // conservation tasks above, deliberately NOT the Dhan-gated
+    // spawn_post_market_tasks seam: this leg's token is the shared-minter
+    // SSM read (never the Dhan JWT), so a Dhan-off (Groww-only) session
+    // still runs it. Every trading-day minute close in [09:16:00, 15:30:00]
+    // IST it fetches the just-closed minute's official Groww 1m OHLCV for
+    // the 3 spot indices and persists to `spot_1m_rest` tagged feed='groww'
+    // (+ one `rest_fetch_audit` forensics row per symbol per minute).
+    // Config-gated fail-safe: an absent `[groww_spot_1m]` section disables
+    // it. Supervised respawn wrapper; self-skips on non-trading days / past
+    // 15:30 IST (post the one bounded ~15:31 repair sweep).
+    if config.groww_spot_1m.enabled {
+        let _groww_spot1m_supervisor =
+            tickvault_app::groww_spot_1m_boot::spawn_supervised_groww_spot_1m(
+                tickvault_app::groww_spot_1m_boot::GrowwSpot1mTaskParams {
+                    notifier: notifier.clone(),
+                    calendar: std::sync::Arc::clone(&trading_calendar),
+                    questdb: config.questdb.clone(),
+                },
+            );
+        info!(
+            "groww_spot_1m: Groww per-minute spot 1m REST leg spawned \
+             (fires each minute close 09:16:00-15:30:00 IST; sequential \
+             symbol pacing)"
+        );
+    } else {
+        info!("groww_spot_1m: disabled by config — Groww per-minute spot fetch not spawned");
+    }
+
     // -----------------------------------------------------------------------
     // DayOhlcTracker boot wiring (post 2026-05-26 simplification; MOVED to
     // process-global scope 2026-07-01 to stop the per-lane cold-start leak).
