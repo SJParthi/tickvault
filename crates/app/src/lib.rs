@@ -67,6 +67,11 @@ pub mod boot_helpers;
 /// Dhan lane's running flag honest across runtime toggles and enforces the
 /// Dhan-disable safety gate at the supervisor layer (operator 2026-06-21/24).
 pub mod dhan_activation;
+/// Shared Dhan `/v2/charts/intraday` 1m request/response primitives —
+/// relocated from `cross_verify_1m_boot.rs` in Phase C1 of the 2026-07-13
+/// Dhan live-WS retirement (the spot-1m legs must outlive the cross-verify
+/// module the Phase C deletion PRs remove). Pure move, zero behavior change.
+pub mod dhan_intraday_parse;
 /// Dhan REST-only auth bootstrap (Phase A of the Dhan-live-feed removal,
 /// operator directive 2026-07-13): with `feeds.dhan_enabled = false` this
 /// brings up the RETAINED Dhan REST surface — dual-instance lock →

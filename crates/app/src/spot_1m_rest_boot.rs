@@ -124,7 +124,7 @@ use tickvault_storage::spot_1m_rest_persistence::{
     SPOT_1M_REST_SEGMENT_IDX_I, Spot1mRestRow, Spot1mRestWriter, ensure_spot_1m_rest_table,
 };
 
-use crate::cross_verify_1m_boot::{MinuteCandle, intraday_request_body, parse_intraday_1m_candles};
+use crate::dhan_intraday_parse::{MinuteCandle, intraday_request_body, parse_intraday_1m_candles};
 
 /// Dhan `instrument` enum value for IDX_I index rows.
 const SPOT_1M_INSTRUMENT_INDEX: &str = "INDEX";
