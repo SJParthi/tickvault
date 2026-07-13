@@ -2908,6 +2908,9 @@ mod tests {
                 pg_port: 1,
                 ilp_port: 1,
             },
+            // PR-3 rebase reconciliation: the chain leg's minute-done
+            // sequencing sender — None in these fixtures (chain off).
+            minute_done_tx: None,
         }
     }
 
