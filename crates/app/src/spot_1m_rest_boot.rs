@@ -19,6 +19,30 @@
 //! retrieval) as the live measurement. A minute whose candle never appears
 //! is `outcome="empty"` — counted, edge-tracked, never silent (Rule 11).
 //!
+//! ## 2026-07-13 live-failure hotfix — proven day window + backfill sweep
+//! The first live session (2026-07-13) failed EVERY minute with
+//! `ok=0/errors=0/empty=3` ("2xx but the minute's candle never appeared"):
+//! the original same-date 60-second request window
+//! (`fromDate = minute open, toDate = open + 60s`) was answered `2xx`
+//! WITHOUT the target candle all session, while the matcher itself was
+//! verified correct (same conversion as the live-proven cross-verify).
+//! Fixes:
+//! 1. **Window**: each fire now sends the ONLY live-proven window shape —
+//!    day-granular `fromDate = D 00:00:00, toDate = D+1 00:00:00` (the
+//!    exact body the 15:31 cross-verify + prev-day fetchers use daily) —
+//!    and filters client-side to the exact minute (over-delivery: a full
+//!    session ≈ 375 candles ≈ 20 KB, far under the 2 MiB body cap).
+//! 2. **Previous-minute backfill**: the full-day response covers earlier
+//!    minutes, so each fire ALSO persists the previous minute when it was
+//!    not successfully persisted (per-SID in-memory [`PersistTracker`];
+//!    DEDUP UPSERT keys make re-appends idempotent). Edge accounting stays
+//!    honest: a fire's verdict is its OWN target minute's fetch+persist —
+//!    a minute that lands only via next-fire backfill was still that
+//!    fire's failure; the backfilled row's `close_to_data_ms` column
+//!    stamps the REAL retrieval delay (> 60 s), while the
+//!    `tv_spot1m_close_to_data_ms` histogram keeps sampling ONLY own-fire
+//!    retrievals (its defined "just-closed availability" semantics).
+//!
 //! **First-attempt timing (honest):** the boundary sleep is computed on a
 //! SECOND-granular clock plus the 300 ms fire delay, so the first attempt
 //! lands anywhere from ~0.3 s to ~1.3 s after the minute close (never a
@@ -63,17 +87,17 @@
 //! `panic = "abort"`, so a panicked task aborts the PROCESS in prod — the
 //! panic-respawn arm is an unwind-build (dev/test) self-heal path only.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{DateTime, Duration as ChronoDuration, NaiveDate};
 use secrecy::ExposeSecret;
-use serde_json::json;
 use tracing::{error, info, warn};
 
 use tickvault_common::config::QuestDbConfig;
 use tickvault_common::constants::{
-    DHAN_CANDLE_INTERVAL_1MIN, DHAN_CHARTS_INTRADAY_PATH, IST_UTC_OFFSET_SECONDS, SECONDS_PER_DAY,
+    DHAN_CHARTS_INTRADAY_PATH, IST_UTC_OFFSET_SECONDS, SECONDS_PER_DAY,
     SPOT_1M_REST_CONSECUTIVE_FAIL_PAGE_THRESHOLD, SPOT_1M_REST_FIRE_DELAY_MS,
     SPOT_1M_REST_FIRE_STALE_GRACE_SECS, SPOT_1M_REST_FIRST_FIRE_SECS_OF_DAY_IST,
     SPOT_1M_REST_INDICES, SPOT_1M_REST_LAST_FIRE_SECS_OF_DAY_IST, SPOT_1M_REST_MAX_BODY_BYTES,
@@ -82,6 +106,7 @@ use tickvault_common::constants::{
 use tickvault_common::error_code::ErrorCode;
 use tickvault_common::sanitize::{capture_rest_error_body, redact_url_params};
 use tickvault_common::trading_calendar::TradingCalendar;
+use tickvault_common::types::SecurityId;
 use tickvault_common::url_join::join_api_url;
 use tickvault_core::auth::token_manager::TokenHandle;
 use tickvault_core::notification::{NotificationEvent, NotificationService};
@@ -90,7 +115,7 @@ use tickvault_storage::spot_1m_rest_persistence::{
     SPOT_1M_REST_SEGMENT_IDX_I, Spot1mRestRow, Spot1mRestWriter, ensure_spot_1m_rest_table,
 };
 
-use crate::cross_verify_1m_boot::{MinuteCandle, parse_intraday_1m_candles};
+use crate::cross_verify_1m_boot::{MinuteCandle, intraday_request_body, parse_intraday_1m_candles};
 
 /// Dhan `instrument` enum value for IDX_I index rows.
 const SPOT_1M_INSTRUMENT_INDEX: &str = "INDEX";
@@ -192,46 +217,28 @@ pub fn spot_1m_day_is_over(now_secs_of_day: u32, is_trading_day: bool) -> bool {
     !is_trading_day || now_secs_of_day > SPOT_1M_REST_LAST_FIRE_SECS_OF_DAY_IST
 }
 
-/// `fromDate`/`toDate` datetime strings (`"YYYY-MM-DD HH:MM:SS"`) for ONE
-/// minute: `from` = the minute open, `to` = open + 60 s. Dhan may
-/// over-deliver beyond `toDate` (community-reported intraday behaviour) —
-/// the consumer filters client-side to the exact minute regardless. `None`
-/// only on an impossible seconds-of-day (defensive). Pure.
+/// The `/v2/charts/intraday` request body for ONE index — the PROVEN
+/// day-granular window (`fromDate = D 00:00:00`, `toDate = D+1 00:00:00`),
+/// the EXACT shape the 15:31 cross-verify + prev-day fetchers use live
+/// daily (delegates to the shared [`intraday_request_body`] builder).
+///
+/// 2026-07-13 live-failure hotfix: the original same-date
+/// `[minute open, open + 60s]` window was answered `2xx` WITHOUT the
+/// target candle for EVERY session minute (SPOT1M-01 all day, `empty=3`
+/// per fire) — that window shape was never live-proven. The consumer
+/// filters the full-day response client-side to the exact minute;
+/// over-delivery is ~375 candles ≈ 20 KB, far under the 2 MiB body cap.
+/// Pure.
 #[must_use]
-pub fn minute_window_strings(
-    trading_date: NaiveDate,
-    minute_open_secs_of_day: u32,
-) -> Option<(String, String)> {
-    let open = trading_date.and_hms_opt(
-        minute_open_secs_of_day / 3600,
-        (minute_open_secs_of_day % 3600) / 60,
-        minute_open_secs_of_day % 60,
-    )?;
-    let close = open + ChronoDuration::seconds(60);
-    Some((
-        open.format("%Y-%m-%d %H:%M:%S").to_string(),
-        close.format("%Y-%m-%d %H:%M:%S").to_string(),
-    ))
-}
-
-/// The `/v2/charts/intraday` request body for ONE index and ONE minute
-/// window. `securityId` is a STRING; `interval` is the STRING `"1"`
-/// (historical-data.md rules 4-5). Pure.
-#[must_use]
-pub fn spot_1m_request_body(
-    security_id: &str,
-    from_datetime: &str,
-    to_datetime: &str,
-) -> serde_json::Value {
-    json!({
-        "securityId": security_id,
-        "exchangeSegment": SPOT_1M_REST_SEGMENT_IDX_I,
-        "instrument": SPOT_1M_INSTRUMENT_INDEX,
-        "interval": DHAN_CANDLE_INTERVAL_1MIN,
-        "oi": false,
-        "fromDate": from_datetime,
-        "toDate": to_datetime,
-    })
+pub fn spot_1m_day_request_body(security_id: &str, trading_date: NaiveDate) -> serde_json::Value {
+    let next_day = trading_date.succ_opt().unwrap_or(trading_date);
+    intraday_request_body(
+        security_id,
+        SPOT_1M_REST_SEGMENT_IDX_I,
+        SPOT_1M_INSTRUMENT_INDEX,
+        trading_date,
+        next_day,
+    )
 }
 
 /// IST-wall-clock-as-epoch nanoseconds for a minute open on `trading_date`
@@ -262,15 +269,66 @@ pub fn select_minute_candle(
         .find(|c| c.minute_ts_ist_nanos == target_minute_ist_nanos)
 }
 
-/// Parse a Dhan intraday columnar body and pick the target minute's candle.
-/// Malformed / short / length-mismatched bodies parse to an empty set (the
-/// reused panic-free columnar parser) and therefore yield `None`. Pure.
+/// Parse a Dhan intraday columnar body and pick the target minute's candle
+/// PLUS (when requested) the previous-minute backfill candle from the SAME
+/// full-day body. Malformed / short / length-mismatched bodies parse to an
+/// empty set (the reused panic-free columnar parser) and therefore yield
+/// `(None, None)`. Pure.
 #[must_use]
-pub fn parse_intraday_columnar_for_minute(
+pub fn parse_intraday_columnar_for_minutes(
     body: &str,
     target_minute_ist_nanos: i64,
-) -> Option<MinuteCandle> {
-    select_minute_candle(&parse_intraday_1m_candles(body), target_minute_ist_nanos)
+    backfill_minute_ist_nanos: Option<i64>,
+) -> (Option<MinuteCandle>, Option<MinuteCandle>) {
+    let candles = parse_intraday_1m_candles(body);
+    (
+        select_minute_candle(&candles, target_minute_ist_nanos),
+        backfill_minute_ist_nanos.and_then(|b| select_minute_candle(&candles, b)),
+    )
+}
+
+/// Nanoseconds per minute (backfill arithmetic).
+const NANOS_PER_MINUTE: i64 = 60 * NANOS_PER_SEC;
+
+/// The previous minute to BACKFILL on this fire, or `None` when no backfill
+/// is due: the previous minute must be inside today's session (at or after
+/// the 09:15 open) and must not already be persisted for this SID. One-minute
+/// lookback only — older gaps stay absent (re-fetchable manually; DEDUP
+/// makes any re-append idempotent). Pure.
+#[must_use]
+pub fn backfill_minute_nanos(
+    last_persisted: Option<i64>,
+    target_minute_nanos: i64,
+    session_first_minute_nanos: i64,
+) -> Option<i64> {
+    let prev = target_minute_nanos.saturating_sub(NANOS_PER_MINUTE);
+    (prev >= session_first_minute_nanos && last_persisted.is_none_or(|l| l < prev)).then_some(prev)
+}
+
+/// Per-SID latest successfully PERSISTED minute (append + flush confirmed).
+/// Drives the previous-minute backfill sweep; commits are max-merge so a
+/// double persist of the same minute (DEDUP-idempotent server-side) never
+/// regresses the watermark. In-memory only — a restart re-fills via the
+/// backfill sweep's one-minute lookback.
+#[derive(Debug, Default)]
+pub struct PersistTracker {
+    committed: HashMap<SecurityId, i64>,
+}
+
+impl PersistTracker {
+    /// The latest persisted minute (IST nanos) for this SID, if any.
+    #[must_use]
+    pub fn last_persisted(&self, security_id: SecurityId) -> Option<i64> {
+        self.committed.get(&security_id).copied()
+    }
+
+    /// Commit a persisted minute — max-merge (idempotent; never regresses).
+    pub fn commit(&mut self, security_id: SecurityId, minute_nanos: i64) {
+        let entry = self.committed.entry(security_id).or_insert(minute_nanos);
+        if *entry < minute_nanos {
+            *entry = minute_nanos;
+        }
+    }
 }
 
 /// Sleep DELTAS (ms) between ladder attempts, derived from the constant
@@ -397,7 +455,11 @@ fn fetched_at_ist_nanos_now() -> i64 {
 // Fetch ladder
 // ---------------------------------------------------------------------------
 
-/// One index's per-minute fetch verdict after the bounded ladder.
+/// One index's per-minute fetch verdict after the bounded ladder. Every
+/// arm additionally carries the PREVIOUS-minute backfill candle when the
+/// backfill was due and any 2xx body of the ladder contained it — a fire
+/// whose OWN minute failed can still repair the previous minute (the
+/// vendor-lateness recovery path).
 #[derive(Clone, Debug, PartialEq)]
 enum SidFetchOutcome {
     /// The target minute's candle was retrieved (`close_to_data_ms` =
@@ -405,12 +467,18 @@ enum SidFetchOutcome {
     Found {
         candle: MinuteCandle,
         close_to_data_ms: i64,
+        backfill_candle: Option<MinuteCandle>,
     },
     /// Every attempt got a parseable 2xx but the target minute never
     /// appeared — counted `outcome="empty"`, included in the failure edge.
-    Empty,
+    Empty {
+        backfill_candle: Option<MinuteCandle>,
+    },
     /// The last attempt (transport / non-2xx) failure, bounded + redacted.
-    Failed(String),
+    Failed {
+        reason: String,
+        backfill_candle: Option<MinuteCandle>,
+    },
 }
 
 /// One attempt's typed failure — `rate_limited` is derived from the REAL
@@ -515,10 +583,14 @@ async fn fetch_minute_with_ladder(
     jwt: &secrecy::SecretString,
     body: &serde_json::Value,
     target_minute_ist_nanos: i64,
+    backfill_minute_ist_nanos: Option<i64>,
     minute_close_ms_of_day: i64,
 ) -> SidFetchOutcome {
     let deltas = retry_sleep_deltas_ms();
     let mut last_error: Option<String> = None;
+    // Sticky: the FIRST 2xx body carrying the due backfill minute wins —
+    // preserved across rungs and across a failing own-minute verdict.
+    let mut backfill_found: Option<MinuteCandle> = None;
     for attempt in 0..=deltas.len() {
         if attempt > 0 {
             tokio::time::sleep(Duration::from_millis(deltas[attempt - 1])).await;
@@ -529,14 +601,21 @@ async fn fetch_minute_with_ladder(
             .record(started.elapsed().as_secs_f64() * 1_000.0);
         match result {
             Ok(body_text) => {
-                if let Some(candle) =
-                    parse_intraday_columnar_for_minute(&body_text, target_minute_ist_nanos)
-                {
+                let (target, backfill) = parse_intraday_columnar_for_minutes(
+                    &body_text,
+                    target_minute_ist_nanos,
+                    backfill_minute_ist_nanos,
+                );
+                if backfill_found.is_none() {
+                    backfill_found = backfill;
+                }
+                if let Some(candle) = target {
                     let close_to_data_ms =
                         (ist_millis_of_day_now() - minute_close_ms_of_day).max(0);
                     return SidFetchOutcome::Found {
                         candle,
                         close_to_data_ms,
+                        backfill_candle: backfill_found,
                     };
                 }
                 // 2xx without the target minute — the seal may not have
@@ -553,8 +632,13 @@ async fn fetch_minute_with_ladder(
         }
     }
     match last_error {
-        Some(reason) => SidFetchOutcome::Failed(reason),
-        None => SidFetchOutcome::Empty,
+        Some(reason) => SidFetchOutcome::Failed {
+            reason,
+            backfill_candle: backfill_found,
+        },
+        None => SidFetchOutcome::Empty {
+            backfill_candle: backfill_found,
+        },
     }
 }
 
@@ -569,6 +653,7 @@ async fn fetch_minute_bounded(
     jwt: &secrecy::SecretString,
     body: &serde_json::Value,
     target_minute_ist_nanos: i64,
+    backfill_minute_ist_nanos: Option<i64>,
     minute_close_ms_of_day: i64,
 ) -> SidFetchOutcome {
     match tokio::time::timeout(
@@ -579,6 +664,7 @@ async fn fetch_minute_bounded(
             jwt,
             body,
             target_minute_ist_nanos,
+            backfill_minute_ist_nanos,
             minute_close_ms_of_day,
         ),
     )
@@ -587,9 +673,12 @@ async fn fetch_minute_bounded(
         Ok(outcome) => outcome,
         Err(_elapsed) => {
             metrics::counter!("tv_spot1m_sid_budget_exceeded_total").increment(1);
-            SidFetchOutcome::Failed(format!(
-                "ladder budget exceeded ({SPOT_1M_REST_SID_BUDGET_SECS}s) — peer stalling"
-            ))
+            SidFetchOutcome::Failed {
+                reason: format!(
+                    "ladder budget exceeded ({SPOT_1M_REST_SID_BUDGET_SECS}s) — peer stalling"
+                ),
+                backfill_candle: None,
+            }
         }
     }
 }
@@ -635,6 +724,9 @@ pub async fn run_spot_1m_rest(params: Spot1mRestTaskParams) {
     };
     let mut writer = Spot1mRestWriter::new(&params.questdb);
     let mut edge = FailureEdge::default();
+    // 2026-07-13 backfill sweep: per-SID latest PERSISTED minute — drives
+    // the previous-minute repair on every fire.
+    let mut tracker = PersistTracker::default();
     // H1 (2026-07-12): the last boundary actually HANDLED (fired or
     // skipped-stale) — the next fire is always STRICTLY after it, so a
     // fast-completing fire can never re-fire the same boundary second.
@@ -685,7 +777,16 @@ pub async fn run_spot_1m_rest(params: Spot1mRestTaskParams) {
             continue;
         }
 
-        fire_one_minute(&params, &client, &url, &mut writer, &mut edge, fire).await;
+        fire_one_minute(
+            &params,
+            &client,
+            &url,
+            &mut writer,
+            &mut edge,
+            &mut tracker,
+            fire,
+        )
+        .await;
         // PR-3 sequencing: tell the option-chain leg this minute's spot
         // fire is DONE (success or failure — the chain must never block on
         // a failing spot leg). `send_replace` never errors.
@@ -747,14 +848,56 @@ fn record_skipped_boundaries(
     }
 }
 
-/// One minute-close fire: 3 concurrent ladder fetches → persist → counters
-/// → edge accounting. Failures are coalesced to ONE coded log per fire.
+/// Build one `spot_1m_rest` row from a parsed candle. The `close_to_data_ms`
+/// stamp is the caller's HONEST retrieval delay (own-fire latency, or the
+/// > 60 s real delay for a backfilled minute).
+fn build_spot_1m_row(
+    candle: &MinuteCandle,
+    security_id: SecurityId,
+    symbol: &'static str,
+    trading_date_nanos: i64,
+    close_to_data_ms: i64,
+) -> Spot1mRestRow {
+    Spot1mRestRow {
+        ts_ist_nanos: candle.minute_ts_ist_nanos,
+        trading_date_ist_nanos: trading_date_nanos,
+        // Unreachable for the pinned 13/25/51 set; a hypothetical overflow
+        // is LOUD + a visible sentinel, never a silent sid=0 (review LOW).
+        security_id: i64::try_from(security_id).unwrap_or_else(|_| {
+            error!(
+                code = ErrorCode::Spot1m02PersistFailed.code_str(),
+                stage = "sid_overflow",
+                security_id,
+                "SPOT1M-02: security_id exceeds i64 — row \
+                 stamped with the i64::MAX sentinel"
+            );
+            i64::MAX
+        }),
+        symbol,
+        open: candle.open,
+        high: candle.high,
+        low: candle.low,
+        close: candle.close,
+        volume: candle.volume,
+        close_to_data_ms,
+        fetched_at_ist_nanos: fetched_at_ist_nanos_now(),
+    }
+}
+
+/// One minute-close fire: 3 concurrent ladder fetches (each carrying the
+/// full-day proven window) → persist the target minute AND the
+/// previous-minute backfill when due → counters → edge accounting.
+/// Failures are coalesced to ONE coded log per fire. Edge honesty: the
+/// verdict is the OWN target minute's fetch + persist — a backfill hit
+/// never counts as this fire's `ok` (a minute that lands only via
+/// next-fire backfill was still that fire's failure).
 async fn fire_one_minute(
     params: &Spot1mRestTaskParams,
     client: &reqwest::Client,
     url: &str,
     writer: &mut Spot1mRestWriter,
     edge: &mut FailureEdge,
+    tracker: &mut PersistTracker,
     fire_secs_of_day: u32,
 ) {
     let minute_open_secs = fire_secs_of_day.saturating_sub(60);
@@ -779,28 +922,15 @@ async fn fire_one_minute(
     // outage must eventually page via the SAME Spot1mFetchDegraded path.
     let mut persist_failed = false;
     let mut sample_failure: Option<String> = None;
+    // Minutes appended this fire, committed to the tracker ONLY after the
+    // flush confirms (a failed flush discards the buffer — never a false
+    // watermark advance).
+    let mut staged: Vec<(SecurityId, i64)> = Vec::new();
 
     if let Some(jwt) = jwt {
-        let Some((from_dt, to_dt)) = minute_window_strings(trading_date, minute_open_secs) else {
-            // Defensive: impossible seconds-of-day. Counted as a full miss.
-            error_count = SPOT_1M_REST_INDICES.len();
-            sample_failure = Some("internal: minute window build failed".to_string());
-            for _ in 0..error_count {
-                metrics::counter!("tv_spot1m_fetch_total", "outcome" => "error").increment(1);
-            }
-            record_minute_verdict(
-                params,
-                edge,
-                &minute_label,
-                0,
-                error_count,
-                0,
-                false,
-                sample_failure.as_deref(),
-            );
-            return;
-        };
         let target_nanos = minute_open_ist_nanos(trading_date, minute_open_secs);
+        let session_first_nanos =
+            minute_open_ist_nanos(trading_date, SPOT_1M_REST_FIRST_FIRE_SECS_OF_DAY_IST - 60);
         let minute_close_ms = i64::from(fire_secs_of_day).saturating_mul(MILLIS_PER_SEC);
 
         let mut join_set = tokio::task::JoinSet::new();
@@ -808,11 +938,25 @@ async fn fire_one_minute(
             let client = client.clone();
             let url = url.to_string();
             let jwt = jwt.clone();
-            let body = spot_1m_request_body(&security_id.to_string(), &from_dt, &to_dt);
+            // 2026-07-13 hotfix: the PROVEN full-day window (cross-verify /
+            // prev-day shape) — the consumer filters to the exact minute.
+            let body = spot_1m_day_request_body(&security_id.to_string(), trading_date);
+            let backfill_nanos = backfill_minute_nanos(
+                tracker.last_persisted(security_id),
+                target_nanos,
+                session_first_nanos,
+            );
             join_set.spawn(async move {
-                let outcome =
-                    fetch_minute_bounded(&client, &url, &jwt, &body, target_nanos, minute_close_ms)
-                        .await;
+                let outcome = fetch_minute_bounded(
+                    &client,
+                    &url,
+                    &jwt,
+                    &body,
+                    target_nanos,
+                    backfill_nanos,
+                    minute_close_ms,
+                )
+                .await;
                 (security_id, symbol, outcome)
             });
         }
@@ -826,58 +970,17 @@ async fn fire_one_minute(
                 }
                 continue;
             };
-            match outcome {
+            // Previous-minute backfill (any outcome arm): persist with the
+            // HONEST real retrieval delay (> 60 s by construction). Never
+            // counted as this fire's `ok` and never sampled into the
+            // own-fire `tv_spot1m_close_to_data_ms` histogram.
+            let (own_outcome, backfill_candle) = match outcome {
                 SidFetchOutcome::Found {
                     candle,
                     close_to_data_ms,
-                } => {
-                    ok_count = ok_count.saturating_add(1);
-                    metrics::counter!("tv_spot1m_fetch_total", "outcome" => "ok").increment(1);
-                    #[allow(clippy::cast_precision_loss)] // APPROVED: histogram sample only
-                    metrics::histogram!("tv_spot1m_close_to_data_ms")
-                        .record(close_to_data_ms as f64);
-                    let row = Spot1mRestRow {
-                        ts_ist_nanos: candle.minute_ts_ist_nanos,
-                        trading_date_ist_nanos: trading_date_nanos,
-                        // Unreachable for the pinned 13/25/51 set; a
-                        // hypothetical overflow is LOUD + a visible
-                        // sentinel, never a silent sid=0 (review LOW).
-                        security_id: i64::try_from(security_id).unwrap_or_else(|_| {
-                            error!(
-                                code = ErrorCode::Spot1m02PersistFailed.code_str(),
-                                stage = "sid_overflow",
-                                security_id,
-                                "SPOT1M-02: security_id exceeds i64 — row \
-                                 stamped with the i64::MAX sentinel"
-                            );
-                            i64::MAX
-                        }),
-                        symbol,
-                        open: candle.open,
-                        high: candle.high,
-                        low: candle.low,
-                        close: candle.close,
-                        volume: candle.volume,
-                        close_to_data_ms,
-                        fetched_at_ist_nanos: fetched_at_ist_nanos_now(),
-                    };
-                    if let Err(err) = writer.append_row(&row) {
-                        persist_failed = true;
-                        metrics::counter!("tv_spot1m_persist_errors_total", "stage" => "append")
-                            .increment(1);
-                        error!(
-                            code = ErrorCode::Spot1m02PersistFailed.code_str(),
-                            stage = "append",
-                            security_id,
-                            ?err,
-                            "SPOT1M-02: spot_1m_rest row append failed"
-                        );
-                        if sample_failure.is_none() {
-                            sample_failure = Some(format!("persist append failed: {err:#}"));
-                        }
-                    }
-                }
-                SidFetchOutcome::Empty => {
+                    backfill_candle,
+                } => (Some((candle, close_to_data_ms)), backfill_candle),
+                SidFetchOutcome::Empty { backfill_candle } => {
                     empty_count = empty_count.saturating_add(1);
                     metrics::counter!("tv_spot1m_fetch_total", "outcome" => "empty").increment(1);
                     if sample_failure.is_none() {
@@ -886,13 +989,83 @@ async fn fire_one_minute(
                              appeared within the re-poll ladder"
                         ));
                     }
+                    (None, backfill_candle)
                 }
-                SidFetchOutcome::Failed(reason) => {
+                SidFetchOutcome::Failed {
+                    reason,
+                    backfill_candle,
+                } => {
                     error_count = error_count.saturating_add(1);
                     metrics::counter!("tv_spot1m_fetch_total", "outcome" => "error").increment(1);
                     if sample_failure.is_none() {
                         sample_failure = Some(format!("sid {security_id}: {reason}"));
                     }
+                    (None, backfill_candle)
+                }
+            };
+            if let Some((candle, close_to_data_ms)) = own_outcome {
+                ok_count = ok_count.saturating_add(1);
+                metrics::counter!("tv_spot1m_fetch_total", "outcome" => "ok").increment(1);
+                #[allow(clippy::cast_precision_loss)] // APPROVED: histogram sample only
+                metrics::histogram!("tv_spot1m_close_to_data_ms").record(close_to_data_ms as f64);
+                let row = build_spot_1m_row(
+                    &candle,
+                    security_id,
+                    symbol,
+                    trading_date_nanos,
+                    close_to_data_ms,
+                );
+                if let Err(err) = writer.append_row(&row) {
+                    persist_failed = true;
+                    metrics::counter!("tv_spot1m_persist_errors_total", "stage" => "append")
+                        .increment(1);
+                    error!(
+                        code = ErrorCode::Spot1m02PersistFailed.code_str(),
+                        stage = "append",
+                        security_id,
+                        ?err,
+                        "SPOT1M-02: spot_1m_rest row append failed"
+                    );
+                    if sample_failure.is_none() {
+                        sample_failure = Some(format!("persist append failed: {err:#}"));
+                    }
+                } else {
+                    staged.push((security_id, candle.minute_ts_ist_nanos));
+                }
+            }
+            if let Some(backfill) = backfill_candle {
+                // Honest delay: the backfilled minute closed 60 s before
+                // this fire's target minute close.
+                let backfill_close_to_data_ms =
+                    (ist_millis_of_day_now() - (minute_close_ms - 60 * MILLIS_PER_SEC)).max(0);
+                let row = build_spot_1m_row(
+                    &backfill,
+                    security_id,
+                    symbol,
+                    trading_date_nanos,
+                    backfill_close_to_data_ms,
+                );
+                if let Err(err) = writer.append_row(&row) {
+                    persist_failed = true;
+                    metrics::counter!("tv_spot1m_persist_errors_total", "stage" => "append")
+                        .increment(1);
+                    error!(
+                        code = ErrorCode::Spot1m02PersistFailed.code_str(),
+                        stage = "append",
+                        security_id,
+                        ?err,
+                        "SPOT1M-02: spot_1m_rest BACKFILL row append failed"
+                    );
+                } else {
+                    metrics::counter!("tv_spot1m_backfilled_total").increment(1);
+                    info!(
+                        security_id,
+                        symbol,
+                        backfill_close_to_data_ms,
+                        "spot_1m_rest: previous minute backfilled from this \
+                         fire's full-day response (DEDUP-idempotent)"
+                    );
+                    staged.push((security_id, backfill.minute_ts_ist_nanos));
                 }
             }
         }
@@ -909,6 +1082,11 @@ async fn fire_one_minute(
             );
             if sample_failure.is_none() {
                 sample_failure = Some(format!("persist flush failed: {err:#}"));
+            }
+        } else {
+            // Flush confirmed — advance the per-SID persisted watermark.
+            for (security_id, minute_nanos) in staged {
+                tracker.commit(security_id, minute_nanos);
             }
         }
     } else {
@@ -1256,31 +1434,37 @@ mod tests {
         assert!(!spot_1m_day_is_over(LAST, true));
     }
 
-    // ---- minute_window_strings / request body ------------------------------
+    // ---- request body (2026-07-13 hotfix: PROVEN day-granular window) -------
 
+    /// 2026-07-13 live-failure regression lock: the request body carries
+    /// the ONLY live-proven window shape — the day-granular
+    /// `[D 00:00:00, D+1 00:00:00)` window the 15:31 cross-verify uses
+    /// successfully every trading day. The retired same-date 60-second
+    /// window was answered 2xx WITHOUT the target candle for every minute
+    /// of the first live session (SPOT1M-01 all day).
     #[test]
-    fn test_minute_window_strings_open_plus_60s() {
-        let date = NaiveDate::from_ymd_opt(2026, 7, 10).expect("valid date");
-        let (from, to) = minute_window_strings(date, 9 * 3600 + 15 * 60).expect("valid window");
-        assert_eq!(from, "2026-07-10 09:15:00");
-        assert_eq!(to, "2026-07-10 09:16:00");
-        // The last session minute: 15:29 → 15:30.
-        let (from, to) = minute_window_strings(date, 15 * 3600 + 29 * 60).expect("valid window");
-        assert_eq!(from, "2026-07-10 15:29:00");
-        assert_eq!(to, "2026-07-10 15:30:00");
-    }
-
-    #[test]
-    fn test_spot_1m_request_body_shape_string_security_id() {
-        let body = spot_1m_request_body("13", "2026-07-10 09:15:00", "2026-07-10 09:16:00");
+    fn test_regression_spot_1m_day_request_body_uses_proven_day_window() {
+        let date = NaiveDate::from_ymd_opt(2026, 7, 13).expect("valid date");
+        let body = spot_1m_day_request_body("13", date);
         // securityId is a STRING (orders.md rule 4 class), interval "1".
         assert_eq!(body["securityId"], "13");
         assert_eq!(body["exchangeSegment"], "IDX_I");
         assert_eq!(body["instrument"], "INDEX");
         assert_eq!(body["interval"], "1");
         assert_eq!(body["oi"], false);
-        assert_eq!(body["fromDate"], "2026-07-10 09:15:00");
-        assert_eq!(body["toDate"], "2026-07-10 09:16:00");
+        // The proven full-day window — NEVER a same-date minute window.
+        assert_eq!(body["fromDate"], "2026-07-13 00:00:00");
+        assert_eq!(body["toDate"], "2026-07-14 00:00:00");
+    }
+
+    /// Month boundary: toDate is the NEXT calendar day even across a
+    /// month end (the cross-verify `succ_opt` semantics).
+    #[test]
+    fn test_spot_1m_day_request_body_month_boundary() {
+        let date = NaiveDate::from_ymd_opt(2026, 7, 31).expect("valid date");
+        let body = spot_1m_day_request_body("51", date);
+        assert_eq!(body["fromDate"], "2026-07-31 00:00:00");
+        assert_eq!(body["toDate"], "2026-08-01 00:00:00");
     }
 
     // ---- timestamps + parsing ----------------------------------------------
@@ -1300,46 +1484,184 @@ mod tests {
         );
     }
 
-    /// UTC→IST (+19800) conversion: a Dhan intraday timestamp of UTC
-    /// 03:45:00 is IST 09:15:00 — the parsed candle's minute bucket must
-    /// equal our IST-as-epoch target for the same wall-clock minute.
+    /// UTC→IST (+19800) conversion against a REAL doc-convention fixture
+    /// (annexure rule 13 / historical-data.md §5: response timestamps are
+    /// UNIX **UTC** epoch seconds): the 2026-07-13 09:15:00 IST candle is
+    /// UTC epoch `1783914300` (03:45:00 UTC) and MUST match the matcher's
+    /// IST-as-epoch target `1_783_934_100e9` exactly.
     #[test]
-    fn test_parse_intraday_columnar_for_minute_utc_to_ist_and_filter() {
-        let date = NaiveDate::from_ymd_opt(2026, 7, 10).expect("valid date");
+    fn test_parse_intraday_columnar_utc_epoch_fixture_matches_ist_minute() {
+        let date = NaiveDate::from_ymd_opt(2026, 7, 13).expect("valid date");
         let open_secs: u32 = 9 * 3600 + 15 * 60;
         let target = minute_open_ist_nanos(date, open_secs);
-        // The UTC epoch for IST 2026-07-10 09:15:00 = (IST-as-epoch) - 19800.
-        let utc_ts = target / 1_000_000_000 - 19_800;
-        // Over-delivering body: the target minute AND the next minute (the
-        // community-reported toDate over-delivery) — client-side filter
-        // must pick exactly the target.
+        // The genuine UTC epoch for IST 2026-07-13 09:15:00.
+        let utc_ts: i64 = 1_783_914_300;
+        assert_eq!(target, (utc_ts + 19_800) * 1_000_000_000);
+        // Full-day over-delivering body: an earlier minute, the target,
+        // and the next minute — client-side filter must pick exactly the
+        // target.
         let body = format!(
-            r#"{{"open":[100.0,200.0],"high":[101.0,201.0],"low":[99.0,199.0],
-                "close":[100.5,200.5],"volume":[0,0],"timestamp":[{utc_ts},{next}]}}"#,
+            r#"{{"open":[50.0,100.0,200.0],"high":[51.0,101.0,201.0],
+                "low":[49.0,99.0,199.0],"close":[50.5,100.5,200.5],
+                "volume":[0,0,0],"timestamp":[{prev},{utc_ts},{next}]}}"#,
+            prev = utc_ts - 60,
             next = utc_ts + 60
         );
-        let candle = parse_intraday_columnar_for_minute(&body, target).expect("target found");
+        let (candle, backfill) = parse_intraday_columnar_for_minutes(&body, target, None);
+        let candle = candle.expect("target found");
+        assert!(backfill.is_none(), "no backfill requested → none returned");
         assert_eq!(candle.minute_ts_ist_nanos, target);
         assert_eq!(candle.open, 100.0);
         assert_eq!(candle.close, 100.5);
         // A target NOT in the body → None (the "empty" arm).
-        assert!(parse_intraday_columnar_for_minute(&body, target + 120 * 1_000_000_000).is_none());
+        let (missing, _) =
+            parse_intraday_columnar_for_minutes(&body, target + 120 * 1_000_000_000, None);
+        assert!(missing.is_none());
+    }
+
+    /// Backfill extraction from the SAME full-day body: the previous
+    /// minute is returned alongside the target — and ALSO when the target
+    /// itself is absent (the vendor-lateness recovery path).
+    #[test]
+    fn test_parse_intraday_columnar_for_minutes_backfill_hit() {
+        let date = NaiveDate::from_ymd_opt(2026, 7, 13).expect("valid date");
+        let target = minute_open_ist_nanos(date, 9 * 3600 + 16 * 60); // 09:16
+        let prev = target - NANOS_PER_MINUTE; // 09:15
+        let utc_prev = prev / 1_000_000_000 - 19_800;
+        // Body carries ONLY the previous minute (target not sealed yet).
+        let body_prev_only = format!(
+            r#"{{"open":[100.0],"high":[101.0],"low":[99.0],"close":[100.5],
+                "volume":[0],"timestamp":[{utc_prev}]}}"#
+        );
+        let (t, b) = parse_intraday_columnar_for_minutes(&body_prev_only, target, Some(prev));
+        assert!(t.is_none(), "target minute not sealed yet");
+        assert_eq!(
+            b.expect("backfill found").minute_ts_ist_nanos,
+            prev,
+            "previous minute must backfill even when the target is absent"
+        );
+        // Body carries BOTH → both returned.
+        let body_both = format!(
+            r#"{{"open":[100.0,200.0],"high":[101.0,201.0],"low":[99.0,199.0],
+                "close":[100.5,200.5],"volume":[0,0],
+                "timestamp":[{utc_prev},{utc_target}]}}"#,
+            utc_target = utc_prev + 60
+        );
+        let (t, b) = parse_intraday_columnar_for_minutes(&body_both, target, Some(prev));
+        assert_eq!(t.expect("target").minute_ts_ist_nanos, target);
+        assert_eq!(b.expect("backfill").minute_ts_ist_nanos, prev);
     }
 
     #[test]
-    fn test_parse_for_minute_malformed_short_and_mismatched_bodies_are_none() {
+    fn test_parse_for_minutes_malformed_short_and_mismatched_bodies_are_none() {
         let target = 1_770_000_900_000_000_000;
+        let bf = Some(target - NANOS_PER_MINUTE);
         // Malformed JSON.
-        assert!(parse_intraday_columnar_for_minute("not json", target).is_none());
+        assert_eq!(
+            parse_intraday_columnar_for_minutes("not json", target, bf),
+            (None, None)
+        );
         // Missing arrays.
-        assert!(parse_intraday_columnar_for_minute("{}", target).is_none());
+        assert_eq!(
+            parse_intraday_columnar_for_minutes("{}", target, bf),
+            (None, None)
+        );
         // Empty arrays.
         let empty = r#"{"open":[],"high":[],"low":[],"close":[],"volume":[],"timestamp":[]}"#;
-        assert!(parse_intraday_columnar_for_minute(empty, target).is_none());
+        assert_eq!(
+            parse_intraday_columnar_for_minutes(empty, target, bf),
+            (None, None)
+        );
         // Length-mismatched parallel arrays.
         let mismatched = r#"{"open":[1.0,2.0],"high":[1.0],"low":[1.0],
             "close":[1.0],"volume":[0],"timestamp":[1752118500]}"#;
-        assert!(parse_intraday_columnar_for_minute(mismatched, target).is_none());
+        assert_eq!(
+            parse_intraday_columnar_for_minutes(mismatched, target, bf),
+            (None, None)
+        );
+    }
+
+    // ---- backfill sweep (2026-07-13 hotfix) ----------------------------------
+
+    /// Backfill decision: due exactly when the previous minute is inside
+    /// the session AND not already persisted.
+    #[test]
+    fn test_backfill_minute_nanos_hit_and_not_needed() {
+        let date = NaiveDate::from_ymd_opt(2026, 7, 13).expect("valid date");
+        let session_first = minute_open_ist_nanos(date, FIRST - 60); // 09:15 open
+        let target_0916 = session_first + NANOS_PER_MINUTE; // 09:16 open
+        // Never persisted anything → previous minute (09:15) is due.
+        assert_eq!(
+            backfill_minute_nanos(None, target_0916, session_first),
+            Some(session_first)
+        );
+        // Previous minute already persisted → no backfill.
+        assert_eq!(
+            backfill_minute_nanos(Some(session_first), target_0916, session_first),
+            None
+        );
+        // An older watermark (gap) still only looks back ONE minute.
+        let target_0920 = session_first + 5 * NANOS_PER_MINUTE;
+        assert_eq!(
+            backfill_minute_nanos(Some(session_first), target_0920, session_first),
+            Some(target_0920 - NANOS_PER_MINUTE)
+        );
+    }
+
+    /// The session's FIRST fire (target = the 09:15 candle) has no
+    /// in-session previous minute — never a pre-open backfill.
+    #[test]
+    fn test_backfill_minute_nanos_first_session_minute_has_no_backfill() {
+        let date = NaiveDate::from_ymd_opt(2026, 7, 13).expect("valid date");
+        let session_first = minute_open_ist_nanos(date, FIRST - 60);
+        assert_eq!(
+            backfill_minute_nanos(None, session_first, session_first),
+            None
+        );
+    }
+
+    /// `last_persisted` reads back exactly the committed watermark —
+    /// per-SID, `None` before the first confirmed persist.
+    #[test]
+    fn test_persist_tracker_last_persisted_reads_committed_watermark() {
+        let mut t = PersistTracker::default();
+        assert_eq!(t.last_persisted(51), None);
+        t.commit(51, 42);
+        assert_eq!(t.last_persisted(51), Some(42));
+        assert_eq!(t.last_persisted(13), None, "per-SID isolation");
+    }
+
+    /// Tracker: max-merge commits; double-persisting the same minute
+    /// (DEDUP-idempotent server-side) never regresses the watermark.
+    #[test]
+    fn test_persist_tracker_commit_max_merge_and_double_persist_idempotent() {
+        let mut t = PersistTracker::default();
+        assert_eq!(t.last_persisted(13), None);
+        t.commit(13, 1_000);
+        assert_eq!(t.last_persisted(13), Some(1_000));
+        // Double persist of the SAME minute: idempotent.
+        t.commit(13, 1_000);
+        assert_eq!(t.last_persisted(13), Some(1_000));
+        // A backfill commit of an OLDER minute never regresses.
+        t.commit(13, 500);
+        assert_eq!(t.last_persisted(13), Some(1_000));
+        // Advance.
+        t.commit(13, 2_000);
+        assert_eq!(t.last_persisted(13), Some(2_000));
+        // Per-SID isolation.
+        assert_eq!(t.last_persisted(25), None);
+    }
+
+    /// Edge accounting stays honest: a fire whose OWN target fetch found
+    /// nothing is fully failed for the edge even when the same fire
+    /// backfilled the previous minute (backfill persists never increment
+    /// `ok_count` — structural: only the `Found` arm does).
+    #[test]
+    fn test_backfill_never_flips_edge_accounting() {
+        assert!(minute_fully_failed(0, false));
+        let mut t = PersistTracker::default();
+        t.commit(13, 1_000); // a backfilled minute committed…
+        assert!(minute_fully_failed(0, false)); // …edge verdict unchanged
     }
 
     // ---- ladder deltas ------------------------------------------------------
