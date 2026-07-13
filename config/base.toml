@@ -487,3 +487,18 @@ enabled = true
 [option_chain_1m]
 enabled = true  # entitlement proven live 2026-07-13 08:31:49 IST (§8.7)
 probe_and_report = true
+
+# ===========================================================================
+# Groww per-minute spot 1m REST leg (operator grant 2026-07-13 — PR-2 of
+# the Groww per-minute REST plan). Every trading-day minute close in
+# [09:16:00, 15:30:00] IST, fetch the just-closed minute's official 1m
+# OHLCV for the 3 spot indices (NSE-NIFTY / NSE-BANKNIFTY / BSE-SENSEX)
+# via Groww GET /v1/historical/candles and persist to the SAME
+# spot_1m_rest table tagged feed='groww' (feed-in-key DEDUP — the Dhan
+# rows are untouched). Token: shared-minter SSM READ-ONLY (never mint).
+# Independent of the Dhan lane (process-global spawn) — a Dhan-off session
+# still runs it. Cold path; the WS pipelines are untouched. An ABSENT
+# section = disabled (fail-safe); `enabled = false` is the rollback switch.
+# ===========================================================================
+[groww_spot_1m]
+enabled = true
