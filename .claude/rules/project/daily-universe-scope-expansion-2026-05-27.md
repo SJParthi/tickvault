@@ -1074,8 +1074,9 @@ futidx_scope_legacy_gate_still_false}`; the selector boundary + proptest suite i
 `test_select_index_future_expiries_drops_expired_month_next_morning`,
 `test_select_monthly_serial_flood_degrades_whole_underlying`,
 `test_cross_feed_parity_far_suffix_is_depth_only`, `test_cross_feed_parity_hole_is_divergence`);
-planner/snapshot/Groww ratchets per `.claude/plans/active-plan-futidx-4.md` +
-`.claude/plans/active-plan-futidx-allmonths.md` (2026-07-10).
+planner/snapshot/Groww ratchets per `.claude/plans/archive/2026-07-08-futidx-4.md` +
+`.claude/plans/archive/2026-07-10-futidx-allmonths.md` (2026-07-10; both archived from
+active 2026-07-13 per plan-enforcement rule 7).
 
 ## §36.6 Auto-driver explanation
 
