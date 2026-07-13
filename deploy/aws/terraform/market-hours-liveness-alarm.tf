@@ -150,11 +150,11 @@ resource "aws_cloudwatch_metric_alarm" "market_hours_liveness_missing" {
   # (see the HONEST SIGNAL CHOICE block above). Dimension shape copied from
   # the groww-exchange-lag-p99-high alarm (silent-feed-alarms.tf S4), which
   # watches the SAME gauge.
-  metric_name         = "tv_groww_exchange_lag_p99_seconds"
-  namespace           = local.app_namespace
-  period              = 60
-  statistic           = "Maximum"
-  threshold           = 0
+  metric_name = "tv_groww_exchange_lag_p99_seconds"
+  namespace   = local.app_namespace
+  period      = 60
+  statistic   = "Maximum"
+  threshold   = 0
   # INTENTIONAL inverse of every other app alarm: during market hours a MISSING
   # liveness signal is the condition we MUST page on, so missing data BREACHES.
   treat_missing_data = "breaching"
