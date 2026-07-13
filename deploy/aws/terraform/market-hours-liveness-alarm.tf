@@ -61,7 +61,15 @@
 #   here, with app-log-ingestion-silent as the co-firing diagnostic;
 #   (c) tv_realtime_guarantee_score stays in the CW allowlist + the
 #   realtime-guarantee-critical/degraded alarms (both notBreaching-on-missing,
-#   so they are correctly silent while the lane is retired).
+#   so they are correctly silent while the lane is retired);
+#   (d) this alarm does NOT cover the Dhan REST-only stack: a stack wedged in
+#   its lock/auth retry loops — or PARKED after the bounded AlreadyHeld
+#   patience window (a live dual-instance peer) — is log-visible only
+#   (coalesced error! lines); tv_dhan_rest_stack_up is not CW-shipped (not in
+#   the EMF allowlist) and RESILIENCE-01 has no error_code_alerts entry, so
+#   the entire retained Dhan REST surface (incl. the canary, which lives
+#   inside the stack) can be absent all session without a page. Flagged
+#   follow-up for Phase C.
 #
 #   So: treat_missing_data = "breaching" → MISSING data PAGES during the gated
 #   window. Same inverse-of-other-alarms rationale as boot-heartbeat.

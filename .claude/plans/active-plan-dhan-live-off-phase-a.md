@@ -52,7 +52,12 @@ apply; this item's specifics are in the sections above).
    would otherwise cold-start the full lane and collide with the REST-only
    auth stack: dual-instance SSM lock AlreadyHeld → DHAN-LANE-03 retry loop +
    pages). Refusal is edge-latched once per attempt-episode (re-arms when the
-   desired-ON flag drops). The /feeds POST handler itself is NOT changed.
+   desired-ON flag drops). REVISED (review round 1, FIX 3): the /feeds POST
+   handler ALSO refuses the Dhan ENABLE direction with 409 CONFLICT when the
+   boot config carries `dhan_enabled = false` (both trading modes; runtime
+   flag not flipped, nothing persisted — the pre-fix accept was a Rule-11
+   false-OK: /feeds showed ON while nothing could start). Boot-ON semantics
+   and the PR-E disable gate + bearer auth are unchanged.
 5. **THE CORE — Dhan REST-only auth bootstrap** — new module
    `crates/app/src/dhan_rest_stack.rs` (`spawn_dhan_rest_stack`), spawned from
    main.rs's Dhan-OFF branch (the `else` of `if config.feeds.dhan_enabled`,
@@ -60,10 +65,17 @@ apply; this item's specifics are in the sections above).
    `build_shared_infra` + the metrics recorder install). One background task:
    a. dual-instance SSM lock BEFORE any mint (`try_acquire_instance_lock` +
       `spawn_instance_lock_heartbeat`, lock-before-mint per
-      `dual-instance-lock-2026-07-04.md` §2). AlreadyHeld / SSM failure →
-      `error!` (RESILIENCE-01 code semantics) + bounded exponential backoff
-      (cap 300s) + retry forever; NEVER halts the process; Groww/shared infra
-      never blocked.
+      `dual-instance-lock-2026-07-04.md` §2, addendum §3.5). REVISED
+      (review round 1, FIX 1 — lurk-and-steal): AlreadyHeld gets a BOUNDED
+      patience window (300s cumulative backoff ≥ 3× the 90s TTL — a
+      same-machine previous process's stale entry always clears inside it),
+      then ONE TTL-deferred DualInstanceDetected page + a PERMANENT PARK
+      (no further SSM polling — a live peer's lock can never be seized via
+      the stale-takeover; restart is the only retry). SSM transport errors
+      (`stage="ssm_transport"`) retry with bounded backoff forever in the
+      background. NEVER halts the process; Groww/shared infra never blocked.
+      Holder machine identity is not reliably comparable (all host_ids are
+      `local:`-prefixed), so the bounded window applies to ALL AlreadyHeld.
    b. `TokenManager::initialize` (SSM → TOTP → JWT) with the SAME
       `instance_lock_held` wiring (RESILIENCE-03 tripwire), then
       `set_global_token_manager` + `feed_runtime.set_live_token_manager` so
@@ -108,14 +120,16 @@ apply; this item's specifics are in the sections above).
   toggle before the directive): the AND-gate suppresses it → effective false
   + ONE warn naming the directive. Groww's persisted choice still honored.
 - **Corrupt/missing overlay**: unchanged fail-safe (config default).
-- **Operator toggles Dhan ON via POST /api/feeds/dhan at runtime**: the
-  FeedRuntimeState flag flips (API accepts as today) but the runtime
-  supervisor REFUSES the cold-start (edge-latched log); toggling OFF re-arms
-  the latch. No lane, no double auth stack.
+- **Operator toggles Dhan ON via POST /api/feeds/dhan at runtime**
+  (REVISED, FIX 3): the API REFUSES with 409 (directive + restart path
+  named in the body); the runtime flag never flips, nothing is persisted,
+  /feeds keeps showing OFF. The supervisor's edge-latched refusal remains
+  as defence-in-depth behind it. No lane, no double auth stack.
 - **Quick restart (<90s) after a stop**: the previous process's REST-stack
   SSM lock entry is not yet stale → AlreadyHeld → the stack retries with
-  backoff and acquires once the 90s TTL clears it. The Telegram
-  DualInstanceDetected page is deferred to the 4th attempt (~150s cumulative
+  backoff inside the bounded patience window and acquires once the 90s TTL
+  clears it (well inside the 300s park threshold). The Telegram
+  DualInstanceDetected page fires only from attempt 5 (~150s cumulative
   backoff > TTL) so the self-stale window never pages; `error!` lines are
   coalesced (first + every 10th attempt).
 - **TV_ENVIRONMENT=dev/local boots** (base.toml only): dhan_enabled=false +
@@ -137,9 +151,13 @@ apply; this item's specifics are in the sections above).
 - **SSM unreachable at stack start** → lock acquire retries forever (cap
   300s), coalesced `error!`; no token, so canary/spot/chain are not yet
   spawned; Groww capture unaffected.
-- **AlreadyHeld persists (genuine peer)** → RESILIENCE-01 `error!` coalesced
-  + ONE DualInstanceDetected Telegram (attempt ≥ 4); stack keeps retrying —
-  fail-safe: the peer's token is never invalidated (lock-before-mint).
+- **AlreadyHeld persists (genuine peer)** (REVISED, FIX 1) → RESILIENCE-01
+  `error!` coalesced + ONE DualInstanceDetected Telegram (attempt ≥ 5,
+  ~150s), then at 300s+ of cumulative patience the stack PARKS permanently
+  (terminal `error!` + parked `info!`; restart is the only retry) — it
+  never lurks, so it can never seize the peer's lock via the 90s
+  stale-takeover when the peer restarts. Fail-safe both ways: the peer's
+  token is never invalidated (lock-before-mint + park).
 - **Auth permanently failing (rotated TOTP — AUTH-GAP-04 class)** →
   TokenManager's own internal retries + AUTH-GAP-04 emission fire as today;
   the stack's outer loop retries at the 300s cap; canary/spot/chain absent
@@ -168,10 +186,16 @@ apply; this item's specifics are in the sections above).
   `test_dhan_overlay_suppressed_predicate`.
 - `crates/common` — `test_production_groww_live_dhan_rest_only` (replaces
   `test_production_runs_both_feeds`).
-- `crates/app` — new guard `dhan_live_off_phase_a_guard.rs` (4 tests, source
-  scans per §7 of Design); `dhan_rest_stack.rs` unit tests for the pure
-  helpers (`dhan_rest_stack_backoff_secs`, `dhan_rest_retry_should_log`,
-  Telegram-defer threshold).
+- `crates/app` — new guard `dhan_live_off_phase_a_guard.rs` (5 tests, source
+  scans per §7 of Design; Pin 4 is region-scoped + source-order asserted per
+  review FIX 6); `dhan_rest_stack.rs` unit tests for the pure helpers
+  (`dhan_rest_stack_backoff_secs`, `dhan_rest_retry_should_log`, bounded
+  AlreadyHeld patience + page-then-park math, ssm-transport retry,
+  `dhan_rest_token_backoff_secs` ≥130s mint-cooldown floor, the shared
+  `claim_post_market_task_family_once` once-guard).
+- `crates/api` (FIX 3) — handler tests: Dhan enable refused 409 in BOTH
+  trading modes when config-off (flag not flipped), Dhan disable still a
+  no-op success, Groww toggles unaffected, config snapshot immutable.
 - Full suites: `cargo test -p tickvault-common -p tickvault-api -p
   tickvault-app` + fmt + clippy + banned-pattern scanner + plan-gate.
 - Files: `config/base.toml`, `config/production.toml`,
@@ -210,5 +234,14 @@ apply; this item's specifics are in the sections above).
   (REST-CANARY-01, SPOT1M-01/02, CHAIN-01..04) unchanged.
 - The market-hours liveness alarm now watches the Groww lag gauge — dated
   comment block in the tf explains the signal move + honest envelope.
-- Runtime-enable refusal: edge-latched `warn!` naming the 2026-07-13
-  directive; overlay suppression: one boot-time `warn!` naming the directive.
+- Runtime-enable refusal: 409 at the API layer (FIX 3) + the edge-latched
+  supervisor `warn!` naming the 2026-07-13 directive; overlay suppression:
+  one boot-time `warn!` naming the directive.
+- Honest pager gap (flagged follow-up for Phase C): a REST stack wedged in
+  its lock/auth retry loops — or PARKED after the bounded AlreadyHeld
+  patience window (the FIX 1 park state) — is LOG-visible only (coalesced
+  `error!`, plus the one DualInstanceDetected Telegram on the peer case)
+  but has NO CloudWatch pager: `tv_dhan_rest_stack_up` is not CW-shipped
+  (not in the EMF allowlist) and RESILIENCE-01 has no errcode alarm entry —
+  the entire retained Dhan REST surface (incl. the canary, which lives
+  inside the stack) can be absent all session without a page.
