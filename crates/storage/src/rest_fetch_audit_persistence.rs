@@ -27,17 +27,18 @@
 //!     close_to_data_ms LONG, rate_limited_count INT, outcome SYMBOL,
 //!     error_class SYMBOL
 //! ) timestamp(ts) PARTITION BY DAY
-//!   DEDUP UPSERT KEYS(ts, trading_date_ist, feed, leg, security_id, exchange_segment);
+//!   DEDUP UPSERT KEYS(ts, trading_date_ist, feed, leg, security_id, exchange_segment, outcome);
 //! ```
 //!
 //! DEDUP discipline: designated `ts` FIRST (2026-04-28 rule);
 //! `exchange_segment` alongside `security_id` (I-P1-11); `feed` in-key
 //! (feed-in-key EVERYWHERE, 2026-06-28); `leg` in-key so a future chain-leg
-//! row for the same minute/underlying never collides with the spot row. A
-//! re-fired/re-swept minute UPSERTs its row in place (latest verdict wins —
-//! a repair overwrites the earlier failure row for the same key, which is
-//! the intended "current truth per minute" read model; the coded logs keep
-//! the full history).
+//! row for the same minute/underlying never collides with the spot row;
+//! `outcome` in-key (phase-0-architecture DEDUP rule 3 — TRANSITION rows
+//! must BOTH survive: a sweep `named_gap`/`no_token` row for a minute must
+//! never UPSERT-overwrite that minute's original ladder forensics row, and
+//! a later repair's `ok` row lands ALONGSIDE the earlier failure row). A
+//! re-run with the SAME outcome UPSERTs its row in place (idempotent).
 
 use anyhow::{Context, Result};
 use questdb::ingress::{Buffer, ProtocolVersion, Sender, TimestampNanos};
@@ -50,9 +51,11 @@ pub const REST_FETCH_AUDIT_TABLE: &str = "rest_fetch_audit";
 
 /// DEDUP key. Designated `ts` FIRST (2026-04-28 regression rule);
 /// `exchange_segment` alongside `security_id` (I-P1-11); `feed` in-key
-/// (2026-06-28 override); `leg` in-key (spot vs future chain/contract rows).
+/// (2026-06-28 override); `leg` in-key (spot vs future chain/contract rows);
+/// `outcome` in-key (phase-0 DEDUP rule 3 — transition rows BOTH survive:
+/// a sweep gap row never overwrites the same minute's ladder row).
 pub const DEDUP_KEY_REST_FETCH_AUDIT: &str =
-    "ts, trading_date_ist, feed, leg, security_id, exchange_segment";
+    "ts, trading_date_ist, feed, leg, security_id, exchange_segment, outcome";
 
 /// `leg` SYMBOL value — the per-minute SPOT 1m fetch (the only live leg
 /// today; `chain_1m` / `contract_1m` land with PR-3/PR-4).
@@ -78,6 +81,13 @@ pub enum RestFetchOutcome {
     /// The minute boundary elapsed unfetched (fire overrun / suspend /
     /// clock step) — no request was ever made for it.
     Skipped,
+    /// A finally-unrecovered NAMED GAP (post-sweep target-absent minute,
+    /// pre-boot unverified minute, or a flush-lost swept minute).
+    /// `final_http_status` carries the ACTUAL last HTTP status when a fetch
+    /// happened for it (e.g. the sweep's 200 that lacked the minute), or
+    /// the 0 sentinel when none did (hostile round 1 item 6 — never a
+    /// fabricated 200 + `error` pair).
+    NamedGap,
 }
 
 impl RestFetchOutcome {
@@ -91,6 +101,7 @@ impl RestFetchOutcome {
             Self::RateLimited => "rate_limited",
             Self::NoToken => "no_token",
             Self::Skipped => "skipped",
+            Self::NamedGap => "named_gap",
         }
     }
 }
@@ -479,9 +490,11 @@ mod tests {
     /// DEDUP-key discipline: designated `ts` FIRST (2026-04-28 regression
     /// rule); `exchange_segment` with `security_id` (I-P1-11); `feed`
     /// in-key (2026-06-28 override); `leg` in-key (spot vs future
-    /// chain/contract rows) — whole-token matches.
+    /// chain/contract rows); `outcome` in-key (phase-0 DEDUP rule 3 —
+    /// transition rows BOTH survive; hostile round 1 item 5) —
+    /// whole-token matches.
     #[test]
-    fn test_rest_fetch_audit_dedup_key_ts_first_segment_feed_and_leg_in_key() {
+    fn test_rest_fetch_audit_dedup_key_ts_first_segment_feed_leg_and_outcome_in_key() {
         assert!(DEDUP_KEY_REST_FETCH_AUDIT.trim_start().starts_with("ts,"));
         let has_token = |t: &str| {
             DEDUP_KEY_REST_FETCH_AUDIT
@@ -494,8 +507,10 @@ mod tests {
         assert!(has_token("leg"));
         assert!(has_token("security_id"));
         assert!(has_token("exchange_segment"));
-        // Exactly (ts, trading_date_ist, feed, leg, security_id, exchange_segment).
-        assert_eq!(DEDUP_KEY_REST_FETCH_AUDIT.matches(',').count() + 1, 6);
+        assert!(has_token("outcome"));
+        // Exactly (ts, trading_date_ist, feed, leg, security_id,
+        // exchange_segment, outcome).
+        assert_eq!(DEDUP_KEY_REST_FETCH_AUDIT.matches(',').count() + 1, 7);
     }
 
     /// Outcome SYMBOL wire strings are stable (forensic queries group on
@@ -509,6 +524,7 @@ mod tests {
             (RestFetchOutcome::RateLimited, "rate_limited"),
             (RestFetchOutcome::NoToken, "no_token"),
             (RestFetchOutcome::Skipped, "skipped"),
+            (RestFetchOutcome::NamedGap, "named_gap"),
         ];
         for (variant, wire) in all {
             assert_eq!(variant.as_str(), wire);
