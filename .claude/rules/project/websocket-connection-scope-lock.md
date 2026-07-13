@@ -181,8 +181,14 @@ To add a new WS type or instrument class in a future phase:
 | **GDF (feed #3)** | Separate lock — NOT governed here | `gdf-third-feed-scope-2026-07-13.md` (default OFF, trial-first). This amendment deliberately leaves the pluggable seam clean for it: `FeedsConfig`, feed-in-key shared tables, WAL/ring/spill/aggregator are all UNTOUCHED by the Dhan deletions. |
 
 **Total live market-data WebSocket connections: 1 (Groww).** Total Dhan WebSocket
-connections: 1 (order-update, functional-dormant). The 2026-05-15 "two Dhan phone lines"
-lock text below is retained as historical audit; THIS table is the effective contract.
+connections: **TODAY (post-Phase-A): 0 · AFTER the Phase C rewire: ≤1** (order-update,
+functional-dormant). The 2026-05-15 "two Dhan phone lines" lock text below is retained
+as historical audit; THIS table is the effective contract.
+
+> Footnote (tense honesty): the order-update WS is spawned today ONLY from the Dhan-gated
+> fast crash-recovery arm + `start_dhan_lane` — both OFF with `dhan_enabled = false` — so
+> the live Dhan WS count is 0 until the Phase C rewire spawns it from `dhan_rest_stack`
+> (functional-dormant, ≤1).
 
 ### §B. What the Phase C deletion PRs MAY remove (authorized by Q1/Q3/Q4; consumer map Verified 2026-07-13)
 
@@ -208,8 +214,14 @@ row Verified with file:line evidence):
    `parse_intraday_1m_candles` + `MinuteCandle`, consumed by `spot_1m_rest_boot`),
    `InstrumentRegistry`, plan-snapshot files.
 4. **Tick-gap detector + WS-GAP-06 (Q4-ii):** the detector, its seeding, the far-month
-   alarm-gate exclusion sites, `tv_tick_gap_*` metrics. Groww stall detection is the
-   FEED-level stall watchdog (`feed-stall-watchdog-error-codes.md`) — see the honest
+   alarm-gate exclusion sites, `tv_tick_gap_*` metrics — AND the CloudWatch alarm on
+   `tv_tick_gap_instruments_silent`
+   (`aws_cloudwatch_metric_alarm.tick_gap_instruments_silent` =
+   `tv-<env>-tick-gap-instruments-silent`, `deploy/aws/terraform/app-alarms.tf`,
+   including its market-hours window-gate membership + the file's alarm-count/cost
+   note), which retires WITH the detector — otherwise Phase C orphans a dead monitor
+   (the gauge is never written again once the detector dies). Groww stall detection is
+   the FEED-level stall watchdog (`feed-stall-watchdog-error-codes.md`) — see the honest
    envelope in §C.
 5. **Error codes** whose only emit sites die with the chain: INSTR-FETCH-01..04,
    NTM-CONSTITUENCY-01, PREVDAY-01, CROSS-VERIFY-1M-01/02, DHAN-LANE-01..04, WS-GAP-06
@@ -276,13 +288,17 @@ evidence (all Verified, sources cited):
 | 3 | Per-minute silent instruments on the Dhan feed, 2026-07-06 | **29–67 instruments/minute** with tick gaps of 300–978 s; **590 gap events** logged | same doc, timeline row "per-minute tick gaps" |
 | 4 | The 15:31 IST Dhan cross-verify was **BLIND SINCE BIRTH** | The `candles_1m`-side SELECT used NANOSECOND literals against QuestDB's MICROSECOND timestamp comparison — the WHERE window sat ~year 58502 and matched ZERO rows on every run since the feature shipped; `compared=0` reported honestly as BLIND, so no mismatch page ever fired. Fixed by PR #1474 (commit `f84b4398`, merged 2026-07-11) — the first sessions with a WORKING comparison are what surfaced the live-vs-historical candle mismatches behind Q2 | PR #1474 commit body (`git show f84b4398`); `crates/app/src/cross_verify_1m_boot.rs` digit-magnitude ratchets |
 | 5 | Cross-verify design expectation vs observation | `cross-verify-1m-error-codes.md` §1 documents that NON-ZERO High/Low sampling noise is expected (Dhan WS is a ~2–4 ticks/sec SAMPLED stream vs their full-tape candle API) — "track the trend, not the absolute count". The post-#1474 observed divergence + the Incident-3 lag class exceeded that expected-noise envelope in the operator's judgment (Q2: "massive major mismatches") | `.claude/rules/project/cross-verify-1m-error-codes.md` §1; operator Q2 |
-| 6 | Server-side transport instability (supporting) | 2026-07-06: token invalidated server-side with ZERO mints from our box (DH-906 for 4+ hours); 39+ order-update RST-after-accepted-login cycles. 2026-07-08 13:55–14:06 IST: 7 bare-RST main-feed disconnect cycles + a ~2-min full outage — continuing the 2026-07-02 RST pattern | same support doc, Incidents 1/2/4; `docs/dhan-support/2026-07-02-mainfeed-tcpresets.md` (filename per the doc's own cross-link) |
+| 6 | Server-side transport instability (supporting) | 2026-07-06: token invalidated server-side with ZERO mints from our box (DH-906 for 4+ hours); 39+ order-update RST-after-accepted-login cycles. 2026-07-08 13:55–14:06 IST: 7 bare-RST main-feed disconnect cycles + a ~2-min full outage — continuing the 2026-07-02 RST pattern | same support doc, Incidents 1/2/4; `docs/dhan-support/2026-07-02-mainfeed-tcp-resets.md` (the file on disk; the 2026-07-08 doc's own cross-link cites the same name) |
 
 Honest note on row 5: the WS-sampled-vs-full-tape asymmetry means SOME candle divergence
 was always expected by design; the retirement decision is the operator's judgment call on
 its magnitude (Q2 verbatim) reinforced by rows 1–3 (delivery lag + silence), which are
 NOT explainable by sampling. Neither side of any candle comparison is claimed as ground
-truth (the §37 doctrine).
+truth (the §37 doctrine). Provenance honesty: the 2026-07-11 first-honest-run mismatch
+COUNTS are NOT repo-quantified — they exist only in the AWS box's `cross_verify_1m_audit`
+table, the day's `data/cross-verify/` CSV, and the Telegram summary; the "massive major
+mismatches" magnitude is the operator's own observation of those outputs (Q2), not a
+number reproducible from this repository.
 
 ### §F. Auto-driver / Insta-reel explanation
 
