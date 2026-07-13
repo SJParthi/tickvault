@@ -2741,12 +2741,9 @@ mod tests {
         assert!(build_auth_short_circuit_rows(&[], 900, 0).is_empty());
     }
 
-    /// Item 12 (ladder-level): an HTTP 401 SHORT-CIRCUITS the ladder on
-    /// the FIRST attempt — no further doomed rungs (attempts == 1, not 5)
-    /// — and the forensics carry the auth classification.
-    #[tokio::test]
-    async fn test_ladder_short_circuits_on_auth_reject() {
-        const MOCK_401: &str = "HTTP/1.1 401 Unauthorized\r\nContent-Length: 2\r\n\r\n{}";
+    /// Spawn a one-response-per-connection mock HTTP server; returns the
+    /// candles URL pointing at it.
+    async fn spawn_mock_candles_server(response: &'static str) -> String {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind");
@@ -2758,16 +2755,29 @@ mod tests {
                         use tokio::io::{AsyncReadExt, AsyncWriteExt};
                         let mut buf = [0u8; 8192];
                         let _ = stream.read(&mut buf).await;
-                        let _ = stream.write_all(MOCK_401.as_bytes()).await;
+                        let _ = stream.write_all(response.as_bytes()).await;
                     });
                 }
             }
         });
-        let client = reqwest::Client::builder()
+        format!("http://127.0.0.1:{port}/v1/historical/candles")
+    }
+
+    fn mock_client() -> reqwest::Client {
+        reqwest::Client::builder()
             .timeout(Duration::from_secs(2))
             .build()
-            .expect("client");
-        let url = format!("http://127.0.0.1:{port}/v1/historical/candles");
+            .expect("client")
+    }
+
+    /// Item 12 (ladder-level): an HTTP 401 SHORT-CIRCUITS the ladder on
+    /// the FIRST attempt — no further doomed rungs (attempts == 1, not 5)
+    /// — and the forensics carry the auth classification.
+    #[tokio::test]
+    async fn test_ladder_short_circuits_on_auth_reject() {
+        const MOCK_401: &str = "HTTP/1.1 401 Unauthorized\r\nContent-Length: 2\r\n\r\n{}";
+        let url = spawn_mock_candles_server(MOCK_401).await;
+        let client = mock_client();
         let date = NaiveDate::from_ymd_opt(2026, 7, 13).expect("valid date");
         let query = groww_candles_query("NSE-NIFTY", "NSE", "CASH", date);
         let token = SecretString::from("test-token");
@@ -2784,5 +2794,310 @@ mod tests {
             matches!(outcome, SymbolFetchOutcome::Failed { .. }),
             "got {outcome:?}"
         );
+    }
+
+    // ---- CI coverage hardening (PR #1507 Coverage & Perf: app 63.07% <
+    // 63.3% floor — REAL tests over the runner arms; the floor is never
+    // touched) --------------------------------------------------------------
+
+    /// Deterministic params: TODAY is stamped an NSE holiday, so
+    /// `is_trading_day_today()` is `false` regardless of the real weekday;
+    /// QuestDB points at reserved port 1 (fast refused connections — the
+    /// ensure-DDL degrade arms run for real, nothing live is touched).
+    fn test_params() -> GrowwSpot1mTaskParams {
+        use tickvault_common::config::{NseHolidayEntry, TradingConfig};
+        let config = TradingConfig {
+            market_open_time: "09:00:00".to_string(),
+            market_close_time: "15:30:00".to_string(),
+            order_cutoff_time: "15:29:00".to_string(),
+            data_collection_start: "09:00:00".to_string(),
+            data_collection_end: "15:30:00".to_string(),
+            timezone: "Asia/Kolkata".to_string(),
+            max_orders_per_second: 10,
+            nse_holidays: vec![NseHolidayEntry {
+                date: today_ist().format("%Y-%m-%d").to_string(),
+                name: "coverage-test holiday".to_string(),
+            }],
+            muhurat_trading_dates: vec![],
+            nse_mock_trading_dates: vec![],
+        };
+        GrowwSpot1mTaskParams {
+            notifier: NotificationService::disabled(),
+            calendar: Arc::new(
+                tickvault_common::trading_calendar::TradingCalendar::from_config(&config)
+                    .expect("calendar"),
+            ),
+            questdb: QuestDbConfig {
+                host: "127.0.0.1".to_string(),
+                http_port: 1,
+                pg_port: 1,
+                ilp_port: 1,
+            },
+        }
+    }
+
+    /// `record_skipped_boundaries` arms: zero → early return; a wake that
+    /// crossed IST midnight → counter + log only (no mis-dated rows, item
+    /// 7); same-day → per-(minute, symbol) rows + edge accounting (3
+    /// skipped minutes trip the 3-consecutive page through the disabled
+    /// notifier) + the best-effort flush error arm (disconnected writer).
+    #[test]
+    fn test_record_skipped_boundaries_zero_midnight_and_sameday_arms() {
+        let params = test_params();
+        let mut edge = FailureEdge::default();
+        let mut aw = RestFetchAuditWriter::for_test();
+        let boundary = 9 * 3600 + 17 * 60;
+
+        record_skipped_boundaries(&params, &mut edge, &mut aw, 0, boundary, today_ist());
+        assert_eq!(aw.pending(), 0, "zero skipped is a no-op");
+
+        let yesterday = today_ist().pred_opt().expect("valid date");
+        record_skipped_boundaries(&params, &mut edge, &mut aw, 2, boundary, yesterday);
+        assert_eq!(aw.pending(), 0, "midnight-crossed wake writes no rows");
+
+        record_skipped_boundaries(&params, &mut edge, &mut aw, 3, boundary, today_ist());
+        assert_eq!(
+            aw.pending(),
+            0,
+            "same-day rows are appended then best-effort flushed (the \
+             disconnected test writer's flush error arm discards them)"
+        );
+    }
+
+    /// `fire_one_minute` no-token arm end-to-end: the pacing-gated token
+    /// cache returns `None` WITHOUT any SSM read (last_read stamped now),
+    /// every symbol counts as a full miss with a `no_token` forensics row,
+    /// and 3 consecutive fully-failed minutes trip the edge page (via the
+    /// disabled notifier). Nothing persists; no request leaves the box.
+    #[tokio::test]
+    async fn test_fire_one_minute_no_token_full_miss_and_edge() {
+        let params = test_params();
+        let client = mock_client();
+        let mut writer = Spot1mRestWriter::for_test_with_feed(
+            SPOT_1M_REST_FEED_GROWW,
+            SPOT_1M_REST_SOURCE_GROWW_CANDLES,
+        );
+        let mut aw = RestFetchAuditWriter::for_test();
+        let mut edge = FailureEdge::default();
+        let mut tracker = PersistTracker::default();
+        // Constructed via new() + field mutation (never a struct literal)
+        // so concurrently-added fields keep this fixture compiling.
+        let mut cache = GrowwTokenCache::new();
+        cache.last_read_ms = Some(epoch_millis_now());
+        for _ in 0..3 {
+            fire_one_minute(
+                &params,
+                &client,
+                &mut writer,
+                &mut aw,
+                &mut edge,
+                &mut tracker,
+                &mut cache,
+                9 * 3600 + 16 * 60,
+            )
+            .await;
+        }
+        assert_eq!(writer.pending(), 0, "no candle rows without a token");
+        assert!(cache.token.is_none(), "pacing gate blocks any SSM re-read");
+        assert_eq!(tracker.last_persisted(1), None);
+    }
+
+    /// `record_minute_verdict` arms: clean minute; sub-edge degraded log;
+    /// 3 consecutive fully-failed → Page; then a good minute → Recover.
+    #[test]
+    fn test_record_minute_verdict_page_and_recover_arms() {
+        let params = test_params();
+        let mut edge = FailureEdge::default();
+        record_minute_verdict(&params, &mut edge, "9:15 AM", 3, 0, 0, false, None);
+        record_minute_verdict(
+            &params,
+            &mut edge,
+            "9:16 AM",
+            2,
+            1,
+            0,
+            false,
+            Some("one miss"),
+        );
+        for _ in 0..3 {
+            record_minute_verdict(&params, &mut edge, "9:17 AM", 0, 3, 0, false, Some("down"));
+        }
+        record_minute_verdict(&params, &mut edge, "9:20 AM", 3, 0, 0, false, None);
+    }
+
+    /// Non-trading-day run: `run_groww_spot_1m` degrades its ensure-DDL
+    /// legs against the refused-connection QuestDB config, then returns at
+    /// the trading-day gate; the supervisor observes day-over and exits
+    /// cleanly (never respawns into a holiday).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_supervisor_exits_cleanly_on_non_trading_day() {
+        let handle = spawn_supervised_groww_spot_1m(test_params());
+        tokio::time::timeout(Duration::from_secs(60), handle)
+            .await
+            .expect("supervisor must exit on a non-trading day")
+            .expect("join");
+    }
+
+    /// Happy fetch path through a mock server: 200 body carrying the
+    /// target minute AND its backfill minute → `Found` on the FIRST rung
+    /// with the sticky backfill candle; the bounded wrapper passes it
+    /// through untouched.
+    #[tokio::test]
+    async fn test_ladder_found_first_attempt_with_backfill_and_bounded_passthrough() {
+        // IST minute 1_770_000_900 (multiple of 60, year 2026): epoch UTC
+        // = IST − 19_800; the backfill row is one minute earlier.
+        const TARGET_IST_SECS: i64 = 1_770_000_900;
+        const BODY: &str = r#"{"status":"SUCCESS","payload":{"candles":[[1769981040,99.0,101.0,98.0,100.0,0],[1769981100,100.0,102.0,99.0,101.0,0]]}}"#;
+        let response: &'static str = Box::leak(
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{}",
+                BODY.len(),
+                BODY
+            )
+            .into_boxed_str(),
+        );
+        let url = spawn_mock_candles_server(response).await;
+        let client = mock_client();
+        let date = NaiveDate::from_ymd_opt(2026, 7, 13).expect("valid date");
+        let query = groww_candles_query("NSE-NIFTY", "NSE", "CASH", date);
+        let token = SecretString::from("test-token");
+        let target_nanos = TARGET_IST_SECS * NANOS_PER_SEC;
+        let backfill_nanos = target_nanos - NANOS_PER_MINUTE;
+        let (outcome, forensics) = fetch_minute_with_ladder(
+            &client,
+            &url,
+            &query,
+            &token,
+            target_nanos,
+            Some(backfill_nanos),
+            0,
+        )
+        .await;
+        assert_eq!(forensics.attempts, 1, "found on the first rung");
+        assert_eq!(forensics.final_http_status, 200);
+        match outcome {
+            SymbolFetchOutcome::Found {
+                candle,
+                backfill_candle,
+                ..
+            } => {
+                assert_eq!(candle.minute_ts_ist_nanos, target_nanos);
+                assert_eq!(candle.close, 101.0);
+                let backfill = backfill_candle.expect("backfill candle mined from same body");
+                assert_eq!(backfill.minute_ts_ist_nanos, backfill_nanos);
+            }
+            other => panic!("expected Found, got {other:?}"),
+        }
+        // The budget wrapper passes the same verdict through.
+        let (bounded, bf) = fetch_minute_bounded(
+            &client,
+            &url,
+            &query,
+            &token,
+            target_nanos,
+            Some(backfill_nanos),
+            0,
+        )
+        .await;
+        assert!(matches!(bounded, SymbolFetchOutcome::Found { .. }));
+        assert_eq!(bf.final_http_status, 200);
+    }
+
+    /// 429 classification through a mock server: rate_limited flagged +
+    /// counted, Retry-After presence captured (the live-probe (e) shape),
+    /// bounded redacted body — never a panic.
+    #[tokio::test]
+    async fn test_fetch_once_429_rate_limited_classification() {
+        const MOCK_429: &str =
+            "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 7\r\nContent-Length: 2\r\n\r\n{}";
+        let url = spawn_mock_candles_server(MOCK_429).await;
+        let client = mock_client();
+        let date = NaiveDate::from_ymd_opt(2026, 7, 13).expect("valid date");
+        let query = groww_candles_query("NSE-NIFTY", "NSE", "CASH", date);
+        let token = SecretString::from("test-token");
+        let failure = groww_fetch_once(&client, &url, &query, &token)
+            .await
+            .expect_err("429 must be a typed failure");
+        assert!(failure.rate_limited);
+        assert!(!failure.auth_rejected);
+        assert_eq!(failure.status, 429);
+        assert!(failure.msg.contains("retry_after_present=true"));
+    }
+
+    /// The declared-Content-Length body cap (§18 pattern): a 200 whose
+    /// declared length exceeds the 2 MiB cap is refused BEFORE streaming.
+    #[tokio::test]
+    async fn test_fetch_once_declared_body_over_cap_refused() {
+        const MOCK_HUGE: &str = "HTTP/1.1 200 OK\r\nContent-Length: 3000000\r\n\r\n{}";
+        let url = spawn_mock_candles_server(MOCK_HUGE).await;
+        let client = mock_client();
+        let date = NaiveDate::from_ymd_opt(2026, 7, 13).expect("valid date");
+        let query = groww_candles_query("NSE-NIFTY", "NSE", "CASH", date);
+        let token = SecretString::from("test-token");
+        let failure = groww_fetch_once(&client, &url, &query, &token)
+            .await
+            .expect_err("over-cap declared length must fail");
+        assert_eq!(failure.status, 200, "the HTTP status itself was 200");
+        assert!(
+            failure.msg.contains("body too large"),
+            "got: {}",
+            failure.msg
+        );
+    }
+
+    /// Named-gap + best-effort audit arms with the disconnected writer:
+    /// rows append (pending rises), the best-effort flush error arm
+    /// discards them loudly — the caller is never affected.
+    #[test]
+    fn test_record_named_gaps_appends_and_best_effort_flush_discards() {
+        let mut aw = RestFetchAuditWriter::for_test();
+        record_named_gaps(
+            &mut aw,
+            &[100, 100 + NANOS_PER_MINUTE],
+            0,
+            7,
+            "NIFTY",
+            RestFetchOutcome::NamedGap,
+            "persist_failed",
+            200,
+        );
+        assert_eq!(aw.pending(), 2, "one row per gap minute");
+        audit_flush_best_effort(&mut aw);
+        assert_eq!(aw.pending(), 0, "flush error arm discards (best-effort)");
+        // Empty gaps are a no-op.
+        record_named_gaps(
+            &mut aw,
+            &[],
+            0,
+            7,
+            "NIFTY",
+            RestFetchOutcome::NamedGap,
+            "named_gap",
+            200,
+        );
+        assert_eq!(aw.pending(), 0);
+    }
+
+    /// Wall-clock helper smokes (range assertions — the fns are thin IST
+    /// conversions) + the parse-stats counter emitter + BOTH
+    /// `note_auth_rejected` arms of the token cache.
+    #[test]
+    fn test_wall_clock_helpers_parse_stats_and_token_cache_arms() {
+        assert!(ist_secs_of_day_now() < SECONDS_PER_DAY);
+        assert!((0..MILLIS_PER_DAY).contains(&ist_millis_of_day_now()));
+        assert!(epoch_millis_now() > 0);
+        assert!(fetched_at_ist_nanos_now() > 0);
+        let _today = today_ist();
+        record_parse_stats(GrowwParseStats {
+            epoch_ts_rows: 1,
+            string_ts_rows: 1,
+            malformed_rows: 1,
+        });
+        let mut cache = GrowwTokenCache::new();
+        cache.note_auth_rejected(); // no cached token — silent arm
+        assert!(cache.token.is_none());
+        cache.token = Some(SecretString::from("t"));
+        cache.note_auth_rejected(); // drop arm
+        assert!(cache.token.is_none(), "auth reject drops the cached token");
     }
 }
