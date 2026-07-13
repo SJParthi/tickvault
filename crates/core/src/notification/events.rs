@@ -478,6 +478,60 @@ pub enum NotificationEvent {
         detail: String,
     },
 
+    /// Daily timeframe-consistency verifier (operator directive 2026-07-13:
+    /// *"how will you guarantee that all our defined timeframes internally
+    /// are correct"*): the ONE 3:40 PM IST summary covering BOTH passes —
+    /// Dhan (today) and Groww (previous trading day). Severity AND wording
+    /// derive from `status_label` (the verifier's flush-adjusted verdict —
+    /// L6 fix, never re-derived from the counts, which can disagree on
+    /// edge days): `Info` only for `pass` / `no_data`; everything else is
+    /// `High`. A `buckets_compared == 0` run with data expected must NEVER
+    /// read as PASS (audit Rule 11 — the BLIND wording).
+    TfConsistencySummary {
+        /// The Dhan trading day verified, `YYYY-MM-DD` IST.
+        dhan_date_ist: String,
+        /// The Groww trading day verified (previous trading day), IST.
+        groww_date_ist: String,
+        /// Instruments examined across both passes.
+        instruments: u64,
+        /// Higher-timeframe candles present on BOTH sides and compared.
+        buckets_compared: u64,
+        /// Field-cells where a stored candle disagrees with its recompute.
+        mismatches: u64,
+        /// Windows with 1-minute data but NO stored higher-TF candle.
+        missing_tf_rows: u64,
+        /// Stored higher-TF candles with ZERO 1-minute rows behind them.
+        no_coverage: u64,
+        /// Stored candles whose timestamp is off the 9:15 AM grid.
+        off_grid: u64,
+        /// Duplicate rows sharing one storage key.
+        duplicates: u64,
+        /// Groww end-of-day buckets that are never sealed on the
+        /// production schedule (the system stops before midnight) — not
+        /// verified BY DESIGN, never a page (H1 carve-out).
+        tail_unsealed: u64,
+        /// True when any query/flush/budget leg degraded — the run cannot
+        /// vouch for the full universe.
+        degraded: bool,
+        /// True when findings exceeded the stored-detail cap (counts stay
+        /// exact; only the per-row detail was truncated).
+        truncated: bool,
+        /// Stable run verdict: `pass` / `mismatch` / `degraded` / `blind`
+        /// / `no_data`.
+        status_label: String,
+        /// Up to 10 plain-English worst offenders.
+        top_detail: Vec<String>,
+    },
+
+    /// The daily timeframe-consistency TASK died (panicked/failed) before
+    /// producing its summary. High so the absence of the daily verdict is
+    /// impossible to miss. NOT fired on graceful shutdown/cancellation
+    /// (the 16:30 IST auto-stop is a normal teardown, not an abort).
+    TfConsistencyAborted {
+        /// Plain-English description of how the task died.
+        detail: String,
+    },
+
     /// Per-minute spot 1m REST pipeline (operator grant 2026-07-12): the
     /// per-minute pull of the just-closed minute's official index candle
     /// has fully failed (no index succeeded) for several minutes in a row.
@@ -545,6 +599,53 @@ pub enum NotificationEvent {
         symbol: String,
         /// How many counted minutes the index went unserved.
         not_served_minutes: u32,
+    },
+
+    /// Groww per-minute option-chain REST leg (operator grant 2026-07-13,
+    /// PR-3 of the Groww per-minute REST plan): the per-minute Groww
+    /// option-chain snapshot has fully failed for several minutes in a row
+    /// (edge-triggered ONCE per episode, Rule 4; re-armed only after a
+    /// successful minute). Severity::High.
+    GrowwChain1mFetchDegraded {
+        /// How many minutes in a row have fully failed.
+        consecutive_failed_minutes: u32,
+        /// The most recent failed minute, IST 12-hour (e.g. "10:42 AM").
+        minute_ist: String,
+    },
+
+    /// The Groww per-minute option-chain snapshot RECOVERED after a
+    /// failing episode (falling edge — one Info ping; the missing minutes
+    /// stay absent until re-pulled, never fabricated).
+    GrowwChain1mFetchRecovered {
+        /// The minute that succeeded, IST 12-hour (e.g. "10:45 AM").
+        minute_ist: String,
+        /// How many minutes had fully failed during the episode.
+        failed_minutes: u32,
+    },
+
+    /// The Groww chain leg could not resolve today's option expiry for one
+    /// or more underlyings from the daily instruments list (list download
+    /// failed after bounded tries, or the list carried no usable option
+    /// rows) — those underlyings' chain recording stays OFF for the day
+    /// (expiry dates are never guessed). One HIGH page per day.
+    GrowwChain1mExpiryUnresolved {
+        /// Plain-English detail naming the affected underlyings / cause
+        /// (already secret-redacted + bounded at the emit site).
+        detail: String,
+    },
+
+    /// The boot-time Groww option-chain probe verdict (pipeline switched
+    /// OFF, probe-and-report ON): one Info ping carrying the MEASURED
+    /// result — whether the chain answered, how many strikes, how fast, or
+    /// which reject class — so the operator can decide to turn recording
+    /// on. Nothing was recorded either way.
+    GrowwChain1mProbeVerdict {
+        /// `true` when every underlying's chain call answered with a
+        /// parseable chain.
+        ok: bool,
+        /// Plain-English measured detail (already secret-redacted +
+        /// bounded at the emit site).
+        detail: String,
     },
 
     /// Per-minute option-chain REST pipeline (operator grant 2026-07-12,
@@ -2112,6 +2213,119 @@ impl NotificationEvent {
                      2. Restart the app to re-arm tomorrow's check."
                 )
             }
+            Self::TfConsistencySummary {
+                dhan_date_ist,
+                groww_date_ist,
+                instruments,
+                buckets_compared,
+                mismatches,
+                missing_tf_rows,
+                no_coverage,
+                off_grid,
+                duplicates,
+                tail_unsealed,
+                degraded,
+                truncated,
+                status_label,
+                top_detail,
+            } => {
+                // H1: name the Groww end-of-day buckets that are never
+                // sealed on the production schedule — honest coverage
+                // note, never a finding.
+                let tail_note = if *tail_unsealed > 0 {
+                    format!(
+                        "\n{tail_unsealed} Groww end-of-day buckets are not \
+                         sealed by design (the system stops before the \
+                         midnight seal) — not verified."
+                    )
+                } else {
+                    String::new()
+                };
+                // L6: wording derives from status_label — the verifier's
+                // flush-adjusted verdict — never re-derived from counts.
+                if status_label == "pass" {
+                    format!(
+                        "\u{2705} <b>Daily timeframe check @ 3:40 PM IST — PASS</b>\n\
+                         Dhan day: {dhan_date_ist} | Groww day: {groww_date_ist}\n\
+                         Instruments: {instruments} | Candles compared: {buckets_compared}\n\
+                         Every 2-minute-to-4-hour candle matches its 1-minute \
+                         building blocks exactly.{tail_note}"
+                    )
+                } else if status_label == "no_data" {
+                    format!(
+                        "\u{1f515} <b>Daily timeframe check @ 3:40 PM IST — nothing to check</b>\n\
+                         Dhan day: {dhan_date_ist} | Groww day: {groww_date_ist}\n\
+                         No candles were recorded for these days (feeds were \
+                         off). This is not a pass and not a failure — there \
+                         was simply nothing to verify."
+                    )
+                } else if *buckets_compared == 0 {
+                    // The BLIND day: rows may exist but NOTHING could be
+                    // compared. An empty finding list must never read as a
+                    // pass (audit Rule 11 — the false-OK class). The Groww
+                    // tail note rides along here too (refuter round 2) —
+                    // un-catch-up-able tail buckets stay unverified even on
+                    // a blind day.
+                    format!(
+                        "\u{1f198} <b>Daily timeframe check @ 3:40 PM IST — BLIND</b>\n\
+                         Dhan day: {dhan_date_ist} | Groww day: {groww_date_ist}\n\
+                         Checked NOTHING today — could NOT verify a single \
+                         candle. This is not a pass.{tail_note}\n\
+                         What to do RIGHT NOW:\n\
+                         1. Check the database is up and reachable.\n\
+                         2. Confirm the live feeds recorded candles today.\n\
+                         3. Re-run the check once the database is healthy."
+                    )
+                } else {
+                    let coverage_note = if *degraded {
+                        "\nCoverage was PARTIAL — some data could not be read, \
+                         so today's check cannot vouch for everything."
+                    } else {
+                        ""
+                    };
+                    let truncated_note = if *truncated {
+                        "\nCounts exceed the stored detail — only the first \
+                         findings were recorded row-by-row; the totals are exact."
+                    } else {
+                        ""
+                    };
+                    let mut detail_block = String::new();
+                    for line in top_detail.iter().take(10) {
+                        detail_block.push('\n');
+                        detail_block.push_str("• ");
+                        detail_block.push_str(&html_escape(line));
+                    }
+                    format!(
+                        "\u{26a0}\u{fe0f} <b>Daily timeframe check @ 3:40 PM IST — \
+                         NEEDS ATTENTION</b>\n\
+                         Dhan day: {dhan_date_ist} | Groww day: {groww_date_ist}\n\
+                         Instruments: {instruments} | Candles compared: {buckets_compared}\n\
+                         Value differences: {mismatches} | Missing candles: {missing_tf_rows}\n\
+                         Candles with no 1-minute data behind them: {no_coverage}\n\
+                         Off-grid timestamps: {off_grid} | Duplicates: {duplicates}\
+                         {tail_note}{coverage_note}{truncated_note}{detail_block}\n\
+                         What to do RIGHT NOW:\n\
+                         1. Review the worst offenders above — do they cluster \
+                         on one timeframe or one time of day?\n\
+                         2. If the app restarted mid-session today, restart \
+                         windows explain value differences.\n\
+                         3. Any off-grid timestamp means the candle clock \
+                         itself is wrong — escalate immediately."
+                    )
+                }
+            }
+            Self::TfConsistencyAborted { detail } => {
+                let detail = html_escape(detail);
+                format!(
+                    "\u{26a0}\u{fe0f} <b>Daily timeframe check did NOT run</b>\n\
+                     The 3:40 PM IST check that recomputes every higher-timeframe \
+                     candle from its 1-minute building blocks died before finishing.\n\
+                     Reason: {detail}\n\
+                     What to do RIGHT NOW:\n\
+                     1. Check the app is still running.\n\
+                     2. Restart the app to re-arm tomorrow's check."
+                )
+            }
             Self::Spot1mFetchDegraded {
                 consecutive_failed_minutes,
                 minute_ist,
@@ -2212,6 +2426,78 @@ impl NotificationEvent {
                      minute(s). The minutes that were missed stay blank in \
                      the record until re-pulled — nothing is made up."
                 )
+            }
+            Self::GrowwChain1mFetchDegraded {
+                consecutive_failed_minutes,
+                minute_ist,
+            } => {
+                format!(
+                    "\u{1f198} <b>Groww minute-by-minute option chain recording is FAILING</b>\n\
+                     The per-minute option chain snapshot for NIFTY, BANKNIFTY \
+                     and SENSEX from the second broker (Groww) has failed \
+                     {consecutive_failed_minutes} minutes in a row (latest \
+                     failed minute: {minute_ist} IST).\n\
+                     Live streaming prices are NOT affected — only Groww's \
+                     per-minute option chain record is missing.\n\
+                     What to do RIGHT NOW:\n\
+                     1. Check the Groww account's daily access is active \
+                     (the shared morning key).\n\
+                     2. If Groww live streaming prices ALSO stopped, treat it \
+                     as a full Groww outage.\n\
+                     3. Missing minutes stay blank — nothing is made up."
+                )
+            }
+            Self::GrowwChain1mFetchRecovered {
+                minute_ist,
+                failed_minutes,
+            } => {
+                format!(
+                    "\u{2705} <b>Groww minute-by-minute option chain recording recovered</b>\n\
+                     The Groww per-minute option chain snapshot is working \
+                     again as of {minute_ist} IST, after {failed_minutes} \
+                     failed minute(s). The minutes that failed stay blank in \
+                     the record until re-pulled — nothing is made up."
+                )
+            }
+            Self::GrowwChain1mExpiryUnresolved { detail } => {
+                let detail = html_escape(detail);
+                format!(
+                    "\u{1f198} <b>Groww option chain recording could NOT start \
+                     for some indices today</b>\n\
+                     Today's contract list from Groww did not give a usable \
+                     option expiry date, so those indices' option chain \
+                     recording stays OFF for today (expiry dates are never \
+                     guessed).\n\
+                     Detail: {detail}\n\
+                     Live streaming prices are NOT affected. Tomorrow's start \
+                     retries automatically.\n\
+                     What to do RIGHT NOW:\n\
+                     1. Nothing urgent — the affected recording is off for \
+                     today only.\n\
+                     2. If this repeats daily, the Groww contract list has a \
+                     problem — check with the broker."
+                )
+            }
+            Self::GrowwChain1mProbeVerdict { ok, detail } => {
+                let detail = html_escape(detail);
+                if *ok {
+                    format!(
+                        "\u{2705} <b>Groww option chain check PASSED</b>\n\
+                         Today's one-time check pulled the Groww option chain \
+                         successfully. Measured: {detail}\n\
+                         Recording is currently switched OFF. To start \
+                         recording it minute-by-minute: turn ON the Groww \
+                         option chain setting and restart the app."
+                    )
+                } else {
+                    format!(
+                        "\u{1f514} <b>Groww option chain check did NOT pass</b>\n\
+                         Today's one-time check could not pull a usable Groww \
+                         option chain. Measured: {detail}\n\
+                         Nothing is broken — recording is switched off and \
+                         stays off. Tomorrow's start checks again."
+                    )
+                }
             }
             Self::ChainFetchDegraded {
                 consecutive_failed_minutes,
@@ -3175,12 +3461,18 @@ impl NotificationEvent {
             Self::EndOfDayDigest { .. } => "EndOfDayDigest",
             Self::CrossVerify1mSummary { .. } => "CrossVerify1mSummary",
             Self::CrossVerify1mAborted { .. } => "CrossVerify1mAborted",
+            Self::TfConsistencySummary { .. } => "TfConsistencySummary",
+            Self::TfConsistencyAborted { .. } => "TfConsistencyAborted",
             Self::Spot1mFetchDegraded { .. } => "Spot1mFetchDegraded",
             Self::Spot1mFetchRecovered { .. } => "Spot1mFetchRecovered",
             Self::GrowwSpot1mFetchDegraded { .. } => "GrowwSpot1mFetchDegraded",
             Self::GrowwSpot1mFetchRecovered { .. } => "GrowwSpot1mFetchRecovered",
             Self::Spot1mSidNotServed { .. } => "Spot1mSidNotServed",
             Self::Spot1mSidServedRecovered { .. } => "Spot1mSidServedRecovered",
+            Self::GrowwChain1mFetchDegraded { .. } => "GrowwChain1mFetchDegraded",
+            Self::GrowwChain1mFetchRecovered { .. } => "GrowwChain1mFetchRecovered",
+            Self::GrowwChain1mExpiryUnresolved { .. } => "GrowwChain1mExpiryUnresolved",
+            Self::GrowwChain1mProbeVerdict { .. } => "GrowwChain1mProbeVerdict",
             Self::ChainFetchDegraded { .. } => "ChainFetchDegraded",
             Self::ChainFetchRecovered { .. } => "ChainFetchRecovered",
             Self::ChainEntitlementAbsent { .. } => "ChainEntitlementAbsent",
@@ -3460,6 +3752,23 @@ impl NotificationEvent {
                 }
             }
             Self::CrossVerify1mAborted { .. } => Severity::High,
+            // Daily timeframe-consistency verifier (2026-07-13): severity
+            // derives from status_label itself — the verifier's
+            // flush-adjusted verdict (L6 fix: a count-derived re-check can
+            // contradict the label on edge days, e.g. blind-without-
+            // degrade). Info ONLY for a real `pass` or a feed-off
+            // `no_data` day (which must never page High every day of a
+            // disabled-feed month); everything else — mismatch, degraded,
+            // blind — is High (audit Rule 11: an empty compare set never
+            // reads as pass).
+            Self::TfConsistencySummary { status_label, .. } => {
+                if status_label == "pass" || status_label == "no_data" {
+                    Severity::Info
+                } else {
+                    Severity::High
+                }
+            }
+            Self::TfConsistencyAborted { .. } => Severity::High,
             // Per-minute spot 1m REST pipeline (2026-07-12): the degraded
             // page is the edge-triggered escalation (3 consecutive fully-
             // failed minutes); the recovery is a positive Info ping.
@@ -3472,6 +3781,14 @@ impl NotificationEvent {
             Self::GrowwSpot1mFetchRecovered { .. } => Severity::Info,
             Self::Spot1mSidNotServed { .. } => Severity::High,
             Self::Spot1mSidServedRecovered { .. } => Severity::Info,
+            Self::GrowwChain1mFetchDegraded { .. } => Severity::High,
+            Self::GrowwChain1mFetchRecovered { .. } => Severity::Info,
+            // One page per day when an underlying's chain recording could
+            // not start (never a guessed expiry) — actionable, not fatal.
+            Self::GrowwChain1mExpiryUnresolved { .. } => Severity::High,
+            // The probe is informational either way — nothing was expected
+            // to record while the pipeline is switched off.
+            Self::GrowwChain1mProbeVerdict { .. } => Severity::Info,
             Self::ChainFetchDegraded { .. } => Severity::High,
             Self::ChainFetchRecovered { .. } => Severity::Info,
             // HIGH only when the pipeline was ON and expected to record;
@@ -3643,6 +3960,11 @@ impl NotificationEvent {
             // that re-renders the body — Severity::Info would otherwise be
             // batched by the default routing.
             Self::CrossVerify1mSummary { .. } => DispatchPolicy::Immediate,
+            // Daily timeframe-consistency verifier (2026-07-13): the
+            // once-per-day post-market summary must arrive AT 3:40 PM IST,
+            // not coalesced into a batching window — the exact
+            // CrossVerify1mSummary rationale above.
+            Self::TfConsistencySummary { .. } => DispatchPolicy::Immediate,
             // Dual-feed scorecard (2026-07-10): the once-per-day 15:45 IST
             // digest must arrive AT 15:45 (post-close = off-hours, so the
             // default Info routing would coalesce it) — same rationale as
@@ -7090,6 +7412,30 @@ mod tests {
         assert!(msg.contains("NOT affected"), "got: {msg}");
     }
 
+    // -----------------------------------------------------------------------
+    // GrowwChain1m* events (2026-07-13 — Groww per-minute option-chain
+    // leg, PR-3 of the Groww REST plan)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_groww_chain_1m_fetch_degraded_is_high_with_action_lines() {
+        let event = NotificationEvent::GrowwChain1mFetchDegraded {
+            consecutive_failed_minutes: 3,
+            minute_ist: "10:42 AM".to_string(),
+        };
+        assert_eq!(event.topic(), "GrowwChain1mFetchDegraded");
+        assert_eq!(event.severity(), Severity::High);
+        let msg = event.to_message();
+        assert!(msg.contains("Groww"), "got: {msg}");
+        assert!(msg.contains("FAILING"), "got: {msg}");
+        assert!(msg.contains("3 minutes in a row"), "got: {msg}");
+        // IST 12-hour timestamp (Telegram commandment 9).
+        assert!(msg.contains("10:42 AM IST"), "got: {msg}");
+        assert!(msg.contains("What to do RIGHT NOW"), "got: {msg}");
+        // Honest scope line: the live WS pipelines are untouched.
+        assert!(msg.contains("NOT affected"), "got: {msg}");
+    }
+
     #[test]
     fn test_spot_1m_sid_served_recovered_is_info_positive_ping() {
         let event = NotificationEvent::Spot1mSidServedRecovered {
@@ -7106,6 +7452,63 @@ mod tests {
         assert!(msg.contains("12 missed"), "got: {msg}");
         // No false-OK: recovery never claims the missing minutes came back.
         assert!(msg.contains("nothing is made up"), "got: {msg}");
+    }
+
+    #[test]
+    fn test_groww_chain_1m_fetch_recovered_is_info_positive_ping() {
+        let event = NotificationEvent::GrowwChain1mFetchRecovered {
+            minute_ist: "10:45 AM".to_string(),
+            failed_minutes: 4,
+        };
+        assert_eq!(event.topic(), "GrowwChain1mFetchRecovered");
+        assert_eq!(event.severity(), Severity::Info);
+        let msg = event.to_message();
+        assert!(msg.contains("Groww"), "got: {msg}");
+        assert!(msg.contains("recovered"), "got: {msg}");
+        assert!(msg.contains("10:45 AM IST"), "got: {msg}");
+        assert!(msg.contains("4 failed"), "got: {msg}");
+        // No false-OK: recovery never claims the missing minutes came back.
+        assert!(msg.contains("nothing is made up"), "got: {msg}");
+    }
+
+    #[test]
+    fn test_groww_chain_1m_expiry_unresolved_is_high_and_escapes_detail() {
+        let event = NotificationEvent::GrowwChain1mExpiryUnresolved {
+            detail: "SENSEX: no usable option rows <script>".to_string(),
+        };
+        assert_eq!(event.topic(), "GrowwChain1mExpiryUnresolved");
+        assert_eq!(event.severity(), Severity::High);
+        let msg = event.to_message();
+        assert!(msg.contains("could NOT start"), "got: {msg}");
+        assert!(msg.contains("never"), "expiry never guessed: {msg}");
+        // Hostile detail is HTML-escaped, never raw.
+        assert!(!msg.contains("<script>"), "got: {msg}");
+        assert!(msg.contains("&lt;script&gt;"), "got: {msg}");
+        assert!(msg.contains("What to do RIGHT NOW"), "got: {msg}");
+    }
+
+    #[test]
+    fn test_groww_chain_1m_probe_verdict_is_info_both_ways() {
+        let passed = NotificationEvent::GrowwChain1mProbeVerdict {
+            ok: true,
+            detail: "NIFTY: 102 strikes in 0.8s".to_string(),
+        };
+        assert_eq!(passed.topic(), "GrowwChain1mProbeVerdict");
+        assert_eq!(passed.severity(), Severity::Info);
+        let msg = passed.to_message();
+        assert!(msg.contains("PASSED"), "got: {msg}");
+        assert!(msg.contains("102 strikes"), "got: {msg}");
+        assert!(msg.contains("switched OFF"), "honest state: {msg}");
+
+        let failed = NotificationEvent::GrowwChain1mProbeVerdict {
+            ok: false,
+            detail: "http 403 <b>hostile</b>".to_string(),
+        };
+        assert_eq!(failed.severity(), Severity::Info);
+        let msg = failed.to_message();
+        assert!(msg.contains("did NOT pass"), "got: {msg}");
+        assert!(!msg.contains("<b>hostile</b>"), "escaped: {msg}");
+        assert!(msg.contains("Nothing is broken"), "got: {msg}");
     }
 
     // -----------------------------------------------------------------------

@@ -50,10 +50,20 @@ pub mod option_chain_1m_boot;
 // 1m OHLCV for the 3 spot indices → `spot_1m_rest` feed='groww' + the
 // `rest_fetch_audit` per-fetch forensics rows.
 pub mod groww_spot_1m_boot;
+// Groww per-minute option-chain REST leg (operator grant 2026-07-13 — PR-3
+// of the Groww per-minute REST plan): the current-expiry chain for the 3
+// underlyings, sequenced after the Groww spot leg → `option_chain_1m`
+// feed='groww' + `rest_fetch_audit` leg='chain_1m' forensics rows.
+pub mod groww_option_chain_1m_boot;
 // Dual-feed scoreboard PR-A (operator 2026-07-10): boot-time process-death
 // reconciler + the 15:45 IST daily Dhan-vs-Groww aggregation + the Telegram
 // scorecard summary (SCOREBOARD-01 family).
 pub mod feed_scoreboard_boot;
+// Daily timeframe-consistency verifier (operator 2026-07-13): at 15:40 IST,
+// recompute every higher-TF candle (2m..4h) from the stored 1m rows and
+// compare against the persisted TF tables — Dhan verifies TODAY, Groww
+// verifies the PREVIOUS trading day (TF-VERIFY-01/02).
+pub mod tf_consistency_boot;
 pub mod tick_conservation_boot;
 // PR #8a (2026-05-19) — Slice 1: 09:15:00 IST `DayOhlcTracker::arm_sid()`
 // boot wiring per `index-day-ohlc-tracker-error-codes.md`. Closes the

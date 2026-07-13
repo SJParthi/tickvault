@@ -7,6 +7,15 @@
 
 ---
 
+> **⚠ RETIREMENT AUTHORIZED 2026-07-13 (deletion lands with the Phase C PRs):**
+> `NTM-CONSTITUENCY-01` (`NtmConstituency01SourceDegraded`) retires with the Dhan live WS
+> — its emit site is the DHAN-side universe-build degrade path (Q1/Q3, 2026-07-13;
+> `websocket-connection-scope-lock.md` "2026-07-13 Amendment"). The §31 NTM contract
+> itself LIVES ON on the GROWW side: the Groww watch build fetches the same niftyindices
+> CSV via its OWN hardened client and resolves against the GROWW master
+> (`build_isin_token_map` — Phase B map, Verified); its failure surface is the Groww
+> watch-build degrade path, not this code. Content below retained for historical audit.
+
 ## §0. Why this code exists
 
 §31 (operator lock 2026-06-06) makes the live subscription the **NTM union** — indices + F&O

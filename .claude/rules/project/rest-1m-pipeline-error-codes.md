@@ -337,6 +337,13 @@ Dhan-shaped 403 naming "subscription" for a non-entitlement reason still
 classifies absent — bounded to ONE HIGH page, day-scoped, the WS feed
 untouched; triage step 2 (the Dhan portal check) disambiguates.
 
+**2026-07-13 — the GROWW chain leg NEVER emits CHAIN-01:** Groww's chain
+endpoint has no separate Data-API entitlement question (the shared-minter
+access token is the only gate) and no expirylist endpoint (expiries come
+from the already-ingested daily instruments CSV), so a Groww auth /
+transport reject is a CHAIN-02 transient (`feed = "groww"`), never a
+day-killing CHAIN-01.
+
 ## §2c. CHAIN-02 — per-minute option-chain fetch degraded
 
 **Severity:** High. **Auto-triage safe:** Yes (the degrade already
@@ -385,6 +392,44 @@ the `stage` field — the SPOT1M-01 taxonomy applied to the chain leg):
 re-poll ladder (the chain is a live snapshot, not a just-sealed candle) —
 a failed minute is a counted, coded, visible gap; re-appends UPSERT in
 place so a later manual re-run backfills safely.
+
+**2026-07-13 — the GROWW chain leg emits this SAME code (no new
+variant):** the Groww per-minute option-chain leg
+(`crates/app/src/groww_option_chain_1m_boot.rs`, plan
+`.claude/plans/active-plan-groww-rest-1m.md` PR-3) reuses `CHAIN-02` with
+the SAME stage taxonomy, distinguished by a **`feed = "groww"` field on
+every emit** (the Dhan sites stay field-less — grep `feed="groww"` to
+split). Groww-specific additions: `stage="probe"` (the boot-time
+probe-only path — one bounded chain GET, verdict via Info Telegram,
+persists nothing), `stage="expiry_unresolved"` (the daily Groww
+instruments CSV carried no FNO CE/PE rows ≥ today for an underlying —
+that underlying degrades for the day, coded + counted by
+`tv_groww_chain1m_expiry_unresolved_total` + the typed HIGH
+`GrowwChain1mExpiryUnresolved` Telegram; NEVER guessed), and
+`stage="strikes_truncated"` (a hostile/oversized chain body hit the
+strike cap — truncated + counted, never unbounded). `stage="token_read"`
+lives on the shared token cache (`tv_groww_chain1m_token_read_failed_total`
+— re-read paced ≥60 s, NEVER minted). Sequencing mirrors the Dhan leg:
+the chain fires on the spot leg's watch signal after every spot fire,
+bounded by the ~2.5 s fallback timer; one request per underlying per
+minute, sequential, with a defensive 1 s min-gap (Groww documents no
+chain-specific rate rule). Groww counters mirror the Dhan names under the
+`tv_groww_chain1m_*` prefix (`fetch_total{outcome}`, `close_to_data_ms`,
+`fetch_duration_ms`, `strikes_per_chain`, `legs_per_chain`,
+`payload_bytes`, `rate_limited_total`, `boundary_skipped_total`,
+`underlying_budget_exceeded_total`, `invalid_strikes_total`,
+`task_respawn_total{reason}`). The typed pages are the Groww-specific
+`GrowwChain1mFetchDegraded` / `GrowwChain1mFetchRecovered` Telegram
+events (same 3-minute persist-gated edge). Forensics: one
+`rest_fetch_audit` row per (minute, underlying) with `leg='chain_1m'`,
+`attempts=1` (no re-poll ladder — live snapshot semantics). Gate note
+(2026-07-13): the Groww chain leg shipped base.toml DEFAULT-OFF
+(probe-only); the first live probe PASSED the same night (build
+`eeca0ec`, ~11:47 PM IST) and `[groww_option_chain_1m].enabled` flipped
+to `true` in base.toml — dated record in
+`groww-second-feed-scope-2026-06-19.md` §38.6; the serde DEFAULT stays
+OFF (fail-safe) and `probe_and_report` stays `true` (inert while
+enabled; the rollback canary).
 
 ## §2d. CHAIN-03 — option_chain_1m persist failed
 
@@ -448,6 +493,23 @@ the failure edge honestly counts it fully-failed (persist-gated). A later
 re-run/backfill of the same minute UPSERTs in place (DEDUP-idempotent)
 and heals the partial rows.
 
+**2026-07-13 — the GROWW chain leg emits this SAME code (no new
+variant):** the Groww leg writes the SAME `option_chain_1m` table with
+`feed='groww'` rows (`feed` is already in the DEDUP key — the two feeds'
+rows never collide), same stage taxonomy (`append`/`flush`; the
+ensure-DDL stages are shared — one table, one DDL), with a **`feed =
+"groww"` field on every emit** and counters under
+`tv_groww_chain1m_persist_errors_total{stage}` +
+`tv_groww_chain1m_rows_discarded_total`. Two columns added 2026-07-13 via
+ALTER-ADD self-heal for the Groww leg: `rho` (Groww supplies it; Dhan
+does not) and `close_to_data_ms` (per-row latency stamp — the ONLY
+freshness signal, since Groww's chain response carries NO timestamp).
+Dhan rows leave both NULL (the Dhan emit path is untouched). The Groww
+leg's `rest_fetch_audit` forensics failures reuse the SPOT1M-02 stage
+names `audit_append` / `audit_flush` but are coded CHAIN-03 with
+`leg='chain_1m'` context — a forensics write failure NEVER affects the
+fetch loop or the failure edge.
+
 ## §2e. CHAIN-04 — day-start expirylist warmup failed (pipeline down for the day)
 
 **Severity:** High. **Auto-triage safe:** Yes (the next trading-day boot
@@ -496,6 +558,13 @@ boot re-probes).
 failing expirylist would be a reject storm for zero benefit; one loud
 page + a clean daily boundary is the honest degrade.
 
+**2026-07-13 — the GROWW chain leg NEVER emits CHAIN-04:** there is no
+Groww expirylist endpoint — the CURRENT expiry per underlying is resolved
+from the already-ingested daily Groww instruments CSV (nearest ≥ today,
+never-roll). A master that carries no usable FNO rows for an underlying
+degrades THAT underlying via CHAIN-02 `stage="expiry_unresolved"`
+(`feed = "groww"`), never a whole-pipeline CHAIN-04 day-kill.
+
 ## §3. Delivery boundary (honest — no false-OK)
 
 All six codes (SPOT1M-01/02 + CHAIN-01..04) are **log-sink-only today**: NO `error_code_alerts` map entry in
@@ -516,16 +585,19 @@ This rule activates when editing:
 - `crates/app/src/spot_1m_rest_boot.rs`
 - `crates/app/src/option_chain_1m_boot.rs`
 - `crates/app/src/groww_spot_1m_boot.rs` (the 2026-07-13 Groww leg)
+- `crates/app/src/groww_option_chain_1m_boot.rs` (the 2026-07-13 Groww
+  chain leg)
 - `crates/storage/src/spot_1m_rest_persistence.rs`
 - `crates/storage/src/option_chain_1m_persistence.rs`
 - `crates/storage/src/rest_fetch_audit_persistence.rs` (the 2026-07-13
   per-fetch forensics table)
 - `crates/common/src/config.rs` (`Spot1mRestConfig` / `OptionChain1mConfig`
-  / `GrowwSpot1mConfig`)
+  / `GrowwSpot1mConfig` / `GrowwOptionChain1mConfig`)
 - Any file containing `SPOT1M-01`, `SPOT1M-02`, `Spot1m01FetchDegraded`,
   `Spot1m02PersistFailed`, `spot_1m_rest`, `SPOT_1M_REST_INDICES`,
   `tv_spot1m_fetch_total`, `CHAIN-01`, `CHAIN-02`, `CHAIN-03`, `CHAIN-04`,
   `Chain01EntitlementAbsent`, `Chain02FetchDegraded`,
   `Chain03PersistFailed`, `Chain04ExpirylistFailed`, `option_chain_1m`,
-  `tv_chain1m_fetch_total`, `GROWW_SPOT_1M_SYMBOLS`, `rest_fetch_audit`, or
-  `tv_groww_spot1m_fetch_total`
+  `tv_chain1m_fetch_total`, `GROWW_SPOT_1M_SYMBOLS`, `rest_fetch_audit`,
+  `tv_groww_spot1m_fetch_total`, `GROWW_CHAIN_1M_UNDERLYINGS`, or
+  `tv_groww_chain1m_fetch_total`

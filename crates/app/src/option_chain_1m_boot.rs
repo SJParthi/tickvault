@@ -1223,7 +1223,11 @@ async fn wait_until_chain_fire(
 /// The signal-or-timer core of [`wait_until_chain_fire`], parameterized on
 /// the fallback duration so the tokio tests exercise every arm with
 /// millisecond timers (no `test-util` paused clock available).
-async fn wait_for_signal_or_fallback(
+/// `pub(crate)` since 2026-07-13: the Groww chain leg
+/// (`groww_option_chain_1m_boot.rs`) reuses this exact core with its own
+/// fallback constant — one sequencing implementation, two feeds.
+// TEST-EXEMPT: exercised by test_wait_until_chain_fire_signal_wakes_early_and_fallback_bounds + the stale-wake tokio tests below (visibility widened only).
+pub(crate) async fn wait_for_signal_or_fallback(
     fallback_ms: u64,
     fire_secs_of_day: u32,
     spot_rx: &mut Option<tokio::sync::watch::Receiver<Option<u32>>>,
