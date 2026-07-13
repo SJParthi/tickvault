@@ -15,6 +15,33 @@ PR-C1 is the REWIRES-ONLY precursor of the Phase C deletion PRs (ZERO deletions;
 3. **Intraday-parser relocation (pure move, zero behavior change).** `MinuteCandle`, `intraday_request_body`, `intraday_utc_secs_to_ist_minute_nanos` (the parser's own IST-bucket helper) and `parse_intraday_1m_candles` (+ their 5 unit tests) move from `crates/app/src/cross_verify_1m_boot.rs` to the new `crates/app/src/dhan_intraday_parse.rs`; `cross_verify_1m_boot.rs`, `spot_1m_rest_boot.rs` AND `groww_spot_1m_boot.rs` (the third consumer, added by PR #1507) re-import from the new home — so Phase C can delete `cross_verify_1m_boot.rs` without orphaning the §8/§9 spot legs.
 4. **Groww FUTIDX de-gate (the §36.7 mandate must not depend on a build feature).** Remove the `daily_universe_fetcher` cfg gates from `crates/core/src/instrument/index_futures.rs` (+ its two compile-time deps `csv_parser.rs` + `index_extractor.rs` — the minimal transitive closure; both are pure parse/canonicalize modules with no feature-only deps) and from the Groww extraction/audit/emission sites in `crates/core/src/feed/groww/instruments.rs` (extract_index_future_entries + GrowwIndexFuture + collect_fut_underlying_symbols_seen + groww_indices_absent_vs_dhan + the index-coverage audit block + the §36 selection/emission blocks + their tests); delete the now-dead `#[cfg(not(feature))]` empty-futures fallbacks. `shared_master_writer.rs` gates + the `daily_universe_fetcher` feature itself stay INTACT (SEBI-table gating — ruling Q3 scope). New ratchet pins: `index_futures.rs` carries no feature gate; the Groww extraction call is unconditional.
 
+### Boot-notify hotfix (folded 2026-07-13 — coordinator fast-path decision)
+
+**Attribution:** the READY + watchdog-pinger implementation is taken from PR #1515's app-side work (branch `claude/deploy-grow-hang-fix`): commit `170ac6d8`'s main.rs hunk (folded as a path-limited apply — that commit also edits deploy-aws.yml, which stays in #1515) + a `git cherry-pick -x c1a50504` (the complete reviewed app-side state: process-global pinger + 60→300s liveness widening; that commit is REVERTED on the #1515 branch per the coordinator re-scope — #1515 narrows to deploy-side; the app half ships HERE). Coordinator fast-path decision dated 2026-07-13.
+
+**The bug (box-verified):** tickvault.service is `Type=notify` + `WatchdogSec=60`. (1) `notify_systemd_ready()` fired only on Dhan-gated paths (FAST arm + inside `start_dhan_lane`) — a `dhan_enabled=false` boot (Phase A, #1496) left systemd `activating` forever → `systemctl restart` never returned → 5 consecutive hung prod deploys. (2) The only `WATCHDOG=1` pingers (`spawn_heartbeat_watchdog`) were equally Dhan-gated (fast arm; lane-owned + aborted on teardown) — fixing READY alone would SIGABRT the box at t+60s. (3) The Dhan-OFF `tv_boot_completed` emit's 60s one-shot window would false-page the 08:40 boot-heartbeat alarm on any merely-slow cold Groww watch-list build.
+
+5. **READY=1 on the Dhan-OFF arm** (main.rs, after the lane gate's else-arm, before `run_process_runloop`): `if !config.feeds.dhan_enabled { infra::notify_systemd_ready(); emit_boot_completed_when_feed_live(..., false).await; }` — READY first (unconditional for the arm; systemd start-job release is never held hostage to feed liveness), then the feed-liveness-gated `tv_boot_completed` (Rule 11: a dead Groww still withholds the metric).
+6. **Process-global WATCHDOG=1 pinger** in the SHARED boot prefix (before the fast/slow split, the lane gate, and every READY site), unconditional on feed config, process-lifetime (owned by no lane, never torn down): pings `infra::notify_systemd_watchdog()` every `WATCHDOG_INTERVAL_SECS` (30s) = half of the unit's `WatchdogSec=60` (≥2 pings per window). Extra pings alongside the lane-owned heartbeat tasks are harmless (each resets the timer); also closes the pre-existing PR-E hole where a runtime Dhan disable aborted the ONLY pinger.
+7. **`BOOT_COMPLETED_FEED_LIVENESS_WAIT_SECS` widened 60 → 300** — covers a slow-but-good cold Groww build while still resolving before the 08:40 IST alarm evaluation for the 08:30 boot; a genuinely dead feed still withholds the metric (loud `error!` at the window edge names the dead feed). This is the coordinator's fix-(3) "generous timeout with a loud log" option; a poll-until-emitted wrapper was drafted and DROPPED in favor of this reviewed state (see scratchpad `superseded-hand-rolled.diff` in the session record).
+
+### Boot-notify hotfix — Failure Modes
+- READY with no pinger (SIGABRT loop): impossible by source order — the pinger spawn precedes every READY site; ratcheted.
+- Pinger feed-gated again: ratcheted (`systemd_boot_notify_guard.rs` asserts no `if config.feeds.dhan_enabled` above the spawn inside `main()`).
+- False boot-heartbeat page on slow Groww build: bounded by the 300s window; a >300s build still withholds → page → honest (a build that slow warrants eyes).
+- Local `cargo run`/tests: all notify calls no-op without `$NOTIFY_SOCKET` — zero behavior change outside systemd.
+
+### Boot-notify hotfix — Test Plan
+- NEW ratchet `crates/app/tests/systemd_boot_notify_guard.rs` (4 tests): READY ≥3 real sites + Dhan-OFF site positioned + gated; pinger spawn exactly-once + shared-prefix source order (before fast split, lane gate, first READY) + no feed ON-gate above it + real body (notify call + interval const, Rule 14); `WATCHDOG_INTERVAL_SECS × 2 ≤ WatchdogSec` parsed from the REAL unit file + `Type=notify` pin; comment-stripper non-vacuity self-test.
+
+### Boot-notify hotfix — Observability
+- `tv_boot_completed` restored on Dhan-OFF boots (the 08:40 IST boot-heartbeat alarm's signal — previously lane-owned, would have false-paged every morning).
+- systemd journal: READY/WATCHDOG visible via `systemctl status tickvault` (activating→active transition is the deploy-unblock evidence).
+- No new ErrorCode, no new metric, no hot-path involvement (boot cold path only).
+
+### Boot-notify hotfix — Rollback
+- Pure code revert of the two folded commits restores the pre-hotfix state (deploys hang again on dhan-off boots — rollback only meaningful together with a Phase-A config rollback).
+
 ## Edge Cases
 
 - Off-hours boot: the stack's order-update spawn parks on `defer_until_market_open_ist` (order_update_connection.rs:115) exactly as the lane spawn did — no flap, no reconnect storm.
@@ -68,6 +95,13 @@ Single revert of this PR restores: the order-update WS spawned only from the (de
 - [x] Item 4 — Groww FUTIDX de-gate (selector + minimal dep closure + Groww sites)
   - Files: crates/core/src/instrument/index_futures.rs, crates/core/src/instrument/csv_parser.rs, crates/core/src/instrument/index_extractor.rs, crates/core/src/instrument/mod.rs, crates/core/src/feed/groww/instruments.rs
   - Tests: futidx_selector_is_not_feature_gated (new ratchet), existing index_futures + groww instruments suites now running in BOTH feature modes
+
+- [x] Item 5 — boot-notify hotfix: READY=1 on the Dhan-OFF arm + process-global WATCHDOG=1 pinger + 60→300s boot-completed liveness window (folded from PR #1515 app-side commits 170ac6d8 + c1a50504 per coordinator fast-path decision 2026-07-13)
+  - Files: crates/app/src/main.rs
+  - Tests: test_ready_notify_covers_all_boot_paths, test_watchdog_pinger_is_shared_prefix_feed_unconditional_and_real, test_pinger_interval_within_unit_watchdog_budget, test_comment_stripper_removes_commented_needles
+- [x] Item 6 — boot-notify ratchet guard
+  - Files: crates/app/tests/systemd_boot_notify_guard.rs
+  - Tests: test_ready_notify_covers_all_boot_paths, test_watchdog_pinger_is_shared_prefix_feed_unconditional_and_real, test_pinger_interval_within_unit_watchdog_budget
 
 ## Scenarios
 
