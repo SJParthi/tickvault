@@ -112,6 +112,12 @@ pub(crate) const DAY_PARTITIONED_TABLES: &[&str] = &[
     // operator retention follow-up in option_chain_1m_persistence.rs);
     // same DAY partitioning + retention class; `feed` is in the DEDUP key.
     "option_chain_1m",
+    // TF-VERIFY-01/02 (2026-07-13, daily timeframe-consistency verifier):
+    // one row per finding cell where a stored higher-TF candle disagrees
+    // with its recompute-from-1m — bounded at 10K rows/run by
+    // TF_VERIFY_MAX_AUDIT_ROWS_PER_RUN, normally ~0; same SEBI-audit class
+    // + DAY partitioning as cross_verify_1m_audit; `feed` is in the DEDUP key.
+    "tf_consistency_audit",
 ];
 
 /// Tables EXEMPT from retention sweeping — NEVER detached or dropped.
