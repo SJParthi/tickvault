@@ -443,6 +443,24 @@ async fn main() -> Result<()> {
                  — falling back to the config default per-feed enabled state"
             );
         }
+        // 2026-07-13 operator directive ("now remove this entire Dhan live
+        // websocket feed instruments subscription even entire live websocket
+        // feed itself"): the Dhan overlay is narrow-only — config-off is
+        // AUTHORITATIVE for the retired Dhan live WS lane, so a STALE
+        // pre-directive webpage toggle (`dhan_enabled: true` in
+        // data/feed-state.json) can never resurrect it. One boot-time warn
+        // makes the suppression visible (never silent).
+        if tickvault_api::feed_state_persist::dhan_overlay_suppressed(
+            &config.feeds,
+            persisted.as_ref(),
+        ) {
+            warn!(
+                "feed-state overlay requested dhan_enabled=true but the config says false — \
+                 overlay SUPPRESSED: the Dhan live WS lane is retired by operator directive \
+                 2026-07-13 (Dhan is REST-only; Groww is the live feed). Re-enabling requires \
+                 a config change + restart."
+            );
+        }
         config.feeds = tickvault_api::feed_state_persist::overlay_feeds(config.feeds, persisted);
     }
     let feeds = &config.feeds;
@@ -3276,6 +3294,38 @@ async fn main() -> Result<()> {
             groww_enabled = config.feeds.groww_enabled,
             "DHAN LANE SKIPPED (dhan_enabled=false) — shared-infra-only runtime; \
              the unified run-loop keeps the API + seal-writer + aggregator alive"
+        );
+        // ===================================================================
+        // Phase A (operator directive 2026-07-13 — "now remove this entire
+        // Dhan live websocket feed instruments subscription even entire live
+        // websocket feed itself"): the Dhan live WS lane is retired, but the
+        // Dhan REST retained surface (token/auth stack, REST canary,
+        // per-minute spot_1m_rest, per-minute option_chain_1m + entitlement
+        // probe) must KEEP RUNNING. Before Phase A those subsystems lived
+        // exclusively inside the lane / fast-boot arm and died with it. The
+        // REST-only stack brings them up WITHOUT any WebSocket.
+        //
+        // Placement notes (mutual exclusion + reachability):
+        //   - Spawned ONLY here, in the Dhan-OFF branch — the lane (whose
+        //     `spawn_post_market_tasks` seam owns these subsystems on a
+        //     Dhan-ON boot) can never run alongside it, and the runtime
+        //     cold-start supervisor REFUSES a lane start while the boot
+        //     config says Dhan is off (see run_dhan_lane_runtime_supervisor).
+        //   - The FAST crash-recovery arm is filtered on
+        //     `config.feeds.dhan_enabled` (its `fast_cache.filter`), so with
+        //     Dhan off it never fires its early return — every Dhan-off boot
+        //     reaches THIS slow-path site. The metrics recorder + notifier +
+        //     shared infra are all installed well above (`build_shared_infra`).
+        //   - Bring-up is a background task with internal retry-forever
+        //     loops: it never blocks boot and never halts the process.
+        // ===================================================================
+        let _dhan_rest_stack_monitor = tickvault_app::dhan_rest_stack::spawn_dhan_rest_stack(
+            tickvault_app::dhan_rest_stack::DhanRestStackParams {
+                config: std::sync::Arc::new(config.clone()),
+                notifier: std::sync::Arc::clone(&notifier),
+                calendar: std::sync::Arc::clone(&trading_calendar),
+                feed_runtime: std::sync::Arc::clone(&feed_runtime),
+            },
         );
         None
     };
@@ -10773,6 +10823,10 @@ pub async fn run_dhan_lane_runtime_supervisor(
 ) {
     use tickvault_api::feed_state::{Feed, LaneState};
     let mut active_task: Option<tokio::task::JoinHandle<()>> = None;
+    // 2026-07-13 refusal latch — edge-triggered once per attempt-episode
+    // (audit Rule 4): set on the first refused cold-start of an ON period,
+    // re-armed when the operator toggles Dhan OFF again. Never per-2s spam.
+    let mut cold_start_refusal_logged = false;
     loop {
         // Idle (zero Dhan work) until the runtime context exists. The context is
         // populated by `main()` right after `build_shared_infra`, which runs in
@@ -10935,12 +10989,41 @@ pub async fn run_dhan_lane_runtime_supervisor(
             feed_runtime.dhan_lane_state(),
             active_task.is_some(),
         ) {
-            info!(
-                "[dhan-lane] runtime supervisor spawning cold-start (boot-OFF Dhan enabled at \
-                 runtime, lane is Off)"
-            );
-            let task = tokio::spawn(run_dhan_lane_cold_start(std::sync::Arc::clone(ctx)));
-            active_task = Some(task);
+            // 2026-07-13 operator directive ("now remove this entire Dhan
+            // live websocket feed instruments subscription even entire live
+            // websocket feed itself"): with `feeds.dhan_enabled = false` in
+            // the effective boot config, the Dhan REST-only stack
+            // (`dhan_rest_stack.rs`) already owns the dual-instance SSM lock
+            // + the TokenManager. A runtime cold-start of the FULL lane
+            // (POST /api/feeds/dhan → desired-ON here) would collide with it
+            // — Step 6a-prime sees AlreadyHeld → DHAN-LANE-03 retry loop +
+            // RESILIENCE-01 pages against our OWN process. The supervisor
+            // therefore REFUSES the cold-start while the boot config says
+            // Dhan is off; re-enabling the live WS lane requires a config
+            // change + restart (and a fresh dated operator quote per
+            // production_config_wiring.rs).
+            if !ctx.config.feeds.dhan_enabled {
+                if !cold_start_refusal_logged {
+                    warn!(
+                        "Dhan live WS lane retired by operator directive 2026-07-13 — runtime \
+                         enable refused; config change + restart required (the Dhan REST-only \
+                         stack keeps running; toggling the feed OFF re-arms this notice)"
+                    );
+                    cold_start_refusal_logged = true;
+                }
+            } else {
+                info!(
+                    "[dhan-lane] runtime supervisor spawning cold-start (boot-OFF Dhan enabled \
+                     at runtime, lane is Off)"
+                );
+                let task = tokio::spawn(run_dhan_lane_cold_start(std::sync::Arc::clone(ctx)));
+                active_task = Some(task);
+            }
+        }
+        if !desired_on {
+            // Operator toggled Dhan back OFF — re-arm the refusal notice for
+            // the next ON attempt-episode (edge-triggered, audit Rule 4).
+            cold_start_refusal_logged = false;
         }
 
         tokio::time::sleep(DHAN_LANE_RUNTIME_POLL).await;
