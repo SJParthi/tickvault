@@ -11470,7 +11470,7 @@ async fn run_process_runloop(
             )
             .await
             {
-                Ok(mut archiver) => {
+                Ok(Some(mut archiver)) => {
                     let summary = archiver.archive_and_drop_old_partitions().await;
                     info!(
                         tables_scanned = summary.tables_scanned,
@@ -11484,6 +11484,11 @@ async fn run_process_runloop(
                         "post-market partition archive complete (verified S3 copy before every drop)"
                     );
                 }
+                // Review round 1 F1b (fail-closed): no explicit archive
+                // bucket AND no explicit TV_ENVIRONMENT/ENVIRONMENT env var
+                // — archival skipped rather than guessing the prod bucket.
+                // The constructor already logged the actionable warn.
+                Ok(None) => {}
                 Err(err) => {
                     error!(
                         ?err,

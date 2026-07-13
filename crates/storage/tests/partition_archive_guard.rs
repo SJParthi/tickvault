@@ -1,7 +1,7 @@
 //! Ratchet guards for the QuestDB partition archive→verify→drop leg
 //! (2026-07-13 disk-pressure remediation).
 //!
-//! Pins the four load-bearing invariants:
+//! Pins the five load-bearing invariants:
 //! 1. `archive_enabled` defaults FALSE in code (the destructive leg must be
 //!    explicitly configured on; deleting the key = instant rollback).
 //! 2. `config/base.toml` explicitly enables it for the deployed box
@@ -14,6 +14,9 @@
 //!    `VerifiedArchive` type-state proof (private-field struct — the
 //!    compiler enforces archive-verify-before-drop; this scan keeps a
 //!    refactor from adding a second, proof-free drop site).
+//! 5. (Review round 1, F4) the verify decision's INPUTS come from the REAL
+//!    post-export recount + post-upload S3 HeadObject calls — a stubbed
+//!    input would make the fail-closed verify vacuously true.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -155,6 +158,88 @@ fn drop_partition_requires_verified_archive_proof() {
             );
         }
     }
+}
+
+#[test]
+fn verify_inputs_come_from_real_recount_and_head_calls() {
+    // F4 ratchet (review round 1): the fail-closed verify decision is only
+    // as strong as its INPUTS. Pin that `process_one` feeds `verify_archive`
+    // from a REAL post-export recount + a REAL post-upload S3 HeadObject —
+    // a refactor stubbing either input (e.g. `Some(exported.rows)`) would
+    // make the verify vacuously true and let a corrupt archive gate a drop.
+    let archive_src = read_workspace_file("crates/storage/src/partition_archive.rs");
+    let process_one = extract_fn_body(&archive_src, "async fn process_one");
+    assert!(
+        process_one.contains("self.recount_rows("),
+        "process_one must obtain the recount from the real recount_rows() call"
+    );
+    assert!(
+        process_one.contains("self.head_object_len("),
+        "process_one must obtain the S3 length from the real head_object_len() call"
+    );
+    // The two fetched values must be the ones handed to verify_archive —
+    // pin the binding names appearing in the verify_archive call.
+    let verify_call_idx = process_one
+        .find("verify_archive(")
+        .expect("process_one must call verify_archive");
+    let verify_call = &process_one[verify_call_idx..];
+    for needle in ["recount", "s3_len"] {
+        assert!(
+            verify_call.contains(needle),
+            "verify_archive must be fed the fetched `{needle}` value, not a stub"
+        );
+    }
+    // Vacuous-pass tripwires: verify inputs must never be self-satisfied.
+    for forbidden in ["Some(exported.rows)", "Some(exported.gzip_bytes)"] {
+        assert!(
+            !process_one.contains(forbidden),
+            "process_one must never feed verify_archive a self-satisfied \
+             input ({forbidden}) — that makes the verify vacuous"
+        );
+    }
+}
+
+/// Extracts a fn body by brace matching from its signature marker (test-only
+/// source scan; panics loudly on a missing fn so the ratchet never goes
+/// silently vacuous).
+fn extract_fn_body(src: &str, marker: &str) -> String {
+    let start = src
+        .find(marker)
+        .unwrap_or_else(|| panic!("source must contain `{marker}`"));
+    let open = src[start..]
+        .find('{')
+        .map(|i| start + i)
+        .unwrap_or_else(|| panic!("`{marker}` must open a body"));
+    let mut depth = 0usize;
+    for (i, c) in src[open..].char_indices() {
+        match c {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return src[start..=open + i].to_string();
+                }
+            }
+            _ => {}
+        }
+    }
+    panic!("`{marker}` body never closed");
+}
+
+#[test]
+fn extract_fn_body_self_test_is_not_vacuous() {
+    // The F4 ratchet's own scanner must fail loudly on a missing fn and
+    // must capture nested braces correctly — otherwise the ratchet could
+    // silently scan the wrong region and pass vacuously.
+    let sample = "fn a() { if x { y(); } }\nfn b() { z(); }";
+    let body = extract_fn_body(sample, "fn a()");
+    assert!(body.contains("y();"));
+    assert!(
+        !body.contains("z();"),
+        "must stop at fn a()'s closing brace"
+    );
+    let result = std::panic::catch_unwind(|| extract_fn_body(sample, "fn missing()"));
+    assert!(result.is_err(), "a missing marker must panic, never pass");
 }
 
 #[test]
