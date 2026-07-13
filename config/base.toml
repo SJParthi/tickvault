@@ -341,6 +341,16 @@ groww_enabled = false
 # No shared-table writes, no strategy/order wiring, no sidecar changes.
 groww_native_shadow = false
 
+# Groww capture-archive S3 offload (2026-07-13 disk-retention hardening).
+# Rotated sidecar capture archives (data/groww/live-ticks-YYYYMMDD.ndjson)
+# are uploaded to s3://<bucket>/<prefix>/<filename>, VERIFIED (head_object
+# size match), and only then deleted locally after a grace window. Empty
+# bucket = archival OFF (archives kept on disk — the dev-Mac behaviour);
+# the sidecar NEVER deletes a file without a verified S3 copy.
+[feeds.groww]
+capture_archive_s3_bucket = "tv-prod-cold"
+capture_archive_s3_prefix = "groww-capture"
+
 # Groww multi-connection AUTO-SCALE ladder (operator authorization 2026-07-03,
 # §34 of .claude/rules/project/groww-second-feed-scope-2026-06-19.md).
 # enabled = false (the default) keeps the single-connection sidecar path
