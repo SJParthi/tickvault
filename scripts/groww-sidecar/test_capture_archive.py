@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
-"""Unit tests for the 2026-07-13 capture rotation-at-open + verified S3
-offload (prod disk-full remediation).
+"""Unit tests for the 2026-07-13 capture-archive verified S3 offload (prod
+disk-full remediation; review round 1 applied — rotation-at-open moved to
+RUST, see crates/app/src/groww_bridge.rs::rotate_stale_groww_capture_at_open,
+so these tests cover the sidecar-side sweep + pure gates only).
 
 Runnable WITHOUT the growwapi SDK installed:
     cd scripts/groww-sidecar && python3 -m unittest test_capture_archive -v
 
 A stub `growwapi` module is injected before importing groww_sidecar (same
-pattern as test_dedup.py). Tests exercise ONLY the pure gates + the local
-rotate-at-open filesystem path — never the SDK surface, never real S3.
+pattern as test_dedup.py). The F4 sweep tests exercise `_archive_sweep`'s
+ACTUAL delete path against a stubbed S3 client injected via the
+`s3_client_factory` parameter — never real S3.
 """
 import os
 import sys
@@ -15,6 +18,7 @@ import tempfile
 import time
 import types
 import unittest
+from unittest import mock
 
 if "growwapi" not in sys.modules:
     _stub = types.ModuleType("growwapi")
@@ -22,32 +26,18 @@ if "growwapi" not in sys.modules:
     _stub.GrowwFeed = object
     sys.modules["growwapi"] = _stub
 
-from groww_sidecar import (  # noqa: E402  (stub must precede)
+import groww_sidecar  # noqa: E402  (stub must precede)
+from groww_sidecar import (  # noqa: E402
     ARCHIVE_DELETE_GRACE_SECS,
     ARCHIVE_S3_BUCKET_ENV,
     ARCHIVE_S3_PREFIX_ENV,
     _archive_delete_eligible,
     _archive_path,
+    _archive_sweep,
     _collision_free_archive_path,
     _ist_day,
     _list_capture_archives,
-    _rotate_at_open_if_stale,
-    _should_rotate_at_open,
 )
-
-
-class ShouldRotateAtOpen(unittest.TestCase):
-    def test_should_rotate_at_open_previous_day(self):
-        self.assertTrue(_should_rotate_at_open(20649, 20650))
-        self.assertTrue(_should_rotate_at_open(20600, 20650))
-
-    def test_should_rotate_at_open_same_day(self):
-        # An in-day sidecar restart must APPEND, never rotate.
-        self.assertFalse(_should_rotate_at_open(20650, 20650))
-
-    def test_should_rotate_at_open_future_mtime_clock_skew(self):
-        # A future mtime (clock skew) must never rotate today's capture out.
-        self.assertFalse(_should_rotate_at_open(20651, 20650))
 
 
 class CollisionFreeArchivePath(unittest.TestCase):
@@ -85,58 +75,7 @@ class ArchiveDeleteEligible(unittest.TestCase):
         self.assertGreaterEqual(ARCHIVE_DELETE_GRACE_SECS, 45 * 60)
 
 
-class RotateAtOpenFilesystem(unittest.TestCase):
-    def test_rotate_at_open_moves_stale_file(self):
-        with tempfile.TemporaryDirectory() as d:
-            live = os.path.join(d, "live-ticks.ndjson")
-            with open(live, "w", encoding="utf-8") as fh:
-                fh.write('{"ltp":1}\n')
-            # Backdate mtime 2 IST days.
-            stale = time.time() - 2 * 86400
-            os.utime(live, (stale, stale))
-            archived = _rotate_at_open_if_stale(live)
-            self.assertIsNotNone(archived)
-            self.assertFalse(os.path.exists(live))
-            self.assertTrue(os.path.exists(archived))
-            expected = _archive_path(live, _ist_day(stale))
-            self.assertEqual(archived, expected)
-            self.assertEqual(_list_capture_archives(live), [archived])
-
-    def test_rotate_at_open_leaves_today_file(self):
-        with tempfile.TemporaryDirectory() as d:
-            live = os.path.join(d, "live-ticks.ndjson")
-            with open(live, "w", encoding="utf-8") as fh:
-                fh.write('{"ltp":1}\n')
-            self.assertIsNone(_rotate_at_open_if_stale(live))
-            self.assertTrue(os.path.exists(live))
-            self.assertEqual(_list_capture_archives(live), [])
-
-    def test_rotate_at_open_ignores_missing_and_empty(self):
-        with tempfile.TemporaryDirectory() as d:
-            live = os.path.join(d, "live-ticks.ndjson")
-            self.assertIsNone(_rotate_at_open_if_stale(live))  # missing
-            open(live, "w", encoding="utf-8").close()  # empty
-            stale = time.time() - 2 * 86400
-            os.utime(live, (stale, stale))
-            self.assertIsNone(_rotate_at_open_if_stale(live))
-            self.assertTrue(os.path.exists(live))
-
-    def test_rotate_at_open_collision_appends_suffix(self):
-        with tempfile.TemporaryDirectory() as d:
-            live = os.path.join(d, "live-ticks.ndjson")
-            stale = time.time() - 2 * 86400
-            dated = _archive_path(live, _ist_day(stale))
-            with open(dated, "w", encoding="utf-8") as fh:
-                fh.write("prior archive — must not be overwritten\n")
-            with open(live, "w", encoding="utf-8") as fh:
-                fh.write('{"ltp":2}\n')
-            os.utime(live, (stale, stale))
-            archived = _rotate_at_open_if_stale(live)
-            root, ext = os.path.splitext(dated)
-            self.assertEqual(archived, f"{root}-1{ext}")
-            with open(dated, encoding="utf-8") as fh:
-                self.assertIn("must not be overwritten", fh.read())
-
+class ListCaptureArchives(unittest.TestCase):
     def test_list_capture_archives_excludes_live_and_foreign_files(self):
         with tempfile.TemporaryDirectory() as d:
             live = os.path.join(d, "live-ticks.ndjson")
@@ -147,10 +86,134 @@ class RotateAtOpenFilesystem(unittest.TestCase):
             self.assertEqual(_list_capture_archives(live), [keep])
 
 
+class _StubS3:
+    """Minimal boto3-S3-shaped stub: an in-memory object store with
+    injectable upload/head failure modes."""
+
+    def __init__(self, fail_upload=False, head_size_delta=0):
+        self.objects = {}
+        self.fail_upload = fail_upload
+        self.head_size_delta = head_size_delta
+        self.uploads = []
+
+    def upload_file(self, path, bucket, key):
+        if self.fail_upload:
+            raise RuntimeError("stub: upload refused")
+        self.uploads.append(key)
+        self.objects[(bucket, key)] = os.path.getsize(path)
+
+    def head_object(self, Bucket, Key):  # noqa: N803 - boto3 casing
+        size = self.objects.get((Bucket, Key))
+        if size is None:
+            raise KeyError("stub: no such object")
+        return {"ContentLength": size + self.head_size_delta}
+
+
+class ArchiveSweepDeletePath(unittest.TestCase):
+    """F4 (review round 1): pin the verify-before-delete invariant at the
+    ACTUAL `_archive_sweep` call site — a hostile `verified = True` revert
+    must fail these, not only the pure-gate tests."""
+
+    def setUp(self):
+        self._dir = tempfile.TemporaryDirectory()
+        self.base = os.path.join(self._dir.name, "live-ticks.ndjson")
+        self.archive = os.path.join(self._dir.name, "live-ticks-20260712.ndjson")
+        with open(self.archive, "w", encoding="utf-8") as fh:
+            fh.write('{"ltp":1}\n' * 10)
+        # Backdate mtime past any grace so age is never the reason a
+        # "kept" assertion passes.
+        stale = time.time() - 3 * 86400
+        os.utime(self.archive, (stale, stale))
+        groww_sidecar._ARCHIVE_WARNED.clear()
+        self._env = mock.patch.dict(
+            os.environ,
+            {ARCHIVE_S3_BUCKET_ENV: "stub-bucket", ARCHIVE_S3_PREFIX_ENV: "stub-prefix"},
+        )
+        self._env.start()
+
+    def tearDown(self):
+        self._env.stop()
+        self._dir.cleanup()
+
+    def _sweep(self, s3, grace_secs=0.0, process_start_secs=None):
+        _archive_sweep(
+            self.base,
+            s3_client_factory=lambda: s3,
+            grace_secs=grace_secs,
+            sleep_fn=lambda _s: None,  # never really sleep in tests
+            process_start_secs=process_start_secs,
+        )
+
+    def test_upload_failure_keeps_file(self):
+        s3 = _StubS3(fail_upload=True)
+        self._sweep(s3, grace_secs=0.0)
+        self.assertTrue(os.path.exists(self.archive), "upload failed => file KEPT")
+
+    def test_head_size_mismatch_keeps_file(self):
+        s3 = _StubS3(head_size_delta=7)  # object exists but wrong size
+        self._sweep(s3, grace_secs=0.0)
+        self.assertTrue(
+            os.path.exists(self.archive),
+            "head_object size mismatch => NOT verified => file KEPT",
+        )
+
+    def test_verified_and_eligible_deletes_file(self):
+        s3 = _StubS3()
+        self._sweep(s3, grace_secs=0.0)
+        self.assertFalse(
+            os.path.exists(self.archive),
+            "verified S3 copy + both grace legs => local file deleted",
+        )
+        self.assertEqual(s3.uploads, ["stub-prefix/live-ticks-20260712.ndjson"])
+
+    def test_verified_but_uptime_below_grace_keeps_file(self):
+        s3 = _StubS3()
+        # Process "started" just now => uptime ~0 < grace.
+        self._sweep(s3, grace_secs=3600.0, process_start_secs=time.time())
+        self.assertTrue(
+            os.path.exists(self.archive),
+            "verified but uptime below grace => KEPT (bridge boot-drain window)",
+        )
+
+    def test_verified_but_age_below_grace_keeps_file(self):
+        s3 = _StubS3()
+        now = time.time()
+        os.utime(self.archive, (now, now))  # freshly rotated
+        self._sweep(s3, grace_secs=3600.0, process_start_secs=now - 7200)
+        self.assertTrue(
+            os.path.exists(self.archive),
+            "verified but file age below grace => KEPT",
+        )
+
+    def test_symlink_is_never_uploaded_or_deleted(self):
+        target = os.path.join(self._dir.name, "outside.txt")
+        with open(target, "w", encoding="utf-8") as fh:
+            fh.write("outside the capture dir\n")
+        link = os.path.join(self._dir.name, "live-ticks-20260711.ndjson")
+        os.symlink(target, link)
+        s3 = _StubS3()
+        self._sweep(s3, grace_secs=0.0)
+        self.assertTrue(os.path.lexists(link), "symlink must never be deleted")
+        self.assertTrue(os.path.exists(target))
+        self.assertNotIn("stub-prefix/live-ticks-20260711.ndjson", s3.uploads)
+
+    def test_no_bucket_keeps_everything(self):
+        with mock.patch.dict(os.environ, {ARCHIVE_S3_BUCKET_ENV: ""}):
+            self._sweep(_StubS3(), grace_secs=0.0)
+        self.assertTrue(os.path.exists(self.archive))
+
+
 class EnvNames(unittest.TestCase):
     def test_env_var_names_match_supervisor_contract(self):
         self.assertEqual(ARCHIVE_S3_BUCKET_ENV, "TICKVAULT_GROWW_ARCHIVE_S3_BUCKET")
         self.assertEqual(ARCHIVE_S3_PREFIX_ENV, "TICKVAULT_GROWW_ARCHIVE_S3_PREFIX")
+
+
+class IstDaySanity(unittest.TestCase):
+    def test_ist_day_boundary(self):
+        # 18:30:00 UTC is IST midnight — the day ordinal must roll there.
+        at_midnight_ist = ((20650 * 86400) - 19800)  # UTC secs of an IST midnight
+        self.assertEqual(_ist_day(at_midnight_ist) - _ist_day(at_midnight_ist - 1), 1)
 
 
 if __name__ == "__main__":

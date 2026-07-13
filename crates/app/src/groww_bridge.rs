@@ -1965,6 +1965,196 @@ pub fn archive_path_for_ist_day(tick_file_path: &Path, ist_day: i64) -> PathBuf 
         .unwrap_or_else(|| PathBuf::from(name))
 }
 
+/// Rotation-at-open action for a stale (previous-IST-day) capture file —
+/// decided by [`decide_capture_rotate_at_open`] (pure). 2026-07-13
+/// disk-retention hardening, REDESIGNED after review round 1 (F1+F2): the
+/// rotation lives in RUST and runs synchronously BEFORE the Groww bridge +
+/// sidecar supervisor spawns, so (F1) the bridge's one-shot archive-drain
+/// decision always sees the archive (no sidecar-vs-bridge boot race — only
+/// Rust renames at open, and the rename completes before either process/task
+/// starts), and (F2) the archive is NAMED BY THE BRIDGE'S SNAPSHOT DAY
+/// (`archive_path_for_ist_day(snap.ist_day)`) — exactly the name
+/// `drain_archive_tail_if_needed` probes — so a snapshot stuck on an older
+/// day (QuestDB degraded before the last stop) still finds its archive and
+/// drains from the persisted offset to EOF.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CaptureRotateAction {
+    /// Live file absent, empty, or last written TODAY (in-day restart) —
+    /// no rotation, append continues.
+    Keep,
+    /// Rename the live file to the dated archive for `archive_day`.
+    /// `named_by_snapshot` = the day came from the bridge's offset snapshot
+    /// (the drain lookup key — the F2-correct name); `false` = no usable
+    /// snapshot (first-boot edge) → fall back to the file-mtime day and log
+    /// loudly.
+    Rotate {
+        /// IST day index the archive is named for.
+        archive_day: i64,
+        /// Whether the day came from the bridge snapshot (vs mtime fallback).
+        named_by_snapshot: bool,
+    },
+    /// The target archive name already exists (only reachable after a
+    /// dev-Mac in-process midnight rotation the same day — prod never
+    /// crosses midnight). Do NOT overwrite: leave the live file in place
+    /// (= pre-PR behavior for this boot: zero loss, no reclaim — honest
+    /// degrade, logged loudly).
+    SkipCollision {
+        /// IST day index whose archive name collided.
+        archive_day: i64,
+    },
+}
+
+/// Pure decision core for the boot-time capture rotation-at-open.
+///
+/// Name precedence: a snapshot from a provable PREVIOUS day (`0 < snap_day <
+/// today`) names the archive — that is the exact name the bridge's drain
+/// probes (F2 by construction; the legacy `ist_day == 0` snapshot is not
+/// trusted, mirroring [`should_drain_archive`]). Otherwise the file-mtime
+/// day names it (first-boot fallback; the drain has no snapshot to resume
+/// from anyway). NOTE (F5): a file rotated at open may span MULTIPLE IST
+/// days (e.g. snapshot stuck on Thursday, file written through Friday) —
+/// the archive carries the SNAPSHOT day in its name as the drain/resume
+/// key, and the drain reads from the persisted offset to EOF, so every
+/// spanned day's rows still drain; the dated S3 object name is a forensic
+/// note of the resume day, not a content bound.
+#[must_use]
+pub fn decide_capture_rotate_at_open(
+    mtime_ist_day: i64,
+    today_ist_day: i64,
+    snapshot_ist_day: Option<i64>,
+    target_exists: bool,
+) -> CaptureRotateAction {
+    if mtime_ist_day >= today_ist_day {
+        // Same-day restart (append must continue) or future mtime (clock
+        // skew — never rotate today's capture out on uncertainty).
+        return CaptureRotateAction::Keep;
+    }
+    let (archive_day, named_by_snapshot) = match snapshot_ist_day {
+        Some(d) if d > 0 && d < today_ist_day => (d, true),
+        _ => (mtime_ist_day, false),
+    };
+    if target_exists {
+        CaptureRotateAction::SkipCollision { archive_day }
+    } else {
+        CaptureRotateAction::Rotate {
+            archive_day,
+            named_by_snapshot,
+        }
+    }
+}
+
+/// IST day index for a unix-epoch-seconds instant (the sidecar's `_ist_day`
+/// boundary: `(secs + 19800) / 86400`).
+#[must_use]
+pub fn ist_day_from_unix_secs(unix_secs: i64) -> i64 {
+    unix_secs
+        .saturating_add(i64::from(
+            tickvault_common::constants::IST_UTC_OFFSET_SECONDS,
+        ))
+        .div_euclid(i64::from(tickvault_common::constants::SECONDS_PER_DAY))
+}
+
+/// Boot-time capture rotation-at-open with an injected `today` — the
+/// testable core of [`rotate_stale_groww_capture_at_open`]. Sync std::fs on
+/// the COLD boot path, called strictly BEFORE the bridge + sidecar spawns
+/// (ordering pinned by `disk_retention_wiring_guard.rs`). Returns the
+/// archive path when a rotation happened. Failure never blocks boot — the
+/// live file is simply left in place (pre-PR behavior).
+pub fn rotate_stale_groww_capture_at_open_at(
+    tick_file_path: &Path,
+    today_ist_day: i64,
+) -> Option<PathBuf> {
+    let meta = std::fs::metadata(tick_file_path).ok()?;
+    if meta.len() == 0 {
+        return None; // empty file — nothing worth archiving
+    }
+    let mtime_secs = meta
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?;
+    // APPROVED: mtime seconds fit i64 for any realistic wall clock; cold boot path.
+    let mtime_ist_day = ist_day_from_unix_secs(mtime_secs.as_secs() as i64);
+    // Best-effort snapshot read (sync — cold boot path, before any spawn).
+    let snapshot_ist_day = std::fs::read_to_string(offset_snapshot_path(tick_file_path))
+        .ok()
+        .and_then(|raw| serde_json::from_str::<GrowwOffsetSnapshot>(&raw).ok())
+        .map(|snap| snap.ist_day);
+    let candidate_day = match snapshot_ist_day {
+        Some(d) if d > 0 && d < today_ist_day => d,
+        _ => mtime_ist_day,
+    };
+    let target = archive_path_for_ist_day(tick_file_path, candidate_day);
+    match decide_capture_rotate_at_open(
+        mtime_ist_day,
+        today_ist_day,
+        snapshot_ist_day,
+        target.exists(),
+    ) {
+        CaptureRotateAction::Keep => None,
+        CaptureRotateAction::SkipCollision { archive_day } => {
+            warn!(
+                live = %tick_file_path.display(),
+                target = %target.display(),
+                archive_day,
+                "groww capture rotate-at-open: target archive already exists \
+                 (in-process midnight rotation same day) — NOT overwriting; \
+                 live file left in place (no reclaim this boot, zero loss)"
+            );
+            None
+        }
+        CaptureRotateAction::Rotate {
+            archive_day,
+            named_by_snapshot,
+        } => {
+            if !named_by_snapshot {
+                warn!(
+                    live = %tick_file_path.display(),
+                    mtime_ist_day,
+                    "groww capture rotate-at-open: no usable bridge offset \
+                     snapshot — archive named by the file's last-write (mtime) \
+                     day; the bridge will byte-0 re-tail today's fresh file \
+                     (first-boot edge)"
+                );
+            }
+            match std::fs::rename(tick_file_path, &target) {
+                Ok(()) => {
+                    info!(
+                        archive = %target.display(),
+                        bytes = meta.len(),
+                        archive_day,
+                        named_by_snapshot,
+                        "groww capture rotated at open (stale previous-IST-day \
+                         file archived BEFORE the bridge + sidecar spawn; the \
+                         file may span multiple IST days — the dated name is \
+                         the bridge's drain/resume key, and the drain reads to \
+                         EOF)"
+                    );
+                    Some(target)
+                }
+                Err(err) => {
+                    warn!(
+                        live = %tick_file_path.display(),
+                        error = %err,
+                        "groww capture rotate-at-open: rename failed — live \
+                         file left in place (capture unaffected; no reclaim \
+                         this boot)"
+                    );
+                    None
+                }
+            }
+        }
+    }
+}
+
+/// Wall-clock wrapper over [`rotate_stale_groww_capture_at_open_at`].
+pub fn rotate_stale_groww_capture_at_open(tick_file_path: &Path) -> Option<PathBuf> {
+    rotate_stale_groww_capture_at_open_at(
+        tick_file_path,
+        ist_day_from_ist_nanos(receipt_ist_nanos()),
+    )
+}
+
 /// Pure drain decision (PR-5 H-3): drain a PREVIOUS day's archive tail ONLY
 /// when the snapshot provably belongs to an earlier IST day (a legacy
 /// `ist_day == 0` snapshot is NOT trusted to name an archive), the archive
@@ -5867,5 +6057,189 @@ mod tests {
             gate_idx < liveness_idx,
             "liveness_ts_advanced must guard the record_feed_liveness stamp"
         );
+    }
+
+    // ── boot capture rotation-at-open (2026-07-13, review round 1 F1+F2) ────
+
+    #[test]
+    fn test_decide_capture_rotate_keeps_same_day_and_future_mtime() {
+        // In-day restart (append continues) + clock-skew future mtime.
+        assert_eq!(
+            decide_capture_rotate_at_open(20650, 20650, Some(20649), false),
+            CaptureRotateAction::Keep
+        );
+        assert_eq!(
+            decide_capture_rotate_at_open(20651, 20650, Some(20649), false),
+            CaptureRotateAction::Keep
+        );
+    }
+
+    #[test]
+    fn test_decide_capture_rotate_names_by_snapshot_day() {
+        // F2: a snapshot stuck on an OLDER day (QuestDB degraded before the
+        // last stop) must name the archive — that is the exact name
+        // drain_archive_tail_if_needed probes, so the tail drains from the
+        // persisted offset even when the file spans multiple days.
+        assert_eq!(
+            decide_capture_rotate_at_open(20650, 20651, Some(20647), false),
+            CaptureRotateAction::Rotate {
+                archive_day: 20647,
+                named_by_snapshot: true
+            }
+        );
+    }
+
+    #[test]
+    fn test_decide_capture_rotate_falls_back_to_mtime_day() {
+        // No snapshot (first boot), legacy ist_day==0, or a same/future-day
+        // snapshot → mtime-day fallback name (logged loudly by the wrapper).
+        for snap in [None, Some(0), Some(20651), Some(20655)] {
+            assert_eq!(
+                decide_capture_rotate_at_open(20650, 20651, snap, false),
+                CaptureRotateAction::Rotate {
+                    archive_day: 20650,
+                    named_by_snapshot: false
+                },
+                "snapshot {snap:?} must fall back to the mtime day"
+            );
+        }
+    }
+
+    #[test]
+    fn test_decide_capture_rotate_skips_on_collision() {
+        // Target archive exists (dev-Mac in-process midnight rotation the
+        // same day) → NEVER overwrite; leave the live file (zero loss,
+        // no reclaim — pre-PR behavior for this boot).
+        assert_eq!(
+            decide_capture_rotate_at_open(20650, 20651, Some(20650), true),
+            CaptureRotateAction::SkipCollision { archive_day: 20650 }
+        );
+    }
+
+    fn backdate_mtime(path: &Path, secs_ago: u64) {
+        let mtime = std::time::SystemTime::now() - std::time::Duration::from_secs(secs_ago);
+        let f = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+        f.set_times(std::fs::FileTimes::new().set_modified(mtime))
+            .unwrap();
+    }
+
+    fn today_ist_day_for_tests() -> i64 {
+        ist_day_from_ist_nanos(receipt_ist_nanos())
+    }
+
+    #[test]
+    fn test_rotate_at_open_uses_snapshot_day_name() {
+        let dir = retail_tmp_dir("rotate_open_snap");
+        let tick_file = dir.join("live-ticks.ndjson");
+        std::fs::write(&tick_file, "{\"ltp\":1}\n").unwrap();
+        backdate_mtime(&tick_file, 86_400); // yesterday
+        let today = today_ist_day_for_tests();
+        let snap_day = today - 3; // stuck snapshot, older than the mtime day
+        retail_write_snapshot(
+            &tick_file,
+            &GrowwOffsetSnapshot {
+                offset: 4,
+                capture_seq: 9,
+                file_len: 10,
+                head: "{\"ltp\":1}\n".to_string(),
+                ist_day: snap_day,
+            },
+        );
+        let rotated = rotate_stale_groww_capture_at_open_at(&tick_file, today)
+            .expect("stale file must rotate");
+        assert_eq!(
+            rotated,
+            archive_path_for_ist_day(&tick_file, snap_day),
+            "the archive must carry the SNAPSHOT day name — the exact name \
+             the bridge's drain probes (F2)"
+        );
+        assert!(!tick_file.exists());
+        assert!(rotated.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_rotate_at_open_mtime_fallback_without_snapshot() {
+        let dir = retail_tmp_dir("rotate_open_mtime");
+        let tick_file = dir.join("live-ticks.ndjson");
+        std::fs::write(&tick_file, "{\"ltp\":2}\n").unwrap();
+        backdate_mtime(&tick_file, 2 * 86_400);
+        let today = today_ist_day_for_tests();
+        let rotated = rotate_stale_groww_capture_at_open_at(&tick_file, today)
+            .expect("stale file must rotate on the first-boot edge too");
+        // mtime two days back → the mtime IST day is today-2 (exact value
+        // depends on the IST wall clock; assert via the same helper).
+        let meta_day = ist_day_from_unix_secs(
+            // APPROVED: test-only clock math.
+            (std::time::SystemTime::now() - std::time::Duration::from_secs(2 * 86_400))
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs() as i64,
+        );
+        assert_eq!(rotated, archive_path_for_ist_day(&tick_file, meta_day));
+        assert!(!tick_file.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_rotate_at_open_collision_leaves_live_file() {
+        let dir = retail_tmp_dir("rotate_open_collision");
+        let tick_file = dir.join("live-ticks.ndjson");
+        std::fs::write(&tick_file, "{\"ltp\":3}\n").unwrap();
+        backdate_mtime(&tick_file, 86_400);
+        let today = today_ist_day_for_tests();
+        let snap_day = today - 1;
+        retail_write_snapshot(
+            &tick_file,
+            &GrowwOffsetSnapshot {
+                offset: 0,
+                capture_seq: 1,
+                file_len: 10,
+                head: "{\"ltp\":3}\n".to_string(),
+                ist_day: snap_day,
+            },
+        );
+        let target = archive_path_for_ist_day(&tick_file, snap_day);
+        std::fs::write(&target, "prior archive — never overwritten\n").unwrap();
+        assert_eq!(
+            rotate_stale_groww_capture_at_open_at(&tick_file, today),
+            None,
+            "collision must skip the rotation"
+        );
+        assert!(
+            tick_file.exists(),
+            "live file left in place (honest degrade)"
+        );
+        let prior = std::fs::read_to_string(&target).unwrap();
+        assert!(prior.contains("never overwritten"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_rotate_at_open_keeps_fresh_missing_and_empty_files() {
+        let dir = retail_tmp_dir("rotate_open_keep");
+        let tick_file = dir.join("live-ticks.ndjson");
+        let today = today_ist_day_for_tests();
+        // Missing file.
+        assert_eq!(
+            rotate_stale_groww_capture_at_open_at(&tick_file, today),
+            None
+        );
+        // Fresh (today) file — in-day restart must keep appending.
+        std::fs::write(&tick_file, "{\"ltp\":4}\n").unwrap();
+        assert_eq!(
+            rotate_stale_groww_capture_at_open_at(&tick_file, today),
+            None
+        );
+        assert!(tick_file.exists());
+        // Empty stale file — nothing worth archiving.
+        std::fs::write(&tick_file, "").unwrap();
+        backdate_mtime(&tick_file, 86_400);
+        assert_eq!(
+            rotate_stale_groww_capture_at_open_at(&tick_file, today),
+            None
+        );
+        assert!(tick_file.exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

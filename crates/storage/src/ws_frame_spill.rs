@@ -1001,10 +1001,12 @@ pub struct ArchivePruneOutcome {
 ///   persisted (replay-confirmed). `archive/` is never re-replayed.
 /// - The one remaining reader is the same-day 15:40 IST tick-conservation
 ///   audit ([`count_frames_for_ist_day`]), which counts frames for the
-///   CURRENT IST day only; a ≥2-day-old segment carries no current-day
+///   CURRENT IST day only; a ≥7-day-old segment carries no current-day
 ///   frames, so pruning it cannot change the audit
-///   (`WS_WAL_ARCHIVE_RETENTION_SECS` = 2 days comfortably exceeds that
-///   window).
+///   (`WS_WAL_ARCHIVE_RETENTION_SECS` = 7 days, matching
+///   `SPILL_FILE_MAX_AGE_SECS`, comfortably exceeds that window AND — F3,
+///   review round 1 — preserves the confirm-on-channel residual's only
+///   copy across a long weekend for triage before it ages out).
 /// - Only `*.wal` files are touched; anything else in the dir is kept.
 ///   A missing `archive/` dir is a no-op. Deletion failures are NOT
 ///   persist/flush failures — they log at WARN (bounded: once per file per
@@ -1956,7 +1958,7 @@ mod tests {
         let dir = tmp_dir("prune-fresh");
         let now = SystemTime::now();
         let fresh = plant_archive_file(&dir, "ws-frames-00000000000000000001.wal", now, 3600);
-        let outcome = prune_archived_segments_at(&dir, 172_800, now);
+        let outcome = prune_archived_segments_at(&dir, 604_800, now);
         assert_eq!(outcome.deleted, 0);
         assert_eq!(outcome.kept, 1);
         assert!(fresh.exists(), "a fresh segment must never be pruned");
@@ -1971,10 +1973,10 @@ mod tests {
             &dir,
             "ws-frames-00000000000000000002.wal",
             now,
-            172_800 + 3600, // retention + 1h
+            604_800 + 3600, // retention + 1h
         );
         let fresh = plant_archive_file(&dir, "ws-frames-00000000000000000003.wal", now, 60);
-        let outcome = prune_archived_segments_at(&dir, 172_800, now);
+        let outcome = prune_archived_segments_at(&dir, 604_800, now);
         assert_eq!(outcome.deleted, 1);
         assert_eq!(outcome.kept, 1);
         assert!(!old.exists(), "a past-retention segment must be deleted");
@@ -1988,7 +1990,7 @@ mod tests {
         let now = SystemTime::now();
         let foreign = plant_archive_file(&dir, "notes.txt", now, 999_999_999);
         let marker = plant_archive_file(&dir, "replay-marker", now, 999_999_999);
-        let outcome = prune_archived_segments_at(&dir, 172_800, now);
+        let outcome = prune_archived_segments_at(&dir, 604_800, now);
         assert_eq!(outcome.deleted, 0);
         assert_eq!(outcome.kept, 2);
         assert!(foreign.exists(), "non-.wal files must never be touched");
@@ -2000,7 +2002,7 @@ mod tests {
     fn test_prune_missing_dir_is_noop() {
         let dir = tmp_dir("prune-missing");
         // No archive/ subdir created at all.
-        let outcome = prune_archived_segments_at(&dir, 172_800, SystemTime::now());
+        let outcome = prune_archived_segments_at(&dir, 604_800, SystemTime::now());
         assert_eq!(outcome, ArchivePruneOutcome::default());
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2013,7 +2015,7 @@ mod tests {
         // evaluating "now" one day in the past.
         let past_now = now - Duration::from_secs(86_400);
         let skewed = plant_archive_file(&dir, "ws-frames-00000000000000000004.wal", now, 60);
-        let outcome = prune_archived_segments_at(&dir, 172_800, past_now);
+        let outcome = prune_archived_segments_at(&dir, 604_800, past_now);
         assert_eq!(outcome.deleted, 0);
         assert!(
             skewed.exists(),

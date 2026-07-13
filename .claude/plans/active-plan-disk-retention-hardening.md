@@ -25,12 +25,22 @@ Prod 30 GB root EBS crossed 80% used today (81.8% peak, `tv-prod-disk-used-high`
 
 ## Plan Items
 
-- [x] Item 1 — Groww sidecar rotation-at-open + verified S3 offload (Python)
+- [x] Item 1 — Groww sidecar verified S3 offload sweep (Python; review round 1: the
+  sidecar does NOT rotate at open — see Item 1b)
   - Files: scripts/groww-sidecar/groww_sidecar.py, scripts/groww-sidecar/test_capture_archive.py
-  - Tests: test_should_rotate_at_open_previous_day, test_should_rotate_at_open_same_day,
-    test_collision_free_archive_path_suffixes, test_archive_delete_eligible_requires_s3_verified,
-    test_archive_delete_eligible_requires_both_graces, test_rotate_at_open_moves_stale_file,
-    test_rotate_at_open_leaves_today_file (python3 -m unittest, scripts/groww-sidecar/)
+  - Tests: test_collision_free_archive_path_suffixes, test_archive_delete_eligible_requires_s3_verified,
+    test_archive_delete_eligible_requires_both_graces, test_upload_failure_keeps_file,
+    test_head_size_mismatch_keeps_file, test_verified_and_eligible_deletes_file,
+    test_verified_but_uptime_below_grace_keeps_file, test_verified_but_age_below_grace_keeps_file,
+    test_symlink_is_never_uploaded_or_deleted (python3 -m unittest, scripts/groww-sidecar/)
+- [x] Item 1b — Rust-owned capture rotation-at-open, pre-spawn (review round 1 F1+F2
+  redesign; crates/app)
+  - Files: crates/app/src/groww_bridge.rs, crates/app/src/main.rs
+  - Tests: test_decide_capture_rotate_names_by_snapshot_day, test_decide_capture_rotate_falls_back_to_mtime_day,
+    test_decide_capture_rotate_skips_on_collision, test_decide_capture_rotate_keeps_same_day_and_future_mtime,
+    test_rotate_at_open_uses_snapshot_day_name, test_rotate_at_open_mtime_fallback_without_snapshot,
+    test_rotate_at_open_collision_leaves_live_file, test_rotate_at_open_keeps_fresh_missing_and_empty_files,
+    test_capture_rotation_precedes_bridge_and_sidecar_spawns (ordering ratchet, crates/app)
 - [x] Item 2 — Supervisor env plumbing + config fields (Rust, crates/app + crates/common)
   - Files: crates/app/src/groww_sidecar_supervisor.rs, crates/common/src/config.rs,
     crates/app/src/main.rs, config/base.toml
@@ -59,18 +69,23 @@ Prod 30 GB root EBS crossed 80% used today (81.8% peak, `tv-prod-disk-used-high`
 
 ## Design
 
-**Item 1 (sidecar).** Two additions to the existing `_RotatingOut` machinery, keeping the
-writer-owns-rotation model:
+**Item 1 + 1b (capture rotation + offload) — REDESIGNED in review round 1 (F1+F2).**
 
-- *Rotation-at-open:* before opening the live file, `_RotatingOut.__init__` calls
-  `_rotate_at_open_if_stale(path)` — one `os.stat`; if the file exists, is non-empty, and its
-  mtime's IST day (`_ist_day(mtime)`) is BEFORE today's IST day (pure gate
-  `_should_rotate_at_open(mtime_day, today_day)`), it is `os.replace`d to the SAME dated
-  archive name the midnight rotation uses (`live-ticks-YYYYMMDD.ndjson`, stamped with the
-  mtime's day = the last-write day, honest). On a name collision a numeric suffix is appended
-  (`-1`, `-2`, …; pure `_collision_free_archive_path`) — never overwrite. Cheap: a stat, no
-  file scan. The fresh live file then opens exactly as today.
-- *Verified S3 offload:* after any rotation (at-open or midnight) and once at startup, a
+- *Rotation-at-open is RUST-OWNED* (`groww_bridge.rs::rotate_stale_groww_capture_at_open`,
+  pure core `decide_capture_rotate_at_open`): executed SYNCHRONOUSLY in main.rs at the single
+  shared spawn site, strictly BEFORE both the Groww bridge task and the sidecar supervisor
+  spawn, on every boot arm (ordering pinned by the source-order ratchet). This kills the F1
+  boot race (the bridge's one-shot archive-drain decision always sees the archive — only
+  Rust renames at open, and the rename completes before either consumer starts). The archive
+  is NAMED BY THE BRIDGE'S OFFSET-SNAPSHOT DAY (`archive_path_for_ist_day(snap.ist_day)` —
+  the exact name `drain_archive_tail_if_needed` probes; F2 by construction, and a file
+  spanning multiple days drains fully from the stuck offset to EOF). No usable snapshot
+  (first boot / legacy ist_day==0) → mtime-day fallback name + one loud warn. Target name
+  already exists (dev-Mac same-day midnight rotation) → NO overwrite, live file left in
+  place (pre-PR behavior for that boot: zero loss, no reclaim — honest degrade, loud warn).
+  The PYTHON sidecar never rotates at open (guard-pinned absence).
+- *Verified S3 offload (sidecar-side, unchanged semantics):* after a midnight rotation and
+  once at startup, a
   single-flight DAEMON thread (`_spawn_archive_sweep`) sweeps `live-ticks-*.ndjson` archives:
   upload each to `s3://$TICKVAULT_GROWW_ARCHIVE_S3_BUCKET/$TICKVAULT_GROWW_ARCHIVE_S3_PREFIX/<filename>`
   via boto3 (already pinned for the SSM token read), then VERIFY via `head_object`
@@ -83,7 +98,12 @@ writer-owns-rotation model:
   uploads retry at the next trigger (next startup / next midnight rotation), never in a loop.
   Re-runs are idempotent (same key, overwrite fine; already-verified objects skip re-upload).
   The old blind 2-day age-delete (`_archives_to_delete` + `NDJSON_ARCHIVE_KEEP_DAYS`) is
-  REMOVED — verified-offload-then-delete is the ONE archival path.
+  REMOVED — verified-offload-then-delete is the ONE archival path. Review round 1 F4: the
+  sweep takes injectable `s3_client_factory`/`grace_secs`/`sleep_fn`/`process_start_secs`
+  keywords so unit tests pin the verify-before-delete invariant at the ACTUAL delete call
+  site with a stubbed S3 client (upload-fail kept / size-mismatch kept / verified+eligible
+  deleted / below-grace kept). SEC-LOW: symlinks are skipped (never followed) with one
+  bounded warning before any getsize/upload/delete.
 - *Bridge safety (the grace rationale, Verified from crates/app/src/groww_bridge.rs):* the
   bridge persists a flushed-offset snapshot carrying `ist_day`; at BOOT, when the snapshot
   belongs to a previous IST day, `drain_archive_tail_if_needed` re-reads the rotated archive
@@ -110,11 +130,15 @@ credential). main.rs builds the options from `config.feeds.groww` at both spawn 
 **Item 4 (WAL prune).** `crates/storage/src/ws_frame_spill.rs` gains
 `prune_archived_segments_at(wal_dir, retention_secs, now)` (pure-testable core over an
 injected `now`) + `prune_archived_segments` wrapper: deletes `<wal_dir>/archive/*.wal` files
-with mtime older than `WS_WAL_ARCHIVE_RETENTION_SECS` (172_800 s = 2 days, new constant in
+with mtime older than `WS_WAL_ARCHIVE_RETENTION_SECS` (604_800 s = 7 days — review round 1
+F3, widened from 2 days; matches SPILL_FILE_MAX_AGE_SECS — new constant in
 crates/common/src/constants.rs). Rationale: archived segments are post-confirmed-replay
 copies — their frames are already durably persisted + replay-confirmed; the same-day
 tick-conservation audit reads only the CURRENT day's frames (3-day segment-creation lookback
-pre-filter, day-attributed counting), and 2 days comfortably exceeds that window. Spawned as
+pre-filter, day-attributed counting), so even 2 days was audit-safe — but the archive is
+also the only remaining copy for the documented confirm-on-channel residual (crash after
+confirm, before the consumer drains), and a 2-day window could erase that triage copy
+across a long weekend; 7 days covers any weekend/holiday gap. Spawned as
 a new periodic tokio task in the process-global boot prefix of main.rs next to the existing
 log-retention sweeper family (runs on BOTH boot arms — deliberately NOT inside the Dhan-lane
 periodic health loop, which never runs on a Groww-only boot): prune once at task start, then
@@ -136,12 +160,14 @@ errors.jsonl retention sweeper task in main.rs (no new task). Canonical path nam
 
 ## Edge Cases
 
-- Sidecar restart mid-day (stall watchdog kill+relaunch): the live file's mtime is TODAY →
-  `_should_rotate_at_open` false → no rotation, append continues (capture_seq/bridge tail
-  unaffected).
+- Sidecar restart mid-day (stall watchdog kill+relaunch): only Rust rotates, and only at
+  BOOT — a sidecar relaunch never renames anything; append continues (capture_seq/bridge
+  tail unaffected). A same-day app restart hits the Rust Keep arm (mtime is today).
 - Live file exists but empty at open → no rotation (size > 0 required); nothing to archive.
-- Archive name collision (crash between rotate and open, or two rotations attributing the
-  same day) → numeric suffix, never overwrite; both files sweep to S3 under distinct keys.
+- At-open archive-name collision (dev-Mac same-day midnight rotation) → Rust rotation
+  SKIPS (never overwrites; live file kept — zero loss, no reclaim that boot, loud warn).
+  The sidecar's midnight rotation keeps the collision-suffix path (`-1`, `-2`, …) — never
+  overwrite; suffixed archives still sweep to S3 under distinct keys.
 - Dev Mac without AWS creds / empty bucket config → upload never verifies → NO deletion ever
   (archives accumulate on dev; accepted per the no-delete-without-verified-S3 rule; one
   bounded warning per file per session).
@@ -165,24 +191,27 @@ errors.jsonl retention sweeper task in main.rs (no new task). Canonical path nam
   daemon thread.
 - `head_object` size mismatch (truncated upload) → NOT verified → file KEPT, re-uploaded next
   trigger.
-- `os.replace` failure at-open (bad disk) → warning, capture continues appending to the
-  existing file (exactly the midnight-rotation failure semantics).
+- Rust at-open `fs::rename` failure (bad disk) → one warn, live file left in place —
+  capture unaffected, no reclaim that boot (the sidecar's midnight `os.replace` keeps its
+  own never-stops-capture failure semantics).
 - Sweep thread crash → daemon thread dies silently for THIS session; next startup re-triggers
   (bounded blast radius: archives are kept, never lost).
 - WAL prune `remove_file` failure → `warn!` + counted in the outcome; retried next 6 h pass.
 - errors.log truncate failure (permissions) → `warn!` once per hourly pass; file keeps
   growing until fixed — visible, never silent.
 - Race: prune scanning `archive/` while `confirm_replayed` renames into it → both are
-  metadata ops on distinct files; a just-moved segment's mtime is fresh relative to the 2-day
-  cutoff, so it is never deleted mid-move-window.
+  metadata ops on distinct files; a just-moved segment's mtime is fresh relative to the
+  7-day cutoff, so it is never deleted mid-move-window.
 
 ## Test Plan
 
 - Python: `python3 -m unittest discover scripts/groww-sidecar -p 'test_*.py'` — new
-  test_capture_archive.py covers the pure gates (`_should_rotate_at_open`,
-  `_archive_delete_eligible`, `_collision_free_archive_path`) + a tmpdir end-to-end
-  rotate-at-open test using `os.utime` to backdate mtime; existing test_dedup.py must stay
-  green. `python3 -m py_compile scripts/groww-sidecar/groww_sidecar.py`.
+  test_capture_archive.py covers the pure gates (`_archive_delete_eligible`,
+  `_collision_free_archive_path`) + the F4 stubbed-S3 `_archive_sweep` delete-path suite
+  (upload-fail/size-mismatch/verified-eligible/below-grace/symlink); existing test_dedup.py
+  must stay green. `python3 -m py_compile scripts/groww-sidecar/groww_sidecar.py`.
+- Rust rotation (Item 1b): pure decision tests + tmpdir wrapper tests (snapshot-day name,
+  mtime fallback, collision-skip, keep fresh/missing/empty) + the pre-spawn ordering ratchet.
 - Rust: `cargo test -p tickvault-common -p tickvault-storage -p tickvault-app -p
   tickvault-core` (crates/common changed → escalation; CI runs the full battery).
   New tests: config round-trip (common), groww_capture_archive_guard (common, source-scan),
@@ -199,6 +228,8 @@ errors.jsonl retention sweeper task in main.rs (no new task). Canonical path nam
   understands). Setting `capture_archive_s3_bucket = ""` in config disables S3
   offload+deletion at runtime without a code revert (archives then accumulate = pre-PR
   behavior).
+- Rust rotation-at-open: an additive pre-spawn call in main.rs — revert the call; the
+  bridge handles both rotated and unrotated files (byte-0 re-tail is DEDUP-idempotent).
 - WAL prune: the task is additive; revert the main.rs spawn (or the whole commit) — no state
   migration; already-deleted archives were confirmed-replayed copies whose frames are in
   QuestDB.
@@ -208,16 +239,18 @@ errors.jsonl retention sweeper task in main.rs (no new task). Canonical path nam
 
 ## Observability
 
-- Sidecar prints (stdout → supervisor → tracing → CloudWatch): one line per at-open rotation,
-  per archive upload (filename + size + key ONLY — never a token/credential), per verified
-  delete, and one bounded warning per kept file per session.
+- Rust rotation logs one info! per at-open rotation (loud warns on fallback-name /
+  collision / rename-failure). Sidecar prints (stdout → supervisor → tracing → CloudWatch):
+  one line per archive upload (filename + size + key ONLY — never a token/credential), per
+  verified delete, and one bounded warning per kept/symlink file per session.
 - Rust: `tv_ws_wal_archive_pruned_total` counter + one `info!` summary per pruning pass that
   deleted files; `warn!` per deletion failure. errors.log cap: `info!` on truncation (with
   the pre-truncation size), `warn!` on failure. All through the existing 5-sink tracing chain.
-- Ratchets (build-failing): groww_capture_archive_guard.rs pins rotation-at-open, the
-  no-delete-without-verified-S3 literal, the env-var names, the config fields, and the
-  retired blind age-delete; disk_retention_wiring_guard.rs pins the main.rs prune spawn +
-  errors.log cap wiring.
+- Ratchets (build-failing): groww_capture_archive_guard.rs pins the RUST-owned rotation
+  (and the ABSENCE of sidecar-side at-open rotation), the no-delete-without-verified-S3
+  literal, the env-var names, the config fields, and the retired blind age-delete;
+  disk_retention_wiring_guard.rs pins the main.rs prune spawn + errors.log cap wiring +
+  the rotation-precedes-both-spawns source order (F1).
 - Honest envelope: this PR stops the three verified unbounded writers; it does NOT change
   QuestDB partition retention (detach ≠ free; separate operator decision per the audit) and
   does NOT claim S3 offload works without AWS creds (dev accumulates, stated above).

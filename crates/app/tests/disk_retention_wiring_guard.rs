@@ -8,7 +8,7 @@
 //! Groww-only boot):
 //!
 //! 1. The WAL `archive/` prune task — confirmed-replay segments older than
-//!    `WS_WAL_ARCHIVE_RETENTION_SECS` (2 days) are deleted; before this,
+//!    `WS_WAL_ARCHIVE_RETENTION_SECS` (7 days, F3) are deleted; before this,
 //!    `data/ws_wal/archive/` grew ~0.15–0.6 GB/day unbounded (nothing
 //!    anywhere pruned it).
 //! 2. The `errors.log` size cap — the single-file WARN+ append log is
@@ -38,7 +38,8 @@ fn test_main_spawns_ws_wal_archive_prune() {
     assert!(
         src.contains("WS_WAL_ARCHIVE_RETENTION_SECS"),
         "the prune must use the pinned WS_WAL_ARCHIVE_RETENTION_SECS \
-         retention constant (2 days — safe for the same-day 15:40 IST \
+         retention constant (7 days — audit-safe AND long-weekend-safe for \
+         the confirm-on-channel residual, F3; same-day 15:40 IST \
          tick-conservation audit), never an ad-hoc literal"
     );
     assert!(
@@ -56,6 +57,52 @@ fn test_main_spawns_ws_wal_archive_prune() {
         "the prune task must resolve the WAL dir via \
          tick_conservation_boot::ws_wal_dir() (the shared single source of \
          truth), not a hardcoded path"
+    );
+}
+
+#[test]
+fn test_capture_rotation_precedes_bridge_and_sidecar_spawns() {
+    // Review round 1 F1 (HIGH): the bridge's one-shot archive-drain decision
+    // checks archive existence ONCE at its boot resume, while a sidecar-side
+    // at-open rotation renames the live file ~1s later — a boot race that
+    // silently orphans yesterday's un-flushed tail. The fix: ONLY Rust
+    // rotates at open, synchronously, BEFORE both the bridge task and the
+    // sidecar supervisor spawn. main.rs has a single shared spawn site for
+    // both (process-global boot prefix, every boot arm), so pinning source
+    // order here pins the runtime order by construction.
+    let src = read_main_rs();
+    let rotate_idx = src.find("rotate_stale_groww_capture_at_open(").expect(
+        "main.rs must call groww_bridge::rotate_stale_groww_capture_at_open \
+         (the Rust-owned boot rotation — F1/F2)",
+    );
+    for spawn in [
+        // Both bridge arms (scale shard bridges + single-conn bridge)…
+        "spawn_supervised_groww_shard_bridges(",
+        "spawn_supervised_groww_bridge(",
+        // …and both sidecar arms (fleet + single-conn supervisor).
+        "spawn_groww_scale_fleet(",
+        "spawn_supervised_groww_sidecar_supervisor(",
+    ] {
+        let spawn_idx = src
+            .find(spawn)
+            .unwrap_or_else(|| panic!("main.rs must contain the {spawn} spawn site"));
+        assert!(
+            rotate_idx < spawn_idx,
+            "rotate_stale_groww_capture_at_open must be called BEFORE {spawn} \
+             in main.rs source order — the rename must complete before the \
+             bridge's one-shot drain decision and before the sidecar process \
+             can re-open the old inode (F1)"
+        );
+    }
+    // Single-owner invariant: the PYTHON sidecar must never rotate at open
+    // (that reintroduces the race). The sidecar-side scan lives in
+    // crates/common/tests/groww_capture_archive_guard.rs; here we pin that
+    // main.rs carries exactly one rotation call site — the shared pre-spawn
+    // boot prefix.
+    assert_eq!(
+        src.matches("rotate_stale_groww_capture_at_open(").count(),
+        1,
+        "exactly one rotation call site — the shared pre-spawn boot prefix"
     );
 }
 

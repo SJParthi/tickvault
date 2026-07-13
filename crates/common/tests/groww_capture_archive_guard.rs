@@ -30,23 +30,31 @@ fn read(rel: &str) -> String {
 const SIDECAR: &str = "scripts/groww-sidecar/groww_sidecar.py";
 
 #[test]
-fn test_sidecar_has_rotation_at_open() {
+fn test_rotation_at_open_is_rust_owned() {
+    // Review round 1 F1+F2 redesign: rotation-at-open lives in RUST
+    // (groww_bridge.rs), executed synchronously BEFORE the bridge + sidecar
+    // spawns (ordering pinned by crates/app/tests/disk_retention_wiring_guard.rs)
+    // and NAMED BY THE BRIDGE'S SNAPSHOT DAY — the exact archive name the
+    // bridge's boot drain probes. A sidecar-side at-open rename races the
+    // bridge's one-shot drain decision and can orphan the un-flushed tail,
+    // so the PYTHON side must never rotate at open.
+    let bridge = read("crates/app/src/groww_bridge.rs");
+    assert!(
+        bridge.contains("pub fn decide_capture_rotate_at_open("),
+        "the at-open decision must stay a pure, unit-tested Rust gate"
+    );
+    assert!(
+        bridge.contains("pub fn rotate_stale_groww_capture_at_open"),
+        "the Rust-owned boot rotation must exist in groww_bridge.rs"
+    );
     let sidecar = read(SIDECAR);
-    assert!(
-        sidecar.contains("def _rotate_at_open_if_stale("),
-        "the sidecar must rotate a stale previous-IST-day live file AT OPEN — \
-         the prod box (08:30-16:30 IST) never crosses midnight in-process, so \
-         midnight-only rotation is dead there"
-    );
-    assert!(
-        sidecar.contains("_rotate_at_open_if_stale(path)"),
-        "_RotatingOut.__init__ must actually CALL the at-open rotation before \
-         opening the live file"
-    );
-    assert!(
-        sidecar.contains("def _should_rotate_at_open("),
-        "the at-open decision must stay a pure, unit-tested gate"
-    );
+    for banned in ["_rotate_at_open_if_stale", "_should_rotate_at_open"] {
+        assert!(
+            !sidecar.contains(banned),
+            "sidecar-side rotation-at-open ({banned}) must stay retired — \
+             only Rust renames at open (F1 boot-race prevention)"
+        );
+    }
 }
 
 #[test]

@@ -863,29 +863,32 @@ def still_silent_rewarn_interval_secs(
 
 
 # ---------------------------------------------------------------------------
-# Capture-file rotation (PR-3, 2026-07-02; hardened 2026-07-13) — the WRITER
-# owns rotation. Two rotation triggers:
-#   1. IST-midnight (original): at the first write after IST midnight the
-#      current file is archived to live-ticks-YYYYMMDD.ndjson (the COMPLETED
-#      IST day) and a fresh file opens.
-#   2. ROTATION-AT-OPEN (2026-07-13, prod disk-full remediation): the prod box
-#      runs 08:30-16:30 IST and is NEVER alive at IST midnight, so trigger 1
-#      never fired there and the live file grew ~1 GB/day unbounded. At open,
-#      if the existing file's last write (mtime, converted to the IST day —
-#      honest: the last day anything was appended) belongs to a PREVIOUS IST
-#      day, it is archived under the SAME dated naming convention before the
-#      fresh file opens. One stat — never a file scan.
-# After any rotation (and once at startup) a daemon-thread archive sweep
-# uploads each dated archive to S3, VERIFIES the copy (head_object
+# Capture-file rotation (PR-3, 2026-07-02; hardened 2026-07-13) — two owners:
+#   1. IST-midnight (THIS file, original): at the first write after IST
+#      midnight the current file is archived to live-ticks-YYYYMMDD.ndjson
+#      (the COMPLETED IST day) and a fresh file opens.
+#   2. ROTATION-AT-OPEN lives in RUST (review round 1 redesign, F1+F2):
+#      crates/app/src/groww_bridge.rs::rotate_stale_groww_capture_at_open
+#      runs synchronously BEFORE the bridge task and this sidecar are
+#      spawned, and names the archive by the BRIDGE'S OFFSET-SNAPSHOT day —
+#      the exact name the bridge's boot archive-tail drain probes. The
+#      sidecar must NOT rotate at open: a sidecar-side rename races the
+#      bridge's one-shot drain decision (the bridge task starts first and
+#      checks archive existence ONCE) and could orphan the un-flushed tail.
+# After the midnight rotation (and once at startup) a daemon-thread archive
+# sweep uploads each dated archive to S3, VERIFIES the copy (head_object
 # ContentLength == local size), and only then deletes the local file after a
-# grace window (see ARCHIVE_DELETE_GRACE_SECS). The pre-2026-07-13 blind 2-day
-# age-delete is RETIRED — the verified S3 offload is the ONE archival path,
-# and NEVER delete without the verified S3 copy is the invariant. Rotation
-# happens BETWEEN records (never splits a line) and ONLY at an IST day
-# boundary: the market is closed at midnight (and pre-open), so the Rust
-# bridge's per-file capture_seq restart can never collide same-second dedup
-# keys across the boundary. A rotation failure NEVER stops capture — the
-# sidecar keeps appending to the current file.
+# grace window (see ARCHIVE_DELETE_GRACE_SECS). The pre-2026-07-13 blind
+# 2-day age-delete is RETIRED — the verified S3 offload is the ONE archival
+# path, and NEVER delete without the verified S3 copy is the invariant.
+# NOTE (F5): a Rust-rotated (at-open) archive may SPAN multiple IST days —
+# its dated name is the bridge's drain/resume key (a forensic note carried
+# into the S3 object name), not a content bound. Midnight rotation happens
+# BETWEEN records (never splits a line) and ONLY at an IST day boundary: the
+# market is closed at midnight (and pre-open), so the Rust bridge's per-file
+# capture_seq restart can never collide same-second dedup keys across the
+# boundary. A rotation failure NEVER stops capture — the sidecar keeps
+# appending to the current file.
 # ---------------------------------------------------------------------------
 
 # Grace window before a verified-uploaded archive may be deleted locally.
@@ -893,12 +896,13 @@ def still_silent_rewarn_interval_secs(
 # uptime leg (Verified from crates/app/src/groww_bridge.rs): at BOOT, when the
 # bridge's persisted flushed-offset snapshot belongs to a PREVIOUS IST day, it
 # re-reads the rotated archive's tail (drain_archive_tail_if_needed) through
-# the persist path. The archive's mtime is stale (yesterday's last write), so
-# an mtime-only grace would pass INSTANTLY at the 08:31 at-open rotation and
-# could delete the archive before the co-booted bridge drains it. The sidecar
-# is spawned by the supervisor inside the SAME app process as the bridge, so
-# 45 minutes of sidecar uptime guarantees the bridge's one-shot boot drain
-# finished long before any delete fires.
+# the persist path — asynchronously, some time after the Rust at-open
+# rotation created the archive. The archive's mtime is stale (yesterday's
+# last write), so an mtime-only grace would pass INSTANTLY at the ~08:31
+# boot and could delete the archive before the co-booted bridge finishes
+# that drain. The sidecar is spawned by the supervisor inside the SAME app
+# process as the bridge, so 45 minutes of sidecar uptime guarantees the
+# bridge's one-shot boot drain finished long before any delete fires.
 ARCHIVE_DELETE_GRACE_SECS = 45 * 60
 
 # S3 offload destination — injected by the Rust supervisor from
@@ -932,14 +936,6 @@ def _archive_path(base: str, day_ordinal: int) -> str:
     return f"{root}-{_ist_date_str(day_ordinal)}{ext}"
 
 
-def _should_rotate_at_open(mtime_day_ordinal: int, today_ordinal: int) -> bool:
-    """Pure gate: rotate an existing live file at open ONLY when its last
-    write day (mtime's IST day) is strictly BEFORE today's IST day. A
-    same-day (or clock-skewed future) mtime means an in-day sidecar restart —
-    append must continue, never rotate."""
-    return mtime_day_ordinal < today_ordinal
-
-
 def _collision_free_archive_path(base: str, day_ordinal: int, exists_fn) -> str:
     """Pure-testable: the dated archive path, with a numeric suffix appended
     on collision (-1, -2, ...) — NEVER overwrite an existing archive."""
@@ -968,42 +964,6 @@ def _archive_delete_eligible(
     return age_secs >= grace_secs and uptime_secs >= grace_secs
 
 
-def _rotate_at_open_if_stale(path: str):
-    """ROTATION-AT-OPEN: archive a previous-IST-day live file before opening.
-
-    One os.stat. Returns the archive path when a rotation happened, else
-    None. Failure never stops capture (the caller opens/append the existing
-    file exactly as before).
-    """
-    try:
-        st = os.stat(path)
-    except OSError:
-        return None  # no existing file — fresh open
-    if st.st_size <= 0:
-        return None  # empty file — nothing worth archiving
-    mtime_day = _ist_day(st.st_mtime)
-    if not _should_rotate_at_open(mtime_day, _ist_day(time.time())):
-        return None
-    archive = _collision_free_archive_path(path, mtime_day, os.path.exists)
-    try:
-        os.replace(path, archive)
-    except OSError as exc:
-        print(
-            f"groww sidecar error [rotate-at-open]: {type(exc).__name__}: {exc} — "
-            "capture continues on the existing file",
-            file=sys.stderr,
-            flush=True,
-        )
-        return None
-    print(
-        f"groww capture rotated at open: {archive} "
-        f"({st.st_size} bytes, last written IST day {_ist_date_str(mtime_day)}) "
-        f"-> fresh {path}",
-        flush=True,
-    )
-    return archive
-
-
 def _list_capture_archives(base: str) -> list:
     """All dated (incl. collision-suffixed) archives next to the live file."""
     root, ext = os.path.splitext(base)
@@ -1028,7 +988,23 @@ def _s3_object_matches(s3, bucket: str, key: str, local_size: int) -> bool:
         return False
 
 
-def _archive_sweep(base: str) -> None:
+def _default_s3_client_factory():
+    """Real boto3 S3 client (deferred import). Raises on failure — the sweep
+    catches, warns once, and keeps every file."""
+    import boto3  # deferred: only the S3 offload path needs AWS
+
+    region = os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION") or "ap-south-1"
+    return boto3.client("s3", region_name=region)
+
+
+def _archive_sweep(
+    base: str,
+    *,
+    s3_client_factory=None,
+    grace_secs=None,
+    sleep_fn=time.sleep,
+    process_start_secs=None,
+) -> None:
     """Upload rotated capture archives to S3, verify, then delete after grace.
 
     Runs on a DAEMON thread (never delays feed auth/subscribe/streaming).
@@ -1037,7 +1013,17 @@ def _archive_sweep(base: str) -> None:
     upload is retried at the NEXT trigger (next startup / next midnight
     rotation), never in a loop. Logs filenames/sizes/keys ONLY — never a
     token or credential.
+
+    The keyword injection points (`s3_client_factory`, `grace_secs`,
+    `sleep_fn`, `process_start_secs`) exist so tests exercise THIS actual
+    delete path against a stubbed client (review round 1 F4 — the
+    verify-before-delete invariant is pinned at the call site, not only in
+    the pure gate); production callers pass none of them.
     """
+    if grace_secs is None:
+        grace_secs = ARCHIVE_DELETE_GRACE_SECS
+    if process_start_secs is None:
+        process_start_secs = _PROCESS_START_SECS
     bucket = (os.environ.get(ARCHIVE_S3_BUCKET_ENV) or "").strip()
     prefix = (os.environ.get(ARCHIVE_S3_PREFIX_ENV) or "").strip().strip("/")
     archives = _list_capture_archives(base)
@@ -1052,13 +1038,7 @@ def _archive_sweep(base: str) -> None:
         )
         return
     try:
-        import boto3  # deferred: only the S3 offload path needs AWS
-    except Exception as exc:  # noqa: BLE001
-        _warn_once("no-boto3", f"groww sidecar: boto3 unavailable ({type(exc).__name__}) — archives kept on disk")
-        return
-    region = os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION") or "ap-south-1"
-    try:
-        s3 = boto3.client("s3", region_name=region)
+        s3 = (s3_client_factory or _default_s3_client_factory)()
     except Exception as exc:  # noqa: BLE001
         _warn_once("no-s3-client", f"groww sidecar: S3 client init failed ({type(exc).__name__}) — archives kept on disk")
         return
@@ -1067,6 +1047,11 @@ def _archive_sweep(base: str) -> None:
     for path in archives:
         name = os.path.basename(path)
         key = f"{prefix}/{name}" if prefix else name
+        if os.path.islink(path):
+            # SEC: never follow a symlink out of the capture dir — neither
+            # upload nor (below) delete it.
+            _warn_once(f"symlink:{name}", f"groww sidecar: {name} is a symlink — skipped (never followed)")
+            continue
         try:
             size = os.path.getsize(path)
         except OSError:
@@ -1091,19 +1076,21 @@ def _archive_sweep(base: str) -> None:
     # bridge's one-shot boot archive drain has finished (see
     # ARCHIVE_DELETE_GRACE_SECS). Sleeping the uptime deficit on a daemon
     # thread costs nothing.
-    uptime = time.time() - _PROCESS_START_SECS
-    deficit = ARCHIVE_DELETE_GRACE_SECS - uptime
+    uptime = time.time() - process_start_secs
+    deficit = grace_secs - uptime
     if deficit > 0:
-        time.sleep(deficit)
+        sleep_fn(deficit)
 
     # Pass B — verified delete. NEVER delete without the verified S3 copy:
     # eligibility = head_object-verified AT DELETE TIME + both grace legs
     # (_archive_delete_eligible). Anything ineligible is simply kept.
     now = time.time()
-    uptime = now - _PROCESS_START_SECS
+    uptime = now - process_start_secs
     for path in archives:
         name = os.path.basename(path)
         key = f"{prefix}/{name}" if prefix else name
+        if os.path.islink(path):
+            continue  # SEC: warned in pass A; a symlink is never deleted
         try:
             st = os.stat(path)
         except OSError:
@@ -1116,7 +1103,7 @@ def _archive_sweep(base: str) -> None:
                 "file KEPT (retry at the next sweep)",
             )
             continue
-        if not _archive_delete_eligible(verified, now - st.st_mtime, uptime, ARCHIVE_DELETE_GRACE_SECS):
+        if not _archive_delete_eligible(verified, now - st.st_mtime, uptime, grace_secs):
             continue  # inside a grace window — next trigger handles it
         try:
             os.remove(path)
@@ -1164,16 +1151,16 @@ class _RotatingOut:
 
     def __init__(self, path: str):
         self._path = path
-        # ROTATION-AT-OPEN (2026-07-13): a live file whose last write belongs
-        # to a previous IST day is archived BEFORE opening — the prod box
-        # (08:30-16:30 IST) is never alive at IST midnight, so this is the
-        # trigger that actually fires there. One stat, never a file scan.
-        _rotate_at_open_if_stale(path)
+        # NOTE (review round 1, F1+F2): rotation-at-open is RUST-owned
+        # (groww_bridge.rs::rotate_stale_groww_capture_at_open, executed
+        # before this sidecar is spawned) — the sidecar opens whatever live
+        # file exists and NEVER renames it at open.
         self._fh = open(path, "a", buffering=1)
         self._day = _ist_day(time.time())
         self._rotate_error_printed = False
-        # Startup archive sweep: verified S3 offload of anything rotated (now
-        # or by previous sessions) + retry of previously failed uploads.
+        # Startup archive sweep: verified S3 offload of anything rotated (by
+        # the Rust at-open rotation, a previous session's midnight rotation)
+        # + retry of previously failed uploads.
         _spawn_archive_sweep(path)
 
     def _maybe_rotate(self) -> None:
