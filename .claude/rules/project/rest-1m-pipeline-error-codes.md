@@ -691,6 +691,21 @@ and the `rest_fetch_audit` outcome names the recovery path. No strategy
 consumer exists (the §28 boundary); building one needs its own operator
 scope.
 
+**2026-07-13 update — the daily Quote-2 digest is LIVE (Groww REST plan
+PR-5):** the 15:45 IST dual-feed scorecard now carries one plain-English
+"Official minute candles — how fast after each minute closed" line per
+(feed, leg), aggregated from the day's `rest_fetch_audit` rows (+ the
+`spot_1m_rest` latency-fallback column for the Dhan spot leg, whose
+forensics emits remain the flagged follow-up) — prompt-pull p50/p99/max
+seconds-after-close, ok/failed counts, rate-limit hits, late recoveries
+and never-recovered gaps, all MEASURED, `-1` sentinels rendering "not
+measured yet". Degrade stages `rest_leg_*` live under SCOREBOARD-01; full
+contract in `dual-feed-scoreboard-error-codes.md` §2b. The per-fire
+histograms + typed pages above are UNCHANGED — the digest is the daily
+plain-English summary the §9.3 mandate demanded, not a new pager. The contract leg's `rest_fetch_audit` rows (PR-4,
+`leg='contract_1m'`) feed the SAME digest line automatically — no
+digest-side change was needed.
+
 ## §4. Trigger / auto-load
 
 This rule activates when editing:
