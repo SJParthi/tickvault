@@ -77,7 +77,18 @@ never conflated) — only always-on instruments can have out-of-session 1m
 rows (the aggregator session gate blocks everyone else), so the exclusion
 holds even on FAST crash-recovery boots where the registration set is
 never initialized. It is applied BEFORE any classification (including
-`off_grid_ts`). A data-derived exclusion of an instrument absent from the
+`off_grid_ts`) **and BEFORE the Query-A truncation tripwire (refuter
+round 3)**: GIFT Nifty's ~21h day (~1,260 1m rows) exceeds the 500-row
+1m LIMIT, so classifying truncation first would have made every FAST-arm
+boot a guaranteed daily Degraded page. The exclusion is still sound on a
+TRUNCATED row set — the session window holds at most 375 1m rows (< the
+500 LIMIT, test-pinned), so a truncated (≥ LIMIT-row) response
+necessarily contains out-of-session rows, and under the query's
+`ORDER BY ts ASC` the pre-open rows sort into the returned prefix (even
+a purely post-close overflow lands inside the LIMIT because in-session
+rows fill at most 375 of its slots). Only a NON-excluded instrument's
+LIMIT hit classifies the `truncated` degrade. A data-derived exclusion
+of an instrument absent from the
 registry set additionally emits ONE coalesced `warn!` per pass naming ≤5
 sample `security_id segment` pairs (self-disarm visibility — expected
 only on FAST-arm boots).
@@ -107,7 +118,7 @@ a `tf_consistency_audit` row + `tv_tf_verify_findings_total{category}`):
 | `missing_tf_row` | 1m rows cover a bucket window but the TF table has NO row for it (a lost seal). EXCEPTION: an absent Groww row on an un-catch-up-able TAIL window (effective end within 60s of the close — every final window plus e.g. the 2m penultimate `[15:27, 15:29)`) is the non-paging `tail_unsealed` carve-out (structurally unsealed on the prod schedule — see §0) |
 | `no_1m_coverage` | a stored TF row exists but ZERO 1m rows cover its window (baseline hole — the recompute cannot vouch) |
 | `off_grid_ts` | a stored TF row's `ts` is not on the session bucket grid (bucket-boundary corruption) |
-| `duplicate_key` | two stored TF rows share `(ts, security_id, segment, tf)` for one feed — DEDUP failed; compared on the FIRST row |
+| `duplicate_key` | two stored rows share `(ts, security_id, segment, tf)` for one feed — DEDUP failed; compared on the FIRST row. Fires for the higher-TF tables AND for the 1m BASELINE itself (rows carry tf label `1m` — a duplicated `candles_1m` key poisons every recompute built on it) |
 
 SOFT (never pages, no audit row beyond counters): `tick_count` divergence
 (`tv_tf_verify_soft_divergence_total{field="tick_count"}`), 1m-baseline

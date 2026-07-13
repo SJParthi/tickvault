@@ -435,14 +435,17 @@ mod tests {
 
     fn sample_finding() -> TfConsistencyFinding {
         TfConsistencyFinding {
-            // 2026-07-13 15:40:00 IST-as-epoch (illustrative deterministic run ts).
-            run_ts_ist_nanos: 1_784_281_800_000_000_000,
-            trading_date_ist_nanos: 1_784_225_400_000_000_000,
+            // 2026-07-13 15:40:00 IST-as-epoch — the deterministic run ts
+            // (2026-07-13 00:00:00 IST-as-epoch midnight = 1_783_900_800s;
+            // + 56_400s = 15:40:00). Corrected refuter round 3: the prior
+            // pair was neither the claimed instant nor an IST midnight.
+            run_ts_ist_nanos: 1_783_957_200_000_000_000,
+            trading_date_ist_nanos: 1_783_900_800_000_000_000,
             feed: "dhan",
             security_id: 13,
             segment: "IDX_I".to_string(),
             tf: "5m",
-            bucket_ts_ist_nanos: 1_784_225_400_000_000_000 + 33_300 * 1_000_000_000,
+            bucket_ts_ist_nanos: 1_783_900_800_000_000_000 + 33_300 * 1_000_000_000,
             category: FindingCategory::Mismatch,
             field: "high",
             stored_value: 25_647.5,

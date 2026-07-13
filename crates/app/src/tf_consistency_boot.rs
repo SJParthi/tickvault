@@ -1372,15 +1372,13 @@ async fn run_tf_pass(p: PassParams<'_>, state: &mut RunState) -> PassStats {
         }
         stats.instruments = stats.instruments.saturating_add(1);
 
-        // Query A — the 1m baseline.
+        // Query A — the 1m baseline. The parsed rows are kept even when
+        // the LIMIT tripped — the always-on exclusion below must see them
+        // FIRST (refuter round 3).
         let sql_1m = select_1m_sql(p.feed, *sid, segment, day_start_nanos);
-        let rows_1m = match http_get_text(p.client, p.exec_url, &sql_1m).await {
+        let (rows_1m, truncated_1m) = match http_get_text(p.client, p.exec_url, &sql_1m).await {
             Ok(body) => match parse_1m_dataset(&body, TF_VERIFY_1M_ROW_LIMIT) {
-                Ok((rows, false)) => rows,
-                Ok((_, true)) => {
-                    count_query_failure(&mut stats, "truncated");
-                    continue; // never a silent partial compare.
-                }
+                Ok(pair) => pair,
                 Err(reason) => {
                     count_query_failure(&mut stats, "query_failed");
                     warn!(feed = p.feed, security_id = sid, %reason, "tf_consistency: 1m parse failed (skip)");
@@ -1400,7 +1398,19 @@ async fn run_tf_pass(p: PassParams<'_>, state: &mut RunState) -> PassStats {
         // row outside [09:15, 15:30) IST marks the instrument always-on
         // even when the process-global set is empty (the FAST
         // crash-recovery boot arm never initializes it). Applied BEFORE
-        // any classification, including off_grid.
+        // any classification, including off_grid — AND BEFORE the Query-A
+        // truncation tripwire (refuter round 3): GIFT Nifty's ~21h day
+        // (~1,260 1m rows) exceeds TF_VERIFY_1M_ROW_LIMIT, so classifying
+        // truncation first made every FAST-arm boot (empty always_on set)
+        // a guaranteed daily Degraded page. The exclusion is still sound
+        // on a TRUNCATED row set: the session window holds at most 375
+        // 1m rows (< the 500 LIMIT — pinned by the
+        // `TF_VERIFY_1M_ROW_LIMIT > 375` assertion below), so a truncated
+        // (>= LIMIT-row) response necessarily contains out-of-session
+        // rows, and under the query's ORDER BY ts ASC the pre-open rows
+        // sort into the returned prefix (even a purely post-close
+        // overflow lands inside the LIMIT because in-session rows fill
+        // at most 375 of its slots).
         if has_out_of_session_1m_row(&rows_1m, day_start_nanos) {
             // Refuter round 2: the DATA-derived exclusion gets its own
             // reason label — an instrument reaching this arm is by
@@ -1416,6 +1426,16 @@ async fn run_tf_pass(p: PassParams<'_>, state: &mut RunState) -> PassStats {
             // Mirror the set-based exclusion above: an excluded instrument
             // is not counted as examined.
             stats.instruments = stats.instruments.saturating_sub(1);
+            continue;
+        }
+
+        // Truncation tripwire — ONLY for a NON-excluded instrument
+        // (refuter round 3): a truncated compare set is never trusted
+        // (no silent partial compare), but an EXCLUDED always-on
+        // instrument was never going to be compared at all, so its
+        // truncation must not degrade the run.
+        if truncated_1m {
+            count_query_failure(&mut stats, "truncated");
             continue;
         }
 
@@ -3274,8 +3294,10 @@ mod tests {
     }
 
     /// H2 + L8 wiring order inside the per-instrument sweep: the segment
-    /// allowlist gate precedes ANY query build, and the data-derived
-    /// always-on exclusion precedes Query B and all classification.
+    /// allowlist gate precedes ANY query build, the data-derived
+    /// always-on exclusion precedes the Query-A truncation tripwire
+    /// (refuter round 3 — a truncated always-on instrument must be
+    /// EXCLUDED, never degraded), Query B, and all classification.
     #[test]
     fn test_ratchet_exclusion_gates_precede_queries_and_classification() {
         let body = run_tf_pass_body();
@@ -3298,5 +3320,62 @@ mod tests {
             out_of_session < classify,
             "H2: exclusion before ANY classification (incl. off_grid)"
         );
+        // Refuter round 3: within the per-instrument loop, the FIRST
+        // "truncated" classification is the Query-A tripwire — it must sit
+        // AFTER the data-derived exclusion, otherwise GIFT Nifty's ~1,260
+        // 1m rows (> the 500 LIMIT) turn every FAST-arm boot into a
+        // guaranteed daily Degraded page.
+        let loop_start = body
+            .find("for (idx, (sid, segment)) in instruments.iter()")
+            .expect("per-instrument loop must exist");
+        let loop_body = &body[loop_start..];
+        let out_of_session_in_loop = loop_body
+            .find("has_out_of_session_1m_row(&rows_1m")
+            .expect("H2 exclusion must be inside the loop");
+        let first_truncated = loop_body
+            .find(r#"count_query_failure(&mut stats, "truncated")"#)
+            .expect("the Query-A truncation tripwire must exist");
+        assert!(
+            out_of_session_in_loop < first_truncated,
+            "refuter round 3: the always-on exclusion must precede the \
+             Query-A truncation tripwire (a truncated always-on \
+             instrument is excluded, never degraded)"
+        );
+    }
+
+    /// Refuter round 3: a >LIMIT always-on instrument (GIFT Nifty's ~21h
+    /// day) parses truncated=true AND its returned prefix still carries
+    /// out-of-session rows (ORDER BY ts ASC sorts pre-open rows first;
+    /// the session window holds at most 375 rows < the LIMIT) — so the
+    /// exclusion decision fires and the instrument is skipped WITHOUT a
+    /// truncation degrade or page.
+    #[test]
+    fn test_truncated_always_on_prefix_still_excluded_not_degraded() {
+        // Simulate the truncated response of a >LIMIT always-on day: the
+        // first returned rows are pre-open (00:00 IST onward), exactly as
+        // ORDER BY ts ASC delivers them. LIMIT 4 stands in for the 500.
+        let limit = 4;
+        let body = format!(
+            r#"{{"dataset":[
+                [{a},1.0,1.0,1.0,1.0,0,1],
+                [{b},1.0,1.0,1.0,1.0,0,1],
+                [{c},1.0,1.0,1.0,1.0,0,1],
+                [{d},1.0,1.0,1.0,1.0,0,1]
+            ]}}"#,
+            a = DAY_START,
+            b = DAY_START + 60 * NANOS_PER_SEC,
+            c = DAY_START + 33_300 * NANOS_PER_SEC,
+            d = DAY_START + 33_360 * NANOS_PER_SEC,
+        );
+        let (rows, truncated) = parse_1m_dataset(&body, limit).expect("parse");
+        assert!(truncated, "at-LIMIT response must flag the tripwire");
+        assert!(
+            has_out_of_session_1m_row(&rows, DAY_START),
+            "the truncated prefix must still expose the out-of-session \
+             rows, so the exclusion (NOT a degrade) decides the instrument"
+        );
+        // The real-limit arithmetic backing the reasoning: a truncated
+        // (>= LIMIT-row) response cannot be all in-session (375 max).
+        assert!(TF_VERIFY_1M_ROW_LIMIT > 375);
     }
 }

@@ -1,8 +1,12 @@
 # Implementation Plan: Daily timeframe-consistency verifier (TF-VERIFY-01/02)
 
-**Status:** APPROVED
+**Status:** VERIFIED
 **Date:** 2026-07-13
 **Approved by:** Parthiban (operator) — 2026-07-13 timeframe-correctness directive relayed via the coordinator session
+**Verified:** 2026-07-13 (refuter round 3) — every test name below grep-audited
+against the code (`grep -rn 'fn <name>' crates/` per name) and the app/storage/
+wiring-guard suites green; the round-2 plan carried ~10 paraphrased test names
+that did not exist by fn name, replaced here with the real ones.
 
 Operator directive (2026-07-13, verbatim): *"how will you guarantee that all
 our defined timeframes internally are correct — how do you identify whether
@@ -36,9 +40,7 @@ tick_count equality is soft (documented legitimate divergence classes).
   Default OFF) wired into `ApplicationConfig` in the `common` crate;
   config/base.toml opts in with a dated comment.
   - Files: crates/common/src/config.rs, config/base.toml
-  - Tests: test_tf_consistency_config_default_off,
-    test_tf_consistency_config_absent_section_disabled,
-    test_tf_consistency_config_explicit_enable
+  - Tests: test_tf_consistency_config_default_off_and_round_trip
 - [x] NotificationEvents `TfConsistencySummary` (data-dependent severity;
   BLIND / no_data wordings; ≤10 plain-English top_detail lines) +
   `TfConsistencyAborted` in the `core` crate, with rendering tests.
@@ -52,14 +54,18 @@ tick_count equality is soft (documented legitimate divergence classes).
   discard-pending poisoned-buffer defense; fail-soft ensure-DDL.
   - Files: crates/storage/src/tf_consistency_audit_persistence.rs,
     crates/storage/src/lib.rs
-  - Tests: test_tf_consistency_audit_create_ddl_columns_and_dedup,
-    test_tf_consistency_dedup_key_ts_first_segment_and_feed,
-    test_finding_category_as_str_stable, test_append_finding_fills_buffer,
-    test_tf_verify_flush_when_disconnected_errors_and_discards,
+  - Tests: test_tf_consistency_audit_create_ddl_contains_expected_columns,
+    test_tf_consistency_dedup_key_ts_first_segment_and_feed_in_key,
+    test_finding_category_as_str_labels_are_stable,
+    test_append_finding_writes_symbols_and_columns,
+    test_append_finding_both_feeds_coexist_in_one_buffer,
+    test_tf_verify_flush_when_disconnected_errors_and_discards_pending,
     test_tf_verify_discard_pending_clears_buffer_and_count,
-    test_tf_verify_writer_uses_ilp_http_conf,
-    test_ensure_tf_consistency_audit_table_mock_200 (+500/unreachable),
-    test_tf_verify_writer_new_is_lazy
+    test_tf_verify_writer_uses_ilp_http_conf_with_bounded_knobs,
+    test_ensure_tf_consistency_audit_table_mock_200_completes,
+    test_ensure_tf_consistency_audit_table_mock_500_degrades_without_panic,
+    test_ensure_tf_consistency_audit_table_unreachable_degrades_without_panic,
+    test_tf_verify_writer_new_is_lazy_and_buffers_without_network
 - [x] Verifier boot module in the `app` crate: pure grid/recompute/compare/
   classify/SQL/parse/decide fns + the async orchestrator + the
   process-global dual-spawn entry point.
@@ -68,17 +74,26 @@ tick_count equality is soft (documented legitimate divergence classes).
   - Tests: test_bucket_grid_daily_counts_all_19_tfs,
     test_tripwire_grid_agrees_with_tf_index_bucket_start,
     test_recompute_window_first_max_min_last_sum,
-    test_to_paise_boundaries, test_decide_tf_verify_start_variants,
-    test_previous_trading_day_walks_back_over_weekend,
-    test_select_1m_sql_micros_window_nanos_key_feed_filter_limit,
+    test_to_paise_boundaries,
+    test_decide_tf_verify_start_trigger_constant_is_1540_ist,
+    test_decide_tf_verify_start_sleeps_before_trigger,
+    test_decide_tf_verify_start_catch_up_at_and_after_trigger,
+    test_decide_tf_verify_start_skips_non_trading_day,
+    test_decide_tf_verify_start_force_overrides_everything,
+    test_previous_trading_day_walks_back_over_weekend_and_holiday,
+    test_select_1m_sql_micros_window_nanos_key_feed_filter_and_limit,
     test_select_tf_union_sql_has_19_arms_excludes_1m_and_1d,
-    test_parse_1m_dataset_flags_rows_at_cap,
+    test_parse_1m_dataset_happy_path_skips_malformed_flags_cap,
+    test_truncated_always_on_prefix_still_excluded_not_degraded,
+    test_ratchet_exclusion_gates_precede_queries_and_classification,
     test_classify_run_status_precedence (+ many more in the module)
 - [x] Wiring-guard ratchet pinning both main.rs spawn sites + the
   no-skeleton stub-guard.
   - Files: crates/app/tests/tf_consistency_wiring_guard.rs
-  - Tests: ratchet_tf_consistency_dual_spawn_sites,
-    ratchet_tf_consistency_boot_module_is_not_a_stub
+  - Tests: test_spawn_tf_consistency_tasks_is_wired_into_both_main_boot_paths,
+    test_spawn_tf_consistency_tasks_threads_config_calendar_notifier,
+    test_tf_consistency_boot_module_is_not_a_stub,
+    test_tf_consistency_boot_uses_once_per_process_guard
 - [x] Runbook `.claude/rules/project/tf-consistency-error-codes.md`
   (forward crossref + runbook_path target + delivery-boundary note).
   - Files: .claude/rules/project/tf-consistency-error-codes.md
@@ -155,6 +170,13 @@ enabled` + trading day; env `TICKVAULT_TF_VERIFY_NOW` force-runs and
   windows truncate at 15:30 (partial H1/H4 buckets compare correctly
   because no ≥15:30 1m row exists).
 - Query returns rows == LIMIT → truncation tripwire → read_degraded.
+  EXCEPTION (refuter round 3): the Query-A tripwire fires ONLY for a
+  NON-excluded instrument — the always-on/out-of-session exclusion runs
+  FIRST on the parsed rows (GIFT Nifty's ~21h day exceeds the 500-row 1m
+  LIMIT; classifying truncation first made every FAST-arm boot a
+  guaranteed daily Degraded page). Sound on a truncated set because the
+  session holds ≤375 1m rows < the LIMIT and ORDER BY ts ASC sorts the
+  out-of-session rows into the returned prefix.
 - Weekend/holiday walk-back for the Groww D-1 date (≤7 days, else the
   Groww pass degrades loudly).
 - Non-trading day: skip; `TICKVAULT_TF_VERIFY_NOW` without a DATE is
