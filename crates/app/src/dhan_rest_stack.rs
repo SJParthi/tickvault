@@ -235,11 +235,11 @@ pub fn dhan_rest_token_backoff_secs(attempt: u32) -> u64 {
 /// Called ONLY from main.rs's Dhan-OFF branch, and only when the RAW boot
 /// TOML retires the lane — see the module docs for the mutual-exclusion
 /// contract with the Dhan lane.
-// TEST-EXEMPT: orchestration spawn around live I/O (SSM lock + TOTP mint +
-// task spawns); the pure decisions (dhan_rest_stack_backoff_secs,
-// dhan_rest_retry_should_log, dhan_rest_peer_page_due) are unit-tested
-// below and the wiring is pinned by
-// crates/app/tests/dhan_live_off_phase_a_guard.rs.
+// The pure decisions (dhan_rest_stack_backoff_secs, dhan_rest_retry_should_log,
+// dhan_rest_peer_page_due) are unit-tested below and the wiring is pinned by
+// crates/app/tests/dhan_live_off_phase_a_guard.rs. The guard heuristic reads
+// only the line directly above the fn, so the exemption token sits last:
+// TEST-EXEMPT: orchestration spawn around live I/O (SSM lock + TOTP mint + task spawns)
 pub fn spawn_dhan_rest_stack(params: DhanRestStackParams) -> Option<tokio::task::JoinHandle<()>> {
     if DHAN_REST_STACK_SPAWNED.swap(true, Ordering::SeqCst) {
         info!(
@@ -351,7 +351,7 @@ async fn run_dhan_rest_stack(params: DhanRestStackParams) {
                 // ALWAYS fired before park — the ladder's page attempt (5,
                 // 150s cumulative) strictly precedes the 300s park threshold
                 // (first reachable at 310s, loop top), pinned by
-                // test_dhan_rest_lock_genuine_peer_pages_once_then_parks.
+                // test_dhan_rest_peer_page_due_genuine_peer_pages_once_then_parks.
                 error!(
                     code = ErrorCode::Resilience01DualInstanceDetected.code_str(),
                     severity = ErrorCode::Resilience01DualInstanceDetected
@@ -781,7 +781,7 @@ mod tests {
     /// restart / crash) is always taken over INSIDE the window, and the
     /// park predicate must be false everywhere below the threshold.
     #[test]
-    fn test_dhan_rest_lock_same_machine_bounded_patience_covers_ttl() {
+    fn test_dhan_rest_lock_park_due_same_machine_patience_covers_ttl() {
         // ≥3x TTL margin: a same-machine restart can never be mislabeled a
         // genuine peer just because the TTL takeover was a beat late.
         assert!(
@@ -809,7 +809,7 @@ mod tests {
     /// cumulative backoff reaches the park threshold within one more
     /// attempt, so a lurking retry-forever loop is structurally impossible.
     #[test]
-    fn test_dhan_rest_lock_genuine_peer_pages_once_then_parks() {
+    fn test_dhan_rest_peer_page_due_genuine_peer_pages_once_then_parks() {
         // Page timing: cumulative backoff before the page attempt > TTL.
         let cumulative_before_page: u64 = (1..DHAN_REST_STACK_PEER_PAGE_MIN_ATTEMPT)
             .map(dhan_rest_stack_backoff_secs)
