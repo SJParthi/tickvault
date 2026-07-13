@@ -205,10 +205,12 @@ patterns.
   per-day cap) does not NAME the `/historical/*` or `/option-chain/*` buckets — conservatively
   ASSUMED Live Data. Our ~6–12 requests/min is far inside either reading; 429s are counted,
   never out-polled.
-- **Shared-account budget note:** the ONE daily shared-minter token means the bucket is
-  effectively account-shared with BruteX. BruteX's bulk historical pulls are nightly /
-  post-market — TIME-DISJOINT from our in-session per-minute pulls (Assumed; coordinate
-  before relying on tighter headroom).
+- **Shared-account budget note:** whether Groww scopes rate limits per API key, per token,
+  or per account is officially UNSTATED (Unknown). Both BruteX and TickVault present the ONE
+  shared daily minter token, so the bucket is EFFECTIVELY shared for us either way — an
+  Assumed inference from the single shared token, not a documented fact. BruteX's bulk
+  historical pulls are nightly / post-market — TIME-DISJOINT from our in-session per-minute
+  pulls (Assumed; coordinate before relying on tighter headroom).
 - V2 candle timestamp type (string vs epoch) is UNVERIFIED-LIVE — defensive dual-format
   parse; zero-trade option-strike minutes may be legitimately absent (counted, never
   fabricated).

@@ -270,7 +270,7 @@ FORBIDDEN until the operator re-authorizes with a fresh dated quote. The live-vs
 
 > **2026-07-12 note:** the SP5–SP7 cancellation and the `BacktestSource` / `backtest`-module naming ban stand. The §37 consumer is a DIFFERENT mechanism (S3-CSV read of BruteX artifacts) named `brutex_crossverify` — never `backtest`/`BacktestSource`.
 
-> **2026-07-13 note:** the SP5–SP7 cancellation and the `BacktestSource`/`backtest` naming ban STILL stand. The §38 pipeline is a `get_historical_candles`-endpoint CONSUMER, but only in the per-minute scheduled shape (day-granular window, target-minute filter) — it is NOT the cancelled backtest-comparison fetcher, is never named `backtest`/`BacktestSource`, and performs no bulk sweeps.
+> **2026-07-13 note:** the SP5–SP7 cancellation and the `BacktestSource`/`backtest` naming ban STILL stand. The §38 pipeline is a `GET /v1/historical/candles` consumer, but only in the per-minute scheduled shape (day-granular window, target-minute filter) — it is NOT the cancelled backtest-comparison fetcher, is never named `backtest`/`BacktestSource`, and performs no bulk sweeps.
 
 ## §33.3 What is UNCHANGED
 
@@ -513,6 +513,10 @@ or per-(underlying, month) for month-scoped reasons (FUTIDX-01, feed=groww) —
 never fail the watch build; cross-feed expiry-SET divergence in any comparable month pages
 FUTIDX-02 (a far-suffix depth difference is an info-level note, never a page).
 
+> **2026-07-13 note:** the "(NO Groww historical call ever)" parenthetical is narrowed by
+> §38 — the per-minute SCHEDULED REST pulls of §38 are the sole authorized exception. §36's
+> own machinery is unchanged: expiry resolution still comes ONLY from the static master CSV.
+
 ## §36.2 Honest notes
 
 Groww LTP carries only `{ltp, tsInMillis}` — no volume/OI for futures (`cum_volume` stays 0). A
@@ -531,6 +535,10 @@ truncated); any new Groww connection; any Groww historical fetch (§33); resolvi
 anything but the static master CSV. (The pre-2026-07-10 single-expiry-per-underlying ban is
 REMOVED by this dated §36.7 edit.) This file must be edited FIRST with a fresh dated quote
 for any of the above.
+
+> **2026-07-13 note:** "any Groww historical fetch (§33)" reads: any Groww historical fetch
+> OUTSIDE the §38 per-minute scheduled grant. The §36 watch-set/expiry machinery itself
+> still makes no Groww REST call.
 
 ---
 
@@ -570,6 +578,11 @@ S3 cold-archive KEEP row — see the 2026-07-12 KEEP row added there). The new w
 `aws-sdk-s3` (exact pin, same feature set as the sibling aws-sdk-* pins) is authorized by
 Quote 1 as the read mechanism (flagged in the PR for the operator's visibility per the
 CLAUDE.md new-dep approval rule).
+
+> **2026-07-13 note:** "TickVault makes ZERO Groww API historical calls" narrows: zero
+> BULK/backtest Groww API calls remains true, but since 2026-07-13 the §38 per-minute
+> SCHEDULED pulls (spot 1m + option chain + bounded per-contract 1m) are the sole exception.
+> §33 stands for the Groww API surface outside the §38 grant.
 
 ## §37.2 The comparison contract (LOCKED)
 
@@ -636,7 +649,7 @@ current-state row per instrument, ts pinned):
 
 ## §37.6 What a violating PR looks like (REJECT)
 
-- Any Groww API historical/candle fetch from TickVault (§33 stands).
+- Any Groww API historical/candle fetch from TickVault OUTSIDE the §38 grant (2026-07-13 narrowing: §38's per-minute SCHEDULED pulls are the sole authorized exception — §33 stands for every other Groww fetch, incl. all bulk/backtest sweeps).
 - Any module/type named `backtest` / `BacktestSource` (§33.2 naming ban stands — the
   consumer is `brutex_crossverify`).
 - Reviving SP5–SP7 of the cancelled parity plan.
@@ -665,8 +678,10 @@ file containing `BRUTEX-XVERIFY` or `brutex_crossverify`.
 > `no-rest-except-live-feed-2026-06-27.md` §8 pipeline — and NOTHING else. §33's ban on bulk
 > Groww historical / backtest fetching otherwise stands. The 2-Dhan-WS lock (§3), the
 > shared-table model + feed-in-key, default-OFF per-feed toggles, the token-minter lock
-> (`groww-shared-token-minter-2026-07-02.md`), and the §4/§32.4/§36.3/§37.6 REJECT conditions
-> all stand unchanged.
+> (`groww-shared-token-minter-2026-07-02.md`), and the §4/§32.4/§36.3 REJECT conditions all
+> stand unchanged; the §37.6 REJECT conditions stand EXCEPT the historical-fetch bullet,
+> which this §38 grant narrows (per-minute scheduled pulls are the sole exception — reworded
+> in place with a dated 2026-07-13 qualifier).
 > **Cross-ref:** `no-rest-except-live-feed-2026-06-27.md` §9 (the same-day KEEP-class rows +
 > grant); companion plan `.claude/plans/active-plan-groww-rest-1m.md` (APPROVED 2026-07-13).
 
