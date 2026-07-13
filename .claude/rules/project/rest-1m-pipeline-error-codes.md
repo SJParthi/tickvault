@@ -228,15 +228,23 @@ collide. ADDITIONALLY (operator scope addition 2026-07-13): the NEW
 **`rest_fetch_audit` per-fetch forensics table**
 (`crates/storage/src/rest_fetch_audit_persistence.rs` — one row per
 `(target minute, symbol, feed, leg)` fetch, success AND failure, DEDUP
-`(ts, trading_date_ist, feed, leg, security_id, exchange_segment)`) is
-written BEST-EFFORT by the Groww leg (the Dhan leg's emit sites are a fast
-FOLLOW-UP after #1499 merges); its ensure/append/flush failures reuse
-SPOT1M-02 with stages `audit_ensure_client_build` / `audit_ensure_ddl` /
-`audit_append` / `audit_flush` + `tv_rest_fetch_audit_persist_errors_total{stage}`
-— a forensics write failure NEVER affects the fetch loop or the failure
-edge. A minute the 15:31 sweep still cannot recover is a NAMED GAP: one
-`rest_fetch_audit` row (`error_class="named_gap"` class slugs) per
-(minute, symbol) — never a silent hole.
+`(ts, trading_date_ist, feed, leg, security_id, exchange_segment, outcome)`
+— `outcome` in-key per phase-0 DEDUP rule 3 so TRANSITION rows BOTH
+survive: a sweep gap row never overwrites the minute's original ladder
+row; hostile round 1 item 5) is written BEST-EFFORT by the Groww leg (the
+Dhan leg's emit sites are a fast FOLLOW-UP after #1499 merges); its
+ensure/append/flush failures reuse SPOT1M-02 with stages
+`audit_ensure_client_build` / `audit_ensure_ddl` / `audit_append` /
+`audit_flush` + `tv_rest_fetch_audit_persist_errors_total{stage}` — a
+forensics write failure NEVER affects the fetch loop or the failure edge.
+A minute the 15:31 sweep still cannot recover is a NAMED GAP: one
+`rest_fetch_audit` row per (minute, symbol) with the DISTINCT
+`outcome="named_gap"` (hostile round 1 item 6 — never a misleading
+200+`error` pair; `final_http_status` = the ACTUAL last status when a
+fetch happened, 0 sentinel when none) and class slugs `named_gap` /
+`pre_boot` (a mid-session boot's pre-boot blind window is named
+AUDIT-ONLY — §38/§9 forbid a bulk backfill fetch) / `flush_failed` (swept
+minutes lost at the ILP flush) / `no_token` — never a silent hole.
 
 ## §2b. CHAIN-01 — option-chain entitlement absent (pipeline down for the day)
 
