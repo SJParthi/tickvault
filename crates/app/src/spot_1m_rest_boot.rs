@@ -48,9 +48,13 @@
 //!    failed flush — stays absent DURING the session; and the 15:30:00
 //!    fire is the last, so a vendor-late 15:29 candle has no in-session
 //!    repair path at all. The one bounded post-session sweep
-//!    (~15:31:00 IST, single fire, [`run_post_session_sweep`]) closes all
+//!    (~15:33:30 IST, single fire, [`run_post_session_sweep`]) closes all
 //!    three: it re-fetches the day window once per SID and persists every
-//!    session minute above the watermark that is still missing.
+//!    session minute above the watermark that is still missing. The sweep
+//!    fires at 15:33:30 — NOT 15:31 — so its ≤3 requests clear the 15:31
+//!    bulk cross-verify's burst window (2026-07-13 live session: 91/776
+//!    cross-verify fetches 429'd at 15:31–15:33; see the 429-coordination
+//!    follow-up in `rest-1m-pipeline-error-codes.md`).
 //!
 //! **First-attempt timing (honest):** the boundary sleep is computed on a
 //! SECOND-granular clock plus the 300 ms fire delay, so the first attempt
@@ -107,9 +111,11 @@ use tracing::{error, info, warn};
 use tickvault_common::config::QuestDbConfig;
 use tickvault_common::constants::{
     DHAN_CHARTS_INTRADAY_PATH, IST_UTC_OFFSET_SECONDS, SECONDS_PER_DAY,
-    SPOT_1M_REST_CONSECUTIVE_FAIL_PAGE_THRESHOLD, SPOT_1M_REST_FIRE_DELAY_MS,
-    SPOT_1M_REST_FIRE_STALE_GRACE_SECS, SPOT_1M_REST_FIRST_FIRE_SECS_OF_DAY_IST,
-    SPOT_1M_REST_INDICES, SPOT_1M_REST_LAST_FIRE_SECS_OF_DAY_IST, SPOT_1M_REST_MAX_BODY_BYTES,
+    SPOT_1M_REST_429_EXTRA_BACKOFF_MS, SPOT_1M_REST_CONSECUTIVE_FAIL_PAGE_THRESHOLD,
+    SPOT_1M_REST_FIRE_DELAY_MS, SPOT_1M_REST_FIRE_STALE_GRACE_SECS,
+    SPOT_1M_REST_FIRST_FIRE_SECS_OF_DAY_IST, SPOT_1M_REST_INDICES,
+    SPOT_1M_REST_LADDER_JITTER_SLOTS, SPOT_1M_REST_LADDER_JITTER_STEP_MS,
+    SPOT_1M_REST_LAST_FIRE_SECS_OF_DAY_IST, SPOT_1M_REST_MAX_BODY_BYTES,
     SPOT_1M_REST_REQUEST_TIMEOUT_SECS, SPOT_1M_REST_RETRY_OFFSETS_MS, SPOT_1M_REST_SID_BUDGET_SECS,
 };
 use tickvault_common::error_code::ErrorCode;
@@ -314,13 +320,32 @@ pub fn backfill_minute_nanos(
     (prev >= session_first_minute_nanos && last_persisted.is_none_or(|l| l < prev)).then_some(prev)
 }
 
-/// Post-session sweep instant, IST seconds-of-day: 15:31:00 — one minute
-/// after the last (15:30:00) fire, once the whole session is final. The
-/// single bounded sweep re-fetches the day window ONCE per SID and
-/// backfills every session minute above the persisted watermark that is
-/// still missing (M1, review 2026-07-13: the 15:30:00 fire is the LAST, so
-/// a vendor-late 15:29 candle had no repair path).
-const SPOT_1M_REST_SWEEP_FIRE_SECS_OF_DAY_IST: u32 = 15 * 3600 + 31 * 60;
+/// Post-session sweep instant, IST seconds-of-day: 15:33:30 — after the
+/// last (15:30:00) fire, once the whole session is final. The single
+/// bounded sweep re-fetches the day window ONCE per SID and backfills
+/// every session minute above the persisted watermark that is still
+/// missing (M1, review 2026-07-13: the 15:30:00 fire is the LAST, so a
+/// vendor-late 15:29 candle had no repair path).
+///
+/// 429-coordination (2026-07-13, same-day follow-up): moved from 15:31:00
+/// to 15:33:30 so the sweep's ≤3 requests land AFTER the 15:31 bulk
+/// cross-verify's observed 429 burst window (live session 2026-07-13:
+/// 91/776 cross-verify fetches failed HTTP 429 between 15:31 and 15:33).
+/// The const-assert below pins the sweep strictly clear of that window.
+const SPOT_1M_REST_SWEEP_FIRE_SECS_OF_DAY_IST: u32 = 15 * 3600 + 33 * 60 + 30;
+
+// The sweep must clear the cross-verify burst: at least 150 s after the
+// 15:31:00 cross-verify trigger (burst observed through 15:33), and still
+// comfortably before the 16:30 IST box stop.
+const _: () = assert!(
+    SPOT_1M_REST_SWEEP_FIRE_SECS_OF_DAY_IST
+        >= crate::cross_verify_1m_boot::CROSS_VERIFY_TRIGGER_SECS_OF_DAY_IST + 150,
+    "post-session sweep must clear the 15:31-15:33 cross-verify burst window"
+);
+const _: () = assert!(
+    SPOT_1M_REST_SWEEP_FIRE_SECS_OF_DAY_IST < 16 * 3600 + 30 * 60,
+    "post-session sweep must fire before the 16:30 IST box stop"
+);
 
 /// All session minutes STILL MISSING above the persisted watermark at
 /// sweep time: `(watermark, session_last]` step one minute (the whole
@@ -385,6 +410,41 @@ pub fn retry_sleep_deltas_ms() -> [u64; 4] {
         o[2].saturating_sub(o[1]),
         o[3].saturating_sub(o[2]),
     ]
+}
+
+/// Deterministic per-SID ladder jitter (ms) for the SID at `slot` in the
+/// pinned [`SPOT_1M_REST_INDICES`] array: `(slot % slots) × step` → 0 /
+/// 150 / 300 ms for the 3 spot SIDs. The slot (a SID's fixed position in
+/// the const array) is used instead of `sid % 3` because the pinned SIDs
+/// 13/25/51 give `1/1/0` under `% 3` — two of three would still re-poll in
+/// lockstep. NO randomness — deterministic + testable (429-coordination
+/// follow-up 2026-07-13). Pure.
+#[must_use]
+pub fn ladder_jitter_ms(slot: usize) -> u64 {
+    (slot as u64 % SPOT_1M_REST_LADDER_JITTER_SLOTS) * SPOT_1M_REST_LADDER_JITTER_STEP_MS
+}
+
+/// The sleep (ms) before one ladder re-poll: the schedule delta, plus the
+/// per-SID jitter on the FIRST re-poll only (shifting the whole schedule —
+/// later deltas are relative, so the shift carries through), plus the
+/// bounded [`SPOT_1M_REST_429_EXTRA_BACKOFF_MS`] when the PREVIOUS attempt
+/// was rate-limited (HTTP 429) so the next poll never lands straight back
+/// inside Dhan's rate-limit window. Pure — worst-case totals are
+/// const-asserted inside the hard per-SID budget in `constants.rs`.
+#[must_use]
+pub fn ladder_sleep_ms(
+    base_delta_ms: u64,
+    is_first_repoll: bool,
+    jitter_ms: u64,
+    prev_rate_limited: bool,
+) -> u64 {
+    base_delta_ms
+        .saturating_add(if is_first_repoll { jitter_ms } else { 0 })
+        .saturating_add(if prev_rate_limited {
+            SPOT_1M_REST_429_EXTRA_BACKOFF_MS
+        } else {
+            0
+        })
 }
 
 /// IST 12-hour label for a seconds-of-day instant (Telegram commandment 9
@@ -612,13 +672,18 @@ async fn spot_1m_fetch_once(
 }
 
 /// Bounded in-minute re-poll ladder for ONE index: first attempt at the
-/// fire instant, then re-polls at [`SPOT_1M_REST_RETRY_OFFSETS_MS`] until
-/// the target minute's candle appears — after the last offset the minute
-/// is `Empty`/`Failed`, never an unbounded in-minute retry (DH-904/429
-/// counts via the REAL `StatusCode` + falls out of the ladder like any
-/// other error). The WHOLE ladder is additionally hard-bounded by
-/// [`SPOT_1M_REST_SID_BUDGET_SECS`] in [`fetch_minute_bounded`] so no
-/// stall combination can overrun the minute (2026-07-12 H2 fix).
+/// fire instant, then re-polls at [`SPOT_1M_REST_RETRY_OFFSETS_MS`] (the
+/// whole schedule shifted by the deterministic per-SID `jitter_ms` so the
+/// 3 SIDs never re-poll in lockstep) until the target minute's candle
+/// appears — after the last offset the minute is `Empty`/`Failed`, never
+/// an unbounded in-minute retry. DH-904/429 counts via the REAL
+/// `StatusCode` AND adds the bounded extra backoff before the NEXT rung
+/// ([`ladder_sleep_ms`]) — same rung count, never an extra retry
+/// (429-coordination follow-up 2026-07-13). The WHOLE ladder is
+/// additionally hard-bounded by [`SPOT_1M_REST_SID_BUDGET_SECS`] in
+/// [`fetch_minute_bounded`] so no stall combination can overrun the
+/// minute (2026-07-12 H2 fix).
+#[allow(clippy::too_many_arguments)] // APPROVED: private ladder — a struct would be pure ceremony
 async fn fetch_minute_with_ladder(
     client: &reqwest::Client,
     url: &str,
@@ -627,15 +692,23 @@ async fn fetch_minute_with_ladder(
     target_minute_ist_nanos: i64,
     backfill_minute_ist_nanos: Option<i64>,
     minute_close_ms_of_day: i64,
+    jitter_ms: u64,
 ) -> SidFetchOutcome {
     let deltas = retry_sleep_deltas_ms();
     let mut last_error: Option<String> = None;
+    let mut prev_rate_limited = false;
     // Sticky: the FIRST 2xx body carrying the due backfill minute wins —
     // preserved across rungs and across a failing own-minute verdict.
     let mut backfill_found: Option<MinuteCandle> = None;
     for attempt in 0..=deltas.len() {
         if attempt > 0 {
-            tokio::time::sleep(Duration::from_millis(deltas[attempt - 1])).await;
+            let sleep_ms = ladder_sleep_ms(
+                deltas[attempt - 1],
+                attempt == 1,
+                jitter_ms,
+                prev_rate_limited,
+            );
+            tokio::time::sleep(Duration::from_millis(sleep_ms)).await;
         }
         let started = std::time::Instant::now();
         let result = spot_1m_fetch_once(client, url, jwt.expose_secret(), body).await;
@@ -663,12 +736,15 @@ async fn fetch_minute_with_ladder(
                 // 2xx without the target minute — the seal may not have
                 // landed yet; the next ladder rung re-polls.
                 last_error = None;
+                prev_rate_limited = false;
             }
             Err(failure) => {
                 if failure.rate_limited {
-                    // DH-904 class: counted; NEVER retried past the ladder.
+                    // DH-904 class: counted; the NEXT rung waits the extra
+                    // bounded backoff; NEVER retried past the ladder.
                     metrics::counter!("tv_spot1m_rate_limited_total").increment(1);
                 }
+                prev_rate_limited = failure.rate_limited;
                 last_error = Some(failure.msg);
             }
         }
@@ -689,6 +765,7 @@ async fn fetch_minute_with_ladder(
 /// failure for the minute — the fire can never overrun the next boundary
 /// (the const-asserts in `constants.rs` pin the budget < 60 s including
 /// the per-request timeout).
+#[allow(clippy::too_many_arguments)] // APPROVED: private budget wrapper over the ladder — same rationale
 async fn fetch_minute_bounded(
     client: &reqwest::Client,
     url: &str,
@@ -697,6 +774,7 @@ async fn fetch_minute_bounded(
     target_minute_ist_nanos: i64,
     backfill_minute_ist_nanos: Option<i64>,
     minute_close_ms_of_day: i64,
+    jitter_ms: u64,
 ) -> SidFetchOutcome {
     match tokio::time::timeout(
         Duration::from_secs(SPOT_1M_REST_SID_BUDGET_SECS),
@@ -708,6 +786,7 @@ async fn fetch_minute_bounded(
             target_minute_ist_nanos,
             backfill_minute_ist_nanos,
             minute_close_ms_of_day,
+            jitter_ms,
         ),
     )
     .await
@@ -980,7 +1059,7 @@ async fn fire_one_minute(
         let minute_close_ms = i64::from(fire_secs_of_day).saturating_mul(MILLIS_PER_SEC);
 
         let mut join_set = tokio::task::JoinSet::new();
-        for (security_id, symbol) in SPOT_1M_REST_INDICES {
+        for (slot, (security_id, symbol)) in SPOT_1M_REST_INDICES.into_iter().enumerate() {
             let client = client.clone();
             let url = url.to_string();
             let jwt = jwt.clone();
@@ -992,6 +1071,9 @@ async fn fire_one_minute(
                 target_nanos,
                 session_first_nanos,
             );
+            // 429-coordination (2026-07-13): deterministic per-SID schedule
+            // shift so the 3 concurrent ladders never re-poll in lockstep.
+            let jitter_ms = ladder_jitter_ms(slot);
             join_set.spawn(async move {
                 let outcome = fetch_minute_bounded(
                     &client,
@@ -1001,6 +1083,7 @@ async fn fire_one_minute(
                     target_nanos,
                     backfill_nanos,
                     minute_close_ms,
+                    jitter_ms,
                 )
                 .await;
                 (security_id, symbol, outcome)
@@ -1165,8 +1248,10 @@ pub fn minute_fully_failed(ok_count: usize, persist_failed: bool) -> bool {
     ok_count == 0 || persist_failed
 }
 
-/// ONE bounded post-session repair sweep (~15:31:00 IST, single fire —
-/// M1, review 2026-07-13): once the session is final, re-fetch the proven
+/// ONE bounded post-session repair sweep (~15:33:30 IST, single fire —
+/// M1, review 2026-07-13; moved off 15:31 the same day so it clears the
+/// bulk cross-verify's observed 15:31–15:33 429 burst window): once the
+/// session is final, re-fetch the proven
 /// day window ONCE per SID that still has session minutes above its
 /// persisted watermark (the 15:29 candle after a vendor-late seal, a
 /// flush-failed backfill row, any tail gap the per-minute one-minute
@@ -1851,7 +1936,7 @@ mod tests {
     // ---- post-session sweep (M1, review 2026-07-13) --------------------------
 
     /// The M1 scenario: the 15:29 candle sealed late, its own 15:30:00
-    /// fire found nothing (watermark stuck at 15:28) — the 15:31 sweep
+    /// fire found nothing (watermark stuck at 15:28) — the 15:33:30 sweep
     /// must select exactly the 15:29 minute and find it in the final
     /// day-window response.
     #[test]
@@ -1911,6 +1996,102 @@ mod tests {
             session_last,
         );
         assert_eq!(missing, vec![session_last - NANOS_PER_MINUTE, session_last]);
+    }
+
+    // ---- 429 coordination (2026-07-13 follow-up) -----------------------------
+
+    /// The sweep fire instant is pinned at 15:33:30 IST — strictly clear of
+    /// the bulk cross-verify's observed 15:31–15:33 429 burst window
+    /// (2026-07-13 live session: 91/776 cross-verify fetches 429'd there).
+    #[test]
+    fn test_sweep_fire_instant_clears_cross_verify_burst_window() {
+        assert_eq!(
+            SPOT_1M_REST_SWEEP_FIRE_SECS_OF_DAY_IST,
+            15 * 3600 + 33 * 60 + 30, // 15:33:30 = 56_010
+        );
+        // ≥ 150 s after the 15:31:00 cross-verify trigger (burst observed
+        // through 15:33) and before the 16:30 IST box stop.
+        assert!(
+            SPOT_1M_REST_SWEEP_FIRE_SECS_OF_DAY_IST
+                >= crate::cross_verify_1m_boot::CROSS_VERIFY_TRIGGER_SECS_OF_DAY_IST + 150
+        );
+        assert!(SPOT_1M_REST_SWEEP_FIRE_SECS_OF_DAY_IST > SPOT_1M_REST_LAST_FIRE_SECS_OF_DAY_IST);
+        assert!(SPOT_1M_REST_SWEEP_FIRE_SECS_OF_DAY_IST < 16 * 3600 + 30 * 60);
+    }
+
+    /// Deterministic per-SID jitter: one distinct value per slot of the
+    /// pinned index array (0 / 150 / 300 ms), bounded by
+    /// `(slots - 1) × step`, wrapping for defensive out-of-range slots.
+    /// Slot-based (not `sid % 3`) because the pinned SIDs 13/25/51 give
+    /// 1/1/0 under `% 3` — two ladders would still re-poll in lockstep.
+    #[test]
+    fn test_ladder_jitter_ms_bounds_and_decorrelation() {
+        let jitters: Vec<u64> = (0..SPOT_1M_REST_INDICES.len())
+            .map(ladder_jitter_ms)
+            .collect();
+        assert_eq!(jitters, vec![0, 150, 300], "one distinct shift per SID");
+        let max = (SPOT_1M_REST_LADDER_JITTER_SLOTS - 1) * SPOT_1M_REST_LADDER_JITTER_STEP_MS;
+        for j in &jitters {
+            assert!(*j <= max, "jitter bounded by (slots-1) x step");
+        }
+        // All three schedules are pairwise distinct — no lockstep re-polls.
+        assert!(jitters[0] != jitters[1] && jitters[1] != jitters[2] && jitters[0] != jitters[2]);
+        // Defensive wrap for a hypothetical 4th slot.
+        assert_eq!(ladder_jitter_ms(3), 0);
+    }
+
+    /// The ladder sleep composition: jitter shifts ONLY the first re-poll
+    /// (later deltas are relative, so the whole schedule carries the
+    /// shift), and a 429 on the previous attempt adds exactly the bounded
+    /// extra backoff.
+    #[test]
+    fn test_ladder_sleep_ms_jitter_and_429_backoff_composition() {
+        let deltas = retry_sleep_deltas_ms();
+        // First re-poll, no 429: base + jitter.
+        assert_eq!(
+            ladder_sleep_ms(deltas[0], true, 300, false),
+            deltas[0] + 300
+        );
+        // Later re-poll: jitter NOT re-applied.
+        assert_eq!(ladder_sleep_ms(deltas[1], false, 300, false), deltas[1]);
+        // 429 on the previous attempt: + the bounded extra backoff.
+        assert_eq!(
+            ladder_sleep_ms(deltas[2], false, 300, true),
+            deltas[2] + SPOT_1M_REST_429_EXTRA_BACKOFF_MS
+        );
+        // First re-poll after a first-attempt 429: both apply.
+        assert_eq!(
+            ladder_sleep_ms(deltas[0], true, 150, true),
+            deltas[0] + 150 + SPOT_1M_REST_429_EXTRA_BACKOFF_MS
+        );
+    }
+
+    /// Worst-case all-429 jittered schedule stays inside the hard per-SID
+    /// budget: every rung rate-limited (extra backoff before each of the 4
+    /// re-polls) + max jitter + one full request timeout < 20 s.
+    #[test]
+    fn test_ladder_worst_case_429_schedule_stays_inside_sid_budget() {
+        let deltas = retry_sleep_deltas_ms();
+        let max_jitter =
+            (SPOT_1M_REST_LADDER_JITTER_SLOTS - 1) * SPOT_1M_REST_LADDER_JITTER_STEP_MS;
+        let mut total_sleep_ms: u64 = 0;
+        for (i, delta) in deltas.iter().enumerate() {
+            total_sleep_ms += ladder_sleep_ms(*delta, i == 0, max_jitter, true);
+        }
+        // Scheduled sleeps sum to the (jittered) last offset + 4 backoffs.
+        assert_eq!(
+            total_sleep_ms,
+            SPOT_1M_REST_RETRY_OFFSETS_MS[3]
+                + max_jitter
+                + deltas.len() as u64 * SPOT_1M_REST_429_EXTRA_BACKOFF_MS
+        );
+        // Plus one full request timeout: still inside the hard budget the
+        // `tokio::time::timeout` enforces (19.3 s < 20 s).
+        assert!(
+            total_sleep_ms + SPOT_1M_REST_REQUEST_TIMEOUT_SECS * 1_000
+                < SPOT_1M_REST_SID_BUDGET_SECS * 1_000,
+            "worst-case 429 ladder must fit the per-SID budget"
+        );
     }
 
     /// Tracker: max-merge commits; double-persisting the same minute
