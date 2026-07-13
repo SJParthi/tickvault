@@ -13,6 +13,15 @@
 
 ---
 
+> **⚠ RETIREMENT AUTHORIZED 2026-07-13 (deletion lands with the Phase C PRs):**
+> `PREVDAY-01` (`PrevDay01CoverageEmpty`) and the boot-time prev-day OHLCV fetch retire
+> with the Dhan live WS lane (Q1, 2026-07-13 — the fetch's universe input and its
+> `*_pct_from_prev_day` consumers are lane-only; `websocket-connection-scope-lock.md`
+> "2026-07-13 Amendment"). The retained Dhan REST surface is the §8 per-minute
+> `spot_1m_rest` / `option_chain_1m` pulls on hardcoded SIDs — no prev-day sweep. The
+> `prev_day_ohlcv` table is retained (forensic). Content below retained for historical
+> audit.
+
 ## §0. Why this exists (the 2026-06-26 silent-empties signature)
 
 After auth + instruments load, the boot-time prev-day fetch

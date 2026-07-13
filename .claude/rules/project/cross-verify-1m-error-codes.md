@@ -9,6 +9,22 @@
 
 ---
 
+> **⚠ RETIREMENT AUTHORIZED 2026-07-13 (deletion lands with the Phase C PRs):** the
+> 15:31 IST Dhan live-vs-historical 1m cross-verify — and with it `CROSS-VERIFY-1M-01`
+> (`CrossVerify1m01MismatchFound`) and `CROSS-VERIFY-1M-02`
+> (`CrossVerify1m02FetchDegraded`) — retires with the Dhan live WS: with no Dhan live
+> candles there is no live side to compare (operator Q1/Q2, 2026-07-13;
+> `websocket-connection-scope-lock.md` "2026-07-13 Amendment"). For the record: this
+> subsystem was BLIND SINCE BIRTH until PR #1474 (2026-07-11) fixed the micros-vs-nanos
+> SQL literal bug (`compared=0` on every run, honestly reported as BLIND), and its FIRST
+> working sessions surfaced the live-vs-historical mismatches behind the operator's Q2
+> retirement rationale — the amendment's §E evidence table carries the numbers. Phase C
+> obligation: `spot_1m_rest_boot` imports `parse_intraday_1m_candles` + `MinuteCandle`
+> from `cross_verify_1m_boot.rs` — the parser MUST be relocated before the file is
+> deleted (Phase B map §4, Verified). The `cross_verify_1m_audit` table + CSVs are
+> retained (forensic). Ongoing OHLCV parity signals: the §37 BruteX comparison + the §38
+> Groww/Dhan per-minute REST tables. Content below retained for historical audit.
+
 ## §0. Why this exists (operator directive 2026-06-02)
 
 Operator quote: *"put back the historical cross verification at precise 3.31 pm
