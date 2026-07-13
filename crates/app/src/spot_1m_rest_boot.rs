@@ -42,6 +42,15 @@
 //!    stamps the REAL retrieval delay (> 60 s), while the
 //!    `tv_spot1m_close_to_data_ms` histogram keeps sampling ONLY own-fire
 //!    retrievals (its defined "just-closed availability" semantics).
+//! 3. **Post-session sweep** (M1, review 2026-07-13): the per-minute
+//!    backfill looks back exactly ONE minute, so a minute that stays
+//!    absent for ≥2 consecutive fires — or a backfill row lost to a
+//!    failed flush — stays absent DURING the session; and the 15:30:00
+//!    fire is the last, so a vendor-late 15:29 candle has no in-session
+//!    repair path at all. The one bounded post-session sweep
+//!    (~15:31:00 IST, single fire, [`run_post_session_sweep`]) closes all
+//!    three: it re-fetches the day window once per SID and persists every
+//!    session minute above the watermark that is still missing.
 //!
 //! **First-attempt timing (honest):** the boundary sleep is computed on a
 //! SECOND-granular clock plus the 300 ms fire delay, so the first attempt
@@ -297,6 +306,39 @@ pub fn backfill_minute_nanos(
 ) -> Option<i64> {
     let prev = target_minute_nanos.saturating_sub(NANOS_PER_MINUTE);
     (prev >= session_first_minute_nanos && last_persisted.is_none_or(|l| l < prev)).then_some(prev)
+}
+
+/// Post-session sweep instant, IST seconds-of-day: 15:31:00 — one minute
+/// after the last (15:30:00) fire, once the whole session is final. The
+/// single bounded sweep re-fetches the day window ONCE per SID and
+/// backfills every session minute above the persisted watermark that is
+/// still missing (M1, review 2026-07-13: the 15:30:00 fire is the LAST, so
+/// a vendor-late 15:29 candle had no repair path).
+const SPOT_1M_REST_SWEEP_FIRE_SECS_OF_DAY_IST: u32 = 15 * 3600 + 31 * 60;
+
+/// All session minutes STILL MISSING above the persisted watermark at
+/// sweep time: `(watermark, session_last]` step one minute (the whole
+/// session when nothing was ever persisted). Bounded to ≤375 minutes by
+/// construction. Pure.
+#[must_use]
+pub fn sweep_missing_minutes(
+    last_persisted: Option<i64>,
+    session_first_minute_nanos: i64,
+    session_last_minute_nanos: i64,
+) -> Vec<i64> {
+    let start = match last_persisted {
+        Some(w) => w
+            .saturating_add(NANOS_PER_MINUTE)
+            .max(session_first_minute_nanos),
+        None => session_first_minute_nanos,
+    };
+    let mut out = Vec::new();
+    let mut m = start;
+    while m <= session_last_minute_nanos {
+        out.push(m);
+        m = m.saturating_add(NANOS_PER_MINUTE);
+    }
+    out
 }
 
 /// Per-SID latest successfully PERSISTED minute (append + flush confirmed).
@@ -740,7 +782,11 @@ pub async fn run_spot_1m_rest(params: Spot1mRestTaskParams) {
         }
         let now = ist_secs_of_day_now();
         let Some(fire) = next_fire_after(now, last_fired) else {
-            info!("spot_1m_rest: past 15:30 IST — today's minute fires complete");
+            info!(
+                "spot_1m_rest: past 15:30 IST — today's minute fires complete; \
+                 running the one bounded post-session sweep"
+            );
+            run_post_session_sweep(&client, &url, &params, &mut writer, &mut tracker).await;
             return;
         };
         let sleep_ms =
@@ -1111,6 +1157,177 @@ async fn fire_one_minute(
 #[must_use]
 pub fn minute_fully_failed(ok_count: usize, persist_failed: bool) -> bool {
     ok_count == 0 || persist_failed
+}
+
+/// ONE bounded post-session repair sweep (~15:31:00 IST, single fire —
+/// M1, review 2026-07-13): once the session is final, re-fetch the proven
+/// day window ONCE per SID that still has session minutes above its
+/// persisted watermark (the 15:29 candle after a vendor-late seal, a
+/// flush-failed backfill row, any tail gap the per-minute one-minute
+/// lookback could not reach) and persist every one found. Bounded: ≤3
+/// requests total, ≤375 minutes/SID, DEDUP-idempotent re-appends; loud
+/// counters (`tv_spot1m_sweep_backfilled_total` /
+/// `tv_spot1m_sweep_still_missing_total`) + one coalesced coded log; the
+/// swept rows' `close_to_data_ms` column stamps the honest real delay.
+/// The membership filter is O(missing × candles) ≤ 375×375 once per day —
+/// cold path, flagged honestly.
+// TEST-EXEMPT: live-deps async runner — the missing-minute selection (sweep_missing_minutes) and row/window builders are pure fns unit-tested below; the HTTP+persist legs reuse the tested fire_one_minute pattern.
+async fn run_post_session_sweep(
+    client: &reqwest::Client,
+    url: &str,
+    params: &Spot1mRestTaskParams,
+    writer: &mut Spot1mRestWriter,
+    tracker: &mut PersistTracker,
+) {
+    // Wait for the sweep instant (a run reaching here right at 15:30:00
+    // sleeps ~60s; a late boot past 15:31 fires immediately).
+    let now = ist_secs_of_day_now();
+    if now < SPOT_1M_REST_SWEEP_FIRE_SECS_OF_DAY_IST {
+        tokio::time::sleep(Duration::from_secs(u64::from(
+            SPOT_1M_REST_SWEEP_FIRE_SECS_OF_DAY_IST - now,
+        )))
+        .await;
+    }
+    // Same-day defense: a suspend across midnight (seconds-of-day wrapped
+    // below the close) or a day flip means the session data is no longer
+    // "today's" — skip rather than stamp the wrong trading date.
+    let woke = ist_secs_of_day_now();
+    if woke < SPOT_1M_REST_LAST_FIRE_SECS_OF_DAY_IST || !params.calendar.is_trading_day_today() {
+        warn!(
+            woke_at_secs = woke,
+            "spot_1m_rest: post-session sweep woke outside today's session \
+             (midnight wrap / non-trading day) — skipping"
+        );
+        return;
+    }
+    let trading_date = today_ist();
+    let trading_date_nanos = minute_open_ist_nanos(trading_date, 0);
+    let session_first =
+        minute_open_ist_nanos(trading_date, SPOT_1M_REST_FIRST_FIRE_SECS_OF_DAY_IST - 60);
+    let session_last =
+        minute_open_ist_nanos(trading_date, SPOT_1M_REST_LAST_FIRE_SECS_OF_DAY_IST - 60);
+    let jwt: Option<secrecy::SecretString> = {
+        let guard = params.token_handle.load();
+        guard
+            .as_ref()
+            .as_ref()
+            .map(|state| state.access_token().clone())
+    };
+    let Some(jwt) = jwt else {
+        error!(
+            code = ErrorCode::Spot1m01FetchDegraded.code_str(),
+            stage = "sweep_failed",
+            "SPOT1M-01: no access token at post-session sweep time — \
+             missing minutes stay absent (DEDUP-idempotent manual re-run \
+             remains possible)"
+        );
+        return;
+    };
+
+    let mut swept: u64 = 0;
+    let mut still_missing: u64 = 0;
+    let mut staged: Vec<(SecurityId, i64)> = Vec::new();
+    let mut persist_failed = false;
+    for (security_id, symbol) in SPOT_1M_REST_INDICES {
+        let missing = sweep_missing_minutes(
+            tracker.last_persisted(security_id),
+            session_first,
+            session_last,
+        );
+        if missing.is_empty() {
+            continue;
+        }
+        let body = spot_1m_day_request_body(&security_id.to_string(), trading_date);
+        let candles = match spot_1m_fetch_once(client, url, jwt.expose_secret(), &body).await {
+            Ok(body_text) => parse_intraday_1m_candles(&body_text),
+            Err(failure) => {
+                if failure.rate_limited {
+                    metrics::counter!("tv_spot1m_rate_limited_total").increment(1);
+                }
+                error!(
+                    code = ErrorCode::Spot1m01FetchDegraded.code_str(),
+                    stage = "sweep_failed",
+                    security_id,
+                    reason = %failure.msg,
+                    "SPOT1M-01: post-session sweep fetch failed for this SID"
+                );
+                still_missing = still_missing.saturating_add(missing.len() as u64);
+                continue;
+            }
+        };
+        let mut found_for_sid: u64 = 0;
+        for minute_nanos in &missing {
+            let Some(candle) = select_minute_candle(&candles, *minute_nanos) else {
+                still_missing = still_missing.saturating_add(1);
+                continue;
+            };
+            // Honest real retrieval delay for the swept minute.
+            let close_ms_of_day = ((minute_nanos - trading_date_nanos) / NANOS_PER_SEC + 60)
+                .saturating_mul(MILLIS_PER_SEC);
+            let close_to_data_ms = (ist_millis_of_day_now() - close_ms_of_day).max(0);
+            let row = build_spot_1m_row(
+                &candle,
+                security_id,
+                symbol,
+                trading_date_nanos,
+                close_to_data_ms,
+            );
+            if let Err(err) = writer.append_row(&row) {
+                persist_failed = true;
+                metrics::counter!("tv_spot1m_persist_errors_total", "stage" => "append")
+                    .increment(1);
+                error!(
+                    code = ErrorCode::Spot1m02PersistFailed.code_str(),
+                    stage = "append",
+                    security_id,
+                    ?err,
+                    "SPOT1M-02: post-session sweep row append failed"
+                );
+                still_missing = still_missing.saturating_add(1);
+            } else {
+                found_for_sid = found_for_sid.saturating_add(1);
+                staged.push((security_id, *minute_nanos));
+            }
+        }
+        swept = swept.saturating_add(found_for_sid);
+    }
+    if let Err(err) = writer.flush() {
+        persist_failed = true;
+        metrics::counter!("tv_spot1m_persist_errors_total", "stage" => "flush").increment(1);
+        error!(
+            code = ErrorCode::Spot1m02PersistFailed.code_str(),
+            stage = "flush",
+            ?err,
+            "SPOT1M-02: post-session sweep ILP flush failed — pending swept \
+             rows discarded (poisoned-buffer defense)"
+        );
+        still_missing = still_missing.saturating_add(swept);
+        swept = 0;
+    } else {
+        for (security_id, minute_nanos) in staged {
+            tracker.commit(security_id, minute_nanos);
+        }
+    }
+    metrics::counter!("tv_spot1m_sweep_backfilled_total").increment(swept);
+    metrics::counter!("tv_spot1m_sweep_still_missing_total").increment(still_missing);
+    if still_missing > 0 || persist_failed {
+        error!(
+            code = ErrorCode::Spot1m01FetchDegraded.code_str(),
+            stage = "sweep_incomplete",
+            swept,
+            still_missing,
+            persist_failed,
+            "SPOT1M-01: post-session sweep left session minutes absent — \
+             the day's table stays short (DEDUP-idempotent manual re-run \
+             remains possible)"
+        );
+    } else {
+        info!(
+            swept,
+            "spot_1m_rest: post-session sweep complete — every session \
+             minute above the watermark is persisted"
+        );
+    }
 }
 
 /// Coalesced per-minute verdict: ONE coded log per fired minute with any
@@ -1623,6 +1840,71 @@ mod tests {
         t.commit(51, 42);
         assert_eq!(t.last_persisted(51), Some(42));
         assert_eq!(t.last_persisted(13), None, "per-SID isolation");
+    }
+
+    // ---- post-session sweep (M1, review 2026-07-13) --------------------------
+
+    /// The M1 scenario: the 15:29 candle sealed late, its own 15:30:00
+    /// fire found nothing (watermark stuck at 15:28) — the 15:31 sweep
+    /// must select exactly the 15:29 minute and find it in the final
+    /// day-window response.
+    #[test]
+    fn test_sweep_recovers_vendor_late_1529_minute() {
+        let date = NaiveDate::from_ymd_opt(2026, 7, 13).expect("valid date");
+        let session_first = minute_open_ist_nanos(date, FIRST - 60); // 09:15
+        let session_last = minute_open_ist_nanos(date, LAST - 60); // 15:29
+        let watermark_1528 = session_last - NANOS_PER_MINUTE;
+        let missing = sweep_missing_minutes(Some(watermark_1528), session_first, session_last);
+        assert_eq!(missing, vec![session_last], "exactly the 15:29 minute");
+        // The post-close day window now carries the late-sealed candle.
+        let utc_1529 = session_last / 1_000_000_000 - 19_800;
+        let body = format!(
+            r#"{{"open":[100.0],"high":[101.0],"low":[99.0],"close":[100.5],
+                "volume":[0],"timestamp":[{utc_1529}]}}"#
+        );
+        let candles = parse_intraday_1m_candles(&body);
+        let found = select_minute_candle(&candles, missing[0]).expect("15:29 swept in");
+        assert_eq!(found.minute_ts_ist_nanos, session_last);
+    }
+
+    /// Sweep no-ops when nothing is missing: watermark at the session's
+    /// last minute (15:29) → empty selection → zero requests.
+    #[test]
+    fn test_sweep_missing_minutes_noop_when_complete() {
+        let date = NaiveDate::from_ymd_opt(2026, 7, 13).expect("valid date");
+        let session_first = minute_open_ist_nanos(date, FIRST - 60);
+        let session_last = minute_open_ist_nanos(date, LAST - 60);
+        assert!(sweep_missing_minutes(Some(session_last), session_first, session_last).is_empty());
+        // A watermark somehow past the session (defensive): still empty.
+        assert!(
+            sweep_missing_minutes(
+                Some(session_last + NANOS_PER_MINUTE),
+                session_first,
+                session_last
+            )
+            .is_empty()
+        );
+    }
+
+    /// No watermark at all (post-close boot / fresh tracker): the sweep
+    /// selects the WHOLE 375-minute session — the full-day repair case —
+    /// and a multi-minute tail gap selects each missing minute.
+    #[test]
+    fn test_sweep_missing_minutes_full_session_and_tail_gap() {
+        let date = NaiveDate::from_ymd_opt(2026, 7, 13).expect("valid date");
+        let session_first = minute_open_ist_nanos(date, FIRST - 60);
+        let session_last = minute_open_ist_nanos(date, LAST - 60);
+        let all = sweep_missing_minutes(None, session_first, session_last);
+        assert_eq!(all.len(), 375, "one per session minute");
+        assert_eq!(all[0], session_first);
+        assert_eq!(*all.last().expect("non-empty"), session_last);
+        // Tail gap: watermark at 15:27 → 15:28 + 15:29 both selected.
+        let missing = sweep_missing_minutes(
+            Some(session_last - 2 * NANOS_PER_MINUTE),
+            session_first,
+            session_last,
+        );
+        assert_eq!(missing, vec![session_last - NANOS_PER_MINUTE, session_last]);
     }
 
     /// Tracker: max-merge commits; double-persisting the same minute

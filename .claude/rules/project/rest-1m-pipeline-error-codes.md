@@ -324,6 +324,23 @@ the CHAIN-02 failure edge.
    `df -h /data` + RESOURCE-03 and see the retention follow-up note in
    `option_chain_1m_persistence.rs`.
 
+**Day-1 enabled-boot operator checklist (2026-07-13, review M2 — the
+DOUBLE-strike/TIMESTAMP-expiry DEDUP key is UNVERIFIED-LIVE):** on the
+FIRST boot with `[option_chain_1m].enabled = true`:
+1. Watch boot logs for `CHAIN-03` with `stage="ensure_client_build"` /
+   `stage="ensure_ddl"` — a rejected/skipped DEDUP DDL means the first ILP
+   write may auto-create `option_chain_1m` WITHOUT DEDUP UPSERT KEYS: a
+   SILENT duplicate-row window until a later boot's ensure succeeds.
+2. Verify DEDUP actually engaged:
+   `mcp__tickvault-logs__questdb_sql "select * from wal_tables() where name = 'option_chain_1m'"`
+   (table present + not suspended), and after the first enabled hour run
+   the duplicate spot check —
+   `mcp__tickvault-logs__questdb_sql "select ts, security_id, strike, leg, count(*) c from option_chain_1m group by ts, security_id, strike, leg order by c desc limit 5"`
+   (adjust column names to the live schema if they differ) — every `c`
+   MUST be 1. Any `c > 1` = DEDUP did not engage; fix the DDL (re-run the
+   ensure via a restart) and manually dedup the window before trusting
+   the day's rows.
+
 **Honest envelope:** the table is a forensic/reference capture — a persist
 outage loses chain rows for the outage window only; it never affects tick
 capture, the WS candles, or trading. **Partial-persist wrinkle
