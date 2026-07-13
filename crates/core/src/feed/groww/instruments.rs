@@ -360,8 +360,16 @@ const INDEX_SECURITY_ID_BIT: i64 = 1 << 62;
 /// across boots, and the sidecar never re-derives it. Because every index id has
 /// bit 62 set and stock ids (numeric tokens) are far below `2^32`, the two ranges
 /// are DISJOINT by construction — collision is impossible, not merely unlikely.
+///
+/// PUBLIC since 2026-07-13 (Groww per-minute REST plan, PR-2): this is the
+/// CANONICAL Groww index id — the per-minute REST leg
+/// (`crates/app/src/groww_spot_1m_boot.rs`) reuses it so `feed='groww'`
+/// rows in `spot_1m_rest` carry the SAME `security_id` values as the live
+/// lane's ticks/candles for these indices (cross-source joins work by
+/// construction). Any consumer deriving a Groww index id MUST call this —
+/// never re-implement the hash.
 #[must_use]
-fn stable_index_security_id(groww_symbol: &str) -> i64 {
+pub fn stable_index_security_id(groww_symbol: &str) -> i64 {
     const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
     const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
     let mut hash = FNV_OFFSET;
@@ -2638,5 +2646,30 @@ mod tests {
             "the FUTIDX-01 miss emissions must run AFTER assemble_watch_set succeeds — \
              a failing assemble day must never re-page per retry attempt"
         );
+    }
+
+    /// `stable_index_security_id` is PUBLIC since 2026-07-13 (the Groww
+    /// per-minute REST leg reuses it): pin its contract — deterministic,
+    /// bit-62 band `[2^62, 2^63)` (positive, disjoint from stock tokens),
+    /// and distinct across the 3 REST-leg index symbols.
+    #[test]
+    fn test_stable_index_security_id_public_contract_for_rest_leg() {
+        for symbol in ["NSE-NIFTY", "NSE-BANKNIFTY", "BSE-SENSEX"] {
+            let id = stable_index_security_id(symbol);
+            assert_eq!(
+                id,
+                stable_index_security_id(symbol),
+                "id must be deterministic across calls for {symbol}"
+            );
+            assert!(id > 0, "id must be a positive i64 for {symbol}");
+            assert!(
+                id & (1 << 62) != 0,
+                "bit 62 must be set (index band) for {symbol}"
+            );
+        }
+        let nifty = stable_index_security_id("NSE-NIFTY");
+        let banknifty = stable_index_security_id("NSE-BANKNIFTY");
+        let sensex = stable_index_security_id("BSE-SENSEX");
+        assert!(nifty != banknifty && banknifty != sensex && nifty != sensex);
     }
 }

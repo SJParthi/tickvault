@@ -45,6 +45,11 @@ pub mod spot_1m_rest_boot;
 // chain for the 3 underlyings via POST /v2/optionchain and persist to the
 // `option_chain_1m` table (CHAIN-01..04).
 pub mod option_chain_1m_boot;
+// Groww per-minute spot 1m REST leg (operator grant 2026-07-13 — PR-2 of
+// the Groww per-minute REST plan): the just-closed minute's official Groww
+// 1m OHLCV for the 3 spot indices → `spot_1m_rest` feed='groww' + the
+// `rest_fetch_audit` per-fetch forensics rows.
+pub mod groww_spot_1m_boot;
 // Dual-feed scoreboard PR-A (operator 2026-07-10): boot-time process-death
 // reconciler + the 15:45 IST daily Dhan-vs-Groww aggregation + the Telegram
 // scorecard summary (SCOREBOARD-01 family).
@@ -62,6 +67,12 @@ pub mod boot_helpers;
 /// Dhan lane's running flag honest across runtime toggles and enforces the
 /// Dhan-disable safety gate at the supervisor layer (operator 2026-06-21/24).
 pub mod dhan_activation;
+/// Dhan REST-only auth bootstrap (Phase A of the Dhan-live-feed removal,
+/// operator directive 2026-07-13): with `feeds.dhan_enabled = false` this
+/// brings up the RETAINED Dhan REST surface — dual-instance lock →
+/// TokenManager → renewal + mid-session watchdog → REST canary +
+/// spot_1m_rest + option_chain_1m — WITHOUT any WebSocket lane.
+pub mod dhan_rest_stack;
 /// Groww runtime activation watcher — feed toggle cold-starts/teardowns the
 /// whole Groww lane live (operator 2026-06-24). Default-OFF; dormant until enabled.
 pub mod groww_activation;

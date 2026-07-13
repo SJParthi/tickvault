@@ -524,8 +524,14 @@ resource "aws_cloudwatch_metric_alarm" "clock_skew_high" {
 # (3-month) data-pull NEVER ages a partition past the eviction window — so the
 # disk only grows for the whole run, with zero auto-eviction. This alarm is the
 # trip-wire. RESPONSE (no downtime, no data loss — gp3 grows online):
-#   1. bump ebs_gp3_size_gb (e.g. 30 -> 50) in variables.tf + terraform apply
+#   1. grow the LIVE volume online: scripts/aws-upgrade-instance.sh --ebs-size N
+#      (aws ec2 modify-volume; terraform apply does NOT touch the live volume —
+#      volume_size is in lifecycle.ignore_changes) + bump ebs_gp3_size_gb in
+#      variables.tf so fresh-provision intent matches (done 30 -> 50 on
+#      2026-07-13 when the fs hit 82%).
 #   2. on the box (SSM): sudo growpart /dev/nvme0n1 1 && sudo xfs_growfs /
+#      (or wait for the next daily boot — AL2023 cloud-init growpart/resizefs
+#      run every boot and auto-expand the fs).
 #   See docs/runbooks/may31-inplace-upgrade-and-access.md §2.1.
 #
 # Uses a CloudWatch Metrics Insights query so we do NOT have to pin the
@@ -533,7 +539,7 @@ resource "aws_cloudwatch_metric_alarm" "clock_skew_high" {
 # mount path only.
 resource "aws_cloudwatch_metric_alarm" "disk_used_high" {
   alarm_name          = "tv-${var.environment}-disk-used-high"
-  alarm_description   = "Root volume > 75% full. 90-day retention means a 3-month run never auto-evicts, so the disk only grows. Grow online (no downtime): bump ebs_gp3_size_gb 30->50 + apply, then on the box: sudo growpart /dev/nvme0n1 1 && sudo xfs_growfs /. See may31-inplace-upgrade-and-access.md §2.1."
+  alarm_description   = "Root volume > 75% full. 90-day retention means a 3-month run never auto-evicts, so the disk only grows. Grow online (no downtime): scripts/aws-upgrade-instance.sh --ebs-size N (modify-volume; grown 30->50 on 2026-07-13), then on the box: sudo growpart /dev/nvme0n1 1 && sudo xfs_growfs / (or the next daily boot's cloud-init growpart/resizefs). See may31-inplace-upgrade-and-access.md §2.1."
   comparison_operator = "GreaterThanThreshold"
   evaluation_periods  = 1
   threshold           = 75

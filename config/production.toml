@@ -58,9 +58,11 @@ port = 3001
 sns_enabled = true
 
 [feeds]
-# Both market-data feeds run under the single prod env (operator 2026-06-30).
-# Dhan (feed #1) is the primary trading feed; Groww (feed #2) is the
-# independent second live feed per groww-second-feed-scope-2026-06-19.md.
+# 2026-07-13 operator directive: Dhan live WS feed removed from runtime; Dhan
+# retained for REST pulls only (spot_1m_rest / option_chain_1m / historical).
+# Groww is the live feed. (Supersedes the 2026-06-30 both-feeds lock; the
+# Dhan REST retained surface is brought up WITHOUT the WS lane by
+# crates/app/src/dhan_rest_stack.rs when dhan_enabled = false.)
 # Neither feed places orders — dry_run=true above gates all order placement.
-dhan_enabled = true
+dhan_enabled = false
 groww_enabled = true

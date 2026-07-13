@@ -79,9 +79,15 @@
 //! boot-symmetry 2026-06-09), so a mid-session crash restart re-arms this
 //! task; the process-global once-guard there prevents duplicates on runtime
 //! Dhan cold-start cycles. BOTH call sites are Dhan-gated — correct here,
-//! because this fetcher is Dhan-REST-dependent (token) — so a Groww-only
-//! session (`dhan_enabled = false`) runs NO spot-1m REST fetch: a
-//! documented limitation, mirroring the rest_canary.
+//! because this fetcher is Dhan-REST-dependent (token).
+//!
+//! **2026-07-13 update (Phase A, Dhan-live-feed removal):** the old
+//! "a Groww-only session runs NO spot-1m REST fetch" limitation is CLOSED —
+//! with `dhan_enabled = false` (now the locked default; the live WS lane is
+//! retired) the Dhan REST-only stack (`crate::dhan_rest_stack`) spawns this
+//! scheduler with its OWN TokenManager, mirroring the
+//! spawn_post_market_tasks shape (same params, same config gate, same
+//! spot→chain sequencing channel).
 //!
 //! ## Lifetime
 //! The task runs today's remaining minute closes and exits after 15:30 IST

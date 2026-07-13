@@ -308,10 +308,13 @@ auto_start_docker = true
 
 # Pluggable market-data feed selection (Groww second feed, operator lock
 # 2026-06-19 — .claude/rules/project/groww-second-feed-scope-2026-06-19.md).
-# Dhan = feed #1 (default ON, UNCHANGED). Groww = feed #2 (default OFF,
-# opt-in). Run Dhan-only (today's default), Groww-only, or both.
+# 2026-07-13 operator directive: Dhan live WS feed removed from runtime; Dhan
+# retained for REST pulls only (spot_1m_rest / option_chain_1m / historical).
+# Groww is the live feed. The Dhan REST retained surface is brought up
+# WITHOUT the WS lane by crates/app/src/dhan_rest_stack.rs when
+# dhan_enabled = false (Phase A — flip + REST-only bootstrap).
 [feeds]
-dhan_enabled = true
+dhan_enabled = false
 groww_enabled = false
 # Groww NATIVE-RUST SHADOW client (PR-R1 of the parity migration, operator
 # "go" 2026-07-04 — groww-second-feed-scope-2026-06-19.md §35). Default OFF.
@@ -484,3 +487,18 @@ enabled = true
 [option_chain_1m]
 enabled = true  # entitlement proven live 2026-07-13 08:31:49 IST (§8.7)
 probe_and_report = true
+
+# ===========================================================================
+# Groww per-minute spot 1m REST leg (operator grant 2026-07-13 — PR-2 of
+# the Groww per-minute REST plan). Every trading-day minute close in
+# [09:16:00, 15:30:00] IST, fetch the just-closed minute's official 1m
+# OHLCV for the 3 spot indices (NSE-NIFTY / NSE-BANKNIFTY / BSE-SENSEX)
+# via Groww GET /v1/historical/candles and persist to the SAME
+# spot_1m_rest table tagged feed='groww' (feed-in-key DEDUP — the Dhan
+# rows are untouched). Token: shared-minter SSM READ-ONLY (never mint).
+# Independent of the Dhan lane (process-global spawn) — a Dhan-off session
+# still runs it. Cold path; the WS pipelines are untouched. An ABSENT
+# section = disabled (fail-safe); `enabled = false` is the rollback switch.
+# ===========================================================================
+[groww_spot_1m]
+enabled = true
