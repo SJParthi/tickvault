@@ -512,17 +512,17 @@ jobs:
               "# Reconstructs /opt/tickvault layout if user-data.sh.tftpl never completed",
               "# (rebuilt instance / EBS swap / cold restore). No-op when already correct.",
               "# Ensure git is installed (AL2023 uses dnf; AL2 uses yum — try both).",
-              "command -v git >/dev/null 2>&1 || sudo dnf install -y git || sudo yum install -y git",
+              "command -v git >/dev/null 2>&1 || sudo timeout 180 dnf install -y git || sudo timeout 180 yum install -y git",
               "# Ensure Docker is installed AND running. AL2023 ships `docker` in the",
               "# default repo but does NOT ship `docker-compose-plugin` — Docker Compose",
               "# v2 must be installed manually as a CLI plugin via curl from GitHub.",
               "# All steps idempotent: dnf install no-ops if present, systemctl enable",
               "# is no-op if running, curl download is no-op if plugin already exists.",
-              "command -v docker >/dev/null 2>&1 || sudo dnf install -y docker || sudo yum install -y docker",
+              "command -v docker >/dev/null 2>&1 || sudo timeout 180 dnf install -y docker || sudo timeout 180 yum install -y docker",
               "sudo systemctl enable --now docker",
               "sudo usermod -aG docker ec2-user || true",
-              "docker compose version >/dev/null 2>&1 || sudo dnf install -y docker-compose-plugin || true",
-              "if ! docker compose version >/dev/null 2>&1; then sudo mkdir -p /usr/local/lib/docker/cli-plugins && sudo curl -fsSL https://github.com/docker/compose/releases/download/v2.29.7/docker-compose-linux-$(uname -m) -o /usr/local/lib/docker/cli-plugins/docker-compose && sudo chmod +x /usr/local/lib/docker/cli-plugins/docker-compose; fi",
+              "docker compose version >/dev/null 2>&1 || sudo timeout 180 dnf install -y docker-compose-plugin || true",
+              "if ! docker compose version >/dev/null 2>&1; then sudo mkdir -p /usr/local/lib/docker/cli-plugins && sudo curl -fsSL --max-time 120 https://github.com/docker/compose/releases/download/v2.29.7/docker-compose-linux-$(uname -m) -o /usr/local/lib/docker/cli-plugins/docker-compose && sudo chmod +x /usr/local/lib/docker/cli-plugins/docker-compose; fi",
               "docker compose version || (echo FATAL: docker compose plugin install failed; exit 1)",
               "mkdir -p /opt/tickvault/config /opt/tickvault/data/spill /opt/tickvault/logs /opt/tickvault/bin",
               "chown -R ec2-user:ec2-user /opt/tickvault",
@@ -533,7 +533,7 @@ jobs:
               "# the box keeps its first-boot config + systemd unit. CRITICAL: the",
               "# systemd unit carries TV_ENVIRONMENT (single real env: prod, dry_run=true);",
               "# a stale unit could load an older env and arm the wrong config.",
-              "if [ -d repo/.git ]; then sudo -u ec2-user git -C repo fetch --depth 1 origin main && sudo -u ec2-user git -C repo reset --hard origin/main; fi",
+              "if [ -d repo/.git ]; then sudo -u ec2-user timeout 120 git -C repo fetch --depth 1 origin main && sudo -u ec2-user git -C repo reset --hard origin/main; fi",
               "# Sync config files from the refreshed repo clone (idempotent).",
               "# Failures here MUST surface — previously masked by `2>/dev/null || true`",
               "# which silently swallowed missing dirs / permission errors. After cp,",
@@ -577,8 +577,8 @@ jobs:
               "# Back up the current binary so we can roll back",
               "if [ -f bin/tickvault ]; then cp bin/tickvault bin/tickvault.backup; fi",
               "# Download the new binaries from S3",
-              "aws s3 cp s3://tv-prod-cold/deploys/${{ github.sha }}/tickvault  bin/tickvault.new",
-              "aws s3 cp s3://tv-prod-cold/deploys/${{ github.sha }}/smoke_test bin/smoke_test.new",
+              "timeout 300 aws s3 cp s3://tv-prod-cold/deploys/${{ github.sha }}/tickvault  bin/tickvault.new",
+              "timeout 300 aws s3 cp s3://tv-prod-cold/deploys/${{ github.sha }}/smoke_test bin/smoke_test.new",
               "chmod +x bin/tickvault.new bin/smoke_test.new",
               "# Run smoke test using the NEW standalone binary (must exit 0 in < 30s)",
               "timeout 40 bin/smoke_test.new --duration 30",
@@ -607,7 +607,7 @@ jobs:
               "# so the bind persists across restarts. Idempotent grep-or-append.",
               "grep -q \"^TV_QDB_HTTP_BIND=\" repo/deploy/docker/.env 2>/dev/null || echo \"TV_QDB_HTTP_BIND=0.0.0.0\" >> repo/deploy/docker/.env",
               "chown ec2-user:ec2-user repo/deploy/docker/.env",
-              "if [ -f repo/deploy/docker/docker-compose.yml ]; then export TV_QUESTDB_PG_USER=$(aws ssm get-parameter --region ap-south-1 --name /tickvault/prod/questdb/pg-user --with-decryption --output text --query Parameter.Value 2>/dev/null || echo admin); export TV_QUESTDB_PG_PASSWORD=$(aws ssm get-parameter --region ap-south-1 --name /tickvault/prod/questdb/pg-password --with-decryption --output text --query Parameter.Value 2>/dev/null || echo quest); (cd repo/deploy/docker && TV_QUESTDB_PG_USER=\"$TV_QUESTDB_PG_USER\" TV_QUESTDB_PG_PASSWORD=\"$TV_QUESTDB_PG_PASSWORD\" docker compose up -d) || (echo FATAL: docker compose up failed; exit 1); else echo FATAL: docker-compose.yml missing from repo/deploy/docker; exit 1; fi",
+              "if [ -f repo/deploy/docker/docker-compose.yml ]; then export TV_QUESTDB_PG_USER=$(aws ssm get-parameter --region ap-south-1 --name /tickvault/prod/questdb/pg-user --with-decryption --output text --query Parameter.Value 2>/dev/null || echo admin); export TV_QUESTDB_PG_PASSWORD=$(aws ssm get-parameter --region ap-south-1 --name /tickvault/prod/questdb/pg-password --with-decryption --output text --query Parameter.Value 2>/dev/null || echo quest); (cd repo/deploy/docker && TV_QUESTDB_PG_USER=\"$TV_QUESTDB_PG_USER\" TV_QUESTDB_PG_PASSWORD=\"$TV_QUESTDB_PG_PASSWORD\" timeout 600 docker compose up -d) || (echo FATAL: docker compose up failed or exceeded 600s; exit 1); else echo FATAL: docker-compose.yml missing from repo/deploy/docker; exit 1; fi",
               "# Verify QuestDB is actually listening on 9000 (HTTP) within 30s",
               "for i in 1 2 3 4 5 6; do if curl -fsS http://127.0.0.1:9000/exec?query=SELECT%201 >/dev/null 2>&1; then echo QUESTDB-UP; break; fi; sleep 5; if [ $i -eq 6 ]; then echo FATAL: QuestDB not responding on :9000 after 30s; docker compose -f repo/deploy/docker/docker-compose.yml ps; exit 1; fi; done",
               "# Console-shell HARD canary (2026-07-06 shell-hang fix; hard gate 2026-07-08): the console back lambda rewrites GET / -> /index.html, so /index.html must complete box-locally within 5s on every box deploy — this is the lane that ships QuestDB image bumps. curl -f fails on any code >= 400, and --max-time 5 fails an unframed keep-alive response whose body never completes (curl exit 28): completion-within-5s IS the framing assertion. Disclosed limitation: a framed 3xx at /index.html (< 400) passes curl -f here; the end-to-end proxy gate in terraform-apply.yml requires a literal 200 and catches that shape on the next in-window apply. Never probe bare / here: QuestDB answers it with an unframed keep-alive 301 that would hang this shell.",
@@ -645,7 +645,7 @@ jobs:
               "# has zero log streams. Idempotent. EVERY step is `|| true` and bounded by",
               "# `timeout` / `--no-block` so the agent can NEVER block or fail the deploy —",
               "# the verified-running trading app above is what the deploy succeeds on.",
-              "command -v amazon-cloudwatch-agent-ctl >/dev/null 2>&1 || sudo dnf install -y amazon-cloudwatch-agent || sudo yum install -y amazon-cloudwatch-agent || (curl -fsSL https://amazoncloudwatch-agent-ap-south-1.s3.ap-south-1.amazonaws.com/amazon_linux/arm64/latest/amazon-cloudwatch-agent.rpm -o /tmp/cwa.rpm && sudo rpm -i /tmp/cwa.rpm) || true",
+              "command -v amazon-cloudwatch-agent-ctl >/dev/null 2>&1 || sudo timeout 180 dnf install -y amazon-cloudwatch-agent || sudo timeout 180 yum install -y amazon-cloudwatch-agent || (curl -fsSL --max-time 120 https://amazoncloudwatch-agent-ap-south-1.s3.ap-south-1.amazonaws.com/amazon_linux/arm64/latest/amazon-cloudwatch-agent.rpm -o /tmp/cwa.rpm && sudo rpm -i /tmp/cwa.rpm) || true",
               "sudo mkdir -p /opt/aws/amazon-cloudwatch-agent/etc",
               "if [ -f repo/deploy/aws/cloudwatch-agent.json ]; then sudo cp -f repo/deploy/aws/cloudwatch-agent.json /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json; fi",
               "if [ -f repo/deploy/aws/prometheus.yaml ]; then sudo cp -f repo/deploy/aws/prometheus.yaml /opt/aws/amazon-cloudwatch-agent/etc/prometheus.yaml; fi",
@@ -654,7 +654,7 @@ jobs:
               "sudo systemctl start amazon-cloudwatch-agent --no-block || true",
               "echo CWAGENT-CONFIGURED",
               "sleep 8",
-              "echo === CWAGENT STATUS ===; sudo /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a status || true",
+              "echo === CWAGENT STATUS ===; sudo timeout 30 /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a status || true",
               "echo === CWAGENT OWN LOG tail40 ===; sudo tail -n 40 /opt/aws/amazon-cloudwatch-agent/logs/amazon-cloudwatch-agent.log 2>/dev/null || true",
               "echo === APP LOG DIR ===; ls -la /opt/tickvault/data/logs/ 2>/dev/null | head -20 || true; ls -la /opt/tickvault/data/logs/machine/ 2>/dev/null | head -20 || true",
               "echo DEPLOY OK"
@@ -679,29 +679,36 @@ jobs:
         # Status=InProgress (with EMPTY stdout/stderr, because SSM only fills
         # those at a terminal state) and hard-failed a deploy that was actually
         # still progressing (deploy run 26732460896, 2026-06-01). We poll
-        # manually with a ~15-minute budget for a genuine TERMINAL state instead.
+        # manually with a ~25-minute budget for a genuine TERMINAL state instead.
         continue-on-error: true
         run: |
           set -uo pipefail
           REGION="${{ vars.AWS_REGION || 'ap-south-1' }}"
           CMD_ID="${{ steps.ssm.outputs.command_id }}"
           IID="${{ secrets.EC2_INSTANCE_ID }}"
-          # 150 polls × 5s = 750s nominal. Bumped 120 → 150 (2026-07-13): the
-          # observed cadence is ~6.3s/poll (5s sleep + ~1.3s API round-trip —
-          # runs 29269805430 / 29273283894 burned 120 polls in ~12.6 min), and
-          # the on-box script now carries a bounded 300s `systemctl restart`
-          # (deploy-hang fix, same date). Worst honest failure path — S3
-          # download + 40s smoke + docker up + 300s restart timeout + journal
-          # dumps — must still reach a TERMINAL SSM state inside this budget,
-          # otherwise the auto-stop kills the box mid-script with EMPTY on-box
-          # output (SSM fills stdout/stderr only at a terminal state). 150
-          # polls ≈ 15.7 min real. SSM send-command default execution timeout
-          # is 3600s, so the command itself is never killed under us.
-          for i in $(seq 1 150); do
+          # 240 polls × 5s = 1200s nominal. Bumped 120 → 240 (2026-07-13):
+          # the observed cadence is ~6.3s/poll (5s sleep + ~1.3s API
+          # round-trip — runs 29269805430 / 29273283894 burned 120 polls in
+          # ~12.6 min), so 240 polls ≈ 25 min REAL. Sizing: every on-box stage
+          # is now explicitly bounded (same-date deploy-hang fix — dnf ≤180s,
+          # curl ≤120s, git fetch ≤120s, s3 cp ≤300s each, compose up ≤600s,
+          # smoke ≤40s, systemctl restart ≤300s, CW agent ≤~300s), and the
+          # sizing case is a POST-NUKE FIRST deploy that must also dnf-install
+          # docker + pull the QuestDB image inside `compose up` — realistic
+          # wall-clock ~8-12 min, so 25 min real gives ~2x headroom while any
+          # single wedged stage still fails LOUDLY at its own bound (terminal
+          # SSM Failed → the Fetch step prints the on-box reason). Budget
+          # exhaustion here means something is wedged BEYOND every stage
+          # bound; the auto-stop then kills the box with EMPTY on-box output
+          # (SSM fills stdout/stderr only at a terminal state) — which is why
+          # the per-stage bounds, not this budget, are the primary defense.
+          # SSM send-command default execution timeout is 3600s, so the
+          # command itself is never killed under us.
+          for i in $(seq 1 240); do
             STATUS=$(aws ssm get-command-invocation \
               --region "$REGION" --command-id "$CMD_ID" --instance-id "$IID" \
               --query 'Status' --output text 2>/dev/null || echo "Pending")
-            echo "poll $i/150: status=$STATUS"
+            echo "poll $i/240: status=$STATUS"
             case "$STATUS" in
               Success|Failed|Cancelled|TimedOut)
                 echo "reached terminal state: $STATUS"
@@ -710,7 +717,7 @@ jobs:
             esac
             sleep 5
           done
-          echo "::warning::SSM command still non-terminal after ~15 min — the Fetch step below will report the real status."
+          echo "::warning::SSM command still non-terminal after ~25 min — the Fetch step below will report the real status."
 
       - name: Fetch SSM command output + fail loudly on box-side error
         # if: always() — print the box-side STDOUT/STDERR no matter what, so a
