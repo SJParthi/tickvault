@@ -2125,12 +2125,15 @@ impl NotificationEvent {
                 } else if *buckets_compared == 0 {
                     // The BLIND day: rows may exist but NOTHING could be
                     // compared. An empty finding list must never read as a
-                    // pass (audit Rule 11 — the false-OK class).
+                    // pass (audit Rule 11 — the false-OK class). The Groww
+                    // tail note rides along here too (refuter round 2) —
+                    // un-catch-up-able tail buckets stay unverified even on
+                    // a blind day.
                     format!(
                         "\u{1f198} <b>Daily timeframe check @ 3:40 PM IST — BLIND</b>\n\
                          Dhan day: {dhan_date_ist} | Groww day: {groww_date_ist}\n\
                          Checked NOTHING today — could NOT verify a single \
-                         candle. This is not a pass.\n\
+                         candle. This is not a pass.{tail_note}\n\
                          What to do RIGHT NOW:\n\
                          1. Check the database is up and reachable.\n\
                          2. Confirm the live feeds recorded candles today.\n\

@@ -520,6 +520,8 @@ fn test_tf_consistency_summary_message_variants() {
     assert_eq!(no_data.severity(), Severity::Info);
 
     // BLIND day (rows expected, zero compared) → High, BLIND wording.
+    // Refuter round 2: the Groww tail note must ride the BLIND wording
+    // too when tail_unsealed > 0.
     let blind = NotificationEvent::TfConsistencySummary {
         dhan_date_ist: "2026-07-13".to_string(),
         groww_date_ist: "2026-07-10".to_string(),
@@ -530,7 +532,7 @@ fn test_tf_consistency_summary_message_variants() {
         no_coverage: 0,
         off_grid: 0,
         duplicates: 0,
-        tail_unsealed: 0,
+        tail_unsealed: 3,
         degraded: true,
         truncated: false,
         status_label: "blind".to_string(),
@@ -538,6 +540,10 @@ fn test_tf_consistency_summary_message_variants() {
     };
     let m = render(&blind);
     assert!(m.contains("BLIND") && m.contains("not a pass"), "{m}");
+    assert!(
+        m.contains("3 Groww end-of-day buckets are not sealed by design"),
+        "the Groww tail note must render on the BLIND wording too: {m}"
+    );
     assert_eq!(blind.severity(), Severity::High);
 
     // L6 pin: the blind-WITHOUT-degrade edge (rows seen, zero compared,

@@ -15,16 +15,21 @@
 //! Two passes per run:
 //! - `feed='dhan'` verifies **TODAY** (amend-frozen after the close seal);
 //! - `feed='groww'` verifies the **PREVIOUS trading day**. Groww has NO
-//!   close-time force-seal — its session-final buckets would only seal at
+//!   close-time force-seal — its session-tail buckets would only seal at
 //!   the IST-midnight force-seal, which NEVER RUNS on the prod schedule
 //!   (the box auto-stops at 16:30 IST and the bridge resumes from a
-//!   persisted NDJSON offset, so the finals are never rebuilt). Every
-//!   TF's FINAL session window is therefore STRUCTURALLY absent for
-//!   Groww: a missing final row takes the NON-PAGING `tail_unsealed`
-//!   carve-out (counter only — no audit row, no page); a PRESENT final
-//!   row is sealed data and is compared normally; non-final Groww
-//!   windows keep full paging classification. Dhan finals are covered
-//!   by the 15:30:05 close-time force-seal and are never carved out.
+//!   persisted NDJSON offset, so the tails are never rebuilt). The Groww
+//!   catch-up seal additionally requires a window end E ≤ watermark −
+//!   60s with a max pre-close watermark of 15:29:59, so EVERY window
+//!   whose effective end lands within [`GROWW_CATCHUP_MARGIN_SECS`] of
+//!   the 15:30:00 close is STRUCTURALLY absent for Groww — every final
+//!   window PLUS e.g. the 2m penultimate `[15:27, 15:29)` window
+//!   (refuter round 2, 2026-07-13). A missing un-catch-up-able tail row
+//!   takes the NON-PAGING `tail_unsealed` carve-out (counter only — no
+//!   audit row, no page); a PRESENT tail row is sealed data and is
+//!   compared normally; earlier Groww windows keep full paging
+//!   classification. Dhan finals are covered by the 15:30:05 close-time
+//!   force-seal and are never carved out.
 //!
 //! The bucket grid is REIMPLEMENTED here independently (windows
 //! `[33_300 + k*S, min(+S, 55_800))` per trading day) and cross-pinned
@@ -107,6 +112,11 @@ const TF_VERIFY_POLITENESS_SLEEP_MS: u64 = 5;
 /// Max plain-English offender lines carried into the Telegram summary.
 const TF_VERIFY_TOP_DETAIL_MAX: usize = 10;
 
+/// Max sample `security_id segment` pairs named by the coalesced
+/// data-derived out-of-session exclusion warn (refuter round 2 —
+/// self-disarm visibility; one warn per pass, never per instrument).
+const TF_VERIFY_OUT_OF_SESSION_SAMPLE_MAX: usize = 5;
+
 /// How far back the Groww previous-trading-day walk searches before the
 /// pass degrades loudly (a >7-day gap has never occurred on NSE).
 pub const TF_VERIFY_PREV_DAY_LOOKBACK_DAYS: u32 = 7;
@@ -129,6 +139,17 @@ const _: () = assert!(
     SESSION_CLOSE_SECS_OF_DAY_IST as i64 * NANOS_PER_SEC == MARKET_CLOSE_IST_NANOS,
     "session close drifted from the canonical common-crate constant"
 );
+
+/// The Groww aggregator's catch-up-seal lateness margin (refuter round 2,
+/// 2026-07-13). The Groww catch-up seal only seals a window whose end E
+/// satisfies E ≤ watermark − margin, and the max pre-close watermark is
+/// 15:29:59 — so any window whose effective end lands within this margin
+/// of the 15:30:00 close can NEVER seal intraday on the prod schedule
+/// (e.g. the 2m penultimate `[15:27, 15:29)` window, E = 55_740, plus
+/// every final window). Mirrors
+/// `tickvault_trading::candles::CATCHUP_SEAL_LATENESS_MARGIN_SECS_GROWW`
+/// (= 60) — equality tripwire-pinned in the tests below.
+pub const GROWW_CATCHUP_MARGIN_SECS: u32 = 60;
 
 // ---------------------------------------------------------------------------
 // Scheduling (pure)
@@ -295,6 +316,19 @@ pub fn is_on_grid(secs_of_day: i64, tf_secs: u32) -> bool {
     let open = i64::from(SESSION_OPEN_SECS_OF_DAY_IST);
     let close = i64::from(SESSION_CLOSE_SECS_OF_DAY_IST);
     secs_of_day >= open && secs_of_day < close && (secs_of_day - open) % i64::from(tf_secs) == 0
+}
+
+/// NEW-MEDIUM (refuter round 2): `true` when a Groww window can NEVER be
+/// catch-up-sealed intraday on the prod schedule — its effective end lands
+/// within [`GROWW_CATCHUP_MARGIN_SECS`] of the 15:30:00 close, so the
+/// `end ≤ watermark − margin` seal condition is unsatisfiable before the
+/// midnight force-seal (which never runs on the prod schedule). Catches
+/// every final window AND e.g. the 2m penultimate `[15:27, 15:29)` window
+/// (E = 55_740). Pure.
+#[must_use]
+pub fn groww_uncatchupable_tail(end_effective_secs_of_day: u32) -> bool {
+    end_effective_secs_of_day.saturating_add(GROWW_CATCHUP_MARGIN_SECS)
+        >= SESSION_CLOSE_SECS_OF_DAY_IST
 }
 
 // ---------------------------------------------------------------------------
@@ -476,9 +510,10 @@ pub struct TfCompareCounts {
     pub bucket_gaps: u64,
     pub soft_tick_count: u64,
     pub volume_overflows: u64,
-    /// Final-window stored rows ABSENT under the Groww tail carve-out
-    /// (structurally unsealed on the prod schedule) — counted, never a
-    /// finding, never a page.
+    /// Un-catch-up-able tail-window stored rows ABSENT under the Groww
+    /// carve-out (window end within [`GROWW_CATCHUP_MARGIN_SECS`] of the
+    /// close — structurally unsealed on the prod schedule) — counted,
+    /// never a finding, never a page.
     pub tail_unsealed: u64,
 }
 
@@ -486,19 +521,23 @@ pub struct TfCompareCounts {
 /// recompute over its (sorted, de-duplicated) 1m rows. Pure — O(rows) with
 /// a single sweep over the grid.
 ///
-/// `exempt_final_missing` is the Groww tail carve-out: when `true`, an
-/// ABSENT stored row on the grid's FINAL window counts `tail_unsealed`
-/// instead of a paging `missing_tf_row` (Groww finals never seal on the
-/// prod schedule — the 16:30 IST auto-stop precedes the midnight
-/// force-seal). A PRESENT final row is still compared normally, and
-/// non-final windows keep full classification. Dhan passes `false`.
+/// `exempt_unsealable_tail` is the Groww tail carve-out: when `true`, an
+/// ABSENT stored row on any [`groww_uncatchupable_tail`] window (its
+/// effective end within [`GROWW_CATCHUP_MARGIN_SECS`] of the 15:30 close
+/// — every final window plus e.g. the 2m penultimate `[15:27, 15:29)`
+/// window) counts `tail_unsealed` instead of a paging `missing_tf_row`
+/// (those windows never seal on the prod schedule — the 16:30 IST
+/// auto-stop precedes the midnight force-seal, and the catch-up seal's
+/// 60s lateness margin blocks them intraday). A PRESENT tail row is
+/// still compared normally, and earlier windows keep full
+/// classification. Dhan passes `false`.
 #[must_use]
 pub fn compare_tf(
     tf: TfIndex,
     rows_1m_sorted: &[CandleRow],
     stored_rows: &[CandleRow],
     day_start_ist_nanos: i64,
-    exempt_final_missing: bool,
+    exempt_unsealable_tail: bool,
 ) -> (Vec<FindingDraft>, TfCompareCounts) {
     let tf_secs = tf.seconds_per_bucket();
     let tf_label = tf.display_name();
@@ -608,11 +647,13 @@ pub fn compare_tf(
                 }
             }
             (None, Some(rec)) => {
-                if exempt_final_missing && w.is_final {
-                    // H1 Groww tail carve-out: the final session bucket is
-                    // STRUCTURALLY absent (no close-time force-seal; the
-                    // 16:30 IST auto-stop precedes the midnight seal) —
-                    // counted, no audit row, no page.
+                if exempt_unsealable_tail && groww_uncatchupable_tail(w.end_effective_secs_of_day) {
+                    // H1 (widened, refuter round 2) Groww tail carve-out:
+                    // an un-catch-up-able tail bucket is STRUCTURALLY
+                    // absent (no close-time force-seal; the catch-up
+                    // seal's 60s margin blocks any window ending within
+                    // it of the close; the 16:30 IST auto-stop precedes
+                    // the midnight seal) — counted, no audit row, no page.
                     counts.tail_unsealed = counts.tail_unsealed.saturating_add(1);
                 } else {
                     findings.push(FindingDraft {
@@ -944,8 +985,9 @@ pub struct PassStats {
     pub duplicates: u64,
     pub bucket_gaps: u64,
     pub soft_tick_count: u64,
-    /// Groww final-window carve-out count (structurally unsealed on the
-    /// prod schedule) — a counter, never a finding, never a page.
+    /// Groww un-catch-up-able tail-window carve-out count (structurally
+    /// unsealed on the prod schedule) — a counter, never a finding,
+    /// never a page.
     pub tail_unsealed: u64,
     pub query_failures: u64,
     pub rows_seen: bool,
@@ -1103,26 +1145,33 @@ pub fn response_exceeds_cap(body_len: usize) -> bool {
     body_len > TF_VERIFY_MAX_RESPONSE_BYTES
 }
 
-/// L7(a) — pure refusal decision for a FORCED run
-/// (`TICKVAULT_TF_VERIFY_NOW` WITHOUT `TICKVAULT_TF_VERIFY_DATE`).
-/// Refused on a non-trading day (nothing to verify — the scoreboard
-/// round-5 mechanic) AND on a trading day BEFORE the 15:40 IST trigger
-/// (today's candles are still being sealed — verifying them would page
-/// false findings). `NOW` + `DATE` for a past trading day is validated
-/// separately and is never refused here. `None` = run proceeds. Pure.
+/// L7(a) + L7-completion (refuter round 2) — pure refusal decision for a
+/// FORCED run (`TICKVAULT_TF_VERIFY_NOW`).
+/// Refused on a non-trading day without a DATE (nothing to verify — the
+/// scoreboard round-5 mechanic) AND — whenever the run targets TODAY,
+/// i.e. bare `NOW` OR `NOW` + `DATE=today` (the round-1 bypass) — on a
+/// trading day BEFORE the 15:40 IST trigger (today's candles are still
+/// being sealed — verifying them would page false findings). `NOW` +
+/// `DATE` for a PAST trading day is validated separately and is never
+/// refused here; `DATE=today` AT/AFTER the trigger is allowed.
+/// `None` = run proceeds. Pure.
 #[must_use]
 pub fn forced_run_refusal(
     has_date_override: bool,
+    date_override_is_today: bool,
     is_trading_day: bool,
     now_secs_of_day_ist: u32,
 ) -> Option<&'static str> {
-    if has_date_override {
+    if has_date_override && !date_override_is_today {
+        // A PAST trading day (already validated) — sealed data; proceed.
         return None;
     }
-    if !is_trading_day {
+    if !has_date_override && !is_trading_day {
         return Some("non-trading day — nothing sealed to verify");
     }
-    if now_secs_of_day_ist < TF_VERIFY_TRIGGER_SECS_OF_DAY_IST {
+    // Targets TODAY (bare NOW, or NOW + DATE=today — the L7-completion
+    // bypass closure): refuse before the trigger on a trading day.
+    if is_trading_day && now_secs_of_day_ist < TF_VERIFY_TRIGGER_SECS_OF_DAY_IST {
         return Some(
             "before the 3:40 PM IST trigger on a trading day — today's \
              candles are still unsealed",
@@ -1165,6 +1214,23 @@ async fn http_get_text(
         .map_err(|e| (format!("send: {e}"), "questdb_unreachable"))?;
     if !resp.status().is_success() {
         return Err((format!("http {}", resp.status()), "query_failed"));
+    }
+    // SEC (refuter round 2): refuse a DECLARED oversize body BEFORE
+    // reading it at all. Honest residual: a chunked-transfer response
+    // (no Content-Length header) is still fully buffered by `.text()`
+    // before the post-read cap below can fire — bounded in practice by
+    // the per-request timeout; documented in the runbook honest
+    // envelope.
+    if let Some(declared) = resp.content_length()
+        && declared > TF_VERIFY_MAX_RESPONSE_BYTES as u64
+    {
+        return Err((
+            format!(
+                "declared content-length {declared} bytes exceeds the \
+                 {TF_VERIFY_MAX_RESPONSE_BYTES}-byte cap"
+            ),
+            "oversize",
+        ));
     }
     let body = resp
         .text()
@@ -1251,13 +1317,20 @@ async fn run_tf_pass(p: PassParams<'_>, state: &mut RunState) -> PassStats {
     }
     stats.rows_seen = true;
 
-    // H1: the Groww pass carves out ABSENT final-window rows (structurally
-    // unsealed on the prod schedule); Dhan finals are close-time-sealed.
-    let exempt_final_missing = p.feed == "groww";
+    // H1 (widened, refuter round 2): the Groww pass carves out ABSENT
+    // rows on un-catch-up-able tail windows (effective end within the
+    // 60s catch-up margin of the close — structurally unsealed on the
+    // prod schedule); Dhan finals are close-time-sealed.
+    let exempt_unsealable_tail = p.feed == "groww";
 
     // ── Per-instrument sweep ──
     let mut pass_samples: Vec<String> = Vec::new();
     let mut bad_segments: u64 = 0;
+    // Refuter round 2 (self-disarm visibility): data-derived
+    // out-of-session exclusions — reported via ONE coalesced warn after
+    // the sweep, never per instrument.
+    let mut out_of_session_excluded: u64 = 0;
+    let mut out_of_session_samples: Vec<String> = Vec::new();
     for (idx, (sid, segment)) in instruments.iter().enumerate() {
         // Wall-clock budget between SIDs: remaining SIDs read-degraded.
         // The `break` right after guarantees exactly ONE coalesced emission.
@@ -1329,7 +1402,17 @@ async fn run_tf_pass(p: PassParams<'_>, state: &mut RunState) -> PassStats {
         // crash-recovery boot arm never initializes it). Applied BEFORE
         // any classification, including off_grid.
         if has_out_of_session_1m_row(&rows_1m, day_start_nanos) {
-            metrics::counter!("tv_tf_verify_excluded_total", "reason" => "always_on").increment(1);
+            // Refuter round 2: the DATA-derived exclusion gets its own
+            // reason label — an instrument reaching this arm is by
+            // construction NOT in the always-on registry set (the
+            // set-based arm above already `continue`d), so folding it
+            // into reason="always_on" misattributed it.
+            metrics::counter!("tv_tf_verify_excluded_total", "reason" => "out_of_session")
+                .increment(1);
+            out_of_session_excluded = out_of_session_excluded.saturating_add(1);
+            if out_of_session_samples.len() < TF_VERIFY_OUT_OF_SESSION_SAMPLE_MAX {
+                out_of_session_samples.push(format!("{sid} {segment}"));
+            }
             // Mirror the set-based exclusion above: an excluded instrument
             // is not counted as examined.
             stats.instruments = stats.instruments.saturating_sub(1);
@@ -1390,7 +1473,7 @@ async fn run_tf_pass(p: PassParams<'_>, state: &mut RunState) -> PassStats {
                 &rows_1m_sorted,
                 &stored,
                 day_start_nanos,
-                exempt_final_missing,
+                exempt_unsealable_tail,
             );
             drafts.extend(tf_drafts);
             stats.buckets_compared = stats
@@ -1470,13 +1553,30 @@ async fn run_tf_pass(p: PassParams<'_>, state: &mut RunState) -> PassStats {
     // emission would overcount quadratically.
     metrics::counter!("tv_tf_verify_buckets_compared_total").increment(stats.buckets_compared);
     metrics::counter!("tv_tf_verify_bucket_gap_total").increment(stats.bucket_gaps);
-    // H1: Groww final windows absent by design (never sealed on the prod
-    // schedule) — visible, never silent, never a page.
+    // H1 (widened): Groww un-catch-up-able tail windows absent by design
+    // (never sealed on the prod schedule) — visible, never silent, never
+    // a page.
     metrics::counter!("tv_tf_verify_tail_unsealed_total").increment(stats.tail_unsealed);
 
     // Soft tick_count divergence is a counter, never a page.
     metrics::counter!("tv_tf_verify_soft_divergence_total", "field" => "tick_count")
         .increment(stats.soft_tick_count);
+
+    // Refuter round 2 (H2 self-disarm visibility): ONE coalesced warn per
+    // pass naming instruments excluded by the DATA-derived out-of-session
+    // rule while absent from the always-on registry — expected only on
+    // FAST-arm boots (the registry set is never initialized there);
+    // anywhere else it flags a possible exclusion misattribution.
+    if out_of_session_excluded > 0 {
+        warn!(
+            feed = p.feed,
+            date = %stats.date_label,
+            count = out_of_session_excluded,
+            samples = %out_of_session_samples.join(", "),
+            "tf_consistency: instrument(s) excluded by the data-derived \
+             out-of-session rule without an always-on registration"
+        );
+    }
 
     // L8: ONE coalesced bad-segment error per pass (never per instrument).
     // The poisoned value itself is deliberately NOT logged — it is
@@ -1823,18 +1923,24 @@ pub fn spawn_tf_consistency_tasks(
                 TfVerifyStart::RunNow => {
                     // L7(a) + the scoreboard round-5 mechanic: NOW without a
                     // DATE is refused on a non-trading day (an empty weekend
-                    // "today") AND on a trading day BEFORE the 15:40 trigger
+                    // "today") AND — for ANY run targeting today, i.e. bare
+                    // NOW or NOW + DATE=today (L7-completion, refuter round
+                    // 2) — on a trading day BEFORE the 15:40 trigger
                     // (today's candles are still unsealed — verifying them
                     // would page false findings). Info log, never a page;
-                    // NOW + DATE for a past trading day stays allowed.
-                    if let Some(reason) =
-                        forced_run_refusal(date_override.is_some(), is_trading_day, now_secs_of_day)
-                    {
+                    // NOW + DATE for a past trading day stays allowed, and
+                    // DATE=today AFTER the trigger stays allowed.
+                    if let Some(reason) = forced_run_refusal(
+                        date_override.is_some(),
+                        date_override == Some(today_ist),
+                        is_trading_day,
+                        now_secs_of_day,
+                    ) {
                         info!(
                             %reason,
-                            "tf_consistency: TICKVAULT_TF_VERIFY_NOW without a date \
-                             refused (pass TICKVAULT_TF_VERIFY_DATE=YYYY-MM-DD for \
-                             the trading day you meant)"
+                            "tf_consistency: forced run refused (pass \
+                             TICKVAULT_TF_VERIFY_DATE=YYYY-MM-DD for a PAST \
+                             trading day, or re-run after 3:40 PM IST)"
                         );
                         return Ok(None);
                     }
@@ -2858,6 +2964,83 @@ mod tests {
         assert_eq!(counts.tail_unsealed, 0);
     }
 
+    /// H1 widened (refuter round 2): the 2m PENULTIMATE window
+    /// `[15:27, 15:29)` has E = 55_740 and 55_740 + 60 ≥ 55_800, so it can
+    /// never catch-up-seal intraday — an ABSENT Groww stored row there is
+    /// `tail_unsealed`, NOT a paging `missing_tf_row`.
+    #[test]
+    fn test_compare_tf_groww_2m_penultimate_missing_is_tail_unsealed() {
+        // 1m member inside the M2 penultimate window [55_620, 55_740).
+        let ones = vec![row(55_620, 100.0, 101.0, 99.0, 100.5, 10, 3)];
+        let (findings, counts) = compare_tf(TfIndex::M2, &ones, &[], DAY_START, true);
+        assert!(
+            findings.is_empty(),
+            "groww 2m penultimate absence must not page: {findings:?}"
+        );
+        assert_eq!(counts.tail_unsealed, 1, "counted, never silent");
+        assert_eq!(counts.buckets_compared, 0);
+    }
+
+    /// H1 widened: an EARLIER 2m window (`[15:25, 15:27)`, E = 55_620;
+    /// 55_620 + 60 < 55_800) is catch-up-able — an absent Groww row there
+    /// still pages `missing_tf_row`.
+    #[test]
+    fn test_compare_tf_groww_2m_earlier_window_missing_still_pages() {
+        let ones = vec![row(55_500, 100.0, 101.0, 99.0, 100.5, 10, 3)];
+        let (findings, counts) = compare_tf(TfIndex::M2, &ones, &[], DAY_START, true);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].category, FindingCategory::MissingTfRow);
+        assert_eq!(findings[0].bucket_secs_of_day, 55_500);
+        assert_eq!(counts.tail_unsealed, 0);
+    }
+
+    /// H1 widened: the 5m PENULTIMATE window `[15:20, 15:25)` has
+    /// E = 55_500; 55_500 + 60 < 55_800 → NOT exempt — an absent Groww row
+    /// there still pages (the widening is margin-exact, not
+    /// last-two-windows).
+    #[test]
+    fn test_compare_tf_groww_5m_penultimate_missing_still_pages() {
+        let ones = vec![row(55_200, 100.0, 101.0, 99.0, 100.5, 10, 3)];
+        let (findings, counts) = compare_tf(TfIndex::M5, &ones, &[], DAY_START, true);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].category, FindingCategory::MissingTfRow);
+        assert_eq!(findings[0].bucket_secs_of_day, 55_200);
+        assert_eq!(counts.tail_unsealed, 0);
+    }
+
+    /// Refuter round 2: the pure tail predicate — boundary-exact against
+    /// the 60s catch-up margin.
+    #[test]
+    fn test_groww_uncatchupable_tail_boundaries() {
+        // Final windows always end at 15:30:00 → exempt.
+        assert!(groww_uncatchupable_tail(SESSION_CLOSE_SECS_OF_DAY_IST));
+        // Exactly margin before the close (E = 55_740) → exempt.
+        assert!(groww_uncatchupable_tail(
+            SESSION_CLOSE_SECS_OF_DAY_IST - GROWW_CATCHUP_MARGIN_SECS
+        ));
+        // One second earlier (E = 55_739) → catch-up-able, NOT exempt.
+        assert!(!groww_uncatchupable_tail(
+            SESSION_CLOSE_SECS_OF_DAY_IST - GROWW_CATCHUP_MARGIN_SECS - 1
+        ));
+        // Mid-session windows are never exempt.
+        assert!(!groww_uncatchupable_tail(
+            SESSION_OPEN_SECS_OF_DAY_IST + 300
+        ));
+    }
+
+    /// TRIPWIRE (refuter round 2): the verifier's margin mirror must equal
+    /// the aggregator's own Groww catch-up lateness margin — editing either
+    /// constant alone fails the build.
+    #[test]
+    fn test_groww_catchup_margin_matches_aggregator_constant() {
+        assert_eq!(
+            GROWW_CATCHUP_MARGIN_SECS,
+            tickvault_trading::candles::CATCHUP_SEAL_LATENESS_MARGIN_SECS_GROWW,
+            "GROWW_CATCHUP_MARGIN_SECS drifted from the aggregator's \
+             CATCHUP_SEAL_LATENESS_MARGIN_SECS_GROWW"
+        );
+    }
+
     /// H1: a PRESENT Groww final row is sealed data — it is compared
     /// normally and a mismatch still pages even with the carve-out ON.
     #[test]
@@ -2967,23 +3150,57 @@ mod tests {
 
     #[test]
     fn test_forced_run_refusal_variants() {
-        // NOW + DATE (past trading day, validated separately) → never
-        // refused here, at ANY time of day.
-        assert_eq!(forced_run_refusal(true, true, 10 * 3600), None);
-        assert_eq!(forced_run_refusal(true, false, 10 * 3600), None);
+        // NOW + DATE for a PAST trading day (validated separately) →
+        // never refused here, at ANY time of day.
+        assert_eq!(forced_run_refusal(true, false, true, 10 * 3600), None);
+        assert_eq!(forced_run_refusal(true, false, false, 10 * 3600), None);
         // NOW without DATE on a non-trading day → refused.
-        assert!(forced_run_refusal(false, false, 10 * 3600).is_some());
+        assert!(forced_run_refusal(false, false, false, 10 * 3600).is_some());
         // NOW without DATE on a trading day BEFORE 15:40 → refused (the
         // day's candles are still unsealed).
-        let before = forced_run_refusal(false, true, TF_VERIFY_TRIGGER_SECS_OF_DAY_IST - 1);
+        let before = forced_run_refusal(false, false, true, TF_VERIFY_TRIGGER_SECS_OF_DAY_IST - 1);
         assert!(before.is_some_and(|r| r.contains("unsealed")), "{before:?}");
         // NOW without DATE AT/AFTER the 15:40 trigger on a trading day →
         // allowed (today is sealed).
         assert_eq!(
-            forced_run_refusal(false, true, TF_VERIFY_TRIGGER_SECS_OF_DAY_IST),
+            forced_run_refusal(false, false, true, TF_VERIFY_TRIGGER_SECS_OF_DAY_IST),
             None
         );
-        assert_eq!(forced_run_refusal(false, true, 17 * 3600), None);
+        assert_eq!(forced_run_refusal(false, false, true, 17 * 3600), None);
+    }
+
+    /// L7-completion (refuter round 2): `NOW` + `DATE=today` on a trading
+    /// day BEFORE the 15:40 trigger was a documented-refusal BYPASS (the
+    /// date validator accepts `d <= today`; the old refusal short-circuited
+    /// on any date override). It must now refuse exactly like bare `NOW`.
+    #[test]
+    fn test_forced_run_refusal_date_today_before_trigger_bypass_closed() {
+        let refused = forced_run_refusal(
+            true, // has_date_override
+            true, // date_override_is_today
+            true, // trading day
+            TF_VERIFY_TRIGGER_SECS_OF_DAY_IST - 1,
+        );
+        assert!(
+            refused.is_some_and(|r| r.contains("unsealed")),
+            "DATE=today before the trigger must be refused: {refused:?}"
+        );
+    }
+
+    /// L7-completion: `NOW` + `DATE=today` AT/AFTER the 15:40 trigger on a
+    /// trading day stays ALLOWED (today is sealed — a same-day backfill).
+    #[test]
+    fn test_forced_run_refusal_date_today_after_trigger_allowed() {
+        assert_eq!(
+            forced_run_refusal(true, true, true, TF_VERIFY_TRIGGER_SECS_OF_DAY_IST),
+            None
+        );
+        assert_eq!(forced_run_refusal(true, true, true, 17 * 3600), None);
+        // A PAST date before the trigger remains unchanged (allowed).
+        assert_eq!(
+            forced_run_refusal(true, false, true, TF_VERIFY_TRIGGER_SECS_OF_DAY_IST - 1),
+            None
+        );
     }
 
     // -------------------------------------------------------------------

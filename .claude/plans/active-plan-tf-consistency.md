@@ -134,12 +134,19 @@ enabled` + trading day; env `TICKVAULT_TF_VERIFY_NOW` force-runs and
   finding row (would explode on legitimately sparse instruments).
 - Stored TF row over ZERO member 1m rows → `no_1m_coverage` (pages).
 - Recomputed present, stored row absent → `missing_tf_row` (pages) — the
-  dead-seal-leg detector. EXCEPTION (review round 1 fix H1): an absent
-  Groww FINAL-window row is the non-paging `tail_unsealed` carve-out —
-  Groww finals never seal on the prod schedule (16:30 auto-stop precedes
-  the midnight seal), so without it every day floods thousands of false
-  `missing_tf_row` pages. A present Groww final row is still compared;
-  Dhan finals and Groww non-finals keep the page.
+  dead-seal-leg detector. EXCEPTION (review round 1 fix H1, WIDENED
+  refuter round 2): an absent Groww row on any UN-CATCH-UP-ABLE tail
+  window — effective end within `GROWW_CATCHUP_MARGIN_SECS` (60s,
+  tripwired against the aggregator's
+  `CATCHUP_SEAL_LATENESS_MARGIN_SECS_GROWW`) of the 15:30 close — is the
+  non-paging `tail_unsealed` carve-out. That is every final window PLUS
+  e.g. the 2m penultimate `[15:27, 15:29)` window (E = 15:29:00; the
+  catch-up seal needs E ≤ watermark − 60s and the max pre-close watermark
+  is 15:29:59). Groww tails never seal on the prod schedule (16:30
+  auto-stop precedes the midnight seal), so without the carve-out every
+  day floods false `missing_tf_row` pages. A present Groww tail row is
+  still compared; Dhan finals and earlier Groww windows (e.g. the 5m
+  penultimate `[15:20, 15:25)`, E = 15:25:00) keep the page.
 - Stored TF ts not on the 09:15-anchored grid → `off_grid_ts` (pages) —
   the purest anchoring-bug signal.
 - Duplicate rows per DEDUP key in a response → `duplicate_key` (pages),
@@ -153,18 +160,25 @@ enabled` + trading day; env `TICKVAULT_TF_VERIFY_NOW` force-runs and
 - Non-trading day: skip; `TICKVAULT_TF_VERIFY_NOW` without a DATE is
   REFUSED with an info log on a non-trading day AND on a trading day
   BEFORE the 15:40 trigger (unsealed today — review round 1 fix L7a);
-  NOW + DATE backfills that past trading day. DATE without NOW is ignored
-  with one warn line (L7b).
+  `NOW + DATE=today` BEFORE the trigger is refused the same way
+  (the round-1 bypass, closed refuter round 2 — L7-completion);
+  NOW + DATE backfills a past trading day and DATE=today after the
+  trigger stays allowed. DATE without NOW is ignored with one warn line
+  (L7b).
 - Late boot (post-15:40): RunCatchUp — runs immediately (idempotent).
 - Volume i64 overflow on the recompute sum: checked_add → degraded, never
   a wrap.
 - Feed off all day: zero rows both sides → `no_data` status, Info wording,
   never a daily High page and never a PASS claim.
 - Always-on instruments (GIFT Nifty): excluded STATE-INDEPENDENTLY (review
-  round 1 fix H2) — in the process-global always_on set OR any parsed 1m
-  row outside [09:15, 15:30) IST (only always-on instruments can carry
-  out-of-session 1m rows; the set is empty on FAST-arm boots). Applied
-  before any classification (incl. off_grid), counted reason="always_on".
+  round 1 fix H2) — in the process-global always_on set (counted
+  reason="always_on") OR any parsed 1m row outside [09:15, 15:30) IST
+  (only always-on instruments can carry out-of-session 1m rows; the set
+  is empty on FAST-arm boots — counted under its OWN
+  reason="out_of_session" label, refuter round 2, plus ONE coalesced
+  warn per pass naming ≤5 sample security_id+segment pairs for
+  self-disarm visibility). Applied before any classification (incl.
+  off_grid).
 - Poisoned/unknown discovered segment string (second-order injection —
   review round 1 fix L8): refused against the exact known-segment
   allowlist BEFORE any follow-up SQL; stage `bad_segment`, ONE coalesced
