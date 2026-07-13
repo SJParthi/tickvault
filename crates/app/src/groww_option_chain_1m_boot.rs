@@ -184,12 +184,30 @@ pub struct GrowwChain1mTaskParams {
     pub anchor_store: Option<GrowwChainAnchorStore>,
 }
 
+/// One chain-leg ATM anchor: the latest REAL vendor `underlying_ltp` plus
+/// the IST wall-clock instant it was observed. The stamp is the contract
+/// leg's staleness-gate input (round-1 review M3): a frozen anchor (chain
+/// leg dead / silently failing) must become VISIBLY stale — beyond
+/// `GROWW_CONTRACT_1M_ANCHOR_MAX_AGE_MINUTES` the contract leg treats the
+/// underlying as unresolved (named skip), never fetching a frozen
+/// off-ATM window silently (§38.7 decision-freshness alignment).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct GrowwChainAnchor {
+    /// The vendor `underlying_ltp` (a REAL LTP only — omitted/zero never
+    /// lands here).
+    pub ltp: f64,
+    /// IST wall-clock nanos when this anchor was observed.
+    pub set_at_ist_nanos: i64,
+}
+
 /// The chain → contract in-memory anchor handoff (PR-4): plain-symbol →
-/// the latest Groww `underlying_ltp`. A missing/omitted vendor LTP never
-/// overwrites a previous good anchor (ATM moves slowly; a minute-old
-/// anchor still selects the right window).
+/// the latest Groww `underlying_ltp` + its observation instant. A
+/// missing/omitted vendor LTP never overwrites a previous good anchor
+/// (ATM moves slowly; a minute-old anchor still selects the right window
+/// — but an anchor older than the contract leg's max-age gate is treated
+/// as unresolved there, never silently trusted).
 pub type GrowwChainAnchorStore =
-    std::sync::Arc<std::sync::Mutex<std::collections::HashMap<&'static str, f64>>>;
+    std::sync::Arc<std::sync::Mutex<std::collections::HashMap<&'static str, GrowwChainAnchor>>>;
 
 // ---------------------------------------------------------------------------
 // Pure request building
@@ -875,7 +893,8 @@ async fn fire_one_groww_chain_minute(
                     ok_count = ok_count.saturating_add(1);
                     // PR-4: hand the contract leg its ATM anchor — only a
                     // REAL vendor LTP updates it (an omitted/zero LTP never
-                    // erases a previous good anchor).
+                    // erases a previous good anchor). The observation stamp
+                    // feeds the contract leg's staleness gate (review M3).
                     if let Some(store) = &params.anchor_store
                         && !chain.underlying_ltp_missing
                         && chain.underlying_ltp > 0.0
@@ -883,7 +902,13 @@ async fn fire_one_groww_chain_minute(
                         store
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .insert(target.underlying, chain.underlying_ltp);
+                            .insert(
+                                target.underlying,
+                                GrowwChainAnchor {
+                                    ltp: chain.underlying_ltp,
+                                    set_at_ist_nanos: fetched_at_ist_nanos_now(),
+                                },
+                            );
                     }
                     metrics::counter!("tv_groww_chain1m_fetch_total", "outcome" => "ok")
                         .increment(1);

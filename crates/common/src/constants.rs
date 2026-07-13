@@ -2158,6 +2158,16 @@ pub const GROWW_CONTRACT_1M_FIRE_BUDGET_SECS: u64 = 45;
 /// contracts/minute = exactly the envelope cap (const-asserted below).
 pub const GROWW_CONTRACT_1M_DEFAULT_STRIKES_EACH_SIDE: u32 = 2;
 
+/// Maximum ATM-anchor age (minutes) the contract leg will still trust. A
+/// chain-leg anchor OLDER than this (the chain leg died or is silently
+/// failing while its last anchor sits frozen) makes the underlying
+/// UNRESOLVED for the minute — a NAMED skip (coded warn `anchor_stale` +
+/// counter + `rest_fetch_audit` rows), never a silently-frozen off-ATM
+/// fetch window (round-1 review M3; the §38.7 decision-freshness
+/// principle applied to the selection input). 5 minutes ≈ the 3-minute
+/// escalation edge + margin: the chain leg's own paging fires first.
+pub const GROWW_CONTRACT_1M_ANCHOR_MAX_AGE_MINUTES: u32 = 5;
+
 const _: () = assert!(
     GROWW_CONTRACT_1M_FALLBACK_DELAY_MS > GROWW_CHAIN_1M_FALLBACK_DELAY_MS,
     "the contract leg is sequenced AFTER the chain leg — its fallback must trail the chain's"
@@ -2166,12 +2176,19 @@ const _: () = assert!(
     GROWW_CONTRACT_1M_FALLBACK_DELAY_MS + GROWW_CONTRACT_1M_FIRE_BUDGET_SECS * 1_000 < 60_000,
     "GROWW_CONTRACT_1M fire (fallback + fire budget) must finish inside the minute"
 );
-// Boundary-burst pacing ceiling (§38.3): spot ≤1 in-flight + chain ≤1 req/s
-// (its 1s min-gap) + contract ≤ 1000/min-gap req/s must stay inside the
-// ≤6 req/s shared-bucket ceiling even in the worst overlap.
+// Boundary-burst pacing ceiling (§38.3): spot ≤1 in-flight + chain ≤
+// 1000/chain-gap req/s + contract ≤ 1000/contract-gap req/s must stay
+// inside the ≤6 req/s shared-bucket ceiling even in the worst overlap.
+// EXACT rational math via cross-multiplication (round-1 review LOW: the
+// former `1_000 / 300 = 3` integer division silently rounded the true
+// 3.33 req/s DOWN — optimistic):
+//   1 + 1000/cg + 1000/kg ≤ 6  ⇔  1000·kg + 1000·cg ≤ 5·cg·kg
+// (all terms positive). Today: 1000·300 + 1000·1000 = 1.3M ≤ 5·1000·300
+// = 1.5M — the true worst-overlap burst is 1 + 1 + 3.33 ≈ 5.33 req/s.
 const _: () = assert!(
-    1 + 1_000 / GROWW_CHAIN_1M_MIN_GAP_MS + 1_000 / GROWW_CONTRACT_1M_MIN_GAP_MS <= 6,
-    "spot + chain + contract worst-overlap boundary burst must stay inside the 6 req/s ceiling"
+    1_000 * GROWW_CONTRACT_1M_MIN_GAP_MS + 1_000 * GROWW_CHAIN_1M_MIN_GAP_MS
+        <= 5 * GROWW_CHAIN_1M_MIN_GAP_MS * GROWW_CONTRACT_1M_MIN_GAP_MS,
+    "spot + chain + contract worst-overlap boundary burst must stay inside the 6 req/s ceiling (exact rational math)"
 );
 // Per-minute request math (the §38.3 capacity envelope): worst case
 // 30 contracts + the spot leg's 15 (3 symbols × 5 ladder rungs) + 3 chain
@@ -4409,14 +4426,21 @@ mod tests {
         assert_eq!(GROWW_CONTRACT_1M_MAX_PER_MINUTE, 30);
         assert_eq!(GROWW_CONTRACT_1M_FIRE_BUDGET_SECS, 45);
         assert_eq!(GROWW_CONTRACT_1M_DEFAULT_STRIKES_EACH_SIDE, 2);
+        assert_eq!(GROWW_CONTRACT_1M_ANCHOR_MAX_AGE_MINUTES, 5);
         // Fallback + fire budget fit the minute.
         assert!(
             GROWW_CONTRACT_1M_FALLBACK_DELAY_MS + GROWW_CONTRACT_1M_FIRE_BUDGET_SECS * 1_000
                 < 60_000
         );
         // Worst-overlap boundary burst inside the 6 req/s family ceiling:
-        // spot (sequential, <=1 in-flight) + chain (1s min-gap) + contract.
-        assert!(1 + 1_000 / GROWW_CHAIN_1M_MIN_GAP_MS + 1_000 / GROWW_CONTRACT_1M_MIN_GAP_MS <= 6);
+        // spot (sequential, <=1 in-flight) + chain + contract. EXACT
+        // rational cross-multiplication (integer division would round the
+        // contract leg's true 3.33 req/s down to 3 — optimistic):
+        //   1 + 1000/cg + 1000/kg <= 6  <=>  1000*kg + 1000*cg <= 5*cg*kg.
+        assert!(
+            1_000 * GROWW_CONTRACT_1M_MIN_GAP_MS + 1_000 * GROWW_CHAIN_1M_MIN_GAP_MS
+                <= 5 * GROWW_CHAIN_1M_MIN_GAP_MS * GROWW_CONTRACT_1M_MIN_GAP_MS
+        );
         // Per-minute request math (the capacity envelope): 30 contracts +
         // the spot leg's worst 15 (3 symbols x 5 ladder rungs) + 3 chain
         // = 48/min <= 20% of the 300/min shared budget (typical ~36/min).

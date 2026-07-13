@@ -250,22 +250,43 @@ target, day-granular window + client-side minute filter, persist-gated
 fields on every emit** — grep the leg field to split it from the spot
 legs. Contract-specific stages beyond the spot taxonomy:
 `selection_unresolved` (no chain anchor for an underlying this minute —
-its contracts skip; an ATM is never guessed), `selection_truncated` (the
+its contracts skip; an ATM is never guessed), `anchor_stale` (round-2,
+2026-07-13: a chain anchor OLDER than
+`GROWW_CONTRACT_1M_ANCHOR_MAX_AGE_MINUTES` = 5 — the chain leg dead or
+frozen past its own 3-minute paging edge — makes the underlying
+UNRESOLVED for the minute: counter + ONE edge-latched coded warn per
+episode + named audit rows; a frozen off-ATM window is never fetched
+silently — the §38.7 decision-freshness principle applied to the
+selection input), `selection_truncated` (the
 ATM window exceeded the hard `GROWW_CONTRACT_1M_MAX_PER_MINUTE` cap —
 truncated deterministically nearest-ATM-first, counted, never fetched
 past the cap), `book_unresolved` (warmup — the instruments master gave no
 usable contracts at the current expiry; that underlying degrades for the
-day, contract identities are never guessed), `fire_budget` (the hard
+day, contract identities are never guessed), `token_collision` (warmup —
+a duplicate `exchange_token` across DIFFERENT contracts in the master:
+later rows dropped keep-first + counter + one coded warn, the Dhan
+dedup-drop precedent), `enabled_without_chain` (boot — the contract leg
+enabled without the chain leg; refused loudly, never an anchor-less
+loop), `fire_budget` (the hard
 per-fire deadline killed the remaining contracts — skipped loudly),
 `implausible_ohlc` (vendor candle persisted verbatim + counted). ONE
 request per contract per minute (NO in-minute re-poll ladder — 30
 contracts × a ladder would blow the minute); a one-minute-lookback
-backfill is mined from the SAME day-window body. Contract counters mirror
+backfill is mined from the SAME day-window body. Every unrecovered
+minute is a NAMED `rest_fetch_audit` absence (round-2): skipped
+selections carry `outcome=skipped` rows on the underlying's stable id
+(classes `anchor_unresolved` / `anchor_stale` / `empty_selection` /
+`boundary_skipped`), a fetched-but-append-failed row is
+`named_gap`/`persist_failed`, and flush-lost staged minutes are
+`named_gap`/`flush_failed` (the spot sweep's item-4 precedent — the
+earlier `ok` row and the flush-failed row BOTH survive because `outcome`
+is in the audit DEDUP key). Contract counters mirror
 the spot names under the `tv_groww_contract1m_*` prefix
 (`fetch_total{outcome}`, `close_to_data_ms`, `fetch_duration_ms`,
 `rate_limited_total`, `boundary_skipped_total`, `task_respawn_total{reason}`,
 `rows_discarded_total`, `persist_errors_total{stage}`, `ts_form_total{form}`,
 `selection_truncated_total`, `selection_unresolved_total`,
+`anchor_stale_total`, `token_collisions_total`,
 `book_unresolved_total`, `fire_budget_exceeded_total`, `backfilled_total`).
 The typed pages are `GrowwContract1mFetchDegraded` /
 `GrowwContract1mFetchRecovered` (the 3-minute edge) +

@@ -28,9 +28,17 @@
 //! - ANCHOR (per minute, in-memory handoff): the chain leg's latest
 //!   per-underlying `underlying_ltp` ([`GrowwChainAnchorStore`]) — a
 //!   QuestDB read is never needed. A minute with no anchor for an
-//!   underlying SKIPS that underlying's contracts (counted + coded, never
-//!   a guessed ATM); the anchor is sticky across minutes (ATM moves
-//!   slowly), so one failed chain minute never blanks the selection.
+//!   underlying SKIPS that underlying's contracts (counted + coded +
+//!   named `rest_fetch_audit` rows, never a guessed ATM); the anchor is
+//!   sticky across minutes (ATM moves slowly), so one failed chain
+//!   minute never blanks the selection — but STICKINESS IS BOUNDED: an
+//!   anchor older than [`GROWW_CONTRACT_1M_ANCHOR_MAX_AGE_MINUTES`]
+//!   (5 min — the chain leg dead/frozen past its own 3-minute paging
+//!   edge) makes the underlying UNRESOLVED for the minute (stage
+//!   `anchor_stale`: counter + edge-latched coded warn + named audit
+//!   rows), never a silently-frozen off-ATM window (round-1 review M3;
+//!   the §38.7 decision-freshness principle applied to the selection
+//!   input).
 //! - WINDOW: ATM ± `strikes_each_side` (config, default 2) strikes × CE+PE
 //!   per underlying, interleaved round-robin across underlyings by
 //!   ATM-distance rank, HARD-capped at
@@ -48,7 +56,15 @@
 //! minute-scoped (ATM moves with the anchor), so "which contracts belong
 //! to minute M" is only known AT minute M — an unrecovered contract
 //! minute is a NAMED absence via its `rest_fetch_audit` row (leg
-//! `contract_1m`), never a silent hole and never a fabricated row.
+//! `contract_1m`), never a silent hole and never a fabricated row. That
+//! one-row-per-unrecovered-minute contract covers EVERY arm: fetch
+//! errors/empties, `fire_budget`/auth short-circuits, boundary skips,
+//! anchor-unresolved/stale/empty selections (`Skipped` rows keyed on the
+//! underlying's stable id — no per-contract selection ever existed), a
+//! fetched-but-append-failed row (`named_gap`/`persist_failed`), and
+//! flush-lost staged minutes (`named_gap`/`flush_failed` — the spot
+//! sweep's item-4 precedent; the earlier `ok` row plus the flush-failed
+//! row BOTH survive because `outcome` is in the audit DEDUP key).
 //! Zero-trade thin-strike minutes may be legitimately ABSENT from the
 //! vendor body (UNVERIFIED-LIVE whether Groww gap-fills) — counted
 //! `outcome="empty"`, never fabricated.
@@ -102,10 +118,11 @@ use tracing::{error, info, warn};
 use tickvault_common::config::QuestDbConfig;
 use tickvault_common::constants::{
     GROWW_API_VERSION_HEADER, GROWW_API_VERSION_VALUE, GROWW_CHAIN_1M_UNDERLYINGS,
-    GROWW_CONTRACT_1M_FALLBACK_DELAY_MS, GROWW_CONTRACT_1M_FIRE_BUDGET_SECS,
-    GROWW_CONTRACT_1M_MAX_PER_MINUTE, GROWW_CONTRACT_1M_MIN_GAP_MS,
-    GROWW_CONTRACT_1M_REQUEST_TIMEOUT_SECS, GROWW_SPOT_1M_MAX_BODY_BYTES, IST_UTC_OFFSET_SECONDS,
-    SECONDS_PER_DAY, SPOT_1M_REST_LAST_FIRE_SECS_OF_DAY_IST,
+    GROWW_CONTRACT_1M_ANCHOR_MAX_AGE_MINUTES, GROWW_CONTRACT_1M_FALLBACK_DELAY_MS,
+    GROWW_CONTRACT_1M_FIRE_BUDGET_SECS, GROWW_CONTRACT_1M_MAX_PER_MINUTE,
+    GROWW_CONTRACT_1M_MIN_GAP_MS, GROWW_CONTRACT_1M_REQUEST_TIMEOUT_SECS,
+    GROWW_SPOT_1M_MAX_BODY_BYTES, IST_UTC_OFFSET_SECONDS, SECONDS_PER_DAY,
+    SPOT_1M_REST_LAST_FIRE_SECS_OF_DAY_IST,
 };
 use tickvault_common::error_code::ErrorCode;
 use tickvault_common::sanitize::capture_rest_error_body;
@@ -132,7 +149,9 @@ use tickvault_storage::rest_fetch_audit_persistence::{
 // chain leg; the shared candle-row parser + token cache + query builders
 // from the GROWW spot leg; the warmup master download + anchor store from
 // the GROWW chain leg.
-use crate::groww_option_chain_1m_boot::{GrowwChainAnchorStore, download_master_bounded};
+use crate::groww_option_chain_1m_boot::{
+    GrowwChainAnchor, GrowwChainAnchorStore, download_master_bounded,
+};
 use crate::groww_spot_1m_boot::{
     GrowwCandleRow, GrowwParseStats, GrowwTokenCache, error_class_for_status, groww_candles_query,
     parse_groww_1m_candle_rows,
@@ -271,7 +290,13 @@ pub fn parse_contract_symbol(groww_symbol: &str) -> Option<(f64, &'static str)> 
 /// disagrees with `instrument_type`, or a non-numeric `exchange_token`
 /// are SKIPPED (returned in the count — the caller logs them, never
 /// silent). Duplicate `(strike, leg)` rows keep the FIRST (the
-/// index_extractor first-row-wins precedent). Pure.
+/// index_extractor first-row-wins precedent). A duplicate
+/// `exchange_token` across DIFFERENT `(strike, leg)` identities is
+/// vendor id-space corruption (the Dhan dedup-drop precedent): the LATER
+/// row is dropped keep-first and COUNTED in the third return (the caller
+/// emits one coded warn — round-1 review LOW; two identities sharing one
+/// token would collapse into one `security_id` in the persisted table).
+/// Pure.
 #[must_use]
 pub fn build_contract_book(
     rows: &[&GrowwInstrumentRow],
@@ -279,9 +304,11 @@ pub fn build_contract_book(
     exchange: &'static str,
     underlying_security_id: i64,
     expiry: NaiveDate,
-) -> (GrowwContractBook, u32) {
+) -> (GrowwContractBook, u32, u32) {
     let mut slots: Vec<GrowwStrikeSlot> = Vec::new();
+    let mut seen_tokens: std::collections::HashSet<i64> = std::collections::HashSet::new();
     let mut skipped: u32 = 0;
+    let mut token_collisions: u32 = 0;
     for row in rows {
         let Some((strike, leg)) = parse_contract_symbol(&row.groww_symbol) else {
             skipped = skipped.saturating_add(1);
@@ -320,11 +347,21 @@ pub fn build_contract_book(
             &mut slots[slot_idx].pe
         };
         if side.is_none() {
-            *side = Some(contract);
+            // Token uniqueness across DISTINCT (strike, leg) identities:
+            // an already-seen token on a NEW identity is a collision —
+            // keep-first, counted, never two identities on one id.
+            if seen_tokens.insert(token) {
+                *side = Some(contract);
+            } else {
+                token_collisions = token_collisions.saturating_add(1);
+            }
         }
         // else: duplicate (strike, leg) — first row wins, not counted as
         // malformed (the vendor-glitch duplicate-line class).
     }
+    // Drop empty slots a collision-refused sole row may have left behind
+    // (a slot with neither side selects nothing but would widen windows).
+    slots.retain(|s| s.ce.is_some() || s.pe.is_some());
     slots.sort_by(|a, b| a.strike.total_cmp(&b.strike));
     (
         GrowwContractBook {
@@ -336,27 +373,30 @@ pub fn build_contract_book(
             strikes: slots,
         },
         skipped,
+        token_collisions,
     )
 }
 
 /// Resolve today's contract books from parsed master rows. Returns
-/// `(books, degraded)` — an underlying with no usable expiry OR an empty
-/// book degrades (named), never the whole day unless ALL degrade. Pure.
+/// `(books, degraded, skipped_rows, token_collisions)` — an underlying
+/// with no usable expiry OR an empty book degrades (named), never the
+/// whole day unless ALL degrade. Pure.
 #[must_use]
 pub fn resolve_groww_contract_books(
     rows: &[GrowwInstrumentRow],
     today: NaiveDate,
-) -> (Vec<GrowwContractBook>, Vec<&'static str>, u32) {
+) -> (Vec<GrowwContractBook>, Vec<&'static str>, u32, u32) {
     let mut books = Vec::with_capacity(GROWW_CHAIN_1M_UNDERLYINGS.len());
     let mut degraded = Vec::new();
     let mut skipped_rows: u32 = 0;
+    let mut token_collisions: u32 = 0;
     for (underlying, exchange, groww_symbol) in GROWW_CHAIN_1M_UNDERLYINGS {
         let Some(expiry) = select_current_option_expiry(rows, exchange, underlying, today) else {
             degraded.push(underlying);
             continue;
         };
         let contract_rows = select_option_contract_rows(rows, exchange, underlying, expiry);
-        let (book, skipped) = build_contract_book(
+        let (book, skipped, collisions) = build_contract_book(
             &contract_rows,
             underlying,
             exchange,
@@ -364,13 +404,14 @@ pub fn resolve_groww_contract_books(
             expiry,
         );
         skipped_rows = skipped_rows.saturating_add(skipped);
+        token_collisions = token_collisions.saturating_add(collisions);
         if book.strikes.is_empty() {
             degraded.push(underlying);
         } else {
             books.push(book);
         }
     }
-    (books, degraded, skipped_rows)
+    (books, degraded, skipped_rows, token_collisions)
 }
 
 /// Plain-English degrade detail for the book-unresolved page — bounded,
@@ -524,6 +565,32 @@ pub fn select_contracts_for_minute(
         rank = rank.saturating_add(1);
     }
     selection
+}
+
+/// Split a raw chain-anchor snapshot into FRESH `underlying → ltp`
+/// anchors and STALE underlyings (age strictly beyond
+/// `max_age_minutes` — review M3: a frozen anchor from a dead/failing
+/// chain leg must become a NAMED unresolved skip, never a silently
+/// trusted off-ATM window). The stale list is sorted for deterministic
+/// logging. Pure.
+#[must_use]
+pub fn partition_fresh_anchors(
+    raw: &HashMap<&'static str, GrowwChainAnchor>,
+    now_ist_nanos: i64,
+    max_age_minutes: u32,
+) -> (HashMap<&'static str, f64>, Vec<&'static str>) {
+    let max_age_nanos = i64::from(max_age_minutes).saturating_mul(NANOS_PER_MINUTE);
+    let mut fresh = HashMap::with_capacity(raw.len());
+    let mut stale = Vec::new();
+    for (underlying, anchor) in raw {
+        if now_ist_nanos.saturating_sub(anchor.set_at_ist_nanos) > max_age_nanos {
+            stale.push(*underlying);
+        } else {
+            fresh.insert(*underlying, anchor.ltp);
+        }
+    }
+    stale.sort_unstable();
+    (fresh, stale)
 }
 
 // ---------------------------------------------------------------------------
@@ -888,6 +955,7 @@ async fn fire_one_groww_contract_minute(
     tracker: &mut ContractPersistTracker,
     session_first_minute_nanos: i64,
     fire_secs_of_day: u32,
+    anchor_stale_latched: &mut bool,
 ) {
     let minute_open_secs = fire_secs_of_day.saturating_sub(60);
     let minute_label = format_minute_ist_12h(minute_open_secs);
@@ -897,8 +965,8 @@ async fn fire_one_groww_contract_minute(
     let minute_close_ms = i64::from(fire_secs_of_day).saturating_mul(MILLIS_PER_SEC);
     let fire_started = std::time::Instant::now();
 
-    // ---- Selection (anchors → ATM windows → capped set) ----
-    let anchors: HashMap<&'static str, f64> = params
+    // ---- Selection (anchors → staleness gate → ATM windows → capped set) ----
+    let raw_anchors: HashMap<&'static str, GrowwChainAnchor> = params
         .anchor_store
         .as_ref()
         .map(|store| {
@@ -908,25 +976,109 @@ async fn fire_one_groww_contract_minute(
                 .clone()
         })
         .unwrap_or_default();
+    // Review M3: an anchor frozen past the max age (chain leg dead /
+    // silently failing) is a NAMED unresolved skip — never a silently
+    // trusted off-ATM window (§38.7 decision-freshness at the selection
+    // input).
+    let (anchors, stale) = partition_fresh_anchors(
+        &raw_anchors,
+        fetched_at_ist_nanos_now(),
+        GROWW_CONTRACT_1M_ANCHOR_MAX_AGE_MINUTES,
+    );
+    let stale_books: Vec<&GrowwContractBook> = books
+        .iter()
+        .filter(|b| stale.contains(&b.underlying))
+        .collect();
+    if stale_books.is_empty() {
+        // Episode over (or never started) — re-arm the stale warn latch.
+        *anchor_stale_latched = false;
+    } else {
+        metrics::counter!("tv_groww_contract1m_anchor_stale_total")
+            .increment(stale_books.len() as u64);
+        if !*anchor_stale_latched {
+            // Edge-latched per episode: ONE coded warn when staleness
+            // begins; the per-minute counter + audit rows carry the rest.
+            *anchor_stale_latched = true;
+            warn!(
+                code = ErrorCode::Spot1m01FetchDegraded.code_str(),
+                stage = "anchor_stale",
+                feed = "groww",
+                leg = "contract_1m",
+                stale = ?stale,
+                max_age_minutes = GROWW_CONTRACT_1M_ANCHOR_MAX_AGE_MINUTES,
+                minute = %minute_label,
+                "SPOT1M-01: chain ATM anchor(s) older than the max age — \
+                 these underlyings' contracts are skipped NAMED until a \
+                 fresh anchor arrives (a frozen off-ATM window is never \
+                 fetched silently)"
+            );
+        }
+        for book in &stale_books {
+            let row = build_contract_audit_row(
+                target_minute_nanos,
+                trading_date_nanos,
+                book.underlying_security_id,
+                book.segment,
+                book.underlying,
+                0,
+                0,
+                -1,
+                -1,
+                0,
+                RestFetchOutcome::Skipped,
+                "anchor_stale",
+            );
+            contract_audit_append_best_effort(audit_writer, &row);
+        }
+    }
     let selection = select_contracts_for_minute(
         books,
         &anchors,
         params.strikes_each_side,
         GROWW_CONTRACT_1M_MAX_PER_MINUTE,
     );
-    if !selection.unresolved.is_empty() {
+    // Stale underlyings surface in `unresolved` too (their anchors were
+    // filtered out above) — subtract them so each cause is named ONCE.
+    let unresolved: Vec<&'static str> = selection
+        .unresolved
+        .iter()
+        .copied()
+        .filter(|u| !stale.contains(u))
+        .collect();
+    if !unresolved.is_empty() {
         metrics::counter!("tv_groww_contract1m_selection_unresolved_total")
-            .increment(selection.unresolved.len() as u64);
+            .increment(unresolved.len() as u64);
         warn!(
             code = ErrorCode::Spot1m01FetchDegraded.code_str(),
             stage = "selection_unresolved",
             feed = "groww",
             leg = "contract_1m",
-            unresolved = ?selection.unresolved,
+            unresolved = ?unresolved,
             minute = %minute_label,
             "SPOT1M-01: no chain anchor for these underlyings this minute — \
              their contracts are skipped (counted; an ATM is never guessed)"
         );
+        // Review M4: the skipped-underlying minute is a NAMED absence —
+        // one Skipped row per (minute, underlying) on the underlying's
+        // stable id (no per-contract selection ever existed), mirroring
+        // the boundary-skip arm.
+        for book in books.iter().filter(|b| unresolved.contains(&b.underlying)) {
+            let row = build_contract_audit_row(
+                target_minute_nanos,
+                trading_date_nanos,
+                book.underlying_security_id,
+                book.segment,
+                book.underlying,
+                0,
+                0,
+                -1,
+                -1,
+                0,
+                RestFetchOutcome::Skipped,
+                "anchor_unresolved",
+            );
+            contract_audit_append_best_effort(audit_writer, &row);
+        }
     }
     if selection.truncated > 0 {
         metrics::counter!("tv_groww_contract1m_selection_truncated_total")
@@ -952,14 +1104,39 @@ async fn fire_one_groww_contract_minute(
     // persisted minute is NOT ok — a day-long QuestDB outage must page.
     let mut persist_failed = false;
     let mut sample_failure: Option<String> = None;
-    // (token, segment, minute) commits staged until the flush ACKs.
-    let mut staged_commits: Vec<(i64, &'static str, i64)> = Vec::new();
+    // (token, segment, underlying, minute) commits staged until the flush
+    // ACKs (the underlying rides along for the flush-failed forensics).
+    let mut staged_commits: Vec<(i64, &'static str, &'static str, i64)> = Vec::new();
 
     if selection.selected.is_empty() {
         // Nothing selectable this minute (no anchors / empty books) — the
         // minute is a full functional miss for this leg.
         error_count = 1;
         sample_failure = Some("no contracts selectable (no chain anchors yet)".to_string());
+        // Review M4: books whose emptiness was NOT already named by the
+        // stale/unresolved arms (an anchored book whose ATM window carried
+        // zero one-sided contracts) still get their named Skipped rows —
+        // every unrecovered minute is a queryable absence.
+        for book in books
+            .iter()
+            .filter(|b| !unresolved.contains(&b.underlying) && !stale.contains(&b.underlying))
+        {
+            let row = build_contract_audit_row(
+                target_minute_nanos,
+                trading_date_nanos,
+                book.underlying_security_id,
+                book.segment,
+                book.underlying,
+                0,
+                0,
+                -1,
+                -1,
+                0,
+                RestFetchOutcome::Skipped,
+                "empty_selection",
+            );
+            contract_audit_append_best_effort(audit_writer, &row);
+        }
     } else if let Some(token) = token_cache.ensure_token().await {
         let backfill_minute = {
             let prev = target_minute_nanos.saturating_sub(NANOS_PER_MINUTE);
@@ -1051,7 +1228,12 @@ async fn fire_one_groww_contract_minute(
                             Ok(()) => {
                                 metrics::counter!("tv_groww_contract1m_backfilled_total")
                                     .increment(1);
-                                staged_commits.push((contract.token, contract.segment, bf_minute));
+                                staged_commits.push((
+                                    contract.token,
+                                    contract.segment,
+                                    contract.underlying,
+                                    bf_minute,
+                                ));
                             }
                             Err(err) => {
                                 persist_failed = true;
@@ -1068,6 +1250,26 @@ async fn fire_one_groww_contract_minute(
                                     "SPOT1M-02: option_contract_1m_rest backfill \
                                      row append failed"
                                 );
+                                // Review M1: a fetched-but-append-failed
+                                // minute is a PERSIST failure, not vendor
+                                // absence — named (the spot sweep's
+                                // `persist_failed` class; the fetch itself
+                                // answered 200).
+                                let row = build_contract_audit_row(
+                                    bf_minute,
+                                    trading_date_nanos,
+                                    contract.token,
+                                    contract.segment,
+                                    contract.underlying,
+                                    1,
+                                    200,
+                                    latency_ms,
+                                    -1,
+                                    0,
+                                    RestFetchOutcome::NamedGap,
+                                    "persist_failed",
+                                );
+                                contract_audit_append_best_effort(audit_writer, &row);
                             }
                         }
                     }
@@ -1118,6 +1320,7 @@ async fn fire_one_groww_contract_minute(
                                     staged_commits.push((
                                         contract.token,
                                         contract.segment,
+                                        contract.underlying,
                                         target_minute_nanos,
                                     ));
                                     let audit_row = build_contract_audit_row(
@@ -1156,6 +1359,25 @@ async fn fire_one_groww_contract_minute(
                                         sample_failure =
                                             Some(format!("persist append failed: {err:#}"));
                                     }
+                                    // Review M1: fetched OK, append failed —
+                                    // a PERSIST failure named per the spot
+                                    // sweep's `persist_failed` class (the
+                                    // fetch itself answered 200).
+                                    let row = build_contract_audit_row(
+                                        target_minute_nanos,
+                                        trading_date_nanos,
+                                        contract.token,
+                                        contract.segment,
+                                        contract.underlying,
+                                        1,
+                                        200,
+                                        latency_ms,
+                                        -1,
+                                        0,
+                                        RestFetchOutcome::NamedGap,
+                                        "persist_failed",
+                                    );
+                                    contract_audit_append_best_effort(audit_writer, &row);
                                 }
                             }
                         }
@@ -1260,7 +1482,7 @@ async fn fire_one_groww_contract_minute(
         match writer.flush() {
             Ok(()) => {
                 // Flush ACKed — commit the staged watermarks.
-                for (tok, seg, minute) in staged_commits.drain(..) {
+                for (tok, seg, _underlying, minute) in staged_commits.drain(..) {
                     tracker.commit(tok, seg, minute);
                 }
             }
@@ -1280,6 +1502,29 @@ async fn fire_one_groww_contract_minute(
                 );
                 if sample_failure.is_none() {
                     sample_failure = Some(format!("persist flush failed: {err:#}"));
+                }
+                // Review M2 (the spot sweep's item-4 `flush_failed`
+                // precedent): every staged-but-unflushed minute is STILL
+                // absent from the table while its earlier `ok` audit row
+                // says retrieved — name each one. The `ok` row and this
+                // `named_gap`/`flush_failed` row BOTH survive (`outcome`
+                // is in the audit DEDUP key — the transition-row rule).
+                for (tok, seg, underlying, minute) in staged_commits.drain(..) {
+                    let row = build_contract_audit_row(
+                        minute,
+                        trading_date_nanos,
+                        tok,
+                        seg,
+                        underlying,
+                        1,
+                        200,
+                        -1,
+                        -1,
+                        0,
+                        RestFetchOutcome::NamedGap,
+                        "flush_failed",
+                    );
+                    contract_audit_append_best_effort(audit_writer, &row);
                 }
             }
         }
@@ -1600,7 +1845,8 @@ async fn resolve_and_cache_contract_books(
             return None;
         }
     };
-    let (books, degraded, skipped_rows) = resolve_groww_contract_books(&rows, today);
+    let (books, degraded, skipped_rows, token_collisions) =
+        resolve_groww_contract_books(&rows, today);
     if skipped_rows > 0 {
         metrics::counter!("tv_groww_contract1m_master_rows_skipped_total")
             .increment(u64::from(skipped_rows));
@@ -1608,6 +1854,25 @@ async fn resolve_and_cache_contract_books(
             skipped_rows,
             "groww_contract_1m: skipped malformed master contract rows \
              (unparsable symbol / type mismatch / non-numeric token)"
+        );
+    }
+    if token_collisions > 0 {
+        // Round-1 review LOW (the Dhan dedup-drop precedent): a duplicate
+        // `exchange_token` across DIFFERENT contracts is vendor id-space
+        // corruption — the later rows were dropped keep-first, counted,
+        // one coded warn (two identities on one token would collapse into
+        // one `security_id` in the persisted table).
+        metrics::counter!("tv_groww_contract1m_token_collisions_total")
+            .increment(u64::from(token_collisions));
+        warn!(
+            code = ErrorCode::Spot1m01FetchDegraded.code_str(),
+            stage = "token_collision",
+            feed = "groww",
+            leg = "contract_1m",
+            token_collisions,
+            "SPOT1M-01: duplicate exchange_token across DIFFERENT contracts \
+             in today's Groww instruments master — later rows dropped \
+             keep-first (vendor id-space corruption; counted, never silent)"
         );
     }
     if !degraded.is_empty() {
@@ -1665,6 +1930,9 @@ async fn run_groww_contract_minute_loop(
     // ONE scalar spanning consecutive contract requests — the
     // cross-request min-gap pacing state (the chain MEDIUM-1 pattern).
     let mut last_request_ms: Option<i64> = None;
+    // Anchor-staleness warn latch (review M3): ONE coded warn per stale
+    // episode; re-armed when every anchor is fresh again.
+    let mut anchor_stale_latched = false;
     let mut chain_rx = params.chain_minute_done.clone();
     // The session's first minute-open (09:15:00 IST) — the backfill's
     // in-session floor.
@@ -1747,6 +2015,7 @@ async fn run_groww_contract_minute_loop(
             &mut tracker,
             session_first_minute_nanos,
             fire,
+            &mut anchor_stale_latched,
         )
         .await;
         last_fired = Some(fire);
@@ -1924,8 +2193,10 @@ mod tests {
             master_row("NSE", "105", "garbage", "CE"),
         ];
         let refs: Vec<&GrowwInstrumentRow> = rows.iter().collect();
-        let (book, skipped) = build_contract_book(&refs, "NIFTY", "NSE", 42, d("2026-07-16"));
+        let (book, skipped, collisions) =
+            build_contract_book(&refs, "NIFTY", "NSE", 42, d("2026-07-16"));
         assert_eq!(skipped, 3, "type mismatch + bad token + bad symbol");
+        assert_eq!(collisions, 0, "no cross-identity token reuse here");
         assert_eq!(book.segment, "NSE_FNO");
         assert_eq!(book.underlying_security_id, 42);
         // Sorted ascending by strike; 2 slots (25000, 25100).
@@ -1944,6 +2215,82 @@ mod tests {
         // BSE maps to BSE_FNO.
         assert_eq!(contract_segment_for_exchange("BSE"), "BSE_FNO");
         assert_eq!(contract_segment_for_exchange("NSE"), "NSE_FNO");
+    }
+
+    #[test]
+    fn test_build_contract_book_counts_cross_identity_token_collisions_keep_first() {
+        // Token 101 reused by a DIFFERENT (strike, leg) identity — vendor
+        // id-space corruption: keep-first, count, drop the later row.
+        let rows = [
+            master_row("NSE", "101", "NSE-NIFTY-16Jul26-25100-CE", "CE"),
+            master_row("NSE", "101", "NSE-NIFTY-16Jul26-25100-PE", "PE"),
+            master_row("NSE", "102", "NSE-NIFTY-16Jul26-25000-CE", "CE"),
+        ];
+        let refs: Vec<&GrowwInstrumentRow> = rows.iter().collect();
+        let (book, skipped, collisions) =
+            build_contract_book(&refs, "NIFTY", "NSE", 42, d("2026-07-16"));
+        assert_eq!(skipped, 0, "collisions are counted separately");
+        assert_eq!(collisions, 1, "the PE row reusing token 101 collides");
+        // The colliding PE never landed; the CE (first) kept the token.
+        let s25100 = book
+            .strikes
+            .iter()
+            .find(|s| s.strike == 25_100.0)
+            .expect("25100 slot");
+        assert_eq!(s25100.ce.as_ref().map(|c| c.token), Some(101));
+        assert!(s25100.pe.is_none(), "colliding later identity dropped");
+        // An EXACT duplicate line (same token, same identity) stays the
+        // benign first-row-wins class — NOT a collision.
+        let dup_rows = [
+            master_row("NSE", "101", "NSE-NIFTY-16Jul26-25100-CE", "CE"),
+            master_row("NSE", "101", "NSE-NIFTY-16Jul26-25100-CE", "CE"),
+        ];
+        let dup_refs: Vec<&GrowwInstrumentRow> = dup_rows.iter().collect();
+        let (_, dup_skipped, dup_collisions) =
+            build_contract_book(&dup_refs, "NIFTY", "NSE", 42, d("2026-07-16"));
+        assert_eq!(dup_skipped, 0);
+        assert_eq!(dup_collisions, 0, "exact duplicate line is benign");
+    }
+
+    #[test]
+    fn test_partition_fresh_anchors_names_stale_and_keeps_fresh() {
+        let now = 1_000_000 * NANOS_PER_MINUTE;
+        let max_age = GROWW_CONTRACT_1M_ANCHOR_MAX_AGE_MINUTES;
+        let mut raw: HashMap<&'static str, GrowwChainAnchor> = HashMap::new();
+        // Fresh (just set) / EXACTLY at the max age (still fresh — the
+        // gate is strictly "beyond") / one nano beyond (stale).
+        raw.insert(
+            "NIFTY",
+            GrowwChainAnchor {
+                ltp: 25_100.0,
+                set_at_ist_nanos: now,
+            },
+        );
+        raw.insert(
+            "SENSEX",
+            GrowwChainAnchor {
+                ltp: 81_000.0,
+                set_at_ist_nanos: now - i64::from(max_age) * NANOS_PER_MINUTE,
+            },
+        );
+        raw.insert(
+            "BANKNIFTY",
+            GrowwChainAnchor {
+                ltp: 52_000.0,
+                set_at_ist_nanos: now - i64::from(max_age) * NANOS_PER_MINUTE - 1,
+            },
+        );
+        let (fresh, stale) = partition_fresh_anchors(&raw, now, max_age);
+        assert_eq!(fresh.get("NIFTY").copied(), Some(25_100.0));
+        assert_eq!(
+            fresh.get("SENSEX").copied(),
+            Some(81_000.0),
+            "exactly-at-max-age is still fresh (strictly beyond = stale)"
+        );
+        assert_eq!(stale, vec!["BANKNIFTY"], "one nano beyond = stale, named");
+        // Empty input: nothing fresh, nothing stale.
+        let (fresh_e, stale_e) = partition_fresh_anchors(&HashMap::new(), now, max_age);
+        assert!(fresh_e.is_empty() && stale_e.is_empty());
     }
 
     // ---- ATM / window / selection -----------------------------------------
@@ -2149,14 +2496,16 @@ mod tests {
             master_row("NSE", "101", "NSE-NIFTY-16Jul26-25000-CE", "CE"),
             master_row("NSE", "102", "NSE-NIFTY-16Jul26-25000-PE", "PE"),
         ];
-        let (books, degraded, skipped) = resolve_groww_contract_books(&rows, d("2026-07-13"));
+        let (books, degraded, skipped, collisions) =
+            resolve_groww_contract_books(&rows, d("2026-07-13"));
         assert_eq!(books.len(), 1);
         assert_eq!(books[0].underlying, "NIFTY");
         assert_eq!(books[0].expiry, d("2026-07-16"));
         assert_eq!(degraded, vec!["BANKNIFTY", "SENSEX"]);
         assert_eq!(skipped, 0);
+        assert_eq!(collisions, 0);
         // Empty master → everything degrades, nothing panics.
-        let (none, all_degraded, _) = resolve_groww_contract_books(&[], d("2026-07-13"));
+        let (none, all_degraded, _, _) = resolve_groww_contract_books(&[], d("2026-07-13"));
         assert!(none.is_empty());
         assert_eq!(all_degraded.len(), 3);
         // The degrade detail names the underlyings + the row count.
@@ -2383,8 +2732,20 @@ mod tests {
     }
 
     fn params_with_anchors(anchors: &[(&'static str, f64)]) -> GrowwContract1mTaskParams {
+        let now = fetched_at_ist_nanos_now();
         let store: GrowwChainAnchorStore = Arc::new(std::sync::Mutex::new(
-            anchors.iter().copied().collect::<HashMap<_, _>>(),
+            anchors
+                .iter()
+                .map(|&(u, ltp)| {
+                    (
+                        u,
+                        GrowwChainAnchor {
+                            ltp,
+                            set_at_ist_nanos: now,
+                        },
+                    )
+                })
+                .collect::<HashMap<_, _>>(),
         ));
         GrowwContract1mTaskParams {
             anchor_store: Some(store),
@@ -2406,6 +2767,11 @@ mod tests {
     /// One-slot NIFTY book whose only strike is the anchor's ATM.
     fn one_contract_book() -> Vec<GrowwContractBook> {
         vec![book_with_strikes("NIFTY", &[25_100.0])]
+    }
+
+    /// Fresh anchor-stale warn latch for a fire call (borrowed inline).
+    fn false_latch() -> bool {
+        false
     }
 
     #[tokio::test]
@@ -2431,6 +2797,7 @@ mod tests {
             &mut tracker,
             minute_open_ist_nanos(today_ist(), 9 * 3600 + 15 * 60),
             9 * 3600 + 16 * 60,
+            &mut false_latch(),
         )
         .await;
         assert_eq!(writer.pending(), 0, "no contract rows without a token");
@@ -2496,6 +2863,7 @@ mod tests {
             &mut tracker,
             target_nanos,
             9 * 3600 + 16 * 60,
+            &mut false_latch(),
         )
         .await;
         // 2 contracts selected (ATM CE + PE, one strike) — both found the
@@ -2540,6 +2908,7 @@ mod tests {
             &mut tracker,
             minute_open_ist_nanos(today_ist(), 9 * 3600 + 15 * 60),
             9 * 3600 + 16 * 60,
+            &mut false_latch(),
         )
         .await;
         assert_eq!(writer.pending(), 0, "nothing persisted on a 401 fire");

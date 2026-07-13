@@ -15124,7 +15124,14 @@ fn spawn_groww_spot_1m_leg(
     let contract_enabled = config.groww_contract_1m.enabled && chain_enabled;
     if config.groww_contract_1m.enabled && !chain_enabled {
         warn!(
-            "groww_contract_1m: [groww_contract_1m] is enabled but the chain              leg ([groww_option_chain_1m]) is OFF — the contract leg needs the              chain's per-minute ATM anchors; NOT spawned (enable the chain              leg first)"
+            code = tickvault_common::error_code::ErrorCode::Spot1m01FetchDegraded.code_str(),
+            stage = "enabled_without_chain",
+            feed = "groww",
+            leg = "contract_1m",
+            "SPOT1M-01: [groww_contract_1m] is enabled but the chain leg \
+             ([groww_option_chain_1m]) is OFF — the contract leg needs the \
+             chain's per-minute ATM anchors; NOT spawned (enable the chain \
+             leg first)"
         );
     }
     let (chain_minute_done_tx, chain_minute_done_rx, contract_anchor_store) = if contract_enabled {

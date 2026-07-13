@@ -473,6 +473,21 @@ impl OptionContract1mRestWriter {
 mod tests {
     use super::*;
 
+    /// Retention-registration pin (round-1 review LOW): the partition
+    /// manager MUST carry `option_contract_1m_rest` in its managed set —
+    /// deleting the registration would let the hot window grow unbounded
+    /// on the 50 GB EBS. Source-scan ratchet (the
+    /// partition_retention_coverage_guard covers the table-constant side;
+    /// this pins the manager side by name).
+    #[test]
+    fn test_partition_manager_registers_option_contract_1m_rest() {
+        let src = include_str!("partition_manager.rs");
+        assert!(
+            src.contains("\"option_contract_1m_rest\""),
+            "partition_manager.rs must register option_contract_1m_rest for retention"
+        );
+    }
+
     fn sample_row() -> OptionContract1mRestRow {
         OptionContract1mRestRow {
             // 2026-07-10 09:15:00 IST-as-epoch minute-open (illustrative).
