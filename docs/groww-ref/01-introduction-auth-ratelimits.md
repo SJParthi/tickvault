@@ -3,6 +3,8 @@
 > **Source:** https://groww.in/trade-api/docs/python-sdk
 > **Captured:** 2026-07-03 (direct page capture, verified lossless: all headings, tables, and code blocks match the live page 1:1)
 
+> **⚠ SUPERSEDED ON RATE LIMITS + TOKEN LIFECYCLE (2026-07-13 full-coverage refresh):** the authoritative rate-limit/capacity truth (incl. freshness forensics + unassigned families) is [`15-rate-limits-and-capacity.md`](./15-rate-limits-and-capacity.md), and the CORRECTED auth/token truth (THREE documented approaches, the officially documented daily 6:00 AM expiry, the mint response's `expiry` field) is [`17-token-lifecycle.md`](./17-token-lifecycle.md). This python-sdk page shows only 2 of the 3 approaches — the REST intro's 1st Approach (direct Access Token) carries the expiry statement. Content below retained verbatim as the 2026-07-03 capture.
+
 ---
 
 # Introduction
