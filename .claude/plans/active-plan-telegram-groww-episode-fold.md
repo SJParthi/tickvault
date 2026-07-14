@@ -28,7 +28,7 @@
   - Tests: (comment-only; behavior covered by test_groww_reject_open_then_progress_edits_no_second_page occurrence counting)
 - [x] Reduce GROWW_REJECT_PAGE_COOLDOWN_SECS 1800 → 60 (mechanism KEPT — transport-failure bound only)
   - Files: crates/app/src/groww_sidecar_supervisor.rs
-  - Tests: test_should_page_reject_rising_edge_and_cooldown (≤60 + >0 pins)
+  - Tests: test_should_page_reject_rising_edge_and_cooldown (exact ==60 / ==1800 pins + the reject_page_cooldown_secs mode selector), ratchet_supervisor_selects_cooldown_from_boot_time_episode_mode, ratchet_main_plumbs_config_episode_mode_into_sidecar_options
 - [x] Update the rule file's cooldown contract with a dated 2026-07-14 note
   - Files: .claude/rules/project/feed-stall-watchdog-error-codes.md
   - Tests: (docs; the ==60/==1800 pins are the mechanical guard)
@@ -99,7 +99,11 @@ the redundant pager), WS endpoints, §28 indicator/strategy, hot path.
   High/Critical Open/Progress (proptest, family-generic — the proptest is
   parameterized on severity/role, covering the new family by construction).
 - A future edit restoring the 30-min cooldown gap would starve the bubble's
-  occurrence counter → pinned by the ≤60 assert in the supervisor test.
+  occurrence counter → pinned EXACTLY (==60 episode-mode-on / ==1800
+  episode-mode-off) in the supervisor test; the wiring itself (selector
+  called with opts.episode_mode; main.rs plumbs config.notification.
+  episode_mode) is source-scan-ratcheted by
+  groww_reject_cooldown_wiring_guard.rs.
 - Deleting any episode mapping silently restores the storm → pinned by
   `episode_runtime_family_wiring_guard.rs`.
 - CloudWatch alarm chain untouched: the `error!` emit sites (FEED-REJECT-01,
@@ -118,7 +122,9 @@ the redundant pager), WS endpoints, §28 indicator/strategy, hot path.
   (commandments); (3) snapshot round-trip incl. GrowwFeed + exhaustiveness
   pin; (4) wiring guard `episode_runtime_family_wiring_guard.rs` (4 tests);
   (5) Boot-exclusion inverse `test_groww_feed_included_in_tick_scans_and_snapshot`;
-  (6) cooldown ≤60 pin in `test_should_page_reject_rising_edge_and_cooldown`.
+  (6) cooldown exact-value pins (==60 / ==1800 + mode selector) in
+  `test_should_page_reject_rising_edge_and_cooldown`, with the runtime
+  wiring source-scan-ratcheted by `groww_reject_cooldown_wiring_guard.rs`.
 
 ## Rollback
 
