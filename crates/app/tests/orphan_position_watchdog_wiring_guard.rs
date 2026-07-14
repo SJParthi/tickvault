@@ -25,6 +25,24 @@
 //!     into a silent skip). Pinned via CODE-SHAPED needles (real call
 //!     expressions), so a comment can never satisfy the assert.
 //!
+//! 2026-07-14 re-home update: the ONLY spawn used to live inside the
+//! Dhan-gated `spawn_post_market_tasks` family — dead on `dhan_enabled =
+//! false` boots (the production default since the 2026-07-13 Dhan live-WS
+//! retirement). The topology this guard now pins:
+//!
+//!  1. PRIMARY spawn in the PROCESS-GLOBAL prefix of `main()` (before the
+//!     `fn spawn_post_market_tasks(` definition in source order), using
+//!     `WatchdogAuth::GlobalAtFireTime` — dhan-off boots covered.
+//!  2. The family-site spawn INSIDE `spawn_post_market_tasks` (fast
+//!     crash-recovery coverage, `WatchdogAuth::Static`) — exactly 2 spawn
+//!     occurrences total; a third/moved spawn trips the count.
+//!  3. The boot module resolves the session at fire time — live lane-owned
+//!     manager PREFERRED, global OnceLock as the fallback (review round 1,
+//!     2026-07-14: the D2c staleness class) — and carries the no-manager
+//!     degraded wording (stub-guard — the fallback cannot be hollowed out
+//!     into a silent skip). Pinned via CODE-SHAPED needles (real call
+//!     expressions), so a comment can never satisfy the assert.
+//!
 //! Mirrors the codebase's `*_is_wired` guard pattern
 //! (`instrument_build_failed_wiring_guard.rs`, `daily_universe_boot_wiring_guard.rs`).
 //! Reads SOURCE text, so it runs on the default build independent of any
@@ -42,6 +60,12 @@ fn stack_src() -> String {
         Some(cut) => full[..cut].to_string(),
         None => full,
     }
+}
+
+fn watchdog_boot_source() -> String {
+    let path =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/orphan_position_watchdog_boot.rs");
+    fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
 }
 
 fn watchdog_boot_source() -> String {

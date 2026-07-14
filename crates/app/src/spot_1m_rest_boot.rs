@@ -484,7 +484,7 @@ impl EmptyDiagnostics {
 pub fn ist_nanos_minute_label(minute_ist_nanos: i64, trading_date_nanos: i64) -> String {
     let secs_of_day = (minute_ist_nanos.saturating_sub(trading_date_nanos) / NANOS_PER_SEC)
         .clamp(0, i64::from(SECONDS_PER_DAY) - 1);
-    // APPROVED: clamped into [0, SECONDS_PER_DAY); the cast is safe.
+    // APPROVED: clamped into [0, SECONDS_PER_DAY) — the cast is safe.
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     format_minute_ist_12h(secs_of_day as u32)
 }
@@ -1295,6 +1295,41 @@ struct FetchFailure {
     msg: String,
 }
 
+/// Per-ladder forensics for the Dhan `rest_fetch_audit` row (GAP-11
+/// review HIGH, 2026-07-14): the REAL rung count + 429 count + whether
+/// the TERMINAL failure was an HTTP 429 — so a Dhan 429 storm can never
+/// again read 0 on the scoreboard digest while
+/// `tv_spot1m_rate_limited_total` climbs. `final_http_status` /
+/// `fetch_latency_ms` REMAIN the storage crate's 0/-1 named sentinels
+/// (the Dhan [`FetchFailure`] carries no status/latency fields — that
+/// residual is the remaining flagged follow-up).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct DhanLadderForensics {
+    /// Requests actually sent by the ladder (0 = the budget-overrun arm —
+    /// the timed-out ladder's partial state is dropped with its future,
+    /// the Groww `budget_exceeded` honesty note).
+    attempts: u32,
+    /// How many of those attempts were HTTP 429 (derived from the REAL
+    /// `StatusCode`, never a substring scan).
+    rate_limited_count: u32,
+    /// The FINAL attempt was an HTTP 429 — drives the terminal
+    /// [`RestFetchOutcome::RateLimited`] classification (mirrors the
+    /// Groww `error_class == "rate_limited"` rule: the LAST attempt's
+    /// status decides).
+    terminal_rate_limited: bool,
+}
+
+/// GAP-11 review HIGH (2026-07-14): terminal-failure classification for
+/// the Dhan audit row — mirrors the Groww `audit_outcome_for` rule
+/// (`RateLimited` keys on the LAST attempt being an HTTP 429). Pure.
+fn dhan_failed_audit_class(forensics: &DhanLadderForensics) -> (RestFetchOutcome, &'static str) {
+    if forensics.terminal_rate_limited {
+        (RestFetchOutcome::RateLimited, "rate_limited")
+    } else {
+        (RestFetchOutcome::Error, "error")
+    }
+}
+
 /// A 2xx response body + its `Content-Type` header value (2026-07-14
 /// raw-body discriminator: the header names WHAT Dhan is serving when the
 /// body carries zero candles — JSON envelope vs HTML shell vs empty).
@@ -1617,7 +1652,8 @@ async fn fetch_minute_with_ladder(
                 backfill_candle: backfill_found,
             }
         }
-    }
+    };
+    (outcome, forensics)
 }
 
 /// The ladder wrapped in the HARD per-SID wall-clock budget
