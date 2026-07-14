@@ -49,6 +49,13 @@ aws-lc-rs = "1.17.0"
 rustls-webpki = "0.103.13"
 rand = "0.10.1"
 
+[features]
+# Gate 2 of the Groww order-side live-fire lattice (groww-second-feed-scope
+# §39.2). NON-DEFAULT — the broker_order_events seam is always compiled, but
+# this feature marks the order-side build surface so the lattice guard can
+# assert it exists in BOTH manifests and is never in a `default = [...]` set.
+groww_orders = []
+
 [dev-dependencies]
 criterion = { workspace = true }
 proptest = { workspace = true }

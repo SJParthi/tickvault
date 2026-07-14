@@ -2221,6 +2221,32 @@ pub const GROWW_CONTRACT_1M_REQUEST_TIMEOUT_SECS: u64 = 5;
 /// cap, never silent.
 pub const GROWW_CONTRACT_1M_MAX_PER_MINUTE: usize = 30;
 
+/// GATE 3 of the Groww order-side 4-gate live-fire lattice (operator
+/// authorization 2026-07-14 — `.claude/rules/project/groww-second-feed-scope-2026-06-19.md`
+/// §39.2, `.claude/rules/project/no-rest-except-live-feed-2026-06-27.md` §10).
+///
+/// The HARDCODED master live-fire switch for placing REAL Groww orders. While
+/// `false`, every Groww mutating order path (order create / modify / cancel
+/// and the smart-order family) MUST refuse to send — fail-closed, at
+/// compile-reasoned certainty, independent of any config value. A
+/// `[groww_orders] live_fire_requested = true` in config is INERT unless this
+/// const is ALSO flipped to `true` in source AND the non-default `groww_orders`
+/// cargo feature (Gate 2) is built.
+///
+/// Flipping this to `true` is a SEPARATE, FUTURE, DATED operator action: it
+/// requires editing §39 with a fresh dated live-orders-enable quote FIRST, and
+/// is caught by the lattice ratchet
+/// (`crates/common/tests/groww_order_lattice_guard.rs`), which pins this
+/// literal at `false` until that dated edit lands. It stays `false` here — the
+/// operator's 2026-07-14 authorization ("confirm — apply the Groww order
+/// scope-unlock PR-0. Build only, behind the OFF switch, no live orders") was
+/// to BUILD + INTEGRATE the order-side behind the lattice, explicitly NOT to
+/// fire live orders.
+///
+/// `dry_run` (StrategyConfig) stays `true` and the §28 strategy/indicator
+/// boundary stays frozen — this const does not touch either.
+pub const GROWW_ORDER_LIVE_FIRE: bool = false;
+
 /// HARD wall-clock deadline (secs) for ONE minute's whole contract fire:
 /// contracts not reached before the deadline are SKIPPED loudly (counted +
 /// forensics rows), never fetched into the next minute. Normal fires
@@ -3695,6 +3721,17 @@ mod boot_constants_tests {
 #[allow(clippy::assertions_on_constants)] // APPROVED: S4 — schema-stability tests intentionally assert on compile-time constants as a regression guard against silent protocol-value drift. Converting to `const { assert!(..) }` blocks compiles away the check message which defeats the guard purpose.
 mod tests {
     use super::*;
+
+    /// GATE 3 (§39.2): the hardcoded Groww live-fire switch MUST be false
+    /// until a dated operator live-orders-enable edits §39 + this const
+    /// together.
+    #[test]
+    fn test_groww_order_live_fire_is_off() {
+        assert!(
+            !GROWW_ORDER_LIVE_FIRE,
+            "GROWW_ORDER_LIVE_FIRE must stay false — see groww-second-feed-scope §39.2 Gate 3"
+        );
+    }
 
     #[test]
     fn test_ist_offset_seconds_is_5h30m() {
