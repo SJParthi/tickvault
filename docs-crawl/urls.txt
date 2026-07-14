@@ -1,19 +1,22 @@
-# Dhan live-docs crawl list — 2026-07-13
+# Dhan live-docs crawl list — 2026-07-13 (run 3: full re-crawl via verified routes)
 #
-# Provenance: docs/dhan-ref/verification-2026-07-13.md §3 (the operator
-# paste list from the 2026-07-13 search-index verification sweep, branch
-# claude/dhan-docs-verification-2026-07-13). The sandbox proxy 403-blocks
-# every Dhan host; this list is fetched runner-side by
-# .github/workflows/docs-fetch.yml where egress is open.
+# Provenance: docs/dhan-ref/verification-2026-07-13.md §3 (operator paste list)
+# + run-1/run-2 findings committed on this branch:
+#   - dhanhq.co/docs/v2/* serves REAL server-rendered HTML (24/24 distinct sha256).
+#   - docs.dhanhq.co rewrites every normal route (incl. *.md at the page path,
+#     trailing-slash forms, llms-full.txt) to ONE identical 33,884-byte
+#     Docusaurus shell. Its /llms.txt is REAL and names the machine routes:
+#     /docs-export.md, /markdown/<route>.md, /openapi/dhan-api-v2.yaml.
+#   - The 149 /markdown/*.md URLs below are the /api/v2 portal sitemap mapped
+#     through the /markdown/ prefix per llms.txt.
 #
-# Format: `SEED <url>` = fetched AND nav-crawled for doc links;
-# bare `<url>` = fetched only; `#` = comment.
+# Format: `SEED <url>` = fetched AND nav-crawled; bare `<url>` = fetched only.
 
-# Nav roots (seed the discovery crawl — defines the completeness universe)
+# Nav roots
 SEED https://dhanhq.co/docs/v2/
 SEED https://docs.dhanhq.co/
 
-# The 21 dhan-ref section pages (verification §3 checklist)
+# dhanhq.co/docs/v2 section pages (server-rendered HTML — verified real, run 1)
 https://dhanhq.co/docs/v2/authentication/
 https://dhanhq.co/docs/v2/live-market-feed/
 https://dhanhq.co/docs/v2/full-market-depth/
@@ -34,22 +37,161 @@ https://dhanhq.co/docs/v2/funds/
 https://dhanhq.co/docs/v2/statements/
 https://dhanhq.co/docs/v2/traders-control/
 https://dhanhq.co/docs/v2/releases/
-
-# Snapshot-only coverage (no dhan-ref file)
 https://dhanhq.co/docs/v2/expired-options-data/
-
-# NEW docs portal pages named in verification §3 / §4 flag 7
-https://docs.dhanhq.co/api/v2/authentication/renew-token
-https://docs.dhanhq.co/api/v2/funds/calculate-multi-margin
-
-# Portal content probes (added after run 1: every docs.dhanhq.co route
-# returned the IDENTICAL 33,884-byte Docusaurus root shell — SPA/CDN
-# rewrite. Probe the LLM-export + .md + trailing-slash forms.)
-https://docs.dhanhq.co/llms.txt
-https://docs.dhanhq.co/llms-full.txt
-https://docs.dhanhq.co/api/v2/authentication/renew-token/
-https://docs.dhanhq.co/api/v2/authentication/renew-token.md
-https://docs.dhanhq.co/api/v2/funds/calculate-multi-margin/
-https://docs.dhanhq.co/api/v2/funds/calculate-multi-margin.md
-https://docs.dhanhq.co/api/v2/guides/rate-limits.md
 https://dhanhq.co/sitemap-api-docs.xml
+
+# docs.dhanhq.co machine-readable routes (per its /llms.txt)
+https://docs.dhanhq.co/llms.txt
+https://docs.dhanhq.co/docs-export.md
+https://docs.dhanhq.co/openapi/dhan-api-v2.yaml
+
+# Per-page markdown export — /api/v2 portal sitemap via /markdown/ prefix (149)
+https://docs.dhanhq.co/markdown/api/v2.md
+https://docs.dhanhq.co/markdown/api/v2/authentication/api-key-consume-consent.md
+https://docs.dhanhq.co/markdown/api/v2/authentication/api-key-generate-consent.md
+https://docs.dhanhq.co/markdown/api/v2/authentication/generate-token.md
+https://docs.dhanhq.co/markdown/api/v2/authentication/get-ip.md
+https://docs.dhanhq.co/markdown/api/v2/authentication/modify-ip.md
+https://docs.dhanhq.co/markdown/api/v2/authentication/partner-consume-consent.md
+https://docs.dhanhq.co/markdown/api/v2/authentication/partner-generate-consent.md
+https://docs.dhanhq.co/markdown/api/v2/authentication/renew-token.md
+https://docs.dhanhq.co/markdown/api/v2/authentication/set-ip.md
+https://docs.dhanhq.co/markdown/api/v2/conditional-triggers.md
+https://docs.dhanhq.co/markdown/api/v2/conditional-triggers/delete-conditional-trigger.md
+https://docs.dhanhq.co/markdown/api/v2/conditional-triggers/get-all-conditional-triggers.md
+https://docs.dhanhq.co/markdown/api/v2/conditional-triggers/get-conditional-trigger-by-id.md
+https://docs.dhanhq.co/markdown/api/v2/conditional-triggers/modify-conditional-trigger.md
+https://docs.dhanhq.co/markdown/api/v2/conditional-triggers/place-conditional-trigger.md
+https://docs.dhanhq.co/markdown/api/v2/conditional-triggers/place-multi-order.md
+https://docs.dhanhq.co/markdown/api/v2/data-apis.md
+https://docs.dhanhq.co/markdown/api/v2/edis.md
+https://docs.dhanhq.co/markdown/api/v2/edis/edis-inquiry.md
+https://docs.dhanhq.co/markdown/api/v2/edis/generate-edis-form.md
+https://docs.dhanhq.co/markdown/api/v2/edis/generate-tpin.md
+https://docs.dhanhq.co/markdown/api/v2/expired-options-data.md
+https://docs.dhanhq.co/markdown/api/v2/expired-options-data/get-expired-options-data.md
+https://docs.dhanhq.co/markdown/api/v2/funds.md
+https://docs.dhanhq.co/markdown/api/v2/funds/calculate-margin.md
+https://docs.dhanhq.co/markdown/api/v2/funds/calculate-multi-margin.md
+https://docs.dhanhq.co/markdown/api/v2/funds/get-fund-limits.md
+https://docs.dhanhq.co/markdown/api/v2/global-stocks.md
+https://docs.dhanhq.co/markdown/api/v2/global-stocks/cancel-order.md
+https://docs.dhanhq.co/markdown/api/v2/global-stocks/data-apis.md
+https://docs.dhanhq.co/markdown/api/v2/global-stocks/data-apis/broadcast-websocket.md
+https://docs.dhanhq.co/markdown/api/v2/global-stocks/funds.md
+https://docs.dhanhq.co/markdown/api/v2/global-stocks/get-fund-limit.md
+https://docs.dhanhq.co/markdown/api/v2/global-stocks/get-holdings.md
+https://docs.dhanhq.co/markdown/api/v2/global-stocks/get-market-status.md
+https://docs.dhanhq.co/markdown/api/v2/global-stocks/get-order-book.md
+https://docs.dhanhq.co/markdown/api/v2/global-stocks/get-order-by-id.md
+https://docs.dhanhq.co/markdown/api/v2/global-stocks/get-past-trades.md
+https://docs.dhanhq.co/markdown/api/v2/global-stocks/get-past-trades-by-scrip.md
+https://docs.dhanhq.co/markdown/api/v2/global-stocks/margin-calculator.md
+https://docs.dhanhq.co/markdown/api/v2/global-stocks/modify-order.md
+https://docs.dhanhq.co/markdown/api/v2/global-stocks/order-estimator.md
+https://docs.dhanhq.co/markdown/api/v2/global-stocks/orders.md
+https://docs.dhanhq.co/markdown/api/v2/global-stocks/place-order.md
+https://docs.dhanhq.co/markdown/api/v2/global-stocks/portfolio.md
+https://docs.dhanhq.co/markdown/api/v2/global-stocks/statements.md
+https://docs.dhanhq.co/markdown/api/v2/global-stocks/traders-control.md
+https://docs.dhanhq.co/markdown/api/v2/guides/annexure.md
+https://docs.dhanhq.co/markdown/api/v2/guides/authentication.md
+https://docs.dhanhq.co/markdown/api/v2/guides/conditional-trigger.md
+https://docs.dhanhq.co/markdown/api/v2/guides/edis.md
+https://docs.dhanhq.co/markdown/api/v2/guides/errors.md
+https://docs.dhanhq.co/markdown/api/v2/guides/expired-options-data.md
+https://docs.dhanhq.co/markdown/api/v2/guides/full-market-depth.md
+https://docs.dhanhq.co/markdown/api/v2/guides/getting-started.md
+https://docs.dhanhq.co/markdown/api/v2/guides/instruments.md
+https://docs.dhanhq.co/markdown/api/v2/guides/live-market-feed.md
+https://docs.dhanhq.co/markdown/api/v2/guides/order-update.md
+https://docs.dhanhq.co/markdown/api/v2/guides/postback.md
+https://docs.dhanhq.co/markdown/api/v2/guides/rate-limits.md
+https://docs.dhanhq.co/markdown/api/v2/guides/releases.md
+https://docs.dhanhq.co/markdown/api/v2/guides/sdks/python.md
+https://docs.dhanhq.co/markdown/api/v2/guides/statements.md
+https://docs.dhanhq.co/markdown/api/v2/guides/traders-control.md
+https://docs.dhanhq.co/markdown/api/v2/historical-data.md
+https://docs.dhanhq.co/markdown/api/v2/historical-data/get-daily-historical.md
+https://docs.dhanhq.co/markdown/api/v2/historical-data/get-intraday-historical.md
+https://docs.dhanhq.co/markdown/api/v2/market-quote.md
+https://docs.dhanhq.co/markdown/api/v2/market-quote/get-ltp.md
+https://docs.dhanhq.co/markdown/api/v2/market-quote/get-ohlc.md
+https://docs.dhanhq.co/markdown/api/v2/market-quote/get-quote.md
+https://docs.dhanhq.co/markdown/api/v2/option-chain.md
+https://docs.dhanhq.co/markdown/api/v2/option-chain/get-expiry-list.md
+https://docs.dhanhq.co/markdown/api/v2/option-chain/get-option-chain.md
+https://docs.dhanhq.co/markdown/api/v2/orders.md
+https://docs.dhanhq.co/markdown/api/v2/orders/cancel-order.md
+https://docs.dhanhq.co/markdown/api/v2/orders/get-order-by-correlation-id.md
+https://docs.dhanhq.co/markdown/api/v2/orders/get-order-by-id.md
+https://docs.dhanhq.co/markdown/api/v2/orders/get-orders.md
+https://docs.dhanhq.co/markdown/api/v2/orders/get-trades.md
+https://docs.dhanhq.co/markdown/api/v2/orders/get-trades-by-order-id.md
+https://docs.dhanhq.co/markdown/api/v2/orders/modify-order.md
+https://docs.dhanhq.co/markdown/api/v2/orders/place-order.md
+https://docs.dhanhq.co/markdown/api/v2/orders/slice-order.md
+https://docs.dhanhq.co/markdown/api/v2/portfolio.md
+https://docs.dhanhq.co/markdown/api/v2/portfolio/convert-position.md
+https://docs.dhanhq.co/markdown/api/v2/portfolio/exit-all-positions.md
+https://docs.dhanhq.co/markdown/api/v2/portfolio/get-holdings.md
+https://docs.dhanhq.co/markdown/api/v2/portfolio/get-positions.md
+https://docs.dhanhq.co/markdown/api/v2/sandbox.md
+https://docs.dhanhq.co/markdown/api/v2/schemas/conditionaltriggercondition.md
+https://docs.dhanhq.co/markdown/api/v2/schemas/conditionaltriggerdetail.md
+https://docs.dhanhq.co/markdown/api/v2/schemas/conditionaltriggerorder.md
+https://docs.dhanhq.co/markdown/api/v2/schemas/conditionaltriggerrequest.md
+https://docs.dhanhq.co/markdown/api/v2/schemas/conditionaltriggerresponse.md
+https://docs.dhanhq.co/markdown/api/v2/schemas/convertpositionrequest.md
+https://docs.dhanhq.co/markdown/api/v2/schemas/edisformrequest.md
+https://docs.dhanhq.co/markdown/api/v2/schemas/edisformresponse.md
+https://docs.dhanhq.co/markdown/api/v2/schemas/edisinquiryresponse.md
+https://docs.dhanhq.co/markdown/api/v2/schemas/expiredoptionsrequest.md
+https://docs.dhanhq.co/markdown/api/v2/schemas/expiredoptionsresponse.md
+https://docs.dhanhq.co/markdown/api/v2/schemas/expirylistrequest.md
+https://docs.dhanhq.co/markdown/api/v2/schemas/fundlimit.md
+https://docs.dhanhq.co/markdown/api/v2/schemas/historicalrequest.md
+https://docs.dhanhq.co/markdown/api/v2/schemas/historicalresponse.md
+https://docs.dhanhq.co/markdown/api/v2/schemas/holding.md
+https://docs.dhanhq.co/markdown/api/v2/schemas/intradayhistoricalrequest.md
+https://docs.dhanhq.co/markdown/api/v2/schemas/killswitchresponse.md
+https://docs.dhanhq.co/markdown/api/v2/schemas/ledgerentry.md
+https://docs.dhanhq.co/markdown/api/v2/schemas/ltpresponse.md
+https://docs.dhanhq.co/markdown/api/v2/schemas/marginrequest.md
+https://docs.dhanhq.co/markdown/api/v2/schemas/marginresponse.md
+https://docs.dhanhq.co/markdown/api/v2/schemas/marketfeedrequest.md
+https://docs.dhanhq.co/markdown/api/v2/schemas/modifyorderrequest.md
+https://docs.dhanhq.co/markdown/api/v2/schemas/modifysuperorderrequest.md
+https://docs.dhanhq.co/markdown/api/v2/schemas/multimarginrequest.md
+https://docs.dhanhq.co/markdown/api/v2/schemas/multimarginresponse.md
+https://docs.dhanhq.co/markdown/api/v2/schemas/ohlcresponse.md
+https://docs.dhanhq.co/markdown/api/v2/schemas/optionchainrequest.md
+https://docs.dhanhq.co/markdown/api/v2/schemas/optionchainresponse.md
+https://docs.dhanhq.co/markdown/api/v2/schemas/optiondata.md
+https://docs.dhanhq.co/markdown/api/v2/schemas/order.md
+https://docs.dhanhq.co/markdown/api/v2/schemas/orderresponse.md
+https://docs.dhanhq.co/markdown/api/v2/schemas/placeorderrequest.md
+https://docs.dhanhq.co/markdown/api/v2/schemas/pnlexitdetail.md
+https://docs.dhanhq.co/markdown/api/v2/schemas/pnlexitrequest.md
+https://docs.dhanhq.co/markdown/api/v2/schemas/pnlexitresponse.md
+https://docs.dhanhq.co/markdown/api/v2/schemas/position.md
+https://docs.dhanhq.co/markdown/api/v2/schemas/quoteresponse.md
+https://docs.dhanhq.co/markdown/api/v2/schemas/superorder.md
+https://docs.dhanhq.co/markdown/api/v2/schemas/superorderrequest.md
+https://docs.dhanhq.co/markdown/api/v2/schemas/trade.md
+https://docs.dhanhq.co/markdown/api/v2/schemas/tradehistoryentry.md
+https://docs.dhanhq.co/markdown/api/v2/statements.md
+https://docs.dhanhq.co/markdown/api/v2/statements/get-ledger-report.md
+https://docs.dhanhq.co/markdown/api/v2/statements/get-trade-history.md
+https://docs.dhanhq.co/markdown/api/v2/super-orders.md
+https://docs.dhanhq.co/markdown/api/v2/super-orders/cancel-super-order-leg.md
+https://docs.dhanhq.co/markdown/api/v2/super-orders/get-super-orders.md
+https://docs.dhanhq.co/markdown/api/v2/super-orders/modify-super-order.md
+https://docs.dhanhq.co/markdown/api/v2/super-orders/place-super-order.md
+https://docs.dhanhq.co/markdown/api/v2/traders-control.md
+https://docs.dhanhq.co/markdown/api/v2/traders-control/configure-pnl-exit.md
+https://docs.dhanhq.co/markdown/api/v2/traders-control/get-kill-switch-status.md
+https://docs.dhanhq.co/markdown/api/v2/traders-control/get-pnl-exit.md
+https://docs.dhanhq.co/markdown/api/v2/traders-control/manage-kill-switch.md
+https://docs.dhanhq.co/markdown/api/v2/traders-control/stop-pnl-exit.md
+https://docs.dhanhq.co/markdown/api/v2/trading-apis.md
