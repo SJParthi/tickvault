@@ -41,3 +41,15 @@ https://dhanhq.co/docs/v2/expired-options-data/
 # NEW docs portal pages named in verification §3 / §4 flag 7
 https://docs.dhanhq.co/api/v2/authentication/renew-token
 https://docs.dhanhq.co/api/v2/funds/calculate-multi-margin
+
+# Portal content probes (added after run 1: every docs.dhanhq.co route
+# returned the IDENTICAL 33,884-byte Docusaurus root shell — SPA/CDN
+# rewrite. Probe the LLM-export + .md + trailing-slash forms.)
+https://docs.dhanhq.co/llms.txt
+https://docs.dhanhq.co/llms-full.txt
+https://docs.dhanhq.co/api/v2/authentication/renew-token/
+https://docs.dhanhq.co/api/v2/authentication/renew-token.md
+https://docs.dhanhq.co/api/v2/funds/calculate-multi-margin/
+https://docs.dhanhq.co/api/v2/funds/calculate-multi-margin.md
+https://docs.dhanhq.co/api/v2/guides/rate-limits.md
+https://dhanhq.co/sitemap-api-docs.xml
