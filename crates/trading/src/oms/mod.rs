@@ -32,6 +32,7 @@ pub mod api_client;
 pub mod circuit_breaker;
 pub mod dh904_backoff;
 pub mod engine;
+pub mod error_taxonomy;
 pub mod idempotency;
 pub mod rate_limiter;
 pub mod reconciliation;
@@ -41,6 +42,7 @@ pub mod types;
 // Re-export key types for ergonomic use.
 pub use api_client::OrderApiClient;
 pub use engine::{OrderManagementSystem, TokenProvider};
+pub use error_taxonomy::{BrokerCooldownLatch, DhanErrorClass, OrderEndpoint, OrderErrorPolicy};
 pub use rate_limiter::OrderRateLimiter;
 pub use types::{
     ManagedOrder, ModifyOrderRequest, OmsError, PlaceOrderRequest, ReconciliationReport,

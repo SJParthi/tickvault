@@ -1393,6 +1393,23 @@ pub enum OmsError {
     /// Maximum modifications per order exceeded.
     #[error("max modifications ({max}) exceeded for order {order_id}")]
     MaxModificationsExceeded { order_id: String, max: u32 },
+
+    /// Cluster B: a live order was refused by the order-readiness gate
+    /// (fail-closed on never-probed / stale / invalid profile / token headroom).
+    #[error("order readiness gate refused: {reason} (ORDER-READY-01)")]
+    OrderReadinessRefused { reason: &'static str },
+
+    /// Cluster B: the OMS order path is HALTED (DH-901 post-retry / DH-902 /
+    /// DH-903 / DATA-810). Cleared only by an operator (`clear_order_halt`) or
+    /// a process restart — never by `reset_daily`. Field is `cause` (not
+    /// `source`) because `&'static str` is not an `std::error::Error`.
+    #[error("OMS order path HALTED by {cause} — operator action required")]
+    OrderPathHalted { cause: &'static str },
+
+    /// Cluster B: DATA-805 stop-all cooldown is active — every order-API call is
+    /// refused for the remaining window, then resumes passively.
+    #[error("Dhan DATA-805 stop-all cooldown active ({remaining_secs}s remaining)")]
+    StopAllCooldown { remaining_secs: u64 },
 }
 
 // ---------------------------------------------------------------------------
@@ -1919,12 +1936,41 @@ mod tests {
             OmsError::TokenExpired,
             OmsError::HttpError("connection refused".to_owned()),
             OmsError::JsonError("unexpected token".to_owned()),
+            OmsError::OrderReadinessRefused { reason: "stale" },
+            OmsError::OrderPathHalted { cause: "DH-901" },
+            OmsError::StopAllCooldown { remaining_secs: 42 },
         ];
 
         for err in &all_errors {
             let display = err.to_string();
             assert!(!display.is_empty(), "Display must not be empty for {err:?}");
         }
+    }
+
+    #[test]
+    fn test_display_order_readiness_refused() {
+        let err = OmsError::OrderReadinessRefused {
+            reason: "profile_invalid",
+        };
+        let s = err.to_string();
+        assert!(s.contains("profile_invalid"));
+        assert!(s.contains("ORDER-READY-01"));
+    }
+
+    #[test]
+    fn test_display_order_path_halted() {
+        let err = OmsError::OrderPathHalted { cause: "DH-902" };
+        let s = err.to_string();
+        assert!(s.contains("DH-902"));
+        assert!(s.contains("HALTED"));
+    }
+
+    #[test]
+    fn test_display_stop_all_cooldown() {
+        let err = OmsError::StopAllCooldown { remaining_secs: 17 };
+        let s = err.to_string();
+        assert!(s.contains("17"));
+        assert!(s.contains("805"));
     }
 
     #[test]

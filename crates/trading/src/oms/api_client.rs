@@ -50,19 +50,18 @@ const HTTP_TOO_MANY_REQUESTS: u16 = 429;
 // ---------------------------------------------------------------------------
 
 /// Extracts the `errorCode` field from a Dhan API error response body and
-/// increments the corresponding Prometheus counter.
+/// increments the `tv_dhan_error_total` Prometheus counter.
 ///
-/// Dhan error responses have the shape `{"errorCode":"DH-9XX", ...}`.
-/// If the code cannot be extracted, the counter is not emitted.
+/// The `code` label is a CLOSED SET: the extracted code is mapped through the
+/// taxonomy to a known `ErrorCode::code_str()`, or the literal `"unknown"`.
+/// This prevents an attacker-controllable label-cardinality bomb (R23) — a
+/// hostile error body can no longer inject arbitrary metric-label values.
 fn record_dh_error_metric(body: &str) {
-    // Simple extraction without allocating a full serde parse.
-    if let Some(start) = body.find("\"errorCode\":\"") {
-        let after = &body[start + 13..]; // skip past `"errorCode":"`
-        if let Some(end) = after.find('"') {
-            let code = &after[..end];
-            metrics::counter!("tv_dhan_error_total", "code" => code.to_owned()).increment(1);
-        }
-    }
+    let label: &'static str = super::error_taxonomy::extract_dhan_error_code(body)
+        .and_then(super::error_taxonomy::class_for_code_token)
+        .map(|class| super::error_taxonomy::error_code_for(class).code_str())
+        .unwrap_or("unknown");
+    metrics::counter!("tv_dhan_error_total", "code" => label).increment(1);
 }
 
 // ---------------------------------------------------------------------------
