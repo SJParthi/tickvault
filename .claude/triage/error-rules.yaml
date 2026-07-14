@@ -1803,14 +1803,16 @@ rules:
     confidence: 1.0
     cooldown_secs: 0
     justification: >-
-      REST-CANARY-01 = a scheduled GET /v2/profile health probe (09:05 /
-      12:00 / 15:25 IST) returned non-2xx or failed to send after one 30s
-      retry. Severity::High, NOT auto-fixable: the captured body names the
-      cause (data-plan expiry vs DH-901 token vs WAF/malformed URL) and
-      each requires a different operator action (renew plan on Dhan portal /
-      rotate token / fix base-URL override). Fires at most 3 times per
-      trading day by construction (3 fixed probe times). The operator reads
-      the body + url fields in the error payload per the runbook triage.
+      RETIRED EMIT 2026-07-14 (operator Dhan noise lock,
+      dhan-rest-only-noise-lock-2026-07-14.md): the REST canary module +
+      both spawn sites are DELETED, so REST-CANARY-01 has ZERO production
+      emit sites — this rule can only match a historical errors.jsonl
+      line. The ErrorCode variant + this rule are retained per the house
+      retirement-banner style (the triage full-coverage guard requires a
+      rule or an exemption per variant). Historical semantics: a scheduled
+      GET /v2/profile health probe (09:05 / 12:00 / 15:25 IST) returned
+      non-2xx or failed to send after one 30s retry; the spot/chain legs'
+      own escalation edges now self-detect a dead REST surface in ~3-4 min.
 
   - name: prevday-01-coverage-empty-escalate
     match:
@@ -2306,6 +2308,54 @@ rules:
       auto-executed. Recovery confirmed by the falling-edge log +
       tv_questdb_wal_suspended_tables returning to 0.
 
+  # BRUTEX-XVERIFY-01 (BruteX crossverify Commit 1, 2026-07-12) = the daily
+  # 15:50 IST BruteX-vs-live 1m cross-verify found >=1 divergent cell
+  # (diverged / missing_live / missing_brutex). Escalate — NOT auto-triage
+  # safe (is_auto_triage_safe() == false severity-independent override, the
+  # FUTIDX-02 / WAL-SUSPEND-01 precedent): a data-comparability signal is
+  # never auto-actioned; the operator decides which capture chain (TickVault
+  # live vs BruteX) is wrong. Both sides re-produce tomorrow; the audit rows
+  # are the durable record — never hand-patch either table.
+  - name: brutex-xverify-01-divergence-found-escalate
+    match:
+      code: BRUTEX-XVERIFY-01
+    action: escalate
+    runbook_path: .claude/rules/project/brutex-crossverify-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 600
+    justification: >-
+      BRUTEX-XVERIFY-01 = the daily BruteX-vs-live 1-minute cross-verify
+      found divergent cells. Data-comparability signal — never auto-actioned
+      (severity-independent is_auto_triage_safe override): the operator
+      inspects brutex_crossverify_cell_audit (field/kind breakdown), the
+      /crossverify trend page, and the day's Groww feed health to decide
+      which capture chain drifted. Track the trend, not the absolute count —
+      both sides sample the same vendor stream at different capture points.
+
+  # BRUTEX-XVERIFY-02 (BruteX crossverify Commit 1, 2026-07-12) = a leg of
+  # the daily run failed (s3_list/s3_fetch/csv_parse/wall_clock_cap/
+  # questdb_read/questdb_write/outcome_regression). The degrade already
+  # happened and is honestly stamped (partial/no_data/degraded — never a
+  # false clean); the run is DEDUP-idempotent and the keep-better guard
+  # protects a previously measured day, so escalate = the operator re-runs
+  # the backfill after fixing the underlying S3/QuestDB condition.
+  - name: brutex-xverify-02-run-degraded-escalate
+    match:
+      code: BRUTEX-XVERIFY-02
+    action: escalate
+    runbook_path: .claude/rules/project/brutex-crossverify-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 600
+    justification: >-
+      BRUTEX-XVERIFY-02 = the daily BruteX cross-verify run degraded on one
+      leg — the stage field names it (S3 list/fetch, CSV parse, 16:05 IST
+      wall-clock cap, QuestDB read/write, suppressed outcome regression).
+      Best-effort cold-path forensic compare — feeds/capture/trading are
+      unaffected; escalate so the operator knows the day is
+      partial/no_data/degraded and can backfill via the DEDUP-idempotent
+      re-run once the underlying condition (BruteX producer publish, S3
+      reachability, QuestDB health per BOOT-01/02) is fixed.
+
   # -----------------------------------------------------------------------
   # Per-minute spot 1m REST pipeline (operator grant 2026-07-12, PR-2)
   # -----------------------------------------------------------------------
@@ -2329,7 +2379,8 @@ rules:
       self-retries every minute close and the Telegram page is
       edge-triggered app-side; escalate so the operator inspects the
       bounded secret-redacted sample failure (status + redacted URL +
-      body) and cross-checks REST-CANARY-01 / the WS feed per the runbook.
+      body) per the runbook (the REST canary cross-check retired
+      2026-07-14 — the legs' own edges are the REST-death detector).
       Missing minutes stay absent (never fabricated) and backfill safely
       via DEDUP-idempotent re-appends.
 
@@ -2388,7 +2439,8 @@ rules:
       CHAIN-02 = per-minute option-chain fetch degraded. The scheduler
       self-retries every minute close; escalate so the operator inspects
       the bounded secret-redacted sample failure and cross-checks the
-      spot leg (SPOT1M-01) + REST-CANARY-01 per the runbook. Missing
+      spot leg (SPOT1M-01) per the runbook (the REST canary cross-check
+      retired 2026-07-14 — the legs' own edges detect REST death). Missing
       minutes stay absent (never fabricated) and backfill safely via
       DEDUP-idempotent re-appends.
 

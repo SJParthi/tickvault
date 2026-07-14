@@ -562,6 +562,9 @@ pub async fn run_cross_verify_1m(
     run_ts_ist_nanos: i64,
     csv_dir: &str,
 ) -> CrossVerify1mSummary {
+    // 2026-07-14 raw-body discriminator: re-arm the once-per-run empty-body
+    // capture (a forced TICKVAULT_CROSS_VERIFY_NOW re-run captures again).
+    CV_RAW_BODY_CAPTURED.store(false, std::sync::atomic::Ordering::Relaxed);
     ensure_feed_parity_1m_audit_table(&questdb_config).await;
 
     let jwt = {
@@ -910,11 +913,50 @@ async fn dhan_intraday_fetch(
             ),
         });
     }
+    // Content-Type BEFORE `.text()` consumes the response (2026-07-14
+    // raw-body discriminator).
+    let content_type = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
     let text = resp.text().await.map_err(|e| IntradayFetchFailure {
         rate_limited: false,
         reason: format!("read: {e}"),
     })?;
-    Ok(parse_intraday_1m_candles(&text))
+    let candles = parse_intraday_1m_candles(&text);
+    // 2026-07-14 raw-body discriminator (Dhan-support evidence): the FIRST
+    // 2xx-but-zero-candles fetch of a run logs ONE bounded 600-char
+    // secret-redacted body sample + total byte length + Content-Type.
+    // Edge-latched per run (`claim_once` — the run's targets fetch
+    // sequentially/concurrently; exactly one line either way).
+    if candles.is_empty() && claim_once(&CV_RAW_BODY_CAPTURED) {
+        error!(
+            code = tickvault_common::error_code::ErrorCode::CrossVerify1m02FetchDegraded.code_str(),
+            stage = "raw_body_sample",
+            body_bytes = text.len(),
+            content_type = %content_type,
+            body_sample = %tickvault_common::sanitize::capture_rest_raw_body_sample(&text),
+            "cross_verify_1m: FIRST empty intraday fetch of the run — bounded 600-char \
+             secret-redacted sample of the 2xx charts body (the account-condition vs \
+             envelope-drift discriminator; once per run)"
+        );
+    }
+    Ok(candles)
+}
+
+/// Process-global once-per-run latch for the empty-fetch raw-body capture
+/// (re-armed at the top of [`run_cross_verify_1m`]).
+static CV_RAW_BODY_CAPTURED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// CAS claim: `true` exactly once until the flag is re-armed. Pure over
+/// the passed flag (unit-tested on a local `AtomicBool`).
+fn claim_once(flag: &std::sync::atomic::AtomicBool) -> bool {
+    use std::sync::atomic::Ordering;
+    flag.compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
+        .is_ok()
 }
 
 /// GET helper returning the response text (or an error string). Used for the
@@ -1011,6 +1053,23 @@ pub const fn default_csv_dir() -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    /// 2026-07-14 raw-body discriminator: the once-per-run latch fires
+    /// exactly once until re-armed (the run start `store(false)`).
+    #[test]
+    fn test_claim_once_fires_exactly_once_until_rearmed() {
+        let flag = std::sync::atomic::AtomicBool::new(false);
+        assert!(super::claim_once(&flag), "first claim must win");
+        assert!(
+            !super::claim_once(&flag),
+            "second claim must be latched out"
+        );
+        flag.store(false, std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            super::claim_once(&flag),
+            "re-arm restores exactly one claim"
+        );
+    }
+
     #[test]
     fn test_cross_verify_targets_exclude_index_future_role() {
         // §36 (2026-07-08): the main.rs 15:31 target build keeps ONLY roles

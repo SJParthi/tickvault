@@ -16,6 +16,7 @@
 
 pub mod board;
 pub mod board_page;
+pub mod brutex_crossverify;
 pub mod dashboard_page;
 pub mod debug;
 pub mod feeds;

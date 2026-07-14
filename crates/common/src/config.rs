@@ -7,7 +7,10 @@ use anyhow::{Result, bail};
 use chrono::NaiveTime;
 use serde::Deserialize;
 
-use crate::constants::SEBI_MAX_ORDERS_PER_SECOND;
+use crate::constants::{
+    DHAN_DATA_API_DEFAULT_TARGET_RPS, DHAN_DATA_API_RPS_CEILING, DHAN_DATA_API_RPS_FLOOR,
+    SEBI_MAX_ORDERS_PER_SECOND,
+};
 use crate::trading_calendar::TradingCalendar;
 
 /// Root application configuration.
@@ -82,6 +85,15 @@ pub struct ApplicationConfig {
     /// off is the whole-subsystem rollback switch (B12).
     #[serde(default)]
     pub scoreboard: ScoreboardConfig,
+    /// `[brutex_crossverify]` — daily BruteX↔TickVault Groww 1-minute
+    /// cross-verification (operator authorization tracked in
+    /// `.claude/rules/project/brutex-crossverify-error-codes.md`). Reads
+    /// BruteX-produced OHLCV CSVs from S3 at 15:50 IST and compares them
+    /// against live `candles_1m` rows tagged `feed='groww'`. Default OFF —
+    /// a missing section keeps today's behaviour byte-identical; flipping
+    /// `enabled = false` is the whole-subsystem rollback switch (B12).
+    #[serde(default)]
+    pub brutex_crossverify: BrutexCrossverifyConfig,
     /// `[spot_1m_rest]` — per-minute spot 1m REST pipeline (operator grant
     /// 2026-07-12, `no-rest-except-live-feed-2026-06-27.md` §8): every
     /// trading-day minute close in session, fetch that just-closed minute's
@@ -90,6 +102,14 @@ pub struct ApplicationConfig {
     /// section ⇒ DISABLED (fail-safe default off).
     #[serde(default)]
     pub spot_1m_rest: Spot1mRestConfig,
+    /// `[dhan_data_api]` — shared Dhan Data-API REST pacing (operator
+    /// pacing directive 2026-07-14): the process-wide token-bucket limiter
+    /// every per-minute Dhan Data-API REST fire passes through (spot-1m
+    /// fires + ladder re-polls + the 15:33:30 sweep + the #1524 diagnostic
+    /// probes + the option-chain fires). Absent section ⇒ the directed
+    /// 3 rps default. Dhan-ONLY — Groww untouched.
+    #[serde(default)]
+    pub dhan_data_api: DhanDataApiConfig,
     /// `[option_chain_1m]` — per-minute option-chain REST pipeline (operator
     /// grant 2026-07-12, `no-rest-except-live-feed-2026-06-27.md` §8; PR-3,
     /// the OPTION-CHAIN half). Config-gated DEFAULT-OFF pending the
@@ -144,6 +164,16 @@ pub struct ApplicationConfig {
     /// section ⇒ DISABLED (fail-safe default off).
     #[serde(default)]
     pub groww_contract_1m: GrowwContract1mConfig,
+    /// `[dhan_margin_gate]` — 🔷 DHAN pre-trade margin gate (operator
+    /// directive 2026-07-14, relayed via the coordinator session — the
+    /// Funds & Margin surface runs as its own dedicated build; umbrella
+    /// plan cluster E2). Code-ready DEFAULT-OFF: even with
+    /// `enabled = true` the REST legs stay dark until the code-change
+    /// master lock `DHAN_MARGIN_GATE_REST_ALLOWED` (constants.rs) flips
+    /// with a fresh dated operator quote. Absent section ⇒ DISABLED
+    /// (fail-safe default off).
+    #[serde(default)]
+    pub dhan_margin_gate: DhanMarginGateConfig,
 }
 
 /// `[feeds]` — pluggable market-data feed selection (operator lock
@@ -402,6 +432,129 @@ impl Default for ScoreboardConfig {
     }
 }
 
+/// `[brutex_crossverify]` — daily BruteX↔TickVault Groww 1-minute
+/// cross-verification. At 15:50 IST the runner lists + downloads the
+/// BruteX-produced OHLCV CSVs from S3 (`s3://<bucket>/<prefix>/<date>/…`)
+/// and compares them cell-by-cell (paise-integer, tolerance INCLUSIVE)
+/// against live `candles_1m` rows tagged `feed='groww'`. All fields
+/// serde-defaulted so a missing section is safe. `enabled = false` is
+/// SAFE-OFF: nothing spawns until the operator flips it — the flip back
+/// to `false` is the whole-subsystem rollback switch (B12; pinned by
+/// `brutex_crossverify_flag_rollback`).
+#[derive(Debug, Clone, Deserialize)]
+pub struct BrutexCrossverifyConfig {
+    /// Master switch for the whole subsystem (15:50 IST daily runner +
+    /// forensic tables + Telegram summary + `/crossverify` page data).
+    /// Default OFF — cold-path S3 reads only begin once enabled.
+    #[serde(default = "default_brutex_xverify_enabled")]
+    pub enabled: bool,
+    /// Send the daily Telegram summary (the comparison + tables still run
+    /// when this is off — forensic record without the ping).
+    #[serde(default = "default_brutex_xverify_telegram_enabled")]
+    pub telegram_enabled: bool,
+    /// S3 bucket carrying the BruteX-produced CSVs. Reuses the existing
+    /// cold-archive bucket (instance role already has read access —
+    /// zero IAM change).
+    #[serde(default = "default_brutex_xverify_bucket")]
+    pub bucket: String,
+    /// Key prefix under the bucket; the runner lists
+    /// `<prefix>/<YYYY-MM-DD>/` for the trading day.
+    #[serde(default = "default_brutex_xverify_prefix")]
+    pub prefix: String,
+    /// IST seconds-of-day for the daily trigger. Default 57_000 =
+    /// 15:50:00 IST (after the 15:31 cross-verify, the 15:40
+    /// tick-conservation audit and the 15:45 scoreboard).
+    #[serde(default = "default_brutex_xverify_trigger_secs")]
+    pub trigger_secs_of_day_ist: u32,
+    /// IST seconds-of-day wall-clock cap. An empty S3 listing re-polls
+    /// every `repoll_interval_secs` until this cap (default 57_900 =
+    /// 16:05:00 IST — well before the AWS 16:30 IST auto-stop), then the
+    /// day records NO_DATA / degraded honestly (stage `wall_clock_cap`).
+    #[serde(default = "default_brutex_xverify_deadline_secs")]
+    pub deadline_secs_of_day_ist: u32,
+    /// Seconds between re-polls while the day's S3 listing is empty.
+    #[serde(default = "default_brutex_xverify_repoll_secs")]
+    pub repoll_interval_secs: u64,
+    /// Per-object size cap (bytes). A CSV larger than this is refused
+    /// (degraded, loud) — bounds memory on a corrupt/hostile object.
+    #[serde(default = "default_brutex_xverify_max_object_bytes")]
+    pub max_object_bytes: u64,
+    /// Cap on the number of listed keys per day (bounds a runaway
+    /// producer; beyond it the run degrades loudly).
+    #[serde(default = "default_brutex_xverify_max_keys")]
+    pub max_keys: u32,
+    /// Bounded download attempts per S3 object (with backoff) before
+    /// that object is counted failed for the day.
+    #[serde(default = "default_brutex_xverify_fetch_attempts")]
+    pub fetch_attempts_per_object: u32,
+    /// INCLUSIVE per-cell price tolerance in paise (integer compare —
+    /// `|live - brutex| <= tolerance` matches). Default 0 = exact match.
+    #[serde(default = "default_brutex_xverify_price_tolerance_paise")]
+    pub price_tolerance_paise: i64,
+    /// Classify volume divergences. Default OFF — Groww live volume is
+    /// always 0 (LTP-only feed), so volume classification for the groww
+    /// feed is hard-refused regardless of this flag; both sides are
+    /// still STORED for forensics.
+    #[serde(default = "default_brutex_xverify_compare_volume")]
+    pub compare_volume: bool,
+}
+
+fn default_brutex_xverify_enabled() -> bool {
+    false
+}
+fn default_brutex_xverify_telegram_enabled() -> bool {
+    true
+}
+fn default_brutex_xverify_bucket() -> String {
+    String::from("tv-prod-cold")
+}
+fn default_brutex_xverify_prefix() -> String {
+    String::from("crossverify/groww")
+}
+fn default_brutex_xverify_trigger_secs() -> u32 {
+    15 * 3600 + 50 * 60 // 57_000 = 15:50:00 IST
+}
+fn default_brutex_xverify_deadline_secs() -> u32 {
+    16 * 3600 + 5 * 60 // 57_900 = 16:05:00 IST
+}
+fn default_brutex_xverify_repoll_secs() -> u64 {
+    120
+}
+fn default_brutex_xverify_max_object_bytes() -> u64 {
+    5 * 1024 * 1024 // 5 MiB per CSV object
+}
+fn default_brutex_xverify_max_keys() -> u32 {
+    2_000
+}
+fn default_brutex_xverify_fetch_attempts() -> u32 {
+    3
+}
+fn default_brutex_xverify_price_tolerance_paise() -> i64 {
+    0
+}
+fn default_brutex_xverify_compare_volume() -> bool {
+    false
+}
+
+impl Default for BrutexCrossverifyConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_brutex_xverify_enabled(),
+            telegram_enabled: default_brutex_xverify_telegram_enabled(),
+            bucket: default_brutex_xverify_bucket(),
+            prefix: default_brutex_xverify_prefix(),
+            trigger_secs_of_day_ist: default_brutex_xverify_trigger_secs(),
+            deadline_secs_of_day_ist: default_brutex_xverify_deadline_secs(),
+            repoll_interval_secs: default_brutex_xverify_repoll_secs(),
+            max_object_bytes: default_brutex_xverify_max_object_bytes(),
+            max_keys: default_brutex_xverify_max_keys(),
+            fetch_attempts_per_object: default_brutex_xverify_fetch_attempts(),
+            price_tolerance_paise: default_brutex_xverify_price_tolerance_paise(),
+            compare_volume: default_brutex_xverify_compare_volume(),
+        }
+    }
+}
+
 /// `[spot_1m_rest]` — per-minute spot 1m REST pipeline (operator grant
 /// 2026-07-12; PR-2, the SPOT half). Cold path only — the WS candle
 /// pipeline is untouched.
@@ -437,6 +590,110 @@ pub struct Spot1mRestConfig {
     /// burst. Inert while `diagnostics = false`.
     #[serde(default = "default_spot1m_diagnostics_second_probe_secs")]
     pub diagnostics_second_probe_secs_of_day_ist: u32,
+    /// 2026-07-14 architecture optionality (pending the ~15:40 IST
+    /// sweep-discriminator operator ruling): `per_minute` (default —
+    /// today's behaviour) fires each minute close; `batch_catchup`
+    /// replaces the per-minute fires with a sweep-style catch-up every
+    /// [`Self::batch_interval_minutes`] — one day-window fetch per SID
+    /// through the shared Dhan Data-API limiter, persisting everything
+    /// new above the per-SID persisted watermark. A CONFIG MODE, not a
+    /// rewrite (reuses the existing sweep machinery).
+    #[serde(default)]
+    pub fetch_mode: SpotFetchMode,
+    /// Batch catch-up cadence (minutes) — inert while
+    /// `fetch_mode = "per_minute"`. Default 5; validated to 1..=60.
+    #[serde(default = "default_spot1m_batch_interval_minutes")]
+    pub batch_interval_minutes: u32,
+}
+
+/// `[spot_1m_rest] fetch_mode` values (2026-07-14 — see the field doc).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SpotFetchMode {
+    /// Fire each in-session minute close (the shipped PR-2 behaviour).
+    #[default]
+    PerMinute,
+    /// Sweep-style catch-up every `batch_interval_minutes` instead of
+    /// per-minute fires (the batch-architecture option the ~15:40 IST
+    /// sweep-discriminator verdict may select).
+    BatchCatchup,
+}
+
+/// Serde default for [`Spot1mRestConfig::batch_interval_minutes`] — 5.
+fn default_spot1m_batch_interval_minutes() -> u32 {
+    5
+}
+
+impl Spot1mRestConfig {
+    /// Boot-time validation — the batch cadence must be a sane in-session
+    /// interval (1..=60 minutes).
+    ///
+    /// # Errors
+    /// Returns a descriptive error when `batch_interval_minutes` is
+    /// outside `1..=60`.
+    pub fn validate(&self) -> Result<()> {
+        if !(1..=60).contains(&self.batch_interval_minutes) {
+            bail!(
+                "spot_1m_rest.batch_interval_minutes ({}) must be within 1..=60",
+                self.batch_interval_minutes
+            );
+        }
+        Ok(())
+    }
+}
+
+/// `[dhan_data_api]` — shared Dhan Data-API REST pacing (operator pacing
+/// directive 2026-07-14, relayed via the coordinator session: pace Dhan to
+/// 3 requests/sec — tunable DOWN to 2 — spread overflow into the next
+/// second(s), route the option-chain API through the SAME limiter, with
+/// incremental/decremental self-tuning: "if it accepts max 3 or 2, stick
+/// to that and split it up").
+///
+/// `target_rps` is the tuning CAP: the shared limiter starts here and the
+/// self-tuner steps down to the [`DHAN_DATA_API_RPS_FLOOR`] on observed
+/// 429 bursts / back up toward this cap on clean streaks. Legal range
+/// [`DHAN_DATA_API_RPS_FLOOR`]..=[`DHAN_DATA_API_RPS_CEILING`] (2..=4),
+/// rejected at boot by [`Self::validate`]. Absent section ⇒ the directed
+/// 3 rps default. Dhan-ONLY — the Groww legs keep their own budgets.
+#[derive(Debug, Clone, Deserialize)]
+pub struct DhanDataApiConfig {
+    /// Target (cap) requests/second for the shared Dhan Data-API limiter.
+    #[serde(default = "default_dhan_data_api_target_rps")]
+    pub target_rps: u32,
+}
+
+/// Serde default for [`DhanDataApiConfig::target_rps`] — the directed 3.
+fn default_dhan_data_api_target_rps() -> u32 {
+    DHAN_DATA_API_DEFAULT_TARGET_RPS
+}
+
+impl Default for DhanDataApiConfig {
+    fn default() -> Self {
+        Self {
+            target_rps: default_dhan_data_api_target_rps(),
+        }
+    }
+}
+
+impl DhanDataApiConfig {
+    /// Boot-time validation — the pacing cap must stay inside the
+    /// operator-directed ladder (2..=4; 5/sec is the ACCOUNT budget and is
+    /// deliberately never claimable by this process alone).
+    ///
+    /// # Errors
+    /// Returns a descriptive error when `target_rps` is outside the legal
+    /// range.
+    pub fn validate(&self) -> Result<()> {
+        if !(DHAN_DATA_API_RPS_FLOOR..=DHAN_DATA_API_RPS_CEILING).contains(&self.target_rps) {
+            bail!(
+                "dhan_data_api.target_rps ({}) must be within {}..={}",
+                self.target_rps,
+                DHAN_DATA_API_RPS_FLOOR,
+                DHAN_DATA_API_RPS_CEILING
+            );
+        }
+        Ok(())
+    }
 }
 
 /// Serde default for [`Spot1mRestConfig::diagnostics_second_probe_secs_of_day_ist`]
@@ -455,6 +712,8 @@ impl Default for Spot1mRestConfig {
             diagnostics: false,
             diagnostics_second_probe_secs_of_day_ist: default_spot1m_diagnostics_second_probe_secs(
             ),
+            fetch_mode: SpotFetchMode::default(),
+            batch_interval_minutes: default_spot1m_batch_interval_minutes(),
         }
     }
 }
@@ -627,6 +886,106 @@ impl Default for GrowwContract1mConfig {
             enabled: false,
             strikes_each_side: default_groww_contract_1m_strikes_each_side(),
         }
+    }
+}
+
+/// 🔷 DHAN pre-trade margin gate (`[dhan_margin_gate]`).
+///
+/// Fail-safe: an absent section deserializes to DISABLED. Even when
+/// `enabled = true`, the REST legs stay dark until the code-change master
+/// lock `DHAN_MARGIN_GATE_REST_ALLOWED` (constants.rs) flips with a fresh
+/// dated operator quote — config flips alone can never turn the REST legs on.
+///
+/// Shared-account safety (BruteX co-tenant on the same Dhan account):
+/// `tenant_budget_percent` caps EACH entry to at most half of the
+/// then-current pooled `availabelBalance` (per-entry, not cumulative);
+/// `rest_self_cap_per_sec` self-caps our funds/margin REST usage — the
+/// funds/margin endpoints' rate bucket is NOT named by Dhan's docs, so the
+/// budget is Assumed Non-Trading (20/sec); the 5/sec default stays ≤ 50%
+/// even under the more conservative 10/sec reading; live-probe before
+/// raising.
+#[derive(Debug, Clone, Deserialize)]
+pub struct DhanMarginGateConfig {
+    /// Master config gate. Serde default FALSE (absent section = disabled).
+    #[serde(default)]
+    pub enabled: bool,
+    /// PER-ENTRY cap: percent of the THEN-CURRENT pooled account
+    /// `availabelBalance` a single entry may consume. Hard-capped at 50
+    /// (shared account — never assume the full account margin is ours).
+    /// CUMULATIVE our-share is NOT capped — sequential entries each
+    /// re-read the balance, so they can cumulatively consume more of the
+    /// pool (a cumulative tenant ledger is a flagged follow-up for the
+    /// OMS-wiring PR).
+    #[serde(default = "default_margin_gate_tenant_budget_percent")]
+    pub tenant_budget_percent: u8,
+    /// Self-imposed funds/margin REST ceiling (requests/sec). Default 5:
+    /// the funds/margin endpoints' rate bucket is NOT named by Dhan's docs
+    /// — Assumed Non-Trading (20/sec); a 5/sec default stays ≤ 50% even
+    /// under the more conservative 10/sec reading; live-probe before
+    /// raising. Hard-capped at 10; minimum 2 (one entry check issues two
+    /// REST calls in one burst).
+    #[serde(default = "default_margin_gate_rest_self_cap_per_sec")]
+    pub rest_self_cap_per_sec: u32,
+}
+
+/// Serde default for [`DhanMarginGateConfig::tenant_budget_percent`] — 50,
+/// the shared-account hard cap (half the pooled balance is the most our
+/// entries may ever consume).
+fn default_margin_gate_tenant_budget_percent() -> u8 {
+    50
+}
+
+/// Serde default for [`DhanMarginGateConfig::rest_self_cap_per_sec`] — 5.
+/// The funds/margin endpoints' rate bucket is NOT named by Dhan's docs —
+/// Assumed Non-Trading (20/sec); a 5/sec default stays ≤ 50% even under the
+/// more conservative 10/sec reading; live-probe before raising.
+fn default_margin_gate_rest_self_cap_per_sec() -> u32 {
+    5
+}
+
+impl Default for DhanMarginGateConfig {
+    /// Manual impl so `Default` matches the serde field defaults exactly
+    /// (a derived `Default` would zero the budget/cap fields while an
+    /// absent `[dhan_margin_gate]` section deserializes them to 50/5).
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            tenant_budget_percent: default_margin_gate_tenant_budget_percent(),
+            rest_self_cap_per_sec: default_margin_gate_rest_self_cap_per_sec(),
+        }
+    }
+}
+
+impl DhanMarginGateConfig {
+    /// Boot-time validation — the shared-account envelope must hold.
+    ///
+    /// # Errors
+    /// Returns a descriptive error when `tenant_budget_percent` is outside
+    /// `1..=50` (the Dhan account is pooled with the BruteX co-tenant, so
+    /// our entries may never claim more than half the pooled balance) or
+    /// when `rest_self_cap_per_sec` is outside `2..=10` (the ceiling is
+    /// half of the Assumed Non-Trading 20/sec bucket — the funds/margin
+    /// endpoints' bucket is NOT named by Dhan's docs; at least 2 because
+    /// one entry check issues two REST calls in one burst).
+    pub fn validate(&self) -> Result<()> {
+        if !(1..=50).contains(&self.tenant_budget_percent) {
+            bail!(
+                "dhan_margin_gate.tenant_budget_percent ({}) must be within 1..=50 — the Dhan \
+                 account is shared with the BruteX co-tenant, so our entries may never claim \
+                 more than half of the pooled available balance",
+                self.tenant_budget_percent
+            );
+        }
+        if !(2..=10).contains(&self.rest_self_cap_per_sec) {
+            bail!(
+                "dhan_margin_gate.rest_self_cap_per_sec ({}) must be within 2..=10 — the \
+                 ceiling is half of the ASSUMED Non-Trading 20/sec bucket (the funds/margin \
+                 endpoints' bucket is not named by Dhan's docs; the account is shared with \
+                 the BruteX co-tenant) and at least 2 (one entry check bursts two REST calls)",
+                self.rest_self_cap_per_sec
+            );
+        }
+        Ok(())
     }
 }
 
@@ -1034,18 +1393,31 @@ pub struct StrategyConfig {
     pub mode: TradingMode,
     /// S6-Step4: Sandbox-only enforcement until this date. If the current
     /// date is BEFORE this value, `mode = Live` is forbidden — the boot
-    /// sequence panics. Format: `YYYY-MM-DD`. Default `2026-06-30` per
-    /// Parthiban's "no real orders until June end" requirement.
+    /// sequence panics. Format: `YYYY-MM-DD`. Default `2099-12-31`
+    /// (2026-07-14 re-arm — the old `2026-06-30` default EXPIRED silently;
+    /// the sentinel matches production.toml, so going live requires an
+    /// explicit config edit with a fresh dated operator quote).
     ///
-    /// Set to `1970-01-01` (or any past date) to disable the gate.
+    /// Set to `1970-01-01` to disable the gate — that EXACT sentinel is
+    /// exempt from the loud-expiry tripwire (`expired_live_gates`); any
+    /// OTHER configured past date warns at every boot as a likely silent
+    /// no-op (the 2026-06-30 incident class).
     #[serde(default = "default_sandbox_only_until")]
     pub sandbox_only_until: String,
 }
 
 fn default_sandbox_only_until() -> String {
-    // Per Parthiban — sandbox-only until June end 2026.
-    "2026-06-30".to_string()
+    // 2026-07-14 re-arm: sentinel matching production.toml — an absent key
+    // now means ARMED, never silently expired.
+    "2099-12-31".to_string()
 }
+
+/// The documented intentional-disable value for `[strategy]
+/// sandbox_only_until` (the field doc's canonical "disable this gate"
+/// sentinel). Exactly this value is exempt from the loud-expiry tripwire —
+/// any OTHER configured past date is treated as accidental expiry and
+/// warned about at every boot (review round 1, 2026-07-14).
+const SANDBOX_ONLY_UNTIL_DISABLE_SENTINEL: &str = "1970-01-01";
 
 impl Default for StrategyConfig {
     fn default() -> Self {
@@ -2128,6 +2500,22 @@ impl ApplicationConfig {
             }
         }
 
+        // LOUD-EXPIRY tripwire (2026-07-14 re-arm): every date safety gate
+        // that has silently passed its date is a no-op — the exact class bug
+        // that left all three gates dead between 2026-07-01 and 2026-07-14.
+        // One warn! per expired gate at every boot (runtime-only; no
+        // time-bomb ratchet — unit tests inject dates).
+        {
+            let today = ist_date_from_utc(chrono::Utc::now());
+            for gate in expired_live_gates(today, &self.strategy.sandbox_only_until) {
+                tracing::warn!(
+                    gate,
+                    "date safety gate {gate} is in the PAST — it is a silent \
+                     no-op; re-arm it with a dated operator quote"
+                );
+            }
+        }
+
         // Gap 6: URL format validation — fail-fast on invalid URLs.
         // Catches typos and misconfiguration at boot instead of cryptic runtime errors.
         let validate_url = |name: &str, url: &str, required_scheme: &str| -> Result<()> {
@@ -2172,6 +2560,18 @@ impl ApplicationConfig {
         // valid, so today's single-conn boot is unaffected).
         self.feeds.groww.scale.validate()?;
 
+        // 2026-07-14 operator pacing directive: the shared Dhan Data-API
+        // limiter cap must stay inside the 2..=4 ladder, and the spot-1m
+        // batch catch-up cadence must be a sane in-session interval —
+        // both rejected at boot, BEFORE any REST task spawns.
+        self.dhan_data_api.validate()?;
+        self.spot_1m_rest.validate()?;
+
+        // 2026-07-14 Dhan margin gate: the shared-account budget/self-cap
+        // envelope (≤50% of the pooled balance, ≤10 req/sec) is rejected at
+        // boot, BEFORE any gate could consult it.
+        self.dhan_margin_gate.validate()?;
+
         Ok(())
     }
 }
@@ -2199,6 +2599,71 @@ fn is_before_live_trading_earliest(
     earliest: chrono::NaiveDate,
 ) -> bool {
     today_ist < earliest
+}
+
+/// LOUD-EXPIRY tripwire (2026-07-14 re-arm): returns the names of the date
+/// safety gates whose date is strictly in the PAST relative to `today_ist` —
+/// i.e. gates that have become silent no-ops. All three gates expired
+/// unnoticed between 2026-07-01 and 2026-07-14; `validate()` now warns once
+/// per expired gate at every boot so that class of drift can never recur
+/// silently. Pure (date injected) so unit tests never depend on the wall
+/// clock — no time-bomb ratchets.
+///
+/// Gates checked (the single sources of truth):
+/// - `LIVE_TRADING_EARLIEST` — the `LIVE_TRADING_EARLIEST_*` constants
+///   (config-level Live-mode boot gate, strict `<` on IST date).
+/// - `SANDBOX_DEADLINE_EPOCH_SECS` — the OMS `place_order` epoch sentinel
+///   (converted to its UTC calendar date).
+/// - `sandbox_only_until_default` — the serde default for
+///   `[strategy] sandbox_only_until`.
+/// - `sandbox_only_until_configured` — the CONFIGURED `[strategy]
+///   sandbox_only_until` value (review round 1, 2026-07-14: the historical
+///   incident WAS the configured base.toml value `2026-06-30` expiring, not
+///   the compiled default). The documented disable sentinel
+///   [`SANDBOX_ONLY_UNTIL_DISABLE_SENTINEL`] (`1970-01-01`) is exempt —
+///   that expiry is intentional; a value equal to the compiled default is
+///   also skipped (gate 3 already covers that exact date — no double warn).
+///   An unparseable configured value is not this tripwire's job —
+///   `check_sandbox_window` rejects it on the Live path.
+fn expired_live_gates(
+    today_ist: chrono::NaiveDate,
+    configured_sandbox_only_until: &str,
+) -> Vec<&'static str> {
+    let mut expired = Vec::new();
+
+    if let Some(earliest) = chrono::NaiveDate::from_ymd_opt(
+        crate::constants::LIVE_TRADING_EARLIEST_YEAR,
+        crate::constants::LIVE_TRADING_EARLIEST_MONTH,
+        crate::constants::LIVE_TRADING_EARLIEST_DAY,
+    ) && earliest < today_ist
+    {
+        expired.push("LIVE_TRADING_EARLIEST");
+    }
+
+    if let Some(deadline_utc) =
+        chrono::DateTime::from_timestamp(crate::constants::SANDBOX_DEADLINE_EPOCH_SECS, 0)
+        && deadline_utc.date_naive() < today_ist
+    {
+        expired.push("SANDBOX_DEADLINE_EPOCH_SECS");
+    }
+
+    if let Ok(cutoff) = chrono::NaiveDate::parse_from_str(&default_sandbox_only_until(), "%Y-%m-%d")
+        && cutoff < today_ist
+    {
+        // NOTE: this label covers BOTH shapes — default-by-absence AND a CONFIGURED value explicitly equal to the (expired) default (gate 4's `!= default` dedup routes that shape here; pinned by test_expired_live_gates_all_at_2100).
+        expired.push("sandbox_only_until_default");
+    }
+
+    if configured_sandbox_only_until != default_sandbox_only_until()
+        && configured_sandbox_only_until != SANDBOX_ONLY_UNTIL_DISABLE_SENTINEL
+        && let Ok(cutoff) =
+            chrono::NaiveDate::parse_from_str(configured_sandbox_only_until, "%Y-%m-%d")
+        && cutoff < today_ist
+    {
+        expired.push("sandbox_only_until_configured");
+    }
+
+    expired
 }
 
 // ---------------------------------------------------------------------------
@@ -2289,9 +2754,10 @@ mod tests {
     }
 
     #[test]
-    fn test_sandbox_default_value_is_2026_06_30() {
-        // The default value is exactly the date Parthiban specified.
-        assert_eq!(default_sandbox_only_until(), "2026-06-30");
+    fn test_sandbox_default_value_is_2099_sentinel() {
+        // 2026-07-14 re-arm: the default is the 2099-12-31 sentinel matching
+        // production.toml — an absent key means ARMED, never silently expired.
+        assert_eq!(default_sandbox_only_until(), "2099-12-31");
     }
 
     #[test]
@@ -2447,6 +2913,116 @@ mod tests {
     }
 
     // =======================================================================
+    // LOUD-EXPIRY tripwire tests (2026-07-14 re-arm) — dates injected, never
+    // wall-clock-dependent (no time-bomb tests).
+    // =======================================================================
+
+    #[test]
+    fn test_expired_live_gates_empty_today() {
+        // At the re-arm date (2026-07-14) every gate carries the 2099-12-31
+        // sentinel — nothing is expired.
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 7, 14).unwrap();
+        assert!(
+            expired_live_gates(today, &default_sandbox_only_until()).is_empty(),
+            "no gate may read expired at the 2026-07-14 re-arm date"
+        );
+    }
+
+    #[test]
+    fn test_expired_live_gates_all_at_2100() {
+        // Past the sentinel, all three compile-time gates are silent no-ops —
+        // the tripwire must name every one of them. A configured value EQUAL
+        // to the compiled default must NOT double-warn (gate 3 already covers
+        // that exact date — no `sandbox_only_until_configured` entry).
+        let today = chrono::NaiveDate::from_ymd_opt(2100, 1, 1).unwrap();
+        let expired = expired_live_gates(today, &default_sandbox_only_until());
+        assert_eq!(
+            expired,
+            vec![
+                "LIVE_TRADING_EARLIEST",
+                "SANDBOX_DEADLINE_EPOCH_SECS",
+                "sandbox_only_until_default",
+            ],
+            "at 2100-01-01 all three date gates must be reported expired, \
+             with NO duplicate configured entry for the default value"
+        );
+    }
+
+    #[test]
+    fn test_expired_live_gates_per_gate_granularity() {
+        // The check is strictly-past per gate: ON the sentinel date itself no
+        // gate is expired; the DAY AFTER, every 2099-12-31 gate is.
+        let sentinel = chrono::NaiveDate::from_ymd_opt(2099, 12, 31).unwrap();
+        assert!(
+            expired_live_gates(sentinel, &default_sandbox_only_until()).is_empty(),
+            "a gate dated today is NOT expired (strictly-past check)"
+        );
+        let day_after = sentinel.succ_opt().unwrap();
+        assert_eq!(
+            expired_live_gates(day_after, &default_sandbox_only_until()).len(),
+            3,
+            "the day after the sentinel every gate reads expired"
+        );
+    }
+
+    #[test]
+    fn test_expired_live_gates_configured_past_date_warns() {
+        // Review round 1 (2026-07-14): the historical incident WAS the
+        // configured base.toml value (2026-06-30) expiring — a configured
+        // past date that is neither the default nor the disable sentinel
+        // MUST be named by the tripwire.
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 7, 14).unwrap();
+        assert_eq!(
+            expired_live_gates(today, "2026-06-30"),
+            vec!["sandbox_only_until_configured"],
+            "a configured past date (the 2026-06-30 incident class) must warn"
+        );
+    }
+
+    #[test]
+    fn test_expired_live_gates_configured_future_silent() {
+        // A configured FUTURE date (non-default) is an armed gate — silent.
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 7, 14).unwrap();
+        assert!(
+            expired_live_gates(today, "2097-01-01").is_empty(),
+            "a configured future date must not warn"
+        );
+    }
+
+    #[test]
+    fn test_expired_live_gates_disable_sentinel_silent() {
+        // The documented intentional-disable sentinel (exactly 1970-01-01)
+        // is exempt — that expiry is deliberate, not drift.
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 7, 14).unwrap();
+        assert!(
+            expired_live_gates(today, SANDBOX_ONLY_UNTIL_DISABLE_SENTINEL).is_empty(),
+            "the documented 1970-01-01 disable sentinel must not warn"
+        );
+        // But any OTHER ancient date is NOT the sentinel — it warns.
+        assert_eq!(
+            expired_live_gates(today, "1970-01-02"),
+            vec!["sandbox_only_until_configured"],
+            "only the exact documented sentinel is exempt"
+        );
+    }
+
+    #[test]
+    fn test_expired_live_gates_configured_and_default_both_named_when_distinct() {
+        // Past the default sentinel with a DIFFERENT configured past date:
+        // both the default gate and the configured gate must be named.
+        let today = chrono::NaiveDate::from_ymd_opt(2100, 1, 2).unwrap();
+        let expired = expired_live_gates(today, "2099-06-30");
+        assert!(
+            expired.contains(&"sandbox_only_until_default"),
+            "the expired compiled default must still be caught: {expired:?}"
+        );
+        assert!(
+            expired.contains(&"sandbox_only_until_configured"),
+            "the distinct expired configured value must also be caught: {expired:?}"
+        );
+    }
+
+    // =======================================================================
 
     /// Helper: creates a valid ApplicationConfig for testing.
     /// Modify individual fields to test specific validation failures.
@@ -2561,12 +3137,15 @@ mod tests {
             in_mem: InMemConfig::default(),
             feeds: FeedsConfig::default(),
             scoreboard: ScoreboardConfig::default(),
+            brutex_crossverify: BrutexCrossverifyConfig::default(),
             spot_1m_rest: Spot1mRestConfig::default(),
+            dhan_data_api: DhanDataApiConfig::default(),
             option_chain_1m: OptionChain1mConfig::default(),
             groww_spot_1m: GrowwSpot1mConfig::default(),
             groww_option_chain_1m: GrowwOptionChain1mConfig::default(),
             tf_consistency: TfConsistencyConfig::default(),
             groww_contract_1m: GrowwContract1mConfig::default(),
+            dhan_margin_gate: DhanMarginGateConfig::default(),
         }
     }
 
@@ -3577,7 +4156,10 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_sandbox_guard_blocks_live_before_july() {
+    fn test_sandbox_guard_blocks_live_before_earliest_date() {
+        // Renamed 2026-07-14 (was `..._before_july` — era-named; the earliest
+        // date is now the 2099-12-31 sentinel). Logic is constant-driven and
+        // self-adapts to whichever era "today" is in.
         // Date-robust (2026-07-02 coverage-gate fix): the previous version only
         // called validate() with Live INSIDE `if today < earliest`, so from
         // 2026-07-01 the entire D1 live-mode guard block silently fell out of
@@ -3950,6 +4532,73 @@ mod tests {
         assert!(missing.scoreboard.enabled);
     }
 
+    /// BruteX crossverify (2026-07-12): the `[brutex_crossverify]` section
+    /// defaults SAFE-OFF (a NEW subsystem must not activate on deploy day
+    /// without an explicit config flip), trigger at 15:50:00 IST, S3
+    /// wall-clock deadline at 16:05:00 IST, and a missing section must
+    /// default, never error.
+    #[test]
+    fn test_brutex_crossverify_config_defaults_disabled_safe_off() {
+        let bx = BrutexCrossverifyConfig::default();
+        assert!(!bx.enabled, "brutex_crossverify must default OFF");
+        assert!(bx.telegram_enabled);
+        assert_eq!(
+            bx.trigger_secs_of_day_ist, 57_000,
+            "trigger must default to 15:50:00 IST"
+        );
+        assert_eq!(
+            bx.deadline_secs_of_day_ist, 57_900,
+            "S3 wall-clock deadline must default to 16:05:00 IST"
+        );
+        assert!(
+            bx.trigger_secs_of_day_ist < bx.deadline_secs_of_day_ist,
+            "trigger must precede the deadline"
+        );
+        assert_eq!(bx.bucket, "tv-prod-cold");
+        assert_eq!(bx.prefix, "crossverify/groww");
+        assert_eq!(bx.repoll_interval_secs, 120);
+        assert_eq!(bx.max_object_bytes, 5 * 1024 * 1024);
+        assert_eq!(bx.max_keys, 2_000);
+        assert_eq!(bx.fetch_attempts_per_object, 3);
+        assert_eq!(bx.price_tolerance_paise, 0, "exact match by default");
+        assert!(!bx.compare_volume, "volume classification defaults OFF");
+    }
+
+    /// B12 rollback test (`brutex_crossverify_flag_rollback`): flipping
+    /// `[brutex_crossverify] enabled = true` must round-trip through TOML
+    /// (the tested ON-switch path — the subsystem is default-OFF, so the
+    /// rollback IS the default), a partial section must fill every other
+    /// field from serde defaults, and a MISSING section must default to
+    /// the safe-off state, never error.
+    #[test]
+    fn brutex_crossverify_flag_rollback() {
+        use figment::Figment;
+        use figment::providers::{Format, Toml};
+
+        #[derive(Deserialize)]
+        struct Wrapper {
+            #[serde(default)]
+            brutex_crossverify: BrutexCrossverifyConfig,
+        }
+        // ON shape: enabled=true parses and turns the subsystem on.
+        let on: Wrapper = Figment::new()
+            .merge(Toml::string("[brutex_crossverify]\nenabled = true\n"))
+            .extract()
+            .expect("brutex_crossverify enable TOML must parse");
+        assert!(on.brutex_crossverify.enabled, "enable flag must stick");
+        // Partial section: unspecified keys fill from serde defaults.
+        assert!(on.brutex_crossverify.telegram_enabled);
+        assert_eq!(on.brutex_crossverify.trigger_secs_of_day_ist, 57_000);
+        assert_eq!(on.brutex_crossverify.deadline_secs_of_day_ist, 57_900);
+        assert_eq!(on.brutex_crossverify.bucket, "tv-prod-cold");
+        // Missing section entirely → full defaults (OFF), never an error.
+        let missing: Wrapper = Figment::new()
+            .merge(Toml::string("[feeds]\ndhan_enabled = true\n"))
+            .extract()
+            .expect("missing [brutex_crossverify] must default");
+        assert!(!missing.brutex_crossverify.enabled);
+    }
+
     /// Per-minute spot 1m REST pipeline (operator grant 2026-07-12): the
     /// `[spot_1m_rest]` section is FAIL-SAFE default OFF — via `Default`,
     /// via a missing section, and via an empty section — and an explicit
@@ -4038,6 +4687,214 @@ mod tests {
             on.spot_1m_rest.diagnostics_second_probe_secs_of_day_ist,
             12 * 3600
         );
+    }
+
+    /// 2026-07-14 operator pacing directive: `[dhan_data_api] target_rps`
+    /// defaults to the directed 3 (via `Default`, a missing section, and
+    /// an empty section), explicit values round-trip, and `validate()`
+    /// rejects anything outside the 2..=4 ladder.
+    #[test]
+    fn test_dhan_data_api_config_default_is_3_and_round_trips() {
+        use figment::Figment;
+        use figment::providers::{Format, Toml};
+
+        assert_eq!(
+            DhanDataApiConfig::default().target_rps,
+            3,
+            "target_rps must default to the operator-directed 3"
+        );
+
+        #[derive(Deserialize)]
+        struct Wrapper {
+            #[serde(default)]
+            dhan_data_api: DhanDataApiConfig,
+        }
+        let missing: Wrapper = Figment::new()
+            .merge(Toml::string("[other]\nx = 1\n"))
+            .extract()
+            .expect("missing [dhan_data_api] must default, not error");
+        assert_eq!(missing.dhan_data_api.target_rps, 3);
+        let empty: Wrapper = Figment::new()
+            .merge(Toml::string("[dhan_data_api]\n"))
+            .extract()
+            .expect("empty [dhan_data_api] must default, not error");
+        assert_eq!(empty.dhan_data_api.target_rps, 3);
+        let two: Wrapper = Figment::new()
+            .merge(Toml::string("[dhan_data_api]\ntarget_rps = 2\n"))
+            .extract()
+            .expect("explicit target_rps must round-trip");
+        assert_eq!(two.dhan_data_api.target_rps, 2);
+    }
+
+    /// The 2..=4 pacing ladder is REJECTED-at-boot enforced: 0/1/5 fail,
+    /// every in-range value passes.
+    #[test]
+    fn test_dhan_data_api_config_validate_rejects_out_of_range() {
+        for bad in [0_u32, 1, 5, 100] {
+            let cfg = DhanDataApiConfig { target_rps: bad };
+            assert!(
+                cfg.validate().is_err(),
+                "target_rps {bad} must be rejected (legal range 2..=4)"
+            );
+        }
+        for good in [2_u32, 3, 4] {
+            let cfg = DhanDataApiConfig { target_rps: good };
+            assert!(cfg.validate().is_ok(), "target_rps {good} must pass");
+        }
+    }
+
+    /// 🔷 DHAN margin gate (2026-07-14): `[dhan_margin_gate]` is FAIL-SAFE
+    /// default OFF on every path — `Default`, a missing section, and an
+    /// empty section — with the shared-account defaults (50% tenant budget,
+    /// 5 req/sec self-cap — the funds/margin rate bucket is Assumed
+    /// Non-Trading, unnamed by Dhan's docs) intact on all of them.
+    #[test]
+    fn test_dhan_margin_gate_config_default_is_disabled() {
+        use figment::Figment;
+        use figment::providers::{Format, Toml};
+
+        let d = DhanMarginGateConfig::default();
+        assert!(!d.enabled, "margin gate must default OFF (fail-safe)");
+        assert_eq!(d.tenant_budget_percent, 50);
+        assert_eq!(d.rest_self_cap_per_sec, 5);
+
+        #[derive(Deserialize)]
+        struct Wrapper {
+            #[serde(default)]
+            dhan_margin_gate: DhanMarginGateConfig,
+        }
+        // Missing section entirely → disabled, never an error.
+        let missing: Wrapper = Figment::new()
+            .merge(Toml::string("[other]\nx = 1\n"))
+            .extract()
+            .expect("missing [dhan_margin_gate] must default, not error");
+        assert!(!missing.dhan_margin_gate.enabled);
+        assert_eq!(missing.dhan_margin_gate.tenant_budget_percent, 50);
+        assert_eq!(missing.dhan_margin_gate.rest_self_cap_per_sec, 5);
+        // Empty section (no keys) → disabled via the field-level default.
+        let empty: Wrapper = Figment::new()
+            .merge(Toml::string("[dhan_margin_gate]\n"))
+            .extract()
+            .expect("empty [dhan_margin_gate] must default, not error");
+        assert!(!empty.dhan_margin_gate.enabled);
+        assert_eq!(empty.dhan_margin_gate.tenant_budget_percent, 50);
+        assert_eq!(empty.dhan_margin_gate.rest_self_cap_per_sec, 5);
+    }
+
+    /// Shared-account tenant budget: 0% and >50% are REJECTED at boot
+    /// (the Dhan account is pooled with the BruteX co-tenant — our entries
+    /// may never claim more than half the pooled balance); the 1..=50
+    /// boundaries pass.
+    #[test]
+    fn test_dhan_margin_gate_validate_rejects_over_50_percent() {
+        for bad in [0_u8, 51, 100] {
+            let cfg = DhanMarginGateConfig {
+                tenant_budget_percent: bad,
+                ..DhanMarginGateConfig::default()
+            };
+            assert!(
+                cfg.validate().is_err(),
+                "tenant_budget_percent {bad} must be rejected (legal range 1..=50)"
+            );
+        }
+        for good in [1_u8, 50] {
+            let cfg = DhanMarginGateConfig {
+                tenant_budget_percent: good,
+                ..DhanMarginGateConfig::default()
+            };
+            assert!(
+                cfg.validate().is_ok(),
+                "tenant_budget_percent {good} must pass"
+            );
+        }
+    }
+
+    /// Funds/margin REST self-cap: 0/1 (below the 2-call entry burst) and
+    /// 11+ (over half of the ASSUMED Non-Trading 20/sec bucket — unnamed
+    /// by Dhan's docs) are REJECTED; the 2..=10 boundaries pass.
+    #[test]
+    fn test_dhan_margin_gate_validate_rejects_rest_cap_out_of_range() {
+        for bad in [0_u32, 1, 11, 100] {
+            let cfg = DhanMarginGateConfig {
+                rest_self_cap_per_sec: bad,
+                ..DhanMarginGateConfig::default()
+            };
+            assert!(
+                cfg.validate().is_err(),
+                "rest_self_cap_per_sec {bad} must be rejected (legal range 2..=10)"
+            );
+        }
+        for good in [2_u32, 10] {
+            let cfg = DhanMarginGateConfig {
+                rest_self_cap_per_sec: good,
+                ..DhanMarginGateConfig::default()
+            };
+            assert!(
+                cfg.validate().is_ok(),
+                "rest_self_cap_per_sec {good} must pass"
+            );
+        }
+    }
+
+    /// 2026-07-14 fetch-mode flag: defaults to `per_minute` on every path
+    /// (Default / missing key / pre-flag TOML), `batch_catchup` +
+    /// `batch_interval_minutes` parse, and unknown mode strings are
+    /// REJECTED (never silently coerced to a mode).
+    #[test]
+    fn test_spot1m_fetch_mode_defaults_per_minute_and_parses_batch() {
+        use figment::Figment;
+        use figment::providers::{Format, Toml};
+
+        let d = Spot1mRestConfig::default();
+        assert_eq!(d.fetch_mode, SpotFetchMode::PerMinute);
+        assert_eq!(d.batch_interval_minutes, 5);
+
+        #[derive(Deserialize)]
+        struct Wrapper {
+            #[serde(default)]
+            spot_1m_rest: Spot1mRestConfig,
+        }
+        // Pre-flag TOML (enabled only) → per_minute, interval 5.
+        let old: Wrapper = Figment::new()
+            .merge(Toml::string("[spot_1m_rest]\nenabled = true\n"))
+            .extract()
+            .expect("pre-flag TOML must keep deserializing");
+        assert_eq!(old.spot_1m_rest.fetch_mode, SpotFetchMode::PerMinute);
+        assert_eq!(old.spot_1m_rest.batch_interval_minutes, 5);
+        // The batch shape round-trips.
+        let batch: Wrapper = Figment::new()
+            .merge(Toml::string(
+                "[spot_1m_rest]\nenabled = true\nfetch_mode = \"batch_catchup\"\n\
+                 batch_interval_minutes = 10\n",
+            ))
+            .extract()
+            .expect("batch_catchup opt-in must round-trip");
+        assert_eq!(batch.spot_1m_rest.fetch_mode, SpotFetchMode::BatchCatchup);
+        assert_eq!(batch.spot_1m_rest.batch_interval_minutes, 10);
+        // An unknown mode string is an ERROR, never a silent default.
+        let junk: Result<Wrapper, _> = Figment::new()
+            .merge(Toml::string(
+                "[spot_1m_rest]\nfetch_mode = \"warp_speed\"\n",
+            ))
+            .extract();
+        assert!(junk.is_err(), "unknown fetch_mode must be rejected");
+    }
+
+    /// Batch cadence bounds: 0 and 61+ are rejected; 1..=60 pass.
+    #[test]
+    fn test_spot1m_batch_interval_validate_bounds() {
+        let mut cfg = Spot1mRestConfig::default();
+        for bad in [0_u32, 61, 1_000] {
+            cfg.batch_interval_minutes = bad;
+            assert!(
+                cfg.validate().is_err(),
+                "batch_interval_minutes {bad} must be rejected (1..=60)"
+            );
+        }
+        for good in [1_u32, 5, 60] {
+            cfg.batch_interval_minutes = good;
+            assert!(cfg.validate().is_ok(), "interval {good} must pass");
+        }
     }
 
     /// Per-minute option-chain REST pipeline (operator grant 2026-07-12,
