@@ -71,6 +71,23 @@ row's `close_to_data_ms` column stamps the REAL (> 60 s) retrieval delay
 while the histogram keeps sampling own-fire retrievals only. See
 `no-rest-except-live-feed-2026-06-27.md` §8.7 for the dated record.
 
+**2026-07-13 429-coordination follow-up (same-day, second PR):** the first
+live session ALSO showed `/v2/charts/intraday` rate-limiting BOTH
+consumers — the 15:31 bulk cross-verify lost 91/776 fetches to HTTP 429 at
+15:31–15:33 (compared=0, a BLIND day). Three bounded changes: (a) the spot
+half's ONE post-session repair sweep now fires at **~15:33:30 IST** (was
+~15:31:00) so its ≤3 requests clear that burst window (const-asserted ≥
+the cross-verify trigger + 150 s and before the 16:30 IST box stop);
+(b) the in-minute re-poll ladder carries a deterministic per-SID schedule
+jitter (slot × 150 ms — 0/150/300 ms, NO randomness) so the 3 concurrent
+ladders never re-poll in lockstep, and an HTTP 429 adds a bounded +2 s
+backoff before the NEXT rung (same rung count — never an extra retry;
+still counted by `tv_spot1m_rate_limited_total`; the worst-case all-429
+jittered schedule of 19.3 s is const-asserted inside the 20 s per-SID
+budget); (c) the cross-verify gained its OWN bounded 429 second pass —
+see the dated note in `cross-verify-1m-error-codes.md` §2 and the
+`tv_cross_verify_1m_retry_429_total{outcome}` counters.
+
 The OPTION-CHAIN half (PR-3, appended 2026-07-12) shares the same minute
 boundaries, SEQUENCED immediately after the spot leg via a watch signal the
 spot task publishes at the end of each fire (fallback timer 2.5 s after the
@@ -108,7 +125,9 @@ the `stage` field):
 1. `stage="minute_failed"` — coalesced ONCE per fired minute when one or
    more of the 3 SIDs ended the bounded ladder without the target candle:
    transport error, non-2xx (incl. DH-904/429 — counted by
-   `tv_spot1m_rate_limited_total`, never retried past the ladder), no
+   `tv_spot1m_rate_limited_total`, +2 s bounded backoff before the next
+   rung since the 2026-07-13 429-coordination follow-up, never retried
+   past the ladder), no
    token at fire time, or a 200 whose body never contained the just-closed
    minute (`outcome="empty"` — counted, included in the failure edge,
    never silent per audit Rule 11). Sub-edge: log-only, never a page.
@@ -133,6 +152,66 @@ the `stage` field):
    `SPOT_1M_REST_SID_BUDGET_SECS` (20 s) with a 5 s per-request timeout
    (`SPOT_1M_REST_REQUEST_TIMEOUT_SECS`), const-asserted < the minute —
    `tv_spot1m_sid_budget_exceeded_total` counts budget trips.
+5. `stage="sid_not_served"` (2026-07-13 — INDIA VIX joins the spot set;
+   operator scope addition 2026-07-13, relayed via the coordinator
+   session: INDIA VIX joins the spot 1m pull, spot only, no option
+   chain) — the per-SID persistent-empty detector: ONE SID accumulated
+   `SPOT_1M_REST_SID_NOT_SERVED_THRESHOLD` (10) consecutive empty/failed
+   minutes WHILE ≥1 other SID succeeded in those same minutes — the
+   vendor is not serving THIS index (a global-outage minute neither
+   counts nor resets the streak; general outages stay the
+   `stage="escalation"` edge's page). Fires ONE edge-latched HIGH page
+   per SID per episode (typed `Spot1mSidNotServed` Telegram, plain
+   English: "Dhan is not returning 1-minute candles for INDIA VIX — the
+   other indices are unaffected"), re-armed only by that SID's own
+   recovery (one Info `Spot1mSidServedRecovered`). Counter:
+   `tv_spot1m_sid_not_served_total{symbol}` (4 static label values —
+   the pinned index symbols), one increment per counted not-served
+   minute. HONESTY: whether Dhan `/v2/charts/intraday` serves INDIA VIX
+   1m candles at all is a LIVE-PROBE UNKNOWN — the spot set is now 4
+   SIDs (NIFTY 13 / BANKNIFTY 25 / SENSEX 51 / INDIA VIX 21; still
+   inside the Data-API 5/sec budget, jitter slots widened 0/150/300/450
+   ms, worst-case ladder 19.45 s < the 20 s budget), the chain leg stays
+   the VIX-free 3-underlying `CHAIN_1M_UNDERLYINGS` subset
+   (const-asserted — VIX can never enter the option-chain pipeline),
+   per-SID independence is unit-pinned (a 3-ok/1-empty minute is NOT
+   fully-failed and NOT edge-counted), and index candles legitimately
+   carry zero volume (never flagged as an error).
+
+**2026-07-14 update — serving-delay diagnostics (empty-class split + one-shot
+probes):** the 2026-07-14 morning ran 21/21 minutes `empty` on all 4 SIDs
+(2xx, no errors, no 429s, healthy token) WITH the #1499 day-granular window
+live — and the single `outcome="empty"` label could not discriminate the two
+very different vendor states behind it. The split (unconditional — honest
+accounting): `outcome="empty_no_rows"` (the 2xx body parsed to ZERO candles
+for the whole day) vs `outcome="empty_stale"` (candles present but none at
+the target minute — the vendor is serving the day with a LAG). Every
+`empty_stale` records the measured SERVING LAG (`target minute open −
+newest candle minute open`, whole seconds) into the
+`tv_spot1m_serving_lag_ms` histogram (dedicated 1 s→6 h buckets via
+`Matcher::Full` in `observability.rs` — the generic `_ms` 60 s cap would
+collapse every meaningful sample into `+Inf`), and the coalesced
+`stage="minute_failed"` line gains `empty_no_rows` / `empty_stale` /
+`rows_in_response` / `last_candle_ist` / `max_serving_lag_secs` fields —
+one glance per minute answers "is Dhan behind, and by how much?". Edge /
+backfill / persist semantics are UNCHANGED (both empty classes still count
+as an empty minute). Companion LOG-ONLY probes, config-gated
+(`[spot_1m_rest] diagnostics`, serde default OFF; base.toml ON while this
+investigation runs): two one-shot moments per day (the first session fire
+after boot + a configurable second instant, default 11:00 IST —
+`diagnostics_second_probe_secs_of_day_ist`), each issuing ≤3 bounded extra
+requests for ONE SID ~300 ms apart (≤6/day, inside the Data-API 5/sec
+budget; a probe only starts with ≥20 s of room before the next boundary and
+otherwise defers) — (a) the 15:31 cross-verify's BYTE-EXACT day window
+(equality unit-pinned: both builders share `intraday_request_body`), (b)
+the previous-trading-day full window (proves settled-data serving), (c) a
+same-day window with `toDate = now`. All three requests' bodies + response
+shapes (rows, first/last candle IST, target presence, serving lag) land
+side by side in ONE structured `info!` line
+("spot_1m_rest diagnostics: one-shot serving-delay probe"). Together with
+the 15:33:30 sweep's verdict this discriminates "Dhan serves same-day
+intraday candles with a DELAY" from "our request shape is wrong". The
+probes never touch the fetch / persist / edge legs.
 
 **Triage:**
 1. `mcp__tickvault-logs__tail_errors` — find `SPOT1M-01`; the payload
@@ -179,6 +258,74 @@ under the `tv_groww_spot1m_*` prefix (`fetch_total{outcome}`,
 `ts_form_total{form}` — the UNVERIFIED-LIVE timestamp wire-format probe).
 The typed pages are the Groww-specific `GrowwSpot1mFetchDegraded` /
 `GrowwSpot1mFetchRecovered` Telegram events (same 3-minute edge).
+
+**2026-07-13 scope note — the Groww spot leg covers 4 indices (INDIA VIX
+added, SPOT ONLY; `groww-second-feed-scope-2026-06-19.md` §38.7):** the
+4th target's Groww identity is RUNTIME-resolved from the day's watch file
+(never a guessed literal). VIX-specific stages on `SPOT1M-01`
+(`feed="groww"`, both `warn!`-level, log-sink-only per §3):
+`stage="vix_unresolved"` — the day's master carries no resolvable VIX row
+(one edge-latched warn per run; `tv_groww_spot1m_vix_unresolved_total` per
+attempt; VIX skipped, the 3 core indices unaffected) — and
+`stage="vix_not_served"` — the once-per-session sweep found ZERO persisted
+VIX minutes while the core indices persisted ("India VIX not served by
+Groww historical-candles"; `tv_groww_spot1m_vix_not_served_total`, plus
+`tv_groww_spot1m_vix_empty_total` per 2xx-without-the-minute VIX ladder).
+Per-SID independence: the 3-minute escalation edge keys on the 3 CORE
+indices only — a VIX-only failure never pages, core-all-failed still does.
+
+**2026-07-13 — the GROWW CONTRACT leg emits this SAME code with
+`leg = "contract_1m"` (no new variant):** the per-minute per-contract 1m
+candle leg (`crates/app/src/groww_contract_1m_boot.rs`, operator grant
+2026-07-13 — `groww-second-feed-scope-2026-06-19.md` §38 /
+`no-rest-except-live-feed-2026-06-27.md` §9, plan PR-4 — the FILL-MODEL
+leg) reuses `SPOT1M-01` (same candles-fetch semantics: sealing-minute
+target, day-granular window + client-side minute filter, persist-gated
+3-minute failure edge) with **`feed = "groww"` + `leg = "contract_1m"`
+fields on every emit** — grep the leg field to split it from the spot
+legs. Contract-specific stages beyond the spot taxonomy:
+`selection_unresolved` (no chain anchor for an underlying this minute —
+its contracts skip; an ATM is never guessed), `anchor_stale` (round-2,
+2026-07-13: a chain anchor OLDER than
+`GROWW_CONTRACT_1M_ANCHOR_MAX_AGE_MINUTES` = 5 — the chain leg dead or
+frozen past its own 3-minute paging edge — makes the underlying
+UNRESOLVED for the minute: counter + ONE edge-latched coded warn per
+episode + named audit rows; a frozen off-ATM window is never fetched
+silently — the §38.7 decision-freshness principle applied to the
+selection input), `selection_truncated` (the
+ATM window exceeded the hard `GROWW_CONTRACT_1M_MAX_PER_MINUTE` cap —
+truncated deterministically nearest-ATM-first, counted, never fetched
+past the cap), `book_unresolved` (warmup — the instruments master gave no
+usable contracts at the current expiry; that underlying degrades for the
+day, contract identities are never guessed), `token_collision` (warmup —
+a duplicate `exchange_token` across DIFFERENT contracts in the master:
+later rows dropped keep-first + counter + one coded warn, the Dhan
+dedup-drop precedent), `enabled_without_chain` (boot — the contract leg
+enabled without the chain leg; refused loudly, never an anchor-less
+loop), `fire_budget` (the hard
+per-fire deadline killed the remaining contracts — skipped loudly),
+`implausible_ohlc` (vendor candle persisted verbatim + counted). ONE
+request per contract per minute (NO in-minute re-poll ladder — 30
+contracts × a ladder would blow the minute); a one-minute-lookback
+backfill is mined from the SAME day-window body. Every unrecovered
+minute is a NAMED `rest_fetch_audit` absence (round-2): skipped
+selections carry `outcome=skipped` rows on the underlying's stable id
+(classes `anchor_unresolved` / `anchor_stale` / `empty_selection` /
+`boundary_skipped`), a fetched-but-append-failed row is
+`named_gap`/`persist_failed`, and flush-lost staged minutes are
+`named_gap`/`flush_failed` (the spot sweep's item-4 precedent — the
+earlier `ok` row and the flush-failed row BOTH survive because `outcome`
+is in the audit DEDUP key). Contract counters mirror
+the spot names under the `tv_groww_contract1m_*` prefix
+(`fetch_total{outcome}`, `close_to_data_ms`, `fetch_duration_ms`,
+`rate_limited_total`, `boundary_skipped_total`, `task_respawn_total{reason}`,
+`rows_discarded_total`, `persist_errors_total{stage}`, `ts_form_total{form}`,
+`selection_truncated_total`, `selection_unresolved_total`,
+`anchor_stale_total`, `token_collisions_total`,
+`book_unresolved_total`, `fire_budget_exceeded_total`, `backfilled_total`).
+The typed pages are `GrowwContract1mFetchDegraded` /
+`GrowwContract1mFetchRecovered` (the 3-minute edge) +
+`GrowwContract1mBookUnresolved` (one HIGH per day).
 
 ## §2. SPOT1M-02 — spot_1m_rest persist failed
 
@@ -247,6 +394,25 @@ AUDIT-ONLY — §38/§9 forbid a bulk backfill fetch) / `persist_failed`
 (fetched OK but the ILP APPEND failed — a persist failure, never dressed
 as vendor absence; round-2 LOW) / `flush_failed` (swept minutes lost at
 the ILP flush) / `no_token` — never a silent hole.
+
+**2026-07-13 — the GROWW CONTRACT leg emits SPOT1M-02 with
+`leg = "contract_1m"` for the NEW `option_contract_1m_rest` table:** the
+fill-model leg persists to its OWN table
+(`crates/storage/src/option_contract_1m_rest_persistence.rs` — DEDUP
+`(ts, security_id, exchange_segment, feed)` where `security_id` is the
+contract's Groww exchange_token and `exchange_segment` is
+`NSE_FNO`/`BSE_FNO`; the float `strike` is deliberately NOT in-key;
+retention registered in the partition manager's DAY sweep list). Persist
+failures reuse `SPOT1M-02` with `feed = "groww"` + `leg = "contract_1m"`,
+stages `ensure_client_build` / `ensure_ddl` / `append` / `flush` /
+`audit_append` / `audit_flush`, counters
+`tv_groww_contract1m_persist_errors_total{stage}` +
+`tv_groww_contract1m_rows_discarded_total` (discard-pending on any failed
+flush — the poisoned-buffer defense; rows are DEDUP-idempotent
+re-fetchable). One `rest_fetch_audit` row per (minute, contract) with
+`leg='contract_1m'` — `security_id` = the exchange_token, `symbol` = the
+UNDERLYING's plain symbol (the full contract identity lives in the data
+table's `groww_symbol` column).
 
 ## §2b. CHAIN-01 — option-chain entitlement absent (pipeline down for the day)
 
@@ -378,7 +544,14 @@ chain-specific rate rule). Groww counters mirror the Dhan names under the
 `GrowwChain1mFetchDegraded` / `GrowwChain1mFetchRecovered` Telegram
 events (same 3-minute persist-gated edge). Forensics: one
 `rest_fetch_audit` row per (minute, underlying) with `leg='chain_1m'`,
-`attempts=1` (no re-poll ladder — live snapshot semantics).
+`attempts=1` (no re-poll ladder — live snapshot semantics). Gate note
+(2026-07-13): the Groww chain leg shipped base.toml DEFAULT-OFF
+(probe-only); the first live probe PASSED the same night (build
+`eeca0ec`, ~11:47 PM IST) and `[groww_option_chain_1m].enabled` flipped
+to `true` in base.toml — dated record in
+`groww-second-feed-scope-2026-06-19.md` §38.6; the serde DEFAULT stays
+OFF (fail-safe) and `probe_and_report` stays `true` (inert while
+enabled; the rollback canary).
 
 ## §2d. CHAIN-03 — option_chain_1m persist failed
 
@@ -527,6 +700,47 @@ probe-verdict Infos; the coded `error!` lines are the forensic WHY. Adding a
 CloudWatch filter+alarm is a flagged follow-up (one map entry + the doc
 paragraph + a cost note, per the FEED-REJECT-01 / SCOREBOARD-01 precedent).
 
+**Contract-leg honest envelope (2026-07-13, PR-4):** UNVERIFIED-LIVE —
+FNO per-contract 1m candle availability latency for the just-sealed
+minute (the `tv_groww_contract1m_close_to_data_ms` histogram is the
+probe); whether Groww gap-fills or OMITS zero-trade thin-strike minutes
+(an absent contract minute is counted `outcome="empty"`, reported, never
+fabricated); the live per-contract response shape beyond the
+production-grounded `[ts, o, h, l, c, volume, oi]` tuple. DELIBERATELY NO
+15:31 post-session sweep for contracts: the selection is minute-scoped
+(the ATM window moves with the chain anchor), so "which contracts belong
+to minute M" is only knowable AT minute M — an unrecovered contract
+minute is a NAMED absence via its `rest_fetch_audit` row, never a silent
+hole. The one-minute-lookback backfill (mined from the same day-window
+body) is the only cross-minute repair.
+
+**Decision-freshness gate (2026-07-13 — mirrors
+`groww-second-feed-scope-2026-06-19.md` §38.8):** backfill/sweep-repaired
+rows in `spot_1m_rest` / `option_chain_1m` / `option_contract_1m_rest`
+are RECORD-COMPLETENESS data (backtest parity, cross-verify, audit) —
+NEVER trading-decision inputs. Any future strategy consumer MUST fail
+closed on staleness (a row older than a configured freshness threshold ⇒
+no trade that minute). Stale rows are mechanically distinguishable TODAY:
+`close_to_data_ms ≥ 60000` on backfilled/swept rows vs ~1-2 s own-fire,
+and the `rest_fetch_audit` outcome names the recovery path. No strategy
+consumer exists (the §28 boundary); building one needs its own operator
+scope.
+
+**2026-07-13 update — the daily Quote-2 digest is LIVE (Groww REST plan
+PR-5):** the 15:45 IST dual-feed scorecard now carries one plain-English
+"Official minute candles — how fast after each minute closed" line per
+(feed, leg), aggregated from the day's `rest_fetch_audit` rows (+ the
+`spot_1m_rest` latency-fallback column for the Dhan spot leg, whose
+forensics emits remain the flagged follow-up) — prompt-pull p50/p99/max
+seconds-after-close, ok/failed counts, rate-limit hits, late recoveries
+and never-recovered gaps, all MEASURED, `-1` sentinels rendering "not
+measured yet". Degrade stages `rest_leg_*` live under SCOREBOARD-01; full
+contract in `dual-feed-scoreboard-error-codes.md` §2b. The per-fire
+histograms + typed pages above are UNCHANGED — the digest is the daily
+plain-English summary the §9.3 mandate demanded, not a new pager. The contract leg's `rest_fetch_audit` rows (PR-4,
+`leg='contract_1m'`) feed the SAME digest line automatically — no
+digest-side change was needed.
+
 ## §4. Trigger / auto-load
 
 This rule activates when editing:
@@ -536,17 +750,23 @@ This rule activates when editing:
 - `crates/app/src/groww_spot_1m_boot.rs` (the 2026-07-13 Groww leg)
 - `crates/app/src/groww_option_chain_1m_boot.rs` (the 2026-07-13 Groww
   chain leg)
+- `crates/app/src/groww_contract_1m_boot.rs` (the 2026-07-13 Groww
+  contract leg — PR-4, the fill-model leg)
 - `crates/storage/src/spot_1m_rest_persistence.rs`
 - `crates/storage/src/option_chain_1m_persistence.rs`
+- `crates/storage/src/option_contract_1m_rest_persistence.rs` (the
+  2026-07-13 PR-4 fill-model table)
 - `crates/storage/src/rest_fetch_audit_persistence.rs` (the 2026-07-13
   per-fetch forensics table)
 - `crates/common/src/config.rs` (`Spot1mRestConfig` / `OptionChain1mConfig`
-  / `GrowwSpot1mConfig` / `GrowwOptionChain1mConfig`)
+  / `GrowwSpot1mConfig` / `GrowwOptionChain1mConfig` / `GrowwContract1mConfig`)
 - Any file containing `SPOT1M-01`, `SPOT1M-02`, `Spot1m01FetchDegraded`,
   `Spot1m02PersistFailed`, `spot_1m_rest`, `SPOT_1M_REST_INDICES`,
-  `tv_spot1m_fetch_total`, `CHAIN-01`, `CHAIN-02`, `CHAIN-03`, `CHAIN-04`,
+  `tv_spot1m_fetch_total`, `tv_spot1m_serving_lag_ms`, `EmptyClass`,
+  `CHAIN-01`, `CHAIN-02`, `CHAIN-03`, `CHAIN-04`,
   `Chain01EntitlementAbsent`, `Chain02FetchDegraded`,
   `Chain03PersistFailed`, `Chain04ExpirylistFailed`, `option_chain_1m`,
   `tv_chain1m_fetch_total`, `GROWW_SPOT_1M_SYMBOLS`, `rest_fetch_audit`,
-  `tv_groww_spot1m_fetch_total`, `GROWW_CHAIN_1M_UNDERLYINGS`, or
-  `tv_groww_chain1m_fetch_total`
+  `tv_groww_spot1m_fetch_total`, `GROWW_CHAIN_1M_UNDERLYINGS`,
+  `tv_groww_chain1m_fetch_total`, `option_contract_1m_rest`,
+  `GROWW_CONTRACT_1M_MAX_PER_MINUTE`, or `tv_groww_contract1m_fetch_total`

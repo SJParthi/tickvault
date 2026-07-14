@@ -7,12 +7,21 @@
 //! Every trading-day minute close in session — the 09:15 candle closes at
 //! 09:16:00 IST; the last (15:29) candle closes at 15:30:00 — this task
 //! wakes shortly after the boundary and fetches THAT just-closed minute's
-//! official 1m OHLCV for the 3 spot indices (`NSE-NIFTY` / `NSE-BANKNIFTY`
-//! / `BSE-SENSEX`) via Groww `GET /v1/historical/candles`
+//! official 1m OHLCV for the 3 CORE spot indices (`NSE-NIFTY` /
+//! `NSE-BANKNIFTY` / `BSE-SENSEX`) plus — since the 2026-07-13 operator
+//! scope addition (§38.7 of `groww-second-feed-scope-2026-06-19.md`) — the
+//! RUNTIME-resolved INDIA VIX index (SPOT ONLY; identity resolved from the
+//! day's Groww master via the watch file, never guessed; fail-soft skipped
+//! for the day when unresolved; per-SID independent — a VIX failure can
+//! never delay or page the core 3) via Groww `GET /v1/historical/candles`
 //! (`candle_interval="1minute"`), then persists to the SAME `spot_1m_rest`
 //! QuestDB table tagged `feed='groww'` (feed-in-key DEDUP — the Dhan rows
 //! are untouched; a re-fetch UPSERTs in place). Cold path ONLY: the WS
-//! pipelines, tick capture and trading are untouched.
+//! pipelines, tick capture and trading are untouched. Whether Groww's
+//! historical-candles endpoint SERVES India VIX is a live-probe UNKNOWN —
+//! persistent VIX emptiness yields named forensics rows + one coalesced
+//! per-day "VIX not served" coded warn, never silence; VIX volume 0/absent
+//! is EXPECTED (indices are price-only).
 //!
 //! ## The #1499 lessons, baked in from day one
 //! The Dhan spot leg's first live session (2026-07-13) proved the
@@ -93,6 +102,7 @@
 //! unwind-build self-heal path only.
 
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -102,18 +112,22 @@ use tracing::{error, info, warn};
 
 use tickvault_common::config::QuestDbConfig;
 use tickvault_common::constants::{
-    GROWW_API_VERSION_HEADER, GROWW_API_VERSION_VALUE, GROWW_CANDLE_INTERVAL_1MIN,
+    GROWW_API_VERSION_HEADER, GROWW_API_VERSION_VALUE, GROWW_CANDLE_INTERVAL_1MIN, GROWW_DATA_DIR,
     GROWW_HISTORICAL_CANDLES_URL, GROWW_SPOT_1M_FIRE_DELAY_MS, GROWW_SPOT_1M_MAX_BODY_BYTES,
     GROWW_SPOT_1M_REQUEST_TIMEOUT_SECS, GROWW_SPOT_1M_RETRY_OFFSETS_MS,
     GROWW_SPOT_1M_SYMBOL_BUDGET_SECS, GROWW_SPOT_1M_SYMBOLS, GROWW_SPOT_1M_TOKEN_REREAD_FLOOR_SECS,
-    IST_UTC_OFFSET_SECONDS, SECONDS_PER_DAY, SPOT_1M_REST_FIRST_FIRE_SECS_OF_DAY_IST,
-    SPOT_1M_REST_LAST_FIRE_SECS_OF_DAY_IST,
+    GROWW_SPOT_1M_VIX_SYMBOL, IST_UTC_OFFSET_SECONDS, SECONDS_PER_DAY,
+    SPOT_1M_REST_FIRST_FIRE_SECS_OF_DAY_IST, SPOT_1M_REST_LAST_FIRE_SECS_OF_DAY_IST,
 };
 use tickvault_common::error_code::ErrorCode;
 use tickvault_common::sanitize::capture_rest_error_body;
 use tickvault_common::trading_calendar::TradingCalendar;
 use tickvault_core::auth::secret_manager::fetch_groww_access_token;
 use tickvault_core::feed::groww::instruments::stable_index_security_id;
+use tickvault_core::feed::groww::native::watch_reader::{
+    WatchFileDoc, WatchFileKind, parse_watch_file,
+};
+use tickvault_core::instrument::index_extractor::canonicalize_index_symbol;
 use tickvault_core::notification::{NotificationEvent, NotificationService};
 use tickvault_storage::disk_health_watcher::classify_join_exit;
 use tickvault_storage::rest_fetch_audit_persistence::{
@@ -125,7 +139,7 @@ use tickvault_storage::spot_1m_rest_persistence::{
     Spot1mRestRow, Spot1mRestWriter, ensure_spot_1m_rest_table,
 };
 
-use crate::cross_verify_1m_boot::MinuteCandle;
+use crate::dhan_intraday_parse::MinuteCandle;
 // The session-boundary scheduling primitives + edge tracker + body-cap
 // helpers are REUSED from the Dhan spot leg (they are NSE-session facts and
 // pure state machines — the option_chain_1m_boot precedent).
@@ -182,6 +196,216 @@ pub struct GrowwSpot1mTaskParams {
 }
 
 // ---------------------------------------------------------------------------
+// Spot targets — the 3 const CORE indices + the RUNTIME-resolved INDIA VIX
+// (operator scope 2026-07-13, relayed via the coordinator session; §38.7 of
+// `groww-second-feed-scope-2026-06-19.md`). SPOT ONLY — no chain, no
+// contracts.
+// ---------------------------------------------------------------------------
+
+/// One per-minute spot fetch target. The 3 CORE targets come verbatim from
+/// [`GROWW_SPOT_1M_SYMBOLS`]; the 4th — INDIA VIX — is RUNTIME-resolved
+/// from the day's ingested Groww master (the watch file the Groww lane
+/// builds) because its exact `groww_symbol` is not provably pinnable
+/// in-repo ("do NOT guess the literal" — operator scope 2026-07-13).
+/// `core` drives the escalation edge: the 3-consecutive-minutes page keys
+/// on the ORIGINAL 3 core indices ONLY, so a VIX-only failure can never
+/// page the leg (per-SID independence — VIX failing can never delay or
+/// escalate the other 3).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct GrowwSpotTarget {
+    /// The Groww candles identity (`groww_symbol`, e.g. `NSE-NIFTY`).
+    groww_symbol: String,
+    /// Human symbol persisted on rows (`NIFTY` / ... / `INDIA VIX`).
+    symbol: &'static str,
+    /// Groww exchange (`NSE` / `BSE`).
+    exchange: String,
+    /// Groww segment (`CASH` for indices).
+    segment: String,
+    /// The live-lane canonical Groww index id
+    /// ([`stable_index_security_id`] of the groww_symbol).
+    security_id: i64,
+    /// `true` for the 3 §38 core indices; `false` for INDIA VIX.
+    core: bool,
+}
+
+/// The 3 CORE targets from the const table. Pure.
+fn core_spot_targets() -> Vec<GrowwSpotTarget> {
+    GROWW_SPOT_1M_SYMBOLS
+        .iter()
+        .map(
+            |&(groww_symbol, symbol, exchange, segment)| GrowwSpotTarget {
+                groww_symbol: groww_symbol.to_string(),
+                symbol,
+                exchange: exchange.to_string(),
+                segment: segment.to_string(),
+                security_id: stable_index_security_id(groww_symbol),
+                core: true,
+            },
+        )
+        .collect()
+}
+
+/// Resolve the INDIA VIX target from a parsed watch-file doc. Match rule
+/// (the house canonicalize path — the same two identity keys the Groww
+/// index-coverage audit uses): an `index_value` entry whose
+/// `exchange_token` OR display `symbol_name` canonicalizes to the
+/// allowlisted `INDIA VIX` (the live 2026-06-28 master carries token
+/// `INDIAVIX` + name "India Vix"; both keys resolve via
+/// `INDEX_SYMBOL_ALIASES` / normalization). Fail-CLOSED on every anomaly
+/// (`None` + the caller's coded warn): a stale file (date mismatch), a
+/// missing `index_name` (no groww_symbol to query with), or a
+/// `security_id` that disagrees with the canonical hash (derivation drift)
+/// all refuse — NEVER a guessed identity. Pure.
+fn vix_target_from_watch_doc(doc: &WatchFileDoc, expected_date: &str) -> Option<GrowwSpotTarget> {
+    if doc.trading_date_ist != expected_date {
+        return None;
+    }
+    let vix_canonical = canonicalize_index_symbol(GROWW_SPOT_1M_VIX_SYMBOL);
+    let entry = doc.entries.iter().find(|e| {
+        e.kind == WatchFileKind::IndexValue
+            && (canonicalize_index_symbol(&e.exchange_token) == vix_canonical
+                || e.symbol_name
+                    .as_deref()
+                    .is_some_and(|n| canonicalize_index_symbol(n) == vix_canonical))
+    })?;
+    let groww_symbol = entry.index_name.as_deref()?.trim();
+    if groww_symbol.is_empty() {
+        return None;
+    }
+    let security_id = stable_index_security_id(groww_symbol);
+    if security_id != entry.security_id {
+        // Derivation drift — refuse rather than persist rows under an id
+        // the live lane would not join on.
+        return None;
+    }
+    Some(GrowwSpotTarget {
+        groww_symbol: groww_symbol.to_string(),
+        symbol: GROWW_SPOT_1M_VIX_SYMBOL,
+        exchange: entry.exchange.clone(),
+        segment: entry.segment.clone(),
+        security_id,
+        core: false,
+    })
+}
+
+/// One RUNTIME resolution attempt for the INDIA VIX target: read today's
+/// watch file (`data/groww/groww-watch-<date>.json` — the day's ingested
+/// Groww master product, built by the Groww lane activation) and match via
+/// [`vix_target_from_watch_doc`]. Fail-SOFT: any miss returns `None`
+/// (counted + warned once by the caller; the 3 core targets are never
+/// blocked). Cold path, at most one small file read per minute.
+// TEST-EXEMPT: thin fs-read shim — the parse + match + fail-closed arms are the pure vix_target_from_watch_doc, unit-tested below.
+fn try_resolve_vix_target(trading_date: NaiveDate) -> Option<GrowwSpotTarget> {
+    let date = trading_date.format("%Y-%m-%d").to_string();
+    let path = crate::groww_native_shadow::watch_file_path_for(Path::new(GROWW_DATA_DIR), &date);
+    let json = std::fs::read_to_string(&path).ok()?;
+    let doc = parse_watch_file(&json).ok()?;
+    vix_target_from_watch_doc(&doc, &date)
+}
+
+/// Lazy per-iteration VIX resolution: pushes the resolved target once (the
+/// watch build lands asynchronously after boot, so a run-start-only
+/// attempt would race it). The coded warn fires ONCE per run
+/// (edge-latched); every failed attempt increments the counter so the
+/// unresolved rate stays visible. An unresolved day degrades to the 3
+/// core targets — never a guessed literal, never a blocked core fire.
+fn ensure_vix_target(
+    targets: &mut Vec<GrowwSpotTarget>,
+    vix_warned: &mut bool,
+    trading_date: NaiveDate,
+) {
+    if targets.iter().any(|t| !t.core) {
+        return;
+    }
+    match try_resolve_vix_target(trading_date) {
+        Some(vix) => {
+            info!(
+                groww_symbol = %vix.groww_symbol,
+                exchange = %vix.exchange,
+                segment = %vix.segment,
+                security_id = vix.security_id,
+                "groww_spot_1m: INDIA VIX target runtime-resolved from the \
+                 day's Groww master (2026-07-13 operator scope) — the spot \
+                 set is now 4 targets"
+            );
+            targets.push(vix);
+        }
+        None => {
+            metrics::counter!("tv_groww_spot1m_vix_unresolved_total").increment(1);
+            if !*vix_warned {
+                *vix_warned = true;
+                warn!(
+                    code = ErrorCode::Spot1m01FetchDegraded.code_str(),
+                    stage = "vix_unresolved",
+                    feed = SPOT_1M_REST_FEED_GROWW,
+                    "SPOT1M-01: INDIA VIX could not be resolved from today's \
+                     Groww master (watch file absent or carries no VIX index \
+                     row) — the spot leg runs the 3 core indices; VIX is \
+                     skipped (never guessed) and re-attempted each minute"
+                );
+            }
+        }
+    }
+}
+
+/// Escalation-edge tally for one fired minute, restricted to the 3 CORE
+/// indices (operator scope 2026-07-13: VIX failing can never delay — nor
+/// page — the other 3). The page/recover edge feeds ONLY from core
+/// outcomes: a VIX-only fetch failure, a VIX-only row-append failure and a
+/// VIX-only empty are all non-edge (still counted + forensics-rowed +
+/// verdict-logged); a shared ILP FLUSH failure IS edge-relevant (it loses
+/// core rows too). Conversely, all-3-core-failed pages even when VIX alone
+/// succeeded. Pure state — unit-tested below.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct MinuteEdgeTally {
+    core_ok: usize,
+    core_persist_failed: bool,
+}
+
+impl MinuteEdgeTally {
+    /// Record one target's successful own-minute fetch.
+    fn note_ok(&mut self, core: bool) {
+        if core {
+            self.core_ok = self.core_ok.saturating_add(1);
+        }
+    }
+
+    /// Record one target's row-append failure (own or backfill row).
+    fn note_append_failure(&mut self, core: bool) {
+        if core {
+            self.core_persist_failed = true;
+        }
+    }
+
+    /// Record the shared ILP flush failing (loses core rows too).
+    fn note_flush_failure(&mut self) {
+        self.core_persist_failed = true;
+    }
+
+    /// The edge verdict for this minute — the shared fully-failed rule
+    /// (`minute_fully_failed`) over CORE inputs only.
+    fn fully_failed(self) -> bool {
+        minute_fully_failed(self.core_ok, self.core_persist_failed)
+    }
+}
+
+/// The end-of-session "India VIX not served" verdict (operator scope
+/// 2026-07-13): `true` when a VIX target WAS resolved yet ZERO VIX minutes
+/// ever persisted this run (fires + sweep included), while at least one
+/// CORE index DID persist — so the emptiness is VIX-specific ("VIX not
+/// served by Groww"), not a leg-wide outage (leg-wide outages already
+/// paged via the escalation edge). Pure.
+fn vix_not_served_verdict(targets: &[GrowwSpotTarget], tracker: &PersistTracker) -> bool {
+    let Some(vix) = targets.iter().find(|t| !t.core) else {
+        return false;
+    };
+    tracker.last_persisted(vix.security_id).is_none()
+        && targets
+            .iter()
+            .any(|t| t.core && tracker.last_persisted(t.security_id).is_some())
+}
+
+// ---------------------------------------------------------------------------
 // Pure request/window builders
 // ---------------------------------------------------------------------------
 
@@ -190,7 +414,7 @@ pub struct GrowwSpot1mTaskParams {
 /// to Groww from day one; the consumer filters client-side to the exact
 /// minute. Month/day boundaries via `succ_opt` (cross-verify semantics).
 /// Pure.
-fn groww_day_window_strings(trading_date: NaiveDate) -> (String, String) {
+pub(crate) fn groww_day_window_strings(trading_date: NaiveDate) -> (String, String) {
     // `succ_opt` is `None` ONLY for `NaiveDate::MAX` (year 262142) — an
     // unreachable input for a live trading date. The fallback collapses the
     // window to zero width (start == end), which the server answers with an
@@ -208,7 +432,7 @@ fn groww_day_window_strings(trading_date: NaiveDate) -> (String, String) {
 /// `start_time` / `end_time` / `candle_interval="1minute"` (SDK-verified
 /// param set; identity = the `groww_symbol`, never the token or the bare
 /// trading symbol). Pure.
-fn groww_candles_query(
+pub(crate) fn groww_candles_query(
     groww_symbol: &str,
     exchange: &str,
     segment: &str,
@@ -287,12 +511,31 @@ fn parse_groww_candle_ts(v: &serde_json::Value) -> Option<(i64, GrowwTsForm)> {
 }
 
 /// Per-body parse accounting — which ts forms were seen + how many rows
-/// were malformed (all counted, never silent).
+/// were malformed (all counted, never silent). Shared with the PR-4
+/// contract leg (`groww_contract_1m_boot.rs`) — each leg records the
+/// stats into its OWN counter names.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct GrowwParseStats {
-    epoch_ts_rows: u32,
-    string_ts_rows: u32,
-    malformed_rows: u32,
+pub(crate) struct GrowwParseStats {
+    pub(crate) epoch_ts_rows: u32,
+    pub(crate) string_ts_rows: u32,
+    pub(crate) malformed_rows: u32,
+}
+
+/// One parsed Groww candle tuple `[ts, o, h, l, c, volume, oi]` — the
+/// SHARED wire row (PR-4 refactor): the spot leg maps it to
+/// [`MinuteCandle`] (dropping `oi` — indices carry none), the contract
+/// leg consumes `oi` directly (the fill-model column).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct GrowwCandleRow {
+    pub(crate) minute_ts_ist_nanos: i64,
+    pub(crate) open: f64,
+    pub(crate) high: f64,
+    pub(crate) low: f64,
+    pub(crate) close: f64,
+    pub(crate) volume: i64,
+    /// Candle tuple element 6 (`open_interest`) — 0 when absent/null
+    /// (indices legitimately carry none; contracts carry the real OI).
+    pub(crate) oi: i64,
 }
 
 /// Parse a Groww candles response body into [`MinuteCandle`]s. Envelope:
@@ -303,6 +546,26 @@ struct GrowwParseStats {
 /// + counted — never a panic (typed-degrade discipline). `volume` may be
 /// null (indices) → 0; non-finite prices skip the row. Pure.
 fn parse_groww_1m_candles(body: &str) -> (Vec<MinuteCandle>, GrowwParseStats) {
+    let (rows, stats) = parse_groww_1m_candle_rows(body);
+    let candles = rows
+        .into_iter()
+        .map(|r| MinuteCandle {
+            minute_ts_ist_nanos: r.minute_ts_ist_nanos,
+            open: r.open,
+            high: r.high,
+            low: r.low,
+            close: r.close,
+            volume: r.volume,
+        })
+        .collect();
+    (candles, stats)
+}
+
+/// The SHARED candle-tuple parser (PR-4 refactor — one wire parser, two
+/// consumers): identical envelope/row/timestamp semantics to the original
+/// spot parser, PLUS the `oi` element (tuple[6], tolerant: absent/null →
+/// 0) the contract leg consumes. Pure.
+pub(crate) fn parse_groww_1m_candle_rows(body: &str) -> (Vec<GrowwCandleRow>, GrowwParseStats) {
     let mut stats = GrowwParseStats::default();
     let Ok(v) = serde_json::from_str::<serde_json::Value>(body) else {
         stats.malformed_rows = 1;
@@ -348,30 +611,34 @@ fn parse_groww_1m_candles(body: &str) -> (Vec<MinuteCandle>, GrowwParseStats) {
             continue;
         }
         // Index volume is legitimately null/0 — stored verbatim, never a
-        // malformed marker. `open_interest` (tuple[6]) is ignored on the
-        // spot leg (the contract leg consumes it in PR-4).
-        let volume = tuple[5]
-            .as_i64()
-            .or_else(|| {
-                tuple[5]
-                    .as_f64()
-                    .filter(|f| f.is_finite() && f.abs() < 9.2e18)
-                    .map(|f| f as i64)
+        // malformed marker. `oi` (tuple[6]) is tolerant the same way: the
+        // spot leg drops it, the contract leg persists it verbatim.
+        let tolerant_i64 = |v: Option<&serde_json::Value>| -> i64 {
+            v.and_then(|v| {
+                v.as_i64().or_else(|| {
+                    v.as_f64()
+                        .filter(|f| f.is_finite() && f.abs() < 9.2e18)
+                        .map(|f| f as i64)
+                })
             })
-            .unwrap_or(0);
+            .unwrap_or(0)
+        };
+        let volume = tolerant_i64(tuple.get(5));
+        let oi = tolerant_i64(tuple.get(6));
         match form {
             GrowwTsForm::EpochSecs => stats.epoch_ts_rows = stats.epoch_ts_rows.saturating_add(1),
             GrowwTsForm::IstString => {
                 stats.string_ts_rows = stats.string_ts_rows.saturating_add(1);
             }
         }
-        out.push(MinuteCandle {
+        out.push(GrowwCandleRow {
             minute_ts_ist_nanos,
             open,
             high,
             low,
             close,
             volume,
+            oi,
         });
     }
     (out, stats)
@@ -552,7 +819,7 @@ fn should_reread_token(last_read_ms: Option<i64>, now_ms: i64) -> bool {
 }
 
 /// Bounded failure slug for the forensics row — NEVER raw body text. Pure.
-fn error_class_for_status(status: u16) -> &'static str {
+pub(crate) fn error_class_for_status(status: u16) -> &'static str {
     match status {
         0 => "transport",
         401 | 403 => "auth",
@@ -618,10 +885,22 @@ fn fetched_at_ist_nanos_now() -> i64 {
 pub(crate) struct GrowwTokenCache {
     token: Option<SecretString>,
     last_read_ms: Option<i64>,
-    /// `true` when the CHAIN leg owns this cache — routes the SSM
-    /// read-failure emit to CHAIN-02 / `tv_groww_chain1m_*` instead of the
-    /// spot taxonomy. Behaviour (pacing, drop-on-auth-reject) is identical.
-    chain_leg: bool,
+    /// WHICH Groww REST leg owns this cache — routes the SSM read-failure
+    /// emit to that leg's error-code/counter taxonomy. Behaviour (pacing,
+    /// drop-on-auth-reject) is identical across legs.
+    leg: GrowwRestLegRoute,
+}
+
+/// The owning REST leg of a [`GrowwTokenCache`] — error-routing only.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum GrowwRestLegRoute {
+    /// Spot 1m leg (SPOT1M-01 / `tv_groww_spot1m_*`).
+    Spot,
+    /// Option-chain leg (CHAIN-02 / `tv_groww_chain1m_*`).
+    Chain,
+    /// Per-contract 1m leg (SPOT1M-01 leg=contract_1m /
+    /// `tv_groww_contract1m_*` — PR-4).
+    Contract,
 }
 
 impl GrowwTokenCache {
@@ -630,7 +909,7 @@ impl GrowwTokenCache {
         Self {
             token: None,
             last_read_ms: None,
-            chain_leg: false,
+            leg: GrowwRestLegRoute::Spot,
         }
     }
 
@@ -639,7 +918,17 @@ impl GrowwTokenCache {
     // TEST-EXEMPT: trivial constructor — same tested semantics as new(); the routing flag is exercised by the chain wiring guard's stub scan.
     pub(crate) fn new_chain() -> Self {
         Self {
-            chain_leg: true,
+            leg: GrowwRestLegRoute::Chain,
+            ..Self::new()
+        }
+    }
+
+    /// Contract-leg constructor (PR-4) — same cache semantics,
+    /// contract-routed read-failure emits.
+    // TEST-EXEMPT: trivial constructor — same tested semantics as new(); the routing flag is exercised by the contract wiring guard's stub scan.
+    pub(crate) fn new_contract() -> Self {
+        Self {
+            leg: GrowwRestLegRoute::Contract,
             ..Self::new()
         }
     }
@@ -649,11 +938,12 @@ impl GrowwTokenCache {
     /// network read (the pacing floor), so the no-token fire arms are
     /// testable hermetically.
     #[cfg(test)]
+    // TEST-EXEMPT: cfg(test)-only constructor consumed by the hermetic fire-arm tests below — guard raw-grep false positive
     pub(crate) fn for_test_paced_out(now_ms: i64) -> Self {
         Self {
             token: None,
             last_read_ms: Some(now_ms),
-            chain_leg: true,
+            leg: GrowwRestLegRoute::Chain,
         }
     }
 
@@ -661,11 +951,12 @@ impl GrowwTokenCache {
     /// returns it without any SSM read, so the token-path fire arms are
     /// testable hermetically against a mock server.
     #[cfg(test)]
+    // TEST-EXEMPT: cfg(test)-only constructor consumed by the hermetic fire-arm tests below — guard raw-grep false positive
     pub(crate) fn for_test_with_token(token: SecretString) -> Self {
         Self {
             token: Some(token),
             last_read_ms: None,
-            chain_leg: true,
+            leg: GrowwRestLegRoute::Chain,
         }
     }
 
@@ -680,13 +971,13 @@ impl GrowwTokenCache {
             match fetch_groww_access_token().await {
                 Ok(token) => {
                     info!(
-                        chain_leg = self.chain_leg,
+                        leg = ?self.leg,
                         "groww_rest_1m: shared access token read from SSM \
                          (read-only; minted by the token-minter Lambda)"
                     );
                     self.token = Some(token);
                 }
-                Err(err) if self.chain_leg => {
+                Err(err) if self.leg == GrowwRestLegRoute::Chain => {
                     metrics::counter!("tv_groww_chain1m_token_read_failed_total").increment(1);
                     error!(
                         code = ErrorCode::Chain02FetchDegraded.code_str(),
@@ -695,6 +986,19 @@ impl GrowwTokenCache {
                         ?err,
                         "CHAIN-02: shared Groww access token SSM read failed \
                          — the chain leg's minutes miss until the read \
+                         succeeds (re-read paced at 60s; NEVER minted)"
+                    );
+                }
+                Err(err) if self.leg == GrowwRestLegRoute::Contract => {
+                    metrics::counter!("tv_groww_contract1m_token_read_failed_total").increment(1);
+                    error!(
+                        code = ErrorCode::Spot1m01FetchDegraded.code_str(),
+                        stage = "token_read",
+                        feed = SPOT_1M_REST_FEED_GROWW,
+                        leg = "contract_1m",
+                        ?err,
+                        "SPOT1M-01: shared Groww access token SSM read failed \
+                         — the contract leg's minutes miss until the read \
                          succeeds (re-read paced at 60s; NEVER minted)"
                     );
                 }
@@ -722,7 +1026,7 @@ impl GrowwTokenCache {
     pub(crate) fn note_auth_rejected(&mut self) {
         if self.token.take().is_some() {
             warn!(
-                chain_leg = self.chain_leg,
+                leg = ?self.leg,
                 "groww_rest_1m: auth-class reject — cached token dropped; \
                  re-reading from SSM at >=60s pacing (never minting)"
             );
@@ -1117,12 +1421,12 @@ fn build_fetch_audit_row(
     }
 }
 
-/// Forensics rows for the symbols SKIPPED after an auth-class reject
+/// Forensics rows for the targets SKIPPED after an auth-class reject
 /// short-circuited the fire (hostile round 1 item 12): no request is ever
 /// sent for them with the dead token — outcome `no_token`, class `auth`,
 /// 0/-1 sentinels (no HTTP happened). Pure — unit-tested below.
 fn build_auth_short_circuit_rows(
-    remaining: &[(&'static str, &'static str, &'static str, &'static str)],
+    remaining: &[GrowwSpotTarget],
     target_minute_ist_nanos: i64,
     trading_date_nanos: i64,
 ) -> Vec<RestFetchAuditRow> {
@@ -1136,12 +1440,12 @@ fn build_auth_short_circuit_rows(
     };
     remaining
         .iter()
-        .map(|&(groww_symbol, symbol, _exchange, _segment)| {
+        .map(|target| {
             build_fetch_audit_row(
                 target_minute_ist_nanos,
                 trading_date_nanos,
-                stable_index_security_id(groww_symbol),
-                symbol,
+                target.security_id,
+                target.symbol,
                 &forensics,
                 RestFetchOutcome::NoToken,
                 -1,
@@ -1234,6 +1538,13 @@ pub async fn run_groww_spot_1m(params: GrowwSpot1mTaskParams) {
     let mut edge = FailureEdge::default();
     let mut tracker = PersistTracker::default();
     let mut token_cache = GrowwTokenCache::new();
+    // 2026-07-13 (operator scope, §38.7): the 4th target — INDIA VIX — is
+    // RUNTIME-resolved from the day's watch file. Resolution is retried
+    // lazily before every fire until it succeeds (the watch build lands
+    // asynchronously after boot); an unresolved day degrades to the 3
+    // core targets with ONE coded warn + a per-attempt counter.
+    let mut targets = core_spot_targets();
+    let mut vix_warned = false;
     // H1: the last boundary actually HANDLED (fired or skipped-stale) —
     // the next fire is always STRICTLY after it.
     let mut last_fired: Option<u32> = None;
@@ -1244,10 +1555,11 @@ pub async fn run_groww_spot_1m(params: GrowwSpot1mTaskParams) {
     // forbids a bulk backfill). `None` = the run never fired.
     let mut first_covered: Option<i64> = None;
     info!(
-        symbols = GROWW_SPOT_1M_SYMBOLS.len(),
+        core_symbols = GROWW_SPOT_1M_SYMBOLS.len(),
         "groww_spot_1m: per-minute fetch loop armed (fires each minute close \
          09:16:00-15:30:00 IST, ~0.3-1.3s after the boundary; sequential \
-         symbol pacing)"
+         target pacing; INDIA VIX joins as the 4th target once \
+         runtime-resolved — 2026-07-13 operator scope)"
     );
 
     loop {
@@ -1262,6 +1574,9 @@ pub async fn run_groww_spot_1m(params: GrowwSpot1mTaskParams) {
         // day, and stamping pre-suspend session seconds onto it would file
         // forensics rows under the wrong trading date.
         let iter_date = today_ist();
+        // 2026-07-13: retry the INDIA VIX runtime resolution until it
+        // lands (fail-soft; the 3 core targets never wait on it).
+        ensure_vix_target(&mut targets, &mut vix_warned, iter_date);
         let now = ist_secs_of_day_now();
         let Some(fire) = next_fire_after(now, last_fired) else {
             info!(
@@ -1271,6 +1586,7 @@ pub async fn run_groww_spot_1m(params: GrowwSpot1mTaskParams) {
             run_post_session_sweep(
                 &client,
                 &params,
+                &targets,
                 &mut writer,
                 &mut audit_writer,
                 &mut tracker,
@@ -1298,6 +1614,7 @@ pub async fn run_groww_spot_1m(params: GrowwSpot1mTaskParams) {
             let missed = count_missed_boundaries(fire.saturating_sub(60), woke.saturating_sub(1));
             record_skipped_boundaries(
                 &params,
+                &targets,
                 &mut edge,
                 &mut audit_writer,
                 missed,
@@ -1322,6 +1639,7 @@ pub async fn run_groww_spot_1m(params: GrowwSpot1mTaskParams) {
         fire_one_minute(
             &params,
             &client,
+            &targets,
             &mut writer,
             &mut audit_writer,
             &mut edge,
@@ -1344,6 +1662,7 @@ pub async fn run_groww_spot_1m(params: GrowwSpot1mTaskParams) {
         let missed = count_missed_boundaries(fire, after.saturating_sub(1));
         record_skipped_boundaries(
             &params,
+            &targets,
             &mut edge,
             &mut audit_writer,
             missed,
@@ -1362,8 +1681,12 @@ pub async fn run_groww_spot_1m(params: GrowwSpot1mTaskParams) {
 /// forensics row per (minute, symbol) so the hole is queryable (never
 /// silent — Rule 11). `first_missed_boundary_secs` = the FIRST boundary
 /// in the missed run (each targets the minute opening 60 s before it).
+/// A skipped boundary skips EVERY current target (incl. a resolved INDIA
+/// VIX), so forensics rows cover all of them; the edge feed below is the
+/// whole-fire skip — core and VIX alike missed, so it is core-failed too.
 fn record_skipped_boundaries(
     params: &GrowwSpot1mTaskParams,
+    targets: &[GrowwSpotTarget],
     edge: &mut FailureEdge,
     audit_writer: &mut RestFetchAuditWriter,
     skipped: u32,
@@ -1412,12 +1735,12 @@ fn record_skipped_boundaries(
         let boundary = first_missed_boundary_secs.saturating_add(i.saturating_mul(60));
         let minute_open_secs = boundary.saturating_sub(60);
         let target_nanos = minute_open_ist_nanos(trading_date, minute_open_secs);
-        for (groww_symbol, symbol, _exchange, _segment) in GROWW_SPOT_1M_SYMBOLS {
+        for target in targets {
             let row = build_fetch_audit_row(
                 target_nanos,
                 trading_date_nanos,
-                stable_index_security_id(groww_symbol),
-                symbol,
+                target.security_id,
+                target.symbol,
                 &skip_forensics,
                 RestFetchOutcome::Skipped,
                 -1,
@@ -1446,16 +1769,21 @@ fn record_skipped_boundaries(
     audit_flush_best_effort(audit_writer);
 }
 
-/// One minute-close fire: SEQUENTIAL ladder fetches for the 3 symbols
-/// (pacing rule — at most one in-flight request) → persist the target
-/// minute AND the previous-minute backfill when due → forensics rows →
-/// counters → edge accounting. Edge honesty: the verdict is the OWN
-/// target minute's fetch + persist — a backfill hit never counts as this
-/// fire's `ok` and never samples the own-fire histogram.
+/// One minute-close fire: SEQUENTIAL ladder fetches for the current
+/// targets (3 core + the runtime-resolved INDIA VIX when present; pacing
+/// rule — at most one in-flight request) → persist the target minute AND
+/// the previous-minute backfill when due → forensics rows → counters →
+/// edge accounting. Edge honesty: the verdict is the OWN target minute's
+/// fetch + persist — a backfill hit never counts as this fire's `ok` and
+/// never samples the own-fire histogram. Per-SID independence (2026-07-13
+/// operator scope): each target runs its OWN bounded ladder/budget, so a
+/// VIX failure can never delay the core 3, and the escalation edge feeds
+/// ONLY from core outcomes via [`MinuteEdgeTally`].
 #[allow(clippy::too_many_arguments)] // APPROVED: private fire sink over the run loop's owned state — a struct would be pure ceremony
 async fn fire_one_minute(
     params: &GrowwSpot1mTaskParams,
     client: &reqwest::Client,
+    targets: &[GrowwSpotTarget],
     writer: &mut Spot1mRestWriter,
     audit_writer: &mut RestFetchAuditWriter,
     edge: &mut FailureEdge,
@@ -1478,6 +1806,10 @@ async fn fire_one_minute(
     // M1: a minute is fully-OK for the edge ONLY when the fetch succeeded
     // AND append+flush confirmed (a day-long QuestDB outage must page).
     let mut persist_failed = false;
+    // 2026-07-13: the escalation edge feeds ONLY from the 3 CORE indices —
+    // a VIX-only failure never pages, core-all-failed pages even when VIX
+    // alone succeeded.
+    let mut tally = MinuteEdgeTally::default();
     let mut implausible_count: usize = 0;
     let mut sample_failure: Option<String> = None;
     // Minutes appended this fire, committed to the tracker ONLY after the
@@ -1486,11 +1818,14 @@ async fn fire_one_minute(
     let mut staged: Vec<(i64, i64)> = Vec::new();
 
     if let Some(token) = token_cache.ensure_token().await {
-        for (idx, &(groww_symbol, symbol, exchange, segment)) in
-            GROWW_SPOT_1M_SYMBOLS.iter().enumerate()
-        {
-            let security_id = stable_index_security_id(groww_symbol);
-            let query = groww_candles_query(groww_symbol, exchange, segment, trading_date);
+        for (idx, target) in targets.iter().enumerate() {
+            let security_id = target.security_id;
+            let query = groww_candles_query(
+                &target.groww_symbol,
+                &target.exchange,
+                &target.segment,
+                trading_date,
+            );
             let backfill_nanos = backfill_minute_nanos(
                 tracker.last_persisted(security_id),
                 target_nanos,
@@ -1520,7 +1855,7 @@ async fn fire_one_minute(
                 target_nanos,
                 trading_date_nanos,
                 security_id,
-                symbol,
+                target.symbol,
                 &forensics,
                 audit_outcome,
                 audit_close_to_data,
@@ -1546,10 +1881,20 @@ async fn fire_one_minute(
                     empty_count = empty_count.saturating_add(1);
                     metrics::counter!("tv_groww_spot1m_fetch_total", "outcome" => "empty")
                         .increment(1);
+                    if !target.core {
+                        // 2026-07-13 live-probe unknown: whether Groww's
+                        // historical-candles endpoint SERVES India VIX.
+                        // Its 2xx-without-the-minute emptiness gets its own
+                        // static-label counter so the vendor answer is
+                        // measurable; the daily sweep verdict pages the
+                        // coalesced "VIX not served" warn.
+                        metrics::counter!("tv_groww_spot1m_vix_empty_total").increment(1);
+                    }
                     if sample_failure.is_none() {
                         sample_failure = Some(format!(
-                            "{groww_symbol}: 2xx but the minute's candle never \
-                             appeared within the re-poll ladder"
+                            "{}: 2xx but the minute's candle never \
+                             appeared within the re-poll ladder",
+                            target.groww_symbol
                         ));
                     }
                     (None, backfill_candle)
@@ -1562,13 +1907,14 @@ async fn fire_one_minute(
                     metrics::counter!("tv_groww_spot1m_fetch_total", "outcome" => "error")
                         .increment(1);
                     if sample_failure.is_none() {
-                        sample_failure = Some(format!("{groww_symbol}: {reason}"));
+                        sample_failure = Some(format!("{}: {reason}", target.groww_symbol));
                     }
                     (None, backfill_candle)
                 }
             };
             if let Some((candle, close_to_data_ms)) = own_outcome {
                 ok_count = ok_count.saturating_add(1);
+                tally.note_ok(target.core);
                 if candle_ohlc_implausible(&candle) {
                     implausible_count = implausible_count.saturating_add(1);
                 }
@@ -1579,12 +1925,13 @@ async fn fire_one_minute(
                 let row = build_groww_spot_1m_row(
                     &candle,
                     security_id,
-                    symbol,
+                    target.symbol,
                     trading_date_nanos,
                     close_to_data_ms,
                 );
                 if let Err(err) = writer.append_row(&row) {
                     persist_failed = true;
+                    tally.note_append_failure(target.core);
                     metrics::counter!("tv_groww_spot1m_persist_errors_total", "stage" => "append")
                         .increment(1);
                     error!(
@@ -1613,12 +1960,13 @@ async fn fire_one_minute(
                 let row = build_groww_spot_1m_row(
                     &backfill,
                     security_id,
-                    symbol,
+                    target.symbol,
                     trading_date_nanos,
                     backfill_close_to_data_ms,
                 );
                 if let Err(err) = writer.append_row(&row) {
                     persist_failed = true;
+                    tally.note_append_failure(target.core);
                     metrics::counter!("tv_groww_spot1m_persist_errors_total", "stage" => "append")
                         .increment(1);
                     error!(
@@ -1633,7 +1981,7 @@ async fn fire_one_minute(
                     metrics::counter!("tv_groww_spot1m_backfilled_total").increment(1);
                     info!(
                         security_id,
-                        symbol,
+                        symbol = target.symbol,
                         backfill_close_to_data_ms,
                         "groww_spot_1m: previous minute backfilled from this \
                          fire's full-day response (DEDUP-idempotent)"
@@ -1648,7 +1996,7 @@ async fn fire_one_minute(
                 // rejects worst case). The next fire's ensure_token
                 // re-reads SSM at the ≥60s floor (unchanged); NEVER a mint.
                 token_cache.note_auth_rejected();
-                let remaining = &GROWW_SPOT_1M_SYMBOLS[idx + 1..];
+                let remaining = &targets[idx + 1..];
                 if !remaining.is_empty() {
                     error_count = error_count.saturating_add(remaining.len());
                     warn!(
@@ -1684,6 +2032,7 @@ async fn fire_one_minute(
             if sample_failure.is_none() {
                 sample_failure = Some(format!("persist flush failed: {err:#}"));
             }
+            tally.note_flush_failure();
         } else {
             // Flush confirmed — advance the per-symbol persisted watermark.
             for (security_id, minute_nanos) in staged {
@@ -1708,9 +2057,10 @@ async fn fire_one_minute(
         }
     } else {
         // No token at fire time — nothing can be sent; the whole minute is
-        // a full miss (counted per symbol for honest rate math) + one
-        // no_token forensics row per symbol.
-        error_count = GROWW_SPOT_1M_SYMBOLS.len();
+        // a full miss (counted per target for honest rate math; core_ok
+        // stays 0, so the edge sees a fully-failed minute) + one no_token
+        // forensics row per target.
+        error_count = targets.len();
         sample_failure = Some("no shared Groww access token available at fire time".to_string());
         let no_token_forensics = LadderForensics {
             attempts: 0,
@@ -1720,13 +2070,13 @@ async fn fire_one_minute(
             error_class: "no_token",
             auth_rejected: false,
         };
-        for (groww_symbol, symbol, _exchange, _segment) in GROWW_SPOT_1M_SYMBOLS {
+        for target in targets {
             metrics::counter!("tv_groww_spot1m_fetch_total", "outcome" => "error").increment(1);
             let row = build_fetch_audit_row(
                 target_nanos,
                 trading_date_nanos,
-                stable_index_security_id(groww_symbol),
-                symbol,
+                target.security_id,
+                target.symbol,
                 &no_token_forensics,
                 RestFetchOutcome::NoToken,
                 -1,
@@ -1745,13 +2095,16 @@ async fn fire_one_minute(
         error_count,
         empty_count,
         persist_failed,
+        tally,
         sample_failure.as_deref(),
     );
 }
 
 /// Coalesced per-minute verdict: ONE coded log per fired minute with any
 /// failure, plus the edge-triggered escalation page / recovery ping
-/// (typed Groww events).
+/// (typed Groww events). 2026-07-13: the edge verdict comes from the CORE
+/// tally ([`MinuteEdgeTally`]) — a VIX-only failure never pages; the total
+/// ok/error/empty counts stay in the log for full visibility.
 #[allow(clippy::too_many_arguments)] // APPROVED: private verdict sink — a struct would be pure ceremony
 fn record_minute_verdict(
     params: &GrowwSpot1mTaskParams,
@@ -1761,9 +2114,10 @@ fn record_minute_verdict(
     error_count: usize,
     empty_count: usize,
     persist_failed: bool,
+    tally: MinuteEdgeTally,
     sample_failure: Option<&str>,
 ) {
-    let fully_failed = minute_fully_failed(ok_count, persist_failed);
+    let fully_failed = tally.fully_failed();
     let action = edge.record_minute(fully_failed);
     match action {
         EdgeAction::Page { consecutive } => {
@@ -1807,6 +2161,7 @@ fn record_minute_verdict(
                     feed = SPOT_1M_REST_FEED_GROWW,
                     minute = minute_label,
                     ok = ok_count,
+                    core_ok = tally.core_ok,
                     errors = error_count,
                     empty = empty_count,
                     persist_failed,
@@ -1831,9 +2186,11 @@ fn record_minute_verdict(
 /// membership filter is O(missing × candles) ≤ 375×375 once per day —
 /// cold path, flagged honestly.
 // TEST-EXEMPT: live-deps async runner — the missing-minute selection (sweep_missing_minutes), row builders and named-gap mapping are pure fns unit-tested below; the HTTP+persist legs reuse the tested fire_one_minute pattern.
+#[allow(clippy::too_many_arguments)] // APPROVED: private once-a-day sweep sink over the run loop's owned state — a struct would be pure ceremony
 async fn run_post_session_sweep(
     client: &reqwest::Client,
     params: &GrowwSpot1mTaskParams,
+    targets: &[GrowwSpotTarget],
     writer: &mut Spot1mRestWriter,
     audit_writer: &mut RestFetchAuditWriter,
     tracker: &mut PersistTracker,
@@ -1874,8 +2231,8 @@ async fn run_post_session_sweep(
     let mut pre_boot_named: u64 = 0;
     let mut staged: Vec<(i64, i64)> = Vec::new();
     let mut persist_failed = false;
-    for (groww_symbol, symbol, exchange, segment) in GROWW_SPOT_1M_SYMBOLS {
-        let security_id = stable_index_security_id(groww_symbol);
+    for target in targets {
+        let security_id = target.security_id;
         // Item 2: the run's PRE-BOOT blind window [session_first,
         // first_covered) is named AUDIT-ONLY — one `named_gap`/`pre_boot`
         // forensics row per minute, NO fetch (§38 forbids a bulk
@@ -1891,7 +2248,7 @@ async fn run_post_session_sweep(
                 &pre_boot,
                 trading_date_nanos,
                 security_id,
-                symbol,
+                target.symbol,
                 RestFetchOutcome::NamedGap,
                 "pre_boot",
                 0,
@@ -1927,14 +2284,19 @@ async fn run_post_session_sweep(
                 &missing,
                 trading_date_nanos,
                 security_id,
-                symbol,
+                target.symbol,
                 RestFetchOutcome::NoToken,
                 "no_token",
                 0,
             );
             continue;
         };
-        let query = groww_candles_query(groww_symbol, exchange, segment, trading_date);
+        let query = groww_candles_query(
+            &target.groww_symbol,
+            &target.exchange,
+            &target.segment,
+            trading_date,
+        );
         let candles =
             match groww_fetch_once(client, GROWW_HISTORICAL_CANDLES_URL, &query, token).await {
                 Ok(body_text) => {
@@ -1957,7 +2319,7 @@ async fn run_post_session_sweep(
                         &missing,
                         trading_date_nanos,
                         security_id,
-                        symbol,
+                        target.symbol,
                         if failure.rate_limited {
                             RestFetchOutcome::RateLimited
                         } else {
@@ -1987,7 +2349,7 @@ async fn run_post_session_sweep(
             let row = build_groww_spot_1m_row(
                 &candle,
                 security_id,
-                symbol,
+                target.symbol,
                 trading_date_nanos,
                 close_to_data_ms,
             );
@@ -2023,7 +2385,7 @@ async fn run_post_session_sweep(
             &gaps,
             trading_date_nanos,
             security_id,
-            symbol,
+            target.symbol,
             RestFetchOutcome::NamedGap,
             "named_gap",
             200,
@@ -2033,7 +2395,7 @@ async fn run_post_session_sweep(
             &persist_gaps,
             trading_date_nanos,
             security_id,
-            symbol,
+            target.symbol,
             RestFetchOutcome::NamedGap,
             "persist_failed",
             200,
@@ -2058,8 +2420,9 @@ async fn run_post_session_sweep(
         // would be the only trace. Name each one (`named_gap` /
         // `flush_failed`; the fetch itself answered 200) BEFORE the
         // best-effort audit flush below.
-        for &(groww_symbol, gap_symbol, _, _) in GROWW_SPOT_1M_SYMBOLS.iter() {
-            let gap_sid = stable_index_security_id(groww_symbol);
+        for target in targets {
+            let gap_sid = target.security_id;
+            let gap_symbol = target.symbol;
             let lost: Vec<i64> = staged
                 .iter()
                 .filter(|(sid, _)| *sid == gap_sid)
@@ -2084,6 +2447,24 @@ async fn run_post_session_sweep(
     audit_flush_best_effort(audit_writer);
     metrics::counter!("tv_groww_spot1m_sweep_backfilled_total").increment(swept);
     metrics::counter!("tv_groww_spot1m_sweep_still_missing_total").increment(still_missing);
+    if vix_not_served_verdict(targets, tracker) {
+        // Operator scope 2026-07-13 (§38.7): ZERO India VIX minutes
+        // persisted across the whole session (fires + sweep) while the
+        // core indices DID persist — the VIX-specific "not served" answer
+        // to the live-probe unknown. ONE coded warn per day, edge-latched
+        // by construction (the sweep fires once per session); the
+        // per-minute forensics + named-gap rows above already name every
+        // VIX minute. Delivery boundary: log-sink-only, per the SPOT1M
+        // codes' §3 contract in rest-1m-pipeline-error-codes.md.
+        metrics::counter!("tv_groww_spot1m_vix_not_served_total").increment(1);
+        warn!(
+            code = ErrorCode::Spot1m01FetchDegraded.code_str(),
+            stage = "vix_not_served",
+            feed = SPOT_1M_REST_FEED_GROWW,
+            "SPOT1M-01: India VIX not served by Groww historical-candles — \
+             named gap rows written; other-broker coverage unaffected"
+        );
+    }
     if still_missing > 0 || persist_failed || pre_boot_named > 0 {
         error!(
             code = ErrorCode::Spot1m01FetchDegraded.code_str(),
@@ -2241,6 +2622,210 @@ mod tests {
         assert_eq!(get("end_time"), "2026-07-14 00:00:00");
         assert_eq!(get("candle_interval"), "1minute");
         assert_eq!(q.len(), 6);
+    }
+
+    // ---- 2026-07-13: INDIA VIX — the runtime-resolved 4th spot target -------
+
+    /// A watch-file JSON fixture carrying the given entries array.
+    fn watch_json(date: &str, entries: &str) -> String {
+        format!(
+            r#"{{"trading_date_ist":"{date}","feed":"groww","count":1,
+                 "resolved_stocks":0,"indices":1,"entries":[{entries}]}}"#
+        )
+    }
+
+    /// A live-master-shaped VIX index entry (token `INDIAVIX`, display
+    /// name "India Vix" — the 2026-06-28 `REAL_GROWW_NSE_INDICES`
+    /// spellings) with the given groww_symbol + security_id.
+    fn vix_entry_json(groww_symbol: &str, security_id: i64) -> String {
+        format!(
+            r#"{{"exchange":"NSE","segment":"CASH","exchange_token":"INDIAVIX",
+                 "kind":"index_value","security_id":{security_id},
+                 "index_name":"{groww_symbol}","symbol_name":"India Vix"}}"#
+        )
+    }
+
+    #[test]
+    fn test_core_spot_targets_pin_the_three_core_indices() {
+        let targets = core_spot_targets();
+        assert_eq!(targets.len(), 3, "the CORE set stays exactly 3");
+        for (target, &(groww_symbol, symbol, exchange, segment)) in
+            targets.iter().zip(GROWW_SPOT_1M_SYMBOLS.iter())
+        {
+            assert_eq!(target.groww_symbol, groww_symbol);
+            assert_eq!(target.symbol, symbol);
+            assert_eq!(target.exchange, exchange);
+            assert_eq!(target.segment, segment);
+            assert_eq!(
+                target.security_id,
+                stable_index_security_id(groww_symbol),
+                "core ids reuse the canonical live-lane hash"
+            );
+            assert!(target.core, "const-table targets are all CORE");
+        }
+    }
+
+    /// FOUND arms: the live-master token spelling (`INDIAVIX`, via the
+    /// 2026-07-13 alias) resolves; so does a name-only match (token
+    /// unrecognizable, display name "India Vix"). The resolved target
+    /// carries the master's groww_symbol verbatim, the canonical id, and
+    /// `core = false` (never feeds the escalation edge).
+    #[test]
+    fn test_vix_target_resolves_via_token_alias_and_display_name() {
+        let sid = stable_index_security_id("NSE-INDIAVIX");
+        let doc = parse_watch_file(&watch_json(
+            "2026-07-13",
+            &vix_entry_json("NSE-INDIAVIX", sid),
+        ))
+        .expect("fixture parses");
+        let vix = vix_target_from_watch_doc(&doc, "2026-07-13").expect("VIX resolves");
+        assert_eq!(vix.groww_symbol, "NSE-INDIAVIX");
+        assert_eq!(vix.symbol, GROWW_SPOT_1M_VIX_SYMBOL);
+        assert_eq!(vix.exchange, "NSE");
+        assert_eq!(vix.segment, "CASH");
+        assert_eq!(vix.security_id, sid);
+        assert!(!vix.core, "VIX must never join the core escalation edge");
+
+        // Name-only key: an unrecognizable token still resolves through
+        // the display name (the index-coverage-audit key pair).
+        let name_only = format!(
+            r#"{{"exchange":"NSE","segment":"CASH","exchange_token":"IVX-UNKNOWN",
+                 "kind":"index_value","security_id":{sid},
+                 "index_name":"NSE-INDIAVIX","symbol_name":"India Vix"}}"#
+        );
+        let doc = parse_watch_file(&watch_json("2026-07-13", &name_only)).expect("parses");
+        let vix = vix_target_from_watch_doc(&doc, "2026-07-13").expect("name key resolves");
+        assert_eq!(vix.groww_symbol, "NSE-INDIAVIX");
+    }
+
+    /// FAIL-CLOSED arms — every anomaly refuses (`None`; the caller skips
+    /// VIX for the day with the coded warn): no VIX row at all, a stale
+    /// file (date mismatch), a missing `index_name`, an id that disagrees
+    /// with the canonical hash, and a non-index (`ltp`) kind.
+    #[test]
+    fn test_vix_target_from_watch_doc_fail_closed_arms() {
+        let sid = stable_index_security_id("NSE-INDIAVIX");
+
+        // Absent: only a NIFTY entry.
+        let nifty = format!(
+            r#"{{"exchange":"NSE","segment":"CASH","exchange_token":"NIFTY",
+                 "kind":"index_value","security_id":{}}}"#,
+            stable_index_security_id("NSE-NIFTY")
+        );
+        let doc = parse_watch_file(&watch_json("2026-07-13", &nifty)).expect("parses");
+        assert_eq!(vix_target_from_watch_doc(&doc, "2026-07-13"), None);
+
+        // Stale file: yesterday's date must refuse.
+        let doc = parse_watch_file(&watch_json(
+            "2026-07-12",
+            &vix_entry_json("NSE-INDIAVIX", sid),
+        ))
+        .expect("parses");
+        assert_eq!(vix_target_from_watch_doc(&doc, "2026-07-13"), None);
+
+        // Missing index_name: no groww_symbol to query with.
+        let no_name = format!(
+            r#"{{"exchange":"NSE","segment":"CASH","exchange_token":"INDIAVIX",
+                 "kind":"index_value","security_id":{sid},"symbol_name":"India Vix"}}"#
+        );
+        let doc = parse_watch_file(&watch_json("2026-07-13", &no_name)).expect("parses");
+        assert_eq!(vix_target_from_watch_doc(&doc, "2026-07-13"), None);
+
+        // Derivation drift: entry id disagrees with the canonical hash.
+        let doc = parse_watch_file(&watch_json(
+            "2026-07-13",
+            &vix_entry_json("NSE-INDIAVIX", sid + 1),
+        ))
+        .expect("parses");
+        assert_eq!(vix_target_from_watch_doc(&doc, "2026-07-13"), None);
+
+        // Wrong kind: an ltp (stock-class) entry never matches.
+        let ltp_kind = format!(
+            r#"{{"exchange":"NSE","segment":"CASH","exchange_token":"INDIAVIX",
+                 "kind":"ltp","security_id":{sid},
+                 "index_name":"NSE-INDIAVIX","symbol_name":"India Vix"}}"#
+        );
+        let doc = parse_watch_file(&watch_json("2026-07-13", &ltp_kind)).expect("parses");
+        assert_eq!(vix_target_from_watch_doc(&doc, "2026-07-13"), None);
+    }
+
+    /// Per-SID independence (operator scope 2026-07-13): the escalation
+    /// edge feeds ONLY from the 3 core indices. A VIX-only failure —
+    /// fetch, empty, or VIX row append — never yields a fully-failed
+    /// minute; all-core-failed does, even when VIX alone succeeded; a
+    /// shared flush failure does (core rows are lost too).
+    #[test]
+    fn test_minute_edge_tally_vix_failure_never_pages_core_failure_does() {
+        // All 3 core ok, VIX failed (no note_ok for VIX) → not fully failed.
+        let mut tally = MinuteEdgeTally::default();
+        for _ in 0..3 {
+            tally.note_ok(true);
+        }
+        assert!(!tally.fully_failed(), "VIX-only failure must not page");
+
+        // VIX append failure alone → still not fully failed.
+        tally.note_append_failure(false);
+        assert!(
+            !tally.fully_failed(),
+            "a VIX-only persist failure must not page"
+        );
+
+        // A CORE append failure flips it (M1: persist-gated).
+        tally.note_append_failure(true);
+        assert!(tally.fully_failed(), "a core persist failure must page");
+
+        // All core failed while VIX alone succeeded → fully failed.
+        let mut vix_only_ok = MinuteEdgeTally::default();
+        vix_only_ok.note_ok(false);
+        assert!(
+            vix_only_ok.fully_failed(),
+            "core-all-failed must page even when VIX succeeded"
+        );
+
+        // Shared flush failure → fully failed.
+        let mut flush_fail = MinuteEdgeTally::default();
+        for _ in 0..3 {
+            flush_fail.note_ok(true);
+        }
+        flush_fail.note_flush_failure();
+        assert!(flush_fail.fully_failed(), "a shared flush failure pages");
+    }
+
+    /// The daily "VIX not served" latch verdict: fires ONLY when a VIX
+    /// target exists, zero VIX minutes persisted, and at least one core
+    /// index persisted (VIX-specific emptiness — never on a leg-wide
+    /// outage, never without a resolved VIX, never once VIX persisted).
+    #[test]
+    fn test_vix_not_served_verdict_arms() {
+        let vix_sid = stable_index_security_id("NSE-INDIAVIX");
+        let mut targets = core_spot_targets();
+        let core_sid = targets[0].security_id;
+
+        // No VIX target resolved → never fires.
+        let mut tracker = PersistTracker::default();
+        tracker.commit(core_sid, 1);
+        assert!(!vix_not_served_verdict(&targets, &tracker));
+
+        targets.push(GrowwSpotTarget {
+            groww_symbol: "NSE-INDIAVIX".to_string(),
+            symbol: GROWW_SPOT_1M_VIX_SYMBOL,
+            exchange: "NSE".to_string(),
+            segment: "CASH".to_string(),
+            security_id: vix_sid,
+            core: false,
+        });
+
+        // Core persisted + zero VIX minutes → fires.
+        assert!(vix_not_served_verdict(&targets, &tracker));
+
+        // Leg-wide outage (nothing persisted anywhere) → does NOT fire
+        // (the escalation edge already paged that).
+        let empty = PersistTracker::default();
+        assert!(!vix_not_served_verdict(&targets, &empty));
+
+        // VIX persisted at least one minute → does NOT fire.
+        tracker.commit(vix_sid, 1);
+        assert!(!vix_not_served_verdict(&targets, &tracker));
     }
 
     // ---- timestamp dual parse (UNVERIFIED-LIVE wire format) ------------------
@@ -2650,8 +3235,10 @@ mod tests {
 
     // ---- symbol table sanity ---------------------------------------------------
 
-    /// The 3 symbols resolve to 3 DISTINCT canonical Groww index ids and
-    /// their exchanges/segments match the docs-grounded identity table.
+    /// The 3 CORE symbols resolve to 3 DISTINCT canonical Groww index ids
+    /// and their exchanges/segments match the docs-grounded identity
+    /// table. (2026-07-13 operator scope: the 4th target — INDIA VIX — is
+    /// runtime-resolved, so the CONST set deliberately stays 3 here.)
     #[test]
     fn test_groww_symbols_resolve_to_distinct_live_lane_ids() {
         let ids: Vec<i64> = GROWW_SPOT_1M_SYMBOLS
@@ -2661,7 +3248,7 @@ mod tests {
         let mut deduped = ids.clone();
         deduped.sort_unstable();
         deduped.dedup();
-        assert_eq!(deduped.len(), 3, "ids must be distinct: {ids:?}");
+        assert_eq!(deduped.len(), 3, "core ids must be distinct: {ids:?}");
         for (gs, _, exchange, segment) in GROWW_SPOT_1M_SYMBOLS {
             assert_eq!(segment, "CASH", "{gs}: indices are CASH segment");
             assert!(
@@ -2800,9 +3387,13 @@ mod tests {
     /// doomed request, never a silent skip.
     #[test]
     fn test_build_auth_short_circuit_rows_names_remaining_symbols() {
-        let rows = build_auth_short_circuit_rows(&GROWW_SPOT_1M_SYMBOLS[1..], 900, 0);
-        assert_eq!(rows.len(), 2, "two symbols remain after the first");
-        for (row, (gs, symbol, _, _)) in rows.iter().zip(&GROWW_SPOT_1M_SYMBOLS[1..]) {
+        // 2026-07-13: the short-circuit slice is target-typed now, so a
+        // resolved INDIA VIX target is skipped + forensics-rowed exactly
+        // like the core symbols.
+        let targets = core_spot_targets();
+        let rows = build_auth_short_circuit_rows(&targets[1..], 900, 0);
+        assert_eq!(rows.len(), 2, "two targets remain after the first");
+        for (row, target) in rows.iter().zip(&targets[1..]) {
             assert_eq!(row.outcome, RestFetchOutcome::NoToken);
             assert_eq!(row.error_class, "auth");
             assert_eq!(row.final_http_status, 0, "no HTTP happened");
@@ -2810,8 +3401,8 @@ mod tests {
             assert_eq!(row.fetch_latency_ms, -1);
             assert_eq!(row.close_to_data_ms, -1);
             assert_eq!(row.ts_ist_nanos, 900);
-            assert_eq!(row.security_id, stable_index_security_id(gs));
-            assert_eq!(row.symbol, *symbol);
+            assert_eq!(row.security_id, target.security_id);
+            assert_eq!(row.symbol, target.symbol);
         }
         assert!(build_auth_short_circuit_rows(&[], 900, 0).is_empty());
     }
@@ -2922,18 +3513,37 @@ mod tests {
     #[test]
     fn test_record_skipped_boundaries_zero_midnight_and_sameday_arms() {
         let params = test_params();
+        let targets = core_spot_targets();
         let mut edge = FailureEdge::default();
         let mut aw = RestFetchAuditWriter::for_test();
         let boundary = 9 * 3600 + 17 * 60;
 
-        record_skipped_boundaries(&params, &mut edge, &mut aw, 0, boundary, today_ist());
+        record_skipped_boundaries(
+            &params,
+            &targets,
+            &mut edge,
+            &mut aw,
+            0,
+            boundary,
+            today_ist(),
+        );
         assert_eq!(aw.pending(), 0, "zero skipped is a no-op");
 
         let yesterday = today_ist().pred_opt().expect("valid date");
-        record_skipped_boundaries(&params, &mut edge, &mut aw, 2, boundary, yesterday);
+        record_skipped_boundaries(
+            &params, &targets, &mut edge, &mut aw, 2, boundary, yesterday,
+        );
         assert_eq!(aw.pending(), 0, "midnight-crossed wake writes no rows");
 
-        record_skipped_boundaries(&params, &mut edge, &mut aw, 3, boundary, today_ist());
+        record_skipped_boundaries(
+            &params,
+            &targets,
+            &mut edge,
+            &mut aw,
+            3,
+            boundary,
+            today_ist(),
+        );
         assert_eq!(
             aw.pending(),
             0,
@@ -2962,10 +3572,12 @@ mod tests {
         // so concurrently-added fields keep this fixture compiling.
         let mut cache = GrowwTokenCache::new();
         cache.last_read_ms = Some(epoch_millis_now());
+        let targets = core_spot_targets();
         for _ in 0..3 {
             fire_one_minute(
                 &params,
                 &client,
+                &targets,
                 &mut writer,
                 &mut aw,
                 &mut edge,
@@ -2980,13 +3592,33 @@ mod tests {
         assert_eq!(tracker.last_persisted(1), None);
     }
 
+    /// A core-only tally with `n` successful core fetches (test shorthand).
+    fn tally_core_ok(n: usize) -> MinuteEdgeTally {
+        let mut tally = MinuteEdgeTally::default();
+        for _ in 0..n {
+            tally.note_ok(true);
+        }
+        tally
+    }
+
     /// `record_minute_verdict` arms: clean minute; sub-edge degraded log;
     /// 3 consecutive fully-failed → Page; then a good minute → Recover.
+    /// 2026-07-13: the edge verdict comes from the CORE tally.
     #[test]
     fn test_record_minute_verdict_page_and_recover_arms() {
         let params = test_params();
         let mut edge = FailureEdge::default();
-        record_minute_verdict(&params, &mut edge, "9:15 AM", 3, 0, 0, false, None);
+        record_minute_verdict(
+            &params,
+            &mut edge,
+            "9:15 AM",
+            3,
+            0,
+            0,
+            false,
+            tally_core_ok(3),
+            None,
+        );
         record_minute_verdict(
             &params,
             &mut edge,
@@ -2995,12 +3627,33 @@ mod tests {
             1,
             0,
             false,
+            tally_core_ok(2),
             Some("one miss"),
         );
         for _ in 0..3 {
-            record_minute_verdict(&params, &mut edge, "9:17 AM", 0, 3, 0, false, Some("down"));
+            record_minute_verdict(
+                &params,
+                &mut edge,
+                "9:17 AM",
+                0,
+                3,
+                0,
+                false,
+                tally_core_ok(0),
+                Some("down"),
+            );
         }
-        record_minute_verdict(&params, &mut edge, "9:20 AM", 3, 0, 0, false, None);
+        record_minute_verdict(
+            &params,
+            &mut edge,
+            "9:20 AM",
+            3,
+            0,
+            0,
+            false,
+            tally_core_ok(3),
+            None,
+        );
     }
 
     /// Non-trading-day run: `run_groww_spot_1m` degrades its ensure-DDL

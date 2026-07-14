@@ -128,7 +128,7 @@ regression coverage).
   extraction + honest close_to_data_ms + edge semantics unchanged)
   - Files: crates/app/src/spot_1m_rest_boot.rs
   - Tests: test_parse_intraday_columnar_for_minutes_backfill_hit, test_backfill_minute_nanos_hit_and_not_needed, test_backfill_minute_nanos_first_session_minute_has_no_backfill, test_persist_tracker_commit_max_merge_and_double_persist_idempotent, test_backfill_never_flips_edge_accounting
-- [x] Post-session sweep (M1, review 2026-07-13) — one bounded ~15:31 IST
+- [x] Post-session sweep (M1, review 2026-07-13) — one bounded ~15:33:30 IST (moved off 15:31 by the 429-coordination follow-up below)
   fire repairs every session minute still missing above the per-SID
   watermark (gives the final 15:29 candle its repair path; also closes the
   L2/L4 gaps: ≥2-fire-old absences and flush-failed backfill rows)
@@ -138,13 +138,44 @@ regression coverage).
   - Files: config/base.toml, .claude/rules/project/no-rest-except-live-feed-2026-06-27.md, .claude/rules/project/rest-1m-pipeline-error-codes.md
   - Tests: existing test_wait_until_chain_fire_signal_wakes_early_and_fallback_bounds (fallback arms a–e) + option_chain_1m_wiring_guard (send_replace pin)
 
+### Follow-up scope appended 2026-07-13 per coordinator directive — 429 coordination
+
+Same-day live evidence: Dhan `/v2/charts/intraday` rate-limited BOTH
+consumers — the 15:31 bulk cross-verify lost 91/776 fetches to HTTP 429 at
+15:31–15:33 (compared=0, a BLIND day), and the new post-session sweep's 3
+requests would have landed inside that same burst window. Three bounded,
+cold-path follow-ups (honestly appended to THIS approved plan instead of a
+new plan file — the active-plan count is at the design-first-wall cap):
+
+- [x] Sweep timing: post-session sweep fire moved ~15:31:00 → ~15:33:30 IST
+  (clears the observed 15:31–15:33 cross-verify burst; const-asserted
+  ≥ trigger + 150 s and < the 16:30 IST box stop)
+  - Files: crates/app/src/spot_1m_rest_boot.rs, crates/app/src/cross_verify_1m_boot.rs (trigger const pub(crate)), .claude/rules/project/rest-1m-pipeline-error-codes.md, .claude/rules/project/no-rest-except-live-feed-2026-06-27.md
+  - Tests: test_sweep_fire_instant_clears_cross_verify_burst_window
+- [x] Spot ladder 429-awareness: deterministic per-SID (slot-based) re-poll
+  jitter (0/150/300 ms — no randomness) + bounded +2 s extra backoff before
+  the next rung after an HTTP 429 (same rung count; counted via the existing
+  tv_spot1m_rate_limited_total); const-asserts extended so the worst-case
+  jittered all-429 schedule (19.3 s) still fits the 20 s per-SID budget
+  - Files: crates/common/src/constants.rs, crates/app/src/spot_1m_rest_boot.rs
+  - Tests: test_ladder_jitter_ms_bounds_and_decorrelation, test_ladder_sleep_ms_jitter_and_429_backoff_composition, test_ladder_worst_case_429_schedule_stays_inside_sid_budget, test_spot_1m_rest_constants_pinned (extended)
+- [x] Cross-verify bounded second pass: typed 429 fetch failure
+  (IntradayFetchFailure from the REAL StatusCode), first-pass 429s deferred
+  into a cohort, ONE bounded retry pass after a 45 s cool-down paced at
+  ≤3/sec (below the Data-API 5/sec budget), successes folded into the
+  comparison BEFORE the report; anything still failing rides the unchanged
+  honest BLIND/DEGRADED classification (tv_cross_verify_1m_retry_429_total
+  {outcome=recovered|still_failed})
+  - Files: crates/app/src/cross_verify_1m_boot.rs, .claude/rules/project/cross-verify-1m-error-codes.md
+  - Tests: test_collect_429_cohort_selects_only_rate_limited_in_order, test_retry_pace_gap_ms_stays_inside_data_api_budget, test_second_pass_duration_bound_is_linear_and_bounded
+
 ## Scenarios
 
 | # | Scenario | Expected |
 |---|----------|----------|
 | 1 | Minute M candle available at fire M+60 | Found via day window, persisted, ok=3, histogram sampled |
 | 2 | Minute M sealed late (> 6.3 s) | M's fire empty (honest failure); M repaired by fire M+120's backfill with real delay stamp |
-| 2b | 15:29 sealed late (no next fire) | Repaired by the ~15:31 post-session sweep with real delay stamp |
+| 2b | 15:29 sealed late (no next fire) | Repaired by the ~15:33:30 post-session sweep with real delay stamp |
 | 3 | Flush failure mid-fire | Watermark not advanced; SPOT1M-02; next fire re-backfills |
 | 4 | Chain leg with spot leg hung | 2.5 s fallback timer fires the chain (tested arms a–e) |
 | 5 | Chain entitlement regresses | CHAIN-01/02 loud; rollback = config flip |

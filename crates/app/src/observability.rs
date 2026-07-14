@@ -231,6 +231,31 @@ const API_MS_HISTOGRAM_BUCKETS: &[f64] = &[
     60_000.0, // 60 s
 ];
 
+/// Bucket boundaries (upper bounds in milliseconds) for the spot-1m vendor
+/// SERVING-LAG histogram `tv_spot1m_serving_lag_ms` (2026-07-14
+/// serving-delay diagnostics: on every `empty_stale` per-minute fetch —
+/// candles present but none at the target minute — the fetcher records
+/// `target minute open − max(candle minute open)`). Registered via
+/// `Matcher::Full` so it overrides the generic `_ms` suffix buckets:
+/// serving lag is a minutes-to-hours-scale signal, and the generic 60 s
+/// `_ms` cap would collapse every meaningful sample into `+Inf`.
+///
+/// Range: 1 s → 6 h, roughly log-spaced (a whole-session-behind vendor
+/// still lands in a real bucket).
+const SPOT1M_SERVING_LAG_MS_BUCKETS: &[f64] = &[
+    1_000.0,      // 1 s
+    5_000.0,      // 5 s
+    15_000.0,     // 15 s
+    30_000.0,     // 30 s
+    60_000.0,     // 1 min
+    120_000.0,    // 2 min
+    300_000.0,    // 5 min
+    600_000.0,    // 10 min
+    1_800_000.0,  // 30 min
+    3_600_000.0,  // 1 h
+    21_600_000.0, // 6 h
+];
+
 /// Initializes the Prometheus metrics exporter.
 ///
 /// Starts an HTTP server on `0.0.0.0:{metrics_port}` that serves `/metrics`
@@ -266,6 +291,15 @@ pub fn init_metrics(config: &ObservabilityConfig) -> Result<()> {
         .context("failed to set histogram buckets for _duration_ns metrics")?
         .set_buckets_for_metric(Matcher::Suffix("_ms".to_string()), API_MS_HISTOGRAM_BUCKETS)
         .context("failed to set histogram buckets for _ms metrics")?
+        // Serving-lag override: `Matcher::Full` sorts BEFORE `Matcher::Suffix`
+        // in the exporter's override resolution (variant order on the derived
+        // `Ord`), so this metric gets the minutes-to-hours buckets instead of
+        // the generic 60 s-capped `_ms` set regardless of registration order.
+        .set_buckets_for_metric(
+            Matcher::Full("tv_spot1m_serving_lag_ms".to_string()),
+            SPOT1M_SERVING_LAG_MS_BUCKETS,
+        )
+        .context("failed to set histogram buckets for tv_spot1m_serving_lag_ms")?
         .install()
         .context("failed to install Prometheus metrics exporter")?;
 
@@ -608,6 +642,41 @@ pub fn sweep_errors_jsonl_retention(
     Ok(deleted)
 }
 
+/// Size cap for the single-file WARN+ append log
+/// (`data/logs/machine/errors.log`) — 512 MiB (2026-07-13 disk-retention
+/// hardening).
+///
+/// That file is deliberately skipped by every retention sweeper (the
+/// `*.log`-name guard in [`sweep_app_log_retention`] protects the human
+/// daily log), so before this cap it was the one unbounded single file in
+/// the log family — 100s of MB across degraded days (429 storms, tick-gap
+/// warns). Truncating it loses nothing uniquely: the same WARN+ lines also
+/// exist in the hourly machine app logs (`app.YYYY-MM-DD-HH`, 168 h
+/// retention) and — for ERROR — in `errors.jsonl.*` (48 h retention).
+pub const ERRORS_LOG_MAX_BYTES: u64 = 512 * 1024 * 1024;
+
+/// Truncates `path` to 0 bytes when it exceeds `max_bytes`; returns the
+/// pre-truncation size when a truncation happened, `Ok(None)` otherwise
+/// (including a missing file — never creates one). Safe against the live
+/// tracing writer: the file is opened `O_APPEND`, so every subsequent write
+/// repositions at the (new) EOF — no sparse hole, no torn offset. Hosted by
+/// the hourly errors.jsonl retention sweeper task in `main.rs` (no new
+/// task). Canonical path names are untouched — the caller passes
+/// `boot_helpers::ERROR_LOG_FILE_PATH`.
+pub fn cap_errors_log_size(path: &std::path::Path, max_bytes: u64) -> std::io::Result<Option<u64>> {
+    let size = match std::fs::metadata(path) {
+        Ok(meta) => meta.len(),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err),
+    };
+    if size <= max_bytes {
+        return Ok(None);
+    }
+    let file = std::fs::OpenOptions::new().write(true).open(path)?;
+    file.set_len(0)?;
+    Ok(Some(size))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -633,6 +702,10 @@ mod tests {
         for (name, buckets) in [
             ("TICK_NS_HISTOGRAM_BUCKETS", TICK_NS_HISTOGRAM_BUCKETS),
             ("API_MS_HISTOGRAM_BUCKETS", API_MS_HISTOGRAM_BUCKETS),
+            (
+                "SPOT1M_SERVING_LAG_MS_BUCKETS",
+                SPOT1M_SERVING_LAG_MS_BUCKETS,
+            ),
         ] {
             assert!(!buckets.is_empty(), "{name} must not be empty");
             for window in buckets.windows(2) {
@@ -1452,5 +1525,62 @@ mod tests {
         let _ = std::fs::remove_dir_all(&nonexistent);
         let deleted = sweep_category_log_retention(&nonexistent, "movers", 24).unwrap();
         assert_eq!(deleted, 0);
+    }
+
+    // ── errors.log size cap (2026-07-13 disk-retention hardening) ──────────
+
+    fn cap_tmp_file(name: &str, bytes: usize) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let path = std::env::temp_dir().join(format!("tv-errcap-{name}-{nanos}.log"));
+        std::fs::write(&path, vec![b'x'; bytes]).unwrap();
+        path
+    }
+
+    #[test]
+    fn test_cap_errors_log_under_limit_untouched() {
+        let path = cap_tmp_file("under", 100);
+        let outcome = cap_errors_log_size(&path, 200).unwrap();
+        assert_eq!(outcome, None, "under-limit file must be untouched");
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 100);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_cap_errors_log_at_limit_untouched() {
+        let path = cap_tmp_file("atlimit", 200);
+        let outcome = cap_errors_log_size(&path, 200).unwrap();
+        assert_eq!(outcome, None, "exactly-at-cap file must be untouched");
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 200);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_cap_errors_log_over_limit_truncated() {
+        let path = cap_tmp_file("over", 300);
+        let outcome = cap_errors_log_size(&path, 200).unwrap();
+        assert_eq!(outcome, Some(300), "must report the pre-truncation size");
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            0,
+            "over-cap file must be truncated to 0"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_cap_errors_log_missing_file_ok() {
+        let path = std::env::temp_dir().join("tv-errcap-definitely-missing.log");
+        let _ = std::fs::remove_file(&path);
+        let outcome = cap_errors_log_size(&path, 200).unwrap();
+        assert_eq!(outcome, None);
+        assert!(!path.exists(), "the cap must never CREATE the file");
+    }
+
+    #[test]
+    fn test_errors_log_cap_is_512_mib() {
+        assert_eq!(ERRORS_LOG_MAX_BYTES, 512 * 1024 * 1024);
     }
 }

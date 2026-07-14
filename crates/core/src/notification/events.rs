@@ -187,6 +187,16 @@ pub enum NotificationEvent {
     StartupComplete {
         /// "LIVE" or "OFFLINE".
         mode: &'static str,
+        /// Per-minute spot 1m REST leg armed at boot (config truth —
+        /// 2026-07-13 operator visibility rider: the boot Telegram must say
+        /// what the per-minute price capture will actually do today).
+        spot_1m_enabled: bool,
+        /// How many indices the spot leg pulls (4 since 2026-07-13).
+        spot_1m_indices: u32,
+        /// Per-minute option-chain REST leg armed at boot (config truth).
+        chain_1m_enabled: bool,
+        /// How many underlyings the chain leg pulls (3 — VIX is spot-only).
+        chain_1m_underlyings: u32,
     },
 
     /// Dhan authentication token acquired at boot.
@@ -468,6 +478,60 @@ pub enum NotificationEvent {
         detail: String,
     },
 
+    /// Daily timeframe-consistency verifier (operator directive 2026-07-13:
+    /// *"how will you guarantee that all our defined timeframes internally
+    /// are correct"*): the ONE 3:40 PM IST summary covering BOTH passes —
+    /// Dhan (today) and Groww (previous trading day). Severity AND wording
+    /// derive from `status_label` (the verifier's flush-adjusted verdict —
+    /// L6 fix, never re-derived from the counts, which can disagree on
+    /// edge days): `Info` only for `pass` / `no_data`; everything else is
+    /// `High`. A `buckets_compared == 0` run with data expected must NEVER
+    /// read as PASS (audit Rule 11 — the BLIND wording).
+    TfConsistencySummary {
+        /// The Dhan trading day verified, `YYYY-MM-DD` IST.
+        dhan_date_ist: String,
+        /// The Groww trading day verified (previous trading day), IST.
+        groww_date_ist: String,
+        /// Instruments examined across both passes.
+        instruments: u64,
+        /// Higher-timeframe candles present on BOTH sides and compared.
+        buckets_compared: u64,
+        /// Field-cells where a stored candle disagrees with its recompute.
+        mismatches: u64,
+        /// Windows with 1-minute data but NO stored higher-TF candle.
+        missing_tf_rows: u64,
+        /// Stored higher-TF candles with ZERO 1-minute rows behind them.
+        no_coverage: u64,
+        /// Stored candles whose timestamp is off the 9:15 AM grid.
+        off_grid: u64,
+        /// Duplicate rows sharing one storage key.
+        duplicates: u64,
+        /// Groww end-of-day buckets that are never sealed on the
+        /// production schedule (the system stops before midnight) — not
+        /// verified BY DESIGN, never a page (H1 carve-out).
+        tail_unsealed: u64,
+        /// True when any query/flush/budget leg degraded — the run cannot
+        /// vouch for the full universe.
+        degraded: bool,
+        /// True when findings exceeded the stored-detail cap (counts stay
+        /// exact; only the per-row detail was truncated).
+        truncated: bool,
+        /// Stable run verdict: `pass` / `mismatch` / `degraded` / `blind`
+        /// / `no_data`.
+        status_label: String,
+        /// Up to 10 plain-English worst offenders.
+        top_detail: Vec<String>,
+    },
+
+    /// The daily timeframe-consistency TASK died (panicked/failed) before
+    /// producing its summary. High so the absence of the daily verdict is
+    /// impossible to miss. NOT fired on graceful shutdown/cancellation
+    /// (the 16:30 IST auto-stop is a normal teardown, not an abort).
+    TfConsistencyAborted {
+        /// Plain-English description of how the task died.
+        detail: String,
+    },
+
     /// Per-minute spot 1m REST pipeline (operator grant 2026-07-12): the
     /// per-minute pull of the just-closed minute's official index candle
     /// has fully failed (no index succeeded) for several minutes in a row.
@@ -510,6 +574,31 @@ pub enum NotificationEvent {
         minute_ist: String,
         /// How many minutes had fully failed during the episode.
         failed_minutes: u32,
+    },
+
+    /// Per-SID persistent-empty detector (operator scope addition
+    /// 2026-07-13, relayed via the coordinator session — the INDIA VIX
+    /// live-probe companion): ONE index accumulated N consecutive
+    /// empty/failed minutes in the per-minute spot pull WHILE the other
+    /// indices succeeded in those same minutes — the vendor is not serving
+    /// THIS index, not a general outage. Fires ONCE per SID per episode
+    /// (edge-latched, Rule 4); re-armed only by that SID's own recovery.
+    /// Severity::High.
+    Spot1mSidNotServed {
+        /// The affected index (e.g. "INDIA VIX").
+        symbol: String,
+        /// How many counted minutes in a row this index went unserved.
+        consecutive_minutes: u32,
+    },
+
+    /// A previously-not-served index is being served again (falling edge —
+    /// one Info ping; the missing minutes stay absent until re-pulled,
+    /// never fabricated).
+    Spot1mSidServedRecovered {
+        /// The recovered index (e.g. "INDIA VIX").
+        symbol: String,
+        /// How many counted minutes the index went unserved.
+        not_served_minutes: u32,
     },
 
     /// Groww per-minute option-chain REST leg (operator grant 2026-07-13,
@@ -556,6 +645,40 @@ pub enum NotificationEvent {
         ok: bool,
         /// Plain-English measured detail (already secret-redacted +
         /// bounded at the emit site).
+        detail: String,
+    },
+
+    /// Groww per-minute PER-CONTRACT candle REST leg (operator grant
+    /// 2026-07-13, PR-4 of the Groww per-minute REST plan — the fill-model
+    /// leg): the per-minute contract candle pull has fully failed for
+    /// several minutes in a row (edge-triggered ONCE per episode, Rule 4;
+    /// re-armed only after a successful minute). Severity::High.
+    GrowwContract1mFetchDegraded {
+        /// How many minutes in a row have fully failed.
+        consecutive_failed_minutes: u32,
+        /// The most recent failed minute, IST 12-hour (e.g. "10:42 AM").
+        minute_ist: String,
+    },
+
+    /// The Groww per-minute contract candle pull RECOVERED after a failing
+    /// episode (falling edge — one Info ping; the missing minutes stay
+    /// absent until re-pulled, never fabricated).
+    GrowwContract1mFetchRecovered {
+        /// The minute that succeeded, IST 12-hour (e.g. "10:45 AM").
+        minute_ist: String,
+        /// How many minutes had fully failed during the episode.
+        failed_minutes: u32,
+    },
+
+    /// The Groww contract leg could not build today's contract book for
+    /// one or more underlyings from the daily instruments list (list
+    /// download failed after bounded tries, or the list carried no usable
+    /// option contracts at the current expiry) — those underlyings'
+    /// per-contract recording stays OFF for the day (contract identities
+    /// are never guessed). One HIGH page per day.
+    GrowwContract1mBookUnresolved {
+        /// Plain-English detail naming the affected underlyings / cause
+        /// (already secret-redacted + bounded at the emit site).
         detail: String,
     },
 
@@ -649,6 +772,16 @@ pub enum NotificationEvent {
         dhan_feed_off: bool,
         /// `true` when Groww was switched OFF for the day (round 4).
         groww_feed_off: bool,
+        /// Official minute-candle pull digest lines (Groww REST plan PR-5,
+        /// operator Quote 2 2026-07-13): one plain-English line per
+        /// feed/pull-family answering "within how many seconds precisely"
+        /// with MEASURED numbers. Empty = the digest is not wired for this
+        /// card (older callers / tests) — the section is simply omitted.
+        rest_legs: Vec<RestLegScoreLine>,
+        /// `true` when the day's per-pull records could not be read while
+        /// building this card — the candle-pull lines may under-count or
+        /// read "not measured yet" (honest cause footnote, Rule 11).
+        rest_legs_read_failed: bool,
     },
 
     /// The daily dual-feed scorecard TASK died (panicked / errored) before
@@ -1381,6 +1514,48 @@ pub struct FeedScoreLine {
     pub streaming_minutes: i64,
 }
 
+/// One official-minute-candle pull digest line on the daily scorecard
+/// (Groww REST plan PR-5, operator Quote 2 2026-07-13: *"always clearly
+/// note within a second — or within how many seconds precisely — we are
+/// fetching this live real OHLCV, along with the option chain API"*).
+///
+/// `-1` on any field means "not measured / not recorded" and renders
+/// honestly (never a fabricated zero — audit Rule 11). Every number is
+/// MEASURED from the day's per-pull records — the line never asserts a
+/// freshness it did not observe.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RestLegScoreLine {
+    /// Feed display name ("Dhan" / "Groww").
+    pub feed: String,
+    /// Pull-family display name ("spot candles" / "option chain" /
+    /// "option contracts") — already plain English, never a wire slug.
+    pub leg: String,
+    /// Pulls that retrieved their target minute; `-1` = counts not
+    /// recorded for this feed/family yet.
+    pub ok_fetches: i64,
+    /// Pulls that ended without the target minute; `-1` = not recorded.
+    pub failed_fetches: i64,
+    /// Minutes that NEVER got repaired (post-close sweep included);
+    /// `-1` = not recorded.
+    pub named_gaps: i64,
+    /// How many rate-limit rejections the day's pulls hit; `-1` unknown.
+    pub rate_limited_hits: i64,
+    /// Pulls repaired LATE (retrieved ≥60s after the minute closed — a
+    /// later pull's catch-up, not the prompt fetch); `-1` unknown.
+    pub late_recovered: i64,
+    /// Prompt-pull minute-close → data delay, median ms; `-1` = not
+    /// measured.
+    pub close_p50_ms: i64,
+    /// Prompt-pull worst-1% delay ms; `-1` = not measured.
+    pub close_p99_ms: i64,
+    /// Prompt-pull slowest delay ms; `-1` = not measured.
+    pub close_max_ms: i64,
+    /// How many prompt pulls the delay distribution is built from;
+    /// `-1` = no delay source at all, `0` = measured zero (every pull
+    /// failed).
+    pub close_samples: i64,
+}
+
 /// The Dhan exchange-clock quantization floor in milliseconds — Dhan LTT
 /// carries WHOLE IST seconds, so its measured lag has a uniform [0,1)s
 /// inflation Groww's millisecond clock does not. The verdict's delay rung
@@ -1503,6 +1678,64 @@ fn render_ms(ms: i64) -> String {
         return format!("{:.1} s", ms as f64 / 1000.0);
     }
     format!("{ms} ms")
+}
+
+/// Renders one official-minute-candle pull digest line (Groww REST plan
+/// PR-5, operator Quote 2). Every number is measured; `-1` sentinels
+/// render "not measured yet" / "(pull counts not recorded yet)" — never a
+/// fabricated zero (audit Rule 11). Plain-English, no wire slugs.
+fn rest_leg_line(l: &RestLegScoreLine) -> String {
+    let label = format!("{} {}", l.feed, l.leg);
+    // Nothing measured for this feed/family at all → one honest phrase.
+    if l.ok_fetches < 0 && l.close_samples < 0 {
+        return format!("{label}: not measured yet");
+    }
+    let mut parts: Vec<String> = Vec::new();
+    if l.ok_fetches >= 0 {
+        parts.push(format!(
+            "{} pulls OK, {} failed",
+            render_count(l.ok_fetches),
+            render_count(l.failed_fetches)
+        ));
+    }
+    if l.close_p50_ms >= 0 {
+        let mut freshness = format!(
+            "typical {} / worst 1% {} / slowest {} after close",
+            render_ms(l.close_p50_ms),
+            render_ms(l.close_p99_ms),
+            render_ms(l.close_max_ms)
+        );
+        if l.ok_fetches < 0 {
+            // Latency measured from the stored candles themselves while
+            // this feed's per-pull records are not written yet — say so.
+            freshness.push_str(" (pull counts not recorded yet)");
+        }
+        parts.push(freshness);
+    } else if l.close_samples == 0 && l.ok_fetches == 0 {
+        parts.push("freshness not measurable (no successful pull)".to_string());
+    } else {
+        parts.push("freshness not measured yet".to_string());
+    }
+    let mut line = format!("{label}: {}", parts.join(" — "));
+    if l.late_recovered > 0 {
+        line.push_str(&format!(
+            "; {} recovered late",
+            render_count(l.late_recovered)
+        ));
+    }
+    if l.rate_limited_hits > 0 {
+        line.push_str(&format!(
+            "; {} rate-limit hits",
+            render_count(l.rate_limited_hits)
+        ));
+    }
+    if l.named_gaps > 0 {
+        line.push_str(&format!(
+            "; {} never recovered \u{26a0}\u{fe0f}",
+            render_count(l.named_gaps)
+        ));
+    }
+    line
 }
 
 /// Renders a `-1`-sentinel count: honest "?" instead of a fabricated zero.
@@ -1784,7 +2017,13 @@ impl NotificationEvent {
     /// Callers outside this impl use [`Self::to_message`].
     fn message_body(&self) -> String {
         match self {
-            Self::StartupComplete { mode } => {
+            Self::StartupComplete {
+                mode,
+                spot_1m_enabled,
+                spot_1m_indices,
+                chain_1m_enabled,
+                chain_1m_underlyings,
+            } => {
                 // SECURITY: Do not expose internal service ports in Telegram.
                 // Dashboards line trimmed in #O1/#O2/#O3/#O4 — Grafana,
                 // Prometheus, Alertmanager, Valkey all removed in the
@@ -1795,8 +2034,35 @@ impl NotificationEvent {
                 // conscious operator-approved override of the "no version
                 // numbers in body" Telegram commandment (B9 directive
                 // 2026-07-03) — it answers "WHICH code booted?" at a glance.
+                // 2026-07-13 operator visibility rider: say what the
+                // per-minute price capture will ACTUALLY do today (a
+                // midnight boot is silent until 9:16 AM and the operator
+                // asked "what happened to it?"). Truthful per-leg wording —
+                // a switched-off leg says so.
+                let capture_line = match (spot_1m_enabled, chain_1m_enabled) {
+                    (true, true) => format!(
+                        "\u{2705} Per-minute price capture — armed (fires \
+                         9:16 AM to 3:30 PM IST on trading days): spot \
+                         candles for {spot_1m_indices} indices + option \
+                         chain for {chain_1m_underlyings} indices"
+                    ),
+                    (true, false) => format!(
+                        "\u{2705} Per-minute price capture — armed (fires \
+                         9:16 AM to 3:30 PM IST on trading days): spot \
+                         candles for {spot_1m_indices} indices; option \
+                         chain — switched off"
+                    ),
+                    (false, true) => format!(
+                        "\u{2705} Per-minute price capture — armed (fires \
+                         9:16 AM to 3:30 PM IST on trading days): option \
+                         chain for {chain_1m_underlyings} indices; spot \
+                         candles — switched off"
+                    ),
+                    (false, false) => "Per-minute price capture — switched off".to_string(),
+                };
                 format!(
-                    "<b>tickvault started</b>\nMode: {mode}\nBuild: {build}\n\n\
+                    "<b>tickvault started</b>\nMode: {mode}\nBuild: {build}\n\
+                     {capture_line}\n\n\
                      Dashboards: QuestDB Console (local) / CloudWatch (prod)",
                     build = tickvault_common::build_info::build_git_sha_short(),
                 )
@@ -2091,6 +2357,119 @@ impl NotificationEvent {
                      2. Restart the app to re-arm tomorrow's check."
                 )
             }
+            Self::TfConsistencySummary {
+                dhan_date_ist,
+                groww_date_ist,
+                instruments,
+                buckets_compared,
+                mismatches,
+                missing_tf_rows,
+                no_coverage,
+                off_grid,
+                duplicates,
+                tail_unsealed,
+                degraded,
+                truncated,
+                status_label,
+                top_detail,
+            } => {
+                // H1: name the Groww end-of-day buckets that are never
+                // sealed on the production schedule — honest coverage
+                // note, never a finding.
+                let tail_note = if *tail_unsealed > 0 {
+                    format!(
+                        "\n{tail_unsealed} Groww end-of-day buckets are not \
+                         sealed by design (the system stops before the \
+                         midnight seal) — not verified."
+                    )
+                } else {
+                    String::new()
+                };
+                // L6: wording derives from status_label — the verifier's
+                // flush-adjusted verdict — never re-derived from counts.
+                if status_label == "pass" {
+                    format!(
+                        "\u{2705} <b>Daily timeframe check @ 3:40 PM IST — PASS</b>\n\
+                         Dhan day: {dhan_date_ist} | Groww day: {groww_date_ist}\n\
+                         Instruments: {instruments} | Candles compared: {buckets_compared}\n\
+                         Every 2-minute-to-4-hour candle matches its 1-minute \
+                         building blocks exactly.{tail_note}"
+                    )
+                } else if status_label == "no_data" {
+                    format!(
+                        "\u{1f515} <b>Daily timeframe check @ 3:40 PM IST — nothing to check</b>\n\
+                         Dhan day: {dhan_date_ist} | Groww day: {groww_date_ist}\n\
+                         No candles were recorded for these days (feeds were \
+                         off). This is not a pass and not a failure — there \
+                         was simply nothing to verify."
+                    )
+                } else if *buckets_compared == 0 {
+                    // The BLIND day: rows may exist but NOTHING could be
+                    // compared. An empty finding list must never read as a
+                    // pass (audit Rule 11 — the false-OK class). The Groww
+                    // tail note rides along here too (refuter round 2) —
+                    // un-catch-up-able tail buckets stay unverified even on
+                    // a blind day.
+                    format!(
+                        "\u{1f198} <b>Daily timeframe check @ 3:40 PM IST — BLIND</b>\n\
+                         Dhan day: {dhan_date_ist} | Groww day: {groww_date_ist}\n\
+                         Checked NOTHING today — could NOT verify a single \
+                         candle. This is not a pass.{tail_note}\n\
+                         What to do RIGHT NOW:\n\
+                         1. Check the database is up and reachable.\n\
+                         2. Confirm the live feeds recorded candles today.\n\
+                         3. Re-run the check once the database is healthy."
+                    )
+                } else {
+                    let coverage_note = if *degraded {
+                        "\nCoverage was PARTIAL — some data could not be read, \
+                         so today's check cannot vouch for everything."
+                    } else {
+                        ""
+                    };
+                    let truncated_note = if *truncated {
+                        "\nCounts exceed the stored detail — only the first \
+                         findings were recorded row-by-row; the totals are exact."
+                    } else {
+                        ""
+                    };
+                    let mut detail_block = String::new();
+                    for line in top_detail.iter().take(10) {
+                        detail_block.push('\n');
+                        detail_block.push_str("• ");
+                        detail_block.push_str(&html_escape(line));
+                    }
+                    format!(
+                        "\u{26a0}\u{fe0f} <b>Daily timeframe check @ 3:40 PM IST — \
+                         NEEDS ATTENTION</b>\n\
+                         Dhan day: {dhan_date_ist} | Groww day: {groww_date_ist}\n\
+                         Instruments: {instruments} | Candles compared: {buckets_compared}\n\
+                         Value differences: {mismatches} | Missing candles: {missing_tf_rows}\n\
+                         Candles with no 1-minute data behind them: {no_coverage}\n\
+                         Off-grid timestamps: {off_grid} | Duplicates: {duplicates}\
+                         {tail_note}{coverage_note}{truncated_note}{detail_block}\n\
+                         What to do RIGHT NOW:\n\
+                         1. Review the worst offenders above — do they cluster \
+                         on one timeframe or one time of day?\n\
+                         2. If the app restarted mid-session today, restart \
+                         windows explain value differences.\n\
+                         3. Any off-grid timestamp means the candle clock \
+                         itself is wrong — escalate immediately."
+                    )
+                }
+            }
+            Self::TfConsistencyAborted { detail } => {
+                let detail = html_escape(detail);
+                format!(
+                    "\u{26a0}\u{fe0f} <b>Daily timeframe check did NOT run</b>\n\
+                     The 3:40 PM IST check that recomputes every higher-timeframe \
+                     candle from its 1-minute building blocks died before finishing.\n\
+                     Reason: {detail}\n\
+                     What to do RIGHT NOW:\n\
+                     1. Check the app is still running.\n\
+                     2. Restart the app to re-arm tomorrow's check."
+                )
+            }
             Self::Spot1mFetchDegraded {
                 consecutive_failed_minutes,
                 minute_ist,
@@ -2151,6 +2530,44 @@ impl NotificationEvent {
                      The Groww per-minute official candle pull is working \
                      again as of {minute_ist} IST, after {failed_minutes} \
                      failed minute(s). The minutes that failed stay blank in \
+                     the record until re-pulled — nothing is made up."
+                )
+            }
+            Self::Spot1mSidNotServed {
+                symbol,
+                consecutive_minutes,
+            } => {
+                format!(
+                    "\u{1f198} <b>Dhan is not returning 1-minute candles for \
+                     {symbol}</b>\n\
+                     For {consecutive_minutes} minutes in a row the official \
+                     1-minute candle for {symbol} was missing from the \
+                     per-minute pull while the other indices came through \
+                     fine — the other indices are unaffected, so this looks \
+                     like the broker not serving THIS index, not a general \
+                     outage.\n\
+                     Live streaming prices are NOT affected — only the \
+                     per-minute official record copy for {symbol} is \
+                     missing.\n\
+                     What to do RIGHT NOW:\n\
+                     1. Nothing urgent — the other indices keep recording \
+                     normally.\n\
+                     2. If this fires every day, ask the broker whether \
+                     1-minute candles exist for this index at all.\n\
+                     3. Missing minutes fill in safely if the broker starts \
+                     serving them."
+                )
+            }
+            Self::Spot1mSidServedRecovered {
+                symbol,
+                not_served_minutes,
+            } => {
+                format!(
+                    "\u{2705} <b>Dhan is serving 1-minute candles for \
+                     {symbol} again</b>\n\
+                     The per-minute official candle pull for {symbol} is \
+                     working again after {not_served_minutes} missed \
+                     minute(s). The minutes that were missed stay blank in \
                      the record until re-pulled — nothing is made up."
                 )
             }
@@ -2225,6 +2642,57 @@ impl NotificationEvent {
                          stays off. Tomorrow's start checks again."
                     )
                 }
+            }
+            Self::GrowwContract1mFetchDegraded {
+                consecutive_failed_minutes,
+                minute_ist,
+            } => {
+                format!(
+                    "\u{1f198} <b>Groww minute-by-minute option CONTRACT price \
+                     recording is FAILING</b>\n\
+                     The per-minute price pull for the selected NIFTY, \
+                     BANKNIFTY and SENSEX option contracts from the second \
+                     broker (Groww) has failed {consecutive_failed_minutes} \
+                     minutes in a row (latest failed minute: {minute_ist} \
+                     IST).\n\
+                     Live streaming prices are NOT affected — only Groww's \
+                     per-minute contract price record is missing.\n\
+                     What to do RIGHT NOW:\n\
+                     1. Check the Groww account's daily access is active \
+                     (the shared morning key).\n\
+                     2. If the Groww option chain recording ALSO failed, the \
+                     problem is upstream of this leg.\n\
+                     3. Missing minutes stay blank — nothing is made up."
+                )
+            }
+            Self::GrowwContract1mFetchRecovered {
+                minute_ist,
+                failed_minutes,
+            } => {
+                format!(
+                    "\u{2705} <b>Groww minute-by-minute option contract price \
+                     recording recovered</b>\n\
+                     The Groww per-minute contract price pull is working \
+                     again as of {minute_ist} IST, after {failed_minutes} \
+                     failed minute(s). The minutes that failed stay blank in \
+                     the record until re-pulled — nothing is made up."
+                )
+            }
+            Self::GrowwContract1mBookUnresolved { detail } => {
+                let detail = html_escape(detail);
+                format!(
+                    "\u{1f198} <b>Groww option contract recording could NOT \
+                     start for some indices today</b>\n\
+                     Today's contract list from Groww did not give usable \
+                     option contracts for the current expiry, so those \
+                     indices' per-minute contract recording stays OFF for \
+                     today (contract identities are never guessed).\n\
+                     Detail: {detail}\n\
+                     Live streaming prices are NOT affected. Tomorrow's start \
+                     retries automatically.\n\
+                     If this repeats for days, the contract list itself has a \
+                     problem — check with the broker."
+                )
             }
             Self::ChainFetchDegraded {
                 consecutive_failed_minutes,
@@ -2322,6 +2790,8 @@ impl NotificationEvent {
                 restart_partial,
                 dhan_feed_off,
                 groww_feed_off,
+                rest_legs,
+                rest_legs_read_failed,
             } => {
                 // Operator-charter §G wording: plain English, emoji status,
                 // IST 12-hour time, specific numbers, ONE decision (the
@@ -2353,7 +2823,36 @@ impl NotificationEvent {
                         render_count(f.blame_unclear)
                     )
                 };
+                // Groww REST plan PR-5 (operator Quote 2, 2026-07-13): the
+                // official minute-candle pull digest — one plain-English
+                // line per feed/pull-family with the MEASURED
+                // seconds-after-close numbers. An empty vec (older callers
+                // / tests) omits the section entirely; a `-1` sentinel
+                // line renders "not measured yet", never a fabricated
+                // freshness (Rule 11).
+                let rest_section = if rest_legs.is_empty() {
+                    String::new()
+                } else {
+                    let mut s = String::from(
+                        "Official minute candles — how fast after each \
+                         minute closed:\n",
+                    );
+                    for l in rest_legs {
+                        s.push_str("  ");
+                        s.push_str(&rest_leg_line(l));
+                        s.push('\n');
+                    }
+                    s
+                };
                 let mut footnotes = String::new();
+                if *rest_legs_read_failed {
+                    footnotes.push_str(
+                        "\n\u{26a0}\u{fe0f} Today's minute-candle pull records could \
+                         not be read while building this card — the candle-pull \
+                         lines may under-count or read \u{201c}not measured \
+                         yet\u{201d}.",
+                    );
+                }
                 if *early_run {
                     footnotes.push_str(
                         "\n\u{26a0}\u{fe0f} This card was produced early on operator \
@@ -2450,7 +2949,7 @@ impl NotificationEvent {
                      Stalls: Dhan {} | Groww {}\n\
                      App restarts detected: Dhan {} | Groww {}\n\
                      Streaming: Dhan {} | Groww {}\n\
-                     {}{}",
+                     {}{}{}",
                     render_count(dhan.ticks),
                     render_count(groww.ticks),
                     render_count(dhan.exclusive_minutes),
@@ -2469,6 +2968,7 @@ impl NotificationEvent {
                     render_count(groww.restarts),
                     streaming_line(dhan),
                     streaming_line(groww),
+                    rest_section,
                     scorecard_verdict(dhan, groww, *dhan_feed_off, *groww_feed_off),
                     footnotes
                 )
@@ -3188,14 +3688,21 @@ impl NotificationEvent {
             Self::EndOfDayDigest { .. } => "EndOfDayDigest",
             Self::CrossVerify1mSummary { .. } => "CrossVerify1mSummary",
             Self::CrossVerify1mAborted { .. } => "CrossVerify1mAborted",
+            Self::TfConsistencySummary { .. } => "TfConsistencySummary",
+            Self::TfConsistencyAborted { .. } => "TfConsistencyAborted",
             Self::Spot1mFetchDegraded { .. } => "Spot1mFetchDegraded",
             Self::Spot1mFetchRecovered { .. } => "Spot1mFetchRecovered",
             Self::GrowwSpot1mFetchDegraded { .. } => "GrowwSpot1mFetchDegraded",
             Self::GrowwSpot1mFetchRecovered { .. } => "GrowwSpot1mFetchRecovered",
+            Self::Spot1mSidNotServed { .. } => "Spot1mSidNotServed",
+            Self::Spot1mSidServedRecovered { .. } => "Spot1mSidServedRecovered",
             Self::GrowwChain1mFetchDegraded { .. } => "GrowwChain1mFetchDegraded",
             Self::GrowwChain1mFetchRecovered { .. } => "GrowwChain1mFetchRecovered",
             Self::GrowwChain1mExpiryUnresolved { .. } => "GrowwChain1mExpiryUnresolved",
             Self::GrowwChain1mProbeVerdict { .. } => "GrowwChain1mProbeVerdict",
+            Self::GrowwContract1mFetchDegraded { .. } => "GrowwContract1mFetchDegraded",
+            Self::GrowwContract1mFetchRecovered { .. } => "GrowwContract1mFetchRecovered",
+            Self::GrowwContract1mBookUnresolved { .. } => "GrowwContract1mBookUnresolved",
             Self::ChainFetchDegraded { .. } => "ChainFetchDegraded",
             Self::ChainFetchRecovered { .. } => "ChainFetchRecovered",
             Self::ChainEntitlementAbsent { .. } => "ChainEntitlementAbsent",
@@ -3360,7 +3867,7 @@ impl NotificationEvent {
             }
             Self::OrderUpdateConnected => Some(BootMilestone::OrderUpdateConnected),
             Self::OrderUpdateAuthenticated => Some(BootMilestone::OrderUpdateAuthenticated),
-            Self::StartupComplete { mode } => Some(BootMilestone::Complete { mode }),
+            Self::StartupComplete { mode, .. } => Some(BootMilestone::Complete { mode }),
             Self::FeedAuthOk { feed } if feed.eq_ignore_ascii_case("groww") => {
                 Some(BootMilestone::GrowwAuth)
             }
@@ -3475,6 +3982,23 @@ impl NotificationEvent {
                 }
             }
             Self::CrossVerify1mAborted { .. } => Severity::High,
+            // Daily timeframe-consistency verifier (2026-07-13): severity
+            // derives from status_label itself — the verifier's
+            // flush-adjusted verdict (L6 fix: a count-derived re-check can
+            // contradict the label on edge days, e.g. blind-without-
+            // degrade). Info ONLY for a real `pass` or a feed-off
+            // `no_data` day (which must never page High every day of a
+            // disabled-feed month); everything else — mismatch, degraded,
+            // blind — is High (audit Rule 11: an empty compare set never
+            // reads as pass).
+            Self::TfConsistencySummary { status_label, .. } => {
+                if status_label == "pass" || status_label == "no_data" {
+                    Severity::Info
+                } else {
+                    Severity::High
+                }
+            }
+            Self::TfConsistencyAborted { .. } => Severity::High,
             // Per-minute spot 1m REST pipeline (2026-07-12): the degraded
             // page is the edge-triggered escalation (3 consecutive fully-
             // failed minutes); the recovery is a positive Info ping.
@@ -3485,6 +4009,8 @@ impl NotificationEvent {
             // Info ping on the falling edge.
             Self::GrowwSpot1mFetchDegraded { .. } => Severity::High,
             Self::GrowwSpot1mFetchRecovered { .. } => Severity::Info,
+            Self::Spot1mSidNotServed { .. } => Severity::High,
+            Self::Spot1mSidServedRecovered { .. } => Severity::Info,
             Self::GrowwChain1mFetchDegraded { .. } => Severity::High,
             Self::GrowwChain1mFetchRecovered { .. } => Severity::Info,
             // One page per day when an underlying's chain recording could
@@ -3493,6 +4019,12 @@ impl NotificationEvent {
             // The probe is informational either way — nothing was expected
             // to record while the pipeline is switched off.
             Self::GrowwChain1mProbeVerdict { .. } => Severity::Info,
+            // The contract leg mirrors the chain edge semantics: one HIGH
+            // page per failing episode, one Info recovery, one HIGH per day
+            // for an unresolvable contract book.
+            Self::GrowwContract1mFetchDegraded { .. } => Severity::High,
+            Self::GrowwContract1mFetchRecovered { .. } => Severity::Info,
+            Self::GrowwContract1mBookUnresolved { .. } => Severity::High,
             Self::ChainFetchDegraded { .. } => Severity::High,
             Self::ChainFetchRecovered { .. } => Severity::Info,
             // HIGH only when the pipeline was ON and expected to record;
@@ -3664,6 +4196,11 @@ impl NotificationEvent {
             // that re-renders the body — Severity::Info would otherwise be
             // batched by the default routing.
             Self::CrossVerify1mSummary { .. } => DispatchPolicy::Immediate,
+            // Daily timeframe-consistency verifier (2026-07-13): the
+            // once-per-day post-market summary must arrive AT 3:40 PM IST,
+            // not coalesced into a batching window — the exact
+            // CrossVerify1mSummary rationale above.
+            Self::TfConsistencySummary { .. } => DispatchPolicy::Immediate,
             // Dual-feed scorecard (2026-07-10): the once-per-day 15:45 IST
             // digest must arrive AT 15:45 (post-close = off-hours, so the
             // default Info routing would coalesce it) — same rationale as
@@ -3842,7 +4379,13 @@ mod tests {
             },
             NotificationEvent::OrderUpdateConnected,
             NotificationEvent::OrderUpdateAuthenticated,
-            NotificationEvent::StartupComplete { mode: "sandbox" },
+            NotificationEvent::StartupComplete {
+                mode: "sandbox",
+                spot_1m_enabled: true,
+                spot_1m_indices: 4,
+                chain_1m_enabled: true,
+                chain_1m_underlyings: 3,
+            },
             NotificationEvent::FeedAuthOk {
                 feed: "Groww".to_string(),
             },
@@ -3975,7 +4518,14 @@ mod tests {
             Some(M::OrderUpdateAuthenticated)
         );
         assert_eq!(
-            NotificationEvent::StartupComplete { mode: "sandbox" }.boot_milestone(),
+            NotificationEvent::StartupComplete {
+                mode: "sandbox",
+                spot_1m_enabled: true,
+                spot_1m_indices: 4,
+                chain_1m_enabled: true,
+                chain_1m_underlyings: 3
+            }
+            .boot_milestone(),
             Some(BootMilestone::Complete { mode: "sandbox" })
         );
         assert_eq!(
@@ -4076,7 +4626,13 @@ mod tests {
         // (e.g. always returning "Event") cannot pass.
         let cases: Vec<(NotificationEvent, &'static str)> = vec![
             (
-                NotificationEvent::StartupComplete { mode: "LIVE" },
+                NotificationEvent::StartupComplete {
+                    mode: "LIVE",
+                    spot_1m_enabled: true,
+                    spot_1m_indices: 4,
+                    chain_1m_enabled: true,
+                    chain_1m_underlyings: 3,
+                },
                 "StartupComplete",
             ),
             (
@@ -4115,7 +4671,13 @@ mod tests {
 
     #[test]
     fn test_startup_complete_live_message() {
-        let event = NotificationEvent::StartupComplete { mode: "LIVE" };
+        let event = NotificationEvent::StartupComplete {
+            mode: "LIVE",
+            spot_1m_enabled: true,
+            spot_1m_indices: 4,
+            chain_1m_enabled: true,
+            chain_1m_underlyings: 3,
+        };
         let msg = event.to_message();
         assert!(msg.contains("LIVE"));
         assert!(msg.contains("started"));
@@ -4157,11 +4719,68 @@ mod tests {
         assert!(!msg.contains("Valkey"), "retired in #O4: {msg}");
     }
 
+    /// 2026-07-13 operator visibility rider: the boot Telegram states the
+    /// per-minute price capture's ACTUAL config state — on/on, on/off,
+    /// off/on and off/off arms all worded truthfully.
+    #[test]
+    fn test_startup_complete_per_minute_capture_wording_arms() {
+        let build = |spot: bool, chain: bool| NotificationEvent::StartupComplete {
+            mode: "LIVE",
+            spot_1m_enabled: spot,
+            spot_1m_indices: 4,
+            chain_1m_enabled: chain,
+            chain_1m_underlyings: 3,
+        };
+
+        let both = build(true, true).to_message();
+        assert!(
+            both.contains("Per-minute price capture — armed"),
+            "got: {both}"
+        );
+        assert!(both.contains("9:16 AM to 3:30 PM IST"), "got: {both}");
+        assert!(both.contains("spot candles for 4 indices"), "got: {both}");
+        assert!(both.contains("option chain for 3 indices"), "got: {both}");
+        assert!(!both.contains("switched off"), "got: {both}");
+
+        let chain_off = build(true, false).to_message();
+        assert!(
+            chain_off.contains("spot candles for 4 indices"),
+            "got: {chain_off}"
+        );
+        assert!(
+            chain_off.contains("option chain — switched off"),
+            "got: {chain_off}"
+        );
+
+        let spot_off = build(false, true).to_message();
+        assert!(
+            spot_off.contains("option chain for 3 indices"),
+            "got: {spot_off}"
+        );
+        assert!(
+            spot_off.contains("spot candles — switched off"),
+            "got: {spot_off}"
+        );
+
+        let both_off = build(false, false).to_message();
+        assert!(
+            both_off.contains("Per-minute price capture — switched off"),
+            "got: {both_off}"
+        );
+        assert!(!both_off.contains("armed"), "got: {both_off}");
+    }
+
     #[test]
     fn test_startup_complete_message_contains_build_sha() {
         // B9 deploy provenance: the boot Telegram must carry the short git
         // SHA of the running binary so the operator sees WHICH code booted.
-        let event = NotificationEvent::StartupComplete { mode: "LIVE" };
+        let event = NotificationEvent::StartupComplete {
+            mode: "LIVE",
+            spot_1m_enabled: true,
+            spot_1m_indices: 4,
+            chain_1m_enabled: true,
+            chain_1m_underlyings: 3,
+        };
         let msg = event.to_message();
         let expected = format!(
             "Build: {}",
@@ -4437,7 +5056,13 @@ mod tests {
 
     #[test]
     fn test_startup_complete_offline_message() {
-        let event = NotificationEvent::StartupComplete { mode: "OFFLINE" };
+        let event = NotificationEvent::StartupComplete {
+            mode: "OFFLINE",
+            spot_1m_enabled: true,
+            spot_1m_indices: 4,
+            chain_1m_enabled: true,
+            chain_1m_underlyings: 3,
+        };
         let msg = event.to_message();
         assert!(msg.contains("OFFLINE"));
         // Post-#O1/#O2/#O3/#O4: dashboard line names QuestDB + CloudWatch
@@ -4872,7 +5497,13 @@ mod tests {
 
     #[test]
     fn test_startup_complete_is_info() {
-        let event = NotificationEvent::StartupComplete { mode: "LIVE" };
+        let event = NotificationEvent::StartupComplete {
+            mode: "LIVE",
+            spot_1m_enabled: true,
+            spot_1m_indices: 4,
+            chain_1m_enabled: true,
+            chain_1m_underlyings: 3,
+        };
         assert_eq!(event.severity(), Severity::Info);
     }
 
@@ -5620,7 +6251,13 @@ mod tests {
     #[test]
     fn test_every_severity_variant_is_reachable() {
         // Verify each severity level is returned by at least one event variant
-        let info_event = NotificationEvent::StartupComplete { mode: "LIVE" };
+        let info_event = NotificationEvent::StartupComplete {
+            mode: "LIVE",
+            spot_1m_enabled: true,
+            spot_1m_indices: 4,
+            chain_1m_enabled: true,
+            chain_1m_underlyings: 3,
+        };
         assert_eq!(info_event.severity(), Severity::Info);
 
         let low_event = NotificationEvent::TokenRenewed;
@@ -6668,7 +7305,13 @@ mod tests {
         // Non-feed events are byte-identical to before — no badge, no "—"
         // prefix injected.
         let events = [
-            NotificationEvent::StartupComplete { mode: "sandbox" },
+            NotificationEvent::StartupComplete {
+                mode: "sandbox",
+                spot_1m_enabled: true,
+                spot_1m_indices: 4,
+                chain_1m_enabled: true,
+                chain_1m_underlyings: 3,
+            },
             NotificationEvent::QuestDbReconnected {
                 writer: "ticks".to_string(),
                 failed_checks_before_recovery: 3,
@@ -6979,9 +7622,87 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // Spot1mSidNotServed + Spot1mSidServedRecovered (operator scope addition
+    // 2026-07-13, relayed via the coordinator session — the INDIA VIX
+    // live-probe companion)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_spot_1m_sid_not_served_is_high_names_the_index_and_scopes_honestly() {
+        let event = NotificationEvent::Spot1mSidNotServed {
+            symbol: "INDIA VIX".to_string(),
+            consecutive_minutes: 10,
+        };
+        assert_eq!(event.topic(), "Spot1mSidNotServed");
+        assert_eq!(event.severity(), Severity::High);
+        let msg = event.to_message();
+        // The operator-mandated plain-English core wording.
+        assert!(
+            msg.contains("not returning 1-minute candles for INDIA VIX"),
+            "got: {msg}"
+        );
+        assert!(msg.contains("other indices are unaffected"), "got: {msg}");
+        assert!(msg.contains("10 minutes in a row"), "got: {msg}");
+        assert!(msg.contains("What to do RIGHT NOW"), "got: {msg}");
+        // Honest scope line: the live WS pipeline is untouched.
+        assert!(msg.contains("NOT affected"), "got: {msg}");
+    }
+
+    // -----------------------------------------------------------------------
     // GrowwChain1m* events (2026-07-13 — Groww per-minute option-chain
     // leg, PR-3 of the Groww REST plan)
     // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_groww_contract_1m_fetch_degraded_is_high_with_action_lines() {
+        let event = NotificationEvent::GrowwContract1mFetchDegraded {
+            consecutive_failed_minutes: 3,
+            minute_ist: "10:42 AM".to_string(),
+        };
+        assert_eq!(event.topic(), "GrowwContract1mFetchDegraded");
+        assert_eq!(event.severity(), Severity::High);
+        let msg = event.to_message();
+        assert!(msg.contains("Groww"), "got: {msg}");
+        assert!(msg.contains("FAILING"), "got: {msg}");
+        assert!(msg.contains("3 minutes in a row"), "got: {msg}");
+        // IST 12-hour timestamp (Telegram commandment 9).
+        assert!(msg.contains("10:42 AM IST"), "got: {msg}");
+        assert!(msg.contains("What to do RIGHT NOW"), "got: {msg}");
+        // Honest scope line: the live WS pipelines are untouched.
+        assert!(msg.contains("NOT affected"), "got: {msg}");
+    }
+
+    #[test]
+    fn test_groww_contract_1m_fetch_recovered_is_info_positive_ping() {
+        let event = NotificationEvent::GrowwContract1mFetchRecovered {
+            minute_ist: "10:45 AM".to_string(),
+            failed_minutes: 4,
+        };
+        assert_eq!(event.topic(), "GrowwContract1mFetchRecovered");
+        assert_eq!(event.severity(), Severity::Info);
+        let msg = event.to_message();
+        assert!(msg.contains("Groww"), "got: {msg}");
+        assert!(msg.contains("recovered"), "got: {msg}");
+        assert!(msg.contains("10:45 AM IST"), "got: {msg}");
+        assert!(msg.contains("4 failed"), "got: {msg}");
+        // No false-OK: recovery never claims the missing minutes came back.
+        assert!(msg.contains("nothing is made up"), "got: {msg}");
+    }
+
+    #[test]
+    fn test_groww_contract_1m_book_unresolved_is_high_and_escapes_detail() {
+        let event = NotificationEvent::GrowwContract1mBookUnresolved {
+            detail: "SENSEX: no usable contracts <script>".to_string(),
+        };
+        assert_eq!(event.topic(), "GrowwContract1mBookUnresolved");
+        assert_eq!(event.severity(), Severity::High);
+        let msg = event.to_message();
+        assert!(msg.contains("could NOT"), "got: {msg}");
+        assert!(msg.contains("never guessed"), "got: {msg}");
+        // Hostile detail is HTML-escaped, never raw.
+        assert!(!msg.contains("<script>"), "got: {msg}");
+        assert!(msg.contains("&lt;script&gt;"), "got: {msg}");
+    }
 
     #[test]
     fn test_groww_chain_1m_fetch_degraded_is_high_with_action_lines() {
@@ -7000,6 +7721,24 @@ mod tests {
         assert!(msg.contains("What to do RIGHT NOW"), "got: {msg}");
         // Honest scope line: the live WS pipelines are untouched.
         assert!(msg.contains("NOT affected"), "got: {msg}");
+    }
+
+    #[test]
+    fn test_spot_1m_sid_served_recovered_is_info_positive_ping() {
+        let event = NotificationEvent::Spot1mSidServedRecovered {
+            symbol: "INDIA VIX".to_string(),
+            not_served_minutes: 12,
+        };
+        assert_eq!(event.topic(), "Spot1mSidServedRecovered");
+        assert_eq!(event.severity(), Severity::Info);
+        let msg = event.to_message();
+        assert!(
+            msg.contains("serving 1-minute candles for INDIA VIX again"),
+            "got: {msg}"
+        );
+        assert!(msg.contains("12 missed"), "got: {msg}");
+        // No false-OK: recovery never claims the missing minutes came back.
+        assert!(msg.contains("nothing is made up"), "got: {msg}");
     }
 
     #[test]
@@ -7198,7 +7937,211 @@ mod tests {
             restart_partial: false,
             dhan_feed_off: false,
             groww_feed_off: false,
+            rest_legs: vec![],
+            rest_legs_read_failed: false,
         }
+    }
+
+    fn scorecard_with_rest(rest_legs: Vec<RestLegScoreLine>, read_failed: bool) -> String {
+        NotificationEvent::DualFeedDailyScorecard {
+            trading_date_ist: "2026-07-13".to_string(),
+            dhan: score_line("Dhan"),
+            groww: score_line("Groww"),
+            session_minutes: 375,
+            partial_coverage: false,
+            degraded: false,
+            early_run: false,
+            restart_partial: false,
+            dhan_feed_off: false,
+            groww_feed_off: false,
+            rest_legs,
+            rest_legs_read_failed: read_failed,
+        }
+        .to_message()
+    }
+
+    fn rest_line(feed: &str, leg: &str) -> RestLegScoreLine {
+        RestLegScoreLine {
+            feed: feed.to_string(),
+            leg: leg.to_string(),
+            ok_fetches: -1,
+            failed_fetches: -1,
+            named_gaps: -1,
+            rate_limited_hits: -1,
+            late_recovered: -1,
+            close_p50_ms: -1,
+            close_p99_ms: -1,
+            close_max_ms: -1,
+            close_samples: -1,
+        }
+    }
+
+    /// PR-5 (operator Quote 2): the measured digest line carries pull
+    /// counts + the seconds-after-close distribution + the extras, all in
+    /// plain English.
+    #[test]
+    fn test_rest_leg_digest_line_measured_full() {
+        let msg = scorecard_with_rest(
+            vec![RestLegScoreLine {
+                ok_fetches: 1_496,
+                failed_fetches: 4,
+                named_gaps: 1,
+                rate_limited_hits: 3,
+                late_recovered: 2,
+                close_p50_ms: 1_400,
+                close_p99_ms: 3_200,
+                close_max_ms: 6_200,
+                close_samples: 1_494,
+                ..rest_line("Groww", "spot candles")
+            }],
+            false,
+        );
+        assert!(
+            msg.contains("Official minute candles — how fast after each"),
+            "digest section header missing: {msg}"
+        );
+        assert!(
+            msg.contains(
+                "Groww spot candles: 1496 pulls OK, 4 failed — typical 1.4 s / \
+                 worst 1% 3.2 s / slowest 6.2 s after close; 2 recovered late; \
+                 3 rate-limit hits; 1 never recovered \u{26a0}\u{fe0f}"
+            ),
+            "measured digest line wrong: {msg}"
+        );
+    }
+
+    /// A latency-only line (the Dhan spot fallback: freshness measured
+    /// from the stored candles while per-pull records are not written yet)
+    /// says so — and never fabricates pull counts.
+    #[test]
+    fn test_rest_leg_digest_line_latency_only_and_placeholder() {
+        let msg = scorecard_with_rest(
+            vec![
+                RestLegScoreLine {
+                    close_p50_ms: 1_900,
+                    close_p99_ms: 5_000,
+                    close_max_ms: 61_000,
+                    close_samples: 1_480,
+                    late_recovered: 1,
+                    ..rest_line("Dhan", "spot candles")
+                },
+                rest_line("Dhan", "option chain"),
+            ],
+            false,
+        );
+        assert!(
+            msg.contains(
+                "Dhan spot candles: typical 1.9 s / worst 1% 5.0 s / slowest \
+                 61.0 s after close (pull counts not recorded yet); 1 recovered late"
+            ),
+            "latency-only digest line wrong: {msg}"
+        );
+        // The all-sentinel placeholder is the honest Quote-2 answer for a
+        // family with no measurement source yet — never a fabricated zero.
+        assert!(
+            msg.contains("Dhan option chain: not measured yet"),
+            "placeholder digest line wrong: {msg}"
+        );
+        // The -1 sentinels must never render numerically on a digest line
+        // (a bare `-1` substring check would trip on the ISO date).
+        for leaked in ["-1 pulls", "typical -1", "worst 1% -1", "slowest -1"] {
+            assert!(
+                !msg.contains(leaked),
+                "sentinels must never render numerically ({leaked:?}): {msg}"
+            );
+        }
+    }
+
+    /// An all-pulls-failed day renders a measured-zero, not a fabricated
+    /// freshness ("0 pulls OK" + "not measurable"); and the read-failed
+    /// flag carries its own honest footnote.
+    #[test]
+    fn test_rest_leg_digest_zero_ok_day_and_read_failed_footnote() {
+        let msg = scorecard_with_rest(
+            vec![RestLegScoreLine {
+                ok_fetches: 0,
+                failed_fetches: 375,
+                named_gaps: 375,
+                rate_limited_hits: 0,
+                late_recovered: 0,
+                close_p50_ms: -1,
+                close_p99_ms: -1,
+                close_max_ms: -1,
+                close_samples: 0,
+                ..rest_line("Groww", "option chain")
+            }],
+            true,
+        );
+        assert!(
+            msg.contains(
+                "Groww option chain: 0 pulls OK, 375 failed — freshness not \
+                 measurable (no successful pull); 375 never recovered \u{26a0}\u{fe0f}"
+            ),
+            "zero-ok digest line wrong: {msg}"
+        );
+        assert!(
+            msg.contains("minute-candle pull records could \n                         not be read")
+                || msg.contains("minute-candle pull records could not be read"),
+            "read-failed footnote missing: {msg}"
+        );
+    }
+
+    /// An EMPTY digest vec omits the section entirely (older callers /
+    /// pre-deploy cards) — no header, no stale claim.
+    #[test]
+    fn test_rest_leg_digest_empty_vec_omits_section() {
+        let msg = scorecard(score_line("Dhan"), score_line("Groww")).to_message();
+        assert!(
+            !msg.contains("Official minute candles"),
+            "empty rest_legs must omit the digest section: {msg}"
+        );
+    }
+
+    /// The digest lines obey the Telegram commandments: plain English, no
+    /// wire slugs, no library/infrastructure names, no file paths.
+    #[test]
+    fn test_rest_leg_digest_obeys_telegram_commandments() {
+        let msg = scorecard_with_rest(
+            vec![
+                RestLegScoreLine {
+                    ok_fetches: 1_120,
+                    failed_fetches: 5,
+                    named_gaps: 0,
+                    rate_limited_hits: 0,
+                    late_recovered: 0,
+                    close_p50_ms: 2_100,
+                    close_p99_ms: 4_000,
+                    close_max_ms: 9_000,
+                    close_samples: 1_120,
+                    ..rest_line("Groww", "option chain")
+                },
+                rest_line("Dhan", "option chain"),
+            ],
+            false,
+        );
+        for banned in [
+            "spot_1m",
+            "chain_1m",
+            "contract_1m",
+            "rest_fetch_audit",
+            "p50",
+            "p99",
+            ".rs",
+            "SQL",
+        ] {
+            assert!(
+                !msg.contains(banned),
+                "digest must not carry {banned:?}: {msg}"
+            );
+        }
+        assert!(
+            msg.contains("Groww option chain: 1120 pulls OK, 5 failed"),
+            "{msg}"
+        );
+        // Zero-valued extras stay OFF the line (one line = one answer).
+        assert!(!msg.contains("0 recovered late"), "{msg}");
+        assert!(!msg.contains("0 rate-limit hits"), "{msg}");
+        assert!(!msg.contains("0 never recovered"), "{msg}");
     }
 
     #[test]
@@ -7370,6 +8313,8 @@ mod tests {
             restart_partial: false,
             dhan_feed_off: false,
             groww_feed_off: false,
+            rest_legs: vec![],
+            rest_legs_read_failed: false,
         };
         let msg = ev.to_message();
         assert!(
@@ -7394,6 +8339,8 @@ mod tests {
             restart_partial: false,
             dhan_feed_off: false,
             groww_feed_off: false,
+            rest_legs: vec![],
+            rest_legs_read_failed: false,
         };
         let msg = ev.to_message();
         assert!(
@@ -7454,6 +8401,8 @@ mod tests {
             restart_partial: true,
             dhan_feed_off: false,
             groww_feed_off: false,
+            rest_legs: vec![],
+            rest_legs_read_failed: false,
         };
         let msg = ev.to_message();
         assert!(
@@ -7525,6 +8474,8 @@ mod tests {
             restart_partial: false,
             dhan_feed_off: false,
             groww_feed_off: true,
+            rest_legs: vec![],
+            rest_legs_read_failed: false,
         };
         let msg = ev.to_message();
         assert!(
@@ -7561,6 +8512,8 @@ mod tests {
             restart_partial: false,
             dhan_feed_off: true,
             groww_feed_off: true,
+            rest_legs: vec![],
+            rest_legs_read_failed: false,
         };
         let msg = ev.to_message();
         assert!(

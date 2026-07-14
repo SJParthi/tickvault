@@ -153,6 +153,20 @@ aws-lc-rs = "1.17.0"
 aws-config = { version = "1.8.18", default-features = false, features = ["behavior-version-latest", "default-https-client", "rt-tokio", "credentials-process", "sso"] }
 aws-sdk-sns = { version = "1.103.0", default-features = false, features = ["behavior-version-latest", "default-https-client", "rt-tokio"] }
 aws-sdk-ssm = { version = "1.112.0", default-features = false, features = ["behavior-version-latest", "default-https-client", "rt-tokio"] }
+# 2026-07-13 (QuestDB partition archive→verify→drop, disk-pressure remediation):
+# S3 PutObject/HeadObject for the verified partition archive to the
+# tv-<env>-cold bucket. Authorized as a workspace dep by the 2026-07-12
+# operator quote recorded in groww-second-feed-scope-2026-06-19.md §37
+# ("The new workspace dep `aws-sdk-s3` ... is authorized ... as the read
+# mechanism") — same SDK family + feature set as the sibling aws-sdk-* pins.
+aws-sdk-s3 = { version = "1.136.0", default-features = false, features = ["behavior-version-latest", "default-https-client", "rt-tokio"] }
+
+# ---- Section 11b: Compression (partition archive) ----
+# 2026-07-13: gzip encoder for the streamed QuestDB /exp CSV export before
+# S3 upload. NOT a new supply-chain root — flate2 1.1.9 was ALREADY resolved
+# in Cargo.lock (transitive via tower-http compression-gzip); this promotes
+# it to a direct pin — the aws-lc-rs promotion precedent above.
+flate2 = "1.1.9"
 
 # ---- Section 16: CLI ----
 clap = { version = "4.6.1", features = ["derive"] }
