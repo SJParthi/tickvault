@@ -2544,65 +2544,47 @@ rules:
       re-run per the runbook. Auto-restarting the app for a degraded
       forensic run would be worse than the miss.
 
-  # CADENCE-01 = a cadence broker lane degraded inside a cycle (fetch
-  # failures / 429-despite-gates / empty spots / fallback provenance /
-  # unknown moneyness / ladder exhausted). The scheduler self-heals by
-  # construction: the next minute boundary re-fires, the failure ladder
-  # walks the anchor earlier, and RateLimited is never blind-retried.
-  # Escalate so the operator reads the coalesced per-cycle stage list —
-  # a sustained rate_limited stage is a gate-bug / shared-budget signal
-  # worth human eyes, never an auto-fix.
-  - name: cadence-01-lane-degraded-escalate
-    match:
-      code: CADENCE-01
-    action: escalate
-    runbook_path: .claude/rules/project/cadence-error-codes.md
-    confidence: 1.0
-    cooldown_secs: 600
-    justification: >-
-      CADENCE-01 = cadence lane degraded this cycle (coalesced). The
-      ladder + next-boundary re-fire already self-heal; the operator
-      inspects the stage taxonomy per the runbook (rate_limited despite
-      the structural gates = shared-budget co-tenant or broker
-      tightening — a spacing constant must never be auto-touched).
+  # -----------------------------------------------------------------------
+  # 🔷 DHAN exit-order execution layer (Cluster B, 2026-07-14, WP1)
+  # -----------------------------------------------------------------------
 
-  # CADENCE-02 = a (lane, cycle-minute) decision honest-skipped (cutoff /
-  # both sources dead / all-Unknown moneyness). The skip IS the
-  # fail-closed action — no decision on missing/stale data; nothing to
-  # undo, nothing to restart. Escalate for visibility (Rule 11: a skip is
-  # never rendered OK); a RUN of skips points at the broker surface and
-  # the capture legs' own codes for the same window.
-  - name: cadence-02-decision-skipped-escalate
+  # EXIT-ORDER-01 = an exit engine call degraded (validation refusal on a
+  # dispatched command / Dhan API error on a super, forever, or sliced
+  # order / ENTRY_LEG cancel refused post-fill — the naked-position race
+  # U4, never exercised / slicing response anomaly). The layer ships
+  # default-off behind four locks and dry-run paper mode; the coded line
+  # carries the order/correlation ids. Never auto-fixed: re-issuing an
+  # order-side mutation blind is exactly the double-exposure class the
+  # idempotency machinery exists to prevent.
+  - name: exit-order-01-execution-degraded-escalate
     match:
-      code: CADENCE-02
+      code: EXIT-ORDER-01
     action: escalate
-    runbook_path: .claude/rules/project/cadence-error-codes.md
+    runbook_path: .claude/rules/project/dhan-exit-order-lockout-2026-07-14.md
     confidence: 1.0
     cooldown_secs: 600
     justification: >-
-      CADENCE-02 = cadence decision honest-skipped. The skip is the
-      fail-closed design outcome (exactly-once latch, never a late
-      decision); dry-run boots skip EVERY minute by design (the
-      DryRunLoggingExecutor returns Empty). Operator correlates a skip
-      run with CADENCE-01 stages + SPOT1M-01/CHAIN-02 per the runbook.
+      EXIT-ORDER-01 = exit engine call degraded. The refusal/degrade
+      already happened loudly with correlation ids in the coded line;
+      the operator inspects per the lockout runbook. Log-sink-only (the
+      2026-07-14 Dhan noise lock) — no pager entry; auto-triage must
+      never re-issue an order mutation.
 
-  # CADENCE-03 = scheduler machinery degraded (ladder shift / late wake /
-  # boundary skipped / skew clamped / runner respawn / nominal gate
-  # deferral). Every arm already self-corrected or self-reported; the
-  # supervised runner respawns itself (release panics abort the process —
-  # the TICK-FLUSH-01 honesty note). Escalate so trends (host pressure,
-  # respawn storms, the should-never gate_deferred_nominal) reach the
-  # operator; nothing here is auto-fixable.
-  - name: cadence-03-scheduler-degraded-escalate
+  # EXIT-VERIFY-01 = the MPP verify ladder exhausted with a degraded
+  # verdict: PendingAtLimit (MARKET auto-converted to LIMIT resting on the
+  # book past the deadline — orders.md rule 18, NEVER assumed filled),
+  # partial fill at budget (needs_reconciliation set — the remainder is
+  # never silently forgotten), or an Unknown unparsable status
+  # (fail-closed). The order stays tracked; reconcile owns the follow-up.
+  - name: exit-verify-01-degraded-escalate
     match:
-      code: CADENCE-03
+      code: EXIT-VERIFY-01
     action: escalate
-    runbook_path: .claude/rules/project/cadence-error-codes.md
+    runbook_path: .claude/rules/project/dhan-exit-order-lockout-2026-07-14.md
     confidence: 1.0
     cooldown_secs: 600
     justification: >-
-      CADENCE-03 = cadence scheduler machinery degraded. late_wake /
-      boundary_skipped trends correlate with host pressure (PROC-01,
-      RESOURCE-01..03); a respawn storm is a real bug needing the panic
-      backtrace; gate_deferred_nominal is a schedule/gate consistency
-      bug to file — never widen spacings as a reaction.
+      EXIT-VERIFY-01 = MPP verify ladder exhausted without a clean fill.
+      An unverified exit is open exposure — operator eyes required; any
+      live policy action (modify-to-aggressive / cancel-remainder) is a
+      live order action and is never auto-executed in the dry-run layer.

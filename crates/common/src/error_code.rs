@@ -1024,43 +1024,29 @@ pub enum ErrorCode {
     TfVerify02RunDegraded,
 
     // -----------------------------------------------------------------------
-    // Cadence scheduler (operator cadence directive 2026-07-14, judge-locked
-    // design rev-8 — `crates/core/src/cadence/`). Dry-run decision-timing
-    // skeleton: per-minute Dhan (:55 pre-close serialized) + Groww (:00
-    // post-close burst) fetch cadence with structural zero-429 gates,
-    // failure ladder, event-driven per-lane decisions. DEFAULT-OFF.
-    // See cadence-error-codes.md.
+    // 🔷 DHAN exit-order execution layer (Cluster B, 2026-07-14).
+    // Default-off behind FOUR independent locks (config default-off, no
+    // reachable live path, hardcoded dry_run, build-failing ratchet guard).
+    // Both codes are LOG-SINK-ONLY (no error_code_alerts map entry, no
+    // paging-list edit — the 2026-07-14 Dhan noise lock posture).
+    // See dhan-exit-order-lockout-2026-07-14.md.
     // -----------------------------------------------------------------------
-    /// CADENCE-01: a cadence lane DEGRADED this cycle — a fetch failed
-    /// (`stage="fetch_failed"`), a 429 arrived despite the gates
-    /// (`stage="rate_limited"` — also a gate-bug signal), a Dhan spot
-    /// returned 200-empty (`stage="spot_empty"`), the Groww burst fell back
-    /// (`stage="groww_fallback"`), a lane borrowed the other broker's data
-    /// (`stage="cross_fill"`), a spot resolved from the chain-embedded
-    /// price (`stage="chain_embedded_spot"`), moneyness classified Unknown
-    /// (`stage="moneyness_unknown"`), or the failure ladder exhausted its
-    /// floor (`stage="ladder_exhausted"`, edge-latched per episode). ONE
-    /// coalesced emission per (lane, cycle), never per-request.
-    /// Severity::High, auto-triage-safe (the next cycle re-attempts; the
-    /// ladder + cross-fill are the self-corrections).
-    Cadence01LaneDegraded,
-    /// CADENCE-02: a cadence lane's decision was HONEST-SKIPPED — the lane
-    /// was incomplete at its cutoff (`stage="cutoff"`), both brokers were
-    /// dead (`stage="both_sources_dead"`), or every underlying classified
-    /// Unknown (`stage="all_unknown"`). Exactly one per (lane, cycle);
-    /// never a late decision, never a decision on missing/stale data.
-    /// Severity::High, auto-triage-safe (the skip IS the fail-closed
-    /// action; the operator inspects the stage at leisure).
-    Cadence02DecisionSkipped,
-    /// CADENCE-03: the cadence scheduler itself DEGRADED — the failure
-    /// ladder shifted a rung (`stage="ladder_shift"`), a wake landed late
-    /// past a slot (`stage="late_wake"`), one or more minute boundaries
-    /// were skipped (`stage="boundary_skipped"`), a clock skew was clamped
-    /// (`stage="skew_clamped"`), the supervised runner respawned
-    /// (`stage="respawn"`), or a gate deferred a NOMINAL slot
-    /// (`stage="gate_deferred_nominal"` — a should-never scheduling-math
-    /// signal). Severity::Medium, auto-triage-safe.
-    Cadence03SchedulerDegraded,
+    /// EXIT-ORDER-01: an exit engine call degraded — a validation refusal
+    /// on a dispatched command, a Dhan API error on a super/forever/sliced
+    /// order, an ENTRY_LEG cancel refused post-fill (the naked-position
+    /// race U4 — never exercised), or a slicing response anomaly.
+    /// Severity::High, auto-triage-safe (the dispatched command already
+    /// refused/degraded loudly; the operator inspects the correlation-id
+    /// forensic log line).
+    ExitOrder01ExecutionDegraded,
+    /// EXIT-VERIFY-01: the MPP verify ladder exhausted with a degraded
+    /// verdict — `PendingAtLimit` (MARKET→LIMIT auto-conversion resting on
+    /// the book past the deadline — orders.md rule 18; NEVER assumed
+    /// filled), a partial fill at budget (`needs_reconciliation` set — the
+    /// remainder is never silently forgotten), or an `Unknown` unparsable
+    /// status (fail-closed). Severity::High, auto-triage-safe (the order
+    /// stays tracked; reconcile + the caller's policy own the follow-up).
+    ExitVerify01Degraded,
 }
 
 impl ErrorCode {
@@ -1260,10 +1246,8 @@ impl ErrorCode {
             // Daily timeframe-consistency verifier (operator 2026-07-13)
             Self::TfVerify01MismatchFound => "TF-VERIFY-01",
             Self::TfVerify02RunDegraded => "TF-VERIFY-02",
-            // Cadence scheduler (operator directive 2026-07-14)
-            Self::Cadence01LaneDegraded => "CADENCE-01",
-            Self::Cadence02DecisionSkipped => "CADENCE-02",
-            Self::Cadence03SchedulerDegraded => "CADENCE-03",
+            Self::ExitOrder01ExecutionDegraded => "EXIT-ORDER-01",
+            Self::ExitVerify01Degraded => "EXIT-VERIFY-01",
         }
     }
 
@@ -1464,13 +1448,13 @@ impl ErrorCode {
             // run could not vouch for it); never a halt — the live candle
             // pipeline is untouched and reruns are DEDUP-idempotent.
             Self::TfVerify01MismatchFound | Self::TfVerify02RunDegraded => Severity::High,
-            // CADENCE-01/02 (operator 2026-07-14) — a cadence lane degraded
-            // this cycle / a lane decision was honest-skipped. High:
-            // operator eyes on every occurrence (a skip means no decision
-            // input for the minute; a degrade means a broker leg is
-            // failing); never a halt — the record-capture legs and tick
-            // capture are untouched, the next cycle re-attempts.
-            Self::Cadence01LaneDegraded | Self::Cadence02DecisionSkipped => Severity::High,
+            // EXIT-ORDER-01 / EXIT-VERIFY-01 (Cluster B, 2026-07-14) — the
+            // exit-order layer degraded / the MPP verify ladder exhausted
+            // without a clean fill. High: operator eyes on every occurrence
+            // (an unverified exit is open exposure); never a halt — the
+            // order stays tracked and reconcile owns the follow-up. Both
+            // LOG-SINK-ONLY (no pager entry — 2026-07-14 Dhan noise lock).
+            Self::ExitOrder01ExecutionDegraded | Self::ExitVerify01Degraded => Severity::High,
             // Medium: data pipeline correctness
             // PR #6b (2026-05-19): I-P0-01/02/04/05 retired with their modules.
             Self::InstrumentP1CrossSegmentCollision
@@ -1796,11 +1780,9 @@ impl ErrorCode {
             Self::TfVerify01MismatchFound | Self::TfVerify02RunDegraded => {
                 ".claude/rules/project/tf-consistency-error-codes.md"
             }
-            // Cadence scheduler (operator directive 2026-07-14)
-            Self::Cadence01LaneDegraded
-            | Self::Cadence02DecisionSkipped
-            | Self::Cadence03SchedulerDegraded => {
-                ".claude/rules/project/cadence-error-codes.md"
+            // 🔷 DHAN exit-order execution layer (Cluster B, 2026-07-14)
+            Self::ExitOrder01ExecutionDegraded | Self::ExitVerify01Degraded => {
+                ".claude/rules/project/dhan-exit-order-lockout-2026-07-14.md"
             }
         }
     }
@@ -2041,10 +2023,9 @@ impl ErrorCode {
             // Daily timeframe-consistency verifier (operator 2026-07-13)
             Self::TfVerify01MismatchFound,
             Self::TfVerify02RunDegraded,
-            // Cadence scheduler (operator directive 2026-07-14)
-            Self::Cadence01LaneDegraded,
-            Self::Cadence02DecisionSkipped,
-            Self::Cadence03SchedulerDegraded,
+            // 🔷 DHAN exit-order execution layer (Cluster B, 2026-07-14)
+            Self::ExitOrder01ExecutionDegraded,
+            Self::ExitVerify01Degraded,
         ]
     }
 }
@@ -2408,10 +2389,13 @@ mod tests {
         // recomputed-from-1m value — coalesced per (feed, date) pass,
         // manual triage) + TF-VERIFY-02 (the daily run degraded —
         // client/query/truncation/flush/budget stage taxonomy) => 148.
-        // 2026-07-14 (cadence scheduler, operator directive): CADENCE-01
-        // (lane degraded) + CADENCE-02 (decision honest-skipped) +
-        // CADENCE-03 (scheduler degraded) => 151.
-        assert_eq!(ErrorCode::all().len(), 151);
+        // 2026-07-14 (🔷 DHAN exit-order layer, Cluster B WP1): bumped
+        // 148 -> 150 for EXIT-ORDER-01 (exit engine call degraded —
+        // validation refusal / Dhan API error / post-fill ENTRY_LEG cancel
+        // refused / slicing anomaly) + EXIT-VERIFY-01 (MPP verify ladder
+        // exhausted with PendingAtLimit / partial-at-budget / Unknown —
+        // fail-closed, never assumed filled). Both log-sink-only.
+        assert_eq!(ErrorCode::all().len(), 150);
     }
 
     #[test]
@@ -2791,8 +2775,9 @@ mod tests {
                 || s.starts_with("CHAIN-")
                 // Operator 2026-07-13: daily timeframe-consistency verifier
                 || s.starts_with("TF-VERIFY-")
-                // Operator 2026-07-14: broker-agnostic fetch-cadence scheduler
-                || s.starts_with("CADENCE-");
+                // 🔷 DHAN exit-order execution layer (Cluster B, 2026-07-14)
+                || s.starts_with("EXIT-ORDER-")
+                || s.starts_with("EXIT-VERIFY-");
             assert!(has_known_prefix, "unexpected code prefix: {s}");
         }
     }

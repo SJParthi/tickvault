@@ -46,10 +46,12 @@
 //! (`capture_rest_error_body` — M1: no raw Dhan body reaches a sink
 //! unbounded).
 
+use crate::order_observability::{OrderSideDayStats, OrderSideMsg, try_send_order_side};
 use tickvault_common::config::ExitOrdersConfig;
 use tickvault_common::error_code::ErrorCode;
 use tickvault_common::order_types::{OrderType, OrderValidity, ProductType, TransactionType};
 use tickvault_common::sanitize::capture_rest_error_body;
+use tickvault_common::segment::segment_code_to_str;
 use tickvault_trading::oms::exit_rules::{self, ExitCommand};
 use tickvault_trading::oms::types::OrderLeg;
 use tickvault_trading::oms::{
@@ -58,6 +60,23 @@ use tickvault_trading::oms::{
 use tickvault_trading::risk::engine::RiskEngine;
 use tickvault_trading::risk::types::RiskCheck;
 use tracing::{error, info, warn};
+
+/// Cluster-C order-side observation handle (#1554) — mirror of the
+/// `trading_pipeline` alias; `None` in tests. The DISABLED legacy exit
+/// body emits the same `order_audit` rows through it that the pre-Cluster-B
+/// inline `Signal::Exit` arm did (audit-row-only, no Telegram).
+type OrderSideObserver = Option<(
+    tokio::sync::mpsc::Sender<OrderSideMsg>,
+    std::sync::Arc<OrderSideDayStats>,
+)>;
+
+/// Counted, non-blocking order-side capture — no-op without wiring
+/// (mirror of `trading_pipeline::order_side_send`).
+fn observe_order_side(handle: &OrderSideObserver, msg: OrderSideMsg) {
+    if let Some((tx, stats)) = handle {
+        try_send_order_side(tx, stats, msg);
+    }
+}
 
 /// M1 (2026-07-14 hostile review): every dispatcher log line rendering an
 /// [`OmsError`] is redacted + truncated (300 chars) via the house
@@ -216,15 +235,20 @@ pub async fn dispatch_exit_command(
 ///
 /// `enabled == false` ⇒ the behavior-equivalent LEGACY body (cancel
 /// actives + plain MARKET close via `oms.place_order` — identical control
-/// flow and API calls to the pre-Cluster-B `trading_pipeline.rs` arm; log
-/// fields upgraded to redacted rendering per the M1 fix). `enabled == true` ⇒
-/// [`ExitCommand::CloseAll`] through [`dispatch_exit_command`] (cancel
-/// actives super-order-aware + `place_order_sliced` + the verify ladder).
+/// flow and API calls to the pre-Cluster-B `trading_pipeline.rs` arm,
+/// including the cluster-C order-side observability (#1554): every exit
+/// cancel/close still lands in `order_audit` via `order_side` —
+/// audit-row-only, no Telegram; log fields upgraded to redacted rendering
+/// per the M1 fix). `enabled == true` ⇒ [`ExitCommand::CloseAll`] through
+/// [`dispatch_exit_command`] (cancel actives super-order-aware +
+/// `place_order_sliced` + the verify ladder).
 pub async fn execute_exit_for_security(
     oms: &mut OrderManagementSystem,
     risk_engine: &mut RiskEngine,
     security_id: u64,
     cfg: &ExitOrdersConfig,
+    order_side: &OrderSideObserver,
+    exchange_segment_code: u8,
 ) {
     if cfg.enabled {
         let cmd = ExitCommand::CloseAll {
@@ -247,7 +271,8 @@ pub async fn execute_exit_for_security(
 
     // ---- LEGACY body (disabled path) — behavior-equivalent to the
     // pre-Cluster-B Signal::Exit arm (identical control flow and API
-    // calls; log fields upgraded to redacted rendering per the M1 fix). ----
+    // calls), including the cluster-C order-side observability (#1554);
+    // log fields upgraded to redacted rendering per the M1 fix. ----
     // Step 1: Cancel active (unfilled/pending) orders for this security
     let active: Vec<String> = oms
         .active_orders()
@@ -256,14 +281,27 @@ pub async fn execute_exit_for_security(
         .map(|o| o.order_id.clone())
         .collect();
     for order_id in active {
-        if let Err(err) = oms.cancel_order(&order_id).await {
-            // M1 (refuter round 1, 2026-07-14): sanitized Display, not
-            // Debug — same redaction class as the enabled path.
-            warn!(
-                error = %sanitize_oms_error(&err),
-                order_id = %order_id,
-                "EXIT signal → cancel failed"
-            );
+        match oms.cancel_order(&order_id).await {
+            Ok(()) => {
+                observe_order_side(order_side, OrderSideMsg::Cancelled { order_id });
+            }
+            Err(err) => {
+                // M1 (refuter round 1, 2026-07-14): sanitized Display, not
+                // Debug — same redaction class as the enabled path. The
+                // order_audit `detail` is sanitized + truncated at append.
+                warn!(
+                    error = %sanitize_oms_error(&err),
+                    order_id = %order_id,
+                    "EXIT signal → cancel failed"
+                );
+                observe_order_side(
+                    order_side,
+                    OrderSideMsg::CancelFailed {
+                        order_id,
+                        detail: format!("exit cancel: {err}"),
+                    },
+                );
+            }
         }
     }
     // Step 2: Close open position (if any filled lots exist)
@@ -301,6 +339,18 @@ pub async fn execute_exit_for_security(
                     net_lots,
                     "EXIT signal → closing order placed"
                 );
+                observe_order_side(
+                    order_side,
+                    OrderSideMsg::Placed {
+                        order_id,
+                        correlation_id: String::new(),
+                        security_id,
+                        exchange_segment: segment_code_to_str(exchange_segment_code),
+                        transaction_type: if net_lots > 0 { "SELL" } else { "BUY" },
+                        quantity: close_qty,
+                        price: 0.0,
+                    },
+                );
             }
             Err(err) => {
                 // M1 (refuter round 1, 2026-07-14): sanitized Display, not
@@ -309,6 +359,14 @@ pub async fn execute_exit_for_security(
                     error = %sanitize_oms_error(&err),
                     security_id,
                     "EXIT signal → closing order placement failed"
+                );
+                observe_order_side(
+                    order_side,
+                    OrderSideMsg::PlaceFailed {
+                        correlation_id: String::new(),
+                        security_id,
+                        detail: format!("exit close: {err}"),
+                    },
                 );
             }
         }
@@ -906,7 +964,7 @@ mod tests {
         };
         let pending_id = oms.place_order(pending).await.expect("paper place");
 
-        execute_exit_for_security(&mut oms, &mut risk, 13, &cfg).await;
+        execute_exit_for_security(&mut oms, &mut risk, 13, &cfg, &None, 0).await;
 
         // Legacy path: the active order cancelled + exactly ONE close
         // order placed (freeze scalar 0 is IGNORED — no slicing path).
@@ -925,7 +983,7 @@ mod tests {
         let mut risk = RiskEngine::new(2.0, 100, 1_000_000.0);
         let cfg = ExitOrdersConfig::default();
 
-        execute_exit_for_security(&mut oms, &mut risk, 13, &cfg).await;
+        execute_exit_for_security(&mut oms, &mut risk, 13, &cfg, &None, 0).await;
         assert_eq!(oms.total_placed(), 0, "flat + no actives = no orders");
     }
 
@@ -939,7 +997,7 @@ mod tests {
         risk.record_fill(21, -2, 50.0, 1); // net -2 lots → BUY 2 to close
         let cfg = enabled_cfg(1);
 
-        execute_exit_for_security(&mut oms, &mut risk, 21, &cfg).await;
+        execute_exit_for_security(&mut oms, &mut risk, 21, &cfg, &None, 0).await;
         assert_eq!(
             oms.total_placed(),
             2,

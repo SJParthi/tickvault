@@ -574,99 +574,36 @@ async fn run_trading_pipeline(
                                         strategy = %strategy.definition().name,
                                         "EXIT signal"
                                     );
-                                    // Step 1: Cancel active (unfilled/pending) orders for this security
-                                    let active: Vec<String> = oms
-                                        .active_orders()
-                                        .iter()
-                                        .filter(|o| o.security_id == tick.security_id)
-                                        .map(|o| o.order_id.clone())
-                                        .collect();
-                                    for order_id in active {
-                                        match oms.cancel_order(&order_id).await {
-                                            Ok(()) => {
-                                                order_side_send(&order_side, OrderSideMsg::Cancelled {
-                                                    order_id,
-                                                });
-                                            }
-                                            Err(err) => {
-                                                warn!(
-                                                    ?err,
-                                                    order_id = %order_id,
-                                                    "EXIT signal → cancel failed"
-                                                );
-                                                order_side_send(&order_side, OrderSideMsg::CancelFailed {
-                                                    order_id,
-                                                    detail: format!("exit cancel: {err}"),
-                                                });
-                                            }
-                                        }
-                                    }
-                                    // Step 2: Close open position (if any filled lots exist)
-                                    let net_lots = risk_engine.net_lots_for(tick.security_id);
-                                    if net_lots != 0 {
-                                        let close_type = if net_lots > 0 {
-                                            TransactionType::Sell
-                                        } else {
-                                            TransactionType::Buy
-                                        };
-                                        let close_qty = net_lots.unsigned_abs() as i64;
-                                        info!(
-                                            security_id = tick.security_id,
-                                            net_lots,
-                                            close_type = ?close_type,
-                                            "EXIT signal → placing closing order for open position"
-                                        );
-                                        let close_request = PlaceOrderRequest {
-                                            security_id: tick.security_id,
-                                            transaction_type: close_type,
-                                            order_type: OrderType::Market,
-                                            product_type: ProductType::Intraday,
-                                            validity: OrderValidity::Day,
-                                            quantity: close_qty,
-                                            price: 0.0,
-                                            trigger_price: 0.0,
-                                            lot_size: 1,
-                                            expiry_date: None,
-                                        };
-                                        match oms.place_order(close_request).await {
-                                            Ok(order_id) => {
-                                                info!(
-                                                    order_id = %order_id,
-                                                    security_id = tick.security_id,
-                                                    net_lots,
-                                                    "EXIT signal → closing order placed"
-                                                );
-                                                order_side_send(&order_side, OrderSideMsg::Placed {
-                                                    order_id,
-                                                    correlation_id: String::new(),
-                                                    security_id: tick.security_id,
-                                                    exchange_segment:
-                                                        tickvault_common::segment::segment_code_to_str(
-                                                            tick.exchange_segment_code,
-                                                        ),
-                                                    transaction_type: if net_lots > 0 {
-                                                        "SELL"
-                                                    } else {
-                                                        "BUY"
-                                                    },
-                                                    quantity: close_qty,
-                                                    price: 0.0,
-                                                });
-                                            }
-                                            Err(err) => {
-                                                warn!(
-                                                    ?err,
-                                                    security_id = tick.security_id,
-                                                    "EXIT signal → closing order placement failed"
-                                                );
-                                                order_side_send(&order_side, OrderSideMsg::PlaceFailed {
-                                                    correlation_id: String::new(),
-                                                    security_id: tick.security_id,
-                                                    detail: format!("exit close: {err}"),
-                                                });
-                                            }
-                                        }
-                                    }
+                                    // 🔷 DHAN exit-order layer (Cluster B, design §3.10):
+                                    // disabled (the shipped default) ⇒ the delegate runs the
+                                    // behavior-equivalent legacy cancel+close body (identical
+                                    // control flow and API calls; redacted log rendering per
+                                    // the M1 fix); enabled ⇒
+                                    // ExitCommand::CloseAll through the dispatcher (super-
+                                    // order-aware cancel + sliced close + MPP verify ladder).
+                                    // The delegate carries the cluster-C order-side
+                                    // observability (#1554) so the exit cancels/closes still
+                                    // land in order_audit — audit-row-only, no Telegram.
+                                    //
+                                    // HONEST BLOCKING ENVELOPE (H3, 2026-07-14 hostile
+                                    // review): while [exit_orders] is ENABLED this await
+                                    // stalls THE STRATEGY TASK for up to
+                                    // ~mpp_verify_deadline_secs per close order (the
+                                    // CloseAll verify budget bounds the multi-slice case to
+                                    // ONE deadline) — ticks buffer in the broadcast channel
+                                    // meanwhile and order updates may lag. Accepted for the
+                                    // dry-run layer; the PRE-LIVE design change is a
+                                    // SPAWNED exit executor (rule-file §4 enable-time
+                                    // protocol).
+                                    crate::exit_execution::execute_exit_for_security(
+                                        &mut oms,
+                                        &mut risk_engine,
+                                        tick.security_id,
+                                        &config.exit_orders,
+                                        &order_side,
+                                        tick.exchange_segment_code,
+                                    )
+                                    .await;
                                 }
                             }
                         }

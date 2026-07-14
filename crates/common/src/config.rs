@@ -181,7 +181,15 @@ pub struct ApplicationConfig {
     /// executors log fires and return Empty. Absent section ⇒ DISABLED
     /// (fail-safe default off).
     #[serde(default)]
-    pub cadence: CadenceConfig,
+    pub dhan_margin_gate: DhanMarginGateConfig,
+    /// `[exit_orders]` — 🔷 DHAN exit-order execution layer (Cluster B,
+    /// 2026-07-14; `.claude/rules/project/dhan-exit-order-lockout-2026-07-14.md`).
+    /// LOCK #1 of the 4-lock OFF switch: default OFF; absent section =
+    /// disabled (fail-safe). The app-crate dispatcher drops every
+    /// `ExitCommand` while disabled; enabling activates DRY-RUN PAPER
+    /// behavior only (the engine's hardcoded `dry_run` blocks live POSTs).
+    #[serde(default)]
+    pub exit_orders: ExitOrdersConfig,
 }
 
 /// `[feeds]` — pluggable market-data feed selection (operator lock
@@ -3119,6 +3127,11 @@ impl ApplicationConfig {
         // valid, so today's boot is unaffected).
         self.cadence.validate()?;
 
+        // 🔷 DHAN exit-order layer (Cluster B, 2026-07-14): verify-ladder
+        // bounds always; freeze-limit + review-date sanity when enabled —
+        // rejected at boot, BEFORE the trading pipeline spawns.
+        self.exit_orders.validate()?;
+
         Ok(())
     }
 }
@@ -3693,7 +3706,8 @@ mod tests {
             groww_option_chain_1m: GrowwOptionChain1mConfig::default(),
             tf_consistency: TfConsistencyConfig::default(),
             groww_contract_1m: GrowwContract1mConfig::default(),
-            cadence: CadenceConfig::default(),
+            dhan_margin_gate: DhanMarginGateConfig::default(),
+            exit_orders: ExitOrdersConfig::default(),
         }
     }
 
