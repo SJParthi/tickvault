@@ -955,9 +955,9 @@ async fn main() -> Result<()> {
                     total = live + ord,
                     live_feed = live,
                     order_update = ord,
-                    "STAGE-C: WAL replay recovered residual frames — LiveFeed will be \
-                     re-injected into pool mpsc; OrderUpdate drained into broadcast once \
-                     sender is created"
+                    "STAGE-C: WAL replay recovered residual frames — both types are \
+                     pre-retirement residue with no live consumer (PR-C3, 2026-07-14): \
+                     counted loudly at STAGE-C.2b, then archived (raw frames stay on disk)"
                 );
                 metrics::counter!("tv_ws_frame_wal_replay_total", "ws_type" => "live_feed")
                     .increment(live);
@@ -1711,7 +1711,6 @@ async fn main() -> Result<()> {
         notifier,
         health_status,
         tick_broadcast_sender,
-        order_update_sender,
         api_handle,
     } = build_shared_infra(
         &config,
@@ -1967,46 +1966,45 @@ async fn main() -> Result<()> {
     );
 
     // =======================================================================
-    // STAGE-C.2b (PR-C2, 2026-07-13): WAL replay settlement — single path.
+    // STAGE-C.2b (PR-C2, 2026-07-13; order-update leg re-shaped in PR-C3,
+    // 2026-07-14): WAL replay settlement — single path, BOTH legs
+    // archive-only + loud.
     //
     // The Dhan live-WS lane (and with it the pool frame channel the LiveFeed
     // re-injection targeted) is DELETED per the operator's 2026-07-13
-    // retirement directive. Two legs remain:
-    //   - OrderUpdate frames drain into the PROCESS-shared broadcast created
-    //     by `build_shared_infra` (closing the C1 "boot-staged order-update
-    //     WAL segments remain undrained on dhan-off boots" residual — the
-    //     dhan_rest_stack's order-update WS + dormant drain consume the same
-    //     broadcast).
-    //   - Residual LiveFeed frames (possible only from a PRE-retirement
-    //     session's WAL) have NO live consumer anymore: they are counted +
-    //     logged loudly, then archived WITH the segments below — the raw
-    //     frames stay on disk in the WAL archive (forensic), and NOT
-    //     confirming would re-stage them every boot forever (the
-    //     WS-REINJECT-01 growth-storm class).
+    // retirement directive, and the order-update WS spawn + its dormant
+    // drain were retired by the 2026-07-14 Dhan noise lock (#1532,
+    // dhan-rest-only-noise-lock-2026-07-14.md) — so the process-shared
+    // order-update broadcast the C2 drain targeted became PERMANENTLY
+    // receiver-less (the trading pipeline has zero spawn sites until the
+    // live-trading re-wire; order_side_wiring_guard pins that). Draining
+    // into a receiver-less broadcast was delivery theater: every send
+    // returned Err and the frames went nowhere while the confirm archived
+    // them. PR-C3 makes both legs the SAME honest shape:
+    //   - Residual frames of EITHER type (possible only from a
+    //     PRE-retirement session's WAL) are counted + logged loudly, then
+    //     archived WITH the segments below — the raw frames stay on disk in
+    //     the WAL archive (forensic; `confirm_replayed` MOVES, never
+    //     deletes), and NOT confirming would re-stage them every boot
+    //     forever (the WS-REINJECT-01 growth-storm class). Durable
+    //     order-event capture returns with the live-trading re-wire.
     // =======================================================================
     if !ws_wal_replay_order_update.is_empty() {
-        let frames = std::mem::take(&mut ws_wal_replay_order_update);
-        let (parsed, broadcast_count, parse_errors) =
-            tickvault_app::boot_helpers::drain_replayed_order_updates_to_broadcast(
-                frames,
-                &order_update_sender,
-            );
-        info!(
-            parsed,
-            broadcast_count, parse_errors, "STAGE-C.2b: OrderUpdate WAL replay drain complete"
+        let dropped = ws_wal_replay_order_update.len() as u64;
+        warn!(
+            frames = dropped,
+            "STAGE-C.2b: residual OrderUpdate WAL frames from a pre-retirement session have \
+             no consumer (the order-update WS spawn + its drain were retired 2026-07-14 per \
+             the Dhan noise lock; the trading pipeline is dormant until the live-trading \
+             re-wire) — counted and archived with the WAL segments; the raw JSON frames \
+             remain on disk in the archive for forensic replay"
         );
         metrics::counter!(
-            "tv_ws_frame_wal_reinjected_total",
+            "tv_ws_frame_wal_reinjected_dropped_total",
             "ws_type" => "order_update"
         )
-        .increment(broadcast_count);
-        if parse_errors > 0 {
-            metrics::counter!(
-                "tv_ws_frame_wal_reinjected_parse_errors_total",
-                "ws_type" => "order_update"
-            )
-            .increment(parse_errors);
-        }
+        .increment(dropped);
+        ws_wal_replay_order_update.clear();
     }
     if !ws_wal_replay_live_feed.is_empty() {
         let dropped = ws_wal_replay_live_feed.len() as u64;
@@ -2892,9 +2890,12 @@ struct SharedInfraHandles {
     /// install + channel wiring stay publisher-ready; the C3 universe-chain
     /// deletion decides whether the idle consumers go too.
     tick_broadcast_sender: tokio::sync::broadcast::Sender<tickvault_common::tick_types::ParsedTick>,
-    /// The PROCESS-shared order-update broadcast (lane order-update WS publishes;
-    /// trading pipeline subscribes).
-    order_update_sender: tokio::sync::broadcast::Sender<tickvault_common::order_types::OrderUpdate>,
+    // PR-C3 (2026-07-14): the PROCESS-shared order-update broadcast
+    // (`order_update_sender`) was REMOVED — its publisher (the order-update
+    // WS, retired 2026-07-14 per the Dhan noise lock) and its subscriber
+    // (the trading pipeline, zero spawn sites — order_side_wiring_guard)
+    // are both gone, so the channel was a permanently receiver-less shell.
+    // The live-trading re-wire re-creates it alongside the pipeline spawn.
     /// The hoisted axum API server handle (binds exactly once, incl. /api/feeds).
     api_handle: tokio::task::JoinHandle<()>,
 }
@@ -3003,10 +3004,8 @@ async fn build_shared_infra(
         tokio::sync::broadcast::channel::<tickvault_common::tick_types::ParsedTick>(
             tickvault_common::constants::TICK_BROADCAST_CAPACITY,
         );
-    let (order_update_sender, _order_update_receiver) =
-        tokio::sync::broadcast::channel::<tickvault_common::order_types::OrderUpdate>(
-            tickvault_common::constants::ORDER_UPDATE_BROADCAST_CAPACITY,
-        );
+    // PR-C3 (2026-07-14): the order-update broadcast channel was removed
+    // (publisher + subscriber both retired — see the SharedInfraHandles note).
 
     // --- Subscriber tasks: obs + 21-TF aggregator + tick-storage ---
     // ALL three `.subscribe()` to `tick_broadcast_sender` HERE, in the hoisted
@@ -3099,7 +3098,6 @@ async fn build_shared_infra(
         notifier,
         health_status,
         tick_broadcast_sender,
-        order_update_sender,
         api_handle,
     })
 }
