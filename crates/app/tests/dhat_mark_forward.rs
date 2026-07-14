@@ -7,7 +7,15 @@
 //!   - ARMED + channel FULL (backpressure drop arm): the bounded `try_send`
 //!     of a 16-byte `Copy` struct fails without blocking; the drop counter
 //!     is a static-key `metrics::counter!` — ZERO heap allocation after the
-//!     one-time recorder/key warm-up.
+//!     one-time recorder/key warm-up. HP-5 honesty: this zero-alloc proof is
+//!     measured against THIS test process's NO-OP recorder; under the
+//!     production prometheus recorder each uncached `counter!` does a
+//!     sharded registry read-lock lookup (no alloc post-registration, but
+//!     not lock-free) — bounded to the drop arm only. Caching the Counter
+//!     handle at construction was evaluated and REJECTED: the forwarder is
+//!     built in main.rs BEFORE `observability::init_metrics` installs the
+//!     recorder, so a construction-time handle would permanently bind the
+//!     no-op recorder (the feed-stall first-sample-baseline trap class).
 //!
 //! HONEST COVERAGE: the armed+ACCEPTED arm is deliberately NOT in the DHAT
 //! window — tokio's mpsc grows/reuses its 32-slot block list as the queue

@@ -17,6 +17,16 @@
 //! self-test, daily reset) is covered by the unit suite in
 //! `crates/app/src/order_runtime.rs`; the wiring ordering is pinned by
 //! `test_rest_stack_wires_order_runtime` + `order_runtime_spawn_site_guard`.
+//!
+//! H3 (fix-round 2026-07-14): the FULL promised chain — place → paper fill
+//! via a mark → net_lots ≠ 0 → adverse mark → daily-loss halt → RiskHalt
+//! reaches a test alert sink → check_order rejects — is driven through the
+//! ACTUAL production arm bodies (`process_mark` etc.) by
+//! `order_runtime::tests::test_e2e_place_fill_mark_halt_fires_risk_halt_sink`
+//! (an in-module test: the arm bodies are private, and the SPAWNED runtime
+//! only places orders via the time-gated self-test, which no test can drive
+//! deterministically). THIS file keeps the spawned-task black-box coverage
+//! (liveness, orphan tolerance, drain, disarmed gate).
 
 #![cfg(test)]
 

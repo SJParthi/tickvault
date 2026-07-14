@@ -86,25 +86,42 @@ fn both_paths_gate_confirm_on_a_reinjection_clean_flag() {
 #[test]
 fn rest_stack_confirm_is_gated_on_confirm_decision() {
     let body = dhan_rest_stack_rs();
-    let (prod, _) = body
-        .split_once("#[cfg(test)]")
-        .expect("dhan_rest_stack.rs must keep its test module marker");
+    let prod = tickvault_common::source_scan::production_region(&body)
+        .expect("dhan_rest_stack.rs must keep its test module"); // APPROVED: test
+    // M1 (fix-round 2026-07-14): textual PRECEDENCE is not GATING — the
+    // regression `let v = confirm_decision(..); confirm_replayed(..);
+    // if let Defer{..} = v { … }` (an UNCONDITIONAL confirm) passed the old
+    // precedence check. Pin CONTAINMENT instead: confirm_replayed occurs
+    // EXACTLY ONCE in production code, strictly INSIDE the slice between
+    // the `ConfirmVerdict::Confirm =>` match arm and the
+    // `ConfirmVerdict::Defer` arm.
+    let confirm_calls = prod
+        .matches("tickvault_storage::ws_frame_spill::confirm_replayed(")
+        .count();
+    assert_eq!(
+        confirm_calls, 1,
+        "dhan_rest_stack.rs production region must contain EXACTLY ONE \
+         confirm_replayed call (inside the Confirm verdict arm); found \
+         {confirm_calls}"
+    );
     let decision = prod
         .find("crate::order_runtime::confirm_decision(")
         .expect("rest stack must route its confirm through confirm_decision (F6)"); // APPROVED: test
-    let confirm = prod
+    let confirm_arm = prod
+        .find("ConfirmVerdict::Confirm =>")
+        .expect("the Confirm match arm must exist"); // APPROVED: test
+    let defer_arm = prod
+        .find("ConfirmVerdict::Defer")
+        .expect("the Defer match arm must exist"); // APPROVED: test
+    let confirm_call = prod
         .find("tickvault_storage::ws_frame_spill::confirm_replayed(")
-        .expect("rest stack must call confirm_replayed on the Confirm verdict"); // APPROVED: test
+        .expect("confirm_replayed call present (counted above)"); // APPROVED: test
     assert!(
-        decision < confirm,
-        "the confirm_decision match @{decision} must precede (gate) the \
-         confirm_replayed call @{confirm} — an unconditional confirm archives \
+        decision < confirm_arm && confirm_arm < confirm_call && confirm_call < defer_arm,
+        "confirm_replayed @{confirm_call} must sit INSIDE the Confirm arm \
+         (decision @{decision} < Confirm-arm @{confirm_arm} < call < \
+         Defer-arm @{defer_arm}) — an unconditional confirm archives \
          un-reinjected stale live-feed frames (silent tick loss)"
-    );
-    assert!(
-        prod.contains("ConfirmVerdict::Defer"),
-        "the Defer arm disappeared — a stale-livefeed / parse-error boot must \
-         leave staged segments in replaying/ (re-replayed next boot), loudly"
     );
     assert!(
         prod.contains("metrics::counter!(\"tv_wal_confirm_deferred_total\")"),

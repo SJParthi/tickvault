@@ -1303,9 +1303,12 @@ mod tests {
     #[test]
     fn test_rest_stack_wires_order_runtime() {
         let own_src = include_str!("dhan_rest_stack.rs");
-        let (prod, _) = own_src
-            .split_once("#[cfg(test)]")
-            .expect("dhan_rest_stack.rs must keep its test module marker");
+        // H1 fix-round 2026-07-14: the canonical production-region helper
+        // (blanks the test MODULE only — robust to future mid-file
+        // #[cfg(test)] attrs, unlike a naive split_once).
+        let prod = tickvault_common::source_scan::production_region(own_src)
+            .expect("dhan_rest_stack.rs must keep its test module"); // APPROVED: test
+        let prod = prod.as_str();
         for needle in [
             // The rewired WS spawn itself (Q4-i — kept).
             "run_order_update_connection(",
@@ -1325,6 +1328,10 @@ mod tests {
             // Defer arm loudness: the coalesced counter (warn-level by design).
             "metrics::counter!(\"tv_wal_confirm_deferred_total\")",
             // ENABLED branch: durable order-update frame capture restored.
+            // M8 (fix-round 2026-07-14): pin the BINDING SHAPE, not just
+            // that a clone exists somewhere — the clone must feed the
+            // config-gated `ou_wal_spill` binding that the WS call consumes.
+            "let ou_wal_spill = if config.order_runtime.enabled {",
             "params.ws_frame_spill.clone()",
             // DISABLED branch: the PR-C1 dormant shape survives byte-identical
             // — receiver HELD + drained (hostile-review M1) and counted.
@@ -1363,6 +1370,24 @@ mod tests {
         let ou_spawn = prod
             .find("order_update_connection::run_order_update_connection(")
             .expect("order-update spawn present (asserted above)"); // APPROVED: test
+        // M8: the `ou_wal_spill` binding must be PASSED as an argument inside
+        // the WS call region — `let _x = clone(); let ou_wal_spill = None;`
+        // (dead capture) fails here.
+        let wal_binding = prod
+            .find("let ou_wal_spill = if config.order_runtime.enabled {")
+            .expect("ou_wal_spill binding present (asserted above)"); // APPROVED: test
+        assert!(
+            wal_binding < ou_spawn,
+            "the ou_wal_spill binding @{wal_binding} must precede the WS spawn \
+             @{ou_spawn}"
+        );
+        let ws_call_region = &prod[ou_spawn..prod.len().min(ou_spawn + 2_000)];
+        assert!(
+            ws_call_region.contains("ou_wal_spill,"),
+            "the WS call must consume `ou_wal_spill,` as its wal_spill \
+             argument — a dead clone with `wal_spill: None` would silently \
+             kill durable order-event capture (M8)"
+        );
         assert!(
             claim_call < subscribe
                 && subscribe < runtime_spawn
