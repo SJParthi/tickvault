@@ -28,6 +28,7 @@ fn groww_reject() -> NotificationEvent {
     NotificationEvent::GrowwSidecarRejected {
         reason: "authentication rejected".to_string(),
         fleet_summary: false,
+        detail: None,
     }
 }
 
@@ -96,6 +97,7 @@ fn guard_groww_runtime_events_are_episode_routed() {
     let fleet = NotificationEvent::GrowwSidecarRejected {
         reason: "3 of 10 connections rejected".to_string(),
         fleet_summary: true,
+        detail: None,
     };
     assert_eq!(
         fleet.episode_key().map(|k| k.family),
@@ -232,6 +234,7 @@ fn guard_no_critical_event_maps_to_groww_family() {
         NotificationEvent::GrowwSidecarRejected {
             reason: "3 of 10 connections rejected".to_string(),
             fleet_summary: true,
+            detail: None,
         },
         feed_down_full("Groww", true, false),
         NotificationEvent::FeedRecovered {
