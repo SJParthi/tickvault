@@ -9,16 +9,14 @@
 //! the pool create; a prefix-anchored 401/403 forces a re-mint through the
 //! EXISTING TokenManager machinery.
 //!
-//! This guard pins, in the main.rs PRODUCTION region (everything strictly
-//! before the first top-level `#[cfg(test)]` — robust to code after
-//! `mod tests`), with comments stripped (a comment mentioning the call can
-//! never satisfy the scan):
+//! Pins (comments stripped so a comment mention can never satisfy a scan):
 //!
-//! 1. EXACTLY ONE `validate_cached_token_at_fast_boot(` call site
-//!    ("exactly one profile check per boot").
-//! 2. That call precedes the FIRST `wait_out_persisted_ws_rate_limit_cooldown().await`
-//!    AND the FIRST `match create_websocket_pool(` (the fast arm's pool
-//!    site) — the mandated ordering: validation → cooldown wait → pool.
+//! 1.+2. RETIRED (PR-C2, 2026-07-13 — Dhan live-WS lane deletion, operator
+//!    retirement directive per websocket-connection-scope-lock.md
+//!    "2026-07-13 Amendment" §B): the main.rs fast-arm ordering pins
+//!    (validate → cooldown wait → create_websocket_pool) died with the
+//!    fast arm, the WS-GAP-08 cooldown wait, and the pool — see the dated
+//!    retirement block above the surviving stub-guard below.
 //! 3. Stub-guard: the core helper module actually calls the profile
 //!    endpoint (`DHAN_USER_PROFILE_PATH`) and the existing remint
 //!    machinery (`force_renewal(`) in ITS production region — the helper
@@ -31,11 +29,6 @@
 
 use std::fs;
 use std::path::PathBuf;
-
-fn read_main_rs() -> String {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/main.rs");
-    fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
-}
 
 fn read_core_helper() -> String {
     let path =
@@ -85,64 +78,20 @@ fn production_region(src: &str) -> &str {
     }
 }
 
-const VALIDATION_CALL: &str = "validate_cached_token_at_fast_boot(";
-/// The `().await` suffix distinguishes CALL sites from the fn definition.
-const COOLDOWN_CALL: &str = "wait_out_persisted_ws_rate_limit_cooldown().await";
-/// Both pool CALL sites are `match create_websocket_pool(`; the fn
-/// definition is `fn create_websocket_pool(` and never matches this needle.
-const POOL_CALL: &str = "match create_websocket_pool(";
-
-#[test]
-fn ratchet_fast_boot_validation_precedes_pool_create_and_cooldown() {
-    let full = read_main_rs();
-    let stripped = strip_comments(&full);
-    let production = production_region(&stripped);
-
-    let validation_positions: Vec<usize> = production
-        .match_indices(VALIDATION_CALL)
-        .map(|(pos, _)| pos)
-        .collect();
-    assert_eq!(
-        validation_positions.len(),
-        1,
-        "expected EXACTLY ONE `{VALIDATION_CALL}` call site in the main.rs \
-         production region (one profile check per boot — AUTH-GAP-06); \
-         found {} — a removed call re-opens the 2026-07-07 dead-cached-token \
-         outage class; a second call violates the one-check contract",
-        validation_positions.len()
-    );
-    let validation = validation_positions[0];
-
-    let first_cooldown = production.find(COOLDOWN_CALL).unwrap_or_else(|| {
-        panic!(
-            "no `{COOLDOWN_CALL}` call in the main.rs production region — \
-             the WS-GAP-08 wiring this guard orders against has moved; \
-             update both ratchets together"
-        )
-    });
-    let first_pool = production.find(POOL_CALL).unwrap_or_else(|| {
-        panic!(
-            "no `{POOL_CALL}` call in the main.rs production region — \
-             the fast-arm pool site this guard orders against has moved; \
-             update this ratchet"
-        )
-    });
-
-    assert!(
-        validation < first_cooldown,
-        "AUTH-GAP-06 ordering broken: `{VALIDATION_CALL}` at byte {validation} \
-         must precede the first `{COOLDOWN_CALL}` at byte {first_cooldown} — \
-         the mandated fast-arm order is cached-token load → validation \
-         (→ re-mint if rejected) → cooldown wait → create_websocket_pool"
-    );
-    assert!(
-        validation < first_pool,
-        "AUTH-GAP-06 ordering broken: `{VALIDATION_CALL}` at byte {validation} \
-         must precede the first `{POOL_CALL}` at byte {first_pool} — the \
-         cached token must be validated (and re-minted if Dhan rejected it) \
-         BEFORE any WebSocket spawns"
-    );
-}
+// RETIRED (PR-C2, 2026-07-13 — Dhan live-WS lane deletion, operator
+// retirement directive per websocket-connection-scope-lock.md "2026-07-13
+// Amendment" §B): `ratchet_fast_boot_validation_precedes_pool_create_and_cooldown`
+// pinned the FAST crash-recovery arm's ordering (cached-token load →
+// validate_cached_token_at_fast_boot → WS-GAP-08 cooldown wait →
+// create_websocket_pool). The fast arm, the cooldown wait, and the pool
+// were ALL deleted with the lane — main.rs boots from cold via
+// dhan_rest_stack (which mints/validates through the TokenManager
+// machinery under the SSM lock), so the 2026-07-07 dead-cached-token
+// outage class is structurally gone: no boot path trusts a cached token
+// to spawn a market-data WS. The core `fast_boot_validation.rs` MODULE is
+// retained un-consumed pending the Phase C auth-surface cleanup; the
+// stub-guard below keeps pinning its internals so it cannot silently
+// degrade before that decision lands.
 
 /// Stub-guard: the core helper must actually probe the profile endpoint
 /// and reach the existing remint machinery — in CODE (comments stripped),
