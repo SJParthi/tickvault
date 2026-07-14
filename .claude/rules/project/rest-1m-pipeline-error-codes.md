@@ -634,42 +634,15 @@ to `true` in base.toml — dated record in
 OFF (fail-safe) and `probe_and_report` stays `true` (inert while
 enabled; the rollback canary).
 
-**2026-07-14 — the GROWW leg gains a per-underlying not-served paging
-edge (`stage="underlying_not_served"`):** the motivating incident — on
-expiry day 2026-07-14 Groww stopped serving NIFTY's same-day-expiring
-chain at 14:54 IST (2xx, zero strikes, `outcome=empty`) while BANKNIFTY
-+ SENSEX kept working (`ok=2 empty=1` per minute, ALL afternoon), and
-NOTHING paged: the `stage="escalation"` edge arms only on FULLY-failed
-minutes (ok == 0), so a single-underlying vendor cutoff was invisible.
-The new arm mirrors the spot leg's `sid_not_served` detector (§1 item
-5): a minute COUNTS toward an underlying's streak only when that
-underlying's chain came back empty/failed (FETCH-level — Empty AND
-error-class count the same; persist failures stay the escalation edge's
-M1 business) while ≥1 OTHER underlying was OK in the SAME minute; a
-global-failure minute (zero OK) neither counts nor resets — so within
-the FETCH-failure class the two edges are mutually exclusive per minute
-(the escalation edge needs ok == 0, this edge needs ≥1 OK). HONEST
-OVERLAP: a persist-failed minute with ok ≥ 1 can legitimately count
-toward BOTH edges (the M1 persist gate makes the escalation edge count
-it fully-failed while an empty sibling counts here) — two DISTINCT
-signals: persistence broken + vendor not serving one underlying. An
-auth-aborted fire (401 short-circuit — a global token condition, even
-after an earlier underlying succeeded) is a tracker HOLD: neither
-counts nor resets. At
-`GROWW_CHAIN_1M_UNDERLYING_NOT_SERVED_THRESHOLD` (10) consecutive
-counted minutes: ONE `error!(code = CHAIN-02,
-stage = "underlying_not_served", feed = "groww", underlying,
-consecutive_minutes)` + ONE typed HIGH `GrowwChain1mUnderlyingNotServed`
-Telegram page per underlying per episode (edge-latched, Rule 4;
-re-armed only by that underlying's own recovery — falling edge = one
-Info `GrowwChain1mUnderlyingServedRecovered`). Counter:
-`tv_groww_chain1m_underlying_not_served_total{underlying}` (3 static
-label values — the pinned plain symbols), one increment per counted
-minute. The typed HIGH Telegram event IS the page — CHAIN-02 remains
-log-sink-only per §3. Streak state is per scheduler run (per trading
-day; a mid-day task respawn restarts it — the FailureEdge envelope).
-Source: `crates/app/src/groww_option_chain_1m_boot.rs`
-(`UnderlyingServedTracker` / `record_groww_chain_underlying_verdicts`).
+**2026-07-14 — the DHAN chain leg emits this SAME code with the new
+stages** `underlying_not_served` (error, edge — the #1537 Groww mirror,
+Dhan emits field-less), `ladder_shrunk` (warn, edge-latched heuristic),
+`retry_skipped_ceiling` (warn, per refused retry — bounded ≤3/minute),
+`trading_day_flip_exit` (error, one-shot; + the SPOT1M-01 spot twin),
+plus the bounded retry counters
+(`tv_chain1m_retry_total{outcome="recovered"|"still_failed"|"skipped_ceiling"}`)
+— full contract + triage in
+`cross-source-chain-coverage-2026-07-14.md`.
 
 ## §2d. CHAIN-03 — option_chain_1m persist failed
 
