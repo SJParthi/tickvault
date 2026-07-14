@@ -305,3 +305,67 @@ must update this §9 FIRST with a dated quote.
 Covered by the §6 trigger list (extended 2026-07-13 with the `groww_spot_1m` /
 `groww_option_chain_1m` / `option_contract_1m_rest` / `v1/historical/candles` /
 `v1/option-chain` strings and the §9 module paths).
+
+---
+
+# §10 — 2026-07-14 operator re-assertion: Dhan spot-1m + option-chain REST are ENABLED classes
+
+## §10.0 The verbatim operator quotes (preserve exactly, do not paraphrase — expletives included)
+
+**Quote 1 (2026-07-14, verbatim):**
+> "dhan option chain should be enabled why the fuck this is disabled ... only live feed is disabled"
+
+**Quote 2 (2026-07-14, verbatim):**
+> "market feed ... it should be clearly historical data api for spot 1m"
+
+## §10.1 The re-assertion — one paragraph
+
+`POST /v2/charts/intraday` (interval `"1"` — the spot-1m leg) and
+`POST /v2/optionchain` (+ `POST /v2/optionchain/expirylist`) are **KEEP /
+RE-AUTHORIZED** classes. This section RE-ASSERTS the existing §8 grant
+(2026-07-12; the chain half flipped ON 2026-07-13 after the live entitlement
+probe PASSED — §8.7) with tonight's quotes, so the §3 REMOVE-row HISTORY
+(the pre-§8 removals of `charts/intraday` / `optionchain`) can never again be
+misread as "these endpoints are disabled". The §3 rows already carry the
+re-authorization annotations; this section is the dated, quote-backed record
+that they are ENABLED classes, permanently.
+
+## §10.2 The factual config truth (Verified, 2026-07-14)
+
+- **Both legs are `enabled = true` in `config/base.toml` and running in
+  prod** — `[spot_1m_rest]` (the §8 spot half) and `[option_chain_1m]`
+  (flipped ON 2026-07-13 per §8.7; the serde DEFAULT stays OFF, fail-safe).
+- **The ONLY disabled Dhan surface is the live WebSocket feed** — the
+  2026-07-13 retirement (`websocket-connection-scope-lock.md` "2026-07-13
+  Amendment"; operator Quote 1 above: "only live feed is disabled").
+- **The apparent "disabled" symptom is NOT a config state:** it is the
+  `charts/intraday` VENDOR-SIDE zero-candle serving issue — the SPOT1M-01
+  `empty` class, running ~14 days (2xx responses carrying no same-day
+  candles), diagnosed by the #1543/#1524 raw-body serving-delay probes at
+  the next 09:16 IST fire (`rest-1m-pipeline-error-codes.md` §1, the
+  2026-07-14 empty-class split + one-shot probes). A vendor not serving
+  data is a measured degrade, never a reason to call the leg "disabled".
+
+## §10.3 What stays REMOVED (explicit, per Quote 2)
+
+**`POST /v2/marketfeed/quote` and `POST /v2/marketfeed/ltp` REMAIN REMOVED**
+(the §3 REMOVE row stands). Per Quote 2, the spot-1m data source is
+"clearly historical data api" — any cadence-scheduler spot slot MUST use
+`charts/intraday` under the Data-API 5/sec bucket, NEVER the marketfeed
+quote endpoints (Quote-API 1/sec bucket). Re-adding a marketfeed caller
+requires a fresh dated quote HERE first.
+
+## §10.4 Cross-references + honest envelope
+
+Consistent with `dhan-rest-only-noise-lock-2026-07-14.md` §1 (same-day
+operator lock: "for Dhan except spot 1m and option chain nothing else should
+work") and with this PR's cross-source-chain-coverage rule. Honest envelope:
+this section changes ZERO code and ZERO config — it is the dated record that
+the two legs are authorized + enabled; whether Dhan actually SERVES same-day
+intraday candles remains the open vendor-side question the §10.2 probes
+measure (the chain leg is serving normally — 735/735 on 2026-07-14).
+
+## §10.5 Trigger (auto-loaded)
+
+Covered by the §6 trigger list (the `charts/intraday`, `optionchain`,
+`spot_1m_rest`, `option_chain_1m` strings already activate this file).
