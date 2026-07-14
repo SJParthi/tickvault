@@ -1,6 +1,6 @@
 //! Dhan API endpoint coverage tests.
 //!
-//! Verifies that all 55 Dhan API endpoints have URL constants or are
+//! Verifies that all 57 Dhan API endpoints have URL constants or are
 //! documented as intentionally skipped. Prevents endpoint drift where
 //! new endpoints are added to api_client.rs using inline strings without
 //! corresponding constants in constants.rs.
@@ -26,6 +26,10 @@ use tickvault_common::constants::{
     DHAN_MARGIN_CALCULATOR_MULTI_PATH,
     DHAN_MARGIN_CALCULATOR_PATH,
     DHAN_MODIFY_IP_PATH,
+    // Option chain (2) — 2026-07-12 §8 rebuild, consumed by
+    // crates/app/src/option_chain_1m_boot.rs (scheduled pull)
+    DHAN_OPTION_CHAIN_EXPIRYLIST_PATH,
+    DHAN_OPTION_CHAIN_PATH,
     DHAN_PNL_EXIT_PATH,
     DHAN_POSITIONS_CONVERT_PATH,
     DHAN_POSITIONS_PATH,
@@ -44,12 +48,15 @@ use tickvault_common::constants::{
 // Test: All Dhan REST endpoint constants are defined and have correct paths
 // ---------------------------------------------------------------------------
 
-/// Verifies that constants exist for all 17 implemented Dhan REST endpoints
+/// Verifies that constants exist for all 19 implemented Dhan REST endpoints
 /// in constants.rs, and that each constant maps to the correct v2 API path.
 ///
 /// Endpoint groups covered:
 /// - Authentication: generateAccessToken, RenewToken
 /// - Historical data: charts/intraday, charts/historical
+/// - Option chain: optionchain, optionchain/expirylist (2026-07-12 §8
+///   rebuild — LIVE consumers in crates/app/src/option_chain_1m_boot.rs,
+///   the per-minute scheduled pull; NOT api_client.rs)
 /// - User profile: profile
 /// - IP management: setIP, modifyIP, getIP
 /// - Portfolio: holdings, positions, positions/convert
@@ -76,6 +83,21 @@ fn test_all_dhan_rest_endpoint_constants_defined() {
     assert_eq!(
         DHAN_CHARTS_HISTORICAL_PATH, "/charts/historical",
         "POST api.dhan.co/v2/charts/historical"
+    );
+
+    // --- Option chain (docs/dhan-ref/06-option-chain.md) ---
+    // Deleted 2026-06-28 with the retired core option_chain subsystem;
+    // REBUILT 2026-07-12 as the app-crate per-minute scheduled pull
+    // (no-rest-except-live-feed-2026-06-27.md §8; [option_chain_1m].enabled
+    // = true in base.toml since 2026-07-13). Consumer:
+    // crates/app/src/option_chain_1m_boot.rs — constants-backed, live.
+    assert_eq!(
+        DHAN_OPTION_CHAIN_PATH, "/optionchain",
+        "POST api.dhan.co/v2/optionchain"
+    );
+    assert_eq!(
+        DHAN_OPTION_CHAIN_EXPIRYLIST_PATH, "/optionchain/expirylist",
+        "POST api.dhan.co/v2/optionchain/expirylist"
     );
 
     // --- User profile (docs/dhan-ref/02-authentication.md) ---
@@ -140,13 +162,18 @@ fn test_all_dhan_rest_endpoint_constants_defined() {
     );
 
     // --- Count verification ---
-    // 17 REST endpoint path constants in constants.rs
-    // (2026-07-14: +1 /alerts/multi/orders — Conditional & Multi Order family)
+    // 19 REST endpoint path constants in constants.rs
+    // (2026-07-14: +1 /alerts/multi/orders — Conditional & Multi Order family;
+    // 2026-07-14 review fix: +2 option-chain constants — they were LIVE since
+    // the 2026-07-12 §8 rebuild but absent from this ledger, which falsely
+    // claimed them "no longer implemented")
     let rest_paths: &[&str] = &[
         DHAN_GENERATE_TOKEN_PATH,
         DHAN_RENEW_TOKEN_PATH,
         DHAN_CHARTS_INTRADAY_PATH,
         DHAN_CHARTS_HISTORICAL_PATH,
+        DHAN_OPTION_CHAIN_PATH,
+        DHAN_OPTION_CHAIN_EXPIRYLIST_PATH,
         DHAN_USER_PROFILE_PATH,
         DHAN_SET_IP_PATH,
         DHAN_MODIFY_IP_PATH,
@@ -163,8 +190,8 @@ fn test_all_dhan_rest_endpoint_constants_defined() {
     ];
     assert_eq!(
         rest_paths.len(),
-        17,
-        "Expected 17 REST endpoint path constants in constants.rs"
+        19,
+        "Expected 19 REST endpoint path constants in constants.rs"
     );
 
     // All paths must start with '/'
@@ -337,16 +364,19 @@ fn test_skipped_endpoints_documented() {
 /// - Conditional & Multi Order (6): create, modify, delete, get-one, get-all, place-multi (2026-07-14; place-multi is constants-backed)
 /// - EDIS (3): tpin, form, inquire
 /// - Statements (2): ledger, trade-history
-/// - Option chain: REMOVED 2026-06-28 (option_chain client deleted)
+/// - Option chain via constants (2): optionchain, expirylist — core client
+///   deleted 2026-06-28, REBUILT 2026-07-12 as the app-crate per-minute
+///   scheduled pull (crates/app/src/option_chain_1m_boot.rs; counted in the
+///   19 constants, NOT in api_client.rs)
 /// - Portfolio via constant (3): holdings, positions, positions/convert
 /// - Funds/margin via constant (3): margin-calc, margin-multi, fund-limit
 /// - Trader's control via constant (2): killswitch, pnl-exit
 /// - Exit-all (DELETE /positions) shares DHAN_POSITIONS_PATH (1, counted above)
 ///
-/// Total unique paths: 17 (constants) + 16 (inline in api_client) = 33 (option_chain's 2 removed 2026-06-28; +1 constants-backed /alerts/multi/orders 2026-07-14)
-/// Plus 4 WebSocket URLs = 41 endpoint URLs
+/// Total unique paths: 19 (constants) + 16 (inline in api_client) = 35 (+1 constants-backed /alerts/multi/orders 2026-07-14; +2 option-chain constants re-counted 2026-07-14 — live since the 2026-07-12 §8 rebuild)
+/// Plus 4 WebSocket URLs = 39 endpoint URLs
 /// Plus 14 parameterized variants (e.g., /orders/{id}) that share base paths
-/// Grand total of distinct API operations: 55
+/// Grand total of distinct API operations: 57
 #[test]
 fn test_oms_inline_endpoint_paths_documented() {
     // --- Orders (docs/dhan-ref/07-orders.md) ---
@@ -442,11 +472,15 @@ fn test_oms_inline_endpoint_paths_documented() {
         "Statements: 2 endpoint operations"
     );
 
-    // --- Option chain — REMOVED 2026-06-28 ---
-    // The option_chain REST client (crates/core/src/option_chain/client.rs)
-    // was deleted with the entire option_chain subsystem (operator directive
-    // 2026-06-28). The `/optionchain` + `/optionchain/expirylist` endpoints
-    // are no longer implemented in our codebase.
+    // --- Option chain — deleted 2026-06-28, REBUILT 2026-07-12 (§8) ---
+    // The core option_chain REST client (crates/core/src/option_chain/) was
+    // deleted with the retired subsystem (operator directive 2026-06-28).
+    // A NEW per-minute scheduled-pull surface was authorized 2026-07-12
+    // (no-rest-except-live-feed-2026-06-27.md §8) and is LIVE: constants
+    // DHAN_OPTION_CHAIN_PATH + DHAN_OPTION_CHAIN_EXPIRYLIST_PATH are
+    // consumed by crates/app/src/option_chain_1m_boot.rs (enabled in
+    // base.toml since 2026-07-13). Both are counted in the 19
+    // constants-backed endpoints above — there is NO api_client.rs sender.
 
     // --- Exit all positions ---
     // Uses DELETE on DHAN_POSITIONS_PATH (/positions), already counted above.
@@ -456,16 +490,19 @@ fn test_oms_inline_endpoint_paths_documented() {
         "Exit-all shares the /positions path (DELETE method)"
     );
 
-    // --- Grand total (2026-06-28: option_chain client removed, −2) ---
-    // 17 constants-backed REST endpoints
+    // --- Grand total ---
+    // 19 constants-backed REST endpoints
     // 2026-07-14: +1 /alerts/multi/orders (Conditional & Multi Order family)
-    // + 16 inline base paths in api_client.rs (was 18 = the OMS inline set +
-    //   the 2 option_chain/client.rs local-constant paths; the option_chain
-    //   client was deleted 2026-06-28, so the 2 option-chain paths are gone → 16)
+    // 2026-07-14 review fix: +2 option-chain constants (LIVE since the
+    //   2026-07-12 §8 rebuild in crates/app — the prior 17/51/55 totals
+    //   undercounted reality by exactly these 2)
+    // + 16 inline base paths in api_client.rs (the OMS inline set; the 2
+    //   option-chain paths moved from the deleted core client's local
+    //   constants to constants.rs, so they count in the 19, never here)
     // + 14 parameterized variants ({order-id}, {correlation-id}, {alertId}, {isin}, {leg}, {dates})
     // + 4 WebSocket endpoints
-    let constants_rest_count: usize = 17;
-    let inline_base_paths: usize = 16; // unique base paths in api_client.rs (option_chain removed 2026-06-28)
+    let constants_rest_count: usize = 19;
+    let inline_base_paths: usize = 16; // unique base paths in api_client.rs
     let parameterized_variants: usize = 14; // {id} variants
     let websocket_count: usize = 4;
     let skipped_count: usize = 4;
@@ -473,15 +510,15 @@ fn test_oms_inline_endpoint_paths_documented() {
     let total_implemented =
         constants_rest_count + inline_base_paths + parameterized_variants + websocket_count;
     assert_eq!(
-        total_implemented, 51,
-        "51 implemented endpoint operations (option_chain's 2 removed 2026-06-28; /alerts/multi/orders added 2026-07-14)"
+        total_implemented, 53,
+        "53 implemented endpoint operations (/alerts/multi/orders added 2026-07-14; option-chain's 2 constants re-counted 2026-07-14 — live since the 2026-07-12 §8 rebuild)"
     );
 
     // Plus the 4 intentionally skipped = total Dhan API endpoints known
     let total_known = total_implemented + skipped_count;
     assert_eq!(
-        total_known, 55,
-        "55 total known Dhan API endpoints (51 implemented + 4 skipped)"
+        total_known, 57,
+        "57 total known Dhan API endpoints (53 implemented + 4 skipped)"
     );
 }
 
@@ -533,6 +570,8 @@ fn test_path_constants_are_paths_not_full_urls() {
         DHAN_RENEW_TOKEN_PATH,
         DHAN_CHARTS_INTRADAY_PATH,
         DHAN_CHARTS_HISTORICAL_PATH,
+        DHAN_OPTION_CHAIN_PATH,
+        DHAN_OPTION_CHAIN_EXPIRYLIST_PATH,
         DHAN_USER_PROFILE_PATH,
         DHAN_SET_IP_PATH,
         DHAN_MODIFY_IP_PATH,

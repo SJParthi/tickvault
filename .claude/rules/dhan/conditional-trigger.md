@@ -57,7 +57,13 @@
 
 7. **`comparingValue` type wobble:** bare number in the request, STRING
    (`"250.00"`) in the GET response. Tolerate both (`DhanNumeric`). Same for
-   `lastPrice` (string in the doc example, number in the yaml).
+   `lastPrice` (string in the doc example, number in the yaml). The ENTIRE
+   GET echo is parsed tolerantly — condition via `TriggerConditionDetail`
+   AND the order legs via `TriggerOrderDetail` (all fields defaulted,
+   prices `DhanNumeric`; the OpenAPI yaml marks NO order sub-field
+   required) — NEVER with the strict request-side structs: one
+   UI-created sparse leg must not brick a GET or the whole GET-all list
+   (2026-07-14 review fix).
 
 8. **`createdTime`/`triggeredTime` are ISO-8601 UTC `Z`** — the ONLY UTC
    timestamps in the trading-API family (everything else is IST strings).

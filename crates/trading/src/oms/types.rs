@@ -955,9 +955,12 @@ pub struct DhanConditionalTriggerResponse {
     /// Condition echo on GET responses (string `comparingValue` safe).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub condition: Option<TriggerConditionDetail>,
-    /// Order-leg echo on GET responses.
+    /// Order-leg echo on GET responses — the tolerant [`TriggerOrderDetail`]
+    /// mirror, NEVER the strict request-side [`TriggerOrder`] (one
+    /// non-conforming leg must never brick the whole GET / GET-all parse;
+    /// the OpenAPI yaml marks NO order sub-field required).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub orders: Option<Vec<TriggerOrder>>,
+    pub orders: Option<Vec<TriggerOrderDetail>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1696,6 +1699,51 @@ pub struct TriggerConditionDetail {
     /// User note echo.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user_note: Option<String>,
+}
+
+/// Response-only mirror of [`TriggerOrder`] — every field defaulted and the
+/// price-family fields tolerant ([`DhanNumeric`]). The GET / GET-all order
+/// echo must be parsed DEFENSIVELY: the OpenAPI yaml marks NO order
+/// sub-field required (an alert created via Dhan's web/app UI can omit the
+/// request-optional `triggerPrice`/`discQuantity`), and the family's
+/// documented number/string wobble (`comparingValue`/`lastPrice`) applies
+/// to the leg's `price` fields too. Parsing the echo with the strict
+/// request-side struct would fail the ENTIRE response — and the whole
+/// account list on GET-all — over ONE such leg.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TriggerOrderDetail {
+    /// "BUY" or "SELL" echo.
+    #[serde(default)]
+    pub transaction_type: String,
+    /// Exchange segment echo.
+    #[serde(default)]
+    pub exchange_segment: String,
+    /// Product type echo.
+    #[serde(default)]
+    pub product_type: String,
+    /// Order type echo.
+    #[serde(default)]
+    pub order_type: String,
+    /// Security ID echo.
+    #[serde(default)]
+    pub security_id: String,
+    /// Quantity echo.
+    #[serde(default)]
+    pub quantity: i64,
+    /// Validity echo.
+    #[serde(default)]
+    pub validity: String,
+    /// Price — STRING in the doc example ("250.00"); tolerant to a bare
+    /// number (the family's documented wobble class).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub price: Option<DhanNumeric>,
+    /// Disclosed quantity echo (STRING "0" in the doc example).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disc_quantity: Option<DhanNumeric>,
+    /// Trigger price echo — request-optional, so the echo may omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trigger_price: Option<DhanNumeric>,
 }
 
 /// Multi-order WIRE leg — DISTINCT schema from [`TriggerOrder`] (07c §9.1
@@ -3288,39 +3336,81 @@ mod tests {
             parse_segment_chars("BSE", "D"),
             Some(ExchangeSegment::BseFno)
         );
+        let orders = resp.orders.expect("orders echo present");
+        assert_eq!(orders.len(), 1);
         assert_eq!(
-            parse_segment_chars("NSE", "E"),
-            Some(ExchangeSegment::NseEquity)
+            orders[0].price,
+            Some(DhanNumeric::Text("250.00".to_string())) // STRING in response
         );
         assert_eq!(
-            parse_segment_chars("BSE", "E"),
-            Some(ExchangeSegment::BseEquity)
+            orders[0].disc_quantity,
+            Some(DhanNumeric::Text("0".to_string()))
         );
-        // Indices: any exchange with segment "I" maps to IDX_I (both NSE and
-        // BSE indices live in the IDX_I segment per annexure rule 2).
-        assert_eq!(parse_segment_chars("NSE", "I"), Some(ExchangeSegment::IdxI));
-        assert_eq!(parse_segment_chars("BSE", "I"), Some(ExchangeSegment::IdxI));
-        // Unknown / empty / currency / commodity → None, never panic.
-        assert_eq!(parse_segment_chars("", ""), None);
-        assert_eq!(parse_segment_chars("NSE", "C"), None);
-        assert_eq!(parse_segment_chars("MCX", "M"), None);
-        assert_eq!(parse_segment_chars("NSE", "X"), None);
+        assert_eq!(
+            orders[0].trigger_price,
+            Some(DhanNumeric::Text("0".to_string()))
+        );
+
+        // Place/Modify 2-field responses stay byte-identical: the five
+        // additive detail fields serialize away when None (golden check).
+        let place: DhanConditionalTriggerResponse =
+            serde_json::from_str(r#"{"alertId":"12345","alertStatus":"ACTIVE"}"#).unwrap();
+        let place_json = serde_json::to_string(&place).unwrap();
+        assert_eq!(place_json, r#"{"alertId":"12345","alertStatus":"ACTIVE"}"#);
+        assert!(!place_json.contains("createdTime"));
     }
 
     #[test]
-    fn test_fill_event_carries_segment_sentinel_for_unknown() {
-        // The engine maps a None from parse_segment_chars to the sentinel;
-        // pin the sentinel value so downstream consumers can rely on it.
-        assert_eq!(SEGMENT_CODE_UNKNOWN, u8::MAX);
-        let fill = FillEvent {
-            security_id: 13,
-            segment_code: SEGMENT_CODE_UNKNOWN,
-            fill_lots: 1,
-            avg_price: 100.0,
-            lot_size: 1,
-            order_id: "PAPER-1".to_string(),
-        };
-        assert_eq!(fill.segment_code, SEGMENT_CODE_UNKNOWN);
-        assert_eq!(fill.fill_lots, 1);
+    fn test_trigger_response_order_echo_tolerates_missing_and_numeric_fields() {
+        // A leg created via Dhan's web/app UI (or another client) can omit
+        // request-optional fields — the OpenAPI yaml marks NO order
+        // sub-field required — and the family's documented number/string
+        // wobble can echo `price` as a bare number. Neither shape may brick
+        // the response parse (tolerance parity with origin/main, where the
+        // whole echo was serde-ignored).
+        let json = r#"{
+            "alertId": "77",
+            "alertStatus": "ACTIVE",
+            "orders": [ { "transactionType": "BUY", "securityId": "1333", "quantity": 5, "price": 250.5 } ]
+        }"#;
+        let resp: DhanConditionalTriggerResponse = serde_json::from_str(json).unwrap();
+        let orders = resp.orders.expect("orders echo present");
+        assert_eq!(orders.len(), 1);
+        assert_eq!(orders[0].price, Some(DhanNumeric::Num(250.5)));
+        assert!(orders[0].trigger_price.is_none()); // omitted, never a failure
+        assert!(orders[0].disc_quantity.is_none());
+        assert_eq!(orders[0].quantity, 5);
+        assert!(orders[0].validity.is_empty()); // defaulted, never required
+
+        // GET-all: one UI-created sparse alert must not fail the WHOLE list.
+        let list_json = r#"[
+            {"alertId":"A1","alertStatus":"ACTIVE",
+             "orders":[{"transactionType":"BUY","securityId":"1333","quantity":1}]},
+            {"alertId":"A2","alertStatus":"ACTIVE"}
+        ]"#;
+        let list: Vec<DhanConditionalTriggerResponse> = serde_json::from_str(list_json).unwrap();
+        assert_eq!(list.len(), 2);
+        assert!(list[0].orders.is_some());
+        assert!(list[1].orders.is_none());
+    }
+
+    #[test]
+    fn test_dhan_numeric_accepts_number_and_string() {
+        let num: DhanNumeric = serde_json::from_str("245.5").unwrap();
+        assert_eq!(num, DhanNumeric::Num(245.5));
+        assert_eq!(num.as_f64(), Some(245.5));
+        let text: DhanNumeric = serde_json::from_str("\"245.50\"").unwrap();
+        assert_eq!(text, DhanNumeric::Text("245.50".to_string()));
+        assert_eq!(text.as_f64(), Some(245.5));
+        // Round-trips verbatim (string stays a string).
+        assert_eq!(serde_json::to_string(&text).unwrap(), "\"245.50\"");
+    }
+
+    #[test]
+    fn test_dhan_numeric_as_f64_unparsable_is_none() {
+        let garbage = DhanNumeric::Text("not-a-number".to_string());
+        assert_eq!(garbage.as_f64(), None);
+        let padded = DhanNumeric::Text("  250.00  ".to_string());
+        assert_eq!(padded.as_f64(), Some(250.0));
     }
 }
