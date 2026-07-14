@@ -136,7 +136,13 @@ else
   fi
 fi
 
-# 3a. compose v2 plugin (`docker compose`).
+# 3a. compose v2 plugin (`docker compose`). Since 2026-07-14 the deploy
+#     script (.github/workflows/deploy-aws.yml SSM block) ENSURES this plugin
+#     on every deploy — pinned + sha256-verified static install to
+#     /usr/local/lib/docker/cli-plugins/docker-compose when the distro repo
+#     lacks it. That dir is the docker CLI's system-wide plugin dir, so
+#     `docker compose` works for ANY user here (service-user boot included);
+#     rung 3c below also probes that exact path directly as belt-and-braces.
 if dtimeout compose version >/dev/null 2>&1; then
   if ctimeout docker compose -f "$COMPOSE_FILE" up -d "$SVC"; then
     log "recreated via 'docker compose' (v2)"
