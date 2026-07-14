@@ -576,7 +576,7 @@ jobs:
   # filesystem disagrees with the list below (a new/renamed file must be
   # added to the list). Side 2 — each cargo test step asserts the EXECUTED
   # target count ("Running tests/dhat_" lines) equals its expected count
-  # (9 core / 3 storage / 3 trading), so a `--test` flag dropped from a
+  # (11 core / 3 storage / 3 trading / 1 app), so a `--test` flag dropped from a
   # run step (while the file + list entry survive) fails loudly instead of
   # silently un-gating that target (2026-07-09 adversarial-review HIGH).
   #
@@ -600,6 +600,7 @@ jobs:
           set -euo pipefail
           actual=$(ls crates/*/tests/dhat_*.rs | LC_ALL=C sort)
           expected=$(LC_ALL=C sort <<'EOF'
+          crates/app/tests/dhat_mark_forward.rs
           crates/core/tests/dhat_allocation.rs
           crates/core/tests/dhat_feed_consumer.rs
           crates/core/tests/dhat_feed_lag_groww.rs
@@ -717,6 +718,27 @@ jobs:
           ran=$(grep -c 'Running.*tests/dhat_' /tmp/dhat-trading.log || true)
           if [ "$ran" -ne 3 ]; then
             echo "::error::trading DHAT step executed $ran targets, expected 3 — a --test flag was dropped from this step."
+            exit 1
+          fi
+
+      # Added 2026-07-14 (order-runtime dry-run PR): the app crate's first
+      # dhat target — the Groww-bridge mark-forward tap. Feature-UNGATED
+      # (house pattern), so Test (app) also runs it; this lane is the
+      # allocation-ratchet authority per the header note above.
+      - name: DHAT (app)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p tickvault-app \
+            --test dhat_mark_forward \
+            2>&1 | tee /tmp/dhat-app.log
+          if grep -q 'running 0 tests' /tmp/dhat-app.log; then
+            echo "::error::an app dhat target ran ZERO tests — vacuous green. Rule 11: no false-OK."
+            exit 1
+          fi
+          ran=$(grep -c 'Running.*tests/dhat_' /tmp/dhat-app.log || true)
+          if [ "$ran" -ne 1 ]; then
+            echo "::error::app DHAT step executed $ran targets, expected 1 — a --test flag was dropped from this step."
             exit 1
           fi
 
