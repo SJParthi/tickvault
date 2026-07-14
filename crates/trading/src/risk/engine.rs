@@ -175,6 +175,29 @@ impl RiskEngine {
         fill_price: f64,
         lot_size: u32,
     ) {
+        // S1 (fix-round 2026-07-14): mirror `update_market_price`'s guard —
+        // the fill side was ASYMMETRICALLY unguarded. A non-finite or
+        // non-positive fill price poisons realized P&L / avg_entry with
+        // NaN/±inf, and a NaN `total_pnl` silently BYPASSES the daily-loss
+        // halt comparison (`NaN < 0.0` is false). Reject loudly, never fold.
+        if !fill_price.is_finite() || fill_price <= 0.0 {
+            error!(
+                code = ErrorCode::RiskGapPositionPnl.code_str(),
+                security_id,
+                filled_lots,
+                fill_price,
+                "RISK-GAP-02: fill REJECTED — non-finite or non-positive fill \
+                 price (would poison P&L and silently bypass the daily-loss halt)"
+            );
+            metrics::counter!("tv_risk_fill_rejected_total", "reason" => "invalid_price")
+                .increment(1);
+            return;
+        }
+        if filled_lots == 0 {
+            // Zero-lot no-op guard: nothing to book (defensive — the engine
+            // never emits zero-lot FillEvents).
+            return;
+        }
         let pos = self.positions.entry(security_id).or_default();
         // 2026-07-14 unrealized-P&L fix: store the lot size so mark-to-market
         // P&L multiplies by the SAME contract multiplier realized P&L uses.
@@ -193,9 +216,28 @@ impl RiskEngine {
                 // Short position being closed by buy
                 pos.avg_entry_price - fill_price
             };
-            let realized = pnl_per_lot * f64::from(closing_lots) * f64::from(lot_size);
-            pos.realized_pnl += realized;
-            self.total_realized_pnl += realized;
+            // C12 (fix-round 2026-07-14): multiply by pos.lot_size (already
+            // normalized `max(1)` above) — the raw `lot_size` arg could be 0,
+            // silently zeroing realized P&L on a close.
+            let realized = pnl_per_lot * f64::from(closing_lots) * f64::from(pos.lot_size);
+            // S1 overflow guard: an extreme-but-finite price can overflow the
+            // product to ±inf; skipping the add (loudly) beats poisoning the
+            // accumulator the halt comparison reads.
+            if realized.is_finite() {
+                pos.realized_pnl += realized;
+                self.total_realized_pnl += realized;
+            } else {
+                error!(
+                    code = ErrorCode::RiskGapPositionPnl.code_str(),
+                    security_id,
+                    fill_price,
+                    closing_lots,
+                    "RISK-GAP-02: realized P&L product overflowed to non-finite — \
+                     SKIPPED (accumulator kept finite; investigate the fill price)"
+                );
+                metrics::counter!("tv_risk_fill_rejected_total", "reason" => "pnl_overflow")
+                    .increment(1);
+            }
             metrics::gauge!("tv_realized_pnl").set(self.total_realized_pnl);
         }
 
@@ -219,6 +261,19 @@ impl RiskEngine {
         }
         // If reversing through zero, just set the new entry price
         if (old_lots > 0 && pos.net_lots < 0) || (old_lots < 0 && pos.net_lots > 0) {
+            pos.avg_entry_price = fill_price;
+        }
+        // S1 repair guard: the weighted average can overflow to non-finite
+        // under extreme-but-finite inputs — repair to the (guarded-finite)
+        // fill price instead of carrying NaN/inf into unrealized P&L.
+        if !pos.avg_entry_price.is_finite() {
+            error!(
+                code = ErrorCode::RiskGapPositionPnl.code_str(),
+                security_id,
+                fill_price,
+                "RISK-GAP-02: avg_entry_price overflowed to non-finite — repaired \
+                 to the fill price (P&L accuracy degraded for this position)"
+            );
             pos.avg_entry_price = fill_price;
         }
     }
@@ -245,6 +300,21 @@ impl RiskEngine {
             return true;
         }
         let (total_pnl, max_loss) = self.daily_loss_state();
+        // S1 fail-closed arm (fix-round 2026-07-14): a non-finite total P&L
+        // means the book is POISONED — `NaN < 0.0` is false, so treating it
+        // as "no loss" would silently bypass the halt. Fail CLOSED instead
+        // (defense-in-depth; the record_fill/update_market_price guards make
+        // this structurally unreachable with guarded inputs).
+        if !total_pnl.is_finite() {
+            error!(
+                code = ErrorCode::RiskGapPreTrade.code_str(),
+                total_pnl,
+                "RISK-GAP-01: total P&L is NON-FINITE — failing CLOSED (halt); \
+                 a poisoned book must never trade"
+            );
+            self.trigger_halt(RiskBreach::MaxDailyLossExceeded);
+            return true;
+        }
         if total_pnl < 0.0 && total_pnl.abs() >= max_loss {
             self.trigger_halt(RiskBreach::MaxDailyLossExceeded);
             return true;
@@ -301,6 +371,22 @@ impl RiskEngine {
     /// Returns the net lots for a specific security (positive = long, negative = short, 0 = flat).
     pub fn net_lots_for(&self, security_id: u64) -> i32 {
         self.positions.get(&security_id).map_or(0, |p| p.net_lots)
+    }
+
+    /// Iterates the security ids of every tracked position row (including
+    /// flat rows) — the union-side input of the order runtime's local
+    /// reconcile invariant (C7 fix-round 2026-07-14: a risk-side position
+    /// absent from the FillEvent mirror must be checkable too).
+    pub fn position_security_ids(&self) -> impl Iterator<Item = u64> + '_ {
+        self.positions.keys().copied()
+    }
+
+    /// Test-only accumulator poison — exercises the fail-closed non-finite
+    /// arm of `evaluate_daily_loss_halt`, which is structurally unreachable
+    /// through the guarded production write paths.
+    #[cfg(test)]
+    pub(crate) fn poison_realized_pnl_for_test(&mut self, value: f64) {
+        self.total_realized_pnl = value;
     }
 
     /// Returns the total realized P&L for today.
@@ -842,15 +928,16 @@ mod tests {
 
     #[test]
     fn test_fill_at_zero_price_no_nan() {
+        // S1 (fix-round 2026-07-14): a 0.0-price fill is now REJECTED
+        // outright (mirror of update_market_price) — previously it was
+        // folded with avg_entry 0.0. Either way: no NaN anywhere.
         let mut engine = make_engine();
         engine.record_fill(1001, 5, 0.0, 25);
-
-        let pos = engine.position(1001).unwrap();
-        assert_eq!(pos.net_lots, 5);
-        assert!((pos.avg_entry_price - 0.0).abs() < 0.01);
-        // Ensure no NaN
-        assert!(!pos.avg_entry_price.is_nan());
-        assert!(!pos.realized_pnl.is_nan());
+        assert!(
+            engine.position(1001).is_none(),
+            "zero-price fill must be rejected, never booked"
+        );
+        assert!(!engine.total_realized_pnl().is_nan());
     }
 
     #[test]
@@ -1327,5 +1414,148 @@ mod tests {
     fn test_pnl_metrics_exported() {
         metrics::gauge!("tv_realized_pnl").set(0.0_f64);
         metrics::gauge!("tv_unrealized_pnl").set(0.0_f64);
+    }
+
+    // -----------------------------------------------------------------------
+    // S1 fix-round (2026-07-14): record_fill finiteness/positivity guards
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_record_fill_rejects_nonfinite_and_nonpositive_price() {
+        let mut engine = make_engine();
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, 0.0, -100.0] {
+            engine.record_fill(1001, 5, bad, 25);
+            assert!(
+                engine.position(1001).is_none(),
+                "fill at price {bad} must be REJECTED (no position row)"
+            );
+        }
+        // A guarded reject must not disturb an EXISTING position either.
+        engine.record_fill(1001, 2, 100.0, 25);
+        engine.record_fill(1001, -2, f64::NAN, 25);
+        let pos = engine.position(1001).expect("position exists"); // APPROVED: test
+        assert_eq!(pos.net_lots, 2, "NaN close must not touch the position");
+        assert!(pos.realized_pnl.is_finite());
+        assert!(engine.total_realized_pnl().is_finite());
+    }
+
+    #[test]
+    fn test_record_fill_zero_lots_is_noop() {
+        let mut engine = make_engine();
+        engine.record_fill(1001, 0, 100.0, 25);
+        // A lot_size row may be created-or-not; net effect must be flat + 0 P&L.
+        assert_eq!(engine.net_lots_for(1001), 0);
+        assert!((engine.total_realized_pnl() - 0.0).abs() < f64::EPSILON);
+    }
+
+    /// C12: a raw `lot_size = 0` argument must not zero realized P&L on a
+    /// close — the realized product uses the normalized position lot size.
+    #[test]
+    fn test_record_fill_lot_size_zero_realized_uses_normalized() {
+        let mut engine = make_engine();
+        engine.record_fill(1001, 4, 100.0, 0);
+        engine.record_fill(1001, -4, 110.0, 0);
+        // (110-100) × 4 lots × lot_size max(0,1)=1 = 40 — never 0.
+        assert!(
+            (engine.total_realized_pnl() - 40.0).abs() < f64::EPSILON,
+            "realized must use the normalized lot size, got {}",
+            engine.total_realized_pnl()
+        );
+    }
+
+    /// S1 overflow arm: a realized product that overflows to ±inf is skipped
+    /// loudly — the accumulator the halt comparison reads stays finite.
+    #[test]
+    fn test_realized_overflow_skipped_keeps_accumulator_finite() {
+        let mut engine = make_engine();
+        let huge = f64::MAX / 2.0;
+        engine.record_fill(1001, 1, huge, 25);
+        // Closing at a tiny price: pnl_per_lot ≈ -huge; × 25 overflows → -inf
+        // → the add is SKIPPED (counted + coded error), accumulator finite.
+        engine.record_fill(1001, -1, 1.0, 25);
+        assert!(
+            engine.total_realized_pnl().is_finite(),
+            "overflowed realized product must never poison the accumulator"
+        );
+        assert_eq!(engine.net_lots_for(1001), 0, "position math still applies");
+    }
+
+    /// S1 fail-closed arm: a non-finite total P&L HALTS (fail-closed), never
+    /// reads as "no loss". Structurally unreachable through guarded writes —
+    /// exercised via the test-only poison setter.
+    #[test]
+    fn test_evaluate_daily_loss_halt_fails_closed_on_nonfinite_pnl() {
+        for poison in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let mut engine = make_engine();
+            engine.poison_realized_pnl_for_test(poison);
+            assert!(
+                engine.evaluate_daily_loss_halt(),
+                "non-finite total P&L ({poison}) must fail CLOSED"
+            );
+            assert!(engine.is_halted());
+            assert_eq!(engine.halt_reason(), Some(RiskBreach::MaxDailyLossExceeded));
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // M4/F13: the halt fires the alert sink exactly once per episode
+    // -----------------------------------------------------------------------
+
+    struct CountingSink {
+        fires: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        last_reason: std::sync::Arc<std::sync::Mutex<String>>,
+    }
+
+    impl RiskAlertSink for CountingSink {
+        fn fire_risk_halt(&self, reason: &'static str) {
+            self.fires.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            *self
+                .last_reason
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = reason.to_string();
+        }
+    }
+
+    #[test]
+    fn test_halt_fires_risk_halt_once_per_episode() {
+        let fires = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let last_reason = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let mut engine = make_engine();
+        engine.set_alert_sink(Box::new(CountingSink {
+            fires: std::sync::Arc::clone(&fires),
+            last_reason: std::sync::Arc::clone(&last_reason),
+        }));
+        // Open 1 lot @400 with lot_size 75, mark to 100 → unrealized
+        // -22,500 ≥ the 20,000 threshold (2% of 10L).
+        engine.record_fill(1001, 1, 400.0, 75);
+        engine.update_market_price(1001, 100.0);
+        assert!(engine.evaluate_daily_loss_halt(), "breach must halt");
+        assert!(
+            engine.evaluate_daily_loss_halt(),
+            "second evaluation stays halted"
+        );
+        assert_eq!(
+            fires.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the RiskHalt sink must fire EXACTLY once per halt episode"
+        );
+        assert_eq!(
+            *last_reason
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            "MaxDailyLossExceeded"
+        );
+    }
+
+    /// C7 companion: the position-sid iterator surfaces every tracked row.
+    #[test]
+    fn test_position_security_ids_iterates_tracked_rows() {
+        let mut engine = make_engine();
+        assert_eq!(engine.position_security_ids().count(), 0);
+        engine.record_fill(1001, 1, 100.0, 25);
+        engine.record_fill(2002, -1, 200.0, 25);
+        let mut sids: Vec<u64> = engine.position_security_ids().collect();
+        sids.sort_unstable();
+        assert_eq!(sids, vec![1001, 2002]);
     }
 }
