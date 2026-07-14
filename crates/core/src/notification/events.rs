@@ -1161,6 +1161,39 @@ pub enum NotificationEvent {
         down_secs: u64,
     },
 
+    /// A feed GAP EPISODE opened (Groww hardening PR-3, 2026-07-14): the
+    /// feed-level last-tick age crossed `FEED_GAP_EPISODE_THRESHOLD_SECS`
+    /// in-session. ONE bubble per episode (edge-latched — never per-poll
+    /// spam). The durable twin is the `feed_gap_audit` OPEN row; this event
+    /// is the operator-visible half of the same edge. Severity::High —
+    /// pages once per episode.
+    FeedGapEpisodeOpened {
+        /// Feed display name (e.g. "Groww").
+        feed: String,
+        /// Gap detection instant as an IST HH:MM label (12-hour style is
+        /// handled at the format site; the producer sends "HH:MM").
+        start_hhmm_ist: String,
+        /// `true` in paper/dry-run mode — the body then reassures the
+        /// operator no live orders exist.
+        dry_run: bool,
+    },
+
+    /// A feed GAP EPISODE closed (recovery edge): liveness advanced again
+    /// after an open episode. Carries the MEASURED gap, the stall-restart
+    /// count inside the episode (`-1` sentinel = not cheaply measurable),
+    /// and the NAMED partial 1-minute bars the gap overlapped — annotation
+    /// only, never a repair claim (`candles_*` untouched). Severity::Info.
+    FeedGapEpisodeClosed {
+        /// Feed display name (e.g. "Groww").
+        feed: String,
+        /// Measured gap in whole seconds.
+        gap_secs: u64,
+        /// Stall-watchdog restarts inside the episode; `-1` = unknown.
+        kill_count: i64,
+        /// Comma list of partial 1m bucket labels (bounded, may be empty).
+        partial_minutes: String,
+    },
+
     /// Instrument build failed — includes manual trigger URL for retry.
     InstrumentBuildFailed {
         /// Error description.
@@ -2114,7 +2147,9 @@ impl NotificationEvent {
             | Self::FeedInstrumentsLoaded { feed, .. }
             | Self::FeedConnectedAwaitingTicks { feed, .. }
             | Self::FeedDown { feed, .. }
-            | Self::FeedRecovered { feed, .. } => feed_badge_for_name(feed).map(|b| b.badge()),
+            | Self::FeedRecovered { feed, .. }
+            | Self::FeedGapEpisodeOpened { feed, .. }
+            | Self::FeedGapEpisodeClosed { feed, .. } => feed_badge_for_name(feed).map(|b| b.badge()),
             // ── WS sleep/wake: badge follows the `feed` field, falling
             //    back to Dhan — the live values are "main"/"order_update"
             //    (both Dhan WebSocket types); a future feed value like
@@ -3468,6 +3503,53 @@ impl NotificationEvent {
                     feed_name = html_escape(feed),
                 )
             }
+            Self::FeedGapEpisodeOpened {
+                feed,
+                start_hhmm_ist,
+                dry_run,
+            } => {
+                // One bubble per gap episode (audit Rule 4 edge discipline).
+                // Plain English per the 10 Telegram commandments — no
+                // library names, no file paths; the paper-mode clause keeps
+                // the page calm when no live orders exist.
+                let feed_name = html_escape(feed).to_uppercase();
+                let since = html_escape(start_hhmm_ist);
+                let paper = if *dry_run {
+                    " (paper mode — no live orders exist)"
+                } else {
+                    ""
+                };
+                format!(
+                    "🟡 <b>{feed_name} — feed paused — reconnecting</b>\n\
+                     No prices since {since} IST. The system is reconnecting \
+                     automatically — no restart needed.{paper}"
+                )
+            }
+            Self::FeedGapEpisodeClosed {
+                feed,
+                gap_secs,
+                kill_count,
+                partial_minutes,
+            } => {
+                // Annotation, never repair: the partial bars are NAMED so
+                // the operator knows which 1-minute bars are thin — they
+                // are never back-filled or fabricated (live-feed purity).
+                let feed_name = html_escape(feed).to_uppercase();
+                let restarts = if *kill_count < 0 {
+                    "restarts not measured".to_string()
+                } else {
+                    format!("{kill_count} restart(s)")
+                };
+                let bars = if partial_minutes.is_empty() {
+                    "none".to_string()
+                } else {
+                    html_escape(partial_minutes)
+                };
+                format!(
+                    "🟢 <b>{feed_name} — feed recovered</b>\n\
+                     gap {gap_secs}s, {restarts}; partial 1-minute bars: {bars}"
+                )
+            }
             Self::InstrumentBuildFailed {
                 reason,
                 manual_trigger_url,
@@ -3940,6 +4022,8 @@ impl NotificationEvent {
             Self::FeedConnectedAwaitingTicks { .. } => "FeedConnectedAwaitingTicks",
             Self::FeedDown { .. } => "FeedDown",
             Self::FeedRecovered { .. } => "FeedRecovered",
+            Self::FeedGapEpisodeOpened { .. } => "FeedGapEpisodeOpened",
+            Self::FeedGapEpisodeClosed { .. } => "FeedGapEpisodeClosed",
             Self::InstrumentBuildFailed { .. } => "InstrumentBuildFailed",
             Self::IpVerificationFailed { .. } => "IpVerificationFailed",
             Self::IpVerificationSuccess { .. } => "IpVerificationSuccess",
@@ -4338,6 +4422,10 @@ impl NotificationEvent {
             // Mirrors WebSocketReconnected (Medium) — a recovery is
             // operator-visible but never pages SNS.
             Self::FeedRecovered { .. } => Severity::Medium,
+            // Gap-episode bubbles (2026-07-14): opened pages ONCE per
+            // episode (High); closed is the calm Info companion.
+            Self::FeedGapEpisodeOpened { .. } => Severity::High,
+            Self::FeedGapEpisodeClosed { .. } => Severity::Info,
             Self::BootHealthCheck { .. } => Severity::Low,
             Self::OrphanPositionDetected { .. } => Severity::Critical,
             Self::OrphanPositionsClean => Severity::Info,
