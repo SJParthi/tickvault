@@ -1106,6 +1106,45 @@ pub enum ErrorCode {
     /// in-flight mutation stays ambiguous with the ladder clock paused.
     /// Severity::High, auto-triage-safe.
     GrowwOrd10AuthStale,
+
+    // -----------------------------------------------------------------------
+    // Cadence scheduler (operator cadence directive 2026-07-14, judge-locked
+    // design rev-8 — `crates/core/src/cadence/`). Dry-run decision-timing
+    // skeleton: per-minute Dhan (:55 pre-close serialized) + Groww (:00
+    // post-close burst) fetch cadence with structural zero-429 gates,
+    // failure ladder, event-driven per-lane decisions. DEFAULT-OFF.
+    // See cadence-error-codes.md.
+    // -----------------------------------------------------------------------
+    /// CADENCE-01: a cadence lane DEGRADED this cycle — a fetch failed
+    /// (`stage="fetch_failed"`), a 429 arrived despite the gates
+    /// (`stage="rate_limited"` — also a gate-bug signal), a Dhan spot
+    /// returned 200-empty (`stage="spot_empty"`), the Groww burst fell back
+    /// (`stage="groww_fallback"`), a lane borrowed the other broker's data
+    /// (`stage="cross_fill"`), a spot resolved from the chain-embedded
+    /// price (`stage="chain_embedded_spot"`), moneyness classified Unknown
+    /// (`stage="moneyness_unknown"`), or the failure ladder exhausted its
+    /// floor (`stage="ladder_exhausted"`, edge-latched per episode). ONE
+    /// coalesced emission per (lane, cycle), never per-request.
+    /// Severity::High, auto-triage-safe (the next cycle re-attempts; the
+    /// ladder + cross-fill are the self-corrections).
+    Cadence01LaneDegraded,
+    /// CADENCE-02: a cadence lane's decision was HONEST-SKIPPED — the lane
+    /// was incomplete at its cutoff (`stage="cutoff"`), both brokers were
+    /// dead (`stage="both_sources_dead"`), or every underlying classified
+    /// Unknown (`stage="all_unknown"`). Exactly one per (lane, cycle);
+    /// never a late decision, never a decision on missing/stale data.
+    /// Severity::High, auto-triage-safe (the skip IS the fail-closed
+    /// action; the operator inspects the stage at leisure).
+    Cadence02DecisionSkipped,
+    /// CADENCE-03: the cadence scheduler itself DEGRADED — the failure
+    /// ladder shifted a rung (`stage="ladder_shift"`), a wake landed late
+    /// past a slot (`stage="late_wake"`), one or more minute boundaries
+    /// were skipped (`stage="boundary_skipped"`), a clock skew was clamped
+    /// (`stage="skew_clamped"`), the supervised runner respawned
+    /// (`stage="respawn"`), or a gate deferred a NOMINAL slot
+    /// (`stage="gate_deferred_nominal"` — a should-never scheduling-math
+    /// signal). Severity::Medium, auto-triage-safe.
+    Cadence03SchedulerDegraded,
 }
 
 impl ErrorCode {
@@ -1314,6 +1353,10 @@ impl ErrorCode {
             Self::GrowwOrd08AuditWriteFailed => "GROWW-ORD-08",
             Self::GrowwOrd09QuantityRefused => "GROWW-ORD-09",
             Self::GrowwOrd10AuthStale => "GROWW-ORD-10",
+            // Cadence scheduler (operator directive 2026-07-14)
+            Self::Cadence01LaneDegraded => "CADENCE-01",
+            Self::Cadence02DecisionSkipped => "CADENCE-02",
+            Self::Cadence03SchedulerDegraded => "CADENCE-03",
         }
     }
 
@@ -1507,6 +1550,13 @@ impl ErrorCode {
             | Self::GrowwMarg02PersistFailed
             | Self::GrowwMarg03SnapshotStaleGateClosed
             | Self::GrowwMarg04EntryRejectedInsufficient => Severity::High,
+            // CADENCE-01/02 (operator 2026-07-14) — a cadence lane degraded
+            // this cycle / a lane decision was honest-skipped. High:
+            // operator eyes on every occurrence (a skip means no decision
+            // input for the minute; a degrade means a broker leg is
+            // failing); never a halt — the record-capture legs and tick
+            // capture are untouched, the next cycle re-attempts.
+            Self::Cadence01LaneDegraded | Self::Cadence02DecisionSkipped => Severity::High,
             // Medium: data pipeline correctness
             // PR #6b (2026-05-19): I-P0-01/02/04/05 retired with their modules.
             Self::InstrumentP1CrossSegmentCollision
@@ -1591,6 +1641,11 @@ impl ErrorCode {
             Self::GrowwOrd05RateLimited
             | Self::GrowwOrd07UnknownStatus
             | Self::GrowwOrd08AuditWriteFailed => Severity::Medium,
+            // CADENCE-03 (operator 2026-07-14): the cadence scheduler
+            // degraded (ladder shift / late wake / boundary skip / respawn)
+            // — self-correcting scheduling telemetry, never data loss;
+            // the lane-level consequences page via CADENCE-01/02. Medium.
+            Self::Cadence03SchedulerDegraded => Severity::Medium,
             // Low: trading-day / Dhan other
             // PR #6a (2026-05-19): I-P1-01 (DailyScheduler) + I-P1-02 (DeltaFieldCoverage) retired
             Self::InstrumentP2TradingDayGuard
@@ -1846,6 +1901,12 @@ impl ErrorCode {
             | Self::GrowwOrd09QuantityRefused
             | Self::GrowwOrd10AuthStale => {
                 ".claude/rules/project/groww-orders-error-codes.md"
+            }
+            // Cadence scheduler (operator directive 2026-07-14)
+            Self::Cadence01LaneDegraded
+            | Self::Cadence02DecisionSkipped
+            | Self::Cadence03SchedulerDegraded => {
+                ".claude/rules/project/cadence-error-codes.md"
             }
         }
     }
@@ -2117,6 +2178,10 @@ impl ErrorCode {
             Self::GrowwOrd08AuditWriteFailed,
             Self::GrowwOrd09QuantityRefused,
             Self::GrowwOrd10AuthStale,
+            // Cadence scheduler (operator directive 2026-07-14)
+            Self::Cadence01LaneDegraded,
+            Self::Cadence02DecisionSkipped,
+            Self::Cadence03SchedulerDegraded,
         ]
     }
 }
@@ -2480,48 +2545,12 @@ mod tests {
         // recomputed-from-1m value — coalesced per (feed, date) pass,
         // manual triage) + TF-VERIFY-02 (the daily run degraded —
         // client/query/truncation/flush/budget stage taxonomy) => 148.
-        // 2026-07-14 (Groww hardening PR-3): FEED-GAP-01 (gap-episode
-        // forensics degraded — annotation-only side record) => 149.
-        // 2026-07-14 (🔷 DHAN exit-order layer, Cluster B WP1): bumped
-        // 149 -> 151 for EXIT-ORDER-01 (exit engine call degraded —
-        // validation refusal / Dhan API error / post-fill ENTRY_LEG cancel
-        // refused / slicing anomaly) + EXIT-VERIFY-01 (MPP verify ladder
-        // exhausted with PendingAtLimit / partial-at-budget / Unknown —
-        // fail-closed, never assumed filled). Both log-sink-only.
-        // 2026-07-15 (C4 sweep — Dhan live-WS retirement, operator
-        // 2026-07-13): DROPPED 151 -> 129. The 22 zero-emit-site variants
-        // retained through Phases A/B/C1/C2/C3 were deleted:
-        // INSTR-FETCH-01..04, NTM-CONSTITUENCY-01, PREVDAY-01,
-        // CROSS-VERIFY-1M-01/-02, DHAN-LANE-01..04, WS-GAP-05..09,
-        // AUTH-GAP-06, REST-CANARY-01, SLO-01/02/03 (WS-GAP-04 +
-        // WS-GAP-10 survive — emitted by the retained-dormant
-        // order_update_connection.rs; main's FEED-GAP-01 landed
-        // mid-flight making the pre-merge base 149, and the exit-order
-        // pair #1566 landed during the merge train making it 151 —
-        // hence 151 -> 129, not 148 -> 126).
-        // 2026-07-15 (Groww order fan-out contract stubs): bumped
-        // 129 -> 143. Groww Portfolio 6c.1 contract stubs (§39.3,
-        // 2026-07-14): +4 for GROWW-PORT-01 (snapshot fetch degraded) +
-        // GROWW-PORT-02 (persist failed, best-effort) + GROWW-PORT-03
-        // (recon residual confirmed — manual triage, FUTIDX-02 precedent)
-        // + GROWW-PORT-04 (foreign position — never auto-exited). Plus
-        // +5 GROWW-OCO-01..05 (smart-order placement/sibling-cancel-
-        // unverified/reconcile/modify/poller). All log-sink-only contract
-        // stubs; zero emit sites until the area code PRs land.
-        // 2026-07-15 (Groww margin area, §39.3 slot #4): GROWW-MARG-01..05
-        // (fetch degrade / audit persist / stale-gate-closed /
-        // entry-rejected [manual triage override] / calc divergence) => +5.
-        // 2026-07-15 (Groww orders shared contracts PR-A0, rebased onto
-        // the C4-sweep base of 129): bumped 129 -> 139 for
-        // GROWW-ORD-01..10 (mutation-rejected / ambiguous-outcome /
-        // ambiguity-unresolved [Critical] / reconcile-mismatch [High,
-        // manual triage] / rate-limited / ledger-write-failed /
-        // unknown-status / audit-write-failed / quantity-refused /
-        // auth-stale) — all log-sink-only.
         // 2026-07-15 (merge of #1587 fan-out stubs + main's #1578
         // GROWW-ORD contracts): both families coexist — 129 base + 14
         // (PORT/OCO/MARG) + 10 (ORD) = 153, mechanically recounted.
-        assert_eq!(ErrorCode::all().len(), 153);
+        // 2026-07-16 (rebase onto post-#1540 main): + CADENCE-01/02/03
+        // (cadence scheduler, operator directive 2026-07-14) => 156.
+        assert_eq!(ErrorCode::all().len(), 156);
     }
 
     #[test]
@@ -2565,6 +2594,39 @@ mod tests {
             "GROWW-SCALE-05 runbook missing on disk: {shown}"
         );
         assert!(ErrorCode::all().contains(&code));
+    }
+
+    #[test]
+    fn test_cadence_codes_contract() {
+        // Cadence scheduler (operator directive 2026-07-14, judge-locked
+        // design rev-8): 3 variants, rich stage taxonomy per the house
+        // SPOT1M-01/CHAIN-02 pattern.
+        let c1 = ErrorCode::Cadence01LaneDegraded;
+        assert_eq!(c1.code_str(), "CADENCE-01");
+        assert_eq!("CADENCE-01".parse::<ErrorCode>(), Ok(c1));
+        assert_eq!(c1.severity(), Severity::High);
+        // The ladder + cross-fill are the self-corrections — auto-triage
+        // may inspect.
+        assert!(c1.is_auto_triage_safe());
+
+        let c2 = ErrorCode::Cadence02DecisionSkipped;
+        assert_eq!(c2.code_str(), "CADENCE-02");
+        assert_eq!("CADENCE-02".parse::<ErrorCode>(), Ok(c2));
+        assert_eq!(c2.severity(), Severity::High);
+        // The skip IS the fail-closed action (design §0 ErrorCodes ruling).
+        assert!(c2.is_auto_triage_safe());
+
+        let c3 = ErrorCode::Cadence03SchedulerDegraded;
+        assert_eq!(c3.code_str(), "CADENCE-03");
+        assert_eq!("CADENCE-03".parse::<ErrorCode>(), Ok(c3));
+        assert_eq!(c3.severity(), Severity::Medium);
+        assert!(c3.is_auto_triage_safe());
+        for code in [c1, c2, c3] {
+            assert_eq!(
+                code.runbook_path(),
+                ".claude/rules/project/cadence-error-codes.md"
+            );
+        }
     }
 
     #[test]
@@ -2998,7 +3060,9 @@ mod tests {
                 // Groww orders shared contracts (PR-A0, 2026-07-15). Does NOT
                 // auto-accept via any other GROWW-* arm (GROWW-MASTER-/SCALE-/
                 // NATIVE- are enumerated separately) — this arm is required.
-                || s.starts_with("GROWW-ORD-");
+                || s.starts_with("GROWW-ORD-")
+                // Operator 2026-07-14: broker-agnostic fetch-cadence scheduler
+                || s.starts_with("CADENCE-");
             assert!(has_known_prefix, "unexpected code prefix: {s}");
         }
     }

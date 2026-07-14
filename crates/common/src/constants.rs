@@ -1790,6 +1790,30 @@ const _: () = assert!(
 );
 
 // ---------------------------------------------------------------------------
+// Cadence scheduler validation floors (operator cadence directive
+// 2026-07-14, judge-locked design rev-8 — `crates/core/src/cadence/`).
+// Consumed by `CadenceConfig::validate` in `config.rs`. The cadence
+// SCHEDULE numbers themselves are `[cadence]` config keys (serde defaults);
+// these are the non-negotiable validation FLOORS.
+// ---------------------------------------------------------------------------
+
+/// Hard floor for `[cadence] dhan_spot_spacing_ms` — 334ms = exactly
+/// 3 requests/sec (the operator's "≥334" recommendation; the shipped
+/// default is 400ms = 2.5 rps, strictly under the shared limiter's 3 rps
+/// default so composition never queues in steady state).
+pub const CADENCE_SPOT_SPACING_FLOOR_MS: i64 = 334;
+
+/// Hard floor for `[cadence] chain_min_spacing_ms` — Dhan's option-chain
+/// rule is 1 unique request every 3 seconds (`dhan/option-chain.md` rule 4;
+/// the cadence gates apply it per-underlying AND globally, the strictest
+/// interpretation).
+pub const CADENCE_CHAIN_MIN_SPACING_FLOOR_MS: i64 = 3_000;
+
+/// Hard ceiling for `[cadence] dhan_ladder_max_rungs` — rung 5 puts the
+/// earliest chain pre-fire at T−10s (:50), the operator-locked floor.
+pub const CADENCE_LADDER_MAX_RUNGS_CEILING: u8 = 5;
+
+// ---------------------------------------------------------------------------
 // Option-chain 1m REST pipeline (operator grant 2026-07-12 — PR-3, the
 // OPTION-CHAIN half). The 3 underlyings are the [`CHAIN_1M_UNDERLYINGS`]
 // subset below (NOT the full [`SPOT_1M_REST_INDICES`] set since the

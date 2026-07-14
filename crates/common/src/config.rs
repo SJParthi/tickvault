@@ -8,8 +8,9 @@ use chrono::NaiveTime;
 use serde::Deserialize;
 
 use crate::constants::{
-    DHAN_DATA_API_DEFAULT_TARGET_RPS, DHAN_DATA_API_RPS_CEILING, DHAN_DATA_API_RPS_FLOOR,
-    SEBI_MAX_ORDERS_PER_SECOND,
+    CADENCE_CHAIN_MIN_SPACING_FLOOR_MS, CADENCE_LADDER_MAX_RUNGS_CEILING,
+    CADENCE_SPOT_SPACING_FLOOR_MS, DHAN_DATA_API_DEFAULT_TARGET_RPS, DHAN_DATA_API_RPS_CEILING,
+    DHAN_DATA_API_RPS_FLOOR, SEBI_MAX_ORDERS_PER_SECOND,
 };
 use crate::trading_calendar::TradingCalendar;
 
@@ -210,6 +211,17 @@ pub struct ApplicationConfig {
     /// behavior only (the engine's hardcoded `dry_run` blocks live POSTs).
     #[serde(default)]
     pub exit_orders: ExitOrdersConfig,
+    /// `[cadence]` — broker-agnostic fetch-cadence + decision-timing
+    /// scheduler (operator cadence directive 2026-07-14, judge-locked
+    /// design rev-8 — `crates/core/src/cadence/`). Dry-run decision-timing
+    /// skeleton: per-minute Dhan (:55 pre-close serialized chains + :03
+    /// post-close spots) + Groww (:00 post-close 7-parallel burst) with
+    /// structural zero-429 gates, a Dhan failure ladder, and event-driven
+    /// per-lane decisions. This PR ships NO REST caller — the dry-run
+    /// executors log fires and return Empty. Absent section ⇒ DISABLED
+    /// (fail-safe default off).
+    #[serde(default)]
+    pub cadence: CadenceConfig,
 }
 
 /// `[feeds]` — pluggable market-data feed selection (operator lock
@@ -846,6 +858,288 @@ pub struct TfConsistencyConfig {
     /// explicitly.
     #[serde(default)]
     pub enabled: bool,
+}
+
+/// `[cadence]` — broker-agnostic fetch-cadence + decision-timing scheduler
+/// (operator cadence directive 2026-07-14, judge-locked design rev-8).
+/// Every timing below is a TARGET on the IST millis-of-day clock; the
+/// monotonic CAS gates in `crates/core/src/cadence/gate.rs` are the hard
+/// zero-429 floor. All defaults are the judge-locked operator numbers;
+/// the ones marked (Assumed) in the design await operator confirmation and
+/// are operator-flippable here without code changes.
+///
+/// Fail-safe shape: `enabled` is `#[serde(default)]` = `false` and every
+/// other field carries the judge-locked serde default, so an absent
+/// `[cadence]` section (or a TOML written before this PR) disables the
+/// scheduler entirely and deserializes the full locked cadence table.
+#[derive(Debug, Clone, Deserialize)]
+pub struct CadenceConfig {
+    /// Master switch — DEFAULT OFF (fail-safe). Flipping the DEFAULT needs
+    /// a fresh dated operator quote.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Dhan chain slot offsets relative to the minute-close instant T, in
+    /// milliseconds (negative = pre-close). Default `[-5000, -2000, 2000]`
+    /// = the operator's :55 NIFTY / :58 BANKNIFTY / :02 SENSEX serialized
+    /// chain schedule. Validated strictly ascending with pairwise gaps
+    /// ≥ `chain_min_spacing_ms`.
+    #[serde(default = "default_cadence_dhan_chain_offsets_ms")]
+    pub dhan_chain_offsets_ms: Vec<i64>,
+    /// Dhan spot leg anchor offset from T, ms. Default 3000 (:03 — 1s
+    /// after the SENSEX chain slot; the just-closed candle cannot exist
+    /// pre-close).
+    #[serde(default = "default_cadence_dhan_spot_start_offset_ms")]
+    pub dhan_spot_start_offset_ms: i64,
+    /// Spacing between the 4 Dhan spot singles, ms. Default 400 (2.5 rps —
+    /// strictly under the shared limiter's 3 rps default so composition
+    /// never queues in steady state). Validated ≥ 334 (= exactly 3 rps,
+    /// the operator's recommended floor).
+    #[serde(default = "default_cadence_dhan_spot_spacing_ms")]
+    pub dhan_spot_spacing_ms: i64,
+    /// Ladder clamp: a rung-shifted spot slot never lands earlier than
+    /// T + this, ms. Default 300 — the proven house
+    /// `SPOT_1M_REST_FIRE_DELAY_MS` post-close fire delay.
+    #[serde(default = "default_cadence_spot_min_post_close_ms")]
+    pub spot_min_post_close_ms: i64,
+    /// Failure-ladder step: each failing cycle shifts the NEXT cycle's
+    /// Dhan anchor this much earlier, ms. Default 1000 (:55 → :54 → …).
+    #[serde(default = "default_cadence_dhan_ladder_step_ms")]
+    pub dhan_ladder_step_ms: i64,
+    /// Failure-ladder floor: maximum rung (default 5 — earliest chain
+    /// pre-fire :50). Validated ≤ 5.
+    #[serde(default = "default_cadence_dhan_ladder_max_rungs")]
+    pub dhan_ladder_max_rungs: u8,
+    /// Maximum in-cycle retries per failed request (Assumed — default 1).
+    /// Retries fire ONLY through the gates and only when landing before
+    /// the lane cutoff; a RateLimited is NEVER retried in-cycle.
+    #[serde(default = "default_cadence_in_cycle_retry_max")]
+    pub in_cycle_retry_max: u32,
+    /// Ladder recovery mode (Assumed — the only legal value today is
+    /// `"step_back_one"`: one rung back per fully-clean cycle, hysteresis
+    /// against a flapping vendor).
+    #[serde(default = "default_cadence_recovery_mode")]
+    pub recovery_mode: String,
+    /// Dhan lane staleness cutoff, ms after T (Assumed — default 15000:
+    /// primary ~T+4.5s + one full retry round ending :11 + gate waits).
+    /// Past it ⇒ HONEST-SKIP + CADENCE-02, never a late decision.
+    #[serde(default = "default_cadence_dhan_lane_cutoff_ms")]
+    pub dhan_lane_cutoff_ms: i64,
+    /// Groww lane anchor offset from T, ms. Default 0 (T+0 post-close
+    /// burst).
+    #[serde(default)]
+    pub groww_anchor_offset_ms: i64,
+    /// Groww burst-failure verdict instant, ms after the burst anchor
+    /// (Assumed — default 800: a request FAILED iff Err OR still pending
+    /// here; any failure ⇒ sequential fallback).
+    #[serde(default = "default_cadence_groww_burst_timeout_ms")]
+    pub groww_burst_timeout_ms: i64,
+    /// Per-request bound on every individual Groww request incl. fallback
+    /// fetches, ms (Assumed — default 1500).
+    #[serde(default = "default_cadence_groww_request_timeout_ms")]
+    pub groww_request_timeout_ms: i64,
+    /// Groww lane staleness cutoff, ms after T (Assumed — default 6000:
+    /// admits the fallback path AND Dhan's ~T+4.5s completion cross-filling
+    /// a frozen Groww lane). Validated > `groww_burst_timeout_ms`.
+    #[serde(default = "default_cadence_groww_lane_cutoff_ms")]
+    pub groww_lane_cutoff_ms: i64,
+    /// Minimum spacing enforced by BOTH the per-underlying and the GLOBAL
+    /// chain gates, ms. Default 3000 (Dhan's 1-unique-request-per-3s rule,
+    /// strictest interpretation). Validated ≥ 3000.
+    #[serde(default = "default_cadence_chain_min_spacing_ms")]
+    pub chain_min_spacing_ms: i64,
+}
+
+/// Serde default for [`CadenceConfig::dhan_chain_offsets_ms`] — the
+/// operator's :55 / :58 / :02 chain schedule.
+fn default_cadence_dhan_chain_offsets_ms() -> Vec<i64> {
+    vec![-5_000, -2_000, 2_000]
+}
+
+/// Serde default for [`CadenceConfig::dhan_spot_start_offset_ms`] — :03.
+fn default_cadence_dhan_spot_start_offset_ms() -> i64 {
+    3_000
+}
+
+/// Serde default for [`CadenceConfig::dhan_spot_spacing_ms`] — 400ms
+/// (2.5 rps, the operator's own example instants :03.0/:03.4/:03.8/:04.2).
+fn default_cadence_dhan_spot_spacing_ms() -> i64 {
+    400
+}
+
+/// Serde default for [`CadenceConfig::spot_min_post_close_ms`] — the house
+/// 300ms post-close fire delay.
+fn default_cadence_spot_min_post_close_ms() -> i64 {
+    300
+}
+
+/// Serde default for [`CadenceConfig::dhan_ladder_step_ms`] — 1s per rung.
+fn default_cadence_dhan_ladder_step_ms() -> i64 {
+    1_000
+}
+
+/// Serde default for [`CadenceConfig::dhan_ladder_max_rungs`] — the :50
+/// floor.
+fn default_cadence_dhan_ladder_max_rungs() -> u8 {
+    CADENCE_LADDER_MAX_RUNGS_CEILING
+}
+
+/// Serde default for [`CadenceConfig::in_cycle_retry_max`] — 1 (Assumed).
+fn default_cadence_in_cycle_retry_max() -> u32 {
+    1
+}
+
+/// Serde default for [`CadenceConfig::recovery_mode`] — step-back-one
+/// (Assumed; unanimous designer choice).
+fn default_cadence_recovery_mode() -> String {
+    "step_back_one".to_string()
+}
+
+/// Serde default for [`CadenceConfig::dhan_lane_cutoff_ms`] — 15s
+/// (Assumed).
+fn default_cadence_dhan_lane_cutoff_ms() -> i64 {
+    15_000
+}
+
+/// Serde default for [`CadenceConfig::groww_burst_timeout_ms`] — 800ms
+/// (Assumed).
+fn default_cadence_groww_burst_timeout_ms() -> i64 {
+    800
+}
+
+/// Serde default for [`CadenceConfig::groww_request_timeout_ms`] — 1500ms
+/// (Assumed).
+fn default_cadence_groww_request_timeout_ms() -> i64 {
+    1_500
+}
+
+/// Serde default for [`CadenceConfig::groww_lane_cutoff_ms`] — 6s
+/// (Assumed).
+fn default_cadence_groww_lane_cutoff_ms() -> i64 {
+    6_000
+}
+
+/// Serde default for [`CadenceConfig::chain_min_spacing_ms`] — Dhan's
+/// 1-unique-request-per-3s option-chain rule.
+fn default_cadence_chain_min_spacing_ms() -> i64 {
+    3_000
+}
+
+impl Default for CadenceConfig {
+    /// Manual impl so `Default` matches the serde field defaults exactly
+    /// (the `Spot1mRestConfig` precedent — a derived `Default` would zero
+    /// every timing while an empty `[cadence]` section deserializes the
+    /// full judge-locked cadence table).
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            dhan_chain_offsets_ms: default_cadence_dhan_chain_offsets_ms(),
+            dhan_spot_start_offset_ms: default_cadence_dhan_spot_start_offset_ms(),
+            dhan_spot_spacing_ms: default_cadence_dhan_spot_spacing_ms(),
+            spot_min_post_close_ms: default_cadence_spot_min_post_close_ms(),
+            dhan_ladder_step_ms: default_cadence_dhan_ladder_step_ms(),
+            dhan_ladder_max_rungs: default_cadence_dhan_ladder_max_rungs(),
+            in_cycle_retry_max: default_cadence_in_cycle_retry_max(),
+            recovery_mode: default_cadence_recovery_mode(),
+            dhan_lane_cutoff_ms: default_cadence_dhan_lane_cutoff_ms(),
+            groww_anchor_offset_ms: 0,
+            groww_burst_timeout_ms: default_cadence_groww_burst_timeout_ms(),
+            groww_request_timeout_ms: default_cadence_groww_request_timeout_ms(),
+            groww_lane_cutoff_ms: default_cadence_groww_lane_cutoff_ms(),
+            chain_min_spacing_ms: default_cadence_chain_min_spacing_ms(),
+        }
+    }
+}
+
+impl CadenceConfig {
+    /// Boot-time validation (range-bail house shape) — rejects any
+    /// `[cadence]` section that could compress the structural zero-429
+    /// spacing floors or produce a degenerate schedule, BEFORE the runner
+    /// spawns.
+    ///
+    /// # Errors
+    /// Returns a descriptive error for the first violation found: chain
+    /// gaps under 3s, spot spacing under 334ms, negative clamps,
+    /// non-positive cutoffs/timeouts, rungs above the :50 floor, an
+    /// unknown recovery mode, or a Groww cutoff at/below the burst
+    /// verdict.
+    pub fn validate(&self) -> Result<()> {
+        if self.chain_min_spacing_ms < CADENCE_CHAIN_MIN_SPACING_FLOOR_MS {
+            bail!(
+                "cadence.chain_min_spacing_ms ({}) must be >= {} (Dhan's 1-unique-request-per-3s option-chain rule)",
+                self.chain_min_spacing_ms,
+                CADENCE_CHAIN_MIN_SPACING_FLOOR_MS
+            );
+        }
+        if self.dhan_chain_offsets_ms.len() != 3 {
+            bail!(
+                "cadence.dhan_chain_offsets_ms must carry exactly 3 slots (one per chain underlying: NIFTY/BANKNIFTY/SENSEX), got {:?}",
+                self.dhan_chain_offsets_ms
+            );
+        }
+        for pair in self.dhan_chain_offsets_ms.windows(2) {
+            if pair[1].saturating_sub(pair[0]) < self.chain_min_spacing_ms {
+                bail!(
+                    "cadence.dhan_chain_offsets_ms must ascend with pairwise gaps >= chain_min_spacing_ms ({}ms), got {:?}",
+                    self.chain_min_spacing_ms,
+                    self.dhan_chain_offsets_ms
+                );
+            }
+        }
+        if self.dhan_spot_spacing_ms < CADENCE_SPOT_SPACING_FLOOR_MS {
+            bail!(
+                "cadence.dhan_spot_spacing_ms ({}) must be >= {} (3 rps — the operator's recommended floor)",
+                self.dhan_spot_spacing_ms,
+                CADENCE_SPOT_SPACING_FLOOR_MS
+            );
+        }
+        if self.spot_min_post_close_ms < 0 {
+            bail!(
+                "cadence.spot_min_post_close_ms ({}) must be >= 0 (a spot can never fire pre-close)",
+                self.spot_min_post_close_ms
+            );
+        }
+        if self.dhan_ladder_step_ms <= 0 {
+            bail!(
+                "cadence.dhan_ladder_step_ms ({}) must be > 0",
+                self.dhan_ladder_step_ms
+            );
+        }
+        if self.dhan_ladder_max_rungs > CADENCE_LADDER_MAX_RUNGS_CEILING {
+            bail!(
+                "cadence.dhan_ladder_max_rungs ({}) must be <= {} (the :50 floor)",
+                self.dhan_ladder_max_rungs,
+                CADENCE_LADDER_MAX_RUNGS_CEILING
+            );
+        }
+        if self.recovery_mode != "step_back_one" {
+            bail!(
+                "cadence.recovery_mode ({:?}) — the only legal value today is \"step_back_one\"",
+                self.recovery_mode
+            );
+        }
+        if self.dhan_lane_cutoff_ms <= 0 || self.groww_lane_cutoff_ms <= 0 {
+            bail!(
+                "cadence lane cutoffs must be > 0 (dhan {}, groww {})",
+                self.dhan_lane_cutoff_ms,
+                self.groww_lane_cutoff_ms
+            );
+        }
+        if self.groww_burst_timeout_ms <= 0 || self.groww_request_timeout_ms <= 0 {
+            bail!(
+                "cadence groww timeouts must be > 0 (burst {}, request {})",
+                self.groww_burst_timeout_ms,
+                self.groww_request_timeout_ms
+            );
+        }
+        if self.groww_lane_cutoff_ms <= self.groww_burst_timeout_ms {
+            bail!(
+                "cadence.groww_lane_cutoff_ms ({}) must exceed groww_burst_timeout_ms ({}) — the fallback needs room inside the cutoff",
+                self.groww_lane_cutoff_ms,
+                self.groww_burst_timeout_ms
+            );
+        }
+        Ok(())
+    }
 }
 
 /// `[option_chain_1m]` — per-minute option-chain REST pipeline (operator
@@ -2581,6 +2875,11 @@ impl ApplicationConfig {
         // bounds always; freeze-limit + review-date sanity when enabled —
         // rejected at boot, BEFORE the trading pipeline spawns.
         self.exit_orders.validate()?;
+        // Cadence scheduler (operator 2026-07-14): the structural zero-429
+        // spacing floors are validated at boot, BEFORE the runner spawns
+        // (fail-closed; the default cadence.enabled=false section is always
+        // valid, so today's boot is unaffected).
+        self.cadence.validate()?;
 
         Ok(())
     }
@@ -3159,6 +3458,7 @@ mod tests {
             groww_orders: GrowwOrdersConfig::default(),
             dhan_margin_gate: DhanMarginGateConfig::default(),
             exit_orders: ExitOrdersConfig::default(),
+            cadence: CadenceConfig::default(),
         }
     }
 
@@ -4898,6 +5198,121 @@ mod tests {
             .extract()
             .expect("explicit enabled = true must round-trip");
         assert!(on.tf_consistency.enabled);
+    }
+
+    /// Cadence scheduler (operator 2026-07-14): the `[cadence]` section is
+    /// fail-safe DEFAULT-OFF (the design's ratchet
+    /// `!CadenceConfig::default().enabled`) — via `Default`, via a missing
+    /// section, and via an empty section — and every field of the empty
+    /// section deserializes to the judge-locked cadence table.
+    #[test]
+    fn test_cadence_config_default_off() {
+        use figment::Figment;
+        use figment::providers::{Format, Toml};
+
+        let d = CadenceConfig::default();
+        assert!(
+            !d.enabled,
+            "cadence must default OFF (fail-safe; the operator flips it)"
+        );
+        // The judge-locked cadence table (design rev-8 §9).
+        assert_eq!(d.dhan_chain_offsets_ms, vec![-5_000, -2_000, 2_000]);
+        assert_eq!(d.dhan_spot_start_offset_ms, 3_000);
+        assert_eq!(d.dhan_spot_spacing_ms, 400);
+        assert_eq!(d.spot_min_post_close_ms, 300);
+        assert_eq!(d.dhan_ladder_step_ms, 1_000);
+        assert_eq!(d.dhan_ladder_max_rungs, 5);
+        assert_eq!(d.in_cycle_retry_max, 1);
+        assert_eq!(d.recovery_mode, "step_back_one");
+        assert_eq!(d.dhan_lane_cutoff_ms, 15_000);
+        assert_eq!(d.groww_anchor_offset_ms, 0);
+        assert_eq!(d.groww_burst_timeout_ms, 800);
+        assert_eq!(d.groww_request_timeout_ms, 1_500);
+        assert_eq!(d.groww_lane_cutoff_ms, 6_000);
+        assert_eq!(d.chain_min_spacing_ms, 3_000);
+        assert!(d.validate().is_ok(), "the shipped defaults must validate");
+
+        #[derive(Deserialize)]
+        struct Wrapper {
+            #[serde(default)]
+            cadence: CadenceConfig,
+        }
+        // Missing section entirely → disabled, never an error.
+        let missing: Wrapper = Figment::new()
+            .merge(Toml::string("[other]\nx = 1\n"))
+            .extract()
+            .expect("missing [cadence] must default, not error");
+        assert!(!missing.cadence.enabled);
+        // Empty section (no keys) → disabled + the full locked table via
+        // the field-level serde defaults (must equal `Default`).
+        let empty: Wrapper = Figment::new()
+            .merge(Toml::string("[cadence]\n"))
+            .extract()
+            .expect("empty [cadence] must default, not error");
+        assert!(!empty.cadence.enabled);
+        assert_eq!(empty.cadence.dhan_chain_offsets_ms, d.dhan_chain_offsets_ms);
+        assert_eq!(empty.cadence.dhan_spot_spacing_ms, d.dhan_spot_spacing_ms);
+        assert_eq!(empty.cadence.groww_lane_cutoff_ms, d.groww_lane_cutoff_ms);
+        // Explicit ON round-trips.
+        let on: Wrapper = Figment::new()
+            .merge(Toml::string("[cadence]\nenabled = true\n"))
+            .extract()
+            .expect("explicit enabled = true must round-trip");
+        assert!(on.cadence.enabled);
+    }
+
+    /// Cadence validate(): a spot spacing under the 334ms floor (3 rps)
+    /// is rejected at boot — the structural zero-429 spot floor.
+    #[test]
+    fn test_cadence_config_validate_rejects_sub_334_spacing() {
+        let mut cfg = CadenceConfig::default();
+        cfg.dhan_spot_spacing_ms = 333;
+        let err = cfg.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("dhan_spot_spacing_ms"),
+            "unexpected error: {err}"
+        );
+        // The floor itself (334 = exactly 3 rps) is legal.
+        cfg.dhan_spot_spacing_ms = 334;
+        assert!(cfg.validate().is_ok());
+    }
+
+    /// Cadence validate(): chain slot offsets whose pairwise gap
+    /// undercuts the 3s chain rule are rejected — as is a
+    /// `chain_min_spacing_ms` below the 3000ms floor itself.
+    #[test]
+    fn test_cadence_config_validate_rejects_sub_3s_chain_gaps() {
+        let mut cfg = CadenceConfig::default();
+        // :55 / :57 — a 2s gap undercuts the 3s rule.
+        cfg.dhan_chain_offsets_ms = vec![-5_000, -3_000, 2_000];
+        let err = cfg.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("dhan_chain_offsets_ms"),
+            "unexpected error: {err}"
+        );
+        // Non-ascending offsets are equally rejected (negative gap).
+        cfg.dhan_chain_offsets_ms = vec![-2_000, -5_000, 2_000];
+        assert!(cfg.validate().is_err());
+        // The spacing floor itself cannot be configured away.
+        cfg.dhan_chain_offsets_ms = default_cadence_dhan_chain_offsets_ms();
+        cfg.chain_min_spacing_ms = 2_999;
+        let err = cfg.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("chain_min_spacing_ms"),
+            "unexpected error: {err}"
+        );
+        // A Groww cutoff at/below the burst verdict is degenerate.
+        cfg.chain_min_spacing_ms = 3_000;
+        cfg.groww_lane_cutoff_ms = 800;
+        assert!(cfg.validate().is_err());
+        // An unknown recovery mode is refused (only step_back_one ships).
+        cfg.groww_lane_cutoff_ms = 6_000;
+        cfg.recovery_mode = "reset_to_zero".to_string();
+        assert!(cfg.validate().is_err());
+        // Rungs above the :50 floor are refused.
+        cfg.recovery_mode = "step_back_one".to_string();
+        cfg.dhan_ladder_max_rungs = 6;
+        assert!(cfg.validate().is_err());
     }
 
     /// PR-4 (Groww contract leg): the `[groww_contract_1m]` section is

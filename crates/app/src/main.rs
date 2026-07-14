@@ -1613,6 +1613,19 @@ async fn main() -> Result<()> {
         &notifier,
     );
 
+    // Judge-locked cadence scheduler — PROCESS-GLOBAL like the verifier
+    // above (2026-07-14): per-minute chain + spot fire timing with
+    // structural zero-429 gates, failure ladder, and event-driven dry-run
+    // decisions (CADENCE-01/02/03). Config-gated (`[cadence] enabled`,
+    // ships false); dry-run executors both lanes — NO REST caller in this
+    // PR; the once-per-process AtomicBool inside makes the fast-arm +
+    // prefix dual-spawn safe. See `cadence_boot::spawn_cadence_scheduler`.
+    let _cadence_shutdown = tickvault_app::cadence_boot::spawn_cadence_scheduler(
+        &config,
+        &trading_calendar,
+        &feed_runtime,
+    );
+
     // -----------------------------------------------------------------------
     // DayOhlcTracker boot wiring (post 2026-05-26 simplification; MOVED to
     // process-global scope 2026-07-01 to stop the per-lane cold-start leak).
