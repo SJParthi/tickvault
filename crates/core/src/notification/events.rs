@@ -2000,7 +2000,13 @@ impl NotificationEvent {
             | Self::OrderUpdateReconnected { .. }
             // ── Dhan-scoped: instrument master build ──
             | Self::InstrumentBuildSuccess { .. }
-            | Self::InstrumentBuildFailed { .. } => Some(FeedBadge::Dhan.badge()),
+            | Self::InstrumentBuildFailed { .. }
+            // ── Dhan-scoped: OMS / risk (orders are Dhan-only today) ──
+            | Self::OrderRejected { .. }
+            | Self::CircuitBreakerOpened { .. }
+            | Self::CircuitBreakerClosed
+            | Self::RateLimitExhausted { .. }
+            | Self::RiskHalt { .. } => Some(FeedBadge::Dhan.badge()),
             // ── Groww-scoped ──
             Self::GrowwSidecarRejected { .. } => Some(FeedBadge::Groww.badge()),
             // ── Feed-generic: badge follows the `feed` field ──
@@ -3527,8 +3533,10 @@ impl NotificationEvent {
             Self::CircuitBreakerOpened {
                 consecutive_failures,
             } => {
+                // Cluster-C (2026-07-14): self-heal line appended so the
+                // operator knows no action is needed if a CLOSED follows.
                 format!(
-                    "<b>Circuit breaker OPENED</b>\nConsecutive failures: {consecutive_failures}\nOrder API calls halted"
+                    "<b>Circuit breaker OPENED</b>\nConsecutive failures: {consecutive_failures}\nOrder API calls halted\nThe system retries by itself in about a minute — if a CLOSED message follows, no action needed."
                 )
             }
             Self::CircuitBreakerClosed => {
@@ -3538,7 +3546,14 @@ impl NotificationEvent {
                 format!("<b>Rate limit EXHAUSTED</b>\nLimit: {limit_type}")
             }
             Self::RiskHalt { reason } => {
-                format!("<b>RISK HALT</b>\nTrading stopped: {}", html_escape(reason))
+                // Cluster-C (2026-07-14): APPEND-style action lines
+                // (Telegram commandment 7 — Critical needs "what to do
+                // RIGHT NOW"); the leading "RISK HALT" literal is kept so
+                // the 4 pinning contains()-tests survive.
+                format!(
+                    "<b>RISK HALT</b>\nTrading stopped: {}\nAll new orders are blocked.\nWhat you need to do RIGHT NOW:\n1. Open the broker app and check open positions.\n2. Decide: exit positions now, or accept no trading for the rest of the day.\n3. Trading stays blocked until the daily reset or a restart.",
+                    html_escape(reason)
+                )
             }
             Self::WebSocketReconnectionExhausted {
                 connection_index,
@@ -5783,6 +5798,9 @@ mod tests {
         let msg = event.to_message();
         assert!(msg.contains("OPENED"));
         assert!(msg.contains("halted"));
+        // Cluster-C (2026-07-14): the self-heal line — a lone OPENED page
+        // must tell the operator the system retries on its own.
+        assert!(msg.contains("retries by itself"));
         assert_eq!(event.severity(), Severity::High);
     }
 
@@ -5794,7 +5812,49 @@ mod tests {
         let msg = event.to_message();
         assert!(msg.contains("RISK HALT"));
         assert!(msg.contains("daily_loss_breach"));
+        // Cluster-C (2026-07-14): Critical bodies carry action lines
+        // (Telegram commandment 7).
+        assert!(msg.contains("What you need to do RIGHT NOW"));
+        assert!(msg.contains("All new orders are blocked"));
         assert_eq!(event.severity(), Severity::Critical);
+    }
+
+    /// Cluster-C (2026-07-14): the 5 OMS/risk events are Dhan-badged —
+    /// orders are Dhan-only today, so their pages must carry the same
+    /// feed badge as the order-update WS lifecycle events.
+    #[test]
+    fn test_oms_risk_events_are_dhan_badged() {
+        let events = [
+            NotificationEvent::OrderRejected {
+                correlation_id: "X".to_string(),
+                reason: "bad".to_string(),
+            },
+            NotificationEvent::CircuitBreakerOpened {
+                consecutive_failures: 3,
+            },
+            NotificationEvent::CircuitBreakerClosed,
+            NotificationEvent::RateLimitExhausted {
+                limit_type: "per_second".to_string(),
+            },
+            NotificationEvent::RiskHalt {
+                reason: "x".to_string(),
+            },
+        ];
+        for event in events {
+            let badge = event
+                .feed_badge()
+                .unwrap_or_else(|| panic!("{} must be feed-badged", event.topic()));
+            assert!(
+                badge.contains("DHAN"),
+                "{} must carry the Dhan badge, got {badge}",
+                event.topic()
+            );
+            assert!(
+                event.to_message().starts_with(badge),
+                "{} message must start with the badge",
+                event.topic()
+            );
+        }
     }
 
     #[test]
