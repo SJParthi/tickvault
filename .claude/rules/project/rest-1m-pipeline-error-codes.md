@@ -652,6 +652,43 @@ day; a mid-day task respawn restarts it — the FailureEdge envelope).
 Source: `crates/app/src/groww_option_chain_1m_boot.rs`
 (`UnderlyingServedTracker` / `record_groww_chain_underlying_verdicts`).
 
+**2026-07-14 — the GROWW leg's zero-leg classifications are now
+SELF-EVIDENCING (empty-vs-`leg_shape_drift` split):** the same 2026-07-14
+incident's second finding — NIFTY (expiry day) classified `outcome=empty`
+every minute 14:54→15:29 IST with `errors=0` (every body WAS a parseable
+chain envelope whose `strikes` object yielded zero legs) — could NOT be
+discriminated retroactively: was the body ~40 B (a truly empty map) or
+~37 KB (entries our leg extraction dropped)? The evidence was STRUCTURALLY
+UNRECORDED — `tv_groww_chain1m_payload_bytes` + the `strikes_kept` /
+`invalid_strikes` counts were recorded ONLY on the Found arm; the Empty arm
+discarded the parsed struct and captured no body evidence (the payload
+histogram count simply dropped 3→2 at 14:55). Closed in two halves:
+(1) **EVIDENCE** — every zero-leg classification now carries
+`payload_bytes`, `strikes_seen` (RAW `strikes`-map entry count — a new
+parse diagnostic), `strikes_kept`, `invalid_strikes`, and a BOUNDED
+SANITIZED body sample (≤300 chars through the house
+`capture_rest_error_body` choke point — the exact sanitizer the failure
+arms use, so a token/credential can never leak) on ONE coded `error!` per
+affected underlying per fired minute (`stage="empty_chain"` /
+`stage="leg_shape_drift"`, `feed="groww"`), plus the new
+`tv_groww_chain1m_empty_payload_bytes` histogram (the Found-only
+`tv_groww_chain1m_payload_bytes` semantics never shift). (2) **HONEST
+RECLASSIFICATION** — the zero-legs case splits: `strikes_seen == 0` (map
+literally empty) stays `Empty` (`outcome="empty"`, audit
+`empty`/`error_class="empty_chain"` — unchanged wire values);
+`strikes_seen > 0` with zero extractable legs is now **`leg_shape_drift`**
+(the vendor served entries our leg extraction couldn't read — an ERROR,
+not an empty chain): it flows into the minute verdict's `errors` count,
+the same CHAIN-02 `minute_failed` accounting, its own
+`tv_groww_chain1m_leg_shape_drift_total` counter, and the audit row's
+EXISTING `error` outcome with `error_class="leg_shape_drift"` (no audit
+schema change, no new ErrorCode). The `underlying_not_served` detector is
+UNAFFECTED (empty and error-class minutes already counted not-served
+identically). HONEST NOTE: today's 14:54 incident class (empty vs drift)
+could not be discriminated after the fact — from this change forward it
+is, within one minute of occurrence
+(`mcp__tickvault-logs__tail_errors` shows the size + sample directly).
+
 ## §2d. CHAIN-03 — option_chain_1m persist failed
 
 **Severity:** High. **Auto-triage safe:** Yes (best-effort persist; the

@@ -268,6 +268,12 @@ pub struct GrowwParsedChain {
     /// a panic; whether both sides are always present is Unknown, so the
     /// `Option<>` discipline is defensive).
     pub legs: Vec<GrowwParsedLeg>,
+    /// RAW entry count of the `strikes` map — every map entry increments
+    /// it BEFORE the invalid/cap/kept triage (2026-07-14 NIFTY expiry-day
+    /// incident: the empty-vs-drift discriminator; `strikes_seen ==
+    /// strikes_kept + invalid_strikes + truncated_strikes` by
+    /// construction).
+    pub strikes_seen: u32,
     /// Strikes kept (the U-12 chain-size probe input).
     pub strikes_kept: u32,
     /// Strike keys that did not parse as numbers OR parsed to an
@@ -354,6 +360,7 @@ pub fn parse_groww_option_chain(body: &str) -> Option<GrowwParsedChain> {
         ..GrowwParsedChain::default()
     };
     for (strike_key, legs) in strikes {
+        chain.strikes_seen = chain.strikes_seen.saturating_add(1);
         let Ok(strike) = strike_key.trim().parse::<f64>() else {
             chain.invalid_strikes = chain.invalid_strikes.saturating_add(1);
             continue;
@@ -743,6 +750,60 @@ fn chain_audit_flush_best_effort(audit_writer: &mut RestFetchAuditWriter) {
 // Per-minute fire
 // ---------------------------------------------------------------------------
 
+/// Zero-leg evidence bundle (2026-07-14 NIFTY expiry-day incident): the
+/// discriminator the 14:54→15:29 IST window structurally lacked — the
+/// Empty arm discarded the parsed struct and captured no body evidence,
+/// so "~40 B truly-empty map" vs "~37 KB of entries our leg extraction
+/// dropped" was unanswerable retroactively. Recorded on EVERY zero-leg
+/// classification so the next occurrence is self-evidencing within one
+/// minute of occurrence.
+#[derive(Clone, Debug, PartialEq)]
+struct ChainZeroLegEvidence {
+    /// Raw 2xx body size in bytes (the decisive size discriminator).
+    payload_bytes: usize,
+    /// RAW `strikes` map entry count (0 = genuinely empty chain).
+    strikes_seen: u32,
+    /// Entries that survived the key-plausibility triage.
+    strikes_kept: u32,
+    /// Entries dropped by the key-plausibility triage.
+    invalid_strikes: u32,
+    /// BOUNDED SANITIZED body sample — the EXACT house choke point the
+    /// failure arms use ([`capture_rest_error_body`]: control-char strip
+    /// → URL/credential-param redaction → JWT-shape redaction →
+    /// credential-JSON-field redaction → ≤300-char truncation), so a
+    /// token/credential can never leak into the log line.
+    body_sample: String,
+}
+
+/// Pure zero-leg classifier (the 2026-07-14 empty-vs-drift split): a
+/// parseable 2xx chain whose leg extraction yielded ZERO legs is
+/// - `Empty` when the `strikes` map was LITERALLY empty (a genuinely
+///   empty chain — the pre-existing `outcome="empty"` semantics), or
+/// - `LegShapeDrift` when the vendor SERVED strike entries but our leg
+///   extraction could read none of them (null/non-object CE+PE, or every
+///   key implausible) — that is an ERROR class, not an empty chain.
+///
+/// Both carry the full evidence bundle. Pure (testable without I/O).
+#[must_use]
+fn zero_leg_outcome(
+    chain: &GrowwParsedChain,
+    payload_bytes: usize,
+    body_text: &str,
+) -> GrowwChainFetchOutcome {
+    let evidence = ChainZeroLegEvidence {
+        payload_bytes,
+        strikes_seen: chain.strikes_seen,
+        strikes_kept: chain.strikes_kept,
+        invalid_strikes: chain.invalid_strikes,
+        body_sample: capture_rest_error_body(body_text),
+    };
+    if chain.strikes_seen == 0 {
+        GrowwChainFetchOutcome::Empty(evidence)
+    } else {
+        GrowwChainFetchOutcome::LegShapeDrift(evidence)
+    }
+}
+
 /// One underlying's per-minute chain verdict.
 #[derive(Clone, Debug, PartialEq)]
 enum GrowwChainFetchOutcome {
@@ -754,9 +815,15 @@ enum GrowwChainFetchOutcome {
         close_to_data_ms: i64,
         payload_bytes: usize,
     },
-    /// A parseable 2xx whose chain carried ZERO strikes — counted
-    /// `outcome="empty"`, included in the failure edge, never silent.
-    Empty,
+    /// A parseable 2xx whose `strikes` map was LITERALLY empty — counted
+    /// `outcome="empty"`, included in the failure edge, never silent;
+    /// carries the 2026-07-14 evidence bundle.
+    Empty(ChainZeroLegEvidence),
+    /// A parseable 2xx that SERVED strike entries but yielded ZERO
+    /// extractable legs (vendor leg-shape drift) — an ERROR, not an
+    /// empty chain: flows into the minute verdict's `errors` count and
+    /// the audit's `error`/`leg_shape_drift` class (2026-07-14 split).
+    LegShapeDrift(ChainZeroLegEvidence),
     /// Transport / non-2xx / malformed body / budget overrun.
     Failed(GrowwChainFetchFailure),
 }
@@ -789,7 +856,9 @@ async fn fetch_groww_chain_bounded(
             Ok(body_text) => {
                 let payload_bytes = body_text.len();
                 match parse_groww_option_chain(&body_text) {
-                    Some(chain) if chain.legs.is_empty() => GrowwChainFetchOutcome::Empty,
+                    Some(chain) if chain.legs.is_empty() => {
+                        zero_leg_outcome(&chain, payload_bytes, &body_text)
+                    }
                     Some(chain) => {
                         let close_to_data_ms =
                             (ist_millis_of_day_now() - minute_close_ms_of_day).max(0);
@@ -1157,15 +1226,40 @@ async fn fire_one_groww_chain_minute(
                     );
                     chain_audit_append_best_effort(audit_writer, &audit_row);
                 }
-                GrowwChainFetchOutcome::Empty => {
+                GrowwChainFetchOutcome::Empty(evidence) => {
                     empty_count = empty_count.saturating_add(1);
                     served_verdicts.push((target.underlying, false));
                     metrics::counter!("tv_groww_chain1m_fetch_total", "outcome" => "empty")
                         .increment(1);
+                    // 2026-07-14 evidence discipline: the payload size of
+                    // an EMPTY classification is recorded (its own series —
+                    // the Found-only tv_groww_chain1m_payload_bytes
+                    // semantics never shift) and the full evidence bundle
+                    // rides ONE coded line per empty underlying per fired
+                    // minute (bounded ≤3/min; errors.jsonl-visible).
+                    #[allow(clippy::cast_precision_loss)] // APPROVED: histogram sample only
+                    metrics::histogram!("tv_groww_chain1m_empty_payload_bytes")
+                        .record(evidence.payload_bytes as f64);
+                    error!(
+                        code = ErrorCode::Chain02FetchDegraded.code_str(),
+                        stage = "empty_chain",
+                        feed = OPTION_CHAIN_1M_FEED_GROWW,
+                        symbol = target.underlying,
+                        minute = %minute_label,
+                        payload_bytes = evidence.payload_bytes,
+                        strikes_seen = evidence.strikes_seen,
+                        strikes_kept = evidence.strikes_kept,
+                        invalid_strikes = evidence.invalid_strikes,
+                        body_sample = %evidence.body_sample,
+                        "CHAIN-02: 2xx chain carried a literally EMPTY \
+                         strikes map — evidence recorded (2026-07-14 \
+                         discipline: an empty minute is self-evidencing)"
+                    );
                     if sample_failure.is_none() {
                         sample_failure = Some(format!(
-                            "{}: 2xx but the chain carried zero strikes",
-                            target.underlying
+                            "{}: 2xx but the chain carried zero strikes \
+                             (payload_bytes={}, strikes_seen=0)",
+                            target.underlying, evidence.payload_bytes
                         ));
                     }
                     let audit_row = build_chain_audit_row(
@@ -1180,6 +1274,53 @@ async fn fire_one_groww_chain_minute(
                         0,
                         RestFetchOutcome::Empty,
                         "empty_chain",
+                    );
+                    chain_audit_append_best_effort(audit_writer, &audit_row);
+                }
+                GrowwChainFetchOutcome::LegShapeDrift(evidence) => {
+                    // 2026-07-14 split: the vendor SERVED strike entries
+                    // but our leg extraction read none — an ERROR (drift),
+                    // never an "empty chain". Flows into the errors count
+                    // + the minute_failed accounting like any failure.
+                    error_count = error_count.saturating_add(1);
+                    served_verdicts.push((target.underlying, false));
+                    metrics::counter!("tv_groww_chain1m_fetch_total", "outcome" => "error")
+                        .increment(1);
+                    metrics::counter!("tv_groww_chain1m_leg_shape_drift_total").increment(1);
+                    error!(
+                        code = ErrorCode::Chain02FetchDegraded.code_str(),
+                        stage = "leg_shape_drift",
+                        feed = OPTION_CHAIN_1M_FEED_GROWW,
+                        symbol = target.underlying,
+                        minute = %minute_label,
+                        payload_bytes = evidence.payload_bytes,
+                        strikes_seen = evidence.strikes_seen,
+                        strikes_kept = evidence.strikes_kept,
+                        invalid_strikes = evidence.invalid_strikes,
+                        body_sample = %evidence.body_sample,
+                        "CHAIN-02: 2xx chain served strike entries but ZERO \
+                         legs were extractable — vendor leg-shape drift (an \
+                         ERROR, not an empty chain; evidence recorded)"
+                    );
+                    if sample_failure.is_none() {
+                        sample_failure = Some(format!(
+                            "{}: 2xx served {} strike entries but zero legs \
+                             extracted (leg-shape drift, payload_bytes={})",
+                            target.underlying, evidence.strikes_seen, evidence.payload_bytes
+                        ));
+                    }
+                    let audit_row = build_chain_audit_row(
+                        target_minute_nanos,
+                        trading_date_nanos,
+                        target.security_id,
+                        target.underlying,
+                        1,
+                        200,
+                        latency_ms,
+                        -1,
+                        0,
+                        RestFetchOutcome::Error,
+                        "leg_shape_drift",
                     );
                     chain_audit_append_best_effort(audit_writer, &audit_row);
                 }
@@ -2291,6 +2432,7 @@ mod tests {
         let empty = parse_groww_option_chain(r#"{"payload":{"underlying_ltp":1.0,"strikes":{}}}"#)
             .expect("empty chain parses");
         assert!(empty.legs.is_empty());
+        assert_eq!(empty.strikes_seen, 0, "a literally empty map saw nothing");
         assert_eq!(empty.strikes_kept, 0);
     }
 
@@ -2310,6 +2452,7 @@ mod tests {
         let chain = parse_groww_option_chain(body).expect("parses");
         // Decimal strike keys parse (the U-11 Unknown, handled); the
         // hostile keys are skipped + counted, never a row.
+        assert_eq!(chain.strikes_seen, 4, "every raw map entry is counted");
         assert_eq!(chain.strikes_kept, 1);
         assert_eq!(chain.invalid_strikes, 3);
         assert_eq!(chain.legs.len(), 1);
@@ -2330,9 +2473,126 @@ mod tests {
         }
         let body = format!(r#"{{"payload":{{"underlying_ltp":1.0,"strikes":{{{strikes}}}}}}}"#);
         let chain = parse_groww_option_chain(&body).expect("parses");
+        assert_eq!(chain.strikes_seen as usize, MAX_STRIKES_PER_CHAIN + 25);
         assert_eq!(chain.strikes_kept as usize, MAX_STRIKES_PER_CHAIN);
         assert_eq!(chain.truncated_strikes, 25);
         assert_eq!(chain.legs.len(), MAX_STRIKES_PER_CHAIN);
+    }
+
+    // ---- zero-leg classification matrix (2026-07-14 empty-vs-drift) --------
+
+    /// The body-class → classification matrix the 14:54 incident demanded:
+    /// (a) literally-empty map → Empty (strikes_seen=0);
+    /// (b) entries with null/non-object legs → LegShapeDrift;
+    /// (c) all-implausible keys → LegShapeDrift (kept=0);
+    /// (d) a normal body → Found (unchanged);
+    /// (e) a FAILURE envelope → parse-Failed (unchanged, `None`).
+    #[test]
+    fn test_zero_leg_outcome_matrix_empty_vs_drift() {
+        // (a) literally empty strikes map → Empty with full evidence.
+        let empty_body = r#"{"payload":{"underlying_ltp":1.0,"strikes":{}}}"#;
+        let chain = parse_groww_option_chain(empty_body).expect("parses");
+        assert!(chain.legs.is_empty());
+        match zero_leg_outcome(&chain, empty_body.len(), empty_body) {
+            GrowwChainFetchOutcome::Empty(ev) => {
+                assert_eq!(ev.payload_bytes, empty_body.len());
+                assert_eq!(ev.strikes_seen, 0);
+                assert_eq!(ev.strikes_kept, 0);
+                assert_eq!(ev.invalid_strikes, 0);
+                assert!(
+                    ev.body_sample.contains("strikes"),
+                    "the sanitized sample keeps the (non-secret) body text: {}",
+                    ev.body_sample
+                );
+            }
+            other => panic!("expected Empty, got {other:?}"),
+        }
+
+        // (b) 2 VALID strike entries whose CE/PE are null/non-object →
+        // drift: strikes_seen=2, strikes_kept=2, zero legs.
+        let drift_body = r#"{"payload":{"underlying_ltp":100.0,"strikes":{
+            "100": {"CE": null, "PE": null},
+            "110": {"CE": "not-an-object"}
+        }}}"#;
+        let chain = parse_groww_option_chain(drift_body).expect("parses");
+        assert!(chain.legs.is_empty(), "no extractable legs");
+        match zero_leg_outcome(&chain, drift_body.len(), drift_body) {
+            GrowwChainFetchOutcome::LegShapeDrift(ev) => {
+                assert_eq!(ev.strikes_seen, 2);
+                assert_eq!(ev.strikes_kept, 2);
+                assert_eq!(ev.invalid_strikes, 0);
+                assert_eq!(ev.payload_bytes, drift_body.len());
+            }
+            other => panic!("expected LegShapeDrift, got {other:?}"),
+        }
+
+        // (c) entries present but EVERY key implausible → still drift
+        // (the vendor served SOMETHING our extraction dropped).
+        let implausible = r#"{"payload":{"strikes":{
+            "not-a-number": {"CE": {"ltp": 1.0}},
+            "-5": {"CE": {"ltp": 1.0}}
+        }}}"#;
+        let chain = parse_groww_option_chain(implausible).expect("parses");
+        assert!(chain.legs.is_empty());
+        match zero_leg_outcome(&chain, implausible.len(), implausible) {
+            GrowwChainFetchOutcome::LegShapeDrift(ev) => {
+                assert_eq!(ev.strikes_seen, 2);
+                assert_eq!(ev.strikes_kept, 0);
+                assert_eq!(ev.invalid_strikes, 2);
+            }
+            other => panic!("expected LegShapeDrift, got {other:?}"),
+        }
+
+        // (d) a normal body never reaches the zero-leg classifier — its
+        // legs are non-empty (Found arm unchanged).
+        let found = parse_groww_option_chain(SAMPLE_WRAPPED).expect("parses");
+        assert!(!found.legs.is_empty());
+
+        // (e) the FAILURE envelope stays the parse-Failed arm (`None` —
+        // never classified empty OR drift).
+        assert_eq!(
+            parse_groww_option_chain(
+                r#"{"status":"FAILURE","error":{"code":"GA001","message":"x"}}"#
+            ),
+            None
+        );
+    }
+
+    /// (f) The evidence body sample is length-bounded AND rides the house
+    /// sanitize choke point: a JWT-shaped token can never survive into the
+    /// log line, and a 37-KB body truncates to ≤ the 300-char capture cap.
+    #[test]
+    fn test_zero_leg_outcome_body_sample_bounded_and_sanitized() {
+        use tickvault_common::sanitize::REST_BODY_CAPTURE_MAX_CHARS;
+        // A huge zero-leg body carrying a JWT-shaped credential.
+        let token = format!(
+            "eyJ{}.eyJ{}.sig{}",
+            "a".repeat(40),
+            "b".repeat(40),
+            "c".repeat(20)
+        );
+        let filler: String = std::iter::repeat_n("\"pad\":0,", 8_000).collect();
+        let body = format!(
+            r#"{{"payload":{{"token":"{token}","strikes":{{"100":{{"CE":null}}}},{filler}"end":1}}}}"#
+        );
+        let chain = parse_groww_option_chain(&body).expect("parses");
+        assert!(chain.legs.is_empty());
+        match zero_leg_outcome(&chain, body.len(), &body) {
+            GrowwChainFetchOutcome::LegShapeDrift(ev) => {
+                assert!(
+                    ev.body_sample.chars().count() <= REST_BODY_CAPTURE_MAX_CHARS,
+                    "sample must be bounded to the capture cap; got {} chars",
+                    ev.body_sample.chars().count()
+                );
+                assert!(
+                    !ev.body_sample.contains("eyJ"),
+                    "a JWT-shaped token must never survive the sanitizer: {}",
+                    ev.body_sample
+                );
+                assert_eq!(ev.payload_bytes, body.len(), "the REAL size is kept");
+            }
+            other => panic!("expected LegShapeDrift, got {other:?}"),
+        }
     }
 
     // ---- pacing / classification ------------------------------------------
@@ -2667,7 +2927,46 @@ mod tests {
         let url = spawn_chain_mock(empty_resp).await;
         let (outcome, _, _) =
             fetch_groww_chain_bounded(&test_client(), &url, "2026-07-16", &token, 0, None).await;
-        assert_eq!(outcome, GrowwChainFetchOutcome::Empty);
+        match outcome {
+            GrowwChainFetchOutcome::Empty(ev) => {
+                // 2026-07-14 discipline: the Empty arm carries the full
+                // evidence bundle instead of discarding the parsed struct.
+                assert_eq!(ev.payload_bytes, empty_body.len());
+                assert_eq!(ev.strikes_seen, 0);
+                assert_eq!(ev.strikes_kept, 0);
+                assert_eq!(ev.invalid_strikes, 0);
+                assert!(
+                    !ev.body_sample.is_empty(),
+                    "the sanitized sample rides along"
+                );
+            }
+            other => panic!("expected Empty, got {other:?}"),
+        }
+
+        // (b') A parseable 2xx that SERVED entries but yielded zero legs →
+        // LegShapeDrift (the 2026-07-14 split — an error, never "empty").
+        let drift_body =
+            r#"{"payload":{"underlying_ltp":1.0,"strikes":{"100":{"CE":null,"PE":null}}}}"#;
+        let drift_resp: &'static str = Box::leak(
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{drift_body}",
+                drift_body.len()
+            )
+            .into_boxed_str(),
+        );
+        let url = spawn_chain_mock(drift_resp).await;
+        let (outcome, _, _) =
+            fetch_groww_chain_bounded(&test_client(), &url, "2026-07-16", &token, 0, None).await;
+        match outcome {
+            GrowwChainFetchOutcome::LegShapeDrift(ev) => {
+                assert_eq!(ev.payload_bytes, drift_body.len());
+                assert_eq!(ev.strikes_seen, 1);
+                assert_eq!(ev.strikes_kept, 1);
+                assert_eq!(ev.invalid_strikes, 0);
+                assert!(ev.body_sample.contains("strikes"));
+            }
+            other => panic!("expected LegShapeDrift, got {other:?}"),
+        }
 
         // (c) A 2xx that is not a parseable option chain → Failed(200).
         let url = spawn_chain_mock("HTTP/1.1 200 OK\r\nContent-Length: 8\r\n\r\nnot-json").await;
@@ -2948,9 +3247,11 @@ mod tests {
 
     /// The token-path fire against a hermetic mock (target-carried URL):
     /// a Found underlying (with a vendor-omitted underlying_ltp — the
-    /// LOW-5 warn arm) + an Empty underlying. The disconnected test
-    /// writer's flush fails, so the persist gate counts the minute fully
-    /// failed (M1) even though the fetch found a chain.
+    /// LOW-5 warn arm) + an Empty underlying + a LegShapeDrift underlying
+    /// (the 2026-07-14 split: entries served, zero legs extractable — an
+    /// error, never "empty"). The disconnected test writer's flush fails,
+    /// so the persist gate counts the minute fully failed (M1) even
+    /// though the fetch found a chain.
     #[tokio::test]
     async fn test_fire_token_path_found_and_empty_via_mock() {
         let params = test_params();
@@ -2974,9 +3275,20 @@ mod tests {
             .into_boxed_str(),
         );
         let empty_url = spawn_chain_mock(empty_resp).await;
+        let drift_body =
+            r#"{"payload":{"underlying_ltp":1.0,"strikes":{"100":{"CE":null,"PE":null}}}}"#;
+        let drift_resp: &'static str = Box::leak(
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{drift_body}",
+                drift_body.len()
+            )
+            .into_boxed_str(),
+        );
+        let drift_url = spawn_chain_mock(drift_resp).await;
         let targets = vec![
             test_target_with_url("NIFTY", "NSE", found_url),
             test_target_with_url("SENSEX", "BSE", empty_url),
+            test_target_with_url("BANKNIFTY", "NSE", drift_url),
         ];
         let mut last_request_ms: Option<i64> = None;
         let mut writer = OptionChain1mWriter::for_test_with_feed(
@@ -3014,16 +3326,26 @@ mod tests {
             EdgeAction::Page { consecutive: 3 }
         ));
         // The not-served tracker is FETCH-level: NIFTY was served (Found),
-        // SENSEX was not (empty) with a served sibling → SENSEX's streak
-        // holds 1 counted minute — threshold-1 more counted minutes page
-        // it (had the fire NOT counted, the page would land one late).
+        // SENSEX was not (empty) and BANKNIFTY was not (leg-shape drift —
+        // the 2026-07-14 error class counts not-served EXACTLY like empty,
+        // so PR #1537's tracker semantics are unaffected by the split) —
+        // both streaks hold 1 counted minute; threshold-1 more counted
+        // minutes page each (had the fire NOT counted, the pages would
+        // land one late).
         let n = GROWW_CHAIN_1M_UNDERLYING_NOT_SERVED_THRESHOLD;
         for _ in 2..n {
-            let actions = not_served.record_minute(&[("NIFTY", true), ("SENSEX", false)]);
+            let actions = not_served.record_minute(&[
+                ("NIFTY", true),
+                ("SENSEX", false),
+                ("BANKNIFTY", false),
+            ]);
             assert_eq!(actions[1].1, UnderlyingEdgeAction::None);
+            assert_eq!(actions[2].1, UnderlyingEdgeAction::None);
         }
-        let actions = not_served.record_minute(&[("NIFTY", true), ("SENSEX", false)]);
+        let actions =
+            not_served.record_minute(&[("NIFTY", true), ("SENSEX", false), ("BANKNIFTY", false)]);
         assert_eq!(actions[1].1, UnderlyingEdgeAction::Page { consecutive: n });
+        assert_eq!(actions[2].1, UnderlyingEdgeAction::Page { consecutive: n });
     }
 
     /// The token-path fire's auth short-circuit (the item-12 mirror): a
