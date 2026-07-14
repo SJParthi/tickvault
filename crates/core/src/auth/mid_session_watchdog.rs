@@ -414,9 +414,10 @@ const AUTH_FAILED_DISPLAY_PREFIX: &str = "Dhan authentication failed: ";
 /// Pure. Strips the optional [`AUTH_FAILED_DISPLAY_PREFIX`] so wrapper
 /// matching is prefix-anchored on the underlying reason.
 ///
-/// `pub(crate)` since 2026-07-08: the AUTH-GAP-06 fast-boot cached-token
-/// classifier (`crate::auth::fast_boot_validation`) reuses this exact
-/// prefix-anchoring primitive so both classifiers share one definition.
+/// `pub(crate)` since 2026-07-08 for the AUTH-GAP-06 fast-boot cached-token
+/// classifier (its module was deleted 2026-07-14 per the Dhan noise lock;
+/// the visibility is kept — a future auth classifier reuses this exact
+/// prefix-anchoring primitive rather than redefining it).
 pub(crate) fn reason_core(reason: &str) -> &str {
     reason
         .strip_prefix(AUTH_FAILED_DISPLAY_PREFIX)
@@ -443,10 +444,10 @@ fn is_inflight_lock_refusal(rendered_error: &str) -> bool {
 /// produced by OUR `format!` before any server body is appended, so it is
 /// the only part of the string an upstream cannot forge.
 ///
-/// `pub(crate)` since 2026-07-08: reused by the AUTH-GAP-06 fast-boot
-/// cached-token classifier (`crate::auth::fast_boot_validation`) — the
-/// 401/403-vs-everything-else split must parse the status from the SAME
-/// fixed, unforgeable position in both classifiers.
+/// `pub(crate)` since 2026-07-08 for the AUTH-GAP-06 fast-boot cached-token
+/// classifier (its module was deleted 2026-07-14 per the Dhan noise lock;
+/// the visibility is kept so any future auth classifier parses the status
+/// from the SAME fixed, unforgeable position).
 pub(crate) fn http_response_status(core: &str) -> Option<u16> {
     let rest = core.strip_prefix(HTTP_RESPONSE_WRAPPER)?;
     let digits: &str = rest

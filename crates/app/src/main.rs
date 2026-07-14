@@ -2158,34 +2158,12 @@ async fn main() -> Result<()> {
             );
         }
 
-        // AUTH-GAP-06 (2026-07-08 — operator incident, THIRD morning
-        // cached-token outage, 08:32–09:06 IST on 2026-07-07): the fast arm
-        // previously trusted yesterday's cached token blindly — Dhan had
-        // killed it (one active token at a time), so the WS pool spawned
-        // dead and stayed dead until the ~30-min AUTH-GAP-05 watchdog /
-        // manual intervention. Validate the cached token with ONE
-        // GET /v2/profile BEFORE any WebSocket spawn: a prefix-anchored
-        // 401/403 rejection forces a re-mint through the EXISTING
-        // TokenManager machinery (RESILIENCE-03 in-flight tripwire +
-        // Dhan mint semantics preserved; this arm passes None for the
-        // dual-instance lock flag per dual-instance-lock-2026-07-04.md §3
-        // — documented residual, deliberately UNCHANGED). Transient /
-        // REST-surface failures retry once, then proceed LOUDLY with the
-        // cached token — boot never hangs, never gains a mint-on-ambiguity
-        // path. Returns Some(manager) on the remint path so the deferred
-        // background arm below reuses it (no duplicate SSM fetch). Ordering
-        // (validation → cooldown wait → create_websocket_pool) is pinned by
-        // crates/app/tests/fast_boot_token_validation_wiring_guard.rs.
-        let fast_boot_prevalidated_token_manager =
-            tickvault_core::auth::fast_boot_validation::validate_cached_token_at_fast_boot(
-                &token_handle,
-                &client_id,
-                &config.dhan,
-                &config.token,
-                &config.network,
-                &fast_notifier,
-            )
-            .await;
+        // AUTH-GAP-06 fast-boot cached-token validation DELETED 2026-07-14
+        // (operator Dhan noise lock — dhan-rest-only-noise-lock-2026-07-14.md):
+        // this Dhan-gated fast arm is dead with `dhan_enabled = false` and is
+        // deleted wholesale by the Phase C-2 lane PR; a stale cached token on
+        // a REST-only boot is covered by dhan_rest_stack Phase 2's full
+        // TokenManager::initialize (which owns cache/mint logic itself).
 
         // WS-GAP-08 (2026-07-06 audit fix): the FAST crash-recovery arm must
         // ALSO honour a persisted Dhan 429 rate-limit cooldown BEFORE its
@@ -2604,17 +2582,8 @@ async fn main() -> Result<()> {
             },
             // SSM validation + TokenManager for renewal
             async {
-                // AUTH-GAP-06 (2026-07-08): the fast-boot cached-token
-                // validation may already have constructed (and re-minted
-                // through) a TokenManager on its Remint path — reuse it
-                // instead of a duplicate SSM fetch + duplicate manager.
-                if let Some(manager) = fast_boot_prevalidated_token_manager {
-                    info!(
-                        "deferred auth: reusing the AUTH-GAP-06 fast-boot validation \
-                         TokenManager (re-mint path) — skipping duplicate initialize_deferred"
-                    );
-                    return Ok(Ok(manager));
-                }
+                // (The AUTH-GAP-06 prevalidated-manager reuse branch was
+                // deleted 2026-07-14 with fast_boot_validation.rs.)
                 let timeout = std::time::Duration::from_secs(
                     tickvault_common::constants::TOKEN_INIT_TIMEOUT_SECS,
                 );
