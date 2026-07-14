@@ -61,6 +61,9 @@ use tickvault_common::feed_blame::{
 use tickvault_storage::feed_episode_audit_persistence::{
     FeedEpisodeAuditRow, FeedEpisodeAuditWriter, ensure_feed_episode_audit_table,
 };
+use tickvault_storage::feed_gap_audit_persistence::{
+    FeedGapAuditRow, FeedGapAuditWriter, ensure_feed_gap_audit_table,
+};
 use tickvault_storage::feed_scoreboard_persistence::{
     CoverageSource, FeedCoverageDailyRow, FeedScoreboardDailyRow, FeedScoreboardWriter,
     LAG_FLOOR_MS_DHAN, LAG_FLOOR_MS_GROWW, SCOREBOARD_SESSION_MINUTES,
@@ -2516,6 +2519,65 @@ pub fn build_spot1m_close_latency_day_sql(target_ist_day: u64) -> String {
     )
 }
 
+/// The day's `feed_gap_audit` edge rows — `(feed, start_ts micros, outcome)`
+/// — for the FEED-GAP-01 dangling-close sweep. `cast(start_ts as long)`
+/// yields micros so the parse stays numeric (no ISO-timestamp parsing).
+/// Fetch-all-and-pair-in-Rust deliberately: QuestDB 9.3.5 rejects
+/// `NOT IN (SELECT …)` on TIMESTAMP (the scoreboard round-6 lesson), and a
+/// day carries at most a handful of gap edges. Micros literals.
+#[must_use]
+pub fn build_feed_gap_day_sql(target_ist_day: u64) -> String {
+    let (start, end) = day_bounds_micros(target_ist_day);
+    format!(
+        "select feed, cast(start_ts as long) start_us, outcome \
+         from feed_gap_audit where ts >= {start} and ts < {end}"
+    )
+}
+
+/// Parse the [`build_feed_gap_day_sql`] response into
+/// `(feed, start_ts_micros, outcome)` rows. Pure; `None` = unparsable body;
+/// malformed rows are SKIPPED (best-effort), never a panic.
+#[must_use]
+pub fn parse_feed_gap_day_rows(body: &str) -> Option<Vec<(String, i64, String)>> {
+    let rows = parse_dataset(body)?;
+    let mut out = Vec::with_capacity(rows.len());
+    for row in rows {
+        if let Some(cols) = row.as_array()
+            && cols.len() >= 3
+            && let (Some(feed), Some(start_us), Some(outcome)) =
+                (cols[0].as_str(), cols[1].as_i64(), cols[2].as_str())
+        {
+            out.push((feed.to_string(), start_us, outcome.to_string()));
+        }
+    }
+    Some(out)
+}
+
+/// The day's DANGLING gap episodes: `(feed, start_ts_micros)` keys that
+/// carry an `open` row but NO `closed` / `dangling_closed` row (session-tail
+/// EOF / box-death dark-hole class). Pure + testable; order-independent.
+#[must_use]
+pub fn compute_dangling_gap_opens(rows: &[(String, i64, String)]) -> Vec<(String, i64)> {
+    use std::collections::HashSet;
+    // Per-feed-episode keys — no security_id involved, so I-P1-11 is N/A.
+    let closed: HashSet<(&str, i64)> = rows
+        .iter()
+        .filter(|(_, _, outcome)| outcome != "open")
+        .map(|(feed, start_us, _)| (feed.as_str(), *start_us))
+        .collect();
+    let mut seen: HashSet<(&str, i64)> = HashSet::new();
+    let mut out = Vec::new();
+    for (feed, start_us, outcome) in rows {
+        if outcome == "open"
+            && !closed.contains(&(feed.as_str(), *start_us))
+            && seen.insert((feed.as_str(), *start_us))
+        {
+            out.push((feed.clone(), *start_us));
+        }
+    }
+    out
+}
+
 /// Parse the [`build_rest_fetch_audit_day_sql`] response. Pure; `None` =
 /// unparsable body; rows with unexpected shapes are SKIPPED (best-effort),
 /// never a panic.
@@ -3737,6 +3799,86 @@ pub async fn run_feed_scoreboard(
                 )
                 .set(s.close_p99_ms as f64);
             }
+        }
+    }
+
+    // 6f. FEED-GAP-01 dangling-close sweep (Groww hardening PR-3,
+    //     2026-07-14): every gap episode whose recovery edge never fired
+    //     (session-tail EOF / box death mid-gap) gets ONE `dangling_closed`
+    //     row with -1 sentinels — never fabricated measurements (Rule 11).
+    //     ADDITIVE + best-effort: a read/parse/write failure logs
+    //     FEED-GAP-01 (stage=dangling_close) and NEVER touches the
+    //     episode/coverage/lag sections, the daily rows, or the run
+    //     outcome. DEDUP-idempotent: the row's deterministic identity is
+    //     (ts, day, feed, start_ts, outcome), so a rerun UPSERTs in place.
+    {
+        ensure_feed_gap_audit_table(questdb).await;
+        let sql = build_feed_gap_day_sql(target_ist_day);
+        match exec_query(&client, questdb, &sql).await {
+            Some(body) => match parse_feed_gap_day_rows(&body) {
+                Some(rows) => {
+                    let dangling = compute_dangling_gap_opens(&rows);
+                    if !dangling.is_empty() {
+                        let now_ist_nanos = chrono::Utc::now()
+                            .timestamp_nanos_opt()
+                            .unwrap_or_default()
+                            .saturating_add(tickvault_common::constants::IST_UTC_OFFSET_NANOS);
+                        let nanos_per_day: i64 = 86_400 * 1_000_000_000;
+                        let trading_date_ist_nanos =
+                            now_ist_nanos - now_ist_nanos.rem_euclid(nanos_per_day);
+                        let mut writer = FeedGapAuditWriter::new(questdb);
+                        let mut append_err = false;
+                        for (feed, start_us) in &dangling {
+                            let row = FeedGapAuditRow::dangling_closed(
+                                now_ist_nanos,
+                                trading_date_ist_nanos,
+                                feed,
+                                start_us.saturating_mul(1_000),
+                            );
+                            if let Err(err) = writer.append_row(&row) {
+                                append_err = true;
+                                error!(
+                                    code = "FEED-GAP-01",
+                                    stage = "dangling_close",
+                                    ?err,
+                                    feed,
+                                    "FEED-GAP-01: dangling-close row append failed"
+                                );
+                            }
+                        }
+                        match writer.flush() {
+                            Ok(()) if !append_err => info!(
+                                closed = dangling.len(),
+                                "feed_scoreboard: dangling gap episodes closed                                  with -1 sentinels (FEED-GAP-01 sweep)"
+                            ),
+                            Ok(()) => {}
+                            Err(err) => {
+                                metrics::counter!(
+                                    "tv_feed_gap_audit_write_errors_total",
+                                    "stage" => "dangling_close"
+                                )
+                                .increment(1);
+                                error!(
+                                    code = "FEED-GAP-01",
+                                    stage = "dangling_close",
+                                    ?err,
+                                    "FEED-GAP-01: dangling-close flush failed —                                      the day's open episodes stay open (honest,                                      visible via SQL); the next run re-sweeps"
+                                );
+                            }
+                        }
+                    }
+                }
+                None => error!(
+                    code = "FEED-GAP-01",
+                    stage = "dangling_close",
+                    "FEED-GAP-01: the day's feed_gap_audit body was unparsable                      — dangling episodes stay open until the next sweep"
+                ),
+            },
+            None => error!(
+                code = "FEED-GAP-01",
+                stage = "dangling_close",
+                "FEED-GAP-01: the day's feed_gap_audit rows could not be read                  — dangling episodes stay open until the next sweep"
+            ),
         }
     }
 
@@ -7047,5 +7189,60 @@ mod tests {
         assert_eq!(dhan_chain.close_samples, -1);
         // Empty summaries still render the four canonical placeholders.
         assert_eq!(build_rest_leg_score_lines(&[]).len(), 4);
+    }
+
+    // -----------------------------------------------------------------------
+    // FEED-GAP-01 dangling-close sweep (Groww hardening PR-3, 2026-07-14)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_feed_gap_day_sql_uses_micros_bounds_and_long_cast() {
+        let sql = build_feed_gap_day_sql(20_650);
+        assert!(sql.contains("from feed_gap_audit"));
+        assert!(sql.contains("cast(start_ts as long)"));
+        let start = 20_650_i64 * 86_400 * 1_000_000;
+        assert!(sql.contains(&format!("ts >= {start}")));
+    }
+
+    #[test]
+    fn test_compute_dangling_gap_opens_pairs_open_with_any_close() {
+        let rows = vec![
+            // Episode A: open + closed → NOT dangling.
+            ("groww".to_string(), 100, "open".to_string()),
+            ("groww".to_string(), 100, "closed".to_string()),
+            // Episode B: open only → DANGLING.
+            ("groww".to_string(), 200, "open".to_string()),
+            // Episode C: open + dangling_closed (a prior sweep) → NOT dangling.
+            ("groww".to_string(), 300, "open".to_string()),
+            ("groww".to_string(), 300, "dangling_closed".to_string()),
+            // Duplicate open rows for B (DEDUP re-append) → ONE sweep row.
+            ("groww".to_string(), 200, "open".to_string()),
+        ];
+        assert_eq!(
+            compute_dangling_gap_opens(&rows),
+            vec![("groww".to_string(), 200)]
+        );
+    }
+
+    #[test]
+    fn test_compute_dangling_gap_opens_is_per_feed() {
+        // The same start_ts on ANOTHER feed never closes this feed's episode.
+        let rows = vec![
+            ("groww".to_string(), 500, "open".to_string()),
+            ("dhan".to_string(), 500, "closed".to_string()),
+        ];
+        assert_eq!(
+            compute_dangling_gap_opens(&rows),
+            vec![("groww".to_string(), 500)]
+        );
+    }
+
+    #[test]
+    fn test_parse_feed_gap_day_rows_skips_malformed() {
+        let body = r#"{"columns":[{"name":"feed"},{"name":"start_us"},{"name":"outcome"}],
+            "dataset":[["groww",123,"open"],["groww","bad","open"],[null,1,"open"]]}"#;
+        let rows = parse_feed_gap_day_rows(body).expect("parsable");
+        assert_eq!(rows, vec![("groww".to_string(), 123, "open".to_string())]);
+        assert!(parse_feed_gap_day_rows("not json").is_none());
     }
 }

@@ -53,10 +53,10 @@ use tickvault_common::types::ExchangeSegment;
 use tickvault_common::ws_event_types::{
     WS_EVENT_NO_DHAN_CODE, WsEventAuditRow, WsEventKind, WsType,
 };
-use tickvault_storage::groww_persistence::{GrowwLiveTickRow, GrowwLiveTickWriter};
 use tickvault_storage::feed_gap_audit_persistence::{
-    ensure_feed_gap_audit_table, FeedGapAuditRow, FeedGapAuditWriter,
+    FeedGapAuditRow, FeedGapAuditWriter, ensure_feed_gap_audit_table,
 };
+use tickvault_storage::groww_persistence::{GrowwLiveTickRow, GrowwLiveTickWriter};
 use tickvault_storage::seal_writer_runner::global_seal_sender;
 use tickvault_trading::candles::{FeedStrategy, MultiTfAggregator};
 
@@ -719,8 +719,7 @@ impl FeedGapTracker {
             }
             self.prev_last_tick_nanos = last_tick_nanos;
             if let Some((last_tick_before, detect_nanos)) = self.open.take() {
-                let gap_secs = (last_tick_nanos.saturating_sub(last_tick_before)
-                    / 1_000_000_000)
+                let gap_secs = (last_tick_nanos.saturating_sub(last_tick_before) / 1_000_000_000)
                     .max(0) as u64;
                 return (
                     FeedGapEdge::Close {
@@ -752,7 +751,11 @@ impl FeedGapTracker {
 /// IST "HH:MM" label for an IST-epoch-nanos instant (pure).
 pub(crate) fn ist_hhmm_label(ist_nanos: i64) -> String {
     let secs_of_day = (ist_nanos / 1_000_000_000).rem_euclid(86_400);
-    format!("{:02}:{:02}", secs_of_day / 3_600, (secs_of_day % 3_600) / 60)
+    format!(
+        "{:02}:{:02}",
+        secs_of_day / 3_600,
+        (secs_of_day % 3_600) / 60
+    )
 }
 
 /// Comma list of the 1-minute bucket labels overlapped by `[start, end]`
@@ -3480,8 +3483,7 @@ pub async fn run_groww_bridge(
                         end_nanos,
                         gap_secs,
                     } => {
-                        let partial =
-                            partial_minute_labels(*last_tick_before_nanos, *end_nanos);
+                        let partial = partial_minute_labels(*last_tick_before_nanos, *end_nanos);
                         (
                             FeedGapAuditRow::closed(
                                 gap_now_nanos,
@@ -3532,9 +3534,7 @@ pub async fn run_groww_bridge(
                     // sender instead of replaying a poisoned buffer.
                     gap_writer = None;
                 }
-                if let Some(notifier) =
-                    notifier_slot.as_ref().and_then(|slot| slot.load_full())
-                {
+                if let Some(notifier) = notifier_slot.as_ref().and_then(|slot| slot.load_full()) {
                     notifier.notify(event);
                 }
             }
@@ -6587,7 +6587,11 @@ mod tests {
         let mut t = FeedGapTracker::default();
         let _ = t.poll(Some(0), GAP_NOW, false);
         let (edge, _) = t.poll(Some(60), GAP_NOW + 60 * SEC, false);
-        assert_eq!(edge, FeedGapEdge::None, "out-of-session silence is not a gap");
+        assert_eq!(
+            edge,
+            FeedGapEdge::None,
+            "out-of-session silence is not a gap"
+        );
     }
 
     #[test]
@@ -6648,7 +6652,10 @@ mod tests {
         // Bound: a multi-hour gap collapses past the cap with an ellipsis.
         let long_end = day + (12 * 3_600) * SEC;
         let labels = partial_minute_labels(start, long_end);
-        assert!(labels.ends_with(",…"), "bounded list must end with ellipsis: {labels}");
+        assert!(
+            labels.ends_with(",…"),
+            "bounded list must end with ellipsis: {labels}"
+        );
         assert_eq!(
             labels.trim_end_matches(",…").split(',').count(),
             FEED_GAP_PARTIAL_MINUTES_MAX
