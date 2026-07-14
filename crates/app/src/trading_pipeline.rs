@@ -43,6 +43,9 @@ use tickvault_common::order_types::{
 };
 use tickvault_common::tick_types::ParsedTick;
 use tickvault_core::auth::token_manager::TokenHandle;
+use tickvault_core::notification::NotificationService;
+
+use crate::oms_alert_bridge::OmsAlertBridge;
 
 use tickvault_trading::indicator::{IndicatorEngine, IndicatorParams};
 use tickvault_trading::oms::{
@@ -109,6 +112,10 @@ pub struct TradingPipelineConfig {
     pub client_id: String,
     /// Token handle for authentication.
     pub token_handle: TokenHandle,
+    /// Shared notifier for OMS/Risk alert sinks (noise-lock §2.1 order-side
+    /// family). `None` in tests; `Some` in production — mirrors the engines'
+    /// `alert_sink: Option<…>` fields.
+    pub notifier: Option<std::sync::Arc<NotificationService>>,
 }
 
 /// Spawns the trading pipeline as a background task.
@@ -228,6 +235,20 @@ async fn run_trading_pipeline(
     });
     let mut oms =
         OrderManagementSystem::new(api_client, rate_limiter, token_bridge, config.client_id);
+
+    // Noise-lock §2.1 (2026-07-14): wire the OMS + Risk alert sinks to the
+    // shared notifier — the first-ever production `set_alert_sink` callers.
+    // Cold path: a sink fires only on rejects / breaker edges / rate-limit
+    // denials / risk halts (~1-100 events/day). Two boxed bridges — the
+    // sinks are `Box<dyn …>` on separate engines over the same Arc.
+    if let Some(ref notifier) = config.notifier {
+        oms.set_alert_sink(Box::new(OmsAlertBridge::new(std::sync::Arc::clone(
+            notifier,
+        ))));
+        risk_engine.set_alert_sink(Box::new(OmsAlertBridge::new(std::sync::Arc::clone(
+            notifier,
+        ))));
+    }
 
     info!(
         dry_run = config.dry_run,
@@ -667,6 +688,7 @@ pub fn init_trading_pipeline(
     config: &ApplicationConfig,
     token_handle: &TokenHandle,
     client_id: &str,
+    notifier: Option<std::sync::Arc<NotificationService>>,
 ) -> Option<(TradingPipelineConfig, Option<StrategyHotReloader>)> {
     let strategy_path = Path::new(&config.strategy.config_path);
 
@@ -725,6 +747,7 @@ pub fn init_trading_pipeline(
         },
         client_id: client_id.to_owned(),
         token_handle: token_handle.clone(),
+        notifier,
     };
 
     Some((pipeline_config, hot_reloader))
@@ -1088,6 +1111,7 @@ threshold = 70.0
             rest_api_base_url: "https://api.dhan.co/v2".to_owned(),
             client_id: "test_client".to_owned(),
             token_handle: handle,
+            notifier: None,
         };
 
         assert!(config.dry_run, "dry_run must be true for safety");
@@ -1160,6 +1184,7 @@ threshold = 25.0
             rest_api_base_url: "https://api.dhan.co/v2".to_owned(),
             client_id: "client_123".to_owned(),
             token_handle: handle,
+            notifier: None,
         };
 
         assert_eq!(config.strategies.len(), 2);
@@ -1587,6 +1612,7 @@ threshold = 25.0
             rest_api_base_url: "https://api.dhan.co/v2".to_owned(),
             client_id: "test".to_owned(),
             token_handle: handle,
+            notifier: None,
         };
         // Zero capital is technically allowed at construction — risk engine
         // will handle this by immediately breaching daily loss threshold.
@@ -1608,6 +1634,7 @@ threshold = 25.0
             rest_api_base_url: "https://api.dhan.co/v2".to_owned(),
             client_id: "test".to_owned(),
             token_handle: handle,
+            notifier: None,
         };
         assert!((config.max_daily_loss_percent - 100.0).abs() < f64::EPSILON);
     }
@@ -1637,6 +1664,7 @@ threshold = 25.0
             rest_api_base_url: "https://api.dhan.co/v2".to_owned(),
             client_id: "test".to_owned(),
             token_handle: handle,
+            notifier: None,
         };
         assert_eq!(config.indicator_params.ema_fast_period, 5);
         assert_eq!(config.indicator_params.ema_slow_period, 10);
@@ -1660,6 +1688,7 @@ threshold = 25.0
             rest_api_base_url: "https://api.dhan.co/v2".to_owned(),
             client_id: "live_client".to_owned(),
             token_handle: handle,
+            notifier: None,
         };
         assert!(
             !config.dry_run,
@@ -1682,6 +1711,7 @@ threshold = 25.0
             rest_api_base_url: "https://api.dhan.co/v2".to_owned(),
             client_id: "test".to_owned(),
             token_handle: handle,
+            notifier: None,
         };
         assert_eq!(config.max_orders_per_second, 1);
     }
@@ -1967,6 +1997,7 @@ threshold = 70.0
             rest_api_base_url: "https://api.dhan.co/v2".to_owned(),
             client_id: "test".to_owned(),
             token_handle: handle,
+            notifier: None,
         };
 
         let task_handle = spawn_trading_pipeline(config, tick_rx, order_rx, None);
@@ -2014,6 +2045,7 @@ threshold = 70.0
             rest_api_base_url: "https://api.dhan.co/v2".to_owned(),
             client_id: "test".to_owned(),
             token_handle: handle,
+            notifier: None,
         };
 
         let task_handle = spawn_trading_pipeline(config, tick_rx, order_rx, None);
@@ -2061,6 +2093,7 @@ threshold = 70.0
             rest_api_base_url: "https://api.dhan.co/v2".to_owned(),
             client_id: "test".to_owned(),
             token_handle: handle,
+            notifier: None,
         };
 
         let task_handle = spawn_trading_pipeline(config, tick_rx, order_rx, None);
@@ -2224,6 +2257,7 @@ threshold = 70.0
             rest_api_base_url: "https://api.dhan.co/v2".to_owned(),
             client_id: "test".to_owned(),
             token_handle: handle,
+            notifier: None,
         };
 
         let task_handle = spawn_trading_pipeline(config, tick_rx, order_rx, None);
@@ -2256,6 +2290,7 @@ threshold = 70.0
             rest_api_base_url: "https://api.dhan.co/v2".to_owned(),
             client_id: "test".to_owned(),
             token_handle: handle,
+            notifier: None,
         };
 
         let task_handle = spawn_trading_pipeline(config, tick_rx, order_rx, None);
@@ -2305,7 +2340,7 @@ threshold = 70.0
         let config = build_test_application_config("/tmp/tv_nonexistent_strategy_99999.toml");
         let handle = make_token_handle_with_value("jwt");
 
-        let result = init_trading_pipeline(&config, &handle, "test_client");
+        let result = init_trading_pipeline(&config, &handle, "test_client", None);
         assert!(
             result.is_none(),
             "nonexistent strategy file should return None"
@@ -2337,7 +2372,7 @@ threshold = 70.0
         let config = build_test_application_config(config_path.to_str().unwrap());
         let handle = make_token_handle_with_value("jwt");
 
-        let result = init_trading_pipeline(&config, &handle, "test_client");
+        let result = init_trading_pipeline(&config, &handle, "test_client", None);
         assert!(result.is_some(), "valid strategy file should return Some");
 
         let (pipeline_config, _hot_reloader) = result.unwrap();
@@ -2358,7 +2393,7 @@ threshold = 70.0
         let config = build_test_application_config(config_path.to_str().unwrap());
         let handle = make_token_handle_with_value("jwt");
 
-        let result = init_trading_pipeline(&config, &handle, "test_client");
+        let result = init_trading_pipeline(&config, &handle, "test_client", None);
         assert!(
             result.is_some(),
             "empty strategy file should still return Some (0 strategies)"
@@ -2384,7 +2419,7 @@ threshold = 70.0
         let config = build_test_application_config(config_path.to_str().unwrap());
         let handle = make_token_handle_with_value("jwt");
 
-        let result = init_trading_pipeline(&config, &handle, "test_client");
+        let result = init_trading_pipeline(&config, &handle, "test_client", None);
         assert!(
             result.is_some(),
             "invalid TOML should still return Some (with defaults)"
@@ -2425,6 +2460,7 @@ threshold = 70.0
             rest_api_base_url: "https://api.dhan.co/v2".to_owned(),
             client_id: "test".to_owned(),
             token_handle: handle,
+            notifier: None,
         };
 
         let task_handle = spawn_trading_pipeline(config, tick_rx, order_rx, None);
@@ -2468,6 +2504,7 @@ threshold = 70.0
             rest_api_base_url: "https://api.dhan.co/v2".to_owned(),
             client_id: "test".to_owned(),
             token_handle: handle,
+            notifier: None,
         };
 
         let task_handle = spawn_trading_pipeline(config, tick_rx, order_rx, None);
@@ -2506,6 +2543,7 @@ threshold = 70.0
             rest_api_base_url: "https://api.dhan.co/v2".to_owned(),
             client_id: "test".to_owned(),
             token_handle: handle,
+            notifier: None,
         };
 
         let task_handle = spawn_trading_pipeline(config, tick_rx, order_rx, None);
@@ -2604,6 +2642,7 @@ threshold = 70.0
             rest_api_base_url: "https://api.dhan.co/v2".to_owned(),
             client_id: "test".to_owned(),
             token_handle: handle,
+            notifier: None,
         };
 
         assert!(config.dry_run, "must be paper trading mode");
@@ -2632,6 +2671,7 @@ threshold = 70.0
             rest_api_base_url: "https://api.dhan.co/v2".to_owned(),
             client_id: "test".to_owned(),
             token_handle: handle,
+            notifier: None,
         };
 
         assert!(!config.dry_run, "must be live mode");
@@ -2672,7 +2712,7 @@ threshold = 70.0
         let config = build_test_application_config(config_path.to_str().unwrap());
         let handle = make_token_handle_with_value("jwt");
 
-        let result = init_trading_pipeline(&config, &handle, "test_client");
+        let result = init_trading_pipeline(&config, &handle, "test_client", None);
         assert!(
             result.is_some(),
             "file with disabled strategy should still return Some"
@@ -2730,7 +2770,7 @@ threshold = 20.0
         let config = build_test_application_config(config_path.to_str().unwrap());
         let handle = make_token_handle_with_value("jwt");
 
-        let result = init_trading_pipeline(&config, &handle, "test_client");
+        let result = init_trading_pipeline(&config, &handle, "test_client", None);
         assert!(result.is_some());
 
         let _ = std::fs::remove_file(&config_path);
@@ -2766,7 +2806,7 @@ threshold = 70.0
         let config = build_test_application_config(config_path.to_str().unwrap());
         let handle = make_token_handle_with_value("jwt");
 
-        let result = init_trading_pipeline(&config, &handle, "my_client_id");
+        let result = init_trading_pipeline(&config, &handle, "my_client_id", None);
         assert!(result.is_some());
 
         let (pipeline_config, _) = result.unwrap();
@@ -2938,6 +2978,7 @@ threshold = 30.0
             rest_api_base_url: "https://api.dhan.co/v2".to_owned(),
             client_id: "test".to_owned(),
             token_handle: handle,
+            notifier: None,
         };
 
         let task_handle = spawn_trading_pipeline(config, tick_rx, order_rx, None);
@@ -3070,6 +3111,7 @@ threshold = 30.0
             rest_api_base_url: "https://api.dhan.co/v2".to_owned(),
             client_id: "test".to_owned(),
             token_handle: handle,
+            notifier: None,
         };
         assert!(
             config.rest_api_base_url.contains("/v2"),
@@ -3199,6 +3241,7 @@ threshold = 70.0
             rest_api_base_url: "https://api.dhan.co/v2".to_owned(),
             client_id: "test".to_owned(),
             token_handle: handle,
+            notifier: None,
         };
 
         // Pass the reloader to the pipeline — exercises the `if let Some(ref reloader)` path
@@ -3282,6 +3325,7 @@ threshold = 50.0
             rest_api_base_url: "https://api.dhan.co/v2".to_owned(),
             client_id: "test".to_owned(),
             token_handle: handle,
+            notifier: None,
         };
 
         let task_handle = spawn_trading_pipeline(config, tick_rx, order_rx, None);
@@ -3336,6 +3380,7 @@ threshold = 50.0
             rest_api_base_url: "https://api.dhan.co/v2".to_owned(),
             client_id: "test".to_owned(),
             token_handle: handle,
+            notifier: None,
         };
 
         let task_handle = spawn_trading_pipeline(config, tick_rx, order_rx, None);
@@ -3396,7 +3441,7 @@ threshold = 70.0
         let config = build_test_application_config(config_path.to_str().unwrap());
         let handle = make_token_handle_with_value("jwt");
 
-        let result = init_trading_pipeline(&config, &handle, "client");
+        let result = init_trading_pipeline(&config, &handle, "client", None);
         assert!(result.is_some());
 
         let (pipeline_config, _) = result.unwrap();
@@ -3470,6 +3515,7 @@ threshold = 65.0
             rest_api_base_url: "https://api.dhan.co/v2".to_owned(),
             client_id: "test".to_owned(),
             token_handle: handle,
+            notifier: None,
         };
 
         let task_handle = spawn_trading_pipeline(config, tick_rx, order_rx, None);
@@ -3549,6 +3595,7 @@ threshold = 35.0
             rest_api_base_url: "https://api.dhan.co/v2".to_owned(),
             client_id: "test".to_owned(),
             token_handle: handle,
+            notifier: None,
         };
 
         let task_handle = spawn_trading_pipeline(config, tick_rx, order_rx, None);
@@ -3594,6 +3641,7 @@ threshold = 35.0
             rest_api_base_url: "https://api.dhan.co/v2".to_owned(),
             client_id: "test".to_owned(),
             token_handle: handle,
+            notifier: None,
         };
 
         let task_handle = spawn_trading_pipeline(config, tick_rx, order_rx, None);
@@ -3622,6 +3670,7 @@ threshold = 35.0
             rest_api_base_url: "https://api.dhan.co/v2".to_owned(),
             client_id: "test".to_owned(),
             token_handle: handle,
+            notifier: None,
         };
 
         let task_handle = spawn_trading_pipeline(config, tick_rx, order_rx, None);
@@ -3684,7 +3733,7 @@ threshold = 70.0
         let config = build_test_application_config(config_path.to_str().unwrap());
         let handle = make_token_handle_with_value("jwt");
 
-        let result = init_trading_pipeline(&config, &handle, "client");
+        let result = init_trading_pipeline(&config, &handle, "client", None);
         assert!(result.is_some());
 
         let (_, hot_reloader) = result.unwrap();

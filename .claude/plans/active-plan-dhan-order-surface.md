@@ -122,6 +122,34 @@ normative resolutions from the judge synthesis:
     `crates/common/src/config.rs`.
 12. **Scope OUT** enumerated in the OUT OF SCOPE section below.
 
+### Cluster B — order-side alerting + monitoring, dormant behind the OFF switch (owning session: the order-alerting PR)
+
+The 🔷 DHAN order-side alert + monitoring surface, fully dormant today
+(dry_run=true + dhan_enabled=false — OMS never instantiated). NEW
+`crates/app/src/oms_alert_bridge.rs` implements BOTH `OmsAlertSink` +
+`RiskAlertSink` over `Arc<NotificationService>`, mapping the 4
+`OmsAlert` arms + `fire_risk_halt` 1:1 to the 5 EXISTING
+NotificationEvent variants (zero events.rs changes) and carrying the
+coded OMS-GAP-04 / RISK-GAP-01 `error!` emits (synchronous, before the
+Telegram dispatch — dual-route with the CloudWatch errcode alarms).
+Wiring lives in `run_trading_pipeline` (the sole construction site),
+gated on the new `TradingPipelineConfig::notifier: Option<…>`; main.rs
+delta = 2 one-line param passes (dropped without loss if PR #1522
+merges first — the `Option` field + in-pipeline wiring survive; the
+bridge's future production consumer becomes Cluster A's
+`order_runtime`). CloudWatch: +3 `error_code_alerts` entries
+(OMS-GAP-03/04, RISK-GAP-01), +4 metric alarms (orders-placed-live
+tripwire {host,mode="live"} via a THIRD EMF declaration,
+circuit-breaker-open, daily-pnl-breach — a PLAIN alarm on the NEW
+`tv_daily_pnl` gauge at ≤ −20,000, order-latency-high >5s), EMF decl-1
+26→29 names, dashboard #3 `tv-<env>-orders`. Cost: +$0.70/mo alarms
+now; ~$1.50/mo EMF once live — dormant series bill $0. Rule-edit-FIRST:
+noise-lock §2.1 dated amendment (the 5 variants + 7 alarms), the
+observability-architecture.md paging paragraph, gap-enforcement.md
+dated notes, aws-budget.md COST NOTE. Cluster A's umbrella item
+"NotifierAlertSink" (design bullet 7) is SATISFIED by this bridge —
+whichever lands second reuses the merged type; no duplicate sink impls.
+
 ### Cluster C — order-side audit tables revival (owning session TBD; parallel-safe)
 
 Re-create the order_audit-family QuestDB persistence deleted 2026-05-20
@@ -195,6 +223,24 @@ Cluster A (this session's PR; Files/Tests per the judge-approved final design):
 - [ ] A8 — config section + rule files (order-runtime-dryrun.md; dated notes in ws-reinject-error-codes.md + websocket-connection-scope-lock.md)
   - Files: crates/common/src/config.rs, config/base.toml, .claude/rules/project/order-runtime-dryrun.md, .claude/rules/project/ws-reinject-error-codes.md
   - Tests: config validation unit tests (interval ≥ 60, capacity bounds), serde-default-off test
+
+Cluster B (the order-alerting PR; ticked progressively in its own diff):
+
+- [x] B1 — oms_alert_bridge.rs: both sink impls (OmsAlertSink + RiskAlertSink) over Arc<NotificationService>, 1:1 event mapping, coded OMS-GAP-04/RISK-GAP-01 emits, Handle::try_current panic guard + counted drop arm
+  - Files: crates/app/src/oms_alert_bridge.rs, crates/app/src/lib.rs
+  - Tests: test_bridge_maps_order_rejected_arm, test_bridge_maps_circuit_breaker_arms, test_bridge_maps_rate_limit_arm, test_fire_risk_halt_maps_riskhalt_event, test_bridge_no_runtime_counts_drop
+- [x] B2 — trading_pipeline wiring (TradingPipelineConfig::notifier Option field + set_alert_sink on BOTH engines, gated) + main.rs 2 one-line param passes + wiring ratchet
+  - Files: crates/app/src/trading_pipeline.rs, crates/app/src/main.rs, crates/app/tests/oms_alert_wiring_guard.rs
+  - Tests: test_trading_pipeline_sets_both_alert_sinks, test_bridge_covers_all_oms_alert_arms
+- [ ] B3 — tv_daily_pnl (ONE line in total_unrealized_pnl after risk/engine.rs:300 — the :197 record_fill site is a borrow conflict, judged out) + tv_order_placement_last_ms beside both place_order histogram sites
+  - Files: crates/trading/src/risk/engine.rs, crates/trading/src/oms/engine.rs
+  - Tests: test_daily_pnl_gauge_is_realized_plus_unrealized, test_order_placement_last_ms_set_on_place
+- [ ] B4 — terraform: +3 error_code_alerts entries (OMS-GAP-03/04, RISK-GAP-01), +4 app-alarms (orders-placed-live {host,mode="live"}, circuit-breaker-open, daily-pnl-breach ≤ −20000, order-latency-high >5000ms), EMF decl-1 26→29 + NEW decl-3 [host,mode] in BOTH lockstep files, wiring.rs pins 26→29 / 22→26 + the 2 new mirror tests
+  - Files: deploy/aws/terraform/error-code-alarms.tf, deploy/aws/terraform/app-alarms.tf, deploy/aws/terraform/user-data.sh.tftpl, deploy/aws/cloudwatch-agent.json, crates/common/tests/cloudwatch_app_alarms_wiring.rs
+  - Tests: test_emf_metric_selectors_name_count_is_twenty_nine, test_app_alarms_count_is_twenty_six, test_third_emf_declaration_publishes_orders_placed_per_mode, test_orders_placed_live_alarm_uses_per_mode_dimensions
+- [ ] B5 — dashboard #3 (tv-<env>-orders) + rule/doc edits (noise-lock §2.1 dated amendment, observability-architecture.md paging paragraph, gap-enforcement.md dated notes, aws-budget.md COST NOTE)
+  - Files: deploy/aws/terraform/dashboard.tf, .claude/rules/project/dhan-rest-only-noise-lock-2026-07-14.md, .claude/rules/project/gap-enforcement.md, .claude/rules/project/observability-architecture.md, .claude/rules/project/aws-budget.md
+  - Tests: error_code_paging_filter_drift_guard (tf ⇔ doc ⇔ emit, bidirectional), error_code_rule_file_crossref
 
 Other clusters (checked off by their owning sessions' PRs, all referencing THIS plan):
 
@@ -378,6 +424,11 @@ adding one records the cost note per `aws-budget.md`.
 | `crates/trading/src/risk/engine.rs` | Cluster A this round (lot_size fix + halt extraction); E2's margin gate REBASES after A merges | `check_order` gains OrderIntent in E2 only |
 | `crates/app/src/groww_bridge.rs` tick seam | Cluster A | marks tap (one guarded try_send block) |
 | Storage order-audit writers (`crates/storage/src/`) | Cluster C | A emits via a seam C fills in; A ships without tables (flagged follow-up) |
+| `crates/app/src/oms_alert_bridge.rs` (new module) | Cluster B | SATISFIES Cluster A's "NotifierAlertSink" item — whichever lands second reuses the merged type; no duplicate sink impls |
+| `crates/app/src/trading_pipeline.rs` (notifier field + set_alert_sink wiring) | Cluster B | A owns relocating the wiring into `order_runtime` when #1522's spawn-site deletion lands; the main.rs param passes drop without loss |
+| `crates/trading/src/risk/engine.rs` `tv_daily_pnl` gauge | Cluster B (1 line inside total_unrealized_pnl after :300) | Rebases on Cluster A's risk/engine.rs round; the :197 record_fill site is a borrow conflict, judged out |
+| `crates/trading/src/oms/engine.rs` `place_order` gauge one-liners (:239/:359 region) | Cluster B | Disjoint from A's handle_order_update+FillEvent region AND D's SANDBOX_DEADLINE region (verified) |
+| `deploy/aws/terraform` order-side alarms/EMF/dashboard + `cloudwatch_app_alarms_wiring.rs` pins | Cluster B | Textual-conflict-prone with #1528 (error-code-alarms.tf / observability-architecture.md / aws-budget.md) — Cluster B rebases + re-runs the drift tests |
 
 Build-lead: the cluster A session. Conflicts on any seam: the
 non-owner rebases; never a force-merge over an owner's in-flight PR.

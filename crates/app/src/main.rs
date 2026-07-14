@@ -2809,7 +2809,12 @@ async fn main() -> Result<()> {
             let tick_rx = fast_tick_broadcast_sender.subscribe();
             let order_rx = order_update_sender.subscribe();
 
-            match trading_pipeline::init_trading_pipeline(&config, &token_handle, &client_id) {
+            match trading_pipeline::init_trading_pipeline(
+                &config,
+                &token_handle,
+                &client_id,
+                Some(std::sync::Arc::clone(&fast_notifier)),
+            ) {
                 Some((pipeline_config, hot_reloader)) => {
                     let handle = trading_pipeline::spawn_trading_pipeline_full(
                         pipeline_config,
@@ -8965,6 +8970,7 @@ async fn start_dhan_lane(
             config,
             &token_manager.token_handle(),
             &ws_client_id,
+            Some(std::sync::Arc::clone(&notifier)),
         ) {
             Some((pipeline_config, hot_reloader)) => {
                 let handle = trading_pipeline::spawn_trading_pipeline_full(

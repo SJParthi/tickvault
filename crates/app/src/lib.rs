@@ -213,6 +213,11 @@ pub mod lifecycle_reconcile_orchestrator;
 pub mod api_token_rotation;
 #[cfg(feature = "daily_universe_fetcher")]
 pub mod daily_universe_boot;
+/// DHAN order-side alerting (2026-07-14, noise-lock §2.1 grant): bridges
+/// the OMS/Risk alert-sink callbacks to `NotificationService` (the
+/// first-ever production `set_alert_sink` callers) + the coded
+/// OMS-GAP-04 / RISK-GAP-01 error! emits.
+pub mod oms_alert_bridge;
 pub mod subsystem_memory;
 pub mod trading_pipeline;
 /// C3 (2026-07-03): bounded, chunked, backpressured STAGE-C.2b WAL frame
