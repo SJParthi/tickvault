@@ -3826,6 +3826,13 @@ pub async fn run_feed_scoreboard(
                         let nanos_per_day: i64 = 86_400 * 1_000_000_000;
                         let trading_date_ist_nanos =
                             now_ist_nanos - now_ist_nanos.rem_euclid(nanos_per_day);
+                        // Inline append+flush is acceptable HERE (unlike the
+                        // bridge loop): this sweep runs ONCE per daily run on
+                        // the cold scoreboard task, and the writer's ILP conf
+                        // is pinned no-retry + 5s request timeout (review
+                        // HIGH 2026-07-14), so the worst case is a bounded
+                        // ~5s wait once a day — nothing latency-sensitive
+                        // shares this task.
                         let mut writer = FeedGapAuditWriter::new(questdb);
                         let mut append_err = false;
                         for (feed, start_us) in &dangling {

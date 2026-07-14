@@ -2973,7 +2973,12 @@ pub async fn run_groww_bridge(
         });
     }
     let mut gap_tracker = FeedGapTracker::default();
-    let mut gap_writer: Option<FeedGapAuditWriter> = None;
+    // Shared slot for the lazy writer: the edge append+flush runs OFF this
+    // loop in `spawn_blocking` (review HIGH 2026-07-14), so the slot is an
+    // Arc<Mutex<Option<...>>> the blocking task locks per edge (cold path —
+    // once per episode edge; the Mutex is uncontended in practice).
+    let gap_writer: Arc<std::sync::Mutex<Option<FeedGapAuditWriter>>> =
+        Arc::new(std::sync::Mutex::new(None));
     // PR-3 (2026-07-02): resume from the persisted flushed-offset when it
     // provably belongs to the current capture file — otherwise byte-0 re-tail
     // (DEDUP-idempotent, the pre-PR-3 behavior).
@@ -3529,28 +3534,42 @@ pub async fn run_groww_bridge(
                 };
                 // Durable row FIRST (audit-first §24), best-effort — a
                 // failure is loud (FEED-GAP-01 + counter) and never blocks
-                // the Telegram bubble or the recovery machinery.
-                let writer = gap_writer.get_or_insert_with(|| FeedGapAuditWriter::new(&qdb));
-                let write_result = writer.append_row(&row).and_then(|()| writer.flush());
-                if let Err(err) = write_result {
-                    metrics::counter!(
-                        "tv_feed_gap_audit_write_errors_total",
-                        "stage" => "append_flush"
-                    )
-                    .increment(1);
-                    error!(
-                        code = "FEED-GAP-01",
-                        stage = "append_flush",
-                        ?err,
-                        outcome = row.outcome,
-                        "FEED-GAP-01: gap-episode row not persisted — the \
-                         Telegram bubble still fires; the next edge re-appends \
-                         (DEDUP-idempotent)"
-                    );
-                    // Drop the writer so the next edge rebuilds a fresh
-                    // sender instead of replaying a poisoned buffer.
-                    gap_writer = None;
-                }
+                // the Telegram bubble or the recovery machinery. The
+                // append+flush runs OFF this loop (`spawn_blocking`,
+                // fire-and-forget; review HIGH 2026-07-14): even with the
+                // bounded no-retry/5s-timeout ILP conf, a down QuestDB must
+                // never stall the NDJSON drain or the parse-time liveness
+                // stamp (a stalled stamp risks a false FEED-STALL-01 kill of
+                // a healthy sidecar). Episode edges are cold (once per
+                // episode), so the spawn cost is irrelevant.
+                let writer_slot = Arc::clone(&gap_writer);
+                let qdb_for_gap = qdb.clone();
+                tokio::task::spawn_blocking(move || {
+                    let mut slot = writer_slot
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let writer = slot.get_or_insert_with(|| FeedGapAuditWriter::new(&qdb_for_gap));
+                    let write_result = writer.append_row(&row).and_then(|()| writer.flush());
+                    if let Err(err) = write_result {
+                        metrics::counter!(
+                            "tv_feed_gap_audit_write_errors_total",
+                            "stage" => "append_flush"
+                        )
+                        .increment(1);
+                        error!(
+                            code = "FEED-GAP-01",
+                            stage = "append_flush",
+                            ?err,
+                            outcome = row.outcome,
+                            "FEED-GAP-01: gap-episode row not persisted — the \
+                             Telegram bubble still fires; the next edge re-appends \
+                             (DEDUP-idempotent)"
+                        );
+                        // Drop the writer so the next edge rebuilds a fresh
+                        // sender instead of replaying a poisoned buffer.
+                        *slot = None;
+                    }
+                });
                 if let Some(notifier) = notifier_slot.as_ref().and_then(|slot| slot.load_full()) {
                     notifier.notify(event);
                 }

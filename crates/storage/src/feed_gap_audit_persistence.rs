@@ -262,9 +262,17 @@ pub async fn ensure_feed_gap_audit_table(questdb_config: &QuestDbConfig) {
 /// Builds the ILP-over-HTTP conf string. HTTP (NOT ILP TCP) so every flush
 /// gets a per-request server ACK — a server-side reject (schema drift, DEDUP
 /// violation) surfaces as `Err` instead of a silently empty table (the
-/// 2026-07-05 ws_event_audit lesson).
+/// 2026-07-05 ws_event_audit lesson). `retry_timeout=0` disables questdb-rs's
+/// INTERNAL ~10s sleep-and-resend ladder and `request_timeout=5000` bounds a
+/// single flush to 5s (the shadow-writer 2026-07-06 precedent) — so a flush
+/// against a down/black-holed QuestDB can never wedge the caller for tens of
+/// seconds (review HIGH 2026-07-14: the bridge-loop edge write must stay
+/// bounded even inside its `spawn_blocking` offload).
 fn gap_ilp_http_conf(config: &QuestDbConfig) -> String {
-    format!("http::addr={}:{};", config.host, config.http_port)
+    format!(
+        "http::addr={}:{};protocol_version=1;retry_timeout=0;request_timeout=5000;",
+        config.host, config.http_port
+    )
 }
 
 /// Lazy ILP-over-HTTP writer for `feed_gap_audit`. Mirrors
@@ -404,6 +412,24 @@ mod tests {
 
     const TS: i64 = 1_770_000_000_000_000_000;
     const DAY: i64 = 1_769_990_400_000_000_000;
+
+    #[test]
+    fn test_gap_ilp_conf_targets_http_with_bounded_no_retry_shape() {
+        // Review HIGH (2026-07-14): the bare `http::addr=host:port;` conf let
+        // questdb-rs's internal ~10s retry ladder block the caller. The conf
+        // must pin the house shape (shadow-writer 2026-07-06 precedent):
+        // retry_timeout=0 (our caller owns retry) + request_timeout=5000.
+        let cfg = QuestDbConfig {
+            host: "tv-questdb".to_string(),
+            http_port: 9000,
+            pg_port: 8812,
+            ilp_port: 9009,
+        };
+        assert_eq!(
+            gap_ilp_http_conf(&cfg),
+            "http::addr=tv-questdb:9000;protocol_version=1;retry_timeout=0;request_timeout=5000;"
+        );
+    }
 
     #[test]
     fn test_feed_gap_audit_ddl_contains_expected_columns_and_dedup() {
