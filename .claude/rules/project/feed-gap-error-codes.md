@@ -113,7 +113,15 @@ delays the reconnect/recovery machinery. Gap measurement is the feed-level
 last-tick age (whole-universe liveness, the ILLIQUID-vs-DEAD rule of
 `feed-stall-watchdog-error-codes.md` §0) — a single quiet instrument is not
 a gap. The episode check rides the bridge's existing periodic poll, not the
-per-tick hot path.
+per-tick hot path. **Restart-duplicate bound (review MEDIUM, 2026-07-14):**
+the tracker is process/bridge-incarnation-local, so a bridge/process
+respawn mid-gap opens a SECOND episode with a recomputed start — bounded:
+one extra OPEN row + one extra High page per restart — and the FIRST OPEN
+closes as `dangling_closed` at the 15:45 sweep even though the recovery was
+observed by the successor; the restart itself stays visible via the
+process-death / scoreboard machinery, so the double-count is auditable.
+Seeding the tracker from the day's last OPEN row at bridge start is a
+flagged follow-up.
 
 **Delivery boundary (operator-approved default, 2026-07-14):**
 FEED-GAP-01 is **Telegram-episode-only** — deliberately NO CloudWatch log
