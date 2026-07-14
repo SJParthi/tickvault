@@ -274,7 +274,22 @@ Groww historical-candles"; `tv_groww_spot1m_vix_not_served_total`, plus
 Per-SID independence: the 3-minute escalation edge keys on the 3 CORE
 indices only — a VIX-only failure never pages, core-all-failed still does.
 
-**2026-07-13 — the GROWW CONTRACT leg emits this SAME code with
+**2026-07-14 — Groww 2xx GA-FAILURE misclassification fixed (empty →
+error) + `ga_code` forensics (coordinator-authorized 2026-07-14 build,
+G1):** a 2xx whose body is the Groww FAILURE envelope
+(`{"status":"FAILURE","error":{code,message}}` — GA000/GA001/GA003–GA007,
+`docs/groww-ref/16-orders-margins-portfolio.md` §5; the envelope wins over
+the HTTP status) previously rode the Groww SPOT leg's benign
+`outcome="empty"` class. It now classifies `outcome="error"` (feeds the
+minute_failed coalesced log, the escalation edge, and a named
+`rest_fetch_audit` row with `error_class="ga_failure"`), and the coded
+`SPOT1M-01` verdict lines carry a `ga_code` field (`"none"` when absent) +
+a redacted bounded message sample. The CHAIN leg (already error-classified)
+gains the same `ga_code=` forensics in its parse-failure msg. FORENSICS
+ONLY — policy never branches on the GA code (no short-circuit even on
+GA005; auth short-circuit stays HTTP-401/403-only). The CONTRACT leg still
+takes the shared parser's empty return on a FAILURE envelope — flagged
+follow-up.
 `leg = "contract_1m"` (no new variant):** the per-minute per-contract 1m
 candle leg (`crates/app/src/groww_contract_1m_boot.rs`, operator grant
 2026-07-13 — `groww-second-feed-scope-2026-06-19.md` §38 /

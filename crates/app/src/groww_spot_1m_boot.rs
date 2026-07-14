@@ -561,6 +561,49 @@ fn parse_groww_1m_candles(body: &str) -> (Vec<MinuteCandle>, GrowwParseStats) {
     (candles, stats)
 }
 
+/// A 2xx body carrying Groww's FAILURE envelope
+/// (`{"status":"FAILURE","error":{code,message,metadata}}` — wire codes
+/// GA000/GA001/GA003–GA007 per `docs/groww-ref/16-orders-margins-portfolio.md`
+/// §5; the envelope wins over the HTTP status). Detected by the G1 fix
+/// (2026-07-14) so the ladder classifies it as an ERROR rung, never a
+/// benign target-absent. `ga_code` is FORENSICS-ONLY — policy never
+/// branches on its value.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct GrowwGaFailure {
+    /// The GA wire code, bounded ≤16 chars; `"none"` when absent.
+    pub(crate) ga_code: String,
+    /// The raw `error.message` — callers MUST redact via
+    /// `capture_rest_error_body` before logging.
+    pub(crate) message: String,
+}
+
+/// Sniff the Groww FAILURE envelope from a 2xx body. `None` for SUCCESS /
+/// bare-candles / non-JSON bodies (those keep their existing paths). Pure,
+/// panic-free on hostile input (serde_json value walking, bounded fields).
+pub(crate) fn parse_groww_ga_failure(body: &str) -> Option<GrowwGaFailure> {
+    /// GA wire codes are 5 chars (`GA005`); 16 bounds a hostile field.
+    const GA_CODE_MAX_CHARS: usize = 16;
+    let v: serde_json::Value = serde_json::from_str(body).ok()?;
+    if v.get("status").and_then(|s| s.as_str()) != Some("FAILURE") {
+        return None;
+    }
+    let err = v.get("error");
+    let ga_code = err
+        .and_then(|e| e.get("code"))
+        .and_then(|c| c.as_str())
+        .filter(|c| !c.is_empty())
+        .map_or_else(
+            || "none".to_string(),
+            |c| c.chars().take(GA_CODE_MAX_CHARS).collect(),
+        );
+    let message = err
+        .and_then(|e| e.get("message"))
+        .and_then(|m| m.as_str())
+        .unwrap_or_default()
+        .to_string();
+    Some(GrowwGaFailure { ga_code, message })
+}
+
 /// The SHARED candle-tuple parser (PR-4 refactor — one wire parser, two
 /// consumers): identical envelope/row/timestamp semantics to the original
 /// spot parser, PLUS the `oi` element (tuple[6], tolerant: absent/null →
@@ -572,6 +615,11 @@ pub(crate) fn parse_groww_1m_candle_rows(body: &str) -> (Vec<GrowwCandleRow>, Gr
         return (Vec::new(), stats);
     };
     if v.get("status").and_then(|s| s.as_str()) == Some("FAILURE") {
+        // Typed reject, zero malformed. NOTE (G1, 2026-07-14): the spot
+        // ladder sniffs this envelope BEFORE calling this parser
+        // (`parse_groww_ga_failure`) and classifies the rung as an ERROR —
+        // this empty return is no longer a spot-leg classification path.
+        // The contract leg still reaches it (follow-up flagged).
         return (Vec::new(), stats);
     }
     let candles = v
@@ -1058,9 +1106,13 @@ enum SymbolFetchOutcome {
     Empty {
         backfill_candle: Option<MinuteCandle>,
     },
-    /// The last attempt (transport / non-2xx) failure, bounded + redacted.
+    /// The last attempt's failure (transport / non-2xx / a 2xx carrying
+    /// the Groww FAILURE envelope — G1, 2026-07-14), bounded + redacted.
+    /// `ga_code` carries the FINAL failure's GA wire code when that
+    /// failure was a 2xx FAILURE envelope — forensics only, never policy.
     Failed {
         reason: String,
+        ga_code: Option<String>,
         backfill_candle: Option<MinuteCandle>,
     },
 }
@@ -1194,6 +1246,10 @@ async fn fetch_minute_with_ladder(
 ) -> (SymbolFetchOutcome, LadderForensics) {
     let deltas = groww_retry_sleep_deltas_ms();
     let mut last_error: Option<String> = None;
+    // G1 (2026-07-14): the FINAL failure's GA wire code, when that failure
+    // was a 2xx FAILURE envelope. Mirrors `last_error` semantics — a later
+    // clean 2xx or HTTP-level failure clears it. Forensics only.
+    let mut last_ga_code: Option<String> = None;
     let mut backfill_found: Option<MinuteCandle> = None;
     let mut forensics = LadderForensics {
         error_class: "none",
@@ -1212,6 +1268,25 @@ async fn fetch_minute_with_ladder(
         forensics.final_latency_ms = latency_ms;
         match result {
             Ok(body_text) => {
+                // G1 (2026-07-14): a 2xx whose body is the Groww FAILURE
+                // envelope is an ERROR rung, never a benign target-absent —
+                // the envelope wins over the HTTP status
+                // (docs/groww-ref/16 §5). The bounded next rung re-polls
+                // exactly like any non-auth HTTP failure; the GA code is
+                // forensics-only (policy never branches on it — no
+                // short-circuit even on GA005; auth short-circuit stays
+                // HTTP-401/403-only).
+                if let Some(ga) = parse_groww_ga_failure(&body_text) {
+                    forensics.final_http_status = 200;
+                    forensics.error_class = "ga_failure";
+                    let captured = capture_rest_error_body(&ga.message);
+                    last_error = Some(format!(
+                        "2xx FAILURE envelope ga_code={} msg={captured}",
+                        ga.ga_code
+                    ));
+                    last_ga_code = Some(ga.ga_code);
+                    continue;
+                }
                 forensics.final_http_status = 200;
                 forensics.error_class = "none";
                 let (candles, stats) = parse_groww_1m_candles(&body_text);
@@ -1252,6 +1327,7 @@ async fn fetch_minute_with_ladder(
                 // whole ladder ends target-absent.
                 forensics.error_class = "target_absent";
                 last_error = None;
+                last_ga_code = None;
             }
             Err(failure) => {
                 if failure.rate_limited {
@@ -1261,6 +1337,7 @@ async fn fetch_minute_with_ladder(
                 forensics.final_http_status = failure.status;
                 forensics.error_class = error_class_for_status(failure.status);
                 last_error = Some(failure.msg);
+                last_ga_code = None;
                 if failure.auth_rejected {
                     // Item 12: an auth-class reject dooms every further
                     // rung with the same token — abort the ladder NOW; the
@@ -1274,6 +1351,7 @@ async fn fetch_minute_with_ladder(
     let outcome = match last_error {
         Some(reason) => SymbolFetchOutcome::Failed {
             reason,
+            ga_code: last_ga_code,
             backfill_candle: backfill_found,
         },
         None => SymbolFetchOutcome::Empty {
@@ -1326,6 +1404,7 @@ async fn fetch_minute_bounded(
                     reason: format!(
                         "ladder budget exceeded ({GROWW_SPOT_1M_SYMBOL_BUDGET_SECS}s) — peer stalling"
                     ),
+                    ga_code: None,
                     backfill_candle: None,
                 },
                 LadderForensics {
@@ -1812,6 +1891,9 @@ async fn fire_one_minute(
     let mut tally = MinuteEdgeTally::default();
     let mut implausible_count: usize = 0;
     let mut sample_failure: Option<String> = None;
+    // G1 (2026-07-14): the GA wire code paired with `sample_failure` when
+    // that failure was a 2xx FAILURE envelope — forensics only.
+    let mut sample_ga_code: Option<String> = None;
     // Minutes appended this fire, committed to the tracker ONLY after the
     // flush confirms (a failed flush discards the buffer — never a false
     // watermark advance).
@@ -1901,13 +1983,17 @@ async fn fire_one_minute(
                 }
                 SymbolFetchOutcome::Failed {
                     reason,
+                    ga_code,
                     backfill_candle,
                 } => {
                     error_count = error_count.saturating_add(1);
                     metrics::counter!("tv_groww_spot1m_fetch_total", "outcome" => "error")
                         .increment(1);
                     if sample_failure.is_none() {
+                        // The ga_code sample stays PAIRED with the failure
+                        // sample it describes (G1, 2026-07-14).
                         sample_failure = Some(format!("{}: {reason}", target.groww_symbol));
+                        sample_ga_code = ga_code;
                     }
                     (None, backfill_candle)
                 }
@@ -2097,6 +2183,7 @@ async fn fire_one_minute(
         persist_failed,
         tally,
         sample_failure.as_deref(),
+        sample_ga_code.as_deref(),
     );
 }
 
@@ -2116,9 +2203,11 @@ fn record_minute_verdict(
     persist_failed: bool,
     tally: MinuteEdgeTally,
     sample_failure: Option<&str>,
+    sample_ga_code: Option<&str>,
 ) {
     let fully_failed = tally.fully_failed();
     let action = edge.record_minute(fully_failed);
+    let ga_code = sample_ga_code.unwrap_or("none");
     match action {
         EdgeAction::Page { consecutive } => {
             error!(
@@ -2127,6 +2216,7 @@ fn record_minute_verdict(
                 feed = SPOT_1M_REST_FEED_GROWW,
                 consecutive,
                 minute = minute_label,
+                ga_code,
                 sample = sample_failure.unwrap_or("none captured"),
                 "SPOT1M-01: Groww per-minute spot fetch fully failed for \
                  consecutive minutes — paging (edge-triggered)"
@@ -2165,6 +2255,7 @@ fn record_minute_verdict(
                     errors = error_count,
                     empty = empty_count,
                     persist_failed,
+                    ga_code,
                     sample = sample_failure.unwrap_or("none captured"),
                     "SPOT1M-01: Groww per-minute spot fetch degraded for this minute"
                 );
@@ -2981,6 +3072,48 @@ mod tests {
         assert_eq!(candles.len(), 1);
     }
 
+    /// G1 (2026-07-14): the FAILURE-envelope sniffer extracts the GA wire
+    /// code + message; absent/empty code → `"none"`; hostile oversized code
+    /// bounded; SUCCESS/bare/non-JSON bodies never sniff (their existing
+    /// empty/ok/malformed paths stay untouched).
+    #[test]
+    fn test_parse_groww_ga_failure_envelope_extracts_code_and_message() {
+        let ga = parse_groww_ga_failure(
+            r#"{"status":"FAILURE","error":{"code":"GA005","message":"not authorised","metadata":{}}}"#,
+        )
+        .expect("FAILURE envelope must sniff");
+        assert_eq!(ga.ga_code, "GA005");
+        assert_eq!(ga.message, "not authorised");
+        // Absent error object / code → "none" (tolerated), empty message.
+        let ga = parse_groww_ga_failure(r#"{"status":"FAILURE"}"#)
+            .expect("codeless FAILURE must still sniff");
+        assert_eq!(ga.ga_code, "none");
+        assert!(ga.message.is_empty());
+        // Empty-string code → "none".
+        let ga = parse_groww_ga_failure(r#"{"status":"FAILURE","error":{"code":""}}"#)
+            .expect("empty-code FAILURE must still sniff");
+        assert_eq!(ga.ga_code, "none");
+        // Hostile oversized code → bounded to 16 chars.
+        let hostile = format!(
+            r#"{{"status":"FAILURE","error":{{"code":"{}"}}}}"#,
+            "X".repeat(500)
+        );
+        let ga = parse_groww_ga_failure(&hostile).expect("hostile FAILURE must still sniff");
+        assert_eq!(ga.ga_code.chars().count(), 16, "ga_code must be bounded");
+        // SUCCESS / bare-candles / non-JSON bodies never sniff.
+        for body in [
+            r#"{"status":"SUCCESS","payload":{"candles":[]}}"#,
+            r#"{"candles":[]}"#,
+            "not json",
+            "{}",
+        ] {
+            assert!(
+                parse_groww_ga_failure(body).is_none(),
+                "body {body:?} must not sniff as a FAILURE envelope"
+            );
+        }
+    }
+
     #[test]
     fn test_parse_groww_1m_candles_malformed_rows_skipped_and_counted() {
         let good_ts: i64 = 1_783_914_300;
@@ -3158,9 +3291,23 @@ mod tests {
             audit_outcome_for(
                 &SymbolFetchOutcome::Failed {
                     reason: "x".into(),
+                    ga_code: None,
                     backfill_candle: None
                 },
                 &mk_forensics("http_5xx")
+            ),
+            RestFetchOutcome::Error
+        );
+        // G1 (2026-07-14): a 2xx FAILURE-envelope failure is an ERROR
+        // forensics outcome — never Empty, never RateLimited.
+        assert_eq!(
+            audit_outcome_for(
+                &SymbolFetchOutcome::Failed {
+                    reason: "2xx FAILURE envelope ga_code=GA005 msg=denied".into(),
+                    ga_code: Some("GA005".into()),
+                    backfill_candle: None
+                },
+                &mk_forensics("ga_failure")
             ),
             RestFetchOutcome::Error
         );
@@ -3168,6 +3315,7 @@ mod tests {
             audit_outcome_for(
                 &SymbolFetchOutcome::Failed {
                     reason: "429".into(),
+                    ga_code: None,
                     backfill_candle: None
                 },
                 &mk_forensics("rate_limited")
@@ -3462,6 +3610,51 @@ mod tests {
         );
     }
 
+    /// G1 (2026-07-14): a 2xx whose body is the Groww FAILURE envelope
+    /// classifies as an ERROR — never a benign `empty` — with the GA code
+    /// extracted as forensics, the FULL bounded ladder run (policy never
+    /// branches on the GA code — no auth short-circuit even on GA005), and
+    /// the forensics outcome mapped to `Error` (not Empty/RateLimited).
+    #[tokio::test]
+    async fn test_ladder_classifies_2xx_ga_failure_as_error_never_empty() {
+        const MOCK_GA_FAILURE: &str = "HTTP/1.1 200 OK\r\nContent-Length: 72\r\n\r\n{\"status\":\"FAILURE\",\"error\":{\"code\":\"GA005\",\"message\":\"not authorised\"}}";
+        let url = spawn_mock_candles_server(MOCK_GA_FAILURE).await;
+        let client = mock_client();
+        let date = NaiveDate::from_ymd_opt(2026, 7, 14).expect("valid date");
+        let query = groww_candles_query("NSE-NIFTY", "NSE", "CASH", date);
+        let token = SecretString::from("test-token");
+        let (outcome, forensics) =
+            fetch_minute_with_ladder(&client, &url, &query, &token, 900, None, 0).await;
+        assert_eq!(
+            forensics.attempts,
+            GROWW_SPOT_1M_RETRY_OFFSETS_MS.len() as u32 + 1,
+            "the full bounded ladder must run — no GA-code policy branch"
+        );
+        assert!(
+            !forensics.auth_rejected,
+            "GA005 must NOT auth-short-circuit"
+        );
+        assert_eq!(forensics.final_http_status, 200);
+        assert_eq!(forensics.error_class, "ga_failure");
+        match &outcome {
+            SymbolFetchOutcome::Failed {
+                reason, ga_code, ..
+            } => {
+                assert_eq!(ga_code.as_deref(), Some("GA005"));
+                assert!(
+                    reason.contains("ga_code=GA005"),
+                    "reason must carry the GA code, got {reason:?}"
+                );
+            }
+            other => panic!("2xx FAILURE envelope must classify Failed, got {other:?}"),
+        }
+        assert_eq!(
+            audit_outcome_for(&outcome, &forensics),
+            RestFetchOutcome::Error,
+            "forensics outcome must be error — never empty"
+        );
+    }
+
     // ---- CI coverage hardening (PR #1507 Coverage & Perf: app 63.07% <
     // 63.3% floor — REAL tests over the runner arms; the floor is never
     // touched) --------------------------------------------------------------
@@ -3618,6 +3811,7 @@ mod tests {
             false,
             tally_core_ok(3),
             None,
+            None,
         );
         record_minute_verdict(
             &params,
@@ -3629,6 +3823,7 @@ mod tests {
             false,
             tally_core_ok(2),
             Some("one miss"),
+            None,
         );
         for _ in 0..3 {
             record_minute_verdict(
@@ -3641,6 +3836,7 @@ mod tests {
                 false,
                 tally_core_ok(0),
                 Some("down"),
+                Some("GA003"),
             );
         }
         record_minute_verdict(
@@ -3652,6 +3848,7 @@ mod tests {
             0,
             false,
             tally_core_ok(3),
+            None,
             None,
         );
     }
