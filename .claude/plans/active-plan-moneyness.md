@@ -1,6 +1,6 @@
 # Implementation Plan: Per-Row Moneyness (ITM/ATM/OTM/UNKNOWN) — RAM-first decision source + write-time DB audit column
 
-**Status:** APPROVED
+**Status:** VERIFIED
 **Date:** 2026-07-14
 **Approved by:** Parthiban (operator directive 2026-07-14, relayed verbatim via the coordinator session)
 
@@ -29,25 +29,25 @@ candle-minute-exact; old rows stay NULL forever (never backfilled).
 
 ## Plan Items
 
-- [ ] Item 1 — Moneyness enum + grid-rounded ATM + classifier + step table (crates/common)
+- [x] Item 1 — Moneyness enum + grid-rounded ATM + classifier + step table (crates/common)
   - Files: crates/common/src/moneyness.rs, crates/common/src/lib.rs
   - Tests: test_moneyness_as_str_and_parse_round_trip_for_every_variant, test_moneyness_labels_unique, test_classify_moneyness_ce_pe_direction_table, test_classify_moneyness_zero_spot_is_unknown, test_classify_moneyness_negative_spot_and_strike_is_unknown, test_classify_moneyness_nan_inf_extreme_price_overflow_guard, test_atm_strike_paise_midpoint_tie_half_up_boundary, test_atm_strike_paise_zero_negative_odd_step_is_none, test_price_to_paise_guarded_boundary, proptest_classify_moneyness_invariants
-- [ ] Item 2 — RAM chain-moneyness snapshot registry (crates/core/src/pipeline/chain_snapshot.rs)
+- [x] Item 2 — RAM chain-moneyness snapshot registry (crates/core/src/pipeline/chain_snapshot.rs)
   - Files: crates/core/src/pipeline/chain_snapshot.rs, crates/core/src/pipeline/mod.rs
   - Tests: test_publish_then_load_roundtrip, test_slot_isolation_across_feeds_and_underlyings, test_empty_sentinel_before_first_publish, test_age_secs_boundaries
-- [ ] Item 3 — option_chain_1m: moneyness SYMBOL column (manifest 23→24, .symbol stamp next to leg)
+- [x] Item 3 — option_chain_1m: moneyness SYMBOL column (manifest 23→24, .symbol stamp next to leg)
   - Files: crates/storage/src/option_chain_1m_persistence.rs
   - Tests: test_chain1m_append_row_stamps_moneyness_symbol (+ test_option_chain_1m_create_ddl_contains_expected_columns auto-covers via the manifest)
-- [ ] Item 4 — option_contract_1m_rest: moneyness SYMBOL + underlying_spot DOUBLE (CREATE + inline ALTER array + DDL test)
+- [x] Item 4 — option_contract_1m_rest: moneyness SYMBOL + underlying_spot DOUBLE (CREATE + inline ALTER array + DDL test)
   - Files: crates/storage/src/option_contract_1m_rest_persistence.rs
   - Tests: test_contract1m_append_row_stamps_moneyness_and_underlying_spot, test_option_contract_1m_rest_create_ddl_contains_expected_columns extended
-- [ ] Item 5 — Boot-leg wiring: Dhan chain + Groww chain (classify per row, publish snapshot, counters, edge-latched warns) + Groww contract (classify from anchor, stamp underlying_spot, DB-only)
+- [x] Item 5 — Boot-leg wiring: Dhan chain + Groww chain (classify per row, publish snapshot, counters, edge-latched warns) + Groww contract (classify from anchor, stamp underlying_spot, DB-only)
   - Files: crates/app/src/option_chain_1m_boot.rs, crates/app/src/groww_option_chain_1m_boot.rs, crates/app/src/groww_contract_1m_boot.rs
   - Tests: per-leg unit tests on the wiring helpers; crates/core/tests/chain_snapshot_ram_first_guard.rs wiring assertions
-- [ ] Item 6 — Proof artifacts: Criterion bench + budget, DHAT zero-alloc test, RAM-first ratchet
+- [x] Item 6 — Proof artifacts: Criterion bench + budget, DHAT zero-alloc test, RAM-first ratchet
   - Files: crates/core/benches/moneyness.rs, crates/core/Cargo.toml, quality/benchmark-budgets.toml, crates/core/tests/dhat_moneyness.rs, crates/core/tests/chain_snapshot_ram_first_guard.rs
   - Tests: dhat_moneyness_classify_and_snapshot_read_zero_alloc, test_snapshot_module_has_no_db_or_network_tokens, test_scanner_detects_planted_token, test_banned_pattern_scanner_still_covers_strategy_selects, test_boot_legs_call_classify_and_chain_legs_publish_snapshot
-- [ ] Item 7 — Docs: rule-file §2f note + plan archives (spot-1m-diagnostics 2026-07-14, questdb-partition-s3-archive 2026-07-13)
+- [x] Item 7 — Docs: rule-file §2f note + plan archives (spot-1m-diagnostics 2026-07-14, questdb-partition-s3-archive 2026-07-13)
   - Files: .claude/rules/project/rest-1m-pipeline-error-codes.md, .claude/plans/archive/2026-07-14-spot-1m-diagnostics.md, .claude/plans/archive/2026-07-13-questdb-partition-s3-archive.md
   - Tests: n/a (docs; the rule-file trigger list gains moneyness/chain_snapshot tokens)
 
@@ -106,6 +106,9 @@ candle-minute-exact; old rows stay NULL forever (never backfilled).
   anchor-store gate).
 - Spot NaN / ±inf / negative / sub-paise (0.004) / implausible (>1e7 rupees)
   ⇒ UNKNOWN — the guard makes the saturating f64→i64 cast unreachable.
+- Spot below half a step (grid-rounds to 0 — the 2026-07-14 proptest
+  counterexample: spot ₹1.00 on the ₹50 grid) ⇒ atm_strike_paise None ⇒
+  UNKNOWN — fail-closed, never a bogus 0-paise ATM.
 - Spot exactly midway between strikes ⇒ half-up: the HIGHER strike is ATM,
   deterministically (proof comment in the module).
 - Spot exactly ON a grid strike ⇒ that strike is ATM for both CE and PE.
