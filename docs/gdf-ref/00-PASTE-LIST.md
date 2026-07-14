@@ -1,5 +1,15 @@
 # GDF 00 — OPERATOR BROWSER-PASTE LIST (the definitive capture queue)
 
+> **⚠ 2026-07-14 — DEMOTED TO FALLBACK ROUTE.** The runner route succeeded: the GitHub
+> Actions workflow `docs-fetch.yml` (runs 29316509037 + 29317477759) fetched **215 pages,
+> 213 HTTP 200 + 2 genuine 404s, ZERO 403s** — the WAF blocks only sandbox/Anthropic
+> egress, NOT datacenter runner IPs. Every Tier-1/Tier-2 page below (and nearly everything
+> else) is now `fetched-verbatim (RUNNER-DOC 2026-07-14)` — see
+> [`00-COVERAGE-MANIFEST.md`](./00-COVERAGE-MANIFEST.md) for the per-URL truth. **This
+> paste list is retained ONLY as a FALLBACK capture route** (for future refreshes if the
+> runner route ever breaks); the per-row statuses below are the 2026-07-13 historical
+> snapshot and are deliberately NOT updated.
+
 > **Dated:** 2026-07-13 · **Purpose:** every URL below is WAF-403-blocked to ALL automated
 > fetchers — re-verified 2026-07-13, **42/42 requests returned HTTP 403** across BOTH hosts
 > (`globaldatafeeds.in` AND `docs.globaldatafeeds.in`) via WebFetch, which DOES reach the site
