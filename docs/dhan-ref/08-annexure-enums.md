@@ -6,6 +6,9 @@
 > **⚠ Read the "2026-07-03 Upstream Update" section below FIRST** — three enum tables in this
 > file drifted from the live annexure after the 2026-06-02 upstream snapshot. Original tables
 > are retained per repo convention (dated supersede sections, never silent rewrites).
+> **⚠ Then read the "2026-07-14 Upstream Update"** — a runner crawl proved the 2026-07-03
+> section compared the NEW-PORTAL export, not the classic annexure; Dhan runs TWO official
+> doc surfaces that DISAGREE with each other (the two-surface story below).
 
 ---
 
@@ -44,6 +47,92 @@ With the currency segments gone, the live annexure lists 8 instrument types (the
 minus `FUTCUR` and `OPTCUR`). Our enum variants are KEPT for CSV back-compat — in crates they
 appear only in the F&O extractor's EXCLUSION filters and `types.rs`; if the master CSV stops
 carrying those rows the exclusion filter simply matches nothing. No code change.
+
+---
+
+## 2026-07-14 Upstream Update (runner-crawled live pages) — TWO official doc surfaces DISAGREE
+
+**Evidence tier: Verified-live.** A GitHub-Actions runner fetched the raw server-rendered HTML
+of `https://dhanhq.co/docs/v2/annexure/` (runs 1–3, 2026-07-13T19:36Z → 2026-07-14T07:58:09Z,
+sha256 `1a9330a1` content-identical across runs) AND the NEW portal's markdown export
+`https://docs.dhanhq.co/markdown/api/v2/guides/annexure.md` (2026-07-14T08:01:01Z, sha
+`40a17f84`). Diff was comment-aware (content inside HTML comments counted as non-rendered).
+This section SUPERSEDES the FRAMING of the 2026-07-03 §(a)/(b)/(c) above — the originals stay
+per house style. Full manifest: `00-COVERAGE-MANIFEST.md`.
+
+### (a) The two-surface story (supersedes "the live annexure removed / renumbered / lists 8")
+
+Dhan operates TWO official documentation surfaces that DISAGREE with each other on every
+contested enum, and NEITHER has changed since first observed:
+
+| Capture | Surface | Currency 3/7 | ExpiryCode | Instr. types | Unsub full depth |
+|---|---|---|---|---|---|
+| 2026-06-02 snapshot (`dhanhq-v2-upstream-2026-06-02/08_annexure.md`) | classic `dhanhq.co/docs/v2/annexure/` | PRESENT | 0/1/2 | 10 | **24** |
+| 2026-06-30 LLM export (= the 2026-07-03 snapshot `20-annexure.md`) | portal `docs.dhanhq.co` | ABSENT | 1/2/3 | 8 | **25** |
+| 2026-07-13/14 runner crawl (runs 1–3, sha `1a9330a1`, stable) | classic | PRESENT | 0/1/2 | 10 | **24** |
+| 2026-07-14T08:01Z run-3 markdown export (sha `40a17f84`) | portal `/markdown/` | ABSENT | 1/2/3 | 8 | **25** |
+
+- The **classic annexure NEVER changed**: `NSE_CURRENCY | 3` and `BSE_CURRENCY | 7` are
+  RENDERED (not comments); ExpiryCode reads `0 | Current Expiry/Near Expiry`, `1 | Next`,
+  `2 | Far`; all 10 instrument types incl. FUTCUR/OPTCUR present — verbatim-stable
+  2026-06-02 → 2026-07-14.
+- The **portal export never changed either** since first observed (2026-06-30 → 2026-07-14):
+  numeric table `IDX_I=0, NSE_EQ=1, NSE_FNO=2, BSE_EQ=4, MCX_COMM=5, BSE_FNO=8` (no currency
+  rows), ExpiryCode `1=Near, 2=Next, 3=Far`, 8 instrument types.
+- The 2026-07-03 "Upstream Update" above **read the PORTAL export** (its own source header:
+  docs.dhanhq.co "Export .md for LLMs", generated 2026-06-30) and **misattributed
+  cross-SURFACE divergence as cross-TIME drift** ("Dhan dropped…", "upstream renumbered…").
+  The reading was accurate FOR ITS SURFACE but wrong about "the live annexure" having changed.
+- Which surface is authoritative per-item CANNOT be adjudicated from docs alone: the portal's
+  values align with real-world facts (NSE currency-derivative discontinuation; the SDK's
+  tolerated `expiryCode=3`; the expired-options sample `1`), but the same export family
+  carries known LIVE corruption (the transposed rate-limit dailies — see
+  `01-introduction-and-rate-limits.md` "2026-07-14 Upstream Update"). Wire truth for every
+  contested enum stays **UNVERIFIED-LIVE**.
+- **Repo posture that survives ALL readings (UNCHANGED):** keep the defensive 3/7 decode
+  arms; keep `ExpiryCode` 0/1/2 with §(b)'s live-probe-BOTH-conventions mandate (note: the
+  classic historical-data page's sample sends `"expiryCode": 0`; the expired-options page —
+  a DIFFERENT API, `/charts/rollingoption` — samples `1`; do not conflate the two endpoints);
+  keep the 10 instrument-type variants; keep depth forbidden. Nothing here is
+  runtime-load-bearing today.
+
+### (b) Unsubscribe Full Market Depth — 24-vs-25 is a CROSS-SURFACE split (supersedes §2's "25, per this annexure")
+
+Classic annexure (BOTH the 2026-06-02 snapshot at `08_annexure.md:84` AND the 2026-07-14 live
+page, rendered): `23 | Subscribe - Full Market Depth` then `24 | Unsubscribe - Full Market
+Depth`. Portal export (2026-06-30 snapshot AND 2026-07-14 live): `25`. The §2 SDK note's
+"the correct code per this annexure is 25" was ALREADY contradicted by the repo's own
+2026-06-02 classic snapshot — the 25-vs-annexure conflict predates this crawl. Evidence stack:
+**24** = classic surface (stable) + the SDK's generic `subscribe_code + 1` behavior (per the
+§2 SDK note itself); **25** = portal export + a `crates/common/src/constants.rs:395` comment
+citing `fulldepth.py` (not vendored — unverifiable from this repo). Weight of evidence has
+SHIFTED toward 24; both readings are recorded and NEITHER is asserted as wire truth —
+**UNVERIFIED-LIVE both ways, zero runtime impact** (depth WebSockets are FORBIDDEN FOREVER
+per `websocket-connection-scope-lock.md`; any currently-banned future depth work MUST
+live-probe before trusting either value). Code follow-up (comment-only, separate PR): the
+`constants.rs:395` "There is NO code 24" claim is now cross-surface-contested.
+
+### (c) Smaller classic-surface deltas (2026-07-14, Verified-live)
+
+- **Order Status (§5):** the classic annexure table lists exactly **8** statuses (TRANSIT,
+  PENDING, CLOSED, TRIGGERED, REJECTED, CANCELLED, PART_TRADED, TRADED) — no EXPIRED row; the
+  §5 EXPIRED/CONFIRM "not in original annexure table" annotations remain correct.
+- **Product Type (§4):** the classic annexure table now INCLUDES `CO | Cover Order` and
+  `BO | Bracket Order`, plus a new table note: "CO & BO product types will be valid only for
+  Intraday." — §4's "(appears in Order Update WS …)" framing for CO/BO is stale (they are
+  annexure-listed now). MTF remains ABSENT from the annexure table (§4's MTF annotation
+  stands).
+- **DH-911 (§10):** NOT present on either live surface (the classic Trading API Error table
+  ends at DH-910; grep across the whole 191-page crawl incl. comments: 0 hits, releases page
+  included). The §10 DH-911 row is comms/inference-sourced, NOT annexure-backed — and no
+  `ErrorCode` variant exists in `crates/common/src/error_code.rs` either (only a "Reserved"
+  rule-file stub in `wave-4-error-codes.md`). Related Secondary datapoint: a live static-IP
+  reject has been observed surfacing as **DH-905** with errorMessage "Invalid IP".
+- **Rate Limits (§9) placement:** the classic ANNEXURE page carries no rate-limit section —
+  the table lives on the introduction page (verified identical there). §9 is
+  content-correct, placement-annotated; do not cite "the annexure" for rate limits.
+- **§12 placement note:** the live annexure has no timestamp-format section; §12 is
+  repo-derived cross-verification (Ticket/SDK-based) — correct, but not annexure content.
 
 ---
 
