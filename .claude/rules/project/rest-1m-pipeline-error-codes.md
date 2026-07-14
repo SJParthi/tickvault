@@ -579,6 +579,16 @@ to `true` in base.toml — dated record in
 OFF (fail-safe) and `probe_and_report` stays `true` (inert while
 enabled; the rollback canary).
 
+**2026-07-14 — the DHAN chain leg emits this SAME code with the new
+stages** `underlying_not_served` (error, edge — the #1537 Groww mirror,
+Dhan emits field-less), `ladder_shrunk` (warn, edge-latched heuristic),
+`retry_skipped_ceiling` (warn, per refused retry — bounded ≤3/minute),
+`trading_day_flip_exit` (error, one-shot; + the SPOT1M-01 spot twin),
+plus the bounded retry counters
+(`tv_chain1m_retry_total{outcome="recovered"|"still_failed"|"skipped_ceiling"}`)
+— full contract + triage in
+`cross-source-chain-coverage-2026-07-14.md`.
+
 ## §2d. CHAIN-03 — option_chain_1m persist failed
 
 **Severity:** High. **Auto-triage safe:** Yes (best-effort persist; the

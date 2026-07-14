@@ -39,9 +39,22 @@ self-heals SILENTLY.**
 | # | Allowed Dhan alert | Variant(s) / route | Fires when |
 |---|---|---|---|
 | 1 | Spot-1m pull failing / recovered | `Spot1mFetchDegraded` (High) / `Spot1mFetchRecovered` (Info) / `Spot1mSidNotServed` (High) / `Spot1mSidServedRecovered` (Info) | the per-minute spot leg's persist-gated 3-minute escalation edge (`rest-1m-pipeline-error-codes.md`) |
-| 2 | Option-chain pull failing / recovered | `ChainFetchDegraded` (High) / `ChainFetchRecovered` (Info) / `ChainEntitlementAbsent`/`Confirmed` / `ChainExpirylistFailed` (High) | the chain leg's own edges (`rest-1m-pipeline-error-codes.md`) |
+| 2 | Option-chain pull failing / recovered | `ChainFetchDegraded` (High) / `ChainFetchRecovered` (Info) / `ChainEntitlementAbsent`/`Confirmed` / `ChainExpirylistFailed` (High) / **`Chain1mUnderlyingNotServed` (High) / `Chain1mUnderlyingServedRecovered` (Info) — added 2026-07-14 per the §2.1 dated directive (the Dhan mirror of the Groww #1537 per-underlying detector)** | the chain leg's own edges (`rest-1m-pipeline-error-codes.md`) |
 | 3 | Token could not be obtained | `AuthenticationFailed` / `TokenRenewalFailed` (both Critical; reworded 2026-07-14 to plain English naming DHAN + the consequence: "the Dhan spot-1m and option-chain pulls will stop until this is fixed") | mint/renewal is TERMINALLY dead — the mid-session watchdog pages **ONCE PER FAILING EPISODE** (H1a latch, 2026-07-14 fix round — never the pre-fix ~30-min repeat) on EITHER (a) a forced re-mint failing terminally OR (b) the H1b attempt cap: `REMINT_MAX_ATTEMPTS_PER_EPISODE` (= 3) re-mints all "succeeded" yet the profile stayed REAL-invalid (dead-dataPlan/segment class — the body names the N re-logins + that the spot-1m/chain pulls are blocked). The latch resets on a clean profile cycle. (Its terminal arm emits `AuthenticationFailed` directly, since `force_renewal` -> `acquire_token` pages nothing on a non-RESILIENCE-03 permanent failure; the Telegram body is redacted + truncated via the house sanitizer — M2.) |
 | 4 | Token expires soon (4h early warning) | CloudWatch alarm `tv-<env>-token-remaining-low` on `tv_token_remaining_seconds` → SNS → Telegram Lambda | the renewal loop stopped renewing (the watchdog-of-the-renewal-loop). The Lambda's wording is ANOTHER session's scope. |
+
+**§2.1 — 2026-07-14 (same day, second directive): the family-(2) row gains the per-underlying
+not-served pair.** Coordinator-relayed operator directive (verbatim intent, labeled as such —
+the §38.0-Context-3 convention): *"make the Dhan option-chain capture complete and precise,
+cross-cover the Groww gaps, and be loud on any empty or partial chain — never a silent gap."*
+The motivating incident is the 2026-07-14 Groww NIFTY expiry-day cutoff (14:54 IST, 2xx/zero
+strikes, `ok=2/empty=1` all afternoon, ZERO pages — PR #1537); the Dhan chain leg carries the
+IDENTICAL blind spot (`chain_minute_fully_failed` requires `ok == 0`). Per this quote the
+family-(2) row is extended with `Chain1mUnderlyingNotServed` (High, one page per underlying per
+episode, edge-latched, ~10-minute detection latency) + `Chain1mUnderlyingServedRecovered` (Info,
+falling edge). This is a variant EXTENSION of family (2), not a 5th family: it still means
+"the Dhan option-chain pull is failing" — scoped to one index. Everything else in §2 stands;
+the deleted/silenced table is untouched.
 
 **Deleted or silenced 2026-07-14 (everything else Dhan):**
 
@@ -88,7 +101,11 @@ Any such PR MUST be rejected in review even if the operator approves verbally
 
 > "100% inside the tested envelope, with ratcheted regression coverage: a dead
 > Dhan token is detected within minutes by the legs' own persist-gated
-> escalation edges (SPOT1M-01 / CHAIN-02 → the family-(1)/(2) High pages) and
+> escalation edges (SPOT1M-01 / CHAIN-02 → the family-(1)/(2) High pages), and
+> a SINGLE-underlying vendor cutoff (the 2026-07-14 class) pages within ~10
+> counted minutes via the family-(2) `Chain1mUnderlyingNotServed` edge (a
+> mid-day task respawn restarts the streak — worst case ~doubles that
+> latency), and it
 > self-heals SILENTLY via three retained mechanisms (the 900s profile probe's
 > AUTH-GAP-05 forced re-mint with the GAP-04 ~30-min latch re-arm, the GAP-02
 > 900s `force_renewal_if_stale(4h)` stack sweep, and the ~23h renewal loop);
