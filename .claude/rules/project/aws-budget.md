@@ -46,6 +46,21 @@ The dual-feed scoreboard PR-C added, per `deploy/aws/terraform/silent-feed-alarm
 Total **≈ $0.40/mo pre-GST (~₹40/mo incl. 18% GST at ₹85/$)** — inside the
 $35/mo pre-GST budget alarm ceiling and the ~₹2,919/mo envelope.
 
+## COST NOTE 2026-07-13 — EBS 30→50 GB (+~₹170/mo incl GST)
+
+Prod disk-pressure remediation (operator pre-approved 2026-07-13): the root fs
+hit **82%** on 2026-07-13, growing ~2.5–3.6 GB/trading-day with ZERO
+reclamation (partition manager `detached=0` every run; S3 archive leg never
+fired) — the 50 GB gp3 grow is the pressure-relief backstop alongside the
+code retention fixes. EBS line $2.74 → $4.56 ($0.0912 × 50), bill ~₹2,919 →
+**~₹3,101/mo incl GST** — still under the $35/mo pre-GST budget alarm. The
+box's S3 write for Groww-capture archival needed NO IAM change (the instance
+role already has Put/Get/List on the whole `tv-<env>-cold` bucket). The
+effective contract lives in `daily-universe-scope-expansion-2026-05-27.md` §7
+(Mechanical Rule 3); the live grow is `scripts/aws-upgrade-instance.sh
+--ebs-size 50` (online) — terraform's `ebs_gp3_size_gb=50` documents
+fresh-provision intent only (`volume_size` is in `lifecycle.ignore_changes`).
+
 ## OPERATOR DECISION 2026-05-20 — Observability stack → CloudWatch-only
 
 > **Operator (Parthiban), 2026-05-20:** "except questdb app and cloud

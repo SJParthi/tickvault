@@ -167,7 +167,18 @@ aws-sdk-ssm = { version = "1.112.0", default-features = false, features = ["beha
 # a caret range, so a future fresh resolution could silently move this dep
 # onto a smithy generation that no longer matches the rest of the lock; the
 # exact `=` requirement keeps the family alignment deliberate.
+# 2026-07-13 merge note: main's QuestDB partition archive→verify→drop
+# (#1504) also uses this SDK (PutObject/HeadObject to tv-<env>-cold) with a
+# caret "1.136.0" requirement — the exact =1.138.0 pin satisfies it; ONE
+# workspace entry serves both consumers.
 aws-sdk-s3 = { version = "=1.138.0", default-features = false, features = ["behavior-version-latest", "default-https-client", "rt-tokio"] }
+
+# ---- Section 11b: Compression (partition archive) ----
+# 2026-07-13: gzip encoder for the streamed QuestDB /exp CSV export before
+# S3 upload. NOT a new supply-chain root — flate2 1.1.9 was ALREADY resolved
+# in Cargo.lock (transitive via tower-http compression-gzip); this promotes
+# it to a direct pin — the aws-lc-rs promotion precedent above.
+flate2 = "1.1.9"
 
 # ---- Section 16: CLI ----
 clap = { version = "4.6.1", features = ["derive"] }

@@ -24,7 +24,7 @@ Use `docs/runbooks/aws-deploy.md` for first-time account setup.
 | Resource | Type | Spec | Notes |
 |---|---|---|---|
 | EC2 | `m8g.large` | ARM Graviton4, 2 vCPU, 8 GiB RAM | On-demand only ($0.06416/hr ap-south-1); never reserved/spot. Operator-PINNED (daily-universe §7) |
-| EBS root | gp3 | 30 GB (`ebs_gp3_size_gb`, default 30, range 10-200) | Host OS + Docker + QuestDB hot window; >90d partitions archived to S3 |
+| EBS root | gp3 | 50 GB (`ebs_gp3_size_gb`, default 50 since 2026-07-13 — was 30; range 10-200) | Host OS + Docker + QuestDB hot window; >90d partitions archived to S3. Live volume grown out-of-band (`aws-upgrade-instance.sh --ebs-size`) — `volume_size` is in `lifecycle.ignore_changes` |
 | Elastic IP | static IPv4 | count-gated (`enable_eip`, **default OFF**) | EXCLUDED for the 3-month no-orders data-pull window (saves ~₹430/mo). Flip `enable_eip = true` + re-register with Dhan BEFORE live orders |
 | IAM Role | `tv-prod-instance-role` | SSM read + S3 archive write | Attached to EC2 instance profile |
 | IAM Role | `tv-github-deploy-role` | EC2 stop/start + EIP describe | Used by GitHub Actions deploy workflow (OIDC, `oidc.tf`) |

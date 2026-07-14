@@ -67,6 +67,9 @@ use tickvault_core::pipeline::run_tick_processor;
 use tickvault_core::websocket::connection_pool::WebSocketConnectionPool;
 use tickvault_core::websocket::order_update_connection::run_order_update_connection;
 use tickvault_core::websocket::types::{InstrumentSubscription, WebSocketError};
+// Phase C1 (2026-07-13): relocated from this binary to the lib so
+// dhan_rest_stack can create its own ws_event_audit consumer (Q4-i rewire).
+use tickvault_app::ws_audit_consumer::spawn_ws_event_audit_consumer;
 
 // PR-E (2026-05-26): ensure_candle_table_dedup_keys retired alongside
 // the deleted candle_persistence module + historical_candles table.
@@ -198,8 +201,17 @@ fn emit_boot_completed() {
 /// would false-NEGATIVE a feed that is legitimately still coming up. A bounded
 /// wait removes that race while keeping the honest end-state: a feed that never
 /// comes up correctly withholds the "alive" signal. Boot is cold path, so a
-/// bounded 60s poll is well inside every boot budget.
-const BOOT_COMPLETED_FEED_LIVENESS_WAIT_SECS: u64 = 60;
+/// bounded poll is well inside every boot budget.
+///
+/// WIDENED 60 -> 300 (2026-07-13, deploy-hang fix hostile-review round 1
+/// MEDIUM): the Groww lane flips running only after the watch-list BUILD
+/// succeeds — a merely-SLOW cold-boot build (>60s: CSV download + resolve on
+/// a cold cache) exhausted the old 60s window and withheld `tv_boot_completed`
+/// FOREVER, so the 08:40 IST boot-heartbeat alarm false-paged a HEALTHY boot.
+/// 300s comfortably covers a slow-but-good build while still paging honestly
+/// on a genuinely dead feed (the 08:30 boot + 300s ceiling resolves well
+/// before the 08:40 alarm evaluation).
+const BOOT_COMPLETED_FEED_LIVENESS_WAIT_SECS: u64 = 300;
 
 /// Poll cadence for the boot-completed feed-liveness wait.
 const BOOT_COMPLETED_FEED_LIVENESS_POLL_MS: u64 = 1000;
@@ -427,6 +439,15 @@ async fn main() -> Result<()> {
     // AND the Dhan-off per-feed boot dispatcher gate (the `config.feeds`
     // dhan-enabled skip-guard further down) read the EFFECTIVE state with no
     // further edits.
+    // Round-2 FIX A (2026-07-13): capture the RAW TOML Dhan value BEFORE the
+    // feed-state overlay is applied. The Phase A "lane retired" truth — the
+    // /api/feeds 409 gate, the runtime cold-start refusal, and the REST-only
+    // stack spawn below — is a statement about the CONFIG, never about the
+    // last webpage toggle. Seeding it from the POST-overlay effective value
+    // would let a persisted runtime-OFF overlay permanently 409-lock a
+    // config-ON boot with a misleading "config change + restart" message
+    // (breaking the PR-E disable→restart→re-enable round trip).
+    let dhan_config_enabled_raw = config.feeds.dhan_enabled;
     {
         let overlay_path = tickvault_api::feed_state_persist::feed_state_path();
         let persisted = tickvault_api::feed_state_persist::load_feed_state(&overlay_path);
@@ -443,6 +464,24 @@ async fn main() -> Result<()> {
                  — falling back to the config default per-feed enabled state"
             );
         }
+        // 2026-07-13 operator directive ("now remove this entire Dhan live
+        // websocket feed instruments subscription even entire live websocket
+        // feed itself"): the Dhan overlay is narrow-only — config-off is
+        // AUTHORITATIVE for the retired Dhan live WS lane, so a STALE
+        // pre-directive webpage toggle (`dhan_enabled: true` in
+        // data/feed-state.json) can never resurrect it. One boot-time warn
+        // makes the suppression visible (never silent).
+        if tickvault_api::feed_state_persist::dhan_overlay_suppressed(
+            &config.feeds,
+            persisted.as_ref(),
+        ) {
+            warn!(
+                "feed-state overlay requested dhan_enabled=true but the config says false — \
+                 overlay SUPPRESSED: the Dhan live WS lane is retired by operator directive \
+                 2026-07-13 (Dhan is REST-only; Groww is the live feed). Re-enabling requires \
+                 a config change + restart."
+            );
+        }
         config.feeds = tickvault_api::feed_state_persist::overlay_feeds(config.feeds, persisted);
     }
     let feeds = &config.feeds;
@@ -450,8 +489,14 @@ async fn main() -> Result<()> {
     // `Arc<FeedRuntimeState>` seeded from config, handed to BOTH the API state
     // (so `POST /api/feeds/{feed}` flips it) AND the Groww bridge (which reads it
     // live each loop) — so a runtime toggle is observed without a restart.
+    // The runtime atomics seed from the EFFECTIVE (post-overlay) feeds; the
+    // Phase A retirement snapshot seeds from the RAW TOML value captured
+    // above (round-2 FIX A, 2026-07-13).
     let feed_runtime = std::sync::Arc::new(
-        tickvault_api::feed_state::FeedRuntimeState::from_config(feeds),
+        tickvault_api::feed_state::FeedRuntimeState::from_config_with_dhan_config(
+            feeds,
+            dhan_config_enabled_raw,
+        ),
     );
     // Live-feed health check (operator 2026-06-22): the ONE shared per-feed
     // signal registry. The feed lanes update it (ticks/candles/drops/connected);
@@ -610,6 +655,21 @@ async fn main() -> Result<()> {
     let groww_scale_entries: std::sync::Arc<
         arc_swap::ArcSwapOption<Vec<tickvault_core::feed::groww::instruments::WatchEntry>>,
     > = std::sync::Arc::new(arc_swap::ArcSwapOption::empty());
+    // ── Groww capture rotation-at-open — PROCESS-GLOBAL, BEFORE both spawns ──
+    // 2026-07-13 disk-retention hardening (review round 1 redesign, F1+F2):
+    // rotate a stale previous-IST-day capture file HERE, synchronously,
+    // strictly BEFORE the Groww bridge task AND the sidecar supervisor spawn
+    // below — ordering holds by construction on EVERY boot arm (this is the
+    // single shared spawn site; the ratchet in disk_retention_wiring_guard.rs
+    // pins the source order). Only Rust renames at open: the rename completes
+    // before the sidecar process exists (it can never re-open the old inode)
+    // and before the bridge's one-shot archive-drain decision runs (F1), and
+    // the archive is named by the bridge's snapshot day — the exact name
+    // drain_archive_tail_if_needed probes (F2). Scale-lab per-conn shard
+    // captures (main-locked-out, dev only) are not rotated at open.
+    let _rotated_capture = tickvault_app::groww_bridge::rotate_stale_groww_capture_at_open(
+        std::path::Path::new(tickvault_app::groww_bridge::GROWW_TICK_FILE_DEFAULT),
+    );
     if groww_scale_enabled {
         let _groww_shard_bridges =
             tickvault_app::groww_bridge::spawn_supervised_groww_shard_bridges(
@@ -653,13 +713,22 @@ async fn main() -> Result<()> {
     // FEED-SUPERVISOR-01: spawn the feed-agnostic sidecar supervisor under a
     // respawning wrapper so the stall-watchdog (FEED-STALL-01) can never die
     // silently — a panic/return respawns it (WS-GAP-05 / DISK-WATCHER-01 pattern).
+    // Disk-retention hardening (2026-07-13): thread the capture-archive S3
+    // destination from `[feeds.groww]` into the sidecar child env so rotated
+    // capture archives are verified-offloaded to S3 instead of accumulating
+    // unbounded on the 30 GB root EBS. Empty bucket = archival OFF.
+    let groww_sidecar_options = tickvault_app::groww_sidecar_supervisor::GrowwSidecarOptions {
+        archive_s3_bucket: config.feeds.groww.capture_archive_s3_bucket.clone(),
+        archive_s3_prefix: config.feeds.groww.capture_archive_s3_prefix.clone(),
+        ..tickvault_app::groww_sidecar_supervisor::GrowwSidecarOptions::default()
+    };
     if groww_scale_enabled {
         // §34: the ladder publishes desired_conns; the fleet reconciles the
         // per-conn Python children to it (spawn missing / kill newest).
         let scale_runtime = tickvault_app::groww_scale_ladder::GrowwScaleRuntime::default();
         let _groww_fleet = tickvault_app::groww_sidecar_supervisor::spawn_groww_scale_fleet(
             std::sync::Arc::clone(&feed_runtime),
-            tickvault_app::groww_sidecar_supervisor::GrowwSidecarOptions::default(),
+            groww_sidecar_options.clone(),
             groww_shards_root.clone(),
             std::sync::Arc::clone(&scale_runtime.desired_conns),
             std::sync::Arc::clone(&scale_runtime.wake),
@@ -682,7 +751,7 @@ async fn main() -> Result<()> {
     } else {
         tickvault_app::groww_sidecar_supervisor::spawn_supervised_groww_sidecar_supervisor(
             std::sync::Arc::clone(&feed_runtime),
-            tickvault_app::groww_sidecar_supervisor::GrowwSidecarOptions::default(),
+            groww_sidecar_options.clone(),
             std::sync::Arc::clone(&feed_health),
             std::sync::Arc::clone(&groww_sidecar_notifier_slot),
             // Scoreboard PR-B (2026-07-10): every stall-watchdog
@@ -1592,6 +1661,29 @@ async fn main() -> Result<()> {
                     ),
                 }
             }
+            // 2026-07-13 disk-retention hardening: the single-file WARN+
+            // append log is deliberately skipped by every retention sweeper
+            // (the `*.log`-name guard), so it was the one unbounded log
+            // file. Cap it at ERRORS_LOG_MAX_BYTES — the same WARN+ lines
+            // also live in the hourly machine app logs + errors.jsonl, so a
+            // truncation loses nothing uniquely. Hosted here (the existing
+            // hourly sweep task) rather than a new task.
+            match observability::cap_errors_log_size(
+                Path::new(tickvault_app::boot_helpers::ERROR_LOG_FILE_PATH),
+                observability::ERRORS_LOG_MAX_BYTES,
+            ) {
+                Ok(None) => {}
+                Ok(Some(prev_bytes)) => tracing::info!(
+                    prev_bytes,
+                    max_bytes = observability::ERRORS_LOG_MAX_BYTES,
+                    "errors.log exceeded its size cap — reset to 0 (WARN+ lines \
+                     remain in the hourly app logs + errors.jsonl)"
+                ),
+                Err(err) => tracing::warn!(
+                    ?err,
+                    "errors.log size cap check failed — file keeps growing until fixed"
+                ),
+            }
         }
     });
 
@@ -1675,6 +1767,33 @@ async fn main() -> Result<()> {
                     }
                 }
             }
+        }
+    });
+
+    // 2026-07-13 disk-retention hardening: prune confirmed-replay WAL
+    // segments from `<wal_dir>/archive/` older than 7 days (F3: matches
+    // SPILL_FILE_MAX_AGE_SECS and preserves the confirm-on-channel
+    // residual's only copy across a long weekend for triage). Archived
+    // segments are post-confirmed-replay copies (frames re-injected +
+    // durably persisted); the same-day 15:40 IST tick-conservation audit
+    // reads only the CURRENT day's frames, so a 7-day retention can never
+    // change it. Before this task, `archive/` grew ~0.15–0.6 GB/day
+    // unbounded on the prod 30 GB volume. Process-global boot prefix (both
+    // boot arms) — deliberately NOT the Dhan-lane periodic health loop,
+    // which never runs on a Groww-only boot. Prunes once at task start
+    // (each daily prod boot reclaims immediately), then every 6 h.
+    tokio::spawn(async {
+        use std::time::Duration;
+        loop {
+            let wal_dir = tickvault_app::tick_conservation_boot::ws_wal_dir();
+            let _outcome = tickvault_storage::ws_frame_spill::prune_archived_segments(
+                &wal_dir,
+                tickvault_common::constants::WS_WAL_ARCHIVE_RETENTION_SECS,
+            );
+            tokio::time::sleep(Duration::from_secs(
+                tickvault_common::constants::WS_WAL_ARCHIVE_PRUNE_INTERVAL_SECS,
+            ))
+            .await;
         }
     });
 
@@ -1786,6 +1905,41 @@ async fn main() -> Result<()> {
             );
         }
     }
+
+    // =====================================================================
+    // PROCESS-GLOBAL systemd WATCHDOG=1 pinger (2026-07-13, deploy-hang fix
+    // hostile-review round 1 CRITICAL). The unit sets WatchdogSec=60, and
+    // BOTH pre-existing `notify_systemd_watchdog()` ping tasks
+    // (`spawn_heartbeat_watchdog`) are Dhan-gated: the FAST-arm spawn runs
+    // only on a dhan-enabled crash-recovery boot, and the slow-boot spawn
+    // lives INSIDE `start_dhan_lane` (lane-owned; a PR-E lane teardown
+    // aborts it). Sending READY=1 on a Dhan-OFF boot (the same-date
+    // deploy-hang fix) would therefore ARM the watchdog with NOBODY pinging
+    // -> systemd SIGABRTs the process at t+60s -> Restart=always loop ->
+    // StartLimitBurst hard-fail minutes after a deploy that reported
+    // success (Rule-11 false-OK), and the next 08:30 boot dies by ~08:40.
+    // This thin, FEED-AGNOSTIC, process-lifetime task pings every
+    // WATCHDOG_INTERVAL_SECS (30s) from the shared boot prefix, BEFORE any
+    // boot path can send READY=1 (both READY-capable arms — the FAST arm
+    // and the Dhan-OFF arm — sit below this line in source order; a
+    // source-scan ratchet pinning that ordering + the absence of any feed
+    // gate on this spawn must land with this fix). Extra pings alongside
+    // the lane-owned `spawn_heartbeat_watchdog` are harmless (each
+    // WATCHDOG=1 just resets the 60s timer); the lane-owned tasks keep
+    // their ownership semantics untouched — and this task ALSO closes the
+    // pre-existing PR-E hole where a runtime Dhan disable aborted the ONLY
+    // pinger of a watchdog-armed process. No-op outside systemd
+    // (`notify_systemd_watchdog` requires NOTIFY_SOCKET).
+    let _process_global_watchdog_pinger = tokio::spawn(async {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(
+            tickvault_app::boot_helpers::WATCHDOG_INTERVAL_SECS,
+        ));
+        interval.tick().await; // skip the immediate first tick
+        loop {
+            interval.tick().await;
+            infra::notify_systemd_watchdog();
+        }
+    });
 
     let fast_cache = token_cache::load_token_cache_fast();
     // PR #6b (2026-05-19): inlined `is_within_build_window` after retiring
@@ -2949,6 +3103,26 @@ async fn main() -> Result<()> {
             &notifier,
         );
 
+        // Groww per-minute spot 1m REST leg on the FAST crash-recovery arm
+        // too (hostile round 1 item 1 — the scoreboard dual-site pattern):
+        // this arm `return run_shutdown_fast`s and never reaches the
+        // slow-path spawn below, yet a mid-market crash restart routes
+        // through EXACTLY this arm — without this call the flagship
+        // crash-restart day ran NO per-minute fetches and NO 15:31 sweep.
+        spawn_groww_spot_1m_leg(&config, &notifier, &trading_calendar);
+
+        // Daily 15:40 IST timeframe-consistency verifier on the FAST
+        // crash-recovery arm too (operator 2026-07-13; the scoreboard
+        // dual-spawn precedent directly above): this arm `return
+        // run_shutdown_fast`s and never reaches the process-global spawn
+        // below, yet a mid-market crash-restart session must still own the
+        // day's 15:40 TF-VERIFY run. Once-per-process guarded inside.
+        tickvault_app::tf_consistency_boot::spawn_tf_consistency_tasks(
+            &config,
+            &trading_calendar,
+            &notifier,
+        );
+
         // --- Await shutdown ---
         return run_shutdown_fast(
             ws_handles,
@@ -3137,6 +3311,30 @@ async fn main() -> Result<()> {
         &notifier,
     );
 
+    // Groww per-minute spot 1m REST leg (operator grant 2026-07-13 — PR-2 of
+    // the Groww per-minute REST plan) — the slow-path call site; the FAST
+    // crash-recovery arm carries its own (hostile round 1 item 1 — the
+    // scoreboard dual-site pattern). Every trading-day minute close in
+    // [09:16:00, 15:30:00] IST it fetches the just-closed minute's official
+    // Groww 1m OHLCV for the 3 spot indices and persists to `spot_1m_rest`
+    // tagged feed='groww' (+ `rest_fetch_audit` forensics rows). See
+    // `spawn_groww_spot_1m_leg`.
+    spawn_groww_spot_1m_leg(&config, &notifier, &trading_calendar);
+
+    // Daily 15:40 IST timeframe-consistency verifier — PROCESS-GLOBAL like
+    // the conservation audit + scoreboard above (operator 2026-07-13):
+    // recompute every higher-TF candle (2m..4h) from the stored 1m rows and
+    // compare against the persisted TF tables — Dhan verifies TODAY, Groww
+    // verifies the PREVIOUS trading day (TF-VERIFY-01/02). Gated on
+    // `[tf_consistency] enabled` + trading-day inside the task; the
+    // once-per-process AtomicBool inside makes the fast-arm + prefix
+    // dual-spawn safe. See `tf_consistency_boot::spawn_tf_consistency_tasks`.
+    tickvault_app::tf_consistency_boot::spawn_tf_consistency_tasks(
+        &config,
+        &trading_calendar,
+        &notifier,
+    );
+
     // -----------------------------------------------------------------------
     // DayOhlcTracker boot wiring (post 2026-05-26 simplification; MOVED to
     // process-global scope 2026-07-01 to stop the per-lane cold-start leak).
@@ -3297,8 +3495,103 @@ async fn main() -> Result<()> {
             "DHAN LANE SKIPPED (dhan_enabled=false) — shared-infra-only runtime; \
              the unified run-loop keeps the API + seal-writer + aggregator alive"
         );
+        // ===================================================================
+        // Phase A (operator directive 2026-07-13 — "now remove this entire
+        // Dhan live websocket feed instruments subscription even entire live
+        // websocket feed itself"): the Dhan live WS lane is retired, but the
+        // Dhan REST retained surface (token/auth stack, REST canary,
+        // per-minute spot_1m_rest, per-minute option_chain_1m + entitlement
+        // probe) must KEEP RUNNING. Before Phase A those subsystems lived
+        // exclusively inside the lane / fast-boot arm and died with it. The
+        // REST-only stack brings them up WITHOUT any WebSocket.
+        //
+        // Placement notes (mutual exclusion + reachability):
+        //   - Spawned ONLY here, in the Dhan-OFF branch, and ONLY when the
+        //     RAW boot TOML retires the lane (`is_dhan_config_enabled() ==
+        //     false` — round-2 FIX A, 2026-07-13). The lane (whose
+        //     `spawn_post_market_tasks` seam owns these subsystems on a
+        //     Dhan-ON boot) can never run alongside it: the runtime
+        //     cold-start supervisor REFUSES a lane start on the SAME raw
+        //     gate (see run_dhan_lane_runtime_supervisor).
+        //   - The FAST crash-recovery arm is filtered on
+        //     `config.feeds.dhan_enabled` (its `fast_cache.filter`), so with
+        //     Dhan off it never fires its early return — every Dhan-off boot
+        //     reaches THIS slow-path site. The metrics recorder + notifier +
+        //     shared infra are all installed well above (`build_shared_infra`).
+        //   - Bring-up is a background task with internal retry-forever
+        //     loops: it never blocks boot and never halts the process.
+        // ===================================================================
+        if feed_runtime.is_dhan_config_enabled() {
+            // Round-2 FIX A (2026-07-13): a config-ON boot whose feed-state
+            // overlay (last webpage toggle) left Dhan runtime-OFF — the lane
+            // is DORMANT, not retired. The REST-only stack must NOT spawn
+            // here: it would hold the dual-instance SSM lock + mint the
+            // TokenManager, and the (allowed) runtime re-enable's cold-start
+            // would then collide with our OWN process (AlreadyHeld →
+            // DHAN-LANE-03 retry loop + RESILIENCE-01 pages). The retained
+            // Dhan REST surface comes up WITH the lane on re-enable
+            // (`spawn_post_market_tasks`) — pre-Phase-A behavior; until
+            // then the Dhan REST surface is honestly absent (as it was
+            // pre-Phase-A on every runtime-OFF boot).
+            info!(
+                "Dhan REST-only stack NOT spawned: the boot TOML carries dhan_enabled=true \
+                 (lane dormant via the runtime overlay, not retired) — a runtime re-enable \
+                 cold-starts the full lane, which owns the Dhan REST surface"
+            );
+        } else {
+            let _dhan_rest_stack_monitor = tickvault_app::dhan_rest_stack::spawn_dhan_rest_stack(
+                tickvault_app::dhan_rest_stack::DhanRestStackParams {
+                    config: std::sync::Arc::new(config.clone()),
+                    notifier: std::sync::Arc::clone(&notifier),
+                    calendar: std::sync::Arc::clone(&trading_calendar),
+                    feed_runtime: std::sync::Arc::clone(&feed_runtime),
+                },
+            );
+        }
         None
     };
+
+    // =======================================================================
+    // Dhan-OFF boot completion signals (deploy-hang fix, 2026-07-13).
+    //
+    // The systemd unit is Type=notify with TimeoutStartSec=infinity: systemd
+    // releases the `systemctl restart tickvault` start job ONLY when the app
+    // sends sd_notify(READY=1). Both pre-existing notify sites are Dhan-gated
+    // — the FAST crash-recovery arm (filtered on `config.feeds.dhan_enabled`)
+    // and the slow-boot site inside `start_dhan_lane` — so the Phase-A
+    // `dhan_enabled=false` flip (#1496, 2026-07-13) left every prod boot
+    // stuck `activating` forever: the on-box deploy script's
+    // `systemctl restart tickvault` never returned, the SSM command never
+    // reached a terminal state, and the deploy workflow's wait budget expired
+    // into the auto-stop mid-script (runs 29269805430 / 29273283894 — every
+    // post-#1496 deploy failed identically). This arm sends READY=1 and the
+    // feed-liveness-gated `tv_boot_completed` (the 08:40 IST boot-heartbeat
+    // alarm's signal — equally lane-owned before this fix, so a Dhan-OFF boot
+    // would also have false-paged that alarm every morning) for the Dhan-OFF
+    // boot, mirroring the two existing sites. `dhan_poolless_idle=false`:
+    // with `dhan_enabled=false` the Dhan term of `boot_completed_should_emit`
+    // is vacuous and the gate genuinely waits (bounded — see
+    // BOOT_COMPLETED_FEED_LIVENESS_WAIT_SECS, widened 60->300 per the
+    // 2026-07-13 hostile-review MEDIUM: a merely-slow watch-list build must
+    // not withhold the metric forever) for the Groww lane — a Groww that
+    // never comes up still withholds the metric so the
+    // boot-heartbeat alarm pages (Rule 11, no false-OK). READY=1 is sent
+    // FIRST (unconditionally for this arm): systemd start-job release must
+    // never be held hostage to feed liveness — the PROCESS booted; feed
+    // health has its own alarms. No-op when NOTIFY_SOCKET is unset (local
+    // `cargo run` / Mac scale-test boots, which took this arm long before
+    // Phase A without ever running under systemd).
+    // =======================================================================
+    if !config.feeds.dhan_enabled {
+        infra::notify_systemd_ready();
+        emit_boot_completed_when_feed_live(
+            &feed_runtime,
+            config.feeds.dhan_enabled,
+            config.feeds.groww_enabled,
+            false,
+        )
+        .await;
+    }
 
     // =======================================================================
     // PROCESS RUN-LOOP (BOTH Dhan-OFF and Dhan-ON-slow).
@@ -4033,84 +4326,12 @@ fn create_websocket_pool(
     Some((receiver, pool))
 }
 
-/// Bounded capacity for the WS-event audit channel. WS lifecycle events are
-/// rare (a few per connection per day), so a small bound is ample; the producer
-/// `try_send`s and drops on the (practically unreachable) full case rather than
-/// ever blocking the WS read loop.
-const WS_EVENT_AUDIT_CHANNEL_CAPACITY: usize = 1024;
-
-/// Creates the WS-event audit channel + spawns its consumer task, returning the
-/// `Sender` to hand to a WebSocket producer (the main-feed pool OR the
-/// order-update connection). Self-contained: each call owns one consumer
-/// writing to the shared `ws_event_audit` table (ILP appends are independent),
-/// so the order-update connection reuses this exact pattern with no boot
-/// refactor.
-fn spawn_ws_event_audit_consumer(
-    questdb_cfg: tickvault_common::config::QuestDbConfig,
-) -> tokio::sync::mpsc::Sender<tickvault_common::ws_event_types::WsEventAuditRow> {
-    let (tx, rx) = tokio::sync::mpsc::channel::<tickvault_common::ws_event_types::WsEventAuditRow>(
-        WS_EVENT_AUDIT_CHANNEL_CAPACITY,
-    );
-    tokio::spawn(async move {
-        run_ws_event_audit_consumer(rx, questdb_cfg).await;
-    });
-    tx
-}
-
-/// Drains the WS-event audit channel into the `ws_event_audit` QuestDB table.
-///
-/// Owns the ILP writer for the table's lifetime, ensures the table exists once
-/// at start, then appends + flushes each row as it arrives. A flush failure
-/// emits AUDIT-WS-01 (Medium) — the WS events still reached CloudWatch logs +
-/// Telegram, so this is a forensic-record gap, never a recovery-path failure.
-/// Exits cleanly when all producers (the pool connections) drop their senders.
-async fn run_ws_event_audit_consumer(
-    mut rx: tokio::sync::mpsc::Receiver<tickvault_common::ws_event_types::WsEventAuditRow>,
-    questdb_cfg: tickvault_common::config::QuestDbConfig,
-) {
-    use tickvault_common::error_code::ErrorCode;
-    use tickvault_storage::ws_event_audit_persistence::{
-        WsEventAuditWriter, ensure_ws_event_audit_table,
-    };
-
-    ensure_ws_event_audit_table(&questdb_cfg).await;
-    let mut writer = WsEventAuditWriter::new(&questdb_cfg);
-    while let Some(row) = rx.recv().await {
-        if let Err(err) = writer.append_row(&row) {
-            error!(
-                code = ErrorCode::AuditWs01EventWriteFailed.code_str(),
-                ws_type = row.ws_type.as_str(),
-                connection_index = row.connection_index,
-                event_kind = row.event_kind.as_str(),
-                ?err,
-                "ws_event_audit: append failed"
-            );
-            metrics::counter!("tv_ws_event_audit_write_errors_total", "stage" => "append")
-                .increment(1);
-            continue;
-        }
-        if let Err(err) = writer.flush() {
-            error!(
-                code = ErrorCode::AuditWs01EventWriteFailed.code_str(),
-                ws_type = row.ws_type.as_str(),
-                connection_index = row.connection_index,
-                event_kind = row.event_kind.as_str(),
-                ?err,
-                "ws_event_audit: flush failed"
-            );
-            metrics::counter!("tv_ws_event_audit_write_errors_total", "stage" => "flush")
-                .increment(1);
-        } else {
-            metrics::counter!(
-                "tv_ws_event_audit_rows_total",
-                "ws_type" => row.ws_type.as_str(),
-                "event_kind" => row.event_kind.as_str(),
-            )
-            .increment(1);
-        }
-    }
-    info!("ws_event_audit consumer: all producers dropped — exiting");
-}
+// Phase C1 (2026-07-13): the WS-event audit channel + consumer helper
+// (`spawn_ws_event_audit_consumer` / `run_ws_event_audit_consumer` /
+// `WS_EVENT_AUDIT_CHANNEL_CAPACITY`) RELOCATED to the lib module
+// `tickvault_app::ws_audit_consumer` (pure move, zero behavior change) so
+// `dhan_rest_stack` — which owns the functional-dormant order-update WS per
+// operator ruling Q4-i — can create its own consumer. Re-imported below.
 
 /// Spawns all WebSocket connections in the pool (with stagger).
 /// Call AFTER the tick processor is started so frames are consumed immediately.
@@ -9211,7 +9432,8 @@ async fn start_dhan_lane(
     //   * the one-shot prev-day OHLCV fetch — self-exits after its bounded
     //     fail-soft fetch pass;
     //   * process-LATCHED families (spawned at most once per process):
-    //     post-market tasks (POST_MARKET_TASKS_SPAWNED), the market-open
+    //     post-market tasks (the shared lib guard
+    //     claim_post_market_task_family_once), the market-open
     //     one-shots (MARKET_OPEN_ONE_SHOTS_SPAWNED + fire-time dhan gate),
     //     the SLO supervisor (SLO_PUBLISHER_SUPERVISOR_SPAWNED), and the
     //     FirstSeenSet midnight reset (FIRST_SEEN_RESET_SPAWNED).
@@ -10793,6 +11015,10 @@ pub async fn run_dhan_lane_runtime_supervisor(
 ) {
     use tickvault_api::feed_state::{Feed, LaneState};
     let mut active_task: Option<tokio::task::JoinHandle<()>> = None;
+    // 2026-07-13 refusal latch — edge-triggered once per attempt-episode
+    // (audit Rule 4): set on the first refused cold-start of an ON period,
+    // re-armed when the operator toggles Dhan OFF again. Never per-2s spam.
+    let mut cold_start_refusal_logged = false;
     loop {
         // Idle (zero Dhan work) until the runtime context exists. The context is
         // populated by `main()` right after `build_shared_infra`, which runs in
@@ -10955,12 +11181,50 @@ pub async fn run_dhan_lane_runtime_supervisor(
             feed_runtime.dhan_lane_state(),
             active_task.is_some(),
         ) {
-            info!(
-                "[dhan-lane] runtime supervisor spawning cold-start (boot-OFF Dhan enabled at \
-                 runtime, lane is Off)"
-            );
-            let task = tokio::spawn(run_dhan_lane_cold_start(std::sync::Arc::clone(ctx)));
-            active_task = Some(task);
+            // 2026-07-13 operator directive ("now remove this entire Dhan
+            // live websocket feed instruments subscription even entire live
+            // websocket feed itself"): with `dhan_enabled = false` in the
+            // RAW boot TOML, the Dhan REST-only stack (`dhan_rest_stack.rs`)
+            // already owns the dual-instance SSM lock + the TokenManager. A
+            // runtime cold-start of the FULL lane (POST /api/feeds/dhan →
+            // desired-ON here) would collide with it — Step 6a-prime sees
+            // AlreadyHeld → DHAN-LANE-03 retry loop + RESILIENCE-01 pages
+            // against our OWN process. The supervisor therefore REFUSES the
+            // cold-start while the RAW config says Dhan is off; re-enabling
+            // the live WS lane requires a config change + restart (and a
+            // fresh dated operator quote per production_config_wiring.rs).
+            //
+            // Round-2 FIX A (2026-07-13): the gate reads the RAW TOML
+            // snapshot (`is_dhan_config_enabled`, seeded pre-overlay), NOT
+            // the overlaid `ctx.config.feeds` — a persisted runtime-OFF
+            // overlay on a config-ON boot leaves the lane dormant-but-NOT-
+            // retired (the REST-only stack did NOT spawn on that boot, same
+            // raw gate — no lock to collide with), so the cold-start stays
+            // allowed there (pre-Phase-A round trip). This keeps the gate in
+            // lockstep with the /api/feeds 409 arm: the API never accepts an
+            // enable this supervisor would refuse.
+            if !feed_runtime.is_dhan_config_enabled() {
+                if !cold_start_refusal_logged {
+                    warn!(
+                        "Dhan live WS lane retired by operator directive 2026-07-13 — runtime \
+                         enable refused; config change + restart required (the Dhan REST-only \
+                         stack keeps running; toggling the feed OFF re-arms this notice)"
+                    );
+                    cold_start_refusal_logged = true;
+                }
+            } else {
+                info!(
+                    "[dhan-lane] runtime supervisor spawning cold-start (boot-OFF Dhan enabled \
+                     at runtime, lane is Off)"
+                );
+                let task = tokio::spawn(run_dhan_lane_cold_start(std::sync::Arc::clone(ctx)));
+                active_task = Some(task);
+            }
+        }
+        if !desired_on {
+            // Operator toggled Dhan back OFF — re-arm the refusal notice for
+            // the next ON attempt-episode (edge-triggered, audit Rule 4).
+            cold_start_refusal_logged = false;
         }
 
         tokio::time::sleep(DHAN_LANE_RUNTIME_POLL).await;
@@ -11406,7 +11670,20 @@ async fn run_process_runloop(
         "system ready — press Ctrl+C to stop"
     );
 
-    notifier.notify(NotificationEvent::StartupComplete { mode });
+    // 2026-07-13 operator visibility rider: the boot Telegram states what
+    // the per-minute Dhan REST legs will ACTUALLY do today (config truth) —
+    // a midnight boot is otherwise silent about them until 09:16 IST.
+    notifier.notify(NotificationEvent::StartupComplete {
+        mode,
+        spot_1m_enabled: config.spot_1m_rest.enabled,
+        spot_1m_indices: u32::try_from(tickvault_common::constants::SPOT_1M_REST_INDICES.len())
+            .unwrap_or(0),
+        chain_1m_enabled: config.option_chain_1m.enabled,
+        chain_1m_underlyings: u32::try_from(
+            tickvault_common::constants::CHAIN_1M_UNDERLYINGS.len(),
+        )
+        .unwrap_or(0),
+    });
 
     // --- Post-market WebSocket disconnect timer ---
     // Compute sleep duration until market_close_time (15:30 IST).
@@ -11474,8 +11751,59 @@ async fn run_process_runloop(
             }
         }
 
+        // Post-market: archive→verify→drop old QuestDB partitions (2026-07-13
+        // disk-pressure remediation). MUST run BEFORE the legacy detach cycle
+        // so a >retention_days partition is archived+dropped (disk freed, S3
+        // copy verified) rather than detached-unarchived (renamed inside the
+        // same volume, zero bytes freed). Gated on `archive_enabled` (serde
+        // default false) — a config rollback restores detach-only behaviour
+        // byte-identically. Fail-closed: a partition is dropped ONLY after
+        // its S3 copy is row-count- and size-verified; any failure keeps the
+        // partition and retries next run.
+        if config.partition_retention.archive_enabled {
+            match tickvault_storage::partition_archive::PartitionArchiver::new(
+                &config.questdb,
+                &config.partition_retention,
+            )
+            .await
+            {
+                Ok(Some(mut archiver)) => {
+                    let summary = archiver.archive_and_drop_old_partitions().await;
+                    info!(
+                        tables_scanned = summary.tables_scanned,
+                        partitions_considered = summary.partitions_considered,
+                        verified = summary.verified,
+                        dropped = summary.dropped,
+                        failed = summary.failed,
+                        rows_archived = summary.rows_archived,
+                        gzip_bytes_uploaded = summary.gzip_bytes_uploaded,
+                        csv_bytes_exported = summary.csv_bytes_exported,
+                        "post-market partition archive complete (verified S3 copy before every drop)"
+                    );
+                }
+                // Review round 1 F1b (fail-closed): no explicit archive
+                // bucket AND no explicit TV_ENVIRONMENT/ENVIRONMENT env var
+                // — archival skipped rather than guessing the prod bucket.
+                // The constructor already logged the actionable warn.
+                Ok(None) => {}
+                Err(err) => {
+                    error!(
+                        ?err,
+                        code = tickvault_common::error_code::ErrorCode::StorageGap04S3ArchiveFailed
+                            .code_str(),
+                        "partition archiver construction failed — archive cycle skipped \
+                         this run (fail-closed no-op; detach cycle still runs)"
+                    );
+                }
+            }
+        }
+
         // Post-market: detach old QuestDB partitions (Phase B).
         // Runs daily after pipeline stops — keeps hot data bounded to retention_days.
+        // KEPT even with the archive leg enabled: the archive cycle above drops
+        // aged partitions first, so this legacy cycle finds nothing new — but its
+        // `total_detached=…` log lines keep firing so the CloudWatch evidence
+        // trail (the 15:30 IST "partition" filter) continues uninterrupted.
         {
             let retention_days = config.partition_retention.retention_days;
             if retention_days > 0 {
@@ -14310,16 +14638,22 @@ fn redact_ip_last_octet(raw: &str) -> String {
     "[REDACTED]".to_string()
 }
 
-/// Process-global once-guard for `spawn_post_market_tasks` (2026-07-02
-/// adversarial-sweep fix). The runtime Dhan cold-start path
-/// (`run_dhan_lane_cold_start` → `start_dhan_lane`) re-invokes
-/// `spawn_post_market_tasks` on EVERY disable→enable cycle, and the spawned
-/// tasks are bare `tokio::spawn`s not owned by `DhanLaneRunHandles` — so N
-/// enable cycles before the triggers accumulated N duplicate task families
-/// (N EOD digests, N cross-verifies, N orphan watchdogs). First caller wins;
-/// later calls log INFO and return.
-static POST_MARKET_TASKS_SPAWNED: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+// Process-global once-guard for `spawn_post_market_tasks` (2026-07-02
+// adversarial-sweep fix): the runtime Dhan cold-start path
+// (`run_dhan_lane_cold_start` → `start_dhan_lane`) re-invokes
+// `spawn_post_market_tasks` on EVERY disable→enable cycle, and the spawned
+// tasks are bare `tokio::spawn`s not owned by `DhanLaneRunHandles` — so N
+// enable cycles before the guard accumulated N duplicate task families
+// (N EOD digests, N cross-verifies, N orphan watchdogs). First caller wins;
+// later calls log INFO and return.
+//
+// 2026-07-13 (Phase A FIX 4): the guard static moved into the lib —
+// `tickvault_app::dhan_rest_stack::claim_post_market_task_family_once()` —
+// because the Dhan REST-only stack's Phase 5 spawns the SAME canary/spot/
+// chain family and must claim the SAME guard. INVARIANT: the Dhan-REST
+// scheduled task family is spawned at most once per process, whichever
+// path (lane or REST-only stack) claims first — a future relaxation of the
+// runtime cold-start refusal can never double-spawn canary/spot/chain.
 
 /// Spawn the scheduled daily tasks — the 15:25 IST orphan-position watchdog,
 /// end-of-day digest (15:31:30 IST), the 1-minute cross-verify (15:31:00 IST),
@@ -14346,10 +14680,11 @@ fn spawn_post_market_tasks(
     feed_runtime: std::sync::Arc<tickvault_api::feed_state::FeedRuntimeState>,
     feed_health: std::sync::Arc<tickvault_common::feed_health::FeedHealthRegistry>,
 ) {
-    if POST_MARKET_TASKS_SPAWNED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+    if !tickvault_app::dhan_rest_stack::claim_post_market_task_family_once() {
         info!(
             "post-market tasks already spawned this process — skipping duplicate \
-             (runtime Dhan cold-start re-entry)"
+             (runtime Dhan cold-start re-entry, or the Dhan REST-only stack \
+             already owns the canary/spot/chain family)"
         );
         return;
     }
@@ -14897,6 +15232,150 @@ fn spawn_daily_tick_conservation_task(
 ///    and `DualFeedScorecardAborted` on Err/panic — the daily signal can
 ///    never be silently dropped. Graceful-shutdown cancellation stays
 ///    silent (normal teardown, not an abort).
+/// Groww per-minute spot 1m REST leg (operator grant 2026-07-13 — PR-2 of
+/// the Groww per-minute REST plan), called from BOTH boot arms (the FAST
+/// crash-recovery arm AND the slow process-global prefix — the
+/// `spawn_feed_scoreboard_tasks` dual-site pattern; hostile round 1 item 1:
+/// a mid-market crash restart takes the fast arm's `return
+/// run_shutdown_fast` and would otherwise never run this leg or its 15:31
+/// sweep). PROCESS-GLOBAL and deliberately NOT the Dhan-gated
+/// `spawn_post_market_tasks` seam: this leg's token is the shared-minter
+/// SSM read (never the Dhan JWT), so a Dhan-off (Groww-only) session still
+/// runs it. Config-gated fail-safe: an absent `[groww_spot_1m]` section
+/// disables it. Supervised respawn wrapper; self-skips on non-trading days
+/// / past 15:30 IST (post the one bounded ~15:31 repair sweep).
+// TEST-EXEMPT: tokio::spawn wrapper over the unit-tested boot modules; BOTH call sites + the config gates pinned by crates/app/tests/groww_spot_1m_wiring_guard.rs + crates/app/tests/groww_chain_1m_wiring_guard.rs.
+fn spawn_groww_spot_1m_leg(
+    config: &ApplicationConfig,
+    notifier: &std::sync::Arc<NotificationService>,
+    trading_calendar: &std::sync::Arc<TradingCalendar>,
+) {
+    // PR-3 sequencing: the spot→chain minute-done watch channel exists
+    // ONLY when BOTH Groww REST legs are enabled — chain-off keeps the
+    // spot leg byte-identical to PR-2 (no sender, no publishes; the Dhan
+    // seam's precedent).
+    let chain_enabled = config.groww_option_chain_1m.enabled;
+    let (minute_done_tx, spot_minute_done) = if config.groww_spot_1m.enabled && chain_enabled {
+        let (tx, rx) = tokio::sync::watch::channel::<Option<u32>>(None);
+        (Some(tx), Some(rx))
+    } else {
+        (None, None)
+    };
+    // PR-4 sequencing + selection handoff: the chain→contract channel +
+    // anchor store exist ONLY when BOTH legs are on (contract-off keeps
+    // the chain leg byte-identical to PR-3). The contract leg DEPENDS on
+    // the chain leg's per-minute anchors — enabled-without-chain is
+    // refused loudly, never a silent anchor-less loop.
+    let contract_enabled = config.groww_contract_1m.enabled && chain_enabled;
+    if config.groww_contract_1m.enabled && !chain_enabled {
+        warn!(
+            code = tickvault_common::error_code::ErrorCode::Spot1m01FetchDegraded.code_str(),
+            stage = "enabled_without_chain",
+            feed = "groww",
+            leg = "contract_1m",
+            "SPOT1M-01: [groww_contract_1m] is enabled but the chain leg \
+             ([groww_option_chain_1m]) is OFF — the contract leg needs the \
+             chain's per-minute ATM anchors; NOT spawned (enable the chain \
+             leg first)"
+        );
+    }
+    let (chain_minute_done_tx, chain_minute_done_rx, contract_anchor_store) = if contract_enabled {
+        let (tx, rx) = tokio::sync::watch::channel::<Option<u32>>(None);
+        let store: tickvault_app::groww_option_chain_1m_boot::GrowwChainAnchorStore =
+            std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+        (Some(tx), Some(rx), Some(store))
+    } else {
+        (None, None, None)
+    };
+    if config.groww_spot_1m.enabled {
+        let _groww_spot1m_supervisor =
+            tickvault_app::groww_spot_1m_boot::spawn_supervised_groww_spot_1m(
+                tickvault_app::groww_spot_1m_boot::GrowwSpot1mTaskParams {
+                    notifier: notifier.clone(),
+                    calendar: std::sync::Arc::clone(trading_calendar),
+                    questdb: config.questdb.clone(),
+                    minute_done_tx,
+                },
+            );
+        info!(
+            "groww_spot_1m: Groww per-minute spot 1m REST leg spawned \
+             (fires each minute close 09:16:00-15:30:00 IST; sequential \
+             symbol pacing)"
+        );
+    } else {
+        info!("groww_spot_1m: disabled by config — Groww per-minute spot fetch not spawned");
+    }
+    // Groww per-minute option-chain leg (PR-3): sequenced after the spot
+    // fire via the watch signal + fallback timer; DEFAULT-OFF pending the
+    // first live probe — the probe-and-report path runs instead while
+    // disabled (one bounded chain call per underlying, Info verdict).
+    if chain_enabled {
+        let _groww_chain1m_supervisor =
+            tickvault_app::groww_option_chain_1m_boot::spawn_supervised_groww_chain_1m(
+                tickvault_app::groww_option_chain_1m_boot::GrowwChain1mTaskParams {
+                    notifier: notifier.clone(),
+                    calendar: std::sync::Arc::clone(trading_calendar),
+                    questdb: config.questdb.clone(),
+                    spot_minute_done,
+                    minute_done_tx: chain_minute_done_tx,
+                    anchor_store: contract_anchor_store.clone(),
+                },
+            );
+        info!(
+            "groww_chain_1m: Groww per-minute option-chain leg spawned \
+             (fires each minute close right after the Groww spot fetch; \
+             sequential underlying pacing)"
+        );
+        // Groww per-contract 1m leg (PR-4, the fill-model leg): sequenced
+        // after the chain fire via the watch signal + fallback timer;
+        // selection = ATM window from the chain's in-memory anchors,
+        // hard-capped per minute. DEFAULT-OFF (depends on the chain leg).
+        if contract_enabled {
+            let _groww_contract1m_supervisor =
+                tickvault_app::groww_contract_1m_boot::spawn_supervised_groww_contract_1m(
+                    tickvault_app::groww_contract_1m_boot::GrowwContract1mTaskParams {
+                        notifier: notifier.clone(),
+                        calendar: std::sync::Arc::clone(trading_calendar),
+                        questdb: config.questdb.clone(),
+                        chain_minute_done: chain_minute_done_rx,
+                        anchor_store: contract_anchor_store,
+                        strikes_each_side: config.groww_contract_1m.strikes_each_side,
+                    },
+                );
+            info!(
+                "groww_contract_1m: Groww per-minute contract candle leg \
+                 spawned (fires each minute close right after the Groww \
+                 chain fetch; ATM-window selection, sequential contract \
+                 pacing)"
+            );
+        } else {
+            info!(
+                "groww_contract_1m: disabled by config — Groww per-minute \
+                 contract fetch not spawned"
+            );
+        }
+    } else if config.groww_option_chain_1m.probe_and_report {
+        let _groww_chain1m_probe = tokio::spawn(
+            tickvault_app::groww_option_chain_1m_boot::run_groww_chain_1m_probe(
+                tickvault_app::groww_option_chain_1m_boot::GrowwChain1mTaskParams {
+                    notifier: notifier.clone(),
+                    calendar: std::sync::Arc::clone(trading_calendar),
+                    questdb: config.questdb.clone(),
+                    spot_minute_done: None,
+                    minute_done_tx: None,
+                    anchor_store: None,
+                },
+            ),
+        );
+        info!(
+            "groww_chain_1m: pipeline OFF — one boot-time chain probe \
+             spawned (verdict via Telegram; persists nothing)"
+        );
+    } else {
+        info!("groww_chain_1m: disabled by config (probe off) — nothing spawned");
+    }
+}
+
 // TEST-EXEMPT: tokio::spawn wrapper over the unit-tested pure parts (decide_scoreboard_start / synthesize_process_death_episodes / SQL builders / parsers); spawn site pinned by test_feed_scoreboard_task_is_wired_into_main.
 fn spawn_feed_scoreboard_tasks(
     config: &ApplicationConfig,
@@ -15338,6 +15817,15 @@ fn spawn_feed_scoreboard_tasks(
                     // FASTER than the 30s stall threshold remain invisible
                     // to both columns on both card sides.
                     let groww_line = to_line("Groww", &summary.groww);
+                    // Groww REST plan PR-5 (operator Quote 2, 2026-07-13):
+                    // the official minute-candle pull digest lines — the
+                    // four canonical feed/leg pairs always render (honest
+                    // "not measured yet" when a source is absent); the
+                    // contract leg lights up automatically once its
+                    // forensics rows land.
+                    let rest_legs = tickvault_app::feed_scoreboard_boot::build_rest_leg_score_lines(
+                        &summary.rest_legs,
+                    );
                     sb_notifier.notify(NotificationEvent::DualFeedDailyScorecard {
                         trading_date_ist: summary.trading_date_ist.clone(),
                         dhan: to_line("Dhan", &summary.dhan),
@@ -15349,6 +15837,8 @@ fn spawn_feed_scoreboard_tasks(
                         restart_partial: summary.restart_partial,
                         dhan_feed_off: summary.dhan_feed_off,
                         groww_feed_off: summary.groww_feed_off,
+                        rest_legs,
+                        rest_legs_read_failed: summary.rest_legs_read_failed,
                     });
                 } else {
                     info!("feed_scoreboard: Telegram disabled — daily rows written only");

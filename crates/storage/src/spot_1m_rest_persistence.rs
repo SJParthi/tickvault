@@ -48,8 +48,17 @@ pub const DEDUP_KEY_SPOT_1M_REST: &str = "ts, security_id, exchange_segment, fee
 /// `feed` SYMBOL value — the source broker is Dhan (REST leg).
 pub const SPOT_1M_REST_FEED_DHAN: &str = "dhan";
 
+/// `feed` SYMBOL value — the source broker is Groww (REST leg, operator
+/// grant 2026-07-13: SAME table, `feed='groww'` rows; `feed` is in the
+/// DEDUP key so the Dhan and Groww rows for one minute NEVER collide).
+pub const SPOT_1M_REST_FEED_GROWW: &str = "groww";
+
 /// `source` SYMBOL label — provenance beyond `feed` (label, NOT in-key).
 pub const SPOT_1M_REST_SOURCE: &str = "rest_intraday";
+
+/// `source` SYMBOL label for the Groww leg — the rows come from Groww's
+/// `GET /v1/historical/candles` endpoint (label, NOT in-key).
+pub const SPOT_1M_REST_SOURCE_GROWW_CANDLES: &str = "rest_candles";
 
 /// `exchange_segment` SYMBOL value — the 3 spot indices are all IDX_I.
 pub const SPOT_1M_REST_SEGMENT_IDX_I: &str = "IDX_I";
@@ -221,13 +230,41 @@ pub struct Spot1mRestWriter {
     sender: Option<Sender>,
     buffer: Buffer,
     pending: usize,
+    /// The `feed` SYMBOL stamped on every appended row (`'dhan'`/`'groww'`).
+    feed: &'static str,
+    /// The `source` SYMBOL stamped on every appended row (provenance label).
+    source: &'static str,
+}
+
+/// The per-feed discard counter name — the Dhan and Groww legs each keep
+/// their own series so a Groww discard can never inflate the Dhan signal.
+/// Pure.
+#[must_use]
+fn spot_1m_discard_counter_for(feed: &str) -> &'static str {
+    if feed == SPOT_1M_REST_FEED_GROWW {
+        "tv_groww_spot1m_rows_discarded_total"
+    } else {
+        "tv_spot1m_rows_discarded_total"
+    }
 }
 
 impl Spot1mRestWriter {
     /// Production constructor — ILP-over-HTTP sender, lazy on failure.
+    /// Stamps `feed='dhan'` / `source='rest_intraday'` (the original PR-2
+    /// behaviour, byte-identical — the Groww leg uses [`Self::new_with_feed`]).
     #[must_use]
     // TEST-EXEMPT: production ILP-connect constructor (lazy-build contract exercised via test_spot1m_writer_new_is_lazy...); append/flush paths covered via for_test()
     pub fn new(config: &QuestDbConfig) -> Self {
+        Self::new_with_feed(config, SPOT_1M_REST_FEED_DHAN, SPOT_1M_REST_SOURCE)
+    }
+
+    /// Feed-parameterized production constructor (operator grant 2026-07-13
+    /// — the Groww leg writes the SAME table tagged `feed='groww'`, source
+    /// [`SPOT_1M_REST_SOURCE_GROWW_CANDLES`]). Lazy on failure like
+    /// [`Self::new`].
+    #[must_use]
+    // TEST-EXEMPT: production ILP-connect constructor (same lazy-build contract as new(); the feed/source stamping is exercised via for_test_with_feed()).
+    pub fn new_with_feed(config: &QuestDbConfig, feed: &'static str, source: &'static str) -> Self {
         let conf = spot_1m_rest_ilp_http_conf(config);
         match Sender::from_conf(&conf) {
             Ok(s) => {
@@ -236,30 +273,43 @@ impl Spot1mRestWriter {
                     sender: Some(s),
                     buffer: b,
                     pending: 0,
+                    feed,
+                    source,
                 }
             }
             Err(err) => {
                 warn!(
                     ?err,
-                    "spot_1m_rest writer: QuestDB unreachable — buffering locally"
+                    feed, "spot_1m_rest writer: QuestDB unreachable — buffering locally"
                 );
                 Self {
                     sender: None,
                     buffer: Buffer::new(ProtocolVersion::V1),
                     pending: 0,
+                    feed,
+                    source,
                 }
             }
         }
     }
 
-    /// Test constructor — disconnected writer, empty buffer.
+    /// Test constructor — disconnected writer, empty buffer (Dhan stamps).
     #[must_use]
     // TEST-EXEMPT: test-only helper used by the append/flush unit tests below.
     pub fn for_test() -> Self {
+        Self::for_test_with_feed(SPOT_1M_REST_FEED_DHAN, SPOT_1M_REST_SOURCE)
+    }
+
+    /// Test constructor with explicit feed/source stamps.
+    #[must_use]
+    // TEST-EXEMPT: test-only helper used by the feed-stamp unit tests below.
+    pub fn for_test_with_feed(feed: &'static str, source: &'static str) -> Self {
         Self {
             sender: None,
             buffer: Buffer::new(ProtocolVersion::V1),
             pending: 0,
+            feed,
+            source,
         }
     }
 
@@ -287,9 +337,9 @@ impl Spot1mRestWriter {
             // Symbols BEFORE columns (ILP tags-before-fields rule).
             .symbol("exchange_segment", SPOT_1M_REST_SEGMENT_IDX_I)
             .context("exchange_segment")?
-            .symbol("feed", SPOT_1M_REST_FEED_DHAN)
+            .symbol("feed", self.feed)
             .context("feed")?
-            .symbol("source", SPOT_1M_REST_SOURCE)
+            .symbol("source", self.source)
             .context("source")?
             .symbol("symbol", r.symbol)
             .context("symbol")?
@@ -374,7 +424,7 @@ impl Spot1mRestWriter {
     pub fn discard_pending(&mut self) -> usize {
         let dropped = self.pending;
         if dropped > 0 {
-            metrics::counter!("tv_spot1m_rows_discarded_total").increment(dropped as u64);
+            metrics::counter!(spot_1m_discard_counter_for(self.feed)).increment(dropped as u64);
         }
         self.buffer.clear();
         self.pending = 0;
@@ -484,6 +534,40 @@ mod tests {
         );
         // Index volume of 0 is stored verbatim (never dropped).
         assert!(line.contains("volume=0i"), "volume missing: {line}");
+    }
+
+    /// Feed-parameterized writer (2026-07-13, Groww spot-1m leg): a Groww
+    /// writer stamps `feed=groww` + `source=rest_candles` on every row —
+    /// and the default constructor path stays byte-identical Dhan.
+    #[test]
+    fn test_append_row_groww_writer_stamps_groww_feed_and_source() {
+        let mut w = Spot1mRestWriter::for_test_with_feed(
+            SPOT_1M_REST_FEED_GROWW,
+            SPOT_1M_REST_SOURCE_GROWW_CANDLES,
+        );
+        w.append_row(&sample_row()).expect("append must succeed");
+        let line = w.buffer_utf8();
+        assert!(line.contains(",feed=groww"), "groww feed tag: {line}");
+        assert!(
+            line.contains(",source=rest_candles"),
+            "groww source tag: {line}"
+        );
+        assert!(
+            line.contains(",exchange_segment=IDX_I"),
+            "indices stay IDX_I (the live-lane convention): {line}"
+        );
+        // Constant pins for the Groww stamps.
+        assert_eq!(SPOT_1M_REST_FEED_GROWW, "groww");
+        assert_eq!(SPOT_1M_REST_SOURCE_GROWW_CANDLES, "rest_candles");
+        // Per-feed discard counters never share a series.
+        assert_eq!(
+            spot_1m_discard_counter_for(SPOT_1M_REST_FEED_GROWW),
+            "tv_groww_spot1m_rows_discarded_total"
+        );
+        assert_eq!(
+            spot_1m_discard_counter_for(SPOT_1M_REST_FEED_DHAN),
+            "tv_spot1m_rows_discarded_total"
+        );
     }
 
     #[test]

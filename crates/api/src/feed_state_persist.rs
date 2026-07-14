@@ -234,7 +234,19 @@ pub fn load_feed_state(path: &Path) -> Option<PersistedFeedState> {
 /// directly unit-testable.
 ///
 /// - `None` (no/corrupt overlay) → the config default is returned unchanged.
-/// - `Some(p)` → the persisted per-feed flags win.
+/// - `Some(p)` → the persisted GROWW flag wins (both directions, unchanged);
+///   the persisted DHAN flag can only ever NARROW the config, never WIDEN it:
+///   effective dhan = `config.dhan_enabled && p.dhan_enabled`.
+///
+/// **Why the Dhan AND-gate (operator directive 2026-07-13):** the Dhan live
+/// WS feed was removed from the runtime ("now remove this entire Dhan live
+/// websocket feed instruments subscription even entire live websocket feed
+/// itself") — Dhan is REST-only, Groww is the live feed. Config-off is
+/// AUTHORITATIVE for Dhan: a stale `data/feed-state.json` written by a
+/// webpage toggle BEFORE the directive (`dhan_enabled: true`) must not
+/// resurrect the retired lane over the operator-locked config. Use
+/// [`dhan_overlay_suppressed`] at the application site to log the
+/// suppression (this fn stays pure).
 #[must_use]
 pub fn overlay_feeds(config: FeedsConfig, persisted: Option<PersistedFeedState>) -> FeedsConfig {
     match persisted {
@@ -242,7 +254,11 @@ pub fn overlay_feeds(config: FeedsConfig, persisted: Option<PersistedFeedState>)
         // The persisted overlay carries ONLY the runtime toggles; the
         // `[feeds.groww]` tuning (auto-scale §34) always comes from config.
         Some(p) => FeedsConfig {
-            dhan_enabled: p.dhan_enabled,
+            // 2026-07-13: narrow-only for Dhan — config-off wins over any
+            // persisted-on (the retired live WS lane can never be
+            // overlay-resurrected); config-on + persisted-off still honors
+            // the operator's last disable (pre-Phase-A behaviour).
+            dhan_enabled: config.dhan_enabled && p.dhan_enabled,
             groww_enabled: p.groww_enabled,
             groww: config.groww,
             // PR-R1 (2026-07-04): the native-shadow flag is CONFIG-ONLY (no
@@ -250,6 +266,19 @@ pub fn overlay_feeds(config: FeedsConfig, persisted: Option<PersistedFeedState>)
             groww_native_shadow: config.groww_native_shadow,
         },
     }
+}
+
+/// True when [`overlay_feeds`] would SUPPRESS a widening Dhan overlay —
+/// i.e. the persisted `data/feed-state.json` says `dhan_enabled: true` while
+/// the config says `false`. Pure companion predicate so the boot site can
+/// log ONE `warn!` naming the 2026-07-13 operator directive without this
+/// module doing any I/O or logging.
+#[must_use]
+pub fn dhan_overlay_suppressed(
+    config: &FeedsConfig,
+    persisted: Option<&PersistedFeedState>,
+) -> bool {
+    matches!(persisted, Some(p) if p.dhan_enabled && !config.dhan_enabled)
 }
 
 #[cfg(test)]
@@ -540,5 +569,123 @@ mod tests {
         assert!(s.dhan_enabled);
         assert!(!s.groww_enabled);
         assert!(s.updated_at_ist.is_empty(), "missing field defaults empty");
+    }
+
+    /// 2026-07-13 operator directive ("now remove this entire Dhan live
+    /// websocket feed... even entire live websocket feed itself"): a STALE
+    /// overlay written before the directive (`dhan_enabled: true`) must NOT
+    /// widen a config-off Dhan — config-off is authoritative for the retired
+    /// live WS lane. Effective dhan = config && persisted.
+    #[test]
+    fn test_overlay_feeds_dhan_and_gate_suppresses_stale_widen() {
+        let config = FeedsConfig {
+            dhan_enabled: false,
+            groww_enabled: true,
+            ..Default::default()
+        };
+        let persisted = Some(PersistedFeedState {
+            dhan_enabled: true, // stale pre-directive webpage toggle
+            groww_enabled: true,
+            updated_at_ist: "2026-07-12 15:00:00".to_string(),
+        });
+        let effective = overlay_feeds(config, persisted);
+        assert!(
+            !effective.dhan_enabled,
+            "config dhan-off must win over a stale persisted dhan-on \
+             (2026-07-13 directive: the live WS lane is retired)"
+        );
+        assert!(effective.groww_enabled, "groww overlay unaffected");
+    }
+
+    /// The narrow direction is unchanged: config dhan-on + persisted
+    /// dhan-off → OFF (the operator's last runtime disable still sticks,
+    /// exactly as before Phase A).
+    #[test]
+    fn test_overlay_feeds_dhan_narrow_still_wins() {
+        let config = FeedsConfig {
+            dhan_enabled: true,
+            groww_enabled: false,
+            ..Default::default()
+        };
+        let persisted = Some(PersistedFeedState {
+            dhan_enabled: false,
+            groww_enabled: false,
+            updated_at_ist: String::new(),
+        });
+        let effective = overlay_feeds(config, persisted);
+        assert!(
+            !effective.dhan_enabled,
+            "persisted dhan-off must still narrow a config dhan-on"
+        );
+    }
+
+    /// Groww overlay semantics are UNCHANGED by the 2026-07-13 Dhan
+    /// AND-gate: the persisted Groww choice wins in BOTH directions
+    /// (widen and narrow).
+    #[test]
+    fn test_overlay_feeds_groww_semantics_unchanged() {
+        // Widen: config groww-off + persisted groww-on → ON.
+        let widened = overlay_feeds(
+            FeedsConfig {
+                dhan_enabled: false,
+                groww_enabled: false,
+                ..Default::default()
+            },
+            Some(PersistedFeedState {
+                dhan_enabled: false,
+                groww_enabled: true,
+                updated_at_ist: String::new(),
+            }),
+        );
+        assert!(widened.groww_enabled, "persisted groww-on must still widen");
+        // Narrow: config groww-on + persisted groww-off → OFF.
+        let narrowed = overlay_feeds(
+            FeedsConfig {
+                dhan_enabled: false,
+                groww_enabled: true,
+                ..Default::default()
+            },
+            Some(PersistedFeedState {
+                dhan_enabled: false,
+                groww_enabled: false,
+                updated_at_ist: String::new(),
+            }),
+        );
+        assert!(
+            !narrowed.groww_enabled,
+            "persisted groww-off must still narrow"
+        );
+    }
+
+    /// `dhan_overlay_suppressed` fires ONLY on the widening combination
+    /// (config off + persisted on) — the one the 2026-07-13 AND-gate
+    /// suppresses — so the boot warn can never false-fire.
+    #[test]
+    fn test_dhan_overlay_suppressed_predicate() {
+        let cfg_off = FeedsConfig {
+            dhan_enabled: false,
+            groww_enabled: true,
+            ..Default::default()
+        };
+        let cfg_on = FeedsConfig {
+            dhan_enabled: true,
+            groww_enabled: true,
+            ..Default::default()
+        };
+        let p = |dhan: bool| {
+            Some(PersistedFeedState {
+                dhan_enabled: dhan,
+                groww_enabled: true,
+                updated_at_ist: String::new(),
+            })
+        };
+        assert!(
+            dhan_overlay_suppressed(&cfg_off, p(true).as_ref()),
+            "config off + persisted on = suppressed (warn fires)"
+        );
+        assert!(!dhan_overlay_suppressed(&cfg_off, p(false).as_ref()));
+        assert!(!dhan_overlay_suppressed(&cfg_on, p(true).as_ref()));
+        assert!(!dhan_overlay_suppressed(&cfg_on, p(false).as_ref()));
+        assert!(!dhan_overlay_suppressed(&cfg_off, None));
     }
 }

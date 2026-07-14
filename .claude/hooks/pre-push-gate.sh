@@ -26,6 +26,14 @@
 set -uo pipefail
 
 INPUT=$(cat)
+
+# 2026-07-13 hardening (review finding): resolve HOOKS_DIR to an ABSOLUTE
+# path BEFORE any cd. With a relative $0, a later `dirname "$0"` would
+# resolve against the post-anchor cwd, making every `[ -x "$HOOKS_DIR/..." ]`
+# sub-guard check fail -> silent SKIP of gates — the exact silent-degrade
+# class the anchor fix below closes.
+HOOKS_DIR="$(cd "$(dirname "$0")" && pwd)"
+
 COMMAND=$(echo "$INPUT" | jq -r '.tool_input.command // empty')
 
 # Only gate git push commands
@@ -40,19 +48,34 @@ fi
 
 cd "$CWD" || { echo "  FAIL: Cannot cd to $CWD" >&2; exit 2; }
 
+# 2026-07-13 hardening: anchor to the repo root, never trust the caller's cwd.
+# Before this, a `git push` issued from any directory lacking crates/ (a temp
+# dir, a subdirectory, a different project) made `find crates` come up empty
+# and the gate exited 0 SILENTLY — a full-gate bypass. Both silent arms are
+# now loud exit-2 failures, and all downstream relative paths run from the
+# repo root instead of the caller's cwd.
+REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null)
+if [ -z "$REPO_ROOT" ]; then
+  echo "  FAIL: pre-push gate: not inside a git repository (cwd=$CWD) — refusing to pass silently" >&2
+  exit 2
+fi
+cd "$REPO_ROOT" || { echo "  FAIL: pre-push gate: cannot cd to repo root $REPO_ROOT" >&2; exit 2; }
+CWD="$REPO_ROOT"
+
 # Signal to auto-save-remote that a user push is in progress
 PUSH_LOCK="$CWD/.claude/hooks/.push-in-progress"
 touch "$PUSH_LOCK" 2>/dev/null || true
 cleanup_push_lock() { rm -f "$PUSH_LOCK" 2>/dev/null || true; }
 trap cleanup_push_lock EXIT
 
-# Check if any .rs files exist in the project
+# Check if any .rs files exist in the project (from the repo root — never a
+# silent exit 0: an unevaluable gate must refuse, not pass)
 RS_EXISTS=$(find crates -name '*.rs' 2>/dev/null | head -1)
 if [ -z "$RS_EXISTS" ]; then
-  exit 0
+  echo "  FAIL: pre-push gate: no crates/*.rs found at repo root $REPO_ROOT — this gate guards the tickvault workspace and cannot evaluate this push; refusing to pass silently (if this is intentionally a non-tickvault repo, push it from outside this session)" >&2
+  exit 2
 fi
 
-HOOKS_DIR="$(dirname "$0")"
 FAILED=0
 
 echo "╔══════════════════════════════════════════════╗" >&2

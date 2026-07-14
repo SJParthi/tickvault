@@ -51,6 +51,8 @@ drift/missing-tick problem against an independent second source.
 
 ## §2. The pluggable-feed contract (LOCKED)
 
+> **⚠ 2026-07-13 (extended in Phase B):** the "#1 Dhan … Default **ON** (unchanged)" row and the run-mode table's "Today / prod default: dhan=true" are SUPERSEDED — the Dhan live WS is RETIRED (operator directive 2026-07-13, verbatim + full contract in `websocket-connection-scope-lock.md`'s "2026-07-13 Amendment" §-section). **Groww is now the SOLE live market-data feed**; prod = `dhan_enabled = false` + `groww_enabled = true`; Dhan is REST-only (spot-1m / chain / historical) plus the functional-dormant order-update WS inside `dhan_rest_stack`. The per-feed enable/disable CONTRACT itself is UNCHANGED and load-bearing — it is the pluggable seam feed #3 (GDF, `gdf-third-feed-scope-2026-07-13.md`) plugs into; the "Both (the target)" run mode row now reads Groww + GDF prospectively, not Groww + Dhan. §5's and §34.3's honest-envelope references to measuring/comparing against the Dhan live feed (e.g. "quantify the Dhan-live-feed drift... against an independent second source", "measuring that drift against Dhan is the whole point") are OVERTAKEN BY EVENTS — the measurement CONCLUDED (it is what retired the Dhan feed; evidence table in the scope-lock amendment §E); until GDF is live, Groww runs single-source and the §37/§38 REST comparisons are the parity signals.
+
 | Feed | Provider | Default | Connection | Reuses tickvault resilience chain | Writes to |
 |---|---|---|---|---|---|
 | **#1 Dhan** | Dhan | **ON** (unchanged) | ≤2 WS (main-feed + order-update) | yes (existing) | `ticks`, `candles_*`, audit tables (UNCHANGED) |
@@ -106,6 +108,8 @@ must update this rule file FIRST with a dated quote, only then can the PR land.
 > ZERO audit rows. See `groww-shared-master-error-codes.md` §0 (2026-06-29 close-out).
 
 ## §5. Honest envelope (mandatory per `operator-charter-forever.md` §F)
+
+> **⚠ 2026-07-13:** the "by extension, quantify the Dhan-live-feed drift" clause below is CONCLUDED, not ongoing — the comparison retired the Dhan live WS (see the §2 banner + `websocket-connection-scope-lock.md` "2026-07-13 Amendment" §E for the quantified record). The CAPTURE-vs-UPSTREAM split and every Groww-side guarantee below stand unchanged.
 
 When any PR / commit / Telegram for this work invokes "100% guarantee", qualify it exactly:
 
@@ -232,6 +236,8 @@ fast path; it already contains the NATS-over-WS + nkey + protobuf decode.
 
 > **⚠ PARTIALLY SUPERSEDED 2026-07-12 by §37 below** — the operator re-authorized ONE narrow backtest-comparison mechanism: read-only consumption of BruteX-produced backtest CSVs from OUR OWN S3 bucket. §33's ban on TickVault-side Groww historical/API fetching stands unchanged; see §37.
 >
+> **⚠ PARTIALLY SUPERSEDED 2026-07-13 by §38 below** — the operator authorized the Groww PER-MINUTE SCHEDULED REST pipeline (spot 1m + option chain + bounded per-contract 1m — the Dhan §8-pattern mirror). §33's ban on BULK Groww historical / backtest sweeps otherwise stands unchanged; see §38.
+>
 > **Authority:** this section SUPERSEDES the §0 Quote-1 live-vs-backtest deliverable and
 > HALTS the §32 Python-sidecar backtest-comparison purpose (the `get_historical_candles`
 > capture + the Rust consumer's "parity checker" role). It does NOT lift the §32 Python
@@ -255,6 +261,8 @@ FORBIDDEN until the operator re-authorizes with a fresh dated quote. The live-vs
 
 > **2026-07-12 note:** the "pulling from Groww" ban above stands UNCHANGED. §37 (dated quote) re-authorizes ONLY the read-only consumption of BruteX-PRODUCED backtest CSVs from our own S3 bucket — a comparison mechanism, not a Groww fetch.
 
+> **2026-07-13 note:** §38 (dated quotes) re-authorizes ONE narrow Groww-fetch class: PER-MINUTE SCHEDULED in-session pulls (spot 1m + option chain + bounded per-contract 1m, day-granular candle windows only). Everything else in this rule — bulk historical sweeps, past-day backfills beyond §38's one-minute/15:31-sweep patterns, any backtest-fetch track — stands FORBIDDEN.
+
 ## §33.2 What this HALTS / CANCELS
 
 | Cancelled | Detail |
@@ -265,6 +273,8 @@ FORBIDDEN until the operator re-authorizes with a fresh dated quote. The live-vs
 | Any Groww `BacktestSource` impl | `crates/core/src/feed/groww/backtest.rs`, `scripts/groww-sidecar/groww_backtest_fetch.py`, and any Groww historical fetcher MUST NOT be created. |
 
 > **2026-07-12 note:** the SP5–SP7 cancellation and the `BacktestSource` / `backtest`-module naming ban stand. The §37 consumer is a DIFFERENT mechanism (S3-CSV read of BruteX artifacts) named `brutex_crossverify` — never `backtest`/`BacktestSource`.
+
+> **2026-07-13 note:** the SP5–SP7 cancellation and the `BacktestSource`/`backtest` naming ban STILL stand. The §38 pipeline is a `GET /v1/historical/candles` consumer, but only in the per-minute scheduled shape (day-granular window, target-minute filter) — it is NOT the cancelled backtest-comparison fetcher, is never named `backtest`/`BacktestSource`, and performs no bulk sweeps.
 
 ## §33.3 What is UNCHANGED
 
@@ -285,6 +295,8 @@ can the PR land.
 
 > **2026-07-12 note:** the required §33 update happened — §37 below carries the fresh dated operator quote authorizing the narrow BruteX-S3-CSV consumption path (and ONLY that path). Every REJECT bullet above still applies to any TickVault-side Groww API/historical fetch.
 
+> **2026-07-13 note:** a SECOND required §33 update happened — §38 below carries the fresh dated operator quotes authorizing the per-minute SCHEDULED Groww REST pipeline (spot 1m + option chain + bounded per-contract 1m, and ONLY that shape). The REJECT bullets above still apply to any BULK Groww historical/backtest fetch outside the §38 grant.
+
 ## §33.5 Honest envelope (mandatory per §5 / operator-charter §F)
 
 > "Groww is live-feed-only as of 2026-06-26. We capture and seal Groww LIVE ticks (1m + 21 TFs,
@@ -294,6 +306,8 @@ can the PR land.
 > is untouched."
 
 > **2026-07-12 note:** TickVault still fetches NO Groww backtest data from Groww; since 2026-07-12 it CONSUMES BruteX-produced backtest CSVs from our own S3 per §37, so the Dhan cross-verify is no longer the ONLY OHLCV parity signal — the §37 BruteX↔TickVault daily comparison is the second one.
+
+> **2026-07-13 note:** the "we deliberately fetch NO Groww backtest data" claim narrows: since 2026-07-13 TickVault fetches Groww's OFFICIAL per-minute candles + option chain IN-SESSION per §38 (scheduled pulls only — still no bulk backtest fetch). The §38 REST tables become the fill-model parity source alongside the §37 comparison.
 
 ## §33.6 Auto-driver / Insta-reel explanation
 
@@ -503,6 +517,10 @@ or per-(underlying, month) for month-scoped reasons (FUTIDX-01, feed=groww) —
 never fail the watch build; cross-feed expiry-SET divergence in any comparable month pages
 FUTIDX-02 (a far-suffix depth difference is an info-level note, never a page).
 
+> **2026-07-13 note:** the "(NO Groww historical call ever)" parenthetical is narrowed by
+> §38 — the per-minute SCHEDULED REST pulls of §38 are the sole authorized exception. §36's
+> own machinery is unchanged: expiry resolution still comes ONLY from the static master CSV.
+
 ## §36.2 Honest notes
 
 Groww LTP carries only `{ltp, tsInMillis}` — no volume/OI for futures (`cum_volume` stays 0). A
@@ -521,6 +539,10 @@ truncated); any new Groww connection; any Groww historical fetch (§33); resolvi
 anything but the static master CSV. (The pre-2026-07-10 single-expiry-per-underlying ban is
 REMOVED by this dated §36.7 edit.) This file must be edited FIRST with a fresh dated quote
 for any of the above.
+
+> **2026-07-13 note:** "any Groww historical fetch (§33)" reads: any Groww historical fetch
+> OUTSIDE the §38 per-minute scheduled grant. The §36 watch-set/expiry machinery itself
+> still makes no Groww REST call.
 
 ---
 
@@ -560,6 +582,11 @@ S3 cold-archive KEEP row — see the 2026-07-12 KEEP row added there). The new w
 `aws-sdk-s3` (exact pin, same feature set as the sibling aws-sdk-* pins) is authorized by
 Quote 1 as the read mechanism (flagged in the PR for the operator's visibility per the
 CLAUDE.md new-dep approval rule).
+
+> **2026-07-13 note:** "TickVault makes ZERO Groww API historical calls" narrows: zero
+> BULK/backtest Groww API calls remains true, but since 2026-07-13 the §38 per-minute
+> SCHEDULED pulls (spot 1m + option chain + bounded per-contract 1m) are the sole exception.
+> §33 stands for the Groww API surface outside the §38 grant.
 
 ## §37.2 The comparison contract (LOCKED)
 
@@ -626,7 +653,7 @@ current-state row per instrument, ts pinned):
 
 ## §37.6 What a violating PR looks like (REJECT)
 
-- Any Groww API historical/candle fetch from TickVault (§33 stands).
+- Any Groww API historical/candle fetch from TickVault OUTSIDE the §38 grant (2026-07-13 narrowing: §38's per-minute SCHEDULED pulls are the sole authorized exception — §33 stands for every other Groww fetch, incl. all bulk/backtest sweeps).
 - Any module/type named `backtest` / `BacktestSource` (§33.2 naming ban stands — the
   consumer is `brutex_crossverify`).
 - Reviving SP5–SP7 of the cancelled parity plan.
@@ -644,3 +671,263 @@ must update THIS §37 first with a fresh dated quote.
 Always loaded. Reinforced on any session editing `crates/app/src/brutex_crossverify*`,
 `crates/storage/src/brutex_crossverify*`, the `[brutex_crossverify]` config section, or any
 file containing `BRUTEX-XVERIFY` or `brutex_crossverify`.
+
+---
+
+# §38 — Groww per-minute REST pipeline: spot 1m + option chain + per-contract 1m (operator authorization 2026-07-13)
+
+> **Authority:** this section PARTIALLY SUPERSEDES §33 (see the dated banner on §33's header
+> and the dated notes on §33.1/§33.2/§33.4/§33.5). It re-authorizes exactly ONE narrow
+> Groww-fetch class — PER-MINUTE SCHEDULED in-session REST pulls mirroring the Dhan
+> `no-rest-except-live-feed-2026-06-27.md` §8 pipeline — and NOTHING else. §33's ban on bulk
+> Groww historical / backtest fetching otherwise stands. The 2-Dhan-WS lock (§3), the
+> shared-table model + feed-in-key, default-OFF per-feed toggles, the token-minter lock
+> (`groww-shared-token-minter-2026-07-02.md`), and the §4/§32.4/§36.3 REJECT conditions all
+> stand unchanged; the §37.6 REJECT conditions stand EXCEPT the historical-fetch bullet,
+> which this §38 grant narrows (per-minute scheduled pulls are the sole exception — reworded
+> in place with a dated 2026-07-13 qualifier).
+> **Cross-ref:** `no-rest-except-live-feed-2026-06-27.md` §9 (the same-day KEEP-class rows +
+> grant); companion plan `.claude/plans/active-plan-groww-rest-1m.md` (APPROVED 2026-07-13).
+
+## §38.0 The verbatim operator authorization (2026-07-13, relayed verbatim via the coordinator session — preserve exactly, typos included)
+
+**Quote 1 (the directive):**
+> "can we implement the same Groww one min fetch which is precisely very similar to the same Dhan — REST api pull ohlcv entirely and even then instantly option chain api also... for Groww live feed and now we planned to add this live REST which is very similar to Dhan. That's it."
+
+**Quote 2 (latency visibility):**
+> "always clearly note within a second — or within how many seconds precisely — we are fetching this live real OHLCV, along with the option chain API."
+
+**Context 3 (verbatim intent, not a quote — labeled as such):** the purpose is backtest↔live
+parity of the operator's fill model. BruteX backtests on Groww 1-minute candles with a
+worst-case fill rule: signal on the current candle → fill at the NEXT minute's worst-case
+high/low, for BOTH the underlying AND the option leg. Live must recreate exactly that combo
+from the same data source; therefore per-contract 1m candles for selected option contracts
+are in scope (the chain endpoint serves strike discovery/liquidity), and the close-to-data
+latency measurement is load-bearing (the signal→next-minute-fill window depends on it).
+
+## §38.1 The grant — one paragraph
+
+PER-MINUTE SCHEDULED pulls only, in-session ([09:15, 15:30) IST trading days, the Dhan §8
+fire pattern): (a) **spot 1m** — the 3 indices (NIFTY / BANKNIFTY on NSE, SENSEX on BSE,
+segment CASH; **+ INDIA VIX since 2026-07-13 — runtime-resolved, SPOT ONLY, per §38.7**) via `GET https://api.groww.in/v1/historical/candles`
+(`candle_interval="1minute"`, `groww_symbol` identity), one day-granular
+`start_time`/`end_time` window per fire with client-side target-minute filtering (the
+Dhan-#1499 lesson — never an undocumented sub-minute window); (b) **option chain** — the
+SAME 3 underlyings' CURRENT expiry (resolved from the already-ingested daily Groww
+instruments CSV — never guessed, zero extra rate cost) via
+`GET /v1/option-chain/exchange/{exchange}/underlying/{underlying}?expiry_date=...`,
+sequenced after the spot leg; (c) **per-contract 1m** — the same `/v1/historical/candles`
+endpoint with `segment=FNO` for a BOUNDED selected set of active option contracts (selection
+fed by the chain snapshot / instruments master; envelope cap on contracts per minute). The
+bulk-history / backtest-fetch ban of §33 OTHERWISE STANDS — no 30-day sweeps, no past-day
+backfills beyond the one-minute-lookback and 15:31 post-session sweep patterns (the Dhan
+PR #1499 pattern, pending merge), no `BacktestSource`/`backtest` naming. Cold-path scheduled
+tasks only; the live WS capture chain, the tick hot path, and the Dhan legs are untouched.
+
+## §38.2 The locked contract table
+
+| Aspect | Locked value |
+|---|---|
+| Endpoints | `GET api.groww.in/v1/historical/candles` (`candle_interval="1minute"`, day-granular `start_time`/`end_time` in `yyyy-MM-dd HH:mm:ss` (IST Assumed — Indian-exchange convention, confirm live), target-minute filtered client-side) + `GET api.groww.in/v1/option-chain/exchange/{e}/underlying/{u}?expiry_date=YYYY-MM-DD` |
+| Identity | the CANDLE legs (spot + contracts) take `groww_symbol`: indices `NSE-NIFTY` / `NSE-BANKNIFTY` / `BSE-SENSEX` (segment CASH); contracts `NSE-NIFTY-04Jan24-19200-CE`-shape (segment FNO). The CHAIN endpoint's `underlying` path param is the PLAIN symbol (`NIFTY` / `BANKNIFTY` / `SENSEX`), NOT groww_symbol. Persisted `security_id` = the SAME ids the Groww live lane uses (`stable_index_security_id` indices; `exchange_token` contracts) |
+| Token | shared-minter SSM READ-ONLY via the existing `fetch_groww_access_token` (`/tickvault/<env>/groww/access-token`) — NEVER minted, never logged, never in URLs; `Authorization: Bearer <token>` + `x-api-version: 1.0`. The token's ~06:00 IST daily expiry is OFFICIALLY documented (upgraded from assumption, 2026-07-13 docs research); the bruteX minter Lambda re-mints ~06:05 IST |
+| Tables | SAME shared tables + feed-in-key: `spot_1m_rest` + `option_chain_1m` tagged `feed='groww'` (their DEDUP keys already carry `feed`); the per-contract leg gets ONE new table (proposal `option_contract_1m_rest`) with `feed` in its DEDUP key + retention registration. NEVER `ticks` / `candles_*` / `historical_candles` |
+| Expiry source | the already-ingested daily Groww instruments CSV (nearest expiry ≥ today; never-roll) — no new expiry REST endpoint |
+| Rate budget | ~6–12 requests/min in-session against the documented Live Data 10/sec + 300/min type bucket (the `/historical/*` + `/option-chain/*` bucket is UNNAMED in the docs → conservatively assumed Live Data); own min-gap pacing on the chain/contract legs |
+| Latency mandate (Quote 2) | per-fetch close-to-data latency stored PER-ROW + histograms (`tv_groww_spot1m_close_to_data_ms` / `tv_groww_chain1m_close_to_data_ms`) + a plain-English daily digest/scorecard line per feed per leg |
+| Config gates | `[groww_spot_1m]` / `[groww_option_chain_1m]` / the contract-leg section — all serde default OFF; base.toml opts in per leg; the chain leg's DEFAULT stayed OFF pending first-live-session verification + a dated note — **verified + flipped ON in base.toml 2026-07-13 after the live probe PASSED (§38.6; the serde DEFAULT stays OFF)** |
+
+## §38.3 Honest envelope (mandatory per §5 / operator-charter §F)
+
+> "100% inside the tested envelope, with ratcheted regression coverage: bounded scheduled
+> fetchers with per-request timeouts, per-leg hard budgets, discard-pending persist defense,
+> DEDUP-idempotent re-fetch, and edge-triggered pagers. NOT claimed: just-closed-minute
+> freshness — Groww documents NO availability delay for the sealing minute, so it is
+> UNVERIFIED-LIVE; we NEVER assert 'within a second' — we MEASURE and SHOW the number
+> (per-row latency columns + histograms + the daily digest line, per Quote 2). The V2
+> candle timestamp type and the endpoints' rate bucket are also UNVERIFIED-LIVE (first live
+> session is the probe; defensive dual-format parse; 429s counted, never out-polled).
+> Neither side is ground truth per the §37 doctrine — TickVault carries the known
+> tick-conservation residual, Groww's candle store carries vendor-fill/sealing fluctuation —
+> the parity comparison separates expected fluctuation from real divergence and never
+> assumes live is correct. Capacity verdict (2026-07-13 docs research): the rate buckets are
+> TYPE-LEVEL POOLED (exhausting one API throttles the whole type; Orders changed 15→10
+> between Dec'25 and Mar'26 — numbers CAN change, re-verify on the box), Groww documents NO
+> Retry-After/ban/cooldown for 429 and the SDK ships ZERO client-side throttling — pacing
+> (minute-boundary bursts spread to ≤6 req/s against the shared 10/s ceiling) and timeouts
+> are entirely ours; worst-case ~18 req/min ≈ 6% of the 300/min budget solo, ~66% with
+> in-session BruteX co-tenancy — still inside."
+
+## §38.4 What a violating PR looks like (REJECT)
+
+- Any BULK Groww historical / backtest fetch (multi-day sweeps, 30-day windows consumed as
+  history, past-day backfills beyond the one-minute-lookback / 15:31-sweep patterns) — §33
+  stands for everything outside the per-minute scheduled shape.
+- Any module/type named `backtest` / `BacktestSource` (§33.2 naming ban stands).
+- Any UNBOUNDED or tighter-than-per-minute polling, or exceeding the shared Live Data
+  10/sec + 300/min budget share (BruteX shares the same token's bucket).
+- Minting a Groww token, caching one past an auth failure, or reading the credential params
+  (token-minter lock 2026-07-02).
+- Writing any leg's output to `ticks` / `candles_*` / `historical_candles`, or omitting
+  `feed` from a DEDUP key.
+- Touching GDF in the name of this grant (GDF is a separate parked trial —
+  `gdf-third-feed-scope-2026-07-13.md`).
+- Shipping the chain leg DEFAULT-ON before first-live-session verification AND a fresh dated
+  quote recorded here.
+- Any hot-path / WS-read-loop / strategy / order involvement (cold-path only; §28 boundary).
+- Extending scope (a 4th index, stocks, non-current expiries, an unbounded contract set)
+  without a fresh dated quote HERE first.
+
+Any such PR MUST be rejected in review even if the operator approves verbally — the operator
+must update THIS §38 first with a fresh dated quote.
+
+## §38.5 Trigger (auto-loaded)
+
+Always loaded. Reinforced on any session editing `crates/app/src/groww_spot_1m*`,
+`crates/app/src/groww_option_chain_1m*`, `crates/app/src/groww_contract_1m*`,
+`crates/storage/src/option_contract_1m_rest*`, the `[groww_spot_1m]` /
+`[groww_option_chain_1m]` config sections, or any file containing `groww_spot_1m`,
+`groww_option_chain_1m`, `option_contract_1m_rest`, `v1/historical/candles`,
+`v1/option-chain`, `tv_groww_spot1m_close_to_data_ms`, or `tv_groww_chain1m_close_to_data_ms`.
+
+## §38.6 — 2026-07-13: chain-leg first-live verification PASSED → `[groww_option_chain_1m].enabled` flips to true in base.toml (dated note)
+
+**Live-probe evidence (Verified, prod box, build `eeca0ec`, ~11:47 PM IST 2026-07-13 —
+the operator's Telegram probe report, relayed verbatim via the coordinator session):**
+the boot-time Groww chain probe (`run_groww_chain_1m_probe`, the probe-only path this
+grant shipped DEFAULT-OFF) hit the live `GET /v1/option-chain/...` endpoint for all 3
+underlyings' current expiry and PASSED:
+
+| Underlying | Strikes | Contract prices | Fetch time | Payload |
+|---|---|---|---|---|
+| NIFTY | 99 | 198 | 0.2s | 36 KB |
+| BANKNIFTY | 172 | 344 | 0.2s | 64 KB |
+| SENSEX | 189 | 378 | 0.2s | 69 KB |
+
+The probe report closed with: *"recording currently switched OFF — to start, turn ON the
+setting and restart."*
+
+**Authorization (coordinator-relayed operator directive, 2026-07-13):** the operator
+directed enabling the chain leg TONIGHT so that tomorrow's session records option chains
+from the first in-session minute close (09:16 IST). Per that directive, and mirroring the
+Dhan precedent exactly (`no-rest-except-live-feed-2026-06-27.md` §8.7),
+`config/base.toml [groww_option_chain_1m].enabled` flips `false → true` in the PR carrying
+this note. This satisfies BOTH conditions of the §38.4 REJECT row ("Shipping the chain leg
+DEFAULT-ON before first-live-session verification AND a fresh dated quote recorded here"):
+the first-live verification is the probe evidence above, and this dated note is the quote
+record — recorded HERE first, in the same PR as the flip.
+
+**What stays unchanged (fail-safe posture, the Dhan §8.7 shape):** the serde DEFAULT in
+`crates/common/src/config.rs` stays OFF (an absent `[groww_option_chain_1m]` section still
+means disabled); `probe_and_report` stays `true` (inert while enabled; the automatic
+fallback canary on any rollback to `enabled = false`); everything else in the §38.2 scope
+table — 3 underlyings, current expiry only, per-minute cadence sequenced after the spot
+leg, `option_chain_1m` table only (`feed='groww'`), the shared Live Data budget share —
+is UNCHANGED.
+
+**Honest caveat (§38.3 discipline):** the probe proves ENTITLEMENT + response SHAPE +
+fetch SPEED with the market CLOSED (~11:47 PM IST). It does NOT prove in-session
+just-closed-minute freshness or per-minute delivery under load — those are MEASURED from
+the first enabled session onward via the per-row `close_to_data_ms` column + the
+`tv_groww_chain1m_close_to_data_ms` histogram (Quote 2), and any in-session problem
+surfaces through the leg's own edge-triggered paging (the CHAIN-02-class 3-minute
+escalation + the coded per-minute failure logs — see
+`rest-1m-pipeline-error-codes.md`), never a silent gap.
+
+## §38.7 — 2026-07-13: INDIA VIX joins the Groww per-minute SPOT leg (3 → 4 targets; SPOT ONLY)
+
+**The operator scope (2026-07-13, verbatim intent, relayed via the coordinator
+session):** add India VIX to the per-minute spot pull on the Groww leg; resolve the
+correct Groww exchange/segment/groww_symbol for the VIX index from the Groww master — do
+NOT guess the literal; same fetch machinery; per-SID independence (VIX failing can never
+delay the other 3); volume 0/absent expected; whether Groww's historical-candles endpoint
+serves India VIX is a live-probe unknown — persistent reject/empty = named forensics rows
++ one coalesced page ("VIX not served by Groww"), never silent.
+
+**The grant — one paragraph:** the Groww spot leg (`groww_spot_1m_boot.rs`) fetches a
+4th index — **INDIA VIX** — each in-session minute close, through the SAME bounded
+ladder / budget / backfill / sweep / forensics machinery as the 3 core indices. SPOT
+ONLY: no chain leg, no contracts (the chain stays 3 underlyings — the
+`GROWW_CHAIN_1M_UNDERLYINGS` arity guard is annotated, unchanged). The VIX identity is
+**RUNTIME-resolved, never guessed**: at each fire until resolved, the leg reads the day's
+watch file (`data/groww/groww-watch-<date>.json` — the ingested Groww master product) and
+matches an `index_value` entry whose `exchange_token` OR display `symbol_name`
+canonicalizes (the house `canonicalize_index_symbol` path, with the new additive
+`INDIAVIX → INDIA VIX` alias grounded in the live 2026-06-28 master capture:
+token `INDIAVIX`, name "India Vix") to the allowlisted `INDIA VIX`; the entry's
+`index_name` (the groww_symbol) + exchange + segment become the candles-query identity
+and `stable_index_security_id(groww_symbol)` the persisted id (cross-checked against the
+entry's own id — derivation drift refuses). Unresolved (watch file absent / no VIX row)
+= fail-SOFT: one edge-latched coded warn (`SPOT1M-01`, `stage="vix_unresolved"`) + the
+per-attempt `tv_groww_spot1m_vix_unresolved_total` counter + VIX skipped for the day —
+the 3 core targets are NEVER blocked.
+
+**Per-SID independence + escalation-edge keying (implemented as CORE-keyed):** each
+target runs its own hard-budgeted ladder sequentially (budget re-derived 18 s → 14 s so
+4 × budget + the fire delay still finishes inside the minute — const-asserted), so a VIX
+stall can never starve the core 3. The 3-consecutive-minutes escalation page keys on the
+**ORIGINAL 3 core indices** (`MinuteEdgeTally` — core fetch ok + core/shared persist
+only): a VIX-only failure (fetch, empty, or VIX row append) NEVER pages the leg, while
+core-all-failed still pages even when VIX alone succeeded; a shared ILP flush failure
+pages (core rows are lost too).
+
+**VIX-not-served visibility:** every VIX minute gets the normal per-minute
+`rest_fetch_audit` forensics row (outcome named — `ok`/`empty`/`error`/`no_token`/
+`named_gap`, never silent) + the VIX-specific `tv_groww_spot1m_vix_empty_total` counter
+on 2xx-without-the-minute. At the once-per-session 15:31 sweep, ZERO persisted VIX
+minutes while ≥1 core index persisted fires ONE coalesced coded warn per day
+(`SPOT1M-01`, `stage="vix_not_served"`: "India VIX not served by Groww
+historical-candles — named gap rows written; other-broker coverage unaffected") +
+`tv_groww_spot1m_vix_not_served_total`. Delivery boundary (honest): the SPOT1M codes are
+log-sink-only per `rest-1m-pipeline-error-codes.md` §3 — the daily warn is the coalesced
+signal, not a Telegram page; wiring a typed event/CloudWatch filter is a flagged
+follow-up.
+
+**Honest envelope (§38.3 discipline):** whether Groww's historical-candles endpoint
+SERVES India VIX at all is UNVERIFIED-LIVE — the first enabled session is the probe, and
+the counters + daily latch above are the measured answer either way. VIX volume 0/absent
+is EXPECTED (indices are price-only); rows persist `feed='groww'` into the SAME
+`spot_1m_rest` table under the live-lane canonical id, so cross-source joins work by
+construction. The runtime resolution depends on the Groww lane's watch build having run
+(a Groww-disabled session leaves VIX unresolved — fail-soft, counted, warned once).
+
+**What a violating PR looks like (REJECT):** hardcoding a GUESSED VIX groww_symbol
+literal; adding VIX (or any index) to the chain/contract legs under cover of this grant;
+letting a VIX failure feed the core escalation edge or block/reorder the core fetches; a
+5th spot index without a fresh dated quote HERE first.
+
+## §38.8 The decision-freshness gate (operator verbatim-intent, 2026-07-13 — recorded with PR-4)
+
+**Operator verbatim-intent (2026-07-13, relayed via the coordinator
+session — labeled as intent, not a literal quote):**
+> "we cannot rely on backfill — within the particular second or few
+> seconds it should definitely be pulled for TRADING DECISIONS; we need
+> precise filling."
+
+**The rule (binding on every future consumer of the §38 REST tables):**
+
+1. **Backfill and sweep repairs are RECORD-COMPLETENESS ONLY** — they
+   exist for backtest parity, cross-verification and audit. A
+   backfilled/swept row is NEVER a trading-decision input: the fill-model
+   window (signal on minute M → fill at minute M+1's worst-case) only
+   works when M's data arrived within seconds of M's close.
+2. **Any future strategy consumer of `spot_1m_rest` / `option_chain_1m`
+   / `option_contract_1m_rest` MUST fail closed on staleness:** a row
+   whose retrieval was older than a configured freshness threshold ⇒ NO
+   trade for that minute — never a trade on late data, never a guessed
+   fill.
+3. **Stale rows are mechanically distinguishable TODAY** — no schema
+   change is needed when a consumer arrives: every row carries
+   `close_to_data_ms` (own-fire rows measure ~1-2 s; a
+   backfilled/swept row carries its REAL ≥ 60 s delay — the #1499
+   semantics split), and the `rest_fetch_audit` row's outcome names the
+   recovery path (`ok` repaired-late vs the own-fire `ok`).
+4. **No strategy code ships under this gate** — the §28
+   indicators/strategies boundary stands; wiring any of these tables
+   into a decision path needs its own dated operator scope FIRST.
+
+(Numbered §38.8 — §38.5 is the Trigger, §38.6 is the chain-flip dated
+note, and §38.7 is the VIX spot-leg grant, all of which predate this
+subsection on `main`.) Mirrored (one
+paragraph each) into `no-rest-except-live-feed-2026-06-27.md` §9 and
+`rest-1m-pipeline-error-codes.md` §3.

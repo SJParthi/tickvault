@@ -19,6 +19,18 @@
 
 ---
 
+> **⚠ 2026-07-13 — DHAN LEG RETIRED; GROWW LEG STANDS:** the Dhan live WS is retired
+> (operator directive 2026-07-13, `websocket-connection-scope-lock.md` "2026-07-13
+> Amendment"), so the §36 grant's DHAN subscription leg (the ~08:45 daily-universe build,
+> the Dhan FUTIDX-01 emit site, `record_dhan_selection_from_universe`, the prev-day/
+> cross-verify skip counters) retires with it — deletion lands with the Phase C PRs. The
+> GROWW leg is UNCHANGED (§36.7 all-months, watch-set extraction, Groww FUTIDX-01 arms,
+> cap-priority). Phase C obligation (scope-lock §B): the shared selector
+> `index_futures.rs` must be DE-GATED from the `daily_universe_fetcher` cargo feature or
+> the Groww futures silently drop. `FUTIDX-02` goes structurally DORMANT (below), and the
+> §3 far-month alarm-gate exclusion dies with the tick-gap detector (Q4-ii). Dhan-side
+> content retained for historical audit.
+
 ## §0. Why these codes exist
 
 The §36 grant subscribes ALL available monthly-expiry index-futures contracts (`>= today`,
@@ -92,9 +104,19 @@ the distinct-key count).
 
 ## §2. FUTIDX-02 — cross-feed expiry mismatch
 
+> **⚠ DORMANT 2026-07-13 (variant RETAINED, not deleted):** with the Dhan leg retired the
+> comparator is structurally dormant — it fires only when BOTH feeds record a same-date
+> selection (`record_index_future_selection` is order-independent and single-feed runs
+> never fire it, by design), and the Dhan side never records again. The
+> `Futidx02CrossFeedExpiryMismatch` variant, the comparator, and the parity types are
+> KEPT: they are the ready-made cross-feed parity seam for GDF feed #3
+> (`gdf-third-feed-scope-2026-07-13.md` maps cross-feed joins by contract identity, the
+> same key). Re-activation needs no rule edit — a second recording feed re-arms it.
+
 **Severity:** High. **Auto-triage safe:** **No** — hostile-review round 3 (2026-07-08)
 reconciled the enum to the design contract (THIS section + the R3-4 record in
-`.claude/plans/active-plan-futidx-4.md` — the in-repo authority; round 4 (2026-07-08)
+`.claude/plans/archive/2026-07-08-futidx-4.md` — the in-repo authority (archived from
+active 2026-07-13 per plan-enforcement rule 7); round 4 (2026-07-08)
 replaced a dangling scratchpad "FINAL.md D0.5/T3.4" citation that never landed in the
 tree): `is_auto_triage_safe()`
 now carries a severity-independent override arm returning `false` for FUTIDX-02, so ANY

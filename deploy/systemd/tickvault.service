@@ -146,7 +146,19 @@ LimitNPROC=4096
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=/opt/tickvault/data /opt/tickvault/config
+# Docker socket exemption (2026-07-13, deploy-hang fix companion):
+# ProtectSystem=strict mounts the whole hierarchy read-only (except
+# /dev /proc /sys), and connect(2) on a unix socket needs WRITE access to the
+# socket inode — so every `docker …` call made by ExecStartPre
+# (ensure-questdb.sh) fails with EACCES in the SERVICE-USER context while the
+# SAME script works from an SSM/root shell (no sandbox). On a post-nuke boot
+# with no QuestDB container/image that meant the self-heal could never bring
+# QuestDB up → BOOT-02 halt at 08:30. The `-` prefix ignores a missing socket
+# (docker.service not yet up), so this can never fail the unit start; it only
+# widens the sandbox by the docker control socket (ec2-user is already in the
+# docker group — no privilege change). /var/run is a /run symlink; both listed
+# so the exemption holds regardless of which path the CLI resolves.
+ReadWritePaths=/opt/tickvault/data /opt/tickvault/config -/var/run/docker.sock -/run/docker.sock
 PrivateTmp=true
 
 # Graceful shutdown: send SIGTERM, wait 30s, then SIGKILL.

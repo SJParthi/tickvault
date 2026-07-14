@@ -20,6 +20,21 @@
 
 ---
 
+> **⚠ RETIREMENT AUTHORIZED 2026-07-13 (Dhan live WS retired — deletion lands with the
+> Phase C PRs):** the runtime Dhan-lane cold-start FSM this file documents is retired with
+> the Dhan live WS (operator directive 2026-07-13, verbatim in
+> `websocket-connection-scope-lock.md` "2026-07-13 Amendment"). Phase A already refuses the
+> runtime cold-start (raw-TOML gate + the /feeds 409); the Phase C code PRs DELETE the lane
+> (`LaneState` / `start_dhan_lane` / `stop_dhan_lane` / `run_dhan_lane_runtime`) and with it
+> ALL FOUR codes — `DHAN-LANE-01` (`DhanLane01UniverseBuildFailed`; its universe-build
+> emit site dies with the instrument chain per Q3), `DHAN-LANE-02`
+> (`DhanLane02WsPoolSpawnFailed`), `DHAN-LANE-03` (`DhanLane03AuthFailed` — auth-failure
+> visibility for the retained Dhan surface lives on in the `dhan_rest_stack` backoff arms
+> + the existing AUTH-GAP-* codes; no replacement variant), and `DHAN-LANE-04`
+> (`DhanLane04TeardownTimeout`). The order-update WS the lane used to spawn is REWIRED
+> into `dhan_rest_stack` (functional-dormant, operator Q4-i "agreed dude"). Content below
+> retained for historical audit.
+
 ## §0. Why these codes exist (the locked design)
 
 A Dhan feed that was **OFF at boot** has no main-feed WS pool. PR-E's in-loop

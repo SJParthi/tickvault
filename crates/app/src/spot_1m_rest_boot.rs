@@ -4,8 +4,11 @@
 //! Every trading-day minute close in session — the 09:15 candle closes at
 //! 09:16:00 IST; the last (15:29) candle closes at 15:30:00 — this task
 //! wakes shortly after the boundary and fetches THAT just-closed minute's
-//! official 1m OHLCV for the 3 IDX_I spot indices (NIFTY 13, BANKNIFTY 25,
-//! SENSEX 51) via Dhan `POST /v2/charts/intraday` (interval `"1"`), then
+//! official 1m OHLCV for the 4 IDX_I spot indices (NIFTY 13, BANKNIFTY 25,
+//! SENSEX 51, INDIA VIX 21 — VIX per the operator scope addition
+//! 2026-07-13, relayed via the coordinator session: INDIA VIX joins the
+//! spot 1m pull, SPOT ONLY, no option chain) via Dhan
+//! `POST /v2/charts/intraday` (interval `"1"`), then
 //! persists to the `spot_1m_rest` QuestDB table (DEDUP-idempotent — a
 //! re-fetch UPSERTs in place). Cold path ONLY: the WS candle pipeline,
 //! tick capture and trading are untouched.
@@ -19,6 +22,43 @@
 //! retrieval) as the live measurement. A minute whose candle never appears
 //! is `outcome="empty"` — counted, edge-tracked, never silent (Rule 11).
 //!
+//! ## 2026-07-13 live-failure hotfix — proven day window + backfill sweep
+//! The first live session (2026-07-13) failed EVERY minute with
+//! `ok=0/errors=0/empty=3` ("2xx but the minute's candle never appeared"):
+//! the original same-date 60-second request window
+//! (`fromDate = minute open, toDate = open + 60s`) was answered `2xx`
+//! WITHOUT the target candle all session, while the matcher itself was
+//! verified correct (same conversion as the live-proven cross-verify).
+//! Fixes:
+//! 1. **Window**: each fire now sends the ONLY live-proven window shape —
+//!    day-granular `fromDate = D 00:00:00, toDate = D+1 00:00:00` (the
+//!    exact body the 15:31 cross-verify + prev-day fetchers use daily) —
+//!    and filters client-side to the exact minute (over-delivery: a full
+//!    session ≈ 375 candles ≈ 20 KB, far under the 2 MiB body cap).
+//! 2. **Previous-minute backfill**: the full-day response covers earlier
+//!    minutes, so each fire ALSO persists the previous minute when it was
+//!    not successfully persisted (per-SID in-memory [`PersistTracker`];
+//!    DEDUP UPSERT keys make re-appends idempotent). Edge accounting stays
+//!    honest: a fire's verdict is its OWN target minute's fetch+persist —
+//!    a minute that lands only via next-fire backfill was still that
+//!    fire's failure; the backfilled row's `close_to_data_ms` column
+//!    stamps the REAL retrieval delay (> 60 s), while the
+//!    `tv_spot1m_close_to_data_ms` histogram keeps sampling ONLY own-fire
+//!    retrievals (its defined "just-closed availability" semantics).
+//! 3. **Post-session sweep** (M1, review 2026-07-13): the per-minute
+//!    backfill looks back exactly ONE minute, so a minute that stays
+//!    absent for ≥2 consecutive fires — or a backfill row lost to a
+//!    failed flush — stays absent DURING the session; and the 15:30:00
+//!    fire is the last, so a vendor-late 15:29 candle has no in-session
+//!    repair path at all. The one bounded post-session sweep
+//!    (~15:33:30 IST, single fire, [`run_post_session_sweep`]) closes all
+//!    three: it re-fetches the day window once per SID and persists every
+//!    session minute above the watermark that is still missing. The sweep
+//!    fires at 15:33:30 — NOT 15:31 — so its ≤4 requests clear the 15:31
+//!    bulk cross-verify's burst window (2026-07-13 live session: 91/776
+//!    cross-verify fetches 429'd at 15:31–15:33; see the 429-coordination
+//!    follow-up in `rest-1m-pipeline-error-codes.md`).
+//!
 //! **First-attempt timing (honest):** the boundary sleep is computed on a
 //! SECOND-granular clock plus the 300 ms fire delay, so the first attempt
 //! lands anywhere from ~0.3 s to ~1.3 s after the minute close (never a
@@ -30,10 +70,33 @@
 //! into the failure edge — never silent (Rule 11).
 //!
 //! ## Rate budget (Dhan Data-API 5/sec)
-//! One fire = 3 concurrent requests (one per index), plus at most 4 ladder
-//! re-polls per index spread over ~6 s — worst case 3 requests at any one
-//! ladder instant, comfortably inside the 5/sec Data-API budget and the
-//! prev-day fetcher's 4/sec headroom assumption (Q2/Q3 2026-06-23 lesson).
+//! One fire = 4 concurrent requests (one per index), plus at most 4 ladder
+//! re-polls per index spread over ~6 s and staggered by the deterministic
+//! per-SID jitter (0/150/300/450 ms) — worst case 4 requests at the fire
+//! instant, inside the 5/sec Data-API budget (verified for the 2026-07-13
+//! 4-SID arity; re-poll instants never exceed the initial burst).
+//!
+//! ## INDIA VIX (2026-07-13) — live-probe unknown, per-SID independence
+//! Whether Dhan's intraday endpoint serves INDIA VIX 1m candles at all is
+//! a LIVE-PROBE UNKNOWN. Two guarantees keep that honest:
+//! 1. **Per-SID independence** — each SID rides its OWN budgeted ladder in
+//!    its OWN JoinSet task, and the escalation edge's "fully failed" means
+//!    ZERO SIDs succeeded ([`minute_fully_failed`]) — a never-serving VIX
+//!    can never delay, fail, or edge-count a minute where the other 3
+//!    succeeded (unit-pinned below).
+//! 2. **Per-SID persistent-empty detector** ([`SidServedTracker`]) — a SID
+//!    accumulating [`SPOT_1M_REST_SID_NOT_SERVED_THRESHOLD`] consecutive
+//!    empty/failed minutes WHILE ≥1 other SID succeeded in those same
+//!    minutes (vendor-not-serving, NOT a global outage) fires ONE
+//!    edge-latched `SPOT1M-01 stage="sid_not_served"` page per SID
+//!    (re-armed only by that SID's own recovery — one Info ping).
+//!
+//! ## Volume (index candles)
+//! Index candles legitimately carry zero/absent volume — the columnar
+//! parser defaults an absent `volume` to `0` and NOTHING in this module
+//! treats `volume == 0` as an error: a candle is "served" purely by its
+//! presence at the target minute (OHLC), so VIX/index rows with volume 0
+//! persist normally.
 //!
 //! ## Boot wiring (honest answer, module contract)
 //! Spawned from `main.rs::spawn_post_market_tasks` — the SAME seam as the
@@ -42,9 +105,15 @@
 //! boot-symmetry 2026-06-09), so a mid-session crash restart re-arms this
 //! task; the process-global once-guard there prevents duplicates on runtime
 //! Dhan cold-start cycles. BOTH call sites are Dhan-gated — correct here,
-//! because this fetcher is Dhan-REST-dependent (token) — so a Groww-only
-//! session (`dhan_enabled = false`) runs NO spot-1m REST fetch: a
-//! documented limitation, mirroring the rest_canary.
+//! because this fetcher is Dhan-REST-dependent (token).
+//!
+//! **2026-07-13 update (Phase A, Dhan-live-feed removal):** the old
+//! "a Groww-only session runs NO spot-1m REST fetch" limitation is CLOSED —
+//! with `dhan_enabled = false` (now the locked default; the live WS lane is
+//! retired) the Dhan REST-only stack (`crate::dhan_rest_stack`) spawns this
+//! scheduler with its OWN TokenManager, mirroring the
+//! spawn_post_market_tasks shape (same params, same config gate, same
+//! spot→chain sequencing channel).
 //!
 //! ## Lifetime
 //! The task runs today's remaining minute closes and exits after 15:30 IST
@@ -57,25 +126,29 @@
 //! `panic = "abort"`, so a panicked task aborts the PROCESS in prod — the
 //! panic-respawn arm is an unwind-build (dev/test) self-heal path only.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{DateTime, Duration as ChronoDuration, NaiveDate};
 use secrecy::ExposeSecret;
-use serde_json::json;
 use tracing::{error, info, warn};
 
 use tickvault_common::config::QuestDbConfig;
 use tickvault_common::constants::{
-    DHAN_CANDLE_INTERVAL_1MIN, DHAN_CHARTS_INTRADAY_PATH, IST_UTC_OFFSET_SECONDS, SECONDS_PER_DAY,
-    SPOT_1M_REST_CONSECUTIVE_FAIL_PAGE_THRESHOLD, SPOT_1M_REST_FIRE_DELAY_MS,
-    SPOT_1M_REST_FIRE_STALE_GRACE_SECS, SPOT_1M_REST_FIRST_FIRE_SECS_OF_DAY_IST,
-    SPOT_1M_REST_INDICES, SPOT_1M_REST_LAST_FIRE_SECS_OF_DAY_IST, SPOT_1M_REST_MAX_BODY_BYTES,
+    DHAN_CHARTS_INTRADAY_PATH, IST_UTC_OFFSET_SECONDS, SECONDS_PER_DAY,
+    SPOT_1M_REST_429_EXTRA_BACKOFF_MS, SPOT_1M_REST_CONSECUTIVE_FAIL_PAGE_THRESHOLD,
+    SPOT_1M_REST_FIRE_DELAY_MS, SPOT_1M_REST_FIRE_STALE_GRACE_SECS,
+    SPOT_1M_REST_FIRST_FIRE_SECS_OF_DAY_IST, SPOT_1M_REST_INDICES,
+    SPOT_1M_REST_LADDER_JITTER_SLOTS, SPOT_1M_REST_LADDER_JITTER_STEP_MS,
+    SPOT_1M_REST_LAST_FIRE_SECS_OF_DAY_IST, SPOT_1M_REST_MAX_BODY_BYTES,
     SPOT_1M_REST_REQUEST_TIMEOUT_SECS, SPOT_1M_REST_RETRY_OFFSETS_MS, SPOT_1M_REST_SID_BUDGET_SECS,
+    SPOT_1M_REST_SID_NOT_SERVED_THRESHOLD,
 };
 use tickvault_common::error_code::ErrorCode;
 use tickvault_common::sanitize::{capture_rest_error_body, redact_url_params};
 use tickvault_common::trading_calendar::TradingCalendar;
+use tickvault_common::types::SecurityId;
 use tickvault_common::url_join::join_api_url;
 use tickvault_core::auth::token_manager::TokenHandle;
 use tickvault_core::notification::{NotificationEvent, NotificationService};
@@ -84,7 +157,7 @@ use tickvault_storage::spot_1m_rest_persistence::{
     SPOT_1M_REST_SEGMENT_IDX_I, Spot1mRestRow, Spot1mRestWriter, ensure_spot_1m_rest_table,
 };
 
-use crate::cross_verify_1m_boot::{MinuteCandle, parse_intraday_1m_candles};
+use crate::dhan_intraday_parse::{MinuteCandle, intraday_request_body, parse_intraday_1m_candles};
 
 /// Dhan `instrument` enum value for IDX_I index rows.
 const SPOT_1M_INSTRUMENT_INDEX: &str = "INDEX";
@@ -186,46 +259,28 @@ pub fn spot_1m_day_is_over(now_secs_of_day: u32, is_trading_day: bool) -> bool {
     !is_trading_day || now_secs_of_day > SPOT_1M_REST_LAST_FIRE_SECS_OF_DAY_IST
 }
 
-/// `fromDate`/`toDate` datetime strings (`"YYYY-MM-DD HH:MM:SS"`) for ONE
-/// minute: `from` = the minute open, `to` = open + 60 s. Dhan may
-/// over-deliver beyond `toDate` (community-reported intraday behaviour) —
-/// the consumer filters client-side to the exact minute regardless. `None`
-/// only on an impossible seconds-of-day (defensive). Pure.
+/// The `/v2/charts/intraday` request body for ONE index — the PROVEN
+/// day-granular window (`fromDate = D 00:00:00`, `toDate = D+1 00:00:00`),
+/// the EXACT shape the 15:31 cross-verify + prev-day fetchers use live
+/// daily (delegates to the shared [`intraday_request_body`] builder).
+///
+/// 2026-07-13 live-failure hotfix: the original same-date
+/// `[minute open, open + 60s]` window was answered `2xx` WITHOUT the
+/// target candle for EVERY session minute (SPOT1M-01 all day, `empty=3`
+/// per fire) — that window shape was never live-proven. The consumer
+/// filters the full-day response client-side to the exact minute;
+/// over-delivery is ~375 candles ≈ 20 KB, far under the 2 MiB body cap.
+/// Pure.
 #[must_use]
-pub fn minute_window_strings(
-    trading_date: NaiveDate,
-    minute_open_secs_of_day: u32,
-) -> Option<(String, String)> {
-    let open = trading_date.and_hms_opt(
-        minute_open_secs_of_day / 3600,
-        (minute_open_secs_of_day % 3600) / 60,
-        minute_open_secs_of_day % 60,
-    )?;
-    let close = open + ChronoDuration::seconds(60);
-    Some((
-        open.format("%Y-%m-%d %H:%M:%S").to_string(),
-        close.format("%Y-%m-%d %H:%M:%S").to_string(),
-    ))
-}
-
-/// The `/v2/charts/intraday` request body for ONE index and ONE minute
-/// window. `securityId` is a STRING; `interval` is the STRING `"1"`
-/// (historical-data.md rules 4-5). Pure.
-#[must_use]
-pub fn spot_1m_request_body(
-    security_id: &str,
-    from_datetime: &str,
-    to_datetime: &str,
-) -> serde_json::Value {
-    json!({
-        "securityId": security_id,
-        "exchangeSegment": SPOT_1M_REST_SEGMENT_IDX_I,
-        "instrument": SPOT_1M_INSTRUMENT_INDEX,
-        "interval": DHAN_CANDLE_INTERVAL_1MIN,
-        "oi": false,
-        "fromDate": from_datetime,
-        "toDate": to_datetime,
-    })
+pub fn spot_1m_day_request_body(security_id: &str, trading_date: NaiveDate) -> serde_json::Value {
+    let next_day = trading_date.succ_opt().unwrap_or(trading_date);
+    intraday_request_body(
+        security_id,
+        SPOT_1M_REST_SEGMENT_IDX_I,
+        SPOT_1M_INSTRUMENT_INDEX,
+        trading_date,
+        next_day,
+    )
 }
 
 /// IST-wall-clock-as-epoch nanoseconds for a minute open on `trading_date`
@@ -256,15 +311,118 @@ pub fn select_minute_candle(
         .find(|c| c.minute_ts_ist_nanos == target_minute_ist_nanos)
 }
 
-/// Parse a Dhan intraday columnar body and pick the target minute's candle.
-/// Malformed / short / length-mismatched bodies parse to an empty set (the
-/// reused panic-free columnar parser) and therefore yield `None`. Pure.
+/// Parse a Dhan intraday columnar body and pick the target minute's candle
+/// PLUS (when requested) the previous-minute backfill candle from the SAME
+/// full-day body. Malformed / short / length-mismatched bodies parse to an
+/// empty set (the reused panic-free columnar parser) and therefore yield
+/// `(None, None)`. Pure.
 #[must_use]
-pub fn parse_intraday_columnar_for_minute(
+pub fn parse_intraday_columnar_for_minutes(
     body: &str,
     target_minute_ist_nanos: i64,
-) -> Option<MinuteCandle> {
-    select_minute_candle(&parse_intraday_1m_candles(body), target_minute_ist_nanos)
+    backfill_minute_ist_nanos: Option<i64>,
+) -> (Option<MinuteCandle>, Option<MinuteCandle>) {
+    let candles = parse_intraday_1m_candles(body);
+    (
+        select_minute_candle(&candles, target_minute_ist_nanos),
+        backfill_minute_ist_nanos.and_then(|b| select_minute_candle(&candles, b)),
+    )
+}
+
+/// Nanoseconds per minute (backfill arithmetic).
+const NANOS_PER_MINUTE: i64 = 60 * NANOS_PER_SEC;
+
+/// The previous minute to BACKFILL on this fire, or `None` when no backfill
+/// is due: the previous minute must be inside today's session (at or after
+/// the 09:15 open) and must not already be persisted for this SID. One-minute
+/// lookback only — older gaps stay absent (re-fetchable manually; DEDUP
+/// makes any re-append idempotent). Pure.
+#[must_use]
+pub fn backfill_minute_nanos(
+    last_persisted: Option<i64>,
+    target_minute_nanos: i64,
+    session_first_minute_nanos: i64,
+) -> Option<i64> {
+    let prev = target_minute_nanos.saturating_sub(NANOS_PER_MINUTE);
+    (prev >= session_first_minute_nanos && last_persisted.is_none_or(|l| l < prev)).then_some(prev)
+}
+
+/// Post-session sweep instant, IST seconds-of-day: 15:33:30 — after the
+/// last (15:30:00) fire, once the whole session is final. The single
+/// bounded sweep re-fetches the day window ONCE per SID and backfills
+/// every session minute above the persisted watermark that is still
+/// missing (M1, review 2026-07-13: the 15:30:00 fire is the LAST, so a
+/// vendor-late 15:29 candle had no repair path).
+///
+/// 429-coordination (2026-07-13, same-day follow-up): moved from 15:31:00
+/// to 15:33:30 so the sweep's ≤4 requests land AFTER the 15:31 bulk
+/// cross-verify's observed 429 burst window (live session 2026-07-13:
+/// 91/776 cross-verify fetches failed HTTP 429 between 15:31 and 15:33).
+/// The const-assert below pins the sweep strictly clear of that window.
+const SPOT_1M_REST_SWEEP_FIRE_SECS_OF_DAY_IST: u32 = 15 * 3600 + 33 * 60 + 30;
+
+// The sweep must clear the cross-verify burst: at least 150 s after the
+// 15:31:00 cross-verify trigger (burst observed through 15:33), and still
+// comfortably before the 16:30 IST box stop.
+const _: () = assert!(
+    SPOT_1M_REST_SWEEP_FIRE_SECS_OF_DAY_IST
+        >= crate::cross_verify_1m_boot::CROSS_VERIFY_TRIGGER_SECS_OF_DAY_IST + 150,
+    "post-session sweep must clear the 15:31-15:33 cross-verify burst window"
+);
+const _: () = assert!(
+    SPOT_1M_REST_SWEEP_FIRE_SECS_OF_DAY_IST < 16 * 3600 + 30 * 60,
+    "post-session sweep must fire before the 16:30 IST box stop"
+);
+
+/// All session minutes STILL MISSING above the persisted watermark at
+/// sweep time: `(watermark, session_last]` step one minute (the whole
+/// session when nothing was ever persisted). Bounded to ≤375 minutes by
+/// construction. Pure.
+#[must_use]
+pub fn sweep_missing_minutes(
+    last_persisted: Option<i64>,
+    session_first_minute_nanos: i64,
+    session_last_minute_nanos: i64,
+) -> Vec<i64> {
+    let start = match last_persisted {
+        Some(w) => w
+            .saturating_add(NANOS_PER_MINUTE)
+            .max(session_first_minute_nanos),
+        None => session_first_minute_nanos,
+    };
+    let mut out = Vec::new();
+    let mut m = start;
+    while m <= session_last_minute_nanos {
+        out.push(m);
+        m = m.saturating_add(NANOS_PER_MINUTE);
+    }
+    out
+}
+
+/// Per-SID latest successfully PERSISTED minute (append + flush confirmed).
+/// Drives the previous-minute backfill sweep; commits are max-merge so a
+/// double persist of the same minute (DEDUP-idempotent server-side) never
+/// regresses the watermark. In-memory only — a restart re-fills via the
+/// backfill sweep's one-minute lookback.
+#[derive(Debug, Default)]
+pub struct PersistTracker {
+    committed: HashMap<SecurityId, i64>,
+}
+
+impl PersistTracker {
+    /// The latest persisted minute (IST nanos) for this SID, if any.
+    #[must_use]
+    pub fn last_persisted(&self, security_id: SecurityId) -> Option<i64> {
+        self.committed.get(&security_id).copied()
+    }
+
+    /// Commit a persisted minute — max-merge (idempotent; never regresses).
+    pub fn commit(&mut self, security_id: SecurityId, minute_nanos: i64) {
+        let entry = self.committed.entry(security_id).or_insert(minute_nanos);
+        if *entry < minute_nanos {
+            *entry = minute_nanos;
+        }
+    }
 }
 
 /// Sleep DELTAS (ms) between ladder attempts, derived from the constant
@@ -279,6 +437,41 @@ pub fn retry_sleep_deltas_ms() -> [u64; 4] {
         o[2].saturating_sub(o[1]),
         o[3].saturating_sub(o[2]),
     ]
+}
+
+/// Deterministic per-SID ladder jitter (ms) for the SID at `slot` in the
+/// pinned [`SPOT_1M_REST_INDICES`] array: `(slot % slots) × step` → 0 /
+/// 150 / 300 / 450 ms for the 4 spot SIDs. The slot (a SID's fixed position in
+/// the const array) is used instead of `sid % 3` because the pinned SIDs
+/// 13/25/51 give `1/1/0` under `% 3` — two of three would still re-poll in
+/// lockstep. NO randomness — deterministic + testable (429-coordination
+/// follow-up 2026-07-13). Pure.
+#[must_use]
+pub fn ladder_jitter_ms(slot: usize) -> u64 {
+    (slot as u64 % SPOT_1M_REST_LADDER_JITTER_SLOTS) * SPOT_1M_REST_LADDER_JITTER_STEP_MS
+}
+
+/// The sleep (ms) before one ladder re-poll: the schedule delta, plus the
+/// per-SID jitter on the FIRST re-poll only (shifting the whole schedule —
+/// later deltas are relative, so the shift carries through), plus the
+/// bounded [`SPOT_1M_REST_429_EXTRA_BACKOFF_MS`] when the PREVIOUS attempt
+/// was rate-limited (HTTP 429) so the next poll never lands straight back
+/// inside Dhan's rate-limit window. Pure — worst-case totals are
+/// const-asserted inside the hard per-SID budget in `constants.rs`.
+#[must_use]
+pub fn ladder_sleep_ms(
+    base_delta_ms: u64,
+    is_first_repoll: bool,
+    jitter_ms: u64,
+    prev_rate_limited: bool,
+) -> u64 {
+    base_delta_ms
+        .saturating_add(if is_first_repoll { jitter_ms } else { 0 })
+        .saturating_add(if prev_rate_limited {
+            SPOT_1M_REST_429_EXTRA_BACKOFF_MS
+        } else {
+            0
+        })
 }
 
 /// IST 12-hour label for a seconds-of-day instant (Telegram commandment 9
@@ -352,6 +545,101 @@ impl FailureEdge {
 }
 
 // ---------------------------------------------------------------------------
+// Pure per-SID not-served detector (2026-07-13 — the INDIA VIX live-probe
+// companion; operator scope addition 2026-07-13, relayed via the
+// coordinator session)
+// ---------------------------------------------------------------------------
+
+/// What the caller must do for ONE SID after recording a minute's per-SID
+/// served verdicts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SidEdgeAction {
+    /// Nothing to page for this SID this minute.
+    None,
+    /// RISING edge: this SID reached
+    /// [`SPOT_1M_REST_SID_NOT_SERVED_THRESHOLD`] consecutive counted
+    /// not-served minutes (each with ≥1 sibling success) — page ONCE
+    /// (High), latched until this SID's own recovery.
+    Page { consecutive: u32 },
+    /// FALLING edge: a paged SID was served again — one Info ping; the
+    /// latch re-arms.
+    Recover { not_served_minutes: u32 },
+}
+
+/// Per-SID persistent-empty state: consecutive COUNTED not-served minutes
+/// + the page latch.
+#[derive(Debug, Default)]
+struct SidServedState {
+    consecutive_not_served: u32,
+    paged: bool,
+}
+
+/// Per-SID "is the vendor serving this index?" tracker. Distinguishes
+/// vendor-not-serving-ONE-index from a global outage:
+///
+/// | This minute, this SID | ≥1 OTHER SID served? | Effect on this SID |
+/// |---|---|---|
+/// | served (own-minute candle retrieved) | — | streak reset; `Recover` if paged |
+/// | not served | yes | streak +1; `Page` once at the threshold |
+/// | not served | no (global outage) | HOLD — neither counts nor resets |
+///
+/// The global-outage HOLD keeps the two signals disjoint: a full outage is
+/// the [`FailureEdge`]'s page, and a mid-streak global blip can neither
+/// inflate nor launder a genuine vendor-not-serving streak. Pure state
+/// machine — unit-tested without a clock. State is per scheduler run
+/// (session-scoped, same envelope as [`FailureEdge`] — a task respawn
+/// restarts the streak).
+#[derive(Debug, Default)]
+pub struct SidServedTracker {
+    per_sid: HashMap<SecurityId, SidServedState>,
+}
+
+impl SidServedTracker {
+    /// Record one fired minute's per-SID served verdicts (`served` = the
+    /// SID's OWN target-minute candle was retrieved this fire) and return
+    /// one action per input SID, index-aligned with `verdicts`.
+    pub fn record_minute(
+        &mut self,
+        verdicts: &[(SecurityId, bool)],
+    ) -> Vec<(SecurityId, SidEdgeAction)> {
+        let any_served = verdicts.iter().any(|&(_, served)| served);
+        verdicts
+            .iter()
+            .map(|&(sid, served)| {
+                let state = self.per_sid.entry(sid).or_default();
+                let action = if served {
+                    let not_served_minutes = state.consecutive_not_served;
+                    let was_paged = state.paged;
+                    state.consecutive_not_served = 0;
+                    state.paged = false;
+                    if was_paged {
+                        SidEdgeAction::Recover { not_served_minutes }
+                    } else {
+                        SidEdgeAction::None
+                    }
+                } else if any_served {
+                    state.consecutive_not_served = state.consecutive_not_served.saturating_add(1);
+                    if !state.paged
+                        && state.consecutive_not_served >= SPOT_1M_REST_SID_NOT_SERVED_THRESHOLD
+                    {
+                        state.paged = true;
+                        SidEdgeAction::Page {
+                            consecutive: state.consecutive_not_served,
+                        }
+                    } else {
+                        SidEdgeAction::None
+                    }
+                } else {
+                    // Global-outage minute (no SID served): HOLD.
+                    SidEdgeAction::None
+                };
+                (sid, action)
+            })
+            .collect()
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Wall-clock helpers (IST)
 // ---------------------------------------------------------------------------
 
@@ -391,7 +679,11 @@ fn fetched_at_ist_nanos_now() -> i64 {
 // Fetch ladder
 // ---------------------------------------------------------------------------
 
-/// One index's per-minute fetch verdict after the bounded ladder.
+/// One index's per-minute fetch verdict after the bounded ladder. Every
+/// arm additionally carries the PREVIOUS-minute backfill candle when the
+/// backfill was due and any 2xx body of the ladder contained it — a fire
+/// whose OWN minute failed can still repair the previous minute (the
+/// vendor-lateness recovery path).
 #[derive(Clone, Debug, PartialEq)]
 enum SidFetchOutcome {
     /// The target minute's candle was retrieved (`close_to_data_ms` =
@@ -399,12 +691,18 @@ enum SidFetchOutcome {
     Found {
         candle: MinuteCandle,
         close_to_data_ms: i64,
+        backfill_candle: Option<MinuteCandle>,
     },
     /// Every attempt got a parseable 2xx but the target minute never
     /// appeared — counted `outcome="empty"`, included in the failure edge.
-    Empty,
+    Empty {
+        backfill_candle: Option<MinuteCandle>,
+    },
     /// The last attempt (transport / non-2xx) failure, bounded + redacted.
-    Failed(String),
+    Failed {
+        reason: String,
+        backfill_candle: Option<MinuteCandle>,
+    },
 }
 
 /// One attempt's typed failure — `rate_limited` is derived from the REAL
@@ -496,26 +794,43 @@ async fn spot_1m_fetch_once(
 }
 
 /// Bounded in-minute re-poll ladder for ONE index: first attempt at the
-/// fire instant, then re-polls at [`SPOT_1M_REST_RETRY_OFFSETS_MS`] until
-/// the target minute's candle appears — after the last offset the minute
-/// is `Empty`/`Failed`, never an unbounded in-minute retry (DH-904/429
-/// counts via the REAL `StatusCode` + falls out of the ladder like any
-/// other error). The WHOLE ladder is additionally hard-bounded by
-/// [`SPOT_1M_REST_SID_BUDGET_SECS`] in [`fetch_minute_bounded`] so no
-/// stall combination can overrun the minute (2026-07-12 H2 fix).
+/// fire instant, then re-polls at [`SPOT_1M_REST_RETRY_OFFSETS_MS`] (the
+/// whole schedule shifted by the deterministic per-SID `jitter_ms` so the
+/// 3 SIDs never re-poll in lockstep) until the target minute's candle
+/// appears — after the last offset the minute is `Empty`/`Failed`, never
+/// an unbounded in-minute retry. DH-904/429 counts via the REAL
+/// `StatusCode` AND adds the bounded extra backoff before the NEXT rung
+/// ([`ladder_sleep_ms`]) — same rung count, never an extra retry
+/// (429-coordination follow-up 2026-07-13). The WHOLE ladder is
+/// additionally hard-bounded by [`SPOT_1M_REST_SID_BUDGET_SECS`] in
+/// [`fetch_minute_bounded`] so no stall combination can overrun the
+/// minute (2026-07-12 H2 fix).
+#[allow(clippy::too_many_arguments)] // APPROVED: private ladder — a struct would be pure ceremony
 async fn fetch_minute_with_ladder(
     client: &reqwest::Client,
     url: &str,
     jwt: &secrecy::SecretString,
     body: &serde_json::Value,
     target_minute_ist_nanos: i64,
+    backfill_minute_ist_nanos: Option<i64>,
     minute_close_ms_of_day: i64,
+    jitter_ms: u64,
 ) -> SidFetchOutcome {
     let deltas = retry_sleep_deltas_ms();
     let mut last_error: Option<String> = None;
+    let mut prev_rate_limited = false;
+    // Sticky: the FIRST 2xx body carrying the due backfill minute wins —
+    // preserved across rungs and across a failing own-minute verdict.
+    let mut backfill_found: Option<MinuteCandle> = None;
     for attempt in 0..=deltas.len() {
         if attempt > 0 {
-            tokio::time::sleep(Duration::from_millis(deltas[attempt - 1])).await;
+            let sleep_ms = ladder_sleep_ms(
+                deltas[attempt - 1],
+                attempt == 1,
+                jitter_ms,
+                prev_rate_limited,
+            );
+            tokio::time::sleep(Duration::from_millis(sleep_ms)).await;
         }
         let started = std::time::Instant::now();
         let result = spot_1m_fetch_once(client, url, jwt.expose_secret(), body).await;
@@ -523,32 +838,47 @@ async fn fetch_minute_with_ladder(
             .record(started.elapsed().as_secs_f64() * 1_000.0);
         match result {
             Ok(body_text) => {
-                if let Some(candle) =
-                    parse_intraday_columnar_for_minute(&body_text, target_minute_ist_nanos)
-                {
+                let (target, backfill) = parse_intraday_columnar_for_minutes(
+                    &body_text,
+                    target_minute_ist_nanos,
+                    backfill_minute_ist_nanos,
+                );
+                if backfill_found.is_none() {
+                    backfill_found = backfill;
+                }
+                if let Some(candle) = target {
                     let close_to_data_ms =
                         (ist_millis_of_day_now() - minute_close_ms_of_day).max(0);
                     return SidFetchOutcome::Found {
                         candle,
                         close_to_data_ms,
+                        backfill_candle: backfill_found,
                     };
                 }
                 // 2xx without the target minute — the seal may not have
                 // landed yet; the next ladder rung re-polls.
                 last_error = None;
+                prev_rate_limited = false;
             }
             Err(failure) => {
                 if failure.rate_limited {
-                    // DH-904 class: counted; NEVER retried past the ladder.
+                    // DH-904 class: counted; the NEXT rung waits the extra
+                    // bounded backoff; NEVER retried past the ladder.
                     metrics::counter!("tv_spot1m_rate_limited_total").increment(1);
                 }
+                prev_rate_limited = failure.rate_limited;
                 last_error = Some(failure.msg);
             }
         }
     }
     match last_error {
-        Some(reason) => SidFetchOutcome::Failed(reason),
-        None => SidFetchOutcome::Empty,
+        Some(reason) => SidFetchOutcome::Failed {
+            reason,
+            backfill_candle: backfill_found,
+        },
+        None => SidFetchOutcome::Empty {
+            backfill_candle: backfill_found,
+        },
     }
 }
 
@@ -557,13 +887,16 @@ async fn fetch_minute_with_ladder(
 /// failure for the minute — the fire can never overrun the next boundary
 /// (the const-asserts in `constants.rs` pin the budget < 60 s including
 /// the per-request timeout).
+#[allow(clippy::too_many_arguments)] // APPROVED: private budget wrapper over the ladder — same rationale
 async fn fetch_minute_bounded(
     client: &reqwest::Client,
     url: &str,
     jwt: &secrecy::SecretString,
     body: &serde_json::Value,
     target_minute_ist_nanos: i64,
+    backfill_minute_ist_nanos: Option<i64>,
     minute_close_ms_of_day: i64,
+    jitter_ms: u64,
 ) -> SidFetchOutcome {
     match tokio::time::timeout(
         Duration::from_secs(SPOT_1M_REST_SID_BUDGET_SECS),
@@ -573,7 +906,9 @@ async fn fetch_minute_bounded(
             jwt,
             body,
             target_minute_ist_nanos,
+            backfill_minute_ist_nanos,
             minute_close_ms_of_day,
+            jitter_ms,
         ),
     )
     .await
@@ -581,9 +916,12 @@ async fn fetch_minute_bounded(
         Ok(outcome) => outcome,
         Err(_elapsed) => {
             metrics::counter!("tv_spot1m_sid_budget_exceeded_total").increment(1);
-            SidFetchOutcome::Failed(format!(
-                "ladder budget exceeded ({SPOT_1M_REST_SID_BUDGET_SECS}s) — peer stalling"
-            ))
+            SidFetchOutcome::Failed {
+                reason: format!(
+                    "ladder budget exceeded ({SPOT_1M_REST_SID_BUDGET_SECS}s) — peer stalling"
+                ),
+                backfill_candle: None,
+            }
         }
     }
 }
@@ -629,6 +967,11 @@ pub async fn run_spot_1m_rest(params: Spot1mRestTaskParams) {
     };
     let mut writer = Spot1mRestWriter::new(&params.questdb);
     let mut edge = FailureEdge::default();
+    // 2026-07-13 VIX companion: per-SID vendor-not-serving detector.
+    let mut sid_tracker = SidServedTracker::default();
+    // 2026-07-13 backfill sweep: per-SID latest PERSISTED minute — drives
+    // the previous-minute repair on every fire.
+    let mut tracker = PersistTracker::default();
     // H1 (2026-07-12): the last boundary actually HANDLED (fired or
     // skipped-stale) — the next fire is always STRICTLY after it, so a
     // fast-completing fire can never re-fire the same boundary second.
@@ -648,7 +991,11 @@ pub async fn run_spot_1m_rest(params: Spot1mRestTaskParams) {
         }
         let now = ist_secs_of_day_now();
         let Some(fire) = next_fire_after(now, last_fired) else {
-            info!("spot_1m_rest: past 15:30 IST — today's minute fires complete");
+            info!(
+                "spot_1m_rest: past 15:30 IST — today's minute fires complete; \
+                 running the one bounded post-session sweep"
+            );
+            run_post_session_sweep(&client, &url, &params, &mut writer, &mut tracker).await;
             return;
         };
         let sleep_ms =
@@ -679,7 +1026,17 @@ pub async fn run_spot_1m_rest(params: Spot1mRestTaskParams) {
             continue;
         }
 
-        fire_one_minute(&params, &client, &url, &mut writer, &mut edge, fire).await;
+        fire_one_minute(
+            &params,
+            &client,
+            &url,
+            &mut writer,
+            &mut edge,
+            &mut sid_tracker,
+            &mut tracker,
+            fire,
+        )
+        .await;
         // PR-3 sequencing: tell the option-chain leg this minute's spot
         // fire is DONE (success or failure — the chain must never block on
         // a failing spot leg). `send_replace` never errors.
@@ -741,14 +1098,58 @@ fn record_skipped_boundaries(
     }
 }
 
-/// One minute-close fire: 3 concurrent ladder fetches → persist → counters
-/// → edge accounting. Failures are coalesced to ONE coded log per fire.
+/// Build one `spot_1m_rest` row from a parsed candle. The `close_to_data_ms`
+/// stamp is the caller's HONEST retrieval delay (own-fire latency, or the
+/// > 60 s real delay for a backfilled minute).
+fn build_spot_1m_row(
+    candle: &MinuteCandle,
+    security_id: SecurityId,
+    symbol: &'static str,
+    trading_date_nanos: i64,
+    close_to_data_ms: i64,
+) -> Spot1mRestRow {
+    Spot1mRestRow {
+        ts_ist_nanos: candle.minute_ts_ist_nanos,
+        trading_date_ist_nanos: trading_date_nanos,
+        // Unreachable for the pinned 13/25/51 set; a hypothetical overflow
+        // is LOUD + a visible sentinel, never a silent sid=0 (review LOW).
+        security_id: i64::try_from(security_id).unwrap_or_else(|_| {
+            error!(
+                code = ErrorCode::Spot1m02PersistFailed.code_str(),
+                stage = "sid_overflow",
+                security_id,
+                "SPOT1M-02: security_id exceeds i64 — row \
+                 stamped with the i64::MAX sentinel"
+            );
+            i64::MAX
+        }),
+        symbol,
+        open: candle.open,
+        high: candle.high,
+        low: candle.low,
+        close: candle.close,
+        volume: candle.volume,
+        close_to_data_ms,
+        fetched_at_ist_nanos: fetched_at_ist_nanos_now(),
+    }
+}
+
+/// One minute-close fire: 4 concurrent ladder fetches (each carrying the
+/// full-day proven window) → persist the target minute AND the
+/// previous-minute backfill when due → counters → edge accounting.
+/// Failures are coalesced to ONE coded log per fire. Edge honesty: the
+/// verdict is the OWN target minute's fetch + persist — a backfill hit
+/// never counts as this fire's `ok` (a minute that lands only via
+/// next-fire backfill was still that fire's failure).
+#[allow(clippy::too_many_arguments)] // APPROVED: private fire sink over the run loop's owned state — a struct would be pure ceremony
 async fn fire_one_minute(
     params: &Spot1mRestTaskParams,
     client: &reqwest::Client,
     url: &str,
     writer: &mut Spot1mRestWriter,
     edge: &mut FailureEdge,
+    sid_tracker: &mut SidServedTracker,
+    tracker: &mut PersistTracker,
     fire_secs_of_day: u32,
 ) {
     let minute_open_secs = fire_secs_of_day.saturating_sub(60);
@@ -773,40 +1174,51 @@ async fn fire_one_minute(
     // outage must eventually page via the SAME Spot1mFetchDegraded path.
     let mut persist_failed = false;
     let mut sample_failure: Option<String> = None;
+    // Minutes appended this fire, committed to the tracker ONLY after the
+    // flush confirms (a failed flush discards the buffer — never a false
+    // watermark advance).
+    let mut staged: Vec<(SecurityId, i64)> = Vec::new();
+    // 2026-07-13 VIX companion: per-SID served verdicts for THIS minute
+    // (served = the SID's OWN target-minute candle was retrieved). A
+    // join-failed task leaves its SID unrecorded (HOLD); the no-token arm
+    // records nothing (a global miss — the detector deliberately never
+    // counts it).
+    let mut sid_verdicts: Vec<(SecurityId, &'static str, bool)> = Vec::new();
 
     if let Some(jwt) = jwt {
-        let Some((from_dt, to_dt)) = minute_window_strings(trading_date, minute_open_secs) else {
-            // Defensive: impossible seconds-of-day. Counted as a full miss.
-            error_count = SPOT_1M_REST_INDICES.len();
-            sample_failure = Some("internal: minute window build failed".to_string());
-            for _ in 0..error_count {
-                metrics::counter!("tv_spot1m_fetch_total", "outcome" => "error").increment(1);
-            }
-            record_minute_verdict(
-                params,
-                edge,
-                &minute_label,
-                0,
-                error_count,
-                0,
-                false,
-                sample_failure.as_deref(),
-            );
-            return;
-        };
         let target_nanos = minute_open_ist_nanos(trading_date, minute_open_secs);
+        let session_first_nanos =
+            minute_open_ist_nanos(trading_date, SPOT_1M_REST_FIRST_FIRE_SECS_OF_DAY_IST - 60);
         let minute_close_ms = i64::from(fire_secs_of_day).saturating_mul(MILLIS_PER_SEC);
 
         let mut join_set = tokio::task::JoinSet::new();
-        for (security_id, symbol) in SPOT_1M_REST_INDICES {
+        for (slot, (security_id, symbol)) in SPOT_1M_REST_INDICES.into_iter().enumerate() {
             let client = client.clone();
             let url = url.to_string();
             let jwt = jwt.clone();
-            let body = spot_1m_request_body(&security_id.to_string(), &from_dt, &to_dt);
+            // 2026-07-13 hotfix: the PROVEN full-day window (cross-verify /
+            // prev-day shape) — the consumer filters to the exact minute.
+            let body = spot_1m_day_request_body(&security_id.to_string(), trading_date);
+            let backfill_nanos = backfill_minute_nanos(
+                tracker.last_persisted(security_id),
+                target_nanos,
+                session_first_nanos,
+            );
+            // 429-coordination (2026-07-13): deterministic per-SID schedule
+            // shift so the 3 concurrent ladders never re-poll in lockstep.
+            let jitter_ms = ladder_jitter_ms(slot);
             join_set.spawn(async move {
-                let outcome =
-                    fetch_minute_bounded(&client, &url, &jwt, &body, target_nanos, minute_close_ms)
-                        .await;
+                let outcome = fetch_minute_bounded(
+                    &client,
+                    &url,
+                    &jwt,
+                    &body,
+                    target_nanos,
+                    backfill_nanos,
+                    minute_close_ms,
+                    jitter_ms,
+                )
+                .await;
                 (security_id, symbol, outcome)
             });
         }
@@ -820,58 +1232,17 @@ async fn fire_one_minute(
                 }
                 continue;
             };
-            match outcome {
+            // Previous-minute backfill (any outcome arm): persist with the
+            // HONEST real retrieval delay (> 60 s by construction). Never
+            // counted as this fire's `ok` and never sampled into the
+            // own-fire `tv_spot1m_close_to_data_ms` histogram.
+            let (own_outcome, backfill_candle) = match outcome {
                 SidFetchOutcome::Found {
                     candle,
                     close_to_data_ms,
-                } => {
-                    ok_count = ok_count.saturating_add(1);
-                    metrics::counter!("tv_spot1m_fetch_total", "outcome" => "ok").increment(1);
-                    #[allow(clippy::cast_precision_loss)] // APPROVED: histogram sample only
-                    metrics::histogram!("tv_spot1m_close_to_data_ms")
-                        .record(close_to_data_ms as f64);
-                    let row = Spot1mRestRow {
-                        ts_ist_nanos: candle.minute_ts_ist_nanos,
-                        trading_date_ist_nanos: trading_date_nanos,
-                        // Unreachable for the pinned 13/25/51 set; a
-                        // hypothetical overflow is LOUD + a visible
-                        // sentinel, never a silent sid=0 (review LOW).
-                        security_id: i64::try_from(security_id).unwrap_or_else(|_| {
-                            error!(
-                                code = ErrorCode::Spot1m02PersistFailed.code_str(),
-                                stage = "sid_overflow",
-                                security_id,
-                                "SPOT1M-02: security_id exceeds i64 — row \
-                                 stamped with the i64::MAX sentinel"
-                            );
-                            i64::MAX
-                        }),
-                        symbol,
-                        open: candle.open,
-                        high: candle.high,
-                        low: candle.low,
-                        close: candle.close,
-                        volume: candle.volume,
-                        close_to_data_ms,
-                        fetched_at_ist_nanos: fetched_at_ist_nanos_now(),
-                    };
-                    if let Err(err) = writer.append_row(&row) {
-                        persist_failed = true;
-                        metrics::counter!("tv_spot1m_persist_errors_total", "stage" => "append")
-                            .increment(1);
-                        error!(
-                            code = ErrorCode::Spot1m02PersistFailed.code_str(),
-                            stage = "append",
-                            security_id,
-                            ?err,
-                            "SPOT1M-02: spot_1m_rest row append failed"
-                        );
-                        if sample_failure.is_none() {
-                            sample_failure = Some(format!("persist append failed: {err:#}"));
-                        }
-                    }
-                }
-                SidFetchOutcome::Empty => {
+                    backfill_candle,
+                } => (Some((candle, close_to_data_ms)), backfill_candle),
+                SidFetchOutcome::Empty { backfill_candle } => {
                     empty_count = empty_count.saturating_add(1);
                     metrics::counter!("tv_spot1m_fetch_total", "outcome" => "empty").increment(1);
                     if sample_failure.is_none() {
@@ -880,13 +1251,84 @@ async fn fire_one_minute(
                              appeared within the re-poll ladder"
                         ));
                     }
+                    (None, backfill_candle)
                 }
-                SidFetchOutcome::Failed(reason) => {
+                SidFetchOutcome::Failed {
+                    reason,
+                    backfill_candle,
+                } => {
                     error_count = error_count.saturating_add(1);
                     metrics::counter!("tv_spot1m_fetch_total", "outcome" => "error").increment(1);
                     if sample_failure.is_none() {
                         sample_failure = Some(format!("sid {security_id}: {reason}"));
                     }
+                    (None, backfill_candle)
+                }
+            };
+            sid_verdicts.push((security_id, symbol, own_outcome.is_some()));
+            if let Some((candle, close_to_data_ms)) = own_outcome {
+                ok_count = ok_count.saturating_add(1);
+                metrics::counter!("tv_spot1m_fetch_total", "outcome" => "ok").increment(1);
+                #[allow(clippy::cast_precision_loss)] // APPROVED: histogram sample only
+                metrics::histogram!("tv_spot1m_close_to_data_ms").record(close_to_data_ms as f64);
+                let row = build_spot_1m_row(
+                    &candle,
+                    security_id,
+                    symbol,
+                    trading_date_nanos,
+                    close_to_data_ms,
+                );
+                if let Err(err) = writer.append_row(&row) {
+                    persist_failed = true;
+                    metrics::counter!("tv_spot1m_persist_errors_total", "stage" => "append")
+                        .increment(1);
+                    error!(
+                        code = ErrorCode::Spot1m02PersistFailed.code_str(),
+                        stage = "append",
+                        security_id,
+                        ?err,
+                        "SPOT1M-02: spot_1m_rest row append failed"
+                    );
+                    if sample_failure.is_none() {
+                        sample_failure = Some(format!("persist append failed: {err:#}"));
+                    }
+                } else {
+                    staged.push((security_id, candle.minute_ts_ist_nanos));
+                }
+            }
+            if let Some(backfill) = backfill_candle {
+                // Honest delay: the backfilled minute closed 60 s before
+                // this fire's target minute close.
+                let backfill_close_to_data_ms =
+                    (ist_millis_of_day_now() - (minute_close_ms - 60 * MILLIS_PER_SEC)).max(0);
+                let row = build_spot_1m_row(
+                    &backfill,
+                    security_id,
+                    symbol,
+                    trading_date_nanos,
+                    backfill_close_to_data_ms,
+                );
+                if let Err(err) = writer.append_row(&row) {
+                    persist_failed = true;
+                    metrics::counter!("tv_spot1m_persist_errors_total", "stage" => "append")
+                        .increment(1);
+                    error!(
+                        code = ErrorCode::Spot1m02PersistFailed.code_str(),
+                        stage = "append",
+                        security_id,
+                        ?err,
+                        "SPOT1M-02: spot_1m_rest BACKFILL row append failed"
+                    );
+                } else {
+                    metrics::counter!("tv_spot1m_backfilled_total").increment(1);
+                    info!(
+                        security_id,
+                        symbol,
+                        backfill_close_to_data_ms,
+                        "spot_1m_rest: previous minute backfilled from this \
+                         fire's full-day response (DEDUP-idempotent)"
+                    );
+                    staged.push((security_id, backfill.minute_ts_ist_nanos));
                 }
             }
         }
@@ -903,6 +1345,11 @@ async fn fire_one_minute(
             );
             if sample_failure.is_none() {
                 sample_failure = Some(format!("persist flush failed: {err:#}"));
+            }
+        } else {
+            // Flush confirmed — advance the per-SID persisted watermark.
+            for (security_id, minute_nanos) in staged {
+                tracker.commit(security_id, minute_nanos);
             }
         }
     } else {
@@ -925,6 +1372,7 @@ async fn fire_one_minute(
         persist_failed,
         sample_failure.as_deref(),
     );
+    record_sid_served_verdicts(params, sid_tracker, &sid_verdicts, &minute_label);
 }
 
 /// M1 (2026-07-12): the edge's "fully failed" verdict for one fired
@@ -933,6 +1381,248 @@ async fn fire_one_minute(
 #[must_use]
 pub fn minute_fully_failed(ok_count: usize, persist_failed: bool) -> bool {
     ok_count == 0 || persist_failed
+}
+
+/// ONE bounded post-session repair sweep (~15:33:30 IST, single fire —
+/// M1, review 2026-07-13; moved off 15:31 the same day so it clears the
+/// bulk cross-verify's observed 15:31–15:33 429 burst window): once the
+/// session is final, re-fetch the proven
+/// day window ONCE per SID that still has session minutes above its
+/// persisted watermark (the 15:29 candle after a vendor-late seal, a
+/// flush-failed backfill row, any tail gap the per-minute one-minute
+/// lookback could not reach) and persist every one found. Bounded: ≤4
+/// requests total (one per pinned SID since the 2026-07-13 VIX addition),
+/// ≤375 minutes/SID, DEDUP-idempotent re-appends; loud
+/// counters (`tv_spot1m_sweep_backfilled_total` /
+/// `tv_spot1m_sweep_still_missing_total`) + one coalesced coded log; the
+/// swept rows' `close_to_data_ms` column stamps the honest real delay.
+/// The membership filter is O(missing × candles) ≤ 375×375 once per day —
+/// cold path, flagged honestly.
+// TEST-EXEMPT: live-deps async runner — the missing-minute selection (sweep_missing_minutes) and row/window builders are pure fns unit-tested below; the HTTP+persist legs reuse the tested fire_one_minute pattern.
+async fn run_post_session_sweep(
+    client: &reqwest::Client,
+    url: &str,
+    params: &Spot1mRestTaskParams,
+    writer: &mut Spot1mRestWriter,
+    tracker: &mut PersistTracker,
+) {
+    // Wait for the sweep instant (a run reaching here right at 15:30:00
+    // sleeps ~60s; a late boot past 15:31 fires immediately).
+    let now = ist_secs_of_day_now();
+    if now < SPOT_1M_REST_SWEEP_FIRE_SECS_OF_DAY_IST {
+        tokio::time::sleep(Duration::from_secs(u64::from(
+            SPOT_1M_REST_SWEEP_FIRE_SECS_OF_DAY_IST - now,
+        )))
+        .await;
+    }
+    // Same-day defense: a suspend across midnight (seconds-of-day wrapped
+    // below the close) or a day flip means the session data is no longer
+    // "today's" — skip rather than stamp the wrong trading date.
+    let woke = ist_secs_of_day_now();
+    if woke < SPOT_1M_REST_LAST_FIRE_SECS_OF_DAY_IST || !params.calendar.is_trading_day_today() {
+        warn!(
+            woke_at_secs = woke,
+            "spot_1m_rest: post-session sweep woke outside today's session \
+             (midnight wrap / non-trading day) — skipping"
+        );
+        return;
+    }
+    let trading_date = today_ist();
+    let trading_date_nanos = minute_open_ist_nanos(trading_date, 0);
+    let session_first =
+        minute_open_ist_nanos(trading_date, SPOT_1M_REST_FIRST_FIRE_SECS_OF_DAY_IST - 60);
+    let session_last =
+        minute_open_ist_nanos(trading_date, SPOT_1M_REST_LAST_FIRE_SECS_OF_DAY_IST - 60);
+    let jwt: Option<secrecy::SecretString> = {
+        let guard = params.token_handle.load();
+        guard
+            .as_ref()
+            .as_ref()
+            .map(|state| state.access_token().clone())
+    };
+    let Some(jwt) = jwt else {
+        error!(
+            code = ErrorCode::Spot1m01FetchDegraded.code_str(),
+            stage = "sweep_failed",
+            "SPOT1M-01: no access token at post-session sweep time — \
+             missing minutes stay absent (DEDUP-idempotent manual re-run \
+             remains possible)"
+        );
+        return;
+    };
+
+    let mut swept: u64 = 0;
+    let mut still_missing: u64 = 0;
+    let mut staged: Vec<(SecurityId, i64)> = Vec::new();
+    let mut persist_failed = false;
+    for (security_id, symbol) in SPOT_1M_REST_INDICES {
+        let missing = sweep_missing_minutes(
+            tracker.last_persisted(security_id),
+            session_first,
+            session_last,
+        );
+        if missing.is_empty() {
+            continue;
+        }
+        let body = spot_1m_day_request_body(&security_id.to_string(), trading_date);
+        let candles = match spot_1m_fetch_once(client, url, jwt.expose_secret(), &body).await {
+            Ok(body_text) => parse_intraday_1m_candles(&body_text),
+            Err(failure) => {
+                if failure.rate_limited {
+                    metrics::counter!("tv_spot1m_rate_limited_total").increment(1);
+                }
+                error!(
+                    code = ErrorCode::Spot1m01FetchDegraded.code_str(),
+                    stage = "sweep_failed",
+                    security_id,
+                    reason = %failure.msg,
+                    "SPOT1M-01: post-session sweep fetch failed for this SID"
+                );
+                still_missing = still_missing.saturating_add(missing.len() as u64);
+                continue;
+            }
+        };
+        let mut found_for_sid: u64 = 0;
+        for minute_nanos in &missing {
+            let Some(candle) = select_minute_candle(&candles, *minute_nanos) else {
+                still_missing = still_missing.saturating_add(1);
+                continue;
+            };
+            // Honest real retrieval delay for the swept minute.
+            let close_ms_of_day = ((minute_nanos - trading_date_nanos) / NANOS_PER_SEC + 60)
+                .saturating_mul(MILLIS_PER_SEC);
+            let close_to_data_ms = (ist_millis_of_day_now() - close_ms_of_day).max(0);
+            let row = build_spot_1m_row(
+                &candle,
+                security_id,
+                symbol,
+                trading_date_nanos,
+                close_to_data_ms,
+            );
+            if let Err(err) = writer.append_row(&row) {
+                persist_failed = true;
+                metrics::counter!("tv_spot1m_persist_errors_total", "stage" => "append")
+                    .increment(1);
+                error!(
+                    code = ErrorCode::Spot1m02PersistFailed.code_str(),
+                    stage = "append",
+                    security_id,
+                    ?err,
+                    "SPOT1M-02: post-session sweep row append failed"
+                );
+                still_missing = still_missing.saturating_add(1);
+            } else {
+                found_for_sid = found_for_sid.saturating_add(1);
+                staged.push((security_id, *minute_nanos));
+            }
+        }
+        swept = swept.saturating_add(found_for_sid);
+    }
+    if let Err(err) = writer.flush() {
+        persist_failed = true;
+        metrics::counter!("tv_spot1m_persist_errors_total", "stage" => "flush").increment(1);
+        error!(
+            code = ErrorCode::Spot1m02PersistFailed.code_str(),
+            stage = "flush",
+            ?err,
+            "SPOT1M-02: post-session sweep ILP flush failed — pending swept \
+             rows discarded (poisoned-buffer defense)"
+        );
+        still_missing = still_missing.saturating_add(swept);
+        swept = 0;
+    } else {
+        for (security_id, minute_nanos) in staged {
+            tracker.commit(security_id, minute_nanos);
+        }
+    }
+    metrics::counter!("tv_spot1m_sweep_backfilled_total").increment(swept);
+    metrics::counter!("tv_spot1m_sweep_still_missing_total").increment(still_missing);
+    if still_missing > 0 || persist_failed {
+        error!(
+            code = ErrorCode::Spot1m01FetchDegraded.code_str(),
+            stage = "sweep_incomplete",
+            swept,
+            still_missing,
+            persist_failed,
+            "SPOT1M-01: post-session sweep left session minutes absent — \
+             the day's table stays short (DEDUP-idempotent manual re-run \
+             remains possible)"
+        );
+    } else {
+        info!(
+            swept,
+            "spot_1m_rest: post-session sweep complete — every session \
+             minute above the watermark is persisted"
+        );
+    }
+}
+
+/// 2026-07-13 VIX companion: feed one fired minute's per-SID served
+/// verdicts into the [`SidServedTracker`] and emit the edge-latched
+/// per-SID page / recovery ping + the per-counted-minute counter
+/// (`tv_spot1m_sid_not_served_total{symbol}` — 4 static label values, the
+/// pinned index symbols). Counting semantics live in the tracker doc.
+fn record_sid_served_verdicts(
+    params: &Spot1mRestTaskParams,
+    sid_tracker: &mut SidServedTracker,
+    verdicts: &[(SecurityId, &'static str, bool)],
+    minute_label: &str,
+) {
+    if verdicts.is_empty() {
+        return;
+    }
+    let any_served = verdicts.iter().any(|&(_, _, served)| served);
+    let pairs: Vec<(SecurityId, bool)> = verdicts
+        .iter()
+        .map(|&(sid, _, served)| (sid, served))
+        .collect();
+    let actions = sid_tracker.record_minute(&pairs);
+    for (&(security_id, symbol, served), &(_, action)) in verdicts.iter().zip(actions.iter()) {
+        if !served && any_served {
+            // One counted vendor-not-serving minute for this SID (a
+            // global-outage minute is deliberately NOT counted here).
+            metrics::counter!("tv_spot1m_sid_not_served_total", "symbol" => symbol).increment(1);
+        }
+        match action {
+            SidEdgeAction::Page { consecutive } => {
+                error!(
+                    code = ErrorCode::Spot1m01FetchDegraded.code_str(),
+                    stage = "sid_not_served",
+                    sid = security_id,
+                    symbol,
+                    consecutive,
+                    minute = minute_label,
+                    "SPOT1M-01: the vendor is not returning 1-minute candles \
+                     for this index while the other indices succeed — paging \
+                     once per SID (edge-latched; re-armed on this SID's \
+                     recovery)"
+                );
+                params
+                    .notifier
+                    .notify(NotificationEvent::Spot1mSidNotServed {
+                        symbol: symbol.to_string(),
+                        consecutive_minutes: consecutive,
+                    });
+            }
+            SidEdgeAction::Recover { not_served_minutes } => {
+                info!(
+                    sid = security_id,
+                    symbol,
+                    not_served_minutes,
+                    minute = minute_label,
+                    "spot_1m_rest: this index is being served again after a \
+                     paged not-served episode"
+                );
+                params
+                    .notifier
+                    .notify(NotificationEvent::Spot1mSidServedRecovered {
+                        symbol: symbol.to_string(),
+                        not_served_minutes,
+                    });
+            }
+            SidEdgeAction::None => {}
+        }
+    }
 }
 
 /// Coalesced per-minute verdict: ONE coded log per fired minute with any
@@ -1250,31 +1940,37 @@ mod tests {
         assert!(!spot_1m_day_is_over(LAST, true));
     }
 
-    // ---- minute_window_strings / request body ------------------------------
+    // ---- request body (2026-07-13 hotfix: PROVEN day-granular window) -------
 
+    /// 2026-07-13 live-failure regression lock: the request body carries
+    /// the ONLY live-proven window shape — the day-granular
+    /// `[D 00:00:00, D+1 00:00:00)` window the 15:31 cross-verify uses
+    /// successfully every trading day. The retired same-date 60-second
+    /// window was answered 2xx WITHOUT the target candle for every minute
+    /// of the first live session (SPOT1M-01 all day).
     #[test]
-    fn test_minute_window_strings_open_plus_60s() {
-        let date = NaiveDate::from_ymd_opt(2026, 7, 10).expect("valid date");
-        let (from, to) = minute_window_strings(date, 9 * 3600 + 15 * 60).expect("valid window");
-        assert_eq!(from, "2026-07-10 09:15:00");
-        assert_eq!(to, "2026-07-10 09:16:00");
-        // The last session minute: 15:29 → 15:30.
-        let (from, to) = minute_window_strings(date, 15 * 3600 + 29 * 60).expect("valid window");
-        assert_eq!(from, "2026-07-10 15:29:00");
-        assert_eq!(to, "2026-07-10 15:30:00");
-    }
-
-    #[test]
-    fn test_spot_1m_request_body_shape_string_security_id() {
-        let body = spot_1m_request_body("13", "2026-07-10 09:15:00", "2026-07-10 09:16:00");
+    fn test_regression_spot_1m_day_request_body_uses_proven_day_window() {
+        let date = NaiveDate::from_ymd_opt(2026, 7, 13).expect("valid date");
+        let body = spot_1m_day_request_body("13", date);
         // securityId is a STRING (orders.md rule 4 class), interval "1".
         assert_eq!(body["securityId"], "13");
         assert_eq!(body["exchangeSegment"], "IDX_I");
         assert_eq!(body["instrument"], "INDEX");
         assert_eq!(body["interval"], "1");
         assert_eq!(body["oi"], false);
-        assert_eq!(body["fromDate"], "2026-07-10 09:15:00");
-        assert_eq!(body["toDate"], "2026-07-10 09:16:00");
+        // The proven full-day window — NEVER a same-date minute window.
+        assert_eq!(body["fromDate"], "2026-07-13 00:00:00");
+        assert_eq!(body["toDate"], "2026-07-14 00:00:00");
+    }
+
+    /// Month boundary: toDate is the NEXT calendar day even across a
+    /// month end (the cross-verify `succ_opt` semantics).
+    #[test]
+    fn test_spot_1m_day_request_body_month_boundary() {
+        let date = NaiveDate::from_ymd_opt(2026, 7, 31).expect("valid date");
+        let body = spot_1m_day_request_body("51", date);
+        assert_eq!(body["fromDate"], "2026-07-31 00:00:00");
+        assert_eq!(body["toDate"], "2026-08-01 00:00:00");
     }
 
     // ---- timestamps + parsing ----------------------------------------------
@@ -1294,46 +1990,353 @@ mod tests {
         );
     }
 
-    /// UTC→IST (+19800) conversion: a Dhan intraday timestamp of UTC
-    /// 03:45:00 is IST 09:15:00 — the parsed candle's minute bucket must
-    /// equal our IST-as-epoch target for the same wall-clock minute.
+    /// UTC→IST (+19800) conversion against a REAL doc-convention fixture
+    /// (annexure rule 13 / historical-data.md §5: response timestamps are
+    /// UNIX **UTC** epoch seconds): the 2026-07-13 09:15:00 IST candle is
+    /// UTC epoch `1783914300` (03:45:00 UTC) and MUST match the matcher's
+    /// IST-as-epoch target `1_783_934_100e9` exactly.
     #[test]
-    fn test_parse_intraday_columnar_for_minute_utc_to_ist_and_filter() {
-        let date = NaiveDate::from_ymd_opt(2026, 7, 10).expect("valid date");
+    fn test_parse_intraday_columnar_utc_epoch_fixture_matches_ist_minute() {
+        let date = NaiveDate::from_ymd_opt(2026, 7, 13).expect("valid date");
         let open_secs: u32 = 9 * 3600 + 15 * 60;
         let target = minute_open_ist_nanos(date, open_secs);
-        // The UTC epoch for IST 2026-07-10 09:15:00 = (IST-as-epoch) - 19800.
-        let utc_ts = target / 1_000_000_000 - 19_800;
-        // Over-delivering body: the target minute AND the next minute (the
-        // community-reported toDate over-delivery) — client-side filter
-        // must pick exactly the target.
+        // The genuine UTC epoch for IST 2026-07-13 09:15:00.
+        let utc_ts: i64 = 1_783_914_300;
+        assert_eq!(target, (utc_ts + 19_800) * 1_000_000_000);
+        // Full-day over-delivering body: an earlier minute, the target,
+        // and the next minute — client-side filter must pick exactly the
+        // target.
         let body = format!(
-            r#"{{"open":[100.0,200.0],"high":[101.0,201.0],"low":[99.0,199.0],
-                "close":[100.5,200.5],"volume":[0,0],"timestamp":[{utc_ts},{next}]}}"#,
+            r#"{{"open":[50.0,100.0,200.0],"high":[51.0,101.0,201.0],
+                "low":[49.0,99.0,199.0],"close":[50.5,100.5,200.5],
+                "volume":[0,0,0],"timestamp":[{prev},{utc_ts},{next}]}}"#,
+            prev = utc_ts - 60,
             next = utc_ts + 60
         );
-        let candle = parse_intraday_columnar_for_minute(&body, target).expect("target found");
+        let (candle, backfill) = parse_intraday_columnar_for_minutes(&body, target, None);
+        let candle = candle.expect("target found");
+        assert!(backfill.is_none(), "no backfill requested → none returned");
         assert_eq!(candle.minute_ts_ist_nanos, target);
         assert_eq!(candle.open, 100.0);
         assert_eq!(candle.close, 100.5);
         // A target NOT in the body → None (the "empty" arm).
-        assert!(parse_intraday_columnar_for_minute(&body, target + 120 * 1_000_000_000).is_none());
+        let (missing, _) =
+            parse_intraday_columnar_for_minutes(&body, target + 120 * 1_000_000_000, None);
+        assert!(missing.is_none());
+    }
+
+    /// Backfill extraction from the SAME full-day body: the previous
+    /// minute is returned alongside the target — and ALSO when the target
+    /// itself is absent (the vendor-lateness recovery path).
+    #[test]
+    fn test_parse_intraday_columnar_for_minutes_backfill_hit() {
+        let date = NaiveDate::from_ymd_opt(2026, 7, 13).expect("valid date");
+        let target = minute_open_ist_nanos(date, 9 * 3600 + 16 * 60); // 09:16
+        let prev = target - NANOS_PER_MINUTE; // 09:15
+        let utc_prev = prev / 1_000_000_000 - 19_800;
+        // Body carries ONLY the previous minute (target not sealed yet).
+        let body_prev_only = format!(
+            r#"{{"open":[100.0],"high":[101.0],"low":[99.0],"close":[100.5],
+                "volume":[0],"timestamp":[{utc_prev}]}}"#
+        );
+        let (t, b) = parse_intraday_columnar_for_minutes(&body_prev_only, target, Some(prev));
+        assert!(t.is_none(), "target minute not sealed yet");
+        assert_eq!(
+            b.expect("backfill found").minute_ts_ist_nanos,
+            prev,
+            "previous minute must backfill even when the target is absent"
+        );
+        // Body carries BOTH → both returned.
+        let body_both = format!(
+            r#"{{"open":[100.0,200.0],"high":[101.0,201.0],"low":[99.0,199.0],
+                "close":[100.5,200.5],"volume":[0,0],
+                "timestamp":[{utc_prev},{utc_target}]}}"#,
+            utc_target = utc_prev + 60
+        );
+        let (t, b) = parse_intraday_columnar_for_minutes(&body_both, target, Some(prev));
+        assert_eq!(t.expect("target").minute_ts_ist_nanos, target);
+        assert_eq!(b.expect("backfill").minute_ts_ist_nanos, prev);
     }
 
     #[test]
-    fn test_parse_for_minute_malformed_short_and_mismatched_bodies_are_none() {
+    fn test_parse_for_minutes_malformed_short_and_mismatched_bodies_are_none() {
         let target = 1_770_000_900_000_000_000;
+        let bf = Some(target - NANOS_PER_MINUTE);
         // Malformed JSON.
-        assert!(parse_intraday_columnar_for_minute("not json", target).is_none());
+        assert_eq!(
+            parse_intraday_columnar_for_minutes("not json", target, bf),
+            (None, None)
+        );
         // Missing arrays.
-        assert!(parse_intraday_columnar_for_minute("{}", target).is_none());
+        assert_eq!(
+            parse_intraday_columnar_for_minutes("{}", target, bf),
+            (None, None)
+        );
         // Empty arrays.
         let empty = r#"{"open":[],"high":[],"low":[],"close":[],"volume":[],"timestamp":[]}"#;
-        assert!(parse_intraday_columnar_for_minute(empty, target).is_none());
+        assert_eq!(
+            parse_intraday_columnar_for_minutes(empty, target, bf),
+            (None, None)
+        );
         // Length-mismatched parallel arrays.
         let mismatched = r#"{"open":[1.0,2.0],"high":[1.0],"low":[1.0],
             "close":[1.0],"volume":[0],"timestamp":[1752118500]}"#;
-        assert!(parse_intraday_columnar_for_minute(mismatched, target).is_none());
+        assert_eq!(
+            parse_intraday_columnar_for_minutes(mismatched, target, bf),
+            (None, None)
+        );
+    }
+
+    // ---- backfill sweep (2026-07-13 hotfix) ----------------------------------
+
+    /// Backfill decision: due exactly when the previous minute is inside
+    /// the session AND not already persisted.
+    #[test]
+    fn test_backfill_minute_nanos_hit_and_not_needed() {
+        let date = NaiveDate::from_ymd_opt(2026, 7, 13).expect("valid date");
+        let session_first = minute_open_ist_nanos(date, FIRST - 60); // 09:15 open
+        let target_0916 = session_first + NANOS_PER_MINUTE; // 09:16 open
+        // Never persisted anything → previous minute (09:15) is due.
+        assert_eq!(
+            backfill_minute_nanos(None, target_0916, session_first),
+            Some(session_first)
+        );
+        // Previous minute already persisted → no backfill.
+        assert_eq!(
+            backfill_minute_nanos(Some(session_first), target_0916, session_first),
+            None
+        );
+        // An older watermark (gap) still only looks back ONE minute.
+        let target_0920 = session_first + 5 * NANOS_PER_MINUTE;
+        assert_eq!(
+            backfill_minute_nanos(Some(session_first), target_0920, session_first),
+            Some(target_0920 - NANOS_PER_MINUTE)
+        );
+    }
+
+    /// The session's FIRST fire (target = the 09:15 candle) has no
+    /// in-session previous minute — never a pre-open backfill.
+    #[test]
+    fn test_backfill_minute_nanos_first_session_minute_has_no_backfill() {
+        let date = NaiveDate::from_ymd_opt(2026, 7, 13).expect("valid date");
+        let session_first = minute_open_ist_nanos(date, FIRST - 60);
+        assert_eq!(
+            backfill_minute_nanos(None, session_first, session_first),
+            None
+        );
+    }
+
+    /// `last_persisted` reads back exactly the committed watermark —
+    /// per-SID, `None` before the first confirmed persist.
+    #[test]
+    fn test_persist_tracker_last_persisted_reads_committed_watermark() {
+        let mut t = PersistTracker::default();
+        assert_eq!(t.last_persisted(51), None);
+        t.commit(51, 42);
+        assert_eq!(t.last_persisted(51), Some(42));
+        assert_eq!(t.last_persisted(13), None, "per-SID isolation");
+    }
+
+    // ---- post-session sweep (M1, review 2026-07-13) --------------------------
+
+    /// The M1 scenario: the 15:29 candle sealed late, its own 15:30:00
+    /// fire found nothing (watermark stuck at 15:28) — the 15:33:30 sweep
+    /// must select exactly the 15:29 minute and find it in the final
+    /// day-window response.
+    #[test]
+    fn test_sweep_recovers_vendor_late_1529_minute() {
+        let date = NaiveDate::from_ymd_opt(2026, 7, 13).expect("valid date");
+        let session_first = minute_open_ist_nanos(date, FIRST - 60); // 09:15
+        let session_last = minute_open_ist_nanos(date, LAST - 60); // 15:29
+        let watermark_1528 = session_last - NANOS_PER_MINUTE;
+        let missing = sweep_missing_minutes(Some(watermark_1528), session_first, session_last);
+        assert_eq!(missing, vec![session_last], "exactly the 15:29 minute");
+        // The post-close day window now carries the late-sealed candle.
+        let utc_1529 = session_last / 1_000_000_000 - 19_800;
+        let body = format!(
+            r#"{{"open":[100.0],"high":[101.0],"low":[99.0],"close":[100.5],
+                "volume":[0],"timestamp":[{utc_1529}]}}"#
+        );
+        let candles = parse_intraday_1m_candles(&body);
+        let found = select_minute_candle(&candles, missing[0]).expect("15:29 swept in");
+        assert_eq!(found.minute_ts_ist_nanos, session_last);
+    }
+
+    /// Sweep no-ops when nothing is missing: watermark at the session's
+    /// last minute (15:29) → empty selection → zero requests.
+    #[test]
+    fn test_sweep_missing_minutes_noop_when_complete() {
+        let date = NaiveDate::from_ymd_opt(2026, 7, 13).expect("valid date");
+        let session_first = minute_open_ist_nanos(date, FIRST - 60);
+        let session_last = minute_open_ist_nanos(date, LAST - 60);
+        assert!(sweep_missing_minutes(Some(session_last), session_first, session_last).is_empty());
+        // A watermark somehow past the session (defensive): still empty.
+        assert!(
+            sweep_missing_minutes(
+                Some(session_last + NANOS_PER_MINUTE),
+                session_first,
+                session_last
+            )
+            .is_empty()
+        );
+    }
+
+    /// No watermark at all (post-close boot / fresh tracker): the sweep
+    /// selects the WHOLE 375-minute session — the full-day repair case —
+    /// and a multi-minute tail gap selects each missing minute.
+    #[test]
+    fn test_sweep_missing_minutes_full_session_and_tail_gap() {
+        let date = NaiveDate::from_ymd_opt(2026, 7, 13).expect("valid date");
+        let session_first = minute_open_ist_nanos(date, FIRST - 60);
+        let session_last = minute_open_ist_nanos(date, LAST - 60);
+        let all = sweep_missing_minutes(None, session_first, session_last);
+        assert_eq!(all.len(), 375, "one per session minute");
+        assert_eq!(all[0], session_first);
+        assert_eq!(*all.last().expect("non-empty"), session_last);
+        // Tail gap: watermark at 15:27 → 15:28 + 15:29 both selected.
+        let missing = sweep_missing_minutes(
+            Some(session_last - 2 * NANOS_PER_MINUTE),
+            session_first,
+            session_last,
+        );
+        assert_eq!(missing, vec![session_last - NANOS_PER_MINUTE, session_last]);
+    }
+
+    // ---- 429 coordination (2026-07-13 follow-up) -----------------------------
+
+    /// The sweep fire instant is pinned at 15:33:30 IST — strictly clear of
+    /// the bulk cross-verify's observed 15:31–15:33 429 burst window
+    /// (2026-07-13 live session: 91/776 cross-verify fetches 429'd there).
+    #[test]
+    fn test_sweep_fire_instant_clears_cross_verify_burst_window() {
+        assert_eq!(
+            SPOT_1M_REST_SWEEP_FIRE_SECS_OF_DAY_IST,
+            15 * 3600 + 33 * 60 + 30, // 15:33:30 = 56_010
+        );
+        // ≥ 150 s after the 15:31:00 cross-verify trigger (burst observed
+        // through 15:33) and before the 16:30 IST box stop.
+        assert!(
+            SPOT_1M_REST_SWEEP_FIRE_SECS_OF_DAY_IST
+                >= crate::cross_verify_1m_boot::CROSS_VERIFY_TRIGGER_SECS_OF_DAY_IST + 150
+        );
+        assert!(SPOT_1M_REST_SWEEP_FIRE_SECS_OF_DAY_IST > SPOT_1M_REST_LAST_FIRE_SECS_OF_DAY_IST);
+        assert!(SPOT_1M_REST_SWEEP_FIRE_SECS_OF_DAY_IST < 16 * 3600 + 30 * 60);
+    }
+
+    /// Deterministic per-SID jitter: one distinct value per slot of the
+    /// pinned index array (0 / 150 / 300 / 450 ms at the 2026-07-13 4-SID
+    /// arity), bounded by `(slots - 1) × step`, wrapping for defensive
+    /// out-of-range slots. Slot-based (not `sid % n`) because the pinned
+    /// SIDs give colliding residues — ladders would re-poll in lockstep.
+    #[test]
+    fn test_ladder_jitter_ms_bounds_and_decorrelation() {
+        let jitters: Vec<u64> = (0..SPOT_1M_REST_INDICES.len())
+            .map(ladder_jitter_ms)
+            .collect();
+        assert_eq!(
+            jitters,
+            vec![0, 150, 300, 450],
+            "one distinct shift per SID"
+        );
+        let max = (SPOT_1M_REST_LADDER_JITTER_SLOTS - 1) * SPOT_1M_REST_LADDER_JITTER_STEP_MS;
+        for j in &jitters {
+            assert!(*j <= max, "jitter bounded by (slots-1) x step");
+        }
+        // All four schedules are pairwise distinct — no lockstep re-polls.
+        for a in 0..jitters.len() {
+            for b in (a + 1)..jitters.len() {
+                assert_ne!(jitters[a], jitters[b], "slots {a} and {b} collide");
+            }
+        }
+        // Defensive wrap for a hypothetical 5th slot.
+        assert_eq!(ladder_jitter_ms(4), 0);
+    }
+
+    /// The ladder sleep composition: jitter shifts ONLY the first re-poll
+    /// (later deltas are relative, so the whole schedule carries the
+    /// shift), and a 429 on the previous attempt adds exactly the bounded
+    /// extra backoff.
+    #[test]
+    fn test_ladder_sleep_ms_jitter_and_429_backoff_composition() {
+        let deltas = retry_sleep_deltas_ms();
+        // First re-poll, no 429: base + jitter.
+        assert_eq!(
+            ladder_sleep_ms(deltas[0], true, 300, false),
+            deltas[0] + 300
+        );
+        // Later re-poll: jitter NOT re-applied.
+        assert_eq!(ladder_sleep_ms(deltas[1], false, 300, false), deltas[1]);
+        // 429 on the previous attempt: + the bounded extra backoff.
+        assert_eq!(
+            ladder_sleep_ms(deltas[2], false, 300, true),
+            deltas[2] + SPOT_1M_REST_429_EXTRA_BACKOFF_MS
+        );
+        // First re-poll after a first-attempt 429: both apply.
+        assert_eq!(
+            ladder_sleep_ms(deltas[0], true, 150, true),
+            deltas[0] + 150 + SPOT_1M_REST_429_EXTRA_BACKOFF_MS
+        );
+    }
+
+    /// Worst-case all-429 jittered schedule stays inside the hard per-SID
+    /// budget: every rung rate-limited (extra backoff before each of the 4
+    /// re-polls) + max jitter + one full request timeout < 20 s.
+    #[test]
+    fn test_ladder_worst_case_429_schedule_stays_inside_sid_budget() {
+        let deltas = retry_sleep_deltas_ms();
+        let max_jitter =
+            (SPOT_1M_REST_LADDER_JITTER_SLOTS - 1) * SPOT_1M_REST_LADDER_JITTER_STEP_MS;
+        let mut total_sleep_ms: u64 = 0;
+        for (i, delta) in deltas.iter().enumerate() {
+            total_sleep_ms += ladder_sleep_ms(*delta, i == 0, max_jitter, true);
+        }
+        // Scheduled sleeps sum to the (jittered) last offset + 4 backoffs.
+        assert_eq!(
+            total_sleep_ms,
+            SPOT_1M_REST_RETRY_OFFSETS_MS[3]
+                + max_jitter
+                + deltas.len() as u64 * SPOT_1M_REST_429_EXTRA_BACKOFF_MS
+        );
+        // Plus one full request timeout: still inside the hard budget the
+        // `tokio::time::timeout` enforces (19.3 s < 20 s).
+        assert!(
+            total_sleep_ms + SPOT_1M_REST_REQUEST_TIMEOUT_SECS * 1_000
+                < SPOT_1M_REST_SID_BUDGET_SECS * 1_000,
+            "worst-case 429 ladder must fit the per-SID budget"
+        );
+    }
+
+    /// Tracker: max-merge commits; double-persisting the same minute
+    /// (DEDUP-idempotent server-side) never regresses the watermark.
+    #[test]
+    fn test_persist_tracker_commit_max_merge_and_double_persist_idempotent() {
+        let mut t = PersistTracker::default();
+        assert_eq!(t.last_persisted(13), None);
+        t.commit(13, 1_000);
+        assert_eq!(t.last_persisted(13), Some(1_000));
+        // Double persist of the SAME minute: idempotent.
+        t.commit(13, 1_000);
+        assert_eq!(t.last_persisted(13), Some(1_000));
+        // A backfill commit of an OLDER minute never regresses.
+        t.commit(13, 500);
+        assert_eq!(t.last_persisted(13), Some(1_000));
+        // Advance.
+        t.commit(13, 2_000);
+        assert_eq!(t.last_persisted(13), Some(2_000));
+        // Per-SID isolation.
+        assert_eq!(t.last_persisted(25), None);
+    }
+
+    /// Edge accounting stays honest: a fire whose OWN target fetch found
+    /// nothing is fully failed for the edge even when the same fire
+    /// backfilled the previous minute (backfill persists never increment
+    /// `ok_count` — structural: only the `Found` arm does).
+    #[test]
+    fn test_backfill_never_flips_edge_accounting() {
+        assert!(minute_fully_failed(0, false));
+        let mut t = PersistTracker::default();
+        t.commit(13, 1_000); // a backfilled minute committed…
+        assert!(minute_fully_failed(0, false)); // …edge verdict unchanged
     }
 
     // ---- ladder deltas ------------------------------------------------------
@@ -1408,6 +2411,172 @@ mod tests {
         // Recovery WITHOUT a page: no Recover event (never a false ping).
         assert_eq!(edge.record_minute(false), EdgeAction::None);
         assert_eq!(edge.record_minute(false), EdgeAction::None);
+    }
+
+    // ---- per-SID not-served detector (2026-07-13 — INDIA VIX companion) ----
+
+    const NIFTY: SecurityId = 13;
+    const BANKNIFTY: SecurityId = 25;
+    const SENSEX: SecurityId = 51;
+    const VIX: SecurityId = 21;
+    const N: u32 = SPOT_1M_REST_SID_NOT_SERVED_THRESHOLD;
+
+    fn minute(vix_served: bool, others_served: bool) -> [(SecurityId, bool); 4] {
+        [
+            (NIFTY, others_served),
+            (BANKNIFTY, others_served),
+            (SENSEX, others_served),
+            (VIX, vix_served),
+        ]
+    }
+
+    fn vix_action(actions: &[(SecurityId, SidEdgeAction)]) -> SidEdgeAction {
+        actions
+            .iter()
+            .find(|(sid, _)| *sid == VIX)
+            .map(|&(_, a)| a)
+            .expect("VIX action present")
+    }
+
+    /// A 3-ok / 1-empty minute is NOT fully-failed and NOT edge-counted —
+    /// per-SID independence: a never-serving VIX can never fail or delay
+    /// the other 3 (2026-07-13 requirement 2a).
+    #[test]
+    fn test_partial_minute_three_ok_one_empty_is_not_fully_failed_or_edge_counted() {
+        // The M1 verdict: 3 SIDs succeeded, persist ok → NOT fully failed.
+        assert!(!minute_fully_failed(3, false));
+        // And the escalation edge never counts it: threshold-many such
+        // minutes still page nothing.
+        let mut edge = FailureEdge::default();
+        for _ in 0..(SPOT_1M_REST_CONSECUTIVE_FAIL_PAGE_THRESHOLD * 2) {
+            assert_eq!(
+                edge.record_minute(minute_fully_failed(3, false)),
+                EdgeAction::None,
+                "a 3-ok/1-empty minute must never feed the global edge"
+            );
+        }
+    }
+
+    /// LATCH: the per-SID detector pages ONCE at N counted not-served
+    /// minutes (each with sibling successes) and never re-pages while
+    /// latched.
+    #[test]
+    fn test_sid_not_served_pages_once_at_threshold_then_stays_latched() {
+        let mut t = SidServedTracker::default();
+        for i in 1..N {
+            assert_eq!(
+                vix_action(&t.record_minute(&minute(false, true))),
+                SidEdgeAction::None,
+                "below threshold at minute {i}"
+            );
+        }
+        assert_eq!(
+            vix_action(&t.record_minute(&minute(false, true))),
+            SidEdgeAction::Page { consecutive: N },
+            "rising edge at exactly N"
+        );
+        // No re-page while the episode continues.
+        for _ in 0..20 {
+            assert_eq!(
+                vix_action(&t.record_minute(&minute(false, true))),
+                SidEdgeAction::None,
+                "latched — never a second page in the same episode"
+            );
+        }
+        // The healthy siblings never see any action.
+        let actions = t.record_minute(&minute(false, true));
+        for &(sid, action) in &actions {
+            if sid != VIX {
+                assert_eq!(action, SidEdgeAction::None, "sibling {sid} untouched");
+            }
+        }
+    }
+
+    /// RE-ARM: the SID's own recovery emits ONE Recover and re-arms the
+    /// latch — a later persistent episode pages again.
+    #[test]
+    fn test_sid_not_served_recovery_rearms_the_latch() {
+        let mut t = SidServedTracker::default();
+        for _ in 0..N {
+            t.record_minute(&minute(false, true));
+        }
+        // Recovery: VIX served again → one Info edge.
+        assert_eq!(
+            vix_action(&t.record_minute(&minute(true, true))),
+            SidEdgeAction::Recover {
+                not_served_minutes: N
+            }
+        );
+        // A second served minute emits nothing (no repeated recovery ping).
+        assert_eq!(
+            vix_action(&t.record_minute(&minute(true, true))),
+            SidEdgeAction::None
+        );
+        // Re-armed: a fresh N-minute episode pages again.
+        for _ in 1..N {
+            assert_eq!(
+                vix_action(&t.record_minute(&minute(false, true))),
+                SidEdgeAction::None
+            );
+        }
+        assert_eq!(
+            vix_action(&t.record_minute(&minute(false, true))),
+            SidEdgeAction::Page { consecutive: N }
+        );
+    }
+
+    /// GLOBAL OUTAGE: minutes where NO SID succeeded neither count toward
+    /// nor reset a SID's streak — the detector can never fire on a general
+    /// outage (that is the FailureEdge's page), and a mid-streak global
+    /// blip cannot launder a genuine vendor-not-serving streak.
+    #[test]
+    fn test_sid_not_served_global_outage_neither_counts_nor_resets() {
+        let mut t = SidServedTracker::default();
+        // A long pure global outage never fires the per-SID page.
+        for _ in 0..(N * 3) {
+            for &(_, action) in &t.record_minute(&minute(false, false)) {
+                assert_eq!(
+                    action,
+                    SidEdgeAction::None,
+                    "global outage must not page per-SID"
+                );
+            }
+        }
+        // A streak interrupted by a global-outage minute HOLDS (does not
+        // reset): N-1 counted + 1 global + 1 counted = page.
+        for _ in 1..N {
+            assert_eq!(
+                vix_action(&t.record_minute(&minute(false, true))),
+                SidEdgeAction::None
+            );
+        }
+        assert_eq!(
+            vix_action(&t.record_minute(&minute(false, false))),
+            SidEdgeAction::None,
+            "global-outage minute holds the streak"
+        );
+        assert_eq!(
+            vix_action(&t.record_minute(&minute(false, true))),
+            SidEdgeAction::Page { consecutive: N },
+            "the held streak completes on the next counted minute"
+        );
+    }
+
+    /// Recovery without a page emits nothing (no false Info ping), and a
+    /// no-token / empty-verdict minute is a no-op.
+    #[test]
+    fn test_sid_not_served_no_false_recovery_and_empty_verdicts_noop() {
+        let mut t = SidServedTracker::default();
+        t.record_minute(&minute(false, true)); // 1 counted, below threshold
+        assert_eq!(
+            vix_action(&t.record_minute(&minute(true, true))),
+            SidEdgeAction::None,
+            "recovery below the page threshold is silent"
+        );
+        assert!(
+            t.record_minute(&[]).is_empty(),
+            "empty verdicts are a no-op"
+        );
     }
 
     // ---- select_minute_candle ---------------------------------------------

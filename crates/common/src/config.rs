@@ -108,6 +108,51 @@ pub struct ApplicationConfig {
     /// pipeline disabled + probe-and-report ON.
     #[serde(default)]
     pub option_chain_1m: OptionChain1mConfig,
+    /// `[groww_spot_1m]` — Groww per-minute spot 1m REST leg (operator grant
+    /// 2026-07-13, `.claude/plans/active-plan-groww-rest-1m.md` PR-2): every
+    /// trading-day minute close in session, fetch that just-closed minute's
+    /// official 1m OHLCV for the 3 spot indices via Groww
+    /// `GET /v1/historical/candles` and persist to `spot_1m_rest` tagged
+    /// `feed='groww'`. Independent of the Dhan lane (spawned process-global;
+    /// a Dhan-off session still runs it). Absent section ⇒ DISABLED
+    /// (fail-safe default off).
+    #[serde(default)]
+    pub groww_spot_1m: GrowwSpot1mConfig,
+    /// `[groww_option_chain_1m]` — Groww per-minute option-chain REST leg
+    /// (operator grant 2026-07-13, `.claude/plans/active-plan-groww-rest-1m.md`
+    /// PR-3): every trading-day minute close in session — sequenced after
+    /// the Groww spot leg — fetch the CURRENT-expiry option chain for the
+    /// 3 underlyings via Groww `GET /v1/option-chain/...` and persist to
+    /// the EXISTING `option_chain_1m` table tagged `feed='groww'`. Shipped
+    /// DEFAULT-OFF pending the first live probe (the endpoint is
+    /// documented-available — unlike Dhan's entitlement question — but the
+    /// live shape/latency are UNVERIFIED). Absent section ⇒ pipeline
+    /// disabled + probe-and-report ON.
+    #[serde(default)]
+    pub groww_option_chain_1m: GrowwOptionChain1mConfig,
+    /// `[tf_consistency]` — daily timeframe-consistency verifier (operator
+    /// directive 2026-07-13: *"how will you guarantee that all our defined
+    /// timeframes internally are correct"*). At 15:40 IST every trading day,
+    /// recompute every sealed higher-TF candle (2m..4h, both feeds) from its
+    /// stored `candles_1m` constituents and compare exactly; findings land
+    /// in `tf_consistency_audit` + one Telegram summary. Cold path only.
+    /// Absent section ⇒ DISABLED (fail-safe default off).
+    #[serde(default)]
+    pub tf_consistency: TfConsistencyConfig,
+    /// `[groww_contract_1m]` — Groww per-minute PER-CONTRACT 1m candle REST
+    /// leg (operator grant 2026-07-13,
+    /// `.claude/plans/active-plan-groww-rest-1m.md` PR-4 — the fill-model
+    /// leg): every trading-day minute close in session — sequenced after
+    /// the Groww CHAIN leg (its per-minute `underlying_ltp` is the ATM
+    /// anchor) — fetch the just-closed minute's 1m candle for a BOUNDED
+    /// ATM-window selection of option contracts via Groww
+    /// `GET /v1/historical/candles` (`segment=FNO`) and persist to the NEW
+    /// `option_contract_1m_rest` table tagged `feed='groww'`. Requires the
+    /// chain leg (`[groww_option_chain_1m] enabled = true`) — without it
+    /// there is no anchor and the leg is refused loudly at spawn. Absent
+    /// section ⇒ DISABLED (fail-safe default off).
+    #[serde(default)]
+    pub groww_contract_1m: GrowwContract1mConfig,
 }
 
 /// `[feeds]` — pluggable market-data feed selection (operator lock
@@ -169,6 +214,20 @@ pub struct GrowwFeedTuning {
     /// `[feeds.groww.scale]` — multi-connection auto-scale ladder config.
     #[serde(default)]
     pub scale: GrowwScaleConfig,
+    /// S3 bucket for the sidecar's rotated capture archives
+    /// (`live-ticks-YYYYMMDD.ndjson`) — 2026-07-13 disk-retention hardening.
+    /// The supervisor injects this into the sidecar child as
+    /// `TICKVAULT_GROWW_ARCHIVE_S3_BUCKET`; the sidecar uploads each rotated
+    /// archive, VERIFIES the copy (head_object size match), and only then
+    /// deletes the local file after a grace window. Empty (the default) =
+    /// archival OFF: rotated archives are kept on disk (dev-Mac behaviour) —
+    /// the sidecar NEVER deletes a file without a verified S3 copy.
+    #[serde(default)]
+    pub capture_archive_s3_bucket: String,
+    /// Key prefix inside the archive bucket (`<prefix>/<filename>`).
+    /// Empty = bucket root.
+    #[serde(default)]
+    pub capture_archive_s3_prefix: String,
 }
 
 /// Tier A ceiling (§34.2, operator lock 2026-07-03): the Monday-approved
@@ -497,6 +556,24 @@ pub struct Spot1mRestConfig {
     pub enabled: bool,
 }
 
+/// `[tf_consistency]` — daily timeframe-consistency verifier (operator
+/// directive 2026-07-13). Cold path only — the live candle pipeline, tick
+/// capture and trading are untouched; the verifier READS `candles_*` and
+/// writes ONLY its own `tf_consistency_audit` table.
+///
+/// Fail-safe shape: `enabled` is `#[serde(default)]` = `false`, so an
+/// absent `[tf_consistency]` section (or a TOML written before this PR)
+/// disables the verifier entirely. `config/base.toml` explicitly sets
+/// `enabled = true`.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct TfConsistencyConfig {
+    /// Master switch for the daily 15:40 IST timeframe-consistency
+    /// verifier. Default OFF (fail-safe) — `config/base.toml` turns it on
+    /// explicitly.
+    #[serde(default)]
+    pub enabled: bool,
+}
+
 /// `[option_chain_1m]` — per-minute option-chain REST pipeline (operator
 /// grant 2026-07-12; PR-3, the OPTION-CHAIN half). Cold path only — the
 /// WS candle pipeline, tick capture and trading are untouched.
@@ -537,11 +614,115 @@ fn default_chain_1m_probe_and_report() -> bool {
     true
 }
 
+/// `[groww_spot_1m]` — Groww per-minute spot 1m REST leg (operator grant
+/// 2026-07-13; PR-2 of the Groww per-minute REST plan). Cold path only —
+/// the WS pipelines, tick capture and trading are untouched.
+///
+/// Fail-safe shape: `enabled` is `#[serde(default)]` = `false`, so an
+/// absent `[groww_spot_1m]` section (or a TOML written before this PR)
+/// disables the fetcher entirely. `config/base.toml` explicitly sets
+/// `enabled = true` (the Dhan spot-leg precedent: spot on, chain gated).
+///
+/// Extension point (PR-3/PR-4, chain + contract legs): every FUTURE field
+/// on this struct MUST also be `#[serde(default)]` so older TOMLs keep
+/// deserializing byte-identically (the `Spot1mRestConfig` precedent).
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct GrowwSpot1mConfig {
+    /// Master switch for the Groww per-minute spot 1m REST fetcher.
+    /// Default OFF (fail-safe) — `config/base.toml` turns it on explicitly.
+    #[serde(default)]
+    pub enabled: bool,
+}
+
 impl Default for OptionChain1mConfig {
     fn default() -> Self {
         Self {
             enabled: false,
             probe_and_report: default_chain_1m_probe_and_report(),
+        }
+    }
+}
+
+/// `[groww_option_chain_1m]` — Groww per-minute option-chain REST leg
+/// (operator grant 2026-07-13; PR-3 of the Groww per-minute REST plan).
+/// Cold path only — the WS pipelines, tick capture and trading are
+/// untouched.
+///
+/// Config semantics mirror the Dhan `[option_chain_1m]` gate:
+/// - `enabled = true` → run the per-minute chain pipeline (sequenced after
+///   the Groww spot leg via the watch signal + fallback timer).
+/// - `enabled = false` + `probe_and_report = true` (the default) → run ONE
+///   bounded boot-time chain probe per underlying, report the measured
+///   verdict (shape / strikes / latency / reject class) via an Info
+///   Telegram + coded log, persist NOTHING, then exit. The pipeline NEVER
+///   auto-runs while `enabled = false` — the operator flips the config
+///   after the probe verdict.
+///
+/// DEFAULT-OFF rationale (dated 2026-07-13): the Groww chain endpoint is
+/// documented-available (no Dhan-style entitlement question), but the live
+/// response shape / strike-key format / latency / rate-limit family are
+/// UNVERIFIED-LIVE (`docs/groww-ref/99-UNKNOWNS.md` U-4/U-11/U-12/U-13) —
+/// the probe is the first live measurement. Flipping the DEFAULT needs a
+/// fresh dated operator quote.
+#[derive(Debug, Clone, Deserialize)]
+pub struct GrowwOptionChain1mConfig {
+    /// Master switch for the Groww per-minute chain fetcher. Default OFF
+    /// (pending the first live probe).
+    #[serde(default)]
+    pub enabled: bool,
+    /// When the pipeline is disabled, still run the ONE boot-time chain
+    /// probe and report the measured verdict via Telegram. Default ON.
+    #[serde(default = "default_chain_1m_probe_and_report")]
+    pub probe_and_report: bool,
+}
+
+impl Default for GrowwOptionChain1mConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            probe_and_report: default_chain_1m_probe_and_report(),
+        }
+    }
+}
+
+/// serde default for [`GrowwContract1mConfig::strikes_each_side`] — the
+/// pinned [`crate::constants::GROWW_CONTRACT_1M_DEFAULT_STRIKES_EACH_SIDE`].
+fn default_groww_contract_1m_strikes_each_side() -> u32 {
+    crate::constants::GROWW_CONTRACT_1M_DEFAULT_STRIKES_EACH_SIDE
+}
+
+/// `[groww_contract_1m]` — Groww per-minute per-contract 1m candle REST
+/// leg (operator grant 2026-07-13; PR-4 of the Groww per-minute REST plan
+/// — the fill-model leg). Cold path only — the WS pipelines, tick capture
+/// and trading are untouched.
+///
+/// Fail-safe shape: `enabled` is `#[serde(default)]` = `false`, so an
+/// absent `[groww_contract_1m]` section (or a TOML written before this PR)
+/// disables the fetcher entirely. `config/base.toml` ships the section
+/// with `enabled = false` — the leg DEPENDS on the chain leg's per-minute
+/// anchors, so it stays OFF until `[groww_option_chain_1m]` is live and
+/// the operator flips this with a dated note.
+#[derive(Debug, Clone, Deserialize)]
+pub struct GrowwContract1mConfig {
+    /// Master switch for the Groww per-minute contract candle fetcher.
+    /// Default OFF (fail-safe; depends on the chain leg's anchors).
+    #[serde(default)]
+    pub enabled: bool,
+    /// ATM window half-width: strikes selected EACH SIDE of the ATM strike
+    /// per underlying (× CE+PE × 3 underlyings = the per-minute contract
+    /// count). Default 2 → 30 contracts/minute = exactly the
+    /// `GROWW_CONTRACT_1M_MAX_PER_MINUTE` envelope cap; a wider value is
+    /// truncated deterministically nearest-ATM-first at the cap (counted +
+    /// one coded warn, never fetched past it).
+    #[serde(default = "default_groww_contract_1m_strikes_each_side")]
+    pub strikes_each_side: u32,
+}
+
+impl Default for GrowwContract1mConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            strikes_each_side: default_groww_contract_1m_strikes_each_side(),
         }
     }
 }
@@ -1167,18 +1348,63 @@ impl QuestDbConfig {
 }
 
 /// Partition retention configuration (separate from QuestDbConfig to avoid breaking existing code).
+///
+/// 2026-07-13 (disk-pressure remediation): grew the archive→verify→drop knobs.
+/// Two retention classes exist:
+/// - **market-data** (`ticks` + the 21 `candles_*` tables) → `market_data_hot_days`
+/// - **everything else** (audit / daily-data tables) → `retention_days`
+///
+/// The destructive archive→verify→drop leg is gated on `archive_enabled`
+/// (serde default **false**), so a config rollback (`archive_enabled = false`,
+/// or simply deleting the key) restores the legacy detach-only behaviour
+/// instantly. `market_data_hot_days` defaulting to 14 is safe-by-default
+/// precisely BECAUSE the flow is fail-closed: nothing is ever dropped unless
+/// its S3 copy has been row-count- and size-verified, and nothing at all
+/// happens while `archive_enabled` is false.
 #[derive(Debug, Clone, Deserialize)]
 pub struct PartitionRetentionConfig {
-    /// Hot partition retention in days. Partitions older than this are detached.
+    /// Hot partition retention in days for the STANDARD class (audit /
+    /// daily-data tables). Partitions older than this are detached (legacy
+    /// path) or archived→verified→dropped (when `archive_enabled`).
     /// Default: 90 days. Set to 0 to disable auto-detach.
     #[serde(default = "default_retention_days")]
     pub retention_days: u32,
+    /// Hot window in days for the HIGH-VOLUME market-data class (`ticks` +
+    /// the 21 `candles_*` tables, ~1.2–2 GB/day combined). 90 days of ticks
+    /// (~135+ GB) can never fit the 30 GB volume — the hot window must be
+    /// shorter, with S3 as the durable long-term store (aws-budget.md §5
+    /// hot-window-on-EBS doctrine; SEBI retention satisfied by the S3 copy).
+    /// Only consulted when `archive_enabled = true`; clamped to a hard
+    /// MIN_HOT_DAYS=2 floor at use (today + yesterday are untouchable).
+    #[serde(default = "default_market_data_hot_days")]
+    pub market_data_hot_days: u32,
+    /// Master gate for the archive→verify→drop leg. serde default FALSE so
+    /// the destructive behaviour must be explicitly configured on
+    /// (config/base.toml sets it true for prod); flipping it off restores
+    /// the legacy detach-only cycle byte-identically.
+    #[serde(default)]
+    pub archive_enabled: bool,
+    /// S3 bucket receiving verified partition archives. Empty (the default)
+    /// = derive `tv-<env>-cold` from TV_ENVIRONMENT/ENVIRONMENT (prod →
+    /// `tv-prod-cold`, the bucket the instance role already reads/writes).
+    #[serde(default)]
+    pub archive_bucket: String,
+    /// Per-run bound on archived partitions (oldest first) so the first
+    /// catch-up sweep (weeks of hourly ticks partitions) converges over a
+    /// few post-market runs instead of overrunning the 16:30 IST box stop.
+    /// 0 = unlimited.
+    #[serde(default = "default_max_partitions_per_run")]
+    pub max_partitions_per_run: u32,
 }
 
 impl Default for PartitionRetentionConfig {
     fn default() -> Self {
         Self {
             retention_days: default_retention_days(),
+            market_data_hot_days: default_market_data_hot_days(),
+            archive_enabled: false,
+            archive_bucket: String::new(),
+            max_partitions_per_run: default_max_partitions_per_run(),
         }
     }
 }
@@ -1186,6 +1412,20 @@ impl Default for PartitionRetentionConfig {
 /// Default retention: 90 days of hot data.
 const fn default_retention_days() -> u32 {
     90
+}
+
+/// Default market-data hot window: 14 days. Inert unless `archive_enabled`;
+/// safe-by-default because the archive→verify→drop flow is fail-closed
+/// (no verified S3 copy ⇒ no drop).
+const fn default_market_data_hot_days() -> u32 {
+    14
+}
+
+/// Default per-run archive bound: 200 partitions. At ~8–24 hourly ticks
+/// partitions + ~22 daily candle partitions per aged-out day, one run covers
+/// several days of backlog while staying far inside the post-market window.
+const fn default_max_partitions_per_run() -> u32 {
+    200
 }
 
 // `ValkeyConfig` struct + `default_valkey_password` helper DELETED in
@@ -2208,6 +2448,45 @@ mod tests {
         assert_eq!(PartitionRetentionConfig::default().retention_days, 90);
     }
 
+    #[test]
+    fn test_partition_retention_serde_defaults_backward_compatible() {
+        // A pre-2026-07-13 config carrying ONLY retention_days must parse
+        // with the archive leg OFF and the documented class defaults —
+        // missing keys = legacy behaviour (archive_enabled false).
+        let cfg: PartitionRetentionConfig =
+            toml::from_str("retention_days = 90").expect("legacy section must parse");
+        assert_eq!(cfg.retention_days, 90);
+        assert_eq!(cfg.market_data_hot_days, 14);
+        assert!(!cfg.archive_enabled, "archive leg must default OFF");
+        assert!(cfg.archive_bucket.is_empty(), "bucket must default derived");
+        assert_eq!(cfg.max_partitions_per_run, 200);
+    }
+
+    #[test]
+    fn test_partition_retention_archive_enabled_default_false() {
+        // The destructive leg must be explicitly configured on. Kills
+        // `default -> true` mutants and pins the instant-rollback contract
+        // (delete the key ⇒ detach-only legacy behaviour).
+        assert!(!PartitionRetentionConfig::default().archive_enabled);
+        assert_eq!(default_market_data_hot_days(), 14);
+        assert_eq!(default_max_partitions_per_run(), 200);
+        let cfg: PartitionRetentionConfig =
+            toml::from_str("").expect("empty section must parse via defaults");
+        assert!(!cfg.archive_enabled);
+    }
+
+    #[test]
+    fn test_partition_retention_full_section_parses() {
+        let cfg: PartitionRetentionConfig = toml::from_str(
+            "retention_days = 90\nmarket_data_hot_days = 14\narchive_enabled = true\narchive_bucket = \"tv-prod-cold\"\nmax_partitions_per_run = 50\n",
+        )
+        .expect("full section must parse");
+        assert!(cfg.archive_enabled);
+        assert_eq!(cfg.archive_bucket, "tv-prod-cold");
+        assert_eq!(cfg.market_data_hot_days, 14);
+        assert_eq!(cfg.max_partitions_per_run, 50);
+    }
+
     // =======================================================================
     // B6 mutation kills: live-trading sandbox gate pure helpers
     // =======================================================================
@@ -2382,6 +2661,10 @@ mod tests {
             brutex_crossverify: BrutexCrossverifyConfig::default(),
             spot_1m_rest: Spot1mRestConfig::default(),
             option_chain_1m: OptionChain1mConfig::default(),
+            groww_spot_1m: GrowwSpot1mConfig::default(),
+            groww_option_chain_1m: GrowwOptionChain1mConfig::default(),
+            tf_consistency: TfConsistencyConfig::default(),
+            groww_contract_1m: GrowwContract1mConfig::default(),
         }
     }
 
@@ -3660,6 +3943,62 @@ mod tests {
         assert!(wrapper_on.feeds.groww_native_shadow);
     }
 
+    /// Disk-retention hardening (2026-07-13): the Groww capture-archive S3
+    /// fields default EMPTY (= archival OFF, dev-Mac behaviour unchanged) —
+    /// both via `Default` and via a TOML that omits the keys.
+    #[test]
+    fn test_feeds_groww_capture_archive_defaults_empty() {
+        let tuning = GrowwFeedTuning::default();
+        assert!(
+            tuning.capture_archive_s3_bucket.is_empty(),
+            "archive bucket must default empty (archival OFF)"
+        );
+        assert!(tuning.capture_archive_s3_prefix.is_empty());
+
+        use figment::Figment;
+        use figment::providers::{Format, Toml};
+        #[derive(Deserialize)]
+        struct Wrapper {
+            feeds: FeedsConfig,
+        }
+        let wrapper: Wrapper = Figment::new()
+            .merge(Toml::string(
+                "[feeds]\ndhan_enabled = true\ngroww_enabled = false\n",
+            ))
+            .extract()
+            .expect("missing capture_archive keys must default, not error");
+        assert!(wrapper.feeds.groww.capture_archive_s3_bucket.is_empty());
+        assert!(wrapper.feeds.groww.capture_archive_s3_prefix.is_empty());
+    }
+
+    /// Disk-retention hardening (2026-07-13): explicit `[feeds.groww]`
+    /// capture-archive keys round-trip.
+    #[test]
+    fn test_feeds_groww_capture_archive_round_trip() {
+        use figment::Figment;
+        use figment::providers::{Format, Toml};
+        #[derive(Deserialize)]
+        struct Wrapper {
+            feeds: FeedsConfig,
+        }
+        let wrapper: Wrapper = Figment::new()
+            .merge(Toml::string(
+                "[feeds]\ndhan_enabled = true\ngroww_enabled = false\n\
+                 [feeds.groww]\ncapture_archive_s3_bucket = \"tv-prod-cold\"\n\
+                 capture_archive_s3_prefix = \"groww-capture\"\n",
+            ))
+            .extract()
+            .expect("explicit capture_archive keys must round-trip");
+        assert_eq!(
+            wrapper.feeds.groww.capture_archive_s3_bucket,
+            "tv-prod-cold"
+        );
+        assert_eq!(
+            wrapper.feeds.groww.capture_archive_s3_prefix,
+            "groww-capture"
+        );
+    }
+
     /// Dual-feed scoreboard PR-A (2026-07-10): the `[scoreboard]` section
     /// defaults SAFE-ON (aggregation-only — reads existing tables, no hot
     /// path), trigger at 15:45:00 IST, and a missing section must default,
@@ -3857,6 +4196,184 @@ mod tests {
             .expect("explicit values must round-trip");
         assert!(on.option_chain_1m.enabled);
         assert!(!on.option_chain_1m.probe_and_report);
+    }
+
+    /// Groww per-minute spot 1m REST leg (operator grant 2026-07-13,
+    /// PR-2): the `[groww_spot_1m]` section is FAIL-SAFE default OFF —
+    /// via `Default`, via a missing section, and via an empty section —
+    /// and an explicit `enabled = true` (the base.toml shape) round-trips.
+    #[test]
+    fn test_groww_spot_1m_config_defaults_off_and_round_trips() {
+        use figment::Figment;
+        use figment::providers::{Format, Toml};
+
+        assert!(
+            !GrowwSpot1mConfig::default().enabled,
+            "groww_spot_1m must default OFF (fail-safe; base.toml opts in)"
+        );
+
+        #[derive(Deserialize)]
+        struct Wrapper {
+            #[serde(default)]
+            groww_spot_1m: GrowwSpot1mConfig,
+        }
+        // Missing section entirely → disabled, never an error.
+        let missing: Wrapper = Figment::new()
+            .merge(Toml::string("[other]\nx = 1\n"))
+            .extract()
+            .expect("missing [groww_spot_1m] must default, not error");
+        assert!(!missing.groww_spot_1m.enabled);
+        // Empty section (no keys) → disabled via the field-level default.
+        let empty: Wrapper = Figment::new()
+            .merge(Toml::string("[groww_spot_1m]\n"))
+            .extract()
+            .expect("empty [groww_spot_1m] must default, not error");
+        assert!(!empty.groww_spot_1m.enabled);
+        // Explicit ON (the base.toml shape) round-trips.
+        let on: Wrapper = Figment::new()
+            .merge(Toml::string("[groww_spot_1m]\nenabled = true\n"))
+            .extract()
+            .expect("explicit enabled = true must round-trip");
+        assert!(on.groww_spot_1m.enabled);
+    }
+
+    /// Config-gate contract (Groww per-minute REST plan PR-3): the
+    /// `[groww_option_chain_1m]` section is DEFAULT-OFF with
+    /// probe-and-report ON — mirrors the Dhan `[option_chain_1m]` gate;
+    /// an absent/empty section (or an older TOML) never errors.
+    #[test]
+    fn test_groww_option_chain_1m_config_defaults_off_probe_on_and_round_trips() {
+        use figment::Figment;
+        use figment::providers::{Format, Toml};
+
+        let d = GrowwOptionChain1mConfig::default();
+        assert!(
+            !d.enabled,
+            "groww_option_chain_1m must default OFF (pending the first live probe)"
+        );
+        assert!(
+            d.probe_and_report,
+            "probe_and_report must default ON (the operator learns the live verdict)"
+        );
+
+        #[derive(Deserialize)]
+        struct Wrapper {
+            #[serde(default)]
+            groww_option_chain_1m: GrowwOptionChain1mConfig,
+        }
+        // Missing section entirely → disabled + probe ON, never an error.
+        let missing: Wrapper = Figment::new()
+            .merge(Toml::string("[other]\nx = 1\n"))
+            .extract()
+            .expect("missing [groww_option_chain_1m] must default, not error");
+        assert!(!missing.groww_option_chain_1m.enabled);
+        assert!(missing.groww_option_chain_1m.probe_and_report);
+        // Empty section (no keys) → field-level defaults.
+        let empty: Wrapper = Figment::new()
+            .merge(Toml::string("[groww_option_chain_1m]\n"))
+            .extract()
+            .expect("empty [groww_option_chain_1m] must default, not error");
+        assert!(!empty.groww_option_chain_1m.enabled);
+        assert!(empty.groww_option_chain_1m.probe_and_report);
+        // Explicit ON (the future flip shape) round-trips; probe can be
+        // explicitly silenced.
+        let on: Wrapper = Figment::new()
+            .merge(Toml::string(
+                "[groww_option_chain_1m]\nenabled = true\nprobe_and_report = false\n",
+            ))
+            .extract()
+            .expect("explicit values must round-trip");
+        assert!(on.groww_option_chain_1m.enabled);
+        assert!(!on.groww_option_chain_1m.probe_and_report);
+    }
+
+    /// Daily timeframe-consistency verifier (operator 2026-07-13): the
+    /// `[tf_consistency]` section is fail-safe DEFAULT-OFF — via `Default`,
+    /// via a missing section, and via an empty section — and the explicit
+    /// base.toml opt-in round-trips.
+    #[test]
+    fn test_tf_consistency_config_default_off_and_round_trip() {
+        use figment::Figment;
+        use figment::providers::{Format, Toml};
+
+        assert!(
+            !TfConsistencyConfig::default().enabled,
+            "tf_consistency must default OFF (fail-safe; base.toml opts in)"
+        );
+
+        #[derive(Deserialize)]
+        struct Wrapper {
+            #[serde(default)]
+            tf_consistency: TfConsistencyConfig,
+        }
+        // Missing section entirely → disabled, never an error.
+        let missing: Wrapper = Figment::new()
+            .merge(Toml::string("[other]\nx = 1\n"))
+            .extract()
+            .expect("missing [tf_consistency] must default, not error");
+        assert!(!missing.tf_consistency.enabled);
+        // Empty section (no keys) → disabled via the field-level default.
+        let empty: Wrapper = Figment::new()
+            .merge(Toml::string("[tf_consistency]\n"))
+            .extract()
+            .expect("empty [tf_consistency] must default, not error");
+        assert!(!empty.tf_consistency.enabled);
+        // Explicit ON (the base.toml shape) round-trips.
+        let on: Wrapper = Figment::new()
+            .merge(Toml::string("[tf_consistency]\nenabled = true\n"))
+            .extract()
+            .expect("explicit enabled = true must round-trip");
+        assert!(on.tf_consistency.enabled);
+    }
+
+    /// PR-4 (Groww contract leg): the `[groww_contract_1m]` section is
+    /// FAIL-SAFE default OFF — an absent section, an empty section, and an
+    /// older TOML all deserialize to disabled with the pinned ATM-window
+    /// default; explicit values round-trip.
+    #[test]
+    fn test_groww_contract_1m_config_defaults_off_and_round_trips() {
+        use figment::Figment;
+        use figment::providers::{Format, Toml};
+
+        let d = GrowwContract1mConfig::default();
+        assert!(
+            !d.enabled,
+            "groww_contract_1m must default OFF (fail-safe; depends on the chain leg)"
+        );
+        assert_eq!(
+            d.strikes_each_side,
+            crate::constants::GROWW_CONTRACT_1M_DEFAULT_STRIKES_EACH_SIDE,
+            "the ATM window default is the pinned constant"
+        );
+
+        #[derive(Deserialize)]
+        struct Wrapper {
+            #[serde(default)]
+            groww_contract_1m: GrowwContract1mConfig,
+        }
+        // Missing section entirely → disabled, never an error.
+        let missing: Wrapper = Figment::new()
+            .merge(Toml::string("[other]\nx = 1\n"))
+            .extract()
+            .expect("missing [groww_contract_1m] must default, not error");
+        assert!(!missing.groww_contract_1m.enabled);
+        assert_eq!(missing.groww_contract_1m.strikes_each_side, 2);
+        // Empty section (no keys) → field-level defaults.
+        let empty: Wrapper = Figment::new()
+            .merge(Toml::string("[groww_contract_1m]\n"))
+            .extract()
+            .expect("empty [groww_contract_1m] must default, not error");
+        assert!(!empty.groww_contract_1m.enabled);
+        assert_eq!(empty.groww_contract_1m.strikes_each_side, 2);
+        // Explicit values (the future flip shape) round-trip.
+        let on: Wrapper = Figment::new()
+            .merge(Toml::string(
+                "[groww_contract_1m]\nenabled = true\nstrikes_each_side = 1\n",
+            ))
+            .extract()
+            .expect("explicit values must round-trip");
+        assert!(on.groww_contract_1m.enabled);
+        assert_eq!(on.groww_contract_1m.strikes_each_side, 1);
     }
 
     /// A missing `[feeds]` section must fall back to the safe default

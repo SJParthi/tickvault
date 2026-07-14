@@ -162,7 +162,24 @@ pg_port = 8812
 ilp_port = 9009
 
 [partition_retention]
+# STANDARD class (audit / daily-data tables) hot window.
 retention_days = 90
+# HIGH-VOLUME market-data class (ticks + 21 candles_* tables, ~1.2-2 GB/day).
+# 90d of ticks (~135+ GB) can never fit the 30 GB volume; 14d hot on EBS with
+# the verified S3 archive as the durable long-term store (SEBI retention is
+# satisfied by the S3 copy — aws-budget hot-window doctrine).
+market_data_hot_days = 14
+# Archive->verify->drop leg ON (2026-07-13 disk-pressure remediation).
+# Fail-closed: a partition is dropped ONLY after its S3 copy is row-count-
+# and size-verified. ROLLBACK: set false (or delete the key) to restore the
+# legacy detach-only behaviour instantly.
+archive_enabled = true
+# Empty = derive tv-<TV_ENVIRONMENT>-cold (prod -> tv-prod-cold; the instance
+# role already has Put/Get/List on it — no IAM change).
+archive_bucket = ""
+# Oldest-first per-run bound so the first catch-up sweep converges over a few
+# post-market runs instead of overrunning the 16:30 IST box stop.
+max_partitions_per_run = 200
 
 # [valkey] section DELETED in #O4 (2026-05-24). Valkey removed from
 # the runtime; the dual-instance lock moved to AWS SSM Parameter Store
@@ -308,10 +325,13 @@ auto_start_docker = true
 
 # Pluggable market-data feed selection (Groww second feed, operator lock
 # 2026-06-19 — .claude/rules/project/groww-second-feed-scope-2026-06-19.md).
-# Dhan = feed #1 (default ON, UNCHANGED). Groww = feed #2 (default OFF,
-# opt-in). Run Dhan-only (today's default), Groww-only, or both.
+# 2026-07-13 operator directive: Dhan live WS feed removed from runtime; Dhan
+# retained for REST pulls only (spot_1m_rest / option_chain_1m / historical).
+# Groww is the live feed. The Dhan REST retained surface is brought up
+# WITHOUT the WS lane by crates/app/src/dhan_rest_stack.rs when
+# dhan_enabled = false (Phase A — flip + REST-only bootstrap).
 [feeds]
-dhan_enabled = true
+dhan_enabled = false
 groww_enabled = false
 # Groww NATIVE-RUST SHADOW client (PR-R1 of the parity migration, operator
 # "go" 2026-07-04 — groww-second-feed-scope-2026-06-19.md §35). Default OFF.
@@ -320,6 +340,16 @@ groww_enabled = false
 # (data/groww/rust-live-ticks.ndjson) for the exact per-tick parity comparer.
 # No shared-table writes, no strategy/order wiring, no sidecar changes.
 groww_native_shadow = false
+
+# Groww capture-archive S3 offload (2026-07-13 disk-retention hardening).
+# Rotated sidecar capture archives (data/groww/live-ticks-YYYYMMDD.ndjson)
+# are uploaded to s3://<bucket>/<prefix>/<filename>, VERIFIED (head_object
+# size match), and only then deleted locally after a grace window. Empty
+# bucket = archival OFF (archives kept on disk — the dev-Mac behaviour);
+# the sidecar NEVER deletes a file without a verified S3 copy.
+[feeds.groww]
+capture_archive_s3_bucket = "tv-prod-cold"
+capture_archive_s3_prefix = "groww-capture"
 
 # Groww multi-connection AUTO-SCALE ladder (operator authorization 2026-07-03,
 # §34 of .claude/rules/project/groww-second-feed-scope-2026-06-19.md).
@@ -491,12 +521,88 @@ enabled = true
 # right after the spot leg — the FULL current-expiry option chain for the
 # 3 underlyings is pulled via POST /v2/optionchain and persisted to the
 # option_chain_1m table. Cold path; the WS pipeline is untouched.
-# DEFAULT-OFF pending the live entitlement probe (the account had no
-# Option Chain Data-API entitlement in June 2026 — DH-902/806 class).
-# While disabled, probe_and_report = true runs ONE boot-time expirylist
-# probe and reports the verdict via Telegram; the pipeline NEVER auto-runs
-# — the operator flips `enabled = true` after an entitled verdict.
+# Shipped DEFAULT-OFF pending the live entitlement probe (the account had
+# no Option Chain Data-API entitlement in June 2026 — DH-902/806 class).
+# 2026-07-13: the first-live-boot probe PASSED at 08:31:49 IST ("entitlement
+# probe PASSED — chain data is available", NIFTY, 18 expiries — CloudWatch
+# /tickvault/prod/app) → enabled per the dated operator note recorded in
+# no-rest-except-live-feed-2026-06-27.md §8.7. probe_and_report stays true
+# (inert while enabled — the boot probe only runs when the pipeline is
+# disabled; keeping it true preserves the probe as the automatic fallback
+# canary if `enabled` is ever rolled back).
 # ===========================================================================
 [option_chain_1m]
-enabled = false  # pending live entitlement probe
+enabled = true  # entitlement proven live 2026-07-13 08:31:49 IST (§8.7)
 probe_and_report = true
+
+# ===========================================================================
+# Groww per-minute spot 1m REST leg (operator grant 2026-07-13 — PR-2 of
+# the Groww per-minute REST plan). Every trading-day minute close in
+# [09:16:00, 15:30:00] IST, fetch the just-closed minute's official 1m
+# OHLCV for the 3 spot indices (NSE-NIFTY / NSE-BANKNIFTY / BSE-SENSEX)
+# via Groww GET /v1/historical/candles and persist to the SAME
+# spot_1m_rest table tagged feed='groww' (feed-in-key DEDUP — the Dhan
+# rows are untouched). Token: shared-minter SSM READ-ONLY (never mint).
+# Independent of the Dhan lane (process-global spawn) — a Dhan-off session
+# still runs it. Cold path; the WS pipelines are untouched. An ABSENT
+# section = disabled (fail-safe); `enabled = false` is the rollback switch.
+# ===========================================================================
+[groww_spot_1m]
+enabled = true
+
+# ===========================================================================
+# Groww per-minute option-chain REST leg (operator grant 2026-07-13 — PR-3
+# of the Groww per-minute REST plan). When enabled: every session minute —
+# sequenced right after the Groww spot fetch — pull the CURRENT-expiry
+# option chain for NIFTY/BANKNIFTY (NSE) + SENSEX (BSE) and persist every
+# per-strike per-leg row into the option_chain_1m table tagged feed='groww'
+# (feed-in-key DEDUP — the Dhan rows are untouched). Expiry comes from the
+# daily Groww instruments master CSV (zero extra rate cost — never a new
+# expiry endpoint, never guessed). Shipped DEFAULT-OFF pending the first
+# live probe: the endpoint is documented-available, but the live response
+# shape / strike keys / latency / rate-limit family are UNVERIFIED-LIVE.
+# probe_and_report = true runs ONE bounded boot-time chain call per
+# underlying and reports the measured verdict via Telegram (persists
+# nothing) — flip enabled = true only after the probe passes.
+# ===========================================================================
+[groww_option_chain_1m]
+enabled = true # flipped 2026-07-13 after the live probe PASSED (groww-second-feed-scope §38.6); serde default stays OFF
+probe_and_report = true # inert while enabled; the rollback canary (the Dhan §8.7 precedent)
+
+# ===========================================================================
+# Groww per-minute PER-CONTRACT 1m candle REST leg (operator grant
+# 2026-07-13 — PR-4 of the Groww per-minute REST plan, the FILL-MODEL
+# leg). When enabled: every session minute — sequenced right after the
+# Groww chain fetch — pull the just-closed minute's 1m candle for a
+# BOUNDED ATM-window selection of option contracts (ATM ±
+# strikes_each_side x CE+PE x 3 underlyings, hard-capped per minute) via
+# Groww GET /v1/historical/candles (segment=FNO) and persist to the NEW
+# option_contract_1m_rest table tagged feed='groww' (feed-in-key DEDUP).
+# DEPENDS ON THE CHAIN LEG: the per-minute ATM anchor is the chain's
+# underlying price — the chain leg is live (enabled = true above, §38.6),
+# but THIS leg stays OFF until the operator flips it with its own dated
+# note. Rows are RECORD data: any future strategy consumer must fail
+# closed on staleness per the decision-freshness gate
+# (groww-second-feed-scope-2026-06-19.md §38.8).
+# An ABSENT section = disabled (fail-safe); `enabled = false` is the
+# rollback switch.
+# ===========================================================================
+[groww_contract_1m]
+enabled = false # stays OFF until the operator's dated flip note (the chain leg feeds its ATM anchors)
+strikes_each_side = 2
+
+# ===========================================================================
+# Daily timeframe-consistency verifier (operator directive 2026-07-13 —
+# "how will you guarantee that all our defined timeframes internally are
+# correct — how do you identify whether any miscalculation or data
+# issues"). At 15:40 IST every trading day, recompute every sealed
+# higher-timeframe candle (2m..4h) from its stored 1-minute constituents
+# and compare exactly — Dhan verifies TODAY (stable after the 15:30:05
+# close seal); Groww verifies the PREVIOUS trading day (its tails seal at
+# IST midnight). Findings land in the tf_consistency_audit table + one
+# Telegram summary (TF-VERIFY-01/02). Cold path; the live candle pipeline
+# is untouched. An ABSENT section = disabled (fail-safe);
+# `enabled = false` is the rollback switch.
+# ===========================================================================
+[tf_consistency]
+enabled = true

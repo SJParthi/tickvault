@@ -53,10 +53,32 @@ pub mod spot_1m_rest_boot;
 // chain for the 3 underlyings via POST /v2/optionchain and persist to the
 // `option_chain_1m` table (CHAIN-01..04).
 pub mod option_chain_1m_boot;
+// Groww per-minute spot 1m REST leg (operator grant 2026-07-13 — PR-2 of
+// the Groww per-minute REST plan): the just-closed minute's official Groww
+// 1m OHLCV for the 3 spot indices → `spot_1m_rest` feed='groww' + the
+// `rest_fetch_audit` per-fetch forensics rows.
+pub mod groww_spot_1m_boot;
+// Groww per-minute option-chain REST leg (operator grant 2026-07-13 — PR-3
+// of the Groww per-minute REST plan): the current-expiry chain for the 3
+// underlyings, sequenced after the Groww spot leg → `option_chain_1m`
+// feed='groww' + `rest_fetch_audit` leg='chain_1m' forensics rows.
+pub mod groww_option_chain_1m_boot;
+// Groww per-minute PER-CONTRACT 1m candle REST leg (operator grant
+// 2026-07-13 — PR-4 of the Groww per-minute REST plan, the fill-model
+// leg): the just-closed minute's 1m candle for a bounded ATM-window
+// contract selection, sequenced after the Groww chain leg →
+// `option_contract_1m_rest` feed='groww' + `rest_fetch_audit`
+// leg='contract_1m' forensics rows.
+pub mod groww_contract_1m_boot;
 // Dual-feed scoreboard PR-A (operator 2026-07-10): boot-time process-death
 // reconciler + the 15:45 IST daily Dhan-vs-Groww aggregation + the Telegram
 // scorecard summary (SCOREBOARD-01 family).
 pub mod feed_scoreboard_boot;
+// Daily timeframe-consistency verifier (operator 2026-07-13): at 15:40 IST,
+// recompute every higher-TF candle (2m..4h) from the stored 1m rows and
+// compare against the persisted TF tables — Dhan verifies TODAY, Groww
+// verifies the PREVIOUS trading day (TF-VERIFY-01/02).
+pub mod tf_consistency_boot;
 pub mod tick_conservation_boot;
 // PR #8a (2026-05-19) — Slice 1: 09:15:00 IST `DayOhlcTracker::arm_sid()`
 // boot wiring per `index-day-ohlc-tracker-error-codes.md`. Closes the
@@ -70,6 +92,17 @@ pub mod boot_helpers;
 /// Dhan lane's running flag honest across runtime toggles and enforces the
 /// Dhan-disable safety gate at the supervisor layer (operator 2026-06-21/24).
 pub mod dhan_activation;
+/// Shared Dhan `/v2/charts/intraday` 1m request/response primitives —
+/// relocated from `cross_verify_1m_boot.rs` in Phase C1 of the 2026-07-13
+/// Dhan live-WS retirement (the spot-1m legs must outlive the cross-verify
+/// module the Phase C deletion PRs remove). Pure move, zero behavior change.
+pub mod dhan_intraday_parse;
+/// Dhan REST-only auth bootstrap (Phase A of the Dhan-live-feed removal,
+/// operator directive 2026-07-13): with `feeds.dhan_enabled = false` this
+/// brings up the RETAINED Dhan REST surface — dual-instance lock →
+/// TokenManager → renewal + mid-session watchdog → REST canary +
+/// spot_1m_rest + option_chain_1m — WITHOUT any WebSocket lane.
+pub mod dhan_rest_stack;
 /// Groww runtime activation watcher — feed toggle cold-starts/teardowns the
 /// whole Groww lane live (operator 2026-06-24). Default-OFF; dormant until enabled.
 pub mod groww_activation;
@@ -180,3 +213,8 @@ pub mod trading_pipeline;
 /// re-injection — replaces the raw try_send loop that dropped 1,127,801
 /// frames + kept the WAL unconfirmed (self-feeding re-replay storm).
 pub mod wal_reinject;
+/// Shared `ws_event_audit` channel + consumer helper — relocated from the
+/// main.rs binary in Phase C1 (2026-07-13) so the lib-side `dhan_rest_stack`
+/// (which owns the functional-dormant order-update WS per operator ruling
+/// Q4-i) can create its own audit consumer. Pure move, zero behavior change.
+pub mod ws_audit_consumer;

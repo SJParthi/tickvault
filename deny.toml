@@ -144,6 +144,12 @@ skip = [
     { crate = "hmac", reason = "aws-sigv4 1.4.3 uses 0.13, totp-rs uses 0.12" },
     { crate = "sha1", reason = "aws-smithy-checksums 0.65.0 (aws-sdk-s3 1.138.0) is on 0.11; aws-config/axum/totp-rs/tungstenite remain on 0.10 — same crypto-family split as the entries above" },
     { crate = "sha2", reason = "aws-sigv4 1.4.3 uses 0.11, totp-rs/digest use 0.10" },
+    # 2026-07-13: aws-sdk-s3 (partition archive→verify→drop) pulls
+    # aws-smithy-checksums, whose EVERY published version requires sha1 0.11
+    # (digest 0.11 family) while aws-config/axum/tungstenite still sit on
+    # sha1 0.10.6 — the same unavoidable 0.10/0.11 crypto-stack split as the
+    # digest/sha2/hmac entries above. Advisories still cover BOTH versions.
+    { crate = "sha1", reason = "aws-smithy-checksums (aws-sdk-s3) uses 0.11, aws-config/tungstenite use 0.10" },
     { crate = "typenum", reason = "transitive splits 1.19/1.20 across digest 0.10/0.11" },
     # toml_edit 0.22 (direct) + toml_edit 0.23 (via cargo-deny internal) etc.
     # causes winnow 0.6 + 0.7 duplicate through toml_edit's parser stack.
