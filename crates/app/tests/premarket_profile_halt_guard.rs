@@ -92,53 +92,18 @@ fn pre_market_profile_check_failed_to_message_mentions_diagnostics() {
     );
 }
 
-#[test]
-fn main_rs_halts_on_profile_failure_during_market_hours() {
-    let src = read("crates/app/src/main.rs");
-    assert!(
-        src.contains("HALTING BOOT — pre-market profile check failed during market hours"),
-        "main.rs must HALT when pre_market_check fails during market \
-         hours (09:15-15:30 IST). Regression = app boots with bad \
-         profile → silent data loss during trading."
-    );
-    assert!(
-        src.contains("anyhow::bail!"),
-        "main.rs halt branch must use anyhow::bail! to exit the boot \
-         sequence — using plain `return` skips the top-level error \
-         handler that systemd relies on to trigger restart."
-    );
-}
-
-#[test]
-fn main_rs_fires_critical_telegram_on_profile_failure() {
-    let src = read("crates/app/src/main.rs");
-    assert!(
-        src.contains("NotificationEvent::PreMarketProfileCheckFailed"),
-        "main.rs must call notifier.notify(PreMarketProfileCheckFailed \
-         {{ ... }}) on every pre_market_check failure — else the \
-         operator receives no Telegram and learns via Grafana (the \
-         2026-04-21 failure mode)."
-    );
-}
-
-#[test]
-fn main_rs_covers_both_pre_market_and_market_hours_windows() {
-    let src = read("crates/app/src/main.rs");
-    assert!(
-        src.contains("in_pre_market"),
-        "main.rs pre-market check must define an in_pre_market window \
-         variable so the CRITICAL alert can fire BEFORE 09:15 (giving \
-         the operator 75 minutes to rotate a bad token)."
-    );
-    assert!(
-        src.contains("in_market_hours"),
-        "main.rs pre-market check must define an in_market_hours \
-         window so the HALT branch activates inside 09:15-15:30 IST."
-    );
-    assert!(
-        src.contains("within_market_hours: in_market_hours"),
-        "main.rs must pass the in_market_hours flag into the \
-         PreMarketProfileCheckFailed event so the Telegram message \
-         distinguishes HALT from WARN."
-    );
-}
+// RETIRED (PR-C2, 2026-07-13 — Dhan live-WS lane deletion, operator
+// retirement directive per websocket-connection-scope-lock.md "2026-07-13
+// Amendment" §B): the three main.rs pins
+// (`main_rs_halts_on_profile_failure_during_market_hours`,
+// `main_rs_fires_critical_telegram_on_profile_failure`,
+// `main_rs_covers_both_pre_market_and_market_hours_windows`) died with the
+// lane's boot-time pre-market gate — there is no market-data boot to HALT,
+// so the "boots with a bad profile → silent data loss" class is
+// structurally gone. The SURVIVING surface for the 2026-04-21 incident
+// class is the 900s mid-session profile watchdog
+// (`crates/core/src/auth/mid_session_watchdog.rs` — calls
+// `pre_market_check`, emits `PreMarketProfileCheckFailed` CRITICAL,
+// never halts), spawned by `dhan_rest_stack` and pinned by the re-pointed
+// token_health guard in `crates/core/src/auth/secret_manager.rs`. The
+// events.rs variant/severity/message pins above stay live.

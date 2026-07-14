@@ -22,46 +22,17 @@ fn read_app_source(rel: &str) -> String {
         .unwrap_or_else(|e| panic!("guard could not read {}: {e}", path.display()))
 }
 
-#[test]
-fn emit_call_site_for_summary_is_pinned() {
-    let main_rs = read_app_source("src/main.rs");
-    assert!(
-        main_rs.contains("NotificationEvent::CrossVerify1mSummary {"),
-        "main.rs must emit the typed CrossVerify1mSummary Telegram event \
-         after run_cross_verify_1m completes — the summary must never be \
-         silently dropped again (visibility directive 2026-06-10)"
-    );
-    assert!(
-        main_rs.contains("missing: summary.stats.missing_ours"),
-        "the summary event must carry missing_ours — missing minutes are \
-         missed live candles, the very signal the audit exists for"
-    );
-    assert!(
-        main_rs.contains("degraded: summary.degraded"),
-        "the summary event must carry the degraded flag (false-OK guard)"
-    );
-}
-
-#[test]
-fn emit_call_site_for_aborted_is_pinned() {
-    let main_rs = read_app_source("src/main.rs");
-    assert!(
-        main_rs.contains("NotificationEvent::CrossVerify1mAborted {"),
-        "main.rs must emit CrossVerify1mAborted when the cross-verify task \
-         dies before producing the daily summary — absence of the summary \
-         must be impossible to miss"
-    );
-    assert!(
-        main_rs.contains("join_err.is_panic()"),
-        "the Aborted emit must be gated on is_panic() — cancellation during \
-         the 16:30 IST auto-stop is normal teardown and must NOT page \
-         (pre-impl finding H2)"
-    );
-    assert!(
-        main_rs.contains("cross_verify_1m: task cancelled during shutdown"),
-        "graceful cancellation must keep its quiet log-only arm"
-    );
-}
+// RETIRED (PR-C2, 2026-07-13 — Dhan live-WS lane deletion, operator
+// retirement directive per websocket-connection-scope-lock.md "2026-07-13
+// Amendment" §B): `emit_call_site_for_summary_is_pinned` +
+// `emit_call_site_for_aborted_is_pinned` pinned the main.rs spawn/emit sites
+// of the 15:31 IST Dhan live-vs-historical 1m cross-verify, which is RETIRED
+// with the Dhan live WS (no live side to compare —
+// cross-verify-1m-error-codes.md retirement banner). The spawn died with the
+// deleted `spawn_post_market_tasks` helper. The `cross_verify_1m_boot.rs`
+// MODULE is retained un-consumed pending the Phase C parser relocation
+// (`parse_intraday_1m_candles` → spot_1m_rest_boot; scope-lock amendment §B),
+// so the module-internal summary-JSON pin below survives.
 
 #[test]
 fn summary_json_write_is_pinned() {

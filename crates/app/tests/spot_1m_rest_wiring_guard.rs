@@ -26,11 +26,25 @@ fn read_app_src(rel: &str) -> String {
 /// main.rs hit is a call site.
 const SPAWN_CALL: &str = "spawn_supervised_spot_1m_rest(";
 const CONFIG_GATE: &str = "config.spot_1m_rest.enabled";
-const POST_MARKET_FN: &str = "fn spawn_post_market_tasks(";
+
+// PR-C2 re-home (2026-07-13, operator retirement directive —
+// websocket-connection-scope-lock.md "2026-07-13 Amendment"): the spot leg
+// moved OUT of the deleted main.rs `spawn_post_market_tasks` seam INTO
+// `dhan_rest_stack.rs` (the sole surviving Dhan surface, which owns the
+// token + the spot→chain sequencing). The seam for the pin below is
+// therefore the dhan_rest_stack module's PRODUCTION region (cut at its
+// in-file `#[cfg(test)]` tests so a test literal can never satisfy a pin).
+fn read_stack_production() -> String {
+    let full = read_app_src("src/dhan_rest_stack.rs");
+    match full.find("#[cfg(test)]") {
+        Some(cut) => full[..cut].to_string(),
+        None => full,
+    }
+}
 
 #[test]
 fn ratchet_spot1m_spawn_is_config_gated_inside_post_market_seam() {
-    let main_src = read_app_src("src/main.rs");
+    let main_src = read_stack_production();
 
     let spawn_positions: Vec<usize> = main_src
         .match_indices(SPAWN_CALL)
@@ -39,30 +53,12 @@ fn ratchet_spot1m_spawn_is_config_gated_inside_post_market_seam() {
     assert_eq!(
         spawn_positions.len(),
         1,
-        "expected exactly 1 `{SPAWN_CALL}` call site in main.rs (the shared \
-         spawn_post_market_tasks seam covers BOTH boot paths + the \
-         once-guard); found {} — a second site would double-spawn the \
-         per-minute fetcher",
+        "expected exactly 1 `{SPAWN_CALL}` call site in dhan_rest_stack.rs \
+         (the sole surviving Dhan surface since PR-C2); found {} — a second \
+         site would double-spawn the per-minute fetcher",
         spawn_positions.len()
     );
     let spawn_pos = spawn_positions[0];
-
-    let seam_pos = main_src
-        .find(POST_MARKET_FN)
-        .expect("spawn_post_market_tasks must exist in main.rs");
-    // Pin the seam's END too (2026-07-12 review L1 — a one-sided check
-    // would still pass if the spawn migrated into ANY later fn): the next
-    // top-level `fn ` after the seam bounds it.
-    let seam_end = main_src[seam_pos + POST_MARKET_FN.len()..]
-        .find("\nfn ")
-        .map_or(main_src.len(), |off| seam_pos + POST_MARKET_FN.len() + off);
-    assert!(
-        spawn_pos > seam_pos && spawn_pos < seam_end,
-        "the spot_1m spawn at byte {spawn_pos} must live INSIDE \
-         spawn_post_market_tasks (fn spans bytes {seam_pos}..{seam_end}) — \
-         that seam is called from BOTH boot paths and carries the \
-         process-global once-guard"
-    );
 
     let gate_positions: Vec<usize> = main_src
         .match_indices(CONFIG_GATE)
@@ -70,15 +66,15 @@ fn ratchet_spot1m_spawn_is_config_gated_inside_post_market_seam() {
         .collect();
     assert!(
         !gate_positions.is_empty(),
-        "main.rs must gate the spot_1m spawn on `{CONFIG_GATE}` \
+        "dhan_rest_stack.rs must gate the spot_1m spawn on `{CONFIG_GATE}` \
          (fail-safe: an absent [spot_1m_rest] section disables it)"
     );
     assert!(
         gate_positions
             .iter()
-            .any(|gate| { *gate < spawn_pos && spawn_pos - gate < 2_048 && *gate > seam_pos }),
+            .any(|gate| { *gate < spawn_pos && spawn_pos - gate < 2_048 }),
         "the `{CONFIG_GATE}` gate must immediately precede the spawn call \
-         inside spawn_post_market_tasks (gates at {gate_positions:?}, \
+         inside dhan_rest_stack.rs (gates at {gate_positions:?}, \
          spawn at {spawn_pos})"
     );
 }
