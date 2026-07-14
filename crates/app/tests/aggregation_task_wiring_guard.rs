@@ -82,6 +82,17 @@ fn strip_line_comments(body: &str) -> String {
 /// the file (`with_aggregator`, ~line 908) — a naive split there would hide
 /// the real production spawn sites further down (the WS-GAP-07 false-dead
 /// class the drift guard documented on 2026-07-10).
+///
+/// 2026-07-14 mutation-review FIX-2: the lookahead SKIPS `//` comment
+/// lines exactly like attribute lines. main.rs's test-module header
+/// stacks `#[cfg(test)]`, `#[allow(…)]`, an interleaved `// APPROVED:`
+/// comment, another `#[allow(…)]`, then `mod tests {` — the earlier
+/// lookahead treated the comment line as "next code, not a module" and
+/// silently returned the WHOLE file, so any future needle-like string
+/// literal inside main.rs's mod tests would have made a scan permanently
+/// vacuous. Pinned live by
+/// `test_production_region_truncates_real_test_modules` and synthetically
+/// below.
 fn production_region(body: &str) -> &str {
     fn is_test_cfg(attr: &str) -> bool {
         attr.starts_with("#[cfg(") && attr.contains("test") && !attr.contains("not(test)")
@@ -97,12 +108,13 @@ fn production_region(body: &str) -> &str {
             {
                 return &body[..offset];
             }
-            // Next-non-attribute-line form.
+            // Next-non-attribute, non-comment-line form (FIX-2: comment
+            // lines interleaved between attributes must not end the scan).
             let mut ahead = lines.clone();
             let mut next_code = None;
             for l in ahead.by_ref() {
                 let t = l.trim();
-                if t.is_empty() || t.starts_with("#[") {
+                if t.is_empty() || t.starts_with("#[") || t.starts_with("//") {
                     continue;
                 }
                 next_code = Some(t);
@@ -189,16 +201,24 @@ fn test_main_rs_spawns_ist_midnight_force_seal_with_watermark_reset() {
 fn test_main_rs_spawns_watermark_catchup_driver() {
     let full = read_repo_file("src/main.rs");
     let prod = production_region(&full);
+    // 2026-07-14 mutation-review FIX-1: the window MUST be end-anchored at
+    // the next section marker ("D2-pre:") — with an open-ended window the
+    // `tokio::spawn(` needle was satisfiable by ANY later spawn in main.rs
+    // (mutation `tokio::spawn(async move {` -> `let _dead = async move {`
+    // inside Task 4 passed the guard). The spawn needle must be INSIDE the
+    // Task 4 block.
     let window = strip_line_comments(raw_window(
         prod,
         "Task 4: watermark-aware per-minute catch-up seal",
-        None,
+        Some("D2-pre:"),
     ));
     assert!(
         window.contains("tokio::spawn("),
-        "the Task 4 catch-up seal driver must still be spawned — a dropped \
-         spawn silently stalls BOUNDARY-01 catch-up sealing for Dhan (the \
-         boundary_catchup_storm alarm is a CEILING; nothing pages on zero)"
+        "the Task 4 catch-up seal driver must still be spawned (the spawn \
+         must be INSIDE the Task 4 block, before the D2-pre section) — a \
+         dropped/de-spawned driver silently stalls BOUNDARY-01 catch-up \
+         sealing for Dhan (the boundary_catchup_storm alarm is a CEILING; \
+         nothing pages on zero)"
     );
     for needle in [
         "CATCHUP_SEAL_POLL_INTERVAL_SECS",
@@ -230,18 +250,36 @@ fn test_groww_bridge_spawns_catchup_driver() {
         prod.contains("fn spawn_groww_catchup_seal("),
         "groww_bridge.rs must define the spawn_groww_catchup_seal driver"
     );
-    // … AND CALLED at least once in the production region (definition
-    // occurrences carry the `fn ` prefix; whitespace-normalize so rustfmt
-    // re-wrapping cannot split `fn` from the name).
-    let compacted: String = prod.chars().filter(|c| !c.is_whitespace()).collect();
-    let total = compacted.matches("spawn_groww_catchup_seal(").count();
-    let defs = compacted.matches("fnspawn_groww_catchup_seal(").count();
+    // … AND CALLED from BOTH runtime wrappers (2026-07-14 mutation-review
+    // FIX-3): a bare `calls >= 1` count was satisfiable by the call inside
+    // `spawn_supervised_groww_shard_bridges` — the scale-FLEET path that is
+    // DORMANT on main per groww-scale-aws-lockout-2026-07-06.md — so
+    // deleting the PRODUCTION single-conn call passed the guard while the
+    // live Groww catch-up driver silently never ran. Pin the call inside
+    // EACH wrapper's own window.
+    let single_conn = strip_line_comments(raw_window(
+        production_region(&full),
+        "pub fn spawn_supervised_groww_bridge(",
+        Some("pub fn spawn_supervised_groww_shard_bridges("),
+    ));
     assert!(
-        total > defs,
-        "groww_bridge.rs must CALL spawn_groww_catchup_seal( in its \
-         production region (found {defs} definition(s), {total} total \
-         occurrence(s)) — without the call the Groww BOUNDARY-01 catch-up \
-         driver silently never runs"
+        single_conn.contains("spawn_groww_catchup_seal("),
+        "spawn_supervised_groww_bridge (the LIVE single-conn wrapper) must \
+         call spawn_groww_catchup_seal( — without it the Groww BOUNDARY-01 \
+         catch-up driver silently never runs on the production path (the \
+         fleet wrapper's call does not count: that path is dormant per \
+         groww-scale-aws-lockout-2026-07-06.md)"
+    );
+    let fleet = strip_line_comments(raw_window(
+        production_region(&full),
+        "pub fn spawn_supervised_groww_shard_bridges(",
+        None,
+    ));
+    assert!(
+        fleet.contains("spawn_groww_catchup_seal("),
+        "spawn_supervised_groww_shard_bridges (the fleet wrapper) must also \
+         call spawn_groww_catchup_seal( — a scale-enabled boot without it \
+         would run the fleet with no catch-up driver"
     );
     // The driver body must keep its load-bearing pieces.
     let body = strip_line_comments(raw_window(
@@ -346,4 +384,105 @@ fn test_synthetic_production_region_is_module_aware() {
     // cfg(not(test)) gates PRODUCTION code and must never truncate.
     let not_test = "#[cfg(not(test))]\nmod prod { fn f() {} }\nfn tail() {}\n";
     assert!(production_region(not_test).contains("fn tail()"));
+    // FIX-2 regression pin (2026-07-14 mutation review): main.rs's real
+    // test-module header interleaves a `// APPROVED:` comment between
+    // #[allow] attributes and `mod tests {` — the lookahead must skip
+    // comment lines too, or the splitter silently degrades to whole-file
+    // and any needle-like literal inside mod tests becomes a permanent
+    // false-satisfier.
+    let interleaved = "fn real() {}\n\
+                       #[cfg(test)]\n\
+                       #[allow(clippy::items_after_test_module)]\n\
+                       // APPROVED: comment between attributes and the module\n\
+                       #[allow(clippy::assertions_on_constants)]\n\
+                       mod tests { fn f() { spawn_groww_catchup_seal(x); } }\n";
+    let prod = production_region(interleaved);
+    assert!(
+        prod.contains("fn real()") && !prod.contains("spawn_groww_catchup_seal("),
+        "an attribute+comment+`mod tests {{` header must still truncate — \
+         a planted needle inside such a module must NOT be visible: {prod}"
+    );
+}
+
+/// FIX-2 live self-check (2026-07-14 mutation review): the splitter must
+/// ACTUALLY truncate both scanned files' trailing test modules — before
+/// the comment-skip fix it silently returned main.rs WHOLE (prod len ==
+/// full len), so every whole-region scan was one needle-like test literal
+/// away from permanent vacuity.
+#[test]
+fn test_production_region_truncates_real_test_modules() {
+    for rel in ["src/main.rs", "src/groww_bridge.rs"] {
+        let full = read_repo_file(rel);
+        let prod = production_region(&full);
+        assert!(
+            prod.len() < full.len(),
+            "{rel}: production_region returned the WHOLE file ({} bytes) — \
+             the trailing #[cfg(test)] mod tests module was not truncated \
+             (the FIX-2 silent-degrade class)",
+            full.len()
+        );
+    }
+}
+
+/// FIX-1 synthetic pin (2026-07-14 mutation review): the de-spawn shape —
+/// `tokio::spawn(async move {` replaced by `let _dead = async move {`
+/// inside the anchored block, with a LATER spawn elsewhere in the file —
+/// must fail the end-anchored window check (with an open-ended window the
+/// later spawn satisfied the needle).
+#[test]
+fn test_synthetic_end_anchored_window_catches_de_spawn() {
+    let src = "// --- Task 4: watermark-aware per-minute catch-up seal ---\n\
+               let _dead = async move { catch_up_seal_all(cutoff); };\n\
+               // D2-pre: next section\n\
+               fn later() { tokio::spawn(async move {}); }\n";
+    let window = strip_line_comments(raw_window(
+        src,
+        "Task 4: watermark-aware per-minute catch-up seal",
+        Some("D2-pre:"),
+    ));
+    assert!(
+        !window.contains("tokio::spawn("),
+        "a de-spawned block must NOT be satisfied by a spawn AFTER the end \
+         anchor: {window}"
+    );
+    // And the healthy shape passes:
+    let healthy = "// --- Task 4: watermark-aware per-minute catch-up seal ---\n\
+                   tokio::spawn(async move { catch_up_seal_all(cutoff); });\n\
+                   // D2-pre: next section\n";
+    let window = strip_line_comments(raw_window(
+        healthy,
+        "Task 4: watermark-aware per-minute catch-up seal",
+        Some("D2-pre:"),
+    ));
+    assert!(window.contains("tokio::spawn("));
+}
+
+/// FIX-3 synthetic pin (2026-07-14 mutation review): deleting the LIVE
+/// single-conn `spawn_groww_catchup_seal(` call must fail even while the
+/// dormant fleet wrapper still calls it — the per-wrapper window must not
+/// be satisfiable by the other wrapper's call.
+#[test]
+fn test_synthetic_per_wrapper_window_catches_single_conn_call_deletion() {
+    let mutated = "pub fn spawn_supervised_groww_bridge(x: u32) {\n\
+                   // catch-up call DELETED here (the mutation)\n\
+                   }\n\
+                   pub fn spawn_supervised_groww_shard_bridges(x: u32) {\n\
+                   spawn_groww_catchup_seal(a, b, c);\n\
+                   }\n";
+    let single_conn = strip_line_comments(raw_window(
+        mutated,
+        "pub fn spawn_supervised_groww_bridge(",
+        Some("pub fn spawn_supervised_groww_shard_bridges("),
+    ));
+    assert!(
+        !single_conn.contains("spawn_groww_catchup_seal("),
+        "the single-conn wrapper's window must NOT be satisfied by the \
+         fleet wrapper's call: {single_conn}"
+    );
+    let fleet = strip_line_comments(raw_window(
+        mutated,
+        "pub fn spawn_supervised_groww_shard_bridges(",
+        None,
+    ));
+    assert!(fleet.contains("spawn_groww_catchup_seal("));
 }

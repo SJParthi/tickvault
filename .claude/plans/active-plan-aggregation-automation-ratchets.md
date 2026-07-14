@@ -107,6 +107,26 @@ Close the 3 Verified automation gaps from the 2026-07-10 coverage audit:
   merged at ee96a3d0, 0 unchecked items)
   - Files: .claude/plans/archive/2026-07-14-spot-1m-diagnostics.md
   - Tests: N/A — archival per plan-enforcement.md convention
+- [x] Mutation-review fix round (coordinator hostile review, 2026-07-14 —
+  3 real escapes live-verified against mutated copies, all now bite):
+  FIX-1 the Task 4 window is end-anchored at "D2-pre:" (a de-spawn was
+  previously rescued by any LATER spawn in main.rs); FIX-2 the
+  production-region lookahead skips `//` comment lines (main.rs's
+  attribute+comment+`mod tests {` header silently degraded the splitter
+  to whole-file — new live self-check pins prod < full for both scanned
+  files); FIX-3 the Groww catch-up call is pinned PER-WRAPPER (deleting
+  the LIVE single-conn call was previously masked by the DORMANT
+  scale-fleet wrapper's call, per groww-scale-aws-lockout); FIX-4 the
+  drift guard documents the raw-string (r#"…"#) odd-quote-parity residual
+  next to the char-literal note. Each fixed shape proven by real-file
+  mutation (FAILED output captured) + a synthetic pin.
+  - Files: crates/app/tests/aggregation_task_wiring_guard.rs,
+    crates/common/tests/error_code_paging_filter_drift_guard.rs
+  - Tests: test_synthetic_end_anchored_window_catches_de_spawn,
+    test_production_region_truncates_real_test_modules,
+    test_synthetic_per_wrapper_window_catches_single_conn_call_deletion
+    (+ the FIX-2 interleaved-header arm in
+    test_synthetic_production_region_is_module_aware)
 
 ## Edge Cases
 
