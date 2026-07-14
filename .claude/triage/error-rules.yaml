@@ -2543,3 +2543,48 @@ rules:
       (BOOT-01/02, WAL-SUSPEND-01) and backfills with the env override
       re-run per the runbook. Auto-restarting the app for a degraded
       forensic run would be worse than the miss.
+
+  # -----------------------------------------------------------------------
+  # 🔷 DHAN exit-order execution layer (Cluster B, 2026-07-14, WP1)
+  # -----------------------------------------------------------------------
+
+  # EXIT-ORDER-01 = an exit engine call degraded (validation refusal on a
+  # dispatched command / Dhan API error on a super, forever, or sliced
+  # order / ENTRY_LEG cancel refused post-fill — the naked-position race
+  # U4, never exercised / slicing response anomaly). The layer ships
+  # default-off behind four locks and dry-run paper mode; the coded line
+  # carries the order/correlation ids. Never auto-fixed: re-issuing an
+  # order-side mutation blind is exactly the double-exposure class the
+  # idempotency machinery exists to prevent.
+  - name: exit-order-01-execution-degraded-escalate
+    match:
+      code: EXIT-ORDER-01
+    action: escalate
+    runbook_path: .claude/rules/project/dhan-exit-order-lockout-2026-07-14.md
+    confidence: 1.0
+    cooldown_secs: 600
+    justification: >-
+      EXIT-ORDER-01 = exit engine call degraded. The refusal/degrade
+      already happened loudly with correlation ids in the coded line;
+      the operator inspects per the lockout runbook. Log-sink-only (the
+      2026-07-14 Dhan noise lock) — no pager entry; auto-triage must
+      never re-issue an order mutation.
+
+  # EXIT-VERIFY-01 = the MPP verify ladder exhausted with a degraded
+  # verdict: PendingAtLimit (MARKET auto-converted to LIMIT resting on the
+  # book past the deadline — orders.md rule 18, NEVER assumed filled),
+  # partial fill at budget (needs_reconciliation set — the remainder is
+  # never silently forgotten), or an Unknown unparsable status
+  # (fail-closed). The order stays tracked; reconcile owns the follow-up.
+  - name: exit-verify-01-degraded-escalate
+    match:
+      code: EXIT-VERIFY-01
+    action: escalate
+    runbook_path: .claude/rules/project/dhan-exit-order-lockout-2026-07-14.md
+    confidence: 1.0
+    cooldown_secs: 600
+    justification: >-
+      EXIT-VERIFY-01 = MPP verify ladder exhausted without a clean fill.
+      An unverified exit is open exposure — operator eyes required; any
+      live policy action (modify-to-aggressive / cancel-remainder) is a
+      live order action and is never auto-executed in the dry-run layer.

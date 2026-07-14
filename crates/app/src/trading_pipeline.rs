@@ -106,12 +106,13 @@ pub struct TradingPipelineConfig {
     pub client_id: String,
     /// Token handle for authentication.
     pub token_handle: TokenHandle,
-    /// `[oms_reconcile]` scheduled OMS reconciliation settings (default OFF).
-    pub oms_reconcile: OmsReconcileConfig,
-    /// NSE trading calendar for the reconcile gate (`None` ⇒ weekday-only
-    /// fallback — the pipeline must never fail to spawn over a holiday-list
-    /// parse problem).
-    pub trading_calendar: Option<std::sync::Arc<TradingCalendar>>,
+    /// `[exit_orders]` — 🔷 DHAN exit-order layer (Cluster B, 2026-07-14).
+    /// The `Signal::Exit` arm routes through
+    /// `exit_execution::execute_exit_for_security` with this; disabled
+    /// (the default) ⇒ byte-equivalent legacy cancel+close behavior.
+    /// Field appended at the END per the Cluster A/B field-append
+    /// discipline (design §4).
+    pub exit_orders: tickvault_common::config::ExitOrdersConfig,
 }
 
 /// Spawns the trading pipeline as a background task.
@@ -267,6 +268,35 @@ async fn run_trading_pipeline(
         info!("PAPER TRADING MODE — no real orders will be placed");
     } else {
         warn!("LIVE TRADING MODE — real orders WILL be placed");
+    }
+
+    // 🔷 DHAN exit-order layer boot honesty (Cluster B, design §7): a
+    // config flip is never a silent no-op — one line names the mode; the
+    // live path stays gated by the engine's hardcoded dry_run (LOCK #3).
+    info!(
+        enabled = config.exit_orders.enabled,
+        "exit-order layer: {} (dry-run paper mode — live path gated by hardcoded dry_run)",
+        if config.exit_orders.enabled {
+            "ENABLED"
+        } else {
+            "disabled"
+        }
+    );
+    if config.exit_orders.enabled {
+        let today_ist = (chrono::Utc::now()
+            + chrono::TimeDelta::seconds(i64::from(IST_UTC_OFFSET_SECONDS)))
+        .date_naive();
+        if tickvault_common::config::freeze_review_is_stale(
+            &config.exit_orders.freeze_limits_reviewed_on,
+            today_ist,
+        ) {
+            warn!(
+                reviewed_on = %config.exit_orders.freeze_limits_reviewed_on,
+                "exit-order freeze-limit review is STALE (>90 days old or unparsable) — \
+                 re-verify [exit_orders].default_freeze_limit_qty against the NSE \
+                 quantity-freeze file before trusting sliced closes"
+            );
+        }
     }
 
     let mut ticks_processed: u64 = 0;
@@ -523,99 +553,18 @@ async fn run_trading_pipeline(
                                         strategy = %strategy.definition().name,
                                         "EXIT signal"
                                     );
-                                    // Step 1: Cancel active (unfilled/pending) orders for this security
-                                    let active: Vec<String> = oms
-                                        .active_orders()
-                                        .iter()
-                                        .filter(|o| o.security_id == tick.security_id)
-                                        .map(|o| o.order_id.clone())
-                                        .collect();
-                                    for order_id in active {
-                                        match oms.cancel_order(&order_id).await {
-                                            Ok(()) => {
-                                                order_side_send(&order_side, OrderSideMsg::Cancelled {
-                                                    order_id,
-                                                });
-                                            }
-                                            Err(err) => {
-                                                warn!(
-                                                    ?err,
-                                                    order_id = %order_id,
-                                                    "EXIT signal → cancel failed"
-                                                );
-                                                order_side_send(&order_side, OrderSideMsg::CancelFailed {
-                                                    order_id,
-                                                    detail: format!("exit cancel: {err}"),
-                                                });
-                                            }
-                                        }
-                                    }
-                                    // Step 2: Close open position (if any filled lots exist)
-                                    let net_lots = risk_engine.net_lots_for(tick.security_id);
-                                    if net_lots != 0 {
-                                        let close_type = if net_lots > 0 {
-                                            TransactionType::Sell
-                                        } else {
-                                            TransactionType::Buy
-                                        };
-                                        let close_qty = net_lots.unsigned_abs() as i64;
-                                        info!(
-                                            security_id = tick.security_id,
-                                            net_lots,
-                                            close_type = ?close_type,
-                                            "EXIT signal → placing closing order for open position"
-                                        );
-                                        let close_request = PlaceOrderRequest {
-                                            security_id: tick.security_id,
-                                            transaction_type: close_type,
-                                            order_type: OrderType::Market,
-                                            product_type: ProductType::Intraday,
-                                            validity: OrderValidity::Day,
-                                            quantity: close_qty,
-                                            price: 0.0,
-                                            trigger_price: 0.0,
-                                            lot_size: 1,
-                                            expiry_date: None,
-                                        };
-                                        match oms.place_order(close_request).await {
-                                            Ok(order_id) => {
-                                                info!(
-                                                    order_id = %order_id,
-                                                    security_id = tick.security_id,
-                                                    net_lots,
-                                                    "EXIT signal → closing order placed"
-                                                );
-                                                order_side_send(&order_side, OrderSideMsg::Placed {
-                                                    order_id,
-                                                    correlation_id: String::new(),
-                                                    security_id: tick.security_id,
-                                                    exchange_segment:
-                                                        tickvault_common::segment::segment_code_to_str(
-                                                            tick.exchange_segment_code,
-                                                        ),
-                                                    transaction_type: if net_lots > 0 {
-                                                        "SELL"
-                                                    } else {
-                                                        "BUY"
-                                                    },
-                                                    quantity: close_qty,
-                                                    price: 0.0,
-                                                });
-                                            }
-                                            Err(err) => {
-                                                warn!(
-                                                    ?err,
-                                                    security_id = tick.security_id,
-                                                    "EXIT signal → closing order placement failed"
-                                                );
-                                                order_side_send(&order_side, OrderSideMsg::PlaceFailed {
-                                                    correlation_id: String::new(),
-                                                    security_id: tick.security_id,
-                                                    detail: format!("exit close: {err}"),
-                                                });
-                                            }
-                                        }
-                                    }
+                                    // 🔷 DHAN exit-order layer (Cluster B, design §3.10):
+                                    // disabled (the shipped default) ⇒ the delegate runs the
+                                    // byte-equivalent legacy cancel+close body; enabled ⇒
+                                    // ExitCommand::CloseAll through the dispatcher (super-
+                                    // order-aware cancel + sliced close + MPP verify ladder).
+                                    crate::exit_execution::execute_exit_for_security(
+                                        &mut oms,
+                                        &risk_engine,
+                                        tick.security_id,
+                                        &config.exit_orders,
+                                    )
+                                    .await;
                                 }
                             }
                         }
@@ -1001,23 +950,7 @@ pub fn init_trading_pipeline(
         },
         client_id: client_id.to_owned(),
         token_handle: token_handle.clone(),
-        oms_reconcile: config.oms_reconcile.clone(),
-        // Calendar-inside-init: build the NSE trading calendar for the
-        // reconcile gate HERE so main.rs stays untouched (both dhan-gated
-        // spawn sites flow through this fn). Err ⇒ weekday-only fallback —
-        // the pipeline must never fail to spawn over a holiday-list parse
-        // problem.
-        trading_calendar: match TradingCalendar::from_config(&config.trading) {
-            Ok(calendar) => Some(std::sync::Arc::new(calendar)),
-            Err(err) => {
-                warn!(
-                    ?err,
-                    "trading calendar unavailable for the reconcile gate — \
-                     falling back to a weekday-only trading-day check"
-                );
-                None
-            }
-        },
+        exit_orders: config.exit_orders.clone(),
     };
 
     Some((pipeline_config, hot_reloader))
@@ -1454,9 +1387,14 @@ threshold = 70.0
             rest_api_base_url: "https://api.dhan.co/v2".to_owned(),
             client_id: "test_client".to_owned(),
             token_handle: handle,
+            exit_orders: tickvault_common::config::ExitOrdersConfig::default(),
         };
 
         assert!(config.dry_run, "dry_run must be true for safety");
+        assert!(
+            !config.exit_orders.enabled,
+            "exit-order layer must default OFF (LOCK #1)"
+        );
         assert!((config.max_daily_loss_percent - 2.0).abs() < f64::EPSILON);
         assert_eq!(config.max_position_lots, 10);
         assert!((config.capital - 500_000.0).abs() < f64::EPSILON);
@@ -1528,6 +1466,7 @@ threshold = 25.0
             rest_api_base_url: "https://api.dhan.co/v2".to_owned(),
             client_id: "client_123".to_owned(),
             token_handle: handle,
+            exit_orders: tickvault_common::config::ExitOrdersConfig::default(),
         };
 
         assert_eq!(config.strategies.len(), 2);
@@ -1957,6 +1896,7 @@ threshold = 25.0
             rest_api_base_url: "https://api.dhan.co/v2".to_owned(),
             client_id: "test".to_owned(),
             token_handle: handle,
+            exit_orders: tickvault_common::config::ExitOrdersConfig::default(),
         };
         // Zero capital is technically allowed at construction — risk engine
         // will handle this by immediately breaching daily loss threshold.
@@ -1980,6 +1920,7 @@ threshold = 25.0
             rest_api_base_url: "https://api.dhan.co/v2".to_owned(),
             client_id: "test".to_owned(),
             token_handle: handle,
+            exit_orders: tickvault_common::config::ExitOrdersConfig::default(),
         };
         assert!((config.max_daily_loss_percent - 100.0).abs() < f64::EPSILON);
     }
@@ -2011,6 +1952,7 @@ threshold = 25.0
             rest_api_base_url: "https://api.dhan.co/v2".to_owned(),
             client_id: "test".to_owned(),
             token_handle: handle,
+            exit_orders: tickvault_common::config::ExitOrdersConfig::default(),
         };
         assert_eq!(config.indicator_params.ema_fast_period, 5);
         assert_eq!(config.indicator_params.ema_slow_period, 10);
@@ -2036,6 +1978,7 @@ threshold = 25.0
             rest_api_base_url: "https://api.dhan.co/v2".to_owned(),
             client_id: "live_client".to_owned(),
             token_handle: handle,
+            exit_orders: tickvault_common::config::ExitOrdersConfig::default(),
         };
         assert!(
             !config.dry_run,
@@ -2060,6 +2003,7 @@ threshold = 25.0
             rest_api_base_url: "https://api.dhan.co/v2".to_owned(),
             client_id: "test".to_owned(),
             token_handle: handle,
+            exit_orders: tickvault_common::config::ExitOrdersConfig::default(),
         };
         assert_eq!(config.max_orders_per_second, 1);
     }
@@ -2347,6 +2291,7 @@ threshold = 70.0
             rest_api_base_url: "https://api.dhan.co/v2".to_owned(),
             client_id: "test".to_owned(),
             token_handle: handle,
+            exit_orders: tickvault_common::config::ExitOrdersConfig::default(),
         };
 
         let task_handle = spawn_trading_pipeline(config, tick_rx, order_rx, None);
@@ -2396,6 +2341,7 @@ threshold = 70.0
             rest_api_base_url: "https://api.dhan.co/v2".to_owned(),
             client_id: "test".to_owned(),
             token_handle: handle,
+            exit_orders: tickvault_common::config::ExitOrdersConfig::default(),
         };
 
         let task_handle = spawn_trading_pipeline(config, tick_rx, order_rx, None);
@@ -2445,6 +2391,7 @@ threshold = 70.0
             rest_api_base_url: "https://api.dhan.co/v2".to_owned(),
             client_id: "test".to_owned(),
             token_handle: handle,
+            exit_orders: tickvault_common::config::ExitOrdersConfig::default(),
         };
 
         let task_handle = spawn_trading_pipeline(config, tick_rx, order_rx, None);
@@ -2610,6 +2557,7 @@ threshold = 70.0
             rest_api_base_url: "https://api.dhan.co/v2".to_owned(),
             client_id: "test".to_owned(),
             token_handle: handle,
+            exit_orders: tickvault_common::config::ExitOrdersConfig::default(),
         };
 
         let task_handle = spawn_trading_pipeline(config, tick_rx, order_rx, None);
@@ -2644,6 +2592,7 @@ threshold = 70.0
             rest_api_base_url: "https://api.dhan.co/v2".to_owned(),
             client_id: "test".to_owned(),
             token_handle: handle,
+            exit_orders: tickvault_common::config::ExitOrdersConfig::default(),
         };
 
         let task_handle = spawn_trading_pipeline(config, tick_rx, order_rx, None);
@@ -2731,6 +2680,11 @@ threshold = 70.0
         let (pipeline_config, _hot_reloader) = result.unwrap();
         assert!(pipeline_config.dry_run, "dry_run must default to true");
         assert_eq!(pipeline_config.strategies.len(), 1);
+        assert!(
+            !pipeline_config.exit_orders.enabled,
+            "base.toml carries [exit_orders] enabled = false (LOCK #1) — \
+             init_trading_pipeline must thread it through"
+        );
 
         let _ = std::fs::remove_file(&config_path);
         let _ = std::fs::remove_dir(&tmp_dir);
@@ -2815,6 +2769,7 @@ threshold = 70.0
             rest_api_base_url: "https://api.dhan.co/v2".to_owned(),
             client_id: "test".to_owned(),
             token_handle: handle,
+            exit_orders: tickvault_common::config::ExitOrdersConfig::default(),
         };
 
         let task_handle = spawn_trading_pipeline(config, tick_rx, order_rx, None);
@@ -2860,6 +2815,7 @@ threshold = 70.0
             rest_api_base_url: "https://api.dhan.co/v2".to_owned(),
             client_id: "test".to_owned(),
             token_handle: handle,
+            exit_orders: tickvault_common::config::ExitOrdersConfig::default(),
         };
 
         let task_handle = spawn_trading_pipeline(config, tick_rx, order_rx, None);
@@ -2900,6 +2856,7 @@ threshold = 70.0
             rest_api_base_url: "https://api.dhan.co/v2".to_owned(),
             client_id: "test".to_owned(),
             token_handle: handle,
+            exit_orders: tickvault_common::config::ExitOrdersConfig::default(),
         };
 
         let task_handle = spawn_trading_pipeline(config, tick_rx, order_rx, None);
@@ -3000,6 +2957,7 @@ threshold = 70.0
             rest_api_base_url: "https://api.dhan.co/v2".to_owned(),
             client_id: "test".to_owned(),
             token_handle: handle,
+            exit_orders: tickvault_common::config::ExitOrdersConfig::default(),
         };
 
         assert!(config.dry_run, "must be paper trading mode");
@@ -3030,6 +2988,7 @@ threshold = 70.0
             rest_api_base_url: "https://api.dhan.co/v2".to_owned(),
             client_id: "test".to_owned(),
             token_handle: handle,
+            exit_orders: tickvault_common::config::ExitOrdersConfig::default(),
         };
 
         assert!(!config.dry_run, "must be live mode");
@@ -3338,6 +3297,7 @@ threshold = 30.0
             rest_api_base_url: "https://api.dhan.co/v2".to_owned(),
             client_id: "test".to_owned(),
             token_handle: handle,
+            exit_orders: tickvault_common::config::ExitOrdersConfig::default(),
         };
 
         let task_handle = spawn_trading_pipeline(config, tick_rx, order_rx, None);
@@ -3472,6 +3432,7 @@ threshold = 30.0
             rest_api_base_url: "https://api.dhan.co/v2".to_owned(),
             client_id: "test".to_owned(),
             token_handle: handle,
+            exit_orders: tickvault_common::config::ExitOrdersConfig::default(),
         };
         assert!(
             config.rest_api_base_url.contains("/v2"),
@@ -3603,6 +3564,7 @@ threshold = 70.0
             rest_api_base_url: "https://api.dhan.co/v2".to_owned(),
             client_id: "test".to_owned(),
             token_handle: handle,
+            exit_orders: tickvault_common::config::ExitOrdersConfig::default(),
         };
 
         // Pass the reloader to the pipeline — exercises the `if let Some(ref reloader)` path
@@ -3688,6 +3650,7 @@ threshold = 50.0
             rest_api_base_url: "https://api.dhan.co/v2".to_owned(),
             client_id: "test".to_owned(),
             token_handle: handle,
+            exit_orders: tickvault_common::config::ExitOrdersConfig::default(),
         };
 
         let task_handle = spawn_trading_pipeline(config, tick_rx, order_rx, None);
@@ -3744,6 +3707,7 @@ threshold = 50.0
             rest_api_base_url: "https://api.dhan.co/v2".to_owned(),
             client_id: "test".to_owned(),
             token_handle: handle,
+            exit_orders: tickvault_common::config::ExitOrdersConfig::default(),
         };
 
         let task_handle = spawn_trading_pipeline(config, tick_rx, order_rx, None);
@@ -3880,6 +3844,7 @@ threshold = 65.0
             rest_api_base_url: "https://api.dhan.co/v2".to_owned(),
             client_id: "test".to_owned(),
             token_handle: handle,
+            exit_orders: tickvault_common::config::ExitOrdersConfig::default(),
         };
 
         let task_handle = spawn_trading_pipeline(config, tick_rx, order_rx, None);
@@ -3961,6 +3926,7 @@ threshold = 35.0
             rest_api_base_url: "https://api.dhan.co/v2".to_owned(),
             client_id: "test".to_owned(),
             token_handle: handle,
+            exit_orders: tickvault_common::config::ExitOrdersConfig::default(),
         };
 
         let task_handle = spawn_trading_pipeline(config, tick_rx, order_rx, None);
@@ -4008,6 +3974,7 @@ threshold = 35.0
             rest_api_base_url: "https://api.dhan.co/v2".to_owned(),
             client_id: "test".to_owned(),
             token_handle: handle,
+            exit_orders: tickvault_common::config::ExitOrdersConfig::default(),
         };
 
         let task_handle = spawn_trading_pipeline(config, tick_rx, order_rx, None);
@@ -4038,6 +4005,7 @@ threshold = 35.0
             rest_api_base_url: "https://api.dhan.co/v2".to_owned(),
             client_id: "test".to_owned(),
             token_handle: handle,
+            exit_orders: tickvault_common::config::ExitOrdersConfig::default(),
         };
 
         let task_handle = spawn_trading_pipeline(config, tick_rx, order_rx, None);

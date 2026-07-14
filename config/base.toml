@@ -644,37 +644,21 @@ strikes_each_side = 2
 enabled = true
 
 # ===========================================================================
-# Scheduled OMS order-book reconciliation (2026-07-14). Every
-# `interval_secs` during the NSE session the trading pipeline reconciles
-# OMS state against the Dhan order book (the OMS-GAP-02 machinery gains a
-# scheduled caller). DEFAULT-OFF until live trading — the OMS dry-run
-# short-circuit makes an enabled run a zero-HTTP no-op anyway. An ABSENT
-# section = disabled (fail-safe); `enabled = false` is the rollback switch.
+# 🔷 DHAN exit-order execution layer (Cluster B, 2026-07-14 — LOCK #1 of
+# the 4-lock OFF switch; runbook + lockout contract in
+# .claude/rules/project/dhan-exit-order-lockout-2026-07-14.md). While
+# enabled = false the app-crate dispatcher drops every exit command
+# (counted, never silent). Flipping to true activates DRY-RUN PAPER
+# behavior ONLY — the engine's hardcoded dry_run = true blocks every live
+# POST, and one boot log line names the mode honestly (a flip is never a
+# silent no-op). Going live needs a code change + ratchet edit + rule-file
+# edit with a dated operator quote — never a config flip alone. This
+# section deliberately EXISTS with enabled = false: it is the lockout
+# guard's non-vacuous scan surface (the groww-scale-lockout pattern).
+# When enabling: default_freeze_limit_qty (>= 1, the NSE freeze quantity)
+# and freeze_limits_reviewed_on ("YYYY-MM-DD", warns when > 90 days old)
+# become mandatory; mpp_verify_deadline_secs (default 30) and
+# mpp_verify_max_attempts (default 5) drive the verify-after-place ladder.
 # ===========================================================================
-[order_runtime]
-enabled = true
-paper_fill = true
-self_test = true
-reconcile_interval_secs = 300
-mark_channel_capacity = 8192
-
-# ===========================================================================
-# 🔷 DHAN pre-trade margin gate (operator directive 2026-07-14, relayed via
-# the coordinator session — the Funds & Margin surface runs as its own
-# dedicated build). Code-ready, DEFAULT-OFF: even with enabled = true the
-# REST legs stay dark until the code-change master lock
-# DHAN_MARGIN_GATE_REST_ALLOWED (constants.rs) flips with a fresh dated
-# operator quote recorded in .claude/rules/dhan/funds-margin.md (the
-# umbrella-plan E2 hold). Shared account with BruteX: tenant_budget_percent
-# caps EACH entry to <=50% of the then-current pooled availabelBalance
-# (per-entry, not cumulative); rest_self_cap_per_sec self-caps our
-# funds/margin REST usage — the endpoints' rate bucket is NOT named by
-# Dhan's docs (Assumed Non-Trading 20/sec; 5/sec stays <=50% even under the
-# more conservative 10/sec reading; live-probe before raising). The
-# self-cap is per gate instance — the OMS wiring PR constructs exactly one
-# gate per process and ratchets it. Exits are NEVER margin-gated.
-# ===========================================================================
-[dhan_margin_gate]
+[exit_orders]
 enabled = false
-tenant_budget_percent = 50
-rest_self_cap_per_sec = 5
