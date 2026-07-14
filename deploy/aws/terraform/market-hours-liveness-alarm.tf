@@ -430,7 +430,12 @@ resource "aws_cloudwatch_log_group" "tv_market_hours_liveness_gate" {
 # ---------------------------------------------------------------------------
 resource "aws_cloudwatch_metric_alarm" "market_hours_gate_lambda_errors" {
   alarm_name          = "tv-${var.environment}-market-hours-gate-errors"
-  alarm_description   = "The market-hours gate Lambda FAILED - its 09:20 IST open invocation is the ONLY path that arms the 6 gated alarms (market-hours-liveness-missing, aggregator-no-seals, app-log-ingestion-silent, boundary-catchup-storm-dhan, dhan-exchange-lag-p99-high, groww-exchange-lag-p99-high - the Lambda's ALARM_NAMES env is the authoritative list; count 12 -> 8 in PR-C2 2026-07-14 with the 4 Dhan-lane alarms retired, -> 7 via the merged 2026-07-14 Dhan noise lock retiring order-update-reconnect-storm, -> 6 in PR-C3 2026-07-14 with tick-gap-instruments-silent retired alongside its deleted gauge producer). A failed open leaves all 6 disarmed for the session (the 2026-07-06 leg-3 zero-page class); a failed close leaves them armed overnight (false-page risk). NO green OK page ever follows this alarm (ok_actions suppressed - the Lambda runs 2x/day, so an auto-OK is aged-out, never a fix): manually re-arm/verify the 6 gated alarms (enable_alarm_actions / disable_alarm_actions) REGARDLESS, after reading the gate Lambda's log group."
+  # CloudWatch caps alarm_description at 1024 chars — the count history
+  # (12 -> 8 PR-C2, -> 7 Dhan noise lock, -> 6 PR-C3 2026-07-14 with
+  # tick-gap-instruments-silent retired alongside its deleted gauge
+  # producer) lives HERE in the comment; the description keeps only the
+  # operator-actionable core.
+  alarm_description   = "The market-hours gate Lambda FAILED - its 09:20 IST open invocation is the ONLY path that arms the 6 gated alarms (market-hours-liveness-missing, aggregator-no-seals, app-log-ingestion-silent, boundary-catchup-storm-dhan, dhan-exchange-lag-p99-high, groww-exchange-lag-p99-high - the Lambda's ALARM_NAMES env is the authoritative list; trimmed to 6 in PR-C3 2026-07-14). A failed open leaves all 6 disarmed for the session (the 2026-07-06 leg-3 zero-page class); a failed close leaves them armed overnight (false-page risk). NO green OK page ever follows this alarm (ok_actions suppressed - the Lambda runs 2x/day, so an auto-OK is aged-out, never a fix): manually re-arm/verify the 6 gated alarms (enable_alarm_actions / disable_alarm_actions) REGARDLESS, after reading the gate Lambda's log group."
   comparison_operator = "GreaterThanOrEqualToThreshold"
   evaluation_periods  = 1
   metric_name         = "Errors"
